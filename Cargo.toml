@@ -1,0 +1,15 @@
+[package]
+name = "liquidium-pipeline"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+tokio = { version = "1.38", features = ["full"] }
+ic-agent = "0.40.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+async-trait = "0.1"
+dotenv = "0.15"
+futures = "0.3"
+candid = "0.10.14"
+num-traits = "0.2.19"
