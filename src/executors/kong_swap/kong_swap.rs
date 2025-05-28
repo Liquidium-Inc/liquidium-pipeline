@@ -1,5 +1,6 @@
 use std::{collections::HashMap, str::FromStr, sync::Arc, u128::MAX};
 
+use async_trait::async_trait;
 use candid::{Decode, Encode, Nat, Principal, encode_args};
 use ic_agent::Agent;
 use icrc_ledger_types::{
@@ -12,27 +13,29 @@ use icrc_ledger_types::{
 use log::{debug, info, warn};
 
 use crate::{
+    config::Config,
+    executors::executor::IcrcSwapExecutor,
     icrc_token::{icrc_token::IcrcToken, icrc_token_amount::IcrcTokenAmount},
-    types::SwapAmountsReply,
 };
 
-use super::types::{SwapArgs, SwapReply};
+use super::types::{SwapAmountsReply, SwapArgs, SwapReply};
 
 static DEX_PRINCIPAL: &str = "2ipq2-uqaaa-aaaar-qailq-cai";
 
 pub struct KongSwapExecutor {
-    agent: Arc<Agent>,
-    account_id: Account,
-    dex_account: Account,
-    allowances: HashMap<Principal, Nat>,
+    pub agent: Arc<Agent>,
+    pub config: Arc<Config>,
+    pub account_id: Account,
+    pub dex_account: Account,
+    pub allowances: HashMap<Principal, Nat>,
 }
 
 impl KongSwapExecutor {
-    pub fn new(agent: Arc<Agent>, owner: Principal) -> Self {
+    pub fn new(agent: Arc<Agent>, config: Arc<Config>) -> Self {
         Self {
             agent,
             account_id: Account {
-                owner,
+                owner: config.liquidator_principal,
                 subaccount: None,
             },
             dex_account: Account {
@@ -40,6 +43,7 @@ impl KongSwapExecutor {
                 subaccount: None,
             },
             allowances: HashMap::new(),
+            config,
         }
     }
 
@@ -68,12 +72,15 @@ impl KongSwapExecutor {
         info!("DEX token approval complete");
         Ok(())
     }
+}
 
-    pub async fn get_swap_info(
+#[async_trait]
+impl IcrcSwapExecutor for KongSwapExecutor {
+    async fn get_swap_info(
         &self,
-        token_in: IcrcToken,
-        token_out: IcrcToken,
-        amount: IcrcTokenAmount,
+        token_in: &IcrcToken,
+        token_out: &IcrcToken,
+        amount: &IcrcTokenAmount,
     ) -> Result<SwapAmountsReply, String> {
         let dex_principal = Principal::from_str(DEX_PRINCIPAL).unwrap();
 
@@ -85,7 +92,14 @@ impl KongSwapExecutor {
         let result = self
             .agent
             .query(&dex_principal, "swap_amounts")
-            .with_arg(encode_args((token_in.symbol, amount.value, token_out.symbol)).unwrap())
+            .with_arg(
+                encode_args((
+                    token_in.symbol.clone(),
+                    amount.value.clone(),
+                    token_out.symbol.clone(),
+                ))
+                .unwrap(),
+            )
             .await
             .map_err(|e| format!("Swap call error: {}", e))?;
 
@@ -93,7 +107,7 @@ impl KongSwapExecutor {
             .map_err(|e| format!("Candid decode error: {}", e))?
     }
 
-    pub async fn swap(&self, swap_args: SwapArgs) -> Result<SwapReply, String> {
+    async fn swap(&self, swap_args: SwapArgs) -> Result<SwapReply, String> {
         let dex_principal = Principal::from_str(DEX_PRINCIPAL).unwrap();
         let result = self
             .agent

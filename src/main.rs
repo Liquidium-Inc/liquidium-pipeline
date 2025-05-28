@@ -13,15 +13,19 @@ use executors::kong_swap::kong_swap::KongSwapExecutor;
 use ic_agent::Agent;
 
 use log::info;
-use stages::liquidation::LiquidationExecutor;
 use stages::opportunity::OpportunityFinder;
+use stages::simple_strategy::IcrcLiquidationStrategy;
 
 async fn init(
     config: Arc<Config>,
     agent: Arc<Agent>,
-) -> (OpportunityFinder, LiquidationExecutor, KongSwapExecutor) {
+) -> (
+    OpportunityFinder,
+    IcrcLiquidationStrategy<KongSwapExecutor>,
+    Arc<KongSwapExecutor>,
+) {
     info!("Initializing swap stage...");
-    let mut swapper = KongSwapExecutor::new(agent.clone(), config.liquidator_principal);
+    let mut swapper = KongSwapExecutor::new(agent.clone(), config.clone());
 
     // Pre approve tokens
     swapper
@@ -35,15 +39,13 @@ async fn init(
         .await
         .expect("could not pre approve tokens");
 
+    let swapper = Arc::new(swapper);
+
     info!("Initializing find stage ...");
     let finder = OpportunityFinder::new(agent.clone(), config.lending_canister);
 
     info!("Initializing liquidations stage ...");
-    let executor = LiquidationExecutor::new(
-        agent.clone(),
-        config.lending_canister,
-        config.liquidator_principal,
-    );
+    let executor = IcrcLiquidationStrategy::new(config.clone(), swapper.clone());
 
     (finder, executor, swapper)
 }
@@ -63,41 +65,6 @@ async fn main() {
 
     let (finder, executor, swapper) = init(config.clone(), agent.clone()).await;
 
-    // let token_in = IcrcToken::from_principal(
-    //     Principal::from_text("cngnf-vqaaa-aaaar-qag4q-cai").unwrap(),
-    //     agent.clone(),
-    // )
-    // .await;
-
-    // let token_out = IcrcToken::from_principal(
-    //     Principal::from_text("ryjl3-tyaaa-aaaaa-aaaba-cai").unwrap(),
-    //     agent.clone(),
-    // )
-    // .await;
-
-    // let amount = IcrcTokenAmount::from_formatted(token_in.clone(), 1.0);
-    // let swap_info = swapper
-    //     .get_swap_info(token_in, token_out, amount.clone())
-    //     .await
-    //     .expect("failed to get swap info");
-
-    // info!("Got swap info {:#?}", swap_info);
-
-    // let swap_result = swapper
-    //     .swap(SwapArgs {
-    //         pay_token: swap_info.pay_symbol,
-    //         pay_amount: amount.value,
-    //         pay_tx_id: None,
-    //         receive_token: swap_info.receive_symbol,
-    //         receive_amount: None,
-    //         receive_address: None,
-    //         max_slippage: Some(swap_info.slippage),
-    //         referred_by: None,
-    //     })
-    //     .await
-    //     .expect("swap failed");
-
-    // info!("Executed swap {:?}", swap_result);
     // todo!()
 
     // loop {

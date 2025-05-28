@@ -1,9 +1,7 @@
 use candid::Principal;
-use dotenv::dotenv;
 use env_logger::Env;
 use ic_agent::{Agent, Identity};
 use log::info;
-use once_cell::sync::Lazy;
 use std::collections::HashMap;
 use std::env;
 use std::sync::Arc;

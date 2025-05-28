@@ -18,6 +18,9 @@ icrc-ledger-types = "0.1.6"
 log = "0.4"
 env_logger = "0.11"
 
-icrc-ledger-agent = { git = "https://github.com/dfinity/ic", tag="release-2025-04-11_13-20-base" }
-once_cell = "1.21.3"
+lending = { path = "../liquidium-icp-pools/liquidium-pools/canisters/lending" }
+lending-utils = { path = "../liquidium-icp-pools/liquidium-pools/shared", package = "shared" }
 
+
+icrc-ledger-agent = { git = "https://github.com/dfinity/ic", tag = "release-2025-04-11_13-20-base" }
+once_cell = "1.21.3"

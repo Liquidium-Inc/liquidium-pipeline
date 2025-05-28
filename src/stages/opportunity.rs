@@ -1,10 +1,11 @@
 use std::sync::Arc;
 
 use crate::stage::PipelineStage;
-use crate::types::*;
 use async_trait::async_trait;
 use candid::{Decode, Encode, Nat, Principal};
 use ic_agent::Agent;
+use lending::liquidation::liquidation::LiquidateblePosition;
+use lending_utils::types::pool::AssetType;
 
 pub struct OpportunityFinder {
     pub agent: Arc<Agent>,
@@ -18,8 +19,8 @@ impl OpportunityFinder {
 }
 
 #[async_trait]
-impl PipelineStage<(), Vec<LiquidationOpportunity>> for OpportunityFinder {
-    async fn process(&self, _: ()) -> Result<Vec<LiquidationOpportunity>, String> {
+impl PipelineStage<Vec<String>, Vec<LiquidateblePosition>> for OpportunityFinder {
+    async fn process(&self, supported_assets: Vec<String>) -> Result<Vec<LiquidateblePosition>, String> {
         // Configure pagination
         let offset: u64 = 0;
         let limit: u64 = 100;
@@ -37,17 +38,19 @@ impl PipelineStage<(), Vec<LiquidationOpportunity>> for OpportunityFinder {
             .map_err(|e| format!("Agent query error: {e}"))?;
 
         // Decode candid response
-        // Adjust the type below to match your candid output!
-        let decoded: Vec<(Principal, Vec<LiquidationOpportunity>, Nat)> = Decode!(
-            &response,
-            Vec<(Principal, Vec<LiquidationOpportunity>, Nat)>
-        )
-        .map_err(|e| format!("Candid decode error: {e}"))?;
+        // Vec<(Borrower, Opportunities, Health)>
+        let decoded: Vec<(Principal, Vec<LiquidateblePosition>, Nat)> =
+            Decode!(&response, Vec<(Principal, Vec<LiquidateblePosition>, Nat)>)
+                .map_err(|e| format!("Candid decode error: {e}"))?;
 
-        // Flatten Vec<Vec<LiquidationOpportunity>>
+        // Flatten Vec<Vec<LiquidateblePosition>>
         let opportunities = decoded
             .into_iter()
             .flat_map(|(_principal, ops, _nat)| ops)
+            .filter(|item| matches!(item.asset_type, AssetType::CkAsset(_))) // Only liquidated ck asset collaterals
+            .filter(|item| {
+                supported_assets.contains(&item.asset.to_string()) // Filter out any unsupported assets
+            })
             .collect();
 
         Ok(opportunities)
