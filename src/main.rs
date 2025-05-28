@@ -1,57 +1,120 @@
+mod config;
+mod executors;
+mod icrc_token;
 mod stage;
 mod stages;
 mod types;
+mod utils;
 
-use std::env;
+use std::sync::Arc;
 
-use crate::stages::*;
-use crate::types::*;
-use candid::Principal;
+use config::Config;
+use executors::kong_swap::kong_swap::KongSwapExecutor;
 use ic_agent::Agent;
-use ic_agent::identity::BasicIdentity;
-use stage::PipelineStage;
-use stages::dex_swap::DexSwapExecutor;
+
+use log::info;
 use stages::liquidation::LiquidationExecutor;
 use stages::opportunity::OpportunityFinder;
-use tokio::time::{Duration, sleep};
+
+async fn init(
+    config: Arc<Config>,
+    agent: Arc<Agent>,
+) -> (OpportunityFinder, LiquidationExecutor, KongSwapExecutor) {
+    info!("Initializing swap stage...");
+    let mut swapper = KongSwapExecutor::new(agent.clone(), config.liquidator_principal);
+
+    // Pre approve tokens
+    swapper
+        .init(
+            config
+                .collateral_assets
+                .keys()
+                .map(|item| item.clone())
+                .collect(),
+        )
+        .await
+        .expect("could not pre approve tokens");
+
+    info!("Initializing find stage ...");
+    let finder = OpportunityFinder::new(agent.clone(), config.lending_canister);
+
+    info!("Initializing liquidations stage ...");
+    let executor = LiquidationExecutor::new(
+        agent.clone(),
+        config.lending_canister,
+        config.liquidator_principal,
+    );
+
+    (finder, executor, swapper)
+}
 
 #[tokio::main]
 async fn main() {
-    dotenv::dotenv().ok();
-    let ic_url = env::var("IC_URL").unwrap();
-    let pem_path = env::var("IDENTITY_PEM").unwrap();
-    let canister_id = env::var("CANISTER_ID").unwrap();
+    // Load our config
+    let config = Config::load().await.unwrap();
 
-    let identity = BasicIdentity::from_pem_file(pem_path).unwrap();
     let agent = Agent::builder()
-        .with_url(ic_url)
-        .with_identity(identity)
+        .with_url(config.ic_url.clone())
+        .with_identity(config.liquidator_identity.clone())
         .build()
-        .unwrap();
+        .expect("could not initialize client");
 
-    let finder = OpportunityFinder {
-        agent,
-        canister_id: Principal::from_text(canister_id).unwrap(),
-    };
-    let executor = LiquidationExecutor;
-    let swapper = DexSwapExecutor;
+    let agent = Arc::new(agent);
 
-    loop {
-        println!("Polling for opportunities...");
-        let opportunities = finder.process(()).await.unwrap_or_default();
+    let (finder, executor, swapper) = init(config.clone(), agent.clone()).await;
 
-        // Iterate over all opportunities and execute them
-        for opp in opportunities {
-            if let Ok(receipt) = executor.process(opp.clone()).await {
-                if let Ok(swap) = swapper.process(receipt.clone()).await {
-                    println!(
-                        "Liquidation: loan={} swapped {} -> {} (amt={})",
-                        opp.debt_pool_id, opp.debt_asset, swap.received_asset, swap.received_amount
-                    );
-                }
-            }
-        }
+    // let token_in = IcrcToken::from_principal(
+    //     Principal::from_text("cngnf-vqaaa-aaaar-qag4q-cai").unwrap(),
+    //     agent.clone(),
+    // )
+    // .await;
 
-        sleep(Duration::from_secs(15)).await;
-    }
+    // let token_out = IcrcToken::from_principal(
+    //     Principal::from_text("ryjl3-tyaaa-aaaaa-aaaba-cai").unwrap(),
+    //     agent.clone(),
+    // )
+    // .await;
+
+    // let amount = IcrcTokenAmount::from_formatted(token_in.clone(), 1.0);
+    // let swap_info = swapper
+    //     .get_swap_info(token_in, token_out, amount.clone())
+    //     .await
+    //     .expect("failed to get swap info");
+
+    // info!("Got swap info {:#?}", swap_info);
+
+    // let swap_result = swapper
+    //     .swap(SwapArgs {
+    //         pay_token: swap_info.pay_symbol,
+    //         pay_amount: amount.value,
+    //         pay_tx_id: None,
+    //         receive_token: swap_info.receive_symbol,
+    //         receive_amount: None,
+    //         receive_address: None,
+    //         max_slippage: Some(swap_info.slippage),
+    //         referred_by: None,
+    //     })
+    //     .await
+    //     .expect("swap failed");
+
+    // info!("Executed swap {:?}", swap_result);
+    // todo!()
+
+    // loop {
+    //     info!("Polling for opportunities...");
+    //     let opportunities = finder.process(()).await.unwrap_or_default();
+
+    //     for opp in opportunities {
+    //         if let Ok(receipt) = executor.process(opp.clone()).await {
+    //             if let Ok(swap) = swapper.process(receipt.clone()).await {
+    //                 info!(
+    //                     "Liquidation: loan={} swapped {} -> {} (amt={})",
+    //                     opp.debt_pool_id, opp.debt_asset, swap.received_asset, swap.received_amount
+    //                 );
+    //             }
+    //         }
+    //     }
+
+    //     sleep(Duration::from_secs(15)).await;
+    // }
 }

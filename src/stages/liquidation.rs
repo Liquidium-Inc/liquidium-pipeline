@@ -1,14 +1,17 @@
+use std::sync::Arc;
+
 use crate::stage::PipelineStage;
 use crate::types::*;
 use async_trait::async_trait;
 use candid::{CandidType, Decode, Encode, Nat, Principal};
 use ic_agent::Agent;
-use serde::{Deserialize, Serialize};
 use num_traits::ToPrimitive;
+use serde::{Deserialize, Serialize};
+
 pub struct LiquidationExecutor {
-    agent: Agent,
-    canister_id: Principal,
-    liquidator_principal: Principal,
+    pub agent: Arc<Agent>,
+    pub canister_id: Principal,
+    pub liquidator_principal: Principal,
 }
 
 #[derive(Debug, CandidType, Serialize, Deserialize, Clone)]
@@ -24,6 +27,16 @@ pub struct LiquidationResult {
     pub collateral_received: Nat, // Amount of collateral received by liquidator
     pub debt_repaid: Nat,         // Amount of debt repaid
     pub bonus_earned: Nat,        // Value of bonus earned (in debt asset)
+}
+
+impl LiquidationExecutor {
+    pub fn new(agent: Arc<Agent>, canister_id: Principal, liquidator_principal: Principal) -> Self {
+        Self {
+            agent,
+            canister_id,
+            liquidator_principal,
+        }
+    }
 }
 
 #[async_trait]

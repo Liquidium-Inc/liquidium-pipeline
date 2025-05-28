@@ -1,11 +1,13 @@
-use crate::stage::PipelineStage;
-use crate::types::*;
 use async_trait::async_trait;
 
-pub struct DexSwapExecutor;
+use crate::{
+    executors::kong_swap::kong_swap::KongSwapExecutor,
+    stage::PipelineStage,
+    types::{ExecutionReceipt, SwapResult},
+};
 
 #[async_trait]
-impl PipelineStage<ExecutionReceipt, SwapResult> for DexSwapExecutor {
+impl PipelineStage<ExecutionReceipt, SwapResult> for KongSwapExecutor {
     async fn process(&self, receipt: ExecutionReceipt) -> Result<SwapResult, String> {
         // TODO: Swap via DEX
         Ok(SwapResult {

@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use crate::stage::PipelineStage;
 use crate::types::*;
 use async_trait::async_trait;
@@ -5,8 +7,14 @@ use candid::{Decode, Encode, Nat, Principal};
 use ic_agent::Agent;
 
 pub struct OpportunityFinder {
-    pub agent: Agent,
+    pub agent: Arc<Agent>,
     pub canister_id: Principal,
+}
+
+impl OpportunityFinder {
+    pub fn new(agent: Arc<Agent>, canister_id: Principal) -> Self {
+        Self { agent, canister_id }
+    }
 }
 
 #[async_trait]
