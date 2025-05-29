@@ -1,6 +1,8 @@
+mod calculations;
 mod config;
 mod executors;
 mod icrc_token;
+mod pipeline_agent;
 mod stage;
 mod stages;
 mod types;
@@ -8,6 +10,7 @@ mod utils;
 
 use std::sync::Arc;
 
+use calculations::collateral_service::{CollateralService};
 use config::Config;
 use executors::kong_swap::kong_swap::KongSwapExecutor;
 use ic_agent::Agent;
@@ -20,9 +23,9 @@ async fn init(
     config: Arc<Config>,
     agent: Arc<Agent>,
 ) -> (
-    OpportunityFinder,
-    IcrcLiquidationStrategy<KongSwapExecutor>,
-    Arc<KongSwapExecutor>,
+    OpportunityFinder<Agent>,
+    IcrcLiquidationStrategy<KongSwapExecutor<Agent>, Config, CollateralService>,
+    Arc<KongSwapExecutor<Agent>>,
 ) {
     info!("Initializing swap stage...");
     let mut swapper = KongSwapExecutor::new(agent.clone(), config.clone());
@@ -45,7 +48,9 @@ async fn init(
     let finder = OpportunityFinder::new(agent.clone(), config.lending_canister);
 
     info!("Initializing liquidations stage ...");
-    let executor = IcrcLiquidationStrategy::new(config.clone(), swapper.clone());
+    let collateral_service = Arc::new(CollateralService::default());
+    let executor =
+        IcrcLiquidationStrategy::new(config.clone(), swapper.clone(), collateral_service);
 
     (finder, executor, swapper)
 }

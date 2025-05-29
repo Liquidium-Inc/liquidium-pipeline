@@ -2,7 +2,6 @@ use std::{collections::HashMap, str::FromStr, sync::Arc, u128::MAX};
 
 use async_trait::async_trait;
 use candid::{Decode, Encode, Nat, Principal, encode_args};
-use ic_agent::Agent;
 use icrc_ledger_types::{
     icrc1::account::Account,
     icrc2::{
@@ -16,22 +15,23 @@ use crate::{
     config::Config,
     executors::executor::IcrcSwapExecutor,
     icrc_token::{icrc_token::IcrcToken, icrc_token_amount::IcrcTokenAmount},
+    pipeline_agent::PipelineAgent,
 };
 
 use super::types::{SwapAmountsReply, SwapArgs, SwapReply};
 
 static DEX_PRINCIPAL: &str = "2ipq2-uqaaa-aaaar-qailq-cai";
 
-pub struct KongSwapExecutor {
-    pub agent: Arc<Agent>,
+pub struct KongSwapExecutor<A: PipelineAgent> {
+    pub agent: Arc<A>,
     pub config: Arc<Config>,
     pub account_id: Account,
     pub dex_account: Account,
     pub allowances: HashMap<Principal, Nat>,
 }
 
-impl KongSwapExecutor {
-    pub fn new(agent: Arc<Agent>, config: Arc<Config>) -> Self {
+impl<A: PipelineAgent> KongSwapExecutor<A> {
+    pub fn new(agent: Arc<A>, config: Arc<Config>) -> Self {
         Self {
             agent,
             account_id: Account {
@@ -75,7 +75,7 @@ impl KongSwapExecutor {
 }
 
 #[async_trait]
-impl IcrcSwapExecutor for KongSwapExecutor {
+impl<A: PipelineAgent> IcrcSwapExecutor for KongSwapExecutor<A> {
     async fn get_swap_info(
         &self,
         token_in: &IcrcToken,
@@ -91,8 +91,9 @@ impl IcrcSwapExecutor for KongSwapExecutor {
 
         let result = self
             .agent
-            .query(&dex_principal, "swap_amounts")
-            .with_arg(
+            .call_query(
+                &dex_principal,
+                "swap_amounts",
                 encode_args((
                     token_in.symbol.clone(),
                     amount.value.clone(),
@@ -111,8 +112,7 @@ impl IcrcSwapExecutor for KongSwapExecutor {
         let dex_principal = Principal::from_str(DEX_PRINCIPAL).unwrap();
         let result = self
             .agent
-            .update(&dex_principal, "swap")
-            .with_arg(swap_args)
+            .call_update(&dex_principal, "swap", Encode!(&swap_args).unwrap())
             .await
             .map_err(|e| format!("Swap call error: {}", e))?;
 
@@ -121,7 +121,7 @@ impl IcrcSwapExecutor for KongSwapExecutor {
     }
 }
 
-impl KongSwapExecutor {
+impl<A: PipelineAgent> KongSwapExecutor<A> {
     async fn approve(&self, ledger: &Principal) -> Result<Nat, String> {
         let args = ApproveArgs {
             from_subaccount: None,
@@ -133,13 +133,12 @@ impl KongSwapExecutor {
             memo: None,
             created_at_time: None,
         };
-        let blob = Encode!(&args).map_err(|e| format!("Encode error: {}", e))?;
+        let args = Encode!(&args).map_err(|e| format!("Encode error: {}", e))?;
 
         info!("Approving {} on spender {}", ledger, self.dex_account.owner);
         let result = self
             .agent
-            .update(ledger, "icrc2_approve")
-            .with_arg(blob)
+            .call_update(ledger, "icrc2_approve", args)
             .await
             .map_err(|e| format!("Approve call error: {}", e))?;
 
@@ -157,8 +156,7 @@ impl KongSwapExecutor {
 
         let result = self
             .agent
-            .query(ledger, "icrc2_allowance")
-            .with_arg(blob)
+            .call_query(ledger, "icrc2_allowance", blob)
             .await
             .expect("could not fetch allowance");
 

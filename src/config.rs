@@ -18,6 +18,22 @@ pub struct Config {
     pub lending_canister: Principal,
 }
 
+#[cfg_attr(test, mockall::automock)]
+pub trait ConfigTrait: Send + Sync {
+    fn get_collateral_assets(&self) -> HashMap<Principal, IcrcToken>;
+    fn get_debt_assets(&self) -> HashMap<Principal, IcrcToken>;
+}
+
+impl ConfigTrait for Config {
+    fn get_collateral_assets(&self) -> HashMap<Principal, IcrcToken> {
+        self.collateral_assets.clone()
+    }
+
+    fn get_debt_assets(&self) -> HashMap<Principal, IcrcToken> {
+        self.debt_assets.clone()
+    }
+}
+
 impl Config {
     pub async fn load() -> Result<Arc<Self>, String> {
         dotenv::dotenv().ok();

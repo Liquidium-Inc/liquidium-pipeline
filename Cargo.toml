@@ -3,6 +3,9 @@ name = "liquidium-pipeline"
 version = "0.1.0"
 edition = "2024"
 
+[lib]
+crate-type = ["lib"]
+
 [dependencies]
 tokio = { version = "1.38", features = ["full"] }
 ic-agent = "0.39.3"
@@ -21,6 +24,11 @@ env_logger = "0.11"
 lending = { path = "../liquidium-icp-pools/liquidium-pools/canisters/lending" }
 lending-utils = { path = "../liquidium-icp-pools/liquidium-pools/shared", package = "shared" }
 
-
 icrc-ledger-agent = { git = "https://github.com/dfinity/ic", tag = "release-2025-04-11_13-20-base" }
 once_cell = "1.21.3"
+
+[dev-dependencies]
+mockall = "0.13.1"
+ic_principal = { version = "0.1.1", features = ["arbitrary"] }
+arbitrary = "1.4.1"
+

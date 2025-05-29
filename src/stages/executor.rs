@@ -8,12 +8,13 @@ use crate::{
         executor::{ExecutorRequest, IcrcSwapExecutor},
         kong_swap::kong_swap::KongSwapExecutor,
     },
+    pipeline_agent::PipelineAgent,
     stage::PipelineStage,
     types::SwapResult,
 };
 
 #[async_trait]
-impl PipelineStage<ExecutorRequest, SwapResult> for KongSwapExecutor {
+impl<A: PipelineAgent> PipelineStage<ExecutorRequest, SwapResult> for KongSwapExecutor<A> {
     async fn process(&self, executor_request: ExecutorRequest) -> Result<SwapResult, String> {
         let args = Encode!(
             &self.config.liquidator_principal,
@@ -24,9 +25,7 @@ impl PipelineStage<ExecutorRequest, SwapResult> for KongSwapExecutor {
         // Make the update call to the canister
         let response = self
             .agent
-            .update(&self.config.lending_canister, "liquidate")
-            .with_arg(args)
-            .call_and_wait()
+            .call_update(&self.config.lending_canister, "liquidate", args)
             .await
             .map_err(|e| format!("Agent update error: {e}"))?;
 
