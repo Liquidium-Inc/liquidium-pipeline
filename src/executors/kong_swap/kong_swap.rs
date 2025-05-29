@@ -24,26 +24,23 @@ static DEX_PRINCIPAL: &str = "2ipq2-uqaaa-aaaar-qailq-cai";
 
 pub struct KongSwapExecutor<A: PipelineAgent> {
     pub agent: Arc<A>,
-    pub config: Arc<Config>,
     pub account_id: Account,
+    pub lending_canister: Principal,
     pub dex_account: Account,
     pub allowances: HashMap<Principal, Nat>,
 }
 
 impl<A: PipelineAgent> KongSwapExecutor<A> {
-    pub fn new(agent: Arc<A>, config: Arc<Config>) -> Self {
+    pub fn new(agent: Arc<A>, account_id: Account, lending_canister: Principal) -> Self {
         Self {
             agent,
-            account_id: Account {
-                owner: config.liquidator_principal,
-                subaccount: None,
-            },
+            account_id,
+            lending_canister,
             dex_account: Account {
                 owner: DEX_PRINCIPAL.parse().unwrap(),
                 subaccount: None,
             },
             allowances: HashMap::new(),
-            config,
         }
     }
 

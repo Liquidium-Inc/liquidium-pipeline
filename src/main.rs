@@ -10,11 +10,12 @@ mod utils;
 
 use std::sync::Arc;
 
-use calculations::collateral_service::{CollateralService};
+use calculations::collateral_service::CollateralService;
 use config::Config;
 use executors::kong_swap::kong_swap::KongSwapExecutor;
 use ic_agent::Agent;
 
+use icrc_ledger_types::icrc1::account::Account;
 use log::info;
 use stages::opportunity::OpportunityFinder;
 use stages::simple_strategy::IcrcLiquidationStrategy;
@@ -28,7 +29,14 @@ async fn init(
     Arc<KongSwapExecutor<Agent>>,
 ) {
     info!("Initializing swap stage...");
-    let mut swapper = KongSwapExecutor::new(agent.clone(), config.clone());
+    let mut swapper = KongSwapExecutor::new(
+        agent.clone(),
+        Account {
+            owner: config.liquidator_principal.clone(),
+            subaccount: None,
+        },
+        config.lending_canister.clone(),
+    );
 
     // Pre approve tokens
     swapper
