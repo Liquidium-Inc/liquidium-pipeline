@@ -13,7 +13,7 @@ pub struct ExecutorRequest {
 
 #[cfg_attr(test, mockall::automock)]
 #[async_trait]
-pub trait IcrcSwapExecutor {
+pub trait IcrcSwapExecutor: Send + Sync {
     async fn get_swap_info(
         &self,
         token_in: &IcrcToken,

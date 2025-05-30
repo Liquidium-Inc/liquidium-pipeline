@@ -22,6 +22,7 @@ pub struct Config {
 pub trait ConfigTrait: Send + Sync {
     fn get_collateral_assets(&self) -> HashMap<Principal, IcrcToken>;
     fn get_debt_assets(&self) -> HashMap<Principal, IcrcToken>;
+    fn get_liquidator_principal(&self) -> Principal;
 }
 
 impl ConfigTrait for Config {
@@ -31,6 +32,9 @@ impl ConfigTrait for Config {
 
     fn get_debt_assets(&self) -> HashMap<Principal, IcrcToken> {
         self.debt_assets.clone()
+    }
+    fn get_liquidator_principal(&self) -> Principal {
+        self.liquidator_principal.clone()
     }
 }
 
@@ -45,9 +49,7 @@ impl Config {
         // Load the liquidator identity
         let pem_path = env::var("IDENTITY_PEM").unwrap();
         let identity = create_identity_from_pem_file(&pem_path).expect("could not create identity");
-        let liquidator_principal = identity
-            .sender()
-            .expect("could not decode liquidator principal");
+        let liquidator_principal = identity.sender().expect("could not decode liquidator principal");
 
         info!("Using identity {}", liquidator_principal);
 
@@ -70,12 +72,7 @@ impl Config {
 
 async fn load_asset_maps() -> (HashMap<Principal, IcrcToken>, HashMap<Principal, IcrcToken>) {
     let ic_url = env::var("IC_URL").unwrap();
-    let agent = Arc::new(
-        Agent::builder()
-            .with_url(ic_url.clone())
-            .build()
-            .expect("could not initialize client"),
-    );
+    let agent = Arc::new(Agent::builder().with_url(ic_url.clone()).build().expect("could not initialize client"));
     let mut debt = HashMap::new();
     for p in parse_principals("DEBT_ASSETS") {
         let token = IcrcToken::from_principal(p.0.clone(), agent.clone()).await;

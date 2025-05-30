@@ -12,7 +12,6 @@ use icrc_ledger_types::{
 use log::{debug, info, warn};
 
 use crate::{
-    config::Config,
     executors::executor::IcrcSwapExecutor,
     icrc_token::{icrc_token::IcrcToken, icrc_token_amount::IcrcTokenAmount},
     pipeline_agent::PipelineAgent,

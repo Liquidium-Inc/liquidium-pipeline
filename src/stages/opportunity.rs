@@ -3,9 +3,9 @@ use std::sync::Arc;
 use crate::pipeline_agent::PipelineAgent;
 use crate::stage::PipelineStage;
 use async_trait::async_trait;
-use candid::{Decode, Encode, Nat, Principal};
+use candid::{Decode, Encode, Principal};
 
-use lending::liquidation::liquidation::LiquidateblePosition;
+use lending::liquidation::liquidation::LiquidatebleUser;
 use lending_utils::types::pool::AssetType;
 pub struct OpportunityFinder<A: PipelineAgent> {
     pub agent: Arc<A>,
@@ -19,14 +19,11 @@ impl<A: PipelineAgent> OpportunityFinder<A> {
 }
 
 #[async_trait]
-impl<A> PipelineStage<Vec<String>, Vec<LiquidateblePosition>> for OpportunityFinder<A>
+impl<A> PipelineStage<Vec<String>, Vec<LiquidatebleUser>> for OpportunityFinder<A>
 where
     A: PipelineAgent,
 {
-    async fn process(
-        &self,
-        supported_assets: Vec<String>,
-    ) -> Result<Vec<LiquidateblePosition>, String> {
+    async fn process(&self, supported_assets: Vec<String>) -> Result<Vec<LiquidatebleUser>, String> {
         // Configure pagination
         let offset: u64 = 0;
         let limit: u64 = 100;
@@ -42,21 +39,21 @@ where
             .map_err(|e| format!("Agent query error: {e}"))?;
 
         // Decode candid response
-        // Vec<(Borrower, Opportunities, Health)>
-        let decoded: Vec<(Principal, Vec<LiquidateblePosition>, Nat)> =
-            Decode!(&response, Vec<(Principal, Vec<LiquidateblePosition>, Nat)>)
-                .map_err(|e| format!("Candid decode error: {e}"))?;
+        let mut opportunities: Vec<LiquidatebleUser> = Decode!(&response, Vec<LiquidatebleUser>).map_err(|e| format!("Candid decode error: {e}"))?;
 
-        // Flatten Vec<Vec<LiquidateblePosition>>
-        let opportunities = decoded
-            .into_iter()
-            .flat_map(|(_principal, ops, health_factor)| (ops))
-            .filter(|item| matches!(item.asset_type, AssetType::CkAsset(_))) // Only liquidated ck asset collaterals
-            .filter(|item| {
-                supported_assets.contains(&item.asset.to_string()) // Filter out any unsupported assets
-            })
-            .collect();
+        opportunities.iter_mut().for_each(|user| {
+            user.positions = user
+                .positions
+                .iter()
+                .filter(|item| matches!(item.asset_type, AssetType::CkAsset(_))) // Only liquidated ck asset collaterals
+                .filter(|item| {
+                    supported_assets.contains(&item.asset.to_string()) // Filter out any unsupported assets
+                })
+                .cloned()
+                .collect();
+        });
 
+        let opportunities: Vec<LiquidatebleUser> = opportunities.iter().filter(|item| item.positions.len() > 0).cloned().collect();
         Ok(opportunities)
     }
 }
@@ -67,6 +64,7 @@ mod tests {
     use crate::pipeline_agent::MockPipelineAgent;
     use crate::stage::PipelineStage;
     use candid::{Encode, Nat, Principal};
+    use lending::liquidation::liquidation::LiquidateblePosition;
     use lending_utils::types::{assets::Assets, pool::AssetType};
     use std::sync::Arc;
 
@@ -82,6 +80,7 @@ mod tests {
             asset: Assets::BTC,
             asset_type: AssetType::CkAsset(Principal::anonymous()),
             account: Principal::anonymous(),
+            liquidation_bonus: Nat::from(60u8),
         };
 
         let pos_ckusdc = LiquidateblePosition {
@@ -96,39 +95,40 @@ mod tests {
             ..pos_ckbtc.clone()
         };
 
-        let positions = vec![
-            (
-                Principal::anonymous(),
-                vec![pos_ckbtc.clone()],
-                Nat::from(1u64),
-            ),
-            (
-                Principal::anonymous(),
-                vec![pos_ckusdc.clone()],
-                Nat::from(2u64),
-            ),
-            (
-                Principal::anonymous(),
-                vec![pos_sol.clone()],
-                Nat::from(3u64),
-            ),
+        let users = vec![
+            LiquidatebleUser {
+                account: Principal::anonymous(),
+                health_factor: Nat::from(1u64),
+                total_debt: Nat::from(1000u64),
+                positions: vec![pos_ckbtc.clone()],
+            },
+            LiquidatebleUser {
+                account: Principal::anonymous(),
+                health_factor: Nat::from(1u64),
+                total_debt: Nat::from(1000u64),
+                positions: vec![pos_ckusdc.clone()],
+            },
+            LiquidatebleUser {
+                account: Principal::anonymous(),
+                health_factor: Nat::from(1u64),
+                total_debt: Nat::from(1000u64),
+                positions: vec![pos_sol.clone()],
+            },
         ];
 
-        let encoded_response = Encode!(&positions).unwrap();
+        let encoded_response = Encode!(&users).unwrap();
 
-        mock.expect_call_query()
-            .returning(move |_, _, _| Ok(encoded_response.clone()));
+        mock.expect_call_query().returning(move |_, _, _| Ok(encoded_response.clone()));
 
         let finder = OpportunityFinder::new(Arc::new(mock), canister_id);
-        let result = finder
-            .process(vec!["BTC".to_string(), "USDC".to_string()])
-            .await
-            .unwrap();
+        let result = finder.process(vec!["BTC".to_string(), "USDC".to_string()]).await.unwrap();
 
-        // SOL is excluded (unsupported + Unknown type)
+        // Only BTC and USDC should remain
         assert_eq!(result.len(), 2);
-        assert!(result.contains(&pos_ckbtc));
-        assert!(result.contains(&pos_ckusdc));
-        assert!(!result.contains(&pos_sol));
+
+        let all_positions: Vec<_> = result.iter().flat_map(|u| u.positions.iter()).collect();
+        assert!(all_positions.contains(&&pos_ckbtc));
+        assert!(all_positions.contains(&&pos_ckusdc));
+        assert!(!all_positions.iter().any(|p| p.asset == Assets::SOL));
     }
 }
