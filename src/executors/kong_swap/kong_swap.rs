@@ -1,12 +1,12 @@
 use std::{collections::HashMap, str::FromStr, sync::Arc, u128::MAX};
 
 use async_trait::async_trait;
-use candid::{Decode, Encode, Nat, Principal, encode_args};
+use candid::{Encode, Nat, Principal, encode_args};
 use icrc_ledger_types::{
     icrc1::account::Account,
     icrc2::{
         allowance::{Allowance, AllowanceArgs},
-        approve::{ApproveArgs, ApproveError},
+        approve::ApproveArgs,
     },
 };
 use log::{debug, info, warn};
@@ -87,33 +87,26 @@ impl<A: PipelineAgent> IcrcSwapExecutor for KongSwapExecutor<A> {
 
         let result = self
             .agent
-            .call_query(
+            .call_query::<SwapAmountsReply>(
                 &dex_principal,
                 "swap_amounts",
-                encode_args((
-                    token_in.symbol.clone(),
-                    amount.value.clone(),
-                    token_out.symbol.clone(),
-                ))
-                .unwrap(),
+                encode_args((token_in.symbol.clone(), amount.value.clone(), token_out.symbol.clone())).unwrap(),
             )
             .await
             .map_err(|e| format!("Swap call error: {}", e))?;
 
-        Decode!(result.as_slice(), Result<SwapAmountsReply, String>)
-            .map_err(|e| format!("Candid decode error: {}", e))?
+        Ok(result)
     }
 
     async fn swap(&self, swap_args: SwapArgs) -> Result<SwapReply, String> {
         let dex_principal = Principal::from_str(DEX_PRINCIPAL).unwrap();
         let result = self
             .agent
-            .call_update(&dex_principal, "swap", Encode!(&swap_args).unwrap())
+            .call_update::<SwapReply>(&dex_principal, "swap", Encode!(&swap_args).unwrap())
             .await
             .map_err(|e| format!("Swap call error: {}", e))?;
 
-        Decode!(result.as_slice(), Result<SwapReply, String>)
-            .map_err(|e| format!("Candid decode error: {}", e))?
+        Ok(result)
     }
 }
 
@@ -134,13 +127,11 @@ impl<A: PipelineAgent> KongSwapExecutor<A> {
         info!("Approving {} on spender {}", ledger, self.dex_account.owner);
         let result = self
             .agent
-            .call_update(ledger, "icrc2_approve", args)
+            .call_update::<Nat>(ledger, "icrc2_approve", args)
             .await
             .map_err(|e| format!("Approve call error: {}", e))?;
 
-        Decode!(result.as_slice(), Result<Nat, ApproveError>)
-            .expect("could not decode approve result")
-            .map_err(|e| format!("Approve decode error: {}", e))
+        Ok(result)
     }
 
     async fn allowance(&self, ledger: &Principal) -> Nat {
@@ -152,17 +143,15 @@ impl<A: PipelineAgent> KongSwapExecutor<A> {
 
         let result = self
             .agent
-            .call_query(ledger, "icrc2_allowance", blob)
+            .call_query::<Allowance>(ledger, "icrc2_allowance", blob)
             .await
             .expect("could not fetch allowance");
 
-        let allowance =
-            Decode!(result.as_slice(), Allowance).expect("could not decode allowance result");
-
         info!(
             "Allowance for {} on {} = {}",
-            ledger, self.dex_account.owner, allowance.allowance
+            ledger, self.dex_account.owner, result.allowance
         );
-        allowance.allowance
+
+        result.allowance
     }
 }

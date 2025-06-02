@@ -5,7 +5,7 @@ pub mod account {
     };
 
     use async_trait::async_trait;
-    use candid::{Decode, Encode, Nat, Principal};
+    use candid::{Encode, Nat, Principal};
 
     use crate::pipeline_agent::PipelineAgent;
 
@@ -37,8 +37,11 @@ pub mod account {
         A: PipelineAgent,
     {
         async fn get_balance(&self, ledger_id: Principal, account: Principal) -> Result<Nat, String> {
-            let balance = self.agent.call_query(&ledger_id, "icrc1_balance_of", Encode!(&account).unwrap()).await?;
-            Decode!(&balance, Nat).map_err(|e| e.to_string())
+            let balance = self
+                .agent
+                .call_query::<Nat>(&ledger_id, "icrc1_balance_of", Encode!(&account).unwrap())
+                .await?;
+            Ok(balance)
         }
 
         async fn sync_balance(&self, ledger_id: Principal, account: Principal) -> Result<(), String> {

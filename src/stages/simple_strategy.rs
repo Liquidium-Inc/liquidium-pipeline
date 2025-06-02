@@ -14,7 +14,6 @@ use candid::{Int, Nat, Principal};
 use lending::interface::liquidation::LiquidationRequest;
 use lending::liquidation::liquidation::LiquidatebleUser;
 use lending_utils::types::pool::AssetType;
-use log::{debug, log};
 
 pub struct IcrcLiquidationStrategy<T, C, U, W>
 where

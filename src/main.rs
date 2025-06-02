@@ -11,6 +11,8 @@ mod types;
 mod utils;
 
 use std::sync::Arc;
+use std::thread::sleep;
+use std::time::Duration;
 
 use account::account::{IcrcAccountInfo, LiquidatorAccount};
 use candid::Principal;
@@ -20,8 +22,9 @@ use ic_agent::Agent;
 use liquidation::collateral_service::CollateralService;
 
 use icrc_ledger_types::icrc1::account::Account;
-use log::info;
+use log::{error, info, warn};
 use price_oracle::price_oracle::LiquidationPriceOracle;
+use stage::PipelineStage;
 use stages::opportunity::OpportunityFinder;
 use stages::simple_strategy::IcrcLiquidationStrategy;
 
@@ -30,7 +33,12 @@ async fn init(
     agent: Arc<Agent>,
 ) -> (
     OpportunityFinder<Agent>,
-    IcrcLiquidationStrategy<KongSwapExecutor<Agent>, Config, CollateralService<LiquidationPriceOracle<Agent>>, LiquidatorAccount<Agent>>,
+    IcrcLiquidationStrategy<
+        KongSwapExecutor<Agent>,
+        Config,
+        CollateralService<LiquidationPriceOracle<Agent>>,
+        LiquidatorAccount<Agent>,
+    >,
     Arc<KongSwapExecutor<Agent>>,
     Arc<LiquidatorAccount<Agent>>,
 ) {
@@ -56,7 +64,7 @@ async fn init(
         .await
         .expect("could not pre approve tokens");
 
-    let swapper = Arc::new(swapper);
+    let executor = Arc::new(swapper);
 
     info!("Initializing find stage ...");
     let finder = OpportunityFinder::new(agent.clone(), config.lending_canister.clone());
@@ -66,51 +74,75 @@ async fn init(
 
     let collateral_service = Arc::new(CollateralService::new(price_oracle));
     let icrc_account_service = Arc::new(LiquidatorAccount::new(agent.clone()));
-    let executor = IcrcLiquidationStrategy::new(config.clone(), swapper.clone(), collateral_service.clone(), icrc_account_service.clone());
+    let strategy = IcrcLiquidationStrategy::new(
+        config.clone(),
+        executor.clone(),
+        collateral_service.clone(),
+        icrc_account_service.clone(),
+    );
 
-    (finder, executor, swapper, icrc_account_service)
+    (finder, strategy, executor, icrc_account_service)
 }
 
 #[tokio::main]
 async fn main() {
-    // Load our config
-    let config = Config::load().await.unwrap();
+    // === Load Config ===
+    let config = Config::load().await.expect("Failed to load config");
+    info!("Config loaded for network: {}", config.ic_url);
 
+    // === Initialize IC Agent ===
     let agent = Agent::builder()
         .with_url(config.ic_url.clone())
         .with_identity(config.liquidator_identity.clone())
         .build()
-        .expect("could not initialize client");
-
+        .expect("Failed to initialize IC agent");
     let agent = Arc::new(agent);
+    info!("Agent initialized with principal: {}", config.liquidator_principal);
 
-    let (finder, executor, swapper, account_service) = init(config.clone(), agent.clone()).await;
+    // === Initialize components ===
+    let (finder, strategy, executor, account_service) = init(config.clone(), agent.clone()).await;
+    info!("Components initialized");
 
+    // === Sync balances for all debt assets ===
     let debt_assets = config.get_debt_assets().keys().cloned().collect::<Vec<String>>();
-    for asset in debt_assets {
-        let asset = Principal::from_text(asset).unwrap();
+    for asset in &debt_assets {
+        let principal = Principal::from_text(asset).unwrap_or_else(|_| panic!("Invalid asset principal: {asset}"));
+
         account_service
-            .sync_balance(asset, config.liquidator_principal)
+            .sync_balance(principal, config.liquidator_principal)
             .await
-            .expect("could not sync balance")
+            .expect("Failed to sync balance");
+        info!("Balance synced for asset {}", asset);
     }
-    // todo!()
 
-    // loop {
-    //     info!("Polling for opportunities...");
-    //     let opportunities = finder.process(()).await.unwrap_or_default();
+    // === Main Loop ===
+    loop {
+        info!("Polling for liquidation opportunities...");
 
-    //     for opp in opportunities {
-    //         if let Ok(receipt) = executor.process(opp.clone()).await {
-    //             if let Ok(swap) = swapper.process(receipt.clone()).await {
-    //                 info!(
-    //                     "Liquidation: loan={} swapped {} -> {} (amt={})",
-    //                     opp.debt_pool_id, opp.debt_asset, swap.received_asset, swap.received_amount
-    //                 );
-    //             }
-    //         }
-    //     }
+        let opportunities = finder.process(debt_assets.clone()).await.unwrap_or_else(|e| {
+            warn!("Failed to find opportunities: {e}");
+            vec![]
+        });
 
-    //     sleep(Duration::from_secs(15)).await;
-    // }
+        if opportunities.is_empty() {
+            info!("No opportunities found");
+            sleep(Duration::from_secs(2));
+            continue;
+        }
+
+        info!("Found {} opportunities", opportunities.len());
+
+        let executions = strategy.process(opportunities).await.unwrap_or_else(|e| {
+            error!("Strategy processing failed: {e}");
+            vec![]
+        });
+
+        let results = executor.process(executions).await.unwrap_or_else(|e| {
+            error!("Executor failed: {e}");
+            vec![]
+        });
+
+        info!("Completed {} executions", results.len());
+        sleep(Duration::from_secs(2));
+    }
 }

@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use candid::{Decode, Encode, Principal};
+use candid::{Encode, Principal};
 
 use crate::pipeline_agent::PipelineAgent;
 
@@ -20,7 +20,10 @@ where
     A: PipelineAgent,
 {
     pub fn new(agent: Arc<A>, lending_canister: Principal) -> Self {
-        Self { agent, lending_canister }
+        Self {
+            agent,
+            lending_canister,
+        }
     }
 }
 
@@ -37,6 +40,6 @@ impl<A: PipelineAgent> PriceOracle for LiquidationPriceOracle<A> {
             )
             .await?;
 
-        Decode!(&price, (u64, u32)).map_err(|e| e.to_string())
+        Ok(price)
     }
 }

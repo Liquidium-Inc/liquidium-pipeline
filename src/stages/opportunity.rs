@@ -3,7 +3,7 @@ use std::sync::Arc;
 use crate::pipeline_agent::PipelineAgent;
 use crate::stage::PipelineStage;
 use async_trait::async_trait;
-use candid::{Decode, Encode, Principal};
+use candid::{Encode, Principal};
 
 use lending::liquidation::liquidation::LiquidatebleUser;
 use lending_utils::types::pool::AssetType;
@@ -32,14 +32,11 @@ where
         let args = Encode!(&offset, &limit).map_err(|e| e.to_string())?;
 
         // Query canister
-        let response = self
+        let mut opportunities = self
             .agent
-            .call_query(&self.canister_id, "get_at_risk_positions", args)
+            .call_query::<Vec<LiquidatebleUser>>(&self.canister_id, "get_at_risk_positions", args)
             .await
             .map_err(|e| format!("Agent query error: {e}"))?;
-
-        // Decode candid response
-        let mut opportunities: Vec<LiquidatebleUser> = Decode!(&response, Vec<LiquidatebleUser>).map_err(|e| format!("Candid decode error: {e}"))?;
 
         opportunities.iter_mut().for_each(|user| {
             user.positions = user
@@ -53,7 +50,11 @@ where
                 .collect();
         });
 
-        let opportunities: Vec<LiquidatebleUser> = opportunities.iter().filter(|item| item.positions.len() > 0).cloned().collect();
+        let opportunities: Vec<LiquidatebleUser> = opportunities
+            .iter()
+            .filter(|item| item.positions.len() > 0)
+            .cloned()
+            .collect();
         Ok(opportunities)
     }
 }
@@ -116,12 +117,13 @@ mod tests {
             },
         ];
 
-        let encoded_response = Encode!(&users).unwrap();
-
-        mock.expect_call_query().returning(move |_, _, _| Ok(encoded_response.clone()));
+        mock.expect_call_query().returning(move |_, _, _| Ok(users.clone()));
 
         let finder = OpportunityFinder::new(Arc::new(mock), canister_id);
-        let result = finder.process(vec!["BTC".to_string(), "USDC".to_string()]).await.unwrap();
+        let result = finder
+            .process(vec!["BTC".to_string(), "USDC".to_string()])
+            .await
+            .unwrap();
 
         // Only BTC and USDC should remain
         assert_eq!(result.len(), 2);
