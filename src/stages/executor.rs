@@ -26,12 +26,14 @@ impl<A: PipelineAgent> PipelineStage<Vec<ExecutorRequest>, ()> for KongSwapExecu
                 .map_err(|e| format!("Agent update error: {e}"))?;
 
             // Decode the candid response
-            let result: Result<LiquidationResult, String> =
-                Decode!(&response, Result<LiquidationResult, String>).map_err(|e| format!("Candid decode error: {e}"))?;
+            let result: Result<LiquidationResult, String> = Decode!(&response, Result<LiquidationResult, String>)
+                .map_err(|e| format!("Candid decode error: {e}"))?;
 
             info!("Executed liquidation {:?}", result);
 
-            let _ = self.swap(executor_request.swap_args).await;
+            if executor_request.swap_args.is_some() {
+                let _ = self.swap(executor_request.swap_args.unwrap()).await;
+            }
         }
         // TODO: Log each execution
         Ok(())

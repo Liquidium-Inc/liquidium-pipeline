@@ -9,6 +9,7 @@ pub mod account {
 
     use crate::pipeline_agent::PipelineAgent;
 
+    #[cfg_attr(test, mockall::automock)]
     #[async_trait]
     pub trait IcrcAccountInfo: Send + Sync {
         async fn get_balance(&self, ledger_id: Principal, account: Principal) -> Result<Nat, String>;

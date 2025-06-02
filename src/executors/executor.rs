@@ -7,8 +7,10 @@ use super::kong_swap::types::{SwapAmountsReply, SwapArgs, SwapReply};
 
 #[derive(Debug)]
 pub struct ExecutorRequest {
+    // The liquidation request to figure out how much debt we repay
     pub liquidation: LiquidationRequest,
-    pub swap_args: SwapArgs,
+    // If the debt and collaterals assets are the same we don't need to swap
+    pub swap_args: Option<SwapArgs>,
 }
 
 #[cfg_attr(test, mockall::automock)]

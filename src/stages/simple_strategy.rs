@@ -14,6 +14,7 @@ use candid::{Int, Nat, Principal};
 use lending::interface::liquidation::LiquidationRequest;
 use lending::liquidation::liquidation::LiquidatebleUser;
 use lending_utils::types::pool::AssetType;
+use log::{debug, log};
 
 pub struct IcrcLiquidationStrategy<T, C, U, W>
 where
@@ -59,17 +60,24 @@ where
 
         // We need to keep track of available balances when preparing our liquidations
         for asset in self.config.get_debt_assets().keys() {
+            let asset = Principal::from_text(asset).unwrap();
             let balance = self
                 .account_service
-                .get_cached_balance(*asset, self.config.get_liquidator_principal())
+                .get_cached_balance(asset, self.config.get_liquidator_principal())
                 .ok_or("Could not get balance")?;
 
-            balances.insert(*asset, balance);
+            balances.insert(asset, balance);
         }
+
+        println!("Balance {:?}", balances);
 
         for user in users {
             // Find the largest debt position
-            let debt_position = user.positions.iter().max_by(|a, b| a.debt_amount.cmp(&b.debt_amount)).unwrap();
+            let debt_position = user
+                .positions
+                .iter()
+                .max_by(|a, b| a.debt_amount.cmp(&b.debt_amount))
+                .unwrap();
 
             // Find the largest collateral position
             let collateral_position = user
@@ -79,28 +87,36 @@ where
                 .unwrap();
 
             let debt_asset_principal = match debt_position.asset_type {
-                AssetType::CkAsset(principal) => Ok(principal),
-                _ => Err("invalid asset type"),
-            }
-            .unwrap();
+                AssetType::CkAsset(principal) => principal,
+                _ => return Err("invalid asset type".to_string()),
+            };
 
-            let collateral_asset_principal = match debt_position.asset_type {
-                AssetType::CkAsset(principal) => Ok(principal),
-                _ => Err("invalid asset type"),
-            }
-            .unwrap();
+            let collateral_asset_principal = match collateral_position.asset_type {
+                AssetType::CkAsset(principal) => principal,
+                _ => return Err("invalid asset type".to_string()),
+            };
+
+            println!(
+                "collateral asset principal {:?}",
+                collateral_asset_principal.to_string()
+            );
 
             let available_balance = if let Some(b) = balances.get_mut(&debt_asset_principal) {
                 b
             } else {
+                println!("Asset balance not found {:?}", debt_asset_principal.to_string());
                 continue;
             };
 
             let collateral_assets = self.config.get_collateral_assets();
-            let collateral_token = collateral_assets.get(&collateral_asset_principal).ok_or("invalid asset principal")?;
+            let collateral_token = collateral_assets
+                .get(&collateral_asset_principal.to_text())
+                .ok_or("invalid collateral asset principal")?;
 
             let debt_assets = self.config.get_debt_assets();
-            let repayment_token = debt_assets.get(&debt_asset_principal).ok_or("invalid asset principal")?;
+            let repayment_token = debt_assets
+                .get(&debt_asset_principal.to_text())
+                .ok_or("invalid debt asset principal")?;
 
             let max_balance = available_balance.clone() - repayment_token.fee.clone();
 
@@ -114,13 +130,33 @@ where
                 value: estimation.received_collateral,
             };
 
-            let swap_info = self
-                .executor
-                .get_swap_info(collateral_token, repayment_token, &amount_in)
-                .await
-                .expect("could not get swap info");
+            let (swap_args, amount_received) = if collateral_asset_principal == debt_asset_principal {
+                (None, amount_in.value)
+            } else {
+                let swap_info = self
+                    .executor
+                    .get_swap_info(collateral_token, repayment_token, &amount_in)
+                    .await
+                    .expect("could not get swap info");
+                (
+                    Some(SwapArgs {
+                        pay_token: collateral_token.symbol.clone(),
+                        pay_amount: amount_in.value,
+                        pay_tx_id: None,
+                        receive_token: swap_info.receive_symbol,
+                        receive_amount: Some(swap_info.receive_amount.clone()),
+                        receive_address: None,
+                        max_slippage: Some(swap_info.slippage),
+                        referred_by: None,
+                    }),
+                    swap_info.receive_amount,
+                )
+            };
 
-            let amount_received = swap_info.receive_amount.clone();
+            println!(
+                "repaid_debt={},  amount_received={}",
+                estimation.repaid_debt, amount_received
+            );
 
             // Calculate profit as:
             // profit = received_from_swap
@@ -136,6 +172,7 @@ where
                 - Int::from(repayment_token.fee.clone()) * 2
                 - Int::from(collateral_token.fee.clone()) * 2;
 
+            println!("Profit {profit}");
             if profit < 0 {
                 // No profit, move on
                 continue;
@@ -151,16 +188,7 @@ where
                     collateral_pool_id: collateral_position.pool_id,
                     debt_amount: Some(estimation.repaid_debt.clone()),
                 },
-                swap_args: SwapArgs {
-                    pay_token: collateral_token.symbol.clone(),
-                    pay_amount: amount_in.value,
-                    pay_tx_id: None,
-                    receive_token: swap_info.receive_symbol,
-                    receive_amount: Some(swap_info.receive_amount),
-                    receive_address: None,
-                    max_slippage: Some(swap_info.slippage),
-                    referred_by: None,
-                },
+                swap_args,
             });
         }
 
@@ -168,223 +196,650 @@ where
     }
 }
 
-// #[cfg(test)]
-// mod tests {
-//     use super::*;
-//     use crate::{
-//         config::MockConfigTrait,
-//         executors::{executor::MockIcrcSwapExecutor, kong_swap::types::SwapAmountsReply},
-//         icrc_token::icrc_token::IcrcToken,
-//         liquidation::collateral_service::MockCollateralServiceTrait,
-//     };
-//     use arbitrary::Unstructured;
-//     use candid::{Nat, Principal};
-//     use lending::liquidation::liquidation::LiquidateblePosition;
-//     use lending_utils::types::{assets::Assets, pool::AssetType};
-//     use std::{collections::HashMap, sync::Arc};
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        account::account::MockIcrcAccountInfo,
+        config::MockConfigTrait,
+        executors::{executor::MockIcrcSwapExecutor, kong_swap::types::SwapAmountsReply},
+        icrc_token::icrc_token::IcrcToken,
+        liquidation::collateral_service::{LiquidationEstimation, MockCollateralServiceTrait},
+    };
+    use lending::liquidation::liquidation::{LiquidateblePosition, LiquidatebleUser};
+    use lending_utils::types::{assets::Assets, pool::AssetType};
+    use rand::random;
 
-//     #[tokio::test]
-//     async fn test_icrc_liquidation_strategy_process() {
-//         let principal_a = Principal::anonymous();
-//         let principal_b = Principal::anonymous();
-//         let token_in = IcrcToken {
-//             ledger: principal_a,
-//             decimals: 6,
-//             name: "ckUSDC".to_string(),
-//             symbol: "ckUSDC".to_string(),
-//             fee: Nat::from(10u64),
-//         };
+    #[tokio::test]
+    async fn test_icrc_liquidation_strategy_process() {
+        let debt_token_principal = "xevnm-gaaaa-aaaar-qafnq-cai".to_string();
+        let collateral_token_principal = "mxzaz-hqaaa-aaaar-qaada-cai".to_string();
 
-//         let token_out = IcrcToken {
-//             ledger: principal_b,
-//             decimals: 8,
-//             name: "Bitcoin".to_string(),
-//             symbol: "ckBTC".to_string(),
-//             fee: Nat::from(5u64),
-//         };
+        let debt_token = IcrcToken {
+            ledger: Principal::from_text(&debt_token_principal).unwrap(),
+            decimals: 6,
+            name: "ckUSDC".to_string(),
+            symbol: "ckUSDC".to_string(),
+            fee: Nat::from(10u64),
+        };
 
-//         // Mock the config
-//         let mut mock_config = MockConfigTrait::new();
-//         mock_config.expect_get_collateral_assets().return_const(
-//             vec![(principal_a, token_in.clone()), (principal_b, token_out.clone())]
-//                 .into_iter()
-//                 .collect::<HashMap<_, _>>(),
-//         );
+        let collateral_token = IcrcToken {
+            ledger: Principal::from_text(&collateral_token_principal).unwrap(),
+            decimals: 8,
+            name: "ckBTC".to_string(),
+            symbol: "ckBTC".to_string(),
+            fee: Nat::from(10u64),
+        };
 
-//         mock_config.expect_get_debt_assets().return_const(
-//             vec![(principal_a, token_in.clone()), (principal_b, token_out.clone())]
-//                 .into_iter()
-//                 .collect::<HashMap<_, _>>(),
-//         );
+        // Mocks
+        let mut config = MockConfigTrait::new();
+        config.expect_get_collateral_assets().return_const(
+            vec![(collateral_token_principal.clone(), collateral_token.clone())]
+                .into_iter()
+                .collect::<HashMap<_, _>>(),
+        );
 
-//         let config = Arc::new(mock_config);
+        config.expect_get_debt_assets().return_const(
+            vec![(debt_token_principal.clone(), debt_token.clone())]
+                .into_iter()
+                .collect::<HashMap<_, _>>(),
+        );
 
-//         let mut executor = MockIcrcSwapExecutor::new();
-//         executor.expect_get_swap_info().returning(move |_, _, _| {
-//             Ok(SwapAmountsReply {
-//                 pay_chain: "ICP".to_string(),
-//                 pay_symbol: "ckBTC".to_string(),
-//                 pay_address: "pay-addr".to_string(),
-//                 pay_amount: Nat::from(500_000u64),
-//                 receive_chain: "ICP".to_string(),
-//                 receive_symbol: "ckUSDC".to_string(),
-//                 receive_address: "recv-addr".to_string(),
-//                 receive_amount: Nat::from(100_000u64),
-//                 mid_price: 0.0002,
-//                 price: 0.00019,
-//                 slippage: 0.005,
-//                 txs: vec![],
-//             })
-//         });
+        config
+            .expect_get_liquidator_principal()
+            .return_const(Principal::anonymous());
 
-//         let mut liquidation_utils_mock = MockCollateralServiceTrait::new();
+        let mut executor = MockIcrcSwapExecutor::new();
+        executor.expect_get_swap_info().returning(move |_, _, _| {
+            Ok(SwapAmountsReply {
+                pay_chain: "ICP".to_string(),
+                pay_symbol: collateral_token.symbol.clone(),
+                pay_address: "pay-addr".to_string(),
+                pay_amount: Nat::from(4000u64),
+                receive_chain: "ICP".to_string(),
+                receive_symbol: debt_token.symbol.clone(),
+                receive_address: "recv-addr".to_string(),
+                receive_amount: Nat::from(6000u64),
+                mid_price: 1.0,
+                price: 1.0,
+                slippage: 0.005,
+                txs: vec![],
+            })
+        });
 
-//         liquidation_utils_mock
-//             .expect_calculate_received_collateral()
-//             .return_const(Nat::from(4000u64));
+        let mut collateral = MockCollateralServiceTrait::new();
+        collateral
+            .expect_calculate_liquidation_amounts()
+            .returning(|_, _, _, _| {
+                Ok(LiquidationEstimation {
+                    received_collateral: Nat::from(4000u64),
+                    repaid_debt: Nat::from(1000u64),
+                })
+            });
 
-//         let strategy = IcrcLiquidationStrategy::new(config.clone(), Arc::new(executor), Arc::new(liquidation_utils_mock));
+        let mut account = MockIcrcAccountInfo::new();
+        account
+            .expect_get_cached_balance()
+            .returning(|_, _| Some(Nat::from(10_000u64)));
 
-//         let pos = LiquidateblePosition {
-//             pool_id: Principal::anonymous(),
-//             debt_amount: Nat::from(1000u64),
-//             collateral_amount: Nat::from(1500u64),
-//             asset: Assets::BTC,
-//             asset_type: AssetType::CkAsset(principal_a),
-//             account: Principal::anonymous(),
-//         };
+        let strategy = IcrcLiquidationStrategy::new(
+            Arc::new(config),
+            Arc::new(executor),
+            Arc::new(collateral),
+            Arc::new(account),
+        );
 
-//         let result = strategy.process(vec![pos.clone()]).await.unwrap();
+        let pos = LiquidateblePosition {
+            pool_id: Principal::anonymous(),
+            debt_amount: Nat::from(0u8),
+            collateral_amount: Nat::from(1500u64),
+            asset: Assets::BTC,
+            asset_type: AssetType::CkAsset(collateral_token.ledger),
+            account: Principal::anonymous(),
+            liquidation_bonus: Nat::from(1000u64),
+        };
 
-//         assert_eq!(result.liquidation.borrower, pos.account);
-//         assert_eq!(result.swap_args.pay_token, "ckBTC");
-//         assert_eq!(result.swap_args.receive_token, "ckUSDC");
-//     }
+        let second_pos = LiquidateblePosition {
+            pool_id: Principal::anonymous(),
+            debt_amount: Nat::from(1000u64),
+            collateral_amount: Nat::from(0u8),
+            asset: Assets::USDC,
+            asset_type: AssetType::CkAsset(debt_token.ledger),
+            account: Principal::anonymous(),
+            liquidation_bonus: Nat::from(1000u64),
+        };
 
-//     #[tokio::test]
-//     async fn test_icrc_liquidation_strategy_selects_highest_debt_and_collateral() {
-//         let principal_a = Principal::anonymous();
-//         let principal_b = Principal::management_canister();
+        let user = LiquidatebleUser {
+            account: Principal::anonymous(),
+            positions: vec![pos.clone(), second_pos.clone()],
+            total_debt: Nat::from(100u8),
+            health_factor: Nat::from(950u64),
+        };
 
-//         let token_in = IcrcToken {
-//             ledger: principal_a,
-//             decimals: 6,
-//             name: "ckUSDC".to_string(),
-//             symbol: "ckUSDC".to_string(),
-//             fee: Nat::from(10u64),
-//         };
+        let result = strategy.process(vec![user]).await.unwrap();
+        let req = &result[0];
 
-//         let token_out = IcrcToken {
-//             ledger: principal_b,
-//             decimals: 8,
-//             name: "Bitcoin".to_string(),
-//             symbol: "ckBTC".to_string(),
-//             fee: Nat::from(5u64),
-//         };
+        assert_eq!(req.liquidation.borrower, pos.account);
+        assert_eq!(req.swap_args.as_ref().unwrap().pay_token, "ckBTC");
+        assert_eq!(req.swap_args.as_ref().unwrap().receive_token, "ckUSDC");
+    }
 
-//         // Mock the config
-//         let mut mock_config = MockConfigTrait::new();
-//         mock_config.expect_get_collateral_assets().return_const(
-//             vec![(principal_a, token_in.clone()), (principal_b, token_out.clone())]
-//                 .into_iter()
-//                 .collect::<HashMap<_, _>>(),
-//         );
-//         mock_config.expect_get_debt_assets().return_const(
-//             vec![(principal_a, token_in.clone()), (principal_b, token_out.clone())]
-//                 .into_iter()
-//                 .collect::<HashMap<_, _>>(),
-//         );
-//         let config = Arc::new(mock_config);
+    #[tokio::test]
+    async fn test_icrc_liquidation_strategy_skips_if_no_profit() {
+        // Setup debt asset (ckUSDC) and collateral asset (ckBTC)
+        let collateral_token_principal = "mxzaz-hqaaa-aaaar-qaada-cai".to_string();
+        let debt_token_principal = "xevnm-gaaaa-aaaar-qafnq-cai".to_string();
 
-//         // Mock executor
-//         let mut mock_executor = MockIcrcSwapExecutor::new();
-//         mock_executor.expect_get_swap_info().returning(move |_, _, _| {
-//             Ok(SwapAmountsReply {
-//                 pay_chain: "ICP".to_string(),
-//                 pay_symbol: "ckUSDC".to_string(),
-//                 pay_address: "pay-addr".to_string(),
-//                 pay_amount: Nat::from(500_000u64),
-//                 receive_chain: "ICP".to_string(),
-//                 receive_symbol: "ckBTC".to_string(),
-//                 receive_address: "recv-addr".to_string(),
-//                 receive_amount: Nat::from(123_000u64),
-//                 mid_price: 0.0002,
-//                 price: 0.00019,
-//                 slippage: 0.005,
-//                 txs: vec![],
-//             })
-//         });
+        let debt_token = IcrcToken {
+            ledger: Principal::from_text(&debt_token_principal).unwrap(),
+            decimals: 6,
+            name: "ckUSDC".to_string(),
+            symbol: "ckUSDC".to_string(),
+            fee: Nat::from(10u64),
+        };
 
-//         // Mock collateral service
-//         let mut mock_collateral = MockCollateralServiceTrait::new();
-//         mock_collateral.expect_calculate_received_collateral().return_const(Nat::from(4000u64));
+        let collateral_token = IcrcToken {
+            ledger: Principal::from_text(&collateral_token_principal).unwrap(),
+            decimals: 8,
+            name: "ckBTC".to_string(),
+            symbol: "ckBTC".to_string(),
+            fee: Nat::from(10u64),
+        };
 
-//         let strategy = IcrcLiquidationStrategy::new(config, Arc::new(mock_executor), Arc::new(mock_collateral));
-//         use arbitrary::Arbitrary;
-//         let raw = (0..32).collect::<Vec<u8>>();
-//         let mut u = Unstructured::new(&raw);
-//         // Create multiple positions to trigger max selection
-//         let pos_low = LiquidateblePosition {
-//             pool_id: Principal::arbitrary(&mut u).unwrap(),
-//             debt_amount: Nat::from(100u64),
-//             collateral_amount: Nat::from(200u64),
-//             asset: Assets::BTC,
-//             asset_type: AssetType::CkAsset(principal_a),
-//             account: Principal::arbitrary(&mut u).unwrap(),
-//         };
+        // Mock config with correct principal-to-token mappings
+        let mut config = MockConfigTrait::new();
+        config.expect_get_collateral_assets().return_const(
+            vec![(collateral_token_principal.clone(), collateral_token.clone())]
+                .into_iter()
+                .collect::<HashMap<_, _>>(),
+        );
+        config.expect_get_debt_assets().return_const(
+            vec![(debt_token_principal.clone(), debt_token.clone())]
+                .into_iter()
+                .collect::<HashMap<_, _>>(),
+        );
+        config
+            .expect_get_liquidator_principal()
+            .return_const(Principal::anonymous());
 
-//         let pos_high = LiquidateblePosition {
-//             pool_id: Principal::arbitrary(&mut u).unwrap(),
-//             debt_amount: Nat::from(5000u64),
-//             collateral_amount: Nat::from(8000u64),
-//             asset: Assets::BTC,
-//             asset_type: AssetType::CkAsset(principal_a),
-//             account: Principal::arbitrary(&mut u).unwrap(),
-//         };
+        // Mock swap returns receive_amount = repaid_debt → no profit
+        let mut executor = MockIcrcSwapExecutor::new();
+        executor.expect_get_swap_info().returning(move |_, _, _| {
+            Ok(SwapAmountsReply {
+                pay_chain: "ICP".to_string(),
+                pay_symbol: collateral_token.symbol.clone(),
+                pay_address: "pay-addr".to_string(),
+                pay_amount: Nat::from(4000u64),
+                receive_chain: "ICP".to_string(),
+                receive_symbol: debt_token.symbol.clone(),
+                receive_address: "recv-addr".to_string(),
+                receive_amount: Nat::from(1000u64), // equal to repaid_debt
+                mid_price: 1.0,
+                price: 1.0,
+                slippage: 0.005,
+                txs: vec![],
+            })
+        });
 
-//         let result = strategy.process(vec![pos_low.clone(), pos_high.clone()]).await.unwrap();
+        // Mock liquidation estimation with equal repaid_debt
+        let mut collateral = MockCollateralServiceTrait::new();
+        collateral
+            .expect_calculate_liquidation_amounts()
+            .returning(|_, _, _, _| {
+                Ok(LiquidationEstimation {
+                    received_collateral: Nat::from(4000u64),
+                    repaid_debt: Nat::from(1000u64),
+                })
+            });
 
-//         // Assert that the highest values were selected
-//         assert_eq!(result.liquidation.borrower, pos_high.account);
-//         assert_eq!(result.liquidation.debt_pool_id, pos_high.pool_id);
-//         assert_eq!(result.liquidation.collateral_pool_id, pos_high.pool_id); // same in this setup
-//         assert_eq!(result.swap_args.pay_token, token_in.symbol);
-//         assert_eq!(result.swap_args.receive_token, "ckBTC");
-//     }
+        // Mock available balance as sufficient
+        let mut account = MockIcrcAccountInfo::new();
+        account
+            .expect_get_cached_balance()
+            .returning(|_, _| Some(Nat::from(10_000u64)));
 
-//     #[tokio::test]
-//     async fn test_process_fails_on_missing_asset_principal() {
-//         let principal_in = Principal::anonymous();
+        // Build strategy
+        let strategy = IcrcLiquidationStrategy::new(
+            Arc::new(config),
+            Arc::new(executor),
+            Arc::new(collateral),
+            Arc::new(account),
+        );
 
-//         // config is missing `principal_in` on purpose
-//         let mut mock_config = MockConfigTrait::new();
-//         mock_config.expect_get_collateral_assets().return_const(HashMap::new());
-//         mock_config.expect_get_debt_assets().return_const(HashMap::new());
+        // Define positions: collateral = ckBTC, debt = ckUSDC
+        let btc_pos = LiquidateblePosition {
+            pool_id: Principal::anonymous(),
+            debt_amount: Nat::from(0u8),
+            collateral_amount: Nat::from(1500u64),
+            asset: Assets::BTC,
+            asset_type: AssetType::CkAsset(collateral_token.ledger),
+            account: Principal::anonymous(),
+            liquidation_bonus: Nat::from(1000u64),
+        };
 
-//         let mut mock_executor = MockIcrcSwapExecutor::new();
-//         // shouldn't be called, but stub to avoid panic
-//         mock_executor.expect_get_swap_info().returning(|_, _, _| panic!("should not be called"));
+        let usdc_pos = LiquidateblePosition {
+            pool_id: Principal::anonymous(),
+            debt_amount: Nat::from(1000u64),
+            collateral_amount: Nat::from(0u8),
+            asset: Assets::USDC,
+            asset_type: AssetType::CkAsset(debt_token.ledger),
+            account: Principal::anonymous(),
+            liquidation_bonus: Nat::from(1000u64),
+        };
 
-//         let mut mock_collateral_service = MockCollateralServiceTrait::new();
-//         mock_collateral_service
-//             .expect_calculate_received_collateral()
-//             .return_const(Nat::from(1000u64));
+        // One user with a liquidation opportunity
+        let user = LiquidatebleUser {
+            account: Principal::anonymous(),
+            positions: vec![btc_pos, usdc_pos],
+            total_debt: Nat::from(100u8),
+            health_factor: Nat::from(900u16),
+        };
 
-//         let strategy = IcrcLiquidationStrategy::new(Arc::new(mock_config), Arc::new(mock_executor), Arc::new(mock_collateral_service));
+        // Execute strategy
+        let result = strategy.process(vec![user]).await.unwrap();
 
-//         let position = LiquidateblePosition {
-//             pool_id: Principal::from_text("aaaaa-aa").unwrap(),
-//             debt_amount: Nat::from(1000u64),
-//             collateral_amount: Nat::from(2000u64),
-//             asset: Assets::USDC,
-//             asset_type: AssetType::CkAsset(principal_in),
-//             account: Principal::from_text("aaaaa-aa").unwrap(),
-//         };
+        // Expect no result due to negative profit
+        assert!(
+            result.is_empty(),
+            "Expected no liquidation request due to negative profit"
+        );
+    }
 
-//         let result = strategy.process(vec![position]).await;
+    #[tokio::test]
+    async fn test_icrc_liquidation_strategy_fails_on_missing_balance() {
+        let debt_token_principal = "xevnm-gaaaa-aaaar-qafnq-cai".to_string();
+        let collateral_token_principal = "mxzaz-hqaaa-aaaar-qaada-cai".to_string();
 
-//         assert!(result.is_err());
+        let debt_token = IcrcToken {
+            ledger: Principal::from_text(&debt_token_principal).unwrap(),
+            decimals: 6,
+            name: "ckUSDC".to_string(),
+            symbol: "ckUSDC".to_string(),
+            fee: Nat::from(10u64),
+        };
 
-//         assert!(result.unwrap_err().contains("invalid asset principal"), "Expected asset principal error");
-//     }
-// }
+        let collateral_token = IcrcToken {
+            ledger: Principal::from_text(&collateral_token_principal).unwrap(),
+            decimals: 8,
+            name: "ckBTC".to_string(),
+            symbol: "ckBTC".to_string(),
+            fee: Nat::from(10u64),
+        };
+
+        // Mock config with valid token principals
+        let mut config = MockConfigTrait::new();
+        config.expect_get_collateral_assets().return_const(
+            vec![(collateral_token_principal.clone(), collateral_token.clone())]
+                .into_iter()
+                .collect::<HashMap<_, _>>(),
+        );
+        config.expect_get_debt_assets().return_const(
+            vec![(debt_token_principal.clone(), debt_token.clone())]
+                .into_iter()
+                .collect::<HashMap<_, _>>(),
+        );
+
+        config
+            .expect_get_liquidator_principal()
+            .return_const(Principal::anonymous());
+
+        // We shouldn't reach these
+        let mut executor = MockIcrcSwapExecutor::new();
+        executor
+            .expect_get_swap_info()
+            .returning(|_, _, _| panic!("should not be called"));
+
+        let mut collateral = MockCollateralServiceTrait::new();
+        collateral
+            .expect_calculate_liquidation_amounts()
+            .returning(|_, _, _, _| panic!("should not be called"));
+
+        // Simulate missing balance
+        let mut account = MockIcrcAccountInfo::new();
+        account.expect_get_cached_balance().returning(|_, _| None); // balance not found
+
+        let strategy = IcrcLiquidationStrategy::new(
+            Arc::new(config),
+            Arc::new(executor),
+            Arc::new(collateral),
+            Arc::new(account),
+        );
+
+        let btc_pos = LiquidateblePosition {
+            pool_id: Principal::anonymous(),
+            debt_amount: Nat::from(0u8),
+            collateral_amount: Nat::from(2000u64),
+            asset: Assets::BTC,
+            asset_type: AssetType::CkAsset(collateral_token.ledger),
+            account: Principal::anonymous(),
+            liquidation_bonus: Nat::from(1000u64),
+        };
+
+        let usdc_pos = LiquidateblePosition {
+            pool_id: Principal::anonymous(),
+            debt_amount: Nat::from(1000u64),
+            collateral_amount: Nat::from(0u8),
+            asset: Assets::USDC,
+            asset_type: AssetType::CkAsset(debt_token.ledger),
+            account: Principal::anonymous(),
+            liquidation_bonus: Nat::from(1000u64),
+        };
+
+        let user = LiquidatebleUser {
+            account: Principal::anonymous(),
+            positions: vec![btc_pos, usdc_pos],
+            total_debt: Nat::from(100u8),
+            health_factor: Nat::from(900u16),
+        };
+
+        let result = strategy.process(vec![user]).await;
+
+        // We expect an early failure due to missing balance
+        assert!(result.is_err(), "Expected error due to missing cached balance");
+        assert_eq!(result.unwrap_err(), "Could not get balance");
+    }
+
+    #[tokio::test]
+    async fn test_icrc_liquidation_strategy_fails_on_unsupported_asset_type() {
+        let debt_token_principal = "xevnm-gaaaa-aaaar-qafnq-cai".to_string();
+        let collateral_token_principal = "mxzaz-hqaaa-aaaar-qaada-cai".to_string();
+
+        let debt_token = IcrcToken {
+            ledger: Principal::from_text(&debt_token_principal).unwrap(),
+            decimals: 6,
+            name: "ckUSDC".to_string(),
+            symbol: "ckUSDC".to_string(),
+            fee: Nat::from(10u64),
+        };
+
+        let collateral_token = IcrcToken {
+            ledger: Principal::from_text(&collateral_token_principal).unwrap(),
+            decimals: 8,
+            name: "ckBTC".to_string(),
+            symbol: "ckBTC".to_string(),
+            fee: Nat::from(10u64),
+        };
+
+        // Mock config
+        let mut config = MockConfigTrait::new();
+        config.expect_get_collateral_assets().return_const(
+            vec![(collateral_token_principal.clone(), collateral_token.clone())]
+                .into_iter()
+                .collect::<HashMap<_, _>>(),
+        );
+        config.expect_get_debt_assets().return_const(
+            vec![(debt_token_principal.clone(), debt_token.clone())]
+                .into_iter()
+                .collect::<HashMap<_, _>>(),
+        );
+        config
+            .expect_get_liquidator_principal()
+            .return_const(Principal::anonymous());
+
+        // We shouldn't reach these
+        let mut executor = MockIcrcSwapExecutor::new();
+        executor
+            .expect_get_swap_info()
+            .returning(|_, _, _| panic!("should not be called"));
+
+        let mut collateral = MockCollateralServiceTrait::new();
+        collateral
+            .expect_calculate_liquidation_amounts()
+            .returning(|_, _, _, _| panic!("should not be called"));
+
+        let mut account = MockIcrcAccountInfo::new();
+        account
+            .expect_get_cached_balance()
+            .returning(|_, _| Some(Nat::from(10_000u64))); // simulate valid balance
+
+        let strategy = IcrcLiquidationStrategy::new(
+            Arc::new(config),
+            Arc::new(executor),
+            Arc::new(collateral),
+            Arc::new(account),
+        );
+
+        // This asset type is invalid for the strategy
+        let pos_native = LiquidateblePosition {
+            pool_id: Principal::anonymous(),
+            debt_amount: Nat::from(1000u64),
+            collateral_amount: Nat::from(1000u64),
+            asset: Assets::USDC,
+            asset_type: AssetType::Unknown, // <-- not supported
+            account: Principal::anonymous(),
+            liquidation_bonus: Nat::from(1000u64),
+        };
+
+        let user = LiquidatebleUser {
+            account: Principal::anonymous(),
+            positions: vec![pos_native.clone()],
+            total_debt: Nat::from(100u8),
+            health_factor: Nat::from(900u16),
+        };
+
+        let result = strategy.process(vec![user]).await;
+
+        // Should fail due to invalid asset type
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err(), "invalid asset type");
+    }
+
+    #[tokio::test]
+    async fn test_icrc_liquidation_strategy_mixed_users_only_one_executes() {
+        let principal_debt = Principal::from_text("xevnm-gaaaa-aaaar-qafnq-cai").unwrap(); // ckUSDC
+        let principal_collateral = Principal::from_text("mxzaz-hqaaa-aaaar-qaada-cai").unwrap(); // ckBTC
+
+        let debt_token = IcrcToken {
+            ledger: principal_debt,
+            decimals: 6,
+            name: "ckUSDC".to_string(),
+            symbol: "ckUSDC".to_string(),
+            fee: Nat::from(10u64),
+        };
+
+        let collateral_token = IcrcToken {
+            ledger: principal_collateral,
+            decimals: 8,
+            name: "ckBTC".to_string(),
+            symbol: "ckBTC".to_string(),
+            fee: Nat::from(10u64),
+        };
+
+        let mut config = MockConfigTrait::new();
+        config.expect_get_collateral_assets().return_const(
+            vec![(principal_collateral.to_text(), collateral_token.clone())]
+                .into_iter()
+                .collect::<HashMap<_, _>>(),
+        );
+        config.expect_get_debt_assets().return_const(
+            vec![(principal_debt.to_text(), debt_token.clone())]
+                .into_iter()
+                .collect::<HashMap<_, _>>(),
+        );
+        config
+            .expect_get_liquidator_principal()
+            .return_const(Principal::from_text("aaaaa-aa").unwrap());
+
+        let mut executor = MockIcrcSwapExecutor::new();
+        let mut calls = 0;
+        executor.expect_get_swap_info().returning(move |_, _, _| {
+            Ok(SwapAmountsReply {
+                pay_chain: "ICP".to_string(),
+                pay_symbol: "ckBTC".to_string(),
+                pay_address: "pay-addr".to_string(),
+                pay_amount: Nat::from(4000u64),
+                receive_chain: "ICP".to_string(),
+                receive_symbol: "ckUSDC".to_string(),
+                receive_address: "recv-addr".to_string(),
+                receive_amount: if calls == 0 {
+                    calls = calls + 1;
+                    Nat::from(2000u64) // profitable
+                } else {
+                    calls = calls + 1;
+                    Nat::from(500u64)
+                },
+                mid_price: 1.0,
+                price: 1.0,
+                slippage: 0.005,
+                txs: vec![],
+            })
+        });
+
+        let mut collateral = MockCollateralServiceTrait::new();
+        collateral
+            .expect_calculate_liquidation_amounts()
+            .returning(|_, _, _, _| {
+                Ok(LiquidationEstimation {
+                    received_collateral: Nat::from(4000u64),
+                    repaid_debt: Nat::from(1000u64),
+                })
+            });
+
+        let mut account = MockIcrcAccountInfo::new();
+        account
+            .expect_get_cached_balance()
+            .returning(|_, _| Some(Nat::from(10_000u64)));
+
+        let strategy = IcrcLiquidationStrategy::new(
+            Arc::new(config),
+            Arc::new(executor),
+            Arc::new(collateral),
+            Arc::new(account),
+        );
+
+        let valid_user = LiquidatebleUser {
+            account: Principal::anonymous(),
+            positions: vec![
+                LiquidateblePosition {
+                    pool_id: Principal::self_authenticating(random::<[u8; 32]>()),
+                    debt_amount: Nat::from(1000u64),
+                    collateral_amount: Nat::from(2000u64),
+                    asset: Assets::USDC,
+                    asset_type: AssetType::CkAsset(principal_debt),
+                    account: Principal::from_text("user-valid").unwrap_or_else(|_| Principal::management_canister()),
+                    liquidation_bonus: Nat::from(1000u64),
+                },
+                LiquidateblePosition {
+                    pool_id: Principal::self_authenticating(random::<[u8; 32]>()),
+                    debt_amount: Nat::from(0u64),
+                    collateral_amount: Nat::from(2000u64),
+                    asset: Assets::BTC,
+                    asset_type: AssetType::CkAsset(principal_collateral),
+                    account: Principal::from_text("user-valid").unwrap_or_else(|_| Principal::management_canister()),
+                    liquidation_bonus: Nat::from(1000u64),
+                },
+            ],
+            total_debt: Nat::from(2000u64),
+            health_factor: Nat::from(900u64),
+        };
+
+        let unprofitable_user = LiquidatebleUser {
+            account: Principal::anonymous(),
+            positions: vec![
+                LiquidateblePosition {
+                    pool_id: Principal::self_authenticating(random::<[u8; 32]>()),
+                    debt_amount: Nat::from(1000u64),
+                    collateral_amount: Nat::from(0u64),
+                    asset: Assets::USDC,
+                    asset_type: AssetType::CkAsset(principal_debt),
+                    account: Principal::anonymous(),
+                    liquidation_bonus: Nat::from(1000u64),
+                },
+                LiquidateblePosition {
+                    pool_id: Principal::self_authenticating(random::<[u8; 32]>()),
+                    debt_amount: Nat::from(0u64),
+                    collateral_amount: Nat::from(2000u64),
+                    asset: Assets::BTC,
+                    asset_type: AssetType::CkAsset(principal_collateral),
+                    account: Principal::anonymous(),
+                    liquidation_bonus: Nat::from(1000u64),
+                },
+            ],
+            total_debt: Nat::from(1000u64),
+            health_factor: Nat::from(910u64),
+        };
+
+        let result = strategy.process(vec![valid_user, unprofitable_user]).await.unwrap();
+
+        // Only the valid user should yield one ExecutorRequest
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].swap_args.as_ref().unwrap().pay_token, "ckBTC");
+        assert_eq!(result[0].swap_args.as_ref().unwrap().receive_token, "ckUSDC");
+    }
+
+    #[tokio::test]
+    async fn test_icrc_liquidation_strategy_with_leveraged_position() {
+        let principal = Principal::from_text("xevnm-gaaaa-aaaar-qafnq-cai").unwrap(); // ckUSDC
+        let token = IcrcToken {
+            ledger: principal,
+            decimals: 8,
+            name: "ckBTC".to_string(),
+            symbol: "ckBTC".to_string(),
+            fee: Nat::from(10u64),
+        };
+
+        let mut config = MockConfigTrait::new();
+        config.expect_get_collateral_assets().return_const(
+            vec![(principal.to_text(), token.clone())]
+                .into_iter()
+                .collect::<HashMap<_, _>>(),
+        );
+        config.expect_get_debt_assets().return_const(
+            vec![(principal.to_text(), token.clone())]
+                .into_iter()
+                .collect::<HashMap<_, _>>(),
+        );
+        config
+            .expect_get_liquidator_principal()
+            .return_const(Principal::from_text("aaaaa-aa").unwrap());
+
+        let mut executor = MockIcrcSwapExecutor::new();
+
+        executor
+            .expect_get_swap_info()
+            .returning(move |_, _, _| panic!("We should not get here"));
+
+        let mut collateral = MockCollateralServiceTrait::new();
+        collateral
+            .expect_calculate_liquidation_amounts()
+            .returning(|_, _, _, _| {
+                Ok(LiquidationEstimation {
+                    received_collateral: Nat::from(11e8 as u32),
+                    repaid_debt: Nat::from(10e8 as u32),
+                })
+            });
+
+        let mut account = MockIcrcAccountInfo::new();
+        account
+            .expect_get_cached_balance()
+            .returning(|_, _| Some(Nat::from(10_000u64)));
+
+        let strategy = IcrcLiquidationStrategy::new(
+            Arc::new(config),
+            Arc::new(executor),
+            Arc::new(collateral),
+            Arc::new(account),
+        );
+
+        let valid_user = LiquidatebleUser {
+            account: Principal::anonymous(),
+            positions: vec![LiquidateblePosition {
+                pool_id: Principal::self_authenticating(random::<[u8; 32]>()),
+                debt_amount: Nat::from(80e8 as u64),
+                collateral_amount: Nat::from(100e8 as u64),
+                asset: Assets::BTC,
+                asset_type: AssetType::CkAsset(principal),
+                account: Principal::self_authenticating(random::<[u8; 32]>()),
+                liquidation_bonus: Nat::from(1000u64),
+            }],
+            total_debt: Nat::from(2000u64),
+            health_factor: Nat::from(900u64),
+        };
+
+        let result = strategy.process(vec![valid_user]).await.unwrap();
+
+        // Only the valid user should yield one ExecutorRequest
+        assert_eq!(result.len(), 1);
+        assert!(result[0].swap_args.is_none());
+    }
+}

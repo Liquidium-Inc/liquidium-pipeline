@@ -46,7 +46,13 @@ async fn init(
 
     // Pre approve tokens
     swapper
-        .init(config.collateral_assets.keys().map(|item| item.clone()).collect())
+        .init(
+            config
+                .collateral_assets
+                .keys()
+                .map(|item| Principal::from_text(item.clone()).unwrap())
+                .collect(),
+        )
         .await
         .expect("could not pre approve tokens");
 
@@ -80,8 +86,9 @@ async fn main() {
 
     let (finder, executor, swapper, account_service) = init(config.clone(), agent.clone()).await;
 
-    let debt_assets = config.get_debt_assets().keys().cloned().collect::<Vec<Principal>>();
+    let debt_assets = config.get_debt_assets().keys().cloned().collect::<Vec<String>>();
     for asset in debt_assets {
+        let asset = Principal::from_text(asset).unwrap();
         account_service
             .sync_balance(asset, config.liquidator_principal)
             .await

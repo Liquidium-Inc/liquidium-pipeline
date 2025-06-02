@@ -12,25 +12,25 @@ use crate::utils::create_identity_from_pem_file;
 pub struct Config {
     pub liquidator_identity: Arc<dyn Identity>,
     pub liquidator_principal: Principal,
-    pub debt_assets: HashMap<Principal, IcrcToken>,
-    pub collateral_assets: HashMap<Principal, IcrcToken>,
+    pub debt_assets: HashMap<String, IcrcToken>,
+    pub collateral_assets: HashMap<String, IcrcToken>,
     pub ic_url: String,
     pub lending_canister: Principal,
 }
 
 #[cfg_attr(test, mockall::automock)]
 pub trait ConfigTrait: Send + Sync {
-    fn get_collateral_assets(&self) -> HashMap<Principal, IcrcToken>;
-    fn get_debt_assets(&self) -> HashMap<Principal, IcrcToken>;
+    fn get_collateral_assets(&self) -> HashMap<String, IcrcToken>;
+    fn get_debt_assets(&self) -> HashMap<String, IcrcToken>;
     fn get_liquidator_principal(&self) -> Principal;
 }
 
 impl ConfigTrait for Config {
-    fn get_collateral_assets(&self) -> HashMap<Principal, IcrcToken> {
+    fn get_collateral_assets(&self) -> HashMap<String, IcrcToken> {
         self.collateral_assets.clone()
     }
 
-    fn get_debt_assets(&self) -> HashMap<Principal, IcrcToken> {
+    fn get_debt_assets(&self) -> HashMap<String, IcrcToken> {
         self.debt_assets.clone()
     }
     fn get_liquidator_principal(&self) -> Principal {
@@ -70,25 +70,25 @@ impl Config {
     }
 }
 
-async fn load_asset_maps() -> (HashMap<Principal, IcrcToken>, HashMap<Principal, IcrcToken>) {
+async fn load_asset_maps() -> (HashMap<String, IcrcToken>, HashMap<String, IcrcToken>) {
     let ic_url = env::var("IC_URL").unwrap();
     let agent = Arc::new(Agent::builder().with_url(ic_url.clone()).build().expect("could not initialize client"));
     let mut debt = HashMap::new();
     for p in parse_principals("DEBT_ASSETS") {
         let token = IcrcToken::from_principal(p.0.clone(), agent.clone()).await;
         assert_eq!(token.symbol, p.1, "token mismatch detected");
-        debt.insert(p.0, token);
+        debt.insert(p.0.to_string(), token);
     }
 
     let mut coll = HashMap::new();
     for p in parse_principals("COLLATERAL_ASSETS") {
-        let mut token = debt.get(&p.0).and_then(|t| Some(t.clone()));
+        let mut token = debt.get(&p.0.to_text()).and_then(|t| Some(t.clone()));
         if token.is_none() {
             token = Some(IcrcToken::from_principal(p.0.clone(), agent.clone()).await);
         }
         let token = token.unwrap();
         assert_eq!(token.symbol, p.1, "token mismatch detected");
-        coll.insert(p.0, token.clone());
+        coll.insert(p.0.to_string(), token.clone());
     }
     (debt, coll)
 }
