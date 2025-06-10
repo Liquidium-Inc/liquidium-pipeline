@@ -64,7 +64,7 @@ mod tests {
     use super::*;
     use crate::pipeline_agent::MockPipelineAgent;
     use crate::stage::PipelineStage;
-    use candid::{Encode, Nat, Principal};
+    use candid::{Nat, Principal};
     use lending::liquidation::liquidation::LiquidateblePosition;
     use lending_utils::types::{assets::Assets, pool::AssetType};
     use std::sync::Arc;

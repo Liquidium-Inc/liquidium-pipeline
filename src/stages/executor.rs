@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use candid::Encode;
-use lending::interface::liquidation::LiquidationResult;
+use lending::interface::liquidation::{LiquidationResult, LiquidationStatus};
 use log::info;
 
 use crate::{
@@ -12,12 +12,14 @@ use crate::{
     stage::PipelineStage,
 };
 
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub enum ExecutionStatus {
     Success,
     Error(String),
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct ExecutionReceipt {
     pub liquidation_result: Option<LiquidationResult>,
@@ -37,6 +39,11 @@ impl<A: PipelineAgent> PipelineStage<Vec<ExecutorRequest>, Vec<ExecutionReceipt>
                 .agent
                 .call_update::<LiquidationResult>(&self.lending_canister, "liquidate", args)
                 .await;
+
+            let liquidation_result = liquidation_result.and_then(|result| match result.status {
+                LiquidationStatus::Success => Ok(result),
+                LiquidationStatus::Failed(err) => Err(err),
+            });
 
             // Check that the liquidation was executed successfully
             if liquidation_result.is_err() {
@@ -107,6 +114,7 @@ mod test {
             tx_id: "tx123".to_string(),
             collateral_asset: AssetType::CkAsset(Principal::from_text("mxzaz-hqaaa-aaaar-qaada-cai").unwrap()),
             debt_asset: AssetType::CkAsset(Principal::from_text("xevnm-gaaaa-aaaar-qafnq-cai").unwrap()),
+            status: LiquidationStatus::Success,
         };
 
         let swap_result = SwapReply {
@@ -194,6 +202,7 @@ mod test {
             tx_id: "tx456".to_string(),
             collateral_asset: AssetType::CkAsset(Principal::from_text("mxzaz-hqaaa-aaaar-qaada-cai").unwrap()),
             debt_asset: AssetType::CkAsset(Principal::from_text("xevnm-gaaaa-aaaar-qafnq-cai").unwrap()),
+            status: LiquidationStatus::Success,
         };
 
         mock_agent.expect_call_update().returning(move |_, method, _| {
@@ -302,6 +311,7 @@ mod test {
             tx_id: "tx789".to_string(),
             collateral_asset: AssetType::CkAsset(Principal::from_text("mxzaz-hqaaa-aaaar-qaada-cai").unwrap()),
             debt_asset: AssetType::CkAsset(Principal::from_text("xevnm-gaaaa-aaaar-qafnq-cai").unwrap()),
+            status: LiquidationStatus::Success,
         };
 
         // Simulate a successful liquidation update call
@@ -356,6 +366,6 @@ mod test {
         };
 
         // Run the executor
-        let result = executor.process(vec![request]).await;
+        let _ = executor.process(vec![request]).await;
     }
 }

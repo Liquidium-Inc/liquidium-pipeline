@@ -5,6 +5,7 @@ use ic_agent::Agent;
 use icrc_ledger_agent::Icrc1Agent;
 use lending_utils::types::assets::{Asset, Assets};
 
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct IcrcToken {
     // The ledger id
@@ -38,10 +39,22 @@ impl IcrcToken {
             ledger_canister_id: principal,
         };
 
-        let decimals = agent.decimals(icrc_ledger_agent::CallMode::Query).await.expect("could not get decimals");
-        let name = agent.name(icrc_ledger_agent::CallMode::Query).await.expect("could not get name");
-        let symbol = agent.symbol(icrc_ledger_agent::CallMode::Query).await.expect("could not get symbol");
-        let fee = agent.fee(icrc_ledger_agent::CallMode::Query).await.expect("could not get fee");
+        let decimals = agent
+            .decimals(icrc_ledger_agent::CallMode::Query)
+            .await
+            .expect("could not get decimals");
+        let name = agent
+            .name(icrc_ledger_agent::CallMode::Query)
+            .await
+            .expect("could not get name");
+        let symbol = agent
+            .symbol(icrc_ledger_agent::CallMode::Query)
+            .await
+            .expect("could not get symbol");
+        let fee = agent
+            .fee(icrc_ledger_agent::CallMode::Query)
+            .await
+            .expect("could not get fee");
 
         Self {
             decimals,

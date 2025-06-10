@@ -6,6 +6,5 @@ pub mod icrc_token;
 pub mod pipeline_agent;
 pub mod stage;
 pub mod stages;
-pub mod types;
 pub mod utils;
 pub mod price_oracle;

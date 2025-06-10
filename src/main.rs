@@ -7,7 +7,6 @@ mod pipeline_agent;
 mod price_oracle;
 mod stage;
 mod stages;
-mod types;
 mod utils;
 
 use std::sync::Arc;
