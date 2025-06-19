@@ -74,6 +74,7 @@ async fn load_asset_maps() -> (HashMap<String, IcrcToken>, HashMap<String, IcrcT
     let ic_url = env::var("IC_URL").unwrap();
     let agent = Arc::new(Agent::builder().with_url(ic_url.clone()).build().expect("could not initialize client"));
     let mut debt = HashMap::new();
+
     for p in parse_principals("DEBT_ASSETS") {
         let token = IcrcToken::from_principal(p.0.clone(), agent.clone()).await;
         assert_eq!(token.symbol, p.1, "token mismatch detected");

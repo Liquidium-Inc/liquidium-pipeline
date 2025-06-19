@@ -48,13 +48,13 @@ impl<P: PriceOracle> CollateralServiceTrait for CollateralService<P> {
             .price_oracle
             .get_price(&debt_position.asset.symbol(), "USDT")
             .await
-            .map_err(|_| "Could not get debt price")?;
+            .map_err(|e| format!("Could not get debt price: {}", e))?;
 
         let collateral_price = self
             .price_oracle
             .get_price(&collateral_position.asset.symbol(), "USDT")
             .await
-            .map_err(|_| "Could not get collateral price")?;
+            .map_err(|e| format!("Could not get collateral price: {}", e))?;
 
         debug!(" *** Collateral Price {} {:?}", collateral_position.asset.symbol(), collateral_price);
 

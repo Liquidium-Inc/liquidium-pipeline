@@ -6,6 +6,7 @@ pub mod account {
 
     use async_trait::async_trait;
     use candid::{Encode, Nat, Principal};
+    use icrc_ledger_types::icrc1::account::Account;
 
     use crate::pipeline_agent::PipelineAgent;
 
@@ -37,6 +38,11 @@ pub mod account {
         A: PipelineAgent,
     {
         async fn get_balance(&self, ledger_id: Principal, account: Principal) -> Result<Nat, String> {
+            let account = Account {
+                owner: account,
+                subaccount: None,
+            };
+
             let balance = self
                 .agent
                 .call_query::<Nat>(&ledger_id, "icrc1_balance_of", Encode!(&account).unwrap())

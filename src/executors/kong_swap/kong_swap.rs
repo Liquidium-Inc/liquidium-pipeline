@@ -6,7 +6,7 @@ use icrc_ledger_types::{
     icrc1::account::Account,
     icrc2::{
         allowance::{Allowance, AllowanceArgs},
-        approve::ApproveArgs,
+        approve::{ApproveArgs, ApproveError},
     },
 };
 use log::{debug, info, warn};
@@ -87,12 +87,13 @@ impl<A: PipelineAgent> IcrcSwapExecutor for KongSwapExecutor<A> {
 
         let result = self
             .agent
-            .call_query::<SwapAmountsReply>(
+            .call_query::<Result<SwapAmountsReply, String>>(
                 &dex_principal,
                 "swap_amounts",
                 encode_args((token_in.symbol.clone(), amount.value.clone(), token_out.symbol.clone())).unwrap(),
             )
             .await
+            .map_err(|e| format!("Swap call error: {}", e))?
             .map_err(|e| format!("Swap call error: {}", e))?;
 
         Ok(result)
@@ -127,9 +128,10 @@ impl<A: PipelineAgent> KongSwapExecutor<A> {
         info!("Approving {} on spender {}", ledger, self.dex_account.owner);
         let result = self
             .agent
-            .call_update::<Nat>(ledger, "icrc2_approve", args)
+            .call_update::<Result<Nat, ApproveError>>(ledger, "icrc2_approve", args)
             .await
-            .map_err(|e| format!("Approve call error: {}", e))?;
+            .map_err(|e| format!("Approve call error: {}", e))?
+            .map_err(|e| format!("Approve call canister error: {}", e))?;
 
         Ok(result)
     }

@@ -33,7 +33,7 @@ impl<A: PipelineAgent> PriceOracle for LiquidationPriceOracle<A> {
     async fn get_price(&self, token_in: &str, token_out: &str) -> Result<(u64, u32), String> {
         let price = self
             .agent
-            .call_query(
+            .call_query_tuple::<(u64, u32)>(
                 &self.lending_canister,
                 "get_price",
                 Encode!(&token_in, &token_out).expect("could not encode params"),
