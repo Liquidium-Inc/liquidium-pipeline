@@ -56,11 +56,30 @@ impl<P: PriceOracle> CollateralServiceTrait for CollateralService<P> {
             .await
             .map_err(|e| format!("Could not get collateral price: {}", e))?;
 
-        debug!(" *** Collateral Price {} {:?}", collateral_position.asset.symbol(), collateral_price);
+        debug!(
+            " *** Collateral Price {} {:?}",
+            collateral_position.asset.symbol(),
+            collateral_price
+        );
+        debug!(" *** Debt Price {} {:?}", debt_position.asset.symbol(), debt_price);
 
-        let liquidation_ratio = if user.health_factor <= 950u64 { 1000u64 } else { MAX_LIQUIDATION_RATIO };
+        let liquidation_ratio = if user.health_factor <= 950u64 {
+            1000u64
+        } else {
+            MAX_LIQUIDATION_RATIO
+        };
+
+        debug!(" *** Liquidation Ratio {}", liquidation_ratio);
 
         let collateral_decimals = collateral_position.asset.decimals();
+
+        debug!(
+            "*** Debt amount {}",
+            debt_position.debt_amount
+        );
+
+        debug!("Max Repay Amount: {}", max_repay_amount);
+
         let debt_amount = debt_position.debt_amount.clone().min(max_repay_amount);
 
         let debt_value = (debt_amount.clone() * debt_price.0) / 10u32.pow(debt_price.1);
@@ -73,6 +92,21 @@ impl<P: PriceOracle> CollateralServiceTrait for CollateralService<P> {
         }
 
         let bonus_multiplier = Nat::from(1000u64 + debt_position.liquidation_bonus.clone());
+
+        debug!(
+            "debt_value: {}
+            bonus_multiplier: {}
+            collateral_price: {:?}
+            debt_price: {:?}
+            collateral_position.collateral_amount: {}
+            collateral_decimals: {}",
+            debt_value,
+            bonus_multiplier,
+            collateral_price,
+            debt_price,
+            collateral_position.collateral_amount.clone(),
+            collateral_decimals
+        );
 
         let (final_collateral, final_repaid_debt) = estimate_partial_liquidation(
             debt_value,
@@ -101,7 +135,14 @@ fn estimate_partial_liquidation(
     collateral_decimals: u32,
 ) -> (Nat, Nat) {
     // Ideal collateral needed
-    let collateral_needed = (debt_value.clone() * bonus_multiplier.clone() * 10u32.pow(collateral_decimals)) / (collateral_price.0 * 1000u64);
+    let collateral_needed = (debt_value.clone() * bonus_multiplier.clone() * 10u32.pow(collateral_price.1))
+        / (collateral_price.0 * 1000u64);
+
+    debug!(
+        "collateral_needed: {} available_collateral: {}",
+        collateral_needed, available_collateral
+    );
+
     if collateral_needed <= available_collateral {
         return (collateral_needed, debt_value * 10u32.pow(debt_price.1) / debt_price.0);
     }
@@ -109,12 +150,17 @@ fn estimate_partial_liquidation(
     // Partial liquidation fallback
     let adjusted_collateral = available_collateral;
 
-    let adjusted_debt_value =
-        (adjusted_collateral.clone() * collateral_price.0 * 1000u64) / (bonus_multiplier.clone() * 10u32.pow(collateral_decimals));
+    let adjusted_debt_value = (adjusted_collateral.clone() * collateral_price.0) / (10u32.pow(collateral_price.1));
 
-    let adjusted_debt_amount = (adjusted_debt_value.clone() * 10u32.pow(debt_price.1)) / debt_price.0;
 
-    println!("Adjusted collateral{:?}", adjusted_collateral);
+    // TODO: get this discount ratio from position
+    let adjusted_debt_value = adjusted_debt_value * 800u32 / 1000u32;
+
+    // TODO: correct this
+    let adjusted_debt_amount = (adjusted_debt_value.clone() * 1e27 as u128 / debt_price.0) / 1e16 as u128;
+
+
+    println!("Adjusted collateral {:?}", adjusted_collateral);
     (adjusted_collateral, adjusted_debt_amount)
 }
 

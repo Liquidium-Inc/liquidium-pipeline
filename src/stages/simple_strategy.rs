@@ -119,6 +119,7 @@ where
 
             let max_balance = available_balance.clone() - repayment_token.fee.clone();
 
+            debug!("available_balance: {:?} repayment_token_fee {:?} max_balance: {:?}", available_balance, repayment_token.fee, max_balance);
             let estimation = self
                 .collateral_service
                 .calculate_liquidation_amounts(max_balance, debt_position, collateral_position, &user)
@@ -152,7 +153,9 @@ where
                 )
             };
 
-            println!(
+            debug!("Swap args: {:?}", swap_args);
+
+            info!(
                 "repaid_debt={},  amount_received={}",
                 estimation.repaid_debt, amount_received
             );

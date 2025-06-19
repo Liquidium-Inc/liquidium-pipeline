@@ -7,6 +7,7 @@ pub mod account {
     use async_trait::async_trait;
     use candid::{Encode, Nat, Principal};
     use icrc_ledger_types::icrc1::account::Account;
+    use log::debug;
 
     use crate::pipeline_agent::PipelineAgent;
 
@@ -53,6 +54,7 @@ pub mod account {
         async fn sync_balance(&self, ledger_id: Principal, account: Principal) -> Result<(), String> {
             let balance = self.get_balance(ledger_id, account).await?;
             self.cache.lock().unwrap().insert((ledger_id, account), balance.clone());
+            debug!("Balance synced for ledger {}. Balance: {}", ledger_id, balance);
             Ok(())
         }
 
