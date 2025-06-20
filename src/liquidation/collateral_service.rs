@@ -6,7 +6,7 @@ use lending::liquidation::liquidation::{LiquidateblePosition, LiquidatebleUser};
 use lending_utils::{constants::MAX_LIQUIDATION_RATIO, types::assets::Asset};
 use log::debug;
 
-use crate::price_oracle::price_oracle::PriceOracle;
+use crate::{liquidation::liquidation_utils::estimate_liquidation, price_oracle::price_oracle::PriceOracle};
 
 pub struct LiquidationEstimation {
     pub repaid_debt: Nat,
@@ -34,7 +34,6 @@ impl<P: PriceOracle> CollateralService<P> {
         Self { price_oracle }
     }
 }
-
 #[async_trait]
 impl<P: PriceOracle> CollateralServiceTrait for CollateralService<P> {
     async fn calculate_liquidation_amounts(
@@ -44,232 +43,138 @@ impl<P: PriceOracle> CollateralServiceTrait for CollateralService<P> {
         collateral_position: &LiquidateblePosition,
         user: &LiquidatebleUser,
     ) -> Result<LiquidationEstimation, String> {
+        let debt_symbol = debt_position.asset.symbol();
+        let collateral_symbol = collateral_position.asset.symbol();
+
         let debt_price = self
             .price_oracle
-            .get_price(&debt_position.asset.symbol(), "USDT")
+            .get_price(&debt_symbol, "USDT")
             .await
             .map_err(|e| format!("Could not get debt price: {}", e))?;
 
         let collateral_price = self
             .price_oracle
-            .get_price(&collateral_position.asset.symbol(), "USDT")
+            .get_price(&collateral_symbol, "USDT")
             .await
             .map_err(|e| format!("Could not get collateral price: {}", e))?;
 
-        debug!(
-            " *** Collateral Price {} {:?}",
-            collateral_position.asset.symbol(),
-            collateral_price
-        );
-        debug!(" *** Debt Price {} {:?}", debt_position.asset.symbol(), debt_price);
+        println!("Debt Price [{}]: {:?}", debt_symbol, debt_price);
+        println!("Collateral Price [{}]: {:?}", collateral_symbol, collateral_price);
 
-        let liquidation_ratio = if user.health_factor <= 950u64 {
-            1000u64
+        let liquidation_ratio = if user.health_factor <= 950u128 {
+            1000
         } else {
             MAX_LIQUIDATION_RATIO
         };
 
-        debug!(" *** Liquidation Ratio {}", liquidation_ratio);
-
+        let debt_decimals = debt_position.asset.decimals();
         let collateral_decimals = collateral_position.asset.decimals();
 
-        debug!(
-            "*** Debt amount {}",
-            debt_position.debt_amount
-        );
+        let debt_amount = debt_position.debt_amount.clone().min(max_repay_amount.clone());
 
-        debug!("Max Repay Amount: {}", max_repay_amount);
+        let debt_value = (debt_amount.clone() * debt_price.0) / 10u128.pow(debt_decimals);
+        let max_liquidation = (user.total_debt.clone() * liquidation_ratio) / 1000u128;
 
-        let debt_amount = debt_position.debt_amount.clone().min(max_repay_amount);
-
-        let debt_value = (debt_amount.clone() * debt_price.0) / 10u32.pow(debt_price.1);
-        let max_liquidation = (user.total_debt.clone() * liquidation_ratio) / 1000u32;
-
-        debug!(" *** Max Allowed {max_liquidation} ({debt_value})");
+        debug!("Debt amount: {}", debt_amount);
+        debug!("Max repay amount: {}", max_repay_amount);
+        debug!("Debt value (USD): {}", debt_value);
+        debug!("Max liquidation (USD): {}", max_liquidation);
 
         if debt_value > max_liquidation {
             return Err("Liquidation amount exceeds maximum allowed".to_string());
         }
 
-        let bonus_multiplier = Nat::from(1000u64 + debt_position.liquidation_bonus.clone());
+        let bonus_multiplier = Nat::from(1000u128 + debt_position.liquidation_bonus.clone());
 
         debug!(
-            "debt_value: {}
-            bonus_multiplier: {}
-            collateral_price: {:?}
-            debt_price: {:?}
-            collateral_position.collateral_amount: {}
-            collateral_decimals: {}",
-            debt_value,
-            bonus_multiplier,
-            collateral_price,
-            debt_price,
-            collateral_position.collateral_amount.clone(),
-            collateral_decimals
+            "Estimating liquidation: debt_value={}, bonus_multiplier={}, available_collateral={}, decimals=(debt: {}, collateral: {})",
+            debt_value, bonus_multiplier, collateral_position.collateral_amount, debt_decimals, collateral_decimals
         );
 
-        let (final_collateral, final_repaid_debt) = estimate_partial_liquidation(
+        let (received_collateral, repaid_debt) = estimate_liquidation(
             debt_value,
             bonus_multiplier,
             collateral_price,
             debt_price,
             collateral_position.collateral_amount.clone(),
+            debt_decimals,
             collateral_decimals,
         );
 
         Ok(LiquidationEstimation {
-            received_collateral: final_collateral,
-            repaid_debt: final_repaid_debt,
+            received_collateral,
+            repaid_debt,
         })
     }
 }
 
-/// Computes the actual collateral that can be seized and the corresponding repayable debt.
-/// Handles both full and partial liquidation scenarios.
-fn estimate_partial_liquidation(
-    debt_value: Nat,
-    bonus_multiplier: Nat,
-    collateral_price: (u64, u32),
-    debt_price: (u64, u32),
-    available_collateral: Nat,
-    collateral_decimals: u32,
-) -> (Nat, Nat) {
-    // Ideal collateral needed
-    let collateral_needed = (debt_value.clone() * bonus_multiplier.clone() * 10u32.pow(collateral_price.1))
-        / (collateral_price.0 * 1000u64);
-
-    debug!(
-        "collateral_needed: {} available_collateral: {}",
-        collateral_needed, available_collateral
-    );
-
-    if collateral_needed <= available_collateral {
-        return (collateral_needed, debt_value * 10u32.pow(debt_price.1) / debt_price.0);
-    }
-
-    // Partial liquidation fallback
-    let adjusted_collateral = available_collateral;
-
-    let adjusted_debt_value = (adjusted_collateral.clone() * collateral_price.0) / (10u32.pow(collateral_price.1));
-
-
-    // TODO: get this discount ratio from position
-    let adjusted_debt_value = adjusted_debt_value * 800u32 / 1000u32;
-
-    // TODO: correct this
-    let adjusted_debt_amount = (adjusted_debt_value.clone() * 1e27 as u128 / debt_price.0) / 1e16 as u128;
-
-
-    println!("Adjusted collateral {:?}", adjusted_collateral);
-    (adjusted_collateral, adjusted_debt_amount)
-}
-
 #[cfg(test)]
-mod tests {
+mod test {
+    use candid::Principal;
+    use lending_utils::types::{assets::Assets, pool::AssetType};
+    use mockall::predicate::eq;
+
+    use crate::price_oracle::price_oracle::MockPriceOracle;
+
     use super::*;
-    use candid::Nat;
+    use std::sync::Arc;
 
-    fn nat<T: Into<u64>>(v: T) -> Nat {
-        Nat::from(v.into())
-    }
+    #[tokio::test]
+    async fn test_full_liquidation_btc_debt_usdt_collateral() {
+        let mut mock_oracle = MockPriceOracle::new();
 
-    #[test]
-    fn test_full_liquidation_allowed() {
-        let debt_value = nat(1000e6 as u64);
-        let bonus_multiplier = nat(1050u64); // 5% bonus
-        let collateral_price = (2_000_000u64, 6); // $2 with 6 decimals
-        let debt_price = (1_000_000u64, 6); // $1 with 6 decimals
-        let available_collateral = nat(600_000e6 as u64);
-        let collateral_decimals = 6;
+        // BTC → USDT = $1.00 with 9 decimals
+        mock_oracle
+            .expect_get_price()
+            .with(eq("BTC"), eq("USDT"))
+            .return_once(|_, _| Ok((80000000000000u64, 9)));
 
-        let (collateral, debt) = estimate_partial_liquidation(
-            debt_value.clone(),
-            bonus_multiplier.clone(),
-            collateral_price,
-            debt_price,
-            available_collateral.clone(),
-            collateral_decimals,
-        );
+        // USDT → USDT = $1.00 with 6 decimals
+        mock_oracle
+            .expect_get_price()
+            .with(eq("USDT"), eq("USDT"))
+            .return_once(|_, _| Ok((1_000_000_000, 9)));
 
-        assert_eq!(collateral <= available_collateral, true);
-        assert_eq!(debt, nat(1000e6 as u64));
-    }
+        let service = CollateralService::new(Arc::new(mock_oracle));
 
-    #[test]
-    fn test_partial_liquidation_due_to_insufficient_collateral() {
-        // The debt we are targeting to repay (in dollars, scaled as Nat)
-        let debt_value = nat(2000e6 as u64); // $2000
+        let user = LiquidatebleUser {
+            account: Principal::anonymous(),
+            health_factor: Nat::from(900u64),
+            positions: vec![],
+            total_debt: Nat::from(81_789_600_000u128), // $81$
+        };
 
-        // The liquidation bonus is 10%, so we use a multiplier of 1100 (i.e., 1.1x)
-        let bonus_multiplier = nat(1100u64); // 1000 = no bonus, 1100 = 10% bonus
+        let debt_position = LiquidateblePosition {
+            pool_id: Principal::anonymous(),
+            account: Principal::anonymous(),
+            asset: Assets::BTC,
+            asset_type: AssetType::CkAsset(Principal::anonymous()),
+            debt_amount: Nat::from(102_237u64), // ≈ $95.489
+            collateral_amount: Nat::from(0u64),
+            liquidation_bonus: Nat::from(200u64), // 20%
+        };
 
-        // Collateral price is $2.00, represented as (2_000_000, 6 decimals)
-        let collateral_price = (2_000_000u64, 6);
+        let collateral_position = LiquidateblePosition {
+            pool_id: Principal::anonymous(),
+            account: Principal::anonymous(),
+            asset: Assets::USDT,
+            asset_type: AssetType::CkAsset(Principal::anonymous()),
+            debt_amount: Nat::from(0u64),
+            collateral_amount: Nat::from(99_940_000u64), // 99.94 USDT
+            liquidation_bonus: Nat::from(2000u64),
+        };
 
-        // Debt asset price is $1.00, also with 6 decimals
-        let debt_price = (1_000_000u64, 6);
+        let result = service
+            .calculate_liquidation_amounts(
+                Nat::from(95_489u64), // max repay = 95_489 sats
+                &debt_position,
+                &collateral_position,
+                &user,
+            )
+            .await
+            .expect("Expected liquidation to succeed");
 
-        // The user only has 0.5 units of the collateral asset available
-        // With 6 decimals, this is represented as 500_000 (0.5 * 10^6)
-        // At $2 per unit, the total value = $1,000 worth of collateral
-        let available_collateral = nat(500_000u64);
-
-        // The collateral asset has 6 decimal places (like USDC, WBTC, etc.)
-        let collateral_decimals = 6;
-
-        // Now run the partial liquidation estimation function
-        // It will try to repay as much debt as possible with the given collateral
-        let (collateral, debt) = estimate_partial_liquidation(
-            debt_value.clone(),
-            bonus_multiplier.clone(),
-            collateral_price,
-            debt_price,
-            available_collateral.clone(),
-            collateral_decimals,
-        );
-
-        // We expect the function to return the max available collateral (i.e. cap was hit)
-        assert_eq!(collateral, available_collateral);
-
-        // And since we couldn’t seize enough to cover the full $2000 + bonus,
-        // the debt we’re repaying must be less than the original requested amount
-        assert!(debt < debt_value);
-    }
-    #[test]
-    fn test_zero_collateral_returns_zero() {
-        // We simulate a case where the user has zero collateral available.
-        // Even if they want to repay $1000 worth of debt, nothing can be seized.
-
-        // Target debt value of $1000, scaled to match 6 decimal precision (i.e., 1000 * 10^6)
-        let debt_value = nat(1_000_000_000u64); // $1000.000000
-
-        // Bonus multiplier of 1050 (i.e., 5% bonus over the base of 1000)
-        let bonus_multiplier = nat(1050u64);
-
-        // Collateral price: $2.000000 (scaled as 2_000_000 with 6 decimals)
-        let collateral_price = (2_000_000u64, 6);
-
-        // Debt price: $1.000000 (scaled as 1_000_000 with 6 decimals)
-        let debt_price = (1_000_000u64, 6);
-
-        // Zero available collateral — user has no funds to seize
-        let available_collateral = nat(0u64);
-
-        // Collateral asset uses 6 decimal places
-        let collateral_decimals = 6;
-
-        // Run the estimator
-        let (collateral, debt) = estimate_partial_liquidation(
-            debt_value.clone(),
-            bonus_multiplier.clone(),
-            collateral_price,
-            debt_price,
-            available_collateral.clone(),
-            collateral_decimals,
-        );
-
-        // Both returned values should be exactly zero
-        assert_eq!(collateral, nat(0u8), "Expected zero collateral seized");
-        assert_eq!(debt, nat(0u8), "Expected zero debt repaid");
+        assert_eq!(result.repaid_debt, Nat::from(95_489u64)); // repay in sats
+        assert_eq!(result.received_collateral, Nat::from(91_669_440u64)); // 91.669440 USDT
     }
 }

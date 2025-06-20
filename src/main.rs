@@ -8,6 +8,7 @@ mod price_oracle;
 mod stage;
 mod stages;
 mod utils;
+mod ray_math;
 
 use std::sync::Arc;
 use std::thread::sleep;

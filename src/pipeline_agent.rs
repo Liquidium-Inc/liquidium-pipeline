@@ -1,4 +1,4 @@
-use candid::{decode_args, decode_one, utils::ArgumentDecoder, CandidType, Decode, Principal};
+use candid::{CandidType, Decode, Principal};
 use serde::de::DeserializeOwned;
 
 #[cfg_attr(test, mockall::automock)]
@@ -11,7 +11,7 @@ pub trait PipelineAgent: Send + Sync {
         arg: Vec<u8>,
     ) -> Result<R, String>;
 
-    async fn call_query_tuple<R: Sized + CandidType + DeserializeOwned + for<'a> candid::utils::ArgumentDecoder<'a>>(
+    async fn call_query_tuple<R: Sized + CandidType + DeserializeOwned + 'static>(
         &self,
         canister: &Principal,
         method: &str,
@@ -42,13 +42,12 @@ impl PipelineAgent for ic_agent::Agent {
             .map_err(|e| e.to_string());
 
         // Decode the candid response
-        let res =
-            Decode!(&res.unwrap(), R).map_err(|e| format!("Candid decode error: {e}"))?;
+        let res = Decode!(&res.unwrap(), R).map_err(|e| format!("Candid decode error: {e}"))?;
 
         Ok(res)
     }
 
-    async fn call_query_tuple<R: Sized + CandidType + DeserializeOwned + for<'a> candid::utils::ArgumentDecoder<'a>>(
+    async fn call_query_tuple<R: Sized + CandidType + DeserializeOwned>(
         &self,
         canister: &Principal,
         method: &str,
@@ -61,8 +60,7 @@ impl PipelineAgent for ic_agent::Agent {
             .await
             .map_err(|e| e.to_string());
 
-        let res = candid::utils::decode_args::<R>(&res.unwrap())
-            .map_err(|e| format!("Candid decode error: {}", e))?;
+        let res = candid::utils::decode_one::<R>(&res.unwrap()).map_err(|e| format!("Candid decode error: {}", e))?;
 
         Ok(res)
     }
@@ -81,8 +79,7 @@ impl PipelineAgent for ic_agent::Agent {
             .map_err(|e| e.to_string());
 
         // Decode the candid response
-        let res =
-            Decode!(&res.unwrap(), R).map_err(|e| format!("Candid decode error: {e}"))?;
+        let res = Decode!(&res.unwrap(), R).map_err(|e| format!("Candid decode error: {e}"))?;
 
         Ok(res)
     }

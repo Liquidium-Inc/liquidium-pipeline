@@ -5,6 +5,7 @@ use candid::{Encode, Principal};
 
 use crate::pipeline_agent::PipelineAgent;
 
+#[cfg_attr(test, mockall::automock)]
 #[async_trait]
 pub trait PriceOracle: Sync + Send {
     async fn get_price(&self, token_in: &str, token_out: &str) -> Result<(u64, u32), String>;
