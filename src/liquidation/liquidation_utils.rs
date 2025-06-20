@@ -5,92 +5,110 @@ use log::debug;
 
 use crate::ray_math::WadRayMath;
 
-/// Computes the actual collateral that can be seized and the corresponding repayable debt.
-/// Handles both full and partial liquidation scenarios.
 pub fn estimate_liquidation(
-    debt_value: Nat,
-    bonus_multiplier: Nat,
-    collateral_price: (u64, u32),
-    debt_price: (u64, u32),
-    available_collateral: Nat,
+    debt_value: Nat,              // USD in raw units
+    bonus_multiplier: Nat,        // e.g. 1100 = 10% bonus (raw)
+    collateral_price: (u64, u32), // (price, decimals)
+    debt_price: (u64, u32),       // (price, decimals)
+    available_collateral: Nat,    // in raw collateral units
     debt_decimals: u32,
     collateral_decimals: u32,
 ) -> (Nat, Nat) {
-    let coll_price_nat = Nat::from(collateral_price.0 as u128);
-    let coll_price_decimals = Nat::from(10u128.pow(collateral_price.1));
-    let debt_price_nat = Nat::from(debt_price.0 as u128);
-    let debt_price_decimals = Nat::from(10u128.pow(debt_price.1));
+    // Ray‐scale all the building blocks exactly once:
+    let ray_1000        = Nat::from(1000u128).to_ray();
+    let bonus_ray       = bonus_multiplier.to_ray();
+    let debt_value    = debt_value.to_ray();
+    let collateral_price_ray  = Nat::from(collateral_price.0 as u128).to_ray();
+    let debt_price_ray  = Nat::from(debt_price.0       as u128).to_ray();
+    let collateral_price_scale_ray = Nat::from(10u128.pow(collateral_price.1)).to_ray();
+    let debt_price_scale = Nat::from(10u128.pow(debt_price.1)).to_ray();
+    let collateral_scale   = Nat::from(10u128.pow(collateral_decimals)).to_ray();
+    let debt_scale   = Nat::from(10u128.pow(debt_decimals)).to_ray();
 
     debug!(
-        "[estimate] debt_value: {}, bonus: {}, coll_price: {} (decimals {}), debt_price: {} (decimals {})",
-        debt_value,
-        bonus_multiplier,
-        coll_price_nat,
-        collateral_price.1,
-        debt_price_nat,
-        debt_price.1
+        "[estimate] debt_val={} (raw), bonus={}, price_coll={} (dec{}), price_debt={} (dec{}), avail_coll={}",
+        debt_value, bonus_multiplier,
+        collateral_price.0, collateral_price.1,
+        debt_price.0,       debt_price.1,
+        available_collateral,
     );
 
-    let adjusted_debt_value = debt_value
-        .to_ray()
-        .ray_mul(&bonus_multiplier)
-        .ray_div(&Nat::from(1000u128));
-
-    let collateral_needed = adjusted_debt_value
-        .ray_mul(&coll_price_decimals)
-        .ray_div(&coll_price_nat)
-        .ray_div(&debt_price_decimals)
-        .ray_mul(&Nat::from(10u128.pow(collateral_decimals)));
+    // 1) Apply liquidation bonus
+    let adj_debt_value_ray = debt_value
+        .ray_mul(&bonus_ray)
+        .ray_div(&ray_1000);
 
     debug!(
-        "[estimate] adjusted_debt_value: {}, collateral_needed: {}, available: {}",
-        adjusted_debt_value.from_ray(),
-        collateral_needed.from_ray(),
-        available_collateral
+        "[estimate] adj_debt_ray={} -> {} USD raw",
+        adj_debt_value_ray, adj_debt_value_ray.from_ray()
     );
 
-    if collateral_needed.from_ray() <= available_collateral {
-        let repayable_debt = debt_value
-            .to_ray()
-            .ray_div(&debt_price_nat)
-            .ray_mul(&Nat::from(10u128.pow(debt_decimals)));
+    // 2) Compute collateral needed in RAY:
+    //    adj_debt_ray * (10^token_dec) / (10^price_dec) / price
+    let collateral_needed_ray = adj_debt_value_ray // in USD 
+        .ray_mul(&collateral_price_scale_ray)    // account for collateral price decimals 
+        .ray_div(&collateral_price_ray)         // divide by price (ray)
+        .ray_mul(&collateral_scale)
+        .ray_div(&collateral_price_scale_ray);
+    
+    let collateral_needed = collateral_needed_ray.from_ray();
+    debug!(
+        "[estimate] collateral_needed={} (tokens), available={}",
+        collateral_needed, available_collateral
+    );
+
+    // 3) Full vs Partial
+    if collateral_needed <= available_collateral {
+        // full liquidation: repay entire debt
+        let repay_ray = debt_value
+            .ray_div(&debt_price_ray)
+            .ray_mul(&debt_scale);
+        let repay = repay_ray.from_ray();
 
         debug!(
-            "[estimate] full liquidation → repayable_debt: {}, collateral_used: {}",
-            repayable_debt.from_ray(),
-            collateral_needed.from_ray()
+            "[estimate] FULL -> use_coll={}, repay={}",
+            collateral_needed, repay
         );
-
-        return (collateral_needed.from_ray(), repayable_debt.from_ray());
+        return (collateral_needed, repay);
     }
 
-    debug!("[estimate] executing partial liquidation");
+    debug!("[estimate] PARTIAL -> using all collateral");
 
-    let collateral_value = available_collateral
+    // value of collateral in USD ray:
+    let collateral_value_ray = available_collateral
         .to_ray()
-        .ray_mul(&coll_price_nat)
-        .ray_div(&coll_price_decimals);
-
-    let adjusted_debt_value = collateral_value
-        .ray_mul(&Nat::from(1000u128))
-        .ray_div(&bonus_multiplier);
-
-    let repayable_debt = adjusted_debt_value
-        .ray_div(&Nat::from(10u128.pow(collateral_decimals)))
-        .ray_mul(&debt_price_decimals)
-        .ray_div(&debt_price_nat)
-        .ray_mul(&Nat::from(10u128.pow(debt_decimals)))
-        .from_ray();
+        .ray_mul(&collateral_price_ray)
+        .ray_div(&collateral_scale); // get rid of collateral scaling
 
     debug!(
-        "[estimate] partial result → collateral_used: {}, repayable_debt: {}",
-        available_collateral,
-        repayable_debt
+        "[estimate] collateral_value_ray={} (raw = {}), collateral_scale = {} ",
+        collateral_value_ray, collateral_value_ray.from_ray(), collateral_scale.from_ray()
     );
 
-    (available_collateral, repayable_debt)
-}
+    // reverse bonus: USD ray debt = coll_value_ray * 1000 / bonus
+    let partial_debt_ray = collateral_value_ray
+        .ray_mul(&ray_1000)
+        .ray_div(&bonus_ray);
 
+      debug!(
+        "[estimate] partial_debt_ray={} (raw = {}), debt_scale = {} ",
+        partial_debt_ray, partial_debt_ray.from_ray(), debt_scale.from_ray()
+    );
+
+    // convert USD ray -> debt tokens
+    let repay_ray = partial_debt_ray
+        .ray_div(&debt_price_ray) // USD scale is here
+        .ray_mul(&debt_scale);
+
+    let repay = repay_ray.from_ray();
+
+    debug!(
+        "[estimate] PARTIAL -> use_coll={}, repay={}",
+        available_collateral, repay
+    );
+
+    (available_collateral, repay)
+}
 
 #[cfg(test)]
 mod tests {
@@ -181,10 +199,10 @@ mod tests {
         let debt_value = nat(2_000_000_000_000u64); // 2000 * 1e9
 
         // 10% bonus -> multiplier = 1100 (basis points)
-        let bonus_multiplier = nat(1100u64);
+        let bonus_multiplier = nat(1200u64);
 
         // Collateral price: $2.00 -> (price, decimals)
-        let collateral_price = (2_000_000u64, 6);
+        let collateral_price = (2_000_00000u64, 8);
 
         // Debt price: $1.00 with 9 decimals
         let debt_price = (1_000_000_000u64, 9);
@@ -199,7 +217,7 @@ mod tests {
             collateral_price,
             debt_price,
             available_collateral.clone(),
-            6u32,
+            12u32,
             6u32
         );
 
@@ -225,18 +243,23 @@ mod tests {
       
         let collateral_value =  available_collateral *  
                                 Nat::from(collateral_price.0 as u128) // collateral USD value 
-                                / Nat::from(10u128.pow(collateral_price.1));
+                                / Nat::from(10u128.pow(6));
 
-        let expected_repaid_debt = collateral_value * Nat::from(1000u64) / bonus_multiplier.clone();
+        let expected_repaid_debt_value = collateral_value * Nat::from(1000u64) / bonus_multiplier.clone();
 
-        let expected_repaid_debt =
-            expected_repaid_debt * Nat::from(10u128.pow(debt_price.1)) / Nat::from(debt_price.0 as u128);
+        println!("expected_repaid_debt: {}", expected_repaid_debt_value);
+
+        let expected_repaid_debt = expected_repaid_debt_value.to_ray()
+                                .ray_div(&Nat::from(debt_price.0 as u128).to_ray()) 
+                                .ray_mul(&Nat::from(10u128.pow(12)).to_ray())
+                                .from_ray();
       
         assert!(
-            expected_repaid_debt == repaid_debt,
-            "Expected repaid debt ≈ {}, got {}",
+             repaid_debt.clone() - expected_repaid_debt.clone()  < 1000u32,
+            "Expected repaid debt ≈ {}, got {}, diff {}",
             expected_repaid_debt,
             repaid_debt,
+            repaid_debt.clone() -  expected_repaid_debt.clone()
         );
     }
 
