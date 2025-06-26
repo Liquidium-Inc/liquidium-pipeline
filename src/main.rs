@@ -5,10 +5,10 @@ mod icrc_token;
 mod liquidation;
 mod pipeline_agent;
 mod price_oracle;
+mod ray_math;
 mod stage;
 mod stages;
 mod utils;
-mod ray_math;
 
 use std::sync::Arc;
 use std::thread::sleep;
@@ -96,6 +96,7 @@ async fn main() {
         .with_identity(config.liquidator_identity.clone())
         .build()
         .expect("Failed to initialize IC agent");
+
     let agent = Arc::new(agent);
     info!("Agent initialized with principal: {}", config.liquidator_principal);
 
@@ -104,18 +105,19 @@ async fn main() {
     info!("Components initialized");
 
     // === Sync balances for all debt assets ===
-    let debt_assets = config.get_debt_assets().keys().cloned().collect::<Vec<String>>();
-    for asset in &debt_assets {
+    for (asset, token) in config.get_debt_assets().iter() {
         let principal = Principal::from_text(asset).unwrap_or_else(|_| panic!("Invalid asset principal: {asset}"));
 
-        account_service
+        let balance = account_service
             .sync_balance(principal, config.liquidator_principal)
             .await
             .expect("Failed to sync balance");
-        info!("Balance synced for asset {}", asset);
+
+        info!("Balance synced for asset {} {}", token.symbol, balance);
     }
 
     // === Main Loop ===
+    let debt_assets = config.get_debt_assets().keys().cloned().collect::<Vec<String>>();
     loop {
         info!("Polling for liquidation opportunities...");
 
@@ -143,6 +145,6 @@ async fn main() {
         });
 
         info!("Completed {} executions", results.len());
-        sleep(Duration::from_secs(2));
+        sleep(Duration::from_secs(30));
     }
 }

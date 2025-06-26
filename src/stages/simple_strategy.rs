@@ -15,7 +15,7 @@ use lending::interface::liquidation::LiquidationRequest;
 use lending::liquidation::liquidation::LiquidatebleUser;
 use lending_utils::types::pool::AssetType;
 use log::{debug, info};
-
+use num_traits::ToPrimitive;
 pub struct IcrcLiquidationStrategy<T, C, U, W>
 where
     T: IcrcSwapExecutor + Send + Sync,
@@ -69,8 +69,6 @@ where
             balances.insert(asset, balance);
         }
 
-        println!("Balance {:?}", balances);
-
         for user in users {
             // Find the largest debt position
             let debt_position = user
@@ -120,7 +118,10 @@ where
 
             let max_balance = available_balance.clone() - repayment_token.fee.clone();
 
-            debug!("available_balance: {:?} repayment_token_fee {:?} max_balance: {:?}", available_balance, repayment_token.fee, max_balance);
+            debug!(
+                "available_balance: {:?} repayment_token_fee {:?} max_balance: {:?}",
+                available_balance, repayment_token.fee, max_balance
+            );
             let estimation = self
                 .collateral_service
                 .calculate_liquidation_amounts(max_balance, debt_position, collateral_position, &user)
@@ -172,10 +173,10 @@ where
             // - So total cost is 2x token_fee plus the debt amount repaid
             let profit = Int::from(amount_received)
                 - Int::from(estimation.repaid_debt.clone())
-                - Int::from(repayment_token.fee.clone()) * 2
-                - Int::from(collateral_token.fee.clone()) * 2;
+                - Int::from(repayment_token.fee.clone()) * 2u128
+                - Int::from(collateral_token.fee.clone()) * 2u128;
 
-            println!("Profit {profit}");
+            println!("Expected Profit {profit}");
             if profit < 0 {
                 // No profit, move on
                 continue;
@@ -192,6 +193,7 @@ where
                     debt_amount: Some(estimation.repaid_debt.clone()),
                 },
                 swap_args,
+                expected_profit: profit.0.to_u128().unwrap(),
             });
         }
 

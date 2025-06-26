@@ -72,7 +72,7 @@ impl<P: PriceOracle> CollateralServiceTrait for CollateralService<P> {
 
         let debt_amount = debt_position.debt_amount.clone().min(max_repay_amount.clone());
 
-        let debt_value = (debt_amount.clone() * debt_price.0) / 10u128.pow(debt_decimals);
+        let debt_value = (debt_amount.clone() * debt_price.0.clone()) / 10u128.pow(debt_decimals);
         let max_liquidation = (user.total_debt.clone() * liquidation_ratio) / 1000u128;
 
         debug!("Debt amount: {}", debt_amount);
@@ -141,13 +141,13 @@ mod test {
         mock_oracle
             .expect_get_price()
             .with(eq("BTC"), eq("USDT"))
-            .return_once(|_, _| Ok((80000000000000u64, 9)));
+            .return_once(|_, _| Ok((80000000000000u64.into(), 9)));
 
         // USDT -> USDT = $1.00 with 6 decimals
         mock_oracle
             .expect_get_price()
             .with(eq("USDT"), eq("USDT"))
-            .return_once(|_, _| Ok((1_000_000_000, 9)));
+            .return_once(|_, _| Ok((1_000_000_000u64.into(), 9)));
 
         let service = CollateralService::new(Arc::new(mock_oracle));
 
@@ -200,13 +200,13 @@ mod test {
         mock_oracle
             .expect_get_price()
             .with(eq("USDT"), eq("USDT"))
-            .return_once(|_, _| Ok((1_000_000, 6)));
+            .return_once(|_, _| Ok((1_000_000u64.into(), 6)));
 
         // BTC -> USDT = $80,000.00 with 9 decimals
         mock_oracle
             .expect_get_price()
             .with(eq("BTC"), eq("USDT"))
-            .return_once(|_, _| Ok((80_000_000_000, 9)));
+            .return_once(|_, _| Ok((80_000_000_000u64.into(), 9)));
 
         let service = CollateralService::new(Arc::new(mock_oracle));
 
@@ -264,13 +264,13 @@ mod test {
         mock_oracle
             .expect_get_price()
             .with(eq("USDT"), eq("USDT"))
-            .return_once(|_, _| Ok((1_000_000, 6)));
+            .return_once(|_, _| Ok((1_000_000u64.into(), 6)));
 
         // BTC -> USDT = $80,000.00 with 9 decimals
         mock_oracle
             .expect_get_price()
             .with(eq("BTC"), eq("USDT"))
-            .return_once(|_, _| Ok((80_000_000_000, 9)));
+            .return_once(|_, _| Ok((80_000_000_000u64.into(), 9)));
 
         let service = CollateralService::new(Arc::new(mock_oracle));
 

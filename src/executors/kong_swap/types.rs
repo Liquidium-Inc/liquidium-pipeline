@@ -63,6 +63,10 @@ pub struct ICTransferReply {
     pub block_index: Nat,
 }
 
+
+#[derive(CandidType, Deserialize)]
+pub enum SwapResult { Ok(SwapReply), Err(String) }
+
 #[derive(CandidType, Debug, Clone, Serialize, Deserialize)]
 pub struct SwapReply {
     pub tx_id: u64,

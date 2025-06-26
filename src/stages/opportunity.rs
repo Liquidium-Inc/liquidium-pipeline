@@ -44,7 +44,11 @@ where
                 .iter()
                 .filter(|item| matches!(item.asset_type, AssetType::CkAsset(_))) // Only liquidated ck asset collaterals
                 .filter(|item| {
-                    supported_assets.contains(&item.asset.to_string()) // Filter out any unsupported assets
+                    let AssetType::CkAsset(asset_principal) = item.asset_type else {
+                        return false;
+                    };
+
+                    supported_assets.contains(&asset_principal.to_string()) // Filter out any unsupported assets
                 })
                 .cloned()
                 .collect();
@@ -55,6 +59,7 @@ where
             .filter(|item| item.positions.len() > 0)
             .cloned()
             .collect();
+
         Ok(opportunities)
     }
 }

@@ -15,7 +15,7 @@ pub mod account {
     #[async_trait]
     pub trait IcrcAccountInfo: Send + Sync {
         async fn get_balance(&self, ledger_id: Principal, account: Principal) -> Result<Nat, String>;
-        async fn sync_balance(&self, ledger_id: Principal, account: Principal) -> Result<(), String>;
+        async fn sync_balance(&self, ledger_id: Principal, account: Principal) -> Result<Nat, String>;
         fn get_cached_balance(&self, ledger_id: Principal, account: Principal) -> Option<Nat>;
     }
 
@@ -51,11 +51,11 @@ pub mod account {
             Ok(balance)
         }
 
-        async fn sync_balance(&self, ledger_id: Principal, account: Principal) -> Result<(), String> {
+        async fn sync_balance(&self, ledger_id: Principal, account: Principal) -> Result<Nat, String> {
             let balance = self.get_balance(ledger_id, account).await?;
             self.cache.lock().unwrap().insert((ledger_id, account), balance.clone());
             debug!("Balance synced for ledger {}. Balance: {}", ledger_id, balance);
-            Ok(())
+            Ok(balance)
         }
 
         fn get_cached_balance(&self, ledger_id: Principal, account: Principal) -> Option<Nat> {

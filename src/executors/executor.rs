@@ -11,6 +11,8 @@ pub struct ExecutorRequest {
     pub liquidation: LiquidationRequest,
     // If the debt and collaterals assets are the same we don't need to swap
     pub swap_args: Option<SwapArgs>,
+    // The expected profit
+    pub expected_profit: u128
 }
 
 #[cfg_attr(test, mockall::automock)]

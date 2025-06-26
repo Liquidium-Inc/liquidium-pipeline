@@ -84,3 +84,46 @@ impl PipelineAgent for ic_agent::Agent {
         Ok(res)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use candid::Encode;
+    use mockall::predicate::*;
+
+    #[tokio::test]
+    async fn test_get_price_decodes_tuple() {
+        let canister = Principal::anonymous();
+        let method = "get_price";
+        let arg = Encode!(&"BTC", &"USDT").expect("encoding failed");
+
+        // Create mock agent
+        let mut mock_agent = MockPipelineAgent::new();
+        mock_agent
+            .expect_call_query_tuple::<(u64, u32)>()
+            .with(eq(canister), eq(method), eq(arg.clone()))
+            .returning(move |_, _, _| Ok((80_000_000_000u64, 9u32)));
+
+        // Call
+        let result = mock_agent
+            .call_query_tuple::<(u64, u32)>(&canister, method, arg)
+            .await
+            .expect("call should succeed");
+
+        assert_eq!(result, (80_000_000_000, 9));
+    }
+
+    #[test]
+    fn test_decode_u64_u32_tuple() {
+        let price: u64 = 85_000_000_000_000;
+        let decimals: u32 = 9;
+
+        let encoded = Encode!(&(price, decimals)).expect("encoding failed");
+        println!("Encoded {:?}",  encoded );
+
+        let (decoded_price, decoded_decimals): (u64, u32) = Decode!(&encoded, (u64, u32)).expect("decoding failed");
+
+        assert_eq!(decoded_price, price);
+        assert_eq!(decoded_decimals, decimals);
+    }
+}

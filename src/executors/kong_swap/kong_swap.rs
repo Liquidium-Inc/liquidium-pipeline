@@ -1,4 +1,4 @@
-use std::{collections::HashMap, str::FromStr, sync::Arc, u128::MAX};
+use std::{collections::HashMap, str::FromStr, sync::Arc};
 
 use async_trait::async_trait;
 use candid::{Encode, Nat, Principal, encode_args};
@@ -12,7 +12,7 @@ use icrc_ledger_types::{
 use log::{debug, info, warn};
 
 use crate::{
-    executors::executor::IcrcSwapExecutor,
+    executors::{executor::IcrcSwapExecutor, kong_swap::types::SwapResult},
     icrc_token::{icrc_token::IcrcToken, icrc_token_amount::IcrcTokenAmount},
     pipeline_agent::PipelineAgent,
 };
@@ -26,7 +26,7 @@ pub struct KongSwapExecutor<A: PipelineAgent> {
     pub account_id: Account,
     pub lending_canister: Principal,
     pub dex_account: Account,
-    pub allowances: HashMap<Principal, Nat>,
+    pub allowances: HashMap<(Principal, Principal), Nat>,
 }
 
 impl<A: PipelineAgent> KongSwapExecutor<A> {
@@ -46,27 +46,51 @@ impl<A: PipelineAgent> KongSwapExecutor<A> {
     pub async fn init(&mut self, tokens: Vec<Principal>) -> Result<(), String> {
         info!("Starting DEX token approval process");
         for token in tokens {
-            let mut allowance = self.allowance(&token).await;
-            debug!("Current allowance for {}: {}", token, allowance);
+            let lending_allowance = self.check_allowance(&token, &self.lending_canister).await;
+            let swap_allowance = self.check_allowance(&token, &self.dex_account.owner).await;
 
-            if allowance < MAX / 2 {
-                info!("Allowance low for {}, re-approving…", token);
-                allowance = match self.approve(&token).await {
-                    Ok(a) => {
-                        debug!("Approved {} => {}", token, a);
-                        a
-                    }
-                    Err(e) => {
-                        warn!("Could not set allowance for {}: {}", token, e);
-                        Nat::from(0u8)
-                    }
-                };
-            }
-
-            self.allowances.insert(token, allowance);
+            self.allowances.insert((token, self.lending_canister), lending_allowance);
+            self.allowances.insert((token, self.dex_account.owner), swap_allowance);
         }
         info!("DEX token approval complete");
         Ok(())
+    }
+
+    async fn check_allowance(&self, token: &Principal, spender: &Principal) -> Nat {
+        let mut allowance = self
+            .allowance(
+                &token,
+                Account {
+                    owner: spender.clone(),
+                    subaccount: None,
+                },
+            )
+            .await;
+        debug!("Current allowance for {}: {}", token, allowance);
+
+        if allowance < max_for_ledger(token) / Nat::from(2u8) {
+            info!("Allowance low for {}, re-approving…", token);
+            allowance = match self
+                .approve(
+                    &token,
+                    Account {
+                        owner: spender.clone(),
+                        subaccount: None,
+                    },
+                )
+                .await
+            {
+                Ok(a) => {
+                    debug!("Approved {} => {}", token, a);
+                    a
+                }
+                Err(e) => {
+                    warn!("Could not set allowance for {}: {}", token, e);
+                    Nat::from(0u8)
+                }
+            };
+        }
+        allowance
     }
 }
 
@@ -103,20 +127,27 @@ impl<A: PipelineAgent> IcrcSwapExecutor for KongSwapExecutor<A> {
         let dex_principal = Principal::from_str(DEX_PRINCIPAL).unwrap();
         let result = self
             .agent
-            .call_update::<SwapReply>(&dex_principal, "swap", Encode!(&swap_args).unwrap())
+            .call_update::<SwapResult>(&dex_principal, "swap", Encode!(&swap_args).unwrap())
             .await
             .map_err(|e| format!("Swap call error: {}", e))?;
 
-        Ok(result)
+        match result {
+            SwapResult::Ok(res) => {
+                Ok(res)
+            },
+            SwapResult::Err(e) => {
+                return Err(format!("Could not execute swap {e}"))
+            }
+        }
     }
 }
 
 impl<A: PipelineAgent> KongSwapExecutor<A> {
-    async fn approve(&self, ledger: &Principal) -> Result<Nat, String> {
+    async fn approve(&self, ledger: &Principal, spender: Account) -> Result<Nat, String> {
         let args = ApproveArgs {
             from_subaccount: None,
-            spender: self.dex_account,
-            amount: Nat::from(MAX),
+            spender,
+            amount: max_for_ledger(ledger),
             expected_allowance: None,
             expires_at: None,
             fee: None,
@@ -136,10 +167,10 @@ impl<A: PipelineAgent> KongSwapExecutor<A> {
         Ok(result)
     }
 
-    async fn allowance(&self, ledger: &Principal) -> Nat {
+    async fn allowance(&self, ledger: &Principal, spender: Account) -> Nat {
         let blob = Encode!(&AllowanceArgs {
             account: self.account_id,
-            spender: self.dex_account,
+            spender,
         })
         .unwrap();
 
@@ -156,4 +187,19 @@ impl<A: PipelineAgent> KongSwapExecutor<A> {
 
         result.allowance
     }
+}
+fn max_for_ledger(token: &Principal) -> Nat {
+    if *token == Principal::from_text("ryjl3-tyaaa-aaaaa-aaaba-cai").unwrap() {
+        return Nat::from(u64::MAX);
+    }
+
+    if *token == Principal::from_text("cngnf-vqaaa-aaaar-qag4q-cai").unwrap() {
+        return Nat::from(340_282_366_920_938_463_463_374_607_431_768_211_455u128);
+    }
+
+    if *token == Principal::from_text("mxzaz-hqaaa-aaaar-qaada-cai").unwrap() {
+        return Nat::from(u64::MAX);
+    }
+
+    Nat::from(0u8)
 }

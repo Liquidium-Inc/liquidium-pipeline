@@ -8,8 +8,8 @@ use crate::ray_math::WadRayMath;
 pub fn estimate_liquidation(
     debt_value: Nat,              // USD in raw units
     bonus_multiplier: Nat,        // e.g. 1100 = 10% bonus (raw)
-    collateral_price: (u64, u32), // (price, decimals)
-    debt_price: (u64, u32),       // (price, decimals)
+    collateral_price: (Nat, u32), // (price, decimals)
+    debt_price: (Nat, u32),       // (price, decimals)
     available_collateral: Nat,    // in raw collateral units
     debt_decimals: u32,
     collateral_decimals: u32,
@@ -18,8 +18,8 @@ pub fn estimate_liquidation(
     let ray_1000        = Nat::from(1000u128).to_ray();
     let bonus_ray       = bonus_multiplier.to_ray();
     let debt_value    = debt_value.to_ray();
-    let collateral_price_ray  = Nat::from(collateral_price.0 as u128).to_ray();
-    let debt_price_ray  = Nat::from(debt_price.0       as u128).to_ray();
+    let collateral_price_ray  = collateral_price.0.to_ray();
+    let debt_price_ray  = debt_price.0.to_ray();
     let collateral_price_scale_ray = Nat::from(10u128.pow(collateral_price.1)).to_ray();
     let debt_price_scale = Nat::from(10u128.pow(debt_price.1)).to_ray();
     let collateral_scale   = Nat::from(10u128.pow(collateral_decimals)).to_ray();
@@ -123,8 +123,8 @@ mod tests {
     fn test_full_liquidation_allowed() {
         let debt_value = nat(1000e6 as u64);
         let bonus_multiplier = nat(1050u64); // 5% bonus
-        let collateral_price = (2_000_000u64, 6); // $2 with 6 decimals
-        let debt_price = (1_000_000u64, 6); // $1 with 6 decimals
+        let collateral_price = (nat(2_000_000u64), 6); // $2 with 6 decimals
+        let debt_price = (nat(1_000_000u64), 6); // $1 with 6 decimals
         let available_collateral = nat(600_000e6 as u64);
 
         let (collateral, debt) = estimate_liquidation(
@@ -151,10 +151,10 @@ mod tests {
         let bonus_multiplier = nat(1100u64);
 
         // Collateral price: $2.00 -> (price, decimals)
-        let collateral_price = (2_000_000_000u64, 9);
+        let collateral_price = (nat(2_000_000_000u64), 9);
 
         // Debt price: $1.00 with 9 decimals
-        let debt_price = (1_000_000_000u64, 9);
+        let debt_price = (nat(1_000_000_000u64), 9);
 
         let available_collateral = nat(600_000_000u64); // enough for full liquidation
 
@@ -162,8 +162,8 @@ mod tests {
         let (collateral, repaid_debt) = estimate_liquidation(
             debt_value.clone(),
             bonus_multiplier.clone(),
-            collateral_price,
-            debt_price,
+            collateral_price.clone(),
+            debt_price.clone(),
             available_collateral.clone(),
             9u32,
             6u32
@@ -178,7 +178,7 @@ mod tests {
         let adjusted = debt_value.clone() * bonus_multiplier.clone() / nat(1000u64); // in 9 decimals
         let expected_collateral = adjusted.clone()
             * nat(10u64.pow(6)) // scale to collateral decimals
-            / nat(collateral_price.0 as u128); // price already in 6 decimals
+            / collateral_price.0 ; // price already in 6 decimals
 
         assert_eq!(
             collateral, expected_collateral,
@@ -202,10 +202,10 @@ mod tests {
         let bonus_multiplier = nat(1200u64);
 
         // Collateral price: $2.00 -> (price, decimals)
-        let collateral_price = (2_000_00000u64, 8);
+        let collateral_price = (nat(2_000_00000u64), 8);
 
         // Debt price: $1.00 with 9 decimals
-        let debt_price = (1_000_000_000u64, 9);
+        let debt_price = (nat(1_000_000_000u64), 9);
 
         // Available collateral = 0.5 units -> 0.5 * 1e6 = 500_000
         let available_collateral = nat(500_000u64);
@@ -214,8 +214,8 @@ mod tests {
         let (collateral, repaid_debt) = estimate_liquidation(
             debt_value.clone(),
             bonus_multiplier.clone(),
-            collateral_price,
-            debt_price,
+            collateral_price.clone(),
+            debt_price.clone(),
             available_collateral.clone(),
             12u32,
             6u32
@@ -242,7 +242,7 @@ mod tests {
 
       
         let collateral_value =  available_collateral *  
-                                Nat::from(collateral_price.0 as u128) // collateral USD value 
+                                collateral_price.0.clone()  // collateral USD value 
                                 / Nat::from(10u128.pow(6));
 
         let expected_repaid_debt_value = collateral_value * Nat::from(1000u64) / bonus_multiplier.clone();
@@ -250,7 +250,7 @@ mod tests {
         println!("expected_repaid_debt: {}", expected_repaid_debt_value);
 
         let expected_repaid_debt = expected_repaid_debt_value.to_ray()
-                                .ray_div(&Nat::from(debt_price.0 as u128).to_ray()) 
+                                .ray_div(&debt_price.0.to_ray()) 
                                 .ray_mul(&Nat::from(10u128.pow(12)).to_ray())
                                 .from_ray();
       
@@ -273,10 +273,10 @@ mod tests {
         let bonus_multiplier = nat(1200u64);
 
         // Collateral price: $1.00 -> (price, decimals)
-        let collateral_price = (1000000000, 9);
+        let collateral_price = (nat(1000000000u128), 9);
 
         // Debt price: $80,000.00 with 9 decimals
-        let debt_price = (80000000000000, 9);
+        let debt_price = (nat(80000000000000u128), 9);
 
         // Available collateral = 99.94 units -> * 1e6 = 99_940_000u
         let available_collateral = nat(99_940_000u128);
@@ -285,8 +285,8 @@ mod tests {
         let (collateral, repaid_debt) = estimate_liquidation(
             debt_value.clone(),
             bonus_multiplier.clone(),
-            collateral_price,
-            debt_price,
+            collateral_price.clone(),
+            debt_price.clone(),
             available_collateral.clone(),
             8u32,
             6u32
@@ -323,10 +323,10 @@ mod tests {
         let bonus_multiplier = nat(1050u64);
 
         // Collateral price: $2.000000 (scaled as 2_000_000 with 6 decimals)
-        let collateral_price = (2_000_000u64, 6);
+        let collateral_price = (nat(2_000_000u64), 6);
 
         // Debt price: $1.000000 (scaled as 1_000_000 with 6 decimals)
-        let debt_price = (1_000_000u64, 6);
+        let debt_price = (nat(1_000_000u64), 6);
 
         // Zero available collateral — user has no funds to seize
         let available_collateral = nat(0u64);
@@ -338,7 +338,7 @@ mod tests {
             collateral_price,
             debt_price,
             available_collateral.clone(),
-              6u32,
+            6u32,
             6u32
         );
 

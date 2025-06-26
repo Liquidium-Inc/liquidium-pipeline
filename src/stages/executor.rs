@@ -2,6 +2,7 @@ use async_trait::async_trait;
 use candid::Encode;
 use lending::interface::liquidation::{LiquidationResult, LiquidationStatus};
 use log::info;
+use num_traits::ToPrimitive;
 
 use crate::{
     executors::{
@@ -25,6 +26,8 @@ pub struct ExecutionReceipt {
     pub liquidation_result: Option<LiquidationResult>,
     pub swap_result: Option<SwapReply>,
     pub status: ExecutionStatus,
+    pub expected_profit: u128,
+    pub realized_profit: i128,
 }
 
 #[async_trait]
@@ -50,6 +53,8 @@ impl<A: PipelineAgent> PipelineStage<Vec<ExecutorRequest>, Vec<ExecutionReceipt>
                 execution_receipts.push(ExecutionReceipt {
                     liquidation_result: None,
                     swap_result: None,
+                    expected_profit: executor_request.expected_profit,
+                    realized_profit: 0,
                     status: ExecutionStatus::Error(format!(
                         "Could not execute liquidation {:?} {:?}",
                         executor_request,
@@ -61,21 +66,25 @@ impl<A: PipelineAgent> PipelineStage<Vec<ExecutorRequest>, Vec<ExecutionReceipt>
             }
 
             info!("Executed liquidation {:?}", liquidation_result);
-
             execution_receipts.push(ExecutionReceipt {
                 liquidation_result: liquidation_result.ok(),
                 swap_result: None,
                 status: ExecutionStatus::Success,
+                expected_profit: executor_request.expected_profit,
+                realized_profit: 0,
             });
 
             if executor_request.swap_args.is_some() {
+                //TODO: Add retry, handle failed swaps do to slippage
                 let result = self
                     .swap(executor_request.swap_args.unwrap())
                     .await
-                    .unwrap_or_else(|_| panic!("Could not execute swap"));
+                    .unwrap_or_else(|e| panic!("Could not execute swap ${e}"));
 
                 let len = execution_receipts.len();
+                let realized_profit = result.receive_amount.clone() - executor_request.liquidation.debt_amount.unwrap();
                 execution_receipts[len - 1].swap_result = Some(result);
+                execution_receipts[len - 1].realized_profit = realized_profit.0.to_i128().unwrap();
             }
         }
 
@@ -181,6 +190,7 @@ mod test {
                 max_slippage: Some(3.0),
                 referred_by: None,
             }),
+            expected_profit: 0,
         };
 
         let result = executor.process(vec![request]).await;
@@ -234,6 +244,7 @@ mod test {
                 debt_amount: Some(Nat::from(18_000u64)),
             },
             swap_args: None,
+            expected_profit: 0,
         };
 
         let result = executor.process(vec![request]).await;
@@ -284,6 +295,7 @@ mod test {
                 max_slippage: Some(3.0),
                 referred_by: None,
             }),
+            expected_profit: 0,
         };
 
         let result = executor.process(vec![request]).await.expect("process failed");
@@ -363,6 +375,7 @@ mod test {
                 max_slippage: Some(3.0),
                 referred_by: None,
             }),
+            expected_profit: 0,
         };
 
         // Run the executor
