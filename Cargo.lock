@@ -3877,6 +3877,7 @@ dependencies = [
  "num-format",
  "num-traits",
  "once_cell",
+ "openssl",
  "rand 0.9.1",
  "serde",
  "serde_json",

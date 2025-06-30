@@ -23,6 +23,7 @@ ctor = "0.4.2"
 clap = { version = "4.5.40", features = ["derive"] }
 num-format = "0.4.4"
 icrc-ledger-types = "0.1.10"
+openssl = "0.10"
 
 
 lending = { path = "../liquidium-icp-pools/liquidium-pools/canisters/lending" }
