@@ -1,9 +1,11 @@
-use std::{ops::Deref, sync::Arc};
+use std::sync::Arc;
 
 use candid::{Nat, Principal};
 use ic_agent::Agent;
 use icrc_ledger_agent::Icrc1Agent;
 use lending_utils::types::assets::{Asset, Assets};
+
+use crate::pipeline_agent::PipelineAgent;
 
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
@@ -35,7 +37,7 @@ impl From<(Assets, Principal)> for IcrcToken {
 impl IcrcToken {
     pub async fn from_principal(principal: Principal, agent: Arc<Agent>) -> Self {
         let agent = Icrc1Agent {
-            agent: agent.deref().clone(),
+            agent: agent.agent(),
             ledger_canister_id: principal,
         };
 
@@ -53,7 +55,7 @@ impl IcrcToken {
             .symbol(icrc_ledger_agent::CallMode::Query)
             .await
             .expect("could not get symbol");
-        
+
         let fee = agent
             .fee(icrc_ledger_agent::CallMode::Query)
             .await

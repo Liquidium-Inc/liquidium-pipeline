@@ -28,7 +28,7 @@ struct Cli {
 #[derive(Subcommand)]
 enum Commands {
     Run,
-    Funds,
+    Balance,
     Withdraw { asset: String, amount: String, to: String },
 }
 
@@ -41,12 +41,11 @@ async fn main() {
         Commands::Run => {
             run_liquidation_loop().await;
         }
-        Commands::Funds => {
+        Commands::Balance => {
            commands::funds::funds().await;
         }
         Commands::Withdraw { asset, amount, to } => {
-            println!("Withdrawing {} {} to {}", amount, asset, to);
-            // TODO: Implement actual withdraw logic with account_service
+            commands::withdraw::withdraw(asset, amount, to).await;
         }
     }
 }

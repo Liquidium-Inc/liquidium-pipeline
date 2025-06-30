@@ -34,7 +34,7 @@ pub async fn funds() {
                 .sync_balance(principal, liquidator_principal)
                 .await
                 .expect("Failed to sync balance");
-            balance.formatted()
+            (balance.formatted(), principal)
         })
     });
 
@@ -43,9 +43,8 @@ pub async fn funds() {
     println!("Account: {}", config.liquidator_principal.to_text());
     for result in results {
         match result {
-            Ok(formatted) => println!("{}", formatted),
+            Ok(formatted) => println!("{} ({})", formatted.0, formatted.1),
             Err(e) => eprintln!("Task failed: {}", e),
         }
     }
-    
 }
