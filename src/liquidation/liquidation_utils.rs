@@ -21,7 +21,6 @@ pub fn estimate_liquidation(
     let collateral_price_ray  = collateral_price.0.to_ray();
     let debt_price_ray  = debt_price.0.to_ray();
     let collateral_price_scale_ray = Nat::from(10u128.pow(collateral_price.1)).to_ray();
-    let debt_price_scale = Nat::from(10u128.pow(debt_price.1)).to_ray();
     let collateral_scale   = Nat::from(10u128.pow(collateral_decimals)).to_ray();
     let debt_scale   = Nat::from(10u128.pow(debt_decimals)).to_ray();
 

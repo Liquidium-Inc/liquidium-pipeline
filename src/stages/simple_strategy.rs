@@ -66,7 +66,7 @@ where
                 .get_cached_balance(asset, self.config.get_liquidator_principal())
                 .ok_or("Could not get balance")?;
 
-            balances.insert(asset, balance);
+            balances.insert(asset, balance.value);
         }
 
         for user in users {
@@ -283,9 +283,18 @@ mod tests {
             });
 
         let mut account = MockIcrcAccountInfo::new();
-        account
-            .expect_get_cached_balance()
-            .returning(|_, _| Some(Nat::from(10_000u64)));
+        account.expect_get_cached_balance().returning(|_, _| {
+            Some(IcrcTokenAmount {
+                token: IcrcToken {
+                    ledger: Principal::anonymous(),
+                    decimals: 8,
+                    name: "Dummy Token".to_string(),
+                    symbol: "DUM".to_string(),
+                    fee: Nat::from(0u8), // example fee in smallest units
+                },
+                value: Nat::from(10_000u64),
+            })
+        });
 
         let strategy = IcrcLiquidationStrategy::new(
             Arc::new(config),
@@ -399,9 +408,18 @@ mod tests {
 
         // Mock available balance as sufficient
         let mut account = MockIcrcAccountInfo::new();
-        account
-            .expect_get_cached_balance()
-            .returning(|_, _| Some(Nat::from(10_000u64)));
+        account.expect_get_cached_balance().returning(|_, _| {
+            Some(IcrcTokenAmount {
+                token: IcrcToken {
+                    ledger: Principal::anonymous(),
+                    decimals: 8,
+                    name: "Dummy Token".to_string(),
+                    symbol: "DUM".to_string(),
+                    fee: Nat::from(0u8), // example fee in smallest units
+                },
+                value: Nat::from(10_000u64),
+            })
+        });
 
         // Build strategy
         let strategy = IcrcLiquidationStrategy::new(
@@ -593,9 +611,19 @@ mod tests {
             .returning(|_, _, _, _| panic!("should not be called"));
 
         let mut account = MockIcrcAccountInfo::new();
-        account
-            .expect_get_cached_balance()
-            .returning(|_, _| Some(Nat::from(10_000u64))); // simulate valid balance
+
+        account.expect_get_cached_balance().returning(|_, _| {
+            Some(IcrcTokenAmount {
+                token: IcrcToken {
+                    ledger: Principal::anonymous(),
+                    decimals: 8,
+                    name: "Dummy Token".to_string(),
+                    symbol: "DUM".to_string(),
+                    fee: Nat::from(0u8), // example fee in smallest units
+                },
+                value: Nat::from(10_000u64),
+            })
+        });
 
         let strategy = IcrcLiquidationStrategy::new(
             Arc::new(config),
@@ -701,9 +729,18 @@ mod tests {
             });
 
         let mut account = MockIcrcAccountInfo::new();
-        account
-            .expect_get_cached_balance()
-            .returning(|_, _| Some(Nat::from(10_000u64)));
+        account.expect_get_cached_balance().returning(|_, _| {
+            Some(IcrcTokenAmount {
+                token: IcrcToken {
+                    ledger: Principal::anonymous(),
+                    decimals: 8,
+                    name: "Dummy Token".to_string(),
+                    symbol: "DUM".to_string(),
+                    fee: Nat::from(0u8), // example fee in smallest units
+                },
+                value: Nat::from(10_000u64),
+            })
+        });
 
         let strategy = IcrcLiquidationStrategy::new(
             Arc::new(config),
@@ -815,9 +852,18 @@ mod tests {
             });
 
         let mut account = MockIcrcAccountInfo::new();
-        account
-            .expect_get_cached_balance()
-            .returning(|_, _| Some(Nat::from(10_000u64)));
+        account.expect_get_cached_balance().returning(|_, _| {
+            Some(IcrcTokenAmount {
+                token: IcrcToken {
+                    ledger: Principal::anonymous(),
+                    decimals: 8,
+                    name: "Dummy Token".to_string(),
+                    symbol: "DUM".to_string(),
+                    fee: Nat::from(0u8), // example fee in smallest units
+                },
+                value: Nat::from(10_000u64),
+            })
+        });
 
         let strategy = IcrcLiquidationStrategy::new(
             Arc::new(config),

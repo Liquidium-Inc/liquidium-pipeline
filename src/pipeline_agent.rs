@@ -1,4 +1,5 @@
 use candid::{CandidType, Decode, Principal};
+use ic_agent::Agent;
 use serde::de::DeserializeOwned;
 
 #[cfg_attr(test, mockall::automock)]
@@ -11,6 +12,7 @@ pub trait PipelineAgent: Send + Sync {
         arg: Vec<u8>,
     ) -> Result<R, String>;
 
+    #[allow(dead_code)]
     async fn call_query_tuple<R: Sized + CandidType + DeserializeOwned + 'static>(
         &self,
         canister: &Principal,
@@ -24,6 +26,8 @@ pub trait PipelineAgent: Send + Sync {
         method: &str,
         arg: Vec<u8>,
     ) -> Result<R, String>;
+
+    fn agent(&self) -> Agent;
 }
 
 #[async_trait::async_trait]
@@ -83,6 +87,10 @@ impl PipelineAgent for ic_agent::Agent {
 
         Ok(res)
     }
+
+    fn agent(&self) -> Agent {
+        self.clone()
+    }
 }
 
 #[cfg(test)]
@@ -119,7 +127,7 @@ mod tests {
         let decimals: u32 = 9;
 
         let encoded = Encode!(&(price, decimals)).expect("encoding failed");
-        println!("Encoded {:?}",  encoded );
+        println!("Encoded {:?}", encoded);
 
         let (decoded_price, decoded_decimals): (u64, u32) = Decode!(&encoded, (u64, u32)).expect("decoding failed");
 

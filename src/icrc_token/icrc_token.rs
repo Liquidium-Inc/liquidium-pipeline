@@ -43,14 +43,17 @@ impl IcrcToken {
             .decimals(icrc_ledger_agent::CallMode::Query)
             .await
             .expect("could not get decimals");
+
         let name = agent
             .name(icrc_ledger_agent::CallMode::Query)
             .await
             .expect("could not get name");
+
         let symbol = agent
             .symbol(icrc_ledger_agent::CallMode::Query)
             .await
             .expect("could not get symbol");
+        
         let fee = agent
             .fee(icrc_ledger_agent::CallMode::Query)
             .await

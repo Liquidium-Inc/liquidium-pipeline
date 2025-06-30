@@ -1,7 +1,7 @@
 use candid::Principal;
 use env_logger::Env;
 use ic_agent::{Agent, Identity};
-use log::info;
+use log::debug;
 use std::collections::HashMap;
 use std::env;
 use std::sync::Arc;
@@ -33,6 +33,7 @@ impl ConfigTrait for Config {
     fn get_debt_assets(&self) -> HashMap<String, IcrcToken> {
         self.debt_assets.clone()
     }
+
     fn get_liquidator_principal(&self) -> Principal {
         self.liquidator_principal.clone()
     }
@@ -51,7 +52,7 @@ impl Config {
         let identity = create_identity_from_pem_file(&pem_path).expect("could not create identity");
         let liquidator_principal = identity.sender().expect("could not decode liquidator principal");
 
-        info!("Using identity {}", liquidator_principal);
+        debug!("Using identity {}", liquidator_principal);
 
         // Load the asset maps
         let (debt, coll) = load_asset_maps().await;
@@ -72,7 +73,12 @@ impl Config {
 
 async fn load_asset_maps() -> (HashMap<String, IcrcToken>, HashMap<String, IcrcToken>) {
     let ic_url = env::var("IC_URL").unwrap();
-    let agent = Arc::new(Agent::builder().with_url(ic_url.clone()).build().expect("could not initialize client"));
+    let agent = Arc::new(
+        Agent::builder()
+            .with_url(ic_url.clone())
+            .build()
+            .expect("could not initialize client"),
+    );
     let mut debt = HashMap::new();
 
     for p in parse_principals("DEBT_ASSETS") {

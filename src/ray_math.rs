@@ -1,5 +1,6 @@
 use candid::Nat;
 
+#[allow(dead_code)]
 pub trait WadRayMath {
     fn wad_mul(&self, other: &Self) -> Self;
     fn wad_div(&self, other: &Self) -> Self;
@@ -21,6 +22,7 @@ pub const RAY: u128 = 1_000_000_000_000_000_000_000_000_000;   // 1e27
 pub const HALF_RAY: u128 = RAY / 2;
 pub const WAD_RAY_RATIO: u128 = 1_000_000_000;                // 1e9
 
+#[allow(dead_code)]
 pub fn ray_from(value: u128) -> Nat {
     Nat::from(value).to_ray()
 }
