@@ -75,7 +75,10 @@ pub mod account {
         }
 
         fn get_cached_balance(&self, ledger_id: Principal, account: Principal) -> Option<IcrcTokenAmount> {
-            self.cache.lock().unwrap().get(&(ledger_id, account)).cloned()
+            let balance = self.cache.lock().unwrap().get(&(ledger_id, account)).cloned();
+            println!("Balance {:?}", balance);
+            balance
+
         }
     }
 

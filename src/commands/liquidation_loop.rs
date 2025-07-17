@@ -5,6 +5,7 @@ use std::{sync::Arc, thread::sleep, time::Duration};
 
 use crate::{
     account::account::LiquidatorAccount,
+    commands::funds::load_assets,
     config::{Config, ConfigTrait},
     executors::kong_swap::kong_swap::KongSwapExecutor,
     liquidation::collateral_service::CollateralService,
@@ -26,6 +27,7 @@ async fn init(
         LiquidatorAccount<Agent>,
     >,
     Arc<KongSwapExecutor<Agent>>,
+    Arc<LiquidatorAccount<Agent>>,
 ) {
     info!("Initializing swap stage...");
     let mut swapper = KongSwapExecutor::new(
@@ -66,7 +68,7 @@ async fn init(
         icrc_account_service.clone(),
     );
 
-    (finder, strategy, executor)
+    (finder, strategy, executor, icrc_account_service)
 }
 
 pub async fn run_liquidation_loop() {
@@ -85,10 +87,11 @@ pub async fn run_liquidation_loop() {
     info!("Agent initialized with principal: {}", config.liquidator_principal);
 
     // Initialize components from run_liquidation_loop module
-    let (finder, strategy, executor) = init(config.clone(), agent.clone()).await;
+    let (finder, strategy, executor, account_service) = init(config.clone(), agent.clone()).await;
     info!("Components initialized");
 
     let debt_assets = config.get_debt_assets().keys().cloned().collect::<Vec<String>>();
+    load_assets(&config, account_service, &debt_assets).await;
 
     loop {
         info!("Polling for liquidation opportunities...");

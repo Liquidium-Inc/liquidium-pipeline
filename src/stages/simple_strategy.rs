@@ -129,7 +129,7 @@ where
 
             let amount_in = IcrcTokenAmount {
                 token: collateral_token.clone(),
-                value: estimation.received_collateral,
+                value: estimation.received_collateral - collateral_token.fee.clone(),
             };
 
             let (swap_args, amount_received) = if collateral_asset_principal == debt_asset_principal {
