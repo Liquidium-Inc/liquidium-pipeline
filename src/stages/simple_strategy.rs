@@ -47,14 +47,14 @@ where
 }
 
 #[async_trait]
-impl<T, C, U, W> PipelineStage<Vec<LiquidatebleUser>, Vec<ExecutorRequest>> for IcrcLiquidationStrategy<T, C, U, W>
+impl<'a, T, C, U, W> PipelineStage<'a, Vec<LiquidatebleUser>, Vec<ExecutorRequest>> for IcrcLiquidationStrategy<T, C, U, W>
 where
     T: IcrcSwapExecutor,
     C: ConfigTrait,
     U: CollateralServiceTrait,
     W: IcrcAccountInfo,
 {
-    async fn process(&self, users: Vec<LiquidatebleUser>) -> Result<Vec<ExecutorRequest>, String> {
+    async fn process(&self, users: &'a  Vec<LiquidatebleUser>) -> Result<Vec<ExecutorRequest>, String> {
         let mut result: Vec<ExecutorRequest> = vec![];
         let mut balances: HashMap<Principal, Nat> = HashMap::new();
 
@@ -116,7 +116,7 @@ where
                 .get(&debt_asset_principal.to_text())
                 .ok_or("invalid debt asset principal")?;
 
-            let max_balance = available_balance.clone() - repayment_token.fee.clone();
+            let max_balance = available_balance.clone() - repayment_token.fee.clone() * 2u64;
 
             debug!(
                 "available_balance: {:?} repayment_token_fee {:?} max_balance: {:?}",
@@ -155,11 +155,12 @@ where
                 )
             };
 
-            debug!("Swap args: {:?}", swap_args);
-
             info!(
-                "repaid_debt={},  amount_received={}",
-                estimation.repaid_debt, amount_received
+                "repaid_debt={} ({}),  amount_received={} ({})",
+                estimation.repaid_debt.0.to_f64().unwrap() / 10u32.pow(repayment_token.decimals as u32) as f64,
+                repayment_token.symbol,
+                amount_received.0.to_f64().unwrap() / 10u32.pow(repayment_token.decimals as u32) as f64,
+                repayment_token.symbol
             );
 
             // Calculate profit as:
@@ -176,14 +177,20 @@ where
                 - Int::from(repayment_token.fee.clone()) * 2u128
                 - Int::from(collateral_token.fee.clone()) * 2u128;
 
-            println!("Expected Profit {profit}");
+            info!(
+                "Expected Profit {} {}",
+                profit.0.to_f64().unwrap() / 10u32.pow(repayment_token.decimals as u32) as f64,
+                repayment_token.symbol
+            );
+
             if profit < 0 {
                 // No profit, move on
                 continue;
             }
 
             // We have profit update the available balance
-            *available_balance = estimation.repaid_debt.clone() - repayment_token.fee.clone() * 2u64;
+            info!("Updating available balance: {:?} {} {}", available_balance, estimation.repaid_debt, repayment_token.fee);
+            *available_balance = available_balance.clone() - estimation.repaid_debt.clone() - repayment_token.fee.clone() * 2u64;
 
             result.push(ExecutorRequest {
                 liquidation: LiquidationRequest {
@@ -330,7 +337,7 @@ mod tests {
             health_factor: Nat::from(950u64),
         };
 
-        let result = strategy.process(vec![user]).await.unwrap();
+        let result = strategy.process(&vec![user]).await.unwrap();
         let req = &result[0];
 
         assert_eq!(req.liquidation.borrower, pos.account);
@@ -459,7 +466,7 @@ mod tests {
         };
 
         // Execute strategy
-        let result = strategy.process(vec![user]).await.unwrap();
+        let result = strategy.process(&vec![user]).await.unwrap();
 
         // Expect no result due to negative profit
         assert!(
@@ -555,8 +562,7 @@ mod tests {
             health_factor: Nat::from(900u16),
         };
 
-        let result = strategy.process(vec![user]).await;
-
+        let result = strategy.process(&vec![user]).await;
         // We expect an early failure due to missing balance
         assert!(result.is_err(), "Expected error due to missing cached balance");
         assert_eq!(result.unwrap_err(), "Could not get balance");
@@ -650,7 +656,7 @@ mod tests {
             health_factor: Nat::from(900u16),
         };
 
-        let result = strategy.process(vec![user]).await;
+        let result = strategy.process(&vec![user]).await;
 
         // Should fail due to invalid asset type
         assert!(result.is_err());
@@ -801,7 +807,7 @@ mod tests {
             health_factor: Nat::from(910u64),
         };
 
-        let result = strategy.process(vec![valid_user, unprofitable_user]).await.unwrap();
+        let result = strategy.process(&vec![valid_user, unprofitable_user]).await.unwrap();
 
         // Only the valid user should yield one ExecutorRequest
         assert_eq!(result.len(), 1);
@@ -861,7 +867,7 @@ mod tests {
                     symbol: "DUM".to_string(),
                     fee: Nat::from(0u8), // example fee in smallest units
                 },
-                value: Nat::from(10_000u64),
+                value: Nat::from(10_000e8 as u64),
             })
         });
 
@@ -887,7 +893,7 @@ mod tests {
             health_factor: Nat::from(900u64),
         };
 
-        let result = strategy.process(vec![valid_user]).await.unwrap();
+        let result = strategy.process(&vec![valid_user]).await.unwrap();
 
         // Only the valid user should yield one ExecutorRequest
         assert_eq!(result.len(), 1);

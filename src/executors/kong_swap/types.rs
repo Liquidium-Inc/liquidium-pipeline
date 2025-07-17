@@ -64,7 +64,7 @@ pub struct ICTransferReply {
 }
 
 
-#[derive(CandidType, Deserialize)]
+#[derive(CandidType, Deserialize, Clone, Serialize)]
 pub enum SwapResult { Ok(SwapReply), Err(String) }
 
 #[derive(CandidType, Debug, Clone, Serialize, Deserialize)]

@@ -1,6 +1,6 @@
 use candid::Principal;
 use icrc_ledger_types::icrc1::account::Account;
-use log::{error, info, warn};
+use log::{info, warn};
 use std::{sync::Arc, thread::sleep, time::Duration};
 
 use crate::{
@@ -11,7 +11,7 @@ use crate::{
     liquidation::collateral_service::CollateralService,
     price_oracle::price_oracle::LiquidationPriceOracle,
     stage::PipelineStage,
-    stages::{opportunity::OpportunityFinder, simple_strategy::IcrcLiquidationStrategy},
+    stages::{export::ExportStage, opportunity::OpportunityFinder, simple_strategy::IcrcLiquidationStrategy},
 };
 use ic_agent::Agent;
 
@@ -28,6 +28,7 @@ async fn init(
     >,
     Arc<KongSwapExecutor<Agent>>,
     Arc<LiquidatorAccount<Agent>>,
+    Arc<ExportStage>,
 ) {
     info!("Initializing swap stage...");
     let mut swapper = KongSwapExecutor::new(
@@ -68,7 +69,11 @@ async fn init(
         icrc_account_service.clone(),
     );
 
-    (finder, strategy, executor, icrc_account_service)
+    let exporter = Arc::new(ExportStage {
+        path: config.export_path.clone()
+    });
+
+    (finder, strategy, executor, icrc_account_service, exporter)
 }
 
 pub async fn run_liquidation_loop() {
@@ -87,7 +92,7 @@ pub async fn run_liquidation_loop() {
     info!("Agent initialized with principal: {}", config.liquidator_principal);
 
     // Initialize components from run_liquidation_loop module
-    let (finder, strategy, executor, account_service) = init(config.clone(), agent.clone()).await;
+    let (finder, strategy, executor, account_service, exporter) = init(config.clone(), agent.clone()).await;
     info!("Components initialized");
 
     let debt_assets = config.get_debt_assets().keys().cloned().collect::<Vec<String>>();
@@ -96,7 +101,7 @@ pub async fn run_liquidation_loop() {
     loop {
         info!("Polling for liquidation opportunities...");
 
-        let opportunities = finder.process(debt_assets.clone()).await.unwrap_or_else(|e| {
+        let opportunities = finder.process(&debt_assets).await.unwrap_or_else(|e| {
             warn!("Failed to find opportunities: {e}");
             vec![]
         });
@@ -109,17 +114,25 @@ pub async fn run_liquidation_loop() {
 
         info!("Found {} opportunities", opportunities.len());
 
-        let executions = strategy.process(opportunities).await.unwrap_or_else(|e| {
-            error!("Strategy processing failed: {e}");
-            vec![]
-        });
+        // let executions = strategy.process(&opportunities).await.unwrap_or_else(|e| {
+        //     error!("Strategy processing failed: {e}");
+        //     vec![]
+        // });
 
-        let results = executor.process(executions).await.unwrap_or_else(|e| {
-            error!("Executor failed: {e}");
-            vec![]
-        });
+        // let results = executor.process(&executions).await.unwrap_or_else(|e| {
+        //     error!("Executor failed: {e}");
+        //     vec![]
+        // });
 
-        info!("Completed {} executions", results.len());
+        // if results.is_empty() {
+        //     info!("No successful executions");
+        //     sleep(Duration::from_secs(2));
+        //     continue;
+        // }
+
+        // exporter.process(&results).await.expect("Failed to export results");
+
+        // info!("Completed {} executions", results.len());
         sleep(Duration::from_secs(30));
     }
 }

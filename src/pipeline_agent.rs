@@ -20,12 +20,19 @@ pub trait PipelineAgent: Send + Sync {
         arg: Vec<u8>,
     ) -> Result<R, String>;
 
+    async fn call_update_raw(&self, canister: &Principal, method: &str, arg: Vec<u8>) -> Result<Vec<u8>, String>;
+
     async fn call_update<R: Sized + CandidType + DeserializeOwned + 'static>(
         &self,
         canister: &Principal,
         method: &str,
         arg: Vec<u8>,
-    ) -> Result<R, String>;
+    ) -> Result<R, String> {
+        let res = self.call_update_raw(canister, method, arg).await;
+        // Decode the candid response
+        let res = Decode!(&res.unwrap(), R).map_err(|e| format!("Candid decode error: {e}"))?;
+        Ok(res)
+    }
 
     fn agent(&self) -> Agent;
 }
@@ -69,23 +76,9 @@ impl PipelineAgent for ic_agent::Agent {
         Ok(res)
     }
 
-    async fn call_update<R: CandidType + Sized + DeserializeOwned>(
-        &self,
-        canister: &Principal,
-        method: &str,
-        arg: Vec<u8>,
-    ) -> Result<R, String> {
-        let res = self
-            .update(&canister, method)
-            .with_arg(arg)
-            .call_and_wait()
-            .await
-            .map_err(|e| e.to_string());
-
-        // Decode the candid response
-        let res = Decode!(&res.unwrap(), R).map_err(|e| format!("Candid decode error: {e}"))?;
-
-        Ok(res)
+    async fn call_update_raw(&self, canister: &Principal, method: &str, arg: Vec<u8>) -> Result<Vec<u8>, String> {
+        let res = self.update(&canister, method).with_arg(arg).call_and_wait().await;
+        res.map_err(|e| e.to_string())
     }
 
     fn agent(&self) -> Agent {

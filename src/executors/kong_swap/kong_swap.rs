@@ -49,7 +49,8 @@ impl<A: PipelineAgent> KongSwapExecutor<A> {
             let lending_allowance = self.check_allowance(&token, &self.lending_canister).await;
             let swap_allowance = self.check_allowance(&token, &self.dex_account.owner).await;
 
-            self.allowances.insert((token, self.lending_canister), lending_allowance);
+            self.allowances
+                .insert((token, self.lending_canister), lending_allowance);
             self.allowances.insert((token, self.dex_account.owner), swap_allowance);
         }
         info!("DEX token approval complete");
@@ -105,8 +106,8 @@ impl<A: PipelineAgent> IcrcSwapExecutor for KongSwapExecutor<A> {
         let dex_principal = Principal::from_str(DEX_PRINCIPAL).unwrap();
 
         info!(
-            "Fetching swap info for {} {} {}",
-            token_in.symbol, token_out.symbol, amount.value
+            "Fetching swap info for {} {} -> {} ",
+            amount.value, token_in.symbol, token_out.symbol,
         );
 
         let result = self
@@ -127,17 +128,13 @@ impl<A: PipelineAgent> IcrcSwapExecutor for KongSwapExecutor<A> {
         let dex_principal = Principal::from_str(DEX_PRINCIPAL).unwrap();
         let result = self
             .agent
-            .call_update::<SwapResult>(&dex_principal, "swap", Encode!(&swap_args).unwrap())
+            .call_update::<SwapResult>(&dex_principal, "swap", swap_args.into())
             .await
             .map_err(|e| format!("Swap call error: {}", e))?;
 
         match result {
-            SwapResult::Ok(res) => {
-                Ok(res)
-            },
-            SwapResult::Err(e) => {
-                return Err(format!("Could not execute swap {e}"))
-            }
+            SwapResult::Ok(res) => Ok(res),
+            SwapResult::Err(e) => return Err(format!("Could not execute swap {e}")),
         }
     }
 }

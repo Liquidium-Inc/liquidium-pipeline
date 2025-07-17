@@ -19,11 +19,11 @@ impl<A: PipelineAgent> OpportunityFinder<A> {
 }
 
 #[async_trait]
-impl<A> PipelineStage<Vec<String>, Vec<LiquidatebleUser>> for OpportunityFinder<A>
+impl<'a, A> PipelineStage<'a, Vec<String>, Vec<LiquidatebleUser>> for OpportunityFinder<A>
 where
     A: PipelineAgent,
 {
-    async fn process(&self, supported_assets: Vec<String>) -> Result<Vec<LiquidatebleUser>, String> {
+    async fn process(&self, supported_assets: &'a Vec<String>) -> Result<Vec<LiquidatebleUser>, String> {
         // Configure pagination
         let offset: u64 = 0;
         let limit: u64 = 100;
@@ -49,6 +49,10 @@ where
                     };
 
                     supported_assets.contains(&asset_principal.to_string()) // Filter out any unsupported assets
+                })
+                .filter(|item| {
+                    item.account == Principal::from_text("h64ya-zt56r-44pvj-pjay2-j47ik-gv222-iw4mq-3wrll-yho5m-kmth4-kae")
+                        .expect("Invalid principal text")
                 })
                 .cloned()
                 .collect();
@@ -126,7 +130,7 @@ mod tests {
 
         let finder = OpportunityFinder::new(Arc::new(mock), canister_id);
         let result = finder
-            .process(vec!["BTC".to_string(), "USDC".to_string()])
+            .process(&vec!["BTC".to_string(), "USDC".to_string()])
             .await
             .unwrap();
 

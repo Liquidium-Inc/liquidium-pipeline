@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 
 #[async_trait]
-pub trait PipelineStage<I, O> {
-    async fn process(&self, input: I) -> Result<O, String>;
+pub trait PipelineStage<'a, I, O> {
+    async fn process(&self, input: &'a I) -> Result<O, String>;
 }

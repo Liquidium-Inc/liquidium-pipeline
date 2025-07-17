@@ -31,8 +31,8 @@ pub struct ExecutionReceipt {
 }
 
 #[async_trait]
-impl<A: PipelineAgent> PipelineStage<Vec<ExecutorRequest>, Vec<ExecutionReceipt>> for KongSwapExecutor<A> {
-    async fn process(&self, executor_requests: Vec<ExecutorRequest>) -> Result<Vec<ExecutionReceipt>, String> {
+impl<'a, A: PipelineAgent> PipelineStage<'a, Vec<ExecutorRequest>, Vec<ExecutionReceipt>> for KongSwapExecutor<A> {
+    async fn process(&self, executor_requests: &'a Vec<ExecutorRequest>) -> Result<Vec<ExecutionReceipt>, String> {
         let mut execution_receipts: Vec<ExecutionReceipt> = vec![];
         for executor_request in executor_requests {
             let args = Encode!(&self.account_id.owner, &executor_request.liquidation).map_err(|e| e.to_string())?;
@@ -74,15 +74,33 @@ impl<A: PipelineAgent> PipelineStage<Vec<ExecutorRequest>, Vec<ExecutionReceipt>
                 realized_profit: 0,
             });
 
-            if executor_request.swap_args.is_some() {
-                //TODO: Add retry, handle failed swaps do to slippage
-                let result = self
-                    .swap(executor_request.swap_args.unwrap())
-                    .await
-                    .unwrap_or_else(|e| panic!("Could not execute swap ${e}"));
+            if let Some(mut swap_args) = executor_request.swap_args.clone() {
+                let max_retries = 3;
+                let mut attempt = 0;
+                let result;
+                loop {
+                    match self.swap(swap_args.clone()).await {
+                        Ok(res) => {
+                            info!("Executed swap {:?}", res);
+                            result = res;
+                            break;
+                        }
+                        Err(e) => {
+                            attempt += 1;
+                            if attempt >= max_retries {
+                                panic!("Swap failed after {max_retries} attempts: {e}");
+                            }
 
+                            swap_args.max_slippage = Some(swap_args.max_slippage.unwrap() + 0.25); // Increase slippage for next attempt
+                            tokio::time::sleep(std::time::Duration::from_millis(100 * 2u64.pow(attempt))).await;
+                        }
+                    }
+                }
+
+                info!("Executed swap {:?}", result);
                 let len = execution_receipts.len();
-                let realized_profit = result.receive_amount.clone() - executor_request.liquidation.debt_amount.unwrap();
+                let realized_profit =
+                    result.receive_amount.clone() - executor_request.liquidation.debt_amount.clone().unwrap();
                 execution_receipts[len - 1].swap_result = Some(result);
                 execution_receipts[len - 1].realized_profit = realized_profit.0.to_i128().unwrap();
             }
@@ -102,7 +120,7 @@ mod test {
     use lending_utils::types::pool::AssetType;
 
     use crate::{
-        executors::kong_swap::types::{SwapArgs, SwapReply},
+        executors::kong_swap::types::{SwapArgs, SwapReply, SwapResult},
         pipeline_agent::MockPipelineAgent,
     };
 
@@ -126,7 +144,7 @@ mod test {
             status: LiquidationStatus::Success,
         };
 
-        let swap_result = SwapReply {
+        let swap_result = SwapResult::Ok(SwapReply {
             tx_id: 1,
             request_id: 42,
             status: "Success".to_string(),
@@ -143,20 +161,19 @@ mod test {
             transfer_ids: vec![],
             claim_ids: vec![888],
             ts: 1_717_178_000,
-        };
+        });
 
         mock_agent
-            .expect_call_update::<SwapReply>()
-            .returning(move |_, method, _| match method {
-                "swap" => Ok(swap_result.clone()),
-                _ => panic!("Unexpected method"),
-            });
+            .expect_call_update::<SwapResult>()
+            .withf(|_, method, _| method == "swap")
+            .return_const(Ok(swap_result.clone()));
 
         mock_agent
             .expect_call_update::<LiquidationResult>()
-            .returning(move |_, method, _| match method {
-                "liquidate" => Ok(liquidation_result.clone()),
-                _ => panic!("Unexpected method"),
+            .withf(|_, method, _| method == "liquidate")
+            .returning(move |_, method, _| {
+                println!("{}", method);
+                Ok(liquidation_result.clone())
             });
 
         let executor = KongSwapExecutor {
@@ -178,7 +195,7 @@ mod test {
                 borrower: principal,
                 debt_pool_id: principal,
                 collateral_pool_id: principal,
-                debt_amount: None,
+                debt_amount: Some(Nat::from(500u64)),
             },
             swap_args: Some(SwapArgs {
                 pay_token: "ckUSDC".to_string(),
@@ -193,7 +210,7 @@ mod test {
             expected_profit: 0,
         };
 
-        let result = executor.process(vec![request]).await;
+        let result = executor.process(&vec![request]).await;
         assert!(result.is_ok(), "Expected process to succeed");
     }
 
@@ -247,7 +264,7 @@ mod test {
             expected_profit: 0,
         };
 
-        let result = executor.process(vec![request]).await;
+        let result = executor.process(&vec![request]).await;
         assert!(result.is_ok(), "Expected liquidation-only process to succeed");
     }
 
@@ -298,7 +315,7 @@ mod test {
             expected_profit: 0,
         };
 
-        let result = executor.process(vec![request]).await.expect("process failed");
+        let result = executor.process(&vec![request]).await.expect("process failed");
 
         assert_eq!(result.len(), 1);
         let receipt = &result[0];
@@ -379,6 +396,6 @@ mod test {
         };
 
         // Run the executor
-        let _ = executor.process(vec![request]).await;
+        let _ = executor.process(&vec![request]).await;
     }
 }

@@ -31,9 +31,10 @@ lending-utils = { path = "../liquidium-icp-pools/liquidium-pools/shared", packag
 
 icrc-ledger-agent = "0.1.0"
 once_cell = "1.21.3"
+csv = "1.3.1"
+mockall = "0.13.1"
 
 [dev-dependencies]
-mockall = "0.13.1"
 ic_principal = { version = "0.1.1", features = ["arbitrary"] }
 arbitrary = "1.4.1"
 rand = "0.9.1"

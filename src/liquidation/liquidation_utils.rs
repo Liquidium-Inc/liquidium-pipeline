@@ -1,7 +1,7 @@
 
 
 use candid::Nat;
-use log::debug;
+use log::{debug, info};
 
 use crate::ray_math::WadRayMath;
 
@@ -15,20 +15,23 @@ pub fn estimate_liquidation(
     collateral_decimals: u32,
 ) -> (Nat, Nat) {
     // Ray‐scale all the building blocks exactly once:
-    let ray_1000        = Nat::from(1000u128).to_ray();
-    let bonus_ray       = bonus_multiplier.to_ray();
-    let debt_value    = debt_value.to_ray();
-    let collateral_price_ray  = collateral_price.0.to_ray();
-    let debt_price_ray  = debt_price.0.to_ray();
+    let ray_1000                   = Nat::from(1000u128).to_ray();
+    let bonus_ray                  = bonus_multiplier.to_ray();
+    let debt_value                 = debt_value.to_ray();
+    let collateral_price_ray       = collateral_price.0.to_ray();
+    let debt_price_ray             = debt_price.0.to_ray();
     let collateral_price_scale_ray = Nat::from(10u128.pow(collateral_price.1)).to_ray();
-    let collateral_scale   = Nat::from(10u128.pow(collateral_decimals)).to_ray();
-    let debt_scale   = Nat::from(10u128.pow(debt_decimals)).to_ray();
+    let collateral_scale           = Nat::from(10u128.pow(collateral_decimals)).to_ray();
+    let debt_scale                 = Nat::from(10u128.pow(debt_decimals)).to_ray();
 
     debug!(
-        "[estimate] debt_val={} (raw), bonus={}, price_coll={} (dec{}), price_debt={} (dec{}), avail_coll={}",
-        debt_value, bonus_multiplier,
-        collateral_price.0, collateral_price.1,
-        debt_price.0,       debt_price.1,
+        "[estimate] \n\n debt_val={} (raw)\n bonus={}\n price_coll={} (dec{}) \n price_debt={} (dec{}) \n avail_coll={}\n",
+        debt_value.from_ray(),
+        bonus_multiplier,
+        collateral_price.0, 
+        collateral_price.1,
+        debt_price.0,      
+        debt_price.1,
         available_collateral,
     );
 
@@ -38,21 +41,21 @@ pub fn estimate_liquidation(
         .ray_div(&ray_1000);
 
     debug!(
-        "[estimate] adj_debt_ray={} -> {} USD raw",
-        adj_debt_value_ray, adj_debt_value_ray.from_ray()
+        "[estimate] \nadj_debt={} USD",
+        adj_debt_value_ray.from_ray()
     );
 
-    // 2) Compute collateral needed in RAY:
-    //    adj_debt_ray * (10^token_dec) / (10^price_dec) / price
-    let collateral_needed_ray = adj_debt_value_ray // in USD 
-        .ray_mul(&collateral_price_scale_ray)    // account for collateral price decimals 
-        .ray_div(&collateral_price_ray)         // divide by price (ray)
+    // 2) Compute collateral needed in RAY: adj_debt_ray * (10^token_dec) / (10^price_dec) / price
+    let collateral_needed_ray = adj_debt_value_ray 
+        .ray_mul(&collateral_price_scale_ray)
+        .ray_div(&collateral_price_ray)            
         .ray_mul(&collateral_scale)
         .ray_div(&collateral_price_scale_ray);
     
     let collateral_needed = collateral_needed_ray.from_ray();
+
     debug!(
-        "[estimate] collateral_needed={} (tokens), available={}",
+        "[estimate] collateral_needed={}, available={}",
         collateral_needed, available_collateral
     );
 
@@ -65,13 +68,13 @@ pub fn estimate_liquidation(
         let repay = repay_ray.from_ray();
 
         debug!(
-            "[estimate] FULL -> use_coll={}, repay={}",
+            "[estimate] USING PARTIAL COLLATERAL -> use_coll={}, repay={}",
             collateral_needed, repay
         );
         return (collateral_needed, repay);
     }
 
-    debug!("[estimate] PARTIAL -> using all collateral");
+    debug!("[estimate] FULL -> using all collateral");
 
     // value of collateral in USD ray:
     let collateral_value_ray = available_collateral
@@ -90,8 +93,8 @@ pub fn estimate_liquidation(
         .ray_div(&bonus_ray);
 
       debug!(
-        "[estimate] partial_debt_ray={} (raw = {}), debt_scale = {} ",
-        partial_debt_ray, partial_debt_ray.from_ray(), debt_scale.from_ray()
+        "[estimate] partial_debt_ray= {}, debt_scale = {} ",
+        partial_debt_ray.from_ray(), debt_scale.from_ray()
     );
 
     // convert USD ray -> debt tokens
@@ -101,7 +104,7 @@ pub fn estimate_liquidation(
 
     let repay = repay_ray.from_ray();
 
-    debug!(
+    info!(
         "[estimate] PARTIAL -> use_coll={}, repay={}",
         available_collateral, repay
     );

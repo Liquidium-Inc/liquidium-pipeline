@@ -16,6 +16,7 @@ pub struct Config {
     pub collateral_assets: HashMap<String, IcrcToken>,
     pub ic_url: String,
     pub lending_canister: Principal,
+    pub export_path: String,
 }
 
 #[cfg_attr(test, mockall::automock)]
@@ -47,6 +48,7 @@ impl Config {
             .init();
 
         let ic_url = env::var("IC_URL").unwrap();
+        let export_path = env::var("EXPORT_PATH").unwrap_or("default_export.json".to_string());
         // Load the liquidator identity
         let pem_path = env::var("IDENTITY_PEM").unwrap();
         let identity = create_identity_from_pem_file(&pem_path).expect("could not create identity");
@@ -67,6 +69,7 @@ impl Config {
             ic_url,
             liquidator_principal,
             lending_canister,
+            export_path,
         }))
     }
 }
