@@ -103,9 +103,9 @@ impl<P: PriceOracle> CollateralServiceTrait for CollateralService<P> {
             debt_decimals,
             collateral_decimals,
         );
-        
+
         // Factor in the 10% liquidation fee
-        let received_collateral = received_collateral - (received_collateral * 1000u128 / 10_000u128);
+        let received_collateral = received_collateral.clone() - (received_collateral.clone() * 1000u128 / 10_000u128);
         Ok(LiquidationEstimation {
             received_collateral,
             repaid_debt,
