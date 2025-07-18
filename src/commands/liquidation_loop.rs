@@ -15,6 +15,22 @@ use crate::{
 };
 use ic_agent::Agent;
 
+/// Prints the startup banner.
+fn print_banner() {
+    println!(
+        r#"
+██████╗ ██╗██████╗ ███████╗██╗     ██╗███╗   ██╗███████╗
+██╔══██╗██║██╔══██╗██╔════╝██║     ██║████╗  ██║██╔════╝
+██████╔╝██║██████╔╝█████╗  ██║     ██║██╔██╗ ██║█████╗  
+██╔═══╝ ██║██╔═══╝ ██╔══╝  ██║     ██║██║╚██╗██║██╔══╝  
+██║     ██║██║     ███████╗███████╗██║██║ ╚████║███████╗
+╚═╝     ╚═╝╚═╝     ╚══════╝╚══════╝╚═╝╚═╝  ╚═══╝╚══════╝
+                                                        
+          Liquidation Execution Engine
+"#
+    );
+}
+
 async fn init(
     config: Arc<Config>,
     agent: Arc<Agent>,
@@ -76,8 +92,19 @@ async fn init(
 }
 
 pub async fn run_liquidation_loop() {
+    print_banner();
     // Load Config
     let config = Config::load().await.expect("Failed to load config");
+
+    if config.buy_bad_debt {
+        info!("🚨 BUYING BAD DEBT ENABLED: {} 🚨", config.buy_bad_debt);
+        println!("⚠️  You are about to BUY BAD DEBT. Type 'yes' to continue:");
+        let mut input = String::new();
+        std::io::stdin().read_line(&mut input).unwrap();
+        if input.trim() != "yes" {
+            panic!("Aborted by user.");
+        }
+    }
     info!("Config loaded for network: {}", config.ic_url);
 
     // Initialize IC Agent
@@ -125,7 +152,7 @@ pub async fn run_liquidation_loop() {
 
         if results.is_empty() {
             info!("No successful executions");
-            sleep(Duration::from_secs(2));
+            sleep(Duration::from_secs(30));
             continue;
         }
 

@@ -17,6 +17,7 @@ pub struct Config {
     pub ic_url: String,
     pub lending_canister: Principal,
     pub export_path: String,
+    pub buy_bad_debt: bool,
 }
 
 #[cfg_attr(test, mockall::automock)]
@@ -24,6 +25,7 @@ pub trait ConfigTrait: Send + Sync {
     fn get_collateral_assets(&self) -> HashMap<String, IcrcToken>;
     fn get_debt_assets(&self) -> HashMap<String, IcrcToken>;
     fn get_liquidator_principal(&self) -> Principal;
+    fn should_buy_bad_debt(&self) -> bool;
 }
 
 impl ConfigTrait for Config {
@@ -37,6 +39,10 @@ impl ConfigTrait for Config {
 
     fn get_liquidator_principal(&self) -> Principal {
         self.liquidator_principal.clone()
+    }
+
+    fn should_buy_bad_debt(&self) -> bool {
+        self.buy_bad_debt
     }
 }
 
@@ -53,6 +59,9 @@ impl Config {
         let pem_path = env::var("IDENTITY_PEM").unwrap();
         let identity = create_identity_from_pem_file(&pem_path).expect("could not create identity");
         let liquidator_principal = identity.sender().expect("could not decode liquidator principal");
+        let buy_bad_debt = env::var("BUY_BAD_DEBT")
+            .map(|v| v.parse().unwrap_or(false))
+            .unwrap_or(false);
 
         debug!("Using identity {}", liquidator_principal);
 
@@ -70,6 +79,7 @@ impl Config {
             liquidator_principal,
             lending_canister,
             export_path,
+            buy_bad_debt,
         }))
     }
 }

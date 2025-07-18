@@ -118,12 +118,18 @@ where
                 "available_balance: {:?} repayment_token_fee {:?} max_balance: {:?}",
                 available_balance, repayment_token.fee, max_balance
             );
-            let estimation = self
+            let mut estimation = self
                 .collateral_service
                 .calculate_liquidation_amounts(max_balance, debt_position, collateral_position, &user)
                 .await?;
 
-            if estimation.received_collateral < collateral_token.fee {
+            estimation.received_collateral = if estimation.received_collateral < collateral_token.fee {
+                0u64.into()
+            } else {
+                estimation.received_collateral - collateral_token.fee.clone()
+            };
+
+            if !self.config.should_buy_bad_debt() && estimation.received_collateral == 0u32 {
                 // Not enough collateral to cover fees, skip
                 info!(
                     "Not enough collateral {} to cover fees {}, skipping liquidation",
@@ -134,31 +140,31 @@ where
 
             let amount_in = IcrcTokenAmount {
                 token: collateral_token.clone(),
-                value: estimation.received_collateral - collateral_token.fee.clone(),
+                value: estimation.received_collateral.clone(),
             };
 
-            let (swap_args, amount_received) = if collateral_asset_principal == debt_asset_principal {
-                (None, amount_in.value)
-            } else {
-                let swap_info = self
-                    .executor
-                    .get_swap_info(collateral_token, repayment_token, &amount_in)
-                    .await
-                    .expect("could not get swap info");
-                (
-                    Some(SwapArgs {
-                        pay_token: collateral_token.symbol.clone(),
-                        pay_amount: amount_in.value,
-                        pay_tx_id: None,
-                        receive_token: swap_info.receive_symbol,
-                        receive_amount: Some(swap_info.receive_amount.clone()),
-                        receive_address: None,
-                        max_slippage: Some(swap_info.slippage),
-                        referred_by: None,
-                    }),
-                    swap_info.receive_amount,
-                )
-            };
+            let (swap_args, amount_received) = if estimation.received_collateral == 0u32 || collateral_asset_principal == debt_asset_principal {
+                    (None, amount_in.value)
+                } else {
+                    let swap_info = self
+                        .executor
+                        .get_swap_info(collateral_token, repayment_token, &amount_in)
+                        .await
+                        .expect("could not get swap info");
+                    (
+                        Some(SwapArgs {
+                            pay_token: collateral_token.symbol.clone(),
+                            pay_amount: amount_in.value,
+                            pay_tx_id: None,
+                            receive_token: swap_info.receive_symbol,
+                            receive_amount: Some(swap_info.receive_amount.clone()),
+                            receive_address: None,
+                            max_slippage: Some(swap_info.slippage),
+                            referred_by: None,
+                        }),
+                        swap_info.receive_amount,
+                    )
+                };
 
             info!(
                 "repaid_debt={} ({}),  amount_received={} ({})",
@@ -188,7 +194,7 @@ where
                 repayment_token.symbol
             );
 
-            if profit < 0 {
+            if profit <= 0 && !self.config.should_buy_bad_debt() {
                 // No profit, move on
                 continue;
             }
@@ -198,6 +204,7 @@ where
                 "Updating available balance: {:?} {} {}",
                 available_balance, estimation.repaid_debt, repayment_token.fee
             );
+
             *available_balance =
                 available_balance.clone() - estimation.repaid_debt.clone() - repayment_token.fee.clone() * 2u64;
 
@@ -207,10 +214,18 @@ where
                     debt_pool_id: debt_position.pool_id,
                     collateral_pool_id: collateral_position.pool_id,
                     debt_amount: Some(estimation.repaid_debt.clone()),
+                    min_collateral_amount: Some(estimation.received_collateral.clone()),
                 },
                 swap_args,
-                expected_profit: profit.0.to_u128().unwrap(),
+                expected_profit: profit.0.to_i128().unwrap(),
             });
+
+            if profit <= 0 && self.config.should_buy_bad_debt() {
+                info!(
+                    "Buying bad debt {}",
+                    estimation.repaid_debt.0.to_f64().unwrap() / 10u32.pow(repayment_token.decimals as u32) as f64
+                );
+            }
         }
 
         Ok(result)

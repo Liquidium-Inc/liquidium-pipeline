@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use candid::Encode;
 use lending::interface::liquidation::{LiquidationResult, LiquidationStatus};
-use log::{debug, info};
+use log::debug;
 use num_traits::ToPrimitive;
 
 use crate::{
@@ -26,7 +26,7 @@ pub struct ExecutionReceipt {
     pub liquidation_result: Option<LiquidationResult>,
     pub swap_result: Option<SwapReply>,
     pub status: ExecutionStatus,
-    pub expected_profit: u128,
+    pub expected_profit: i128,
     pub realized_profit: i128,
 }
 
@@ -195,6 +195,7 @@ mod test {
                 debt_pool_id: principal,
                 collateral_pool_id: principal,
                 debt_amount: Some(Nat::from(500u64)),
+                min_collateral_amount: None,
             },
             swap_args: Some(SwapArgs {
                 pay_token: "ckUSDC".to_string(),
@@ -258,6 +259,7 @@ mod test {
                 debt_pool_id: principal,
                 collateral_pool_id: principal,
                 debt_amount: Some(Nat::from(18_000u64)),
+                min_collateral_amount: None,
             },
             swap_args: None,
             expected_profit: 0,
@@ -300,6 +302,7 @@ mod test {
                 debt_pool_id: principal,
                 collateral_pool_id: principal,
                 debt_amount: Some(Nat::from(1_000u64)),
+                min_collateral_amount: None,
             },
             swap_args: Some(SwapArgs {
                 pay_token: "ckUSDC".to_string(),
@@ -380,6 +383,7 @@ mod test {
                 debt_pool_id: principal,
                 collateral_pool_id: principal,
                 debt_amount: None,
+                min_collateral_amount: None,
             },
             swap_args: Some(SwapArgs {
                 pay_token: "ckUSDC".to_string(),

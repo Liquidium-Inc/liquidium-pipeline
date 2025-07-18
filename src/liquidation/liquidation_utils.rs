@@ -74,6 +74,21 @@ pub fn estimate_liquidation(
         return (collateral_needed, repay);
     }
 
+    // Handle buying of bad debt
+    if available_collateral == Nat::from(0u8) {
+        // full liquidation: repay entire debt
+        let repay_ray = debt_value
+            .ray_div(&debt_price_ray)
+            .ray_mul(&debt_scale);
+        let repay = repay_ray.from_ray();
+
+        debug!(
+            "[estimate] REPAYING BAD REBT -> use_coll={}, repay={}",
+            available_collateral, repay
+        );
+        return (available_collateral, repay);
+    }
+
     debug!("[estimate] FULL -> using all collateral");
 
     // value of collateral in USD ray:

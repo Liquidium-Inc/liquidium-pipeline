@@ -13,7 +13,7 @@ pub struct ExportStage {
 #[derive(Serialize)]
 struct ExecutionAnalyticsRow {
     status: String,
-    expected_profit: u128,
+    expected_profit: i128,
     realized_profit: i128,
     liquidation_tx_id: Option<String>,
     collateral_asset: Option<String>,
