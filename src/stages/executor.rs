@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use candid::Encode;
 use lending::interface::liquidation::{LiquidationResult, LiquidationStatus};
-use log::info;
+use log::{debug, info};
 use num_traits::ToPrimitive;
 
 use crate::{
@@ -65,7 +65,7 @@ impl<'a, A: PipelineAgent> PipelineStage<'a, Vec<ExecutorRequest>, Vec<Execution
                 continue;
             }
 
-            info!("Executed liquidation {:?}", liquidation_result);
+            debug!("Executed liquidation {:?}", liquidation_result);
             execution_receipts.push(ExecutionReceipt {
                 liquidation_result: liquidation_result.ok(),
                 swap_result: None,
@@ -81,7 +81,6 @@ impl<'a, A: PipelineAgent> PipelineStage<'a, Vec<ExecutorRequest>, Vec<Execution
                 loop {
                     match self.swap(swap_args.clone()).await {
                         Ok(res) => {
-                            info!("Executed swap {:?}", res);
                             result = res;
                             break;
                         }
@@ -97,7 +96,7 @@ impl<'a, A: PipelineAgent> PipelineStage<'a, Vec<ExecutorRequest>, Vec<Execution
                     }
                 }
 
-                info!("Executed swap {:?}", result);
+                debug!("Executed swap {:?}", result);
                 let len = execution_receipts.len();
                 let realized_profit =
                     result.receive_amount.clone() - executor_request.liquidation.debt_amount.clone().unwrap();

@@ -15,6 +15,22 @@ use clap::{Parser, Subcommand};
 
 use commands::liquidation_loop::run_liquidation_loop;
 
+/// Prints the startup banner.
+fn print_banner() {
+    println!(
+        r#"
+██████╗ ██╗██████╗ ███████╗██╗     ██╗███╗   ██╗███████╗
+██╔══██╗██║██╔══██╗██╔════╝██║     ██║████╗  ██║██╔════╝
+██████╔╝██║██████╔╝█████╗  ██║     ██║██╔██╗ ██║█████╗  
+██╔═══╝ ██║██╔═══╝ ██╔══╝  ██║     ██║██║╚██╗██║██╔══╝  
+██║     ██║██║     ███████╗███████╗██║██║ ╚████║███████╗
+╚═╝     ╚═╝╚═╝     ╚══════╝╚══════╝╚═╝╚═╝  ╚═══╝╚══════╝
+                                                        
+          Liquidation Execution Engine
+"#
+    );
+}
+
 #[derive(Parser)]
 #[command(name = "liquidator")]
 #[command(about = "Liquidator Bot CLI to run liquidations, check balances, withdraw funds, and manage accounts.")]
@@ -59,6 +75,8 @@ enum AccountCommands {
 
 #[tokio::main]
 async fn main() {
+
+    print_banner();
     // Parse CLI
     let cli = Cli::parse();
 

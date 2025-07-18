@@ -30,7 +30,6 @@ async fn init(
     Arc<LiquidatorAccount<Agent>>,
     Arc<ExportStage>,
 ) {
-    info!("Initializing swap stage...");
     let mut swapper = KongSwapExecutor::new(
         agent.clone(),
         Account {
@@ -70,7 +69,7 @@ async fn init(
     );
 
     let exporter = Arc::new(ExportStage {
-        path: config.export_path.clone()
+        path: config.export_path.clone(),
     });
 
     (finder, strategy, executor, icrc_account_service, exporter)
@@ -114,25 +113,23 @@ pub async fn run_liquidation_loop() {
 
         info!("Found {} opportunities", opportunities.len());
 
-        // let executions = strategy.process(&opportunities).await.unwrap_or_else(|e| {
-        //     error!("Strategy processing failed: {e}");
-        //     vec![]
-        // });
+        let executions = strategy.process(&opportunities).await.unwrap_or_else(|e| {
+            log::error!("Strategy processing failed: {e}");
+            vec![]
+        });
 
-        // let results = executor.process(&executions).await.unwrap_or_else(|e| {
-        //     error!("Executor failed: {e}");
-        //     vec![]
-        // });
+        let results = executor.process(&executions).await.unwrap_or_else(|e| {
+            log::error!("Executor failed: {e}");
+            vec![]
+        });
 
-        // if results.is_empty() {
-        //     info!("No successful executions");
-        //     sleep(Duration::from_secs(2));
-        //     continue;
-        // }
+        if results.is_empty() {
+            info!("No successful executions");
+            sleep(Duration::from_secs(2));
+            continue;
+        }
 
-        // exporter.process(&results).await.expect("Failed to export results");
-
-        // info!("Completed {} executions", results.len());
+        exporter.process(&results).await.expect("Failed to export results");
         sleep(Duration::from_secs(30));
     }
 }

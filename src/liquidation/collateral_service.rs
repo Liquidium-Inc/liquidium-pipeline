@@ -1,12 +1,12 @@
 use std::sync::Arc;
 
+use crate::{liquidation::liquidation_utils::estimate_liquidation, price_oracle::price_oracle::PriceOracle};
 use async_trait::async_trait;
 use candid::Nat;
 use lending::liquidation::liquidation::{LiquidateblePosition, LiquidatebleUser};
-use lending_utils::{constants::MAX_LIQUIDATION_RATIO, types::assets::Asset};
+use lending_utils::{constants::MAX_LIQUIDATION_RATIO, ray_math::WadRayMath, types::assets::Asset};
 use log::debug;
-
-use crate::{liquidation::liquidation_utils::estimate_liquidation, price_oracle::price_oracle::PriceOracle};
+use num_traits::ToPrimitive;
 
 pub struct LiquidationEstimation {
     pub repaid_debt: Nat,
@@ -58,9 +58,6 @@ impl<P: PriceOracle> CollateralServiceTrait for CollateralService<P> {
             .await
             .map_err(|e| format!("Could not get collateral price: {}", e))?;
 
-        println!("Debt Price [{}]: {:?}", debt_symbol, debt_price);
-        println!("Collateral Price [{}]: {:?}", collateral_symbol, collateral_price);
-
         let liquidation_ratio = if user.health_factor <= 950u128 {
             1000
         } else {
@@ -72,7 +69,7 @@ impl<P: PriceOracle> CollateralServiceTrait for CollateralService<P> {
 
         let debt_amount = debt_position.debt_amount.clone().min(max_repay_amount.clone());
 
-        let debt_value = (debt_amount.clone() * debt_price.0.clone()) / 10u128.pow(debt_decimals);
+        let mut debt_value = (debt_amount.clone() * debt_price.0.clone()) / 10u128.pow(debt_decimals);
         let max_liquidation = (user.total_debt.clone() * liquidation_ratio) / 1000u128;
 
         debug!("Debt amount: {}", debt_amount);
@@ -81,7 +78,13 @@ impl<P: PriceOracle> CollateralServiceTrait for CollateralService<P> {
         debug!("Max liquidation (USD): {}", max_liquidation);
 
         if debt_value > max_liquidation {
-            return Err("Liquidation amount exceeds maximum allowed".to_string());
+            debug!(
+                "Liquidation amount  {} exceeds maxmimum liquidation {}",
+                debt_value.from_ray().0.to_f64().unwrap() / 10u128.pow(debt_decimals as u32) as f64,
+                max_liquidation.from_ray().0.to_f64().unwrap() / 10u128.pow(debt_decimals as u32) as f64
+            );
+
+            debt_value = max_liquidation
         }
 
         let bonus_multiplier = Nat::from(1000u128 + debt_position.liquidation_bonus.clone());

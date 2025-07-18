@@ -48,7 +48,7 @@ impl Config {
             .init();
 
         let ic_url = env::var("IC_URL").unwrap();
-        let export_path = env::var("EXPORT_PATH").unwrap_or("default_export.json".to_string());
+        let export_path = env::var("EXPORT_PATH").unwrap_or("executions.csv".to_string());
         // Load the liquidator identity
         let pem_path = env::var("IDENTITY_PEM").unwrap();
         let identity = create_identity_from_pem_file(&pem_path).expect("could not create identity");

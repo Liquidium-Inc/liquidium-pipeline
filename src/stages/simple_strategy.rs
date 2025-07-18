@@ -47,14 +47,15 @@ where
 }
 
 #[async_trait]
-impl<'a, T, C, U, W> PipelineStage<'a, Vec<LiquidatebleUser>, Vec<ExecutorRequest>> for IcrcLiquidationStrategy<T, C, U, W>
+impl<'a, T, C, U, W> PipelineStage<'a, Vec<LiquidatebleUser>, Vec<ExecutorRequest>>
+    for IcrcLiquidationStrategy<T, C, U, W>
 where
     T: IcrcSwapExecutor,
     C: ConfigTrait,
     U: CollateralServiceTrait,
     W: IcrcAccountInfo,
 {
-    async fn process(&self, users: &'a  Vec<LiquidatebleUser>) -> Result<Vec<ExecutorRequest>, String> {
+    async fn process(&self, users: &'a Vec<LiquidatebleUser>) -> Result<Vec<ExecutorRequest>, String> {
         let mut result: Vec<ExecutorRequest> = vec![];
         let mut balances: HashMap<Principal, Nat> = HashMap::new();
 
@@ -94,11 +95,6 @@ where
                 _ => return Err("invalid asset type".to_string()),
             };
 
-            println!(
-                "collateral asset principal {:?}",
-                collateral_asset_principal.to_string()
-            );
-
             let available_balance = if let Some(b) = balances.get_mut(&debt_asset_principal) {
                 b
             } else {
@@ -126,6 +122,15 @@ where
                 .collateral_service
                 .calculate_liquidation_amounts(max_balance, debt_position, collateral_position, &user)
                 .await?;
+
+            if estimation.received_collateral < collateral_token.fee {
+                // Not enough collateral to cover fees, skip
+                info!(
+                    "Not enough collateral {} to cover fees {}, skipping liquidation",
+                    estimation.received_collateral, collateral_token.fee
+                );
+                continue;
+            }
 
             let amount_in = IcrcTokenAmount {
                 token: collateral_token.clone(),
@@ -189,8 +194,12 @@ where
             }
 
             // We have profit update the available balance
-            info!("Updating available balance: {:?} {} {}", available_balance, estimation.repaid_debt, repayment_token.fee);
-            *available_balance = available_balance.clone() - estimation.repaid_debt.clone() - repayment_token.fee.clone() * 2u64;
+            debug!(
+                "Updating available balance: {:?} {} {}",
+                available_balance, estimation.repaid_debt, repayment_token.fee
+            );
+            *available_balance =
+                available_balance.clone() - estimation.repaid_debt.clone() - repayment_token.fee.clone() * 2u64;
 
             result.push(ExecutorRequest {
                 liquidation: LiquidationRequest {
