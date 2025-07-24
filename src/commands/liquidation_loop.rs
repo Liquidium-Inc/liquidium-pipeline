@@ -1,6 +1,7 @@
 use candid::Principal;
 use icrc_ledger_types::icrc1::account::Account;
 use log::{info, warn};
+use prettytable::{Cell, Row, Table, format};
 use std::{sync::Arc, thread::sleep, time::Duration};
 
 use crate::{
@@ -11,7 +12,12 @@ use crate::{
     liquidation::collateral_service::CollateralService,
     price_oracle::price_oracle::LiquidationPriceOracle,
     stage::PipelineStage,
-    stages::{export::ExportStage, opportunity::OpportunityFinder, simple_strategy::IcrcLiquidationStrategy},
+    stages::{
+        executor::{ExecutionReceipt, ExecutionStatus},
+        export::ExportStage,
+        opportunity::OpportunityFinder,
+        simple_strategy::IcrcLiquidationStrategy,
+    },
 };
 use ic_agent::Agent;
 
@@ -157,6 +163,64 @@ pub async fn run_liquidation_loop() {
         }
 
         exporter.process(&results).await.expect("Failed to export results");
-        sleep(Duration::from_secs(30));
+        print_execution_results(results);
+
+        sleep(Duration::from_secs(5));
     }
+}
+
+pub fn print_execution_results(results: Vec<ExecutionReceipt>) {
+    let mut table = Table::new();
+    table.set_format(*format::consts::FORMAT_NO_LINESEP_WITH_TITLE);
+    table.set_titles(Row::new(vec![
+        Cell::new("Realized (Δ)"),
+        Cell::new("Expected"),
+        Cell::new("Debt Repaid"),
+        Cell::new("Collateral"),
+        Cell::new("Swap Output"),
+        Cell::new("Swap Status"),
+        Cell::new("Status"),
+    ]));
+
+    for r in results {
+        let (debt, collat) = match &r.liquidation_result {
+            Some(_) => (r.formatted_debt_repaid(), r.formatted_received_collateral()),
+            None => ("-".to_string(), "-".to_string()),
+        };
+
+        let (recv_amt, swap_status) = match &r.swap_result {
+            Some(sr) => (r.formatted_swap_output(), sr.status.clone()),
+            None => ("-".to_string(), "-".to_string()),
+        };
+
+        let delta = r.realized_profit - r.expected_profit;
+        let delta_cell = {
+            let txt = format!("{} ({})", r.formatted_realized_profit(), r.formatted_profit_delta());
+            if delta > 0 {
+                Cell::new(&txt).style_spec("Fg")
+            } else if delta < 0 {
+                Cell::new(&txt).style_spec("Fr")
+            } else {
+                Cell::new(&txt)
+            }
+        };
+
+        let status_text = format!("{:?}", r.status);
+        let status_cell = match r.status {
+            ExecutionStatus::Success => Cell::new(&status_text).style_spec("Fg"),
+            ExecutionStatus::Error(_) => Cell::new(&status_text).style_spec("Fr"),
+        };
+
+        table.add_row(Row::new(vec![
+            delta_cell,
+            Cell::new(&r.formatted_expected_profit()),
+            Cell::new(&debt),
+            Cell::new(&collat),
+            Cell::new(&recv_amt),
+            Cell::new(&swap_status),
+            status_cell,
+        ]));
+    }
+
+    table.printstd();
 }

@@ -16,8 +16,6 @@ struct ExecutionAnalyticsRow {
     expected_profit: i128,
     realized_profit: i128,
     liquidation_tx_id: Option<String>,
-    collateral_asset: Option<String>,
-    debt_asset: Option<String>,
     swap_tx_id: Option<u64>,
     pay_chain: Option<String>,
     pay_symbol: Option<String>,
@@ -25,7 +23,6 @@ struct ExecutionAnalyticsRow {
     receive_chain: Option<String>,
     receive_symbol: Option<String>,
     receive_amount: Option<String>,
-    mid_price: Option<f64>,
     price: Option<f64>,
     slippage: Option<f64>,
     swap_ts: Option<u64>,
@@ -46,11 +43,6 @@ impl<'a> PipelineStage<'a, Vec<ExecutionReceipt>, ()> for ExportStage {
                 expected_profit: r.expected_profit,
                 realized_profit: r.realized_profit,
                 liquidation_tx_id: r.liquidation_result.as_ref().map(|l| l.tx_id.clone()),
-                collateral_asset: r
-                    .liquidation_result
-                    .as_ref()
-                    .map(|l| format!("{:?}", l.collateral_asset)),
-                debt_asset: r.liquidation_result.as_ref().map(|l| format!("{:?}", l.debt_asset)),
                 swap_tx_id: r.swap_result.as_ref().map(|s| s.tx_id),
                 pay_chain: r.swap_result.as_ref().map(|s| s.pay_chain.clone()),
                 pay_symbol: r.swap_result.as_ref().map(|s| s.pay_symbol.clone()),
@@ -58,7 +50,6 @@ impl<'a> PipelineStage<'a, Vec<ExecutionReceipt>, ()> for ExportStage {
                 receive_chain: r.swap_result.as_ref().map(|s| s.receive_chain.clone()),
                 receive_symbol: r.swap_result.as_ref().map(|s| s.receive_symbol.clone()),
                 receive_amount: r.swap_result.as_ref().map(|s| s.receive_amount.to_string()),
-                mid_price: r.swap_result.as_ref().map(|s| s.mid_price),
                 price: r.swap_result.as_ref().map(|s| s.price),
                 slippage: r.swap_result.as_ref().map(|s| s.slippage),
                 swap_ts: r.swap_result.as_ref().map(|s| s.ts),

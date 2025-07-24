@@ -23,11 +23,59 @@ pub enum ExecutionStatus {
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct ExecutionReceipt {
+    pub request: ExecutorRequest,
     pub liquidation_result: Option<LiquidationResult>,
     pub swap_result: Option<SwapReply>,
     pub status: ExecutionStatus,
     pub expected_profit: i128,
     pub realized_profit: i128,
+}
+
+impl ExecutionReceipt {
+    pub fn formatted_debt_repaid(&self) -> String {
+        if let Some(result) = &self.liquidation_result {
+            let amount =
+                result.amounts.debt_repaid.0.to_f64().unwrap() / 10f64.powi(self.request.debt_asset.decimals as i32);
+            return format!("{amount} {}", self.request.debt_asset.symbol);
+        }
+        format!("0 {}", self.request.debt_asset.symbol)
+    }
+
+    pub fn formatted_received_collateral(&self) -> String {
+        if let Some(result) = &self.liquidation_result {
+            let amount = result.amounts.collateral_received.0.to_f64().unwrap()
+                / 10f64.powi(self.request.collateral_asset.decimals as i32);
+            return format!("{amount} {}", self.request.collateral_asset.symbol);
+        }
+        format!("0 {}", self.request.collateral_asset.symbol)
+    }
+
+    pub fn formatted_swap_output(&self) -> String {
+        if let Some(result) = &self.swap_result {
+            let amount =
+                result.receive_amount.0.to_f64().unwrap() / 10f64.powi(self.request.debt_asset.decimals as i32);
+            return format!("{amount} {}", self.request.debt_asset.symbol);
+        }
+        format!("0 {}", self.request.debt_asset.symbol)
+    }
+
+    pub fn formatted_realized_profit(&self) -> String {
+        let amount = self.realized_profit as f64 / 10f64.powi(self.request.debt_asset.decimals as i32);
+        return format!("{amount} {}", self.request.debt_asset.symbol);
+    }
+
+    pub fn formatted_expected_profit(&self) -> String {
+        let amount = self.expected_profit as f64 / 10f64.powi(self.request.debt_asset.decimals as i32);
+        return format!("{amount} {}", self.request.debt_asset.symbol);
+    }
+
+    pub fn formatted_profit_delta(&self) -> String {
+        let delta = self.realized_profit - self.expected_profit;
+        let decimals = self.request.debt_asset.decimals as i32;
+        let abs_amount = (delta.abs() as f64) / 10f64.powi(decimals);
+        let prefix = if delta >= 0 { "+" } else { "-" };
+        format!("{prefix}{:.3}", abs_amount)
+    }
 }
 
 #[async_trait]
@@ -51,6 +99,7 @@ impl<'a, A: PipelineAgent> PipelineStage<'a, Vec<ExecutorRequest>, Vec<Execution
             // Check that the liquidation was executed successfully
             if liquidation_result.is_err() {
                 execution_receipts.push(ExecutionReceipt {
+                    request: executor_request.clone(),
                     liquidation_result: None,
                     swap_result: None,
                     expected_profit: executor_request.expected_profit,
@@ -67,6 +116,7 @@ impl<'a, A: PipelineAgent> PipelineStage<'a, Vec<ExecutorRequest>, Vec<Execution
 
             debug!("Executed liquidation {:?}", liquidation_result);
             execution_receipts.push(ExecutionReceipt {
+                request: executor_request.clone(),
                 liquidation_result: liquidation_result.ok(),
                 swap_result: None,
                 status: ExecutionStatus::Success,
@@ -120,6 +170,7 @@ mod test {
 
     use crate::{
         executors::kong_swap::types::{SwapArgs, SwapReply, SwapResult},
+        icrc_token::icrc_token::IcrcToken,
         pipeline_agent::MockPipelineAgent,
     };
 
@@ -190,6 +241,20 @@ mod test {
         };
 
         let request = ExecutorRequest {
+            debt_asset: IcrcToken {
+                ledger: Principal::anonymous(),
+                decimals: 8,
+                name: "Dummy Token".to_string(),
+                symbol: "DUM".to_string(),
+                fee: Nat::from(0u8), // example fee in smallest units
+            },
+            collateral_asset: IcrcToken {
+                ledger: Principal::anonymous(),
+                decimals: 8,
+                name: "Dummy Token".to_string(),
+                symbol: "DUM".to_string(),
+                fee: Nat::from(0u8), // example fee in smallest units
+            },
             liquidation: LiquidationRequest {
                 borrower: principal,
                 debt_pool_id: principal,
@@ -254,6 +319,20 @@ mod test {
         };
 
         let request = ExecutorRequest {
+            debt_asset: IcrcToken {
+                ledger: Principal::anonymous(),
+                decimals: 8,
+                name: "Dummy Token".to_string(),
+                symbol: "DUM".to_string(),
+                fee: Nat::from(0u8), // example fee in smallest units
+            },
+            collateral_asset: IcrcToken {
+                ledger: Principal::anonymous(),
+                decimals: 8,
+                name: "Dummy Token".to_string(),
+                symbol: "DUM".to_string(),
+                fee: Nat::from(0u8), // example fee in smallest units
+            },
             liquidation: LiquidationRequest {
                 borrower: principal,
                 debt_pool_id: principal,
@@ -297,6 +376,20 @@ mod test {
         };
 
         let request = ExecutorRequest {
+            debt_asset: IcrcToken {
+                ledger: Principal::anonymous(),
+                decimals: 8,
+                name: "Dummy Token".to_string(),
+                symbol: "DUM".to_string(),
+                fee: Nat::from(0u8), // example fee in smallest units
+            },
+            collateral_asset: IcrcToken {
+                ledger: Principal::anonymous(),
+                decimals: 8,
+                name: "Dummy Token".to_string(),
+                symbol: "DUM".to_string(),
+                fee: Nat::from(0u8), // example fee in smallest units
+            },
             liquidation: LiquidationRequest {
                 borrower: principal,
                 debt_pool_id: principal,
@@ -378,6 +471,20 @@ mod test {
 
         // Build a request with both liquidation and swap
         let request = ExecutorRequest {
+            debt_asset: IcrcToken {
+                ledger: Principal::anonymous(),
+                decimals: 8,
+                name: "Dummy Token".to_string(),
+                symbol: "DUM".to_string(),
+                fee: Nat::from(0u8), // example fee in smallest units
+            },
+            collateral_asset: IcrcToken {
+                ledger: Principal::anonymous(),
+                decimals: 8,
+                name: "Dummy Token".to_string(),
+                symbol: "DUM".to_string(),
+                fee: Nat::from(0u8), // example fee in smallest units
+            },
             liquidation: LiquidationRequest {
                 borrower: principal,
                 debt_pool_id: principal,

@@ -189,7 +189,7 @@ where
                 - Int::from(collateral_token.fee.clone()) * 2u128;
 
             info!(
-                "Expected Profit {} {}",
+                "Expected Profit {} {}... Executing...",
                 profit.0.to_f64().unwrap() / 10u32.pow(repayment_token.decimals as u32) as f64,
                 repayment_token.symbol
             );
@@ -209,6 +209,8 @@ where
                 available_balance.clone() - estimation.repaid_debt.clone() - repayment_token.fee.clone() * 2u64;
 
             result.push(ExecutorRequest {
+                debt_asset: repayment_token.clone(),
+                collateral_asset: collateral_token.clone(),
                 liquidation: LiquidationRequest {
                     borrower: debt_position.account,
                     debt_pool_id: debt_position.pool_id,
