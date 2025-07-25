@@ -4,7 +4,11 @@ use crate::{liquidation::liquidation_utils::estimate_liquidation, price_oracle::
 use async_trait::async_trait;
 use candid::Nat;
 use lending::liquidation::liquidation::{LiquidateblePosition, LiquidatebleUser};
-use lending_utils::{constants::MAX_LIQUIDATION_RATIO, ray_math::WadRayMath, types::assets::Asset};
+use lending_utils::{
+    constants::{LIQUIDATION_BONUS_SCALE, MAX_LIQUIDATION_RATIO},
+    ray_math::WadRayMath,
+    types::assets::Asset,
+};
 use log::debug;
 use num_traits::ToPrimitive;
 
@@ -87,7 +91,7 @@ impl<P: PriceOracle> CollateralServiceTrait for CollateralService<P> {
             debt_value = max_liquidation
         }
 
-        let bonus_multiplier = Nat::from(1000u128 + debt_position.liquidation_bonus.clone());
+        let bonus_multiplier = Nat::from(LIQUIDATION_BONUS_SCALE + debt_position.liquidation_bonus.clone());
 
         debug!(
             "Estimating liquidation: debt_value={}, bonus_multiplier={}, available_collateral={}, decimals=(debt: {}, collateral: {})",
@@ -96,7 +100,7 @@ impl<P: PriceOracle> CollateralServiceTrait for CollateralService<P> {
 
         let (received_collateral, repaid_debt) = estimate_liquidation(
             debt_value,
-            bonus_multiplier,
+            bonus_multiplier.clone(),
             collateral_price,
             debt_price,
             collateral_position.collateral_amount.clone(),
@@ -104,8 +108,11 @@ impl<P: PriceOracle> CollateralServiceTrait for CollateralService<P> {
             collateral_decimals,
         );
 
-        // Factor in the 10% liquidation fee
-        let received_collateral = received_collateral.clone() - (received_collateral.clone() * 1000u128 / 10_000u128);
+        let bonus =  received_collateral.clone() - ((received_collateral.clone() * LIQUIDATION_BONUS_SCALE) / bonus_multiplier);
+        // TODO: Add the protocol fee the canister metadata response
+        let protocol_fee = (bonus * 200u128) / 10_000u128; // Factor in the 10% liquidation fee
+        let received_collateral = received_collateral.clone() - protocol_fee;
+
         Ok(LiquidationEstimation {
             received_collateral,
             repaid_debt,

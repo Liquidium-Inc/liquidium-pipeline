@@ -143,8 +143,9 @@ where
                 value: estimation.received_collateral.clone(),
             };
 
-            let (swap_args, amount_received) = if estimation.received_collateral == 0u32 || collateral_asset_principal == debt_asset_principal {
-                    (None, amount_in.value)
+            let (swap_args, amount_received, price) =
+                if estimation.received_collateral == 0u32 || collateral_asset_principal == debt_asset_principal {
+                    (None, amount_in.value, 1f64)
                 } else {
                     let swap_info = self
                         .executor
@@ -163,15 +164,17 @@ where
                             referred_by: None,
                         }),
                         swap_info.receive_amount,
+                        swap_info.price,
                     )
                 };
 
             info!(
-                "repaid_debt={} ({}),  amount_received={} ({})",
+                "repaid_debt={} ({}),  amount_received={} ({}), price={}",
                 estimation.repaid_debt.0.to_f64().unwrap() / 10u32.pow(repayment_token.decimals as u32) as f64,
                 repayment_token.symbol,
                 amount_received.0.to_f64().unwrap() / 10u32.pow(repayment_token.decimals as u32) as f64,
-                repayment_token.symbol
+                repayment_token.symbol,
+                price
             );
 
             // Calculate profit as:
@@ -205,8 +208,7 @@ where
                 available_balance, estimation.repaid_debt, repayment_token.fee
             );
 
-            *available_balance =
-                available_balance.clone() - estimation.repaid_debt.clone() - repayment_token.fee.clone() * 2u64;
+            *available_balance = available_balance.clone() - estimation.repaid_debt.clone() - repayment_token.fee.clone() * 2u64;
 
             result.push(ExecutorRequest {
                 debt_asset: repayment_token.clone(),

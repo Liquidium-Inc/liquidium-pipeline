@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use csv::Writer;
 use serde::Serialize;
-use std::fs::File;
+use std::fs::OpenOptions;
 
 use crate::stage::PipelineStage;
 use crate::stages::executor::{ExecutionReceipt, ExecutionStatus};
@@ -31,7 +31,13 @@ struct ExecutionAnalyticsRow {
 #[async_trait]
 impl<'a> PipelineStage<'a, Vec<ExecutionReceipt>, ()> for ExportStage {
     async fn process(&self, input: &'a Vec<ExecutionReceipt>) -> Result<(), String> {
-        let file = File::create(&self.path).map_err(|e| format!("File error: {}", e))?;
+        let file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&self.path)
+            .map_err(|e| format!("File error: {}", e))?;
+
         let mut wtr = Writer::from_writer(file);
 
         for r in input {

@@ -6,7 +6,7 @@ use std::{sync::Arc, thread::sleep, time::Duration};
 
 use crate::{
     account::account::LiquidatorAccount,
-    commands::funds::load_assets,
+    commands::funds::sync_balances,
     config::{Config, ConfigTrait},
     executors::kong_swap::kong_swap::KongSwapExecutor,
     liquidation::collateral_service::CollateralService,
@@ -128,11 +128,10 @@ pub async fn run_liquidation_loop() {
     info!("Components initialized");
 
     let debt_assets = config.get_debt_assets().keys().cloned().collect::<Vec<String>>();
-    load_assets(&config, account_service, &debt_assets).await;
 
     loop {
         info!("Polling for liquidation opportunities...");
-
+        sync_balances(&config, account_service.clone(), &debt_assets).await;
         let opportunities = finder.process(&debt_assets).await.unwrap_or_else(|e| {
             warn!("Failed to find opportunities: {e}");
             vec![]

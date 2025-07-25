@@ -1,13 +1,14 @@
 
 
 use candid::Nat;
+use lending_utils::constants::LIQUIDATION_BONUS_SCALE;
 use log::{debug, info};
 
 use crate::ray_math::WadRayMath;
 
 pub fn estimate_liquidation(
     debt_value: Nat,              // USD in raw units
-    bonus_multiplier: Nat,        // e.g. 1100 = 10% bonus (raw)
+    bonus_multiplier: Nat,        // e.g. 11_000 = 10% bonus (raw)
     collateral_price: (Nat, u32), // (price, decimals)
     debt_price: (Nat, u32),       // (price, decimals)
     available_collateral: Nat,    // in raw collateral units
@@ -15,7 +16,7 @@ pub fn estimate_liquidation(
     collateral_decimals: u32,
 ) -> (Nat, Nat) {
     // Ray‐scale all the building blocks exactly once:
-    let ray_1000                   = Nat::from(1000u128).to_ray();
+let bonus_scale_ray                = Nat::from(LIQUIDATION_BONUS_SCALE).to_ray();
     let bonus_ray                  = bonus_multiplier.to_ray();
     let debt_value                 = debt_value.to_ray();
     let collateral_price_ray       = collateral_price.0.to_ray();
@@ -38,7 +39,7 @@ pub fn estimate_liquidation(
     // 1) Apply liquidation bonus
     let adj_debt_value_ray = debt_value
         .ray_mul(&bonus_ray)
-        .ray_div(&ray_1000);
+        .ray_div(&bonus_scale_ray);
 
     debug!(
         "[estimate] \nadj_debt={} USD",
@@ -104,7 +105,7 @@ pub fn estimate_liquidation(
 
     // reverse bonus: USD ray debt = coll_value_ray * 1000 / bonus
     let partial_debt_ray = collateral_value_ray
-        .ray_mul(&ray_1000)
+        .ray_mul(&bonus_scale_ray)
         .ray_div(&bonus_ray);
 
       debug!(

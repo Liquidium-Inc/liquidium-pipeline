@@ -117,14 +117,16 @@ impl<'a, A: PipelineAgent> PipelineStage<'a, Vec<ExecutorRequest>, Vec<Execution
             debug!("Executed liquidation {:?}", liquidation_result);
             execution_receipts.push(ExecutionReceipt {
                 request: executor_request.clone(),
-                liquidation_result: liquidation_result.ok(),
+                liquidation_result: liquidation_result.clone().ok(),
                 swap_result: None,
                 status: ExecutionStatus::Success,
                 expected_profit: executor_request.expected_profit,
                 realized_profit: 0,
             });
 
+            let collateral_received = liquidation_result.unwrap().amounts.collateral_received.clone();
             if let Some(mut swap_args) = executor_request.swap_args.clone() {
+                swap_args.pay_amount = collateral_received;
                 let max_retries = 3;
                 let mut attempt = 0;
                 let result;

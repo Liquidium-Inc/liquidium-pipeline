@@ -23,7 +23,7 @@ pub async fn funds() {
     let account_service = Arc::new(LiquidatorAccount::new(agent.clone()));
 
     let debt_assets = config.get_debt_assets().keys().cloned().collect::<Vec<String>>();
-    let results = load_assets(&config, account_service, &debt_assets).await;
+    let results = sync_balances(&config, account_service, &debt_assets).await;
 
     println!("Account: {}", config.liquidator_principal.to_text());
     for result in results {
@@ -34,7 +34,7 @@ pub async fn funds() {
     }
 }
 
-pub async fn load_assets(
+pub async fn sync_balances(
     config: &Arc<Config>,
     account_service: Arc<LiquidatorAccount<Agent>>,
     assets: &Vec<String>,
