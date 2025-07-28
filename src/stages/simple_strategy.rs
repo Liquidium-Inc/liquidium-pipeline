@@ -112,6 +112,10 @@ where
                 .get(&debt_asset_principal.to_text())
                 .ok_or("invalid debt asset principal")?;
 
+            if available_balance.clone() < repayment_token.fee.clone() * 2u64 {
+                return Err("Insufficient funds to execute liquidation".to_string());
+            }
+
             let max_balance = available_balance.clone() - repayment_token.fee.clone() * 2u64;
 
             debug!(
@@ -208,7 +212,8 @@ where
                 available_balance, estimation.repaid_debt, repayment_token.fee
             );
 
-            *available_balance = available_balance.clone() - estimation.repaid_debt.clone() - repayment_token.fee.clone() * 2u64;
+            *available_balance =
+                available_balance.clone() - estimation.repaid_debt.clone() - repayment_token.fee.clone() * 2u64;
 
             result.push(ExecutorRequest {
                 debt_asset: repayment_token.clone(),

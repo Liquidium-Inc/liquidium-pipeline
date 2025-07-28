@@ -1,5 +1,6 @@
 use candid::Principal;
 use icrc_ledger_types::icrc1::account::Account;
+use indicatif::{ProgressBar, ProgressStyle};
 use log::{info, warn};
 use prettytable::{Cell, Row, Table, format};
 use std::{sync::Arc, thread::sleep, time::Duration};
@@ -75,7 +76,7 @@ async fn init(
 
     let executor = Arc::new(swapper);
 
-    info!("Initializing find stage ...");
+    info!("Initializing searcher stage ...");
     let finder = OpportunityFinder::new(agent.clone(), config.lending_canister.clone());
 
     info!("Initializing liquidations stage ...");
@@ -129,8 +130,22 @@ pub async fn run_liquidation_loop() {
 
     let debt_assets = config.get_debt_assets().keys().cloned().collect::<Vec<String>>();
 
+    // Create the spinner for fancy UI
+
+    let start_spinner = || {
+        let spinner = ProgressBar::new_spinner();
+        spinner.set_style(
+            ProgressStyle::with_template("{spinner} {msg}")
+                .unwrap()
+                .tick_chars("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏ "),
+        );
+        spinner.enable_steady_tick(Duration::from_millis(100));
+        spinner
+    };
+
+    let mut spinner = start_spinner();
     loop {
-        info!("Polling for liquidation opportunities...");
+        spinner.set_message("Scanning for liquidation opportunities...");
         sync_balances(&config, account_service.clone(), &debt_assets).await;
         let opportunities = finder.process(&debt_assets).await.unwrap_or_else(|e| {
             warn!("Failed to find opportunities: {e}");
@@ -138,11 +153,12 @@ pub async fn run_liquidation_loop() {
         });
 
         if opportunities.is_empty() {
-            info!("No opportunities found");
             sleep(Duration::from_secs(2));
+            spinner = start_spinner();
             continue;
         }
 
+        spinner.finish_and_clear();
         info!("Found {} opportunities", opportunities.len());
 
         let executions = strategy.process(&opportunities).await.unwrap_or_else(|e| {
@@ -157,13 +173,16 @@ pub async fn run_liquidation_loop() {
 
         if results.is_empty() {
             info!("No successful executions");
+            spinner = start_spinner();
+            spinner.set_message("Scanning for liquidation opportunities...");
             sleep(Duration::from_secs(30));
             continue;
         }
 
         exporter.process(&results).await.expect("Failed to export results");
         print_execution_results(results);
-
+        spinner = start_spinner();
+        spinner.set_message("Scanning for liquidation opportunities...");
         sleep(Duration::from_secs(5));
     }
 }

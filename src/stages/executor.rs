@@ -143,6 +143,7 @@ impl<'a, A: PipelineAgent> PipelineStage<'a, Vec<ExecutorRequest>, Vec<Execution
                             }
 
                             swap_args.max_slippage = Some(swap_args.max_slippage.unwrap() + 0.25); // Increase slippage for next attempt
+                            swap_args.pay_amount -= executor_request.collateral_asset.fee.clone();
                             tokio::time::sleep(std::time::Duration::from_millis(100 * 2u64.pow(attempt))).await;
                         }
                     }

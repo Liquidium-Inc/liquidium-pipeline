@@ -1,7 +1,7 @@
 use async_trait::async_trait;
-use csv::Writer;
+use csv::WriterBuilder;
 use serde::Serialize;
-use std::fs::OpenOptions;
+use std::fs::{OpenOptions, metadata};
 
 use crate::stage::PipelineStage;
 use crate::stages::executor::{ExecutionReceipt, ExecutionStatus};
@@ -34,11 +34,17 @@ impl<'a> PipelineStage<'a, Vec<ExecutionReceipt>, ()> for ExportStage {
         let file = OpenOptions::new()
             .write(true)
             .create(true)
-            .truncate(false)
+            .append(true)
             .open(&self.path)
             .map_err(|e| format!("File error: {}", e))?;
 
-        let mut wtr = Writer::from_writer(file);
+        let is_empty = metadata(&self.path).map(|m| m.len() == 0).unwrap_or(true);
+        let mut wtr = WriterBuilder::new();
+        if !is_empty {
+            wtr.has_headers(false);
+        }
+
+        let mut wtr = wtr.from_writer(file);
 
         for r in input {
             let row = ExecutionAnalyticsRow {

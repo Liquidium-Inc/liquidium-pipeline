@@ -177,7 +177,7 @@ impl<A: PipelineAgent> KongSwapExecutor<A> {
             .await
             .expect("could not fetch allowance");
 
-        info!(
+        debug!(
             "Allowance for {} on {} = {}",
             ledger, self.dex_account.owner, result.allowance
         );

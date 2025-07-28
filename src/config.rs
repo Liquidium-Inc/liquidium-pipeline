@@ -1,6 +1,7 @@
 use candid::Principal;
-use env_logger::Env;
 use ic_agent::{Agent, Identity};
+use indicatif::MultiProgress;
+use indicatif_log_bridge::LogWrapper;
 use log::debug;
 use std::collections::HashMap;
 use std::env;
@@ -49,9 +50,13 @@ impl ConfigTrait for Config {
 impl Config {
     pub async fn load() -> Result<Arc<Self>, String> {
         dotenv::dotenv().ok();
-        env_logger::Builder::from_env(Env::default().default_filter_or("info"))
+
+        let logger = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
             .format_target(false)
-            .init();
+            .build();
+        let multi = MultiProgress::new();
+
+        LogWrapper::new(multi.clone(), logger).try_init().unwrap();
 
         let ic_url = env::var("IC_URL").unwrap();
         let export_path = env::var("EXPORT_PATH").unwrap_or("executions.csv".to_string());
