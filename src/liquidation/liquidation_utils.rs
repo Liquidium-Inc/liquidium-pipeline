@@ -35,7 +35,6 @@ let bonus_scale_ray                = Nat::from(LIQUIDATION_BONUS_SCALE).to_ray()
         debt_price.1,
         available_collateral,
     );
-
     // 1) Apply liquidation bonus
     let adj_debt_value_ray = debt_value
         .ray_mul(&bonus_ray)
@@ -76,7 +75,7 @@ let bonus_scale_ray                = Nat::from(LIQUIDATION_BONUS_SCALE).to_ray()
     }
 
     // Handle buying of bad debt
-    if available_collateral == Nat::from(0u8) {
+    if available_collateral <= Nat::from(1u8) {
         // full liquidation: repay entire debt
         let repay_ray = debt_value
             .ray_div(&debt_price_ray)
