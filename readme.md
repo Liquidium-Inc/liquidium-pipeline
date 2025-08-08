@@ -1,121 +1,144 @@
-Sure — here’s a clean, copy-paste-ready README.md version:
-
-⸻
-
 
 # 🧯 Liquidator Bot Framework for ICP
 
-A modular, event-driven offchain liquidation bot framework for [Internet Computer (ICP)](https://internetcomputer.org/) protocols.  
+A modular, event-driven off-chain liquidation bot framework for [Internet Computer (ICP)](https://internetcomputer.org/) protocols.  
 Inspired by Artemis/MEV patterns and designed for permissionless, community-driven liquidations.
 
 ---
 
 ## ✨ Features
 
-- 🔁 **Pipeline Architecture**: Composable pipeline stages for opportunity discovery, execution, and asset swaps.
-- ⚡ **Async/Concurrent**: Built with async Rust for efficiency and scalability.
-- 👷 **Extensible**: Add custom modules for risk checks, strategy, swaps, notification, and more.
-- 📦 **Open Source & Permissionless**: Anyone can run a bot, or contribute new pipeline stages.
-- 🧪 **CLI Interface**: Check balances, withdraw funds, and manage identities with ease.
+- 🔁 **Pipeline Architecture** — Composable stages for discovery, execution, and swaps.  
+- ⚡ **Async Rust** — Highly concurrent and efficient.  
+- 👷 **Extensible** — Add custom risk checks, strategies, swaps, or notification stages.  
+- 📦 **Permissionless** — Anyone can run it.  
+- 🧪 **CLI Interface** — Manage balances, funds, and identities.
 
 ---
 
-## 🏗️ Architecture Overview
-
-### How It Works
-
-The bot is structured as a **pipeline of stages**.  
-Each stage is a Rust struct implementing the `PipelineStage` trait (via `async-trait`).  
-Data flows through the pipeline as it is polled and processed in steps:
-
-1. **Opportunity Discovery**  
-   Polls ICP canisters for loans or positions eligible for liquidation.  
-   → `PipelineStage<(), Vec<LiquidationOpportunity>>`
-
-2. **Liquidation Execution**  
-   Calls the canister to liquidate an at-risk position, seizing collateral.  
-   → `PipelineStage<LiquidationOpportunity, ExecutionReceipt>`
-
-3. **Swapping Assets**  
-   Swaps seized collateral for a desired asset (e.g., via DEX).  
-   → `PipelineStage<ExecutionReceipt, SwapResult>`
-
----
-
-## 🧪 CLI Usage
-
-### Setup
+## 📦 Quick Install
 
 ```bash
-git clone <your-repo>
-cd <your-repo>
+curl -fsSL https://raw.githubusercontent.com/Liquidium-Inc/liquidium-pipeline/main/install.sh | sudo bash
+```
+This will:
+- Clone/update the repo
+- Build the liquidator binary
+- Install it to /usr/local/bin/liquidator
+- Create ~/.config/liquidator/config.env if it doesn’t exist
+
+⸻
+
+⚙ Configuration
+
+The bot loads configuration from:
+
+1.	~/.config/liquidator/config.env (preferred, created automatically)
+
+2.	.env in the current directory (optional overrides)
+
+Example config.env:
+
+```bash
+IC_URL=https://ic0.app
+IDENTITY_PEM=/home/youruser/.config/liquidator/id.pem
+LENDING_CANISTER=ryjl3-tyaaa-aaaaa-aaaba-cai
+EXPORT_PATH=executions.csv
+BUY_BAD_DEBT=false
+
+# Comma-separated principal:symbol
+DEBT_ASSETS=principal1:BTC,principal2:ETH
+COLLATERAL_ASSETS=principal3:ckBTC,principal4:ckETH
+```
+
+⸻
+
+🔑 Identity Management
+
+Generate a new Ed25519 identity:
+```
+liquidator account new
+```
+
+Show the liquidator principal:
+```
+liquidator account show
+```
+By default, identities are stored at:
+```
+~/.config/liquidator/id.pem
+```
+Change location by setting IDENTITY_PEM in config.env.
+
+⸻
+
+🏗️ Architecture Overview
+
+Pipeline Stages
+
+```mermaid
+flowchart LR
+    A[Opportunity Discovery] --> B[Liquidation Execution]
+    B --> C[Asset Swap]
+    C --> D[Reporting / Export]
+```
+
+
+- Opportunity Discovery → Polls ICP canisters for loans or positions eligible for liquidation.
+- Liquidation Execution → Calls the canister to liquidate an at-risk position, seizing collateral.
+- Asset Swap → Swaps seized collateral for a desired asset.
+- Reporting / Export → Saves execution details to CSV or external systems.
+
+Stages are implemented with async-trait for composability.
+
+⸻
+
+🧪 CLI Commands
+
+Run loop:
+```
+liquidator run
+```
+Check balances:
+```
+liquidator balance
+```
+Withdraw funds:
+```
+liquidator withdraw <ASSET_PRINCIPAL> <AMOUNT> <TO_PRINCIPAL>
+```
+Show identity principal:
+```
+liquidator account show
+```
+Generate new identity:
+```
+liquidator account new
+```
+
+⸻
+
+🛠 Developer Setup
+```bash
+git clone https://github.com/Liquidium-Inc/liquidium-pipeline.git
+
+cd liquidium-pipeline
+
 cargo build --release
-```
 
-The binary will be located at:
-```
+Binary will be at:
+
 target/release/liquidator
+
 ```
---- 
-### Identity
+⸻
 
-The bot expects an identity PEM file at ./id.pem.
-Generate a new one using the CLI (account new) or manually.
-
----
-
-### Commands
-
-#### 🔁 Run
-
-Starts the liquidation loop.
-
-```bash
-./liquidator run
-```
-💰 Balance
-
-Shows token balances for the configured wallet.
-
-```bash
-./liquidator balance
-```
-
-💸 Withdraw
-
-Withdraw funds to a specified principal.
-```bash
-./liquidator withdraw <ASSET_PRINCIPAL> <AMOUNT> <TO_PRINCIPAL>
-```
-Example:
-```bash
-./liquidator withdraw ryjl3-tyaaa-aaaaa-aaaba-cai 0.01 q5wrv-piaaa-aaaag-qaagq-cai
-```
-
-🆔 Account Show
-
-Displays the principal of the wallet.
-
-```bash
-./liquidator account show
-```
-
-🛠️ Account New
-
-Generates a new identity (overwrites ./id.pem).
-
-```bash
-./liquidator account new
-```
-
----
 📝 Notes
+- Works with ICRC-1 assets like ckBTC
+- Identity/config can be system-wide or project-local
+- Composable stages allow for custom liquidation strategies
 
-	•	Compatible with ICRC-1 assets like ckBTC.
-	•	Identity PEM path defaults to ./id.pem unless configured otherwise.
-	•	Composable pipeline structure enables custom execution strategies.
-
----
+⸻
 
 📄 License
 
