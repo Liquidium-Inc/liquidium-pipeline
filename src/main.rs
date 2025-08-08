@@ -10,6 +10,7 @@ mod ray_math;
 mod stage;
 mod stages;
 mod utils;
+mod types;
 
 use clap::{Parser, Subcommand};
 

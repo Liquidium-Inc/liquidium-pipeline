@@ -1,6 +1,5 @@
 use async_trait::async_trait;
 use candid::Encode;
-use lending::interface::liquidation::{LiquidationResult, LiquidationStatus};
 use log::debug;
 use num_traits::ToPrimitive;
 
@@ -10,7 +9,7 @@ use crate::{
         kong_swap::{kong_swap::KongSwapExecutor, types::SwapReply},
     },
     pipeline_agent::PipelineAgent,
-    stage::PipelineStage,
+    stage::PipelineStage, types::protocol_types::{LiquidationResult, LiquidationStatus},
 };
 
 #[allow(dead_code)]
@@ -164,20 +163,17 @@ impl<'a, A: PipelineAgent> PipelineStage<'a, Vec<ExecutorRequest>, Vec<Execution
 
 #[cfg(test)]
 mod test {
+    use super::*;
     use std::{collections::HashMap, sync::Arc};
 
     use candid::{Nat, Principal};
     use icrc_ledger_types::icrc1::account::Account;
-    use lending::interface::liquidation::{LiquidationAmounts, LiquidationRequest};
-    use lending_utils::types::pool::AssetType;
-
     use crate::{
         executors::kong_swap::types::{SwapArgs, SwapReply, SwapResult},
         icrc_token::icrc_token::IcrcToken,
-        pipeline_agent::MockPipelineAgent,
+        pipeline_agent::MockPipelineAgent, types::protocol_types::{AssetType, LiquidationAmounts, LiquidationRequest},
     };
 
-    use super::*;
 
     #[tokio::test]
     async fn test_kong_executor_process_success() {

@@ -3,9 +3,8 @@ use std::sync::Arc;
 use candid::{Nat, Principal};
 use ic_agent::Agent;
 use icrc_ledger_agent::Icrc1Agent;
-use lending_utils::types::assets::{Asset, Assets};
 
-use crate::pipeline_agent::PipelineAgent;
+use crate::{pipeline_agent::PipelineAgent, types::protocol_types::{Asset, Assets}};
 
 #[allow(dead_code)]
 #[derive(Debug, Clone)]

@@ -1,10 +1,9 @@
 
 
 use candid::Nat;
-use lending_utils::constants::LIQUIDATION_BONUS_SCALE;
 use log::{debug, info};
 
-use crate::ray_math::WadRayMath;
+use crate::{ray_math::WadRayMath, types::protocol_types::LIQUIDATION_BONUS_SCALE};
 
 pub fn estimate_liquidation(
     debt_value: Nat,              // USD in raw units

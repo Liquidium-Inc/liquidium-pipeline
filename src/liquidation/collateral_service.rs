@@ -1,16 +1,11 @@
 use std::sync::Arc;
 
-use crate::{liquidation::liquidation_utils::estimate_liquidation, price_oracle::price_oracle::PriceOracle};
 use async_trait::async_trait;
 use candid::Nat;
-use lending::liquidation::liquidation::{LiquidateblePosition, LiquidatebleUser};
-use lending_utils::{
-    constants::{LIQUIDATION_BONUS_SCALE, MAX_LIQUIDATION_RATIO},
-    ray_math::WadRayMath,
-    types::assets::Asset,
-};
 use log::debug;
 use num_traits::ToPrimitive;
+
+use crate::{liquidation::liquidation_utils::estimate_liquidation, price_oracle::price_oracle::PriceOracle, ray_math::WadRayMath, types::protocol_types::{Asset, LiquidateblePosition, LiquidatebleUser, LIQUIDATION_BONUS_SCALE, MAX_LIQUIDATION_RATIO}};
 
 pub struct LiquidationEstimation {
     pub repaid_debt: Nat,
@@ -124,10 +119,9 @@ impl<P: PriceOracle> CollateralServiceTrait for CollateralService<P> {
 mod test {
     use candid::Principal;
     use ctor::ctor;
-    use lending_utils::types::{assets::Assets, pool::AssetType};
     use mockall::predicate::eq;
 
-    use crate::price_oracle::price_oracle::MockPriceOracle;
+    use crate::{price_oracle::price_oracle::MockPriceOracle, types::protocol_types::{AssetType, Assets}};
 
     use super::*;
     use std::sync::Arc;

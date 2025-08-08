@@ -8,12 +8,10 @@ use crate::executors::kong_swap::types::SwapArgs;
 use crate::icrc_token::icrc_token_amount::IcrcTokenAmount;
 use crate::liquidation::collateral_service::CollateralServiceTrait;
 use crate::stage::PipelineStage;
+use crate::types::protocol_types::{AssetType, LiquidatebleUser, LiquidationRequest};
 use async_trait::async_trait;
 
 use candid::{Int, Nat, Principal};
-use lending::interface::liquidation::LiquidationRequest;
-use lending::liquidation::liquidation::LiquidatebleUser;
-use lending_utils::types::pool::AssetType;
 use log::{debug, info};
 use num_traits::ToPrimitive;
 pub struct IcrcLiquidationStrategy<T, C, U, W>
@@ -249,10 +247,8 @@ mod tests {
         config::MockConfigTrait,
         executors::{executor::MockIcrcSwapExecutor, kong_swap::types::SwapAmountsReply},
         icrc_token::icrc_token::IcrcToken,
-        liquidation::collateral_service::{LiquidationEstimation, MockCollateralServiceTrait},
+        liquidation::collateral_service::{LiquidationEstimation, MockCollateralServiceTrait}, types::protocol_types::{Assets, LiquidateblePosition},
     };
-    use lending::liquidation::liquidation::{LiquidateblePosition, LiquidatebleUser};
-    use lending_utils::types::{assets::Assets, pool::AssetType};
     use rand::random;
 
     #[tokio::test]

@@ -1,7 +1,9 @@
 use async_trait::async_trait;
-use lending::interface::liquidation::LiquidationRequest;
 
-use crate::icrc_token::{icrc_token::IcrcToken, icrc_token_amount::IcrcTokenAmount};
+use crate::{
+    icrc_token::{icrc_token::IcrcToken, icrc_token_amount::IcrcTokenAmount},
+    types::protocol_types::LiquidationRequest,
+};
 
 use super::kong_swap::types::{SwapAmountsReply, SwapArgs, SwapReply};
 

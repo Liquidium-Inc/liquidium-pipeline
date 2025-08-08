@@ -1,12 +1,11 @@
 use std::sync::Arc;
 
-use crate::pipeline_agent::PipelineAgent;
+use crate::types::protocol_types::AssetType;
+use crate::{pipeline_agent::PipelineAgent, types::protocol_types::LiquidatebleUser};
 use crate::stage::PipelineStage;
 use async_trait::async_trait;
 use candid::{Encode, Principal};
 
-use lending::liquidation::liquidation::LiquidatebleUser;
-use lending_utils::types::pool::AssetType;
 pub struct OpportunityFinder<A: PipelineAgent> {
     pub agent: Arc<A>,
     pub canister_id: Principal,
@@ -67,11 +66,10 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pipeline_agent::MockPipelineAgent;
+    use crate::types::protocol_types::Assets;
+    use crate::{pipeline_agent::MockPipelineAgent, types::protocol_types::LiquidateblePosition};
     use crate::stage::PipelineStage;
     use candid::{Nat, Principal};
-    use lending::liquidation::liquidation::LiquidateblePosition;
-    use lending_utils::types::{assets::Assets, pool::AssetType};
     use std::sync::Arc;
 
     #[tokio::test]
