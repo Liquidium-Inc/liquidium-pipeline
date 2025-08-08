@@ -110,6 +110,26 @@ else
   git clone --branch "$BRANCH" --depth 1 "$REPO" "$INSTALL_DIR"
 fi
 
+# ===== Update configs =====
+
+# Ensure user config directory exists
+USER_CONFIG_DIR="$HOME/.config/liquidator"
+USER_CONFIG_FILE="$USER_CONFIG_DIR/config.env"
+mkdir -p "$USER_CONFIG_DIR"
+
+# Copy default config.env from repo if missing
+if [[ ! -f "$USER_CONFIG_FILE" ]]; then
+  if [[ -f "$INSTALL_DIR/config.env" ]]; then
+    cp "$INSTALL_DIR/config.env" "$USER_CONFIG_FILE"
+    chmod 600 "$USER_CONFIG_FILE"
+    echo "✅ Created default config at $USER_CONFIG_FILE"
+  else
+    echo "⚠ No config.env found in repo — skipping"
+  fi
+else
+  echo "ℹ Config already exists at $USER_CONFIG_FILE (not overwritten)"
+fi
+
 # ===== Build =====
 echo "Building in release mode..."
 pushd "$INSTALL_DIR" >/dev/null

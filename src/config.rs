@@ -49,8 +49,14 @@ impl ConfigTrait for Config {
 
 impl Config {
     pub async fn load() -> Result<Arc<Self>, String> {
-        dotenv::dotenv().ok();
+        // Load $HOME/.config/liquidator/config.env first
+        if let Ok(home) = env::var("HOME") {
+            let config_path = format!("{}/.config/liquidator/config.env", home);
+            let _ = dotenv::from_filename(config_path);
+        }
 
+        // Then load local .env (override)
+        let _ = dotenv::dotenv();
         let logger = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
             .format_target(false)
             .build();
