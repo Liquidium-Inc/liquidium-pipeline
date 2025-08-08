@@ -19,7 +19,7 @@ Inspired by Artemis/MEV patterns and designed for permissionless, community-driv
 ## 📦 Quick Install
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Liquidium-Inc/liquidium-pipeline/main/install.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/Liquidium-Inc/liquidium-pipeline/main/install.sh | bash
 ```
 This will:
 - Clone/update the repo
