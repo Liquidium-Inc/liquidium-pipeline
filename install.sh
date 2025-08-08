@@ -64,11 +64,11 @@ This will:
   - Source in: ${INSTALL_DIR}
   - Versioned releases in: ${RELEASES_DIR}
 EOM
-  read -rp "Proceed? [y/N] " ans
-  case "$ans" in
-    [Yy]*) ;;
-    *) echo "Aborted."; exit 1;;
-  esac
+    read -rp "Proceed? [Y/n] " ans
+    case "$ans" in
+    [Nn]*) echo "Aborted."; exit 1;;
+    *) ;;
+    esac
 fi
 
 # Install deps (Debian/Ubuntu)
