@@ -35,7 +35,7 @@ EOF
   exit 1
 }
 
-# Parse flags
+# Parse args
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --branch) BRANCH="$2"; shift 2;;
@@ -54,7 +54,7 @@ fi
 
 mkdir -p "$INSTALL_DIR" "$RELEASES_DIR"
 
-# Confirm
+# ===== Confirm (works with curl | bash, defaults to Yes) =====
 if [[ "$YES" != "true" && "$CI" != "true" ]]; then
   cat <<EOM
 This will:
@@ -64,14 +64,23 @@ This will:
   - Source in: ${INSTALL_DIR}
   - Versioned releases in: ${RELEASES_DIR}
 EOM
-    read -rp "Proceed? [Y/n] " ans
-    case "$ans" in
+
+  ans=""
+  if [[ -r /dev/tty ]]; then
+    # Read from the real terminal so curl|bash stdin pipe doesn't break it.
+    read -rp "Proceed? [Y/n] " ans < /dev/tty || true
+  else
+    # No TTY (e.g., CI) -> default Yes
+    ans=""
+  fi
+
+  case "${ans:-}" in
     [Nn]*) echo "Aborted."; exit 1;;
-    *) ;;
-    esac
+    *) ;;  # default Yes
+  case
 fi
 
-# Install deps (Debian/Ubuntu)
+# ===== Deps (Debian/Ubuntu best-effort) =====
 if [[ -f /etc/debian_version ]]; then
   apt-get update -y
   apt-get install -y build-essential pkg-config libssl-dev cmake git curl
@@ -79,7 +88,7 @@ fi
 
 command -v git >/dev/null || { echo "git is required"; exit 1; }
 
-# Rust toolchain
+# ===== Rust toolchain =====
 if [[ "$SKIP_RUST" != "true" ]]; then
   if ! command -v cargo >/dev/null 2>&1; then
     echo "Installing Rust toolchain..."
@@ -91,7 +100,7 @@ fi
 
 command -v cargo >/dev/null || { echo "cargo not found"; exit 1; }
 
-# Clone or update the repo
+# ===== Clone or update the repo =====
 if [[ -d "$INSTALL_DIR/.git" ]]; then
   echo "Updating repository..."
   git -C "$INSTALL_DIR" fetch --all -q
@@ -103,7 +112,7 @@ else
   git clone --branch "$BRANCH" --depth 1 "$REPO" "$INSTALL_DIR"
 fi
 
-# Build
+# ===== Build =====
 echo "Building in release mode..."
 pushd "$INSTALL_DIR" >/dev/null
 if [[ -f Cargo.lock ]]; then
@@ -118,7 +127,7 @@ DST="$RELEASES_DIR/${BIN_NAME}-${GITSHA}"
 install -m 0755 "$SRC" "$DST"
 popd >/dev/null
 
-# Symlink toggle
+# ===== Symlink toggle =====
 ln -sfn "$DST" "/usr/local/bin/$BIN_NAME"
 hash -r 2>/dev/null || true
 
@@ -133,4 +142,4 @@ echo "Other commands:"
 echo "  ${BIN_NAME} balance"
 echo "  ${BIN_NAME} withdraw <asset_principal> <amount> <to_principal>"
 echo ""
-echo "To update, just rerun the same curl | bash command."
+echo "Update later: re-run the same curl | bash command."
