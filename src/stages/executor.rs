@@ -9,7 +9,8 @@ use crate::{
         kong_swap::{kong_swap::KongSwapExecutor, types::SwapReply},
     },
     pipeline_agent::PipelineAgent,
-    stage::PipelineStage, types::protocol_types::{LiquidationResult, LiquidationStatus},
+    stage::PipelineStage,
+    types::protocol_types::{LiquidationResult, LiquidationStatus},
 };
 
 #[allow(dead_code)]
@@ -142,7 +143,11 @@ impl<'a, A: PipelineAgent> PipelineStage<'a, Vec<ExecutorRequest>, Vec<Execution
                             }
 
                             swap_args.max_slippage = Some(swap_args.max_slippage.unwrap() + 0.25); // Increase slippage for next attempt
-                            swap_args.pay_amount -= executor_request.collateral_asset.fee.clone();
+                            if swap_args.pay_amount > executor_request.collateral_asset.fee.clone() {
+                                swap_args.pay_amount -= executor_request.collateral_asset.fee.clone();
+                            } else {
+                                panic!("Swap failed after {max_retries} attempts: Insufficient pay amount");
+                            }
                             tokio::time::sleep(std::time::Duration::from_millis(100 * 2u64.pow(attempt))).await;
                         }
                     }
@@ -166,14 +171,14 @@ mod test {
     use super::*;
     use std::{collections::HashMap, sync::Arc};
 
-    use candid::{Nat, Principal};
-    use icrc_ledger_types::icrc1::account::Account;
     use crate::{
         executors::kong_swap::types::{SwapArgs, SwapReply, SwapResult},
         icrc_token::icrc_token::IcrcToken,
-        pipeline_agent::MockPipelineAgent, types::protocol_types::{AssetType, LiquidationAmounts, LiquidationRequest},
+        pipeline_agent::MockPipelineAgent,
+        types::protocol_types::{AssetType, LiquidationAmounts, LiquidationRequest},
     };
-
+    use candid::{Nat, Principal};
+    use icrc_ledger_types::icrc1::account::Account;
 
     #[tokio::test]
     async fn test_kong_executor_process_success() {
