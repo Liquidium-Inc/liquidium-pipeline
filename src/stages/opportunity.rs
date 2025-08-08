@@ -50,10 +50,6 @@ where
 
                     supported_assets.contains(&asset_principal.to_string()) // Filter out any unsupported assets
                 })
-                .filter(|item| {
-                    item.account == Principal::from_text("h64ya-zt56r-44pvj-pjay2-j47ik-gv222-iw4mq-3wrll-yho5m-kmth4-kae")
-                        .expect("Invalid principal text")
-                })
                 .cloned()
                 .collect();
         });
