@@ -77,7 +77,7 @@ EOM
   case "${ans:-}" in
     [Nn]*) echo "Aborted."; exit 1;;
     *) ;;  # default Yes
-  case
+  esac
 fi
 
 # ===== Deps (Debian/Ubuntu best-effort) =====
