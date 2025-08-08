@@ -6,6 +6,10 @@ edition = "2024"
 [lib]
 crate-type = ["lib"]
 
+[[bin]]
+name = "liquidator"
+path = "src/main.rs"
+
 [dependencies]
 tokio = { version = "1.38", features = ["full"] }
 ic-agent = "0.40"

@@ -5,7 +5,7 @@ set -euo pipefail
 GH_USER="Liquidium-Inc"
 GH_REPO="liquidium-pipeline"
 BRANCH="${BRANCH:-main}"
-BIN_NAME="${BIN_NAME:-liquidator}"
+BIN_NAME="${BIN_NAME:-liquidator}"   # default binary name
 INSTALL_DIR="${INSTALL_DIR:-/opt/liquidator}"
 REPO="https://github.com/${GH_USER}/${GH_REPO}.git"
 SKIP_RUST="${SKIP_RUST:-false}"
@@ -67,10 +67,8 @@ EOM
 
   ans=""
   if [[ -r /dev/tty ]]; then
-    # Read from the real terminal so curl|bash stdin pipe doesn't break it.
     read -rp "Proceed? [Y/n] " ans < /dev/tty || true
   else
-    # No TTY (e.g., CI) -> default Yes
     ans=""
   fi
 
@@ -116,9 +114,9 @@ fi
 echo "Building in release mode..."
 pushd "$INSTALL_DIR" >/dev/null
 if [[ -f Cargo.lock ]]; then
-  cargo build --release --locked
+  cargo build --release --locked --bin "$BIN_NAME"
 else
-  cargo build --release
+  cargo build --release --bin "$BIN_NAME"
 fi
 GITSHA="$(git rev-parse --short HEAD)"
 SRC="$INSTALL_DIR/target/release/$BIN_NAME"
