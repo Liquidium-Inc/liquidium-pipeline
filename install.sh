@@ -47,11 +47,6 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-if [[ $EUID -ne 0 ]]; then
-  echo "Run as root (sudo)."
-  exit 1
-fi
-
 mkdir -p "$INSTALL_DIR" "$RELEASES_DIR"
 
 # ===== Confirm (works with curl | bash, defaults to Yes) =====
