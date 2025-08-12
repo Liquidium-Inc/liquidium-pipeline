@@ -31,7 +31,7 @@ fn default_identity_path() -> PathBuf {
 pub async fn new() {
     // Load config locations if you haven't already done that globally
     let _ = dotenv::from_filename(format!(
-        "{}/.liquidium-pipeline/wallets/id.pem/config.env",
+        "{}/.liquidium-pipeline/wallets/config.env",
         env::var("HOME").unwrap_or_default()
     ));
     let _ = dotenv::dotenv();
