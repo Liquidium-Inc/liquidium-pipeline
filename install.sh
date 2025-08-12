@@ -6,7 +6,7 @@ GH_USER="Liquidium-Inc"
 GH_REPO="liquidium-pipeline"
 BRANCH="${BRANCH:-main}"
 BIN_NAME="${BIN_NAME:-liquidator}"   # default binary name
-INSTALL_DIR="${INSTALL_DIR:-/opt/liquidator}"
+INSTALL_DIR="${INSTALL_DIR:-$HOME/.liquidium-pipeline}"
 REPO="https://github.com/${GH_USER}/${GH_REPO}.git"
 SKIP_RUST="${SKIP_RUST:-false}"
 YES="${YES:-false}"
@@ -108,7 +108,7 @@ fi
 # ===== Update configs =====
 
 # Ensure user config directory exists
-USER_CONFIG_DIR="$HOME/.config/liquidator"
+USER_CONFIG_DIR="$HOME/.liquidium-pipeline"
 USER_CONFIG_FILE="$USER_CONFIG_DIR/config.env"
 mkdir -p "$USER_CONFIG_DIR"
 

@@ -49,9 +49,9 @@ impl ConfigTrait for Config {
 
 impl Config {
     pub async fn load() -> Result<Arc<Self>, String> {
-        // Load $HOME/.config/liquidator/config.env first
+        // Load $HOME/.liquidium-pipeline/config.env first
         if let Ok(home) = env::var("HOME") {
-            let config_path = format!("{}/.config/liquidator/config.env", home);
+            let config_path = format!("{}/.liquidium-pipeline/config.env", home);
             let _ = dotenv::from_filename(config_path);
         }
 
