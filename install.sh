@@ -5,7 +5,7 @@ set -euo pipefail
 GH_USER="Liquidium-Inc"
 GH_REPO="liquidium-pipeline"
 BRANCH="${BRANCH:-main}"
-BIN_NAME="${BIN_NAME:-liquidator}"   # default binary name
+BIN_NAME="${BIN_NAME:-liquidator}"
 INSTALL_DIR="${INSTALL_DIR:-$HOME/.liquidium-pipeline}"
 REPO="https://github.com/${GH_USER}/${GH_REPO}.git"
 SKIP_RUST="${SKIP_RUST:-false}"
@@ -13,13 +13,14 @@ YES="${YES:-false}"
 CI="${CI:-false}"
 
 RELEASES_DIR="${INSTALL_DIR%/}/releases"
+USER_BIN="$HOME/.local/bin"
 
 usage() {
   cat <<EOF
-Liquidator install script (no systemd).
+Liquidator install script (user-only, no sudo).
 
 Usage (install/update):
-  curl -fsSL https://raw.githubusercontent.com/${GH_USER}/${GH_REPO}/${BRANCH}/install.sh | sudo bash
+  curl -fsSL https://raw.githubusercontent.com/${GH_USER}/${GH_REPO}/${BRANCH}/install.sh | bash
 
 Options:
   --branch <name>       (default: ${BRANCH})
@@ -27,10 +28,10 @@ Options:
   --install-dir <path>  (default: ${INSTALL_DIR})
   --yes                 Skip confirmation
 
-Environment variables:
+Env:
   SKIP_RUST=true   Skip Rust install
   YES=true         Skip confirmation
-  CI=true          Skip confirmation (for CI)
+  CI=true          Skip confirmation (CI)
 EOF
   exit 1
 }
@@ -47,51 +48,57 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-mkdir -p "$INSTALL_DIR" "$RELEASES_DIR"
+mkdir -p "$INSTALL_DIR" "$RELEASES_DIR" "$USER_BIN"
 
-# ===== Confirm (works with curl | bash, defaults to Yes) =====
+# ===== PATH ensure (user shell) =====
+ensure_path() {
+  case "${SHELL##*/}" in
+    zsh) PROFILE="$HOME/.zshrc" ;;
+    fish) PROFILE="$HOME/.config/fish/config.fish" ;;
+    *) PROFILE="$HOME/.bashrc" ;;
+  esac
+
+  if ! echo ":$PATH:" | grep -q ":$USER_BIN:"; then
+    echo "export PATH=\"$USER_BIN:\$PATH\"" >> "$PROFILE"
+    # Also export for current session
+    export PATH="$USER_BIN:$PATH"
+  fi
+}
+ensure_path
+
+# ===== Confirm =====
 if [[ "$YES" != "true" && "$CI" != "true" ]]; then
   cat <<EOM
 This will:
   - Clone/update: ${REPO} (branch: ${BRANCH})
   - Build binary: ${BIN_NAME}
-  - Install to: /usr/local/bin/${BIN_NAME}
+  - Install to: ${USER_BIN}/${BIN_NAME}
   - Source in: ${INSTALL_DIR}
   - Versioned releases in: ${RELEASES_DIR}
 EOM
-
   ans=""
   if [[ -r /dev/tty ]]; then
     read -rp "Proceed? [Y/n] " ans < /dev/tty || true
-  else
-    ans=""
   fi
-
   case "${ans:-}" in
     [Nn]*) echo "Aborted."; exit 1;;
-    *) ;;  # default Yes
+    *) ;;
   esac
 fi
 
-# ===== Deps (Debian/Ubuntu best-effort) =====
-if [[ -f /etc/debian_version ]]; then
-  apt-get update -y
-  apt-get install -y build-essential pkg-config libssl-dev cmake git curl
-fi
-
-command -v git >/dev/null || { echo "git is required"; exit 1; }
+command -v git >/dev/null || { echo "git is required (install it via your package manager)"; exit 1; }
 
 # ===== Rust toolchain =====
 if [[ "$SKIP_RUST" != "true" ]]; then
   if ! command -v cargo >/dev/null 2>&1; then
-    echo "Installing Rust toolchain..."
+    echo "Installing Rust toolchain (user)…"
     curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
       | sh -s -- -y --default-toolchain stable
   fi
-  export PATH="$PATH:$HOME/.cargo/bin:/root/.cargo/bin"
+  export PATH="$HOME/.cargo/bin:$PATH"
 fi
 
-command -v cargo >/dev/null || { echo "cargo not found"; exit 1; }
+command -v cargo >/dev/null || { echo "cargo not found; set SKIP_RUST=false or add ~/.cargo/bin to PATH"; exit 1; }
 
 # ===== Clone or update the repo =====
 if [[ -d "$INSTALL_DIR/.git" ]]; then
@@ -105,14 +112,11 @@ else
   git clone --branch "$BRANCH" --depth 1 "$REPO" "$INSTALL_DIR"
 fi
 
-# ===== Update configs =====
-
-# Ensure user config directory exists
+# ===== User config =====
 USER_CONFIG_DIR="$HOME/.liquidium-pipeline"
 USER_CONFIG_FILE="$USER_CONFIG_DIR/config.env"
 mkdir -p "$USER_CONFIG_DIR"
 
-# Copy default config.env from repo if missing
 if [[ ! -f "$USER_CONFIG_FILE" ]]; then
   if [[ -f "$INSTALL_DIR/config.env" ]]; then
     cp "$INSTALL_DIR/config.env" "$USER_CONFIG_FILE"
@@ -140,13 +144,13 @@ DST="$RELEASES_DIR/${BIN_NAME}-${GITSHA}"
 install -m 0755 "$SRC" "$DST"
 popd >/dev/null
 
-# ===== Symlink toggle =====
-ln -sfn "$DST" "/usr/local/bin/$BIN_NAME"
+# ===== Symlink (user space) =====
+ln -sfn "$DST" "$USER_BIN/$BIN_NAME"
 hash -r 2>/dev/null || true
 
 echo ""
 echo "✅ Installed ${BIN_NAME} @ ${DST}"
-echo "➡  Symlinked: /usr/local/bin/${BIN_NAME} -> ${DST}"
+echo "➡  Symlinked: $USER_BIN/${BIN_NAME} -> ${DST}"
 echo ""
 echo "Usage:"
 echo "  ${BIN_NAME} run"
@@ -154,5 +158,6 @@ echo ""
 echo "Other commands:"
 echo "  ${BIN_NAME} balance"
 echo "  ${BIN_NAME} withdraw <asset_principal> <amount> <to_principal>"
+echo "  Added $USER_BIN to PATH in $PROFILE. Reload your shell or 'source $PROFILE'."
 echo ""
 echo "Update later: re-run the same curl | bash command."
