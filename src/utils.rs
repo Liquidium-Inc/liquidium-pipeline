@@ -9,7 +9,9 @@ pub fn create_identity_from_pem_file(pem_file: &str) -> Result<Box<dyn Identity>
         Err(_) => match Secp256k1Identity::from_pem_file(pem_file) {
             Ok(secp256k1_identity) => Ok(Box::new(secp256k1_identity)),
             Err(err) => Err(format!(
-                "Failed to create identity from pem file. Unknown identity format. {}", err.to_string()
+                "Failed to create identity from pem file at {}. Unknown identity format. {}",
+                pem_file,
+                err.to_string()
             )),
         },
     }
