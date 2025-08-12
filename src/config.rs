@@ -49,14 +49,15 @@ impl ConfigTrait for Config {
 
 impl Config {
     pub async fn load() -> Result<Arc<Self>, String> {
-        // Load $HOME/.liquidium-pipeline/config.env first
+        // Then load local .env
+        let _ = dotenv::dotenv();
+
+        // Load $HOME/.liquidium-pipeline/config.env 
         if let Ok(home) = env::var("HOME") {
             let config_path = format!("{}/.liquidium-pipeline/config.env", home);
             let _ = dotenv::from_filename(config_path);
         }
 
-        // Then load local .env (override)
-        let _ = dotenv::dotenv();
         let logger = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
             .format_target(false)
             .build();
@@ -68,6 +69,7 @@ impl Config {
         let export_path = env::var("EXPORT_PATH").unwrap_or("executions.csv".to_string());
         // Load the liquidator identity
         let pem_path = env::var("IDENTITY_PEM").unwrap();
+        debug!("Path {}", pem_path);
         let identity = create_identity_from_pem_file(&pem_path).expect("could not create identity");
         let liquidator_principal = identity.sender().expect("could not decode liquidator principal");
         let buy_bad_debt = env::var("BUY_BAD_DEBT")
