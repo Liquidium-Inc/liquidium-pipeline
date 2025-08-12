@@ -25,13 +25,13 @@ use std::{env, io::Write, path::PathBuf};
 fn default_identity_path() -> PathBuf {
     // $HOME/.config/liquidator/id.pem
     let home = env::var("HOME").expect("HOME not set");
-    PathBuf::from(home).join(".config/liquidator/id.pem")
+    PathBuf::from(home).join(".liquidium-pipeline/wallets/id.pem")
 }
 
 pub async fn new() {
     // Load config locations if you haven't already done that globally
     let _ = dotenv::from_filename(format!(
-        "{}/.config/liquidator/config.env",
+        "{}/.liquidium-pipeline/wallets/id.pem/config.env",
         env::var("HOME").unwrap_or_default()
     ));
     let _ = dotenv::dotenv();
