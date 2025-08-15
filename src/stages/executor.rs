@@ -97,7 +97,11 @@ impl<'a, A: PipelineAgent> PipelineStage<'a, Vec<ExecutorRequest>, Vec<Execution
             });
 
             // Check that the liquidation was executed successfully
-            if liquidation_result.is_err() {
+            if let Err(mut err) = liquidation_result {
+                if err.contains("Position is not liquidateble") {
+                    err = "Position can no longer be liquidated.".to_string();
+                };
+
                 execution_receipts.push(ExecutionReceipt {
                     request: executor_request.clone(),
                     liquidation_result: None,
@@ -107,7 +111,7 @@ impl<'a, A: PipelineAgent> PipelineStage<'a, Vec<ExecutorRequest>, Vec<Execution
                     status: ExecutionStatus::Error(format!(
                         "Could not execute liquidation {:?} {:?}",
                         executor_request,
-                        liquidation_result.err()
+                        err
                     )),
                 });
 
