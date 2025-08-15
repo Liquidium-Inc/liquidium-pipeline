@@ -102,6 +102,7 @@ async fn load_asset_maps() -> (HashMap<String, IcrcToken>, HashMap<String, IcrcT
     let agent = Arc::new(
         Agent::builder()
             .with_url(ic_url.clone())
+            .with_max_tcp_error_retries(3)
             .build()
             .expect("could not initialize client"),
     );
