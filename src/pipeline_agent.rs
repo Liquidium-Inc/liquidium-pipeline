@@ -28,9 +28,9 @@ pub trait PipelineAgent: Send + Sync {
         method: &str,
         arg: Vec<u8>,
     ) -> Result<R, String> {
-        let res = self.call_update_raw(canister, method, arg).await;
+        let res = self.call_update_raw(canister, method, arg).await.map_err(|e| format!("Call error: {e}"))?;
         // Decode the candid response
-        let res = Decode!(&res.unwrap(), R).map_err(|e| format!("Candid decode error: {e}"))?;
+        let res = Decode!(&res, R).map_err(|e| format!("Candid decode error: {e}"))?;
         Ok(res)
     }
 
@@ -46,7 +46,7 @@ impl PipelineAgent for ic_agent::Agent {
         arg: Vec<u8>,
     ) -> Result<R, String> {
         let res = self
-            .query(&canister, method)
+            .query(canister, method)
             .with_arg(arg)
             .call()
             .await
@@ -65,7 +65,7 @@ impl PipelineAgent for ic_agent::Agent {
         arg: Vec<u8>,
     ) -> Result<R, String> {
         let res = self
-            .query(&canister, method)
+            .query(canister, method)
             .with_arg(arg)
             .call()
             .await
