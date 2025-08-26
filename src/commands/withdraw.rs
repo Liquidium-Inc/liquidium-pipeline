@@ -17,6 +17,7 @@ pub async fn withdraw(asset: &String, amount: &str, to: &String) {
     let agent = Agent::builder()
         .with_url(config.ic_url.clone())
         .with_identity(config.liquidator_identity.clone())
+        .with_max_tcp_error_retries(3)
         .build()
         .expect("Failed to initialize IC agent");
 
