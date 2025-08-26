@@ -39,7 +39,7 @@ impl ConfigTrait for Config {
     }
 
     fn get_liquidator_principal(&self) -> Principal {
-        self.liquidator_principal.clone()
+        self.liquidator_principal
     }
 
     fn should_buy_bad_debt(&self) -> bool {
@@ -52,7 +52,7 @@ impl Config {
         // Then load local .env
         let _ = dotenv::dotenv();
 
-        // Load $HOME/.liquidium-pipeline/config.env 
+        // Load $HOME/.liquidium-pipeline/config.env
         if let Ok(home) = env::var("HOME") {
             let config_path = format!("{}/.liquidium-pipeline/config.env", home);
             let _ = dotenv::from_filename(config_path);
@@ -108,16 +108,16 @@ async fn load_asset_maps() -> (HashMap<String, IcrcToken>, HashMap<String, IcrcT
     let mut debt = HashMap::new();
 
     for p in parse_principals("DEBT_ASSETS") {
-        let token = IcrcToken::from_principal(p.0.clone(), agent.clone()).await;
+        let token = IcrcToken::from_principal(p.0, agent.clone()).await;
         assert_eq!(token.symbol, p.1, "token mismatch detected");
         debt.insert(p.0.to_string(), token);
     }
 
     let mut coll = HashMap::new();
     for p in parse_principals("COLLATERAL_ASSETS") {
-        let mut token = debt.get(&p.0.to_text()).and_then(|t| Some(t.clone()));
+        let mut token = debt.get(&p.0.to_text()).cloned();
         if token.is_none() {
-            token = Some(IcrcToken::from_principal(p.0.clone(), agent.clone()).await);
+            token = Some(IcrcToken::from_principal(p.0, agent.clone()).await);
         }
         let token = token.unwrap();
         assert_eq!(token.symbol, p.1, "token mismatch detected");
@@ -131,9 +131,9 @@ fn parse_principals(var: &str) -> Vec<(Principal, String)> {
     std::env::var(var)
         .unwrap_or_default()
         .split(',')
-        .filter_map(|s| {
+        .map(|s| {
             let s: Vec<&str> = s.trim().split(":").collect();
-            Some((Principal::from_text(s[0]).unwrap(), s[1].to_string()))
+            (Principal::from_text(s[0]).unwrap(), s[1].to_string())
         })
         .collect::<Vec<(Principal, String)>>()
 }

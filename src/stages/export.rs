@@ -32,7 +32,6 @@ struct ExecutionAnalyticsRow {
 impl<'a> PipelineStage<'a, Vec<ExecutionReceipt>, ()> for ExportStage {
     async fn process(&self, input: &'a Vec<ExecutionReceipt>) -> Result<(), String> {
         let file = OpenOptions::new()
-            .write(true)
             .create(true)
             .append(true)
             .open(&self.path)

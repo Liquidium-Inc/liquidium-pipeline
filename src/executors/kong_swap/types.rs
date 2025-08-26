@@ -21,9 +21,9 @@ pub struct SwapArgs {
     pub referred_by: Option<String>,
 }
 
-impl Into<Vec<u8>> for SwapArgs {
-    fn into(self) -> Vec<u8> {
-        Encode!(&self).expect("could not encode swap args")
+impl From<SwapArgs> for Vec<u8> {
+    fn from(val: SwapArgs) -> Self {
+        Encode!(&val).expect("could not encode swap args")
     }
 }
 
@@ -64,6 +64,7 @@ pub struct ICTransferReply {
 }
 
 
+#[allow(clippy::large_enum_variant)]
 #[derive(CandidType, Deserialize, Clone, Serialize)]
 pub enum SwapResult { Ok(SwapReply), Err(String) }
 

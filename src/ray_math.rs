@@ -1,6 +1,6 @@
 use candid::Nat;
 
-#[allow(dead_code)]
+#[allow(dead_code, clippy::wrong_self_convention)]
 pub trait WadRayMath {
     fn wad_mul(&self, other: &Self) -> Self;
     fn wad_div(&self, other: &Self) -> Self;
@@ -139,7 +139,7 @@ mod tests {
         } else {
             expected - wad_quotient
         };
-        assert!(diff <= Nat::from(1u8));
+        assert!(diff <= 1u8);
     }
 
     #[test]

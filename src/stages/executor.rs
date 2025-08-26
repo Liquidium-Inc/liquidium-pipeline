@@ -61,12 +61,12 @@ impl ExecutionReceipt {
 
     pub fn formatted_realized_profit(&self) -> String {
         let amount = self.realized_profit as f64 / 10f64.powi(self.request.debt_asset.decimals as i32);
-        return format!("{amount} {}", self.request.debt_asset.symbol);
+        format!("{amount} {}", self.request.debt_asset.symbol)
     }
 
     pub fn formatted_expected_profit(&self) -> String {
         let amount = self.expected_profit as f64 / 10f64.powi(self.request.debt_asset.decimals as i32);
-        return format!("{amount} {}", self.request.debt_asset.symbol);
+        format!("{amount} {}", self.request.debt_asset.symbol)
     }
 
     pub fn formatted_profit_delta(&self) -> String {

@@ -32,15 +32,12 @@ where
 impl<A: PipelineAgent> PriceOracle for LiquidationPriceOracle<A> {
     // Fetches price data from the lending canister
     async fn get_price(&self, token_in: &str, token_out: &str) -> Result<(Nat, u32), String> {
-        let price = self
-            .agent
-            .call_query::<Result<(Nat, u32),String>>(
+        self.agent
+            .call_query::<Result<(Nat, u32), String>>(
                 &self.lending_canister,
                 "get_price",
                 Encode!(&token_in, &token_out).expect("could not encode params"),
             )
-            .await?;
-
-        price
+            .await?
     }
 }

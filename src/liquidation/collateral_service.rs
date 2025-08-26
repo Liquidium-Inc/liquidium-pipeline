@@ -5,7 +5,14 @@ use candid::Nat;
 use log::debug;
 use num_traits::ToPrimitive;
 
-use crate::{liquidation::liquidation_utils::estimate_liquidation, price_oracle::price_oracle::PriceOracle, ray_math::WadRayMath, types::protocol_types::{Asset, LiquidateblePosition, LiquidatebleUser, LIQUIDATION_BONUS_SCALE, MAX_LIQUIDATION_RATIO}};
+use crate::{
+    liquidation::liquidation_utils::estimate_liquidation,
+    price_oracle::price_oracle::PriceOracle,
+    ray_math::WadRayMath,
+    types::protocol_types::{
+        Asset, LIQUIDATION_BONUS_SCALE, LiquidateblePosition, LiquidatebleUser, MAX_LIQUIDATION_RATIO,
+    },
+};
 
 pub struct LiquidationEstimation {
     pub repaid_debt: Nat,
@@ -79,14 +86,14 @@ impl<P: PriceOracle> CollateralServiceTrait for CollateralService<P> {
         if debt_value > max_liquidation {
             debug!(
                 "Liquidation amount  {} exceeds maxmimum liquidation {}",
-                debt_value.from_ray().0.to_f64().unwrap() / 10u128.pow(debt_decimals as u32) as f64,
-                max_liquidation.from_ray().0.to_f64().unwrap() / 10u128.pow(debt_decimals as u32) as f64
+                debt_value.from_ray().0.to_f64().unwrap() / 10u128.pow(debt_decimals) as f64,
+                max_liquidation.from_ray().0.to_f64().unwrap() / 10u128.pow(debt_decimals) as f64
             );
 
             debt_value = max_liquidation
         }
 
-        let bonus_multiplier = Nat::from(LIQUIDATION_BONUS_SCALE + debt_position.liquidation_bonus.clone());
+        let bonus_multiplier = LIQUIDATION_BONUS_SCALE + debt_position.liquidation_bonus.clone();
 
         debug!(
             "Estimating liquidation: debt_value={}, bonus_multiplier={}, available_collateral={}, decimals=(debt: {}, collateral: {})",
@@ -103,7 +110,8 @@ impl<P: PriceOracle> CollateralServiceTrait for CollateralService<P> {
             collateral_decimals,
         );
 
-        let bonus =  received_collateral.clone() - ((received_collateral.clone() * LIQUIDATION_BONUS_SCALE) / bonus_multiplier);
+        let bonus =
+            received_collateral.clone() - ((received_collateral.clone() * LIQUIDATION_BONUS_SCALE) / bonus_multiplier);
         // TODO: Add the protocol fee the canister metadata response
         let protocol_fee = (bonus * 200u128) / 10_000u128; // Factor in the 10% liquidation fee
         let received_collateral = received_collateral.clone() - protocol_fee;
@@ -121,7 +129,10 @@ mod test {
     use ctor::ctor;
     use mockall::predicate::eq;
 
-    use crate::{price_oracle::price_oracle::MockPriceOracle, types::protocol_types::{AssetType, Assets}};
+    use crate::{
+        price_oracle::price_oracle::MockPriceOracle,
+        types::protocol_types::{AssetType, Assets},
+    };
 
     use super::*;
     use std::sync::Arc;

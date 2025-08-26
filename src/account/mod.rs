@@ -77,7 +77,6 @@ pub mod account {
         fn get_cached_balance(&self, ledger_id: Principal, account: Principal) -> Option<IcrcTokenAmount> {
             let balance = self.cache.lock().unwrap().get(&(ledger_id, account)).cloned();
             balance
-
         }
     }
 
@@ -94,8 +93,7 @@ pub mod account {
                 agent: self.agent.agent(),
                 ledger_canister_id: token_amount.token.ledger,
             };
-
-            let result = icrc_agent
+            icrc_agent
                 .transfer(TransferArg {
                     from_subaccount: None,
                     to: Account {
@@ -109,10 +107,8 @@ pub mod account {
                 })
                 .await
                 .map_err(|e| format!("Withdraw error {:?}", e))?
-                .and_then(|res| Ok(res.to_string().replace("_", "")))
-                .map_err(|e| format!("Withdraw error {:?}", e));
-
-            result
+                .map_err(|e| format!("Withdraw error {:?}", e))
+                .map(|res| res.to_string().replace("_", ""))
         }
     }
 }

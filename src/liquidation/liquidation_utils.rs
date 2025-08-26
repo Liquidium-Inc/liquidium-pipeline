@@ -74,7 +74,7 @@ let bonus_scale_ray                = Nat::from(LIQUIDATION_BONUS_SCALE).to_ray()
     }
 
     // Handle buying of bad debt
-    if available_collateral <= Nat::from(1u8) {
+    if available_collateral <= 1u8 {
         // full liquidation: repay entire debt
         let repay_ray = debt_value
             .ray_div(&debt_price_ray)
@@ -153,7 +153,7 @@ mod tests {
             6u32
         );
 
-        assert_eq!(collateral <= available_collateral, true);
+        assert!(collateral <= available_collateral);
         assert_eq!(debt, nat(1000e6 as u64));
     }
 
@@ -218,7 +218,7 @@ mod tests {
         let bonus_multiplier = nat(1200u64);
 
         // Collateral price: $2.00 -> (price, decimals)
-        let collateral_price = (nat(2_000_00000u64), 8);
+        let collateral_price = (nat(200_000_000_u64), 8);
 
         // Debt price: $1.00 with 9 decimals
         let debt_price = (nat(1_000_000_000u64), 9);

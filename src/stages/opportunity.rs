@@ -55,7 +55,7 @@ where
 
         let opportunities: Vec<LiquidatebleUser> = opportunities
             .iter()
-            .filter(|item| item.positions.len() > 0)
+            .filter(|item| !item.positions.is_empty())
             .cloned()
             .collect();
 

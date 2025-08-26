@@ -9,7 +9,7 @@ use crate::{
     icrc_token::{icrc_token::IcrcToken, icrc_token_amount::IcrcTokenAmount},
 };
 
-pub async fn withdraw(asset: &String, amount: &String, to: &String) {
+pub async fn withdraw(asset: &String, amount: &str, to: &String) {
     // Load Config
     let config = Config::load().await.expect("Failed to load config");
 

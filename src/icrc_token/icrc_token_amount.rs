@@ -31,11 +31,12 @@ impl IcrcTokenAmount {
         let frac_part = raw_value % 10u128.pow(decimals);
 
         if decimals > 0 {
+            let suffix = format!("{:0>width$}", frac_part, width = decimals as usize);
             format!(
                 "{}: {}.{}",
                 self.token.symbol,
                 int_part.to_formatted_string(&Locale::en),
-                format!("{:0>width$}", frac_part, width = decimals as usize)
+                suffix
             )
         } else {
             format!("{}: {}", self.token.symbol, int_part.to_formatted_string(&Locale::en),)

@@ -10,6 +10,7 @@ use crate::liquidation::collateral_service::CollateralServiceTrait;
 use crate::stage::PipelineStage;
 use crate::types::protocol_types::{AssetType, LiquidatebleUser, LiquidationRequest};
 use async_trait::async_trait;
+use itertools::Itertools;
 
 use candid::{Int, Nat, Principal};
 use log::{debug, info};
@@ -67,6 +68,13 @@ where
 
             balances.insert(asset, balance.value);
         }
+
+        // Take smallest hf first
+        let users: Vec<LiquidatebleUser> = users
+            .iter()
+            .sorted_by(|a, b| a.health_factor.cmp(&b.health_factor))
+            .cloned()
+            .collect();
 
         for user in users {
             // Find the largest debt position
@@ -247,7 +255,8 @@ mod tests {
         config::MockConfigTrait,
         executors::{executor::MockIcrcSwapExecutor, kong_swap::types::SwapAmountsReply},
         icrc_token::icrc_token::IcrcToken,
-        liquidation::collateral_service::{LiquidationEstimation, MockCollateralServiceTrait}, types::protocol_types::{Assets, LiquidateblePosition},
+        liquidation::collateral_service::{LiquidationEstimation, MockCollateralServiceTrait},
+        types::protocol_types::{Assets, LiquidateblePosition},
     };
     use rand::random;
 
@@ -740,10 +749,10 @@ mod tests {
                 receive_symbol: "ckUSDC".to_string(),
                 receive_address: "recv-addr".to_string(),
                 receive_amount: if calls == 0 {
-                    calls = calls + 1;
+                    calls += 1;
                     Nat::from(2000u64) // profitable
                 } else {
-                    calls = calls + 1;
+                    calls += 1;
                     Nat::from(500u64)
                 },
                 mid_price: 1.0,

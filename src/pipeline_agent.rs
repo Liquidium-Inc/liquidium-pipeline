@@ -46,7 +46,7 @@ impl PipelineAgent for ic_agent::Agent {
         arg: Vec<u8>,
     ) -> Result<R, String> {
         let res = self
-            .query(&canister, method)
+            .query(canister, method)
             .with_arg(arg)
             .call()
             .await
@@ -65,7 +65,7 @@ impl PipelineAgent for ic_agent::Agent {
         arg: Vec<u8>,
     ) -> Result<R, String> {
         let res = self
-            .query(&canister, method)
+            .query(canister, method)
             .with_arg(arg)
             .call()
             .await
@@ -77,7 +77,7 @@ impl PipelineAgent for ic_agent::Agent {
     }
 
     async fn call_update_raw(&self, canister: &Principal, method: &str, arg: Vec<u8>) -> Result<Vec<u8>, String> {
-        let res = self.update(&canister, method).with_arg(arg).call_and_wait().await;
+        let res = self.update(canister, method).with_arg(arg).call_and_wait().await;
         res.map_err(|e| e.to_string())
     }
 

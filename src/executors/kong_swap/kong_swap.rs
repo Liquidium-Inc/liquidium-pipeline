@@ -60,9 +60,9 @@ impl<A: PipelineAgent> KongSwapExecutor<A> {
     async fn check_allowance(&self, token: &Principal, spender: &Principal) -> Nat {
         let mut allowance = self
             .allowance(
-                &token,
+                token,
                 Account {
-                    owner: spender.clone(),
+                    owner: *spender,
                     subaccount: None,
                 },
             )
@@ -73,9 +73,9 @@ impl<A: PipelineAgent> KongSwapExecutor<A> {
             info!("Allowance low for {}, re-approving…", token);
             allowance = match self
                 .approve(
-                    &token,
+                    token,
                     Account {
-                        owner: spender.clone(),
+                        owner: *spender,
                         subaccount: None,
                     },
                 )

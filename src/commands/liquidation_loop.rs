@@ -56,10 +56,10 @@ async fn init(
     let mut swapper = KongSwapExecutor::new(
         agent.clone(),
         Account {
-            owner: config.liquidator_principal.clone(),
+            owner: config.liquidator_principal,
             subaccount: None,
         },
-        config.lending_canister.clone(),
+        config.lending_canister,
     );
 
     // Pre approve tokens
@@ -77,7 +77,7 @@ async fn init(
     let executor = Arc::new(swapper);
 
     info!("Initializing searcher stage ...");
-    let finder = OpportunityFinder::new(agent.clone(), config.lending_canister.clone());
+    let finder = OpportunityFinder::new(agent.clone(), config.lending_canister);
 
     info!("Initializing liquidations stage ...");
     let price_oracle = Arc::new(LiquidationPriceOracle::new(agent.clone(), config.lending_canister));
@@ -214,12 +214,10 @@ pub fn print_execution_results(results: Vec<ExecutionReceipt>) {
         let delta = r.realized_profit - r.expected_profit;
         let delta_cell = {
             let txt = format!("{} ({})", r.formatted_realized_profit(), r.formatted_profit_delta());
-            if delta > 0 {
-                Cell::new(&txt).style_spec("Fg")
-            } else if delta < 0 {
-                Cell::new(&txt).style_spec("Fr")
-            } else {
-                Cell::new(&txt)
+            match delta.cmp(&0) {
+                std::cmp::Ordering::Greater => Cell::new(&txt).style_spec("Fg"),
+                std::cmp::Ordering::Less => Cell::new(&txt).style_spec("Fr"),
+                std::cmp::Ordering::Equal => Cell::new(&txt),
             }
         };
 

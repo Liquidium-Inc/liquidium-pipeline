@@ -37,7 +37,7 @@ pub async fn funds() {
 pub async fn sync_balances(
     config: &Arc<Config>,
     account_service: Arc<LiquidatorAccount<Agent>>,
-    assets: &Vec<String>,
+    assets: &[String],
 ) -> Vec<Result<(String, Principal), tokio::task::JoinError>> {
     let futures = assets.iter().map(|asset| {
         let account_service = account_service.clone();
@@ -52,7 +52,6 @@ pub async fn sync_balances(
             (balance.formatted(), principal)
         })
     });
-
-    let results = join_all(futures).await;
-    results
+    
+    join_all(futures).await
 }
