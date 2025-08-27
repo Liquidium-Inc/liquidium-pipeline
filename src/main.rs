@@ -11,6 +11,7 @@ mod stage;
 mod stages;
 mod utils;
 mod types;
+mod watchdog;
 
 use clap::{Parser, Subcommand};
 

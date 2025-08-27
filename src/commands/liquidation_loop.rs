@@ -19,6 +19,7 @@ use crate::{
         opportunity::OpportunityFinder,
         simple_strategy::IcrcLiquidationStrategy,
     },
+    watchdog::{WatchdogEvent, webhook_watchdog_from_env},
 };
 use ic_agent::Agent;
 
@@ -84,12 +85,16 @@ async fn init(
 
     let collateral_service = Arc::new(CollateralService::new(price_oracle));
     let icrc_account_service = Arc::new(LiquidatorAccount::new(agent.clone()));
+
+    let wd = webhook_watchdog_from_env(Duration::from_secs(300));
+    wd.notify(WatchdogEvent::Heartbeat { stage: "Init" }).await;
     let strategy = IcrcLiquidationStrategy::new(
         config.clone(),
         executor.clone(),
         collateral_service.clone(),
         icrc_account_service.clone(),
-    );
+    )
+    .with_watchdog(wd);
 
     let exporter = Arc::new(ExportStage {
         path: config.export_path.clone(),

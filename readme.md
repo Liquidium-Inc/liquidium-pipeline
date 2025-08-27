@@ -1,4 +1,3 @@
-
 # 🧯 Liquidator Bot Framework for ICP
 
 A modular, event-driven off-chain liquidation bot framework for [Internet Computer (ICP)](https://internetcomputer.org/) protocols.  
@@ -8,10 +7,10 @@ Inspired by Artemis/MEV patterns and designed for permissionless, community-driv
 
 ## ✨ Features
 
-- 🔁 **Pipeline Architecture** — Composable stages for discovery, execution, and swaps.  
-- ⚡ **Async Rust** — Highly concurrent and efficient.  
-- 👷 **Extensible** — Add custom risk checks, strategies, swaps, or notification stages.  
-- 📦 **Permissionless** — Anyone can run it.  
+- 🔁 **Pipeline Architecture** — Composable stages for discovery, execution, and swaps.
+- ⚡ **Async Rust** — Highly concurrent and efficient.
+- 👷 **Extensible** — Add custom risk checks, strategies, swaps, or notification stages.
+- 📦 **Permissionless** — Anyone can run it.
 - 🧪 **CLI Interface** — Manage balances, funds, and identities.
 
 ---
@@ -21,7 +20,9 @@ Inspired by Artemis/MEV patterns and designed for permissionless, community-driv
 ```bash
 curl -fsSL https://raw.githubusercontent.com/Liquidium-Inc/liquidium-pipeline/main/install.sh | bash
 ```
+
 This will:
+
 - Clone/update the repo
 - Build the liquidator binary
 - Install it to /usr/local/bin/liquidator
@@ -33,9 +34,9 @@ This will:
 
 The bot loads configuration from:
 
-1.	~/.config/liquidator/config.env (preferred, created automatically)
+1. ~/.config/liquidator/config.env (preferred, created automatically)
 
-2.	.env in the current directory (optional overrides)
+2. .env in the current directory (optional overrides)
 
 Example config.env:
 
@@ -49,25 +50,37 @@ BUY_BAD_DEBT=false
 # Comma-separated principal:symbol
 DEBT_ASSETS=principal1:BTC,principal2:ETH
 COLLATERAL_ASSETS=principal3:ckBTC,principal4:ckETH
+WATCHDOG_WEBHOOK=http://...
 ```
+
+🔔 WATCHDOG_WEBHOOK
+
+If set, the bot will send a POST request with JSON payloads to the given URL.
+
+Use this for monitoring and alerting (e.g. Slack, Discord, or your own service).
 
 ⸻
 
 🔑 Identity Management
 
 Generate a new Ed25519 identity:
+
 ```
 liquidator account new
 ```
 
 Show the liquidator principal:
+
 ```
 liquidator account show
 ```
+
 By default, identities are stored at:
+
 ```
 ~/.config/liquidator/id.pem
 ```
+
 Change location by setting IDENTITY_PEM in config.env.
 
 ⸻
@@ -83,7 +96,6 @@ flowchart LR
     C --> D[Reporting / Export]
 ```
 
-
 - Opportunity Discovery → Polls ICP canisters for loans or positions eligible for liquidation.
 - Liquidation Execution → Calls the canister to liquidate an at-risk position, seizing collateral.
 - Asset Swap → Swaps seized collateral for a desired asset.
@@ -96,22 +108,31 @@ Stages are implemented with async-trait for composability.
 🧪 CLI Commands
 
 Run loop:
+
 ```
 liquidator run
 ```
+
 Check balances:
+
 ```
 liquidator balance
 ```
+
 Withdraw funds:
+
 ```
 liquidator withdraw <ASSET_PRINCIPAL> <AMOUNT> <TO_PRINCIPAL>
 ```
+
 Show identity principal:
+
 ```
 liquidator account show
 ```
+
 Generate new identity:
+
 ```
 liquidator account new
 ```
@@ -119,6 +140,7 @@ liquidator account new
 ⸻
 
 🛠 Developer Setup
+
 ```bash
 git clone https://github.com/Liquidium-Inc/liquidium-pipeline.git
 
@@ -131,9 +153,11 @@ Binary will be at:
 target/release/liquidator
 
 ```
+
 ⸻
 
 📝 Notes
+
 - Works with ICRC-1 assets like ckBTC
 - Identity/config can be system-wide or project-local
 - Composable stages allow for custom liquidation strategies

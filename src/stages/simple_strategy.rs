@@ -9,6 +9,7 @@ use crate::icrc_token::icrc_token_amount::IcrcTokenAmount;
 use crate::liquidation::collateral_service::CollateralServiceTrait;
 use crate::stage::PipelineStage;
 use crate::types::protocol_types::{AssetType, LiquidatebleUser, LiquidationRequest};
+use crate::watchdog::{Watchdog, WatchdogEvent, noop_watchdog};
 use async_trait::async_trait;
 use itertools::Itertools;
 
@@ -26,6 +27,7 @@ where
     pub executor: Arc<T>,
     pub collateral_service: Arc<U>,
     pub account_service: Arc<W>,
+    pub watchdog: Arc<dyn Watchdog>,
 }
 
 impl<T, C, U, W> IcrcLiquidationStrategy<T, C, U, W>
@@ -41,7 +43,13 @@ where
             executor,
             collateral_service,
             account_service,
+            watchdog: noop_watchdog(),
         }
+    }
+
+    pub fn with_watchdog(mut self, wd: Arc<dyn Watchdog>) -> Self {
+        self.watchdog = wd;
+        self
     }
 }
 
@@ -105,6 +113,11 @@ where
                 b
             } else {
                 println!("Asset balance not found {:?}", debt_asset_principal.to_string());
+                self.watchdog
+                    .notify(WatchdogEvent::BalanceMissing {
+                        asset: &debt_position.asset.to_string(),
+                    })
+                    .await;
                 continue;
             };
 
@@ -119,6 +132,12 @@ where
                 .ok_or("invalid debt asset principal")?;
 
             if available_balance.clone() < repayment_token.fee.clone() * 2u64 {
+                self.watchdog
+                    .notify(WatchdogEvent::InsufficientFunds {
+                        asset: &debt_position.asset.to_string(),
+                        available: available_balance.to_string(),
+                    })
+                    .await;
                 return Err("Insufficient funds to execute liquidation".to_string());
             }
 
@@ -128,6 +147,7 @@ where
                 "available_balance: {:?} repayment_token_fee {:?} max_balance: {:?}",
                 available_balance, repayment_token.fee, max_balance
             );
+
             let mut estimation = self
                 .collateral_service
                 .calculate_liquidation_amounts(max_balance, debt_position, collateral_position, &user)
