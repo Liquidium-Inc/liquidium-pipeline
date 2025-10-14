@@ -1,2 +1,2 @@
 pub mod collateral_service;
-pub mod liquidation_utils;
+pub mod liquidation_math;

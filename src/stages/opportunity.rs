@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
+use crate::stage::PipelineStage;
 use crate::types::protocol_types::AssetType;
 use crate::{pipeline_agent::PipelineAgent, types::protocol_types::LiquidatebleUser};
-use crate::stage::PipelineStage;
 use async_trait::async_trait;
 use candid::{Encode, Principal};
 
@@ -66,9 +66,9 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::stage::PipelineStage;
     use crate::types::protocol_types::Assets;
     use crate::{pipeline_agent::MockPipelineAgent, types::protocol_types::LiquidateblePosition};
-    use crate::stage::PipelineStage;
     use candid::{Nat, Principal};
     use std::sync::Arc;
 
@@ -84,7 +84,9 @@ mod tests {
             asset: Assets::BTC,
             asset_type: AssetType::CkAsset(Principal::anonymous()),
             account: Principal::anonymous(),
-            liquidation_bonus: Nat::from(60u8),
+            liquidation_bonus: 60,
+            liquidation_threshold: 8000,
+            protocol_fee: 200,
         };
 
         let pos_ckusdc = LiquidateblePosition {

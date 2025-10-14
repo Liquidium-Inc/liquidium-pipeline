@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc d40ceb2a48c7bbe1f2f6387d2bbce1dda59a4b664fdb092b300d95ac8e6e7c11 # shrinks to debt_native = 559228133, coll_native = 1, max_repay_native = 1, user_total_usd = 1, hf_permille = 800, bonus_bps = 0, fee_bps = 0
+cc e042ae23f85af27404b119fa8243c2cd28790320dd0be2f4783752530fe31c2f # shrinks to debt_native = 712133881, coll_native = 0, max_repay_native = 1, user_total_usd = 1, hf_permille = 800, bonus_bps = 0, fee_bps = 0

@@ -47,3 +47,4 @@ chrono = "0.4.41"
 ic_principal = { version = "0.1.1", features = ["arbitrary"] }
 arbitrary = "1.4.1"
 rand = "0.9.1"
+proptest = "1.4"

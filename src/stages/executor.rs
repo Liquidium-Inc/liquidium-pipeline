@@ -88,8 +88,8 @@ impl<'a, A: PipelineAgent> PipelineStage<'a, Vec<ExecutorRequest>, Vec<Execution
             // Make the update call to the canister
             let liquidation_result = self
                 .agent
-                .call_update::<LiquidationResult>(&self.lending_canister, "liquidate", args)
-                .await;
+                .call_update::<Result<LiquidationResult, String>>(&self.lending_canister, "liquidate", args)
+                .await?;
 
             let liquidation_result = liquidation_result.and_then(|result| match result.status {
                 LiquidationStatus::Success => Ok(result),
@@ -110,8 +110,7 @@ impl<'a, A: PipelineAgent> PipelineStage<'a, Vec<ExecutorRequest>, Vec<Execution
                     realized_profit: 0,
                     status: ExecutionStatus::Error(format!(
                         "Could not execute liquidation {:?} {:?}",
-                        executor_request,
-                        err
+                        executor_request, err
                     )),
                 });
 
@@ -159,8 +158,7 @@ impl<'a, A: PipelineAgent> PipelineStage<'a, Vec<ExecutorRequest>, Vec<Execution
 
                 debug!("Executed swap {:?}", result);
                 let len = execution_receipts.len();
-                let realized_profit =
-                    result.receive_amount.clone() - executor_request.liquidation.debt_amount.clone().unwrap();
+                let realized_profit = result.receive_amount.clone() - executor_request.liquidation.debt_amount.clone();
                 execution_receipts[len - 1].swap_result = Some(result);
                 execution_receipts[len - 1].realized_profit = realized_profit.0.to_i128().unwrap();
             }
@@ -267,8 +265,7 @@ mod test {
                 borrower: principal,
                 debt_pool_id: principal,
                 collateral_pool_id: principal,
-                debt_amount: Some(Nat::from(500u64)),
-                min_collateral_amount: None,
+                debt_amount: Nat::from(500u64),
             },
             swap_args: Some(SwapArgs {
                 pay_token: "ckUSDC".to_string(),
@@ -345,8 +342,7 @@ mod test {
                 borrower: principal,
                 debt_pool_id: principal,
                 collateral_pool_id: principal,
-                debt_amount: Some(Nat::from(18_000u64)),
-                min_collateral_amount: None,
+                debt_amount: Nat::from(18_000u64),
             },
             swap_args: None,
             expected_profit: 0,
@@ -402,8 +398,7 @@ mod test {
                 borrower: principal,
                 debt_pool_id: principal,
                 collateral_pool_id: principal,
-                debt_amount: Some(Nat::from(1_000u64)),
-                min_collateral_amount: None,
+                debt_amount: (Nat::from(1_000u64)),
             },
             swap_args: Some(SwapArgs {
                 pay_token: "ckUSDC".to_string(),
@@ -497,8 +492,7 @@ mod test {
                 borrower: principal,
                 debt_pool_id: principal,
                 collateral_pool_id: principal,
-                debt_amount: None,
-                min_collateral_amount: None,
+                debt_amount: 0u8.into(),
             },
             swap_args: Some(SwapArgs {
                 pay_token: "ckUSDC".to_string(),
