@@ -4,7 +4,8 @@ use serde::Serialize;
 use std::fs::{OpenOptions, metadata};
 
 use crate::stage::PipelineStage;
-use crate::stages::executor::{ExecutionReceipt, ExecutionStatus};
+
+use crate::stages::finalize::LiquidationOutcome;
 
 pub struct ExportStage {
     pub path: String,
@@ -29,8 +30,8 @@ struct ExecutionAnalyticsRow {
 }
 
 #[async_trait]
-impl<'a> PipelineStage<'a, Vec<ExecutionReceipt>, ()> for ExportStage {
-    async fn process(&self, input: &'a Vec<ExecutionReceipt>) -> Result<(), String> {
+impl<'a> PipelineStage<'a, Vec<LiquidationOutcome>, ()> for ExportStage {
+    async fn process(&self, input: &'a Vec<LiquidationOutcome>) -> Result<(), String> {
         let file = OpenOptions::new()
             .create(true)
             .append(true)
@@ -47,13 +48,10 @@ impl<'a> PipelineStage<'a, Vec<ExecutionReceipt>, ()> for ExportStage {
 
         for r in input {
             let row = ExecutionAnalyticsRow {
-                status: match &r.status {
-                    ExecutionStatus::Success => "Success".into(),
-                    ExecutionStatus::Error(e) => format!("Error: {}", e),
-                },
-                expected_profit: r.expected_profit,
+                status: r.status.description(),
+                expected_profit: r.request.expected_profit,
                 realized_profit: r.realized_profit,
-                liquidation_tx_id: r.liquidation_result.as_ref().map(|l| l.tx_id.clone()),
+                liquidation_tx_id: r.liquidation_result.collateral_tx.tx_id.clone(),
                 swap_tx_id: r.swap_result.as_ref().map(|s| s.tx_id),
                 pay_chain: r.swap_result.as_ref().map(|s| s.pay_chain.clone()),
                 pay_symbol: r.swap_result.as_ref().map(|s| s.pay_symbol.clone()),

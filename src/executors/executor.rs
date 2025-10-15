@@ -1,13 +1,10 @@
-use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 
 use crate::{
-    icrc_token::{icrc_token::IcrcToken, icrc_token_amount::IcrcTokenAmount},
-    types::protocol_types::LiquidationRequest,
+    icrc_token::icrc_token::IcrcToken, swappers::kong_types::SwapArgs, types::protocol_types::LiquidationRequest,
 };
 
-use super::kong_swap::types::{SwapAmountsReply, SwapArgs, SwapReply};
-
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExecutorRequest {
     // The liquidation request to figure out how much debt we repay
     pub liquidation: LiquidationRequest,
@@ -19,17 +16,4 @@ pub struct ExecutorRequest {
     pub collateral_asset: IcrcToken,
     // The expected profit
     pub expected_profit: i128,
-}
-
-#[cfg_attr(test, mockall::automock)]
-#[async_trait]
-pub trait IcrcSwapExecutor: Send + Sync {
-    async fn get_swap_info(
-        &self,
-        token_in: &IcrcToken,
-        token_out: &IcrcToken,
-        amount: &IcrcTokenAmount,
-    ) -> Result<SwapAmountsReply, String>;
-
-    async fn swap(&self, swap_args: SwapArgs) -> Result<SwapReply, String>;
 }

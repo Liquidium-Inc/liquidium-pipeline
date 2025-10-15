@@ -3,14 +3,19 @@ use std::sync::Arc;
 
 use crate::account::account::IcrcAccountInfo;
 use crate::config::ConfigTrait;
-use crate::executors::executor::{ExecutorRequest, IcrcSwapExecutor};
-use crate::executors::kong_swap::types::SwapArgs;
+use crate::executors::executor::ExecutorRequest;
+
 use crate::icrc_token::icrc_token_amount::IcrcTokenAmount;
 use crate::liquidation::collateral_service::CollateralServiceTrait;
 use crate::stage::PipelineStage;
+
+use crate::swappers::kong_types::SwapArgs;
+use crate::swappers::swap_interface::IcrcSwapInterface;
 use crate::types::protocol_types::{AssetType, LiquidateblePosition, LiquidatebleUser, LiquidationRequest};
+
 use crate::watchdog::{Watchdog, WatchdogEvent, noop_watchdog};
 use async_trait::async_trait;
+use icrc_ledger_types::icrc1::account::Account;
 use itertools::Itertools;
 
 use candid::{Int, Nat, Principal};
@@ -18,13 +23,13 @@ use log::{debug, info};
 use num_traits::ToPrimitive;
 pub struct IcrcLiquidationStrategy<T, C, U, W>
 where
-    T: IcrcSwapExecutor + Send + Sync,
+    T: IcrcSwapInterface + Send + Sync,
     C: ConfigTrait,
     U: CollateralServiceTrait,
     W: IcrcAccountInfo,
 {
     pub config: Arc<C>,
-    pub executor: Arc<T>,
+    pub swapper: Arc<T>,
     pub collateral_service: Arc<U>,
     pub account_service: Arc<W>,
     pub watchdog: Arc<dyn Watchdog>,
@@ -32,7 +37,7 @@ where
 
 impl<T, C, U, W> IcrcLiquidationStrategy<T, C, U, W>
 where
-    T: IcrcSwapExecutor,
+    T: IcrcSwapInterface,
     C: ConfigTrait,
     U: CollateralServiceTrait,
     W: IcrcAccountInfo,
@@ -40,7 +45,7 @@ where
     pub fn new(config: Arc<C>, executor: Arc<T>, collateral_service: Arc<U>, account_service: Arc<W>) -> Self {
         Self {
             config,
-            executor,
+            swapper: executor,
             collateral_service,
             account_service,
             watchdog: noop_watchdog(),
@@ -57,7 +62,7 @@ where
 impl<'a, T, C, U, W> PipelineStage<'a, Vec<LiquidatebleUser>, Vec<ExecutorRequest>>
     for IcrcLiquidationStrategy<T, C, U, W>
 where
-    T: IcrcSwapExecutor,
+    T: IcrcSwapInterface,
     C: ConfigTrait,
     U: CollateralServiceTrait,
     W: IcrcAccountInfo,
@@ -224,7 +229,7 @@ where
                     (None, amount_in.value, 1f64)
                 } else {
                     let swap_info = self
-                        .executor
+                        .swapper
                         .get_swap_info(collateral_token, repayment_token, &amount_in)
                         .await
                         .expect("could not get swap info");
@@ -235,7 +240,7 @@ where
                             pay_tx_id: None,
                             receive_token: swap_info.receive_symbol,
                             receive_amount: Some(swap_info.receive_amount.clone()),
-                            receive_address: None,
+                            receive_address: Some(self.config.get_liquidator_principal().to_string()),
                             max_slippage: Some(swap_info.slippage),
                             referred_by: None,
                         }),
@@ -294,6 +299,10 @@ where
                     debt_pool_id: debt_position.pool_id,
                     collateral_pool_id: collateral_position.pool_id,
                     debt_amount: estimation.repaid_debt.clone(),
+                    receiver: Account {
+                        owner: self.config.get_trader_principal(),
+                        subaccount: None,
+                    },
                 },
                 swap_args,
                 expected_profit: profit.0.to_i128().unwrap(),
@@ -318,7 +327,6 @@ mod tests {
     use crate::{
         account::account::MockIcrcAccountInfo,
         config::MockConfigTrait,
-        executors::{executor::MockIcrcSwapExecutor, kong_swap::types::SwapAmountsReply},
         icrc_token::icrc_token::IcrcToken,
         liquidation::collateral_service::{LiquidationEstimation, MockCollateralServiceTrait},
         stages::simple_strategy::tests::test_helpers::{
@@ -326,15 +334,19 @@ mod tests {
             mk_config_with_maps, mk_executor_panic, mk_executor_reply, mk_token, mk_user, pos_collateral_btc,
             pos_debt_usdc,
         },
+        swappers::{kong_types::SwapAmountsReply, swap_interface::MockIcrcSwapInterface},
         types::protocol_types::{Assets, LiquidateblePosition},
     };
     use rand::random;
 
     mod test_helpers {
         use super::*;
-        use crate::executors::kong_swap::types::SwapAmountsReply;
         use crate::icrc_token::icrc_token::IcrcToken;
+
+        use crate::swappers::kong_types::SwapAmountsReply;
+        use crate::swappers::swap_interface::MockIcrcSwapInterface;
         use crate::types::protocol_types::Assets;
+
         use std::collections::HashMap;
 
         pub fn p(text: &str) -> Principal {
@@ -390,15 +402,15 @@ mod tests {
             acc
         }
 
-        pub fn mk_executor_panic() -> MockIcrcSwapExecutor {
-            let mut ex = MockIcrcSwapExecutor::new();
+        pub fn mk_executor_panic() -> MockIcrcSwapInterface {
+            let mut ex = MockIcrcSwapInterface::new();
             ex.expect_get_swap_info()
                 .returning(|_, _, _| panic!("executor should not be called"));
             ex
         }
 
-        pub fn mk_executor_reply(pay_sym: String, recv_sym: String, recv_amount: u64) -> MockIcrcSwapExecutor {
-            let mut ex = MockIcrcSwapExecutor::new();
+        pub fn mk_executor_reply(pay_sym: String, recv_sym: String, recv_amount: u64) -> MockIcrcSwapInterface {
+            let mut ex = MockIcrcSwapInterface::new();
             ex.expect_get_swap_info().returning(move |_, _, _| {
                 Ok(SwapAmountsReply {
                     pay_chain: "ICP".to_string(),
@@ -619,7 +631,7 @@ mod tests {
         config.expect_should_buy_bad_debt().return_const(false);
 
         // We shouldn't reach these
-        let mut executor = MockIcrcSwapExecutor::new();
+        let mut executor = MockIcrcSwapInterface::new();
         executor
             .expect_get_swap_info()
             .returning(|_, _, _| panic!("should not be called"));
@@ -716,7 +728,7 @@ mod tests {
             .return_const(Principal::from_text("aaaaa-aa").unwrap());
         config.expect_should_buy_bad_debt().return_const(false);
 
-        let mut executor = MockIcrcSwapExecutor::new();
+        let mut executor = MockIcrcSwapInterface::new();
         let mut calls = 0;
         executor.expect_get_swap_info().returning(move |_, _, _| {
             Ok(SwapAmountsReply {
@@ -868,7 +880,7 @@ mod tests {
             .return_const(Principal::from_text("aaaaa-aa").unwrap());
         config.expect_should_buy_bad_debt().return_const(false);
 
-        let mut executor = MockIcrcSwapExecutor::new();
+        let mut executor = MockIcrcSwapInterface::new();
 
         executor
             .expect_get_swap_info()
@@ -1005,7 +1017,7 @@ mod tests {
         config.expect_should_buy_bad_debt().return_const(false);
 
         // Executor and collateral service should not be called since HF >= 1000 skips combos
-        let mut executor = MockIcrcSwapExecutor::new();
+        let mut executor = MockIcrcSwapInterface::new();
         executor
             .expect_get_swap_info()
             .returning(|_, _, _| panic!("executor should not be called when HF >= 1000"));
@@ -1108,7 +1120,7 @@ mod tests {
         config.expect_should_buy_bad_debt().return_const(true);
 
         // Executor should not be called because we will have zero received collateral after fee
-        let mut executor = MockIcrcSwapExecutor::new();
+        let mut executor = MockIcrcSwapInterface::new();
         executor
             .expect_get_swap_info()
             .returning(|_, _, _| panic!("executor should not be called when received collateral is zero"));

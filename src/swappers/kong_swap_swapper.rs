@@ -12,29 +12,28 @@ use icrc_ledger_types::{
 use log::{debug, info, warn};
 
 use crate::{
-    executors::{executor::IcrcSwapExecutor, kong_swap::types::SwapResult},
     icrc_token::{icrc_token::IcrcToken, icrc_token_amount::IcrcTokenAmount},
     pipeline_agent::PipelineAgent,
+    swappers::{
+        kong_types::{SwapAmountsReply, SwapArgs, SwapReply, SwapResult},
+        swap_interface::IcrcSwapInterface,
+    },
 };
-
-use super::types::{SwapAmountsReply, SwapArgs, SwapReply};
 
 static DEX_PRINCIPAL: &str = "2ipq2-uqaaa-aaaar-qailq-cai";
 
-pub struct KongSwapExecutor<A: PipelineAgent> {
+pub struct KongSwapSwapper<A: PipelineAgent> {
     pub agent: Arc<A>,
     pub account_id: Account,
-    pub lending_canister: Principal,
     pub dex_account: Account,
     pub allowances: HashMap<(Principal, Principal), Nat>,
 }
 
-impl<A: PipelineAgent> KongSwapExecutor<A> {
-    pub fn new(agent: Arc<A>, account_id: Account, lending_canister: Principal) -> Self {
+impl<A: PipelineAgent> KongSwapSwapper<A> {
+    pub fn new(agent: Arc<A>, account_id: Account) -> Self {
         Self {
             agent,
             account_id,
-            lending_canister,
             dex_account: Account {
                 owner: DEX_PRINCIPAL.parse().unwrap(),
                 subaccount: None,
@@ -43,15 +42,11 @@ impl<A: PipelineAgent> KongSwapExecutor<A> {
         }
     }
 
-    pub async fn init(&mut self, tokens: Vec<Principal>) -> Result<(), String> {
+    pub async fn init(&mut self, tokens: &Vec<Principal>) -> Result<(), String> {
         info!("Starting DEX token approval process");
         for token in tokens {
-            let lending_allowance = self.check_allowance(&token, &self.lending_canister).await;
-            let swap_allowance = self.check_allowance(&token, &self.dex_account.owner).await;
-
-            self.allowances
-                .insert((token, self.lending_canister), lending_allowance);
-            self.allowances.insert((token, self.dex_account.owner), swap_allowance);
+            let swap_allowance = self.check_allowance(token, &self.dex_account.owner).await;
+            self.allowances.insert((*token, self.dex_account.owner), swap_allowance);
         }
         info!("DEX token approval complete");
         Ok(())
@@ -96,7 +91,7 @@ impl<A: PipelineAgent> KongSwapExecutor<A> {
 }
 
 #[async_trait]
-impl<A: PipelineAgent> IcrcSwapExecutor for KongSwapExecutor<A> {
+impl<A: PipelineAgent> IcrcSwapInterface for KongSwapSwapper<A> {
     async fn get_swap_info(
         &self,
         token_in: &IcrcToken,
@@ -139,7 +134,7 @@ impl<A: PipelineAgent> IcrcSwapExecutor for KongSwapExecutor<A> {
     }
 }
 
-impl<A: PipelineAgent> KongSwapExecutor<A> {
+impl<A: PipelineAgent> KongSwapSwapper<A> {
     async fn approve(&self, ledger: &Principal, spender: Account) -> Result<Nat, String> {
         let args = ApproveArgs {
             from_subaccount: None,

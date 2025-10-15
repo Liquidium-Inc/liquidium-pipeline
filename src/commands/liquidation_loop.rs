@@ -1,6 +1,7 @@
 use candid::Principal;
 use icrc_ledger_types::icrc1::account::Account;
 use indicatif::{ProgressBar, ProgressStyle};
+
 use log::{info, warn};
 use prettytable::{Cell, Row, Table, format};
 use std::{sync::Arc, thread::sleep, time::Duration};
@@ -9,16 +10,17 @@ use crate::{
     account::account::LiquidatorAccount,
     commands::funds::sync_balances,
     config::{Config, ConfigTrait},
-    executors::kong_swap::kong_swap::KongSwapExecutor,
+    executors::basic::basic_executor::BasicExecutor,
+    finalizers::kong_swap::kong_swap_finalizer::KongSwapFinalizer,
     liquidation::collateral_service::CollateralService,
+    persistance::sqlite::SqliteWalStore,
     price_oracle::price_oracle::LiquidationPriceOracle,
     stage::PipelineStage,
     stages::{
-        executor::{ExecutionReceipt, ExecutionStatus},
-        export::ExportStage,
-        opportunity::OpportunityFinder,
+        executor::ExecutionStatus, export::ExportStage, finalize::LiquidationOutcome, opportunity::OpportunityFinder,
         simple_strategy::IcrcLiquidationStrategy,
     },
+    swappers::kong_swap_swapper::KongSwapSwapper,
     watchdog::{WatchdogEvent, webhook_watchdog_from_env},
 };
 use ic_agent::Agent;
@@ -45,16 +47,48 @@ async fn init(
 ) -> (
     OpportunityFinder<Agent>,
     IcrcLiquidationStrategy<
-        KongSwapExecutor<Agent>,
+        KongSwapSwapper<Agent>,
         Config,
         CollateralService<LiquidationPriceOracle<Agent>>,
         LiquidatorAccount<Agent>,
     >,
-    Arc<KongSwapExecutor<Agent>>,
+    Arc<BasicExecutor<Agent>>,
     Arc<LiquidatorAccount<Agent>>,
     Arc<ExportStage>,
+    Arc<KongSwapFinalizer<SqliteWalStore, KongSwapSwapper<Agent>>>,
 ) {
-    let mut swapper = KongSwapExecutor::new(
+    let swap_agent = Arc::new(
+        Agent::builder()
+            .with_url(config.ic_url.clone())
+            .with_identity(config.trader_identity.clone())
+            .with_max_tcp_error_retries(3)
+            .build()
+            .expect("Failed to initialize swap agent"),
+    );
+
+    let tokens: Vec<Principal> = config
+        .collateral_assets
+        .keys()
+        .map(|item| Principal::from_text(item.clone()).unwrap())
+        .collect();
+
+    let mut swapper = KongSwapSwapper::new(
+        swap_agent,
+        Account {
+            owner: config.trader_principal,
+            subaccount: None,
+        },
+    );
+
+    // Pre approve tokens
+    swapper
+        .init(&tokens)
+        .await
+        .expect("could not pre approve swapper tokens");
+
+    let swapper = Arc::new(swapper);
+
+    let mut executor = BasicExecutor::new(
         agent.clone(),
         Account {
             owner: config.liquidator_principal,
@@ -63,19 +97,11 @@ async fn init(
         config.lending_canister,
     );
 
-    // Pre approve tokens
-    swapper
-        .init(
-            config
-                .collateral_assets
-                .keys()
-                .map(|item| Principal::from_text(item.clone()).unwrap())
-                .collect(),
-        )
-        .await
-        .expect("could not pre approve tokens");
+    executor.init(&tokens).await.expect("could not approce executor tokens");
+    let executor = Arc::new(executor);
 
-    let executor = Arc::new(swapper);
+    let db = Arc::new(SqliteWalStore::new(&config.db_path).expect("could not connect to db"));
+    let finalizer = KongSwapFinalizer::new(db, swapper.clone());
 
     info!("Initializing searcher stage ...");
     let finder = OpportunityFinder::new(agent.clone(), config.lending_canister);
@@ -90,7 +116,7 @@ async fn init(
     wd.notify(WatchdogEvent::Heartbeat { stage: "Init" }).await;
     let strategy = IcrcLiquidationStrategy::new(
         config.clone(),
-        executor.clone(),
+        swapper.clone(),
         collateral_service.clone(),
         icrc_account_service.clone(),
     )
@@ -100,7 +126,14 @@ async fn init(
         path: config.export_path.clone(),
     });
 
-    (finder, strategy, executor, icrc_account_service, exporter)
+    (
+        finder,
+        strategy,
+        executor,
+        icrc_account_service,
+        exporter,
+        finalizer.into(),
+    )
 }
 
 pub async fn run_liquidation_loop() {
@@ -131,7 +164,7 @@ pub async fn run_liquidation_loop() {
     info!("Agent initialized with principal: {}", config.liquidator_principal);
 
     // Initialize components from run_liquidation_loop module
-    let (finder, strategy, executor, account_service, exporter) = init(config.clone(), agent.clone()).await;
+    let (finder, strategy, executor, account_service, exporter, finalizer) = init(config.clone(), agent.clone()).await;
     info!("Components initialized");
 
     let debt_assets = config.get_debt_assets().keys().cloned().collect::<Vec<String>>();
@@ -172,12 +205,17 @@ pub async fn run_liquidation_loop() {
             vec![]
         });
 
-        let results = executor.process(&executions).await.unwrap_or_else(|e| {
+        let receipts = executor.process(&executions).await.unwrap_or_else(|e| {
             log::error!("Executor failed: {e}");
             vec![]
         });
 
-        if results.is_empty() {
+        let outcomes = finalizer.process(&receipts).await.unwrap_or_else(|e| {
+            log::error!("Executor failed: {e}");
+            vec![]
+        });
+
+        if outcomes.is_empty() {
             info!("No successful executions");
             spinner = start_spinner();
             spinner.set_message("Scanning for liquidation opportunities...");
@@ -185,15 +223,15 @@ pub async fn run_liquidation_loop() {
             continue;
         }
 
-        exporter.process(&results).await.expect("Failed to export results");
-        print_execution_results(results);
+        exporter.process(&outcomes).await.expect("Failed to export results");
+        print_execution_results(outcomes);
         spinner = start_spinner();
         spinner.set_message("Scanning for liquidation opportunities...");
         sleep(Duration::from_secs(5));
     }
 }
 
-pub fn print_execution_results(results: Vec<ExecutionReceipt>) {
+pub fn print_execution_results(results: Vec<LiquidationOutcome>) {
     let mut table = Table::new();
     table.set_format(*format::consts::FORMAT_NO_LINESEP_WITH_TITLE);
     table.set_titles(Row::new(vec![
@@ -207,10 +245,7 @@ pub fn print_execution_results(results: Vec<ExecutionReceipt>) {
     ]));
 
     for r in results {
-        let (debt, collat) = match &r.liquidation_result {
-            Some(_) => (r.formatted_debt_repaid(), r.formatted_received_collateral()),
-            None => ("-".to_string(), "-".to_string()),
-        };
+        let (debt, collat) = (r.formatted_debt_repaid(), r.formatted_received_collateral());
 
         let (recv_amt, swap_status) = match &r.swap_result {
             Some(sr) => (r.formatted_swap_output(), sr.status.clone()),
@@ -227,10 +262,10 @@ pub fn print_execution_results(results: Vec<ExecutionReceipt>) {
             }
         };
 
-        let status_text = format!("{:?}", r.status);
-        let status_cell = match r.status {
+        let status_text = r.status.description();
+        let status_cell = match &r.status {
             ExecutionStatus::Success => Cell::new(&status_text).style_spec("Fg"),
-            ExecutionStatus::Error(_) => Cell::new(&status_text).style_spec("Fr"),
+            _ => Cell::new(&status_text).style_spec("Fr"),
         };
 
         table.add_row(Row::new(vec![

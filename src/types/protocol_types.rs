@@ -1,11 +1,13 @@
 use core::fmt;
 
 use candid::{CandidType, Nat, Principal};
+use icrc_ledger_types::icrc1::account::Account;
 use serde::{Deserialize, Serialize};
+
+
 
 // Max liquidation ratio
 pub const MAX_LIQUIDATION_RATIO: u64 = 500; // 50% of debt can be liquidated at once
-
 
 #[derive(Debug, CandidType, Serialize, Deserialize, Clone, PartialEq, Eq)]
 pub struct LiquidationRequest {
@@ -13,6 +15,7 @@ pub struct LiquidationRequest {
     pub debt_pool_id: Principal,       // Pool containing the debt to be repaid
     pub collateral_pool_id: Principal, // Pool containing collateral to be liquidated
     pub debt_amount: Nat,              // Amount of debt to repay
+    pub receiver: Account,             // Account that receives collateral and change
 }
 
 pub trait Asset {
@@ -64,10 +67,33 @@ pub struct LiquidationAmounts {
 #[derive(Debug, CandidType, Serialize, Deserialize, Clone, PartialEq, Eq)]
 pub struct LiquidationResult {
     pub amounts: LiquidationAmounts,
-    pub tx_id: String,               // Reference to the collateral claim transaction
     pub collateral_asset: AssetType, // The collateral type that the liquidator receives
     pub debt_asset: AssetType,       // The debt type that the liquidator spends
     pub status: LiquidationStatus,
+    pub change_tx: TxStatus,
+    pub collateral_tx: TxStatus,
+}
+
+#[derive(Debug, CandidType, Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub enum TransferStatus {
+    Pending,
+    Success,
+    Failed(String),
+}
+
+#[derive(Debug, CandidType, Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub struct TxStatus {
+    // Some chains may not have a tx id yet (queued) — keep it optional.
+    pub tx_id: Option<String>,
+    pub status: TransferStatus,
+}
+
+#[derive(Debug, CandidType, Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub enum LiquidationStatus {
+    Success,
+    FailedLiquidation(String),
+    CollateralTransferFailed(String),
+    ChangeTransferFailed(String),
 }
 
 #[derive(Debug, CandidType, Serialize, Deserialize, Clone, PartialEq, Eq)]
@@ -76,18 +102,12 @@ pub enum AssetType {
     Unknown,
 }
 
-#[derive(Debug, CandidType, Serialize, Deserialize, Clone, PartialEq, Eq)]
-pub enum LiquidationStatus {
-    Success,
-    Failed(String),
-}
-
 impl fmt::Display for LiquidationResult {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "[tx_id: {}, collateral: {:?}, debt: {:?}, status: {:?}]",
-            self.tx_id, self.collateral_asset, self.debt_asset, self.status,
+            "[collateral: {:?}, debt: {:?}, status: {:?}]",
+            self.collateral_asset, self.debt_asset, self.status,
         )
     }
 }

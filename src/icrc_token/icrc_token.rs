@@ -3,11 +3,12 @@ use std::sync::Arc;
 use candid::{Nat, Principal};
 use ic_agent::Agent;
 use icrc_ledger_agent::Icrc1Agent;
+use serde::{Deserialize, Serialize};
 
 use crate::{pipeline_agent::PipelineAgent, types::protocol_types::{Asset, Assets}};
 
 #[allow(dead_code)]
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct IcrcToken {
     // The ledger id
     pub ledger: Principal,
