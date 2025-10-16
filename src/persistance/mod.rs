@@ -2,7 +2,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 pub mod sqlite;
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(i32)]
 pub enum ResultStatus {
     Enqueued = 0,
@@ -23,6 +23,7 @@ pub struct LiqResultRecord {
     pub meta_json: String,
 }
 
+#[cfg_attr(test, mockall::automock)]
 #[async_trait]
 pub trait WalStore: Send + Sync {
     async fn upsert_result(&self, row: LiqResultRecord) -> Result<()>;

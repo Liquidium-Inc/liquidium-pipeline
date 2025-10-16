@@ -12,13 +12,13 @@ use crate::{pipeline_agent::PipelineAgent, types::protocol_types::{Asset, Assets
 pub struct IcrcToken {
     // The ledger id
     pub ledger: Principal,
-    /// icrc1:decimals
+    // icrc1:decimals
     pub decimals: u8,
-    /// icrc1:name
+    // icrc1:name
     pub name: String,
-    /// icrc1:symbol
+    // icrc1:symbol
     pub symbol: String,
-    /// icrc1:fee (in the smallest units)
+    // icrc1:fee (in the smallest units)
     pub fee: Nat,
 }
 

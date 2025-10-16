@@ -9,7 +9,7 @@ pub enum TxId {
     TransactionHash(String),
 }
 
-#[derive(CandidType, Debug, Clone, Serialize, Deserialize)]
+#[derive(CandidType, Debug, Clone, Serialize, Deserialize, Default)]
 pub struct SwapArgs {
     pub pay_token: String,
     pub pay_amount: Nat,
