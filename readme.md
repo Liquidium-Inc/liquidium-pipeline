@@ -63,17 +63,14 @@ Use this for monitoring and alerting (e.g. Slack, Discord, or your own service).
 
 🔑 Identity Management
 
-Generate a new Ed25519 identity:
+Generate a new Ed25519 identity or show existing identities:
 
 ```
 liquidator account new
-```
-
-Show the liquidator principal:
-
-```
 liquidator account show
 ```
+
+Both commands now manage and display **liquidator**, **trader**, and **recovery** identities. The output is presented in a table format showing all relevant principals and their statuses.
 
 By default, identities are stored at:
 
@@ -119,23 +116,51 @@ Check balances:
 liquidator balance
 ```
 
+This command now displays both **main** and **recovery** balances, with recovery balances marked as “seized collateral (stale, pending withdrawal if swaps failed)”.
+
 Withdraw funds:
 
+### Interactive withdraw wizard
+
+Run the withdraw command without flags to launch an interactive wizard:
+
 ```
-liquidator withdraw <ASSET_PRINCIPAL> <AMOUNT> <TO_PRINCIPAL>
+liquidator withdraw
 ```
 
-Show identity principal:
+This wizard helps you select the asset, amount (supports typing “all” to withdraw the full balance), and destination principal. It auto-resolves your current balances and confirms the transaction before execution.
+
+### Non-interactive withdraw (flags)
+
+For automation or scripting, you can use flags:
+
+```
+liquidator withdraw --asset <ASSET_PRINCIPAL> --amount <AMOUNT|all> --to <TO_PRINCIPAL>
+```
+
+Example:
+
+```
+liquidator withdraw --asset principal1 --amount all --to principalX
+```
+
+This mode skips prompts, auto-resolves balances, supports “all” as amount, and requires confirmation before executing.
+
+Show identity principals and management:
 
 ```
 liquidator account show
 ```
 
-Generate new identity:
+This displays a table of **liquidator**, **trader**, and **recovery** identities with their principals.
+
+Generate new identities:
 
 ```
 liquidator account new
 ```
+
+Creates new Ed25519 identities for liquidator, trader, and recovery roles.
 
 ⸻
 
@@ -161,6 +186,8 @@ target/release/liquidator
 - Works with ICRC-1 assets like ckBTC
 - Identity/config can be system-wide or project-local
 - Composable stages allow for custom liquidation strategies
+
+💡 Tip: You can use either interactive wizards or CLI flags for automation (e.g. cron jobs, scripts).
 
 ⸻
 
