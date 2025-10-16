@@ -187,7 +187,12 @@ pub async fn run_liquidation_loop() {
     let mut spinner = start_spinner();
     loop {
         spinner.set_message("Scanning for liquidation opportunities...");
-        sync_balances(&config, account_service.clone(), &debt_assets).await;
+        sync_balances(
+            account_service.clone(),
+            &debt_assets,
+            config.liquidator_principal.into(),
+        )
+        .await;
         let opportunities = finder.process(&debt_assets).await.unwrap_or_else(|e| {
             warn!("Failed to find opportunities: {e}");
             vec![]

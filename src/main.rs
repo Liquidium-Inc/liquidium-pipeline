@@ -2,23 +2,22 @@ mod account;
 mod commands;
 mod config;
 mod executors;
+mod finalizers;
 mod icrc_token;
 mod liquidation;
+mod persistance;
 mod pipeline_agent;
 mod price_oracle;
 mod ray_math;
 mod stage;
 mod stages;
-mod utils;
-mod types;
-mod watchdog;
-mod finalizers;
 pub mod swappers;
-mod persistance;
+mod types;
+mod utils;
+mod watchdog;
 use clap::{Parser, Subcommand};
 
 use commands::liquidation_loop::run_liquidation_loop;
-
 
 #[derive(Parser)]
 #[command(name = "liquidator")]
@@ -36,14 +35,21 @@ enum Commands {
     /// Shows wallet token balances
     Balance,
 
-    /// Withdraws funds to a specified address
+    /// Withdraws funds. Without flags, starts the interactive wizard.
+    /// With flags, performs a non-interactive withdrawal.
     Withdraw {
-        /// Asset principal ID (e.g. ckBTC ledger principal)
-        asset: String,
-        /// Amount to withdraw in human-readable units
-        amount: String,
-        /// Destination principal address
-        to: String,
+        /// Source account: "main" or "recovery" (non-interactive)
+        #[arg(long)]
+        source: Option<String>,
+        /// Destination: "main" or full Account string (non-interactive)
+        #[arg(long)]
+        destination: Option<String>,
+        /// Asset symbol (e.g., "ckUSDT") or "all" (non-interactive)
+        #[arg(long)]
+        asset: Option<String>,
+        /// Amount as decimal (respects token decimals) or "all" (non-interactive)
+        #[arg(long)]
+        amount: Option<String>,
     },
 
     /// Account management commands
@@ -74,8 +80,24 @@ async fn main() {
         Commands::Balance => {
             commands::funds::funds().await;
         }
-        Commands::Withdraw { asset, amount, to } => {
-            commands::withdraw::withdraw(asset, amount, to).await;
+        Commands::Withdraw { source, destination, asset, amount } => {
+            let has_any = source.is_some() || destination.is_some() || asset.is_some() || amount.is_some();
+            if has_any {
+                // Validate that all required args are present
+                match (source.as_deref(), destination.as_deref(), asset.as_deref(), amount.as_deref()) {
+                    (Some(s), Some(d), Some(a), Some(am)) => {
+                        commands::withdraw::withdraw_noninteractive(s, d, a, am).await;
+                    }
+                    _ => {
+                        eprintln!(
+                            "Missing flags. Required for non-interactive: --source <main|recovery> --destination <main|ACCOUNT> --asset <SYMBOL|all> --amount <DECIMAL|all>.\nRun without flags to use the interactive wizard."
+                        );
+                    }
+                }
+            } else {
+                // Interactive wizard
+                commands::withdraw::withdraw().await;
+            }
         }
         Commands::Account { subcommand } => match subcommand {
             AccountCommands::Show => {

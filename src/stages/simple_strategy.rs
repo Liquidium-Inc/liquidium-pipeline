@@ -76,7 +76,7 @@ where
             let asset = Principal::from_text(asset).unwrap();
             let balance = self
                 .account_service
-                .get_cached_balance(asset, self.config.get_liquidator_principal())
+                .get_cached_balance(asset, self.config.get_liquidator_principal().into())
                 .ok_or("Could not get balance")?;
 
             balances.insert(asset, balance.value);

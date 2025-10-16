@@ -1,5 +1,6 @@
 use candid::Principal;
 use ic_agent::{Agent, Identity};
+use icrc_ledger_types::icrc1::account::Account;
 use indicatif::MultiProgress;
 use indicatif_log_bridge::LogWrapper;
 use log::debug;
@@ -7,6 +8,7 @@ use std::collections::HashMap;
 use std::env;
 use std::sync::Arc;
 
+use crate::account::account::RECOVERY_ACCOUNT;
 use crate::icrc_token::icrc_token::IcrcToken;
 use crate::utils::create_identity_from_pem_file;
 
@@ -32,6 +34,7 @@ pub trait ConfigTrait: Send + Sync {
     fn get_trader_principal(&self) -> Principal;
     fn should_buy_bad_debt(&self) -> bool;
     fn get_lending_canister(&self) -> Principal;
+    fn get_recovery_account(&self) -> Account;
 }
 
 impl ConfigTrait for Config {
@@ -53,6 +56,13 @@ impl ConfigTrait for Config {
 
     fn get_trader_principal(&self) -> Principal {
         self.trader_principal
+    }
+
+    fn get_recovery_account(&self) -> Account {
+        Account {
+            owner: self.trader_principal,
+            subaccount: Some(*RECOVERY_ACCOUNT),
+        }
     }
 
     fn get_lending_canister(&self) -> Principal {
@@ -84,8 +94,8 @@ impl Config {
         let ic_url = env::var("IC_URL").unwrap();
         let export_path = env::var("EXPORT_PATH").unwrap_or("executions.csv".to_string());
         // Load the liquidator identity
-        let pem_path = env::var("IDENTITY_PEM").unwrap();
-        let trader_pem_path = env::var("TRADER_IDENTITY_PEM").unwrap();
+        let pem_path = env::var("IDENTITY_PEM").expect("Account missing `run account new`");
+        let trader_pem_path = env::var("TRADER_IDENTITY_PEM").expect("Account missing `run account new`");
         debug!("Path {}", pem_path);
 
         let identity = create_identity_from_pem_file(&pem_path).expect("could not create identity");

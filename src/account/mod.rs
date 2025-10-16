@@ -17,19 +17,23 @@ pub mod account {
         pipeline_agent::PipelineAgent,
     };
 
-    pub const RECOVERY_ACCOUNT: &Subaccount = &[0x1; 32];
+    pub const RECOVERY_ACCOUNT: &Subaccount = &[
+        0xBE, 0xEF, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    ];
 
     #[cfg_attr(test, mockall::automock)]
     #[async_trait]
     pub trait IcrcAccountInfo: Send + Sync {
-        async fn get_balance(&self, ledger_id: Principal, account: Principal) -> Result<IcrcTokenAmount, String>;
-        async fn sync_balance(&self, ledger_id: Principal, account: Principal) -> Result<IcrcTokenAmount, String>;
-        fn get_cached_balance(&self, ledger_id: Principal, account: Principal) -> Option<IcrcTokenAmount>;
+        async fn get_balance(&self, ledger_id: Principal, account: Account) -> Result<IcrcTokenAmount, String>;
+        async fn sync_balance(&self, ledger_id: Principal, account: Account) -> Result<IcrcTokenAmount, String>;
+        fn get_cached_balance(&self, ledger_id: Principal, account: Account) -> Option<IcrcTokenAmount>;
     }
 
     pub struct LiquidatorAccount<A: PipelineAgent> {
         pub agent: Arc<A>,
-        pub cache: Arc<Mutex<HashMap<(Principal, Principal), IcrcTokenAmount>>>, // (ledger_id, account) -> (balance, )
+        pub cache: Arc<Mutex<HashMap<(Principal, String), IcrcTokenAmount>>>, // (ledger_id, account) -> (balance, )
+        pub sub_account: Option<Subaccount>,
     }
 
     impl<A: PipelineAgent> LiquidatorAccount<A> {
@@ -37,7 +41,12 @@ pub mod account {
             Self {
                 agent,
                 cache: Arc::new(Mutex::new(HashMap::new())),
+                sub_account: None,
             }
+        }
+
+        pub fn set_sub_account(&mut self, account: Subaccount) {
+            self.sub_account = Some(account);
         }
     }
 
@@ -46,12 +55,7 @@ pub mod account {
     where
         A: PipelineAgent,
     {
-        async fn get_balance(&self, ledger_id: Principal, account: Principal) -> Result<IcrcTokenAmount, String> {
-            let account = Account {
-                owner: account,
-                subaccount: None,
-            };
-
+        async fn get_balance(&self, ledger_id: Principal, account: Account) -> Result<IcrcTokenAmount, String> {
             let icrc_token = IcrcToken::from_principal(ledger_id, Arc::new(self.agent.agent())).await;
 
             let balance = self
@@ -65,9 +69,13 @@ pub mod account {
             })
         }
 
-        async fn sync_balance(&self, ledger_id: Principal, account: Principal) -> Result<IcrcTokenAmount, String> {
+        async fn sync_balance(&self, ledger_id: Principal, account: Account) -> Result<IcrcTokenAmount, String> {
             let balance = self.get_balance(ledger_id, account).await?;
-            self.cache.lock().unwrap().insert((ledger_id, account), balance.clone());
+            self.cache
+                .lock()
+                .unwrap()
+                .insert((ledger_id, account.to_string()), balance.clone());
+
             debug!(
                 "Balance synced for ledger {}. Balance: {}",
                 ledger_id,
@@ -76,8 +84,13 @@ pub mod account {
             Ok(balance)
         }
 
-        fn get_cached_balance(&self, ledger_id: Principal, account: Principal) -> Option<IcrcTokenAmount> {
-            let balance = self.cache.lock().unwrap().get(&(ledger_id, account)).cloned();
+        fn get_cached_balance(&self, ledger_id: Principal, account: Account) -> Option<IcrcTokenAmount> {
+            let balance = self
+                .cache
+                .lock()
+                .unwrap()
+                .get(&(ledger_id, account.to_string()))
+                .cloned();
             balance
         }
     }
@@ -86,10 +99,31 @@ pub mod account {
     #[async_trait]
     pub trait IcrcAccountActions: Send + Sync {
         async fn transfer(&self, amount: IcrcTokenAmount, to: Account) -> Result<String, String>;
+        async fn transfer_from_subaccount(&self, amount: IcrcTokenAmount, to: Account) -> Result<String, String>;
     }
 
     #[async_trait]
     impl<A: PipelineAgent> IcrcAccountActions for LiquidatorAccount<A> {
+        async fn transfer_from_subaccount(&self, token_amount: IcrcTokenAmount, to: Account) -> Result<String, String> {
+            let icrc_agent = Icrc1Agent {
+                agent: self.agent.agent(),
+                ledger_canister_id: token_amount.token.ledger,
+            };
+            icrc_agent
+                .transfer(TransferArg {
+                    from_subaccount: self.sub_account,
+                    to,
+                    fee: None,
+                    created_at_time: None,
+                    memo: None,
+                    amount: token_amount.value - token_amount.token.fee,
+                })
+                .await
+                .map_err(|e| format!("Withdraw error {:?}", e))?
+                .map_err(|e| format!("Withdraw error {:?}", e))
+                .map(|res| res.to_string().replace("_", ""))
+        }
+
         async fn transfer(&self, token_amount: IcrcTokenAmount, to: Account) -> Result<String, String> {
             let icrc_agent = Icrc1Agent {
                 agent: self.agent.agent(),
