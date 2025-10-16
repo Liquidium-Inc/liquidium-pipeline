@@ -55,7 +55,7 @@ async fn init(
     Arc<BasicExecutor<Agent>>,
     Arc<LiquidatorAccount<Agent>>,
     Arc<ExportStage>,
-    Arc<KongSwapFinalizer<SqliteWalStore, KongSwapSwapper<Agent>>>,
+    Arc<KongSwapFinalizer<SqliteWalStore, KongSwapSwapper<Agent>, LiquidatorAccount<Agent>, Config, Agent>>,
 ) {
     let swap_agent = Arc::new(
         Agent::builder()
@@ -65,6 +65,8 @@ async fn init(
             .build()
             .expect("Failed to initialize swap agent"),
     );
+
+    let trader_account = Arc::new(LiquidatorAccount::new(swap_agent.clone()));
 
     let tokens: Vec<Principal> = config
         .collateral_assets
@@ -101,7 +103,7 @@ async fn init(
     let executor = Arc::new(executor);
 
     let db = Arc::new(SqliteWalStore::new(&config.db_path).expect("could not connect to db"));
-    let finalizer = KongSwapFinalizer::new(db, swapper.clone());
+    let finalizer = KongSwapFinalizer::new(db, swapper.clone(), trader_account, config.clone(), agent.clone());
 
     info!("Initializing searcher stage ...");
     let finder = OpportunityFinder::new(agent.clone(), config.lending_canister);

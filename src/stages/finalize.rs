@@ -1,13 +1,22 @@
 use crate::{
+    account::account::{IcrcAccountActions, RECOVERY_ACCOUNT},
+    config::ConfigTrait,
     executors::executor::ExecutorRequest,
     finalizers::kong_swap::kong_swap_finalizer::KongSwapFinalizer,
+    icrc_token::icrc_token_amount::IcrcTokenAmount,
     persistance::{LiqResultRecord, ResultStatus, WalStore, now_secs},
+    pipeline_agent::PipelineAgent,
     stage::PipelineStage,
     stages::executor::{ExecutionReceipt, ExecutionStatus},
-    swappers::{kong_types::SwapReply, swap_interface::IcrcSwapInterface},
-    types::protocol_types::LiquidationResult,
+    swappers::{
+        kong_types::{SwapAmountsReply, SwapReply},
+        swap_interface::IcrcSwapInterface,
+    },
+    types::protocol_types::{LiquidationResult, TransferStatus},
 };
 use async_trait::async_trait;
+use candid::Encode;
+use icrc_ledger_types::icrc1::account::Account;
 use num_traits::ToPrimitive;
 use std::time::Duration;
 
@@ -65,8 +74,8 @@ impl LiquidationOutcome {
 }
 
 #[async_trait]
-impl<'a, D: WalStore, S: IcrcSwapInterface> PipelineStage<'a, Vec<ExecutionReceipt>, Vec<LiquidationOutcome>>
-    for KongSwapFinalizer<D, S>
+impl<'a, D: WalStore, S: IcrcSwapInterface, A: IcrcAccountActions, C: ConfigTrait, P: PipelineAgent>
+    PipelineStage<'a, Vec<ExecutionReceipt>, Vec<LiquidationOutcome>> for KongSwapFinalizer<D, S, A, C, P>
 {
     async fn process(&self, executor_receipts: &'a Vec<ExecutionReceipt>) -> Result<Vec<LiquidationOutcome>, String> {
         let mut outcomes = Vec::with_capacity(executor_receipts.len());
@@ -79,40 +88,38 @@ impl<'a, D: WalStore, S: IcrcSwapInterface> PipelineStage<'a, Vec<ExecutionRecei
             // Persist to WAL first
             self.persist_receipt_to_wal(&liq_id, i as i32, 0, receipt).await?;
 
-            // If eligible, execute swap with retries
             let mut effective_status = exec_status.clone();
             let mut swap_result: Option<SwapReply> = None;
-            if Self::needs_swap(receipt) && matches!(effective_status, ExecutionStatus::Success) {
-                match self.execute_swap_with_retries(0, receipt).await {
+
+            // Swap only if still Success and we have a fresh liquidation
+            if matches!(effective_status, ExecutionStatus::Success) && Self::needs_swap(receipt) {
+                match self.execute_swap_with_retries(receipt).await {
                     Ok(Some(sr)) => {
                         swap_result = Some(sr);
-                        // Remove WAL entry on success
-                        if let Err(e) = self.db.delete(&liq_id, i as i32).await {
-                            eprintln!("Failed to delete WAL entry after successful swap: {}", e);
-                        }
+                        self.delete_wal_silent(&liq_id, i as i32).await;
                     }
                     Ok(None) => {
-                        if let Err(e) = self.db.delete(&liq_id, i as i32).await {
-                            eprintln!("Failed to delete WAL entry after successful swap: {}", e);
-                        }
+                        self.delete_wal_silent(&liq_id, i as i32).await;
                     }
                     Err(status_override) => {
                         effective_status = status_override;
-                        // Decide next status based on attempt count
-                        let next_status = match self.db.get_result(&liq_id, i as i32).await {
-                            Ok(Some(r)) if r.attempt + 1 >= MAX_WAL_ATTEMPTS => ResultStatus::FailedPermanent,
-                            _ => ResultStatus::FailedRetryable,
-                        };
-                        if let Err(e) = self.db.update_status(&liq_id, i as i32, next_status, true).await {
+                        let attempt = self
+                            .db
+                            .get_result(&liq_id, i as i32)
+                            .await
+                            .ok()
+                            .flatten()
+                            .map(|r| r.attempt)
+                            .unwrap_or(0);
+                        let next = Self::next_retry_status(attempt);
+                        if let Err(e) = self.db.update_status(&liq_id, i as i32, next, true).await {
                             eprintln!("Failed to update WAL after swap failure: {}", e);
                         }
                     }
                 }
             } else if matches!(effective_status, ExecutionStatus::Success) {
-                // No swap needed; clean up WAL row eagerly
-                if let Err(e) = self.db.delete(&liq_id, i as i32).await {
-                    eprintln!("Failed to delete WAL entry (no-swap case): {}", e);
-                }
+                // Success but no swap needed -> remove now
+                self.delete_wal_silent(&liq_id, i as i32).await;
             }
 
             // If there's no liquidation result, skip producing an outcome.
@@ -143,7 +150,78 @@ impl<'a, D: WalStore, S: IcrcSwapInterface> PipelineStage<'a, Vec<ExecutionRecei
     }
 }
 
-impl<D: WalStore, S: IcrcSwapInterface> KongSwapFinalizer<D, S> {
+impl<D: WalStore, S: IcrcSwapInterface, A: IcrcAccountActions, C: ConfigTrait, P: PipelineAgent>
+    KongSwapFinalizer<D, S, A, C, P>
+{
+    // Helper: extract ExecutionReceipt from a WAL row's meta_json
+    fn receipt_from_meta(meta_json: &str) -> Option<ExecutionReceipt> {
+        serde_json::from_str::<serde_json::Value>(meta_json).ok().and_then(|v| {
+            serde_json::from_value::<ExecutionReceipt>(v.get("receipt").cloned().unwrap_or(serde_json::Value::Null))
+                .ok()
+        })
+    }
+
+    fn receipt_from_row(row: &LiqResultRecord) -> Option<ExecutionReceipt> {
+        Self::receipt_from_meta(&row.meta_json)
+    }
+
+
+    async fn delete_wal_silent(&self, liq_id: &str, idx: i32) {
+        if let Err(e) = self.db.delete(liq_id, idx).await {
+            eprintln!("Failed to delete WAL entry {}[{}]: {}", liq_id, idx, e);
+        }
+    }
+
+    #[inline]
+    fn next_retry_status(current_attempt: i32) -> ResultStatus {
+        if current_attempt + 1 >= MAX_WAL_ATTEMPTS {
+            ResultStatus::FailedPermanent
+        } else {
+            ResultStatus::FailedRetryable
+        }
+    }
+
+    // Build swap args from receipt and liquidation, then fetch a fresh quote.
+    // Returns SwapInfo if quoting succeeds; Err(String) otherwise.
+    async fn preflight_quote(
+        &self,
+        receipt: &ExecutionReceipt,
+        liq: &LiquidationResult,
+    ) -> Result<SwapAmountsReply, String> {
+        self.swapper
+            .get_swap_info(
+                &receipt.request.collateral_asset,
+                &receipt.request.debt_asset,
+                &IcrcTokenAmount {
+                    token: receipt.request.collateral_asset.clone(),
+                    value: liq.amounts.collateral_received.clone(),
+                },
+            )
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    // Preflight quote and check against expected profit. Returns the quote if acceptable,
+    // or Err(ResultStatus) indicating the next WAL status to set when unprofitable/unavailable.
+    async fn preflight_quote_checked(
+        &self,
+        receipt: &ExecutionReceipt,
+        liq: &LiquidationResult,
+        attempt: i32,
+    ) -> Result<SwapAmountsReply, ResultStatus> {
+        match self.preflight_quote(receipt, liq).await {
+            Ok(info) => {
+                let quoted = info.receive_amount.0.to_i128().unwrap_or(0);
+                if quoted < receipt.request.expected_profit {
+                    Err(Self::next_retry_status(attempt))
+                } else {
+                    Ok(info)
+                }
+            }
+            Err(_err) => Err(Self::next_retry_status(attempt)),
+        }
+    }
+
     async fn persist_receipt_to_wal(
         &self,
         liq_id: &str,
@@ -182,9 +260,33 @@ impl<D: WalStore, S: IcrcSwapInterface> KongSwapFinalizer<D, S> {
             .map_err(|e| format!("wal upsert failed: {}", e))?;
         Ok(())
     }
+
+    // Query the canister for a liquidation by id using the pipeline agent.
+    pub async fn get_liquidation(&self, liquidation_id: u128) -> Result<LiquidationResult, String> {
+        let args = Encode!(&liquidation_id).map_err(|e| e.to_string())?;
+
+        // Call canister get_liquidation
+        match self
+            .agent
+            .call_query::<Result<LiquidationResult, String>>(
+                &self.config.get_lending_canister(),
+                "get_liquidation",
+                args,
+            )
+            .await
+        {
+            Ok(v) => v,
+            Err(err) => {
+                eprintln!("get_liquidation call failed: {}", err);
+                Err(err)
+            }
+        }
+    }
 }
 
-impl<D: WalStore, S: IcrcSwapInterface> KongSwapFinalizer<D, S> {
+impl<D: WalStore, S: IcrcSwapInterface, A: IcrcAccountActions, C: ConfigTrait, P: PipelineAgent>
+    KongSwapFinalizer<D, S, A, C, P>
+{
     fn needs_swap(receipt: &ExecutionReceipt) -> bool {
         receipt.request.expected_profit > 0
             && receipt.request.swap_args.is_some()
@@ -194,7 +296,6 @@ impl<D: WalStore, S: IcrcSwapInterface> KongSwapFinalizer<D, S> {
 
     async fn execute_swap_with_retries(
         &self,
-        mut attempt: i32,
         receipt: &ExecutionReceipt,
     ) -> Result<Option<SwapReply>, ExecutionStatus> {
         let liq = match &receipt.liquidation_result {
@@ -207,8 +308,10 @@ impl<D: WalStore, S: IcrcSwapInterface> KongSwapFinalizer<D, S> {
             Some(sa) => sa,
             None => return Ok(None),
         };
+
         swap_args.pay_amount = liq.amounts.collateral_received.clone();
 
+        let mut attempt = 0;
         let max_retries = 3;
         loop {
             match self.swapper.swap(swap_args.clone()).await {
@@ -239,14 +342,39 @@ impl<D: WalStore, S: IcrcSwapInterface> KongSwapFinalizer<D, S> {
                     }
 
                     // Exponential backoff
-                    tokio::time::sleep(Duration::from_millis(100 * 2u64.pow(attempt as u32))).await;
+                    tokio::time::sleep(Duration::from_millis(500 * 2u64.pow(attempt as u32))).await;
                 }
             }
         }
     }
 }
 
-impl<D: WalStore, S: IcrcSwapInterface> KongSwapFinalizer<D, S> {
+impl<D: WalStore, S: IcrcSwapInterface, A: IcrcAccountActions, C: ConfigTrait, P: PipelineAgent>
+    KongSwapFinalizer<D, S, A, C, P>
+{
+    async fn move_funds_to_recovery(&self, receipt: &ExecutionReceipt) {
+        // Move seized collateral to recovery account when we cannot complete the swap
+        let Some(liq) = &receipt.liquidation_result else {
+            return;
+        };
+
+        // Destination account is configured on the finalizer (assumed present)
+        let trasfer = self.account.transfer(
+            IcrcTokenAmount {
+                token: receipt.request.collateral_asset.clone(),
+                value: liq.amounts.collateral_received.clone(),
+            },
+            Account {
+                owner: self.config.get_liquidator_principal(),
+                subaccount: Some(*RECOVERY_ACCOUNT),
+            },
+        );
+
+        if let Err(e) = trasfer.await {
+            eprintln!("Recovery transfer failed: {}", e);
+        }
+    }
+
     pub async fn retry_failed_swaps(&self, max: Option<usize>) -> Result<Vec<LiquidationOutcome>, String> {
         let limit: usize = max.unwrap_or(100);
 
@@ -259,25 +387,8 @@ impl<D: WalStore, S: IcrcSwapInterface> KongSwapFinalizer<D, S> {
         let mut outcomes = Vec::with_capacity(rows.len());
 
         for row in rows {
-            // Hard cap attempts at MAX_WAL_ATTEMPTS
-            if row.attempt >= MAX_WAL_ATTEMPTS {
-                if let Err(e) = self
-                    .db
-                    .update_status(&row.liq_id, row.idx, ResultStatus::FailedPermanent, false)
-                    .await
-                {
-                    eprintln!(
-                        "Failed to mark WAL entry as permanent {}[{}]: {}",
-                        row.liq_id, row.idx, e
-                    );
-                }
-                continue;
-            }
-
-            let receipt: ExecutionReceipt = match serde_json::from_str::<serde_json::Value>(&row.meta_json)
-                .ok()
-                .and_then(|v| serde_json::from_value(v.get("receipt").cloned().unwrap_or(serde_json::Value::Null)).ok())
-            {
+            // Load stored receipt
+            let mut receipt: ExecutionReceipt = match Self::receipt_from_row(&row) {
                 Some(r) => r,
                 None => {
                     eprintln!(
@@ -288,67 +399,90 @@ impl<D: WalStore, S: IcrcSwapInterface> KongSwapFinalizer<D, S> {
                 }
             };
 
+            // Skip rows that no longer need swap
             if !Self::needs_swap(&receipt) {
-                if let Err(e) = self.db.delete(&row.liq_id, row.idx).await {
-                    eprintln!(
-                        "Failed to delete WAL entry for {}[{}] (no longer needs swap): {}",
-                        row.liq_id, row.idx, e
-                    );
-                }
+                self.delete_wal_silent(&row.liq_id, row.idx).await;
                 continue;
             }
 
-            match self.execute_swap_with_retries(row.attempt, &receipt).await {
-                Ok(Some(sr)) => {
-                    if let Err(e) = self.db.delete(&row.liq_id, row.idx).await {
-                        eprintln!(
-                            "Failed to delete WAL entry after successful retry {}[{}]: {}",
-                            row.liq_id, row.idx, e
-                        );
-                    }
+            // Ensure we have a liquidation id recorded in the receipt
+            let Some(id) = receipt.liquidation_result.as_ref().and_then(|l| l.id) else {
+                self.delete_wal_silent(&row.liq_id, row.idx).await;
+                continue;
+            };
 
-                    if let Some(liq_res) = receipt.liquidation_result.clone() {
-                        outcomes.push(LiquidationOutcome {
-                            request: receipt.request.clone(),
-                            liquidation_result: liq_res,
-                            swap_result: Some(sr.clone()),
-                            status: ExecutionStatus::Success,
-                            expected_profit: receipt.request.expected_profit,
-                            realized_profit: sr.receive_amount.0.to_i128().unwrap(),
-                        });
+            // Fetch latest liquidation from canister
+            let liq_from_chain = match self.get_liquidation(id).await {
+                Ok(liq) => liq,
+                Err(err) => {
+                    let next = Self::next_retry_status(row.attempt);
+                    if let Err(e) = self.db.update_status(&row.liq_id, row.idx, next, true).await {
+                        eprintln!("WAL update failed {}[{}]: {}", row.liq_id, row.idx, e);
                     }
+                    eprintln!("get_liquidation failed for {}[{}]: {}", row.liq_id, row.idx, err);
+                    continue;
+                }
+            };
+
+            // Do not swap until collateral transfer is confirmed
+            if matches!(
+                liq_from_chain.collateral_tx.status,
+                TransferStatus::Failed(_) | TransferStatus::Pending
+            ) {
+                continue;
+            }
+
+            // Use refreshed liquidation for swap
+            receipt.liquidation_result = Some(liq_from_chain.clone());
+
+            // Preflight: re-quote and check profitability in one step
+            match self
+                .preflight_quote_checked(&receipt, &liq_from_chain, row.attempt)
+                .await
+            {
+                Ok(_) => {}
+                Err(next) => {
+                    if let Err(e) = self.db.update_status(&row.liq_id, row.idx, next, true).await {
+                        eprintln!("WAL update failed {}[{}]: {}", row.liq_id, row.idx, e);
+                    }
+                    if matches!(next, ResultStatus::FailedPermanent) {
+                        self.move_funds_to_recovery(&receipt).await;
+                    }
+                    continue;
+                }
+            };
+
+            match self.execute_swap_with_retries(&receipt).await {
+                Ok(Some(sr)) => {
+                    self.delete_wal_silent(&row.liq_id, row.idx).await;
+                    outcomes.push(LiquidationOutcome {
+                        request: receipt.request.clone(),
+                        liquidation_result: liq_from_chain.clone(),
+                        swap_result: Some(sr.clone()),
+                        status: ExecutionStatus::Success,
+                        expected_profit: receipt.request.expected_profit,
+                        realized_profit: sr.receive_amount.0.to_i128().unwrap(),
+                    });
                 }
                 Ok(None) => {
-                    if let Err(e) = self.db.delete(&row.liq_id, row.idx).await {
-                        eprintln!(
-                            "Failed to delete WAL entry after no-op retry {}[{}]: {}",
-                            row.liq_id, row.idx, e
-                        );
-                    }
+                    self.delete_wal_silent(&row.liq_id, row.idx).await;
                 }
                 Err(status_override) => {
-                    let next_status = if row.attempt + 1 >= MAX_WAL_ATTEMPTS {
-                        ResultStatus::FailedPermanent
-                    } else {
-                        ResultStatus::FailedRetryable
-                    };
-                    if let Err(e) = self.db.update_status(&row.liq_id, row.idx, next_status, true).await {
-                        eprintln!(
-                            "Failed to update WAL after failed retry {}[{}]: {}",
-                            row.liq_id, row.idx, e
-                        );
+                    let next = Self::next_retry_status(row.attempt);
+                    if let Err(e) = self.db.update_status(&row.liq_id, row.idx, next, true).await {
+                        eprintln!("WAL update failed {}[{}]: {}", row.liq_id, row.idx, e);
                     }
-
-                    if let Some(liq_res) = receipt.liquidation_result.clone() {
-                        outcomes.push(LiquidationOutcome {
-                            request: receipt.request.clone(),
-                            liquidation_result: liq_res,
-                            swap_result: None,
-                            status: status_override,
-                            expected_profit: receipt.request.expected_profit,
-                            realized_profit: 0,
-                        });
+                    if matches!(next, ResultStatus::FailedPermanent) {
+                        self.move_funds_to_recovery(&receipt).await;
                     }
+                    outcomes.push(LiquidationOutcome {
+                        request: receipt.request.clone(),
+                        liquidation_result: liq_from_chain.clone(),
+                        swap_result: None,
+                        status: status_override,
+                        expected_profit: receipt.request.expected_profit,
+                        realized_profit: 0,
+                    });
                 }
             }
         }

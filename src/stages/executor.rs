@@ -8,7 +8,7 @@ use crate::{
     executors::{basic::basic_executor::BasicExecutor, executor::ExecutorRequest},
     pipeline_agent::PipelineAgent,
     stage::PipelineStage,
-    types::protocol_types::{LiquidationResult, LiquidationStatus},
+    types::protocol_types::{LiquidationResult, LiquidationStatus, TransferStatus},
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -18,7 +18,7 @@ pub enum ExecutionStatus {
     FailedLiquidation(String),
     CollateralTransferFailed(String),
     ChangeTransferFailed(String),
-    SwapFailed(String) 
+    SwapFailed(String),
 }
 
 impl ExecutionStatus {
@@ -39,6 +39,7 @@ pub struct ExecutionReceipt {
     pub request: ExecutorRequest,
     pub liquidation_result: Option<LiquidationResult>,
     pub status: ExecutionStatus,
+    pub change_received: bool,
 }
 
 #[async_trait]
@@ -50,6 +51,7 @@ impl<'a, A: PipelineAgent> PipelineStage<'a, Vec<ExecutorRequest>, Vec<Execution
                 request: executor_request.clone(),
                 liquidation_result: None,
                 status: ExecutionStatus::Success,
+                change_received: true,
             };
 
             // Force receiver to the configured dex account to separate seized collateral from repay funds
@@ -87,14 +89,20 @@ impl<'a, A: PipelineAgent> PipelineStage<'a, Vec<ExecutorRequest>, Vec<Execution
                 continue;
             }
 
-            if let LiquidationStatus::ChangeTransferFailed(err) = liq.status {
-                receipt.status = ExecutionStatus::ChangeTransferFailed(err);
+            if matches!(
+                liq.change_tx.status,
+                TransferStatus::Failed(_) | TransferStatus::Pending
+            ) {
+                receipt.change_received = false;
                 liquidations.push(receipt);
                 continue;
             }
 
-            if let LiquidationStatus::CollateralTransferFailed(err) = liq.status {
-                receipt.status = ExecutionStatus::CollateralTransferFailed(err);
+            if matches!(
+                liq.collateral_tx.status,
+                TransferStatus::Failed(_) | TransferStatus::Pending
+            ) {
+                receipt.status = ExecutionStatus::CollateralTransferFailed("collateral missing".to_string());
                 liquidations.push(receipt);
                 continue;
             }

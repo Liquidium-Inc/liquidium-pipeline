@@ -4,8 +4,6 @@ use candid::{CandidType, Nat, Principal};
 use icrc_ledger_types::icrc1::account::Account;
 use serde::{Deserialize, Serialize};
 
-
-
 // Max liquidation ratio
 pub const MAX_LIQUIDATION_RATIO: u64 = 500; // 50% of debt can be liquidated at once
 
@@ -72,6 +70,7 @@ pub struct LiquidationResult {
     pub status: LiquidationStatus,
     pub change_tx: TxStatus,
     pub collateral_tx: TxStatus,
+    pub id: Option<u128>,
 }
 
 #[derive(Debug, CandidType, Serialize, Deserialize, Clone, PartialEq, Eq)]

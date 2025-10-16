@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use candid::Principal;
 use ic_agent::Agent;
+use icrc_ledger_types::icrc1::account::Account;
 
 use crate::{
     account::account::{IcrcAccountActions, LiquidatorAccount},
@@ -31,7 +32,13 @@ pub async fn withdraw(asset: &String, amount: &str, to: &String) {
     println!("Withdrawing {} to {}", amount.value, to);
 
     let txid = account_service
-        .withdraw(amount, Principal::from_text(to.clone()).unwrap())
+        .transfer(
+            amount,
+            Account {
+                owner: Principal::from_text(to.clone()).unwrap(),
+                subaccount: None,
+            },
+        )
         .await
         .expect("Failed to withdraw funds");
 

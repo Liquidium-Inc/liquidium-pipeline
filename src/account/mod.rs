@@ -7,7 +7,7 @@ pub mod account {
     use async_trait::async_trait;
     use candid::{Encode, Nat, Principal};
     use icrc_ledger_agent::Icrc1Agent;
-    use icrc_ledger_types::icrc1::transfer::TransferArg;
+    use icrc_ledger_types::icrc1::{account::Subaccount, transfer::TransferArg};
 
     use icrc_ledger_types::icrc1::account::Account;
     use log::debug;
@@ -16,6 +16,8 @@ pub mod account {
         icrc_token::{icrc_token::IcrcToken, icrc_token_amount::IcrcTokenAmount},
         pipeline_agent::PipelineAgent,
     };
+
+    pub const RECOVERY_ACCOUNT: &Subaccount = &[0x1; 32];
 
     #[cfg_attr(test, mockall::automock)]
     #[async_trait]
@@ -83,12 +85,12 @@ pub mod account {
     #[cfg_attr(test, mockall::automock)]
     #[async_trait]
     pub trait IcrcAccountActions: Send + Sync {
-        async fn withdraw(&self, amount: IcrcTokenAmount, to: Principal) -> Result<String, String>;
+        async fn transfer(&self, amount: IcrcTokenAmount, to: Account) -> Result<String, String>;
     }
 
     #[async_trait]
     impl<A: PipelineAgent> IcrcAccountActions for LiquidatorAccount<A> {
-        async fn withdraw(&self, token_amount: IcrcTokenAmount, to: Principal) -> Result<String, String> {
+        async fn transfer(&self, token_amount: IcrcTokenAmount, to: Account) -> Result<String, String> {
             let icrc_agent = Icrc1Agent {
                 agent: self.agent.agent(),
                 ledger_canister_id: token_amount.token.ledger,
@@ -96,10 +98,7 @@ pub mod account {
             icrc_agent
                 .transfer(TransferArg {
                     from_subaccount: None,
-                    to: Account {
-                        owner: to,
-                        subaccount: None,
-                    },
+                    to,
                     fee: None,
                     created_at_time: None,
                     memo: None,

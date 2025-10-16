@@ -31,6 +31,7 @@ pub trait ConfigTrait: Send + Sync {
     fn get_liquidator_principal(&self) -> Principal;
     fn get_trader_principal(&self) -> Principal;
     fn should_buy_bad_debt(&self) -> bool;
+    fn get_lending_canister(&self) -> Principal;
 }
 
 impl ConfigTrait for Config {
@@ -52,6 +53,10 @@ impl ConfigTrait for Config {
 
     fn get_trader_principal(&self) -> Principal {
         self.trader_principal
+    }
+
+    fn get_lending_canister(&self) -> Principal {
+        self.lending_canister
     }
 }
 
