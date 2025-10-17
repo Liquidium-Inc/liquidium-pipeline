@@ -319,7 +319,7 @@ mod test {
             .expect("Expected liquidation to succeed");
 
         assert_eq!(result.repaid_debt, Nat::from(95_489u64)); // repay in sats
-        assert_eq!(result.received_collateral, Nat::from(91_363_876u64)); // 76,391,200 + 20% - 2% of bonus
+        assert_eq!(result.received_collateral, Nat::from(91_363_875u64)); // 76,391,200 + 20% - 2% of bonus
     }
 
     #[tokio::test]

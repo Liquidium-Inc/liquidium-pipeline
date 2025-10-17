@@ -375,6 +375,7 @@ mod tests {
             cfg.expect_get_debt_assets().return_const(debt_map);
             cfg.expect_get_collateral_assets().return_const(coll_map);
             cfg.expect_get_liquidator_principal().return_const(liquidator);
+            cfg.expect_get_trader_principal().return_const(liquidator);
             cfg.expect_should_buy_bad_debt().return_const(buy_bad_debt);
             cfg
         }
@@ -726,6 +727,9 @@ mod tests {
         config
             .expect_get_liquidator_principal()
             .return_const(Principal::from_text("aaaaa-aa").unwrap());
+        config
+            .expect_get_trader_principal()
+            .return_const(Principal::from_text("aaaaa-aa").unwrap());
         config.expect_should_buy_bad_debt().return_const(false);
 
         let mut executor = MockIcrcSwapInterface::new();
@@ -878,6 +882,9 @@ mod tests {
         config
             .expect_get_liquidator_principal()
             .return_const(Principal::from_text("aaaaa-aa").unwrap());
+        config
+            .expect_get_trader_principal()
+            .return_const(Principal::from_text("aaaaa-aa").unwrap());
         config.expect_should_buy_bad_debt().return_const(false);
 
         let mut executor = MockIcrcSwapInterface::new();
@@ -1014,6 +1021,9 @@ mod tests {
         config
             .expect_get_liquidator_principal()
             .return_const(Principal::anonymous());
+        config
+            .expect_get_trader_principal()
+            .return_const(Principal::anonymous());
         config.expect_should_buy_bad_debt().return_const(false);
 
         // Executor and collateral service should not be called since HF >= 1000 skips combos
@@ -1103,6 +1113,9 @@ mod tests {
         };
 
         let mut config = MockConfigTrait::new();
+        config
+            .expect_get_trader_principal()
+            .return_const(Principal::anonymous());
         config.expect_get_collateral_assets().return_const(
             vec![(collateral_token_principal.clone(), collateral_token.clone())]
                 .into_iter()
@@ -1436,12 +1449,15 @@ mod tests {
     async fn test_icrc_liquidation_strategy_orders_by_debt_when_hf_equal() {
         let debt_token = mk_token("xevnm-gaaaa-aaaar-qafnq-cai", "ckUSDC", "ckUSDC", 6, 10);
         let collateral_token = mk_token("mxzaz-hqaaa-aaaar-qaada-cai", "ckBTC", "ckBTC", 8, 10);
-        let config = mk_config_with_maps(
+        let mut config = mk_config_with_maps(
             &[("xevnm-gaaaa-aaaar-qafnq-cai".to_string(), debt_token.clone())],
             &[("mxzaz-hqaaa-aaaar-qaada-cai".to_string(), collateral_token.clone())],
             Principal::anonymous(),
             false,
         );
+        config
+            .expect_get_trader_principal()
+            .return_const(Principal::from_text("aaaaa-aa").unwrap());
 
         // Assert the first debt seen is the larger one when HF ties
         let mut first_checked = true;
