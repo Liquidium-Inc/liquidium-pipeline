@@ -175,7 +175,7 @@ impl<P: PriceOracle> CollateralServiceTrait for CollateralService<P> {
 
             // NOTE: expect per-position liquidation threshold bps available on the position.
             // This mirrors canister's: weighted_liquidation_threshold = sum(coll_value * pool.liq_threshold_bps) / total_collateral
-            let liq_threshold_bps = Nat::from(pos.liquidation_threshold);
+            let liq_threshold_bps = Nat::from(8500u64);
             weighted_sum_new += coll_quote * liq_threshold_bps;
         }
 
@@ -289,7 +289,6 @@ mod test {
             collateral_amount: Nat::from(0u64),
             liquidation_bonus: 2000u64, // 20% (bps)
             protocol_fee: 200u64,       // 2% (bps)
-            liquidation_threshold: 8500u64,
         };
 
         user.positions.push(debt_position.clone());
@@ -303,7 +302,6 @@ mod test {
             collateral_amount: Nat::from(99_940_000u64), // 99.94 USDT
             liquidation_bonus: 2000u64,
             protocol_fee: 200u64,
-            liquidation_threshold: 8500u64,
         };
 
         user.positions.push(collateral_position.clone());
@@ -357,7 +355,6 @@ mod test {
             collateral_amount: Nat::from(0u64),
             liquidation_bonus: 1000u64, // 10% (bps)
             protocol_fee: 200u64,
-            liquidation_threshold: 8500u64,
         };
 
         let collateral_position = LiquidateblePosition {
@@ -369,7 +366,6 @@ mod test {
             collateral_amount: Nat::from(1_400_000u64), // 0.014 BTC = ~$1120
             liquidation_bonus: 1000u64,
             protocol_fee: 200u64,
-            liquidation_threshold: 8500u64,
         };
 
         let mut user = user;
@@ -428,7 +424,6 @@ mod test {
             collateral_amount: Nat::from(0u64),
             liquidation_bonus: 1000u64, // 10% (bps)
             protocol_fee: 200u64,
-            liquidation_threshold: 8500u64,
         };
 
         // Only 0.001 BTC available -> 100 000 sats
@@ -441,7 +436,6 @@ mod test {
             collateral_amount: Nat::from(100_000u64), // 0.001 BTC
             liquidation_bonus: 1000u64,
             protocol_fee: 200u64,
-            liquidation_threshold: 8500u64,
         };
 
         // Execute
@@ -515,7 +509,6 @@ mod test {
             collateral_amount: Nat::from(0u64),
             liquidation_bonus: 1000u64,
             protocol_fee: 200u64,
-            liquidation_threshold: 8500u64,
         };
 
         // Collateral: 0.002 BTC (200_000 sats)
@@ -528,7 +521,6 @@ mod test {
             collateral_amount: Nat::from(200_000u64),
             liquidation_bonus: 1000u64,
             protocol_fee: 200u64,
-            liquidation_threshold: 8500u64,
         };
 
         user.positions.push(debt_position.clone());
@@ -609,7 +601,6 @@ mod test {
             collateral_amount: Nat::from(0u64),
             liquidation_bonus: 1000u64,
             protocol_fee: 200u64,
-            liquidation_threshold: 8500u64,
         };
 
         let collateral_position = LiquidateblePosition {
@@ -621,7 +612,6 @@ mod test {
             collateral_amount: Nat::from(0u64),
             liquidation_bonus: 1000u64,
             protocol_fee: 200u64,
-            liquidation_threshold: 8500u64,
         };
 
         user.positions.push(debt_position.clone());
@@ -690,7 +680,6 @@ mod test {
                     collateral_amount: Nat::from(0u64),
                     liquidation_bonus: bonus_bps as u64,
                     protocol_fee: fee_bps as u64,
-                    liquidation_threshold: 8500u64,
                 };
 
                 let collateral_position = LiquidateblePosition {
@@ -702,7 +691,6 @@ mod test {
                     collateral_amount: Nat::from(coll_native),
                     liquidation_bonus: bonus_bps as u64,
                     protocol_fee: fee_bps as u64,
-                    liquidation_threshold: 8500u64,
                 };
 
                 user.positions.push(debt_position.clone());

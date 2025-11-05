@@ -15,7 +15,6 @@ use crate::types::protocol_types::{AssetType, LiquidateblePosition, Liquidateble
 
 use crate::watchdog::{Watchdog, WatchdogEvent, noop_watchdog};
 use async_trait::async_trait;
-use icrc_ledger_types::icrc1::account::Account;
 use itertools::Itertools;
 
 use candid::{Int, Nat, Principal};
@@ -299,10 +298,7 @@ where
                     debt_pool_id: debt_position.pool_id,
                     collateral_pool_id: collateral_position.pool_id,
                     debt_amount: estimation.repaid_debt.clone(),
-                    receiver: Account {
-                        owner: self.config.get_trader_principal(),
-                        subaccount: None,
-                    },
+                    receiver_address: self.config.get_trader_principal(),
                 },
                 swap_args,
                 expected_profit: profit.0.to_i128().unwrap(),
@@ -458,7 +454,6 @@ mod tests {
                 account: Principal::anonymous(),
                 liquidation_bonus: 1000,
                 protocol_fee: 200,
-                liquidation_threshold: 8500,
             }
         }
 
@@ -472,7 +467,6 @@ mod tests {
                 account: Principal::anonymous(),
                 liquidation_bonus: 1000,
                 protocol_fee: 200,
-                liquidation_threshold: 8500,
             }
         }
 
@@ -673,7 +667,6 @@ mod tests {
             account: Principal::anonymous(),
             liquidation_bonus: 1000u64,
             protocol_fee: 200u64,
-            liquidation_threshold: 8500u64,
         };
 
         let user = LiquidatebleUser {
@@ -796,7 +789,6 @@ mod tests {
                     account: Principal::from_text("user-valid").unwrap_or_else(|_| Principal::management_canister()),
                     liquidation_bonus: 1000u64,
                     protocol_fee: 200u64,
-                    liquidation_threshold: 8500u64,
                 },
                 LiquidateblePosition {
                     pool_id: Principal::self_authenticating(random::<[u8; 32]>()),
@@ -807,7 +799,6 @@ mod tests {
                     account: Principal::from_text("user-valid").unwrap_or_else(|_| Principal::management_canister()),
                     liquidation_bonus: 1000u64,
                     protocol_fee: 200u64,
-                    liquidation_threshold: 8500u64,
                 },
             ],
             total_debt: Nat::from(2000u64),
@@ -826,7 +817,6 @@ mod tests {
                     account: Principal::anonymous(),
                     liquidation_bonus: 1000u64,
                     protocol_fee: 200u64,
-                    liquidation_threshold: 8500u64,
                 },
                 LiquidateblePosition {
                     pool_id: Principal::self_authenticating(random::<[u8; 32]>()),
@@ -837,7 +827,6 @@ mod tests {
                     account: Principal::anonymous(),
                     liquidation_bonus: 1000u64,
                     protocol_fee: 200u64,
-                    liquidation_threshold: 8500u64,
                 },
             ],
             total_debt: Nat::from(1000u64),
@@ -928,7 +917,6 @@ mod tests {
                 account: Principal::self_authenticating(random::<[u8; 32]>()),
                 liquidation_bonus: 1000u64,
                 protocol_fee: 200u64,
-                liquidation_threshold: 8500u64,
             }],
             total_debt: Nat::from(2000u64),
             health_factor: Nat::from(900u64),
@@ -1052,7 +1040,6 @@ mod tests {
             account: Principal::anonymous(),
             liquidation_bonus: 1000u64,
             protocol_fee: 200u64,
-            liquidation_threshold: 8500u64,
         };
         let usdc_pos = LiquidateblePosition {
             pool_id: Principal::anonymous(),
@@ -1063,7 +1050,6 @@ mod tests {
             account: Principal::anonymous(),
             liquidation_bonus: 1000u64,
             protocol_fee: 200u64,
-            liquidation_threshold: 8500u64,
         };
 
         let user = LiquidatebleUser {
@@ -1166,7 +1152,6 @@ mod tests {
             account: Principal::anonymous(),
             liquidation_bonus: 1000u64,
             protocol_fee: 200u64,
-            liquidation_threshold: 8500u64,
         };
         let usdc_pos = LiquidateblePosition {
             pool_id: Principal::anonymous(),
@@ -1177,7 +1162,6 @@ mod tests {
             account: Principal::anonymous(),
             liquidation_bonus: 1000u64,
             protocol_fee: 200u64,
-            liquidation_threshold: 8500u64,
         };
 
         let user = LiquidatebleUser {

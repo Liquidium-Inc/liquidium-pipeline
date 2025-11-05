@@ -85,7 +85,6 @@ mod tests {
             asset_type: AssetType::CkAsset(Principal::anonymous()),
             account: Principal::anonymous(),
             liquidation_bonus: 60,
-            liquidation_threshold: 8000,
             protocol_fee: 200,
         };
 
