@@ -1,7 +1,12 @@
-use async_trait::async_trait;
-use ethers::prelude::*;
-use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+
+use alloy::primitives::{Address, B256, U256};
+use async_trait::async_trait;
+use evm_bridge_client::{EvmClient, PrivateKeySigner};
+use hyperliquid_rust_sdk::ExchangeClient;
+use serde::{Deserialize, Serialize};
+
+use crate::config::ConfigTrait;
 
 // Receipt from depositing tokens from Hyperliquid EVM to Hyperliquid Core
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -11,7 +16,7 @@ pub struct EvmToCoreReceipt {
     // Amount deposited from EVM
     pub evm_amount: U256,
     // Transaction hash on EVM initiating the deposit
-    pub evm_tx_hash: H256,
+    pub evm_tx_hash: B256,
     // Transaction ID on Hyperliquid Core confirming receipt
     pub core_tx_id: String,
     // Amount received on Core (after fees)
@@ -32,7 +37,7 @@ pub struct CoreToEvmReceipt {
     // Transaction ID on Core initiating withdrawal
     pub core_tx_id: String,
     // Transaction hash on EVM confirming receipt
-    pub evm_tx_hash: H256,
+    pub evm_tx_hash: B256,
     // Amount received on EVM (after fees)
     pub evm_amount: U256,
     // Block number on EVM
@@ -41,7 +46,7 @@ pub struct CoreToEvmReceipt {
     pub evm_timestamp: u64,
 }
 
-// Status of an EVM ↔ Core transfer
+// Status of an EVM yo Core transfer
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum TransferStatus {
     // Transfer initiated, waiting for confirmation
@@ -52,11 +57,11 @@ pub enum TransferStatus {
     Failed(String),
 }
 
-// Errors specific to EVM ↔ Core bridge operations
+// Errors specific to EVM yo Core bridge operations
 #[derive(Debug, Clone)]
 pub enum EvmCoreBridgeError {
     // Failed to deposit from EVM to Core
-    DepositFailed { evm_tx: H256, reason: String },
+    DepositFailed { evm_tx: B256, reason: String },
     // Failed to withdraw from Core to EVM
     WithdrawFailed { core_tx: String, reason: String },
     // Insufficient balance on source layer
@@ -68,7 +73,7 @@ pub enum EvmCoreBridgeError {
     // Transaction not found on Core
     CoreTxNotFound(String),
     // Transaction not found on EVM
-    EvmTxNotFound(H256),
+    EvmTxNotFound(B256),
     // Timeout waiting for transfer
     TransferTimeout { waited: u64, timeout: u64 },
     // Network error
@@ -85,7 +90,11 @@ impl std::fmt::Display for EvmCoreBridgeError {
                 write!(f, "Withdrawal failed (Core tx {}): {}", core_tx, reason)
             }
             EvmCoreBridgeError::InsufficientBalance { required, available } => {
-                write!(f, "Insufficient balance: required {}, available {}", required, available)
+                write!(
+                    f,
+                    "Insufficient balance: required {}, available {}",
+                    required, available
+                )
             }
             EvmCoreBridgeError::ContractCallFailed(e) => write!(f, "Bridge contract call failed: {}", e),
             EvmCoreBridgeError::CoreApiFailed(e) => write!(f, "Core API call failed: {}", e),
@@ -128,7 +137,11 @@ pub trait EvmCoreBridge: Send + Sync {
     //
     // # Returns
     // Receipt with EVM tx hash and Core tx ID
-    async fn deposit_evm_to_core(&self, evm_token: Address, amount: U256) -> Result<EvmToCoreReceipt, EvmCoreBridgeError>;
+    async fn deposit_evm_to_core(
+        &self,
+        evm_token: Address,
+        amount: u128,
+    ) -> Result<EvmToCoreReceipt, EvmCoreBridgeError>;
 
     // Withdraw tokens from Hyperliquid Core to Hyperliquid EVM
     //
@@ -148,7 +161,11 @@ pub trait EvmCoreBridge: Send + Sync {
     //
     // # Returns
     // Receipt with Core tx ID and EVM tx hash
-    async fn withdraw_core_to_evm(&self, core_token: String, amount: U256) -> Result<CoreToEvmReceipt, EvmCoreBridgeError>;
+    async fn withdraw_core_to_evm(
+        &self,
+        core_token: String,
+        amount: u128,
+    ) -> Result<CoreToEvmReceipt, EvmCoreBridgeError>;
 
     // Check the status of an EVM -> Core deposit
     //
@@ -158,7 +175,7 @@ pub trait EvmCoreBridge: Send + Sync {
     // # Returns
     // - `Some(core_tx_id)` if deposit is confirmed on Core
     // - `None` if still pending
-    async fn check_deposit_status(&self, evm_tx_hash: H256) -> Result<Option<String>, EvmCoreBridgeError>;
+    async fn check_deposit_status(&self, evm_tx_hash: B256) -> Result<Option<String>, EvmCoreBridgeError>;
 
     // Check the status of a Core -> EVM withdrawal
     //
@@ -168,7 +185,7 @@ pub trait EvmCoreBridge: Send + Sync {
     // # Returns
     // - `Some(evm_tx_hash)` if withdrawal is confirmed on EVM
     // - `None` if still pending
-    async fn check_withdrawal_status(&self, core_tx_id: String) -> Result<Option<H256>, EvmCoreBridgeError>;
+    async fn check_withdrawal_status(&self, core_tx_id: String) -> Result<Option<B256>, EvmCoreBridgeError>;
 
     // Get balance of a token on Hyperliquid Core
     //
@@ -190,65 +207,45 @@ pub trait EvmCoreBridge: Send + Sync {
     async fn get_evm_balance(&self, evm_token: Address, address: Address) -> Result<U256, EvmCoreBridgeError>;
 }
 
-// Implementation of the EVM ↔ Core bridge for Hyperliquid
-pub struct HyperliquidEvmCoreBridge {
-    // EVM provider for Hyperliquid EVM layer
-    evm_provider: Arc<Provider<Http>>,
-    // Wallet for signing transactions on both layers
-    wallet: LocalWallet,
-    // Bridge contract address on EVM
-    bridge_contract: Address,
-    // Hyperliquid Core API URL
-    core_api_url: String,
-    // Chain ID
-    chain_id: u64,
-    // Timeout for waiting for transfers (seconds)
-    transfer_timeout: u64,
+// Implementation of the EVM yo Core bridge for Hyperliquid
+pub struct HyperliquidEvmCoreBridge<C: ConfigTrait> {
+    // Evm Client
+    pub evm_client: Arc<EvmClient>,
+    // Core client
+    pub exchange_client: ExchangeClient,
+    // Config
+    pub config: Arc<C>,
 }
 
-impl HyperliquidEvmCoreBridge {
-    // Create a new EVM ↔ Core bridge
-    //
-    // # Arguments
-    // * `evm_rpc_url` - RPC URL for Hyperliquid EVM
-    // * `core_api_url` - API URL for Hyperliquid Core
-    // * `wallet_private_key` - Private key for signing transactions
-    // * `bridge_contract` - Address of the bridge contract on EVM
-    // * `chain_id` - Hyperliquid chain ID
-    pub fn new(
-        evm_rpc_url: String,
-        core_api_url: String,
-        wallet_private_key: String,
-        bridge_contract: Address,
-        chain_id: u64,
-    ) -> Result<Self, EvmCoreBridgeError> {
-        let evm_provider = Provider::<Http>::try_from(evm_rpc_url)
-            .map_err(|e| EvmCoreBridgeError::NetworkError(format!("Failed to create EVM provider: {}", e)))?;
-
-        let wallet: LocalWallet = wallet_private_key
+impl<C: ConfigTrait> HyperliquidEvmCoreBridge<C> {
+    // Create a new EVM to Core bridge
+    pub async fn new(config: Arc<C>, evm_client: Arc<EvmClient>) -> Result<Self, EvmCoreBridgeError> {
+        let key = config.get_hyperliquid_wallet_key().unwrap();
+        let key = key.trim_start_matches("0x");
+        let signer: PrivateKeySigner = key
             .parse()
             .map_err(|e| EvmCoreBridgeError::NetworkError(format!("Invalid private key: {}", e)))?;
 
-        Ok(Self {
-            evm_provider: Arc::new(evm_provider),
-            wallet,
-            bridge_contract,
-            core_api_url,
-            chain_id,
-            transfer_timeout: 300, // 5 minutes default
-        })
-    }
+        let exchange_client =
+            ExchangeClient::new(None, signer, Some(hyperliquid_rust_sdk::BaseUrl::Mainnet), None, None)
+                .await
+                .unwrap();
 
-    // Set the transfer timeout (in seconds)
-    pub fn with_timeout(mut self, timeout_secs: u64) -> Self {
-        self.transfer_timeout = timeout_secs;
-        self
+        Ok(Self {
+            config,
+            evm_client,
+            exchange_client,
+        })
     }
 }
 
 #[async_trait]
-impl EvmCoreBridge for HyperliquidEvmCoreBridge {
-    async fn deposit_evm_to_core(&self, evm_token: Address, amount: U256) -> Result<EvmToCoreReceipt, EvmCoreBridgeError> {
+impl<C: ConfigTrait> EvmCoreBridge for HyperliquidEvmCoreBridge<C> {
+    async fn deposit_evm_to_core(
+        &self,
+        evm_token: Address,
+        amount: u128,
+    ) -> Result<EvmToCoreReceipt, EvmCoreBridgeError> {
         log::info!("Depositing {} of token {:?} from EVM to Core", amount, evm_token);
 
         // TODO: Implement actual deposit logic
@@ -283,7 +280,11 @@ impl EvmCoreBridge for HyperliquidEvmCoreBridge {
         // ```
     }
 
-    async fn withdraw_core_to_evm(&self, core_token: String, amount: U256) -> Result<CoreToEvmReceipt, EvmCoreBridgeError> {
+    async fn withdraw_core_to_evm(
+        &self,
+        core_token: String,
+        amount: u128,
+    ) -> Result<CoreToEvmReceipt, EvmCoreBridgeError> {
         log::info!("Withdrawing {} of token {} from Core to EVM", amount, core_token);
 
         // TODO: Implement actual withdrawal logic
@@ -316,7 +317,7 @@ impl EvmCoreBridge for HyperliquidEvmCoreBridge {
         // ```
     }
 
-    async fn check_deposit_status(&self, evm_tx_hash: H256) -> Result<Option<String>, EvmCoreBridgeError> {
+    async fn check_deposit_status(&self, evm_tx_hash: B256) -> Result<Option<String>, EvmCoreBridgeError> {
         log::debug!("Checking deposit status for EVM tx {:?}", evm_tx_hash);
 
         // TODO: Implement status check
@@ -327,7 +328,7 @@ impl EvmCoreBridge for HyperliquidEvmCoreBridge {
         ))
     }
 
-    async fn check_withdrawal_status(&self, core_tx_id: String) -> Result<Option<H256>, EvmCoreBridgeError> {
+    async fn check_withdrawal_status(&self, core_tx_id: String) -> Result<Option<B256>, EvmCoreBridgeError> {
         log::debug!("Checking withdrawal status for Core tx {}", core_tx_id);
 
         // TODO: Implement status check

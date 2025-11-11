@@ -1,5 +1,5 @@
+use alloy::primitives::{Address, B256, U256};
 use async_trait::async_trait;
-use ethers::types::U256;
 use std::sync::Arc;
 
 use crate::{
@@ -32,10 +32,7 @@ where
     }
 
     // Process a single bridge receipt through the swap flow
-    async fn process_bridge_receipt(
-        &self,
-        bridge_receipt: &BridgeToHyperliquidReceipt,
-    ) -> Result<SwapReceipt, String> {
+    async fn process_bridge_receipt(&self, bridge_receipt: &BridgeToHyperliquidReceipt) -> Result<SwapReceipt, String> {
         let tx_id = format!("swap_{}", chrono::Utc::now().timestamp());
 
         log::info!(
@@ -111,7 +108,7 @@ where
             .await
             .map_err(|e| format!("[{}] Swap execution failed: {}", tx_id, e))?;
 
-        let final_amount = swap_result.final_amount.as_u128();
+        let final_amount = swap_result.final_amount;
 
         log::info!(
             "[{}] Swap completed successfully: {} BTC -> {} USDT (rate: {:.6})",
@@ -135,16 +132,12 @@ where
 }
 
 #[async_trait]
-impl<'a, S, C> PipelineStage<'a, Vec<BridgeToHyperliquidReceipt>, Vec<SwapReceipt>>
-    for HyperliquidSwapStage<S, C>
+impl<'a, S, C> PipelineStage<'a, Vec<BridgeToHyperliquidReceipt>, Vec<SwapReceipt>> for HyperliquidSwapStage<S, C>
 where
     S: HyperliquidSwapInterface,
     C: ConfigTrait,
 {
-    async fn process(
-        &self,
-        bridge_receipts: &'a Vec<BridgeToHyperliquidReceipt>,
-    ) -> Result<Vec<SwapReceipt>, String> {
+    async fn process(&self, bridge_receipts: &'a Vec<BridgeToHyperliquidReceipt>) -> Result<Vec<SwapReceipt>, String> {
         log::info!(
             "HyperliquidSwapStage processing {} bridge receipts",
             bridge_receipts.len()
@@ -153,7 +146,11 @@ where
         let mut swap_receipts = Vec::with_capacity(bridge_receipts.len());
 
         for (i, bridge_receipt) in bridge_receipts.iter().enumerate() {
-            log::info!("[{}/{}] Executing swap on Hyperliquid Core", i + 1, bridge_receipts.len());
+            log::info!(
+                "[{}/{}] Executing swap on Hyperliquid Core",
+                i + 1,
+                bridge_receipts.len()
+            );
 
             // Skip failed bridge receipts
             if let crate::stages::bridge::BridgeStatus::Failed { stage, error } = &bridge_receipt.status {
@@ -169,30 +166,30 @@ where
                     bridge_receipt: bridge_receipt.clone(),
                     swap_result: crate::swappers::hyperliquid_types::MultiHopSwapResult {
                         first_leg: crate::swappers::hyperliquid_types::SwapLegResult {
-                            tx_hash: ethers::types::H256::zero(),
-                            token_in: ethers::types::Address::zero(),
-                            amount_in: U256::zero(),
-                            token_out: ethers::types::Address::zero(),
-                            amount_out: U256::zero(),
+                            tx_hash: B256::ZERO,
+                            token_in: Address::ZERO,
+                            amount_in: U256::ZERO,
+                            token_out: Address::ZERO,
+                            amount_out: U256::ZERO,
                             price: 0.0,
-                            gas_used: U256::zero(),
+                            gas_used: U256::ZERO,
                             block_number: 0,
                             timestamp: 0,
                         },
                         second_leg: crate::swappers::hyperliquid_types::SwapLegResult {
-                            tx_hash: ethers::types::H256::zero(),
-                            token_in: ethers::types::Address::zero(),
-                            amount_in: U256::zero(),
-                            token_out: ethers::types::Address::zero(),
-                            amount_out: U256::zero(),
+                            tx_hash: B256::ZERO,
+                            token_in: Address::ZERO,
+                            amount_in: U256::ZERO,
+                            token_out: Address::ZERO,
+                            amount_out: U256::ZERO,
                             price: 0.0,
-                            gas_used: U256::zero(),
+                            gas_used: U256::ZERO,
                             block_number: 0,
                             timestamp: 0,
                         },
-                        total_gas_used: U256::zero(),
-                        initial_amount: U256::zero(),
-                        final_amount: U256::zero(),
+                        total_gas_used: U256::ZERO,
+                        initial_amount: 0u128,
+                        final_amount: 0u128,
                         overall_rate: 0.0,
                     },
                     final_token_address: String::new(),
@@ -221,30 +218,30 @@ where
                         bridge_receipt: bridge_receipt.clone(),
                         swap_result: crate::swappers::hyperliquid_types::MultiHopSwapResult {
                             first_leg: crate::swappers::hyperliquid_types::SwapLegResult {
-                                tx_hash: ethers::types::H256::zero(),
-                                token_in: ethers::types::Address::zero(),
-                                amount_in: U256::zero(),
-                                token_out: ethers::types::Address::zero(),
-                                amount_out: U256::zero(),
+                                tx_hash: B256::ZERO,
+                                token_in: Address::ZERO,
+                                amount_in: U256::ZERO,
+                                token_out: Address::ZERO,
+                                amount_out: U256::ZERO,
                                 price: 0.0,
-                                gas_used: U256::zero(),
+                                gas_used: U256::ZERO,
                                 block_number: 0,
                                 timestamp: 0,
                             },
                             second_leg: crate::swappers::hyperliquid_types::SwapLegResult {
-                                tx_hash: ethers::types::H256::zero(),
-                                token_in: ethers::types::Address::zero(),
-                                amount_in: U256::zero(),
-                                token_out: ethers::types::Address::zero(),
-                                amount_out: U256::zero(),
+                                tx_hash: B256::ZERO,
+                                token_in: Address::ZERO,
+                                amount_in: U256::ZERO,
+                                token_out: Address::ZERO,
+                                amount_out: U256::ZERO,
                                 price: 0.0,
-                                gas_used: U256::zero(),
+                                gas_used: U256::ZERO,
                                 block_number: 0,
                                 timestamp: 0,
                             },
-                            total_gas_used: U256::zero(),
-                            initial_amount: U256::zero(),
-                            final_amount: U256::zero(),
+                            total_gas_used: U256::ZERO,
+                            initial_amount: 0u128,
+                            final_amount:   0u128,
                             overall_rate: 0.0,
                         },
                         final_token_address: String::new(),

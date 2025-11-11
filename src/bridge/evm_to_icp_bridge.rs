@@ -1,5 +1,6 @@
+use alloy::primitives::{Address, B256};
 use async_trait::async_trait;
-use ethers::prelude::*;
+use evm_bridge_client::{EvmClient, IcpHypeBridge};
 use std::sync::Arc;
 
 use super::types::{BridgeError, BurnReceipt, BurnRequest, MintReceipt, MintRequest};
@@ -10,9 +11,6 @@ use crate::pipeline_agent::PipelineAgent;
 #[cfg_attr(test, mockall::automock)]
 #[async_trait]
 pub trait EvmBridge: Send + Sync {
-    // Get the EVM wallet address used by this bridge
-    fn get_wallet_address(&self) -> Address;
-
     // Burn ckTokens on IC and unwrap to native tokens on Hyperliquid EVM
     //
     // This performs a two-step process:
@@ -28,56 +26,37 @@ pub trait EvmBridge: Send + Sync {
     async fn wrap_and_mint(&self, request: MintRequest) -> Result<MintReceipt, BridgeError>;
 
     // Check if a burn transaction has completed
-    async fn check_burn_status(&self, ic_block_index: u64) -> Result<Option<H256>, BridgeError>;
+    async fn check_burn_status(&self, ic_block_index: u64) -> Result<Option<B256>, BridgeError>;
 
     // Check if a mint transaction has completed
-    async fn check_mint_status(&self, evm_tx_hash: H256) -> Result<Option<u64>, BridgeError>;
+    async fn check_mint_status(&self, evm_tx_hash: B256) -> Result<Option<u64>, BridgeError>;
 }
 
 // Implementation of EVM bridge for Hyperliquid
-pub struct HyperliquidEvmBridge<A: PipelineAgent, C: ConfigTrait> {
+pub struct HyperliquidToIcpBridge<A: PipelineAgent, C: ConfigTrait> {
     // IC agent for calling IC canisters
     pub ic_agent: Arc<A>,
-    // EVM provider for Hyperliquid
-    pub evm_provider: Arc<Provider<Http>>,
-    // Wallet for signing EVM transactions
-    pub wallet: LocalWallet,
     // Configuration
     pub config: Arc<C>,
     // Optional EVM client for advanced operations
-    pub evm_client: Option<Arc<evm_bridge_client::EvmClient>>,
+    pub bridge: IcpHypeBridge,
 }
 
-impl<A: PipelineAgent, C: ConfigTrait> HyperliquidEvmBridge<A, C> {
+impl<A: PipelineAgent, C: ConfigTrait> HyperliquidToIcpBridge<A, C> {
     // Create a new Hyperliquid EVM bridge
-    pub fn new(
-        ic_agent: Arc<A>,
-        evm_rpc_url: String,
-        wallet_private_key: String,
-        config: Arc<C>,
-    ) -> Result<Self, BridgeError> {
-        // Create EVM provider
-        let provider = Provider::<Http>::try_from(evm_rpc_url)
-            .map_err(|e| BridgeError::ConfigError(format!("Failed to create provider: {}", e)))?;
-
-        // Parse wallet
-        let wallet: LocalWallet = wallet_private_key
+    pub fn new(ic_agent: Arc<A>, evm_client: Arc<EvmClient>, config: Arc<C>) -> Result<Self, BridgeError> {
+        let bridge_addr: Address = config
+            .get_hyperliquid_bridge_address()
+            .expect("bridge address not found")
             .parse()
-            .map_err(|e| BridgeError::ConfigError(format!("Invalid private key: {}", e)))?;
+            .map_err(|_| BridgeError::ConfigError("invalid bridge address".to_string()))?;
 
+        let bridge = IcpHypeBridge::new(bridge_addr, evm_client.clone());
         Ok(Self {
             ic_agent,
-            evm_provider: Arc::new(provider),
-            wallet,
+            bridge,
             config,
-            evm_client: None, // Will be set separately if needed
         })
-    }
-
-    // Set the EVM client for advanced operations
-    pub fn with_evm_client(mut self, evm_client: Arc<evm_bridge_client::EvmClient>) -> Self {
-        self.evm_client = Some(evm_client);
-        self
     }
 
     // Get the bridge contract address for a given ckToken
@@ -101,11 +80,7 @@ impl<A: PipelineAgent, C: ConfigTrait> HyperliquidEvmBridge<A, C> {
 }
 
 #[async_trait]
-impl<A: PipelineAgent, C: ConfigTrait> EvmBridge for HyperliquidEvmBridge<A, C> {
-    fn get_wallet_address(&self) -> Address {
-        self.wallet.address()
-    }
-
+impl<A: PipelineAgent, C: ConfigTrait> EvmBridge for HyperliquidToIcpBridge<A, C> {
     async fn burn_and_unwrap(&self, request: BurnRequest) -> Result<BurnReceipt, BridgeError> {
         log::info!(
             "Burning {} {} and unwrapping to {}",
@@ -144,9 +119,7 @@ impl<A: PipelineAgent, C: ConfigTrait> EvmBridge for HyperliquidEvmBridge<A, C> 
 
         // TODO: Implement actual wrap logic
         // For now, return an error indicating this is not yet implemented
-        Err(BridgeError::WrapFailed(
-            "Wrap and mint not yet implemented".to_string(),
-        ))
+        Err(BridgeError::WrapFailed("Wrap and mint not yet implemented".to_string()))
 
         // Expected flow:
         // 1. Approve EVM token for bridge contract
@@ -156,7 +129,7 @@ impl<A: PipelineAgent, C: ConfigTrait> EvmBridge for HyperliquidEvmBridge<A, C> 
         // 5. Return receipt with both EVM tx hash and IC block index
     }
 
-    async fn check_burn_status(&self, _ic_block_index: u64) -> Result<Option<H256>, BridgeError> {
+    async fn check_burn_status(&self, _ic_block_index: u64) -> Result<Option<B256>, BridgeError> {
         // Check if the burn on IC has resulted in unwrapped tokens on EVM
         // Returns Some(tx_hash) if found, None if still pending
 
@@ -166,7 +139,7 @@ impl<A: PipelineAgent, C: ConfigTrait> EvmBridge for HyperliquidEvmBridge<A, C> 
         ))
     }
 
-    async fn check_mint_status(&self, _evm_tx_hash: H256) -> Result<Option<u64>, BridgeError> {
+    async fn check_mint_status(&self, _evm_tx_hash: B256) -> Result<Option<u64>, BridgeError> {
         // Check if the wrap on EVM has resulted in minted ckTokens on IC
         // Returns Some(block_index) if found, None if still pending
 

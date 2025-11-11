@@ -1,6 +1,6 @@
 use crate::icrc_token::icrc_token::IcrcToken;
 use crate::icrc_token::icrc_token_amount::IcrcTokenAmount;
-use ethers::types::{Address, H256};
+pub use alloy::primitives::{Address, B256};
 
 // Request to burn ckTokens on IC and receive native tokens on Hyperliquid EVM
 #[derive(Debug, Clone)]
@@ -21,7 +21,7 @@ pub struct BurnReceipt {
     // Block index of the burn transaction on IC
     pub ic_block_index: u64,
     // Transaction hash on Hyperliquid EVM (after unwrapping)
-    pub evm_tx_hash: H256,
+    pub evm_tx_hash: B256,
     // Amount actually received on Hyperliquid (after fees)
     pub received_amount: u128,
 }
@@ -45,7 +45,7 @@ pub struct MintReceipt {
     // The mint request that was executed
     pub request: MintRequest,
     // Transaction hash on Hyperliquid EVM (wrapping transaction)
-    pub evm_tx_hash: H256,
+    pub evm_tx_hash: B256,
     // Block index of the mint transaction on IC
     pub ic_block_index: u64,
     // Amount actually minted on IC (after fees)
@@ -60,11 +60,11 @@ pub enum CrossChainTxStatus {
     // Burn completed, tokens received on Hyperliquid
     BurnCompleted(BurnReceipt),
     // First swap completed (BTC -> USDC)
-    FirstSwapCompleted { tx_hash: H256, usdc_amount: u128 },
+    FirstSwapCompleted { tx_hash: B256, usdc_amount: u128 },
     // Second swap completed (USDC -> USDT)
-    SecondSwapCompleted { tx_hash: H256, usdt_amount: u128 },
+    SecondSwapCompleted { tx_hash: B256, usdt_amount: u128 },
     // Wrap initiated on Hyperliquid
-    WrapInitiated { tx_hash: H256 },
+    WrapInitiated { tx_hash: B256 },
     // Mint completed on IC
     MintCompleted(MintReceipt),
     // Transaction failed at some stage
@@ -100,7 +100,7 @@ pub enum BridgeError {
     // Failed to mint ckTokens on IC
     MintFailed(String),
     // EVM transaction failed
-    EvmTransactionFailed { tx_hash: H256, reason: String },
+    EvmTransactionFailed { tx_hash: B256, reason: String },
     // Insufficient balance
     InsufficientBalance { required: u128, available: u128 },
     // Configuration error

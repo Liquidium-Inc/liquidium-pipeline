@@ -1,5 +1,7 @@
 // ICP CkDeposit bridge integration
 
+use std::sync::Arc;
+
 use crate::{client::EvmClient, erc20::Erc20Client, errors::EvmError, types::*};
 use alloy::{providers::DynProvider, sol};
 
@@ -37,13 +39,13 @@ pub struct DepositEvent {
 }
 
 #[derive(Clone)]
-pub struct IcpBridge {
+pub struct IcpHypeBridge {
     pub bridge: Address,
-    pub client: EvmClient,
+    pub client: Arc<EvmClient>,
 }
 
-impl IcpBridge {
-    pub fn new(bridge: Address, client: EvmClient) -> Self {
+impl IcpHypeBridge {
+    pub fn new(bridge: Address, client: Arc<EvmClient>) -> Self {
         Self { bridge, client }
     }
 
@@ -165,7 +167,10 @@ impl IcpBridge {
     ) -> Result<Vec<DepositEvent>, EvmError> {
         use alloy::{rpc::types::Filter, sol_types::SolEvent};
 
-        let mut filter = Filter::new().address(self.bridge).from_block(from_block).to_block(to_block);
+        let mut filter = Filter::new()
+            .address(self.bridge)
+            .from_block(from_block)
+            .to_block(to_block);
 
         // Add event signatures
         filter = filter.event_signature(vec![

@@ -1,6 +1,7 @@
 use async_trait::async_trait;
-use ethers::types::{Address, H256};
+use alloy::primitives::{Address, B256};
 use serde::{Deserialize, Serialize};
+
 
 // Receipt from depositing tokens from EVM to Hyperliquid Core
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -10,7 +11,7 @@ pub struct CoreDepositReceipt {
     // Amount deposited from EVM
     pub evm_amount: u128,
     // Transaction hash on EVM for the deposit
-    pub evm_tx_hash: H256,
+    pub evm_tx_hash: B256,
     // Transaction hash/ID on Hyperliquid Core
     pub core_tx_hash: String,
     // Amount received on Core (after fees)
@@ -29,7 +30,7 @@ pub struct CoreWithdrawReceipt {
     // Transaction hash/ID on Hyperliquid Core
     pub core_tx_hash: String,
     // Transaction hash on EVM where tokens were received
-    pub evm_tx_hash: H256,
+    pub evm_tx_hash: B256,
     // Amount received on EVM (after fees)
     pub amount_received: u128,
     // Timestamp of confirmation
@@ -126,10 +127,10 @@ pub trait HyperliquidCoreInterface: Send + Sync {
     async fn wait_for_core_tx(&self, tx_hash: String) -> Result<CoreTxReceipt, HyperliquidCoreError>;
 
     // Check if a deposit from EVM has been credited on Core
-    async fn check_deposit_status(&self, evm_tx_hash: H256) -> Result<Option<String>, HyperliquidCoreError>;
+    async fn check_deposit_status(&self, evm_tx_hash: B256) -> Result<Option<String>, HyperliquidCoreError>;
 
     // Check if a withdrawal from Core has been received on EVM
-    async fn check_withdrawal_status(&self, core_tx_hash: String) -> Result<Option<H256>, HyperliquidCoreError>;
+    async fn check_withdrawal_status(&self, core_tx_hash: String) -> Result<Option<B256>, HyperliquidCoreError>;
 }
 
 // Implementation of Hyperliquid Core interface
@@ -138,8 +139,6 @@ pub struct HyperliquidCore {
     api_url: String,
     // Wallet private key for signing Core transactions
     wallet_key: String,
-    // EVM provider for monitoring EVM-side transactions
-    evm_provider: ethers::providers::Provider<ethers::providers::Http>,
     // Chain ID
     chain_id: u64,
 }
@@ -148,16 +147,12 @@ impl HyperliquidCore {
     pub fn new(
         api_url: String,
         wallet_key: String,
-        evm_rpc_url: String,
+        _evm_rpc_url: String,
         chain_id: u64,
     ) -> Result<Self, HyperliquidCoreError> {
-        let evm_provider = ethers::providers::Provider::<ethers::providers::Http>::try_from(evm_rpc_url)
-            .map_err(|e| HyperliquidCoreError::NetworkError(format!("Failed to create EVM provider: {}", e)))?;
-
         Ok(Self {
             api_url,
             wallet_key,
-            evm_provider,
             chain_id,
         })
     }
@@ -250,7 +245,7 @@ impl HyperliquidCoreInterface for HyperliquidCore {
         // 4. Return CoreTxReceipt
     }
 
-    async fn check_deposit_status(&self, evm_tx_hash: H256) -> Result<Option<String>, HyperliquidCoreError> {
+    async fn check_deposit_status(&self, evm_tx_hash: B256) -> Result<Option<String>, HyperliquidCoreError> {
         log::info!("Checking deposit status for EVM tx {:?}", evm_tx_hash);
 
         // TODO: Implement deposit status check
@@ -261,7 +256,7 @@ impl HyperliquidCoreInterface for HyperliquidCore {
         ))
     }
 
-    async fn check_withdrawal_status(&self, core_tx_hash: String) -> Result<Option<H256>, HyperliquidCoreError> {
+    async fn check_withdrawal_status(&self, core_tx_hash: String) -> Result<Option<B256>, HyperliquidCoreError> {
         log::info!("Checking withdrawal status for Core tx {}", core_tx_hash);
 
         // TODO: Implement withdrawal status check

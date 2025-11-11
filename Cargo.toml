@@ -52,8 +52,16 @@ r2d2 = "0.8.10"
 dialoguer = "0.12.0"
 
 # Hyperliquid integration
-hyperliquid_rust_sdk = "0.6.0"
-ethers = { version = "2.0", features = ["abigen", "ws"] }
+hyperliquid_rust_sdk = { git = "https://github.com/hyperliquid-dex/hyperliquid-rust-sdk" }
+alloy = { version = "1.1.0", features = [
+    "providers",
+    "provider-http",
+    "signer-local",
+    "contract",
+    "sol-types",
+    "network",
+    "rpc-types",
+] }
 reqwest = { version = "0.11", features = ["json"] }
 
 # EVM bridge client

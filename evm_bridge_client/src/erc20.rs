@@ -1,5 +1,7 @@
 // ERC-20 token client with automatic allowance management
 
+use std::sync::Arc;
+
 use crate::{client::EvmClient, errors::EvmError, types::*};
 use alloy::{providers::DynProvider, sol};
 
@@ -18,11 +20,11 @@ sol! {
 #[derive(Clone)]
 pub struct Erc20Client {
     pub token: Address,
-    pub client: EvmClient,
+    pub client: Arc<EvmClient>,
 }
 
 impl Erc20Client {
-    pub fn new(token: Address, client: EvmClient) -> Self {
+    pub fn new(token: Address, client: Arc<EvmClient>) -> Self {
         Self { token, client }
     }
 

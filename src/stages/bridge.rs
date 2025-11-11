@@ -1,11 +1,6 @@
-use async_trait::async_trait;
-use ethers::types::H256;
-use num_traits::ToPrimitive;
-use std::sync::Arc;
-
 use crate::{
     bridge::{
-        evm_bridge::EvmBridge,
+        evm_to_icp_bridge::EvmBridge,
         evm_core_bridge::EvmCoreBridge,
         types::{BurnRequest, MintRequest},
     },
@@ -17,6 +12,10 @@ use crate::{
     swappers::hyperliquid_types::MultiHopSwapResult,
     types::protocol_types::LiquidationResult,
 };
+use alloy::primitives::B256;
+use async_trait::async_trait;
+use num_traits::ToPrimitive;
+use std::sync::Arc;
 
 // Status of bridge operations
 #[derive(Debug, Clone)]
@@ -46,13 +45,13 @@ pub struct BridgeToHyperliquidReceipt {
     // Block index where ckBTC was burned on IC
     pub ic_burn_block: u64,
     // Transaction hash where BTC was received on Hyperliquid EVM
-    pub evm_receive_tx: H256,
+    pub evm_receive_tx: B256,
     // Amount received on EVM (after bridge fees)
     pub evm_amount: u128,
 
     // Step 2: Hyperliquid EVM -> Core
     // Transaction hash for EVM -> Core deposit
-    pub evm_to_core_tx: H256,
+    pub evm_to_core_tx: B256,
     // Transaction ID on Hyperliquid Core
     pub core_receive_tx: String,
     // Amount received on Core (after transfer fees)
@@ -92,13 +91,13 @@ pub struct BridgeToIcReceipt {
     // Transaction ID for Core -> EVM withdrawal
     pub core_to_evm_tx: String,
     // Transaction hash where tokens were received on EVM
-    pub evm_receive_tx: H256,
+    pub evm_receive_tx: B256,
     // Amount received on EVM
     pub evm_amount: u128,
 
     // Step 2: Hyperliquid EVM -> IC
     // Transaction hash for wrapping on EVM
-    pub evm_wrap_tx: H256,
+    pub evm_wrap_tx: B256,
     // Block index where ckUSDT was minted on IC
     pub ic_mint_block: u64,
     // Amount minted on IC (ckUSDT)
@@ -157,7 +156,7 @@ where
                 token: receipt.request.collateral_asset.clone(),
                 value: liquidation_result.amounts.collateral_received.clone(),
             },
-            destination_address: self.evm_bridge.get_wallet_address(),
+            destination_address: todo!()
         };
 
         let burn_receipt = self
@@ -188,7 +187,7 @@ where
 
         let core_deposit = self
             .evm_core_bridge
-            .deposit_evm_to_core(btc_address, burn_receipt.received_amount.into())
+            .deposit_evm_to_core(btc_address, burn_receipt.received_amount)
             .await
             .map_err(|e| format!("[{}] EVM to Core transfer failed: {}", tx_id, e))?;
 
@@ -207,7 +206,7 @@ where
             evm_amount: burn_receipt.received_amount,
             evm_to_core_tx: core_deposit.evm_tx_hash,
             core_receive_tx: core_deposit.core_tx_id,
-            core_amount: core_deposit.core_amount.as_u128(),
+            core_amount: core_deposit.core_amount.to::<u128>(),
             core_token_address: self
                 .config
                 .get_hyperliquid_btc_address()
@@ -246,9 +245,9 @@ where
                             original_request: receipt.request.clone(),
                             liquidation_result: liquidation_result.clone(),
                             ic_burn_block: 0,
-                            evm_receive_tx: H256::zero(),
+                            evm_receive_tx: B256::ZERO,
                             evm_amount: 0,
-                            evm_to_core_tx: H256::zero(),
+                            evm_to_core_tx: B256::ZERO,
                             core_receive_tx: String::new(),
                             core_amount: 0,
                             core_token_address: String::new(),
@@ -307,7 +306,7 @@ where
             .evm_core_bridge
             .withdraw_core_to_evm(
                 swap_receipt.final_token_address.clone(),
-                swap_receipt.final_amount.into(),
+                swap_receipt.final_amount,
             )
             .await
             .map_err(|e| format!("[{}] Core to EVM transfer failed: {}", tx_id, e))?;
@@ -331,7 +330,7 @@ where
 
         let mint_request = MintRequest {
             native_token_address: usdt_address,
-            amount: core_withdraw.evm_amount.as_u128(),
+            amount: core_withdraw.evm_amount.to::<u128>(),
             ck_token: swap_receipt.bridge_receipt.original_request.debt_asset.clone(),
             destination_principal: self.config.get_trader_principal(),
         };
@@ -365,7 +364,7 @@ where
             swap_receipt: swap_receipt.clone(),
             core_to_evm_tx: core_withdraw.core_tx_id,
             evm_receive_tx: core_withdraw.evm_tx_hash,
-            evm_amount: core_withdraw.evm_amount.as_u128(),
+            evm_amount: core_withdraw.evm_amount.to::<u128>(),
             evm_wrap_tx: mint_receipt.evm_tx_hash,
             ic_mint_block: mint_receipt.ic_block_index,
             ic_amount,
@@ -406,9 +405,9 @@ where
                     ic_receipts.push(BridgeToIcReceipt {
                         swap_receipt: swap_receipt.clone(),
                         core_to_evm_tx: String::new(),
-                        evm_receive_tx: H256::zero(),
+                        evm_receive_tx: B256::ZERO,
                         evm_amount: 0,
-                        evm_wrap_tx: H256::zero(),
+                        evm_wrap_tx: B256::ZERO,
                         ic_mint_block: 0,
                         ic_amount: 0,
                         status: BridgeStatus::Failed {

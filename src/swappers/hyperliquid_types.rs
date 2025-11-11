@@ -1,5 +1,7 @@
-use ethers::types::{Address, H256, U256};
+use alloy::primitives::{Address, U256};
 use serde::{Deserialize, Serialize};
+
+use crate::bridge::types::B256;
 
 // Represents a single swap leg in a multi-hop swap
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -33,7 +35,7 @@ pub struct MultiHopSwapArgs {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SwapLegResult {
     // Transaction hash on Hyperliquid
-    pub tx_hash: H256,
+    pub tx_hash: B256,
     // Token that was sold
     pub token_in: Address,
     // Amount sold
@@ -62,9 +64,9 @@ pub struct MultiHopSwapResult {
     // Total gas used
     pub total_gas_used: U256,
     // Initial amount (BTC)
-    pub initial_amount: U256,
+    pub initial_amount: u128,
     // Final amount (USDT)
-    pub final_amount: U256,
+    pub final_amount: u128,
     // Overall conversion rate (USDT per BTC)
     pub overall_rate: f64,
 }
@@ -136,7 +138,7 @@ impl HyperliquidToken {
     // Convert raw token units to human-readable amount
     pub fn from_raw_amount(&self, raw: U256) -> f64 {
         let divisor = 10_f64.powi(self.decimals as i32);
-        raw.as_u128() as f64 / divisor
+        raw.to::<u128>() as f64 / divisor
     }
 }
 
@@ -150,7 +152,7 @@ pub enum HyperliquidSwapError {
     // Deadline passed
     DeadlineExceeded { deadline: u64, current_time: u64 },
     // Transaction reverted
-    TransactionReverted { tx_hash: H256, reason: String },
+    TransactionReverted { tx_hash: B256, reason: String },
     // Network error
     NetworkError(String),
     // Invalid parameters

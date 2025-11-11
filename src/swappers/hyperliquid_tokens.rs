@@ -1,4 +1,4 @@
-use ethers::types::Address;
+use alloy::primitives::Address;
 use std::str::FromStr;
 
 use crate::config::ConfigTrait;
@@ -53,17 +53,5 @@ impl HyperliquidTokenFactory {
         let usdt = Self::create_usdt(config)?;
 
         Ok((btc, usdc, usdt))
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::config::Config;
-
-    #[test]
-    fn test_token_creation() {
-        // This test would require a mock config
-        // TODO: Add tests when Config mocking is available
     }
 }

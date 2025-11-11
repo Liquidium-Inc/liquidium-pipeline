@@ -1,14 +1,11 @@
 // Wrapper around evm_bridge_client for the liquidium pipeline
 
 use evm_bridge_client::{EvmClient, EvmError, RpcConfig, TxPolicyConfig};
+use log::info;
 use std::sync::Arc;
 
 /// Initialize an EVM client from configuration
-pub async fn init_evm_client(
-    rpc_url: String,
-    chain_id: u64,
-    private_key: String,
-) -> Result<Arc<EvmClient>, String> {
+pub async fn init_evm_client(rpc_url: String, chain_id: u64, private_key: String) -> Result<Arc<EvmClient>, String> {
     // Parse private key
     let private_key = private_key.trim_start_matches("0x");
     let signer: evm_bridge_client::PrivateKeySigner = private_key
@@ -22,18 +19,20 @@ pub async fn init_evm_client(
 
     // Create transaction policy with sensible defaults
     let policy = TxPolicyConfig {
-        max_fee_per_gas_wei: None,           // Fetch from network
-        max_priority_fee_per_gas_wei: None,  // Fetch from network
-        gas_limit_multiplier_bps: 12000,     // 120%
+        max_fee_per_gas_wei: None,          // Fetch from network
+        max_priority_fee_per_gas_wei: None, // Fetch from network
+        gas_limit_multiplier_bps: 12000,    // 120%
         max_retries: 3,
-        confirm_blocks: 2,                   // Wait for 2 confirmations
-        receipt_timeout_secs: 300,           // 5 minutes
+        confirm_blocks: 2,         // Wait for 2 confirmations
+        receipt_timeout_secs: 300, // 5 minutes
     };
 
     // Create EVM client
     let client = EvmClient::new(rpc, signer, from, policy)
         .await
         .map_err(|e| format!("Failed to create EVM client: {}", e))?;
+
+    info!("EVM client initialized with address: {:?}", client.from);
 
     Ok(Arc::new(client))
 }

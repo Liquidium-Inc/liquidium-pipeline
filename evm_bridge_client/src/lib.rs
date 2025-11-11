@@ -65,5 +65,5 @@ pub use client::EvmClient;
 pub use config::{RpcConfig, TxPolicyConfig};
 pub use erc20::Erc20Client;
 pub use errors::EvmError;
-pub use icp_bridge::IcpBridge;
+pub use icp_bridge::IcpHypeBridge;
 pub use types::*;

@@ -30,7 +30,6 @@ pub struct Config {
     pub hyperliquid_rpc_url: Option<String>,
     pub hyperliquid_core_api_url: Option<String>,
     pub hyperliquid_wallet_key: Option<String>,
-    pub hyperliquid_evm_private_key: Option<String>,
     pub hyperliquid_dex_router: Option<String>,
     pub hyperliquid_chain_id: Option<u64>,
     // Token addresses on Hyperliquid EVM
@@ -52,9 +51,14 @@ pub trait ConfigTrait: Send + Sync {
     fn get_recovery_account(&self) -> Account;
 
     // Hyperliquid configuration methods
+    fn get_hyperliquid_bridge_address(&self) -> Option<String>;
     fn get_hyperliquid_btc_address(&self) -> Option<String>;
     fn get_hyperliquid_usdc_address(&self) -> Option<String>;
     fn get_hyperliquid_usdt_address(&self) -> Option<String>;
+    fn get_hyperliquid_wallet_key(&self) -> Option<String>;
+    fn get_hyperliquid_rpc_url(&self) -> Option<String>;
+    fn get_hyperliquid_core_api_url(&self) -> Option<String>;
+    fn get_hyperliquid_chain_id(&self) -> Option<u64>;
 }
 
 impl ConfigTrait for Config {
@@ -89,6 +93,10 @@ impl ConfigTrait for Config {
         self.lending_canister
     }
 
+    fn get_hyperliquid_bridge_address(&self) -> Option<String> {
+        self.hyperliquid_bridge_address.clone()
+    }
+
     fn get_hyperliquid_btc_address(&self) -> Option<String> {
         self.hyperliquid_btc_address.clone()
     }
@@ -99,6 +107,22 @@ impl ConfigTrait for Config {
 
     fn get_hyperliquid_usdt_address(&self) -> Option<String> {
         self.hyperliquid_usdt_address.clone()
+    }
+
+    fn get_hyperliquid_wallet_key(&self) -> Option<String> {
+        self.hyperliquid_wallet_key.clone()
+    }
+
+    fn get_hyperliquid_rpc_url(&self) -> Option<String> {
+        self.hyperliquid_rpc_url.clone()
+    }
+
+    fn get_hyperliquid_core_api_url(&self) -> Option<String> {
+        self.hyperliquid_core_api_url.clone()
+    }
+
+    fn get_hyperliquid_chain_id(&self) -> Option<u64> {
+        self.hyperliquid_chain_id.clone()
     }
 }
 
@@ -155,11 +179,8 @@ impl Config {
         let hyperliquid_rpc_url = env::var("HYPERLIQUID_RPC_URL").ok();
         let hyperliquid_core_api_url = env::var("HYPERLIQUID_CORE_API_URL").ok();
         let hyperliquid_wallet_key = env::var("HYPERLIQUID_WALLET_KEY").ok();
-        let hyperliquid_evm_private_key = env::var("HYPERLIQUID_EVM_PRIVATE_KEY").ok();
         let hyperliquid_dex_router = env::var("HYPERLIQUID_DEX_ROUTER").ok();
-        let hyperliquid_chain_id = env::var("HYPERLIQUID_CHAIN_ID")
-            .ok()
-            .and_then(|s| s.parse().ok());
+        let hyperliquid_chain_id = env::var("HYPERLIQUID_CHAIN_ID").ok().and_then(|s| s.parse().ok());
         let hyperliquid_btc_address = env::var("HYPERLIQUID_BTC_ADDRESS").ok();
         let hyperliquid_usdc_address = env::var("HYPERLIQUID_USDC_ADDRESS").ok();
         let hyperliquid_usdt_address = env::var("HYPERLIQUID_USDT_ADDRESS").ok();
@@ -181,7 +202,6 @@ impl Config {
             hyperliquid_rpc_url,
             hyperliquid_core_api_url,
             hyperliquid_wallet_key,
-            hyperliquid_evm_private_key,
             hyperliquid_dex_router,
             hyperliquid_chain_id,
             hyperliquid_btc_address,
