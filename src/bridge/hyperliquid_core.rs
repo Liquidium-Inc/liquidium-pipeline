@@ -272,13 +272,3 @@ impl HyperliquidCoreInterface for HyperliquidCore {
         ))
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn test_hyperliquid_core_creation() {
-        // TODO: Add tests when implementation is complete
-    }
-}

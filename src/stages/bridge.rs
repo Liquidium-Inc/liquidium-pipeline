@@ -157,7 +157,7 @@ where
                 token: receipt.request.collateral_asset.clone(),
                 value: liquidation_result.amounts.collateral_received.clone(),
             },
-            destination_address,
+            destination_address: self.evm_bridge.get_wallet_address(),
         };
 
         let burn_receipt = self

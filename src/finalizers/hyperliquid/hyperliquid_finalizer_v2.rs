@@ -170,13 +170,3 @@ where
         Ok(outcomes)
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn test_finalizer_creation() {
-        // TODO: Add tests when implementation is complete
-    }
-}

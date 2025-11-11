@@ -10,6 +10,9 @@ use crate::pipeline_agent::PipelineAgent;
 #[cfg_attr(test, mockall::automock)]
 #[async_trait]
 pub trait EvmBridge: Send + Sync {
+    // Get the EVM wallet address used by this bridge
+    fn get_wallet_address(&self) -> Address;
+
     // Burn ckTokens on IC and unwrap to native tokens on Hyperliquid EVM
     //
     // This performs a two-step process:
@@ -41,6 +44,8 @@ pub struct HyperliquidEvmBridge<A: PipelineAgent, C: ConfigTrait> {
     pub wallet: LocalWallet,
     // Configuration
     pub config: Arc<C>,
+    // Optional EVM client for advanced operations
+    pub evm_client: Option<Arc<evm_bridge_client::EvmClient>>,
 }
 
 impl<A: PipelineAgent, C: ConfigTrait> HyperliquidEvmBridge<A, C> {
@@ -65,7 +70,14 @@ impl<A: PipelineAgent, C: ConfigTrait> HyperliquidEvmBridge<A, C> {
             evm_provider: Arc::new(provider),
             wallet,
             config,
+            evm_client: None, // Will be set separately if needed
         })
+    }
+
+    // Set the EVM client for advanced operations
+    pub fn with_evm_client(mut self, evm_client: Arc<evm_bridge_client::EvmClient>) -> Self {
+        self.evm_client = Some(evm_client);
+        self
     }
 
     // Get the bridge contract address for a given ckToken
@@ -90,6 +102,10 @@ impl<A: PipelineAgent, C: ConfigTrait> HyperliquidEvmBridge<A, C> {
 
 #[async_trait]
 impl<A: PipelineAgent, C: ConfigTrait> EvmBridge for HyperliquidEvmBridge<A, C> {
+    fn get_wallet_address(&self) -> Address {
+        self.wallet.address()
+    }
+
     async fn burn_and_unwrap(&self, request: BurnRequest) -> Result<BurnReceipt, BridgeError> {
         log::info!(
             "Burning {} {} and unwrapping to {}",
@@ -158,15 +174,5 @@ impl<A: PipelineAgent, C: ConfigTrait> EvmBridge for HyperliquidEvmBridge<A, C> 
         Err(BridgeError::NetworkError(
             "Status checking not yet implemented".to_string(),
         ))
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn test_bridge_creation() {
-        // TODO: Add tests when implementation is complete
     }
 }

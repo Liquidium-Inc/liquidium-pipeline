@@ -182,15 +182,31 @@ async fn init(
         );
 
         // 2. Create IC to EVM bridge
-        let evm_bridge = Arc::new(
-            HyperliquidEvmBridge::new(
-                agent.clone(),
+        let mut evm_bridge = HyperliquidEvmBridge::new(
+            agent.clone(),
+            config.hyperliquid_rpc_url.clone().unwrap(),
+            config.hyperliquid_wallet_key.clone().unwrap(),
+            config.clone(),
+        )
+        .expect("Failed to create EVM bridge");
+
+        // Initialize EVM client if private key is provided
+        if let Some(evm_pk) = config.hyperliquid_evm_private_key.clone() {
+            use crate::bridge::evm_client_wrapper::init_evm_client;
+
+            let evm_client = init_evm_client(
                 config.hyperliquid_rpc_url.clone().unwrap(),
-                config.hyperliquid_wallet_key.clone().unwrap(),
-                config.clone(),
+                config.hyperliquid_chain_id.unwrap(),
+                evm_pk,
             )
-            .expect("Failed to create EVM bridge"),
-        );
+            .await
+            .expect("Failed to initialize EVM client");
+
+            info!("EVM client initialized with address: {:?}", evm_client.from);
+            evm_bridge = evm_bridge.with_evm_client(evm_client);
+        }
+
+        let evm_bridge = Arc::new(evm_bridge);
 
         // 3. Create token definitions
         use crate::swappers::hyperliquid_types::HyperliquidToken;

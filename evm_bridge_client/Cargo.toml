@@ -1,0 +1,12 @@
+[package]
+name = "evm_bridge_client"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+alloy = { version = "1.1.0", features = ["providers", "provider-http", "signer-local", "contract", "sol-types", "network", "rpc-types"] }
+thiserror = "2.0"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }

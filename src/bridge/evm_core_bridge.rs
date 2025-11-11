@@ -358,13 +358,3 @@ impl EvmCoreBridge for HyperliquidEvmCoreBridge {
         ))
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn test_bridge_creation() {
-        // TODO: Add tests when implementation is complete
-    }
-}
