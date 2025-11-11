@@ -309,13 +309,13 @@ fn decimal_to_units(dec_str: &str, decimals: u8) -> Option<u128> {
 }
 
 
-/// Non-interactive withdraw flow.
-///
-/// Arguments (case-insensitive where noted):
-/// - `source`: "main" | "recovery"
-/// - `destination`: "main" | full Account text (e.g., "aaaaa-aa" or "aaaaa-aa:beef...")
-/// - `asset`: token symbol (e.g., "ckUSDT") | "all"
-/// - `amount`: decimal string (respects token decimals) | "all"
+// Non-interactive withdraw flow.
+//
+// Arguments (case-insensitive where noted):
+// - `source`: "main" | "recovery"
+// - `destination`: "main" | full Account text (e.g., "aaaaa-aa" or "aaaaa-aa:beef...")
+// - `asset`: token symbol (e.g., "ckUSDT") | "all"
+// - `amount`: decimal string (respects token decimals) | "all"
 pub async fn withdraw_noninteractive(
     source: &str,
     destination: &str,

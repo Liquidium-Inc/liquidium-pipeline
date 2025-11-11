@@ -28,7 +28,6 @@ pub fn ray_from(value: u128) -> Nat {
 }
 
 impl WadRayMath for Nat {
-   
     fn to_ray(&self) -> Self {
         self.clone() * RAY
     }
@@ -40,7 +39,7 @@ impl WadRayMath for Nat {
     fn from_ray(&self) -> Self {
         self.clone() / RAY
     }
-    
+
     fn from_wad(&self) -> Self {
         self.clone() / WAD
     }
@@ -71,14 +70,10 @@ impl WadRayMath for Nat {
     fn wad_to_ray(&self) -> Self {
         self.clone() * Nat::from(WAD_RAY_RATIO)
     }
-    
+
     fn ray_pow(&self, mut exp: u128) -> Self {
         // Compute self^exp in ray precision.
-        let mut z = if exp % 2 != 0 {
-            self.clone()
-        } else {
-            Nat::from(RAY)
-        };
+        let mut z = if exp % 2 != 0 { self.clone() } else { Nat::from(RAY) };
         let mut base = self.clone();
         exp /= 2;
         while exp != 0 {

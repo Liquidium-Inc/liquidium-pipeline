@@ -24,6 +24,20 @@ pub struct Config {
     pub export_path: String,
     pub buy_bad_debt: bool,
     pub db_path: String,
+
+    // Hyperliquid configuration
+    pub finalizer_type: String, // "kong" or "hyperliquid"
+    pub hyperliquid_rpc_url: Option<String>,
+    pub hyperliquid_core_api_url: Option<String>,
+    pub hyperliquid_wallet_key: Option<String>,
+    pub hyperliquid_dex_router: Option<String>,
+    pub hyperliquid_chain_id: Option<u64>,
+    // Token addresses on Hyperliquid EVM
+    pub hyperliquid_btc_address: Option<String>,
+    pub hyperliquid_usdc_address: Option<String>,
+    pub hyperliquid_usdt_address: Option<String>,
+    // Bridge contract addresses
+    pub hyperliquid_bridge_address: Option<String>,
 }
 
 #[cfg_attr(test, mockall::automock)]
@@ -35,6 +49,11 @@ pub trait ConfigTrait: Send + Sync {
     fn should_buy_bad_debt(&self) -> bool;
     fn get_lending_canister(&self) -> Principal;
     fn get_recovery_account(&self) -> Account;
+
+    // Hyperliquid configuration methods
+    fn get_hyperliquid_btc_address(&self) -> Option<String>;
+    fn get_hyperliquid_usdc_address(&self) -> Option<String>;
+    fn get_hyperliquid_usdt_address(&self) -> Option<String>;
 }
 
 impl ConfigTrait for Config {
@@ -67,6 +86,18 @@ impl ConfigTrait for Config {
 
     fn get_lending_canister(&self) -> Principal {
         self.lending_canister
+    }
+
+    fn get_hyperliquid_btc_address(&self) -> Option<String> {
+        self.hyperliquid_btc_address.clone()
+    }
+
+    fn get_hyperliquid_usdc_address(&self) -> Option<String> {
+        self.hyperliquid_usdc_address.clone()
+    }
+
+    fn get_hyperliquid_usdt_address(&self) -> Option<String> {
+        self.hyperliquid_usdt_address.clone()
     }
 }
 
@@ -117,6 +148,21 @@ impl Config {
 
         // The db path
         let db_path = env::var("DB_PATH").unwrap_or(format!("{}/wal.db", home));
+
+        // Hyperliquid configuration
+        let finalizer_type = env::var("FINALIZER_TYPE").unwrap_or("kong".to_string());
+        let hyperliquid_rpc_url = env::var("HYPERLIQUID_RPC_URL").ok();
+        let hyperliquid_core_api_url = env::var("HYPERLIQUID_CORE_API_URL").ok();
+        let hyperliquid_wallet_key = env::var("HYPERLIQUID_WALLET_KEY").ok();
+        let hyperliquid_dex_router = env::var("HYPERLIQUID_DEX_ROUTER").ok();
+        let hyperliquid_chain_id = env::var("HYPERLIQUID_CHAIN_ID")
+            .ok()
+            .and_then(|s| s.parse().ok());
+        let hyperliquid_btc_address = env::var("HYPERLIQUID_BTC_ADDRESS").ok();
+        let hyperliquid_usdc_address = env::var("HYPERLIQUID_USDC_ADDRESS").ok();
+        let hyperliquid_usdt_address = env::var("HYPERLIQUID_USDT_ADDRESS").ok();
+        let hyperliquid_bridge_address = env::var("HYPERLIQUID_BRIDGE_ADDRESS").ok();
+
         Ok(Arc::new(Config {
             debt_assets: debt,
             collateral_assets: coll,
@@ -129,6 +175,16 @@ impl Config {
             export_path,
             buy_bad_debt,
             db_path,
+            finalizer_type,
+            hyperliquid_rpc_url,
+            hyperliquid_core_api_url,
+            hyperliquid_wallet_key,
+            hyperliquid_dex_router,
+            hyperliquid_chain_id,
+            hyperliquid_btc_address,
+            hyperliquid_usdc_address,
+            hyperliquid_usdt_address,
+            hyperliquid_bridge_address,
         }))
     }
 }

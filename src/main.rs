@@ -16,6 +16,7 @@ mod types;
 mod utils;
 mod watchdog;
 use clap::{Parser, Subcommand};
+mod bridge;
 
 use commands::liquidation_loop::run_liquidation_loop;
 
@@ -29,30 +30,30 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Starts the liquidation bot loop
+    // Starts the liquidation bot loop
     Run,
 
-    /// Shows wallet token balances
+    // Shows wallet token balances
     Balance,
 
-    /// Withdraws funds. Without flags, starts the interactive wizard.
-    /// With flags, performs a non-interactive withdrawal.
+    // Withdraws funds. Without flags, starts the interactive wizard.
+    // With flags, performs a non-interactive withdrawal.
     Withdraw {
-        /// Source account: "main" or "recovery" (non-interactive)
+        // Source account: "main" or "recovery" (non-interactive)
         #[arg(long)]
         source: Option<String>,
-        /// Destination: "main" or full Account string (non-interactive)
+        // Destination: "main" or full Account string (non-interactive)
         #[arg(long)]
         destination: Option<String>,
-        /// Asset symbol (e.g., "ckUSDT") or "all" (non-interactive)
+        // Asset symbol (e.g., "ckUSDT") or "all" (non-interactive)
         #[arg(long)]
         asset: Option<String>,
-        /// Amount as decimal (respects token decimals) or "all" (non-interactive)
+        // Amount as decimal (respects token decimals) or "all" (non-interactive)
         #[arg(long)]
         amount: Option<String>,
     },
 
-    /// Account management commands
+    // Account management commands
     Account {
         #[command(subcommand)]
         subcommand: AccountCommands,
@@ -61,10 +62,10 @@ enum Commands {
 
 #[derive(Subcommand)]
 enum AccountCommands {
-    /// Shows the wallet principal
+    // Shows the wallet principal
     Show,
 
-    /// Generates a new identity or account key (implementation specific)
+    // Generates a new identity or account key (implementation specific)
     New,
 }
 

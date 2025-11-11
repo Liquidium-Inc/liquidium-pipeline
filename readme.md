@@ -93,10 +93,10 @@ flowchart LR
     C --> D[Reporting / Export]
 ```
 
-- Opportunity Discovery → Polls ICP canisters for loans or positions eligible for liquidation.
-- Liquidation Execution → Calls the canister to liquidate an at-risk position, seizing collateral.
-- Asset Swap → Swaps seized collateral for a desired asset.
-- Reporting / Export → Saves execution details to CSV or external systems.
+- Opportunity Discovery -> Polls ICP canisters for loans or positions eligible for liquidation.
+- Liquidation Execution -> Calls the canister to liquidate an at-risk position, seizing collateral.
+- Asset Swap -> Swaps seized collateral for a desired asset.
+- Reporting / Export -> Saves execution details to CSV or external systems.
 
 Stages are implemented with async-trait for composability.
 

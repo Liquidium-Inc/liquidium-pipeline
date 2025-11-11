@@ -8,24 +8,74 @@ use std::{sync::Arc, thread::sleep, time::Duration};
 
 use crate::{
     account::account::LiquidatorAccount,
+    bridge::{evm_bridge::HyperliquidEvmBridge, evm_core_bridge::HyperliquidEvmCoreBridge},
     commands::funds::sync_balances,
     config::{Config, ConfigTrait},
     executors::basic::basic_executor::BasicExecutor,
-    finalizers::kong_swap::kong_swap_finalizer::KongSwapFinalizer,
+    finalizers::{
+        hyperliquid::hyperliquid_finalizer_v2::HyperliquidFinalizerV2,
+        kong_swap::kong_swap_finalizer::KongSwapFinalizer,
+    },
     liquidation::collateral_service::CollateralService,
     persistance::sqlite::SqliteWalStore,
     price_oracle::price_oracle::LiquidationPriceOracle,
     stage::PipelineStage,
     stages::{
-        executor::ExecutionStatus, export::ExportStage, finalize::LiquidationOutcome, opportunity::OpportunityFinder,
+        bridge::{BridgeToHyperliquidStage, BridgeToIcStage},
+        executor::ExecutionStatus,
+        export::ExportStage,
+        finalize::LiquidationOutcome,
+        opportunity::OpportunityFinder,
         simple_strategy::IcrcLiquidationStrategy,
+        swap::HyperliquidSwapStage,
     },
-    swappers::kong_swap_swapper::KongSwapSwapper,
+    swappers::{
+        hyperliquid_swapper::HyperliquidSwapper,
+        hyperliquid_tokens::HyperliquidTokenFactory,
+        kong_swap_swapper::KongSwapSwapper,
+    },
     watchdog::{WatchdogEvent, webhook_watchdog_from_env},
 };
 use ic_agent::Agent;
 
-/// Prints the startup banner.
+// Enum to handle different finalizer pipelines
+enum FinalizerPipeline {
+    Kong(Arc<KongSwapFinalizer<SqliteWalStore, KongSwapSwapper<Agent>, LiquidatorAccount<Agent>, Config, Agent>>),
+    Hyperliquid {
+        bridge_to_hl:
+            Arc<BridgeToHyperliquidStage<HyperliquidEvmBridge<Agent, Config>, HyperliquidEvmCoreBridge, Config>>,
+        swap: Arc<HyperliquidSwapStage<HyperliquidSwapper, Config>>,
+        bridge_to_ic: Arc<BridgeToIcStage<HyperliquidEvmBridge<Agent, Config>, HyperliquidEvmCoreBridge, Config>>,
+        finalizer: Arc<HyperliquidFinalizerV2<SqliteWalStore, Config, Agent>>,
+    },
+}
+
+impl FinalizerPipeline {
+    async fn process(
+        &self,
+        receipts: &Vec<crate::stages::executor::ExecutionReceipt>,
+    ) -> Result<Vec<LiquidationOutcome>, String> {
+        match self {
+            FinalizerPipeline::Kong(finalizer) => finalizer.process(receipts).await,
+            FinalizerPipeline::Hyperliquid {
+                bridge_to_hl,
+                swap,
+                bridge_to_ic,
+                finalizer,
+            } => {
+                // Multi-stage pipeline: executor → bridge_to_hl → swap → bridge_to_ic → finalizer
+                log::info!("Processing through Hyperliquid multi-stage pipeline");
+
+                let bridge_receipts = bridge_to_hl.process(receipts).await?;
+                let swap_receipts = swap.process(&bridge_receipts).await?;
+                let ic_receipts = bridge_to_ic.process(&swap_receipts).await?;
+                finalizer.process(&ic_receipts).await
+            }
+        }
+    }
+}
+
+// Prints the startup banner.
 fn print_banner() {
     println!(
         r#"
@@ -55,7 +105,7 @@ async fn init(
     Arc<BasicExecutor<Agent>>,
     Arc<LiquidatorAccount<Agent>>,
     Arc<ExportStage>,
-    Arc<KongSwapFinalizer<SqliteWalStore, KongSwapSwapper<Agent>, LiquidatorAccount<Agent>, Config, Agent>>,
+    FinalizerPipeline,
 ) {
     let swap_agent = Arc::new(
         Agent::builder()
@@ -103,7 +153,123 @@ async fn init(
     let executor = Arc::new(executor);
 
     let db = Arc::new(SqliteWalStore::new(&config.db_path).expect("could not connect to db"));
-    let finalizer = KongSwapFinalizer::new(db, swapper.clone(), trader_account, config.clone(), agent.clone());
+
+    // Select finalizer pipeline based on config.finalizer_type
+    let finalizer_pipeline = if config.finalizer_type == "hyperliquid" {
+        info!("Initializing Hyperliquid multi-stage pipeline...");
+
+        // 1. Create EVM to Core bridge
+        let evm_core_bridge = Arc::new(
+            HyperliquidEvmCoreBridge::new(
+                config.hyperliquid_rpc_url.clone().expect("Missing HYPERLIQUID_RPC_URL"),
+                config
+                    .hyperliquid_core_api_url
+                    .clone()
+                    .expect("Missing HYPERLIQUID_CORE_API_URL"),
+                config
+                    .hyperliquid_wallet_key
+                    .clone()
+                    .expect("Missing HYPERLIQUID_WALLET_KEY"),
+                config
+                    .hyperliquid_bridge_address
+                    .clone()
+                    .expect("Missing HYPERLIQUID_BRIDGE_ADDRESS")
+                    .parse()
+                    .expect("Invalid HYPERLIQUID_BRIDGE_ADDRESS"),
+                config.hyperliquid_chain_id.expect("Missing HYPERLIQUID_CHAIN_ID"),
+            )
+            .expect("Failed to create EVM-Core bridge"),
+        );
+
+        // 2. Create IC to EVM bridge
+        let evm_bridge = Arc::new(
+            HyperliquidEvmBridge::new(
+                agent.clone(),
+                config.hyperliquid_rpc_url.clone().unwrap(),
+                config.hyperliquid_wallet_key.clone().unwrap(),
+                config.clone(),
+            )
+            .expect("Failed to create EVM bridge"),
+        );
+
+        // 3. Create token definitions
+        use crate::swappers::hyperliquid_types::HyperliquidToken;
+        let btc_token = HyperliquidToken::new(
+            "BTC".to_string(),
+            config
+                .get_hyperliquid_btc_address()
+                .expect("Missing HYPERLIQUID_BTC_ADDRESS")
+                .parse()
+                .expect("Invalid BTC address"),
+            8,
+        );
+
+        let usdc_token = HyperliquidToken::new(
+            "USDC".to_string(),
+            config
+                .get_hyperliquid_usdc_address()
+                .expect("Missing HYPERLIQUID_USDC_ADDRESS")
+                .parse()
+                .expect("Invalid USDC address"),
+            6,
+        );
+
+        let usdt_token = HyperliquidToken::new(
+            "USDT".to_string(),
+            config
+                .get_hyperliquid_usdt_address()
+                .expect("Missing HYPERLIQUID_USDT_ADDRESS")
+                .parse()
+                .expect("Invalid USDT address"),
+            6,
+        );
+
+        // 4. Create Hyperliquid swapper
+        let hl_swapper = Arc::new(
+            HyperliquidSwapper::new(
+                config.hyperliquid_rpc_url.clone().unwrap(),
+                config.hyperliquid_wallet_key.clone().unwrap(),
+                btc_token,
+                usdc_token,
+                usdt_token,
+                config.hyperliquid_dex_router.clone().unwrap().parse().unwrap(),
+                config.hyperliquid_chain_id.unwrap(),
+            )
+            .expect("Failed to create Hyperliquid swapper"),
+        );
+
+        // 5. Create pipeline stages
+        let bridge_to_hl = Arc::new(BridgeToHyperliquidStage::new(
+            evm_bridge.clone(),
+            evm_core_bridge.clone(),
+            config.clone(),
+        ));
+
+        let swap_stage = Arc::new(HyperliquidSwapStage::new(hl_swapper, config.clone()));
+
+        let bridge_to_ic = Arc::new(BridgeToIcStage::new(evm_bridge, evm_core_bridge, config.clone()));
+
+        let hl_finalizer = Arc::new(HyperliquidFinalizerV2::new(db, config.clone(), agent.clone()));
+
+        info!("Hyperliquid pipeline initialized");
+
+        FinalizerPipeline::Hyperliquid {
+            bridge_to_hl,
+            swap: swap_stage,
+            bridge_to_ic,
+            finalizer: hl_finalizer,
+        }
+    } else {
+        info!("Initializing Kong Swap finalizer...");
+        let finalizer = Arc::new(KongSwapFinalizer::new(
+            db,
+            swapper.clone(),
+            trader_account,
+            config.clone(),
+            agent.clone(),
+        ));
+        FinalizerPipeline::Kong(finalizer)
+    };
 
     info!("Initializing searcher stage ...");
     let finder = OpportunityFinder::new(agent.clone(), config.lending_canister);
@@ -134,7 +300,7 @@ async fn init(
         executor,
         icrc_account_service,
         exporter,
-        finalizer.into(),
+        finalizer_pipeline,
     )
 }
 

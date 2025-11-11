@@ -14,3 +14,4 @@ pub mod types;
 pub mod watchdog;
 pub mod finalizers;
 pub mod swappers;
+pub mod bridge;
