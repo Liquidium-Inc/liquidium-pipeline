@@ -50,6 +50,8 @@ diesel = { version = "2", features = [
 ] }
 r2d2 = "0.8.10"
 dialoguer = "0.12.0"
+ccxt = { git = "https://github.com/kizzx2/ccxt-rs-lib" }
+
 
 
 [dev-dependencies]

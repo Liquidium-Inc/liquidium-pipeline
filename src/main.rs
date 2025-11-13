@@ -16,6 +16,7 @@ mod types;
 mod utils;
 mod watchdog;
 use clap::{Parser, Subcommand};
+mod connectors;
 
 use commands::liquidation_loop::run_liquidation_loop;
 
@@ -80,11 +81,21 @@ async fn main() {
         Commands::Balance => {
             commands::funds::funds().await;
         }
-        Commands::Withdraw { source, destination, asset, amount } => {
+        Commands::Withdraw {
+            source,
+            destination,
+            asset,
+            amount,
+        } => {
             let has_any = source.is_some() || destination.is_some() || asset.is_some() || amount.is_some();
             if has_any {
                 // Validate that all required args are present
-                match (source.as_deref(), destination.as_deref(), asset.as_deref(), amount.as_deref()) {
+                match (
+                    source.as_deref(),
+                    destination.as_deref(),
+                    asset.as_deref(),
+                    amount.as_deref(),
+                ) {
                     (Some(s), Some(d), Some(a), Some(am)) => {
                         commands::withdraw::withdraw_noninteractive(s, d, a, am).await;
                     }

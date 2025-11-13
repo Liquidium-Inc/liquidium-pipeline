@@ -15,7 +15,7 @@ use crate::{
     icrc_token::{icrc_token::IcrcToken, icrc_token_amount::IcrcTokenAmount},
     pipeline_agent::PipelineAgent,
     swappers::{
-        kong_types::{SwapAmountsReply, SwapArgs, SwapReply, SwapResult},
+        kong::kong_types::{SwapAmountsReply, SwapArgs, SwapReply, SwapResult},
         swap_interface::IcrcSwapInterface,
     },
 };

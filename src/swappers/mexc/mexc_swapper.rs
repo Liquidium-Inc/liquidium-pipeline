@@ -1,0 +1,172 @@
+use std::sync::Arc;
+
+use async_trait::async_trait;
+use candid::Nat;
+use log::{debug, info};
+
+use crate::connectors::ccxt_client::CcxtClient;
+use crate::swappers::model::{
+    AssetId,
+    SwapExecution,
+    SwapQuote,
+    SwapQuoteLeg,
+    SwapRequest,
+    TransferRecord,
+    TxRef,
+};
+use crate::swappers::router::SwapVenue;
+
+fn nat_to_f64(n: &Nat) -> Result<f64, String> {
+    let u = n
+        .0
+        .to_u128()
+        .ok_or_else(|| format!("Nat too large for f64: {}", n))?;
+    Ok(u as f64)
+}
+
+fn f64_to_nat(v: f64) -> Nat {
+    Nat::from(v as u128)
+}
+
+fn market_symbol(token_in: &AssetId, token_out: &AssetId) -> String {
+    // You will probably want a proper mapping later;
+    // for now assume "<IN>/<OUT>" is the MEXC market.
+    format!("{}/{}", token_in.symbol, token_out.symbol)
+}
+
+pub struct MexcSwapVenue<C: CcxtClient> {
+    pub client: Arc<C>,
+}
+
+impl<C: CcxtClient> MexcSwapVenue<C> {
+    pub fn new(client: Arc<C>) -> Self {
+        Self { client }
+    }
+}
+
+#[async_trait]
+impl<C: CcxtClient> SwapVenue for MexcSwapVenue<C> {
+    fn venue_name(&self) -> &'static str {
+        "mexc"
+    }
+
+    async fn quote(&self, req: &SwapRequest) -> Result<SwapQuote, String> {
+        let market = market_symbol(&req.pay_asset, &req.receive_asset);
+        let amount_in_f = nat_to_f64(&req.pay_amount)?;
+
+        info!(
+            "MEXC quote {} {} -> {} on {}",
+            req.pay_amount, req.pay_asset.symbol, req.receive_asset.symbol, market
+        );
+
+        let out_f = self.client.get_quote(&market, amount_in_f).await?;
+        debug!("MEXC quote result: in={} out={}", amount_in_f, out_f);
+
+        let leg = SwapQuoteLeg {
+            venue: "mexc".to_string(),
+            route_id: market.clone(),
+
+            pay_chain: req.pay_asset.chain.clone(),
+            pay_symbol: req.pay_asset.symbol.clone(),
+            pay_amount: req.pay_amount.clone(),
+
+            receive_chain: req.receive_asset.chain.clone(),
+            receive_symbol: req.receive_asset.symbol.clone(),
+            receive_amount: f64_to_nat(out_f),
+
+            price: if amount_in_f > 0.0 { out_f / amount_in_f } else { 0.0 },
+            lp_fee: Nat::from(0u8),
+            gas_fee: Nat::from(0u8),
+        };
+
+        Ok(SwapQuote {
+            pay_asset: req.pay_asset.clone(),
+            pay_amount: req.pay_amount.clone(),
+            receive_asset: req.receive_asset.clone(),
+            receive_amount: leg.receive_amount.clone(),
+            mid_price: leg.price,
+            exec_price: leg.price,
+            slippage: 0.0, // you can compute from orderbook later
+            legs: vec![leg],
+        })
+    }
+
+    async fn execute(&self, req: &SwapRequest) -> Result<SwapExecution, String> {
+        let market = market_symbol(&req.pay_asset, &req.receive_asset);
+        let amount_in_f = nat_to_f64(&req.pay_amount)?;
+        let side = "sell"; // assuming pay_asset is the base
+
+        info!(
+            "MEXC swap {} {} -> {} on {}",
+            req.pay_amount, req.pay_asset.symbol, req.receive_asset.symbol, market
+        );
+
+        let out_f = self
+            .client
+            .execute_swap(&market, side, amount_in_f, None)
+            .await?;
+
+        let price = if amount_in_f > 0.0 { out_f / amount_in_f } else { 0.0 };
+
+        let leg = SwapQuoteLeg {
+            venue: "mexc".to_string(),
+            route_id: market.clone(),
+
+            pay_chain: req.pay_asset.chain.clone(),
+            pay_symbol: req.pay_asset.symbol.clone(),
+            pay_amount: req.pay_amount.clone(),
+
+            receive_chain: req.receive_asset.chain.clone(),
+            receive_symbol: req.receive_asset.symbol.clone(),
+            receive_amount: f64_to_nat(out_f),
+
+            price,
+            lp_fee: Nat::from(0u8),
+            gas_fee: Nat::from(0u8),
+        };
+
+        let transfers: Vec<TransferRecord> = vec![
+            TransferRecord {
+                asset: req.pay_asset.clone(),
+                is_send: true,
+                amount: req.pay_amount.clone(),
+                tx_ref: req
+                    .pay_tx_ref
+                    .clone()
+                    .unwrap_or(TxRef::TxHash {
+                        chain: req.pay_asset.chain.clone(),
+                        hash: "mexc-trade".to_string(),
+                    }),
+            },
+            TransferRecord {
+                asset: req.receive_asset.clone(),
+                is_send: false,
+                amount: leg.receive_amount.clone(),
+                tx_ref: TxRef::TxHash {
+                    chain: req.receive_asset.chain.clone(),
+                    hash: "mexc-trade".to_string(),
+                },
+            },
+        ];
+
+        Ok(SwapExecution {
+            swap_id: 0,         // you can fill from WAL or an internal sequence later
+            request_id: 0,      // same
+            status: "filled".to_string(),
+
+            pay_asset: req.pay_asset.clone(),
+            pay_amount: req.pay_amount.clone(),
+            receive_asset: req.receive_asset.clone(),
+            receive_amount: leg.receive_amount.clone(),
+
+            mid_price: price,
+            exec_price: price,
+            slippage: 0.0,
+
+            legs: vec![leg],
+            transfers,
+            claim_ids: vec![],
+            ts: 0, // populate from clock if needed
+        })
+    }
+}
