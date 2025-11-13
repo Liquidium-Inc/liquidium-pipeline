@@ -1,3 +1,4 @@
+use alloy::primitives::Address;
 use candid::Principal;
 use ic_agent::{Agent, Identity};
 use icrc_ledger_types::icrc1::account::Account;
@@ -9,6 +10,8 @@ use std::env;
 use std::sync::Arc;
 
 use crate::account::account::RECOVERY_ACCOUNT;
+use crate::bridge::minter_client::fetch_minter_info;
+use crate::bridge::types::MinterInfo;
 use crate::icrc_token::icrc_token::IcrcToken;
 use crate::utils::create_identity_from_pem_file;
 
@@ -32,12 +35,10 @@ pub struct Config {
     pub hyperliquid_wallet_key: Option<String>,
     pub hyperliquid_dex_router: Option<String>,
     pub hyperliquid_chain_id: Option<u64>,
-    // Token addresses on Hyperliquid EVM
-    pub hyperliquid_btc_address: Option<String>,
-    pub hyperliquid_usdc_address: Option<String>,
-    pub hyperliquid_usdt_address: Option<String>,
-    // Bridge contract addresses
-    pub hyperliquid_bridge_address: Option<String>,
+    // Minter canister for fetching ERC20 addresses dynamically
+    pub hyperliquid_minter_canister: Option<Principal>,
+    // Cached minter info with token address mappings
+    pub minter_info: Option<Arc<MinterInfo>>,
 }
 
 #[cfg_attr(test, mockall::automock)]
@@ -51,10 +52,11 @@ pub trait ConfigTrait: Send + Sync {
     fn get_recovery_account(&self) -> Account;
 
     // Hyperliquid configuration methods
-    fn get_hyperliquid_bridge_address(&self) -> Option<String>;
-    fn get_hyperliquid_btc_address(&self) -> Option<String>;
-    fn get_hyperliquid_usdc_address(&self) -> Option<String>;
-    fn get_hyperliquid_usdt_address(&self) -> Option<String>;
+    fn get_hyperliquid_bridge_address(&self) -> Result<Address, String>;
+    fn get_hyperliquid_minter_principal(&self) -> Result<Principal, String>;
+    fn get_erc20_address_by_ledger(&self, ledger_id: &Principal) -> Result<Address, String>;
+    fn get_symbol_by_erc20_address(&self, address: &Address) -> Result<String, String>;
+    fn get_erc20_address_by_symbol(&self, symbol: &str) -> Result<Address, String>;
     fn get_hyperliquid_wallet_key(&self) -> Option<String>;
     fn get_hyperliquid_rpc_url(&self) -> Option<String>;
     fn get_hyperliquid_core_api_url(&self) -> Option<String>;
@@ -93,20 +95,45 @@ impl ConfigTrait for Config {
         self.lending_canister
     }
 
-    fn get_hyperliquid_bridge_address(&self) -> Option<String> {
-        self.hyperliquid_bridge_address.clone()
+    fn get_hyperliquid_bridge_address(&self) -> Result<Address, String> {
+        self.minter_info
+            .as_ref()
+            .ok_or_else(|| "Minter info not loaded".to_string())
+            .map(|info| info.bridge_address)
     }
 
-    fn get_hyperliquid_btc_address(&self) -> Option<String> {
-        self.hyperliquid_btc_address.clone()
+    fn get_hyperliquid_minter_principal(&self) -> Result<Principal, String> {
+        self.hyperliquid_minter_canister
+            .ok_or_else(|| "Hyperliquid minter canister not configured".to_string())
     }
 
-    fn get_hyperliquid_usdc_address(&self) -> Option<String> {
-        self.hyperliquid_usdc_address.clone()
+    fn get_erc20_address_by_ledger(&self, ledger_id: &Principal) -> Result<Address, String> {
+        self.minter_info
+            .as_ref()
+            .ok_or_else(|| "Minter info not loaded".to_string())?
+            .get_erc20_address(ledger_id)
+            .ok_or_else(|| format!("No ERC20 address found for ledger {}", ledger_id))
     }
 
-    fn get_hyperliquid_usdt_address(&self) -> Option<String> {
-        self.hyperliquid_usdt_address.clone()
+    fn get_symbol_by_erc20_address(&self, address: &Address) -> Result<String, String> {
+        self.minter_info
+            .as_ref()
+            .ok_or_else(|| "Minter info not loaded".to_string())?
+            .get_symbol_by_address(address)
+            .ok_or_else(|| format!("No symbol found for ERC20 address {:?}", address))
+    }
+
+    fn get_erc20_address_by_symbol(&self, symbol: &str) -> Result<Address, String> {
+        let minter_info = self.minter_info
+            .as_ref()
+            .ok_or_else(|| "Minter info not loaded".to_string())?;
+
+        // Find address by matching symbol (Core symbol like "USDT")
+        minter_info.address_to_symbol
+            .iter()
+            .find(|(_, sym)| sym.as_str() == symbol)
+            .map(|(addr, _)| *addr)
+            .ok_or_else(|| format!("No ERC20 address found for symbol '{}'", symbol))
     }
 
     fn get_hyperliquid_wallet_key(&self) -> Option<String> {
@@ -122,7 +149,7 @@ impl ConfigTrait for Config {
     }
 
     fn get_hyperliquid_chain_id(&self) -> Option<u64> {
-        self.hyperliquid_chain_id.clone()
+        self.hyperliquid_chain_id
     }
 }
 
@@ -181,10 +208,38 @@ impl Config {
         let hyperliquid_wallet_key = env::var("HYPERLIQUID_WALLET_KEY").ok();
         let hyperliquid_dex_router = env::var("HYPERLIQUID_DEX_ROUTER").ok();
         let hyperliquid_chain_id = env::var("HYPERLIQUID_CHAIN_ID").ok().and_then(|s| s.parse().ok());
-        let hyperliquid_btc_address = env::var("HYPERLIQUID_BTC_ADDRESS").ok();
-        let hyperliquid_usdc_address = env::var("HYPERLIQUID_USDC_ADDRESS").ok();
-        let hyperliquid_usdt_address = env::var("HYPERLIQUID_USDT_ADDRESS").ok();
-        let hyperliquid_bridge_address = env::var("HYPERLIQUID_BRIDGE_ADDRESS").ok();
+
+        // Get minter canister for Hyperliquid integration
+        let hyperliquid_minter_canister = env::var("HYPERLIQUID_MINTER_CANISTER")
+            .ok()
+            .and_then(|s| Principal::from_text(s).ok());
+
+        // Fetch minter info if minter canister is configured
+        let minter_info = if let Some(minter_canister) = hyperliquid_minter_canister {
+            log::info!("Fetching minter info from canister: {}", minter_canister);
+            let agent = Agent::builder()
+                .with_url(ic_url.clone())
+                .with_max_tcp_error_retries(3)
+                .build()
+                .expect("Failed to initialize agent for minter query");
+
+            match fetch_minter_info(&agent, minter_canister).await {
+                Ok(info) => {
+                    log::info!(
+                        "Successfully loaded minter info with {} tokens",
+                        info.token_addresses.len()
+                    );
+                    Some(Arc::new(info))
+                }
+                Err(e) => {
+                    log::error!("Failed to fetch minter info: {}", e);
+                    return Err(format!("Failed to fetch minter info: {}", e));
+                }
+            }
+        } else {
+            log::warn!("HYPERLIQUID_MINTER_CANISTER not configured, minter info not loaded");
+            None
+        };
 
         Ok(Arc::new(Config {
             debt_assets: debt,
@@ -204,10 +259,8 @@ impl Config {
             hyperliquid_wallet_key,
             hyperliquid_dex_router,
             hyperliquid_chain_id,
-            hyperliquid_btc_address,
-            hyperliquid_usdc_address,
-            hyperliquid_usdt_address,
-            hyperliquid_bridge_address,
+            hyperliquid_minter_canister,
+            minter_info,
         }))
     }
 }

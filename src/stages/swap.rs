@@ -58,37 +58,41 @@ where
         // Build swap arguments
         let deadline = chrono::Utc::now().timestamp() as u64 + 300; // 5 minutes
 
+        // Get token addresses from minter info
+        let collateral_address = self
+            .config
+            .get_erc20_address_by_ledger(&bridge_receipt.original_request.collateral_asset.ledger)
+            .map_err(|e| format!("[{}] {}", tx_id, e))?;
+
+        // TODO: USDC intermediate token should be configurable or discovered dynamically
+        // For now, we need to add a way to specify the intermediate token ledger ID
+        // Placeholder - this will fail until HYPERLIQUID_USDC_LEDGER is added to config
+        let usdc_ledger = std::env::var("HYPERLIQUID_USDC_LEDGER")
+            .ok()
+            .and_then(|s| candid::Principal::from_text(s).ok())
+            .ok_or(format!("[{}] HYPERLIQUID_USDC_LEDGER not configured", tx_id))?;
+
+        let usdc_address = self
+            .config
+            .get_erc20_address_by_ledger(&usdc_ledger)
+            .map_err(|e| format!("[{}] {}", tx_id, e))?;
+
         let first_leg = SwapLeg {
-            token_in: self
-                .config
-                .get_hyperliquid_btc_address()
-                .ok_or("Missing HYPERLIQUID_BTC_ADDRESS")?
-                .parse()
-                .map_err(|e| format!("Invalid BTC address: {}", e))?,
-            token_out: self
-                .config
-                .get_hyperliquid_usdc_address()
-                .ok_or("Missing HYPERLIQUID_USDC_ADDRESS")?
-                .parse()
-                .map_err(|e| format!("Invalid USDC address: {}", e))?,
+            token_in: collateral_address,
+            token_out: usdc_address,
             amount_in: quote.first_leg.amount_in,
             min_amount_out: quote.first_leg.amount_out * U256::from(99) / U256::from(100), // 1% slippage
             pool_id: None,
         };
 
+        let debt_address = self
+            .config
+            .get_erc20_address_by_ledger(&bridge_receipt.original_request.debt_asset.ledger)
+            .map_err(|e| format!("[{}] {}", tx_id, e))?;
+
         let second_leg = SwapLeg {
-            token_in: self
-                .config
-                .get_hyperliquid_usdc_address()
-                .ok_or("Missing HYPERLIQUID_USDC_ADDRESS")?
-                .parse()
-                .map_err(|e| format!("Invalid USDC address: {}", e))?,
-            token_out: self
-                .config
-                .get_hyperliquid_usdt_address()
-                .ok_or("Missing HYPERLIQUID_USDT_ADDRESS")?
-                .parse()
-                .map_err(|e| format!("Invalid USDT address: {}", e))?,
+            token_in: usdc_address,
+            token_out: debt_address,
             amount_in: quote.second_leg.amount_in,
             min_amount_out: quote.second_leg.amount_out * U256::from(99) / U256::from(100), // 1% slippage
             pool_id: None,
@@ -121,10 +125,7 @@ where
         Ok(SwapReceipt {
             bridge_receipt: bridge_receipt.clone(),
             swap_result,
-            final_token_address: self
-                .config
-                .get_hyperliquid_usdt_address()
-                .ok_or("Missing HYPERLIQUID_USDT_ADDRESS")?,
+            final_token_address: format!("{:?}", debt_address),
             final_amount,
             status: SwapStatus::Success,
         })

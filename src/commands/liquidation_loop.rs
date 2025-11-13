@@ -225,20 +225,20 @@ pub async fn run_liquidation_loop() {
         }
 
         spinner.finish_and_clear();
-        // info!("Found {} opportunities", opportunities.len());
+        info!("Found {} opportunities", opportunities.len());
 
-        // let executions = strategy.process(&opportunities).await.unwrap_or_else(|e| {
-        //     log::error!("Strategy processing failed: {e}");
-        //     vec![]
-        // });
+        let executions = strategy.process(&opportunities).await.unwrap_or_else(|e| {
+            log::error!("Strategy processing failed: {e}");
+            vec![]
+        });
 
-        // let receipts = executor.process(&executions).await.unwrap_or_else(|e| {
-        //     log::error!("Executor failed: {e}");
-        //     vec![]
-        // });
+        let receipts = executor.process(&executions).await.unwrap_or_else(|e| {
+            log::error!("Executor failed: {e}");
+            vec![]
+        });
 
         let outcomes = finalizer.process(&receipts).await.unwrap_or_else(|e| {
-            log::error!("Executor failed: {e}");
+            log::error!("Finalizer failed: {e}");
             vec![]
         });
 

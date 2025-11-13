@@ -156,7 +156,7 @@ where
                 token: receipt.request.collateral_asset.clone(),
                 value: liquidation_result.amounts.collateral_received.clone(),
             },
-            destination_address: todo!()
+            destination_address: self.evm_core_bridge.get_wallet_address(),
         };
 
         let burn_receipt = self
@@ -177,17 +177,15 @@ where
         // Step 2: Transfer BTC from Hyperliquid EVM -> Core
         log::info!("[{}] Step 2: Transferring BTC from EVM to Core", tx_id);
 
-        // TODO @Bogdan : Get evm address from collateral asset
-        let btc_address = self
+        // Get ERC20 address for collateral asset from minter info
+        let collateral_erc20_address = self
             .config
-            .get_hyperliquid_btc_address()
-            .ok_or("Missing HYPERLIQUID_BTC_ADDRESS")?
-            .parse()
-            .map_err(|e| format!("Invalid BTC address: {}", e))?;
+            .get_erc20_address_by_ledger(&receipt.request.collateral_asset.ledger)
+            .map_err(|e| format!("[{}] {}", tx_id, e))?;
 
         let core_deposit = self
             .evm_core_bridge
-            .deposit_evm_to_core(btc_address, burn_receipt.received_amount)
+            .deposit_evm_to_core(collateral_erc20_address, burn_receipt.received_amount)
             .await
             .map_err(|e| format!("[{}] EVM to Core transfer failed: {}", tx_id, e))?;
 
@@ -207,10 +205,7 @@ where
             evm_to_core_tx: core_deposit.evm_tx_hash,
             core_receive_tx: core_deposit.core_tx_id,
             core_amount: core_deposit.core_amount.to::<u128>(),
-            core_token_address: self
-                .config
-                .get_hyperliquid_btc_address()
-                .ok_or("Missing HYPERLIQUID_BTC_ADDRESS")?,
+            core_token_address: format!("{:?}", collateral_erc20_address),
             status: BridgeStatus::Success,
         })
     }
@@ -321,15 +316,14 @@ where
         // Step 2: Wrap USDT on EVM and mint ckUSDT on IC
         log::info!("[{}] Step 2: Wrapping USDT on EVM and minting ckUSDT on IC", tx_id);
 
-        let usdt_address = self
+        // Get ERC20 address for debt asset (USDT) from minter info
+        let debt_erc20_address = self
             .config
-            .get_hyperliquid_usdt_address()
-            .ok_or("Missing HYPERLIQUID_USDT_ADDRESS")?
-            .parse()
-            .map_err(|e| format!("Invalid USDT address: {}", e))?;
+            .get_erc20_address_by_ledger(&swap_receipt.bridge_receipt.original_request.debt_asset.ledger)
+            .map_err(|e| format!("[{}] {}", tx_id, e))?;
 
         let mint_request = MintRequest {
-            native_token_address: usdt_address,
+            native_token_address: debt_erc20_address,
             amount: core_withdraw.evm_amount.to::<u128>(),
             ck_token: swap_receipt.bridge_receipt.original_request.debt_asset.clone(),
             destination_principal: self.config.get_trader_principal(),

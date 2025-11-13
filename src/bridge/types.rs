@@ -136,3 +136,209 @@ impl std::fmt::Display for BridgeError {
 }
 
 impl std::error::Error for BridgeError {}
+
+// Minter canister types for fetching ERC20 addresses dynamically
+
+// Supported ckERC20 token information from minter
+#[derive(Debug, Clone, candid::CandidType, candid::Deserialize, serde::Serialize)]
+pub struct SupportedCkErc20Token {
+    pub erc20_contract_address: String,
+    pub ledger_canister_id: candid::Principal,
+    pub ckerc20_token_symbol: String,
+}
+
+// Gas fee estimate from minter
+#[derive(Debug, Clone, candid::CandidType, candid::Deserialize, serde::Serialize)]
+pub struct GasFeeEstimate {
+    pub max_priority_fee_per_gas: candid::Nat,
+    pub max_fee_per_gas: candid::Nat,
+    pub timestamp: u64,
+}
+
+// ERC20 balance information
+#[derive(Debug, Clone, candid::CandidType, candid::Deserialize, serde::Serialize)]
+pub struct Erc20Balance {
+    pub balance: candid::Nat,
+    pub erc20_contract_address: String,
+}
+
+// Ethereum block height variant
+#[derive(Debug, Clone, candid::CandidType, candid::Deserialize, serde::Serialize)]
+pub enum EthereumBlockHeight {
+    Safe,
+    Finalized,
+    Latest,
+}
+
+// Complete minter info response
+#[derive(Debug, Clone, candid::CandidType, candid::Deserialize, serde::Serialize)]
+pub struct MinterInfoResponse {
+    pub deposit_with_subaccount_helper_contract_address: Option<String>,
+    pub eth_balance: Option<candid::Nat>,
+    pub eth_helper_contract_address: Option<String>,
+    pub last_observed_block_number: Option<candid::Nat>,
+    pub evm_rpc_id: Option<candid::Principal>,
+    pub erc20_helper_contract_address: Option<String>,
+    pub last_erc20_scraped_block_number: Option<candid::Nat>,
+    pub supported_ckerc20_tokens: Option<Vec<SupportedCkErc20Token>>,
+    pub last_gas_fee_estimate: Option<GasFeeEstimate>,
+    pub cketh_ledger_id: Option<candid::Principal>,
+    pub smart_contract_address: Option<String>,
+    pub last_eth_scraped_block_number: Option<candid::Nat>,
+    pub minimum_withdrawal_amount: Option<candid::Nat>,
+    pub erc20_balances: Option<Vec<Erc20Balance>>,
+    pub minter_address: Option<String>,
+    pub last_deposit_with_subaccount_scraped_block_number: Option<candid::Nat>,
+    pub ethereum_block_height: Option<EthereumBlockHeight>,
+}
+
+// Processed minter info with parsed addresses for fast lookup
+#[derive(Debug, Clone)]
+pub struct MinterInfo {
+    // Raw response from minter
+    pub raw: MinterInfoResponse,
+    // Map of ledger canister ID to ERC20 contract address for O(1) lookup
+    pub token_addresses: std::collections::HashMap<candid::Principal, Address>,
+    // Reverse map: ERC20 contract address to token symbol for O(1) lookup
+    pub address_to_symbol: std::collections::HashMap<Address, String>,
+    // Bridge contract address (smart_contract_address from minter)
+    pub bridge_address: Address,
+}
+
+impl MinterInfo {
+    // Create MinterInfo from raw response, parsing addresses
+    pub fn from_response(response: MinterInfoResponse) -> Result<Self, BridgeError> {
+        let mut token_addresses = std::collections::HashMap::new();
+        let mut address_to_symbol = std::collections::HashMap::new();
+
+        // Parse supported tokens and build both forward and reverse mappings
+        if let Some(tokens) = &response.supported_ckerc20_tokens {
+            for token in tokens {
+                let address: Address = token
+                    .erc20_contract_address
+                    .parse()
+                    .map_err(|_| {
+                        BridgeError::ConfigError(format!(
+                            "Invalid ERC20 address for {}: {}",
+                            token.ckerc20_token_symbol, token.erc20_contract_address
+                        ))
+                    })?;
+
+                // Forward mapping: ledger ID -> ERC20 address
+                token_addresses.insert(token.ledger_canister_id, address);
+
+                // Reverse mapping: ERC20 address -> token symbol
+                // Strip "ck" prefix to get Hyperliquid Core token symbol
+                let core_symbol = token.ckerc20_token_symbol.strip_prefix("ck")
+                    .unwrap_or(&token.ckerc20_token_symbol)
+                    .to_string();
+                address_to_symbol.insert(address, core_symbol);
+            }
+        }
+
+        // Parse bridge address
+        let bridge_address = response
+            .smart_contract_address
+            .as_ref()
+            .ok_or_else(|| BridgeError::ConfigError("Missing smart_contract_address in minter info".to_string()))?
+            .parse()
+            .map_err(|_| {
+                BridgeError::ConfigError(format!(
+                    "Invalid smart_contract_address: {}",
+                    response.smart_contract_address.as_ref().unwrap()
+                ))
+            })?;
+
+        Ok(Self {
+            raw: response,
+            token_addresses,
+            address_to_symbol,
+            bridge_address,
+        })
+    }
+
+    // Get ERC20 address for a given ledger canister ID
+    pub fn get_erc20_address(&self, ledger_id: &candid::Principal) -> Option<Address> {
+        self.token_addresses.get(ledger_id).copied()
+    }
+
+    // Get token symbol for a ledger canister ID
+    pub fn get_token_symbol(&self, ledger_id: &candid::Principal) -> Option<String> {
+        self.raw
+            .supported_ckerc20_tokens
+            .as_ref()?
+            .iter()
+            .find(|t| t.ledger_canister_id == *ledger_id)
+            .map(|t| t.ckerc20_token_symbol.clone())
+    }
+
+    // Get Core token symbol from ERC20 address (reverse lookup)
+    pub fn get_symbol_by_address(&self, address: &Address) -> Option<String> {
+        self.address_to_symbol.get(address).cloned()
+    }
+}
+
+// Minter withdrawal types
+
+// Argument for getting EIP-1559 transaction price estimate
+#[derive(Debug, Clone, candid::CandidType, candid::Deserialize, serde::Serialize)]
+pub struct Eip1559TransactionPriceArg {
+    pub ckerc20_ledger_id: candid::Principal,
+}
+
+// EIP-1559 transaction price response
+#[derive(Debug, Clone, candid::CandidType, candid::Deserialize, serde::Serialize)]
+pub struct Eip1559TransactionPrice {
+    pub max_fee_per_gas: candid::Nat,
+    pub max_priority_fee_per_gas: candid::Nat,
+    pub max_transaction_fee: candid::Nat,
+    pub timestamp: Option<u64>,
+}
+
+// Subaccount type for IC
+pub type Subaccount = [u8; 32];
+
+// Argument for withdrawing ERC20 tokens (burn)
+#[derive(Debug, Clone, candid::CandidType, candid::Deserialize, serde::Serialize)]
+pub struct WithdrawErc20Arg {
+    pub amount: candid::Nat,
+    pub ckerc20_ledger_id: candid::Principal,
+    pub recipient: String,
+    pub from_ckerc20_subaccount: Option<Subaccount>,
+    pub from_cketh_subaccount: Option<Subaccount>,
+}
+
+// Successful withdrawal response
+#[derive(Debug, Clone, candid::CandidType, candid::Deserialize, serde::Serialize)]
+pub struct WithdrawErc20Success {
+    pub cketh_block_index: candid::Nat,
+    pub ckerc20_block_index: candid::Nat,
+    pub tx_hash: String,
+}
+
+// Withdrawal error
+#[derive(Debug, Clone, candid::CandidType, candid::Deserialize, serde::Serialize)]
+pub enum WithdrawErc20Error {
+    TokenNotSupported { supported_tokens: Vec<SupportedCkErc20Token> },
+    CkEthLedgerError { error: String },
+    CkErc20LedgerError { error: String },
+    TemporarilyUnavailable(String),
+}
+
+// Withdrawal result
+#[derive(Debug, Clone, candid::CandidType, candid::Deserialize, serde::Serialize)]
+pub enum WithdrawErc20Result {
+    Ok(WithdrawErc20Success),
+    Err(WithdrawErc20Error),
+}
+
+// Fee calculation result
+#[derive(Debug, Clone)]
+pub struct BurnFees {
+    // Amount to actually withdraw after fees
+    pub net_withdrawal: candid::Nat,
+    // Fee to charge the user (in ckERC20)
+    pub erc_burn_fee: candid::Nat,
+    // ETH gas fee estimate
+    pub eth_gas_fee: candid::Nat,
+}
