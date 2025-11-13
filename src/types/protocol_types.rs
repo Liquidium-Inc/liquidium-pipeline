@@ -1,7 +1,6 @@
 use core::fmt;
 
 use candid::{CandidType, Nat, Principal};
-use icrc_ledger_types::icrc1::account::Account;
 use serde::{Deserialize, Serialize};
 
 // Max liquidation ratio
@@ -13,7 +12,7 @@ pub struct LiquidationRequest {
     pub debt_pool_id: Principal,       // Pool containing the debt to be repaid
     pub collateral_pool_id: Principal, // Pool containing collateral to be liquidated
     pub debt_amount: Nat,              // Amount of debt to repay
-    pub receiver: Account,             // Account that receives collateral and change
+    pub receiver_address: Principal,   // Account that receives collateral and change
 }
 
 pub trait Asset {
@@ -59,7 +58,6 @@ impl Asset for Assets {
 pub struct LiquidationAmounts {
     pub collateral_received: Nat, // Amount of collateral received by liquidator
     pub debt_repaid: Nat,         // Amount of debt repaid
-    pub bonus_earned: Nat,        // Value of bonus earned (in debt asset)
 }
 
 #[derive(Debug, CandidType, Serialize, Deserialize, Clone, PartialEq, Eq)]
@@ -70,7 +68,7 @@ pub struct LiquidationResult {
     pub status: LiquidationStatus,
     pub change_tx: TxStatus,
     pub collateral_tx: TxStatus,
-    pub id: Option<u128>,
+    pub id: u128,
 }
 
 #[derive(Debug, CandidType, Serialize, Deserialize, Clone, PartialEq, Eq)]
@@ -121,7 +119,6 @@ pub struct LiquidateblePosition {
     pub account: Principal,         // Account that will be liquidated
     pub liquidation_bonus: u64,     // The collateral pool's liquidation bonus in  (in basis points, 1000 = 10%)
     pub protocol_fee: u64,          // The fee on the liquidation bonus un  (in basis points, 1000 = 10%)
-    pub liquidation_threshold: u64, // The liquidation threshold
 }
 
 #[derive(Debug, Clone, Deserialize, CandidType, PartialEq, Eq)]

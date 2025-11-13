@@ -4,10 +4,9 @@ use candid::{Encode, Nat, Principal};
 use icrc_ledger_types::{
     icrc1::account::Account,
     icrc2::{
-        allowance::AllowanceArgs,
+        allowance::{AllowanceArgs, Allowance},
         approve::{ApproveArgs, ApproveError},
     },
-    icrc103::get_allowances::Allowance,
 };
 use log::{debug, info, warn};
 

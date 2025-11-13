@@ -405,7 +405,7 @@ impl<D: WalStore, S: IcrcSwapInterface, A: IcrcAccountActions, C: ConfigTrait, P
             }
 
             // Ensure we have a liquidation id recorded in the receipt
-            let Some(id) = receipt.liquidation_result.as_ref().and_then(|l| l.id) else {
+            let Some(id) = receipt.liquidation_result.as_ref().map(|l| l.id) else {
                 self.delete_wal_silent(&row.liq_id, row.idx).await;
                 continue;
             };
@@ -778,10 +778,7 @@ mod tests {
             debt_pool_id: Principal::anonymous(),
             collateral_pool_id: Principal::anonymous(),
             debt_amount: Nat::from(1000_u128),
-            receiver: Account {
-                owner: Principal::anonymous(),
-                subaccount: None,
-            },
+            receiver_address: Principal::anonymous(),
         };
         ExecutionReceipt {
             request: ExecutorRequest {
@@ -798,11 +795,10 @@ mod tests {
                 }),
             },
             liquidation_result: Some(LiquidationResult {
-                id: Some(42),
+                id: 42,
                 amounts: crate::types::protocol_types::LiquidationAmounts {
                     debt_repaid: Nat::from(1000_u128),
                     collateral_received: Nat::from(2000_u128),
-                    bonus_earned: Nat::from(0_u128),
                 },
                 collateral_asset: crate::types::protocol_types::AssetType::CkAsset(Principal::anonymous()),
                 debt_asset: crate::types::protocol_types::AssetType::CkAsset(Principal::anonymous()),
@@ -947,11 +943,10 @@ mod tests {
             .expect_call_query::<Result<LiquidationResult, String>>()
             .returning(|_, _, _| {
                 Ok(Ok(LiquidationResult {
-                    id: Some(42),
+                    id: 42,
                     amounts: crate::types::protocol_types::LiquidationAmounts {
                         debt_repaid: Nat::from(1000_u128),
                         collateral_received: Nat::from(2000_u128),
-                        bonus_earned: Nat::from(0_u128),
                     },
                     collateral_asset: crate::types::protocol_types::AssetType::CkAsset(Principal::anonymous()),
                     debt_asset: crate::types::protocol_types::AssetType::CkAsset(Principal::anonymous()),
@@ -1105,11 +1100,10 @@ mod tests {
             .expect_call_query::<Result<LiquidationResult, String>>()
             .returning(|_, _, _| {
                 Ok(Ok(LiquidationResult {
-                    id: Some(42),
+                    id: 42,
                     amounts: crate::types::protocol_types::LiquidationAmounts {
                         debt_repaid: Nat::from(1000_u128),
                         collateral_received: Nat::from(2000_u128),
-                        bonus_earned: Nat::from(0_u128),
                     },
                     collateral_asset: crate::types::protocol_types::AssetType::CkAsset(Principal::anonymous()),
                     debt_asset: crate::types::protocol_types::AssetType::CkAsset(Principal::anonymous()),
@@ -1212,11 +1206,10 @@ mod tests {
             .expect_call_query::<Result<LiquidationResult, String>>()
             .returning(|_, _, _| {
                 Ok(Ok(LiquidationResult {
-                    id: Some(42),
+                    id: 42,
                     amounts: crate::types::protocol_types::LiquidationAmounts {
                         debt_repaid: Nat::from(1000_u128),
                         collateral_received: Nat::from(2000_u128),
-                        bonus_earned: Nat::from(0_u128),
                     },
                     collateral_asset: crate::types::protocol_types::AssetType::CkAsset(Principal::anonymous()),
                     debt_asset: crate::types::protocol_types::AssetType::CkAsset(Principal::anonymous()),
@@ -1336,11 +1329,10 @@ mod tests {
             .expect_call_query::<Result<LiquidationResult, String>>()
             .returning(|_, _, _| {
                 Ok(Ok(LiquidationResult {
-                    id: Some(42),
+                    id: 42,
                     amounts: crate::types::protocol_types::LiquidationAmounts {
                         debt_repaid: Nat::from(1000_u128),
                         collateral_received: Nat::from(2000_u128),
-                        bonus_earned: Nat::from(0_u128),
                     },
                     collateral_asset: crate::types::protocol_types::AssetType::CkAsset(Principal::anonymous()),
                     debt_asset: crate::types::protocol_types::AssetType::CkAsset(Principal::anonymous()),
@@ -1489,11 +1481,10 @@ mod tests {
             .expect_call_query::<Result<LiquidationResult, String>>()
             .returning(|_, _, _| {
                 Ok(Ok(LiquidationResult {
-                    id: Some(1),
+                    id: 1,
                     amounts: crate::types::protocol_types::LiquidationAmounts {
                         debt_repaid: Nat::from(1000_u128),
                         collateral_received: Nat::from(2000_u128),
-                        bonus_earned: Nat::from(0_u128),
                     },
                     collateral_asset: crate::types::protocol_types::AssetType::CkAsset(Principal::anonymous()),
                     debt_asset: crate::types::protocol_types::AssetType::CkAsset(Principal::anonymous()),
@@ -1571,11 +1562,10 @@ mod tests {
             .expect_call_query::<Result<LiquidationResult, String>>()
             .returning(|_, _, _| {
                 Ok(Ok(LiquidationResult {
-                    id: Some(7),
+                    id: 7,
                     amounts: crate::types::protocol_types::LiquidationAmounts {
                         debt_repaid: Nat::from(1000_u128),
                         collateral_received: Nat::from(2000_u128),
-                        bonus_earned: Nat::from(0_u128),
                     },
                     collateral_asset: crate::types::protocol_types::AssetType::CkAsset(Principal::anonymous()),
                     debt_asset: crate::types::protocol_types::AssetType::CkAsset(Principal::anonymous()),
@@ -1620,8 +1610,7 @@ mod tests {
     #[tokio::test]
     async fn get_liquidation_missing_id_in_receipt() {
         // If receipt lacks liquidation id, WAL row should be deleted and no swap attempted.
-        let mut rec = receipt_ok_with_swap(100);
-        rec.liquidation_result.as_mut().unwrap().id = None;
+        let rec = receipt_ok_with_swap(100);
 
         let mut wal = MockWalStore::new();
         wal.expect_list_by_status().returning({
@@ -1729,11 +1718,10 @@ mod tests {
             .expect_call_query::<Result<LiquidationResult, String>>()
             .returning(|_, _, _| {
                 Ok(Ok(LiquidationResult {
-                    id: Some(1),
+                    id: 1,
                     amounts: crate::types::protocol_types::LiquidationAmounts {
                         debt_repaid: Nat::from(1000_u128),
                         collateral_received: Nat::from(2000_u128),
-                        bonus_earned: Nat::from(0_u128),
                     },
                     collateral_asset: crate::types::protocol_types::AssetType::CkAsset(Principal::anonymous()),
                     debt_asset: crate::types::protocol_types::AssetType::CkAsset(Principal::anonymous()),
@@ -1918,11 +1906,10 @@ mod tests {
             .expect_call_query::<Result<LiquidationResult, String>>()
             .returning(|_, _, _| {
                 Ok(Ok(LiquidationResult {
-                    id: Some(1),
+                    id: 1,
                     amounts: crate::types::protocol_types::LiquidationAmounts {
                         debt_repaid: Nat::from(1000_u128),
                         collateral_received: Nat::from(2000_u128),
-                        bonus_earned: Nat::from(0_u128),
                     },
                     collateral_asset: crate::types::protocol_types::AssetType::CkAsset(Principal::anonymous()),
                     debt_asset: crate::types::protocol_types::AssetType::CkAsset(Principal::anonymous()),
@@ -2103,11 +2090,10 @@ mod tests {
             .expect_call_query::<Result<LiquidationResult, String>>()
             .returning(|_, _, _| {
                 Ok(Ok(LiquidationResult {
-                    id: Some(1),
+                    id: 1,
                     amounts: crate::types::protocol_types::LiquidationAmounts {
                         debt_repaid: Nat::from(1u128),
                         collateral_received: Nat::from(2u128),
-                        bonus_earned: Nat::from(0u128),
                     },
                     collateral_asset: crate::types::protocol_types::AssetType::CkAsset(Principal::anonymous()),
                     debt_asset: crate::types::protocol_types::AssetType::CkAsset(Principal::anonymous()),
@@ -2222,10 +2208,7 @@ mod tests {
                 debt_pool_id: Principal::anonymous(),
                 collateral_pool_id: Principal::anonymous(),
                 debt_amount: Nat::from(0u128),
-                receiver: Account {
-                    owner: Principal::anonymous(),
-                    subaccount: None,
-                },
+                receiver_address: Principal::anonymous(),
             },
             swap_args: None,
             debt_asset: debt.clone(),
@@ -2233,11 +2216,10 @@ mod tests {
             expected_profit: 100, // 1.00 USD
         };
         let liq_res = LiquidationResult {
-            id: Some(1),
+            id: 1,
             amounts: crate::types::protocol_types::LiquidationAmounts {
                 debt_repaid: Nat::from(1234u128),         // 12.34
                 collateral_received: Nat::from(5678u128), // 56.78
-                bonus_earned: Nat::from(0u128),
             },
             collateral_asset: crate::types::protocol_types::AssetType::CkAsset(Principal::anonymous()),
             debt_asset: crate::types::protocol_types::AssetType::CkAsset(Principal::anonymous()),
