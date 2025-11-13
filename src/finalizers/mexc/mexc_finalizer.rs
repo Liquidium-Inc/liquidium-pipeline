@@ -1,38 +1,44 @@
 use std::sync::Arc;
 
-use log::{info, warn};
+use log::info;
+use num_traits::ToPrimitive;
 
 use crate::{
-    account::account::IcrcAccountActions,
+    account::{actions::AccountActions, model::ChainToken},
     config::ConfigTrait,
+    connectors::ccxt_client::CcxtClient,
     persistance::WalStore,
     pipeline_agent::PipelineAgent,
     swappers::{
-        kong_types::{SwapArgs, SwapReply},
-        swap_interface::IcrcSwapInterface,
+        model::{SwapExecution, SwapRequest},
+        swap_interface::SwapInterface,
     },
 };
 
-use super::ccxt_client::CcxtClient;
-
 pub struct MexcFinalizer<
     D: WalStore,
-    S: IcrcSwapInterface,
-    A: IcrcAccountActions,
+    S: SwapInterface,
+    A: AccountActions,
     C: ConfigTrait,
     P: PipelineAgent,
     X: CcxtClient,
 > {
     pub config: Arc<C>,
     pub db: Arc<D>,
-    pub swapper: Arc<S>, // MixcCcxtSwapper<X> typically
+    pub swapper: Arc<S>, // typically a MexcSwapSwapper<X> implementing IcrcSwapInterface
     pub account: Arc<A>,
     pub agent: Arc<P>,
     pub ccxt: Arc<X>,
 }
 
-impl<D: WalStore, S: IcrcSwapInterface, A: IcrcAccountActions, C: ConfigTrait, P: PipelineAgent, X: CcxtClient>
-    MexcFinalizer<D, S, A, C, P, X>
+impl<D, S, A, C, P, X> MexcFinalizer<D, S, A, C, P, X>
+where
+    D: WalStore,
+    S: SwapInterface,
+    A: AccountActions,
+    C: ConfigTrait,
+    P: PipelineAgent,
+    X: CcxtClient,
 {
     pub fn new(db: Arc<D>, swapper: Arc<S>, account: Arc<A>, config: Arc<C>, agent: Arc<P>, ccxt: Arc<X>) -> Self {
         Self {
@@ -46,75 +52,72 @@ impl<D: WalStore, S: IcrcSwapInterface, A: IcrcAccountActions, C: ConfigTrait, P
     }
 
     // High-level flow: deposit -> swap -> withdraw back
-    pub async fn execute_mexc_swap(&self, swap_args: SwapArgs) -> Result<SwapReply, String> {
-        let token_in = &swap_args.token_in;
-        let token_out = &swap_args.token_out;
+    pub async fn execute_mexc_swap(&self, swap_args: SwapRequest) -> Result<SwapExecution, String> {
+        let asset_in = swap_args.pay_asset.clone();
+        let asset_out = swap_args.receive_asset.clone();
 
-        let asset_in = token_in.symbol.clone(); // map ICRC symbol -> CEX asset
-        let asset_out = token_out.symbol.clone(); // same for out side
-
-        let network_in = Some("ICP"); // TODO: from config
-        let network_out = Some("ETH"); // TODO: from config
-
-        info!("MEXC finalizer: starting cross-cex swap {} -> {}", asset_in, asset_out);
-
-        // 1. Get MEXC deposit address
-        let dep = self.ccxt.get_deposit_address(&asset_in, network_in.as_deref()).await?;
-
-        // 2. Send funds from IC to that deposit address
-        // This uses your IcrcAccountActions implementation.
-        // Adjust method name / params to your real API.
         info!(
-            "MEXC finalizer: sending deposit to {} (network {:?})",
-            dep.address, dep.network
+            "MEXC finalizer: starting cross-cex swap {} -> {} (amount {})",
+            asset_in, asset_out, swap_args.pay_amount
         );
 
-        // Example, you likely have something like:
-        // self.account.send_icrc_deposit(&asset_in, &dep.address, swap_args.amount_in.value.clone()).await?;
+        // 1. Determine the IC deposit account used as MEXC inbox for this asset.
+        // The off-chain / bridge side is responsible for forwarding from that inbox
+        // to the actual MEXC deposit address.
+        let mexc_ic_deposit_account = "";
+
+        info!(
+            "MEXC finalizer: sending deposit of {} {} to {:?} (IC inbox)",
+            swap_args.pay_amount, asset_in, mexc_ic_deposit_account
+        );
+
         self.account
-            .send_cex_deposit(&asset_in, &dep.address, swap_args.amount_in.value.clone())
+            .transfer(
+                &asset_in,
+                mexc_ic_deposit_account,
+                swap_args.pay_amount.0.to_u128().unwrap(),
+                false,
+            )
             .await
             .map_err(|e| format!("ICRC deposit failed: {}", e))?;
 
-        // TODO: mark in WAL: deposit_sent
+        // TODO: persist in WAL: deposit_sent
 
         // 3. Wait for deposit credited on MEXC
-        // In practice this is usually done by an off-chain watcher, not this function.
-        // Here we just assume funds are there or you call ccxt to poll balances.
+        // In practice: off-chain watcher polls balances / deposit history.
+        // Here we assume funds are available by the time we call swap.
 
-        // 4. Execute swap on MEXC via ccxt-backed swapper
-        info!("MEXC finalizer: executing ccxt swap on MEXC");
-        let swap_reply = self.swapper.swap(swap_args).await?;
+        // 4. Execute swap on MEXC via ccxt-backed swapper (implements IcrcSwapInterface)
+        info!("MEXC finalizer: executing swap on MEXC {} -> {}", asset_in, asset_out);
+        let swap_reply = self
+            .swapper
+            .execute(&swap_args)
+            .await
+            .map_err(|e| format!("MEXC swap failed: {}", e))?;
 
-        // TODO: mark in WAL: swap_done
+        // TODO: persist in WAL: swap_done
 
-        // 5. Withdraw back from MEXC to IC address
-        let withdraw_target = self
-            .config
-            .mexc_withdraw_address_for(&asset_out)
-            .map_err(|e| format!("No withdraw address for {}: {}", asset_out, e))?;
+        // 5. Withdraw back from MEXC to IC address for the output asset
+        let withdraw_target = "";
 
         let out_amount_f64 = {
-            // you will want proper Nat -> f64 conversion with decimals
             let u = swap_reply
-                .amount_out
-                .value
+                .receive_amount
                 .0
                 .to_u128()
-                .ok_or("swap_out too large for f64")?;
+                .ok_or("receive_amount too large for f64")?;
             u as f64
         };
 
         info!(
-            "MEXC finalizer: withdrawing {} {} back to {}",
-            out_amount_f64, asset_out, withdraw_target
+            "MEXC finalizer: withdrawing {} {} back to {} (network {:?})",
+            out_amount_f64, asset_out, withdraw_target, asset_out
         );
 
-        let _receipt = self
-            .ccxt
+        self.ccxt
             .withdraw(
-                &asset_out,
-                network_out.as_deref(),
+                &asset_out.symbol(),
+                &asset_out.chain(),
                 &withdraw_target,
                 None,
                 out_amount_f64,
@@ -122,7 +125,7 @@ impl<D: WalStore, S: IcrcSwapInterface, A: IcrcAccountActions, C: ConfigTrait, P
             .await
             .map_err(|e| format!("MEXC withdraw failed: {}", e))?;
 
-        // TODO: mark in WAL: withdraw_sent
+        // TODO: persist in WAL: withdraw_sent
 
         Ok(swap_reply)
     }

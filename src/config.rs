@@ -8,9 +8,8 @@ use std::collections::HashMap;
 use std::env;
 use std::sync::Arc;
 
-use crate::account::account::RECOVERY_ACCOUNT;
+use crate::account::icp::adapter::{RECOVERY_ACCOUNT, derive_icp_identity};
 use crate::icrc_token::icrc_token::IcrcToken;
-use crate::utils::create_identity_from_pem_file;
 
 pub struct Config {
     pub liquidator_identity: Arc<dyn Identity>,
@@ -24,6 +23,7 @@ pub struct Config {
     pub export_path: String,
     pub buy_bad_debt: bool,
     pub db_path: String,
+    pub mnemonic: String,
 }
 
 #[cfg_attr(test, mockall::automock)]
@@ -35,6 +35,10 @@ pub trait ConfigTrait: Send + Sync {
     fn should_buy_bad_debt(&self) -> bool;
     fn get_lending_canister(&self) -> Principal;
     fn get_recovery_account(&self) -> Account;
+    fn icrc_token_for_symbol(&self, symbol: &str) -> Result<IcrcToken, String>;
+    fn exchange_deposit_account_for(&self, chain: &str) -> Result<Account, String>;
+    fn exchange_withdraw_address_for(&self, chain: &str) -> Result<String, String>;
+    fn mnemonic(&self) -> String;
 }
 
 impl ConfigTrait for Config {
@@ -68,6 +72,38 @@ impl ConfigTrait for Config {
     fn get_lending_canister(&self) -> Principal {
         self.lending_canister
     }
+
+    fn icrc_token_for_symbol(&self, symbol: &str) -> Result<IcrcToken, String> {
+        // search both maps by token symbol
+        if let Some(token) = self.debt_assets.values().find(|t| t.symbol == symbol).cloned() {
+            return Ok(token);
+        }
+        if let Some(token) = self.collateral_assets.values().find(|t| t.symbol == symbol).cloned() {
+            return Ok(token);
+        }
+        Err(format!("Unknown ICRC token symbol: {}", symbol))
+    }
+
+    fn exchange_deposit_account_for(&self, _chain: &str) -> Result<Account, String> {
+        // For now, reuse the recovery account as the MEXC IC inbox.
+        // This can be refined later per-asset if needed.
+        Ok(self.get_recovery_account())
+    }
+
+    fn exchange_withdraw_address_for(&self, chain: &str) -> Result<String, String> {
+        let var = format!("EXCHANGE_WITHDRAW_{}", chain);
+        match std::env::var(&var).or_else(|_| std::env::var("EXCHANGE_WITHDRAW_DEFAULT")) {
+            Ok(addr) => Ok(addr),
+            Err(_) => Err(format!(
+                "No withdraw address configured for chain {} (tried {} and EXCHANGE_WITHDRAW_DEFAULT)",
+                chain, var
+            )),
+        }
+    }
+
+    fn mnemonic(&self) -> String {
+        self.mnemonic.clone()
+    }
 }
 
 impl Config {
@@ -93,16 +129,18 @@ impl Config {
 
         let ic_url = env::var("IC_URL").unwrap();
         let export_path = env::var("EXPORT_PATH").unwrap_or("executions.csv".to_string());
-        // Load the liquidator identity
-        let pem_path = env::var("IDENTITY_PEM").expect("Account missing `run account new`");
-        let trader_pem_path = env::var("TRADER_IDENTITY_PEM").expect("Account missing `run account new`");
-        debug!("Path {}", pem_path);
+        // Load base mnemonic and derive child identities
+        let mnemonic = env::var("MNEMONIC").expect("MNEMONIC not configured");
 
-        let identity = create_identity_from_pem_file(&pem_path).expect("could not create identity");
-        let liquidator_principal = identity.sender().expect("could not decode liquidator principal");
+        let liquidator_identity =
+            derive_icp_identity(&mnemonic, 0, 0).expect("could not create liquidator identity from mnemonic");
+        let liquidator_principal = liquidator_identity
+            .sender()
+            .expect("could not decode liquidator principal");
 
-        let trader_identity = create_identity_from_pem_file(&trader_pem_path).expect("could not create identity");
-        let trader_principal = trader_identity.sender().expect("could not decode liquidator principal");
+        let trader_identity =
+            derive_icp_identity(&mnemonic, 0, 1).expect("could not create trader identity from mnemonic");
+        let trader_principal = trader_identity.sender().expect("could not decode trader principal");
 
         let buy_bad_debt = env::var("BUY_BAD_DEBT")
             .map(|v| v.parse().unwrap_or(false))
@@ -120,15 +158,16 @@ impl Config {
         Ok(Arc::new(Config {
             debt_assets: debt,
             collateral_assets: coll,
-            liquidator_identity: identity.into(),
+            liquidator_identity: Arc::new(liquidator_identity),
             ic_url,
             liquidator_principal,
-            trader_identity: trader_identity.into(),
+            trader_identity: Arc::new(trader_identity),
             trader_principal,
             lending_canister,
             export_path,
             buy_bad_debt,
             db_path,
+            mnemonic,
         }))
     }
 }

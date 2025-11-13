@@ -20,32 +20,18 @@ pub struct WithdrawalReceipt {
 #[async_trait]
 pub trait CcxtClient: Send + Sync {
     // trading
-    async fn get_quote(
-        &self,
-        market: &str,
-        amount_in: f64,
-    ) -> Result<f64, String>;
+    async fn get_quote(&self, market: &str, amount_in: f64) -> Result<f64, String>;
 
-    async fn execute_swap(
-        &self,
-        market: &str,
-        side: &str,
-        amount_in: f64,
-        price: Option<f64>,
-    ) -> Result<f64, String>;
+    async fn execute_swap(&self, market: &str, side: &str, amount_in: f64) -> Result<f64, String>;
 
     // deposits
-    async fn get_deposit_address(
-        &self,
-        asset: &str,
-        network: Option<&str>,
-    ) -> Result<DepositAddress, String>;
+    async fn get_deposit_address(&self, asset: &str, network: Option<&str>) -> Result<DepositAddress, String>;
 
     // withdrawals
     async fn withdraw(
         &self,
         asset: &str,
-        network: Option<&str>,
+        network: &str,
         address: &str,
         tag: Option<&str>,
         amount: f64,

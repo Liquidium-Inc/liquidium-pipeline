@@ -1,10 +1,10 @@
 use async_trait::async_trait;
 
-use serde_json::{Value, json};
+use serde_json::json;
 
 use crate::connectors::ccxt_client::{CcxtClient, DepositAddress, WithdrawalReceipt};
 use ccxt::binance::{Binance as Mexc, BinanceImpl as MexcImpl};
-use ccxt::exchange::normalize;
+use ccxt::exchange::{normalize, Value};
 
 pub struct MexcCcxtAdapter {
     inner: tokio::sync::Mutex<MexcImpl>,
@@ -35,24 +35,21 @@ impl CcxtClient for MexcCcxtAdapter {
         Ok(amount_in * best)
     }
 
-    async fn execute_swap(&self, market: &str, side: &str, amount_in: f64, price: Option<f64>) -> Result<f64, String> {
+    async fn execute_swap(&self, market: &str, side: &str, amount_in: f64) -> Result<f64, String> {
         let mut ex = self.inner.lock().await;
 
-        let res = Mexc::create_order(
-            &mut ex,
-            market.into(),
-            "market".into(),
-            side.into(),
-            amount_in.into(),
-            match price {
-                Some(p) => Value::from(p),
-                None => Value::Undefined,
-            },
-            Value::Undefined,
-        )
-        .await;
+        let res = ex
+            .create_order(
+                market.into(),
+                "market".into(),
+                side.into(),
+                amount_in.into(),
+                Value::Undefined,
+                Value::Undefined,
+            )
+            .await;
 
-        let norm = normalize(&res).map_err(|e| e.to_string())?;
+        let norm = normalize(&res).expect("coould not normalize res");
         let filled_quote = norm["cost"].as_f64().ok_or("missing filled quote amount (cost)")?;
 
         Ok(filled_quote)
@@ -86,7 +83,7 @@ impl CcxtClient for MexcCcxtAdapter {
     async fn withdraw(
         &self,
         asset: &str,
-        network: Option<&str>,
+        network: &str,
         address: &str,
         tag: Option<&str>,
         amount: f64,

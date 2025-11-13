@@ -16,7 +16,7 @@ use crate::{
     pipeline_agent::PipelineAgent,
     swappers::{
         kong::kong_types::{SwapAmountsReply, SwapArgs, SwapReply, SwapResult},
-        swap_interface::IcrcSwapInterface,
+        swap_interface::{IcrcSwapInterface, SwapInterface},
     },
 };
 
@@ -91,47 +91,8 @@ impl<A: PipelineAgent> KongSwapSwapper<A> {
 }
 
 #[async_trait]
-impl<A: PipelineAgent> IcrcSwapInterface for KongSwapSwapper<A> {
-    async fn get_swap_info(
-        &self,
-        token_in: &IcrcToken,
-        token_out: &IcrcToken,
-        amount: &IcrcTokenAmount,
-    ) -> Result<SwapAmountsReply, String> {
-        let dex_principal = Principal::from_str(DEX_PRINCIPAL).unwrap();
-
-        info!(
-            "Fetching swap info for {} {} -> {} ",
-            amount.value, token_in.symbol, token_out.symbol,
-        );
-
-        let result = self
-            .agent
-            .call_query::<Result<SwapAmountsReply, String>>(
-                &dex_principal,
-                "swap_amounts",
-                encode_args((token_in.symbol.clone(), amount.value.clone(), token_out.symbol.clone())).unwrap(),
-            )
-            .await
-            .map_err(|e| format!("Swap call error: {}", e))?
-            .map_err(|e| format!("Swap call error: {}", e))?;
-
-        Ok(result)
-    }
-
-    async fn swap(&self, swap_args: SwapArgs) -> Result<SwapReply, String> {
-        let dex_principal = Principal::from_str(DEX_PRINCIPAL).unwrap();
-        let result = self
-            .agent
-            .call_update::<SwapResult>(&dex_principal, "swap", swap_args.into())
-            .await
-            .map_err(|e| format!("Swap call error: {}", e))?;
-
-        match result {
-            SwapResult::Ok(res) => Ok(res),
-            SwapResult::Err(e) => return Err(format!("Could not execute swap {e}")),
-        }
-    }
+impl<A: PipelineAgent> SwapInterface for KongSwapSwapper<A> {
+   todo!()
 }
 
 impl<A: PipelineAgent> KongSwapSwapper<A> {

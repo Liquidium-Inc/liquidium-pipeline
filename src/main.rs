@@ -17,6 +17,7 @@ mod utils;
 mod watchdog;
 use clap::{Parser, Subcommand};
 mod connectors;
+mod wallet;
 
 use commands::liquidation_loop::run_liquidation_loop;
 
