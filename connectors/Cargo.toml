@@ -1,0 +1,27 @@
+[package]
+name = "liquidium-pipeline-connectors"
+version = "0.1.0"
+edition = "2024"
+
+
+[lib]
+crate-type = ["lib"]
+
+
+[dependencies]
+serde = { workspace = true }
+alloy = { workspace = true }
+candid = { workspace = true }
+async-trait = { workspace = true }
+ic-agent = { workspace = true }
+icrc-ledger-agent = { workspace = true }
+icrc-ledger-types = { workspace = true }
+log = { workspace = true }
+mockall = { workspace = true }
+tokio = { workspace = true }
+
+bip39 = "2.2.0"
+bip32 = "0.5.3"
+k256 = "0.13.0"
+liquidium-pipeline-core = { path = "../core" }
+ccxt = { git = "https://github.com/kizzx2/ccxt-rs-lib" }
