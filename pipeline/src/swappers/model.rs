@@ -1,7 +1,6 @@
-use std::fmt;
 
 use candid::{CandidType, Nat};
-use liquidium_pipeline_core::tokens::{asset_id::AssetId, chain_token::ChainToken};
+use liquidium_pipeline_core::tokens::asset_id::AssetId;
 use serde::{Deserialize, Serialize};
 
 #[derive(CandidType, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

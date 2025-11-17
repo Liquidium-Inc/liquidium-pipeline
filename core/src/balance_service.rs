@@ -26,7 +26,7 @@ impl BalanceService {
         Self { registry, accounts }
     }
 
-    /// Sync a custom list of assets for this account.
+    // Sync a custom list of assets for this account.
     pub async fn sync_assets(
         &self,
         assets: &[AssetId],
@@ -51,13 +51,13 @@ impl BalanceService {
         join_all(futs).await
     }
 
-    /// Sync all assets from the registry for this account.
+    // Sync all assets from the registry for this account.
     pub async fn sync_all(&self) -> Vec<Result<(AssetId, ChainBalance), String>> {
         let asset_ids: Vec<AssetId> = self.registry.tokens.keys().cloned().collect();
         self.sync_assets(&asset_ids).await
     }
 
-    /// Sync all assets and return only non-zero balances.
+    // Sync all assets and return only non-zero balances.
     pub async fn non_zero(&self) -> Vec<(AssetId, ChainBalance)> {
         let results = self.sync_all().await;
         results
@@ -69,7 +69,7 @@ impl BalanceService {
             .collect()
     }
 
-    /// Get the balance for a single AssetId.
+    // Get the balance for a single AssetId.
     pub async fn get_balance(
         &self,
         asset_id: &AssetId,
@@ -86,12 +86,12 @@ impl BalanceService {
             .map_err(|e| format!("sync_balance failed for {}: {}", asset_id, e))
     }
 
-    /// Expose the underlying registry if needed by callers.
+    // Expose the underlying registry if needed by callers.
     pub fn registry(&self) -> &TokenRegistry {
         &self.registry
     }
 
-    /// Expose the underlying AccountInfo router if needed by callers.
+    // Expose the underlying AccountInfo router if needed by callers.
     pub fn accounts(&self) -> Arc<dyn AccountInfo + Send + Sync> {
         self.accounts.clone()
     }

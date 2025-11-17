@@ -180,7 +180,7 @@ impl<D: WalStore, S: SwapInterface, A: AccountActions, C: ConfigTrait, P: Pipeli
 
     // Build swap args from receipt and liquidation, then fetch a fresh quote.
     // Returns SwapInfo if quoting succeeds; Err(String) otherwise.
-    async fn preflight_quote(&self, receipt: &ExecutionReceipt, liq: &LiquidationResult) -> Result<SwapQuote, String> {
+    async fn preflight_quote(&self, _receipt: &ExecutionReceipt, _liq: &LiquidationResult) -> Result<SwapQuote, String> {
         todo!()
     }
 
@@ -338,7 +338,7 @@ impl<D: WalStore, S: SwapInterface, A: AccountActions, C: ConfigTrait, P: Pipeli
 {
     async fn move_funds_to_recovery(&self, receipt: &ExecutionReceipt) {
         // Move seized collateral to recovery account when we cannot complete the swap
-        let Some(liq) = &receipt.liquidation_result else {
+        let Some(_liq) = &receipt.liquidation_result else {
             return;
         };
 

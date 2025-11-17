@@ -1,5 +1,4 @@
 use alloy::hex::ToHexExt;
-use bip39::Mnemonic;
 use candid::Principal;
 
 use ic_agent::Identity;

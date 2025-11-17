@@ -3385,6 +3385,7 @@ dependencies = [
  "liquidium-pipeline-core",
  "log",
  "mockall",
+ "num-bigint",
  "serde",
  "tokio",
 ]
@@ -3399,6 +3400,7 @@ dependencies = [
  "futures",
  "ic-agent",
  "icrc-ledger-agent",
+ "icrc-ledger-types",
  "mockall",
  "num-format",
  "num-traits",

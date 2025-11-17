@@ -1,7 +1,5 @@
 use async_trait::async_trait;
-use csv::WriterBuilder;
 use serde::Serialize;
-use std::fs::{OpenOptions, metadata};
 
 use crate::stage::PipelineStage;
 
@@ -31,7 +29,7 @@ struct ExecutionAnalyticsRow {
 
 #[async_trait]
 impl<'a> PipelineStage<'a, Vec<LiquidationOutcome>, ()> for ExportStage {
-    async fn process(&self, input: &'a Vec<LiquidationOutcome>) -> Result<(), String> {
+    async fn process(&self, _input: &'a Vec<LiquidationOutcome>) -> Result<(), String> {
         // let file = OpenOptions::new()
         //     .create(true)
         //     .append(true)

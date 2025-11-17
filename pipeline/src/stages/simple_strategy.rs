@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::config::ConfigTrait;
@@ -10,16 +9,12 @@ use crate::stage::PipelineStage;
 use crate::swappers::swap_interface::SwapInterface;
 use liquidium_pipeline_core::{
     account::actions::AccountInfo,
-    types::protocol_types::{AssetType, LiquidateblePosition, LiquidatebleUser, LiquidationRequest},
+    types::protocol_types::LiquidatebleUser,
 };
 
-use crate::watchdog::{Watchdog, WatchdogEvent, noop_watchdog};
+use crate::watchdog::{Watchdog, noop_watchdog};
 use async_trait::async_trait;
-use itertools::Itertools;
 
-use candid::{Int, Nat, Principal};
-use log::{debug, info};
-use num_traits::ToPrimitive;
 pub struct IcrcLiquidationStrategy<T, C, U, W>
 where
     T: SwapInterface + Send + Sync,
@@ -66,7 +61,7 @@ where
     U: CollateralServiceTrait,
     W: AccountInfo,
 {
-    async fn process(&self, users: &'a Vec<LiquidatebleUser>) -> Result<Vec<ExecutorRequest>, String> {
+    async fn process(&self, _users: &'a Vec<LiquidatebleUser>) -> Result<Vec<ExecutorRequest>, String> {
         // let mut result: Vec<ExecutorRequest> = vec![];
         // let mut balances: HashMap<Principal, Nat> = HashMap::new();
 

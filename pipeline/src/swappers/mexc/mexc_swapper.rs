@@ -6,7 +6,7 @@ use liquidium_pipeline_connectors::backend::cex_backend::CexBackend;
 use liquidium_pipeline_core::tokens::asset_id::AssetId;
 use log::{debug, info};
 
-use crate::swappers::model::{SwapExecution, SwapQuote, SwapQuoteLeg, SwapRequest, TransferRecord, TxRef};
+use crate::swappers::model::{SwapExecution, SwapQuote, SwapQuoteLeg, SwapRequest};
 use crate::swappers::router::SwapVenue;
 use num_traits::ToPrimitive;
 fn nat_to_f64(n: &Nat) -> Result<f64, String> {

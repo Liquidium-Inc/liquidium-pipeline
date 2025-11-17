@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use alloy::network::AnyNetwork;
-use alloy::providers::{Provider, ProviderBuilder, RootProvider};
+use alloy::providers::{Provider, ProviderBuilder, WalletProvider};
 use alloy::signers::local::PrivateKeySigner;
 
 use ic_agent::Agent;
@@ -10,12 +10,18 @@ use liquidium_pipeline_connectors::account::evm_account::EvmAccountInfoAdapter;
 use liquidium_pipeline_connectors::account::icp_account::{IcpAccountInfoAdapter, RECOVERY_ACCOUNT};
 use liquidium_pipeline_connectors::backend::evm_backend::EvmBackendImpl;
 use liquidium_pipeline_core::balance_service::BalanceService;
+use liquidium_pipeline_core::transfer::transfer_service::TransferService;
 
 use liquidium_pipeline_core::{account::actions::AccountInfo, tokens::token_registry::TokenRegistry};
 
 use liquidium_pipeline_connectors::{
     account::router::MultiChainAccountInfoRouter, backend::icp_backend::IcpBackendImpl,
     token_registry_loader::load_token_registry,
+    transfer::{
+        icp_transfer::IcpTransferAdapter,
+        evm_transfer::EvmTransferAdapter,
+        router::MultiChainTransferRouter,
+    },
 };
 
 use crate::config::Config;
@@ -25,6 +31,9 @@ pub struct PipelineContext {
     pub registry: Arc<TokenRegistry>,
     pub main_service: BalanceService,
     pub recovery_service: BalanceService,
+    pub main_transfers: TransferService,
+    pub recovery_transfers: TransferService,
+    pub evm_address: String,
 }
 
 pub struct PipelineContextBuilder<P: Provider<AnyNetwork>> {
@@ -34,7 +43,7 @@ pub struct PipelineContextBuilder<P: Provider<AnyNetwork>> {
     ic_agent_trader: Option<Arc<Agent>>,
 }
 
-impl<P: Provider<AnyNetwork> + 'static> PipelineContextBuilder<P> {
+impl<P: Provider<AnyNetwork> + WalletProvider<AnyNetwork> + Clone + 'static> PipelineContextBuilder<P> {
     pub async fn new() -> Result<Self, String> {
         let config = Config::load().await.map_err(|e| format!("config load failed: {e}"))?;
         Ok(Self {
@@ -68,8 +77,9 @@ impl<P: Provider<AnyNetwork> + 'static> PipelineContextBuilder<P> {
 
         // Use provided EVM providers or fail
         let main_provider = self.evm_provider_main.ok_or("missing main EVM provider")?;
+        let evm_address = format!("{:?}", main_provider.default_signer_address());
 
-        let evm_backend_main = Arc::new(EvmBackendImpl::new(main_provider.erased()));
+        let evm_backend_main = Arc::new(EvmBackendImpl::new(main_provider));
         let evm_backend_trader = evm_backend_main.clone();
 
         let registry = Arc::new(load_token_registry(icp_backend_main.clone(), evm_backend_main.clone()).await?);
@@ -100,11 +110,33 @@ impl<P: Provider<AnyNetwork> + 'static> PipelineContextBuilder<P> {
         let main_service = BalanceService::new(registry.clone(), main_accounts);
         let recovery_service = BalanceService::new(registry.clone(), recovery_accounts);
 
+        // Build transfer adapters and routers
+        let icp_transfer_main = Arc::new(IcpTransferAdapter::new(icp_backend_main.clone(), main_icp_account));
+        let evm_transfer_main = Arc::new(EvmTransferAdapter::new(evm_backend_main.clone()));
+        let transfer_router_main = Arc::new(MultiChainTransferRouter::new(
+            icp_transfer_main,
+            evm_transfer_main,
+        ));
+        let main_transfers = TransferService::new(registry.clone(), transfer_router_main);
+
+        let icp_transfer_recovery = Arc::new(IcpTransferAdapter::new(icp_backend_trader.clone(), recovery_icp_account));
+        let evm_transfer_recovery = Arc::new(EvmTransferAdapter::new(evm_backend_trader.clone()));
+        let transfer_router_recovery = Arc::new(MultiChainTransferRouter::new(
+            icp_transfer_recovery,
+            evm_transfer_recovery,
+        ));
+        let recovery_transfers = TransferService::new(registry.clone(), transfer_router_recovery);
+
+
+        println!("Context innitialized...");
         Ok(PipelineContext {
             config: config.clone(),
             registry,
             main_service,
             recovery_service,
+            main_transfers,
+            recovery_transfers,
+            evm_address,
         })
     }
 }

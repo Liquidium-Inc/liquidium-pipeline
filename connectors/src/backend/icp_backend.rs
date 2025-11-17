@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use candid::{CandidType, Decode, Encode, Nat, Principal};
+use candid::{CandidType, Encode, Nat, Principal};
 use icrc_ledger_types::icrc1::account::{Account, Subaccount};
 use serde::de::DeserializeOwned;
 
@@ -47,7 +47,7 @@ impl<A: PipelineAgent> IcpBackendImpl<A> {
 #[async_trait]
 impl<A: PipelineAgent> IcpBackend for IcpBackendImpl<A> {
     async fn icrc1_balance(&self, ledger: Principal, account: &Account) -> Result<Nat, String> {
-        self.query::<Nat>(ledger, "icrc1_balance", *account).await
+        self.query::<Nat>(ledger, "icrc1_balance_of", *account).await
     }
 
     async fn icrc1_transfer(

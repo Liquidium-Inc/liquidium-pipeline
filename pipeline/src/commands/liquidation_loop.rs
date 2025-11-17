@@ -23,7 +23,7 @@
 // };
 // use ic_agent::Agent;
 
-// /// Prints the startup banner.
+// // Prints the startup banner.
 // fn print_banner() {
 //     println!(
 //         r#"

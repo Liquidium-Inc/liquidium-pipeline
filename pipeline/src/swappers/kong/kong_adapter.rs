@@ -1,12 +1,10 @@
 use liquidium_pipeline_core::tokens::asset_id::AssetId;
-use liquidium_pipeline_core::tokens::chain::Chain;
-use liquidium_pipeline_core::tokens::chain_token::ChainToken;
 
 use crate::swappers::kong::kong_types::{
     ICTransferReply, SwapAmountsReply as KongSwapAmountsReply, SwapArgs as KongSwapArgs, SwapReply as KongSwapReply,
-    SwapTxReply, TransferReply, TxId as KongTxId,
+    SwapTxReply, TxId as KongTxId,
 };
-use crate::swappers::model::{SwapExecution, SwapQuote, SwapQuoteLeg, SwapRequest, TransferRecord, TxRef};
+use crate::swappers::model::{SwapExecution, SwapQuote, SwapQuoteLeg, SwapRequest, TxRef};
 
 fn default_ic_chain() -> String {
     "IC".to_string()

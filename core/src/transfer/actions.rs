@@ -1,0 +1,14 @@
+use async_trait::async_trait;
+
+use crate::account::model::ChainAccount;
+use crate::tokens::chain_token::ChainToken;
+
+#[async_trait]
+pub trait TransferActions: Send + Sync {
+    async fn transfer(
+        &self,
+        token: &ChainToken,
+        to: &ChainAccount,
+        amount_native: u128,
+    ) -> Result<String, String>; // return tx hash/id
+}

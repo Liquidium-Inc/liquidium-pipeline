@@ -1,9 +1,9 @@
-use std::{fmt, str::FromStr};
+use std::fmt;
 
 use candid::{CandidType, Principal};
 use serde::{Deserialize, Serialize};
 
-use crate::{account::model::Chain, tokens::{asset_id::AssetId, icrc::icrc_token::IcrcToken}};
+use crate::tokens::{asset_id::AssetId, icrc::icrc_token::IcrcToken};
 
 #[derive(Clone, Debug, Serialize, Deserialize, CandidType, PartialEq, Eq)]
 pub enum ChainToken {
@@ -12,9 +12,14 @@ pub enum ChainToken {
         symbol: String,
         decimals: u8,
     },
-    Evm {
-        chain: Chain,
-        token_address: String,
+    EvmNative {
+        chain: String,     // "eth", "arb", "base"
+        symbol: String,    // "ETH"
+        decimals: u8,      // usually 18
+    },
+    EvmErc20 {
+        chain: String,          // "eth", "arb"
+        token_address: String,  // "0x..."
         symbol: String,
         decimals: u8,
     },
@@ -24,21 +29,24 @@ impl ChainToken {
     pub fn chain(&self) -> String {
         match self {
             ChainToken::Icp { .. } => "ICP".to_string(),
-            ChainToken::Evm { chain, .. } => chain.to_string(),
+            ChainToken::EvmNative { chain, .. } => format!("evm-{}", chain),
+            ChainToken::EvmErc20 { chain, .. } => format!("evm-{}", chain),
         }
     }
 
     pub fn symbol(&self) -> String {
         match self {
             ChainToken::Icp { symbol, .. } => symbol.clone(),
-            ChainToken::Evm { symbol, .. } => symbol.clone(),
+            ChainToken::EvmNative { symbol, .. } => symbol.clone(),
+            ChainToken::EvmErc20 { symbol, .. } => symbol.clone(),
         }
     }
 
     pub fn decimals(&self) -> u8 {
         match self {
             ChainToken::Icp { decimals, .. } => decimals.clone(),
-            ChainToken::Evm { decimals, .. } => decimals.clone(),
+            ChainToken::EvmNative { decimals, .. } => decimals.clone(),
+            ChainToken::EvmErc20 { decimals, .. } => decimals.clone(),
         }
     }
 
@@ -50,13 +58,19 @@ impl ChainToken {
                 symbol: symbol.clone(),
             },
 
-            ChainToken::Evm {
+            ChainToken::EvmNative { chain, symbol, .. } => AssetId {
+                chain: format!("evm-{}", chain),
+                address: "native".to_string(),
+                symbol: symbol.clone(),
+            },
+
+            ChainToken::EvmErc20 {
                 chain,
                 token_address,
                 symbol,
                 ..
             } => AssetId {
-                chain: chain.to_string(),
+                chain: format!("evm-{}", chain),
                 address: token_address.clone(),
                 symbol: symbol.clone(),
             },
@@ -70,7 +84,10 @@ impl fmt::Display for ChainToken {
             ChainToken::Icp { symbol, .. } => {
                 write!(f, "ICP:{}", symbol)
             }
-            ChainToken::Evm {
+            ChainToken::EvmNative { chain, symbol, .. } => {
+                write!(f, "EVM[{}]:{}@native", chain, symbol)
+            }
+            ChainToken::EvmErc20 {
                 chain,
                 token_address,
                 symbol,

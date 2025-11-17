@@ -1,6 +1,5 @@
 use std::{collections::HashMap, str::FromStr, sync::Arc};
 
-use async_trait::async_trait;
 use candid::{Encode, Nat, Principal, encode_args};
 use icrc_ledger_types::{
     icrc1::account::Account,
@@ -14,10 +13,7 @@ use log::{debug, info, warn};
 
 use liquidium_pipeline_connectors::pipeline_agent::PipelineAgent;
 
-use crate::swappers::{
-    kong::kong_types::{SwapAmountsReply, SwapArgs, SwapReply, SwapResult},
-    swap_interface::SwapInterface,
-};
+use crate::swappers::kong::kong_types::{SwapAmountsReply, SwapArgs, SwapReply, SwapResult};
 
 static DEX_PRINCIPAL: &str = "2ipq2-uqaaa-aaaar-qailq-cai";
 

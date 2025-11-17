@@ -3,3 +3,4 @@ pub mod backend;
 pub mod token_registry_loader;
 pub mod pipeline_agent;
 pub mod crypto;
+pub mod transfer;

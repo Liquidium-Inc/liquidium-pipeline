@@ -14,7 +14,8 @@ use crate::backend::evm_backend::EvmBackend;
 
 pub struct EvmAccountInfoAdapter<B: EvmBackend> {
     pub backend: Arc<B>,
-    // (chain, token_address) -> ChainBalance
+    // Cache key: (chain, address_or_native) -> ChainBalance
+    // For native assets, use "native" as the address
     cache: Mutex<HashMap<(String, String), ChainBalance>>,
 }
 
@@ -31,46 +32,66 @@ impl<B: EvmBackend> EvmAccountInfoAdapter<B> {
 impl<B: EvmBackend> AccountInfo for EvmAccountInfoAdapter<B> {
     async fn get_balance(&self, token: &ChainToken) -> Result<ChainBalance, String> {
         match token {
-            ChainToken::Evm {
+            ChainToken::EvmNative {
                 chain,
-                token_address,
                 symbol,
                 decimals,
             } => {
-                let amount_native = self.backend.erc20_balance(&chain.to_string(), token_address).await?;
+                let amount_native = self.backend.native_balance(chain).await?;
 
                 Ok(ChainBalance {
-                    chain: chain.clone(),
+                    chain: liquidium_pipeline_core::account::model::Chain::Evm { chain: chain.clone() },
                     symbol: symbol.clone(),
                     amount_native,
                     decimals: *decimals,
                 })
             }
-            _ => Err("EvmAccountInfoAdapter only supports Evm tokens".to_string()),
+            ChainToken::EvmErc20 {
+                chain,
+                token_address,
+                symbol,
+                decimals,
+            } => {
+                let amount_native = self.backend.erc20_balance(chain, token_address).await?;
+
+                Ok(ChainBalance {
+                    chain: liquidium_pipeline_core::account::model::Chain::Evm { chain: chain.clone() },
+                    symbol: symbol.clone(),
+                    amount_native,
+                    decimals: *decimals,
+                })
+            }
+            _ => Err("EvmAccountInfoAdapter only supports EvmNative and EvmErc20 tokens".to_string()),
         }
     }
 
     async fn sync_balance(&self, token: &ChainToken) -> Result<ChainBalance, String> {
         let bal = self.get_balance(token).await?;
 
-        if let ChainToken::Evm {
-            chain, token_address, ..
-        } = token
-        {
+        let cache_key = match token {
+            ChainToken::EvmNative { chain, .. } => Some((chain.clone(), "native".to_string())),
+            ChainToken::EvmErc20 { chain, token_address, .. } => Some((chain.clone(), token_address.clone())),
+            _ => None,
+        };
+
+        if let Some((chain, addr)) = cache_key {
             let mut lock = self.cache.lock().unwrap();
-            lock.insert((chain.to_string(), token_address.clone()), bal.clone());
+            lock.insert((chain, addr), bal.clone());
         }
 
         Ok(bal)
     }
 
     fn get_cached_balance(&self, token: &ChainToken) -> Option<ChainBalance> {
-        if let ChainToken::Evm {
-            chain, token_address, ..
-        } = token
-        {
+        let cache_key = match token {
+            ChainToken::EvmNative { chain, .. } => Some((chain.clone(), "native".to_string())),
+            ChainToken::EvmErc20 { chain, token_address, .. } => Some((chain.clone(), token_address.clone())),
+            _ => None,
+        };
+
+        if let Some((chain, addr)) = cache_key {
             let lock = self.cache.lock().unwrap();
-            return lock.get(&(chain.to_string(), token_address.clone())).cloned();
+            return lock.get(&(chain, addr)).cloned();
         }
         None
     }
@@ -96,14 +117,17 @@ impl<B: EvmBackend> AccountActions for EvmAccountActionsAdapter<B> {
         _from_subaccount: bool,
     ) -> Result<TxRef, String> {
         match token {
-            ChainToken::Evm {
-                chain, token_address, ..
-            } => {
-                let tx_hash = self.backend.erc20_transfer(&chain.to_string(), token_address, to, amount).await?;
-
+            ChainToken::EvmNative { chain, .. } => {
+                let tx_hash = self.backend.native_transfer(chain, to, amount).await?;
                 Ok(TxRef::EvmTxHash(tx_hash))
             }
-            _ => Err("EvmAccountActionsAdapter only supports Evm tokens".to_string()),
+            ChainToken::EvmErc20 {
+                chain, token_address, ..
+            } => {
+                let tx_hash = self.backend.erc20_transfer(chain, token_address, to, amount).await?;
+                Ok(TxRef::EvmTxHash(tx_hash))
+            }
+            _ => Err("EvmAccountActionsAdapter only supports EvmNative and EvmErc20 tokens".to_string()),
         }
     }
 }

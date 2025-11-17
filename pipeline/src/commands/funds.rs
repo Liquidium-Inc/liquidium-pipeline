@@ -4,8 +4,10 @@ use prettytable::{Cell, Row, Table, format};
 use liquidium_pipeline_core::account::model::ChainBalance;
 
 pub async fn funds() -> Result<(), String> {
+
     let ctx = init_context().await?;
 
+    println!("\n=== Account (Main / Liquidator) ===");
     // Main balances
     let main_results = ctx.main_service.sync_all().await;
 
@@ -17,7 +19,8 @@ pub async fn funds() -> Result<(), String> {
     ]));
 
     println!("\n=== Account (Main / Liquidator) ===");
-    println!("ICP principal: {}\n", ctx.config.liquidator_principal.to_text());
+    println!("ICP principal: {}", ctx.config.liquidator_principal.to_text());
+    println!("EVM address: {}\n", ctx.evm_address);
 
     for r in main_results {
         match r {
@@ -62,18 +65,22 @@ fn format_chain_balance(bal: &ChainBalance) -> String {
     let raw = bal.amount_native.clone();
     let decimals = bal.decimals as u32;
 
-    let int_part = raw.clone() / 10u128.pow(decimals);
-    let frac_part = raw % 10u128.pow(decimals);
-
-    if decimals > 0 {
-        format!(
-            "{}.{:0>width$} {}",
-            int_part,
-            frac_part,
-            bal.symbol,
-            width = decimals as usize
-        )
-    } else {
-        format!("{} {}", int_part, bal.symbol)
+    if decimals == 0 {
+        return format!("{} {}", raw, bal.symbol);
     }
+
+    // clamp to max 6 displayed decimals
+    let display_decimals = decimals.min(6);
+    let scale = 10u128.pow(decimals - display_decimals);
+    let scaled = raw / scale;
+
+    let int_part = scaled.clone() / 10u128.pow(display_decimals);
+    let frac_part = scaled % 10u128.pow(display_decimals);
+
+    let mut frac_clean = frac_part.to_string();
+    frac_clean = frac_clean.replace('_', "");
+
+    let frac_str = format!("{:0>width$}", frac_clean, width = display_decimals as usize);
+
+    format!("{}.{} {}", int_part, frac_str, bal.symbol)
 }

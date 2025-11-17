@@ -1,10 +1,17 @@
 use candid::{CandidType, Nat};
+use icrc_ledger_types::icrc1::account::Account;
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Serialize, Deserialize,CandidType, PartialEq, Eq)]
 pub enum Chain {
     Icp,
     Evm { chain: String }, // "ETH", "ARB", ...
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, CandidType, PartialEq, Eq)]
+pub enum ChainAccount {
+    Icp(Account),
+    Evm(String), // EVM address as string
 }
 
 impl std::fmt::Display for Chain {

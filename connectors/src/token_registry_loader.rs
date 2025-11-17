@@ -1,10 +1,8 @@
 use std::collections::{HashMap, HashSet};
-use std::str::FromStr;
 use std::{env, sync::Arc};
 
 use candid::Principal;
 
-use liquidium_pipeline_core::account::model::Chain;
 use liquidium_pipeline_core::tokens::{chain_token::ChainToken, token_registry::TokenRegistry};
 
 use crate::backend::evm_backend::EvmBackend;
@@ -57,18 +55,32 @@ where
             symbol,
             decimals,
         })
-    } else {
-        let decimals = evm_backend
-            .erc20_decimals(&chain, &address)
-            .await
-            .map_err(|e| format!("evm decimals for `{spec}` failed: {e}"))?;
+    } else if let Some(chain_name) = chain.strip_prefix("evm-") {
+        // EVM chain: evm-eth, evm-arb, etc.
+        if address == "native" {
+            // Native asset (ETH, ARB, etc.)
+            // Native assets always have 18 decimals
+            Ok(ChainToken::EvmNative {
+                chain: chain_name.to_string(),
+                symbol,
+                decimals: 18,
+            })
+        } else {
+            // ERC-20 token
+            let decimals = evm_backend
+                .erc20_decimals(chain_name, &address)
+                .await
+                .map_err(|e| format!("evm decimals for `{spec}` failed: {e}"))?;
 
-        Ok(ChainToken::Evm {
-            chain: Chain::from_str(&chain)?,
-            token_address: address,
-            symbol,
-            decimals,
-        })
+            Ok(ChainToken::EvmErc20 {
+                chain: chain_name.to_string(),
+                token_address: address,
+                symbol,
+                decimals,
+            })
+        }
+    } else {
+        Err(format!("unsupported chain `{chain}` in spec `{spec}`"))
     }
 }
 

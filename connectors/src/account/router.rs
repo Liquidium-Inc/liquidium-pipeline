@@ -26,21 +26,21 @@ impl AccountInfo for MultiChainAccountInfoRouter {
     async fn get_balance(&self, token: &ChainToken) -> Result<ChainBalance, String> {
         match token {
             ChainToken::Icp { .. } => self.icp.get_balance(token).await,
-            ChainToken::Evm { .. } => self.evm.get_balance(token).await,
+            ChainToken::EvmNative { .. } | ChainToken::EvmErc20 { .. } => self.evm.get_balance(token).await,
         }
     }
 
     async fn sync_balance(&self, token: &ChainToken) -> Result<ChainBalance, String> {
         match token {
             ChainToken::Icp { .. } => self.icp.sync_balance(token).await,
-            ChainToken::Evm { .. } => self.evm.sync_balance(token).await,
+            ChainToken::EvmNative { .. } | ChainToken::EvmErc20 { .. } => self.evm.sync_balance(token).await,
         }
     }
 
     fn get_cached_balance(&self, token: &ChainToken) -> Option<ChainBalance> {
         match token {
             ChainToken::Icp { .. } => self.icp.get_cached_balance(token),
-            ChainToken::Evm { .. } => self.evm.get_cached_balance(token),
+            ChainToken::EvmNative { .. } | ChainToken::EvmErc20 { .. } => self.evm.get_cached_balance(token),
         }
     }
 }
@@ -67,7 +67,7 @@ impl AccountActions for MultiChainAccountActionsRouter {
     ) -> Result<TxRef, String> {
         match token {
             ChainToken::Icp { .. } => self.icp.transfer(token, to, amount_native, from_subaccount).await,
-            ChainToken::Evm { .. } => self.evm.transfer(token, to, amount_native, from_subaccount).await,
+            ChainToken::EvmNative { .. } | ChainToken::EvmErc20 { .. } => self.evm.transfer(token, to, amount_native, from_subaccount).await,
         }
     }
 }

@@ -45,7 +45,7 @@ pub async fn build_backends(config: &Config) -> Result<BackendSet, String> {
         PrivateKeySigner::from_str(&config.evm_private_key).map_err(|e| format!("invalid EVM private key: {e}"))?;
 
     let provider = ProviderBuilder::new()
-        .wallet(signer)
+        .wallet(signer.clone())
         .network::<AnyNetwork>()
         .connect_http(rpc_url.parse().unwrap());
 

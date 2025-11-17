@@ -1,4 +1,3 @@
-use std::str::FromStr;
 
 use std::{
     collections::HashMap,
@@ -16,15 +15,12 @@ use liquidium_pipeline_core::{
     tokens::chain_token::ChainToken,
 };
 
-use bip32::{DerivationPath, XPrv};
-use bip39::{Language, Mnemonic};
 use candid::Principal;
 use ic_agent::Identity;
 use ic_agent::identity::{BasicIdentity, Secp256k1Identity};
 use icrc_ledger_types::icrc1::account::Account;
-use k256::SecretKey;
 
-use icrc_ledger_types::icrc1::{account::Subaccount, transfer::TransferArg};
+use icrc_ledger_types::icrc1::account::Subaccount;
 
 pub fn create_identity_from_pem_file(pem_file: &str) -> Result<Box<dyn Identity>, String> {
     match BasicIdentity::from_pem_file(pem_file) {

@@ -29,30 +29,30 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Starts the liquidation bot loop
+    // Starts the liquidation bot loop
     Run,
 
-    /// Shows wallet token balances
+    // Shows wallet token balances
     Balance,
 
-    /// Withdraws funds. Without flags, starts the interactive wizard.
-    /// With flags, performs a non-interactive withdrawal.
+    // Withdraws funds. Without flags, starts the interactive wizard.
+    // With flags, performs a non-interactive withdrawal.
     Withdraw {
-        /// Source account: "main" or "recovery" (non-interactive)
+        // Source account: "main" or "recovery" (non-interactive)
         #[arg(long)]
         source: Option<String>,
-        /// Destination: "main" or full Account string (non-interactive)
+        // Destination: "main" or full Account string (non-interactive)
         #[arg(long)]
         destination: Option<String>,
-        /// Asset symbol (e.g., "ckUSDT") or "all" (non-interactive)
+        // Asset symbol (e.g., "ckUSDT") or "all" (non-interactive)
         #[arg(long)]
         asset: Option<String>,
-        /// Amount as decimal (respects token decimals) or "all" (non-interactive)
+        // Amount as decimal (respects token decimals) or "all" (non-interactive)
         #[arg(long)]
         amount: Option<String>,
     },
 
-    /// Account management commands
+    // Account management commands
     Account {
         #[command(subcommand)]
         subcommand: AccountCommands,
@@ -61,10 +61,10 @@ enum Commands {
 
 #[derive(Subcommand)]
 enum AccountCommands {
-    /// Shows the wallet principal
+    // Shows the wallet principal
     Show,
 
-    /// Generates a new identity or account key (implementation specific)
+    // Generates a new identity or account key (implementation specific)
     New,
 }
 
@@ -78,7 +78,7 @@ async fn main() {
             // run_liquidation_loop().await;
         }
         Commands::Balance => {
-            commands::funds::funds().await;
+            commands::funds::funds().await.unwrap();
         }
         Commands::Withdraw {
             source,
@@ -95,7 +95,7 @@ async fn main() {
                     asset.as_deref(),
                     amount.as_deref(),
                 ) {
-                    (Some(s), Some(d), Some(a), Some(am)) => {
+                    (Some(_s), Some(_d), Some(_a), Some(_am)) => {
                         // commands::withdraw::withdraw_noninteractive(s, d, a, am).await;
                     }
                     _ => {
@@ -106,7 +106,7 @@ async fn main() {
                 }
             } else {
                 // Interactive wizard
-                // commands::withdraw::withdraw().await;
+                commands::withdraw::withdraw().await;
             }
         }
         Commands::Account { subcommand } => match subcommand {

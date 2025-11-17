@@ -4,7 +4,7 @@ use liquidium_pipeline_connectors::account::icp_account::RECOVERY_ACCOUNT;
 use std::fs::{self, OpenOptions};
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
-use std::{env, fs::File, io::Write, path::PathBuf};
+use std::{env, io::Write, path::PathBuf};
 
 use bip39::{Language, Mnemonic};
 use alloy::signers::local::PrivateKeySigner;
