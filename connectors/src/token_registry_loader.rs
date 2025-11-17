@@ -1,8 +1,10 @@
 use std::collections::{HashMap, HashSet};
+use std::str::FromStr;
 use std::{env, sync::Arc};
 
 use candid::Principal;
 
+use liquidium_pipeline_core::account::model::Chain;
 use liquidium_pipeline_core::tokens::{chain_token::ChainToken, token_registry::TokenRegistry};
 
 use crate::backend::evm_backend::EvmBackend;
@@ -60,8 +62,9 @@ where
             .erc20_decimals(&chain, &address)
             .await
             .map_err(|e| format!("evm decimals for `{spec}` failed: {e}"))?;
+
         Ok(ChainToken::Evm {
-            chain,
+            chain: Chain::from_str(&chain)?,
             token_address: address,
             symbol,
             decimals,

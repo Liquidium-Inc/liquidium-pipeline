@@ -1,9 +1,9 @@
-use std::fmt;
+use std::{fmt, str::FromStr};
 
 use candid::{CandidType, Principal};
 use serde::{Deserialize, Serialize};
 
-use crate::tokens::{asset_id::AssetId, icrc::icrc_token::IcrcToken};
+use crate::{account::model::Chain, tokens::{asset_id::AssetId, icrc::icrc_token::IcrcToken}};
 
 #[derive(Clone, Debug, Serialize, Deserialize, CandidType, PartialEq, Eq)]
 pub enum ChainToken {
@@ -13,7 +13,7 @@ pub enum ChainToken {
         decimals: u8,
     },
     Evm {
-        chain: String,
+        chain: Chain,
         token_address: String,
         symbol: String,
         decimals: u8,
@@ -24,7 +24,7 @@ impl ChainToken {
     pub fn chain(&self) -> String {
         match self {
             ChainToken::Icp { .. } => "ICP".to_string(),
-            ChainToken::Evm { chain, .. } => chain.clone(),
+            ChainToken::Evm { chain, .. } => chain.to_string(),
         }
     }
 
@@ -56,7 +56,7 @@ impl ChainToken {
                 symbol,
                 ..
             } => AssetId {
-                chain: chain.clone(),
+                chain: chain.to_string(),
                 address: token_address.clone(),
                 symbol: symbol.clone(),
             },
@@ -82,6 +82,7 @@ impl fmt::Display for ChainToken {
         }
     }
 }
+
 
 impl From<IcrcToken> for ChainToken {
     fn from(value: IcrcToken) -> Self {

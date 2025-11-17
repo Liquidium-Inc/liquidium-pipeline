@@ -1,8 +1,13 @@
 use icrc_ledger_types::icrc1::account::Account;
 use liquidium_pipeline::config::Config;
 use liquidium_pipeline_connectors::account::icp_account::RECOVERY_ACCOUNT;
-use openssl::pkey::PKey;
-use std::{fs, path::Path};
+use std::fs::{self, OpenOptions};
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
+use std::{env, fs::File, io::Write, path::PathBuf};
+
+use bip39::{Language, Mnemonic};
+use alloy::signers::local::PrivateKeySigner;
 
 use prettytable::{Cell, Row, Table, format};
 
@@ -22,12 +27,24 @@ pub async fn show() {
             ]));
 
             let recovery = Account {
-                owner: config.trader_principal,
+                owner: config.liquidator_principal,
                 subaccount: Some(*RECOVERY_ACCOUNT),
             };
             table.add_row(Row::new(vec![
                 Cell::new("Recovery Account"),
                 Cell::new(&recovery.to_string()),
+            ]));
+
+            // Derive EVM account from the configured EVM private key.
+            let evm_signer: PrivateKeySigner = config
+                .evm_private_key
+                .parse()
+                .expect("invalid EVM private key in config");
+            let evm_address = evm_signer.address();
+
+            table.add_row(Row::new(vec![
+                Cell::new("EVM Account"),
+                Cell::new(&format!("{evm_address}")),
             ]));
 
             table.printstd();
@@ -38,59 +55,10 @@ pub async fn show() {
     }
 }
 
-use std::fs::OpenOptions;
-#[cfg(unix)]
-use std::os::unix::fs::OpenOptionsExt;
-use std::{env, io::Write, path::PathBuf};
-
-fn default_identity_path() -> PathBuf {
-    // $HOME/.config/liquidator/id.pem
+fn default_mnemonic_path() -> PathBuf {
+    // $HOME/.liquidium-pipeline/wallets/mnemonic.txt
     let home = env::var("HOME").expect("HOME not set");
-    PathBuf::from(home).join(".liquidium-pipeline/wallets/id.pem")
-}
-
-fn default_trader_identity_path() -> PathBuf {
-    // $HOME/.config/liquidator/trader.pem
-    let home = env::var("HOME").expect("HOME not set");
-    PathBuf::from(home).join(".liquidium-pipeline/wallets/trader.pem")
-}
-
-fn write_new_ed25519_key(path: &Path) -> Result<(), String> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|e| format!("Failed to create directory {}: {e}", parent.display()))?;
-    }
-
-    if Path::new(path).exists() {
-        println!("ℹ️ Identity already exists at {}. Skipping creation.", path.display());
-        return Ok(());
-    }
-
-    let key = PKey::generate_ed25519().map_err(|e| format!("Failed to generate key: {e}"))?;
-    let private_pem = key
-        .private_key_to_pem_pkcs8()
-        .map_err(|e| format!("Failed to encode key: {e}"))?;
-
-    #[cfg(unix)]
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(path)
-        .map_err(|e| format!("Failed to create {}: {e}", path.display()))?;
-
-    #[cfg(not(unix))]
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)
-        .map_err(|e| format!("Failed to create {}: {e}", path.display()))?;
-
-    if let Err(e) = file.write_all(&private_pem) {
-        let _ = fs::remove_file(path);
-        return Err(format!("Failed to write {}: {e}", path.display()));
-    }
-
-    Ok(())
+    PathBuf::from(home).join(".liquidium-pipeline/wallets/mnemonic.txt")
 }
 
 pub async fn new() {
@@ -101,37 +69,68 @@ pub async fn new() {
     ));
     let _ = dotenv::dotenv();
 
-    let path: PathBuf = env::var("IDENTITY_PEM")
+    // Path where we will store the mnemonic phrase.
+    // Can be overridden with MNEMONIC_FILE, otherwise defaults under $HOME.
+    let mnemonic_path: PathBuf = env::var("MNEMONIC_FILE")
         .map(PathBuf::from)
-        .unwrap_or_else(|_| default_identity_path());
+        .unwrap_or_else(|_| default_mnemonic_path());
 
-    let trader_path: PathBuf = env::var("TRADER_IDENTITY_PEM")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| default_trader_identity_path());
-
-    // Create liquidator identity
-    match write_new_ed25519_key(&path) {
-        Ok(()) => {
-            println!("✅ Liquidator private key saved to {}", path.display());
-        }
-        Err(e) => {
-            eprintln!("❌ Liquidator key error: {e}");
-        }
+    if mnemonic_path.exists() {
+        println!(
+            "Mnemonic file already exists at {}. Not overwriting.",
+            mnemonic_path.display()
+        );
+        println!("If you want to regenerate, delete the file manually and run this command again.");
+        return;
     }
 
-    // Create trader identity
-    match write_new_ed25519_key(&trader_path) {
-        Ok(()) => {
-            println!("✅ Trader private key saved to {}", trader_path.display());
-        }
+    // Generate a fresh 24-word English mnemonic.
+    let mnemonic = Mnemonic::generate_in(Language::English, 24).unwrap();
+    let phrase = mnemonic.to_string();
+
+    if let Some(parent) = mnemonic_path.parent()
+        && let Err(e) = fs::create_dir_all(parent)
+    {
+        eprintln!("Failed to create directory {}: {e}", parent.display());
+        return;
+    }
+
+    #[cfg(unix)]
+    let mut file = match OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&mnemonic_path)
+    {
+        Ok(f) => f,
         Err(e) => {
-            eprintln!("❌ Trader key error: {e}");
+            eprintln!("Failed to create {}: {e}", mnemonic_path.display());
+            return;
         }
+    };
+
+    #[cfg(not(unix))]
+    let mut file = match OpenOptions::new().write(true).create_new(true).open(&mnemonic_path) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("Failed to create {}: {e}", mnemonic_path.display());
+            return;
+        }
+    };
+
+    if let Err(e) = writeln!(file, "{phrase}") {
+        let _ = fs::remove_file(&mnemonic_path);
+        eprintln!("Failed to write {}: {e}", mnemonic_path.display());
+        return;
     }
 
     println!(
-        "   Tip: set IDENTITY_PEM={} and \n TRADER_IDENTITY_PEM={} in your environment",
-        path.display(),
-        trader_path.display()
+        "✅ New 24-word mnemonic generated and saved to {}",
+        mnemonic_path.display()
+    );
+    println!("   IMPORTANT: Back this up securely. Anyone with this phrase controls all derived wallets.");
+    println!(
+        "   Tip: set MNEMONIC_FILE={} in your environment, or configure your pipeline to read it.",
+        mnemonic_path.display()
     );
 }

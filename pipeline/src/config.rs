@@ -1,3 +1,5 @@
+use alloy::hex::ToHexExt;
+use bip39::Mnemonic;
 use candid::Principal;
 
 use ic_agent::Identity;
@@ -5,8 +7,10 @@ use icrc_ledger_types::icrc1::account::Account;
 use indicatif::MultiProgress;
 use indicatif_log_bridge::LogWrapper;
 use liquidium_pipeline_connectors::account::icp_account::{RECOVERY_ACCOUNT, derive_icp_identity};
+use liquidium_pipeline_connectors::crypto::derivation::derive_evm_private_key;
 use log::debug;
 
+use alloy::signers::local::PrivateKeySigner;
 use std::env;
 use std::sync::Arc;
 
@@ -106,8 +110,13 @@ impl Config {
 
         let ic_url = env::var("IC_URL").unwrap();
         let export_path = env::var("EXPORT_PATH").unwrap_or("executions.csv".to_string());
-        // Load base mnemonic and derive child identities
-        let mnemonic = env::var("MNEMONIC").expect("MNEMONIC not configured");
+
+        let mnemonic_path = env::var("MNEMONIC_FILE").expect("MNEMONIC_FILE not configured");
+
+        let mnemonic = std::fs::read_to_string(&mnemonic_path)
+            .expect("failed to read mnemonic file")
+            .trim()
+            .to_string();
 
         let liquidator_identity =
             derive_icp_identity(&mnemonic, 0, 0).expect("could not create liquidator identity from mnemonic");
@@ -131,7 +140,16 @@ impl Config {
 
         // The db path
         let db_path = env::var("DB_PATH").unwrap_or(format!("{}/wal.db", home));
+
+        // Derive EVM private key
+        let sk = derive_evm_private_key(&mnemonic, 0, 0)?;
+        let evm_signer: PrivateKeySigner = PrivateKeySigner::from_slice(&sk.to_bytes()).map_err(|e| e.to_string())?;
+        let hex = evm_signer.to_bytes().encode_hex();
+        let evm_private_key = format!("{:#}", hex);
+
         Ok(Arc::new(Config {
+            evm_private_key,
+            evm_rpc_url: env::var("EVM_RPC_URL").expect("EVM_RPC_URL not configured"),
             liquidator_identity: Arc::new(liquidator_identity),
             ic_url,
             liquidator_principal,

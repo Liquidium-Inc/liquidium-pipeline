@@ -1,5 +1,21 @@
 use std::str::FromStr;
 
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex},
+};
+
+use crate::backend::icp_backend::IcpBackend;
+use crate::crypto::derivation::derive_evm_private_key;
+use async_trait::async_trait;
+use liquidium_pipeline_core::{
+    account::{
+        actions::AccountInfo,
+        model::{Chain, ChainBalance},
+    },
+    tokens::chain_token::ChainToken,
+};
+
 use bip32::{DerivationPath, XPrv};
 use bip39::{Language, Mnemonic};
 use candid::Principal;
@@ -9,7 +25,6 @@ use icrc_ledger_types::icrc1::account::Account;
 use k256::SecretKey;
 
 use icrc_ledger_types::icrc1::{account::Subaccount, transfer::TransferArg};
-
 
 pub fn create_identity_from_pem_file(pem_file: &str) -> Result<Box<dyn Identity>, String> {
     match BasicIdentity::from_pem_file(pem_file) {
@@ -25,28 +40,7 @@ pub fn create_identity_from_pem_file(pem_file: &str) -> Result<Box<dyn Identity>
 }
 
 pub fn derive_icp_identity(mnemonic: &str, account: u32, index: u32) -> Result<Secp256k1Identity, String> {
-    // Parse mnemonic
-    let mnemonic = Mnemonic::parse_in(Language::English, mnemonic).map_err(|e| format!("invalid mnemonic: {e}"))?;
-
-    // Seed
-    let seed = mnemonic.to_seed("");
-
-    // Master XPrv
-    let master = XPrv::new(seed).map_err(|e| format!("xprv error: {e}"))?;
-
-    // ICP-ish path
-    let path_str = format!("m/44'/223'/{}'/0/{}", account, index);
-    let derivation = DerivationPath::from_str(&path_str).map_err(|e| format!("path error: {e}"))?;
-
-    // Walk path via derive_child
-    let mut node = master;
-    for cn in derivation.into_iter() {
-        node = node.derive_child(cn).map_err(|e| format!("derive_child error: {e}"))?;
-    }
-
-    let raw = node.private_key().to_bytes();
-    let sk = SecretKey::from_bytes(&raw).map_err(|e| format!("secret key error: {e}"))?;
-
+    let sk = derive_evm_private_key(mnemonic, account, index)?;
     Ok(Secp256k1Identity::from_private_key(sk))
 }
 
@@ -184,3 +178,79 @@ pub const RECOVERY_ACCOUNT: &Subaccount = &[
 //             .map(|res| res.to_string().replace("_", ""))
 //     }
 // }
+
+// Adapter that turns an IcpBackend + Account into a core::AccountInfo implementation.
+pub struct IcpAccountInfoAdapter<B: IcpBackend> {
+    backend: Arc<B>,
+    account: Account,
+    cache: Arc<Mutex<HashMap<(Principal, String), ChainBalance>>>,
+}
+
+impl<B: IcpBackend> IcpAccountInfoAdapter<B> {
+    pub fn new(backend: Arc<B>, account: Account) -> Self {
+        Self {
+            backend,
+            account,
+            cache: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    pub fn account(&self) -> &Account {
+        &self.account
+    }
+}
+
+#[async_trait]
+impl<B> AccountInfo for IcpAccountInfoAdapter<B>
+where
+    B: IcpBackend + Send + Sync,
+{
+    async fn get_balance(&self, token: &ChainToken) -> Result<ChainBalance, String> {
+        if let Some(cached) = self.get_cached_balance(token) {
+            return Ok(cached);
+        }
+        self.sync_balance(token).await
+    }
+
+    async fn sync_balance(&self, token: &ChainToken) -> Result<ChainBalance, String> {
+        match token {
+            ChainToken::Icp {
+                ledger,
+                symbol,
+                decimals,
+            } => {
+                let amount = self
+                    .backend
+                    .icrc1_balance(*ledger, self.account())
+                    .await
+                    .map_err(|e| format!("icp get_balance failed: {e}"))?;
+
+                let balance = ChainBalance {
+                    chain: Chain::Icp,
+                    amount_native: amount,
+                    decimals: *decimals,
+                    symbol: symbol.clone(),
+                };
+
+                // Cache key: (ledger principal, symbol)
+                {
+                    let mut cache = self.cache.lock().expect("icp balance cache poisoned");
+                    cache.insert((*ledger, symbol.clone()), balance.clone());
+                }
+
+                Ok(balance)
+            }
+            _ => Err("IcpAccountInfoAdapter only supports ChainToken::Icp".to_string()),
+        }
+    }
+
+    fn get_cached_balance(&self, token: &ChainToken) -> Option<ChainBalance> {
+        match token {
+            ChainToken::Icp { ledger, symbol, .. } => {
+                let cache = self.cache.lock().ok()?;
+                cache.get(&(*ledger, symbol.clone())).cloned()
+            }
+            _ => None,
+        }
+    }
+}

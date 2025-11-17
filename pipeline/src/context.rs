@@ -1,0 +1,154 @@
+use std::sync::Arc;
+
+use alloy::network::AnyNetwork;
+use alloy::providers::{Provider, ProviderBuilder, RootProvider};
+use alloy::signers::local::PrivateKeySigner;
+
+use ic_agent::Agent;
+use icrc_ledger_types::icrc1::account::Account;
+use liquidium_pipeline_connectors::account::evm_account::EvmAccountInfoAdapter;
+use liquidium_pipeline_connectors::account::icp_account::{IcpAccountInfoAdapter, RECOVERY_ACCOUNT};
+use liquidium_pipeline_connectors::backend::evm_backend::EvmBackendImpl;
+use liquidium_pipeline_core::balance_service::BalanceService;
+
+use liquidium_pipeline_core::{account::actions::AccountInfo, tokens::token_registry::TokenRegistry};
+
+use liquidium_pipeline_connectors::{
+    account::router::MultiChainAccountInfoRouter, backend::icp_backend::IcpBackendImpl,
+    token_registry_loader::load_token_registry,
+};
+
+use crate::config::Config;
+
+pub struct PipelineContext {
+    pub config: Arc<Config>,
+    pub registry: Arc<TokenRegistry>,
+    pub main_service: BalanceService,
+    pub recovery_service: BalanceService,
+}
+
+pub struct PipelineContextBuilder<P: Provider<AnyNetwork>> {
+    config: Arc<Config>,
+    evm_provider_main: Option<P>,
+    ic_agent_main: Option<Arc<Agent>>,
+    ic_agent_trader: Option<Arc<Agent>>,
+}
+
+impl<P: Provider<AnyNetwork> + 'static> PipelineContextBuilder<P> {
+    pub async fn new() -> Result<Self, String> {
+        let config = Config::load().await.map_err(|e| format!("config load failed: {e}"))?;
+        Ok(Self {
+            config,
+            evm_provider_main: None,
+            ic_agent_main: None,
+            ic_agent_trader: None,
+        })
+    }
+
+    pub fn with_main_evm_provider(mut self, provider: P) -> Self {
+        self.evm_provider_main = Some(provider);
+        self
+    }
+
+    pub fn with_main_ic_agent(mut self, agent: Arc<Agent>) -> Self {
+        self.ic_agent_main = Some(agent);
+        self
+    }
+
+    pub fn with_trader_ic_agent(mut self, agent: Arc<Agent>) -> Self {
+        self.ic_agent_trader = Some(agent);
+        self
+    }
+
+    pub async fn build(self) -> Result<PipelineContext, String> {
+        let config = self.config;
+
+        let icp_backend_main = Arc::new(IcpBackendImpl::new(self.ic_agent_main.ok_or("missing IC Main Agent")?));
+        let icp_backend_trader = Arc::new(IcpBackendImpl::new(self.ic_agent_trader.ok_or("missing IC Trader")?));
+
+        // Use provided EVM providers or fail
+        let main_provider = self.evm_provider_main.ok_or("missing main EVM provider")?;
+
+        let evm_backend_main = Arc::new(EvmBackendImpl::new(main_provider.erased()));
+        let evm_backend_trader = evm_backend_main.clone();
+
+        let registry = Arc::new(load_token_registry(icp_backend_main.clone(), evm_backend_main.clone()).await?);
+
+        let main_icp_account = Account {
+            owner: config.liquidator_principal,
+            subaccount: None,
+        };
+
+        let recovery_icp_account = Account {
+            owner: config.liquidator_principal,
+            subaccount: Some(*RECOVERY_ACCOUNT),
+        };
+
+        let icp_info_main = Arc::new(IcpAccountInfoAdapter::new(icp_backend_main.clone(), main_icp_account));
+        let evm_info_main = Arc::new(EvmAccountInfoAdapter::new(evm_backend_main.clone()));
+        let main_accounts: Arc<dyn AccountInfo + Send + Sync> =
+            Arc::new(MultiChainAccountInfoRouter::new(icp_info_main, evm_info_main));
+
+        let icp_info_recovery = Arc::new(IcpAccountInfoAdapter::new(
+            icp_backend_trader.clone(),
+            recovery_icp_account,
+        ));
+        let evm_info_recovery = Arc::new(EvmAccountInfoAdapter::new(evm_backend_trader.clone()));
+        let recovery_accounts: Arc<dyn AccountInfo + Send + Sync> =
+            Arc::new(MultiChainAccountInfoRouter::new(icp_info_recovery, evm_info_recovery));
+
+        let main_service = BalanceService::new(registry.clone(), main_accounts);
+        let recovery_service = BalanceService::new(registry.clone(), recovery_accounts);
+
+        Ok(PipelineContext {
+            config: config.clone(),
+            registry,
+            main_service,
+            recovery_service,
+        })
+    }
+}
+
+pub async fn init_context() -> Result<PipelineContext, String> {
+    // Start from the builder so we keep one place that owns Config.
+    let mut builder = PipelineContextBuilder::new().await?;
+    let config = builder.config.clone();
+
+    // Build ICP agents for main and trader accounts.
+    let agent_main = Arc::new(
+        Agent::builder()
+            .with_url(config.ic_url.clone())
+            .with_identity(config.liquidator_identity.clone())
+            .with_max_tcp_error_retries(3)
+            .build()
+            .map_err(|e| format!("ic agent(main) build: {e}"))?,
+    );
+
+    let agent_trader = Arc::new(
+        Agent::builder()
+            .with_url(config.ic_url.clone())
+            .with_identity(config.trader_identity.clone())
+            .with_max_tcp_error_retries(3)
+            .build()
+            .map_err(|e| format!("ic agent(trader) build: {e}"))?,
+    );
+
+    // Build a wallet-backed EVM RootProvider from config.evm_url and config.evm_private_key.
+    let signer: PrivateKeySigner = config
+        .evm_private_key
+        .parse()
+        .map_err(|e| format!("failed parsing evm private key: {e}"))?;
+
+    let main_provider = ProviderBuilder::new()
+        .network::<AnyNetwork>()
+        .wallet(signer)
+        .connect_http(config.evm_rpc_url.parse().unwrap());
+
+    // Feed everything into the builder and let it wire backends, routers, and services.
+    builder = builder
+        .with_main_ic_agent(agent_main)
+        .with_trader_ic_agent(agent_trader)
+        .with_main_evm_provider(main_provider);
+
+    builder.build().await
+}

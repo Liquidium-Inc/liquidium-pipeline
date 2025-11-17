@@ -17,7 +17,7 @@ mod watchdog;
 use clap::{Parser, Subcommand};
 mod backend_factory;
 
-use commands::liquidation_loop::run_liquidation_loop;
+// use commands::liquidation_loop::run_liquidation_loop;
 
 #[derive(Parser)]
 #[command(name = "liquidator")]
@@ -75,7 +75,7 @@ async fn main() {
 
     match &cli.command {
         Commands::Run => {
-            run_liquidation_loop().await;
+            // run_liquidation_loop().await;
         }
         Commands::Balance => {
             commands::funds::funds().await;
@@ -96,7 +96,7 @@ async fn main() {
                     amount.as_deref(),
                 ) {
                     (Some(s), Some(d), Some(a), Some(am)) => {
-                        commands::withdraw::withdraw_noninteractive(s, d, a, am).await;
+                        // commands::withdraw::withdraw_noninteractive(s, d, a, am).await;
                     }
                     _ => {
                         eprintln!(
@@ -106,7 +106,7 @@ async fn main() {
                 }
             } else {
                 // Interactive wizard
-                commands::withdraw::withdraw().await;
+                // commands::withdraw::withdraw().await;
             }
         }
         Commands::Account { subcommand } => match subcommand {

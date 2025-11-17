@@ -47,7 +47,7 @@ impl<A: PipelineAgent> IcpBackendImpl<A> {
 #[async_trait]
 impl<A: PipelineAgent> IcpBackend for IcpBackendImpl<A> {
     async fn icrc1_balance(&self, ledger: Principal, account: &Account) -> Result<Nat, String> {
-        self.query::<Nat>(ledger, "icrc1_balance", account.clone()).await
+        self.query::<Nat>(ledger, "icrc1_balance", *account).await
     }
 
     async fn icrc1_transfer(

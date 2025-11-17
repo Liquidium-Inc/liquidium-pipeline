@@ -37,7 +37,7 @@ impl<B: EvmBackend> AccountInfo for EvmAccountInfoAdapter<B> {
                 symbol,
                 decimals,
             } => {
-                let amount_native = self.backend.erc20_balance(chain, token_address).await?;
+                let amount_native = self.backend.erc20_balance(&chain.to_string(), token_address).await?;
 
                 Ok(ChainBalance {
                     chain: chain.clone(),
@@ -58,7 +58,7 @@ impl<B: EvmBackend> AccountInfo for EvmAccountInfoAdapter<B> {
         } = token
         {
             let mut lock = self.cache.lock().unwrap();
-            lock.insert((chain.clone(), token_address.clone()), bal.clone());
+            lock.insert((chain.to_string(), token_address.clone()), bal.clone());
         }
 
         Ok(bal)
@@ -70,7 +70,7 @@ impl<B: EvmBackend> AccountInfo for EvmAccountInfoAdapter<B> {
         } = token
         {
             let lock = self.cache.lock().unwrap();
-            return lock.get(&(chain.clone(), token_address.clone())).cloned();
+            return lock.get(&(chain.to_string(), token_address.clone())).cloned();
         }
         None
     }
@@ -99,7 +99,7 @@ impl<B: EvmBackend> AccountActions for EvmAccountActionsAdapter<B> {
             ChainToken::Evm {
                 chain, token_address, ..
             } => {
-                let tx_hash = self.backend.erc20_transfer(chain, token_address, to, amount).await?;
+                let tx_hash = self.backend.erc20_transfer(&chain.to_string(), token_address, to, amount).await?;
 
                 Ok(TxRef::EvmTxHash(tx_hash))
             }

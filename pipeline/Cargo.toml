@@ -34,10 +34,11 @@ icrc-ledger-types = { workspace = true }
 icrc-ledger-agent = { workspace = true }
 tokio = { workspace = true }
 alloy = { workspace = true }
+futures = { workspace = true }
+bip39 = { workspace = true }
 
 ccxt = { git = "https://github.com/kizzx2/ccxt-rs-lib" }
 dotenv = "0.15"
-futures = "0.3"
 ctor = "0.4.2"
 clap = { version = "4.5.40", features = ["derive"] }
 once_cell = "1.21.3"
