@@ -1,12 +1,8 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use candid::Nat;
 use liquidium_pipeline_core::{
-    account::{
-        actions::{AccountActions, AccountInfo},
-        model::{ChainBalance, TxRef},
-    },
+    account::{actions::AccountInfo, model::ChainBalance},
     tokens::chain_token::ChainToken,
 };
 
@@ -41,33 +37,6 @@ impl AccountInfo for MultiChainAccountInfoRouter {
         match token {
             ChainToken::Icp { .. } => self.icp.get_cached_balance(token),
             ChainToken::EvmNative { .. } | ChainToken::EvmErc20 { .. } => self.evm.get_cached_balance(token),
-        }
-    }
-}
-
-pub struct MultiChainAccountActionsRouter {
-    pub icp: Arc<dyn AccountActions + Send + Sync>,
-    pub evm: Arc<dyn AccountActions + Send + Sync>,
-}
-
-impl MultiChainAccountActionsRouter {
-    pub fn new(icp: Arc<dyn AccountActions + Send + Sync>, evm: Arc<dyn AccountActions + Send + Sync>) -> Self {
-        Self { icp, evm }
-    }
-}
-
-#[async_trait]
-impl AccountActions for MultiChainAccountActionsRouter {
-    async fn transfer(
-        &self,
-        token: &ChainToken,
-        to: &str,
-        amount_native: Nat,
-        from_subaccount: bool,
-    ) -> Result<TxRef, String> {
-        match token {
-            ChainToken::Icp { .. } => self.icp.transfer(token, to, amount_native, from_subaccount).await,
-            ChainToken::EvmNative { .. } | ChainToken::EvmErc20 { .. } => self.evm.transfer(token, to, amount_native, from_subaccount).await,
         }
     }
 }

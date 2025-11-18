@@ -13,10 +13,12 @@ path = "src/main.rs"
 [lints.clippy]
 module_inception = "allow"
 upper_case_acronyms = "allow"
+too_many_arguments = "allow"
 
 [dependencies]
 liquidium-pipeline-core = { path = "../core" }
 liquidium-pipeline-connectors = { path = "../connectors" }
+liquidium-pipeline-commons = { path = "../commons" }
 
 mockall = { workspace = true }
 serde = { workspace = true }
@@ -36,6 +38,7 @@ tokio = { workspace = true }
 alloy = { workspace = true }
 futures = { workspace = true }
 bip39 = { workspace = true }
+thiserror = { workspace = true }
 
 ccxt = { git = "https://github.com/kizzx2/ccxt-rs-lib" }
 dotenv = "0.15"

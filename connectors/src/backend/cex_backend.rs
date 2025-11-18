@@ -36,4 +36,7 @@ pub trait CexBackend: Send + Sync {
         tag: Option<&str>,
         amount: f64,
     ) -> Result<WithdrawalReceipt, String>;
+
+    // balance
+    async fn get_balance(&self, asset: &str) -> Result<f64, String>;
 }

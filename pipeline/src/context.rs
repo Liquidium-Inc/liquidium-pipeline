@@ -15,16 +15,14 @@ use liquidium_pipeline_core::transfer::transfer_service::TransferService;
 use liquidium_pipeline_core::{account::actions::AccountInfo, tokens::token_registry::TokenRegistry};
 
 use liquidium_pipeline_connectors::{
-    account::router::MultiChainAccountInfoRouter, backend::icp_backend::IcpBackendImpl,
+    account::router::MultiChainAccountInfoRouter,
+    backend::icp_backend::IcpBackendImpl,
     token_registry_loader::load_token_registry,
-    transfer::{
-        icp_transfer::IcpTransferAdapter,
-        evm_transfer::EvmTransferAdapter,
-        router::MultiChainTransferRouter,
-    },
+    transfer::{evm_transfer::EvmTransferAdapter, icp_transfer::IcpTransferAdapter, router::MultiChainTransferRouter},
 };
 
-use crate::config::Config;
+use crate::config::Config; 
+
 
 pub struct PipelineContext {
     pub config: Arc<Config>,
@@ -113,20 +111,20 @@ impl<P: Provider<AnyNetwork> + WalletProvider<AnyNetwork> + Clone + 'static> Pip
         // Build transfer adapters and routers
         let icp_transfer_main = Arc::new(IcpTransferAdapter::new(icp_backend_main.clone(), main_icp_account));
         let evm_transfer_main = Arc::new(EvmTransferAdapter::new(evm_backend_main.clone()));
-        let transfer_router_main = Arc::new(MultiChainTransferRouter::new(
-            icp_transfer_main,
-            evm_transfer_main,
-        ));
+        let transfer_router_main = Arc::new(MultiChainTransferRouter::new(icp_transfer_main, evm_transfer_main));
         let main_transfers = TransferService::new(registry.clone(), transfer_router_main);
 
-        let icp_transfer_recovery = Arc::new(IcpTransferAdapter::new(icp_backend_trader.clone(), recovery_icp_account));
+        let icp_transfer_recovery = Arc::new(IcpTransferAdapter::new(
+            icp_backend_trader.clone(),
+            recovery_icp_account,
+        ));
+        
         let evm_transfer_recovery = Arc::new(EvmTransferAdapter::new(evm_backend_trader.clone()));
         let transfer_router_recovery = Arc::new(MultiChainTransferRouter::new(
             icp_transfer_recovery,
             evm_transfer_recovery,
         ));
         let recovery_transfers = TransferService::new(registry.clone(), transfer_router_recovery);
-
 
         println!("Context innitialized...");
         Ok(PipelineContext {

@@ -376,7 +376,6 @@ pub async fn withdraw() {
             ChainToken::EvmNative { .. } | ChainToken::EvmErc20 { .. } => ctx.evm_address.clone(),
             _ => account.to_string(),
         };
-        let amount_native: u128 = amt.value.0.to_string().parse().unwrap_or(0);
 
         let to = match (&token, &dst) {
             (ChainToken::Icp { .. }, Destination::Icp(acc)) => ChainAccount::Icp(*acc),
@@ -394,7 +393,7 @@ pub async fn withdraw() {
         };
 
         match transfer_service
-            .transfer_by_asset_id(&asset_id, to.clone(), amount_native)
+            .transfer_by_asset_id(&asset_id, to.clone(), amt.value)
             .await
         {
             Ok(txid) => {
@@ -701,12 +700,11 @@ pub async fn withdraw_noninteractive(source: &str, destination: &str, asset: &st
     };
 
     for (asset_id, _tok, amt, bal_fmt) in plan {
-        let amount_native: u128 = amt.value.0.to_string().parse().unwrap_or(0);
 
         let to = ChainAccount::Icp(dst_account.clone());
 
         match transfer_service
-            .transfer_by_asset_id(&asset_id, to.clone(), amount_native)
+            .transfer_by_asset_id(&asset_id, to.clone(), amt.value)
             .await
         {
             Ok(txid) => {

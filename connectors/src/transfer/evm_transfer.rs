@@ -24,11 +24,11 @@ impl<B: EvmBackend + Send + Sync> TransferActions for EvmTransferAdapter<B> {
         &self,
         token: &ChainToken,
         to: &ChainAccount,
-        amount_native: u128,
+        amount_native: Nat,
     ) -> Result<String, String> {
         match (token, to) {
             (ChainToken::EvmNative { chain, .. }, ChainAccount::Evm(to_address)) => {
-                let amount = Nat::from(amount_native);
+                let amount = amount_native;
                 let tx_hash = self
                     .backend
                     .native_transfer(chain, to_address, amount)

@@ -9,7 +9,6 @@ pub enum TxRef {
     TxHash { chain: String, hash: String },
 }
 
-
 #[derive(CandidType, Debug, Clone, Serialize, Deserialize)]
 pub struct SwapRequest {
     pub pay_asset: AssetId,

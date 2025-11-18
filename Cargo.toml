@@ -1,5 +1,5 @@
 [workspace]
-members = ["core", "connectors", "pipeline"]
+members = ["core", "connectors", "pipeline", "commons"]
 resolver = "2"
 
 [workspace.dependencies]
@@ -20,4 +20,5 @@ alloy = "1.1.1"
 icrc-ledger-agent = "0.1.0"
 icrc-ledger-types = "0.1.10"
 futures = "0.3"
-bip39 = {version = "2.2.0", features = ["rand"]}
+bip39 = { version = "2.2.0", features = ["rand"] }
+thiserror = "2.0.17"

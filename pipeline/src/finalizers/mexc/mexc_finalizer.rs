@@ -1,56 +1,61 @@
+use async_trait::async_trait;
+use icrc_ledger_types::icrc1::account::Account;
+use liquidium_pipeline_core::account::model::ChainAccount;
+use liquidium_pipeline_core::transfer::actions::TransferActions;
+use std::str::FromStr;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
-use liquidium_pipeline_connectors::{backend::cex_backend::CexBackend, pipeline_agent::PipelineAgent};
-use liquidium_pipeline_core::{account::actions::AccountActions, tokens::token_registry::TokenRegistry};
+use liquidium_pipeline_connectors::backend::cex_backend::CexBackend;
+use liquidium_pipeline_core::tokens::token_registry::TokenRegistry;
 use log::info;
 use num_traits::ToPrimitive;
 
+use crate::config::Config;
 use crate::{
-    config::ConfigTrait,
-    persistance::WalStore,
+    persistance::{LiqResultRecord, ResultStatus, WalStore, now_secs},
     swappers::{
         model::{SwapExecution, SwapRequest},
         swap_interface::SwapInterface,
     },
 };
+use serde_json::json;
+use tokio::time::sleep;
 
-pub struct MexcFinalizer<D, C, P, X>
+#[async_trait]
+pub trait CexBridge: Send + Sync {
+    async fn execute_roundtrip(&self, liq_id: &str, idx: i32, req: &SwapRequest) -> Result<SwapExecution, String>;
+}
+
+pub struct MexcBridge<D, X>
 where
     D: WalStore,
-    C: ConfigTrait,
-    P: PipelineAgent,
     X: CexBackend,
 {
-    pub config: Arc<C>,
+    pub config: Arc<Config>,
     pub db: Arc<D>,
-    pub agent: Arc<P>,
     pub ccxt: Arc<X>,
-
     pub registry: Arc<TokenRegistry>,
-    pub accounts: Arc<dyn AccountActions + Send + Sync>,
+    pub accounts: Arc<dyn TransferActions + Send + Sync>,
     pub swapper: Arc<dyn SwapInterface + Send + Sync>,
 }
 
-impl<D, C, P, X> MexcFinalizer<D, C, P, X>
+impl<D, X> MexcBridge<D, X>
 where
     D: WalStore,
-    C: ConfigTrait,
-    P: PipelineAgent,
     X: CexBackend,
 {
     pub fn new(
-        config: Arc<C>,
+        config: Arc<Config>,
         db: Arc<D>,
-        agent: Arc<P>,
         ccxt: Arc<X>,
         registry: Arc<TokenRegistry>,
-        accounts: Arc<dyn AccountActions + Send + Sync>,
+        accounts: Arc<dyn TransferActions + Send + Sync>,
         swapper: Arc<dyn SwapInterface + Send + Sync>,
     ) -> Self {
         Self {
             config,
             db,
-            agent,
             ccxt,
             registry,
             accounts,
@@ -58,51 +63,220 @@ where
         }
     }
 
-    // High-level flow: deposit -> swap -> withdraw back
-    pub async fn execute_mexc_swap(&self, swap_args: SwapRequest) -> Result<SwapExecution, String> {
-        let asset_in = swap_args.pay_asset.clone();
-        let asset_out = swap_args.receive_asset.clone();
+    async fn journal(
+        &self,
+        liq_id: &str,
+        idx: i32,
+        step: &str,
+        status: ResultStatus,
+        req: &SwapRequest,
+        swap: Option<&SwapExecution>,
+        last_error: Option<&str>,
+    ) -> Result<(), String> {
+        let existing = self
+            .db
+            .get_result(liq_id, idx)
+            .await
+            .map_err(|e| format!("wal get_result failed: {e}"))?;
 
+        let created_at = existing.as_ref().map(|r| r.created_at).unwrap_or_else(now_secs);
+        let attempt = existing.as_ref().map(|r| r.attempt).unwrap_or(0);
+
+        let receive_amount = swap.map(|s| s.receive_amount.0.to_string());
+
+        let meta = json!({
+            "type": "mexc_cex_leg",
+            "step": step,
+            "pay_asset": {
+                "chain": req.pay_asset.chain,
+                "symbol": req.pay_asset.symbol,
+            },
+            "receive_asset": {
+                "chain": req.receive_asset.chain,
+                "symbol": req.receive_asset.symbol,
+            },
+            "pay_amount": req.pay_amount.0.to_string(),
+            "receive_amount": receive_amount,
+            "last_error": last_error,
+        });
+
+        let row = LiqResultRecord {
+            liq_id: liq_id.to_string(),
+            idx,
+            status,
+            attempt,
+            created_at,
+            updated_at: now_secs(),
+            meta_json: meta.to_string(),
+        };
+
+        self.db
+            .upsert_result(row)
+            .await
+            .map_err(|e| format!("wal journal failed: {e}"))
+    }
+
+    async fn wait_for_credit(
+        &self,
+        liq_id: &str,
+        idx: i32,
+        req: &SwapRequest,
+        asset_symbol: &str,
+    ) -> Result<(), String> {
+        let required = {
+            let u = req.pay_amount.0.to_u128().ok_or("pay_amount too large for f64")?;
+            u as f64
+        };
+
+        let timeout = Duration::from_secs(600);
+        let wait_start = Instant::now();
+
+        loop {
+            let bal = self
+                .ccxt
+                .get_balance(asset_symbol)
+                .await
+                .map_err(|e| format!("failed to get MEXC balance: {}", e))?;
+
+            info!(
+                "MEXC bridge: current MEXC balance for {} is {} (required {})",
+                asset_symbol, bal, required
+            );
+
+            if bal + 1e-8 >= required {
+                info!("MEXC bridge: deposit credited on MEXC, proceeding to swap");
+                self.journal(liq_id, idx, "CexCredited", ResultStatus::InFlight, req, None, None)
+                    .await?;
+                break;
+            }
+
+            if Instant::now().duration_since(wait_start) > timeout {
+                let msg = "timeout waiting for MEXC deposit credit".to_string();
+                self.journal(
+                    liq_id,
+                    idx,
+                    "CreditTimeout",
+                    ResultStatus::FailedRetryable,
+                    req,
+                    None,
+                    Some(&msg),
+                )
+                .await?;
+                return Err(msg);
+            }
+
+            sleep(Duration::from_secs(10)).await;
+        }
+
+        Ok(())
+    }
+
+    async fn step_ic_deposit(
+        &self,
+        liq_id: &str,
+        idx: i32,
+        req: &SwapRequest,
+        asset_in: &str,
+        mexc_ic_deposit_account: &str,
+    ) -> Result<(), String> {
+        let deposit_start = Instant::now();
         info!(
-            "MEXC finalizer: starting cross-cex swap {} -> {} (amount {})",
-            asset_in, asset_out, swap_args.pay_amount
+            "MEXC bridge: sending deposit of {} {} to {:?} (IC inbox)",
+            req.pay_amount, asset_in, mexc_ic_deposit_account
         );
 
-        // 1. Determine the IC deposit account used as MEXC inbox for this asset.
-        // The off-chain / bridge side is responsible for forwarding from that inbox
-        // to the actual MEXC deposit address.
-        let mexc_ic_deposit_account = "";
+        let dep_account = ChainAccount::Icp(Account::from_str(mexc_ic_deposit_account).map_err(|e| e.to_string())?);
+        let transfer_in = self
+            .registry
+            .resolve(&req.pay_asset)
+            .map_err(|e| format!("token registry resolve failed: {}", e))?;
 
+        if let Err(e) = self
+            .accounts
+            .transfer(&transfer_in, &dep_account, req.pay_amount.clone())
+            .await
+        {
+            let msg = format!("ICRC deposit failed: {}", e);
+            self.journal(
+                liq_id,
+                idx,
+                "DepositFailed",
+                ResultStatus::FailedRetryable,
+                req,
+                None,
+                Some(&msg),
+            )
+            .await?;
+            return Err(msg);
+        }
+
+        let deposit_done = Instant::now();
         info!(
-            "MEXC finalizer: sending deposit of {} {} to {:?} (IC inbox)",
-            swap_args.pay_amount, asset_in, mexc_ic_deposit_account
+            "MEXC bridge: deposit step took {:?}",
+            deposit_done.duration_since(deposit_start)
         );
 
-        let transfer_in = self.registry.resolve(&asset_in)?;
-        self.accounts
-            .transfer(&transfer_in, mexc_ic_deposit_account, swap_args.pay_amount.clone(), false)
-            .await
-            .map_err(|e| format!("ICRC deposit failed: {}", e))?;
+        self.journal(liq_id, idx, "DepositSent", ResultStatus::InFlight, req, None, None)
+            .await?;
 
-        // TODO: persist in WAL: deposit_sent
+        Ok(())
+    }
 
-        // 3. Wait for deposit credited on MEXC
-        // In practice: off-chain watcher polls balances / deposit history.
-        // Here we assume funds are available by the time we call swap.
+    async fn step_swap(
+        &self,
+        liq_id: &str,
+        idx: i32,
+        req: &SwapRequest,
+        asset_in: &str,
+        asset_out: &str,
+    ) -> Result<SwapExecution, String> {
+        let swap_start = Instant::now();
+        info!("MEXC bridge: executing swap on MEXC {} -> {}", asset_in, asset_out);
 
-        // 4. Execute swap on MEXC via ccxt-backed swapper (implements IcrcSwapInterface)
-        info!("MEXC finalizer: executing swap on MEXC {} -> {}", asset_in, asset_out);
-        let swap_reply = self
-            .swapper
-            .execute(&swap_args)
-            .await
-            .map_err(|e| format!("MEXC swap failed: {}", e))?;
+        let swap_reply = match self.swapper.execute(req).await {
+            Ok(s) => s,
+            Err(e) => {
+                let msg = format!("MEXC swap failed: {}", e);
+                self.journal(
+                    liq_id,
+                    idx,
+                    "SwapFailed",
+                    ResultStatus::FailedRetryable,
+                    req,
+                    None,
+                    Some(&msg),
+                )
+                .await?;
+                return Err(msg);
+            }
+        };
 
-        // TODO: persist in WAL: swap_done
+        let swap_done = Instant::now();
+        info!("MEXC bridge: swap step took {:?}", swap_done.duration_since(swap_start));
 
-        // 5. Withdraw back from MEXC to IC address for the output asset
-        let withdraw_target = "";
+        self.journal(
+            liq_id,
+            idx,
+            "SwapDone",
+            ResultStatus::InFlight,
+            req,
+            Some(&swap_reply),
+            None,
+        )
+        .await?;
 
+        Ok(swap_reply)
+    }
+
+    async fn step_withdraw(
+        &self,
+        liq_id: &str,
+        idx: i32,
+        req: &SwapRequest,
+        asset_out: &str,
+        withdraw_target: &str,
+        swap_reply: &SwapExecution,
+    ) -> Result<(), String> {
         let out_amount_f64 = {
             let u = swap_reply
                 .receive_amount
@@ -112,24 +286,135 @@ where
             u as f64
         };
 
+        let withdraw_start = Instant::now();
         info!(
-            "MEXC finalizer: withdrawing {} {} back to {} (network {:?})",
-            out_amount_f64, asset_out, withdraw_target, asset_out
+            "MEXC bridge: withdrawing {} {} back to {}",
+            out_amount_f64, asset_out, withdraw_target
         );
 
-        self.ccxt
+        if let Err(e) = self
+            .ccxt
             .withdraw(
-                &asset_out.symbol,
-                &asset_out.chain,
-                &withdraw_target,
+                &req.receive_asset.symbol,
+                &req.receive_asset.chain,
+                withdraw_target,
                 None,
                 out_amount_f64,
             )
             .await
-            .map_err(|e| format!("MEXC withdraw failed: {}", e))?;
+        {
+            let msg = format!("MEXC withdraw failed: {}", e);
+            self.journal(
+                liq_id,
+                idx,
+                "WithdrawFailed",
+                ResultStatus::FailedRetryable,
+                req,
+                Some(swap_reply),
+                Some(&msg),
+            )
+            .await?;
+            return Err(msg);
+        }
 
-        // TODO: persist in WAL: withdraw_sent
+        let withdraw_done = Instant::now();
+        info!(
+            "MEXC bridge: withdraw step took {:?}",
+            withdraw_done.duration_since(withdraw_start)
+        );
+
+        self.journal(
+            liq_id,
+            idx,
+            "WithdrawSent",
+            ResultStatus::Succeeded,
+            req,
+            Some(swap_reply),
+            None,
+        )
+        .await?;
+
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl<D, X> CexBridge for MexcBridge<D, X>
+where
+    D: WalStore,
+    X: CexBackend,
+{
+    async fn execute_roundtrip(&self, liq_id: &str, idx: i32, req: &SwapRequest) -> Result<SwapExecution, String> {
+        let asset_in = req.pay_asset.clone();
+        let asset_out = req.receive_asset.clone();
+
+        self.journal(liq_id, idx, "Created", ResultStatus::Enqueued, req, None, None)
+            .await?;
+
+        info!(
+            "MEXC bridge: starting cross-cex swap {} -> {} (amount {})",
+            asset_in, asset_out, req.pay_amount
+        );
+        let t0 = Instant::now();
+
+        let dep = self
+            .ccxt
+            .get_deposit_address(&asset_in.symbol, Some(&asset_in.chain))
+            .await
+            .map_err(|e| format!("failed to fetch MEXC deposit address: {}", e))?;
+
+        let mexc_ic_deposit_account = dep.address.clone();
+
+        info!("[] Got deposit addr {} ", dep.address);
+
+        panic!("wait!");
+
+        self.step_ic_deposit(liq_id, idx, req, &asset_in.symbol, &mexc_ic_deposit_account)
+            .await?;
+
+        self.wait_for_credit(liq_id, idx, req, &asset_in.symbol).await?;
+
+        let swap_reply = self
+            .step_swap(liq_id, idx, req, &asset_in.symbol, &asset_out.symbol)
+            .await?;
+
+        let withdraw_target = req.receive_address.clone().unwrap();
+
+        self.step_withdraw(liq_id, idx, req, &asset_out.symbol, &withdraw_target, &swap_reply)
+            .await?;
+
+        let withdraw_done = Instant::now();
+        info!(
+            "MEXC bridge: total mexc leg took {:?}",
+            withdraw_done.duration_since(t0)
+        );
 
         Ok(swap_reply)
+    }
+}
+
+pub struct MexcFinalizer<B>
+where
+    B: CexBridge,
+{
+    pub bridge: Arc<B>,
+}
+
+impl<B> MexcFinalizer<B>
+where
+    B: CexBridge,
+{
+    pub fn new(bridge: Arc<B>) -> Self {
+        Self { bridge }
+    }
+
+    // High-level flow delegating to the bridge
+    pub async fn execute_mexc_swap(
+        &self,
+        liq_id: &str,
+        idx: i32,
+        swap_args: SwapRequest,
+    ) -> Result<SwapExecution, String> {
+        self.bridge.execute_roundtrip(liq_id, idx, &swap_args).await
     }
 }

@@ -2,11 +2,10 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use candid::Nat;
 
 // All these come from core
-use liquidium_pipeline_core::account::actions::{AccountActions, AccountInfo};
-use liquidium_pipeline_core::account::model::{ChainBalance, TxRef};
+use liquidium_pipeline_core::account::actions::AccountInfo;
+use liquidium_pipeline_core::account::model::ChainBalance;
 use liquidium_pipeline_core::tokens::chain_token::ChainToken;
 
 // This comes from connectors
@@ -70,7 +69,9 @@ impl<B: EvmBackend> AccountInfo for EvmAccountInfoAdapter<B> {
 
         let cache_key = match token {
             ChainToken::EvmNative { chain, .. } => Some((chain.clone(), "native".to_string())),
-            ChainToken::EvmErc20 { chain, token_address, .. } => Some((chain.clone(), token_address.clone())),
+            ChainToken::EvmErc20 {
+                chain, token_address, ..
+            } => Some((chain.clone(), token_address.clone())),
             _ => None,
         };
 
@@ -85,7 +86,9 @@ impl<B: EvmBackend> AccountInfo for EvmAccountInfoAdapter<B> {
     fn get_cached_balance(&self, token: &ChainToken) -> Option<ChainBalance> {
         let cache_key = match token {
             ChainToken::EvmNative { chain, .. } => Some((chain.clone(), "native".to_string())),
-            ChainToken::EvmErc20 { chain, token_address, .. } => Some((chain.clone(), token_address.clone())),
+            ChainToken::EvmErc20 {
+                chain, token_address, ..
+            } => Some((chain.clone(), token_address.clone())),
             _ => None,
         };
 
@@ -94,40 +97,5 @@ impl<B: EvmBackend> AccountInfo for EvmAccountInfoAdapter<B> {
             return lock.get(&(chain, addr)).cloned();
         }
         None
-    }
-}
-
-pub struct EvmAccountActionsAdapter<B: EvmBackend> {
-    backend: Arc<B>,
-}
-
-impl<B: EvmBackend> EvmAccountActionsAdapter<B> {
-    pub fn new(backend: Arc<B>) -> Self {
-        Self { backend }
-    }
-}
-
-#[async_trait]
-impl<B: EvmBackend> AccountActions for EvmAccountActionsAdapter<B> {
-    async fn transfer(
-        &self,
-        token: &ChainToken,
-        to: &str,
-        amount: Nat,
-        _from_subaccount: bool,
-    ) -> Result<TxRef, String> {
-        match token {
-            ChainToken::EvmNative { chain, .. } => {
-                let tx_hash = self.backend.native_transfer(chain, to, amount).await?;
-                Ok(TxRef::EvmTxHash(tx_hash))
-            }
-            ChainToken::EvmErc20 {
-                chain, token_address, ..
-            } => {
-                let tx_hash = self.backend.erc20_transfer(chain, token_address, to, amount).await?;
-                Ok(TxRef::EvmTxHash(tx_hash))
-            }
-            _ => Err("EvmAccountActionsAdapter only supports EvmNative and EvmErc20 tokens".to_string()),
-        }
     }
 }

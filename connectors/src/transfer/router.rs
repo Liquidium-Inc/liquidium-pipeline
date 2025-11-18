@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use candid::Nat;
 use liquidium_pipeline_core::account::model::ChainAccount;
 use liquidium_pipeline_core::tokens::chain_token::ChainToken;
 use liquidium_pipeline_core::transfer::actions::TransferActions;
@@ -26,7 +27,7 @@ where
         &self,
         token: &ChainToken,
         to: &ChainAccount,
-        amount_native: u128,
+        amount_native: Nat,
     ) -> Result<String, String> {
         // Validate that token and destination are on the same chain
         match (token, to) {

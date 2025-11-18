@@ -66,7 +66,8 @@ fn format_chain_balance(bal: &ChainBalance) -> String {
     let decimals = bal.decimals as u32;
 
     if decimals == 0 {
-        return format!("{} {}", raw, bal.symbol);
+        let int_str = raw.to_string().replace('_', "");
+        return format!("{} {}", int_str, bal.symbol);
     }
 
     // clamp to max 6 displayed decimals
@@ -77,10 +78,12 @@ fn format_chain_balance(bal: &ChainBalance) -> String {
     let int_part = scaled.clone() / 10u128.pow(display_decimals);
     let frac_part = scaled % 10u128.pow(display_decimals);
 
+    let int_str = int_part.to_string().replace('_', "");
+
     let mut frac_clean = frac_part.to_string();
     frac_clean = frac_clean.replace('_', "");
 
     let frac_str = format!("{:0>width$}", frac_clean, width = display_decimals as usize);
 
-    format!("{}.{} {}", int_part, frac_str, bal.symbol)
+    format!("{}.{} {}", int_str, frac_str, bal.symbol)
 }

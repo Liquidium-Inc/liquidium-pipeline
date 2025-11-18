@@ -2,20 +2,17 @@ mod commands;
 mod config;
 mod executors;
 mod finalizers;
-
 mod liquidation;
 mod persistance;
-
 mod price_oracle;
-
 mod stage;
 mod stages;
 pub mod swappers;
+mod context;
 
 mod utils;
 mod watchdog;
 use clap::{Parser, Subcommand};
-mod backend_factory;
 
 // use commands::liquidation_loop::run_liquidation_loop;
 
@@ -34,6 +31,9 @@ enum Commands {
 
     // Shows wallet token balances
     Balance,
+
+    // Runs the MEXC smoke test (deposit -> wait -> swap -> withdraw)
+    MexcSmoke,
 
     // Withdraws funds. Without flags, starts the interactive wizard.
     // With flags, performs a non-interactive withdrawal.
@@ -79,6 +79,9 @@ async fn main() {
         }
         Commands::Balance => {
             commands::funds::funds().await.unwrap();
+        }
+        Commands::MexcSmoke => {
+            commands::mexc_smoke_test::mexc_finalizer_smoke_test().await.unwrap();
         }
         Commands::Withdraw {
             source,

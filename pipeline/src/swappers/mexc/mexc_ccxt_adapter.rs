@@ -64,9 +64,9 @@ impl CexBackend for MexcCcxtAdapter {
         // depending on exchange; adjust to what Mexc exposes in ccxt-rs.
         let res = ex
             .fetch_deposit_address(
-                asset.into(),
+                "OGY".into(),
                 match network {
-                    Some(n) => Value::from(n),
+                    Some(n) => Value::from("OGY"),
                     None => Value::Undefined,
                 },
             )
@@ -80,6 +80,22 @@ impl CexBackend for MexcCcxtAdapter {
             address: norm["address"].as_str().ok_or("missing deposit address")?.to_string(),
             tag: norm["tag"].as_str().map(|s| s.to_string()),
         })
+    }
+
+    async fn get_balance(&self, asset: &str) -> Result<f64, String> {
+        let mut ex = self.inner.lock().await;
+
+        let res = ex
+            .fetch_balance(Value::Undefined)
+            .await;
+
+        let norm = normalize(&res).ok_or("could not normalize balance response".to_string())?;
+
+        let free = norm["free"][asset]
+            .as_f64()
+            .ok_or_else(|| format!("missing free balance for asset {}", asset))?;
+
+        Ok(free)
     }
 
     async fn withdraw(

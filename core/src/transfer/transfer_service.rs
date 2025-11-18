@@ -1,5 +1,7 @@
 use std::sync::Arc;
 
+use candid::Nat;
+
 use crate::account::model::ChainAccount;
 use crate::tokens::asset_id::AssetId;
 use crate::tokens::token_registry::TokenRegistry;
@@ -26,7 +28,7 @@ impl TransferService {
         &self,
         asset_id: &AssetId,
         to: ChainAccount,
-        amount_native: u128,
+        amount_native: Nat,
     ) -> Result<String, String> {
         let token = self
             .registry

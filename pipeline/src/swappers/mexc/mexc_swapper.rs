@@ -8,6 +8,7 @@ use log::{debug, info};
 
 use crate::swappers::model::{SwapExecution, SwapQuote, SwapQuoteLeg, SwapRequest};
 use crate::swappers::router::SwapVenue;
+use crate::swappers::swap_interface::SwapInterface;
 use num_traits::ToPrimitive;
 fn nat_to_f64(n: &Nat) -> Result<f64, String> {
     let u = n.0.to_u128().ok_or_else(|| format!("Nat too large for f64: {}", n))?;
@@ -129,5 +130,30 @@ impl<C: CexBackend> SwapVenue for MexcSwapVenue<C> {
             legs: vec![leg],
             ts: 0, // populate from clock if needed
         })
+    }
+}
+
+pub struct MexcSwapper<C: CexBackend> {
+    venue: Arc<MexcSwapVenue<C>>,
+}
+
+impl<C: CexBackend> MexcSwapper<C> {
+    pub fn new(client: Arc<C>) -> Self {
+        let venue = Arc::new(MexcSwapVenue::new(client));
+        Self { venue }
+    }
+}
+
+#[async_trait]
+impl<C> SwapInterface for MexcSwapper<C>
+where
+    C: CexBackend + Send + Sync,
+{
+    async fn quote(&self, req: &SwapRequest) -> Result<SwapQuote, String> {
+        self.venue.quote(req).await
+    }
+
+    async fn execute(&self, req: &SwapRequest) -> Result<SwapExecution, String> {
+        self.venue.execute(req).await
     }
 }

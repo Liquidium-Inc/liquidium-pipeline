@@ -1,5 +1,6 @@
 use icrc_ledger_types::icrc1::account::Account;
-use liquidium_pipeline::config::Config;
+
+
 use liquidium_pipeline_connectors::account::icp_account::RECOVERY_ACCOUNT;
 use std::fs::{self, OpenOptions};
 #[cfg(unix)]
@@ -10,6 +11,8 @@ use bip39::{Language, Mnemonic};
 use alloy::signers::local::PrivateKeySigner;
 
 use prettytable::{Cell, Row, Table, format};
+
+use crate::config::Config;
 
 pub async fn show() {
     // Load Config

@@ -2,7 +2,7 @@ use crate::{
     config::ConfigTrait,
     executors::executor::ExecutorRequest,
     finalizers::kong_swap::kong_swap_finalizer::KongSwapFinalizer,
-    persistance::{now_secs, LiqResultRecord, ResultStatus, WalStore},
+    persistance::{LiqResultRecord, ResultStatus, WalStore, now_secs},
     stage::PipelineStage,
     stages::executor::{ExecutionReceipt, ExecutionStatus},
     swappers::{
@@ -12,9 +12,9 @@ use crate::{
 };
 use async_trait::async_trait;
 use candid::Encode;
-use liquidium_pipeline_core::account::actions::AccountActions;
-use liquidium_pipeline_core::types::protocol_types::{LiquidationResult, TransferStatus};
+
 use liquidium_pipeline_connectors::pipeline_agent::PipelineAgent;
+use liquidium_pipeline_core::{transfer::actions::TransferActions, types::protocol_types::{LiquidationResult, TransferStatus}};
 use num_traits::ToPrimitive;
 use std::time::Duration;
 
@@ -72,7 +72,7 @@ impl LiquidationOutcome {
 }
 
 #[async_trait]
-impl<'a, D: WalStore, S: SwapInterface, A: AccountActions, C: ConfigTrait, P: PipelineAgent>
+impl<'a, D: WalStore, S: SwapInterface, A: TransferActions, C: ConfigTrait, P: PipelineAgent>
     PipelineStage<'a, Vec<ExecutionReceipt>, Vec<LiquidationOutcome>> for KongSwapFinalizer<D, S, A, C, P>
 {
     async fn process(&self, executor_receipts: &'a Vec<ExecutionReceipt>) -> Result<Vec<LiquidationOutcome>, String> {
@@ -148,7 +148,7 @@ impl<'a, D: WalStore, S: SwapInterface, A: AccountActions, C: ConfigTrait, P: Pi
     }
 }
 
-impl<D: WalStore, S: SwapInterface, A: AccountActions, C: ConfigTrait, P: PipelineAgent>
+impl<D: WalStore, S: SwapInterface, A: TransferActions, C: ConfigTrait, P: PipelineAgent>
     KongSwapFinalizer<D, S, A, C, P>
 {
     // Helper: extract ExecutionReceipt from a WAL row's meta_json
@@ -180,7 +180,11 @@ impl<D: WalStore, S: SwapInterface, A: AccountActions, C: ConfigTrait, P: Pipeli
 
     // Build swap args from receipt and liquidation, then fetch a fresh quote.
     // Returns SwapInfo if quoting succeeds; Err(String) otherwise.
-    async fn preflight_quote(&self, _receipt: &ExecutionReceipt, _liq: &LiquidationResult) -> Result<SwapQuote, String> {
+    async fn preflight_quote(
+        &self,
+        _receipt: &ExecutionReceipt,
+        _liq: &LiquidationResult,
+    ) -> Result<SwapQuote, String> {
         todo!()
     }
 
@@ -267,7 +271,7 @@ impl<D: WalStore, S: SwapInterface, A: AccountActions, C: ConfigTrait, P: Pipeli
     }
 }
 
-impl<D: WalStore, S: SwapInterface, A: AccountActions, C: ConfigTrait, P: PipelineAgent>
+impl<D: WalStore, S: SwapInterface, A: TransferActions, C: ConfigTrait, P: PipelineAgent>
     KongSwapFinalizer<D, S, A, C, P>
 {
     fn needs_swap(receipt: &ExecutionReceipt) -> bool {
@@ -333,7 +337,7 @@ impl<D: WalStore, S: SwapInterface, A: AccountActions, C: ConfigTrait, P: Pipeli
     }
 }
 
-impl<D: WalStore, S: SwapInterface, A: AccountActions, C: ConfigTrait, P: PipelineAgent>
+impl<D: WalStore, S: SwapInterface, A: TransferActions, C: ConfigTrait, P: PipelineAgent>
     KongSwapFinalizer<D, S, A, C, P>
 {
     async fn move_funds_to_recovery(&self, receipt: &ExecutionReceipt) {

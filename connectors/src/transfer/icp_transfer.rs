@@ -26,7 +26,7 @@ impl<B: IcpBackend + Send + Sync> TransferActions for IcpTransferAdapter<B> {
         &self,
         token: &ChainToken,
         to: &ChainAccount,
-        amount_native: u128,
+        amount_native: Nat,
     ) -> Result<String, String> {
         match (token, to) {
             (

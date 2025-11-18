@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use candid::Nat;
 
 use crate::account::model::ChainAccount;
 use crate::tokens::chain_token::ChainToken;
@@ -9,6 +10,6 @@ pub trait TransferActions: Send + Sync {
         &self,
         token: &ChainToken,
         to: &ChainAccount,
-        amount_native: u128,
+        amount_native: Nat,
     ) -> Result<String, String>; // return tx hash/id
 }

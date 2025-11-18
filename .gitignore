@@ -4,3 +4,4 @@ id.pem
 executions.csv
 trader.pem
 key
+.hyper.env
