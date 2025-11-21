@@ -15,7 +15,7 @@ use liquidium_pipeline_core::tokens::{
     asset_id::AssetId, chain_token::ChainToken, chain_token_amount::ChainTokenAmount,
 };
 
-use liquidium_pipeline_core::account::model::{ChainAccount, ChainBalance};
+use liquidium_pipeline_core::account::model::ChainAccount;
 
 use alloy::primitives::Address as EvmAddress;
 
@@ -28,13 +28,12 @@ pub async fn withdraw() {
     let theme = ColorfulTheme::default();
     println!("\n=== Withdraw Wizard ===\n");
 
-    // Formatter for ChainBalance to display balances with decimals and symbol
-    fn format_chain_balance(bal: &ChainBalance) -> String {
-        let raw = bal.amount_native.clone();
-        let decimals = bal.decimals as u32;
+    fn format_chain_balance(bal: &ChainTokenAmount) -> String {
+        let raw = bal.value.clone();
+        let decimals = bal.token.decimals() as u32;
 
         if decimals == 0 {
-            return format!("{} {}", raw, bal.symbol);
+            return format!("{} {}", raw, bal.token.symbol());
         }
 
         let display_decimals = decimals.min(6);
@@ -47,7 +46,7 @@ pub async fn withdraw() {
         let frac_clean = frac_part.to_string().replace('_', "");
         let frac_str = format!("{:0>width$}", frac_clean, width = display_decimals as usize);
 
-        format!("{}.{} {}", int_part, frac_str, bal.symbol)
+        format!("{}.{} {}", int_part, frac_str, bal.token.symbol())
     }
 
     // Initialize pipeline context (config + registry + backends)
@@ -95,7 +94,7 @@ pub async fn withdraw() {
         &ctx.recovery_service
     };
 
-    let mut balances: HashMap<AssetId, ChainBalance> = HashMap::new();
+    let mut balances: HashMap<AssetId, ChainTokenAmount> = HashMap::new();
     for (id, _token) in &assets {
         if let Ok(bal) = balance_service.get_balance(id).await {
             balances.insert(id.clone(), bal);
@@ -269,7 +268,7 @@ pub async fn withdraw() {
             };
 
             let bal_fmt = format_chain_balance(bal);
-            let amount_native = bal.amount_native.clone();
+            let amount_native = bal.value.clone();
 
             let amount_nat = ChainTokenAmount {
                 token: token.clone(),
@@ -291,12 +290,12 @@ pub async fn withdraw() {
             // For "all", behavior depends on token type.
             let amount_native: Nat = match &token {
                 // ICP and non-native tokens: send full balance in native units.
-                ChainToken::Icp { .. } => bal_opt.map(|b| b.amount_native.clone()).unwrap_or(0u8.into()),
-                ChainToken::EvmErc20 { .. } => bal_opt.map(|b| b.amount_native.clone()).unwrap_or(0u8.into()),
+                ChainToken::Icp { .. } => bal_opt.map(|b| b.value.clone()).unwrap_or(0u8.into()),
+                ChainToken::EvmErc20 { .. } => bal_opt.map(|b| b.value.clone()).unwrap_or(0u8.into()),
 
                 // EVM native: reserve a gas buffer so the tx can actually be sent.
                 ChainToken::EvmNative { .. } => {
-                    let bal_native = bal_opt.map(|b| b.amount_native.clone()).unwrap_or(0u8.into());
+                    let bal_native = bal_opt.map(|b| b.value.clone()).unwrap_or(0u8.into());
 
                     // Simple fixed gas buffer in wei (e.g. ~0.0002 ETH).
                     let gas_buffer_wei: u128 = 200_000_000_000_000u128;
@@ -311,7 +310,7 @@ pub async fn withdraw() {
                 }
 
                 // Fallback: just use full balance if present.
-                _ => bal_opt.map(|b| b.amount_native.clone()).unwrap_or(0u128.into()),
+                _ => bal_opt.map(|b| b.value.clone()).unwrap_or(0u128.into()),
             };
 
             ChainTokenAmount {
@@ -700,7 +699,6 @@ pub async fn withdraw_noninteractive(source: &str, destination: &str, asset: &st
     };
 
     for (asset_id, _tok, amt, bal_fmt) in plan {
-
         let to = ChainAccount::Icp(dst_account.clone());
 
         match transfer_service

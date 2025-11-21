@@ -11,7 +11,7 @@ use serde::Serialize;
 
 use crate::tokens::chain_token::ChainToken;
 
-#[derive(Debug, Clone, CandidType, Serialize, Deserialize)]
+#[derive(Debug, Clone, CandidType, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ChainTokenAmount {
     pub token: ChainToken,
     pub value: Nat, // native units (10^decimals)

@@ -44,7 +44,7 @@ impl<B: EvmBackend + Send + Sync> TransferActions for EvmTransferAdapter<B> {
                 },
                 ChainAccount::Evm(to_address),
             ) => {
-                let amount = Nat::from(amount_native);
+                let amount = amount_native;
                 let tx_hash = self
                     .backend
                     .erc20_transfer(chain, token_address, to_address, amount)

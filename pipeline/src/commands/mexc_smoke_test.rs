@@ -4,9 +4,8 @@ use std::time::{Duration, Instant};
 
 use crate::swappers::mexc::mexc_adapter::MexcAdapter;
 use crate::swappers::model::SwapRequest;
-use candid::Nat;
-use liquidium_pipeline_core::tokens::asset_id::AssetId;
 use liquidium_pipeline_core::tokens::chain_token_amount::ChainTokenAmount;
+use liquidium_pipeline_core::tokens::token_registry::TokenRegistryTrait;
 use log::info;
 
 use crate::context::init_context;
@@ -55,18 +54,21 @@ pub async fn mexc_finalizer_smoke_test() -> Result<(), String> {
     // };
 
     // USDT (ERC20) on Ethereum as output
-    let (receive_asset_id, token) = ctx.registry.by_symbol("USDT").next().unwrap();
+    let usdt_entries = ctx.registry.by_symbol("USDT");
+    let (receive_asset_id, token) = usdt_entries
+        .get(0)
+        .cloned()
+        .ok_or_else(|| "USDT not found in token registry".to_string())?;
 
     // let token = ctx.registry.get(&pay).unwrap();
 
-    let pay_amount = ChainTokenAmount::from_formatted(token, 1.0f64);
+    let pay_amount = ChainTokenAmount::from_formatted(token.clone(), 1.0f64);
     let request = SwapRequest {
         pay_asset: receive_asset_id.clone(),
         pay_amount,
         receive_asset: receive_asset_id.clone(),
         receive_address: Some(ctx.evm_address),
         max_slippage_bps: Some(100), // 1% slippage cap for the smoke test
-        referred_by: None,
         venue_hint: Some("mexc".to_string()),
     };
 

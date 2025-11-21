@@ -5,17 +5,17 @@ use async_trait::async_trait;
 
 // All these come from core
 use liquidium_pipeline_core::account::actions::AccountInfo;
-use liquidium_pipeline_core::account::model::ChainBalance;
 use liquidium_pipeline_core::tokens::chain_token::ChainToken;
+use liquidium_pipeline_core::tokens::chain_token_amount::ChainTokenAmount;
 
 // This comes from connectors
 use crate::backend::evm_backend::EvmBackend;
 
 pub struct EvmAccountInfoAdapter<B: EvmBackend> {
     pub backend: Arc<B>,
-    // Cache key: (chain, address_or_native) -> ChainBalance
+    // Cache key: (chain, address_or_native) -> ChainTokenAmount
     // For native assets, use "native" as the address
-    cache: Mutex<HashMap<(String, String), ChainBalance>>,
+    cache: Mutex<HashMap<(String, String), ChainTokenAmount>>,
 }
 
 impl<B: EvmBackend> EvmAccountInfoAdapter<B> {
@@ -29,42 +29,31 @@ impl<B: EvmBackend> EvmAccountInfoAdapter<B> {
 
 #[async_trait]
 impl<B: EvmBackend> AccountInfo for EvmAccountInfoAdapter<B> {
-    async fn get_balance(&self, token: &ChainToken) -> Result<ChainBalance, String> {
+    async fn get_balance(&self, token: &ChainToken) -> Result<ChainTokenAmount, String> {
         match token {
-            ChainToken::EvmNative {
-                chain,
-                symbol,
-                decimals,
-            } => {
+            ChainToken::EvmNative { chain, .. } => {
                 let amount_native = self.backend.native_balance(chain).await?;
 
-                Ok(ChainBalance {
-                    chain: liquidium_pipeline_core::account::model::Chain::Evm { chain: chain.clone() },
-                    symbol: symbol.clone(),
-                    amount_native,
-                    decimals: *decimals,
+                Ok(ChainTokenAmount {
+                    token: token.clone(),
+                    value: amount_native,
                 })
             }
             ChainToken::EvmErc20 {
-                chain,
-                token_address,
-                symbol,
-                decimals,
+                chain, token_address, ..
             } => {
                 let amount_native = self.backend.erc20_balance(chain, token_address).await?;
 
-                Ok(ChainBalance {
-                    chain: liquidium_pipeline_core::account::model::Chain::Evm { chain: chain.clone() },
-                    symbol: symbol.clone(),
-                    amount_native,
-                    decimals: *decimals,
+                Ok(ChainTokenAmount {
+                    token: token.clone(),
+                    value: amount_native,
                 })
             }
             _ => Err("EvmAccountInfoAdapter only supports EvmNative and EvmErc20 tokens".to_string()),
         }
     }
 
-    async fn sync_balance(&self, token: &ChainToken) -> Result<ChainBalance, String> {
+    async fn sync_balance(&self, token: &ChainToken) -> Result<ChainTokenAmount, String> {
         let bal = self.get_balance(token).await?;
 
         let cache_key = match token {
@@ -83,7 +72,7 @@ impl<B: EvmBackend> AccountInfo for EvmAccountInfoAdapter<B> {
         Ok(bal)
     }
 
-    fn get_cached_balance(&self, token: &ChainToken) -> Option<ChainBalance> {
+    fn get_cached_balance(&self, token: &ChainToken) -> Option<ChainTokenAmount> {
         let cache_key = match token {
             ChainToken::EvmNative { chain, .. } => Some((chain.clone(), "native".to_string())),
             ChainToken::EvmErc20 {

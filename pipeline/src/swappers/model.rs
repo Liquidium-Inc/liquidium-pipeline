@@ -16,7 +16,6 @@ pub struct SwapRequest {
     pub receive_asset: AssetId,
     pub receive_address: Option<String>,
     pub max_slippage_bps: Option<u32>, // 100 = 1%
-    pub referred_by: Option<String>,
     pub venue_hint: Option<String>, // "kong", "mexc", etc (optional)
 }
 

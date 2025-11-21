@@ -23,7 +23,6 @@ use liquidium_pipeline_connectors::{
 
 use crate::config::Config; 
 
-
 pub struct PipelineContext {
     pub config: Arc<Config>,
     pub registry: Arc<TokenRegistry>,

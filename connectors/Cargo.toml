@@ -7,6 +7,8 @@ edition = "2024"
 [lib]
 crate-type = ["lib"]
 
+[lints.clippy]
+double_parens = "allow"
 
 [dependencies]
 serde = { workspace = true }

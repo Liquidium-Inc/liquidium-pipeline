@@ -1,4 +1,3 @@
-
 use std::{
     collections::HashMap,
     sync::{Arc, Mutex},
@@ -8,11 +7,8 @@ use crate::backend::icp_backend::IcpBackend;
 use crate::crypto::derivation::derive_evm_private_key;
 use async_trait::async_trait;
 use liquidium_pipeline_core::{
-    account::{
-        actions::AccountInfo,
-        model::{Chain, ChainBalance},
-    },
-    tokens::chain_token::ChainToken,
+    account::actions::AccountInfo,
+    tokens::{chain_token::ChainToken, chain_token_amount::ChainTokenAmount},
 };
 
 use candid::Principal;
@@ -64,7 +60,7 @@ pub const RECOVERY_ACCOUNT: &Subaccount = &[
 pub struct IcpAccountInfoAdapter<B: IcpBackend> {
     backend: Arc<B>,
     account: Account,
-    cache: Arc<Mutex<HashMap<(Principal, String), ChainBalance>>>,
+    cache: Arc<Mutex<HashMap<(Principal, String), ChainTokenAmount>>>,
 }
 
 impl<B: IcpBackend> IcpAccountInfoAdapter<B> {
@@ -86,38 +82,29 @@ impl<B> AccountInfo for IcpAccountInfoAdapter<B>
 where
     B: IcpBackend + Send + Sync,
 {
-    async fn get_balance(&self, token: &ChainToken) -> Result<ChainBalance, String> {
+    async fn get_balance(&self, token: &ChainToken) -> Result<ChainTokenAmount, String> {
         if let Some(cached) = self.get_cached_balance(token) {
             return Ok(cached);
         }
         self.sync_balance(token).await
     }
 
-    async fn sync_balance(&self, token: &ChainToken) -> Result<ChainBalance, String> {
+    async fn sync_balance(&self, token: &ChainToken) -> Result<ChainTokenAmount, String> {
         match token {
-            ChainToken::Icp {
-                ledger,
-                symbol,
-                decimals,
-            } => {
+            ChainToken::Icp { ledger, symbol, .. } => {
                 let amount = self
                     .backend
                     .icrc1_balance(*ledger, self.account())
                     .await
                     .map_err(|e| format!("icp get_balance failed: {e}"))?;
 
-                let balance = ChainBalance {
-                    chain: Chain::Icp,
-                    amount_native: amount,
-                    decimals: *decimals,
-                    symbol: symbol.clone(),
+                let balance = ChainTokenAmount {
+                    token: token.clone(),
+                    value: amount,
                 };
 
-                // Cache key: (ledger principal, symbol)
-                {
-                    let mut cache = self.cache.lock().expect("icp balance cache poisoned");
-                    cache.insert((*ledger, symbol.clone()), balance.clone());
-                }
+                let mut cache = self.cache.lock().expect("icp balance cache poisoned");
+                cache.insert((*ledger, symbol.clone()), balance.clone());
 
                 Ok(balance)
             }
@@ -125,7 +112,7 @@ where
         }
     }
 
-    fn get_cached_balance(&self, token: &ChainToken) -> Option<ChainBalance> {
+    fn get_cached_balance(&self, token: &ChainToken) -> Option<ChainTokenAmount> {
         match token {
             ChainToken::Icp { ledger, symbol, .. } => {
                 let cache = self.cache.lock().ok()?;

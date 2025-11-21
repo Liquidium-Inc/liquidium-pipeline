@@ -1,8 +1,8 @@
-use candid::{CandidType, Nat};
+use candid::CandidType;
 use icrc_ledger_types::icrc1::account::Account;
 use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Debug, Serialize, Deserialize,CandidType, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, Deserialize, CandidType, PartialEq, Eq)]
 pub enum Chain {
     Icp,
     Evm { chain: String }, // "ETH", "ARB", ...
@@ -38,22 +38,16 @@ impl std::str::FromStr for Chain {
             if rest.is_empty() {
                 return Err("invalid chain: empty evm chain name".into());
             }
-            return Ok(Chain::Evm { chain: rest.to_string() });
+            return Ok(Chain::Evm {
+                chain: rest.to_string(),
+            });
         }
 
         Err(format!("invalid chain: {s}"))
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize,CandidType, PartialEq, Eq)]
-pub struct ChainBalance {
-    pub chain: Chain,
-    pub symbol: String,
-    pub amount_native: Nat,
-    pub decimals: u8,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize,CandidType, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, Deserialize, CandidType, PartialEq, Eq)]
 pub enum TxRef {
     IcpBlockIndex(String),
     EvmTxHash(String),

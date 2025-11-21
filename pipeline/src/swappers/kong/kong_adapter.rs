@@ -50,7 +50,7 @@ impl From<SwapRequest> for KongSwapArgs {
             receive_amount: None,
             receive_address: req.receive_address,
             max_slippage: req.max_slippage_bps.map(|bps| (bps as f64) / 10_000.0),
-            referred_by: req.referred_by,
+            referred_by: None,
         }
     }
 }

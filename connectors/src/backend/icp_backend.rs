@@ -19,6 +19,7 @@ pub trait IcpBackend: Send + Sync {
     async fn icp_transfer(&self, ledger: Principal, to_account_id_hex: &str, amount_e8s: Nat) -> Result<u64, String>;
 
     async fn icrc1_decimals(&self, ledger: Principal) -> Result<u8, String>;
+    async fn icrc1_fee(&self, ledger: Principal) -> Result<Nat, String>;
 }
 
 pub struct IcpBackendImpl<A: PipelineAgent> {
@@ -154,5 +155,9 @@ impl<A: PipelineAgent> IcpBackend for IcpBackendImpl<A> {
 
     async fn icrc1_decimals(&self, ledger: Principal) -> Result<u8, String> {
         self.query::<u8>(ledger, "icrc1_decimals", ()).await
+    }
+
+    async fn icrc1_fee(&self, ledger: Principal) -> Result<Nat, String> {
+          self.query::<Nat>(ledger, "icrc1_fee", ()).await
     }
 }

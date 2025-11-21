@@ -1,50 +1,49 @@
-// use candid::Principal;
-// use icrc_ledger_types::icrc1::account::Account;
-// use indicatif::{ProgressBar, ProgressStyle};
+use candid::Principal;
+use icrc_ledger_types::icrc1::account::Account;
+use indicatif::{ProgressBar, ProgressStyle};
 
-// use log::{info, warn};
-// use prettytable::{Cell, Row, Table, format};
-// use std::{sync::Arc, thread::sleep, time::Duration};
+use log::{info, warn};
+use prettytable::{Cell, Row, Table, format};
+use std::{sync::Arc, thread::sleep, time::Duration};
 
-// use crate::{
-//     commands::funds::sync_balances,
-//     config::{Config, ConfigTrait},
-//     executors::basic::basic_executor::BasicExecutor,
-//     finalizers::kong_swap::kong_swap_finalizer::KongSwapFinalizer,
-//     liquidation::collateral_service::CollateralService,
-//     persistance::sqlite::SqliteWalStore,
-//     price_oracle::price_oracle::LiquidationPriceOracle,
-//     stage::PipelineStage,
-//     stages::{
-//         executor::ExecutionStatus, export::ExportStage, finalize::LiquidationOutcome, opportunity::OpportunityFinder,
-//         simple_strategy::IcrcLiquidationStrategy,
-//     },
-//     watchdog::{WatchdogEvent, webhook_watchdog_from_env},
-// };
-// use ic_agent::Agent;
+use crate::{
+    config::Config,
+    executors::basic::basic_executor::BasicExecutor,
+    finalizers::kong_swap::kong_swap_finalizer::KongSwapFinalizer,
+    liquidation::collateral_service::CollateralService,
+    persistance::sqlite::SqliteWalStore,
+    price_oracle::price_oracle::LiquidationPriceOracle,
+    stage::PipelineStage,
+    stages::{
+        executor::ExecutionStatus, export::ExportStage, finalize::LiquidationOutcome, opportunity::OpportunityFinder,
+        simple_strategy::SimpleLiquidationStrategy,
+    },
+    watchdog::{WatchdogEvent, webhook_watchdog_from_env},
+};
+use ic_agent::Agent;
 
-// // Prints the startup banner.
-// fn print_banner() {
-//     println!(
-//         r#"
-// ██████╗ ██╗██████╗ ███████╗██╗     ██╗███╗   ██╗███████╗
-// ██╔══██╗██║██╔══██╗██╔════╝██║     ██║████╗  ██║██╔════╝
-// ██████╔╝██║██████╔╝█████╗  ██║     ██║██╔██╗ ██║█████╗  
-// ██╔═══╝ ██║██╔═══╝ ██╔══╝  ██║     ██║██║╚██╗██║██╔══╝  
-// ██║     ██║██║     ███████╗███████╗██║██║ ╚████║███████╗
-// ╚═╝     ╚═╝╚═╝     ╚══════╝╚══════╝╚═╝╚═╝  ╚═══╝╚══════╝
+// Prints the startup banner.
+fn print_banner() {
+    println!(
+        r#"
+██████╗ ██╗██████╗ ███████╗██╗     ██╗███╗   ██╗███████╗
+██╔══██╗██║██╔══██╗██╔════╝██║     ██║████╗  ██║██╔════╝
+██████╔╝██║██████╔╝█████╗  ██║     ██║██╔██╗ ██║█████╗  
+██╔═══╝ ██║██╔═══╝ ██╔══╝  ██║     ██║██║╚██╗██║██╔══╝  
+██║     ██║██║     ███████╗███████╗██║██║ ╚████║███████╗
+╚═╝     ╚═╝╚═╝     ╚══════╝╚══════╝╚═╝╚═╝  ╚═══╝╚══════╝
                                                         
-//           Liquidation Execution Engine
-// "#
-//     );
-// }
+          Liquidation Execution Engine
+"#
+    );
+}
 
 // async fn init(
 //     config: Arc<Config>,
 //     agent: Arc<Agent>,
 // ) -> (
 //     OpportunityFinder<Agent>,
-//     IcrcLiquidationStrategy<
+//     SimpleLiquidationStrategy<
 //         KongSwapSwapper<Agent>,
 //         Config,
 //         CollateralService<LiquidationPriceOracle<Agent>>,

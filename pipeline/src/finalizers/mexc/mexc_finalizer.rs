@@ -1,13 +1,11 @@
 use async_trait::async_trait;
-use icrc_ledger_types::icrc1::account::Account;
 use liquidium_pipeline_core::account::model::ChainAccount;
 use liquidium_pipeline_core::transfer::actions::TransferActions;
-use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use liquidium_pipeline_connectors::backend::cex_backend::CexBackend;
-use liquidium_pipeline_core::tokens::token_registry::TokenRegistry;
+use liquidium_pipeline_core::tokens::token_registry::{TokenRegistry, TokenRegistryTrait};
 use log::info;
 use num_traits::ToPrimitive;
 
@@ -198,7 +196,7 @@ where
 
         if let Err(e) = self
             .accounts
-            .transfer(transfer_in, &dep_account, req.pay_amount.value.clone())
+            .transfer(&transfer_in, &dep_account, req.pay_amount.value.clone())
             .await
         {
             let msg = format!("ICRC deposit failed: {}", e);

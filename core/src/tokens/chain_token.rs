@@ -1,27 +1,30 @@
 use std::fmt;
 
-use candid::{CandidType, Principal};
+use candid::{CandidType, Nat, Principal};
 use serde::{Deserialize, Serialize};
 
 use crate::tokens::{asset_id::AssetId, icrc::icrc_token::IcrcToken};
 
-#[derive(Clone, Debug, Serialize, Deserialize, CandidType, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, Deserialize, CandidType, PartialEq, Eq, Hash)]
 pub enum ChainToken {
     Icp {
         ledger: Principal,
         symbol: String,
         decimals: u8,
+        fee: Nat,
     },
     EvmNative {
         chain: String,  // "eth", "arb", "base"
         symbol: String, // "ETH"
         decimals: u8,   // usually 18
+        fee: Nat,
     },
     EvmErc20 {
         chain: String,         // "eth", "arb"
         token_address: String, // "0x..."
         symbol: String,
         decimals: u8,
+        fee: Nat,
     },
 }
 
@@ -44,9 +47,17 @@ impl ChainToken {
 
     pub fn decimals(&self) -> u8 {
         match self {
-            ChainToken::Icp { decimals, .. } => decimals.clone(),
-            ChainToken::EvmNative { decimals, .. } => decimals.clone(),
-            ChainToken::EvmErc20 { decimals, .. } => decimals.clone(),
+            ChainToken::Icp { decimals, .. } => *decimals,
+            ChainToken::EvmNative { decimals, .. } => *decimals,
+            ChainToken::EvmErc20 { decimals, .. } => *decimals,
+        }
+    }
+
+    pub fn fee(&self) -> Nat {
+        match self {
+            ChainToken::Icp { fee, .. } => fee.clone(),
+            ChainToken::EvmNative { fee, .. } => fee.clone(),
+            ChainToken::EvmErc20 { fee, .. } => fee.clone(),
         }
     }
 
@@ -106,6 +117,7 @@ impl From<IcrcToken> for ChainToken {
             ledger: value.ledger,
             symbol: value.symbol,
             decimals: value.decimals,
+            fee: value.fee,
         }
     }
 }

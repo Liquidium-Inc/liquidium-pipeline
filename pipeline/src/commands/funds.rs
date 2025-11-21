@@ -1,10 +1,9 @@
 use liquidium_pipeline::{config::ConfigTrait, context::init_context};
 use prettytable::{Cell, Row, Table, format};
 
-use liquidium_pipeline_core::account::model::ChainBalance;
+use liquidium_pipeline_core::tokens::chain_token_amount::ChainTokenAmount;
 
 pub async fn funds() -> Result<(), String> {
-
     let ctx = init_context().await?;
 
     println!("\n=== Account (Main / Liquidator) ===");
@@ -61,13 +60,13 @@ pub async fn funds() -> Result<(), String> {
     Ok(())
 }
 
-fn format_chain_balance(bal: &ChainBalance) -> String {
-    let raw = bal.amount_native.clone();
-    let decimals = bal.decimals as u32;
+fn format_chain_balance(bal: &ChainTokenAmount) -> String {
+    let raw = bal.value.clone();
+    let decimals = bal.token.decimals() as u32;
 
     if decimals == 0 {
         let int_str = raw.to_string().replace('_', "");
-        return format!("{} {}", int_str, bal.symbol);
+        return format!("{} {}", int_str, bal.token.symbol());
     }
 
     // clamp to max 6 displayed decimals
@@ -85,5 +84,5 @@ fn format_chain_balance(bal: &ChainBalance) -> String {
 
     let frac_str = format!("{:0>width$}", frac_clean, width = display_decimals as usize);
 
-    format!("{}.{} {}", int_str, frac_str, bal.symbol)
+    format!("{}.{} {}", int_str, frac_str, bal.token.symbol())
 }

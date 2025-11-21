@@ -74,7 +74,7 @@ impl WadRayMath for Nat {
     
     fn ray_pow(&self, mut exp: u128) -> Self {
         // Compute self^exp in ray precision.
-        let mut z = if exp % 2 != 0 {
+        let mut z = if !exp.is_multiple_of(2) {
             self.clone()
         } else {
             Nat::from(RAY)
@@ -83,7 +83,7 @@ impl WadRayMath for Nat {
         exp /= 2;
         while exp != 0 {
             base = base.ray_mul(&base);
-            if exp % 2 != 0 {
+            if !exp.is_multiple_of(2) {
                 z = z.ray_mul(&base);
             }
             exp /= 2;

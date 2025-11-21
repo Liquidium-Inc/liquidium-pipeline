@@ -4,22 +4,19 @@ use candid::Nat;
 
 use crate::account::model::ChainAccount;
 use crate::tokens::asset_id::AssetId;
-use crate::tokens::token_registry::TokenRegistry;
+use crate::tokens::token_registry::{TokenRegistry, TokenRegistryTrait};
 use crate::transfer::actions::TransferActions;
 
 // Service for transferring tokens across chains using a token registry.
 // This is pure core logic: it only depends on TransferActions and TokenRegistry,
 // and has no knowledge of concrete backends (ICP, EVM, etc).
 pub struct TransferService {
-    registry: Arc<TokenRegistry>,
+    registry: Arc<dyn TokenRegistryTrait>,
     actions: Arc<dyn TransferActions + Send + Sync>,
 }
 
 impl TransferService {
-    pub fn new(
-        registry: Arc<TokenRegistry>,
-        actions: Arc<dyn TransferActions + Send + Sync>,
-    ) -> Self {
+    pub fn new(registry: Arc<TokenRegistry>, actions: Arc<dyn TransferActions + Send + Sync>) -> Self {
         Self { registry, actions }
     }
 
@@ -43,8 +40,8 @@ impl TransferService {
     }
 
     // Expose the underlying registry if needed by callers.
-    pub fn registry(&self) -> &TokenRegistry {
-        &self.registry
+    pub fn registry(&self) -> Arc<dyn TokenRegistryTrait> {
+        self.registry.clone()
     }
 
     // Expose the underlying TransferActions router if needed by callers.

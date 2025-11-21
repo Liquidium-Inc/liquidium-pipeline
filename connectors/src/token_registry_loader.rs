@@ -50,10 +50,17 @@ where
             .icrc1_decimals(ledger)
             .await
             .map_err(|e| format!("icp decimals for `{spec}` failed: {e}"))?;
+
+        let fee = icp_backend
+            .icrc1_fee(ledger)
+            .await
+            .map_err(|e| format!("icp decimals for `{spec}` failed: {e}"))?;
+
         Ok(ChainToken::Icp {
             ledger,
             symbol,
             decimals,
+            fee,
         })
     } else if let Some(chain_name) = chain.strip_prefix("evm-") {
         // EVM chain: evm-eth, evm-arb, etc.
@@ -64,6 +71,7 @@ where
                 chain: chain_name.to_string(),
                 symbol,
                 decimals: 18,
+                fee: 0u8.into(),
             })
         } else {
             // ERC-20 token
@@ -77,6 +85,7 @@ where
                 token_address: address,
                 symbol,
                 decimals,
+                fee: 0u8.into(),
             })
         }
     } else {
