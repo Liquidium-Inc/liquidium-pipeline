@@ -2,7 +2,7 @@ use candid::{CandidType, Decode, Principal};
 use ic_agent::Agent;
 use serde::de::DeserializeOwned;
 
-#[cfg_attr(test, mockall::automock)]
+#[mockall::automock]
 #[async_trait::async_trait]
 pub trait PipelineAgent: Send + Sync {
     async fn call_query<R: Sized + CandidType + DeserializeOwned + 'static>(

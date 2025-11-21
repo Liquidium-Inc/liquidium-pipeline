@@ -2,8 +2,8 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use candid::{Encode, Principal};
-use liquidium_pipeline_core::types::protocol_types::{AssetType, LiquidatebleUser};
 use liquidium_pipeline_connectors::pipeline_agent::PipelineAgent;
+use liquidium_pipeline_core::types::protocol_types::{AssetType, LiquidatebleUser};
 
 use crate::stage::PipelineStage;
 
@@ -64,79 +64,136 @@ where
     }
 }
 
-// #[cfg(test)]
-// mod tests {
-//     use super::*;
-//     use candid::{Nat, Principal};
-//     use liquidium_pipeline_core::types::protocol_types::{Assets, LiquidateblePosition};
-//     // use liquidium_pipeline_connectors::pipeline_agent::MockPipelineAgent;
-//     use std::sync::Arc;
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use candid::{Nat, Principal};
+    use liquidium_pipeline_connectors::pipeline_agent::MockPipelineAgent;
+    use liquidium_pipeline_core::types::protocol_types::{AssetType, Assets, LiquidateblePosition, LiquidatebleUser};
 
-//     use crate::stage::PipelineStage;
+    #[tokio::test]
+    async fn opportunity_finder_filters_supported_ck_assets_by_principal() {
+        let canister_id = Principal::anonymous();
 
-//     #[tokio::test]
-//     async fn test_process_filters_supported_ck_assets() {
-//         let mut mock = MockPipelineAgent::new();
-//         let canister_id = Principal::anonymous();
+        // Two supported ck assets, one unsupported native/unknown asset.
+        let ckbtc_principal = Principal::from_text("mxzaz-hqaaa-aaaar-qaada-cai").unwrap();
+        let ckusdc_principal = Principal::from_text("xevnm-gaaaa-aaaar-qafnq-cai").unwrap();
 
-//         let pos_ckbtc = LiquidateblePosition {
-//             pool_id: Principal::anonymous(),
-//             debt_amount: Nat::from(1000u64),
-//             collateral_amount: Nat::from(2000u64),
-//             asset: Assets::BTC,
-//             asset_type: AssetType::CkAsset(Principal::anonymous()),
-//             account: Principal::anonymous(),
-//             liquidation_bonus: 60,
-//             protocol_fee: 200,
-//         };
+        let pos_ckbtc = LiquidateblePosition {
+            pool_id: Principal::anonymous(),
+            debt_amount: Nat::from(1_000u64),
+            collateral_amount: Nat::from(2_000u64),
+            asset: Assets::BTC,
+            asset_type: AssetType::CkAsset(ckbtc_principal),
+            account: Principal::anonymous(),
+            liquidation_bonus: 60,
+            protocol_fee: 200,
+        };
 
-//         let pos_ckusdc = LiquidateblePosition {
-//             asset: Assets::USDC,
-//             asset_type: AssetType::CkAsset(Principal::anonymous()),
-//             ..pos_ckbtc.clone()
-//         };
+        let pos_ckusdc = LiquidateblePosition {
+            asset: Assets::USDC,
+            asset_type: AssetType::CkAsset(ckusdc_principal),
+            ..pos_ckbtc.clone()
+        };
 
-//         let pos_sol = LiquidateblePosition {
-//             asset: Assets::SOL,
-//             asset_type: AssetType::Unknown,
-//             ..pos_ckbtc.clone()
-//         };
+        let pos_sol_unknown = LiquidateblePosition {
+            asset: Assets::SOL,
+            asset_type: AssetType::Unknown,
+            ..pos_ckbtc.clone()
+        };
 
-//         let users = vec![
-//             LiquidatebleUser {
-//                 account: Principal::anonymous(),
-//                 health_factor: Nat::from(1u64),
-//                 total_debt: Nat::from(1000u64),
-//                 positions: vec![pos_ckbtc.clone()],
-//             },
-//             LiquidatebleUser {
-//                 account: Principal::anonymous(),
-//                 health_factor: Nat::from(1u64),
-//                 total_debt: Nat::from(1000u64),
-//                 positions: vec![pos_ckusdc.clone()],
-//             },
-//             LiquidatebleUser {
-//                 account: Principal::anonymous(),
-//                 health_factor: Nat::from(1u64),
-//                 total_debt: Nat::from(1000u64),
-//                 positions: vec![pos_sol.clone()],
-//             },
-//         ];
+        let users = vec![
+            LiquidatebleUser {
+                account: Principal::anonymous(),
+                health_factor: Nat::from(1u64),
+                total_debt: Nat::from(1_000u64),
+                positions: vec![pos_ckbtc.clone()],
+            },
+            LiquidatebleUser {
+                account: Principal::anonymous(),
+                health_factor: Nat::from(1u64),
+                total_debt: Nat::from(1_000u64),
+                positions: vec![pos_ckusdc.clone()],
+            },
+            LiquidatebleUser {
+                account: Principal::anonymous(),
+                health_factor: Nat::from(1u64),
+                total_debt: Nat::from(1_000u64),
+                positions: vec![pos_sol_unknown.clone()],
+            },
+        ];
 
-//         mock.expect_call_query().returning(move |_, _, _| Ok(users.clone()));
+        let mut agent = MockPipelineAgent::new();
+        agent.expect_call_query().returning(move |_, _, _| Ok(users.clone()));
 
-//         let finder = OpportunityFinder::new(Arc::new(mock), canister_id);
-//         let result = finder
-//             .process(&vec!["BTC".to_string(), "USDC".to_string()])
-//             .await
-//             .unwrap();
+        let finder = OpportunityFinder::new(Arc::new(agent), canister_id);
 
-//         // Only BTC and USDC should remain
-//         assert_eq!(result.len(), 2);
+        // supported_assets is a Vec of ck ledger principals as strings
+        let supported_assets = vec![ckbtc_principal.to_string(), ckusdc_principal.to_string()];
 
-//         let all_positions: Vec<_> = result.iter().flat_map(|u| u.positions.iter()).collect();
-//         assert!(all_positions.contains(&&pos_ckbtc));
-//         assert!(all_positions.contains(&&pos_ckusdc));
-//         assert!(!all_positions.iter().any(|p| p.asset == Assets::SOL));
-//     }
-// }
+        let result = finder.process(&supported_assets).await.unwrap();
+
+        // Only BTC and USDC users should remain; SOL should be dropped
+        assert_eq!(result.len(), 2);
+
+        let all_positions: Vec<_> = result.iter().flat_map(|u| u.positions.iter()).collect();
+        assert!(all_positions.iter().any(|p| p.asset == Assets::BTC));
+        assert!(all_positions.iter().any(|p| p.asset == Assets::USDC));
+        assert!(!all_positions.iter().any(|p| p.asset == Assets::SOL));
+    }
+
+    #[tokio::test]
+    async fn opportunity_finder_drops_users_with_no_supported_positions() {
+        let canister_id = Principal::anonymous();
+
+        let ckbtc_principal = Principal::from_text("mxzaz-hqaaa-aaaar-qaada-cai").unwrap();
+        let unsupported_principal = Principal::from_text("ryjl3-tyaaa-aaaaa-aaaba-cai").unwrap(); // e.g. ICP
+
+        let supported_pos = LiquidateblePosition {
+            pool_id: Principal::anonymous(),
+            debt_amount: Nat::from(1_000u64),
+            collateral_amount: Nat::from(2_000u64),
+            asset: Assets::BTC,
+            asset_type: AssetType::CkAsset(ckbtc_principal),
+            account: Principal::anonymous(),
+            liquidation_bonus: 60,
+            protocol_fee: 200,
+        };
+
+        let unsupported_pos = LiquidateblePosition {
+            asset: Assets::BTC,
+            asset_type: AssetType::CkAsset(unsupported_principal),
+            ..supported_pos.clone()
+        };
+
+        let users = vec![
+            LiquidatebleUser {
+                account: Principal::anonymous(),
+                health_factor: Nat::from(1u64),
+                total_debt: Nat::from(1_000u64),
+                positions: vec![supported_pos.clone()],
+            },
+            LiquidatebleUser {
+                account: Principal::anonymous(),
+                health_factor: Nat::from(1u64),
+                total_debt: Nat::from(1_000u64),
+                positions: vec![unsupported_pos.clone()],
+            },
+        ];
+
+        let mut agent = MockPipelineAgent::new();
+        agent.expect_call_query().returning(move |_, _, _| Ok(users.clone()));
+        
+        let finder = OpportunityFinder::new(Arc::new(agent), canister_id);
+
+        let supported_assets = vec![ckbtc_principal.to_string()];
+
+        let result = finder.process(&supported_assets).await.unwrap();
+
+        // Only the user with a supported ck asset principal should remain
+        assert_eq!(result.len(), 1);
+        let positions = &result[0].positions;
+        assert_eq!(positions.len(), 1);
+        assert_eq!(positions[0].asset_type, AssetType::CkAsset(ckbtc_principal));
+    }
+}
