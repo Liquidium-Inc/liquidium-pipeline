@@ -3,7 +3,7 @@ use async_trait::async_trait;
 #[derive(Debug, Clone)]
 pub struct DepositAddress {
     pub asset: String,
-    pub network: Option<String>,
+    pub network: String,
     pub address: String,
     pub tag: Option<String>, // for exchanges that need memo/tag
 }
@@ -17,6 +17,15 @@ pub struct WithdrawalReceipt {
     pub internal_id: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WithdrawStatus {
+    Pending,
+    Completed,
+    Failed,
+    Canceled,
+    Unknown,
+}
+
 #[async_trait]
 pub trait CexBackend: Send + Sync {
     // trading
@@ -25,7 +34,7 @@ pub trait CexBackend: Send + Sync {
     async fn execute_swap(&self, market: &str, side: &str, amount_in: f64) -> Result<f64, String>;
 
     // deposits
-    async fn get_deposit_address(&self, asset: &str, network: Option<&str>) -> Result<DepositAddress, String>;
+    async fn get_deposit_address(&self, asset: &str, network: &str) -> Result<DepositAddress, String>;
 
     // withdrawals
     async fn withdraw(
@@ -33,10 +42,16 @@ pub trait CexBackend: Send + Sync {
         asset: &str,
         network: &str,
         address: &str,
-        tag: Option<&str>,
         amount: f64,
     ) -> Result<WithdrawalReceipt, String>;
 
     // balance
     async fn get_balance(&self, asset: &str) -> Result<f64, String>;
+
+    // withdrawal status
+    async fn get_withdraw_status_by_id(
+        &self,
+        coin: &str,
+        withdraw_id: &str,
+    ) -> Result<WithdrawStatus, String>;
 }

@@ -10,10 +10,6 @@ use crate::swappers::model::{SwapExecution, SwapQuote, SwapQuoteLeg, SwapRequest
 use crate::swappers::router::SwapVenue;
 use crate::swappers::swap_interface::SwapInterface;
 use num_traits::ToPrimitive;
-fn nat_to_f64(n: &Nat) -> Result<f64, String> {
-    let u = n.0.to_u128().ok_or_else(|| format!("Nat too large for f64: {}", n))?;
-    Ok(u as f64)
-}
 
 fn f64_to_nat(v: f64) -> Nat {
     Nat::from(v as u128)
@@ -43,11 +39,14 @@ impl<C: CexBackend> SwapVenue for MexcSwapVenue<C> {
 
     async fn quote(&self, req: &SwapRequest) -> Result<SwapQuote, String> {
         let market = market_symbol(&req.pay_asset, &req.receive_asset);
-        let amount_in_f = nat_to_f64(&req.pay_amount)?;
+        let amount_in_f = req.pay_amount.to_f64();
 
         info!(
             "MEXC quote {} {} -> {} on {}",
-            req.pay_amount, req.pay_asset.symbol, req.receive_asset.symbol, market
+            req.pay_amount.formatted(),
+            req.pay_asset.symbol,
+            req.receive_asset.symbol,
+            market
         );
 
         let out_f = self.client.get_quote(&market, amount_in_f).await?;
@@ -59,7 +58,7 @@ impl<C: CexBackend> SwapVenue for MexcSwapVenue<C> {
 
             pay_chain: req.pay_asset.chain.clone(),
             pay_symbol: req.pay_asset.symbol.clone(),
-            pay_amount: req.pay_amount.clone(),
+            pay_amount: req.pay_amount.value.clone(),
 
             receive_chain: req.receive_asset.chain.clone(),
             receive_symbol: req.receive_asset.symbol.clone(),
@@ -72,7 +71,7 @@ impl<C: CexBackend> SwapVenue for MexcSwapVenue<C> {
 
         Ok(SwapQuote {
             pay_asset: req.pay_asset.clone(),
-            pay_amount: req.pay_amount.clone(),
+            pay_amount: req.pay_amount.value.clone(),
             receive_asset: req.receive_asset.clone(),
             receive_amount: leg.receive_amount.clone(),
             mid_price: leg.price,
@@ -84,12 +83,15 @@ impl<C: CexBackend> SwapVenue for MexcSwapVenue<C> {
 
     async fn execute(&self, req: &SwapRequest) -> Result<SwapExecution, String> {
         let market = market_symbol(&req.pay_asset, &req.receive_asset);
-        let amount_in_f = nat_to_f64(&req.pay_amount)?;
+        let amount_in_f = req.pay_amount.to_f64();
         let side = "sell"; // assuming pay_asset is the base
 
         info!(
             "MEXC swap {} {} -> {} on {}",
-            req.pay_amount, req.pay_asset.symbol, req.receive_asset.symbol, market
+            req.pay_amount.formatted(),
+            req.pay_asset.symbol,
+            req.receive_asset.symbol,
+            market
         );
 
         let out_f = self.client.execute_swap(&market, side, amount_in_f).await?;
@@ -102,7 +104,7 @@ impl<C: CexBackend> SwapVenue for MexcSwapVenue<C> {
 
             pay_chain: req.pay_asset.chain.clone(),
             pay_symbol: req.pay_asset.symbol.clone(),
-            pay_amount: req.pay_amount.clone(),
+            pay_amount: req.pay_amount.value.clone(),
 
             receive_chain: req.receive_asset.chain.clone(),
             receive_symbol: req.receive_asset.symbol.clone(),
@@ -112,14 +114,14 @@ impl<C: CexBackend> SwapVenue for MexcSwapVenue<C> {
             lp_fee: Nat::from(0u8),
             gas_fee: Nat::from(0u8),
         };
-        
+
         Ok(SwapExecution {
             swap_id: 0,    // you can fill from WAL or an internal sequence later
             request_id: 0, // same
             status: "filled".to_string(),
 
             pay_asset: req.pay_asset.clone(),
-            pay_amount: req.pay_amount.clone(),
+            pay_amount: req.pay_amount.value.clone(),
             receive_asset: req.receive_asset.clone(),
             receive_amount: leg.receive_amount.clone(),
 

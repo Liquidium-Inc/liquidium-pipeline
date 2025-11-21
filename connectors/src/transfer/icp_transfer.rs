@@ -29,11 +29,26 @@ impl<B: IcpBackend + Send + Sync> TransferActions for IcpTransferAdapter<B> {
         amount_native: Nat,
     ) -> Result<String, String> {
         match (token, to) {
+            // Native ICP via ICP ledger: destination is an AccountIdentifier hex string
+            (
+                ChainToken::Icp { ledger, .. },
+                ChainAccount::IcpLedger(to_account_id_hex),
+            ) => {
+                // amount_native is in e8s for ICP
+                let block_index = self
+                    .backend
+                    .icp_transfer(*ledger, to_account_id_hex, amount_native)
+                    .await?;
+
+                Ok(block_index.to_string())
+            }
+
+            // ICRC-1 style transfers that still use an ICRC `Account` as destination
             (
                 ChainToken::Icp { ledger, .. },
                 ChainAccount::Icp(to_account),
             ) => {
-                let amount = Nat::from(amount_native);
+                let amount = amount_native;
                 let block_index = self
                     .backend
                     .icrc1_transfer(*ledger, &self.account, to_account, amount)
@@ -41,6 +56,7 @@ impl<B: IcpBackend + Send + Sync> TransferActions for IcpTransferAdapter<B> {
 
                 Ok(block_index.to_string())
             }
+
             (ChainToken::Icp { .. }, _) => {
                 Err("IcpTransferAdapter: destination chain must be ICP".to_string())
             }

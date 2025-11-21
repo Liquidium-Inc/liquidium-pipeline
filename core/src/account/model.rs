@@ -11,6 +11,7 @@ pub enum Chain {
 #[derive(Clone, Debug, Serialize, Deserialize, CandidType, PartialEq, Eq)]
 pub enum ChainAccount {
     Icp(Account),
+    IcpLedger(String),
     Evm(String), // EVM address as string
 }
 

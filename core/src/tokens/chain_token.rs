@@ -13,13 +13,13 @@ pub enum ChainToken {
         decimals: u8,
     },
     EvmNative {
-        chain: String,     // "eth", "arb", "base"
-        symbol: String,    // "ETH"
-        decimals: u8,      // usually 18
+        chain: String,  // "eth", "arb", "base"
+        symbol: String, // "ETH"
+        decimals: u8,   // usually 18
     },
     EvmErc20 {
-        chain: String,          // "eth", "arb"
-        token_address: String,  // "0x..."
+        chain: String,         // "eth", "arb"
+        token_address: String, // "0x..."
         symbol: String,
         decimals: u8,
     },
@@ -59,7 +59,7 @@ impl ChainToken {
             },
 
             ChainToken::EvmNative { chain, symbol, .. } => AssetId {
-                chain: format!("evm-{}", chain),
+                chain: chain.to_string(),
                 address: "native".to_string(),
                 symbol: symbol.clone(),
             },
@@ -70,7 +70,7 @@ impl ChainToken {
                 symbol,
                 ..
             } => AssetId {
-                chain: format!("evm-{}", chain),
+                chain: chain.to_string(),
                 address: token_address.clone(),
                 symbol: symbol.clone(),
             },
@@ -99,7 +99,6 @@ impl fmt::Display for ChainToken {
         }
     }
 }
-
 
 impl From<IcrcToken> for ChainToken {
     fn from(value: IcrcToken) -> Self {

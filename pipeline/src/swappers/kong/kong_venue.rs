@@ -26,12 +26,6 @@ impl<A: PipelineAgent> KongVenue<A> {
         Self { swapper, tokens }
     }
 
-    fn ensure_pay_amount(req: &SwapRequest) -> Result<Nat, String> {
-        // For now just use req.pay_amount; if you ever support
-        // "receive_exact" flows, you can adapt here.
-        Ok(req.pay_amount.clone())
-    }
-
     fn find_token(&self, symbol: &str) -> Result<ChainToken, String> {
         self.tokens
             .iter()
@@ -42,7 +36,7 @@ impl<A: PipelineAgent> KongVenue<A> {
 
     fn build_amount(&self, req: &SwapRequest) -> Result<ChainTokenAmount, String> {
         let pay_token = self.find_token(&req.pay_asset.symbol)?;
-        let value = Self::ensure_pay_amount(req)?;
+        let value = req.pay_amount.value.clone();
         Ok(ChainTokenAmount {
             token: pay_token,
             value,
@@ -82,7 +76,7 @@ where
     async fn execute(&self, req: &SwapRequest) -> Result<SwapExecution, String> {
         // Generic SwapRequest -> KongSwapArgs via adapter
         let mut kong_req: KongSwapArgs = KongSwapArgs::from(req.clone());
-        kong_req.pay_amount = Self::ensure_pay_amount(req)?;
+        kong_req.pay_amount = req.pay_amount.value.clone();
 
         info!(
             "KongVenue execute {} {} -> {}",

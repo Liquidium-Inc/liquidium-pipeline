@@ -19,10 +19,11 @@ icrc-ledger-types = { workspace = true }
 log = { workspace = true }
 mockall = { workspace = true }
 tokio = { workspace = true }
+hex = { workspace = true }
+num-traits = { workspace = true }
 
 bip39 = "2.2.0"
 bip32 = "0.5.3"
 k256 = "0.13.0"
 num-bigint = "0.4.6"
 liquidium-pipeline-core = { path = "../core" }
-ccxt = { git = "https://github.com/kizzx2/ccxt-rs-lib" }

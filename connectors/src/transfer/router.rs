@@ -23,26 +23,15 @@ where
     I: TransferActions + Send + Sync,
     E: TransferActions + Send + Sync,
 {
-    async fn transfer(
-        &self,
-        token: &ChainToken,
-        to: &ChainAccount,
-        amount_native: Nat,
-    ) -> Result<String, String> {
+    async fn transfer(&self, token: &ChainToken, to: &ChainAccount, amount_native: Nat) -> Result<String, String> {
         // Validate that token and destination are on the same chain
         match (token, to) {
-            (ChainToken::Icp { .. }, ChainAccount::Icp(_)) => {
-                self.icp.transfer(token, to, amount_native).await
-            }
+            (ChainToken::Icp { .. }, ChainAccount::Icp(_)) => self.icp.transfer(token, to, amount_native).await,
+            (ChainToken::Icp { .. }, ChainAccount::IcpLedger(_)) => self.icp.transfer(token, to, amount_native).await,
             (ChainToken::EvmNative { .. } | ChainToken::EvmErc20 { .. }, ChainAccount::Evm(_)) => {
                 self.evm.transfer(token, to, amount_native).await
             }
-            (ChainToken::Icp { .. }, ChainAccount::Evm(_)) => {
-                Err("chain mismatch: cannot transfer ICP token to EVM address".to_string())
-            }
-            (ChainToken::EvmNative { .. } | ChainToken::EvmErc20 { .. }, ChainAccount::Icp(_)) => {
-                Err("chain mismatch: cannot transfer EVM token to ICP account".to_string())
-            }
+            _ => Err("invalid transfer configuration".to_string()),
         }
     }
 }

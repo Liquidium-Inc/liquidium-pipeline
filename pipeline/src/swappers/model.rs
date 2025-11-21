@@ -1,6 +1,6 @@
 
 use candid::{CandidType, Nat};
-use liquidium_pipeline_core::tokens::asset_id::AssetId;
+use liquidium_pipeline_core::tokens::{asset_id::AssetId, chain_token_amount::ChainTokenAmount};
 use serde::{Deserialize, Serialize};
 
 #[derive(CandidType, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -12,7 +12,7 @@ pub enum TxRef {
 #[derive(CandidType, Debug, Clone, Serialize, Deserialize)]
 pub struct SwapRequest {
     pub pay_asset: AssetId,
-    pub pay_amount: Nat,
+    pub pay_amount: ChainTokenAmount,
     pub receive_asset: AssetId,
     pub receive_address: Option<String>,
     pub max_slippage_bps: Option<u32>, // 100 = 1%

@@ -21,8 +21,11 @@ impl TokenRegistry {
         self.tokens.iter()
     }
 
-    pub fn by_symbol(&self, symbol: &str) -> impl Iterator<Item = (&AssetId, &ChainToken)> {
-        self.tokens.iter().filter(move |(_, t)| t.symbol() == symbol)
+    pub fn by_symbol(&self, symbol: &str) -> impl Iterator<Item = (AssetId, ChainToken)> {
+        self.tokens
+            .iter()
+            .filter(move |(_, t)| t.symbol() == symbol)
+            .map(|item| (item.0.clone(), item.1.clone()))
     }
 
     pub fn resolve(&self, id: &AssetId) -> Result<&ChainToken, String> {

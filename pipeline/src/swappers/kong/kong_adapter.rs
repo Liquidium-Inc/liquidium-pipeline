@@ -44,7 +44,7 @@ impl From<SwapRequest> for KongSwapArgs {
 
         KongSwapArgs {
             pay_token: pay_symbol,
-            pay_amount: req.pay_amount,
+            pay_amount: req.pay_amount.value,
             pay_tx_id: None,
             receive_token: recv_symbol,
             receive_amount: None,

@@ -14,7 +14,11 @@ use async_trait::async_trait;
 use candid::Encode;
 
 use liquidium_pipeline_connectors::pipeline_agent::PipelineAgent;
-use liquidium_pipeline_core::{transfer::actions::TransferActions, types::protocol_types::{LiquidationResult, TransferStatus}};
+use liquidium_pipeline_core::{
+    tokens::chain_token_amount::ChainTokenAmount,
+    transfer::actions::TransferActions,
+    types::protocol_types::{LiquidationResult, TransferStatus},
+};
 use num_traits::ToPrimitive;
 use std::time::Duration;
 
@@ -296,7 +300,10 @@ impl<D: WalStore, S: SwapInterface, A: TransferActions, C: ConfigTrait, P: Pipel
             None => return Ok(None),
         };
 
-        swap_args.pay_amount = liq.amounts.collateral_received.clone();
+        swap_args.pay_amount = ChainTokenAmount::from_raw(
+            receipt.request.collateral_asset.clone(),
+            liq.amounts.collateral_received,
+        );
 
         let mut attempt = 0;
         let max_retries = 3;
@@ -321,8 +328,8 @@ impl<D: WalStore, S: SwapInterface, A: TransferActions, C: ConfigTrait, P: Pipel
 
                     let fee = 0u8; // TODO: get icrc fee
                     // Reduce pay amount by collateral fee; abort if not enough
-                    if swap_args.pay_amount > fee {
-                        swap_args.pay_amount -= fee;
+                    if swap_args.pay_amount.value > fee {
+                        swap_args.pay_amount.value -= fee;
                     } else {
                         return Err(ExecutionStatus::SwapFailed(
                             "Swap retry aborted: insufficient pay amount".to_string(),
