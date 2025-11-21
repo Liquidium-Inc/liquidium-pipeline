@@ -1,8 +1,10 @@
 use std::collections::{HashMap, HashSet};
+use std::str::FromStr;
 use std::{env, sync::Arc};
 
 use candid::Principal;
 
+use liquidium_pipeline_core::tokens::asset_id::AssetId;
 use liquidium_pipeline_core::tokens::{chain_token::ChainToken, token_registry::TokenRegistry};
 
 use crate::backend::evm_backend::EvmBackend;
@@ -93,32 +95,43 @@ where
     }
 }
 
-/// Load DEBT_ASSETS and COLLATERAL_ASSETS into a deduped TokenRegistry.
-///
-/// Env format:
-///   DEBT_ASSETS=icp:mxzaz-hqaaa-aaaar-qaada-cai:ckBTC,evm-arb:0x...:USDC
-///   COLLATERAL_ASSETS=icp:mxzaz-hqaaa-aaaar-qaada-cai:ckBTC,...
+// Load DEBT_ASSETS and COLLATERAL_ASSETS into a deduped TokenRegistry.
+//
+// Env format:
+//   DEBT_ASSETS=icp:mxzaz-hqaaa-aaaar-qaada-cai:ckBTC,evm-arb:0x...:USDC
+//   COLLATERAL_ASSETS=icp:mxzaz-hqaaa-aaaar-qaada-cai:ckBTC,...
 pub async fn load_token_registry<IB, EB>(icp_backend: Arc<IB>, evm_backend: Arc<EB>) -> Result<TokenRegistry, String>
 where
     IB: IcpBackend + Send + Sync,
     EB: EvmBackend + Send + Sync,
 {
-    let mut specs = HashSet::new();
+    let debt_specs = load_env_specs("DEBT_ASSETS")?;
+    let coll_specs = load_env_specs("COLLATERAL_ASSETS")?;
 
-    for spec in load_env_specs("DEBT_ASSETS")? {
-        specs.insert(spec);
+    let mut all_specs = HashSet::new();
+    for s in &debt_specs {
+        all_specs.insert(s.clone());
     }
-    for spec in load_env_specs("COLLATERAL_ASSETS")? {
-        specs.insert(spec);
+    for s in &coll_specs {
+        all_specs.insert(s.clone());
     }
 
     let mut tokens = HashMap::new();
-
-    for spec in specs {
-        let token = resolve_chain_token(&spec, &icp_backend, &evm_backend).await?;
+    for spec in &all_specs {
+        let token = resolve_chain_token(spec, &icp_backend, &evm_backend).await?;
         let id = token.asset_id();
         tokens.insert(id, token);
     }
 
-    Ok(TokenRegistry::new(tokens))
+    let collateral_ids = coll_specs
+        .into_iter()
+        .map(|spec| AssetId::from_str(&spec).unwrap())
+        .collect::<Vec<_>>();
+
+    let debt_ids = debt_specs
+        .into_iter()
+        .map(|spec| AssetId::from_str(&spec).unwrap())
+        .collect::<Vec<_>>();
+
+    Ok(TokenRegistry::with_roles(tokens, collateral_ids, debt_ids))
 }

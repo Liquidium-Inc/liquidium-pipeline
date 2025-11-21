@@ -16,7 +16,6 @@ use candid::Encode;
 use liquidium_pipeline_connectors::pipeline_agent::PipelineAgent;
 use liquidium_pipeline_core::{
     tokens::chain_token_amount::ChainTokenAmount,
-    transfer::actions::TransferActions,
     types::protocol_types::{LiquidationResult, TransferStatus},
 };
 use num_traits::ToPrimitive;
@@ -76,8 +75,8 @@ impl LiquidationOutcome {
 }
 
 #[async_trait]
-impl<'a, D: WalStore, S: SwapInterface, A: TransferActions, C: ConfigTrait, P: PipelineAgent>
-    PipelineStage<'a, Vec<ExecutionReceipt>, Vec<LiquidationOutcome>> for KongSwapFinalizer<D, S, A, C, P>
+impl<'a, D: WalStore, S: SwapInterface, C: ConfigTrait, P: PipelineAgent>
+    PipelineStage<'a, Vec<ExecutionReceipt>, Vec<LiquidationOutcome>> for KongSwapFinalizer<D, S, C, P>
 {
     async fn process(&self, executor_receipts: &'a Vec<ExecutionReceipt>) -> Result<Vec<LiquidationOutcome>, String> {
         let mut outcomes = Vec::with_capacity(executor_receipts.len());
@@ -152,9 +151,7 @@ impl<'a, D: WalStore, S: SwapInterface, A: TransferActions, C: ConfigTrait, P: P
     }
 }
 
-impl<D: WalStore, S: SwapInterface, A: TransferActions, C: ConfigTrait, P: PipelineAgent>
-    KongSwapFinalizer<D, S, A, C, P>
-{
+impl<D: WalStore, S: SwapInterface, C: ConfigTrait, P: PipelineAgent> KongSwapFinalizer<D, S, C, P> {
     // Helper: extract ExecutionReceipt from a WAL row's meta_json
     fn receipt_from_meta(meta_json: &str) -> Option<ExecutionReceipt> {
         serde_json::from_str::<serde_json::Value>(meta_json).ok().and_then(|v| {
@@ -275,9 +272,7 @@ impl<D: WalStore, S: SwapInterface, A: TransferActions, C: ConfigTrait, P: Pipel
     }
 }
 
-impl<D: WalStore, S: SwapInterface, A: TransferActions, C: ConfigTrait, P: PipelineAgent>
-    KongSwapFinalizer<D, S, A, C, P>
-{
+impl<D: WalStore, S: SwapInterface, C: ConfigTrait, P: PipelineAgent> KongSwapFinalizer<D, S, C, P> {
     fn needs_swap(receipt: &ExecutionReceipt) -> bool {
         receipt.request.expected_profit > 0
             && receipt.request.swap_args.is_some()
@@ -344,9 +339,7 @@ impl<D: WalStore, S: SwapInterface, A: TransferActions, C: ConfigTrait, P: Pipel
     }
 }
 
-impl<D: WalStore, S: SwapInterface, A: TransferActions, C: ConfigTrait, P: PipelineAgent>
-    KongSwapFinalizer<D, S, A, C, P>
-{
+impl<D: WalStore, S: SwapInterface, C: ConfigTrait, P: PipelineAgent> KongSwapFinalizer<D, S, C, P> {
     async fn move_funds_to_recovery(&self, receipt: &ExecutionReceipt) {
         // Move seized collateral to recovery account when we cannot complete the swap
         let Some(_liq) = &receipt.liquidation_result else {

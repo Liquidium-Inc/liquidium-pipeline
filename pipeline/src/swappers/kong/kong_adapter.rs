@@ -1,14 +1,9 @@
 use liquidium_pipeline_core::tokens::asset_id::AssetId;
 
 use crate::swappers::kong::kong_types::{
-    ICTransferReply, SwapAmountsReply as KongSwapAmountsReply, SwapArgs as KongSwapArgs, SwapReply as KongSwapReply,
-    SwapTxReply, TxId as KongTxId,
+    SwapAmountsReply as KongSwapAmountsReply, SwapArgs as KongSwapArgs, SwapReply as KongSwapReply, SwapTxReply,
 };
-use crate::swappers::model::{SwapExecution, SwapQuote, SwapQuoteLeg, SwapRequest, TxRef};
-
-fn default_ic_chain() -> String {
-    "IC".to_string()
-}
+use crate::swappers::model::{SwapExecution, SwapQuote, SwapQuoteLeg, SwapRequest};
 
 fn asset_to_chain_and_symbol(asset: &AssetId) -> (String, String, String) {
     (asset.chain.clone(), asset.symbol.clone(), asset.address.clone())
@@ -19,20 +14,6 @@ fn chain_symbol_to_asset(chain: &str, symbol: &str, address: &str) -> AssetId {
         chain: chain.to_string(),
         symbol: symbol.to_string(),
         address: address.to_string(),
-    }
-}
-
-fn txref_from_ic_transfer(ic: &ICTransferReply) -> TxRef {
-    TxRef::IcBlockIndex {
-        ledger: ic.canister_id.clone(),
-        block_index: ic.block_index.clone(),
-    }
-}
-
-fn txref_to_kong(tx: &TxRef) -> Option<KongTxId> {
-    match tx {
-        TxRef::IcBlockIndex { block_index, .. } => Some(KongTxId::BlockIndex(block_index.clone())),
-        TxRef::TxHash { hash, .. } => Some(KongTxId::TransactionHash(hash.clone())),
     }
 }
 

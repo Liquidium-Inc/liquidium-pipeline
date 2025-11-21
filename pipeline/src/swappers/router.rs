@@ -2,13 +2,25 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
-use crate::swappers::model::{SwapExecution, SwapQuote, SwapRequest};
+use crate::swappers::{model::{SwapExecution, SwapQuote, SwapRequest}, swap_interface::SwapInterface};
 
 #[async_trait]
 pub trait SwapVenue: Send + Sync {
     fn venue_name(&self) -> &'static str;
     async fn quote(&self, req: &SwapRequest) -> Result<SwapQuote, String>;
     async fn execute(&self, req: &SwapRequest) -> Result<SwapExecution, String>;
+}
+
+#[async_trait]
+impl SwapInterface for SwapRouter {
+    async fn quote(&self, req: &SwapRequest) -> Result<SwapQuote, String> {
+        // delegate to inherent method to avoid recursion
+        SwapRouter::quote(self, req).await
+    }
+
+    async fn execute(&self, req: &SwapRequest) -> Result<SwapExecution, String> {
+        SwapRouter::execute(self, req).await
+    }
 }
 
 pub struct SwapRouter {

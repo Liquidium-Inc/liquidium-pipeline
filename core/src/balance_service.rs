@@ -4,11 +4,7 @@ use futures::future::join_all;
 
 use crate::{
     account::actions::AccountInfo,
-    tokens::{
-        asset_id::AssetId,
-        chain_token_amount::ChainTokenAmount,
-        token_registry::{TokenRegistry, TokenRegistryTrait},
-    },
+    tokens::{asset_id::AssetId, chain_token_amount::ChainTokenAmount, token_registry::TokenRegistryTrait},
 };
 
 /// Service for querying balances for a given account across a token registry.
@@ -20,7 +16,7 @@ pub struct BalanceService {
 }
 
 impl BalanceService {
-    pub fn new(registry: Arc<TokenRegistry>, accounts: Arc<dyn AccountInfo + Send + Sync>) -> Self {
+    pub fn new(registry: Arc<dyn TokenRegistryTrait>, accounts: Arc<dyn AccountInfo + Send + Sync>) -> Self {
         Self { registry, accounts }
     }
 

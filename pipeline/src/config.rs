@@ -25,7 +25,6 @@ pub struct Config {
     pub export_path: String,
     pub buy_bad_debt: bool,
     pub db_path: String,
-    pub mnemonic: String,
 }
 
 #[cfg_attr(test, mockall::automock)]
@@ -37,7 +36,6 @@ pub trait ConfigTrait: Send + Sync {
     fn get_recovery_account(&self) -> Account;
     fn exchange_deposit_account_for(&self, chain: &str) -> Result<Account, String>;
     fn exchange_withdraw_address_for(&self, chain: &str) -> Result<String, String>;
-    fn mnemonic(&self) -> String;
 }
 
 impl ConfigTrait for Config {
@@ -79,10 +77,6 @@ impl ConfigTrait for Config {
                 chain, var
             )),
         }
-    }
-
-    fn mnemonic(&self) -> String {
-        self.mnemonic.clone()
     }
 }
 
@@ -158,7 +152,6 @@ impl Config {
             export_path,
             buy_bad_debt,
             db_path,
-            mnemonic,
         }))
     }
 }

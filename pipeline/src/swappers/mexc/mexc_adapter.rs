@@ -1,3 +1,5 @@
+use std::env;
+
 use async_trait::async_trait;
 
 use liquidium_pipeline_connectors::backend::cex_backend::{
@@ -33,11 +35,11 @@ use mexc_rs::spot::{
 
 use num_traits::ToPrimitive;
 
-pub struct MexcAdapter {
+pub struct MexcClient {
     inner: tokio::sync::Mutex<MexcSpotApiClientWithAuthentication>,
 }
 
-impl MexcAdapter {
+impl MexcClient {
     pub fn new(api_key: &str, secret: &str) -> Self {
         let api = MexcSpotApiClientWithAuthentication::new(
             mexc_rs::spot::MexcSpotApiEndpoint::Base,
@@ -48,10 +50,19 @@ impl MexcAdapter {
             inner: tokio::sync::Mutex::new(api),
         }
     }
+
+    pub fn from_env() -> Result<Self, String> {
+        let api_key = env::var("MEXC_API_KEY").map_err(|_| "MEXC_API_KEY not set".to_string())?;
+        let api_secret = env::var("MEXC_API_SECRET").map_err(|_| "MEXC_API_SECRET not set".to_string())?;
+
+        Ok(Self::new(&api_key, &api_secret))
+    }
+
+
 }
 
 #[async_trait]
-impl CexBackend for MexcAdapter {
+impl CexBackend for MexcClient {
     async fn get_quote(&self, market: &str, amount_in: f64) -> Result<f64, String> {
         let ex = self.inner.lock().await;
 

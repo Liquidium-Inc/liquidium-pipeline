@@ -244,10 +244,6 @@ pub async fn withdraw() {
 
                 Destination::Evm(manual_input)
             }
-            _ => {
-                println!("Selected asset chain is not supported for withdraw.");
-                return;
-            }
         }
     };
 
@@ -272,7 +268,7 @@ pub async fn withdraw() {
 
             let amount_nat = ChainTokenAmount {
                 token: token.clone(),
-                value: Nat::from(amount_native),
+                value: amount_native,
             };
 
             plan.push((id.clone(), token.clone(), amount_nat, bal_fmt));
@@ -308,14 +304,11 @@ pub async fn withdraw() {
 
                     send_native.into()
                 }
-
-                // Fallback: just use full balance if present.
-                _ => bal_opt.map(|b| b.value.clone()).unwrap_or(0u128.into()),
             };
 
             ChainTokenAmount {
                 token: token.clone(),
-                value: Nat::from(amount_native),
+                value: amount_native,
             }
         } else {
             let val = f64::from_str(&amount_input).unwrap_or(0.0);
@@ -331,7 +324,6 @@ pub async fn withdraw() {
         let src_str = match tok {
             ChainToken::Icp { .. } => account.to_string(),
             ChainToken::EvmNative { .. } | ChainToken::EvmErc20 { .. } => ctx.evm_address.clone(),
-            _ => account.to_string(),
         };
 
         println!("Transfer #{}:", i + 1);
@@ -373,7 +365,6 @@ pub async fn withdraw() {
         let src_str = match &token {
             ChainToken::Icp { .. } => account.to_string(),
             ChainToken::EvmNative { .. } | ChainToken::EvmErc20 { .. } => ctx.evm_address.clone(),
-            _ => account.to_string(),
         };
 
         let to = match (&token, &dst) {
@@ -475,11 +466,9 @@ async fn sync_balances(
 
         let decimals = *decimals_map.get(&ledger).unwrap_or(&decimals);
 
-        let arg = account.clone();
-
         let res = agent
             .query(&ledger, "icrc1_balance_of")
-            .with_arg(Encode!(&arg).unwrap())
+            .with_arg(Encode!(&account).unwrap())
             .call()
             .await;
 

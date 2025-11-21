@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 
@@ -11,11 +12,13 @@ use liquidium_pipeline_core::tokens::chain_token_amount::ChainTokenAmount;
 // This comes from connectors
 use crate::backend::evm_backend::EvmBackend;
 
+const CACHE_TTL: Duration = Duration::from_secs(30);
+
 pub struct EvmAccountInfoAdapter<B: EvmBackend> {
     pub backend: Arc<B>,
     // Cache key: (chain, address_or_native) -> ChainTokenAmount
     // For native assets, use "native" as the address
-    cache: Mutex<HashMap<(String, String), ChainTokenAmount>>,
+    cache: Mutex<HashMap<(String, String), (ChainTokenAmount, Instant)>>,
 }
 
 impl<B: EvmBackend> EvmAccountInfoAdapter<B> {
@@ -66,7 +69,7 @@ impl<B: EvmBackend> AccountInfo for EvmAccountInfoAdapter<B> {
 
         if let Some((chain, addr)) = cache_key {
             let mut lock = self.cache.lock().unwrap();
-            lock.insert((chain, addr), bal.clone());
+            lock.insert((chain, addr), (bal.clone(), Instant::now()));
         }
 
         Ok(bal)
@@ -81,10 +84,27 @@ impl<B: EvmBackend> AccountInfo for EvmAccountInfoAdapter<B> {
             _ => None,
         };
 
-        if let Some((chain, addr)) = cache_key {
+        let (chain, addr) = cache_key?;
+
+        let mut is_stale = false;
+        let mut result = None;
+
+        {
             let lock = self.cache.lock().unwrap();
-            return lock.get(&(chain, addr)).cloned();
+            if let Some((amount, ts)) = lock.get(&(chain.clone(), addr.clone())) {
+                if ts.elapsed() <= CACHE_TTL {
+                    result = Some(amount.clone());
+                } else {
+                    is_stale = true;
+                }
+            }
         }
-        None
+
+        if is_stale {
+            let mut lock = self.cache.lock().unwrap();
+            lock.remove(&(chain, addr));
+        }
+
+        result
     }
 }

@@ -9,6 +9,7 @@ crate-type = ["lib"]
 
 [lints.clippy]
 double_parens = "allow"
+type_complexity = "allow"
 
 [dependencies]
 serde = { workspace = true }

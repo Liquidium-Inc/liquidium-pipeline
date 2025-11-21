@@ -1,6 +1,7 @@
 use std::{
     collections::HashMap,
     sync::{Arc, Mutex},
+    time::{Duration, Instant},
 };
 
 use crate::backend::icp_backend::IcpBackend;
@@ -56,11 +57,13 @@ pub const RECOVERY_ACCOUNT: &Subaccount = &[
     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
 ];
 
+const CACHE_TTL: Duration = Duration::from_secs(30);
+
 // Adapter that turns an IcpBackend + Account into a core::AccountInfo implementation.
 pub struct IcpAccountInfoAdapter<B: IcpBackend> {
     backend: Arc<B>,
     account: Account,
-    cache: Arc<Mutex<HashMap<(Principal, String), ChainTokenAmount>>>,
+    cache: Arc<Mutex<HashMap<(Principal, String), (ChainTokenAmount, Instant)>>>,
 }
 
 impl<B: IcpBackend> IcpAccountInfoAdapter<B> {
@@ -104,7 +107,7 @@ where
                 };
 
                 let mut cache = self.cache.lock().expect("icp balance cache poisoned");
-                cache.insert((*ledger, symbol.clone()), balance.clone());
+                cache.insert((*ledger, symbol.clone()), (balance.clone(), Instant::now()));
 
                 Ok(balance)
             }
@@ -115,8 +118,17 @@ where
     fn get_cached_balance(&self, token: &ChainToken) -> Option<ChainTokenAmount> {
         match token {
             ChainToken::Icp { ledger, symbol, .. } => {
-                let cache = self.cache.lock().ok()?;
-                cache.get(&(*ledger, symbol.clone())).cloned()
+                let key = (*ledger, symbol.clone());
+                let mut guard = self.cache.lock().ok()?;
+                if let Some((amount, ts)) = guard.get(&key) {
+                    if ts.elapsed() <= CACHE_TTL {
+                        return Some(amount.clone());
+                    } else {
+                        // stale entry, drop it
+                        guard.remove(&key);
+                    }
+                }
+                None
             }
             _ => None,
         }

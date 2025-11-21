@@ -1,5 +1,6 @@
 mod commands;
 mod config;
+mod context;
 mod executors;
 mod finalizers;
 mod liquidation;
@@ -8,13 +9,12 @@ mod price_oracle;
 mod stage;
 mod stages;
 pub mod swappers;
-mod context;
 
 mod utils;
 mod watchdog;
 use clap::{Parser, Subcommand};
 
-// use commands::liquidation_loop::run_liquidation_loop;
+use crate::commands::liquidation_loop::run_liquidation_loop;
 
 #[derive(Parser)]
 #[command(name = "liquidator")]
@@ -75,13 +75,13 @@ async fn main() {
 
     match &cli.command {
         Commands::Run => {
-            // run_liquidation_loop().await;
+            run_liquidation_loop().await;
         }
         Commands::Balance => {
             commands::funds::funds().await.unwrap();
         }
         Commands::MexcSmoke => {
-            commands::mexc_smoke_test::mexc_finalizer_smoke_test().await.unwrap();
+            // commands::mexc_smoke_test::mexc_finalizer_smoke_test().await.unwrap();
         }
         Commands::Withdraw {
             source,

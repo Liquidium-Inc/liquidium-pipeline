@@ -10,6 +10,7 @@ use liquidium_pipeline_connectors::account::evm_account::EvmAccountInfoAdapter;
 use liquidium_pipeline_connectors::account::icp_account::{IcpAccountInfoAdapter, RECOVERY_ACCOUNT};
 use liquidium_pipeline_connectors::backend::evm_backend::EvmBackendImpl;
 use liquidium_pipeline_core::balance_service::BalanceService;
+use liquidium_pipeline_core::tokens::chain_token::ChainToken;
 use liquidium_pipeline_core::transfer::transfer_service::TransferService;
 
 use liquidium_pipeline_core::{account::actions::AccountInfo, tokens::token_registry::TokenRegistry};
@@ -21,15 +22,22 @@ use liquidium_pipeline_connectors::{
     transfer::{evm_transfer::EvmTransferAdapter, icp_transfer::IcpTransferAdapter, router::MultiChainTransferRouter},
 };
 
-use crate::config::Config; 
+use crate::config::Config;
+use crate::swappers::kong::kong_swapper::KongSwapSwapper;
+use crate::swappers::kong::kong_venue::KongVenue;
+use crate::swappers::mexc::mexc_adapter::MexcClient;
+use crate::swappers::mexc::mexc_swapper::MexcSwapVenue;
+use crate::swappers::router::{SwapRouter, SwapVenue};
 
 pub struct PipelineContext {
     pub config: Arc<Config>,
     pub registry: Arc<TokenRegistry>,
-    pub main_service: BalanceService,
-    pub recovery_service: BalanceService,
-    pub main_transfers: TransferService,
-    pub recovery_transfers: TransferService,
+    pub main_service: Arc<BalanceService>,
+    pub recovery_service: Arc<BalanceService>,
+    pub agent: Arc<Agent>,
+    pub main_transfers: Arc<TransferService>,
+    pub swap_router: Arc<SwapRouter>,
+    pub recovery_transfers: Arc<TransferService>,
     pub evm_address: String,
 }
 
@@ -69,7 +77,8 @@ impl<P: Provider<AnyNetwork> + WalletProvider<AnyNetwork> + Clone + 'static> Pip
     pub async fn build(self) -> Result<PipelineContext, String> {
         let config = self.config;
 
-        let icp_backend_main = Arc::new(IcpBackendImpl::new(self.ic_agent_main.ok_or("missing IC Main Agent")?));
+        let main_agent = self.ic_agent_main.ok_or("missing IC Main Agent")?;
+        let icp_backend_main = Arc::new(IcpBackendImpl::new(main_agent.clone()));
         let icp_backend_trader = Arc::new(IcpBackendImpl::new(self.ic_agent_trader.ok_or("missing IC Trader")?));
 
         // Use provided EVM providers or fail
@@ -117,7 +126,7 @@ impl<P: Provider<AnyNetwork> + WalletProvider<AnyNetwork> + Clone + 'static> Pip
             icp_backend_trader.clone(),
             recovery_icp_account,
         ));
-        
+
         let evm_transfer_recovery = Arc::new(EvmTransferAdapter::new(evm_backend_trader.clone()));
         let transfer_router_recovery = Arc::new(MultiChainTransferRouter::new(
             icp_transfer_recovery,
@@ -125,15 +134,38 @@ impl<P: Provider<AnyNetwork> + WalletProvider<AnyNetwork> + Clone + 'static> Pip
         ));
         let recovery_transfers = TransferService::new(registry.clone(), transfer_router_recovery);
 
-        println!("Context innitialized...");
+        // Setup swap venue
+
+        // Kong swapper uses the trader agent/backend, adjust ctor args to your real API
+        let kong_swapper = Arc::new(KongSwapSwapper::new(icp_backend_main.agent.clone(), main_icp_account));
+        // Build Kong venue (ICP)
+        let icp_tokens: Vec<ChainToken> = registry
+            .tokens
+            .values()
+            .filter_map(|t| match t {
+                ChainToken::Icp { .. } => Some(t.clone()),
+                _ => None,
+            })
+            .collect();
+
+        let kong_venue: Arc<dyn SwapVenue> = Arc::new(KongVenue::new(kong_swapper, icp_tokens));
+
+        let mexc_client = Arc::new(MexcClient::from_env()?);
+        let mexc_venue: Arc<dyn SwapVenue> = Arc::new(MexcSwapVenue::new(mexc_client));
+
+        // Build router
+        let swap_router = Arc::new(SwapRouter::new(kong_venue, mexc_venue));
+
         Ok(PipelineContext {
             config: config.clone(),
+            swap_router,
             registry,
-            main_service,
-            recovery_service,
-            main_transfers,
-            recovery_transfers,
+            main_service: Arc::new(main_service),
+            recovery_service: Arc::new(recovery_service),
+            main_transfers: Arc::new(main_transfers),
+            recovery_transfers: Arc::new(recovery_transfers),
             evm_address,
+            agent: main_agent.clone(),
         })
     }
 }

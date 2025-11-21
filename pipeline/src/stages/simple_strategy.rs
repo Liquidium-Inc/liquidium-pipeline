@@ -15,6 +15,7 @@ use candid::{Int, Nat};
 use futures::TryFutureExt;
 use liquidium_pipeline_core::{
     account::actions::AccountInfo,
+    balance_service::BalanceService,
     tokens::{
         asset_id::AssetId, chain_token::ChainToken, chain_token_amount::ChainTokenAmount,
         token_registry::TokenRegistryTrait,
@@ -47,43 +48,41 @@ fn resolve_token_for_position(registry: &dyn TokenRegistryTrait, pos: &Liquidate
     }
 }
 
-pub struct SimpleLiquidationStrategy<T, C, R, U, W>
+pub struct SimpleLiquidationStrategy<T, C, R, U>
 where
     T: SwapInterface + Send + Sync,
     C: ConfigTrait,
     R: TokenRegistryTrait,
     U: CollateralServiceTrait,
-    W: AccountInfo,
 {
     pub config: Arc<C>,
     pub registry: Arc<R>,
     pub swapper: Arc<T>,
     pub collateral_service: Arc<U>,
-    pub account_service: Arc<W>,
+    pub account_service: Arc<BalanceService>,
     pub watchdog: Arc<dyn Watchdog>,
 }
 
-impl<T, C, R, U, W> SimpleLiquidationStrategy<T, C, R, U, W>
+impl<T, C, R, U> SimpleLiquidationStrategy<T, C, R, U>
 where
     T: SwapInterface,
     C: ConfigTrait,
     R: TokenRegistryTrait,
     U: CollateralServiceTrait,
-    W: AccountInfo,
 {
     pub fn new(
         config: Arc<C>,
         registry: Arc<R>,
-        executor: Arc<T>,
+        swapper: Arc<T>,
         collateral_service: Arc<U>,
-        account_service: Arc<W>,
+        balance_service: Arc<BalanceService>,
     ) -> Self {
         Self {
             config,
             registry,
-            swapper: executor,
+            swapper,
             collateral_service,
-            account_service,
+            account_service: balance_service,
             watchdog: noop_watchdog(),
         }
     }
@@ -95,14 +94,13 @@ where
 }
 
 #[async_trait]
-impl<'a, T, C, R, U, W> PipelineStage<'a, Vec<LiquidatebleUser>, Vec<ExecutorRequest>>
-    for SimpleLiquidationStrategy<T, C, R, U, W>
+impl<'a, T, C, R, U> PipelineStage<'a, Vec<LiquidatebleUser>, Vec<ExecutorRequest>>
+    for SimpleLiquidationStrategy<T, C, R, U>
 where
     T: SwapInterface,
     C: ConfigTrait,
     R: TokenRegistryTrait + 'static,
     U: CollateralServiceTrait,
-    W: AccountInfo,
 {
     async fn process(&self, users: &'a Vec<LiquidatebleUser>) -> Result<Vec<ExecutorRequest>, String> {
         let mut result: Vec<ExecutorRequest> = vec![];
@@ -124,7 +122,7 @@ where
         for asset in debt_assets {
             let balance = self
                 .account_service
-                .get_balance(&asset)
+                .get_balance(&asset.asset_id())
                 .map_err(|_| "Could not get balance")
                 .await?;
 
@@ -450,6 +448,13 @@ mod tests {
 
         // Account service: plenty of balance
         let mut account = MockAccountInfo::new();
+        account.expect_sync_balance().returning(move |_t: &ChainToken| {
+            Ok(ChainTokenAmount {
+                token: _t.clone(),
+                value: Nat::from(1_000_000u64),
+            })
+        });
+
         account.expect_get_balance().returning(move |_t: &ChainToken| {
             Ok(ChainTokenAmount {
                 token: _t.clone(),
@@ -463,12 +468,16 @@ mod tests {
             .expect_quote()
             .returning(|_req| panic!("quote should not be called in same-asset happy path"));
 
+        let registry = Arc::new(registry);
+        let account = Arc::new(account);
+        let balance_service = Arc::new(BalanceService::new(registry.clone(), account.clone()));
+
         let strategy = SimpleLiquidationStrategy::new(
             Arc::new(cfg),
-            Arc::new(registry),
+            registry.clone(),
             Arc::new(swapper),
             Arc::new(collateral),
-            Arc::new(account),
+            balance_service,
         );
 
         let pool = p("mxzaz-hqaaa-aaaar-qaada-cai");
@@ -507,6 +516,9 @@ mod tests {
 
         let mut account = MockAccountInfo::new();
         account
+            .expect_sync_balance()
+            .returning(move |_t: &ChainToken| Err("boom".to_string()));
+        account
             .expect_get_balance()
             .returning(|_t: &ChainToken| Err("boom".to_string()));
 
@@ -515,12 +527,16 @@ mod tests {
             .expect_quote()
             .returning(|_req| panic!("quote should not be called when balance fetch fails"));
 
+        let registry = Arc::new(registry);
+        let account = Arc::new(account);
+        let balance_service = Arc::new(BalanceService::new(registry.clone(), account.clone()));
+
         let strategy = SimpleLiquidationStrategy::new(
             Arc::new(cfg),
-            Arc::new(registry),
+            registry.clone(),
             Arc::new(swapper),
             Arc::new(collateral),
-            Arc::new(account),
+            balance_service,
         );
 
         let pool = p("mxzaz-hqaaa-aaaar-qaada-cai");
@@ -556,6 +572,9 @@ mod tests {
 
         let mut account = MockAccountInfo::new();
         account
+            .expect_sync_balance()
+            .returning(|_t: &ChainToken| panic!("sync_balance should not be called for invalid asset type"));
+        account
             .expect_get_balance()
             .returning(|_t: &ChainToken| panic!("balance should not be fetched for invalid asset type"));
 
@@ -564,12 +583,16 @@ mod tests {
             .expect_quote()
             .returning(|_req| panic!("quote should not be called for invalid asset type"));
 
+        let registry = Arc::new(registry);
+        let account = Arc::new(account);
+        let balance_service = Arc::new(BalanceService::new(registry.clone(), account.clone()));
+
         let strategy = SimpleLiquidationStrategy::new(
             Arc::new(cfg),
-            Arc::new(registry),
+            registry.clone(),
             Arc::new(swapper),
             Arc::new(collateral),
-            Arc::new(account),
+            balance_service,
         );
 
         let pool = p("mxzaz-hqaaa-aaaar-qaada-cai");
@@ -614,6 +637,12 @@ mod tests {
             .returning(|_, _, _, _| panic!("collateral should not be called when HF >= 1000"));
 
         let mut account = MockAccountInfo::new();
+        account.expect_sync_balance().returning(move |_t: &ChainToken| {
+            Ok(ChainTokenAmount {
+                token: _t.clone(),
+                value: Nat::from(1_000_000u64),
+            })
+        });
         account.expect_get_balance().returning(move |_t: &ChainToken| {
             Ok(ChainTokenAmount {
                 token: _t.clone(),
@@ -626,12 +655,16 @@ mod tests {
             .expect_quote()
             .returning(|_req| panic!("quote should not be called when HF >= 1000"));
 
+        let registry = Arc::new(registry);
+        let account = Arc::new(account);
+        let balance_service = Arc::new(BalanceService::new(registry.clone(), account.clone()));
+
         let strategy = SimpleLiquidationStrategy::new(
             Arc::new(cfg),
-            Arc::new(registry),
+            registry.clone(),
             Arc::new(swapper),
             Arc::new(collateral),
-            Arc::new(account),
+            balance_service,
         );
 
         let pool = p("mxzaz-hqaaa-aaaar-qaada-cai");
@@ -676,26 +709,34 @@ mod tests {
             });
 
         let mut account = MockAccountInfo::new();
-        account
-            .expect_get_balance()
-            .returning(move |_t: &ChainToken| {
-                Ok(ChainTokenAmount {
-                    token: _t.clone(),
-                    value: Nat::from(10_000u64),
-                })
-            });
+        account.expect_sync_balance().returning(move |_t: &ChainToken| {
+            Ok(ChainTokenAmount {
+                token: _t.clone(),
+                value: Nat::from(1_000_000u64),
+            })
+        });
+        account.expect_get_balance().returning(move |_t: &ChainToken| {
+            Ok(ChainTokenAmount {
+                token: _t.clone(),
+                value: Nat::from(10_000u64),
+            })
+        });
 
         let mut swapper = MockSwapInterface::new();
         swapper
             .expect_quote()
             .returning(|_req| panic!("quote should not be called when assets are equal"));
 
+        let registry = Arc::new(registry);
+        let account = Arc::new(account);
+        let balance_service = Arc::new(BalanceService::new(registry.clone(), account.clone()));
+
         let strategy = SimpleLiquidationStrategy::new(
             Arc::new(cfg),
-            Arc::new(registry),
+            registry.clone(),
             Arc::new(swapper),
             Arc::new(collateral),
-            Arc::new(account),
+            balance_service,
         );
 
         let pool = p("mxzaz-hqaaa-aaaar-qaada-cai");
@@ -704,7 +745,11 @@ mod tests {
         let user = mk_user(vec![pos], 1_000, 900);
 
         let res = strategy.process(&vec![user]).await.unwrap();
-        assert_eq!(res.len(), 1, "expected a request even with zero net collateral and negative profit");
+        assert_eq!(
+            res.len(),
+            1,
+            "expected a request even with zero net collateral and negative profit"
+        );
         assert!(res[0].swap_args.is_none(), "no swap expected when assets match");
         assert!(res[0].expected_profit < 0, "profit should be negative in this setup");
     }
@@ -740,26 +785,34 @@ mod tests {
         // Initial available balance B = R + 4F - 1 = 1000 + 400 - 1 = 1399
         // After first request, new balance = B - R - 2F = 199 < 2F, so next combo is skipped.
         let mut account = MockAccountInfo::new();
-        account
-            .expect_get_balance()
-            .returning(move |_t: &ChainToken| {
-                Ok(ChainTokenAmount {
-                    token: _t.clone(),
-                    value: Nat::from(1_399u64),
-                })
-            });
+        account.expect_sync_balance().returning(move |_t: &ChainToken| {
+            Ok(ChainTokenAmount {
+                token: _t.clone(),
+                value: Nat::from(1_399u64),
+            })
+        });
+        account.expect_get_balance().returning(move |_t: &ChainToken| {
+            Ok(ChainTokenAmount {
+                token: _t.clone(),
+                value: Nat::from(1_399u64),
+            })
+        });
 
         let mut swapper = MockSwapInterface::new();
         swapper
             .expect_quote()
             .returning(|_req| panic!("quote should not be called when assets match"));
 
+        let registry = Arc::new(registry);
+        let account = Arc::new(account);
+        let balance_service = Arc::new(BalanceService::new(registry.clone(), account.clone()));
+
         let strategy = SimpleLiquidationStrategy::new(
             Arc::new(cfg),
-            Arc::new(registry),
+            registry.clone(),
             Arc::new(swapper),
             Arc::new(collateral),
-            Arc::new(account),
+            balance_service,
         );
 
         // One user with one debt and two collateral positions produces two combos against same repay token
@@ -793,9 +846,8 @@ mod tests {
 
         let mut calls = 0u32;
         let mut collateral = MockCollateralServiceTrait::new();
-        collateral
-            .expect_calculate_liquidation_amounts()
-            .returning(move |_max_balance, _debt_pos, _coll_pos, user: &mut LiquidatebleUser| {
+        collateral.expect_calculate_liquidation_amounts().returning(
+            move |_max_balance, _debt_pos, _coll_pos, user: &mut LiquidatebleUser| {
                 calls += 1;
                 if calls == 1 {
                     user.health_factor = Nat::from(1_000u64);
@@ -806,29 +858,38 @@ mod tests {
                 } else {
                     panic!("collateral service should not be called after HF bump");
                 }
-            });
+            },
+        );
 
         let mut account = MockAccountInfo::new();
-        account
-            .expect_get_balance()
-            .returning(move |_t: &ChainToken| {
-                Ok(ChainTokenAmount {
-                    token: _t.clone(),
-                    value: Nat::from(1_000_000u64),
-                })
-            });
+        account.expect_sync_balance().returning(move |_t: &ChainToken| {
+            Ok(ChainTokenAmount {
+                token: _t.clone(),
+                value: Nat::from(1_000_000u64),
+            })
+        });
+        account.expect_get_balance().returning(move |_t: &ChainToken| {
+            Ok(ChainTokenAmount {
+                token: _t.clone(),
+                value: Nat::from(1_000_000u64),
+            })
+        });
 
         let mut swapper = MockSwapInterface::new();
         swapper
             .expect_quote()
             .returning(|_req| panic!("quote should not be called when assets match"));
 
+        let registry = Arc::new(registry);
+        let account = Arc::new(account);
+        let balance_service = Arc::new(BalanceService::new(registry.clone(), account.clone()));
+
         let strategy = SimpleLiquidationStrategy::new(
             Arc::new(cfg),
-            Arc::new(registry),
+            registry.clone(),
             Arc::new(swapper),
             Arc::new(collateral),
-            Arc::new(account),
+            balance_service,
         );
 
         let pool = p("mxzaz-hqaaa-aaaar-qaada-cai");
@@ -839,7 +900,11 @@ mod tests {
         let user = mk_user(vec![coll_pos, debt_pos1, debt_pos2], 1_500, 900);
 
         let res = strategy.process(&vec![user]).await.unwrap();
-        assert_eq!(res.len(), 1, "expected only one request; followup combos were skipped after HF bump");
+        assert_eq!(
+            res.len(),
+            1,
+            "expected only one request; followup combos were skipped after HF bump"
+        );
     }
 
     // Ordering: lower HF is processed first.
@@ -861,40 +926,52 @@ mod tests {
 
         let mut first_called_for_low_hf = true;
         let mut collateral = MockCollateralServiceTrait::new();
-        collateral
-            .expect_calculate_liquidation_amounts()
-            .returning(move |_max_balance, _debt_pos, _coll_pos, user: &mut LiquidatebleUser| {
+        collateral.expect_calculate_liquidation_amounts().returning(
+            move |_max_balance, _debt_pos, _coll_pos, user: &mut LiquidatebleUser| {
                 if first_called_for_low_hf {
-                    assert_eq!(user.health_factor, Nat::from(900u64), "expected lower HF to be processed first");
+                    assert_eq!(
+                        user.health_factor,
+                        Nat::from(900u64),
+                        "expected lower HF to be processed first"
+                    );
                     first_called_for_low_hf = false;
                 }
                 Ok(LiquidationEstimation {
                     received_collateral: Nat::from(4_000u64),
                     repaid_debt: Nat::from(1_000u64),
                 })
-            });
+            },
+        );
 
         let mut account = MockAccountInfo::new();
-        account
-            .expect_get_balance()
-            .returning(move |_t: &ChainToken| {
-                Ok(ChainTokenAmount {
-                    token: _t.clone(),
-                    value: Nat::from(1_000_000u64),
-                })
-            });
+        account.expect_sync_balance().returning(move |_t: &ChainToken| {
+            Ok(ChainTokenAmount {
+                token: _t.clone(),
+                value: Nat::from(1_000_000u64),
+            })
+        });
+        account.expect_get_balance().returning(move |_t: &ChainToken| {
+            Ok(ChainTokenAmount {
+                token: _t.clone(),
+                value: Nat::from(1_000_000u64),
+            })
+        });
 
         let mut swapper = MockSwapInterface::new();
         swapper
             .expect_quote()
             .returning(|_req| panic!("quote should not be called when assets match"));
 
+        let registry = Arc::new(registry);
+        let account = Arc::new(account);
+        let balance_service = Arc::new(BalanceService::new(registry.clone(), account.clone()));
+
         let strategy = SimpleLiquidationStrategy::new(
             Arc::new(cfg),
-            Arc::new(registry),
+            registry.clone(),
             Arc::new(swapper),
             Arc::new(collateral),
-            Arc::new(account),
+            balance_service,
         );
 
         let pool = p("mxzaz-hqaaa-aaaar-qaada-cai");
@@ -935,7 +1012,11 @@ mod tests {
             .expect_calculate_liquidation_amounts()
             .returning(move |_max_balance, debt_pos, _coll_pos, _user| {
                 if first_checked {
-                    assert_eq!(debt_pos.debt_amount, Nat::from(2_000u64), "expected larger debt first on HF tie");
+                    assert_eq!(
+                        debt_pos.debt_amount,
+                        Nat::from(2_000u64),
+                        "expected larger debt first on HF tie"
+                    );
                     first_checked = false;
                 }
                 Ok(LiquidationEstimation {
@@ -945,26 +1026,35 @@ mod tests {
             });
 
         let mut account = MockAccountInfo::new();
-        account
-            .expect_get_balance()
-            .returning(move |_t: &ChainToken| {
-                Ok(ChainTokenAmount {
-                    token: _t.clone(),
-                    value: Nat::from(1_000_000u64),
-                })
-            });
+        account.expect_sync_balance().returning(move |_t: &ChainToken| {
+            Ok(ChainTokenAmount {
+                token: _t.clone(),
+                value: Nat::from(1_000_000u64),
+            })
+        });
+
+        account.expect_get_balance().returning(move |_t: &ChainToken| {
+            Ok(ChainTokenAmount {
+                token: _t.clone(),
+                value: Nat::from(1_000_000u64),
+            })
+        });
 
         let mut swapper = MockSwapInterface::new();
         swapper
             .expect_quote()
             .returning(|_req| panic!("quote should not be called when assets match"));
 
+        let registry = Arc::new(registry);
+        let account = Arc::new(account);
+        let balance_service = Arc::new(BalanceService::new(registry.clone(), account.clone()));
+
         let strategy = SimpleLiquidationStrategy::new(
             Arc::new(cfg),
-            Arc::new(registry),
+            registry.clone(),
             Arc::new(swapper),
             Arc::new(collateral),
-            Arc::new(account),
+            balance_service,
         );
 
         let pool = p("mxzaz-hqaaa-aaaar-qaada-cai");
