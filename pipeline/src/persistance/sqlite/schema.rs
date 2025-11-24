@@ -1,7 +1,6 @@
 diesel::table! {
-    liquidation_results (liq_id, idx) {
+    liquidation_results (liq_id) {
         liq_id -> Text,
-        idx -> Integer,
         status -> Integer,
         attempt -> Integer,
         created_at -> BigInt,

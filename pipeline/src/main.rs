@@ -14,7 +14,7 @@ mod utils;
 mod watchdog;
 use clap::{Parser, Subcommand};
 
-use crate::commands::liquidation_loop::run_liquidation_loop;
+// use crate::commands::liquidation_loop::run_liquidation_loop;
 
 #[derive(Parser)]
 #[command(name = "liquidator")]
@@ -75,7 +75,7 @@ async fn main() {
 
     match &cli.command {
         Commands::Run => {
-            run_liquidation_loop().await;
+            // run_liquidation_loop().await;
         }
         Commands::Balance => {
             commands::funds::funds().await.unwrap();

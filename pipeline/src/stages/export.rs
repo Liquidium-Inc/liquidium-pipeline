@@ -1,9 +1,7 @@
 use async_trait::async_trait;
 use serde::Serialize;
 
-use crate::stage::PipelineStage;
-
-use crate::stages::finalize::LiquidationOutcome;
+use crate::{finalizers::liquidation_outcome::LiquidationOutcome, stage::PipelineStage};
 
 pub struct ExportStage {
     pub path: String,

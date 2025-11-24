@@ -3,10 +3,9 @@ use diesel::prelude::{AsChangeset, Identifiable, Insertable, Queryable};
 use serde::{Deserialize, Serialize};
 
 #[derive(Queryable, Insertable, Identifiable, AsChangeset, Serialize, Deserialize, Debug, Clone)]
-#[diesel(table_name = liquidation_results, primary_key(liq_id, idx))]
+#[diesel(table_name = liquidation_results, primary_key(liq_id))]
 pub struct LiquidationResultRow {
     pub liq_id: String,
-    pub idx: i32,
     pub status: i32,
     pub attempt: i32,
     pub created_at: i64,

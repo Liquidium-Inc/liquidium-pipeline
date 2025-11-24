@@ -15,7 +15,6 @@ pub enum ResultStatus {
 #[derive(Debug, Clone)]
 pub struct LiqResultRecord {
     pub liq_id: String,
-    pub idx: i32,
     pub status: ResultStatus,
     pub attempt: i32,
     pub created_at: i64,
@@ -27,10 +26,10 @@ pub struct LiqResultRecord {
 #[async_trait]
 pub trait WalStore: Send + Sync {
     async fn upsert_result(&self, row: LiqResultRecord) -> Result<()>;
-    async fn get_result(&self, liq_id: &str, idx: i32) -> Result<Option<LiqResultRecord>>;
+    async fn get_result(&self, liq_id: &str) -> Result<Option<LiqResultRecord>>;
     async fn list_by_status(&self, status: ResultStatus, limit: usize) -> Result<Vec<LiqResultRecord>>;
-    async fn update_status(&self, liq_id: &str, idx: i32, next: ResultStatus, bump_attempt: bool) -> Result<()>;
-    async fn delete(&self, liq_id: &str, idx: i32) -> Result<()>;
+    async fn update_status(&self, liq_id: &str, next: ResultStatus, bump_attempt: bool) -> Result<()>;
+    async fn delete(&self, liq_id: &str) -> Result<()>;
 }
 
 pub fn now_secs() -> i64 {
