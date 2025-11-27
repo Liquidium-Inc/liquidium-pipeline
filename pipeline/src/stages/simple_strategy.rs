@@ -135,6 +135,7 @@ where
             .sorted_by(|a, b| a.health_factor.cmp(&b.health_factor))
             .cloned()
             .collect();
+
         // Working copy of users for in-loop mutation
         let mut work_users: Vec<LiquidatebleUser> = users.clone();
 
@@ -274,12 +275,13 @@ where
             let (swap_args, amount_received, price) = if estimation.received_collateral == 0u32 || same_asset {
                 (None, amount_in.value.clone(), 1f64)
             } else {
+                debug!(" ======== Amount in {:?}", amount_in);
                 let swap_request = SwapRequest {
-                    pay_asset: repayment_token.asset_id(),
+                    pay_asset: collateral_token.asset_id(),
                     pay_amount: amount_in,
-                    receive_asset: collateral_token.asset_id(),
+                    receive_asset: repayment_token.asset_id(),
                     receive_address: Some(self.config.get_liquidator_principal().to_string()),
-                    max_slippage_bps: Some(200), //2% slippage
+                    max_slippage_bps: Some(2000), //2% slippage
                     venue_hint: None,
                 };
                 let swap_info = self
@@ -356,7 +358,6 @@ where
                 );
             }
         }
-
         Ok(result)
     }
 }

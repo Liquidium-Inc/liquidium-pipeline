@@ -9,6 +9,7 @@ use crate::finalizers::profit_calculator::ProfitCalculator;
 use crate::persistance::WalStore;
 use crate::stage::PipelineStage;
 use crate::stages::executor::ExecutionReceipt;
+use crate::wal::decode_meta;
 
 //
 // FinalizeStage: pipeline stage over a concrete Finalizer
@@ -47,8 +48,16 @@ where
     D: WalStore + Sync + Send,
     P: ProfitCalculator + Sync + Send,
 {
-    async fn process(&self, input: &'a Vec<ExecutionReceipt>) -> Result<Vec<LiquidationOutcome>, String> {
+    async fn process(&self, _input: &'a Vec<ExecutionReceipt>) -> Result<Vec<LiquidationOutcome>, String> {
         // Call batch finalizer
+
+        let input = self.wal.get_pending(100).await.map_err(|e| e.to_string())?;
+        let input: Vec<ExecutionReceipt> = input
+            .iter()
+            .map(|item| decode_meta(item).unwrap())
+            .map(|item: Option<LiquidationOutcome>| item.unwrap().execution_receipt)
+            .collect();
+
         let fin_results = self.finalizer.finalize(&*self.wal, input.clone()).await?;
 
         if fin_results.len() != input.len() {
@@ -72,8 +81,8 @@ where
 
             outcomes.push(LiquidationOutcome {
                 request: req.clone(),
-                liquidation_result: liq.clone(),
-                swap_result: fin_res.swap_result.clone(),
+                execution_receipt: receipt.clone(),
+                finalizer_result: fin_res.clone(),
                 status: receipt.status.clone(),
                 expected_profit,
                 realized_profit,

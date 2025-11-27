@@ -4,6 +4,7 @@ use alloy::network::AnyNetwork;
 use alloy::providers::{Provider, ProviderBuilder, WalletProvider};
 use alloy::signers::local::PrivateKeySigner;
 
+use candid::Principal;
 use ic_agent::Agent;
 use icrc_ledger_types::icrc1::account::Account;
 use liquidium_pipeline_connectors::account::evm_account::EvmAccountInfoAdapter;
@@ -21,6 +22,7 @@ use liquidium_pipeline_connectors::{
     token_registry_loader::load_token_registry,
     transfer::{evm_transfer::EvmTransferAdapter, icp_transfer::IcpTransferAdapter, router::MultiChainTransferRouter},
 };
+use log::debug;
 
 use crate::config::Config;
 use crate::swappers::kong::kong_swapper::KongSwapSwapper;
@@ -95,6 +97,11 @@ impl<P: Provider<AnyNetwork> + WalletProvider<AnyNetwork> + Clone + 'static> Pip
             subaccount: None,
         };
 
+        let main_trader_account = Account {
+            owner: config.trader_principal,
+            subaccount: None,
+        };
+
         let recovery_icp_account = Account {
             owner: config.liquidator_principal,
             subaccount: Some(*RECOVERY_ACCOUNT),
@@ -137,7 +144,7 @@ impl<P: Provider<AnyNetwork> + WalletProvider<AnyNetwork> + Clone + 'static> Pip
         // Setup swap venue
 
         // Kong swapper uses the trader agent/backend, adjust ctor args to your real API
-        let kong_swapper = Arc::new(KongSwapSwapper::new(icp_backend_main.agent.clone(), main_icp_account));
+        let mut kong_swapper = KongSwapSwapper::new(icp_backend_trader.agent.clone(), main_trader_account);
         // Build Kong venue (ICP)
         let icp_tokens: Vec<ChainToken> = registry
             .tokens
@@ -148,6 +155,14 @@ impl<P: Provider<AnyNetwork> + WalletProvider<AnyNetwork> + Clone + 'static> Pip
             })
             .collect();
 
+        debug!("Kong swap init");
+        let kong_tokens = icp_tokens
+            .iter()
+            .map(|item| Principal::from_text(item.asset_id().address).unwrap())
+            .collect::<Vec<Principal>>();
+        kong_swapper.init(&kong_tokens).await?;
+
+        let kong_swapper = Arc::new(kong_swapper);
         let kong_venue: Arc<dyn SwapVenue> = Arc::new(KongVenue::new(kong_swapper, icp_tokens));
 
         let mexc_client = Arc::new(MexcClient::from_env()?);

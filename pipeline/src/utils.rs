@@ -1,3 +1,5 @@
+use std::time::{SystemTime, UNIX_EPOCH};
+
 use candid::{Nat, Principal};
 
 pub fn max_for_ledger(token: &Principal) -> Nat {
@@ -14,4 +16,11 @@ pub fn max_for_ledger(token: &Principal) -> Nat {
     }
 
     Nat::from(0u8)
+}
+
+pub fn now_ts() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64
 }

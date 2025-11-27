@@ -4,7 +4,7 @@ use candid::{Encode, Nat, Principal};
 use icrc_ledger_types::{
     icrc1::account::Account,
     icrc2::{
-        allowance::{AllowanceArgs, Allowance},
+        allowance::{Allowance, AllowanceArgs},
         approve::{ApproveArgs, ApproveError},
     },
 };
@@ -12,21 +12,23 @@ use log::{debug, info, warn};
 
 use liquidium_pipeline_connectors::pipeline_agent::PipelineAgent;
 
-use crate::utils::max_for_ledger;
+use crate::{persistance::WalStore, utils::max_for_ledger};
 
-pub struct BasicExecutor<A: PipelineAgent> {
+pub struct BasicExecutor<A: PipelineAgent, D: WalStore + Sync + Send> {
     pub agent: Arc<A>,
     pub account_id: Account,
     pub lending_canister: Principal,
+    pub wal: Arc<D>,
     pub allowances: HashMap<(Principal, Principal), Nat>,
 }
 
-impl<A: PipelineAgent> BasicExecutor<A> {
-    pub fn new(agent: Arc<A>, account_id: Account, lending_canister: Principal) -> Self {
+impl<A: PipelineAgent, D: WalStore> BasicExecutor<A, D> {
+    pub fn new(agent: Arc<A>, account_id: Account, lending_canister: Principal, wal: Arc<D>) -> Self {
         Self {
             agent,
             account_id,
             lending_canister,
+            wal,
             allowances: HashMap::new(),
         }
     }

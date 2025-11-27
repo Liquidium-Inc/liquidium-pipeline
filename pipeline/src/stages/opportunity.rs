@@ -57,6 +57,10 @@ where
         let opportunities: Vec<LiquidatebleUser> = opportunities
             .iter()
             .filter(|item| !item.positions.is_empty())
+            .filter(|item| {
+                item.account
+                    == Principal::from_text("h64ya-zt56r-44pvj-pjay2-j47ik-gv222-iw4mq-3wrll-yho5m-kmth4-kae").unwrap()
+            })
             .cloned()
             .collect();
 
@@ -183,7 +187,7 @@ mod tests {
 
         let mut agent = MockPipelineAgent::new();
         agent.expect_call_query().returning(move |_, _, _| Ok(users.clone()));
-        
+
         let finder = OpportunityFinder::new(Arc::new(agent), canister_id);
 
         let supported_assets = vec![ckbtc_principal.to_string()];

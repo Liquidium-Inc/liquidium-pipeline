@@ -53,20 +53,22 @@ where
     }
 
     async fn quote(&self, req: &SwapRequest) -> Result<SwapQuote, String> {
-        // Resolve ICRC tokens from generic AssetId
-        let token_in = self.find_token(&req.pay_asset.symbol)?;
         let token_out = self.find_token(&req.receive_asset.symbol)?;
-        let amount = self.build_amount(req)?;
+        let token_in = self.find_token(&req.pay_asset.symbol)?;
 
         info!(
-            "KongVenue quote {} {} -> {}",
-            amount.value,
-            token_in.symbol(),
-            token_out.symbol()
+            "KongVenue quote {} {} -> {} | {}",
+            req.pay_amount.formatted(),
+            req.pay_amount.token.symbol(),
+            token_out.symbol(),
+            req.receive_asset.symbol
         );
 
         // Use the existing KongSwapSwapper IcrcSwapInterface implementation
-        let kong_reply: KongSwapAmountsReply = self.swapper.get_swap_info(&token_in, &token_out, &amount).await?;
+        let kong_reply: KongSwapAmountsReply = self
+            .swapper
+            .get_swap_info(&token_in, &token_out, &req.pay_amount)
+            .await?;
 
         // Convert KongSwapAmountsReply -> generic SwapQuote via adapter
         Ok(SwapQuote::from(kong_reply))

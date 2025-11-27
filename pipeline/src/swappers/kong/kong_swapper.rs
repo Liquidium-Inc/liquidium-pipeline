@@ -57,7 +57,7 @@ impl<A: PipelineAgent> KongSwapSwapper<A> {
                 },
             )
             .await;
-        debug!("Current allowance for {}: {}", token, allowance);
+        debug!("Current allowance for {}: {} on {}", token, allowance, self.agent.agent().get_principal().unwrap());
 
         if allowance < max_for_ledger(token) / Nat::from(2u8) {
             info!("Allowance low for {}, re-approving…", token);
@@ -116,6 +116,7 @@ impl<A: PipelineAgent> KongSwapSwapper<A> {
     }
 
     pub async fn swap(&self, swap_args: SwapArgs) -> Result<SwapReply, String> {
+        debug!("Swap args {:#?}", swap_args);
         let dex_principal = Principal::from_str(DEX_PRINCIPAL).unwrap();
         let result = self
             .agent
@@ -125,7 +126,7 @@ impl<A: PipelineAgent> KongSwapSwapper<A> {
 
         match result {
             SwapResult::Ok(res) => Ok(res),
-            SwapResult::Err(e) => return Err(format!("Could not execute swap {e}")),
+            SwapResult::Err(e) => Err(format!("Could not execute swap {e}")),
         }
     }
 }

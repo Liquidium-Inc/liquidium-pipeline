@@ -5,3 +5,4 @@ executions.csv
 trader.pem
 key
 .hyper.env
+wal.db

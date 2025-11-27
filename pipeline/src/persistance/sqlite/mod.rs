@@ -59,6 +59,21 @@ impl SqliteWalStore {
 
 #[async_trait]
 impl WalStore for SqliteWalStore {
+    async fn get_pending(&self, limit: usize) -> Result<Vec<LiqResultRecord>> {
+        let mut conn = self.pool.get()?;
+
+        let rows = tbl::table
+            .filter(
+                tbl::status
+                    .eq(ResultStatus::Enqueued as i32)
+                    .or(tbl::status.eq(ResultStatus::FailedRetryable as i32)),
+            )
+            .order(tbl::created_at.asc())
+            .limit(limit as i64)
+            .load::<Row>(&mut conn)?;
+        Ok(rows.into_iter().map(Self::from_row).collect())
+    }
+
     async fn upsert_result(&self, row: LiqResultRecord) -> Result<()> {
         let mut conn = self.pool.get()?;
         diesel::insert_into(tbl::table)
@@ -77,10 +92,7 @@ impl WalStore for SqliteWalStore {
 
     async fn get_result(&self, liq_id: &str) -> Result<Option<LiqResultRecord>> {
         let mut conn = self.pool.get()?;
-        let res = tbl::table
-            .find(liq_id.to_string())
-            .first::<Row>(&mut conn)
-            .optional()?;
+        let res = tbl::table.find(liq_id.to_string()).first::<Row>(&mut conn).optional()?;
         Ok(res.map(Self::from_row))
     }
 

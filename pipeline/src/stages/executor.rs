@@ -1,12 +1,17 @@
 use async_trait::async_trait;
 use candid::Encode;
 
+use futures::TryFutureExt;
 use log::{debug, warn};
 use serde::{Deserialize, Serialize};
 
 use crate::{
     executors::{basic::basic_executor::BasicExecutor, executor::ExecutorRequest},
+    finalizers::{finalizer::FinalizerResult, liquidation_outcome::LiquidationOutcome},
+    persistance::{LiqResultRecord, WalStore},
     stage::PipelineStage,
+    utils::now_ts, wal::{encode_meta, liq_id_from_receipt},
+
 };
 use liquidium_pipeline_connectors::pipeline_agent::PipelineAgent;
 
@@ -14,6 +19,7 @@ use liquidium_pipeline_core::types::protocol_types::{LiquidationResult, Liquidat
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ExecutionStatus {
+    Pending,
     Success,
     LiquidationCallFailed(String),
     FailedLiquidation(String),
@@ -25,6 +31,7 @@ pub enum ExecutionStatus {
 impl ExecutionStatus {
     pub fn description(&self) -> String {
         match self {
+            ExecutionStatus::Pending => "Pending".to_string(),
             ExecutionStatus::Success => "Success".to_string(),
             ExecutionStatus::LiquidationCallFailed(msg) => format!("LiquidationCallFailed: {}", msg),
             ExecutionStatus::FailedLiquidation(msg) => format!("FailedLiquidation: {}", msg),
@@ -44,7 +51,9 @@ pub struct ExecutionReceipt {
 }
 
 #[async_trait]
-impl<'a, A: PipelineAgent> PipelineStage<'a, Vec<ExecutorRequest>, Vec<ExecutionReceipt>> for BasicExecutor<A> {
+impl<'a, A: PipelineAgent, D: WalStore> PipelineStage<'a, Vec<ExecutorRequest>, Vec<ExecutionReceipt>>
+    for BasicExecutor<A, D>
+{
     async fn process(&self, executor_requests: &'a Vec<ExecutorRequest>) -> Result<Vec<ExecutionReceipt>, String> {
         let mut liquidations: Vec<ExecutionReceipt> = vec![];
         for executor_request in executor_requests {
@@ -107,12 +116,40 @@ impl<'a, A: PipelineAgent> PipelineStage<'a, Vec<ExecutorRequest>, Vec<Execution
                 liquidations.push(receipt);
                 continue;
             }
-
             debug!("Executed liquidation {:?}", liq);
-
+            if let Err(err) = self.store_to_wal(&receipt, executor_request).await {
+                warn!("Failed to store to WAL: {}", err);
+            }
             liquidations.push(receipt);
         }
 
         Ok(liquidations)
+    }
+}
+
+impl<A: PipelineAgent, D: WalStore> BasicExecutor<A, D> {
+    async fn store_to_wal(&self, receipt: &ExecutionReceipt, executor_request: &ExecutorRequest) -> Result<(), String> {
+        debug!("Storing execution log...");
+        let liq_id = liq_id_from_receipt(receipt)?;
+
+        let outcome = LiquidationOutcome {
+            execution_receipt: receipt.clone(),
+            expected_profit: executor_request.expected_profit,
+            request: executor_request.clone(),
+            finalizer_result: FinalizerResult::noop(),
+            realized_profit: 0i128,
+            status: ExecutionStatus::Pending,
+        };
+
+        let mut result_record = LiqResultRecord {
+            liq_id,
+            status: crate::persistance::ResultStatus::Enqueued,
+            attempt: 0,
+            created_at: now_ts(),
+            updated_at: now_ts(),
+            meta_json: "{}".to_string(),
+        };
+        encode_meta(&mut result_record, &outcome);
+        self.wal.upsert_result(result_record).map_err(|e| e.to_string()).await
     }
 }

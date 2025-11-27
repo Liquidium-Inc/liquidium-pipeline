@@ -1,11 +1,14 @@
 use core::fmt;
-use std::str::FromStr;
+use std::{
+    hash::{Hash, Hasher},
+    str::FromStr,
+};
 
 use candid::CandidType;
 use serde::{Deserialize, Serialize};
 
 /// Canonical key for a token across chains.
-#[derive(Clone, Debug, Eq, PartialEq, Hash, Serialize, Deserialize, CandidType)]
+#[derive(Clone, Debug, Serialize, Deserialize, CandidType)]
 pub struct AssetId {
     pub chain: String,   // "icp", "evm-arb", etc
     pub address: String, // ICP ledger principal or EVM address
@@ -15,6 +18,21 @@ pub struct AssetId {
 impl fmt::Display for AssetId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}:{}:{}", self.chain, self.address, self.symbol)
+    }
+}
+
+impl PartialEq for AssetId {
+    fn eq(&self, other: &Self) -> bool {
+        self.chain == other.chain && self.address == other.address
+    }
+}
+
+impl Eq for AssetId {}
+
+impl Hash for AssetId {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.chain.hash(state);
+        self.address.hash(state);
     }
 }
 

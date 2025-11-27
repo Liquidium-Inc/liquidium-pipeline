@@ -8,6 +8,7 @@ mod persistance;
 mod price_oracle;
 mod stage;
 mod stages;
+mod wal;
 pub mod swappers;
 
 mod utils;

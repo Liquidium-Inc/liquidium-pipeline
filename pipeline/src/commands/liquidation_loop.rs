@@ -2,7 +2,7 @@ use candid::Principal;
 use icrc_ledger_types::icrc1::account::Account;
 use indicatif::{ProgressBar, ProgressStyle};
 
-use log::{info, warn};
+use log::{debug, info, warn};
 use prettytable::{Cell, Row, Table, format};
 use std::{sync::Arc, thread::sleep, time::Duration};
 
@@ -10,7 +10,10 @@ use crate::{
     config::Config,
     context::{PipelineContext, init_context},
     executors::basic::basic_executor::BasicExecutor,
-    finalizers::{kong_swap::kong_swap_finalizer::KongSwapFinalizer, liquidation_outcome::LiquidationOutcome, profit_calculator::PassthroughProfitCalculator},
+    finalizers::{
+        kong_swap::kong_swap_finalizer::KongSwapFinalizer, liquidation_outcome::LiquidationOutcome,
+        profit_calculator::PassthroughProfitCalculator,
+    },
     liquidation::collateral_service::CollateralService,
     persistance::sqlite::SqliteWalStore,
     price_oracle::price_oracle::LiquidationPriceOracle,
@@ -50,13 +53,14 @@ async fn init(
 ) -> (
     OpportunityFinder<Agent>,
     SimpleLiquidationStrategy<SwapRouter, Config, TokenRegistry, CollateralService<LiquidationPriceOracle<Agent>>>,
-    Arc<BasicExecutor<Agent>>,
+    Arc<BasicExecutor<Agent, SqliteWalStore>>,
     Arc<ExportStage>,
     Arc<FinalizeStage<KongSwapFinalizer<SwapRouter>, SqliteWalStore, PassthroughProfitCalculator>>,
 ) {
     let config = ctx.config.clone();
     let agent = ctx.agent.clone();
     let registry = ctx.registry.clone();
+    let db = Arc::new(SqliteWalStore::new(&config.db_path).expect("could not connect to db"));
 
     let tokens: Vec<Principal> = registry
         .debt_assets()
@@ -77,18 +81,17 @@ async fn init(
             subaccount: None,
         },
         config.lending_canister,
+        db.clone(),
     );
 
     executor.init(&tokens).await.expect("could not approce executor tokens");
     let executor = Arc::new(executor);
 
-    let db = Arc::new(SqliteWalStore::new(&config.db_path).expect("could not connect to db"));
-
     // Finalizer logic (Kong swapper)
     let kong_finalizer = Arc::new(KongSwapFinalizer::new(ctx.swap_router.clone()));
 
     // Profit calculator for expected/realized PnL
-    let profit_calc = Arc::new(PassthroughProfitCalculator::default()); //todo implement real profit calculator
+    let profit_calc = Arc::new(PassthroughProfitCalculator); //todo implement real profit calculator
 
     // FinalizeStage wires WAL + finalizer + profit calculation
     let finalizer = Arc::new(FinalizeStage::new(db.clone(), kong_finalizer, profit_calc));
@@ -141,9 +144,7 @@ pub async fn run_liquidation_loop() {
     info!("Agent initialized with principal: {}", config.liquidator_principal);
 
     // Initialize components using shared pipeline context
-    let (finder, strategy, executor, exporter, finalizer) = init(ctx.clone()).await;
-
-    info!("Components initialized");
+    let (finder, strategy, executor, _exporter, finalizer) = init(ctx.clone()).await;
 
     let debt_assets: Vec<String> = ctx
         .registry
@@ -157,6 +158,8 @@ pub async fn run_liquidation_loop() {
             }
         })
         .collect();
+
+    let assets = ctx.registry.all();
 
     // Create the spinner for fancy UI
     let start_spinner = || {
@@ -188,19 +191,21 @@ pub async fn run_liquidation_loop() {
         info!("Found {} opportunities", opportunities.len());
 
         let executions = strategy.process(&opportunities).await.unwrap_or_else(|e| {
-            log::error!("Strategy processing failed: {e}");
+            log::info!("Strategy processing failed: {e}");
             vec![]
         });
 
-        // // let receipts = executor.process(&executions).await.unwrap_or_else(|e| {
-        // //     log::error!("Executor failed: {e}");
-        // //     vec![]
-        // // });
+        info!("Executing liquidations...");
+        let receipts = executor.process(&executions).await.unwrap_or_else(|e| {
+            log::error!("Executor failed: {e}");
+            vec![]
+        });
 
-        // // let outcomes = finalizer.process(&receipts).await.unwrap_or_else(|e| {
-        // //     log::error!("Executor failed: {e}");
-        // //     vec![]
-        // // });
+        info!("Finalizing liquidations...");
+        let _outcomes = finalizer.process(&receipts).await.unwrap_or_else(|e| {
+            log::error!("Executor failed: {e}");
+            vec![]
+        });
 
         // if outcomes.is_empty() {
         //     info!("No successful executions");
@@ -234,7 +239,7 @@ pub fn print_execution_results(results: Vec<LiquidationOutcome>) {
     for r in results {
         let (debt, collat) = (r.formatted_debt_repaid(), r.formatted_received_collateral());
 
-        let (recv_amt, swap_status) = match &r.swap_result {
+        let (recv_amt, swap_status) = match &r.finalizer_result.swap_result {
             Some(sr) => (r.formatted_swap_output(), sr.status.clone()),
             None => ("-".to_string(), "-".to_string()),
         };
