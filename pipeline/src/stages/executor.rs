@@ -92,6 +92,7 @@ impl<'a, A: PipelineAgent, D: WalStore> PipelineStage<'a, Vec<ExecutorRequest>, 
                 }
             };
 
+            println!("EXECUTIOn result {:?}", liq);
             receipt.liquidation_result = Some(liq.clone());
             if let LiquidationStatus::FailedLiquidation(err) = liq.status {
                 receipt.status = ExecutionStatus::FailedLiquidation(err);

@@ -128,6 +128,7 @@ mod tests {
                 collateral_pool_id: Principal::anonymous(),
                 debt_amount: Nat::from(0u32),
                 receiver_address: Principal::anonymous(),
+                buy_bad_debt: false,
             },
             swap_args: Some(make_default_request()),
             debt_asset: ChainToken::Icp {
@@ -313,7 +314,7 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert!(results[0].swap_result.is_some());
     }
-    
+
     #[tokio::test]
     async fn kong_finalize_marks_failed_permanent_after_too_many_attempts() {
         use mockall::predicate::eq;

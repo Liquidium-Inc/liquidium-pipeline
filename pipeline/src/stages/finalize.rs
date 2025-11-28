@@ -42,14 +42,14 @@ where
 }
 
 #[async_trait]
-impl<'a, F, D, P> PipelineStage<'a, Vec<ExecutionReceipt>, Vec<LiquidationOutcome>> for FinalizeStage<F, D, P>
+impl<'a, F, D, P> PipelineStage<'a, (), Vec<LiquidationOutcome>> for FinalizeStage<F, D, P>
 where
     F: Finalizer + Sync + Send,
     D: WalStore + Sync + Send,
     P: ProfitCalculator + Sync + Send,
 {
-    async fn process(&self, _input: &'a Vec<ExecutionReceipt>) -> Result<Vec<LiquidationOutcome>, String> {
-        // Call batch finalizer
+    async fn process(&self, _: &'a ()) -> Result<Vec<LiquidationOutcome>, String> {
+        // Finalizer no inputs because it uses persisted journal as the input source
 
         let input = self.wal.get_pending(100).await.map_err(|e| e.to_string())?;
         let input: Vec<ExecutionReceipt> = input

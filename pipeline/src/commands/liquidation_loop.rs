@@ -129,22 +129,22 @@ pub async fn run_liquidation_loop() {
     let ctx = Arc::new(ctx);
     let config = ctx.config.clone();
 
-    if config.buy_bad_debt {
-        info!("🚨 BUYING BAD DEBT ENABLED: {} 🚨", config.buy_bad_debt);
-        println!("⚠️  You are about to BUY BAD DEBT. Type 'yes' to continue:");
-        let mut input = String::new();
-        std::io::stdin().read_line(&mut input).unwrap();
-        if input.trim() != "yes" {
-            panic!("Aborted by user.");
-        }
-    }
+    // if config.buy_bad_debt {
+    //     info!("🚨 BUYING BAD DEBT ENABLED: {} 🚨", config.buy_bad_debt);
+    //     println!("⚠️  You are about to BUY BAD DEBT. Type 'yes' to continue:");
+    //     let mut input = String::new();
+    //     std::io::stdin().read_line(&mut input).unwrap();
+    //     if input.trim() != "yes" {
+    //         panic!("Aborted by user.");
+    //     }
+    // }
     info!("Config loaded for network: {}", config.ic_url);
 
     // Use main IC agent (liquidator identity) from context
     info!("Agent initialized with principal: {}", config.liquidator_principal);
 
     // Initialize components using shared pipeline context
-    let (finder, strategy, executor, _exporter, finalizer) = init(ctx.clone()).await;
+    let (finder, strategy, executor, exporter, finalizer) = init(ctx.clone()).await;
 
     let debt_assets: Vec<String> = ctx
         .registry
@@ -158,8 +158,6 @@ pub async fn run_liquidation_loop() {
             }
         })
         .collect();
-
-    let assets = ctx.registry.all();
 
     // Create the spinner for fancy UI
     let start_spinner = || {
@@ -195,28 +193,25 @@ pub async fn run_liquidation_loop() {
             vec![]
         });
 
-        info!("Executing liquidations...");
-        let receipts = executor.process(&executions).await.unwrap_or_else(|e| {
+        executor.process(&executions).await.unwrap_or_else(|e| {
             log::error!("Executor failed: {e}");
             vec![]
         });
 
-        info!("Finalizing liquidations...");
-        let _outcomes = finalizer.process(&receipts).await.unwrap_or_else(|e| {
+        let outcomes = finalizer.process(&()).await.unwrap_or_else(|e| {
             log::error!("Executor failed: {e}");
             vec![]
         });
 
-        // if outcomes.is_empty() {
-        //     info!("No successful executions");
-        //     spinner = start_spinner();
-        //     spinner.set_message("Scanning for liquidation opportunities...");
-        //     sleep(Duration::from_secs(30));
-        //     continue;
-        // }
+        if outcomes.is_empty() {
+            spinner = start_spinner();
+            spinner.set_message("Scanning for liquidation opportunities...");
+            sleep(Duration::from_secs(30));
+            continue;
+        }
 
-        // exporter.process(&outcomes).await.expect("Failed to export results");
-        // print_execution_results(outcomes);
+        exporter.process(&outcomes).await.expect("Failed to export results");
+        print_execution_results(outcomes);
         spinner = start_spinner();
         spinner.set_message("Scanning for liquidation opportunities...");
         sleep(Duration::from_secs(5));

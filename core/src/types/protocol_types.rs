@@ -13,6 +13,7 @@ pub struct LiquidationRequest {
     pub collateral_pool_id: Principal, // Pool containing collateral to be liquidated
     pub debt_amount: Nat,              // Amount of debt to repay
     pub receiver_address: Principal,   // Account that receives collateral and change
+    pub buy_bad_debt: bool
 }
 
 pub trait Asset {

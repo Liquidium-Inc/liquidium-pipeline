@@ -14,7 +14,6 @@ use crate::swappers::swap_interface::SwapInterface;
 use candid::{Int, Nat};
 use futures::TryFutureExt;
 use liquidium_pipeline_core::{
-    account::actions::AccountInfo,
     balance_service::BalanceService,
     tokens::{
         asset_id::AssetId, chain_token::ChainToken, chain_token_amount::ChainTokenAmount,
@@ -91,6 +90,218 @@ where
         self.watchdog = wd;
         self
     }
+
+    // Helper: Prefetch balances for all debt assets we might need
+    async fn prefetch_balances_for_users(&self, users: &[LiquidatebleUser]) -> Result<HashMap<String, Nat>, String> {
+        let mut debt_assets: HashSet<ChainToken> = HashSet::new();
+        for user in users.iter() {
+            for pos in user.positions.iter() {
+                if pos.debt_amount > 0u8
+                    && let Some(token) = resolve_token_for_position(self.registry.as_ref(), pos)
+                {
+                    debt_assets.insert(token);
+                }
+            }
+        }
+
+        let mut balances: HashMap<String, Nat> = HashMap::new();
+        for asset in debt_assets {
+            let balance = self
+                .account_service
+                .get_balance(&asset.asset_id())
+                .map_err(|_| "Could not get balance".to_string())
+                .await?
+                .value;
+
+            balances.insert(asset.asset_id().address, balance);
+        }
+
+        Ok(balances)
+    }
+
+    fn sort_users_by_health(&self, users: &[LiquidatebleUser]) -> Vec<LiquidatebleUser> {
+        users
+            .iter()
+            .sorted_by(|a, b| a.health_factor.cmp(&b.health_factor))
+            .cloned()
+            .collect()
+    }
+
+    fn build_combos(
+        &self,
+        work_users: &[LiquidatebleUser],
+    ) -> (
+        Vec<(usize, LiquidateblePosition, LiquidateblePosition)>,
+        Vec<(usize, LiquidateblePosition)>,
+    ) {
+        let mut combos: Vec<(usize, LiquidateblePosition, LiquidateblePosition)> = Vec::new();
+        let mut bad_debts: Vec<(usize, LiquidateblePosition)> = Vec::new();
+
+        for (idx, user) in work_users.iter().enumerate() {
+            let debts: Vec<_> = user.positions.iter().filter(|p| p.debt_amount > 0u8).cloned().collect();
+
+            let colls: Vec<_> = user
+                .positions
+                .iter()
+                .filter(|p| p.collateral_amount > 0u8)
+                .cloned()
+                .collect();
+
+            if debts.is_empty() {
+                continue;
+            }
+
+            if colls.is_empty() {
+                info!(
+                    "User {:?} has debt but no collateral. Treating as bad debt and creating bad-debt entries.",
+                    user.account
+                );
+                for d in debts {
+                    bad_debts.push((idx, d));
+                }
+                continue;
+            }
+
+            for d in &debts {
+                for c in &colls {
+                    combos.push((idx, d.clone(), c.clone()));
+                }
+            }
+        }
+
+        (combos, bad_debts)
+    }
+
+    async fn handle_bad_debt_positions(
+        &self,
+        bad_debts: Vec<(usize, LiquidateblePosition)>,
+        balances: &mut HashMap<String, Nat>,
+        work_users: &mut [LiquidatebleUser],
+        result: &mut Vec<ExecutorRequest>,
+    ) -> Result<(), String> {
+        if bad_debts.is_empty() {
+            return Ok(());
+        }
+
+        if !self.config.should_buy_bad_debt() {
+            // Config says we should not buy bad debt; just log and skip.
+            for (idx, pos) in bad_debts {
+                info!(
+                    "Skipping pure bad debt for user {:?} pool {:?} amount {} because should_buy_bad_debt=false",
+                    work_users[idx].account, pos.pool_id, pos.debt_amount,
+                );
+            }
+            return Ok(());
+        }
+
+        for (user_idx, debt_position) in bad_debts {
+            if work_users[user_idx].health_factor >= 1000u32 {
+                continue;
+            }
+
+            if !matches!(debt_position.asset_type, AssetType::CkAsset(_)) {
+                return Err("invalid asset type".to_string());
+            }
+
+            let repayment_token = if let Some(tok) = resolve_token_for_position(self.registry.as_ref(), &debt_position)
+            {
+                tok
+            } else {
+                debug!(
+                    "Skipping bad-debt position due to unknown debt asset {:?}",
+                    debt_position.asset
+                );
+                continue;
+            };
+
+            let balance_key = repayment_token.asset_id().address.clone();
+            let Some(available_balance) = balances.get_mut(&balance_key) else {
+                debug!("Asset balance not found for bad-debt position: {:?}", balance_key);
+                self.watchdog
+                    .notify(WatchdogEvent::BalanceMissing {
+                        asset: &debt_position.asset.to_string(),
+                    })
+                    .await;
+                continue;
+            };
+
+            if available_balance.clone() < repayment_token.fee() * 2u64 {
+                self.watchdog
+                    .notify(WatchdogEvent::InsufficientFunds {
+                        asset: &debt_position.asset.to_string(),
+                        available: available_balance.to_string(),
+                    })
+                    .await;
+                debug!(
+                    "Skipping bad-debt position due to insufficient funds: asset={}, available={} < min_required={}",
+                    debt_position.asset,
+                    available_balance,
+                    repayment_token.fee() * 2u64
+                );
+                continue;
+            }
+
+            let max_balance = available_balance.clone() - repayment_token.fee() * 2u64;
+
+            // We buy as much bad debt as we can, capped by wallet balance and position size.
+            let repay_amount = if max_balance.clone() < debt_position.debt_amount {
+                max_balance
+            } else {
+                debt_position.debt_amount.clone()
+            };
+
+            if repay_amount == Nat::from(0u64) {
+                continue;
+            }
+
+            // No collateral to seize, so amount_received is zero and profit is strictly negative.
+            let amount_received: Nat = Nat::from(0u64);
+            let profit = Int::from(amount_received.clone())
+                - Int::from(repay_amount.clone())
+                - Int::from(repayment_token.fee()) * 2u128;
+
+            info!(
+                "Buying pure bad debt: repay={} {} profit={} {}",
+                repay_amount.0.to_f64().unwrap() / 10u32.pow(repayment_token.decimals() as u32) as f64,
+                repayment_token.symbol(),
+                profit.0.to_f64().unwrap() / 10u32.pow(repayment_token.decimals() as u32) as f64,
+                repayment_token.symbol()
+            );
+
+            if profit <= 0 && !self.config.should_buy_bad_debt() {
+                continue;
+            }
+
+            if available_balance.clone() >= repay_amount.clone() + repayment_token.fee() * 2u64 {
+                *available_balance = available_balance.clone() - repay_amount.clone() - repayment_token.fee() * 2u64;
+            } else {
+                debug!(
+                    "Available balance would underflow when updating bad-debt balance. available={}, repay={}, fees={}",
+                    available_balance,
+                    repay_amount,
+                    repayment_token.fee() * 2u64
+                );
+                continue;
+            }
+
+            result.push(ExecutorRequest {
+                debt_asset: repayment_token.clone(),
+                collateral_asset: repayment_token.clone(),
+                liquidation: LiquidationRequest {
+                    borrower: debt_position.account,
+                    debt_pool_id: debt_position.pool_id,
+                    collateral_pool_id: debt_position.pool_id,
+                    debt_amount: repay_amount.clone(),
+                    receiver_address: self.config.get_trader_principal(),
+                    buy_bad_debt: true,
+                },
+                swap_args: None,
+                expected_profit: profit.0.to_i128().unwrap(),
+            });
+        }
+
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -103,64 +314,20 @@ where
     U: CollateralServiceTrait,
 {
     async fn process(&self, users: &'a Vec<LiquidatebleUser>) -> Result<Vec<ExecutorRequest>, String> {
-        let mut result: Vec<ExecutorRequest> = vec![];
-        let mut balances: HashMap<String, Nat> = HashMap::new();
+        let mut result: Vec<ExecutorRequest> = Vec::new();
 
-        // Discover which debt assets we actually need from the input users via the registry
-        let mut debt_assets: HashSet<ChainToken> = HashSet::new();
-        for user in users.iter() {
-            for pos in user.positions.iter() {
-                if pos.debt_amount > 0u8
-                    && let Some(token) = resolve_token_for_position(self.registry.as_ref(), pos)
-                {
-                    debt_assets.insert(token);
-                }
-            }
-        }
-
-        // Prefetch available balances for those debt assets for the liquidator
-        for asset in debt_assets {
-            let balance = self
-                .account_service
-                .get_balance(&asset.asset_id())
-                .map_err(|_| "Could not get balance")
-                .await?;
-
-            balances.insert(asset.asset_id().address, balance.value);
-        }
+        // Prefetch balances for all debt assets we might need
+        let mut balances = self.prefetch_balances_for_users(users).await?;
 
         // Take smallest hf first
-        let users: Vec<LiquidatebleUser> = users
-            .iter()
-            .sorted_by(|a, b| a.health_factor.cmp(&b.health_factor))
-            .cloned()
-            .collect();
+        let users_sorted: Vec<LiquidatebleUser> = self.sort_users_by_health(users);
 
         // Working copy of users for in-loop mutation
-        let mut work_users: Vec<LiquidatebleUser> = users.clone();
+        let mut work_users: Vec<LiquidatebleUser> = users_sorted.clone();
 
-        // Build all candidate (user_idx, debt_position, collateral_position) combinations
-        let mut combos: Vec<(usize, LiquidateblePosition, LiquidateblePosition)> = vec![];
-        for (idx, user) in work_users.iter().enumerate() {
-            let debts = user
-                .positions
-                .iter()
-                .filter(|p| p.debt_amount > 0u8)
-                .cloned()
-                .collect::<Vec<_>>();
-            let colls = user
-                .positions
-                .iter()
-                .filter(|p| p.collateral_amount > 0u8)
-                .cloned()
-                .collect::<Vec<_>>();
-
-            for d in &debts {
-                for c in &colls {
-                    combos.push((idx, d.clone(), c.clone()));
-                }
-            }
-        }
+        // Build all candidate (user_idx, debt_position, collateral_position) combinations,
+        // and collect pure bad-debt positions.
+        let (mut combos, bad_debts) = self.build_combos(&work_users);
 
         // Sort by most urgent first: lowest health factor, then largest debt, then largest collateral
         combos.sort_by(|(i1, d1, c1), (i2, d2, c2)| {
@@ -182,7 +349,6 @@ where
                 return Err("invalid asset type".to_string());
             }
 
-            // Resolve chain tokens from registry
             let repayment_token = if let Some(tok) = resolve_token_for_position(self.registry.as_ref(), &debt_position)
             {
                 tok
@@ -203,9 +369,7 @@ where
                 };
 
             let balance_key = repayment_token.asset_id().address.clone();
-            let available_balance = if let Some(b) = balances.get_mut(&balance_key) {
-                b
-            } else {
+            let Some(available_balance) = balances.get_mut(&balance_key) else {
                 debug!("Asset balance not found {:?}", balance_key);
                 self.watchdog
                     .notify(WatchdogEvent::BalanceMissing {
@@ -270,7 +434,6 @@ where
                 value: estimation.received_collateral.clone(),
             };
 
-            // &collateral_token, &repayment_token, &amount_in
             let same_asset = collateral_token.asset_id().address == repayment_token.asset_id().address;
             let (swap_args, amount_received, price) = if estimation.received_collateral == 0u32 || same_asset {
                 (None, amount_in.value.clone(), 1f64)
@@ -281,7 +444,7 @@ where
                     pay_amount: amount_in,
                     receive_asset: repayment_token.asset_id(),
                     receive_address: Some(self.config.get_liquidator_principal().to_string()),
-                    max_slippage_bps: Some(2000), //2% slippage
+                    max_slippage_bps: Some(2000),
                     venue_hint: None,
                 };
                 let swap_info = self
@@ -346,6 +509,7 @@ where
                     collateral_pool_id: collateral_position.pool_id,
                     debt_amount: estimation.repaid_debt.clone(),
                     receiver_address: self.config.get_trader_principal(),
+                    buy_bad_debt: false
                 },
                 swap_args,
                 expected_profit: profit.0.to_i128().unwrap(),
@@ -358,6 +522,11 @@ where
                 );
             }
         }
+
+        // After handling normal collateral-backed combos, handle pure bad-debt positions.
+        self.handle_bad_debt_positions(bad_debts, &mut balances, &mut work_users, &mut result)
+            .await?;
+
         Ok(result)
     }
 }
