@@ -4,7 +4,6 @@ use alloy::network::AnyNetwork;
 use alloy::providers::{Provider, ProviderBuilder, WalletProvider};
 use alloy::signers::local::PrivateKeySigner;
 
-use candid::Principal;
 use ic_agent::Agent;
 use icrc_ledger_types::icrc1::account::Account;
 use liquidium_pipeline_connectors::account::evm_account::EvmAccountInfoAdapter;
@@ -22,7 +21,6 @@ use liquidium_pipeline_connectors::{
     token_registry_loader::load_token_registry,
     transfer::{evm_transfer::EvmTransferAdapter, icp_transfer::IcpTransferAdapter, router::MultiChainTransferRouter},
 };
-use log::debug;
 
 use crate::config::Config;
 use crate::swappers::kong::kong_swapper::KongSwapSwapper;

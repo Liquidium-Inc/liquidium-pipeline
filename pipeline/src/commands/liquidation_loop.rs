@@ -2,7 +2,7 @@ use candid::Principal;
 use icrc_ledger_types::icrc1::account::Account;
 use indicatif::{ProgressBar, ProgressStyle};
 
-use log::{debug, info, warn};
+use log::{info, warn};
 use prettytable::{Cell, Row, Table, format};
 use std::{sync::Arc, thread::sleep, time::Duration};
 
@@ -87,7 +87,7 @@ async fn init(
     executor.init(&tokens).await.expect("could not approce executor tokens");
     let executor = Arc::new(executor);
 
-    ctx.swap_router.init().await;
+    let _ = ctx.swap_router.init().await;
 
     // Finalizer logic (Kong swapper)
     let kong_finalizer = Arc::new(KongSwapFinalizer::new(ctx.swap_router.clone()));

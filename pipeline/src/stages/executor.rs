@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use candid::Encode;
 
-use futures::TryFutureExt;
+use futures::{TryFutureExt, future::join_all};
 use log::{debug, warn};
 use serde::{Deserialize, Serialize};
 
@@ -10,8 +10,8 @@ use crate::{
     finalizers::{finalizer::FinalizerResult, liquidation_outcome::LiquidationOutcome},
     persistance::{LiqResultRecord, WalStore},
     stage::PipelineStage,
-    utils::now_ts, wal::{encode_meta, liq_id_from_receipt},
-
+    utils::now_ts,
+    wal::{encode_meta, liq_id_from_receipt},
 };
 use liquidium_pipeline_connectors::pipeline_agent::PipelineAgent;
 
@@ -49,78 +49,84 @@ pub struct ExecutionReceipt {
     pub status: ExecutionStatus,
     pub change_received: bool,
 }
-
 #[async_trait]
 impl<'a, A: PipelineAgent, D: WalStore> PipelineStage<'a, Vec<ExecutorRequest>, Vec<ExecutionReceipt>>
     for BasicExecutor<A, D>
 {
     async fn process(&self, executor_requests: &'a Vec<ExecutorRequest>) -> Result<Vec<ExecutionReceipt>, String> {
-        let mut liquidations: Vec<ExecutionReceipt> = vec![];
-        for executor_request in executor_requests {
-            let mut receipt = ExecutionReceipt {
-                request: executor_request.clone(),
-                liquidation_result: None,
-                status: ExecutionStatus::Success,
-                change_received: true,
-            };
+        // One future per request, all run concurrently
+        let futures = executor_requests.iter().map(|executor_request| {
+            let executor_request = executor_request.clone();
 
-            // Force receiver to the configured dex account to separate seized collateral from repay funds
-            let liq_req = executor_request.liquidation.clone();
+            async move {
+                let mut receipt = ExecutionReceipt {
+                    request: executor_request.clone(),
+                    liquidation_result: None,
+                    status: ExecutionStatus::Success,
+                    change_received: true,
+                };
 
-            let args = Encode!(&self.account_id.owner, &liq_req).map_err(|e| e.to_string())?;
-            // Make the update call to the canister
-            let liq_call = match self
-                .agent
-                .call_update::<Result<LiquidationResult, String>>(&self.lending_canister, "liquidate", args)
-                .await
-            {
-                Ok(v) => v,
-                Err(err) => {
-                    warn!("Liquidation call failed {err}");
-                    receipt.status = ExecutionStatus::LiquidationCallFailed(err);
-                    liquidations.push(receipt);
-                    continue;
-                }
-            };
+                let liq_req = executor_request.liquidation.clone();
 
-            let liq = match liq_call {
-                Ok(v) => v,
-                Err(err) => {
+                let args = Encode!(&self.account_id.owner, &liq_req).map_err(|e| e.to_string())?;
+
+                let liq_call = match self
+                    .agent
+                    .call_update::<Result<LiquidationResult, String>>(&self.lending_canister, "liquidate", args)
+                    .await
+                {
+                    Ok(v) => v,
+                    Err(err) => {
+                        warn!("Liquidation call failed {err}");
+                        receipt.status = ExecutionStatus::LiquidationCallFailed(err);
+                        return Ok::<ExecutionReceipt, String>(receipt);
+                    }
+                };
+
+                let liq = match liq_call {
+                    Ok(v) => v,
+                    Err(err) => {
+                        receipt.status = ExecutionStatus::FailedLiquidation(err);
+                        return Ok::<ExecutionReceipt, String>(receipt);
+                    }
+                };
+
+                receipt.liquidation_result = Some(liq.clone());
+                if let LiquidationStatus::FailedLiquidation(err) = liq.status {
                     receipt.status = ExecutionStatus::FailedLiquidation(err);
-                    liquidations.push(receipt);
-                    continue;
+                    return Ok::<ExecutionReceipt, String>(receipt);
                 }
-            };
 
-            println!("EXECUTIOn result {:?}", liq);
-            receipt.liquidation_result = Some(liq.clone());
-            if let LiquidationStatus::FailedLiquidation(err) = liq.status {
-                receipt.status = ExecutionStatus::FailedLiquidation(err);
-                liquidations.push(receipt);
-                continue;
-            }
+                if matches!(
+                    liq.change_tx.status,
+                    TransferStatus::Failed(_) | TransferStatus::Pending
+                ) {
+                    receipt.change_received = false;
+                    return Ok::<ExecutionReceipt, String>(receipt);
+                }
 
-            if matches!(
-                liq.change_tx.status,
-                TransferStatus::Failed(_) | TransferStatus::Pending
-            ) {
-                receipt.change_received = false;
-                liquidations.push(receipt);
-                continue;
-            }
+                if matches!(
+                    liq.collateral_tx.status,
+                    TransferStatus::Failed(_) | TransferStatus::Pending
+                ) {
+                    receipt.status = ExecutionStatus::CollateralTransferFailed("collateral missing".to_string());
+                    return Ok::<ExecutionReceipt, String>(receipt);
+                }
 
-            if matches!(
-                liq.collateral_tx.status,
-                TransferStatus::Failed(_) | TransferStatus::Pending
-            ) {
-                receipt.status = ExecutionStatus::CollateralTransferFailed("collateral missing".to_string());
-                liquidations.push(receipt);
-                continue;
+                debug!("Executed liquidation {:?}", liq);
+                if let Err(err) = self.store_to_wal(&receipt, &executor_request).await {
+                    warn!("Failed to store to WAL: {}", err);
+                }
+
+                Ok::<ExecutionReceipt, String>(receipt)
             }
-            debug!("Executed liquidation {:?}", liq);
-            if let Err(err) = self.store_to_wal(&receipt, executor_request).await {
-                warn!("Failed to store to WAL: {}", err);
-            }
+        });
+
+        let results = join_all(futures).await;
+
+        let mut liquidations = Vec::with_capacity(results.len());
+        for res in results {
+            let receipt = res?;
             liquidations.push(receipt);
         }
 

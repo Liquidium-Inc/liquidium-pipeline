@@ -95,11 +95,6 @@ where
         let mut kong_req: KongSwapArgs = KongSwapArgs::from(req.clone());
         kong_req.pay_amount = req.pay_amount.value.clone();
 
-        info!(
-            "KongVenue execute {} {} -> {}",
-            kong_req.pay_amount, kong_req.pay_token, kong_req.receive_token
-        );
-
         // Execute swap on Kong
         let reply: KongSwapReply = self.swapper.swap(kong_req).await?;
 

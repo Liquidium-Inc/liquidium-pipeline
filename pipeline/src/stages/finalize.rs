@@ -75,9 +75,7 @@ where
 
             let expected_profit = self.profit_calc.expected(req, Some(liq));
 
-            let realized_profit =
-                self.profit_calc
-                    .realized(req, liq, fin_res.swap_result.as_ref(), receipt.change_received);
+            let realized_profit = self.profit_calc.realized(liq, fin_res.swap_result.as_ref());
 
             outcomes.push(LiquidationOutcome {
                 request: req.clone(),
