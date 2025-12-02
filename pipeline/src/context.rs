@@ -144,7 +144,7 @@ impl<P: Provider<AnyNetwork> + WalletProvider<AnyNetwork> + Clone + 'static> Pip
         // Setup swap venue
 
         // Kong swapper uses the trader agent/backend, adjust ctor args to your real API
-        let mut kong_swapper = KongSwapSwapper::new(icp_backend_trader.agent.clone(), main_trader_account);
+        let kong_swapper = KongSwapSwapper::new(icp_backend_trader.agent.clone(), main_trader_account);
         // Build Kong venue (ICP)
         let icp_tokens: Vec<ChainToken> = registry
             .tokens
@@ -155,13 +155,7 @@ impl<P: Provider<AnyNetwork> + WalletProvider<AnyNetwork> + Clone + 'static> Pip
             })
             .collect();
 
-        debug!("Kong swap init");
-        let kong_tokens = icp_tokens
-            .iter()
-            .map(|item| Principal::from_text(item.asset_id().address).unwrap())
-            .collect::<Vec<Principal>>();
-        kong_swapper.init(&kong_tokens).await?;
-
+       
         let kong_swapper = Arc::new(kong_swapper);
         let kong_venue: Arc<dyn SwapVenue> = Arc::new(KongVenue::new(kong_swapper, icp_tokens));
 

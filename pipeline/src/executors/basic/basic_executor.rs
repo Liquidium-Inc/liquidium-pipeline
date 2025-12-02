@@ -1,6 +1,7 @@
 use std::{collections::HashMap, sync::Arc};
 
 use candid::{Encode, Nat, Principal};
+use futures::future::join_all;
 use icrc_ledger_types::{
     icrc1::account::Account,
     icrc2::{
@@ -33,15 +34,28 @@ impl<A: PipelineAgent, D: WalStore> BasicExecutor<A, D> {
         }
     }
 
-    pub async fn init(&mut self, tokens: &Vec<Principal>) -> Result<(), String> {
-        info!("Starting DEX token approval process");
-        for token in tokens {
-            let lending_allowance = self.check_allowance(token, &self.lending_canister).await;
+    pub async fn init(&mut self, tokens: &[Principal]) -> Result<(), String> {
+        let spender = self.lending_canister;
+        let this = &*self;
 
-            self.allowances
-                .insert((*token, self.lending_canister), lending_allowance);
+        // Build futures without mutating self inside the loop
+        let futures = tokens.iter().map(|token| {
+            let token = *token;
+
+            async move {
+                let lending_allowance = this.check_allowance(&token, &spender).await;
+                (token, spender, lending_allowance)
+            }
+        });
+
+        // Run all allowance checks in parallel
+        let results = join_all(futures).await;
+
+        // Now safely update the local allowance cache
+        for (token, spender, lending_allowance) in results {
+            self.allowances.insert((token, spender), lending_allowance);
         }
-        info!("DEX token approval complete");
+
         Ok(())
     }
 

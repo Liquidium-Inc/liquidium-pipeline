@@ -150,7 +150,7 @@ impl<A: PipelineAgent, D: WalStore> BasicExecutor<A, D> {
             updated_at: now_ts(),
             meta_json: "{}".to_string(),
         };
-        encode_meta(&mut result_record, &outcome);
+        let _ = encode_meta(&mut result_record, &outcome);
         self.wal.upsert_result(result_record).map_err(|e| e.to_string()).await
     }
 }

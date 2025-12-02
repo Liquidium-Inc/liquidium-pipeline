@@ -87,6 +87,8 @@ async fn init(
     executor.init(&tokens).await.expect("could not approce executor tokens");
     let executor = Arc::new(executor);
 
+    ctx.swap_router.init().await;
+
     // Finalizer logic (Kong swapper)
     let kong_finalizer = Arc::new(KongSwapFinalizer::new(ctx.swap_router.clone()));
 
@@ -129,15 +131,15 @@ pub async fn run_liquidation_loop() {
     let ctx = Arc::new(ctx);
     let config = ctx.config.clone();
 
-    // if config.buy_bad_debt {
-    //     info!("🚨 BUYING BAD DEBT ENABLED: {} 🚨", config.buy_bad_debt);
-    //     println!("⚠️  You are about to BUY BAD DEBT. Type 'yes' to continue:");
-    //     let mut input = String::new();
-    //     std::io::stdin().read_line(&mut input).unwrap();
-    //     if input.trim() != "yes" {
-    //         panic!("Aborted by user.");
-    //     }
-    // }
+    if config.buy_bad_debt {
+        info!("🚨 BUYING BAD DEBT ENABLED: {} 🚨", config.buy_bad_debt);
+        println!("⚠️  You are about to BUY BAD DEBT. Type 'yes' to continue:");
+        let mut input = String::new();
+        std::io::stdin().read_line(&mut input).unwrap();
+        if input.trim() != "yes" {
+            panic!("Aborted by user.");
+        }
+    }
     info!("Config loaded for network: {}", config.ic_url);
 
     // Use main IC agent (liquidator identity) from context

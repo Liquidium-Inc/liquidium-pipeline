@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use candid::Principal;
 use liquidium_pipeline_connectors::pipeline_agent::PipelineAgent;
 use liquidium_pipeline_core::tokens::{chain_token::ChainToken, chain_token_amount::ChainTokenAmount};
 use log::info;
@@ -50,6 +51,21 @@ where
 {
     fn venue_name(&self) -> &'static str {
         "kong"
+    }
+
+    async fn init(&self) -> Result<(), String> {
+        let kong_tokens = self
+            .tokens
+            .iter()
+            .map(|item| Principal::from_text(item.asset_id().address).unwrap())
+            .collect::<Vec<Principal>>();
+
+        self.swapper
+            .init(&kong_tokens)
+            .await
+            .expect("could not init kong venue");
+
+        Ok(())
     }
 
     async fn quote(&self, req: &SwapRequest) -> Result<SwapQuote, String> {

@@ -1,6 +1,11 @@
-use std::{collections::HashMap, str::FromStr, sync::Arc};
+use std::{
+    collections::HashMap,
+    str::FromStr,
+    sync::{Arc, Mutex},
+};
 
 use candid::{Encode, Nat, Principal, encode_args};
+use futures::future::join_all;
 use icrc_ledger_types::{
     icrc1::account::Account,
     icrc2::{
@@ -21,7 +26,7 @@ pub struct KongSwapSwapper<A: PipelineAgent> {
     pub agent: Arc<A>,
     pub account_id: Account,
     pub dex_account: Account,
-    pub allowances: HashMap<(Principal, Principal), Nat>,
+    pub allowances: Mutex<HashMap<(Principal, Principal), Nat>>,
 }
 
 impl<A: PipelineAgent> KongSwapSwapper<A> {
@@ -33,16 +38,32 @@ impl<A: PipelineAgent> KongSwapSwapper<A> {
                 owner: DEX_PRINCIPAL.parse().unwrap(),
                 subaccount: None,
             },
-            allowances: HashMap::new(),
+            allowances: Mutex::new(HashMap::new()),
         }
     }
 
-    pub async fn init(&mut self, tokens: &Vec<Principal>) -> Result<(), String> {
-        info!("Starting DEX token approval process");
-        for token in tokens {
-            let swap_allowance = self.check_allowance(token, &self.dex_account.owner).await;
-            self.allowances.insert((*token, self.dex_account.owner), swap_allowance);
+    pub async fn init(&self, tokens: &[Principal]) -> Result<(), String> {
+        let owner = self.dex_account.owner;
+        let this = &*self;
+
+        let futures = tokens.iter().map(|token| {
+            let token = *token;
+            let owner = owner;
+            let this = this;
+
+            async move {
+                let allowance = this.check_allowance(&token, &owner).await;
+                (token, owner, allowance)
+            }
+        });
+
+        let results = join_all(futures).await;
+
+        let mut map = this.allowances.lock().expect("allowances mutex poisoned");
+        for (token, owner, allowance) in results {
+            map.insert((token, owner), allowance);
         }
+
         info!("DEX token approval complete");
         Ok(())
     }
@@ -57,7 +78,12 @@ impl<A: PipelineAgent> KongSwapSwapper<A> {
                 },
             )
             .await;
-        debug!("Current allowance for {}: {} on {}", token, allowance, self.agent.agent().get_principal().unwrap());
+        debug!(
+            "Current allowance for {}: {} on {}",
+            token,
+            allowance,
+            self.agent.agent().get_principal().unwrap()
+        );
 
         if allowance < max_for_ledger(token) / Nat::from(2u8) {
             info!("Allowance low for {}, re-approving…", token);

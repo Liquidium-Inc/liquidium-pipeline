@@ -35,6 +35,12 @@ impl<C: CexBackend> SwapVenue for MexcSwapVenue<C> {
         "mexc"
     }
 
+    async fn init(&self) -> Result<(), String> {
+        // Epmty impl;
+
+        Ok(())
+    }
+
     async fn quote(&self, req: &SwapRequest) -> Result<SwapQuote, String> {
         let market = market_symbol(&req.pay_asset, &req.receive_asset);
         let amount_in_f = req.pay_amount.to_f64();

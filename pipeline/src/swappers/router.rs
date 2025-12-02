@@ -2,11 +2,15 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
-use crate::swappers::{model::{SwapExecution, SwapQuote, SwapRequest}, swap_interface::SwapInterface};
+use crate::swappers::{
+    model::{SwapExecution, SwapQuote, SwapRequest},
+    swap_interface::SwapInterface,
+};
 
 #[async_trait]
 pub trait SwapVenue: Send + Sync {
     fn venue_name(&self) -> &'static str;
+    async fn init(&self) -> Result<(), String>;
     async fn quote(&self, req: &SwapRequest) -> Result<SwapQuote, String>;
     async fn execute(&self, req: &SwapRequest) -> Result<SwapExecution, String>;
 }
@@ -40,6 +44,13 @@ impl SwapRouter {
             Some("kong") | None => &*self.kong,
             Some(_) => &*self.kong, // fallback for unknown hints
         }
+    }
+
+    pub async fn init(&self) -> Result<(), String> {
+        let _ = self.kong.init().await;
+        let _ = self.mexc.init().await;
+
+        Ok(())
     }
 
     pub async fn quote(&self, req: &SwapRequest) -> Result<SwapQuote, String> {
