@@ -16,6 +16,7 @@ use crate::{
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum CexStep {
     Deposit,
+    DepositPending,
     Trade,
     Withdraw,
     Completed,
@@ -31,6 +32,7 @@ pub struct CexState {
     // deposit leg
     pub deposit_asset: ChainToken,
     pub deposit_txid: Option<String>,
+    pub deposit_balance_before: Option<f64>,
 
     // trade leg
     pub market: String,
@@ -165,6 +167,10 @@ impl Finalizer for dyn CexFinalizerLogic {
                         debug!("[cex] liq_id={} step=Deposit", cex_state.liq_id);
                         self.deposit(&mut cex_state).await
                     }
+                    CexStep::DepositPending => {
+                        // Deposit did not arrive, we cannot break yet, so break;
+                        break;
+                    }
                     CexStep::Trade => {
                         debug!("[cex] liq_id={} step=Trade", cex_state.liq_id);
                         self.trade(&mut cex_state).await
@@ -187,10 +193,6 @@ impl Finalizer for dyn CexFinalizerLogic {
                 if step_res.is_err() {
                     break;
                 }
-
-                // If the step implementation transitioned us to Completed,
-                // the next loop iteration will hit the Completed arm and break.
-                // Otherwise we keep advancing to the next leg.
             }
 
             if let Err(err) = step_res {

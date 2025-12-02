@@ -3,7 +3,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use candid::Principal;
 use icrc_ledger_types::icrc1::account::Account;
-use liquidium_pipeline_connectors::backend::cex_backend::CexBackend;
+use liquidium_pipeline_connectors::backend::cex_backend::{CexBackend, DepositAddress};
 use liquidium_pipeline_core::{
     account::model::ChainAccount, tokens::chain_token_amount::ChainTokenAmount,
     transfer::transfer_service::TransferService,
@@ -44,6 +44,39 @@ where
             transfer_service,
         }
     }
+
+    pub async fn check_deposit(&self, state: &mut CexState) -> Result<(), String> {
+        let symbol = state.deposit_asset.symbol();
+        let current_bal = self.backend.get_balance(&symbol).await?;
+
+        match state.deposit_balance_before {
+            Some(b0) => {
+                if current_bal - b0 > 0.00001 {
+                    debug!(
+                        "[mexc] liq_id={} deposit confirmed on CEX, before={} after={}",
+                        state.liq_id, b0, current_bal
+                    );
+                    state.step = CexStep::Trade;
+                } else {
+                    debug!(
+                        "[mexc] liq_id={} deposit not yet visible on CEX (before={}, after={}), staying in Deposit",
+                        state.liq_id, b0, current_bal
+                    );
+                }
+                Ok(())
+            }
+            None => {
+                // No baseline recorded yet (should normally be set when we send the transfer),
+                // so record the current balance as the baseline and stay in Deposit.
+                debug!(
+                    "[mexc] liq_id={} no baseline balance recorded, setting deposit_balance_before={}",
+                    state.liq_id, current_bal
+                );
+                state.deposit_balance_before = Some(current_bal);
+                Ok(())
+            }
+        }
+    }
 }
 
 #[async_trait]
@@ -72,6 +105,7 @@ where
             // deposit leg
             deposit_asset: receipt.request.collateral_asset.clone(),
             deposit_txid: None,
+            deposit_balance_before: None,
 
             // trade leg
             market: format!(
@@ -99,49 +133,63 @@ where
             state.deposit_asset.chain()
         );
 
-        // Idempotency: if we already recorded a deposit txid, just move on.
-        if state.deposit_txid.is_some() {
+        // Phase A: no transfer yet -> snapshot balance and send once, then stay in Deposit.
+        if state.deposit_txid.is_none() {
+            let symbol = state.deposit_asset.symbol();
+            let baseline = match self.backend.get_balance(&symbol).await {
+                Ok(bal) => bal,
+                Err(e) => {
+                    debug!(
+                        "[mexc] liq_id={} could not get baseline balance before deposit: {} (using 0.0)",
+                        state.liq_id, e
+                    );
+                    0.0
+                }
+            };
+
             debug!(
-                "[mexc] liq_id={} deposit already recorded (txid={:?}), skipping",
-                state.liq_id, state.deposit_txid
+                "[mexc] liq_id={} baseline balance before deposit: {}",
+                state.liq_id, baseline
             );
-            state.step = CexStep::Trade;
+            state.deposit_balance_before = Some(baseline);
+
+            let addr = self
+                .backend
+                .get_deposit_address(&state.deposit_asset.symbol(), &state.deposit_asset.chain())
+                .await?;
+
+            debug!(
+                "[mexc] liq_id={} got deposit address={} tag={:?}",
+                state.liq_id, addr.address, addr.tag
+            );
+
+            let amount = &state.size_in;
+
+            let actions = self.transfer_service.actions();
+            let tx_id = actions
+                .transfer(
+                    &state.deposit_asset,
+                    &ChainAccount::Icp(Account {
+                        owner: Principal::from_text(addr.address)
+                            .map_err(|e| format!("invalid deposit address: {e}"))?,
+                        subaccount: None,
+                    }),
+                    amount.value.clone(),
+                )
+                .await?;
+
+            debug!("[mexc] liq_id={} sent deposit txid={}", state.liq_id, tx_id);
+
+            state.deposit_txid = Some(tx_id);
+            state.step = CexStep::DepositPending;
+
+            // Keep step as Deposit. WAL will persist, and a later finalize run
+            // will call check_deposit to see if funds landed on the CEX.
             return Ok(());
         }
 
-        // Ask MEXC for the deposit address for this asset/network.
-        let addr = self
-            .backend
-            .get_deposit_address(&state.deposit_asset.symbol(), &state.deposit_asset.chain())
-            .await?;
-
-        debug!(
-            "[mexc] liq_id={} got deposit address={} tag={:?}",
-            state.liq_id, addr.address, addr.tag
-        );
-
-        // Amount to send to MEXC (seized collateral).
-        let amount = &state.size_in;
-
-        assert_eq!(addr.asset, state.deposit_asset.symbol(), "deposit address mismatch");
-
-        let actions = self.transfer_service.actions();
-        let tx_id = actions
-            .transfer(
-                &state.deposit_asset,
-                &ChainAccount::Icp(Account {
-                    owner: Principal::from_text(addr.address).expect("could not decode deposit address"),
-                    subaccount: None,
-                }),
-                amount.value.clone(),
-            )
-            .await?;
-
-        // Record txid for idempotency and advance to the next step.
-        state.deposit_txid = Some(tx_id);
-        state.step = CexStep::Trade;
-
-        Ok(())
+        // Phase B: transfer already sent -> just check whether it is now credited.
+        self.check_deposit(state).await
     }
 
     async fn trade(&self, state: &mut CexState) -> Result<(), String> {
@@ -260,20 +308,14 @@ where
             .ok_or_else(|| "missing liquidation_result in receipt".to_string())?;
 
         // Receive side: whatever debt was repaid for this liquidation.
-        let receive_amount = liq.amounts.debt_repaid.clone();
+        let receive_amount = state.size_out.clone();
 
         // Pay side: seized collateral we sent in, as recorded on the CEX state.
-        let pay_amount = state.size_in.value.clone();
+        let pay_amount = state.size_in.clone();
 
         // Compute an effective execution price in native units: receive / pay.
-        let pay_f = pay_amount
-            .0
-            .to_f64()
-            .ok_or_else(|| "could not convert pay amount to f64".to_string())?;
-        let recv_f = receive_amount
-            .0
-            .to_f64()
-            .ok_or_else(|| "could not convert receive amount to f64".to_string())?;
+        let pay_f = pay_amount.to_f64();
+        let recv_f = receive_amount.clone().expect("receive amount missing").to_f64();
 
         let exec_price = if pay_f > 0.0 { recv_f / pay_f } else { 0.0 };
 
@@ -292,9 +334,9 @@ where
             request_id: 0,
             status: "completed".to_string(),
             pay_asset: state.deposit_asset.asset_id(),
-            pay_amount,
+            pay_amount: pay_amount.value,
             receive_asset: state.withdraw_asset.asset_id(),
-            receive_amount,
+            receive_amount: receive_amount.unwrap().value,
             mid_price: exec_price,
             exec_price,
             slippage: 0.0,
