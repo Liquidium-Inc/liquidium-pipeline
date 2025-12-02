@@ -1,425 +1,307 @@
-// use async_trait::async_trait;
-// use liquidium_pipeline_core::account::model::ChainAccount;
-// use liquidium_pipeline_core::transfer::actions::TransferActions;
-// use std::sync::Arc;
-// use std::time::{Duration, Instant};
+use std::sync::Arc;
 
-// use liquidium_pipeline_connectors::backend::cex_backend::CexBackend;
-// use liquidium_pipeline_core::tokens::token_registry::{TokenRegistry, TokenRegistryTrait};
-// use log::info;
-// use num_traits::ToPrimitive;
+use async_trait::async_trait;
+use candid::Principal;
+use icrc_ledger_types::icrc1::account::Account;
+use liquidium_pipeline_connectors::backend::cex_backend::CexBackend;
+use liquidium_pipeline_core::{
+    account::model::ChainAccount, tokens::chain_token_amount::ChainTokenAmount,
+    transfer::transfer_service::TransferService,
+};
+use log::debug;
+use serde::{Deserialize, Serialize};
 
-// use crate::config::Config;
-// use crate::{
-//     persistance::{LiqResultRecord, ResultStatus, WalStore, now_secs},
-//     swappers::{
-//         model::{SwapExecution, SwapRequest},
-//         swap_interface::SwapInterface,
-//     },
-// };
-// use serde_json::json;
-// use tokio::time::sleep;
+use crate::{
+    finalizers::cex_finalizer::{CexFinalizerLogic, CexState, CexStep},
+    stages::executor::ExecutionReceipt,
+    swappers::model::SwapExecution,
+};
 
-// #[async_trait]
-// pub trait CexBridge: Send + Sync {
-//     async fn execute_roundtrip(&self, liq_id: &str, idx: i32, req: &SwapRequest) -> Result<(), String>;
-// }
+use num_traits::ToPrimitive;
 
-// pub struct MexcBridge<D, X>
-// where
-//     D: WalStore,
-//     X: CexBackend,
-// {
-//     pub config: Arc<Config>,
-//     pub db: Arc<D>,
-//     pub ccxt: Arc<X>,
-//     pub registry: Arc<TokenRegistry>,
-//     pub accounts: Arc<dyn TransferActions + Send + Sync>,
-//     pub swapper: Arc<dyn SwapInterface + Send + Sync>,
-// }
+/// MEXC-specific implementation of the generic CEX finalizer logic.
+///
+/// This is a thin state machine wrapper around the generic `CexState`:
+/// - `prepare` initializes the state from a liquidation id / receipt plus static config
+/// - `deposit` transitions Deposit -> Trade
+/// - `trade` transitions Trade -> Withdraw
+/// - `withdraw` transitions Withdraw -> Completed
+pub struct MexcFinalizer<B>
+where
+    B: CexBackend,
+{
+    pub backend: Arc<B>,
+    pub transfer_service: Arc<TransferService>,
+}
 
-// impl<D, X> MexcBridge<D, X>
-// where
-//     D: WalStore,
-//     X: CexBackend,
-// {
-//     pub fn new(
-//         config: Arc<Config>,
-//         db: Arc<D>,
-//         ccxt: Arc<X>,
-//         registry: Arc<TokenRegistry>,
-//         accounts: Arc<dyn TransferActions + Send + Sync>,
-//         swapper: Arc<dyn SwapInterface + Send + Sync>,
-//     ) -> Self {
-//         Self {
-//             config,
-//             db,
-//             ccxt,
-//             registry,
-//             accounts,
-//             swapper,
-//         }
-//     }
+impl<B> MexcFinalizer<B>
+where
+    B: CexBackend,
+{
+    pub fn new(backend: Arc<B>, transfer_service: Arc<TransferService>) -> Self {
+        Self {
+            backend,
+            transfer_service,
+        }
+    }
+}
 
-//     async fn journal(
-//         &self,
-//         liq_id: &str,
-//         step: &str,
-//         status: ResultStatus,
-//         req: &SwapRequest,
-//         swap: Option<&SwapExecution>,
-//         last_error: Option<&str>,
-//     ) -> Result<(), String> {
-//         let existing = self
-//             .db
-//             .get_result(liq_id)
-//             .await
-//             .map_err(|e| format!("wal get_result failed: {e}"))?;
+#[async_trait]
+impl<B> CexFinalizerLogic for MexcFinalizer<B>
+where
+    B: CexBackend,
+{
+    async fn prepare(&self, liq_id: &str, receipt: &ExecutionReceipt) -> Result<CexState, String> {
+        let amount = &receipt
+            .liquidation_result
+            .as_ref()
+            .expect("liq result unaavailable")
+            .amounts
+            .collateral_received;
 
-//         let created_at = existing.as_ref().map(|r| r.created_at).unwrap_or_else(now_secs);
-//         let attempt = existing.as_ref().map(|r| r.attempt).unwrap_or(0);
+        let size_in = ChainTokenAmount {
+            token: receipt.request.collateral_asset.clone(),
+            value: amount.clone(),
+        };
 
-//         let receive_amount = swap.map(|s| s.receive_amount.0.to_string());
+        Ok(CexState {
+            liq_id: liq_id.to_string(),
+            step: CexStep::Deposit,
+            last_error: None,
 
-//         let meta = json!({
-//             "type": "mexc_cex_leg",
-//             "step": step,
-//             "pay_asset": {
-//                 "chain": req.pay_asset.chain,
-//                 "symbol": req.pay_asset.symbol,
-//             },
-//             "receive_asset": {
-//                 "chain": req.receive_asset.chain,
-//                 "symbol": req.receive_asset.symbol,
-//             },
-//             "pay_amount": req.pay_amount,
-//             "receive_amount": receive_amount,
-//             "last_error": last_error,
-//         });
+            // deposit leg
+            deposit_asset: receipt.request.collateral_asset.clone(),
+            deposit_txid: None,
 
-//         let row = LiqResultRecord {
-//             liq_id: liq_id.to_string(),
-//             status,
-//             attempt,
-//             created_at,
-//             updated_at: now_secs(),
-//             meta_json: meta.to_string(),
-//         };
+            // trade leg
+            market: format!(
+                "{}_{}",
+                receipt.request.collateral_asset.symbol(),
+                receipt.request.debt_asset.symbol()
+            ),
+            side: "sell".to_string(),
+            size_in,
 
-//         self.db
-//             .upsert_result(row)
-//             .await
-//             .map_err(|e| format!("wal journal failed: {e}"))
-//     }
+            // withdraw leg
+            withdraw_asset: receipt.request.debt_asset.clone(),
+            withdraw_address: receipt.request.liquidation.receiver_address.to_text(),
+            withdraw_id: None,
+            withdraw_txid: None,
+            size_out: None,
+        })
+    }
 
-//     async fn wait_for_credit(
-//         &self,
-//         liq_id: &str,
-//         idx: i32,
-//         req: &SwapRequest,
-//         asset_symbol: &str,
-//         start_balance: f64,
-//     ) -> Result<(), String> {
-//         let required = req.pay_amount.to_f64();
+    async fn deposit(&self, state: &mut CexState) -> Result<(), String> {
+        debug!(
+            "[mexc] liq_id={} step=Deposit asset={} network={}",
+            state.liq_id,
+            state.deposit_asset,
+            state.deposit_asset.chain()
+        );
 
-//         let timeout = Duration::from_secs(6000);
-//         let wait_start = Instant::now();
+        // Idempotency: if we already recorded a deposit txid, just move on.
+        if state.deposit_txid.is_some() {
+            debug!(
+                "[mexc] liq_id={} deposit already recorded (txid={:?}), skipping",
+                state.liq_id, state.deposit_txid
+            );
+            state.step = CexStep::Trade;
+            return Ok(());
+        }
 
-//         loop {
-//             let bal = self
-//                 .ccxt
-//                 .get_balance(asset_symbol)
-//                 .await
-//                 .map_err(|e| format!("failed to get MEXC balance: {}", e))?;
+        // Ask MEXC for the deposit address for this asset/network.
+        let addr = self
+            .backend
+            .get_deposit_address(&state.deposit_asset.symbol(), &state.deposit_asset.chain())
+            .await?;
 
-//             info!(
-//                 "MEXC bridge: current MEXC balance for {} is {} (required {})",
-//                 asset_symbol,
-//                 bal - start_balance,
-//                 required
-//             );
+        debug!(
+            "[mexc] liq_id={} got deposit address={} tag={:?}",
+            state.liq_id, addr.address, addr.tag
+        );
 
-//             if bal - start_balance >= required - 0.000001 {
-//                 let elapsed = wait_start.elapsed();
-//                 info!(
-//                     "MEXC bridge: deposit credited on MEXC after {:?}, proceeding to swap",
-//                     elapsed
-//                 );
-//                 self.journal(liq_id, "CexCredited", ResultStatus::InFlight, req, None, None)
-//                     .await?;
-//                 break;
-//             }
+        // Amount to send to MEXC (seized collateral).
+        let amount = &state.size_in;
 
-//             if Instant::now().duration_since(wait_start) > timeout {
-//                 let msg = "timeout waiting for MEXC deposit credit".to_string();
-//                 self.journal(
-//                     liq_id,
-//                     "CreditTimeout",
-//                     ResultStatus::FailedRetryable,
-//                     req,
-//                     None,
-//                     Some(&msg),
-//                 )
-//                 .await?;
-//                 return Err(msg);
-//             }
+        assert_eq!(addr.asset, state.deposit_asset.symbol(), "deposit address mismatch");
 
-//             sleep(Duration::from_secs(10)).await;
-//         }
+        let actions = self.transfer_service.actions();
+        let tx_id = actions
+            .transfer(
+                &state.deposit_asset,
+                &ChainAccount::Icp(Account {
+                    owner: Principal::from_text(addr.address).expect("could not decode deposit address"),
+                    subaccount: None,
+                }),
+                amount.value.clone(),
+            )
+            .await?;
 
-//         Ok(())
-//     }
+        // Record txid for idempotency and advance to the next step.
+        state.deposit_txid = Some(tx_id);
+        state.step = CexStep::Trade;
 
-//     async fn step_ic_deposit(
-//         &self,
-//         liq_id: &str,
-//         idx: i32,
-//         req: &SwapRequest,
-//         asset_in: &str,
-//         mexc_deposit_account: &str,
-//     ) -> Result<(), String> {
-//         let deposit_start = Instant::now();
-//         info!(
-//             "MEXC bridge: sending deposit of {} {} to {:?} (IC inbox)",
-//             req.pay_amount.formatted(),
-//             asset_in,
-//             mexc_deposit_account
-//         );
+        Ok(())
+    }
 
-//         let dep_account = ChainAccount::Evm(mexc_deposit_account.to_string());
+    async fn trade(&self, state: &mut CexState) -> Result<(), String> {
+        debug!(
+            "[mexc] liq_id={} step=Trade market={} side={} size_in={}",
+            state.liq_id,
+            state.market,
+            state.side,
+            state.size_in.formatted(),
+        );
 
-//         let transfer_in = self
-//             .registry
-//             .resolve(&req.pay_asset)
-//             .map_err(|e| format!("token registry resolve failed: {}", e))?;
+        let amount_in = state.size_in.to_f64();
 
-//         if let Err(e) = self
-//             .accounts
-//             .transfer(&transfer_in, &dep_account, req.pay_amount.value.clone())
-//             .await
-//         {
-//             let msg = format!("ICRC deposit failed: {}", e);
-//             self.journal(
-//                 liq_id,
-//                 "DepositFailed",
-//                 ResultStatus::FailedRetryable,
-//                 req,
-//                 None,
-//                 Some(&msg),
-//             )
-//             .await?;
-//             return Err(msg);
-//         }
+        if amount_in <= 0.0 {
+            debug!(
+                "[mexc] liq_id={} trade skipped: non-positive amount_in={}",
+                state.liq_id, amount_in
+            );
+            // Nothing to trade, move on to Withdraw leg (or you could keep it at Trade).
+            state.step = CexStep::Withdraw;
+            return Ok(());
+        }
 
-//         let deposit_done = Instant::now();
-//         info!(
-//             "MEXC bridge: deposit step took {:?}",
-//             deposit_done.duration_since(deposit_start)
-//         );
+        // Execute the spot trade on MEXC. The backend is responsible for:
+        // - placing the order (market)
+        // - handling partial fills / retries
+        // - updating internal CEX balances
+        let filled = self.backend.execute_swap(&state.market, &state.side, amount_in).await?;
 
-//         self.journal(liq_id, "DepositSent", ResultStatus::InFlight, req, None, None)
-//             .await?;
+        debug!(
+            "[mexc] liq_id={} trade executed: market={} side={} amount_in={} filled={}",
+            state.liq_id, state.market, state.side, amount_in, filled
+        );
 
-//         Ok(())
-//     }
+        // For now we don't feed `filled` back into on-chain amounts; withdraw leg
+        // can either use backend-specific balance checks or later extend CexState
+        // with an explicit post-trade amount.
+        state.step = CexStep::Withdraw;
 
-//     async fn step_swap(
-//         &self,
-//         liq_id: &str,
-//         idx: i32,
-//         req: &SwapRequest,
-//         asset_in: &str,
-//         asset_out: &str,
-//     ) -> Result<SwapExecution, String> {
-//         let swap_start = Instant::now();
-//         info!("MEXC bridge: executing swap on MEXC {} -> {}", asset_in, asset_out);
+        state.size_out = Some(ChainTokenAmount::from_formatted(state.withdraw_asset.clone(), filled));
+        Ok(())
+    }
 
-//         let swap_reply = match self.swapper.execute(req).await {
-//             Ok(s) => s,
-//             Err(e) => {
-//                 let msg = format!("MEXC swap failed: {}", e);
-//                 self.journal(
-//                     liq_id,
-//                     "SwapFailed",
-//                     ResultStatus::FailedRetryable,
-//                     req,
-//                     None,
-//                     Some(&msg),
-//                 )
-//                 .await?;
-//                 return Err(msg);
-//             }
-//         };
+    async fn withdraw(&self, state: &mut CexState) -> Result<(), String> {
+        debug!(
+            "[mexc] liq_id={} step=Withdraw asset={} network={} address={}",
+            state.liq_id,
+            state.withdraw_asset,
+            state.withdraw_asset.chain(),
+            state.withdraw_address,
+        );
 
-//         let swap_done = Instant::now();
-//         info!("MEXC bridge: swap step took {:?}", swap_done.duration_since(swap_start));
+        // Idempotency: if we already have a withdraw id or txid, just advance.
+        if state.withdraw_id.is_some() || state.withdraw_txid.is_some() {
+            debug!(
+                "[mexc] liq_id={} withdraw already recorded (id={:?}, txid={:?}), skipping",
+                state.liq_id, state.withdraw_id, state.withdraw_txid,
+            );
+            state.step = CexStep::Completed;
+            return Ok(());
+        }
 
-//         self.journal(
-//             liq_id,
-//             "SwapDone",
-//             ResultStatus::InFlight,
-//             req,
-//             Some(&swap_reply),
-//             None,
-//         )
-//         .await?;
+        // Amount to withdraw. For now, reuse the size_in amount expressed in withdraw-asset units.
+        // Later we can switch to a post-trade amount or explicit CEX balance if needed.
+        let amount = state.size_in.to_f64();
 
-//         Ok(swap_reply)
-//     }
+        if amount <= 0.0 {
+            return Err(format!(
+                "withdrawal amount is zero or negative for liq_id {} (amount={})",
+                state.liq_id, amount
+            ));
+        }
 
-//     async fn step_withdraw(
-//         &self,
-//         liq_id: &str,
-//         idx: i32,
-//         req: &SwapRequest,
-//         asset_out: &str,
-//         withdraw_target: &str,
-//         swap_reply: &SwapExecution,
-//     ) -> Result<(), String> {
-//         let out_amount_f64 = {
-//             let u = swap_reply
-//                 .receive_amount
-//                 .0
-//                 .to_u128()
-//                 .ok_or("receive_amount too large for f64")?;
-//             u as f64
-//         };
+        // Execute withdrawal on MEXC via the backend.
+        let receipt = self
+            .backend
+            .withdraw(
+                &state.withdraw_asset.symbol(),
+                &state.withdraw_asset.chain(),
+                &state.withdraw_address,
+                amount,
+            )
+            .await?;
 
-//         let withdraw_start = Instant::now();
-//         info!(
-//             "MEXC bridge: withdrawing {} {} back to {}",
-//             out_amount_f64, asset_out, withdraw_target
-//         );
+        debug!(
+            "[mexc] liq_id={} withdraw executed: asset={} network={} amount={} txid={:?} internal_id={:?}",
+            state.liq_id,
+            state.withdraw_asset.symbol(),
+            state.withdraw_asset.chain(),
+            amount,
+            receipt.txid,
+            receipt.internal_id,
+        );
 
-//         if let Err(e) = self
-//             .ccxt
-//             .withdraw(
-//                 &req.receive_asset.symbol,
-//                 &req.receive_asset.chain,
-//                 withdraw_target,
-//                 out_amount_f64,
-//             )
-//             .await
-//         {
-//             let msg = format!("MEXC withdraw failed: {}", e);
-//             self.journal(
-//                 liq_id,
-//                 "WithdrawFailed",
-//                 ResultStatus::FailedRetryable,
-//                 req,
-//                 Some(swap_reply),
-//                 Some(&msg),
-//             )
-//             .await?;
-//             return Err(msg);
-//         }
+        // Persist identifiers for idempotency.
+        state.withdraw_id = receipt.internal_id.clone();
+        state.withdraw_txid = receipt.txid.clone();
 
-//         let withdraw_done = Instant::now();
-//         info!(
-//             "MEXC bridge: withdraw step took {:?}",
-//             withdraw_done.duration_since(withdraw_start)
-//         );
+        // Mark the CEX leg as completed.
+        state.step = CexStep::Completed;
+        Ok(())
+    }
 
-//         self.journal(
-//             liq_id,
-//             "WithdrawSent",
-//             ResultStatus::Succeeded,
-//             req,
-//             Some(swap_reply),
-//             None,
-//         )
-//         .await?;
+    async fn finish(&self, receipt: &ExecutionReceipt, state: &CexState) -> Result<SwapExecution, String> {
+        // We treat the CEX cycle as a single synthetic swap:
+        //  - pay: seized collateral that was sent to MEXC (deposit leg)
+        //  - receive: amount of debt that was actually repaid on-chain
+        //
+        // This keeps the semantics aligned with the DEX path, where SwapExecution
+        // represents "how much did we pay vs how much did we receive" for
+        // a given liquidation.
 
-//         Ok(())
-//     }
-// }
+        let liq = receipt
+            .liquidation_result
+            .as_ref()
+            .ok_or_else(|| "missing liquidation_result in receipt".to_string())?;
 
-// #[async_trait]
-// impl<D, X> CexBridge for MexcBridge<D, X>
-// where
-//     D: WalStore,
-//     X: CexBackend,
-// {
-//     async fn execute_roundtrip(&self, liq_id: &str, idx: i32, req: &SwapRequest) -> Result<(), String> {
-//         let asset_in = req.pay_asset.clone();
-//         let asset_out = req.receive_asset.clone();
+        // Receive side: whatever debt was repaid for this liquidation.
+        let receive_amount = liq.amounts.debt_repaid.clone();
 
-//         self.journal(liq_id, "Created", ResultStatus::Enqueued, req, None, None)
-//             .await?;
+        // Pay side: seized collateral we sent in, as recorded on the CEX state.
+        let pay_amount = state.size_in.value.clone();
 
-//         info!(
-//             "MEXC bridge: starting cross-cex swap {} -> {} (amount {})",
-//             asset_in,
-//             asset_out,
-//             req.pay_amount.formatted()
-//         );
-//         let t0 = Instant::now();
+        // Compute an effective execution price in native units: receive / pay.
+        let pay_f = pay_amount
+            .0
+            .to_f64()
+            .ok_or_else(|| "could not convert pay amount to f64".to_string())?;
+        let recv_f = receive_amount
+            .0
+            .to_f64()
+            .ok_or_else(|| "could not convert receive amount to f64".to_string())?;
 
-//         let dep = self
-//             .ccxt
-//             .get_deposit_address(&asset_in.symbol, &asset_in.chain)
-//             .await
-//             .map_err(|e| format!("failed to fetch MEXC deposit address: {}", e))?;
+        let exec_price = if pay_f > 0.0 { recv_f / pay_f } else { 0.0 };
 
-//         info!("using deposit address {:?}", dep);
+        // We do not have a separate mid-price or detailed legs from MEXC here,
+        // so we approximate:
+        //  - mid_price == exec_price
+        //  - slippage == 0.0
+        //  - legs == empty (single synthetic hop via MEXC)
+        //
+        // swap_id / request_id are set to 0 for now since there is no natural
+        // mapping from the CEX API to these fields yet. If you later add a
+        // CEX-side id, you can thread it into CexState and use it here.
 
-//         let mexc_ic_deposit_account = dep.address.clone();
+        let exec = SwapExecution {
+            swap_id: 0,
+            request_id: 0,
+            status: "completed".to_string(),
+            pay_asset: state.deposit_asset.asset_id(),
+            pay_amount,
+            receive_asset: state.withdraw_asset.asset_id(),
+            receive_amount,
+            mid_price: exec_price,
+            exec_price,
+            slippage: 0.0,
+            legs: Vec::new(),
+            ts: 0,
+        };
 
-//         self.step_ic_deposit(liq_id, idx, req, &asset_in.symbol, &mexc_ic_deposit_account)
-//             .await?;
-
-//         let bal = self
-//             .ccxt
-//             .get_balance(&asset_in.symbol)
-//             .await
-//             .map_err(|e| format!("failed to get MEXC balance: {}", e))?;
-
-//         self.wait_for_credit(liq_id, idx, req, &asset_in.symbol, bal).await?;
-
-//         // let swap_reply = self
-//         //     .step_swap(liq_id, idx, req, &asset_in.symbol, &asset_out.symbol)
-//         //     .await?;
-
-//         let withdraw_target = req.receive_address.clone().unwrap();
-
-//         info!("[] Sending to addr {} ", withdraw_target);
-
-//         // self.step_withdraw(liq_id, idx, req, &asset_in.symbol, &withdraw_target, &swap_reply)
-//         //     .await?;
-
-//         let _ = self
-//             .ccxt
-//             .withdraw(&req.receive_asset.symbol, "ARB", &withdraw_target, 1.0)
-//             .await
-//             .map_err(|e| e.to_string())?;
-
-//         let withdraw_done = Instant::now();
-//         info!(
-//             "MEXC bridge: total mexc leg took {:?}",
-//             withdraw_done.duration_since(t0)
-//         );
-
-//         Ok(())
-//     }
-// }
-
-// pub struct MexcFinalizer<B>
-// where
-//     B: CexBridge,
-// {
-//     pub bridge: Arc<B>,
-// }
-
-// impl<B> MexcFinalizer<B>
-// where
-//     B: CexBridge,
-// {
-//     pub fn new(bridge: Arc<B>) -> Self {
-//         Self { bridge }
-//     }
-
-//     // High-level flow delegating to the bridge
-//     pub async fn execute_mexc_swap(&self, liq_id: &str, idx: i32, swap_args: SwapRequest) -> Result<(), String> {
-//         self.bridge.execute_roundtrip(liq_id, idx, &swap_args).await
-//     }
-// }
+        Ok(exec)
+    }
+}

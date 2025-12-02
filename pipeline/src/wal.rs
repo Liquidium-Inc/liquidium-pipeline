@@ -36,7 +36,6 @@ pub fn liq_id_from_receipt(receipt: &ExecutionReceipt) -> Result<String, String>
 //
 // WAL wrappers for finalizer
 //
-
 pub async fn wal_load(wal: &dyn WalStore, liq_id: &str) -> Result<Option<LiqResultRecord>, String> {
     wal.get_result(liq_id).await.map_err(|e| e.to_string())
 }

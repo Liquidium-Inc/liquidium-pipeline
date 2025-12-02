@@ -1,5 +1,8 @@
 use anyhow::Result;
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
+
+use crate::finalizers::liquidation_outcome::LiquidationOutcome;
 pub mod sqlite;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
