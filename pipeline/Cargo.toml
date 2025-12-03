@@ -66,6 +66,7 @@ ed25519-dalek = "2"
 rust_decimal = "1.39.0"
 k256 = "0.13.0"
 ic-ledger-types = "0.15.0"
+hex = "0.4.2"
 
 
 [dev-dependencies]

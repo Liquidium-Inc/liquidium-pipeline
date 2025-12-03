@@ -3562,6 +3562,7 @@ dependencies = [
  "ed25519-dalek",
  "env_logger",
  "futures",
+ "hex",
  "ic-agent",
  "ic-ledger-types",
  "ic_principal",

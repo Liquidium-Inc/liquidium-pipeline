@@ -30,7 +30,7 @@ impl SqliteWalStore {
 
     fn to_row(r: &LiqResultRecord) -> Row {
         Row {
-            liq_id: r.liq_id.clone(),
+            liq_id: r.id.clone(),
             status: r.status as i32,
             attempt: r.attempt,
             created_at: r.created_at,
@@ -41,7 +41,7 @@ impl SqliteWalStore {
 
     fn from_row(r: Row) -> LiqResultRecord {
         LiqResultRecord {
-            liq_id: r.liq_id,
+            id: r.liq_id,
             status: match r.status {
                 0 => ResultStatus::Enqueued,
                 1 => ResultStatus::InFlight,

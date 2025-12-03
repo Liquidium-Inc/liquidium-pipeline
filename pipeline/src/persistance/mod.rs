@@ -1,8 +1,8 @@
 use anyhow::Result;
 use async_trait::async_trait;
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use serde::Serialize;
 
-use crate::finalizers::liquidation_outcome::LiquidationOutcome;
+use crate::stages::executor::ExecutionReceipt;
 pub mod sqlite;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -15,9 +15,15 @@ pub enum ResultStatus {
     FailedPermanent = 4,
 }
 
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
+pub struct LiqMetaWrapper {
+    pub receipt: ExecutionReceipt,
+    pub meta: Vec<u8>,
+}
+
 #[derive(Debug, Clone)]
 pub struct LiqResultRecord {
-    pub liq_id: String,
+    pub id: String,
     pub status: ResultStatus,
     pub attempt: i32,
     pub created_at: i64,

@@ -7,20 +7,19 @@ use crate::{persistance::WalStore, stages::executor::ExecutionReceipt, swappers:
 pub struct FinalizerResult {
     // Optional swap; non-swap finalizers can leave this as None
     pub swap_result: Option<SwapExecution>,
-    // You can add more fields later (tx ids, extra fees, etc) if needed
+    pub finalized: bool,
 }
 
 impl FinalizerResult {
     pub fn noop() -> Self {
-        Self { swap_result: None }
+        Self {
+            swap_result: None,
+            finalized: false,
+        }
     }
 }
 
 #[async_trait]
 pub trait Finalizer: Send + Sync {
-    async fn finalize(
-        &self,
-        wal: &dyn WalStore,
-        receipt: Vec<ExecutionReceipt>,
-    ) -> Result<Vec<FinalizerResult>, String>;
+    async fn finalize(&self, wal: &dyn WalStore, receipt: ExecutionReceipt) -> Result<FinalizerResult, String>;
 }

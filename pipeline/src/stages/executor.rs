@@ -3,15 +3,14 @@ use candid::Encode;
 
 use futures::{TryFutureExt, future::join_all};
 use log::{debug, warn};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 use crate::{
     executors::{basic::basic_executor::BasicExecutor, executor::ExecutorRequest},
     finalizers::{finalizer::FinalizerResult, liquidation_outcome::LiquidationOutcome},
     persistance::{LiqResultRecord, WalStore},
     stage::PipelineStage,
-    utils::now_ts,
-    wal::{encode_meta, liq_id_from_receipt},
+    utils::now_ts, wal::{encode_meta, liq_id_from_receipt},
 };
 use liquidium_pipeline_connectors::pipeline_agent::PipelineAgent;
 
@@ -49,6 +48,7 @@ pub struct ExecutionReceipt {
     pub status: ExecutionStatus,
     pub change_received: bool,
 }
+
 #[async_trait]
 impl<'a, A: PipelineAgent, D: WalStore> PipelineStage<'a, Vec<ExecutorRequest>, Vec<ExecutionReceipt>>
     for BasicExecutor<A, D>
@@ -149,14 +149,15 @@ impl<A: PipelineAgent, D: WalStore> BasicExecutor<A, D> {
         };
 
         let mut result_record = LiqResultRecord {
-            liq_id,
+            id: liq_id,
             status: crate::persistance::ResultStatus::Enqueued,
             attempt: 0,
             created_at: now_ts(),
             updated_at: now_ts(),
             meta_json: "{}".to_string(),
         };
-        let _ = encode_meta(&mut result_record, &outcome);
+        let _ = encode_meta(&mut result_record, &receipt);
         self.wal.upsert_result(result_record).map_err(|e| e.to_string()).await
     }
 }
+

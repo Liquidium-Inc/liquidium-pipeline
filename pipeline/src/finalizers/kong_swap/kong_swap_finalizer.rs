@@ -42,7 +42,7 @@ mod tests {
 
     use crate::executors::executor::ExecutorRequest;
     use crate::finalizers::finalizer::Finalizer;
-    use crate::persistance::{LiqResultRecord, MockWalStore, ResultStatus};
+    use crate::persistance::MockWalStore;
     use crate::stages::executor::{ExecutionReceipt, ExecutionStatus};
     use crate::swappers::model::{SwapExecution, SwapRequest};
     use crate::swappers::swap_interface::MockSwapInterface;
@@ -217,137 +217,44 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn kong_finalize_idempotent_succeeded_skips_swap_and_reads_wal() {
-        use mockall::predicate::eq;
-
-        let mut wal = MockWalStore::new();
+    async fn kong_finalize_uses_swap_args_and_sets_swap_result() {
+        let wal = MockWalStore::new();
         let mut swapper = MockSwapInterface::new();
 
-        // No swap should be executed when WAL already has Succeeded
-        swapper.expect_execute().times(0);
+        swapper
+            .expect_execute()
+            .times(1)
+            .returning(|req: &SwapRequest| {
+                // basic sanity: finalize passes the swap_args through to the swapper
+                assert_eq!(req.pay_asset.symbol, "ckBTC");
+                assert_eq!(req.receive_asset.symbol, "ckUSDT");
+                Ok(make_test_swap_execution())
+            });
 
         let finalizer = KongSwapFinalizer {
             swapper: Arc::new(swapper),
         };
 
         let receipt = make_execution_receipt(42);
-        let swap_exec = make_test_swap_execution();
 
-        // Encode meta_json as production does
-        let meta_json = serde_json::json!({
-            "swap": swap_exec
-        })
-        .to_string();
-
-        wal.expect_get_result().with(eq("42")).returning(move |_| {
-            Ok(Some(LiqResultRecord {
-                liq_id: "42".to_string(),
-                status: ResultStatus::Succeeded,
-                attempt: 3,
-                created_at: 0,
-                updated_at: 0,
-                meta_json: meta_json.clone(),
-            }))
-        });
-
-        // Call batch finalizer with a single receipt
-        let results = finalizer
-            .finalize(&wal, std::slice::from_ref(&receipt).to_vec())
+        let result = finalizer
+            .finalize(&wal, receipt)
             .await
             .expect("finalize should succeed");
 
-        assert_eq!(results.len(), 1);
-        // On idempotent path we expect to read back the swap from WAL
-        assert_eq!(results[0].swap_result.as_ref().unwrap().swap_id, swap_exec.swap_id);
+        let swap = result.swap_result.expect("swap_result should be present");
+        assert_eq!(swap.swap_id, 1);
+        assert_eq!(swap.pay_asset.symbol, "ckBTC");
+        assert_eq!(swap.receive_asset.symbol, "ckUSDT");
     }
 
     #[tokio::test]
-    async fn kong_finalize_retryable_then_success_updates_wal_and_stores_meta() {
-        use mockall::predicate::eq;
-
-        let mut wal = MockWalStore::new();
+    async fn kong_finalize_propagates_swap_errors() {
+        let wal = MockWalStore::new();
         let mut swapper = MockSwapInterface::new();
 
-        let swap_exec = make_test_swap_execution();
-
-        // 1. WAL: get_result returns FailedRetryable row for liq_id 43
-        wal.expect_get_result().with(eq("43")).returning(|_| {
-            Ok(Some(LiqResultRecord {
-                liq_id: "43".to_string(),
-                status: ResultStatus::FailedRetryable,
-                attempt: 1,
-                created_at: 0,
-                updated_at: 0,
-                meta_json: "{}".to_string(),
-            }))
-        });
-
-        // 2. WAL: mark InFlight
-        wal.expect_update_status()
-            .with(eq("43"), eq(ResultStatus::InFlight), eq(true))
-            .returning(|_, _, _| Ok(()));
-
-        // 3. WAL: upsert_result with Succeeded and non-empty meta_json
-        wal.expect_upsert_result().times(1).returning(|row: LiqResultRecord| {
-            assert_eq!(row.status, ResultStatus::Succeeded);
-            assert!(!row.meta_json.is_empty());
-            Ok(())
-        });
-
-        // 4. Swap: execute once and return swap_exec
         swapper
             .expect_execute()
-            .times(1)
-            .returning(move |_req: &SwapRequest| Ok(swap_exec.clone()));
-
-        let finalizer = KongSwapFinalizer {
-            swapper: Arc::new(swapper),
-        };
-
-        let receipt = make_execution_receipt(43);
-
-        let results = finalizer
-            .finalize(&wal, std::slice::from_ref(&receipt).to_vec())
-            .await
-            .expect("finalize should succeed");
-
-        assert_eq!(results.len(), 1);
-        assert!(results[0].swap_result.is_some());
-    }
-
-    #[tokio::test]
-    async fn kong_finalize_marks_failed_permanent_after_too_many_attempts() {
-        use mockall::predicate::eq;
-
-        let mut wal = MockWalStore::new();
-        let mut swapper = MockSwapInterface::new();
-
-        // WAL: get_result returns a FailedRetryable row with high attempt count for liq_id 44
-        wal.expect_get_result().with(eq("44")).returning(|_| {
-            Ok(Some(LiqResultRecord {
-                liq_id: "44".to_string(),
-                status: ResultStatus::FailedRetryable,
-                attempt: 5, // assuming MAX_FINALIZER_ATTEMPTS = 5
-                created_at: 0,
-                updated_at: 0,
-                meta_json: "{}".to_string(),
-            }))
-        });
-
-        // First mark InFlight
-        wal.expect_update_status()
-            .with(eq("44"), eq(ResultStatus::InFlight), eq(true))
-            .returning(|_, _, _| Ok(()));
-
-        // Then mark FailedPermanent after swap error
-        wal.expect_update_status()
-            .with(eq("44"), eq(ResultStatus::FailedPermanent), eq(true))
-            .returning(|_, _, _| Ok(()));
-
-        // Swap: execute fails once
-        swapper
-            .expect_execute()
-            .times(1)
             .returning(|_req: &SwapRequest| Err("boom".to_string()));
 
         let finalizer = KongSwapFinalizer {
@@ -357,7 +264,7 @@ mod tests {
         let receipt = make_execution_receipt(44);
 
         let err = finalizer
-            .finalize(&wal, std::slice::from_ref(&receipt).to_vec())
+            .finalize(&wal, receipt)
             .await
             .expect_err("finalize should fail");
 

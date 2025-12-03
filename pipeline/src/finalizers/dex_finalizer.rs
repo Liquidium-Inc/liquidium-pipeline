@@ -1,18 +1,13 @@
 use async_trait::async_trait;
-use log::{debug, warn};
+use log::debug;
 
 use crate::{
     finalizers::finalizer::{Finalizer, FinalizerResult},
-    persistance::{ResultStatus, WalStore},
+    persistance::WalStore,
     stages::executor::{ExecutionReceipt, ExecutionStatus},
     swappers::model::{SwapExecution, SwapRequest},
-    wal::{
-        decode_meta, liq_id_from_receipt, wal_load, wal_mark_inflight, wal_mark_permanent_failed,
-        wal_mark_retryable_failed, wal_mark_succeeded,
-    },
 };
 
-const MAX_FINALIZER_ATTEMPTS: i32 = 5;
 
 // Tunables
 const BASE_SLIPPAGE_BPS: u32 = 7500; // 0.75%
@@ -58,75 +53,24 @@ impl<T> Finalizer for T
 where
     T: DexFinalizerLogic,
 {
-    async fn finalize(
-        &self,
-        wal: &dyn WalStore,
-        receipts: Vec<ExecutionReceipt>,
-    ) -> Result<Vec<FinalizerResult>, String> {
-        let mut out = Vec::with_capacity(receipts.len());
-
-        for receipt in receipts {
-            // Only finalize successful executions
-            if !matches!(receipt.status, ExecutionStatus::Success) {
-                out.push(FinalizerResult::noop());
-                continue;
-            }
-
-            // If no swap is needed, noop
-            let Some(swap_req) = &receipt.request.swap_args else {
-                out.push(FinalizerResult::noop());
-                continue;
-            };
-
-            let liq_id = liq_id_from_receipt(&receipt)?;
-
-            let (row, mut outcome) = if let Some(row) = wal_load(wal, &liq_id).await? {
-                let row = match row.status {
-                    ResultStatus::Succeeded => {
-                        continue;
-                    }
-                    ResultStatus::Enqueued | ResultStatus::InFlight | ResultStatus::FailedRetryable => row,
-                    ResultStatus::FailedPermanent => {
-                        return Err(format!("invalid WAL state {:?} for liq_id {}", row.status, row.liq_id));
-                    }
-                };
-
-                let outcome = decode_meta(&row)?;
-
-                if outcome.is_none() {
-                    return Err("Could not decode liquidation outoome".to_string());
-                }
-                (row, outcome.unwrap())
-            } else {
-                warn!("Liquidation {} was not found in journal, skipping...", liq_id);
-                continue;
-            };
-
-            wal_mark_inflight(wal, &row.liq_id).await?;
-
-            let swap_exec = match self.swap_with_slippage_retry(swap_req.clone()).await {
-                Ok(s) => s,
-                Err(e) => {
-                    let next_attempt = row.attempt + 1;
-                    if next_attempt >= MAX_FINALIZER_ATTEMPTS {
-                        let _ = wal_mark_permanent_failed(wal, &row.liq_id).await;
-                    } else {
-                        let _ = wal_mark_retryable_failed(wal, &row.liq_id).await;
-                    }
-                    return Err(e);
-                }
-            };
-
-            let finlizer_result = FinalizerResult {
-                swap_result: Some(swap_exec),
-            };
-
-            outcome.finalizer_result = finlizer_result.clone();
-            wal_mark_succeeded(wal, row, outcome).await?;
-
-            out.push(finlizer_result)
+    async fn finalize(&self, _: &dyn WalStore, receipt: ExecutionReceipt) -> Result<FinalizerResult, String> {
+        // Only finalize successful executions
+        if !matches!(receipt.status, ExecutionStatus::Success) {
+            return Ok(FinalizerResult::noop());
         }
 
-        Ok(out)
+        // If no swap is needed, noop
+        let Some(swap_req) = &receipt.request.swap_args else {
+            return Ok(FinalizerResult::noop());
+        };
+
+        let swap_exec = self.swap_with_slippage_retry(swap_req.clone()).await?;
+
+        let finlizer_result = FinalizerResult {
+            swap_result: Some(swap_exec),
+            finalized: true
+        };
+
+        Ok(finlizer_result)
     }
 }
