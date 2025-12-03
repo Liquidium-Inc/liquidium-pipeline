@@ -12,7 +12,7 @@ use crate::{
     executors::basic::basic_executor::BasicExecutor,
     finalizers::{
         kong_swap::kong_swap_finalizer::KongSwapFinalizer, liquidation_outcome::LiquidationOutcome,
-        profit_calculator::PassthroughProfitCalculator,
+        profit_calculator::SimpleProfitCalculator,
     },
     liquidation::collateral_service::CollateralService,
     persistance::sqlite::SqliteWalStore,
@@ -55,7 +55,7 @@ async fn init(
     SimpleLiquidationStrategy<SwapRouter, Config, TokenRegistry, CollateralService<LiquidationPriceOracle<Agent>>>,
     Arc<BasicExecutor<Agent, SqliteWalStore>>,
     Arc<ExportStage>,
-    Arc<FinalizeStage<KongSwapFinalizer<SwapRouter>, SqliteWalStore, PassthroughProfitCalculator>>,
+    Arc<FinalizeStage<KongSwapFinalizer<SwapRouter>, SqliteWalStore, SimpleProfitCalculator>>,
 ) {
     let config = ctx.config.clone();
     let agent = ctx.agent.clone();
@@ -93,7 +93,7 @@ async fn init(
     let kong_finalizer = Arc::new(KongSwapFinalizer::new(ctx.swap_router.clone()));
 
     // Profit calculator for expected/realized PnL
-    let profit_calc = Arc::new(PassthroughProfitCalculator); //todo implement real profit calculator
+    let profit_calc = Arc::new(SimpleProfitCalculator); //todo implement real profit calculator
 
     // FinalizeStage wires WAL + finalizer + profit calculation
     let finalizer = Arc::new(FinalizeStage::new(db.clone(), kong_finalizer, profit_calc));

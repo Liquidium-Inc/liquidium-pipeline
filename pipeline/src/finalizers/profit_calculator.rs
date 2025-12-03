@@ -17,9 +17,9 @@ pub trait ProfitCalculator: Send + Sync {
 
 // Simple passthrough impl you can replace with real math
 #[derive(Default)]
-pub struct PassthroughProfitCalculator;
+pub struct SimpleProfitCalculator;
 
-impl ProfitCalculator for PassthroughProfitCalculator {
+impl ProfitCalculator for SimpleProfitCalculator {
     fn expected(&self, req: &ExecutorRequest, _liq: Option<&LiquidationResult>) -> i128 {
         req.expected_profit
     }

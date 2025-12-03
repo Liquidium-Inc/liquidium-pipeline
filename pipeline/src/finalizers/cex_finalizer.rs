@@ -9,7 +9,7 @@ use crate::{
     finalizers::liquidation_outcome::LiquidationOutcome,
     persistance::{LiqResultRecord, ResultStatus, WalStore},
     stages::executor::{ExecutionReceipt, ExecutionStatus},
-    swappers::model::{SwapExecution, SwapRequest},
+    swappers::model::SwapExecution,
     wal::{liq_id_from_receipt, wal_load, wal_mark_inflight, wal_mark_permanent_failed, wal_mark_retryable_failed},
 };
 

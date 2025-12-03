@@ -1,3 +1,4 @@
+use alloy::providers::mock;
 use async_trait::async_trait;
 
 #[derive(Debug, Clone)]
@@ -26,6 +27,7 @@ pub enum WithdrawStatus {
     Unknown,
 }
 
+#[mockall::automock]
 #[async_trait]
 pub trait CexBackend: Send + Sync {
     // trading
