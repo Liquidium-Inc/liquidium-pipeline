@@ -1,4 +1,3 @@
-use alloy::providers::mock;
 use async_trait::async_trait;
 
 #[derive(Debug, Clone)]
@@ -51,9 +50,5 @@ pub trait CexBackend: Send + Sync {
     async fn get_balance(&self, asset: &str) -> Result<f64, String>;
 
     // withdrawal status
-    async fn get_withdraw_status_by_id(
-        &self,
-        coin: &str,
-        withdraw_id: &str,
-    ) -> Result<WithdrawStatus, String>;
+    async fn get_withdraw_status_by_id(&self, coin: &str, withdraw_id: &str) -> Result<WithdrawStatus, String>;
 }

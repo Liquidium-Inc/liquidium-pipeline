@@ -6,11 +6,25 @@ use liquidium_pipeline_core::tokens::token_registry::TokenRegistryTrait;
 pub async fn funds() -> Result<(), String> {
     let ctx = init_context().await?;
 
+    const HEADER_LABEL_WIDTH: usize = 22;
+
     println!("\n=== Balances (Main | Trader | Recovery) ===");
-    println!("Main ICP principal: {}", ctx.config.liquidator_principal.to_text());
-    println!("Trader ICP principal: {}", ctx.config.trader_principal.to_text());
-    println!("Recovery account: {}", ctx.config.get_recovery_account());
-    println!("EVM address: {}\n", ctx.evm_address);
+    println!(
+        "{: <HEADER_LABEL_WIDTH$}: {}",
+        "Main ICP principal",
+        ctx.config.liquidator_principal.to_text()
+    );
+    println!(
+        "{: <HEADER_LABEL_WIDTH$}: {}",
+        "Trader ICP principal",
+        ctx.config.trader_principal.to_text()
+    );
+    println!(
+        "{: <HEADER_LABEL_WIDTH$}: {}",
+        "Recovery account",
+        ctx.config.get_recovery_account()
+    );
+    println!("{: <HEADER_LABEL_WIDTH$}: {}\n", "EVM address", ctx.evm_address);
     println!("Recovery account holds seized collateral from failed swaps.\n");
 
     let asset_ids: Vec<AssetId> = ctx.registry.all().into_iter().map(|(id, _)| id).collect();

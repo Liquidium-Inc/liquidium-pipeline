@@ -33,6 +33,7 @@ pub struct PipelineContext {
     pub config: Arc<Config>,
     pub registry: Arc<TokenRegistry>,
     pub main_service: Arc<BalanceService>,
+    pub trader_service: Arc<BalanceService>,
     pub recovery_service: Arc<BalanceService>,
     pub agent: Arc<Agent>,
     pub main_transfers: Arc<TransferService>,
@@ -95,6 +96,11 @@ impl<P: Provider<AnyNetwork> + WalletProvider<AnyNetwork> + Clone + 'static> Pip
             subaccount: None,
         };
 
+        let trader_icp_account = Account {
+            owner: config.trader_principal,
+            subaccount: None,
+        };
+
         let main_trader_account = Account {
             owner: config.trader_principal,
             subaccount: None,
@@ -110,6 +116,14 @@ impl<P: Provider<AnyNetwork> + WalletProvider<AnyNetwork> + Clone + 'static> Pip
         let main_accounts: Arc<dyn AccountInfo + Send + Sync> =
             Arc::new(MultiChainAccountInfoRouter::new(icp_info_main, evm_info_main));
 
+        let icp_info_trader = Arc::new(IcpAccountInfoAdapter::new(
+            icp_backend_trader.clone(),
+            trader_icp_account,
+        ));
+        let evm_info_trader = Arc::new(EvmAccountInfoAdapter::new(evm_backend_trader.clone()));
+        let trader_accounts: Arc<dyn AccountInfo + Send + Sync> =
+            Arc::new(MultiChainAccountInfoRouter::new(icp_info_trader, evm_info_trader));
+
         let icp_info_recovery = Arc::new(IcpAccountInfoAdapter::new(
             icp_backend_trader.clone(),
             recovery_icp_account,
@@ -119,6 +133,7 @@ impl<P: Provider<AnyNetwork> + WalletProvider<AnyNetwork> + Clone + 'static> Pip
             Arc::new(MultiChainAccountInfoRouter::new(icp_info_recovery, evm_info_recovery));
 
         let main_service = BalanceService::new(registry.clone(), main_accounts);
+        let trader_service = BalanceService::new(registry.clone(), trader_accounts);
         let recovery_service = BalanceService::new(registry.clone(), recovery_accounts);
 
         // Build transfer adapters and routers
@@ -168,6 +183,7 @@ impl<P: Provider<AnyNetwork> + WalletProvider<AnyNetwork> + Clone + 'static> Pip
             swap_router,
             registry,
             main_service: Arc::new(main_service),
+            trader_service: Arc::new(trader_service),
             recovery_service: Arc::new(recovery_service),
             main_transfers: Arc::new(main_transfers),
             recovery_transfers: Arc::new(recovery_transfers),

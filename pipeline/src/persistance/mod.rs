@@ -31,6 +31,7 @@ pub struct LiqResultRecord {
     pub meta_json: String,
 }
 
+#[allow(dead_code)]
 #[cfg_attr(test, mockall::automock)]
 #[async_trait]
 pub trait WalStore: Send + Sync {

@@ -4,8 +4,9 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use candid::Nat;
 use liquidium_pipeline_core::tokens::asset_id::AssetId;
+use log::info;
 
-use crate::finalizers::finalizer::Finalizer;
+use crate::finalizers::finalizer::{Finalizer, FinalizerResult};
 use crate::finalizers::liquidation_outcome::LiquidationOutcome;
 use crate::finalizers::profit_calculator::ProfitCalculator;
 
@@ -89,7 +90,7 @@ where
             grouped.entry((pay, recv)).or_default().push(receipt);
         }
 
-        let mut fin_results: Vec<(crate::finalizers::finalizer::FinalizerResult, ExecutionReceipt)> = vec![];
+        let mut fin_results: Vec<(FinalizerResult, ExecutionReceipt)> = vec![];
 
         // Iterate per asset-pair group. For each group:
         // - collapse receipts into one synthetic ExecutionReceipt
@@ -101,6 +102,8 @@ where
             }
 
             let collapsed = collapse_receipts(&receipts);
+
+            info!("Executing collapesed receipt {:?}", collapsed);
 
             // Use the first liq in this batch to derive an attempt baseline for error handling
             let first_liq_id = collapsed
