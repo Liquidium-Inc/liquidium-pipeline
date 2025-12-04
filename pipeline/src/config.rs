@@ -1,4 +1,5 @@
 use alloy::hex::ToHexExt;
+use alloy::primitives::map::HashMap;
 use candid::Principal;
 
 use ic_agent::Identity;
@@ -13,6 +14,13 @@ use alloy::signers::local::PrivateKeySigner;
 use std::env;
 use std::sync::Arc;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SwapperMode {
+    Dex,
+    Cex,
+    Hybrid,
+}
+
 pub struct Config {
     pub liquidator_identity: Arc<dyn Identity>,
     pub trader_identity: Arc<dyn Identity>,
@@ -25,6 +33,9 @@ pub struct Config {
     pub export_path: String,
     pub buy_bad_debt: bool,
     pub db_path: String,
+    pub max_allowed_dex_slippage: u32,
+    pub swapper: SwapperMode,
+    pub cex_credentials: HashMap<String, (String, String)>,
 }
 
 #[cfg_attr(test, mockall::automock)]
@@ -32,10 +43,13 @@ pub trait ConfigTrait: Send + Sync {
     fn get_liquidator_principal(&self) -> Principal;
     fn get_trader_principal(&self) -> Principal;
     fn should_buy_bad_debt(&self) -> bool;
+    fn get_max_allowed_dex_slippage(&self) -> u32;
     fn get_lending_canister(&self) -> Principal;
     fn get_recovery_account(&self) -> Account;
     fn exchange_deposit_account_for(&self, chain: &str) -> Result<Account, String>;
     fn exchange_withdraw_address_for(&self, chain: &str) -> Result<String, String>;
+    fn get_swapper_mode(&self) -> SwapperMode;
+    fn get_cex_credentials(&self, cex: &str) -> Result<(String, String), String>;
 }
 
 impl ConfigTrait for Config {
@@ -77,6 +91,21 @@ impl ConfigTrait for Config {
                 chain, var
             )),
         }
+    }
+
+    fn get_max_allowed_dex_slippage(&self) -> u32 {
+        self.max_allowed_dex_slippage
+    }
+
+    fn get_swapper_mode(&self) -> SwapperMode {
+        self.swapper
+    }
+
+    fn get_cex_credentials(&self, cex: &str) -> Result<(String, String), String> {
+        self.cex_credentials
+            .get(cex)
+            .ok_or("Cex credentials not found".to_string())
+            .cloned()
     }
 }
 
@@ -140,6 +169,27 @@ impl Config {
         let hex = evm_signer.to_bytes().encode_hex();
         let evm_private_key = format!("{:#}", hex);
 
+        let max_allowed_dex_slippage: u32 = std::env::var("MAX_ALLOWED_DEX_SLIPPAGE")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(500); // default 5%
+
+        let swapper = match env::var("SWAPPER")
+            .unwrap_or_else(|_| "hybrid".to_string())
+            .to_lowercase()
+            .as_str()
+        {
+            "dex" => SwapperMode::Dex,
+            "cex" => SwapperMode::Cex,
+            "hybrid" => SwapperMode::Hybrid,
+            other => {
+                debug!("Unknown SWAPPER value '{}', defaulting to hybrid", other);
+                SwapperMode::Hybrid
+            }
+        };
+
+        
+
         Ok(Arc::new(Config {
             evm_private_key,
             evm_rpc_url: env::var("EVM_RPC_URL").expect("EVM_RPC_URL not configured"),
@@ -152,6 +202,9 @@ impl Config {
             export_path,
             buy_bad_debt,
             db_path,
+            max_allowed_dex_slippage,
+            swapper,
+            cex_credentials
         }))
     }
 }

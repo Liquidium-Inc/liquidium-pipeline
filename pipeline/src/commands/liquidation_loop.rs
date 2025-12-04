@@ -7,11 +7,12 @@ use prettytable::{Cell, Row, Table, format};
 use std::{sync::Arc, thread::sleep, time::Duration};
 
 use crate::{
-    config::Config,
+    config::{Config, ConfigTrait},
     context::{PipelineContext, init_context},
     executors::basic::basic_executor::BasicExecutor,
     finalizers::{
-        kong_swap::kong_swap_finalizer::KongSwapFinalizer, liquidation_outcome::LiquidationOutcome,
+        hybrid::hybrid_finalizer::HybridFinalizer, kong_swap::kong_swap_finalizer::KongSwapFinalizer,
+        liquidation_outcome::LiquidationOutcome, mexc::mexc_finalizer::MexcFinalizer,
         profit_calculator::SimpleProfitCalculator,
     },
     liquidation::collateral_service::CollateralService,
@@ -22,7 +23,7 @@ use crate::{
         executor::ExecutionStatus, export::ExportStage, finalize::FinalizeStage, opportunity::OpportunityFinder,
         simple_strategy::SimpleLiquidationStrategy,
     },
-    swappers::router::SwapRouter,
+    swappers::{mexc::mexc_adapter::MexcClient, router::SwapRouter},
     watchdog::{WatchdogEvent, webhook_watchdog_from_env},
 };
 use ic_agent::Agent;
@@ -55,7 +56,7 @@ async fn init(
     SimpleLiquidationStrategy<SwapRouter, Config, TokenRegistry, CollateralService<LiquidationPriceOracle<Agent>>>,
     Arc<BasicExecutor<Agent, SqliteWalStore>>,
     Arc<ExportStage>,
-    Arc<FinalizeStage<KongSwapFinalizer<SwapRouter>, SqliteWalStore, SimpleProfitCalculator>>,
+    Arc<FinalizeStage<HybridFinalizer<Config>, SqliteWalStore, SimpleProfitCalculator>>,
 ) {
     let config = ctx.config.clone();
     let agent = ctx.agent.clone();
@@ -89,14 +90,27 @@ async fn init(
 
     let _ = ctx.swap_router.init().await;
 
-    // Finalizer logic (Kong swapper)
+    // Base DEX finalizer (Kong swapper)
     let kong_finalizer = Arc::new(KongSwapFinalizer::new(ctx.swap_router.clone()));
+
+    let (api_key, secret) = ctx.config.get_cex_credentials("mexc").expect("missing cex credentials");
+    let mexc_client = MexcClient::new(api_key, secret);
+    let mexc_finalizer = Arc::new(MexcFinalizer::new(mexc_client, ctx.main_transfers));
+
+    // Hybrid finalizer composes DEX and CEX finalizers.
+    // For now, CEX is wired to the same Kong finalizer; you can later swap in a dedicated CEX finalizer.
+    let hybrid_finalizer = Arc::new(HybridFinalizer {
+        config: config.clone(),
+        dex_swapper: ctx.swap_router.clone(),
+        dex_finalizer: kong_finalizer.clone() as Arc<dyn crate::finalizers::finalizer::Finalizer>,
+        cex_finalizer: mexc_finalizer.clone() as Arc<dyn crate::finalizers::finalizer::Finalizer>,
+    });
 
     // Profit calculator for expected/realized PnL
     let profit_calc = Arc::new(SimpleProfitCalculator); //todo implement real profit calculator
 
     // FinalizeStage wires WAL + finalizer + profit calculation
-    let finalizer = Arc::new(FinalizeStage::new(db.clone(), kong_finalizer, profit_calc));
+    let finalizer = Arc::new(FinalizeStage::new(db.clone(), hybrid_finalizer, profit_calc));
 
     info!("Initializing searcher stage ...");
     let finder = OpportunityFinder::new(agent.clone(), config.lending_canister);

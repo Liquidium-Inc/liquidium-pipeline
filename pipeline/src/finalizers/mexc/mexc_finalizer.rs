@@ -5,16 +5,18 @@ use candid::Principal;
 use icrc_ledger_types::icrc1::account::Account;
 use liquidium_pipeline_connectors::backend::cex_backend::{CexBackend, DepositAddress};
 use liquidium_pipeline_core::{
-    account::model::ChainAccount, tokens::chain_token_amount::ChainTokenAmount,
+    account::model::ChainAccount,
+    tokens::chain_token_amount::ChainTokenAmount,
     transfer::{actions::TransferActions, transfer_service::TransferService},
 };
 use log::debug;
 use serde::{Deserialize, Serialize};
 
 use crate::{
+    config::ConfigTrait,
     finalizers::cex_finalizer::{CexFinalizerLogic, CexState, CexStep},
     stages::executor::ExecutionReceipt,
-    swappers::model::SwapExecution,
+    swappers::{mexc::mexc_adapter::MexcClient, model::SwapExecution},
 };
 
 use num_traits::ToPrimitive;
@@ -26,19 +28,19 @@ use num_traits::ToPrimitive;
 /// - `deposit` transitions Deposit -> Trade
 /// - `trade` transitions Trade -> Withdraw
 /// - `withdraw` transitions Withdraw -> Completed
-pub struct MexcFinalizer<B>
+pub struct MexcFinalizer<C>
 where
-    B: CexBackend,
+    C: CexBackend,
 {
-    pub backend: Arc<B>,
+    pub backend: Arc<C>,
     pub transfer_service: Arc<dyn TransferActions>,
 }
 
-impl<B> MexcFinalizer<B>
+impl<C> MexcFinalizer<C>
 where
-    B: CexBackend,
+    C: CexBackend,
 {
-    pub fn new(backend: Arc<B>, transfer_service: Arc<dyn TransferActions>) -> Self {
+    pub fn new(backend: Arc<C>, transfer_service: Arc<dyn TransferActions>) -> Self {
         Self {
             backend,
             transfer_service,
@@ -294,7 +296,6 @@ where
     }
 
     async fn finish(&self, _receipt: &ExecutionReceipt, state: &CexState) -> Result<SwapExecution, String> {
-
         let receive_amount = state.size_out.clone();
 
         // Pay side: seized collateral we sent in, as recorded on the CEX state.
@@ -421,10 +422,7 @@ mod tests {
         let finalizer = MexcFinalizer::new(backend, transfer_service);
 
         let receipt = make_execution_receipt(42);
-        let state: CexState = finalizer
-            .prepare("42", &receipt)
-            .await
-            .expect("prepare should succeed");
+        let state: CexState = finalizer.prepare("42", &receipt).await.expect("prepare should succeed");
 
         assert_eq!(state.liq_id, "42");
         assert!(matches!(state.step, CexStep::Deposit));
@@ -445,12 +443,7 @@ mod tests {
         assert_eq!(state.size_in.token, receipt.request.collateral_asset);
         assert_eq!(
             state.size_in.value,
-            receipt
-                .liquidation_result
-                .as_ref()
-                .unwrap()
-                .amounts
-                .collateral_received
+            receipt.liquidation_result.as_ref().unwrap().amounts.collateral_received
         );
 
         // withdraw leg
@@ -469,20 +462,16 @@ mod tests {
         let mut backend = MockCexBackend::new();
         let mut transfers = MockTransferActions::new();
 
-        backend
-            .expect_get_balance()
-            .returning(|_symbol| Ok(10.0));
+        backend.expect_get_balance().returning(|_symbol| Ok(10.0));
 
-        backend
-            .expect_get_deposit_address()
-            .returning(|_symbol, _chain| {
-                Ok(DepositAddress {
-                    asset: "CkBTC".to_string(),
-                    network: "ICP".to_string(),
-                    address: "aaaaa-aa".to_string(),
-                    tag: None,
-                })
-            });
+        backend.expect_get_deposit_address().returning(|_symbol, _chain| {
+            Ok(DepositAddress {
+                asset: "CkBTC".to_string(),
+                network: "ICP".to_string(),
+                address: "aaaaa-aa".to_string(),
+                tag: None,
+            })
+        });
 
         transfers
             .expect_transfer()
@@ -494,10 +483,7 @@ mod tests {
         let finalizer = MexcFinalizer::new(backend, transfer_service);
 
         let receipt = make_execution_receipt(42);
-        let mut state = finalizer
-            .prepare("42", &receipt)
-            .await
-            .expect("prepare should succeed");
+        let mut state = finalizer.prepare("42", &receipt).await.expect("prepare should succeed");
 
         // Pre-conditions: no deposit has been sent yet
         assert!(state.deposit_txid.is_none());
@@ -505,10 +491,7 @@ mod tests {
         assert!(matches!(state.step, CexStep::Deposit));
 
         // Phase A: snapshot baseline and send transfer
-        finalizer
-            .deposit(&mut state)
-            .await
-            .expect("deposit should succeed");
+        finalizer.deposit(&mut state).await.expect("deposit should succeed");
 
         assert_eq!(state.deposit_balance_before, Some(10.0));
         assert_eq!(state.deposit_txid.as_deref(), Some("tx-123"));
@@ -520,9 +503,7 @@ mod tests {
         let mut backend = MockCexBackend::new();
         let transfers = MockTransferActions::new();
 
-        backend
-            .expect_get_balance()
-            .returning(|_symbol| Ok(5.0));
+        backend.expect_get_balance().returning(|_symbol| Ok(5.0));
 
         let backend = Arc::new(backend);
         let transfer_service = Arc::new(transfers);
@@ -530,10 +511,7 @@ mod tests {
         let finalizer = MexcFinalizer::new(backend, transfer_service);
 
         let receipt = make_execution_receipt(42);
-        let mut state = finalizer
-            .prepare("42", &receipt)
-            .await
-            .expect("prepare should succeed");
+        let mut state = finalizer.prepare("42", &receipt).await.expect("prepare should succeed");
 
         // Simulate that Phase A already ran and sent a tx, but baseline was never recorded.
         state.deposit_txid = Some("tx-123".to_string());
@@ -557,9 +535,7 @@ mod tests {
         let mut backend = MockCexBackend::new();
         let transfers = MockTransferActions::new();
 
-        backend
-            .expect_get_balance()
-            .returning(|_symbol| Ok(5.1));
+        backend.expect_get_balance().returning(|_symbol| Ok(5.1));
 
         let backend = Arc::new(backend);
         let transfer_service = Arc::new(transfers);
@@ -567,10 +543,7 @@ mod tests {
         let finalizer = MexcFinalizer::new(backend, transfer_service);
 
         let receipt = make_execution_receipt(42);
-        let mut state = finalizer
-            .prepare("42", &receipt)
-            .await
-            .expect("prepare should succeed");
+        let mut state = finalizer.prepare("42", &receipt).await.expect("prepare should succeed");
 
         // Simulate that Phase A already ran, we have a baseline, and we are now in DepositPending.
         state.deposit_txid = Some("tx-123".to_string());
@@ -594,9 +567,7 @@ mod tests {
         let transfers = MockTransferActions::new();
 
         // Balance stays the same as baseline.
-        backend
-            .expect_get_balance()
-            .returning(|_symbol| Ok(5.0));
+        backend.expect_get_balance().returning(|_symbol| Ok(5.0));
 
         let backend = Arc::new(backend);
         let transfer_service = Arc::new(transfers);
@@ -604,10 +575,7 @@ mod tests {
         let finalizer = MexcFinalizer::new(backend, transfer_service);
 
         let receipt = make_execution_receipt(42);
-        let mut state = finalizer
-            .prepare("42", &receipt)
-            .await
-            .expect("prepare should succeed");
+        let mut state = finalizer.prepare("42", &receipt).await.expect("prepare should succeed");
 
         // Simulate Phase A done, baseline recorded, and we are waiting in DepositPending.
         state.deposit_txid = Some("tx-123".to_string());
@@ -639,10 +607,7 @@ mod tests {
         let finalizer = MexcFinalizer::new(backend, transfer_service);
 
         let receipt = make_execution_receipt(42);
-        let mut state = finalizer
-            .prepare("42", &receipt)
-            .await
-            .expect("prepare should succeed");
+        let mut state = finalizer.prepare("42", &receipt).await.expect("prepare should succeed");
 
         // Force amount_in to zero and move state into Trade step.
         state.size_in.value = Nat::from(0u32);
@@ -679,18 +644,12 @@ mod tests {
         let finalizer = MexcFinalizer::new(backend, transfer_service);
 
         let receipt = make_execution_receipt(42);
-        let mut state = finalizer
-            .prepare("42", &receipt)
-            .await
-            .expect("prepare should succeed");
+        let mut state = finalizer.prepare("42", &receipt).await.expect("prepare should succeed");
 
         // Move directly into Trade step; size_in is taken from receipt and should be > 0.
         state.step = CexStep::Trade;
 
-        finalizer
-            .trade(&mut state)
-            .await
-            .expect("trade should succeed");
+        finalizer.trade(&mut state).await.expect("trade should succeed");
 
         let out = state.size_out.as_ref().expect("size_out should be set");
         assert_eq!(out.token, state.withdraw_asset);
@@ -714,17 +673,11 @@ mod tests {
         let finalizer = MexcFinalizer::new(backend, transfer_service);
 
         let receipt = make_execution_receipt(42);
-        let mut state = finalizer
-            .prepare("42", &receipt)
-            .await
-            .expect("prepare should succeed");
+        let mut state = finalizer.prepare("42", &receipt).await.expect("prepare should succeed");
 
         state.step = CexStep::Trade;
 
-        let err = finalizer
-            .trade(&mut state)
-            .await
-            .expect_err("trade should fail");
+        let err = finalizer.trade(&mut state).await.expect_err("trade should fail");
 
         assert_eq!(err, "boom");
         // On error we expect the step to remain Trade.
@@ -745,10 +698,7 @@ mod tests {
         let finalizer = MexcFinalizer::new(backend, transfer_service);
 
         let receipt = make_execution_receipt(42);
-        let mut state = finalizer
-            .prepare("42", &receipt)
-            .await
-            .expect("prepare should succeed");
+        let mut state = finalizer.prepare("42", &receipt).await.expect("prepare should succeed");
 
         state.step = CexStep::Withdraw;
         state.withdraw_id = Some("internal-1".to_string());
@@ -776,10 +726,7 @@ mod tests {
         let finalizer = MexcFinalizer::new(backend, transfer_service);
 
         let receipt = make_execution_receipt(42);
-        let mut state = finalizer
-            .prepare("42", &receipt)
-            .await
-            .expect("prepare should succeed");
+        let mut state = finalizer.prepare("42", &receipt).await.expect("prepare should succeed");
 
         state.step = CexStep::Withdraw;
         state.size_in.value = Nat::from(0u32);
@@ -800,22 +747,13 @@ mod tests {
         let finalizer = MexcFinalizer::new(backend, transfers);
 
         let receipt = make_execution_receipt(42);
-        let mut state = finalizer
-            .prepare("42", &receipt)
-            .await
-            .expect("prepare should succeed");
+        let mut state = finalizer.prepare("42", &receipt).await.expect("prepare should succeed");
 
         // Simulate that trade/withdraw legs have populated size_out.
         // Use a nice round native amount so we can reason about the price.
-        state.size_out = Some(ChainTokenAmount::from_formatted(
-            state.withdraw_asset.clone(),
-            2.0,
-        ));
+        state.size_out = Some(ChainTokenAmount::from_formatted(state.withdraw_asset.clone(), 2.0));
 
-        let swap = finalizer
-            .finish(&receipt, &state)
-            .await
-            .expect("finish should succeed");
+        let swap = finalizer.finish(&receipt, &state).await.expect("finish should succeed");
 
         // Pay leg comes from seized collateral (size_in).
         assert_eq!(swap.pay_asset, state.deposit_asset.asset_id());

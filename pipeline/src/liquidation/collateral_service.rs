@@ -16,6 +16,7 @@ use liquidium_pipeline_core::types::protocol_types::{
 pub struct LiquidationEstimation {
     pub repaid_debt: Nat,
     pub received_collateral: Nat,
+    pub ref_price: Nat,
 }
 
 #[cfg_attr(test, mockall::automock)]
@@ -225,6 +226,7 @@ impl<P: PriceOracle> CollateralServiceTrait for CollateralService<P> {
         Ok(LiquidationEstimation {
             received_collateral: seized_native,
             repaid_debt: repay_native,
+            ref_price: price_coll_ray,
         })
     }
 }

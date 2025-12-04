@@ -250,7 +250,7 @@ where
                 debt_position.debt_amount.clone()
             };
 
-            if repay_amount == Nat::from(0u64) {
+            if repay_amount == 0u64 {
                 continue;
             }
 
@@ -613,6 +613,7 @@ mod tests {
                 Ok(LiquidationEstimation {
                     received_collateral: Nat::from(2_000u64),
                     repaid_debt: Nat::from(1_000u64),
+                    ref_price: Nat::from(0u8),
                 })
             });
 
@@ -875,6 +876,7 @@ mod tests {
                 Ok(LiquidationEstimation {
                     received_collateral: Nat::from(1_000u64), // equals fee, nets to zero
                     repaid_debt: Nat::from(500u64),
+                    ref_price: Nat::from(0u8),
                 })
             });
 
@@ -949,6 +951,7 @@ mod tests {
                 Ok(LiquidationEstimation {
                     received_collateral: Nat::from(4_000u64),
                     repaid_debt: Nat::from(1_000u64),
+                    ref_price: Nat::from(0u8),
                 })
             });
 
@@ -1024,6 +1027,7 @@ mod tests {
                     Ok(LiquidationEstimation {
                         received_collateral: Nat::from(4_000u64),
                         repaid_debt: Nat::from(1_000u64),
+                        ref_price: Nat::from(0u8),
                     })
                 } else {
                     panic!("collateral service should not be called after HF bump");
@@ -1109,6 +1113,7 @@ mod tests {
                 Ok(LiquidationEstimation {
                     received_collateral: Nat::from(4_000u64),
                     repaid_debt: Nat::from(1_000u64),
+                    ref_price: Nat::from(0u8),
                 })
             },
         );
@@ -1192,6 +1197,7 @@ mod tests {
                 Ok(LiquidationEstimation {
                     received_collateral: Nat::from(4_000u64),
                     repaid_debt: Nat::from(1_000u64),
+                    ref_price: Nat::from(0u8),
                 })
             });
 

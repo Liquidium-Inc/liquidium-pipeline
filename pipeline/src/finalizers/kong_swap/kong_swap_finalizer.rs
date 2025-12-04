@@ -144,6 +144,7 @@ mod tests {
                 fee: Nat::from(1_000u64),
             },
             expected_profit: 0,
+            ref_price: Nat::from(0u8),
         };
 
         let liq = LiquidationResult {

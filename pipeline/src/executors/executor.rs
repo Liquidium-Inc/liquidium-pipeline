@@ -1,3 +1,4 @@
+use candid::Nat;
 use liquidium_pipeline_core::{tokens::chain_token::ChainToken, types::protocol_types::LiquidationRequest};
 use serde::{Deserialize, Serialize};
 
@@ -15,4 +16,6 @@ pub struct ExecutorRequest {
     pub collateral_asset: ChainToken,
     // The expected profit
     pub expected_profit: i128,
+    // Ref price
+    pub ref_price: Nat,
 }
