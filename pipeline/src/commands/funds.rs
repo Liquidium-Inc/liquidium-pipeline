@@ -1,63 +1,56 @@
 use liquidium_pipeline::{config::ConfigTrait, context::init_context};
-use prettytable::{Cell, Row, Table, format};
+use prettytable::{format, Cell, Row, Table};
 
-use liquidium_pipeline_core::tokens::chain_token_amount::ChainTokenAmount;
-
+use liquidium_pipeline_core::tokens::{asset_id::AssetId, chain_token_amount::ChainTokenAmount};
+use liquidium_pipeline_core::tokens::token_registry::TokenRegistryTrait;
 pub async fn funds() -> Result<(), String> {
     let ctx = init_context().await?;
 
-    println!("\n=== Account (Main / Liquidator) ===");
-    // Main balances
-    let main_results = ctx.main_service.sync_all().await;
-
-    let mut table_main = Table::new();
-    table_main.set_format(*format::consts::FORMAT_NO_LINESEP_WITH_TITLE);
-    table_main.set_titles(Row::new(vec![
-        Cell::new("Asset (chain:address:symbol)"),
-        Cell::new("Balance"),
-    ]));
-
-    println!("\n=== Account (Main / Liquidator) ===");
-    println!("ICP principal: {}", ctx.config.liquidator_principal.to_text());
+    println!("\n=== Balances (Main | Trader | Recovery) ===");
+    println!("Main ICP principal: {}", ctx.config.liquidator_principal.to_text());
+    println!("Trader ICP principal: {}", ctx.config.trader_principal.to_text());
+    println!("Recovery account: {}", ctx.config.get_recovery_account());
     println!("EVM address: {}\n", ctx.evm_address);
-
-    for r in main_results {
-        match r {
-            Ok((id, bal)) => table_main.add_row(Row::new(vec![
-                Cell::new(&id.to_string()),
-                Cell::new(&format_chain_balance(&bal)),
-            ])),
-            Err(e) => table_main.add_row(Row::new(vec![Cell::new("error"), Cell::new(&e)])),
-        };
-    }
-    table_main.printstd();
-
-    // Recovery balances
-    let recovery_results = ctx.recovery_service.sync_all().await;
-
-    let mut table_recovery = Table::new();
-    table_recovery.set_format(*format::consts::FORMAT_NO_LINESEP_WITH_TITLE);
-    table_recovery.set_titles(Row::new(vec![
-        Cell::new("Asset (chain:address:symbol)"),
-        Cell::new("Balance"),
-    ]));
-
-    println!("\n=== Account (Recovery / Trader) ===");
-    println!("ICP principal: {}\n", ctx.config.get_recovery_account());
     println!("Recovery account holds seized collateral from failed swaps.\n");
 
-    for r in recovery_results {
-        match r {
-            Ok((id, bal)) => table_recovery.add_row(Row::new(vec![
-                Cell::new(&id.to_string()),
-                Cell::new(&format_chain_balance(&bal)),
-            ])),
-            Err(e) => table_recovery.add_row(Row::new(vec![Cell::new("error"), Cell::new(&e)])),
-        };
+    let asset_ids: Vec<AssetId> = ctx.registry.all().into_iter().map(|(id, _)| id).collect();
+
+    let main_results = ctx.main_service.sync_assets(&asset_ids).await;
+    let trader_results = ctx.trader_service.sync_assets(&asset_ids).await;
+    let recovery_results = ctx.recovery_service.sync_assets(&asset_ids).await;
+
+    let mut table = Table::new();
+    table.set_format(*format::consts::FORMAT_NO_LINESEP_WITH_TITLE);
+    table.set_titles(Row::new(vec![
+        Cell::new("Asset (chain:address:symbol)"),
+        Cell::new("Main"),
+        Cell::new("Trader"),
+        Cell::new("Recovery"),
+    ]));
+
+    for (idx, asset_id) in asset_ids.iter().enumerate() {
+        let main_cell = format_balance_result(main_results.get(idx));
+        let trader_cell = format_balance_result(trader_results.get(idx));
+        let recovery_cell = format_balance_result(recovery_results.get(idx));
+
+        table.add_row(Row::new(vec![
+            Cell::new(&asset_id.to_string()),
+            Cell::new(&main_cell),
+            Cell::new(&trader_cell),
+            Cell::new(&recovery_cell),
+        ]));
     }
-    table_recovery.printstd();
+    table.printstd();
 
     Ok(())
+}
+
+fn format_balance_result(res: Option<&Result<(AssetId, ChainTokenAmount), String>>) -> String {
+    match res {
+        Some(Ok((_, bal))) => format_chain_balance(bal),
+        Some(Err(e)) => format!("error: {}", e),
+        None => "n/a".to_string(),
+    }
 }
 
 fn format_chain_balance(bal: &ChainTokenAmount) -> String {
