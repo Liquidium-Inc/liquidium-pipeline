@@ -1,3 +1,5 @@
+use std::default;
+
 use candid::Nat;
 use liquidium_pipeline_core::{tokens::chain_token::ChainToken, types::protocol_types::LiquidationRequest};
 use serde::{Deserialize, Serialize};
@@ -17,5 +19,6 @@ pub struct ExecutorRequest {
     // The expected profit
     pub expected_profit: i128,
     // Ref price
+    #[serde(default)]
     pub ref_price: Nat,
 }

@@ -38,6 +38,8 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
 
     use crate::executors::executor::ExecutorRequest;
@@ -238,7 +240,7 @@ mod tests {
 
         let receipt = make_execution_receipt(42);
 
-        let result = finalizer
+        let result = (&finalizer as &dyn DexFinalizerLogic)
             .finalize(&wal, receipt)
             .await
             .expect("finalize should succeed");
@@ -264,7 +266,7 @@ mod tests {
 
         let receipt = make_execution_receipt(44);
 
-        let err = finalizer
+        let err = (&finalizer as &dyn DexFinalizerLogic)
             .finalize(&wal, receipt)
             .await
             .expect_err("finalize should fail");

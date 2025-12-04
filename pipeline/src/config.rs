@@ -1,5 +1,4 @@
 use alloy::hex::ToHexExt;
-use alloy::primitives::map::HashMap;
 use candid::Principal;
 
 use ic_agent::Identity;
@@ -11,6 +10,7 @@ use liquidium_pipeline_connectors::crypto::derivation::derive_evm_private_key;
 use log::debug;
 
 use alloy::signers::local::PrivateKeySigner;
+use std::collections::HashMap;
 use std::env;
 use std::sync::Arc;
 
@@ -188,8 +188,9 @@ impl Config {
             }
         };
 
-        
-
+        debug!("Loading cex credentials...");
+        let cex_credentials = load_cex_credentials();
+        debug!("Cex credentials loaded...");
         Ok(Arc::new(Config {
             evm_private_key,
             evm_rpc_url: env::var("EVM_RPC_URL").expect("EVM_RPC_URL not configured"),
@@ -204,7 +205,31 @@ impl Config {
             db_path,
             max_allowed_dex_slippage,
             swapper,
-            cex_credentials
+            cex_credentials,
         }))
     }
+}
+
+fn load_cex_credentials() -> HashMap<String, (String, String)> {
+    let mut cex_credentials: HashMap<String, (String, String)> = HashMap::new();
+
+    for (key, value) in std::env::vars() {
+        // match CEX_NAME_API_KEY
+        if let Some(name) = key.strip_prefix("CEX_").and_then(|s| s.strip_suffix("_API_KEY")) {
+            let name_lower = name.to_lowercase();
+            let secret_var = format!("CEX_{}_API_SECRET", name);
+
+            match std::env::var(&secret_var) {
+                Ok(secret) => {
+                    debug!("Loaded CEX credentials for '{}'", name_lower);
+                    cex_credentials.insert(name_lower, (value, secret));
+                }
+                Err(_) => {
+                    debug!("Found {} but missing {}", key, secret_var);
+                }
+            }
+        }
+    }
+
+    cex_credentials
 }

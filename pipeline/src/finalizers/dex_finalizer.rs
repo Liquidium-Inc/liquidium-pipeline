@@ -8,7 +8,6 @@ use crate::{
     swappers::model::{SwapExecution, SwapRequest},
 };
 
-
 // Tunables
 const BASE_SLIPPAGE_BPS: u32 = 7500; // 0.75%
 const STEP_SLIPPAGE_BPS: u32 = 5000; // +0.5% per retry
@@ -49,10 +48,7 @@ pub trait DexFinalizerLogic: Send + Sync {
 }
 
 #[async_trait]
-impl<T> Finalizer for T
-where
-    T: DexFinalizerLogic,
-{
+impl Finalizer for dyn DexFinalizerLogic {
     async fn finalize(&self, _: &dyn WalStore, receipt: ExecutionReceipt) -> Result<FinalizerResult, String> {
         // Only finalize successful executions
         if !matches!(receipt.status, ExecutionStatus::Success) {
@@ -68,7 +64,7 @@ where
 
         let finlizer_result = FinalizerResult {
             swap_result: Some(swap_exec),
-            finalized: true
+            finalized: true,
         };
 
         Ok(finlizer_result)

@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 use async_trait::async_trait;
 
@@ -28,29 +28,29 @@ impl SwapInterface for SwapRouter {
 }
 
 pub struct SwapRouter {
-    pub kong: Arc<dyn SwapVenue>,
-    pub mexc: Arc<dyn SwapVenue>,
-    // later: raydium, hyperliquid, etc
+    pub venues: HashMap<String, Arc<dyn SwapVenue>>,
 }
 
 impl SwapRouter {
-    pub fn new(kong: Arc<dyn SwapVenue>, mexc: Arc<dyn SwapVenue>) -> Self {
-        Self { kong, mexc }
+    pub fn new() -> Self {
+        Self { venues: HashMap::new() }
     }
 
-    fn pick_venue<'a>(&'a self, req: &SwapRequest) -> &'a dyn SwapVenue {
-        match req.venue_hint.as_deref() {
-            Some("mexc") => &*self.mexc,
-            Some("kong") | None => &*self.kong,
-            Some(_) => &*self.kong, // fallback for unknown hints
+    pub fn with_venue(mut self, name: &str, venue: Arc<dyn SwapVenue>) -> Self {
+        self.venues.insert(name.to_string(), venue);
+        self
+    }
+
+    fn pick_venue<'a>(&'a self, req: &SwapRequest) -> &'a Arc<dyn SwapVenue> {
+        let v = self.venues.get(&req.venue_hint.clone().unwrap_or("kong".to_owned()));
+        let v = v.expect(&format!("{:?} venue not found", req.venue_hint));
+        v
+    }
+
+    pub async fn init(&self) {
+        for venue in &self.venues {
+            let _ = venue.1.init().await;
         }
-    }
-
-    pub async fn init(&self) -> Result<(), String> {
-        let _ = self.kong.init().await;
-        let _ = self.mexc.init().await;
-
-        Ok(())
     }
 
     pub async fn quote(&self, req: &SwapRequest) -> Result<SwapQuote, String> {
@@ -59,5 +59,11 @@ impl SwapRouter {
 
     pub async fn execute(&self, req: &SwapRequest) -> Result<SwapExecution, String> {
         self.pick_venue(req).execute(req).await
+    }
+}
+
+impl Default for SwapRouter {
+    fn default() -> Self {
+        Self::new()
     }
 }

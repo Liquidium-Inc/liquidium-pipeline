@@ -404,6 +404,7 @@ mod tests {
             debt_asset: debt_token.clone(),
             collateral_asset: collateral_token.clone(),
             expected_profit: 0,
+            ref_price: Nat::from(0u8),
         };
 
         ExecutionReceipt {

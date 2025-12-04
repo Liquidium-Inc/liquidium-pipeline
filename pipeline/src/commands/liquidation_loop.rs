@@ -7,13 +7,13 @@ use prettytable::{Cell, Row, Table, format};
 use std::{sync::Arc, thread::sleep, time::Duration};
 
 use crate::{
-    config::{Config, ConfigTrait},
+    config::{Config, ConfigTrait, SwapperMode},
     context::{PipelineContext, init_context},
     executors::basic::basic_executor::BasicExecutor,
     finalizers::{
-        hybrid::hybrid_finalizer::HybridFinalizer, kong_swap::kong_swap_finalizer::KongSwapFinalizer,
-        liquidation_outcome::LiquidationOutcome, mexc::mexc_finalizer::MexcFinalizer,
-        profit_calculator::SimpleProfitCalculator,
+        cex_finalizer::CexFinalizerLogic, hybrid::hybrid_finalizer::HybridFinalizer,
+        kong_swap::kong_swap_finalizer::KongSwapFinalizer, liquidation_outcome::LiquidationOutcome,
+        mexc::mexc_finalizer::MexcFinalizer, profit_calculator::SimpleProfitCalculator,
     },
     liquidation::collateral_service::CollateralService,
     persistance::sqlite::SqliteWalStore,
@@ -93,17 +93,24 @@ async fn init(
     // Base DEX finalizer (Kong swapper)
     let kong_finalizer = Arc::new(KongSwapFinalizer::new(ctx.swap_router.clone()));
 
-    let (api_key, secret) = ctx.config.get_cex_credentials("mexc").expect("missing cex credentials");
-    let mexc_client = MexcClient::new(api_key, secret);
-    let mexc_finalizer = Arc::new(MexcFinalizer::new(mexc_client, ctx.main_transfers));
+    let mexc_finalizer = if let Some((api_key, secret)) = ctx.config.get_cex_credentials("mexc").ok() {
+        let mexc_client = Arc::new(MexcClient::new(&api_key, &secret));
+        let mexc_finalizer = Arc::new(MexcFinalizer::new(mexc_client, ctx.main_transfers.actions()));
+        Some(mexc_finalizer)
+    } else {
+        if config.swapper != SwapperMode::Dex {
+            panic!("Cex credentials not found");
+        }
+        None
+    };
 
     // Hybrid finalizer composes DEX and CEX finalizers.
     // For now, CEX is wired to the same Kong finalizer; you can later swap in a dedicated CEX finalizer.
     let hybrid_finalizer = Arc::new(HybridFinalizer {
         config: config.clone(),
         dex_swapper: ctx.swap_router.clone(),
-        dex_finalizer: kong_finalizer.clone() as Arc<dyn crate::finalizers::finalizer::Finalizer>,
-        cex_finalizer: mexc_finalizer.clone() as Arc<dyn crate::finalizers::finalizer::Finalizer>,
+        dex_finalizer: kong_finalizer.clone(),
+        cex_finalizer: mexc_finalizer.clone().map(|f| f as Arc<dyn CexFinalizerLogic>),
     });
 
     // Profit calculator for expected/realized PnL

@@ -3,13 +3,14 @@ use std::sync::Arc;
 
 use crate::{
     config::{ConfigTrait, SwapperMode},
-    finalizers::finalizer::{Finalizer, FinalizerResult},
+    finalizers::{
+        cex_finalizer::CexFinalizerLogic,
+        dex_finalizer::DexFinalizerLogic,
+        finalizer::{Finalizer, FinalizerResult},
+    },
     persistance::{ResultStatus, WalStore},
     stages::executor::ExecutionReceipt,
-    swappers::{
-        model::{SwapQuote, SwapRequest},
-        swap_interface::SwapInterface,
-    },
+    swappers::swap_interface::SwapInterface,
     wal::liq_id_from_receipt,
 };
 
@@ -22,8 +23,8 @@ where
     pub config: Arc<C>,
     // Used only for getting DEX quotes; actual DEX execution is delegated to dex_finalizer.
     pub dex_swapper: Arc<dyn SwapInterface>,
-    pub dex_finalizer: Arc<dyn Finalizer>, // e.g. KongSwapFinalizer
-    pub cex_finalizer: Arc<dyn Finalizer>, // existing CEX finalizer
+    pub dex_finalizer: Arc<dyn DexFinalizerLogic>, // e.g. KongSwapFinalizer
+    pub cex_finalizer: Option<Arc<dyn CexFinalizerLogic>>, // existing CEX finalizer
 }
 
 impl<C> HybridFinalizer<C>
@@ -47,7 +48,11 @@ where
         _reason: Option<String>,
     ) -> Result<FinalizerResult, String> {
         // Delegate full CEX settlement logic to the underlying CEX finalizer.
-        self.cex_finalizer.finalize(wal, receipt).await
+        self.cex_finalizer
+            .as_ref()
+            .expect("missing cex finalizer")
+            .finalize(wal, receipt)
+            .await
     }
 }
 

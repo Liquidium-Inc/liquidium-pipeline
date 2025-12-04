@@ -295,6 +295,7 @@ where
                     receiver_address: self.config.get_trader_principal(),
                     buy_bad_debt: true,
                 },
+                ref_price: 0u32.into(),
                 swap_args: None,
                 expected_profit: profit.0.to_i128().unwrap(),
             });
@@ -509,8 +510,9 @@ where
                     collateral_pool_id: collateral_position.pool_id,
                     debt_amount: estimation.repaid_debt.clone(),
                     receiver_address: self.config.get_trader_principal(),
-                    buy_bad_debt: false
+                    buy_bad_debt: false,
                 },
+                ref_price: estimation.ref_price,
                 swap_args,
                 expected_profit: profit.0.to_i128().unwrap(),
             });

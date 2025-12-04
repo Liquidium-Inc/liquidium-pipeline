@@ -168,15 +168,16 @@ impl<P: Provider<AnyNetwork> + WalletProvider<AnyNetwork> + Clone + 'static> Pip
             })
             .collect();
 
-       
         let kong_swapper = Arc::new(kong_swapper);
         let kong_venue: Arc<dyn SwapVenue> = Arc::new(KongVenue::new(kong_swapper, icp_tokens));
 
-        let mexc_client = Arc::new(MexcClient::from_env()?);
-        let mexc_venue: Arc<dyn SwapVenue> = Arc::new(MexcSwapVenue::new(mexc_client));
+        // let mexc_client = Arc::new(MexcClient::from_env()?);
+        // let mexc_venue: Arc<dyn SwapVenue> = Arc::new(MexcSwapVenue::new(mexc_client));
 
         // Build router
-        let swap_router = Arc::new(SwapRouter::new(kong_venue, mexc_venue));
+        let swap_router = SwapRouter::new().with_venue("kong", kong_venue);
+
+        let swap_router = Arc::new(swap_router);
 
         Ok(PipelineContext {
             config: config.clone(),

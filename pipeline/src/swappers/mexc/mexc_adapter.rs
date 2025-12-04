@@ -52,8 +52,8 @@ impl MexcClient {
     }
 
     pub fn from_env() -> Result<Self, String> {
-        let api_key = env::var("MEXC_API_KEY").map_err(|_| "MEXC_API_KEY not set".to_string())?;
-        let api_secret = env::var("MEXC_API_SECRET").map_err(|_| "MEXC_API_SECRET not set".to_string())?;
+        let api_key = env::var("CEX_MEXC_API_KEY").map_err(|_| "CEX_MEXC_API_KEY not set".to_string())?;
+        let api_secret = env::var("CEX_MEXC_API_SECRET").map_err(|_| "CEX_MEXC_API_SECRET not set".to_string())?;
 
         Ok(Self::new(&api_key, &api_secret))
     }
