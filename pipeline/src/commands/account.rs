@@ -1,14 +1,13 @@
 use icrc_ledger_types::icrc1::account::Account;
 
-
 use liquidium_pipeline_connectors::account::icp_account::RECOVERY_ACCOUNT;
 use std::fs::{self, OpenOptions};
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
 use std::{env, io::Write, path::PathBuf};
 
-use bip39::{Language, Mnemonic};
 use alloy::signers::local::PrivateKeySigner;
+use bip39::{Language, Mnemonic};
 
 use prettytable::{Cell, Row, Table, format};
 
@@ -65,10 +64,10 @@ fn default_mnemonic_path() -> PathBuf {
 }
 
 fn expand_tilde(p: &str) -> PathBuf {
-    if let Some(stripped) = p.strip_prefix("~/") {
-        if let Ok(home) = env::var("HOME") {
-            return PathBuf::from(home).join(stripped);
-        }
+    if let Some(stripped) = p.strip_prefix("~/")
+        && let Ok(home) = env::var("HOME")
+    {
+        return PathBuf::from(home).join(stripped);
     }
     PathBuf::from(p)
 }
