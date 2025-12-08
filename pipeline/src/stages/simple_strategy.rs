@@ -127,6 +127,7 @@ where
             .collect()
     }
 
+    #[allow(clippy::type_complexity)]
     fn build_combos(
         &self,
         work_users: &[LiquidatebleUser],

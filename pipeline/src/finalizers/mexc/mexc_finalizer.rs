@@ -3,31 +3,28 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use candid::Principal;
 use icrc_ledger_types::icrc1::account::Account;
-use liquidium_pipeline_connectors::backend::cex_backend::{CexBackend, DepositAddress};
+use liquidium_pipeline_connectors::backend::cex_backend::CexBackend;
 use liquidium_pipeline_core::{
     account::model::ChainAccount,
     tokens::chain_token_amount::ChainTokenAmount,
-    transfer::{actions::TransferActions, transfer_service::TransferService},
+    transfer::actions::TransferActions,
 };
 use log::debug;
-use serde::{Deserialize, Serialize};
 
 use crate::{
-    config::ConfigTrait,
     finalizers::cex_finalizer::{CexFinalizerLogic, CexState, CexStep},
     stages::executor::ExecutionReceipt,
-    swappers::{mexc::mexc_adapter::MexcClient, model::SwapExecution},
+    swappers::model::SwapExecution,
 };
 
-use num_traits::ToPrimitive;
 
-/// MEXC-specific implementation of the generic CEX finalizer logic.
-///
-/// This is a thin state machine wrapper around the generic `CexState`:
-/// - `prepare` initializes the state from a liquidation id / receipt plus static config
-/// - `deposit` transitions Deposit -> Trade
-/// - `trade` transitions Trade -> Withdraw
-/// - `withdraw` transitions Withdraw -> Completed
+// MEXC-specific implementation of the generic CEX finalizer logic.
+//
+// This is a thin state machine wrapper around the generic `CexState`:
+// - `prepare` initializes the state from a liquidation id / receipt plus static config
+// - `deposit` transitions Deposit -> Trade
+// - `trade` transitions Trade -> Withdraw
+// - `withdraw` transitions Withdraw -> Completed
 pub struct MexcFinalizer<C>
 where
     C: CexBackend,

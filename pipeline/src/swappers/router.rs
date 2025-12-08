@@ -43,8 +43,7 @@ impl SwapRouter {
 
     fn pick_venue<'a>(&'a self, req: &SwapRequest) -> &'a Arc<dyn SwapVenue> {
         let v = self.venues.get(&req.venue_hint.clone().unwrap_or("kong".to_owned()));
-        let v = v.expect(&format!("{:?} venue not found", req.venue_hint));
-        v
+        (v.unwrap_or_else(|| panic!("{:?} venue not found", req.venue_hint))) as _
     }
 
     pub async fn init(&self) {

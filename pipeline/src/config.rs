@@ -44,10 +44,10 @@ pub trait ConfigTrait: Send + Sync {
     fn get_trader_principal(&self) -> Principal;
     fn should_buy_bad_debt(&self) -> bool;
     fn get_max_allowed_dex_slippage(&self) -> u32;
+    #[allow(dead_code)]
     fn get_lending_canister(&self) -> Principal;
+    #[allow(dead_code)]
     fn get_recovery_account(&self) -> Account;
-    fn exchange_deposit_account_for(&self, chain: &str) -> Result<Account, String>;
-    fn exchange_withdraw_address_for(&self, chain: &str) -> Result<String, String>;
     fn get_swapper_mode(&self) -> SwapperMode;
     fn get_cex_credentials(&self, cex: &str) -> Result<(String, String), String>;
 }
@@ -74,23 +74,6 @@ impl ConfigTrait for Config {
 
     fn get_lending_canister(&self) -> Principal {
         self.lending_canister
-    }
-
-    fn exchange_deposit_account_for(&self, _chain: &str) -> Result<Account, String> {
-        // For now, reuse the recovery account as the MEXC IC inbox.
-        // This can be refined later per-asset if needed.
-        Ok(self.get_recovery_account())
-    }
-
-    fn exchange_withdraw_address_for(&self, chain: &str) -> Result<String, String> {
-        let var = format!("EXCHANGE_WITHDRAW_{}", chain);
-        match std::env::var(&var).or_else(|_| std::env::var("EXCHANGE_WITHDRAW_DEFAULT")) {
-            Ok(addr) => Ok(addr),
-            Err(_) => Err(format!(
-                "No withdraw address configured for chain {} (tried {} and EXCHANGE_WITHDRAW_DEFAULT)",
-                chain, var
-            )),
-        }
     }
 
     fn get_max_allowed_dex_slippage(&self) -> u32 {

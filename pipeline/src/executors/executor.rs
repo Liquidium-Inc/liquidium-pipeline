@@ -1,4 +1,3 @@
-use std::default;
 
 use candid::Nat;
 use liquidium_pipeline_core::{tokens::chain_token::ChainToken, types::protocol_types::LiquidationRequest};

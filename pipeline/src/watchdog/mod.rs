@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use candid::Principal;
 use ic_agent::export::reqwest;
 use serde::Serialize;
 use std::{
@@ -30,14 +31,16 @@ pub struct WebhookWatchdog {
     url: String,
     cooldown: Duration,
     last: Mutex<HashMap<String, Instant>>,
+    account: Option<Principal>,
     client: reqwest::Client,
 }
 
 impl WebhookWatchdog {
-    pub fn new(url: impl Into<String>, cooldown: Duration) -> Self {
+    pub fn new(url: impl Into<String>, cooldown: Duration, principal: Option<Principal>) -> Self {
         Self {
             url: url.into(),
             cooldown,
+            account: principal,
             last: Mutex::new(HashMap::new()),
             client: reqwest::Client::builder()
                 .timeout(Duration::from_secs(5))
@@ -73,6 +76,7 @@ impl Watchdog for WebhookWatchdog {
 
         let payload = serde_json::json!({
             "ts": chrono::Utc::now().timestamp(),
+            "account": self.account,
             "event": ev,
         });
 
@@ -85,9 +89,15 @@ impl Watchdog for WebhookWatchdog {
 pub fn noop_watchdog() -> Arc<dyn Watchdog> {
     Arc::new(NoopWatchdog)
 }
+
+pub fn account_monitor_watchdog(default_cooldown: Duration, account: Principal) -> Arc<dyn Watchdog> {
+    let url = "TODO".to_string();
+    Arc::new(WebhookWatchdog::new(url, default_cooldown, Some(account)))
+}
+
 pub fn webhook_watchdog_from_env(default_cooldown: Duration) -> Arc<dyn Watchdog> {
     if let Ok(url) = std::env::var("WATCHDOG_WEBHOOK") {
-        Arc::new(WebhookWatchdog::new(url, default_cooldown))
+        Arc::new(WebhookWatchdog::new(url, default_cooldown, None))
     } else {
         noop_watchdog()
     }

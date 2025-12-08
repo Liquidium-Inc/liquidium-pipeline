@@ -25,8 +25,6 @@ use liquidium_pipeline_connectors::{
 use crate::config::Config;
 use crate::swappers::kong::kong_swapper::KongSwapSwapper;
 use crate::swappers::kong::kong_venue::KongVenue;
-use crate::swappers::mexc::mexc_adapter::MexcClient;
-use crate::swappers::mexc::mexc_swapper::MexcSwapVenue;
 use crate::swappers::router::{SwapRouter, SwapVenue};
 
 pub struct PipelineContext {

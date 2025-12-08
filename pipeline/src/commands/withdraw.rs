@@ -1,5 +1,4 @@
 use dialoguer::{Confirm, Input, Select, theme::ColorfulTheme};
-use liquidium_pipeline::{config::ConfigTrait, context::init_context};
 
 use std::collections::HashMap;
 use std::str::FromStr;
@@ -18,6 +17,9 @@ use liquidium_pipeline_core::tokens::{
 use liquidium_pipeline_core::account::model::ChainAccount;
 
 use alloy::primitives::Address as EvmAddress;
+
+use crate::config::ConfigTrait;
+use crate::context::init_context;
 
 enum Destination {
     Icp(Account),
@@ -542,6 +544,7 @@ fn decimal_to_units(dec_str: &str, decimals: u8) -> Option<u128> {
 /// - `destination`: "main" | full Account text (e.g., "aaaaa-aa" or "aaaaa-aa:beef...")
 /// - `asset`: token symbol (e.g., "ckUSDT") | "all"
 /// - `amount`: decimal string (respects token decimals) | "all"
+#[allow(dead_code)]
 pub async fn withdraw_noninteractive(source: &str, destination: &str, asset: &str, amount: &str) {
     println!("\n=== Withdraw (non-interactive) ===\n");
 
@@ -688,7 +691,7 @@ pub async fn withdraw_noninteractive(source: &str, destination: &str, asset: &st
     };
 
     for (asset_id, _tok, amt, bal_fmt) in plan {
-        let to = ChainAccount::Icp(dst_account.clone());
+        let to = ChainAccount::Icp(dst_account);
 
         match transfer_service
             .transfer_by_asset_id(&asset_id, to.clone(), amt.value)

@@ -11,7 +11,7 @@ use crate::{
     wal::{decode_meta, encode_meta, liq_id_from_receipt, wal_load},
 };
 
-use log::debug;
+use log::{debug,error};
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum CexStep {
@@ -109,20 +109,15 @@ impl Finalizer for dyn CexFinalizerLogic {
             self.prepare(&liq_id, &receipt).await?
         };
 
-        // Run as many steps as possible in one finalize call.
-        // We rely on WAL for crash recovery, but in the happy path we
-        // want to progress Deposit -> Trade -> Withdraw -> Completed
-        // within a single invocation if each leg succeeds.
-        let mut step_res: Result<(), String> = Ok(());
-
+        let mut row_after = row;
         loop {
-            step_res = match cex_state.step {
+           let step_res = match cex_state.step {
                 CexStep::Deposit => {
                     debug!("[cex] liq_id={} step=Deposit", cex_state.liq_id);
                     self.deposit(&mut cex_state).await
                 }
                 CexStep::DepositPending => {
-                    // Deposit did not arrive, we cannot break yet, so break;
+                    // Deposit did not arrive, we cannot progress further in this call.
                     break;
                 }
                 CexStep::Trade => {
@@ -138,7 +133,7 @@ impl Finalizer for dyn CexFinalizerLogic {
                     break;
                 }
                 CexStep::Failed => {
-                    step_res = Err("CEX finalizer in Failed state".to_string());
+                    error!("[cex] liq_id={} step=Err (noop)", cex_state.liq_id);
                     break;
                 }
             };
@@ -147,16 +142,18 @@ impl Finalizer for dyn CexFinalizerLogic {
             if step_res.is_err() {
                 break;
             }
-        }
 
-        // Persist updated CexLiqMetaWrapper with new cex_state
-        let mut row_after = row;
-        meta.meta = serde_json::to_vec(&cex_state).map_err(|e| e.to_string())?;
-        encode_meta(&mut row_after, &meta)?;
+            // Persist state after each successful step so we can resume safely on crash.
+            meta.meta = serde_json::to_vec(&cex_state).map_err(|e| e.to_string())?;
+            encode_meta(&mut row_after, &meta)?;
+            wal.upsert_result(row_after.clone()).await.map_err(|e| e.to_string())?;
+        }
 
         // If completed, mark as succeeded and build final SwapExecution; otherwise just persist state
         let res = if matches!(cex_state.step, CexStep::Completed) {
             row_after.status = ResultStatus::Succeeded;
+            meta.meta = serde_json::to_vec(&cex_state).map_err(|e| e.to_string())?;
+            encode_meta(&mut row_after, &meta)?;
             wal.upsert_result(row_after).await.map_err(|e| e.to_string())?;
 
             let swap_exec = self.finish(&receipt, &cex_state).await?;
@@ -165,7 +162,7 @@ impl Finalizer for dyn CexFinalizerLogic {
                 finalized: true,
             }
         } else {
-            // Minimal change: just persist the updated state.
+            // Minimal change: just persist the updated state (already done in-loop).
             wal.upsert_result(row_after).await.map_err(|e| e.to_string())?;
             FinalizerResult::noop()
         };

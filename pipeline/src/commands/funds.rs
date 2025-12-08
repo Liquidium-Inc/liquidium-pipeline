@@ -1,8 +1,11 @@
-use liquidium_pipeline::{config::ConfigTrait, context::init_context};
+
 use prettytable::{format, Cell, Row, Table};
 
 use liquidium_pipeline_core::tokens::{asset_id::AssetId, chain_token_amount::ChainTokenAmount};
 use liquidium_pipeline_core::tokens::token_registry::TokenRegistryTrait;
+
+use crate::config::ConfigTrait;
+use crate::context::init_context;
 pub async fn funds() -> Result<(), String> {
     let ctx = init_context().await?;
 

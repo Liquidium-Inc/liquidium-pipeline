@@ -44,12 +44,10 @@ impl<A: PipelineAgent> KongSwapSwapper<A> {
 
     pub async fn init(&self, tokens: &[Principal]) -> Result<(), String> {
         let owner = self.dex_account.owner;
-        let this = &*self;
+        let this = self;
 
         let futures = tokens.iter().map(|token| {
             let token = *token;
-            let owner = owner;
-            let this = this;
 
             async move {
                 let allowance = this.check_allowance(&token, &owner).await;

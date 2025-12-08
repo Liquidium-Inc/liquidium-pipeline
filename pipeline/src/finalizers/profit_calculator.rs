@@ -26,8 +26,8 @@ impl ProfitCalculator for SimpleProfitCalculator {
 
     fn realized(&self, liq: &LiquidationResult, swap: Option<&SwapExecution>) -> i128 {
         // For now just echo expected; replace with real realized PnL logic
-        if swap.is_some() {
-            let res = swap.unwrap().receive_amount.clone() - liq.amounts.debt_repaid.clone();
+        if let Some(swap) = swap {
+            let res = swap.receive_amount.clone() - liq.amounts.debt_repaid.clone();
             return res.0.to_i128().expect("could not covert profit to integer");
         }
 

@@ -57,8 +57,6 @@ impl MexcClient {
 
         Ok(Self::new(&api_key, &api_secret))
     }
-
-
 }
 
 #[async_trait]
@@ -190,7 +188,7 @@ impl CexBackend for MexcClient {
         let balance = res
             .balances
             .iter()
-            .find(|item| item.asset == asset.to_string())
+            .find(|item| item.asset == asset)
             .cloned()
             .unwrap_or(AccountBalance {
                 asset: asset.to_string(),

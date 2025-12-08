@@ -24,7 +24,7 @@ use crate::{
         simple_strategy::SimpleLiquidationStrategy,
     },
     swappers::{mexc::mexc_adapter::MexcClient, router::SwapRouter},
-    watchdog::{WatchdogEvent, webhook_watchdog_from_env},
+    watchdog::{WatchdogEvent, account_monitor_watchdog, webhook_watchdog_from_env},
 };
 use ic_agent::Agent;
 
@@ -93,7 +93,7 @@ async fn init(
     // Base DEX finalizer (Kong swapper)
     let kong_finalizer = Arc::new(KongSwapFinalizer::new(ctx.swap_router.clone()));
 
-    let mexc_finalizer = if let Some((api_key, secret)) = ctx.config.get_cex_credentials("mexc").ok() {
+    let mexc_finalizer = if let Ok((api_key, secret)) = ctx.config.get_cex_credentials("mexc") {
         let mexc_client = Arc::new(MexcClient::new(&api_key, &secret));
         let mexc_finalizer = Arc::new(MexcFinalizer::new(mexc_client, ctx.main_transfers.actions()));
         Some(mexc_finalizer)
@@ -182,6 +182,9 @@ pub async fn run_liquidation_loop() {
         })
         .collect();
 
+    // Setup liquidity monitor
+    let liq_dog = account_monitor_watchdog(Duration::from_secs(5), ctx.config.liquidator_principal);
+
     // Create the spinner for fancy UI
     let start_spinner = || {
         let spinner = ProgressBar::new_spinner();
@@ -237,6 +240,9 @@ pub async fn run_liquidation_loop() {
         print_execution_results(outcomes);
         spinner = start_spinner();
         spinner.set_message("Scanning for liquidation opportunities...");
+
+        // Send liquidity monitor heart beat
+        let _ = liq_dog.notify(WatchdogEvent::Heartbeat { stage: "Running" }).await;
         sleep(Duration::from_secs(5));
     }
 }

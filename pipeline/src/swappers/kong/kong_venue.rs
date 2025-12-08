@@ -3,7 +3,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use candid::Principal;
 use liquidium_pipeline_connectors::pipeline_agent::PipelineAgent;
-use liquidium_pipeline_core::tokens::{chain_token::ChainToken, chain_token_amount::ChainTokenAmount};
+use liquidium_pipeline_core::tokens::chain_token::ChainToken;
 use log::info;
 
 use crate::swappers::kong::kong_swapper::KongSwapSwapper;
@@ -32,15 +32,6 @@ impl<A: PipelineAgent> KongVenue<A> {
             .find(|t| t.symbol() == symbol)
             .cloned()
             .ok_or_else(|| format!("Unknown ICRC token symbol in KongVenue: {}", symbol))
-    }
-
-    fn build_amount(&self, req: &SwapRequest) -> Result<ChainTokenAmount, String> {
-        let pay_token = self.find_token(&req.pay_asset.symbol)?;
-        let value = req.pay_amount.value.clone();
-        Ok(ChainTokenAmount {
-            token: pay_token,
-            value,
-        })
     }
 }
 

@@ -3,7 +3,7 @@ use candid::Encode;
 
 use futures::{TryFutureExt, future::join_all};
 use log::{debug, warn};
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use serde::{Deserialize, Serialize};
 
 use crate::{
     executors::{basic::basic_executor::BasicExecutor, executor::ExecutorRequest},
@@ -139,7 +139,7 @@ impl<A: PipelineAgent, D: WalStore> BasicExecutor<A, D> {
         debug!("Storing execution log...");
         let liq_id = liq_id_from_receipt(receipt)?;
 
-        let outcome = LiquidationOutcome {
+        let _outcome = LiquidationOutcome {
             execution_receipt: receipt.clone(),
             expected_profit: executor_request.expected_profit,
             request: executor_request.clone(),
