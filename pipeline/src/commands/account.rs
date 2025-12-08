@@ -64,6 +64,15 @@ fn default_mnemonic_path() -> PathBuf {
     PathBuf::from(home).join(".liquidium-pipeline/wallets/mnemonic.txt")
 }
 
+fn expand_tilde(p: &str) -> PathBuf {
+    if let Some(stripped) = p.strip_prefix("~/") {
+        if let Ok(home) = env::var("HOME") {
+            return PathBuf::from(home).join(stripped);
+        }
+    }
+    PathBuf::from(p)
+}
+
 pub async fn new() {
     // Load config locations if you haven't already done that globally
     let _ = dotenv::from_filename(format!(
@@ -75,7 +84,7 @@ pub async fn new() {
     // Path where we will store the mnemonic phrase.
     // Can be overridden with MNEMONIC_FILE, otherwise defaults under $HOME.
     let mnemonic_path: PathBuf = env::var("MNEMONIC_FILE")
-        .map(PathBuf::from)
+        .map(|p| expand_tilde(&p))
         .unwrap_or_else(|_| default_mnemonic_path());
 
     if mnemonic_path.exists() {
