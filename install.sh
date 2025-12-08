@@ -117,7 +117,11 @@ echo "  ${BIN_NAME} run"
 echo ""
 echo "Other commands:"
 echo "  ${BIN_NAME} balance"
-echo "  ${BIN_NAME} withdraw <asset_principal> <amount> <to_principal>"
-echo "  Added $USER_BIN to PATH in $PROFILE. Reload your shell or 'source $PROFILE'."
+echo "  ${BIN_NAME} withdraw"
+if [[ -n "${PROFILE:-}" ]]; then
+  echo "  Added $USER_BIN to PATH in $PROFILE. Reload your shell or 'source $PROFILE'."
+else
+  echo "  Ensure $USER_BIN is in your PATH (for example by adding 'export PATH=\"$USER_BIN:\$PATH\"' to ~/.bashrc or ~/.zshrc)."
+fi
 echo ""
 echo "Update later: re-run the same curl | bash command."
