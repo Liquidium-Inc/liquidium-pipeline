@@ -3,3 +3,5 @@ id.pem
 .env
 executions.csv
 trader.pem
+key
+wal.db
