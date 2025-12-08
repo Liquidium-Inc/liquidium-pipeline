@@ -1,0 +1,32 @@
+[package]
+name = "liquidium-pipeline-connectors"
+version = "0.1.0"
+edition = "2024"
+
+
+[lib]
+crate-type = ["lib"]
+
+[lints.clippy]
+double_parens = "allow"
+type_complexity = "allow"
+
+[dependencies]
+serde = { workspace = true }
+alloy = { workspace = true }
+candid = { workspace = true }
+async-trait = { workspace = true }
+ic-agent = { workspace = true }
+icrc-ledger-agent = { workspace = true }
+icrc-ledger-types = { workspace = true }
+log = { workspace = true }
+mockall = { workspace = true }
+tokio = { workspace = true }
+hex = { workspace = true }
+num-traits = { workspace = true }
+
+bip39 = "2.2.0"
+bip32 = "0.5.3"
+k256 = "0.13.0"
+num-bigint = "0.4.6"
+liquidium-pipeline-core = { path = "../core" }
