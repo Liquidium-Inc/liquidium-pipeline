@@ -14,6 +14,15 @@ use std::collections::HashMap;
 use std::env;
 use std::sync::Arc;
 
+fn expand_tilde(p: &str) -> std::path::PathBuf {
+    if let Some(stripped) = p.strip_prefix("~/") {
+        if let Ok(home) = std::env::var("HOME") {
+            return std::path::PathBuf::from(home).join(stripped);
+        }
+    }
+    std::path::PathBuf::from(p)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SwapperMode {
     Dex,
@@ -116,7 +125,7 @@ impl Config {
         let ic_url = env::var("IC_URL").unwrap();
         let export_path = env::var("EXPORT_PATH").unwrap_or("executions.csv".to_string());
 
-        let mnemonic_path = env::var("MNEMONIC_FILE").expect("MNEMONIC_FILE not configured");
+        let mnemonic_path = expand_tilde(&env::var("MNEMONIC_FILE").expect("MNEMONIC_FILE not configured"));
 
         let mnemonic = std::fs::read_to_string(&mnemonic_path)
             .expect("failed to read mnemonic file")

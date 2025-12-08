@@ -1,17 +1,21 @@
 # 🧯 Liquidator Bot Framework for ICP
 
-A modular, event-driven off-chain liquidation bot framework for [Internet Computer (ICP)](https://internetcomputer.org/) protocols.  
+A modular, event-driven off-chain liquidation bot framework for [Internet Computer (ICP)](https://internetcomputer.org/) protocols.
 Inspired by Artemis/MEV patterns and designed for permissionless, community-driven liquidations.
 
 ---
 
 ## ✨ Features
 
-- 🔁 **Pipeline Architecture** — Composable stages for discovery, execution, and swaps.
-- ⚡ **Async Rust** — Highly concurrent and efficient.
+- 🔁 **Pipeline Architecture** — Composable stages for discovery, strategy, execution, finalization, and export.
+- ⚡ **Async Rust** — Highly concurrent and efficient with Tokio runtime.
+- 🔀 **Multi-Chain** — Primary support for ICP with EVM (Arbitrum) integration.
+- 💱 **Flexible Swaps** — DEX (Kong), CEX (MEXC), or Hybrid strategies.
 - 👷 **Extensible** — Add custom risk checks, strategies, swaps, or notification stages.
 - 📦 **Permissionless** — Anyone can run it.
+- 🔐 **Multi-Account** — Separate Liquidator, Trader, and Recovery identities for security.
 - 🧪 **CLI Interface** — Manage balances, funds, and identities.
+- 💾 **Persistent State** — SQLite WAL ensures no double-liquidations and supports retries.
 
 ---
 
@@ -23,174 +27,245 @@ curl -fsSL https://raw.githubusercontent.com/Liquidium-Inc/liquidium-pipeline/ma
 
 This will:
 
-- Clone/update the repo
-- Build the liquidator binary
-- Install it to /usr/local/bin/liquidator
-- Create ~/.config/liquidator/config.env if it doesn’t exist
+- Clone/update the repo to `~/.liquidium-pipeline/repo`
+- Build the liquidator binary in release mode
+- Install it to `~/.local/bin/liquidator`
+- Create `~/.liquidium-pipeline/config.env` if it doesn't exist
 
-⸻
+> 💡 Set `SKIP_RUST=true` before running to skip Rust installation if already present.
 
-⚙ Configuration
+---
 
-The bot loads configuration from:
+## ⚙️ Configuration
 
-1. ~/.config/liquidator/config.env (preferred, created automatically)
+The bot loads configuration from (in order of precedence):
 
-2. .env in the current directory (optional overrides)
+1. Environment variables (direct overrides)
+2. `.env` in the current directory (optional overrides)
+3. `~/.config/liquidator/config.env` (user-level defaults)
 
-Example config.env:
+### Core Configuration
 
 ```bash
+# ICP Blockchain
 IC_URL=https://ic0.app
-IDENTITY_PEM=/home/youruser/.config/liquidator/id.pem
-LENDING_CANISTER=ryjl3-tyaaa-aaaaa-aaaba-cai
+LENDING_CANISTER=nja4y-2yaaa-aaaae-qddxa-cai
+
+# EVM Blockchain (Optional)
+EVM_RPC_URL=https://arb1.arbitrum.io/rpc
+
+# Identity
+MNEMONIC_FILE=~/.liquidium-pipeline/wallets/key
+# Or use PEM directly:
+# IDENTITY_PEM=~/.config/liquidator/id.pem
+
+# Assets (comma-separated principal:symbol pairs)
+DEBT_ASSETS=principal1:ckBTC,principal2:ckUSDT,principal3:ICP
+COLLATERAL_ASSETS=principal1:ckBTC,principal2:ckUSDT,principal3:ICP
+```
+
+### Swap Configuration
+
+```bash
+# Swap strategy: dex | cex | hybrid
+SWAPPER=hybrid
+
+# DEX (Kong)
+KONG_SWAP_BACKEND=2ipq2-uqaaa-aaaar-qailq-cai
+MAX_ALLOWED_DEX_SLIPPAGE=7500  # 0.75% in basis points
+
+# CEX (MEXC) - Optional
+CEX_LIST=mexc
+CEX_MEXC_API_KEY=your_api_key
+CEX_MEXC_API_SECRET=your_api_secret
+```
+
+### Storage & Export
+
+```bash
+DB_PATH=./wal.db
 EXPORT_PATH=executions.csv
-BUY_BAD_DEBT=false
-
-# Comma-separated principal:symbol
-DEBT_ASSETS=principal1:BTC,principal2:ETH
-COLLATERAL_ASSETS=principal3:ckBTC,principal4:ckETH
-WATCHDOG_WEBHOOK=http://...
+BUY_BAD_DEBT=false  # Set to true to liquidate even if not profitable
 ```
 
-🔔 WATCHDOG_WEBHOOK
+### Monitoring
 
-If set, the bot will send a POST request with JSON payloads to the given URL.
-
-Use this for monitoring and alerting (e.g. Slack, Discord, or your own service).
-
-⸻
-
-🔑 Identity Management
-
-Generate a new Ed25519 identity or show existing identities:
-
+```bash
+WATCHDOG_WEBHOOK=https://your-webhook-url.com/endpoint
 ```
+
+> 🔔 **WATCHDOG_WEBHOOK**: If set, the bot sends POST requests with JSON payloads for monitoring and alerting (e.g., Slack, Discord, or custom services).
+
+---
+
+## 🔑 Identity Management
+
+The bot uses **three identities** derived from a BIP39 mnemonic for security:
+
+| Identity | Purpose | Description |
+|----------|---------|-------------|
+| **Liquidator** | Main account | Initiates liquidations, receives collateral |
+| **Trader** | Swap execution | Isolated swap operations (reduces MEV risk) |
+| **Recovery** | Fallback | Catches failed collateral transfers |
+
+### Generate New Identities
+
+```bash
 liquidator account new
+```
+
+Creates new Ed25519/Secp256k1 identities for all three roles.
+
+### Show Existing Identities
+
+```bash
 liquidator account show
 ```
 
-Both commands now manage and display **liquidator**, **trader**, and **recovery** identities. The output is presented in a table format showing all relevant principals and their statuses.
+Displays a table of all identities with their principals and statuses.
 
-By default, identities are stored at:
+---
+
+## 🏗️ Architecture Overview
+
+### Crate Structure
 
 ```
-~/.config/liquidator/id.pem
+liquidium-pipeline/
+├── core/        # Chain-agnostic types, tokens, balance service, RAY math
+├── connectors/  # ICP/EVM backends, key derivation, canister calls
+├── pipeline/    # Main app - stages, executors, finalizers, CLI
+└── commons/     # Shared utilities and error types
 ```
 
-Change location by setting IDENTITY_PEM in config.env.
-
-⸻
-
-🏗️ Architecture Overview
-
-Pipeline Stages
+### Pipeline Stages
 
 ```mermaid
 flowchart LR
-    A[Opportunity Discovery] --> B[Liquidation Execution]
-    B --> C[Asset Swap]
-    C --> D[Reporting / Export]
+    A[Opportunity Discovery] --> B[Strategy Filter]
+    B --> C[Liquidation Execution]
+    C --> D[Swap Finalization]
+    D --> E[Export / Reporting]
 ```
 
-- Opportunity Discovery → Polls ICP canisters for loans or positions eligible for liquidation.
-- Liquidation Execution → Calls the canister to liquidate an at-risk position, seizing collateral.
-- Asset Swap → Swaps seized collateral for a desired asset.
-- Reporting / Export → Saves execution details to CSV or external systems.
+| Stage | Description |
+|-------|-------------|
+| **Opportunity Discovery** | Polls lending canister for at-risk positions |
+| **Strategy Filter** | Filters opportunities by profitability and supported assets |
+| **Liquidation Execution** | Calls `liquidate()` on lending canister, seizes collateral |
+| **Swap Finalization** | Swaps collateral via DEX/CEX/Hybrid strategy |
+| **Export / Reporting** | Saves execution details to CSV |
 
-Stages are implemented with async-trait for composability.
+Stages are implemented with `async-trait` for composability.
 
-⸻
+### Swap Strategies
 
-🧪 CLI Commands
+| Strategy | Description |
+|----------|-------------|
+| **DEX** | Swaps via Kong on ICP. Retries with increasing slippage (0.75% → 5%). |
+| **CEX** | Deposits to MEXC, swaps, and withdraws. |
+| **Hybrid** | Tries DEX first, falls back to CEX on failure. |
 
-Run loop:
+### Retry & State Management
 
-```
+- **SQLite WAL** tracks liquidation state across restarts
+- **Retryable failures** retry up to 5 times with exponential backoff
+- **Idempotent operations** prevent double-liquidations
+
+---
+
+## 🧪 CLI Commands
+
+### Run the Liquidation Loop
+
+```bash
 liquidator run
 ```
 
-Check balances:
+Starts the main liquidation loop that continuously monitors and executes liquidations.
 
-```
+### Check Balances
+
+```bash
 liquidator balance
 ```
 
-This command now displays both **main** and **recovery** balances, with recovery balances marked as “seized collateral (stale, pending withdrawal if swaps failed)”.
+Displays both **main** and **recovery** balances. Recovery balances are marked as "seized collateral (stale, pending withdrawal if swaps failed)".
 
-Withdraw funds:
+### Withdraw Funds
 
-### Interactive withdraw wizard
+#### Interactive Wizard
 
-Run the withdraw command without flags to launch an interactive wizard:
-
-```
+```bash
 liquidator withdraw
 ```
 
-This wizard helps you select the asset, amount (supports typing “all” to withdraw the full balance), and destination principal. It auto-resolves your current balances and confirms the transaction before execution.
+Launches an interactive wizard to select source account, asset, amount, and destination.
 
-### Non-interactive withdraw (flags)
-
-For automation or scripting, you can use flags:
-
-```
-liquidator withdraw --asset <ASSET_PRINCIPAL> --amount <AMOUNT|all> --to <TO_PRINCIPAL>
-```
-
-Example:
-
-```
-liquidator withdraw --asset principal1 --amount all --to principalX
-```
-
-This mode skips prompts, auto-resolves balances, supports “all” as amount, and requires confirmation before executing.
-
-Show identity principals and management:
-
-```
-liquidator account show
-```
-
-This displays a table of **liquidator**, **trader**, and **recovery** identities with their principals.
-
-Generate new identities:
-
-```
-liquidator account new
-```
-
-Creates new Ed25519 identities for liquidator, trader, and recovery roles.
-
-⸻
-
-🛠 Developer Setup
+#### Non-Interactive (Flags)
 
 ```bash
-git clone https://github.com/Liquidium-Inc/liquidium-pipeline.git
-
-cd liquidium-pipeline
-
-cargo build --release
-
-Binary will be at:
-
-target/release/liquidator
-
+liquidator withdraw \
+  --source main \
+  --destination <TO_PRINCIPAL> \
+  --asset <ASSET_SYMBOL> \
+  --amount <AMOUNT|all>
 ```
 
-⸻
+**Options:**
+- `--source`: `main` or `recovery`
+- `--destination`: Target principal
+- `--asset`: Asset symbol (e.g., `ckBTC`, `ckUSDT`, `ICP`)
+- `--amount`: Specific amount or `all` for full balance
 
-📝 Notes
+**Example:**
+```bash
+liquidator withdraw --source main --destination abc123-xyz --asset ckUSDT --amount all
+```
 
-- Works with ICRC-1 assets like ckBTC
+---
+
+## 🛠️ Developer Setup
+
+```bash
+# Clone the repository
+git clone https://github.com/Liquidium-Inc/liquidium-pipeline.git
+cd liquidium-pipeline
+
+# Build in release mode
+cargo build --release
+
+# Binary location
+./target/release/liquidator
+```
+
+### Run Tests
+
+```bash
+cargo test
+```
+
+### Environment Logging
+
+Set `RUST_LOG` for debug output:
+
+```bash
+RUST_LOG=debug liquidator run
+```
+
+---
+
+## 📝 Notes
+
+- Works with ICRC-1/ICRC-2 assets (ckBTC, ckUSDT, ICP, etc.)
 - Identity/config can be system-wide or project-local
 - Composable stages allow for custom liquidation strategies
+- EVM support enables cross-chain liquidations (Arbitrum)
 
-💡 Tip: You can use either interactive wizards or CLI flags for automation (e.g. cron jobs, scripts).
+> 💡 **Tip:** Use interactive wizards for manual operations or CLI flags for automation (cron jobs, scripts).
 
-⸻
+---
 
-📄 License
+## 📄 License
 
 MIT
