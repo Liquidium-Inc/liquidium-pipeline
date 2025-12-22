@@ -43,9 +43,30 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-# Safe reset of repo dir and releases; keep INSTALL_DIR for user config and other data
-rm -rf "$REPO_DIR" "$RELEASES_DIR"
-mkdir -p "$INSTALL_DIR" "$REPO_DIR" "$RELEASES_DIR" "$USER_BIN"
+# ===== Native toolchain (cc) =====
+if command -v cc >/dev/null 2>&1; then
+  echo "C compiler found: $(cc --version | head -n1)"
+else
+  if command -v apt-get >/dev/null 2>&1; then
+    echo "On Debian/Ubuntu, install build tools:"
+    echo "  sudo apt-get update && sudo apt-get install -y build-essential"
+    echo ""
+    exit 1
+  elif command -v yum >/dev/null 2>&1; then
+    echo "On RHEL/CentOS, install build tools:"
+    echo "  sudo yum groupinstall 'Development Tools'"
+    echo ""
+    exit 1
+  elif command -v apk >/dev/null 2>&1; then
+    echo "On Alpine, install build tools:"
+    echo "  apk add build-base"
+    echo ""
+    exit 1
+  else
+    echo "No C compiler found and unable to auto-install build tools. Please install a C compiler (gcc/clang)."
+    exit 1
+  fi
+fi
 
 command -v git >/dev/null || { echo "git is required (install it via your package manager)"; exit 1; }
 

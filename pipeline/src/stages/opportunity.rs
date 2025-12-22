@@ -10,11 +10,16 @@ use crate::stage::PipelineStage;
 pub struct OpportunityFinder<A: PipelineAgent> {
     pub agent: Arc<A>,
     pub canister_id: Principal,
+    account_filter: Vec<Principal>,
 }
 
 impl<A: PipelineAgent> OpportunityFinder<A> {
-    pub fn new(agent: Arc<A>, canister_id: Principal) -> Self {
-        Self { agent, canister_id }
+    pub fn new(agent: Arc<A>, canister_id: Principal, account_filter: Vec<Principal>) -> Self {
+        Self {
+            agent,
+            canister_id,
+            account_filter,
+        }
     }
 }
 
@@ -57,10 +62,7 @@ where
         let opportunities: Vec<LiquidatebleUser> = opportunities
             .iter()
             .filter(|item| !item.positions.is_empty())
-            .filter(|item| {
-                item.account
-                    == Principal::from_text("h64ya-zt56r-44pvj-pjay2-j47ik-gv222-iw4mq-3wrll-yho5m-kmth4-kae").unwrap()
-            })
+            .filter(|item| self.account_filter.is_empty() || self.account_filter.contains(&item.account))
             .cloned()
             .collect();
 
@@ -130,7 +132,7 @@ mod tests {
         let mut agent = MockPipelineAgent::new();
         agent.expect_call_query().returning(move |_, _, _| Ok(users.clone()));
 
-        let finder = OpportunityFinder::new(Arc::new(agent), canister_id);
+        let finder = OpportunityFinder::new(Arc::new(agent), canister_id, vec![]);
 
         // supported_assets is a Vec of ck ledger principals as strings
         let supported_assets = vec![ckbtc_principal.to_string(), ckusdc_principal.to_string()];
@@ -188,7 +190,7 @@ mod tests {
         let mut agent = MockPipelineAgent::new();
         agent.expect_call_query().returning(move |_, _, _| Ok(users.clone()));
 
-        let finder = OpportunityFinder::new(Arc::new(agent), canister_id);
+        let finder = OpportunityFinder::new(Arc::new(agent), canister_id, vec![]);
 
         let supported_assets = vec![ckbtc_principal.to_string()];
 
@@ -199,5 +201,50 @@ mod tests {
         let positions = &result[0].positions;
         assert_eq!(positions.len(), 1);
         assert_eq!(positions[0].asset_type, AssetType::CkAsset(ckbtc_principal));
+    }
+
+    #[tokio::test]
+    async fn opportunity_finder_filters_by_configured_account() {
+        let canister_id = Principal::anonymous();
+        let target_account = Principal::from_slice(&[1; 29]);
+        let other_account = Principal::from_slice(&[2; 29]);
+
+        let position = LiquidateblePosition {
+            pool_id: Principal::anonymous(),
+            debt_amount: Nat::from(1_000u64),
+            collateral_amount: Nat::from(2_000u64),
+            asset: Assets::BTC,
+            asset_type: AssetType::CkAsset(Principal::anonymous()),
+            account: Principal::anonymous(),
+            liquidation_bonus: 60,
+            protocol_fee: 200,
+        };
+
+        let users = vec![
+            LiquidatebleUser {
+                account: target_account,
+                health_factor: Nat::from(1u64),
+                total_debt: Nat::from(1_000u64),
+                positions: vec![position.clone()],
+            },
+            LiquidatebleUser {
+                account: other_account,
+                health_factor: Nat::from(1u64),
+                total_debt: Nat::from(1_000u64),
+                positions: vec![position.clone()],
+            },
+        ];
+
+        let mut agent = MockPipelineAgent::new();
+        agent.expect_call_query().returning(move |_, _, _| Ok(users.clone()));
+
+        let finder = OpportunityFinder::new(Arc::new(agent), canister_id, vec![target_account]);
+
+        let supported_assets = vec![Principal::anonymous().to_string()];
+
+        let result = finder.process(&supported_assets).await.unwrap();
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].account, target_account);
     }
 }

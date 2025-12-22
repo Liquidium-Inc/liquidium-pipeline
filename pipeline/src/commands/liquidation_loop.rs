@@ -120,7 +120,7 @@ async fn init(
     let finalizer = Arc::new(FinalizeStage::new(db.clone(), hybrid_finalizer, profit_calc));
 
     info!("Initializing searcher stage ...");
-    let finder = OpportunityFinder::new(agent.clone(), config.lending_canister);
+    let finder = OpportunityFinder::new(agent.clone(), config.lending_canister, config.opportunity_account_filter.clone());
 
     info!("Initializing liquidations stage ...");
     let price_oracle = Arc::new(LiquidationPriceOracle::new(agent.clone(), config.lending_canister));

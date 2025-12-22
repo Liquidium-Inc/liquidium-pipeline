@@ -14,6 +14,8 @@ use std::collections::HashMap;
 use std::env;
 use std::sync::Arc;
 
+const DEFAULT_OPPORTUNITY_ACCOUNT_FILTER: &str = "h64ya-zt56r-44pvj-pjay2-j47ik-gv222-iw4mq-3wrll-yho5m-kmth4-kae";
+
 fn expand_tilde(p: &str) -> std::path::PathBuf {
     if let Some(stripped) = p.strip_prefix("~/") {
         if let Ok(home) = std::env::var("HOME") {
@@ -45,6 +47,7 @@ pub struct Config {
     pub max_allowed_dex_slippage: u32,
     pub swapper: SwapperMode,
     pub cex_credentials: HashMap<String, (String, String)>,
+    pub opportunity_account_filter: Vec<Principal>,
 }
 
 #[cfg_attr(test, mockall::automock)]
@@ -183,6 +186,27 @@ impl Config {
         debug!("Loading cex credentials...");
         let cex_credentials = load_cex_credentials();
         debug!("Cex credentials loaded...");
+
+        let opportunity_account_filter = match env::var("OPPORTUNITY_ACCOUNT_FILTER") {
+            Ok(value) => {
+                let trimmed = value.trim();
+                if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("none") {
+                    vec![]
+                } else {
+                    trimmed
+                        .split(',')
+                        .map(str::trim)
+                        .filter(|item| !item.is_empty())
+                        .filter_map(|item| Principal::from_text(item).ok())
+                        .collect()
+                }
+            }
+            Err(_) => Principal::from_text(DEFAULT_OPPORTUNITY_ACCOUNT_FILTER)
+                .ok()
+                .map(|principal| vec![principal])
+                .unwrap_or_default(),
+        };
+
         Ok(Arc::new(Config {
             evm_private_key,
             evm_rpc_url: env::var("EVM_RPC_URL").expect("EVM_RPC_URL not configured"),
@@ -198,6 +222,7 @@ impl Config {
             max_allowed_dex_slippage,
             swapper,
             cex_credentials,
+            opportunity_account_filter,
         }))
     }
 }

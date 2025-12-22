@@ -62,6 +62,9 @@ MNEMONIC_FILE=~/.liquidium-pipeline/wallets/key
 # Assets (comma-separated principal:symbol pairs)
 DEBT_ASSETS=principal1:ckBTC,principal2:ckUSDT,principal3:ICP
 COLLATERAL_ASSETS=principal1:ckBTC,principal2:ckUSDT,principal3:ICP
+
+# Optional: only scan specific borrower principals (comma-separated). Set to "none" to disable.
+OPPORTUNITY_ACCOUNT_FILTER=principal1,principal2
 ```
 
 ### Swap Configuration
