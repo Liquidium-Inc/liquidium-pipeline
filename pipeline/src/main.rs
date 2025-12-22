@@ -33,9 +33,6 @@ enum Commands {
     // Shows wallet token balances
     Balance,
 
-    // Runs the MEXC smoke test (deposit -> wait -> swap -> withdraw)
-    MexcSmoke,
-
     // Withdraws funds. Without flags, starts the interactive wizard.
     // With flags, performs a non-interactive withdrawal.
     Withdraw {
@@ -80,9 +77,6 @@ async fn main() {
         }
         Commands::Balance => {
             commands::funds::funds().await.unwrap();
-        }
-        Commands::MexcSmoke => {
-            // commands::mexc_smoke_test::mexc_finalizer_smoke_test().await.unwrap();
         }
         Commands::Withdraw {
             source,
