@@ -49,6 +49,50 @@ fn print_banner() {
     );
 }
 
+fn format_principal_list(items: &[Principal]) -> String {
+    if items.is_empty() {
+        "none".to_string()
+    } else {
+        items.iter().map(Principal::to_text).collect::<Vec<_>>().join(", ")
+    }
+}
+
+fn print_startup_table(config: &Config, debt_assets: &[String]) {
+    let mut table = Table::new();
+    table.set_format(*format::consts::FORMAT_NO_LINESEP_WITH_TITLE);
+    table.set_titles(Row::new(vec![Cell::new("Startup Configuration")]));
+
+    table.add_row(Row::new(vec![Cell::new("Network"), Cell::new(&config.ic_url)]));
+    table.add_row(Row::new(vec![
+        Cell::new("Liquidator Principal"),
+        Cell::new(&config.liquidator_principal.to_text()),
+    ]));
+    table.add_row(Row::new(vec![
+        Cell::new("Swapper Mode"),
+        Cell::new(&format!("{:?}", config.swapper)),
+    ]));
+    table.add_row(Row::new(vec![
+        Cell::new("Max DEX Slippage (bps)"),
+        Cell::new(&config.max_allowed_dex_slippage.to_string()),
+    ]));
+    table.add_row(Row::new(vec![
+        Cell::new("Buy Bad Debt"),
+        Cell::new(&config.buy_bad_debt.to_string()),
+    ]));
+    table.add_row(Row::new(vec![
+        Cell::new("Opportunity Filter"),
+        Cell::new(&format_principal_list(&config.opportunity_account_filter)),
+    ]));
+    let debt_assets_list = if debt_assets.is_empty() {
+        "none".to_string()
+    } else {
+        debt_assets.join(", ")
+    };
+    table.add_row(Row::new(vec![Cell::new("Debt Assets"), Cell::new(&debt_assets_list)]));
+
+    table.printstd();
+}
+
 async fn init(
     ctx: Arc<PipelineContext>,
 ) -> (
@@ -120,7 +164,11 @@ async fn init(
     let finalizer = Arc::new(FinalizeStage::new(db.clone(), hybrid_finalizer, profit_calc));
 
     info!("Initializing searcher stage ...");
-    let finder = OpportunityFinder::new(agent.clone(), config.lending_canister, config.opportunity_account_filter.clone());
+    let finder = OpportunityFinder::new(
+        agent.clone(),
+        config.lending_canister,
+        config.opportunity_account_filter.clone(),
+    );
 
     info!("Initializing liquidations stage ...");
     let price_oracle = Arc::new(LiquidationPriceOracle::new(agent.clone(), config.lending_canister));
@@ -161,8 +209,6 @@ pub async fn run_liquidation_loop() {
             panic!("Aborted by user.");
         }
     }
-    info!("Config loaded for network: {}", config.ic_url);
-
     // Use main IC agent (liquidator identity) from context
     info!("Agent initialized with principal: {}", config.liquidator_principal);
 
@@ -181,6 +227,8 @@ pub async fn run_liquidation_loop() {
             }
         })
         .collect();
+
+    print_startup_table(&config, &debt_assets);
 
     // Setup liquidity monitor
     let liq_dog = account_monitor_watchdog(Duration::from_secs(5), ctx.config.liquidator_principal);
@@ -205,24 +253,22 @@ pub async fn run_liquidation_loop() {
             vec![]
         });
 
-        if opportunities.is_empty() {
+        if !opportunities.is_empty() {
             sleep(Duration::from_secs(2));
             spinner = start_spinner();
-            continue;
+            spinner.finish_and_clear();
+            info!("Found {} opportunities", opportunities.len());
+
+            let executions = strategy.process(&opportunities).await.unwrap_or_else(|e| {
+                log::info!("Strategy processing failed: {e}");
+                vec![]
+            });
+
+            executor.process(&executions).await.unwrap_or_else(|e| {
+                log::error!("Executor failed: {e}");
+                vec![]
+            });
         }
-
-        spinner.finish_and_clear();
-        info!("Found {} opportunities", opportunities.len());
-
-        let executions = strategy.process(&opportunities).await.unwrap_or_else(|e| {
-            log::info!("Strategy processing failed: {e}");
-            vec![]
-        });
-
-        executor.process(&executions).await.unwrap_or_else(|e| {
-            log::error!("Executor failed: {e}");
-            vec![]
-        });
 
         let outcomes = finalizer.process(&()).await.unwrap_or_else(|e| {
             log::error!("Executor failed: {e}");
@@ -232,7 +278,7 @@ pub async fn run_liquidation_loop() {
         if outcomes.is_empty() {
             spinner = start_spinner();
             spinner.set_message("Scanning for liquidation opportunities...");
-            sleep(Duration::from_secs(30));
+            sleep(Duration::from_secs(2));
             continue;
         }
 

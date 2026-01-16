@@ -4,7 +4,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use candid::Nat;
 use liquidium_pipeline_core::tokens::asset_id::AssetId;
-use log::info;
+use log::{debug, info};
 
 use crate::finalizers::finalizer::{Finalizer, FinalizerResult};
 use crate::finalizers::liquidation_outcome::LiquidationOutcome;
@@ -59,7 +59,7 @@ where
     async fn process(&self, _: &'a ()) -> Result<Vec<LiquidationOutcome>, String> {
         // Load pending entries from WAL
         let rows = self.wal.get_pending(100).await.map_err(|e| e.to_string())?;
-
+        debug!("Finalizing rowns {:?}", rows);
         if rows.is_empty() {
             return Ok(vec![]);
         }

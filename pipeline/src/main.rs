@@ -36,10 +36,10 @@ enum Commands {
     // Withdraws funds. Without flags, starts the interactive wizard.
     // With flags, performs a non-interactive withdrawal.
     Withdraw {
-        // Source account: "main" or "recovery" (non-interactive)
+        // Source account: "main", "trader", or "recovery" (non-interactive)
         #[arg(long)]
         source: Option<String>,
-        // Destination: "main" or full Account string (non-interactive)
+        // Destination: "main", "trader", "recovery", or full Account string (non-interactive)
         #[arg(long)]
         destination: Option<String>,
         // Asset symbol (e.g., "ckUSDT") or "all" (non-interactive)
@@ -93,12 +93,12 @@ async fn main() {
                     asset.as_deref(),
                     amount.as_deref(),
                 ) {
-                    (Some(_s), Some(_d), Some(_a), Some(_am)) => {
-                        // commands::withdraw::withdraw_noninteractive(s, d, a, am).await;
+                    (Some(s), Some(d), Some(a), Some(am)) => {
+                        commands::withdraw::withdraw_noninteractive(s, d, a, am).await;
                     }
                     _ => {
                         eprintln!(
-                            "Missing flags. Required for non-interactive: --source <main|recovery> --destination <main|ACCOUNT> --asset <SYMBOL|all> --amount <DECIMAL|all>.\nRun without flags to use the interactive wizard."
+                            "Missing flags. Required for non-interactive: --source <main|trader|recovery> --destination <main|trader|recovery|ACCOUNT> --asset <SYMBOL|all> --amount <DECIMAL|all>.\nRun without flags to use the interactive wizard."
                         );
                     }
                 }

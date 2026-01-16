@@ -68,7 +68,7 @@ impl<'a, A: PipelineAgent, D: WalStore> PipelineStage<'a, Vec<ExecutorRequest>, 
 
                 let liq_req = executor_request.liquidation.clone();
 
-                let args = Encode!(&self.account_id.owner, &liq_req).map_err(|e| e.to_string())?;
+                let args = Encode!(&liq_req).map_err(|e| e.to_string())?;
 
                 let liq_call = match self
                     .agent

@@ -35,6 +35,7 @@ pub struct PipelineContext {
     pub recovery_service: Arc<BalanceService>,
     pub agent: Arc<Agent>,
     pub main_transfers: Arc<TransferService>,
+    pub trader_transfers: Arc<TransferService>,
     pub swap_router: Arc<SwapRouter>,
     pub recovery_transfers: Arc<TransferService>,
     pub evm_address: String,
@@ -140,6 +141,17 @@ impl<P: Provider<AnyNetwork> + WalletProvider<AnyNetwork> + Clone + 'static> Pip
         let transfer_router_main = Arc::new(MultiChainTransferRouter::new(icp_transfer_main, evm_transfer_main));
         let main_transfers = TransferService::new(registry.clone(), transfer_router_main);
 
+        let icp_transfer_trader = Arc::new(IcpTransferAdapter::new(
+            icp_backend_trader.clone(),
+            trader_icp_account,
+        ));
+        let evm_transfer_trader = Arc::new(EvmTransferAdapter::new(evm_backend_trader.clone()));
+        let transfer_router_trader = Arc::new(MultiChainTransferRouter::new(
+            icp_transfer_trader,
+            evm_transfer_trader,
+        ));
+        let trader_transfers = TransferService::new(registry.clone(), transfer_router_trader);
+
         let icp_transfer_recovery = Arc::new(IcpTransferAdapter::new(
             icp_backend_trader.clone(),
             recovery_icp_account,
@@ -185,6 +197,7 @@ impl<P: Provider<AnyNetwork> + WalletProvider<AnyNetwork> + Clone + 'static> Pip
             trader_service: Arc::new(trader_service),
             recovery_service: Arc::new(recovery_service),
             main_transfers: Arc::new(main_transfers),
+            trader_transfers: Arc::new(trader_transfers),
             recovery_transfers: Arc::new(recovery_transfers),
             evm_address,
             agent: main_agent.clone(),

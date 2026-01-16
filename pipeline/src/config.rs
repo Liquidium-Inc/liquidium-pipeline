@@ -14,14 +14,12 @@ use std::collections::HashMap;
 use std::env;
 use std::sync::Arc;
 
-const DEFAULT_OPPORTUNITY_ACCOUNT_FILTER: &str = "h64ya-zt56r-44pvj-pjay2-j47ik-gv222-iw4mq-3wrll-yho5m-kmth4-kae";
 
 fn expand_tilde(p: &str) -> std::path::PathBuf {
-    if let Some(stripped) = p.strip_prefix("~/") {
-        if let Ok(home) = std::env::var("HOME") {
+    if let Some(stripped) = p.strip_prefix("~/")
+        && let Ok(home) = std::env::var("HOME") {
             return std::path::PathBuf::from(home).join(stripped);
         }
-    }
     std::path::PathBuf::from(p)
 }
 
@@ -201,10 +199,7 @@ impl Config {
                         .collect()
                 }
             }
-            Err(_) => Principal::from_text(DEFAULT_OPPORTUNITY_ACCOUNT_FILTER)
-                .ok()
-                .map(|principal| vec![principal])
-                .unwrap_or_default(),
+            Err(_) => vec![],
         };
 
         Ok(Arc::new(Config {

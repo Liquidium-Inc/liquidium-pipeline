@@ -157,6 +157,7 @@ mod tests {
             },
             collateral_asset: AssetType::Unknown,
             debt_asset: AssetType::Unknown,
+            timestamp: 0,
             status: LiquidationStatus::Success,
             change_tx: TxStatus {
                 tx_id: None,

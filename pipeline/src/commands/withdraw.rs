@@ -55,19 +55,22 @@ pub async fn withdraw() {
     let ctx = init_context().await.expect("Failed to init context");
     let config = ctx.config.clone();
 
-    // Step 1: Select account (Main | Recovery)
-    let account_choices = vec!["Main (Liquidator)", "Recovery (Trader)"];
+    // Step 1: Select account (Main | Trader | Recovery)
+    let account_choices = vec!["Main (Liquidator)", "Trader (Principal)", "Recovery (Trader)"];
     let account_idx = Select::with_theme(&theme)
         .with_prompt("Select source account")
         .default(0)
         .items(&account_choices)
         .interact()
         .unwrap();
-    let use_main = account_idx == 0;
+    let source_is_main = account_idx == 0;
+    let source_is_trader = account_idx == 1;
 
     // Source selection
-    let (src_identity, account) = if use_main {
+    let (src_identity, account) = if source_is_main {
         (config.liquidator_identity.clone(), config.liquidator_principal.into())
+    } else if source_is_trader {
+        (config.trader_identity.clone(), config.trader_principal.into())
     } else {
         (config.trader_identity.clone(), config.get_recovery_account())
     };
@@ -90,8 +93,10 @@ pub async fn withdraw() {
     assets.sort_by(|(id_a, _), (id_b, _)| id_a.chain.cmp(&id_b.chain).then(id_a.symbol.cmp(&id_b.symbol)));
 
     // Fetch balances for this source account across all assets using BalanceService
-    let balance_service = if use_main {
+    let balance_service = if source_is_main {
         &ctx.main_service
+    } else if source_is_trader {
+        &ctx.trader_service
     } else {
         &ctx.recovery_service
     };
@@ -266,7 +271,23 @@ pub async fn withdraw() {
             };
 
             let bal_fmt = format_chain_balance(bal);
-            let amount_native = bal.value.clone();
+            let amount_native = match token {
+                ChainToken::Icp { ledger, .. } => {
+                    let fee = fetch_icrc1_fee(agent.clone(), *ledger).await;
+                    let send_amount = bal.value.clone().0.to_u128().unwrap_or(0).saturating_sub(
+                        fee.0.to_u128().unwrap_or(0),
+                    );
+                    if send_amount == 0 {
+                        println!(
+                            "Skipping {}: balance too low to cover fee.",
+                            id.symbol
+                        );
+                        continue;
+                    }
+                    Nat::from(send_amount)
+                }
+                _ => bal.value.clone(),
+            };
 
             let amount_nat = ChainTokenAmount {
                 token: token.clone(),
@@ -288,7 +309,18 @@ pub async fn withdraw() {
             // For "all", behavior depends on token type.
             let amount_native: Nat = match &token {
                 // ICP and non-native tokens: send full balance in native units.
-                ChainToken::Icp { .. } => bal_opt.map(|b| b.value.clone()).unwrap_or(0u8.into()),
+                ChainToken::Icp { ledger, .. } => {
+                    let bal_native = bal_opt.map(|b| b.value.clone()).unwrap_or(0u8.into());
+                    let fee = fetch_icrc1_fee(agent.clone(), *ledger).await;
+                    let send_amount = bal_native.0.to_u128().unwrap_or(0).saturating_sub(
+                        fee.0.to_u128().unwrap_or(0),
+                    );
+                    if send_amount == 0 {
+                        println!("Not enough balance to cover fee; aborting.");
+                        return;
+                    }
+                    Nat::from(send_amount)
+                }
                 ChainToken::EvmErc20 { .. } => bal_opt.map(|b| b.value.clone()).unwrap_or(0u8.into()),
 
                 // EVM native: reserve a gas buffer so the tx can actually be sent.
@@ -337,7 +369,7 @@ pub async fn withdraw() {
                 Destination::Evm(addr) => addr.clone(),
             }
         );
-        println!("  Asset:       {}", asset_id.symbol);
+        println!("  Asset:       {} ({})", asset_id.symbol, asset_id.address);
         println!("  Amount:      {}", amount_input);
         println!("  Balance:     {}", bal);
         println!();
@@ -357,8 +389,10 @@ pub async fn withdraw() {
     // Step 6: Execute transfers and show summary (plain prints)
     println!("\nExecuting withdrawals...\n");
 
-    let transfer_service = if use_main {
+    let transfer_service = if source_is_main {
         &ctx.main_transfers
+    } else if source_is_trader {
+        &ctx.trader_transfers
     } else {
         &ctx.recovery_transfers
     };
@@ -496,6 +530,22 @@ async fn sync_balances(
     balances
 }
 
+async fn fetch_icrc1_fee(agent: Arc<Agent>, ledger: Principal) -> Nat {
+    let res = agent
+        .query(&ledger, "icrc1_fee")
+        .with_arg(Encode!(&()).unwrap())
+        .call()
+        .await;
+
+    if let Ok(bytes) = res
+        && let Ok(fee) = Decode!(&bytes, Nat)
+    {
+        fee
+    } else {
+        Nat::from(0u8)
+    }
+}
+
 // Extract the first numeric segment from a string (e.g., "ckUSDT: 12.662686" or "12.662686 ckUSDT")
 fn extract_numeric_segment(s: &str) -> Option<String> {
     // Split on spaces and colons, pick the first segment containing a digit
@@ -540,8 +590,8 @@ fn decimal_to_units(dec_str: &str, decimals: u8) -> Option<u128> {
 /// Non-interactive withdraw flow.
 ///
 /// Arguments (case-insensitive where noted):
-/// - `source`: "main" | "recovery"
-/// - `destination`: "main" | full Account text (e.g., "aaaaa-aa" or "aaaaa-aa:beef...")
+/// - `source`: "main" | "trader" | "recovery"
+/// - `destination`: "main" | "trader" | "recovery" | full Account text (e.g., "aaaaa-aa" or "aaaaa-aa:beef...")
 /// - `asset`: token symbol (e.g., "ckUSDT") | "all"
 /// - `amount`: decimal string (respects token decimals) | "all"
 #[allow(dead_code)]
@@ -559,11 +609,19 @@ pub async fn withdraw_noninteractive(source: &str, destination: &str, asset: &st
     let config = ctx.config.clone();
 
     // Resolve source
-    let use_main = matches!(source.to_lowercase().as_str(), "main" | "m" | "liquidator");
-    let (src_identity, account) = if use_main {
-        (config.liquidator_identity.clone(), config.liquidator_principal.into())
-    } else {
-        (config.trader_identity.clone(), config.get_recovery_account())
+    let source_kind = match source.to_lowercase().as_str() {
+        "main" | "m" | "liquidator" => "main",
+        "trader" | "t" => "trader",
+        "recovery" | "r" => "recovery",
+        other => {
+            eprintln!("Invalid source account: {}", other);
+            return;
+        }
+    };
+    let (src_identity, account) = match source_kind {
+        "main" => (config.liquidator_identity.clone(), config.liquidator_principal.into()),
+        "trader" => (config.trader_identity.clone(), config.trader_principal.into()),
+        _ => (config.trader_identity.clone(), config.get_recovery_account()),
     };
 
     // Initialize Agent and account service
@@ -596,6 +654,10 @@ pub async fn withdraw_noninteractive(source: &str, destination: &str, asset: &st
     // Resolve destination
     let dst_account: Account = if destination.eq_ignore_ascii_case("main") {
         config.liquidator_principal.into()
+    } else if destination.eq_ignore_ascii_case("trader") {
+        config.trader_principal.into()
+    } else if destination.eq_ignore_ascii_case("recovery") {
+        config.get_recovery_account()
     } else {
         match Account::from_str(destination) {
             Ok(a) => {
@@ -626,9 +688,16 @@ pub async fn withdraw_noninteractive(source: &str, destination: &str, asset: &st
                 let spend_units = extract_numeric_segment(&bal_fmt)
                     .and_then(|n| decimal_to_units(&n, decimals))
                     .unwrap_or(0);
+                let fee = fetch_icrc1_fee(agent.clone(), ledger).await;
+                let fee_units = fee.0.to_u128().unwrap_or(0);
+                let send_units = spend_units.saturating_sub(fee_units);
+                if send_units == 0 {
+                    eprintln!("Skipping {}: balance too low to cover fee.", id.symbol);
+                    continue;
+                }
                 ChainTokenAmount {
                     token: token.clone(),
-                    value: candid::Nat::from(spend_units),
+                    value: candid::Nat::from(send_units),
                 }
             } else {
                 let val = f64::from_str(amount).unwrap_or(0.0);
@@ -660,9 +729,16 @@ pub async fn withdraw_noninteractive(source: &str, destination: &str, asset: &st
             let spend_units = extract_numeric_segment(&bal_fmt)
                 .and_then(|n| decimal_to_units(&n, decimals))
                 .unwrap_or(0);
+            let fee = fetch_icrc1_fee(agent.clone(), ledger).await;
+            let fee_units = fee.0.to_u128().unwrap_or(0);
+            let send_units = spend_units.saturating_sub(fee_units);
+            if send_units == 0 {
+                eprintln!("Not enough balance to cover fee; aborting.");
+                return;
+            }
             ChainTokenAmount {
                 token: token.clone(),
-                value: candid::Nat::from(spend_units),
+                value: candid::Nat::from(send_units),
             }
         } else {
             let val = f64::from_str(amount).unwrap_or(0.0);
@@ -684,10 +760,10 @@ pub async fn withdraw_noninteractive(source: &str, destination: &str, asset: &st
     }
 
     // Execute
-    let transfer_service = if use_main {
-        &ctx.main_transfers
-    } else {
-        &ctx.recovery_transfers
+    let transfer_service = match source_kind {
+        "main" => &ctx.main_transfers,
+        "trader" => &ctx.trader_transfers,
+        _ => &ctx.recovery_transfers,
     };
 
     for (asset_id, _tok, amt, bal_fmt) in plan {

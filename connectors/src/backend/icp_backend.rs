@@ -4,7 +4,8 @@ use crate::pipeline_agent::PipelineAgent;
 use alloy::hex;
 use async_trait::async_trait;
 use candid::{CandidType, Encode, Nat, Principal};
-use icrc_ledger_types::icrc1::account::{Account, Subaccount};
+use icrc_ledger_types::icrc1::account::Account;
+use icrc_ledger_types::icrc1::transfer::{TransferArg, TransferError};
 use num_traits::ToPrimitive;
 use serde::{Deserialize, de::DeserializeOwned};
 
@@ -61,22 +62,6 @@ impl<A: PipelineAgent> IcpBackend for IcpBackendImpl<A> {
         to: &Account,
         amount: Nat,
     ) -> Result<Nat, String> {
-        #[derive(CandidType)]
-        struct TransferArg {
-            from_subaccount: Option<Subaccount>,
-            to: Account,
-            amount: Nat,
-            fee: Option<Nat>,
-            memo: Option<Vec<u8>>,
-            created_at_time: Option<u64>,
-        }
-
-        #[derive(CandidType, serde::Deserialize)]
-        enum TransferResult {
-            Ok(Nat),
-            Err(String), // simplify
-        }
-
         let arg = TransferArg {
             from_subaccount: from.subaccount,
             to: *to,
@@ -86,9 +71,10 @@ impl<A: PipelineAgent> IcpBackend for IcpBackendImpl<A> {
             created_at_time: None,
         };
 
-        match self.update::<TransferResult>(ledger, "icrc1_transfer", arg).await? {
-            TransferResult::Ok(idx) => Ok(idx),
-            TransferResult::Err(e) => Err(format!("icrc1_transfer error: {e}")),
+        let result: Result<Nat, TransferError> = self.update(ledger, "icrc1_transfer", arg).await?;
+        match result {
+            Ok(idx) => Ok(idx),
+            Err(e) => Err(format!("icrc1_transfer error: {e}")),
         }
     }
 

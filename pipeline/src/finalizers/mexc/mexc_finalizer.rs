@@ -378,6 +378,7 @@ mod tests {
 
         let liq_result = LiquidationResult {
             id: liq_id,
+            timestamp: 0,
             amounts: LiquidationAmounts {
                 collateral_received: Nat::from(1_000_000u64),
                 debt_repaid: Nat::from(2_000_000u64),
