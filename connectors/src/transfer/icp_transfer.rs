@@ -6,6 +6,7 @@ use icrc_ledger_types::icrc1::account::Account;
 use liquidium_pipeline_core::account::model::ChainAccount;
 use liquidium_pipeline_core::tokens::chain_token::ChainToken;
 use liquidium_pipeline_core::transfer::actions::TransferActions;
+use log::info;
 
 use crate::backend::icp_backend::IcpBackend;
 
@@ -28,12 +29,35 @@ impl<B: IcpBackend + Send + Sync> TransferActions for IcpTransferAdapter<B> {
         to: &ChainAccount,
         amount_native: Nat,
     ) -> Result<String, String> {
+        let from_owner = self.account.owner.to_text();
+        let from_subaccount = if self.account.subaccount.is_some() {
+            "some"
+        } else {
+            "none"
+        };
+        let to_desc = match to {
+            ChainAccount::IcpLedger(hex) => format!("icp_ledger:{hex}"),
+            ChainAccount::Icp(account) => {
+                let sub = if account.subaccount.is_some() { "some" } else { "none" };
+                format!("icp:{} subaccount={}", account.owner.to_text(), sub)
+            }
+            other => format!("{:?}", other),
+        };
+
         match (token, to) {
             // Native ICP via ICP ledger: destination is an AccountIdentifier hex string
             (
                 ChainToken::Icp { ledger, .. },
                 ChainAccount::IcpLedger(to_account_id_hex),
             ) => {
+                info!(
+                    "[transfer] icp from={} subaccount={} to={} amount={} ledger={}",
+                    from_owner,
+                    from_subaccount,
+                    to_desc,
+                    amount_native,
+                    ledger.to_text()
+                );
                 // amount_native is in e8s for ICP
                 let block_index = self
                     .backend
@@ -48,6 +72,14 @@ impl<B: IcpBackend + Send + Sync> TransferActions for IcpTransferAdapter<B> {
                 ChainToken::Icp { ledger, .. },
                 ChainAccount::Icp(to_account),
             ) => {
+                info!(
+                    "[transfer] icp from={} subaccount={} to={} amount={} ledger={}",
+                    from_owner,
+                    from_subaccount,
+                    to_desc,
+                    amount_native,
+                    ledger.to_text()
+                );
                 let amount = amount_native;
                 let block_index = self
                     .backend

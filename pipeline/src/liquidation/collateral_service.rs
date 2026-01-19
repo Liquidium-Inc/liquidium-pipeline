@@ -78,7 +78,8 @@ impl<P: PriceOracle> CollateralServiceTrait for CollateralService<P> {
         let mut repay_native = debt_position.debt_amount.clone().min(max_repay_amount.clone());
 
         //Respect per-user liquidation ratio cap (value terms)
-        let liquidation_ratio = if user.health_factor <= 950u128 {
+        const WIPEOUT_THRESHOLD: u128 = 975u128;
+        let liquidation_ratio = if user.health_factor <= WIPEOUT_THRESHOLD {
             1000
         } else {
             MAX_LIQUIDATION_RATIO
@@ -278,6 +279,7 @@ mod test {
         let mut user = LiquidatebleUser {
             account: Principal::anonymous(),
             health_factor: Nat::from(900u64),
+            weighted_liquidation_threshold: Nat::from(8500u64),
             positions: vec![],
             // total_debt in RAY-scaled quote units (1e27)
             total_debt: Nat::from(81_789_600_000u128) * Nat::from(10u128.pow(21)), // scaled to RAY (1e27) from 6-dec quote
@@ -291,7 +293,8 @@ mod test {
             debt_amount: Nat::from(102_237u64), // ≈ $95.489
             collateral_amount: Nat::from(0u64),
             liquidation_bonus: 2000u64, // 20% (bps)
-            protocol_fee: 200u64,       // 2% (bps)
+            liquidation_threshold: 8500u64,
+            protocol_fee: 200u64, // 2% (bps)
         };
 
         user.positions.push(debt_position.clone());
@@ -304,6 +307,7 @@ mod test {
             debt_amount: Nat::from(0u64),
             collateral_amount: Nat::from(99_940_000u64), // 99.94 USDT
             liquidation_bonus: 2000u64,
+            liquidation_threshold: 8500u64,
             protocol_fee: 200u64,
         };
 
@@ -344,6 +348,7 @@ mod test {
         let user = LiquidatebleUser {
             account: Principal::anonymous(),
             health_factor: Nat::from(900u64),
+            weighted_liquidation_threshold: Nat::from(8500u64),
             positions: vec![],
             // total_debt in RAY-scaled quote units (1e27)
             total_debt: Nat::from(120u128 * 10u128.pow(27)),
@@ -357,6 +362,7 @@ mod test {
             debt_amount: Nat::from(100_000_000u64), // $100.00 in 6 decimals
             collateral_amount: Nat::from(0u64),
             liquidation_bonus: 1000u64, // 10% (bps)
+            liquidation_threshold: 8500u64,
             protocol_fee: 200u64,
         };
 
@@ -368,6 +374,7 @@ mod test {
             debt_amount: Nat::from(0u64),
             collateral_amount: Nat::from(1_400_000u64), // 0.014 BTC = ~$1120
             liquidation_bonus: 1000u64,
+            liquidation_threshold: 8500u64,
             protocol_fee: 200u64,
         };
 
@@ -413,6 +420,7 @@ mod test {
         let user = LiquidatebleUser {
             account: Principal::anonymous(),
             health_factor: Nat::from(900u64),
+            weighted_liquidation_threshold: Nat::from(8500u64),
             positions: vec![],
             // total_debt in RAY-scaled quote units (1e27)
             total_debt: Nat::from(120u128 * 10u128.pow(27)),
@@ -426,6 +434,7 @@ mod test {
             debt_amount: Nat::from(100_000_000u64), // $100.00
             collateral_amount: Nat::from(0u64),
             liquidation_bonus: 1000u64, // 10% (bps)
+            liquidation_threshold: 8500u64,
             protocol_fee: 200u64,
         };
 
@@ -438,6 +447,7 @@ mod test {
             debt_amount: Nat::from(0u64),
             collateral_amount: Nat::from(100_000u64), // 0.001 BTC
             liquidation_bonus: 1000u64,
+            liquidation_threshold: 8500u64,
             protocol_fee: 200u64,
         };
 
@@ -498,6 +508,7 @@ mod test {
         let mut user = LiquidatebleUser {
             account: Principal::anonymous(),
             health_factor: Nat::from(900u64),
+            weighted_liquidation_threshold: Nat::from(8500u64),
             positions: vec![],
             total_debt: Nat::from(120u128 * 10u128.pow(27)),
         };
@@ -511,6 +522,7 @@ mod test {
             debt_amount: Nat::from(100_000_000u64),
             collateral_amount: Nat::from(0u64),
             liquidation_bonus: 1000u64,
+            liquidation_threshold: 8500u64,
             protocol_fee: 200u64,
         };
 
@@ -523,6 +535,7 @@ mod test {
             debt_amount: Nat::from(0u64),
             collateral_amount: Nat::from(200_000u64),
             liquidation_bonus: 1000u64,
+            liquidation_threshold: 8500u64,
             protocol_fee: 200u64,
         };
 
@@ -591,6 +604,7 @@ mod test {
         let mut user = LiquidatebleUser {
             account: Principal::anonymous(),
             health_factor: Nat::from(900u64),
+            weighted_liquidation_threshold: Nat::from(8500u64),
             positions: vec![],
             total_debt: Nat::from(100u128 * 10u128.pow(27)),
         };
@@ -603,6 +617,7 @@ mod test {
             debt_amount: Nat::from(50_000_000u64),
             collateral_amount: Nat::from(0u64),
             liquidation_bonus: 1000u64,
+            liquidation_threshold: 8500u64,
             protocol_fee: 200u64,
         };
 
@@ -614,6 +629,7 @@ mod test {
             debt_amount: Nat::from(0u64),
             collateral_amount: Nat::from(0u64),
             liquidation_bonus: 1000u64,
+            liquidation_threshold: 8500u64,
             protocol_fee: 200u64,
         };
 
@@ -670,6 +686,7 @@ mod test {
                 let mut user = LiquidatebleUser {
                     account: Principal::anonymous(),
                     health_factor: Nat::from(hf_permille),
+                    weighted_liquidation_threshold: Nat::from(8500u64),
                     positions: vec![],
                     total_debt: Nat::from(user_total_usd as u128) * Nat::from(10u128.pow(27)),
                 };
@@ -682,6 +699,7 @@ mod test {
                     debt_amount: Nat::from(debt_native),
                     collateral_amount: Nat::from(0u64),
                     liquidation_bonus: bonus_bps as u64,
+                    liquidation_threshold: 8500u64,
                     protocol_fee: fee_bps as u64,
                 };
 
@@ -693,6 +711,7 @@ mod test {
                     debt_amount: Nat::from(0u64),
                     collateral_amount: Nat::from(coll_native),
                     liquidation_bonus: bonus_bps as u64,
+                    liquidation_threshold: 8500u64,
                     protocol_fee: fee_bps as u64,
                 };
 
@@ -712,7 +731,7 @@ mod test {
                 ).unwrap_or_else(|_| Nat::from(0u8));
 
                 // Liquidation ratio cap in quote (RAY)
-                let liquidation_ratio = if hf_permille <= 950 { 1000 } else { MAX_LIQUIDATION_RATIO };
+                let liquidation_ratio = if hf_permille <= 975 { 1000 } else { MAX_LIQUIDATION_RATIO };
                 let max_liq_quote = (user.total_debt.clone() * Nat::from(liquidation_ratio)) / Nat::from(1000u32);
                 let debt_scale = Nat::from(10u128.pow(6));
                 let price_debt_ray_nat: Nat = price_debt_ray;

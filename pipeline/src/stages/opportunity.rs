@@ -93,6 +93,7 @@ mod tests {
             asset_type: AssetType::CkAsset(ckbtc_principal),
             account: Principal::anonymous(),
             liquidation_bonus: 60,
+            liquidation_threshold: 8500,
             protocol_fee: 200,
         };
 
@@ -112,18 +113,21 @@ mod tests {
             LiquidatebleUser {
                 account: Principal::anonymous(),
                 health_factor: Nat::from(1u64),
+                weighted_liquidation_threshold: Nat::from(8500u64),
                 total_debt: Nat::from(1_000u64),
                 positions: vec![pos_ckbtc.clone()],
             },
             LiquidatebleUser {
                 account: Principal::anonymous(),
                 health_factor: Nat::from(1u64),
+                weighted_liquidation_threshold: Nat::from(8500u64),
                 total_debt: Nat::from(1_000u64),
                 positions: vec![pos_ckusdc.clone()],
             },
             LiquidatebleUser {
                 account: Principal::anonymous(),
                 health_factor: Nat::from(1u64),
+                weighted_liquidation_threshold: Nat::from(8500u64),
                 total_debt: Nat::from(1_000u64),
                 positions: vec![pos_sol_unknown.clone()],
             },
@@ -163,6 +167,7 @@ mod tests {
             asset_type: AssetType::CkAsset(ckbtc_principal),
             account: Principal::anonymous(),
             liquidation_bonus: 60,
+            liquidation_threshold: 8500,
             protocol_fee: 200,
         };
 
@@ -176,12 +181,14 @@ mod tests {
             LiquidatebleUser {
                 account: Principal::anonymous(),
                 health_factor: Nat::from(1u64),
+                weighted_liquidation_threshold: Nat::from(8500u64),
                 total_debt: Nat::from(1_000u64),
                 positions: vec![supported_pos.clone()],
             },
             LiquidatebleUser {
                 account: Principal::anonymous(),
                 health_factor: Nat::from(1u64),
+                weighted_liquidation_threshold: Nat::from(8500u64),
                 total_debt: Nat::from(1_000u64),
                 positions: vec![unsupported_pos.clone()],
             },
@@ -217,6 +224,7 @@ mod tests {
             asset_type: AssetType::CkAsset(Principal::anonymous()),
             account: Principal::anonymous(),
             liquidation_bonus: 60,
+            liquidation_threshold: 8500,
             protocol_fee: 200,
         };
 
@@ -224,12 +232,14 @@ mod tests {
             LiquidatebleUser {
                 account: target_account,
                 health_factor: Nat::from(1u64),
+                weighted_liquidation_threshold: Nat::from(8500u64),
                 total_debt: Nat::from(1_000u64),
                 positions: vec![position.clone()],
             },
             LiquidatebleUser {
                 account: other_account,
                 health_factor: Nat::from(1u64),
+                weighted_liquidation_threshold: Nat::from(8500u64),
                 total_debt: Nat::from(1_000u64),
                 positions: vec![position.clone()],
             },

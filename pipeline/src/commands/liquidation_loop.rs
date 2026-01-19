@@ -139,7 +139,11 @@ async fn init(
 
     let mexc_finalizer = if let Ok((api_key, secret)) = ctx.config.get_cex_credentials("mexc") {
         let mexc_client = Arc::new(MexcClient::new(&api_key, &secret));
-        let mexc_finalizer = Arc::new(MexcFinalizer::new(mexc_client, ctx.main_transfers.actions()));
+        let mexc_finalizer = Arc::new(MexcFinalizer::new(
+            mexc_client,
+            ctx.trader_transfers.actions(),
+            config.liquidator_principal,
+        ));
         Some(mexc_finalizer)
     } else {
         if config.swapper != SwapperMode::Dex {
@@ -257,7 +261,7 @@ pub async fn run_liquidation_loop() {
             sleep(Duration::from_secs(2));
             spinner = start_spinner();
             spinner.finish_and_clear();
-            info!("Found {} opportunities", opportunities.len());
+            info!("Found {:?} opportunities", opportunities);
 
             let executions = strategy.process(&opportunities).await.unwrap_or_else(|e| {
                 log::info!("Strategy processing failed: {e}");
@@ -271,7 +275,7 @@ pub async fn run_liquidation_loop() {
         }
 
         let outcomes = finalizer.process(&()).await.unwrap_or_else(|e| {
-            log::error!("Executor failed: {e}");
+            log::error!("Finalizer failed: {e}");
             vec![]
         });
 

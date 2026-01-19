@@ -61,6 +61,22 @@ impl SqliteWalStore {
 impl WalStore for SqliteWalStore {
     async fn get_pending(&self, limit: usize) -> Result<Vec<LiqResultRecord>> {
         let mut conn = self.pool.get()?;
+        let now = now_secs();
+        let inflight_stale_cutoff = now.saturating_sub(300);
+
+        // Requeue stale in-flight rows so they can be retried.
+        diesel::update(
+            tbl::table.filter(
+                tbl::status
+                    .eq(ResultStatus::InFlight as i32)
+                    .and(tbl::updated_at.le(inflight_stale_cutoff)),
+            ),
+        )
+        .set((
+            tbl::status.eq(ResultStatus::Enqueued as i32),
+            tbl::updated_at.eq(now),
+        ))
+        .execute(&mut conn)?;
 
         let rows = tbl::table
             .filter(

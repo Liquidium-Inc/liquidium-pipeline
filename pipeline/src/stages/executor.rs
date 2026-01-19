@@ -2,13 +2,13 @@ use async_trait::async_trait;
 use candid::Encode;
 
 use futures::{TryFutureExt, future::join_all};
-use log::{debug, warn};
+use log::{debug, info, warn};
 use serde::{Deserialize, Serialize};
 
 use crate::{
     executors::{basic::basic_executor::BasicExecutor, executor::ExecutorRequest},
     finalizers::{finalizer::FinalizerResult, liquidation_outcome::LiquidationOutcome},
-    persistance::{LiqResultRecord, WalStore},
+    persistance::{LiqMetaWrapper, LiqResultRecord, WalStore},
     stage::PipelineStage,
     utils::now_ts, wal::{encode_meta, liq_id_from_receipt},
 };
@@ -54,6 +54,8 @@ impl<'a, A: PipelineAgent, D: WalStore> PipelineStage<'a, Vec<ExecutorRequest>, 
     for BasicExecutor<A, D>
 {
     async fn process(&self, executor_requests: &'a Vec<ExecutorRequest>) -> Result<Vec<ExecutionReceipt>, String> {
+
+        debug!("Executing request {:?}", executor_requests);
         // One future per request, all run concurrently
         let futures = executor_requests.iter().map(|executor_request| {
             let executor_request = executor_request.clone();
@@ -101,6 +103,10 @@ impl<'a, A: PipelineAgent, D: WalStore> PipelineStage<'a, Vec<ExecutorRequest>, 
                     liq.change_tx.status,
                     TransferStatus::Failed(_) | TransferStatus::Pending
                 ) {
+                    info!(
+                        "[executor] 💱 change_tx status={:?} liq_id={}",
+                        liq.change_tx.status, liq.id
+                    );
                     receipt.change_received = false;
                     return Ok::<ExecutionReceipt, String>(receipt);
                 }
@@ -109,6 +115,10 @@ impl<'a, A: PipelineAgent, D: WalStore> PipelineStage<'a, Vec<ExecutorRequest>, 
                     liq.collateral_tx.status,
                     TransferStatus::Failed(_) | TransferStatus::Pending
                 ) {
+                    info!(
+                        "[executor] 🧱 collateral_tx status={:?} liq_id={}",
+                        liq.collateral_tx.status, liq.id
+                    );
                     receipt.status = ExecutionStatus::CollateralTransferFailed("collateral missing".to_string());
                     return Ok::<ExecutionReceipt, String>(receipt);
                 }
@@ -127,6 +137,7 @@ impl<'a, A: PipelineAgent, D: WalStore> PipelineStage<'a, Vec<ExecutorRequest>, 
         let mut liquidations = Vec::with_capacity(results.len());
         for res in results {
             let receipt = res?;
+            debug!("Receipt result {:?}", receipt);
             liquidations.push(receipt);
         }
 
@@ -156,8 +167,11 @@ impl<A: PipelineAgent, D: WalStore> BasicExecutor<A, D> {
             updated_at: now_ts(),
             meta_json: "{}".to_string(),
         };
-        let _ = encode_meta(&mut result_record, &receipt);
+        let wrapper = LiqMetaWrapper {
+            receipt: receipt.clone(),
+            meta: Vec::new(),
+        };
+        let _ = encode_meta(&mut result_record, &wrapper);
         self.wal.upsert_result(result_record).map_err(|e| e.to_string()).await
     }
 }
-

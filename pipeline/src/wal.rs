@@ -1,17 +1,29 @@
 use liquidium_pipeline_core::types::protocol_types::LiquidationResult;
-use serde::{Serialize, de::DeserializeOwned};
+use serde::Serialize;
 
 use crate::{
-    persistance::{LiqResultRecord, ResultStatus, WalStore},
+    persistance::{LiqMetaWrapper, LiqResultRecord, ResultStatus, WalStore},
     stages::executor::ExecutionReceipt,
 };
 
-pub fn decode_meta<T: DeserializeOwned>(row: &LiqResultRecord) -> Result<Option<T>, String> {
+pub fn decode_receipt_wrapper(row: &LiqResultRecord) -> Result<Option<LiqMetaWrapper>, String> {
     if row.meta_json.is_empty() || row.meta_json == "{}" {
         return Ok(None);
     }
 
-    serde_json::from_str(&row.meta_json).map_err(|e| format!("invalid meta_json for {}: {}", row.id, e))
+    match serde_json::from_str::<LiqMetaWrapper>(&row.meta_json) {
+        Ok(wrapper) => Ok(Some(wrapper)),
+        Err(wrapper_err) => match serde_json::from_str::<ExecutionReceipt>(&row.meta_json) {
+            Ok(receipt) => Ok(Some(LiqMetaWrapper {
+                receipt,
+                meta: Vec::new(),
+            })),
+            Err(receipt_err) => Err(format!(
+                "invalid meta_json for {}: wrapper_err={}; receipt_err={}",
+                row.id, wrapper_err, receipt_err
+            )),
+        },
+    }
 }
 
 pub fn encode_meta<T: Serialize>(row: &mut LiqResultRecord, meta: &T) -> Result<(), String> {
@@ -63,7 +75,6 @@ pub async fn wal_mark_permanent_failed(wal: &dyn WalStore, liq_id: &str) -> Resu
         .await
         .map_err(|e| e.to_string())
 }
-
 
 pub async fn wal_mark_enqueued(wal: &dyn WalStore, liq_id: &str) -> Result<(), String> {
     wal.update_status(liq_id, ResultStatus::Enqueued, true)

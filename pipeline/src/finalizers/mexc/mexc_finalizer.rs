@@ -5,18 +5,15 @@ use candid::Principal;
 use icrc_ledger_types::icrc1::account::Account;
 use liquidium_pipeline_connectors::backend::cex_backend::CexBackend;
 use liquidium_pipeline_core::{
-    account::model::ChainAccount,
-    tokens::chain_token_amount::ChainTokenAmount,
-    transfer::actions::TransferActions,
+    account::model::ChainAccount, tokens::chain_token_amount::ChainTokenAmount, transfer::actions::TransferActions,
 };
-use log::debug;
+use log::{debug, info};
 
 use crate::{
     finalizers::cex_finalizer::{CexFinalizerLogic, CexState, CexStep},
     stages::executor::ExecutionReceipt,
     swappers::model::SwapExecution,
 };
-
 
 // MEXC-specific implementation of the generic CEX finalizer logic.
 //
@@ -31,16 +28,64 @@ where
 {
     pub backend: Arc<C>,
     pub transfer_service: Arc<dyn TransferActions>,
+    pub liquidator_principal: Principal,
+}
+
+#[derive(Debug, Clone)]
+struct TradeLeg {
+    market: String,
+    side: String,
+}
+
+fn mexc_trade_legs(
+    deposit_symbol: &str,
+    withdraw_symbol: &str,
+    default_market: &str,
+    default_side: &str,
+) -> Vec<TradeLeg> {
+    let deposit = deposit_symbol.to_ascii_uppercase();
+    let withdraw = withdraw_symbol.to_ascii_uppercase();
+
+    if deposit == "CKBTC" && withdraw == "CKUSDT" {
+        return vec![
+            TradeLeg {
+                market: "CKBTC_BTC".to_string(),
+                side: "sell".to_string(),
+            },
+            TradeLeg {
+                market: "BTC_USDC".to_string(),
+                side: "sell".to_string(),
+            },
+            TradeLeg {
+                market: "USDC_USDT".to_string(),
+                side: "sell".to_string(),
+            },
+            TradeLeg {
+                market: "CKUSDT_USDT".to_string(),
+                side: "buy".to_string(),
+            },
+        ];
+    }
+
+    vec![TradeLeg {
+        market: default_market.to_string(),
+        side: default_side.to_string(),
+    }]
 }
 
 impl<C> MexcFinalizer<C>
 where
     C: CexBackend,
 {
-    pub fn new(backend: Arc<C>, transfer_service: Arc<dyn TransferActions>) -> Self {
+    pub fn new(
+        backend: Arc<C>,
+        transfer_service: Arc<dyn TransferActions>,
+        liquidator_principal: Principal,
+    ) -> Self {
         Self {
             backend,
             transfer_service,
+            liquidator_principal,
         }
     }
 
@@ -50,7 +95,14 @@ where
 
         match state.deposit_balance_before {
             Some(b0) => {
-                if current_bal - b0 >= state.size_in.to_f64() - 0.00001 {
+                let expected = state.size_in.to_f64();
+                let delta = current_bal - b0;
+                info!(
+                    "[mexc] liq_id={} deposit check: before={} current={} delta={} expected={}",
+                    state.liq_id, b0, current_bal, delta, expected
+                );
+
+                if delta >= expected - 0.00001 {
                     debug!(
                         "[mexc] liq_id={} deposit confirmed on CEX, before={} after={}",
                         state.liq_id, b0, current_bal
@@ -67,9 +119,9 @@ where
             None => {
                 // No baseline recorded yet (should normally be set when we send the transfer),
                 // so record the current balance as the baseline and stay in Deposit.
-                debug!(
-                    "[mexc] liq_id={} no baseline balance recorded, setting deposit_balance_before={}",
-                    state.liq_id, current_bal
+                info!(
+                    "[mexc] liq_id={} no baseline recorded, setting deposit_balance_before={} (current={})",
+                    state.liq_id, current_bal, current_bal
                 );
                 state.deposit_balance_before = Some(current_bal);
                 Ok(())
@@ -114,10 +166,17 @@ where
             ),
             side: "sell".to_string(),
             size_in,
+            trade_leg_index: None,
+            trade_leg_total: None,
+            trade_last_market: None,
+            trade_last_side: None,
+            trade_last_amount_in: None,
+            trade_last_amount_out: None,
+            trade_next_amount_in: None,
 
             // withdraw leg
             withdraw_asset: receipt.request.debt_asset.clone(),
-            withdraw_address: receipt.request.liquidation.receiver_address.to_text(),
+            withdraw_address: self.liquidator_principal.to_text(),
             withdraw_id: None,
             withdraw_txid: None,
             size_out: None,
@@ -163,8 +222,24 @@ where
             );
 
             let amount = &state.size_in;
+            let fee = state.deposit_asset.fee();
+            let fee_amount = ChainTokenAmount::from_raw(state.deposit_asset.clone(), fee.clone());
+            let total_amount =
+                ChainTokenAmount::from_raw(state.deposit_asset.clone(), amount.value.clone() + fee);
+            info!(
+                "[mexc] liq_id={} deposit transfer amount={} fee={} total={}",
+                state.liq_id,
+                amount.formatted(),
+                fee_amount.formatted(),
+                total_amount.formatted()
+            );
 
             let actions = &self.transfer_service;
+
+            debug!(
+                "[mexc] liq_id={} transfering {}  address={} ",
+                state.liq_id, amount.value, addr.address,
+            );
             let tx_id = actions
                 .transfer(
                     &state.deposit_asset,
@@ -200,28 +275,90 @@ where
             state.size_in.formatted(),
         );
 
-        let amount_in = state.size_in.to_f64();
+        let legs = mexc_trade_legs(
+            &state.deposit_asset.symbol(),
+            &state.withdraw_asset.symbol(),
+            &state.market,
+            &state.side,
+        );
+        state.trade_leg_total = Some(legs.len() as u32);
+        if legs.len() > 1 {
+            debug!("[mexc] liq_id={} multi-hop route: {:?}", state.liq_id, legs);
+        }
+
+        let idx = state.trade_leg_index.unwrap_or(0) as usize;
+        if idx >= legs.len() {
+            state.step = CexStep::Withdraw;
+            if let Some(out_amt) = state.trade_next_amount_in {
+                state.size_out = Some(ChainTokenAmount::from_formatted(state.withdraw_asset.clone(), out_amt));
+            }
+            return Ok(());
+        }
+
+        let amount_in = state.trade_next_amount_in.unwrap_or_else(|| state.size_in.to_f64());
 
         if amount_in <= 0.0 {
             debug!(
                 "[mexc] liq_id={} trade skipped: non-positive amount_in={}",
                 state.liq_id, amount_in
             );
-            // Nothing to trade, move on to Withdraw leg (or you could keep it at Trade).
             state.step = CexStep::Withdraw;
             return Ok(());
         }
+
+        let leg = &legs[idx];
+
+        state.trade_last_market = Some(leg.market.clone());
+        state.trade_last_side = Some(leg.side.clone());
+        state.trade_last_amount_in = Some(amount_in);
+        state.trade_last_amount_out = None;
+        state.last_error = None;
+
+        debug!(
+            "[mexc] liq_id={} trade leg {}/{} market={} side={} amount_in={}",
+            state.liq_id,
+            idx + 1,
+            legs.len(),
+            leg.market,
+            leg.side,
+            amount_in
+        );
 
         // Execute the spot trade on MEXC. The backend is responsible for:
         // - placing the order (market)
         // - handling partial fills / retries
         // - updating internal CEX balances
-        let filled = self.backend.execute_swap(&state.market, &state.side, amount_in).await?;
+        let filled = match self.backend.execute_swap(&leg.market, &leg.side, amount_in).await {
+            Ok(v) => v,
+            Err(e) => {
+                state.last_error = Some(format!(
+                    "trade leg {}/{} {} {} failed: {}",
+                    idx + 1,
+                    legs.len(),
+                    leg.market,
+                    leg.side,
+                    e
+                ));
+                return Err(e);
+            }
+        };
 
         debug!(
-            "[mexc] liq_id={} trade executed: market={} side={} amount_in={} filled={}",
-            state.liq_id, state.market, state.side, amount_in, filled
+            "[mexc] liq_id={} trade leg {}/{} filled={}",
+            state.liq_id,
+            idx + 1,
+            legs.len(),
+            filled
         );
+
+        state.trade_last_amount_out = Some(filled);
+        state.trade_next_amount_in = Some(filled);
+        state.trade_leg_index = Some((idx + 1) as u32);
+
+        if idx + 1 < legs.len() {
+            state.step = CexStep::TradePending;
+            return Ok(());
+        }
 
         // For now we don't feed `filled` back into on-chain amounts; withdraw leg
         // can either use backend-specific balance checks or later extend CexState
@@ -233,6 +370,15 @@ where
     }
 
     async fn withdraw(&self, state: &mut CexState) -> Result<(), String> {
+        let expected_address = self.liquidator_principal.to_text();
+        if state.withdraw_address != expected_address {
+            debug!(
+                "[mexc] liq_id={} override withdraw_address {} -> {}",
+                state.liq_id, state.withdraw_address, expected_address
+            );
+            state.withdraw_address = expected_address;
+        }
+
         debug!(
             "[mexc] liq_id={} step=Withdraw asset={} network={} address={}",
             state.liq_id,
@@ -240,6 +386,7 @@ where
             state.withdraw_asset.chain(),
             state.withdraw_address,
         );
+
 
         // Idempotency: if we already have a withdraw id or txid, just advance.
         if state.withdraw_id.is_some() || state.withdraw_txid.is_some() {
@@ -251,9 +398,12 @@ where
             return Ok(());
         }
 
-        // Amount to withdraw. For now, reuse the size_in amount expressed in withdraw-asset units.
-        // Later we can switch to a post-trade amount or explicit CEX balance if needed.
-        let amount = state.size_in.to_f64();
+        // Amount to withdraw: prefer post-trade output when available.
+        let amount = state
+            .size_out
+            .as_ref()
+            .map(|out| out.to_f64())
+            .unwrap_or_else(|| state.size_in.to_f64());
 
         if amount <= 0.0 {
             return Err(format!(
@@ -418,7 +568,7 @@ mod tests {
         let backend = Arc::new(MockCexBackend::new());
         let transfer_service = Arc::new(MockTransferActions::new());
 
-        let finalizer = MexcFinalizer::new(backend, transfer_service);
+        let finalizer = MexcFinalizer::new(backend, transfer_service, Principal::anonymous());
 
         let receipt = make_execution_receipt(42);
         let state: CexState = finalizer.prepare("42", &receipt).await.expect("prepare should succeed");
@@ -479,7 +629,7 @@ mod tests {
         let backend = Arc::new(backend);
         let transfer_service = Arc::new(transfers);
 
-        let finalizer = MexcFinalizer::new(backend, transfer_service);
+        let finalizer = MexcFinalizer::new(backend, transfer_service, Principal::anonymous());
 
         let receipt = make_execution_receipt(42);
         let mut state = finalizer.prepare("42", &receipt).await.expect("prepare should succeed");
@@ -507,7 +657,7 @@ mod tests {
         let backend = Arc::new(backend);
         let transfer_service = Arc::new(transfers);
 
-        let finalizer = MexcFinalizer::new(backend, transfer_service);
+        let finalizer = MexcFinalizer::new(backend, transfer_service, Principal::anonymous());
 
         let receipt = make_execution_receipt(42);
         let mut state = finalizer.prepare("42", &receipt).await.expect("prepare should succeed");
@@ -539,7 +689,7 @@ mod tests {
         let backend = Arc::new(backend);
         let transfer_service = Arc::new(transfers);
 
-        let finalizer = MexcFinalizer::new(backend, transfer_service);
+        let finalizer = MexcFinalizer::new(backend, transfer_service, Principal::anonymous());
 
         let receipt = make_execution_receipt(42);
         let mut state = finalizer.prepare("42", &receipt).await.expect("prepare should succeed");
@@ -571,7 +721,7 @@ mod tests {
         let backend = Arc::new(backend);
         let transfer_service = Arc::new(transfers);
 
-        let finalizer = MexcFinalizer::new(backend, transfer_service);
+        let finalizer = MexcFinalizer::new(backend, transfer_service, Principal::anonymous());
 
         let receipt = make_execution_receipt(42);
         let mut state = finalizer.prepare("42", &receipt).await.expect("prepare should succeed");
@@ -603,7 +753,7 @@ mod tests {
         let backend = Arc::new(backend);
         let transfer_service = Arc::new(transfers);
 
-        let finalizer = MexcFinalizer::new(backend, transfer_service);
+        let finalizer = MexcFinalizer::new(backend, transfer_service, Principal::anonymous());
 
         let receipt = make_execution_receipt(42);
         let mut state = finalizer.prepare("42", &receipt).await.expect("prepare should succeed");
@@ -627,20 +777,49 @@ mod tests {
         let mut backend = MockCexBackend::new();
         let transfers = MockTransferActions::new();
 
+        let calls = std::sync::Arc::new(std::sync::Mutex::new(0usize));
+        let calls_handle = calls.clone();
         backend
             .expect_execute_swap()
-            .times(1)
-            .returning(|market, side, amount_in| {
-                assert_eq!(market, "ckBTC_ckUSDT");
-                assert_eq!(side, "sell");
-                assert!(amount_in > 0.0);
-                Ok(1.1)
+            .times(4)
+            .returning(move |market, side, amount_in| {
+                let mut idx = calls_handle.lock().unwrap();
+                let cur = *idx;
+                *idx += 1;
+
+                match cur {
+                    0 => {
+                        assert_eq!(market, "CKBTC_BTC");
+                        assert_eq!(side, "sell");
+                        assert!(amount_in > 0.0);
+                        Ok(0.005)
+                    }
+                    1 => {
+                        assert_eq!(market, "BTC_USDC");
+                        assert_eq!(side, "sell");
+                        assert!((amount_in - 0.005).abs() < 1e-12);
+                        Ok(12.34)
+                    }
+                    2 => {
+                        assert_eq!(market, "USDC_USDT");
+                        assert_eq!(side, "sell");
+                        assert!((amount_in - 12.34).abs() < 1e-12);
+                        Ok(12.33)
+                    }
+                    3 => {
+                        assert_eq!(market, "CKUSDT_USDT");
+                        assert_eq!(side, "buy");
+                        assert!((amount_in - 12.33).abs() < 1e-12);
+                        Ok(12.32)
+                    }
+                    _ => unreachable!("unexpected execute_swap call"),
+                }
             });
 
         let backend = Arc::new(backend);
         let transfer_service = Arc::new(transfers);
 
-        let finalizer = MexcFinalizer::new(backend, transfer_service);
+        let finalizer = MexcFinalizer::new(backend, transfer_service, Principal::anonymous());
 
         let receipt = make_execution_receipt(42);
         let mut state = finalizer.prepare("42", &receipt).await.expect("prepare should succeed");
@@ -648,11 +827,23 @@ mod tests {
         // Move directly into Trade step; size_in is taken from receipt and should be > 0.
         state.step = CexStep::Trade;
 
-        finalizer.trade(&mut state).await.expect("trade should succeed");
+        finalizer.trade(&mut state).await.expect("trade leg 1 should succeed");
+        assert!(matches!(state.step, CexStep::TradePending));
+        assert!(state.size_out.is_none());
+
+        finalizer.trade(&mut state).await.expect("trade leg 2 should succeed");
+        assert!(matches!(state.step, CexStep::TradePending));
+        assert!(state.size_out.is_none());
+
+        finalizer.trade(&mut state).await.expect("trade leg 3 should succeed");
+        assert!(matches!(state.step, CexStep::TradePending));
+        assert!(state.size_out.is_none());
+
+        finalizer.trade(&mut state).await.expect("trade leg 4 should succeed");
 
         let out = state.size_out.as_ref().expect("size_out should be set");
         assert_eq!(out.token, state.withdraw_asset);
-        assert!((out.to_f64() - 1.1).abs() < 1e-9);
+        assert!((out.to_f64() - 12.32).abs() < 1e-9);
         assert!(matches!(state.step, CexStep::Withdraw));
     }
 
@@ -669,7 +860,7 @@ mod tests {
         let backend = Arc::new(backend);
         let transfer_service = Arc::new(transfers);
 
-        let finalizer = MexcFinalizer::new(backend, transfer_service);
+        let finalizer = MexcFinalizer::new(backend, transfer_service, Principal::anonymous());
 
         let receipt = make_execution_receipt(42);
         let mut state = finalizer.prepare("42", &receipt).await.expect("prepare should succeed");
@@ -694,7 +885,7 @@ mod tests {
         let backend = Arc::new(backend);
         let transfer_service = Arc::new(transfers);
 
-        let finalizer = MexcFinalizer::new(backend, transfer_service);
+        let finalizer = MexcFinalizer::new(backend, transfer_service, Principal::anonymous());
 
         let receipt = make_execution_receipt(42);
         let mut state = finalizer.prepare("42", &receipt).await.expect("prepare should succeed");
@@ -722,7 +913,7 @@ mod tests {
         let backend = Arc::new(backend);
         let transfer_service = Arc::new(transfers);
 
-        let finalizer = MexcFinalizer::new(backend, transfer_service);
+        let finalizer = MexcFinalizer::new(backend, transfer_service, Principal::anonymous());
 
         let receipt = make_execution_receipt(42);
         let mut state = finalizer.prepare("42", &receipt).await.expect("prepare should succeed");
@@ -743,7 +934,7 @@ mod tests {
         let backend = Arc::new(MockCexBackend::new());
         let transfers = Arc::new(MockTransferActions::new());
 
-        let finalizer = MexcFinalizer::new(backend, transfers);
+        let finalizer = MexcFinalizer::new(backend, transfers, Principal::anonymous());
 
         let receipt = make_execution_receipt(42);
         let mut state = finalizer.prepare("42", &receipt).await.expect("prepare should succeed");

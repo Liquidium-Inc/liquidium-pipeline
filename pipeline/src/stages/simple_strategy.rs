@@ -576,6 +576,7 @@ mod tests {
             asset_type: AssetType::CkAsset(ledger),
             account,
             liquidation_bonus: 1000,
+            liquidation_threshold: 8500,
             protocol_fee: 200,
         }
     }
@@ -586,6 +587,7 @@ mod tests {
             positions,
             total_debt: Nat::from(total_debt),
             health_factor: Nat::from(hf),
+            weighted_liquidation_threshold: Nat::from(8500u64),
         }
     }
 
@@ -779,6 +781,7 @@ mod tests {
             asset_type: AssetType::Unknown,
             account: borrower,
             liquidation_bonus: 1000,
+            liquidation_threshold: 8500,
             protocol_fee: 200,
         };
 

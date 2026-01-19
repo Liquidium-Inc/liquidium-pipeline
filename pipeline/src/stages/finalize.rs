@@ -14,7 +14,7 @@ use crate::persistance::WalStore;
 use crate::stage::PipelineStage;
 use crate::stages::executor::ExecutionReceipt;
 use crate::wal::{
-    decode_meta, wal_mark_enqueued, wal_mark_inflight, wal_mark_permanent_failed, wal_mark_retryable_failed,
+    decode_receipt_wrapper, wal_mark_enqueued, wal_mark_inflight, wal_mark_permanent_failed, wal_mark_retryable_failed,
     wal_mark_succeeded,
 };
 
@@ -73,7 +73,9 @@ where
         let mut grouped: HashMap<(AssetId, AssetId), Vec<ExecutionReceipt>> = HashMap::new();
 
         for row in rows {
-            let receipt: ExecutionReceipt = decode_meta(&row)?.expect("receipt not found in WAL meta_json");
+            let meta = decode_receipt_wrapper(&row)?
+                .ok_or_else(|| format!("receipt not found in WAL meta_json for {}", row.id))?;
+            let receipt: ExecutionReceipt = meta.receipt;
 
             let liq = receipt
                 .liquidation_result
@@ -102,15 +104,22 @@ where
             }
 
             let collapsed = collapse_receipts(&receipts);
-
-            info!("Executing collapesed receipt {:?}", collapsed);
-
-            // Use the first liq in this batch to derive an attempt baseline for error handling
-            let first_liq_id = collapsed
+            let liq = collapsed
                 .liquidation_result
                 .as_ref()
-                .ok_or_else(|| "missing liquidation_result in collapsed receipt".to_string())?
-                .id;
+                .ok_or_else(|| "missing liquidation_result in collapsed receipt".to_string())?;
+            let first_liq_id = liq.id;
+
+            info!(
+                "[finalize] 🧾 executing collapsed receipt: liq_id={} batch_size={} pay={} recv={} debt_repaid={} collateral_received={} swap={}",
+                first_liq_id,
+                receipts.len(),
+                collapsed.request.collateral_asset.symbol(),
+                collapsed.request.debt_asset.symbol(),
+                liq.amounts.debt_repaid,
+                liq.amounts.collateral_received,
+                collapsed.request.swap_args.is_some()
+            );
 
             // Mark all rows in this batch as in-flight before calling the finalizer
             for r in &receipts {
@@ -170,6 +179,7 @@ where
                             .get(&liq_id)
                             .ok_or_else(|| format!("missing WAL id for liquidation {}", liq_id))?;
 
+                        debug!("Failed finalization {}", e);
                         if next_attempt >= MAX_FINALIZER_ATTEMPTS {
                             let _ = wal_mark_permanent_failed(&*self.wal, wal_id).await;
                         } else {

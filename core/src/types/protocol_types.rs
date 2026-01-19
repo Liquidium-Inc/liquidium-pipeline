@@ -113,20 +113,22 @@ impl fmt::Display for LiquidationResult {
 
 #[derive(Debug, Clone, Deserialize, CandidType, PartialEq, Eq)]
 pub struct LiquidateblePosition {
-    pub pool_id: Principal,     // Pool containing the debt to be repaid
-    pub debt_amount: Nat,       // The debt amount
-    pub collateral_amount: Nat, // The collateral amount on this position
-    pub asset: Assets,          // The debt asset
-    pub asset_type: AssetType,  // The collateral type
-    pub account: Principal,     // Account that will be liquidated
-    pub liquidation_bonus: u64, // The collateral pool's liquidation bonus in  (in basis points, 1000 = 10%)
-    pub protocol_fee: u64,      // The fee on the liquidation bonus un  (in basis points, 1000 = 10%)
+    pub pool_id: Principal,         // Pool containing the debt to be repaid
+    pub debt_amount: Nat,           // The debt amount
+    pub collateral_amount: Nat,     // The collateral amount on this position
+    pub asset: Assets,              // The debt asset
+    pub asset_type: AssetType,      // The collateral type
+    pub account: Principal,         // Account that will be liquidated
+    pub liquidation_bonus: u64,     // The collateral pool's liquidation bonus in  (in basis points, 1000 = 10%)
+    pub liquidation_threshold: u64, // The collateral pool's liquidation threshold (bps)
+    pub protocol_fee: u64,          // The fee on the liquidation bonus un  (in basis points, 1000 = 10%)
 }
 
 #[derive(Debug, Clone, Deserialize, CandidType, PartialEq, Eq)]
 pub struct LiquidatebleUser {
     pub account: Principal,                   // The user's account
     pub health_factor: Nat,                   // The user's health factor
+    pub weighted_liquidation_threshold: Nat,  // Weighted liquidation threshold (bps)
     pub positions: Vec<LiquidateblePosition>, // The user's positions
     pub total_debt: Nat,                      // Users total debt in $
 }
