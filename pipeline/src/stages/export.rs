@@ -13,6 +13,7 @@ pub struct ExportStage {
 #[derive(Serialize)]
 struct ExecutionAnalyticsRow {
     status: String,
+    swapper: String,
     expected_profit: i128,
     realized_profit: i128,
     liquidation_tx_id: Option<String>,
@@ -48,6 +49,7 @@ impl<'a> PipelineStage<'a, Vec<LiquidationOutcome>, ()> for ExportStage {
         for r in input {
             let row = ExecutionAnalyticsRow {
                 status: r.status.description(),
+                swapper: r.formatted_swapper(),
                 expected_profit: r.request.expected_profit,
                 realized_profit: r.realized_profit,
                 liquidation_tx_id: r

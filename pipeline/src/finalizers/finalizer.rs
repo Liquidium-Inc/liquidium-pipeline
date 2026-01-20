@@ -8,6 +8,8 @@ pub struct FinalizerResult {
     // Optional swap; non-swap finalizers can leave this as None
     pub swap_result: Option<SwapExecution>,
     pub finalized: bool,
+    #[serde(default)]
+    pub swapper: Option<String>,
 }
 
 impl FinalizerResult {
@@ -15,6 +17,7 @@ impl FinalizerResult {
         Self {
             swap_result: None,
             finalized: false,
+            swapper: None,
         }
     }
 }

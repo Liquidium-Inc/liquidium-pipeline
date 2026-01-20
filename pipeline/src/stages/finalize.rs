@@ -119,6 +119,7 @@ where
                     FinalizerResult {
                         swap_result: None,
                         finalized: true,
+                        swapper: Some("none".to_string()),
                     },
                     receipt,
                 ));

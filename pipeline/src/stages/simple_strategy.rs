@@ -440,22 +440,27 @@ where
             let (swap_args, amount_received, price) = if estimation.received_collateral == 0u32 || same_asset {
                 (None, amount_in.value.clone(), 1f64)
             } else {
-                debug!(" ======== Amount in {:?}", amount_in);
                 let swap_request = SwapRequest {
                     pay_asset: collateral_token.asset_id(),
-                    pay_amount: amount_in,
+                    pay_amount: amount_in.clone(),
                     receive_asset: repayment_token.asset_id(),
                     receive_address: Some(self.config.get_liquidator_principal().to_string()),
                     max_slippage_bps: Some(2000),
                     venue_hint: None,
                 };
-                let swap_info = self
-                    .swapper
-                    .quote(&swap_request)
-                    .await
-                    .expect("could not get swap info");
+                let price_ray = estimation.ref_price.clone();
+                let price = price_ray.0.to_f64().unwrap_or(0.0) / 1e27f64;
 
-                (Some(swap_request), swap_info.receive_amount, swap_info.mid_price)
+                let amount_received = if price_ray == 0u8 {
+                    Nat::from(0u8)
+                } else {
+                    let ray = Nat::from(10u128.pow(27));
+                    let coll_scale = Nat::from(10u128.pow(collateral_token.decimals() as u32));
+                    let debt_scale = Nat::from(10u128.pow(repayment_token.decimals() as u32));
+                    (amount_in.value.clone() * price_ray * debt_scale) / (coll_scale * ray)
+                };
+
+                (Some(swap_request), amount_received, price)
             };
 
             info!(

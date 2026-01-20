@@ -70,6 +70,15 @@ impl<'a, A: PipelineAgent, D: WalStore> PipelineStage<'a, Vec<ExecutorRequest>, 
 
                 let liq_req = executor_request.liquidation.clone();
 
+                info!(
+                    "[executor] ⚡ liquidation req | borrower={} | debt_pool={} | collateral_pool={} | debt={} | bad_debt={}",
+                    liq_req.borrower.to_text(),
+                    liq_req.debt_pool_id.to_text(),
+                    liq_req.collateral_pool_id.to_text(),
+                    liq_req.debt_amount,
+                    liq_req.buy_bad_debt
+                );
+
                 let args = Encode!(&liq_req).map_err(|e| e.to_string())?;
 
                 let liq_call = match self

@@ -81,4 +81,24 @@ impl LiquidationOutcome {
             .map(|v| v.to_string())
             .unwrap_or_else(|| "-".to_string())
     }
+
+    pub fn formatted_swapper(&self) -> String {
+        if let Some(swapper) = &self.finalizer_result.swapper {
+            return swapper.clone();
+        }
+
+        if self.execution_receipt.request.swap_args.is_none() {
+            return "none".to_string();
+        }
+
+        if let Some(result) = &self.finalizer_result.swap_result {
+            if let Some(leg) = result.legs.first() {
+                return leg.venue.clone();
+            }
+
+            return "mexc".to_string();
+        }
+
+        "unknown".to_string()
+    }
 }

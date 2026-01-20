@@ -307,6 +307,7 @@ pub fn print_execution_results(results: Vec<LiquidationOutcome>) {
         Cell::new("Collateral"),
         Cell::new("Swap Output"),
         Cell::new("Swap Status"),
+        Cell::new("Swapper"),
         Cell::new("Round Trip (s)"),
         Cell::new("Status"),
     ]));
@@ -342,6 +343,7 @@ pub fn print_execution_results(results: Vec<LiquidationOutcome>) {
             Cell::new(&collat),
             Cell::new(&recv_amt),
             Cell::new(&swap_status),
+            Cell::new(&r.formatted_swapper()),
             Cell::new(&r.formatted_round_trip_secs()),
             status_cell,
         ]));

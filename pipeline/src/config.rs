@@ -189,11 +189,9 @@ impl Config {
             .and_then(|v| v.parse::<u32>().ok())
             .unwrap_or(500); // default 5%
 
-        let swapper = match env::var("SWAPPER")
-            .unwrap_or_else(|_| "hybrid".to_string())
-            .to_lowercase()
-            .as_str()
-        {
+        let swapper_raw = env::var("SWAPPER").unwrap_or_else(|_| "hybrid".to_string());
+        let swapper = match swapper_raw.trim().to_lowercase().as_str() {
+            "" => SwapperMode::Hybrid,
             "dex" => SwapperMode::Dex,
             "cex" => SwapperMode::Cex,
             "hybrid" => SwapperMode::Hybrid,

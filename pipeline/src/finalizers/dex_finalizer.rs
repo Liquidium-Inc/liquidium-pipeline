@@ -65,6 +65,7 @@ impl Finalizer for dyn DexFinalizerLogic {
         let finlizer_result = FinalizerResult {
             swap_result: Some(swap_exec),
             finalized: true,
+            swapper: None,
         };
 
         Ok(finlizer_result)

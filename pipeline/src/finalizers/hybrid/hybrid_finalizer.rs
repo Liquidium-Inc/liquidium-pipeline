@@ -14,6 +14,7 @@ use crate::{
     wal::liq_id_from_receipt,
 };
 
+use log::info;
 use num_traits::ToPrimitive;
 
 pub struct HybridFinalizer<C>
@@ -31,11 +32,6 @@ impl<C> HybridFinalizer<C>
 where
     C: ConfigTrait,
 {
-    fn slippage_bps(ref_price: f64, dex_price: f64) -> u32 {
-        let diff = (dex_price - ref_price).abs() / ref_price;
-        (diff * 10_000.0).round() as u32
-    }
-
     async fn finalize_via_dex(&self, wal: &dyn WalStore, receipt: ExecutionReceipt) -> Result<FinalizerResult, String> {
         // Delegate full DEX settlement logic to the underlying DEX finalizer.
         self.dex_finalizer.finalize(wal, receipt).await
@@ -66,11 +62,17 @@ where
         match self.config.get_swapper_mode() {
             SwapperMode::Dex => {
                 // Pure DEX mode: delegate directly to the DEX finalizer.
-                return self.finalize_via_dex(wal, receipt).await;
+                let mut res = self.finalize_via_dex(wal, receipt).await?;
+                res.swapper = Some("kong".to_string());
+                info!("[hybrid] 🟩 forced dex route -> kong");
+                return Ok(res);
             }
             SwapperMode::Cex => {
                 // Pure CEX mode: delegate directly to the CEX finalizer.
-                return self.finalize_via_cex(wal, receipt, None).await;
+                let mut res = self.finalize_via_cex(wal, receipt, None).await?;
+                res.swapper = Some("mexc".to_string());
+                info!("[hybrid] 🟧 forced cex route -> mexc");
+                return Ok(res);
             }
             SwapperMode::Hybrid => {
                 // Fall through to hybrid routing logic below.
@@ -89,48 +91,32 @@ where
                 return Ok(FinalizerResult {
                     finalized: true,
                     swap_result: None,
+                    swapper: Some("none".to_string()),
                 });
             }
         };
 
         // ref_price is stored as a Nat in RAY (1e27) on the request.
         let ref_price_ray = receipt.request.ref_price.clone();
-        let ref_price_f64 = match ref_price_ray.0.to_f64() {
-            Some(x) if x > 0.0 => x / 1e27f64,
-            _ => {
-                // No usable reference price: fall back to CEX finalizer.
-                return self
-                    .finalize_via_cex(wal, receipt, Some("missing ref_price; cex-only".to_string()))
-                    .await;
-            }
-        };
+        let ref_price_f64 = ref_price_ray.0.to_f64().unwrap_or(0.0) / 1e27f64;
 
-        // Use the DEX swapper only to obtain a quote; actual settlement is delegated.
-        let quote = match self.dex_swapper.quote(&swap_req).await {
-            Ok(q) => q,
-            Err(e) => {
-                // DEX infra down or quote failed; route to CEX finalizer.
-                return self
-                    .finalize_via_cex(wal, receipt, Some(format!("dex quote error: {e}")))
-                    .await;
-            }
-        };
-
-        let dex_price = quote.mid_price;
-        let slip = Self::slippage_bps(ref_price_f64, dex_price);
-        let max_slip = self.config.get_max_allowed_dex_slippage();
-
-        if slip <= max_slip {
-            // Slippage acceptable vs oracle: use DEX route.
-            return self.finalize_via_dex(wal, receipt).await;
+        let pay_amount = swap_req.pay_amount.value.0.to_f64().unwrap_or(0.0);
+        let pay_scale = 10f64.powi(swap_req.pay_amount.token.decimals() as i32);
+        let pay_amount_units = pay_amount / pay_scale;
+        let est_value_usd = pay_amount_units * ref_price_f64;
+        
+        if est_value_usd < 2.0 {
+            info!("[hybrid] 🟩 routing to kong (value_usd={:.4} < 2.00)", est_value_usd);
+            let mut res = self.finalize_via_dex(wal, receipt).await?;
+            res.swapper = Some("kong".to_string());
+            return Ok(res);
         }
 
-        // Slippage too high vs oracle: fall back to CEX route.
-        self.finalize_via_cex(
-            wal,
-            receipt,
-            Some(format!("dex slippage {slip} bps > {max_slip} bps; using cex")),
-        )
-        .await
+        info!("[hybrid] 🟧 routing to mexc (value_usd={:.4} >= 2.00)", est_value_usd);
+        let mut res = self
+            .finalize_via_cex(wal, receipt, Some("value_usd >= 2".to_string()))
+            .await?;
+        res.swapper = Some("mexc".to_string());
+        Ok(res)
     }
 }
