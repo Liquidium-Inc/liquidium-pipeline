@@ -70,7 +70,7 @@ impl<'a> PipelineStage<'a, Vec<LiquidationOutcome>, ()> for ExportStage {
                     .finalizer_result
                     .swap_result
                     .as_ref()
-                    .map(|s| s.pay_asset.chain.clone()),
+                    .map(|s| s.pay_asset.symbol.clone()),
                 pay_amount: r
                     .finalizer_result
                     .swap_result
