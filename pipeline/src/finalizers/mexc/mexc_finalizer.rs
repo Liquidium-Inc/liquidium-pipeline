@@ -1,11 +1,14 @@
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use candid::Principal;
+use candid::{Nat, Principal};
 use icrc_ledger_types::icrc1::account::Account;
 use liquidium_pipeline_connectors::backend::cex_backend::CexBackend;
 use liquidium_pipeline_core::{
-    account::model::ChainAccount, tokens::chain_token_amount::ChainTokenAmount, transfer::actions::TransferActions,
+    account::model::ChainAccount,
+    tokens::{chain_token::ChainToken, chain_token_amount::ChainTokenAmount},
+    transfer::actions::TransferActions,
 };
 use log::{debug, info};
 
@@ -29,6 +32,7 @@ where
     pub backend: Arc<C>,
     pub transfer_service: Arc<dyn TransferActions>,
     pub liquidator_principal: Principal,
+    approve_bumps: Mutex<HashMap<String, u8>>,
 }
 
 #[derive(Debug, Clone)]
@@ -77,19 +81,17 @@ impl<C> MexcFinalizer<C>
 where
     C: CexBackend,
 {
-    pub fn new(
-        backend: Arc<C>,
-        transfer_service: Arc<dyn TransferActions>,
-        liquidator_principal: Principal,
-    ) -> Self {
+    pub fn new(backend: Arc<C>, transfer_service: Arc<dyn TransferActions>, liquidator_principal: Principal) -> Self {
         Self {
             backend,
             transfer_service,
             liquidator_principal,
+            approve_bumps: Mutex::new(HashMap::new()),
         }
     }
 
     pub async fn check_deposit(&self, state: &mut CexState) -> Result<(), String> {
+        info!("Checking deposit {}", state.deposit_asset);
         let symbol = state.deposit_asset.symbol();
         let current_bal = self.backend.get_balance(&symbol).await?;
 
@@ -108,13 +110,12 @@ where
                         state.liq_id, b0, current_bal
                     );
                     state.step = CexStep::Trade;
-                } else {
-                    debug!(
-                        "[mexc] liq_id={} deposit not yet visible on CEX (before={}, after={}), staying in Deposit",
-                        state.liq_id, b0, current_bal
-                    );
+                    return Ok(());
                 }
-                Ok(())
+                debug!(
+                    "[mexc] liq_id={} deposit not yet visible on CEX (before={}, after={}), staying in Deposit",
+                    state.liq_id, b0, current_bal
+                );
             }
             None => {
                 // No baseline recorded yet (should normally be set when we send the transfer),
@@ -124,9 +125,10 @@ where
                     state.liq_id, current_bal, current_bal
                 );
                 state.deposit_balance_before = Some(current_bal);
-                Ok(())
             }
         }
+
+        Ok(())
     }
 }
 
@@ -224,8 +226,7 @@ where
             let amount = &state.size_in;
             let fee = state.deposit_asset.fee();
             let fee_amount = ChainTokenAmount::from_raw(state.deposit_asset.clone(), fee.clone());
-            let total_amount =
-                ChainTokenAmount::from_raw(state.deposit_asset.clone(), amount.value.clone() + fee);
+            let total_amount = ChainTokenAmount::from_raw(state.deposit_asset.clone(), amount.value.clone() + fee);
             info!(
                 "[mexc] liq_id={} deposit transfer amount={} fee={} total={}",
                 state.liq_id,
@@ -237,8 +238,8 @@ where
             let actions = &self.transfer_service;
 
             debug!(
-                "[mexc] liq_id={} transfering {}  address={} ",
-                state.liq_id, amount.value, addr.address,
+                "[mexc] liq_id={} transferring {} address={}",
+                state.liq_id, amount.value, addr.address
             );
             let tx_id = actions
                 .transfer(
@@ -253,6 +254,53 @@ where
                 .await?;
 
             debug!("[mexc] liq_id={} sent deposit txid={}", state.liq_id, tx_id);
+
+            if matches!(state.deposit_asset, ChainToken::Icp { .. }) {
+                let already_bumped = {
+                    let approve_bumps = self.approve_bumps.lock().expect("approve_bumps mutex poisoned");
+                    *approve_bumps.get(&state.liq_id).unwrap_or(&0)
+                };
+
+                if already_bumped >= 6 {
+                    debug!(
+                        "[mexc] liq_id={} deposit transfer: approve bump already done (count={})",
+                        state.liq_id, already_bumped
+                    );
+                } else {
+                    let approve_amount = Nat::from(1u8);
+                    let spender = ChainAccount::Icp(Account {
+                        owner: self.liquidator_principal,
+                        subaccount: None,
+                    });
+                    info!(
+                        "[mexc] liq_id={} deposit transfer: approve bump x6 amount={} asset={}",
+                        state.liq_id, approve_amount, state.deposit_asset
+                    );
+
+                    let mut ok = true;
+                    for _ in 0..6 {
+                        if let Err(err) = self
+                            .transfer_service
+                            .approve(&state.deposit_asset, &spender, approve_amount.clone())
+                            .await
+                        {
+                            ok = false;
+                            info!("[mexc] liq_id={} approve bump failed: {}", state.liq_id, err);
+                            break;
+                        }
+                    }
+
+                    if ok {
+                        let mut approve_bumps = self.approve_bumps.lock().expect("approve_bumps mutex poisoned");
+                        approve_bumps.insert(state.liq_id.clone(), 6);
+                    }
+                }
+            } else {
+                debug!(
+                    "[mexc] liq_id={} deposit transfer: approve bump skipped (non-ICP asset={})",
+                    state.liq_id, state.deposit_asset
+                );
+            }
 
             state.deposit_txid = Some(tx_id);
             state.step = CexStep::DepositPending;
@@ -386,7 +434,6 @@ where
             state.withdraw_asset.chain(),
             state.withdraw_address,
         );
-
 
         // Idempotency: if we already have a withdraw id or txid, just advance.
         if state.withdraw_id.is_some() || state.withdraw_txid.is_some() {
@@ -650,9 +697,13 @@ mod tests {
     #[tokio::test]
     async fn mexc_deposit_phase_b_without_baseline_sets_baseline_and_keeps_step() {
         let mut backend = MockCexBackend::new();
-        let transfers = MockTransferActions::new();
+        let mut transfers = MockTransferActions::new();
 
         backend.expect_get_balance().returning(|_symbol| Ok(5.0));
+        transfers
+            .expect_approve()
+            .times(6)
+            .returning(|_token, _spender, _amount| Ok("approve-1".to_string()));
 
         let backend = Arc::new(backend);
         let transfer_service = Arc::new(transfers);
@@ -713,10 +764,14 @@ mod tests {
     #[tokio::test]
     async fn mexc_deposit_phase_b_stays_in_deposit_when_balance_unchanged() {
         let mut backend = MockCexBackend::new();
-        let transfers = MockTransferActions::new();
+        let mut transfers = MockTransferActions::new();
 
         // Balance stays the same as baseline.
         backend.expect_get_balance().returning(|_symbol| Ok(5.0));
+        transfers
+            .expect_approve()
+            .times(6)
+            .returning(|_token, _spender, _amount| Ok("approve-1".to_string()));
 
         let backend = Arc::new(backend);
         let transfer_service = Arc::new(transfers);

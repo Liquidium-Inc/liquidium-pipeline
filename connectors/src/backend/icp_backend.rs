@@ -6,6 +6,7 @@ use async_trait::async_trait;
 use candid::{CandidType, Encode, Nat, Principal};
 use icrc_ledger_types::icrc1::account::Account;
 use icrc_ledger_types::icrc1::transfer::{TransferArg, TransferError};
+use icrc_ledger_types::icrc2::approve::{ApproveArgs, ApproveError};
 use num_traits::ToPrimitive;
 use serde::{Deserialize, de::DeserializeOwned};
 
@@ -21,6 +22,8 @@ pub trait IcpBackend: Send + Sync {
 
     async fn icrc1_decimals(&self, ledger: Principal) -> Result<u8, String>;
     async fn icrc1_fee(&self, ledger: Principal) -> Result<Nat, String>;
+
+    async fn icrc2_approve(&self, ledger: Principal, args: ApproveArgs) -> Result<Nat, String>;
 }
 
 pub struct IcpBackendImpl<A: PipelineAgent> {
@@ -136,6 +139,14 @@ impl<A: PipelineAgent> IcpBackend for IcpBackendImpl<A> {
         match res {
             Result6::Ok(block_index) => Ok(block_index),
             Result6::Err(e) => Err(format!("icp_transfer error: {e:?}")),
+        }
+    }
+
+    async fn icrc2_approve(&self, ledger: Principal, args: ApproveArgs) -> Result<Nat, String> {
+        let result: Result<Nat, ApproveError> = self.update(ledger, "icrc2_approve", args).await?;
+        match result {
+            Ok(idx) => Ok(idx),
+            Err(e) => Err(format!("icrc2_approve error: {e}")),
         }
     }
 

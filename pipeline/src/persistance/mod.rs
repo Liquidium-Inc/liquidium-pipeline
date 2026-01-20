@@ -26,6 +26,8 @@ pub struct LiqResultRecord {
     pub id: String,
     pub status: ResultStatus,
     pub attempt: i32,
+    pub error_count: i32,
+    pub last_error: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
     pub meta_json: String,
@@ -40,6 +42,13 @@ pub trait WalStore: Send + Sync {
     async fn list_by_status(&self, status: ResultStatus, limit: usize) -> Result<Vec<LiqResultRecord>>;
     async fn get_pending(&self, limit: usize) -> Result<Vec<LiqResultRecord>>;
     async fn update_status(&self, liq_id: &str, next: ResultStatus, bump_attempt: bool) -> Result<()>;
+    async fn update_failure(
+        &self,
+        liq_id: &str,
+        next: ResultStatus,
+        last_error: String,
+        bump_attempt: bool,
+    ) -> Result<()>;
     async fn delete(&self, liq_id: &str) -> Result<()>;
 }
 

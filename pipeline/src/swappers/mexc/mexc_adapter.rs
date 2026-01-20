@@ -348,10 +348,11 @@ impl CexBackend for MexcClient {
                             .round_dp_with_strategy(precision, RoundingStrategy::ToZero)
                             .normalize();
                     }
-                    if let Some(min_qty) = f.min_qty {
-                        if qty < min_qty {
-                            return Err(format!("quantity {} below min_qty {} for {}", qty, min_qty, symbol));
-                        }
+
+                    if let Some(min_qty) = f.min_qty
+                        && qty < min_qty
+                    {
+                        return Err(format!("quantity {} below min_qty {} for {}", qty, min_qty, symbol));
                     }
                 }
                 if qty <= Decimal::ZERO {
@@ -367,13 +368,13 @@ impl CexBackend for MexcClient {
                             .round_dp_with_strategy(precision, RoundingStrategy::ToZero)
                             .normalize();
                     }
-                    if let Some(min_notional) = f.min_notional {
-                        if quote_amt < min_notional {
-                            return Err(format!(
-                                "quote amount {} below min_notional {} for {}",
-                                quote_amt, min_notional, symbol
-                            ));
-                        }
+                    if let Some(min_notional) = f.min_notional
+                        && quote_amt < min_notional
+                    {
+                        return Err(format!(
+                            "quote amount {} below min_notional {} for {}",
+                            quote_amt, min_notional, symbol
+                        ));
                     }
                 }
                 (OrderSide::Buy, None, Some(quote_amt))
@@ -551,10 +552,7 @@ impl CexBackend for MexcClient {
         let network_mapped = mexc_withdraw_network(asset, network);
         info!(
             "Withdraw request coin={} network={} amount={} address={}",
-            asset.to_string(),
-            network_mapped,
-            amount,
-            address
+            asset, network_mapped, amount, address
         );
 
         let mut last_err: Option<String> = None;

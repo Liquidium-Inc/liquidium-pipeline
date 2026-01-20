@@ -157,12 +157,15 @@ impl<A: PipelineAgent, D: WalStore> BasicExecutor<A, D> {
             finalizer_result: FinalizerResult::noop(),
             realized_profit: 0i128,
             status: ExecutionStatus::Pending,
+            round_trip_secs: None,
         };
 
         let mut result_record = LiqResultRecord {
             id: liq_id,
             status: crate::persistance::ResultStatus::Enqueued,
             attempt: 0,
+            error_count: 0,
+            last_error: None,
             created_at: now_ts(),
             updated_at: now_ts(),
             meta_json: "{}".to_string(),

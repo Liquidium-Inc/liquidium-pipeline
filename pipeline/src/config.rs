@@ -12,6 +12,8 @@ use log::debug;
 use alloy::signers::local::PrivateKeySigner;
 use std::collections::HashMap;
 use std::env;
+use std::io::Write;
+
 use std::sync::Arc;
 
 
@@ -117,6 +119,26 @@ impl Config {
         };
 
         let logger = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
+            .format(|buf, record| {
+                let (color, level) = match record.level() {
+                    log::Level::Error => ("\u{1b}[31m", "ERROR"),
+                    log::Level::Warn => ("\u{1b}[33m", "WARN"),
+                    log::Level::Info => ("\u{1b}[32m", "INFO"),
+                    log::Level::Debug => ("\u{1b}[34m", "DEBUG"),
+                    log::Level::Trace => ("\u{1b}[35m", "TRACE"),
+                };
+                let reset = "\u{1b}[0m";
+
+                writeln!(
+                    buf,
+                    "{} {}{:<5}{} {}",
+                    buf.timestamp_millis(),
+                    color,
+                    level,
+                    reset,
+                    record.args()
+                )
+            })
             .format_target(false)
             .build();
         let multi = MultiProgress::new();

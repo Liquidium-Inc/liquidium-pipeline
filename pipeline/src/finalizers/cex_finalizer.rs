@@ -280,6 +280,16 @@ mod tests {
             Ok(())
         }
 
+        async fn update_failure(
+            &self,
+            _liq_id: &str,
+            _next: ResultStatus,
+            _last_error: String,
+            _bump_attempt: bool,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
         async fn delete(&self, _liq_id: &str) -> anyhow::Result<()> {
             Ok(())
         }
@@ -460,6 +470,8 @@ mod tests {
             id: "42".to_string(),
             status: ResultStatus::Enqueued,
             attempt: 0,
+            error_count: 0,
+            last_error: None,
             created_at: 0,
             updated_at: 0,
             meta_json: "{}".to_string(),

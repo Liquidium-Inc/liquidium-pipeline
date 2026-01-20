@@ -8,6 +8,8 @@ pub struct LiquidationResultRow {
     pub liq_id: String,
     pub status: i32,
     pub attempt: i32,
+    pub error_count: i32,
+    pub last_error: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
     pub meta_json: String,

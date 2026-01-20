@@ -16,6 +16,7 @@ pub struct LiquidationOutcome {
     pub status: ExecutionStatus,
     pub expected_profit: i128,
     pub realized_profit: i128,
+    pub round_trip_secs: Option<i64>,
 }
 impl LiquidationOutcome {
     fn scale(&self, amount: &Nat, decimals: u8) -> f64 {
@@ -73,5 +74,11 @@ impl LiquidationOutcome {
         let prefix = if delta >= 0 { "+" } else { "-" };
 
         format!("{prefix}{:.3}", abs_scaled)
+    }
+
+    pub fn formatted_round_trip_secs(&self) -> String {
+        self.round_trip_secs
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "-".to_string())
     }
 }

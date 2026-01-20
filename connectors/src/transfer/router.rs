@@ -34,4 +34,18 @@ where
             _ => Err("invalid transfer configuration".to_string()),
         }
     }
+
+    async fn approve(
+        &self,
+        token: &ChainToken,
+        spender: &ChainAccount,
+        amount_native: Nat,
+    ) -> Result<String, String> {
+        match token {
+            ChainToken::Icp { .. } => self.icp.approve(token, spender, amount_native).await,
+            ChainToken::EvmNative { .. } | ChainToken::EvmErc20 { .. } => {
+                self.evm.approve(token, spender, amount_native).await
+            }
+        }
+    }
 }

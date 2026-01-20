@@ -33,6 +33,8 @@ impl SqliteWalStore {
             liq_id: r.id.clone(),
             status: r.status as i32,
             attempt: r.attempt,
+            error_count: r.error_count,
+            last_error: r.last_error.clone(),
             created_at: r.created_at,
             updated_at: r.updated_at,
             meta_json: r.meta_json.clone(),
@@ -50,6 +52,8 @@ impl SqliteWalStore {
                 _ => ResultStatus::FailedPermanent,
             },
             attempt: r.attempt,
+            error_count: r.error_count,
+            last_error: r.last_error,
             created_at: r.created_at,
             updated_at: r.updated_at,
             meta_json: r.meta_json,
@@ -99,6 +103,8 @@ impl WalStore for SqliteWalStore {
             .set((
                 tbl::status.eq(row.status as i32),
                 tbl::attempt.eq(row.attempt),
+                tbl::error_count.eq(row.error_count),
+                tbl::last_error.eq(row.last_error.clone()),
                 tbl::updated_at.eq(row.updated_at),
                 tbl::meta_json.eq(row.meta_json.clone()),
             ))
@@ -143,6 +149,37 @@ impl WalStore for SqliteWalStore {
         Ok(())
     }
 
+    async fn update_failure(
+        &self,
+        liq_id: &str,
+        next: ResultStatus,
+        last_error: String,
+        bump_attempt: bool,
+    ) -> Result<()> {
+        let mut conn = self.pool.get()?;
+        let now = now_secs();
+        let attempt_delta = if bump_attempt { 1 } else { 0 };
+        let current: Option<(i32, i32)> = tbl::table
+            .find(liq_id.to_string())
+            .select((tbl::attempt, tbl::error_count))
+            .first::<(i32, i32)>(&mut conn)
+            .optional()?;
+        let (cur_attempt, cur_error) = current.unwrap_or((0, 0));
+        let new_attempt = cur_attempt + attempt_delta;
+        let new_error_count = cur_error + 1;
+
+        diesel::update(tbl::table.find(liq_id.to_string()))
+            .set((
+                tbl::status.eq(next as i32),
+                tbl::attempt.eq(new_attempt),
+                tbl::error_count.eq(new_error_count),
+                tbl::last_error.eq(Some(last_error)),
+                tbl::updated_at.eq(now),
+            ))
+            .execute(&mut conn)?;
+        Ok(())
+    }
+
     async fn delete(&self, liq_id: &str) -> anyhow::Result<()> {
         let mut conn = self.pool.get()?;
         diesel::delete(tbl::table.find(liq_id.to_string())).execute(&mut conn)?;
@@ -157,6 +194,8 @@ pub fn initialize_schema(conn: &mut SqliteConnection) -> Result<()> {
             liq_id TEXT NOT NULL,
             status INTEGER NOT NULL,
             attempt INTEGER NOT NULL DEFAULT 0,
+            error_count INTEGER NOT NULL DEFAULT 0,
+            last_error TEXT,
             created_at BIGINT NOT NULL,
             updated_at BIGINT NOT NULL,
             meta_json TEXT NOT NULL,

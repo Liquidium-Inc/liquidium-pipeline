@@ -3,6 +3,8 @@ diesel::table! {
         liq_id -> Text,
         status -> Integer,
         attempt -> Integer,
+        error_count -> Integer,
+        last_error -> Nullable<Text>,
         created_at -> BigInt,
         updated_at -> BigInt,
         meta_json -> Text,

@@ -154,7 +154,7 @@ where
 
             if colls.is_empty() {
                 info!(
-                    "User {:?} has debt but no collateral. Treating as bad debt and creating bad-debt entries.",
+                    "🧾 Bad debt detected: user={:?} has no collateral; queueing debt positions.",
                     user.account
                 );
                 for d in debts {
@@ -188,7 +188,7 @@ where
             // Config says we should not buy bad debt; just log and skip.
             for (idx, pos) in bad_debts {
                 info!(
-                    "Skipping pure bad debt for user {:?} pool {:?} amount {} because should_buy_bad_debt=false",
+                    "⏭️ Skip bad debt (disabled): user={:?} pool={:?} debt={}",
                     work_users[idx].account, pos.pool_id, pos.debt_amount,
                 );
             }
@@ -262,7 +262,7 @@ where
                 - Int::from(repayment_token.fee()) * 2u128;
 
             info!(
-                "Buying pure bad debt: repay={} {} profit={} {}",
+                "🧯 Bad debt buy: repay={} {} | profit={} {}",
                 repay_amount.0.to_f64().unwrap() / 10u32.pow(repayment_token.decimals() as u32) as f64,
                 repayment_token.symbol(),
                 profit.0.to_f64().unwrap() / 10u32.pow(repayment_token.decimals() as u32) as f64,
@@ -424,7 +424,7 @@ where
 
             if !self.config.should_buy_bad_debt() && estimation.received_collateral == 0u32 {
                 info!(
-                    "Not enough collateral {} to cover fees {}, skipping liquidation",
+                    "⛔️ Skip liquidation: net collateral {} < fee {}",
                     estimation.received_collateral,
                     collateral_token.fee()
                 );
@@ -459,7 +459,7 @@ where
             };
 
             info!(
-                "repaid_debt={} ({}),  amount_received={} ({}), price={}",
+                "💱 Quote: repay={} {} | received={} {} | price={}",
                 estimation.repaid_debt.0.to_f64().unwrap() / 10u32.pow(repayment_token.decimals() as u32) as f64,
                 repayment_token.symbol(),
                 amount_received.0.to_f64().unwrap() / 10u32.pow(repayment_token.decimals() as u32) as f64,
@@ -471,14 +471,15 @@ where
                 - Int::from(estimation.repaid_debt.clone())
                 - Int::from(repayment_token.fee()) * 2u128
                 - Int::from(collateral_token.fee()) * 2u128;
+            let is_bad_debt = profit <= 0;
 
             info!(
-                "dx Profit {} {}...",
+                "📊 Profit: {} {}",
                 profit.0.to_f64().unwrap() / 10u32.pow(repayment_token.decimals() as u32) as f64,
                 repayment_token.symbol()
             );
 
-            if profit <= 0 && !self.config.should_buy_bad_debt() {
+            if is_bad_debt && !self.config.should_buy_bad_debt() {
                 continue;
             }
 
@@ -511,17 +512,18 @@ where
                     collateral_pool_id: collateral_position.pool_id,
                     debt_amount: estimation.repaid_debt.clone(),
                     receiver_address: self.config.get_trader_principal(),
-                    buy_bad_debt: false,
+                    buy_bad_debt: is_bad_debt,
                 },
                 ref_price: estimation.ref_price,
                 swap_args,
                 expected_profit: profit.0.to_i128().unwrap(),
             });
 
-            if profit <= 0 && self.config.should_buy_bad_debt() {
+            if is_bad_debt && self.config.should_buy_bad_debt() {
                 info!(
-                    "Buying bad debt {}",
-                    estimation.repaid_debt.0.to_f64().unwrap() / 10u32.pow(repayment_token.decimals() as u32) as f64
+                    "🧯 Buying bad debt: repaid={} {}",
+                    estimation.repaid_debt.0.to_f64().unwrap() / 10u32.pow(repayment_token.decimals() as u32) as f64,
+                    repayment_token.symbol()
                 );
             }
         }
@@ -930,6 +932,10 @@ mod tests {
         );
         assert!(res[0].swap_args.is_none(), "no swap expected when assets match");
         assert!(res[0].expected_profit < 0, "profit should be negative in this setup");
+        assert!(
+            res[0].liquidation.buy_bad_debt,
+            "negative-profit liquidation should be marked as bad debt"
+        );
     }
 
     // Balance budgeting across multiple combos uses one wallet and skips when funds fall below fee threshold.

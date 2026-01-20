@@ -58,4 +58,13 @@ impl<B: EvmBackend + Send + Sync> TransferActions for EvmTransferAdapter<B> {
             _ => Err("EvmTransferAdapter only supports EvmNative and EvmErc20 tokens".to_string()),
         }
     }
+
+    async fn approve(
+        &self,
+        _token: &ChainToken,
+        _spender: &ChainAccount,
+        _amount_native: Nat,
+    ) -> Result<String, String> {
+        Err("EvmTransferAdapter does not support approve".to_string())
+    }
 }
