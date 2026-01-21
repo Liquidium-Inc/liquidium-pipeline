@@ -53,10 +53,10 @@ impl PipelineAgent for ic_agent::Agent {
             .with_arg(arg)
             .call()
             .await
-            .map_err(|e| e.to_string());
+            .map_err(|e| format!("Query call failed: {e}"))?;
 
         // Decode the candid response
-        let res = Decode!(&res.unwrap(), R).map_err(|e| format!("Candid decode error: {e}"))?;
+        let res = Decode!(&res, R).map_err(|e| format!("Candid decode error: {e}"))?;
 
         Ok(res)
     }
@@ -72,9 +72,9 @@ impl PipelineAgent for ic_agent::Agent {
             .with_arg(arg)
             .call()
             .await
-            .map_err(|e| e.to_string());
+            .map_err(|e| format!("Query call failed: {e}"))?;
 
-        let res = candid::utils::decode_one::<R>(&res.unwrap()).map_err(|e| format!("Candid decode error: {}", e))?;
+        let res = candid::utils::decode_one::<R>(&res).map_err(|e| format!("Candid decode error: {}", e))?;
 
         Ok(res)
     }

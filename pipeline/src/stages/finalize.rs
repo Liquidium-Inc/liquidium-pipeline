@@ -10,7 +10,7 @@ use crate::finalizers::profit_calculator::ProfitCalculator;
 
 use crate::persistance::WalStore;
 use crate::stage::PipelineStage;
-use crate::stages::executor::ExecutionReceipt;
+use crate::stages::executor::{ExecutionReceipt, ExecutionStatus};
 use crate::utils::now_ts;
 use crate::wal::{
     decode_receipt_wrapper, wal_mark_enqueued, wal_mark_inflight, wal_mark_permanent_failed, wal_mark_retryable_failed,
@@ -159,6 +159,19 @@ where
                     debug!("Failed finalization {}", err_msg);
                     if next_errors >= MAX_FINALIZER_ERRORS {
                         let _ = wal_mark_permanent_failed(&*self.wal, wal_id, err_msg.clone()).await;
+
+                        let mut failed_receipt = receipt.clone();
+                        failed_receipt.status =
+                            ExecutionStatus::SwapFailed(format!("finalizer permanent failure: {}", err_msg));
+
+                        fin_results.push((
+                            FinalizerResult {
+                                swap_result: None,
+                                finalized: true,
+                                swapper: None,
+                            },
+                            failed_receipt,
+                        ));
                     } else {
                         let _ = wal_mark_retryable_failed(&*self.wal, wal_id, err_msg.clone()).await;
                     }

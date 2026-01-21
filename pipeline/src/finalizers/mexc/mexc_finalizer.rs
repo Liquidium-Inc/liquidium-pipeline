@@ -10,7 +10,7 @@ use liquidium_pipeline_core::{
     tokens::{chain_token::ChainToken, chain_token_amount::ChainTokenAmount},
     transfer::actions::TransferActions,
 };
-use log::{debug, info};
+use log::{debug, info, warn};
 
 use crate::{
     finalizers::cex_finalizer::{CexFinalizerLogic, CexState, CexStep},
@@ -32,8 +32,11 @@ where
     pub backend: Arc<C>,
     pub transfer_service: Arc<dyn TransferActions>,
     pub liquidator_principal: Principal,
+    pub max_sell_slippage_bps: f64,
     approve_bumps: Mutex<HashMap<String, u8>>,
 }
+
+const DEFAULT_ORDERBOOK_LIMIT: u32 = 50;
 
 #[derive(Debug, Clone)]
 struct TradeLeg {
@@ -81,11 +84,17 @@ impl<C> MexcFinalizer<C>
 where
     C: CexBackend,
 {
-    pub fn new(backend: Arc<C>, transfer_service: Arc<dyn TransferActions>, liquidator_principal: Principal) -> Self {
+    pub fn new(
+        backend: Arc<C>,
+        transfer_service: Arc<dyn TransferActions>,
+        liquidator_principal: Principal,
+        max_sell_slippage_bps: f64,
+    ) -> Self {
         Self {
             backend,
             transfer_service,
             liquidator_principal,
+            max_sell_slippage_bps,
             approve_bumps: Mutex::new(HashMap::new()),
         }
     }
@@ -126,6 +135,72 @@ where
                 );
                 state.deposit_balance_before = Some(current_bal);
             }
+        }
+
+        Ok(())
+    }
+
+    async fn check_sell_liquidity(&self, liq_id: &str, market: &str, amount_in: f64) -> Result<(), String> {
+        if amount_in <= 0.0 {
+            return Ok(());
+        }
+
+        let orderbook = self
+            .backend
+            .get_orderbook(market, Some(DEFAULT_ORDERBOOK_LIMIT))
+            .await?;
+
+        let best_bid = orderbook.bids.first().map(|level| level.price).unwrap_or(0.0);
+        if best_bid <= 0.0 {
+            return Err(format!("no bids available for market {}", market));
+        }
+
+        let mut remaining = amount_in;
+        let mut proceeds = 0.0;
+
+        for level in &orderbook.bids {
+            if remaining <= 0.0 {
+                break;
+            }
+            if level.quantity <= 0.0 || level.price <= 0.0 {
+                continue;
+            }
+
+            let take = remaining.min(level.quantity);
+            proceeds += take * level.price;
+            remaining -= take;
+        }
+
+        if remaining > 0.0 {
+            return Err(format!(
+                "not enough bid liquidity for {} (needed {}, missing {})",
+                market, amount_in, remaining
+            ));
+        }
+
+        let avg_price = proceeds / amount_in;
+        let slippage_bps = ((best_bid - avg_price) / best_bid) * 10_000.0;
+
+        info!(
+            "[mexc] liq_id={} liquidity check market={} amount_in={} best_bid={} avg_price={} slippage_bps={}",
+            liq_id, market, amount_in, best_bid, avg_price, slippage_bps
+        );
+
+        if slippage_bps > self.max_sell_slippage_bps {
+            warn!(
+                "[mexc] liq_id={} slippage check failed: market={} amount_in={} best_bid={} avg_price={} slippage_bps={} max_bps={}",
+                liq_id,
+                market,
+                amount_in,
+                best_bid,
+                avg_price,
+                slippage_bps,
+                self.max_sell_slippage_bps
+            );
+            return Err(format!(
+                "sell slippage too high for {}: {:.2} bps > {:.2} bps",
+                market, slippage_bps, self.max_sell_slippage_bps
+            ));
         }
 
         Ok(())
@@ -372,6 +447,13 @@ where
             amount_in
         );
 
+        if leg.side.eq_ignore_ascii_case("sell") {
+            if let Err(err) = self.check_sell_liquidity(&state.liq_id, &leg.market, amount_in).await {
+                state.last_error = Some(format!("liquidity check failed: {}", err));
+                return Err(err);
+            }
+        }
+
         // Execute the spot trade on MEXC. The backend is responsible for:
         // - placing the order (market)
         // - handling partial fills / retries
@@ -537,7 +619,9 @@ mod tests {
     use std::sync::Arc;
 
     use candid::{Nat, Principal};
-    use liquidium_pipeline_connectors::backend::cex_backend::{DepositAddress, MockCexBackend};
+    use liquidium_pipeline_connectors::backend::cex_backend::{
+        DepositAddress, MockCexBackend, OrderBook, OrderBookLevel,
+    };
     use liquidium_pipeline_core::tokens::{chain_token::ChainToken, chain_token_amount::ChainTokenAmount};
     use liquidium_pipeline_core::transfer::actions::MockTransferActions;
     use liquidium_pipeline_core::types::protocol_types::{
@@ -548,6 +632,8 @@ mod tests {
     use crate::executors::executor::ExecutorRequest;
     use crate::finalizers::cex_finalizer::{CexState, CexStep};
     use crate::stages::executor::{ExecutionReceipt, ExecutionStatus};
+
+    const TEST_MAX_SELL_SLIPPAGE_BPS: f64 = 200.0;
 
     fn make_execution_receipt(liq_id: u128) -> ExecutionReceipt {
         let collateral_token = ChainToken::Icp {
@@ -614,8 +700,9 @@ mod tests {
     async fn mexc_prepare_builds_initial_cex_state() {
         let backend = Arc::new(MockCexBackend::new());
         let transfer_service = Arc::new(MockTransferActions::new());
+        let liquidator = Principal::anonymous();
 
-        let finalizer = MexcFinalizer::new(backend, transfer_service, Principal::anonymous());
+        let finalizer = MexcFinalizer::new(backend, transfer_service, liquidator, TEST_MAX_SELL_SLIPPAGE_BPS);
 
         let receipt = make_execution_receipt(42);
         let state: CexState = finalizer.prepare("42", &receipt).await.expect("prepare should succeed");
@@ -644,10 +731,7 @@ mod tests {
 
         // withdraw leg
         assert_eq!(state.withdraw_asset, receipt.request.debt_asset);
-        assert_eq!(
-            state.withdraw_address,
-            receipt.request.liquidation.receiver_address.to_text()
-        );
+        assert_eq!(state.withdraw_address, liquidator.to_text());
         assert!(state.withdraw_id.is_none());
         assert!(state.withdraw_txid.is_none());
         assert!(state.size_out.is_none());
@@ -672,11 +756,20 @@ mod tests {
         transfers
             .expect_transfer()
             .returning(|_token, _to, _amount| Ok("tx-123".to_string()));
+        transfers
+            .expect_approve()
+            .times(6)
+            .returning(|_token, _spender, _amount| Ok("approve-1".to_string()));
 
         let backend = Arc::new(backend);
         let transfer_service = Arc::new(transfers);
 
-        let finalizer = MexcFinalizer::new(backend, transfer_service, Principal::anonymous());
+        let finalizer = MexcFinalizer::new(
+            backend,
+            transfer_service,
+            Principal::anonymous(),
+            TEST_MAX_SELL_SLIPPAGE_BPS,
+        );
 
         let receipt = make_execution_receipt(42);
         let mut state = finalizer.prepare("42", &receipt).await.expect("prepare should succeed");
@@ -697,18 +790,19 @@ mod tests {
     #[tokio::test]
     async fn mexc_deposit_phase_b_without_baseline_sets_baseline_and_keeps_step() {
         let mut backend = MockCexBackend::new();
-        let mut transfers = MockTransferActions::new();
+        let transfers = MockTransferActions::new();
 
         backend.expect_get_balance().returning(|_symbol| Ok(5.0));
-        transfers
-            .expect_approve()
-            .times(6)
-            .returning(|_token, _spender, _amount| Ok("approve-1".to_string()));
 
         let backend = Arc::new(backend);
         let transfer_service = Arc::new(transfers);
 
-        let finalizer = MexcFinalizer::new(backend, transfer_service, Principal::anonymous());
+        let finalizer = MexcFinalizer::new(
+            backend,
+            transfer_service,
+            Principal::anonymous(),
+            TEST_MAX_SELL_SLIPPAGE_BPS,
+        );
 
         let receipt = make_execution_receipt(42);
         let mut state = finalizer.prepare("42", &receipt).await.expect("prepare should succeed");
@@ -740,7 +834,12 @@ mod tests {
         let backend = Arc::new(backend);
         let transfer_service = Arc::new(transfers);
 
-        let finalizer = MexcFinalizer::new(backend, transfer_service, Principal::anonymous());
+        let finalizer = MexcFinalizer::new(
+            backend,
+            transfer_service,
+            Principal::anonymous(),
+            TEST_MAX_SELL_SLIPPAGE_BPS,
+        );
 
         let receipt = make_execution_receipt(42);
         let mut state = finalizer.prepare("42", &receipt).await.expect("prepare should succeed");
@@ -764,19 +863,20 @@ mod tests {
     #[tokio::test]
     async fn mexc_deposit_phase_b_stays_in_deposit_when_balance_unchanged() {
         let mut backend = MockCexBackend::new();
-        let mut transfers = MockTransferActions::new();
+        let transfers = MockTransferActions::new();
 
         // Balance stays the same as baseline.
         backend.expect_get_balance().returning(|_symbol| Ok(5.0));
-        transfers
-            .expect_approve()
-            .times(6)
-            .returning(|_token, _spender, _amount| Ok("approve-1".to_string()));
 
         let backend = Arc::new(backend);
         let transfer_service = Arc::new(transfers);
 
-        let finalizer = MexcFinalizer::new(backend, transfer_service, Principal::anonymous());
+        let finalizer = MexcFinalizer::new(
+            backend,
+            transfer_service,
+            Principal::anonymous(),
+            TEST_MAX_SELL_SLIPPAGE_BPS,
+        );
 
         let receipt = make_execution_receipt(42);
         let mut state = finalizer.prepare("42", &receipt).await.expect("prepare should succeed");
@@ -808,7 +908,12 @@ mod tests {
         let backend = Arc::new(backend);
         let transfer_service = Arc::new(transfers);
 
-        let finalizer = MexcFinalizer::new(backend, transfer_service, Principal::anonymous());
+        let finalizer = MexcFinalizer::new(
+            backend,
+            transfer_service,
+            Principal::anonymous(),
+            TEST_MAX_SELL_SLIPPAGE_BPS,
+        );
 
         let receipt = make_execution_receipt(42);
         let mut state = finalizer.prepare("42", &receipt).await.expect("prepare should succeed");
@@ -831,6 +936,21 @@ mod tests {
     async fn mexc_trade_executes_swap_and_sets_size_out_and_step_withdraw() {
         let mut backend = MockCexBackend::new();
         let transfers = MockTransferActions::new();
+
+        let orderbook = OrderBook {
+            bids: vec![OrderBookLevel {
+                price: 100.0,
+                quantity: 1_000.0,
+            }],
+            asks: vec![OrderBookLevel {
+                price: 101.0,
+                quantity: 1_000.0,
+            }],
+        };
+        backend
+            .expect_get_orderbook()
+            .times(3)
+            .returning(move |_market, _limit| Ok(orderbook.clone()));
 
         let calls = std::sync::Arc::new(std::sync::Mutex::new(0usize));
         let calls_handle = calls.clone();
@@ -874,7 +994,12 @@ mod tests {
         let backend = Arc::new(backend);
         let transfer_service = Arc::new(transfers);
 
-        let finalizer = MexcFinalizer::new(backend, transfer_service, Principal::anonymous());
+        let finalizer = MexcFinalizer::new(
+            backend,
+            transfer_service,
+            Principal::anonymous(),
+            TEST_MAX_SELL_SLIPPAGE_BPS,
+        );
 
         let receipt = make_execution_receipt(42);
         let mut state = finalizer.prepare("42", &receipt).await.expect("prepare should succeed");
@@ -907,6 +1032,21 @@ mod tests {
         let mut backend = MockCexBackend::new();
         let transfers = MockTransferActions::new();
 
+        let orderbook = OrderBook {
+            bids: vec![OrderBookLevel {
+                price: 100.0,
+                quantity: 1_000.0,
+            }],
+            asks: vec![OrderBookLevel {
+                price: 101.0,
+                quantity: 1_000.0,
+            }],
+        };
+        backend
+            .expect_get_orderbook()
+            .times(1)
+            .returning(move |_market, _limit| Ok(orderbook.clone()));
+
         backend
             .expect_execute_swap()
             .times(1)
@@ -915,7 +1055,12 @@ mod tests {
         let backend = Arc::new(backend);
         let transfer_service = Arc::new(transfers);
 
-        let finalizer = MexcFinalizer::new(backend, transfer_service, Principal::anonymous());
+        let finalizer = MexcFinalizer::new(
+            backend,
+            transfer_service,
+            Principal::anonymous(),
+            TEST_MAX_SELL_SLIPPAGE_BPS,
+        );
 
         let receipt = make_execution_receipt(42);
         let mut state = finalizer.prepare("42", &receipt).await.expect("prepare should succeed");
@@ -940,7 +1085,12 @@ mod tests {
         let backend = Arc::new(backend);
         let transfer_service = Arc::new(transfers);
 
-        let finalizer = MexcFinalizer::new(backend, transfer_service, Principal::anonymous());
+        let finalizer = MexcFinalizer::new(
+            backend,
+            transfer_service,
+            Principal::anonymous(),
+            TEST_MAX_SELL_SLIPPAGE_BPS,
+        );
 
         let receipt = make_execution_receipt(42);
         let mut state = finalizer.prepare("42", &receipt).await.expect("prepare should succeed");
@@ -968,7 +1118,12 @@ mod tests {
         let backend = Arc::new(backend);
         let transfer_service = Arc::new(transfers);
 
-        let finalizer = MexcFinalizer::new(backend, transfer_service, Principal::anonymous());
+        let finalizer = MexcFinalizer::new(
+            backend,
+            transfer_service,
+            Principal::anonymous(),
+            TEST_MAX_SELL_SLIPPAGE_BPS,
+        );
 
         let receipt = make_execution_receipt(42);
         let mut state = finalizer.prepare("42", &receipt).await.expect("prepare should succeed");
@@ -989,7 +1144,7 @@ mod tests {
         let backend = Arc::new(MockCexBackend::new());
         let transfers = Arc::new(MockTransferActions::new());
 
-        let finalizer = MexcFinalizer::new(backend, transfers, Principal::anonymous());
+        let finalizer = MexcFinalizer::new(backend, transfers, Principal::anonymous(), TEST_MAX_SELL_SLIPPAGE_BPS);
 
         let receipt = make_execution_receipt(42);
         let mut state = finalizer.prepare("42", &receipt).await.expect("prepare should succeed");

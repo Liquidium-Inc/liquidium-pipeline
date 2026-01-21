@@ -17,6 +17,18 @@ pub struct WithdrawalReceipt {
     pub internal_id: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+pub struct OrderBookLevel {
+    pub price: f64,
+    pub quantity: f64,
+}
+
+#[derive(Debug, Clone)]
+pub struct OrderBook {
+    pub bids: Vec<OrderBookLevel>,
+    pub asks: Vec<OrderBookLevel>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WithdrawStatus {
     Pending,
@@ -33,6 +45,8 @@ pub trait CexBackend: Send + Sync {
     async fn get_quote(&self, market: &str, amount_in: f64) -> Result<f64, String>;
 
     async fn execute_swap(&self, market: &str, side: &str, amount_in: f64) -> Result<f64, String>;
+
+    async fn get_orderbook(&self, market: &str, limit: Option<u32>) -> Result<OrderBook, String>;
 
     // deposits
     async fn get_deposit_address(&self, asset: &str, network: &str) -> Result<DepositAddress, String>;

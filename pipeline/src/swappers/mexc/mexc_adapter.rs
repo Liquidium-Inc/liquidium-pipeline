@@ -4,7 +4,7 @@ use std::env;
 use async_trait::async_trait;
 
 use liquidium_pipeline_connectors::backend::cex_backend::{
-    CexBackend, DepositAddress, WithdrawStatus, WithdrawalReceipt,
+    CexBackend, DepositAddress, OrderBook, OrderBookLevel, WithdrawStatus, WithdrawalReceipt,
 };
 use log::{debug, info, warn};
 use rust_decimal::{Decimal, RoundingStrategy};
@@ -459,6 +459,40 @@ impl CexBackend for MexcClient {
         };
 
         Ok(filled)
+    }
+
+    async fn get_orderbook(&self, market: &str, limit: Option<u32>) -> Result<OrderBook, String> {
+        let ex = self.inner.lock().await;
+        let symbol = normalize_market_symbol(market);
+        let ob = ex
+            .depth(DepthParams {
+                limit,
+                symbol: &symbol,
+            })
+            .await
+            .map_err(|e| e.to_string())?;
+
+        let bids = ob
+            .bids
+            .iter()
+            .map(|level| {
+                let price = level.price.to_f64().ok_or("orderbook bid price to f64 failed")?;
+                let quantity = level.quantity.to_f64().ok_or("orderbook bid qty to f64 failed")?;
+                Ok(OrderBookLevel { price, quantity })
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+
+        let asks = ob
+            .asks
+            .iter()
+            .map(|level| {
+                let price = level.price.to_f64().ok_or("orderbook ask price to f64 failed")?;
+                let quantity = level.quantity.to_f64().ok_or("orderbook ask qty to f64 failed")?;
+                Ok(OrderBookLevel { price, quantity })
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+
+        Ok(OrderBook { bids, asks })
     }
 
     async fn get_deposit_address(&self, asset: &str, network: &str) -> Result<DepositAddress, String> {
