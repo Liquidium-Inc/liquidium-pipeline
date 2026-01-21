@@ -75,12 +75,13 @@ SWAPPER=hybrid
 
 # DEX (Kong)
 KONG_SWAP_BACKEND=2ipq2-uqaaa-aaaar-qailq-cai
-MAX_ALLOWED_SLIPPAGE_BPS=200  # 2.00% in basis points
+MAX_ALLOWED_DEX_SLIPPAGE=7500  # 0.75% in basis points
 
 # CEX (MEXC) - Optional
 CEX_LIST=mexc
 CEX_MEXC_API_KEY=your_api_key
 CEX_MEXC_API_SECRET=your_api_secret
+MAX_ALLOWED_CEX_SLIPPAGE_BPS=200  # 2.00% in basis points
 ```
 
 ### Storage & Export

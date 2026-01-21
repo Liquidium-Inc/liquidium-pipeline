@@ -44,7 +44,8 @@ pub struct Config {
     pub export_path: String,
     pub buy_bad_debt: bool,
     pub db_path: String,
-    pub max_allowed_slippage_bps: u32,
+    pub max_allowed_dex_slippage: u32,
+    pub max_allowed_cex_slippage_bps: u32,
     pub swapper: SwapperMode,
     pub cex_credentials: HashMap<String, (String, String)>,
     pub opportunity_account_filter: Vec<Principal>,
@@ -55,7 +56,8 @@ pub trait ConfigTrait: Send + Sync {
     fn get_liquidator_principal(&self) -> Principal;
     fn get_trader_principal(&self) -> Principal;
     fn should_buy_bad_debt(&self) -> bool;
-    fn get_max_allowed_slippage_bps(&self) -> u32;
+    fn get_max_allowed_dex_slippage(&self) -> u32;
+    fn get_max_allowed_cex_slippage_bps(&self) -> u32;
     #[allow(dead_code)]
     fn get_lending_canister(&self) -> Principal;
     #[allow(dead_code)]
@@ -88,8 +90,12 @@ impl ConfigTrait for Config {
         self.lending_canister
     }
 
-    fn get_max_allowed_slippage_bps(&self) -> u32 {
-        self.max_allowed_slippage_bps
+    fn get_max_allowed_dex_slippage(&self) -> u32 {
+        self.max_allowed_dex_slippage
+    }
+
+    fn get_max_allowed_cex_slippage_bps(&self) -> u32 {
+        self.max_allowed_cex_slippage_bps
     }
 
     fn get_swapper_mode(&self) -> SwapperMode {
@@ -184,9 +190,14 @@ impl Config {
         let hex = evm_signer.to_bytes().encode_hex();
         let evm_private_key = format!("{:#}", hex);
 
-        let max_allowed_slippage_bps: u32 = std::env::var("MAX_ALLOWED_SLIPPAGE_BPS")
-            .or_else(|_| std::env::var("MAX_ALLOWED_CEX_SLIPPAGE_BPS"))
-            .or_else(|_| std::env::var("MAX_ALLOWED_DEX_SLIPPAGE"))
+        let max_allowed_dex_slippage: u32 = std::env::var("MAX_ALLOWED_DEX_SLIPPAGE")
+            .or_else(|_| std::env::var("MAX_ALLOWED_SLIPPAGE_BPS"))
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(500); // default 5%
+
+        let max_allowed_cex_slippage_bps: u32 = std::env::var("MAX_ALLOWED_CEX_SLIPPAGE_BPS")
+            .or_else(|_| std::env::var("MAX_ALLOWED_SLIPPAGE_BPS"))
             .ok()
             .and_then(|v| v.parse::<u32>().ok())
             .unwrap_or(200);
@@ -236,7 +247,8 @@ impl Config {
             export_path,
             buy_bad_debt,
             db_path,
-            max_allowed_slippage_bps,
+            max_allowed_dex_slippage,
+            max_allowed_cex_slippage_bps,
             swapper,
             cex_credentials,
             opportunity_account_filter,

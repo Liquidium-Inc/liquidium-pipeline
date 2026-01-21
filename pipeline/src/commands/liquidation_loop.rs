@@ -72,8 +72,12 @@ fn print_startup_table(config: &Config, debt_assets: &[String]) {
         Cell::new(&format!("{:?}", config.swapper)),
     ]));
     table.add_row(Row::new(vec![
-        Cell::new("Max Slippage (bps)"),
-        Cell::new(&config.max_allowed_slippage_bps.to_string()),
+        Cell::new("Max DEX Slippage (bps)"),
+        Cell::new(&config.max_allowed_dex_slippage.to_string()),
+    ]));
+    table.add_row(Row::new(vec![
+        Cell::new("Max CEX Slippage (bps)"),
+        Cell::new(&config.max_allowed_cex_slippage_bps.to_string()),
     ]));
     table.add_row(Row::new(vec![
         Cell::new("Buy Bad Debt"),
@@ -143,7 +147,7 @@ async fn init(
             mexc_client,
             ctx.trader_transfers.actions(),
             config.liquidator_principal,
-            config.max_allowed_slippage_bps as f64,
+            config.max_allowed_cex_slippage_bps as f64,
         ));
         Some(mexc_finalizer)
     } else {

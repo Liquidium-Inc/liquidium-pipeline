@@ -437,7 +437,7 @@ where
             };
 
             let same_asset = collateral_token.asset_id().address == repayment_token.asset_id().address;
-            let max_slippage_bps = self.config.get_max_allowed_slippage_bps();
+            let max_slippage_bps = self.config.get_max_allowed_dex_slippage();
             let (swap_args, amount_received, price) = if estimation.received_collateral == 0u32 || same_asset {
                 (None, amount_in.value.clone(), 1f64)
             } else {
@@ -617,7 +617,7 @@ mod tests {
         cfg.expect_get_trader_principal().return_const(trader);
         cfg.expect_get_liquidator_principal().return_const(trader);
         cfg.expect_should_buy_bad_debt().return_const(false);
-        cfg.expect_get_max_allowed_slippage_bps().return_const(2000);
+        cfg.expect_get_max_allowed_dex_slippage().return_const(2000);
 
         // Collateral service: repay 1_000, receive 2_000 collateral
         let mut collateral = MockCollateralServiceTrait::new();
@@ -693,7 +693,7 @@ mod tests {
         cfg.expect_get_trader_principal().return_const(trader);
         cfg.expect_get_liquidator_principal().return_const(trader);
         cfg.expect_should_buy_bad_debt().return_const(false);
-        cfg.expect_get_max_allowed_slippage_bps().return_const(2000);
+        cfg.expect_get_max_allowed_dex_slippage().return_const(2000);
 
         let mut collateral = MockCollateralServiceTrait::new();
         collateral
@@ -750,7 +750,7 @@ mod tests {
         cfg.expect_get_trader_principal().return_const(trader);
         cfg.expect_get_liquidator_principal().return_const(trader);
         cfg.expect_should_buy_bad_debt().return_const(false);
-        cfg.expect_get_max_allowed_slippage_bps().return_const(2000);
+        cfg.expect_get_max_allowed_dex_slippage().return_const(2000);
 
         let mut collateral = MockCollateralServiceTrait::new();
         collateral
@@ -818,7 +818,7 @@ mod tests {
         cfg.expect_get_trader_principal().return_const(trader);
         cfg.expect_get_liquidator_principal().return_const(trader);
         cfg.expect_should_buy_bad_debt().return_const(false);
-        cfg.expect_get_max_allowed_slippage_bps().return_const(2000);
+        cfg.expect_get_max_allowed_dex_slippage().return_const(2000);
 
         let mut collateral = MockCollateralServiceTrait::new();
         collateral
@@ -886,7 +886,7 @@ mod tests {
         cfg.expect_get_trader_principal().return_const(trader);
         cfg.expect_get_liquidator_principal().return_const(trader);
         cfg.expect_should_buy_bad_debt().return_const(true);
-        cfg.expect_get_max_allowed_slippage_bps().return_const(2000);
+        cfg.expect_get_max_allowed_dex_slippage().return_const(2000);
 
         let mut collateral = MockCollateralServiceTrait::new();
         collateral
@@ -965,7 +965,7 @@ mod tests {
         cfg.expect_get_trader_principal().return_const(trader);
         cfg.expect_get_liquidator_principal().return_const(trader);
         cfg.expect_should_buy_bad_debt().return_const(false);
-        cfg.expect_get_max_allowed_slippage_bps().return_const(2000);
+        cfg.expect_get_max_allowed_dex_slippage().return_const(2000);
 
         // Collateral service returns fixed repay so we can control budgeting
         let mut collateral = MockCollateralServiceTrait::new();
@@ -1040,7 +1040,7 @@ mod tests {
         cfg.expect_get_trader_principal().return_const(trader);
         cfg.expect_get_liquidator_principal().return_const(trader);
         cfg.expect_should_buy_bad_debt().return_const(false);
-        cfg.expect_get_max_allowed_slippage_bps().return_const(2000);
+        cfg.expect_get_max_allowed_dex_slippage().return_const(2000);
 
         let mut calls = 0u32;
         let mut collateral = MockCollateralServiceTrait::new();
@@ -1122,7 +1122,7 @@ mod tests {
         cfg.expect_get_trader_principal().return_const(trader);
         cfg.expect_get_liquidator_principal().return_const(trader);
         cfg.expect_should_buy_bad_debt().return_const(false);
-        cfg.expect_get_max_allowed_slippage_bps().return_const(2000);
+        cfg.expect_get_max_allowed_dex_slippage().return_const(2000);
 
         let mut first_called_for_low_hf = true;
         let mut collateral = MockCollateralServiceTrait::new();
@@ -1206,7 +1206,7 @@ mod tests {
         cfg.expect_get_trader_principal().return_const(trader);
         cfg.expect_get_liquidator_principal().return_const(trader);
         cfg.expect_should_buy_bad_debt().return_const(false);
-        cfg.expect_get_max_allowed_slippage_bps().return_const(2000);
+        cfg.expect_get_max_allowed_dex_slippage().return_const(2000);
 
         let mut first_checked = true;
         let mut collateral = MockCollateralServiceTrait::new();
