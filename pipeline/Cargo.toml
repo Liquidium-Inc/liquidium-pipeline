@@ -41,7 +41,7 @@ futures = { workspace = true }
 bip39 = { workspace = true }
 thiserror = { workspace = true }
 
-mexc-rs = { git = "https://github.com/liquidium-Inc/mexc-rs.git" }
+mexc-rs = { git = "https://github.com/liquidium-Inc/mexc-rs.git", rev = "efcdfff2ad62be2cf53f1defc0ca7f2e24970730" }
 dotenv = "0.15"
 ctor = "0.4.2"
 clap = { version = "4.5.40", features = ["derive"] }
