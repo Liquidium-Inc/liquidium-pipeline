@@ -3725,6 +3725,7 @@ checksum = "32a282da65faaf38286cf3be983213fcf1d2e2a58700e808f83f4ea9a4804bc0"
 [[package]]
 name = "mexc-rs"
 version = "0.6.4"
+source = "git+https://github.com/liquidium-Inc/mexc-rs.git#28e659b035cf08e788f6886e9bbabff38407b329"
 dependencies = [
  "anyhow",
  "async-channel",
