@@ -70,6 +70,36 @@ fi
 
 command -v git >/dev/null || { echo "git is required (install it via your package manager)"; exit 1; }
 
+# ===== SQLite dev headers (libsqlite3-dev) =====
+if command -v pkg-config >/dev/null 2>&1; then
+  if ! pkg-config --exists sqlite3 >/dev/null 2>&1; then
+    if command -v apt-get >/dev/null 2>&1; then
+      echo "On Debian/Ubuntu, install SQLite dev headers:"
+      echo "  sudo apt-get update && sudo apt-get install -y libsqlite3-dev"
+      echo ""
+      exit 1
+    elif command -v yum >/dev/null 2>&1; then
+      echo "On RHEL/CentOS, install SQLite dev headers:"
+      echo "  sudo yum install -y sqlite-devel"
+      echo ""
+      exit 1
+    elif command -v apk >/dev/null 2>&1; then
+      echo "On Alpine, install SQLite dev headers:"
+      echo "  apk add sqlite-dev"
+      echo ""
+      exit 1
+    elif command -v brew >/dev/null 2>&1; then
+      echo "On macOS, install SQLite dev headers:"
+      echo "  brew install sqlite"
+      echo ""
+      exit 1
+    else
+      echo "SQLite dev headers not found. Install libsqlite3-dev and retry."
+      exit 1
+    fi
+  fi
+fi
+
 # ===== Rust toolchain =====
 if [[ "$SKIP_RUST" != "true" ]]; then
   if ! command -v cargo >/dev/null 2>&1; then
@@ -97,6 +127,7 @@ fi
 USER_CONFIG_DIR="$HOME/.liquidium-pipeline"
 USER_CONFIG_FILE="$USER_CONFIG_DIR/config.env"
 mkdir -p "$USER_CONFIG_DIR"
+mkdir -p "$RELEASES_DIR" "$USER_BIN"
 
 if [[ ! -f "$USER_CONFIG_FILE" ]]; then
   if [[ -f "$REPO_DIR/config.env" ]]; then
