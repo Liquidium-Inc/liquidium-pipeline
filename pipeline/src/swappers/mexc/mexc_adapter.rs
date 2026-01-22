@@ -83,28 +83,51 @@ fn parse_u32(v: &Value, key: &str) -> Option<u32> {
 
 fn mexc_network_candidates(asset: &str, network: &str) -> Vec<String> {
     let mut candidates = Vec::new();
-    let network_norm = network.trim().to_ascii_uppercase();
-    if !network_norm.is_empty() {
-        candidates.push(network_norm);
-    }
+    let mut push_unique = |value: String| {
+        if !candidates.iter().any(|item: &String| item.eq_ignore_ascii_case(&value)) {
+            candidates.push(value);
+        }
+    };
 
-    if network.eq_ignore_ascii_case("icp") {
-        let asset_norm = asset.trim().to_ascii_uppercase();
+    let network_norm = network.trim().to_ascii_uppercase();
+    let asset_norm = asset.trim().to_ascii_uppercase();
+    let asset_no_ck = asset_norm.strip_prefix("CK").unwrap_or(&asset_norm);
+    let ck_asset = format!("CK{}", asset_no_ck);
+
+    // Prefer CK network names for ck assets on MEXC, then fall back to ICP/base variants.
+    if asset_norm.starts_with("CK") {
         if !asset_norm.is_empty() {
-            candidates.push(asset_norm.clone());
-            let asset_no_ck = asset_norm.strip_prefix("CK").unwrap_or(&asset_norm);
-            let ck_asset = format!("CK{}", asset_no_ck);
-            candidates.push(ck_asset);
-            candidates.push(asset_no_ck.to_string());
+            push_unique(asset_norm.clone());
+        }
+        push_unique(ck_asset.clone());
+        if !asset_no_ck.is_empty() {
+            push_unique(asset_no_ck.to_string());
         }
     }
 
-    candidates.sort();
-    candidates.dedup();
+    if !network_norm.is_empty() {
+        push_unique(network_norm);
+    }
+
+    if network.eq_ignore_ascii_case("icp") {
+        if !asset_norm.is_empty() {
+            push_unique(asset_norm.clone());
+        }
+        push_unique(ck_asset);
+        if !asset_no_ck.is_empty() {
+            push_unique(asset_no_ck.to_string());
+        }
+    }
+
     candidates
 }
 
 fn mexc_withdraw_network(asset: &str, network: &str) -> String {
+    let asset_norm = asset.trim().to_ascii_uppercase();
+    if asset_norm.starts_with("CK") && !asset_norm.is_empty() {
+        return asset_norm;
+    }
+
     if network.eq_ignore_ascii_case("icp") {
         let asset_norm = asset.trim().to_ascii_uppercase();
         if !asset_norm.is_empty() {
@@ -113,6 +136,25 @@ fn mexc_withdraw_network(asset: &str, network: &str) -> String {
     }
 
     network.to_string()
+}
+
+fn mexc_deposit_asset_candidates(asset: &str) -> Vec<String> {
+    let asset_trimmed = asset.trim();
+    if asset_trimmed.is_empty() {
+        return vec![];
+    }
+
+    let asset_upper = asset_trimmed.to_ascii_uppercase();
+    let asset_no_ck = asset_upper.strip_prefix("CK").unwrap_or(&asset_upper);
+    let mut candidates = vec![
+        asset_trimmed.to_string(),
+        asset_upper.clone(),
+        asset_no_ck.to_string(),
+        format!("CK{}", asset_no_ck),
+    ];
+    candidates.sort();
+    candidates.dedup();
+    candidates
 }
 
 use mexc_rs::spot::{
@@ -269,6 +311,275 @@ impl MexcClient {
     }
 }
 
+impl MexcClient {
+    // Round quote amount to exchange precision and signal whether quote-based buys are viable.
+    fn adjust_quote_amount(amount_dec: Decimal, filters: Option<&SymbolFilters>) -> (Decimal, bool) {
+        let mut quote_amt = amount_dec;
+        let mut use_quote_order = true;
+
+        if let Some(f) = filters {
+            if let Some(precision) = f.quote_precision {
+                quote_amt = quote_amt
+                    .round_dp_with_strategy(precision, RoundingStrategy::ToZero)
+                    .normalize();
+            }
+            if quote_amt <= Decimal::ZERO {
+                use_quote_order = false;
+            }
+        } else if quote_amt <= Decimal::ZERO {
+            use_quote_order = false;
+        }
+
+        (quote_amt, use_quote_order)
+    }
+
+    // Enforce notional minimums against the intended spend amount.
+    fn ensure_min_notional(filters: Option<&SymbolFilters>, amount: Decimal, symbol: &str) -> Result<(), String> {
+        if let Some(f) = filters
+            && let Some(min_notional) = f.min_notional
+            && amount < min_notional
+        {
+            return Err(format!(
+                "quote amount {} below min_notional {} for {}",
+                amount, min_notional, symbol
+            ));
+        }
+        Ok(())
+    }
+
+    // Estimate base output from orderbook for a quote-denominated buy.
+    async fn estimate_buy_quantity(
+        &self,
+        ex: &MexcSpotApiClientWithAuthentication,
+        api_symbol: &str,
+        quote_amount: Decimal,
+    ) -> Result<Decimal, String> {
+        let ob = ex
+            .depth(DepthParams {
+                limit: Some(50),
+                symbol: api_symbol,
+            })
+            .await
+            .map_err(|e| e.to_string())?;
+
+        if ob.asks.is_empty() {
+            return Err("no asks".into());
+        }
+
+        let mut remaining_quote = quote_amount;
+        let mut base_out = Decimal::ZERO;
+        for level in &ob.asks {
+            if remaining_quote <= Decimal::ZERO {
+                break;
+            }
+            if level.price <= Decimal::ZERO || level.quantity <= Decimal::ZERO {
+                continue;
+            }
+            let max_base = remaining_quote / level.price;
+            let take = level.quantity.min(max_base);
+            base_out += take;
+            remaining_quote -= take * level.price;
+        }
+
+        if remaining_quote > Decimal::ZERO {
+            return Err("not enough ask liquidity".into());
+        }
+
+        Ok(base_out)
+    }
+
+    // Apply step size/base precision and min_qty checks to a computed base amount.
+    fn adjust_buy_quantity(qty: Decimal, filters: Option<&SymbolFilters>, symbol: &str) -> Result<Decimal, String> {
+        let mut adjusted = qty;
+        if let Some(f) = filters {
+            if let Some(step) = f.step_size {
+                let step_scale = step.scale();
+                adjusted = truncate_to_step(adjusted, step)
+                    .round_dp_with_strategy(step_scale, RoundingStrategy::ToZero)
+                    .normalize();
+            } else if let Some(precision) = f.base_precision {
+                adjusted = adjusted
+                    .round_dp_with_strategy(precision, RoundingStrategy::ToZero)
+                    .normalize();
+            }
+            if let Some(min_qty) = f.min_qty
+                && adjusted < min_qty
+            {
+                return Err(format!(
+                    "quantity {} below min_qty {} for {}",
+                    adjusted, min_qty, symbol
+                ));
+            }
+        }
+
+        if adjusted <= Decimal::ZERO {
+            return Err(format!("quantity {} not valid for {}", adjusted, symbol));
+        }
+
+        Ok(adjusted)
+    }
+
+    fn candidate_symbols(api_symbol: &str, market_symbol: &str, symbol: &str) -> Vec<String> {
+        let mut candidates = vec![api_symbol.to_string(), market_symbol.to_string(), symbol.to_string()];
+        candidates.sort();
+        candidates.dedup();
+        candidates
+    }
+
+    fn prepare_sell_order(
+        amount_dec: Decimal,
+        filters: Option<&SymbolFilters>,
+        symbol: &str,
+    ) -> Result<(OrderSide, Option<Decimal>, Option<Decimal>), String> {
+        let mut qty = amount_dec;
+        if let Some(f) = filters {
+            if let Some(step) = f.step_size {
+                let step_scale = step.scale();
+                let adjusted = truncate_to_step(qty, step)
+                    .round_dp_with_strategy(step_scale, RoundingStrategy::ToZero)
+                    .normalize();
+
+                if adjusted != qty {
+                    debug!(
+                        "[mexc] adjust sell qty {} -> {} using step_size={}",
+                        qty, adjusted, step
+                    );
+                }
+                qty = adjusted;
+            } else if let Some(precision) = f.base_precision {
+                qty = qty
+                    .round_dp_with_strategy(precision, RoundingStrategy::ToZero)
+                    .normalize();
+            }
+
+            if let Some(min_qty) = f.min_qty
+                && qty < min_qty
+            {
+                return Err(format!("quantity {} below min_qty {} for {}", qty, min_qty, symbol));
+            }
+        }
+
+        if qty <= Decimal::ZERO {
+            return Err(format!("quantity {} not valid for {}", qty, symbol));
+        }
+
+        Ok((OrderSide::Sell, Some(qty), None))
+    }
+
+    async fn submit_market_order(
+        &self,
+        ex: &MexcSpotApiClientWithAuthentication,
+        candidates: &[String],
+        order_side: OrderSide,
+        quantity: Option<Decimal>,
+        quote_order_quantity: Option<Decimal>,
+        market: &str,
+        side: &str,
+        amount_in: f64,
+    ) -> Result<(String, String), String> {
+        let mut last_err: Option<String> = None;
+        for candidate in candidates {
+            info!("Swapping {} {} {} (symbol={})", market, side, amount_in, candidate);
+            match ex
+                .order(OrderParams {
+                    symbol: candidate,
+                    side: order_side,
+                    order_type: v3::enums::OrderType::Market,
+                    quantity,
+                    new_client_order_id: None,
+                    price: None,
+                    quote_order_quantity,
+                })
+                .await
+            {
+                Ok(ok) => return Ok((candidate.clone(), ok.order_id.clone())),
+                Err(e) => {
+                    let details = format_mexc_api_error(&e);
+                    warn!("[mexc] order error response: {}", details);
+                    if is_bad_symbol(&e) {
+                        last_err = Some(format!("Swap err: {}", details));
+                        continue;
+                    }
+                    return Err(format!("Swap err: {}", details));
+                }
+            }
+        }
+
+        Err(last_err.unwrap_or_else(|| "Swap err: bad symbol".to_string()))
+    }
+
+    async fn fetch_filled_amount(
+        &self,
+        ex: &MexcSpotApiClientWithAuthentication,
+        symbol: &str,
+        order_id: &str,
+        side_norm: &str,
+    ) -> Result<f64, String> {
+        let order_res = ex
+            .get_order(GetOrderParams {
+                symbol,
+                order_id: Some(order_id),
+                new_client_order_id: None,
+                original_client_order_id: None,
+            })
+            .await
+            .map_err(|e| format!("Get_order err: {}", e))?;
+
+        match order_res.status {
+            OrderStatus::Filled => {}
+            other => {
+                return Err(format!("order not executed, status: {:?}", other));
+            }
+        }
+
+        if order_res.executed_quantity <= Decimal::ZERO {
+            return Err("order has zero executed quantity".into());
+        }
+
+        if side_norm == "buy" {
+            return order_res
+                .executed_quantity
+                .to_f64()
+                .ok_or("cannot convert executed_quantity to f64".to_string());
+        }
+
+        order_res
+            .cummulative_quote_quantity
+            .to_f64()
+            .ok_or("cannot convert cummulative_quote_quantity to f64".to_string())
+    }
+
+    async fn prepare_buy_order(
+        &self,
+        ex: &MexcSpotApiClientWithAuthentication,
+        amount_dec: Decimal,
+        filters: Option<&SymbolFilters>,
+        api_symbol: &str,
+        symbol: &str,
+    ) -> Result<(OrderSide, Option<Decimal>, Option<Decimal>), String> {
+        if amount_dec <= Decimal::ZERO {
+            return Err(format!("quote amount {} not valid for {}", amount_dec, symbol));
+        }
+
+        // If quote rounds to zero at exchange precision, fall back to a base-quantity buy.
+        let (quote_amt, use_quote_order) = Self::adjust_quote_amount(amount_dec, filters);
+        let check_amt = if use_quote_order { quote_amt } else { amount_dec };
+        Self::ensure_min_notional(filters, check_amt, symbol)?;
+
+        if !use_quote_order {
+            let base_out = self.estimate_buy_quantity(ex, api_symbol, amount_dec).await?;
+            let qty = Self::adjust_buy_quantity(base_out, filters, symbol)?;
+            return Ok((OrderSide::Buy, Some(qty), None));
+        }
+
+        if quote_amt <= Decimal::ZERO {
+            return Err(format!("quote amount {} not valid for {}", quote_amt, symbol));
+        }
+
+        Ok((OrderSide::Buy, None, Some(quote_amt)))
+    }
+}
+
 #[async_trait]
 impl CexBackend for MexcClient {
     async fn get_quote(&self, market: &str, amount_in: f64) -> Result<f64, String> {
@@ -318,7 +629,7 @@ impl CexBackend for MexcClient {
 
         let market_symbol = market.trim().to_ascii_uppercase();
         let symbol = normalize_market_symbol(&market_symbol);
-        // place market order using quote_order_quantity
+        // Determine order params (side, quantity vs quote quantity) using filters.
         let side_norm = side.to_ascii_lowercase();
         let amount_dec = Decimal::from_f64(amount_in).ok_or("could not convert amount_in to Decimal")?;
         let filters = self.get_symbol_filters(&market_symbol).await?;
@@ -326,149 +637,42 @@ impl CexBackend for MexcClient {
             .as_ref()
             .and_then(|f| f.resolved_symbol.as_deref())
             .unwrap_or(&symbol);
-        info!("Swapping {} {} {} (symbol={})", market, side, amount_in, api_symbol);
-        let (order_side, quantity, quote_order_quantity) = match side_norm.as_str() {
-            "sell" => {
-                let mut qty = amount_dec;
-                if let Some(f) = &filters {
-                    if let Some(step) = f.step_size {
-                        let step_scale = step.scale();
-                        let adjusted = truncate_to_step(qty, step)
-                            .round_dp_with_strategy(step_scale, RoundingStrategy::ToZero)
-                            .normalize();
-                        if adjusted != qty {
-                            debug!(
-                                "[mexc] adjust sell qty {} -> {} using step_size={}",
-                                qty, adjusted, step
-                            );
-                        }
-                        qty = adjusted;
-                    } else if let Some(precision) = f.base_precision {
-                        qty = qty
-                            .round_dp_with_strategy(precision, RoundingStrategy::ToZero)
-                            .normalize();
-                    }
 
-                    if let Some(min_qty) = f.min_qty
-                        && qty < min_qty
-                    {
-                        return Err(format!("quantity {} below min_qty {} for {}", qty, min_qty, symbol));
-                    }
-                }
-                if qty <= Decimal::ZERO {
-                    return Err(format!("quantity {} not valid for {}", qty, symbol));
-                }
-                (OrderSide::Sell, Some(qty), None)
-            }
+        info!("Swapping {} {} {} (symbol={})", market, side, amount_in, api_symbol);
+
+        let (order_side, quantity, quote_order_quantity) = match side_norm.as_str() {
+            "sell" => Self::prepare_sell_order(amount_dec, filters.as_ref(), symbol.as_str())?,
             "buy" => {
-                let mut quote_amt = amount_dec;
-                if let Some(f) = &filters {
-                    if let Some(precision) = f.quote_precision {
-                        quote_amt = quote_amt
-                            .round_dp_with_strategy(precision, RoundingStrategy::ToZero)
-                            .normalize();
-                    }
-                    if let Some(min_notional) = f.min_notional
-                        && quote_amt < min_notional
-                    {
-                        return Err(format!(
-                            "quote amount {} below min_notional {} for {}",
-                            quote_amt, min_notional, symbol
-                        ));
-                    }
-                }
-                (OrderSide::Buy, None, Some(quote_amt))
+                self.prepare_buy_order(&ex, amount_dec, filters.as_ref(), api_symbol, symbol.as_str())
+                    .await?
             }
             _ => return Err(format!("unsupported side: {}", side)),
         };
-        let mut candidates = vec![api_symbol.to_string(), market_symbol.clone(), symbol.clone()];
-        candidates.sort();
-        candidates.dedup();
-        let mut last_err: Option<String> = None;
-        let mut chosen_symbol = api_symbol;
-        let mut res = None;
-        for candidate in &candidates {
-            info!("Swapping {} {} {} (symbol={})", market, side, amount_in, candidate);
-            match ex
-                .order(OrderParams {
-                    symbol: candidate,
-                    side: order_side,
-                    order_type: v3::enums::OrderType::Market,
-                    quantity,
-                    new_client_order_id: None,
-                    price: None,
-                    quote_order_quantity,
-                })
-                .await
-            {
-                Ok(ok) => {
-                    chosen_symbol = candidate;
-                    res = Some(ok);
-                    break;
-                }
-                Err(e) => {
-                    let details = format_mexc_api_error(&e);
-                    warn!("[mexc] order error response: {}", details);
-                    if is_bad_symbol(&e) {
-                        last_err = Some(format!("Swap err: {}", details));
-                        continue;
-                    }
-                    return Err(format!("Swap err: {}", details));
-                }
-            }
-        }
 
-        let res = match res {
-            Some(res) => res,
-            None => return Err(last_err.unwrap_or_else(|| "Swap err: bad symbol".to_string())),
-        };
+        // Try multiple candidate symbols for MEXC quirks, then fetch the filled amount.
+        let candidates = Self::candidate_symbols(api_symbol, &market_symbol, &symbol);
+        let (chosen_symbol, order_id) = self
+            .submit_market_order(
+                &ex,
+                &candidates,
+                order_side,
+                quantity,
+                quote_order_quantity,
+                market,
+                side,
+                amount_in,
+            )
+            .await?;
 
-        // fetch final state of the order
-        let order_res = ex
-            .get_order(GetOrderParams {
-                symbol: chosen_symbol,
-                order_id: Some(&res.order_id),
-                new_client_order_id: None,
-                original_client_order_id: None,
-            })
+        self.fetch_filled_amount(&ex, &chosen_symbol, &order_id, &side_norm)
             .await
-            .map_err(|e| format!("Get_order err: {}", e))?;
-
-        // check it actually executed
-        match order_res.status {
-            OrderStatus::Filled => {}
-            other => {
-                return Err(format!("order not executed, status: {:?}", other));
-            }
-        }
-
-        if order_res.executed_quantity <= Decimal::ZERO {
-            return Err("order has zero executed quantity".into());
-        }
-
-        let filled = if side_norm == "buy" {
-            order_res
-                .executed_quantity
-                .to_f64()
-                .ok_or("cannot convert executed_quantity to f64")?
-        } else {
-            order_res
-                .cummulative_quote_quantity
-                .to_f64()
-                .ok_or("cannot convert cummulative_quote_quantity to f64")?
-        };
-
-        Ok(filled)
     }
 
     async fn get_orderbook(&self, market: &str, limit: Option<u32>) -> Result<OrderBook, String> {
         let ex = self.inner.lock().await;
         let symbol = normalize_market_symbol(market);
         let ob = ex
-            .depth(DepthParams {
-                limit,
-                symbol: &symbol,
-            })
+            .depth(DepthParams { limit, symbol: &symbol })
             .await
             .map_err(|e| e.to_string())?;
 
@@ -498,38 +702,63 @@ impl CexBackend for MexcClient {
     async fn get_deposit_address(&self, asset: &str, network: &str) -> Result<DepositAddress, String> {
         let ex = self.inner.lock().await;
 
-        println!("{:?} {:?}", asset, network);
-
-        let res = ex
-            .get_deposit_address(asset.to_string(), None)
-            .await
-            .map_err(|e| e.to_string())?;
-
-        println!("{:?}", res);
-
         let candidates = mexc_network_candidates(asset, network);
-        let addr = res.iter().find(|item| {
-            let item_network = item.network.to_ascii_uppercase();
-            candidates.iter().any(|cand| item_network.contains(cand))
-        });
+        let asset_candidates = mexc_deposit_asset_candidates(asset);
+        let mut last_err: Option<String> = None;
+        let mut last_available: Option<Vec<String>> = None;
 
-        let addr = match addr {
-            Some(v) => v,
-            None => {
-                let available: Vec<String> = res.iter().map(|item| item.network.clone()).collect();
-                return Err(format!(
-                    "address not found for asset={} network={} candidates={:?} available={:?}",
-                    asset, network, candidates, available
+        let mut network_attempts: Vec<Option<String>> = candidates.iter().cloned().map(Some).collect();
+        network_attempts.push(None);
+
+        for coin in &asset_candidates {
+            for net in &network_attempts {
+                let res = match ex.get_deposit_address(coin.to_string(), net.as_deref()).await {
+                    Ok(res) => res,
+                    Err(e) => {
+                        last_err = Some(e.to_string());
+                        continue;
+                    }
+                };
+
+                if res.is_empty() {
+                    last_err = Some(format!(
+                        "no deposit addresses returned for coin={} network={:?}",
+                        coin, net
+                    ));
+                    continue;
+                }
+
+                let addr = res.iter().find(|item| {
+                    let item_network = item.network.to_ascii_uppercase();
+                    candidates.iter().any(|cand| item_network.contains(cand))
+                });
+
+                if let Some(v) = addr {
+                    return Ok(DepositAddress {
+                        asset: asset.to_string(),
+                        network: v.network.clone(),
+                        address: v.address.clone(),
+                        tag: v.memo.clone(),
+                    });
+                }
+
+                last_available = Some(res.iter().map(|item| item.network.clone()).collect());
+                last_err = Some(format!(
+                    "address not found for coin={} network={:?} candidates={:?} available={:?}",
+                    coin, net, candidates, last_available
                 ));
             }
-        };
+        }
 
-        Ok(DepositAddress {
-            asset: asset.to_string(),
-            network: addr.network.clone(),
-            address: addr.address.clone(),
-            tag: addr.memo.clone(),
-        })
+        Err(format!(
+            "address not found for asset={} network={} candidates={:?} asset_candidates={:?} available={:?} err={}",
+            asset,
+            network,
+            candidates,
+            asset_candidates,
+            last_available.unwrap_or_default(),
+            last_err.unwrap_or_else(|| "no deposit address candidates matched".to_string())
+        ))
     }
 
     async fn get_balance(&self, asset: &str) -> Result<f64, String> {
@@ -571,56 +800,79 @@ impl CexBackend for MexcClient {
         amount: f64,
     ) -> Result<WithdrawalReceipt, String> {
         let ex = self.inner.lock().await;
+        let push_unique = |list: &mut Vec<String>, value: String| {
+            if !list.iter().any(|item| item.eq_ignore_ascii_case(&value)) {
+                list.push(value);
+            }
+        };
 
         let asset_upper = asset.to_ascii_uppercase();
         let asset_no_ck = asset_upper.strip_prefix("CK").unwrap_or(&asset_upper);
-        let mut candidates = vec![
-            asset.to_string(),
-            asset_upper.clone(),
-            asset_no_ck.to_string(),
-            format!("CK{}", asset_no_ck),
-        ];
-        candidates.sort();
-        candidates.dedup();
+        let mut candidates = Vec::new();
+        // Prefer native symbol and its CK-prefixed form first.
+        push_unique(&mut candidates, asset_upper.clone());
+        push_unique(&mut candidates, format!("CK{}", asset_no_ck));
+        push_unique(&mut candidates, asset_no_ck.to_string());
+        push_unique(&mut candidates, asset.to_string());
 
+        let mut network_candidates = mexc_network_candidates(asset, network);
         let network_mapped = mexc_withdraw_network(asset, network);
+        let mut ordered_networks = Vec::new();
+        push_unique(&mut ordered_networks, network_mapped.clone());
+        for cand in network_candidates.drain(..) {
+            push_unique(&mut ordered_networks, cand);
+        }
+        if ordered_networks.is_empty() {
+            push_unique(&mut ordered_networks, network_mapped.clone());
+        }
+        let network_candidates = ordered_networks;
+
         info!(
-            "Withdraw request coin={} network={} amount={} address={}",
-            asset, network_mapped, amount, address
+            "Withdraw request coin={} network_candidates={:?} amount={} address={}",
+            asset, network_candidates, amount, address
         );
 
         let mut last_err: Option<String> = None;
+        let mut hard_err: Option<String> = None;
         let mut res = None;
         for coin in &candidates {
-            match ex
-                .withdraw(WithdrawRequest {
-                    address: address.to_string(),
-                    amount: amount.to_string(),
-                    coin: coin.to_string(),
-                    memo: None,
-                    network: Some(network_mapped.clone()),
-                    remark: None,
-                    withdraw_order_id: None,
-                })
-                .await
-            {
-                Ok(ok) => {
-                    res = Some(ok);
-                    break;
-                }
-                Err(e) => {
-                    if is_coin_missing(&e) {
-                        last_err = Some(e.to_string());
-                        continue;
+            for net in &network_candidates {
+                match ex
+                    .withdraw(WithdrawRequest {
+                        address: address.to_string(),
+                        amount: amount.to_string(),
+                        coin: coin.to_string(),
+                        memo: None,
+                        network: Some(net.clone()),
+                        remark: None,
+                        withdraw_order_id: None,
+                    })
+                    .await
+                {
+                    Ok(ok) => {
+                        res = Some(ok);
+                        break;
                     }
-                    return Err(e.to_string());
+                    Err(e) => {
+                        if is_coin_missing(&e) {
+                            last_err = Some(e.to_string());
+                            continue;
+                        }
+                        last_err = Some(e.to_string());
+                        if hard_err.is_none() {
+                            hard_err = last_err.clone();
+                        }
+                    }
                 }
+            }
+            if res.is_some() {
+                break;
             }
         }
 
         let res = match res {
             Some(res) => res,
-            None => return Err(last_err.unwrap_or_else(|| "withdraw failed".to_string())),
+            None => return Err(hard_err.or(last_err).unwrap_or_else(|| "withdraw failed".to_string())),
         };
 
         Ok(WithdrawalReceipt {

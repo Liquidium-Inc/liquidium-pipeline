@@ -42,6 +42,56 @@ impl<A: PipelineAgent> KongSwapSwapper<A> {
         }
     }
 
+    pub async fn ensure_allowance(&self, token: &ChainToken) -> Result<bool, String> {
+        let ledger = match token {
+            ChainToken::Icp { ledger, .. } => *ledger,
+            _ => return Ok(false),
+        };
+
+        let owner = self.dex_account.owner;
+        let threshold = max_for_ledger(&ledger) / Nat::from(2u8);
+
+        {
+            let map = self.allowances.lock().expect("allowances mutex poisoned");
+            if let Some(cached) = map.get(&(ledger, owner))
+                && *cached >= threshold
+            {
+                return Ok(false);
+            }
+        }
+
+        let allowance = self
+            .allowance(
+                &ledger,
+                Account {
+                    owner,
+                    subaccount: None,
+                },
+            )
+            .await;
+
+        if allowance >= threshold {
+            let mut map = self.allowances.lock().expect("allowances mutex poisoned");
+            map.insert((ledger, owner), allowance);
+            return Ok(false);
+        }
+
+        info!("Allowance low for {}, re-approving…", ledger);
+        let approved = self
+            .approve(
+                &ledger,
+                Account {
+                    owner,
+                    subaccount: None,
+                },
+            )
+            .await?;
+
+        let mut map = self.allowances.lock().expect("allowances mutex poisoned");
+        map.insert((ledger, owner), approved);
+        Ok(true)
+    }
+
     pub async fn init(&self, tokens: &[Principal]) -> Result<(), String> {
         let owner = self.dex_account.owner;
         let this = self;

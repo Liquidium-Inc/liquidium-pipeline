@@ -210,13 +210,23 @@ pub async fn run_liquidation_loop() {
     let config = ctx.config.clone();
 
     if config.buy_bad_debt {
-        info!("🚨 BUYING BAD DEBT ENABLED: {} 🚨", config.buy_bad_debt);
+        info!("🚨 BAD DEBT MODE ENABLED: liquidator will repay bad debt to restore solvency");
+        println!("====================================================================");
+        println!("=                                                                  =");
+        println!("=                   !!!  BAD DEBT MODE  !!!                        =");
+        println!("=                                                                  =");
+        println!("=  This bot WILL repay bad debt (you eat the loss).                =");
+        println!("=  Use only if you intend to shore up protocol solvency.            =");
+        println!("=                                                                  =");
+        println!("====================================================================");
         println!("⚠️  You are about to BUY BAD DEBT. Type 'yes' to continue:");
         let mut input = String::new();
         std::io::stdin().read_line(&mut input).unwrap();
         if input.trim() != "yes" {
             panic!("Aborted by user.");
         }
+    } else {
+        info!("✅ BAD DEBT MODE DISABLED: only collateral-backed liquidations will run");
     }
     // Use main IC agent (liquidator identity) from context
     info!("Agent initialized with principal: {}", config.liquidator_principal);
@@ -272,6 +282,13 @@ pub async fn run_liquidation_loop() {
                 log::info!("Strategy processing failed: {e}");
                 vec![]
             });
+
+            if executions.is_empty() {
+                info!(
+                    "Found {} opportunities but none executable yet; likely waiting for funds or liquidity",
+                    opportunities.len()
+                );
+            }
 
             executor.process(&executions).await.unwrap_or_else(|e| {
                 log::error!("Executor failed: {e}");

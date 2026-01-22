@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use candid::Nat;
-use liquidium_pipeline_connectors::backend::cex_backend::CexBackend;
+use liquidium_pipeline_connectors::backend::cex_backend::{CexBackend, OrderBookLevel};
 use liquidium_pipeline_core::tokens::asset_id::AssetId;
 use log::{debug, info};
 
@@ -13,10 +13,65 @@ fn f64_to_nat(v: f64) -> Nat {
     Nat::from(v as u128)
 }
 
-fn market_symbol(token_in: &AssetId, token_out: &AssetId) -> String {
-    // You will probably want a proper mapping later;
-    // for now assume "<IN>/<OUT>" is the MEXC market.
-    format!("{}/{}", token_in.symbol, token_out.symbol)
+const DEFAULT_ORDERBOOK_LIMIT: u32 = 50;
+const LIQUIDITY_EPS: f64 = 1e-9;
+
+fn quote_sell_from_bids(bids: &[OrderBookLevel], amount_in: f64) -> Result<f64, String> {
+    if amount_in <= 0.0 {
+        return Err("amount_in must be positive".to_string());
+    }
+
+    let mut remaining = amount_in;
+    let mut proceeds = 0.0;
+
+    for level in bids {
+        if remaining <= 0.0 {
+            break;
+        }
+        if level.quantity <= 0.0 || level.price <= 0.0 {
+            continue;
+        }
+
+        let take = remaining.min(level.quantity);
+        proceeds += take * level.price;
+        remaining -= take;
+    }
+
+    if remaining > LIQUIDITY_EPS {
+        return Err("not enough bid liquidity".to_string());
+    }
+
+    Ok(proceeds)
+}
+
+fn quote_buy_from_asks(asks: &[OrderBookLevel], quote_in: f64) -> Result<f64, String> {
+    if quote_in <= 0.0 {
+        return Err("amount_in must be positive".to_string());
+    }
+
+    let mut remaining_quote = quote_in;
+    let mut base_out = 0.0;
+
+    for level in asks {
+        if remaining_quote <= 0.0 {
+            break;
+        }
+        if level.quantity <= 0.0 || level.price <= 0.0 {
+            continue;
+        }
+
+        let max_base = remaining_quote / level.price;
+        let take = level.quantity.min(max_base);
+        let cost = take * level.price;
+        base_out += take;
+        remaining_quote -= cost;
+    }
+
+    if remaining_quote > LIQUIDITY_EPS {
+        return Err("not enough ask liquidity".to_string());
+    }
+
+    Ok(base_out)
 }
 
 pub struct MexcSwapVenue<C: CexBackend> {
@@ -26,6 +81,57 @@ pub struct MexcSwapVenue<C: CexBackend> {
 impl<C: CexBackend> MexcSwapVenue<C> {
     pub fn new(client: Arc<C>) -> Self {
         Self { client }
+    }
+
+    async fn resolve_trade(
+        &self,
+        pay_asset: &AssetId,
+        receive_asset: &AssetId,
+        amount_in: f64,
+    ) -> Result<(String, String, f64), String> {
+        let pay = pay_asset.symbol.to_ascii_uppercase();
+        let recv = receive_asset.symbol.to_ascii_uppercase();
+
+        let sell_market = format!("{}/{}", pay, recv);
+        let buy_market = format!("{}/{}", recv, pay);
+        let mut errors: Vec<String> = Vec::new();
+
+        match self
+            .client
+            .get_orderbook(&sell_market, Some(DEFAULT_ORDERBOOK_LIMIT))
+            .await
+        {
+            Ok(orderbook) => {
+                if !orderbook.bids.is_empty() {
+                    let out = quote_sell_from_bids(&orderbook.bids, amount_in)?;
+                    return Ok((sell_market, "sell".to_string(), out));
+                }
+                errors.push(format!("{} has no bids", sell_market));
+            }
+            Err(err) => errors.push(format!("{}: {}", sell_market, err)),
+        }
+
+        match self
+            .client
+            .get_orderbook(&buy_market, Some(DEFAULT_ORDERBOOK_LIMIT))
+            .await
+        {
+            Ok(orderbook) => {
+                if !orderbook.asks.is_empty() {
+                    let out = quote_buy_from_asks(&orderbook.asks, amount_in)?;
+                    return Ok((buy_market, "buy".to_string(), out));
+                }
+                errors.push(format!("{} has no asks", buy_market));
+            }
+            Err(err) => errors.push(format!("{}: {}", buy_market, err)),
+        }
+
+        Err(format!(
+            "could not resolve direct market for {} -> {} ({})",
+            pay,
+            recv,
+            errors.join(" | ")
+        ))
     }
 }
 
@@ -42,18 +148,20 @@ impl<C: CexBackend> SwapVenue for MexcSwapVenue<C> {
     }
 
     async fn quote(&self, req: &SwapRequest) -> Result<SwapQuote, String> {
-        let market = market_symbol(&req.pay_asset, &req.receive_asset);
         let amount_in_f = req.pay_amount.to_f64();
+        let (market, side, out_f) = self
+            .resolve_trade(&req.pay_asset, &req.receive_asset, amount_in_f)
+            .await?;
 
         info!(
-            "MEXC quote {} {} -> {} on {}",
+            "MEXC quote {} {} -> {} on {} ({})",
             req.pay_amount.formatted(),
             req.pay_asset.symbol,
             req.receive_asset.symbol,
-            market
+            market,
+            side
         );
 
-        let out_f = self.client.get_quote(&market, amount_in_f).await?;
         debug!("MEXC quote result: in={} out={}", amount_in_f, out_f);
 
         let leg = SwapQuoteLeg {
@@ -86,19 +194,21 @@ impl<C: CexBackend> SwapVenue for MexcSwapVenue<C> {
     }
 
     async fn execute(&self, req: &SwapRequest) -> Result<SwapExecution, String> {
-        let market = market_symbol(&req.pay_asset, &req.receive_asset);
         let amount_in_f = req.pay_amount.to_f64();
-        let side = "sell"; // assuming pay_asset is the base
+        let (market, side, _out_f) = self
+            .resolve_trade(&req.pay_asset, &req.receive_asset, amount_in_f)
+            .await?;
 
         info!(
-            "MEXC swap {} {} -> {} on {}",
+            "MEXC swap {} {} -> {} on {} ({})",
             req.pay_amount.formatted(),
             req.pay_asset.symbol,
             req.receive_asset.symbol,
-            market
+            market,
+            side
         );
 
-        let out_f = self.client.execute_swap(&market, side, amount_in_f).await?;
+        let out_f = self.client.execute_swap(&market, &side, amount_in_f).await?;
 
         let price = if amount_in_f > 0.0 { out_f / amount_in_f } else { 0.0 };
 

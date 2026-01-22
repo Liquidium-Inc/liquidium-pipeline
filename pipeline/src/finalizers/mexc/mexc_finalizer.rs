@@ -44,17 +44,12 @@ struct TradeLeg {
     side: String,
 }
 
-fn mexc_trade_legs(
-    deposit_symbol: &str,
-    withdraw_symbol: &str,
-    default_market: &str,
-    default_side: &str,
-) -> Vec<TradeLeg> {
+fn mexc_special_trade_legs(deposit_symbol: &str, withdraw_symbol: &str) -> Option<Vec<TradeLeg>> {
     let deposit = deposit_symbol.to_ascii_uppercase();
     let withdraw = withdraw_symbol.to_ascii_uppercase();
 
     if deposit == "CKBTC" && withdraw == "CKUSDT" {
-        return vec![
+        return Some(vec![
             TradeLeg {
                 market: "CKBTC_BTC".to_string(),
                 side: "sell".to_string(),
@@ -71,13 +66,31 @@ fn mexc_trade_legs(
                 market: "CKUSDT_USDT".to_string(),
                 side: "buy".to_string(),
             },
-        ];
+        ]);
     }
 
-    vec![TradeLeg {
-        market: default_market.to_string(),
-        side: default_side.to_string(),
-    }]
+    if deposit == "CKUSDT" && withdraw == "CKBTC" {
+        return Some(vec![
+            TradeLeg {
+                market: "CKUSDT_USDT".to_string(),
+                side: "sell".to_string(),
+            },
+            TradeLeg {
+                market: "USDC_USDT".to_string(),
+                side: "buy".to_string(),
+            },
+            TradeLeg {
+                market: "BTC_USDC".to_string(),
+                side: "buy".to_string(),
+            },
+            TradeLeg {
+                market: "CKBTC_BTC".to_string(),
+                side: "buy".to_string(),
+            },
+        ]);
+    }
+
+    None
 }
 
 impl<C> MexcFinalizer<C>
@@ -106,7 +119,7 @@ where
 
         match state.deposit_balance_before {
             Some(b0) => {
-                let expected = state.size_in.to_f64();
+                let expected = state.trade_next_amount_in.unwrap_or_else(|| state.size_in.to_f64());
                 let delta = current_bal - b0;
                 info!(
                     "[mexc] liq_id={} deposit check: before={} current={} delta={} expected={}",
@@ -138,6 +151,68 @@ where
         }
 
         Ok(())
+    }
+
+    async fn resolve_direct_leg(&self, deposit_symbol: &str, withdraw_symbol: &str) -> Result<TradeLeg, String> {
+        let deposit = deposit_symbol.to_ascii_uppercase();
+        let withdraw = withdraw_symbol.to_ascii_uppercase();
+
+        let sell_market = format!("{}_{}", deposit, withdraw);
+        let buy_market = format!("{}_{}", withdraw, deposit);
+        let mut errors: Vec<String> = Vec::new();
+
+        match self
+            .backend
+            .get_orderbook(&sell_market, Some(DEFAULT_ORDERBOOK_LIMIT))
+            .await
+        {
+            Ok(orderbook) => {
+                if !orderbook.bids.is_empty() {
+                    return Ok(TradeLeg {
+                        market: sell_market,
+                        side: "sell".to_string(),
+                    });
+                }
+                errors.push(format!("{} has no bids", sell_market));
+            }
+            Err(err) => errors.push(format!("{}: {}", sell_market, err)),
+        }
+
+        match self
+            .backend
+            .get_orderbook(&buy_market, Some(DEFAULT_ORDERBOOK_LIMIT))
+            .await
+        {
+            Ok(orderbook) => {
+                if !orderbook.asks.is_empty() {
+                    return Ok(TradeLeg {
+                        market: buy_market,
+                        side: "buy".to_string(),
+                    });
+                }
+                errors.push(format!("{} has no asks", buy_market));
+            }
+            Err(err) => errors.push(format!("{}: {}", buy_market, err)),
+        }
+
+        Err(format!(
+            "could not resolve direct market for {} -> {} ({})",
+            deposit,
+            withdraw,
+            errors.join(" | ")
+        ))
+    }
+
+    async fn resolve_trade_legs(&self, state: &CexState) -> Result<Vec<TradeLeg>, String> {
+        let deposit = state.deposit_asset.symbol();
+        let withdraw = state.withdraw_asset.symbol();
+
+        if let Some(legs) = mexc_special_trade_legs(&deposit, &withdraw) {
+            return Ok(legs);
+        }
+
+        let leg = self.resolve_direct_leg(&deposit, &withdraw).await?;
+        Ok(vec![leg])
     }
 
     async fn check_sell_liquidity(&self, liq_id: &str, market: &str, amount_in: f64) -> Result<(), String> {
@@ -189,13 +264,7 @@ where
         if slippage_bps > self.max_sell_slippage_bps {
             warn!(
                 "[mexc] liq_id={} slippage check failed: market={} amount_in={} best_bid={} avg_price={} slippage_bps={} max_bps={}",
-                liq_id,
-                market,
-                amount_in,
-                best_bid,
-                avg_price,
-                slippage_bps,
-                self.max_sell_slippage_bps
+                liq_id, market, amount_in, best_bid, avg_price, slippage_bps, self.max_sell_slippage_bps
             );
             return Err(format!(
                 "sell slippage too high for {}: {:.2} bps > {:.2} bps",
@@ -286,6 +355,7 @@ where
                 "[mexc] liq_id={} baseline balance before deposit: {}",
                 state.liq_id, baseline
             );
+
             state.deposit_balance_before = Some(baseline);
 
             let addr = self
@@ -301,12 +371,32 @@ where
             let amount = &state.size_in;
             let fee = state.deposit_asset.fee();
             let fee_amount = ChainTokenAmount::from_raw(state.deposit_asset.clone(), fee.clone());
-            let total_amount = ChainTokenAmount::from_raw(state.deposit_asset.clone(), amount.value.clone() + fee);
+            if state.deposit_asset.symbol().eq_ignore_ascii_case("ckusdt") {
+                info!("[mexc] liq_id={} ckUSDT fee={}", state.liq_id, fee_amount.formatted());
+            }
+            let zero = Nat::from(0u8);
+            let transfer_value = if fee > zero {
+                if amount.value.clone() <= fee {
+                    return Err(format!(
+                        "deposit amount {} too small to cover fee {} for {}",
+                        amount.formatted(),
+                        fee_amount.formatted(),
+                        state.deposit_asset.symbol()
+                    ));
+                }
+                amount.value.clone() - fee.clone()
+            } else {
+                amount.value.clone()
+            };
+            let transfer_amount = ChainTokenAmount::from_raw(state.deposit_asset.clone(), transfer_value.clone());
+            let total_amount =
+                ChainTokenAmount::from_raw(state.deposit_asset.clone(), transfer_value.clone() + fee.clone());
             info!(
-                "[mexc] liq_id={} deposit transfer amount={} fee={} total={}",
+                "[mexc] liq_id={} deposit transfer requested={} fee={} net_transfer={} total_debit={}",
                 state.liq_id,
                 amount.formatted(),
                 fee_amount.formatted(),
+                transfer_amount.formatted(),
                 total_amount.formatted()
             );
 
@@ -314,7 +404,7 @@ where
 
             debug!(
                 "[mexc] liq_id={} transferring {} address={}",
-                state.liq_id, amount.value, addr.address
+                state.liq_id, transfer_value, addr.address
             );
             let tx_id = actions
                 .transfer(
@@ -324,9 +414,11 @@ where
                             .map_err(|e| format!("invalid deposit address: {e}"))?,
                         subaccount: None,
                     }),
-                    amount.value.clone(),
+                    transfer_value.clone(),
                 )
                 .await?;
+
+            state.trade_next_amount_in = Some(transfer_amount.to_f64());
 
             debug!("[mexc] liq_id={} sent deposit txid={}", state.liq_id, tx_id);
 
@@ -398,15 +490,15 @@ where
             state.size_in.formatted(),
         );
 
-        let legs = mexc_trade_legs(
-            &state.deposit_asset.symbol(),
-            &state.withdraw_asset.symbol(),
-            &state.market,
-            &state.side,
-        );
+        let legs = self.resolve_trade_legs(state).await?;
         state.trade_leg_total = Some(legs.len() as u32);
         if legs.len() > 1 {
             debug!("[mexc] liq_id={} multi-hop route: {:?}", state.liq_id, legs);
+        }
+
+        if legs.len() == 1 {
+            state.market = legs[0].market.clone();
+            state.side = legs[0].side.clone();
         }
 
         let idx = state.trade_leg_index.unwrap_or(0) as usize;
@@ -447,11 +539,11 @@ where
             amount_in
         );
 
-        if leg.side.eq_ignore_ascii_case("sell") {
-            if let Err(err) = self.check_sell_liquidity(&state.liq_id, &leg.market, amount_in).await {
-                state.last_error = Some(format!("liquidity check failed: {}", err));
-                return Err(err);
-            }
+        if leg.side.eq_ignore_ascii_case("sell")
+            && let Err(err) = self.check_sell_liquidity(&state.liq_id, &leg.market, amount_in).await
+        {
+            state.last_error = Some(format!("liquidity check failed: {}", err));
+            return Err(err);
         }
 
         // Execute the spot trade on MEXC. The backend is responsible for:

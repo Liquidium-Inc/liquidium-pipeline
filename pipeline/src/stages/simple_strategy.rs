@@ -31,6 +31,8 @@ use async_trait::async_trait;
 
 use itertools::Itertools;
 
+const WIPEOUT_THRESHOLD: u32 = 975;
+
 fn resolve_token_for_position(registry: &dyn TokenRegistryTrait, pos: &LiquidateblePosition) -> Option<ChainToken> {
     match pos.asset_type {
         AssetType::CkAsset(principal) => {
@@ -179,6 +181,7 @@ where
         balances: &mut HashMap<String, Nat>,
         work_users: &mut [LiquidatebleUser],
         result: &mut Vec<ExecutorRequest>,
+        cleared_debts: &HashSet<String>,
     ) -> Result<(), String> {
         if bad_debts.is_empty() {
             return Ok(());
@@ -196,6 +199,11 @@ where
         }
 
         for (user_idx, debt_position) in bad_debts {
+            let debt_key = format!("{}:{}", debt_position.account, debt_position.pool_id);
+            if cleared_debts.contains(&debt_key) {
+                continue;
+            }
+
             if work_users[user_idx].health_factor >= 1000u32 {
                 continue;
             }
@@ -330,6 +338,7 @@ where
         // Build all candidate (user_idx, debt_position, collateral_position) combinations,
         // and collect pure bad-debt positions.
         let (mut combos, bad_debts) = self.build_combos(&work_users);
+        let mut cleared_debts: HashSet<String> = HashSet::new();
 
         // Sort by most urgent first: lowest health factor, then largest debt, then largest collateral
         combos.sort_by(|(i1, d1, c1), (i2, d2, c2)| {
@@ -341,6 +350,11 @@ where
         });
 
         for (user_idx, debt_position, collateral_position) in combos {
+            let debt_key = format!("{}:{}", debt_position.account, debt_position.pool_id);
+            if cleared_debts.contains(&debt_key) {
+                continue;
+            }
+
             if work_users[user_idx].health_factor >= 1000u32 {
                 continue;
             }
@@ -409,7 +423,7 @@ where
             let mut estimation = self
                 .collateral_service
                 .calculate_liquidation_amounts(
-                    max_balance,
+                    max_balance.clone(),
                     &debt_position,
                     &collateral_position,
                     &mut work_users[user_idx],
@@ -431,12 +445,27 @@ where
                 continue;
             }
 
+            if self.config.should_buy_bad_debt() && work_users[user_idx].health_factor <= WIPEOUT_THRESHOLD {
+                let desired_repay = debt_position.debt_amount.clone().min(max_balance.clone());
+                if estimation.repaid_debt < desired_repay {
+                    info!(
+                        "🧨 Wipeout bad-debt repay override: {} -> {} for user {}",
+                        estimation.repaid_debt,
+                        desired_repay,
+                        work_users[user_idx].account.to_text()
+                    );
+                    estimation.repaid_debt = desired_repay;
+                }
+            }
+
             let amount_in = ChainTokenAmount {
                 token: collateral_token.clone(),
                 value: estimation.received_collateral.clone(),
             };
 
             let same_asset = collateral_token.asset_id().address == repayment_token.asset_id().address;
+            let price_coll_ray = estimation.ref_price.clone();
+            let price_debt_ray = estimation.debt_price.clone();
             let max_slippage_bps = self.config.get_max_allowed_dex_slippage();
             let (swap_args, amount_received, price) = if estimation.received_collateral == 0u32 || same_asset {
                 (None, amount_in.value.clone(), 1f64)
@@ -449,34 +478,56 @@ where
                     max_slippage_bps: Some(max_slippage_bps),
                     venue_hint: None,
                 };
-                let price_ray = estimation.ref_price.clone();
-                let price = price_ray.0.to_f64().unwrap_or(0.0) / 1e27f64;
+                let price = if price_coll_ray == 0u8 || price_debt_ray == 0u8 {
+                    0.0
+                } else {
+                    let coll_f = price_coll_ray.0.to_f64().unwrap_or(0.0);
+                    let debt_f = price_debt_ray.0.to_f64().unwrap_or(0.0);
+                    if debt_f > 0.0 { coll_f / debt_f } else { 0.0 }
+                };
 
-                let amount_received = if price_ray == 0u8 {
+                let amount_received = if price_coll_ray == 0u8 || price_debt_ray == 0u8 {
                     Nat::from(0u8)
                 } else {
-                    let ray = Nat::from(10u128.pow(27));
                     let coll_scale = Nat::from(10u128.pow(collateral_token.decimals() as u32));
                     let debt_scale = Nat::from(10u128.pow(repayment_token.decimals() as u32));
-                    (amount_in.value.clone() * price_ray * debt_scale) / (coll_scale * ray)
+                    (amount_in.value.clone() * price_coll_ray.clone() * debt_scale)
+                        / (coll_scale * price_debt_ray.clone())
                 };
 
                 (Some(swap_request), amount_received, price)
             };
 
+            let inverse_price = if price > 0.0 { 1.0 / price } else { 0.0 };
             info!(
-                "💱 Quote: repay={} {} | received={} {} | price={}",
+                "💱 Quote: repay={} {} | received={} {} | price={} inverse_price={} (collateral={} -> debt={})",
                 estimation.repaid_debt.0.to_f64().unwrap() / 10u32.pow(repayment_token.decimals() as u32) as f64,
                 repayment_token.symbol(),
                 amount_received.0.to_f64().unwrap() / 10u32.pow(repayment_token.decimals() as u32) as f64,
                 repayment_token.symbol(),
-                price
+                price,
+                inverse_price,
+                collateral_token.symbol(),
+                repayment_token.symbol()
             );
+
+            let debt_fee_total = repayment_token.fee() * 2u64;
+            // Convert collateral fees into debt units using the same price ratio as the swap.
+            let collateral_fee_in_debt = if same_asset {
+                collateral_token.fee()
+            } else if price_coll_ray == 0u8 || price_debt_ray == 0u8 {
+                Nat::from(0u8)
+            } else {
+                let coll_scale = Nat::from(10u128.pow(collateral_token.decimals() as u32));
+                let debt_scale = Nat::from(10u128.pow(repayment_token.decimals() as u32));
+                (collateral_token.fee() * price_coll_ray * debt_scale) / (coll_scale * price_debt_ray)
+            };
+            let collateral_fee_total = collateral_fee_in_debt * 2u64;
 
             let profit = Int::from(amount_received)
                 - Int::from(estimation.repaid_debt.clone())
-                - Int::from(repayment_token.fee()) * 2u128
-                - Int::from(collateral_token.fee()) * 2u128;
+                - Int::from(debt_fee_total)
+                - Int::from(collateral_fee_total);
             let is_bad_debt = profit <= 0;
 
             info!(
@@ -525,6 +576,10 @@ where
                 expected_profit: profit.0.to_i128().unwrap(),
             });
 
+            if estimation.repaid_debt >= debt_position.debt_amount {
+                cleared_debts.insert(debt_key);
+            }
+
             if is_bad_debt && self.config.should_buy_bad_debt() {
                 info!(
                     "🧯 Buying bad debt: repaid={} {}",
@@ -535,7 +590,7 @@ where
         }
 
         // After handling normal collateral-backed combos, handle pure bad-debt positions.
-        self.handle_bad_debt_positions(bad_debts, &mut balances, &mut work_users, &mut result)
+        self.handle_bad_debt_positions(bad_debts, &mut balances, &mut work_users, &mut result, &cleared_debts)
             .await?;
 
         Ok(result)
@@ -617,7 +672,7 @@ mod tests {
         cfg.expect_get_trader_principal().return_const(trader);
         cfg.expect_get_liquidator_principal().return_const(trader);
         cfg.expect_should_buy_bad_debt().return_const(false);
-        cfg.expect_get_max_allowed_dex_slippage().return_const(2000);
+        cfg.expect_get_max_allowed_dex_slippage().return_const(2000u32);
 
         // Collateral service: repay 1_000, receive 2_000 collateral
         let mut collateral = MockCollateralServiceTrait::new();
@@ -628,6 +683,7 @@ mod tests {
                     received_collateral: Nat::from(2_000u64),
                     repaid_debt: Nat::from(1_000u64),
                     ref_price: Nat::from(0u8),
+                    debt_price: Nat::from(0u8),
                 })
             });
 
@@ -693,7 +749,7 @@ mod tests {
         cfg.expect_get_trader_principal().return_const(trader);
         cfg.expect_get_liquidator_principal().return_const(trader);
         cfg.expect_should_buy_bad_debt().return_const(false);
-        cfg.expect_get_max_allowed_dex_slippage().return_const(2000);
+        cfg.expect_get_max_allowed_dex_slippage().return_const(2000u32);
 
         let mut collateral = MockCollateralServiceTrait::new();
         collateral
@@ -750,7 +806,7 @@ mod tests {
         cfg.expect_get_trader_principal().return_const(trader);
         cfg.expect_get_liquidator_principal().return_const(trader);
         cfg.expect_should_buy_bad_debt().return_const(false);
-        cfg.expect_get_max_allowed_dex_slippage().return_const(2000);
+        cfg.expect_get_max_allowed_dex_slippage().return_const(2000u32);
 
         let mut collateral = MockCollateralServiceTrait::new();
         collateral
@@ -818,7 +874,7 @@ mod tests {
         cfg.expect_get_trader_principal().return_const(trader);
         cfg.expect_get_liquidator_principal().return_const(trader);
         cfg.expect_should_buy_bad_debt().return_const(false);
-        cfg.expect_get_max_allowed_dex_slippage().return_const(2000);
+        cfg.expect_get_max_allowed_dex_slippage().return_const(2000u32);
 
         let mut collateral = MockCollateralServiceTrait::new();
         collateral
@@ -886,7 +942,7 @@ mod tests {
         cfg.expect_get_trader_principal().return_const(trader);
         cfg.expect_get_liquidator_principal().return_const(trader);
         cfg.expect_should_buy_bad_debt().return_const(true);
-        cfg.expect_get_max_allowed_dex_slippage().return_const(2000);
+        cfg.expect_get_max_allowed_dex_slippage().return_const(2000u32);
 
         let mut collateral = MockCollateralServiceTrait::new();
         collateral
@@ -896,6 +952,7 @@ mod tests {
                     received_collateral: Nat::from(1_000u64), // equals fee, nets to zero
                     repaid_debt: Nat::from(500u64),
                     ref_price: Nat::from(0u8),
+                    debt_price: Nat::from(0u8),
                 })
             });
 
@@ -965,7 +1022,7 @@ mod tests {
         cfg.expect_get_trader_principal().return_const(trader);
         cfg.expect_get_liquidator_principal().return_const(trader);
         cfg.expect_should_buy_bad_debt().return_const(false);
-        cfg.expect_get_max_allowed_dex_slippage().return_const(2000);
+        cfg.expect_get_max_allowed_dex_slippage().return_const(2000u32);
 
         // Collateral service returns fixed repay so we can control budgeting
         let mut collateral = MockCollateralServiceTrait::new();
@@ -976,6 +1033,7 @@ mod tests {
                     received_collateral: Nat::from(4_000u64),
                     repaid_debt: Nat::from(1_000u64),
                     ref_price: Nat::from(0u8),
+                    debt_price: Nat::from(0u8),
                 })
             });
 
@@ -1040,7 +1098,7 @@ mod tests {
         cfg.expect_get_trader_principal().return_const(trader);
         cfg.expect_get_liquidator_principal().return_const(trader);
         cfg.expect_should_buy_bad_debt().return_const(false);
-        cfg.expect_get_max_allowed_dex_slippage().return_const(2000);
+        cfg.expect_get_max_allowed_dex_slippage().return_const(2000u32);
 
         let mut calls = 0u32;
         let mut collateral = MockCollateralServiceTrait::new();
@@ -1053,6 +1111,7 @@ mod tests {
                         received_collateral: Nat::from(4_000u64),
                         repaid_debt: Nat::from(1_000u64),
                         ref_price: Nat::from(0u8),
+                        debt_price: Nat::from(0u8),
                     })
                 } else {
                     panic!("collateral service should not be called after HF bump");
@@ -1122,7 +1181,7 @@ mod tests {
         cfg.expect_get_trader_principal().return_const(trader);
         cfg.expect_get_liquidator_principal().return_const(trader);
         cfg.expect_should_buy_bad_debt().return_const(false);
-        cfg.expect_get_max_allowed_dex_slippage().return_const(2000);
+        cfg.expect_get_max_allowed_dex_slippage().return_const(2000u32);
 
         let mut first_called_for_low_hf = true;
         let mut collateral = MockCollateralServiceTrait::new();
@@ -1140,6 +1199,7 @@ mod tests {
                     received_collateral: Nat::from(4_000u64),
                     repaid_debt: Nat::from(1_000u64),
                     ref_price: Nat::from(0u8),
+                    debt_price: Nat::from(0u8),
                 })
             },
         );
@@ -1206,7 +1266,7 @@ mod tests {
         cfg.expect_get_trader_principal().return_const(trader);
         cfg.expect_get_liquidator_principal().return_const(trader);
         cfg.expect_should_buy_bad_debt().return_const(false);
-        cfg.expect_get_max_allowed_dex_slippage().return_const(2000);
+        cfg.expect_get_max_allowed_dex_slippage().return_const(2000u32);
 
         let mut first_checked = true;
         let mut collateral = MockCollateralServiceTrait::new();
@@ -1225,6 +1285,7 @@ mod tests {
                     received_collateral: Nat::from(4_000u64),
                     repaid_debt: Nat::from(1_000u64),
                     ref_price: Nat::from(0u8),
+                    debt_price: Nat::from(0u8),
                 })
             });
 
