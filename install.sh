@@ -70,12 +70,40 @@ fi
 
 command -v git >/dev/null || { echo "git is required (install it via your package manager)"; exit 1; }
 
+# ===== Protobuf compiler (protoc) =====
+if ! command -v protoc >/dev/null 2>&1; then
+  if command -v apt-get >/dev/null 2>&1; then
+    echo "On Debian/Ubuntu, install protoc:"
+    echo "  sudo apt-get update && sudo apt-get install -y protobuf-compiler"
+    echo ""
+    exit 1
+  elif command -v yum >/dev/null 2>&1; then
+    echo "On RHEL/CentOS, install protoc:"
+    echo "  sudo yum install -y protobuf-compiler"
+    echo ""
+    exit 1
+  elif command -v apk >/dev/null 2>&1; then
+    echo "On Alpine, install protoc:"
+    echo "  apk add protobuf"
+    echo ""
+    exit 1
+  elif command -v brew >/dev/null 2>&1; then
+    echo "On macOS, install protoc:"
+    echo "  brew install protobuf"
+    echo ""
+    exit 1
+  else
+    echo "protoc not found. Install protobuf-compiler and retry."
+    exit 1
+  fi
+fi
+
 # ===== Rust toolchain =====
 if [[ "$SKIP_RUST" != "true" ]]; then
   if ! command -v cargo >/dev/null 2>&1; then
     echo "Installing Rust toolchain (user)…"
     curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-      | sh -s -- -y --default-toolchain stable
+      | sh -s -- -y --default-toolchain 1.91.0
   fi
   export PATH="$HOME/.cargo/bin:$PATH"
 fi
