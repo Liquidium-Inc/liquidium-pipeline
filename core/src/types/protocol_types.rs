@@ -125,6 +125,13 @@ pub struct LiquidateblePosition {
 }
 
 #[derive(Debug, Clone, Deserialize, CandidType, PartialEq, Eq)]
+pub struct ScanResult {
+    pub users: Vec<LiquidatebleUser>,
+    pub next_cursor: Option<Principal>,
+    pub scanned: u64,
+}
+
+#[derive(Debug, Clone, Deserialize, CandidType, PartialEq, Eq)]
 pub struct LiquidatebleUser {
     pub account: Principal,                   // The user's account
     pub health_factor: Nat,                   // The user's health factor

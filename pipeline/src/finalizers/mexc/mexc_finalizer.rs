@@ -369,7 +369,7 @@ where
             );
 
             let amount = &state.size_in;
-            let fee = state.deposit_asset.fee();
+            let fee = state.deposit_asset.fee() * 7u8; // TODO: Remove after mexc handles deposit confirations
             let fee_amount = ChainTokenAmount::from_raw(state.deposit_asset.clone(), fee.clone());
             if state.deposit_asset.symbol().eq_ignore_ascii_case("ckusdt") {
                 info!("[mexc] liq_id={} ckUSDT fee={}", state.liq_id, fee_amount.formatted());
@@ -389,8 +389,7 @@ where
                 amount.value.clone()
             };
             let transfer_amount = ChainTokenAmount::from_raw(state.deposit_asset.clone(), transfer_value.clone());
-            let total_amount =
-                ChainTokenAmount::from_raw(state.deposit_asset.clone(), transfer_value.clone() + fee.clone());
+            let total_amount    = ChainTokenAmount::from_raw(state.deposit_asset.clone(), transfer_value.clone() + fee.clone());
             info!(
                 "[mexc] liq_id={} deposit transfer requested={} fee={} net_transfer={} total_debit={}",
                 state.liq_id,
@@ -402,7 +401,7 @@ where
 
             let actions = &self.transfer_service;
 
-            debug!(
+            info!(
                 "[mexc] liq_id={} transferring {} address={}",
                 state.liq_id, transfer_value, addr.address
             );

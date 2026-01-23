@@ -3,7 +3,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use candid::{Encode, Principal};
 use liquidium_pipeline_connectors::pipeline_agent::PipelineAgent;
-use liquidium_pipeline_core::types::protocol_types::{AssetType, LiquidatebleUser};
+use liquidium_pipeline_core::types::protocol_types::{AssetType, LiquidatebleUser, ScanResult};
 
 use crate::stage::PipelineStage;
 
@@ -29,19 +29,50 @@ where
     A: PipelineAgent,
 {
     async fn process(&self, supported_assets: &'a Vec<String>) -> Result<Vec<LiquidatebleUser>, String> {
-        // Configure pagination
-        let offset: u64 = 0;
-        let limit: u64 = 100;
+        let max_results: u64 = 500; // stop once we find this many risky users
+        let scan_limit: u64 = 100; // how many accounts to scan per call
 
-        // Encode candid args
-        let args = Encode!(&offset, &limit).map_err(|e| e.to_string())?;
-
-        // Query canister
-        let mut opportunities = self
+        // Hard cap based on the real number of accounts in the canister.
+        let empty = Encode!().map_err(|e| e.to_string())?;
+        let total_accounts = self
             .agent
-            .call_query::<Vec<LiquidatebleUser>>(&self.canister_id, "get_at_risk_positions", args)
+            .call_query::<u64>(&self.canister_id, "get_main_accounts_len", empty)
             .await
             .map_err(|e| format!("Agent query error: {e}"))?;
+
+        let mut cursor: Option<Principal> = None;
+        let mut scanned_total: u64 = 0;
+        let mut opportunities: Vec<LiquidatebleUser> = Vec::new();
+
+        // Safety guard: even if total_accounts is 0, do not loop.
+        while scanned_total < total_accounts {
+            let args = Encode!(&cursor, &scan_limit, &max_results).map_err(|e| e.to_string())?;
+
+            let ScanResult {
+                users: mut page_users,
+                next_cursor,
+                scanned,
+                ..
+            } = self
+                .agent
+                .call_query::<ScanResult>(&self.canister_id, "scan_at_risk_positions", args)
+                .await
+                .map_err(|e| format!("Agent query error: {e}"))?;
+
+            opportunities.append(&mut page_users);
+            cursor = next_cursor;
+
+            scanned_total = scanned_total.saturating_add(scanned);
+
+            if opportunities.len() as u64 >= max_results {
+                break;
+            }
+
+            // End of keyspace or scan made no progress.
+            if cursor.is_none() || scanned == 0 {
+                break;
+            }
+        }
 
         opportunities.iter_mut().for_each(|user| {
             user.positions = user
@@ -134,7 +165,16 @@ mod tests {
         ];
 
         let mut agent = MockPipelineAgent::new();
-        agent.expect_call_query().returning(move |_, _, _| Ok(users.clone()));
+
+        // First query: total accounts len
+        agent
+            .expect_call_query::<u64>()
+            .returning(move |_, _, _| Ok(users.len() as u64));
+
+        // Second query: scan results
+        agent
+            .expect_call_query::<(Vec<LiquidatebleUser>, Option<Principal>, u64)>()
+            .returning(move |_, _, _| Ok((users.clone(), None, users.len() as u64)));
 
         let finder = OpportunityFinder::new(Arc::new(agent), canister_id, vec![]);
 
@@ -195,7 +235,16 @@ mod tests {
         ];
 
         let mut agent = MockPipelineAgent::new();
-        agent.expect_call_query().returning(move |_, _, _| Ok(users.clone()));
+
+        // First query: total accounts len
+        agent
+            .expect_call_query::<u64>()
+            .returning(move |_, _, _| Ok(users.len() as u64));
+
+        // Second query: scan results
+        agent
+            .expect_call_query::<(Vec<LiquidatebleUser>, Option<Principal>, u64)>()
+            .returning(move |_, _, _| Ok((users.clone(), None, users.len() as u64)));
 
         let finder = OpportunityFinder::new(Arc::new(agent), canister_id, vec![]);
 
@@ -246,7 +295,16 @@ mod tests {
         ];
 
         let mut agent = MockPipelineAgent::new();
-        agent.expect_call_query().returning(move |_, _, _| Ok(users.clone()));
+
+        // First query: total accounts len
+        agent
+            .expect_call_query::<u64>()
+            .returning(move |_, _, _| Ok(users.len() as u64));
+
+        // Second query: scan results
+        agent
+            .expect_call_query::<(Vec<LiquidatebleUser>, Option<Principal>, u64)>()
+            .returning(move |_, _, _| Ok((users.clone(), None, users.len() as u64)));
 
         let finder = OpportunityFinder::new(Arc::new(agent), canister_id, vec![target_account]);
 

@@ -82,41 +82,45 @@ fn parse_u32(v: &Value, key: &str) -> Option<u32> {
 }
 
 fn mexc_network_candidates(asset: &str, network: &str) -> Vec<String> {
-    let mut candidates = Vec::new();
+    let mut candidates: Vec<String> = Vec::new();
     let mut push_unique = |value: String| {
-        if !candidates.iter().any(|item: &String| item.eq_ignore_ascii_case(&value)) {
+        if !candidates.iter().any(|item| item.eq_ignore_ascii_case(&value)) {
             candidates.push(value);
         }
     };
 
     let network_norm = network.trim().to_ascii_uppercase();
     let asset_norm = asset.trim().to_ascii_uppercase();
+    if asset_norm.is_empty() {
+        if !network_norm.is_empty() {
+            push_unique(network_norm);
+        }
+        return candidates;
+    }
+
+    // Special-case: native ICP asset on ICP network should just be "ICP".
+    if asset_norm == "ICP" && network.eq_ignore_ascii_case("icp") {
+        push_unique("ICP".to_string());
+        return candidates;
+    }
+
     let asset_no_ck = asset_norm.strip_prefix("CK").unwrap_or(&asset_norm);
     let ck_asset = format!("CK{}", asset_no_ck);
 
-    // Prefer CK network names for ck assets on MEXC, then fall back to ICP/base variants.
+    // For ck-assets, prefer CK network names only (avoid leaking base symbol like BTC/USDT as a network).
     if asset_norm.starts_with("CK") {
-        if !asset_norm.is_empty() {
-            push_unique(asset_norm.clone());
-        }
         push_unique(ck_asset.clone());
-        if !asset_no_ck.is_empty() {
-            push_unique(asset_no_ck.to_string());
-        }
     }
 
+    // Always include the explicit network if provided.
     if !network_norm.is_empty() {
-        push_unique(network_norm);
+        push_unique(network_norm.clone());
     }
 
+    // If requested network is ICP, include ICP and CK-asset network names.
     if network.eq_ignore_ascii_case("icp") {
-        if !asset_norm.is_empty() {
-            push_unique(asset_norm.clone());
-        }
+        push_unique("ICP".to_string());
         push_unique(ck_asset);
-        if !asset_no_ck.is_empty() {
-            push_unique(asset_no_ck.to_string());
-        }
     }
 
     candidates
@@ -145,13 +149,22 @@ fn mexc_deposit_asset_candidates(asset: &str) -> Vec<String> {
     }
 
     let asset_upper = asset_trimmed.to_ascii_uppercase();
+    let has_ck_prefix = asset_upper.starts_with("CK");
     let asset_no_ck = asset_upper.strip_prefix("CK").unwrap_or(&asset_upper);
-    let mut candidates = vec![
-        asset_trimmed.to_string(),
-        asset_upper.clone(),
-        asset_no_ck.to_string(),
-        format!("CK{}", asset_no_ck),
-    ];
+
+    let mut candidates = Vec::new();
+
+    if has_ck_prefix {
+        // only ck variants
+        candidates.push(format!("CK{}", asset_no_ck));
+        candidates.push(format!("ck{}", asset_no_ck));
+    } else {
+        // normal asset + ck variants
+        candidates.push(asset_trimmed.to_string());
+        candidates.push(asset_upper.clone());
+        candidates.push(format!("CK{}", asset_upper));
+    }
+
     candidates.sort();
     candidates.dedup();
     candidates
@@ -710,6 +723,7 @@ impl CexBackend for MexcClient {
         let mut network_attempts: Vec<Option<String>> = candidates.iter().cloned().map(Some).collect();
         network_attempts.push(None);
 
+        dbg!(&network_attempts, &asset_candidates);
         for coin in &asset_candidates {
             for net in &network_attempts {
                 let res = match ex.get_deposit_address(coin.to_string(), net.as_deref()).await {
