@@ -44,11 +44,11 @@ where
         _reason: Option<String>,
     ) -> Result<FinalizerResult, String> {
         // Delegate full CEX settlement logic to the underlying CEX finalizer.
-        self.cex_finalizer
+        let finalizer = self
+            .cex_finalizer
             .as_ref()
-            .expect("missing cex finalizer")
-            .finalize(wal, receipt)
-            .await
+            .ok_or_else(|| "missing cex finalizer".to_string())?;
+        finalizer.finalize(wal, receipt).await
     }
 }
 

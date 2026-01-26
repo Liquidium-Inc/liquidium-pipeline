@@ -55,11 +55,8 @@ impl<'a> PipelineStage<'a, Vec<LiquidationOutcome>, ()> for ExportStage {
                 liquidation_tx_id: r
                     .execution_receipt
                     .liquidation_result
-                    .clone()
-                    .unwrap()
-                    .collateral_tx
-                    .tx_id
-                    .clone(),
+                    .as_ref()
+                    .and_then(|lr| lr.collateral_tx.tx_id.clone()),
                 swap_tx_id: r.finalizer_result.swap_result.as_ref().map(|s| s.swap_id),
                 pay_chain: r
                     .finalizer_result

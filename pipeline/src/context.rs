@@ -238,7 +238,12 @@ pub async fn init_context() -> Result<PipelineContext, String> {
     let main_provider = ProviderBuilder::new()
         .network::<AnyNetwork>()
         .wallet(signer)
-        .connect_http(config.evm_rpc_url.parse().unwrap());
+        .connect_http(
+            config
+                .evm_rpc_url
+                .parse()
+                .map_err(|e| format!("invalid evm rpc url: {e}"))?,
+        );
 
     // Feed everything into the builder and let it wire backends, routers, and services.
     builder = builder

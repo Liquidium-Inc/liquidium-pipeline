@@ -166,15 +166,18 @@ mod tests {
 
         let mut agent = MockPipelineAgent::new();
 
+        let users_len = users.len() as u64;
+        let users_for_scan = users.clone();
+
         // First query: total accounts len
         agent
             .expect_call_query::<u64>()
-            .returning(move |_, _, _| Ok(users.len() as u64));
+            .returning(move |_, _, _| Ok(users_len));
 
         // Second query: scan results
         agent
             .expect_call_query::<(Vec<LiquidatebleUser>, Option<Principal>, u64)>()
-            .returning(move |_, _, _| Ok((users.clone(), None, users.len() as u64)));
+            .returning(move |_, _, _| Ok((users_for_scan.clone(), None, users_len)));
 
         let finder = OpportunityFinder::new(Arc::new(agent), canister_id, vec![]);
 
@@ -236,15 +239,18 @@ mod tests {
 
         let mut agent = MockPipelineAgent::new();
 
+        let users_len = users.len() as u64;
+        let users_for_scan = users.clone();
+
         // First query: total accounts len
         agent
             .expect_call_query::<u64>()
-            .returning(move |_, _, _| Ok(users.len() as u64));
+            .returning(move |_, _, _| Ok(users_len));
 
         // Second query: scan results
         agent
             .expect_call_query::<(Vec<LiquidatebleUser>, Option<Principal>, u64)>()
-            .returning(move |_, _, _| Ok((users.clone(), None, users.len() as u64)));
+            .returning(move |_, _, _| Ok((users_for_scan.clone(), None, users_len)));
 
         let finder = OpportunityFinder::new(Arc::new(agent), canister_id, vec![]);
 
@@ -296,15 +302,18 @@ mod tests {
 
         let mut agent = MockPipelineAgent::new();
 
+        let users_len = users.len() as u64;
+        let users_for_scan = users.clone();
+
         // First query: total accounts len
         agent
             .expect_call_query::<u64>()
-            .returning(move |_, _, _| Ok(users.len() as u64));
+            .returning(move |_, _, _| Ok(users_len));
 
         // Second query: scan results
         agent
             .expect_call_query::<(Vec<LiquidatebleUser>, Option<Principal>, u64)>()
-            .returning(move |_, _, _| Ok((users.clone(), None, users.len() as u64)));
+            .returning(move |_, _, _| Ok((users_for_scan.clone(), None, users_len)));
 
         let finder = OpportunityFinder::new(Arc::new(agent), canister_id, vec![target_account]);
 

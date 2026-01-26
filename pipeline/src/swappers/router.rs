@@ -41,23 +41,33 @@ impl SwapRouter {
         self
     }
 
-    fn pick_venue<'a>(&'a self, req: &SwapRequest) -> &'a Arc<dyn SwapVenue> {
-        let v = self.venues.get(&req.venue_hint.clone().unwrap_or("kong".to_owned()));
-        (v.unwrap_or_else(|| panic!("{:?} venue not found", req.venue_hint))) as _
+    fn pick_venue<'a>(&'a self, req: &SwapRequest) -> Result<&'a Arc<dyn SwapVenue>, String> {
+        let name = req.venue_hint.clone().unwrap_or_else(|| "kong".to_owned());
+        self.venues
+            .get(&name)
+            .ok_or_else(|| format!("{} venue not found", name))
     }
 
-    pub async fn init(&self) {
+    pub async fn init(&self) -> Result<(), String> {
+        let mut errors = Vec::new();
         for venue in &self.venues {
-            let _ = venue.1.init().await;
+            if let Err(err) = venue.1.init().await {
+                errors.push(format!("{}: {}", venue.0, err));
+            }
+        }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(format!("swap venue init errors: {}", errors.join("; ")))
         }
     }
 
     pub async fn quote(&self, req: &SwapRequest) -> Result<SwapQuote, String> {
-        self.pick_venue(req).quote(req).await
+        self.pick_venue(req)?.quote(req).await
     }
 
     pub async fn execute(&self, req: &SwapRequest) -> Result<SwapExecution, String> {
-        self.pick_venue(req).execute(req).await
+        self.pick_venue(req)?.execute(req).await
     }
 }
 

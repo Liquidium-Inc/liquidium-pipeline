@@ -120,17 +120,28 @@ impl<A: PipelineAgent, D: WalStore> BasicExecutor<A, D> {
     }
 
     async fn allowance(&self, ledger: &Principal, spender: Account) -> Nat {
-        let blob = Encode!(&AllowanceArgs {
+        let blob = match Encode!(&AllowanceArgs {
             account: self.account_id,
             spender,
-        })
-        .unwrap();
+        }) {
+            Ok(blob) => blob,
+            Err(err) => {
+                warn!("Failed to encode allowance args for {}: {}", ledger, err);
+                return Nat::from(0u8);
+            }
+        };
 
-        let result = self
+        let result = match self
             .agent
             .call_query::<Allowance>(ledger, "icrc2_allowance", blob)
             .await
-            .expect("could not fetch allowance");
+        {
+            Ok(result) => result,
+            Err(err) => {
+                warn!("Allowance query failed for {}: {}", ledger, err);
+                return Nat::from(0u8);
+            }
+        };
 
         result.allowance
     }

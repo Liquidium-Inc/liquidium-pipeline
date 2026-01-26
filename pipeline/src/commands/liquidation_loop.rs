@@ -99,17 +99,22 @@ fn print_startup_table(config: &Config, debt_assets: &[String]) {
 
 async fn init(
     ctx: Arc<PipelineContext>,
-) -> (
-    OpportunityFinder<Agent>,
-    SimpleLiquidationStrategy<SwapRouter, Config, TokenRegistry, CollateralService<LiquidationPriceOracle<Agent>>>,
-    Arc<BasicExecutor<Agent, SqliteWalStore>>,
-    Arc<ExportStage>,
-    Arc<FinalizeStage<HybridFinalizer<Config>, SqliteWalStore, SimpleProfitCalculator>>,
-) {
+) -> Result<
+    (
+        OpportunityFinder<Agent>,
+        SimpleLiquidationStrategy<SwapRouter, Config, TokenRegistry, CollateralService<LiquidationPriceOracle<Agent>>>,
+        Arc<BasicExecutor<Agent, SqliteWalStore>>,
+        Arc<ExportStage>,
+        Arc<FinalizeStage<HybridFinalizer<Config>, SqliteWalStore, SimpleProfitCalculator>>,
+    ),
+    String,
+> {
     let config = ctx.config.clone();
     let agent = ctx.agent.clone();
     let registry = ctx.registry.clone();
-    let db = Arc::new(SqliteWalStore::new(&config.db_path).expect("could not connect to db"));
+    let db = Arc::new(
+        SqliteWalStore::new(&config.db_path).map_err(|e| format!("could not connect to db: {e}"))?,
+    );
 
     let tokens: Vec<Principal> = registry
         .debt_assets()
@@ -133,28 +138,36 @@ async fn init(
         db.clone(),
     );
 
-    executor.init(&tokens).await.expect("could not approce executor tokens");
+    executor
+        .init(&tokens)
+        .await
+        .map_err(|e| format!("executor token init failed: {e}"))?;
     let executor = Arc::new(executor);
 
-    let _ = ctx.swap_router.init().await;
+    if let Err(err) = ctx.swap_router.init().await {
+        warn!("Swap router init failed: {}", err);
+    }
 
     // Base DEX finalizer (Kong swapper)
     let kong_finalizer = Arc::new(KongSwapFinalizer::new(ctx.swap_router.clone()));
 
-    let mexc_finalizer = if let Ok((api_key, secret)) = ctx.config.get_cex_credentials("mexc") {
-        let mexc_client = Arc::new(MexcClient::new(&api_key, &secret));
-        let mexc_finalizer = Arc::new(MexcFinalizer::new(
-            mexc_client,
-            ctx.trader_transfers.actions(),
-            config.liquidator_principal,
-            config.max_allowed_cex_slippage_bps as f64,
-        ));
-        Some(mexc_finalizer)
-    } else {
-        if config.swapper != SwapperMode::Dex {
-            panic!("Cex credentials not found");
+    let mexc_finalizer = match ctx.config.get_cex_credentials("mexc") {
+        Ok((api_key, secret)) => {
+            let mexc_client = Arc::new(MexcClient::new(&api_key, &secret));
+            let mexc_finalizer = Arc::new(MexcFinalizer::new(
+                mexc_client,
+                ctx.trader_transfers.actions(),
+                config.liquidator_principal,
+                config.max_allowed_cex_slippage_bps as f64,
+            ));
+            Some(mexc_finalizer)
         }
-        None
+        Err(err) => {
+            if config.swapper != SwapperMode::Dex {
+                return Err(format!("Cex credentials not found: {err}"));
+            }
+            None
+        }
     };
 
     // Hybrid finalizer composes DEX and CEX finalizers.
@@ -200,12 +213,18 @@ async fn init(
         path: config.export_path.clone(),
     });
 
-    (finder, strategy, executor, exporter, finalizer)
+    Ok((finder, strategy, executor, exporter, finalizer))
 }
 
 pub async fn run_liquidation_loop() {
     print_banner();
-    let ctx = init_context().await.expect("Failed to initialize pipeline context");
+    let ctx = match init_context().await {
+        Ok(ctx) => ctx,
+        Err(err) => {
+            log::error!("Failed to initialize pipeline context: {}", err);
+            return;
+        }
+    };
     let ctx = Arc::new(ctx);
     let config = ctx.config.clone();
 
@@ -221,9 +240,13 @@ pub async fn run_liquidation_loop() {
         println!("====================================================================");
         println!("⚠️  You are about to BUY BAD DEBT. Type 'yes' to continue:");
         let mut input = String::new();
-        std::io::stdin().read_line(&mut input).unwrap();
+        if let Err(err) = std::io::stdin().read_line(&mut input) {
+            warn!("Failed to read input: {}", err);
+            return;
+        }
         if input.trim() != "yes" {
-            panic!("Aborted by user.");
+            warn!("Aborted by user.");
+            return;
         }
     } else {
         info!("✅ BAD DEBT MODE DISABLED: only collateral-backed liquidations will run");
@@ -232,7 +255,13 @@ pub async fn run_liquidation_loop() {
     info!("Agent initialized with principal: {}", config.liquidator_principal);
 
     // Initialize components using shared pipeline context
-    let (finder, strategy, executor, exporter, finalizer) = init(ctx.clone()).await;
+    let (finder, strategy, executor, exporter, finalizer) = match init(ctx.clone()).await {
+        Ok(stages) => stages,
+        Err(err) => {
+            log::error!("Failed to initialize pipeline stages: {}", err);
+            return;
+        }
+    };
 
     let debt_assets: Vec<String> = ctx
         .registry
@@ -308,7 +337,9 @@ pub async fn run_liquidation_loop() {
             continue;
         }
 
-        exporter.process(&outcomes).await.expect("Failed to export results");
+        if let Err(err) = exporter.process(&outcomes).await {
+            warn!("Failed to export results: {}", err);
+        }
         print_execution_results(outcomes);
         spinner = start_spinner();
         spinner.set_message("Scanning for liquidation opportunities...");

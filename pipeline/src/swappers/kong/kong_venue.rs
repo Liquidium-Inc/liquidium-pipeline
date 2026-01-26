@@ -48,13 +48,16 @@ where
         let kong_tokens = self
             .tokens
             .iter()
-            .map(|item| Principal::from_text(item.asset_id().address).unwrap())
-            .collect::<Vec<Principal>>();
+            .map(|item| {
+                Principal::from_text(item.asset_id().address)
+                    .map_err(|e| format!("invalid token principal {}: {}", item.asset_id().address, e))
+            })
+            .collect::<Result<Vec<Principal>, String>>()?;
 
         self.swapper
             .init(&kong_tokens)
             .await
-            .expect("could not init kong venue");
+            .map_err(|e| format!("could not init kong venue: {}", e))?;
 
         Ok(())
     }

@@ -130,7 +130,11 @@ impl<A: PipelineAgent> KongSwapSwapper<A> {
             "Current allowance for {}: {} on {}",
             token,
             allowance,
-            self.agent.agent().get_principal().unwrap()
+            self.agent
+                .agent()
+                .get_principal()
+                .map(|p| p.to_text())
+                .unwrap_or_else(|_| "<unknown>".to_string())
         );
 
         if allowance < max_for_ledger(token) / Nat::from(2u8) {
@@ -180,7 +184,8 @@ impl<A: PipelineAgent> KongSwapSwapper<A> {
             .call_query::<Result<SwapAmountsReply, String>>(
                 &dex_principal,
                 "swap_amounts",
-                encode_args((token_in.symbol(), amount.value.clone(), token_out.symbol())).unwrap(),
+                encode_args((token_in.symbol(), amount.value.clone(), token_out.symbol()))
+                    .map_err(|e| format!("Swap args encode error: {}", e))?,
             )
             .await
             .map_err(|e| format!("Swap call error: {}", e))?
@@ -231,17 +236,28 @@ impl<A: PipelineAgent> KongSwapSwapper<A> {
     }
 
     async fn allowance(&self, ledger: &Principal, spender: Account) -> Nat {
-        let blob = Encode!(&AllowanceArgs {
+        let blob = match Encode!(&AllowanceArgs {
             account: self.account_id,
             spender,
-        })
-        .unwrap();
+        }) {
+            Ok(blob) => blob,
+            Err(err) => {
+                warn!("Failed to encode allowance args for {}: {}", ledger, err);
+                return Nat::from(0u8);
+            }
+        };
 
-        let result = self
+        let result = match self
             .agent
             .call_query::<Allowance>(ledger, "icrc2_allowance", blob)
             .await
-            .expect("could not fetch allowance");
+        {
+            Ok(result) => result,
+            Err(err) => {
+                warn!("Allowance query failed for {}: {}", ledger, err);
+                return Nat::from(0u8);
+            }
+        };
 
         debug!(
             "Allowance for {} on {} = {}",
