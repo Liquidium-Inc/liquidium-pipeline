@@ -98,6 +98,9 @@ impl Finalizer for dyn CexFinalizerLogic {
                 let row_checked = match row.status {
                     ResultStatus::Succeeded => return Ok(FinalizerResult::noop()),
                     ResultStatus::Enqueued | ResultStatus::InFlight | ResultStatus::FailedRetryable => row,
+                    ResultStatus::WaitingCollateral | ResultStatus::WaitingProfit => {
+                        return Ok(FinalizerResult::noop());
+                    }
                     ResultStatus::FailedPermanent => {
                         return Err(format!("invalid WAL state {:?} for liq_id {}", row.status, row.id));
                     }

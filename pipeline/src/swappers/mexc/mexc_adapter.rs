@@ -723,7 +723,6 @@ impl CexBackend for MexcClient {
         let mut network_attempts: Vec<Option<String>> = candidates.iter().cloned().map(Some).collect();
         network_attempts.push(None);
 
-        dbg!(&network_attempts, &asset_candidates);
         for coin in &asset_candidates {
             for net in &network_attempts {
                 let res = match ex.get_deposit_address(coin.to_string(), net.as_deref()).await {

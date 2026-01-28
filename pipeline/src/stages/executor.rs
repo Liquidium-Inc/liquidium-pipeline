@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     executors::{basic::basic_executor::BasicExecutor, executor::ExecutorRequest},
     finalizers::{finalizer::FinalizerResult, liquidation_outcome::LiquidationOutcome},
-    persistance::{LiqMetaWrapper, LiqResultRecord, WalStore},
+    persistance::{LiqMetaWrapper, LiqResultRecord, ResultStatus, WalStore},
     stage::PipelineStage,
     utils::now_ts, wal::{encode_meta, liq_id_from_receipt},
 };
@@ -128,7 +128,10 @@ impl<'a, A: PipelineAgent, D: WalStore> PipelineStage<'a, Vec<ExecutorRequest>, 
                             liq.collateral_tx.status, liq.id
                         );
                         receipt.status = ExecutionStatus::CollateralTransferFailed("collateral pending".to_string());
-                        if let Err(err) = self.store_to_wal(&receipt, &executor_request).await {
+                        if let Err(err) = self
+                            .store_to_wal(&receipt, &executor_request, ResultStatus::WaitingCollateral)
+                            .await
+                        {
                             warn!("Failed to store to WAL: {}", err);
                         }
                         return Ok::<ExecutionReceipt, String>(receipt);
@@ -139,7 +142,10 @@ impl<'a, A: PipelineAgent, D: WalStore> PipelineStage<'a, Vec<ExecutorRequest>, 
                             liq.collateral_tx.status, liq.id
                         );
                         receipt.status = ExecutionStatus::CollateralTransferFailed(err.clone());
-                        if let Err(err) = self.store_to_wal(&receipt, &executor_request).await {
+                        if let Err(err) = self
+                            .store_to_wal(&receipt, &executor_request, ResultStatus::WaitingCollateral)
+                            .await
+                        {
                             warn!("Failed to store to WAL: {}", err);
                         }
                         return Ok::<ExecutionReceipt, String>(receipt);
@@ -147,7 +153,10 @@ impl<'a, A: PipelineAgent, D: WalStore> PipelineStage<'a, Vec<ExecutorRequest>, 
                 }
 
                 debug!("Executed liquidation {:?}", liq);
-                if let Err(err) = self.store_to_wal(&receipt, &executor_request).await {
+                if let Err(err) = self
+                    .store_to_wal(&receipt, &executor_request, ResultStatus::Enqueued)
+                    .await
+                {
                     warn!("Failed to store to WAL: {}", err);
                 }
 
@@ -169,7 +178,12 @@ impl<'a, A: PipelineAgent, D: WalStore> PipelineStage<'a, Vec<ExecutorRequest>, 
 }
 
 impl<A: PipelineAgent, D: WalStore> BasicExecutor<A, D> {
-    async fn store_to_wal(&self, receipt: &ExecutionReceipt, executor_request: &ExecutorRequest) -> Result<(), String> {
+    async fn store_to_wal(
+        &self,
+        receipt: &ExecutionReceipt,
+        executor_request: &ExecutorRequest,
+        status: ResultStatus,
+    ) -> Result<(), String> {
         debug!("Storing execution log...");
         let liq_id = liq_id_from_receipt(receipt)?;
 
@@ -185,7 +199,7 @@ impl<A: PipelineAgent, D: WalStore> BasicExecutor<A, D> {
 
         let mut result_record = LiqResultRecord {
             id: liq_id,
-            status: crate::persistance::ResultStatus::Enqueued,
+            status,
             attempt: 0,
             error_count: 0,
             last_error: None,

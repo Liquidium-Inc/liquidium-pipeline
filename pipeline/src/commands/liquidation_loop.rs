@@ -20,8 +20,8 @@ use crate::{
     price_oracle::price_oracle::LiquidationPriceOracle,
     stage::PipelineStage,
     stages::{
-        executor::ExecutionStatus, export::ExportStage, finalize::FinalizeStage, opportunity::OpportunityFinder,
-        simple_strategy::SimpleLiquidationStrategy,
+        executor::ExecutionStatus, export::ExportStage, finalize::FinalizeStage,
+        opportunity::OpportunityFinder, settlement_watcher::SettlementWatcher, simple_strategy::SimpleLiquidationStrategy,
     },
     swappers::{mexc::mexc_adapter::MexcClient, router::SwapRouter},
     watchdog::{WatchdogEvent, account_monitor_watchdog, webhook_watchdog_from_env},
@@ -268,6 +268,15 @@ pub async fn run_liquidation_loop() {
             return;
         }
     };
+
+    let watcher = SettlementWatcher::new(
+        finalizer.wal.clone(),
+        ctx.agent.clone(),
+        ctx.swap_router.clone(),
+        config.lending_canister,
+        Duration::from_secs(3),
+    );
+    tokio::spawn(async move { watcher.run().await });
 
     let debt_assets: Vec<String> = ctx
         .registry

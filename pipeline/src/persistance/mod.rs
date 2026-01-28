@@ -13,6 +13,8 @@ pub enum ResultStatus {
     Succeeded = 2,
     FailedRetryable = 3,
     FailedPermanent = 4,
+    WaitingCollateral = 5,
+    WaitingProfit = 6,
 }
 
 #[derive(Debug, Clone, Serialize, serde::Deserialize)]
