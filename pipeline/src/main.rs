@@ -33,6 +33,16 @@ enum Commands {
     // Shows wallet token balances
     Balance,
 
+    // Test MEXC deposit address lookup
+    MexcDepositAddress {
+        // Asset symbol (e.g., ckUSDT, ckBTC)
+        #[arg(long)]
+        asset: String,
+        // Network hint (e.g., ICP, CKUSDT). Defaults to ICP.
+        #[arg(long)]
+        network: Option<String>,
+    },
+
     // Withdraws funds. Without flags, starts the interactive wizard.
     // With flags, performs a non-interactive withdrawal.
     Withdraw {
@@ -77,6 +87,11 @@ async fn main() {
         }
         Commands::Balance => {
             commands::funds::funds().await.unwrap();
+        }
+        Commands::MexcDepositAddress { asset, network } => {
+            if let Err(err) = commands::cex::mexc_deposit_address(asset, network.as_deref()).await {
+                eprintln!("MEXC deposit address failed: {}", err);
+            }
         }
         Commands::Withdraw {
             source,
