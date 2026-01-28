@@ -212,6 +212,30 @@ impl<A: PipelineAgent> KongSwapSwapper<A> {
         Ok(result)
     }
 
+    pub async fn balance_of(&self, token: &ChainToken) -> Result<Nat, String> {
+        let ledger = match token {
+            ChainToken::Icp { ledger, .. } => *ledger,
+            _ => return Err("unsupported token type for balance query".to_string()),
+        };
+
+        let args = Encode!(&Account {
+            owner: self.account_id.owner,
+            subaccount: self.account_id.subaccount,
+        })
+        .map_err(|e| format!("balance_of encode error: {}", e))?;
+
+        let result = self
+            .agent
+            .call_query::<Nat>(&ledger, "icrc1_balance_of", args)
+            .await
+            .map_err(|e| {
+                warn!("[kong] balance query failed ledger={} err={}", ledger, e);
+                format!("balance query failed: {}", e)
+            })?;
+
+        Ok(result)
+    }
+
     pub async fn swap(&self, swap_args: SwapArgs) -> Result<SwapReply, String> {
         debug!("Swap args {:#?}", swap_args);
         let pay_amount = swap_args.pay_amount.clone();

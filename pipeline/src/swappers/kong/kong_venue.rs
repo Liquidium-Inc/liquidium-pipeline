@@ -112,6 +112,23 @@ where
             }
         }
 
+        let balance = self.swapper.balance_of(&token_in).await?;
+        let fee = token_in.fee();
+        if balance <= fee {
+            return Err(format!(
+                "insufficient balance for fee: balance={} fee={}",
+                balance, fee
+            ));
+        }
+        let max_pay = balance - fee.clone();
+        if kong_req.pay_amount > max_pay {
+            info!(
+                "[kong] adjust pay_amount for balance: requested={} max_pay={} fee={}",
+                kong_req.pay_amount, max_pay, fee
+            );
+            kong_req.pay_amount = max_pay;
+        }
+
         info!(
             "[kong] execute pay={} {} -> {} recv_addr={:?} max_slip={:?}",
             req.pay_amount.value,
@@ -138,7 +155,7 @@ where
 #[cfg(test)]
 mod tests {
     use crate::swappers::router::SwapVenue;
-    use candid::{Decode, Encode, Nat, Principal};
+    use candid::{Decode, Nat, Principal};
     use ic_agent::Agent;
     use icrc_ledger_types::icrc1::account::Account;
     use icrc_ledger_types::icrc2::allowance::Allowance;
@@ -211,9 +228,12 @@ mod tests {
         let agent = build_agent();
         mock_agent.expect_agent().returning(move || agent.clone());
 
+        let ledger_allowance = ledger;
+        let ledger_balance = ledger_allowance.clone();
+
         mock_agent
             .expect_call_query::<Allowance>()
-            .withf(move |canister, method, _| *canister == ledger && method == "icrc2_allowance")
+            .withf(move |canister, method, _| *canister == ledger_allowance && method == "icrc2_allowance")
             .returning(|_, _, _| {
                 Ok(Allowance {
                     allowance: Nat::from(0u8),
@@ -221,25 +241,39 @@ mod tests {
                 })
             });
 
+        mock_agent
+            .expect_call_query::<Nat>()
+            .withf(move |canister, method, _| *canister == ledger_balance && method == "icrc1_balance_of")
+            .returning(|_, _, _| Ok(Nat::from(1_000u32)));
+
         let counts = Arc::new(Mutex::new((0usize, 0usize)));
         let counts_clone = counts.clone();
+        let counts_clone_approve = counts_clone.clone();
         mock_agent
-            .expect_call_update_raw()
-            .times(2)
-            .returning(move |_, method, arg| match method {
-                "icrc2_approve" => {
-                    let mut guard = counts_clone.lock().expect("counts mutex poisoned");
-                    guard.0 += 1;
-                    Ok(Encode!(&Ok::<Nat, ApproveError>(Nat::from(500u32))).unwrap())
+            .expect_call_update::<Result<Nat, ApproveError>>()
+            .withf(|_, method, _| method == "icrc2_approve")
+            .times(1)
+            .returning(move |_, _, _| {
+                let mut guard = counts_clone_approve.lock().expect("counts mutex poisoned");
+                guard.0 += 1;
+                Ok(Ok(Nat::from(500u32)))
+            });
+
+        let counts_clone_swap = counts_clone.clone();
+        mock_agent
+            .expect_call_update::<SwapResult>()
+            .withf(|_, method, arg| {
+                if method != "swap" {
+                    return false;
                 }
-                "swap" => {
-                    let decoded: SwapArgs = Decode!(&arg, SwapArgs).expect("decode swap args");
-                    assert_eq!(decoded.pay_amount, Nat::from(90u8));
-                    let mut guard = counts_clone.lock().expect("counts mutex poisoned");
-                    guard.1 += 1;
-                    Ok(Encode!(&SwapResult::Ok(dummy_swap_reply(Nat::from(90u8)))).unwrap())
-                }
-                other => panic!("unexpected method {other}"),
+                let decoded: SwapArgs = Decode!(&arg, SwapArgs).expect("decode swap args");
+                decoded.pay_amount == Nat::from(90u8)
+            })
+            .times(1)
+            .returning(move |_, _, _| {
+                let mut guard = counts_clone_swap.lock().expect("counts mutex poisoned");
+                guard.1 += 1;
+                Ok(SwapResult::Ok(dummy_swap_reply(Nat::from(90u8))))
             });
 
         let swapper = Arc::new(KongSwapSwapper::new(
@@ -287,9 +321,12 @@ mod tests {
         let agent = build_agent();
         mock_agent.expect_agent().returning(move || agent.clone());
 
+        let ledger_allowance = ledger;
+        let ledger_balance = ledger_allowance.clone();
+
         mock_agent
             .expect_call_query::<Allowance>()
-            .withf(move |canister, method, _| *canister == ledger && method == "icrc2_allowance")
+            .withf(move |canister, method, _| *canister == ledger_allowance && method == "icrc2_allowance")
             .returning(|_, _, _| {
                 Ok(Allowance {
                     allowance: Nat::from(u64::MAX),
@@ -298,16 +335,21 @@ mod tests {
             });
 
         mock_agent
-            .expect_call_update_raw()
-            .times(1)
-            .returning(move |_, method, arg| match method {
-                "swap" => {
-                    let decoded: SwapArgs = Decode!(&arg, SwapArgs).expect("decode swap args");
-                    assert_eq!(decoded.pay_amount, Nat::from(100u8));
-                    Ok(Encode!(&SwapResult::Ok(dummy_swap_reply(Nat::from(100u8)))).unwrap())
+            .expect_call_query::<Nat>()
+            .withf(move |canister, method, _| *canister == ledger_balance && method == "icrc1_balance_of")
+            .returning(|_, _, _| Ok(Nat::from(1_000u32)));
+
+        mock_agent
+            .expect_call_update::<SwapResult>()
+            .withf(|_, method, arg| {
+                if method != "swap" {
+                    return false;
                 }
-                other => panic!("unexpected method {other}"),
-            });
+                let decoded: SwapArgs = Decode!(&arg, SwapArgs).expect("decode swap args");
+                decoded.pay_amount == Nat::from(100u8)
+            })
+            .times(1)
+            .returning(move |_, _, _| Ok(SwapResult::Ok(dummy_swap_reply(Nat::from(100u8)))));
 
         let swapper = Arc::new(KongSwapSwapper::new(
             Arc::new(mock_agent),
