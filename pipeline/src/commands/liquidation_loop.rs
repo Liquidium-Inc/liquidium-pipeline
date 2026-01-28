@@ -269,8 +269,15 @@ pub async fn run_liquidation_loop() {
         }
     };
 
+    let watcher_wal = match SqliteWalStore::new_with_busy_timeout(&config.db_path, 30_000) {
+        Ok(wal) => Arc::new(wal),
+        Err(err) => {
+            log::error!("Failed to init watcher WAL: {}", err);
+            return;
+        }
+    };
     let watcher = SettlementWatcher::new(
-        finalizer.wal.clone(),
+        watcher_wal,
         ctx.agent.clone(),
         ctx.swap_router.clone(),
         config.lending_canister,

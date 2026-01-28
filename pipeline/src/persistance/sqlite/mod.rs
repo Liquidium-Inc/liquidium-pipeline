@@ -16,16 +16,30 @@ use self::schema::liquidation_results as tbl;
 
 pub struct SqliteWalStore {
     pool: Pool<ConnectionManager<SqliteConnection>>,
+    busy_timeout_ms: i64,
 }
 
 impl SqliteWalStore {
     pub fn new(path: &str) -> Result<Self> {
+        Self::new_with_busy_timeout(path, 5_000)
+    }
+
+    pub fn new_with_busy_timeout(path: &str, busy_timeout_ms: i64) -> Result<Self> {
         let manager = ConnectionManager::<SqliteConnection>::new(path);
         let pool = Pool::builder().max_size(2).build(manager)?;
         let mut conn = pool.get()?;
         initialize_schema(&mut conn)?;
-        apply_pragmas(&mut conn)?;
-        Ok(Self { pool })
+        apply_pragmas(&mut conn, busy_timeout_ms)?;
+        Ok(Self {
+            pool,
+            busy_timeout_ms,
+        })
+    }
+
+    fn get_conn(&self) -> Result<r2d2::PooledConnection<ConnectionManager<SqliteConnection>>> {
+        let mut conn = self.pool.get()?;
+        apply_pragmas(&mut conn, self.busy_timeout_ms)?;
+        Ok(conn)
     }
 
     fn to_row(r: &LiqResultRecord) -> Row {
@@ -67,7 +81,7 @@ impl SqliteWalStore {
 #[async_trait]
 impl WalStore for SqliteWalStore {
     async fn get_pending(&self, limit: usize) -> Result<Vec<LiqResultRecord>> {
-        let mut conn = self.pool.get()?;
+        let mut conn = self.get_conn()?;
         let now = now_secs();
         let inflight_stale_cutoff = now.saturating_sub(300);
 
@@ -98,7 +112,7 @@ impl WalStore for SqliteWalStore {
     }
 
     async fn upsert_result(&self, row: LiqResultRecord) -> Result<()> {
-        let mut conn = self.pool.get()?;
+        let mut conn = self.get_conn()?;
         diesel::insert_into(tbl::table)
             .values(&Self::to_row(&row))
             .on_conflict(tbl::liq_id)
@@ -116,13 +130,13 @@ impl WalStore for SqliteWalStore {
     }
 
     async fn get_result(&self, liq_id: &str) -> Result<Option<LiqResultRecord>> {
-        let mut conn = self.pool.get()?;
+        let mut conn = self.get_conn()?;
         let res = tbl::table.find(liq_id.to_string()).first::<Row>(&mut conn).optional()?;
         Ok(res.map(Self::from_row))
     }
 
     async fn list_by_status(&self, status: ResultStatus, limit: usize) -> Result<Vec<LiqResultRecord>> {
-        let mut conn = self.pool.get()?;
+        let mut conn = self.get_conn()?;
         let rows = tbl::table
             .filter(tbl::status.eq(status as i32))
             .order(tbl::created_at.asc())
@@ -132,7 +146,7 @@ impl WalStore for SqliteWalStore {
     }
 
     async fn update_status(&self, liq_id: &str, next: ResultStatus, bump_attempt: bool) -> Result<()> {
-        let mut conn = self.pool.get()?;
+        let mut conn = self.get_conn()?;
         let now = now_secs();
         let attempt_delta = if bump_attempt { 1 } else { 0 };
         let current: Option<i32> = tbl::table
@@ -159,7 +173,7 @@ impl WalStore for SqliteWalStore {
         last_error: String,
         bump_attempt: bool,
     ) -> Result<()> {
-        let mut conn = self.pool.get()?;
+        let mut conn = self.get_conn()?;
         let now = now_secs();
         let attempt_delta = if bump_attempt { 1 } else { 0 };
         let current: Option<(i32, i32)> = tbl::table
@@ -184,7 +198,7 @@ impl WalStore for SqliteWalStore {
     }
 
     async fn delete(&self, liq_id: &str) -> anyhow::Result<()> {
-        let mut conn = self.pool.get()?;
+        let mut conn = self.get_conn()?;
         diesel::delete(tbl::table.find(liq_id.to_string())).execute(&mut conn)?;
         Ok(())
     }
@@ -210,9 +224,10 @@ pub fn initialize_schema(conn: &mut SqliteConnection) -> Result<()> {
     Ok(())
 }
 
-pub fn apply_pragmas(conn: &mut SqliteConnection) -> Result<()> {
+pub fn apply_pragmas(conn: &mut SqliteConnection, busy_timeout_ms: i64) -> Result<()> {
     conn.batch_execute(
-        r#"
+        &format!(
+            r#"
         PRAGMA journal_mode=DELETE;
         PRAGMA synchronous=FULL;
         PRAGMA fullfsync=ON;
@@ -221,8 +236,10 @@ pub fn apply_pragmas(conn: &mut SqliteConnection) -> Result<()> {
         PRAGMA mmap_size=0;
         PRAGMA auto_vacuum=FULL;
         PRAGMA secure_delete=ON;
-        PRAGMA busy_timeout=5000;
+        PRAGMA busy_timeout={};
     "#,
+            busy_timeout_ms
+        ),
     )?;
     Ok(())
 }
