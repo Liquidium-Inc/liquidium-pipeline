@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use candid::Principal;
 use liquidium_pipeline_connectors::pipeline_agent::PipelineAgent;
 use liquidium_pipeline_core::tokens::chain_token::ChainToken;
-use log::info;
+use log::{info, warn};
 
 use crate::swappers::kong::kong_swapper::KongSwapSwapper;
 use crate::swappers::kong::kong_types::{
@@ -112,8 +112,23 @@ where
             }
         }
 
+        info!(
+            "[kong] execute pay={} {} -> {} recv_addr={:?} max_slip={:?}",
+            req.pay_amount.value,
+            req.pay_asset.symbol,
+            req.receive_asset.symbol,
+            req.receive_address,
+            req.max_slippage_bps
+        );
+
         // Execute swap on Kong
-        let reply: KongSwapReply = self.swapper.swap(kong_req).await?;
+        let reply: KongSwapReply = self.swapper.swap(kong_req).await.map_err(|e| {
+            warn!(
+                "[kong] execute failed pay={} {} -> {} err={}",
+                req.pay_amount.value, req.pay_asset.symbol, req.receive_asset.symbol, e
+            );
+            e
+        })?;
 
         // KongSwapReply -> generic SwapExecution via adapter
         Ok(SwapExecution::from(reply))

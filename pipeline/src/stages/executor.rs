@@ -14,7 +14,7 @@ use crate::{
 };
 use liquidium_pipeline_connectors::pipeline_agent::PipelineAgent;
 
-use liquidium_pipeline_core::types::protocol_types::{LiquidationResult, LiquidationStatus, TransferStatus};
+use liquidium_pipeline_core::types::protocol_types::{LiquidationResult, LiquidationStatus, ProtocolError, TransferStatus};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ExecutionStatus {
@@ -83,7 +83,11 @@ impl<'a, A: PipelineAgent, D: WalStore> PipelineStage<'a, Vec<ExecutorRequest>, 
 
                 let liq_call = match self
                     .agent
-                    .call_update::<Result<LiquidationResult, String>>(&self.lending_canister, "liquidate", args)
+                    .call_update::<Result<LiquidationResult, ProtocolError>>(
+                        &self.lending_canister,
+                        "liquidate",
+                        args,
+                    )
                     .await
                 {
                     Ok(v) => v,
@@ -97,7 +101,7 @@ impl<'a, A: PipelineAgent, D: WalStore> PipelineStage<'a, Vec<ExecutorRequest>, 
                 let liq = match liq_call {
                     Ok(v) => v,
                     Err(err) => {
-                        receipt.status = ExecutionStatus::FailedLiquidation(err);
+                        receipt.status = ExecutionStatus::FailedLiquidation(format!("{:?}", err));
                         return Ok::<ExecutionReceipt, String>(receipt);
                     }
                 };

@@ -188,24 +188,65 @@ impl<A: PipelineAgent> KongSwapSwapper<A> {
                     .map_err(|e| format!("Swap args encode error: {}", e))?,
             )
             .await
-            .map_err(|e| format!("Swap call error: {}", e))?
-            .map_err(|e| format!("Swap call error: {}", e))?;
+            .map_err(|e| {
+                warn!(
+                    "[kong] quote call failed {} {} -> {} err={}",
+                    amount.value,
+                    token_in.symbol(),
+                    token_out.symbol(),
+                    e
+                );
+                format!("Swap call error: {}", e)
+            })?
+            .map_err(|e| {
+                warn!(
+                    "[kong] quote response error {} {} -> {} err={}",
+                    amount.value,
+                    token_in.symbol(),
+                    token_out.symbol(),
+                    e
+                );
+                format!("Swap call error: {}", e)
+            })?;
 
         Ok(result)
     }
 
     pub async fn swap(&self, swap_args: SwapArgs) -> Result<SwapReply, String> {
         debug!("Swap args {:#?}", swap_args);
+        let pay_amount = swap_args.pay_amount.clone();
+        let pay_token = swap_args.pay_token.clone();
+        let receive_token = swap_args.receive_token.clone();
+        let receive_address = swap_args.receive_address.clone();
+        let max_slippage = swap_args.max_slippage;
+
+        info!(
+            "[kong] swap request pay={} {} -> {} recv_addr={:?} max_slip={:?}",
+            pay_amount, pay_token, receive_token, receive_address, max_slippage
+        );
         let dex_principal = Principal::from_str(DEX_PRINCIPAL).unwrap();
         let result = self
             .agent
             .call_update::<SwapResult>(&dex_principal, "swap", swap_args.into())
             .await
-            .map_err(|e| format!("Swap call error: {}", e))?;
+            .map_err(|e| {
+                warn!(
+                    "[kong] swap call failed pay={} {} -> {} err={}",
+                    pay_amount, pay_token, receive_token,
+                    e
+                );
+                format!("Swap call error: {}", e)
+            })?;
 
         match result {
             SwapResult::Ok(res) => Ok(res),
-            SwapResult::Err(e) => Err(format!("Could not execute swap {e}")),
+            SwapResult::Err(e) => {
+                warn!(
+                    "[kong] swap rejected pay={} {} -> {} err={}",
+                    pay_amount, pay_token, receive_token, e
+                );
+                Err(format!("Could not execute swap {e}"))
+            }
         }
     }
 }
