@@ -120,16 +120,30 @@ impl<'a, A: PipelineAgent, D: WalStore> PipelineStage<'a, Vec<ExecutorRequest>, 
                     return Ok::<ExecutionReceipt, String>(receipt);
                 }
 
-                if matches!(
-                    liq.collateral_tx.status,
-                    TransferStatus::Failed(_) | TransferStatus::Pending
-                ) {
-                    info!(
-                        "[executor] 🧱 collateral_tx status={:?} liq_id={}",
-                        liq.collateral_tx.status, liq.id
-                    );
-                    receipt.status = ExecutionStatus::CollateralTransferFailed("collateral missing".to_string());
-                    return Ok::<ExecutionReceipt, String>(receipt);
+                match &liq.collateral_tx.status {
+                    TransferStatus::Success => {}
+                    TransferStatus::Pending => {
+                        info!(
+                            "[executor] 🧱 collateral_tx status={:?} liq_id={}",
+                            liq.collateral_tx.status, liq.id
+                        );
+                        receipt.status = ExecutionStatus::CollateralTransferFailed("collateral pending".to_string());
+                        if let Err(err) = self.store_to_wal(&receipt, &executor_request).await {
+                            warn!("Failed to store to WAL: {}", err);
+                        }
+                        return Ok::<ExecutionReceipt, String>(receipt);
+                    }
+                    TransferStatus::Failed(err) => {
+                        info!(
+                            "[executor] 🧱 collateral_tx status={:?} liq_id={}",
+                            liq.collateral_tx.status, liq.id
+                        );
+                        receipt.status = ExecutionStatus::CollateralTransferFailed(err.clone());
+                        if let Err(err) = self.store_to_wal(&receipt, &executor_request).await {
+                            warn!("Failed to store to WAL: {}", err);
+                        }
+                        return Ok::<ExecutionReceipt, String>(receipt);
+                    }
                 }
 
                 debug!("Executed liquidation {:?}", liq);

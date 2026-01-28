@@ -81,6 +81,47 @@ pub enum TransferStatus {
 }
 
 #[derive(Debug, CandidType, Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub enum SignatureVerificationError {
+    InvalidEthSignature,
+    UnsupportedChain,
+    InvalidSolSignature,
+    InvalidEthAddress,
+    CouldNotDecode(String),
+    ProfileNotFound,
+    InvalidBtcSignature,
+}
+
+#[derive(Debug, CandidType, Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub enum ProtocolError {
+    PositionNotFound,
+    Internal(String),
+    InvalidAddress(String),
+    InvalidTargetPrincipal,
+    SignatureError(SignatureVerificationError),
+    SupplyCapExceeded,
+    AccountNotFound,
+    NotAllowed(String),
+    FeeClaimReceiverNotConfigured,
+    InsufficientCollateral,
+    ProfileNotFound,
+    SignatureExpiryTooFarInFuture,
+    MaxLtvExceeded,
+    ProfileAlreadyExists,
+    HealthFactorTooLow,
+    NoLiquidity,
+    SignatureExpired,
+    PoolNotfound(String),
+    BorrowingDisabled,
+    BorrowCapExceeded,
+    PoolFrozen,
+    TransferFailed(String),
+    AccountAlreadyLinked,
+    CannotRemoveSoleAccount,
+    InsufficientFunds,
+    LiquidationNotfound(String),
+}
+
+#[derive(Debug, CandidType, Serialize, Deserialize, Clone, PartialEq, Eq)]
 pub struct TxStatus {
     // Some chains may not have a tx id yet (queued) — keep it optional.
     pub tx_id: Option<String>,
@@ -93,6 +134,8 @@ pub enum LiquidationStatus {
     FailedLiquidation(String),
     CollateralTransferFailed(String),
     ChangeTransferFailed(String),
+    InflowProcessed,
+    CoreExecuted,
 }
 
 #[derive(Debug, CandidType, Serialize, Deserialize, Clone, PartialEq, Eq)]

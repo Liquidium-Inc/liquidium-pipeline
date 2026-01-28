@@ -105,7 +105,7 @@ async fn init(
         SimpleLiquidationStrategy<SwapRouter, Config, TokenRegistry, CollateralService<LiquidationPriceOracle<Agent>>>,
         Arc<BasicExecutor<Agent, SqliteWalStore>>,
         Arc<ExportStage>,
-        Arc<FinalizeStage<HybridFinalizer<Config>, SqliteWalStore, SimpleProfitCalculator>>,
+        Arc<FinalizeStage<HybridFinalizer<Config>, SqliteWalStore, SimpleProfitCalculator, Agent>>,
     ),
     String,
 > {
@@ -183,7 +183,13 @@ async fn init(
     let profit_calc = Arc::new(SimpleProfitCalculator); //todo implement real profit calculator
 
     // FinalizeStage wires WAL + finalizer + profit calculation
-    let finalizer = Arc::new(FinalizeStage::new(db.clone(), hybrid_finalizer, profit_calc));
+    let finalizer = Arc::new(FinalizeStage::new(
+        db.clone(),
+        hybrid_finalizer,
+        profit_calc,
+        agent.clone(),
+        config.lending_canister,
+    ));
 
     info!("Initializing searcher stage ...");
     let finder = OpportunityFinder::new(
