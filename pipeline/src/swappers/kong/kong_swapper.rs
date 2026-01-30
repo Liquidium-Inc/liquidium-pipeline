@@ -52,7 +52,10 @@ impl<A: PipelineAgent> KongSwapSwapper<A> {
         let threshold = max_for_ledger(&ledger) / Nat::from(2u8);
 
         {
-            let map = self.allowances.lock().expect("allowances mutex poisoned");
+            let map = self
+                .allowances
+                .lock()
+                .map_err(|_| "allowances mutex poisoned".to_string())?;
             if let Some(cached) = map.get(&(ledger, owner))
                 && *cached >= threshold
             {
@@ -71,7 +74,10 @@ impl<A: PipelineAgent> KongSwapSwapper<A> {
             .await;
 
         if allowance >= threshold {
-            let mut map = self.allowances.lock().expect("allowances mutex poisoned");
+            let mut map = self
+                .allowances
+                .lock()
+                .map_err(|_| "allowances mutex poisoned".to_string())?;
             map.insert((ledger, owner), allowance);
             return Ok(false);
         }
@@ -87,7 +93,10 @@ impl<A: PipelineAgent> KongSwapSwapper<A> {
             )
             .await?;
 
-        let mut map = self.allowances.lock().expect("allowances mutex poisoned");
+        let mut map = self
+            .allowances
+            .lock()
+            .map_err(|_| "allowances mutex poisoned".to_string())?;
         map.insert((ledger, owner), approved);
         Ok(true)
     }
@@ -107,7 +116,10 @@ impl<A: PipelineAgent> KongSwapSwapper<A> {
 
         let results = join_all(futures).await;
 
-        let mut map = this.allowances.lock().expect("allowances mutex poisoned");
+        let mut map = this
+            .allowances
+            .lock()
+            .map_err(|_| "allowances mutex poisoned".to_string())?;
         for (token, owner, allowance) in results {
             map.insert((token, owner), allowance);
         }
