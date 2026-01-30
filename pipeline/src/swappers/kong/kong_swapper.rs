@@ -35,7 +35,7 @@ impl<A: PipelineAgent> KongSwapSwapper<A> {
             agent,
             account_id,
             dex_account: Account {
-                owner: DEX_PRINCIPAL.parse().unwrap(),
+                owner: DEX_PRINCIPAL.parse().expect("invalid DEX_PRINCIPAL"),
                 subaccount: None,
             },
             allowances: Mutex::new(HashMap::new()),
@@ -182,7 +182,7 @@ impl<A: PipelineAgent> KongSwapSwapper<A> {
         token_out: &ChainToken,
         amount: &ChainTokenAmount,
     ) -> Result<SwapAmountsReply, String> {
-        let dex_principal = Principal::from_str(DEX_PRINCIPAL).unwrap();
+        let dex_principal = Principal::from_str(DEX_PRINCIPAL).expect("invalid DEX_PRINCIPAL");
 
         info!(
             "Fetching swap info for {} {} -> {} ",
@@ -260,7 +260,7 @@ impl<A: PipelineAgent> KongSwapSwapper<A> {
             "[kong] swap request pay={} {} -> {} recv_addr={:?} max_slip={:?}",
             pay_amount, pay_token, receive_token, receive_address, max_slippage
         );
-        let dex_principal = Principal::from_str(DEX_PRINCIPAL).unwrap();
+        let dex_principal = Principal::from_str(DEX_PRINCIPAL).expect("invalid DEX_PRINCIPAL");
         let result = self
             .agent
             .call_update::<SwapResult>(&dex_principal, "swap", swap_args.into())
@@ -345,15 +345,15 @@ impl<A: PipelineAgent> KongSwapSwapper<A> {
     }
 }
 fn max_for_ledger(token: &Principal) -> Nat {
-    if *token == Principal::from_text("ryjl3-tyaaa-aaaaa-aaaba-cai").unwrap() {
+    if *token == Principal::from_text("ryjl3-tyaaa-aaaaa-aaaba-cai").expect("invalid ICP ledger principal") {
         return Nat::from(u64::MAX);
     }
 
-    if *token == Principal::from_text("cngnf-vqaaa-aaaar-qag4q-cai").unwrap() {
+    if *token == Principal::from_text("cngnf-vqaaa-aaaar-qag4q-cai").expect("invalid ckUSDT ledger principal") {
         return Nat::from(340_282_366_920_938_463_463_374_607_431_768_211_455u128);
     }
 
-    if *token == Principal::from_text("mxzaz-hqaaa-aaaar-qaada-cai").unwrap() {
+    if *token == Principal::from_text("mxzaz-hqaaa-aaaar-qaada-cai").expect("invalid ckBTC ledger principal") {
         return Nat::from(u64::MAX);
     }
 
