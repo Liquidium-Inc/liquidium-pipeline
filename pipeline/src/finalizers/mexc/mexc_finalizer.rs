@@ -694,14 +694,17 @@ where
     }
 
     async fn finish(&self, _receipt: &ExecutionReceipt, state: &CexState) -> Result<SwapExecution, String> {
-        let receive_amount = state.size_out.clone();
+        let receive_amount = state
+            .size_out
+            .clone()
+            .ok_or_else(|| "receive amount missing".to_string())?;
 
         // Pay side: seized collateral we sent in, as recorded on the CEX state.
         let pay_amount = state.size_in.clone();
 
         // Compute an effective execution price in native units: receive / pay.
         let pay_f = pay_amount.to_f64();
-        let recv_f = receive_amount.clone().expect("receive amount missing").to_f64();
+        let recv_f = receive_amount.to_f64();
 
         let exec_price = if pay_f > 0.0 { recv_f / pay_f } else { 0.0 };
 
@@ -722,7 +725,7 @@ where
             pay_asset: state.deposit_asset.asset_id(),
             pay_amount: pay_amount.value,
             receive_asset: state.withdraw_asset.asset_id(),
-            receive_amount: receive_amount.unwrap().value,
+            receive_amount: receive_amount.value,
             mid_price: exec_price,
             exec_price,
             slippage: 0.0,
