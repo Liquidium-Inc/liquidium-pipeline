@@ -270,9 +270,9 @@ where
 
             info!(
                 "🧯 Bad debt buy: repay={} {} | profit={} {}",
-                repay_amount.0.to_f64().unwrap() / 10u32.pow(repayment_token.decimals() as u32) as f64,
+                repay_amount.0.to_f64().unwrap_or(f64::MAX) / 10u32.pow(repayment_token.decimals() as u32) as f64,
                 repayment_token.symbol(),
-                profit.0.to_f64().unwrap() / 10u32.pow(repayment_token.decimals() as u32) as f64,
+                profit.0.to_f64().unwrap_or(0.0) / 10u32.pow(repayment_token.decimals() as u32) as f64,
                 repayment_token.symbol()
             );
 
@@ -499,9 +499,9 @@ where
             let inverse_price = if price > 0.0 { 1.0 / price } else { 0.0 };
             info!(
                 "💱 Quote: repay={} {} | received={} {} | price={} inverse_price={} (collateral={} -> debt={})",
-                estimation.repaid_debt.0.to_f64().unwrap() / 10u32.pow(repayment_token.decimals() as u32) as f64,
+                estimation.repaid_debt.0.to_f64().unwrap_or(f64::MAX) / 10u32.pow(repayment_token.decimals() as u32) as f64,
                 repayment_token.symbol(),
-                amount_received.0.to_f64().unwrap() / 10u32.pow(repayment_token.decimals() as u32) as f64,
+                amount_received.0.to_f64().unwrap_or(f64::MAX) / 10u32.pow(repayment_token.decimals() as u32) as f64,
                 repayment_token.symbol(),
                 price,
                 inverse_price,
@@ -530,7 +530,7 @@ where
 
             info!(
                 "📊 Profit: {} {}",
-                profit.0.to_f64().unwrap() / 10u32.pow(repayment_token.decimals() as u32) as f64,
+                profit.0.to_f64().unwrap_or(0.0) / 10u32.pow(repayment_token.decimals() as u32) as f64,
                 repayment_token.symbol()
             );
 
@@ -581,7 +581,7 @@ where
             if is_bad_debt && self.config.should_buy_bad_debt() {
                 info!(
                     "🧯 Buying bad debt: repaid={} {}",
-                    estimation.repaid_debt.0.to_f64().unwrap() / 10u32.pow(repayment_token.decimals() as u32) as f64,
+                    estimation.repaid_debt.0.to_f64().unwrap_or(f64::MAX) / 10u32.pow(repayment_token.decimals() as u32) as f64,
                     repayment_token.symbol()
                 );
             }
