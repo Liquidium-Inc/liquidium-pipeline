@@ -121,9 +121,11 @@ impl<A: PipelineAgent> IcpBackend for IcpBackendImpl<A> {
 
         let fee = Tokens { e8s: 10_000 }; // default ICP fee
 
-        let amount = Tokens {
-            e8s: amount_e8s.0.to_u64().unwrap(),
-        };
+        let e8s = amount_e8s
+            .0
+            .to_u64()
+            .ok_or_else(|| "amount too large for ICP transfer".to_string())?;
+        let amount = Tokens { e8s };
 
         let arg = TransferArgs {
             to,
