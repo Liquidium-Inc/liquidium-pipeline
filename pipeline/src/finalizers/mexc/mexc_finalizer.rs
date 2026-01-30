@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use candid::{Nat, Principal};
@@ -11,6 +12,7 @@ use liquidium_pipeline_core::{
     transfer::actions::TransferActions,
 };
 use log::{debug, info, warn};
+use tokio::time::sleep;
 
 use crate::{
     finalizers::cex_finalizer::{CexFinalizerLogic, CexState, CexStep},
@@ -274,6 +276,72 @@ where
 
         Ok(())
     }
+
+    // MEXC approvals are flaky; we send a burst of tiny approvals to increase the chance
+    // the exchange notices the approval without blocking the main liquidation flow.
+    async fn maybe_bump_mexc_approval(&self, liq_id: &str, asset: &ChainToken) {
+        let already_bumped = {
+            let approve_bumps = self.approve_bumps.lock().expect("approve_bumps mutex poisoned");
+            *approve_bumps.get(liq_id).unwrap_or(&0)
+        };
+
+        if already_bumped >= 6 {
+            debug!(
+                "[mexc] liq_id={} deposit transfer: approve bump already done (count={})",
+                liq_id, already_bumped
+            );
+            return;
+        }
+
+        let approve_amount = Nat::from(1u8);
+        let spender = ChainAccount::Icp(Account {
+            owner: self.liquidator_principal,
+            subaccount: None,
+        });
+        info!(
+            "[mexc] liq_id={} deposit transfer: approve bump 3+3 amount={} asset={}",
+            liq_id, approve_amount, asset
+        );
+
+        let mut ok = true;
+        let short_pause = Duration::from_millis(300);
+        for i in 0..3 {
+            if let Err(err) = self
+                .transfer_service
+                .approve(asset, &spender, approve_amount.clone())
+                .await
+            {
+                ok = false;
+                info!("[mexc] liq_id={} approve bump failed: {}", liq_id, err);
+                break;
+            }
+            if i < 2 {
+                sleep(short_pause).await;
+            }
+        }
+        if ok {
+            sleep(Duration::from_secs(3)).await;
+            for i in 0..3 {
+                if let Err(err) = self
+                    .transfer_service
+                    .approve(asset, &spender, approve_amount.clone())
+                    .await
+                {
+                    ok = false;
+                    info!("[mexc] liq_id={} approve bump failed: {}", liq_id, err);
+                    break;
+                }
+                if i < 2 {
+                    sleep(short_pause).await;
+                }
+            }
+        }
+
+        if ok {
+            let mut approve_bumps = self.approve_bumps.lock().expect("approve_bumps mutex poisoned");
+            approve_bumps.insert(liq_id.to_string(), 6);
+        }
+    }
 }
 
 #[async_trait]
@@ -389,7 +457,8 @@ where
                 amount.value.clone()
             };
             let transfer_amount = ChainTokenAmount::from_raw(state.deposit_asset.clone(), transfer_value.clone());
-            let total_amount    = ChainTokenAmount::from_raw(state.deposit_asset.clone(), transfer_value.clone() + fee.clone());
+            let total_amount =
+                ChainTokenAmount::from_raw(state.deposit_asset.clone(), transfer_value.clone() + fee.clone());
             info!(
                 "[mexc] liq_id={} deposit transfer requested={} fee={} net_transfer={} total_debit={}",
                 state.liq_id,
@@ -422,45 +491,7 @@ where
             debug!("[mexc] liq_id={} sent deposit txid={}", state.liq_id, tx_id);
 
             if matches!(state.deposit_asset, ChainToken::Icp { .. }) {
-                let already_bumped = {
-                    let approve_bumps = self.approve_bumps.lock().expect("approve_bumps mutex poisoned");
-                    *approve_bumps.get(&state.liq_id).unwrap_or(&0)
-                };
-
-                if already_bumped >= 6 {
-                    debug!(
-                        "[mexc] liq_id={} deposit transfer: approve bump already done (count={})",
-                        state.liq_id, already_bumped
-                    );
-                } else {
-                    let approve_amount = Nat::from(1u8);
-                    let spender = ChainAccount::Icp(Account {
-                        owner: self.liquidator_principal,
-                        subaccount: None,
-                    });
-                    info!(
-                        "[mexc] liq_id={} deposit transfer: approve bump x6 amount={} asset={}",
-                        state.liq_id, approve_amount, state.deposit_asset
-                    );
-
-                    let mut ok = true;
-                    for _ in 0..6 {
-                        if let Err(err) = self
-                            .transfer_service
-                            .approve(&state.deposit_asset, &spender, approve_amount.clone())
-                            .await
-                        {
-                            ok = false;
-                            info!("[mexc] liq_id={} approve bump failed: {}", state.liq_id, err);
-                            break;
-                        }
-                    }
-
-                    if ok {
-                        let mut approve_bumps = self.approve_bumps.lock().expect("approve_bumps mutex poisoned");
-                        approve_bumps.insert(state.liq_id.clone(), 6);
-                    }
-                }
+                self.maybe_bump_mexc_approval(&state.liq_id, &state.deposit_asset).await;
             } else {
                 debug!(
                     "[mexc] liq_id={} deposit transfer: approve bump skipped (non-ICP asset={})",

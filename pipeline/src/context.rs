@@ -6,6 +6,7 @@ use alloy::signers::local::PrivateKeySigner;
 
 use ic_agent::Agent;
 use icrc_ledger_types::icrc1::account::Account;
+use log::info;
 use liquidium_pipeline_connectors::account::evm_account::EvmAccountInfoAdapter;
 use liquidium_pipeline_connectors::account::icp_account::{IcpAccountInfoAdapter, RECOVERY_ACCOUNT};
 use liquidium_pipeline_connectors::backend::evm_backend::EvmBackendImpl;
@@ -89,6 +90,16 @@ impl<P: Provider<AnyNetwork> + WalletProvider<AnyNetwork> + Clone + 'static> Pip
         let evm_backend_trader = evm_backend_main.clone();
 
         let registry = Arc::new(load_token_registry(icp_backend_main.clone(), evm_backend_main.clone()).await?);
+        for (id, token) in registry.tokens.iter() {
+            if let ChainToken::Icp { fee, .. } = token {
+                info!(
+                    "Loaded ICRC fee: {} {} (ledger={})",
+                    token.symbol(),
+                    fee,
+                    id.address
+                );
+            }
+        }
 
         let main_icp_account = Account {
             owner: config.liquidator_principal,
