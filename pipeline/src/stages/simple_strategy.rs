@@ -306,7 +306,7 @@ where
                 },
                 ref_price: 0u32.into(),
                 swap_args: None,
-                expected_profit: profit.0.to_i128().unwrap(),
+                expected_profit: profit.0.to_i128().unwrap_or(i128::MAX),
             });
         }
 
@@ -573,7 +573,7 @@ where
                 },
                 ref_price: estimation.ref_price,
                 swap_args,
-                expected_profit: profit.0.to_i128().unwrap(),
+                expected_profit: profit.0.to_i128().unwrap_or(i128::MAX),
             });
 
             if estimation.repaid_debt >= debt_position.debt_amount {
