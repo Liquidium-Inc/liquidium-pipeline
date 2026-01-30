@@ -68,7 +68,10 @@ impl<B: EvmBackend> AccountInfo for EvmAccountInfoAdapter<B> {
         };
 
         if let Some((chain, addr)) = cache_key {
-            let mut lock = self.cache.lock().unwrap();
+            let mut lock = self
+                .cache
+                .lock()
+                .map_err(|_| "evm balance cache poisoned".to_string())?;
             lock.insert((chain, addr), (bal.clone(), Instant::now()));
         }
 
@@ -90,7 +93,7 @@ impl<B: EvmBackend> AccountInfo for EvmAccountInfoAdapter<B> {
         let mut result = None;
 
         {
-            let lock = self.cache.lock().unwrap();
+            let lock = self.cache.lock().ok()?;
             if let Some((amount, ts)) = lock.get(&(chain.clone(), addr.clone())) {
                 if ts.elapsed() <= CACHE_TTL {
                     result = Some(amount.clone());
@@ -101,8 +104,9 @@ impl<B: EvmBackend> AccountInfo for EvmAccountInfoAdapter<B> {
         }
 
         if is_stale {
-            let mut lock = self.cache.lock().unwrap();
-            lock.remove(&(chain, addr));
+            if let Ok(mut lock) = self.cache.lock() {
+                lock.remove(&(chain, addr));
+            }
         }
 
         result
