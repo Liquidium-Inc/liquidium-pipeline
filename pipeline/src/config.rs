@@ -12,9 +12,11 @@ use log::debug;
 use alloy::signers::local::PrivateKeySigner;
 use std::collections::HashMap;
 use std::env;
+use std::fs::OpenOptions;
 use std::io::Write;
 
 use std::sync::Arc;
+use std::sync::Mutex;
 
 
 fn expand_tilde(p: &str) -> std::path::PathBuf {
@@ -124,29 +126,103 @@ impl Config {
             ".liquidium-pipeline".to_string()
         };
 
-        let logger = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
-            .format(|buf, record| {
-                let (color, level) = match record.level() {
-                    log::Level::Error => ("\u{1b}[31m", "ERROR"),
-                    log::Level::Warn => ("\u{1b}[33m", "WARN"),
-                    log::Level::Info => ("\u{1b}[32m", "INFO"),
-                    log::Level::Debug => ("\u{1b}[34m", "DEBUG"),
+        let log_file_path = env::var("LOG_FILE")
+            .ok()
+            .map(|value| expand_tilde(&value))
+            .unwrap_or_else(|| std::path::PathBuf::from(format!("{}/pipeline.log", home)));
+        let error_log_file_path = env::var("ERROR_LOG_FILE")
+            .ok()
+            .map(|value| expand_tilde(&value))
+            .unwrap_or_else(|| std::path::PathBuf::from(format!("{}/pipeline.error.log", home)));
+
+        if let Some(parent) = log_file_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Some(parent) = error_log_file_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+
+        let log_file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_file_path)
+            .map(Mutex::new)
+            .ok()
+            .map(Arc::new);
+
+        if log_file.is_none() {
+            eprintln!(
+                "Failed to open log file at {}. Falling back to stdout only for info/debug logs.",
+                log_file_path.display()
+            );
+        }
+
+        let error_log_file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&error_log_file_path)
+            .map(Mutex::new)
+            .ok()
+            .map(Arc::new);
+
+        if error_log_file.is_none() {
+            eprintln!(
+                "Failed to open error log file at {}. Falling back to stdout only for error/warn logs.",
+                error_log_file_path.display()
+            );
+        }
+
+        let info_log = log_file.clone();
+        let error_log = error_log_file.clone();
+
+        let log_env = env_logger::Env::default().default_filter_or("info");
+        let mut logger_builder = env_logger::Builder::from_env(log_env);
+        logger_builder.format(move |buf, record| {
+            let (color, level) = match record.level() {
+                log::Level::Error => ("\u{1b}[31m", "ERROR"),
+                log::Level::Warn => ("\u{1b}[33m", "WARN"),
+                log::Level::Info => ("\u{1b}[32m", "INFO"),
+                log::Level::Debug => ("\u{1b}[34m", "DEBUG"),
                     log::Level::Trace => ("\u{1b}[35m", "TRACE"),
                 };
                 let reset = "\u{1b}[0m";
 
+                let timestamp = buf.timestamp_millis().to_string();
                 writeln!(
                     buf,
                     "{} {}{:<5}{} {}",
-                    buf.timestamp_millis(),
+                    timestamp,
                     color,
                     level,
                     reset,
                     record.args()
-                )
-            })
-            .format_target(false)
-            .build();
+                )?;
+
+                let line = format!(
+                    "{} {:<5} {}\n",
+                    timestamp,
+                    level,
+                    record.args()
+                );
+
+                if record.level() == log::Level::Error || record.level() == log::Level::Warn {
+                    if let Some(file) = error_log.as_ref() {
+                        if let Ok(mut file) = file.lock() {
+                            let _ = file.write_all(line.as_bytes());
+                        }
+                    }
+                } else if let Some(file) = info_log.as_ref() {
+                    if let Ok(mut file) = file.lock() {
+                        let _ = file.write_all(line.as_bytes());
+                    }
+                }
+
+                Ok(())
+            });
+        logger_builder.format_target(false);
+        logger_builder.target(env_logger::Target::Stdout);
+
+        let logger = logger_builder.build();
         let multi = MultiProgress::new();
 
         LogWrapper::new(multi.clone(), logger).try_init().unwrap();
