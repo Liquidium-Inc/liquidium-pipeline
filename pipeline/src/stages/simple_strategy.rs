@@ -155,9 +155,8 @@ where
             }
 
             if colls.is_empty() {
-                info!(
-                    "🧾 Bad debt detected: user={:?} has no collateral; queueing debt positions.",
-                    user.account
+                debug!(
+                    "Bad debt detected: user has no collateral; queueing debt positions."
                 );
                 for d in debts {
                     bad_debts.push((idx, d));
@@ -189,10 +188,10 @@ where
 
         if !self.config.should_buy_bad_debt() {
             // Config says we should not buy bad debt; just log and skip.
-            for (idx, pos) in bad_debts {
-                info!(
-                    "⏭️ Skip bad debt (disabled): user={:?} pool={:?} debt={}",
-                    work_users[idx].account, pos.pool_id, pos.debt_amount,
+            for (_idx, pos) in bad_debts {
+                debug!(
+                    "Skip bad debt (disabled): pool={:?} debt={}",
+                    pos.pool_id, pos.debt_amount,
                 );
             }
             return Ok(());
@@ -448,11 +447,10 @@ where
             if self.config.should_buy_bad_debt() && work_users[user_idx].health_factor <= WIPEOUT_THRESHOLD {
                 let desired_repay = debt_position.debt_amount.clone().min(max_balance.clone());
                 if estimation.repaid_debt < desired_repay {
-                    info!(
-                        "🧨 Wipeout bad-debt repay override: {} -> {} for user {}",
+                    debug!(
+                        "Wipeout bad-debt repay override: {} -> {}",
                         estimation.repaid_debt,
                         desired_repay,
-                        work_users[user_idx].account.to_text()
                     );
                     estimation.repaid_debt = desired_repay;
                 }
