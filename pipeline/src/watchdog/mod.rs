@@ -45,7 +45,7 @@ impl WebhookWatchdog {
             client: reqwest::Client::builder()
                 .timeout(Duration::from_secs(5))
                 .build()
-                .expect("reqwest client"),
+                .unwrap_or_default(),
         }
     }
 
