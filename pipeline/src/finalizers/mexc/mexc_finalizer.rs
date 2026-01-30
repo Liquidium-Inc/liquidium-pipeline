@@ -353,7 +353,7 @@ where
         let amount = &receipt
             .liquidation_result
             .as_ref()
-            .expect("liq result unaavailable")
+            .ok_or_else(|| "missing liquidation result".to_string())?
             .amounts
             .collateral_received;
 
