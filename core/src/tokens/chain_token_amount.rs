@@ -26,8 +26,12 @@ impl ChainTokenAmount {
         let decimals = token.decimals() as u32;
         let scale = 10_f64.powi(decimals as i32);
 
-        let value = (formatted_value * scale).round().to_string();
-        let value = Nat::from_str(&value).expect("invalid formatted value");
+        let scaled = (formatted_value * scale).round();
+        let value = if scaled.is_nan() || scaled.is_infinite() || scaled < 0.0 {
+            Nat::from(0u8)
+        } else {
+            Nat::from_str(&scaled.to_string()).unwrap_or_else(|_| Nat::from(0u8))
+        };
 
         Self { token, value }
     }

@@ -17,8 +17,12 @@ pub struct IcrcTokenAmount {
 #[allow(dead_code)]
 impl IcrcTokenAmount {
     pub fn from_formatted(token: IcrcToken, formatted_value: f64) -> Self {
-        let value = (formatted_value * 10_f64.pow(token.decimals)).to_string();
-        let value = Nat::from_str(&value).unwrap();
+        let scaled = formatted_value * 10_f64.pow(token.decimals);
+        let value = if scaled.is_nan() || scaled.is_infinite() || scaled < 0.0 {
+            Nat::from(0u8)
+        } else {
+            Nat::from_str(&scaled.to_string()).unwrap_or_else(|_| Nat::from(0u8))
+        };
         Self { token, value }
     }
 
