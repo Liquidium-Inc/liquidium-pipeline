@@ -301,7 +301,7 @@ impl<A: PipelineAgent> KongSwapSwapper<A> {
         };
         let args = Encode!(&args).map_err(|e| format!("Encode error: {}", e))?;
 
-        info!("Approving {} on spender {}", ledger, self.dex_account.owner);
+        debug!("Approving {} on DEX spender", ledger);
         let result = self
             .agent
             .call_update::<Result<Nat, ApproveError>>(ledger, "icrc2_approve", args)
@@ -337,8 +337,8 @@ impl<A: PipelineAgent> KongSwapSwapper<A> {
         };
 
         debug!(
-            "Allowance for {} on {} = {}",
-            ledger, self.dex_account.owner, result.allowance
+            "Allowance for {} = {}",
+            ledger, result.allowance
         );
 
         result.allowance
