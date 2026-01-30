@@ -24,19 +24,22 @@ impl BalanceService {
     pub async fn sync_assets(&self, assets: &[AssetId]) -> Vec<Result<(AssetId, ChainTokenAmount), String>> {
         let futs = assets.iter().map(|asset_id| {
             let accounts = self.accounts.clone();
-            let token = self
-                .registry
-                .get(asset_id)
-                .expect("TokenRegistry out of sync with AssetId list")
-                .clone();
+            let token = match self.registry.get(asset_id) {
+                Some(t) => t.clone(),
+                None => {
+                    return futures::future::Either::Left(async move {
+                        Err::<_, String>(format!("unknown asset {}", asset_id))
+                    })
+                }
+            };
 
-            async move {
+            futures::future::Either::Right(async move {
                 let bal = accounts
                     .sync_balance(&token)
                     .await
                     .map_err(|e| format!("sync_balance failed for {}: {}", asset_id, e))?;
                 Ok::<_, String>((asset_id.clone(), bal))
-            }
+            })
         });
 
         join_all(futs).await
