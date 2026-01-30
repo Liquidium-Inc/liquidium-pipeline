@@ -614,7 +614,8 @@ impl CexBackend for MexcClient {
             return Err("no asks".into());
         }
 
-        let mut remaining = Decimal::from_f64_retain(amount_in).expect("could not convert f64");
+        let mut remaining = Decimal::from_f64_retain(amount_in)
+            .ok_or_else(|| "could not convert amount to Decimal".to_string())?;
         let mut cost = Decimal::ZERO;
 
         for level in asks {
@@ -801,8 +802,10 @@ impl CexBackend for MexcClient {
             }
         };
 
-        let var_name = "could not convert balance to f64";
-        Ok(balance.free.to_f64().expect(var_name))
+        balance
+            .free
+            .to_f64()
+            .ok_or_else(|| "could not convert balance to f64".to_string())
     }
 
     async fn withdraw(

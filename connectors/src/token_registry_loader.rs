@@ -125,13 +125,15 @@ where
 
     let collateral_ids = coll_specs
         .into_iter()
-        .map(|spec| AssetId::from_str(&spec).unwrap())
-        .collect::<Vec<_>>();
+        .map(|spec| {
+            AssetId::from_str(&spec).map_err(|e| format!("invalid collateral asset spec '{}': {e}", spec))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
 
     let debt_ids = debt_specs
         .into_iter()
-        .map(|spec| AssetId::from_str(&spec).unwrap())
-        .collect::<Vec<_>>();
+        .map(|spec| AssetId::from_str(&spec).map_err(|e| format!("invalid debt asset spec '{}': {e}", spec)))
+        .collect::<Result<Vec<_>, _>>()?;
 
     Ok(TokenRegistry::with_roles(tokens, collateral_ids, debt_ids))
 }

@@ -155,9 +155,8 @@ where
             }
 
             if colls.is_empty() {
-                info!(
-                    "🧾 Bad debt detected: user={:?} has no collateral; queueing debt positions.",
-                    user.account
+                debug!(
+                    "Bad debt detected: user has no collateral; queueing debt positions."
                 );
                 for d in debts {
                     bad_debts.push((idx, d));
@@ -189,10 +188,10 @@ where
 
         if !self.config.should_buy_bad_debt() {
             // Config says we should not buy bad debt; just log and skip.
-            for (idx, pos) in bad_debts {
-                info!(
-                    "⏭️ Skip bad debt (disabled): user={:?} pool={:?} debt={}",
-                    work_users[idx].account, pos.pool_id, pos.debt_amount,
+            for (_idx, pos) in bad_debts {
+                debug!(
+                    "Skip bad debt (disabled): pool={:?} debt={}",
+                    pos.pool_id, pos.debt_amount,
                 );
             }
             return Ok(());
@@ -271,9 +270,9 @@ where
 
             info!(
                 "🧯 Bad debt buy: repay={} {} | profit={} {}",
-                repay_amount.0.to_f64().unwrap() / 10u32.pow(repayment_token.decimals() as u32) as f64,
+                repay_amount.0.to_f64().unwrap_or(f64::MAX) / 10u32.pow(repayment_token.decimals() as u32) as f64,
                 repayment_token.symbol(),
-                profit.0.to_f64().unwrap() / 10u32.pow(repayment_token.decimals() as u32) as f64,
+                profit.0.to_f64().unwrap_or(0.0) / 10u32.pow(repayment_token.decimals() as u32) as f64,
                 repayment_token.symbol()
             );
 
@@ -306,7 +305,7 @@ where
                 },
                 ref_price: 0u32.into(),
                 swap_args: None,
-                expected_profit: profit.0.to_i128().unwrap(),
+                expected_profit: profit.0.to_i128().unwrap_or(i128::MAX),
             });
         }
 
@@ -448,11 +447,10 @@ where
             if self.config.should_buy_bad_debt() && work_users[user_idx].health_factor <= WIPEOUT_THRESHOLD {
                 let desired_repay = debt_position.debt_amount.clone().min(max_balance.clone());
                 if estimation.repaid_debt < desired_repay {
-                    info!(
-                        "🧨 Wipeout bad-debt repay override: {} -> {} for user {}",
+                    debug!(
+                        "Wipeout bad-debt repay override: {} -> {}",
                         estimation.repaid_debt,
                         desired_repay,
-                        work_users[user_idx].account.to_text()
                     );
                     estimation.repaid_debt = desired_repay;
                 }
@@ -501,9 +499,9 @@ where
             let inverse_price = if price > 0.0 { 1.0 / price } else { 0.0 };
             info!(
                 "💱 Quote: repay={} {} | received={} {} | price={} inverse_price={} (collateral={} -> debt={})",
-                estimation.repaid_debt.0.to_f64().unwrap() / 10u32.pow(repayment_token.decimals() as u32) as f64,
+                estimation.repaid_debt.0.to_f64().unwrap_or(f64::MAX) / 10u32.pow(repayment_token.decimals() as u32) as f64,
                 repayment_token.symbol(),
-                amount_received.0.to_f64().unwrap() / 10u32.pow(repayment_token.decimals() as u32) as f64,
+                amount_received.0.to_f64().unwrap_or(f64::MAX) / 10u32.pow(repayment_token.decimals() as u32) as f64,
                 repayment_token.symbol(),
                 price,
                 inverse_price,
@@ -532,7 +530,7 @@ where
 
             info!(
                 "📊 Profit: {} {}",
-                profit.0.to_f64().unwrap() / 10u32.pow(repayment_token.decimals() as u32) as f64,
+                profit.0.to_f64().unwrap_or(0.0) / 10u32.pow(repayment_token.decimals() as u32) as f64,
                 repayment_token.symbol()
             );
 
@@ -573,7 +571,7 @@ where
                 },
                 ref_price: estimation.ref_price,
                 swap_args,
-                expected_profit: profit.0.to_i128().unwrap(),
+                expected_profit: profit.0.to_i128().unwrap_or(i128::MAX),
             });
 
             if estimation.repaid_debt >= debt_position.debt_amount {
@@ -583,7 +581,7 @@ where
             if is_bad_debt && self.config.should_buy_bad_debt() {
                 info!(
                     "🧯 Buying bad debt: repaid={} {}",
-                    estimation.repaid_debt.0.to_f64().unwrap() / 10u32.pow(repayment_token.decimals() as u32) as f64,
+                    estimation.repaid_debt.0.to_f64().unwrap_or(f64::MAX) / 10u32.pow(repayment_token.decimals() as u32) as f64,
                     repayment_token.symbol()
                 );
             }

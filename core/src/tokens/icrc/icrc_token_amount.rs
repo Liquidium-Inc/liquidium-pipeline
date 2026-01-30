@@ -1,5 +1,3 @@
-use std::str::FromStr;
-
 use candid::Nat;
 use num_format::{Locale, ToFormattedString};
 use num_traits::Pow;
@@ -17,8 +15,17 @@ pub struct IcrcTokenAmount {
 #[allow(dead_code)]
 impl IcrcTokenAmount {
     pub fn from_formatted(token: IcrcToken, formatted_value: f64) -> Self {
-        let value = (formatted_value * 10_f64.pow(token.decimals)).to_string();
-        let value = Nat::from_str(&value).unwrap();
+        let scaled = formatted_value * 10_f64.pow(token.decimals);
+        let rounded = scaled.round();
+
+        let value = if rounded.is_nan() || rounded.is_infinite() || rounded < 0.0 {
+            Nat::from(0u8)
+        } else if rounded > u128::MAX as f64 {
+            Nat::from(u128::MAX)
+        } else {
+            Nat::from(rounded as u128)
+        };
+
         Self { token, value }
     }
 

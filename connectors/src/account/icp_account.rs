@@ -106,7 +106,10 @@ where
                     value: amount,
                 };
 
-                let mut cache = self.cache.lock().expect("icp balance cache poisoned");
+                let mut cache = self
+                    .cache
+                    .lock()
+                    .map_err(|_| "icp balance cache poisoned".to_string())?;
                 cache.insert((*ledger, symbol.clone()), (balance.clone(), Instant::now()));
 
                 Ok(balance)

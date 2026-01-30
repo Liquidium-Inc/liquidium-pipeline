@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 use candid::Principal;
 use ic_agent::export::reqwest;
+use log::warn;
 use serde::Serialize;
 use std::{
     collections::HashMap,
@@ -8,6 +9,8 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio::sync::Mutex;
+
+const WATCHDOG_HTTP_TIMEOUT_SECS: u64 = 5;
 
 #[derive(Debug, Clone, Serialize)]
 pub enum WatchdogEvent<'a> {
@@ -37,15 +40,21 @@ pub struct WebhookWatchdog {
 
 impl WebhookWatchdog {
     pub fn new(url: impl Into<String>, cooldown: Duration, principal: Option<Principal>) -> Self {
+        let timeout = Duration::from_secs(WATCHDOG_HTTP_TIMEOUT_SECS);
+        let client = reqwest::Client::builder()
+            .timeout(timeout)
+            .build()
+            .unwrap_or_else(|e| {
+                warn!("Failed to build reqwest client with timeout: {}, using default", e);
+                reqwest::Client::new()
+            });
+
         Self {
             url: url.into(),
             cooldown,
             account: principal,
             last: Mutex::new(HashMap::new()),
-            client: reqwest::Client::builder()
-                .timeout(Duration::from_secs(5))
-                .build()
-                .expect("reqwest client"),
+            client,
         }
     }
 

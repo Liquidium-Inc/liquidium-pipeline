@@ -43,7 +43,7 @@ pub trait DexFinalizerLogic: Send + Sync {
             }
         }
 
-        Err(last_err.expect("at least one attempt was made"))
+        Err(last_err.unwrap_or_else(|| "swap failed with no error".to_string()))
     }
 }
 

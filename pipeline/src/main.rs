@@ -86,7 +86,9 @@ async fn main() {
             run_liquidation_loop().await;
         }
         Commands::Balance => {
-            commands::funds::funds().await.unwrap();
+            if let Err(e) = commands::funds::funds().await {
+                eprintln!("Balance check failed: {}", e);
+            }
         }
         Commands::MexcDepositAddress { asset, network } => {
             if let Err(err) = commands::cex::mexc_deposit_address(asset, network.as_deref()).await {

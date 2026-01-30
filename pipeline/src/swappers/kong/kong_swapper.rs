@@ -19,8 +19,10 @@ use log::{debug, info, warn};
 use liquidium_pipeline_connectors::pipeline_agent::PipelineAgent;
 
 use crate::swappers::kong::kong_types::{SwapAmountsReply, SwapArgs, SwapReply, SwapResult};
+use crate::utils::max_for_ledger;
 
-static DEX_PRINCIPAL: &str = "2ipq2-uqaaa-aaaar-qailq-cai";
+const DEX_PRINCIPAL: &str = "2ipq2-uqaaa-aaaar-qailq-cai";
+const ALLOWANCE_THRESHOLD_DIVISOR: u8 = 2;
 
 pub struct KongSwapSwapper<A: PipelineAgent> {
     pub agent: Arc<A>,
@@ -35,7 +37,7 @@ impl<A: PipelineAgent> KongSwapSwapper<A> {
             agent,
             account_id,
             dex_account: Account {
-                owner: DEX_PRINCIPAL.parse().unwrap(),
+                owner: DEX_PRINCIPAL.parse().expect("invalid DEX_PRINCIPAL"),
                 subaccount: None,
             },
             allowances: Mutex::new(HashMap::new()),
@@ -49,10 +51,13 @@ impl<A: PipelineAgent> KongSwapSwapper<A> {
         };
 
         let owner = self.dex_account.owner;
-        let threshold = max_for_ledger(&ledger) / Nat::from(2u8);
+        let threshold = max_for_ledger(&ledger) / Nat::from(ALLOWANCE_THRESHOLD_DIVISOR);
 
         {
-            let map = self.allowances.lock().expect("allowances mutex poisoned");
+            let map = self
+                .allowances
+                .lock()
+                .map_err(|_| "allowances mutex poisoned".to_string())?;
             if let Some(cached) = map.get(&(ledger, owner))
                 && *cached >= threshold
             {
@@ -71,7 +76,10 @@ impl<A: PipelineAgent> KongSwapSwapper<A> {
             .await;
 
         if allowance >= threshold {
-            let mut map = self.allowances.lock().expect("allowances mutex poisoned");
+            let mut map = self
+                .allowances
+                .lock()
+                .map_err(|_| "allowances mutex poisoned".to_string())?;
             map.insert((ledger, owner), allowance);
             return Ok(false);
         }
@@ -87,7 +95,10 @@ impl<A: PipelineAgent> KongSwapSwapper<A> {
             )
             .await?;
 
-        let mut map = self.allowances.lock().expect("allowances mutex poisoned");
+        let mut map = self
+            .allowances
+            .lock()
+            .map_err(|_| "allowances mutex poisoned".to_string())?;
         map.insert((ledger, owner), approved);
         Ok(true)
     }
@@ -107,7 +118,10 @@ impl<A: PipelineAgent> KongSwapSwapper<A> {
 
         let results = join_all(futures).await;
 
-        let mut map = this.allowances.lock().expect("allowances mutex poisoned");
+        let mut map = this
+            .allowances
+            .lock()
+            .map_err(|_| "allowances mutex poisoned".to_string())?;
         for (token, owner, allowance) in results {
             map.insert((token, owner), allowance);
         }
@@ -137,7 +151,7 @@ impl<A: PipelineAgent> KongSwapSwapper<A> {
                 .unwrap_or_else(|_| "<unknown>".to_string())
         );
 
-        if allowance < max_for_ledger(token) / Nat::from(2u8) {
+        if allowance < max_for_ledger(token) / Nat::from(ALLOWANCE_THRESHOLD_DIVISOR) {
             info!("Allowance low for {}, re-approving…", token);
             allowance = match self
                 .approve(
@@ -170,7 +184,7 @@ impl<A: PipelineAgent> KongSwapSwapper<A> {
         token_out: &ChainToken,
         amount: &ChainTokenAmount,
     ) -> Result<SwapAmountsReply, String> {
-        let dex_principal = Principal::from_str(DEX_PRINCIPAL).unwrap();
+        let dex_principal = Principal::from_str(DEX_PRINCIPAL).expect("invalid DEX_PRINCIPAL");
 
         info!(
             "Fetching swap info for {} {} -> {} ",
@@ -248,7 +262,7 @@ impl<A: PipelineAgent> KongSwapSwapper<A> {
             "[kong] swap request pay={} {} -> {} recv_addr={:?} max_slip={:?}",
             pay_amount, pay_token, receive_token, receive_address, max_slippage
         );
-        let dex_principal = Principal::from_str(DEX_PRINCIPAL).unwrap();
+        let dex_principal = Principal::from_str(DEX_PRINCIPAL).expect("invalid DEX_PRINCIPAL");
         let result = self
             .agent
             .call_update::<SwapResult>(&dex_principal, "swap", swap_args.into())
@@ -256,8 +270,7 @@ impl<A: PipelineAgent> KongSwapSwapper<A> {
             .map_err(|e| {
                 warn!(
                     "[kong] swap call failed pay={} {} -> {} err={}",
-                    pay_amount, pay_token, receive_token,
-                    e
+                    pay_amount, pay_token, receive_token, e
                 );
                 format!("Swap call error: {}", e)
             })?;
@@ -289,7 +302,7 @@ impl<A: PipelineAgent> KongSwapSwapper<A> {
         };
         let args = Encode!(&args).map_err(|e| format!("Encode error: {}", e))?;
 
-        info!("Approving {} on spender {}", ledger, self.dex_account.owner);
+        debug!("Approving {} on DEX spender", ledger);
         let result = self
             .agent
             .call_update::<Result<Nat, ApproveError>>(ledger, "icrc2_approve", args)
@@ -324,26 +337,8 @@ impl<A: PipelineAgent> KongSwapSwapper<A> {
             }
         };
 
-        debug!(
-            "Allowance for {} on {} = {}",
-            ledger, self.dex_account.owner, result.allowance
-        );
+        debug!("Allowance for {} = {}", ledger, result.allowance);
 
         result.allowance
     }
-}
-fn max_for_ledger(token: &Principal) -> Nat {
-    if *token == Principal::from_text("ryjl3-tyaaa-aaaaa-aaaba-cai").unwrap() {
-        return Nat::from(u64::MAX);
-    }
-
-    if *token == Principal::from_text("cngnf-vqaaa-aaaar-qag4q-cai").unwrap() {
-        return Nat::from(340_282_366_920_938_463_463_374_607_431_768_211_455u128);
-    }
-
-    if *token == Principal::from_text("mxzaz-hqaaa-aaaar-qaada-cai").unwrap() {
-        return Nat::from(u64::MAX);
-    }
-
-    Nat::from(0u8)
 }
