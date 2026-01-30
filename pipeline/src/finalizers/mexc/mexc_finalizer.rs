@@ -281,7 +281,10 @@ where
     // the exchange notices the approval without blocking the main liquidation flow.
     async fn maybe_bump_mexc_approval(&self, liq_id: &str, asset: &ChainToken) {
         let already_bumped = {
-            let approve_bumps = self.approve_bumps.lock().expect("approve_bumps mutex poisoned");
+            let Ok(approve_bumps) = self.approve_bumps.lock() else {
+                warn!("[mexc] liq_id={} approve_bumps mutex poisoned, skipping bump", liq_id);
+                return;
+            };
             *approve_bumps.get(liq_id).unwrap_or(&0)
         };
 
@@ -338,8 +341,9 @@ where
         }
 
         if ok {
-            let mut approve_bumps = self.approve_bumps.lock().expect("approve_bumps mutex poisoned");
-            approve_bumps.insert(liq_id.to_string(), 6);
+            if let Ok(mut approve_bumps) = self.approve_bumps.lock() {
+                approve_bumps.insert(liq_id.to_string(), 6);
+            }
         }
     }
 }
