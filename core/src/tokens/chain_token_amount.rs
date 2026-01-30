@@ -1,5 +1,3 @@
-use std::str::FromStr;
-
 use candid::CandidType;
 use candid::Nat;
 
@@ -25,12 +23,14 @@ impl ChainTokenAmount {
     pub fn from_formatted(token: ChainToken, formatted_value: f64) -> Self {
         let decimals = token.decimals() as u32;
         let scale = 10_f64.powi(decimals as i32);
+        let rounded = (formatted_value * scale).round();
 
-        let scaled = (formatted_value * scale).round();
-        let value = if scaled.is_nan() || scaled.is_infinite() || scaled < 0.0 {
+        let value = if rounded.is_nan() || rounded.is_infinite() || rounded < 0.0 {
             Nat::from(0u8)
+        } else if rounded > u128::MAX as f64 {
+            Nat::from(u128::MAX)
         } else {
-            Nat::from_str(&scaled.to_string()).unwrap_or_else(|_| Nat::from(0u8))
+            Nat::from(rounded as u128)
         };
 
         Self { token, value }
