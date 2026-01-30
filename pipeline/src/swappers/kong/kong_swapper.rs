@@ -19,8 +19,10 @@ use log::{debug, info, warn};
 use liquidium_pipeline_connectors::pipeline_agent::PipelineAgent;
 
 use crate::swappers::kong::kong_types::{SwapAmountsReply, SwapArgs, SwapReply, SwapResult};
+use crate::utils::max_for_ledger;
 
-static DEX_PRINCIPAL: &str = "2ipq2-uqaaa-aaaar-qailq-cai";
+const DEX_PRINCIPAL: &str = "2ipq2-uqaaa-aaaar-qailq-cai";
+const ALLOWANCE_THRESHOLD_DIVISOR: u8 = 2;
 
 pub struct KongSwapSwapper<A: PipelineAgent> {
     pub agent: Arc<A>,
@@ -49,7 +51,7 @@ impl<A: PipelineAgent> KongSwapSwapper<A> {
         };
 
         let owner = self.dex_account.owner;
-        let threshold = max_for_ledger(&ledger) / Nat::from(2u8);
+        let threshold = max_for_ledger(&ledger) / Nat::from(ALLOWANCE_THRESHOLD_DIVISOR);
 
         {
             let map = self
@@ -149,7 +151,7 @@ impl<A: PipelineAgent> KongSwapSwapper<A> {
                 .unwrap_or_else(|_| "<unknown>".to_string())
         );
 
-        if allowance < max_for_ledger(token) / Nat::from(2u8) {
+        if allowance < max_for_ledger(token) / Nat::from(ALLOWANCE_THRESHOLD_DIVISOR) {
             info!("Allowance low for {}, re-approving…", token);
             allowance = match self
                 .approve(
@@ -268,8 +270,7 @@ impl<A: PipelineAgent> KongSwapSwapper<A> {
             .map_err(|e| {
                 warn!(
                     "[kong] swap call failed pay={} {} -> {} err={}",
-                    pay_amount, pay_token, receive_token,
-                    e
+                    pay_amount, pay_token, receive_token, e
                 );
                 format!("Swap call error: {}", e)
             })?;
@@ -336,26 +337,8 @@ impl<A: PipelineAgent> KongSwapSwapper<A> {
             }
         };
 
-        debug!(
-            "Allowance for {} = {}",
-            ledger, result.allowance
-        );
+        debug!("Allowance for {} = {}", ledger, result.allowance);
 
         result.allowance
     }
-}
-fn max_for_ledger(token: &Principal) -> Nat {
-    if *token == Principal::from_text("ryjl3-tyaaa-aaaaa-aaaba-cai").expect("invalid ICP ledger principal") {
-        return Nat::from(u64::MAX);
-    }
-
-    if *token == Principal::from_text("cngnf-vqaaa-aaaar-qag4q-cai").expect("invalid ckUSDT ledger principal") {
-        return Nat::from(340_282_366_920_938_463_463_374_607_431_768_211_455u128);
-    }
-
-    if *token == Principal::from_text("mxzaz-hqaaa-aaaar-qaada-cai").expect("invalid ckBTC ledger principal") {
-        return Nat::from(u64::MAX);
-    }
-
-    Nat::from(0u8)
 }

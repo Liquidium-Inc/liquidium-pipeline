@@ -39,6 +39,10 @@ where
 }
 
 const DEFAULT_ORDERBOOK_LIMIT: u32 = 50;
+const APPROVE_BUMP_MAX_COUNT: u8 = 6;
+const APPROVE_BUMP_BATCH_SIZE: u8 = 3;
+const APPROVE_BUMP_DELAY_MS: u64 = 300;
+const APPROVE_BUMP_BATCH_DELAY_SECS: u64 = 3;
 
 #[derive(Debug, Clone)]
 struct TradeLeg {
@@ -288,7 +292,7 @@ where
             *approve_bumps.get(liq_id).unwrap_or(&0)
         };
 
-        if already_bumped >= 6 {
+        if already_bumped >= APPROVE_BUMP_MAX_COUNT {
             debug!(
                 "[mexc] liq_id={} deposit transfer: approve bump already done (count={})",
                 liq_id, already_bumped
@@ -302,13 +306,13 @@ where
             subaccount: None,
         });
         info!(
-            "[mexc] liq_id={} deposit transfer: approve bump 3+3 amount={} asset={}",
-            liq_id, approve_amount, asset
+            "[mexc] liq_id={} deposit transfer: approve bump {}+{} amount={} asset={}",
+            liq_id, APPROVE_BUMP_BATCH_SIZE, APPROVE_BUMP_BATCH_SIZE, approve_amount, asset
         );
 
         let mut ok = true;
-        let short_pause = Duration::from_millis(300);
-        for i in 0..3 {
+        let short_pause = Duration::from_millis(APPROVE_BUMP_DELAY_MS);
+        for i in 0..APPROVE_BUMP_BATCH_SIZE {
             if let Err(err) = self
                 .transfer_service
                 .approve(asset, &spender, approve_amount.clone())
@@ -318,13 +322,13 @@ where
                 info!("[mexc] liq_id={} approve bump failed: {}", liq_id, err);
                 break;
             }
-            if i < 2 {
+            if i < APPROVE_BUMP_BATCH_SIZE - 1 {
                 sleep(short_pause).await;
             }
         }
         if ok {
-            sleep(Duration::from_secs(3)).await;
-            for i in 0..3 {
+            sleep(Duration::from_secs(APPROVE_BUMP_BATCH_DELAY_SECS)).await;
+            for i in 0..APPROVE_BUMP_BATCH_SIZE {
                 if let Err(err) = self
                     .transfer_service
                     .approve(asset, &spender, approve_amount.clone())
@@ -334,7 +338,7 @@ where
                     info!("[mexc] liq_id={} approve bump failed: {}", liq_id, err);
                     break;
                 }
-                if i < 2 {
+                if i < APPROVE_BUMP_BATCH_SIZE - 1 {
                     sleep(short_pause).await;
                 }
             }
@@ -342,7 +346,7 @@ where
 
         if ok {
             if let Ok(mut approve_bumps) = self.approve_bumps.lock() {
-                approve_bumps.insert(liq_id.to_string(), 6);
+                approve_bumps.insert(liq_id.to_string(), APPROVE_BUMP_MAX_COUNT);
             }
         }
     }
