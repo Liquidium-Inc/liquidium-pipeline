@@ -30,7 +30,6 @@ num-traits = { workspace = true }
 anyhow = { workspace = true }
 log = { workspace = true }
 env_logger = { workspace = true }
-ftail = { workspace = true }
 candid = { workspace = true }
 num-format = { workspace = true }
 openssl = { workspace = true }

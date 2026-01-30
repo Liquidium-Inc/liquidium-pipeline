@@ -7,13 +7,12 @@ use indicatif::MultiProgress;
 use indicatif_log_bridge::LogWrapper;
 use liquidium_pipeline_connectors::account::icp_account::{RECOVERY_ACCOUNT, derive_icp_identity};
 use liquidium_pipeline_connectors::crypto::derivation::derive_evm_private_key;
-use log::{LevelFilter, debug};
+use log::debug;
 
 use alloy::signers::local::PrivateKeySigner;
-use ftail::Ftail;
 use std::collections::HashMap;
 use std::env;
-use std::path::PathBuf;
+use std::io::Write;
 
 use std::sync::Arc;
 
@@ -125,71 +124,32 @@ impl Config {
             ".liquidium-pipeline".to_string()
         };
 
-        let log_dir = match env::var("LOG_DIR") {
-            Ok(value) => {
-                let trimmed = value.trim();
-                if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("none") {
-                    None
-                } else {
-                    Some(expand_tilde(trimmed))
-                }
-            }
-            Err(_) => None,
-        };
-        let log_file = match env::var("LOG_FILE") {
-            Ok(value) => {
-                let trimmed = value.trim();
-                if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("none") {
-                    None
-                } else {
-                    Some(expand_tilde(trimmed))
-                }
-            }
-            Err(_) => Some(PathBuf::from(format!("{}/pipeline.log", home))),
-        };
-        let error_log_file = match env::var("ERROR_LOG_FILE") {
-            Ok(value) => {
-                let trimmed = value.trim();
-                if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("none") {
-                    None
-                } else {
-                    Some(expand_tilde(trimmed))
-                }
-            }
-            Err(_) => Some(PathBuf::from(format!("{}/pipeline.error.log", home))),
-        };
+        let log_env = env_logger::Env::default().default_filter_or("info");
+        let mut logger_builder = env_logger::Builder::from_env(log_env);
+        logger_builder.format(|buf, record| {
+            let (color, level) = match record.level() {
+                log::Level::Error => ("\u{1b}[31m", "ERROR"),
+                log::Level::Warn => ("\u{1b}[33m", "WARN"),
+                log::Level::Info => ("\u{1b}[32m", "INFO"),
+                log::Level::Debug => ("\u{1b}[34m", "DEBUG"),
+                log::Level::Trace => ("\u{1b}[35m", "TRACE"),
+            };
+            let reset = "\u{1b}[0m";
 
-        let log_max_mb = env::var("LOG_MAX_MB")
-            .ok()
-            .and_then(|value| value.parse::<u64>().ok())
-            .unwrap_or(50);
-        let log_retention_days = env::var("LOG_RETENTION_DAYS")
-            .ok()
-            .and_then(|value| value.parse::<u64>().ok())
-            .unwrap_or(7);
+            writeln!(
+                buf,
+                "{} {}{:<5}{} {}",
+                buf.timestamp_millis(),
+                color,
+                level,
+                reset,
+                record.args()
+            )
+        });
+        logger_builder.format_target(false);
+        logger_builder.target(env_logger::Target::Stdout);
 
-        let mut logger = Ftail::new()
-            .formatted_console_env_level()
-            .max_file_size(log_max_mb)
-            .retention_days(log_retention_days);
-
-        if let Some(dir) = log_dir {
-            let _ = std::fs::create_dir_all(&dir);
-            logger = logger.daily_file_env_level(&dir);
-        } else if let Some(path) = log_file {
-            if let Some(parent) = path.parent() {
-                let _ = std::fs::create_dir_all(parent);
-            }
-            logger = logger.single_file_env_level(&path, true);
-        }
-
-        if let Some(path) = error_log_file {
-            if let Some(parent) = path.parent() {
-                let _ = std::fs::create_dir_all(parent);
-            }
-            logger = logger.single_file(&path, true, LevelFilter::Warn);
-        }
-
+        let logger = logger_builder.build();
         let multi = MultiProgress::new();
 
         LogWrapper::new(multi.clone(), logger).try_init().unwrap();
