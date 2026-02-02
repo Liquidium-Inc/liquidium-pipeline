@@ -85,12 +85,6 @@ async fn main() {
         let _ = dotenv::from_filename(config_path);
     }
 
-    if let Ok(endpoint) = std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT") {
-        eprintln!("[telemetry] OTLP endpoint: {}", endpoint);
-    } else {
-        eprintln!("[telemetry] OTLP endpoint not set, telemetry disabled");
-    }
-
     let _telemetry_guard = init_telemetry_from_env().expect("Failed to initialize telemetry");
 
     {
