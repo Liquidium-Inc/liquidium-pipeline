@@ -139,7 +139,7 @@ pub fn init_telemetry(config: TelemetryConfig) -> Result<TelemetryGuard, Box<dyn
                 .with(otel_trace_layer)
                 .with(otel_log_layer);
 
-            tracing::subscriber::set_global_default(subscriber).expect("Failed to set tracing subscriber");
+            tracing::subscriber::set_global_default(subscriber)?;
         }
         (Some(tp), None) => {
             let tracer = tp.tracer(config.service_name);
@@ -150,7 +150,7 @@ pub fn init_telemetry(config: TelemetryConfig) -> Result<TelemetryGuard, Box<dyn
                 .with(fmt_layer)
                 .with(otel_trace_layer);
 
-            tracing::subscriber::set_global_default(subscriber).expect("Failed to set tracing subscriber");
+            tracing::subscriber::set_global_default(subscriber)?;
         }
         (None, Some(lp)) => {
             let otel_log_layer = OpenTelemetryTracingBridge::new(lp);
@@ -160,16 +160,16 @@ pub fn init_telemetry(config: TelemetryConfig) -> Result<TelemetryGuard, Box<dyn
                 .with(fmt_layer)
                 .with(otel_log_layer);
 
-            tracing::subscriber::set_global_default(subscriber).expect("Failed to set tracing subscriber");
+            tracing::subscriber::set_global_default(subscriber)?;
         }
         (None, None) => {
             let subscriber = tracing_subscriber::registry().with(env_filter).with(fmt_layer);
 
-            tracing::subscriber::set_global_default(subscriber).expect("Failed to set tracing subscriber");
+            tracing::subscriber::set_global_default(subscriber)?;
         }
     }
 
-    tracing_log::LogTracer::init().expect("Failed to set log tracer");
+    let _ = tracing_log::LogTracer::builder().init();
 
     Ok(TelemetryGuard {
         tracer_provider,
