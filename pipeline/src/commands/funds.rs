@@ -22,19 +22,32 @@ pub async fn funds() -> Result<(), String> {
         "Trader ICP principal",
         ctx.config.trader_principal.to_text()
     );
-    println!(
-        "{: <HEADER_LABEL_WIDTH$}: {}",
-        "Recovery account",
-        ctx.config.get_recovery_account()
-    );
+    let recovery_account = ctx.config.get_recovery_account();
+    if let Some((principal, subaccount)) = recovery_account.to_string().split_once('.') {
+        println!("{: <HEADER_LABEL_WIDTH$}: {}.", "Recovery account", principal);
+        println!("{: <HEADER_LABEL_WIDTH$}  {}", "", subaccount);
+    } else {
+        println!(
+            "{: <HEADER_LABEL_WIDTH$}: {}",
+            "Recovery account",
+            recovery_account
+        );
+    }
     println!("{: <HEADER_LABEL_WIDTH$}: {}\n", "EVM address", ctx.evm_address);
-    println!("Recovery account holds seized collateral from failed swaps.\n");
+    const ANSI_YELLOW: &str = "\x1b[33m";
+    const ANSI_RESET: &str = "\x1b[0m";
+    println!(
+        "{}Recovery account holds seized collateral from failed swaps.{}\n",
+        ANSI_YELLOW, ANSI_RESET
+    );
 
     let asset_ids: Vec<AssetId> = ctx.registry.all().into_iter().map(|(id, _)| id).collect();
 
-    let main_results = ctx.main_service.sync_assets(&asset_ids).await;
-    let trader_results = ctx.trader_service.sync_assets(&asset_ids).await;
-    let recovery_results = ctx.recovery_service.sync_assets(&asset_ids).await;
+    let (main_results, trader_results, recovery_results) = tokio::join!(
+        ctx.main_service.sync_assets(&asset_ids),
+        ctx.trader_service.sync_assets(&asset_ids),
+        ctx.recovery_service.sync_assets(&asset_ids),
+    );
 
     let mut table = Table::new();
     table.set_format(*format::consts::FORMAT_NO_LINESEP_WITH_TITLE);

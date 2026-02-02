@@ -30,9 +30,16 @@ This will:
 - Clone/update the repo to `~/.liquidium-pipeline/repo`
 - Build the liquidator binary in release mode
 - Install it to `~/.local/bin/liquidator`
-- Create `~/.liquidium-pipeline/config.env` if it doesn't exist
+- Create `~/.liquidium-pipeline/config.env` if it doesn't exist (won't overwrite an existing file)
 
 > 💡 Set `SKIP_RUST=true` before running to skip Rust installation if already present.
+
+### Install Script Behavior (No Surprises)
+
+- User-only install (no sudo) that keeps everything under `~/.liquidium-pipeline`
+- Releases are stored in `~/.liquidium-pipeline/releases` and symlinked to `~/.local/bin/liquidator`
+- Re-running the script updates the repo + binary, but **does not overwrite** your existing `config.env`
+- You can customize with env/args: `BRANCH`, `BIN_NAME`, `INSTALL_DIR`, `SKIP_RUST`
 
 ---
 
@@ -42,7 +49,19 @@ The bot loads configuration from (in order of precedence):
 
 1. Environment variables (direct overrides)
 2. `.env` in the current directory (optional overrides)
-3. `~/.config/liquidator/config.env` (user-level defaults)
+3. `~/.liquidium-pipeline/config.env` (user-level defaults)
+
+### Override Rules (How Env "Overwrites" Work)
+
+- Variables already set in your shell **always win**.
+- `.env` overrides `~/.liquidium-pipeline/config.env`.
+- `~/.liquidium-pipeline/config.env` is the default baseline created by the install script.
+
+**One-off override example:**
+
+```bash
+IC_URL=https://icp-api.io liquidator run
+```
 
 ### Core Configuration
 
@@ -56,8 +75,6 @@ EVM_RPC_URL=https://arb1.arbitrum.io/rpc
 
 # Identity
 MNEMONIC_FILE=~/.liquidium-pipeline/wallets/key
-# Or use PEM directly:
-# IDENTITY_PEM=~/.config/liquidator/id.pem
 
 # Assets (comma-separated principal:symbol pairs)
 DEBT_ASSETS=principal1:ckBTC,principal2:ckUSDT,principal3:ICP
@@ -83,6 +100,12 @@ CEX_MEXC_API_KEY=your_api_key
 CEX_MEXC_API_SECRET=your_api_secret
 MAX_ALLOWED_CEX_SLIPPAGE_BPS=200  # 2.00% in basis points
 ```
+
+**Supported swappers:**
+
+- **DEX (Kong)** — `SWAPPER=dex` (uses the Kong canister specified by `KONG_SWAP_BACKEND`)
+- **CEX (MEXC)** — `SWAPPER=cex` (requires `CEX_LIST=mexc` + API credentials)
+- **Hybrid** — `SWAPPER=hybrid` (tries DEX first, falls back to CEX)
 
 ### Storage & Export
 

@@ -49,15 +49,61 @@ fn print_banner() {
     );
 }
 
-fn format_principal_list(items: &[Principal]) -> String {
+fn shorten_middle(value: &str, head: usize, tail: usize) -> String {
+    let len = value.chars().count();
+    if len <= head + tail + 3 {
+        return value.to_string();
+    }
+
+    let head_str: String = value.chars().take(head).collect();
+    let tail_str: String = value.chars().rev().take(tail).collect::<String>().chars().rev().collect();
+    format!("{head_str}...{tail_str}")
+}
+
+fn truncate_with_ellipsis(value: &str, max_chars: usize) -> String {
+    let len = value.chars().count();
+    if len <= max_chars {
+        return value.to_string();
+    }
+
+    let keep = max_chars.saturating_sub(3);
+    let mut truncated: String = value.chars().take(keep).collect();
+    truncated.push_str("...");
+    truncated
+}
+
+fn compact_list(items: &[String], max_items: usize, max_chars: usize) -> String {
     if items.is_empty() {
-        "none".to_string()
+        return "none".to_string();
+    }
+
+    let preview = items.iter().take(max_items).cloned().collect::<Vec<_>>().join(", ");
+    let preview = truncate_with_ellipsis(&preview, max_chars);
+
+    if items.len() > max_items {
+        format!("{preview} (+{} more)", items.len() - max_items)
     } else {
-        items.iter().map(Principal::to_text).collect::<Vec<_>>().join(", ")
+        preview
     }
 }
 
-fn print_startup_table(config: &Config, debt_assets: &[String]) {
+fn format_principal_list(items: &[Principal]) -> String {
+    let shortened = items
+        .iter()
+        .map(|p| {
+            let text = p.to_text();
+            if text.len() <= 16 {
+                text
+            } else {
+                shorten_middle(&text, 6, 4)
+            }
+        })
+        .collect::<Vec<_>>();
+
+    compact_list(&shortened, 3, 80)
+}
+
+fn print_startup_table(config: &Config, debt_assets: &[Principal], collateral_assets: &[Principal]) {
     let mut table = Table::new();
     table.set_format(*format::consts::FORMAT_NO_LINESEP_WITH_TITLE);
     table.set_titles(Row::new(vec![Cell::new("Startup Configuration")]));
@@ -87,12 +133,13 @@ fn print_startup_table(config: &Config, debt_assets: &[String]) {
         Cell::new("Opportunity Filter"),
         Cell::new(&format_principal_list(&config.opportunity_account_filter)),
     ]));
-    let debt_assets_list = if debt_assets.is_empty() {
-        "none".to_string()
-    } else {
-        debt_assets.join(", ")
-    };
+    let debt_assets_list = format_principal_list(debt_assets);
     table.add_row(Row::new(vec![Cell::new("Debt Assets"), Cell::new(&debt_assets_list)]));
+    let collateral_assets_list = format_principal_list(collateral_assets);
+    table.add_row(Row::new(vec![
+        Cell::new("Collateral Assets"),
+        Cell::new(&collateral_assets_list),
+    ]));
 
     table.printstd();
 }
@@ -285,20 +332,35 @@ pub async fn run_liquidation_loop() {
     );
     tokio::spawn(async move { watcher.run().await });
 
-    let debt_assets: Vec<String> = ctx
+    let debt_asset_principals: Vec<Principal> = ctx
         .registry
         .debt_assets()
         .iter()
         .filter_map(|(_, tok)| {
             if let ChainToken::Icp { ledger, .. } = tok {
-                Some(ledger.to_text())
+                Some(*ledger)
             } else {
                 None
             }
         })
         .collect();
 
-    print_startup_table(&config, &debt_assets);
+    let collateral_asset_principals: Vec<Principal> = ctx
+        .registry
+        .collateral_assets()
+        .iter()
+        .filter_map(|(_, tok)| {
+            if let ChainToken::Icp { ledger, .. } = tok {
+                Some(*ledger)
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    let debt_assets: Vec<String> = debt_asset_principals.iter().map(Principal::to_text).collect();
+
+    print_startup_table(&config, &debt_asset_principals, &collateral_asset_principals);
 
     // Setup liquidity monitor
     let liq_dog = account_monitor_watchdog(Duration::from_secs(5), ctx.config.liquidator_principal);
