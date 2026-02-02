@@ -1,16 +1,14 @@
 use alloy::hex::ToHexExt;
+use alloy::signers::local::PrivateKeySigner;
 use candid::Principal;
-
 use ic_agent::Identity;
 use icrc_ledger_types::icrc1::account::Account;
+use liquidium_pipeline_commons::env::config_dir;
 use liquidium_pipeline_connectors::account::icp_account::{RECOVERY_ACCOUNT, derive_icp_identity};
 use liquidium_pipeline_connectors::crypto::derivation::derive_evm_private_key;
 use log::debug;
-
-use alloy::signers::local::PrivateKeySigner;
 use std::collections::HashMap;
 use std::env;
-
 use std::sync::Arc;
 
 fn expand_tilde(p: &str) -> std::path::PathBuf {
@@ -109,17 +107,7 @@ impl ConfigTrait for Config {
 
 impl Config {
     pub async fn load() -> Result<Arc<Self>, String> {
-        // Then load local .env
-        let _ = dotenv::dotenv();
-
-        // Load $HOME/.liquidium-pipeline/config.env
-        let home = if let Ok(home) = env::var("HOME") {
-            let config_path = format!("{}/.liquidium-pipeline/config.env", home);
-            let _ = dotenv::from_filename(config_path);
-            format!("{}/.liquidium-pipeline", home)
-        } else {
-            ".liquidium-pipeline".to_string()
-        };
+        let home = config_dir();
 
         let ic_url = env::var("IC_URL").map_err(|_| "IC_URL not configured".to_string())?;
         let export_path = env::var("EXPORT_PATH").unwrap_or("executions.csv".to_string());

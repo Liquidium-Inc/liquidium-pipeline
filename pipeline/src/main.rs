@@ -14,6 +14,7 @@ mod wal;
 mod utils;
 mod watchdog;
 use clap::{Parser, Subcommand};
+use liquidium_pipeline_commons::env::load_env;
 use liquidium_pipeline_commons::telemetry::init_telemetry_from_env;
 
 use crate::commands::liquidation_loop::run_liquidation_loop;
@@ -79,12 +80,7 @@ enum AccountCommands {
 
 #[tokio::main]
 async fn main() {
-    let _ = dotenv::dotenv();
-    if let Ok(home) = std::env::var("HOME") {
-        let config_path = format!("{}/.liquidium-pipeline/config.env", home);
-        let _ = dotenv::from_filename(config_path);
-    }
-
+    load_env();
     let _telemetry_guard = init_telemetry_from_env().expect("Failed to initialize telemetry");
 
     {
