@@ -14,8 +14,8 @@ const DEFAULT_SERVICE_NAME: &str = "liquidium-pipeline";
 
 pub struct TelemetryConfig {
     pub service_name: String,
-    pub otlp_endpoint: Option<String>,
-    pub loki_endpoint: Option<String>,
+    pub traces_endpoint: Option<String>,
+    pub logs_endpoint: Option<String>,
     pub auth_header: Option<String>,
 }
 
@@ -23,8 +23,8 @@ impl Default for TelemetryConfig {
     fn default() -> Self {
         Self {
             service_name: DEFAULT_SERVICE_NAME.to_string(),
-            otlp_endpoint: None,
-            loki_endpoint: None,
+            traces_endpoint: None,
+            logs_endpoint: None,
             auth_header: None,
         }
     }
@@ -36,13 +36,13 @@ impl TelemetryConfig {
         self
     }
 
-    pub fn with_otlp_endpoint(mut self, endpoint: impl Into<String>) -> Self {
-        self.otlp_endpoint = Some(endpoint.into());
+    pub fn with_traces_endpoint(mut self, endpoint: impl Into<String>) -> Self {
+        self.traces_endpoint = Some(endpoint.into());
         self
     }
 
-    pub fn with_loki_endpoint(mut self, endpoint: impl Into<String>) -> Self {
-        self.loki_endpoint = Some(endpoint.into());
+    pub fn with_logs_endpoint(mut self, endpoint: impl Into<String>) -> Self {
+        self.logs_endpoint = Some(endpoint.into());
         self
     }
 
@@ -83,7 +83,7 @@ pub fn init_telemetry(config: TelemetryConfig) -> Result<TelemetryGuard, Box<dyn
 
     let resource = Resource::new([KeyValue::new("service.name", config.service_name.clone())]);
 
-    let tracer_provider = if let Some(endpoint) = &config.otlp_endpoint {
+    let tracer_provider = if let Some(endpoint) = &config.traces_endpoint {
         let mut headers = std::collections::HashMap::new();
         if let Some(auth) = &config.auth_header {
             headers.insert("Authorization".to_string(), auth.clone());
@@ -91,7 +91,7 @@ pub fn init_telemetry(config: TelemetryConfig) -> Result<TelemetryGuard, Box<dyn
 
         let span_exporter = SpanExporter::builder()
             .with_http()
-            .with_endpoint(format!("{}/v1/traces", endpoint))
+            .with_endpoint(endpoint)
             .with_headers(headers)
             .build()?;
 
@@ -105,7 +105,7 @@ pub fn init_telemetry(config: TelemetryConfig) -> Result<TelemetryGuard, Box<dyn
         None
     };
 
-    let logger_provider = if let Some(endpoint) = &config.loki_endpoint {
+    let logger_provider = if let Some(endpoint) = &config.logs_endpoint {
         let mut headers = std::collections::HashMap::new();
         if let Some(auth) = &config.auth_header {
             headers.insert("Authorization".to_string(), auth.clone());
@@ -179,14 +179,14 @@ pub fn init_telemetry(config: TelemetryConfig) -> Result<TelemetryGuard, Box<dyn
 
 pub fn init_telemetry_from_env() -> Result<TelemetryGuard, Box<dyn std::error::Error>> {
     let service_name = std::env::var("OTEL_SERVICE_NAME").unwrap_or_else(|_| DEFAULT_SERVICE_NAME.to_string());
-    let otlp_endpoint = std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT").ok();
-    let loki_endpoint = std::env::var("OTEL_EXPORTER_OTLP_LOGS_ENDPOINT").ok();
+    let traces_endpoint = std::env::var("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT").ok();
+    let logs_endpoint = std::env::var("OTEL_EXPORTER_OTLP_LOGS_ENDPOINT").ok();
     let auth_header = std::env::var("OTEL_EXPORTER_AUTH").ok();
 
     let config = TelemetryConfig {
         service_name,
-        otlp_endpoint,
-        loki_endpoint,
+        traces_endpoint,
+        logs_endpoint,
         auth_header,
     };
 
