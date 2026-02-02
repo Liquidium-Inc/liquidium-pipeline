@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use candid::{Encode, Principal};
-use log::{info, warn};
+use tracing::{info, warn};
 use num_traits::ToPrimitive;
 use tokio::time::sleep;
 use tracing::instrument;

@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use candid::Encode;
 
 use futures::{TryFutureExt, future::join_all};
-use log::{debug, info, warn};
+use tracing::{debug, info, warn};
 use serde::{Deserialize, Serialize};
 use tracing::instrument;
 

@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use candid::{Encode, Principal};
-use log::{debug, info, warn};
+use tracing::{debug, info, warn};
 
 use crate::finalizers::finalizer::{Finalizer, FinalizerResult};
 use crate::finalizers::liquidation_outcome::LiquidationOutcome;

@@ -14,7 +14,7 @@ use crate::{
     wal::liq_id_from_receipt,
 };
 
-use log::info;
+use tracing::info;
 use num_traits::ToPrimitive;
 use tracing::instrument;
 
