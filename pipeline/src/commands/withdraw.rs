@@ -274,14 +274,15 @@ pub async fn withdraw() {
             let amount_native = match token {
                 ChainToken::Icp { ledger, .. } => {
                     let fee = fetch_icrc1_fee(agent.clone(), *ledger).await;
-                    let send_amount = bal.value.clone().0.to_u128().unwrap_or(0).saturating_sub(
-                        fee.0.to_u128().unwrap_or(0),
-                    );
+                    let send_amount = bal
+                        .value
+                        .clone()
+                        .0
+                        .to_u128()
+                        .unwrap_or(0)
+                        .saturating_sub(fee.0.to_u128().unwrap_or(0));
                     if send_amount == 0 {
-                        println!(
-                            "Skipping {}: balance too low to cover fee.",
-                            id.symbol
-                        );
+                        println!("Skipping {}: balance too low to cover fee.", id.symbol);
                         continue;
                     }
                     Nat::from(send_amount)
@@ -312,9 +313,11 @@ pub async fn withdraw() {
                 ChainToken::Icp { ledger, .. } => {
                     let bal_native = bal_opt.map(|b| b.value.clone()).unwrap_or(0u8.into());
                     let fee = fetch_icrc1_fee(agent.clone(), *ledger).await;
-                    let send_amount = bal_native.0.to_u128().unwrap_or(0).saturating_sub(
-                        fee.0.to_u128().unwrap_or(0),
-                    );
+                    let send_amount = bal_native
+                        .0
+                        .to_u128()
+                        .unwrap_or(0)
+                        .saturating_sub(fee.0.to_u128().unwrap_or(0));
                     if send_amount == 0 {
                         println!("Not enough balance to cover fee; aborting.");
                         return;

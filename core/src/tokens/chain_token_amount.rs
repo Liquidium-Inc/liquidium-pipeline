@@ -63,6 +63,4 @@ impl ChainTokenAmount {
         let scale = 10u128.pow(decimals);
         (raw as f64) / (scale as f64)
     }
-
-    
 }

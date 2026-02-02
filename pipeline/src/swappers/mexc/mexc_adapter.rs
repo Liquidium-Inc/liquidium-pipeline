@@ -614,8 +614,8 @@ impl CexBackend for MexcClient {
             return Err("no asks".into());
         }
 
-        let mut remaining = Decimal::from_f64_retain(amount_in)
-            .ok_or_else(|| "could not convert amount to Decimal".to_string())?;
+        let mut remaining =
+            Decimal::from_f64_retain(amount_in).ok_or_else(|| "could not convert amount to Decimal".to_string())?;
         let mut cost = Decimal::ZERO;
 
         for level in asks {

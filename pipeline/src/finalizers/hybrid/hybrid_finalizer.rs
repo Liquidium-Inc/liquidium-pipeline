@@ -104,7 +104,7 @@ where
         let pay_scale = 10f64.powi(swap_req.pay_amount.token.decimals() as i32);
         let pay_amount_units = pay_amount / pay_scale;
         let est_value_usd = pay_amount_units * ref_price_f64;
-        
+
         if est_value_usd < 2.0 {
             info!("[hybrid] 🟩 routing to kong (value_usd={:.4} < 2.00)", est_value_usd);
             let mut res = self.finalize_via_dex(wal, receipt).await?;

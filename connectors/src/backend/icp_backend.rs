@@ -157,6 +157,6 @@ impl<A: PipelineAgent> IcpBackend for IcpBackendImpl<A> {
     }
 
     async fn icrc1_fee(&self, ledger: Principal) -> Result<Nat, String> {
-          self.query::<Nat>(ledger, "icrc1_fee", ()).await
+        self.query::<Nat>(ledger, "icrc1_fee", ()).await
     }
 }
