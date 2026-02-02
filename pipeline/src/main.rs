@@ -83,12 +83,6 @@ async fn main() {
     load_env();
     let _telemetry_guard = init_telemetry_from_env().expect("Failed to initialize telemetry");
 
-    {
-        let span = tracing::info_span!("main_startup", version = env!("CARGO_PKG_VERSION"));
-        let _enter = span.enter();
-        tracing::info!("Liquidator starting");
-    }
-
     let cli = Cli::parse();
 
     match &cli.command {

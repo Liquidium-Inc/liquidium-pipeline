@@ -3791,6 +3791,7 @@ dependencies = [
  "num-traits",
  "serde",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -3808,6 +3809,7 @@ dependencies = [
  "num-format",
  "num-traits",
  "serde",
+ "tracing",
 ]
 
 [[package]]

@@ -5,6 +5,7 @@ use candid::{Encode, Principal};
 use log::{info, warn};
 use num_traits::ToPrimitive;
 use tokio::time::sleep;
+use tracing::instrument;
 
 use crate::persistance::{LiqMetaWrapper, LiqResultRecord, ResultStatus, WalStore};
 use crate::stages::executor::ExecutionReceipt;
@@ -81,6 +82,7 @@ where
         Ok(())
     }
 
+    #[instrument(name = "settlement.process_row", skip_all, err, fields(row_id = %row.id))]
     async fn process_row(&self, row: LiqResultRecord) -> Result<(), String> {
         let meta = decode_receipt_wrapper(&row)?
             .ok_or_else(|| format!("receipt not found in WAL meta_json for {}", row.id))?;
