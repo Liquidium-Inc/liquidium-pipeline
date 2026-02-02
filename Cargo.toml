@@ -25,11 +25,11 @@ thiserror = "2.0.17"
 hex = "0.4.3"
 
 # Telemetry
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-tracing-opentelemetry = "0.28"
-tracing-log = "0.2"
-opentelemetry = "0.27"
-opentelemetry_sdk = { version = "0.27", features = ["rt-tokio", "logs"] }
-opentelemetry-otlp = { version = "0.27", features = ["grpc-tonic", "http-proto", "reqwest-client", "logs"] }
-opentelemetry-appender-tracing = "0.27"
+tracing = { version = "0.1.44", features = ["attributes"] }
+tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
+tracing-opentelemetry = "0.32.1"
+tracing-log = "0.2.0"
+opentelemetry = "0.31.0"
+opentelemetry_sdk = { version = "0.31.0", features = ["rt-tokio", "logs"] }
+opentelemetry-otlp = { version = "0.31.0", features = ["grpc-tonic", "http-proto", "reqwest-blocking-client", "logs"] }
+opentelemetry-appender-tracing = "0.31.1"

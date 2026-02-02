@@ -14,8 +14,8 @@ use crate::{
     wal::liq_id_from_receipt,
 };
 
-use tracing::info;
 use num_traits::ToPrimitive;
+use tracing::info;
 use tracing::instrument;
 
 pub struct HybridFinalizer<C>

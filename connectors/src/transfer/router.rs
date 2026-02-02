@@ -38,12 +38,7 @@ where
     }
 
     #[instrument(name = "transfer_router.approve", skip_all, err, fields(token = %token.symbol()))]
-    async fn approve(
-        &self,
-        token: &ChainToken,
-        spender: &ChainAccount,
-        amount_native: Nat,
-    ) -> Result<String, String> {
+    async fn approve(&self, token: &ChainToken, spender: &ChainAccount, amount_native: Nat) -> Result<String, String> {
         match token {
             ChainToken::Icp { .. } => self.icp.approve(token, spender, amount_native).await,
             ChainToken::EvmNative { .. } | ChainToken::EvmErc20 { .. } => {

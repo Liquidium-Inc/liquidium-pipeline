@@ -2,10 +2,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use candid::{Encode, Principal};
-use tracing::{info, warn};
 use num_traits::ToPrimitive;
 use tokio::time::sleep;
 use tracing::instrument;
+use tracing::{info, warn};
 
 use crate::persistance::{LiqMetaWrapper, LiqResultRecord, ResultStatus, WalStore};
 use crate::stages::executor::ExecutionReceipt;

@@ -2,10 +2,10 @@ use candid::Principal;
 use icrc_ledger_types::icrc1::account::Account;
 use indicatif::{ProgressBar, ProgressStyle};
 
-use tracing::{info, warn};
 use prettytable::{Cell, Row, Table, format};
 use std::{sync::Arc, thread::sleep, time::Duration};
-use tracing::{instrument, Instrument, info_span};
+use tracing::{Instrument, info_span, instrument};
+use tracing::{info, warn};
 
 use crate::{
     config::{Config, ConfigTrait, SwapperMode},

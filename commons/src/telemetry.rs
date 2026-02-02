@@ -1,10 +1,9 @@
-use opentelemetry::KeyValue;
 use opentelemetry::trace::TracerProvider as _;
 use opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge;
 use opentelemetry_otlp::{LogExporter, SpanExporter, WithExportConfig, WithHttpConfig};
 use opentelemetry_sdk::Resource;
-use opentelemetry_sdk::logs::LoggerProvider;
-use opentelemetry_sdk::trace::TracerProvider;
+use opentelemetry_sdk::logs::SdkLoggerProvider;
+use opentelemetry_sdk::trace::SdkTracerProvider;
 use tracing_opentelemetry::OpenTelemetryLayer;
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::fmt;
@@ -53,8 +52,8 @@ impl TelemetryConfig {
 }
 
 pub struct TelemetryGuard {
-    tracer_provider: Option<TracerProvider>,
-    logger_provider: Option<LoggerProvider>,
+    tracer_provider: Option<SdkTracerProvider>,
+    logger_provider: Option<SdkLoggerProvider>,
 }
 
 impl Drop for TelemetryGuard {
@@ -81,7 +80,9 @@ pub fn init_telemetry(config: TelemetryConfig) -> Result<TelemetryGuard, Box<dyn
         .with_file(false)
         .with_line_number(false);
 
-    let resource = Resource::new([KeyValue::new("service.name", config.service_name.clone())]);
+    let resource = Resource::builder()
+        .with_service_name(config.service_name.clone())
+        .build();
 
     let tracer_provider = if let Some(endpoint) = &config.traces_endpoint {
         let mut headers = std::collections::HashMap::new();
@@ -95,9 +96,9 @@ pub fn init_telemetry(config: TelemetryConfig) -> Result<TelemetryGuard, Box<dyn
             .with_headers(headers)
             .build()?;
 
-        let tracer_provider = TracerProvider::builder()
+        let tracer_provider = SdkTracerProvider::builder()
             .with_resource(resource.clone())
-            .with_batch_exporter(span_exporter, opentelemetry_sdk::runtime::Tokio)
+            .with_batch_exporter(span_exporter)
             .build();
 
         Some(tracer_provider)
@@ -117,9 +118,9 @@ pub fn init_telemetry(config: TelemetryConfig) -> Result<TelemetryGuard, Box<dyn
             .with_headers(headers)
             .build()?;
 
-        let logger_provider = LoggerProvider::builder()
+        let logger_provider = SdkLoggerProvider::builder()
             .with_resource(resource)
-            .with_batch_exporter(log_exporter, opentelemetry_sdk::runtime::Tokio)
+            .with_batch_exporter(log_exporter)
             .build();
 
         Some(logger_provider)
@@ -150,7 +151,7 @@ pub fn init_telemetry(config: TelemetryConfig) -> Result<TelemetryGuard, Box<dyn
                 .with(fmt_layer)
                 .with(otel_trace_layer);
 
-            tracing::subscriber::set_global_default(subscriber)?;
+            tracing::subscriber::set_global_default(subscriber)?
         }
         (None, Some(lp)) => {
             let otel_log_layer = OpenTelemetryTracingBridge::new(lp);
