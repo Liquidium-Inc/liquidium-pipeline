@@ -281,6 +281,7 @@ mod tests {
             collateral_asset,
             expected_profit: 0,
             ref_price: Nat::from(0u8),
+            debt_approval_needed: false,
         }
     }
 

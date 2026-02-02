@@ -35,6 +35,8 @@ pub struct CexState {
     pub deposit_asset: ChainToken,
     pub deposit_txid: Option<String>,
     pub deposit_balance_before: Option<f64>,
+    #[serde(default)]
+    pub approval_bump_count: Option<u32>,
 
     // trade leg
     pub market: String,
@@ -328,6 +330,7 @@ mod tests {
                 deposit_asset: pay.clone(),
                 deposit_txid: None,
                 deposit_balance_before: None,
+                approval_bump_count: None,
 
                 market: "CKBTC_BTC".to_string(),
                 side: "sell".to_string(),
@@ -388,6 +391,7 @@ mod tests {
                 exec_price: 0.0,
                 slippage: 0.0,
                 legs: vec![],
+                approval_count: None,
                 ts: 0,
             })
         }
@@ -432,6 +436,7 @@ mod tests {
             collateral_asset: pay_token.clone(),
             expected_profit: 0,
             ref_price: Nat::from(0u8),
+            debt_approval_needed: false,
         };
 
         let liq_result = LiquidationResult {

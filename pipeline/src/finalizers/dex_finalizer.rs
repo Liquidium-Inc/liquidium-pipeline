@@ -9,9 +9,9 @@ use crate::{
 };
 
 // Tunables
-const BASE_SLIPPAGE_BPS: u32 = 7500; // 0.75%
-const STEP_SLIPPAGE_BPS: u32 = 5000; // +0.5% per retry
-const MAX_SLIPPAGE_BPS: u32 = 50000; // 5.0% cap
+const BASE_SLIPPAGE_BPS: u32 = 125; // 1.25%
+const STEP_SLIPPAGE_BPS: u32 = 50; // +0.5% per retry
+const MAX_SLIPPAGE_BPS: u32 = 500; // 5.0% cap
 const MAX_SLIPPAGE_RETRIES: u32 = 3; // total attempts = MAX_SLIPPAGE_RETRIES + 1
 
 fn slippage_for_retry(retry: u32, explicit: Option<u32>) -> u32 {

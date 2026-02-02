@@ -12,3 +12,4 @@ pub mod watchdog;
 pub mod context;
 pub mod config;
 pub mod wal;
+pub mod approval_state;

@@ -11,6 +11,7 @@ mod stages;
 mod wal;
 pub mod swappers;
 
+mod approval_state;
 mod utils;
 mod watchdog;
 use clap::{Parser, Subcommand};

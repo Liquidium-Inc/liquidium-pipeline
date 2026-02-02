@@ -13,23 +13,31 @@ use log::{debug, info, warn};
 
 use liquidium_pipeline_connectors::pipeline_agent::PipelineAgent;
 
-use crate::{persistance::WalStore, utils::max_for_ledger};
+use crate::{approval_state::ApprovalState, persistance::WalStore, utils::max_for_ledger};
 
 pub struct BasicExecutor<A: PipelineAgent, D: WalStore + Sync + Send> {
     pub agent: Arc<A>,
     pub account_id: Account,
     pub lending_canister: Principal,
     pub wal: Arc<D>,
+    pub approval_state: Arc<ApprovalState>,
     pub allowances: HashMap<(Principal, Principal), Nat>,
 }
 
 impl<A: PipelineAgent, D: WalStore> BasicExecutor<A, D> {
-    pub fn new(agent: Arc<A>, account_id: Account, lending_canister: Principal, wal: Arc<D>) -> Self {
+    pub fn new(
+        agent: Arc<A>,
+        account_id: Account,
+        lending_canister: Principal,
+        wal: Arc<D>,
+        approval_state: Arc<ApprovalState>,
+    ) -> Self {
         Self {
             agent,
             account_id,
             lending_canister,
             wal,
+            approval_state,
             allowances: HashMap::new(),
         }
     }
@@ -59,6 +67,35 @@ impl<A: PipelineAgent, D: WalStore> BasicExecutor<A, D> {
         Ok(())
     }
 
+    pub async fn refresh_allowances(&self, tokens: &[Principal]) -> Result<(), String> {
+        let spender = self.lending_canister;
+        let this = self;
+
+        let futures = tokens.iter().map(|token| {
+            let token = *token;
+
+            async move {
+                let lending_allowance = this
+                    .allowance(
+                        &token,
+                        Account {
+                            owner: spender,
+                            subaccount: None,
+                        },
+                    )
+                    .await;
+                (token, spender, lending_allowance)
+            }
+        });
+
+        let results = join_all(futures).await;
+        for (token, spender, lending_allowance) in results {
+            self.approval_state.set_allowance(token, spender, lending_allowance);
+        }
+
+        Ok(())
+    }
+
     async fn check_allowance(&self, token: &Principal, spender: &Principal) -> Nat {
         let mut allowance = self
             .allowance(
@@ -69,6 +106,7 @@ impl<A: PipelineAgent, D: WalStore> BasicExecutor<A, D> {
                 },
             )
             .await;
+        self.approval_state.set_allowance(*token, *spender, allowance.clone());
         debug!("Current allowance for {}: {}", token, allowance);
 
         if allowance < max_for_ledger(token) / Nat::from(2u8) {
@@ -85,6 +123,7 @@ impl<A: PipelineAgent, D: WalStore> BasicExecutor<A, D> {
             {
                 Ok(a) => {
                     debug!("Approved {} => {}", token, a);
+                    self.approval_state.set_allowance(*token, *spender, a.clone());
                     a
                 }
                 Err(e) => {

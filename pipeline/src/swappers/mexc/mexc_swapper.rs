@@ -244,6 +244,7 @@ impl<C: CexBackend> SwapVenue for MexcSwapVenue<C> {
             slippage: 0.0,
 
             legs: vec![leg],
+            approval_count: None,
             ts: 0, // populate from clock if needed
         })
     }

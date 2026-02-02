@@ -155,6 +155,7 @@ where
 #[cfg(test)]
 mod tests {
     use crate::swappers::router::SwapVenue;
+    use crate::approval_state::ApprovalState;
     use candid::{Decode, Nat, Principal};
     use ic_agent::Agent;
     use icrc_ledger_types::icrc1::account::Account;
@@ -282,6 +283,7 @@ mod tests {
                 owner: Principal::anonymous(),
                 subaccount: None,
             },
+            Arc::new(ApprovalState::new()),
         ));
         let venue = KongVenue::new(swapper, vec![token_in, token_out]);
 
@@ -357,6 +359,7 @@ mod tests {
                 owner: Principal::anonymous(),
                 subaccount: None,
             },
+            Arc::new(ApprovalState::new()),
         ));
         let venue = KongVenue::new(swapper, vec![token_in, token_out]);
 

@@ -115,6 +115,7 @@ impl From<KongSwapReply> for SwapExecution {
             exec_price: r.price,
             slippage: r.slippage,
             legs,
+            approval_count: None,
             ts: r.ts,
         }
     }

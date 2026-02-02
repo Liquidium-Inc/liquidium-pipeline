@@ -49,61 +49,7 @@ fn print_banner() {
     );
 }
 
-fn shorten_middle(value: &str, head: usize, tail: usize) -> String {
-    let len = value.chars().count();
-    if len <= head + tail + 3 {
-        return value.to_string();
-    }
-
-    let head_str: String = value.chars().take(head).collect();
-    let tail_str: String = value.chars().rev().take(tail).collect::<String>().chars().rev().collect();
-    format!("{head_str}...{tail_str}")
-}
-
-fn truncate_with_ellipsis(value: &str, max_chars: usize) -> String {
-    let len = value.chars().count();
-    if len <= max_chars {
-        return value.to_string();
-    }
-
-    let keep = max_chars.saturating_sub(3);
-    let mut truncated: String = value.chars().take(keep).collect();
-    truncated.push_str("...");
-    truncated
-}
-
-fn compact_list(items: &[String], max_items: usize, max_chars: usize) -> String {
-    if items.is_empty() {
-        return "none".to_string();
-    }
-
-    let preview = items.iter().take(max_items).cloned().collect::<Vec<_>>().join(", ");
-    let preview = truncate_with_ellipsis(&preview, max_chars);
-
-    if items.len() > max_items {
-        format!("{preview} (+{} more)", items.len() - max_items)
-    } else {
-        preview
-    }
-}
-
-fn format_principal_list(items: &[Principal]) -> String {
-    let shortened = items
-        .iter()
-        .map(|p| {
-            let text = p.to_text();
-            if text.len() <= 16 {
-                text
-            } else {
-                shorten_middle(&text, 6, 4)
-            }
-        })
-        .collect::<Vec<_>>();
-
-    compact_list(&shortened, 3, 80)
-}
-
-fn print_startup_table(config: &Config, debt_assets: &[Principal], collateral_assets: &[Principal]) {
+fn print_startup_table(config: &Config) {
     let mut table = Table::new();
     table.set_format(*format::consts::FORMAT_NO_LINESEP_WITH_TITLE);
     table.set_titles(Row::new(vec![Cell::new("Startup Configuration")]));
@@ -128,17 +74,6 @@ fn print_startup_table(config: &Config, debt_assets: &[Principal], collateral_as
     table.add_row(Row::new(vec![
         Cell::new("Buy Bad Debt"),
         Cell::new(&config.buy_bad_debt.to_string()),
-    ]));
-    table.add_row(Row::new(vec![
-        Cell::new("Opportunity Filter"),
-        Cell::new(&format_principal_list(&config.opportunity_account_filter)),
-    ]));
-    let debt_assets_list = format_principal_list(debt_assets);
-    table.add_row(Row::new(vec![Cell::new("Debt Assets"), Cell::new(&debt_assets_list)]));
-    let collateral_assets_list = format_principal_list(collateral_assets);
-    table.add_row(Row::new(vec![
-        Cell::new("Collateral Assets"),
-        Cell::new(&collateral_assets_list),
     ]));
 
     table.printstd();
@@ -183,6 +118,7 @@ async fn init(
         },
         config.lending_canister,
         db.clone(),
+        ctx.approval_state.clone(),
     );
 
     executor
@@ -259,6 +195,7 @@ async fn init(
         ctx.swap_router.clone(),
         collateral_service.clone(),
         ctx.main_service.clone(),
+        ctx.approval_state.clone(),
     )
     .with_watchdog(wd);
 
@@ -345,22 +282,9 @@ pub async fn run_liquidation_loop() {
         })
         .collect();
 
-    let collateral_asset_principals: Vec<Principal> = ctx
-        .registry
-        .collateral_assets()
-        .iter()
-        .filter_map(|(_, tok)| {
-            if let ChainToken::Icp { ledger, .. } = tok {
-                Some(*ledger)
-            } else {
-                None
-            }
-        })
-        .collect();
-
     let debt_assets: Vec<String> = debt_asset_principals.iter().map(Principal::to_text).collect();
 
-    print_startup_table(&config, &debt_asset_principals, &collateral_asset_principals);
+    print_startup_table(&config);
 
     // Setup liquidity monitor
     let liq_dog = account_monitor_watchdog(Duration::from_secs(5), ctx.config.liquidator_principal);
@@ -430,6 +354,9 @@ pub async fn run_liquidation_loop() {
 
         // Send liquidity monitor heart beat
         let _ = liq_dog.notify(WatchdogEvent::Heartbeat { stage: "Running" }).await;
+        if let Err(err) = executor.refresh_allowances(&debt_asset_principals).await {
+            warn!("Failed to refresh lending allowances: {}", err);
+        }
         sleep(Duration::from_secs(5));
     }
 }

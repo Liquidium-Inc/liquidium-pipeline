@@ -39,10 +39,11 @@ where
 }
 
 const DEFAULT_ORDERBOOK_LIMIT: u32 = 50;
-const APPROVE_BUMP_MAX_COUNT: u8 = 6;
+pub const APPROVE_BUMP_MAX_COUNT: u8 = 6;
 const APPROVE_BUMP_BATCH_SIZE: u8 = 3;
 const APPROVE_BUMP_DELAY_MS: u64 = 300;
 const APPROVE_BUMP_BATCH_DELAY_SECS: u64 = 3;
+pub const MEXC_DEPOSIT_FEE_MULTIPLIER: u8 = 7;
 
 #[derive(Debug, Clone)]
 struct TradeLeg {
@@ -283,11 +284,11 @@ where
 
     // MEXC approvals are flaky; we send a burst of tiny approvals to increase the chance
     // the exchange notices the approval without blocking the main liquidation flow.
-    async fn maybe_bump_mexc_approval(&self, liq_id: &str, asset: &ChainToken) {
+    async fn maybe_bump_mexc_approval(&self, liq_id: &str, asset: &ChainToken) -> u32 {
         let already_bumped = {
             let Ok(approve_bumps) = self.approve_bumps.lock() else {
                 warn!("[mexc] liq_id={} approve_bumps mutex poisoned, skipping bump", liq_id);
-                return;
+                return 0;
             };
             *approve_bumps.get(liq_id).unwrap_or(&0)
         };
@@ -297,7 +298,7 @@ where
                 "[mexc] liq_id={} deposit transfer: approve bump already done (count={})",
                 liq_id, already_bumped
             );
-            return;
+            return 0;
         }
 
         let approve_amount = Nat::from(1u8);
@@ -311,6 +312,7 @@ where
         );
 
         let mut ok = true;
+        let mut approved_count: u32 = 0;
         let short_pause = Duration::from_millis(APPROVE_BUMP_DELAY_MS);
         for i in 0..APPROVE_BUMP_BATCH_SIZE {
             if let Err(err) = self
@@ -322,6 +324,7 @@ where
                 info!("[mexc] liq_id={} approve bump failed: {}", liq_id, err);
                 break;
             }
+            approved_count += 1;
             if i < APPROVE_BUMP_BATCH_SIZE - 1 {
                 sleep(short_pause).await;
             }
@@ -338,6 +341,7 @@ where
                     info!("[mexc] liq_id={} approve bump failed: {}", liq_id, err);
                     break;
                 }
+                approved_count += 1;
                 if i < APPROVE_BUMP_BATCH_SIZE - 1 {
                     sleep(short_pause).await;
                 }
@@ -349,6 +353,7 @@ where
                 approve_bumps.insert(liq_id.to_string(), APPROVE_BUMP_MAX_COUNT);
             }
         }
+        approved_count
     }
 }
 
@@ -379,6 +384,7 @@ where
             deposit_asset: receipt.request.collateral_asset.clone(),
             deposit_txid: None,
             deposit_balance_before: None,
+            approval_bump_count: None,
 
             // trade leg
             market: format!(
@@ -445,7 +451,7 @@ where
             );
 
             let amount = &state.size_in;
-            let fee = state.deposit_asset.fee() * 7u8; // TODO: Remove after mexc handles deposit confirations
+            let fee = state.deposit_asset.fee() * MEXC_DEPOSIT_FEE_MULTIPLIER; // TODO: Remove after mexc handles deposit confirations
             let fee_amount = ChainTokenAmount::from_raw(state.deposit_asset.clone(), fee.clone());
             if state.deposit_asset.symbol().eq_ignore_ascii_case("ckusdt") {
                 info!("[mexc] liq_id={} ckUSDT fee={}", state.liq_id, fee_amount.formatted());
@@ -499,7 +505,12 @@ where
             debug!("[mexc] liq_id={} sent deposit txid={}", state.liq_id, tx_id);
 
             if matches!(state.deposit_asset, ChainToken::Icp { .. }) {
-                self.maybe_bump_mexc_approval(&state.liq_id, &state.deposit_asset).await;
+                let approved = self
+                    .maybe_bump_mexc_approval(&state.liq_id, &state.deposit_asset)
+                    .await;
+                if approved > 0 {
+                    state.approval_bump_count = Some(approved);
+                }
             } else {
                 debug!(
                     "[mexc] liq_id={} deposit transfer: approve bump skipped (non-ICP asset={})",
@@ -738,6 +749,7 @@ where
             exec_price,
             slippage: 0.0,
             legs: Vec::new(),
+            approval_count: state.approval_bump_count,
             ts: 0,
         };
 
@@ -819,6 +831,7 @@ mod tests {
             collateral_asset: collateral_token.clone(),
             expected_profit: 0,
             ref_price: Nat::from(0u8),
+            debt_approval_needed: false,
         };
 
         ExecutionReceipt {
