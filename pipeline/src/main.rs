@@ -14,6 +14,7 @@ mod wal;
 mod utils;
 mod watchdog;
 use clap::{Parser, Subcommand};
+use liquidium_pipeline_commons::telemetry::init_telemetry_from_env;
 
 use crate::commands::liquidation_loop::run_liquidation_loop;
 
@@ -78,7 +79,26 @@ enum AccountCommands {
 
 #[tokio::main]
 async fn main() {
-    // Parse CLI
+    let _ = dotenv::dotenv();
+    if let Ok(home) = std::env::var("HOME") {
+        let config_path = format!("{}/.liquidium-pipeline/config.env", home);
+        let _ = dotenv::from_filename(config_path);
+    }
+
+    if let Ok(endpoint) = std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT") {
+        eprintln!("[telemetry] OTLP endpoint: {}", endpoint);
+    } else {
+        eprintln!("[telemetry] OTLP endpoint not set, telemetry disabled");
+    }
+
+    let _telemetry_guard = init_telemetry_from_env().expect("Failed to initialize telemetry");
+
+    {
+        let span = tracing::info_span!("main_startup", version = env!("CARGO_PKG_VERSION"));
+        let _enter = span.enter();
+        tracing::info!("Liquidator starting");
+    }
+
     let cli = Cli::parse();
 
     match &cli.command {

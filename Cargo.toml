@@ -24,5 +24,12 @@ bip39 = { version = "2.2.0", features = ["rand"] }
 thiserror = "2.0.17"
 hex = "0.4.3"
 
-[workspace.dev-dependencies]
-cargo-husky = { version = "1", default-features = false, features = ["precommit-hook", "run-cargo-fmt"] }
+# Telemetry
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-opentelemetry = "0.28"
+tracing-log = "0.2"
+opentelemetry = "0.27"
+opentelemetry_sdk = { version = "0.27", features = ["rt-tokio", "logs"] }
+opentelemetry-otlp = { version = "0.27", features = ["grpc-tonic", "http-proto", "reqwest-client", "logs"] }
+opentelemetry-appender-tracing = "0.27"
