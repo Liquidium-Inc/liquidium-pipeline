@@ -106,7 +106,9 @@ mod tests {
     use super::*;
     use candid::{Nat, Principal};
     use liquidium_pipeline_connectors::pipeline_agent::MockPipelineAgent;
-    use liquidium_pipeline_core::types::protocol_types::{AssetType, Assets, LiquidateblePosition, LiquidatebleUser};
+    use liquidium_pipeline_core::types::protocol_types::{
+        AssetType, Assets, LiquidateblePosition, LiquidatebleUser, ScanResult,
+    };
 
     #[tokio::test]
     async fn opportunity_finder_filters_supported_ck_assets_by_principal() {
@@ -169,21 +171,25 @@ mod tests {
         let users_len = users.len() as u64;
         let users_for_scan = users.clone();
 
-        // First query: total accounts len
+        // given
         agent
             .expect_call_query::<u64>()
             .returning(move |_, _, _| Ok(users_len));
 
-        // Second query: scan results
         agent
-            .expect_call_query::<(Vec<LiquidatebleUser>, Option<Principal>, u64)>()
-            .returning(move |_, _, _| Ok((users_for_scan.clone(), None, users_len)));
+            .expect_call_query::<ScanResult>()
+            .returning(move |_, _, _| {
+                Ok(ScanResult {
+                    users: users_for_scan.clone(),
+                    next_cursor: None,
+                    scanned: users_len,
+                })
+            });
 
         let finder = OpportunityFinder::new(Arc::new(agent), canister_id, vec![]);
-
-        // supported_assets is a Vec of ck ledger principals as strings
         let supported_assets = vec![ckbtc_principal.to_string(), ckusdc_principal.to_string()];
 
+        // when
         let result = finder.process(&supported_assets).await.unwrap();
 
         // Only BTC and USDC users should remain; SOL should be dropped
@@ -242,20 +248,25 @@ mod tests {
         let users_len = users.len() as u64;
         let users_for_scan = users.clone();
 
-        // First query: total accounts len
+        // given
         agent
             .expect_call_query::<u64>()
             .returning(move |_, _, _| Ok(users_len));
 
-        // Second query: scan results
         agent
-            .expect_call_query::<(Vec<LiquidatebleUser>, Option<Principal>, u64)>()
-            .returning(move |_, _, _| Ok((users_for_scan.clone(), None, users_len)));
+            .expect_call_query::<ScanResult>()
+            .returning(move |_, _, _| {
+                Ok(ScanResult {
+                    users: users_for_scan.clone(),
+                    next_cursor: None,
+                    scanned: users_len,
+                })
+            });
 
         let finder = OpportunityFinder::new(Arc::new(agent), canister_id, vec![]);
-
         let supported_assets = vec![ckbtc_principal.to_string()];
 
+        // when
         let result = finder.process(&supported_assets).await.unwrap();
 
         // Only the user with a supported ck asset principal should remain
@@ -305,20 +316,25 @@ mod tests {
         let users_len = users.len() as u64;
         let users_for_scan = users.clone();
 
-        // First query: total accounts len
+        // given
         agent
             .expect_call_query::<u64>()
             .returning(move |_, _, _| Ok(users_len));
 
-        // Second query: scan results
         agent
-            .expect_call_query::<(Vec<LiquidatebleUser>, Option<Principal>, u64)>()
-            .returning(move |_, _, _| Ok((users_for_scan.clone(), None, users_len)));
+            .expect_call_query::<ScanResult>()
+            .returning(move |_, _, _| {
+                Ok(ScanResult {
+                    users: users_for_scan.clone(),
+                    next_cursor: None,
+                    scanned: users_len,
+                })
+            });
 
         let finder = OpportunityFinder::new(Arc::new(agent), canister_id, vec![target_account]);
-
         let supported_assets = vec![Principal::anonymous().to_string()];
 
+        // when
         let result = finder.process(&supported_assets).await.unwrap();
 
         assert_eq!(result.len(), 1);

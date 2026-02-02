@@ -39,6 +39,10 @@ where
 }
 
 const DEFAULT_ORDERBOOK_LIMIT: u32 = 50;
+const APPROVE_BUMP_MAX_COUNT: u8 = 6;
+const APPROVE_BUMP_BATCH_SIZE: u8 = 3;
+const APPROVE_BUMP_DELAY_MS: u64 = 300;
+const APPROVE_BUMP_BATCH_DELAY_SECS: u64 = 3;
 
 #[derive(Debug, Clone)]
 struct TradeLeg {
@@ -281,11 +285,14 @@ where
     // the exchange notices the approval without blocking the main liquidation flow.
     async fn maybe_bump_mexc_approval(&self, liq_id: &str, asset: &ChainToken) {
         let already_bumped = {
-            let approve_bumps = self.approve_bumps.lock().expect("approve_bumps mutex poisoned");
+            let Ok(approve_bumps) = self.approve_bumps.lock() else {
+                warn!("[mexc] liq_id={} approve_bumps mutex poisoned, skipping bump", liq_id);
+                return;
+            };
             *approve_bumps.get(liq_id).unwrap_or(&0)
         };
 
-        if already_bumped >= 6 {
+        if already_bumped >= APPROVE_BUMP_MAX_COUNT {
             debug!(
                 "[mexc] liq_id={} deposit transfer: approve bump already done (count={})",
                 liq_id, already_bumped
@@ -299,13 +306,13 @@ where
             subaccount: None,
         });
         info!(
-            "[mexc] liq_id={} deposit transfer: approve bump 3+3 amount={} asset={}",
-            liq_id, approve_amount, asset
+            "[mexc] liq_id={} deposit transfer: approve bump {}+{} amount={} asset={}",
+            liq_id, APPROVE_BUMP_BATCH_SIZE, APPROVE_BUMP_BATCH_SIZE, approve_amount, asset
         );
 
         let mut ok = true;
-        let short_pause = Duration::from_millis(300);
-        for i in 0..3 {
+        let short_pause = Duration::from_millis(APPROVE_BUMP_DELAY_MS);
+        for i in 0..APPROVE_BUMP_BATCH_SIZE {
             if let Err(err) = self
                 .transfer_service
                 .approve(asset, &spender, approve_amount.clone())
@@ -315,13 +322,13 @@ where
                 info!("[mexc] liq_id={} approve bump failed: {}", liq_id, err);
                 break;
             }
-            if i < 2 {
+            if i < APPROVE_BUMP_BATCH_SIZE - 1 {
                 sleep(short_pause).await;
             }
         }
         if ok {
-            sleep(Duration::from_secs(3)).await;
-            for i in 0..3 {
+            sleep(Duration::from_secs(APPROVE_BUMP_BATCH_DELAY_SECS)).await;
+            for i in 0..APPROVE_BUMP_BATCH_SIZE {
                 if let Err(err) = self
                     .transfer_service
                     .approve(asset, &spender, approve_amount.clone())
@@ -331,15 +338,16 @@ where
                     info!("[mexc] liq_id={} approve bump failed: {}", liq_id, err);
                     break;
                 }
-                if i < 2 {
+                if i < APPROVE_BUMP_BATCH_SIZE - 1 {
                     sleep(short_pause).await;
                 }
             }
         }
 
         if ok {
-            let mut approve_bumps = self.approve_bumps.lock().expect("approve_bumps mutex poisoned");
-            approve_bumps.insert(liq_id.to_string(), 6);
+            if let Ok(mut approve_bumps) = self.approve_bumps.lock() {
+                approve_bumps.insert(liq_id.to_string(), APPROVE_BUMP_MAX_COUNT);
+            }
         }
     }
 }
@@ -353,7 +361,7 @@ where
         let amount = &receipt
             .liquidation_result
             .as_ref()
-            .expect("liq result unaavailable")
+            .ok_or_else(|| "missing liquidation result".to_string())?
             .amounts
             .collateral_received;
 
@@ -694,14 +702,17 @@ where
     }
 
     async fn finish(&self, _receipt: &ExecutionReceipt, state: &CexState) -> Result<SwapExecution, String> {
-        let receive_amount = state.size_out.clone();
+        let receive_amount = state
+            .size_out
+            .clone()
+            .ok_or_else(|| "receive amount missing".to_string())?;
 
         // Pay side: seized collateral we sent in, as recorded on the CEX state.
         let pay_amount = state.size_in.clone();
 
         // Compute an effective execution price in native units: receive / pay.
         let pay_f = pay_amount.to_f64();
-        let recv_f = receive_amount.clone().expect("receive amount missing").to_f64();
+        let recv_f = receive_amount.to_f64();
 
         let exec_price = if pay_f > 0.0 { recv_f / pay_f } else { 0.0 };
 
@@ -722,7 +733,7 @@ where
             pay_asset: state.deposit_asset.asset_id(),
             pay_amount: pay_amount.value,
             receive_asset: state.withdraw_asset.asset_id(),
-            receive_amount: receive_amount.unwrap().value,
+            receive_amount: receive_amount.value,
             mid_price: exec_price,
             exec_price,
             slippage: 0.0,

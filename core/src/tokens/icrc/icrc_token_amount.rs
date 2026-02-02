@@ -1,5 +1,3 @@
-use std::str::FromStr;
-
 use candid::Nat;
 use num_format::{Locale, ToFormattedString};
 use num_traits::Pow;
@@ -17,9 +15,21 @@ pub struct IcrcTokenAmount {
 #[allow(dead_code)]
 impl IcrcTokenAmount {
     pub fn from_formatted(token: IcrcToken, formatted_value: f64) -> Self {
-        let value = (formatted_value * 10_f64.pow(token.decimals)).to_string();
-        let value = Nat::from_str(&value).unwrap();
+        let scaled = formatted_value * 10_f64.pow(token.decimals);
+        let rounded = scaled.round();
+
+        let value = Self::clamp_to_nat(rounded);
         Self { token, value }
+    }
+
+    fn clamp_to_nat(value: f64) -> Nat {
+        if value.is_nan() || value.is_infinite() || value < 0.0 {
+            return Nat::from(0u8);
+        }
+        if value > u128::MAX as f64 {
+            return Nat::from(u128::MAX);
+        }
+        Nat::from(value as u128)
     }
 
     pub fn formatted(&self) -> String {
@@ -41,5 +51,70 @@ impl IcrcTokenAmount {
         } else {
             format!("{}: {}", self.token.symbol, int_part.to_formatted_string(&Locale::en),)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn clamp_to_nat_returns_zero_for_nan() {
+        // given
+        let nan = f64::NAN;
+
+        // when
+        let result = IcrcTokenAmount::clamp_to_nat(nan);
+
+        // then
+        assert_eq!(result, Nat::from(0u8));
+    }
+
+    #[test]
+    fn clamp_to_nat_returns_zero_for_infinity() {
+        // given
+        let inf = f64::INFINITY;
+
+        // when
+        let result = IcrcTokenAmount::clamp_to_nat(inf);
+
+        // then
+        assert_eq!(result, Nat::from(0u8));
+    }
+
+    #[test]
+    fn clamp_to_nat_returns_zero_for_negative() {
+        // given
+        let negative = -100.0;
+
+        // when
+        let result = IcrcTokenAmount::clamp_to_nat(negative);
+
+        // then
+        assert_eq!(result, Nat::from(0u8));
+    }
+
+    #[test]
+    fn clamp_to_nat_returns_max_for_overflow() {
+        // given
+        let overflow = (u128::MAX as f64) * 2.0;
+
+        // when
+        let result = IcrcTokenAmount::clamp_to_nat(overflow);
+
+        // then
+        assert_eq!(result, Nat::from(u128::MAX));
+    }
+
+    #[test]
+    fn clamp_to_nat_converts_valid_value() {
+        // given
+        let valid = 12345.0;
+
+        // when
+        let result = IcrcTokenAmount::clamp_to_nat(valid);
+
+        // then
+        assert_eq!(result, Nat::from(12345u128));
     }
 }

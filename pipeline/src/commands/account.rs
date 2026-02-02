@@ -37,17 +37,21 @@ pub async fn show() {
                 Cell::new(&recovery.to_string()),
             ]));
 
-            // Derive EVM account from the configured EVM private key.
-            let evm_signer: PrivateKeySigner = config
-                .evm_private_key
-                .parse()
-                .expect("invalid EVM private key in config");
-            let evm_address = evm_signer.address();
-
-            table.add_row(Row::new(vec![
-                Cell::new("EVM Account"),
-                Cell::new(&format!("{evm_address}")),
-            ]));
+            match config.evm_private_key.parse::<PrivateKeySigner>() {
+                Ok(evm_signer) => {
+                    let evm_address = evm_signer.address();
+                    table.add_row(Row::new(vec![
+                        Cell::new("EVM Account"),
+                        Cell::new(&format!("{evm_address}")),
+                    ]));
+                }
+                Err(_) => {
+                    table.add_row(Row::new(vec![
+                        Cell::new("EVM Account"),
+                        Cell::new("(invalid EVM private key in config)"),
+                    ]));
+                }
+            }
 
             table.printstd();
         }
@@ -57,10 +61,9 @@ pub async fn show() {
     }
 }
 
-fn default_mnemonic_path() -> PathBuf {
-    // $HOME/.liquidium-pipeline/wallets/mnemonic.txt
-    let home = env::var("HOME").expect("HOME not set");
-    PathBuf::from(home).join(".liquidium-pipeline/wallets/mnemonic.txt")
+fn default_mnemonic_path() -> Option<PathBuf> {
+    let home = env::var("HOME").ok()?;
+    Some(PathBuf::from(home).join(".liquidium-pipeline/wallets/mnemonic.txt"))
 }
 
 fn expand_tilde(p: &str) -> PathBuf {
@@ -80,11 +83,16 @@ pub async fn new() {
     ));
     let _ = dotenv::dotenv();
 
-    // Path where we will store the mnemonic phrase.
-    // Can be overridden with MNEMONIC_FILE, otherwise defaults under $HOME.
-    let mnemonic_path: PathBuf = env::var("MNEMONIC_FILE")
-        .map(|p| expand_tilde(&p))
-        .unwrap_or_else(|_| default_mnemonic_path());
+    let mnemonic_path: PathBuf = match env::var("MNEMONIC_FILE") {
+        Ok(p) => expand_tilde(&p),
+        Err(_) => match default_mnemonic_path() {
+            Some(p) => p,
+            None => {
+                eprintln!("HOME environment variable not set and MNEMONIC_FILE not specified");
+                return;
+            }
+        },
+    };
 
     if mnemonic_path.exists() {
         println!(
@@ -95,8 +103,13 @@ pub async fn new() {
         return;
     }
 
-    // Generate a fresh 24-word English mnemonic.
-    let mnemonic = Mnemonic::generate_in(Language::English, 24).unwrap();
+    let mnemonic = match Mnemonic::generate_in(Language::English, 24) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("Failed to generate mnemonic: {e}");
+            return;
+        }
+    };
     let phrase = mnemonic.to_string();
 
     if let Some(parent) = mnemonic_path.parent()

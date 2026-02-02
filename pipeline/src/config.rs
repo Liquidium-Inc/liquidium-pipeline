@@ -152,27 +152,32 @@ impl Config {
         let logger = logger_builder.build();
         let multi = MultiProgress::new();
 
-        LogWrapper::new(multi.clone(), logger).try_init().unwrap();
+        LogWrapper::new(multi.clone(), logger)
+            .try_init()
+            .map_err(|e| format!("failed to initialize logger: {e}"))?;
 
-        let ic_url = env::var("IC_URL").unwrap();
+        let ic_url = env::var("IC_URL").map_err(|_| "IC_URL not configured".to_string())?;
         let export_path = env::var("EXPORT_PATH").unwrap_or("executions.csv".to_string());
 
-        let mnemonic_path = expand_tilde(&env::var("MNEMONIC_FILE").expect("MNEMONIC_FILE not configured"));
+        let mnemonic_path =
+            expand_tilde(&env::var("MNEMONIC_FILE").map_err(|_| "MNEMONIC_FILE not configured".to_string())?);
 
         let mnemonic = std::fs::read_to_string(&mnemonic_path)
-            .expect("failed to read mnemonic file")
+            .map_err(|e| format!("failed to read mnemonic file: {e}"))?
             .trim()
             .to_string();
 
-        let liquidator_identity =
-            derive_icp_identity(&mnemonic, 0, 0).expect("could not create liquidator identity from mnemonic");
+        let liquidator_identity = derive_icp_identity(&mnemonic, 0, 0)
+            .map_err(|e| format!("could not create liquidator identity: {e}"))?;
         let liquidator_principal = liquidator_identity
             .sender()
-            .expect("could not decode liquidator principal");
+            .map_err(|e| format!("could not decode liquidator principal: {e}"))?;
 
-        let trader_identity =
-            derive_icp_identity(&mnemonic, 0, 1).expect("could not create trader identity from mnemonic");
-        let trader_principal = trader_identity.sender().expect("could not decode trader principal");
+        let trader_identity = derive_icp_identity(&mnemonic, 0, 1)
+            .map_err(|e| format!("could not create trader identity: {e}"))?;
+        let trader_principal = trader_identity
+            .sender()
+            .map_err(|e| format!("could not decode trader principal: {e}"))?;
 
         let buy_bad_debt = env::var("BUY_BAD_DEBT")
             .map(|v| v.parse().unwrap_or(false))
@@ -182,7 +187,10 @@ impl Config {
         debug!("Trader ID {}", trader_principal);
 
         // Load the asset maps
-        let lending_canister = Principal::from_text(env::var("LENDING_CANISTER").unwrap()).unwrap();
+        let lending_canister_str =
+            env::var("LENDING_CANISTER").map_err(|_| "LENDING_CANISTER not configured".to_string())?;
+        let lending_canister = Principal::from_text(&lending_canister_str)
+            .map_err(|e| format!("invalid LENDING_CANISTER principal: {e}"))?;
 
         // The db path
         let db_path = env::var("DB_PATH").unwrap_or(format!("{}/wal.db", home));
@@ -238,9 +246,12 @@ impl Config {
             Err(_) => vec![],
         };
 
+        let evm_rpc_url =
+            env::var("EVM_RPC_URL").map_err(|_| "EVM_RPC_URL not configured".to_string())?;
+
         Ok(Arc::new(Config {
             evm_private_key,
-            evm_rpc_url: env::var("EVM_RPC_URL").expect("EVM_RPC_URL not configured"),
+            evm_rpc_url,
             liquidator_identity: Arc::new(liquidator_identity),
             ic_url,
             liquidator_principal,
