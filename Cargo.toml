@@ -23,3 +23,6 @@ futures = "0.3"
 bip39 = { version = "2.2.0", features = ["rand"] }
 thiserror = "2.0.17"
 hex = "0.4.3"
+
+[workspace.dev-dependencies]
+cargo-husky = { version = "1", default-features = false, features = ["precommit-hook", "run-cargo-fmt"] }
