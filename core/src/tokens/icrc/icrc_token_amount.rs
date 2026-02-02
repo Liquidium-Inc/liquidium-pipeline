@@ -18,15 +18,18 @@ impl IcrcTokenAmount {
         let scaled = formatted_value * 10_f64.pow(token.decimals);
         let rounded = scaled.round();
 
-        let value = if rounded.is_nan() || rounded.is_infinite() || rounded < 0.0 {
-            Nat::from(0u8)
-        } else if rounded > u128::MAX as f64 {
-            Nat::from(u128::MAX)
-        } else {
-            Nat::from(rounded as u128)
-        };
-
+        let value = Self::clamp_to_nat(rounded);
         Self { token, value }
+    }
+
+    fn clamp_to_nat(value: f64) -> Nat {
+        if value.is_nan() || value.is_infinite() || value < 0.0 {
+            return Nat::from(0u8);
+        }
+        if value > u128::MAX as f64 {
+            return Nat::from(u128::MAX);
+        }
+        Nat::from(value as u128)
     }
 
     pub fn formatted(&self) -> String {
