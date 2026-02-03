@@ -23,6 +23,7 @@ use liquidium_pipeline_connectors::{
     transfer::{evm_transfer::EvmTransferAdapter, icp_transfer::IcpTransferAdapter, router::MultiChainTransferRouter},
 };
 
+use crate::approval_state::ApprovalState;
 use crate::config::Config;
 use crate::swappers::kong::kong_swapper::KongSwapSwapper;
 use crate::swappers::kong::kong_venue::KongVenue;
@@ -40,6 +41,7 @@ pub struct PipelineContext {
     pub swap_router: Arc<SwapRouter>,
     pub recovery_transfers: Arc<TransferService>,
     pub evm_address: String,
+    pub approval_state: Arc<ApprovalState>,
 }
 
 pub struct PipelineContextBuilder<P: Provider<AnyNetwork>> {
@@ -164,10 +166,12 @@ impl<P: Provider<AnyNetwork> + WalletProvider<AnyNetwork> + Clone + 'static> Pip
         ));
         let recovery_transfers = TransferService::new(registry.clone(), transfer_router_recovery);
 
+        let approval_state = Arc::new(ApprovalState::new());
+
         // Setup swap venue
 
         // Kong swapper uses the trader agent/backend, adjust ctor args to your real API
-        let kong_swapper = KongSwapSwapper::new(icp_backend_trader.agent.clone(), main_trader_account);
+        let kong_swapper = KongSwapSwapper::new(icp_backend_trader.agent.clone(), main_trader_account, approval_state.clone());
         // Build Kong venue (ICP)
         let icp_tokens: Vec<ChainToken> = registry
             .tokens
@@ -200,6 +204,7 @@ impl<P: Provider<AnyNetwork> + WalletProvider<AnyNetwork> + Clone + 'static> Pip
             trader_transfers: Arc::new(trader_transfers),
             recovery_transfers: Arc::new(recovery_transfers),
             evm_address,
+            approval_state,
             agent: main_agent.clone(),
         })
     }

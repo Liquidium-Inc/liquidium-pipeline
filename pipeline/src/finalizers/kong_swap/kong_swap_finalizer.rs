@@ -82,6 +82,7 @@ mod tests {
             slippage: 0.0,
 
             legs: vec![],
+            approval_count: None,
             ts: 0,
         }
     }
@@ -147,6 +148,7 @@ mod tests {
             },
             expected_profit: 0,
             ref_price: Nat::from(0u8),
+            debt_approval_needed: false,
         };
 
         let liq = LiquidationResult {

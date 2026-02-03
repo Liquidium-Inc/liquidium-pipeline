@@ -19,4 +19,6 @@ pub struct ExecutorRequest {
     // Ref price
     #[serde(default)]
     pub ref_price: Nat,
+    #[serde(default)]
+    pub debt_approval_needed: bool,
 }

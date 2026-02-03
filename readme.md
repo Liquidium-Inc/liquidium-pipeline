@@ -168,11 +168,30 @@ liquidium-pipeline/
 ### Pipeline Stages
 
 ```mermaid
-flowchart LR
-    A[Opportunity Discovery] --> B[Strategy Filter]
-    B --> C[Liquidation Execution]
-    C --> D[Swap Finalization]
-    D --> E[Export / Reporting]
+stateDiagram-v2
+    [*] --> OpportunityQuery
+    OpportunityQuery --> StrategyBuild
+    StrategyBuild --> ExecuteLiquidation
+    ExecuteLiquidation --> WalRecord
+
+    WalRecord --> Finalize
+    Finalize --> SwapDecision
+
+    SwapDecision --> DexSwap: swap_args and dex
+    SwapDecision --> CexSwap: swap_args and cex or hybrid
+    SwapDecision --> NoSwap: no swap_args
+
+    DexSwap --> Finalize
+    CexSwap --> Finalize
+    NoSwap --> Finalize
+
+    Finalize --> WalUpdate
+    WalUpdate --> SettlementWatch
+    SettlementWatch --> Finalize: pending or retryable
+    SettlementWatch --> Export: succeeded
+
+    Finalize --> Export
+    Export --> [*]
 ```
 
 | Stage | Description |

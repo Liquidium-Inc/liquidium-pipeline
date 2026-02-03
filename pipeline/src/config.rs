@@ -158,7 +158,7 @@ impl Config {
             .or_else(|_| std::env::var("MAX_ALLOWED_SLIPPAGE_BPS"))
             .ok()
             .and_then(|v| v.parse::<u32>().ok())
-            .unwrap_or(500); // default 5%
+            .unwrap_or(125); // default 1.25%
 
         let max_allowed_cex_slippage_bps: u32 = std::env::var("MAX_ALLOWED_CEX_SLIPPAGE_BPS")
             .or_else(|_| std::env::var("MAX_ALLOWED_SLIPPAGE_BPS"))

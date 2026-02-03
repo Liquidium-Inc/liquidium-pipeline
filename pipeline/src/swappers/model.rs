@@ -73,5 +73,7 @@ pub struct SwapExecution {
     pub slippage: f64,
 
     pub legs: Vec<SwapQuoteLeg>,
+    #[serde(default)]
+    pub approval_count: Option<u32>,
     pub ts: u64,
 }

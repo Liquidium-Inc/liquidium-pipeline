@@ -6,12 +6,14 @@ use std::{
 use crate::config::ConfigTrait;
 use crate::executors::executor::ExecutorRequest;
 
+use crate::approval_state::ApprovalState;
 use crate::liquidation::collateral_service::CollateralServiceTrait;
 use crate::stage::PipelineStage;
 
+use crate::swappers::kong::kong_swapper::DEX_PRINCIPAL;
 use crate::swappers::swap_interface::SwapInterface;
 
-use candid::{Int, Nat};
+use candid::{Int, Nat, Principal};
 use futures::TryFutureExt;
 use liquidium_pipeline_core::{
     balance_service::BalanceService,
@@ -26,6 +28,7 @@ use log::{debug, info};
 use num_traits::ToPrimitive;
 
 use crate::swappers::model::SwapRequest;
+use crate::utils::max_for_ledger;
 use crate::watchdog::{Watchdog, WatchdogEvent, noop_watchdog};
 use async_trait::async_trait;
 
@@ -61,6 +64,7 @@ where
     pub swapper: Arc<T>,
     pub collateral_service: Arc<U>,
     pub account_service: Arc<BalanceService>,
+    pub approval_state: Arc<ApprovalState>,
     pub watchdog: Arc<dyn Watchdog>,
 }
 
@@ -77,6 +81,7 @@ where
         swapper: Arc<T>,
         collateral_service: Arc<U>,
         balance_service: Arc<BalanceService>,
+        approval_state: Arc<ApprovalState>,
     ) -> Self {
         Self {
             config,
@@ -84,6 +89,7 @@ where
             swapper,
             collateral_service,
             account_service: balance_service,
+            approval_state,
             watchdog: noop_watchdog(),
         }
     }
@@ -91,6 +97,74 @@ where
     pub fn with_watchdog(mut self, wd: Arc<dyn Watchdog>) -> Self {
         self.watchdog = wd;
         self
+    }
+
+    fn debt_approval_needed(&self, token: &ChainToken) -> bool {
+        let ChainToken::Icp { ledger, .. } = token else {
+            return false;
+        };
+
+        let threshold = max_for_ledger(ledger) / Nat::from(2u8);
+        self.approval_state
+            .needs_approval(*ledger, self.config.get_lending_canister(), &threshold)
+    }
+
+    fn dex_approval_needed(&self, token: &ChainToken) -> bool {
+        let ChainToken::Icp { ledger, .. } = token else {
+            return false;
+        };
+
+        let spender = match Principal::from_text(DEX_PRINCIPAL) {
+            Ok(p) => p,
+            Err(_) => return false,
+        };
+
+        let threshold = max_for_ledger(ledger) / Nat::from(2u8);
+        self.approval_state.needs_approval(*ledger, spender, &threshold)
+    }
+
+    fn should_use_cex(&self, swap_needed: bool, amount_in: &ChainTokenAmount, ref_price: &Nat) -> bool {
+        if !swap_needed {
+            return false;
+        }
+
+        match self.config.get_swapper_mode() {
+            crate::config::SwapperMode::Dex => false,
+            crate::config::SwapperMode::Cex => true,
+            crate::config::SwapperMode::Hybrid => {
+                let ref_price_f64 = ref_price.0.to_f64().unwrap_or(0.0) / 1e27f64;
+                let pay_amount = amount_in.value.0.to_f64().unwrap_or(0.0);
+                let pay_scale = 10f64.powi(amount_in.token.decimals() as i32);
+                let pay_units = if pay_scale > 0.0 { pay_amount / pay_scale } else { 0.0 };
+                let est_value_usd = pay_units * ref_price_f64;
+                est_value_usd >= 2.5
+            }
+        }
+    }
+
+    fn fee_in_debt(
+        &self,
+        fee_native: &Nat,
+        fee_token: &ChainToken,
+        debt_token: &ChainToken,
+        price_coll_ray: &Nat,
+        price_debt_ray: &Nat,
+    ) -> Nat {
+        if fee_native == &Nat::from(0u8) {
+            return Nat::from(0u8);
+        }
+
+        if fee_token.asset_id().address == debt_token.asset_id().address {
+            return fee_native.clone();
+        }
+
+        if price_coll_ray == &Nat::from(0u8) || price_debt_ray == &Nat::from(0u8) {
+            return Nat::from(0u8);
+        }
+
+        let coll_scale = Nat::from(10u128.pow(fee_token.decimals() as u32));
+        let debt_scale = Nat::from(10u128.pow(debt_token.decimals() as u32));
+        (fee_native.clone() * price_coll_ray.clone() * debt_scale) / (coll_scale * price_debt_ray.clone())
     }
 
     // Helper: Prefetch balances for all debt assets we might need
@@ -231,7 +305,13 @@ where
                 continue;
             };
 
-            if available_balance.clone() < repayment_token.fee() * 2u64 {
+            let debt_approval_needed = self.debt_approval_needed(&repayment_token);
+            let mut debt_fee_total = repayment_token.fee();
+            if debt_approval_needed {
+                debt_fee_total = debt_fee_total + repayment_token.fee();
+            }
+
+            if available_balance.clone() < debt_fee_total.clone() {
                 self.watchdog
                     .notify(WatchdogEvent::InsufficientFunds {
                         asset: &debt_position.asset.to_string(),
@@ -240,14 +320,12 @@ where
                     .await;
                 debug!(
                     "Skipping bad-debt position due to insufficient funds: asset={}, available={} < min_required={}",
-                    debt_position.asset,
-                    available_balance,
-                    repayment_token.fee() * 2u64
+                    debt_position.asset, available_balance, debt_fee_total
                 );
                 continue;
             }
 
-            let max_balance = available_balance.clone() - repayment_token.fee() * 2u64;
+            let max_balance = available_balance.clone() - debt_fee_total.clone();
 
             // We buy as much bad debt as we can, capped by wallet balance and position size.
             let repay_amount = if max_balance.clone() < debt_position.debt_amount {
@@ -264,7 +342,7 @@ where
             let amount_received: Nat = Nat::from(0u64);
             let profit = Int::from(amount_received.clone())
                 - Int::from(repay_amount.clone())
-                - Int::from(repayment_token.fee()) * 2u128;
+                - Int::from(debt_fee_total.clone());
 
             info!(
                 "🧯 Bad debt buy: repay={} {} | profit={} {}",
@@ -278,14 +356,12 @@ where
                 continue;
             }
 
-            if available_balance.clone() >= repay_amount.clone() + repayment_token.fee() * 2u64 {
-                *available_balance = available_balance.clone() - repay_amount.clone() - repayment_token.fee() * 2u64;
+            if available_balance.clone() >= repay_amount.clone() + debt_fee_total.clone() {
+                *available_balance = available_balance.clone() - repay_amount.clone() - debt_fee_total.clone();
             } else {
                 debug!(
                     "Available balance would underflow when updating bad-debt balance. available={}, repay={}, fees={}",
-                    available_balance,
-                    repay_amount,
-                    repayment_token.fee() * 2u64
+                    available_balance, repay_amount, debt_fee_total
                 );
                 continue;
             }
@@ -304,6 +380,7 @@ where
                 ref_price: 0u32.into(),
                 swap_args: None,
                 expected_profit: profit.0.to_i128().unwrap_or(i128::MAX),
+                debt_approval_needed,
             });
         }
 
@@ -392,7 +469,13 @@ where
                 continue;
             };
 
-            if available_balance.clone() < repayment_token.fee() * 2u64 {
+            let debt_approval_needed = self.debt_approval_needed(&repayment_token);
+            let mut debt_fee_total = repayment_token.fee();
+            if debt_approval_needed {
+                debt_fee_total = debt_fee_total + repayment_token.fee();
+            }
+
+            if available_balance.clone() < debt_fee_total.clone() {
                 self.watchdog
                     .notify(WatchdogEvent::InsufficientFunds {
                         asset: &debt_position.asset.to_string(),
@@ -401,14 +484,12 @@ where
                     .await;
                 debug!(
                     "Skipping combo due to insufficient funds: asset={}, available={} < min_required={}",
-                    debt_position.asset,
-                    available_balance,
-                    repayment_token.fee() * 2u64
+                    debt_position.asset, available_balance, debt_fee_total
                 );
                 continue;
             }
 
-            let max_balance = available_balance.clone() - repayment_token.fee() * 2u64;
+            let max_balance = available_balance.clone() - debt_fee_total.clone();
 
             debug!(
                 "available_balance: {:?} repayment_token_fee {:?} max_balance: {:?}",
@@ -462,7 +543,36 @@ where
             let price_coll_ray = estimation.ref_price.clone();
             let price_debt_ray = estimation.debt_price.clone();
             let max_slippage_bps = self.config.get_max_allowed_dex_slippage();
-            let (swap_args, amount_received, price) = if estimation.received_collateral == 0u32 || same_asset {
+            let swap_needed = estimation.received_collateral != 0u32 && !same_asset;
+            let use_cex = self.should_use_cex(swap_needed, &amount_in, &estimation.ref_price);
+
+            let mut amount_in_effective = amount_in.value.clone();
+            let mut mexc_approval_count: u32 = 0;
+
+            if swap_needed {
+                if use_cex {
+                    let deposit_fee = collateral_token.fee()
+                        * Nat::from(crate::finalizers::mexc::mexc_finalizer::MEXC_DEPOSIT_FEE_MULTIPLIER);
+                    if amount_in_effective <= deposit_fee {
+                        amount_in_effective = Nat::from(0u8);
+                    } else {
+                        amount_in_effective = amount_in_effective - deposit_fee;
+                    }
+
+                    if matches!(collateral_token, ChainToken::Icp { .. }) {
+                        mexc_approval_count = crate::finalizers::mexc::mexc_finalizer::APPROVE_BUMP_MAX_COUNT as u32;
+                    }
+                } else if self.dex_approval_needed(&collateral_token) {
+                    let approval_fee = collateral_token.fee();
+                    if amount_in_effective <= approval_fee {
+                        amount_in_effective = Nat::from(0u8);
+                    } else {
+                        amount_in_effective = amount_in_effective - approval_fee;
+                    }
+                }
+            }
+
+            let (swap_args, amount_received, price) = if !swap_needed {
                 (None, amount_in.value.clone(), 1f64)
             } else {
                 let swap_request = SwapRequest {
@@ -486,7 +596,7 @@ where
                 } else {
                     let coll_scale = Nat::from(10u128.pow(collateral_token.decimals() as u32));
                     let debt_scale = Nat::from(10u128.pow(repayment_token.decimals() as u32));
-                    (amount_in.value.clone() * price_coll_ray.clone() * debt_scale)
+                    (amount_in_effective.clone() * price_coll_ray.clone() * debt_scale)
                         / (coll_scale * price_debt_ray.clone())
                 };
 
@@ -507,23 +617,23 @@ where
                 repayment_token.symbol()
             );
 
-            let debt_fee_total = repayment_token.fee() * 2u64;
-            // Convert collateral fees into debt units using the same price ratio as the swap.
-            let collateral_fee_in_debt = if same_asset {
-                collateral_token.fee()
-            } else if price_coll_ray == 0u8 || price_debt_ray == 0u8 {
-                Nat::from(0u8)
+            let mexc_approval_fee_in_debt = if mexc_approval_count > 0 {
+                let fee_native = collateral_token.fee() * Nat::from(mexc_approval_count);
+                self.fee_in_debt(
+                    &fee_native,
+                    &collateral_token,
+                    &repayment_token,
+                    &price_coll_ray,
+                    &price_debt_ray,
+                )
             } else {
-                let coll_scale = Nat::from(10u128.pow(collateral_token.decimals() as u32));
-                let debt_scale = Nat::from(10u128.pow(repayment_token.decimals() as u32));
-                (collateral_token.fee() * price_coll_ray * debt_scale) / (coll_scale * price_debt_ray)
+                Nat::from(0u8)
             };
-            let collateral_fee_total = collateral_fee_in_debt * 2u64;
 
             let profit = Int::from(amount_received)
                 - Int::from(estimation.repaid_debt.clone())
-                - Int::from(debt_fee_total)
-                - Int::from(collateral_fee_total);
+                - Int::from(debt_fee_total.clone())
+                - Int::from(mexc_approval_fee_in_debt.clone());
             let is_bad_debt = profit <= 0;
 
             info!(
@@ -543,15 +653,13 @@ where
                 repayment_token.fee()
             );
 
-            if available_balance.clone() >= estimation.repaid_debt.clone() + repayment_token.fee() * 2u64 {
+            if available_balance.clone() >= estimation.repaid_debt.clone() + debt_fee_total.clone() {
                 *available_balance =
-                    available_balance.clone() - estimation.repaid_debt.clone() - repayment_token.fee() * 2u64;
+                    available_balance.clone() - estimation.repaid_debt.clone() - debt_fee_total.clone();
             } else {
                 debug!(
                     "Available balance would underflow when updating. available={}, repay={}, fees={}",
-                    available_balance,
-                    estimation.repaid_debt,
-                    repayment_token.fee() * 2u64
+                    available_balance, estimation.repaid_debt, debt_fee_total
                 );
                 continue;
             }
@@ -570,6 +678,7 @@ where
                 ref_price: estimation.ref_price,
                 swap_args,
                 expected_profit: profit.0.to_i128().unwrap_or(i128::MAX),
+                debt_approval_needed,
             });
 
             if estimation.repaid_debt >= debt_position.debt_amount {
@@ -596,6 +705,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::approval_state::ApprovalState;
     use crate::config::MockConfigTrait;
     use crate::liquidation::collateral_service::{LiquidationEstimation, MockCollateralServiceTrait};
     use crate::swappers::swap_interface::MockSwapInterface;
@@ -670,6 +780,7 @@ mod tests {
         cfg.expect_get_liquidator_principal().return_const(trader);
         cfg.expect_should_buy_bad_debt().return_const(false);
         cfg.expect_get_max_allowed_dex_slippage().return_const(2000u32);
+        cfg.expect_get_lending_canister().return_const(p("mxzaz-hqaaa-aaaar-qaada-cai"));
 
         // Collateral service: repay 1_000, receive 2_000 collateral
         let mut collateral = MockCollateralServiceTrait::new();
@@ -716,6 +827,7 @@ mod tests {
             Arc::new(swapper),
             Arc::new(collateral),
             balance_service,
+            Arc::new(ApprovalState::new()),
         );
 
         let pool = p("mxzaz-hqaaa-aaaar-qaada-cai");
@@ -747,6 +859,7 @@ mod tests {
         cfg.expect_get_liquidator_principal().return_const(trader);
         cfg.expect_should_buy_bad_debt().return_const(false);
         cfg.expect_get_max_allowed_dex_slippage().return_const(2000u32);
+        cfg.expect_get_lending_canister().return_const(p("mxzaz-hqaaa-aaaar-qaada-cai"));
 
         let mut collateral = MockCollateralServiceTrait::new();
         collateral
@@ -776,6 +889,7 @@ mod tests {
             Arc::new(swapper),
             Arc::new(collateral),
             balance_service,
+            Arc::new(ApprovalState::new()),
         );
 
         let pool = p("mxzaz-hqaaa-aaaar-qaada-cai");
@@ -804,6 +918,7 @@ mod tests {
         cfg.expect_get_liquidator_principal().return_const(trader);
         cfg.expect_should_buy_bad_debt().return_const(false);
         cfg.expect_get_max_allowed_dex_slippage().return_const(2000u32);
+        cfg.expect_get_lending_canister().return_const(p("mxzaz-hqaaa-aaaar-qaada-cai"));
 
         let mut collateral = MockCollateralServiceTrait::new();
         collateral
@@ -833,6 +948,7 @@ mod tests {
             Arc::new(swapper),
             Arc::new(collateral),
             balance_service,
+            Arc::new(ApprovalState::new()),
         );
 
         let pool = p("mxzaz-hqaaa-aaaar-qaada-cai");
@@ -872,6 +988,7 @@ mod tests {
         cfg.expect_get_liquidator_principal().return_const(trader);
         cfg.expect_should_buy_bad_debt().return_const(false);
         cfg.expect_get_max_allowed_dex_slippage().return_const(2000u32);
+        cfg.expect_get_lending_canister().return_const(p("mxzaz-hqaaa-aaaar-qaada-cai"));
 
         let mut collateral = MockCollateralServiceTrait::new();
         collateral
@@ -907,6 +1024,7 @@ mod tests {
             Arc::new(swapper),
             Arc::new(collateral),
             balance_service,
+            Arc::new(ApprovalState::new()),
         );
 
         let pool = p("mxzaz-hqaaa-aaaar-qaada-cai");
@@ -940,6 +1058,7 @@ mod tests {
         cfg.expect_get_liquidator_principal().return_const(trader);
         cfg.expect_should_buy_bad_debt().return_const(true);
         cfg.expect_get_max_allowed_dex_slippage().return_const(2000u32);
+        cfg.expect_get_lending_canister().return_const(p("mxzaz-hqaaa-aaaar-qaada-cai"));
 
         let mut collateral = MockCollateralServiceTrait::new();
         collateral
@@ -982,6 +1101,7 @@ mod tests {
             Arc::new(swapper),
             Arc::new(collateral),
             balance_service,
+            Arc::new(ApprovalState::new()),
         );
 
         let pool = p("mxzaz-hqaaa-aaaar-qaada-cai");
@@ -1020,6 +1140,7 @@ mod tests {
         cfg.expect_get_liquidator_principal().return_const(trader);
         cfg.expect_should_buy_bad_debt().return_const(false);
         cfg.expect_get_max_allowed_dex_slippage().return_const(2000u32);
+        cfg.expect_get_lending_canister().return_const(p("mxzaz-hqaaa-aaaar-qaada-cai"));
 
         // Collateral service returns fixed repay so we can control budgeting
         let mut collateral = MockCollateralServiceTrait::new();
@@ -1065,6 +1186,7 @@ mod tests {
             Arc::new(swapper),
             Arc::new(collateral),
             balance_service,
+            Arc::new(ApprovalState::new()),
         );
 
         // One user with one debt and two collateral positions produces two combos against same repay token
@@ -1096,6 +1218,7 @@ mod tests {
         cfg.expect_get_liquidator_principal().return_const(trader);
         cfg.expect_should_buy_bad_debt().return_const(false);
         cfg.expect_get_max_allowed_dex_slippage().return_const(2000u32);
+        cfg.expect_get_lending_canister().return_const(p("mxzaz-hqaaa-aaaar-qaada-cai"));
 
         let mut calls = 0u32;
         let mut collateral = MockCollateralServiceTrait::new();
@@ -1145,6 +1268,7 @@ mod tests {
             Arc::new(swapper),
             Arc::new(collateral),
             balance_service,
+            Arc::new(ApprovalState::new()),
         );
 
         let pool = p("mxzaz-hqaaa-aaaar-qaada-cai");
@@ -1179,6 +1303,7 @@ mod tests {
         cfg.expect_get_liquidator_principal().return_const(trader);
         cfg.expect_should_buy_bad_debt().return_const(false);
         cfg.expect_get_max_allowed_dex_slippage().return_const(2000u32);
+        cfg.expect_get_lending_canister().return_const(p("mxzaz-hqaaa-aaaar-qaada-cai"));
 
         let mut first_called_for_low_hf = true;
         let mut collateral = MockCollateralServiceTrait::new();
@@ -1230,6 +1355,7 @@ mod tests {
             Arc::new(swapper),
             Arc::new(collateral),
             balance_service,
+            Arc::new(ApprovalState::new()),
         );
 
         let pool = p("mxzaz-hqaaa-aaaar-qaada-cai");
@@ -1264,6 +1390,7 @@ mod tests {
         cfg.expect_get_liquidator_principal().return_const(trader);
         cfg.expect_should_buy_bad_debt().return_const(false);
         cfg.expect_get_max_allowed_dex_slippage().return_const(2000u32);
+        cfg.expect_get_lending_canister().return_const(p("mxzaz-hqaaa-aaaar-qaada-cai"));
 
         let mut first_checked = true;
         let mut collateral = MockCollateralServiceTrait::new();
@@ -1316,6 +1443,7 @@ mod tests {
             Arc::new(swapper),
             Arc::new(collateral),
             balance_service,
+            Arc::new(ApprovalState::new()),
         );
 
         let pool = p("mxzaz-hqaaa-aaaar-qaada-cai");

@@ -135,11 +135,23 @@ where
             req.max_slippage_bps
         );
 
+        let max_slip_bps = req.max_slippage_bps;
+        let max_slip_pct = max_slip_bps.map(|bps| (bps as f64) / 100.0);
+        let kong_max_slip = kong_req.max_slippage;
+        let pay_amount_final = kong_req.pay_amount.clone();
+
         // Execute swap on Kong
         let reply: KongSwapReply = self.swapper.swap(kong_req).await.map_err(|e| {
             warn!(
-                "[kong] execute failed pay={} {} -> {} err={}",
-                req.pay_amount.value, req.pay_asset.symbol, req.receive_asset.symbol, e
+                "[kong] execute failed pay={} {} -> {} err={} max_slip_bps={:?} max_slip_pct={:?} kong_max_slip={:?} pay_amount_final={}",
+                req.pay_amount.value,
+                req.pay_asset.symbol,
+                req.receive_asset.symbol,
+                e,
+                max_slip_bps,
+                max_slip_pct,
+                kong_max_slip,
+                pay_amount_final
             );
             e
         })?;
@@ -152,6 +164,7 @@ where
 #[cfg(test)]
 mod tests {
     use crate::swappers::router::SwapVenue;
+    use crate::approval_state::ApprovalState;
     use candid::{Decode, Nat, Principal};
     use ic_agent::Agent;
     use icrc_ledger_types::icrc1::account::Account;
@@ -279,6 +292,7 @@ mod tests {
                 owner: Principal::anonymous(),
                 subaccount: None,
             },
+            Arc::new(ApprovalState::new()),
         ));
         let venue = KongVenue::new(swapper, vec![token_in, token_out]);
 
@@ -354,6 +368,7 @@ mod tests {
                 owner: Principal::anonymous(),
                 subaccount: None,
             },
+            Arc::new(ApprovalState::new()),
         ));
         let venue = KongVenue::new(swapper, vec![token_in, token_out]);
 

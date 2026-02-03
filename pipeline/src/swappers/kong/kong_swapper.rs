@@ -18,21 +18,23 @@ use log::{debug, info, warn};
 
 use liquidium_pipeline_connectors::pipeline_agent::PipelineAgent;
 
+use crate::approval_state::ApprovalState;
 use crate::swappers::kong::kong_types::{SwapAmountsReply, SwapArgs, SwapReply, SwapResult};
 use crate::utils::max_for_ledger;
 
-const DEX_PRINCIPAL: &str = "2ipq2-uqaaa-aaaar-qailq-cai";
+pub const DEX_PRINCIPAL: &str = "2ipq2-uqaaa-aaaar-qailq-cai";
 const ALLOWANCE_THRESHOLD_DIVISOR: u8 = 2;
 
 pub struct KongSwapSwapper<A: PipelineAgent> {
     pub agent: Arc<A>,
     pub account_id: Account,
     pub dex_account: Account,
+    pub approval_state: Arc<ApprovalState>,
     pub allowances: Mutex<HashMap<(Principal, Principal), Nat>>,
 }
 
 impl<A: PipelineAgent> KongSwapSwapper<A> {
-    pub fn new(agent: Arc<A>, account_id: Account) -> Self {
+    pub fn new(agent: Arc<A>, account_id: Account, approval_state: Arc<ApprovalState>) -> Self {
         Self {
             agent,
             account_id,
@@ -40,6 +42,7 @@ impl<A: PipelineAgent> KongSwapSwapper<A> {
                 owner: DEX_PRINCIPAL.parse().expect("invalid DEX_PRINCIPAL"),
                 subaccount: None,
             },
+            approval_state,
             allowances: Mutex::new(HashMap::new()),
         }
     }
@@ -61,6 +64,7 @@ impl<A: PipelineAgent> KongSwapSwapper<A> {
             if let Some(cached) = map.get(&(ledger, owner))
                 && *cached >= threshold
             {
+                self.approval_state.set_allowance(ledger, owner, cached.clone());
                 return Ok(false);
             }
         }
@@ -75,6 +79,7 @@ impl<A: PipelineAgent> KongSwapSwapper<A> {
             )
             .await;
 
+        self.approval_state.set_allowance(ledger, owner, allowance.clone());
         if allowance >= threshold {
             let mut map = self
                 .allowances
@@ -99,7 +104,8 @@ impl<A: PipelineAgent> KongSwapSwapper<A> {
             .allowances
             .lock()
             .map_err(|_| "allowances mutex poisoned".to_string())?;
-        map.insert((ledger, owner), approved);
+        map.insert((ledger, owner), approved.clone());
+        self.approval_state.set_allowance(ledger, owner, approved.clone());
         Ok(true)
     }
 
@@ -123,7 +129,8 @@ impl<A: PipelineAgent> KongSwapSwapper<A> {
             .lock()
             .map_err(|_| "allowances mutex poisoned".to_string())?;
         for (token, owner, allowance) in results {
-            map.insert((token, owner), allowance);
+            map.insert((token, owner), allowance.clone());
+            self.approval_state.set_allowance(token, owner, allowance);
         }
 
         info!("DEX token approval complete");
@@ -140,6 +147,7 @@ impl<A: PipelineAgent> KongSwapSwapper<A> {
                 },
             )
             .await;
+        self.approval_state.set_allowance(*token, *spender, allowance.clone());
         debug!(
             "Current allowance for {}: {} on {}",
             token,
@@ -165,6 +173,7 @@ impl<A: PipelineAgent> KongSwapSwapper<A> {
             {
                 Ok(a) => {
                     debug!("Approved {} => {}", token, a);
+                    self.approval_state.set_allowance(*token, *spender, a.clone());
                     a
                 }
                 Err(e) => {

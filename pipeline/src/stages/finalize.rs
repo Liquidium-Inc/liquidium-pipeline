@@ -278,7 +278,7 @@ where
             };
 
             let expected_profit = self.profit_calc.expected(req, Some(liq));
-            let realized_profit = self.profit_calc.realized(liq, fin_res.swap_result.as_ref());
+            let realized_profit = self.profit_calc.realized(req, liq, fin_res.swap_result.as_ref());
 
             outcomes.push(LiquidationOutcome {
                 request: req.clone(),
@@ -359,6 +359,7 @@ mod tests {
             collateral_asset,
             expected_profit: 0,
             ref_price: Nat::from(0u8),
+            debt_approval_needed: false,
         }
     }
 

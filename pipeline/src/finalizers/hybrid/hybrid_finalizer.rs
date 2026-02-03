@@ -107,14 +107,14 @@ where
         let pay_amount_units = pay_amount / pay_scale;
         let est_value_usd = pay_amount_units * ref_price_f64;
 
-        if est_value_usd < 2.0 {
-            info!("[hybrid] 🟩 routing to kong (value_usd={:.4} < 2.00)", est_value_usd);
+        if est_value_usd < 2.5 {
+            info!("[hybrid] 🟩 routing to kong (value_usd={:.4} < 2.50)", est_value_usd);
             let mut res = self.finalize_via_dex(wal, receipt).await?;
             res.swapper = Some("kong".to_string());
             return Ok(res);
         }
 
-        info!("[hybrid] 🟧 routing to mexc (value_usd={:.4} >= 2.00)", est_value_usd);
+        info!("[hybrid] 🟧 routing to mexc (value_usd={:.4} >= 2.50)", est_value_usd);
         let mut res = self
             .finalize_via_cex(wal, receipt, Some("value_usd >= 2".to_string()))
             .await?;
