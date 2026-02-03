@@ -1,0 +1,14 @@
+target/
+*.db
+.git/
+.gitignore
+*.md
+LICENSE
+dev/
+docker-compose.yml
+config.env
+*.env
+*.key
+*.pem
+.github/
+.DS_Store
