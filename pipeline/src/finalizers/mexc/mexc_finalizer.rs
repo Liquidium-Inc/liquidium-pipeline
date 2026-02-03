@@ -621,6 +621,16 @@ where
             legs.len(),
             filled
         );
+        info!(
+            "[mexc] liq_id={} trade leg {}/{} result market={} side={} amount_in={} filled={}",
+            state.liq_id,
+            idx + 1,
+            legs.len(),
+            leg.market,
+            leg.side,
+            amount_in,
+            filled
+        );
 
         state.trade_last_amount_out = Some(filled);
         state.trade_next_amount_in = Some(filled);

@@ -137,7 +137,7 @@ where
                 let pay_scale = 10f64.powi(amount_in.token.decimals() as i32);
                 let pay_units = if pay_scale > 0.0 { pay_amount / pay_scale } else { 0.0 };
                 let est_value_usd = pay_units * ref_price_f64;
-                est_value_usd >= 2.0
+                est_value_usd >= 2.5
             }
         }
     }
