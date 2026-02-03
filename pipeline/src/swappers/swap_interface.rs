@@ -2,7 +2,6 @@ use async_trait::async_trait;
 
 use crate::swappers::model::{SwapExecution, SwapQuote, SwapRequest};
 
-
 #[cfg_attr(test, mockall::automock)]
 #[async_trait]
 pub trait SwapInterface: Send + Sync {

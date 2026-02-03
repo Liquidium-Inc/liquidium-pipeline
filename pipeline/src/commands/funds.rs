@@ -1,8 +1,7 @@
+use prettytable::{Cell, Row, Table, format};
 
-use prettytable::{format, Cell, Row, Table};
-
-use liquidium_pipeline_core::tokens::{asset_id::AssetId, chain_token_amount::ChainTokenAmount};
 use liquidium_pipeline_core::tokens::token_registry::TokenRegistryTrait;
+use liquidium_pipeline_core::tokens::{asset_id::AssetId, chain_token_amount::ChainTokenAmount};
 
 use crate::config::ConfigTrait;
 use crate::context::init_context;
@@ -27,11 +26,7 @@ pub async fn funds() -> Result<(), String> {
         println!("{: <HEADER_LABEL_WIDTH$}: {}.", "Recovery account", principal);
         println!("{: <HEADER_LABEL_WIDTH$}  {}", "", subaccount);
     } else {
-        println!(
-            "{: <HEADER_LABEL_WIDTH$}: {}",
-            "Recovery account",
-            recovery_account
-        );
+        println!("{: <HEADER_LABEL_WIDTH$}: {}", "Recovery account", recovery_account);
     }
     println!("{: <HEADER_LABEL_WIDTH$}: {}\n", "EVM address", ctx.evm_address);
     const ANSI_YELLOW: &str = "\x1b[33m";

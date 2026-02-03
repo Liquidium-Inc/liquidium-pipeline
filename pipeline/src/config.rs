@@ -16,12 +16,12 @@ use std::io::Write;
 
 use std::sync::Arc;
 
-
 fn expand_tilde(p: &str) -> std::path::PathBuf {
     if let Some(stripped) = p.strip_prefix("~/")
-        && let Ok(home) = std::env::var("HOME") {
-            return std::path::PathBuf::from(home).join(stripped);
-        }
+        && let Ok(home) = std::env::var("HOME")
+    {
+        return std::path::PathBuf::from(home).join(stripped);
+    }
     std::path::PathBuf::from(p)
 }
 
@@ -167,14 +167,14 @@ impl Config {
             .trim()
             .to_string();
 
-        let liquidator_identity = derive_icp_identity(&mnemonic, 0, 0)
-            .map_err(|e| format!("could not create liquidator identity: {e}"))?;
+        let liquidator_identity =
+            derive_icp_identity(&mnemonic, 0, 0).map_err(|e| format!("could not create liquidator identity: {e}"))?;
         let liquidator_principal = liquidator_identity
             .sender()
             .map_err(|e| format!("could not decode liquidator principal: {e}"))?;
 
-        let trader_identity = derive_icp_identity(&mnemonic, 0, 1)
-            .map_err(|e| format!("could not create trader identity: {e}"))?;
+        let trader_identity =
+            derive_icp_identity(&mnemonic, 0, 1).map_err(|e| format!("could not create trader identity: {e}"))?;
         let trader_principal = trader_identity
             .sender()
             .map_err(|e| format!("could not decode trader principal: {e}"))?;
@@ -246,8 +246,7 @@ impl Config {
             Err(_) => vec![],
         };
 
-        let evm_rpc_url =
-            env::var("EVM_RPC_URL").map_err(|_| "EVM_RPC_URL not configured".to_string())?;
+        let evm_rpc_url = env::var("EVM_RPC_URL").map_err(|_| "EVM_RPC_URL not configured".to_string())?;
 
         Ok(Arc::new(Config {
             evm_private_key,

@@ -20,8 +20,8 @@ use crate::{
     price_oracle::price_oracle::LiquidationPriceOracle,
     stage::PipelineStage,
     stages::{
-        executor::ExecutionStatus, export::ExportStage, finalize::FinalizeStage,
-        opportunity::OpportunityFinder, settlement_watcher::SettlementWatcher, simple_strategy::SimpleLiquidationStrategy,
+        executor::ExecutionStatus, export::ExportStage, finalize::FinalizeStage, opportunity::OpportunityFinder,
+        settlement_watcher::SettlementWatcher, simple_strategy::SimpleLiquidationStrategy,
     },
     swappers::{mexc::mexc_adapter::MexcClient, router::SwapRouter},
     watchdog::{WatchdogEvent, account_monitor_watchdog, webhook_watchdog_from_env},
@@ -56,7 +56,14 @@ fn shorten_middle(value: &str, head: usize, tail: usize) -> String {
     }
 
     let head_str: String = value.chars().take(head).collect();
-    let tail_str: String = value.chars().rev().take(tail).collect::<String>().chars().rev().collect();
+    let tail_str: String = value
+        .chars()
+        .rev()
+        .take(tail)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect();
     format!("{head_str}...{tail_str}")
 }
 
@@ -159,9 +166,7 @@ async fn init(
     let config = ctx.config.clone();
     let agent = ctx.agent.clone();
     let registry = ctx.registry.clone();
-    let db = Arc::new(
-        SqliteWalStore::new(&config.db_path).map_err(|e| format!("could not connect to db: {e}"))?,
-    );
+    let db = Arc::new(SqliteWalStore::new(&config.db_path).map_err(|e| format!("could not connect to db: {e}"))?);
 
     let tokens: Vec<Principal> = registry
         .debt_assets()

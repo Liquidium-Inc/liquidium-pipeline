@@ -63,10 +63,12 @@ pub struct ICTransferReply {
     pub block_index: Nat,
 }
 
-
 #[allow(clippy::large_enum_variant)]
 #[derive(CandidType, Deserialize, Clone, Serialize)]
-pub enum SwapResult { Ok(SwapReply), Err(String) }
+pub enum SwapResult {
+    Ok(SwapReply),
+    Err(String),
+}
 
 #[derive(CandidType, Debug, Clone, Serialize, Deserialize)]
 pub struct SwapReply {

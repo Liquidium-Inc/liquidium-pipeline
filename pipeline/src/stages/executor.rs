@@ -10,11 +10,14 @@ use crate::{
     finalizers::{finalizer::FinalizerResult, liquidation_outcome::LiquidationOutcome},
     persistance::{LiqMetaWrapper, LiqResultRecord, ResultStatus, WalStore},
     stage::PipelineStage,
-    utils::now_ts, wal::{encode_meta, liq_id_from_receipt},
+    utils::now_ts,
+    wal::{encode_meta, liq_id_from_receipt},
 };
 use liquidium_pipeline_connectors::pipeline_agent::PipelineAgent;
 
-use liquidium_pipeline_core::types::protocol_types::{LiquidationResult, LiquidationStatus, ProtocolError, TransferStatus};
+use liquidium_pipeline_core::types::protocol_types::{
+    LiquidationResult, LiquidationStatus, ProtocolError, TransferStatus,
+};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ExecutionStatus {
@@ -54,7 +57,6 @@ impl<'a, A: PipelineAgent, D: WalStore> PipelineStage<'a, Vec<ExecutorRequest>, 
     for BasicExecutor<A, D>
 {
     async fn process(&self, executor_requests: &'a Vec<ExecutorRequest>) -> Result<Vec<ExecutionReceipt>, String> {
-
         debug!("Executing request {:?}", executor_requests);
         // One future per request, all run concurrently
         let futures = executor_requests.iter().map(|executor_request| {
