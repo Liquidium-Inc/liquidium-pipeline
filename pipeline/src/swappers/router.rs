@@ -1,6 +1,7 @@
 use std::{collections::HashMap, sync::Arc};
 
 use async_trait::async_trait;
+use tracing::instrument;
 
 use crate::swappers::{
     model::{SwapExecution, SwapQuote, SwapRequest},
@@ -48,6 +49,7 @@ impl SwapRouter {
             .ok_or_else(|| format!("{} venue not found", name))
     }
 
+    #[instrument(name = "swap_router.init", skip_all, err)]
     pub async fn init(&self) -> Result<(), String> {
         let mut errors = Vec::new();
         for venue in &self.venues {
@@ -62,10 +64,12 @@ impl SwapRouter {
         }
     }
 
+    #[instrument(name = "swap_router.quote", skip_all, err, fields(pay = %req.pay_asset.symbol, receive = %req.receive_asset.symbol))]
     pub async fn quote(&self, req: &SwapRequest) -> Result<SwapQuote, String> {
         self.pick_venue(req)?.quote(req).await
     }
 
+    #[instrument(name = "swap_router.execute", skip_all, err, fields(pay = %req.pay_asset.symbol, receive = %req.receive_asset.symbol))]
     pub async fn execute(&self, req: &SwapRequest) -> Result<SwapExecution, String> {
         self.pick_venue(req)?.execute(req).await
     }

@@ -1,19 +1,14 @@
 use alloy::hex::ToHexExt;
+use alloy::signers::local::PrivateKeySigner;
 use candid::Principal;
-
 use ic_agent::Identity;
 use icrc_ledger_types::icrc1::account::Account;
-use indicatif::MultiProgress;
-use indicatif_log_bridge::LogWrapper;
+use liquidium_pipeline_commons::env::config_dir;
 use liquidium_pipeline_connectors::account::icp_account::{RECOVERY_ACCOUNT, derive_icp_identity};
 use liquidium_pipeline_connectors::crypto::derivation::derive_evm_private_key;
 use log::debug;
-
-use alloy::signers::local::PrivateKeySigner;
 use std::collections::HashMap;
 use std::env;
-use std::io::Write;
-
 use std::sync::Arc;
 
 fn expand_tilde(p: &str) -> std::path::PathBuf {
@@ -112,49 +107,7 @@ impl ConfigTrait for Config {
 
 impl Config {
     pub async fn load() -> Result<Arc<Self>, String> {
-        // Then load local .env
-        let _ = dotenv::dotenv();
-
-        // Load $HOME/.liquidium-pipeline/config.env
-        let home = if let Ok(home) = env::var("HOME") {
-            let config_path = format!("{}/.liquidium-pipeline/config.env", home);
-            let _ = dotenv::from_filename(config_path);
-            format!("{}/.liquidium-pipeline", home)
-        } else {
-            ".liquidium-pipeline".to_string()
-        };
-
-        let log_env = env_logger::Env::default().default_filter_or("info");
-        let mut logger_builder = env_logger::Builder::from_env(log_env);
-        logger_builder.format(|buf, record| {
-            let (color, level) = match record.level() {
-                log::Level::Error => ("\u{1b}[31m", "ERROR"),
-                log::Level::Warn => ("\u{1b}[33m", "WARN"),
-                log::Level::Info => ("\u{1b}[32m", "INFO"),
-                log::Level::Debug => ("\u{1b}[34m", "DEBUG"),
-                log::Level::Trace => ("\u{1b}[35m", "TRACE"),
-            };
-            let reset = "\u{1b}[0m";
-
-            writeln!(
-                buf,
-                "{} {}{:<5}{} {}",
-                buf.timestamp_millis(),
-                color,
-                level,
-                reset,
-                record.args()
-            )
-        });
-        logger_builder.format_target(false);
-        logger_builder.target(env_logger::Target::Stdout);
-
-        let logger = logger_builder.build();
-        let multi = MultiProgress::new();
-
-        LogWrapper::new(multi.clone(), logger)
-            .try_init()
-            .map_err(|e| format!("failed to initialize logger: {e}"))?;
+        let home = config_dir();
 
         let ic_url = env::var("IC_URL").map_err(|_| "IC_URL not configured".to_string())?;
         let export_path = env::var("EXPORT_PATH").unwrap_or("executions.csv".to_string());

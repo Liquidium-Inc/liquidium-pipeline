@@ -14,8 +14,9 @@ use crate::{
     wal::liq_id_from_receipt,
 };
 
-use log::info;
 use num_traits::ToPrimitive;
+use tracing::info;
+use tracing::instrument;
 
 pub struct HybridFinalizer<C>
 where
@@ -57,6 +58,7 @@ impl<C> Finalizer for HybridFinalizer<C>
 where
     C: ConfigTrait + Send + Sync,
 {
+    #[instrument(name = "hybrid.finalize", skip_all, err)]
     async fn finalize(&self, wal: &dyn WalStore, receipt: ExecutionReceipt) -> Result<FinalizerResult, String> {
         // First, respect the configured swapper mode. In Dex/Cex modes we bypass hybrid logic.
         match self.config.get_swapper_mode() {

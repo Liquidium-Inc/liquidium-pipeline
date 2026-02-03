@@ -2,8 +2,9 @@ use async_trait::async_trait;
 use candid::Encode;
 
 use futures::{TryFutureExt, future::join_all};
-use log::{debug, info, warn};
 use serde::{Deserialize, Serialize};
+use tracing::instrument;
+use tracing::{debug, info, warn};
 
 use crate::{
     executors::{basic::basic_executor::BasicExecutor, executor::ExecutorRequest},
@@ -56,6 +57,7 @@ pub struct ExecutionReceipt {
 impl<'a, A: PipelineAgent, D: WalStore> PipelineStage<'a, Vec<ExecutorRequest>, Vec<ExecutionReceipt>>
     for BasicExecutor<A, D>
 {
+    #[instrument(name = "executor.process", skip_all, err, fields(request_count = executor_requests.len()))]
     async fn process(&self, executor_requests: &'a Vec<ExecutorRequest>) -> Result<Vec<ExecutionReceipt>, String> {
         debug!("Executing request {:?}", executor_requests);
         // One future per request, all run concurrently

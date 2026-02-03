@@ -1,0 +1,34 @@
+# Local development only - observability stack for testing telemetry
+# Usage: docker-compose up -d
+# - Grafana: http://localhost:3008 (traces via Tempo, logs via Loki)
+
+services:
+  tempo:
+    image: grafana/tempo:2.6.1
+    command: ["-config.file=/etc/tempo.yaml"]
+    volumes:
+      - ./dev/tempo.yaml:/etc/tempo.yaml
+    ports:
+      - "4317:4317"
+      - "4318:4318"
+      - "3200:3200"
+
+  loki:
+    image: grafana/loki:latest
+    ports:
+      - "3100:3100"
+    command: -config.file=/etc/loki/local-config.yaml
+
+  grafana:
+    image: grafana/grafana:latest
+    ports:
+      - "3008:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_AUTH_ANONYMOUS_ENABLED=true
+      - GF_AUTH_ANONYMOUS_ORG_ROLE=Admin
+    volumes:
+      - ./dev/grafana-datasources.yaml:/etc/grafana/provisioning/datasources/datasources.yaml
+    depends_on:
+      - loki
+      - tempo

@@ -76,13 +76,6 @@ fn expand_tilde(p: &str) -> PathBuf {
 }
 
 pub async fn new() {
-    // Load config locations if you haven't already done that globally
-    let _ = dotenv::from_filename(format!(
-        "{}/.liquidium-pipeline/config.env",
-        env::var("HOME").unwrap_or_default()
-    ));
-    let _ = dotenv::dotenv();
-
     let mnemonic_path: PathBuf = match env::var("MNEMONIC_FILE") {
         Ok(p) => expand_tilde(&p),
         Err(_) => match default_mnemonic_path() {

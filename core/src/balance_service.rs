@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use futures::future::join_all;
+use tracing::instrument;
 
 use crate::{
     account::actions::AccountInfo,
@@ -21,6 +22,7 @@ impl BalanceService {
     }
 
     // Sync a custom list of assets for this account.
+    #[instrument(name = "balance_service.sync_assets", skip_all, fields(asset_count = assets.len()))]
     pub async fn sync_assets(&self, assets: &[AssetId]) -> Vec<Result<(AssetId, ChainTokenAmount), String>> {
         let futs = assets.iter().cloned().map(|asset_id| {
             let accounts = self.accounts.clone();
@@ -63,6 +65,7 @@ impl BalanceService {
     }
 
     // Get the balance for a single AssetId.
+    #[instrument(name = "balance_service.get_balance", skip(self), err, fields(asset = %asset_id))]
     pub async fn get_balance(&self, asset_id: &AssetId) -> Result<ChainTokenAmount, String> {
         let token = self
             .registry
