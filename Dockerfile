@@ -1,5 +1,7 @@
 FROM rust:alpine AS builder
 
+LABEL org.opencontainers.image.source=https://github.com/Liquidium-Inc/liquidium-pipeline
+
 RUN apk add --no-cache musl-dev pkgconfig openssl-dev sqlite-dev
 
 WORKDIR /app
