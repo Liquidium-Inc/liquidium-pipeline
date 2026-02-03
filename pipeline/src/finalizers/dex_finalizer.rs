@@ -14,10 +14,12 @@ const STEP_SLIPPAGE_BPS: u32 = 50; // +0.5% per retry
 const MAX_SLIPPAGE_BPS: u32 = 500; // 5.0% cap
 const MAX_SLIPPAGE_RETRIES: u32 = 3; // total attempts = MAX_SLIPPAGE_RETRIES + 1
 
-fn slippage_for_retry(retry: u32, explicit: Option<u32>) -> u32 {
-    let base = explicit.unwrap_or(BASE_SLIPPAGE_BPS);
+fn slippage_for_retry(retry: u32, explicit_cap: Option<u32>) -> u32 {
+    // Start at BASE_SLIPPAGE_BPS and bump per retry, respecting the explicit cap if provided.
+    let cap = explicit_cap.unwrap_or(MAX_SLIPPAGE_BPS).min(MAX_SLIPPAGE_BPS);
+    let base = BASE_SLIPPAGE_BPS.min(cap);
     let bump = STEP_SLIPPAGE_BPS.saturating_mul(retry);
-    base.saturating_add(bump).min(MAX_SLIPPAGE_BPS)
+    base.saturating_add(bump).min(cap)
 }
 
 #[async_trait]

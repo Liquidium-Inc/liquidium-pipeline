@@ -138,11 +138,23 @@ where
             req.max_slippage_bps
         );
 
+        let max_slip_bps = req.max_slippage_bps;
+        let max_slip_pct = max_slip_bps.map(|bps| (bps as f64) / 100.0);
+        let kong_max_slip = kong_req.max_slippage;
+        let pay_amount_final = kong_req.pay_amount.clone();
+
         // Execute swap on Kong
         let reply: KongSwapReply = self.swapper.swap(kong_req).await.map_err(|e| {
             warn!(
-                "[kong] execute failed pay={} {} -> {} err={}",
-                req.pay_amount.value, req.pay_asset.symbol, req.receive_asset.symbol, e
+                "[kong] execute failed pay={} {} -> {} err={} max_slip_bps={:?} max_slip_pct={:?} kong_max_slip={:?} pay_amount_final={}",
+                req.pay_amount.value,
+                req.pay_asset.symbol,
+                req.receive_asset.symbol,
+                e,
+                max_slip_bps,
+                max_slip_pct,
+                kong_max_slip,
+                pay_amount_final
             );
             e
         })?;
