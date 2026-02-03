@@ -15,12 +15,11 @@ pub trait WadRayMath {
     fn from_wad(&self) -> Self;
 }
 
-
-pub const WAD: u128 = 1_000_000_000_000_000_000;             // 1e18
+pub const WAD: u128 = 1_000_000_000_000_000_000; // 1e18
 pub const HALF_WAD: u128 = WAD / 2;
-pub const RAY: u128 = 1_000_000_000_000_000_000_000_000_000;   // 1e27
+pub const RAY: u128 = 1_000_000_000_000_000_000_000_000_000; // 1e27
 pub const HALF_RAY: u128 = RAY / 2;
-pub const WAD_RAY_RATIO: u128 = 1_000_000_000;                // 1e9
+pub const WAD_RAY_RATIO: u128 = 1_000_000_000; // 1e9
 
 #[allow(dead_code)]
 pub fn ray_from(value: u128) -> Nat {
@@ -28,7 +27,6 @@ pub fn ray_from(value: u128) -> Nat {
 }
 
 impl WadRayMath for Nat {
-   
     fn to_ray(&self) -> Self {
         self.clone() * RAY
     }
@@ -40,7 +38,7 @@ impl WadRayMath for Nat {
     fn from_ray(&self) -> Self {
         self.clone() / RAY
     }
-    
+
     fn from_wad(&self) -> Self {
         self.clone() / WAD
     }
@@ -71,7 +69,7 @@ impl WadRayMath for Nat {
     fn wad_to_ray(&self) -> Self {
         self.clone() * Nat::from(WAD_RAY_RATIO)
     }
-    
+
     fn ray_pow(&self, mut exp: u128) -> Self {
         // Compute self^exp in ray precision.
         let mut z = if !exp.is_multiple_of(2) {

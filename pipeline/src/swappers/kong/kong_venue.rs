@@ -115,10 +115,7 @@ where
         let balance = self.swapper.balance_of(&token_in).await?;
         let fee = token_in.fee();
         if balance <= fee {
-            return Err(format!(
-                "insufficient balance for fee: balance={} fee={}",
-                balance, fee
-            ));
+            return Err(format!("insufficient balance for fee: balance={} fee={}", balance, fee));
         }
         let max_pay = balance - fee.clone();
         if kong_req.pay_amount > max_pay {

@@ -38,10 +38,18 @@ pub fn compute_liquidation_amounts(
     fee_bps: u64,
 ) -> Result<(Nat, Nat), String> {
     // Guards
-    if *price_coll_ray == 0u8 { return Err("Zero collateral price".into()); }
-    if *price_debt_ray == 0u8 { return Err("Zero debt price".into()); }
-    if bonus_bps > BPS_ONE || fee_bps > BPS_ONE { return Err("bps out of range".into()); }
-    if debt_decimals > 38 || coll_decimals > 38 { return Err("decimals too large".into()); }
+    if *price_coll_ray == 0u8 {
+        return Err("Zero collateral price".into());
+    }
+    if *price_debt_ray == 0u8 {
+        return Err("Zero debt price".into());
+    }
+    if bonus_bps > BPS_ONE || fee_bps > BPS_ONE {
+        return Err("bps out of range".into());
+    }
+    if debt_decimals > 38 || coll_decimals > 38 {
+        return Err("decimals too large".into());
+    }
 
     let debt_scale = pow10(debt_decimals);
     let coll_scale = pow10(coll_decimals);
@@ -53,12 +61,12 @@ pub fn compute_liquidation_amounts(
     // Bonus and fee in quote (RAY)
     let one_bps = Nat::from(BPS_ONE);
     let bonus_quote_ray = (repay_quote_ray.clone() * Nat::from(bonus_bps)) / one_bps.clone();
-    let fee_quote_ray   = (bonus_quote_ray.clone() * Nat::from(fee_bps)) / one_bps.clone();
-    let net_quote_ray   = repay_quote_ray + (bonus_quote_ray.clone() - fee_quote_ray.clone());
+    let fee_quote_ray = (bonus_quote_ray.clone() * Nat::from(fee_bps)) / one_bps.clone();
+    let net_quote_ray = repay_quote_ray + (bonus_quote_ray.clone() - fee_quote_ray.clone());
 
     // Convert quote (RAY) -> collateral native (single truncation)
     let seized_native = (net_quote_ray * coll_scale.clone()) / price_coll_ray.clone();
-    let fee_native    = (fee_quote_ray * coll_scale) / price_coll_ray.clone();
+    let fee_native = (fee_quote_ray * coll_scale) / price_coll_ray.clone();
 
     Ok((seized_native, fee_native))
 }
@@ -117,10 +125,18 @@ pub fn max_repay_from_collateral(
     bonus_bps: u64,
     fee_bps: u64,
 ) -> Result<Nat, String> {
-    if *price_debt_ray == 0u8 { return Err("Zero debt price".into()); }
-    if *price_coll_ray == 0u8 { return Err("Zero collateral price".into()); }
-    if bonus_bps > BPS_ONE || fee_bps > BPS_ONE { return Err("bps out of range".into()); }
-    if debt_decimals > 38 || coll_decimals > 38 { return Err("decimals too large".into()); }
+    if *price_debt_ray == 0u8 {
+        return Err("Zero debt price".into());
+    }
+    if *price_coll_ray == 0u8 {
+        return Err("Zero collateral price".into());
+    }
+    if bonus_bps > BPS_ONE || fee_bps > BPS_ONE {
+        return Err("bps out of range".into());
+    }
+    if debt_decimals > 38 || coll_decimals > 38 {
+        return Err("decimals too large".into());
+    }
 
     let debt_scale = pow10(debt_decimals);
     let coll_scale = pow10(coll_decimals);
@@ -135,7 +151,9 @@ pub fn max_repay_from_collateral(
     let fee = Nat::from(fee_bps);
     let bonus_fee = (bonus.clone() * fee.clone()) / one_bps.clone();
     let denom_bps = one_bps.clone() + bonus - bonus_fee; // >= 10_000
-    if denom_bps == 0u8 { return Err("Invalid liquidation params".into()); }
+    if denom_bps == 0u8 {
+        return Err("Invalid liquidation params".into());
+    }
 
     // r_max_quote_ray = coll_cap_quote_ray * 10_000 / denom_bps   (still RAY)
     let r_max_quote_ray = (coll_cap_quote_ray * one_bps.clone()) / denom_bps;
@@ -227,12 +245,7 @@ mod tests {
         };
         // Tolerance: one smallest native unit of collateral (USDC has 6 decimals here)
         let tol = pow10(6);
-        assert!(
-            diff <= tol,
-            "round-trip loss {} exceeds collateral unit {}",
-            diff,
-            tol
-        );
+        assert!(diff <= tol, "round-trip loss {} exceeds collateral unit {}", diff, tol);
     }
 
     #[test]

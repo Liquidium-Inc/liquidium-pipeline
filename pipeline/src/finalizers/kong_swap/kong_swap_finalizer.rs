@@ -227,15 +227,12 @@ mod tests {
         let wal = MockWalStore::new();
         let mut swapper = MockSwapInterface::new();
 
-        swapper
-            .expect_execute()
-            .times(1)
-            .returning(|req: &SwapRequest| {
-                // basic sanity: finalize passes the swap_args through to the swapper
-                assert_eq!(req.pay_asset.symbol, "ckBTC");
-                assert_eq!(req.receive_asset.symbol, "ckUSDT");
-                Ok(make_test_swap_execution())
-            });
+        swapper.expect_execute().times(1).returning(|req: &SwapRequest| {
+            // basic sanity: finalize passes the swap_args through to the swapper
+            assert_eq!(req.pay_asset.symbol, "ckBTC");
+            assert_eq!(req.receive_asset.symbol, "ckUSDT");
+            Ok(make_test_swap_execution())
+        });
 
         let finalizer = KongSwapFinalizer {
             swapper: Arc::new(swapper),

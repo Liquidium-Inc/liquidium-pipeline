@@ -6,13 +6,13 @@ use alloy::signers::local::PrivateKeySigner;
 
 use ic_agent::Agent;
 use icrc_ledger_types::icrc1::account::Account;
-use log::info;
 use liquidium_pipeline_connectors::account::evm_account::EvmAccountInfoAdapter;
 use liquidium_pipeline_connectors::account::icp_account::{IcpAccountInfoAdapter, RECOVERY_ACCOUNT};
 use liquidium_pipeline_connectors::backend::evm_backend::EvmBackendImpl;
 use liquidium_pipeline_core::balance_service::BalanceService;
 use liquidium_pipeline_core::tokens::chain_token::ChainToken;
 use liquidium_pipeline_core::transfer::transfer_service::TransferService;
+use log::info;
 
 use liquidium_pipeline_core::{account::actions::AccountInfo, tokens::token_registry::TokenRegistry};
 
@@ -94,12 +94,7 @@ impl<P: Provider<AnyNetwork> + WalletProvider<AnyNetwork> + Clone + 'static> Pip
         let registry = Arc::new(load_token_registry(icp_backend_main.clone(), evm_backend_main.clone()).await?);
         for (id, token) in registry.tokens.iter() {
             if let ChainToken::Icp { fee, .. } = token {
-                info!(
-                    "Loaded ICRC fee: {} {} (ledger={})",
-                    token.symbol(),
-                    fee,
-                    id.address
-                );
+                info!("Loaded ICRC fee: {} {} (ledger={})", token.symbol(), fee, id.address);
             }
         }
 
@@ -154,15 +149,9 @@ impl<P: Provider<AnyNetwork> + WalletProvider<AnyNetwork> + Clone + 'static> Pip
         let transfer_router_main = Arc::new(MultiChainTransferRouter::new(icp_transfer_main, evm_transfer_main));
         let main_transfers = TransferService::new(registry.clone(), transfer_router_main);
 
-        let icp_transfer_trader = Arc::new(IcpTransferAdapter::new(
-            icp_backend_trader.clone(),
-            trader_icp_account,
-        ));
+        let icp_transfer_trader = Arc::new(IcpTransferAdapter::new(icp_backend_trader.clone(), trader_icp_account));
         let evm_transfer_trader = Arc::new(EvmTransferAdapter::new(evm_backend_trader.clone()));
-        let transfer_router_trader = Arc::new(MultiChainTransferRouter::new(
-            icp_transfer_trader,
-            evm_transfer_trader,
-        ));
+        let transfer_router_trader = Arc::new(MultiChainTransferRouter::new(icp_transfer_trader, evm_transfer_trader));
         let trader_transfers = TransferService::new(registry.clone(), transfer_router_trader);
 
         let icp_transfer_recovery = Arc::new(IcpTransferAdapter::new(

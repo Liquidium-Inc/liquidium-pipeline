@@ -125,9 +125,7 @@ where
 
     let collateral_ids = coll_specs
         .into_iter()
-        .map(|spec| {
-            AssetId::from_str(&spec).map_err(|e| format!("invalid collateral asset spec '{}': {e}", spec))
-        })
+        .map(|spec| AssetId::from_str(&spec).map_err(|e| format!("invalid collateral asset spec '{}': {e}", spec)))
         .collect::<Result<Vec<_>, _>>()?;
 
     let debt_ids = debt_specs

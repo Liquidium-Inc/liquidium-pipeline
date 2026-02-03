@@ -8,13 +8,15 @@ mod persistance;
 mod price_oracle;
 mod stage;
 mod stages;
-mod wal;
 pub mod swappers;
+mod wal;
 
 mod approval_state;
 mod utils;
 mod watchdog;
 use clap::{Parser, Subcommand};
+use liquidium_pipeline_commons::env::load_env;
+use liquidium_pipeline_commons::telemetry::init_telemetry_from_env;
 
 use crate::commands::liquidation_loop::run_liquidation_loop;
 
@@ -79,7 +81,9 @@ enum AccountCommands {
 
 #[tokio::main]
 async fn main() {
-    // Parse CLI
+    load_env();
+    let _telemetry_guard = init_telemetry_from_env().expect("Failed to initialize telemetry");
+
     let cli = Cli::parse();
 
     match &cli.command {

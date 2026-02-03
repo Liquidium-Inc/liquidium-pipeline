@@ -30,10 +30,7 @@ impl SqliteWalStore {
         let mut conn = pool.get()?;
         initialize_schema(&mut conn)?;
         apply_pragmas(&mut conn, busy_timeout_ms)?;
-        Ok(Self {
-            pool,
-            busy_timeout_ms,
-        })
+        Ok(Self { pool, busy_timeout_ms })
     }
 
     fn get_conn(&self) -> Result<r2d2::PooledConnection<ConnectionManager<SqliteConnection>>> {
@@ -93,10 +90,7 @@ impl WalStore for SqliteWalStore {
                     .and(tbl::updated_at.le(inflight_stale_cutoff)),
             ),
         )
-        .set((
-            tbl::status.eq(ResultStatus::Enqueued as i32),
-            tbl::updated_at.eq(now),
-        ))
+        .set((tbl::status.eq(ResultStatus::Enqueued as i32), tbl::updated_at.eq(now)))
         .execute(&mut conn)?;
 
         let rows = tbl::table
@@ -225,9 +219,8 @@ pub fn initialize_schema(conn: &mut SqliteConnection) -> Result<()> {
 }
 
 pub fn apply_pragmas(conn: &mut SqliteConnection, busy_timeout_ms: i64) -> Result<()> {
-    conn.batch_execute(
-        &format!(
-            r#"
+    conn.batch_execute(&format!(
+        r#"
         PRAGMA journal_mode=DELETE;
         PRAGMA synchronous=FULL;
         PRAGMA fullfsync=ON;
@@ -238,8 +231,7 @@ pub fn apply_pragmas(conn: &mut SqliteConnection, busy_timeout_ms: i64) -> Resul
         PRAGMA secure_delete=ON;
         PRAGMA busy_timeout={};
     "#,
-            busy_timeout_ms
-        ),
-    )?;
+        busy_timeout_ms
+    ))?;
     Ok(())
 }

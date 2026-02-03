@@ -64,21 +64,13 @@ pub async fn wal_mark_succeeded(wal: &dyn WalStore, liq_id: &str) -> Result<(), 
         .map_err(|e| e.to_string())
 }
 
-pub async fn wal_mark_retryable_failed(
-    wal: &dyn WalStore,
-    liq_id: &str,
-    last_error: String,
-) -> Result<(), String> {
+pub async fn wal_mark_retryable_failed(wal: &dyn WalStore, liq_id: &str, last_error: String) -> Result<(), String> {
     wal.update_failure(liq_id, ResultStatus::FailedRetryable, last_error, true)
         .await
         .map_err(|e| e.to_string())
 }
 
-pub async fn wal_mark_permanent_failed(
-    wal: &dyn WalStore,
-    liq_id: &str,
-    last_error: String,
-) -> Result<(), String> {
+pub async fn wal_mark_permanent_failed(wal: &dyn WalStore, liq_id: &str, last_error: String) -> Result<(), String> {
     wal.update_failure(liq_id, ResultStatus::FailedPermanent, last_error, true)
         .await
         .map_err(|e| e.to_string())

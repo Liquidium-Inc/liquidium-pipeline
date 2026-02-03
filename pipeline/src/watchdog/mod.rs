@@ -41,13 +41,10 @@ pub struct WebhookWatchdog {
 impl WebhookWatchdog {
     pub fn new(url: impl Into<String>, cooldown: Duration, principal: Option<Principal>) -> Self {
         let timeout = Duration::from_secs(WATCHDOG_HTTP_TIMEOUT_SECS);
-        let client = reqwest::Client::builder()
-            .timeout(timeout)
-            .build()
-            .unwrap_or_else(|e| {
-                warn!("Failed to build reqwest client with timeout: {}, using default", e);
-                reqwest::Client::new()
-            });
+        let client = reqwest::Client::builder().timeout(timeout).build().unwrap_or_else(|e| {
+            warn!("Failed to build reqwest client with timeout: {}, using default", e);
+            reqwest::Client::new()
+        });
 
         Self {
             url: url.into(),

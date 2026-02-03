@@ -2,9 +2,10 @@ use candid::Principal;
 use icrc_ledger_types::icrc1::account::Account;
 use indicatif::{ProgressBar, ProgressStyle};
 
-use log::{info, warn};
 use prettytable::{Cell, Row, Table, format};
 use std::{sync::Arc, thread::sleep, time::Duration};
+use tracing::{Instrument, info_span, instrument};
+use tracing::{info, warn};
 
 use crate::{
     config::{Config, ConfigTrait, SwapperMode},
@@ -20,8 +21,8 @@ use crate::{
     price_oracle::price_oracle::LiquidationPriceOracle,
     stage::PipelineStage,
     stages::{
-        executor::ExecutionStatus, export::ExportStage, finalize::FinalizeStage,
-        opportunity::OpportunityFinder, settlement_watcher::SettlementWatcher, simple_strategy::SimpleLiquidationStrategy,
+        executor::ExecutionStatus, export::ExportStage, finalize::FinalizeStage, opportunity::OpportunityFinder,
+        settlement_watcher::SettlementWatcher, simple_strategy::SimpleLiquidationStrategy,
     },
     swappers::{mexc::mexc_adapter::MexcClient, router::SwapRouter},
     watchdog::{WatchdogEvent, account_monitor_watchdog, webhook_watchdog_from_env},
@@ -79,6 +80,7 @@ fn print_startup_table(config: &Config) {
     table.printstd();
 }
 
+#[instrument(name = "liquidation.init", skip_all, err)]
 async fn init(
     ctx: Arc<PipelineContext>,
 ) -> Result<
@@ -94,9 +96,7 @@ async fn init(
     let config = ctx.config.clone();
     let agent = ctx.agent.clone();
     let registry = ctx.registry.clone();
-    let db = Arc::new(
-        SqliteWalStore::new(&config.db_path).map_err(|e| format!("could not connect to db: {e}"))?,
-    );
+    let db = Arc::new(SqliteWalStore::new(&config.db_path).map_err(|e| format!("could not connect to db: {e}"))?);
 
     let tokens: Vec<Principal> = registry
         .debt_assets()
@@ -211,7 +211,7 @@ pub async fn run_liquidation_loop() {
     let ctx = match init_context().await {
         Ok(ctx) => ctx,
         Err(err) => {
-            log::error!("Failed to initialize pipeline context: {}", err);
+            tracing::error!("Failed to initialize pipeline context: {}", err);
             return;
         }
     };
@@ -248,7 +248,7 @@ pub async fn run_liquidation_loop() {
     let (finder, strategy, executor, exporter, finalizer) = match init(ctx.clone()).await {
         Ok(stages) => stages,
         Err(err) => {
-            log::error!("Failed to initialize pipeline stages: {}", err);
+            tracing::error!("Failed to initialize pipeline stages: {}", err);
             return;
         }
     };
@@ -256,7 +256,7 @@ pub async fn run_liquidation_loop() {
     let watcher_wal = match SqliteWalStore::new_with_busy_timeout(&config.db_path, 30_000) {
         Ok(wal) => Arc::new(wal),
         Err(err) => {
-            log::error!("Failed to init watcher WAL: {}", err);
+            tracing::error!("Failed to init watcher WAL: {}", err);
             return;
         }
     };
@@ -315,26 +315,31 @@ pub async fn run_liquidation_loop() {
             spinner.finish_and_clear();
             info!("Found {:?} opportunities", opportunities.len());
 
-            let executions = strategy.process(&opportunities).await.unwrap_or_else(|e| {
-                log::info!("Strategy processing failed: {e}");
-                vec![]
-            });
+            let opp_count = opportunities.len();
+            async {
+                let executions = strategy.process(&opportunities).await.unwrap_or_else(|e| {
+                    tracing::info!("Strategy processing failed: {e}");
+                    vec![]
+                });
 
-            if executions.is_empty() {
-                info!(
-                    "Found {} opportunities but none executable yet; likely waiting for funds or liquidity",
-                    opportunities.len()
-                );
+                if executions.is_empty() {
+                    info!(
+                        "Found {} opportunities but none executable yet; likely waiting for funds or liquidity",
+                        opportunities.len()
+                    );
+                }
+
+                executor.process(&executions).await.unwrap_or_else(|e| {
+                    tracing::error!("Executor failed: {e}");
+                    vec![]
+                });
             }
-
-            executor.process(&executions).await.unwrap_or_else(|e| {
-                log::error!("Executor failed: {e}");
-                vec![]
-            });
+            .instrument(info_span!("liquidation.cycle", opportunities = opp_count))
+            .await;
         }
 
         let outcomes = finalizer.process(&()).await.unwrap_or_else(|e| {
-            log::error!("Finalizer failed: {e}");
+            tracing::error!("Finalizer failed: {e}");
             vec![]
         });
 

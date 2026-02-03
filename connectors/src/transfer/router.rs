@@ -5,6 +5,7 @@ use candid::Nat;
 use liquidium_pipeline_core::account::model::ChainAccount;
 use liquidium_pipeline_core::tokens::chain_token::ChainToken;
 use liquidium_pipeline_core::transfer::actions::TransferActions;
+use tracing::instrument;
 
 pub struct MultiChainTransferRouter<I, E> {
     pub icp: Arc<I>,
@@ -23,6 +24,7 @@ where
     I: TransferActions + Send + Sync,
     E: TransferActions + Send + Sync,
 {
+    #[instrument(name = "transfer_router.transfer", skip_all, err, fields(token = %token.symbol()))]
     async fn transfer(&self, token: &ChainToken, to: &ChainAccount, amount_native: Nat) -> Result<String, String> {
         // Validate that token and destination are on the same chain
         match (token, to) {
@@ -35,12 +37,8 @@ where
         }
     }
 
-    async fn approve(
-        &self,
-        token: &ChainToken,
-        spender: &ChainAccount,
-        amount_native: Nat,
-    ) -> Result<String, String> {
+    #[instrument(name = "transfer_router.approve", skip_all, err, fields(token = %token.symbol()))]
+    async fn approve(&self, token: &ChainToken, spender: &ChainAccount, amount_native: Nat) -> Result<String, String> {
         match token {
             ChainToken::Icp { .. } => self.icp.approve(token, spender, amount_native).await,
             ChainToken::EvmNative { .. } | ChainToken::EvmErc20 { .. } => {

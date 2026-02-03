@@ -1,4 +1,3 @@
-
 use candid::{CandidType, Nat};
 use liquidium_pipeline_core::tokens::{asset_id::AssetId, chain_token_amount::ChainTokenAmount};
 use serde::{Deserialize, Serialize};
@@ -16,7 +15,7 @@ pub struct SwapRequest {
     pub receive_asset: AssetId,
     pub receive_address: Option<String>,
     pub max_slippage_bps: Option<u32>, // 100 = 1%
-    pub venue_hint: Option<String>, // "kong", "mexc", etc (optional)
+    pub venue_hint: Option<String>,    // "kong", "mexc", etc (optional)
 }
 
 #[derive(CandidType, Debug, Clone, Serialize, Deserialize)]

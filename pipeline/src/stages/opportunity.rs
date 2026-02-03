@@ -172,19 +172,15 @@ mod tests {
         let users_for_scan = users.clone();
 
         // given
-        agent
-            .expect_call_query::<u64>()
-            .returning(move |_, _, _| Ok(users_len));
+        agent.expect_call_query::<u64>().returning(move |_, _, _| Ok(users_len));
 
-        agent
-            .expect_call_query::<ScanResult>()
-            .returning(move |_, _, _| {
-                Ok(ScanResult {
-                    users: users_for_scan.clone(),
-                    next_cursor: None,
-                    scanned: users_len,
-                })
-            });
+        agent.expect_call_query::<ScanResult>().returning(move |_, _, _| {
+            Ok(ScanResult {
+                users: users_for_scan.clone(),
+                next_cursor: None,
+                scanned: users_len,
+            })
+        });
 
         let finder = OpportunityFinder::new(Arc::new(agent), canister_id, vec![]);
         let supported_assets = vec![ckbtc_principal.to_string(), ckusdc_principal.to_string()];
@@ -249,19 +245,15 @@ mod tests {
         let users_for_scan = users.clone();
 
         // given
-        agent
-            .expect_call_query::<u64>()
-            .returning(move |_, _, _| Ok(users_len));
+        agent.expect_call_query::<u64>().returning(move |_, _, _| Ok(users_len));
 
-        agent
-            .expect_call_query::<ScanResult>()
-            .returning(move |_, _, _| {
-                Ok(ScanResult {
-                    users: users_for_scan.clone(),
-                    next_cursor: None,
-                    scanned: users_len,
-                })
-            });
+        agent.expect_call_query::<ScanResult>().returning(move |_, _, _| {
+            Ok(ScanResult {
+                users: users_for_scan.clone(),
+                next_cursor: None,
+                scanned: users_len,
+            })
+        });
 
         let finder = OpportunityFinder::new(Arc::new(agent), canister_id, vec![]);
         let supported_assets = vec![ckbtc_principal.to_string()];
@@ -317,19 +309,15 @@ mod tests {
         let users_for_scan = users.clone();
 
         // given
-        agent
-            .expect_call_query::<u64>()
-            .returning(move |_, _, _| Ok(users_len));
+        agent.expect_call_query::<u64>().returning(move |_, _, _| Ok(users_len));
 
-        agent
-            .expect_call_query::<ScanResult>()
-            .returning(move |_, _, _| {
-                Ok(ScanResult {
-                    users: users_for_scan.clone(),
-                    next_cursor: None,
-                    scanned: users_len,
-                })
-            });
+        agent.expect_call_query::<ScanResult>().returning(move |_, _, _| {
+            Ok(ScanResult {
+                users: users_for_scan.clone(),
+                next_cursor: None,
+                scanned: users_len,
+            })
+        });
 
         let finder = OpportunityFinder::new(Arc::new(agent), canister_id, vec![target_account]);
         let supported_assets = vec![Principal::anonymous().to_string()];
