@@ -101,6 +101,16 @@ fn draw_balances_actions(f: &mut Frame<'_>, area: Rect, app: &App) {
             "Selected: {}:{}",
             selected.asset.chain, selected.asset.symbol
         )));
+        lines.push(Line::from("Liquidator deposit address:"));
+        if selected.asset.chain.eq_ignore_ascii_case("icp") {
+            lines.push(Line::from(format!("  ICP: {}", app.config.liquidator_principal)));
+        } else {
+            lines.push(Line::from(format!(
+                "  {}: {}",
+                selected.asset.chain.to_ascii_uppercase(),
+                app.config.evm_address
+            )));
+        }
         lines.push(Line::from(""));
     }
 

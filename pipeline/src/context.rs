@@ -86,7 +86,7 @@ impl<P: Provider<AnyNetwork> + WalletProvider<AnyNetwork> + Clone + 'static> Pip
 
         // Use provided EVM providers or fail
         let main_provider = self.evm_provider_main.ok_or("missing main EVM provider")?;
-        let evm_address = format!("{:?}", main_provider.default_signer_address());
+        let evm_address = format!("{}", main_provider.default_signer_address());
 
         let evm_backend_main = Arc::new(EvmBackendImpl::new(main_provider));
         let evm_backend_trader = evm_backend_main.clone();

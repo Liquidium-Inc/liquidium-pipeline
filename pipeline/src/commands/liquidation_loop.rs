@@ -3,7 +3,10 @@ use icrc_ledger_types::icrc1::account::Account;
 use indicatif::{ProgressBar, ProgressStyle};
 
 use prettytable::{Cell, Row, Table, format};
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 use tokio::sync::{mpsc, watch};
 use tokio::time::sleep;
 use tracing::{Instrument, info_span, instrument};
@@ -422,6 +425,9 @@ pub async fn run_liquidation_loop_controlled(
 
     // Setup liquidity monitor
     let liq_dog = account_monitor_watchdog(Duration::from_secs(5), ctx.config.liquidator_principal);
+    let mut last_scan_log = Instant::now()
+        .checked_sub(Duration::from_secs(3600))
+        .unwrap_or_else(Instant::now);
 
     loop {
         let control = *control_rx.borrow();
@@ -431,6 +437,12 @@ pub async fn run_liquidation_loop_controlled(
                 break;
             }
             LoopControl::Running => {
+                let now = Instant::now();
+                if now.duration_since(last_scan_log) >= Duration::from_secs(30) {
+                    let _ = event_tx.send(LoopEvent::Log("scanning for liquidation opportunities...".to_string()));
+                    last_scan_log = now;
+                }
+
                 let opportunities = finder.process(&debt_assets).await.unwrap_or_else(|e| {
                     let _ = event_tx.send(LoopEvent::Error(format!("opportunity finder error: {e}")));
                     vec![]

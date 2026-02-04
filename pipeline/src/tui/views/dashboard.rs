@@ -2,7 +2,7 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, Wrap};
+use ratatui::widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table, Wrap};
 
 use super::super::app::App;
 use super::super::format::format_i128_amount;
@@ -19,15 +19,29 @@ pub(super) fn draw_dashboard(f: &mut Frame<'_>, area: Rect, app: &App) {
         .split(chunks[0]);
 
     draw_recent_logs(f, top[0], app);
-    draw_balances_compact(f, top[1], app);
+    let right = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(0), Constraint::Length(8)])
+        .split(top[1]);
+    draw_balances_compact(f, right[0], app);
+    draw_configuration(f, right[1], app);
 
     draw_profits_panel(f, chunks[1], app);
+
+    if app.bad_debt_confirm_input.is_some() {
+        draw_bad_debt_confirm(f, area, app);
+    }
 }
 
 fn draw_recent_logs(f: &mut Frame<'_>, area: Rect, app: &App) {
     let max_lines = area.height.saturating_sub(2) as usize;
     let start = app.logs.len().saturating_sub(max_lines);
-    let lines: Vec<Line> = app.logs.iter().skip(start).map(|l| Line::from(l.as_str())).collect();
+    let lines: Vec<Line> = app
+        .logs
+        .iter()
+        .skip(start)
+        .map(|l| super::logs::log_to_line(l))
+        .collect();
 
     let title = if let Some(err) = &app.last_error {
         format!("Logs (last error: {})", truncate(err, 60))
@@ -92,6 +106,63 @@ fn draw_balances_compact(f: &mut Frame<'_>, area: Rect, app: &App) {
     .block(Block::default().borders(Borders::ALL).title(title));
 
     f.render_widget(table, area);
+}
+
+fn draw_configuration(f: &mut Frame<'_>, area: Rect, app: &App) {
+    let buy_bad_debt = if app.config.buy_bad_debt {
+        Span::styled("true", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD))
+    } else {
+        Span::styled("false", Style::default().fg(Color::Green))
+    };
+
+    let opp_filter = if app.config.opportunity_filter.is_empty() {
+        "none".to_string()
+    } else {
+        let mut preview: Vec<String> = Vec::new();
+        for p in app.config.opportunity_filter.iter().take(2) {
+            preview.push(truncate(p, 10));
+        }
+        let suffix = if app.config.opportunity_filter.len() > 2 {
+            ",…"
+        } else {
+            ""
+        };
+        format!(
+            "{} ({}{})",
+            app.config.opportunity_filter.len(),
+            preview.join(","),
+            suffix
+        )
+    };
+
+    let lines = vec![
+        Line::from(vec![
+            Span::styled("Swapper: ", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw(app.config.swapper_mode.clone()),
+            Span::raw(" · "),
+            Span::styled("DEX/CEX: ", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw(format!(
+                "{}/{} bps",
+                app.config.max_dex_slippage_bps, app.config.max_cex_slippage_bps
+            )),
+        ]),
+        Line::from(vec![
+            Span::styled("BUY_BAD_DEBT: ", Style::default().add_modifier(Modifier::BOLD)),
+            buy_bad_debt,
+            Span::raw(" · "),
+            Span::styled("Opp filter: ", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw(opp_filter),
+        ]),
+        Line::from(format!("Liq ICP: {}", truncate(&app.config.liquidator_principal, 44))),
+        Line::from(format!("Liq EVM: {}", truncate(&app.config.evm_address, 44))),
+        Line::from(format!("IC: {}", truncate(&app.config.ic_url, 44))),
+        Line::from(format!("Export: {}", truncate_start(&app.config.export_path, 44))),
+    ];
+
+    let w = Paragraph::new(lines)
+        .block(Block::default().borders(Borders::ALL).title("Configuration"))
+        .wrap(Wrap { trim: false });
+    f.render_widget(w, area);
 }
 
 fn draw_profits_panel(f: &mut Frame<'_>, area: Rect, app: &App) {
@@ -241,4 +312,73 @@ fn truncate(s: &str, max: usize) -> String {
         out.push(ch);
     }
     out
+}
+
+fn truncate_start(s: &str, max: usize) -> String {
+    if max <= 1 {
+        return "…".to_string();
+    }
+
+    let len = s.chars().count();
+    if len <= max {
+        return s.to_string();
+    }
+
+    let tail: String = s
+        .chars()
+        .rev()
+        .take(max - 1)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    format!("…{}", tail)
+}
+
+fn draw_bad_debt_confirm(f: &mut Frame<'_>, area: Rect, app: &App) {
+    let popup = centered_rect(70, 35, area);
+    f.render_widget(Clear, popup);
+
+    let input = app.bad_debt_confirm_input.as_deref().unwrap_or("");
+
+    let lines = vec![
+        Line::from(Span::styled(
+            "!!! BAD DEBT MODE !!!",
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        )),
+        Line::from("This bot WILL repay bad debt (you eat the loss)."),
+        Line::from("Type 'yes' then Enter to start · Esc cancels"),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("Input: ", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw(input.to_string()),
+        ]),
+    ];
+
+    let w = Paragraph::new(lines)
+        .block(Block::default().borders(Borders::ALL).title("Confirm BAD DEBT"))
+        .wrap(Wrap { trim: false });
+    f.render_widget(w, popup);
+}
+
+fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
+    let vertical = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage((100 - percent_y) / 2),
+            Constraint::Percentage(percent_y),
+            Constraint::Percentage((100 - percent_y) / 2),
+        ])
+        .split(r);
+
+    let horizontal = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage((100 - percent_x) / 2),
+            Constraint::Percentage(percent_x),
+            Constraint::Percentage((100 - percent_x) / 2),
+        ])
+        .split(vertical[1]);
+
+    horizontal[1]
 }

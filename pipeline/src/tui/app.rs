@@ -9,6 +9,21 @@ use crate::persistance::ResultStatus;
 use liquidium_pipeline_connectors::backend::cex_backend::DepositAddress;
 use liquidium_pipeline_core::tokens::asset_id::AssetId;
 
+#[derive(Clone, Debug)]
+pub(super) struct ConfigSummary {
+    pub(super) ic_url: String,
+    pub(super) liquidator_principal: String,
+    pub(super) trader_principal: String,
+    pub(super) evm_address: String,
+    pub(super) swapper_mode: String,
+    pub(super) max_dex_slippage_bps: u32,
+    pub(super) max_cex_slippage_bps: u32,
+    pub(super) buy_bad_debt: bool,
+    pub(super) opportunity_filter: Vec<String>,
+    pub(super) db_path: String,
+    pub(super) export_path: String,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Tab {
     Dashboard,
@@ -179,6 +194,10 @@ pub(super) struct DepositState {
 }
 
 pub(super) struct App {
+    pub(super) config: ConfigSummary,
+    pub(super) bad_debt_confirmed: bool,
+    pub(super) bad_debt_confirm_input: Option<String>,
+
     pub(super) tab: Tab,
     pub(super) should_quit: bool,
     pub(super) engine: LoopControl,
@@ -207,8 +226,12 @@ pub(super) struct App {
 }
 
 impl App {
-    pub(super) fn new(withdraw_assets: Vec<AssetId>) -> Self {
+    pub(super) fn new(withdraw_assets: Vec<AssetId>, config: ConfigSummary) -> Self {
         Self {
+            bad_debt_confirmed: !config.buy_bad_debt,
+            bad_debt_confirm_input: None,
+            config,
+
             tab: Tab::Dashboard,
             should_quit: false,
             engine: LoopControl::Paused,

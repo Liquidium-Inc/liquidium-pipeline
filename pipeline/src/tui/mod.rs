@@ -33,14 +33,22 @@ use liquidium_pipeline_core::tokens::chain_token::ChainToken;
 use liquidium_pipeline_core::tokens::token_registry::TokenRegistryTrait;
 
 use self::app::{
-    App, BalanceRowData, BalancesPanel, BalancesSnapshot, ProfitBySymbol, ProfitsSnapshot, RecentOutcome, Tab,
-    WalCounts, WalSnapshot, WithdrawAccountKind, WithdrawDestinationKind, WithdrawField,
+    App, BalanceRowData, BalancesPanel, BalancesSnapshot, ConfigSummary, ProfitBySymbol, ProfitsSnapshot,
+    RecentOutcome, Tab, WalCounts, WalSnapshot, WithdrawAccountKind, WithdrawDestinationKind, WithdrawField,
 };
 use self::events::UiEvent;
 use self::logging::{TerminalGuard, init_tui_tracing};
 use self::views::draw_ui;
 
 pub async fn run() -> anyhow::Result<()> {
+    let (ui_tx, mut ui_rx) = mpsc::unbounded_channel::<UiEvent>();
+
+    if let Err(err) = init_tui_tracing(ui_tx.clone()) {
+        let _ = ui_tx.send(UiEvent::Engine(LoopEvent::Error(format!(
+            "failed to init tracing: {err}"
+        ))));
+    }
+
     let ctx = init_context()
         .await
         .map_err(|e| anyhow::anyhow!("init context failed: {e}"))?;
@@ -50,14 +58,6 @@ pub async fn run() -> anyhow::Result<()> {
     let backend = CrosstermBackend::new(io::stdout());
     let mut terminal = Terminal::new(backend).context("create terminal")?;
     terminal.clear().ok();
-
-    let (ui_tx, mut ui_rx) = mpsc::unbounded_channel::<UiEvent>();
-
-    if let Err(err) = init_tui_tracing(ui_tx.clone()) {
-        let _ = ui_tx.send(UiEvent::Engine(LoopEvent::Error(format!(
-            "failed to init tracing: {err}"
-        ))));
-    }
 
     // Engine control + events
     let (engine_tx, engine_rx) = watch::channel::<LoopControl>(LoopControl::Paused);
@@ -184,7 +184,23 @@ pub async fn run() -> anyhow::Result<()> {
     }
 
     let withdraw_assets = build_withdrawable_assets(&ctx);
-    let mut app = App::new(withdraw_assets);
+    let cfg = &ctx.config;
+    let config = ConfigSummary {
+        ic_url: cfg.ic_url.clone(),
+        liquidator_principal: cfg.liquidator_principal.to_text(),
+        trader_principal: cfg.trader_principal.to_text(),
+        evm_address: ctx.evm_address.clone(),
+        swapper_mode: format!("{:?}", cfg.swapper),
+        max_dex_slippage_bps: cfg.max_allowed_dex_slippage,
+        max_cex_slippage_bps: cfg.max_allowed_cex_slippage_bps,
+        buy_bad_debt: cfg.buy_bad_debt,
+        opportunity_filter: cfg.opportunity_account_filter.iter().map(|p| p.to_text()).collect(),
+        db_path: cfg.db_path.clone(),
+        export_path: cfg.export_path.clone(),
+    };
+
+    let mut app = App::new(withdraw_assets, config);
+    push_startup_logs(&mut app, &ctx);
     app.push_log("Press 'r' to start/pause, 'q' to quit, Tab to switch views.");
     {
         let ui_tx = ui_tx.clone();
@@ -308,6 +324,43 @@ async fn handle_key(
     ui_tx: &mpsc::UnboundedSender<UiEvent>,
     ctx: &Arc<crate::context::PipelineContext>,
 ) -> anyhow::Result<bool> {
+    if let Some(input) = app.bad_debt_confirm_input.as_mut() {
+        match (key.code, key.modifiers) {
+            (KeyCode::Char('q'), _) => {
+                app.should_quit = true;
+                return Ok(true);
+            }
+            (KeyCode::Esc, _) => {
+                app.bad_debt_confirm_input = None;
+                app.push_log("bad debt: start canceled");
+                return Ok(false);
+            }
+            (KeyCode::Enter, _) => {
+                if input.trim().eq_ignore_ascii_case("yes") {
+                    app.bad_debt_confirmed = true;
+                    app.bad_debt_confirm_input = None;
+                    app.engine = LoopControl::Running;
+                    let _ = engine_tx.send(LoopControl::Running);
+                    app.push_log("bad debt: confirmed (engine started)");
+                } else {
+                    app.push_log("bad debt: type 'yes' and press Enter to start");
+                }
+                return Ok(false);
+            }
+            (KeyCode::Backspace, _) => {
+                input.pop();
+                return Ok(false);
+            }
+            (KeyCode::Char(c), KeyModifiers::NONE | KeyModifiers::SHIFT) => {
+                if input.len() < 16 && !c.is_control() {
+                    input.push(c);
+                }
+                return Ok(false);
+            }
+            _ => return Ok(false),
+        }
+    }
+
     match (key.code, key.modifiers) {
         (KeyCode::Char('q'), _) => {
             app.should_quit = true;
@@ -350,6 +403,14 @@ async fn handle_key(
                 LoopControl::Paused => LoopControl::Running,
                 LoopControl::Stopping => LoopControl::Stopping,
             };
+
+            if matches!(next, LoopControl::Running) && app.config.buy_bad_debt && !app.bad_debt_confirmed {
+                app.bad_debt_confirm_input = Some(String::new());
+                app.push_log("WARN BAD DEBT MODE ENABLED");
+                app.push_log("Type 'yes' then Enter to start (Esc cancels).");
+                return Ok(false);
+            }
+
             app.engine = next;
             let _ = engine_tx.send(next);
             app.push_log(match next {
@@ -834,4 +895,42 @@ async fn execute_withdraw(
     transfers
         .transfer_by_asset_id(&asset, ChainAccount::Icp(dst_account), amount_native)
         .await
+}
+
+fn push_startup_logs(app: &mut App, ctx: &Arc<crate::context::PipelineContext>) {
+    let cfg = &ctx.config;
+    app.push_log("=== Startup ===");
+    app.push_log(format!("Network: {}", cfg.ic_url));
+    app.push_log(format!("Liquidator principal: {}", cfg.liquidator_principal.to_text()));
+    app.push_log(format!("Trader principal: {}", cfg.trader_principal.to_text()));
+    app.push_log(format!(
+        "Liquidator deposit (ICP): {}",
+        cfg.liquidator_principal.to_text()
+    ));
+    app.push_log(format!("Liquidator deposit (EVM): {}", ctx.evm_address));
+    app.push_log(format!("Swapper mode: {:?}", cfg.swapper));
+    app.push_log(format!("Max DEX slippage (bps): {}", cfg.max_allowed_dex_slippage));
+    app.push_log(format!("Max CEX slippage (bps): {}", cfg.max_allowed_cex_slippage_bps));
+    app.push_log(format!("BUY_BAD_DEBT: {}", cfg.buy_bad_debt));
+    if cfg.opportunity_account_filter.is_empty() {
+        app.push_log("Opportunity filter: none");
+    } else {
+        app.push_log(format!(
+            "Opportunity filter ({}):",
+            cfg.opportunity_account_filter.len()
+        ));
+        for p in cfg.opportunity_account_filter.iter() {
+            app.push_log(format!("  - {}", p.to_text()));
+        }
+    }
+    app.push_log(format!("DB: {}", cfg.db_path));
+    app.push_log(format!("EXPORT_PATH: {}", cfg.export_path));
+
+    if cfg.buy_bad_debt {
+        app.push_log("WARN BAD DEBT MODE ENABLED: liquidator will repay bad debt to restore solvency");
+        app.push_log("WARN This bot WILL repay bad debt (you eat the loss).");
+        app.push_log("WARN Press 'r' then type 'yes' + Enter to start.");
+    } else {
+        app.push_log("Bad debt mode disabled: only collateral-backed liquidations will run");
+    }
 }
