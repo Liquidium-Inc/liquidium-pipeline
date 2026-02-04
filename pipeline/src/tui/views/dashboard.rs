@@ -21,7 +21,7 @@ pub(super) fn draw_dashboard(f: &mut Frame<'_>, area: Rect, app: &App) {
     draw_recent_logs(f, top[0], app);
     let right = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(0), Constraint::Length(8)])
+        .constraints([Constraint::Min(0), Constraint::Length(12)])
         .split(top[1]);
     draw_balances_compact(f, right[0], app);
     draw_configuration(f, right[1], app);
@@ -118,21 +118,14 @@ fn draw_configuration(f: &mut Frame<'_>, area: Rect, app: &App) {
     let opp_filter = if app.config.opportunity_filter.is_empty() {
         "none".to_string()
     } else {
-        let mut preview: Vec<String> = Vec::new();
-        for p in app.config.opportunity_filter.iter().take(2) {
-            preview.push(truncate(p, 10));
-        }
-        let suffix = if app.config.opportunity_filter.len() > 2 {
-            ",…"
-        } else {
-            ""
-        };
-        format!(
-            "{} ({}{})",
-            app.config.opportunity_filter.len(),
-            preview.join(","),
-            suffix
-        )
+        let list = app
+            .config
+            .opportunity_filter
+            .iter()
+            .map(|p| truncate_middle(p, 14))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("{} ({})", app.config.opportunity_filter.len(), list)
     };
 
     let lines = vec![
@@ -333,6 +326,34 @@ fn truncate_start(s: &str, max: usize) -> String {
         .rev()
         .collect();
     format!("…{}", tail)
+}
+
+fn truncate_middle(s: &str, max: usize) -> String {
+    if max <= 1 {
+        return "…".to_string();
+    }
+
+    let len = s.chars().count();
+    if len <= max {
+        return s.to_string();
+    }
+
+    if max <= 3 {
+        return truncate(s, max);
+    }
+
+    let head_len = (max - 1) / 2;
+    let tail_len = max - 1 - head_len;
+    let head: String = s.chars().take(head_len).collect();
+    let tail: String = s
+        .chars()
+        .rev()
+        .take(tail_len)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    format!("{head}…{tail}")
 }
 
 fn draw_bad_debt_confirm(f: &mut Frame<'_>, area: Rect, app: &App) {
