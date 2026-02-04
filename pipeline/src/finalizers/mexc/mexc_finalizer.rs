@@ -505,9 +505,7 @@ where
             debug!("[mexc] liq_id={} sent deposit txid={}", state.liq_id, tx_id);
 
             if matches!(state.deposit_asset, ChainToken::Icp { .. }) {
-                let approved = self
-                    .maybe_bump_mexc_approval(&state.liq_id, &state.deposit_asset)
-                    .await;
+                let approved = self.maybe_bump_mexc_approval(&state.liq_id, &state.deposit_asset).await;
                 if approved > 0 {
                     state.approval_bump_count = Some(approved);
                 }

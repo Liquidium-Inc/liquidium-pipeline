@@ -31,6 +31,8 @@ anyhow = { workspace = true }
 log = { workspace = true }
 env_logger = { workspace = true }
 tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+tracing-log = { workspace = true }
 candid = { workspace = true }
 num-format = { workspace = true }
 openssl = { workspace = true }
@@ -70,6 +72,8 @@ ic-ledger-types = "0.15.0"
 hex = "0.4.2"
 reqwest = { version = "0.12", features = ["json"] }
 
+ratatui = "0.26"
+crossterm = "0.27"
 
 [dev-dependencies]
 ic_principal = { version = "0.1.1", features = ["arbitrary"] }

@@ -3,7 +3,9 @@ use icrc_ledger_types::icrc1::account::Account;
 use indicatif::{ProgressBar, ProgressStyle};
 
 use prettytable::{Cell, Row, Table, format};
-use std::{sync::Arc, thread::sleep, time::Duration};
+use std::{sync::Arc, time::Duration};
+use tokio::sync::{mpsc, watch};
+use tokio::time::sleep;
 use tracing::{Instrument, info_span, instrument};
 use tracing::{info, warn};
 
@@ -310,7 +312,7 @@ pub async fn run_liquidation_loop() {
         });
 
         if !opportunities.is_empty() {
-            sleep(Duration::from_secs(2));
+            sleep(Duration::from_secs(2)).await;
             spinner = start_spinner();
             spinner.finish_and_clear();
             info!("Found {:?} opportunities", opportunities.len());
@@ -346,7 +348,7 @@ pub async fn run_liquidation_loop() {
         if outcomes.is_empty() {
             spinner = start_spinner();
             spinner.set_message("Scanning for liquidation opportunities...");
-            sleep(Duration::from_secs(2));
+            sleep(Duration::from_secs(2)).await;
             continue;
         }
 
@@ -362,8 +364,139 @@ pub async fn run_liquidation_loop() {
         if let Err(err) = executor.refresh_allowances(&debt_asset_principals).await {
             warn!("Failed to refresh lending allowances: {}", err);
         }
-        sleep(Duration::from_secs(5));
+        sleep(Duration::from_secs(5)).await;
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoopControl {
+    Running,
+    Paused,
+    Stopping,
+}
+
+#[derive(Debug, Clone)]
+pub enum LoopEvent {
+    Log(String),
+    Error(String),
+    Outcomes(Vec<LiquidationOutcome>),
+}
+
+pub async fn run_liquidation_loop_controlled(
+    ctx: Arc<PipelineContext>,
+    mut control_rx: watch::Receiver<LoopControl>,
+    event_tx: mpsc::UnboundedSender<LoopEvent>,
+) -> Result<(), String> {
+    let config = ctx.config.clone();
+
+    let (finder, strategy, executor, exporter, finalizer) = init(ctx.clone()).await?;
+
+    let watcher_wal = Arc::new(
+        SqliteWalStore::new_with_busy_timeout(&config.db_path, 30_000)
+            .map_err(|e| format!("could not connect to db: {e}"))?,
+    );
+    let watcher = SettlementWatcher::new(
+        watcher_wal,
+        ctx.agent.clone(),
+        ctx.swap_router.clone(),
+        config.lending_canister,
+        Duration::from_secs(3),
+    );
+    tokio::spawn(async move { watcher.run().await });
+
+    let debt_asset_principals: Vec<Principal> = ctx
+        .registry
+        .debt_assets()
+        .iter()
+        .filter_map(|(_, tok)| {
+            if let ChainToken::Icp { ledger, .. } = tok {
+                Some(*ledger)
+            } else {
+                None
+            }
+        })
+        .collect();
+    let debt_assets: Vec<String> = debt_asset_principals.iter().map(Principal::to_text).collect();
+
+    let _ = event_tx.send(LoopEvent::Log("engine initialized (paused by default)".to_string()));
+
+    // Setup liquidity monitor
+    let liq_dog = account_monitor_watchdog(Duration::from_secs(5), ctx.config.liquidator_principal);
+
+    loop {
+        let control = *control_rx.borrow();
+        match control {
+            LoopControl::Stopping => {
+                let _ = event_tx.send(LoopEvent::Log("engine stopping".to_string()));
+                break;
+            }
+            LoopControl::Running => {
+                let opportunities = finder.process(&debt_assets).await.unwrap_or_else(|e| {
+                    let _ = event_tx.send(LoopEvent::Error(format!("opportunity finder error: {e}")));
+                    vec![]
+                });
+
+                if !opportunities.is_empty() {
+                    let opp_count = opportunities.len();
+                    let _ = event_tx.send(LoopEvent::Log(format!("found {opp_count} opportunity(ies); executing")));
+
+                    async {
+                        let executions = strategy.process(&opportunities).await.unwrap_or_else(|e| {
+                            let _ = event_tx.send(LoopEvent::Error(format!("strategy error: {e}")));
+                            vec![]
+                        });
+
+                        if executions.is_empty() {
+                            let _ = event_tx.send(LoopEvent::Log(
+                                "no executable opportunities (waiting for funds/liquidity)".to_string(),
+                            ));
+                        }
+
+                        let _ = executor.process(&executions).await.unwrap_or_else(|e| {
+                            let _ = event_tx.send(LoopEvent::Error(format!("executor error: {e}")));
+                            vec![]
+                        });
+                    }
+                    .instrument(info_span!("liquidation.cycle", opportunities = opp_count))
+                    .await;
+                }
+            }
+            LoopControl::Paused => {
+                // Paused: do not start new liquidations. We still run finalization below to
+                // allow already-enqueued items to progress.
+            }
+        }
+
+        let outcomes = finalizer.process(&()).await.unwrap_or_else(|e| {
+            let _ = event_tx.send(LoopEvent::Error(format!("finalizer error: {e}")));
+            vec![]
+        });
+
+        if !outcomes.is_empty() {
+            if let Err(err) = exporter.process(&outcomes).await {
+                let _ = event_tx.send(LoopEvent::Error(format!("export error: {err}")));
+            }
+            let _ = event_tx.send(LoopEvent::Outcomes(outcomes));
+        }
+
+        // Send liquidity monitor heart beat
+        let _ = liq_dog.notify(WatchdogEvent::Heartbeat { stage: "TUI" }).await;
+
+        // Keep allowances fresh when actively running.
+        let control = *control_rx.borrow();
+        if matches!(control, LoopControl::Running)
+            && let Err(err) = executor.refresh_allowances(&debt_asset_principals).await
+        {
+            let _ = event_tx.send(LoopEvent::Error(format!("allowance refresh error: {err}")));
+        }
+
+        tokio::select! {
+            _ = sleep(Duration::from_secs(2)) => {},
+            _ = control_rx.changed() => {},
+        }
+    }
+
+    Ok(())
 }
 
 pub fn print_execution_results(results: Vec<LiquidationOutcome>) {

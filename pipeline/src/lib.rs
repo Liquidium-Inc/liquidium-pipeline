@@ -1,3 +1,4 @@
+pub mod approval_state;
 pub mod config;
 pub mod context;
 pub mod executors;
@@ -11,4 +12,3 @@ pub mod swappers;
 pub mod utils;
 pub mod wal;
 pub mod watchdog;
-pub mod approval_state;

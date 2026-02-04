@@ -5,7 +5,7 @@ use serde::Serialize;
 use crate::stages::executor::ExecutionReceipt;
 pub mod sqlite;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(i32)]
 pub enum ResultStatus {
     Enqueued = 0,

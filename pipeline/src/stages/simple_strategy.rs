@@ -780,7 +780,8 @@ mod tests {
         cfg.expect_get_liquidator_principal().return_const(trader);
         cfg.expect_should_buy_bad_debt().return_const(false);
         cfg.expect_get_max_allowed_dex_slippage().return_const(2000u32);
-        cfg.expect_get_lending_canister().return_const(p("mxzaz-hqaaa-aaaar-qaada-cai"));
+        cfg.expect_get_lending_canister()
+            .return_const(p("mxzaz-hqaaa-aaaar-qaada-cai"));
 
         // Collateral service: repay 1_000, receive 2_000 collateral
         let mut collateral = MockCollateralServiceTrait::new();
@@ -859,7 +860,8 @@ mod tests {
         cfg.expect_get_liquidator_principal().return_const(trader);
         cfg.expect_should_buy_bad_debt().return_const(false);
         cfg.expect_get_max_allowed_dex_slippage().return_const(2000u32);
-        cfg.expect_get_lending_canister().return_const(p("mxzaz-hqaaa-aaaar-qaada-cai"));
+        cfg.expect_get_lending_canister()
+            .return_const(p("mxzaz-hqaaa-aaaar-qaada-cai"));
 
         let mut collateral = MockCollateralServiceTrait::new();
         collateral
@@ -918,7 +920,8 @@ mod tests {
         cfg.expect_get_liquidator_principal().return_const(trader);
         cfg.expect_should_buy_bad_debt().return_const(false);
         cfg.expect_get_max_allowed_dex_slippage().return_const(2000u32);
-        cfg.expect_get_lending_canister().return_const(p("mxzaz-hqaaa-aaaar-qaada-cai"));
+        cfg.expect_get_lending_canister()
+            .return_const(p("mxzaz-hqaaa-aaaar-qaada-cai"));
 
         let mut collateral = MockCollateralServiceTrait::new();
         collateral
@@ -988,7 +991,8 @@ mod tests {
         cfg.expect_get_liquidator_principal().return_const(trader);
         cfg.expect_should_buy_bad_debt().return_const(false);
         cfg.expect_get_max_allowed_dex_slippage().return_const(2000u32);
-        cfg.expect_get_lending_canister().return_const(p("mxzaz-hqaaa-aaaar-qaada-cai"));
+        cfg.expect_get_lending_canister()
+            .return_const(p("mxzaz-hqaaa-aaaar-qaada-cai"));
 
         let mut collateral = MockCollateralServiceTrait::new();
         collateral
@@ -1058,7 +1062,8 @@ mod tests {
         cfg.expect_get_liquidator_principal().return_const(trader);
         cfg.expect_should_buy_bad_debt().return_const(true);
         cfg.expect_get_max_allowed_dex_slippage().return_const(2000u32);
-        cfg.expect_get_lending_canister().return_const(p("mxzaz-hqaaa-aaaar-qaada-cai"));
+        cfg.expect_get_lending_canister()
+            .return_const(p("mxzaz-hqaaa-aaaar-qaada-cai"));
 
         let mut collateral = MockCollateralServiceTrait::new();
         collateral
@@ -1140,7 +1145,8 @@ mod tests {
         cfg.expect_get_liquidator_principal().return_const(trader);
         cfg.expect_should_buy_bad_debt().return_const(false);
         cfg.expect_get_max_allowed_dex_slippage().return_const(2000u32);
-        cfg.expect_get_lending_canister().return_const(p("mxzaz-hqaaa-aaaar-qaada-cai"));
+        cfg.expect_get_lending_canister()
+            .return_const(p("mxzaz-hqaaa-aaaar-qaada-cai"));
 
         // Collateral service returns fixed repay so we can control budgeting
         let mut collateral = MockCollateralServiceTrait::new();
@@ -1218,7 +1224,8 @@ mod tests {
         cfg.expect_get_liquidator_principal().return_const(trader);
         cfg.expect_should_buy_bad_debt().return_const(false);
         cfg.expect_get_max_allowed_dex_slippage().return_const(2000u32);
-        cfg.expect_get_lending_canister().return_const(p("mxzaz-hqaaa-aaaar-qaada-cai"));
+        cfg.expect_get_lending_canister()
+            .return_const(p("mxzaz-hqaaa-aaaar-qaada-cai"));
 
         let mut calls = 0u32;
         let mut collateral = MockCollateralServiceTrait::new();
@@ -1303,7 +1310,8 @@ mod tests {
         cfg.expect_get_liquidator_principal().return_const(trader);
         cfg.expect_should_buy_bad_debt().return_const(false);
         cfg.expect_get_max_allowed_dex_slippage().return_const(2000u32);
-        cfg.expect_get_lending_canister().return_const(p("mxzaz-hqaaa-aaaar-qaada-cai"));
+        cfg.expect_get_lending_canister()
+            .return_const(p("mxzaz-hqaaa-aaaar-qaada-cai"));
 
         let mut first_called_for_low_hf = true;
         let mut collateral = MockCollateralServiceTrait::new();
@@ -1390,7 +1398,8 @@ mod tests {
         cfg.expect_get_liquidator_principal().return_const(trader);
         cfg.expect_should_buy_bad_debt().return_const(false);
         cfg.expect_get_max_allowed_dex_slippage().return_const(2000u32);
-        cfg.expect_get_lending_canister().return_const(p("mxzaz-hqaaa-aaaar-qaada-cai"));
+        cfg.expect_get_lending_canister()
+            .return_const(p("mxzaz-hqaaa-aaaar-qaada-cai"));
 
         let mut first_checked = true;
         let mut collateral = MockCollateralServiceTrait::new();
