@@ -3,12 +3,7 @@ use icrc_ledger_types::icrc1::account::Account;
 use indicatif::{ProgressBar, ProgressStyle};
 
 use prettytable::{Cell, Row, Table, format};
-use std::{
-    sync::Arc,
-    time::{Duration, Instant},
-};
-use tokio::sync::{mpsc, watch};
-use tokio::time::sleep;
+use std::{sync::Arc, thread::sleep, time::Duration, time::Instant};
 use tracing::{Instrument, info_span, instrument};
 use tracing::{info, warn};
 
@@ -233,16 +228,7 @@ pub async fn run_liquidation_loop() {
         println!("=  Use only if you intend to shore up protocol solvency.            =");
         println!("=                                                                  =");
         println!("====================================================================");
-        println!("⚠️  You are about to BUY BAD DEBT. Type 'yes' to continue:");
-        let mut input = String::new();
-        if let Err(err) = std::io::stdin().read_line(&mut input) {
-            warn!("Failed to read input: {}", err);
-            return;
-        }
-        if input.trim() != "yes" {
-            warn!("Aborted by user.");
-            return;
-        }
+        warn!("Continuing without interactive confirmation because BUY_BAD_DEBT is enabled.");
     } else {
         info!("✅ BAD DEBT MODE DISABLED: only collateral-backed liquidations will run");
     }
@@ -290,6 +276,7 @@ pub async fn run_liquidation_loop() {
     let debt_assets: Vec<String> = debt_asset_principals.iter().map(Principal::to_text).collect();
 
     print_startup_table(&config);
+    info!("Liquidator started; scanning for liquidation opportunities...");
 
     // Setup liquidity monitor
     let liq_dog = account_monitor_watchdog(Duration::from_secs(5), ctx.config.liquidator_principal);
@@ -307,8 +294,13 @@ pub async fn run_liquidation_loop() {
     };
 
     let mut spinner = start_spinner();
+    let mut last_alive_log = Instant::now();
     loop {
         spinner.set_message("Scanning for liquidation opportunities...");
+        if last_alive_log.elapsed() >= Duration::from_secs(300) {
+            info!("Liquidator running; scanning for liquidation opportunities...");
+            last_alive_log = Instant::now();
+        }
         let opportunities = finder.process(&debt_assets).await.unwrap_or_else(|e| {
             warn!("Failed to find opportunities: {e}");
             vec![]
