@@ -129,7 +129,8 @@ impl Finalizer for dyn CexFinalizerLogic {
         } else {
             self.prepare(&liq_id, &receipt).await?
         };
-        info!(
+
+        debug!(
             "[cex] ✅ liq_id={} state loaded: step={:?}",
             cex_state.liq_id, cex_state.step
         );
@@ -151,7 +152,7 @@ impl Finalizer for dyn CexFinalizerLogic {
                     self.trade(&mut cex_state).await
                 }
                 CexStep::TradePending => {
-                    info!("[cex] ⏳ liq_id={} step=TradePending", cex_state.liq_id);
+                    debug!("[cex] ⏳ liq_id={} step=TradePending", cex_state.liq_id);
                     self.trade(&mut cex_state).await
                 }
                 CexStep::Withdraw => {

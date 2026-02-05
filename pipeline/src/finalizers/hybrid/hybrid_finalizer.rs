@@ -49,6 +49,7 @@ where
             .cex_finalizer
             .as_ref()
             .ok_or_else(|| "missing cex finalizer".to_string())?;
+        
         finalizer.finalize(wal, receipt).await
     }
 }
