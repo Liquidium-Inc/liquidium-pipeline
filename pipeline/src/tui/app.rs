@@ -29,12 +29,19 @@ pub(super) enum Tab {
     Dashboard,
     Balances,
     Profits,
+    Executions,
     Logs,
 }
 
 impl Tab {
     pub(super) fn all() -> &'static [Tab] {
-        &[Tab::Dashboard, Tab::Balances, Tab::Profits, Tab::Logs]
+        &[
+            Tab::Dashboard,
+            Tab::Balances,
+            Tab::Profits,
+            Tab::Executions,
+            Tab::Logs,
+        ]
     }
 
     pub(super) fn title(self) -> &'static str {
@@ -42,6 +49,7 @@ impl Tab {
             Tab::Dashboard => "Dashboard",
             Tab::Balances => "Balances",
             Tab::Profits => "Profits",
+            Tab::Executions => "Executions",
             Tab::Logs => "Logs",
         }
     }
@@ -73,6 +81,23 @@ pub(super) struct ProfitBySymbol {
 #[derive(Clone, Debug)]
 pub(super) struct ProfitsSnapshot {
     pub(super) rows: Vec<ProfitBySymbol>,
+    pub(super) at: DateTime<Local>,
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct ExecutionRowData {
+    pub(super) liq_id: String,
+    pub(super) status: ResultStatus,
+    pub(super) attempt: i32,
+    pub(super) error_count: i32,
+    pub(super) last_error: Option<String>,
+    pub(super) created_at: i64,
+    pub(super) updated_at: i64,
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct ExecutionsSnapshot {
+    pub(super) rows: Vec<ExecutionRowData>,
     pub(super) at: DateTime<Local>,
 }
 
@@ -184,6 +209,12 @@ pub(super) enum BalancesPanel {
     Deposit,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum UiFocus {
+    Tabs,
+    Logs,
+}
+
 #[derive(Default)]
 pub(super) struct DepositState {
     pub(super) in_flight: bool,
@@ -199,11 +230,18 @@ pub(super) struct App {
     pub(super) bad_debt_confirm_input: Option<String>,
 
     pub(super) tab: Tab,
+    pub(super) ui_focus: UiFocus,
     pub(super) should_quit: bool,
     pub(super) engine: LoopControl,
     pub(super) logs: VecDeque<String>,
     pub(super) logs_scroll: u16,
     pub(super) logs_follow: bool,
+    pub(super) logs_g_pending: bool,
+    pub(super) logs_scroll_active: bool,
+    pub(super) dashboard_logs_scroll: u16,
+    pub(super) dashboard_logs_follow: bool,
+    pub(super) dashboard_logs_g_pending: bool,
+    pub(super) dashboard_logs_scroll_active: bool,
     pub(super) last_outcomes: usize,
     pub(super) last_error: Option<String>,
     pub(super) last_tick: Instant,
@@ -217,6 +255,10 @@ pub(super) struct App {
 
     pub(super) profits: Option<ProfitsSnapshot>,
     pub(super) profits_error: Option<String>,
+
+    pub(super) executions: Option<ExecutionsSnapshot>,
+    pub(super) executions_error: Option<String>,
+    pub(super) executions_selected: usize,
 
     pub(super) recent_outcomes: VecDeque<RecentOutcome>,
 
@@ -235,11 +277,18 @@ impl App {
             config,
 
             tab: Tab::Dashboard,
+            ui_focus: UiFocus::Tabs,
             should_quit: false,
             engine: LoopControl::Paused,
             logs: VecDeque::with_capacity(500),
             logs_scroll: 0,
             logs_follow: true,
+            logs_g_pending: false,
+            logs_scroll_active: false,
+            dashboard_logs_scroll: 0,
+            dashboard_logs_follow: true,
+            dashboard_logs_g_pending: false,
+            dashboard_logs_scroll_active: false,
             last_outcomes: 0,
             last_error: None,
             last_tick: Instant::now(),
@@ -254,6 +303,10 @@ impl App {
             profits: None,
             profits_error: None,
 
+            executions: None,
+            executions_error: None,
+            executions_selected: 0,
+
             recent_outcomes: VecDeque::with_capacity(200),
 
             balances_panel: BalancesPanel::None,
@@ -266,7 +319,8 @@ impl App {
 
     pub(super) fn push_log(&mut self, line: impl Into<String>) {
         const MAX: usize = 500;
-        let bump_scroll = !self.logs_follow;
+        let bump_logs_scroll = self.logs_scroll_active && !self.logs_follow;
+        let bump_dashboard_scroll = self.dashboard_logs_scroll_active && !self.dashboard_logs_follow;
         let line = line.into();
         for part in line.split(['\n', '\r']) {
             let part = part.trim_end();
@@ -277,8 +331,11 @@ impl App {
                 self.logs.pop_front();
             }
             self.logs.push_back(part.to_string());
-            if bump_scroll {
+            if bump_logs_scroll {
                 self.logs_scroll = self.logs_scroll.saturating_add(1);
+            }
+            if bump_dashboard_scroll {
+                self.dashboard_logs_scroll = self.dashboard_logs_scroll.saturating_add(1);
             }
         }
     }
@@ -287,11 +344,29 @@ impl App {
         let tabs = Tab::all();
         let idx = tabs.iter().position(|t| *t == self.tab).unwrap_or(0);
         self.tab = tabs[(idx + 1) % tabs.len()];
+        self.ui_focus = UiFocus::Tabs;
+        self.logs_scroll_active = false;
+        self.dashboard_logs_scroll_active = false;
+        self.logs_g_pending = false;
+        self.dashboard_logs_g_pending = false;
+        self.logs_follow = true;
+        self.dashboard_logs_follow = true;
+        self.logs_scroll = 0;
+        self.dashboard_logs_scroll = 0;
     }
 
     pub(super) fn prev_tab(&mut self) {
         let tabs = Tab::all();
         let idx = tabs.iter().position(|t| *t == self.tab).unwrap_or(0);
         self.tab = tabs[(idx + tabs.len() - 1) % tabs.len()];
+        self.ui_focus = UiFocus::Tabs;
+        self.logs_scroll_active = false;
+        self.dashboard_logs_scroll_active = false;
+        self.logs_g_pending = false;
+        self.dashboard_logs_g_pending = false;
+        self.logs_follow = true;
+        self.dashboard_logs_follow = true;
+        self.logs_scroll = 0;
+        self.dashboard_logs_scroll = 0;
     }
 }

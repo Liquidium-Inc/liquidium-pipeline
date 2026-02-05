@@ -10,6 +10,7 @@ use super::app::{App, Tab};
 
 mod balances;
 mod dashboard;
+mod executions;
 mod logs;
 mod profits;
 
@@ -42,7 +43,7 @@ fn draw_header(f: &mut Frame<'_>, area: Rect, app: &App) {
         Span::raw("  |  engine="),
         status,
         Span::raw(
-            "  |  keys: r start/pause · b balances · p profits · w withdraw · d deposit/refresh · tab switch · q quit",
+            "  |  keys: r start/pause · b balances · p profits · e executions · w withdraw · d deposit/refresh · tab switch · q quit",
         ),
     ]);
 
@@ -66,6 +67,7 @@ fn draw_body(f: &mut Frame<'_>, area: Rect, app: &App) {
         Tab::Dashboard => dashboard::draw_dashboard(f, area, app),
         Tab::Balances => balances::draw_balances(f, area, app),
         Tab::Profits => profits::draw_profits(f, area, app),
+        Tab::Executions => executions::draw_executions(f, area, app),
         Tab::Logs => logs::draw_logs(f, area, app),
     }
 }

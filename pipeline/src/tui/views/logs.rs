@@ -4,7 +4,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 
-use super::super::app::App;
+use super::super::app::{App, UiFocus};
 
 pub(super) fn log_to_line(line: &str) -> Line<'static> {
     let line = line.trim_end_matches('\r');
@@ -155,20 +155,19 @@ pub(super) fn draw_logs(f: &mut Frame<'_>, area: Rect, app: &App) {
     let lines: Vec<Line> = app.logs.iter().map(|l| log_to_line(l)).collect();
     let height = area.height.saturating_sub(2) as usize;
     let max_scroll = lines.len().saturating_sub(height) as u16;
-    let scroll = if app.logs_follow {
-        max_scroll
+    let (scroll, title) = if !app.logs_scroll_active {
+        (max_scroll, "Logs (view)")
+    } else if app.logs_follow {
+        (max_scroll, "Logs (follow)")
     } else {
-        max_scroll.saturating_sub(app.logs_scroll)
+        (max_scroll.saturating_sub(app.logs_scroll), "Logs (scroll)")
     };
 
-    let title = if app.logs_follow {
-        "Logs (follow)"
-    } else {
-        "Logs (scroll)"
-    };
+    let mut block = Block::default().borders(Borders::ALL).title(title);
+    if matches!(app.ui_focus, UiFocus::Logs) {
+        block = block.border_style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD));
+    }
 
-    let w = Paragraph::new(lines)
-        .block(Block::default().borders(Borders::ALL).title(title))
-        .scroll((scroll, 0));
+    let w = Paragraph::new(lines).block(block).scroll((scroll, 0));
     f.render_widget(w, area);
 }

@@ -486,9 +486,6 @@ impl MexcClient {
         order_side: OrderSide,
         quantity: Option<Decimal>,
         quote_order_quantity: Option<Decimal>,
-        market: &str,
-        side: &str,
-        amount_in: f64,
     ) -> Result<(String, String), String> {
         let mut last_err: Option<String> = None;
         for candidate in candidates {
@@ -671,9 +668,6 @@ impl CexBackend for MexcClient {
                 order_side,
                 quantity,
                 quote_order_quantity,
-                market,
-                side,
-                amount_in,
             )
             .await?;
 

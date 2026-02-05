@@ -82,6 +82,7 @@ fn print_startup_table(config: &Config) {
     table.printstd();
 }
 
+#[allow(clippy::type_complexity)]
 #[instrument(name = "liquidation.init", skip_all, err)]
 async fn init(
     ctx: Arc<PipelineContext>,

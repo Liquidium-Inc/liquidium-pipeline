@@ -4,7 +4,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table, Wrap};
 
-use super::super::app::App;
+use super::super::app::{App, UiFocus};
 use super::super::format::format_i128_amount;
 
 pub(super) fn draw_dashboard(f: &mut Frame<'_>, area: Rect, app: &App) {
@@ -34,14 +34,14 @@ pub(super) fn draw_dashboard(f: &mut Frame<'_>, area: Rect, app: &App) {
 }
 
 fn draw_recent_logs(f: &mut Frame<'_>, area: Rect, app: &App) {
-    let max_lines = area.height.saturating_sub(2) as usize;
-    let start = app.logs.len().saturating_sub(max_lines);
-    let lines: Vec<Line> = app
-        .logs
-        .iter()
-        .skip(start)
-        .map(|l| super::logs::log_to_line(l))
-        .collect();
+    let lines: Vec<Line> = app.logs.iter().map(|l| super::logs::log_to_line(l)).collect();
+    let height = area.height.saturating_sub(2) as usize;
+    let max_scroll = lines.len().saturating_sub(height) as u16;
+    let scroll = if !app.dashboard_logs_scroll_active || app.dashboard_logs_follow {
+        max_scroll
+    } else {
+        max_scroll.saturating_sub(app.dashboard_logs_scroll)
+    };
 
     let title = if let Some(err) = &app.last_error {
         format!("Logs (last error: {})", truncate(err, 60))
@@ -49,8 +49,20 @@ fn draw_recent_logs(f: &mut Frame<'_>, area: Rect, app: &App) {
         "Logs".to_string()
     };
 
-    let w = Paragraph::new(lines)
-        .block(Block::default().borders(Borders::ALL).title(title));
+    let title = if !app.dashboard_logs_scroll_active {
+        format!("{title} (view)")
+    } else if app.dashboard_logs_follow {
+        title
+    } else {
+        format!("{title} (scroll)")
+    };
+
+    let mut block = Block::default().borders(Borders::ALL).title(title);
+    if matches!(app.ui_focus, UiFocus::Logs) {
+        block = block.border_style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD));
+    }
+
+    let w = Paragraph::new(lines).block(block).scroll((scroll, 0));
     f.render_widget(w, area);
 }
 

@@ -99,6 +99,15 @@ impl SqliteWalStore {
         }
         Ok(out)
     }
+
+    pub fn list_recent(&self, limit: usize) -> Result<Vec<LiqResultRecord>> {
+        let mut conn = self.get_conn()?;
+        let rows = tbl::table
+            .order(tbl::updated_at.desc())
+            .limit(limit as i64)
+            .load::<Row>(&mut conn)?;
+        Ok(rows.into_iter().map(Self::from_row).collect())
+    }
 }
 
 #[async_trait]
