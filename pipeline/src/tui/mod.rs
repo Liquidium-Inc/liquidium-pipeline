@@ -391,6 +391,34 @@ async fn handle_key(
             app.should_quit = true;
             return Ok(true);
         }
+        (KeyCode::Up, KeyModifiers::NONE) if matches!(app.tab, Tab::Logs) => {
+            app.logs_follow = false;
+            app.logs_scroll = app.logs_scroll.saturating_add(1);
+        }
+        (KeyCode::Down, KeyModifiers::NONE) if matches!(app.tab, Tab::Logs) => {
+            app.logs_scroll = app.logs_scroll.saturating_sub(1);
+            if app.logs_scroll == 0 {
+                app.logs_follow = true;
+            }
+        }
+        (KeyCode::PageUp, KeyModifiers::NONE) if matches!(app.tab, Tab::Logs) => {
+            app.logs_follow = false;
+            app.logs_scroll = app.logs_scroll.saturating_add(10);
+        }
+        (KeyCode::PageDown, KeyModifiers::NONE) if matches!(app.tab, Tab::Logs) => {
+            app.logs_scroll = app.logs_scroll.saturating_sub(10);
+            if app.logs_scroll == 0 {
+                app.logs_follow = true;
+            }
+        }
+        (KeyCode::Home, KeyModifiers::NONE) if matches!(app.tab, Tab::Logs) => {
+            app.logs_follow = false;
+            app.logs_scroll = u16::MAX;
+        }
+        (KeyCode::End, KeyModifiers::NONE) if matches!(app.tab, Tab::Logs) => {
+            app.logs_scroll = 0;
+            app.logs_follow = true;
+        }
         (KeyCode::Tab, KeyModifiers::NONE) => app.next_tab(),
         (KeyCode::BackTab, KeyModifiers::SHIFT) => app.prev_tab(),
         (KeyCode::Left, KeyModifiers::NONE)

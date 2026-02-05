@@ -50,8 +50,7 @@ fn draw_recent_logs(f: &mut Frame<'_>, area: Rect, app: &App) {
     };
 
     let w = Paragraph::new(lines)
-        .block(Block::default().borders(Borders::ALL).title(title))
-        .wrap(Wrap { trim: false });
+        .block(Block::default().borders(Borders::ALL).title(title));
     f.render_widget(w, area);
 }
 

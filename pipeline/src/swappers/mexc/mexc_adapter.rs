@@ -492,7 +492,6 @@ impl MexcClient {
     ) -> Result<(String, String), String> {
         let mut last_err: Option<String> = None;
         for candidate in candidates {
-            info!("Swapping {} {} {} (symbol={})", market, side, amount_in, candidate);
             match ex
                 .order(OrderParams {
                     symbol: candidate,

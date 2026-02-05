@@ -202,6 +202,8 @@ pub(super) struct App {
     pub(super) should_quit: bool,
     pub(super) engine: LoopControl,
     pub(super) logs: VecDeque<String>,
+    pub(super) logs_scroll: u16,
+    pub(super) logs_follow: bool,
     pub(super) last_outcomes: usize,
     pub(super) last_error: Option<String>,
     pub(super) last_tick: Instant,
@@ -236,6 +238,8 @@ impl App {
             should_quit: false,
             engine: LoopControl::Paused,
             logs: VecDeque::with_capacity(500),
+            logs_scroll: 0,
+            logs_follow: true,
             last_outcomes: 0,
             last_error: None,
             last_tick: Instant::now(),
@@ -262,6 +266,7 @@ impl App {
 
     pub(super) fn push_log(&mut self, line: impl Into<String>) {
         const MAX: usize = 500;
+        let bump_scroll = !self.logs_follow;
         let line = line.into();
         for part in line.split(['\n', '\r']) {
             let part = part.trim_end();
@@ -272,6 +277,9 @@ impl App {
                 self.logs.pop_front();
             }
             self.logs.push_back(part.to_string());
+            if bump_scroll {
+                self.logs_scroll = self.logs_scroll.saturating_add(1);
+            }
         }
     }
 

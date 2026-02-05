@@ -2,7 +2,7 @@ use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Paragraph};
 
 use super::super::app::App;
 
@@ -152,10 +152,23 @@ fn is_level(token: &str) -> bool {
 }
 
 pub(super) fn draw_logs(f: &mut Frame<'_>, area: Rect, app: &App) {
-    let lines: Vec<Line> = app.logs.iter().rev().take(200).rev().map(|l| log_to_line(l)).collect();
+    let lines: Vec<Line> = app.logs.iter().map(|l| log_to_line(l)).collect();
+    let height = area.height.saturating_sub(2) as usize;
+    let max_scroll = lines.len().saturating_sub(height) as u16;
+    let scroll = if app.logs_follow {
+        max_scroll
+    } else {
+        max_scroll.saturating_sub(app.logs_scroll)
+    };
+
+    let title = if app.logs_follow {
+        "Logs (follow)"
+    } else {
+        "Logs (scroll)"
+    };
 
     let w = Paragraph::new(lines)
-        .block(Block::default().borders(Borders::ALL).title("Logs"))
-        .wrap(Wrap { trim: false });
+        .block(Block::default().borders(Borders::ALL).title(title))
+        .scroll((scroll, 0));
     f.render_widget(w, area);
 }
