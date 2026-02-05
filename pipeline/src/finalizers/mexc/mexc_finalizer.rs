@@ -120,7 +120,6 @@ where
     }
 
     pub async fn check_deposit(&self, state: &mut CexState) -> Result<(), String> {
-        info!("Checking deposit {}", state.deposit_asset);
         let symbol = state.deposit_asset.symbol();
         let current_bal = self.backend.get_balance(&symbol).await?;
 
@@ -128,30 +127,25 @@ where
             Some(b0) => {
                 let expected = state.trade_next_amount_in.unwrap_or_else(|| state.size_in.to_f64());
                 let delta = current_bal - b0;
-                info!(
-                    "[mexc] liq_id={} deposit check: before={} current={} delta={} expected={}",
-                    state.liq_id, b0, current_bal, delta, expected
-                );
-
                 if delta >= expected - 0.00001 {
-                    debug!(
-                        "[mexc] liq_id={} deposit confirmed on CEX, before={} after={}",
-                        state.liq_id, b0, current_bal
+                    info!(
+                        "[mexc] liq_id={} deposit confirmed: before={} after={} expected={}",
+                        state.liq_id, b0, current_bal, expected
                     );
                     state.step = CexStep::Trade;
                     return Ok(());
                 }
-                debug!(
-                    "[mexc] liq_id={} deposit not yet visible on CEX (before={}, after={}), staying in Deposit",
-                    state.liq_id, b0, current_bal
+                info!(
+                    "[mexc] liq_id={} deposit pending: before={} current={} delta={} expected={}",
+                    state.liq_id, b0, current_bal, delta, expected
                 );
             }
             None => {
                 // No baseline recorded yet (should normally be set when we send the transfer),
                 // so record the current balance as the baseline and stay in Deposit.
                 info!(
-                    "[mexc] liq_id={} no baseline recorded, setting deposit_balance_before={} (current={})",
-                    state.liq_id, current_bal, current_bal
+                    "[mexc] liq_id={} deposit baseline set: current={}",
+                    state.liq_id, current_bal
                 );
                 state.deposit_balance_before = Some(current_bal);
             }
@@ -449,11 +443,10 @@ where
             );
 
             let amount = &state.size_in;
+
             let fee = state.deposit_asset.fee() * MEXC_DEPOSIT_FEE_MULTIPLIER; // TODO: Remove after mexc handles deposit confirations
             let fee_amount = ChainTokenAmount::from_raw(state.deposit_asset.clone(), fee.clone());
-            if state.deposit_asset.symbol().eq_ignore_ascii_case("ckusdt") {
-                info!("[mexc] liq_id={} ckUSDT fee={}", state.liq_id, fee_amount.formatted());
-            }
+
             let zero = Nat::from(0u8);
             let transfer_value = if fee > zero {
                 if amount.value.clone() <= fee {
@@ -471,7 +464,8 @@ where
             let transfer_amount = ChainTokenAmount::from_raw(state.deposit_asset.clone(), transfer_value.clone());
             let total_amount =
                 ChainTokenAmount::from_raw(state.deposit_asset.clone(), transfer_value.clone() + fee.clone());
-            info!(
+
+            debug!(
                 "[mexc] liq_id={} deposit transfer requested={} fee={} net_transfer={} total_debit={}",
                 state.liq_id,
                 amount.formatted(),
@@ -482,10 +476,11 @@ where
 
             let actions = &self.transfer_service;
 
-            info!(
+            debug!(
                 "[mexc] liq_id={} transferring {} address={}",
                 state.liq_id, transfer_value, addr.address
             );
+
             let tx_id = actions
                 .transfer(
                     &state.deposit_asset,
@@ -610,13 +605,6 @@ where
             }
         };
 
-        debug!(
-            "[mexc] liq_id={} trade leg {}/{} filled={}",
-            state.liq_id,
-            idx + 1,
-            legs.len(),
-            filled
-        );
         info!(
             "[mexc] liq_id={} trade leg {}/{} result market={} side={} amount_in={} filled={}",
             state.liq_id,
