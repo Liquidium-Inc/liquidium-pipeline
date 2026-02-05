@@ -348,10 +348,8 @@ where
             }
         }
 
-        if ok {
-            if let Ok(mut approve_bumps) = self.approve_bumps.lock() {
-                approve_bumps.insert(liq_id.to_string(), APPROVE_BUMP_MAX_COUNT);
-            }
+        if ok && let Ok(mut approve_bumps) = self.approve_bumps.lock() {
+            approve_bumps.insert(liq_id.to_string(), APPROVE_BUMP_MAX_COUNT);
         }
         approved_count
     }

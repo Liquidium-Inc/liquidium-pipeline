@@ -7,7 +7,7 @@ use alloy::signers::local::PrivateKeySigner;
 use ic_agent::Agent;
 use icrc_ledger_types::icrc1::account::Account;
 use liquidium_pipeline_connectors::account::evm_account::EvmAccountInfoAdapter;
-use liquidium_pipeline_connectors::account::icp_account::{IcpAccountInfoAdapter, RECOVERY_ACCOUNT};
+use liquidium_pipeline_connectors::account::icp_account::IcpAccountInfoAdapter;
 use liquidium_pipeline_connectors::backend::evm_backend::EvmBackendImpl;
 use liquidium_pipeline_core::balance_service::BalanceService;
 use liquidium_pipeline_core::tokens::chain_token::ChainToken;
@@ -24,7 +24,7 @@ use liquidium_pipeline_connectors::{
 };
 
 use crate::approval_state::ApprovalState;
-use crate::config::Config;
+use crate::config::{Config, ConfigTrait};
 use crate::swappers::kong::kong_swapper::KongSwapSwapper;
 use crate::swappers::kong::kong_venue::KongVenue;
 use crate::swappers::router::{SwapRouter, SwapVenue};
@@ -113,10 +113,7 @@ impl<P: Provider<AnyNetwork> + WalletProvider<AnyNetwork> + Clone + 'static> Pip
             subaccount: None,
         };
 
-        let recovery_icp_account = Account {
-            owner: config.liquidator_principal,
-            subaccount: Some(*RECOVERY_ACCOUNT),
-        };
+        let recovery_icp_account = config.get_recovery_account();
 
         let icp_info_main = Arc::new(IcpAccountInfoAdapter::new(icp_backend_main.clone(), main_icp_account));
         let evm_info_main = Arc::new(EvmAccountInfoAdapter::new(evm_backend_main.clone()));

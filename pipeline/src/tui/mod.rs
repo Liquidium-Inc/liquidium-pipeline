@@ -175,6 +175,9 @@ pub async fn run() -> anyhow::Result<()> {
                         Ok(CrosstermEvent::Key(key)) => {
                             let _ = ui_tx.send(UiEvent::Input(key));
                         }
+                        Ok(CrosstermEvent::Paste(text)) => {
+                            let _ = ui_tx.send(UiEvent::Paste(text));
+                        }
                         Ok(_) => {}
                         Err(_) => {}
                     }
@@ -280,6 +283,9 @@ pub async fn run() -> anyhow::Result<()> {
                 if handle_key(&mut app, key, &engine_tx, &ui_tx, &ctx).await? {
                     break;
                 }
+            }
+            UiEvent::Paste(text) => {
+                handle_paste(&mut app, text);
             }
         }
 
@@ -572,8 +578,9 @@ async fn handle_key(
                     }
                     WithdrawField::ManualDestination => {
                         if matches!(app.withdraw.destination, WithdrawDestinationKind::Manual) {
+                            app.withdraw.manual_destination.clear();
                             app.withdraw.editing = Some(WithdrawField::ManualDestination);
-                            app.withdraw.edit_backup = Some(app.withdraw.manual_destination.clone());
+                            app.withdraw.edit_backup = Some(String::new());
                         }
                     }
                     WithdrawField::Submit => {
@@ -590,6 +597,34 @@ async fn handle_key(
         _ => {}
     }
     Ok(false)
+}
+
+fn handle_paste(app: &mut App, text: String) {
+    let mut chars = text.chars().filter(|c| !c.is_control());
+
+    if let Some(input) = app.bad_debt_confirm_input.as_mut() {
+        while input.len() < 16 {
+            let Some(c) = chars.next() else {
+                break;
+            };
+            input.push(c);
+        }
+        return;
+    }
+
+    if matches!(app.tab, Tab::Balances) && matches!(app.balances_panel, BalancesPanel::Withdraw) {
+        if let Some(editing) = app.withdraw.editing {
+            match editing {
+                WithdrawField::Amount => {
+                    app.withdraw.amount.extend(chars);
+                }
+                WithdrawField::ManualDestination => {
+                    app.withdraw.manual_destination.extend(chars);
+                }
+                _ => {}
+            }
+        }
+    }
 }
 
 async fn fetch_balances_snapshot(ctx: Arc<crate::context::PipelineContext>) -> Result<BalancesSnapshot, String> {

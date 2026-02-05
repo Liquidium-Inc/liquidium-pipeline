@@ -2,7 +2,7 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, Wrap};
+use ratatui::widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table, Wrap};
 
 use super::super::app::{App, BalancesPanel, WithdrawAccountKind, WithdrawDestinationKind, WithdrawField};
 use super::super::deposit_network_for_asset;
@@ -84,15 +84,22 @@ pub(super) fn draw_balances(f: &mut Frame<'_>, area: Rect, app: &App) {
         BalancesPanel::Withdraw => draw_withdraw(f, body[1], app),
         BalancesPanel::Deposit => draw_deposit(f, body[1], app),
     }
+
+    if matches!(app.balances_panel, BalancesPanel::Withdraw)
+        && matches!(app.withdraw.editing, Some(WithdrawField::ManualDestination))
+    {
+        draw_withdraw_destination_popup(f, area, app);
+    }
 }
 
 fn draw_balances_actions(f: &mut Frame<'_>, area: Rect, app: &App) {
-    let mut lines: Vec<Line> = Vec::new();
-    lines.push(Line::from("Actions"));
-    lines.push(Line::from("  w  withdraw selected (ICP only)"));
-    lines.push(Line::from("  d  MEXC deposit address"));
-    lines.push(Line::from("  Esc  close panel"));
-    lines.push(Line::from(""));
+    let mut lines: Vec<Line> = vec![
+        Line::from("Actions"),
+        Line::from("  w  withdraw selected (ICP only)"),
+        Line::from("  d  MEXC deposit address"),
+        Line::from("  Esc  close panel"),
+        Line::from(""),
+    ];
 
     if let Some(balances) = &app.balances
         && let Some(selected) = balances.rows.get(app.balances_selected)
@@ -227,7 +234,11 @@ fn draw_withdraw(f: &mut Frame<'_>, area: Rect, app: &App) {
         .unwrap_or_else(|| "-".to_string());
 
     let manual_value = if matches!(app.withdraw.destination, WithdrawDestinationKind::Manual) {
-        app.withdraw.manual_destination.clone()
+        if app.withdraw.manual_destination.is_empty() {
+            "press Enter".to_string()
+        } else {
+            truncate_middle(&app.withdraw.manual_destination, 36)
+        }
     } else {
         "-".to_string()
     };
@@ -340,4 +351,79 @@ fn draw_withdraw(f: &mut Frame<'_>, area: Rect, app: &App) {
             .wrap(Wrap { trim: false }),
         layout[1],
     );
+}
+
+fn draw_withdraw_destination_popup(f: &mut Frame<'_>, area: Rect, app: &App) {
+    let popup = centered_rect(70, 35, area);
+    f.render_widget(Clear, popup);
+
+    let input = app.withdraw.manual_destination.as_str();
+
+    let lines = vec![
+        Line::from(Span::styled(
+            "Manual Withdrawal Address",
+            Style::default().add_modifier(Modifier::BOLD),
+        )),
+        Line::from("Paste address · Enter to save · Esc to cancel"),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("Input: ", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw(input.to_string()),
+        ]),
+    ];
+
+    let w = Paragraph::new(lines)
+        .block(Block::default().borders(Borders::ALL).title("Withdraw Address"))
+        .wrap(Wrap { trim: false });
+    f.render_widget(w, popup);
+}
+
+fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
+    let vertical = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage((100 - percent_y) / 2),
+            Constraint::Percentage(percent_y),
+            Constraint::Percentage((100 - percent_y) / 2),
+        ])
+        .split(r);
+
+    let horizontal = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage((100 - percent_x) / 2),
+            Constraint::Percentage(percent_x),
+            Constraint::Percentage((100 - percent_x) / 2),
+        ])
+        .split(vertical[1]);
+
+    horizontal[1]
+}
+
+fn truncate_middle(s: &str, max: usize) -> String {
+    if max <= 1 {
+        return "…".to_string();
+    }
+
+    let len = s.chars().count();
+    if len <= max {
+        return s.to_string();
+    }
+
+    if max <= 3 {
+        return s.chars().take(max).collect();
+    }
+
+    let head_len = (max - 1) / 2;
+    let tail_len = max - 1 - head_len;
+    let head: String = s.chars().take(head_len).collect();
+    let tail: String = s
+        .chars()
+        .rev()
+        .take(tail_len)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    format!("{head}…{tail}")
 }

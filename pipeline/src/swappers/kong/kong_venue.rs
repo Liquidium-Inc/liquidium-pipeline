@@ -239,7 +239,7 @@ mod tests {
         mock_agent.expect_agent().returning(move || agent.clone());
 
         let ledger_allowance = ledger;
-        let ledger_balance = ledger_allowance.clone();
+        let ledger_balance = ledger_allowance;
 
         mock_agent
             .expect_call_query::<Allowance>()
@@ -277,7 +277,7 @@ mod tests {
                     return false;
                 }
                 let decoded: SwapArgs = Decode!(&arg, SwapArgs).expect("decode swap args");
-                decoded.pay_amount == Nat::from(90u8)
+                decoded.pay_amount == 90u8
             })
             .times(1)
             .returning(move |_, _, _| {
@@ -333,7 +333,7 @@ mod tests {
         mock_agent.expect_agent().returning(move || agent.clone());
 
         let ledger_allowance = ledger;
-        let ledger_balance = ledger_allowance.clone();
+        let ledger_balance = ledger_allowance;
 
         mock_agent
             .expect_call_query::<Allowance>()
@@ -357,7 +357,7 @@ mod tests {
                     return false;
                 }
                 let decoded: SwapArgs = Decode!(&arg, SwapArgs).expect("decode swap args");
-                decoded.pay_amount == Nat::from(100u8)
+                decoded.pay_amount == 100u8
             })
             .times(1)
             .returning(move |_, _, _| Ok(SwapResult::Ok(dummy_swap_reply(Nat::from(100u8)))));

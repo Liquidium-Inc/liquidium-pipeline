@@ -106,7 +106,7 @@ fn highlight_message(msg: &str) -> Vec<Span<'static>> {
                 let is_better = match best_idx {
                     None => true,
                     Some(best) if idx < best => true,
-                    Some(best) if idx == best => best_pat.map_or(true, |p| pat.len() > p.len()),
+                    Some(best) if idx == best => best_pat.is_none_or(|p| pat.len() > p.len()),
                     _ => false,
                 };
                 if is_better {

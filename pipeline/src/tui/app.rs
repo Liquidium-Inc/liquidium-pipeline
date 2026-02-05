@@ -263,7 +263,7 @@ impl App {
     pub(super) fn push_log(&mut self, line: impl Into<String>) {
         const MAX: usize = 500;
         let line = line.into();
-        for part in line.split(|c| c == '\n' || c == '\r') {
+        for part in line.split(['\n', '\r']) {
             let part = part.trim_end();
             if part.is_empty() {
                 continue;

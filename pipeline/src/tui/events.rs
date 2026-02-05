@@ -7,6 +7,7 @@ use super::app::{BalancesSnapshot, ProfitsSnapshot, WalSnapshot};
 
 pub(super) enum UiEvent {
     Input(KeyEvent),
+    Paste(String),
     Tick,
     Engine(LoopEvent),
     Wal(Result<WalSnapshot, String>),

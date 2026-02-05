@@ -3,7 +3,9 @@ use icrc_ledger_types::icrc1::account::Account;
 use indicatif::{ProgressBar, ProgressStyle};
 
 use prettytable::{Cell, Row, Table, format};
-use std::{sync::Arc, thread::sleep, time::Duration, time::Instant};
+use std::{sync::Arc, time::Duration, time::Instant};
+use tokio::sync::{mpsc, watch};
+use tokio::time::sleep;
 use tracing::{Instrument, info_span, instrument};
 use tracing::{info, warn};
 

@@ -1,6 +1,7 @@
 use std::io;
 
 use anyhow::Context as _;
+use crossterm::event::{DisableBracketedPaste, EnableBracketedPaste};
 use crossterm::terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode};
 use crossterm::{ExecutableCommand, execute};
 use tokio::sync::mpsc;
@@ -16,7 +17,8 @@ pub(super) struct TerminalGuard;
 impl TerminalGuard {
     pub(super) fn enter() -> anyhow::Result<Self> {
         enable_raw_mode().context("enable raw mode")?;
-        execute!(io::stdout(), EnterAlternateScreen).context("enter alternate screen")?;
+        execute!(io::stdout(), EnterAlternateScreen, EnableBracketedPaste)
+            .context("enter alternate screen")?;
         Ok(Self)
     }
 }
@@ -24,6 +26,7 @@ impl TerminalGuard {
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
         let _ = disable_raw_mode();
+        let _ = io::stdout().execute(DisableBracketedPaste);
         let _ = io::stdout().execute(LeaveAlternateScreen);
     }
 }

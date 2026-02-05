@@ -308,7 +308,7 @@ where
             let debt_approval_needed = self.debt_approval_needed(&repayment_token);
             let mut debt_fee_total = repayment_token.fee();
             if debt_approval_needed {
-                debt_fee_total = debt_fee_total + repayment_token.fee();
+                debt_fee_total += repayment_token.fee();
             }
 
             if available_balance.clone() < debt_fee_total.clone() {
@@ -472,7 +472,7 @@ where
             let debt_approval_needed = self.debt_approval_needed(&repayment_token);
             let mut debt_fee_total = repayment_token.fee();
             if debt_approval_needed {
-                debt_fee_total = debt_fee_total + repayment_token.fee();
+                debt_fee_total += repayment_token.fee();
             }
 
             if available_balance.clone() < debt_fee_total.clone() {
@@ -556,7 +556,7 @@ where
                     if amount_in_effective <= deposit_fee {
                         amount_in_effective = Nat::from(0u8);
                     } else {
-                        amount_in_effective = amount_in_effective - deposit_fee;
+                        amount_in_effective -= deposit_fee;
                     }
 
                     if matches!(collateral_token, ChainToken::Icp { .. }) {
@@ -567,7 +567,7 @@ where
                     if amount_in_effective <= approval_fee {
                         amount_in_effective = Nat::from(0u8);
                     } else {
-                        amount_in_effective = amount_in_effective - approval_fee;
+                        amount_in_effective -= approval_fee;
                     }
                 }
             }
