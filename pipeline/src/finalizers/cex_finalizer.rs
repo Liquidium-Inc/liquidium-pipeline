@@ -129,7 +129,8 @@ impl Finalizer for dyn CexFinalizerLogic {
         } else {
             self.prepare(&liq_id, &receipt).await?
         };
-        info!(
+
+        debug!(
             "[cex] ✅ liq_id={} state loaded: step={:?}",
             cex_state.liq_id, cex_state.step
         );
