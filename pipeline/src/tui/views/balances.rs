@@ -5,7 +5,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table, Wrap};
 
 use super::super::app::{App, BalancesPanel, WithdrawAccountKind, WithdrawDestinationKind, WithdrawField};
-use super::super::deposit_network_for_asset;
+use super::super::withdraw::deposit_network_for_asset;
 
 pub(super) fn draw_balances(f: &mut Frame<'_>, area: Rect, app: &App) {
     let mut lines: Vec<Line> = Vec::new();

@@ -37,10 +37,10 @@ fn draw_recent_logs(f: &mut Frame<'_>, area: Rect, app: &App) {
     let lines: Vec<Line> = app.logs.iter().map(|l| super::logs::log_to_line(l)).collect();
     let height = area.height.saturating_sub(2) as usize;
     let max_scroll = lines.len().saturating_sub(height) as u16;
-    let scroll = if !app.dashboard_logs_scroll_active || app.dashboard_logs_follow {
-        max_scroll
+    let (scroll, scroll_x) = if !app.dashboard_logs_scroll_active || app.dashboard_logs_follow {
+        (max_scroll, 0)
     } else {
-        max_scroll.saturating_sub(app.dashboard_logs_scroll)
+        (max_scroll.saturating_sub(app.dashboard_logs_scroll), app.dashboard_logs_scroll_x)
     };
 
     let title = if let Some(err) = &app.last_error {
@@ -62,7 +62,7 @@ fn draw_recent_logs(f: &mut Frame<'_>, area: Rect, app: &App) {
         block = block.border_style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD));
     }
 
-    let w = Paragraph::new(lines).block(block).scroll((scroll, 0));
+    let w = Paragraph::new(lines).block(block).scroll((scroll, scroll_x));
     f.render_widget(w, area);
 }
 

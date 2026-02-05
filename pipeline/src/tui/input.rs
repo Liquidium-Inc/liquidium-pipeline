@@ -21,6 +21,13 @@ fn reset_log_focus(app: &mut App) {
     app.dashboard_logs_follow = true;
     app.logs_scroll = 0;
     app.dashboard_logs_scroll = 0;
+    app.logs_scroll_x = 0;
+    app.dashboard_logs_scroll_x = 0;
+}
+
+fn reset_executions_focus(app: &mut App) {
+    app.ui_focus = UiFocus::Tabs;
+    app.executions_details_scroll = 0;
 }
 
 pub(super) async fn handle_key(
@@ -82,6 +89,13 @@ pub(super) async fn handle_key(
         }
     }
 
+    if matches!(app.tab, Tab::Executions) {
+        if matches!(key.code, KeyCode::Down) && matches!(app.ui_focus, UiFocus::Tabs) {
+            app.ui_focus = UiFocus::ExecutionsTable;
+            return Ok(false);
+        }
+    }
+
     if matches!(app.tab, Tab::Logs) && matches!(app.ui_focus, UiFocus::Logs) {
         if !matches!(key.code, KeyCode::Char('g')) {
             app.logs_g_pending = false;
@@ -115,6 +129,16 @@ pub(super) async fn handle_key(
                 }
                 return Ok(false);
             }
+            if matches!(app.tab, Tab::Executions) {
+                if matches!(app.ui_focus, UiFocus::ExecutionsDetails) {
+                    app.ui_focus = UiFocus::ExecutionsTable;
+                    return Ok(false);
+                }
+                if matches!(app.ui_focus, UiFocus::ExecutionsTable) {
+                    reset_executions_focus(app);
+                    return Ok(false);
+                }
+            }
             if matches!(app.ui_focus, UiFocus::Logs) {
                 reset_log_focus(app);
                 return Ok(false);
@@ -126,6 +150,16 @@ pub(super) async fn handle_key(
             return Ok(false);
         }
         (KeyCode::Enter, KeyModifiers::NONE)
+            if matches!(app.tab, Tab::Executions) && matches!(app.ui_focus, UiFocus::ExecutionsTable) =>
+        {
+            app.ui_focus = UiFocus::ExecutionsDetails;
+        }
+        (KeyCode::Enter, KeyModifiers::NONE)
+            if matches!(app.tab, Tab::Executions) && matches!(app.ui_focus, UiFocus::ExecutionsDetails) =>
+        {
+            app.ui_focus = UiFocus::ExecutionsTable;
+        }
+        (KeyCode::Enter, KeyModifiers::NONE)
             if matches!(app.tab, Tab::Logs) && matches!(app.ui_focus, UiFocus::Logs) =>
         {
             app.logs_scroll_active = !app.logs_scroll_active;
@@ -133,6 +167,7 @@ pub(super) async fn handle_key(
                 app.logs_follow = true;
                 app.logs_scroll = 0;
                 app.logs_g_pending = false;
+                app.logs_scroll_x = 0;
             }
         }
         (KeyCode::Enter, KeyModifiers::NONE)
@@ -143,6 +178,7 @@ pub(super) async fn handle_key(
                 app.dashboard_logs_follow = true;
                 app.dashboard_logs_scroll = 0;
                 app.dashboard_logs_g_pending = false;
+                app.dashboard_logs_scroll_x = 0;
             }
         }
         (KeyCode::Up, KeyModifiers::NONE)
@@ -325,6 +361,70 @@ pub(super) async fn handle_key(
             app.dashboard_logs_scroll = 0;
             app.dashboard_logs_follow = true;
         }
+        (KeyCode::Left, KeyModifiers::NONE)
+            if matches!(app.tab, Tab::Logs) && matches!(app.ui_focus, UiFocus::Logs) && app.logs_scroll_active =>
+        {
+            app.logs_scroll_x = app.logs_scroll_x.saturating_sub(1);
+        }
+        (KeyCode::Right, KeyModifiers::NONE)
+            if matches!(app.tab, Tab::Logs) && matches!(app.ui_focus, UiFocus::Logs) && app.logs_scroll_active =>
+        {
+            app.logs_scroll_x = app.logs_scroll_x.saturating_add(1);
+        }
+        (KeyCode::Left, KeyModifiers::NONE)
+            if matches!(app.tab, Tab::Dashboard)
+                && matches!(app.ui_focus, UiFocus::Logs)
+                && app.dashboard_logs_scroll_active =>
+        {
+            app.dashboard_logs_scroll_x = app.dashboard_logs_scroll_x.saturating_sub(1);
+        }
+        (KeyCode::Right, KeyModifiers::NONE)
+            if matches!(app.tab, Tab::Dashboard)
+                && matches!(app.ui_focus, UiFocus::Logs)
+                && app.dashboard_logs_scroll_active =>
+        {
+            app.dashboard_logs_scroll_x = app.dashboard_logs_scroll_x.saturating_add(1);
+        }
+        (KeyCode::Up, KeyModifiers::NONE)
+            if matches!(app.tab, Tab::Executions) && matches!(app.ui_focus, UiFocus::ExecutionsDetails) =>
+        {
+            app.executions_details_scroll = app.executions_details_scroll.saturating_sub(1);
+        }
+        (KeyCode::Down, KeyModifiers::NONE)
+            if matches!(app.tab, Tab::Executions) && matches!(app.ui_focus, UiFocus::ExecutionsDetails) =>
+        {
+            app.executions_details_scroll = app.executions_details_scroll.saturating_add(1);
+        }
+        (KeyCode::Char('k'), KeyModifiers::NONE)
+            if matches!(app.tab, Tab::Executions) && matches!(app.ui_focus, UiFocus::ExecutionsDetails) =>
+        {
+            app.executions_details_scroll = app.executions_details_scroll.saturating_sub(1);
+        }
+        (KeyCode::Char('j'), KeyModifiers::NONE)
+            if matches!(app.tab, Tab::Executions) && matches!(app.ui_focus, UiFocus::ExecutionsDetails) =>
+        {
+            app.executions_details_scroll = app.executions_details_scroll.saturating_add(1);
+        }
+        (KeyCode::PageUp, KeyModifiers::NONE)
+            if matches!(app.tab, Tab::Executions) && matches!(app.ui_focus, UiFocus::ExecutionsDetails) =>
+        {
+            app.executions_details_scroll = app.executions_details_scroll.saturating_sub(10);
+        }
+        (KeyCode::PageDown, KeyModifiers::NONE)
+            if matches!(app.tab, Tab::Executions) && matches!(app.ui_focus, UiFocus::ExecutionsDetails) =>
+        {
+            app.executions_details_scroll = app.executions_details_scroll.saturating_add(10);
+        }
+        (KeyCode::Char('u'), KeyModifiers::CONTROL)
+            if matches!(app.tab, Tab::Executions) && matches!(app.ui_focus, UiFocus::ExecutionsDetails) =>
+        {
+            app.executions_details_scroll = app.executions_details_scroll.saturating_sub(10);
+        }
+        (KeyCode::Char('d'), KeyModifiers::CONTROL)
+            if matches!(app.tab, Tab::Executions) && matches!(app.ui_focus, UiFocus::ExecutionsDetails) =>
+        {
+            app.executions_details_scroll = app.executions_details_scroll.saturating_add(10);
+        }
         (KeyCode::Tab, KeyModifiers::NONE) => app.next_tab(),
         (KeyCode::BackTab, KeyModifiers::SHIFT) => app.prev_tab(),
         (KeyCode::Left, KeyModifiers::NONE)
@@ -384,6 +484,7 @@ pub(super) async fn handle_key(
         }
         (KeyCode::Char('e'), KeyModifiers::NONE) => {
             reset_log_focus(app);
+            reset_executions_focus(app);
             app.tab = Tab::Executions;
         }
         (KeyCode::Char('w'), KeyModifiers::NONE) => {
@@ -414,14 +515,20 @@ pub(super) async fn handle_key(
         {
             app.balances_selected = app.balances_selected.saturating_sub(1);
         }
-        (KeyCode::Down, KeyModifiers::NONE) if matches!(app.tab, Tab::Executions) => {
+        (KeyCode::Down, KeyModifiers::NONE)
+            if matches!(app.tab, Tab::Executions) && matches!(app.ui_focus, UiFocus::ExecutionsTable) =>
+        {
             let max = app.executions.as_ref().map(|e| e.rows.len()).unwrap_or(0);
             if max > 0 {
                 app.executions_selected = (app.executions_selected + 1).min(max - 1);
+                app.executions_details_scroll = 0;
             }
         }
-        (KeyCode::Up, KeyModifiers::NONE) if matches!(app.tab, Tab::Executions) => {
+        (KeyCode::Up, KeyModifiers::NONE)
+            if matches!(app.tab, Tab::Executions) && matches!(app.ui_focus, UiFocus::ExecutionsTable) =>
+        {
             app.executions_selected = app.executions_selected.saturating_sub(1);
+            app.executions_details_scroll = 0;
         }
         (code, KeyModifiers::NONE)
             if matches!(app.tab, Tab::Balances) && matches!(app.balances_panel, BalancesPanel::Withdraw) =>

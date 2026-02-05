@@ -93,6 +93,7 @@ pub(super) struct ExecutionRowData {
     pub(super) last_error: Option<String>,
     pub(super) created_at: i64,
     pub(super) updated_at: i64,
+    pub(super) meta_json: String,
 }
 
 #[derive(Clone, Debug)]
@@ -213,6 +214,8 @@ pub(super) enum BalancesPanel {
 pub(super) enum UiFocus {
     Tabs,
     Logs,
+    ExecutionsTable,
+    ExecutionsDetails,
 }
 
 #[derive(Default)]
@@ -235,10 +238,12 @@ pub(super) struct App {
     pub(super) engine: LoopControl,
     pub(super) logs: VecDeque<String>,
     pub(super) logs_scroll: u16,
+    pub(super) logs_scroll_x: u16,
     pub(super) logs_follow: bool,
     pub(super) logs_g_pending: bool,
     pub(super) logs_scroll_active: bool,
     pub(super) dashboard_logs_scroll: u16,
+    pub(super) dashboard_logs_scroll_x: u16,
     pub(super) dashboard_logs_follow: bool,
     pub(super) dashboard_logs_g_pending: bool,
     pub(super) dashboard_logs_scroll_active: bool,
@@ -259,6 +264,7 @@ pub(super) struct App {
     pub(super) executions: Option<ExecutionsSnapshot>,
     pub(super) executions_error: Option<String>,
     pub(super) executions_selected: usize,
+    pub(super) executions_details_scroll: u16,
 
     pub(super) recent_outcomes: VecDeque<RecentOutcome>,
 
@@ -282,10 +288,12 @@ impl App {
             engine: LoopControl::Paused,
             logs: VecDeque::with_capacity(500),
             logs_scroll: 0,
+            logs_scroll_x: 0,
             logs_follow: true,
             logs_g_pending: false,
             logs_scroll_active: false,
             dashboard_logs_scroll: 0,
+            dashboard_logs_scroll_x: 0,
             dashboard_logs_follow: true,
             dashboard_logs_g_pending: false,
             dashboard_logs_scroll_active: false,
@@ -306,6 +314,7 @@ impl App {
             executions: None,
             executions_error: None,
             executions_selected: 0,
+            executions_details_scroll: 0,
 
             recent_outcomes: VecDeque::with_capacity(200),
 
@@ -353,6 +362,7 @@ impl App {
         self.dashboard_logs_follow = true;
         self.logs_scroll = 0;
         self.dashboard_logs_scroll = 0;
+        self.executions_details_scroll = 0;
     }
 
     pub(super) fn prev_tab(&mut self) {
@@ -368,5 +378,6 @@ impl App {
         self.dashboard_logs_follow = true;
         self.logs_scroll = 0;
         self.dashboard_logs_scroll = 0;
+        self.executions_details_scroll = 0;
     }
 }

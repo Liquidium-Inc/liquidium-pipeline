@@ -155,12 +155,16 @@ pub(super) fn draw_logs(f: &mut Frame<'_>, area: Rect, app: &App) {
     let lines: Vec<Line> = app.logs.iter().map(|l| log_to_line(l)).collect();
     let height = area.height.saturating_sub(2) as usize;
     let max_scroll = lines.len().saturating_sub(height) as u16;
-    let (scroll, title) = if !app.logs_scroll_active {
-        (max_scroll, "Logs (view)")
+    let (scroll, scroll_x, title) = if !app.logs_scroll_active {
+        (max_scroll, 0, "Logs (view)")
     } else if app.logs_follow {
-        (max_scroll, "Logs (follow)")
+        (max_scroll, app.logs_scroll_x, "Logs (follow)")
     } else {
-        (max_scroll.saturating_sub(app.logs_scroll), "Logs (scroll)")
+        (
+            max_scroll.saturating_sub(app.logs_scroll),
+            app.logs_scroll_x,
+            "Logs (scroll)",
+        )
     };
 
     let mut block = Block::default().borders(Borders::ALL).title(title);
@@ -168,6 +172,6 @@ pub(super) fn draw_logs(f: &mut Frame<'_>, area: Rect, app: &App) {
         block = block.border_style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD));
     }
 
-    let w = Paragraph::new(lines).block(block).scroll((scroll, 0));
+    let w = Paragraph::new(lines).block(block).scroll((scroll, scroll_x));
     f.render_widget(w, area);
 }

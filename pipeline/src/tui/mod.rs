@@ -4,8 +4,8 @@ mod format;
 mod input;
 mod logging;
 mod snapshots;
-mod withdraw;
 mod views;
+mod withdraw;
 
 use std::io;
 use std::sync::Arc;
@@ -23,14 +23,12 @@ use crate::commands::liquidation_loop::{LoopControl, LoopEvent, run_liquidation_
 use crate::context::init_context_best_effort;
 use crate::persistance::sqlite::SqliteWalStore;
 
-use self::app::{App, ConfigSummary, ExecutionRowData, ExecutionsSnapshot, RecentOutcome, Tab, WalCounts, WalSnapshot};
+use self::app::{App, ConfigSummary, ExecutionRowData, ExecutionsSnapshot, RecentOutcome, WalCounts, WalSnapshot};
 use self::events::UiEvent;
 use self::logging::{TerminalGuard, init_tui_tracing};
 use self::snapshots::{compute_profits_snapshot, fetch_balances_snapshot};
-use self::withdraw::build_withdrawable_assets;
 use self::views::draw_ui;
-
-pub(super) use self::withdraw::deposit_network_for_asset;
+use self::withdraw::build_withdrawable_assets;
 
 pub async fn run() -> anyhow::Result<()> {
     let (ui_tx, mut ui_rx) = mpsc::unbounded_channel::<UiEvent>();
@@ -128,12 +126,10 @@ pub async fn run() -> anyhow::Result<()> {
                                 last_error: row.last_error,
                                 created_at: row.created_at,
                                 updated_at: row.updated_at,
+                                meta_json: row.meta_json,
                             })
                             .collect();
-                        let exec_snapshot = ExecutionsSnapshot {
-                            rows,
-                            at: Local::now(),
-                        };
+                        let exec_snapshot = ExecutionsSnapshot { rows, at: Local::now() };
                         let _ = ui_tx.send(UiEvent::Executions(Ok(exec_snapshot)));
                     }
                     Ok(Err(e)) => {

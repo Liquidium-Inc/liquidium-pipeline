@@ -1,13 +1,17 @@
-use chrono::Local;
+use chrono::{Local, TimeZone};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, Wrap};
+use serde_json::{Value, json};
 
-use crate::persistance::ResultStatus;
+use crate::finalizers::liquidation_outcome::LiquidationOutcome;
+use crate::persistance::{LiqMetaWrapper, ResultStatus};
+use crate::stages::executor::ExecutionReceipt;
+use crate::wal::liq_id_from_receipt;
 
-use super::super::app::App;
+use super::super::app::{App, ExecutionRowData, UiFocus};
 
 pub(super) fn draw_executions(f: &mut Frame<'_>, area: Rect, app: &App) {
     let mut lines: Vec<Line> = Vec::new();
@@ -55,13 +59,6 @@ pub(super) fn draw_executions(f: &mut Frame<'_>, area: Rect, app: &App) {
         return;
     };
 
-    if exec.rows.is_empty() {
-        let w = Paragraph::new("No WAL entries yet.")
-            .block(Block::default().borders(Borders::ALL).title("WAL"));
-        f.render_widget(w, layout[1]);
-        return;
-    }
-
     let now = Local::now().timestamp();
 
     let rows = exec.rows.iter().enumerate().map(|(idx, r)| {
@@ -70,6 +67,8 @@ pub(super) fn draw_executions(f: &mut Frame<'_>, area: Rect, app: &App) {
 
         let age_secs = now.saturating_sub(r.updated_at);
         let updated = format_age(age_secs);
+
+        let profit_cell = profit_cell_for_row(r, app);
 
         let last_error = r
             .last_error
@@ -83,6 +82,7 @@ pub(super) fn draw_executions(f: &mut Frame<'_>, area: Rect, app: &App) {
             Cell::new(r.attempt.to_string()),
             Cell::new(r.error_count.to_string()),
             Cell::new(updated),
+            profit_cell,
             Cell::new(last_error),
         ]);
 
@@ -98,9 +98,57 @@ pub(super) fn draw_executions(f: &mut Frame<'_>, area: Rect, app: &App) {
         Cell::new("Att"),
         Cell::new("Err"),
         Cell::new("Age"),
+        Cell::new("Profit"),
         Cell::new("Last error"),
     ])
     .style(Style::default().add_modifier(Modifier::BOLD));
+
+    let body_area = layout[1];
+    let body_layout = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
+        .split(body_area);
+
+    let selected = exec
+        .rows
+        .get(app.executions_selected)
+        .or_else(|| exec.rows.first());
+
+    let details_block = {
+        let mut block = Block::default().borders(Borders::ALL).title("Execution Details");
+        if matches!(app.ui_focus, UiFocus::ExecutionsDetails) {
+            block = block.border_style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD));
+        }
+        block
+    };
+
+    if let Some(row) = selected {
+        let lines = build_execution_details(row);
+        let height = body_layout[1].height.saturating_sub(2) as usize;
+        let max_scroll = lines.len().saturating_sub(height) as u16;
+        let scroll = app.executions_details_scroll.min(max_scroll);
+        let details_widget = Paragraph::new(lines)
+            .block(details_block)
+            .scroll((scroll, 0))
+            .wrap(Wrap { trim: false });
+        f.render_widget(details_widget, body_layout[1]);
+    } else {
+        let details_widget = Paragraph::new("No selection.")
+            .block(details_block)
+            .wrap(Wrap { trim: false });
+        f.render_widget(details_widget, body_layout[1]);
+    }
+
+    let mut table_block = Block::default().borders(Borders::ALL).title("WAL");
+    if matches!(app.ui_focus, UiFocus::ExecutionsTable) {
+        table_block = table_block.border_style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD));
+    }
+
+    if exec.rows.is_empty() {
+        let w = Paragraph::new("No WAL entries yet.").block(table_block);
+        f.render_widget(w, body_layout[0]);
+        return;
+    }
 
     let table = Table::new(
         rows,
@@ -110,13 +158,14 @@ pub(super) fn draw_executions(f: &mut Frame<'_>, area: Rect, app: &App) {
             Constraint::Length(4),
             Constraint::Length(4),
             Constraint::Length(6),
+            Constraint::Length(16),
             Constraint::Min(0),
         ],
     )
     .header(header)
-    .block(Block::default().borders(Borders::ALL).title("WAL"));
+    .block(table_block);
 
-    f.render_widget(table, layout[1]);
+    f.render_widget(table, body_layout[0]);
 }
 
 fn status_label(status: ResultStatus) -> &'static str {
@@ -164,4 +213,169 @@ fn truncate(s: &str, max: usize) -> String {
     }
     let take = max - 3;
     format!("{}...", &s[..take])
+}
+
+fn build_execution_details(row: &ExecutionRowData) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+
+    lines.push(Line::from(format!("liq_id: {}", row.liq_id)));
+    lines.push(Line::from(format!(
+        "status: {} | attempt: {} | errors: {}",
+        status_label(row.status),
+        row.attempt,
+        row.error_count
+    )));
+    lines.push(Line::from(format!(
+        "created: {} | updated: {}",
+        format_ts(row.created_at),
+        format_ts(row.updated_at)
+    )));
+
+    if let Some(err) = row.last_error.as_deref() {
+        lines.push(Line::from(format!("last_error: {}", err)));
+    }
+
+    lines.push(Line::from("meta_json:"));
+
+    let meta_lines = parse_meta_lines(&row.meta_json);
+    lines.extend(meta_lines);
+
+    lines
+}
+
+fn parse_meta_lines(raw: &str) -> Vec<Line<'static>> {
+    if raw.trim().is_empty() || raw.trim() == "{}" {
+        return vec![Line::from("<empty>")];
+    }
+
+    match serde_json::from_str::<LiqMetaWrapper>(raw) {
+        Ok(wrapper) => {
+            let meta_val = decode_meta_value(&wrapper.meta);
+            let val = json!({
+                "receipt": wrapper.receipt,
+                "meta": meta_val
+            });
+            return pretty_json_lines(&val);
+        }
+        Err(wrapper_err) => match serde_json::from_str::<ExecutionReceipt>(raw) {
+            Ok(receipt) => {
+                let val = json!({
+                    "receipt": receipt,
+                    "meta": Value::Null
+                });
+                return pretty_json_lines(&val);
+            }
+            Err(receipt_err) => {
+                if let Ok(value) = serde_json::from_str::<Value>(raw) {
+                    let mut lines = Vec::new();
+                    lines.push(Line::from(Span::styled(
+                        format!(
+                            "meta_json unexpected shape (wrapper_err={}, receipt_err={})",
+                            wrapper_err, receipt_err
+                        ),
+                        Style::default().fg(Color::Yellow),
+                    )));
+                    lines.extend(pretty_json_lines(&value));
+                    return lines;
+                }
+
+                return vec![
+                    Line::from(Span::styled(
+                        format!(
+                            "meta_json parse error (wrapper_err={}, receipt_err={})",
+                            wrapper_err, receipt_err
+                        ),
+                        Style::default().fg(Color::Red),
+                    )),
+                    Line::from(truncate(raw, 220)),
+                ];
+            }
+        },
+    }
+}
+
+fn decode_meta_value(meta: &[u8]) -> Value {
+    if meta.is_empty() {
+        return Value::Null;
+    }
+    if let Ok(text) = std::str::from_utf8(meta) {
+        if let Ok(value) = serde_json::from_str::<Value>(text) {
+            return value;
+        }
+        return Value::String(text.to_string());
+    }
+    json!({ "meta_bytes_len": meta.len() })
+}
+
+fn pretty_json_lines(value: &Value) -> Vec<Line<'static>> {
+    let pretty = serde_json::to_string_pretty(value).unwrap_or_else(|_| "<failed to render json>".to_string());
+    pretty.lines().map(|l| Line::from(l.to_string())).collect()
+}
+
+fn format_ts(secs: i64) -> String {
+    if let Some(dt) = Local.timestamp_opt(secs, 0).single() {
+        return dt.format("%Y-%m-%d %H:%M:%S").to_string();
+    }
+    secs.to_string()
+}
+
+fn profit_cell_for_row(row: &ExecutionRowData, app: &App) -> Cell<'static> {
+    if let Some(outcome) = latest_outcome_for(app, &row.liq_id) {
+        let delta = outcome.realized_profit - outcome.expected_profit;
+        let style = profit_style_from_delta(delta);
+        return Cell::new(outcome.formatted_realized_profit()).style(style);
+    }
+
+    if let Some((expected, decimals, symbol)) = expected_profit_from_meta(&row.meta_json) {
+        let style = profit_style_from_delta(expected);
+        let formatted = format_profit(expected, decimals, &symbol);
+        return Cell::new(formatted).style(style);
+    }
+
+    Cell::new("-").style(Style::default().fg(Color::DarkGray))
+}
+
+fn latest_outcome_for<'a>(app: &'a App, liq_id: &str) -> Option<&'a LiquidationOutcome> {
+    for r in app.recent_outcomes.iter().rev() {
+        if let Ok(outcome_id) = liq_id_from_receipt(&r.outcome.execution_receipt) {
+            if outcome_id == liq_id {
+                return Some(&r.outcome);
+            }
+        }
+    }
+    None
+}
+
+fn expected_profit_from_meta(raw: &str) -> Option<(i128, u8, String)> {
+    let receipt = extract_receipt(raw)?;
+    let expected = receipt.request.expected_profit;
+    let decimals = receipt.request.debt_asset.decimals();
+    let symbol = receipt.request.debt_asset.symbol().to_string();
+    Some((expected, decimals, symbol))
+}
+
+fn extract_receipt(raw: &str) -> Option<ExecutionReceipt> {
+    if raw.trim().is_empty() || raw.trim() == "{}" {
+        return None;
+    }
+    if let Ok(wrapper) = serde_json::from_str::<LiqMetaWrapper>(raw) {
+        return Some(wrapper.receipt);
+    }
+    if let Ok(receipt) = serde_json::from_str::<ExecutionReceipt>(raw) {
+        return Some(receipt);
+    }
+    None
+}
+
+fn profit_style_from_delta(delta: i128) -> Style {
+    match delta.cmp(&0) {
+        std::cmp::Ordering::Greater => Style::default().fg(Color::Green),
+        std::cmp::Ordering::Less => Style::default().fg(Color::Red),
+        std::cmp::Ordering::Equal => Style::default().fg(Color::DarkGray),
+    }
+}
+
+fn format_profit(amount: i128, decimals: u8, symbol: &str) -> String {
+    let scaled = (amount as f64) / 10f64.powi(decimals as i32);
+    format!("{scaled} {symbol}")
 }
