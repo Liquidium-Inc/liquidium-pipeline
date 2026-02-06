@@ -97,7 +97,7 @@ impl<'a, A: PipelineAgent, D: WalStore> PipelineStage<'a, Vec<ExecutorRequest>, 
                     Ok(v) => v,
                     Err(err) => {
                         warn!("Liquidation call failed {err}");
-                        receipt.status = ExecutionStatus::LiquidationCallFailed(err);
+                        receipt.status = ExecutionStatus::LiquidationCallFailed(err.into());
                         return Ok::<ExecutionReceipt, String>(receipt);
                     }
                 };

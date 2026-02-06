@@ -9,11 +9,12 @@ use liquidium_pipeline_core::tokens::{chain_token::ChainToken, token_registry::T
 
 use crate::backend::evm_backend::EvmBackend;
 use crate::backend::icp_backend::IcpBackend;
+use crate::error::{ConnectorError, ConnectorResult};
 
 // Helpers for env parsing
 
-fn load_env_specs(key: &str) -> Result<Vec<String>, String> {
-    let raw = env::var(key).map_err(|e| format!("missing {key}: {e}"))?;
+fn load_env_specs(key: &'static str) -> ConnectorResult<Vec<String>> {
+    let raw = env::var(key).map_err(|source| ConnectorError::MissingEnv { var: key, source })?;
     let specs = raw
         .split(',')
         .map(str::trim)
@@ -24,10 +25,12 @@ fn load_env_specs(key: &str) -> Result<Vec<String>, String> {
 }
 
 // spec format: "chain:address:symbol"
-fn split_spec(spec: &str) -> Result<(String, String, String), String> {
+fn split_spec(spec: &str) -> ConnectorResult<(String, String, String)> {
     let parts: Vec<&str> = spec.split(':').collect();
     if parts.len() != 3 {
-        return Err(format!("invalid asset spec `{spec}` (expected chain:address:symbol)"));
+        return Err(ConnectorError::InvalidInput {
+            message: format!("invalid asset spec `{spec}` (expected chain:address:symbol)"),
+        });
     }
     Ok((parts[0].to_string(), parts[1].to_string(), parts[2].to_string()))
 }
@@ -37,7 +40,7 @@ async fn resolve_chain_token<IB, EB>(
     spec: &str,
     icp_backend: &Arc<IB>,
     evm_backend: &Arc<EB>,
-) -> Result<ChainToken, String>
+) -> ConnectorResult<ChainToken>
 where
     IB: IcpBackend + Send + Sync,
     EB: EvmBackend + Send + Sync,
@@ -45,18 +48,18 @@ where
     let (chain, address, symbol) = split_spec(spec)?;
 
     if chain == "icp" {
-        let ledger: Principal = address
-            .parse()
-            .map_err(|_| format!("invalid ICP principal `{address}` in `{spec}`"))?;
+        let ledger: Principal = address.parse().map_err(|_| ConnectorError::InvalidInput {
+            message: format!("invalid ICP principal `{address}` in `{spec}`"),
+        })?;
         let decimals = icp_backend
             .icrc1_decimals(ledger)
             .await
-            .map_err(|e| format!("icp decimals for `{spec}` failed: {e}"))?;
+            .map_err(|e| ConnectorError::backend(format!("icp decimals for `{spec}` failed: {e}")))?;
 
         let fee = icp_backend
             .icrc1_fee(ledger)
             .await
-            .map_err(|e| format!("icp decimals for `{spec}` failed: {e}"))?;
+            .map_err(|e| ConnectorError::backend(format!("icp fee for `{spec}` failed: {e}")))?;
 
         Ok(ChainToken::Icp {
             ledger,
@@ -80,7 +83,7 @@ where
             let decimals = evm_backend
                 .erc20_decimals(chain_name, &address)
                 .await
-                .map_err(|e| format!("evm decimals for `{spec}` failed: {e}"))?;
+                .map_err(|e| ConnectorError::backend(format!("evm decimals for `{spec}` failed: {e}")))?;
 
             Ok(ChainToken::EvmErc20 {
                 chain: chain_name.to_string(),
@@ -91,7 +94,9 @@ where
             })
         }
     } else {
-        Err(format!("unsupported chain `{chain}` in spec `{spec}`"))
+        Err(ConnectorError::InvalidInput {
+            message: format!("unsupported chain `{chain}` in spec `{spec}`"),
+        })
     }
 }
 
@@ -100,7 +105,7 @@ where
 // Env format:
 //   DEBT_ASSETS=icp:mxzaz-hqaaa-aaaar-qaada-cai:ckBTC,evm-arb:0x...:USDC
 //   COLLATERAL_ASSETS=icp:mxzaz-hqaaa-aaaar-qaada-cai:ckBTC,...
-pub async fn load_token_registry<IB, EB>(icp_backend: Arc<IB>, evm_backend: Arc<EB>) -> Result<TokenRegistry, String>
+pub async fn load_token_registry<IB, EB>(icp_backend: Arc<IB>, evm_backend: Arc<EB>) -> ConnectorResult<TokenRegistry>
 where
     IB: IcpBackend + Send + Sync,
     EB: EvmBackend + Send + Sync,
@@ -125,13 +130,21 @@ where
 
     let collateral_ids = coll_specs
         .into_iter()
-        .map(|spec| AssetId::from_str(&spec).map_err(|e| format!("invalid collateral asset spec '{}': {e}", spec)))
-        .collect::<Result<Vec<_>, _>>()?;
+        .map(|spec| {
+            AssetId::from_str(&spec).map_err(|e| ConnectorError::InvalidInput {
+                message: format!("invalid collateral asset spec '{spec}': {e}"),
+            })
+        })
+        .collect::<ConnectorResult<Vec<_>>>()?;
 
     let debt_ids = debt_specs
         .into_iter()
-        .map(|spec| AssetId::from_str(&spec).map_err(|e| format!("invalid debt asset spec '{}': {e}", spec)))
-        .collect::<Result<Vec<_>, _>>()?;
+        .map(|spec| {
+            AssetId::from_str(&spec).map_err(|e| ConnectorError::InvalidInput {
+                message: format!("invalid debt asset spec '{spec}': {e}"),
+            })
+        })
+        .collect::<ConnectorResult<Vec<_>>>()?;
 
     Ok(TokenRegistry::with_roles(tokens, collateral_ids, debt_ids))
 }

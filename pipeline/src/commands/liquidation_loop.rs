@@ -2,6 +2,7 @@ use candid::Principal;
 use icrc_ledger_types::icrc1::account::Account;
 use indicatif::{ProgressBar, ProgressStyle};
 
+use liquidium_pipeline_commons::error::format_with_code;
 use prettytable::{Cell, Row, Table, format};
 use std::{sync::Arc, thread::sleep, time::Duration, time::Instant};
 use tracing::{Instrument, info_span, instrument};
@@ -147,7 +148,7 @@ async fn init(
         }
         Err(err) => {
             if config.swapper != SwapperMode::Dex {
-                return Err(format!("Cex credentials not found: {err}"));
+                return Err(format!("CEX credentials missing: {}", format_with_code(&err)));
             }
             None
         }

@@ -5,6 +5,7 @@ use candid::Nat;
 use icrc_ledger_types::icrc1::account::Account;
 use icrc_ledger_types::icrc2::approve::ApproveArgs;
 use liquidium_pipeline_core::account::model::ChainAccount;
+use liquidium_pipeline_core::error::TransferError;
 use liquidium_pipeline_core::tokens::chain_token::ChainToken;
 use liquidium_pipeline_core::transfer::actions::TransferActions;
 use log::info;
@@ -24,7 +25,12 @@ impl<B: IcpBackend> IcpTransferAdapter<B> {
 
 #[async_trait]
 impl<B: IcpBackend + Send + Sync> TransferActions for IcpTransferAdapter<B> {
-    async fn transfer(&self, token: &ChainToken, to: &ChainAccount, amount_native: Nat) -> Result<String, String> {
+    async fn transfer(
+        &self,
+        token: &ChainToken,
+        to: &ChainAccount,
+        amount_native: Nat,
+    ) -> Result<String, TransferError> {
         let from_owner = self.account.owner.to_text();
         let from_subaccount = if self.account.subaccount.is_some() {
             "some"
@@ -55,7 +61,8 @@ impl<B: IcpBackend + Send + Sync> TransferActions for IcpTransferAdapter<B> {
                 let block_index = self
                     .backend
                     .icp_transfer(*ledger, to_account_id_hex, amount_native)
-                    .await?;
+                    .await
+                    .map_err(TransferError::backend)?;
 
                 Ok(block_index.to_string())
             }
@@ -74,17 +81,27 @@ impl<B: IcpBackend + Send + Sync> TransferActions for IcpTransferAdapter<B> {
                 let block_index = self
                     .backend
                     .icrc1_transfer(*ledger, &self.account, to_account, amount)
-                    .await?;
+                    .await
+                    .map_err(TransferError::backend)?;
 
                 Ok(block_index.to_string())
             }
 
-            (ChainToken::Icp { .. }, _) => Err("IcpTransferAdapter: destination chain must be ICP".to_string()),
-            _ => Err("IcpTransferAdapter only supports ChainToken::Icp".to_string()),
+            (ChainToken::Icp { .. }, _) => Err(TransferError::UnsupportedDestination {
+                details: "destination chain must be ICP".to_string(),
+            }),
+            _ => Err(TransferError::UnsupportedToken {
+                token: token.clone(),
+            }),
         }
     }
 
-    async fn approve(&self, token: &ChainToken, spender: &ChainAccount, amount_native: Nat) -> Result<String, String> {
+    async fn approve(
+        &self,
+        token: &ChainToken,
+        spender: &ChainAccount,
+        amount_native: Nat,
+    ) -> Result<String, TransferError> {
         match (token, spender) {
             (ChainToken::Icp { ledger, .. }, ChainAccount::Icp(spender_account)) => {
                 let args = ApproveArgs {
@@ -98,11 +115,19 @@ impl<B: IcpBackend + Send + Sync> TransferActions for IcpTransferAdapter<B> {
                     created_at_time: None,
                 };
 
-                let block_index = self.backend.icrc2_approve(*ledger, args).await?;
+                let block_index = self
+                    .backend
+                    .icrc2_approve(*ledger, args)
+                    .await
+                    .map_err(TransferError::backend)?;
                 Ok(block_index.to_string())
             }
-            (ChainToken::Icp { .. }, _) => Err("IcpTransferAdapter: spender must be an ICP account".to_string()),
-            _ => Err("IcpTransferAdapter only supports ChainToken::Icp".to_string()),
+            (ChainToken::Icp { .. }, _) => Err(TransferError::UnsupportedDestination {
+                details: "spender must be an ICP account".to_string(),
+            }),
+            _ => Err(TransferError::UnsupportedToken {
+                token: token.clone(),
+            }),
         }
     }
 }

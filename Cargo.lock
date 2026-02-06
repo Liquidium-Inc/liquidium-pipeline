@@ -3736,12 +3736,14 @@ dependencies = [
  "icrc-ledger-agent",
  "icrc-ledger-types",
  "k256",
+ "liquidium-pipeline-commons",
  "liquidium-pipeline-core",
  "log",
  "mockall",
  "num-bigint",
  "num-traits",
  "serde",
+ "thiserror 2.0.17",
  "tokio",
  "tracing",
 ]
@@ -3757,10 +3759,12 @@ dependencies = [
  "ic-agent 0.45.0",
  "icrc-ledger-agent",
  "icrc-ledger-types",
+ "liquidium-pipeline-commons",
  "mockall",
  "num-format",
  "num-traits",
  "serde",
+ "thiserror 2.0.17",
  "tracing",
 ]
 

@@ -711,6 +711,7 @@ mod tests {
     use crate::swappers::swap_interface::MockSwapInterface;
     use candid::{Nat, Principal};
     use liquidium_pipeline_core::account::actions::MockAccountInfo;
+    use liquidium_pipeline_core::error::AccountError;
     use liquidium_pipeline_core::tokens::token_registry::MockTokenRegistryTrait;
     use liquidium_pipeline_core::types::protocol_types::Assets;
 
@@ -869,10 +870,10 @@ mod tests {
         let mut account = MockAccountInfo::new();
         account
             .expect_sync_balance()
-            .returning(move |_t: &ChainToken| Err("boom".to_string()));
+            .returning(move |_t: &ChainToken| Err(AccountError::backend("boom")));
         account
             .expect_get_balance()
-            .returning(|_t: &ChainToken| Err("boom".to_string()));
+            .returning(|_t: &ChainToken| Err(AccountError::backend("boom")));
 
         let mut swapper = MockSwapInterface::new();
         swapper

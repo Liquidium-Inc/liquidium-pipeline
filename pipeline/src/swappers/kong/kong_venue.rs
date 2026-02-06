@@ -166,7 +166,6 @@ mod tests {
     use crate::swappers::router::SwapVenue;
     use crate::approval_state::ApprovalState;
     use candid::{Decode, Nat, Principal};
-    use ic_agent::Agent;
     use icrc_ledger_types::icrc1::account::Account;
     use icrc_ledger_types::icrc2::allowance::Allowance;
     use icrc_ledger_types::icrc2::approve::ApproveError;
@@ -201,13 +200,6 @@ mod tests {
         }
     }
 
-    fn build_agent() -> Agent {
-        Agent::builder()
-            .with_url("http://localhost")
-            .build()
-            .expect("agent should build")
-    }
-
     #[tokio::test]
     async fn kong_venue_execute_applies_fee_after_approve() {
         let ledger = Principal::from_text("ryjl3-tyaaa-aaaaa-aaaba-cai").unwrap();
@@ -235,8 +227,6 @@ mod tests {
         };
 
         let mut mock_agent = MockPipelineAgent::new();
-        let agent = build_agent();
-        mock_agent.expect_agent().returning(move || agent.clone());
 
         let ledger_allowance = ledger;
         let ledger_balance = ledger_allowance.clone();
@@ -329,8 +319,6 @@ mod tests {
         };
 
         let mut mock_agent = MockPipelineAgent::new();
-        let agent = build_agent();
-        mock_agent.expect_agent().returning(move || agent.clone());
 
         let ledger_allowance = ledger;
         let ledger_balance = ledger_allowance.clone();

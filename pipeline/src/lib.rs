@@ -1,6 +1,7 @@
 pub mod config;
 pub mod context;
 pub mod executors;
+pub mod error;
 pub mod finalizers;
 pub mod liquidation;
 pub mod persistance;

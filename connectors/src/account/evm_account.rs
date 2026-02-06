@@ -6,6 +6,7 @@ use async_trait::async_trait;
 
 // All these come from core
 use liquidium_pipeline_core::account::actions::AccountInfo;
+use liquidium_pipeline_core::error::AccountError;
 use liquidium_pipeline_core::tokens::chain_token::ChainToken;
 use liquidium_pipeline_core::tokens::chain_token_amount::ChainTokenAmount;
 
@@ -32,10 +33,10 @@ impl<B: EvmBackend> EvmAccountInfoAdapter<B> {
 
 #[async_trait]
 impl<B: EvmBackend> AccountInfo for EvmAccountInfoAdapter<B> {
-    async fn get_balance(&self, token: &ChainToken) -> Result<ChainTokenAmount, String> {
+    async fn get_balance(&self, token: &ChainToken) -> Result<ChainTokenAmount, AccountError> {
         match token {
             ChainToken::EvmNative { chain, .. } => {
-                let amount_native = self.backend.native_balance(chain).await?;
+                let amount_native = self.backend.native_balance(chain).await.map_err(AccountError::backend)?;
 
                 Ok(ChainTokenAmount {
                     token: token.clone(),
@@ -45,18 +46,24 @@ impl<B: EvmBackend> AccountInfo for EvmAccountInfoAdapter<B> {
             ChainToken::EvmErc20 {
                 chain, token_address, ..
             } => {
-                let amount_native = self.backend.erc20_balance(chain, token_address).await?;
+                let amount_native = self
+                    .backend
+                    .erc20_balance(chain, token_address)
+                    .await
+                    .map_err(AccountError::backend)?;
 
                 Ok(ChainTokenAmount {
                     token: token.clone(),
                     value: amount_native,
                 })
             }
-            _ => Err("EvmAccountInfoAdapter only supports EvmNative and EvmErc20 tokens".to_string()),
+            _ => Err(AccountError::UnsupportedToken {
+                token: token.symbol().to_string(),
+            }),
         }
     }
 
-    async fn sync_balance(&self, token: &ChainToken) -> Result<ChainTokenAmount, String> {
+    async fn sync_balance(&self, token: &ChainToken) -> Result<ChainTokenAmount, AccountError> {
         let bal = self.get_balance(token).await?;
 
         let cache_key = match token {
@@ -68,10 +75,7 @@ impl<B: EvmBackend> AccountInfo for EvmAccountInfoAdapter<B> {
         };
 
         if let Some((chain, addr)) = cache_key {
-            let mut lock = self
-                .cache
-                .lock()
-                .map_err(|_| "evm balance cache poisoned".to_string())?;
+            let mut lock = self.cache.lock().map_err(|_| AccountError::CachePoisoned)?;
             lock.insert((chain, addr), (bal.clone(), Instant::now()));
         }
 

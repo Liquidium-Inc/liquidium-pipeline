@@ -16,6 +16,7 @@ use log::info;
 
 use liquidium_pipeline_core::{account::actions::AccountInfo, tokens::token_registry::TokenRegistry};
 
+use liquidium_pipeline_commons::error::format_with_code;
 use liquidium_pipeline_connectors::{
     account::router::MultiChainAccountInfoRouter,
     backend::icp_backend::IcpBackendImpl,
@@ -24,7 +25,7 @@ use liquidium_pipeline_connectors::{
 };
 
 use crate::approval_state::ApprovalState;
-use crate::config::Config;
+use crate::config::{Config, ConfigResult};
 use crate::swappers::kong::kong_swapper::KongSwapSwapper;
 use crate::swappers::kong::kong_venue::KongVenue;
 use crate::swappers::router::{SwapRouter, SwapVenue};
@@ -52,8 +53,8 @@ pub struct PipelineContextBuilder<P: Provider<AnyNetwork>> {
 }
 
 impl<P: Provider<AnyNetwork> + WalletProvider<AnyNetwork> + Clone + 'static> PipelineContextBuilder<P> {
-    pub async fn new() -> Result<Self, String> {
-        let config = Config::load().await.map_err(|e| format!("config load failed: {e}"))?;
+    pub async fn new() -> ConfigResult<Self> {
+        let config = Config::load().await?;
         Ok(Self {
             config,
             evm_provider_main: None,
@@ -91,7 +92,11 @@ impl<P: Provider<AnyNetwork> + WalletProvider<AnyNetwork> + Clone + 'static> Pip
         let evm_backend_main = Arc::new(EvmBackendImpl::new(main_provider));
         let evm_backend_trader = evm_backend_main.clone();
 
-        let registry = Arc::new(load_token_registry(icp_backend_main.clone(), evm_backend_main.clone()).await?);
+        let registry = Arc::new(
+            load_token_registry(icp_backend_main.clone(), evm_backend_main.clone())
+                .await
+                .map_err(|e| e.to_string())?,
+        );
         for (id, token) in registry.tokens.iter() {
             if let ChainToken::Icp { fee, .. } = token {
                 info!("Loaded ICRC fee: {} {} (ledger={})", token.symbol(), fee, id.address);
@@ -212,7 +217,9 @@ impl<P: Provider<AnyNetwork> + WalletProvider<AnyNetwork> + Clone + 'static> Pip
 
 pub async fn init_context() -> Result<PipelineContext, String> {
     // Start from the builder so we keep one place that owns Config.
-    let mut builder = PipelineContextBuilder::new().await?;
+    let mut builder = PipelineContextBuilder::new()
+        .await
+        .map_err(|e| format!("config init failed: {}", format_with_code(&e)))?;
     let config = builder.config.clone();
 
     // Build ICP agents for main and trader accounts.

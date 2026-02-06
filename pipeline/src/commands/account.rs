@@ -11,6 +11,8 @@ use bip39::{Language, Mnemonic};
 
 use prettytable::{Cell, Row, Table, format};
 
+use liquidium_pipeline_commons::error::format_with_code;
+
 use crate::config::Config;
 
 pub async fn show() {
@@ -55,8 +57,8 @@ pub async fn show() {
 
             table.printstd();
         }
-        Err(_) => {
-            println!("Could not load account.");
+        Err(err) => {
+            eprintln!("Could not load account: {}", format_with_code(&err));
         }
     }
 }

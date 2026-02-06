@@ -3,6 +3,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use liquidium_pipeline_core::{
     account::actions::AccountInfo,
+    error::AccountError,
     tokens::{chain_token::ChainToken, chain_token_amount::ChainTokenAmount},
 };
 
@@ -19,14 +20,14 @@ impl MultiChainAccountInfoRouter {
 
 #[async_trait]
 impl AccountInfo for MultiChainAccountInfoRouter {
-    async fn get_balance(&self, token: &ChainToken) -> Result<ChainTokenAmount, String> {
+    async fn get_balance(&self, token: &ChainToken) -> Result<ChainTokenAmount, AccountError> {
         match token {
             ChainToken::Icp { .. } => self.icp.get_balance(token).await,
             ChainToken::EvmNative { .. } | ChainToken::EvmErc20 { .. } => self.evm.get_balance(token).await,
         }
     }
 
-    async fn sync_balance(&self, token: &ChainToken) -> Result<ChainTokenAmount, String> {
+    async fn sync_balance(&self, token: &ChainToken) -> Result<ChainTokenAmount, AccountError> {
         match token {
             ChainToken::Icp { .. } => self.icp.sync_balance(token).await,
             ChainToken::EvmNative { .. } | ChainToken::EvmErc20 { .. } => self.evm.sync_balance(token).await,

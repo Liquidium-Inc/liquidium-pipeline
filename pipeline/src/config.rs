@@ -3,13 +3,19 @@ use alloy::signers::local::PrivateKeySigner;
 use candid::Principal;
 use ic_agent::Identity;
 use icrc_ledger_types::icrc1::account::Account;
-use liquidium_pipeline_commons::env::config_dir;
+use liquidium_pipeline_commons::{
+    env::config_dir,
+    error::{CodedError, ErrorCode, ExternalError},
+};
 use liquidium_pipeline_connectors::account::icp_account::{RECOVERY_ACCOUNT, derive_icp_identity};
 use liquidium_pipeline_connectors::crypto::derivation::derive_evm_private_key;
 use log::debug;
 use std::collections::HashMap;
 use std::env;
+use std::io;
+use std::path::PathBuf;
 use std::sync::Arc;
+use thiserror::Error;
 
 fn expand_tilde(p: &str) -> std::path::PathBuf {
     if let Some(stripped) = p.strip_prefix("~/")
@@ -25,6 +31,64 @@ pub enum SwapperMode {
     Dex,
     Cex,
     Hybrid,
+}
+
+pub type ConfigResult<T> = std::result::Result<T, ConfigError>;
+
+#[derive(Debug, Error)]
+pub enum ConfigError {
+    #[error("missing required env var {var}")]
+    MissingEnv {
+        var: &'static str,
+        #[source]
+        source: env::VarError,
+    },
+    #[error("failed to parse principal in {var}")]
+    InvalidPrincipal {
+        var: &'static str,
+        #[source]
+        source: ExternalError,
+    },
+    #[error("failed to read mnemonic at {path:?}")]
+    ReadMnemonic {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+    #[error("could not derive {role} identity")]
+    DeriveIdentity {
+        role: &'static str,
+        #[source]
+        source: ExternalError,
+    },
+    #[error("could not derive {role} principal")]
+    DerivePrincipal {
+        role: &'static str,
+        #[source]
+        source: ExternalError,
+    },
+    #[error("failed to derive EVM private key")]
+    DeriveEvmKey {
+        #[source]
+        source: ExternalError,
+    },
+    #[error("missing CEX credentials for {cex}")]
+    MissingCexCredentials { cex: String },
+}
+
+impl CodedError for ConfigError {
+    fn code(&self) -> ErrorCode {
+        match self {
+            ConfigError::MissingEnv { .. } => ErrorCode::ConfigMissingEnv,
+            ConfigError::InvalidPrincipal { .. } => ErrorCode::ConfigInvalidPrincipal,
+            ConfigError::ReadMnemonic { .. } => ErrorCode::ConfigReadMnemonic,
+            ConfigError::DeriveIdentity { .. } | ConfigError::DerivePrincipal { .. } => {
+                ErrorCode::ConfigDeriveIdentity
+            }
+            ConfigError::DeriveEvmKey { .. } => ErrorCode::ConfigDeriveEvmKey,
+            ConfigError::MissingCexCredentials { .. } => ErrorCode::ConfigMissingCexCredentials,
+        }
+    }
 }
 
 pub struct Config {
@@ -58,7 +122,7 @@ pub trait ConfigTrait: Send + Sync {
     #[allow(dead_code)]
     fn get_recovery_account(&self) -> Account;
     fn get_swapper_mode(&self) -> SwapperMode;
-    fn get_cex_credentials(&self, cex: &str) -> Result<(String, String), String>;
+    fn get_cex_credentials(&self, cex: &str) -> ConfigResult<(String, String)>;
 }
 
 impl ConfigTrait for Config {
@@ -97,40 +161,60 @@ impl ConfigTrait for Config {
         self.swapper
     }
 
-    fn get_cex_credentials(&self, cex: &str) -> Result<(String, String), String> {
+    fn get_cex_credentials(&self, cex: &str) -> ConfigResult<(String, String)> {
         self.cex_credentials
             .get(cex)
-            .ok_or("Cex credentials not found".to_string())
             .cloned()
+            .ok_or_else(|| ConfigError::MissingCexCredentials {
+                cex: cex.to_string(),
+            })
     }
 }
 
 impl Config {
-    pub async fn load() -> Result<Arc<Self>, String> {
+    pub async fn load() -> ConfigResult<Arc<Self>> {
         let home = config_dir();
 
-        let ic_url = env::var("IC_URL").map_err(|_| "IC_URL not configured".to_string())?;
+        let ic_url = env::var("IC_URL").map_err(|source| ConfigError::MissingEnv {
+            var: "IC_URL",
+            source,
+        })?;
         let export_path = env::var("EXPORT_PATH").unwrap_or("executions.csv".to_string());
 
-        let mnemonic_path =
-            expand_tilde(&env::var("MNEMONIC_FILE").map_err(|_| "MNEMONIC_FILE not configured".to_string())?);
+        let mnemonic_path = expand_tilde(
+            &env::var("MNEMONIC_FILE").map_err(|source| ConfigError::MissingEnv {
+                var: "MNEMONIC_FILE",
+                source,
+            })?,
+        );
 
         let mnemonic = std::fs::read_to_string(&mnemonic_path)
-            .map_err(|e| format!("failed to read mnemonic file: {e}"))?
+            .map_err(|source| ConfigError::ReadMnemonic {
+                path: mnemonic_path.clone(),
+                source,
+            })?
             .trim()
             .to_string();
 
         let liquidator_identity =
-            derive_icp_identity(&mnemonic, 0, 0).map_err(|e| format!("could not create liquidator identity: {e}"))?;
-        let liquidator_principal = liquidator_identity
-            .sender()
-            .map_err(|e| format!("could not decode liquidator principal: {e}"))?;
+            derive_icp_identity(&mnemonic, 0, 0).map_err(|e| ConfigError::DeriveIdentity {
+                role: "liquidator",
+                source: ExternalError::from(e.to_string()),
+            })?;
+        let liquidator_principal = liquidator_identity.sender().map_err(|e| ConfigError::DerivePrincipal {
+            role: "liquidator",
+            source: ExternalError::from(e.to_string()),
+        })?;
 
         let trader_identity =
-            derive_icp_identity(&mnemonic, 0, 1).map_err(|e| format!("could not create trader identity: {e}"))?;
-        let trader_principal = trader_identity
-            .sender()
-            .map_err(|e| format!("could not decode trader principal: {e}"))?;
+            derive_icp_identity(&mnemonic, 0, 1).map_err(|e| ConfigError::DeriveIdentity {
+                role: "trader",
+                source: ExternalError::from(e.to_string()),
+            })?;
+        let trader_principal = trader_identity.sender().map_err(|e| ConfigError::DerivePrincipal {
+            role: "trader",
+            source: ExternalError::from(e.to_string()),
+        })?;
 
         let buy_bad_debt = env::var("BUY_BAD_DEBT")
             .map(|v| v.parse().unwrap_or(false))
@@ -141,16 +225,28 @@ impl Config {
 
         // Load the asset maps
         let lending_canister_str =
-            env::var("LENDING_CANISTER").map_err(|_| "LENDING_CANISTER not configured".to_string())?;
-        let lending_canister = Principal::from_text(&lending_canister_str)
-            .map_err(|e| format!("invalid LENDING_CANISTER principal: {e}"))?;
+            env::var("LENDING_CANISTER").map_err(|source| ConfigError::MissingEnv {
+                var: "LENDING_CANISTER",
+                source,
+            })?;
+        let lending_canister =
+            Principal::from_text(&lending_canister_str).map_err(|e| ConfigError::InvalidPrincipal {
+                var: "LENDING_CANISTER",
+                source: ExternalError::from(e.to_string()),
+            })?;
 
         // The db path
         let db_path = env::var("DB_PATH").unwrap_or(format!("{}/wal.db", home));
 
         // Derive EVM private key
-        let sk = derive_evm_private_key(&mnemonic, 0, 0)?;
-        let evm_signer: PrivateKeySigner = PrivateKeySigner::from_slice(&sk.to_bytes()).map_err(|e| e.to_string())?;
+        let sk = derive_evm_private_key(&mnemonic, 0, 0).map_err(|e| ConfigError::DeriveEvmKey {
+            source: ExternalError::from(e.to_string()),
+        })?;
+        let evm_signer: PrivateKeySigner = PrivateKeySigner::from_slice(&sk.to_bytes()).map_err(|e| {
+            ConfigError::DeriveEvmKey {
+                source: ExternalError::from(e.to_string()),
+            }
+        })?;
         let hex = evm_signer.to_bytes().encode_hex();
         let evm_private_key = format!("{:#}", hex);
 
@@ -199,7 +295,10 @@ impl Config {
             Err(_) => vec![],
         };
 
-        let evm_rpc_url = env::var("EVM_RPC_URL").map_err(|_| "EVM_RPC_URL not configured".to_string())?;
+        let evm_rpc_url = env::var("EVM_RPC_URL").map_err(|source| ConfigError::MissingEnv {
+            var: "EVM_RPC_URL",
+            source,
+        })?;
 
         Ok(Arc::new(Config {
             evm_private_key,

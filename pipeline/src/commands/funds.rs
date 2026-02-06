@@ -1,4 +1,5 @@
 use prettytable::{Cell, Row, Table, format};
+use std::fmt::Display;
 
 use liquidium_pipeline_core::tokens::token_registry::TokenRegistryTrait;
 use liquidium_pipeline_core::tokens::{asset_id::AssetId, chain_token_amount::ChainTokenAmount};
@@ -70,7 +71,7 @@ pub async fn funds() -> Result<(), String> {
     Ok(())
 }
 
-fn format_balance_result(res: Option<&Result<(AssetId, ChainTokenAmount), String>>) -> String {
+fn format_balance_result<E: Display>(res: Option<&Result<(AssetId, ChainTokenAmount), E>>) -> String {
     match res {
         Some(Ok((_, bal))) => format_chain_balance(bal),
         Some(Err(e)) => format!("error: {}", e),

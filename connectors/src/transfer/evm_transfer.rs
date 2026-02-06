@@ -3,6 +3,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use candid::Nat;
 use liquidium_pipeline_core::account::model::ChainAccount;
+use liquidium_pipeline_core::error::TransferError;
 use liquidium_pipeline_core::tokens::chain_token::ChainToken;
 use liquidium_pipeline_core::transfer::actions::TransferActions;
 
@@ -20,11 +21,20 @@ impl<B: EvmBackend> EvmTransferAdapter<B> {
 
 #[async_trait]
 impl<B: EvmBackend + Send + Sync> TransferActions for EvmTransferAdapter<B> {
-    async fn transfer(&self, token: &ChainToken, to: &ChainAccount, amount_native: Nat) -> Result<String, String> {
+    async fn transfer(
+        &self,
+        token: &ChainToken,
+        to: &ChainAccount,
+        amount_native: Nat,
+    ) -> Result<String, TransferError> {
         match (token, to) {
             (ChainToken::EvmNative { chain, .. }, ChainAccount::Evm(to_address)) => {
                 let amount = amount_native;
-                let tx_hash = self.backend.native_transfer(chain, to_address, amount).await?;
+                let tx_hash = self
+                    .backend
+                    .native_transfer(chain, to_address, amount)
+                    .await
+                    .map_err(TransferError::backend)?;
 
                 Ok(tx_hash)
             }
@@ -38,14 +48,19 @@ impl<B: EvmBackend + Send + Sync> TransferActions for EvmTransferAdapter<B> {
                 let tx_hash = self
                     .backend
                     .erc20_transfer(chain, token_address, to_address, amount)
-                    .await?;
+                    .await
+                    .map_err(TransferError::backend)?;
 
                 Ok(tx_hash)
             }
             (ChainToken::EvmNative { .. } | ChainToken::EvmErc20 { .. }, _) => {
-                Err("EvmTransferAdapter: destination chain must be EVM".to_string())
+                Err(TransferError::UnsupportedDestination {
+                    details: "destination chain must be EVM".to_string(),
+                })
             }
-            _ => Err("EvmTransferAdapter only supports EvmNative and EvmErc20 tokens".to_string()),
+            _ => Err(TransferError::UnsupportedToken {
+                token: token.clone(),
+            }),
         }
     }
 
@@ -54,7 +69,9 @@ impl<B: EvmBackend + Send + Sync> TransferActions for EvmTransferAdapter<B> {
         _token: &ChainToken,
         _spender: &ChainAccount,
         _amount_native: Nat,
-    ) -> Result<String, String> {
-        Err("EvmTransferAdapter does not support approve".to_string())
+    ) -> Result<String, TransferError> {
+        Err(TransferError::UnsupportedDestination {
+            details: "EvmTransferAdapter does not support approve".to_string(),
+        })
     }
 }

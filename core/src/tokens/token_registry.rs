@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
+use crate::error::TokenRegistryError;
 use crate::tokens::{asset_id::AssetId, chain_token::ChainToken};
 
 // In-memory registry of all supported tokens.
@@ -17,7 +18,7 @@ pub trait TokenRegistryTrait: Send + Sync {
     fn get(&self, id: &AssetId) -> Option<ChainToken>;
     fn all(&self) -> Vec<(AssetId, ChainToken)>;
     fn by_symbol(&self, symbol: &str) -> Vec<(AssetId, ChainToken)>;
-    fn resolve(&self, id: &AssetId) -> Result<ChainToken, String>;
+    fn resolve(&self, id: &AssetId) -> Result<ChainToken, TokenRegistryError>;
 
     // Returns all assets that are marked as eligible collateral.
     fn collateral_assets(&self) -> Vec<(AssetId, ChainToken)>;
@@ -80,11 +81,11 @@ impl TokenRegistryTrait for TokenRegistry {
             .collect()
     }
 
-    fn resolve(&self, id: &AssetId) -> Result<ChainToken, String> {
+    fn resolve(&self, id: &AssetId) -> Result<ChainToken, TokenRegistryError> {
         self.tokens
             .get(id)
-            .ok_or_else(|| format!("unknown asset id: {}", id))
             .cloned()
+            .ok_or_else(|| TokenRegistryError::UnknownAsset { asset_id: id.clone() })
     }
 
     fn collateral_assets(&self) -> Vec<(AssetId, ChainToken)> {

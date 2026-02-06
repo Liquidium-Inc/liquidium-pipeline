@@ -5,6 +5,7 @@ use tracing::instrument;
 
 use crate::{
     account::actions::AccountInfo,
+    error::{CoreError, CoreResult, TokenRegistryError},
     tokens::{asset_id::AssetId, chain_token_amount::ChainTokenAmount, token_registry::TokenRegistryTrait},
 };
 
@@ -23,23 +24,22 @@ impl BalanceService {
 
     // Sync a custom list of assets for this account.
     #[instrument(name = "balance_service.sync_assets", skip_all, fields(asset_count = assets.len()))]
-    pub async fn sync_assets(&self, assets: &[AssetId]) -> Vec<Result<(AssetId, ChainTokenAmount), String>> {
+    pub async fn sync_assets(&self, assets: &[AssetId]) -> Vec<CoreResult<(AssetId, ChainTokenAmount)>> {
+        let registry = self.registry.clone();
         let futs = assets.iter().cloned().map(|asset_id| {
             let accounts = self.accounts.clone();
+            let registry = registry.clone();
 
             async move {
-                let token = self
-                    .registry
+                let token = registry
                     .get(&asset_id)
-                    .clone()
-                    .ok_or_else(|| format!("unknown asset {}", asset_id))?;
+                    .ok_or_else(|| TokenRegistryError::UnknownAsset {
+                        asset_id: asset_id.clone(),
+                    })?;
 
-                let bal = accounts
-                    .sync_balance(&token)
-                    .await
-                    .map_err(|e| format!("sync_balance failed for {}: {}", asset_id, e))?;
+                let bal = accounts.sync_balance(&token).await?;
 
-                Ok::<_, String>((asset_id, bal))
+                CoreResult::Ok((asset_id, bal))
             }
         });
 
@@ -47,7 +47,7 @@ impl BalanceService {
     }
 
     // Sync all assets from the registry for this account.
-    pub async fn sync_all(&self) -> Vec<Result<(AssetId, ChainTokenAmount), String>> {
+    pub async fn sync_all(&self) -> Vec<CoreResult<(AssetId, ChainTokenAmount)>> {
         let asset_ids: Vec<AssetId> = self.registry.all().iter().map(|item| item.0.clone()).collect();
         self.sync_assets(&asset_ids).await
     }
@@ -66,17 +66,15 @@ impl BalanceService {
 
     // Get the balance for a single AssetId.
     #[instrument(name = "balance_service.get_balance", skip(self), err, fields(asset = %asset_id))]
-    pub async fn get_balance(&self, asset_id: &AssetId) -> Result<ChainTokenAmount, String> {
+    pub async fn get_balance(&self, asset_id: &AssetId) -> CoreResult<ChainTokenAmount> {
         let token = self
             .registry
             .get(asset_id)
-            .ok_or_else(|| format!("unknown asset {}", asset_id))?
-            .clone();
+            .ok_or_else(|| TokenRegistryError::UnknownAsset {
+                asset_id: asset_id.clone(),
+            })?;
 
-        self.accounts
-            .sync_balance(&token)
-            .await
-            .map_err(|e| format!("sync_balance failed for {}: {}", asset_id, e))
+        self.accounts.sync_balance(&token).await.map_err(CoreError::from)
     }
 
     // Expose the underlying registry if needed by callers.
