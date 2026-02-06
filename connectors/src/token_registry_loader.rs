@@ -10,10 +10,33 @@ use liquidium_pipeline_core::tokens::{chain_token::ChainToken, token_registry::T
 use crate::backend::evm_backend::EvmBackend;
 use crate::backend::icp_backend::IcpBackend;
 
+#[derive(Debug)]
+pub enum RegistryLoadError {
+    MissingIcpDecimals { spec: String, source: String },
+    MissingIcpFee { spec: String, source: String },
+    Other(String),
+}
+
+impl std::fmt::Display for RegistryLoadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RegistryLoadError::MissingIcpDecimals { spec, source } => {
+                write!(f, "icp decimals for `{spec}` failed: {source}")
+            }
+            RegistryLoadError::MissingIcpFee { spec, source } => {
+                write!(f, "icp fee for `{spec}` failed: {source}")
+            }
+            RegistryLoadError::Other(message) => write!(f, "{message}"),
+        }
+    }
+}
+
+impl std::error::Error for RegistryLoadError {}
+
 // Helpers for env parsing
 
-fn load_env_specs(key: &str) -> Result<Vec<String>, String> {
-    let raw = env::var(key).map_err(|e| format!("missing {key}: {e}"))?;
+fn load_env_specs(key: &str) -> Result<Vec<String>, RegistryLoadError> {
+    let raw = env::var(key).map_err(|e| RegistryLoadError::Other(format!("missing {key}: {e}")))?;
     let specs = raw
         .split(',')
         .map(str::trim)
@@ -24,10 +47,12 @@ fn load_env_specs(key: &str) -> Result<Vec<String>, String> {
 }
 
 // spec format: "chain:address:symbol"
-fn split_spec(spec: &str) -> Result<(String, String, String), String> {
+fn split_spec(spec: &str) -> Result<(String, String, String), RegistryLoadError> {
     let parts: Vec<&str> = spec.split(':').collect();
     if parts.len() != 3 {
-        return Err(format!("invalid asset spec `{spec}` (expected chain:address:symbol)"));
+        return Err(RegistryLoadError::Other(format!(
+            "invalid asset spec `{spec}` (expected chain:address:symbol)"
+        )));
     }
     Ok((parts[0].to_string(), parts[1].to_string(), parts[2].to_string()))
 }
@@ -37,7 +62,7 @@ async fn resolve_chain_token<IB, EB>(
     spec: &str,
     icp_backend: &Arc<IB>,
     evm_backend: &Arc<EB>,
-) -> Result<ChainToken, String>
+) -> Result<ChainToken, RegistryLoadError>
 where
     IB: IcpBackend + Send + Sync,
     EB: EvmBackend + Send + Sync,
@@ -47,16 +72,19 @@ where
     if chain == "icp" {
         let ledger: Principal = address
             .parse()
-            .map_err(|_| format!("invalid ICP principal `{address}` in `{spec}`"))?;
+            .map_err(|_| RegistryLoadError::Other(format!("invalid ICP principal `{address}` in `{spec}`")))?;
         let decimals = icp_backend
             .icrc1_decimals(ledger)
             .await
-            .map_err(|e| format!("icp decimals for `{spec}` failed: {e}"))?;
+            .map_err(|e| RegistryLoadError::MissingIcpDecimals {
+                spec: spec.to_string(),
+                source: e.to_string(),
+            })?;
 
-        let fee = icp_backend
-            .icrc1_fee(ledger)
-            .await
-            .map_err(|e| format!("icp decimals for `{spec}` failed: {e}"))?;
+        let fee = icp_backend.icrc1_fee(ledger).await.map_err(|e| RegistryLoadError::MissingIcpFee {
+            spec: spec.to_string(),
+            source: e.to_string(),
+        })?;
 
         Ok(ChainToken::Icp {
             ledger,
@@ -80,7 +108,7 @@ where
             let decimals = evm_backend
                 .erc20_decimals(chain_name, &address)
                 .await
-                .map_err(|e| format!("evm decimals for `{spec}` failed: {e}"))?;
+                .map_err(|e| RegistryLoadError::Other(format!("evm decimals for `{spec}` failed: {e}")))?;
 
             Ok(ChainToken::EvmErc20 {
                 chain: chain_name.to_string(),
@@ -91,7 +119,9 @@ where
             })
         }
     } else {
-        Err(format!("unsupported chain `{chain}` in spec `{spec}`"))
+        Err(RegistryLoadError::Other(format!(
+            "unsupported chain `{chain}` in spec `{spec}`"
+        )))
     }
 }
 
@@ -100,7 +130,10 @@ where
 // Env format:
 //   DEBT_ASSETS=icp:mxzaz-hqaaa-aaaar-qaada-cai:ckBTC,evm-arb:0x...:USDC
 //   COLLATERAL_ASSETS=icp:mxzaz-hqaaa-aaaar-qaada-cai:ckBTC,...
-pub async fn load_token_registry<IB, EB>(icp_backend: Arc<IB>, evm_backend: Arc<EB>) -> Result<TokenRegistry, String>
+pub async fn load_token_registry<IB, EB>(
+    icp_backend: Arc<IB>,
+    evm_backend: Arc<EB>,
+) -> Result<TokenRegistry, RegistryLoadError>
 where
     IB: IcpBackend + Send + Sync,
     EB: EvmBackend + Send + Sync,
@@ -125,12 +158,18 @@ where
 
     let collateral_ids = coll_specs
         .into_iter()
-        .map(|spec| AssetId::from_str(&spec).map_err(|e| format!("invalid collateral asset spec '{}': {e}", spec)))
+        .map(|spec| {
+            AssetId::from_str(&spec)
+                .map_err(|e| RegistryLoadError::Other(format!("invalid collateral asset spec '{}': {e}", spec)))
+        })
         .collect::<Result<Vec<_>, _>>()?;
 
     let debt_ids = debt_specs
         .into_iter()
-        .map(|spec| AssetId::from_str(&spec).map_err(|e| format!("invalid debt asset spec '{}': {e}", spec)))
+        .map(|spec| {
+            AssetId::from_str(&spec)
+                .map_err(|e| RegistryLoadError::Other(format!("invalid debt asset spec '{}': {e}", spec)))
+        })
         .collect::<Result<Vec<_>, _>>()?;
 
     Ok(TokenRegistry::with_roles(tokens, collateral_ids, debt_ids))

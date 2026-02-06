@@ -64,10 +64,17 @@ pub(super) fn format_i128_amount(amount: i128, decimals: Option<u8>) -> String {
 }
 
 pub(super) fn decimal_to_units(dec_str: &str, decimals: u8) -> Option<u128> {
+    let dec_str = dec_str.trim();
+    if dec_str.is_empty() {
+        return None;
+    }
     let mut parts = dec_str.split('.');
     let whole = parts.next().unwrap_or("");
     let frac = parts.next().unwrap_or("");
     if parts.next().is_some() {
+        return None;
+    }
+    if whole.is_empty() && frac.is_empty() {
         return None;
     }
     if !whole.chars().all(|c| c.is_ascii_digit()) {

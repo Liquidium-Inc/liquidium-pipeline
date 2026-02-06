@@ -20,7 +20,7 @@ use liquidium_pipeline_core::{account::actions::AccountInfo, tokens::token_regis
 use liquidium_pipeline_connectors::{
     account::router::MultiChainAccountInfoRouter,
     backend::icp_backend::IcpBackendImpl,
-    token_registry_loader::load_token_registry,
+    token_registry_loader::{load_token_registry, RegistryLoadError},
     transfer::{evm_transfer::EvmTransferAdapter, icp_transfer::IcpTransferAdapter, router::MultiChainTransferRouter},
 };
 
@@ -52,6 +52,23 @@ pub struct PipelineContextBuilder<P: Provider<AnyNetwork>> {
     ic_agent_trader: Option<Arc<Agent>>,
 }
 
+#[derive(Debug)]
+pub enum PipelineContextError {
+    RegistryLoad(RegistryLoadError),
+    Other(String),
+}
+
+impl std::fmt::Display for PipelineContextError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PipelineContextError::RegistryLoad(err) => write!(f, "{err}"),
+            PipelineContextError::Other(message) => write!(f, "{message}"),
+        }
+    }
+}
+
+impl std::error::Error for PipelineContextError {}
+
 impl<P: Provider<AnyNetwork> + WalletProvider<AnyNetwork> + Clone + 'static> PipelineContextBuilder<P> {
     pub async fn new() -> Result<Self, String> {
         let config = Config::load().await.map_err(|e| format!("config load failed: {e}"))?;
@@ -79,21 +96,28 @@ impl<P: Provider<AnyNetwork> + WalletProvider<AnyNetwork> + Clone + 'static> Pip
     }
 
     pub async fn build(self) -> Result<PipelineContext, String> {
-        self.build_with_registry_override(None).await
+        self.build_with_registry_override(None).await.map_err(|e| e.to_string())
     }
 
     pub async fn build_with_registry_override(
         self,
         registry_override: Option<TokenRegistry>,
-    ) -> Result<PipelineContext, String> {
+    ) -> Result<PipelineContext, PipelineContextError> {
         let config = self.config;
 
-        let main_agent = self.ic_agent_main.ok_or("missing IC Main Agent")?;
+        let main_agent = self
+            .ic_agent_main
+            .ok_or_else(|| PipelineContextError::Other("missing IC Main Agent".to_string()))?;
         let icp_backend_main = Arc::new(IcpBackendImpl::new(main_agent.clone()));
-        let icp_backend_trader = Arc::new(IcpBackendImpl::new(self.ic_agent_trader.ok_or("missing IC Trader")?));
+        let icp_backend_trader = Arc::new(IcpBackendImpl::new(
+            self.ic_agent_trader
+                .ok_or_else(|| PipelineContextError::Other("missing IC Trader".to_string()))?,
+        ));
 
         // Use provided EVM providers or fail
-        let main_provider = self.evm_provider_main.ok_or("missing main EVM provider")?;
+        let main_provider = self
+            .evm_provider_main
+            .ok_or_else(|| PipelineContextError::Other("missing main EVM provider".to_string()))?;
         let evm_address = format!("{}", main_provider.default_signer_address());
 
         let evm_backend_main = Arc::new(EvmBackendImpl::new(main_provider));
@@ -101,7 +125,9 @@ impl<P: Provider<AnyNetwork> + WalletProvider<AnyNetwork> + Clone + 'static> Pip
 
         let registry = Arc::new(match registry_override {
             Some(registry) => registry,
-            None => load_token_registry(icp_backend_main.clone(), evm_backend_main.clone()).await?,
+            None => load_token_registry(icp_backend_main.clone(), evm_backend_main.clone())
+                .await
+                .map_err(PipelineContextError::RegistryLoad)?,
         });
         for (id, token) in registry.tokens.iter() {
             if let ChainToken::Icp { fee, .. } = token {
@@ -222,12 +248,16 @@ impl<P: Provider<AnyNetwork> + WalletProvider<AnyNetwork> + Clone + 'static> Pip
     }
 }
 
-pub async fn init_context() -> Result<PipelineContext, String> {
-    // Start from the builder so we keep one place that owns Config.
-    let mut builder = PipelineContextBuilder::new().await?;
-    let config = builder.config.clone();
-
-    // Build ICP agents for main and trader accounts.
+fn setup_agents_and_provider(
+    config: &Config,
+) -> Result<
+    (
+        Arc<Agent>,
+        Arc<Agent>,
+        impl Provider<AnyNetwork> + WalletProvider<AnyNetwork> + Clone + 'static,
+    ),
+    String,
+> {
     let agent_main = Arc::new(
         Agent::builder()
             .with_url(config.ic_url.clone())
@@ -262,6 +292,15 @@ pub async fn init_context() -> Result<PipelineContext, String> {
                 .map_err(|e| format!("invalid evm rpc url: {e}"))?,
         );
 
+    Ok((agent_main, agent_trader, main_provider))
+}
+
+pub async fn init_context() -> Result<PipelineContext, String> {
+    // Start from the builder so we keep one place that owns Config.
+    let mut builder = PipelineContextBuilder::new().await?;
+    let config = builder.config.clone();
+    let (agent_main, agent_trader, main_provider) = setup_agents_and_provider(&config)?;
+
     // Feed everything into the builder and let it wire backends, routers, and services.
     builder = builder
         .with_main_ic_agent(agent_main)
@@ -274,39 +313,7 @@ pub async fn init_context() -> Result<PipelineContext, String> {
 pub async fn init_context_best_effort() -> Result<PipelineContext, String> {
     let mut builder = PipelineContextBuilder::new().await?;
     let config = builder.config.clone();
-
-    let agent_main = Arc::new(
-        Agent::builder()
-            .with_url(config.ic_url.clone())
-            .with_identity(config.liquidator_identity.clone())
-            .with_max_tcp_error_retries(3)
-            .build()
-            .map_err(|e| format!("ic agent(main) build: {e}"))?,
-    );
-
-    let agent_trader = Arc::new(
-        Agent::builder()
-            .with_url(config.ic_url.clone())
-            .with_identity(config.trader_identity.clone())
-            .with_max_tcp_error_retries(3)
-            .build()
-            .map_err(|e| format!("ic agent(trader) build: {e}"))?,
-    );
-
-    let signer: PrivateKeySigner = config
-        .evm_private_key
-        .parse()
-        .map_err(|e| format!("failed parsing evm private key: {e}"))?;
-
-    let main_provider = ProviderBuilder::new()
-        .network::<AnyNetwork>()
-        .wallet(signer)
-        .connect_http(
-            config
-                .evm_rpc_url
-                .parse()
-                .map_err(|e| format!("invalid evm rpc url: {e}"))?,
-        );
+    let (agent_main, agent_trader, main_provider) = setup_agents_and_provider(&config)?;
 
     builder = builder
         .with_main_ic_agent(agent_main)
@@ -315,44 +322,16 @@ pub async fn init_context_best_effort() -> Result<PipelineContext, String> {
 
     match builder.build_with_registry_override(None).await {
         Ok(ctx) => Ok(ctx),
-        Err(err) => {
-            if err.contains("icp decimals") {
-                warn!("Token registry load failed ({}). Starting TUI with empty registry.", err);
+        Err(err) => match err {
+            PipelineContextError::RegistryLoad(RegistryLoadError::MissingIcpDecimals { .. })
+            | PipelineContextError::RegistryLoad(RegistryLoadError::MissingIcpFee { .. }) => {
+                warn!(
+                    "Token registry load failed ({}). Starting TUI with empty registry.",
+                    err
+                );
                 let mut fallback = PipelineContextBuilder::new().await?;
                 let config = fallback.config.clone();
-
-                let agent_main = Arc::new(
-                    Agent::builder()
-                        .with_url(config.ic_url.clone())
-                        .with_identity(config.liquidator_identity.clone())
-                        .with_max_tcp_error_retries(3)
-                        .build()
-                        .map_err(|e| format!("ic agent(main) build: {e}"))?,
-                );
-
-                let agent_trader = Arc::new(
-                    Agent::builder()
-                        .with_url(config.ic_url.clone())
-                        .with_identity(config.trader_identity.clone())
-                        .with_max_tcp_error_retries(3)
-                        .build()
-                        .map_err(|e| format!("ic agent(trader) build: {e}"))?,
-                );
-
-                let signer: PrivateKeySigner = config
-                    .evm_private_key
-                    .parse()
-                    .map_err(|e| format!("failed parsing evm private key: {e}"))?;
-
-                let main_provider = ProviderBuilder::new()
-                    .network::<AnyNetwork>()
-                    .wallet(signer)
-                    .connect_http(
-                        config
-                            .evm_rpc_url
-                            .parse()
-                            .map_err(|e| format!("invalid evm rpc url: {e}"))?,
-                    );
+                let (agent_main, agent_trader, main_provider) = setup_agents_and_provider(&config)?;
 
                 fallback = fallback
                     .with_main_ic_agent(agent_main)
@@ -360,10 +339,12 @@ pub async fn init_context_best_effort() -> Result<PipelineContext, String> {
                     .with_main_evm_provider(main_provider);
 
                 let empty_registry = TokenRegistry::new(HashMap::new());
-                fallback.build_with_registry_override(Some(empty_registry)).await
-            } else {
-                Err(err)
+                fallback
+                    .build_with_registry_override(Some(empty_registry))
+                    .await
+                    .map_err(|err| err.to_string())
             }
-        }
+            PipelineContextError::RegistryLoad(_) | PipelineContextError::Other(_) => Err(err.to_string()),
+        },
     }
 }

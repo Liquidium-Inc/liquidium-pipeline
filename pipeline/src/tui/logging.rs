@@ -17,9 +17,14 @@ pub(super) struct TerminalGuard;
 impl TerminalGuard {
     pub(super) fn enter() -> anyhow::Result<Self> {
         enable_raw_mode().context("enable raw mode")?;
-        execute!(io::stdout(), EnterAlternateScreen, EnableBracketedPaste)
-            .context("enter alternate screen")?;
-        Ok(Self)
+        let guard = Self;
+        if let Err(err) =
+            execute!(io::stdout(), EnterAlternateScreen, EnableBracketedPaste).context("enter alternate screen")
+        {
+            drop(guard);
+            return Err(err);
+        }
+        Ok(guard)
     }
 }
 

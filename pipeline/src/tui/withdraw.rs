@@ -211,7 +211,10 @@ async fn execute_withdraw(
             .0
             .to_u128()
             .ok_or_else(|| "balance too large for u128".to_string())?;
-        let fee_u128 = fee.0.to_u128().unwrap_or(0);
+        let fee_u128 = fee
+            .0
+            .to_u128()
+            .ok_or_else(|| "fee too large to represent".to_string())?;
         if bal_u128 <= fee_u128 {
             return Err("balance too low to cover fee".to_string());
         }

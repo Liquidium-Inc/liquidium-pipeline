@@ -205,14 +205,17 @@ fn format_age(age_secs: i64) -> String {
 }
 
 fn truncate(s: &str, max: usize) -> String {
-    if s.len() <= max {
+    let char_count = s.chars().count();
+    if char_count <= max {
         return s.to_string();
     }
     if max <= 3 {
-        return s[..max].to_string();
+        return s.chars().take(max).collect();
     }
     let take = max - 3;
-    format!("{}...", &s[..take])
+    let mut truncated: String = s.chars().take(take).collect();
+    truncated.push_str("...");
+    truncated
 }
 
 fn build_execution_details(row: &ExecutionRowData) -> Vec<Line<'static>> {
