@@ -95,7 +95,7 @@ impl<P: Provider<AnyNetwork> + WalletProvider<AnyNetwork> + Clone + 'static> Pip
         let registry = Arc::new(
             load_token_registry(icp_backend_main.clone(), evm_backend_main.clone())
                 .await
-                .map_err(|e| e.to_string())?,
+                .map_err(|e| format_with_code(&e))?,
         );
         for (id, token) in registry.tokens.iter() {
             if let ChainToken::Icp { fee, .. } = token {
