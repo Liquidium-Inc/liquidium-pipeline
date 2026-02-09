@@ -142,6 +142,8 @@ async fn init(
                 ctx.trader_transfers.actions(),
                 config.liquidator_principal,
                 config.max_allowed_cex_slippage_bps as f64,
+                config.cex_min_exec_usd,
+                config.cex_slice_target_ratio,
             ));
             Some(mexc_finalizer)
         }
@@ -172,6 +174,8 @@ async fn init(
         profit_calc,
         agent.clone(),
         config.lending_canister,
+        config.cex_retry_base_secs,
+        config.cex_retry_max_secs,
     ));
 
     info!("Initializing searcher stage ...");
@@ -257,6 +261,7 @@ pub async fn run_liquidation_loop() {
         ctx.swap_router.clone(),
         config.lending_canister,
         Duration::from_secs(3),
+        config.swapper,
     );
     tokio::spawn(async move { watcher.run().await });
 

@@ -25,6 +25,32 @@ pub enum CexStep {
     Failed,
 }
 
+/// Route-level CEX feasibility and cost preview used by hybrid routing decisions.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CexRoutePreview {
+    /// Whether the route is executable against current orderbook depth.
+    pub is_executable: bool,
+    /// Estimated output amount in final receive-asset native units.
+    pub estimated_receive_amount: f64,
+    /// Estimated end-to-end route slippage in basis points.
+    pub estimated_slippage_bps: f64,
+    /// Optional reason when preview cannot be executed.
+    pub reason: Option<String>,
+}
+
+/// One executed CEX slice for observability and export analytics.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CexTradeSlice {
+    pub leg_index: u32,
+    pub market: String,
+    pub side: String,
+    pub amount_in: f64,
+    pub amount_out: f64,
+    pub mid_price: f64,
+    pub exec_price: f64,
+    pub slippage_bps: f64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CexState {
     pub liq_id: String,
@@ -49,6 +75,21 @@ pub struct CexState {
     pub trade_last_amount_in: Option<f64>,
     pub trade_last_amount_out: Option<f64>,
     pub trade_next_amount_in: Option<f64>,
+    /// Weighted average route slippage across all executed slices, in bps.
+    pub trade_weighted_slippage_bps: Option<f64>,
+    /// Sum(amount_in * mid_price) across slices.
+    pub trade_mid_notional_sum: Option<f64>,
+    /// Sum(amount_in * exec_price) across slices.
+    pub trade_exec_notional_sum: Option<f64>,
+    /// Recorded slice-level executions for telemetry.
+    #[serde(default)]
+    pub trade_slices: Vec<CexTradeSlice>,
+    /// Whether residual was skipped as dust (< min execution USD).
+    #[serde(default)]
+    pub trade_dust_skipped: bool,
+    /// Residual notional skipped as dust, in USD.
+    #[serde(default)]
+    pub trade_dust_usd: Option<f64>,
 
     // withdraw leg
     pub withdraw_asset: ChainToken,
@@ -74,6 +115,9 @@ pub trait CexFinalizerLogic: Send + Sync {
 
     // Build final SwapExecution to hand back to pipeline when Completed
     async fn finish(&self, receipt: &ExecutionReceipt, state: &CexState) -> Result<SwapExecution, String>;
+
+    // Preview route feasibility and slippage using current orderbook depth.
+    async fn preview_route(&self, receipt: &ExecutionReceipt) -> Result<CexRoutePreview, String>;
 }
 
 #[async_trait]
@@ -183,7 +227,7 @@ impl Finalizer for dyn CexFinalizerLogic {
                 meta.meta = serde_json::to_vec(&cex_state).map_err(|e| e.to_string())?;
                 encode_meta(&mut row_after, &meta)?;
                 wal.upsert_result(row_after.clone()).await.map_err(|e| e.to_string())?;
-                break;
+                return Err(err.to_string());
             }
 
             debug!(
@@ -343,6 +387,12 @@ mod tests {
                 trade_last_amount_in: None,
                 trade_last_amount_out: None,
                 trade_next_amount_in: None,
+                trade_weighted_slippage_bps: None,
+                trade_mid_notional_sum: None,
+                trade_exec_notional_sum: None,
+                trade_slices: Vec::new(),
+                trade_dust_skipped: false,
+                trade_dust_usd: None,
 
                 withdraw_asset: recv,
                 withdraw_address: "dest".to_string(),
@@ -394,6 +444,15 @@ mod tests {
                 legs: vec![],
                 approval_count: None,
                 ts: 0,
+            })
+        }
+
+        async fn preview_route(&self, _receipt: &ExecutionReceipt) -> Result<CexRoutePreview, String> {
+            Ok(CexRoutePreview {
+                is_executable: true,
+                estimated_receive_amount: 0.0,
+                estimated_slippage_bps: 0.0,
+                reason: None,
             })
         }
     }

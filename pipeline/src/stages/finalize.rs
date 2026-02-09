@@ -9,7 +9,7 @@ use crate::finalizers::finalizer::{Finalizer, FinalizerResult};
 use crate::finalizers::liquidation_outcome::LiquidationOutcome;
 use crate::finalizers::profit_calculator::ProfitCalculator;
 
-use crate::persistance::{LiqMetaWrapper, WalStore};
+use crate::persistance::{LiqMetaWrapper, ResultStatus, WalStore};
 use crate::stage::PipelineStage;
 use crate::stages::executor::{ExecutionReceipt, ExecutionStatus};
 use crate::utils::now_ts;
@@ -21,6 +21,17 @@ use liquidium_pipeline_connectors::pipeline_agent::PipelineAgent;
 use liquidium_pipeline_core::types::protocol_types::{LiquidationResult, ProtocolError, TransferStatus};
 
 const MAX_FINALIZER_ERRORS: i32 = 5;
+
+/// Exponential retry delay with cap: min(max, base * 2^(errors-1)).
+fn retry_delay_secs(base: u64, max: u64, error_count: i32) -> u64 {
+    if base == 0 {
+        return 0;
+    }
+    let capped_max = max.max(base);
+    let exponent = error_count.saturating_sub(1).max(0) as u32;
+    let multiplier = if exponent >= 63 { u64::MAX } else { 1u64 << exponent };
+    base.saturating_mul(multiplier).min(capped_max)
+}
 
 //
 // FinalizeStage: pipeline stage over a concrete Finalizer
@@ -37,6 +48,10 @@ where
     pub profit_calc: Arc<P>,
     pub agent: Arc<A>,
     pub lending_canister: Principal,
+    /// Base retry delay for retryable finalizer failures, in seconds.
+    pub cex_retry_base_secs: u64,
+    /// Maximum retry delay cap for retryable finalizer failures, in seconds.
+    pub cex_retry_max_secs: u64,
 }
 
 impl<F, D, P, A> FinalizeStage<F, D, P, A>
@@ -52,6 +67,8 @@ where
         profit_calc: Arc<P>,
         agent: Arc<A>,
         lending_canister: Principal,
+        cex_retry_base_secs: u64,
+        cex_retry_max_secs: u64,
     ) -> Self {
         Self {
             wal,
@@ -59,6 +76,8 @@ where
             profit_calc,
             agent,
             lending_canister,
+            cex_retry_base_secs,
+            cex_retry_max_secs,
         }
     }
 
@@ -111,6 +130,8 @@ where
         // Then collect receipts for per-receipt processing.
         let mut wal_id_by_liq: HashMap<u128, String> = HashMap::new();
         let mut created_at_by_liq: HashMap<u128, i64> = HashMap::new();
+        let mut updated_at_by_liq: HashMap<u128, i64> = HashMap::new();
+        let mut status_by_liq: HashMap<u128, ResultStatus> = HashMap::new();
         let mut error_count_by_liq: HashMap<u128, i32> = HashMap::new();
         let mut receipts: Vec<ExecutionReceipt> = vec![];
 
@@ -127,6 +148,8 @@ where
             let liq_id = liq.id;
             wal_id_by_liq.insert(liq_id, row.id.clone());
             created_at_by_liq.insert(liq_id, row.created_at);
+            updated_at_by_liq.insert(liq_id, row.updated_at);
+            status_by_liq.insert(liq_id, row.status);
             error_count_by_liq.insert(liq_id, row.error_count);
 
             receipts.push(receipt);
@@ -203,6 +226,25 @@ where
                     receipt,
                 ));
                 continue;
+            }
+
+            // Apply bounded retry backoff for retryable failures to avoid thrashing thin books.
+            if matches!(status_by_liq.get(&liq_id), Some(ResultStatus::FailedRetryable)) {
+                let recorded_errors = error_count_by_liq.get(&liq_id).copied().unwrap_or(1).max(1);
+                let delay_secs = retry_delay_secs(self.cex_retry_base_secs, self.cex_retry_max_secs, recorded_errors);
+                let last_update = updated_at_by_liq.get(&liq_id).copied().unwrap_or(0);
+                let due_at = last_update.saturating_add(delay_secs.min(i64::MAX as u64) as i64);
+                let now = now_ts();
+                if now < due_at {
+                    debug!(
+                        "[finalize] ⏳ retry backoff liq_id={} errors={} delay={}s remaining={}s",
+                        liq_id,
+                        recorded_errors,
+                        delay_secs,
+                        due_at.saturating_sub(now)
+                    );
+                    continue;
+                }
             }
 
             if let Some(wal_id) = wal_id_by_liq.get(&liq_id) {
@@ -404,6 +446,22 @@ mod tests {
         row
     }
 
+    #[test]
+    fn retry_delay_secs_progresses_exponentially() {
+        assert_eq!(retry_delay_secs(5, 120, 1), 5);
+        assert_eq!(retry_delay_secs(5, 120, 2), 10);
+        assert_eq!(retry_delay_secs(5, 120, 3), 20);
+        assert_eq!(retry_delay_secs(5, 120, 4), 40);
+        assert_eq!(retry_delay_secs(5, 120, 5), 80);
+    }
+
+    #[test]
+    fn retry_delay_secs_caps_at_max() {
+        assert_eq!(retry_delay_secs(5, 120, 6), 120);
+        assert_eq!(retry_delay_secs(5, 120, 7), 120);
+        assert_eq!(retry_delay_secs(10, 10, 4), 10);
+    }
+
     #[tokio::test]
     async fn finalize_refreshes_pending_collateral_and_skips_if_still_pending() {
         let liq_id = 42u128;
@@ -452,6 +510,8 @@ mod tests {
             Arc::new(SimpleProfitCalculator),
             Arc::new(agent),
             Principal::anonymous(),
+            5,
+            120,
         );
 
         let outcomes = stage.process(&()).await.expect("process should succeed");
@@ -512,6 +572,8 @@ mod tests {
             Arc::new(SimpleProfitCalculator),
             Arc::new(agent),
             Principal::anonymous(),
+            5,
+            120,
         );
 
         let outcomes = stage.process(&()).await.expect("process should succeed");

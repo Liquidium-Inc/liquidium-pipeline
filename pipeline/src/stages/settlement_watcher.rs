@@ -7,6 +7,7 @@ use tokio::time::sleep;
 use tracing::instrument;
 use tracing::{info, warn};
 
+use crate::config::SwapperMode;
 use crate::persistance::{LiqMetaWrapper, LiqResultRecord, ResultStatus, WalStore};
 use crate::stages::executor::ExecutionReceipt;
 use crate::stages::executor::ExecutionStatus;
@@ -28,6 +29,8 @@ where
     pub swapper: Arc<S>,
     pub lending_canister: Principal,
     pub poll_interval: Duration,
+    /// Active swapper mode used to decide whether DEX profitability gating applies.
+    pub swapper_mode: SwapperMode,
 }
 
 impl<A, S, D> SettlementWatcher<A, S, D>
@@ -42,6 +45,7 @@ where
         swapper: Arc<S>,
         lending_canister: Principal,
         poll_interval: Duration,
+        swapper_mode: SwapperMode,
     ) -> Self {
         Self {
             wal,
@@ -49,6 +53,7 @@ where
             swapper,
             lending_canister,
             poll_interval,
+            swapper_mode,
         }
     }
 
@@ -145,6 +150,20 @@ where
                 .update_status(&row.id, ResultStatus::Enqueued, true)
                 .await
                 .map_err(|e| e.to_string())?;
+            return Ok(());
+        }
+
+        // DEX quote-based profitability gating is only valid in pure DEX mode.
+        // In CEX/Hybrid modes, finalizer-side previews decide route viability.
+        if !matches!(self.swapper_mode, SwapperMode::Dex) {
+            self.wal
+                .update_status(&row.id, ResultStatus::Enqueued, true)
+                .await
+                .map_err(|e| e.to_string())?;
+            info!(
+                "[settlement] ✅ liq_id={} mode={:?} -> enqueued without DEX quote gate",
+                liq.id, self.swapper_mode
+            );
             return Ok(());
         }
 
@@ -410,6 +429,59 @@ mod tests {
             Arc::new(swapper),
             Principal::anonymous(),
             Duration::from_secs(3),
+            SwapperMode::Dex,
+        );
+
+        watcher.tick().await.expect("tick should succeed");
+    }
+
+    #[tokio::test]
+    async fn watcher_bypasses_dex_quote_gate_in_hybrid_mode() {
+        let liq_id = 10u128;
+        let swap_args = make_swap_args();
+        let receipt = ExecutionReceipt {
+            request: make_request(false, Some(swap_args.clone())),
+            liquidation_result: Some(make_liq_result(liq_id, TransferStatus::Success)),
+            status: ExecutionStatus::Success,
+            change_received: true,
+        };
+        let row = make_row(ResultStatus::WaitingCollateral, receipt.clone());
+        let row_id = row.id.clone();
+
+        let mut wal = MockWalStore::new();
+        wal.expect_list_by_status()
+            .with(eq(ResultStatus::WaitingCollateral), eq(100usize))
+            .times(1)
+            .returning(move |_, _| Ok(vec![row.clone()]));
+        wal.expect_list_by_status()
+            .with(eq(ResultStatus::WaitingProfit), eq(100usize))
+            .times(1)
+            .returning(|_, _| Ok(vec![]));
+        wal.expect_upsert_result().times(0);
+        wal.expect_update_status()
+            .with(eq(row_id.clone()), eq(ResultStatus::Enqueued), eq(true))
+            .times(1)
+            .returning(|_, _, _| Ok(()));
+
+        let mut agent = MockPipelineAgent::new();
+        let args = Encode!(&liq_id).unwrap();
+        let fresh = make_liq_result(liq_id, TransferStatus::Success);
+        agent
+            .expect_call_query::<Result<LiquidationResult, ProtocolError>>()
+            .with(eq(Principal::anonymous()), eq("get_liquidation"), eq(args))
+            .times(1)
+            .returning(move |_, _, _| Ok(Ok(fresh.clone())));
+
+        let mut swapper = MockSwapInterface::new();
+        swapper.expect_quote().times(0);
+
+        let watcher = SettlementWatcher::new(
+            Arc::new(wal),
+            Arc::new(agent),
+            Arc::new(swapper),
+            Principal::anonymous(),
+            Duration::from_secs(3),
+            SwapperMode::Hybrid,
         );
 
         watcher.tick().await.expect("tick should succeed");
@@ -482,6 +554,7 @@ mod tests {
             Arc::new(swapper),
             Principal::anonymous(),
             Duration::from_secs(3),
+            SwapperMode::Dex,
         );
 
         watcher.tick().await.expect("tick should succeed");

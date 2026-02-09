@@ -5,19 +5,25 @@ use std::time::Duration;
 use async_trait::async_trait;
 use candid::{Nat, Principal};
 use icrc_ledger_types::icrc1::account::Account;
-use liquidium_pipeline_connectors::backend::cex_backend::CexBackend;
+use liquidium_pipeline_connectors::backend::cex_backend::{CexBackend, OrderBookLevel};
 use liquidium_pipeline_core::{
     account::model::ChainAccount,
     tokens::{chain_token::ChainToken, chain_token_amount::ChainTokenAmount},
     transfer::actions::TransferActions,
 };
 use log::{debug, info, warn};
+use tokio::sync::Mutex as TokioMutex;
 use tokio::time::sleep;
 
+use super::mexc_utils::{
+    LIQUIDITY_EPS, SlicePreview, TradeLeg, f64_to_nat, is_usd_stable_symbol, mexc_special_trade_legs,
+    parse_market_symbols, simulate_buy_from_asks, simulate_sell_from_bids,
+};
 use crate::{
-    finalizers::cex_finalizer::{CexFinalizerLogic, CexState, CexStep},
+    finalizers::cex_finalizer::{CexFinalizerLogic, CexRoutePreview, CexState, CexStep, CexTradeSlice},
     stages::executor::ExecutionReceipt,
-    swappers::model::SwapExecution,
+    swappers::model::{SwapExecution, SwapQuoteLeg},
+    utils::now_ts,
 };
 
 // MEXC-specific implementation of the generic CEX finalizer logic.
@@ -35,70 +41,24 @@ where
     pub transfer_service: Arc<dyn TransferActions>,
     pub liquidator_principal: Principal,
     pub max_sell_slippage_bps: f64,
+    /// Minimum USD notional allowed for any CEX execution slice.
+    pub cex_min_exec_usd: f64,
+    /// Target fraction of slippage cap used for per-slice sizing.
+    pub cex_slice_target_ratio: f64,
     approve_bumps: Mutex<HashMap<String, u8>>,
+    market_locks: TokioMutex<HashMap<String, Arc<TokioMutex<()>>>>,
 }
 
+/// Number of orderbook levels used for impact simulation.
+/// Higher = better estimate, slower API calls.
 const DEFAULT_ORDERBOOK_LIMIT: u32 = 50;
+/// Number of binary-search iterations for max-slice estimation.
+const SLICE_SEARCH_STEPS: usize = 24;
 pub const APPROVE_BUMP_MAX_COUNT: u8 = 6;
 const APPROVE_BUMP_BATCH_SIZE: u8 = 3;
 const APPROVE_BUMP_DELAY_MS: u64 = 300;
 const APPROVE_BUMP_BATCH_DELAY_SECS: u64 = 3;
 pub const MEXC_DEPOSIT_FEE_MULTIPLIER: u8 = 7;
-
-#[derive(Debug, Clone)]
-struct TradeLeg {
-    market: String,
-    side: String,
-}
-
-fn mexc_special_trade_legs(deposit_symbol: &str, withdraw_symbol: &str) -> Option<Vec<TradeLeg>> {
-    let deposit = deposit_symbol.to_ascii_uppercase();
-    let withdraw = withdraw_symbol.to_ascii_uppercase();
-
-    if deposit == "CKBTC" && withdraw == "CKUSDT" {
-        return Some(vec![
-            TradeLeg {
-                market: "CKBTC_BTC".to_string(),
-                side: "sell".to_string(),
-            },
-            TradeLeg {
-                market: "BTC_USDC".to_string(),
-                side: "sell".to_string(),
-            },
-            TradeLeg {
-                market: "USDC_USDT".to_string(),
-                side: "sell".to_string(),
-            },
-            TradeLeg {
-                market: "CKUSDT_USDT".to_string(),
-                side: "buy".to_string(),
-            },
-        ]);
-    }
-
-    if deposit == "CKUSDT" && withdraw == "CKBTC" {
-        return Some(vec![
-            TradeLeg {
-                market: "CKUSDT_USDT".to_string(),
-                side: "sell".to_string(),
-            },
-            TradeLeg {
-                market: "USDC_USDT".to_string(),
-                side: "buy".to_string(),
-            },
-            TradeLeg {
-                market: "BTC_USDC".to_string(),
-                side: "buy".to_string(),
-            },
-            TradeLeg {
-                market: "CKBTC_BTC".to_string(),
-                side: "buy".to_string(),
-            },
-        ]);
-    }
-
-    None
-}
 
 impl<C> MexcFinalizer<C>
 where
@@ -109,245 +69,24 @@ where
         transfer_service: Arc<dyn TransferActions>,
         liquidator_principal: Principal,
         max_sell_slippage_bps: f64,
+        cex_min_exec_usd: f64,
+        cex_slice_target_ratio: f64,
     ) -> Self {
         Self {
             backend,
             transfer_service,
             liquidator_principal,
             max_sell_slippage_bps,
+            cex_min_exec_usd,
+            cex_slice_target_ratio,
             approve_bumps: Mutex::new(HashMap::new()),
+            market_locks: TokioMutex::new(HashMap::new()),
         }
-    }
-
-    pub async fn check_deposit(&self, state: &mut CexState) -> Result<(), String> {
-        let symbol = state.deposit_asset.symbol();
-        let current_bal = self.backend.get_balance(&symbol).await?;
-
-        match state.deposit_balance_before {
-            Some(b0) => {
-                let expected = state.trade_next_amount_in.unwrap_or_else(|| state.size_in.to_f64());
-                let delta = current_bal - b0;
-                if delta >= expected - 0.00001 {
-                    info!(
-                        "[mexc] liq_id={} deposit confirmed: before={} after={} expected={}",
-                        state.liq_id, b0, current_bal, expected
-                    );
-                    state.step = CexStep::Trade;
-                    return Ok(());
-                }
-                info!(
-                    "[mexc] liq_id={} deposit pending: before={} current={} delta={} expected={}",
-                    state.liq_id, b0, current_bal, delta, expected
-                );
-            }
-            None => {
-                // No baseline recorded yet (should normally be set when we send the transfer),
-                // so record the current balance as the baseline and stay in Deposit.
-                info!(
-                    "[mexc] liq_id={} deposit baseline set: current={}",
-                    state.liq_id, current_bal
-                );
-                state.deposit_balance_before = Some(current_bal);
-            }
-        }
-
-        Ok(())
-    }
-
-    async fn resolve_direct_leg(&self, deposit_symbol: &str, withdraw_symbol: &str) -> Result<TradeLeg, String> {
-        let deposit = deposit_symbol.to_ascii_uppercase();
-        let withdraw = withdraw_symbol.to_ascii_uppercase();
-
-        let sell_market = format!("{}_{}", deposit, withdraw);
-        let buy_market = format!("{}_{}", withdraw, deposit);
-        let mut errors: Vec<String> = Vec::new();
-
-        match self
-            .backend
-            .get_orderbook(&sell_market, Some(DEFAULT_ORDERBOOK_LIMIT))
-            .await
-        {
-            Ok(orderbook) => {
-                if !orderbook.bids.is_empty() {
-                    return Ok(TradeLeg {
-                        market: sell_market,
-                        side: "sell".to_string(),
-                    });
-                }
-                errors.push(format!("{} has no bids", sell_market));
-            }
-            Err(err) => errors.push(format!("{}: {}", sell_market, err)),
-        }
-
-        match self
-            .backend
-            .get_orderbook(&buy_market, Some(DEFAULT_ORDERBOOK_LIMIT))
-            .await
-        {
-            Ok(orderbook) => {
-                if !orderbook.asks.is_empty() {
-                    return Ok(TradeLeg {
-                        market: buy_market,
-                        side: "buy".to_string(),
-                    });
-                }
-                errors.push(format!("{} has no asks", buy_market));
-            }
-            Err(err) => errors.push(format!("{}: {}", buy_market, err)),
-        }
-
-        Err(format!(
-            "could not resolve direct market for {} -> {} ({})",
-            deposit,
-            withdraw,
-            errors.join(" | ")
-        ))
-    }
-
-    async fn resolve_trade_legs(&self, state: &CexState) -> Result<Vec<TradeLeg>, String> {
-        let deposit = state.deposit_asset.symbol();
-        let withdraw = state.withdraw_asset.symbol();
-
-        if let Some(legs) = mexc_special_trade_legs(&deposit, &withdraw) {
-            return Ok(legs);
-        }
-
-        let leg = self.resolve_direct_leg(&deposit, &withdraw).await?;
-        Ok(vec![leg])
-    }
-
-    async fn check_sell_liquidity(&self, liq_id: &str, market: &str, amount_in: f64) -> Result<(), String> {
-        if amount_in <= 0.0 {
-            return Ok(());
-        }
-
-        let orderbook = self
-            .backend
-            .get_orderbook(market, Some(DEFAULT_ORDERBOOK_LIMIT))
-            .await?;
-
-        let best_bid = orderbook.bids.first().map(|level| level.price).unwrap_or(0.0);
-        if best_bid <= 0.0 {
-            return Err(format!("no bids available for market {}", market));
-        }
-
-        let mut remaining = amount_in;
-        let mut proceeds = 0.0;
-
-        for level in &orderbook.bids {
-            if remaining <= 0.0 {
-                break;
-            }
-            if level.quantity <= 0.0 || level.price <= 0.0 {
-                continue;
-            }
-
-            let take = remaining.min(level.quantity);
-            proceeds += take * level.price;
-            remaining -= take;
-        }
-
-        if remaining > 0.0 {
-            return Err(format!(
-                "not enough bid liquidity for {} (needed {}, missing {})",
-                market, amount_in, remaining
-            ));
-        }
-
-        let avg_price = proceeds / amount_in;
-        let slippage_bps = ((best_bid - avg_price) / best_bid) * 10_000.0;
-
-        info!(
-            "[mexc] liq_id={} liquidity check market={} amount_in={} best_bid={} avg_price={} slippage_bps={}",
-            liq_id, market, amount_in, best_bid, avg_price, slippage_bps
-        );
-
-        if slippage_bps > self.max_sell_slippage_bps {
-            warn!(
-                "[mexc] liq_id={} slippage check failed: market={} amount_in={} best_bid={} avg_price={} slippage_bps={} max_bps={}",
-                liq_id, market, amount_in, best_bid, avg_price, slippage_bps, self.max_sell_slippage_bps
-            );
-            return Err(format!(
-                "sell slippage too high for {}: {:.2} bps > {:.2} bps",
-                market, slippage_bps, self.max_sell_slippage_bps
-            ));
-        }
-
-        Ok(())
-    }
-
-    // MEXC approvals are flaky; we send a burst of tiny approvals to increase the chance
-    // the exchange notices the approval without blocking the main liquidation flow.
-    async fn maybe_bump_mexc_approval(&self, liq_id: &str, asset: &ChainToken) -> u32 {
-        let already_bumped = {
-            let Ok(approve_bumps) = self.approve_bumps.lock() else {
-                warn!("[mexc] liq_id={} approve_bumps mutex poisoned, skipping bump", liq_id);
-                return 0;
-            };
-            *approve_bumps.get(liq_id).unwrap_or(&0)
-        };
-
-        if already_bumped >= APPROVE_BUMP_MAX_COUNT {
-            debug!(
-                "[mexc] liq_id={} deposit transfer: approve bump already done (count={})",
-                liq_id, already_bumped
-            );
-            return 0;
-        }
-
-        let approve_amount = Nat::from(1u8);
-        let spender = ChainAccount::Icp(Account {
-            owner: self.liquidator_principal,
-            subaccount: None,
-        });
-        info!(
-            "[mexc] liq_id={} deposit transfer: approve bump {}+{} amount={} asset={}",
-            liq_id, APPROVE_BUMP_BATCH_SIZE, APPROVE_BUMP_BATCH_SIZE, approve_amount, asset
-        );
-
-        let mut ok = true;
-        let mut approved_count: u32 = 0;
-        let short_pause = Duration::from_millis(APPROVE_BUMP_DELAY_MS);
-        for i in 0..APPROVE_BUMP_BATCH_SIZE {
-            if let Err(err) = self
-                .transfer_service
-                .approve(asset, &spender, approve_amount.clone())
-                .await
-            {
-                ok = false;
-                info!("[mexc] liq_id={} approve bump failed: {}", liq_id, err);
-                break;
-            }
-            approved_count += 1;
-            if i < APPROVE_BUMP_BATCH_SIZE - 1 {
-                sleep(short_pause).await;
-            }
-        }
-        if ok {
-            sleep(Duration::from_secs(APPROVE_BUMP_BATCH_DELAY_SECS)).await;
-            for i in 0..APPROVE_BUMP_BATCH_SIZE {
-                if let Err(err) = self
-                    .transfer_service
-                    .approve(asset, &spender, approve_amount.clone())
-                    .await
-                {
-                    ok = false;
-                    info!("[mexc] liq_id={} approve bump failed: {}", liq_id, err);
-                    break;
-                }
-                approved_count += 1;
-                if i < APPROVE_BUMP_BATCH_SIZE - 1 {
-                    sleep(short_pause).await;
-                }
-            }
-        }
-
-        if ok && let Ok(mut approve_bumps) = self.approve_bumps.lock() {
-            approve_bumps.insert(liq_id.to_string(), APPROVE_BUMP_MAX_COUNT);
-        }
-        approved_count
     }
 }
+
+#[path = "helper_methods.rs"]
+mod helper_methods;
 
 #[async_trait]
 impl<B> CexFinalizerLogic for MexcFinalizer<B>
@@ -393,6 +132,12 @@ where
             trade_last_amount_in: None,
             trade_last_amount_out: None,
             trade_next_amount_in: None,
+            trade_weighted_slippage_bps: None,
+            trade_mid_notional_sum: None,
+            trade_exec_notional_sum: None,
+            trade_slices: Vec::new(),
+            trade_dust_skipped: false,
+            trade_dust_usd: None,
 
             // withdraw leg
             withdraw_asset: receipt.request.debt_asset.clone(),
@@ -521,7 +266,38 @@ where
         self.check_deposit(state).await
     }
 
+    /// Execute one resumable trade invocation for the current CEX route leg.
+    ///
+    /// This method orchestrates leg selection and state transitions, while delegating
+    /// slice-by-slice execution to `execute_trade_leg_slices`.
+    ///
+    /// Behavior summary:
+    /// - resolves direct vs multi-hop route for `deposit_asset -> withdraw_asset`
+    /// - resumes from `trade_leg_index` and `trade_next_amount_in` when present
+    /// - serializes execution per market via a market lock
+    /// - enforces slippage and dust controls during sliced execution
+    /// - updates `state` so next invocation continues at the correct leg/step
+    ///
+    /// Slice execution algorithm (implemented in `execute_trade_leg_slices`):
+    /// 1. Compute a preferred chunk under the soft target (`target_bps`), using
+    ///    orderbook simulation + binary search.
+    /// 2. If no soft-target chunk exists, run a one-shot fallback check on the full
+    ///    remainder against the hard cap (`max_sell_slippage_bps`).
+    /// 3. Skip execution when chunk/remainder notional is below `cex_min_exec_usd`
+    ///    (dust), and carry forward the partial result.
+    /// 4. Execute one market slice, derive realized execution price from fills, and
+    ///    compute realized slippage versus preview midpoint.
+    /// 5. Abort the leg when realized slice slippage exceeds the hard cap.
+    /// 6. Record per-slice telemetry and update weighted route-level notional/slippage.
+    /// 7. Repeat until remainder is consumed or marked dust, then return `(remaining_in, total_out)`.
+    ///
+    /// Success path:
+    /// - moves to `TradePending` for next leg, or `Withdraw` when route is complete
+    ///
+    /// Error path:
+    /// - returns `Err` and stores a descriptive `state.last_error` where applicable
     async fn trade(&self, state: &mut CexState) -> Result<(), String> {
+        // 1) Trace function entry with the currently persisted trade snapshot.
         debug!(
             "[mexc] liq_id={} step=Trade market={} side={} size_in={}",
             state.liq_id,
@@ -530,29 +306,41 @@ where
             state.size_in.formatted(),
         );
 
+        // 2) Resolve the full conversion route (single leg or multi-hop).
         let legs = self.resolve_trade_legs(state).await?;
+
+        // 3) Persist total route length for telemetry / resumability.
         state.trade_leg_total = Some(legs.len() as u32);
+
+        // 4) Log explicit multi-hop route details when applicable.
         if legs.len() > 1 {
             debug!("[mexc] liq_id={} multi-hop route: {:?}", state.liq_id, legs);
         }
 
+        // 5) For one-leg routes, normalize state market/side to the resolved leg.
         if legs.len() == 1 {
             state.market = legs[0].market.clone();
             state.side = legs[0].side.clone();
         }
 
+        // 6) Figure out which leg to process now (resumable index).
         let idx = state.trade_leg_index.unwrap_or(0) as usize;
+
+        // 7) If index is already past route end, go straight to withdraw step.
         if idx >= legs.len() {
             state.step = CexStep::Withdraw;
+            // 8) Carry forward already computed output amount if present.
             if let Some(out_amt) = state.trade_next_amount_in {
                 state.size_out = Some(ChainTokenAmount::from_formatted(state.withdraw_asset.clone(), out_amt));
             }
             return Ok(());
         }
 
+        // 9) Input for this leg is either previous leg output or initial deposit size.
         let amount_in = state.trade_next_amount_in.unwrap_or_else(|| state.size_in.to_f64());
 
-        if amount_in <= 0.0 {
+        // 10) Nothing to trade (or dust below epsilon) -> finish trading phase.
+        if amount_in <= LIQUIDITY_EPS {
             debug!(
                 "[mexc] liq_id={} trade skipped: non-positive amount_in={}",
                 state.liq_id, amount_in
@@ -561,14 +349,13 @@ where
             return Ok(());
         }
 
+        // 11) Pick current leg by index.
         let leg = &legs[idx];
 
-        state.trade_last_market = Some(leg.market.clone());
-        state.trade_last_side = Some(leg.side.clone());
-        state.trade_last_amount_in = Some(amount_in);
-        state.trade_last_amount_out = None;
-        state.last_error = None;
+        // 12) Store current-leg context fields (`trade_last_*`, clear `last_error`).
+        Self::set_trade_leg_context(state, leg, amount_in);
 
+        // 13) Log leg-level execution start.
         debug!(
             "[mexc] liq_id={} trade leg {}/{} market={} side={} amount_in={}",
             state.liq_id,
@@ -579,58 +366,40 @@ where
             amount_in
         );
 
-        if leg.side.eq_ignore_ascii_case("sell")
-            && let Err(err) = self.check_sell_liquidity(&state.liq_id, &leg.market, amount_in).await
-        {
-            state.last_error = Some(format!("liquidity check failed: {}", err));
-            return Err(err);
-        }
+        // Per-market queue to avoid self-impact by concurrent liquidations on the same book.
+        let _market_guard = self.acquire_market_lock(&leg.market).await;
 
-        // Execute the spot trade on MEXC. The backend is responsible for:
-        // - placing the order (market)
-        // - handling partial fills / retries
-        // - updating internal CEX balances
-        let filled = match self.backend.execute_swap(&leg.market, &leg.side, amount_in).await {
-            Ok(v) => v,
-            Err(e) => {
-                state.last_error = Some(format!(
-                    "trade leg {}/{} {} {} failed: {}",
-                    idx + 1,
-                    legs.len(),
-                    leg.market,
-                    leg.side,
-                    e
-                ));
-                return Err(e);
-            }
-        };
+        // Target impact per slice = configured fraction of hard cap.
+        let target_bps = self.target_slice_bps();
 
+        // 14) Execute this leg via shared slice runner.
+        //     The helper repeatedly:
+        //     - previews a safe chunk from live orderbook depth,
+        //     - skips tiny residual chunks below `cex_min_exec_usd` as dust,
+        //     - executes market orders and validates realized slippage,
+        //     - records per-slice telemetry, then returns `(remaining_in, total_out)`.
+        let (remaining_in, total_out) = self
+            .execute_trade_leg_slices(state, leg, idx, legs.len(), amount_in, target_bps)
+            .await?;
+
+        // 15) Emit end-of-leg summary including residual and dust info.
         info!(
-            "[mexc] liq_id={} trade leg {}/{} result market={} side={} amount_in={} filled={}",
+            "[mexc] liq_id={} trade leg {}/{} completed market={} side={} amount_in={} amount_out={} residual_in={} dust_skipped={} dust_usd={:?}",
             state.liq_id,
             idx + 1,
             legs.len(),
             leg.market,
             leg.side,
             amount_in,
-            filled
+            total_out,
+            remaining_in,
+            state.trade_dust_skipped,
+            state.trade_dust_usd
         );
 
-        state.trade_last_amount_out = Some(filled);
-        state.trade_next_amount_in = Some(filled);
-        state.trade_leg_index = Some((idx + 1) as u32);
-
-        if idx + 1 < legs.len() {
-            state.step = CexStep::TradePending;
-            return Ok(());
-        }
-
-        // For now we don't feed `filled` back into on-chain amounts; withdraw leg
-        // can either use backend-specific balance checks or later extend CexState
-        // with an explicit post-trade amount.
-        state.step = CexStep::Withdraw;
-
-        state.size_out = Some(ChainTokenAmount::from_formatted(state.withdraw_asset.clone(), filled));
+        // 16) Move to next leg or to withdraw (and set `size_out` when route is done).
+        Self::advance_after_trade_leg(state, idx, legs.len(), total_out);
+        // 17) Successful completion of this trade invocation.
         Ok(())
     }
 
@@ -720,16 +489,49 @@ where
         let recv_f = receive_amount.to_f64();
 
         let exec_price = if pay_f > 0.0 { recv_f / pay_f } else { 0.0 };
+        let mid_price =
+            if let (Some(mid_sum), Some(exec_sum)) = (state.trade_mid_notional_sum, state.trade_exec_notional_sum) {
+                if exec_sum > LIQUIDITY_EPS {
+                    (mid_sum / exec_sum) * exec_price
+                } else {
+                    exec_price
+                }
+            } else {
+                exec_price
+            };
 
-        // We do not have a separate mid-price or detailed legs from MEXC here,
-        // so we approximate:
-        //  - mid_price == exec_price
-        //  - slippage == 0.0
-        //  - legs == empty (single synthetic hop via MEXC)
-        //
-        // swap_id / request_id are set to 0 for now since there is no natural
-        // mapping from the CEX API to these fields yet. If you later add a
-        // CEX-side id, you can thread it into CexState and use it here.
+        let slippage = state.trade_weighted_slippage_bps.unwrap_or(0.0);
+        let legs: Vec<SwapQuoteLeg> = state
+            .trade_slices
+            .iter()
+            .map(|slice| {
+                let (base, quote) = parse_market_symbols(&slice.market).unwrap_or_else(|| {
+                    (
+                        state.deposit_asset.symbol().to_ascii_uppercase(),
+                        state.withdraw_asset.symbol().to_ascii_uppercase(),
+                    )
+                });
+                let (pay_symbol, recv_symbol, pay_amount, recv_amount) = if slice.side.eq_ignore_ascii_case("sell") {
+                    (base, quote, slice.amount_in, slice.amount_out)
+                } else {
+                    (quote, base, slice.amount_in, slice.amount_out)
+                };
+
+                SwapQuoteLeg {
+                    venue: "mexc".to_string(),
+                    route_id: slice.market.clone(),
+                    pay_chain: state.deposit_asset.chain(),
+                    pay_symbol,
+                    pay_amount: f64_to_nat(pay_amount),
+                    receive_chain: state.withdraw_asset.chain(),
+                    receive_symbol: recv_symbol,
+                    receive_amount: f64_to_nat(recv_amount),
+                    price: slice.exec_price,
+                    lp_fee: Nat::from(0u8),
+                    gas_fee: Nat::from(0u8),
+                }
+            })
+            .collect();
 
         let exec = SwapExecution {
             swap_id: 0,
@@ -739,15 +541,55 @@ where
             pay_amount: pay_amount.value,
             receive_asset: state.withdraw_asset.asset_id(),
             receive_amount: receive_amount.value,
-            mid_price: exec_price,
+            mid_price,
             exec_price,
-            slippage: 0.0,
-            legs: Vec::new(),
+            slippage,
+            legs,
             approval_count: state.approval_bump_count,
-            ts: 0,
+            ts: now_ts().max(0) as u64,
         };
 
         Ok(exec)
+    }
+
+    async fn preview_route(&self, receipt: &ExecutionReceipt) -> Result<CexRoutePreview, String> {
+        let state = self.prepare("preview", receipt).await?;
+        let legs = self.resolve_trade_legs(&state).await?;
+        let mut amount_in = state.size_in.to_f64();
+        if amount_in <= LIQUIDITY_EPS {
+            return Ok(CexRoutePreview {
+                is_executable: false,
+                estimated_receive_amount: 0.0,
+                estimated_slippage_bps: 0.0,
+                reason: Some("non-positive amount_in".to_string()),
+            });
+        }
+
+        let mut weighted_slippage_sum = 0.0;
+        let mut weighted_notional_usd = 0.0;
+        for leg in &legs {
+            let (out, _avg_price, impact_bps) = self.preview_leg(&leg.market, &leg.side, amount_in).await?;
+            let leg_notional_usd = self
+                .input_slice_usd(&leg.market, &leg.side, amount_in)
+                .await
+                .unwrap_or(0.0);
+            weighted_slippage_sum += impact_bps * leg_notional_usd;
+            weighted_notional_usd += leg_notional_usd;
+            amount_in = out;
+        }
+
+        let route_slippage_bps = if weighted_notional_usd > LIQUIDITY_EPS {
+            weighted_slippage_sum / weighted_notional_usd
+        } else {
+            0.0
+        };
+
+        Ok(CexRoutePreview {
+            is_executable: true,
+            estimated_receive_amount: amount_in,
+            estimated_slippage_bps: route_slippage_bps,
+            reason: None,
+        })
     }
 }
 
@@ -771,8 +613,14 @@ mod tests {
     use crate::executors::executor::ExecutorRequest;
     use crate::finalizers::cex_finalizer::{CexState, CexStep};
     use crate::stages::executor::{ExecutionReceipt, ExecutionStatus};
+    use proptest::prelude::*;
 
     const TEST_MAX_SELL_SLIPPAGE_BPS: f64 = 200.0;
+    /// Minimum USD chunk used by test finalizer instances.
+    /// Keep tiny so tests do not trigger dust skipping unless explicitly intended.
+    const TEST_CEX_MIN_EXEC_USD: f64 = 0.0001;
+    /// Slice target ratio used by test finalizer instances.
+    const TEST_CEX_SLICE_TARGET_RATIO: f64 = 0.7;
 
     fn make_execution_receipt(liq_id: u128) -> ExecutionReceipt {
         let collateral_token = ChainToken::Icp {
@@ -842,7 +690,14 @@ mod tests {
         let transfer_service = Arc::new(MockTransferActions::new());
         let liquidator = Principal::anonymous();
 
-        let finalizer = MexcFinalizer::new(backend, transfer_service, liquidator, TEST_MAX_SELL_SLIPPAGE_BPS);
+        let finalizer = MexcFinalizer::new(
+            backend,
+            transfer_service,
+            liquidator,
+            TEST_MAX_SELL_SLIPPAGE_BPS,
+            TEST_CEX_MIN_EXEC_USD,
+            TEST_CEX_SLICE_TARGET_RATIO,
+        );
 
         let receipt = make_execution_receipt(42);
         let state: CexState = finalizer.prepare("42", &receipt).await.expect("prepare should succeed");
@@ -909,6 +764,8 @@ mod tests {
             transfer_service,
             Principal::anonymous(),
             TEST_MAX_SELL_SLIPPAGE_BPS,
+            TEST_CEX_MIN_EXEC_USD,
+            TEST_CEX_SLICE_TARGET_RATIO,
         );
 
         let receipt = make_execution_receipt(42);
@@ -942,6 +799,8 @@ mod tests {
             transfer_service,
             Principal::anonymous(),
             TEST_MAX_SELL_SLIPPAGE_BPS,
+            TEST_CEX_MIN_EXEC_USD,
+            TEST_CEX_SLICE_TARGET_RATIO,
         );
 
         let receipt = make_execution_receipt(42);
@@ -979,6 +838,8 @@ mod tests {
             transfer_service,
             Principal::anonymous(),
             TEST_MAX_SELL_SLIPPAGE_BPS,
+            TEST_CEX_MIN_EXEC_USD,
+            TEST_CEX_SLICE_TARGET_RATIO,
         );
 
         let receipt = make_execution_receipt(42);
@@ -1016,6 +877,8 @@ mod tests {
             transfer_service,
             Principal::anonymous(),
             TEST_MAX_SELL_SLIPPAGE_BPS,
+            TEST_CEX_MIN_EXEC_USD,
+            TEST_CEX_SLICE_TARGET_RATIO,
         );
 
         let receipt = make_execution_receipt(42);
@@ -1053,6 +916,8 @@ mod tests {
             transfer_service,
             Principal::anonymous(),
             TEST_MAX_SELL_SLIPPAGE_BPS,
+            TEST_CEX_MIN_EXEC_USD,
+            TEST_CEX_SLICE_TARGET_RATIO,
         );
 
         let receipt = make_execution_receipt(42);
@@ -1079,17 +944,16 @@ mod tests {
 
         let orderbook = OrderBook {
             bids: vec![OrderBookLevel {
-                price: 100.0,
+                price: 1.0,
                 quantity: 1_000.0,
             }],
             asks: vec![OrderBookLevel {
-                price: 101.0,
+                price: 1.001,
                 quantity: 1_000.0,
             }],
         };
         backend
             .expect_get_orderbook()
-            .times(3)
             .returning(move |_market, _limit| Ok(orderbook.clone()));
 
         let calls = std::sync::Arc::new(std::sync::Mutex::new(0usize));
@@ -1107,25 +971,25 @@ mod tests {
                         assert_eq!(market, "CKBTC_BTC");
                         assert_eq!(side, "sell");
                         assert!(amount_in > 0.0);
-                        Ok(0.005)
+                        Ok(amount_in * 0.9999)
                     }
                     1 => {
                         assert_eq!(market, "BTC_USDC");
                         assert_eq!(side, "sell");
-                        assert!((amount_in - 0.005).abs() < 1e-12);
-                        Ok(12.34)
+                        assert!(amount_in > 0.0);
+                        Ok(amount_in * 0.9998)
                     }
                     2 => {
                         assert_eq!(market, "USDC_USDT");
                         assert_eq!(side, "sell");
-                        assert!((amount_in - 12.34).abs() < 1e-12);
-                        Ok(12.33)
+                        assert!(amount_in > 0.0);
+                        Ok(amount_in * 0.9997)
                     }
                     3 => {
                         assert_eq!(market, "CKUSDT_USDT");
                         assert_eq!(side, "buy");
-                        assert!((amount_in - 12.33).abs() < 1e-12);
-                        Ok(12.32)
+                        assert!(amount_in > 0.0);
+                        Ok(amount_in / 1.0012)
                     }
                     _ => unreachable!("unexpected execute_swap call"),
                 }
@@ -1139,6 +1003,8 @@ mod tests {
             transfer_service,
             Principal::anonymous(),
             TEST_MAX_SELL_SLIPPAGE_BPS,
+            TEST_CEX_MIN_EXEC_USD,
+            TEST_CEX_SLICE_TARGET_RATIO,
         );
 
         let receipt = make_execution_receipt(42);
@@ -1163,7 +1029,8 @@ mod tests {
 
         let out = state.size_out.as_ref().expect("size_out should be set");
         assert_eq!(out.token, state.withdraw_asset);
-        assert!((out.to_f64() - 12.32).abs() < 1e-9);
+        assert!(out.to_f64() > 0.0);
+        assert_eq!(state.trade_slices.len(), 4);
         assert!(matches!(state.step, CexStep::Withdraw));
     }
 
@@ -1184,7 +1051,6 @@ mod tests {
         };
         backend
             .expect_get_orderbook()
-            .times(1)
             .returning(move |_market, _limit| Ok(orderbook.clone()));
 
         backend
@@ -1200,6 +1066,8 @@ mod tests {
             transfer_service,
             Principal::anonymous(),
             TEST_MAX_SELL_SLIPPAGE_BPS,
+            TEST_CEX_MIN_EXEC_USD,
+            TEST_CEX_SLICE_TARGET_RATIO,
         );
 
         let receipt = make_execution_receipt(42);
@@ -1212,6 +1080,695 @@ mod tests {
         assert_eq!(err, "boom");
         // On error we expect the step to remain Trade.
         assert!(matches!(state.step, CexStep::Trade));
+    }
+
+    #[tokio::test]
+    async fn mexc_trade_marks_dust_and_skips_execution_for_small_residual() {
+        let mut backend = MockCexBackend::new();
+        let transfers = MockTransferActions::new();
+
+        let ckbtc_btc = OrderBook {
+            bids: vec![OrderBookLevel {
+                price: 1.0,
+                quantity: 100.0,
+            }],
+            asks: vec![OrderBookLevel {
+                price: 1.001,
+                quantity: 100.0,
+            }],
+        };
+        let btc_usdc = OrderBook {
+            bids: vec![OrderBookLevel {
+                price: 69_000.0,
+                quantity: 100.0,
+            }],
+            asks: vec![OrderBookLevel {
+                price: 69_010.0,
+                quantity: 100.0,
+            }],
+        };
+
+        backend
+            .expect_get_orderbook()
+            .returning(move |market, _limit| match market {
+                "CKBTC_BTC" => Ok(ckbtc_btc.clone()),
+                "BTC_USDC" => Ok(btc_usdc.clone()),
+                _ => Err(format!("unexpected market {}", market)),
+            });
+
+        // Dust path should break before any market execution.
+        backend.expect_execute_swap().times(0);
+
+        let finalizer = MexcFinalizer::new(
+            Arc::new(backend),
+            Arc::new(transfers),
+            Principal::anonymous(),
+            TEST_MAX_SELL_SLIPPAGE_BPS,
+            // 0.01 ckBTC ~= 690 USD at mocked conversion, so this forces dust skip.
+            1_000.0,
+            TEST_CEX_SLICE_TARGET_RATIO,
+        );
+
+        let receipt = make_execution_receipt(42);
+        let mut state = finalizer.prepare("42", &receipt).await.expect("prepare should succeed");
+        state.step = CexStep::Trade;
+        // Force single-leg route: CKBTC -> BTC.
+        state.withdraw_asset = ChainToken::Icp {
+            ledger: Principal::anonymous(),
+            symbol: "BTC".to_string(),
+            decimals: 8,
+            fee: Nat::from(1_000u64),
+        };
+
+        finalizer
+            .trade(&mut state)
+            .await
+            .expect("trade should succeed with dust skip");
+
+        assert!(state.trade_dust_skipped);
+        assert!(state.trade_dust_usd.unwrap_or_default() > 0.0);
+        assert!(state.trade_slices.is_empty());
+        assert!(matches!(state.step, CexStep::Withdraw));
+        let out = state.size_out.as_ref().expect("size_out should be set");
+        assert_eq!(out.to_f64(), 0.0);
+    }
+
+    #[tokio::test]
+    async fn mexc_trade_fails_when_realized_slice_slippage_exceeds_cap() {
+        let mut backend = MockCexBackend::new();
+        let transfers = MockTransferActions::new();
+
+        let ckbtc_btc = OrderBook {
+            bids: vec![OrderBookLevel {
+                price: 1.0,
+                quantity: 100.0,
+            }],
+            asks: vec![OrderBookLevel {
+                price: 1.001,
+                quantity: 100.0,
+            }],
+        };
+        let btc_usdc = OrderBook {
+            bids: vec![OrderBookLevel {
+                price: 69_000.0,
+                quantity: 100.0,
+            }],
+            asks: vec![OrderBookLevel {
+                price: 69_010.0,
+                quantity: 100.0,
+            }],
+        };
+
+        backend
+            .expect_get_orderbook()
+            .returning(move |market, _limit| match market {
+                "CKBTC_BTC" => Ok(ckbtc_btc.clone()),
+                "BTC_USDC" => Ok(btc_usdc.clone()),
+                _ => Err(format!("unexpected market {}", market)),
+            });
+
+        backend
+            .expect_execute_swap()
+            .times(1)
+            .returning(|_market, _side, amount_in| Ok(amount_in * 0.9));
+
+        let finalizer = MexcFinalizer::new(
+            Arc::new(backend),
+            Arc::new(transfers),
+            Principal::anonymous(),
+            // Keep cap tight so the 10% execution drift fails loudly.
+            50.0,
+            TEST_CEX_MIN_EXEC_USD,
+            TEST_CEX_SLICE_TARGET_RATIO,
+        );
+
+        let receipt = make_execution_receipt(42);
+        let mut state = finalizer.prepare("42", &receipt).await.expect("prepare should succeed");
+        state.step = CexStep::Trade;
+        state.withdraw_asset = ChainToken::Icp {
+            ledger: Principal::anonymous(),
+            symbol: "BTC".to_string(),
+            decimals: 8,
+            fee: Nat::from(1_000u64),
+        };
+
+        let err = finalizer
+            .trade(&mut state)
+            .await
+            .expect_err("trade should fail when realized slippage exceeds cap");
+
+        assert!(err.contains("slice slippage too high"));
+        assert!(
+            state
+                .last_error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("slice slippage too high")
+        );
+        assert!(matches!(state.step, CexStep::Trade));
+    }
+
+    #[tokio::test]
+    async fn mexc_trade_retries_current_leg_from_original_amount_after_mid_leg_error() {
+        let mut backend = MockCexBackend::new();
+        let transfers = MockTransferActions::new();
+
+        let ckbtc_btc = OrderBook {
+            bids: vec![OrderBookLevel {
+                price: 1.0,
+                quantity: 100.0,
+            }],
+            asks: vec![OrderBookLevel {
+                price: 1.001,
+                quantity: 100.0,
+            }],
+        };
+        let btc_usdc = OrderBook {
+            bids: vec![OrderBookLevel {
+                price: 69_000.0,
+                quantity: 100.0,
+            }],
+            asks: vec![OrderBookLevel {
+                price: 69_010.0,
+                quantity: 100.0,
+            }],
+        };
+
+        backend
+            .expect_get_orderbook()
+            .returning(move |market, _limit| match market {
+                "CKBTC_BTC" => Ok(ckbtc_btc.clone()),
+                "BTC_USDC" => Ok(btc_usdc.clone()),
+                _ => Err(format!("unexpected market {}", market)),
+            });
+
+        let call_count = Arc::new(std::sync::Mutex::new(0usize));
+        let seen_amounts = Arc::new(std::sync::Mutex::new(Vec::<f64>::new()));
+        let call_count_handle = call_count.clone();
+        let seen_amounts_handle = seen_amounts.clone();
+        backend
+            .expect_execute_swap()
+            .times(2)
+            .returning(move |_market, _side, amount_in| {
+                let mut idx = call_count_handle.lock().unwrap();
+                *idx += 1;
+                seen_amounts_handle.lock().unwrap().push(amount_in);
+                if *idx == 1 {
+                    // First attempt intentionally fails post-trade slippage check.
+                    Ok(amount_in * 0.95)
+                } else {
+                    Ok(amount_in * 0.999)
+                }
+            });
+
+        let finalizer = MexcFinalizer::new(
+            Arc::new(backend),
+            Arc::new(transfers),
+            Principal::anonymous(),
+            200.0,
+            TEST_CEX_MIN_EXEC_USD,
+            TEST_CEX_SLICE_TARGET_RATIO,
+        );
+
+        let receipt = make_execution_receipt(42);
+        let mut state = finalizer.prepare("42", &receipt).await.expect("prepare should succeed");
+        state.step = CexStep::Trade;
+        state.withdraw_asset = ChainToken::Icp {
+            ledger: Principal::anonymous(),
+            symbol: "BTC".to_string(),
+            decimals: 8,
+            fee: Nat::from(1_000u64),
+        };
+
+        let first_err = finalizer
+            .trade(&mut state)
+            .await
+            .expect_err("first trade attempt should fail on slippage");
+        assert!(first_err.contains("slice slippage too high"));
+        assert!(matches!(state.step, CexStep::Trade));
+
+        // Retry same state; this should replay from the original leg amount.
+        finalizer
+            .trade(&mut state)
+            .await
+            .expect("second trade attempt should succeed");
+
+        let amounts = seen_amounts.lock().unwrap();
+        assert_eq!(amounts.len(), 2);
+        assert!((amounts[0] - 0.01).abs() < 1e-12);
+        assert!((amounts[1] - 0.01).abs() < 1e-12);
+        assert!(matches!(state.step, CexStep::Withdraw));
+    }
+
+    #[tokio::test]
+    async fn mexc_trade_uses_resume_amount_when_trade_next_amount_in_is_present() {
+        let mut backend = MockCexBackend::new();
+        let transfers = MockTransferActions::new();
+
+        let ckbtc_btc = OrderBook {
+            bids: vec![OrderBookLevel {
+                price: 1.0,
+                quantity: 100.0,
+            }],
+            asks: vec![OrderBookLevel {
+                price: 1.001,
+                quantity: 100.0,
+            }],
+        };
+        let btc_usdc = OrderBook {
+            bids: vec![OrderBookLevel {
+                price: 69_000.0,
+                quantity: 100.0,
+            }],
+            asks: vec![OrderBookLevel {
+                price: 69_010.0,
+                quantity: 100.0,
+            }],
+        };
+
+        backend
+            .expect_get_orderbook()
+            .returning(move |market, _limit| match market {
+                "CKBTC_BTC" => Ok(ckbtc_btc.clone()),
+                "BTC_USDC" => Ok(btc_usdc.clone()),
+                _ => Err(format!("unexpected market {}", market)),
+            });
+
+        let seen = Arc::new(std::sync::Mutex::new(Vec::<f64>::new()));
+        let seen_handle = seen.clone();
+        backend
+            .expect_execute_swap()
+            .times(1)
+            .returning(move |_market, _side, amount_in| {
+                seen_handle.lock().unwrap().push(amount_in);
+                Ok(amount_in * 0.999)
+            });
+
+        let finalizer = MexcFinalizer::new(
+            Arc::new(backend),
+            Arc::new(transfers),
+            Principal::anonymous(),
+            TEST_MAX_SELL_SLIPPAGE_BPS,
+            TEST_CEX_MIN_EXEC_USD,
+            TEST_CEX_SLICE_TARGET_RATIO,
+        );
+
+        let receipt = make_execution_receipt(42);
+        let mut state = finalizer.prepare("42", &receipt).await.expect("prepare should succeed");
+        state.step = CexStep::Trade;
+        // Force a direct single-leg route: CKBTC -> BTC.
+        state.withdraw_asset = ChainToken::Icp {
+            ledger: Principal::anonymous(),
+            symbol: "BTC".to_string(),
+            decimals: 8,
+            fee: Nat::from(1_000u64),
+        };
+        state.trade_next_amount_in = Some(0.0042);
+
+        finalizer.trade(&mut state).await.expect("trade should succeed");
+
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        assert!((seen[0] - 0.0042).abs() < 1e-12);
+        assert!((state.trade_last_amount_in.unwrap_or_default() - 0.0042).abs() < 1e-12);
+        assert!(matches!(state.step, CexStep::Withdraw));
+    }
+
+    #[tokio::test]
+    async fn mexc_trade_when_leg_index_is_past_route_moves_to_withdraw_and_sets_size_out() {
+        let mut backend = MockCexBackend::new();
+        let transfers = MockTransferActions::new();
+
+        backend.expect_get_orderbook().times(0);
+        backend.expect_execute_swap().times(0);
+
+        let finalizer = MexcFinalizer::new(
+            Arc::new(backend),
+            Arc::new(transfers),
+            Principal::anonymous(),
+            TEST_MAX_SELL_SLIPPAGE_BPS,
+            TEST_CEX_MIN_EXEC_USD,
+            TEST_CEX_SLICE_TARGET_RATIO,
+        );
+
+        let receipt = make_execution_receipt(42);
+        let mut state = finalizer.prepare("42", &receipt).await.expect("prepare should succeed");
+        state.step = CexStep::Trade;
+        // Route for CKBTC -> CKUSDT has 4 legs, so this index is out-of-range.
+        state.trade_leg_index = Some(99);
+        state.trade_next_amount_in = Some(12.345678);
+
+        finalizer.trade(&mut state).await.expect("trade should short-circuit");
+
+        assert!(matches!(state.step, CexStep::Withdraw));
+        let out = state.size_out.as_ref().expect("size_out should be carried forward");
+        assert_eq!(out.token, state.withdraw_asset);
+        assert!((out.to_f64() - 12.345678).abs() < 1e-12);
+    }
+
+    #[tokio::test]
+    async fn mexc_trade_errors_when_direct_market_cannot_be_resolved() {
+        let mut backend = MockCexBackend::new();
+        let transfers = MockTransferActions::new();
+
+        let empty_book = OrderBook {
+            bids: vec![],
+            asks: vec![],
+        };
+
+        backend.expect_get_orderbook().times(2).returning(move |_market, _limit| Ok(empty_book.clone()));
+        backend.expect_execute_swap().times(0);
+
+        let finalizer = MexcFinalizer::new(
+            Arc::new(backend),
+            Arc::new(transfers),
+            Principal::anonymous(),
+            TEST_MAX_SELL_SLIPPAGE_BPS,
+            TEST_CEX_MIN_EXEC_USD,
+            TEST_CEX_SLICE_TARGET_RATIO,
+        );
+
+        let receipt = make_execution_receipt(42);
+        let mut state = finalizer.prepare("42", &receipt).await.expect("prepare should succeed");
+        state.step = CexStep::Trade;
+        // Force non-special pair so resolver must probe direct books.
+        state.deposit_asset = ChainToken::Icp {
+            ledger: Principal::anonymous(),
+            symbol: "BTC".to_string(),
+            decimals: 8,
+            fee: Nat::from(1_000u64),
+        };
+        state.withdraw_asset = ChainToken::Icp {
+            ledger: Principal::anonymous(),
+            symbol: "ETH".to_string(),
+            decimals: 8,
+            fee: Nat::from(1_000u64),
+        };
+        state.size_in = ChainTokenAmount::from_formatted(state.deposit_asset.clone(), 0.01);
+
+        let err = finalizer
+            .trade(&mut state)
+            .await
+            .expect_err("trade should fail when no direct leg can be resolved");
+
+        assert!(err.contains("could not resolve direct market"));
+        assert!(matches!(state.step, CexStep::Trade));
+    }
+
+    #[tokio::test]
+    async fn mexc_preview_trade_slice_sell_binary_search_finds_largest_chunk_under_target() {
+        let mut backend = MockCexBackend::new();
+        let transfers = MockTransferActions::new();
+
+        // Threshold shape:
+        // - up to 1.0 base filled at 100
+        // - remainder filled at 90
+        // For target=500 bps, largest valid chunk is ~2.0.
+        let orderbook = OrderBook {
+            bids: vec![
+                OrderBookLevel {
+                    price: 100.0,
+                    quantity: 1.0,
+                },
+                OrderBookLevel {
+                    price: 90.0,
+                    quantity: 10.0,
+                },
+            ],
+            asks: vec![],
+        };
+
+        backend
+            .expect_get_orderbook()
+            .times(1)
+            .returning(move |_market, _limit| Ok(orderbook.clone()));
+
+        let finalizer = MexcFinalizer::new(
+            Arc::new(backend),
+            Arc::new(transfers),
+            Principal::anonymous(),
+            2_000.0,
+            TEST_CEX_MIN_EXEC_USD,
+            TEST_CEX_SLICE_TARGET_RATIO,
+        );
+
+        let leg = TradeLeg {
+            market: "BTC_USDC".to_string(),
+            side: "sell".to_string(),
+        };
+
+        let preview = finalizer
+            .preview_trade_slice(&leg, 3.0, 500.0)
+            .await
+            .expect("sell preview should succeed");
+
+        assert!((preview.chunk_in - 2.0).abs() < 0.01);
+        assert!(preview.preview_impact_bps <= 500.0 + 0.01);
+        assert!(preview.preview_impact_bps > 450.0);
+    }
+
+    #[tokio::test]
+    async fn mexc_preview_trade_slice_buy_binary_search_finds_largest_chunk_under_target() {
+        let mut backend = MockCexBackend::new();
+        let transfers = MockTransferActions::new();
+
+        // Threshold shape:
+        // - first 100 quote buys at 100
+        // - remaining quote buys at 120
+        // For target=500 bps, largest valid chunk is ~140 quote.
+        let orderbook = OrderBook {
+            bids: vec![],
+            asks: vec![
+                OrderBookLevel {
+                    price: 100.0,
+                    quantity: 1.0,
+                },
+                OrderBookLevel {
+                    price: 120.0,
+                    quantity: 10.0,
+                },
+            ],
+        };
+
+        backend
+            .expect_get_orderbook()
+            .times(1)
+            .returning(move |_market, _limit| Ok(orderbook.clone()));
+
+        let finalizer = MexcFinalizer::new(
+            Arc::new(backend),
+            Arc::new(transfers),
+            Principal::anonymous(),
+            2_000.0,
+            TEST_CEX_MIN_EXEC_USD,
+            TEST_CEX_SLICE_TARGET_RATIO,
+        );
+
+        let leg = TradeLeg {
+            market: "CKUSDT_USDT".to_string(),
+            side: "buy".to_string(),
+        };
+
+        let preview = finalizer
+            .preview_trade_slice(&leg, 240.0, 500.0)
+            .await
+            .expect("buy preview should succeed");
+
+        assert!((preview.chunk_in - 140.0).abs() < 0.05);
+        assert!(preview.preview_impact_bps <= 500.0 + 0.01);
+        assert!(preview.preview_impact_bps > 450.0);
+    }
+
+    #[tokio::test]
+    async fn mexc_preview_trade_slice_sell_fallback_uses_full_remaining_when_hard_cap_allows() {
+        let mut backend = MockCexBackend::new();
+        let transfers = MockTransferActions::new();
+
+        // First level has zero quantity at better price, so any positive amount fills at 90
+        // while best bid is still 100, forcing 1000 bps impact for all >0 chunks.
+        let orderbook = OrderBook {
+            bids: vec![
+                OrderBookLevel {
+                    price: 100.0,
+                    quantity: 0.0,
+                },
+                OrderBookLevel {
+                    price: 90.0,
+                    quantity: 10.0,
+                },
+            ],
+            asks: vec![],
+        };
+
+        backend
+            .expect_get_orderbook()
+            .times(1)
+            .returning(move |_market, _limit| Ok(orderbook.clone()));
+
+        let finalizer = MexcFinalizer::new(
+            Arc::new(backend),
+            Arc::new(transfers),
+            Principal::anonymous(),
+            1_500.0,
+            TEST_CEX_MIN_EXEC_USD,
+            TEST_CEX_SLICE_TARGET_RATIO,
+        );
+
+        let leg = TradeLeg {
+            market: "BTC_USDC".to_string(),
+            side: "sell".to_string(),
+        };
+
+        // target=0 makes binary search return ~0 chunk; fallback should allow full remaining
+        // because hard cap (1500 bps) is above realized impact (1000 bps).
+        let preview = finalizer
+            .preview_trade_slice(&leg, 1.0, 0.0)
+            .await
+            .expect("fallback should allow full remaining");
+
+        assert!((preview.chunk_in - 1.0).abs() < 1e-12);
+        assert!((preview.preview_impact_bps - 1_000.0).abs() < 1e-6);
+    }
+
+    #[tokio::test]
+    async fn mexc_preview_trade_slice_sell_fallback_errors_when_hard_cap_rejects() {
+        let mut backend = MockCexBackend::new();
+        let transfers = MockTransferActions::new();
+
+        let orderbook = OrderBook {
+            bids: vec![
+                OrderBookLevel {
+                    price: 100.0,
+                    quantity: 0.0,
+                },
+                OrderBookLevel {
+                    price: 90.0,
+                    quantity: 10.0,
+                },
+            ],
+            asks: vec![],
+        };
+
+        backend
+            .expect_get_orderbook()
+            .times(1)
+            .returning(move |_market, _limit| Ok(orderbook.clone()));
+
+        let finalizer = MexcFinalizer::new(
+            Arc::new(backend),
+            Arc::new(transfers),
+            Principal::anonymous(),
+            500.0,
+            TEST_CEX_MIN_EXEC_USD,
+            TEST_CEX_SLICE_TARGET_RATIO,
+        );
+
+        let leg = TradeLeg {
+            market: "BTC_USDC".to_string(),
+            side: "sell".to_string(),
+        };
+
+        let err = finalizer
+            .preview_trade_slice(&leg, 1.0, 0.0)
+            .await
+            .expect_err("fallback should reject when hard cap is breached");
+
+        assert!(err.contains("cannot find sell chunk under impact target"));
+    }
+
+    #[tokio::test]
+    async fn mexc_preview_trade_slice_buy_fallback_uses_full_remaining_when_hard_cap_allows() {
+        let mut backend = MockCexBackend::new();
+        let transfers = MockTransferActions::new();
+
+        // Mirror of sell fallback shape on ask side: best ask at 100 with zero quantity,
+        // actual fills at 120 -> 2000 bps impact for any positive buy chunk.
+        let orderbook = OrderBook {
+            bids: vec![],
+            asks: vec![
+                OrderBookLevel {
+                    price: 100.0,
+                    quantity: 0.0,
+                },
+                OrderBookLevel {
+                    price: 120.0,
+                    quantity: 10.0,
+                },
+            ],
+        };
+
+        backend
+            .expect_get_orderbook()
+            .times(1)
+            .returning(move |_market, _limit| Ok(orderbook.clone()));
+
+        let finalizer = MexcFinalizer::new(
+            Arc::new(backend),
+            Arc::new(transfers),
+            Principal::anonymous(),
+            2_500.0,
+            TEST_CEX_MIN_EXEC_USD,
+            TEST_CEX_SLICE_TARGET_RATIO,
+        );
+
+        let leg = TradeLeg {
+            market: "CKUSDT_USDT".to_string(),
+            side: "buy".to_string(),
+        };
+
+        let preview = finalizer
+            .preview_trade_slice(&leg, 120.0, 0.0)
+            .await
+            .expect("buy fallback should allow full remaining");
+
+        assert!((preview.chunk_in - 120.0).abs() < 1e-12);
+        assert!((preview.preview_impact_bps - 2_000.0).abs() < 1e-6);
+    }
+
+    #[tokio::test]
+    async fn mexc_preview_trade_slice_buy_fallback_errors_when_hard_cap_rejects() {
+        let mut backend = MockCexBackend::new();
+        let transfers = MockTransferActions::new();
+
+        let orderbook = OrderBook {
+            bids: vec![],
+            asks: vec![
+                OrderBookLevel {
+                    price: 100.0,
+                    quantity: 0.0,
+                },
+                OrderBookLevel {
+                    price: 120.0,
+                    quantity: 10.0,
+                },
+            ],
+        };
+
+        backend
+            .expect_get_orderbook()
+            .times(1)
+            .returning(move |_market, _limit| Ok(orderbook.clone()));
+
+        let finalizer = MexcFinalizer::new(
+            Arc::new(backend),
+            Arc::new(transfers),
+            Principal::anonymous(),
+            500.0,
+            TEST_CEX_MIN_EXEC_USD,
+            TEST_CEX_SLICE_TARGET_RATIO,
+        );
+
+        let leg = TradeLeg {
+            market: "CKUSDT_USDT".to_string(),
+            side: "buy".to_string(),
+        };
+
+        let err = finalizer
+            .preview_trade_slice(&leg, 120.0, 0.0)
+            .await
+            .expect_err("buy fallback should reject when hard cap is breached");
+
+        assert!(err.contains("cannot find buy chunk under impact target"));
     }
 
     #[tokio::test]
@@ -1230,6 +1787,8 @@ mod tests {
             transfer_service,
             Principal::anonymous(),
             TEST_MAX_SELL_SLIPPAGE_BPS,
+            TEST_CEX_MIN_EXEC_USD,
+            TEST_CEX_SLICE_TARGET_RATIO,
         );
 
         let receipt = make_execution_receipt(42);
@@ -1263,6 +1822,8 @@ mod tests {
             transfer_service,
             Principal::anonymous(),
             TEST_MAX_SELL_SLIPPAGE_BPS,
+            TEST_CEX_MIN_EXEC_USD,
+            TEST_CEX_SLICE_TARGET_RATIO,
         );
 
         let receipt = make_execution_receipt(42);
@@ -1284,7 +1845,14 @@ mod tests {
         let backend = Arc::new(MockCexBackend::new());
         let transfers = Arc::new(MockTransferActions::new());
 
-        let finalizer = MexcFinalizer::new(backend, transfers, Principal::anonymous(), TEST_MAX_SELL_SLIPPAGE_BPS);
+        let finalizer = MexcFinalizer::new(
+            backend,
+            transfers,
+            Principal::anonymous(),
+            TEST_MAX_SELL_SLIPPAGE_BPS,
+            TEST_CEX_MIN_EXEC_USD,
+            TEST_CEX_SLICE_TARGET_RATIO,
+        );
 
         let receipt = make_execution_receipt(42);
         let mut state = finalizer.prepare("42", &receipt).await.expect("prepare should succeed");
@@ -1319,5 +1887,392 @@ mod tests {
         // Status and legs should reflect a single synthetic CEX hop.
         assert_eq!(swap.status, "completed".to_string());
         assert!(swap.legs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn mexc_preview_route_returns_non_executable_for_zero_amount() {
+        let backend = Arc::new(MockCexBackend::new());
+        let transfers = Arc::new(MockTransferActions::new());
+        let finalizer = MexcFinalizer::new(
+            backend,
+            transfers,
+            Principal::anonymous(),
+            TEST_MAX_SELL_SLIPPAGE_BPS,
+            TEST_CEX_MIN_EXEC_USD,
+            TEST_CEX_SLICE_TARGET_RATIO,
+        );
+
+        let mut receipt = make_execution_receipt(42);
+        if let Some(liq) = receipt.liquidation_result.as_mut() {
+            liq.amounts.collateral_received = Nat::from(0u8);
+        }
+
+        let preview = finalizer.preview_route(&receipt).await.expect("preview should succeed");
+        assert!(!preview.is_executable);
+        assert_eq!(preview.estimated_receive_amount, 0.0);
+        assert_eq!(preview.estimated_slippage_bps, 0.0);
+        assert_eq!(preview.reason.as_deref(), Some("non-positive amount_in"));
+    }
+
+    #[tokio::test]
+    async fn mexc_preview_route_resolves_direct_buy_leg_when_sell_book_empty() {
+        let mut backend = MockCexBackend::new();
+        let transfers = MockTransferActions::new();
+
+        // Direct sell market BTC_CKBTC has no bids -> resolver should choose buy market CKBTC_BTC.
+        let btc_ckbtc = OrderBook {
+            bids: vec![],
+            asks: vec![],
+        };
+        let ckbtc_btc = OrderBook {
+            bids: vec![],
+            asks: vec![OrderBookLevel {
+                price: 1.0,
+                quantity: 10.0,
+            }],
+        };
+        let btc_usdc = OrderBook {
+            bids: vec![OrderBookLevel {
+                price: 69_000.0,
+                quantity: 10.0,
+            }],
+            asks: vec![OrderBookLevel {
+                price: 69_010.0,
+                quantity: 10.0,
+            }],
+        };
+
+        backend.expect_get_orderbook().returning(move |market, _limit| match market {
+            "BTC_CKBTC" => Ok(btc_ckbtc.clone()),
+            "CKBTC_BTC" => Ok(ckbtc_btc.clone()),
+            "BTC_USDC" => Ok(btc_usdc.clone()),
+            _ => Err(format!("unexpected market {}", market)),
+        });
+
+        let finalizer = MexcFinalizer::new(
+            Arc::new(backend),
+            Arc::new(transfers),
+            Principal::anonymous(),
+            TEST_MAX_SELL_SLIPPAGE_BPS,
+            TEST_CEX_MIN_EXEC_USD,
+            TEST_CEX_SLICE_TARGET_RATIO,
+        );
+
+        let mut receipt = make_execution_receipt(42);
+        receipt.request.collateral_asset = ChainToken::Icp {
+            ledger: Principal::anonymous(),
+            symbol: "BTC".to_string(),
+            decimals: 8,
+            fee: Nat::from(1_000u64),
+        };
+        receipt.request.debt_asset = ChainToken::Icp {
+            ledger: Principal::anonymous(),
+            symbol: "ckBTC".to_string(),
+            decimals: 8,
+            fee: Nat::from(1_000u64),
+        };
+
+        let preview = finalizer.preview_route(&receipt).await.expect("preview should succeed");
+        assert!(preview.is_executable);
+        assert!(preview.estimated_receive_amount > 0.0);
+        assert!(preview.estimated_slippage_bps >= 0.0);
+    }
+
+    mod fuzz {
+        use super::*;
+
+        proptest! {
+            #[test]
+            fn prop_trade_single_leg_success_invariants(
+                amount_sats in 1_000u64..=2_000_000u64,
+                btc_usd in 20_000u64..=120_000u64,
+                exec_loss_bps in 0u64..=80u64
+            ) {
+                let rt = tokio::runtime::Runtime::new().unwrap();
+                rt.block_on(async move {
+                    let mut backend = MockCexBackend::new();
+                    let transfers = MockTransferActions::new();
+
+                    let ckbtc_btc_book = OrderBook {
+                        bids: vec![OrderBookLevel { price: 1.0, quantity: 100.0 }],
+                        asks: vec![OrderBookLevel { price: 1.001, quantity: 100.0 }],
+                    };
+                    let btc_usdc_book = OrderBook {
+                        bids: vec![OrderBookLevel { price: btc_usd as f64, quantity: 1000.0 }],
+                        asks: vec![OrderBookLevel { price: btc_usd as f64 + 1.0, quantity: 1000.0 }],
+                    };
+
+                    backend.expect_get_orderbook().returning(move |market, _limit| match market {
+                        "CKBTC_BTC" => Ok(ckbtc_btc_book.clone()),
+                        "BTC_USDC" => Ok(btc_usdc_book.clone()),
+                        _ => Err(format!("unexpected market {}", market)),
+                    });
+
+                    let factor = 1.0 - (exec_loss_bps as f64 / 10_000.0);
+                    backend.expect_execute_swap().times(1).returning(move |_market, _side, amount_in| {
+                        Ok(amount_in * factor)
+                    });
+
+                    let finalizer = MexcFinalizer::new(
+                        Arc::new(backend),
+                        Arc::new(transfers),
+                        Principal::anonymous(),
+                        200.0,
+                        TEST_CEX_MIN_EXEC_USD,
+                        TEST_CEX_SLICE_TARGET_RATIO,
+                    );
+
+                    let mut receipt = make_execution_receipt(42);
+                    if let Some(liq) = receipt.liquidation_result.as_mut() {
+                        liq.amounts.collateral_received = Nat::from(amount_sats);
+                    }
+
+                    let mut state = finalizer.prepare("42", &receipt).await.expect("prepare should succeed");
+                    state.step = CexStep::Trade;
+                    // Force single leg CKBTC->BTC for deterministic fuzz invariants.
+                    state.withdraw_asset = ChainToken::Icp {
+                        ledger: Principal::anonymous(),
+                        symbol: "BTC".to_string(),
+                        decimals: 8,
+                        fee: Nat::from(1_000u64),
+                    };
+
+                    finalizer.trade(&mut state).await.expect("trade should succeed");
+
+                    let input = amount_sats as f64 / 100_000_000.0;
+                    let output = state.size_out.as_ref().expect("size_out must exist").to_f64();
+
+                    assert!(matches!(state.step, CexStep::Withdraw));
+                    assert_eq!(state.trade_slices.len(), 1);
+                    assert!(output > 0.0);
+                    assert!(output <= input + 1e-12);
+                    assert!(state.last_error.is_none());
+                });
+            }
+
+            #[test]
+            fn prop_trade_single_leg_slippage_breach_sets_error(
+                amount_sats in 1_000u64..=2_000_000u64,
+                exec_loss_bps in 250u64..=1500u64
+            ) {
+                let rt = tokio::runtime::Runtime::new().unwrap();
+                rt.block_on(async move {
+                    let mut backend = MockCexBackend::new();
+                    let transfers = MockTransferActions::new();
+
+                    let ckbtc_btc_book = OrderBook {
+                        bids: vec![OrderBookLevel { price: 1.0, quantity: 100.0 }],
+                        asks: vec![OrderBookLevel { price: 1.001, quantity: 100.0 }],
+                    };
+                    let btc_usdc_book = OrderBook {
+                        bids: vec![OrderBookLevel { price: 69_000.0, quantity: 1000.0 }],
+                        asks: vec![OrderBookLevel { price: 69_010.0, quantity: 1000.0 }],
+                    };
+
+                    backend.expect_get_orderbook().returning(move |market, _limit| match market {
+                        "CKBTC_BTC" => Ok(ckbtc_btc_book.clone()),
+                        "BTC_USDC" => Ok(btc_usdc_book.clone()),
+                        _ => Err(format!("unexpected market {}", market)),
+                    });
+
+                    let factor = 1.0 - (exec_loss_bps as f64 / 10_000.0);
+                    backend.expect_execute_swap().times(1).returning(move |_market, _side, amount_in| {
+                        Ok(amount_in * factor)
+                    });
+
+                    let finalizer = MexcFinalizer::new(
+                        Arc::new(backend),
+                        Arc::new(transfers),
+                        Principal::anonymous(),
+                        200.0,
+                        TEST_CEX_MIN_EXEC_USD,
+                        TEST_CEX_SLICE_TARGET_RATIO,
+                    );
+
+                    let mut receipt = make_execution_receipt(42);
+                    if let Some(liq) = receipt.liquidation_result.as_mut() {
+                        liq.amounts.collateral_received = Nat::from(amount_sats);
+                    }
+
+                    let mut state = finalizer.prepare("42", &receipt).await.expect("prepare should succeed");
+                    state.step = CexStep::Trade;
+                    state.withdraw_asset = ChainToken::Icp {
+                        ledger: Principal::anonymous(),
+                        symbol: "BTC".to_string(),
+                        decimals: 8,
+                        fee: Nat::from(1_000u64),
+                    };
+
+                    let err = finalizer.trade(&mut state).await.expect_err("trade should fail");
+                    assert!(err.contains("slice slippage too high"));
+                    assert!(matches!(state.step, CexStep::Trade));
+                    assert!(state
+                        .last_error
+                        .as_deref()
+                        .unwrap_or_default()
+                        .contains("slice slippage too high"));
+                });
+            }
+
+            #[test]
+            fn prop_trade_single_leg_multi_slice_progresses(
+                first_level_sat in 50_000u64..=300_000u64,
+                multiplier in 3u64..=8u64,
+                exec_loss_bps in 0u64..=20u64
+            ) {
+                // Remaining amount is 3x..8x first-level depth, which should require multiple
+                // slices under the configured target.
+                let total_sats = first_level_sat * multiplier;
+                let q1 = first_level_sat as f64 / 100_000_000.0;
+                let total_btc = total_sats as f64 / 100_000_000.0;
+
+                let rt = tokio::runtime::Runtime::new().unwrap();
+                rt.block_on(async move {
+                    let mut backend = MockCexBackend::new();
+                    let transfers = MockTransferActions::new();
+
+                    let ckbtc_btc_book = OrderBook {
+                        bids: vec![
+                            OrderBookLevel { price: 1.0, quantity: q1 },
+                            OrderBookLevel { price: 0.99, quantity: 10.0 },
+                        ],
+                        asks: vec![OrderBookLevel { price: 1.001, quantity: 10.0 }],
+                    };
+                    let btc_usdc_book = OrderBook {
+                        bids: vec![OrderBookLevel { price: 69_000.0, quantity: 1000.0 }],
+                        asks: vec![OrderBookLevel { price: 69_010.0, quantity: 1000.0 }],
+                    };
+
+                    backend.expect_get_orderbook().returning(move |market, _limit| match market {
+                        "CKBTC_BTC" => Ok(ckbtc_btc_book.clone()),
+                        "BTC_USDC" => Ok(btc_usdc_book.clone()),
+                        _ => Err(format!("unexpected market {}", market)),
+                    });
+
+                    let calls = Arc::new(std::sync::Mutex::new(0usize));
+                    let calls_handle = calls.clone();
+                    let factor = 1.0 - (exec_loss_bps as f64 / 10_000.0);
+                    backend.expect_execute_swap().returning(move |_market, _side, amount_in| {
+                        *calls_handle.lock().unwrap() += 1;
+                        Ok(amount_in * factor)
+                    });
+
+                    let finalizer = MexcFinalizer::new(
+                        Arc::new(backend),
+                        Arc::new(transfers),
+                        Principal::anonymous(),
+                        200.0,
+                        TEST_CEX_MIN_EXEC_USD,
+                        // target=50 bps when max=200 bps, forcing chunking on this two-level book.
+                        0.25,
+                    );
+
+                    let mut receipt = make_execution_receipt(42);
+                    if let Some(liq) = receipt.liquidation_result.as_mut() {
+                        liq.amounts.collateral_received = Nat::from(total_sats);
+                    }
+
+                    let mut state = finalizer.prepare("42", &receipt).await.expect("prepare should succeed");
+                    state.step = CexStep::Trade;
+                    state.withdraw_asset = ChainToken::Icp {
+                        ledger: Principal::anonymous(),
+                        symbol: "BTC".to_string(),
+                        decimals: 8,
+                        fee: Nat::from(1_000u64),
+                    };
+
+                    finalizer.trade(&mut state).await.expect("trade should succeed");
+
+                    let call_count = *calls.lock().unwrap();
+                    assert!(call_count > 1);
+                    assert!(state.trade_slices.len() > 1);
+                    assert!(matches!(state.step, CexStep::Withdraw));
+                    assert!(state.size_out.as_ref().unwrap().to_f64() > 0.0);
+                    assert!(state.size_out.as_ref().unwrap().to_f64() <= total_btc + 1e-12);
+                });
+            }
+
+            #[test]
+            fn prop_trade_retry_replays_same_leg_input_after_first_failure(
+                amount_sats in 1_000u64..=2_000_000u64,
+                failing_loss_bps in 250u64..=2_000u64,
+                recovery_loss_bps in 0u64..=80u64
+            ) {
+                let rt = tokio::runtime::Runtime::new().unwrap();
+                rt.block_on(async move {
+                    let mut backend = MockCexBackend::new();
+                    let transfers = MockTransferActions::new();
+
+                    let ckbtc_btc_book = OrderBook {
+                        bids: vec![OrderBookLevel { price: 1.0, quantity: 100.0 }],
+                        asks: vec![OrderBookLevel { price: 1.001, quantity: 100.0 }],
+                    };
+                    let btc_usdc_book = OrderBook {
+                        bids: vec![OrderBookLevel { price: 69_000.0, quantity: 1000.0 }],
+                        asks: vec![OrderBookLevel { price: 69_010.0, quantity: 1000.0 }],
+                    };
+
+                    backend.expect_get_orderbook().returning(move |market, _limit| match market {
+                        "CKBTC_BTC" => Ok(ckbtc_btc_book.clone()),
+                        "BTC_USDC" => Ok(btc_usdc_book.clone()),
+                        _ => Err(format!("unexpected market {}", market)),
+                    });
+
+                    let call_count = Arc::new(std::sync::Mutex::new(0usize));
+                    let seen_amounts = Arc::new(std::sync::Mutex::new(Vec::<f64>::new()));
+                    let call_count_handle = call_count.clone();
+                    let seen_amounts_handle = seen_amounts.clone();
+                    let fail_factor = 1.0 - (failing_loss_bps as f64 / 10_000.0);
+                    let recovery_factor = 1.0 - (recovery_loss_bps as f64 / 10_000.0);
+                    backend.expect_execute_swap().times(2).returning(move |_market, _side, amount_in| {
+                        let mut idx = call_count_handle.lock().unwrap();
+                        seen_amounts_handle.lock().unwrap().push(amount_in);
+                        let out = if *idx == 0 {
+                            amount_in * fail_factor
+                        } else {
+                            amount_in * recovery_factor
+                        };
+                        *idx += 1;
+                        Ok(out)
+                    });
+
+                    let finalizer = MexcFinalizer::new(
+                        Arc::new(backend),
+                        Arc::new(transfers),
+                        Principal::anonymous(),
+                        200.0,
+                        TEST_CEX_MIN_EXEC_USD,
+                        TEST_CEX_SLICE_TARGET_RATIO,
+                    );
+
+                    let mut receipt = make_execution_receipt(42);
+                    if let Some(liq) = receipt.liquidation_result.as_mut() {
+                        liq.amounts.collateral_received = Nat::from(amount_sats);
+                    }
+
+                    let mut state = finalizer.prepare("42", &receipt).await.expect("prepare should succeed");
+                    state.step = CexStep::Trade;
+                    // Force single-leg route for deterministic retry assertions.
+                    state.withdraw_asset = ChainToken::Icp {
+                        ledger: Principal::anonymous(),
+                        symbol: "BTC".to_string(),
+                        decimals: 8,
+                        fee: Nat::from(1_000u64),
+                    };
+
+                    let first = finalizer.trade(&mut state).await.expect_err("first attempt should fail");
+                    assert!(first.contains("slice slippage too high"));
+                    assert!(matches!(state.step, CexStep::Trade));
+
+                    finalizer.trade(&mut state).await.expect("second attempt should recover");
+
+                    let seen = seen_amounts.lock().unwrap();
+                    assert_eq!(seen.len(), 2);
+                    assert!((seen[0] - seen[1]).abs() < 1e-12);
+                    assert!(matches!(state.step, CexStep::Withdraw));
+                    assert!(state.size_out.as_ref().unwrap().to_f64() > 0.0);
+                });
+            }
+        }
     }
 }
