@@ -69,6 +69,14 @@ impl std::fmt::Display for PipelineContextError {
 
 impl std::error::Error for PipelineContextError {}
 
+fn should_fallback_to_empty_registry(err: &PipelineContextError) -> bool {
+    matches!(
+        err,
+        PipelineContextError::RegistryLoad(RegistryLoadError::MissingIcpDecimals { .. })
+            | PipelineContextError::RegistryLoad(RegistryLoadError::MissingIcpFee { .. })
+    )
+}
+
 impl<P: Provider<AnyNetwork> + WalletProvider<AnyNetwork> + Clone + 'static> PipelineContextBuilder<P> {
     pub async fn new() -> Result<Self, String> {
         let config = Config::load().await.map_err(|e| format!("config load failed: {e}"))?;
@@ -322,29 +330,100 @@ pub async fn init_context_best_effort() -> Result<PipelineContext, String> {
 
     match builder.build_with_registry_override(None).await {
         Ok(ctx) => Ok(ctx),
-        Err(err) => match err {
-            PipelineContextError::RegistryLoad(RegistryLoadError::MissingIcpDecimals { .. })
-            | PipelineContextError::RegistryLoad(RegistryLoadError::MissingIcpFee { .. }) => {
-                warn!(
-                    "Token registry load failed ({}). Starting TUI with empty registry.",
-                    err
-                );
-                let mut fallback = PipelineContextBuilder::new().await?;
-                let config = fallback.config.clone();
-                let (agent_main, agent_trader, main_provider) = setup_agents_and_provider(&config)?;
+        Err(err) if should_fallback_to_empty_registry(&err) => {
+            warn!(
+                "Token registry load failed ({}). Starting TUI with empty registry.",
+                err
+            );
+            let mut fallback = PipelineContextBuilder::new().await?;
+            let config = fallback.config.clone();
+            let (agent_main, agent_trader, main_provider) = setup_agents_and_provider(&config)?;
 
-                fallback = fallback
-                    .with_main_ic_agent(agent_main)
-                    .with_trader_ic_agent(agent_trader)
-                    .with_main_evm_provider(main_provider);
+            fallback = fallback
+                .with_main_ic_agent(agent_main)
+                .with_trader_ic_agent(agent_trader)
+                .with_main_evm_provider(main_provider);
 
-                let empty_registry = TokenRegistry::new(HashMap::new());
-                fallback
-                    .build_with_registry_override(Some(empty_registry))
-                    .await
-                    .map_err(|err| err.to_string())
-            }
-            PipelineContextError::RegistryLoad(_) | PipelineContextError::Other(_) => Err(err.to_string()),
-        },
+            let empty_registry = TokenRegistry::new(HashMap::new());
+            fallback
+                .build_with_registry_override(Some(empty_registry))
+                .await
+                .map_err(|err| err.to_string())
+        }
+        Err(err) => Err(err.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use alloy::signers::local::PrivateKeySigner;
+    use candid::Principal;
+    use ic_agent::identity::AnonymousIdentity;
+
+    use super::*;
+
+    fn test_config() -> Arc<Config> {
+        Arc::new(Config {
+            liquidator_identity: Arc::new(AnonymousIdentity {}),
+            trader_identity: Arc::new(AnonymousIdentity {}),
+            liquidator_principal: Principal::from_text("aaaaa-aa").expect("principal"),
+            trader_principal: Principal::from_text("2vxsx-fae").expect("principal"),
+            ic_url: "http://localhost:4943".to_string(),
+            evm_rpc_url: "http://localhost:8545".to_string(),
+            evm_private_key: "0x59c6995e998f97a5a0044966f0945382d7f0f5d5f7cd4c95b2f5f7f6c8c6f8de".to_string(),
+            lending_canister: Principal::from_text("aaaaa-aa").expect("principal"),
+            export_path: "executions.csv".to_string(),
+            buy_bad_debt: false,
+            db_path: "wal.db".to_string(),
+            max_allowed_dex_slippage: 125,
+            max_allowed_cex_slippage_bps: 200,
+            swapper: crate::config::SwapperMode::Hybrid,
+            cex_credentials: HashMap::new(),
+            opportunity_account_filter: vec![],
+        })
+    }
+
+    #[test]
+    fn fallback_classifies_registry_errors() {
+        let missing_decimals = PipelineContextError::RegistryLoad(RegistryLoadError::MissingIcpDecimals {
+            spec: "icp:aaaaa-aa:ICP".to_string(),
+            source: "boom".to_string(),
+        });
+        let missing_fee = PipelineContextError::RegistryLoad(RegistryLoadError::MissingIcpFee {
+            spec: "icp:aaaaa-aa:ICP".to_string(),
+            source: "boom".to_string(),
+        });
+        let other_registry = PipelineContextError::RegistryLoad(RegistryLoadError::Other("other".to_string()));
+        let other = PipelineContextError::Other("other".to_string());
+
+        assert!(should_fallback_to_empty_registry(&missing_decimals));
+        assert!(should_fallback_to_empty_registry(&missing_fee));
+        assert!(!should_fallback_to_empty_registry(&other_registry));
+        assert!(!should_fallback_to_empty_registry(&other));
+    }
+
+    #[tokio::test]
+    async fn build_stringifies_typed_internal_errors() {
+        let signer: PrivateKeySigner =
+            "0x59c6995e998f97a5a0044966f0945382d7f0f5d5f7cd4c95b2f5f7f6c8c6f8de".parse().expect("signer");
+        let provider = ProviderBuilder::new()
+            .network::<AnyNetwork>()
+            .wallet(signer)
+            .connect_mocked_client(alloy::transports::mock::Asserter::new());
+
+        let builder = PipelineContextBuilder {
+            config: test_config(),
+            evm_provider_main: Some(provider),
+            ic_agent_main: None,
+            ic_agent_trader: None,
+        };
+
+        let err = match builder.build().await {
+            Ok(_) => panic!("expected error"),
+            Err(err) => err,
+        };
+        assert_eq!(err, "missing IC Main Agent");
     }
 }

@@ -174,3 +174,143 @@ where
 
     Ok(TokenRegistry::with_roles(tokens, collateral_ids, debt_ids))
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use candid::Nat;
+
+    use super::{RegistryLoadError, load_token_registry};
+    use crate::backend::evm_backend::MockEvmBackend;
+    use crate::backend::icp_backend::MockIcpBackend;
+    use liquidium_pipeline_core::tokens::token_registry::TokenRegistryTrait;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    struct EnvGuard {
+        debt_prev: Option<String>,
+        coll_prev: Option<String>,
+    }
+
+    impl EnvGuard {
+        fn set(debt: &str, coll: &str) -> Self {
+            let debt_prev = std::env::var("DEBT_ASSETS").ok();
+            let coll_prev = std::env::var("COLLATERAL_ASSETS").ok();
+            // SAFETY: tests are serialized with ENV_LOCK and values are valid UTF-8.
+            unsafe {
+                std::env::set_var("DEBT_ASSETS", debt);
+                std::env::set_var("COLLATERAL_ASSETS", coll);
+            }
+            Self {
+                debt_prev,
+                coll_prev,
+            }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            // SAFETY: tests are serialized with ENV_LOCK and values are valid UTF-8.
+            unsafe {
+                match &self.debt_prev {
+                    Some(v) => std::env::set_var("DEBT_ASSETS", v),
+                    None => std::env::remove_var("DEBT_ASSETS"),
+                }
+                match &self.coll_prev {
+                    Some(v) => std::env::set_var("COLLATERAL_ASSETS", v),
+                    None => std::env::remove_var("COLLATERAL_ASSETS"),
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn decimals_error_maps_to_missing_icp_decimals() {
+        let _lock = ENV_LOCK.lock().expect("lock");
+        let _env = EnvGuard::set("icp:aaaaa-aa:ICP", "icp:aaaaa-aa:ICP");
+
+        let mut icp = MockIcpBackend::new();
+        icp.expect_icrc1_decimals()
+            .returning(|_| Err("decimals-failed".to_string()));
+
+        let evm = MockEvmBackend::new();
+
+        let err = load_token_registry(Arc::new(icp), Arc::new(evm))
+            .await
+            .expect_err("expected error");
+
+        match err {
+            RegistryLoadError::MissingIcpDecimals { spec, source } => {
+                assert_eq!(spec, "icp:aaaaa-aa:ICP");
+                assert_eq!(source, "decimals-failed");
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn fee_error_maps_to_missing_icp_fee() {
+        let _lock = ENV_LOCK.lock().expect("lock");
+        let _env = EnvGuard::set("icp:aaaaa-aa:ICP", "icp:aaaaa-aa:ICP");
+
+        let mut icp = MockIcpBackend::new();
+        icp.expect_icrc1_decimals().returning(|_| Ok(8));
+        icp.expect_icrc1_fee()
+            .returning(|_| Err("fee-failed".to_string()));
+
+        let evm = MockEvmBackend::new();
+
+        let err = load_token_registry(Arc::new(icp), Arc::new(evm))
+            .await
+            .expect_err("expected error");
+
+        match err {
+            RegistryLoadError::MissingIcpFee { spec, source } => {
+                assert_eq!(spec, "icp:aaaaa-aa:ICP");
+                assert_eq!(source, "fee-failed");
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn bad_spec_maps_to_other() {
+        let _lock = ENV_LOCK.lock().expect("lock");
+        let _env = EnvGuard::set("icp:bad-spec", "icp:bad-spec");
+
+        let icp = MockIcpBackend::new();
+        let evm = MockEvmBackend::new();
+
+        let err = load_token_registry(Arc::new(icp), Arc::new(evm))
+            .await
+            .expect_err("expected error");
+
+        match err {
+            RegistryLoadError::Other(message) => {
+                assert!(message.contains("invalid asset spec"));
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn happy_path_builds_registry() {
+        let _lock = ENV_LOCK.lock().expect("lock");
+        let _env = EnvGuard::set("icp:aaaaa-aa:ICP", "icp:aaaaa-aa:ICP");
+
+        let mut icp = MockIcpBackend::new();
+        icp.expect_icrc1_decimals().returning(|_| Ok(8));
+        icp.expect_icrc1_fee().returning(|_| Ok(Nat::from(10u8)));
+
+        let evm = MockEvmBackend::new();
+
+        let registry = load_token_registry(Arc::new(icp), Arc::new(evm))
+            .await
+            .expect("registry");
+
+        assert_eq!(registry.tokens.len(), 1);
+        assert_eq!(registry.collateral_assets().len(), 1);
+        assert_eq!(registry.debt_assets().len(), 1);
+    }
+}

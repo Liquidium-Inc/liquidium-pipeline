@@ -382,3 +382,34 @@ fn format_profit(amount: i128, decimals: u8, symbol: &str) -> String {
     let scaled = (amount as f64) / 10f64.powi(decimals as i32);
     format!("{scaled} {symbol}")
 }
+
+#[cfg(test)]
+mod tests {
+    use super::truncate;
+
+    #[test]
+    fn truncate_no_change_when_within_limit() {
+        assert_eq!(truncate("abcdef", 6), "abcdef");
+        assert_eq!(truncate("abcdef", 7), "abcdef");
+    }
+
+    #[test]
+    fn truncate_max_le_3_takes_chars_without_panic() {
+        assert_eq!(truncate("é漢🧪abc", 0), "");
+        assert_eq!(truncate("é漢🧪abc", 1), "é");
+        assert_eq!(truncate("é漢🧪abc", 2), "é漢");
+        assert_eq!(truncate("é漢🧪abc", 3), "é漢🧪");
+    }
+
+    #[test]
+    fn truncate_max_gt_3_appends_three_dots() {
+        assert_eq!(truncate("abcdef", 4), "a...");
+        assert_eq!(truncate("abcdef", 5), "ab...");
+    }
+
+    #[test]
+    fn truncate_handles_multibyte_utf8_without_panic() {
+        assert_eq!(truncate("é漢🧪abc", 4), "é...");
+        assert_eq!(truncate("é漢🧪abc", 5), "é漢...");
+    }
+}

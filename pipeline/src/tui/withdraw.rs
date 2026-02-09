@@ -206,8 +206,19 @@ async fn execute_withdraw(
 
     let amount_native: Nat = if amount.trim().eq_ignore_ascii_case("all") {
         let bal = balances.get_balance(&asset).await?;
-        let bal_u128 = bal
-            .value
+        compute_withdraw_amount_native(bal.value, fee.clone(), amount.trim(), decimals)?
+    } else {
+        compute_withdraw_amount_native(Nat::from(0u8), fee.clone(), amount.trim(), decimals)?
+    };
+
+    transfers
+        .transfer_by_asset_id(&asset, ChainAccount::Icp(dst_account), amount_native)
+        .await
+}
+
+fn compute_withdraw_amount_native(balance: Nat, fee: Nat, amount: &str, decimals: u8) -> Result<Nat, String> {
+    if amount.trim().eq_ignore_ascii_case("all") {
+        let bal_u128 = balance
             .0
             .to_u128()
             .ok_or_else(|| "balance too large for u128".to_string())?;
@@ -218,14 +229,54 @@ async fn execute_withdraw(
         if bal_u128 <= fee_u128 {
             return Err("balance too low to cover fee".to_string());
         }
-        Nat::from(bal_u128 - fee_u128)
+        Ok(Nat::from(bal_u128 - fee_u128))
     } else {
         let units = format::decimal_to_units(amount.trim(), decimals)
             .ok_or_else(|| format!("invalid amount (expected decimal with <= {decimals} decimals, or 'all')"))?;
-        Nat::from(units)
-    };
+        Ok(Nat::from(units))
+    }
+}
 
-    transfers
-        .transfer_by_asset_id(&asset, ChainAccount::Icp(dst_account), amount_native)
-        .await
+#[cfg(test)]
+mod tests {
+    use std::str::FromStr;
+
+    use candid::Nat;
+
+    use super::compute_withdraw_amount_native;
+
+    #[test]
+    fn all_subtracts_fee_correctly() {
+        let got = compute_withdraw_amount_native(Nat::from(100u32), Nat::from(3u32), "all", 8).expect("ok");
+        assert_eq!(got, Nat::from(97u32));
+    }
+
+    #[test]
+    fn all_rejects_balance_lte_fee() {
+        let err = compute_withdraw_amount_native(Nat::from(3u32), Nat::from(3u32), "all", 8).expect_err("should fail");
+        assert_eq!(err, "balance too low to cover fee");
+    }
+
+    #[test]
+    fn all_rejects_fee_overflow() {
+        let fee = Nat::from_str("340282366920938463463374607431768211456").expect("nat");
+        let err = compute_withdraw_amount_native(Nat::from(1u32), fee, "all", 8).expect_err("should fail");
+        assert_eq!(err, "fee too large to represent");
+    }
+
+    #[test]
+    fn all_rejects_balance_overflow() {
+        let balance = Nat::from_str("340282366920938463463374607431768211456").expect("nat");
+        let err = compute_withdraw_amount_native(balance, Nat::from(1u32), "all", 8).expect_err("should fail");
+        assert_eq!(err, "balance too large for u128");
+    }
+
+    #[test]
+    fn manual_amount_reuses_decimal_validation() {
+        let err = compute_withdraw_amount_native(Nat::from(0u8), Nat::from(0u8), ".", 8).expect_err("should fail");
+        assert_eq!(err, "invalid amount (expected decimal with <= 8 decimals, or 'all')");
+
+        let got = compute_withdraw_amount_native(Nat::from(0u8), Nat::from(0u8), "1.23", 2).expect("ok");
+        assert_eq!(got, Nat::from(123u32));
+    }
 }

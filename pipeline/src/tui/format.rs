@@ -97,3 +97,49 @@ pub(super) fn decimal_to_units(dec_str: &str, decimals: u8) -> Option<u128> {
     };
     combined.parse::<u128>().ok()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::decimal_to_units;
+
+    #[test]
+    fn decimal_to_units_rejects_empty_or_whitespace() {
+        assert_eq!(decimal_to_units("", 8), None);
+        assert_eq!(decimal_to_units("   ", 8), None);
+        assert_eq!(decimal_to_units("\t\n", 8), None);
+    }
+
+    #[test]
+    fn decimal_to_units_rejects_dot_only() {
+        assert_eq!(decimal_to_units(".", 8), None);
+        assert_eq!(decimal_to_units(" . ", 8), None);
+    }
+
+    #[test]
+    fn decimal_to_units_accepts_trimmed_valid_input() {
+        assert_eq!(decimal_to_units(" 1.23 ", 2), Some(123));
+    }
+
+    #[test]
+    fn decimal_to_units_accepts_leading_dot_fraction() {
+        assert_eq!(decimal_to_units(".5", 2), Some(50));
+    }
+
+    #[test]
+    fn decimal_to_units_rejects_invalid_chars() {
+        assert_eq!(decimal_to_units("1.a", 2), None);
+        assert_eq!(decimal_to_units("a.1", 2), None);
+        assert_eq!(decimal_to_units("1 2", 2), None);
+    }
+
+    #[test]
+    fn decimal_to_units_rejects_too_many_fraction_digits() {
+        assert_eq!(decimal_to_units("1.234", 2), None);
+    }
+
+    #[test]
+    fn decimal_to_units_zero_decimals_behavior() {
+        assert_eq!(decimal_to_units("12", 0), Some(12));
+        assert_eq!(decimal_to_units("12.0", 0), None);
+    }
+}
