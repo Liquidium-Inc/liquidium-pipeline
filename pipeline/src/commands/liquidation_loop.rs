@@ -3,7 +3,13 @@ use icrc_ledger_types::icrc1::account::Account;
 use indicatif::{ProgressBar, ProgressStyle};
 
 use prettytable::{Cell, Row, Table, format};
-use std::{sync::Arc, thread::sleep, time::Duration, time::Instant};
+use std::{
+    io::{IsTerminal, stderr, stdout},
+    sync::Arc,
+    thread::sleep,
+    time::Duration,
+    time::Instant,
+};
 use tracing::{Instrument, info_span, instrument};
 use tracing::{info, warn};
 
@@ -78,6 +84,85 @@ fn print_startup_table(config: &Config) {
     ]));
 
     table.printstd();
+}
+
+fn env_truthy(key: &str) -> bool {
+    std::env::var(key)
+        .ok()
+        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false)
+}
+
+fn console_ui_enabled() -> bool {
+    if env_truthy("LIQUIDATOR_PLAIN_LOGS") {
+        return false;
+    }
+
+    stdout().is_terminal() && stderr().is_terminal()
+}
+
+fn start_spinner(enabled: bool) -> Option<ProgressBar> {
+    if !enabled {
+        return None;
+    }
+
+    let spinner = ProgressBar::new_spinner();
+    spinner.set_style(
+        ProgressStyle::with_template("{spinner} {msg}")
+            .unwrap()
+            .tick_chars("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏ "),
+    );
+    spinner.enable_steady_tick(Duration::from_millis(100));
+    Some(spinner)
+}
+
+fn log_execution_results(results: &[LiquidationOutcome]) {
+    let success_count = results
+        .iter()
+        .filter(|r| matches!(r.status, ExecutionStatus::Success))
+        .count();
+
+    info!(
+        outcome_count = results.len(),
+        success_count,
+        failed_count = results.len() - success_count,
+        "Liquidation outcomes finalized"
+    );
+
+    for r in results {
+        let liquidation_id = r
+            .execution_receipt
+            .liquidation_result
+            .as_ref()
+            .map(|v| v.id.to_string())
+            .unwrap_or_else(|| "n/a".to_string());
+        let swap_status = r
+            .finalizer_result
+            .swap_result
+            .as_ref()
+            .map(|v| v.status.clone())
+            .unwrap_or_else(|| "none".to_string());
+        let status = r.status.description();
+
+        info!(
+            event = "liquidation_outcome",
+            liquidation_id = %liquidation_id,
+            borrower = %r.request.liquidation.borrower.to_text(),
+            debt_asset = %r.request.debt_asset.symbol(),
+            collateral_asset = %r.request.collateral_asset.symbol(),
+            debt_repaid = %r.formatted_debt_repaid(),
+            collateral_received = %r.formatted_received_collateral(),
+            swap_output = %r.formatted_swap_output(),
+            swapper = %r.formatted_swapper(),
+            swap_status = %swap_status,
+            status = %status,
+            expected_profit = r.expected_profit,
+            realized_profit = r.realized_profit,
+            profit_delta = r.realized_profit - r.expected_profit,
+            round_trip_secs = r.round_trip_secs.unwrap_or(-1),
+            "Liquidation outcome"
+        );
+    }
 }
 
 #[instrument(name = "liquidation.init", skip_all, err)]
@@ -207,7 +292,11 @@ async fn init(
 }
 
 pub async fn run_liquidation_loop() {
-    print_banner();
+    let ui_enabled = console_ui_enabled();
+    if ui_enabled {
+        print_banner();
+    }
+
     let ctx = match init_context().await {
         Ok(ctx) => ctx,
         Err(err) => {
@@ -219,21 +308,32 @@ pub async fn run_liquidation_loop() {
     let config = ctx.config.clone();
 
     if config.buy_bad_debt {
-        info!("🚨 BAD DEBT MODE ENABLED: liquidator will repay bad debt to restore solvency");
-        println!("====================================================================");
-        println!("=                                                                  =");
-        println!("=                   !!!  BAD DEBT MODE  !!!                        =");
-        println!("=                                                                  =");
-        println!("=  This bot WILL repay bad debt (you eat the loss).                =");
-        println!("=  Use only if you intend to shore up protocol solvency.            =");
-        println!("=                                                                  =");
-        println!("====================================================================");
+        info!(
+            buy_bad_debt = true,
+            "Bad debt mode enabled: liquidator may repay bad debt to restore solvency"
+        );
+        if ui_enabled {
+            println!("====================================================================");
+            println!("=                                                                  =");
+            println!("=                   !!!  BAD DEBT MODE  !!!                        =");
+            println!("=                                                                  =");
+            println!("=  This bot WILL repay bad debt (you eat the loss).                =");
+            println!("=  Use only if you intend to shore up protocol solvency.            =");
+            println!("=                                                                  =");
+            println!("====================================================================");
+        }
         warn!("Continuing without interactive confirmation because BUY_BAD_DEBT is enabled.");
     } else {
-        info!("✅ BAD DEBT MODE DISABLED: only collateral-backed liquidations will run");
+        info!(
+            buy_bad_debt = false,
+            "Bad debt mode disabled: only collateral-backed liquidations will run"
+        );
     }
     // Use main IC agent (liquidator identity) from context
-    info!("Agent initialized with principal: {}", config.liquidator_principal);
+    info!(
+        liquidator_principal = %config.liquidator_principal.to_text(),
+        "Agent initialized"
+    );
 
     // Initialize components using shared pipeline context
     let (finder, strategy, executor, exporter, finalizer) = match init(ctx.clone()).await {
@@ -275,28 +375,29 @@ pub async fn run_liquidation_loop() {
 
     let debt_assets: Vec<String> = debt_asset_principals.iter().map(Principal::to_text).collect();
 
-    print_startup_table(&config);
+    if ui_enabled {
+        print_startup_table(&config);
+    }
+    info!(
+        network = %config.ic_url,
+        liquidator_principal = %config.liquidator_principal.to_text(),
+        swapper_mode = ?config.swapper,
+        max_dex_slippage_bps = config.max_allowed_dex_slippage,
+        max_cex_slippage_bps = config.max_allowed_cex_slippage_bps,
+        buy_bad_debt = config.buy_bad_debt,
+        "Startup configuration"
+    );
     info!("Liquidator started; scanning for liquidation opportunities...");
 
     // Setup liquidity monitor
     let liq_dog = account_monitor_watchdog(Duration::from_secs(5), ctx.config.liquidator_principal);
 
-    // Create the spinner for fancy UI
-    let start_spinner = || {
-        let spinner = ProgressBar::new_spinner();
-        spinner.set_style(
-            ProgressStyle::with_template("{spinner} {msg}")
-                .unwrap()
-                .tick_chars("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏ "),
-        );
-        spinner.enable_steady_tick(Duration::from_millis(100));
-        spinner
-    };
-
-    let mut spinner = start_spinner();
+    let mut spinner = start_spinner(ui_enabled);
     let mut last_alive_log = Instant::now();
     loop {
-        spinner.set_message("Scanning for liquidation opportunities...");
+        if let Some(s) = spinner.as_ref() {
+            s.set_message("Scanning for liquidation opportunities...");
+        }
         if last_alive_log.elapsed() >= Duration::from_secs(300) {
             info!("Liquidator running; scanning for liquidation opportunities...");
             last_alive_log = Instant::now();
@@ -308,9 +409,13 @@ pub async fn run_liquidation_loop() {
 
         if !opportunities.is_empty() {
             sleep(Duration::from_secs(2));
-            spinner = start_spinner();
-            spinner.finish_and_clear();
-            info!("Found {:?} opportunities", opportunities.len());
+            if let Some(s) = spinner.take() {
+                s.finish_and_clear();
+            }
+            info!(
+                opportunity_count = opportunities.len(),
+                "Found liquidation opportunities"
+            );
 
             let opp_count = opportunities.len();
             async {
@@ -341,8 +446,10 @@ pub async fn run_liquidation_loop() {
         });
 
         if outcomes.is_empty() {
-            spinner = start_spinner();
-            spinner.set_message("Scanning for liquidation opportunities...");
+            spinner = start_spinner(ui_enabled);
+            if let Some(s) = spinner.as_ref() {
+                s.set_message("Scanning for liquidation opportunities...");
+            }
             sleep(Duration::from_secs(2));
             continue;
         }
@@ -350,9 +457,14 @@ pub async fn run_liquidation_loop() {
         if let Err(err) = exporter.process(&outcomes).await {
             warn!("Failed to export results: {}", err);
         }
-        print_execution_results(outcomes);
-        spinner = start_spinner();
-        spinner.set_message("Scanning for liquidation opportunities...");
+        log_execution_results(&outcomes);
+        if ui_enabled {
+            print_execution_results(&outcomes);
+        }
+        spinner = start_spinner(ui_enabled);
+        if let Some(s) = spinner.as_ref() {
+            s.set_message("Scanning for liquidation opportunities...");
+        }
 
         // Send liquidity monitor heart beat
         let _ = liq_dog.notify(WatchdogEvent::Heartbeat { stage: "Running" }).await;
@@ -363,7 +475,7 @@ pub async fn run_liquidation_loop() {
     }
 }
 
-pub fn print_execution_results(results: Vec<LiquidationOutcome>) {
+pub fn print_execution_results(results: &[LiquidationOutcome]) {
     let mut table = Table::new();
     table.set_format(*format::consts::FORMAT_NO_LINESEP_WITH_TITLE);
     table.set_titles(Row::new(vec![

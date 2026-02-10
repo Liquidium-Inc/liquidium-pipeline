@@ -299,6 +299,12 @@ Set `RUST_LOG` for debug output:
 RUST_LOG=debug liquidator run
 ```
 
+For Grafana/Loki-friendly logs (no ASCII tables/spinner/banner), force plain output:
+
+```bash
+LIQUIDATOR_PLAIN_LOGS=1 RUST_LOG=info liquidator run
+```
+
 ---
 
 ## 📝 Notes
