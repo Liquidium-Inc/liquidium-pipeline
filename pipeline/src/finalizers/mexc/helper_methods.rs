@@ -191,7 +191,7 @@ where
                 }
                 Ok(amount * best_bid)
             }
-            _ => Ok(amount),
+            _ => Err(format!("cannot convert {} to USD: unsupported quote", symbol)),
         }
     }
 
@@ -922,10 +922,10 @@ where
             return Ok(false);
         }
 
-        let residual_usd = self
-            .input_slice_usd(&leg.market, &leg.side, remaining_in)
-            .await
-            .unwrap_or(chunk_usd);
+        let residual_usd = self.input_slice_usd(&leg.market, &leg.side, remaining_in).await?;
+        if residual_usd >= self.cex_min_exec_usd {
+            return Ok(false);
+        }
 
         state.trade.trade_dust_skipped = true;
         state.trade.trade_dust_usd = Some(residual_usd);

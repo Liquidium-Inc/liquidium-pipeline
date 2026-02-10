@@ -785,6 +785,62 @@ async fn mexc_maybe_mark_trade_dust_honors_threshold_boundary() {
 }
 
 #[tokio::test]
+async fn mexc_maybe_mark_trade_dust_requires_small_chunk_and_small_residual() {
+    // market CKBTC_BTC with best bid 1 and BTC_USDC best bid 100 => usd = amount * 100
+    let leg = TradeLeg {
+        market: "CKBTC_BTC".to_string(),
+        side: "sell".to_string(),
+    };
+    let receipt = make_execution_receipt(42);
+
+    let mut backend = MockCexBackend::new();
+    let transfers = MockTransferActions::new();
+    let ckbtc_btc = OrderBook {
+        bids: vec![OrderBookLevel {
+            price: 1.0,
+            quantity: 100.0,
+        }],
+        asks: vec![],
+    };
+    let btc_usdc = OrderBook {
+        bids: vec![OrderBookLevel {
+            price: 100.0,
+            quantity: 100.0,
+        }],
+        asks: vec![],
+    };
+    backend
+        .expect_get_orderbook()
+        .returning(move |market, _limit| match market {
+            "CKBTC_BTC" => Ok(ckbtc_btc.clone()),
+            "BTC_USDC" => Ok(btc_usdc.clone()),
+            _ => Err(format!("unexpected market {}", market)),
+        });
+
+    let finalizer = MexcFinalizer::new(
+        Arc::new(backend),
+        Arc::new(transfers),
+        Principal::anonymous(),
+        TEST_MAX_SELL_SLIPPAGE_BPS,
+        1.0,
+        TEST_CEX_SLICE_TARGET_RATIO,
+    );
+    let mut state = finalizer
+        .prepare("42", &receipt)
+        .await
+        .expect("prepare should succeed");
+
+    // chunk_usd=0.5 (<1.0), residual_usd=2.0 (>=1.0) => should not be dust-skipped.
+    let skipped = finalizer
+        .maybe_mark_trade_dust(&mut state, &leg, 0.005, 0.02)
+        .await
+        .expect("dust check should succeed");
+    assert!(!skipped);
+    assert!(!state.trade.trade_dust_skipped);
+    assert!(state.trade.trade_dust_usd.is_none());
+}
+
+#[tokio::test]
 async fn mexc_trade_fails_when_realized_slice_slippage_exceeds_cap() {
     let mut backend = MockCexBackend::new();
     let transfers = MockTransferActions::new();

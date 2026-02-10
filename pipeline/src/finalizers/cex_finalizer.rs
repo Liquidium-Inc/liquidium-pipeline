@@ -62,7 +62,8 @@ pub struct CexDepositState {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CexTradeState {
-    /// Zero-based index of the current trade leg being executed.
+    /// One-based index of the current trade leg being executed.
+    /// `None` means no leg has started yet.
     pub trade_leg_index: Option<u32>,
     /// Total number of legs in the resolved route.
     pub trade_leg_total: Option<u32>,

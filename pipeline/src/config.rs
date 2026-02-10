@@ -383,7 +383,8 @@ fn parse_cex_tunables_from_env() -> CexTunables {
         .map(|v| v.clamp(0.0, 1.0))
         .unwrap_or(0.25);
 
-    let buy_inverse_overspend_bps = env::var("CEX_BUY_INVERSE_OVESPEND_BPS")
+    let buy_inverse_overspend_bps = env::var("CEX_BUY_INVERSE_OVERSPEND_BPS")
+        .or_else(|_| env::var("CEX_BUY_INVERSE_OVESPEND_BPS"))
         .ok()
         .and_then(|v| v.parse::<u32>().ok())
         .map(|v| v.min(100))
@@ -410,7 +411,8 @@ fn parse_cex_tunables_from_env() -> CexTunables {
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
         .filter(|v| *v >= retry_base_secs)
-        .unwrap_or(120);
+        .unwrap_or(120)
+        .max(retry_base_secs);
 
     let min_net_edge_bps = env::var("CEX_MIN_NET_EDGE_BPS")
         .ok()
@@ -463,6 +465,7 @@ mod tests {
             "CEX_MIN_EXEC_USD",
             "CEX_SLICE_TARGET_RATIO",
             "CEX_BUY_TRUNCATION_TRIGGER_RATIO",
+            "CEX_BUY_INVERSE_OVERSPEND_BPS",
             "CEX_BUY_INVERSE_OVESPEND_BPS",
             "CEX_BUY_INVERSE_MAX_RETRIES",
             "CEX_BUY_INVERSE_ENABLED",
@@ -504,7 +507,7 @@ mod tests {
             env::set_var("CEX_MIN_EXEC_USD", "1.05");
             env::set_var("CEX_SLICE_TARGET_RATIO", "0.85");
             env::set_var("CEX_BUY_TRUNCATION_TRIGGER_RATIO", "0.4");
-            env::set_var("CEX_BUY_INVERSE_OVESPEND_BPS", "20");
+            env::set_var("CEX_BUY_INVERSE_OVERSPEND_BPS", "20");
             env::set_var("CEX_BUY_INVERSE_MAX_RETRIES", "2");
             env::set_var("CEX_BUY_INVERSE_ENABLED", "false");
             env::set_var("CEX_RETRY_BASE_SECS", "7");
@@ -542,7 +545,7 @@ mod tests {
             env::set_var("CEX_MIN_EXEC_USD", "0");
             env::set_var("CEX_SLICE_TARGET_RATIO", "99");
             env::set_var("CEX_BUY_TRUNCATION_TRIGGER_RATIO", "-1");
-            env::set_var("CEX_BUY_INVERSE_OVESPEND_BPS", "999");
+            env::set_var("CEX_BUY_INVERSE_OVERSPEND_BPS", "999");
             env::set_var("CEX_BUY_INVERSE_MAX_RETRIES", "9");
             env::set_var("CEX_BUY_INVERSE_ENABLED", "not-a-bool");
             env::set_var("CEX_RETRY_BASE_SECS", "10");
@@ -571,5 +574,42 @@ mod tests {
 
         let parsed = parse_cex_tunables_from_env();
         assert_eq!(parsed.force_over_usd_threshold, 0.0);
+    }
+
+    #[test]
+    fn parse_cex_tunables_accepts_legacy_buy_inverse_overspend_key() {
+        let _guard = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        unsafe {
+            env::remove_var("CEX_BUY_INVERSE_OVERSPEND_BPS");
+            env::set_var("CEX_BUY_INVERSE_OVESPEND_BPS", "33");
+        }
+
+        let parsed = parse_cex_tunables_from_env();
+        assert_eq!(parsed.buy_inverse_overspend_bps, 33);
+    }
+
+    #[test]
+    fn parse_cex_tunables_prefers_new_buy_inverse_overspend_key() {
+        let _guard = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        unsafe {
+            env::set_var("CEX_BUY_INVERSE_OVERSPEND_BPS", "44");
+            env::set_var("CEX_BUY_INVERSE_OVESPEND_BPS", "55");
+        }
+
+        let parsed = parse_cex_tunables_from_env();
+        assert_eq!(parsed.buy_inverse_overspend_bps, 44);
+    }
+
+    #[test]
+    fn parse_cex_tunables_keeps_retry_max_at_least_retry_base() {
+        let _guard = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        unsafe {
+            env::set_var("CEX_RETRY_BASE_SECS", "300");
+            env::remove_var("CEX_RETRY_MAX_SECS");
+        }
+
+        let parsed = parse_cex_tunables_from_env();
+        assert_eq!(parsed.retry_base_secs, 300);
+        assert_eq!(parsed.retry_max_secs, 300);
     }
 }

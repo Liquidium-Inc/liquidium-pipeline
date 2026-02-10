@@ -81,23 +81,20 @@ pub trait CexBackend: Send + Sync {
 
     async fn execute_swap(&self, market: &str, side: &str, amount_in: f64) -> Result<f64, String>;
 
-    async fn execute_swap_detailed(&self, market: &str, side: &str, amount_in: f64) -> Result<SwapFillReport, String> {
-        let output_received = self.execute_swap(market, side, amount_in).await?;
-        Ok(SwapFillReport {
-            input_consumed: amount_in,
-            output_received,
-        })
-    }
+    async fn execute_swap_detailed(
+        &self,
+        market: &str,
+        side: &str,
+        amount_in: f64,
+    ) -> Result<SwapFillReport, String>;
 
     async fn execute_swap_detailed_with_options(
         &self,
         market: &str,
         side: &str,
         amount_in: f64,
-        _options: SwapExecutionOptions,
-    ) -> Result<SwapFillReport, String> {
-        self.execute_swap_detailed(market, side, amount_in).await
-    }
+        options: SwapExecutionOptions,
+    ) -> Result<SwapFillReport, String>;
 
     async fn get_orderbook(&self, market: &str, limit: Option<u32>) -> Result<OrderBook, String>;
 
