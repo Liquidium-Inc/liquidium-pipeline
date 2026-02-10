@@ -12,7 +12,7 @@ COPY commons ./commons
 COPY pipeline ./pipeline
 
 ENV RUSTFLAGS="-C target-feature=-crt-static"
-RUN cargo build --locked --release -p liquidium-pipeline
+RUN cargo build --locked --release -p liquidium-pipeline --features plain-logs
 
 FROM alpine:latest
 
