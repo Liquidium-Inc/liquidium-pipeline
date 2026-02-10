@@ -59,23 +59,12 @@ pub async fn funds() -> Result<(), String> {
         ctx.recovery_service.sync_assets(&asset_ids),
     );
 
-    let mut table = Table::new();
-    if !plain_logs {
-        table.set_format(*format::consts::FORMAT_NO_LINESEP_WITH_TITLE);
-        table.set_titles(Row::new(vec![
-            Cell::new("Asset (chain:address:symbol)"),
-            Cell::new("Main"),
-            Cell::new("Trader"),
-            Cell::new("Recovery"),
-        ]));
-    }
+    if plain_logs {
+        for (idx, asset_id) in asset_ids.iter().enumerate() {
+            let main_cell = format_balance_result(main_results.get(idx));
+            let trader_cell = format_balance_result(trader_results.get(idx));
+            let recovery_cell = format_balance_result(recovery_results.get(idx));
 
-    for (idx, asset_id) in asset_ids.iter().enumerate() {
-        let main_cell = format_balance_result(main_results.get(idx));
-        let trader_cell = format_balance_result(trader_results.get(idx));
-        let recovery_cell = format_balance_result(recovery_results.get(idx));
-
-        if plain_logs {
             info!(
                 asset = %asset_id,
                 main = %main_cell,
@@ -83,19 +72,34 @@ pub async fn funds() -> Result<(), String> {
                 recovery = %recovery_cell,
                 "Balance row"
             );
-        } else {
-            table.add_row(Row::new(vec![
-                Cell::new(&asset_id.to_string()),
-                Cell::new(&main_cell),
-                Cell::new(&trader_cell),
-                Cell::new(&recovery_cell),
-            ]));
         }
+
+        return Ok(());
     }
 
-    if !plain_logs {
-        table.printstd();
+    let mut table = Table::new();
+    table.set_format(*format::consts::FORMAT_NO_LINESEP_WITH_TITLE);
+    table.set_titles(Row::new(vec![
+        Cell::new("Asset (chain:address:symbol)"),
+        Cell::new("Main"),
+        Cell::new("Trader"),
+        Cell::new("Recovery"),
+    ]));
+
+    for (idx, asset_id) in asset_ids.iter().enumerate() {
+        let main_cell = format_balance_result(main_results.get(idx));
+        let trader_cell = format_balance_result(trader_results.get(idx));
+        let recovery_cell = format_balance_result(recovery_results.get(idx));
+
+        table.add_row(Row::new(vec![
+            Cell::new(&asset_id.to_string()),
+            Cell::new(&main_cell),
+            Cell::new(&trader_cell),
+            Cell::new(&recovery_cell),
+        ]));
     }
+
+    table.printstd();
 
     Ok(())
 }
