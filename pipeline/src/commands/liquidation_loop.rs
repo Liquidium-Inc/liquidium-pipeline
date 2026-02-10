@@ -86,19 +86,12 @@ fn print_startup_table(config: &Config) {
     table.printstd();
 }
 
-fn env_truthy(key: &str) -> bool {
-    std::env::var(key)
-        .ok()
-        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
-        .unwrap_or(false)
+fn console_ui_enabled() -> bool {
+    is_console_ui_enabled(cfg!(feature = "plain-logs"), stdout().is_terminal(), stderr().is_terminal())
 }
 
-fn console_ui_enabled() -> bool {
-    if env_truthy("LIQUIDATOR_PLAIN_LOGS") {
-        return false;
-    }
-
-    stdout().is_terminal() && stderr().is_terminal()
+fn is_console_ui_enabled(plain_logs_feature_enabled: bool, stdout_is_tty: bool, stderr_is_tty: bool) -> bool {
+    !plain_logs_feature_enabled && stdout_is_tty && stderr_is_tty
 }
 
 fn start_spinner(enabled: bool) -> Option<ProgressBar> {
@@ -528,4 +521,29 @@ pub fn print_execution_results(results: &[LiquidationOutcome]) {
     }
 
     table.printstd();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_console_ui_enabled;
+
+    #[test]
+    fn disables_console_ui_when_plain_logs_feature_is_enabled() {
+        assert!(!is_console_ui_enabled(true, true, true));
+    }
+
+    #[test]
+    fn enables_console_ui_when_feature_disabled_and_both_terminals_present() {
+        assert!(is_console_ui_enabled(false, true, true));
+    }
+
+    #[test]
+    fn disables_console_ui_when_stdout_is_not_tty() {
+        assert!(!is_console_ui_enabled(false, false, true));
+    }
+
+    #[test]
+    fn disables_console_ui_when_stderr_is_not_tty() {
+        assert!(!is_console_ui_enabled(false, true, false));
+    }
 }

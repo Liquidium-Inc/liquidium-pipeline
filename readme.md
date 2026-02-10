@@ -299,10 +299,11 @@ Set `RUST_LOG` for debug output:
 RUST_LOG=debug liquidator run
 ```
 
-For Grafana/Loki-friendly logs (no ASCII tables/spinner/banner), force plain output:
+For Grafana/Loki-friendly logs (no ASCII tables/spinner/banner), build with the `plain-logs` feature:
 
 ```bash
-LIQUIDATOR_PLAIN_LOGS=1 RUST_LOG=info liquidator run
+cargo build --release -p liquidium-pipeline --features plain-logs
+RUST_LOG=info ./target/release/liquidator run
 ```
 
 ---
