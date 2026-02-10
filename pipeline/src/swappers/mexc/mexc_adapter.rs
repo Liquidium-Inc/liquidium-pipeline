@@ -4,7 +4,8 @@ use std::env;
 use async_trait::async_trait;
 
 use liquidium_pipeline_connectors::backend::cex_backend::{
-    CexBackend, DepositAddress, OrderBook, OrderBookLevel, WithdrawStatus, WithdrawalReceipt,
+    BuyOrderInputMode, CexBackend, DepositAddress, OrderBook, OrderBookLevel, SwapExecutionOptions, SwapFillReport,
+    WithdrawStatus, WithdrawalReceipt,
 };
 use log::{debug, info, warn};
 use rust_decimal::{Decimal, RoundingStrategy};
@@ -51,6 +52,14 @@ fn is_coin_missing(err: &v3::ApiError) -> bool {
         err,
         v3::ApiError::ErrorResponse(resp) if resp.code == v3::ErrorCode::CurrencyDoesNotExist
     )
+}
+
+fn is_order_missing_lookup_error(message: &str) -> bool {
+    let msg = message.to_ascii_lowercase();
+    msg.contains("order does not exist")
+        || msg.contains("unknown order")
+        || msg.contains("-2013")
+        || msg.contains("code=-2013")
 }
 
 #[derive(Debug, Clone, Default)]
@@ -401,6 +410,46 @@ impl MexcClient {
         Ok(base_out)
     }
 
+    // Estimate quote cost from orderbook for a base-denominated buy quantity.
+    async fn estimate_buy_quote_cost(
+        &self,
+        ex: &MexcSpotApiClientWithAuthentication,
+        api_symbol: &str,
+        base_quantity: Decimal,
+    ) -> Result<Decimal, String> {
+        let ob = ex
+            .depth(DepthParams {
+                limit: Some(50),
+                symbol: api_symbol,
+            })
+            .await
+            .map_err(|e| e.to_string())?;
+
+        if ob.asks.is_empty() {
+            return Err("no asks".into());
+        }
+
+        let mut remaining_base = base_quantity;
+        let mut quote_cost = Decimal::ZERO;
+        for level in &ob.asks {
+            if remaining_base <= Decimal::ZERO {
+                break;
+            }
+            if level.price <= Decimal::ZERO || level.quantity <= Decimal::ZERO {
+                continue;
+            }
+            let take = level.quantity.min(remaining_base);
+            quote_cost += take * level.price;
+            remaining_base -= take;
+        }
+
+        if remaining_base > Decimal::ZERO {
+            return Err("not enough ask liquidity".into());
+        }
+
+        Ok(quote_cost)
+    }
+
     // Apply step size/base precision and min_qty checks to a computed base amount.
     fn adjust_buy_quantity(qty: Decimal, filters: Option<&SymbolFilters>, symbol: &str) -> Result<Decimal, String> {
         let mut adjusted = qty;
@@ -433,9 +482,13 @@ impl MexcClient {
     }
 
     fn candidate_symbols(api_symbol: &str, market_symbol: &str, symbol: &str) -> Vec<String> {
-        let mut candidates = vec![api_symbol.to_string(), market_symbol.to_string(), symbol.to_string()];
-        candidates.sort();
-        candidates.dedup();
+        let mut candidates: Vec<String> = Vec::new();
+        for raw in [api_symbol, market_symbol, symbol] {
+            let normalized = normalize_market_symbol(raw);
+            if !normalized.is_empty() && !candidates.iter().any(|candidate| candidate == &normalized) {
+                candidates.push(normalized);
+            }
+        }
         candidates
     }
 
@@ -486,26 +539,37 @@ impl MexcClient {
         order_side: OrderSide,
         quantity: Option<Decimal>,
         quote_order_quantity: Option<Decimal>,
+        client_order_id: Option<&str>,
         market: &str,
         side: &str,
-        amount_in: f64,
+        _amount_in: f64,
     ) -> Result<(String, String), String> {
         let mut last_err: Option<String> = None;
         for candidate in candidates {
-            info!("Swapping {} {} {} (symbol={})", market, side, amount_in, candidate);
             match ex
                 .order(OrderParams {
                     symbol: candidate,
                     side: order_side,
                     order_type: v3::enums::OrderType::Market,
                     quantity,
-                    new_client_order_id: None,
+                    new_client_order_id: client_order_id,
                     price: None,
                     quote_order_quantity,
                 })
                 .await
             {
-                Ok(ok) => return Ok((candidate.clone(), ok.order_id.clone())),
+                Ok(ok) => {
+                    let order_id = ok.order_id.trim().to_string();
+                    if order_id.is_empty() {
+                        let details = format!(
+                            "empty order_id returned for symbol={} market={} side={}",
+                            candidate, market, side
+                        );
+                        warn!("[mexc] {}", details);
+                        return Err(details);
+                    }
+                    return Ok((candidate.clone(), order_id));
+                }
                 Err(e) => {
                     let details = format_mexc_api_error(&e);
                     warn!("[mexc] order error response: {}", details);
@@ -521,13 +585,46 @@ impl MexcClient {
         Err(last_err.unwrap_or_else(|| "Swap err: bad symbol".to_string()))
     }
 
-    async fn fetch_filled_amount(
+    /// Converts MEXC order fill fields into side-agnostic execution amounts.
+    ///
+    /// - `buy`: input is quote spent (`cummulative_quote_quantity`), output is base received (`executed_quantity`)
+    /// - `sell`: input is base sold (`executed_quantity`), output is quote received (`cummulative_quote_quantity`)
+    fn map_fill_report(
+        side_norm: &str,
+        executed_quantity: Decimal,
+        cummulative_quote_quantity: Decimal,
+    ) -> Result<SwapFillReport, String> {
+        if executed_quantity <= Decimal::ZERO {
+            return Err("order has zero executed quantity".into());
+        }
+
+        let executed_base = executed_quantity
+            .to_f64()
+            .ok_or("cannot convert executed_quantity to f64".to_string())?;
+        let cumulative_quote = cummulative_quote_quantity
+            .to_f64()
+            .ok_or("cannot convert cummulative_quote_quantity to f64".to_string())?;
+
+        if side_norm == "buy" {
+            return Ok(SwapFillReport {
+                input_consumed: cumulative_quote,
+                output_received: executed_base,
+            });
+        }
+
+        Ok(SwapFillReport {
+            input_consumed: executed_base,
+            output_received: cumulative_quote,
+        })
+    }
+
+    async fn fetch_fill_report(
         &self,
         ex: &MexcSpotApiClientWithAuthentication,
         symbol: &str,
         order_id: &str,
         side_norm: &str,
-    ) -> Result<f64, String> {
+    ) -> Result<SwapFillReport, String> {
         let order_res = ex
             .get_order(GetOrderParams {
                 symbol,
@@ -536,7 +633,7 @@ impl MexcClient {
                 original_client_order_id: None,
             })
             .await
-            .map_err(|e| format!("Get_order err: {}", e))?;
+            .map_err(|e| format!("Get_order err: {}", format_mexc_api_error(&e)))?;
 
         match order_res.status {
             OrderStatus::Filled => {}
@@ -545,21 +642,75 @@ impl MexcClient {
             }
         }
 
-        if order_res.executed_quantity <= Decimal::ZERO {
-            return Err("order has zero executed quantity".into());
+        Self::map_fill_report(
+            side_norm,
+            order_res.executed_quantity,
+            order_res.cummulative_quote_quantity,
+        )
+    }
+
+    async fn try_fetch_fill_report_by_client_order_id(
+        &self,
+        ex: &MexcSpotApiClientWithAuthentication,
+        symbol: &str,
+        client_order_id: &str,
+        side_norm: &str,
+    ) -> Result<Option<SwapFillReport>, String> {
+        let order_res = ex
+            .get_order(GetOrderParams {
+                symbol,
+                order_id: None,
+                new_client_order_id: None,
+                original_client_order_id: Some(client_order_id),
+            })
+            .await;
+
+        let order_res = match order_res {
+            Ok(res) => res,
+            Err(err) => {
+                debug!(
+                    "[mexc] get_order by client id missed symbol={} client_id={} err={}",
+                    symbol, client_order_id, err
+                );
+                return Ok(None);
+            }
+        };
+
+        match order_res.status {
+            OrderStatus::Filled => {}
+            other => {
+                return Err(format!(
+                    "order {} not executed yet for {} (status={:?})",
+                    client_order_id, symbol, other
+                ));
+            }
         }
 
-        if side_norm == "buy" {
-            return order_res
-                .executed_quantity
-                .to_f64()
-                .ok_or("cannot convert executed_quantity to f64".to_string());
+        let report = Self::map_fill_report(
+            side_norm,
+            order_res.executed_quantity,
+            order_res.cummulative_quote_quantity,
+        )?;
+        Ok(Some(report))
+    }
+
+    async fn try_fetch_fill_report_by_client_order_id_candidates(
+        &self,
+        ex: &MexcSpotApiClientWithAuthentication,
+        candidates: &[String],
+        client_order_id: &str,
+        side_norm: &str,
+    ) -> Result<Option<SwapFillReport>, String> {
+        for candidate in candidates {
+            if let Some(report) = self
+                .try_fetch_fill_report_by_client_order_id(ex, candidate, client_order_id, side_norm)
+                .await?
+            {
+                return Ok(Some(report));
+            }
         }
 
-        order_res
-            .cummulative_quote_quantity
-            .to_f64()
-            .ok_or("cannot convert cummulative_quote_quantity to f64".to_string())
+        Ok(None)
     }
 
     async fn prepare_buy_order(
@@ -569,12 +720,46 @@ impl MexcClient {
         filters: Option<&SymbolFilters>,
         api_symbol: &str,
         symbol: &str,
+        buy_mode: BuyOrderInputMode,
+        max_quote_overspend_bps: Option<f64>,
     ) -> Result<(OrderSide, Option<Decimal>, Option<Decimal>), String> {
         if amount_dec <= Decimal::ZERO {
             return Err(format!("quote amount {} not valid for {}", amount_dec, symbol));
         }
 
-        // If quote rounds to zero at exchange precision, fall back to a base-quantity buy.
+        if buy_mode == BuyOrderInputMode::QuoteOrderQty {
+            let (quote_amt, use_quote_order) = Self::adjust_quote_amount(amount_dec, filters);
+            if !use_quote_order || quote_amt <= Decimal::ZERO {
+                return Err(format!(
+                    "quote-order mode selected but quote amount {} not valid for {}",
+                    quote_amt, symbol
+                ));
+            }
+            Self::ensure_min_notional(filters, quote_amt, symbol)?;
+            return Ok((OrderSide::Buy, None, Some(quote_amt)));
+        }
+
+        if buy_mode == BuyOrderInputMode::BaseQuantity {
+            let base_out = self.estimate_buy_quantity(ex, api_symbol, amount_dec).await?;
+            let qty = Self::adjust_buy_quantity(base_out, filters, symbol)?;
+            let quote_cost = self.estimate_buy_quote_cost(ex, api_symbol, qty).await?;
+            Self::ensure_min_notional(filters, quote_cost, symbol)?;
+
+            if let Some(cap_bps) = max_quote_overspend_bps {
+                let max_allowed =
+                    amount_dec * (Decimal::ONE + Decimal::from_f64_retain(cap_bps / 10_000.0).unwrap_or(Decimal::ZERO));
+                if quote_cost > max_allowed {
+                    return Err(format!(
+                        "base-quantity buy overspend too high for {}: est_quote_cost={} max_allowed={} cap_bps={}",
+                        symbol, quote_cost, max_allowed, cap_bps
+                    ));
+                }
+            }
+
+            return Ok((OrderSide::Buy, Some(qty), None));
+        }
+
+        // Auto mode: if quote rounds to zero at exchange precision, fall back to base quantity.
         let (quote_amt, use_quote_order) = Self::adjust_quote_amount(amount_dec, filters);
         let check_amt = if use_quote_order { quote_amt } else { amount_dec };
         Self::ensure_min_notional(filters, check_amt, symbol)?;
@@ -639,6 +824,22 @@ impl CexBackend for MexcClient {
     }
 
     async fn execute_swap(&self, market: &str, side: &str, amount_in: f64) -> Result<f64, String> {
+        let report = self.execute_swap_detailed(market, side, amount_in).await?;
+        Ok(report.output_received)
+    }
+
+    async fn execute_swap_detailed(&self, market: &str, side: &str, amount_in: f64) -> Result<SwapFillReport, String> {
+        self.execute_swap_detailed_with_options(market, side, amount_in, SwapExecutionOptions::default())
+            .await
+    }
+
+    async fn execute_swap_detailed_with_options(
+        &self,
+        market: &str,
+        side: &str,
+        amount_in: f64,
+        options: SwapExecutionOptions,
+    ) -> Result<SwapFillReport, String> {
         let ex = self.inner.lock().await;
 
         let market_symbol = market.trim().to_ascii_uppercase();
@@ -654,32 +855,93 @@ impl CexBackend for MexcClient {
 
         info!("Swapping {} {} {} (symbol={})", market, side, amount_in, api_symbol);
 
+        let candidates = Self::candidate_symbols(api_symbol, &market_symbol, &symbol);
+
         let (order_side, quantity, quote_order_quantity) = match side_norm.as_str() {
             "sell" => Self::prepare_sell_order(amount_dec, filters.as_ref(), symbol.as_str())?,
             "buy" => {
-                self.prepare_buy_order(&ex, amount_dec, filters.as_ref(), api_symbol, symbol.as_str())
-                    .await?
+                self.prepare_buy_order(
+                    &ex,
+                    amount_dec,
+                    filters.as_ref(),
+                    api_symbol,
+                    symbol.as_str(),
+                    options.buy_mode,
+                    options.max_quote_overspend_bps,
+                )
+                .await?
             }
             _ => return Err(format!("unsupported side: {}", side)),
         };
 
         // Try multiple candidate symbols for MEXC quirks, then fetch the filled amount.
-        let candidates = Self::candidate_symbols(api_symbol, &market_symbol, &symbol);
-        let (chosen_symbol, order_id) = self
+        let submit_res = self
             .submit_market_order(
                 &ex,
                 &candidates,
                 order_side,
                 quantity,
                 quote_order_quantity,
+                options.client_order_id.as_deref(),
                 market,
                 side,
                 amount_in,
             )
-            .await?;
+            .await;
 
-        self.fetch_filled_amount(&ex, &chosen_symbol, &order_id, &side_norm)
-            .await
+        match submit_res {
+            Ok((chosen_symbol, order_id)) => {
+                match self.fetch_fill_report(&ex, &chosen_symbol, &order_id, &side_norm).await {
+                    Ok(report) => Ok(report),
+                    Err(fetch_err) => {
+                        if let Some(client_order_id) = options.client_order_id.as_deref()
+                            && let Some(report) = self
+                                .try_fetch_fill_report_by_client_order_id_candidates(
+                                    &ex,
+                                    &candidates,
+                                    client_order_id,
+                                    &side_norm,
+                                )
+                                .await?
+                        {
+                            info!(
+                                "[mexc] recovered filled order by client id after get_order miss market={} side={} client_id={}",
+                                market, side, client_order_id
+                            );
+                            return Ok(report);
+                        }
+
+                        if is_order_missing_lookup_error(&fetch_err) {
+                            return Err(format!(
+                                "order lookup pending after submit market={} side={} symbol={} order_id={} err={}",
+                                market, side, chosen_symbol, order_id, fetch_err
+                            ));
+                        }
+
+                        Err(fetch_err)
+                    }
+                }
+            }
+            Err(submit_err) => {
+                if let Some(client_order_id) = options.client_order_id.as_deref()
+                    && let Some(report) = self
+                        .try_fetch_fill_report_by_client_order_id_candidates(
+                            &ex,
+                            &candidates,
+                            client_order_id,
+                            &side_norm,
+                        )
+                        .await?
+                {
+                    info!(
+                        "[mexc] recovered filled order by client id after submit error market={} side={} client_id={}",
+                        market, side, client_order_id
+                    );
+                    return Ok(report);
+                }
+                Err(submit_err)
+            }
+        }
     }
 
     async fn get_orderbook(&self, market: &str, limit: Option<u32>) -> Result<OrderBook, String> {
@@ -924,5 +1186,43 @@ impl CexBackend for MexcClient {
 
         let status = from_mexc_raw(rec.status.as_str());
         Ok(status)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn map_fill_report_buy_uses_quote_as_input_and_base_as_output() {
+        let report =
+            MexcClient::map_fill_report("buy", Decimal::new(185, 6), Decimal::new(1280, 2)).expect("map should work");
+        assert!((report.input_consumed - 12.8).abs() < 1e-12);
+        assert!((report.output_received - 0.000185).abs() < 1e-12);
+    }
+
+    #[test]
+    fn map_fill_report_sell_uses_base_as_input_and_quote_as_output() {
+        let report =
+            MexcClient::map_fill_report("sell", Decimal::new(185, 6), Decimal::new(1280, 2)).expect("map should work");
+        assert!((report.input_consumed - 0.000185).abs() < 1e-12);
+        assert!((report.output_received - 12.8).abs() < 1e-12);
+    }
+
+    #[test]
+    fn detects_order_missing_lookup_error_shapes() {
+        assert!(is_order_missing_lookup_error(
+            "400 Bad Request {\"msg\":\"Order does not exist.\",\"code\":-2013}"
+        ));
+        assert!(is_order_missing_lookup_error(
+            "Get_order err: code=-2013 msg=Unknown order sent."
+        ));
+        assert!(!is_order_missing_lookup_error("order not executed, status: New"));
+    }
+
+    #[test]
+    fn candidate_symbols_are_normalized_and_deduped() {
+        let candidates = MexcClient::candidate_symbols("CKBTCBTC", "CKBTC_BTC", "ckbtc-btc");
+        assert_eq!(candidates, vec!["CKBTCBTC".to_string()]);
     }
 }

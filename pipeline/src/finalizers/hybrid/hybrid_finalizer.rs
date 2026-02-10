@@ -116,6 +116,17 @@ where
         est_value_usd > 0.0 && est_value_usd < DEX_DUST_MAX_USD
     }
 
+    /// In hybrid mode, force CEX when estimated notional is above configured threshold.
+    /// A non-positive threshold disables this fast-path override.
+    fn should_force_cex_over_threshold(&self, receipt: &ExecutionReceipt, swap_req: &SwapRequest) -> bool {
+        let est_value_usd = Self::estimate_swap_value_usd(receipt, swap_req);
+        let threshold_usd = self.config.get_cex_force_over_usd_threshold();
+        if threshold_usd <= 0.0 {
+            return false;
+        }
+        est_value_usd > threshold_usd
+    }
+
     /// Build a successful no-swap result and mark WAL succeeded.
     async fn finalize_without_swap(
         &self,
@@ -288,7 +299,18 @@ where
             return self.execute_route(wal, receipt, RouteVenue::Dex, Some(&reason)).await;
         }
 
-        // 4) Candidate build and compare by projected net edge.
+        // 4) Force CEX over configured threshold in hybrid mode.
+        if self.should_force_cex_over_threshold(&receipt, &swap_req) {
+            let est_value_usd = Self::estimate_swap_value_usd(&receipt, &swap_req);
+            let threshold_usd = self.config.get_cex_force_over_usd_threshold();
+            let reason = format!(
+                "force cex route est_value_usd={:.4} threshold_usd={:.2}",
+                est_value_usd, threshold_usd
+            );
+            return self.execute_route(wal, receipt, RouteVenue::Cex, Some(&reason)).await;
+        }
+
+        // 5) Candidate build and compare by projected net edge.
         let gross_edge_bps = Self::gross_edge_bps(&receipt);
         let min_net_edge_bps = self.config.get_cex_min_net_edge_bps() as f64;
 
@@ -325,10 +347,213 @@ where
                 .await;
         }
 
-        // 5) Neither route met threshold constraints.
+        // 6) Neither route met threshold constraints.
         Err(format!(
             "no viable route: gross_edge_bps={:.2}, min_required_bps={:.2}",
             gross_edge_bps, min_net_edge_bps
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use async_trait::async_trait;
+    use candid::{Nat, Principal};
+    use liquidium_pipeline_core::tokens::{chain_token::ChainToken, chain_token_amount::ChainTokenAmount};
+    use liquidium_pipeline_core::types::protocol_types::{
+        AssetType, LiquidationAmounts, LiquidationRequest, LiquidationResult, LiquidationStatus, TransferStatus,
+        TxStatus,
+    };
+
+    use crate::config::MockConfigTrait;
+    use crate::executors::executor::ExecutorRequest;
+    use crate::finalizers::dex_finalizer::DexFinalizerLogic;
+    use crate::persistance::MockWalStore;
+    use crate::stages::executor::{ExecutionReceipt, ExecutionStatus};
+    use crate::swappers::model::{SwapExecution, SwapQuote, SwapRequest};
+    use crate::swappers::swap_interface::MockSwapInterface;
+
+    struct NoopDexFinalizer;
+
+    #[async_trait]
+    impl DexFinalizerLogic for NoopDexFinalizer {
+        async fn swap(&self, _req: &SwapRequest) -> Result<SwapExecution, String> {
+            Err("dex finalizer should not run".to_string())
+        }
+    }
+
+    fn make_receipt(est_value_usd: f64) -> ExecutionReceipt {
+        let collateral = ChainToken::Icp {
+            ledger: Principal::anonymous(),
+            symbol: "ckBTC".to_string(),
+            decimals: 8,
+            fee: Nat::from(1_000u64),
+        };
+        let debt = ChainToken::Icp {
+            ledger: Principal::anonymous(),
+            symbol: "ckUSDT".to_string(),
+            decimals: 6,
+            fee: Nat::from(1_000u64),
+        };
+
+        let swap_req = SwapRequest {
+            pay_asset: collateral.asset_id(),
+            pay_amount: ChainTokenAmount::from_formatted(collateral.clone(), 1.0),
+            receive_asset: debt.asset_id(),
+            receive_address: Some("dest".to_string()),
+            max_slippage_bps: Some(100),
+            venue_hint: None,
+        };
+
+        let liquidation = LiquidationRequest {
+            borrower: Principal::anonymous(),
+            debt_pool_id: Principal::anonymous(),
+            collateral_pool_id: Principal::anonymous(),
+            debt_amount: Nat::from(1_000u64),
+            receiver_address: Principal::anonymous(),
+            buy_bad_debt: false,
+        };
+
+        let liq_result = LiquidationResult {
+            id: 42,
+            timestamp: 0,
+            amounts: LiquidationAmounts {
+                collateral_received: Nat::from(1_000u64),
+                debt_repaid: Nat::from(1_000u64),
+            },
+            collateral_asset: AssetType::Unknown,
+            debt_asset: AssetType::Unknown,
+            status: LiquidationStatus::Success,
+            change_tx: TxStatus {
+                tx_id: None,
+                status: TransferStatus::Success,
+            },
+            collateral_tx: TxStatus {
+                tx_id: None,
+                status: TransferStatus::Success,
+            },
+        };
+
+        let ref_price_ray = (est_value_usd * 1e27f64).round() as u128;
+        let req = ExecutorRequest {
+            liquidation,
+            swap_args: Some(swap_req),
+            debt_asset: debt,
+            collateral_asset: collateral,
+            expected_profit: 0,
+            ref_price: Nat::from(ref_price_ray),
+            debt_approval_needed: false,
+        };
+
+        ExecutionReceipt {
+            request: req,
+            liquidation_result: Some(liq_result),
+            status: ExecutionStatus::Success,
+            change_received: true,
+        }
+    }
+
+    #[tokio::test]
+    async fn hybrid_force_cex_over_threshold_skips_candidate_previews() {
+        let mut config = MockConfigTrait::new();
+        config.expect_get_swapper_mode().return_const(SwapperMode::Hybrid);
+        config.expect_get_cex_force_over_usd_threshold().return_const(2.5);
+
+        let mut dex_swapper = MockSwapInterface::new();
+        dex_swapper.expect_quote().times(0);
+        dex_swapper.expect_execute().times(0);
+
+        let wal = MockWalStore::new();
+        let finalizer = HybridFinalizer {
+            config: Arc::new(config),
+            dex_swapper: Arc::new(dex_swapper),
+            dex_finalizer: Arc::new(NoopDexFinalizer),
+            cex_finalizer: None,
+        };
+
+        let err = finalizer
+            .finalize(&wal, make_receipt(3.0))
+            .await
+            .expect_err("route should fail because cex finalizer is missing");
+
+        assert!(err.contains("missing cex finalizer"));
+    }
+
+    #[tokio::test]
+    async fn hybrid_does_not_force_cex_at_exact_threshold() {
+        let mut config = MockConfigTrait::new();
+        config.expect_get_swapper_mode().return_const(SwapperMode::Hybrid);
+        config.expect_get_cex_force_over_usd_threshold().return_const(2.5);
+        config.expect_get_cex_min_net_edge_bps().return_const(1_000u32);
+
+        let mut dex_swapper = MockSwapInterface::new();
+        dex_swapper.expect_quote().times(1).returning(|req| {
+            Ok(SwapQuote {
+                pay_asset: req.pay_asset.clone(),
+                pay_amount: req.pay_amount.value.clone(),
+                receive_asset: req.receive_asset.clone(),
+                receive_amount: Nat::from(1u8),
+                mid_price: 1.0,
+                exec_price: 1.0,
+                slippage: 0.0,
+                legs: vec![],
+            })
+        });
+        dex_swapper.expect_execute().times(0);
+
+        let wal = MockWalStore::new();
+        let finalizer = HybridFinalizer {
+            config: Arc::new(config),
+            dex_swapper: Arc::new(dex_swapper),
+            dex_finalizer: Arc::new(NoopDexFinalizer),
+            cex_finalizer: None,
+        };
+
+        let err = finalizer
+            .finalize(&wal, make_receipt(2.5))
+            .await
+            .expect_err("no route should satisfy min net edge");
+
+        assert!(err.contains("no viable route"));
+    }
+
+    #[tokio::test]
+    async fn hybrid_zero_force_threshold_disables_force_path() {
+        let mut config = MockConfigTrait::new();
+        config.expect_get_swapper_mode().return_const(SwapperMode::Hybrid);
+        config.expect_get_cex_force_over_usd_threshold().return_const(0.0);
+        config.expect_get_cex_min_net_edge_bps().return_const(1_000u32);
+
+        let mut dex_swapper = MockSwapInterface::new();
+        // If force-path is disabled, candidate preview logic runs and calls DEX quote.
+        dex_swapper.expect_quote().times(1).returning(|req| {
+            Ok(SwapQuote {
+                pay_asset: req.pay_asset.clone(),
+                pay_amount: req.pay_amount.value.clone(),
+                receive_asset: req.receive_asset.clone(),
+                receive_amount: Nat::from(1u8),
+                mid_price: 1.0,
+                exec_price: 1.0,
+                slippage: 0.0,
+                legs: vec![],
+            })
+        });
+        dex_swapper.expect_execute().times(0);
+
+        let wal = MockWalStore::new();
+        let finalizer = HybridFinalizer {
+            config: Arc::new(config),
+            dex_swapper: Arc::new(dex_swapper),
+            dex_finalizer: Arc::new(NoopDexFinalizer),
+            cex_finalizer: None,
+        };
+
+        let err = finalizer
+            .finalize(&wal, make_receipt(100.0))
+            .await
+            .expect_err("no route should satisfy min net edge");
+
+        assert!(err.contains("no viable route"));
     }
 }

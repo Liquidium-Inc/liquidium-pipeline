@@ -101,6 +101,120 @@ CEX_MEXC_API_SECRET=your_api_secret
 MAX_ALLOWED_CEX_SLIPPAGE_BPS=200  # 2.00% in basis points
 ```
 
+### Advanced CEX/Hybrid Tuning
+
+```bash
+# CEX trade slicing and execution controls
+# Skip execution chunks below this USD notional (treat as dust)
+CEX_MIN_EXEC_USD=2.0
+# Per-slice impact target ratio of MAX_ALLOWED_CEX_SLIPPAGE_BPS
+CEX_SLICE_TARGET_RATIO=0.7
+# Arm adaptive buy fallback when truncation ratio is >= this value
+CEX_BUY_TRUNCATION_TRIGGER_RATIO=0.25
+# Max quote overspend allowed for inverse/base buy fallback (bps)
+CEX_BUY_INVERSE_OVESPEND_BPS=10
+# Max inverse/base fallback retries per trade leg
+CEX_BUY_INVERSE_MAX_RETRIES=1
+# Enable/disable adaptive inverse/base fallback
+CEX_BUY_INVERSE_ENABLED=true
+# Retry backoff base and cap (seconds) for retryable CEX errors
+CEX_RETRY_BASE_SECS=5
+CEX_RETRY_MAX_SECS=120
+# Minimum projected net edge required before executing on CEX (bps)
+CEX_MIN_NET_EDGE_BPS=150
+# Additional latency-risk haircut applied to projected edge (bps)
+CEX_DELAY_BUFFER_BPS=75
+# Estimated route fee haircut applied to projected edge (bps)
+CEX_ROUTE_FEE_BPS=25
+# Hybrid shortcut: force CEX above this notional (USD), set 0 to disable
+CEX_FORCE_OVER_USD_THRESHOLD=2.5
+```
+
+Quick reference:
+
+| Parameter | What it controls |
+|----------|-------------------|
+| `CEX_MIN_EXEC_USD` | Dust floor per slice (below this, execution is skipped). |
+| `CEX_SLICE_TARGET_RATIO` | How aggressive slice sizing is vs hard slippage cap. |
+| `CEX_BUY_TRUNCATION_TRIGGER_RATIO` | When buy truncation is considered large enough to trigger fallback logic. |
+| `CEX_BUY_INVERSE_OVESPEND_BPS` | Safety cap for how much inverse/base buy mode may overspend. |
+| `CEX_BUY_INVERSE_MAX_RETRIES` | Max fallback attempts per leg. |
+| `CEX_BUY_INVERSE_ENABLED` | Master toggle for adaptive buy fallback. |
+| `CEX_RETRY_BASE_SECS` | Initial retry delay after retryable CEX errors. |
+| `CEX_RETRY_MAX_SECS` | Maximum retry delay cap. |
+| `CEX_MIN_NET_EDGE_BPS` | Minimum projected edge needed before choosing CEX path. |
+| `CEX_DELAY_BUFFER_BPS` | Extra haircut for execution-latency/price-move risk. |
+| `CEX_ROUTE_FEE_BPS` | Fee haircut applied during route edge estimation. |
+| `CEX_FORCE_OVER_USD_THRESHOLD` | In hybrid mode, force CEX above this USD notional (`0` disables). |
+
+#### `CEX_SLICE_TARGET_RATIO` Explained
+
+`CEX_SLICE_TARGET_RATIO` controls how aggressive each CEX execution slice is.
+
+The slicer computes:
+
+`target_slice_bps = MAX_ALLOWED_CEX_SLIPPAGE_BPS * CEX_SLICE_TARGET_RATIO`
+
+With:
+- `MAX_ALLOWED_CEX_SLIPPAGE_BPS=200`
+- `CEX_SLICE_TARGET_RATIO=0.7`
+
+Target per slice becomes `140 bps`.
+
+Meaning:
+- Higher ratio (`0.9`) -> larger slices, fewer orders, more impact risk.
+- Lower ratio (`0.4`) -> smaller slices, more orders, lower impact risk.
+
+Important:
+- This is a **sizing target**, not the hard reject limit.
+- Hard rejection still uses `MAX_ALLOWED_CEX_SLIPPAGE_BPS`.
+
+Examples when `MAX_ALLOWED_CEX_SLIPPAGE_BPS=200`:
+- `CEX_SLICE_TARGET_RATIO=0.5` -> target `100 bps`
+- `CEX_SLICE_TARGET_RATIO=0.7` -> target `140 bps`
+- `CEX_SLICE_TARGET_RATIO=1.0` -> target `200 bps`
+
+#### Impact Risk (What Can Still Go Wrong)
+
+Even with slicing, execution still has market-impact and timing risk:
+
+- **Book movement risk**: preview uses current orderbook, but fills happen slightly later.
+- **Depth cliff risk**: one more level consumed can sharply worsen average price.
+- **Thin-book risk**: soft target may find no chunk; only hard-cap fallback may be possible.
+- **Precision/truncation risk**: exchange step-size and min-notional rules can reduce consumed size.
+- **Retry drift risk**: after a retry, liquidity and prices may be different.
+
+How config controls this risk:
+
+- `MAX_ALLOWED_CEX_SLIPPAGE_BPS`: hard per-slice reject limit (safety brake).
+- `CEX_SLICE_TARGET_RATIO`: softer sizing target below hard limit (execution smoothness).
+- `CEX_MIN_EXEC_USD`: prevents low-notional micro-fills that usually have poor quality.
+- `CEX_BUY_*`: controls adaptive buy fallback when quote-mode truncation leaves meaningful residual.
+
+#### Execution Algorithm (Per Trade Leg)
+
+For each leg, the finalizer runs a resumable slice loop:
+
+1. Compute target slice impact:
+   `target_slice_bps = MAX_ALLOWED_CEX_SLIPPAGE_BPS * CEX_SLICE_TARGET_RATIO`
+2. Fetch orderbook for the leg market.
+3. Estimate the largest chunk under `target_slice_bps` using binary search on simulated impact.
+4. If no positive chunk passes soft target, try one-shot fallback:
+   full remaining amount is accepted only if fillable and under the hard cap.
+5. If chunk notional is below `CEX_MIN_EXEC_USD`, mark as dust and stop this leg.
+6. Submit one market slice with deterministic `client_order_id` (WAL-safe resume/idempotency).
+7. Use **actual** exchange fill amounts (`input_consumed`, `output_received`) for math.
+8. Compute realized execution price and slippage:
+   - sell: `exec_price = output_received / input_consumed`
+   - buy: `exec_price = input_consumed / output_received`
+   - sell slippage bps: `max(0, (preview_mid - exec_price) / preview_mid * 10000)`
+   - buy slippage bps: `max(0, (exec_price - preview_mid) / preview_mid * 10000)`
+9. If realized slippage > `MAX_ALLOWED_CEX_SLIPPAGE_BPS`, fail fast.
+10. Otherwise, persist progress (`remaining_in`, `total_out`) and continue until consumed/dust.
+11. On buy legs only, if truncation ratio is large and residual is executable, arm one inverse/base fallback retry (bounded by `CEX_BUY_INVERSE_MAX_RETRIES`).
+
+Route summary metrics are updated from slice notional, and weighted slippage is tracked for post-trade reporting.
+
 **Supported swappers:**
 
 - **DEX (Kong)** — `SWAPPER=dex` (uses the Kong canister specified by `KONG_SWAP_BACKEND`)

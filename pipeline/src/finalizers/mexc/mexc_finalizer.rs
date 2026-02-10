@@ -5,7 +5,9 @@ use std::time::Duration;
 use async_trait::async_trait;
 use candid::{Nat, Principal};
 use icrc_ledger_types::icrc1::account::Account;
-use liquidium_pipeline_connectors::backend::cex_backend::{CexBackend, OrderBookLevel};
+use liquidium_pipeline_connectors::backend::cex_backend::{
+    BuyOrderInputMode, CexBackend, OrderBookLevel, SwapExecutionOptions,
+};
 use liquidium_pipeline_core::{
     account::model::ChainAccount,
     tokens::{chain_token::ChainToken, chain_token_amount::ChainTokenAmount},
@@ -20,7 +22,10 @@ use super::mexc_utils::{
     parse_market_symbols, simulate_buy_from_asks, simulate_sell_from_bids,
 };
 use crate::{
-    finalizers::cex_finalizer::{CexFinalizerLogic, CexRoutePreview, CexState, CexStep, CexTradeSlice},
+    finalizers::cex_finalizer::{
+        CexDepositState, CexFinalizerLogic, CexRoutePreview, CexState, CexStep, CexTradeSlice, CexTradeState,
+        CexWithdrawState,
+    },
     stages::executor::ExecutionReceipt,
     swappers::model::{SwapExecution, SwapQuoteLeg},
     utils::now_ts,
@@ -45,6 +50,14 @@ where
     pub cex_min_exec_usd: f64,
     /// Target fraction of slippage cap used for per-slice sizing.
     pub cex_slice_target_ratio: f64,
+    /// Buy truncation trigger ratio for quote->inverse fallback.
+    pub cex_buy_truncation_trigger_ratio: f64,
+    /// Overspend cap for inverse/base buy fallback, in bps.
+    pub cex_buy_inverse_overspend_bps: u32,
+    /// Maximum inverse fallback retries per leg.
+    pub cex_buy_inverse_max_retries: u32,
+    /// Enables inverse buy fallback after truncation.
+    pub cex_buy_inverse_enabled: bool,
     /// `approve_bumps` is only touched in short synchronous sections.
     approve_bumps: Mutex<HashMap<String, u8>>,
     /// `market_locks` is acquired/held in async trade flow, so it uses Tokio's async mutex.
@@ -61,6 +74,10 @@ const APPROVE_BUMP_BATCH_SIZE: u8 = 3;
 const APPROVE_BUMP_DELAY_MS: u64 = 300;
 const APPROVE_BUMP_BATCH_DELAY_SECS: u64 = 3;
 pub const MEXC_DEPOSIT_FEE_MULTIPLIER: u8 = 7;
+const DEFAULT_BUY_TRUNCATION_TRIGGER_RATIO: f64 = 0.25;
+const DEFAULT_BUY_INVERSE_OVERSPEND_BPS: u32 = 10;
+const DEFAULT_BUY_INVERSE_MAX_RETRIES: u32 = 1;
+const DEFAULT_BUY_INVERSE_ENABLED: bool = true;
 
 impl<C> MexcFinalizer<C>
 where
@@ -74,6 +91,33 @@ where
         cex_min_exec_usd: f64,
         cex_slice_target_ratio: f64,
     ) -> Self {
+        Self::new_with_tunables(
+            backend,
+            transfer_service,
+            liquidator_principal,
+            max_sell_slippage_bps,
+            cex_min_exec_usd,
+            cex_slice_target_ratio,
+            DEFAULT_BUY_TRUNCATION_TRIGGER_RATIO,
+            DEFAULT_BUY_INVERSE_OVERSPEND_BPS,
+            DEFAULT_BUY_INVERSE_MAX_RETRIES,
+            DEFAULT_BUY_INVERSE_ENABLED,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_tunables(
+        backend: Arc<C>,
+        transfer_service: Arc<dyn TransferActions>,
+        liquidator_principal: Principal,
+        max_sell_slippage_bps: f64,
+        cex_min_exec_usd: f64,
+        cex_slice_target_ratio: f64,
+        cex_buy_truncation_trigger_ratio: f64,
+        cex_buy_inverse_overspend_bps: u32,
+        cex_buy_inverse_max_retries: u32,
+        cex_buy_inverse_enabled: bool,
+    ) -> Self {
         Self {
             backend,
             transfer_service,
@@ -81,6 +125,10 @@ where
             max_sell_slippage_bps,
             cex_min_exec_usd,
             cex_slice_target_ratio,
+            cex_buy_truncation_trigger_ratio,
+            cex_buy_inverse_overspend_bps,
+            cex_buy_inverse_max_retries,
+            cex_buy_inverse_enabled,
             approve_bumps: Mutex::new(HashMap::new()),
             market_locks: TokioMutex::new(HashMap::new()),
         }
@@ -112,14 +160,6 @@ where
             liq_id: liq_id.to_string(),
             step: CexStep::Deposit,
             last_error: None,
-
-            // deposit leg
-            deposit_asset: receipt.request.collateral_asset.clone(),
-            deposit_txid: None,
-            deposit_balance_before: None,
-            approval_bump_count: None,
-
-            // trade leg
             market: format!(
                 "{}_{}",
                 receipt.request.collateral_asset.symbol(),
@@ -127,26 +167,43 @@ where
             ),
             side: "sell".to_string(),
             size_in,
-            trade_leg_index: None,
-            trade_leg_total: None,
-            trade_last_market: None,
-            trade_last_side: None,
-            trade_last_amount_in: None,
-            trade_last_amount_out: None,
-            trade_next_amount_in: None,
-            trade_weighted_slippage_bps: None,
-            trade_mid_notional_sum: None,
-            trade_exec_notional_sum: None,
-            trade_slices: Vec::new(),
-            trade_dust_skipped: false,
-            trade_dust_usd: None,
-
-            // withdraw leg
-            withdraw_asset: receipt.request.debt_asset.clone(),
-            withdraw_address: self.liquidator_principal.to_text(),
-            withdraw_id: None,
-            withdraw_txid: None,
-            size_out: None,
+            deposit: CexDepositState {
+                deposit_asset: receipt.request.collateral_asset.clone(),
+                deposit_txid: None,
+                deposit_balance_before: None,
+                approval_bump_count: None,
+            },
+            trade: CexTradeState {
+                trade_leg_index: None,
+                trade_leg_total: None,
+                trade_last_market: None,
+                trade_last_side: None,
+                trade_last_amount_in: None,
+                trade_last_amount_out: None,
+                trade_next_amount_in: None,
+                trade_weighted_slippage_bps: None,
+                trade_mid_notional_sum: None,
+                trade_exec_notional_sum: None,
+                trade_slices: Vec::new(),
+                trade_dust_skipped: false,
+                trade_dust_usd: None,
+                trade_progress_remaining_in: None,
+                trade_progress_total_out: None,
+                trade_pending_client_order_id: None,
+                trade_pending_market: None,
+                trade_pending_side: None,
+                trade_pending_requested_in: None,
+                trade_pending_buy_mode: None,
+                trade_inverse_retry_count: 0,
+                trade_unexecutable_residual_in: None,
+            },
+            withdraw: CexWithdrawState {
+                withdraw_asset: receipt.request.debt_asset.clone(),
+                withdraw_address: self.liquidator_principal.to_text(),
+                withdraw_id: None,
+                withdraw_txid: None,
+                size_out: None,
+            },
         })
     }
 
@@ -154,13 +211,13 @@ where
         debug!(
             "[mexc] liq_id={} step=Deposit asset={} network={}",
             state.liq_id,
-            state.deposit_asset,
-            state.deposit_asset.chain()
+            state.deposit.deposit_asset,
+            state.deposit.deposit_asset.chain()
         );
 
         // Phase A: no transfer yet -> snapshot balance and send once, then stay in Deposit.
-        if state.deposit_txid.is_none() {
-            let symbol = state.deposit_asset.symbol();
+        if state.deposit.deposit_txid.is_none() {
+            let symbol = state.deposit.deposit_asset.symbol();
             let baseline = match self.backend.get_balance(&symbol).await {
                 Ok(bal) => bal,
                 Err(e) => {
@@ -177,11 +234,14 @@ where
                 state.liq_id, baseline
             );
 
-            state.deposit_balance_before = Some(baseline);
+            state.deposit.deposit_balance_before = Some(baseline);
 
             let addr = self
                 .backend
-                .get_deposit_address(&state.deposit_asset.symbol(), &state.deposit_asset.chain())
+                .get_deposit_address(
+                    &state.deposit.deposit_asset.symbol(),
+                    &state.deposit.deposit_asset.chain(),
+                )
                 .await?;
 
             debug!(
@@ -191,8 +251,8 @@ where
 
             let amount = &state.size_in;
 
-            let fee = state.deposit_asset.fee() * MEXC_DEPOSIT_FEE_MULTIPLIER; // TODO: Remove after mexc handles deposit confirations
-            let fee_amount = ChainTokenAmount::from_raw(state.deposit_asset.clone(), fee.clone());
+            let fee = state.deposit.deposit_asset.fee() * MEXC_DEPOSIT_FEE_MULTIPLIER; // TODO: Remove after mexc handles deposit confirations
+            let fee_amount = ChainTokenAmount::from_raw(state.deposit.deposit_asset.clone(), fee.clone());
 
             let zero = Nat::from(0u8);
             let transfer_value = if fee > zero {
@@ -201,16 +261,19 @@ where
                         "deposit amount {} too small to cover fee {} for {}",
                         amount.formatted(),
                         fee_amount.formatted(),
-                        state.deposit_asset.symbol()
+                        state.deposit.deposit_asset.symbol()
                     ));
                 }
                 amount.value.clone() - fee.clone()
             } else {
                 amount.value.clone()
             };
-            let transfer_amount = ChainTokenAmount::from_raw(state.deposit_asset.clone(), transfer_value.clone());
-            let total_amount =
-                ChainTokenAmount::from_raw(state.deposit_asset.clone(), transfer_value.clone() + fee.clone());
+            let transfer_amount =
+                ChainTokenAmount::from_raw(state.deposit.deposit_asset.clone(), transfer_value.clone());
+            let total_amount = ChainTokenAmount::from_raw(
+                state.deposit.deposit_asset.clone(),
+                transfer_value.clone() + fee.clone(),
+            );
 
             debug!(
                 "[mexc] liq_id={} deposit transfer requested={} fee={} net_transfer={} total_debit={}",
@@ -230,7 +293,7 @@ where
 
             let tx_id = actions
                 .transfer(
-                    &state.deposit_asset,
+                    &state.deposit.deposit_asset,
                     &ChainAccount::Icp(Account {
                         owner: Principal::from_text(addr.address)
                             .map_err(|e| format!("invalid deposit address: {e}"))?,
@@ -240,23 +303,25 @@ where
                 )
                 .await?;
 
-            state.trade_next_amount_in = Some(transfer_amount.to_f64());
+            state.trade.trade_next_amount_in = Some(transfer_amount.to_f64());
 
             debug!("[mexc] liq_id={} sent deposit txid={}", state.liq_id, tx_id);
 
-            if matches!(state.deposit_asset, ChainToken::Icp { .. }) {
-                let approved = self.maybe_bump_mexc_approval(&state.liq_id, &state.deposit_asset).await;
+            if matches!(state.deposit.deposit_asset, ChainToken::Icp { .. }) {
+                let approved = self
+                    .maybe_bump_mexc_approval(&state.liq_id, &state.deposit.deposit_asset)
+                    .await;
                 if approved > 0 {
-                    state.approval_bump_count = Some(approved);
+                    state.deposit.approval_bump_count = Some(approved);
                 }
             } else {
                 debug!(
                     "[mexc] liq_id={} deposit transfer: approve bump skipped (non-ICP asset={})",
-                    state.liq_id, state.deposit_asset
+                    state.liq_id, state.deposit.deposit_asset
                 );
             }
 
-            state.deposit_txid = Some(tx_id);
+            state.deposit.deposit_txid = Some(tx_id);
             state.step = CexStep::DepositPending;
 
             // Keep step as Deposit. WAL will persist, and a later finalize run
@@ -312,7 +377,7 @@ where
         let legs = self.resolve_trade_legs(state).await?;
 
         // 3) Persist total route length for telemetry / resumability.
-        state.trade_leg_total = Some(legs.len() as u32);
+        state.trade.trade_leg_total = Some(legs.len() as u32);
 
         // 4) Log explicit multi-hop route details when applicable.
         if legs.len() > 1 {
@@ -326,20 +391,28 @@ where
         }
 
         // 6) Figure out which leg to process now (resumable index).
-        let idx = state.trade_leg_index.unwrap_or(0) as usize;
+        let idx = state.trade.trade_leg_index.unwrap_or(0) as usize;
 
         // 7) If index is already past route end, go straight to withdraw step.
         if idx >= legs.len() {
             state.step = CexStep::Withdraw;
             // 8) Carry forward already computed output amount if present.
-            if let Some(out_amt) = state.trade_next_amount_in {
-                state.size_out = Some(ChainTokenAmount::from_formatted(state.withdraw_asset.clone(), out_amt));
+            if let Some(out_amt) = state.trade.trade_next_amount_in {
+                state.withdraw.size_out = Some(ChainTokenAmount::from_formatted(
+                    state.withdraw.withdraw_asset.clone(),
+                    out_amt,
+                ));
             }
             return Ok(());
         }
 
-        // 9) Input for this leg is either previous leg output or initial deposit size.
-        let amount_in = state.trade_next_amount_in.unwrap_or_else(|| state.size_in.to_f64());
+        // 9) Input for this leg is either resumed residual, previous leg output, or initial deposit size.
+        let amount_in = state.trade.trade_progress_remaining_in.unwrap_or_else(|| {
+            state
+                .trade
+                .trade_next_amount_in
+                .unwrap_or_else(|| state.size_in.to_f64())
+        });
 
         // 10) Nothing to trade (or dust below epsilon) -> finish trading phase.
         if amount_in <= LIQUIDITY_EPS {
@@ -348,6 +421,16 @@ where
                 state.liq_id, amount_in
             );
             state.step = CexStep::Withdraw;
+            if let Some(out_amt) = state
+                .trade
+                .trade_progress_total_out
+                .or(state.trade.trade_next_amount_in)
+            {
+                state.withdraw.size_out = Some(ChainTokenAmount::from_formatted(
+                    state.withdraw.withdraw_asset.clone(),
+                    out_amt.max(0.0),
+                ));
+            }
             return Ok(());
         }
 
@@ -395,8 +478,8 @@ where
             amount_in,
             total_out,
             remaining_in,
-            state.trade_dust_skipped,
-            state.trade_dust_usd
+            state.trade.trade_dust_skipped,
+            state.trade.trade_dust_usd
         );
 
         // 16) Move to next leg or to withdraw (and set `size_out` when route is done).
@@ -407,27 +490,27 @@ where
 
     async fn withdraw(&self, state: &mut CexState) -> Result<(), String> {
         let expected_address = self.liquidator_principal.to_text();
-        if state.withdraw_address != expected_address {
+        if state.withdraw.withdraw_address != expected_address {
             debug!(
                 "[mexc] liq_id={} override withdraw_address {} -> {}",
-                state.liq_id, state.withdraw_address, expected_address
+                state.liq_id, state.withdraw.withdraw_address, expected_address
             );
-            state.withdraw_address = expected_address;
+            state.withdraw.withdraw_address = expected_address;
         }
 
         debug!(
             "[mexc] liq_id={} step=Withdraw asset={} network={} address={}",
             state.liq_id,
-            state.withdraw_asset,
-            state.withdraw_asset.chain(),
-            state.withdraw_address,
+            state.withdraw.withdraw_asset,
+            state.withdraw.withdraw_asset.chain(),
+            state.withdraw.withdraw_address,
         );
 
         // Idempotency: if we already have a withdraw id or txid, just advance.
-        if state.withdraw_id.is_some() || state.withdraw_txid.is_some() {
+        if state.withdraw.withdraw_id.is_some() || state.withdraw.withdraw_txid.is_some() {
             debug!(
                 "[mexc] liq_id={} withdraw already recorded (id={:?}, txid={:?}), skipping",
-                state.liq_id, state.withdraw_id, state.withdraw_txid,
+                state.liq_id, state.withdraw.withdraw_id, state.withdraw.withdraw_txid,
             );
             state.step = CexStep::Completed;
             return Ok(());
@@ -435,6 +518,7 @@ where
 
         // Amount to withdraw: prefer post-trade output when available.
         let amount = state
+            .withdraw
             .size_out
             .as_ref()
             .map(|out| out.to_f64())
@@ -451,9 +535,9 @@ where
         let receipt = self
             .backend
             .withdraw(
-                &state.withdraw_asset.symbol(),
-                &state.withdraw_asset.chain(),
-                &state.withdraw_address,
+                &state.withdraw.withdraw_asset.symbol(),
+                &state.withdraw.withdraw_asset.chain(),
+                &state.withdraw.withdraw_address,
                 amount,
             )
             .await?;
@@ -461,16 +545,16 @@ where
         debug!(
             "[mexc] liq_id={} withdraw executed: asset={} network={} amount={} txid={:?} internal_id={:?}",
             state.liq_id,
-            state.withdraw_asset.symbol(),
-            state.withdraw_asset.chain(),
+            state.withdraw.withdraw_asset.symbol(),
+            state.withdraw.withdraw_asset.chain(),
             amount,
             receipt.txid,
             receipt.internal_id,
         );
 
         // Persist identifiers for idempotency.
-        state.withdraw_id = receipt.internal_id.clone();
-        state.withdraw_txid = receipt.txid.clone();
+        state.withdraw.withdraw_id = receipt.internal_id.clone();
+        state.withdraw.withdraw_txid = receipt.txid.clone();
 
         // Mark the CEX leg as completed.
         state.step = CexStep::Completed;
@@ -479,6 +563,7 @@ where
 
     async fn finish(&self, _receipt: &ExecutionReceipt, state: &CexState) -> Result<SwapExecution, String> {
         let receive_amount = state
+            .withdraw
             .size_out
             .clone()
             .ok_or_else(|| "receive amount missing".to_string())?;
@@ -491,26 +576,28 @@ where
         let recv_f = receive_amount.to_f64();
 
         let exec_price = if pay_f > 0.0 { recv_f / pay_f } else { 0.0 };
-        let mid_price =
-            if let (Some(mid_sum), Some(exec_sum)) = (state.trade_mid_notional_sum, state.trade_exec_notional_sum) {
-                if exec_sum > LIQUIDITY_EPS {
-                    (mid_sum / exec_sum) * exec_price
-                } else {
-                    exec_price
-                }
+        let mid_price = if let (Some(mid_sum), Some(exec_sum)) =
+            (state.trade.trade_mid_notional_sum, state.trade.trade_exec_notional_sum)
+        {
+            if exec_sum > LIQUIDITY_EPS {
+                (mid_sum / exec_sum) * exec_price
             } else {
                 exec_price
-            };
+            }
+        } else {
+            exec_price
+        };
 
-        let slippage = state.trade_weighted_slippage_bps.unwrap_or(0.0);
+        let slippage = state.trade.trade_weighted_slippage_bps.unwrap_or(0.0);
         let legs: Vec<SwapQuoteLeg> = state
+            .trade
             .trade_slices
             .iter()
             .map(|slice| {
                 let (base, quote) = parse_market_symbols(&slice.market).unwrap_or_else(|| {
                     (
-                        state.deposit_asset.symbol().to_ascii_uppercase(),
-                        state.withdraw_asset.symbol().to_ascii_uppercase(),
+                        state.deposit.deposit_asset.symbol().to_ascii_uppercase(),
+                        state.withdraw.withdraw_asset.symbol().to_ascii_uppercase(),
                     )
                 });
                 let (pay_symbol, recv_symbol, pay_amount, recv_amount) = if slice.side.eq_ignore_ascii_case("sell") {
@@ -522,10 +609,10 @@ where
                 SwapQuoteLeg {
                     venue: "mexc".to_string(),
                     route_id: slice.market.clone(),
-                    pay_chain: state.deposit_asset.chain(),
+                    pay_chain: state.deposit.deposit_asset.chain(),
                     pay_symbol,
                     pay_amount: f64_to_nat(pay_amount),
-                    receive_chain: state.withdraw_asset.chain(),
+                    receive_chain: state.withdraw.withdraw_asset.chain(),
                     receive_symbol: recv_symbol,
                     receive_amount: f64_to_nat(recv_amount),
                     price: slice.exec_price,
@@ -539,15 +626,15 @@ where
             swap_id: 0,
             request_id: 0,
             status: "completed".to_string(),
-            pay_asset: state.deposit_asset.asset_id(),
+            pay_asset: state.deposit.deposit_asset.asset_id(),
             pay_amount: pay_amount.value,
-            receive_asset: state.withdraw_asset.asset_id(),
+            receive_asset: state.withdraw.withdraw_asset.asset_id(),
             receive_amount: receive_amount.value,
             mid_price,
             exec_price,
             slippage,
             legs,
-            approval_count: state.approval_bump_count,
+            approval_count: state.deposit.approval_bump_count,
             ts: now_ts().max(0) as u64,
         };
 

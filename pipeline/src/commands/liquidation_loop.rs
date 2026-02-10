@@ -137,13 +137,17 @@ async fn init(
     let mexc_finalizer = match ctx.config.get_cex_credentials("mexc") {
         Ok((api_key, secret)) => {
             let mexc_client = Arc::new(MexcClient::new(&api_key, &secret));
-            let mexc_finalizer = Arc::new(MexcFinalizer::new(
+            let mexc_finalizer = Arc::new(MexcFinalizer::new_with_tunables(
                 mexc_client,
                 ctx.trader_transfers.actions(),
                 config.liquidator_principal,
                 config.max_allowed_cex_slippage_bps as f64,
                 config.cex_min_exec_usd,
                 config.cex_slice_target_ratio,
+                config.cex_buy_truncation_trigger_ratio,
+                config.cex_buy_inverse_overspend_bps,
+                config.cex_buy_inverse_max_retries,
+                config.cex_buy_inverse_enabled,
             ));
             Some(mexc_finalizer)
         }

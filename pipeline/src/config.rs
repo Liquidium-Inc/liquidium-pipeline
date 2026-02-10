@@ -47,6 +47,14 @@ pub struct Config {
     /// Target fraction of max allowed slippage used for slice sizing.
     /// Example: 0.85 with 200 bps cap targets ~170 bps per slice.
     pub cex_slice_target_ratio: f64,
+    /// Trigger ratio for buy-side truncation before attempting inverse/base fallback.
+    pub cex_buy_truncation_trigger_ratio: f64,
+    /// Maximum quote overspend allowed for inverse/base buy fallback, in bps.
+    pub cex_buy_inverse_overspend_bps: u32,
+    /// Maximum inverse/base fallback retries per leg.
+    pub cex_buy_inverse_max_retries: u32,
+    /// Enables buy-side inverse/base fallback after truncation.
+    pub cex_buy_inverse_enabled: bool,
     /// Base delay for retryable CEX failures, in seconds.
     pub cex_retry_base_secs: u64,
     /// Maximum retry delay cap, in seconds.
@@ -57,6 +65,10 @@ pub struct Config {
     pub cex_delay_buffer_bps: u32,
     /// Route fee estimate in bps subtracted from projected edge.
     pub cex_route_fee_bps: u32,
+    /// In hybrid mode, skip route candidate comparison and force CEX when
+    /// estimated swap notional is above this USD threshold.
+    /// Set to `0` to disable force-over-threshold behavior.
+    pub cex_force_over_usd_threshold: f64,
     pub swapper: SwapperMode,
     pub cex_credentials: HashMap<String, (String, String)>,
     pub opportunity_account_filter: Vec<Principal>,
@@ -71,11 +83,16 @@ pub trait ConfigTrait: Send + Sync {
     fn get_max_allowed_cex_slippage_bps(&self) -> u32;
     fn get_cex_min_exec_usd(&self) -> f64;
     fn get_cex_slice_target_ratio(&self) -> f64;
+    fn get_cex_buy_truncation_trigger_ratio(&self) -> f64;
+    fn get_cex_buy_inverse_overspend_bps(&self) -> u32;
+    fn get_cex_buy_inverse_max_retries(&self) -> u32;
+    fn get_cex_buy_inverse_enabled(&self) -> bool;
     fn get_cex_retry_base_secs(&self) -> u64;
     fn get_cex_retry_max_secs(&self) -> u64;
     fn get_cex_min_net_edge_bps(&self) -> u32;
     fn get_cex_delay_buffer_bps(&self) -> u32;
     fn get_cex_route_fee_bps(&self) -> u32;
+    fn get_cex_force_over_usd_threshold(&self) -> f64;
     #[allow(dead_code)]
     fn get_lending_canister(&self) -> Principal;
     #[allow(dead_code)]
@@ -124,6 +141,22 @@ impl ConfigTrait for Config {
         self.cex_slice_target_ratio
     }
 
+    fn get_cex_buy_truncation_trigger_ratio(&self) -> f64 {
+        self.cex_buy_truncation_trigger_ratio
+    }
+
+    fn get_cex_buy_inverse_overspend_bps(&self) -> u32 {
+        self.cex_buy_inverse_overspend_bps
+    }
+
+    fn get_cex_buy_inverse_max_retries(&self) -> u32 {
+        self.cex_buy_inverse_max_retries
+    }
+
+    fn get_cex_buy_inverse_enabled(&self) -> bool {
+        self.cex_buy_inverse_enabled
+    }
+
     fn get_cex_retry_base_secs(&self) -> u64 {
         self.cex_retry_base_secs
     }
@@ -142,6 +175,10 @@ impl ConfigTrait for Config {
 
     fn get_cex_route_fee_bps(&self) -> u32 {
         self.cex_route_fee_bps
+    }
+
+    fn get_cex_force_over_usd_threshold(&self) -> f64 {
+        self.cex_force_over_usd_threshold
     }
 
     fn get_swapper_mode(&self) -> SwapperMode {
@@ -269,11 +306,16 @@ impl Config {
             max_allowed_cex_slippage_bps,
             cex_min_exec_usd: cex_tunables.min_exec_usd,
             cex_slice_target_ratio: cex_tunables.slice_target_ratio,
+            cex_buy_truncation_trigger_ratio: cex_tunables.buy_truncation_trigger_ratio,
+            cex_buy_inverse_overspend_bps: cex_tunables.buy_inverse_overspend_bps,
+            cex_buy_inverse_max_retries: cex_tunables.buy_inverse_max_retries,
+            cex_buy_inverse_enabled: cex_tunables.buy_inverse_enabled,
             cex_retry_base_secs: cex_tunables.retry_base_secs,
             cex_retry_max_secs: cex_tunables.retry_max_secs,
             cex_min_net_edge_bps: cex_tunables.min_net_edge_bps,
             cex_delay_buffer_bps: cex_tunables.delay_buffer_bps,
             cex_route_fee_bps: cex_tunables.route_fee_bps,
+            cex_force_over_usd_threshold: cex_tunables.force_over_usd_threshold,
             swapper,
             cex_credentials,
             opportunity_account_filter,
@@ -309,11 +351,16 @@ fn load_cex_credentials() -> HashMap<String, (String, String)> {
 struct CexTunables {
     min_exec_usd: f64,
     slice_target_ratio: f64,
+    buy_truncation_trigger_ratio: f64,
+    buy_inverse_overspend_bps: u32,
+    buy_inverse_max_retries: u32,
+    buy_inverse_enabled: bool,
     retry_base_secs: u64,
     retry_max_secs: u64,
     min_net_edge_bps: u32,
     delay_buffer_bps: u32,
     route_fee_bps: u32,
+    force_over_usd_threshold: f64,
 }
 
 fn parse_cex_tunables_from_env() -> CexTunables {
@@ -329,6 +376,29 @@ fn parse_cex_tunables_from_env() -> CexTunables {
         .and_then(|v| v.parse::<f64>().ok())
         .map(|v| v.clamp(0.1, 1.0))
         .unwrap_or(0.7);
+
+    let buy_truncation_trigger_ratio = env::var("CEX_BUY_TRUNCATION_TRIGGER_RATIO")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .map(|v| v.clamp(0.0, 1.0))
+        .unwrap_or(0.25);
+
+    let buy_inverse_overspend_bps = env::var("CEX_BUY_INVERSE_OVESPEND_BPS")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .map(|v| v.min(100))
+        .unwrap_or(10);
+
+    let buy_inverse_max_retries = env::var("CEX_BUY_INVERSE_MAX_RETRIES")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .map(|v| v.min(3))
+        .unwrap_or(1);
+
+    let buy_inverse_enabled = env::var("CEX_BUY_INVERSE_ENABLED")
+        .ok()
+        .and_then(|v| v.parse::<bool>().ok())
+        .unwrap_or(true);
 
     let retry_base_secs = env::var("CEX_RETRY_BASE_SECS")
         .ok()
@@ -357,14 +427,25 @@ fn parse_cex_tunables_from_env() -> CexTunables {
         .and_then(|v| v.parse::<u32>().ok())
         .unwrap_or(25);
 
+    let force_over_usd_threshold = env::var("CEX_FORCE_OVER_USD_THRESHOLD")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .filter(|v| *v >= 0.0)
+        .unwrap_or(2.5);
+
     CexTunables {
         min_exec_usd,
         slice_target_ratio,
+        buy_truncation_trigger_ratio,
+        buy_inverse_overspend_bps,
+        buy_inverse_max_retries,
+        buy_inverse_enabled,
         retry_base_secs,
         retry_max_secs,
         min_net_edge_bps,
         delay_buffer_bps,
         route_fee_bps,
+        force_over_usd_threshold,
     }
 }
 
@@ -381,11 +462,16 @@ mod tests {
         let vars = [
             "CEX_MIN_EXEC_USD",
             "CEX_SLICE_TARGET_RATIO",
+            "CEX_BUY_TRUNCATION_TRIGGER_RATIO",
+            "CEX_BUY_INVERSE_OVESPEND_BPS",
+            "CEX_BUY_INVERSE_MAX_RETRIES",
+            "CEX_BUY_INVERSE_ENABLED",
             "CEX_RETRY_BASE_SECS",
             "CEX_RETRY_MAX_SECS",
             "CEX_MIN_NET_EDGE_BPS",
             "CEX_DELAY_BUFFER_BPS",
             "CEX_ROUTE_FEE_BPS",
+            "CEX_FORCE_OVER_USD_THRESHOLD",
         ];
         for key in vars {
             unsafe { env::remove_var(key) };
@@ -397,11 +483,16 @@ mod tests {
             CexTunables {
                 min_exec_usd: 2.0,
                 slice_target_ratio: 0.7,
+                buy_truncation_trigger_ratio: 0.25,
+                buy_inverse_overspend_bps: 10,
+                buy_inverse_max_retries: 1,
+                buy_inverse_enabled: true,
                 retry_base_secs: 5,
                 retry_max_secs: 120,
                 min_net_edge_bps: 150,
                 delay_buffer_bps: 75,
                 route_fee_bps: 25,
+                force_over_usd_threshold: 2.5,
             }
         );
     }
@@ -412,11 +503,16 @@ mod tests {
         unsafe {
             env::set_var("CEX_MIN_EXEC_USD", "1.05");
             env::set_var("CEX_SLICE_TARGET_RATIO", "0.85");
+            env::set_var("CEX_BUY_TRUNCATION_TRIGGER_RATIO", "0.4");
+            env::set_var("CEX_BUY_INVERSE_OVESPEND_BPS", "20");
+            env::set_var("CEX_BUY_INVERSE_MAX_RETRIES", "2");
+            env::set_var("CEX_BUY_INVERSE_ENABLED", "false");
             env::set_var("CEX_RETRY_BASE_SECS", "7");
             env::set_var("CEX_RETRY_MAX_SECS", "240");
             env::set_var("CEX_MIN_NET_EDGE_BPS", "160");
             env::set_var("CEX_DELAY_BUFFER_BPS", "90");
             env::set_var("CEX_ROUTE_FEE_BPS", "0");
+            env::set_var("CEX_FORCE_OVER_USD_THRESHOLD", "5.75");
         }
 
         let parsed = parse_cex_tunables_from_env();
@@ -425,11 +521,16 @@ mod tests {
             CexTunables {
                 min_exec_usd: 1.05,
                 slice_target_ratio: 0.85,
+                buy_truncation_trigger_ratio: 0.4,
+                buy_inverse_overspend_bps: 20,
+                buy_inverse_max_retries: 2,
+                buy_inverse_enabled: false,
                 retry_base_secs: 7,
                 retry_max_secs: 240,
                 min_net_edge_bps: 160,
                 delay_buffer_bps: 90,
                 route_fee_bps: 0,
+                force_over_usd_threshold: 5.75,
             }
         );
     }
@@ -440,14 +541,35 @@ mod tests {
         unsafe {
             env::set_var("CEX_MIN_EXEC_USD", "0");
             env::set_var("CEX_SLICE_TARGET_RATIO", "99");
+            env::set_var("CEX_BUY_TRUNCATION_TRIGGER_RATIO", "-1");
+            env::set_var("CEX_BUY_INVERSE_OVESPEND_BPS", "999");
+            env::set_var("CEX_BUY_INVERSE_MAX_RETRIES", "9");
+            env::set_var("CEX_BUY_INVERSE_ENABLED", "not-a-bool");
             env::set_var("CEX_RETRY_BASE_SECS", "10");
             env::set_var("CEX_RETRY_MAX_SECS", "1");
+            env::set_var("CEX_FORCE_OVER_USD_THRESHOLD", "-1");
         }
 
         let parsed = parse_cex_tunables_from_env();
         assert_eq!(parsed.min_exec_usd, 2.0);
         assert_eq!(parsed.slice_target_ratio, 1.0);
+        assert_eq!(parsed.buy_truncation_trigger_ratio, 0.0);
+        assert_eq!(parsed.buy_inverse_overspend_bps, 100);
+        assert_eq!(parsed.buy_inverse_max_retries, 3);
+        assert!(parsed.buy_inverse_enabled);
         assert_eq!(parsed.retry_base_secs, 10);
         assert_eq!(parsed.retry_max_secs, 120);
+        assert_eq!(parsed.force_over_usd_threshold, 2.5);
+    }
+
+    #[test]
+    fn parse_cex_tunables_allows_zero_force_threshold_for_disable() {
+        let _guard = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        unsafe {
+            env::set_var("CEX_FORCE_OVER_USD_THRESHOLD", "0");
+        }
+
+        let parsed = parse_cex_tunables_from_env();
+        assert_eq!(parsed.force_over_usd_threshold, 0.0);
     }
 }

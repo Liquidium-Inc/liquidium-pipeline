@@ -1,17 +1,27 @@
 use super::*;
 
+struct PendingSliceRequest {
+    requested_in: f64,
+    client_order_id: String,
+    buy_mode_label: &'static str,
+}
+
 impl<C> MexcFinalizer<C>
 where
     C: CexBackend,
 {
     /// Phase-B deposit confirmation by balance delta against the captured baseline.
     pub(super) async fn check_deposit(&self, state: &mut CexState) -> Result<(), String> {
-        let symbol = state.deposit_asset.symbol();
+        let symbol = state.deposit.deposit_asset.symbol();
         let current_bal = self.backend.get_balance(&symbol).await?;
 
-        match state.deposit_balance_before {
+        match state.deposit.deposit_balance_before {
             Some(b0) => {
-                let expected = state.trade_next_amount_in.unwrap_or_else(|| state.size_in.to_f64());
+                let expected = state
+                    .trade
+                    .trade_next_amount_in
+                    .unwrap_or_else(|| state.size_in.to_f64());
+
                 let delta = current_bal - b0;
                 if delta >= expected - 0.00001 {
                     info!(
@@ -33,7 +43,7 @@ where
                     "[mexc] liq_id={} deposit baseline set: current={}",
                     state.liq_id, current_bal
                 );
-                state.deposit_balance_before = Some(current_bal);
+                state.deposit.deposit_balance_before = Some(current_bal);
             }
         }
 
@@ -92,8 +102,8 @@ where
 
     /// Resolve one or more market legs for deposit-asset -> withdraw-asset conversion.
     pub(super) async fn resolve_trade_legs(&self, state: &CexState) -> Result<Vec<TradeLeg>, String> {
-        let deposit = state.deposit_asset.symbol();
-        let withdraw = state.withdraw_asset.symbol();
+        let deposit = state.deposit.deposit_asset.symbol();
+        let withdraw = state.withdraw.withdraw_asset.symbol();
 
         if let Some(legs) = mexc_special_trade_legs(&deposit, &withdraw) {
             return Ok(legs);
@@ -314,11 +324,278 @@ where
 
     /// Persist per-leg context on state before slicing starts.
     pub(super) fn set_trade_leg_context(state: &mut CexState, leg: &TradeLeg, amount_in: f64) {
-        state.trade_last_market = Some(leg.market.clone());
-        state.trade_last_side = Some(leg.side.clone());
-        state.trade_last_amount_in = Some(amount_in);
-        state.trade_last_amount_out = None;
+        state.trade.trade_last_market = Some(leg.market.clone());
+        state.trade.trade_last_side = Some(leg.side.clone());
+        state.trade.trade_last_amount_in = Some(amount_in);
+        state.trade.trade_last_amount_out = None;
         state.last_error = None;
+        state.trade.trade_progress_remaining_in = Some(state.trade.trade_progress_remaining_in.unwrap_or(amount_in));
+        state.trade.trade_progress_total_out = Some(state.trade.trade_progress_total_out.unwrap_or(0.0));
+    }
+
+    fn buy_mode_to_str(mode: BuyOrderInputMode) -> &'static str {
+        match mode {
+            BuyOrderInputMode::Auto => "auto",
+            BuyOrderInputMode::QuoteOrderQty => "quote_order_qty",
+            BuyOrderInputMode::BaseQuantity => "base_quantity",
+        }
+    }
+
+    fn parse_buy_mode(mode: Option<&str>) -> BuyOrderInputMode {
+        match mode.unwrap_or_default() {
+            "base_quantity" => BuyOrderInputMode::BaseQuantity,
+            "quote_order_qty" => BuyOrderInputMode::QuoteOrderQty,
+            _ => BuyOrderInputMode::Auto,
+        }
+    }
+
+    fn buy_mode_short_code(mode: BuyOrderInputMode) -> &'static str {
+        match mode {
+            BuyOrderInputMode::Auto => "a",
+            BuyOrderInputMode::QuoteOrderQty => "q",
+            BuyOrderInputMode::BaseQuantity => "b",
+        }
+    }
+
+    fn is_valid_client_order_id(value: &str) -> bool {
+        let len = value.len();
+        if !(1..=32).contains(&len) {
+            return false;
+        }
+
+        value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    }
+
+    fn stable_hash_6hex(value: &str) -> String {
+        let mut hash: u64 = 0xcbf29ce484222325;
+        for byte in value.bytes() {
+            hash ^= byte as u64;
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
+        format!("{:06x}", hash & 0x00ff_ffff)
+    }
+
+    fn sanitize_client_order_id(value: &str) -> String {
+        let mut sanitized: String = value
+            .bytes()
+            .filter(|b| b.is_ascii_alphanumeric() || *b == b'_' || *b == b'-')
+            .map(char::from)
+            .collect();
+
+        if sanitized.is_empty() {
+            sanitized.push_str("liq");
+        }
+
+        if sanitized.len() > 32 {
+            let hash = Self::stable_hash_6hex(&sanitized);
+            sanitized.truncate(25);
+            sanitized.push('-');
+            sanitized.push_str(&hash);
+        }
+
+        sanitized
+    }
+
+    fn clear_pending_trade_order(state: &mut CexState) {
+        state.trade.trade_pending_client_order_id = None;
+        state.trade.trade_pending_market = None;
+        state.trade.trade_pending_side = None;
+        state.trade.trade_pending_requested_in = None;
+    }
+
+    /// Normalize pending-order WAL fields before processing a leg.
+    ///
+    /// Clears persisted pending state when it is:
+    /// - tied to a different market/side tuple,
+    /// - missing a client order id (legacy partial state),
+    /// - carrying an invalid client order id for MEXC.
+    fn sanitize_pending_trade_state_for_leg(state: &mut CexState, leg: &TradeLeg) {
+        if state.trade.trade_pending_client_order_id.is_some()
+            && (state.trade.trade_pending_market.as_deref() != Some(leg.market.as_str())
+                || state.trade.trade_pending_side.as_deref() != Some(leg.side.as_str()))
+        {
+            warn!(
+                "[mexc] liq_id={} clearing stale pending order state market={:?} side={:?}",
+                state.liq_id, state.trade.trade_pending_market, state.trade.trade_pending_side
+            );
+            Self::clear_pending_trade_order(state);
+            state.trade.trade_pending_buy_mode = None;
+        }
+
+        if state.trade.trade_pending_client_order_id.is_none()
+            && (state.trade.trade_pending_market.is_some()
+                || state.trade.trade_pending_side.is_some()
+                || state.trade.trade_pending_requested_in.is_some())
+        {
+            warn!(
+                "[mexc] liq_id={} clearing legacy pending state without client_order_id",
+                state.liq_id
+            );
+            Self::clear_pending_trade_order(state);
+            state.trade.trade_pending_buy_mode = None;
+        }
+
+        if let Some(existing) = state.trade.trade_pending_client_order_id.as_deref()
+            && !Self::is_valid_client_order_id(existing)
+        {
+            warn!(
+                "[mexc] liq_id={} clearing invalid pending client_order_id={}",
+                state.liq_id, existing
+            );
+            Self::clear_pending_trade_order(state);
+            state.trade.trade_pending_buy_mode = None;
+        }
+    }
+
+    fn resolve_slice_buy_mode(
+        state: &CexState,
+        leg: &TradeLeg,
+        forced_next_buy_mode: &mut Option<BuyOrderInputMode>,
+    ) -> BuyOrderInputMode {
+        if leg.side.eq_ignore_ascii_case("buy") {
+            forced_next_buy_mode
+                .take()
+                .unwrap_or_else(|| Self::parse_buy_mode(state.trade.trade_pending_buy_mode.as_deref()))
+        } else {
+            BuyOrderInputMode::Auto
+        }
+    }
+
+    fn next_slice_seq_for_leg(state: &CexState, leg_idx: usize) -> usize {
+        state
+            .trade
+            .trade_slices
+            .iter()
+            .filter(|slice| slice.leg_index == leg_idx as u32)
+            .count()
+            + 1
+    }
+
+    /// Persist one pending slice request in state and return the resolved values.
+    fn prepare_pending_slice_request(
+        state: &mut CexState,
+        leg: &TradeLeg,
+        leg_idx: usize,
+        preview_chunk_in: f64,
+        buy_mode: BuyOrderInputMode,
+    ) -> PendingSliceRequest {
+        let slice_seq = Self::next_slice_seq_for_leg(state, leg_idx);
+        let requested_in = state.trade.trade_pending_requested_in.unwrap_or(preview_chunk_in);
+        let client_order_id = state
+            .trade
+            .trade_pending_client_order_id
+            .clone()
+            .unwrap_or_else(|| Self::build_client_order_id(state, leg_idx, slice_seq, buy_mode));
+        let buy_mode_label = Self::buy_mode_to_str(buy_mode);
+
+        state.trade.trade_pending_client_order_id = Some(client_order_id.clone());
+        state.trade.trade_pending_market = Some(leg.market.clone());
+        state.trade.trade_pending_side = Some(leg.side.clone());
+        state.trade.trade_pending_requested_in = Some(requested_in);
+        state.trade.trade_pending_buy_mode = Some(buy_mode_label.to_string());
+
+        PendingSliceRequest {
+            requested_in,
+            client_order_id,
+            buy_mode_label,
+        }
+    }
+
+    fn persist_trade_progress(state: &mut CexState, remaining_in: f64, total_out: f64) {
+        state.trade.trade_progress_remaining_in = Some(remaining_in);
+        state.trade.trade_progress_total_out = Some(total_out);
+    }
+
+    fn apply_slice_fill_progress(
+        state: &mut CexState,
+        remaining_in: &mut f64,
+        total_out: &mut f64,
+        actual_input_consumed: f64,
+        actual_output_received: f64,
+    ) {
+        *remaining_in = (*remaining_in - actual_input_consumed).max(0.0);
+        *total_out += actual_output_received;
+        Self::persist_trade_progress(state, *remaining_in, *total_out);
+    }
+
+    fn build_client_order_id(
+        state: &CexState,
+        leg_idx: usize,
+        slice_seq: usize,
+        buy_mode: BuyOrderInputMode,
+    ) -> String {
+        let raw = format!(
+            "liq-{}-l{}-s{}-{}",
+            state.liq_id,
+            leg_idx + 1,
+            slice_seq,
+            Self::buy_mode_short_code(buy_mode)
+        );
+        Self::sanitize_client_order_id(&raw)
+    }
+
+    /// Apply adaptive buy fallback after one executed buy slice.
+    ///
+    /// Purpose:
+    /// - Detect meaningful quote-side truncation (requested input > consumed input).
+    /// - If residual is still executable, arm exactly one next-slice override to
+    ///   `BaseQuantity` so we can consume more of the remaining input.
+    ///
+    /// Safety guards:
+    /// - Runs only for buy legs.
+    /// - Honors global enable/disable flag.
+    /// - Requires truncation ratio threshold.
+    /// - Requires retry budget (`trade_inverse_retry_count`) to remain.
+    /// - Requires non-dust residual in USD.
+    ///
+    /// State effects:
+    /// - Increments `trade_inverse_retry_count` when a fallback retry is armed.
+    /// - Sets `forced_next_buy_mode` to `BaseQuantity` for one subsequent slice.
+    /// - Clears persisted buy-mode hint when no forced retry is armed.
+    async fn maybe_arm_adaptive_buy_fallback(
+        &self,
+        state: &mut CexState,
+        leg: &TradeLeg,
+        requested_in: f64,
+        actual_input_consumed: f64,
+        remaining_in: f64,
+        forced_next_buy_mode: &mut Option<BuyOrderInputMode>,
+    ) {
+        if !leg.side.eq_ignore_ascii_case("buy") {
+            return;
+        }
+
+        if !self.cex_buy_inverse_enabled {
+            state.trade.trade_pending_buy_mode = None;
+            return;
+        }
+
+        let truncation_ratio = if requested_in > LIQUIDITY_EPS {
+            ((requested_in - actual_input_consumed) / requested_in).max(0.0)
+        } else {
+            0.0
+        };
+
+        if truncation_ratio >= self.cex_buy_truncation_trigger_ratio
+            && state.trade.trade_inverse_retry_count < self.cex_buy_inverse_max_retries
+            && remaining_in > LIQUIDITY_EPS
+        {
+            let residual_usd = self
+                .input_slice_usd(&leg.market, &leg.side, remaining_in)
+                .await
+                .unwrap_or(0.0);
+
+            if residual_usd >= self.cex_min_exec_usd {
+                state.trade.trade_inverse_retry_count += 1;
+                *forced_next_buy_mode = Some(BuyOrderInputMode::BaseQuantity);
+            }
+        }
+
+        if forced_next_buy_mode.is_none() {
+            state.trade.trade_pending_buy_mode = None;
+        }
     }
 
     /// Execute one route leg by slicing `amount_in` into impact-bounded chunks.
@@ -346,12 +623,18 @@ where
         amount_in: f64,
         target_bps: f64,
     ) -> Result<(f64, f64), String> {
-        // Amount from this leg still to execute.
-        let mut remaining_in = amount_in;
-        // Sum of outputs produced by all executed slices in this leg.
-        let mut total_out = 0.0;
+        // Resume from persisted per-leg progress if available.
+        let mut remaining_in = state.trade.trade_progress_remaining_in.unwrap_or(amount_in);
+        let mut total_out = state.trade.trade_progress_total_out.unwrap_or(0.0);
         // Hard guard against pathological loops when liquidity math cannot converge.
         let mut rounds = 0usize;
+
+        // One-shot override for the NEXT buy slice only.
+        // Normal mode is quote-driven (`Auto`), but if quote truncation is large
+        // we can force `BaseQuantity` on the next slice to consume more residual.
+        let mut forced_next_buy_mode: Option<BuyOrderInputMode> = None;
+
+        Self::sanitize_pending_trade_state_for_leg(state, leg);
 
         // Keep slicing until the leg input is consumed (or considered dust).
         while remaining_in > LIQUIDITY_EPS {
@@ -378,24 +661,54 @@ where
                 .maybe_mark_trade_dust(state, leg, preview.chunk_in, remaining_in)
                 .await?
             {
+                state.trade.trade_unexecutable_residual_in = Some(remaining_in);
+                Self::persist_trade_progress(state, remaining_in, total_out);
                 break;
             }
 
+            let buy_mode = Self::resolve_slice_buy_mode(state, leg, &mut forced_next_buy_mode);
+            let pending = Self::prepare_pending_slice_request(state, leg, leg_idx, preview.chunk_in, buy_mode);
+
             // Execute exactly this one slice as a market order.
-            let filled_out = self
+            let fill_report = self
                 .backend
-                .execute_swap(&leg.market, &leg.side, preview.chunk_in)
+                .execute_swap_detailed_with_options(
+                    &leg.market,
+                    &leg.side,
+                    pending.requested_in,
+                    SwapExecutionOptions {
+                        client_order_id: Some(pending.client_order_id.clone()),
+                        buy_mode,
+                        max_quote_overspend_bps: Some(self.cex_buy_inverse_overspend_bps as f64),
+                    },
+                )
                 .await?;
+
+            Self::clear_pending_trade_order(state);
+            let actual_input_consumed = fill_report.input_consumed;
+            let actual_output_received = fill_report.output_received;
+
+            // Advance by actual consumed input (not requested input), so truncation
+            // is reflected in state and residual handling remains deterministic.
+            Self::apply_slice_fill_progress(
+                state,
+                &mut remaining_in,
+                &mut total_out,
+                actual_input_consumed,
+                actual_output_received,
+            );
 
             // Convert raw fill amounts into a realized execution price.
             // We need `exec_price` so slippage can be measured against preview mid-price.
-            let exec_price = match Self::exec_price_from_fill(&leg.market, &leg.side, preview.chunk_in, filled_out) {
-                Ok(price) => price,
-                Err(err) => {
-                    state.last_error = Some(err.clone());
-                    return Err(err);
-                }
-            };
+            let exec_price =
+                match Self::exec_price_from_fill(&leg.market, &leg.side, actual_input_consumed, actual_output_received)
+                {
+                    Ok(price) => price,
+                    Err(err) => {
+                        state.last_error = Some(err.clone());
+                        return Err(err);
+                    }
+                };
 
             // Slippage is the realized price drift from preview midpoint, in bps.
             // This is the primary safety metric for adverse execution quality.
@@ -404,8 +717,18 @@ where
             // Enforce hard per-slice slippage limit before allowing leg continuation.
             if slice_slippage_bps > self.max_sell_slippage_bps {
                 let err = format!(
-                    "slice slippage too high for {}: {:.2} bps > {:.2} bps",
-                    leg.market, slice_slippage_bps, self.max_sell_slippage_bps
+                    "slice slippage too high for {} {}: {:.2} bps > {:.2} bps (client_id={} buy_mode={} requested_in={} actual_in={} actual_out={} preview_mid={} exec_price={})",
+                    leg.market,
+                    leg.side,
+                    slice_slippage_bps,
+                    self.max_sell_slippage_bps,
+                    pending.client_order_id,
+                    pending.buy_mode_label,
+                    pending.requested_in,
+                    actual_input_consumed,
+                    actual_output_received,
+                    preview.preview_mid_price,
+                    exec_price
                 );
                 state.last_error = Some(err.clone());
                 return Err(err);
@@ -415,8 +738,8 @@ where
             Self::update_trade_notional_stats(
                 state,
                 &leg.side,
-                preview.chunk_in,
-                filled_out,
+                actual_input_consumed,
+                actual_output_received,
                 preview.preview_mid_price,
             );
 
@@ -425,8 +748,8 @@ where
                 state,
                 leg_idx,
                 leg,
-                preview.chunk_in,
-                filled_out,
+                actual_input_consumed,
+                actual_output_received,
                 preview.preview_mid_price,
                 exec_price,
                 slice_slippage_bps,
@@ -442,16 +765,23 @@ where
                 rounds,
                 leg.market,
                 leg.side,
-                preview.chunk_in,
-                filled_out,
+                actual_input_consumed,
+                actual_output_received,
                 slice_slippage_bps
             );
 
-            // Consume executed input from this leg and accumulate produced output.
-            remaining_in = (remaining_in - preview.chunk_in).max(0.0);
-            total_out += filled_out;
+            self.maybe_arm_adaptive_buy_fallback(
+                state,
+                leg,
+                pending.requested_in,
+                actual_input_consumed,
+                remaining_in,
+                &mut forced_next_buy_mode,
+            )
+            .await;
         }
 
+        Self::persist_trade_progress(state, remaining_in, total_out);
         // Return any unexecuted residual (often 0 or dust) plus total output of this leg.
         Ok((remaining_in, total_out))
     }
@@ -597,8 +927,8 @@ where
             .await
             .unwrap_or(chunk_usd);
 
-        state.trade_dust_skipped = true;
-        state.trade_dust_usd = Some(residual_usd);
+        state.trade.trade_dust_skipped = true;
+        state.trade.trade_dust_usd = Some(residual_usd);
         info!(
             "[mexc] liq_id={} dust skipped market={} side={} residual_in={} residual_usd={}",
             state.liq_id, leg.market, leg.side, remaining_in, residual_usd
@@ -655,11 +985,11 @@ where
             chunk_in
         };
 
-        let mid_sum = state.trade_mid_notional_sum.unwrap_or(0.0) + mid_notional;
-        let exec_sum = state.trade_exec_notional_sum.unwrap_or(0.0) + exec_notional;
-        state.trade_mid_notional_sum = Some(mid_sum);
-        state.trade_exec_notional_sum = Some(exec_sum);
-        state.trade_weighted_slippage_bps = if mid_sum > LIQUIDITY_EPS {
+        let mid_sum = state.trade.trade_mid_notional_sum.unwrap_or(0.0) + mid_notional;
+        let exec_sum = state.trade.trade_exec_notional_sum.unwrap_or(0.0) + exec_notional;
+        state.trade.trade_mid_notional_sum = Some(mid_sum);
+        state.trade.trade_exec_notional_sum = Some(exec_sum);
+        state.trade.trade_weighted_slippage_bps = if mid_sum > LIQUIDITY_EPS {
             Some(((mid_sum - exec_sum) / mid_sum * 10_000.0).max(0.0))
         } else {
             None
@@ -678,7 +1008,7 @@ where
         slice_slippage_bps: f64,
         preview_impact_bps: f64,
     ) {
-        state.trade_slices.push(CexTradeSlice {
+        state.trade.trade_slices.push(CexTradeSlice {
             leg_index: leg_idx as u32,
             market: leg.market.clone(),
             side: leg.side.clone(),
@@ -692,9 +1022,15 @@ where
 
     /// Advance state to the next trade leg or to withdraw when route is fully processed.
     pub(super) fn advance_after_trade_leg(state: &mut CexState, leg_idx: usize, total_legs: usize, total_out: f64) {
-        state.trade_last_amount_out = Some(total_out);
-        state.trade_next_amount_in = Some(total_out);
-        state.trade_leg_index = Some((leg_idx + 1) as u32);
+        state.trade.trade_last_amount_out = Some(total_out);
+        state.trade.trade_next_amount_in = Some(total_out);
+        state.trade.trade_leg_index = Some((leg_idx + 1) as u32);
+        state.trade.trade_progress_remaining_in = None;
+        state.trade.trade_progress_total_out = None;
+        Self::clear_pending_trade_order(state);
+        state.trade.trade_pending_buy_mode = None;
+        state.trade.trade_inverse_retry_count = 0;
+        state.trade.trade_unexecutable_residual_in = None;
 
         if leg_idx + 1 < total_legs {
             state.step = CexStep::TradePending;
@@ -702,8 +1038,8 @@ where
         }
 
         state.step = CexStep::Withdraw;
-        state.size_out = Some(ChainTokenAmount::from_formatted(
-            state.withdraw_asset.clone(),
+        state.withdraw.size_out = Some(ChainTokenAmount::from_formatted(
+            state.withdraw.withdraw_asset.clone(),
             total_out.max(0.0),
         ));
     }
