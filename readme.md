@@ -306,6 +306,8 @@ cargo build --release -p liquidium-pipeline --features plain-logs
 RUST_LOG=info ./target/release/liquidator run
 ```
 
+In `plain-logs` builds, interactive withdraw prompts are disabled; use non-interactive `liquidator withdraw --source ... --destination ... --asset ... --amount ...` flags.
+
 ---
 
 ## 📝 Notes

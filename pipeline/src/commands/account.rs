@@ -10,8 +10,10 @@ use alloy::signers::local::PrivateKeySigner;
 use bip39::{Language, Mnemonic};
 
 use prettytable::{Cell, Row, Table, format};
+use tracing::{info, warn};
 
 use crate::config::Config;
+use crate::output::plain_logs_enabled;
 
 pub async fn show() {
     // Load Config
@@ -19,41 +21,55 @@ pub async fn show() {
 
     match config.await {
         Ok(config) => {
-            let mut table = Table::new();
-            table.set_format(*format::consts::FORMAT_NO_LINESEP_WITH_TITLE);
-            table.set_titles(Row::new(vec![Cell::new("Role"), Cell::new("Principal")]));
-
-            table.add_row(Row::new(vec![
-                Cell::new("Liquidator Account"),
-                Cell::new(&config.liquidator_principal.to_string()),
-            ]));
-
             let recovery = Account {
                 owner: config.liquidator_principal,
                 subaccount: Some(*RECOVERY_ACCOUNT),
             };
-            table.add_row(Row::new(vec![
-                Cell::new("Recovery Account"),
-                Cell::new(&recovery.to_string()),
-            ]));
+            if plain_logs_enabled() {
+                info!(role = "liquidator", principal = %config.liquidator_principal, "Account identity");
+                info!(role = "recovery", principal = %recovery, "Account identity");
+                match config.evm_private_key.parse::<PrivateKeySigner>() {
+                    Ok(evm_signer) => {
+                        let evm_address = evm_signer.address();
+                        info!(role = "evm", principal = %evm_address, "Account identity");
+                    }
+                    Err(_) => {
+                        warn!(role = "evm", "Invalid EVM private key in config");
+                    }
+                }
+            } else {
+                let mut table = Table::new();
+                table.set_format(*format::consts::FORMAT_NO_LINESEP_WITH_TITLE);
+                table.set_titles(Row::new(vec![Cell::new("Role"), Cell::new("Principal")]));
 
-            match config.evm_private_key.parse::<PrivateKeySigner>() {
-                Ok(evm_signer) => {
-                    let evm_address = evm_signer.address();
-                    table.add_row(Row::new(vec![
-                        Cell::new("EVM Account"),
-                        Cell::new(&format!("{evm_address}")),
-                    ]));
+                table.add_row(Row::new(vec![
+                    Cell::new("Liquidator Account"),
+                    Cell::new(&config.liquidator_principal.to_string()),
+                ]));
+
+                table.add_row(Row::new(vec![
+                    Cell::new("Recovery Account"),
+                    Cell::new(&recovery.to_string()),
+                ]));
+
+                match config.evm_private_key.parse::<PrivateKeySigner>() {
+                    Ok(evm_signer) => {
+                        let evm_address = evm_signer.address();
+                        table.add_row(Row::new(vec![
+                            Cell::new("EVM Account"),
+                            Cell::new(&format!("{evm_address}")),
+                        ]));
+                    }
+                    Err(_) => {
+                        table.add_row(Row::new(vec![
+                            Cell::new("EVM Account"),
+                            Cell::new("(invalid EVM private key in config)"),
+                        ]));
+                    }
                 }
-                Err(_) => {
-                    table.add_row(Row::new(vec![
-                        Cell::new("EVM Account"),
-                        Cell::new("(invalid EVM private key in config)"),
-                    ]));
-                }
+
+                table.printstd();
             }
-
-            table.printstd();
         }
         Err(_) => {
             println!("Could not load account.");

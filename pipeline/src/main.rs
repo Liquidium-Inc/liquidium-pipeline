@@ -4,6 +4,7 @@ mod context;
 mod executors;
 mod finalizers;
 mod liquidation;
+mod output;
 mod persistance;
 mod price_oracle;
 mod stage;

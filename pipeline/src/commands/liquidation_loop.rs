@@ -13,6 +13,7 @@ use std::{
 use tracing::{Instrument, info_span, instrument};
 use tracing::{info, warn};
 
+use crate::output::human_output_enabled;
 use crate::{
     config::{Config, ConfigTrait, SwapperMode},
     context::{PipelineContext, init_context},
@@ -87,11 +88,7 @@ fn print_startup_table(config: &Config) {
 }
 
 fn console_ui_enabled() -> bool {
-    is_console_ui_enabled(cfg!(feature = "plain-logs"), stdout().is_terminal(), stderr().is_terminal())
-}
-
-fn is_console_ui_enabled(plain_logs_feature_enabled: bool, stdout_is_tty: bool, stderr_is_tty: bool) -> bool {
-    !plain_logs_feature_enabled && stdout_is_tty && stderr_is_tty
+    human_output_enabled() && stdout().is_terminal() && stderr().is_terminal()
 }
 
 fn start_spinner(enabled: bool) -> Option<ProgressBar> {
@@ -525,25 +522,41 @@ pub fn print_execution_results(results: &[LiquidationOutcome]) {
 
 #[cfg(test)]
 mod tests {
-    use super::is_console_ui_enabled;
+    use super::console_ui_enabled;
+    use std::io::IsTerminal;
+
+    fn calc_console_ui_enabled(human_output: bool, stdout_is_tty: bool, stderr_is_tty: bool) -> bool {
+        human_output && stdout_is_tty && stderr_is_tty
+    }
 
     #[test]
     fn disables_console_ui_when_plain_logs_feature_is_enabled() {
-        assert!(!is_console_ui_enabled(true, true, true));
+        assert!(!calc_console_ui_enabled(false, true, true));
     }
 
     #[test]
     fn enables_console_ui_when_feature_disabled_and_both_terminals_present() {
-        assert!(is_console_ui_enabled(false, true, true));
+        assert!(calc_console_ui_enabled(true, true, true));
     }
 
     #[test]
     fn disables_console_ui_when_stdout_is_not_tty() {
-        assert!(!is_console_ui_enabled(false, false, true));
+        assert!(!calc_console_ui_enabled(true, false, true));
     }
 
     #[test]
     fn disables_console_ui_when_stderr_is_not_tty() {
-        assert!(!is_console_ui_enabled(false, true, false));
+        assert!(!calc_console_ui_enabled(true, true, false));
+    }
+
+    #[test]
+    fn console_ui_enabled_matches_helper_contract() {
+        let actual = console_ui_enabled();
+        let expected = calc_console_ui_enabled(
+            crate::output::human_output_enabled(),
+            std::io::stdout().is_terminal(),
+            std::io::stderr().is_terminal(),
+        );
+        assert_eq!(actual, expected);
     }
 }
