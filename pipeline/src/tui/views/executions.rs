@@ -1,14 +1,16 @@
 use chrono::{Local, TimeZone};
+use liquidium_pipeline_core::tokens::chain_token_amount::ChainTokenAmount;
+use liquidium_pipeline_core::types::protocol_types::{LiquidationStatus, TransferStatus, TxStatus};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, Wrap};
-use serde_json::{Value, json};
+use serde_json::Value;
 
 use crate::finalizers::liquidation_outcome::LiquidationOutcome;
 use crate::persistance::{LiqMetaWrapper, ResultStatus};
-use crate::stages::executor::ExecutionReceipt;
+use crate::stages::executor::{ExecutionReceipt, ExecutionStatus};
 use crate::wal::liq_id_from_receipt;
 
 use super::super::app::{App, ExecutionRowData, UiFocus};
@@ -21,6 +23,9 @@ pub(super) fn draw_executions(f: &mut Frame<'_>, area: Rect, app: &App) {
     } else {
         lines.push(Line::from("No executions yet (loading WAL)."));
     }
+    lines.push(Line::from(
+        "Focus: Down -> table, Enter/Right -> details, Left/Esc -> table, Esc -> tabs",
+    ));
 
     if let Some(wal) = &app.wal {
         lines.push(Line::from(format!(
@@ -115,7 +120,12 @@ pub(super) fn draw_executions(f: &mut Frame<'_>, area: Rect, app: &App) {
         .or_else(|| exec.rows.first());
 
     let details_block = {
-        let mut block = Block::default().borders(Borders::ALL).title("Execution Details");
+        let title = if matches!(app.ui_focus, UiFocus::ExecutionsDetails) {
+            "Execution Details (j/k PgUp/PgDn Home/End)"
+        } else {
+            "Execution Details"
+        };
+        let mut block = Block::default().borders(Borders::ALL).title(title);
         if matches!(app.ui_focus, UiFocus::ExecutionsDetails) {
             block = block.border_style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD));
         }
@@ -125,7 +135,9 @@ pub(super) fn draw_executions(f: &mut Frame<'_>, area: Rect, app: &App) {
     if let Some(row) = selected {
         let lines = build_execution_details(row);
         let height = body_layout[1].height.saturating_sub(2) as usize;
-        let max_scroll = lines.len().saturating_sub(height) as u16;
+        let content_width = body_layout[1].width.saturating_sub(2) as usize;
+        let wrapped_lines = estimate_wrapped_lines(&lines, content_width);
+        let max_scroll = wrapped_lines.saturating_sub(height) as u16;
         let scroll = app.executions_details_scroll.min(max_scroll);
         let details_widget = Paragraph::new(lines)
             .block(details_block)
@@ -218,59 +230,78 @@ fn truncate(s: &str, max: usize) -> String {
     truncated
 }
 
+fn estimate_wrapped_lines(lines: &[Line<'_>], content_width: usize) -> usize {
+    if content_width == 0 {
+        return lines.len();
+    }
+
+    lines
+        .iter()
+        .map(|line| line.width().max(1).div_ceil(content_width))
+        .sum()
+}
+
 fn build_execution_details(row: &ExecutionRowData) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
 
-    lines.push(Line::from(format!("liq_id: {}", row.liq_id)));
+    push_section_title(&mut lines, "WAL Row");
+    lines.push(Line::from(format!("Liq ID: {}", row.liq_id)));
     lines.push(Line::from(format!(
-        "status: {} | attempt: {} | errors: {}",
+        "Status: {} | attempt: {} | errors: {}",
         status_label(row.status),
         row.attempt,
         row.error_count
     )));
     lines.push(Line::from(format!(
-        "created: {} | updated: {}",
+        "Created: {} | updated: {}",
         format_ts(row.created_at),
         format_ts(row.updated_at)
     )));
 
     if let Some(err) = row.last_error.as_deref() {
-        lines.push(Line::from(format!("last_error: {}", err)));
+        lines.push(Line::from(format!("Last error: {}", err)));
     }
 
-    lines.push(Line::from("meta_json:"));
-
-    let meta_lines = parse_meta_lines(&row.meta_json);
-    lines.extend(meta_lines);
+    append_receipt_from_meta(&mut lines, &row.meta_json);
 
     lines
 }
 
-fn parse_meta_lines(raw: &str) -> Vec<Line<'static>> {
+fn push_section_title(lines: &mut Vec<Line<'static>>, title: &str) {
+    if !lines.is_empty() {
+        lines.push(Line::from(""));
+    }
+    lines.push(Line::from(Span::styled(
+        title.to_string(),
+        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+    )));
+}
+
+fn append_receipt_from_meta(lines: &mut Vec<Line<'static>>, raw: &str) {
     if raw.trim().is_empty() || raw.trim() == "{}" {
-        return vec![Line::from("<empty>")];
+        push_section_title(lines, "Execution");
+        lines.push(Line::from("<no receipt metadata in WAL row>"));
+        return;
     }
 
     match serde_json::from_str::<LiqMetaWrapper>(raw) {
         Ok(wrapper) => {
-            let meta_val = decode_meta_value(&wrapper.meta);
-            let val = json!({
-                "receipt": wrapper.receipt,
-                "meta": meta_val
-            });
-            pretty_json_lines(&val)
+            append_receipt_lines(lines, &wrapper.receipt);
+            append_finalizer_decision(lines, wrapper.finalizer_decision.as_ref());
+            append_meta_summary(lines, &wrapper.meta);
         }
         Err(wrapper_err) => match serde_json::from_str::<ExecutionReceipt>(raw) {
             Ok(receipt) => {
-                let val = json!({
-                    "receipt": receipt,
-                    "meta": Value::Null
-                });
-                pretty_json_lines(&val)
+                append_receipt_lines(lines, &receipt);
+                push_section_title(lines, "Metadata");
+                lines.push(Line::from(Span::styled(
+                    "Legacy WAL payload: receipt present, wrapper/finalizer decision missing".to_string(),
+                    Style::default().fg(Color::Yellow),
+                )));
             }
             Err(receipt_err) => {
                 if let Ok(value) = serde_json::from_str::<Value>(raw) {
-                    let mut lines = Vec::new();
+                    push_section_title(lines, "Metadata");
                     lines.push(Line::from(Span::styled(
                         format!(
                             "meta_json unexpected shape (wrapper_err={}, receipt_err={})",
@@ -278,41 +309,216 @@ fn parse_meta_lines(raw: &str) -> Vec<Line<'static>> {
                         ),
                         Style::default().fg(Color::Yellow),
                     )));
-                    lines.extend(pretty_json_lines(&value));
-                    return lines;
+                    lines.push(Line::from(format!(
+                        "JSON type: {}",
+                        match value {
+                            Value::Null => "null",
+                            Value::Bool(_) => "bool",
+                            Value::Number(_) => "number",
+                            Value::String(_) => "string",
+                            Value::Array(_) => "array",
+                            Value::Object(_) => "object",
+                        }
+                    )));
+                    return;
                 }
 
-                vec![
-                    Line::from(Span::styled(
-                        format!(
-                            "meta_json parse error (wrapper_err={}, receipt_err={})",
-                            wrapper_err, receipt_err
-                        ),
-                        Style::default().fg(Color::Red),
-                    )),
-                    Line::from(truncate(raw, 220)),
-                ]
+                push_section_title(lines, "Metadata");
+                lines.push(Line::from(Span::styled(
+                    format!(
+                        "meta_json parse error (wrapper_err={}, receipt_err={})",
+                        wrapper_err, receipt_err
+                    ),
+                    Style::default().fg(Color::Red),
+                )));
+                lines.push(Line::from(format!("Raw preview: {}", truncate(raw, 220))));
             }
         },
     }
 }
 
-fn decode_meta_value(meta: &[u8]) -> Value {
-    if meta.is_empty() {
-        return Value::Null;
+fn append_receipt_lines(lines: &mut Vec<Line<'static>>, receipt: &ExecutionReceipt) {
+    push_section_title(lines, "Request");
+    let req = &receipt.request;
+    lines.push(Line::from(format!(
+        "Borrower: {}",
+        req.liquidation.borrower.to_text()
+    )));
+    lines.push(Line::from(format!(
+        "Debt pool: {}",
+        req.liquidation.debt_pool_id.to_text()
+    )));
+    lines.push(Line::from(format!(
+        "Collateral pool: {}",
+        req.liquidation.collateral_pool_id.to_text()
+    )));
+    lines.push(Line::from(format!(
+        "Debt amount request: {}",
+        ChainTokenAmount::from_raw(req.debt_asset.clone(), req.liquidation.debt_amount.clone()).formatted()
+    )));
+    lines.push(Line::from(format!("Bad debt mode: {}", req.liquidation.buy_bad_debt)));
+    lines.push(Line::from(format!(
+        "Swap requested: {}",
+        if req.swap_args.is_some() { "yes" } else { "no" }
+    )));
+    if let Some(swap) = req.swap_args.as_ref() {
+        lines.push(Line::from(format!(
+            "Swap route: {}:{} -> {}:{}",
+            swap.pay_asset.chain, swap.pay_asset.symbol, swap.receive_asset.chain, swap.receive_asset.symbol
+        )));
     }
-    if let Ok(text) = std::str::from_utf8(meta) {
-        if let Ok(value) = serde_json::from_str::<Value>(text) {
-            return value;
-        }
-        return Value::String(text.to_string());
+    lines.push(Line::from(format!(
+        "Debt asset: {} ({})",
+        req.debt_asset.symbol(),
+        req.debt_asset.chain()
+    )));
+    lines.push(Line::from(format!(
+        "Collateral asset: {} ({})",
+        req.collateral_asset.symbol(),
+        req.collateral_asset.chain()
+    )));
+    lines.push(Line::from(format!(
+        "Expected profit: {}",
+        format_profit(req.expected_profit, req.debt_asset.decimals(), req.debt_asset.symbol().as_str())
+    )));
+    lines.push(Line::from(format!(
+        "Debt approval needed: {}",
+        req.debt_approval_needed
+    )));
+
+    push_section_title(lines, "Execution");
+    lines.push(Line::from(format!(
+        "Executor status: {}",
+        format_execution_status(&receipt.status)
+    )));
+    lines.push(Line::from(format!("Change received: {}", receipt.change_received)));
+
+    if let Some(liq) = &receipt.liquidation_result {
+        push_section_title(lines, "Liquidation Result");
+        lines.push(Line::from(format!("Liquidation ID: {}", liq.id)));
+        lines.push(Line::from(format!("Timestamp: {}", format_ts(liq.timestamp as i64))));
+        lines.push(Line::from(format!(
+            "Liquidation status: {}",
+            format_liquidation_status(&liq.status)
+        )));
+        lines.push(Line::from(format!(
+            "Debt repaid: {}",
+            ChainTokenAmount::from_raw(req.debt_asset.clone(), liq.amounts.debt_repaid.clone()).formatted()
+        )));
+        lines.push(Line::from(format!(
+            "Collateral received: {}",
+            ChainTokenAmount::from_raw(req.collateral_asset.clone(), liq.amounts.collateral_received.clone()).formatted()
+        )));
+        lines.push(Line::from(format!(
+            "Change transfer: {}",
+            format_tx_status(&liq.change_tx)
+        )));
+        lines.push(Line::from(format!(
+            "Collateral transfer: {}",
+            format_tx_status(&liq.collateral_tx)
+        )));
+    } else {
+        push_section_title(lines, "Liquidation Result");
+        lines.push(Line::from("<missing liquidation_result>"));
     }
-    json!({ "meta_bytes_len": meta.len() })
 }
 
-fn pretty_json_lines(value: &Value) -> Vec<Line<'static>> {
-    let pretty = serde_json::to_string_pretty(value).unwrap_or_else(|_| "<failed to render json>".to_string());
-    pretty.lines().map(|l| Line::from(l.to_string())).collect()
+fn append_finalizer_decision(
+    lines: &mut Vec<Line<'static>>,
+    decision: Option<&crate::persistance::FinalizerDecisionSnapshot>,
+) {
+    push_section_title(lines, "Hybrid Decision Snapshot");
+    let Some(decision) = decision else {
+        lines.push(Line::from("<not persisted yet>"));
+        return;
+    };
+
+    lines.push(Line::from(format!(
+        "Mode: {} | chosen: {}",
+        decision.mode, decision.chosen
+    )));
+    lines.push(Line::from(format!("Reason: {}", decision.reason)));
+    lines.push(Line::from(format!(
+        "Min required edge: {:.2} bps",
+        decision.min_required_bps
+    )));
+    lines.push(Line::from(format!(
+        "DEX preview: gross={:?} net={:?}",
+        decision.dex_preview_gross_bps, decision.dex_preview_net_bps
+    )));
+    lines.push(Line::from(format!(
+        "CEX preview: gross={:?} net={:?}",
+        decision.cex_preview_gross_bps, decision.cex_preview_net_bps
+    )));
+    lines.push(Line::from(format!("Decision time: {}", format_ts(decision.ts))));
+}
+
+fn append_meta_summary(lines: &mut Vec<Line<'static>>, meta: &[u8]) {
+    push_section_title(lines, "Internal State");
+    if meta.is_empty() {
+        lines.push(Line::from("State bytes: <empty>"));
+        return;
+    }
+
+    lines.push(Line::from(format!("State bytes length: {}", meta.len())));
+    if let Ok(text) = std::str::from_utf8(meta) {
+        lines.push(Line::from("Encoding: utf8"));
+        if let Ok(value) = serde_json::from_str::<Value>(text) {
+            if let Some(step) = value.get("step").and_then(Value::as_str) {
+                lines.push(Line::from(format!("CEX step: {}", step)));
+            }
+            if let Some(last_error) = value.get("last_error").and_then(Value::as_str)
+                && !last_error.trim().is_empty()
+            {
+                lines.push(Line::from(format!("CEX last error: {}", last_error)));
+            }
+            if let Some(withdraw_id) = value
+                .get("withdraw_id")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+            {
+                lines.push(Line::from(format!("CEX withdraw id: {}", withdraw_id)));
+            }
+            return;
+        }
+
+        lines.push(Line::from(format!(
+            "State preview: {}",
+            truncate(text, 180)
+        )));
+        return;
+    }
+
+    lines.push(Line::from("Encoding: binary"));
+}
+
+fn format_execution_status(status: &ExecutionStatus) -> String {
+    status.description()
+}
+
+fn format_liquidation_status(status: &LiquidationStatus) -> String {
+    match status {
+        LiquidationStatus::Success => "success".to_string(),
+        LiquidationStatus::FailedLiquidation(err) => format!("failed liquidation ({err})"),
+        LiquidationStatus::CollateralTransferFailed(err) => format!("collateral transfer failed ({err})"),
+        LiquidationStatus::ChangeTransferFailed(err) => format!("change transfer failed ({err})"),
+        LiquidationStatus::InflowProcessed => "inflow processed".to_string(),
+        LiquidationStatus::CoreExecuted => "core executed".to_string(),
+    }
+}
+
+fn format_transfer_status(status: &TransferStatus) -> String {
+    match status {
+        TransferStatus::Pending => "pending".to_string(),
+        TransferStatus::Success => "success".to_string(),
+        TransferStatus::Failed(err) => format!("failed ({err})"),
+    }
+}
+
+fn format_tx_status(tx: &TxStatus) -> String {
+    let status = format_transfer_status(&tx.status);
+    let tx_id = tx.tx_id.as_deref().unwrap_or("-");
+    format!("{status} | tx_id={tx_id}")
 }
 
 fn format_ts(secs: i64) -> String {

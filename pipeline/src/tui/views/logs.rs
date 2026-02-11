@@ -1,8 +1,10 @@
+use std::collections::VecDeque;
+
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 
 use super::super::app::{App, UiFocus};
 
@@ -151,20 +153,32 @@ fn is_level(token: &str) -> bool {
     matches!(token, "ERROR" | "WARN" | "INFO" | "DEBUG" | "TRACE")
 }
 
+pub(super) fn estimate_wrapped_log_lines(logs: &VecDeque<String>, content_width: usize) -> usize {
+    if content_width == 0 {
+        return logs.len();
+    }
+
+    logs.iter()
+        .map(|line| {
+            // Keep empty lines visible as one visual row.
+            let width = line.trim_end_matches('\r').chars().count().max(1);
+            width.div_ceil(content_width)
+        })
+        .sum()
+}
+
 pub(super) fn draw_logs(f: &mut Frame<'_>, area: Rect, app: &App) {
     let lines: Vec<Line> = app.logs.iter().map(|l| log_to_line(l)).collect();
     let height = area.height.saturating_sub(2) as usize;
-    let max_scroll = lines.len().saturating_sub(height) as u16;
-    let (scroll, scroll_x, title) = if !app.logs_scroll_active {
-        (max_scroll, 0, "Logs (view)")
+    let content_width = area.width.saturating_sub(2) as usize;
+    let wrapped_lines = estimate_wrapped_log_lines(&app.logs, content_width);
+    let max_scroll = wrapped_lines.saturating_sub(height) as u16;
+    let (scroll, title) = if !app.logs_scroll_active {
+        (max_scroll, "Logs (view)")
     } else if app.logs_follow {
-        (max_scroll, app.logs_scroll_x, "Logs (follow)")
+        (max_scroll, "Logs (follow)")
     } else {
-        (
-            max_scroll.saturating_sub(app.logs_scroll),
-            app.logs_scroll_x,
-            "Logs (scroll)",
-        )
+        (max_scroll.saturating_sub(app.logs_scroll), "Logs (scroll)")
     };
 
     let mut block = Block::default().borders(Borders::ALL).title(title);
@@ -172,6 +186,9 @@ pub(super) fn draw_logs(f: &mut Frame<'_>, area: Rect, app: &App) {
         block = block.border_style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD));
     }
 
-    let w = Paragraph::new(lines).block(block).scroll((scroll, scroll_x));
+    let w = Paragraph::new(lines)
+        .block(block)
+        .scroll((scroll, 0))
+        .wrap(Wrap { trim: false });
     f.render_widget(w, area);
 }

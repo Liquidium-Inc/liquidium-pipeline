@@ -94,6 +94,14 @@ pub(super) async fn handle_key(
             app.ui_focus = UiFocus::ExecutionsTable;
             return Ok(false);
         }
+        if matches!(key.code, KeyCode::Right) && matches!(app.ui_focus, UiFocus::ExecutionsTable) {
+            app.ui_focus = UiFocus::ExecutionsDetails;
+            return Ok(false);
+        }
+        if matches!(key.code, KeyCode::Left) && matches!(app.ui_focus, UiFocus::ExecutionsDetails) {
+            app.ui_focus = UiFocus::ExecutionsTable;
+            return Ok(false);
+        }
     }
 
     if matches!(app.tab, Tab::Logs) && matches!(app.ui_focus, UiFocus::Logs) {
@@ -414,6 +422,26 @@ pub(super) async fn handle_key(
             if matches!(app.tab, Tab::Executions) && matches!(app.ui_focus, UiFocus::ExecutionsDetails) =>
         {
             app.executions_details_scroll = app.executions_details_scroll.saturating_add(10);
+        }
+        (KeyCode::Home, KeyModifiers::NONE)
+            if matches!(app.tab, Tab::Executions) && matches!(app.ui_focus, UiFocus::ExecutionsDetails) =>
+        {
+            app.executions_details_scroll = u16::MAX;
+        }
+        (KeyCode::End, KeyModifiers::NONE)
+            if matches!(app.tab, Tab::Executions) && matches!(app.ui_focus, UiFocus::ExecutionsDetails) =>
+        {
+            app.executions_details_scroll = 0;
+        }
+        (KeyCode::Char('g'), KeyModifiers::NONE)
+            if matches!(app.tab, Tab::Executions) && matches!(app.ui_focus, UiFocus::ExecutionsDetails) =>
+        {
+            app.executions_details_scroll = u16::MAX;
+        }
+        (KeyCode::Char('G'), KeyModifiers::SHIFT)
+            if matches!(app.tab, Tab::Executions) && matches!(app.ui_focus, UiFocus::ExecutionsDetails) =>
+        {
+            app.executions_details_scroll = 0;
         }
         (KeyCode::Char('u'), KeyModifiers::CONTROL)
             if matches!(app.tab, Tab::Executions) && matches!(app.ui_focus, UiFocus::ExecutionsDetails) =>
