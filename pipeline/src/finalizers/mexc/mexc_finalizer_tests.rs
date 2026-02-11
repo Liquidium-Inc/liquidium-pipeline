@@ -6,6 +6,7 @@ use candid::{Nat, Principal};
 use liquidium_pipeline_connectors::backend::cex_backend::{
     BuyOrderInputMode, DepositAddress, MockCexBackend, OrderBook, OrderBookLevel, SwapFillReport,
 };
+use liquidium_pipeline_core::error::TransferError;
 use liquidium_pipeline_core::tokens::{chain_token::ChainToken, chain_token_amount::ChainTokenAmount};
 use liquidium_pipeline_core::transfer::actions::MockTransferActions;
 use liquidium_pipeline_core::types::protocol_types::{
@@ -1989,7 +1990,7 @@ async fn mexc_approval_bump_retries_after_first_batch_failure_and_then_short_cir
             let mut n = approve_call_count_handle.lock().unwrap();
             *n += 1;
             if *n == 2 {
-                Err("approve failure in first batch".to_string())
+                Err(TransferError::backend("approve failure in first batch"))
             } else {
                 Ok(format!("approve-{}", *n))
             }
@@ -2041,8 +2042,8 @@ async fn mexc_approval_bump_second_batch_failure_does_not_mark_as_completed() {
             let mut n = approve_call_count_handle.lock().unwrap();
             *n += 1;
             match *n {
-                5 => Err("approve failure in second batch".to_string()),
-                6 => Err("retry attempt reached approve again".to_string()),
+                5 => Err(TransferError::backend("approve failure in second batch")),
+                6 => Err(TransferError::backend("retry attempt reached approve again")),
                 _ => Ok(format!("approve-{}", *n)),
             }
         });

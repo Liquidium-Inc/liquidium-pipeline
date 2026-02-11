@@ -214,6 +214,7 @@ async fn execute_withdraw(
     transfers
         .transfer_by_asset_id(&asset, ChainAccount::Icp(dst_account), amount_native)
         .await
+        .map_err(Into::into)
 }
 
 fn compute_withdraw_amount_native(balance: Nat, fee: Nat, amount: &str, decimals: u8) -> Result<Nat, String> {

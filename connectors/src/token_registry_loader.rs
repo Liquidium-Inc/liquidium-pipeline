@@ -185,6 +185,7 @@ mod tests {
     use super::{RegistryLoadError, load_token_registry};
     use crate::backend::evm_backend::MockEvmBackend;
     use crate::backend::icp_backend::MockIcpBackend;
+    use crate::error::ConnectorError;
     use liquidium_pipeline_core::tokens::token_registry::TokenRegistryTrait;
 
     static ENV_LOCK: Mutex<()> = Mutex::const_new(());
@@ -233,7 +234,11 @@ mod tests {
 
         let mut icp = MockIcpBackend::new();
         icp.expect_icrc1_decimals()
-            .returning(|_| Err("decimals-failed".to_string()));
+            .returning(|_| {
+                Err(ConnectorError::InvalidInput {
+                    message: "decimals-failed".to_string(),
+                })
+            });
 
         let evm = MockEvmBackend::new();
 
@@ -244,7 +249,7 @@ mod tests {
         match err {
             RegistryLoadError::MissingIcpDecimals { spec, source } => {
                 assert_eq!(spec, "icp:aaaaa-aa:ICP");
-                assert_eq!(source, "decimals-failed");
+                assert_eq!(source, "invalid input: decimals-failed");
             }
             other => panic!("unexpected error: {other:?}"),
         }
@@ -258,7 +263,11 @@ mod tests {
         let mut icp = MockIcpBackend::new();
         icp.expect_icrc1_decimals().returning(|_| Ok(8));
         icp.expect_icrc1_fee()
-            .returning(|_| Err("fee-failed".to_string()));
+            .returning(|_| {
+                Err(ConnectorError::InvalidInput {
+                    message: "fee-failed".to_string(),
+                })
+            });
 
         let evm = MockEvmBackend::new();
 
@@ -269,7 +278,7 @@ mod tests {
         match err {
             RegistryLoadError::MissingIcpFee { spec, source } => {
                 assert_eq!(spec, "icp:aaaaa-aa:ICP");
-                assert_eq!(source, "fee-failed");
+                assert_eq!(source, "invalid input: fee-failed");
             }
             other => panic!("unexpected error: {other:?}"),
         }

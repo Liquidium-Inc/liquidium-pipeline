@@ -1,7 +1,8 @@
 use liquidium_pipeline_core::tokens::asset_id::AssetId;
 use liquidium_pipeline_core::tokens::chain_token_amount::ChainTokenAmount;
+use std::fmt::Display;
 
-pub(super) fn format_balance_result(res: Option<&Result<(AssetId, ChainTokenAmount), String>>) -> String {
+pub(super) fn format_balance_result<E: Display>(res: Option<&Result<(AssetId, ChainTokenAmount), E>>) -> String {
     match res {
         Some(Ok((_, bal))) => format_chain_balance(bal),
         Some(Err(e)) => format!("err: {}", e),
