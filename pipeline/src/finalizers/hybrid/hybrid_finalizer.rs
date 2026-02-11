@@ -179,7 +179,9 @@ where
             RouteVenue::Dex => self.finalize_via_dex(wal, receipt).await?,
             RouteVenue::Cex => self.finalize_via_cex(wal, receipt).await?,
         };
+
         res.swapper = Some(Self::swapper_id(venue).to_string());
+
         if let Some(reason) = reason {
             info!("[hybrid] routing -> {} reason={}", venue, reason);
         } else {
@@ -294,17 +296,17 @@ where
 {
     #[instrument(name = "hybrid.finalize", skip_all, err)]
     async fn finalize(&self, wal: &dyn WalStore, receipt: ExecutionReceipt) -> Result<FinalizerResult, String> {
-        // 1) Forced mode override: pure DEX or pure CEX bypasses route comparison.
-        if let Some(forced) = self.forced_mode_venue() {
-            let reason = format!("forced mode {}", forced);
-            return self.execute_route(wal, receipt, forced, Some(&reason)).await;
-        }
-
-        // 2) No swap request: mark succeeded and return a no-op finalizer result.
+        // 1) No swap request: mark succeeded and return a no-op finalizer result.
         let swap_req = match receipt.request.swap_args.clone() {
             Some(req) => req,
             None => return self.finalize_without_swap(wal, &receipt).await,
         };
+
+        // 2) Forced mode override: pure DEX or pure CEX bypasses route comparison.
+        if let Some(forced) = self.forced_mode_venue() {
+            let reason = format!("forced mode {}", forced);
+            return self.execute_route(wal, receipt, forced, Some(&reason)).await;
+        }
 
         // 3) Dust routing: tiny notional is always sent to DEX.
         if Self::is_dust_swap(&receipt, &swap_req) {

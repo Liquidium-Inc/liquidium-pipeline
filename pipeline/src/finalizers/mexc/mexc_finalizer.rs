@@ -74,15 +74,22 @@ const APPROVE_BUMP_BATCH_SIZE: u8 = 3;
 const APPROVE_BUMP_DELAY_MS: u64 = 300;
 const APPROVE_BUMP_BATCH_DELAY_SECS: u64 = 3;
 pub const MEXC_DEPOSIT_FEE_MULTIPLIER: u8 = 7;
+#[allow(dead_code)]
 const DEFAULT_BUY_TRUNCATION_TRIGGER_RATIO: f64 = 0.25;
+#[allow(dead_code)]
 const DEFAULT_BUY_INVERSE_OVERSPEND_BPS: u32 = 10;
+#[allow(dead_code)]
 const DEFAULT_BUY_INVERSE_MAX_RETRIES: u32 = 1;
+#[allow(dead_code)]
 const DEFAULT_BUY_INVERSE_ENABLED: bool = true;
 
 impl<C> MexcFinalizer<C>
 where
     C: CexBackend,
-{
+{   
+
+    // used in tests
+    #[allow(unused)]
     pub fn new(
         backend: Arc<C>,
         transfer_service: Arc<dyn TransferActions>,

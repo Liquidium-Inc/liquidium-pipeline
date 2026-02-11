@@ -3,6 +3,9 @@ name = "liquidium-pipeline-commons"
 version = "0.1.0"
 edition = "2024"
 
+[lints.clippy]
+collapsible_if = "allow"
+
 [dependencies]
 thiserror = { workspace = true }
 async-trait = { workspace = true }
