@@ -477,12 +477,22 @@ mod tests {
         }
     }
 
+    /// Given: Hybrid mode reaches force-cex threshold without a CEX finalizer.
+    /// When: Finalization runs route selection.
+    /// Then: It falls back to candidate previews and returns no-viable-route.
     #[tokio::test]
     async fn hybrid_force_cex_over_threshold_falls_back_when_cex_unavailable() {
+        // given
+        const FORCE_CEX_THRESHOLD_USD: f64 = 2.5;
+        const MIN_NET_EDGE_BPS: u32 = 1_000;
+        const ESTIMATED_SWAP_NOTIONAL_USD: f64 = 3.0;
+
         let mut config = MockConfigTrait::new();
         config.expect_get_swapper_mode().return_const(SwapperMode::Hybrid);
-        config.expect_get_cex_force_over_usd_threshold().return_const(2.5);
-        config.expect_get_cex_min_net_edge_bps().return_const(1_000u32);
+        config
+            .expect_get_cex_force_over_usd_threshold()
+            .return_const(FORCE_CEX_THRESHOLD_USD);
+        config.expect_get_cex_min_net_edge_bps().return_const(MIN_NET_EDGE_BPS);
 
         let mut dex_swapper = MockSwapInterface::new();
         dex_swapper.expect_quote().times(1).returning(|req| {
@@ -507,11 +517,13 @@ mod tests {
             cex_finalizer: None,
         };
 
+        // when
         let err = finalizer
-            .finalize(&wal, make_receipt(3.0))
+            .finalize(&wal, make_receipt(ESTIMATED_SWAP_NOTIONAL_USD))
             .await
             .expect_err("route should fail because no candidate meets threshold");
 
+        // then
         assert!(err.contains("no viable route"));
     }
 
@@ -592,45 +604,67 @@ mod tests {
         assert!(err.contains("no viable route"));
     }
 
+    /// Given: Both DEX and CEX route candidates are viable.
+    /// When: Route selection compares projected net edge.
+    /// Then: The route with higher net edge is selected.
     #[test]
     fn choose_best_route_prefers_higher_net_edge_candidate() {
+        // given
+        const DEX_NET_EDGE_BPS: f64 = 125.0;
+        const CEX_NET_EDGE_BPS: f64 = 126.0;
+
         let dex_candidate = RouteCandidate {
             venue: RouteVenue::Dex,
-            net_edge_bps: 125.0,
+            net_edge_bps: DEX_NET_EDGE_BPS,
             reason: "dex".to_string(),
         };
         let cex_candidate = RouteCandidate {
             venue: RouteVenue::Cex,
-            net_edge_bps: 126.0,
+            net_edge_bps: CEX_NET_EDGE_BPS,
             reason: "cex".to_string(),
         };
 
+        // when
         let selected = HybridFinalizer::<MockConfigTrait>::choose_best_route(Some(dex_candidate), Some(cex_candidate))
             .expect("one candidate should be selected");
 
+        // then
         assert_eq!(selected.venue, RouteVenue::Cex);
-        assert_eq!(selected.net_edge_bps, 126.0);
+        assert_eq!(selected.net_edge_bps, CEX_NET_EDGE_BPS);
     }
 
+    /// Given: Only one side provides a viable route candidate.
+    /// When: Route selection runs.
+    /// Then: The available candidate is returned.
     #[test]
     fn choose_best_route_returns_available_candidate_when_other_missing() {
+        // given
+        const DEX_NET_EDGE_BPS: f64 = 125.0;
+        const CEX_NET_EDGE_BPS: f64 = 118.0;
+
         let dex_candidate = RouteCandidate {
             venue: RouteVenue::Dex,
-            net_edge_bps: 125.0,
+            net_edge_bps: DEX_NET_EDGE_BPS,
             reason: "dex".to_string(),
         };
         let cex_candidate = RouteCandidate {
             venue: RouteVenue::Cex,
-            net_edge_bps: 118.0,
+            net_edge_bps: CEX_NET_EDGE_BPS,
             reason: "cex".to_string(),
         };
 
+        // when
         let selected = HybridFinalizer::<MockConfigTrait>::choose_best_route(Some(dex_candidate.clone()), None)
             .expect("dex candidate should be selected");
+
+        // then
         assert_eq!(selected.venue, RouteVenue::Dex);
 
+        // when
         let selected = HybridFinalizer::<MockConfigTrait>::choose_best_route(None, Some(cex_candidate))
             .expect("candidate should be selected when only one side exists");
+
+        // then
         assert_eq!(selected.venue, RouteVenue::Cex);
     }
 }

@@ -599,9 +599,19 @@ mod tests {
         assert!(matches!(outcomes[0].status, ExecutionStatus::Success));
     }
 
+    /// Given: A retryable row is not yet due under exponential backoff.
+    /// When: Finalize stage processes pending rows.
+    /// Then: The row is skipped and finalizer is not invoked.
     #[tokio::test]
     async fn finalize_skips_retryable_rows_until_backoff_window_expires() {
-        let liq_id = 88u128;
+        // given
+        const LIQUIDATION_ID: u128 = 88;
+        const RECORDED_ERROR_COUNT: i32 = 3;
+        const RETRY_BASE_DELAY_SECS: u64 = 5;
+        const RETRY_MAX_DELAY_SECS: u64 = 120;
+        const WAL_BATCH_LIMIT: usize = 100;
+
+        let liq_id = LIQUIDATION_ID;
         let mut request = make_request();
         request.swap_args = Some(make_swap_request(&request));
         let receipt = ExecutionReceipt {
@@ -612,12 +622,12 @@ mod tests {
         };
         let mut row = make_row(liq_id, receipt);
         row.status = ResultStatus::FailedRetryable;
-        row.error_count = 3;
+        row.error_count = RECORDED_ERROR_COUNT;
         row.updated_at = now_ts();
 
         let mut wal = MockWalStore::new();
         wal.expect_get_pending()
-            .with(eq(100usize))
+            .with(eq(WAL_BATCH_LIMIT))
             .times(1)
             .returning(move |_| Ok(vec![row.clone()]));
         wal.expect_update_status().times(0);
@@ -635,18 +645,34 @@ mod tests {
             Arc::new(SimpleProfitCalculator),
             Arc::new(MockPipelineAgent::new()),
             Principal::anonymous(),
-            5,
-            120,
+            RETRY_BASE_DELAY_SECS,
+            RETRY_MAX_DELAY_SECS,
         );
 
+        // when
         let outcomes = stage.process(&()).await.expect("process should succeed");
+
+        // then
         assert!(outcomes.is_empty(), "backoff-gated rows should not finalize");
         assert_eq!(*finalize_calls.lock().expect("calls lock"), 0);
     }
 
+    /// Given: A retryable row is already due under exponential backoff.
+    /// When: Finalize stage processes pending rows.
+    /// Then: The row is moved in-flight and finalized successfully.
     #[tokio::test]
     async fn finalize_processes_retryable_rows_after_backoff_window_expires() {
-        let liq_id = 89u128;
+        // given
+        const LIQUIDATION_ID: u128 = 89;
+        const RECORDED_ERROR_COUNT: i32 = 3;
+        const RETRY_BASE_DELAY_SECS: u64 = 5;
+        const RETRY_MAX_DELAY_SECS: u64 = 120;
+        const WAL_BATCH_LIMIT: usize = 100;
+        const ALREADY_ELAPSED_WINDOW_SECS: i64 = 1_000;
+        const EXPECTED_FINALIZE_CALLS: usize = 1;
+        const EXPECTED_OUTCOME_COUNT: usize = 1;
+
+        let liq_id = LIQUIDATION_ID;
         let mut request = make_request();
         request.swap_args = Some(make_swap_request(&request));
         let receipt = ExecutionReceipt {
@@ -657,14 +683,14 @@ mod tests {
         };
         let mut row = make_row(liq_id, receipt);
         row.status = ResultStatus::FailedRetryable;
-        row.error_count = 3;
-        row.updated_at = now_ts().saturating_sub(1_000);
+        row.error_count = RECORDED_ERROR_COUNT;
+        row.updated_at = now_ts().saturating_sub(ALREADY_ELAPSED_WINDOW_SECS);
 
         let row_for_pending = row.clone();
         let row_id = row.id.clone();
         let mut wal = MockWalStore::new();
         wal.expect_get_pending()
-            .with(eq(100usize))
+            .with(eq(WAL_BATCH_LIMIT))
             .times(1)
             .returning(move |_| Ok(vec![row_for_pending.clone()]));
         wal.expect_update_status()
@@ -689,12 +715,19 @@ mod tests {
             Arc::new(SimpleProfitCalculator),
             Arc::new(MockPipelineAgent::new()),
             Principal::anonymous(),
-            5,
-            120,
+            RETRY_BASE_DELAY_SECS,
+            RETRY_MAX_DELAY_SECS,
         );
 
+        // when
         let outcomes = stage.process(&()).await.expect("process should succeed");
-        assert_eq!(outcomes.len(), 1, "backoff-expired row should finalize");
-        assert_eq!(*finalize_calls.lock().expect("calls lock"), 1);
+
+        // then
+        assert_eq!(
+            outcomes.len(),
+            EXPECTED_OUTCOME_COUNT,
+            "backoff-expired row should finalize"
+        );
+        assert_eq!(*finalize_calls.lock().expect("calls lock"), EXPECTED_FINALIZE_CALLS);
     }
 }

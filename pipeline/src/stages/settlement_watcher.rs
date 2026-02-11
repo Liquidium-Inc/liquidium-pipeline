@@ -487,9 +487,15 @@ mod tests {
         watcher.tick().await.expect("tick should succeed");
     }
 
+    /// Given: Settlement watcher runs in pure CEX mode with a ready liquidation row.
+    /// When: One watcher tick is executed.
+    /// Then: It enqueues without calling DEX quote gating.
     #[tokio::test]
     async fn watcher_bypasses_dex_quote_gate_in_cex_mode() {
-        let liq_id = 11u128;
+        // given
+        const LIQUIDATION_ID: u128 = 11;
+        const WAL_BATCH_LIMIT: usize = 100;
+        let liq_id = LIQUIDATION_ID;
         let swap_args = make_swap_args();
         let receipt = ExecutionReceipt {
             request: make_request(false, Some(swap_args.clone())),
@@ -502,11 +508,11 @@ mod tests {
 
         let mut wal = MockWalStore::new();
         wal.expect_list_by_status()
-            .with(eq(ResultStatus::WaitingCollateral), eq(100usize))
+            .with(eq(ResultStatus::WaitingCollateral), eq(WAL_BATCH_LIMIT))
             .times(1)
             .returning(move |_, _| Ok(vec![row.clone()]));
         wal.expect_list_by_status()
-            .with(eq(ResultStatus::WaitingProfit), eq(100usize))
+            .with(eq(ResultStatus::WaitingProfit), eq(WAL_BATCH_LIMIT))
             .times(1)
             .returning(|_, _| Ok(vec![]));
         wal.expect_upsert_result().times(0);
@@ -536,7 +542,11 @@ mod tests {
             SwapperMode::Cex,
         );
 
+        // when
         watcher.tick().await.expect("tick should succeed");
+
+        // then
+        // Expectations above assert: no quote calls and Enqueued transition.
     }
 
     #[tokio::test]
