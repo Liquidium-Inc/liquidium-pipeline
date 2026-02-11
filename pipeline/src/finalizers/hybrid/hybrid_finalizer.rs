@@ -323,13 +323,13 @@ where
                     "[hybrid] force-cex threshold reached but cex finalizer is unavailable; continuing with route candidates"
                 );
             } else {
-            let estimated_swap_value_usd = Self::estimate_swap_value_usd(&receipt, &swap_req);
-            let force_cex_threshold_usd = self.config.get_cex_force_over_usd_threshold();
-            let reason = format!(
-                "force cex route est_value_usd={:.4} threshold_usd={:.2}",
-                estimated_swap_value_usd, force_cex_threshold_usd
-            );
-            return self.execute_route(wal, receipt, RouteVenue::Cex, Some(&reason)).await;
+                let estimated_swap_value_usd = Self::estimate_swap_value_usd(&receipt, &swap_req);
+                let force_cex_threshold_usd = self.config.get_cex_force_over_usd_threshold();
+                let reason = format!(
+                    "force cex route est_value_usd={:.4} threshold_usd={:.2}",
+                    estimated_swap_value_usd, force_cex_threshold_usd
+                );
+                return self.execute_route(wal, receipt, RouteVenue::Cex, Some(&reason)).await;
             }
         }
 
@@ -590,5 +590,47 @@ mod tests {
             .expect_err("no route should satisfy min net edge");
 
         assert!(err.contains("no viable route"));
+    }
+
+    #[test]
+    fn choose_best_route_prefers_higher_net_edge_candidate() {
+        let dex_candidate = RouteCandidate {
+            venue: RouteVenue::Dex,
+            net_edge_bps: 125.0,
+            reason: "dex".to_string(),
+        };
+        let cex_candidate = RouteCandidate {
+            venue: RouteVenue::Cex,
+            net_edge_bps: 126.0,
+            reason: "cex".to_string(),
+        };
+
+        let selected = HybridFinalizer::<MockConfigTrait>::choose_best_route(Some(dex_candidate), Some(cex_candidate))
+            .expect("one candidate should be selected");
+
+        assert_eq!(selected.venue, RouteVenue::Cex);
+        assert_eq!(selected.net_edge_bps, 126.0);
+    }
+
+    #[test]
+    fn choose_best_route_returns_available_candidate_when_other_missing() {
+        let dex_candidate = RouteCandidate {
+            venue: RouteVenue::Dex,
+            net_edge_bps: 125.0,
+            reason: "dex".to_string(),
+        };
+        let cex_candidate = RouteCandidate {
+            venue: RouteVenue::Cex,
+            net_edge_bps: 118.0,
+            reason: "cex".to_string(),
+        };
+
+        let selected = HybridFinalizer::<MockConfigTrait>::choose_best_route(Some(dex_candidate.clone()), None)
+            .expect("dex candidate should be selected");
+        assert_eq!(selected.venue, RouteVenue::Dex);
+
+        let selected = HybridFinalizer::<MockConfigTrait>::choose_best_route(None, Some(cex_candidate))
+            .expect("candidate should be selected when only one side exists");
+        assert_eq!(selected.venue, RouteVenue::Cex);
     }
 }
