@@ -3,6 +3,8 @@ use liquidium_pipeline_connectors::backend::cex_backend::OrderBookLevel;
 
 /// Floating-point epsilon used for liquidity comparisons.
 pub(super) const LIQUIDITY_EPS: f64 = 1e-9;
+/// Basis points per 1.00 ratio value.
+const BPS_PER_RATIO_UNIT: f64 = 10_000.0;
 
 /// One market leg in a routed CEX trade.
 #[derive(Debug, Clone)]
@@ -77,7 +79,7 @@ pub(super) fn simulate_sell_from_bids(
         return Err("could not fill any sell amount".to_string());
     }
     let avg_price = quote_out / filled;
-    let impact_bps = ((best_bid - avg_price) / best_bid * 10_000.0).max(0.0);
+    let impact_bps = ((best_bid - avg_price) / best_bid * BPS_PER_RATIO_UNIT).max(0.0);
     Ok((quote_out, avg_price, impact_bps, remaining.max(0.0)))
 }
 
@@ -113,7 +115,7 @@ pub(super) fn simulate_buy_from_asks(asks: &[OrderBookLevel], quote_in: f64) -> 
         return Err("could not fill any buy amount".to_string());
     }
     let avg_price = spent / base_out;
-    let impact_bps = ((avg_price - best_ask) / best_ask * 10_000.0).max(0.0);
+    let impact_bps = ((avg_price - best_ask) / best_ask * BPS_PER_RATIO_UNIT).max(0.0);
     Ok((base_out, avg_price, impact_bps, remaining_quote.max(0.0)))
 }
 

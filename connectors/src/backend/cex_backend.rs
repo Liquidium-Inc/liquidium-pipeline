@@ -81,12 +81,7 @@ pub trait CexBackend: Send + Sync {
 
     async fn execute_swap(&self, market: &str, side: &str, amount_in: f64) -> Result<f64, String>;
 
-    async fn execute_swap_detailed(
-        &self,
-        market: &str,
-        side: &str,
-        amount_in: f64,
-    ) -> Result<SwapFillReport, String>;
+    async fn execute_swap_detailed(&self, market: &str, side: &str, amount_in: f64) -> Result<SwapFillReport, String>;
 
     async fn execute_swap_detailed_with_options(
         &self,
