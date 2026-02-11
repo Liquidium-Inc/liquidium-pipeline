@@ -1,40 +1,55 @@
 use prettytable::{Cell, Row, Table, format};
+use tracing::info;
 
 use liquidium_pipeline_core::tokens::token_registry::TokenRegistryTrait;
 use liquidium_pipeline_core::tokens::{asset_id::AssetId, chain_token_amount::ChainTokenAmount};
 
 use crate::config::ConfigTrait;
 use crate::context::init_context;
+use crate::output::plain_logs_enabled;
 pub async fn funds() -> Result<(), String> {
     let ctx = init_context().await?;
 
     const HEADER_LABEL_WIDTH: usize = 22;
 
-    println!("\n=== Balances (Main | Trader | Recovery) ===");
-    println!(
-        "{: <HEADER_LABEL_WIDTH$}: {}",
-        "Main ICP principal",
-        ctx.config.liquidator_principal.to_text()
-    );
-    println!(
-        "{: <HEADER_LABEL_WIDTH$}: {}",
-        "Trader ICP principal",
-        ctx.config.trader_principal.to_text()
-    );
     let recovery_account = ctx.config.get_recovery_account();
-    if let Some((principal, subaccount)) = recovery_account.to_string().split_once('.') {
-        println!("{: <HEADER_LABEL_WIDTH$}: {}.", "Recovery account", principal);
-        println!("{: <HEADER_LABEL_WIDTH$}  {}", "", subaccount);
+    let plain_logs = plain_logs_enabled();
+
+    if plain_logs {
+        info!(
+            main_icp_principal = %ctx.config.liquidator_principal.to_text(),
+            trader_icp_principal = %ctx.config.trader_principal.to_text(),
+            recovery_account = %recovery_account,
+            evm_address = %ctx.evm_address,
+            "Balances header"
+        );
+        info!("Recovery account holds seized collateral from failed swaps.");
     } else {
-        println!("{: <HEADER_LABEL_WIDTH$}: {}", "Recovery account", recovery_account);
+        println!("\n=== Balances (Main | Trader | Recovery) ===");
+        println!(
+            "{: <HEADER_LABEL_WIDTH$}: {}",
+            "Main ICP principal",
+            ctx.config.liquidator_principal.to_text()
+        );
+        println!(
+            "{: <HEADER_LABEL_WIDTH$}: {}",
+            "Trader ICP principal",
+            ctx.config.trader_principal.to_text()
+        );
+        if let Some((principal, subaccount)) = recovery_account.to_string().split_once('.') {
+            println!("{: <HEADER_LABEL_WIDTH$}: {}.", "Recovery account", principal);
+            println!("{: <HEADER_LABEL_WIDTH$}  {}", "", subaccount);
+        } else {
+            println!("{: <HEADER_LABEL_WIDTH$}: {}", "Recovery account", recovery_account);
+        }
+        println!("{: <HEADER_LABEL_WIDTH$}: {}\n", "EVM address", ctx.evm_address);
+        const ANSI_YELLOW: &str = "\x1b[33m";
+        const ANSI_RESET: &str = "\x1b[0m";
+        println!(
+            "{}Recovery account holds seized collateral from failed swaps.{}\n",
+            ANSI_YELLOW, ANSI_RESET
+        );
     }
-    println!("{: <HEADER_LABEL_WIDTH$}: {}\n", "EVM address", ctx.evm_address);
-    const ANSI_YELLOW: &str = "\x1b[33m";
-    const ANSI_RESET: &str = "\x1b[0m";
-    println!(
-        "{}Recovery account holds seized collateral from failed swaps.{}\n",
-        ANSI_YELLOW, ANSI_RESET
-    );
 
     let asset_ids: Vec<AssetId> = ctx.registry.all().into_iter().map(|(id, _)| id).collect();
 
@@ -43,6 +58,24 @@ pub async fn funds() -> Result<(), String> {
         ctx.trader_service.sync_assets(&asset_ids),
         ctx.recovery_service.sync_assets(&asset_ids),
     );
+
+    if plain_logs {
+        for (idx, asset_id) in asset_ids.iter().enumerate() {
+            let main_cell = format_balance_result(main_results.get(idx));
+            let trader_cell = format_balance_result(trader_results.get(idx));
+            let recovery_cell = format_balance_result(recovery_results.get(idx));
+
+            info!(
+                asset = %asset_id,
+                main = %main_cell,
+                trader = %trader_cell,
+                recovery = %recovery_cell,
+                "Balance row"
+            );
+        }
+
+        return Ok(());
+    }
 
     let mut table = Table::new();
     table.set_format(*format::consts::FORMAT_NO_LINESEP_WITH_TITLE);
@@ -65,6 +98,7 @@ pub async fn funds() -> Result<(), String> {
             Cell::new(&recovery_cell),
         ]));
     }
+
     table.printstd();
 
     Ok(())
