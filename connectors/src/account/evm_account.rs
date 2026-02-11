@@ -103,10 +103,8 @@ impl<B: EvmBackend> AccountInfo for EvmAccountInfoAdapter<B> {
             }
         }
 
-        if is_stale {
-            if let Ok(mut lock) = self.cache.lock() {
-                lock.remove(&(chain, addr));
-            }
+        if is_stale && let Ok(mut lock) = self.cache.lock() {
+            lock.remove(&(chain, addr));
         }
 
         result

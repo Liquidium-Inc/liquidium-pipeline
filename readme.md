@@ -346,6 +346,23 @@ liquidator run
 
 Starts the main liquidation loop that continuously monitors and executes liquidations.
 
+### Start the TUI
+
+```bash
+liquidator tui
+```
+
+Launches a terminal UI to **start/pause** the loop, view **WAL status**, **profits** (from `EXPORT_PATH`), **balances**, and run **withdrawals** (ICP tokens only).
+
+**Key bindings:**
+- `r` — start/pause
+- `b` — refresh balances
+- `p` — refresh profits
+- `w` — withdraw (from balances)
+- `d` — MEXC deposit address (from balances); in Withdraw panel, refresh deposit info
+- `tab` — switch views
+- `q` — quit
+
 ### Check Balances
 
 ```bash

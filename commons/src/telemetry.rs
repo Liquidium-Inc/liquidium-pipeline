@@ -65,10 +65,11 @@ impl Drop for TelemetryGuard {
         {
             eprintln!("Failed to shutdown tracer provider: {e}");
         }
-        if let Some(provider) = self.logger_provider.take() {
-            if let Err(e) = provider.shutdown() {
-                eprintln!("Failed to shutdown logger provider: {e}");
-            }
+        
+        if let Some(provider) = self.logger_provider.take()
+            && let Err(e) = provider.shutdown()
+        {
+            eprintln!("Failed to shutdown logger provider: {e}");
         }
     }
 }

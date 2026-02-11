@@ -61,7 +61,7 @@ where
 {
     pub config: Arc<C>,
     pub registry: Arc<R>,
-    pub swapper: Arc<T>,
+    pub _swapper: Arc<T>,
     pub collateral_service: Arc<U>,
     pub account_service: Arc<BalanceService>,
     pub approval_state: Arc<ApprovalState>,
@@ -86,7 +86,7 @@ where
         Self {
             config,
             registry,
-            swapper,
+            _swapper: swapper,
             collateral_service,
             account_service: balance_service,
             approval_state,

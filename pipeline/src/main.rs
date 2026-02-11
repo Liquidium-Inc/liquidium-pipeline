@@ -13,6 +13,7 @@ pub mod swappers;
 mod wal;
 
 mod approval_state;
+mod tui;
 mod utils;
 mod watchdog;
 use clap::{Parser, Subcommand};
@@ -33,6 +34,9 @@ struct Cli {
 enum Commands {
     // Starts the liquidation bot loop
     Run,
+
+    // Starts the interactive TUI (start/pause loop, view balances & profits)
+    Tui,
 
     // Shows wallet token balances
     Balance,
@@ -83,13 +87,23 @@ enum AccountCommands {
 #[tokio::main]
 async fn main() {
     load_env();
-    let _telemetry_guard = init_telemetry_from_env().expect("Failed to initialize telemetry");
-
     let cli = Cli::parse();
+
+    // Telemetry writes to stdout by default; in TUI mode it will corrupt the terminal.
+    // The TUI sets up its own in-app log sink instead.
+    let _telemetry_guard = match cli.command {
+        Commands::Tui => None,
+        _ => Some(init_telemetry_from_env().expect("Failed to initialize telemetry")),
+    };
 
     match &cli.command {
         Commands::Run => {
             run_liquidation_loop().await;
+        }
+        Commands::Tui => {
+            if let Err(err) = commands::tui::run().await {
+                eprintln!("TUI exited with error: {}", err);
+            }
         }
         Commands::Balance => {
             if let Err(e) = commands::funds::funds().await {

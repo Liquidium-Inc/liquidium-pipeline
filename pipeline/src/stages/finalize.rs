@@ -182,10 +182,10 @@ where
                             {
                                 receipt.status = ExecutionStatus::Success;
                             }
-                            if let Some(wal_id) = wal_id_by_liq.get(&liq_id) {
-                                if let Err(err) = self.update_receipt_meta(wal_id, &receipt).await {
-                                    warn!("Failed to update WAL meta for liq_id {}: {}", liq_id, err);
-                                }
+                            if let Some(wal_id) = wal_id_by_liq.get(&liq_id)
+                                && let Err(err) = self.update_receipt_meta(wal_id, &receipt).await
+                            {
+                                warn!("Failed to update WAL meta for liq_id {}: {}", liq_id, err);
                             }
                         }
                     }
