@@ -163,8 +163,8 @@ where
 
 #[cfg(test)]
 mod tests {
-    use crate::swappers::router::SwapVenue;
     use crate::approval_state::ApprovalState;
+    use crate::swappers::router::SwapVenue;
     use candid::{Decode, Nat, Principal};
     use icrc_ledger_types::icrc1::account::Account;
     use icrc_ledger_types::icrc2::allowance::Allowance;
@@ -227,9 +227,12 @@ mod tests {
         };
 
         let mut mock_agent = MockPipelineAgent::new();
+        mock_agent
+            .expect_agent()
+            .returning(|| panic!("agent() should not be called in kong_venue_execute_applies_fee_after_approve"));
 
         let ledger_allowance = ledger;
-        let ledger_balance = ledger_allowance.clone();
+        let ledger_balance = ledger_allowance;
 
         mock_agent
             .expect_call_query::<Allowance>()
@@ -267,7 +270,7 @@ mod tests {
                     return false;
                 }
                 let decoded: SwapArgs = Decode!(&arg, SwapArgs).expect("decode swap args");
-                decoded.pay_amount == Nat::from(90u8)
+                decoded.pay_amount == 90u8
             })
             .times(1)
             .returning(move |_, _, _| {
@@ -319,9 +322,12 @@ mod tests {
         };
 
         let mut mock_agent = MockPipelineAgent::new();
+        mock_agent
+            .expect_agent()
+            .returning(|| panic!("agent() should not be called in kong_venue_execute_skips_fee_when_allowance_ok"));
 
         let ledger_allowance = ledger;
-        let ledger_balance = ledger_allowance.clone();
+        let ledger_balance = ledger_allowance;
 
         mock_agent
             .expect_call_query::<Allowance>()
@@ -345,7 +351,7 @@ mod tests {
                     return false;
                 }
                 let decoded: SwapArgs = Decode!(&arg, SwapArgs).expect("decode swap args");
-                decoded.pay_amount == Nat::from(100u8)
+                decoded.pay_amount == 100u8
             })
             .times(1)
             .returning(move |_, _, _| Ok(SwapResult::Ok(dummy_swap_reply(Nat::from(100u8)))));

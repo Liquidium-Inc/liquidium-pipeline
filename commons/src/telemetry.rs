@@ -5,7 +5,9 @@ use opentelemetry_sdk::Resource;
 use opentelemetry_sdk::logs::SdkLoggerProvider;
 use opentelemetry_sdk::trace::SdkTracerProvider;
 use tracing_opentelemetry::OpenTelemetryLayer;
+use tracing_subscriber::filter::filter_fn;
 use tracing_subscriber::EnvFilter;
+use tracing_subscriber::Layer;
 use tracing_subscriber::fmt;
 use tracing_subscriber::layer::SubscriberExt;
 
@@ -58,15 +60,16 @@ pub struct TelemetryGuard {
 
 impl Drop for TelemetryGuard {
     fn drop(&mut self) {
-        if let Some(provider) = self.tracer_provider.take() {
-            if let Err(e) = provider.shutdown() {
-                eprintln!("Failed to shutdown tracer provider: {e}");
-            }
+        if let Some(provider) = self.tracer_provider.take()
+            && let Err(e) = provider.shutdown()
+        {
+            eprintln!("Failed to shutdown tracer provider: {e}");
         }
-        if let Some(provider) = self.logger_provider.take() {
-            if let Err(e) = provider.shutdown() {
-                eprintln!("Failed to shutdown logger provider: {e}");
-            }
+        
+        if let Some(provider) = self.logger_provider.take()
+            && let Err(e) = provider.shutdown()
+        {
+            eprintln!("Failed to shutdown logger provider: {e}");
         }
     }
 }
@@ -131,7 +134,8 @@ pub fn init_telemetry(config: TelemetryConfig) -> Result<TelemetryGuard, Box<dyn
     match (&tracer_provider, &logger_provider) {
         (Some(tp), Some(lp)) => {
             let tracer = tp.tracer(config.service_name);
-            let otel_trace_layer = OpenTelemetryLayer::new(tracer);
+            // Export spans to Tempo, but keep events as logs in Loki.
+            let otel_trace_layer = OpenTelemetryLayer::new(tracer).with_filter(filter_fn(|meta| meta.is_span()));
             let otel_log_layer = OpenTelemetryTracingBridge::new(lp);
 
             let subscriber = tracing_subscriber::registry()
@@ -144,7 +148,7 @@ pub fn init_telemetry(config: TelemetryConfig) -> Result<TelemetryGuard, Box<dyn
         }
         (Some(tp), None) => {
             let tracer = tp.tracer(config.service_name);
-            let otel_trace_layer = OpenTelemetryLayer::new(tracer);
+            let otel_trace_layer = OpenTelemetryLayer::new(tracer).with_filter(filter_fn(|meta| meta.is_span()));
 
             let subscriber = tracing_subscriber::registry()
                 .with(env_filter)

@@ -2,9 +2,11 @@ use anyhow::Result;
 use async_trait::async_trait;
 use diesel::{
     connection::SimpleConnection,
+    dsl::count_star,
     prelude::*,
     r2d2::{ConnectionManager, Pool},
 };
+use std::collections::HashMap;
 
 mod models;
 mod schema;
@@ -72,6 +74,39 @@ impl SqliteWalStore {
             updated_at: r.updated_at,
             meta_json: r.meta_json,
         }
+    }
+
+    pub fn status_counts(&self) -> Result<HashMap<ResultStatus, i64>> {
+        let mut conn = self.get_conn()?;
+        let rows: Vec<(i32, i64)> = tbl::table
+            .group_by(tbl::status)
+            .select((tbl::status, count_star()))
+            .load(&mut conn)?;
+
+        let mut out: HashMap<ResultStatus, i64> = HashMap::new();
+        for (status, count) in rows {
+            let status = match status {
+                0 => ResultStatus::Enqueued,
+                1 => ResultStatus::InFlight,
+                2 => ResultStatus::Succeeded,
+                3 => ResultStatus::FailedRetryable,
+                4 => ResultStatus::FailedPermanent,
+                5 => ResultStatus::WaitingCollateral,
+                6 => ResultStatus::WaitingProfit,
+                _ => ResultStatus::FailedPermanent,
+            };
+            *out.entry(status).or_insert(0) += count;
+        }
+        Ok(out)
+    }
+
+    pub fn list_recent(&self, limit: usize) -> Result<Vec<LiqResultRecord>> {
+        let mut conn = self.get_conn()?;
+        let rows = tbl::table
+            .order(tbl::updated_at.desc())
+            .limit(limit as i64)
+            .load::<Row>(&mut conn)?;
+        Ok(rows.into_iter().map(Self::from_row).collect())
     }
 }
 

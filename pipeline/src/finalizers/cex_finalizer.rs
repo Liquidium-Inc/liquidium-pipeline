@@ -25,37 +25,125 @@ pub enum CexStep {
     Failed,
 }
 
+/// Route-level CEX feasibility and cost preview used by hybrid routing decisions.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CexState {
-    pub liq_id: String,
-    pub step: CexStep,
-    pub last_error: Option<String>,
+pub struct CexRoutePreview {
+    /// Whether the route is executable against current orderbook depth.
+    pub is_executable: bool,
+    /// Estimated output amount in final receive-asset native units.
+    pub estimated_receive_amount: f64,
+    /// Estimated end-to-end route slippage in basis points.
+    pub estimated_slippage_bps: f64,
+    /// Optional reason when preview cannot be executed.
+    pub reason: Option<String>,
+}
 
-    // deposit leg
+/// One executed CEX slice for observability and export analytics.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CexTradeSlice {
+    pub leg_index: u32,
+    pub market: String,
+    pub side: String,
+    pub amount_in: f64,
+    pub amount_out: f64,
+    pub mid_price: f64,
+    pub exec_price: f64,
+    pub slippage_bps: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CexDepositState {
     pub deposit_asset: ChainToken,
     pub deposit_txid: Option<String>,
     pub deposit_balance_before: Option<f64>,
     #[serde(default)]
     pub approval_bump_count: Option<u32>,
+}
 
-    // trade leg
-    pub market: String,
-    pub side: String,
-    pub size_in: ChainTokenAmount,
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CexTradeState {
+    /// One-based index of the current trade leg being executed.
+    /// `None` means no leg has started yet.
     pub trade_leg_index: Option<u32>,
+    /// Total number of legs in the resolved route.
     pub trade_leg_total: Option<u32>,
+    /// Market used by the most recently attempted leg/slice.
     pub trade_last_market: Option<String>,
+    /// Side (`buy`/`sell`) used by the most recently attempted leg/slice.
     pub trade_last_side: Option<String>,
+    /// Input amount requested/consumed for the most recent leg update.
     pub trade_last_amount_in: Option<f64>,
+    /// Output amount produced by the most recent leg update.
     pub trade_last_amount_out: Option<f64>,
+    /// Amount to carry into the next leg after a completed leg.
     pub trade_next_amount_in: Option<f64>,
+    /// Weighted average route slippage across all executed slices, in bps.
+    pub trade_weighted_slippage_bps: Option<f64>,
+    /// Sum(amount_in * mid_price) across slices.
+    pub trade_mid_notional_sum: Option<f64>,
+    /// Sum(amount_in * exec_price) across slices.
+    pub trade_exec_notional_sum: Option<f64>,
+    /// Recorded slice-level executions for telemetry.
+    #[serde(default)]
+    pub trade_slices: Vec<CexTradeSlice>,
+    /// Whether residual was skipped as dust (< min execution USD).
+    #[serde(default)]
+    pub trade_dust_skipped: bool,
+    /// Residual notional skipped as dust, in USD.
+    #[serde(default)]
+    pub trade_dust_usd: Option<f64>,
+    /// Remaining input for the current leg persisted for retry-safe resume.
+    #[serde(default)]
+    pub trade_progress_remaining_in: Option<f64>,
+    /// Accumulated output for the current leg persisted for retry-safe resume.
+    #[serde(default)]
+    pub trade_progress_total_out: Option<f64>,
+    /// Deterministic client order id for the in-flight slice, if any.
+    #[serde(default)]
+    pub trade_pending_client_order_id: Option<String>,
+    /// Market of the in-flight slice.
+    #[serde(default)]
+    pub trade_pending_market: Option<String>,
+    /// Side of the in-flight slice.
+    #[serde(default)]
+    pub trade_pending_side: Option<String>,
+    /// Requested input of the in-flight slice.
+    #[serde(default)]
+    pub trade_pending_requested_in: Option<f64>,
+    /// Buy mode selected for the in-flight slice / next buy hint.
+    #[serde(default)]
+    pub trade_pending_buy_mode: Option<String>,
+    /// Count of inverse buy retries executed in the current leg.
+    #[serde(default)]
+    pub trade_inverse_retry_count: u32,
+    /// Residual input that could not be executed due to constraints.
+    #[serde(default)]
+    pub trade_unexecutable_residual_in: Option<f64>,
+}
 
-    // withdraw leg
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CexWithdrawState {
     pub withdraw_asset: ChainToken,
     pub withdraw_address: String,
     pub withdraw_id: Option<String>,
     pub withdraw_txid: Option<String>,
     pub size_out: Option<ChainTokenAmount>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CexState {
+    pub liq_id: String,
+    pub step: CexStep,
+    pub last_error: Option<String>,
+    pub market: String,
+    pub side: String,
+    pub size_in: ChainTokenAmount,
+    #[serde(flatten)]
+    pub deposit: CexDepositState,
+    #[serde(flatten)]
+    pub trade: CexTradeState,
+    #[serde(flatten)]
+    pub withdraw: CexWithdrawState,
 }
 
 #[async_trait]
@@ -74,6 +162,9 @@ pub trait CexFinalizerLogic: Send + Sync {
 
     // Build final SwapExecution to hand back to pipeline when Completed
     async fn finish(&self, receipt: &ExecutionReceipt, state: &CexState) -> Result<SwapExecution, String>;
+
+    // Preview route feasibility and slippage using current orderbook depth.
+    async fn preview_route(&self, receipt: &ExecutionReceipt) -> Result<CexRoutePreview, String>;
 }
 
 #[async_trait]
@@ -135,6 +226,21 @@ impl Finalizer for dyn CexFinalizerLogic {
             cex_state.liq_id, cex_state.step
         );
 
+        // Legacy WAL bootstrap: older rows do not include per-leg progress/pending fields.
+        if matches!(cex_state.step, CexStep::Trade | CexStep::TradePending) {
+            if cex_state.trade.trade_progress_remaining_in.is_none() {
+                let bootstrap_in = cex_state
+                    .trade
+                    .trade_next_amount_in
+                    .unwrap_or_else(|| cex_state.size_in.to_f64());
+                cex_state.trade.trade_progress_remaining_in = Some(bootstrap_in);
+            }
+
+            if cex_state.trade.trade_progress_total_out.is_none() {
+                cex_state.trade.trade_progress_total_out = Some(0.0);
+            }
+        }
+
         let mut row_after = row;
         loop {
             let step_res = match cex_state.step {
@@ -183,7 +289,7 @@ impl Finalizer for dyn CexFinalizerLogic {
                 meta.meta = serde_json::to_vec(&cex_state).map_err(|e| e.to_string())?;
                 encode_meta(&mut row_after, &meta)?;
                 wal.upsert_result(row_after.clone()).await.map_err(|e| e.to_string())?;
-                break;
+                return Err(err.to_string());
             }
 
             debug!(
@@ -327,28 +433,46 @@ mod tests {
                 liq_id: liq_id.to_string(),
                 step: CexStep::Trade,
                 last_error: None,
-
-                deposit_asset: pay.clone(),
-                deposit_txid: None,
-                deposit_balance_before: None,
-                approval_bump_count: None,
-
                 market: "CKBTC_BTC".to_string(),
                 side: "sell".to_string(),
-                size_in: ChainTokenAmount::from_raw(pay, Nat::from(1_000u64)),
-                trade_leg_index: None,
-                trade_leg_total: None,
-                trade_last_market: None,
-                trade_last_side: None,
-                trade_last_amount_in: None,
-                trade_last_amount_out: None,
-                trade_next_amount_in: None,
-
-                withdraw_asset: recv,
-                withdraw_address: "dest".to_string(),
-                withdraw_id: None,
-                withdraw_txid: None,
-                size_out: None,
+                size_in: ChainTokenAmount::from_raw(pay.clone(), Nat::from(1_000u64)),
+                deposit: CexDepositState {
+                    deposit_asset: pay.clone(),
+                    deposit_txid: None,
+                    deposit_balance_before: None,
+                    approval_bump_count: None,
+                },
+                trade: CexTradeState {
+                    trade_leg_index: None,
+                    trade_leg_total: None,
+                    trade_last_market: None,
+                    trade_last_side: None,
+                    trade_last_amount_in: None,
+                    trade_last_amount_out: None,
+                    trade_next_amount_in: None,
+                    trade_weighted_slippage_bps: None,
+                    trade_mid_notional_sum: None,
+                    trade_exec_notional_sum: None,
+                    trade_slices: Vec::new(),
+                    trade_dust_skipped: false,
+                    trade_dust_usd: None,
+                    trade_progress_remaining_in: None,
+                    trade_progress_total_out: None,
+                    trade_pending_client_order_id: None,
+                    trade_pending_market: None,
+                    trade_pending_side: None,
+                    trade_pending_requested_in: None,
+                    trade_pending_buy_mode: None,
+                    trade_inverse_retry_count: 0,
+                    trade_unexecutable_residual_in: None,
+                },
+                withdraw: CexWithdrawState {
+                    withdraw_asset: recv,
+                    withdraw_address: "dest".to_string(),
+                    withdraw_id: None,
+                    withdraw_txid: None,
+                    size_out: None,
+                },
             })
         }
 
@@ -361,14 +485,14 @@ mod tests {
             *calls += 1;
 
             if self.pending_once && *calls == 1 {
-                state.trade_leg_index = Some(1);
-                state.trade_leg_total = Some(2);
+                state.trade.trade_leg_index = Some(1);
+                state.trade.trade_leg_total = Some(2);
                 state.step = CexStep::TradePending;
                 return Ok(());
             }
 
-            state.trade_leg_index = Some(2);
-            state.trade_leg_total = Some(2);
+            state.trade.trade_leg_index = Some(2);
+            state.trade.trade_leg_total = Some(2);
             state.step = CexStep::Completed;
             Ok(())
         }
@@ -378,8 +502,8 @@ mod tests {
         }
 
         async fn finish(&self, _receipt: &ExecutionReceipt, state: &CexState) -> Result<SwapExecution, String> {
-            let pay = state.deposit_asset.asset_id();
-            let recv = state.withdraw_asset.asset_id();
+            let pay = state.deposit.deposit_asset.asset_id();
+            let recv = state.withdraw.withdraw_asset.asset_id();
             Ok(SwapExecution {
                 swap_id: 0,
                 request_id: 0,
@@ -394,6 +518,145 @@ mod tests {
                 legs: vec![],
                 approval_count: None,
                 ts: 0,
+            })
+        }
+
+        async fn preview_route(&self, _receipt: &ExecutionReceipt) -> Result<CexRoutePreview, String> {
+            Ok(CexRoutePreview {
+                is_executable: true,
+                estimated_receive_amount: 0.0,
+                estimated_slippage_bps: 0.0,
+                reason: None,
+            })
+        }
+    }
+
+    struct FailThenResumeFinalizer {
+        prepare_calls: Arc<Mutex<u32>>,
+        trade_calls: Arc<Mutex<u32>>,
+    }
+
+    #[async_trait]
+    impl CexFinalizerLogic for FailThenResumeFinalizer {
+        async fn prepare(&self, liq_id: &str, _receipt: &ExecutionReceipt) -> Result<CexState, String> {
+            *self.prepare_calls.lock().unwrap() += 1;
+
+            let pay = ChainToken::Icp {
+                ledger: Principal::anonymous(),
+                symbol: "ckBTC".to_string(),
+                decimals: 8,
+                fee: Nat::from(10u64),
+            };
+            let recv = ChainToken::Icp {
+                ledger: Principal::anonymous(),
+                symbol: "ckUSDT".to_string(),
+                decimals: 6,
+                fee: Nat::from(10_000u64),
+            };
+
+            Ok(CexState {
+                liq_id: liq_id.to_string(),
+                step: CexStep::Trade,
+                last_error: None,
+                market: "CKBTC_BTC".to_string(),
+                side: "sell".to_string(),
+                size_in: ChainTokenAmount::from_raw(pay.clone(), Nat::from(1_000u64)),
+                deposit: CexDepositState {
+                    deposit_asset: pay.clone(),
+                    deposit_txid: None,
+                    deposit_balance_before: None,
+                    approval_bump_count: None,
+                },
+                trade: CexTradeState {
+                    trade_leg_index: None,
+                    trade_leg_total: None,
+                    trade_last_market: None,
+                    trade_last_side: None,
+                    trade_last_amount_in: None,
+                    trade_last_amount_out: None,
+                    trade_next_amount_in: None,
+                    trade_weighted_slippage_bps: None,
+                    trade_mid_notional_sum: None,
+                    trade_exec_notional_sum: None,
+                    trade_slices: Vec::new(),
+                    trade_dust_skipped: false,
+                    trade_dust_usd: None,
+                    trade_progress_remaining_in: None,
+                    trade_progress_total_out: None,
+                    trade_pending_client_order_id: None,
+                    trade_pending_market: None,
+                    trade_pending_side: None,
+                    trade_pending_requested_in: None,
+                    trade_pending_buy_mode: None,
+                    trade_inverse_retry_count: 0,
+                    trade_unexecutable_residual_in: None,
+                },
+                withdraw: CexWithdrawState {
+                    withdraw_asset: recv,
+                    withdraw_address: "dest".to_string(),
+                    withdraw_id: None,
+                    withdraw_txid: None,
+                    size_out: None,
+                },
+            })
+        }
+
+        async fn deposit(&self, _state: &mut CexState) -> Result<(), String> {
+            Ok(())
+        }
+
+        async fn trade(&self, state: &mut CexState) -> Result<(), String> {
+            let mut calls = self.trade_calls.lock().unwrap();
+            *calls += 1;
+
+            if *calls == 1 {
+                state.trade.trade_leg_index = Some(1);
+                state.trade.trade_leg_total = Some(2);
+                state.trade.trade_next_amount_in = Some(0.1234);
+                return Err("trade exploded once".to_string());
+            }
+
+            if state.trade.trade_leg_index != Some(1) {
+                return Err("expected persisted trade_leg_index=1 on retry".to_string());
+            }
+            if (state.trade.trade_next_amount_in.unwrap_or_default() - 0.1234).abs() > 1e-12 {
+                return Err("expected persisted trade_next_amount_in on retry".to_string());
+            }
+
+            state.trade.trade_leg_index = Some(2);
+            state.trade.trade_leg_total = Some(2);
+            state.step = CexStep::Completed;
+            Ok(())
+        }
+
+        async fn withdraw(&self, _state: &mut CexState) -> Result<(), String> {
+            Ok(())
+        }
+
+        async fn finish(&self, _receipt: &ExecutionReceipt, state: &CexState) -> Result<SwapExecution, String> {
+            Ok(SwapExecution {
+                swap_id: 0,
+                request_id: 0,
+                status: "ok".to_string(),
+                pay_asset: state.deposit.deposit_asset.asset_id(),
+                pay_amount: Nat::from(0u8),
+                receive_asset: state.withdraw.withdraw_asset.asset_id(),
+                receive_amount: Nat::from(0u8),
+                mid_price: 0.0,
+                exec_price: 0.0,
+                slippage: 0.0,
+                legs: vec![],
+                approval_count: None,
+                ts: 0,
+            })
+        }
+
+        async fn preview_route(&self, _receipt: &ExecutionReceipt) -> Result<CexRoutePreview, String> {
+            Ok(CexRoutePreview {
+                is_executable: true,
+                estimated_receive_amount: 0.0,
+                estimated_slippage_bps: 0.0,
+                reason: None,
             })
         }
     }
@@ -506,5 +769,183 @@ mod tests {
 
         let row_after = wal.snapshot().expect("row should exist");
         assert_eq!(row_after.status, ResultStatus::Succeeded);
+    }
+
+    #[tokio::test]
+    async fn cex_finalize_persists_failed_retryable_and_resumes_from_serialized_state() {
+        let receipt = make_receipt(777);
+        let wrapper = LiqMetaWrapper {
+            receipt: receipt.clone(),
+            meta: Vec::new(),
+        };
+
+        let mut row = LiqResultRecord {
+            id: "777".to_string(),
+            status: ResultStatus::Enqueued,
+            attempt: 0,
+            error_count: 0,
+            last_error: None,
+            created_at: 0,
+            updated_at: 0,
+            meta_json: "{}".to_string(),
+        };
+        encode_meta(&mut row, &wrapper).expect("encode meta should succeed");
+
+        let wal = TestWal::new(row);
+
+        let prepare_calls = Arc::new(Mutex::new(0u32));
+        let trade_calls = Arc::new(Mutex::new(0u32));
+        let finalizer = FailThenResumeFinalizer {
+            prepare_calls: prepare_calls.clone(),
+            trade_calls: trade_calls.clone(),
+        };
+
+        let first_err = (&finalizer as &dyn CexFinalizerLogic)
+            .finalize(&wal, receipt.clone())
+            .await
+            .expect_err("first finalize should fail");
+        assert!(first_err.contains("trade exploded once"));
+
+        assert_eq!(*prepare_calls.lock().unwrap(), 1);
+        assert_eq!(*trade_calls.lock().unwrap(), 1);
+
+        let row_after_first = wal.snapshot().expect("row should exist");
+        assert_eq!(row_after_first.status, ResultStatus::FailedRetryable);
+
+        let wrapper_after_first = decode_receipt_wrapper(&row_after_first)
+            .expect("decode wrapper should succeed")
+            .expect("wrapper should exist");
+        let state_after_first: CexState =
+            serde_json::from_slice(&wrapper_after_first.meta).expect("state should decode");
+        assert!(matches!(state_after_first.step, CexStep::Trade));
+        assert_eq!(state_after_first.trade.trade_leg_index, Some(1));
+        assert_eq!(state_after_first.trade.trade_leg_total, Some(2));
+        assert!((state_after_first.trade.trade_next_amount_in.unwrap_or_default() - 0.1234).abs() < 1e-12);
+        assert!(
+            state_after_first
+                .last_error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("trade exploded once")
+        );
+
+        let second = (&finalizer as &dyn CexFinalizerLogic)
+            .finalize(&wal, receipt)
+            .await
+            .expect("second finalize should resume and succeed");
+        assert!(second.finalized);
+
+        // prepare() runs only on the first invocation; second call must load persisted state.
+        assert_eq!(*prepare_calls.lock().unwrap(), 1);
+        assert_eq!(*trade_calls.lock().unwrap(), 2);
+
+        let row_after_second = wal.snapshot().expect("row should exist");
+        assert_eq!(row_after_second.status, ResultStatus::Succeeded);
+        let wrapper_after_second = decode_receipt_wrapper(&row_after_second)
+            .expect("decode wrapper should succeed")
+            .expect("wrapper should exist");
+        let state_after_second: CexState =
+            serde_json::from_slice(&wrapper_after_second.meta).expect("state should decode");
+        assert!(matches!(state_after_second.step, CexStep::Completed));
+        assert_eq!(state_after_second.trade.trade_leg_index, Some(2));
+    }
+
+    #[tokio::test]
+    async fn cex_state_deserializes_when_new_trade_progress_fields_are_missing() {
+        let receipt = make_receipt(888);
+        let finalizer = DummyCexFinalizer {
+            trade_calls: Arc::new(Mutex::new(0)),
+            pending_once: false,
+        };
+        let state = finalizer
+            .prepare("888", &receipt)
+            .await
+            .expect("prepare should succeed");
+
+        let mut value = serde_json::to_value(state).expect("serialize state");
+        let map = value.as_object_mut().expect("state should serialize to object");
+        map.remove("trade_progress_remaining_in");
+        map.remove("trade_progress_total_out");
+        map.remove("trade_pending_client_order_id");
+        map.remove("trade_pending_market");
+        map.remove("trade_pending_side");
+        map.remove("trade_pending_requested_in");
+        map.remove("trade_pending_buy_mode");
+        map.remove("trade_inverse_retry_count");
+        map.remove("trade_unexecutable_residual_in");
+
+        let decoded: CexState = serde_json::from_value(value).expect("legacy deserialize should succeed");
+        assert_eq!(decoded.trade.trade_progress_remaining_in, None);
+        assert_eq!(decoded.trade.trade_progress_total_out, None);
+        assert_eq!(decoded.trade.trade_pending_client_order_id, None);
+        assert_eq!(decoded.trade.trade_pending_market, None);
+        assert_eq!(decoded.trade.trade_pending_side, None);
+        assert_eq!(decoded.trade.trade_pending_requested_in, None);
+        assert_eq!(decoded.trade.trade_pending_buy_mode, None);
+        assert_eq!(decoded.trade.trade_inverse_retry_count, 0);
+        assert_eq!(decoded.trade.trade_unexecutable_residual_in, None);
+    }
+
+    #[tokio::test]
+    async fn cex_finalize_bootstraps_legacy_trade_progress_from_wal_state() {
+        let receipt = make_receipt(889);
+        let trade_calls = Arc::new(Mutex::new(0u32));
+        let finalizer = DummyCexFinalizer {
+            trade_calls: trade_calls.clone(),
+            pending_once: false,
+        };
+
+        let mut state = finalizer
+            .prepare("889", &receipt)
+            .await
+            .expect("prepare should succeed");
+        state.step = CexStep::Trade;
+        state.trade.trade_next_amount_in = Some(0.1234);
+        state.trade.trade_progress_remaining_in = Some(0.1234);
+        state.trade.trade_progress_total_out = Some(0.0);
+        state.trade.trade_pending_client_order_id = None;
+        state.trade.trade_pending_market = None;
+        state.trade.trade_pending_side = None;
+        state.trade.trade_pending_requested_in = None;
+        state.trade.trade_pending_buy_mode = None;
+        state.trade.trade_inverse_retry_count = 0;
+        state.trade.trade_unexecutable_residual_in = None;
+
+        let mut legacy_value = serde_json::to_value(state).expect("serialize state");
+        let map = legacy_value.as_object_mut().expect("state should serialize to object");
+        map.remove("trade_progress_remaining_in");
+        map.remove("trade_progress_total_out");
+        map.remove("trade_pending_client_order_id");
+        map.remove("trade_pending_market");
+        map.remove("trade_pending_side");
+        map.remove("trade_pending_requested_in");
+        map.remove("trade_pending_buy_mode");
+        map.remove("trade_inverse_retry_count");
+        map.remove("trade_unexecutable_residual_in");
+
+        let wrapper = LiqMetaWrapper {
+            receipt: receipt.clone(),
+            meta: serde_json::to_vec(&legacy_value).expect("legacy meta encoding"),
+        };
+
+        let mut row = LiqResultRecord {
+            id: "889".to_string(),
+            status: ResultStatus::FailedRetryable,
+            attempt: 1,
+            error_count: 1,
+            last_error: Some("prior failure".to_string()),
+            created_at: 0,
+            updated_at: 0,
+            meta_json: "{}".to_string(),
+        };
+        encode_meta(&mut row, &wrapper).expect("encode meta should succeed");
+        let wal = TestWal::new(row);
+
+        let res = (&finalizer as &dyn CexFinalizerLogic)
+            .finalize(&wal, receipt)
+            .await
+            .expect("finalize should succeed");
+        assert!(res.finalized);
+        assert_eq!(*trade_calls.lock().unwrap(), 1);
     }
 }

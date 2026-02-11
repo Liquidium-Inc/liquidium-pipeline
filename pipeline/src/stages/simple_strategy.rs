@@ -61,7 +61,7 @@ where
 {
     pub config: Arc<C>,
     pub registry: Arc<R>,
-    pub swapper: Arc<T>,
+    pub _swapper: Arc<T>,
     pub collateral_service: Arc<U>,
     pub account_service: Arc<BalanceService>,
     pub approval_state: Arc<ApprovalState>,
@@ -86,7 +86,7 @@ where
         Self {
             config,
             registry,
-            swapper,
+            _swapper: swapper,
             collateral_service,
             account_service: balance_service,
             approval_state,
@@ -308,7 +308,7 @@ where
             let debt_approval_needed = self.debt_approval_needed(&repayment_token);
             let mut debt_fee_total = repayment_token.fee();
             if debt_approval_needed {
-                debt_fee_total = debt_fee_total + repayment_token.fee();
+                debt_fee_total += repayment_token.fee();
             }
 
             if available_balance.clone() < debt_fee_total.clone() {
@@ -472,7 +472,7 @@ where
             let debt_approval_needed = self.debt_approval_needed(&repayment_token);
             let mut debt_fee_total = repayment_token.fee();
             if debt_approval_needed {
-                debt_fee_total = debt_fee_total + repayment_token.fee();
+                debt_fee_total += repayment_token.fee();
             }
 
             if available_balance.clone() < debt_fee_total.clone() {
@@ -556,7 +556,7 @@ where
                     if amount_in_effective <= deposit_fee {
                         amount_in_effective = Nat::from(0u8);
                     } else {
-                        amount_in_effective = amount_in_effective - deposit_fee;
+                        amount_in_effective -= deposit_fee;
                     }
 
                     if matches!(collateral_token, ChainToken::Icp { .. }) {
@@ -567,7 +567,7 @@ where
                     if amount_in_effective <= approval_fee {
                         amount_in_effective = Nat::from(0u8);
                     } else {
-                        amount_in_effective = amount_in_effective - approval_fee;
+                        amount_in_effective -= approval_fee;
                     }
                 }
             }
@@ -781,7 +781,8 @@ mod tests {
         cfg.expect_get_liquidator_principal().return_const(trader);
         cfg.expect_should_buy_bad_debt().return_const(false);
         cfg.expect_get_max_allowed_dex_slippage().return_const(2000u32);
-        cfg.expect_get_lending_canister().return_const(p("mxzaz-hqaaa-aaaar-qaada-cai"));
+        cfg.expect_get_lending_canister()
+            .return_const(p("mxzaz-hqaaa-aaaar-qaada-cai"));
 
         // Collateral service: repay 1_000, receive 2_000 collateral
         let mut collateral = MockCollateralServiceTrait::new();
@@ -860,7 +861,8 @@ mod tests {
         cfg.expect_get_liquidator_principal().return_const(trader);
         cfg.expect_should_buy_bad_debt().return_const(false);
         cfg.expect_get_max_allowed_dex_slippage().return_const(2000u32);
-        cfg.expect_get_lending_canister().return_const(p("mxzaz-hqaaa-aaaar-qaada-cai"));
+        cfg.expect_get_lending_canister()
+            .return_const(p("mxzaz-hqaaa-aaaar-qaada-cai"));
 
         let mut collateral = MockCollateralServiceTrait::new();
         collateral
@@ -919,7 +921,8 @@ mod tests {
         cfg.expect_get_liquidator_principal().return_const(trader);
         cfg.expect_should_buy_bad_debt().return_const(false);
         cfg.expect_get_max_allowed_dex_slippage().return_const(2000u32);
-        cfg.expect_get_lending_canister().return_const(p("mxzaz-hqaaa-aaaar-qaada-cai"));
+        cfg.expect_get_lending_canister()
+            .return_const(p("mxzaz-hqaaa-aaaar-qaada-cai"));
 
         let mut collateral = MockCollateralServiceTrait::new();
         collateral
@@ -989,7 +992,8 @@ mod tests {
         cfg.expect_get_liquidator_principal().return_const(trader);
         cfg.expect_should_buy_bad_debt().return_const(false);
         cfg.expect_get_max_allowed_dex_slippage().return_const(2000u32);
-        cfg.expect_get_lending_canister().return_const(p("mxzaz-hqaaa-aaaar-qaada-cai"));
+        cfg.expect_get_lending_canister()
+            .return_const(p("mxzaz-hqaaa-aaaar-qaada-cai"));
 
         let mut collateral = MockCollateralServiceTrait::new();
         collateral
@@ -1059,7 +1063,8 @@ mod tests {
         cfg.expect_get_liquidator_principal().return_const(trader);
         cfg.expect_should_buy_bad_debt().return_const(true);
         cfg.expect_get_max_allowed_dex_slippage().return_const(2000u32);
-        cfg.expect_get_lending_canister().return_const(p("mxzaz-hqaaa-aaaar-qaada-cai"));
+        cfg.expect_get_lending_canister()
+            .return_const(p("mxzaz-hqaaa-aaaar-qaada-cai"));
 
         let mut collateral = MockCollateralServiceTrait::new();
         collateral
@@ -1141,7 +1146,8 @@ mod tests {
         cfg.expect_get_liquidator_principal().return_const(trader);
         cfg.expect_should_buy_bad_debt().return_const(false);
         cfg.expect_get_max_allowed_dex_slippage().return_const(2000u32);
-        cfg.expect_get_lending_canister().return_const(p("mxzaz-hqaaa-aaaar-qaada-cai"));
+        cfg.expect_get_lending_canister()
+            .return_const(p("mxzaz-hqaaa-aaaar-qaada-cai"));
 
         // Collateral service returns fixed repay so we can control budgeting
         let mut collateral = MockCollateralServiceTrait::new();
@@ -1219,7 +1225,8 @@ mod tests {
         cfg.expect_get_liquidator_principal().return_const(trader);
         cfg.expect_should_buy_bad_debt().return_const(false);
         cfg.expect_get_max_allowed_dex_slippage().return_const(2000u32);
-        cfg.expect_get_lending_canister().return_const(p("mxzaz-hqaaa-aaaar-qaada-cai"));
+        cfg.expect_get_lending_canister()
+            .return_const(p("mxzaz-hqaaa-aaaar-qaada-cai"));
 
         let mut calls = 0u32;
         let mut collateral = MockCollateralServiceTrait::new();
@@ -1304,7 +1311,8 @@ mod tests {
         cfg.expect_get_liquidator_principal().return_const(trader);
         cfg.expect_should_buy_bad_debt().return_const(false);
         cfg.expect_get_max_allowed_dex_slippage().return_const(2000u32);
-        cfg.expect_get_lending_canister().return_const(p("mxzaz-hqaaa-aaaar-qaada-cai"));
+        cfg.expect_get_lending_canister()
+            .return_const(p("mxzaz-hqaaa-aaaar-qaada-cai"));
 
         let mut first_called_for_low_hf = true;
         let mut collateral = MockCollateralServiceTrait::new();
@@ -1391,7 +1399,8 @@ mod tests {
         cfg.expect_get_liquidator_principal().return_const(trader);
         cfg.expect_should_buy_bad_debt().return_const(false);
         cfg.expect_get_max_allowed_dex_slippage().return_const(2000u32);
-        cfg.expect_get_lending_canister().return_const(p("mxzaz-hqaaa-aaaar-qaada-cai"));
+        cfg.expect_get_lending_canister()
+            .return_const(p("mxzaz-hqaaa-aaaar-qaada-cai"));
 
         let mut first_checked = true;
         let mut collateral = MockCollateralServiceTrait::new();
