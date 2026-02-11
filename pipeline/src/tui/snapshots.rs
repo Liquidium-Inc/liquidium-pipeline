@@ -78,7 +78,13 @@ pub(super) fn compute_profits_snapshot(export_path: &str, registry: &TokenRegist
         if status.is_empty() {
             // Backward compatibility: older exports might omit status; include them.
         }
-        let sym = row.receive_symbol.unwrap_or_else(|| "unknown".to_string());
+        let Some(sym) = row
+            .receive_symbol
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+        else {
+            continue;
+        };
         let entry = totals.entry(sym).or_insert((0, 0, 0));
         entry.0 += 1;
         entry.1 += row.realized_profit;
