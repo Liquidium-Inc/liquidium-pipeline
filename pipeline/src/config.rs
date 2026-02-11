@@ -363,77 +363,95 @@ struct CexTunables {
     force_over_usd_threshold: f64,
 }
 
+const DEFAULT_CEX_MIN_EXEC_USD: f64 = 2.0;
+const DEFAULT_CEX_SLICE_TARGET_RATIO: f64 = 0.7;
+const DEFAULT_CEX_BUY_TRUNCATION_TRIGGER_RATIO: f64 = 0.25;
+const DEFAULT_CEX_BUY_INVERSE_OVERSPEND_BPS: u32 = 10;
+const MAX_CEX_BUY_INVERSE_OVERSPEND_BPS: u32 = 100;
+const DEFAULT_CEX_BUY_INVERSE_MAX_RETRIES: u32 = 1;
+const MAX_CEX_BUY_INVERSE_MAX_RETRIES: u32 = 3;
+const DEFAULT_CEX_BUY_INVERSE_ENABLED: bool = true;
+const DEFAULT_CEX_RETRY_BASE_SECS: u64 = 5;
+const DEFAULT_CEX_RETRY_MAX_SECS: u64 = 120;
+const DEFAULT_CEX_MIN_NET_EDGE_BPS: u32 = 150;
+const DEFAULT_CEX_DELAY_BUFFER_BPS: u32 = 75;
+const DEFAULT_CEX_ROUTE_FEE_BPS: u32 = 25;
+const DEFAULT_CEX_FORCE_OVER_USD_THRESHOLD: f64 = 12.5;
+const MIN_RATIO: f64 = 0.0;
+const MAX_RATIO: f64 = 1.0;
+const MIN_SLICE_TARGET_RATIO: f64 = 0.1;
+
 fn parse_cex_tunables_from_env() -> CexTunables {
     // Defaults are conservative; env overrides are expected in .env.
     let min_exec_usd = env::var("CEX_MIN_EXEC_USD")
         .ok()
         .and_then(|v| v.parse::<f64>().ok())
         .filter(|v| *v > 0.0)
-        .unwrap_or(2.0);
+        .unwrap_or(DEFAULT_CEX_MIN_EXEC_USD);
 
     let slice_target_ratio = env::var("CEX_SLICE_TARGET_RATIO")
         .ok()
         .and_then(|v| v.parse::<f64>().ok())
-        .map(|v| v.clamp(0.1, 1.0))
-        .unwrap_or(0.7);
+        .map(|v| v.clamp(MIN_SLICE_TARGET_RATIO, MAX_RATIO))
+        .unwrap_or(DEFAULT_CEX_SLICE_TARGET_RATIO);
 
     let buy_truncation_trigger_ratio = env::var("CEX_BUY_TRUNCATION_TRIGGER_RATIO")
         .ok()
         .and_then(|v| v.parse::<f64>().ok())
-        .map(|v| v.clamp(0.0, 1.0))
-        .unwrap_or(0.25);
+        .map(|v| v.clamp(MIN_RATIO, MAX_RATIO))
+        .unwrap_or(DEFAULT_CEX_BUY_TRUNCATION_TRIGGER_RATIO);
 
     let buy_inverse_overspend_bps = env::var("CEX_BUY_INVERSE_OVERSPEND_BPS")
         .or_else(|_| env::var("CEX_BUY_INVERSE_OVESPEND_BPS"))
         .ok()
         .and_then(|v| v.parse::<u32>().ok())
-        .map(|v| v.min(100))
-        .unwrap_or(10);
+        .map(|v| v.min(MAX_CEX_BUY_INVERSE_OVERSPEND_BPS))
+        .unwrap_or(DEFAULT_CEX_BUY_INVERSE_OVERSPEND_BPS);
 
     let buy_inverse_max_retries = env::var("CEX_BUY_INVERSE_MAX_RETRIES")
         .ok()
         .and_then(|v| v.parse::<u32>().ok())
-        .map(|v| v.min(3))
-        .unwrap_or(1);
+        .map(|v| v.min(MAX_CEX_BUY_INVERSE_MAX_RETRIES))
+        .unwrap_or(DEFAULT_CEX_BUY_INVERSE_MAX_RETRIES);
 
     let buy_inverse_enabled = env::var("CEX_BUY_INVERSE_ENABLED")
         .ok()
         .and_then(|v| v.parse::<bool>().ok())
-        .unwrap_or(true);
+        .unwrap_or(DEFAULT_CEX_BUY_INVERSE_ENABLED);
 
     let retry_base_secs = env::var("CEX_RETRY_BASE_SECS")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
         .filter(|v| *v > 0)
-        .unwrap_or(5);
+        .unwrap_or(DEFAULT_CEX_RETRY_BASE_SECS);
 
     let retry_max_secs = env::var("CEX_RETRY_MAX_SECS")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
         .filter(|v| *v >= retry_base_secs)
-        .unwrap_or(120)
+        .unwrap_or(DEFAULT_CEX_RETRY_MAX_SECS)
         .max(retry_base_secs);
 
     let min_net_edge_bps = env::var("CEX_MIN_NET_EDGE_BPS")
         .ok()
         .and_then(|v| v.parse::<u32>().ok())
-        .unwrap_or(150);
+        .unwrap_or(DEFAULT_CEX_MIN_NET_EDGE_BPS);
 
     let delay_buffer_bps = env::var("CEX_DELAY_BUFFER_BPS")
         .ok()
         .and_then(|v| v.parse::<u32>().ok())
-        .unwrap_or(75);
+        .unwrap_or(DEFAULT_CEX_DELAY_BUFFER_BPS);
 
     let route_fee_bps = env::var("CEX_ROUTE_FEE_BPS")
         .ok()
         .and_then(|v| v.parse::<u32>().ok())
-        .unwrap_or(25);
+        .unwrap_or(DEFAULT_CEX_ROUTE_FEE_BPS);
 
     let force_over_usd_threshold = env::var("CEX_FORCE_OVER_USD_THRESHOLD")
         .ok()
         .and_then(|v| v.parse::<f64>().ok())
-        .filter(|v| *v >= 0.0)
-        .unwrap_or(2.5);
+        .filter(|v| *v >= MIN_RATIO)
+        .unwrap_or(DEFAULT_CEX_FORCE_OVER_USD_THRESHOLD);
 
     CexTunables {
         min_exec_usd,
@@ -495,7 +513,7 @@ mod tests {
                 min_net_edge_bps: 150,
                 delay_buffer_bps: 75,
                 route_fee_bps: 25,
-                force_over_usd_threshold: 2.5,
+                force_over_usd_threshold: 12.5,
             }
         );
     }
@@ -562,7 +580,7 @@ mod tests {
         assert!(parsed.buy_inverse_enabled);
         assert_eq!(parsed.retry_base_secs, 10);
         assert_eq!(parsed.retry_max_secs, 120);
-        assert_eq!(parsed.force_over_usd_threshold, 2.5);
+        assert_eq!(parsed.force_over_usd_threshold, 12.5);
     }
 
     #[test]

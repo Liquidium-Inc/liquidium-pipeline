@@ -88,18 +88,12 @@ fn print_startup_table(config: &Config) {
         Cell::new(&config.lending_canister.to_text()),
     ]));
     table.add_row(Row::new(vec![Cell::new("DB Path"), Cell::new(&config.db_path)]));
-    table.add_row(Row::new(vec![
-        Cell::new("Export Path"),
-        Cell::new(&config.export_path),
-    ]));
+    table.add_row(Row::new(vec![Cell::new("Export Path"), Cell::new(&config.export_path)]));
     table.add_row(Row::new(vec![
         Cell::new("Swapper Mode"),
         Cell::new(&format!("{:?}", config.swapper)),
     ]));
-    table.add_row(Row::new(vec![
-        Cell::new("Configured CEX"),
-        Cell::new(&cex_names),
-    ]));
+    table.add_row(Row::new(vec![Cell::new("Configured CEX"), Cell::new(&cex_names)]));
     table.add_row(Row::new(vec![
         Cell::new("Max DEX Slippage (bps)"),
         Cell::new(&config.max_allowed_dex_slippage.to_string()),

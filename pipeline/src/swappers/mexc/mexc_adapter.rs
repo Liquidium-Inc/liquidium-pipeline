@@ -11,6 +11,11 @@ use log::{debug, info, warn};
 use rust_decimal::{Decimal, RoundingStrategy};
 use serde_json::Value;
 
+/// Default orderbook depth level used for quote-cost and preview estimations.
+const DEFAULT_ORDERBOOK_DEPTH_LIMIT: u32 = 50;
+/// Basis points per 1.00 ratio value.
+const BPS_PER_RATIO_UNIT: f64 = 10_000.0;
+
 fn from_mexc_raw(s: &str) -> WithdrawStatus {
     match s {
         // adjust to whatever MEXC actually returns
@@ -376,21 +381,21 @@ impl MexcClient {
         api_symbol: &str,
         quote_amount: Decimal,
     ) -> Result<Decimal, String> {
-        let ob = ex
+        let orderbook_depth = ex
             .depth(DepthParams {
-                limit: Some(50),
+                limit: Some(DEFAULT_ORDERBOOK_DEPTH_LIMIT),
                 symbol: api_symbol,
             })
             .await
             .map_err(|e| e.to_string())?;
 
-        if ob.asks.is_empty() {
+        if orderbook_depth.asks.is_empty() {
             return Err("no asks".into());
         }
 
         let mut remaining_quote = quote_amount;
         let mut base_out = Decimal::ZERO;
-        for level in &ob.asks {
+        for level in &orderbook_depth.asks {
             if remaining_quote <= Decimal::ZERO {
                 break;
             }
@@ -417,21 +422,21 @@ impl MexcClient {
         api_symbol: &str,
         base_quantity: Decimal,
     ) -> Result<Decimal, String> {
-        let ob = ex
+        let orderbook_depth = ex
             .depth(DepthParams {
-                limit: Some(50),
+                limit: Some(DEFAULT_ORDERBOOK_DEPTH_LIMIT),
                 symbol: api_symbol,
             })
             .await
             .map_err(|e| e.to_string())?;
 
-        if ob.asks.is_empty() {
+        if orderbook_depth.asks.is_empty() {
             return Err("no asks".into());
         }
 
         let mut remaining_base = base_quantity;
         let mut quote_cost = Decimal::ZERO;
-        for level in &ob.asks {
+        for level in &orderbook_depth.asks {
             if remaining_base <= Decimal::ZERO {
                 break;
             }
@@ -746,8 +751,8 @@ impl MexcClient {
             Self::ensure_min_notional(filters, quote_cost, symbol)?;
 
             if let Some(cap_bps) = max_quote_overspend_bps {
-                let max_allowed =
-                    amount_dec * (Decimal::ONE + Decimal::from_f64_retain(cap_bps / 10_000.0).unwrap_or(Decimal::ZERO));
+                let max_allowed = amount_dec
+                    * (Decimal::ONE + Decimal::from_f64_retain(cap_bps / BPS_PER_RATIO_UNIT).unwrap_or(Decimal::ZERO));
                 if quote_cost > max_allowed {
                     return Err(format!(
                         "base-quantity buy overspend too high for {}: est_quote_cost={} max_allowed={} cap_bps={}",
@@ -1168,7 +1173,7 @@ impl CexBackend for MexcClient {
             .withdraw_history(WithdrawHistoryRequest {
                 coin: Some(coin.to_string()),
                 status: None,
-                limit: Some(50),
+                limit: Some(DEFAULT_ORDERBOOK_DEPTH_LIMIT),
                 start_time: None,
                 end_time: None,
             })

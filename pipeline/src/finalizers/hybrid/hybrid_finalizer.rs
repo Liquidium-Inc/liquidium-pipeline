@@ -1,5 +1,6 @@
 use async_trait::async_trait;
 use std::sync::Arc;
+use std::{fmt, fmt::Display};
 
 use crate::{
     config::{ConfigTrait, SwapperMode},
@@ -20,12 +21,27 @@ use tracing::instrument;
 
 /// Route tiny notional swaps to DEX to avoid CEX overhead/noise for dust-sized trades.
 const DEX_DUST_MAX_USD: f64 = 2.5;
+/// Basis points per 1.00 ratio value (100%).
+const BPS_PER_RATIO_UNIT: f64 = 10_000.0;
+/// Basis points per 1.00 percentage-point value.
+const BPS_PER_PERCENTAGE_POINT: f64 = 100.0;
+/// Fixed-point divisor used to convert RAY price (1e27) into decimal price.
+const RAY_PRICE_SCALE: f64 = 1e27_f64;
 
 /// Route venues available in hybrid finalization.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RouteVenue {
     Dex,
     Cex,
+}
+
+impl Display for RouteVenue {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            RouteVenue::Dex => formatter.write_str("dex"),
+            RouteVenue::Cex => formatter.write_str("cex"),
+        }
+    }
 }
 
 /// Comparable route candidate represented by projected net edge.
@@ -51,19 +67,11 @@ impl<C> HybridFinalizer<C>
 where
     C: ConfigTrait,
 {
-    /// Convert route enum to user-facing swapper label.
-    fn swapper_label(venue: RouteVenue) -> &'static str {
+    /// Convert internal route venue into external swapper id used by exports/UI.
+    fn swapper_id(venue: RouteVenue) -> &'static str {
         match venue {
             RouteVenue::Dex => "kong",
             RouteVenue::Cex => "mexc",
-        }
-    }
-
-    /// Human-readable venue name for logs.
-    fn venue_name(venue: RouteVenue) -> &'static str {
-        match venue {
-            RouteVenue::Dex => "dex",
-            RouteVenue::Cex => "cex",
         }
     }
 
@@ -83,48 +91,48 @@ where
 
     /// Estimate gross edge in bps from strategy-side expected profit over repaid debt.
     fn gross_edge_bps(receipt: &ExecutionReceipt) -> f64 {
-        let Some(liq) = receipt.liquidation_result.as_ref() else {
+        let Some(liquidation_result) = receipt.liquidation_result.as_ref() else {
             return 0.0;
         };
-        let debt_repaid = liq.amounts.debt_repaid.0.to_f64().unwrap_or(0.0);
-        if debt_repaid <= 0.0 {
+        let debt_repaid_amount = liquidation_result.amounts.debt_repaid.0.to_f64().unwrap_or(0.0);
+        if debt_repaid_amount <= 0.0 {
             return 0.0;
         }
-        (receipt.request.expected_profit as f64 / debt_repaid) * 10_000.0
+        (receipt.request.expected_profit as f64 / debt_repaid_amount) * BPS_PER_RATIO_UNIT
     }
 
     /// Normalize quote slippage into basis points.
     fn dex_slippage_bps(slippage: f64) -> f64 {
         // Kong reports slippage in percentage points, e.g. 0.72 => 0.72%.
         // 1% = 100 bps, hence *100.
-        (slippage.max(0.0)) * 100.0
+        (slippage.max(0.0)) * BPS_PER_PERCENTAGE_POINT
     }
 
     /// Estimate swap notional in USD using strategy-provided reference price (ray format 1e27).
     fn estimate_swap_value_usd(receipt: &ExecutionReceipt, swap_req: &SwapRequest) -> f64 {
-        let ref_price_f64 = receipt.request.ref_price.0.to_f64().unwrap_or(0.0) / 1e27f64;
-        if ref_price_f64 <= 0.0 {
+        let reference_price_usd = receipt.request.ref_price.0.to_f64().unwrap_or(0.0) / RAY_PRICE_SCALE;
+        if reference_price_usd <= 0.0 {
             return 0.0;
         }
-        let pay_units = swap_req.pay_amount.to_f64();
-        (pay_units * ref_price_f64).max(0.0)
+        let swap_input_amount = swap_req.pay_amount.to_f64();
+        (swap_input_amount * reference_price_usd).max(0.0)
     }
 
     /// Dust swaps are forced to DEX to avoid CEX overhead on tiny notional.
     fn is_dust_swap(receipt: &ExecutionReceipt, swap_req: &SwapRequest) -> bool {
-        let est_value_usd = Self::estimate_swap_value_usd(receipt, swap_req);
-        est_value_usd > 0.0 && est_value_usd < DEX_DUST_MAX_USD
+        let estimated_swap_value_usd = Self::estimate_swap_value_usd(receipt, swap_req);
+        estimated_swap_value_usd > 0.0 && estimated_swap_value_usd < DEX_DUST_MAX_USD
     }
 
     /// In hybrid mode, force CEX when estimated notional is above configured threshold.
     /// A non-positive threshold disables this fast-path override.
     fn should_force_cex_over_threshold(&self, receipt: &ExecutionReceipt, swap_req: &SwapRequest) -> bool {
-        let est_value_usd = Self::estimate_swap_value_usd(receipt, swap_req);
-        let threshold_usd = self.config.get_cex_force_over_usd_threshold();
-        if threshold_usd <= 0.0 {
+        let estimated_swap_value_usd = Self::estimate_swap_value_usd(receipt, swap_req);
+        let force_cex_threshold_usd = self.config.get_cex_force_over_usd_threshold();
+        if force_cex_threshold_usd <= 0.0 {
             return false;
         }
-        est_value_usd > threshold_usd
+        estimated_swap_value_usd > force_cex_threshold_usd
     }
 
     /// Build a successful no-swap result and mark WAL succeeded.
@@ -171,11 +179,11 @@ where
             RouteVenue::Dex => self.finalize_via_dex(wal, receipt).await?,
             RouteVenue::Cex => self.finalize_via_cex(wal, receipt).await?,
         };
-        res.swapper = Some(Self::swapper_label(venue).to_string());
+        res.swapper = Some(Self::swapper_id(venue).to_string());
         if let Some(reason) = reason {
-            info!("[hybrid] routing -> {} reason={}", Self::swapper_label(venue), reason);
+            info!("[hybrid] routing -> {} reason={}", venue, reason);
         } else {
-            info!("[hybrid] routing -> {}", Self::swapper_label(venue));
+            info!("[hybrid] routing -> {}", venue);
         }
         Ok(res)
     }
@@ -191,16 +199,16 @@ where
         match self.dex_swapper.quote(swap_req).await {
             Ok(quote) => {
                 let slippage_bps = Self::dex_slippage_bps(quote.slippage);
-                let net = Self::net_edge_bps(gross_edge_bps, slippage_bps, 0.0, 0.0);
+                let net_edge_bps = Self::net_edge_bps(gross_edge_bps, slippage_bps, 0.0, 0.0);
                 info!(
                     "[hybrid] dex preview gross_bps={:.2} slippage_bps={:.2} net_bps={:.2}",
-                    gross_edge_bps, slippage_bps, net
+                    gross_edge_bps, slippage_bps, net_edge_bps
                 );
-                if net >= min_net_edge_bps {
+                if net_edge_bps >= min_net_edge_bps {
                     Ok(Some(RouteCandidate {
                         venue: RouteVenue::Dex,
-                        net_edge_bps: net,
-                        reason: format!("dex net edge {:.2} bps", net),
+                        net_edge_bps,
+                        reason: format!("dex net edge {:.2} bps", net_edge_bps),
                     }))
                 } else {
                     Ok(None)
@@ -225,18 +233,27 @@ where
 
         match cex_finalizer.preview_route(receipt).await {
             Ok(preview) if preview.is_executable => {
-                let fee_bps = self.config.get_cex_route_fee_bps() as f64;
-                let delay_bps = self.config.get_cex_delay_buffer_bps() as f64;
-                let net = Self::net_edge_bps(gross_edge_bps, preview.estimated_slippage_bps, fee_bps, delay_bps);
+                let route_fee_bps = self.config.get_cex_route_fee_bps() as f64;
+                let execution_delay_buffer_bps = self.config.get_cex_delay_buffer_bps() as f64;
+                let net_edge_bps = Self::net_edge_bps(
+                    gross_edge_bps,
+                    preview.estimated_slippage_bps,
+                    route_fee_bps,
+                    execution_delay_buffer_bps,
+                );
                 info!(
                     "[hybrid] cex preview gross_bps={:.2} slippage_bps={:.2} fee_bps={:.2} delay_bps={:.2} net_bps={:.2}",
-                    gross_edge_bps, preview.estimated_slippage_bps, fee_bps, delay_bps, net
+                    gross_edge_bps,
+                    preview.estimated_slippage_bps,
+                    route_fee_bps,
+                    execution_delay_buffer_bps,
+                    net_edge_bps
                 );
-                if net >= min_net_edge_bps {
+                if net_edge_bps >= min_net_edge_bps {
                     Ok(Some(RouteCandidate {
                         venue: RouteVenue::Cex,
-                        net_edge_bps: net,
-                        reason: format!("cex net edge {:.2} bps", net),
+                        net_edge_bps,
+                        reason: format!("cex net edge {:.2} bps", net_edge_bps),
                     }))
                 } else {
                     Ok(None)
@@ -279,7 +296,7 @@ where
     async fn finalize(&self, wal: &dyn WalStore, receipt: ExecutionReceipt) -> Result<FinalizerResult, String> {
         // 1) Forced mode override: pure DEX or pure CEX bypasses route comparison.
         if let Some(forced) = self.forced_mode_venue() {
-            let reason = format!("forced mode {}", Self::venue_name(forced));
+            let reason = format!("forced mode {}", forced);
             return self.execute_route(wal, receipt, forced, Some(&reason)).await;
         }
 
@@ -291,23 +308,29 @@ where
 
         // 3) Dust routing: tiny notional is always sent to DEX.
         if Self::is_dust_swap(&receipt, &swap_req) {
-            let est_value_usd = Self::estimate_swap_value_usd(&receipt, &swap_req);
+            let estimated_swap_value_usd = Self::estimate_swap_value_usd(&receipt, &swap_req);
             let reason = format!(
                 "dust route est_value_usd={:.4} threshold_usd={:.2}",
-                est_value_usd, DEX_DUST_MAX_USD
+                estimated_swap_value_usd, DEX_DUST_MAX_USD
             );
             return self.execute_route(wal, receipt, RouteVenue::Dex, Some(&reason)).await;
         }
 
         // 4) Force CEX over configured threshold in hybrid mode.
         if self.should_force_cex_over_threshold(&receipt, &swap_req) {
-            let est_value_usd = Self::estimate_swap_value_usd(&receipt, &swap_req);
-            let threshold_usd = self.config.get_cex_force_over_usd_threshold();
-            let reason = format!(
-                "force cex route est_value_usd={:.4} threshold_usd={:.2}",
-                est_value_usd, threshold_usd
-            );
-            return self.execute_route(wal, receipt, RouteVenue::Cex, Some(&reason)).await;
+            if self.cex_finalizer.is_none() {
+                info!(
+                    "[hybrid] force-cex threshold reached but cex finalizer is unavailable; continuing with route candidates"
+                );
+            } else {
+                let estimated_swap_value_usd = Self::estimate_swap_value_usd(&receipt, &swap_req);
+                let force_cex_threshold_usd = self.config.get_cex_force_over_usd_threshold();
+                let reason = format!(
+                    "force cex route est_value_usd={:.4} threshold_usd={:.2}",
+                    estimated_swap_value_usd, force_cex_threshold_usd
+                );
+                return self.execute_route(wal, receipt, RouteVenue::Cex, Some(&reason)).await;
+            }
         }
 
         // 5) Candidate build and compare by projected net edge.
@@ -435,7 +458,7 @@ mod tests {
             },
         };
 
-        let ref_price_ray = (est_value_usd * 1e27f64).round() as u128;
+        let ref_price_ray = (est_value_usd * RAY_PRICE_SCALE).round() as u128;
         let req = ExecutorRequest {
             liquidation,
             swap_args: Some(swap_req),
@@ -454,14 +477,36 @@ mod tests {
         }
     }
 
+    /// Given: Hybrid mode reaches force-cex threshold without a CEX finalizer.
+    /// When: Finalization runs route selection.
+    /// Then: It falls back to candidate previews and returns no-viable-route.
     #[tokio::test]
-    async fn hybrid_force_cex_over_threshold_skips_candidate_previews() {
+    async fn hybrid_force_cex_over_threshold_falls_back_when_cex_unavailable() {
+        // given
+        const FORCE_CEX_THRESHOLD_USD: f64 = 2.5;
+        const MIN_NET_EDGE_BPS: u32 = 1_000;
+        const ESTIMATED_SWAP_NOTIONAL_USD: f64 = 3.0;
+
         let mut config = MockConfigTrait::new();
         config.expect_get_swapper_mode().return_const(SwapperMode::Hybrid);
-        config.expect_get_cex_force_over_usd_threshold().return_const(2.5);
+        config
+            .expect_get_cex_force_over_usd_threshold()
+            .return_const(FORCE_CEX_THRESHOLD_USD);
+        config.expect_get_cex_min_net_edge_bps().return_const(MIN_NET_EDGE_BPS);
 
         let mut dex_swapper = MockSwapInterface::new();
-        dex_swapper.expect_quote().times(0);
+        dex_swapper.expect_quote().times(1).returning(|req| {
+            Ok(SwapQuote {
+                pay_asset: req.pay_asset.clone(),
+                pay_amount: req.pay_amount.value.clone(),
+                receive_asset: req.receive_asset.clone(),
+                receive_amount: Nat::from(1u8),
+                mid_price: 1.0,
+                exec_price: 1.0,
+                slippage: 0.0,
+                legs: vec![],
+            })
+        });
         dex_swapper.expect_execute().times(0);
 
         let wal = MockWalStore::new();
@@ -472,12 +517,14 @@ mod tests {
             cex_finalizer: None,
         };
 
+        // when
         let err = finalizer
-            .finalize(&wal, make_receipt(3.0))
+            .finalize(&wal, make_receipt(ESTIMATED_SWAP_NOTIONAL_USD))
             .await
-            .expect_err("route should fail because cex finalizer is missing");
+            .expect_err("route should fail because no candidate meets threshold");
 
-        assert!(err.contains("missing cex finalizer"));
+        // then
+        assert!(err.contains("no viable route"));
     }
 
     #[tokio::test]
@@ -555,5 +602,69 @@ mod tests {
             .expect_err("no route should satisfy min net edge");
 
         assert!(err.contains("no viable route"));
+    }
+
+    /// Given: Both DEX and CEX route candidates are viable.
+    /// When: Route selection compares projected net edge.
+    /// Then: The route with higher net edge is selected.
+    #[test]
+    fn choose_best_route_prefers_higher_net_edge_candidate() {
+        // given
+        const DEX_NET_EDGE_BPS: f64 = 125.0;
+        const CEX_NET_EDGE_BPS: f64 = 126.0;
+
+        let dex_candidate = RouteCandidate {
+            venue: RouteVenue::Dex,
+            net_edge_bps: DEX_NET_EDGE_BPS,
+            reason: "dex".to_string(),
+        };
+        let cex_candidate = RouteCandidate {
+            venue: RouteVenue::Cex,
+            net_edge_bps: CEX_NET_EDGE_BPS,
+            reason: "cex".to_string(),
+        };
+
+        // when
+        let selected = HybridFinalizer::<MockConfigTrait>::choose_best_route(Some(dex_candidate), Some(cex_candidate))
+            .expect("one candidate should be selected");
+
+        // then
+        assert_eq!(selected.venue, RouteVenue::Cex);
+        assert_eq!(selected.net_edge_bps, CEX_NET_EDGE_BPS);
+    }
+
+    /// Given: Only one side provides a viable route candidate.
+    /// When: Route selection runs.
+    /// Then: The available candidate is returned.
+    #[test]
+    fn choose_best_route_returns_available_candidate_when_other_missing() {
+        // given
+        const DEX_NET_EDGE_BPS: f64 = 125.0;
+        const CEX_NET_EDGE_BPS: f64 = 118.0;
+
+        let dex_candidate = RouteCandidate {
+            venue: RouteVenue::Dex,
+            net_edge_bps: DEX_NET_EDGE_BPS,
+            reason: "dex".to_string(),
+        };
+        let cex_candidate = RouteCandidate {
+            venue: RouteVenue::Cex,
+            net_edge_bps: CEX_NET_EDGE_BPS,
+            reason: "cex".to_string(),
+        };
+
+        // when
+        let selected = HybridFinalizer::<MockConfigTrait>::choose_best_route(Some(dex_candidate.clone()), None)
+            .expect("dex candidate should be selected");
+
+        // then
+        assert_eq!(selected.venue, RouteVenue::Dex);
+
+        // when
+        let selected = HybridFinalizer::<MockConfigTrait>::choose_best_route(None, Some(cex_candidate))
+            .expect("candidate should be selected when only one side exists");
+
+        // then
+        assert_eq!(selected.venue, RouteVenue::Cex);
     }
 }

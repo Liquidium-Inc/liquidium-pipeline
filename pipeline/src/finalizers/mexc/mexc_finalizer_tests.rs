@@ -825,10 +825,7 @@ async fn mexc_maybe_mark_trade_dust_requires_small_chunk_and_small_residual() {
         1.0,
         TEST_CEX_SLICE_TARGET_RATIO,
     );
-    let mut state = finalizer
-        .prepare("42", &receipt)
-        .await
-        .expect("prepare should succeed");
+    let mut state = finalizer.prepare("42", &receipt).await.expect("prepare should succeed");
 
     // chunk_usd=0.5 (<1.0), residual_usd=2.0 (>=1.0) => should not be dust-skipped.
     let skipped = finalizer

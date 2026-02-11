@@ -6,6 +6,13 @@ struct PendingSliceRequest {
     buy_mode_label: &'static str,
 }
 
+/// Deposit is considered confirmed once balance delta reaches expected amount minus this epsilon.
+const DEPOSIT_CONFIRMATION_DELTA_EPSILON: f64 = 0.00001;
+/// Hard stop to avoid unbounded per-leg slicing loops on pathological books.
+const MAX_SLICE_EXECUTION_ROUNDS: usize = 128;
+/// Basis points per 1.00 ratio value.
+const BPS_PER_RATIO_UNIT: f64 = 10_000.0;
+
 impl<C> MexcFinalizer<C>
 where
     C: CexBackend,
@@ -13,27 +20,27 @@ where
     /// Phase-B deposit confirmation by balance delta against the captured baseline.
     pub(super) async fn check_deposit(&self, state: &mut CexState) -> Result<(), String> {
         let symbol = state.deposit.deposit_asset.symbol();
-        let current_bal = self.backend.get_balance(&symbol).await?;
+        let current_balance = self.backend.get_balance(&symbol).await?;
 
         match state.deposit.deposit_balance_before {
-            Some(b0) => {
-                let expected = state
+            Some(baseline_balance) => {
+                let expected_deposit_amount = state
                     .trade
                     .trade_next_amount_in
                     .unwrap_or_else(|| state.size_in.to_f64());
 
-                let delta = current_bal - b0;
-                if delta >= expected - 0.00001 {
+                let observed_balance_delta = current_balance - baseline_balance;
+                if observed_balance_delta >= expected_deposit_amount - DEPOSIT_CONFIRMATION_DELTA_EPSILON {
                     info!(
                         "[mexc] liq_id={} deposit confirmed: before={} after={} expected={}",
-                        state.liq_id, b0, current_bal, expected
+                        state.liq_id, baseline_balance, current_balance, expected_deposit_amount
                     );
                     state.step = CexStep::Trade;
                     return Ok(());
                 }
                 info!(
                     "[mexc] liq_id={} deposit pending: before={} current={} delta={} expected={}",
-                    state.liq_id, b0, current_bal, delta, expected
+                    state.liq_id, baseline_balance, current_balance, observed_balance_delta, expected_deposit_amount
                 );
             }
             None => {
@@ -41,9 +48,9 @@ where
                 // so record the current balance as the baseline and stay in Deposit.
                 info!(
                     "[mexc] liq_id={} deposit baseline set: current={}",
-                    state.liq_id, current_bal
+                    state.liq_id, current_balance
                 );
-                state.deposit.deposit_balance_before = Some(current_bal);
+                state.deposit.deposit_balance_before = Some(current_balance);
             }
         }
 
@@ -240,29 +247,29 @@ where
         }
 
         // Binary search for the largest executable amount under target impact.
-        let mut lo = 0.0;
-        let mut hi = max_input;
-        let mut best = 0.0;
+        let mut lower_bound = 0.0;
+        let mut upper_bound = max_input;
+        let mut best_valid_chunk = 0.0;
         for _ in 0..SLICE_SEARCH_STEPS {
-            let mid = (lo + hi) / 2.0;
-            if mid <= LIQUIDITY_EPS {
+            let candidate_chunk = (lower_bound + upper_bound) / 2.0;
+            if candidate_chunk <= LIQUIDITY_EPS {
                 break;
             }
 
-            match simulate(mid) {
+            match simulate(candidate_chunk) {
                 // Candidate is valid; keep it and try a larger chunk.
                 Ok((impact, residual)) if residual <= LIQUIDITY_EPS && impact <= target_bps => {
-                    best = mid;
-                    lo = mid;
+                    best_valid_chunk = candidate_chunk;
+                    lower_bound = candidate_chunk;
                 }
                 // Candidate is invalid (too much impact / not fully fillable / sim error); shrink.
                 Ok(_) | Err(_) => {
-                    hi = mid;
+                    upper_bound = candidate_chunk;
                 }
             }
         }
 
-        best
+        best_valid_chunk
     }
 
     /// Estimate the largest sell chunk under a target impact, in base units.
@@ -627,7 +634,7 @@ where
         let mut remaining_in = state.trade.trade_progress_remaining_in.unwrap_or(amount_in);
         let mut total_out = state.trade.trade_progress_total_out.unwrap_or(0.0);
         // Hard guard against pathological loops when liquidity math cannot converge.
-        let mut rounds = 0usize;
+        let mut slice_round_count = 0usize;
 
         // One-shot override for the NEXT buy slice only.
         // Normal mode is quote-driven (`Auto`), but if quote truncation is large
@@ -638,9 +645,9 @@ where
 
         // Keep slicing until the leg input is consumed (or considered dust).
         while remaining_in > LIQUIDITY_EPS {
-            rounds += 1;
+            slice_round_count += 1;
             // Prevent unbounded retries if chunk sizing keeps returning tiny progress.
-            if rounds > 128 {
+            if slice_round_count > MAX_SLICE_EXECUTION_ROUNDS {
                 let err = format!("trade slicing exceeded max rounds for market {}", leg.market);
                 state.last_error = Some(err.clone());
                 return Err(err);
@@ -758,16 +765,17 @@ where
 
             // Emit slice execution log with route and quality context.
             info!(
-                "[mexc] liq_id={} trade leg {}/{} slice={} market={} side={} in={} out={} impact_bps={:.2}",
+                "[mexc] liq_id={} trade leg {}/{} slice={} market={} side={} in={} out={} slippage_bps={:.2} preview_impact_bps={:.2}",
                 state.liq_id,
                 leg_idx + 1,
                 total_legs,
-                rounds,
+                slice_round_count,
                 leg.market,
                 leg.side,
                 actual_input_consumed,
                 actual_output_received,
-                slice_slippage_bps
+                slice_slippage_bps,
+                preview.preview_impact_bps
             );
 
             self.maybe_arm_adaptive_buy_fallback(
@@ -960,9 +968,9 @@ where
     /// Compute slippage in bps from preview mid and realized execution price.
     pub(super) fn slice_slippage_bps(side: &str, preview_mid_price: f64, exec_price: f64) -> f64 {
         if side.eq_ignore_ascii_case("sell") {
-            ((preview_mid_price - exec_price) / preview_mid_price * 10_000.0).max(0.0)
+            ((preview_mid_price - exec_price) / preview_mid_price * BPS_PER_RATIO_UNIT).max(0.0)
         } else {
-            ((exec_price - preview_mid_price) / preview_mid_price * 10_000.0).max(0.0)
+            ((exec_price - preview_mid_price) / preview_mid_price * BPS_PER_RATIO_UNIT).max(0.0)
         }
     }
 
@@ -990,7 +998,7 @@ where
         state.trade.trade_mid_notional_sum = Some(mid_sum);
         state.trade.trade_exec_notional_sum = Some(exec_sum);
         state.trade.trade_weighted_slippage_bps = if mid_sum > LIQUIDITY_EPS {
-            Some(((mid_sum - exec_sum) / mid_sum * 10_000.0).max(0.0))
+            Some(((mid_sum - exec_sum) / mid_sum * BPS_PER_RATIO_UNIT).max(0.0))
         } else {
             None
         };
