@@ -1,25 +1,49 @@
-# 🧯 Liquidator Bot Framework for ICP
+# Liquidator Bot Framework for ICP
 
 A modular, event-driven off-chain liquidation bot framework for [Internet Computer (ICP)](https://internetcomputer.org/) protocols.
 Inspired by Artemis/MEV patterns and designed for permissionless, community-driven liquidations.
 
+## Table of Contents
+
+- [Features](#features)
+- [At a Glance](#at-a-glance)
+- [Quick Install](#quick-install)
+- [Configuration](#configuration)
+- [Identity Management](#identity-management)
+- [Architecture Overview](#architecture-overview)
+- [CLI Commands](#cli-commands)
+- [Operations Runbook](#operations-runbook)
+- [Developer Setup](#developer-setup)
+- [Security](#security)
+- [Troubleshooting](#troubleshooting)
+- [Notes](#notes)
+- [License](#license)
+
 ---
 
-## ✨ Features
+## Features
 
-- 🔁 **Pipeline Architecture** — Composable stages for discovery, strategy, execution, finalization, and export.
-- ⚡ **Async Rust** — Highly concurrent and efficient with Tokio runtime.
-- 🔀 **Multi-Chain** — Primary support for ICP with EVM (Arbitrum) integration.
-- 💱 **Flexible Swaps** — DEX (Kong), CEX (MEXC), or Hybrid strategies.
-- 👷 **Extensible** — Add custom risk checks, strategies, swaps, or notification stages.
-- 📦 **Permissionless** — Anyone can run it.
-- 🔐 **Multi-Account** — Separate Liquidator, Trader, and Recovery identities for security.
-- 🧪 **CLI Interface** — Manage balances, funds, and identities.
-- 💾 **Persistent State** — SQLite WAL ensures no double-liquidations and supports retries.
+- **Pipeline Architecture** — Composable stages for discovery, strategy, execution, finalization, and export.
+- **Async Rust** — Highly concurrent and efficient with Tokio runtime.
+- **Multi-Chain** — Primary support for ICP with EVM (Arbitrum) integration.
+- **Flexible Swaps** — DEX (Kong), CEX (MEXC), or Hybrid strategies.
+- **Extensible** — Add custom risk checks, strategies, swaps, or notification stages.
+- **Permissionless** — Anyone can run it.
+- **Multi-Account** — Separate liquidator, trader, and recovery identities for security.
+- **CLI Interface** — Manage balances, funds, and identities.
+- **Persistent State** — SQLite WAL ensures no double-liquidations and supports retries.
+
+## At a Glance
+
+- **Best first run:** use `SWAPPER=dex` until CEX credentials are configured.
+- **Current config precedence:** shell env vars > local `.env` > `~/.liquidium-pipeline/config.env`.
+- **Required env vars (minimum):** `MNEMONIC_FILE`, `IC_URL`, `EVM_RPC_URL`, `LENDING_CANISTER`, `DEBT_ASSETS`, `COLLATERAL_ASSETS`.
+- **Primary operations:** `liquidator run`, `liquidator balance`, `liquidator withdraw`, `liquidator account show`.
+- **Persistence:** SQLite WAL (`DB_PATH`) enables idempotent retries and resume-safe execution.
 
 ---
 
-## 📦 Quick Install
+## Quick Install
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/Liquidium-Inc/liquidium-pipeline/main/install.sh | bash
@@ -32,7 +56,7 @@ This will:
 - Install it to `~/.local/bin/liquidator`
 - Create `~/.liquidium-pipeline/config.env` if it doesn't exist (won't overwrite an existing file)
 
-> 💡 Set `SKIP_RUST=true` before running to skip Rust installation if already present.
+> Set `SKIP_RUST=true` before running to skip Rust installation if already present.
 
 ### Install Script Behavior (No Surprises)
 
@@ -41,9 +65,15 @@ This will:
 - Re-running the script updates the repo + binary, but **does not overwrite** your existing `config.env`
 - You can customize with env/args: `BRANCH`, `BIN_NAME`, `INSTALL_DIR`, `SKIP_RUST`
 
+### Upgrade and Compatibility
+
+- Re-running the install command is the recommended upgrade path.
+- `config.env` is preserved across upgrades; new config keys should be added manually when needed.
+- Legacy alias `CEX_BUY_INVERSE_OVESPEND_BPS` remains accepted, while `CEX_BUY_INVERSE_OVERSPEND_BPS` is canonical.
+
 ---
 
-## ⚙️ Configuration
+## Configuration
 
 The bot loads configuration from (in order of precedence):
 
@@ -63,14 +93,14 @@ The bot loads configuration from (in order of precedence):
 IC_URL=https://icp-api.io liquidator run
 ```
 
-### Core Configuration
+### Required Configuration
 
 ```bash
 # ICP Blockchain
 IC_URL=https://ic0.app
 LENDING_CANISTER=nja4y-2yaaa-aaaae-qddxa-cai
 
-# EVM Blockchain (Optional)
+# EVM Blockchain
 EVM_RPC_URL=https://arb1.arbitrum.io/rpc
 
 # Identity
@@ -84,6 +114,16 @@ COLLATERAL_ASSETS=principal1:ckBTC,principal2:ckUSDT,principal3:ICP
 OPPORTUNITY_ACCOUNT_FILTER=principal1,principal2
 ```
 
+### Optional Configuration
+
+```bash
+# Optional operation flags
+BUY_BAD_DEBT=false
+DB_PATH=./wal.db
+EXPORT_PATH=executions.csv
+WATCHDOG_WEBHOOK=https://your-webhook-url.com/endpoint
+```
+
 ### Swap Configuration
 
 ```bash
@@ -91,11 +131,9 @@ OPPORTUNITY_ACCOUNT_FILTER=principal1,principal2
 SWAPPER=hybrid
 
 # DEX (Kong)
-KONG_SWAP_BACKEND=2ipq2-uqaaa-aaaar-qailq-cai
-MAX_ALLOWED_DEX_SLIPPAGE=7500  # 0.75% in basis points
+MAX_ALLOWED_DEX_SLIPPAGE=75  # 0.75% in basis points
 
 # CEX (MEXC) - Optional
-CEX_LIST=mexc
 CEX_MEXC_API_KEY=your_api_key
 CEX_MEXC_API_SECRET=your_api_secret
 MAX_ALLOWED_CEX_SLIPPAGE_BPS=200  # 2.00% in basis points
@@ -219,8 +257,8 @@ Route summary metrics are updated from slice notional, and weighted slippage is 
 
 **Supported swappers:**
 
-- **DEX (Kong)** — `SWAPPER=dex` (uses the Kong canister specified by `KONG_SWAP_BACKEND`)
-- **CEX (MEXC)** — `SWAPPER=cex` (requires `CEX_LIST=mexc` + API credentials)
+- **DEX (Kong)** — `SWAPPER=dex` (uses built-in Kong backend defaults)
+- **CEX (MEXC)** — `SWAPPER=cex` (requires MEXC API credentials)
 - **Hybrid** — `SWAPPER=hybrid` (tries DEX first, falls back to CEX)
 
 ### Storage & Export
@@ -237,11 +275,11 @@ BUY_BAD_DEBT=false  # Set to true to liquidate even if not profitable
 WATCHDOG_WEBHOOK=https://your-webhook-url.com/endpoint
 ```
 
-> 🔔 **WATCHDOG_WEBHOOK**: If set, the bot sends POST requests with JSON payloads for monitoring and alerting (e.g., Slack, Discord, or custom services).
+> `WATCHDOG_WEBHOOK`: if set, the bot sends POST requests with JSON payloads for monitoring and alerting (for example: Slack, Discord, or custom services).
 
 ---
 
-## 🔑 Identity Management
+## Identity Management
 
 The bot uses **three identities** derived from a BIP39 mnemonic for security:
 
@@ -269,7 +307,7 @@ Displays a table of all identities with their principals and statuses.
 
 ---
 
-## 🏗️ Architecture Overview
+## Architecture Overview
 
 ### Crate Structure
 
@@ -336,7 +374,7 @@ Stages are implemented with `async-trait` for composability.
 
 ---
 
-## 🧪 CLI Commands
+## CLI Commands
 
 ### Run the Liquidation Loop
 
@@ -369,7 +407,7 @@ Launches a terminal UI to **start/pause** the loop, view **WAL status**, **profi
 liquidator balance
 ```
 
-Displays both **main** and **recovery** balances. Recovery balances are marked as "seized collateral (stale, pending withdrawal if swaps failed)".
+Displays **main**, **trader**, and **recovery** balances. Recovery balances are marked as "seized collateral (stale, pending withdrawal if swaps failed)".
 
 ### Withdraw Funds
 
@@ -386,15 +424,15 @@ Launches an interactive wizard to select source account, asset, amount, and dest
 ```bash
 liquidator withdraw \
   --source main \
-  --destination <TO_PRINCIPAL> \
-  --asset <ASSET_SYMBOL> \
-  --amount <AMOUNT|all>
+  --destination <main|trader|recovery|ACCOUNT> \
+  --asset <ASSET_SYMBOL|all> \
+  --amount <DECIMAL|all>
 ```
 
 **Options:**
-- `--source`: `main` or `recovery`
-- `--destination`: Target principal
-- `--asset`: Asset symbol (e.g., `ckBTC`, `ckUSDT`, `ICP`)
+- `--source`: `main`, `trader`, or `recovery`
+- `--destination`: `main`, `trader`, `recovery`, or target ICP account/principal
+- `--asset`: Asset symbol (e.g., `ckBTC`, `ckUSDT`, `ICP`) or `all`
 - `--amount`: Specific amount or `all` for full balance
 
 **Example:**
@@ -404,7 +442,35 @@ liquidator withdraw --source main --destination abc123-xyz --asset ckUSDT --amou
 
 ---
 
-## 🛠️ Developer Setup
+## Operations Runbook
+
+1. Verify account wiring and credentials:
+
+   ```bash
+   liquidator account show
+   liquidator balance
+   ```
+
+2. Start with conservative routing while validating setup:
+
+   ```bash
+   SWAPPER=dex liquidator run
+   ```
+
+3. Enable monitoring and inspect output artifacts:
+
+   - Configure `WATCHDOG_WEBHOOK` for alerts.
+   - Check CSV exports at `EXPORT_PATH` and WAL state at `DB_PATH`.
+
+4. Move funds operationally when needed:
+
+   ```bash
+   liquidator withdraw --source main --destination <main|trader|recovery|ACCOUNT> --asset <ASSET_SYMBOL|all> --amount <DECIMAL|all>
+   ```
+
+---
+
+## Developer Setup
 
 ```bash
 # Clone the repository
@@ -443,17 +509,32 @@ In `plain-logs` builds, interactive withdraw prompts are disabled; use non-inter
 
 ---
 
-## 📝 Notes
+## Security
+
+- Treat `MNEMONIC_FILE`, `CEX_MEXC_API_KEY`, and `CEX_MEXC_API_SECRET` as secrets; never commit them.
+- Restrict CEX API keys to required permissions only, and rotate keys periodically.
+- Keep mnemonic backups offline and access controlled.
+- Prefer separate runtime users/environments for production bot instances.
+
+## Troubleshooting
+
+- `LENDING_CANISTER not configured` / `EVM_RPC_URL not configured`: confirm required env vars are set in `.env` or `config.env`.
+- `Invalid source account` / destination parse errors during withdraw: use `main|trader|recovery` aliases or valid account/principal text.
+- CEX calls failing in `hybrid`/`cex` mode: verify `CEX_MEXC_API_KEY` and `CEX_MEXC_API_SECRET`.
+- Noisy terminal output in containerized logging stacks: build and run with `--features plain-logs`.
+- Missing diagnostic detail: rerun with `RUST_LOG=debug`.
+
+## Notes
 
 - Works with ICRC-1/ICRC-2 assets (ckBTC, ckUSDT, ICP, etc.)
 - Identity/config can be system-wide or project-local
 - Composable stages allow for custom liquidation strategies
 - EVM support enables cross-chain liquidations (Arbitrum)
 
-> 💡 **Tip:** Use interactive wizards for manual operations or CLI flags for automation (cron jobs, scripts).
+> Tip: use interactive wizards for manual operations and CLI flags for automation (cron jobs, scripts).
 
 ---
 
-## 📄 License
+## License
 
 MIT
