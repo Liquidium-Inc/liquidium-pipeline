@@ -163,8 +163,8 @@ where
 
 #[cfg(test)]
 mod tests {
-    use crate::swappers::router::SwapVenue;
     use crate::approval_state::ApprovalState;
+    use crate::swappers::router::SwapVenue;
     use candid::{Decode, Nat, Principal};
     use ic_agent::Agent;
     use icrc_ledger_types::icrc1::account::Account;

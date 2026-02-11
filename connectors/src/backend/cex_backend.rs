@@ -29,6 +29,41 @@ pub struct OrderBook {
     pub asks: Vec<OrderBookLevel>,
 }
 
+#[derive(Debug, Clone)]
+pub struct SwapFillReport {
+    /// Actual input amount consumed by the exchange for this order.
+    pub input_consumed: f64,
+    /// Actual output amount received from the exchange for this order.
+    pub output_received: f64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BuyOrderInputMode {
+    Auto,
+    QuoteOrderQty,
+    BaseQuantity,
+}
+
+#[derive(Debug, Clone)]
+pub struct SwapExecutionOptions {
+    /// Optional deterministic client order id for retry-safe submissions.
+    pub client_order_id: Option<String>,
+    /// Buy-side input mode selection.
+    pub buy_mode: BuyOrderInputMode,
+    /// Optional quote overspend cap (in bps) used by base-quantity buy mode.
+    pub max_quote_overspend_bps: Option<f64>,
+}
+
+impl Default for SwapExecutionOptions {
+    fn default() -> Self {
+        Self {
+            client_order_id: None,
+            buy_mode: BuyOrderInputMode::Auto,
+            max_quote_overspend_bps: None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WithdrawStatus {
     Pending,
@@ -45,6 +80,16 @@ pub trait CexBackend: Send + Sync {
     async fn get_quote(&self, market: &str, amount_in: f64) -> Result<f64, String>;
 
     async fn execute_swap(&self, market: &str, side: &str, amount_in: f64) -> Result<f64, String>;
+
+    async fn execute_swap_detailed(&self, market: &str, side: &str, amount_in: f64) -> Result<SwapFillReport, String>;
+
+    async fn execute_swap_detailed_with_options(
+        &self,
+        market: &str,
+        side: &str,
+        amount_in: f64,
+        options: SwapExecutionOptions,
+    ) -> Result<SwapFillReport, String>;
 
     async fn get_orderbook(&self, market: &str, limit: Option<u32>) -> Result<OrderBook, String>;
 

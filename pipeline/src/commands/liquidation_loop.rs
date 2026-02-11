@@ -51,19 +51,49 @@ fn print_banner() {
 }
 
 fn print_startup_table(config: &Config) {
+    let cex_names = if config.cex_credentials.is_empty() {
+        "none".to_string()
+    } else {
+        let mut names: Vec<String> = config.cex_credentials.keys().cloned().collect();
+        names.sort();
+        names.join(", ")
+    };
+    let evm_rpc_url = if config.evm_rpc_url.len() > 96 {
+        format!("{}...", &config.evm_rpc_url[..96])
+    } else {
+        config.evm_rpc_url.clone()
+    };
+    let ic_url = if config.ic_url.len() > 96 {
+        format!("{}...", &config.ic_url[..96])
+    } else {
+        config.ic_url.clone()
+    };
+
     let mut table = Table::new();
     table.set_format(*format::consts::FORMAT_NO_LINESEP_WITH_TITLE);
     table.set_titles(Row::new(vec![Cell::new("Startup Configuration")]));
 
-    table.add_row(Row::new(vec![Cell::new("Network"), Cell::new(&config.ic_url)]));
+    table.add_row(Row::new(vec![Cell::new("Network"), Cell::new(&ic_url)]));
+    table.add_row(Row::new(vec![Cell::new("EVM RPC URL"), Cell::new(&evm_rpc_url)]));
     table.add_row(Row::new(vec![
         Cell::new("Liquidator Principal"),
         Cell::new(&config.liquidator_principal.to_text()),
     ]));
     table.add_row(Row::new(vec![
+        Cell::new("Trader Principal"),
+        Cell::new(&config.trader_principal.to_text()),
+    ]));
+    table.add_row(Row::new(vec![
+        Cell::new("Lending Canister"),
+        Cell::new(&config.lending_canister.to_text()),
+    ]));
+    table.add_row(Row::new(vec![Cell::new("DB Path"), Cell::new(&config.db_path)]));
+    table.add_row(Row::new(vec![Cell::new("Export Path"), Cell::new(&config.export_path)]));
+    table.add_row(Row::new(vec![
         Cell::new("Swapper Mode"),
         Cell::new(&format!("{:?}", config.swapper)),
     ]));
+    table.add_row(Row::new(vec![Cell::new("Configured CEX"), Cell::new(&cex_names)]));
     table.add_row(Row::new(vec![
         Cell::new("Max DEX Slippage (bps)"),
         Cell::new(&config.max_allowed_dex_slippage.to_string()),
@@ -75,6 +105,54 @@ fn print_startup_table(config: &Config) {
     table.add_row(Row::new(vec![
         Cell::new("Buy Bad Debt"),
         Cell::new(&config.buy_bad_debt.to_string()),
+    ]));
+    table.add_row(Row::new(vec![
+        Cell::new("CEX Min Exec USD"),
+        Cell::new(&config.cex_min_exec_usd.to_string()),
+    ]));
+    table.add_row(Row::new(vec![
+        Cell::new("CEX Slice Target Ratio"),
+        Cell::new(&config.cex_slice_target_ratio.to_string()),
+    ]));
+    table.add_row(Row::new(vec![
+        Cell::new("CEX Buy Truncation Trigger"),
+        Cell::new(&config.cex_buy_truncation_trigger_ratio.to_string()),
+    ]));
+    table.add_row(Row::new(vec![
+        Cell::new("CEX Buy Inverse Overspend (bps)"),
+        Cell::new(&config.cex_buy_inverse_overspend_bps.to_string()),
+    ]));
+    table.add_row(Row::new(vec![
+        Cell::new("CEX Buy Inverse Max Retries"),
+        Cell::new(&config.cex_buy_inverse_max_retries.to_string()),
+    ]));
+    table.add_row(Row::new(vec![
+        Cell::new("CEX Buy Inverse Enabled"),
+        Cell::new(&config.cex_buy_inverse_enabled.to_string()),
+    ]));
+    table.add_row(Row::new(vec![
+        Cell::new("CEX Retry Base (secs)"),
+        Cell::new(&config.cex_retry_base_secs.to_string()),
+    ]));
+    table.add_row(Row::new(vec![
+        Cell::new("CEX Retry Max (secs)"),
+        Cell::new(&config.cex_retry_max_secs.to_string()),
+    ]));
+    table.add_row(Row::new(vec![
+        Cell::new("CEX Min Net Edge (bps)"),
+        Cell::new(&config.cex_min_net_edge_bps.to_string()),
+    ]));
+    table.add_row(Row::new(vec![
+        Cell::new("CEX Delay Buffer (bps)"),
+        Cell::new(&config.cex_delay_buffer_bps.to_string()),
+    ]));
+    table.add_row(Row::new(vec![
+        Cell::new("CEX Route Fee (bps)"),
+        Cell::new(&config.cex_route_fee_bps.to_string()),
+    ]));
+    table.add_row(Row::new(vec![
+        Cell::new("CEX Force Over USD Threshold"),
+        Cell::new(&config.cex_force_over_usd_threshold.to_string()),
     ]));
 
     table.printstd();
@@ -137,11 +215,17 @@ async fn init(
     let mexc_finalizer = match ctx.config.get_cex_credentials("mexc") {
         Ok((api_key, secret)) => {
             let mexc_client = Arc::new(MexcClient::new(&api_key, &secret));
-            let mexc_finalizer = Arc::new(MexcFinalizer::new(
+            let mexc_finalizer = Arc::new(MexcFinalizer::new_with_tunables(
                 mexc_client,
                 ctx.trader_transfers.actions(),
                 config.liquidator_principal,
                 config.max_allowed_cex_slippage_bps as f64,
+                config.cex_min_exec_usd,
+                config.cex_slice_target_ratio,
+                config.cex_buy_truncation_trigger_ratio,
+                config.cex_buy_inverse_overspend_bps,
+                config.cex_buy_inverse_max_retries,
+                config.cex_buy_inverse_enabled,
             ));
             Some(mexc_finalizer)
         }
@@ -172,6 +256,8 @@ async fn init(
         profit_calc,
         agent.clone(),
         config.lending_canister,
+        config.cex_retry_base_secs,
+        config.cex_retry_max_secs,
     ));
 
     info!("Initializing searcher stage ...");
@@ -257,6 +343,7 @@ pub async fn run_liquidation_loop() {
         ctx.swap_router.clone(),
         config.lending_canister,
         Duration::from_secs(3),
+        config.swapper,
     );
     tokio::spawn(async move { watcher.run().await });
 
