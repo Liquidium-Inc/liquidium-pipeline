@@ -317,6 +317,7 @@ async fn init(
     // For now, CEX is wired to the same Kong finalizer; you can later swap in a dedicated CEX finalizer.
     let hybrid_finalizer = Arc::new(HybridFinalizer {
         config: config.clone(),
+        trader_transfers: ctx.trader_transfers.actions(),
         dex_swapper: ctx.swap_router.clone(),
         dex_finalizer: kong_finalizer.clone(),
         cex_finalizer: mexc_finalizer.clone().map(|f| f as Arc<dyn CexFinalizerLogic>),

@@ -245,6 +245,7 @@ where
         let wrapper = LiqMetaWrapper {
             receipt: receipt.clone(),
             meta: Vec::new(),
+            finalizer_decision: None,
         };
         encode_meta(&mut row, &wrapper)?;
         if touch {
@@ -364,6 +365,7 @@ mod tests {
         let wrapper = LiqMetaWrapper {
             receipt,
             meta: Vec::new(),
+            finalizer_decision: None,
         };
         encode_meta(&mut row, &wrapper).expect("encode_meta should succeed");
         row
