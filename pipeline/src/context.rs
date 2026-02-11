@@ -10,6 +10,7 @@ use icrc_ledger_types::icrc1::account::Account;
 use liquidium_pipeline_connectors::account::evm_account::EvmAccountInfoAdapter;
 use liquidium_pipeline_connectors::account::icp_account::IcpAccountInfoAdapter;
 use liquidium_pipeline_connectors::backend::evm_backend::EvmBackendImpl;
+use liquidium_pipeline_connectors::error_format::format_with_code;
 use liquidium_pipeline_core::balance_service::BalanceService;
 use liquidium_pipeline_core::tokens::chain_token::ChainToken;
 use liquidium_pipeline_core::transfer::transfer_service::TransferService;
@@ -20,7 +21,7 @@ use liquidium_pipeline_core::{account::actions::AccountInfo, tokens::token_regis
 use liquidium_pipeline_connectors::{
     account::router::MultiChainAccountInfoRouter,
     backend::icp_backend::IcpBackendImpl,
-    token_registry_loader::{load_token_registry, RegistryLoadError},
+    token_registry_loader::{RegistryLoadError, load_token_registry},
     transfer::{evm_transfer::EvmTransferAdapter, icp_transfer::IcpTransferAdapter, router::MultiChainTransferRouter},
 };
 
@@ -117,10 +118,10 @@ impl<P: Provider<AnyNetwork> + WalletProvider<AnyNetwork> + Clone + 'static> Pip
             .ic_agent_main
             .ok_or_else(|| PipelineContextError::Other("missing IC Main Agent".to_string()))?;
         let icp_backend_main = Arc::new(IcpBackendImpl::new(main_agent.clone()));
-        let icp_backend_trader = Arc::new(IcpBackendImpl::new(
-            self.ic_agent_trader
-                .ok_or_else(|| PipelineContextError::Other("missing IC Trader".to_string()))?,
-        ));
+        let icp_backend_trader =
+            Arc::new(IcpBackendImpl::new(self.ic_agent_trader.ok_or_else(|| {
+                PipelineContextError::Other("missing IC Trader".to_string())
+            })?));
 
         // Use provided EVM providers or fail
         let main_provider = self
@@ -137,6 +138,7 @@ impl<P: Provider<AnyNetwork> + WalletProvider<AnyNetwork> + Clone + 'static> Pip
                 .await
                 .map_err(PipelineContextError::RegistryLoad)?,
         });
+        
         for (id, token) in registry.tokens.iter() {
             if let ChainToken::Icp { fee, .. } = token {
                 info!("Loaded ICRC fee: {} {} (ledger={})", token.symbol(), fee, id.address);
@@ -406,8 +408,9 @@ mod tests {
 
     #[tokio::test]
     async fn build_stringifies_typed_internal_errors() {
-        let signer: PrivateKeySigner =
-            "0x59c6995e998f97a5a0044966f0945382d7f0f5d5f7cd4c95b2f5f7f6c8c6f8de".parse().expect("signer");
+        let signer: PrivateKeySigner = "0x59c6995e998f97a5a0044966f0945382d7f0f5d5f7cd4c95b2f5f7f6c8c6f8de"
+            .parse()
+            .expect("signer");
         let provider = ProviderBuilder::new()
             .network::<AnyNetwork>()
             .wallet(signer)

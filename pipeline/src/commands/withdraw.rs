@@ -20,6 +20,7 @@ use alloy::primitives::Address as EvmAddress;
 
 use crate::config::ConfigTrait;
 use crate::context::init_context;
+use crate::output::plain_logs_enabled;
 
 enum Destination {
     Icp(Account),
@@ -27,6 +28,13 @@ enum Destination {
 }
 
 pub async fn withdraw() {
+    if plain_logs_enabled() {
+        eprintln!(
+            "Interactive withdraw wizard is disabled in plain-logs mode. Use non-interactive flags: liquidator withdraw --source <main|trader|recovery> --destination <main|trader|recovery|ACCOUNT> --asset <SYMBOL|all> --amount <DECIMAL|all>."
+        );
+        return;
+    }
+
     let theme = ColorfulTheme::default();
     println!("\n=== Withdraw Wizard ===\n");
 

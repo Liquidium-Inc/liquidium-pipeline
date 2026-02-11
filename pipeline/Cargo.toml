@@ -15,6 +15,12 @@ module_inception = "allow"
 upper_case_acronyms = "allow"
 too_many_arguments = "allow"
 double_parens = "allow"
+collapsible_if = "allow"
+type_complexity = "allow"
+
+[features]
+default = []
+plain-logs = []
 
 [dependencies]
 liquidium-pipeline-core = { path = "../core" }

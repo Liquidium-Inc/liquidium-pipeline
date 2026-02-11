@@ -3,13 +3,13 @@ name = "liquidium-pipeline-connectors"
 version = "0.1.0"
 edition = "2024"
 
-
 [lib]
 crate-type = ["lib"]
 
 [lints.clippy]
 double_parens = "allow"
 type_complexity = "allow"
+collapsible_if = "allow"
 
 [dependencies]
 serde = { workspace = true }
