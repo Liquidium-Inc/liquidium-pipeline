@@ -369,6 +369,8 @@ mod tests {
     use super::*;
 
     fn test_config() -> Arc<Config> {
+        let evm_test_private_key = std::env::var("EVM_TEST_PRIVATE_KEY").unwrap_or_default();
+
         Arc::new(Config {
             liquidator_identity: Arc::new(AnonymousIdentity {}),
             trader_identity: Arc::new(AnonymousIdentity {}),
@@ -376,7 +378,7 @@ mod tests {
             trader_principal: Principal::from_text("2vxsx-fae").expect("principal"),
             ic_url: "http://localhost:4943".to_string(),
             evm_rpc_url: "http://localhost:8545".to_string(),
-            evm_private_key: "0x59c6995e998f97a5a0044966f0945382d7f0f5d5f7cd4c95b2f5f7f6c8c6f8de".to_string(),
+            evm_private_key: evm_test_private_key,
             lending_canister: Principal::from_text("aaaaa-aa").expect("principal"),
             export_path: "executions.csv".to_string(),
             buy_bad_debt: false,
