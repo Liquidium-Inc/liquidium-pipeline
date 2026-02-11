@@ -112,7 +112,7 @@ CEX_SLICE_TARGET_RATIO=0.7
 # Arm adaptive buy fallback when truncation ratio is >= this value
 CEX_BUY_TRUNCATION_TRIGGER_RATIO=0.25
 # Max quote overspend allowed for inverse/base buy fallback (bps)
-CEX_BUY_INVERSE_OVESPEND_BPS=10
+CEX_BUY_INVERSE_OVERSPEND_BPS=10
 # Max inverse/base fallback retries per trade leg
 CEX_BUY_INVERSE_MAX_RETRIES=1
 # Enable/disable adaptive inverse/base fallback
@@ -127,7 +127,7 @@ CEX_DELAY_BUFFER_BPS=75
 # Estimated route fee haircut applied to projected edge (bps)
 CEX_ROUTE_FEE_BPS=25
 # Hybrid shortcut: force CEX above this notional (USD), set 0 to disable
-CEX_FORCE_OVER_USD_THRESHOLD=2.5
+CEX_FORCE_OVER_USD_THRESHOLD=12.5
 ```
 
 Quick reference:
@@ -137,7 +137,7 @@ Quick reference:
 | `CEX_MIN_EXEC_USD` | Dust floor per slice (below this, execution is skipped). |
 | `CEX_SLICE_TARGET_RATIO` | How aggressive slice sizing is vs hard slippage cap. |
 | `CEX_BUY_TRUNCATION_TRIGGER_RATIO` | When buy truncation is considered large enough to trigger fallback logic. |
-| `CEX_BUY_INVERSE_OVESPEND_BPS` | Safety cap for how much inverse/base buy mode may overspend. |
+| `CEX_BUY_INVERSE_OVERSPEND_BPS` | Safety cap for how much inverse/base buy mode may overspend. |
 | `CEX_BUY_INVERSE_MAX_RETRIES` | Max fallback attempts per leg. |
 | `CEX_BUY_INVERSE_ENABLED` | Master toggle for adaptive buy fallback. |
 | `CEX_RETRY_BASE_SECS` | Initial retry delay after retryable CEX errors. |
@@ -146,6 +146,8 @@ Quick reference:
 | `CEX_DELAY_BUFFER_BPS` | Extra haircut for execution-latency/price-move risk. |
 | `CEX_ROUTE_FEE_BPS` | Fee haircut applied during route edge estimation. |
 | `CEX_FORCE_OVER_USD_THRESHOLD` | In hybrid mode, force CEX above this USD notional (`0` disables). |
+
+Note: `CEX_BUY_INVERSE_OVESPEND_BPS` is still accepted as a legacy alias, but `CEX_BUY_INVERSE_OVERSPEND_BPS` is the canonical key.
 
 #### `CEX_SLICE_TARGET_RATIO` Explained
 
