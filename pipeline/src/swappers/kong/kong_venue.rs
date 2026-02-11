@@ -166,7 +166,6 @@ mod tests {
     use crate::approval_state::ApprovalState;
     use crate::swappers::router::SwapVenue;
     use candid::{Decode, Nat, Principal};
-    use ic_agent::Agent;
     use icrc_ledger_types::icrc1::account::Account;
     use icrc_ledger_types::icrc2::allowance::Allowance;
     use icrc_ledger_types::icrc2::approve::ApproveError;
@@ -201,13 +200,6 @@ mod tests {
         }
     }
 
-    fn build_agent() -> Agent {
-        Agent::builder()
-            .with_url("http://localhost")
-            .build()
-            .expect("agent should build")
-    }
-
     #[tokio::test]
     async fn kong_venue_execute_applies_fee_after_approve() {
         let ledger = Principal::from_text("ryjl3-tyaaa-aaaaa-aaaba-cai").unwrap();
@@ -235,11 +227,12 @@ mod tests {
         };
 
         let mut mock_agent = MockPipelineAgent::new();
-        let agent = build_agent();
-        mock_agent.expect_agent().returning(move || agent.clone());
+        mock_agent
+            .expect_agent()
+            .returning(|| panic!("agent() should not be called in kong_venue_execute_applies_fee_after_approve"));
 
         let ledger_allowance = ledger;
-        let ledger_balance = ledger_allowance.clone();
+        let ledger_balance = ledger_allowance;
 
         mock_agent
             .expect_call_query::<Allowance>()
@@ -277,7 +270,7 @@ mod tests {
                     return false;
                 }
                 let decoded: SwapArgs = Decode!(&arg, SwapArgs).expect("decode swap args");
-                decoded.pay_amount == Nat::from(90u8)
+                decoded.pay_amount == 90u8
             })
             .times(1)
             .returning(move |_, _, _| {
@@ -329,11 +322,12 @@ mod tests {
         };
 
         let mut mock_agent = MockPipelineAgent::new();
-        let agent = build_agent();
-        mock_agent.expect_agent().returning(move || agent.clone());
+        mock_agent
+            .expect_agent()
+            .returning(|| panic!("agent() should not be called in kong_venue_execute_skips_fee_when_allowance_ok"));
 
         let ledger_allowance = ledger;
-        let ledger_balance = ledger_allowance.clone();
+        let ledger_balance = ledger_allowance;
 
         mock_agent
             .expect_call_query::<Allowance>()
@@ -357,7 +351,7 @@ mod tests {
                     return false;
                 }
                 let decoded: SwapArgs = Decode!(&arg, SwapArgs).expect("decode swap args");
-                decoded.pay_amount == Nat::from(100u8)
+                decoded.pay_amount == 100u8
             })
             .times(1)
             .returning(move |_, _, _| Ok(SwapResult::Ok(dummy_swap_reply(Nat::from(100u8)))));

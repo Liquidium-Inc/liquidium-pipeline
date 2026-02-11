@@ -13,6 +13,8 @@ use serde_json::Value;
 
 /// Default orderbook depth level used for quote-cost and preview estimations.
 const DEFAULT_ORDERBOOK_DEPTH_LIMIT: u32 = 50;
+/// Default record limit for withdrawal history lookups.
+const DEFAULT_WITHDRAW_HISTORY_LIMIT: u32 = 50;
 /// Basis points per 1.00 ratio value.
 const BPS_PER_RATIO_UNIT: f64 = 10_000.0;
 
@@ -339,6 +341,86 @@ impl MexcClient {
 }
 
 impl MexcClient {
+    async fn fetch_ask_levels(
+        &self,
+        ex: &MexcSpotApiClientWithAuthentication,
+        api_symbol: &str,
+    ) -> Result<Vec<(Decimal, Decimal)>, String> {
+        let orderbook_depth = ex
+            .depth(DepthParams {
+                limit: Some(DEFAULT_ORDERBOOK_DEPTH_LIMIT),
+                symbol: api_symbol,
+            })
+            .await
+            .map_err(|e| e.to_string())?;
+
+        if orderbook_depth.asks.is_empty() {
+            return Err("no asks".into());
+        }
+
+        Ok(orderbook_depth
+            .asks
+            .into_iter()
+            .map(|level| (level.price, level.quantity))
+            .collect())
+    }
+
+    fn estimate_buy_quantity_from_levels(ask_levels: &[(Decimal, Decimal)], quote_amount: Decimal) -> Result<Decimal, String> {
+        if ask_levels.is_empty() {
+            return Err("no asks".into());
+        }
+
+        let mut remaining_quote = quote_amount;
+        let mut base_out = Decimal::ZERO;
+        for (price, quantity) in ask_levels {
+            if remaining_quote <= Decimal::ZERO {
+                break;
+            }
+            if *price <= Decimal::ZERO || *quantity <= Decimal::ZERO {
+                continue;
+            }
+            let max_base = remaining_quote / *price;
+            let take = (*quantity).min(max_base);
+            base_out += take;
+            remaining_quote -= take * *price;
+        }
+
+        if remaining_quote > Decimal::ZERO {
+            return Err("not enough ask liquidity".into());
+        }
+
+        Ok(base_out)
+    }
+
+    fn estimate_buy_quote_cost_from_levels(
+        ask_levels: &[(Decimal, Decimal)],
+        base_quantity: Decimal,
+    ) -> Result<Decimal, String> {
+        if ask_levels.is_empty() {
+            return Err("no asks".into());
+        }
+
+        let mut remaining_base = base_quantity;
+        let mut quote_cost = Decimal::ZERO;
+        for (price, quantity) in ask_levels {
+            if remaining_base <= Decimal::ZERO {
+                break;
+            }
+            if *price <= Decimal::ZERO || *quantity <= Decimal::ZERO {
+                continue;
+            }
+            let take = (*quantity).min(remaining_base);
+            quote_cost += take * *price;
+            remaining_base -= take;
+        }
+
+        if remaining_base > Decimal::ZERO {
+            return Err("not enough ask liquidity".into());
+        }
+
+        Ok(quote_cost)
+    }
+
     // Round quote amount to exchange precision and signal whether quote-based buys are viable.
     fn adjust_quote_amount(amount_dec: Decimal, filters: Option<&SymbolFilters>) -> (Decimal, bool) {
         let mut quote_amt = amount_dec;
@@ -381,78 +463,8 @@ impl MexcClient {
         api_symbol: &str,
         quote_amount: Decimal,
     ) -> Result<Decimal, String> {
-        let orderbook_depth = ex
-            .depth(DepthParams {
-                limit: Some(DEFAULT_ORDERBOOK_DEPTH_LIMIT),
-                symbol: api_symbol,
-            })
-            .await
-            .map_err(|e| e.to_string())?;
-
-        if orderbook_depth.asks.is_empty() {
-            return Err("no asks".into());
-        }
-
-        let mut remaining_quote = quote_amount;
-        let mut base_out = Decimal::ZERO;
-        for level in &orderbook_depth.asks {
-            if remaining_quote <= Decimal::ZERO {
-                break;
-            }
-            if level.price <= Decimal::ZERO || level.quantity <= Decimal::ZERO {
-                continue;
-            }
-            let max_base = remaining_quote / level.price;
-            let take = level.quantity.min(max_base);
-            base_out += take;
-            remaining_quote -= take * level.price;
-        }
-
-        if remaining_quote > Decimal::ZERO {
-            return Err("not enough ask liquidity".into());
-        }
-
-        Ok(base_out)
-    }
-
-    // Estimate quote cost from orderbook for a base-denominated buy quantity.
-    async fn estimate_buy_quote_cost(
-        &self,
-        ex: &MexcSpotApiClientWithAuthentication,
-        api_symbol: &str,
-        base_quantity: Decimal,
-    ) -> Result<Decimal, String> {
-        let orderbook_depth = ex
-            .depth(DepthParams {
-                limit: Some(DEFAULT_ORDERBOOK_DEPTH_LIMIT),
-                symbol: api_symbol,
-            })
-            .await
-            .map_err(|e| e.to_string())?;
-
-        if orderbook_depth.asks.is_empty() {
-            return Err("no asks".into());
-        }
-
-        let mut remaining_base = base_quantity;
-        let mut quote_cost = Decimal::ZERO;
-        for level in &orderbook_depth.asks {
-            if remaining_base <= Decimal::ZERO {
-                break;
-            }
-            if level.price <= Decimal::ZERO || level.quantity <= Decimal::ZERO {
-                continue;
-            }
-            let take = level.quantity.min(remaining_base);
-            quote_cost += take * level.price;
-            remaining_base -= take;
-        }
-
-        if remaining_base > Decimal::ZERO {
-            return Err("not enough ask liquidity".into());
-        }
-
-        Ok(quote_cost)
+        let ask_levels = self.fetch_ask_levels(ex, api_symbol).await?;
+        Self::estimate_buy_quantity_from_levels(&ask_levels, quote_amount)
     }
 
     // Apply step size/base precision and min_qty checks to a computed base amount.
@@ -610,17 +622,20 @@ impl MexcClient {
             .to_f64()
             .ok_or("cannot convert cummulative_quote_quantity to f64".to_string())?;
 
-        if side_norm == "buy" {
-            return Ok(SwapFillReport {
+        match side_norm {
+            "buy" => Ok(SwapFillReport {
                 input_consumed: cumulative_quote,
                 output_received: executed_base,
-            });
+            }),
+            "sell" => Ok(SwapFillReport {
+                input_consumed: executed_base,
+                output_received: cumulative_quote,
+            }),
+            _ => Err(format!(
+                "invalid side_norm '{}' in map_fill_report(side_norm, executed_quantity, cummulative_quote_quantity)",
+                side_norm
+            )),
         }
-
-        Ok(SwapFillReport {
-            input_consumed: executed_base,
-            output_received: cumulative_quote,
-        })
     }
 
     async fn fetch_fill_report(
@@ -673,11 +688,20 @@ impl MexcClient {
         let order_res = match order_res {
             Ok(res) => res,
             Err(err) => {
+                let err_str = format_mexc_api_error(&err);
+                // Only treat "order not found" as missing; propagate other errors.
+                if is_bad_symbol(&err) || is_order_missing_lookup_error(&err_str) {
+                    debug!(
+                        "[mexc] get_order by client id not found symbol={} client_id={}",
+                        symbol, client_order_id
+                    );
+                    return Ok(None);
+                }
                 debug!(
-                    "[mexc] get_order by client id missed symbol={} client_id={} err={}",
-                    symbol, client_order_id, err
+                    "[mexc] get_order by client id error symbol={} client_id={} err={}",
+                    symbol, client_order_id, err_str
                 );
-                return Ok(None);
+                return Err(format!("get_order by client_id failed: {}", err_str));
             }
         };
 
@@ -745,9 +769,10 @@ impl MexcClient {
         }
 
         if buy_mode == BuyOrderInputMode::BaseQuantity {
-            let base_out = self.estimate_buy_quantity(ex, api_symbol, amount_dec).await?;
+            let ask_levels = self.fetch_ask_levels(ex, api_symbol).await?;
+            let base_out = Self::estimate_buy_quantity_from_levels(&ask_levels, amount_dec)?;
             let qty = Self::adjust_buy_quantity(base_out, filters, symbol)?;
-            let quote_cost = self.estimate_buy_quote_cost(ex, api_symbol, qty).await?;
+            let quote_cost = Self::estimate_buy_quote_cost_from_levels(&ask_levels, qty)?;
             Self::ensure_min_notional(filters, quote_cost, symbol)?;
 
             if let Some(cap_bps) = max_quote_overspend_bps {
@@ -845,8 +870,6 @@ impl CexBackend for MexcClient {
         amount_in: f64,
         options: SwapExecutionOptions,
     ) -> Result<SwapFillReport, String> {
-        let ex = self.inner.lock().await;
-
         let market_symbol = market.trim().to_ascii_uppercase();
         let symbol = normalize_market_symbol(&market_symbol);
         // Determine order params (side, quantity vs quote quantity) using filters.
@@ -862,9 +885,11 @@ impl CexBackend for MexcClient {
 
         let candidates = Self::candidate_symbols(api_symbol, &market_symbol, &symbol);
 
+        // Lock the authenticated client per exchange interaction, not for the full swap flow.
         let (order_side, quantity, quote_order_quantity) = match side_norm.as_str() {
             "sell" => Self::prepare_sell_order(amount_dec, filters.as_ref(), symbol.as_str())?,
             "buy" => {
+                let ex = self.inner.lock().await;
                 self.prepare_buy_order(
                     &ex,
                     amount_dec,
@@ -880,8 +905,9 @@ impl CexBackend for MexcClient {
         };
 
         // Try multiple candidate symbols for MEXC quirks, then fetch the filled amount.
-        let submit_res = self
-            .submit_market_order(
+        let submit_res = {
+            let ex = self.inner.lock().await;
+            self.submit_market_order(
                 &ex,
                 &candidates,
                 order_side,
@@ -892,28 +918,37 @@ impl CexBackend for MexcClient {
                 side,
                 amount_in,
             )
-            .await;
+            .await
+        };
 
         match submit_res {
             Ok((chosen_symbol, order_id)) => {
-                match self.fetch_fill_report(&ex, &chosen_symbol, &order_id, &side_norm).await {
+                let fetch_res = {
+                    let ex = self.inner.lock().await;
+                    self.fetch_fill_report(&ex, &chosen_symbol, &order_id, &side_norm)
+                        .await
+                };
+                match fetch_res {
                     Ok(report) => Ok(report),
                     Err(fetch_err) => {
-                        if let Some(client_order_id) = options.client_order_id.as_deref()
-                            && let Some(report) = self
-                                .try_fetch_fill_report_by_client_order_id_candidates(
+                        if let Some(client_order_id) = options.client_order_id.as_deref() {
+                            let recovered = {
+                                let ex = self.inner.lock().await;
+                                self.try_fetch_fill_report_by_client_order_id_candidates(
                                     &ex,
                                     &candidates,
                                     client_order_id,
                                     &side_norm,
                                 )
-                                .await?
-                        {
-                            info!(
-                                "[mexc] recovered filled order by client id after get_order miss market={} side={} client_id={}",
-                                market, side, client_order_id
-                            );
-                            return Ok(report);
+                                .await
+                            }?;
+                            if let Some(report) = recovered {
+                                info!(
+                                    "[mexc] recovered filled order by client id after get_order miss market={} side={} client_id={}",
+                                    market, side, client_order_id
+                                );
+                                return Ok(report);
+                            }
                         }
 
                         if is_order_missing_lookup_error(&fetch_err) {
@@ -928,21 +963,24 @@ impl CexBackend for MexcClient {
                 }
             }
             Err(submit_err) => {
-                if let Some(client_order_id) = options.client_order_id.as_deref()
-                    && let Some(report) = self
-                        .try_fetch_fill_report_by_client_order_id_candidates(
+                if let Some(client_order_id) = options.client_order_id.as_deref() {
+                    let recovered = {
+                        let ex = self.inner.lock().await;
+                        self.try_fetch_fill_report_by_client_order_id_candidates(
                             &ex,
                             &candidates,
                             client_order_id,
                             &side_norm,
                         )
-                        .await?
-                {
-                    info!(
-                        "[mexc] recovered filled order by client id after submit error market={} side={} client_id={}",
-                        market, side, client_order_id
-                    );
-                    return Ok(report);
+                        .await
+                    }?;
+                    if let Some(report) = recovered {
+                        info!(
+                            "[mexc] recovered filled order by client id after submit error market={} side={} client_id={}",
+                            market, side, client_order_id
+                        );
+                        return Ok(report);
+                    }
                 }
                 Err(submit_err)
             }
@@ -1173,7 +1211,7 @@ impl CexBackend for MexcClient {
             .withdraw_history(WithdrawHistoryRequest {
                 coin: Some(coin.to_string()),
                 status: None,
-                limit: Some(DEFAULT_ORDERBOOK_DEPTH_LIMIT),
+                limit: Some(DEFAULT_WITHDRAW_HISTORY_LIMIT),
                 start_time: None,
                 end_time: None,
             })

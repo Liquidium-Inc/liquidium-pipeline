@@ -74,6 +74,7 @@ pub struct Config {
     pub opportunity_account_filter: Vec<Principal>,
 }
 
+#[allow(dead_code)]
 #[cfg_attr(test, mockall::automock)]
 pub trait ConfigTrait: Send + Sync {
     fn get_liquidator_principal(&self) -> Principal;

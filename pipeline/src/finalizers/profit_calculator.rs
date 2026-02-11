@@ -27,7 +27,7 @@ impl ProfitCalculator for SimpleProfitCalculator {
     fn realized(&self, req: &ExecutorRequest, liq: &LiquidationResult, swap: Option<&SwapExecution>) -> i128 {
         let mut fee_total = req.debt_asset.fee();
         if req.debt_approval_needed {
-            fee_total = fee_total + req.debt_asset.fee();
+            fee_total += req.debt_asset.fee();
         }
 
         let receive_amount = match swap {
@@ -40,7 +40,7 @@ impl ProfitCalculator for SimpleProfitCalculator {
 
         let approval_fee_in_debt = if let Some(swap) = swap {
             if let Some(count) = swap.approval_count {
-                if count > 0 && swap.pay_amount > Nat::from(0u8) {
+                if count > 0 && swap.pay_amount > 0u8 {
                     let fee_native = req.collateral_asset.fee() * Nat::from(count);
                     (fee_native * swap.receive_amount.clone()) / swap.pay_amount.clone()
                 } else {
