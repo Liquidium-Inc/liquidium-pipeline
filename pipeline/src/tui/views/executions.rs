@@ -258,7 +258,7 @@ fn parse_meta_lines(raw: &str) -> Vec<Line<'static>> {
                 "receipt": wrapper.receipt,
                 "meta": meta_val
             });
-            return pretty_json_lines(&val);
+            pretty_json_lines(&val)
         }
         Err(wrapper_err) => match serde_json::from_str::<ExecutionReceipt>(raw) {
             Ok(receipt) => {
@@ -266,7 +266,7 @@ fn parse_meta_lines(raw: &str) -> Vec<Line<'static>> {
                     "receipt": receipt,
                     "meta": Value::Null
                 });
-                return pretty_json_lines(&val);
+                pretty_json_lines(&val)
             }
             Err(receipt_err) => {
                 if let Ok(value) = serde_json::from_str::<Value>(raw) {
@@ -282,7 +282,7 @@ fn parse_meta_lines(raw: &str) -> Vec<Line<'static>> {
                     return lines;
                 }
 
-                return vec![
+                vec![
                     Line::from(Span::styled(
                         format!(
                             "meta_json parse error (wrapper_err={}, receipt_err={})",
@@ -291,7 +291,7 @@ fn parse_meta_lines(raw: &str) -> Vec<Line<'static>> {
                         Style::default().fg(Color::Red),
                     )),
                     Line::from(truncate(raw, 220)),
-                ];
+                ]
             }
         },
     }

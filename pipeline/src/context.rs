@@ -105,7 +105,9 @@ impl<P: Provider<AnyNetwork> + WalletProvider<AnyNetwork> + Clone + 'static> Pip
     }
 
     pub async fn build(self) -> Result<PipelineContext, String> {
-        self.build_with_registry_override(None).await.map_err(|e| e.to_string())
+        self.build_with_registry_override(None)
+            .await
+            .map_err(|e| format_with_code(&e))
     }
 
     pub async fn build_with_registry_override(
@@ -381,6 +383,18 @@ mod tests {
             db_path: "wal.db".to_string(),
             max_allowed_dex_slippage: 125,
             max_allowed_cex_slippage_bps: 200,
+            cex_min_exec_usd: 5.0,
+            cex_slice_target_ratio: 0.85,
+            cex_buy_truncation_trigger_ratio: 0.25,
+            cex_buy_inverse_overspend_bps: 10,
+            cex_buy_inverse_max_retries: 1,
+            cex_buy_inverse_enabled: true,
+            cex_retry_base_secs: 5,
+            cex_retry_max_secs: 120,
+            cex_min_net_edge_bps: 25,
+            cex_delay_buffer_bps: 15,
+            cex_route_fee_bps: 12,
+            cex_force_over_usd_threshold: 0.0,
             swapper: crate::config::SwapperMode::Hybrid,
             cex_credentials: HashMap::new(),
             opportunity_account_filter: vec![],

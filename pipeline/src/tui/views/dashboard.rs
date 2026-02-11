@@ -158,8 +158,10 @@ fn draw_configuration(f: &mut Frame<'_>, area: Rect, app: &App) {
             Span::raw(opp_filter),
         ]),
         Line::from(format!("Liq ICP: {}", truncate(&app.config.liquidator_principal, 44))),
+        Line::from(format!("Trader ICP: {}", truncate(&app.config.trader_principal, 44))),
         Line::from(format!("Liq EVM: {}", truncate(&app.config.evm_address, 44))),
         Line::from(format!("IC: {}", truncate(&app.config.ic_url, 44))),
+        Line::from(format!("DB: {}", truncate_start(&app.config.db_path, 44))),
         Line::from(format!("Export: {}", truncate_start(&app.config.export_path, 44))),
     ];
 

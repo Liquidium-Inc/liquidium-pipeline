@@ -6,10 +6,11 @@ use prettytable::{Cell, Row, Table, format};
 use std::{
     io::{IsTerminal, stderr, stdout},
     sync::Arc,
-    thread::sleep,
     time::Duration,
     time::Instant,
 };
+use tokio::sync::{mpsc, watch};
+use tokio::time::sleep;
 use tracing::{Instrument, info_span, instrument};
 use tracing::{info, warn};
 
@@ -486,8 +487,9 @@ pub async fn run_liquidation_loop() {
 
         if !opportunities.is_empty() {
             sleep(Duration::from_secs(2)).await;
-            spinner = start_spinner();
-            spinner.finish_and_clear();
+            if let Some(s) = spinner.as_ref() {
+                s.finish_and_clear();
+            }
             info!("Found {:?} opportunities", opportunities.len());
 
             let opp_count = opportunities.len();
@@ -519,8 +521,10 @@ pub async fn run_liquidation_loop() {
         });
 
         if outcomes.is_empty() {
-            spinner = start_spinner();
-            spinner.set_message("Scanning for liquidation opportunities...");
+            spinner = start_spinner(ui_enabled);
+            if let Some(s) = spinner.as_ref() {
+                s.set_message("Scanning for liquidation opportunities...");
+            }
             sleep(Duration::from_secs(2)).await;
             continue;
         }
@@ -530,7 +534,7 @@ pub async fn run_liquidation_loop() {
         }
         log_execution_results(&outcomes);
         if ui_enabled {
-            print_execution_results(&outcomes);
+            print_execution_results(outcomes.clone());
         }
         spinner = start_spinner(ui_enabled);
         if let Some(s) = spinner.as_ref() {
@@ -579,6 +583,7 @@ pub async fn run_liquidation_loop_controlled(
         ctx.swap_router.clone(),
         config.lending_canister,
         Duration::from_secs(3),
+        config.swapper,
     );
     tokio::spawn(async move { watcher.run().await });
 

@@ -177,16 +177,17 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
 
     use candid::Nat;
+    use tokio::sync::Mutex;
 
     use super::{RegistryLoadError, load_token_registry};
     use crate::backend::evm_backend::MockEvmBackend;
     use crate::backend::icp_backend::MockIcpBackend;
     use liquidium_pipeline_core::tokens::token_registry::TokenRegistryTrait;
 
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    static ENV_LOCK: Mutex<()> = Mutex::const_new(());
 
     struct EnvGuard {
         debt_prev: Option<String>,
@@ -227,7 +228,7 @@ mod tests {
 
     #[tokio::test]
     async fn decimals_error_maps_to_missing_icp_decimals() {
-        let _lock = ENV_LOCK.lock().expect("lock");
+        let _lock = ENV_LOCK.lock().await;
         let _env = EnvGuard::set("icp:aaaaa-aa:ICP", "icp:aaaaa-aa:ICP");
 
         let mut icp = MockIcpBackend::new();
@@ -251,7 +252,7 @@ mod tests {
 
     #[tokio::test]
     async fn fee_error_maps_to_missing_icp_fee() {
-        let _lock = ENV_LOCK.lock().expect("lock");
+        let _lock = ENV_LOCK.lock().await;
         let _env = EnvGuard::set("icp:aaaaa-aa:ICP", "icp:aaaaa-aa:ICP");
 
         let mut icp = MockIcpBackend::new();
@@ -276,7 +277,7 @@ mod tests {
 
     #[tokio::test]
     async fn bad_spec_maps_to_other() {
-        let _lock = ENV_LOCK.lock().expect("lock");
+        let _lock = ENV_LOCK.lock().await;
         let _env = EnvGuard::set("icp:bad-spec", "icp:bad-spec");
 
         let icp = MockIcpBackend::new();
@@ -296,7 +297,7 @@ mod tests {
 
     #[tokio::test]
     async fn happy_path_builds_registry() {
-        let _lock = ENV_LOCK.lock().expect("lock");
+        let _lock = ENV_LOCK.lock().await;
         let _env = EnvGuard::set("icp:aaaaa-aa:ICP", "icp:aaaaa-aa:ICP");
 
         let mut icp = MockIcpBackend::new();
