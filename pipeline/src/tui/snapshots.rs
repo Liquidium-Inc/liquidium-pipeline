@@ -61,7 +61,9 @@ pub(super) fn compute_profits_snapshot(export_path: &str, registry: &TokenRegist
         Ok(r) => r,
         Err(e) => {
             // Missing file is common on a fresh install.
-            if e.is_io_error() {
+            if let csv::ErrorKind::Io(io_err) = e.kind()
+                && io_err.kind() == std::io::ErrorKind::NotFound
+            {
                 return Ok(ProfitsSnapshot {
                     rows: vec![],
                     at: Local::now(),
