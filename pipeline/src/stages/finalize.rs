@@ -21,6 +21,8 @@ use liquidium_pipeline_connectors::pipeline_agent::PipelineAgent;
 use liquidium_pipeline_core::types::protocol_types::{LiquidationResult, ProtocolError, TransferStatus};
 
 const MAX_FINALIZER_ERRORS: i32 = 5;
+/// Maximum safe left-shift for `u64` multipliers in retry backoff.
+const MAX_U64_SHIFT: u32 = 63;
 
 /// Exponential retry delay with cap: min(max, base * 2^(errors-1)).
 fn retry_delay_secs(base: u64, max: u64, error_count: i32) -> u64 {
@@ -29,7 +31,11 @@ fn retry_delay_secs(base: u64, max: u64, error_count: i32) -> u64 {
     }
     let capped_max = max.max(base);
     let exponent = error_count.saturating_sub(1).max(0) as u32;
-    let multiplier = if exponent >= 63 { u64::MAX } else { 1u64 << exponent };
+    let multiplier = if exponent >= MAX_U64_SHIFT {
+        u64::MAX
+    } else {
+        1u64 << exponent
+    };
     base.saturating_mul(multiplier).min(capped_max)
 }
 
@@ -346,9 +352,10 @@ mod tests {
     use crate::finalizers::profit_calculator::SimpleProfitCalculator;
     use crate::persistance::{LiqResultRecord, MockWalStore, ResultStatus};
     use crate::stages::executor::ExecutionStatus;
+    use crate::swappers::model::SwapRequest;
     use candid::{Encode, Nat};
     use liquidium_pipeline_connectors::pipeline_agent::MockPipelineAgent;
-    use liquidium_pipeline_core::tokens::chain_token::ChainToken;
+    use liquidium_pipeline_core::tokens::{chain_token::ChainToken, chain_token_amount::ChainTokenAmount};
     use liquidium_pipeline_core::types::protocol_types::{
         AssetType, LiquidationAmounts, LiquidationRequest, LiquidationResult, LiquidationStatus, TransferStatus,
         TxStatus,
@@ -424,6 +431,17 @@ mod tests {
                 tx_id: None,
                 status: collateral_status,
             },
+        }
+    }
+
+    fn make_swap_request(request: &ExecutorRequest) -> SwapRequest {
+        SwapRequest {
+            pay_asset: request.collateral_asset.asset_id(),
+            pay_amount: ChainTokenAmount::from_formatted(request.collateral_asset.clone(), 1.0),
+            receive_asset: request.debt_asset.asset_id(),
+            receive_address: Some("dest".to_string()),
+            max_slippage_bps: Some(100),
+            venue_hint: None,
         }
     }
 
@@ -579,5 +597,104 @@ mod tests {
         let outcomes = stage.process(&()).await.expect("process should succeed");
         assert_eq!(outcomes.len(), 1, "should finalize after collateral success");
         assert!(matches!(outcomes[0].status, ExecutionStatus::Success));
+    }
+
+    #[tokio::test]
+    async fn finalize_skips_retryable_rows_until_backoff_window_expires() {
+        let liq_id = 88u128;
+        let mut request = make_request();
+        request.swap_args = Some(make_swap_request(&request));
+        let receipt = ExecutionReceipt {
+            request,
+            liquidation_result: Some(make_liq_result(liq_id, TransferStatus::Success, 0)),
+            status: ExecutionStatus::Success,
+            change_received: true,
+        };
+        let mut row = make_row(liq_id, receipt);
+        row.status = ResultStatus::FailedRetryable;
+        row.error_count = 3;
+        row.updated_at = now_ts();
+
+        let mut wal = MockWalStore::new();
+        wal.expect_get_pending()
+            .with(eq(100usize))
+            .times(1)
+            .returning(move |_| Ok(vec![row.clone()]));
+        wal.expect_update_status().times(0);
+        wal.expect_get_result().times(0);
+        wal.expect_upsert_result().times(0);
+
+        let finalize_calls = Arc::new(Mutex::new(0usize));
+        let finalizer = NoopFinalizer {
+            calls: finalize_calls.clone(),
+        };
+
+        let stage = FinalizeStage::new(
+            Arc::new(wal),
+            Arc::new(finalizer),
+            Arc::new(SimpleProfitCalculator),
+            Arc::new(MockPipelineAgent::new()),
+            Principal::anonymous(),
+            5,
+            120,
+        );
+
+        let outcomes = stage.process(&()).await.expect("process should succeed");
+        assert!(outcomes.is_empty(), "backoff-gated rows should not finalize");
+        assert_eq!(*finalize_calls.lock().expect("calls lock"), 0);
+    }
+
+    #[tokio::test]
+    async fn finalize_processes_retryable_rows_after_backoff_window_expires() {
+        let liq_id = 89u128;
+        let mut request = make_request();
+        request.swap_args = Some(make_swap_request(&request));
+        let receipt = ExecutionReceipt {
+            request,
+            liquidation_result: Some(make_liq_result(liq_id, TransferStatus::Success, 0)),
+            status: ExecutionStatus::Success,
+            change_received: true,
+        };
+        let mut row = make_row(liq_id, receipt);
+        row.status = ResultStatus::FailedRetryable;
+        row.error_count = 3;
+        row.updated_at = now_ts().saturating_sub(1_000);
+
+        let row_for_pending = row.clone();
+        let row_id = row.id.clone();
+        let mut wal = MockWalStore::new();
+        wal.expect_get_pending()
+            .with(eq(100usize))
+            .times(1)
+            .returning(move |_| Ok(vec![row_for_pending.clone()]));
+        wal.expect_update_status()
+            .withf(move |id, status, _| id == row_id && *status == ResultStatus::InFlight)
+            .times(1)
+            .returning(|_, _, _| Ok(()));
+        wal.expect_update_status()
+            .withf(|_, status, _| *status == ResultStatus::Succeeded)
+            .times(1)
+            .returning(|_, _, _| Ok(()));
+        wal.expect_get_result().times(0);
+        wal.expect_upsert_result().times(0);
+
+        let finalize_calls = Arc::new(Mutex::new(0usize));
+        let finalizer = NoopFinalizer {
+            calls: finalize_calls.clone(),
+        };
+
+        let stage = FinalizeStage::new(
+            Arc::new(wal),
+            Arc::new(finalizer),
+            Arc::new(SimpleProfitCalculator),
+            Arc::new(MockPipelineAgent::new()),
+            Principal::anonymous(),
+            5,
+            120,
+        );
+
+        let outcomes = stage.process(&()).await.expect("process should succeed");
+        assert_eq!(outcomes.len(), 1, "backoff-expired row should finalize");
+        assert_eq!(*finalize_calls.lock().expect("calls lock"), 1);
     }
 }
