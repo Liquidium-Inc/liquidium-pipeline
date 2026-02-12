@@ -773,6 +773,35 @@ pub(super) async fn handle_key(
     Ok(false)
 }
 
+pub(super) fn handle_paste(app: &mut App, text: String) {
+    let mut chars = text.chars().filter(|c| !c.is_control());
+
+    if let Some(input) = app.bad_debt_confirm_input.as_mut() {
+        while input.len() < 16 {
+            let Some(c) = chars.next() else {
+                break;
+            };
+            input.push(c);
+        }
+        return;
+    }
+
+    if matches!(app.tab, Tab::Balances)
+        && matches!(app.balances_panel, BalancesPanel::Withdraw)
+        && let Some(editing) = app.withdraw.editing
+    {
+        match editing {
+            WithdrawField::Amount => {
+                app.withdraw.amount.extend(chars);
+            }
+            WithdrawField::ManualDestination => {
+                app.withdraw.manual_destination.extend(chars);
+            }
+            _ => {}
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{scroll_dashboard_logs_up, scroll_logs_up};
@@ -823,34 +852,5 @@ mod tests {
 
         app.dashboard_logs_scroll = u16::MAX;
         assert!(scroll_dashboard_logs_up(&mut app, 1));
-    }
-}
-
-pub(super) fn handle_paste(app: &mut App, text: String) {
-    let mut chars = text.chars().filter(|c| !c.is_control());
-
-    if let Some(input) = app.bad_debt_confirm_input.as_mut() {
-        while input.len() < 16 {
-            let Some(c) = chars.next() else {
-                break;
-            };
-            input.push(c);
-        }
-        return;
-    }
-
-    if matches!(app.tab, Tab::Balances)
-        && matches!(app.balances_panel, BalancesPanel::Withdraw)
-        && let Some(editing) = app.withdraw.editing
-    {
-        match editing {
-            WithdrawField::Amount => {
-                app.withdraw.amount.extend(chars);
-            }
-            WithdrawField::ManualDestination => {
-                app.withdraw.manual_destination.extend(chars);
-            }
-            _ => {}
-        }
     }
 }
