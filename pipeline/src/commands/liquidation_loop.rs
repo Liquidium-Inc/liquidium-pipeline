@@ -2,11 +2,9 @@ use icrc_ledger_types::icrc1::account::Account;
 use std::{
     path::PathBuf,
     sync::{Arc, atomic::AtomicBool},
-    time::{Duration, Instant},
+    time::Duration,
 };
-use tokio::sync::{mpsc, watch};
-use tokio::time::sleep;
-use tracing::{Instrument, info_span, instrument};
+use tracing::instrument;
 use tracing::{info, warn};
 
 use crate::{
@@ -19,13 +17,12 @@ use crate::{
     executors::basic::basic_executor::BasicExecutor,
     finalizers::{
         cex_finalizer::CexFinalizerLogic, hybrid::hybrid_finalizer::HybridFinalizer,
-        kong_swap::kong_swap_finalizer::KongSwapFinalizer, liquidation_outcome::LiquidationOutcome,
-        mexc::mexc_finalizer::MexcFinalizer, profit_calculator::SimpleProfitCalculator,
+        kong_swap::kong_swap_finalizer::KongSwapFinalizer, mexc::mexc_finalizer::MexcFinalizer,
+        profit_calculator::SimpleProfitCalculator,
     },
     liquidation::collateral_service::CollateralService,
     persistance::sqlite::SqliteWalStore,
     price_oracle::price_oracle::LiquidationPriceOracle,
-    stage::PipelineStage,
     stages::{
         export::ExportStage, finalize::FinalizeStage, opportunity::OpportunityFinder,
         settlement_watcher::SettlementWatcher, simple_strategy::SimpleLiquidationStrategy,
@@ -299,131 +296,6 @@ pub enum LoopControl {
     Running,
     Paused,
     Stopping,
-}
-
-#[allow(dead_code)]
-#[derive(Debug, Clone)]
-pub enum LoopEvent {
-    Log(String),
-    Error(String),
-    Outcomes(Vec<LiquidationOutcome>),
-}
-
-#[allow(dead_code)]
-pub async fn run_liquidation_loop_controlled(
-    ctx: Arc<PipelineContext>,
-    mut control_rx: watch::Receiver<LoopControl>,
-    event_tx: mpsc::UnboundedSender<LoopEvent>,
-) -> Result<(), String> {
-    let config = ctx.config.clone();
-
-    let (finder, strategy, executor, exporter, finalizer) = init(ctx.clone()).await?;
-
-    let watcher_wal = Arc::new(
-        SqliteWalStore::new_with_busy_timeout(&config.db_path, 30_000)
-            .map_err(|e| format!("could not connect to db: {e}"))?,
-    );
-    let watcher = SettlementWatcher::new(
-        watcher_wal,
-        ctx.agent.clone(),
-        ctx.swap_router.clone(),
-        config.lending_canister,
-        Duration::from_secs(3),
-        config.swapper,
-    );
-    tokio::spawn(async move { watcher.run().await });
-
-    let debt_asset_principals = debt_asset_principals(&ctx.registry);
-    let debt_assets = debt_assets_as_text(&debt_asset_principals);
-
-    let _ = event_tx.send(LoopEvent::Log("engine initialized (paused by default)".to_string()));
-
-    // Setup liquidity monitor
-    let liq_dog = account_monitor_watchdog(Duration::from_secs(5), ctx.config.liquidator_principal);
-    let mut last_scan_log = Instant::now()
-        .checked_sub(Duration::from_secs(3600))
-        .unwrap_or_else(Instant::now);
-
-    loop {
-        let control = *control_rx.borrow();
-        match control {
-            LoopControl::Stopping => {
-                let _ = event_tx.send(LoopEvent::Log("engine stopping".to_string()));
-                break;
-            }
-            LoopControl::Running => {
-                let now = Instant::now();
-                if now.duration_since(last_scan_log) >= Duration::from_secs(30) {
-                    let _ = event_tx.send(LoopEvent::Log("scanning for liquidation opportunities...".to_string()));
-                    last_scan_log = now;
-                }
-
-                let opportunities = finder.process(&debt_assets).await.unwrap_or_else(|e| {
-                    let _ = event_tx.send(LoopEvent::Error(format!("opportunity finder error: {e}")));
-                    vec![]
-                });
-
-                if !opportunities.is_empty() {
-                    let opp_count = opportunities.len();
-                    let _ = event_tx.send(LoopEvent::Log(format!("found {opp_count} opportunity(ies); executing")));
-
-                    async {
-                        let executions = strategy.process(&opportunities).await.unwrap_or_else(|e| {
-                            let _ = event_tx.send(LoopEvent::Error(format!("strategy error: {e}")));
-                            vec![]
-                        });
-
-                        if executions.is_empty() {
-                            let _ = event_tx.send(LoopEvent::Log(
-                                "no executable opportunities (waiting for funds/liquidity)".to_string(),
-                            ));
-                        }
-
-                        let _ = executor.process(&executions).await.unwrap_or_else(|e| {
-                            let _ = event_tx.send(LoopEvent::Error(format!("executor error: {e}")));
-                            vec![]
-                        });
-                    }
-                    .instrument(info_span!("liquidation.cycle", opportunities = opp_count))
-                    .await;
-                }
-            }
-            LoopControl::Paused => {
-                // Paused: do not start new liquidations. We still run finalization below to
-                // allow already-enqueued items to progress.
-            }
-        }
-
-        let outcomes = finalizer.process(&()).await.unwrap_or_else(|e| {
-            let _ = event_tx.send(LoopEvent::Error(format!("finalizer error: {e}")));
-            vec![]
-        });
-
-        if !outcomes.is_empty() {
-            if let Err(err) = exporter.process(&outcomes).await {
-                let _ = event_tx.send(LoopEvent::Error(format!("export error: {err}")));
-            }
-            let _ = event_tx.send(LoopEvent::Outcomes(outcomes));
-        }
-
-        // Send liquidity monitor heart beat
-        let _ = liq_dog.notify(WatchdogEvent::Heartbeat { stage: "TUI" }).await;
-
-        // Keep allowances fresh when actively running.
-        let control = *control_rx.borrow();
-        if matches!(control, LoopControl::Running)
-            && let Err(err) = executor.refresh_allowances(&debt_asset_principals).await
-        {
-            let _ = event_tx.send(LoopEvent::Error(format!("allowance refresh error: {err}")));
-        }
-
-        tokio::select! {
-            _ = sleep(Duration::from_secs(2)) => {},
-            _ = control_rx.changed() => {},
-        }
-    }
-
-    Ok(())
 }
 
 #[cfg(test)]

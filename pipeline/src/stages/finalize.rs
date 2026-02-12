@@ -9,7 +9,7 @@ use crate::finalizers::finalizer::{Finalizer, FinalizerResult};
 use crate::finalizers::liquidation_outcome::LiquidationOutcome;
 use crate::finalizers::profit_calculator::ProfitCalculator;
 
-use crate::persistance::{LiqMetaWrapper, ResultStatus, WalStore};
+use crate::persistance::{LiqMetaWrapper, ResultStatus, WalProfitSnapshot, WalStore};
 use crate::stage::PipelineStage;
 use crate::stages::executor::{ExecutionReceipt, ExecutionStatus};
 use crate::utils::now_ts;
@@ -102,16 +102,50 @@ where
     async fn update_receipt_meta(&self, liq_id: &str, receipt: &ExecutionReceipt) -> Result<(), String> {
         let row = self.wal.get_result(liq_id).await.map_err(|e| e.to_string())?;
         if let Some(mut row) = row {
-            let wrapper = LiqMetaWrapper {
+            let mut wrapper = decode_receipt_wrapper(&row)?.unwrap_or(LiqMetaWrapper {
                 receipt: receipt.clone(),
                 meta: Vec::new(),
                 finalizer_decision: None,
-            };
+                profit_snapshot: None,
+            });
+            wrapper.receipt = receipt.clone();
             encode_meta(&mut row, &wrapper)?;
             row.updated_at = now_ts();
             self.wal.upsert_result(row).await.map_err(|e| e.to_string())?;
         }
         Ok(())
+    }
+
+    async fn persist_profit_snapshot(
+        &self,
+        liq_id: &str,
+        receipt: &ExecutionReceipt,
+        expected_profit: i128,
+        realized_profit: i128,
+    ) -> Result<(), String> {
+        let row = self.wal.get_result(liq_id).await.map_err(|e| e.to_string())?;
+        let Some(mut row) = row else {
+            return Err(format!("missing WAL row for liq_id {liq_id}"));
+        };
+
+        let mut wrapper = decode_receipt_wrapper(&row)?.unwrap_or(LiqMetaWrapper {
+            receipt: receipt.clone(),
+            meta: Vec::new(),
+            finalizer_decision: None,
+            profit_snapshot: None,
+        });
+        wrapper.receipt = receipt.clone();
+        wrapper.profit_snapshot = Some(WalProfitSnapshot {
+            expected_profit_raw: expected_profit.to_string(),
+            realized_profit_raw: Some(realized_profit.to_string()),
+            debt_symbol: receipt.request.debt_asset.symbol().to_string(),
+            debt_decimals: receipt.request.debt_asset.decimals(),
+            updated_at: now_ts(),
+        });
+
+        encode_meta(&mut row, &wrapper)?;
+        row.updated_at = now_ts();
+        self.wal.upsert_result(row).await.map_err(|e| e.to_string())
     }
 }
 
@@ -329,6 +363,17 @@ where
             let expected_profit = self.profit_calc.expected(req, Some(liq));
             let realized_profit = self.profit_calc.realized(req, liq, fin_res.swap_result.as_ref());
 
+            if let Some(wal_id) = wal_id_by_liq.get(&liq.id) {
+                if let Err(err) = self
+                    .persist_profit_snapshot(wal_id, &receipt, expected_profit, realized_profit)
+                    .await
+                {
+                    warn!("Failed to persist WAL profit snapshot for liq_id {}: {}", liq.id, err);
+                }
+            } else {
+                warn!("Skipping WAL profit snapshot persistence: missing WAL id for liq_id {}", liq.id);
+            }
+
             outcomes.push(LiquidationOutcome {
                 request: req.clone(),
                 execution_receipt: receipt.clone(),
@@ -351,7 +396,9 @@ mod tests {
     use crate::executors::executor::ExecutorRequest;
     use crate::finalizers::finalizer::{Finalizer, FinalizerResult};
     use crate::finalizers::profit_calculator::SimpleProfitCalculator;
-    use crate::persistance::{LiqResultRecord, MockWalStore, ResultStatus};
+    use crate::persistance::{
+        FinalizerDecisionSnapshot, LiqMetaWrapper, LiqResultRecord, MockWalStore, ResultStatus, WalProfitSnapshot,
+    };
     use crate::stages::executor::ExecutionStatus;
     use crate::swappers::model::SwapRequest;
     use candid::{Encode, Nat};
@@ -461,6 +508,7 @@ mod tests {
             receipt,
             meta: Vec::new(),
             finalizer_decision: None,
+            profit_snapshot: None,
         };
         encode_meta(&mut row, &wrapper).expect("encode_meta should succeed");
         row
@@ -561,10 +609,10 @@ mod tests {
             .returning(move |_| Ok(vec![row_pending.clone()]));
         wal.expect_get_result()
             .withf(move |id| id == liq_id_str.as_str())
-            .times(1)
+            .times(2)
             .returning(move |_| Ok(Some(row_for_get.clone())));
 
-        wal.expect_upsert_result().times(1).returning(|_| Ok(()));
+        wal.expect_upsert_result().times(2).returning(|_| Ok(()));
         wal.expect_update_status()
             .withf(move |id, status, bump| {
                 id == liq_id_str_status.as_str() && *status == ResultStatus::Succeeded && *bump
@@ -689,6 +737,7 @@ mod tests {
         row.updated_at = now_ts().saturating_sub(ALREADY_ELAPSED_WINDOW_SECS);
 
         let row_for_pending = row.clone();
+        let row_for_get = row.clone();
         let row_id = row.id.clone();
         let mut wal = MockWalStore::new();
         wal.expect_get_pending()
@@ -703,8 +752,10 @@ mod tests {
             .withf(|_, status, _| *status == ResultStatus::Succeeded)
             .times(1)
             .returning(|_, _, _| Ok(()));
-        wal.expect_get_result().times(0);
-        wal.expect_upsert_result().times(0);
+        wal.expect_get_result()
+            .times(1)
+            .returning(move |_| Ok(Some(row_for_get.clone())));
+        wal.expect_upsert_result().times(1).returning(|_| Ok(()));
 
         let finalize_calls = Arc::new(Mutex::new(0usize));
         let finalizer = NoopFinalizer {
@@ -731,5 +782,142 @@ mod tests {
             "backoff-expired row should finalize"
         );
         assert_eq!(*finalize_calls.lock().expect("calls lock"), EXPECTED_FINALIZE_CALLS);
+    }
+
+    #[tokio::test]
+    async fn update_receipt_meta_preserves_wrapper_extensions() {
+        let liq_id = 901u128;
+        let old_receipt = ExecutionReceipt {
+            request: make_request(),
+            liquidation_result: Some(make_liq_result(liq_id, TransferStatus::Pending, 0)),
+            status: ExecutionStatus::CollateralTransferFailed("pending".to_string()),
+            change_received: true,
+        };
+        let new_receipt = ExecutionReceipt {
+            request: make_request(),
+            liquidation_result: Some(make_liq_result(liq_id, TransferStatus::Pending, 1)),
+            status: ExecutionStatus::CollateralTransferFailed("pending".to_string()),
+            change_received: true,
+        };
+
+        let mut row = LiqResultRecord {
+            id: liq_id.to_string(),
+            status: ResultStatus::Enqueued,
+            attempt: 0,
+            error_count: 0,
+            last_error: None,
+            created_at: 0,
+            updated_at: 0,
+            meta_json: "{}".to_string(),
+        };
+        let wrapper = LiqMetaWrapper {
+            receipt: old_receipt,
+            meta: vec![1, 2, 3],
+            finalizer_decision: Some(FinalizerDecisionSnapshot {
+                mode: "hybrid".to_string(),
+                chosen: "dex".to_string(),
+                reason: "test".to_string(),
+                min_required_bps: 10.0,
+                dex_preview_gross_bps: Some(12.0),
+                dex_preview_net_bps: Some(11.5),
+                cex_preview_gross_bps: None,
+                cex_preview_net_bps: None,
+                ts: 1,
+            }),
+            profit_snapshot: Some(WalProfitSnapshot {
+                expected_profit_raw: "10".to_string(),
+                realized_profit_raw: Some("9".to_string()),
+                debt_symbol: "ckBTC".to_string(),
+                debt_decimals: 8,
+                updated_at: 1,
+            }),
+        };
+        encode_meta(&mut row, &wrapper).expect("encode wrapper");
+
+        let row_for_get = row.clone();
+        let mut wal = MockWalStore::new();
+        wal.expect_get_result()
+            .withf(move |id| id == liq_id.to_string())
+            .times(1)
+            .returning(move |_| Ok(Some(row_for_get.clone())));
+        wal.expect_upsert_result().times(1).returning(|row| {
+            let wrapper = decode_receipt_wrapper(&row)
+                .expect("decode wrapper")
+                .expect("wrapper exists");
+            assert_eq!(wrapper.meta, vec![1, 2, 3]);
+            assert!(wrapper.finalizer_decision.is_some());
+            assert!(wrapper.profit_snapshot.is_some());
+            Ok(())
+        });
+
+        let stage = FinalizeStage::new(
+            Arc::new(wal),
+            Arc::new(NoopFinalizer {
+                calls: Arc::new(Mutex::new(0)),
+            }),
+            Arc::new(SimpleProfitCalculator),
+            Arc::new(MockPipelineAgent::new()),
+            Principal::anonymous(),
+            5,
+            120,
+        );
+
+        stage
+            .update_receipt_meta(&liq_id.to_string(), &new_receipt)
+            .await
+            .expect("receipt meta update should succeed");
+    }
+
+    #[tokio::test]
+    async fn finalize_persists_profit_snapshot_in_wal_meta() {
+        let liq_id = 902u128;
+        let receipt = ExecutionReceipt {
+            request: make_request(),
+            liquidation_result: Some(make_liq_result(liq_id, TransferStatus::Success, 0)),
+            status: ExecutionStatus::Success,
+            change_received: true,
+        };
+        let row = make_row(liq_id, receipt.clone());
+        let row_for_pending = row.clone();
+        let row_for_get = row.clone();
+
+        let mut wal = MockWalStore::new();
+        wal.expect_get_pending()
+            .with(eq(100usize))
+            .times(1)
+            .returning(move |_| Ok(vec![row_for_pending.clone()]));
+        wal.expect_update_status()
+            .withf(|_, status, bump| *status == ResultStatus::Succeeded && *bump)
+            .times(1)
+            .returning(|_, _, _| Ok(()));
+        wal.expect_get_result()
+            .times(1)
+            .returning(move |_| Ok(Some(row_for_get.clone())));
+        wal.expect_upsert_result().times(1).returning(|row| {
+            let wrapper = decode_receipt_wrapper(&row)
+                .expect("decode wrapper")
+                .expect("wrapper exists");
+            let snapshot = wrapper.profit_snapshot.expect("profit snapshot should be present");
+            assert_eq!(snapshot.expected_profit_raw, "0");
+            assert!(snapshot.realized_profit_raw.is_some());
+            assert_eq!(snapshot.debt_symbol, "ckBTC");
+            assert_eq!(snapshot.debt_decimals, 8);
+            Ok(())
+        });
+
+        let stage = FinalizeStage::new(
+            Arc::new(wal),
+            Arc::new(NoopFinalizer {
+                calls: Arc::new(Mutex::new(0)),
+            }),
+            Arc::new(SimpleProfitCalculator),
+            Arc::new(MockPipelineAgent::new()),
+            Principal::anonymous(),
+            5,
+            120,
+        );
+
+        let outcomes = stage.process(&()).await.expect("process should succeed");
+        assert_eq!(outcomes.len(), 1);
     }
 }

@@ -5,6 +5,8 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table, Wrap};
 use unicode_width::UnicodeWidthStr;
 
+use crate::persistance::ResultStatus;
+
 use super::super::app::{App, UiFocus};
 use super::super::format::format_i128_amount;
 
@@ -244,6 +246,48 @@ fn draw_profits_table(f: &mut Frame<'_>, area: Rect, app: &App) {
 
 fn draw_recent_outcomes_table(f: &mut Frame<'_>, area: Rect, app: &App) {
     if app.recent_outcomes.is_empty() {
+        if let Some(executions) = &app.executions
+            && !executions.rows.is_empty()
+        {
+            let header = Row::new(vec![
+                Cell::new("At"),
+                Cell::new("Status"),
+                Cell::new("Liq ID"),
+                Cell::new("Try"),
+            ])
+            .style(Style::default().add_modifier(Modifier::BOLD));
+
+            let max_rows = area.height.saturating_sub(1) as usize;
+            let rows = executions.rows.iter().take(max_rows.max(1)).map(|r| {
+                let at = chrono::DateTime::<chrono::Utc>::from_timestamp(r.updated_at, 0)
+                    .map(|dt| dt.with_timezone(&chrono::Local).format("%H:%M:%S").to_string())
+                    .unwrap_or_else(|| "-".to_string());
+                let status = status_short(r.status);
+                let status_style = status_style(r.status);
+
+                Row::new(vec![
+                    Cell::new(at),
+                    Cell::from(Span::styled(status, status_style)),
+                    Cell::new(truncate(&r.liq_id, 24)),
+                    Cell::new(r.attempt.to_string()),
+                ])
+            });
+
+            let table = Table::new(
+                rows,
+                [
+                    Constraint::Length(8),
+                    Constraint::Length(12),
+                    Constraint::Percentage(100),
+                    Constraint::Length(4),
+                ],
+            )
+            .header(header);
+
+            f.render_widget(table, area);
+            return;
+        }
+
         let w = Paragraph::new(format!(
             "No executed liquidations yet.\n(last batch: {})",
             app.last_outcomes
@@ -331,6 +375,28 @@ fn truncate_start(s: &str, max: usize) -> String {
         .rev()
         .collect();
     format!("…{}", tail)
+}
+
+fn status_short(status: ResultStatus) -> &'static str {
+    match status {
+        ResultStatus::Enqueued => "enqueued",
+        ResultStatus::InFlight => "inflight",
+        ResultStatus::Succeeded => "succeeded",
+        ResultStatus::FailedRetryable => "failed(r)",
+        ResultStatus::FailedPermanent => "failed(p)",
+        ResultStatus::WaitingCollateral => "wait_collat",
+        ResultStatus::WaitingProfit => "wait_profit",
+    }
+}
+
+fn status_style(status: ResultStatus) -> Style {
+    match status {
+        ResultStatus::Succeeded => Style::default().fg(Color::Green),
+        ResultStatus::FailedRetryable | ResultStatus::FailedPermanent => Style::default().fg(Color::Red),
+        ResultStatus::InFlight => Style::default().fg(Color::Yellow),
+        ResultStatus::WaitingCollateral | ResultStatus::WaitingProfit => Style::default().fg(Color::Cyan),
+        ResultStatus::Enqueued => Style::default().fg(Color::DarkGray),
+    }
 }
 
 fn draw_bad_debt_confirm(f: &mut Frame<'_>, area: Rect, app: &App) {

@@ -18,6 +18,7 @@ pub fn decode_receipt_wrapper(row: &LiqResultRecord) -> Result<Option<LiqMetaWra
                 receipt,
                 meta: Vec::new(),
                 finalizer_decision: None,
+                profit_snapshot: None,
             })),
             Err(receipt_err) => Err(format!(
                 "invalid meta_json for {}: wrapper_err={}; receipt_err={}",
@@ -190,6 +191,7 @@ mod tests {
             .expect("wrapper decode should succeed")
             .expect("wrapper should exist");
         assert!(wrapper.finalizer_decision.is_none());
+        assert!(wrapper.profit_snapshot.is_none());
     }
 
     #[test]
@@ -201,6 +203,37 @@ mod tests {
             .expect("fallback decode should succeed")
             .expect("wrapper should exist");
         assert!(wrapper.finalizer_decision.is_none());
+        assert!(wrapper.profit_snapshot.is_none());
         assert!(wrapper.meta.is_empty());
+    }
+
+    #[test]
+    fn decode_wrapper_with_profit_snapshot_round_trips() {
+        let receipt = make_receipt();
+        let row = make_row(
+            json!({
+                "receipt": receipt,
+                "meta": [],
+                "finalizer_decision": null,
+                "profit_snapshot": {
+                    "expected_profit_raw": "1000",
+                    "realized_profit_raw": "1200",
+                    "debt_symbol": "ckUSDT",
+                    "debt_decimals": 6,
+                    "updated_at": 123
+                }
+            })
+            .to_string(),
+        );
+
+        let wrapper = decode_receipt_wrapper(&row)
+            .expect("wrapper decode should succeed")
+            .expect("wrapper should exist");
+        let snapshot = wrapper.profit_snapshot.expect("profit snapshot should exist");
+        assert_eq!(snapshot.expected_profit_raw, "1000");
+        assert_eq!(snapshot.realized_profit_raw.as_deref(), Some("1200"));
+        assert_eq!(snapshot.debt_symbol, "ckUSDT");
+        assert_eq!(snapshot.debt_decimals, 6);
+        assert_eq!(snapshot.updated_at, 123);
     }
 }
