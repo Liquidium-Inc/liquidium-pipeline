@@ -218,6 +218,7 @@ impl<A: PipelineAgent, D: WalStore> BasicExecutor<A, D> {
         let wrapper = LiqMetaWrapper {
             receipt: receipt.clone(),
             meta: Vec::new(),
+            finalizer_decision: None,
         };
         let _ = encode_meta(&mut result_record, &wrapper);
         self.wal.upsert_result(result_record).map_err(|e| e.to_string()).await

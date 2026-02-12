@@ -737,6 +737,7 @@ mod tests {
         let wrapper = LiqMetaWrapper {
             receipt: receipt.clone(),
             meta: Vec::new(),
+            finalizer_decision: None,
         };
 
         let mut row = LiqResultRecord {
@@ -777,6 +778,7 @@ mod tests {
         let wrapper = LiqMetaWrapper {
             receipt: receipt.clone(),
             meta: Vec::new(),
+            finalizer_decision: None,
         };
 
         let mut row = LiqResultRecord {
@@ -926,6 +928,7 @@ mod tests {
         let wrapper = LiqMetaWrapper {
             receipt: receipt.clone(),
             meta: serde_json::to_vec(&legacy_value).expect("legacy meta encoding"),
+            finalizer_decision: None,
         };
 
         let mut row = LiqResultRecord {

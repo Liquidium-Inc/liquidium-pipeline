@@ -3,6 +3,7 @@ use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table, Wrap};
+use unicode_width::UnicodeWidthStr;
 
 use super::super::app::{App, UiFocus};
 use super::super::format::format_i128_amount;
@@ -36,11 +37,13 @@ pub(super) fn draw_dashboard(f: &mut Frame<'_>, area: Rect, app: &App) {
 fn draw_recent_logs(f: &mut Frame<'_>, area: Rect, app: &App) {
     let lines: Vec<Line> = app.logs.iter().map(|l| super::logs::log_to_line(l)).collect();
     let height = area.height.saturating_sub(2) as usize;
-    let max_scroll = lines.len().saturating_sub(height) as u16;
-    let (scroll, scroll_x) = if !app.dashboard_logs_scroll_active || app.dashboard_logs_follow {
-        (max_scroll, 0)
+    let content_width = area.width.saturating_sub(2) as usize;
+    let wrapped_lines = super::logs::estimate_wrapped_log_lines(&app.logs, content_width);
+    let max_scroll = wrapped_lines.saturating_sub(height) as u16;
+    let scroll = if !app.dashboard_logs_scroll_active || app.dashboard_logs_follow {
+        max_scroll
     } else {
-        (max_scroll.saturating_sub(app.dashboard_logs_scroll), app.dashboard_logs_scroll_x)
+        max_scroll.saturating_sub(app.dashboard_logs_scroll)
     };
 
     let title = if let Some(err) = &app.last_error {
@@ -62,7 +65,10 @@ fn draw_recent_logs(f: &mut Frame<'_>, area: Rect, app: &App) {
         block = block.border_style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD));
     }
 
-    let w = Paragraph::new(lines).block(block).scroll((scroll, scroll_x));
+    let w = Paragraph::new(lines)
+        .block(block)
+        .scroll((scroll, 0))
+        .wrap(Wrap { trim: false });
     f.render_widget(w, area);
 }
 
@@ -325,7 +331,7 @@ fn truncate_start(s: &str, max: usize) -> String {
         return "…".to_string();
     }
 
-    let len = s.chars().count();
+    let len = s.width();
     if len <= max {
         return s.to_string();
     }
@@ -346,7 +352,7 @@ fn truncate_middle(s: &str, max: usize) -> String {
         return "…".to_string();
     }
 
-    let len = s.chars().count();
+    let len = s.width();
     if len <= max {
         return s.to_string();
     }

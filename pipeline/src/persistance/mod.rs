@@ -1,6 +1,6 @@
 use anyhow::Result;
 use async_trait::async_trait;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::stages::executor::ExecutionReceipt;
 pub mod sqlite;
@@ -21,6 +21,21 @@ pub enum ResultStatus {
 pub struct LiqMetaWrapper {
     pub receipt: ExecutionReceipt,
     pub meta: Vec<u8>,
+    #[serde(default)]
+    pub finalizer_decision: Option<FinalizerDecisionSnapshot>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct FinalizerDecisionSnapshot {
+    pub mode: String,
+    pub chosen: String,
+    pub reason: String,
+    pub min_required_bps: f64,
+    pub dex_preview_gross_bps: Option<f64>,
+    pub dex_preview_net_bps: Option<f64>,
+    pub cex_preview_gross_bps: Option<f64>,
+    pub cex_preview_net_bps: Option<f64>,
+    pub ts: i64,
 }
 
 #[derive(Debug, Clone)]
