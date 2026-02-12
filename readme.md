@@ -402,6 +402,9 @@ Default control socket path:
 - Linux: `/run/liquidator/ctl.sock`
 - non-Linux: `<temp>/liquidator/ctl.sock`
 
+Linux note (non-systemd runs): `/run/liquidator` may not exist or may not be writable.
+If you are not using systemd `RuntimeDirectory`, either create `/run/liquidator` with appropriate ownership/permissions, or pass a user-writable socket path via `--sock-path` (for example `--sock-path /tmp/liquidator/ctl.sock`).
+
 ### Start the TUI
 
 ```bash
@@ -540,9 +543,12 @@ Use the sample unit at `dev/liquidator.service`:
 [Service]
 RuntimeDirectory=liquidator
 RuntimeDirectoryMode=0770
-ExecStart=/usr/local/bin/liquidator run --sock-path /run/liquidator/ctl.sock
+ExecStart=/home/liquidator/.local/bin/liquidator run --sock-path /run/liquidator/ctl.sock
 Restart=always
 ```
+
+Use an absolute binary path in `ExecStart` (systemd does not expand `~`).
+If you installed with `install.sh`, the typical binary entrypoint is `~/.local/bin/liquidator` for that user; resolve it with `command -v liquidator` and place that absolute path in the unit.
 
 Validate daemon logs:
 
@@ -562,9 +568,18 @@ Convenience installer for Linux:
 ./dev/install-daemon.sh
 ```
 
+`install-daemon.sh` requires sudo/root because it writes `/etc/systemd/system/*.service`,
+may create the `liquidator` user/group, runs `systemctl daemon-reload`, enables the unit,
+and restarts it.
+
 This installs/updates `/etc/systemd/system/liquidator.service`, creates the
 `liquidator` user/group if missing, runs `systemctl daemon-reload`, enables the
 unit, and restarts it.
+
+How binary path is handled:
+- `install-daemon.sh` does **not** copy the binary into `/usr/local/bin`.
+- It uses `--bin-path` if provided; otherwise it uses `command -v liquidator` and writes that absolute path into `ExecStart`.
+- The separate `install.sh` script builds a release binary under `~/.liquidium-pipeline/releases/...` and symlinks `~/.local/bin/liquidator` to it.
 
 Linux non-service mode with file tail:
 
