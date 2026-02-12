@@ -90,9 +90,7 @@ impl<B: IcpBackend + Send + Sync> TransferActions for IcpTransferAdapter<B> {
             (ChainToken::Icp { .. }, _) => Err(TransferError::UnsupportedDestination {
                 details: "destination chain must be ICP".to_string(),
             }),
-            _ => Err(TransferError::UnsupportedToken {
-                token: token.clone(),
-            }),
+            _ => Err(TransferError::UnsupportedToken { token: token.clone() }),
         }
     }
 
@@ -125,9 +123,7 @@ impl<B: IcpBackend + Send + Sync> TransferActions for IcpTransferAdapter<B> {
             (ChainToken::Icp { .. }, _) => Err(TransferError::UnsupportedDestination {
                 details: "spender must be an ICP account".to_string(),
             }),
-            _ => Err(TransferError::UnsupportedToken {
-                token: token.clone(),
-            }),
+            _ => Err(TransferError::UnsupportedToken { token: token.clone() }),
         }
     }
 }

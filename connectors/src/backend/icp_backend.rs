@@ -16,11 +16,15 @@ use serde::{Deserialize, de::DeserializeOwned};
 pub trait IcpBackend: Send + Sync {
     async fn icrc1_balance(&self, ledger: Principal, account: &Account) -> ConnectorResult<Nat>;
 
-    async fn icrc1_transfer(&self, ledger: Principal, from: &Account, to: &Account, amount: Nat)
-    -> ConnectorResult<Nat>;
+    async fn icrc1_transfer(
+        &self,
+        ledger: Principal,
+        from: &Account,
+        to: &Account,
+        amount: Nat,
+    ) -> ConnectorResult<Nat>;
 
-    async fn icp_transfer(&self, ledger: Principal, to_account_id_hex: &str, amount_e8s: Nat)
-    -> ConnectorResult<u64>;
+    async fn icp_transfer(&self, ledger: Principal, to_account_id_hex: &str, amount_e8s: Nat) -> ConnectorResult<u64>;
 
     async fn icrc1_decimals(&self, ledger: Principal) -> ConnectorResult<u8>;
     async fn icrc1_fee(&self, ledger: Principal) -> ConnectorResult<Nat>;
@@ -41,8 +45,7 @@ impl<A: PipelineAgent> IcpBackendImpl<A> {
     where
         R: CandidType + DeserializeOwned + 'static,
     {
-        let arg_blob =
-            Encode!(&arg).map_err(|e| ConnectorError::backend(format!("encode args: {e}")))?;
+        let arg_blob = Encode!(&arg).map_err(|e| ConnectorError::backend(format!("encode args: {e}")))?;
         self.agent.call_query::<R>(&ledger, method, arg_blob).await
     }
 
@@ -50,8 +53,7 @@ impl<A: PipelineAgent> IcpBackendImpl<A> {
     where
         R: CandidType + DeserializeOwned + 'static,
     {
-        let arg_blob =
-            Encode!(&arg).map_err(|e| ConnectorError::backend(format!("encode args: {e}")))?;
+        let arg_blob = Encode!(&arg).map_err(|e| ConnectorError::backend(format!("encode args: {e}")))?;
         self.agent.call_update::<R>(&ledger, method, arg_blob).await
     }
 }
@@ -85,12 +87,7 @@ impl<A: PipelineAgent> IcpBackend for IcpBackendImpl<A> {
         }
     }
 
-    async fn icp_transfer(
-        &self,
-        ledger: Principal,
-        to_account_id_hex: &str,
-        amount_e8s: Nat,
-    ) -> ConnectorResult<u64> {
+    async fn icp_transfer(&self, ledger: Principal, to_account_id_hex: &str, amount_e8s: Nat) -> ConnectorResult<u64> {
         #[derive(CandidType, Deserialize, Debug)]
         struct Tokens {
             e8s: u64,

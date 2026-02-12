@@ -81,10 +81,13 @@ where
                 source: e.to_string(),
             })?;
 
-        let fee = icp_backend.icrc1_fee(ledger).await.map_err(|e| RegistryLoadError::MissingIcpFee {
-            spec: spec.to_string(),
-            source: e.to_string(),
-        })?;
+        let fee = icp_backend
+            .icrc1_fee(ledger)
+            .await
+            .map_err(|e| RegistryLoadError::MissingIcpFee {
+                spec: spec.to_string(),
+                source: e.to_string(),
+            })?;
 
         Ok(ChainToken::Icp {
             ledger,
@@ -204,10 +207,7 @@ mod tests {
                 std::env::set_var("DEBT_ASSETS", debt);
                 std::env::set_var("COLLATERAL_ASSETS", coll);
             }
-            Self {
-                debt_prev,
-                coll_prev,
-            }
+            Self { debt_prev, coll_prev }
         }
     }
 
@@ -233,12 +233,11 @@ mod tests {
         let _env = EnvGuard::set("icp:aaaaa-aa:ICP", "icp:aaaaa-aa:ICP");
 
         let mut icp = MockIcpBackend::new();
-        icp.expect_icrc1_decimals()
-            .returning(|_| {
-                Err(ConnectorError::InvalidInput {
-                    message: "decimals-failed".to_string(),
-                })
-            });
+        icp.expect_icrc1_decimals().returning(|_| {
+            Err(ConnectorError::InvalidInput {
+                message: "decimals-failed".to_string(),
+            })
+        });
 
         let evm = MockEvmBackend::new();
 
@@ -262,12 +261,11 @@ mod tests {
 
         let mut icp = MockIcpBackend::new();
         icp.expect_icrc1_decimals().returning(|_| Ok(8));
-        icp.expect_icrc1_fee()
-            .returning(|_| {
-                Err(ConnectorError::InvalidInput {
-                    message: "fee-failed".to_string(),
-                })
-            });
+        icp.expect_icrc1_fee().returning(|_| {
+            Err(ConnectorError::InvalidInput {
+                message: "fee-failed".to_string(),
+            })
+        });
 
         let evm = MockEvmBackend::new();
 

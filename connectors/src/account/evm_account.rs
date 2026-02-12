@@ -36,7 +36,11 @@ impl<B: EvmBackend> AccountInfo for EvmAccountInfoAdapter<B> {
     async fn get_balance(&self, token: &ChainToken) -> Result<ChainTokenAmount, AccountError> {
         match token {
             ChainToken::EvmNative { chain, .. } => {
-                let amount_native = self.backend.native_balance(chain).await.map_err(AccountError::backend)?;
+                let amount_native = self
+                    .backend
+                    .native_balance(chain)
+                    .await
+                    .map_err(AccountError::backend)?;
 
                 Ok(ChainTokenAmount {
                     token: token.clone(),

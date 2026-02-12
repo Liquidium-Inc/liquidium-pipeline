@@ -14,7 +14,7 @@ use crate::swappers::kong::kong_swapper::DEX_PRINCIPAL;
 use crate::swappers::swap_interface::SwapInterface;
 
 use candid::{Int, Nat, Principal};
-use futures::TryFutureExt;
+use liquidium_pipeline_commons::error::ErrorCode;
 use liquidium_pipeline_core::{
     balance_service::BalanceService,
     tokens::{
@@ -31,10 +31,43 @@ use crate::swappers::model::SwapRequest;
 use crate::utils::max_for_ledger;
 use crate::watchdog::{Watchdog, WatchdogEvent, noop_watchdog};
 use async_trait::async_trait;
+use thiserror::Error;
 
 use itertools::Itertools;
 
 const WIPEOUT_THRESHOLD: u32 = 975;
+
+fn coded(code: ErrorCode, message: impl Into<String>) -> String {
+    format!("{} (code={})", message.into(), code.as_u16())
+}
+
+type StrategyResult<T> = Result<T, StrategyError>;
+
+#[derive(Debug, Error, PartialEq, Eq)]
+pub(crate) enum StrategyError {
+    #[error("could not get balance: {details}")]
+    BalanceFetch { details: String },
+    #[error("invalid asset type")]
+    InvalidAssetType,
+    #[error("liquidation amount calculation failed: {details}")]
+    LiquidationEstimation { details: String },
+}
+
+impl StrategyError {
+    fn code(&self) -> ErrorCode {
+        match self {
+            StrategyError::BalanceFetch { .. } => ErrorCode::PipelineExecution,
+            StrategyError::InvalidAssetType => ErrorCode::PipelineExecution,
+            StrategyError::LiquidationEstimation { .. } => ErrorCode::PipelineExecution,
+        }
+    }
+}
+
+impl From<StrategyError> for String {
+    fn from(value: StrategyError) -> Self {
+        coded(value.code(), value.to_string())
+    }
+}
 
 fn resolve_token_for_position(registry: &dyn TokenRegistryTrait, pos: &LiquidateblePosition) -> Option<ChainToken> {
     match pos.asset_type {
@@ -168,7 +201,7 @@ where
     }
 
     // Helper: Prefetch balances for all debt assets we might need
-    async fn prefetch_balances_for_users(&self, users: &[LiquidatebleUser]) -> Result<HashMap<String, Nat>, String> {
+    async fn prefetch_balances_for_users(&self, users: &[LiquidatebleUser]) -> StrategyResult<HashMap<String, Nat>> {
         let mut debt_assets: HashSet<ChainToken> = HashSet::new();
         for user in users.iter() {
             for pos in user.positions.iter() {
@@ -185,8 +218,8 @@ where
             let balance = self
                 .account_service
                 .get_balance(&asset.asset_id())
-                .map_err(|_| "Could not get balance".to_string())
-                .await?
+                .await
+                .map_err(|e| StrategyError::BalanceFetch { details: e.to_string() })?
                 .value;
 
             balances.insert(asset.asset_id().address, balance);
@@ -253,7 +286,7 @@ where
         work_users: &mut [LiquidatebleUser],
         result: &mut Vec<ExecutorRequest>,
         cleared_debts: &HashSet<String>,
-    ) -> Result<(), String> {
+    ) -> StrategyResult<()> {
         if bad_debts.is_empty() {
             return Ok(());
         }
@@ -280,7 +313,7 @@ where
             }
 
             if !matches!(debt_position.asset_type, AssetType::CkAsset(_)) {
-                return Err("invalid asset type".to_string());
+                return Err(StrategyError::InvalidAssetType);
             }
 
             let repayment_token = if let Some(tok) = resolve_token_for_position(self.registry.as_ref(), &debt_position)
@@ -386,35 +419,17 @@ where
 
         Ok(())
     }
-}
 
-#[async_trait]
-impl<'a, T, C, R, U> PipelineStage<'a, Vec<LiquidatebleUser>, Vec<ExecutorRequest>>
-    for SimpleLiquidationStrategy<T, C, R, U>
-where
-    T: SwapInterface,
-    C: ConfigTrait,
-    R: TokenRegistryTrait + 'static,
-    U: CollateralServiceTrait,
-{
-    async fn process(&self, users: &'a Vec<LiquidatebleUser>) -> Result<Vec<ExecutorRequest>, String> {
+    pub(crate) async fn process_typed(&self, users: &[LiquidatebleUser]) -> StrategyResult<Vec<ExecutorRequest>> {
         let mut result: Vec<ExecutorRequest> = Vec::new();
 
-        // Prefetch balances for all debt assets we might need
         let mut balances = self.prefetch_balances_for_users(users).await?;
-
-        // Take smallest hf first
         let users_sorted: Vec<LiquidatebleUser> = self.sort_users_by_health(users);
-
-        // Working copy of users for in-loop mutation
         let mut work_users: Vec<LiquidatebleUser> = users_sorted.clone();
 
-        // Build all candidate (user_idx, debt_position, collateral_position) combinations,
-        // and collect pure bad-debt positions.
         let (mut combos, bad_debts) = self.build_combos(&work_users);
         let mut cleared_debts: HashSet<String> = HashSet::new();
 
-        // Sort by most urgent first: lowest health factor, then largest debt, then largest collateral
         combos.sort_by(|(i1, d1, c1), (i2, d2, c2)| {
             work_users[*i1]
                 .health_factor
@@ -436,7 +451,7 @@ where
             if !matches!(debt_position.asset_type, AssetType::CkAsset(_))
                 || !matches!(collateral_position.asset_type, AssetType::CkAsset(_))
             {
-                return Err("invalid asset type".to_string());
+                return Err(StrategyError::InvalidAssetType);
             }
 
             let repayment_token = if let Some(tok) = resolve_token_for_position(self.registry.as_ref(), &debt_position)
@@ -506,7 +521,8 @@ where
                     &collateral_position,
                     &mut work_users[user_idx],
                 )
-                .await?;
+                .await
+                .map_err(|e| StrategyError::LiquidationEstimation { details: e.to_string() })?;
 
             estimation.received_collateral = if estimation.received_collateral < collateral_token.fee() {
                 0u64.into()
@@ -695,11 +711,24 @@ where
             }
         }
 
-        // After handling normal collateral-backed combos, handle pure bad-debt positions.
         self.handle_bad_debt_positions(bad_debts, &mut balances, &mut work_users, &mut result, &cleared_debts)
             .await?;
 
         Ok(result)
+    }
+}
+
+#[async_trait]
+impl<'a, T, C, R, U> PipelineStage<'a, Vec<LiquidatebleUser>, Vec<ExecutorRequest>>
+    for SimpleLiquidationStrategy<T, C, R, U>
+where
+    T: SwapInterface,
+    C: ConfigTrait,
+    R: TokenRegistryTrait + 'static,
+    U: CollateralServiceTrait,
+{
+    async fn process(&self, users: &'a Vec<LiquidatebleUser>) -> Result<Vec<ExecutorRequest>, String> {
+        self.process_typed(users).await.map_err(String::from)
     }
 }
 #[cfg(test)]
@@ -900,9 +929,9 @@ mod tests {
         let pos = mk_position(pool, borrower, ledger, 1_000, 2_000, Assets::USDC);
         let user = mk_user(vec![pos], 1_000, 900);
 
-        let res = strategy.process(&vec![user]).await;
+        let res = strategy.process_typed(&vec![user]).await;
         assert!(res.is_err());
-        assert_eq!(res.unwrap_err(), "Could not get balance");
+        assert!(matches!(res.unwrap_err(), StrategyError::BalanceFetch { .. }));
     }
 
     // Errors on unsupported asset type.
@@ -970,9 +999,9 @@ mod tests {
         };
 
         let user = mk_user(vec![pos], 1_000, 900);
-        let res = strategy.process(&vec![user]).await;
+        let res = strategy.process_typed(&vec![user]).await;
         assert!(res.is_err());
-        assert_eq!(res.unwrap_err(), "invalid asset type");
+        assert!(matches!(res.unwrap_err(), StrategyError::InvalidAssetType));
     }
 
     // HF at or above 1000: no liquidation attempts.

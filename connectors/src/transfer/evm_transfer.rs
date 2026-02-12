@@ -58,9 +58,7 @@ impl<B: EvmBackend + Send + Sync> TransferActions for EvmTransferAdapter<B> {
                     details: "destination chain must be EVM".to_string(),
                 })
             }
-            _ => Err(TransferError::UnsupportedToken {
-                token: token.clone(),
-            }),
+            _ => Err(TransferError::UnsupportedToken { token: token.clone() }),
         }
     }
 

@@ -78,16 +78,7 @@ pub enum ConfigError {
 
 impl CodedError for ConfigError {
     fn code(&self) -> ErrorCode {
-        match self {
-            ConfigError::MissingEnv { .. } => ErrorCode::ConfigMissingEnv,
-            ConfigError::InvalidPrincipal { .. } => ErrorCode::ConfigInvalidPrincipal,
-            ConfigError::ReadMnemonic { .. } => ErrorCode::ConfigReadMnemonic,
-            ConfigError::DeriveIdentity { .. } | ConfigError::DerivePrincipal { .. } => {
-                ErrorCode::ConfigDeriveIdentity
-            }
-            ConfigError::DeriveEvmKey { .. } => ErrorCode::ConfigDeriveEvmKey,
-            ConfigError::MissingCexCredentials { .. } => ErrorCode::ConfigMissingCexCredentials,
-        }
+        ErrorCode::PipelineConfig
     }
 }
 
@@ -254,9 +245,7 @@ impl ConfigTrait for Config {
         self.cex_credentials
             .get(cex)
             .cloned()
-            .ok_or_else(|| ConfigError::MissingCexCredentials {
-                cex: cex.to_string(),
-            })
+            .ok_or_else(|| ConfigError::MissingCexCredentials { cex: cex.to_string() })
     }
 }
 
@@ -264,18 +253,13 @@ impl Config {
     pub async fn load() -> ConfigResult<Arc<Self>> {
         let home = config_dir();
 
-        let ic_url = env::var("IC_URL").map_err(|source| ConfigError::MissingEnv {
-            var: "IC_URL",
-            source,
-        })?;
+        let ic_url = env::var("IC_URL").map_err(|source| ConfigError::MissingEnv { var: "IC_URL", source })?;
         let export_path = env::var("EXPORT_PATH").unwrap_or("executions.csv".to_string());
 
-        let mnemonic_path = expand_tilde(
-            &env::var("MNEMONIC_FILE").map_err(|source| ConfigError::MissingEnv {
-                var: "MNEMONIC_FILE",
-                source,
-            })?,
-        );
+        let mnemonic_path = expand_tilde(&env::var("MNEMONIC_FILE").map_err(|source| ConfigError::MissingEnv {
+            var: "MNEMONIC_FILE",
+            source,
+        })?);
 
         let mnemonic = std::fs::read_to_string(&mnemonic_path)
             .map_err(|source| ConfigError::ReadMnemonic {
@@ -285,21 +269,19 @@ impl Config {
             .trim()
             .to_string();
 
-        let liquidator_identity =
-            derive_icp_identity(&mnemonic, 0, 0).map_err(|e| ConfigError::DeriveIdentity {
-                role: "liquidator",
-                source: ExternalError::from(e.to_string()),
-            })?;
+        let liquidator_identity = derive_icp_identity(&mnemonic, 0, 0).map_err(|e| ConfigError::DeriveIdentity {
+            role: "liquidator",
+            source: ExternalError::from(e.to_string()),
+        })?;
         let liquidator_principal = liquidator_identity.sender().map_err(|e| ConfigError::DerivePrincipal {
             role: "liquidator",
             source: ExternalError::from(e.to_string()),
         })?;
 
-        let trader_identity =
-            derive_icp_identity(&mnemonic, 0, 1).map_err(|e| ConfigError::DeriveIdentity {
-                role: "trader",
-                source: ExternalError::from(e.to_string()),
-            })?;
+        let trader_identity = derive_icp_identity(&mnemonic, 0, 1).map_err(|e| ConfigError::DeriveIdentity {
+            role: "trader",
+            source: ExternalError::from(e.to_string()),
+        })?;
         let trader_principal = trader_identity.sender().map_err(|e| ConfigError::DerivePrincipal {
             role: "trader",
             source: ExternalError::from(e.to_string()),
@@ -313,11 +295,10 @@ impl Config {
         debug!("Trader ID {}", trader_principal);
 
         // Load the asset maps
-        let lending_canister_str =
-            env::var("LENDING_CANISTER").map_err(|source| ConfigError::MissingEnv {
-                var: "LENDING_CANISTER",
-                source,
-            })?;
+        let lending_canister_str = env::var("LENDING_CANISTER").map_err(|source| ConfigError::MissingEnv {
+            var: "LENDING_CANISTER",
+            source,
+        })?;
         let lending_canister =
             Principal::from_text(&lending_canister_str).map_err(|e| ConfigError::InvalidPrincipal {
                 var: "LENDING_CANISTER",
@@ -331,11 +312,10 @@ impl Config {
         let sk = derive_evm_private_key(&mnemonic, 0, 0).map_err(|e| ConfigError::DeriveEvmKey {
             source: ExternalError::from(e.to_string()),
         })?;
-        let evm_signer: PrivateKeySigner = PrivateKeySigner::from_slice(&sk.to_bytes()).map_err(|e| {
-            ConfigError::DeriveEvmKey {
+        let evm_signer: PrivateKeySigner =
+            PrivateKeySigner::from_slice(&sk.to_bytes()).map_err(|e| ConfigError::DeriveEvmKey {
                 source: ExternalError::from(e.to_string()),
-            }
-        })?;
+            })?;
         let hex = evm_signer.to_bytes().encode_hex();
         let evm_private_key = format!("{:#}", hex);
 

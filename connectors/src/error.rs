@@ -25,9 +25,7 @@ impl ConnectorError {
     where
         E: Into<ExternalError>,
     {
-        ConnectorError::Backend {
-            source: err.into(),
-        }
+        ConnectorError::Backend { source: err.into() }
     }
 }
 
@@ -45,10 +43,6 @@ impl From<ConnectorError> for String {
 
 impl CodedError for ConnectorError {
     fn code(&self) -> ErrorCode {
-        match self {
-            ConnectorError::MissingEnv { .. } => ErrorCode::ConnectorEnv,
-            ConnectorError::InvalidInput { .. } => ErrorCode::ConnectorEnv,
-            ConnectorError::Backend { .. } => ErrorCode::ConnectorBackend,
-        }
+        ErrorCode::PipelineConnector
     }
 }

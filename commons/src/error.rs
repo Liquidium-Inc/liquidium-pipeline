@@ -5,22 +5,14 @@ use std::fmt;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u16)]
 pub enum ErrorCode {
-    Unknown = 0,
-    ConfigMissingEnv = 1_000,
-    ConfigInvalidPrincipal = 1_001,
-    ConfigReadMnemonic = 1_002,
-    ConfigDeriveIdentity = 1_003,
-    ConfigDeriveEvmKey = 1_004,
-    ConfigMissingCexCredentials = 1_005,
-    CoreUnknownAsset = 2_000,
-    CoreAccountBackend = 2_001,
-    CoreAccountCache = 2_002,
-    CoreTransferBackend = 2_100,
-    ConnectorBackend = 3_000,
-    ConnectorEnv = 3_001,
-    PipelineWal = 4_000,
-    PipelineStage = 4_001,
-    PipelineSwap = 4_002,
+    PipelineConfig = 4_000,
+    PipelineConnector = 4_001,
+    PipelineCore = 4_002,
+    PipelineWal = 4_003,
+    PipelineExecution = 4_004,
+    PipelineFinalization = 4_005,
+    PipelineContext = 4_006,
+    PipelineUnknown = 4_099,
 }
 
 impl ErrorCode {

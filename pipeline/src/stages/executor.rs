@@ -1,7 +1,8 @@
 use async_trait::async_trait;
 use candid::Encode;
+use liquidium_pipeline_commons::error::ErrorCode;
 
-use futures::{TryFutureExt, future::join_all};
+use futures::future::join_all;
 use serde::{Deserialize, Serialize};
 use tracing::instrument;
 use tracing::{debug, info, warn};
@@ -29,6 +30,10 @@ pub enum ExecutionStatus {
     CollateralTransferFailed(String),
     ChangeTransferFailed(String),
     SwapFailed(String),
+}
+
+fn coded(code: ErrorCode, message: impl Into<String>) -> String {
+    format!("{} (code={})", message.into(), code.as_u16())
 }
 
 impl ExecutionStatus {
@@ -83,7 +88,8 @@ impl<'a, A: PipelineAgent, D: WalStore> PipelineStage<'a, Vec<ExecutorRequest>, 
                     liq_req.buy_bad_debt
                 );
 
-                let args = Encode!(&liq_req).map_err(|e| e.to_string())?;
+                let args = Encode!(&liq_req)
+                    .map_err(|e| coded(ErrorCode::PipelineExecution, format!("liquidation encode failed: {e}")))?;
 
                 let liq_call = match self
                     .agent
@@ -97,7 +103,8 @@ impl<'a, A: PipelineAgent, D: WalStore> PipelineStage<'a, Vec<ExecutorRequest>, 
                     Ok(v) => v,
                     Err(err) => {
                         warn!("Liquidation call failed {err}");
-                        receipt.status = ExecutionStatus::LiquidationCallFailed(err.into());
+                        receipt.status =
+                            ExecutionStatus::LiquidationCallFailed(coded(ErrorCode::PipelineExecution, err.to_string()));
                         return Ok::<ExecutionReceipt, String>(receipt);
                     }
                 };
@@ -105,7 +112,8 @@ impl<'a, A: PipelineAgent, D: WalStore> PipelineStage<'a, Vec<ExecutorRequest>, 
                 let liq = match liq_call {
                     Ok(v) => v,
                     Err(err) => {
-                        receipt.status = ExecutionStatus::FailedLiquidation(format!("{:?}", err));
+                        receipt.status =
+                            ExecutionStatus::FailedLiquidation(coded(ErrorCode::PipelineExecution, format!("{err:?}")));
                         return Ok::<ExecutionReceipt, String>(receipt);
                     }
                 };
@@ -135,7 +143,10 @@ impl<'a, A: PipelineAgent, D: WalStore> PipelineStage<'a, Vec<ExecutorRequest>, 
                             "[executor] 🧱 collateral_tx status={:?} liq_id={}",
                             liq.collateral_tx.status, liq.id
                         );
-                        receipt.status = ExecutionStatus::CollateralTransferFailed("collateral pending".to_string());
+                        receipt.status = ExecutionStatus::CollateralTransferFailed(coded(
+                            ErrorCode::PipelineExecution,
+                            "collateral pending",
+                        ));
                         if let Err(err) = self
                             .store_to_wal(&receipt, &executor_request, ResultStatus::WaitingCollateral)
                             .await
@@ -149,7 +160,10 @@ impl<'a, A: PipelineAgent, D: WalStore> PipelineStage<'a, Vec<ExecutorRequest>, 
                             "[executor] 🧱 collateral_tx status={:?} liq_id={}",
                             liq.collateral_tx.status, liq.id
                         );
-                        receipt.status = ExecutionStatus::CollateralTransferFailed(err.clone());
+                        receipt.status = ExecutionStatus::CollateralTransferFailed(coded(
+                            ErrorCode::PipelineExecution,
+                            err.clone(),
+                        ));
                         if let Err(err) = self
                             .store_to_wal(&receipt, &executor_request, ResultStatus::WaitingCollateral)
                             .await
@@ -220,7 +234,12 @@ impl<A: PipelineAgent, D: WalStore> BasicExecutor<A, D> {
             meta: Vec::new(),
             finalizer_decision: None,
         };
-        let _ = encode_meta(&mut result_record, &wrapper);
-        self.wal.upsert_result(result_record).map_err(|e| e.to_string()).await
+        if let Err(err) = encode_meta(&mut result_record, &wrapper) {
+            warn!("Failed to encode WAL metadata: {}", String::from(err));
+        }
+        self.wal
+            .upsert_result(result_record)
+            .await
+            .map_err(|e| coded(ErrorCode::PipelineWal, format!("wal upsert_result failed: {e}")))
     }
 }

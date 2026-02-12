@@ -40,9 +40,7 @@ pub enum TokenRegistryError {
 
 impl CodedError for TokenRegistryError {
     fn code(&self) -> ErrorCode {
-        match self {
-            TokenRegistryError::UnknownAsset { .. } => ErrorCode::CoreUnknownAsset,
-        }
+        ErrorCode::PipelineCore
     }
 }
 
@@ -70,19 +68,13 @@ impl AccountError {
     where
         E: Into<ExternalError>,
     {
-        AccountError::Backend {
-            source: err.into(),
-        }
+        AccountError::Backend { source: err.into() }
     }
 }
 
 impl CodedError for AccountError {
     fn code(&self) -> ErrorCode {
-        match self {
-            AccountError::Backend { .. } => ErrorCode::CoreAccountBackend,
-            AccountError::CachePoisoned => ErrorCode::CoreAccountCache,
-            AccountError::UnsupportedToken { .. } => ErrorCode::CoreUnknownAsset,
-        }
+        ErrorCode::PipelineCore
     }
 }
 
@@ -112,20 +104,13 @@ impl TransferError {
     where
         E: Into<ExternalError>,
     {
-        TransferError::Backend {
-            source: err.into(),
-        }
+        TransferError::Backend { source: err.into() }
     }
 }
 
 impl CodedError for TransferError {
     fn code(&self) -> ErrorCode {
-        match self {
-            TransferError::Backend { .. } => ErrorCode::CoreTransferBackend,
-            TransferError::UnknownAsset { .. }
-            | TransferError::UnsupportedToken { .. }
-            | TransferError::UnsupportedDestination { .. } => ErrorCode::CoreUnknownAsset,
-        }
+        ErrorCode::PipelineCore
     }
 }
 

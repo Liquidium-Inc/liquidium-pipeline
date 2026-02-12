@@ -108,10 +108,7 @@ where
                     value: amount,
                 };
 
-                let mut cache = self
-                    .cache
-                    .lock()
-                    .map_err(|_| AccountError::CachePoisoned)?;
+                let mut cache = self.cache.lock().map_err(|_| AccountError::CachePoisoned)?;
                 cache.insert((*ledger, symbol.clone()), (balance.clone(), Instant::now()));
 
                 Ok(balance)

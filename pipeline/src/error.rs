@@ -21,10 +21,7 @@ pub enum PipelineError {
         source: ExternalError,
     },
     #[error("{message}")]
-    Stage {
-        code: ErrorCode,
-        message: String,
-    },
+    Stage { code: ErrorCode, message: String },
 }
 
 impl PipelineError {
@@ -32,9 +29,7 @@ impl PipelineError {
     where
         E: Into<ExternalError>,
     {
-        PipelineError::Wal {
-            source: err.into(),
-        }
+        PipelineError::Wal { source: err.into() }
     }
 
     pub fn stage(code: ErrorCode, message: impl Into<String>) -> Self {

@@ -4,6 +4,7 @@ use async_trait::async_trait;
 use candid::{Nat, Principal};
 use icrc_ledger_types::icrc1::account::Account;
 use liquidium_pipeline_core::account::model::ChainAccount;
+use liquidium_pipeline_core::error::TransferError;
 use liquidium_pipeline_core::tokens::{chain_token::ChainToken, chain_token_amount::ChainTokenAmount};
 use liquidium_pipeline_core::transfer::actions::MockTransferActions;
 use liquidium_pipeline_core::types::protocol_types::{
@@ -591,7 +592,7 @@ async fn hybrid_recovery_transfer_failure_returns_error() {
     transfers
         .expect_transfer()
         .times(1)
-        .returning(|_, _, _| Err("boom".to_string()));
+        .returning(|_, _, _| Err(TransferError::backend("boom")));
     transfers.expect_approve().times(0);
 
     let mut dex_swapper = MockSwapInterface::new();

@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use candid::{Encode, Principal};
+use liquidium_pipeline_commons::error::ErrorCode;
 use tracing::{debug, info, warn};
 
 use crate::finalizers::finalizer::{Finalizer, FinalizerResult};
@@ -23,6 +24,10 @@ use liquidium_pipeline_core::types::protocol_types::{LiquidationResult, Protocol
 const MAX_FINALIZER_ERRORS: i32 = 5;
 /// Maximum safe left-shift for `u64` multipliers in retry backoff.
 const MAX_U64_SHIFT: u32 = 63;
+
+fn coded(code: ErrorCode, message: impl Into<String>) -> String {
+    format!("{} (code={})", message.into(), code.as_u16())
+}
 
 /// Exponential retry delay with cap: min(max, base * 2^(errors-1)).
 fn retry_delay_secs(base: u64, max: u64, error_count: i32) -> u64 {
@@ -88,28 +93,44 @@ where
     }
 
     async fn refresh_liquidation(&self, liq_id: u128) -> Result<LiquidationResult, String> {
-        let args = Encode!(&liq_id).map_err(|e| format!("get_liquidation encode error: {e}"))?;
+        let args = Encode!(&liq_id).map_err(|e| {
+            coded(
+                ErrorCode::PipelineFinalization,
+                format!("get_liquidation encode error: {e}"),
+            )
+        })?;
         let res = self
             .agent
             .call_query::<Result<LiquidationResult, ProtocolError>>(&self.lending_canister, "get_liquidation", args)
-            .await?;
+            .await
+            .map_err(|e| coded(ErrorCode::PipelineFinalization, e))?;
         match res {
             Ok(liq) => Ok(liq),
-            Err(err) => Err(format!("get_liquidation error: {err:?}")),
+            Err(err) => Err(coded(
+                ErrorCode::PipelineFinalization,
+                format!("get_liquidation error: {err:?}"),
+            )),
         }
     }
 
     async fn update_receipt_meta(&self, liq_id: &str, receipt: &ExecutionReceipt) -> Result<(), String> {
-        let row = self.wal.get_result(liq_id).await.map_err(|e| e.to_string())?;
+        let row = self
+            .wal
+            .get_result(liq_id)
+            .await
+            .map_err(|e| coded(ErrorCode::PipelineWal, format!("wal get_result failed: {e}")))?;
         if let Some(mut row) = row {
             let wrapper = LiqMetaWrapper {
                 receipt: receipt.clone(),
                 meta: Vec::new(),
                 finalizer_decision: None,
             };
-            encode_meta(&mut row, &wrapper)?;
+            encode_meta(&mut row, &wrapper).map_err(String::from)?;
             row.updated_at = now_ts();
-            self.wal.upsert_result(row).await.map_err(|e| e.to_string())?;
+            self.wal
+                .upsert_result(row)
+                .await
+                .map_err(|e| coded(ErrorCode::PipelineWal, format!("wal upsert_result failed: {e}")))?;
         }
         Ok(())
     }
@@ -125,7 +146,11 @@ where
 {
     async fn process(&self, _: &'a ()) -> Result<Vec<LiquidationOutcome>, String> {
         // Load pending entries from WAL
-        let rows = self.wal.get_pending(100).await.map_err(|e| e.to_string())?;
+        let rows = self
+            .wal
+            .get_pending(100)
+            .await
+            .map_err(|e| coded(ErrorCode::PipelineWal, format!("wal get_pending failed: {e}")))?;
         debug!("Finalizing rows {:?}", rows);
         if rows.is_empty() {
             return Ok(vec![]);

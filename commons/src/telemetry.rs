@@ -5,9 +5,9 @@ use opentelemetry_sdk::Resource;
 use opentelemetry_sdk::logs::SdkLoggerProvider;
 use opentelemetry_sdk::trace::SdkTracerProvider;
 use tracing_opentelemetry::OpenTelemetryLayer;
-use tracing_subscriber::filter::filter_fn;
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::Layer;
+use tracing_subscriber::filter::filter_fn;
 use tracing_subscriber::fmt;
 use tracing_subscriber::layer::SubscriberExt;
 
@@ -65,7 +65,7 @@ impl Drop for TelemetryGuard {
         {
             eprintln!("Failed to shutdown tracer provider: {e}");
         }
-        
+
         if let Some(provider) = self.logger_provider.take()
             && let Err(e) = provider.shutdown()
         {

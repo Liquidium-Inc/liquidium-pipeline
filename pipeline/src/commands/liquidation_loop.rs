@@ -2,7 +2,7 @@ use candid::Principal;
 use icrc_ledger_types::icrc1::account::Account;
 use indicatif::{ProgressBar, ProgressStyle};
 
-use liquidium_pipeline_commons::error::format_with_code;
+use liquidium_pipeline_commons::error::{ErrorCode, format_with_code};
 use prettytable::{Cell, Row, Table, format};
 use std::{
     io::{IsTerminal, stderr, stdout},
@@ -44,6 +44,10 @@ use liquidium_pipeline_core::tokens::{
 };
 
 // Prints the startup banner.
+fn coded(code: ErrorCode, message: impl Into<String>) -> String {
+    format!("{} (code={})", message.into(), code.as_u16())
+}
+
 fn print_banner() {
     println!(
         r#"
@@ -251,7 +255,10 @@ async fn init(
     let config = ctx.config.clone();
     let agent = ctx.agent.clone();
     let registry = ctx.registry.clone();
-    let db = Arc::new(SqliteWalStore::new(&config.db_path).map_err(|e| format!("could not connect to db: {e}"))?);
+    let db = Arc::new(
+        SqliteWalStore::new(&config.db_path)
+            .map_err(|e| coded(ErrorCode::PipelineWal, format!("could not connect to db: {e}")))?,
+    );
 
     let tokens: Vec<Principal> = registry
         .debt_assets()
@@ -279,7 +286,7 @@ async fn init(
     executor
         .init(&tokens)
         .await
-        .map_err(|e| format!("executor token init failed: {e}"))?;
+        .map_err(|e| coded(ErrorCode::PipelineExecution, format!("executor token init failed: {e}")))?;
     let executor = Arc::new(executor);
 
     if let Err(err) = ctx.swap_router.init().await {
@@ -308,7 +315,10 @@ async fn init(
         }
         Err(err) => {
             if config.swapper != SwapperMode::Dex {
-                return Err(format!("CEX credentials missing: {}", format_with_code(&err)));
+                return Err(coded(
+                    ErrorCode::PipelineFinalization,
+                    format!("CEX credentials missing: {}", format_with_code(&err)),
+                ));
             }
             None
         }
@@ -426,7 +436,10 @@ pub async fn run_liquidation_loop() {
     let watcher_wal = match SqliteWalStore::new_with_busy_timeout(&config.db_path, 30_000) {
         Ok(wal) => Arc::new(wal),
         Err(err) => {
-            tracing::error!("Failed to init watcher WAL: {}", err);
+            tracing::error!(
+                "Failed to init watcher WAL: {}",
+                coded(ErrorCode::PipelineWal, err.to_string())
+            );
             return;
         }
     };
@@ -577,7 +590,7 @@ pub async fn run_liquidation_loop_controlled(
 
     let watcher_wal = Arc::new(
         SqliteWalStore::new_with_busy_timeout(&config.db_path, 30_000)
-            .map_err(|e| format!("could not connect to db: {e}"))?,
+            .map_err(|e| coded(ErrorCode::PipelineWal, format!("could not connect to db: {e}")))?,
     );
     let watcher = SettlementWatcher::new(
         watcher_wal,

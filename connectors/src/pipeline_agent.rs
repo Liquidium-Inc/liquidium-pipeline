@@ -22,12 +22,7 @@ pub trait PipelineAgent: Send + Sync {
         arg: Vec<u8>,
     ) -> ConnectorResult<R>;
 
-    async fn call_update_raw(
-        &self,
-        canister: &Principal,
-        method: &str,
-        arg: Vec<u8>,
-    ) -> ConnectorResult<Vec<u8>>;
+    async fn call_update_raw(&self, canister: &Principal, method: &str, arg: Vec<u8>) -> ConnectorResult<Vec<u8>>;
 
     async fn call_update<R: Sized + CandidType + DeserializeOwned + 'static>(
         &self,
@@ -78,18 +73,12 @@ impl PipelineAgent for ic_agent::Agent {
             .await
             .map_err(|e| ConnectorError::backend(e.to_string()))?;
 
-        let res =
-            candid::utils::decode_one::<R>(&res).map_err(|e| ConnectorError::backend(e.to_string()))?;
+        let res = candid::utils::decode_one::<R>(&res).map_err(|e| ConnectorError::backend(e.to_string()))?;
 
         Ok(res)
     }
 
-    async fn call_update_raw(
-        &self,
-        canister: &Principal,
-        method: &str,
-        arg: Vec<u8>,
-    ) -> ConnectorResult<Vec<u8>> {
+    async fn call_update_raw(&self, canister: &Principal, method: &str, arg: Vec<u8>) -> ConnectorResult<Vec<u8>> {
         let res = self.update(canister, method).with_arg(arg).call_and_wait().await;
         res.map_err(|e| ConnectorError::backend(e.to_string()))
     }

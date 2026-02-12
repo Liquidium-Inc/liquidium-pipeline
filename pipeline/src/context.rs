@@ -7,10 +7,10 @@ use alloy::signers::local::PrivateKeySigner;
 
 use ic_agent::Agent;
 use icrc_ledger_types::icrc1::account::Account;
+use liquidium_pipeline_commons::error::{CodedError, ErrorCode, format_with_code};
 use liquidium_pipeline_connectors::account::evm_account::EvmAccountInfoAdapter;
 use liquidium_pipeline_connectors::account::icp_account::IcpAccountInfoAdapter;
 use liquidium_pipeline_connectors::backend::evm_backend::EvmBackendImpl;
-use liquidium_pipeline_connectors::error_format::format_with_code;
 use liquidium_pipeline_core::balance_service::BalanceService;
 use liquidium_pipeline_core::tokens::chain_token::ChainToken;
 use liquidium_pipeline_core::transfer::transfer_service::TransferService;
@@ -70,6 +70,23 @@ impl std::fmt::Display for PipelineContextError {
 
 impl std::error::Error for PipelineContextError {}
 
+impl CodedError for PipelineContextError {
+    fn code(&self) -> ErrorCode {
+        match self {
+            PipelineContextError::RegistryLoad(_) => ErrorCode::PipelineConnector,
+            PipelineContextError::Other(_) => ErrorCode::PipelineContext,
+        }
+    }
+}
+
+fn context_error(message: impl Into<String>) -> PipelineContextError {
+    PipelineContextError::Other(format!(
+        "{} (code={})",
+        message.into(),
+        ErrorCode::PipelineContext.as_u16()
+    ))
+}
+
 fn should_fallback_to_empty_registry(err: &PipelineContextError) -> bool {
     matches!(
         err,
@@ -118,17 +135,16 @@ impl<P: Provider<AnyNetwork> + WalletProvider<AnyNetwork> + Clone + 'static> Pip
 
         let main_agent = self
             .ic_agent_main
-            .ok_or_else(|| PipelineContextError::Other("missing IC Main Agent".to_string()))?;
+            .ok_or_else(|| context_error("missing IC Main Agent"))?;
         let icp_backend_main = Arc::new(IcpBackendImpl::new(main_agent.clone()));
-        let icp_backend_trader =
-            Arc::new(IcpBackendImpl::new(self.ic_agent_trader.ok_or_else(|| {
-                PipelineContextError::Other("missing IC Trader".to_string())
-            })?));
+        let icp_backend_trader = Arc::new(IcpBackendImpl::new(
+            self.ic_agent_trader.ok_or_else(|| context_error("missing IC Trader"))?,
+        ));
 
         // Use provided EVM providers or fail
         let main_provider = self
             .evm_provider_main
-            .ok_or_else(|| PipelineContextError::Other("missing main EVM provider".to_string()))?;
+            .ok_or_else(|| context_error("missing main EVM provider"))?;
         let evm_address = format!("{}", main_provider.default_signer_address());
 
         let evm_backend_main = Arc::new(EvmBackendImpl::new(main_provider));
@@ -358,9 +374,9 @@ pub async fn init_context_best_effort() -> Result<PipelineContext, String> {
             fallback
                 .build_with_registry_override(Some(empty_registry))
                 .await
-                .map_err(|err| err.to_string())
+                .map_err(|err| format_with_code(&err))
         }
-        Err(err) => Err(err.to_string()),
+        Err(err) => Err(format_with_code(&err)),
     }
 }
 
@@ -429,7 +445,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn build_stringifies_typed_internal_errors() {
+    async fn build_with_registry_override_preserves_internal_error_type() {
         let signer: PrivateKeySigner = "0x59c6995e998f97a5a0044966f0945382d7f0f5d5f7cd4c95b2f5f7f6c8c6f8de"
             .parse()
             .expect("signer");
@@ -445,10 +461,13 @@ mod tests {
             ic_agent_trader: None,
         };
 
-        let err = match builder.build().await {
+        let err = match builder
+            .build_with_registry_override(Some(TokenRegistry::new(HashMap::new())))
+            .await
+        {
             Ok(_) => panic!("expected error"),
             Err(err) => err,
         };
-        assert_eq!(err, "missing IC Main Agent");
+        assert!(matches!(err, PipelineContextError::Other(_)));
     }
 }
