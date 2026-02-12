@@ -365,7 +365,10 @@ impl MexcClient {
             .collect())
     }
 
-    fn estimate_buy_quantity_from_levels(ask_levels: &[(Decimal, Decimal)], quote_amount: Decimal) -> Result<Decimal, String> {
+    fn estimate_buy_quantity_from_levels(
+        ask_levels: &[(Decimal, Decimal)],
+        quote_amount: Decimal,
+    ) -> Result<Decimal, String> {
         if ask_levels.is_empty() {
             return Err("no asks".into());
         }
@@ -925,8 +928,7 @@ impl CexBackend for MexcClient {
             Ok((chosen_symbol, order_id)) => {
                 let fetch_res = {
                     let ex = self.inner.lock().await;
-                    self.fetch_fill_report(&ex, &chosen_symbol, &order_id, &side_norm)
-                        .await
+                    self.fetch_fill_report(&ex, &chosen_symbol, &order_id, &side_norm).await
                 };
                 match fetch_res {
                     Ok(report) => Ok(report),

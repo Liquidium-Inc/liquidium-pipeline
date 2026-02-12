@@ -86,8 +86,7 @@ const DEFAULT_BUY_INVERSE_ENABLED: bool = true;
 impl<C> MexcFinalizer<C>
 where
     C: CexBackend,
-{   
-
+{
     // used in tests
     #[allow(unused)]
     pub fn new(

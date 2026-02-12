@@ -14,9 +14,10 @@ pub async fn mexc_deposit_address(asset: &str, network: Option<&str>) -> Result<
     println!("  network : {}", addr.network);
     println!("  address : {}", addr.address);
     if let Some(tag) = addr.tag.as_ref()
-        && !tag.is_empty() {
-            println!("  tag     : {}", tag);
-        }
+        && !tag.is_empty()
+    {
+        println!("  tag     : {}", tag);
+    }
 
     Ok(())
 }

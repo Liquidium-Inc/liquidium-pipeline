@@ -1,8 +1,11 @@
+use std::collections::VecDeque;
+
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
+use unicode_width::UnicodeWidthStr;
 
 use super::super::app::{App, UiFocus};
 
@@ -151,20 +154,115 @@ fn is_level(token: &str) -> bool {
     matches!(token, "ERROR" | "WARN" | "INFO" | "DEBUG" | "TRACE")
 }
 
+pub(crate) fn wrapped_row_count_for_entry(line: &str, content_width: usize) -> usize {
+    if content_width == 0 {
+        return 1;
+    }
+
+    // Keep empty lines visible as one visual row.
+    let width = line.trim_end_matches('\r').width().max(1);
+    width.div_ceil(content_width)
+}
+
+pub(super) fn estimate_wrapped_log_lines(logs: &VecDeque<String>, content_width: usize) -> usize {
+    if content_width == 0 {
+        return logs.len();
+    }
+
+    logs.iter()
+        .map(|line| wrapped_row_count_for_entry(line, content_width))
+        .sum()
+}
+
+fn clamped_scroll_rows(logs: &VecDeque<String>, content_width: usize, scroll: u16) -> usize {
+    let total_rows = estimate_wrapped_log_lines(logs, content_width);
+    usize::from(scroll).min(total_rows)
+}
+
+fn saturating_u16(value: usize) -> u16 {
+    value.min(usize::from(u16::MAX)) as u16
+}
+
+pub(crate) fn scroll_up_by_entries(
+    logs: &VecDeque<String>,
+    content_width: usize,
+    current_scroll: u16,
+    entries: usize,
+) -> u16 {
+    let mut scroll = current_scroll;
+
+    for _ in 0..entries {
+        let target = clamped_scroll_rows(logs, content_width, scroll);
+        let mut hidden_rows = 0usize;
+        let mut step = 0usize;
+
+        for entry in logs.iter().rev() {
+            let entry_rows = wrapped_row_count_for_entry(entry, content_width);
+            if target < hidden_rows + entry_rows {
+                step = hidden_rows + entry_rows - target;
+                break;
+            }
+            hidden_rows += entry_rows;
+        }
+
+        if step == 0 {
+            break;
+        }
+
+        scroll = scroll.saturating_add(saturating_u16(step));
+    }
+
+    scroll
+}
+
+pub(crate) fn scroll_down_by_entries(
+    logs: &VecDeque<String>,
+    content_width: usize,
+    current_scroll: u16,
+    entries: usize,
+) -> u16 {
+    let mut scroll = current_scroll;
+
+    for _ in 0..entries {
+        let target = clamped_scroll_rows(logs, content_width, scroll);
+        if target == 0 {
+            break;
+        }
+
+        let mut hidden_rows = 0usize;
+        let mut step = target;
+
+        for entry in logs.iter().rev() {
+            let entry_rows = wrapped_row_count_for_entry(entry, content_width);
+            if target <= hidden_rows + entry_rows {
+                step = target - hidden_rows;
+                break;
+            }
+            hidden_rows += entry_rows;
+        }
+
+        if step == 0 {
+            break;
+        }
+
+        scroll = scroll.saturating_sub(saturating_u16(step));
+    }
+
+    scroll
+}
+
 pub(super) fn draw_logs(f: &mut Frame<'_>, area: Rect, app: &App) {
     let lines: Vec<Line> = app.logs.iter().map(|l| log_to_line(l)).collect();
     let height = area.height.saturating_sub(2) as usize;
-    let max_scroll = lines.len().saturating_sub(height) as u16;
-    let (scroll, scroll_x, title) = if !app.logs_scroll_active {
-        (max_scroll, 0, "Logs (view)")
+    let content_width = area.width.saturating_sub(2) as usize;
+    let wrapped_lines = estimate_wrapped_log_lines(&app.logs, content_width);
+    let max_scroll = wrapped_lines.saturating_sub(height) as u16;
+    let (scroll, title) = if !app.logs_scroll_active {
+        (max_scroll, "Logs (view)")
     } else if app.logs_follow {
-        (max_scroll, app.logs_scroll_x, "Logs (follow)")
+        (max_scroll, "Logs (follow)")
     } else {
-        (
-            max_scroll.saturating_sub(app.logs_scroll),
-            app.logs_scroll_x,
-            "Logs (scroll)",
-        )
+        (max_scroll.saturating_sub(app.logs_scroll), "Logs (scroll)")
     };
 
     let mut block = Block::default().borders(Borders::ALL).title(title);
@@ -172,6 +270,9 @@ pub(super) fn draw_logs(f: &mut Frame<'_>, area: Rect, app: &App) {
         block = block.border_style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD));
     }
 
-    let w = Paragraph::new(lines).block(block).scroll((scroll, scroll_x));
+    let w = Paragraph::new(lines)
+        .block(block)
+        .scroll((scroll, 0))
+        .wrap(Wrap { trim: false });
     f.render_widget(w, area);
 }

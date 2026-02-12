@@ -216,6 +216,9 @@ pub async fn run() -> anyhow::Result<()> {
     };
 
     let mut app = App::new(withdraw_assets, config);
+    if let Ok(size) = terminal.size() {
+        app.update_log_viewport_widths(size);
+    }
     push_startup_logs(&mut app, &ctx);
     app.push_log("Press 'r' to start/pause, 'q' to quit, Tab to switch views.");
     {
@@ -228,6 +231,9 @@ pub async fn run() -> anyhow::Result<()> {
     }
 
     loop {
+        if let Ok(size) = terminal.size() {
+            app.update_log_viewport_widths(size);
+        }
         terminal.draw(|f| draw_ui(f, &app)).context("draw UI")?;
 
         let Some(ev) = ui_rx.recv().await else {
