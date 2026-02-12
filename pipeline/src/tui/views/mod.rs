@@ -11,7 +11,7 @@ use super::app::{App, Tab};
 mod balances;
 mod dashboard;
 mod executions;
-mod logs;
+pub(super) mod logs;
 mod profits;
 
 pub(super) fn draw_ui(f: &mut Frame<'_>, app: &App) {

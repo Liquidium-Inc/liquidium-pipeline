@@ -2,6 +2,7 @@ use std::collections::{HashMap, VecDeque};
 use std::time::Instant;
 
 use chrono::{DateTime, Local};
+use ratatui::layout::{Constraint, Direction, Layout, Rect};
 
 use crate::commands::liquidation_loop::LoopControl;
 use crate::finalizers::liquidation_outcome::LiquidationOutcome;
@@ -35,13 +36,7 @@ pub(super) enum Tab {
 
 impl Tab {
     pub(super) fn all() -> &'static [Tab] {
-        &[
-            Tab::Dashboard,
-            Tab::Balances,
-            Tab::Profits,
-            Tab::Executions,
-            Tab::Logs,
-        ]
+        &[Tab::Dashboard, Tab::Balances, Tab::Profits, Tab::Executions, Tab::Logs]
     }
 
     pub(super) fn title(self) -> &'static str {
@@ -242,11 +237,13 @@ pub(super) struct App {
     pub(super) logs_follow: bool,
     pub(super) logs_g_pending: bool,
     pub(super) logs_scroll_active: bool,
+    pub(super) logs_content_width: usize,
     pub(super) dashboard_logs_scroll: u16,
     pub(super) dashboard_logs_scroll_x: u16,
     pub(super) dashboard_logs_follow: bool,
     pub(super) dashboard_logs_g_pending: bool,
     pub(super) dashboard_logs_scroll_active: bool,
+    pub(super) dashboard_logs_content_width: usize,
     pub(super) last_outcomes: usize,
     pub(super) last_error: Option<String>,
     pub(super) last_tick: Instant,
@@ -292,11 +289,13 @@ impl App {
             logs_follow: true,
             logs_g_pending: false,
             logs_scroll_active: false,
+            logs_content_width: 1,
             dashboard_logs_scroll: 0,
             dashboard_logs_scroll_x: 0,
             dashboard_logs_follow: true,
             dashboard_logs_g_pending: false,
             dashboard_logs_scroll_active: false,
+            dashboard_logs_content_width: 1,
             last_outcomes: 0,
             last_error: None,
             last_tick: Instant::now(),
@@ -341,12 +340,35 @@ impl App {
             }
             self.logs.push_back(part.to_string());
             if bump_logs_scroll {
-                self.logs_scroll = self.logs_scroll.saturating_add(1);
+                let rows = super::views::logs::wrapped_row_count_for_entry(part, self.logs_content_width)
+                    .min(usize::from(u16::MAX)) as u16;
+                self.logs_scroll = self.logs_scroll.saturating_add(rows);
             }
             if bump_dashboard_scroll {
-                self.dashboard_logs_scroll = self.dashboard_logs_scroll.saturating_add(1);
+                let rows = super::views::logs::wrapped_row_count_for_entry(part, self.dashboard_logs_content_width)
+                    .min(usize::from(u16::MAX)) as u16;
+                self.dashboard_logs_scroll = self.dashboard_logs_scroll.saturating_add(rows);
             }
         }
+    }
+
+    pub(super) fn update_log_viewport_widths(&mut self, area: Rect) {
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(1), Constraint::Length(3), Constraint::Min(0)])
+            .split(area);
+        let body = chunks[2];
+        self.logs_content_width = body.width.saturating_sub(2) as usize;
+
+        let dashboard_chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Percentage(65), Constraint::Percentage(35)])
+            .split(body);
+        let dashboard_top = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(67), Constraint::Percentage(33)])
+            .split(dashboard_chunks[0]);
+        self.dashboard_logs_content_width = dashboard_top[0].width.saturating_sub(2) as usize;
     }
 
     pub(super) fn next_tab(&mut self) {

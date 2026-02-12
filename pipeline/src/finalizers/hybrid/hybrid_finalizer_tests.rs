@@ -7,13 +7,11 @@ use liquidium_pipeline_core::account::model::ChainAccount;
 use liquidium_pipeline_core::tokens::{chain_token::ChainToken, chain_token_amount::ChainTokenAmount};
 use liquidium_pipeline_core::transfer::actions::MockTransferActions;
 use liquidium_pipeline_core::types::protocol_types::{
-    AssetType, LiquidationAmounts, LiquidationRequest, LiquidationResult, LiquidationStatus, TransferStatus,
-    TxStatus,
+    AssetType, LiquidationAmounts, LiquidationRequest, LiquidationResult, LiquidationStatus, TransferStatus, TxStatus,
 };
 use std::sync::{
-    Arc,
+    Arc, Mutex,
     atomic::{AtomicUsize, Ordering},
-    Mutex,
 };
 
 use crate::config::MockConfigTrait;
@@ -100,9 +98,7 @@ struct TestWal {
 
 impl TestWal {
     fn empty() -> Self {
-        Self {
-            row: Mutex::new(None),
-        }
+        Self { row: Mutex::new(None) }
     }
 
     fn with_receipt(receipt: &ExecutionReceipt) -> Self {
@@ -386,8 +382,7 @@ async fn forced_dex_non_positive_preview_routes_to_recovery_and_uses_recovery_ac
         .expect_transfer()
         .times(1)
         .withf(move |_token, to, amount| {
-            matches!(to, ChainAccount::Icp(acc) if acc == &expected_recovery)
-                && amount.clone() == 900u64
+            matches!(to, ChainAccount::Icp(acc) if acc == &expected_recovery) && amount.clone() == 900u64
         })
         .returning(|_, _, _| Ok("tx-1".to_string()));
     transfers.expect_approve().times(0);
@@ -436,8 +431,7 @@ async fn forced_cex_non_positive_preview_routes_to_recovery_and_uses_recovery_ac
         .expect_transfer()
         .times(1)
         .withf(move |_token, to, amount| {
-            matches!(to, ChainAccount::Icp(acc) if acc == &expected_recovery)
-                && amount.clone() == 900u64
+            matches!(to, ChainAccount::Icp(acc) if acc == &expected_recovery) && amount.clone() == 900u64
         })
         .returning(|_, _, _| Ok("tx-1".to_string()));
     transfers.expect_approve().times(0);
@@ -810,8 +804,7 @@ async fn hybrid_both_non_positive_routes_to_recovery_and_uses_recovery_account()
         .expect_transfer()
         .times(1)
         .withf(move |_token, to, amount| {
-            matches!(to, ChainAccount::Icp(acc) if acc == &expected_recovery)
-                && amount.clone() == 900u64
+            matches!(to, ChainAccount::Icp(acc) if acc == &expected_recovery) && amount.clone() == 900u64
         })
         .returning(|_, _, _| Ok("tx-1".to_string()));
     transfers.expect_approve().times(0);
@@ -1084,8 +1077,8 @@ fn choose_best_route_prefers_higher_net_edge_candidate() {
         reason: "cex".to_string(),
     };
 
-    let selected = choose_best_route(Some(dex_candidate), Some(cex_candidate))
-        .expect("one candidate should be selected");
+    let selected =
+        choose_best_route(Some(dex_candidate), Some(cex_candidate)).expect("one candidate should be selected");
     assert_eq!(selected.venue, RouteVenue::Cex);
     assert_eq!(selected.net_edge_bps, CEX_NET_EDGE_BPS);
 }
@@ -1108,11 +1101,10 @@ fn choose_best_route_returns_available_candidate_when_other_missing() {
         reason: "cex".to_string(),
     };
 
-    let selected = choose_best_route(Some(dex_candidate.clone()), None)
-        .expect("dex candidate should be selected");
+    let selected = choose_best_route(Some(dex_candidate.clone()), None).expect("dex candidate should be selected");
     assert_eq!(selected.venue, RouteVenue::Dex);
 
-    let selected = choose_best_route(None, Some(cex_candidate))
-        .expect("candidate should be selected when only one side exists");
+    let selected =
+        choose_best_route(None, Some(cex_candidate)).expect("candidate should be selected when only one side exists");
     assert_eq!(selected.venue, RouteVenue::Cex);
 }

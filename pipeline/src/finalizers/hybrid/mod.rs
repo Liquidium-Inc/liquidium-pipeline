@@ -1,2 +1,2 @@
-pub(crate) mod utils;
 pub mod hybrid_finalizer;
+pub(crate) mod utils;

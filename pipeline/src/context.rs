@@ -140,7 +140,7 @@ impl<P: Provider<AnyNetwork> + WalletProvider<AnyNetwork> + Clone + 'static> Pip
                 .await
                 .map_err(PipelineContextError::RegistryLoad)?,
         });
-        
+
         for (id, token) in registry.tokens.iter() {
             if let ChainToken::Icp { fee, .. } = token {
                 info!("Loaded ICRC fee: {} {} (ledger={})", token.symbol(), fee, id.address);

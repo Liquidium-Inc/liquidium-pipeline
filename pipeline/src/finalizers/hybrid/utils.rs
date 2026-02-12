@@ -72,9 +72,11 @@ pub(crate) fn debt_repaid_f64(receipt: &ExecutionReceipt) -> Result<f64, String>
         .liquidation_result
         .as_ref()
         .ok_or_else(|| "missing liquidation_result in receipt".to_string())?;
-    let debt_repaid_amount =
-        ChainTokenAmount::from_raw(receipt.request.debt_asset.clone(), liquidation_result.amounts.debt_repaid.clone())
-            .to_f64();
+    let debt_repaid_amount = ChainTokenAmount::from_raw(
+        receipt.request.debt_asset.clone(),
+        liquidation_result.amounts.debt_repaid.clone(),
+    )
+    .to_f64();
     if debt_repaid_amount <= 0.0 {
         return Err("invalid debt_repaid amount in receipt".to_string());
     }

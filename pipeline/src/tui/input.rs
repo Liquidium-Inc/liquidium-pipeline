@@ -9,7 +9,10 @@ use crate::commands::liquidation_loop::LoopControl;
 use super::app::{App, BalancesPanel, Tab, UiFocus, WithdrawField};
 use super::events::UiEvent;
 use super::snapshots::{compute_profits_snapshot, fetch_balances_snapshot};
+use super::views::logs::{scroll_down_by_entries, scroll_up_by_entries};
 use super::withdraw::{open_deposit_panel, open_withdraw_panel, refresh_withdraw_deposit_address, submit_withdraw};
+
+const PAGE_SCROLL_ENTRIES: usize = 10;
 
 fn reset_log_focus(app: &mut App) {
     app.ui_focus = UiFocus::Tabs;
@@ -28,6 +31,40 @@ fn reset_log_focus(app: &mut App) {
 fn reset_executions_focus(app: &mut App) {
     app.ui_focus = UiFocus::Tabs;
     app.executions_details_scroll = 0;
+}
+
+fn scroll_logs_up(app: &mut App, entries: usize) {
+    app.logs_follow = false;
+    app.logs_scroll = scroll_up_by_entries(&app.logs, app.logs_content_width, app.logs_scroll, entries);
+}
+
+fn scroll_logs_down(app: &mut App, entries: usize) {
+    app.logs_scroll = scroll_down_by_entries(&app.logs, app.logs_content_width, app.logs_scroll, entries);
+    if app.logs_scroll == 0 {
+        app.logs_follow = true;
+    }
+}
+
+fn scroll_dashboard_logs_up(app: &mut App, entries: usize) {
+    app.dashboard_logs_follow = false;
+    app.dashboard_logs_scroll = scroll_up_by_entries(
+        &app.logs,
+        app.dashboard_logs_content_width,
+        app.dashboard_logs_scroll,
+        entries,
+    );
+}
+
+fn scroll_dashboard_logs_down(app: &mut App, entries: usize) {
+    app.dashboard_logs_scroll = scroll_down_by_entries(
+        &app.logs,
+        app.dashboard_logs_content_width,
+        app.dashboard_logs_scroll,
+        entries,
+    );
+    if app.dashboard_logs_scroll == 0 {
+        app.dashboard_logs_follow = true;
+    }
 }
 
 pub(super) async fn handle_key(
@@ -192,58 +229,42 @@ pub(super) async fn handle_key(
         (KeyCode::Up, KeyModifiers::NONE)
             if matches!(app.tab, Tab::Logs) && matches!(app.ui_focus, UiFocus::Logs) && app.logs_scroll_active =>
         {
-            app.logs_follow = false;
-            app.logs_scroll = app.logs_scroll.saturating_add(1);
+            scroll_logs_up(app, 1);
         }
         (KeyCode::Down, KeyModifiers::NONE)
             if matches!(app.tab, Tab::Logs) && matches!(app.ui_focus, UiFocus::Logs) && app.logs_scroll_active =>
         {
-            app.logs_scroll = app.logs_scroll.saturating_sub(1);
-            if app.logs_scroll == 0 {
-                app.logs_follow = true;
-            }
+            scroll_logs_down(app, 1);
         }
         (KeyCode::Char('k'), KeyModifiers::NONE)
             if matches!(app.tab, Tab::Logs) && matches!(app.ui_focus, UiFocus::Logs) && app.logs_scroll_active =>
         {
-            app.logs_follow = false;
-            app.logs_scroll = app.logs_scroll.saturating_add(1);
+            scroll_logs_up(app, 1);
         }
         (KeyCode::Char('j'), KeyModifiers::NONE)
             if matches!(app.tab, Tab::Logs) && matches!(app.ui_focus, UiFocus::Logs) && app.logs_scroll_active =>
         {
-            app.logs_scroll = app.logs_scroll.saturating_sub(1);
-            if app.logs_scroll == 0 {
-                app.logs_follow = true;
-            }
+            scroll_logs_down(app, 1);
         }
         (KeyCode::PageUp, KeyModifiers::NONE)
             if matches!(app.tab, Tab::Logs) && matches!(app.ui_focus, UiFocus::Logs) && app.logs_scroll_active =>
         {
-            app.logs_follow = false;
-            app.logs_scroll = app.logs_scroll.saturating_add(10);
+            scroll_logs_up(app, PAGE_SCROLL_ENTRIES);
         }
         (KeyCode::PageDown, KeyModifiers::NONE)
             if matches!(app.tab, Tab::Logs) && matches!(app.ui_focus, UiFocus::Logs) && app.logs_scroll_active =>
         {
-            app.logs_scroll = app.logs_scroll.saturating_sub(10);
-            if app.logs_scroll == 0 {
-                app.logs_follow = true;
-            }
+            scroll_logs_down(app, PAGE_SCROLL_ENTRIES);
         }
         (KeyCode::Char('u'), KeyModifiers::CONTROL)
             if matches!(app.tab, Tab::Logs) && matches!(app.ui_focus, UiFocus::Logs) && app.logs_scroll_active =>
         {
-            app.logs_follow = false;
-            app.logs_scroll = app.logs_scroll.saturating_add(10);
+            scroll_logs_up(app, PAGE_SCROLL_ENTRIES);
         }
         (KeyCode::Char('d'), KeyModifiers::CONTROL)
             if matches!(app.tab, Tab::Logs) && matches!(app.ui_focus, UiFocus::Logs) && app.logs_scroll_active =>
         {
-            app.logs_scroll = app.logs_scroll.saturating_sub(10);
-            if app.logs_scroll == 0 {
-                app.logs_follow = true;
-            }
+            scroll_logs_down(app, PAGE_SCROLL_ENTRIES);
         }
         (KeyCode::Char('g'), KeyModifiers::NONE)
             if matches!(app.tab, Tab::Logs) && matches!(app.ui_focus, UiFocus::Logs) && app.logs_scroll_active =>
@@ -280,72 +301,56 @@ pub(super) async fn handle_key(
                 && matches!(app.ui_focus, UiFocus::Logs)
                 && app.dashboard_logs_scroll_active =>
         {
-            app.dashboard_logs_follow = false;
-            app.dashboard_logs_scroll = app.dashboard_logs_scroll.saturating_add(1);
+            scroll_dashboard_logs_up(app, 1);
         }
         (KeyCode::Down, KeyModifiers::NONE)
             if matches!(app.tab, Tab::Dashboard)
                 && matches!(app.ui_focus, UiFocus::Logs)
                 && app.dashboard_logs_scroll_active =>
         {
-            app.dashboard_logs_scroll = app.dashboard_logs_scroll.saturating_sub(1);
-            if app.dashboard_logs_scroll == 0 {
-                app.dashboard_logs_follow = true;
-            }
+            scroll_dashboard_logs_down(app, 1);
         }
         (KeyCode::Char('k'), KeyModifiers::NONE)
             if matches!(app.tab, Tab::Dashboard)
                 && matches!(app.ui_focus, UiFocus::Logs)
                 && app.dashboard_logs_scroll_active =>
         {
-            app.dashboard_logs_follow = false;
-            app.dashboard_logs_scroll = app.dashboard_logs_scroll.saturating_add(1);
+            scroll_dashboard_logs_up(app, 1);
         }
         (KeyCode::Char('j'), KeyModifiers::NONE)
             if matches!(app.tab, Tab::Dashboard)
                 && matches!(app.ui_focus, UiFocus::Logs)
                 && app.dashboard_logs_scroll_active =>
         {
-            app.dashboard_logs_scroll = app.dashboard_logs_scroll.saturating_sub(1);
-            if app.dashboard_logs_scroll == 0 {
-                app.dashboard_logs_follow = true;
-            }
+            scroll_dashboard_logs_down(app, 1);
         }
         (KeyCode::PageUp, KeyModifiers::NONE)
             if matches!(app.tab, Tab::Dashboard)
                 && matches!(app.ui_focus, UiFocus::Logs)
                 && app.dashboard_logs_scroll_active =>
         {
-            app.dashboard_logs_follow = false;
-            app.dashboard_logs_scroll = app.dashboard_logs_scroll.saturating_add(10);
+            scroll_dashboard_logs_up(app, PAGE_SCROLL_ENTRIES);
         }
         (KeyCode::PageDown, KeyModifiers::NONE)
             if matches!(app.tab, Tab::Dashboard)
                 && matches!(app.ui_focus, UiFocus::Logs)
                 && app.dashboard_logs_scroll_active =>
         {
-            app.dashboard_logs_scroll = app.dashboard_logs_scroll.saturating_sub(10);
-            if app.dashboard_logs_scroll == 0 {
-                app.dashboard_logs_follow = true;
-            }
+            scroll_dashboard_logs_down(app, PAGE_SCROLL_ENTRIES);
         }
         (KeyCode::Char('u'), KeyModifiers::CONTROL)
             if matches!(app.tab, Tab::Dashboard)
                 && matches!(app.ui_focus, UiFocus::Logs)
                 && app.dashboard_logs_scroll_active =>
         {
-            app.dashboard_logs_follow = false;
-            app.dashboard_logs_scroll = app.dashboard_logs_scroll.saturating_add(10);
+            scroll_dashboard_logs_up(app, PAGE_SCROLL_ENTRIES);
         }
         (KeyCode::Char('d'), KeyModifiers::CONTROL)
             if matches!(app.tab, Tab::Dashboard)
                 && matches!(app.ui_focus, UiFocus::Logs)
                 && app.dashboard_logs_scroll_active =>
         {
-            app.dashboard_logs_scroll = app.dashboard_logs_scroll.saturating_sub(10);
-            if app.dashboard_logs_scroll == 0 {
-                app.dashboard_logs_follow = true;
-            }
+            scroll_dashboard_logs_down(app, PAGE_SCROLL_ENTRIES);
         }
         (KeyCode::Char('g'), KeyModifiers::NONE)
             if matches!(app.tab, Tab::Dashboard)
@@ -620,8 +625,12 @@ pub(super) async fn handle_key(
                         app.withdraw.destination = match app.withdraw.destination {
                             super::app::WithdrawDestinationKind::Main => super::app::WithdrawDestinationKind::Manual,
                             super::app::WithdrawDestinationKind::Trader => super::app::WithdrawDestinationKind::Main,
-                            super::app::WithdrawDestinationKind::Recovery => super::app::WithdrawDestinationKind::Trader,
-                            super::app::WithdrawDestinationKind::Manual => super::app::WithdrawDestinationKind::Recovery,
+                            super::app::WithdrawDestinationKind::Recovery => {
+                                super::app::WithdrawDestinationKind::Trader
+                            }
+                            super::app::WithdrawDestinationKind::Manual => {
+                                super::app::WithdrawDestinationKind::Recovery
+                            }
                         };
                     }
                     WithdrawField::Asset => {
@@ -643,8 +652,12 @@ pub(super) async fn handle_key(
                     WithdrawField::Destination => {
                         app.withdraw.destination = match app.withdraw.destination {
                             super::app::WithdrawDestinationKind::Main => super::app::WithdrawDestinationKind::Trader,
-                            super::app::WithdrawDestinationKind::Trader => super::app::WithdrawDestinationKind::Recovery,
-                            super::app::WithdrawDestinationKind::Recovery => super::app::WithdrawDestinationKind::Manual,
+                            super::app::WithdrawDestinationKind::Trader => {
+                                super::app::WithdrawDestinationKind::Recovery
+                            }
+                            super::app::WithdrawDestinationKind::Recovery => {
+                                super::app::WithdrawDestinationKind::Manual
+                            }
                             super::app::WithdrawDestinationKind::Manual => super::app::WithdrawDestinationKind::Main,
                         };
                     }

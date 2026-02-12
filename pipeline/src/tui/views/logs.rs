@@ -5,6 +5,7 @@ use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
+use unicode_width::UnicodeWidthStr;
 
 use super::super::app::{App, UiFocus};
 
@@ -153,18 +154,101 @@ fn is_level(token: &str) -> bool {
     matches!(token, "ERROR" | "WARN" | "INFO" | "DEBUG" | "TRACE")
 }
 
+pub(crate) fn wrapped_row_count_for_entry(line: &str, content_width: usize) -> usize {
+    if content_width == 0 {
+        return 1;
+    }
+
+    // Keep empty lines visible as one visual row.
+    let width = line.trim_end_matches('\r').width().max(1);
+    width.div_ceil(content_width)
+}
+
 pub(super) fn estimate_wrapped_log_lines(logs: &VecDeque<String>, content_width: usize) -> usize {
     if content_width == 0 {
         return logs.len();
     }
 
     logs.iter()
-        .map(|line| {
-            // Keep empty lines visible as one visual row.
-            let width = line.trim_end_matches('\r').chars().count().max(1);
-            width.div_ceil(content_width)
-        })
+        .map(|line| wrapped_row_count_for_entry(line, content_width))
         .sum()
+}
+
+fn clamped_scroll_rows(logs: &VecDeque<String>, content_width: usize, scroll: u16) -> usize {
+    let total_rows = estimate_wrapped_log_lines(logs, content_width);
+    usize::from(scroll).min(total_rows)
+}
+
+fn saturating_u16(value: usize) -> u16 {
+    value.min(usize::from(u16::MAX)) as u16
+}
+
+pub(crate) fn scroll_up_by_entries(
+    logs: &VecDeque<String>,
+    content_width: usize,
+    current_scroll: u16,
+    entries: usize,
+) -> u16 {
+    let mut scroll = current_scroll;
+
+    for _ in 0..entries {
+        let target = clamped_scroll_rows(logs, content_width, scroll);
+        let mut hidden_rows = 0usize;
+        let mut step = 0usize;
+
+        for entry in logs.iter().rev() {
+            let entry_rows = wrapped_row_count_for_entry(entry, content_width);
+            if target < hidden_rows + entry_rows {
+                step = hidden_rows + entry_rows - target;
+                break;
+            }
+            hidden_rows += entry_rows;
+        }
+
+        if step == 0 {
+            break;
+        }
+
+        scroll = scroll.saturating_add(saturating_u16(step));
+    }
+
+    scroll
+}
+
+pub(crate) fn scroll_down_by_entries(
+    logs: &VecDeque<String>,
+    content_width: usize,
+    current_scroll: u16,
+    entries: usize,
+) -> u16 {
+    let mut scroll = current_scroll;
+
+    for _ in 0..entries {
+        let target = clamped_scroll_rows(logs, content_width, scroll);
+        if target == 0 {
+            break;
+        }
+
+        let mut hidden_rows = 0usize;
+        let mut step = target;
+
+        for entry in logs.iter().rev() {
+            let entry_rows = wrapped_row_count_for_entry(entry, content_width);
+            if target <= hidden_rows + entry_rows {
+                step = target - hidden_rows;
+                break;
+            }
+            hidden_rows += entry_rows;
+        }
+
+        if step == 0 {
+            break;
+        }
+
+        scroll = scroll.saturating_sub(saturating_u16(step));
+    }
+
+    scroll
 }
 
 pub(super) fn draw_logs(f: &mut Frame<'_>, area: Rect, app: &App) {

@@ -139,7 +139,11 @@ pub(super) fn open_deposit_panel(app: &mut App, ui_tx: &mpsc::UnboundedSender<Ui
     request_mexc_deposit_address(app, ui_tx, asset, network, true, true);
 }
 
-pub(super) fn submit_withdraw(app: &mut App, ui_tx: &mpsc::UnboundedSender<UiEvent>, ctx: &Arc<crate::context::PipelineContext>) {
+pub(super) fn submit_withdraw(
+    app: &mut App,
+    ui_tx: &mpsc::UnboundedSender<UiEvent>,
+    ctx: &Arc<crate::context::PipelineContext>,
+) {
     if app.withdraw.in_flight {
         app.push_log("withdraw: already in flight");
         return;

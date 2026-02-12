@@ -114,10 +114,7 @@ pub(super) fn draw_executions(f: &mut Frame<'_>, area: Rect, app: &App) {
         .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
         .split(body_area);
 
-    let selected = exec
-        .rows
-        .get(app.executions_selected)
-        .or_else(|| exec.rows.first());
+    let selected = exec.rows.get(app.executions_selected).or_else(|| exec.rows.first());
 
     let details_block = {
         let title = if matches!(app.ui_focus, UiFocus::ExecutionsDetails) {
@@ -340,10 +337,7 @@ fn append_receipt_from_meta(lines: &mut Vec<Line<'static>>, raw: &str) {
 fn append_receipt_lines(lines: &mut Vec<Line<'static>>, receipt: &ExecutionReceipt) {
     push_section_title(lines, "Request");
     let req = &receipt.request;
-    lines.push(Line::from(format!(
-        "Borrower: {}",
-        req.liquidation.borrower.to_text()
-    )));
+    lines.push(Line::from(format!("Borrower: {}", req.liquidation.borrower.to_text())));
     lines.push(Line::from(format!(
         "Debt pool: {}",
         req.liquidation.debt_pool_id.to_text()
@@ -379,7 +373,11 @@ fn append_receipt_lines(lines: &mut Vec<Line<'static>>, receipt: &ExecutionRecei
     )));
     lines.push(Line::from(format!(
         "Expected profit: {}",
-        format_profit(req.expected_profit, req.debt_asset.decimals(), req.debt_asset.symbol().as_str())
+        format_profit(
+            req.expected_profit,
+            req.debt_asset.decimals(),
+            req.debt_asset.symbol().as_str()
+        )
     )));
     lines.push(Line::from(format!(
         "Debt approval needed: {}",
@@ -407,7 +405,8 @@ fn append_receipt_lines(lines: &mut Vec<Line<'static>>, receipt: &ExecutionRecei
         )));
         lines.push(Line::from(format!(
             "Collateral received: {}",
-            ChainTokenAmount::from_raw(req.collateral_asset.clone(), liq.amounts.collateral_received.clone()).formatted()
+            ChainTokenAmount::from_raw(req.collateral_asset.clone(), liq.amounts.collateral_received.clone())
+                .formatted()
         )));
         lines.push(Line::from(format!(
             "Change transfer: {}",
@@ -464,13 +463,16 @@ fn append_meta_summary(lines: &mut Vec<Line<'static>>, meta: &[u8]) {
     if let Ok(text) = std::str::from_utf8(meta) {
         lines.push(Line::from("Encoding: utf8"));
         if let Ok(value) = serde_json::from_str::<Value>(text) {
+            let mut emitted = false;
             if let Some(step) = value.get("step").and_then(Value::as_str) {
                 lines.push(Line::from(format!("CEX step: {}", step)));
+                emitted = true;
             }
             if let Some(last_error) = value.get("last_error").and_then(Value::as_str)
                 && !last_error.trim().is_empty()
             {
                 lines.push(Line::from(format!("CEX last error: {}", last_error)));
+                emitted = true;
             }
             if let Some(withdraw_id) = value
                 .get("withdraw_id")
@@ -478,14 +480,15 @@ fn append_meta_summary(lines: &mut Vec<Line<'static>>, meta: &[u8]) {
                 .filter(|s| !s.is_empty())
             {
                 lines.push(Line::from(format!("CEX withdraw id: {}", withdraw_id)));
+                emitted = true;
+            }
+            if !emitted {
+                lines.push(Line::from(format!("State preview: {}", truncate(text, 180))));
             }
             return;
         }
 
-        lines.push(Line::from(format!(
-            "State preview: {}",
-            truncate(text, 180)
-        )));
+        lines.push(Line::from(format!("State preview: {}", truncate(text, 180))));
         return;
     }
 

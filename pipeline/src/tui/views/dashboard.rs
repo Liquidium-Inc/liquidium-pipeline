@@ -3,6 +3,7 @@ use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table, Wrap};
+use unicode_width::UnicodeWidthStr;
 
 use super::super::app::{App, UiFocus};
 use super::super::format::format_i128_amount;
@@ -330,7 +331,7 @@ fn truncate_start(s: &str, max: usize) -> String {
         return "…".to_string();
     }
 
-    let len = s.chars().count();
+    let len = s.width();
     if len <= max {
         return s.to_string();
     }
@@ -351,7 +352,7 @@ fn truncate_middle(s: &str, max: usize) -> String {
         return "…".to_string();
     }
 
-    let len = s.chars().count();
+    let len = s.width();
     if len <= max {
         return s.to_string();
     }
