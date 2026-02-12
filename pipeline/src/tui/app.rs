@@ -383,7 +383,15 @@ impl App {
 
     fn append_log_entry(&mut self, part: String, bump_logs_scroll: bool, bump_dashboard_scroll: bool) {
         if self.logs.len() >= LOG_MAX_ENTRIES {
-            self.logs.pop_front();
+            if let Some(removed) = self.logs.pop_front() {
+                let removed_logs_rows = super::views::logs::wrapped_row_count_for_entry(&removed, self.logs_content_width)
+                    .min(usize::from(u16::MAX)) as u16;
+                let removed_dashboard_rows =
+                    super::views::logs::wrapped_row_count_for_entry(&removed, self.dashboard_logs_content_width)
+                        .min(usize::from(u16::MAX)) as u16;
+                self.logs_scroll = self.logs_scroll.saturating_sub(removed_logs_rows);
+                self.dashboard_logs_scroll = self.dashboard_logs_scroll.saturating_sub(removed_dashboard_rows);
+            }
         }
         self.logs.push_back(part.clone());
         if bump_logs_scroll {
@@ -537,5 +545,28 @@ mod tests {
         assert_eq!(app.logs_scroll, 4);
         assert_eq!(app.logs[0], "INFO older-1");
         assert_eq!(app.logs[1], "INFO older-2");
+    }
+
+    #[test]
+    fn append_logs_eviction_keeps_scroll_offsets_stable() {
+        let mut app = App::new(vec![], sample_config());
+        app.logs_content_width = 8;
+        app.dashboard_logs_content_width = 8;
+        app.logs_scroll_active = true;
+        app.logs_follow = false;
+        app.dashboard_logs_scroll_active = true;
+        app.dashboard_logs_follow = false;
+        app.logs_scroll = 5;
+        app.dashboard_logs_scroll = 7;
+
+        for _ in 0..super::LOG_MAX_ENTRIES {
+            app.logs.push_back("oldline".to_string());
+        }
+
+        app.append_logs(vec!["newline".to_string()]);
+
+        assert_eq!(app.logs_scroll, 5);
+        assert_eq!(app.dashboard_logs_scroll, 7);
+        assert_eq!(app.logs.back().expect("last"), "newline");
     }
 }

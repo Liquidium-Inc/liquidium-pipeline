@@ -413,9 +413,9 @@ liquidator tui --sock-path /run/liquidator/ctl.sock --unit-name liquidator.servi
 Launches an attachable terminal UI to **pause/resume** the daemon, view **WAL status**, **profits** (from `EXPORT_PATH`), **balances**, and run **withdrawals** (ICP tokens only).
 Log source selection:
 - If `--log-file` is provided, TUI tails that file on any OS.
-- On Linux with no `--log-file`, TUI prefers `journalctl -u <unit-name>` (default unit: `liquidator.service`).
-- On Linux when the unit is inactive, TUI may auto-tail `<temp>/liquidator/liquidator.log` if that file exists and was updated recently.
-- On non-Linux without `--log-file`, TUI tails `<temp>/liquidator/liquidator.log` if it exists; otherwise it shows a no-log-source notice.
+- If running on Linux with no `--log-file`, TUI prefers `journalctl -u <unit-name>` (default unit: `liquidator.service`).
+- If that unit is inactive on Linux, TUI may auto-tail `<temp>/liquidator/liquidator.log` if the file exists and was updated recently.
+- On non-Linux systems without `--log-file`, TUI tails `<temp>/liquidator/liquidator.log` if present, otherwise it shows a no-log-source notice.
 
 **Key bindings:**
 - `r` — pause/resume

@@ -675,8 +675,9 @@ fn read_follow_file_lines(path: &Path, state: &mut FileTailState) -> std::io::Re
 
     if len < state.follow_offset {
         state.follow_offset = 0;
-        state.oldest_offset = state.oldest_offset.min(len);
-        state.has_more_older = state.oldest_offset > 0;
+        state.oldest_offset = 0;
+        state.has_more_older = false;
+        state.no_more_notice_sent = false;
     }
     if len == state.follow_offset {
         return Ok(Vec::new());
@@ -952,6 +953,23 @@ mod tests {
         std::fs::write(&path, "reset\n").expect("truncate+write");
         let after_truncate = read_follow_file_lines(&path, &mut state).expect("truncate read");
         assert_eq!(after_truncate, vec!["reset".to_string()]);
+    }
+
+    #[test]
+    fn file_truncation_resets_older_paging_state() {
+        let tmp = TempDir::new().expect("tmp");
+        let path = tmp.path().join("liquidator.log");
+        std::fs::write(&path, "first\nsecond\n").expect("seed");
+
+        let (mut state, _initial) = initialize_file_state(&path).expect("init");
+        state.oldest_offset = 123;
+        state.has_more_older = true;
+
+        std::fs::write(&path, "reset\n").expect("truncate+write");
+        let _ = read_follow_file_lines(&path, &mut state).expect("read after truncation");
+
+        assert_eq!(state.oldest_offset, 0);
+        assert!(!state.has_more_older);
     }
 
     #[test]
