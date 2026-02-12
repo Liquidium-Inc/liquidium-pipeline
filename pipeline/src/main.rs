@@ -186,7 +186,7 @@ async fn main() {
             log_file,
         } => {
             let sock_path = sock_path.unwrap_or_else(control_plane::default_sock_path);
-            let inferred_log_file = infer_tui_log_file(log_file);
+            let inferred_log_file = infer_tui_log_file(log_file, &unit_name);
             let opts = commands::tui::TuiOptions {
                 sock_path,
                 unit_name,
@@ -269,9 +269,25 @@ fn effective_run_log_file(requested: Option<Option<PathBuf>>, no_log_file: bool)
     }
 }
 
-fn infer_tui_log_file(requested: Option<PathBuf>) -> Option<PathBuf> {
+fn infer_tui_log_file(requested: Option<PathBuf>, unit_name: &str) -> Option<PathBuf> {
     if requested.is_some() {
         return requested;
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        match is_systemd_unit_active(unit_name) {
+            Ok(true) => return None,
+            Ok(false) => {}
+            Err(err) => {
+                eprintln!("Warning: unable to query systemd unit state for '{unit_name}': {err}");
+            }
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = unit_name;
     }
 
     let candidate = control_plane::default_log_file_path();

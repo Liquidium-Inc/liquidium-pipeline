@@ -174,33 +174,6 @@ fn detect_level_anywhere(line: &str) -> Option<&'static str> {
     line.split_whitespace().take(12).find_map(normalize_level)
 }
 
-#[cfg(test)]
-mod tests {
-    use ratatui::style::Color;
-
-    use super::log_to_line;
-
-    #[test]
-    fn highlights_lowercase_level_after_timestamp() {
-        let line = log_to_line("2026-02-12T10:00:00.000000Z info started");
-        assert_eq!(line.spans[2].content.as_ref(), "INFO ");
-        assert_eq!(line.spans[2].style.fg, Some(Color::Green));
-    }
-
-    #[test]
-    fn highlights_wrapped_warn_level() {
-        let line = log_to_line("2026-02-12T10:00:00.000000Z [WARN] warning");
-        assert_eq!(line.spans[2].content.as_ref(), "WARN ");
-        assert_eq!(line.spans[2].style.fg, Some(Color::Yellow));
-    }
-
-    #[test]
-    fn fallback_detects_embedded_level_tokens() {
-        let line = log_to_line("Feb 12 host liquidator[123]: INFO daemon resumed");
-        assert_eq!(line.spans[0].style.fg, Some(Color::Green));
-    }
-}
-
 pub(crate) fn wrapped_row_count_for_entry(line: &str, content_width: usize) -> usize {
     if content_width == 0 {
         return 1;
@@ -322,4 +295,31 @@ pub(super) fn draw_logs(f: &mut Frame<'_>, area: Rect, app: &App) {
         .scroll((scroll, 0))
         .wrap(Wrap { trim: false });
     f.render_widget(w, area);
+}
+
+#[cfg(test)]
+mod tests {
+    use ratatui::style::Color;
+
+    use super::log_to_line;
+
+    #[test]
+    fn highlights_lowercase_level_after_timestamp() {
+        let line = log_to_line("2026-02-12T10:00:00.000000Z info started");
+        assert_eq!(line.spans[2].content.as_ref(), "INFO ");
+        assert_eq!(line.spans[2].style.fg, Some(Color::Green));
+    }
+
+    #[test]
+    fn highlights_wrapped_warn_level() {
+        let line = log_to_line("2026-02-12T10:00:00.000000Z [WARN] warning");
+        assert_eq!(line.spans[2].content.as_ref(), "WARN ");
+        assert_eq!(line.spans[2].style.fg, Some(Color::Yellow));
+    }
+
+    #[test]
+    fn fallback_detects_embedded_level_tokens() {
+        let line = log_to_line("Feb 12 host liquidator[123]: INFO daemon resumed");
+        assert_eq!(line.spans[0].style.fg, Some(Color::Green));
+    }
 }

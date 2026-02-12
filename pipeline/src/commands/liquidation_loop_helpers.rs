@@ -44,6 +44,7 @@ const FINALIZER_STAGE_TIMEOUT: Duration = Duration::from_secs(300);
 const EXPORT_STAGE_TIMEOUT: Duration = Duration::from_secs(20);
 const WATCHDOG_STAGE_TIMEOUT: Duration = Duration::from_secs(10);
 const REFRESH_ALLOWANCES_TIMEOUT: Duration = Duration::from_secs(45);
+const SCAN_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(300);
 const PANIC_RECOVERY_DELAY: Duration = Duration::from_secs(1);
 const TIMEOUT_RECOVERY_DELAY: Duration = Duration::from_secs(1);
 const PAUSED_LOOP_DELAY: Duration = Duration::from_secs(2);
@@ -378,7 +379,7 @@ async fn run_single_daemon_cycle(
         set_spinner_message(spinner, true);
     } else {
         set_spinner_message(spinner, false);
-        if last_alive_log.elapsed() >= Duration::from_secs(300) {
+        if last_alive_log.elapsed() >= SCAN_HEARTBEAT_INTERVAL {
             info!("Liquidator running; scanning for liquidation opportunities...");
             *last_alive_log = Instant::now();
         }
