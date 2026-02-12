@@ -537,6 +537,16 @@ Attach the TUI at any time:
 liquidator tui --sock-path /run/liquidator/ctl.sock --unit-name liquidator.service
 ```
 
+Convenience installer for Linux:
+
+```bash
+./dev/install-daemon.sh
+```
+
+This installs/updates `/etc/systemd/system/liquidator.service`, creates the
+`liquidator` user/group if missing, runs `systemctl daemon-reload`, enables the
+unit, and restarts it.
+
 Linux non-service mode with file tail:
 
 ```bash
