@@ -37,9 +37,9 @@ use liquidium_pipeline_core::tokens::{
     token_registry::{TokenRegistry, TokenRegistryTrait},
 };
 
-const FINDER_STAGE_TIMEOUT: Duration = Duration::from_secs(45);
-const LIQUIDATION_CYCLE_TIMEOUT: Duration = Duration::from_secs(90);
-const FINALIZER_STAGE_TIMEOUT: Duration = Duration::from_secs(45);
+const FINDER_STAGE_TIMEOUT: Duration = Duration::from_secs(300);
+const LIQUIDATION_CYCLE_TIMEOUT: Duration = Duration::from_secs(300);
+const FINALIZER_STAGE_TIMEOUT: Duration = Duration::from_secs(300);
 const EXPORT_STAGE_TIMEOUT: Duration = Duration::from_secs(20);
 const WATCHDOG_STAGE_TIMEOUT: Duration = Duration::from_secs(10);
 const REFRESH_ALLOWANCES_TIMEOUT: Duration = Duration::from_secs(45);
@@ -116,6 +116,7 @@ pub(crate) fn log_execution_results(results: &[LiquidationOutcome]) {
             .as_ref()
             .map(|v| v.id.to_string())
             .unwrap_or_else(|| "n/a".to_string());
+
         let swap_status = r
             .finalizer_result
             .swap_result
@@ -152,7 +153,7 @@ pub(crate) fn debt_asset_principals(registry: &TokenRegistry) -> Vec<Principal> 
         .iter()
         .filter_map(|(_, tok)| {
             if let ChainToken::Icp { ledger, .. } = tok {
-                Some(ledger.clone())
+                Some(*ledger)
             } else {
                 None
             }
@@ -226,7 +227,7 @@ pub(crate) async fn run_daemon_cycle_loop(
     liq_dog: &Arc<dyn Watchdog>,
     paused: Arc<AtomicBool>,
     debt_assets: &Vec<String>,
-    debt_asset_principals: &Vec<Principal>,
+    debt_asset_principals: &[Principal],
     ui_enabled: bool,
 ) {
     let mut spinner = start_spinner(ui_enabled);
@@ -263,7 +264,7 @@ pub(crate) async fn run_daemon_cycle_loop(
 
         if outcome.had_timeout {
             consecutive_timed_out_cycles = consecutive_timed_out_cycles.saturating_add(1);
-            if consecutive_timed_out_cycles % 5 == 0 {
+            if consecutive_timed_out_cycles.is_multiple_of(5) {
                 warn!(
                     consecutive_timed_out_cycles,
                     "Repeated stage timeouts detected; daemon remains alive and retrying"
@@ -320,7 +321,7 @@ async fn run_single_daemon_cycle(
     liq_dog: &Arc<dyn Watchdog>,
     paused: &AtomicBool,
     debt_assets: &Vec<String>,
-    debt_asset_principals: &Vec<Principal>,
+    debt_asset_principals: &[Principal],
     ui_enabled: bool,
     spinner: &mut Option<ProgressBar>,
     last_alive_log: &mut Instant,

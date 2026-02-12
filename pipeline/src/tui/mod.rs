@@ -241,8 +241,8 @@ pub async fn run(opts: TuiOptions) -> anyhow::Result<()> {
                 app.last_tick = Instant::now();
             }
             UiEvent::LogLine(msg) => app.push_log(msg),
-            UiEvent::DaemonPaused(res) => match res {
-                Ok(is_paused) => {
+            UiEvent::DaemonPaused(res) => {
+                if let Ok(is_paused) = res {
                     if !matches!(app.engine, LoopControl::Stopping) {
                         app.engine = if is_paused {
                             LoopControl::Paused
@@ -251,8 +251,7 @@ pub async fn run(opts: TuiOptions) -> anyhow::Result<()> {
                         };
                     }
                 }
-                Err(_) => {}
-            },
+            }
             UiEvent::Wal(res) => match res {
                 Ok(snapshot) => {
                     app.wal = Some(snapshot);

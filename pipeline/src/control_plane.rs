@@ -248,6 +248,7 @@ async fn handle_client(
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::os::unix::fs::FileTypeExt;
     use std::os::unix::net as std_uds;
     use std::path::Path;
     use std::sync::Arc;
@@ -314,8 +315,9 @@ mod tests {
         assert!(path.exists());
 
         let listener = bind_control_listener(&path).expect("bind after stale cleanup");
+        let meta = fs::metadata(&path).expect("socket metadata");
+        assert!(meta.file_type().is_socket(), "bound path must be a unix socket");
         drop(listener);
-        assert!(path.exists());
     }
 
     #[test]
