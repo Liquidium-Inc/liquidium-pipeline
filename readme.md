@@ -11,6 +11,7 @@ Inspired by Artemis/MEV patterns and designed for permissionless, community-driv
 - [Configuration](#configuration)
 - [Identity Management](#identity-management)
 - [Architecture Overview](#architecture-overview)
+- [Error Handling](#error-handling)
 - [CLI Commands](#cli-commands)
 - [Operations Runbook](#operations-runbook)
 - [Developer Setup](#developer-setup)
@@ -371,6 +372,39 @@ Stages are implemented with `async-trait` for composability.
 - **SQLite WAL** tracks liquidation state across restarts
 - **Retryable failures** retry up to 5 times with exponential backoff
 - **Idempotent operations** prevent double-liquidations
+
+## Error Handling
+
+The workspace uses layered, typed errors with a shared numeric code taxonomy.
+
+### Error Layers
+
+- `commons` (`commons/src/error.rs`) defines shared primitives: `ErrorCode`, `CodedError`, `ExternalError`, `format_with_code(...)`.
+- `core` (`core/src/error.rs`) defines domain errors (`CoreError`, `TokenRegistryError`, `AccountError`, `TransferError`).
+- `connectors` (`connectors/src/error.rs`) defines infra/boundary errors (`ConnectorError`).
+- `pipeline` (`pipeline/src/error.rs`) defines orchestration root error (`PipelineError`) that wraps config/core/connector/wal/stage failures.
+
+### Shared Error Codes
+
+Compact categories are used across the app:
+
+- `PipelineConfig` (`1000`)
+- `PipelineConnector` (`1001`)
+- `PipelineCore` (`1002`)
+- `PipelineWal` (`1003`)
+- `PipelineExecution` (`1004`)
+- `PipelineFinalization` (`1005`)
+- `PipelineContext` (`1006`)
+- `PipelineUnknown` (`1099`)
+
+### Error Propagation Rules
+
+- Create errors in the layer where they originate.
+- Wrap typed lower-layer errors at crate boundaries (for example, into `PipelineError`).
+- Convert to strings only at user-facing boundaries (CLI/TUI/main) using `format_with_code(...)`.
+- Prefer test assertions on error type/code instead of exact message strings.
+
+Practical model: create low, wrap upward, format at the edge.
 
 ---
 

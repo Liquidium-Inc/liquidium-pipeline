@@ -8,6 +8,7 @@ use tracing::instrument;
 use tracing::{debug, info, warn};
 
 use crate::{
+    error::coded_stage,
     executors::{basic::basic_executor::BasicExecutor, executor::ExecutorRequest},
     finalizers::{finalizer::FinalizerResult, liquidation_outcome::LiquidationOutcome},
     persistance::{LiqMetaWrapper, LiqResultRecord, ResultStatus, WalStore},
@@ -30,10 +31,6 @@ pub enum ExecutionStatus {
     CollateralTransferFailed(String),
     ChangeTransferFailed(String),
     SwapFailed(String),
-}
-
-fn coded(code: ErrorCode, message: impl Into<String>) -> String {
-    format!("{} (code={})", message.into(), code.as_u16())
 }
 
 impl ExecutionStatus {
@@ -89,7 +86,7 @@ impl<'a, A: PipelineAgent, D: WalStore> PipelineStage<'a, Vec<ExecutorRequest>, 
                 );
 
                 let args = Encode!(&liq_req)
-                    .map_err(|e| coded(ErrorCode::PipelineExecution, format!("liquidation encode failed: {e}")))?;
+                    .map_err(|e| coded_stage(ErrorCode::PipelineExecution, format!("liquidation encode failed: {e}")))?;
 
                 let liq_call = match self
                     .agent
@@ -104,7 +101,10 @@ impl<'a, A: PipelineAgent, D: WalStore> PipelineStage<'a, Vec<ExecutorRequest>, 
                     Err(err) => {
                         warn!("Liquidation call failed {err}");
                         receipt.status =
-                            ExecutionStatus::LiquidationCallFailed(coded(ErrorCode::PipelineExecution, err.to_string()));
+                            ExecutionStatus::LiquidationCallFailed(coded_stage(
+                                ErrorCode::PipelineExecution,
+                                err.to_string(),
+                            ));
                         return Ok::<ExecutionReceipt, String>(receipt);
                     }
                 };
@@ -113,7 +113,10 @@ impl<'a, A: PipelineAgent, D: WalStore> PipelineStage<'a, Vec<ExecutorRequest>, 
                     Ok(v) => v,
                     Err(err) => {
                         receipt.status =
-                            ExecutionStatus::FailedLiquidation(coded(ErrorCode::PipelineExecution, format!("{err:?}")));
+                            ExecutionStatus::FailedLiquidation(coded_stage(
+                                ErrorCode::PipelineExecution,
+                                format!("{err:?}"),
+                            ));
                         return Ok::<ExecutionReceipt, String>(receipt);
                     }
                 };
@@ -143,7 +146,7 @@ impl<'a, A: PipelineAgent, D: WalStore> PipelineStage<'a, Vec<ExecutorRequest>, 
                             "[executor] 🧱 collateral_tx status={:?} liq_id={}",
                             liq.collateral_tx.status, liq.id
                         );
-                        receipt.status = ExecutionStatus::CollateralTransferFailed(coded(
+                        receipt.status = ExecutionStatus::CollateralTransferFailed(coded_stage(
                             ErrorCode::PipelineExecution,
                             "collateral pending",
                         ));
@@ -160,7 +163,7 @@ impl<'a, A: PipelineAgent, D: WalStore> PipelineStage<'a, Vec<ExecutorRequest>, 
                             "[executor] 🧱 collateral_tx status={:?} liq_id={}",
                             liq.collateral_tx.status, liq.id
                         );
-                        receipt.status = ExecutionStatus::CollateralTransferFailed(coded(
+                        receipt.status = ExecutionStatus::CollateralTransferFailed(coded_stage(
                             ErrorCode::PipelineExecution,
                             err.clone(),
                         ));
@@ -240,6 +243,6 @@ impl<A: PipelineAgent, D: WalStore> BasicExecutor<A, D> {
         self.wal
             .upsert_result(result_record)
             .await
-            .map_err(|e| coded(ErrorCode::PipelineWal, format!("wal upsert_result failed: {e}")))
+            .map_err(|e| coded_stage(ErrorCode::PipelineWal, format!("wal upsert_result failed: {e}")))
     }
 }

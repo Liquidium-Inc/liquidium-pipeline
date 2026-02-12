@@ -27,6 +27,7 @@ use liquidium_pipeline_connectors::{
 
 use crate::approval_state::ApprovalState;
 use crate::config::{Config, ConfigResult, ConfigTrait};
+use crate::error::coded_stage;
 use crate::swappers::kong::kong_swapper::KongSwapSwapper;
 use crate::swappers::kong::kong_venue::KongVenue;
 use crate::swappers::router::{SwapRouter, SwapVenue};
@@ -80,11 +81,7 @@ impl CodedError for PipelineContextError {
 }
 
 fn context_error(message: impl Into<String>) -> PipelineContextError {
-    PipelineContextError::Other(format!(
-        "{} (code={})",
-        message.into(),
-        ErrorCode::PipelineContext.as_u16()
-    ))
+    PipelineContextError::Other(coded_stage(ErrorCode::PipelineContext, message))
 }
 
 fn should_fallback_to_empty_registry(err: &PipelineContextError) -> bool {

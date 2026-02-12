@@ -1,4 +1,4 @@
-use liquidium_pipeline_commons::error::{CodedError, ErrorCode, ExternalError};
+use liquidium_pipeline_commons::error::{CodedError, ErrorCode, ExternalError, format_with_code};
 use liquidium_pipeline_connectors::error::ConnectorError;
 use liquidium_pipeline_core::error::CoreError;
 use thiserror::Error;
@@ -50,4 +50,8 @@ impl CodedError for PipelineError {
             PipelineError::Stage { code, .. } => *code,
         }
     }
+}
+
+pub fn coded_stage(code: ErrorCode, message: impl Into<String>) -> String {
+    format_with_code(&PipelineError::stage(code, message))
 }

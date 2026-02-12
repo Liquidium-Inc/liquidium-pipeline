@@ -9,6 +9,7 @@ use tracing::instrument;
 use tracing::{info, warn};
 
 use crate::config::SwapperMode;
+use crate::error::coded_stage;
 use crate::persistance::{LiqMetaWrapper, LiqResultRecord, ResultStatus, WalStore};
 use crate::stages::executor::ExecutionReceipt;
 use crate::stages::executor::ExecutionStatus;
@@ -18,10 +19,6 @@ use crate::wal::{decode_receipt_wrapper, encode_meta};
 use liquidium_pipeline_connectors::pipeline_agent::PipelineAgent;
 use liquidium_pipeline_core::types::protocol_types::{LiquidationResult, ProtocolError, TransferStatus};
 const MAX_UNPROFITABLE_SECS: i64 = 180;
-
-fn coded(code: ErrorCode, message: impl Into<String>) -> String {
-    format!("{} (code={})", message.into(), code.as_u16())
-}
 
 pub struct SettlementWatcher<A, S, D>
 where
@@ -77,7 +74,7 @@ where
             .list_by_status(ResultStatus::WaitingCollateral, 100)
             .await
             .map_err(|e| {
-                coded(
+                coded_stage(
                     ErrorCode::PipelineWal,
                     format!("wal list waiting-collateral failed: {e}"),
                 )
@@ -86,7 +83,7 @@ where
             .wal
             .list_by_status(ResultStatus::WaitingProfit, 100)
             .await
-            .map_err(|e| coded(ErrorCode::PipelineWal, format!("wal list waiting-profit failed: {e}")))?;
+            .map_err(|e| coded_stage(ErrorCode::PipelineWal, format!("wal list waiting-profit failed: {e}")))?;
         rows.append(&mut profit_rows);
 
         for row in rows {
@@ -143,7 +140,7 @@ where
                     .update_status(&row.id, ResultStatus::WaitingCollateral, false)
                     .await
                     .map_err(|e| {
-                        coded(
+                        coded_stage(
                             ErrorCode::PipelineWal,
                             format!("wal update_status waiting-collateral failed: {e}"),
                         )
@@ -157,7 +154,7 @@ where
                 .update_status(&row.id, ResultStatus::Succeeded, true)
                 .await
                 .map_err(|e| {
-                    coded(
+                    coded_stage(
                         ErrorCode::PipelineWal,
                         format!("wal update_status succeeded failed: {e}"),
                     )
@@ -170,7 +167,7 @@ where
                 .update_status(&row.id, ResultStatus::Enqueued, true)
                 .await
                 .map_err(|e| {
-                    coded(
+                    coded_stage(
                         ErrorCode::PipelineWal,
                         format!("wal update_status enqueued failed: {e}"),
                     )
@@ -185,7 +182,7 @@ where
                 .update_status(&row.id, ResultStatus::Enqueued, true)
                 .await
                 .map_err(|e| {
-                    coded(
+                    coded_stage(
                         ErrorCode::PipelineWal,
                         format!("wal update_status enqueued failed: {e}"),
                     )
@@ -201,7 +198,7 @@ where
             .request
             .swap_args
             .as_ref()
-            .ok_or_else(|| coded(ErrorCode::PipelineExecution, "missing swap args"))?;
+            .ok_or_else(|| coded_stage(ErrorCode::PipelineExecution, "missing swap args"))?;
 
         let quote = match self.swapper.quote(swap_req).await {
             Ok(q) => q,
@@ -220,7 +217,7 @@ where
                 .update_status(&row.id, ResultStatus::Enqueued, true)
                 .await
                 .map_err(|e| {
-                    coded(
+                    coded_stage(
                         ErrorCode::PipelineWal,
                         format!("wal update_status enqueued failed: {e}"),
                     )
@@ -238,7 +235,7 @@ where
                 .update_status(&row.id, ResultStatus::WaitingProfit, false)
                 .await
                 .map_err(|e| {
-                    coded(
+                    coded_stage(
                         ErrorCode::PipelineWal,
                         format!("wal update_status waiting-profit failed: {e}"),
                     )
@@ -258,7 +255,7 @@ where
                 )
                 .await
                 .map_err(|e| {
-                    coded(
+                    coded_stage(
                         ErrorCode::PipelineWal,
                         format!("wal update_failure permanent failed: {e}"),
                     )
@@ -270,7 +267,7 @@ where
 
     async fn refresh_liquidation(&self, liq_id: u128) -> Result<LiquidationResult, String> {
         let args = Encode!(&liq_id).map_err(|e| {
-            coded(
+            coded_stage(
                 ErrorCode::PipelineExecution,
                 format!("get_liquidation encode error: {e}"),
             )
@@ -279,10 +276,10 @@ where
             .agent
             .call_query::<Result<LiquidationResult, ProtocolError>>(&self.lending_canister, "get_liquidation", args)
             .await
-            .map_err(|e| coded(ErrorCode::PipelineExecution, e))?;
+            .map_err(|e| coded_stage(ErrorCode::PipelineExecution, e))?;
         match res {
             Ok(liq) => Ok(liq),
-            Err(err) => Err(coded(
+            Err(err) => Err(coded_stage(
                 ErrorCode::PipelineExecution,
                 format!("get_liquidation error: {err:?}"),
             )),
@@ -308,7 +305,7 @@ where
         self.wal
             .upsert_result(row)
             .await
-            .map_err(|e| coded(ErrorCode::PipelineWal, format!("wal upsert_result failed: {e}")))?;
+            .map_err(|e| coded_stage(ErrorCode::PipelineWal, format!("wal upsert_result failed: {e}")))?;
         Ok(())
     }
 }

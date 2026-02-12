@@ -1,6 +1,7 @@
 mod commands;
 mod config;
 mod context;
+mod error;
 mod executors;
 mod finalizers;
 mod liquidation;

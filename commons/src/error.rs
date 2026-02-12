@@ -5,14 +5,14 @@ use std::fmt;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u16)]
 pub enum ErrorCode {
-    PipelineConfig = 4_000,
-    PipelineConnector = 4_001,
-    PipelineCore = 4_002,
-    PipelineWal = 4_003,
-    PipelineExecution = 4_004,
-    PipelineFinalization = 4_005,
-    PipelineContext = 4_006,
-    PipelineUnknown = 4_099,
+    PipelineConfig = 1_000,
+    PipelineConnector = 1_001,
+    PipelineCore = 1_002,
+    PipelineWal = 1_003,
+    PipelineExecution = 1_004,
+    PipelineFinalization = 1_005,
+    PipelineContext = 1_006,
+    PipelineUnknown = 1_099,
 }
 
 impl ErrorCode {

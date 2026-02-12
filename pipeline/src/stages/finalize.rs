@@ -6,6 +6,7 @@ use candid::{Encode, Principal};
 use liquidium_pipeline_commons::error::ErrorCode;
 use tracing::{debug, info, warn};
 
+use crate::error::coded_stage;
 use crate::finalizers::finalizer::{Finalizer, FinalizerResult};
 use crate::finalizers::liquidation_outcome::LiquidationOutcome;
 use crate::finalizers::profit_calculator::ProfitCalculator;
@@ -24,10 +25,6 @@ use liquidium_pipeline_core::types::protocol_types::{LiquidationResult, Protocol
 const MAX_FINALIZER_ERRORS: i32 = 5;
 /// Maximum safe left-shift for `u64` multipliers in retry backoff.
 const MAX_U64_SHIFT: u32 = 63;
-
-fn coded(code: ErrorCode, message: impl Into<String>) -> String {
-    format!("{} (code={})", message.into(), code.as_u16())
-}
 
 /// Exponential retry delay with cap: min(max, base * 2^(errors-1)).
 fn retry_delay_secs(base: u64, max: u64, error_count: i32) -> u64 {
@@ -94,7 +91,7 @@ where
 
     async fn refresh_liquidation(&self, liq_id: u128) -> Result<LiquidationResult, String> {
         let args = Encode!(&liq_id).map_err(|e| {
-            coded(
+            coded_stage(
                 ErrorCode::PipelineFinalization,
                 format!("get_liquidation encode error: {e}"),
             )
@@ -103,10 +100,10 @@ where
             .agent
             .call_query::<Result<LiquidationResult, ProtocolError>>(&self.lending_canister, "get_liquidation", args)
             .await
-            .map_err(|e| coded(ErrorCode::PipelineFinalization, e))?;
+            .map_err(|e| coded_stage(ErrorCode::PipelineFinalization, e))?;
         match res {
             Ok(liq) => Ok(liq),
-            Err(err) => Err(coded(
+            Err(err) => Err(coded_stage(
                 ErrorCode::PipelineFinalization,
                 format!("get_liquidation error: {err:?}"),
             )),
@@ -118,7 +115,7 @@ where
             .wal
             .get_result(liq_id)
             .await
-            .map_err(|e| coded(ErrorCode::PipelineWal, format!("wal get_result failed: {e}")))?;
+            .map_err(|e| coded_stage(ErrorCode::PipelineWal, format!("wal get_result failed: {e}")))?;
         if let Some(mut row) = row {
             let wrapper = LiqMetaWrapper {
                 receipt: receipt.clone(),
@@ -130,7 +127,7 @@ where
             self.wal
                 .upsert_result(row)
                 .await
-                .map_err(|e| coded(ErrorCode::PipelineWal, format!("wal upsert_result failed: {e}")))?;
+                .map_err(|e| coded_stage(ErrorCode::PipelineWal, format!("wal upsert_result failed: {e}")))?;
         }
         Ok(())
     }
@@ -150,7 +147,7 @@ where
             .wal
             .get_pending(100)
             .await
-            .map_err(|e| coded(ErrorCode::PipelineWal, format!("wal get_pending failed: {e}")))?;
+            .map_err(|e| coded_stage(ErrorCode::PipelineWal, format!("wal get_pending failed: {e}")))?;
         debug!("Finalizing rows {:?}", rows);
         if rows.is_empty() {
             return Ok(vec![]);

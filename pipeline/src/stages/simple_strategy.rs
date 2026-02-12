@@ -4,6 +4,7 @@ use std::{
 };
 
 use crate::config::ConfigTrait;
+use crate::error::coded_stage;
 use crate::executors::executor::ExecutorRequest;
 
 use crate::approval_state::ApprovalState;
@@ -37,10 +38,6 @@ use itertools::Itertools;
 
 const WIPEOUT_THRESHOLD: u32 = 975;
 
-fn coded(code: ErrorCode, message: impl Into<String>) -> String {
-    format!("{} (code={})", message.into(), code.as_u16())
-}
-
 type StrategyResult<T> = Result<T, StrategyError>;
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -65,7 +62,7 @@ impl StrategyError {
 
 impl From<StrategyError> for String {
     fn from(value: StrategyError) -> Self {
-        coded(value.code(), value.to_string())
+        coded_stage(value.code(), value.to_string())
     }
 }
 
