@@ -394,9 +394,29 @@ fn journal_value_to_text(value: &Value) -> String {
         Value::Bool(v) => v.to_string(),
         Value::Number(v) => v.to_string(),
         Value::String(v) => v.clone(),
-        Value::Array(values) => values.iter().map(journal_value_to_text).collect::<Vec<_>>().join(" "),
+        Value::Array(values) => decode_journal_byte_array(values)
+            .unwrap_or_else(|| values.iter().map(journal_value_to_text).collect::<Vec<_>>().join(" ")),
         Value::Object(_) => value.to_string(),
     }
+}
+
+#[cfg(target_os = "linux")]
+fn decode_journal_byte_array(values: &[Value]) -> Option<String> {
+    let mut bytes = Vec::with_capacity(values.len());
+    for value in values {
+        let n = value.as_u64()?;
+        if n > u8::MAX as u64 {
+            return None;
+        }
+        bytes.push(n as u8);
+    }
+
+    // journald JSON arrays for binary fields may be NUL-terminated.
+    while bytes.last().copied() == Some(0) {
+        bytes.pop();
+    }
+
+    Some(String::from_utf8_lossy(&bytes).to_string())
 }
 
 #[cfg(target_os = "linux")]
@@ -708,6 +728,16 @@ mod tests {
         let older = super::journal_older_args("liquidator.service", "cursor123");
         assert!(older.windows(2).any(|pair| pair == ["--before-cursor", "cursor123"]));
         assert!(older.windows(2).any(|pair| pair == ["-n", "300"]));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn journald_message_byte_array_decodes_to_text() {
+        let value = serde_json::json!([27, 91, 51, 50, 109, 73, 78, 70, 79, 27, 91, 48, 109, 32, 111, 107, 0]);
+        let text = super::journal_value_to_text(&value);
+        assert!(text.contains("INFO"));
+        assert!(text.contains("ok"));
+        assert!(!text.contains("27 91"));
     }
 
     #[cfg(not(target_os = "linux"))]
