@@ -1,9 +1,11 @@
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use tokio::sync::mpsc;
+use tokio::time::timeout;
 
 use crate::commands::liquidation_loop::LoopControl;
 use crate::control_plane::{ControlCommand, send_control_command};
@@ -16,6 +18,12 @@ use super::views::logs::{scroll_down_by_entries, scroll_up_by_entries};
 use super::withdraw::{open_deposit_panel, open_withdraw_panel, refresh_withdraw_deposit_address, submit_withdraw};
 
 const PAGE_SCROLL_ENTRIES: usize = 10;
+const CONTROL_COMMAND_TIMEOUT: Duration = Duration::from_secs(2);
+
+enum ControlSendError {
+    Timeout,
+    Control(String),
+}
 
 fn reset_log_focus(app: &mut App) {
     app.ui_focus = UiFocus::Tabs;
@@ -74,6 +82,17 @@ fn scroll_dashboard_logs_down(app: &mut App, entries: usize) {
     }
 }
 
+async fn send_control_command_timed(
+    sock_path: &Path,
+    cmd: ControlCommand,
+) -> std::result::Result<(), ControlSendError> {
+    match timeout(CONTROL_COMMAND_TIMEOUT, send_control_command(sock_path, cmd)).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(err)) => Err(ControlSendError::Control(err)),
+        Err(_) => Err(ControlSendError::Timeout),
+    }
+}
+
 pub(super) async fn handle_key(
     app: &mut App,
     key: KeyEvent,
@@ -97,12 +116,15 @@ pub(super) async fn handle_key(
                 if input.trim().eq_ignore_ascii_case("yes") {
                     app.bad_debt_confirmed = true;
                     app.bad_debt_confirm_input = None;
-                    match send_control_command(sock_path, ControlCommand::Resume).await {
+                    match send_control_command_timed(sock_path, ControlCommand::Resume).await {
                         Ok(()) => {
                             app.engine = LoopControl::Running;
                             app.push_log("bad debt: confirmed (engine resumed)");
                         }
-                        Err(err) => {
+                        Err(ControlSendError::Timeout) => {
+                            app.push_log("control timeout: daemon did not respond within 2s");
+                        }
+                        Err(ControlSendError::Control(err)) => {
                             app.push_log(format!("control error: {}", err));
                         }
                     }
@@ -524,7 +546,7 @@ pub(super) async fn handle_key(
             };
 
             if let Some(command) = command {
-                match send_control_command(sock_path, command).await {
+                match send_control_command_timed(sock_path, command).await {
                     Ok(()) => {
                         app.engine = next;
                         app.push_log(match next {
@@ -533,7 +555,10 @@ pub(super) async fn handle_key(
                             LoopControl::Stopping => "engine: STOPPING".to_string(),
                         });
                     }
-                    Err(err) => {
+                    Err(ControlSendError::Timeout) => {
+                        app.push_log("control timeout: daemon did not respond within 2s");
+                    }
+                    Err(ControlSendError::Control(err)) => {
                         app.push_log(format!("control error: {}", err));
                     }
                 }

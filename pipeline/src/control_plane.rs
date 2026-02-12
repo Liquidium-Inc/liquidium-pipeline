@@ -138,15 +138,56 @@ fn prepare_socket_path(sock_path: &Path) -> anyhow::Result<()> {
         maybe_harden_parent_permissions(parent)?;
     }
 
-    // Treat any previous file at path as stale. We intentionally ignore errors here:
-    // bind() will produce the authoritative outcome.
-    let _ = fs::remove_file(sock_path);
+    if sock_path.exists() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::FileTypeExt;
+            use std::os::unix::net::UnixStream as StdUnixStream;
+
+            let meta = fs::symlink_metadata(sock_path)
+                .with_context(|| format!("inspect existing control socket path {}", sock_path.display()))?;
+            if !meta.file_type().is_socket() {
+                bail!(
+                    "control socket path is occupied by non-socket file: {}",
+                    sock_path.display()
+                );
+            }
+
+            match StdUnixStream::connect(sock_path) {
+                Ok(_) => {
+                    bail!(
+                        "control socket already in use at {} (another daemon may already be running)",
+                        sock_path.display()
+                    );
+                }
+                Err(err) if is_stale_socket_connect_error(&err) => match fs::remove_file(sock_path) {
+                    Ok(_) => {}
+                    Err(remove_err) if remove_err.kind() == ErrorKind::NotFound => {}
+                    Err(remove_err) => {
+                        return Err(remove_err)
+                            .with_context(|| format!("remove stale control socket {}", sock_path.display()));
+                    }
+                },
+                Err(err) => {
+                    return Err(err).with_context(|| format!("probe existing control socket {}", sock_path.display()));
+                }
+            }
+        }
+    }
 
     if sock_path.exists() {
         bail!("control socket path is occupied: {}", sock_path.display());
     }
 
     Ok(())
+}
+
+#[cfg(unix)]
+fn is_stale_socket_connect_error(err: &std::io::Error) -> bool {
+    matches!(
+        err.kind(),
+        ErrorKind::ConnectionRefused | ErrorKind::ConnectionReset | ErrorKind::NotConnected | ErrorKind::TimedOut
+    )
 }
 
 #[cfg(target_os = "linux")]
@@ -301,8 +342,25 @@ mod tests {
         line
     }
 
-    #[test]
-    fn bind_rejects_non_socket_path() {
+    #[tokio::test]
+    async fn bind_removes_stale_socket_file() {
+        let tmp = TempDir::new().expect("tmp");
+        if skip_if_uds_unsupported(&tmp) {
+            return;
+        }
+        let path = sock_path(&tmp);
+
+        let stale = std_uds::UnixListener::bind(&path).expect("bind stale");
+        drop(stale);
+        assert!(path.exists(), "stale socket file should remain after drop");
+
+        let listener = bind_control_listener(&path).expect("bind should remove stale socket");
+        drop(listener);
+        assert!(path.exists(), "socket should be present after successful bind");
+    }
+
+    #[tokio::test]
+    async fn bind_rejects_non_socket_path() {
         let tmp = TempDir::new().expect("tmp");
         if skip_if_uds_unsupported(&tmp) {
             return;
@@ -313,6 +371,23 @@ mod tests {
 
         let err = bind_control_listener(&path).expect_err("expected bind failure");
         assert!(err.to_string().contains("occupied"));
+    }
+
+    #[tokio::test]
+    async fn bind_rejects_active_socket_path() {
+        let tmp = TempDir::new().expect("tmp");
+        if skip_if_uds_unsupported(&tmp) {
+            return;
+        }
+        let path = sock_path(&tmp);
+        let _active = std_uds::UnixListener::bind(&path).expect("bind active socket");
+
+        let err = bind_control_listener(&path).expect_err("expected active-socket bind failure");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("already in use") || msg.contains("another daemon"),
+            "unexpected error message: {msg}"
+        );
     }
 
     #[tokio::test]

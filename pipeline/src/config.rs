@@ -199,7 +199,8 @@ impl Config {
         let home = config_dir();
 
         let ic_url = env::var("IC_URL").map_err(|_| "IC_URL not configured".to_string())?;
-        let export_path = env::var("EXPORT_PATH").unwrap_or("executions.csv".to_string());
+        let export_path_raw = env::var("EXPORT_PATH").unwrap_or(format!("{}/executions.csv", home));
+        let export_path = expand_tilde(&export_path_raw).to_string_lossy().into_owned();
 
         let mnemonic_path =
             expand_tilde(&env::var("MNEMONIC_FILE").map_err(|_| "MNEMONIC_FILE not configured".to_string())?);

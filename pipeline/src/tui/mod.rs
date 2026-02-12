@@ -28,7 +28,7 @@ use crate::persistance::sqlite::SqliteWalStore;
 
 use self::app::{App, ConfigSummary, ExecutionRowData, ExecutionsSnapshot, WalCounts, WalSnapshot};
 use self::events::UiEvent;
-use self::log_source::start_log_source;
+use self::log_source::{describe_log_source, start_log_source};
 use self::logging::TerminalGuard;
 use self::snapshots::{compute_profits_snapshot, fetch_balances_snapshot};
 use self::views::draw_ui;
@@ -204,11 +204,7 @@ pub async fn run(opts: TuiOptions) -> anyhow::Result<()> {
         buy_bad_debt: cfg.buy_bad_debt,
         opportunity_filter: cfg.opportunity_account_filter.iter().map(|p| p.to_text()).collect(),
         control_socket: sock_path.display().to_string(),
-        log_source: if let Some(path) = &log_file {
-            format!("Log source file: {}", path.display())
-        } else {
-            format!("Log source unit: {}", unit_name)
-        },
+        log_source: describe_log_source(&unit_name, log_file.as_deref()),
         db_path: cfg.db_path.clone(),
         export_path: cfg.export_path.clone(),
     };

@@ -125,18 +125,36 @@ async fn main() {
     let _telemetry_guard = match &cli.command {
         Commands::Tui { .. } => None,
         Commands::Run { log_file, .. } => {
-            let effective_log_file = effective_run_log_file(log_file.clone(), running_under_systemd);
-            match init_telemetry_from_env_with_log_file(effective_log_file.as_deref()) {
+            let mut telemetry_log_file = effective_run_log_file(log_file.clone(), running_under_systemd);
+            if let Some(path) = telemetry_log_file.as_deref()
+                && let Err(err) = ensure_log_file_parent_exists(path)
+            {
+                eprintln!(
+                    "Warning: cannot create log-file parent for {}: {err}. Falling back to stdout logs.",
+                    path.display()
+                );
+                telemetry_log_file = None;
+            }
+
+            match init_telemetry_from_env_with_log_file(telemetry_log_file.as_deref()) {
                 Ok(guard) => Some(guard),
                 Err(err) => {
-                    eprintln!("Failed to initialize telemetry: {err}");
-                    if let Some(path) = effective_log_file {
+                    if let Some(path) = telemetry_log_file.as_deref() {
                         eprintln!(
-                            "Check log-file permissions for {} or use --log-file with a writable path.",
+                            "Failed to initialize telemetry with log file {}: {err}. Falling back to stdout logs.",
                             path.display()
                         );
+                        match init_telemetry_from_env_with_log_file(None) {
+                            Ok(guard) => Some(guard),
+                            Err(stdout_err) => {
+                                eprintln!("Failed to initialize telemetry fallback: {stdout_err}");
+                                return;
+                            }
+                        }
+                    } else {
+                        eprintln!("Failed to initialize telemetry: {err}");
+                        return;
                     }
-                    return;
                 }
             }
         }
@@ -246,6 +264,15 @@ fn infer_tui_log_file(requested: Option<PathBuf>) -> Option<PathBuf> {
 
     let candidate = control_plane::default_log_file_path();
     if candidate.is_file() { Some(candidate) } else { None }
+}
+
+fn ensure_log_file_parent_exists(path: &std::path::Path) -> std::io::Result<()> {
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)?;
+    }
+    Ok(())
 }
 
 fn detect_manual_run_block_reason(running_under_systemd: bool) -> Option<String> {

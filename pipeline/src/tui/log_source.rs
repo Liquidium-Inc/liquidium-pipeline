@@ -2,7 +2,7 @@ use std::fs::File;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
 #[cfg(target_os = "linux")]
@@ -22,6 +22,7 @@ const INITIAL_HISTORY_MAX_LINES: usize = 400;
 const OLDER_PAGE_LINES: usize = 300;
 const FILE_HISTORY_CHUNK_BYTES: u64 = 256 * 1024;
 const FILE_FOLLOW_POLL_MS: u64 = 400;
+const FILE_ERROR_BACKOFF: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum LogSource {
@@ -81,6 +82,15 @@ fn choose_log_source(unit_name: String, log_file: Option<PathBuf>) -> LogSource 
     {
         let _ = unit_name;
         LogSource::Notice("logs unavailable (set --log-file)".to_string())
+    }
+}
+
+pub(super) fn describe_log_source(unit_name: &str, log_file: Option<&Path>) -> String {
+    match choose_log_source(unit_name.to_string(), log_file.map(Path::to_path_buf)) {
+        #[cfg(target_os = "linux")]
+        LogSource::Journalctl { unit_name } => format!("Log source unit: {}", unit_name),
+        LogSource::FileTail(path) => format!("Log source file: {}", path.display()),
+        LogSource::Notice(msg) => format!("Log source: {}", msg),
     }
 }
 
@@ -461,6 +471,8 @@ fn spawn_file_tail(
     mut control_rx: mpsc::Receiver<LogControlMsg>,
 ) {
     tokio::task::spawn_blocking(move || {
+        let mut last_error_message: Option<String> = None;
+        let mut last_error_sent_at: Option<Instant> = None;
         let mut state = match initialize_file_state(&path) {
             Ok((state, lines)) => {
                 if !lines.is_empty() {
@@ -469,11 +481,12 @@ fn spawn_file_tail(
                 state
             }
             Err(err) => {
-                let _ = ui_tx.send(UiEvent::AppendLogLines(vec![format!(
-                    "log tail error ({}): {}",
-                    path.display(),
-                    err
-                )]));
+                emit_throttled_file_error(
+                    &ui_tx,
+                    &mut last_error_message,
+                    &mut last_error_sent_at,
+                    format!("log tail error ({}): {}", path.display(), err),
+                );
                 FileTailState::default()
             }
         };
@@ -494,11 +507,12 @@ fn spawn_file_tail(
                             }
                         }
                         Err(err) => {
-                            let _ = ui_tx.send(UiEvent::AppendLogLines(vec![format!(
-                                "log backfill error ({}): {}",
-                                path.display(),
-                                err
-                            )]));
+                            emit_throttled_file_error(
+                                &ui_tx,
+                                &mut last_error_message,
+                                &mut last_error_sent_at,
+                                format!("log backfill error ({}): {}", path.display(), err),
+                            );
                         }
                     },
                 }
@@ -510,17 +524,38 @@ fn spawn_file_tail(
                 }
                 Ok(_) => {}
                 Err(err) => {
-                    let _ = ui_tx.send(UiEvent::AppendLogLines(vec![format!(
-                        "log tail error ({}): {}",
-                        path.display(),
-                        err
-                    )]));
+                    emit_throttled_file_error(
+                        &ui_tx,
+                        &mut last_error_message,
+                        &mut last_error_sent_at,
+                        format!("log tail error ({}): {}", path.display(), err),
+                    );
                 }
             }
 
             thread::sleep(Duration::from_millis(FILE_FOLLOW_POLL_MS));
         }
     });
+}
+
+fn emit_throttled_file_error(
+    ui_tx: &mpsc::UnboundedSender<UiEvent>,
+    last_error_message: &mut Option<String>,
+    last_error_sent_at: &mut Option<Instant>,
+    message: String,
+) {
+    let now = Instant::now();
+    let same_error = last_error_message.as_deref().is_some_and(|m| m == message);
+    let within_backoff = last_error_sent_at
+        .as_ref()
+        .is_some_and(|sent| now.duration_since(*sent) < FILE_ERROR_BACKOFF);
+    if same_error && within_backoff {
+        return;
+    }
+
+    *last_error_message = Some(message.clone());
+    *last_error_sent_at = Some(now);
+    let _ = ui_tx.send(UiEvent::AppendLogLines(vec![message]));
 }
 
 fn initialize_file_state(path: &Path) -> std::io::Result<(FileTailState, Vec<String>)> {
