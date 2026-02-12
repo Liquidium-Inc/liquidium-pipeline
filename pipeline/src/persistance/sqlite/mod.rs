@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context as _, Result};
 use async_trait::async_trait;
 use diesel::{
     connection::SimpleConnection,
@@ -21,6 +21,7 @@ pub struct SqliteWalStore {
     pool: Pool<ConnectionManager<SqliteConnection>>,
     busy_timeout_ms: i64,
     read_only: bool,
+    db_path: String,
 }
 
 impl SqliteWalStore {
@@ -30,35 +31,55 @@ impl SqliteWalStore {
 
     pub fn new_with_busy_timeout(path: &str, busy_timeout_ms: i64) -> Result<Self> {
         let manager = ConnectionManager::<SqliteConnection>::new(path);
-        let pool = Pool::builder().max_size(2).build(manager)?;
-        let mut conn = pool.get()?;
-        initialize_schema(&mut conn)?;
-        apply_pragmas(&mut conn, busy_timeout_ms)?;
+        let pool = Pool::builder()
+            .max_size(2)
+            .build(manager)
+            .with_context(|| format!("open sqlite pool (mode=rw path={path})"))?;
+        let mut conn = pool
+            .get()
+            .with_context(|| format!("open sqlite connection (mode=rw path={path})"))?;
+        initialize_schema(&mut conn).with_context(|| format!("initialize sqlite schema (path={path})"))?;
+        apply_pragmas(&mut conn, busy_timeout_ms)
+            .with_context(|| format!("apply sqlite pragmas (mode=rw path={path})"))?;
         Ok(Self {
             pool,
             busy_timeout_ms,
             read_only: false,
+            db_path: path.to_string(),
         })
     }
 
     pub fn new_read_only_with_busy_timeout(path: &str, busy_timeout_ms: i64) -> Result<Self> {
         let manager = ConnectionManager::<SqliteConnection>::new(read_only_dsn(path));
-        let pool = Pool::builder().max_size(2).build(manager)?;
-        let mut conn = pool.get()?;
-        apply_read_only_pragmas(&mut conn, busy_timeout_ms)?;
+        let pool = Pool::builder()
+            .max_size(2)
+            .build(manager)
+            .with_context(|| format!("open sqlite pool (mode=ro path={path})"))?;
+        let mut conn = pool
+            .get()
+            .with_context(|| format!("open sqlite connection (mode=ro path={path})"))?;
+        apply_read_only_pragmas(&mut conn, busy_timeout_ms)
+            .with_context(|| format!("apply sqlite pragmas (mode=ro path={path})"))?;
         Ok(Self {
             pool,
             busy_timeout_ms,
             read_only: true,
+            db_path: path.to_string(),
         })
     }
 
     fn get_conn(&self) -> Result<r2d2::PooledConnection<ConnectionManager<SqliteConnection>>> {
-        let mut conn = self.pool.get()?;
+        let mode = if self.read_only { "ro" } else { "rw" };
+        let mut conn = self
+            .pool
+            .get()
+            .with_context(|| format!("open sqlite connection (mode={mode} path={})", self.db_path))?;
         if self.read_only {
-            apply_read_only_pragmas(&mut conn, self.busy_timeout_ms)?;
+            apply_read_only_pragmas(&mut conn, self.busy_timeout_ms)
+                .with_context(|| format!("apply sqlite pragmas (mode=ro path={})", self.db_path))?;
         } else {
-            apply_pragmas(&mut conn, self.busy_timeout_ms)?;
+            apply_pragmas(&mut conn, self.busy_timeout_ms)
+                .with_context(|| format!("apply sqlite pragmas (mode=rw path={})", self.db_path))?;
         }
         Ok(conn)
     }

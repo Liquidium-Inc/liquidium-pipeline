@@ -12,6 +12,7 @@ use super::events::UiEvent;
 use std::process::Stdio;
 
 const MAX_INITIAL_FILE_HISTORY_BYTES: u64 = 256 * 1024;
+const MAX_INITIAL_HISTORY_LINES: usize = 400;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum LogSource {
@@ -58,32 +59,39 @@ fn choose_log_source(unit_name: String, log_file: Option<PathBuf>) -> LogSource 
 
 #[cfg(target_os = "linux")]
 fn spawn_journalctl(ui_tx: mpsc::UnboundedSender<UiEvent>, unit_name: String) {
-    spawn_journalctl_stream(
-        ui_tx.clone(),
-        vec![
-            "-u".to_string(),
-            unit_name.clone(),
-            "--since".to_string(),
-            "1 hour ago".to_string(),
-            "-o".to_string(),
-            "short".to_string(),
-            "--no-pager".to_string(),
-        ],
-        "history",
-    );
+    tokio::spawn(async move {
+        run_journalctl_stream(
+            ui_tx.clone(),
+            vec![
+                "-u".to_string(),
+                unit_name.clone(),
+                "-n".to_string(),
+                MAX_INITIAL_HISTORY_LINES.to_string(),
+                "-o".to_string(),
+                "short".to_string(),
+                "--no-pager".to_string(),
+            ],
+            "history",
+        )
+        .await;
 
-    spawn_journalctl_stream(
-        ui_tx,
-        vec![
-            "-f".to_string(),
-            "-u".to_string(),
-            unit_name,
-            "-o".to_string(),
-            "short".to_string(),
-            "--no-pager".to_string(),
-        ],
-        "follow",
-    );
+        // Start follow after history to avoid startup duplication/flooding.
+        run_journalctl_stream(
+            ui_tx,
+            vec![
+                "-f".to_string(),
+                "-u".to_string(),
+                unit_name,
+                "-n".to_string(),
+                "0".to_string(),
+                "-o".to_string(),
+                "short".to_string(),
+                "--no-pager".to_string(),
+            ],
+            "follow",
+        )
+        .await;
+    });
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -91,69 +99,67 @@ fn spawn_journalctl(ui_tx: mpsc::UnboundedSender<UiEvent>, unit_name: String) {
 fn spawn_journalctl(_ui_tx: mpsc::UnboundedSender<UiEvent>, _unit_name: String) {}
 
 #[cfg(target_os = "linux")]
-fn spawn_journalctl_stream(ui_tx: mpsc::UnboundedSender<UiEvent>, args: Vec<String>, mode: &'static str) {
-    tokio::spawn(async move {
-        use tokio::io::{AsyncBufReadExt, BufReader};
-        use tokio::process::Command;
+async fn run_journalctl_stream(ui_tx: mpsc::UnboundedSender<UiEvent>, args: Vec<String>, mode: &'static str) {
+    use tokio::io::{AsyncBufReadExt, BufReader};
+    use tokio::process::Command;
 
-        let mut child = match Command::new("journalctl")
-            .args(&args)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-        {
-            Ok(child) => child,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                let _ = ui_tx.send(UiEvent::LogLine("logs unavailable: journalctl not found".to_string()));
-                return;
-            }
-            Err(err) => {
-                let _ = ui_tx.send(UiEvent::LogLine(format!(
-                    "logs unavailable: failed to start journalctl ({err})"
-                )));
-                return;
-            }
-        };
-
-        let stdout_task = child.stdout.take().map(|stdout| {
-            let ui_tx = ui_tx.clone();
-            tokio::spawn(async move {
-                let mut lines = BufReader::new(stdout).lines();
-                while let Ok(Some(line)) = lines.next_line().await {
-                    let _ = ui_tx.send(UiEvent::LogLine(line));
-                }
-            })
-        });
-
-        let stderr_task = child.stderr.take().map(|stderr| {
-            let ui_tx = ui_tx.clone();
-            tokio::spawn(async move {
-                let mut lines = BufReader::new(stderr).lines();
-                while let Ok(Some(line)) = lines.next_line().await {
-                    let _ = ui_tx.send(UiEvent::LogLine(format!("journalctl {mode} stderr: {line}")));
-                }
-            })
-        });
-
-        match child.wait().await {
-            Ok(status) if !status.success() => {
-                let _ = ui_tx.send(UiEvent::LogLine(format!(
-                    "journalctl {mode} exited with status {status}"
-                )));
-            }
-            Ok(_) => {}
-            Err(err) => {
-                let _ = ui_tx.send(UiEvent::LogLine(format!("journalctl {mode} wait failed: {err}")));
-            }
+    let mut child = match Command::new("journalctl")
+        .args(&args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            let _ = ui_tx.send(UiEvent::LogLine("logs unavailable: journalctl not found".to_string()));
+            return;
         }
+        Err(err) => {
+            let _ = ui_tx.send(UiEvent::LogLine(format!(
+                "logs unavailable: failed to start journalctl ({err})"
+            )));
+            return;
+        }
+    };
 
-        if let Some(task) = stdout_task {
-            let _ = task.await;
-        }
-        if let Some(task) = stderr_task {
-            let _ = task.await;
-        }
+    let stdout_task = child.stdout.take().map(|stdout| {
+        let ui_tx = ui_tx.clone();
+        tokio::spawn(async move {
+            let mut lines = BufReader::new(stdout).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                let _ = ui_tx.send(UiEvent::LogLine(line));
+            }
+        })
     });
+
+    let stderr_task = child.stderr.take().map(|stderr| {
+        let ui_tx = ui_tx.clone();
+        tokio::spawn(async move {
+            let mut lines = BufReader::new(stderr).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                let _ = ui_tx.send(UiEvent::LogLine(format!("journalctl {mode} stderr: {line}")));
+            }
+        })
+    });
+
+    match child.wait().await {
+        Ok(status) if !status.success() => {
+            let _ = ui_tx.send(UiEvent::LogLine(format!(
+                "journalctl {mode} exited with status {status}"
+            )));
+        }
+        Ok(_) => {}
+        Err(err) => {
+            let _ = ui_tx.send(UiEvent::LogLine(format!("journalctl {mode} wait failed: {err}")));
+        }
+    }
+
+    if let Some(task) = stdout_task {
+        let _ = task.await;
+    }
+    if let Some(task) = stderr_task {
+        let _ = task.await;
+    }
 }
 
 fn spawn_file_tail(ui_tx: mpsc::UnboundedSender<UiEvent>, path: PathBuf) {
@@ -183,6 +189,7 @@ fn read_new_lines(path: &Path, state: &mut FileTailState) -> std::io::Result<Vec
     let mut file = File::open(path)?;
     let len = file.metadata()?.len();
     let mut skip_partial_line = false;
+    let initial_read = !state.initialized;
 
     if !state.initialized {
         state.offset = len.saturating_sub(MAX_INITIAL_FILE_HISTORY_BYTES);
@@ -222,7 +229,17 @@ fn read_new_lines(path: &Path, state: &mut FileTailState) -> std::io::Result<Vec
         state.offset = state.offset.saturating_add(n as u64);
         out.push(line.trim_end_matches(['\r', '\n']).to_string());
     }
+    if initial_read {
+        trim_to_latest_lines(&mut out, MAX_INITIAL_HISTORY_LINES);
+    }
     Ok(out)
+}
+
+fn trim_to_latest_lines(lines: &mut Vec<String>, keep: usize) {
+    if lines.len() > keep {
+        let drop_count = lines.len() - keep;
+        lines.drain(0..drop_count);
+    }
 }
 
 #[cfg(test)]
@@ -231,7 +248,7 @@ mod tests {
 
     use tempfile::TempDir;
 
-    use super::{FileTailState, LogSource, choose_log_source, read_new_lines};
+    use super::{FileTailState, LogSource, choose_log_source, read_new_lines, trim_to_latest_lines};
 
     #[cfg(target_os = "linux")]
     #[test]
@@ -293,5 +310,17 @@ mod tests {
         std::fs::write(&path, "reset\n").expect("truncate+write");
         let after_truncate = read_new_lines(&path, &mut state).expect("truncate read");
         assert_eq!(after_truncate, vec!["reset".to_string()]);
+    }
+
+    #[test]
+    fn trim_to_latest_lines_keeps_tail() {
+        let mut lines = vec![
+            "line-1".to_string(),
+            "line-2".to_string(),
+            "line-3".to_string(),
+            "line-4".to_string(),
+        ];
+        trim_to_latest_lines(&mut lines, 2);
+        assert_eq!(lines, vec!["line-3".to_string(), "line-4".to_string()]);
     }
 }
