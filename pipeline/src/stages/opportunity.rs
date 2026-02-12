@@ -32,20 +32,10 @@ where
         let max_results: u64 = 500; // stop once we find this many risky users
         let scan_limit: u64 = 100; // how many accounts to scan per call
 
-        // Hard cap based on the real number of accounts in the canister.
-        let empty = Encode!().map_err(|e| e.to_string())?;
-        let total_accounts = self
-            .agent
-            .call_query::<u64>(&self.canister_id, "get_main_accounts_len", empty)
-            .await
-            .map_err(|e| format!("Agent query error: {e}"))?;
-
         let mut cursor: Option<Principal> = None;
-        let mut scanned_total: u64 = 0;
         let mut opportunities: Vec<LiquidatebleUser> = Vec::new();
 
-        // Safety guard: even if total_accounts is 0, do not loop.
-        while scanned_total < total_accounts {
+        loop {
             let args = Encode!(&cursor, &scan_limit, &max_results).map_err(|e| e.to_string())?;
 
             let ScanResult {
@@ -60,18 +50,16 @@ where
                 .map_err(|e| format!("Agent query error: {e}"))?;
 
             opportunities.append(&mut page_users);
-            cursor = next_cursor;
-
-            scanned_total = scanned_total.saturating_add(scanned);
 
             if opportunities.len() as u64 >= max_results {
                 break;
             }
 
             // End of keyspace or scan made no progress.
-            if cursor.is_none() || scanned == 0 {
+            if next_cursor.is_none() || scanned == 0 || next_cursor == cursor {
                 break;
             }
+            cursor = next_cursor;
         }
 
         opportunities.iter_mut().for_each(|user| {
@@ -171,9 +159,6 @@ mod tests {
         let users_len = users.len() as u64;
         let users_for_scan = users.clone();
 
-        // given
-        agent.expect_call_query::<u64>().returning(move |_, _, _| Ok(users_len));
-
         agent.expect_call_query::<ScanResult>().returning(move |_, _, _| {
             Ok(ScanResult {
                 users: users_for_scan.clone(),
@@ -244,9 +229,6 @@ mod tests {
         let users_len = users.len() as u64;
         let users_for_scan = users.clone();
 
-        // given
-        agent.expect_call_query::<u64>().returning(move |_, _, _| Ok(users_len));
-
         agent.expect_call_query::<ScanResult>().returning(move |_, _, _| {
             Ok(ScanResult {
                 users: users_for_scan.clone(),
@@ -307,9 +289,6 @@ mod tests {
 
         let users_len = users.len() as u64;
         let users_for_scan = users.clone();
-
-        // given
-        agent.expect_call_query::<u64>().returning(move |_, _, _| Ok(users_len));
 
         agent.expect_call_query::<ScanResult>().returning(move |_, _, _| {
             Ok(ScanResult {
