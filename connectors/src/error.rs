@@ -5,7 +5,7 @@ pub type ConnectorResult<T> = Result<T, ConnectorError>;
 
 #[derive(Debug, Error)]
 pub enum ConnectorError {
-    #[error("missing env var {var}")]
+    #[error("missing env var {var}: {source}")]
     MissingEnv {
         var: &'static str,
         #[source]
@@ -13,7 +13,7 @@ pub enum ConnectorError {
     },
     #[error("invalid input: {message}")]
     InvalidInput { message: String },
-    #[error("backend error")]
+    #[error("backend error: {source}")]
     Backend {
         #[source]
         source: ExternalError,

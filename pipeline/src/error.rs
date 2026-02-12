@@ -15,7 +15,7 @@ pub enum PipelineError {
     Core(#[from] CoreError),
     #[error(transparent)]
     Connector(#[from] ConnectorError),
-    #[error("wal error")]
+    #[error("wal error: {source}")]
     Wal {
         #[source]
         source: ExternalError,

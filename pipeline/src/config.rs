@@ -37,37 +37,37 @@ pub type ConfigResult<T> = std::result::Result<T, ConfigError>;
 
 #[derive(Debug, Error)]
 pub enum ConfigError {
-    #[error("missing required env var {var}")]
+    #[error("missing required env var {var}: {source}")]
     MissingEnv {
         var: &'static str,
         #[source]
         source: env::VarError,
     },
-    #[error("failed to parse principal in {var}")]
+    #[error("failed to parse principal in {var}: {source}")]
     InvalidPrincipal {
         var: &'static str,
         #[source]
         source: ExternalError,
     },
-    #[error("failed to read mnemonic at {path:?}")]
+    #[error("failed to read mnemonic at {path:?}: {source}")]
     ReadMnemonic {
         path: PathBuf,
         #[source]
         source: io::Error,
     },
-    #[error("could not derive {role} identity")]
+    #[error("could not derive {role} identity: {source}")]
     DeriveIdentity {
         role: &'static str,
         #[source]
         source: ExternalError,
     },
-    #[error("could not derive {role} principal")]
+    #[error("could not derive {role} principal: {source}")]
     DerivePrincipal {
         role: &'static str,
         #[source]
         source: ExternalError,
     },
-    #[error("failed to derive EVM private key")]
+    #[error("failed to derive EVM private key: {source}")]
     DeriveEvmKey {
         #[source]
         source: ExternalError,

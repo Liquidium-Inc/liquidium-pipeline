@@ -52,7 +52,7 @@ impl From<TokenRegistryError> for String {
 
 #[derive(Debug, Error)]
 pub enum AccountError {
-    #[error("account backend error")]
+    #[error("account backend error: {source}")]
     Backend {
         #[source]
         source: ExternalError,
@@ -86,7 +86,7 @@ impl From<AccountError> for String {
 
 #[derive(Debug, Error)]
 pub enum TransferError {
-    #[error("transfer backend error")]
+    #[error("transfer backend error: {source}")]
     Backend {
         #[source]
         source: ExternalError,
