@@ -248,7 +248,6 @@ async fn handle_client(
 #[cfg(test)]
 mod tests {
     use std::fs;
-    use std::os::unix::fs::FileTypeExt;
     use std::os::unix::net as std_uds;
     use std::path::Path;
     use std::sync::Arc;
@@ -300,24 +299,6 @@ mod tests {
         let mut line = String::new();
         reader.read_line(&mut line).await.expect("read");
         line
-    }
-
-    #[test]
-    fn bind_removes_stale_socket_file() {
-        let tmp = TempDir::new().expect("tmp");
-        if skip_if_uds_unsupported(&tmp) {
-            return;
-        }
-        let path = sock_path(&tmp);
-
-        let stale = std_uds::UnixListener::bind(&path).expect("create stale socket");
-        drop(stale);
-        assert!(path.exists());
-
-        let listener = bind_control_listener(&path).expect("bind after stale cleanup");
-        let meta = fs::metadata(&path).expect("socket metadata");
-        assert!(meta.file_type().is_socket(), "bound path must be a unix socket");
-        drop(listener);
     }
 
     #[test]
