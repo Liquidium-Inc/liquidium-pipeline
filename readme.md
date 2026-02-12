@@ -379,11 +379,15 @@ Stages are implemented with `async-trait` for composability.
 ### Run the Liquidation Loop
 
 ```bash
+liquidator run
+# optional: custom control socket
 liquidator run --sock-path /run/liquidator/ctl.sock
 # optional: enable file sink at default path
-liquidator run --sock-path /run/liquidator/ctl.sock --log-file
+liquidator run --log-file
 # optional: enable file sink at custom path
-liquidator run --sock-path /run/liquidator/ctl.sock --log-file ./liquidator.log
+liquidator run --log-file ./liquidator.log
+# optional: explicitly disable file sink
+liquidator run --no-log-file
 ```
 
 Starts the foreground daemon loop (systemd-supervised) that continuously monitors and executes liquidations.
@@ -392,17 +396,26 @@ By default, `liquidator run` does not write a local log file.
 Passing `--log-file` (without a value) enables file logging at the default path:
 `<temp>/liquidator/liquidator.log` (for example, `/tmp/liquidator/liquidator.log` on Linux).
 Passing `--log-file /custom/path.log` writes to that custom file.
+`--log-file` and `--no-log-file` are mutually exclusive.
+
+Default control socket path:
+- Linux: `/run/liquidator/ctl.sock`
+- non-Linux: `<temp>/liquidator/ctl.sock`
 
 ### Start the TUI
 
 ```bash
-liquidator tui --sock-path /run/liquidator/ctl.sock --unit-name liquidator.service
+liquidator tui
+# optional: custom socket/unit/file source
+liquidator tui --sock-path /run/liquidator/ctl.sock --unit-name liquidator.service --log-file /path/to/log
 ```
 
 Launches an attachable terminal UI to **pause/resume** the daemon, view **WAL status**, **profits** (from `EXPORT_PATH`), **balances**, and run **withdrawals** (ICP tokens only).
-On Linux, logs are streamed from journald for the configured unit when no file source is available.
-If `--log-file` is omitted and the default file `<temp>/liquidator/liquidator.log` exists, TUI tails it automatically.
-On non-Linux without `--log-file` and without that default file, the UI shows a no-log-source notice.
+Log source selection:
+- If `--log-file` is provided, TUI tails that file on any OS.
+- On Linux with no `--log-file`, TUI prefers `journalctl -u <unit-name>` (default unit: `liquidator.service`).
+- On Linux when the unit is inactive, TUI may auto-tail `<temp>/liquidator/liquidator.log` if that file exists and was updated recently.
+- On non-Linux without `--log-file`, TUI tails `<temp>/liquidator/liquidator.log` if it exists; otherwise it shows a no-log-source notice.
 
 **Key bindings:**
 - `r` — pause/resume
@@ -556,14 +569,15 @@ unit, and restarts it.
 Linux non-service mode with file tail:
 
 ```bash
-liquidator run --sock-path /tmp/liquidator/ctl.sock --log-file
-liquidator tui --sock-path /tmp/liquidator/ctl.sock
+liquidator run --log-file
+liquidator tui
 ```
 
 On macOS/dev, use file fallback explicitly:
 
 ```bash
-liquidator tui --sock-path /tmp/liquidator/ctl.sock --log-file liquidator.log
+liquidator run --log-file ./liquidator.log
+liquidator tui --log-file ./liquidator.log
 ```
 
 ---
@@ -583,6 +597,7 @@ liquidator tui --sock-path /tmp/liquidator/ctl.sock --log-file liquidator.log
 - Noisy terminal output in containerized logging stacks: build and run with `--features plain-logs`.
 - Missing diagnostic detail: rerun with `RUST_LOG=debug`.
 - Runtime socket permission mismatch under systemd: run `systemctl daemon-reload` and restart `liquidator.service`; ensure `RuntimeDirectory=liquidator` and `RuntimeDirectoryMode=0770` are set on the active unit.
+- `liquidator run` exits immediately saying systemd unit is already active: this is intentional duplicate-daemon protection; stop the unit first or use `liquidator tui` to attach.
 
 ## Notes
 

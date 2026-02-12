@@ -5,7 +5,8 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table, Wrap};
 use unicode_width::UnicodeWidthStr;
 
-use crate::persistance::ResultStatus;
+use crate::persistance::{LiqMetaWrapper, ResultStatus};
+use crate::stages::executor::ExecutionReceipt;
 
 use super::super::app::{App, UiFocus};
 use super::super::format::format_i128_amount;
@@ -252,7 +253,9 @@ fn draw_recent_outcomes_table(f: &mut Frame<'_>, area: Rect, app: &App) {
             let header = Row::new(vec![
                 Cell::new("At"),
                 Cell::new("Status"),
-                Cell::new("Liq ID"),
+                Cell::new("Pair"),
+                Cell::new("PnL"),
+                Cell::new("Liq"),
                 Cell::new("Try"),
             ])
             .style(Style::default().add_modifier(Modifier::BOLD));
@@ -264,11 +267,14 @@ fn draw_recent_outcomes_table(f: &mut Frame<'_>, area: Rect, app: &App) {
                     .unwrap_or_else(|| "-".to_string());
                 let status = status_short(r.status);
                 let status_style = status_style(r.status);
+                let (pair, pnl, pnl_style) = compact_liq_context(&r.meta_json);
 
                 Row::new(vec![
                     Cell::new(at),
                     Cell::from(Span::styled(status, status_style)),
-                    Cell::new(truncate(&r.liq_id, 24)),
+                    Cell::new(truncate(&pair, 18)),
+                    Cell::from(Span::styled(truncate(&pnl, 20), pnl_style)),
+                    Cell::new(truncate(&r.liq_id, 10)),
                     Cell::new(r.attempt.to_string()),
                 ])
             });
@@ -278,7 +284,9 @@ fn draw_recent_outcomes_table(f: &mut Frame<'_>, area: Rect, app: &App) {
                 [
                     Constraint::Length(8),
                     Constraint::Length(12),
-                    Constraint::Percentage(100),
+                    Constraint::Length(19),
+                    Constraint::Length(21),
+                    Constraint::Min(8),
                     Constraint::Length(4),
                 ],
             )
@@ -396,6 +404,97 @@ fn status_style(status: ResultStatus) -> Style {
         ResultStatus::InFlight => Style::default().fg(Color::Yellow),
         ResultStatus::WaitingCollateral | ResultStatus::WaitingProfit => Style::default().fg(Color::Cyan),
         ResultStatus::Enqueued => Style::default().fg(Color::DarkGray),
+    }
+}
+
+fn compact_liq_context(raw: &str) -> (String, String, Style) {
+    let default_profit = ("-".to_string(), Style::default().fg(Color::DarkGray));
+
+    match parse_execution_meta(raw) {
+        Some(ParsedExecutionMeta::Wrapper(wrapper)) => {
+            let pair = format!(
+                "{}→{}",
+                wrapper.receipt.request.collateral_asset.symbol(),
+                wrapper.receipt.request.debt_asset.symbol()
+            );
+
+            if let Some(snapshot) = wrapper.profit_snapshot {
+                let expected = snapshot.expected_profit_raw.parse::<i128>().ok();
+                if let Some(realized) = snapshot
+                    .realized_profit_raw
+                    .as_deref()
+                    .and_then(|raw| raw.parse::<i128>().ok())
+                {
+                    let delta_or_value = expected.map(|exp| realized - exp).unwrap_or(realized);
+                    let style = compact_profit_style(delta_or_value);
+                    let pnl = format!(
+                        "{} {}",
+                        format_i128_amount(realized, Some(snapshot.debt_decimals)),
+                        snapshot.debt_symbol
+                    );
+                    return (pair, pnl, style);
+                }
+
+                if let Some(expected) = expected {
+                    let style = compact_profit_style(expected);
+                    let pnl = format!(
+                        "{} {}",
+                        format_i128_amount(expected, Some(snapshot.debt_decimals)),
+                        snapshot.debt_symbol
+                    );
+                    return (pair, pnl, style);
+                }
+            }
+
+            let expected = wrapper.receipt.request.expected_profit;
+            let decimals = wrapper.receipt.request.debt_asset.decimals();
+            let symbol = wrapper.receipt.request.debt_asset.symbol();
+            let pnl = format!("{} {}", format_i128_amount(expected, Some(decimals)), symbol);
+            (pair, pnl, compact_profit_style(expected))
+        }
+        Some(ParsedExecutionMeta::Receipt(receipt)) => {
+            let pair = format!(
+                "{}→{}",
+                receipt.request.collateral_asset.symbol(),
+                receipt.request.debt_asset.symbol()
+            );
+            let expected = receipt.request.expected_profit;
+            let pnl = format!(
+                "{} {}",
+                format_i128_amount(expected, Some(receipt.request.debt_asset.decimals())),
+                receipt.request.debt_asset.symbol()
+            );
+            (pair, pnl, compact_profit_style(expected))
+        }
+        None => ("-".to_string(), default_profit.0, default_profit.1),
+    }
+}
+
+enum ParsedExecutionMeta {
+    Wrapper(LiqMetaWrapper),
+    Receipt(ExecutionReceipt),
+}
+
+fn parse_execution_meta(raw: &str) -> Option<ParsedExecutionMeta> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed == "{}" {
+        return None;
+    }
+
+    if let Ok(wrapper) = serde_json::from_str::<LiqMetaWrapper>(trimmed) {
+        return Some(ParsedExecutionMeta::Wrapper(wrapper));
+    }
+
+    serde_json::from_str::<ExecutionReceipt>(trimmed)
+        .ok()
+        .map(ParsedExecutionMeta::Receipt)
+}
+
+fn compact_profit_style(delta: i128) -> Style {
+    match delta.cmp(&0) {
+        std::cmp::Ordering::Greater => Style::default().fg(Color::Green),
+        std::cmp::Ordering::Less => Style::default().fg(Color::Red),
+        std::cmp::Ordering::Equal => Style::default().fg(Color::DarkGray),
     }
 }
 
