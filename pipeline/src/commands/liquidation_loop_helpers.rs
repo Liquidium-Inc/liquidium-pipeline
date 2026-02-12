@@ -46,7 +46,7 @@ const REFRESH_ALLOWANCES_TIMEOUT: Duration = Duration::from_secs(45);
 const PANIC_RECOVERY_DELAY: Duration = Duration::from_secs(1);
 const TIMEOUT_RECOVERY_DELAY: Duration = Duration::from_secs(1);
 const PAUSED_LOOP_DELAY: Duration = Duration::from_secs(2);
-const RUNNING_LOOP_DELAY: Duration = Duration::from_secs(5);
+const RUNNING_LOOP_DELAY: Duration = Duration::from_secs(3);
 
 /// Prints the startup banner when an interactive terminal is available.
 pub(crate) fn print_banner() {

@@ -21,8 +21,8 @@ pub(super) fn log_to_line(line: &str) -> Line<'static> {
         && looks_like_timestamp(ts)
     {
         let rest = rest.trim_start();
-        if let Some((lvl, msg)) = split_once_ws(rest)
-            && is_level(lvl)
+        if let Some((lvl_token, msg)) = split_once_ws(rest)
+            && let Some(lvl) = normalize_level(lvl_token)
         {
             let mut spans: Vec<Span<'static>> = Vec::new();
             spans.push(Span::styled(
@@ -41,8 +41,8 @@ pub(super) fn log_to_line(line: &str) -> Line<'static> {
     }
 
     // Also support "LEVEL rest..." (for app-internal logs).
-    if let Some((lvl, msg)) = split_once_ws(line)
-        && is_level(lvl)
+    if let Some((lvl_token, msg)) = split_once_ws(line)
+        && let Some(lvl) = normalize_level(lvl_token)
     {
         let mut spans: Vec<Span<'static>> = Vec::new();
         spans.push(Span::styled(
@@ -59,14 +59,18 @@ pub(super) fn log_to_line(line: &str) -> Line<'static> {
 }
 
 fn fallback_style(line: &str) -> Style {
+    if let Some(level) = detect_level_anywhere(line) {
+        return level_style(level);
+    }
+
     let upper = line.to_ascii_uppercase();
     if line.starts_with("error:") || upper.contains("ERROR") || upper.contains("FAILED") || upper.contains("PANIC") {
-        Style::default().fg(Color::Red)
-    } else if upper.contains("WARN") {
-        Style::default().fg(Color::Yellow)
-    } else {
-        Style::default()
+        return Style::default().fg(Color::Red);
     }
+    if upper.contains("WARN") {
+        return Style::default().fg(Color::Yellow);
+    }
+    Style::default()
 }
 
 fn level_style(level: &str) -> Style {
@@ -150,8 +154,51 @@ fn looks_like_timestamp(token: &str) -> bool {
         && (token.contains('T') || token.contains(' '))
 }
 
-fn is_level(token: &str) -> bool {
-    matches!(token, "ERROR" | "WARN" | "INFO" | "DEBUG" | "TRACE")
+fn normalize_level(token: &str) -> Option<&'static str> {
+    let cleaned = token.trim_matches(|c: char| !c.is_ascii_alphabetic());
+    if cleaned.is_empty() {
+        return None;
+    }
+
+    match cleaned.to_ascii_uppercase().as_str() {
+        "ERROR" => Some("ERROR"),
+        "WARN" | "WARNING" => Some("WARN"),
+        "INFO" => Some("INFO"),
+        "DEBUG" => Some("DEBUG"),
+        "TRACE" => Some("TRACE"),
+        _ => None,
+    }
+}
+
+fn detect_level_anywhere(line: &str) -> Option<&'static str> {
+    line.split_whitespace().take(12).find_map(normalize_level)
+}
+
+#[cfg(test)]
+mod tests {
+    use ratatui::style::Color;
+
+    use super::log_to_line;
+
+    #[test]
+    fn highlights_lowercase_level_after_timestamp() {
+        let line = log_to_line("2026-02-12T10:00:00.000000Z info started");
+        assert_eq!(line.spans[2].content.as_ref(), "INFO ");
+        assert_eq!(line.spans[2].style.fg, Some(Color::Green));
+    }
+
+    #[test]
+    fn highlights_wrapped_warn_level() {
+        let line = log_to_line("2026-02-12T10:00:00.000000Z [WARN] warning");
+        assert_eq!(line.spans[2].content.as_ref(), "WARN ");
+        assert_eq!(line.spans[2].style.fg, Some(Color::Yellow));
+    }
+
+    #[test]
+    fn fallback_detects_embedded_level_tokens() {
+        let line = log_to_line("Feb 12 host liquidator[123]: INFO daemon resumed");
+        assert_eq!(line.spans[0].style.fg, Some(Color::Green));
+    }
 }
 
 pub(crate) fn wrapped_row_count_for_entry(line: &str, content_width: usize) -> usize {

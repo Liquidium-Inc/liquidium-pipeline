@@ -5,11 +5,15 @@ use chrono::{DateTime, Local};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 
 use super::log_sanitize::sanitize_log_line;
+use super::log_source::LOG_BUFFER_MAX;
 use crate::commands::liquidation_loop::LoopControl;
 use crate::finalizers::liquidation_outcome::LiquidationOutcome;
 use crate::persistance::ResultStatus;
 use liquidium_pipeline_connectors::backend::cex_backend::DepositAddress;
 use liquidium_pipeline_core::tokens::asset_id::AssetId;
+
+const LOG_MAX_ENTRIES: usize = LOG_BUFFER_MAX;
+const MAX_LOG_LINE_CHARS: usize = 4096;
 
 #[derive(Clone, Debug)]
 pub(super) struct ConfigSummary {
@@ -295,7 +299,7 @@ impl App {
             ui_focus: UiFocus::Tabs,
             should_quit: false,
             engine: LoopControl::Paused,
-            logs: VecDeque::with_capacity(500),
+            logs: VecDeque::with_capacity(LOG_MAX_ENTRIES),
             logs_scroll: 0,
             logs_scroll_x: 0,
             logs_follow: true,
@@ -338,26 +342,32 @@ impl App {
     }
 
     pub(super) fn push_log(&mut self, line: impl Into<String>) {
-        const MAX: usize = 500;
-        const MAX_LINE_CHARS: usize = 4096;
+        self.append_logs(vec![line.into()]);
+    }
+
+    pub(super) fn append_logs(&mut self, lines: Vec<String>) {
         let bump_logs_scroll = self.logs_scroll_active && !self.logs_follow;
         let bump_dashboard_scroll = self.dashboard_logs_scroll_active && !self.dashboard_logs_follow;
-        let line = line.into();
-        for part in line.split(['\n', '\r']) {
-            let sanitized = sanitize_log_line(part);
-            let trimmed = sanitized.trim_end();
-            if trimmed.is_empty() {
-                continue;
+        for line in lines {
+            for part in Self::normalize_log_fragments(&line) {
+                self.append_log_entry(part, bump_logs_scroll, bump_dashboard_scroll);
             }
-            let part = if trimmed.chars().count() > MAX_LINE_CHARS {
-                trimmed.chars().take(MAX_LINE_CHARS).collect::<String>()
-            } else {
-                trimmed.to_string()
-            };
-            if self.logs.len() >= MAX {
-                self.logs.pop_front();
+        }
+    }
+
+    pub(super) fn prepend_logs(&mut self, lines: Vec<String>) {
+        let bump_logs_scroll = self.logs_scroll_active && !self.logs_follow;
+        let bump_dashboard_scroll = self.dashboard_logs_scroll_active && !self.dashboard_logs_follow;
+        let mut normalized = Vec::new();
+        for line in lines {
+            normalized.extend(Self::normalize_log_fragments(&line));
+        }
+
+        for part in normalized.into_iter().rev() {
+            if self.logs.len() >= LOG_MAX_ENTRIES {
+                self.logs.pop_back();
             }
-            self.logs.push_back(part.clone());
+            self.logs.push_front(part.clone());
             if bump_logs_scroll {
                 let rows = super::views::logs::wrapped_row_count_for_entry(&part, self.logs_content_width)
                     .min(usize::from(u16::MAX)) as u16;
@@ -369,6 +379,41 @@ impl App {
                 self.dashboard_logs_scroll = self.dashboard_logs_scroll.saturating_add(rows);
             }
         }
+    }
+
+    fn append_log_entry(&mut self, part: String, bump_logs_scroll: bool, bump_dashboard_scroll: bool) {
+        if self.logs.len() >= LOG_MAX_ENTRIES {
+            self.logs.pop_front();
+        }
+        self.logs.push_back(part.clone());
+        if bump_logs_scroll {
+            let rows = super::views::logs::wrapped_row_count_for_entry(&part, self.logs_content_width)
+                .min(usize::from(u16::MAX)) as u16;
+            self.logs_scroll = self.logs_scroll.saturating_add(rows);
+        }
+        if bump_dashboard_scroll {
+            let rows = super::views::logs::wrapped_row_count_for_entry(&part, self.dashboard_logs_content_width)
+                .min(usize::from(u16::MAX)) as u16;
+            self.dashboard_logs_scroll = self.dashboard_logs_scroll.saturating_add(rows);
+        }
+    }
+
+    fn normalize_log_fragments(line: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        for part in line.split(['\n', '\r']) {
+            let sanitized = sanitize_log_line(part);
+            let trimmed = sanitized.trim_end();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let normalized = if trimmed.chars().count() > MAX_LOG_LINE_CHARS {
+                trimmed.chars().take(MAX_LOG_LINE_CHARS).collect::<String>()
+            } else {
+                trimmed.to_string()
+            };
+            out.push(normalized);
+        }
+        out
     }
 
     pub(super) fn update_log_viewport_widths(&mut self, area: Rect) {
@@ -461,5 +506,36 @@ mod tests {
         app.push_log(huge);
         assert_eq!(app.logs.len(), 1);
         assert_eq!(app.logs[0].chars().count(), 4096);
+    }
+
+    #[test]
+    fn append_logs_preserves_anchor_in_scroll_mode() {
+        let mut app = App::new(vec![], sample_config());
+        app.logs_content_width = 120;
+        app.logs_scroll_active = true;
+        app.logs_follow = false;
+        app.logs_scroll = 3;
+        app.logs.push_back("INFO existing".to_string());
+
+        app.append_logs(vec!["INFO appended".to_string()]);
+
+        assert_eq!(app.logs_scroll, 4);
+        assert_eq!(app.logs.back().expect("last"), "INFO appended");
+    }
+
+    #[test]
+    fn prepend_logs_preserves_anchor_and_order() {
+        let mut app = App::new(vec![], sample_config());
+        app.logs_content_width = 120;
+        app.logs_scroll_active = true;
+        app.logs_follow = false;
+        app.logs_scroll = 2;
+        app.logs.push_back("INFO current".to_string());
+
+        app.prepend_logs(vec!["INFO older-1".to_string(), "INFO older-2".to_string()]);
+
+        assert_eq!(app.logs_scroll, 4);
+        assert_eq!(app.logs[0], "INFO older-1");
+        assert_eq!(app.logs[1], "INFO older-2");
     }
 }

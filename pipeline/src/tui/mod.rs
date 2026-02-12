@@ -40,7 +40,7 @@ pub async fn run(opts: TuiOptions) -> anyhow::Result<()> {
     let log_file = opts.log_file;
 
     let (ui_tx, mut ui_rx) = mpsc::unbounded_channel::<UiEvent>();
-    start_log_source(ui_tx.clone(), unit_name.clone(), log_file.clone());
+    let log_control = start_log_source(ui_tx.clone(), unit_name.clone(), log_file.clone());
 
     let ctx = init_context_best_effort()
         .await
@@ -240,7 +240,8 @@ pub async fn run(opts: TuiOptions) -> anyhow::Result<()> {
             UiEvent::Tick => {
                 app.last_tick = Instant::now();
             }
-            UiEvent::LogLine(msg) => app.push_log(msg),
+            UiEvent::AppendLogLines(lines) => app.append_logs(lines),
+            UiEvent::PrependLogLines(lines) => app.prepend_logs(lines),
             UiEvent::DaemonPaused(res) => {
                 if let Ok(is_paused) = res {
                     if !matches!(app.engine, LoopControl::Stopping) {
@@ -320,7 +321,7 @@ pub async fn run(opts: TuiOptions) -> anyhow::Result<()> {
                 app.deposit.last = Some(res);
             }
             UiEvent::Input(key) => {
-                if input::handle_key(&mut app, key, sock_path.as_path(), &ui_tx, &ctx).await? {
+                if input::handle_key(&mut app, key, sock_path.as_path(), &log_control, &ui_tx, &ctx).await? {
                     break;
                 }
             }
