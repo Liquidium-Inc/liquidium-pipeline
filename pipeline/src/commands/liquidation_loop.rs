@@ -11,8 +11,8 @@ use tracing::{info, warn};
 
 use crate::{
     commands::liquidation_loop_helpers::{
-        bootstrap_control_plane, console_ui_enabled, debt_asset_principals, debt_assets_as_text, print_banner,
-        run_daemon_cycle_loop,
+        bootstrap_control_plane, console_ui_enabled, debt_asset_principals, debt_assets_as_text,
+        ensure_runtime_file_permissions, print_banner, run_daemon_cycle_loop,
     },
     config::{Config, ConfigTrait, SwapperMode},
     context::{PipelineContext, init_context},
@@ -180,6 +180,16 @@ pub async fn run_liquidation_loop(sock_path: PathBuf) {
     };
     let ctx = Arc::new(ctx);
     let config = ctx.config.clone();
+
+    if let Err(err) = ensure_runtime_file_permissions(&config.db_path, &config.export_path) {
+        tracing::error!(
+            db_path = %config.db_path,
+            export_path = %config.export_path,
+            "Startup filesystem preflight failed: {}",
+            err
+        );
+        return;
+    }
 
     if config.buy_bad_debt {
         info!(

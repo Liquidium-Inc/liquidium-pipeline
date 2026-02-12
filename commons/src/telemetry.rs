@@ -229,9 +229,23 @@ fn open_log_file(path: &Path) -> Result<std::fs::File, Box<dyn std::error::Error
     if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()
     {
-        std::fs::create_dir_all(parent)?;
+        std::fs::create_dir_all(parent).map_err(|e| {
+            std::io::Error::new(
+                e.kind(),
+                format!("create local log directory '{}' failed: {}", parent.display(), e),
+            )
+        })?;
     }
 
-    let file = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(|e| {
+            std::io::Error::new(
+                e.kind(),
+                format!("open local log file '{}' failed: {}", path.display(), e),
+            )
+        })?;
     Ok(file)
 }

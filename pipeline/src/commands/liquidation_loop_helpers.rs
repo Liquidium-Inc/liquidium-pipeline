@@ -1,6 +1,7 @@
 use candid::Principal;
 use indicatif::{ProgressBar, ProgressStyle};
 use prettytable::{Cell, Row, Table, format};
+use std::fs::OpenOptions;
 use std::future::Future;
 use std::io::{IsTerminal, stderr, stdout};
 use std::panic::AssertUnwindSafe;
@@ -163,6 +164,50 @@ pub(crate) fn debt_asset_principals(registry: &TokenRegistry) -> Vec<Principal> 
 
 pub(crate) fn debt_assets_as_text(principals: &[Principal]) -> Vec<String> {
     principals.iter().map(Principal::to_text).collect()
+}
+
+/// Verifies startup file-system access for critical runtime artifacts.
+///
+/// This preflight fails fast with explicit path+permission diagnostics so the
+/// daemon does not enter a noisy retry loop when DB/export paths are invalid.
+pub(crate) fn ensure_runtime_file_permissions(db_path: &str, export_path: &str) -> anyhow::Result<()> {
+    ensure_parent_dir(Path::new(db_path), "DB_PATH")?;
+    ensure_parent_dir(Path::new(export_path), "EXPORT_PATH")?;
+
+    probe_rw_file(Path::new(db_path), "DB_PATH", false)?;
+    probe_rw_file(Path::new(export_path), "EXPORT_PATH", true)?;
+    Ok(())
+}
+
+fn ensure_parent_dir(path: &Path, label: &str) -> anyhow::Result<()> {
+    let Some(parent) = path.parent() else {
+        return Ok(());
+    };
+    if parent.as_os_str().is_empty() {
+        return Ok(());
+    }
+
+    std::fs::create_dir_all(parent)
+        .with_context(|| format!("create parent directory for {label}: {}", parent.display()))
+}
+
+fn probe_rw_file(path: &Path, label: &str, append: bool) -> anyhow::Result<()> {
+    let mut opts = OpenOptions::new();
+    opts.create(true).read(true).write(true);
+    if append {
+        opts.append(true);
+    }
+
+    match opts.open(path) {
+        Ok(_) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {
+            anyhow::bail!(
+                "{label} is not writable: {} (permission denied; check file owner/group/mode and parent directory permissions)",
+                path.display()
+            );
+        }
+        Err(err) => Err(err).with_context(|| format!("open {label} at {}", path.display())),
+    }
 }
 
 /// Boots and serves the UDS control plane used by attachable TUI clients.
@@ -512,10 +557,11 @@ pub(crate) fn print_execution_results(results: Vec<LiquidationOutcome>) {
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
+    use tempfile::TempDir;
 
     use tokio::time::sleep;
 
-    use super::stage_with_timeout;
+    use super::{ensure_runtime_file_permissions, stage_with_timeout};
 
     #[tokio::test]
     async fn stage_timeout_returns_none_when_future_exceeds_deadline() {
@@ -532,5 +578,31 @@ mod tests {
     async fn stage_timeout_returns_value_when_future_finishes_in_time() {
         let out = stage_with_timeout("test.stage", Duration::from_millis(100), async { 7usize }).await;
         assert_eq!(out, Some(7));
+    }
+
+    #[test]
+    fn runtime_file_preflight_creates_missing_parents_and_files() {
+        let tmp = TempDir::new().expect("tmp");
+        let db = tmp.path().join("state/wal.db");
+        let export = tmp.path().join("exports/executions.csv");
+
+        ensure_runtime_file_permissions(db.to_str().expect("db path"), export.to_str().expect("export path"))
+            .expect("preflight should pass");
+
+        assert!(db.is_file());
+        assert!(export.is_file());
+    }
+
+    #[test]
+    fn runtime_file_preflight_rejects_directory_target_for_db() {
+        let tmp = TempDir::new().expect("tmp");
+        let db_dir = tmp.path().join("dbdir");
+        std::fs::create_dir_all(&db_dir).expect("mkdir");
+        let export = tmp.path().join("exports/executions.csv");
+
+        let err =
+            ensure_runtime_file_permissions(db_dir.to_str().expect("db dir"), export.to_str().expect("export path"))
+                .expect_err("directory path must fail");
+        assert!(err.to_string().contains("DB_PATH"));
     }
 }

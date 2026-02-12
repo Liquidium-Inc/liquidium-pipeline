@@ -21,6 +21,8 @@ use clap::{Parser, Subcommand};
 use liquidium_pipeline_commons::env::load_env;
 use liquidium_pipeline_commons::telemetry::{init_telemetry_from_env, init_telemetry_from_env_with_log_file};
 use std::path::PathBuf;
+#[cfg(target_os = "linux")]
+use std::process::Command;
 
 use crate::commands::liquidation_loop::run_liquidation_loop;
 
@@ -111,18 +113,40 @@ async fn main() {
     let cli = Cli::parse();
     let running_under_systemd = is_systemd_service_process();
 
+    if matches!(cli.command, Commands::Run { .. })
+        && let Some(reason) = detect_manual_run_block_reason(running_under_systemd)
+    {
+        eprintln!("{reason}");
+        return;
+    }
+
     // Telemetry writes to stdout by default; in TUI mode it will corrupt the terminal.
     // The TUI sets up its own in-app log sink instead.
     let _telemetry_guard = match &cli.command {
         Commands::Tui { .. } => None,
         Commands::Run { log_file, .. } => {
             let effective_log_file = effective_run_log_file(log_file.clone(), running_under_systemd);
-            Some(
-                init_telemetry_from_env_with_log_file(effective_log_file.as_deref())
-                    .expect("Failed to initialize telemetry"),
-            )
+            match init_telemetry_from_env_with_log_file(effective_log_file.as_deref()) {
+                Ok(guard) => Some(guard),
+                Err(err) => {
+                    eprintln!("Failed to initialize telemetry: {err}");
+                    if let Some(path) = effective_log_file {
+                        eprintln!(
+                            "Check log-file permissions for {} or use --log-file with a writable path.",
+                            path.display()
+                        );
+                    }
+                    return;
+                }
+            }
         }
-        _ => Some(init_telemetry_from_env().expect("Failed to initialize telemetry")),
+        _ => match init_telemetry_from_env() {
+            Ok(guard) => Some(guard),
+            Err(err) => {
+                eprintln!("Failed to initialize telemetry: {err}");
+                return;
+            }
+        },
     };
 
     match cli.command {
@@ -222,4 +246,42 @@ fn infer_tui_log_file(requested: Option<PathBuf>) -> Option<PathBuf> {
 
     let candidate = control_plane::default_log_file_path();
     if candidate.is_file() { Some(candidate) } else { None }
+}
+
+fn detect_manual_run_block_reason(running_under_systemd: bool) -> Option<String> {
+    #[cfg(target_os = "linux")]
+    {
+        if running_under_systemd {
+            return None;
+        }
+
+        if !std::path::Path::new("/run/systemd/system").exists() {
+            return None;
+        }
+
+        let unit_name = std::env::var("LIQUIDATOR_SYSTEMD_UNIT").unwrap_or_else(|_| "liquidator.service".to_string());
+        match is_systemd_unit_active(&unit_name) {
+            Ok(true) => Some(format!(
+                "Refusing to start duplicate daemon: systemd unit '{unit_name}' is already active.\nUse `liquidator tui` to attach, or stop the unit first: sudo systemctl stop {unit_name}"
+            )),
+            Ok(false) => None,
+            Err(err) => {
+                eprintln!("Warning: unable to query systemd unit state for '{unit_name}': {err}");
+                None
+            }
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = running_under_systemd;
+        None
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn is_systemd_unit_active(unit_name: &str) -> std::io::Result<bool> {
+    let status = Command::new("systemctl")
+        .args(["is-active", "--quiet", unit_name])
+        .status()?;
+    Ok(status.success())
 }
