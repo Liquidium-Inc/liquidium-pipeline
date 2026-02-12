@@ -41,10 +41,14 @@ enum Commands {
         // Control socket path.
         #[arg(long)]
         sock_path: Option<PathBuf>,
-        // Optional local log file. If omitted outside systemd, defaults to the
-        // platform temp path (e.g. /tmp/liquidator/liquidator.log).
-        #[arg(long)]
-        log_file: Option<PathBuf>,
+        // Optional local log file.
+        // `--log-file` (without a value) uses the default temp path.
+        // `--log-file /path/to/file.log` uses the provided path.
+        #[arg(long, num_args = 0..=1, value_name = "PATH", conflicts_with = "no_log_file")]
+        log_file: Option<Option<PathBuf>>,
+        // Disable local file logs explicitly.
+        #[arg(long, conflicts_with = "log_file")]
+        no_log_file: bool,
     },
 
     // Starts the interactive attachable TUI client.
@@ -124,8 +128,12 @@ async fn main() {
     // The TUI sets up its own in-app log sink instead.
     let _telemetry_guard = match &cli.command {
         Commands::Tui { .. } => None,
-        Commands::Run { log_file, .. } => {
-            let mut telemetry_log_file = effective_run_log_file(log_file.clone(), running_under_systemd);
+        Commands::Run {
+            log_file,
+            no_log_file,
+            ..
+        } => {
+            let mut telemetry_log_file = effective_run_log_file(log_file.clone(), *no_log_file);
             if let Some(path) = telemetry_log_file.as_deref()
                 && let Err(err) = ensure_log_file_parent_exists(path)
             {
@@ -249,11 +257,15 @@ fn is_systemd_service_process() -> bool {
     }
 }
 
-fn effective_run_log_file(requested: Option<PathBuf>, running_under_systemd: bool) -> Option<PathBuf> {
+fn effective_run_log_file(requested: Option<Option<PathBuf>>, no_log_file: bool) -> Option<PathBuf> {
+    if no_log_file {
+        return None;
+    }
+
     match requested {
-        Some(path) => Some(path),
-        None if running_under_systemd => None,
-        None => Some(control_plane::default_log_file_path()),
+        Some(Some(path)) => Some(path),
+        Some(None) => Some(control_plane::default_log_file_path()),
+        None => None,
     }
 }
 
@@ -311,4 +323,80 @@ fn is_systemd_unit_active(unit_name: &str) -> std::io::Result<bool> {
         .args(["is-active", "--quiet", unit_name])
         .status()?;
     Ok(status.success())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn run_log_file_resolution_no_flags_disables_file_sink() {
+        let resolved = effective_run_log_file(None, false);
+        assert_eq!(resolved, None);
+    }
+
+    #[test]
+    fn run_log_file_resolution_no_log_file_disables_file_sink() {
+        let resolved = effective_run_log_file(Some(None), true);
+        assert_eq!(resolved, None);
+    }
+
+    #[test]
+    fn run_log_file_resolution_flag_without_value_uses_default() {
+        let resolved = effective_run_log_file(Some(None), false);
+        assert_eq!(resolved, Some(control_plane::default_log_file_path()));
+    }
+
+    #[test]
+    fn run_log_file_resolution_custom_path() {
+        let custom = PathBuf::from("/tmp/custom.log");
+        let resolved = effective_run_log_file(Some(Some(custom.clone())), false);
+        assert_eq!(resolved, Some(custom));
+    }
+
+    #[test]
+    fn cli_parse_run_without_log_flags() {
+        let parsed = Cli::try_parse_from(["liquidator", "run"]).expect("run should parse");
+        match parsed.command {
+            Commands::Run {
+                log_file,
+                no_log_file,
+                ..
+            } => {
+                assert_eq!(log_file, None);
+                assert!(!no_log_file);
+            }
+            _ => panic!("expected run command"),
+        }
+    }
+
+    #[test]
+    fn cli_parse_run_log_file_flag_without_value() {
+        let parsed =
+            Cli::try_parse_from(["liquidator", "run", "--log-file"]).expect("run --log-file should parse");
+        match parsed.command {
+            Commands::Run { log_file, .. } => {
+                assert_eq!(log_file, Some(None));
+            }
+            _ => panic!("expected run command"),
+        }
+    }
+
+    #[test]
+    fn cli_parse_run_log_file_custom_path() {
+        let parsed = Cli::try_parse_from(["liquidator", "run", "--log-file", "/tmp/x.log"])
+            .expect("run --log-file /tmp/x.log should parse");
+        match parsed.command {
+            Commands::Run { log_file, .. } => {
+                assert_eq!(log_file, Some(Some(PathBuf::from("/tmp/x.log"))));
+            }
+            _ => panic!("expected run command"),
+        }
+    }
+
+    #[test]
+    fn cli_parse_run_conflicting_log_flags_fails() {
+        let parsed = Cli::try_parse_from(["liquidator", "run", "--log-file", "--no-log-file"]);
+        assert!(parsed.is_err(), "conflicting log flags should fail parsing");
+    }
 }

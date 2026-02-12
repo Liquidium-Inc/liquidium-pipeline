@@ -379,13 +379,19 @@ Stages are implemented with `async-trait` for composability.
 ### Run the Liquidation Loop
 
 ```bash
+liquidator run --sock-path /run/liquidator/ctl.sock
+# optional: enable file sink at default path
+liquidator run --sock-path /run/liquidator/ctl.sock --log-file
+# optional: enable file sink at custom path
 liquidator run --sock-path /run/liquidator/ctl.sock --log-file ./liquidator.log
 ```
 
 Starts the foreground daemon loop (systemd-supervised) that continuously monitors and executes liquidations.
 The control socket accepts `pause` / `resume` from attachable clients.
-Outside systemd, if `--log-file` is omitted, the daemon writes to a default file at
-`<temp>/liquidator/liquidator.log`.
+By default, `liquidator run` does not write a local log file.
+Passing `--log-file` (without a value) enables file logging at the default path:
+`<temp>/liquidator/liquidator.log` (for example, `/tmp/liquidator/liquidator.log` on Linux).
+Passing `--log-file /custom/path.log` writes to that custom file.
 
 ### Start the TUI
 
@@ -550,8 +556,8 @@ unit, and restarts it.
 Linux non-service mode with file tail:
 
 ```bash
-liquidator run --sock-path /tmp/liquidator/ctl.sock --log-file ./liquidator.log
-liquidator tui --sock-path /tmp/liquidator/ctl.sock --log-file ./liquidator.log
+liquidator run --sock-path /tmp/liquidator/ctl.sock --log-file
+liquidator tui --sock-path /tmp/liquidator/ctl.sock
 ```
 
 On macOS/dev, use file fallback explicitly:

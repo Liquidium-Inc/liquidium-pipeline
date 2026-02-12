@@ -332,5 +332,6 @@ pub async fn run(opts: TuiOptions) -> anyhow::Result<()> {
     }
 
     stop.store(true, Ordering::Relaxed);
+    log_control.shutdown();
     Ok(())
 }

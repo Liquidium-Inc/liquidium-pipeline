@@ -8,6 +8,7 @@ use chrono::{DateTime, Utc};
 #[cfg(target_os = "linux")]
 use chrono::{SecondsFormat, TimeZone};
 use tokio::sync::mpsc;
+use tokio::sync::mpsc::error::TryRecvError;
 
 use super::events::UiEvent;
 
@@ -37,6 +38,7 @@ enum LogSource {
 #[derive(Debug, Clone, Copy)]
 enum LogControlMsg {
     LoadOlder,
+    Shutdown,
 }
 
 #[derive(Clone)]
@@ -47,6 +49,10 @@ pub(super) struct LogControlHandle {
 impl LogControlHandle {
     pub(super) fn request_older(&self) {
         let _ = self.tx.try_send(LogControlMsg::LoadOlder);
+    }
+
+    pub(super) fn shutdown(&self) {
+        let _ = self.tx.try_send(LogControlMsg::Shutdown);
     }
 }
 
@@ -182,13 +188,13 @@ fn spawn_journalctl(
         }
         has_more_older = oldest_cursor.is_some();
 
-        {
+        let follow_task = {
             let follow_ui_tx = ui_tx.clone();
             let follow_args = journal_follow_args(&unit_name);
             tokio::spawn(async move {
                 run_journalctl_follow(follow_ui_tx, follow_args).await;
-            });
-        }
+            })
+        };
 
         while let Some(msg) = control_rx.recv().await {
             match msg {
@@ -227,8 +233,11 @@ fn spawn_journalctl(
                         None => {}
                     }
                 }
+                LogControlMsg::Shutdown => break,
             }
         }
+
+        follow_task.abort();
     });
 }
 
@@ -492,9 +501,9 @@ fn spawn_file_tail(
         };
 
         loop {
-            while let Ok(msg) = control_rx.try_recv() {
-                match msg {
-                    LogControlMsg::LoadOlder => match load_older_file_lines(&path, &mut state) {
+            loop {
+                match control_rx.try_recv() {
+                    Ok(LogControlMsg::LoadOlder) => match load_older_file_lines(&path, &mut state) {
                         Ok(lines) if !lines.is_empty() => {
                             let _ = ui_tx.send(UiEvent::PrependLogLines(lines));
                         }
@@ -515,6 +524,9 @@ fn spawn_file_tail(
                             );
                         }
                     },
+                    Ok(LogControlMsg::Shutdown) => return,
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => return,
                 }
             }
 
