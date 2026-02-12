@@ -11,6 +11,7 @@ use super::super::app::{App, UiFocus};
 
 pub(super) fn log_to_line(line: &str) -> Line<'static> {
     let line = line.trim_end_matches('\r');
+    let line = strip_duplicated_timestamp_level_prefix(line);
     if line.is_empty() {
         return Line::from("");
     }
@@ -86,6 +87,10 @@ fn level_style(level: &str) -> Style {
 }
 
 fn highlight_message(msg: &str) -> Vec<Span<'static>> {
+    if looks_structured_kv_message(msg) {
+        return highlight_structured_kv_message(msg);
+    }
+
     let patterns: [(&str, Style); 5] = [
         (
             "BAD DEBT MODE",
@@ -140,10 +145,164 @@ fn highlight_message(msg: &str) -> Vec<Span<'static>> {
     spans
 }
 
+fn looks_structured_kv_message(msg: &str) -> bool {
+    msg.matches('=').count() >= 3
+}
+
+fn highlight_structured_kv_message(msg: &str) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
+
+    for (idx, token) in msg.split_whitespace().enumerate() {
+        if idx > 0 {
+            spans.push(Span::raw(" "));
+        }
+
+        if let Some((key, value)) = token.split_once('=') {
+            spans.push(Span::styled(
+                format!("{key}="),
+                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            ));
+            spans.push(Span::styled(
+                value.to_string(),
+                style_structured_value(key, value),
+            ));
+            continue;
+        }
+
+        spans.push(Span::styled(token.to_string(), style_structured_word(token)));
+    }
+
+    spans
+}
+
+fn style_structured_value(key: &str, value: &str) -> Style {
+    let key_l = key.to_ascii_lowercase();
+    let normalized_value = normalize_token_for_match(value);
+
+    if key_l.contains("status")
+        && let Some(style) = status_word_style(normalized_value)
+    {
+        return style;
+    }
+
+    if key_l.contains("profit")
+        && let Ok(n) = normalized_value.parse::<i128>()
+    {
+        return numeric_sign_style(n);
+    }
+
+    if key_l.ends_with("_id") || key_l == "liquidation_id" {
+        return Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD);
+    }
+
+    if looks_number_like(normalized_value) {
+        return Style::default().fg(Color::LightCyan).add_modifier(Modifier::BOLD);
+    }
+
+    if let Some(style) = status_word_style(normalized_value) {
+        return style;
+    }
+
+    Style::default().fg(Color::White).add_modifier(Modifier::BOLD)
+}
+
+fn style_structured_word(word: &str) -> Style {
+    let normalized = normalize_token_for_match(word);
+
+    if let Some(style) = status_word_style(normalized) {
+        return style;
+    }
+
+    if looks_number_like(normalized) {
+        return Style::default().fg(Color::LightCyan).add_modifier(Modifier::BOLD);
+    }
+
+    if looks_asset_symbol(normalized) {
+        return Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD);
+    }
+
+    Style::default()
+}
+
+fn status_word_style(word: &str) -> Option<Style> {
+    match word.to_ascii_lowercase().as_str() {
+        "success" | "succeeded" | "ok" | "true" => {
+            Some(Style::default().fg(Color::Green).add_modifier(Modifier::BOLD))
+        }
+        "failed" | "fail" | "error" | "panic" | "false" => {
+            Some(Style::default().fg(Color::Red).add_modifier(Modifier::BOLD))
+        }
+        "pending" | "retry" | "waiting" => Some(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+        _ => None,
+    }
+}
+
+fn looks_number_like(value: &str) -> bool {
+    let v = value.trim();
+    if v.is_empty() {
+        return false;
+    }
+    v.parse::<i128>().is_ok() || v.parse::<f64>().is_ok()
+}
+
+fn looks_asset_symbol(value: &str) -> bool {
+    if value.len() < 2 || value.len() > 12 {
+        return false;
+    }
+    let has_alpha = value.chars().any(|c| c.is_ascii_alphabetic());
+    let has_upper = value.chars().any(|c| c.is_ascii_uppercase());
+    has_alpha && has_upper && value.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+
+fn normalize_token_for_match(token: &str) -> &str {
+    token.trim_matches(|c: char| matches!(c, '"' | '\'' | ',' | ';' | '(' | ')' | '[' | ']'))
+}
+
+fn numeric_sign_style(value: i128) -> Style {
+    match value.cmp(&0) {
+        std::cmp::Ordering::Greater => Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+        std::cmp::Ordering::Less => Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        std::cmp::Ordering::Equal => Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD),
+    }
+}
+
 fn split_once_ws(s: &str) -> Option<(&str, &str)> {
     let idx = s.find(|c: char| c.is_whitespace())?;
     let (a, b) = s.split_at(idx);
     Some((a, b.trim_start()))
+}
+
+fn strip_duplicated_timestamp_level_prefix(mut line: &str) -> &str {
+    loop {
+        let Some((first_ts, first_rest)) = split_once_ws(line) else {
+            return line;
+        };
+        if !looks_like_timestamp(first_ts) {
+            return line;
+        }
+        let Some((first_level, after_first_level)) = split_once_ws(first_rest) else {
+            return line;
+        };
+        if normalize_level(first_level).is_none() {
+            return line;
+        }
+
+        let Some((second_ts, second_rest)) = split_once_ws(after_first_level) else {
+            return line;
+        };
+        if !looks_like_timestamp(second_ts) {
+            return line;
+        }
+        let Some((second_level, _)) = split_once_ws(second_rest) else {
+            return line;
+        };
+        if normalize_level(second_level).is_none() {
+            return line;
+        }
+
+        // Drop the outer prefix and keep the inner structured message.
+        line = after_first_level;
+    }
 }
 
 fn looks_like_timestamp(token: &str) -> bool {
@@ -321,5 +480,39 @@ mod tests {
     fn fallback_detects_embedded_level_tokens() {
         let line = log_to_line("Feb 12 host liquidator[123]: INFO daemon resumed");
         assert_eq!(line.spans[0].style.fg, Some(Color::Green));
+    }
+
+    #[test]
+    fn collapses_double_timestamp_and_level_prefix() {
+        let line = log_to_line(
+            "2026-02-12T14:07:05.072810Z INFO  2026-02-12T14:07:05.071699Z INFO liquidation.init: Initializing liquidations stage",
+        );
+        let rendered: String = line.spans.iter().map(|span| span.content.as_ref()).collect();
+        assert!(rendered.starts_with("2026-02-12T14:07:05.071699Z INFO"));
+        assert!(!rendered.contains("2026-02-12T14:07:05.072810Z"));
+    }
+
+    #[test]
+    fn structured_outcome_line_highlights_status_and_profit_values() {
+        let line = log_to_line(
+            "2026-02-12T14:06:12.802210Z INFO Liquidation outcome event=\"liquidation_outcome\" swap_status=Success status=Success expected_profit=-68999 realized_profit=6046660 profit_delta=6115659",
+        );
+
+        let has_success_green = line
+            .spans
+            .iter()
+            .any(|span| span.content.as_ref().contains("Success") && span.style.fg == Some(Color::Green));
+        let has_negative_profit_red = line
+            .spans
+            .iter()
+            .any(|span| span.content.as_ref().contains("-68999") && span.style.fg == Some(Color::Red));
+        let has_positive_profit_green = line
+            .spans
+            .iter()
+            .any(|span| span.content.as_ref().contains("6115659") && span.style.fg == Some(Color::Green));
+
+        assert!(has_success_green, "Success should be highlighted in green");
+        assert!(has_negative_profit_red, "negative profit should be highlighted in red");
+        assert!(has_positive_profit_green, "positive profit should be highlighted in green");
     }
 }
