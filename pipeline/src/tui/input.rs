@@ -1,10 +1,12 @@
+use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use tokio::sync::{mpsc, watch};
+use tokio::sync::mpsc;
 
 use crate::commands::liquidation_loop::LoopControl;
+use crate::control_plane::{ControlCommand, send_control_command};
 
 use super::app::{App, BalancesPanel, Tab, UiFocus, WithdrawField};
 use super::events::UiEvent;
@@ -70,7 +72,7 @@ fn scroll_dashboard_logs_down(app: &mut App, entries: usize) {
 pub(super) async fn handle_key(
     app: &mut App,
     key: KeyEvent,
-    engine_tx: &watch::Sender<LoopControl>,
+    sock_path: &Path,
     ui_tx: &mpsc::UnboundedSender<UiEvent>,
     ctx: &Arc<crate::context::PipelineContext>,
 ) -> Result<bool> {
@@ -89,9 +91,15 @@ pub(super) async fn handle_key(
                 if input.trim().eq_ignore_ascii_case("yes") {
                     app.bad_debt_confirmed = true;
                     app.bad_debt_confirm_input = None;
-                    app.engine = LoopControl::Running;
-                    let _ = engine_tx.send(LoopControl::Running);
-                    app.push_log("bad debt: confirmed (engine started)");
+                    match send_control_command(sock_path, ControlCommand::Resume).await {
+                        Ok(()) => {
+                            app.engine = LoopControl::Running;
+                            app.push_log("bad debt: confirmed (engine resumed)");
+                        }
+                        Err(err) => {
+                            app.push_log(format!("control error: {}", err));
+                        }
+                    }
                 } else {
                     app.push_log("bad debt: type 'yes' and press Enter to start");
                 }
@@ -484,13 +492,27 @@ pub(super) async fn handle_key(
                 return Ok(false);
             }
 
-            app.engine = next;
-            let _ = engine_tx.send(next);
-            app.push_log(match next {
-                LoopControl::Running => "engine: RUNNING".to_string(),
-                LoopControl::Paused => "engine: PAUSED".to_string(),
-                LoopControl::Stopping => "engine: STOPPING".to_string(),
-            });
+            let command = match next {
+                LoopControl::Running => Some(ControlCommand::Resume),
+                LoopControl::Paused => Some(ControlCommand::Pause),
+                LoopControl::Stopping => None,
+            };
+
+            if let Some(command) = command {
+                match send_control_command(sock_path, command).await {
+                    Ok(()) => {
+                        app.engine = next;
+                        app.push_log(match next {
+                            LoopControl::Running => "engine: RUNNING".to_string(),
+                            LoopControl::Paused => "engine: PAUSED".to_string(),
+                            LoopControl::Stopping => "engine: STOPPING".to_string(),
+                        });
+                    }
+                    Err(err) => {
+                        app.push_log(format!("control error: {}", err));
+                    }
+                }
+            }
         }
         (KeyCode::Char('b'), KeyModifiers::NONE) => {
             let ui_tx = ui_tx.clone();
@@ -519,6 +541,11 @@ pub(super) async fn handle_key(
             reset_log_focus(app);
             reset_executions_focus(app);
             app.tab = Tab::Executions;
+        }
+        (KeyCode::Char('c'), KeyModifiers::NONE) => {
+            reset_log_focus(app);
+            reset_executions_focus(app);
+            app.tab = Tab::Configuration;
         }
         (KeyCode::Char('w'), KeyModifiers::NONE) => {
             reset_log_focus(app);

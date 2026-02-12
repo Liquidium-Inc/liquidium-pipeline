@@ -1,0 +1,19 @@
+[Unit]
+Description=Liquidator Daemon
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=liquidator
+Group=liquidator
+RuntimeDirectory=liquidator
+# RuntimeDirectoryMode is authoritative for /run/liquidator permissions.
+RuntimeDirectoryMode=0770
+ExecStart=/usr/local/bin/liquidator run --sock-path /run/liquidator/ctl.sock
+Restart=always
+RestartSec=3
+Environment=RUST_LOG=info
+
+[Install]
+WantedBy=multi-user.target

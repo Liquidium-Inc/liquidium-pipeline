@@ -132,19 +132,6 @@ fn draw_configuration(f: &mut Frame<'_>, area: Rect, app: &App) {
         Span::styled("false", Style::default().fg(Color::Green))
     };
 
-    let opp_filter = if app.config.opportunity_filter.is_empty() {
-        "none".to_string()
-    } else {
-        let list = app
-            .config
-            .opportunity_filter
-            .iter()
-            .map(|p| truncate_middle(p, 14))
-            .collect::<Vec<_>>()
-            .join(", ");
-        format!("{} ({})", app.config.opportunity_filter.len(), list)
-    };
-
     let lines = vec![
         Line::from(vec![
             Span::styled("Swapper: ", Style::default().add_modifier(Modifier::BOLD)),
@@ -159,10 +146,9 @@ fn draw_configuration(f: &mut Frame<'_>, area: Rect, app: &App) {
         Line::from(vec![
             Span::styled("BUY_BAD_DEBT: ", Style::default().add_modifier(Modifier::BOLD)),
             buy_bad_debt,
-            Span::raw(" · "),
-            Span::styled("Opp filter: ", Style::default().add_modifier(Modifier::BOLD)),
-            Span::raw(opp_filter),
         ]),
+        Line::from(format!("Control socket: {}", app.config.control_socket)),
+        Line::from(app.config.log_source.clone()),
         Line::from(format!("Liq ICP: {}", truncate(&app.config.liquidator_principal, 44))),
         Line::from(format!("Trader ICP: {}", truncate(&app.config.trader_principal, 44))),
         Line::from(format!("Liq EVM: {}", truncate(&app.config.evm_address, 44))),
@@ -345,34 +331,6 @@ fn truncate_start(s: &str, max: usize) -> String {
         .rev()
         .collect();
     format!("…{}", tail)
-}
-
-fn truncate_middle(s: &str, max: usize) -> String {
-    if max <= 1 {
-        return "…".to_string();
-    }
-
-    let len = s.width();
-    if len <= max {
-        return s.to_string();
-    }
-
-    if max <= 3 {
-        return truncate(s, max);
-    }
-
-    let head_len = (max - 1) / 2;
-    let tail_len = max - 1 - head_len;
-    let head: String = s.chars().take(head_len).collect();
-    let tail: String = s
-        .chars()
-        .rev()
-        .take(tail_len)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .collect();
-    format!("{head}…{tail}")
 }
 
 fn draw_bad_debt_confirm(f: &mut Frame<'_>, area: Rect, app: &App) {

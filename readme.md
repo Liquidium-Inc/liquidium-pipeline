@@ -379,21 +379,27 @@ Stages are implemented with `async-trait` for composability.
 ### Run the Liquidation Loop
 
 ```bash
-liquidator run
+liquidator run --sock-path /run/liquidator/ctl.sock --log-file ./liquidator.log
 ```
 
-Starts the main liquidation loop that continuously monitors and executes liquidations.
+Starts the foreground daemon loop (systemd-supervised) that continuously monitors and executes liquidations.
+The control socket accepts `pause` / `resume` from attachable clients.
+Outside systemd, if `--log-file` is omitted, the daemon writes to a default file at
+`<temp>/liquidator/liquidator.log`.
 
 ### Start the TUI
 
 ```bash
-liquidator tui
+liquidator tui --sock-path /run/liquidator/ctl.sock --unit-name liquidator.service
 ```
 
-Launches a terminal UI to **start/pause** the loop, view **WAL status**, **profits** (from `EXPORT_PATH`), **balances**, and run **withdrawals** (ICP tokens only).
+Launches an attachable terminal UI to **pause/resume** the daemon, view **WAL status**, **profits** (from `EXPORT_PATH`), **balances**, and run **withdrawals** (ICP tokens only).
+On Linux, logs are streamed from journald for the configured unit when no file source is available.
+If `--log-file` is omitted and the default file `<temp>/liquidator/liquidator.log` exists, TUI tails it automatically.
+On non-Linux without `--log-file` and without that default file, the UI shows a no-log-source notice.
 
 **Key bindings:**
-- `r` — start/pause
+- `r` — pause/resume
 - `b` — refresh balances
 - `p` — refresh profits
 - `w` — withdraw (from balances)
@@ -507,6 +513,43 @@ RUST_LOG=info ./target/release/liquidator run
 
 In `plain-logs` builds, interactive withdraw prompts are disabled; use non-interactive `liquidator withdraw --source ... --destination ... --asset ... --amount ...` flags.
 
+### Daemon + systemd Example
+
+Use the sample unit at `dev/liquidator.service`:
+
+```ini
+[Service]
+RuntimeDirectory=liquidator
+RuntimeDirectoryMode=0770
+ExecStart=/usr/local/bin/liquidator run --sock-path /run/liquidator/ctl.sock
+Restart=always
+```
+
+Validate daemon logs:
+
+```bash
+journalctl -u liquidator.service -f -o short
+```
+
+Attach the TUI at any time:
+
+```bash
+liquidator tui --sock-path /run/liquidator/ctl.sock --unit-name liquidator.service
+```
+
+Linux non-service mode with file tail:
+
+```bash
+liquidator run --sock-path /tmp/liquidator/ctl.sock --log-file ./liquidator.log
+liquidator tui --sock-path /tmp/liquidator/ctl.sock --log-file ./liquidator.log
+```
+
+On macOS/dev, use file fallback explicitly:
+
+```bash
+liquidator tui --sock-path /tmp/liquidator/ctl.sock --log-file liquidator.log
+```
+
 ---
 
 ## Security
@@ -523,6 +566,7 @@ In `plain-logs` builds, interactive withdraw prompts are disabled; use non-inter
 - CEX calls failing in `hybrid`/`cex` mode: verify `CEX_MEXC_API_KEY` and `CEX_MEXC_API_SECRET`.
 - Noisy terminal output in containerized logging stacks: build and run with `--features plain-logs`.
 - Missing diagnostic detail: rerun with `RUST_LOG=debug`.
+- Runtime socket permission mismatch under systemd: run `systemctl daemon-reload` and restart `liquidator.service`; ensure `RuntimeDirectory=liquidator` and `RuntimeDirectoryMode=0770` are set on the active unit.
 
 ## Notes
 

@@ -4,6 +4,7 @@ use std::time::Instant;
 use chrono::{DateTime, Local};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 
+use super::log_sanitize::sanitize_log_line;
 use crate::commands::liquidation_loop::LoopControl;
 use crate::finalizers::liquidation_outcome::LiquidationOutcome;
 use crate::persistance::ResultStatus;
@@ -21,6 +22,8 @@ pub(super) struct ConfigSummary {
     pub(super) max_cex_slippage_bps: u32,
     pub(super) buy_bad_debt: bool,
     pub(super) opportunity_filter: Vec<String>,
+    pub(super) control_socket: String,
+    pub(super) log_source: String,
     pub(super) db_path: String,
     pub(super) export_path: String,
 }
@@ -28,6 +31,7 @@ pub(super) struct ConfigSummary {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Tab {
     Dashboard,
+    Configuration,
     Balances,
     Profits,
     Executions,
@@ -36,12 +40,20 @@ pub(super) enum Tab {
 
 impl Tab {
     pub(super) fn all() -> &'static [Tab] {
-        &[Tab::Dashboard, Tab::Balances, Tab::Profits, Tab::Executions, Tab::Logs]
+        &[
+            Tab::Dashboard,
+            Tab::Configuration,
+            Tab::Balances,
+            Tab::Profits,
+            Tab::Executions,
+            Tab::Logs,
+        ]
     }
 
     pub(super) fn title(self) -> &'static str {
         match self {
             Tab::Dashboard => "Dashboard",
+            Tab::Configuration => "Configuration",
             Tab::Balances => "Balances",
             Tab::Profits => "Profits",
             Tab::Executions => "Executions",
@@ -327,25 +339,32 @@ impl App {
 
     pub(super) fn push_log(&mut self, line: impl Into<String>) {
         const MAX: usize = 500;
+        const MAX_LINE_CHARS: usize = 4096;
         let bump_logs_scroll = self.logs_scroll_active && !self.logs_follow;
         let bump_dashboard_scroll = self.dashboard_logs_scroll_active && !self.dashboard_logs_follow;
         let line = line.into();
         for part in line.split(['\n', '\r']) {
-            let part = part.trim_end();
-            if part.is_empty() {
+            let sanitized = sanitize_log_line(part);
+            let trimmed = sanitized.trim_end();
+            if trimmed.is_empty() {
                 continue;
             }
+            let part = if trimmed.chars().count() > MAX_LINE_CHARS {
+                trimmed.chars().take(MAX_LINE_CHARS).collect::<String>()
+            } else {
+                trimmed.to_string()
+            };
             if self.logs.len() >= MAX {
                 self.logs.pop_front();
             }
-            self.logs.push_back(part.to_string());
+            self.logs.push_back(part.clone());
             if bump_logs_scroll {
-                let rows = super::views::logs::wrapped_row_count_for_entry(part, self.logs_content_width)
+                let rows = super::views::logs::wrapped_row_count_for_entry(&part, self.logs_content_width)
                     .min(usize::from(u16::MAX)) as u16;
                 self.logs_scroll = self.logs_scroll.saturating_add(rows);
             }
             if bump_dashboard_scroll {
-                let rows = super::views::logs::wrapped_row_count_for_entry(part, self.dashboard_logs_content_width)
+                let rows = super::views::logs::wrapped_row_count_for_entry(&part, self.dashboard_logs_content_width)
                     .min(usize::from(u16::MAX)) as u16;
                 self.dashboard_logs_scroll = self.dashboard_logs_scroll.saturating_add(rows);
             }
@@ -401,5 +420,46 @@ impl App {
         self.logs_scroll = 0;
         self.dashboard_logs_scroll = 0;
         self.executions_details_scroll = 0;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{App, ConfigSummary};
+
+    fn sample_config() -> ConfigSummary {
+        ConfigSummary {
+            ic_url: "https://ic0.app".to_string(),
+            liquidator_principal: "aaaaa-aa".to_string(),
+            trader_principal: "bbbbb-bb".to_string(),
+            evm_address: "0x0".to_string(),
+            swapper_mode: "Hybrid".to_string(),
+            max_dex_slippage_bps: 500,
+            max_cex_slippage_bps: 200,
+            buy_bad_debt: false,
+            opportunity_filter: vec![],
+            control_socket: "/tmp/liquidator/ctl.sock".to_string(),
+            log_source: "Log source file: /tmp/liquidator/liquidator.log".to_string(),
+            db_path: "./wal.db".to_string(),
+            export_path: "executions.csv".to_string(),
+        }
+    }
+
+    #[test]
+    fn push_log_sanitizes_and_splits_lines() {
+        let mut app = App::new(vec![], sample_config());
+        app.push_log("\x1b[32mINFO\x1b[0m hello\tworld\r\nnext\x07 line");
+        assert_eq!(app.logs.len(), 2);
+        assert_eq!(app.logs[0], "INFO hello world");
+        assert_eq!(app.logs[1], "next line");
+    }
+
+    #[test]
+    fn push_log_clamps_very_long_lines() {
+        let mut app = App::new(vec![], sample_config());
+        let huge = format!("INFO {}", "x".repeat(6000));
+        app.push_log(huge);
+        assert_eq!(app.logs.len(), 1);
+        assert_eq!(app.logs[0].chars().count(), 4096);
     }
 }

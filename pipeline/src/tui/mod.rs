@@ -2,6 +2,8 @@ mod app;
 mod events;
 mod format;
 mod input;
+mod log_sanitize;
+mod log_source;
 mod logging;
 mod snapshots;
 mod views;
@@ -17,27 +19,28 @@ use chrono::Local;
 use crossterm::event::{self, Event as CrosstermEvent};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
-use tokio::sync::{mpsc, watch};
+use tokio::sync::mpsc;
 
-use crate::commands::liquidation_loop::{LoopControl, LoopEvent, run_liquidation_loop_controlled};
+use crate::commands::liquidation_loop::LoopControl;
+use crate::commands::tui::TuiOptions;
 use crate::context::init_context_best_effort;
 use crate::persistance::sqlite::SqliteWalStore;
 
-use self::app::{App, ConfigSummary, ExecutionRowData, ExecutionsSnapshot, RecentOutcome, WalCounts, WalSnapshot};
+use self::app::{App, ConfigSummary, ExecutionRowData, ExecutionsSnapshot, WalCounts, WalSnapshot};
 use self::events::UiEvent;
-use self::logging::{TerminalGuard, init_tui_tracing};
+use self::log_source::start_log_source;
+use self::logging::TerminalGuard;
 use self::snapshots::{compute_profits_snapshot, fetch_balances_snapshot};
 use self::views::draw_ui;
 use self::withdraw::build_withdrawable_assets;
 
-pub async fn run() -> anyhow::Result<()> {
-    let (ui_tx, mut ui_rx) = mpsc::unbounded_channel::<UiEvent>();
+pub async fn run(opts: TuiOptions) -> anyhow::Result<()> {
+    let sock_path = opts.sock_path;
+    let unit_name = opts.unit_name;
+    let log_file = opts.log_file;
 
-    if let Err(err) = init_tui_tracing(ui_tx.clone()) {
-        let _ = ui_tx.send(UiEvent::Engine(LoopEvent::Error(format!(
-            "failed to init tracing: {err}"
-        ))));
-    }
+    let (ui_tx, mut ui_rx) = mpsc::unbounded_channel::<UiEvent>();
+    start_log_source(ui_tx.clone(), unit_name.clone(), log_file.clone());
 
     let ctx = init_context_best_effort()
         .await
@@ -48,21 +51,6 @@ pub async fn run() -> anyhow::Result<()> {
     let backend = CrosstermBackend::new(io::stdout());
     let mut terminal = Terminal::new(backend).context("create terminal")?;
     terminal.clear().ok();
-
-    // Engine control + events
-    let (engine_tx, engine_rx) = watch::channel::<LoopControl>(LoopControl::Paused);
-    let (engine_event_tx, mut engine_event_rx) = mpsc::unbounded_channel::<LoopEvent>();
-    let engine_handle = tokio::spawn(run_liquidation_loop_controlled(ctx.clone(), engine_rx, engine_event_tx));
-
-    // Forward engine events into the main UI channel.
-    {
-        let ui_tx = ui_tx.clone();
-        tokio::spawn(async move {
-            while let Some(ev) = engine_event_rx.recv().await {
-                let _ = ui_tx.send(UiEvent::Engine(ev));
-            }
-        });
-    }
 
     // Ticks
     {
@@ -80,13 +68,13 @@ pub async fn run() -> anyhow::Result<()> {
 
     let stop = Arc::new(AtomicBool::new(false));
 
-    // WAL polling
+    // WAL polling (read-only).
     {
         let ui_tx = ui_tx.clone();
         let stop = stop.clone();
         let db_path = ctx.config.db_path.clone();
         tokio::spawn(async move {
-            let store = match SqliteWalStore::new_with_busy_timeout(&db_path, 30_000) {
+            let store = match SqliteWalStore::new_read_only_with_busy_timeout(&db_path, 30_000) {
                 Ok(s) => Arc::new(s),
                 Err(e) => {
                     let _ = ui_tx.send(UiEvent::Wal(Err(format!("db open failed: {e}"))));
@@ -105,16 +93,18 @@ pub async fn run() -> anyhow::Result<()> {
                 let res = tokio::task::spawn_blocking(move || {
                     let counts = store.status_counts().map_err(|e| e.to_string())?;
                     let rows = store.list_recent(200).map_err(|e| e.to_string())?;
-                    Ok::<_, String>((counts, rows))
+                    let paused = store.daemon_paused().map_err(|e| e.to_string())?;
+                    Ok::<_, String>((counts, rows, paused))
                 })
                 .await;
                 match res {
-                    Ok(Ok((map, rows))) => {
+                    Ok(Ok((map, rows, paused))) => {
                         let snapshot = WalSnapshot {
                             counts: WalCounts::from_map(&map),
                             at: Local::now(),
                         };
                         let _ = ui_tx.send(UiEvent::Wal(Ok(snapshot)));
+                        let _ = ui_tx.send(UiEvent::DaemonPaused(Ok(paused)));
 
                         let rows = rows
                             .into_iter()
@@ -135,10 +125,12 @@ pub async fn run() -> anyhow::Result<()> {
                     Ok(Err(e)) => {
                         let _ = ui_tx.send(UiEvent::Wal(Err(format!("db query failed: {e}"))));
                         let _ = ui_tx.send(UiEvent::Executions(Err(format!("db query failed: {e}"))));
+                        let _ = ui_tx.send(UiEvent::DaemonPaused(Err(format!("db query failed: {e}"))));
                     }
                     Err(e) => {
                         let _ = ui_tx.send(UiEvent::Wal(Err(format!("db task failed: {e}"))));
                         let _ = ui_tx.send(UiEvent::Executions(Err(format!("db task failed: {e}"))));
+                        let _ = ui_tx.send(UiEvent::DaemonPaused(Err(format!("db task failed: {e}"))));
                     }
                 }
             }
@@ -211,6 +203,12 @@ pub async fn run() -> anyhow::Result<()> {
         max_cex_slippage_bps: cfg.max_allowed_cex_slippage_bps,
         buy_bad_debt: cfg.buy_bad_debt,
         opportunity_filter: cfg.opportunity_account_filter.iter().map(|p| p.to_text()).collect(),
+        control_socket: sock_path.display().to_string(),
+        log_source: if let Some(path) = &log_file {
+            format!("Log source file: {}", path.display())
+        } else {
+            format!("Log source unit: {}", unit_name)
+        },
         db_path: cfg.db_path.clone(),
         export_path: cfg.export_path.clone(),
     };
@@ -219,8 +217,6 @@ pub async fn run() -> anyhow::Result<()> {
     if let Ok(size) = terminal.size() {
         app.update_log_viewport_widths(size);
     }
-    push_startup_logs(&mut app, &ctx);
-    app.push_log("Press 'r' to start/pause, 'q' to quit, Tab to switch views.");
     {
         let ui_tx = ui_tx.clone();
         let ctx = ctx.clone();
@@ -244,7 +240,19 @@ pub async fn run() -> anyhow::Result<()> {
             UiEvent::Tick => {
                 app.last_tick = Instant::now();
             }
-            UiEvent::Engine(engine_ev) => handle_engine_event(&mut app, engine_ev),
+            UiEvent::LogLine(msg) => app.push_log(msg),
+            UiEvent::DaemonPaused(res) => match res {
+                Ok(is_paused) => {
+                    if !matches!(app.engine, LoopControl::Stopping) {
+                        app.engine = if is_paused {
+                            LoopControl::Paused
+                        } else {
+                            LoopControl::Running
+                        };
+                    }
+                }
+                Err(_) => {}
+            },
             UiEvent::Wal(res) => match res {
                 Ok(snapshot) => {
                     app.wal = Some(snapshot);
@@ -313,7 +321,7 @@ pub async fn run() -> anyhow::Result<()> {
                 app.deposit.last = Some(res);
             }
             UiEvent::Input(key) => {
-                if input::handle_key(&mut app, key, &engine_tx, &ui_tx, &ctx).await? {
+                if input::handle_key(&mut app, key, sock_path.as_path(), &ui_tx, &ctx).await? {
                     break;
                 }
             }
@@ -328,68 +336,5 @@ pub async fn run() -> anyhow::Result<()> {
     }
 
     stop.store(true, Ordering::Relaxed);
-    let _ = engine_tx.send(LoopControl::Stopping);
-    let _ = engine_handle.await;
     Ok(())
-}
-
-fn handle_engine_event(app: &mut App, ev: LoopEvent) {
-    match ev {
-        LoopEvent::Log(msg) => app.push_log(msg),
-        LoopEvent::Error(err) => {
-            app.last_error = Some(err.clone());
-            app.push_log(format!("error: {}", err));
-        }
-        LoopEvent::Outcomes(outcomes) => {
-            app.last_outcomes = outcomes.len();
-
-            let at = Local::now();
-            for outcome in outcomes {
-                if app.recent_outcomes.len() >= 200 {
-                    app.recent_outcomes.pop_front();
-                }
-                app.recent_outcomes.push_back(RecentOutcome { at, outcome });
-            }
-
-            app.push_log(format!("exported {} outcome(s)", app.last_outcomes));
-        }
-    }
-}
-
-fn push_startup_logs(app: &mut App, ctx: &Arc<crate::context::PipelineContext>) {
-    let cfg = &ctx.config;
-    app.push_log("=== Startup ===");
-    app.push_log(format!("Network: {}", cfg.ic_url));
-    app.push_log(format!("Liquidator principal: {}", cfg.liquidator_principal.to_text()));
-    app.push_log(format!("Trader principal: {}", cfg.trader_principal.to_text()));
-    app.push_log(format!(
-        "Liquidator deposit (ICP): {}",
-        cfg.liquidator_principal.to_text()
-    ));
-    app.push_log(format!("Liquidator deposit (EVM): {}", ctx.evm_address));
-    app.push_log(format!("Swapper mode: {:?}", cfg.swapper));
-    app.push_log(format!("Max DEX slippage (bps): {}", cfg.max_allowed_dex_slippage));
-    app.push_log(format!("Max CEX slippage (bps): {}", cfg.max_allowed_cex_slippage_bps));
-    app.push_log(format!("BUY_BAD_DEBT: {}", cfg.buy_bad_debt));
-    if cfg.opportunity_account_filter.is_empty() {
-        app.push_log("Opportunity filter: none");
-    } else {
-        app.push_log(format!(
-            "Opportunity filter ({}):",
-            cfg.opportunity_account_filter.len()
-        ));
-        for p in cfg.opportunity_account_filter.iter() {
-            app.push_log(format!("  - {}", p.to_text()));
-        }
-    }
-    app.push_log(format!("DB: {}", cfg.db_path));
-    app.push_log(format!("EXPORT_PATH: {}", cfg.export_path));
-
-    if cfg.buy_bad_debt {
-        app.push_log("WARN BAD DEBT MODE ENABLED: liquidator will repay bad debt to restore solvency");
-        app.push_log("WARN This bot WILL repay bad debt (you eat the loss).");
-        app.push_log("WARN Press 'r' then type 'yes' + Enter to start.");
-    } else {
-        app.push_log("Bad debt mode disabled: only collateral-backed liquidations will run");
-    }
 }

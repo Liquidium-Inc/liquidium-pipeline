@@ -13,12 +13,14 @@ pub mod swappers;
 mod wal;
 
 mod approval_state;
+mod control_plane;
 mod tui;
 mod utils;
 mod watchdog;
 use clap::{Parser, Subcommand};
 use liquidium_pipeline_commons::env::load_env;
-use liquidium_pipeline_commons::telemetry::init_telemetry_from_env;
+use liquidium_pipeline_commons::telemetry::{init_telemetry_from_env, init_telemetry_from_env_with_log_file};
+use std::path::PathBuf;
 
 use crate::commands::liquidation_loop::run_liquidation_loop;
 
@@ -32,11 +34,30 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    // Starts the liquidation bot loop
-    Run,
+    // Starts the liquidation daemon loop
+    Run {
+        // Control socket path.
+        #[arg(long)]
+        sock_path: Option<PathBuf>,
+        // Optional local log file. If omitted outside systemd, defaults to the
+        // platform temp path (e.g. /tmp/liquidator/liquidator.log).
+        #[arg(long)]
+        log_file: Option<PathBuf>,
+    },
 
-    // Starts the interactive TUI (start/pause loop, view balances & profits)
-    Tui,
+    // Starts the interactive attachable TUI client.
+    Tui {
+        // Control socket path.
+        #[arg(long)]
+        sock_path: Option<PathBuf>,
+        // Linux systemd unit for journalctl log source.
+        #[arg(long, default_value = "liquidator.service")]
+        unit_name: String,
+        // Optional log file for TUI file-tail mode. If omitted and the default
+        // log file exists, TUI tails it automatically.
+        #[arg(long)]
+        log_file: Option<PathBuf>,
+    },
 
     // Shows wallet token balances
     Balance,
@@ -88,20 +109,40 @@ enum AccountCommands {
 async fn main() {
     load_env();
     let cli = Cli::parse();
+    let running_under_systemd = is_systemd_service_process();
 
     // Telemetry writes to stdout by default; in TUI mode it will corrupt the terminal.
     // The TUI sets up its own in-app log sink instead.
-    let _telemetry_guard = match cli.command {
-        Commands::Tui => None,
+    let _telemetry_guard = match &cli.command {
+        Commands::Tui { .. } => None,
+        Commands::Run { log_file, .. } => {
+            let effective_log_file = effective_run_log_file(log_file.clone(), running_under_systemd);
+            Some(
+                init_telemetry_from_env_with_log_file(effective_log_file.as_deref())
+                    .expect("Failed to initialize telemetry"),
+            )
+        }
         _ => Some(init_telemetry_from_env().expect("Failed to initialize telemetry")),
     };
 
-    match &cli.command {
-        Commands::Run => {
-            run_liquidation_loop().await;
+    match cli.command {
+        Commands::Run { sock_path, .. } => {
+            let sock_path = sock_path.unwrap_or_else(control_plane::default_sock_path);
+            run_liquidation_loop(sock_path).await;
         }
-        Commands::Tui => {
-            if let Err(err) = commands::tui::run().await {
+        Commands::Tui {
+            sock_path,
+            unit_name,
+            log_file,
+        } => {
+            let sock_path = sock_path.unwrap_or_else(control_plane::default_sock_path);
+            let inferred_log_file = infer_tui_log_file(log_file);
+            let opts = commands::tui::TuiOptions {
+                sock_path,
+                unit_name,
+                log_file: inferred_log_file,
+            };
+            if let Err(err) = commands::tui::run(opts).await {
                 eprintln!("TUI exited with error: {}", err);
             }
         }
@@ -111,7 +152,7 @@ async fn main() {
             }
         }
         Commands::MexcDepositAddress { asset, network } => {
-            if let Err(err) = commands::cex::mexc_deposit_address(asset, network.as_deref()).await {
+            if let Err(err) = commands::cex::mexc_deposit_address(&asset, network.as_deref()).await {
                 eprintln!("MEXC deposit address failed: {}", err);
             }
         }
@@ -153,4 +194,32 @@ async fn main() {
             }
         },
     }
+}
+
+fn is_systemd_service_process() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        std::env::var_os("INVOCATION_ID").is_some() || std::env::var_os("JOURNAL_STREAM").is_some()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        false
+    }
+}
+
+fn effective_run_log_file(requested: Option<PathBuf>, running_under_systemd: bool) -> Option<PathBuf> {
+    match requested {
+        Some(path) => Some(path),
+        None if running_under_systemd => None,
+        None => Some(control_plane::default_log_file_path()),
+    }
+}
+
+fn infer_tui_log_file(requested: Option<PathBuf>) -> Option<PathBuf> {
+    if requested.is_some() {
+        return requested;
+    }
+
+    let candidate = control_plane::default_log_file_path();
+    if candidate.is_file() { Some(candidate) } else { None }
 }

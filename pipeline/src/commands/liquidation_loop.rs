@@ -1,21 +1,19 @@
-use candid::Principal;
 use icrc_ledger_types::icrc1::account::Account;
-use indicatif::{ProgressBar, ProgressStyle};
-
-use prettytable::{Cell, Row, Table, format};
 use std::{
-    io::{IsTerminal, stderr, stdout},
-    sync::Arc,
-    time::Duration,
-    time::Instant,
+    path::PathBuf,
+    sync::{Arc, atomic::AtomicBool},
+    time::{Duration, Instant},
 };
 use tokio::sync::{mpsc, watch};
 use tokio::time::sleep;
 use tracing::{Instrument, info_span, instrument};
 use tracing::{info, warn};
 
-use crate::output::human_output_enabled;
 use crate::{
+    commands::liquidation_loop_helpers::{
+        bootstrap_control_plane, console_ui_enabled, debt_asset_principals, debt_assets_as_text, print_banner,
+        run_daemon_cycle_loop,
+    },
     config::{Config, ConfigTrait, SwapperMode},
     context::{PipelineContext, init_context},
     executors::basic::basic_executor::BasicExecutor,
@@ -29,7 +27,7 @@ use crate::{
     price_oracle::price_oracle::LiquidationPriceOracle,
     stage::PipelineStage,
     stages::{
-        executor::ExecutionStatus, export::ExportStage, finalize::FinalizeStage, opportunity::OpportunityFinder,
+        export::ExportStage, finalize::FinalizeStage, opportunity::OpportunityFinder,
         settlement_watcher::SettlementWatcher, simple_strategy::SimpleLiquidationStrategy,
     },
     swappers::{mexc::mexc_adapter::MexcClient, router::SwapRouter},
@@ -37,202 +35,7 @@ use crate::{
 };
 use ic_agent::Agent;
 
-use liquidium_pipeline_core::tokens::{
-    chain_token::ChainToken,
-    token_registry::{TokenRegistry, TokenRegistryTrait},
-};
-
-// Prints the startup banner.
-fn print_banner() {
-    println!(
-        r#"
-██████╗ ██╗██████╗ ███████╗██╗     ██╗███╗   ██╗███████╗
-██╔══██╗██║██╔══██╗██╔════╝██║     ██║████╗  ██║██╔════╝
-██████╔╝██║██████╔╝█████╗  ██║     ██║██╔██╗ ██║█████╗  
-██╔═══╝ ██║██╔═══╝ ██╔══╝  ██║     ██║██║╚██╗██║██╔══╝  
-██║     ██║██║     ███████╗███████╗██║██║ ╚████║███████╗
-╚═╝     ╚═╝╚═╝     ╚══════╝╚══════╝╚═╝╚═╝  ╚═══╝╚══════╝
-                                                        
-          Liquidation Execution Engine
-"#
-    );
-}
-
-fn print_startup_table(config: &Config) {
-    let cex_names = if config.cex_credentials.is_empty() {
-        "none".to_string()
-    } else {
-        let mut names: Vec<String> = config.cex_credentials.keys().cloned().collect();
-        names.sort();
-        names.join(", ")
-    };
-    let evm_rpc_url = if config.evm_rpc_url.len() > 96 {
-        format!("{}...", &config.evm_rpc_url[..96])
-    } else {
-        config.evm_rpc_url.clone()
-    };
-    let ic_url = if config.ic_url.len() > 96 {
-        format!("{}...", &config.ic_url[..96])
-    } else {
-        config.ic_url.clone()
-    };
-
-    let mut table = Table::new();
-    table.set_format(*format::consts::FORMAT_NO_LINESEP_WITH_TITLE);
-    table.set_titles(Row::new(vec![Cell::new("Startup Configuration")]));
-
-    table.add_row(Row::new(vec![Cell::new("Network"), Cell::new(&ic_url)]));
-    table.add_row(Row::new(vec![Cell::new("EVM RPC URL"), Cell::new(&evm_rpc_url)]));
-    table.add_row(Row::new(vec![
-        Cell::new("Liquidator Principal"),
-        Cell::new(&config.liquidator_principal.to_text()),
-    ]));
-    table.add_row(Row::new(vec![
-        Cell::new("Trader Principal"),
-        Cell::new(&config.trader_principal.to_text()),
-    ]));
-    table.add_row(Row::new(vec![
-        Cell::new("Lending Canister"),
-        Cell::new(&config.lending_canister.to_text()),
-    ]));
-    table.add_row(Row::new(vec![Cell::new("DB Path"), Cell::new(&config.db_path)]));
-    table.add_row(Row::new(vec![Cell::new("Export Path"), Cell::new(&config.export_path)]));
-    table.add_row(Row::new(vec![
-        Cell::new("Swapper Mode"),
-        Cell::new(&format!("{:?}", config.swapper)),
-    ]));
-    table.add_row(Row::new(vec![Cell::new("Configured CEX"), Cell::new(&cex_names)]));
-    table.add_row(Row::new(vec![
-        Cell::new("Max DEX Slippage (bps)"),
-        Cell::new(&config.max_allowed_dex_slippage.to_string()),
-    ]));
-    table.add_row(Row::new(vec![
-        Cell::new("Max CEX Slippage (bps)"),
-        Cell::new(&config.max_allowed_cex_slippage_bps.to_string()),
-    ]));
-    table.add_row(Row::new(vec![
-        Cell::new("Buy Bad Debt"),
-        Cell::new(&config.buy_bad_debt.to_string()),
-    ]));
-    table.add_row(Row::new(vec![
-        Cell::new("CEX Min Exec USD"),
-        Cell::new(&config.cex_min_exec_usd.to_string()),
-    ]));
-    table.add_row(Row::new(vec![
-        Cell::new("CEX Slice Target Ratio"),
-        Cell::new(&config.cex_slice_target_ratio.to_string()),
-    ]));
-    table.add_row(Row::new(vec![
-        Cell::new("CEX Buy Truncation Trigger"),
-        Cell::new(&config.cex_buy_truncation_trigger_ratio.to_string()),
-    ]));
-    table.add_row(Row::new(vec![
-        Cell::new("CEX Buy Inverse Overspend (bps)"),
-        Cell::new(&config.cex_buy_inverse_overspend_bps.to_string()),
-    ]));
-    table.add_row(Row::new(vec![
-        Cell::new("CEX Buy Inverse Max Retries"),
-        Cell::new(&config.cex_buy_inverse_max_retries.to_string()),
-    ]));
-    table.add_row(Row::new(vec![
-        Cell::new("CEX Buy Inverse Enabled"),
-        Cell::new(&config.cex_buy_inverse_enabled.to_string()),
-    ]));
-    table.add_row(Row::new(vec![
-        Cell::new("CEX Retry Base (secs)"),
-        Cell::new(&config.cex_retry_base_secs.to_string()),
-    ]));
-    table.add_row(Row::new(vec![
-        Cell::new("CEX Retry Max (secs)"),
-        Cell::new(&config.cex_retry_max_secs.to_string()),
-    ]));
-    table.add_row(Row::new(vec![
-        Cell::new("CEX Min Net Edge (bps)"),
-        Cell::new(&config.cex_min_net_edge_bps.to_string()),
-    ]));
-    table.add_row(Row::new(vec![
-        Cell::new("CEX Delay Buffer (bps)"),
-        Cell::new(&config.cex_delay_buffer_bps.to_string()),
-    ]));
-    table.add_row(Row::new(vec![
-        Cell::new("CEX Route Fee (bps)"),
-        Cell::new(&config.cex_route_fee_bps.to_string()),
-    ]));
-    table.add_row(Row::new(vec![
-        Cell::new("CEX Force Over USD Threshold"),
-        Cell::new(&config.cex_force_over_usd_threshold.to_string()),
-    ]));
-
-    table.printstd();
-}
-
-fn console_ui_enabled() -> bool {
-    human_output_enabled() && stdout().is_terminal() && stderr().is_terminal()
-}
-
-fn start_spinner(enabled: bool) -> Option<ProgressBar> {
-    if !enabled {
-        return None;
-    }
-
-    let spinner = ProgressBar::new_spinner();
-    spinner.set_style(
-        ProgressStyle::with_template("{spinner} {msg}")
-            .unwrap()
-            .tick_chars("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏ "),
-    );
-    spinner.enable_steady_tick(Duration::from_millis(100));
-    Some(spinner)
-}
-
-fn log_execution_results(results: &[LiquidationOutcome]) {
-    let success_count = results
-        .iter()
-        .filter(|r| matches!(r.status, ExecutionStatus::Success))
-        .count();
-
-    info!(
-        outcome_count = results.len(),
-        success_count,
-        failed_count = results.len() - success_count,
-        "Liquidation outcomes finalized"
-    );
-
-    for r in results {
-        let liquidation_id = r
-            .execution_receipt
-            .liquidation_result
-            .as_ref()
-            .map(|v| v.id.to_string())
-            .unwrap_or_else(|| "n/a".to_string());
-        let swap_status = r
-            .finalizer_result
-            .swap_result
-            .as_ref()
-            .map(|v| v.status.clone())
-            .unwrap_or_else(|| "none".to_string());
-        let status = r.status.description();
-
-        info!(
-            event = "liquidation_outcome",
-            liquidation_id = %liquidation_id,
-            borrower = %r.request.liquidation.borrower.to_text(),
-            debt_asset = %r.request.debt_asset.symbol(),
-            collateral_asset = %r.request.collateral_asset.symbol(),
-            debt_repaid = %r.formatted_debt_repaid(),
-            collateral_received = %r.formatted_received_collateral(),
-            swap_output = %r.formatted_swap_output(),
-            swapper = %r.formatted_swapper(),
-            swap_status = %swap_status,
-            status = %status,
-            expected_profit = r.expected_profit,
-            realized_profit = r.realized_profit,
-            profit_delta = r.realized_profit - r.expected_profit,
-            round_trip_secs = r.round_trip_secs.unwrap_or(-1),
-            "Liquidation outcome"
-        );
-    }
-}
+use liquidium_pipeline_core::tokens::token_registry::TokenRegistry;
 
 #[instrument(name = "liquidation.init", skip_all, err)]
 async fn init(
@@ -252,17 +55,7 @@ async fn init(
     let registry = ctx.registry.clone();
     let db = Arc::new(SqliteWalStore::new(&config.db_path).map_err(|e| format!("could not connect to db: {e}"))?);
 
-    let tokens: Vec<Principal> = registry
-        .debt_assets()
-        .iter()
-        .filter_map(|(_, tok)| {
-            if let ChainToken::Icp { ledger, .. } = tok {
-                Some(*ledger)
-            } else {
-                None
-            }
-        })
-        .collect();
+    let tokens = debt_asset_principals(&registry);
 
     let mut executor = BasicExecutor::new(
         agent.clone(),
@@ -369,7 +162,10 @@ async fn init(
     Ok((finder, strategy, executor, exporter, finalizer))
 }
 
-pub async fn run_liquidation_loop() {
+pub async fn run_liquidation_loop(sock_path: PathBuf) {
+    // Auditor note:
+    // This function is the foreground daemon entrypoint. It does not fork/detach;
+    // lifecycle is expected to be managed by an external supervisor (systemd).
     let ui_enabled = console_ui_enabled();
     if ui_enabled {
         print_banner();
@@ -429,6 +225,8 @@ pub async fn run_liquidation_loop() {
             return;
         }
     };
+    // Settlement watcher is intentionally independent from pause/resume.
+    // Even while paused, it can continue reconciling previously-started work.
     let watcher = SettlementWatcher::new(
         watcher_wal,
         ctx.agent.clone(),
@@ -439,24 +237,9 @@ pub async fn run_liquidation_loop() {
     );
     tokio::spawn(async move { watcher.run().await });
 
-    let debt_asset_principals: Vec<Principal> = ctx
-        .registry
-        .debt_assets()
-        .iter()
-        .filter_map(|(_, tok)| {
-            if let ChainToken::Icp { ledger, .. } = tok {
-                Some(*ledger)
-            } else {
-                None
-            }
-        })
-        .collect();
+    let debt_asset_principals = debt_asset_principals(&ctx.registry);
+    let debt_assets = debt_assets_as_text(&debt_asset_principals);
 
-    let debt_assets: Vec<String> = debt_asset_principals.iter().map(Principal::to_text).collect();
-
-    if ui_enabled {
-        print_startup_table(&config);
-    }
     info!(
         network = %config.ic_url,
         liquidator_principal = %config.liquidator_principal.to_text(),
@@ -468,89 +251,39 @@ pub async fn run_liquidation_loop() {
     );
     info!("Liquidator started; scanning for liquidation opportunities...");
 
+    // Shared pause flag controlled by UDS commands.
+    // `true` means: do not initiate new liquidations, but keep housekeeping alive.
+    let paused = Arc::new(AtomicBool::new(false));
+    // The helper encapsulates:
+    // - persisted paused/running state bootstrap
+    // - UDS bind + serve
+    // - state persistence on pause/resume transitions
+    if let Err(err) = bootstrap_control_plane(&sock_path, &config.db_path, paused.clone()) {
+        tracing::error!("{}", err);
+        return;
+    }
+    info!(sock_path = %sock_path.display(), "Control plane ready");
+
     // Setup liquidity monitor
     let liq_dog = account_monitor_watchdog(Duration::from_secs(5), ctx.config.liquidator_principal);
-
-    let mut spinner = start_spinner(ui_enabled);
-    let mut last_alive_log = Instant::now();
-    loop {
-        if let Some(s) = spinner.as_ref() {
-            s.set_message("Scanning for liquidation opportunities...");
-        }
-        if last_alive_log.elapsed() >= Duration::from_secs(300) {
-            info!("Liquidator running; scanning for liquidation opportunities...");
-            last_alive_log = Instant::now();
-        }
-        let opportunities = finder.process(&debt_assets).await.unwrap_or_else(|e| {
-            warn!("Failed to find opportunities: {e}");
-            vec![]
-        });
-
-        if !opportunities.is_empty() {
-            sleep(Duration::from_secs(2)).await;
-            if let Some(s) = spinner.as_ref() {
-                s.finish_and_clear();
-            }
-            info!("Found {:?} opportunities", opportunities.len());
-
-            let opp_count = opportunities.len();
-            async {
-                let executions = strategy.process(&opportunities).await.unwrap_or_else(|e| {
-                    tracing::info!("Strategy processing failed: {e}");
-                    vec![]
-                });
-
-                if executions.is_empty() {
-                    info!(
-                        "Found {} opportunities but none executable yet; likely waiting for funds or liquidity",
-                        opportunities.len()
-                    );
-                }
-
-                executor.process(&executions).await.unwrap_or_else(|e| {
-                    tracing::error!("Executor failed: {e}");
-                    vec![]
-                });
-            }
-            .instrument(info_span!("liquidation.cycle", opportunities = opp_count))
-            .await;
-        }
-
-        let outcomes = finalizer.process(&()).await.unwrap_or_else(|e| {
-            tracing::error!("Finalizer failed: {e}");
-            vec![]
-        });
-
-        if outcomes.is_empty() {
-            spinner = start_spinner(ui_enabled);
-            if let Some(s) = spinner.as_ref() {
-                s.set_message("Scanning for liquidation opportunities...");
-            }
-            sleep(Duration::from_secs(2)).await;
-            continue;
-        }
-
-        if let Err(err) = exporter.process(&outcomes).await {
-            warn!("Failed to export results: {}", err);
-        }
-        log_execution_results(&outcomes);
-        if ui_enabled {
-            print_execution_results(outcomes.clone());
-        }
-        spinner = start_spinner(ui_enabled);
-        if let Some(s) = spinner.as_ref() {
-            s.set_message("Scanning for liquidation opportunities...");
-        }
-
-        // Send liquidity monitor heart beat
-        let _ = liq_dog.notify(WatchdogEvent::Heartbeat { stage: "Running" }).await;
-        if let Err(err) = executor.refresh_allowances(&debt_asset_principals).await {
-            warn!("Failed to refresh lending allowances: {}", err);
-        }
-        sleep(Duration::from_secs(5)).await;
-    }
+    // Steady-state operation is delegated to a helper to keep this entrypoint
+    // focused on bootstrap wiring and lifecycle boundaries.
+    run_daemon_cycle_loop(
+        &finder,
+        &strategy,
+        &executor,
+        &exporter,
+        &finalizer,
+        &liq_dog,
+        paused,
+        &debt_assets,
+        &debt_asset_principals,
+        ui_enabled,
+    )
+    .await;
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LoopControl {
     Running,
@@ -558,6 +291,7 @@ pub enum LoopControl {
     Stopping,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub enum LoopEvent {
     Log(String),
@@ -565,6 +299,7 @@ pub enum LoopEvent {
     Outcomes(Vec<LiquidationOutcome>),
 }
 
+#[allow(dead_code)]
 pub async fn run_liquidation_loop_controlled(
     ctx: Arc<PipelineContext>,
     mut control_rx: watch::Receiver<LoopControl>,
@@ -588,19 +323,8 @@ pub async fn run_liquidation_loop_controlled(
     );
     tokio::spawn(async move { watcher.run().await });
 
-    let debt_asset_principals: Vec<Principal> = ctx
-        .registry
-        .debt_assets()
-        .iter()
-        .filter_map(|(_, tok)| {
-            if let ChainToken::Icp { ledger, .. } = tok {
-                Some(*ledger)
-            } else {
-                None
-            }
-        })
-        .collect();
-    let debt_assets: Vec<String> = debt_asset_principals.iter().map(Principal::to_text).collect();
+    let debt_asset_principals = debt_asset_principals(&ctx.registry);
+    let debt_assets = debt_assets_as_text(&debt_asset_principals);
 
     let _ = event_tx.send(LoopEvent::Log("engine initialized (paused by default)".to_string()));
 
@@ -692,64 +416,9 @@ pub async fn run_liquidation_loop_controlled(
     Ok(())
 }
 
-pub fn print_execution_results(results: Vec<LiquidationOutcome>) {
-    let mut table = Table::new();
-    table.set_format(*format::consts::FORMAT_NO_LINESEP_WITH_TITLE);
-    table.set_titles(Row::new(vec![
-        Cell::new("Realized (Δ)"),
-        Cell::new("Expected"),
-        Cell::new("Debt Repaid"),
-        Cell::new("Collateral"),
-        Cell::new("Swap Output"),
-        Cell::new("Swap Status"),
-        Cell::new("Swapper"),
-        Cell::new("Round Trip (s)"),
-        Cell::new("Status"),
-    ]));
-
-    for r in results {
-        let (debt, collat) = (r.formatted_debt_repaid(), r.formatted_received_collateral());
-
-        let (recv_amt, swap_status) = match &r.finalizer_result.swap_result {
-            Some(sr) => (r.formatted_swap_output(), sr.status.clone()),
-            None => ("-".to_string(), "-".to_string()),
-        };
-
-        let delta = r.realized_profit - r.expected_profit;
-        let delta_cell = {
-            let txt = format!("{} ({})", r.formatted_realized_profit(), r.formatted_profit_delta());
-            match delta.cmp(&0) {
-                std::cmp::Ordering::Greater => Cell::new(&txt).style_spec("Fg"),
-                std::cmp::Ordering::Less => Cell::new(&txt).style_spec("Fr"),
-                std::cmp::Ordering::Equal => Cell::new(&txt),
-            }
-        };
-
-        let status_text = r.status.description();
-        let status_cell = match &r.status {
-            ExecutionStatus::Success => Cell::new(&status_text).style_spec("Fg"),
-            _ => Cell::new(&status_text).style_spec("Fr"),
-        };
-
-        table.add_row(Row::new(vec![
-            delta_cell,
-            Cell::new(&r.formatted_expected_profit()),
-            Cell::new(&debt),
-            Cell::new(&collat),
-            Cell::new(&recv_amt),
-            Cell::new(&swap_status),
-            Cell::new(&r.formatted_swapper()),
-            Cell::new(&r.formatted_round_trip_secs()),
-            status_cell,
-        ]));
-    }
-
-    table.printstd();
-}
-
 #[cfg(test)]
 mod tests {
-    use super::console_ui_enabled;
+    use crate::commands::liquidation_loop_helpers::console_ui_enabled;
     use std::io::IsTerminal;
 
     fn calc_console_ui_enabled(human_output: bool, stdout_is_tty: bool, stderr_is_tty: bool) -> bool {
