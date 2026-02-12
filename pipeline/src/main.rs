@@ -22,6 +22,8 @@ use liquidium_pipeline_commons::env::load_env;
 use liquidium_pipeline_commons::telemetry::{init_telemetry_from_env, init_telemetry_from_env_with_log_file};
 use std::path::PathBuf;
 #[cfg(target_os = "linux")]
+use std::time::{Duration, SystemTime};
+#[cfg(target_os = "linux")]
 use std::process::Command;
 
 use crate::commands::liquidation_loop::run_liquidation_loop;
@@ -278,9 +280,18 @@ fn infer_tui_log_file(requested: Option<PathBuf>, unit_name: &str) -> Option<Pat
     {
         match is_systemd_unit_active(unit_name) {
             Ok(true) => return None,
-            Ok(false) => {}
+            Ok(false) => {
+                let candidate = control_plane::default_log_file_path();
+                if should_infer_tui_log_file(&candidate) {
+                    return Some(candidate);
+                }
+                return None;
+            }
             Err(err) => {
-                eprintln!("Warning: unable to query systemd unit state for '{unit_name}': {err}");
+                eprintln!(
+                    "Warning: unable to query systemd unit state for '{unit_name}': {err}. Defaulting to journald."
+                );
+                return None;
             }
         }
     }
@@ -292,6 +303,26 @@ fn infer_tui_log_file(requested: Option<PathBuf>, unit_name: &str) -> Option<Pat
 
     let candidate = control_plane::default_log_file_path();
     if candidate.is_file() { Some(candidate) } else { None }
+}
+
+#[cfg(target_os = "linux")]
+fn should_infer_tui_log_file(path: &std::path::Path) -> bool {
+    const MAX_FILE_AGE: Duration = Duration::from_secs(15 * 60);
+
+    if !path.is_file() {
+        return false;
+    }
+
+    let modified = match std::fs::metadata(path).and_then(|meta| meta.modified()) {
+        Ok(modified) => modified,
+        Err(_) => return false,
+    };
+
+    match SystemTime::now().duration_since(modified) {
+        Ok(age) => age <= MAX_FILE_AGE,
+        // Clock skew or future timestamp: treat as active file.
+        Err(_) => true,
+    }
 }
 
 fn ensure_log_file_parent_exists(path: &std::path::Path) -> std::io::Result<()> {
@@ -344,6 +375,10 @@ fn is_systemd_unit_active(unit_name: &str) -> std::io::Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(target_os = "linux")]
+    use std::fs::File;
+    #[cfg(target_os = "linux")]
+    use tempfile::TempDir;
 
     #[test]
     fn run_log_file_resolution_no_flags_disables_file_sink() {
@@ -414,5 +449,17 @@ mod tests {
     fn cli_parse_run_conflicting_log_flags_fails() {
         let parsed = Cli::try_parse_from(["liquidator", "run", "--log-file", "--no-log-file"]);
         assert!(parsed.is_err(), "conflicting log flags should fail parsing");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn infer_tui_log_file_candidate_requires_existing_recent_file() {
+        let tmp = TempDir::new().expect("tempdir");
+        let missing = tmp.path().join("missing.log");
+        assert!(!should_infer_tui_log_file(&missing));
+
+        let existing = tmp.path().join("existing.log");
+        File::create(&existing).expect("create log file");
+        assert!(should_infer_tui_log_file(&existing));
     }
 }

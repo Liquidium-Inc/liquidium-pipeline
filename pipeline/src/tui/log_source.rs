@@ -386,6 +386,14 @@ fn parse_journal_record(raw: &str) -> Result<JournalRecord, String> {
     let cursor = value.get("__CURSOR").and_then(Value::as_str).map(ToOwned::to_owned);
 
     let message = value.get("MESSAGE").map(journal_value_to_text).unwrap_or_default();
+    let message = message.trim();
+    if message_has_timestamp_and_level_prefix(message) {
+        return Ok(JournalRecord {
+            line: message.to_string(),
+            cursor,
+        });
+    }
+
     let timestamp = value
         .get("__REALTIME_TIMESTAMP")
         .and_then(Value::as_str)
@@ -404,6 +412,52 @@ fn parse_journal_record(raw: &str) -> Result<JournalRecord, String> {
         format!("{level:<5} {message}")
     };
     Ok(JournalRecord { line, cursor })
+}
+
+#[cfg(target_os = "linux")]
+fn message_has_timestamp_and_level_prefix(message: &str) -> bool {
+    let Some((ts, rest)) = split_once_ws(message) else {
+        return false;
+    };
+    if !looks_like_timestamp(ts) {
+        return false;
+    }
+    let Some((level, _)) = split_once_ws(rest) else {
+        return false;
+    };
+    normalize_level_token(level).is_some()
+}
+
+#[cfg(target_os = "linux")]
+fn split_once_ws(s: &str) -> Option<(&str, &str)> {
+    let idx = s.find(|c: char| c.is_whitespace())?;
+    let (head, tail) = s.split_at(idx);
+    Some((head, tail.trim_start()))
+}
+
+#[cfg(target_os = "linux")]
+fn looks_like_timestamp(token: &str) -> bool {
+    token.len() >= 19
+        && token.get(0..4).is_some_and(|prefix| prefix.chars().all(|c| c.is_ascii_digit()))
+        && token.contains(':')
+        && (token.contains('T') || token.contains(' '))
+}
+
+#[cfg(target_os = "linux")]
+fn normalize_level_token(token: &str) -> Option<&'static str> {
+    let cleaned = token.trim_matches(|c: char| !c.is_ascii_alphabetic());
+    if cleaned.is_empty() {
+        return None;
+    }
+
+    match cleaned.to_ascii_uppercase().as_str() {
+        "ERROR" => Some("ERROR"),
+        "WARN" | "WARNING" => Some("WARN"),
+        "INFO" => Some("INFO"),
+        "DEBUG" => Some("DEBUG"),
+        "TRACE" => Some("TRACE"),
+        _ => None,
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -785,6 +839,23 @@ mod tests {
         assert!(text.contains("INFO"));
         assert!(text.contains("ok"));
         assert!(!text.contains("27 91"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn journald_record_uses_message_when_it_already_has_timestamp_and_level() {
+        let raw = serde_json::json!({
+            "__REALTIME_TIMESTAMP": "1760000000000000",
+            "PRIORITY": "6",
+            "MESSAGE": "2026-02-12T13:16:03.444303Z INFO Found 1 opportunities"
+        })
+        .to_string();
+
+        let record = super::parse_journal_record(&raw).expect("record parse");
+        assert_eq!(
+            record.line,
+            "2026-02-12T13:16:03.444303Z INFO Found 1 opportunities"
+        );
     }
 
     #[cfg(not(target_os = "linux"))]
