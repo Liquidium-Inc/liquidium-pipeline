@@ -424,9 +424,7 @@ mod tests {
 
     #[tokio::test]
     async fn build_stringifies_typed_internal_errors() {
-        let signer: PrivateKeySigner = "0x59c6995e998f97a5a0044966f0945382d7f0f5d5f7cd4c95b2f5f7f6c8c6f8de"
-            .parse()
-            .expect("signer");
+        let signer = PrivateKeySigner::from_slice(&[1u8; 32]).expect("signer");
         let provider = ProviderBuilder::new()
             .network::<AnyNetwork>()
             .wallet(signer)
