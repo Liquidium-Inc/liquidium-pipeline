@@ -5,6 +5,7 @@ use candid::Nat;
 use log::debug;
 
 use crate::{
+    error::AppResult,
     liquidation::liquidation_math::{compute_liquidation_amounts, max_repay_from_collateral},
     price_oracle::price_oracle::PriceOracle,
 };
@@ -30,7 +31,7 @@ pub trait CollateralServiceTrait: Send + Sync {
         debt_position: &LiquidateblePosition,
         collateral_position: &LiquidateblePosition,
         user: &mut LiquidatebleUser,
-    ) -> Result<LiquidationEstimation, String>;
+    ) -> AppResult<LiquidationEstimation>;
 }
 
 pub struct CollateralService<P: PriceOracle> {
@@ -50,7 +51,7 @@ impl<P: PriceOracle> CollateralServiceTrait for CollateralService<P> {
         debt_position: &LiquidateblePosition,
         collateral_position: &LiquidateblePosition,
         user: &mut LiquidatebleUser,
-    ) -> Result<LiquidationEstimation, String> {
+    ) -> AppResult<LiquidationEstimation> {
         let debt_symbol = debt_position.asset.symbol();
         let collateral_symbol = collateral_position.asset.symbol();
 

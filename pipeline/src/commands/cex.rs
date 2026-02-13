@@ -1,9 +1,10 @@
 use liquidium_pipeline_connectors::backend::cex_backend::CexBackend;
 
 use crate::config::Config;
+use crate::error::AppResult;
 use crate::swappers::mexc::mexc_adapter::MexcClient;
 
-pub async fn mexc_deposit_address(asset: &str, network: Option<&str>) -> Result<(), String> {
+pub async fn mexc_deposit_address(asset: &str, network: Option<&str>) -> AppResult<()> {
     let _ = Config::load().await.map_err(|e| format!("config load failed: {e}"))?;
     let client = MexcClient::from_env()?;
     let network = network.unwrap_or("ICP");

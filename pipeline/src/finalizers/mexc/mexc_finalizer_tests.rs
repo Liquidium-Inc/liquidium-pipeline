@@ -589,7 +589,7 @@ async fn mexc_trade_propagates_backend_errors() {
     backend
         .expect_execute_swap_detailed_with_options()
         .times(1)
-        .returning(|_market, _side, _amount_in, _opts| Err("boom".to_string()));
+        .returning(|_market, _side, _amount_in, _opts| Err("boom".into()));
 
     let backend = Arc::new(backend);
     let transfer_service = Arc::new(transfers);
@@ -646,7 +646,7 @@ async fn mexc_trade_marks_dust_and_skips_execution_for_small_residual() {
         .returning(move |market, _limit| match market {
             "CKBTC_BTC" => Ok(ckbtc_btc.clone()),
             "BTC_USDC" => Ok(btc_usdc.clone()),
-            _ => Err(format!("unexpected market {}", market)),
+            _ => Err(format!("unexpected market {}", market).into()),
         });
 
     // Dust path should break before any market execution.
@@ -716,7 +716,7 @@ async fn mexc_maybe_mark_trade_dust_honors_threshold_boundary() {
         .returning(move |market, _limit| match market {
             "CKBTC_BTC" => Ok(ckbtc_btc.clone()),
             "BTC_USDC" => Ok(btc_usdc.clone()),
-            _ => Err(format!("unexpected market {}", market)),
+            _ => Err(format!("unexpected market {}", market).into()),
         });
 
     let finalizer_eq = MexcFinalizer::new(
@@ -760,7 +760,7 @@ async fn mexc_maybe_mark_trade_dust_honors_threshold_boundary() {
         .returning(move |market, _limit| match market {
             "CKBTC_BTC" => Ok(ckbtc_btc_below.clone()),
             "BTC_USDC" => Ok(btc_usdc_below.clone()),
-            _ => Err(format!("unexpected market {}", market)),
+            _ => Err(format!("unexpected market {}", market).into()),
         });
 
     let finalizer_below = MexcFinalizer::new(
@@ -814,7 +814,7 @@ async fn mexc_maybe_mark_trade_dust_requires_small_chunk_and_small_residual() {
         .returning(move |market, _limit| match market {
             "CKBTC_BTC" => Ok(ckbtc_btc.clone()),
             "BTC_USDC" => Ok(btc_usdc.clone()),
-            _ => Err(format!("unexpected market {}", market)),
+            _ => Err(format!("unexpected market {}", market).into()),
         });
 
     let finalizer = MexcFinalizer::new(
@@ -868,7 +868,7 @@ async fn mexc_trade_fails_when_realized_slice_slippage_exceeds_cap() {
         .returning(move |market, _limit| match market {
             "CKBTC_BTC" => Ok(ckbtc_btc.clone()),
             "BTC_USDC" => Ok(btc_usdc.clone()),
-            _ => Err(format!("unexpected market {}", market)),
+            _ => Err(format!("unexpected market {}", market).into()),
         });
 
     backend
@@ -950,7 +950,7 @@ async fn mexc_trade_buy_truncation_mismatch_does_not_false_spike_slippage() {
             "BTC_CKBTC" => Ok(sell_probe.clone()),
             "CKBTC_BTC" => Ok(buy_book.clone()),
             "BTC_USDC" => Ok(btc_usdc.clone()),
-            _ => Err(format!("unexpected market {}", market)),
+            _ => Err(format!("unexpected market {}", market).into()),
         });
 
     // Simulate exchange truncation: requested quote_in=0.000185, actual consumed quote=0.0001.
@@ -1056,7 +1056,7 @@ async fn mexc_trade_slippage_error_includes_requested_and_actual_fill_details() 
         .returning(move |market, _limit| match market {
             "CKBTC_BTC" => Ok(ckbtc_btc.clone()),
             "BTC_USDC" => Ok(btc_usdc.clone()),
-            _ => Err(format!("unexpected market {}", market)),
+            _ => Err(format!("unexpected market {}", market).into()),
         });
 
     backend
@@ -1130,7 +1130,7 @@ async fn mexc_trade_clamp_and_finish_under_consumed_buy_input_single_slice() {
             "BTC_CKBTC" => Ok(sell_probe.clone()),
             "CKBTC_BTC" => Ok(buy_book.clone()),
             "BTC_USDC" => Ok(btc_usdc.clone()),
-            _ => Err(format!("unexpected market {}", market)),
+            _ => Err(format!("unexpected market {}", market).into()),
         });
 
     let calls = Arc::new(std::sync::Mutex::new(0usize));
@@ -1212,7 +1212,7 @@ async fn mexc_trade_retries_current_leg_from_original_amount_after_mid_leg_error
         .returning(move |market, _limit| match market {
             "CKBTC_BTC" => Ok(ckbtc_btc.clone()),
             "BTC_USDC" => Ok(btc_usdc.clone()),
-            _ => Err(format!("unexpected market {}", market)),
+            _ => Err(format!("unexpected market {}", market).into()),
         });
 
     let call_count = Arc::new(std::sync::Mutex::new(0usize));
@@ -1305,7 +1305,7 @@ async fn mexc_trade_uses_resume_amount_when_trade_next_amount_in_is_present() {
         .returning(move |market, _limit| match market {
             "CKBTC_BTC" => Ok(ckbtc_btc.clone()),
             "BTC_USDC" => Ok(btc_usdc.clone()),
-            _ => Err(format!("unexpected market {}", market)),
+            _ => Err(format!("unexpected market {}", market).into()),
         });
 
     let seen = Arc::new(std::sync::Mutex::new(Vec::<f64>::new()));
@@ -1382,7 +1382,7 @@ async fn mexc_trade_clears_legacy_pending_without_client_id_before_submit() {
         .returning(move |market, _limit| match market {
             "CKBTC_BTC" => Ok(ckbtc_btc.clone()),
             "BTC_USDC" => Ok(btc_usdc.clone()),
-            _ => Err(format!("unexpected market {}", market)),
+            _ => Err(format!("unexpected market {}", market).into()),
         });
 
     backend
@@ -1464,7 +1464,7 @@ async fn mexc_trade_clears_stale_pending_from_different_leg_before_submit() {
         .returning(move |market, _limit| match market {
             "CKBTC_BTC" => Ok(ckbtc_btc.clone()),
             "BTC_USDC" => Ok(btc_usdc.clone()),
-            _ => Err(format!("unexpected market {}", market)),
+            _ => Err(format!("unexpected market {}", market).into()),
         });
 
     backend
@@ -1541,7 +1541,7 @@ async fn mexc_trade_regenerates_invalid_pending_client_order_id() {
         .returning(move |market, _limit| match market {
             "CKBTC_BTC" => Ok(ckbtc_btc.clone()),
             "BTC_USDC" => Ok(btc_usdc.clone()),
-            _ => Err(format!("unexpected market {}", market)),
+            _ => Err(format!("unexpected market {}", market).into()),
         });
 
     let invalid_pending_id = "legacy:invalid/client-order-id-that-is-way-too-long";
@@ -1989,7 +1989,7 @@ async fn mexc_approval_bump_retries_after_first_batch_failure_and_then_short_cir
             let mut n = approve_call_count_handle.lock().unwrap();
             *n += 1;
             if *n == 2 {
-                Err("approve failure in first batch".to_string())
+                Err("approve failure in first batch".into())
             } else {
                 Ok(format!("approve-{}", *n))
             }
@@ -2041,8 +2041,8 @@ async fn mexc_approval_bump_second_batch_failure_does_not_mark_as_completed() {
             let mut n = approve_call_count_handle.lock().unwrap();
             *n += 1;
             match *n {
-                5 => Err("approve failure in second batch".to_string()),
-                6 => Err("retry attempt reached approve again".to_string()),
+                5 => Err("approve failure in second batch".into()),
+                6 => Err("retry attempt reached approve again".into()),
                 _ => Ok(format!("approve-{}", *n)),
             }
         });
@@ -2253,7 +2253,7 @@ async fn mexc_preview_route_resolves_direct_buy_leg_when_sell_book_empty() {
             "BTC_CKBTC" => Ok(btc_ckbtc.clone()),
             "CKBTC_BTC" => Ok(ckbtc_btc.clone()),
             "BTC_USDC" => Ok(btc_usdc.clone()),
-            _ => Err(format!("unexpected market {}", market)),
+            _ => Err(format!("unexpected market {}", market).into()),
         });
 
     let finalizer = MexcFinalizer::new(
@@ -2322,7 +2322,7 @@ mod fuzz {
                     .returning(move |market, _limit| match market {
                         "CKBTC_BTC" => Ok(ckbtc_btc.clone()),
                         "BTC_USDC" => Ok(btc_usdc.clone()),
-                        _ => Err(format!("unexpected market {}", market)),
+                        _ => Err(format!("unexpected market {}", market).into()),
                     });
 
                 let seen_ids = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
@@ -2395,7 +2395,7 @@ mod fuzz {
                 backend.expect_get_orderbook().returning(move |market, _limit| match market {
                     "CKBTC_BTC" => Ok(ckbtc_btc_book.clone()),
                     "BTC_USDC" => Ok(btc_usdc_book.clone()),
-                    _ => Err(format!("unexpected market {}", market)),
+                    _ => Err(format!("unexpected market {}", market).into()),
                 });
 
                 let factor = 1.0 - (exec_loss_bps as f64 / 10_000.0);
@@ -2468,7 +2468,7 @@ mod fuzz {
                 backend.expect_get_orderbook().returning(move |market, _limit| match market {
                     "CKBTC_BTC" => Ok(ckbtc_btc_book.clone()),
                     "BTC_USDC" => Ok(btc_usdc_book.clone()),
-                    _ => Err(format!("unexpected market {}", market)),
+                    _ => Err(format!("unexpected market {}", market).into()),
                 });
 
                 let factor = 1.0 - (exec_loss_bps as f64 / 10_000.0);
@@ -2548,7 +2548,7 @@ mod fuzz {
                 backend.expect_get_orderbook().returning(move |market, _limit| match market {
                     "CKBTC_BTC" => Ok(ckbtc_btc_book.clone()),
                     "BTC_USDC" => Ok(btc_usdc_book.clone()),
-                    _ => Err(format!("unexpected market {}", market)),
+                    _ => Err(format!("unexpected market {}", market).into()),
                 });
 
                 let calls = Arc::new(std::sync::Mutex::new(0usize));
@@ -2622,7 +2622,7 @@ mod fuzz {
                 backend.expect_get_orderbook().returning(move |market, _limit| match market {
                     "CKBTC_BTC" => Ok(ckbtc_btc_book.clone()),
                     "BTC_USDC" => Ok(btc_usdc_book.clone()),
-                    _ => Err(format!("unexpected market {}", market)),
+                    _ => Err(format!("unexpected market {}", market).into()),
                 });
 
                 let call_count = Arc::new(std::sync::Mutex::new(0usize));

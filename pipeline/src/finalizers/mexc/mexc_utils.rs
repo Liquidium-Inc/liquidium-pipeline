@@ -1,6 +1,8 @@
 use candid::Nat;
 use liquidium_pipeline_connectors::backend::cex_backend::OrderBookLevel;
 
+use crate::error::AppResult;
+
 /// Floating-point epsilon used for liquidity comparisons.
 pub(super) const LIQUIDITY_EPS: f64 = 1e-9;
 /// Basis points per 1.00 ratio value.
@@ -47,17 +49,14 @@ pub(super) fn f64_to_nat(v: f64) -> Nat {
 
 /// Simulate selling `amount_in_base` into `bids`.
 /// Returns `(quote_out, avg_price, impact_bps, unfilled_base)`.
-pub(super) fn simulate_sell_from_bids(
-    bids: &[OrderBookLevel],
-    amount_in_base: f64,
-) -> Result<(f64, f64, f64, f64), String> {
+pub(super) fn simulate_sell_from_bids(bids: &[OrderBookLevel], amount_in_base: f64) -> AppResult<(f64, f64, f64, f64)> {
     if amount_in_base <= 0.0 {
-        return Err("amount_in_base must be positive".to_string());
+        return Err("amount_in_base must be positive".into());
     }
 
     let best_bid = bids.first().map(|l| l.price).unwrap_or(0.0);
     if best_bid <= 0.0 {
-        return Err("no bid liquidity".to_string());
+        return Err("no bid liquidity".into());
     }
 
     let mut remaining = amount_in_base;
@@ -76,7 +75,7 @@ pub(super) fn simulate_sell_from_bids(
 
     let filled = (amount_in_base - remaining).max(0.0);
     if filled <= LIQUIDITY_EPS {
-        return Err("could not fill any sell amount".to_string());
+        return Err("could not fill any sell amount".into());
     }
     let avg_price = quote_out / filled;
     let impact_bps = ((best_bid - avg_price) / best_bid * BPS_PER_RATIO_UNIT).max(0.0);
@@ -85,14 +84,14 @@ pub(super) fn simulate_sell_from_bids(
 
 /// Simulate buying base with `quote_in` from `asks`.
 /// Returns `(base_out, avg_price, impact_bps, unspent_quote)`.
-pub(super) fn simulate_buy_from_asks(asks: &[OrderBookLevel], quote_in: f64) -> Result<(f64, f64, f64, f64), String> {
+pub(super) fn simulate_buy_from_asks(asks: &[OrderBookLevel], quote_in: f64) -> AppResult<(f64, f64, f64, f64)> {
     if quote_in <= 0.0 {
-        return Err("quote_in must be positive".to_string());
+        return Err("quote_in must be positive".into());
     }
 
     let best_ask = asks.first().map(|l| l.price).unwrap_or(0.0);
     if best_ask <= 0.0 {
-        return Err("no ask liquidity".to_string());
+        return Err("no ask liquidity".into());
     }
 
     let mut remaining_quote = quote_in;
@@ -112,7 +111,7 @@ pub(super) fn simulate_buy_from_asks(asks: &[OrderBookLevel], quote_in: f64) -> 
 
     let spent = (quote_in - remaining_quote).max(0.0);
     if spent <= LIQUIDITY_EPS || base_out <= LIQUIDITY_EPS {
-        return Err("could not fill any buy amount".to_string());
+        return Err("could not fill any buy amount".into());
     }
     let avg_price = spent / base_out;
     let impact_bps = ((avg_price - best_ask) / best_ask * BPS_PER_RATIO_UNIT).max(0.0);

@@ -6,6 +6,7 @@ use liquidium_pipeline_connectors::pipeline_agent::PipelineAgent;
 use liquidium_pipeline_core::tokens::chain_token::ChainToken;
 use log::{info, warn};
 
+use crate::error::AppResult;
 use crate::swappers::kong::kong_swapper::KongSwapSwapper;
 use crate::swappers::kong::kong_types::{
     SwapAmountsReply as KongSwapAmountsReply, SwapArgs as KongSwapArgs, SwapReply as KongSwapReply,
@@ -26,12 +27,12 @@ impl<A: PipelineAgent> KongVenue<A> {
         Self { swapper, tokens }
     }
 
-    fn find_token(&self, symbol: &str) -> Result<ChainToken, String> {
+    fn find_token(&self, symbol: &str) -> AppResult<ChainToken> {
         self.tokens
             .iter()
             .find(|t| t.symbol() == symbol)
             .cloned()
-            .ok_or_else(|| format!("Unknown ICRC token symbol in KongVenue: {}", symbol))
+            .ok_or_else(|| format!("Unknown ICRC token symbol in KongVenue: {}", symbol).into())
     }
 }
 
@@ -44,7 +45,7 @@ where
         "kong"
     }
 
-    async fn init(&self) -> Result<(), String> {
+    async fn init(&self) -> AppResult<()> {
         let kong_tokens = self
             .tokens
             .iter()
@@ -62,7 +63,7 @@ where
         Ok(())
     }
 
-    async fn quote(&self, req: &SwapRequest) -> Result<SwapQuote, String> {
+    async fn quote(&self, req: &SwapRequest) -> AppResult<SwapQuote> {
         let token_out = self.find_token(&req.receive_asset.symbol)?;
         let token_in = self.find_token(&req.pay_asset.symbol)?;
 
@@ -84,7 +85,7 @@ where
         Ok(SwapQuote::from(kong_reply))
     }
 
-    async fn execute(&self, req: &SwapRequest) -> Result<SwapExecution, String> {
+    async fn execute(&self, req: &SwapRequest) -> AppResult<SwapExecution> {
         let token_in = self.find_token(&req.pay_asset.symbol)?;
 
         let mut kong_req: KongSwapArgs = KongSwapArgs::from(req.clone());
@@ -100,7 +101,8 @@ where
                         req.pay_amount.formatted(),
                         fee,
                         token_in.symbol()
-                    ));
+                    )
+                    .into());
                 }
                 kong_req.pay_amount -= fee.clone();
                 info!(
@@ -115,7 +117,7 @@ where
         let balance = self.swapper.balance_of(&token_in).await?;
         let fee = token_in.fee();
         if balance <= fee {
-            return Err(format!("insufficient balance for fee: balance={} fee={}", balance, fee));
+            return Err(format!("insufficient balance for fee: balance={} fee={}", balance, fee).into());
         }
         let max_pay = balance - fee.clone();
         if kong_req.pay_amount > max_pay {

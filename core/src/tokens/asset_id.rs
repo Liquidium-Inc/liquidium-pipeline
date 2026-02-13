@@ -7,6 +7,8 @@ use std::{
 use candid::CandidType;
 use serde::{Deserialize, Serialize};
 
+use crate::error::{AppError, error_codes};
+
 /// Canonical key for a token across chains.
 #[derive(Clone, Debug, Serialize, Deserialize, CandidType)]
 pub struct AssetId {
@@ -37,12 +39,13 @@ impl Hash for AssetId {
 }
 
 impl FromStr for AssetId {
-    type Err = String;
+    type Err = AppError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         let parts: Vec<&str> = s.split(':').collect();
         if parts.len() != 3 {
-            return Err(format!("invalid AssetId `{}` (expected chain:address:symbol)", s));
+            return Err(AppError::from_def(error_codes::INVALID_INPUT)
+                .with_context(format!("invalid AssetId `{}` (expected chain:address:symbol)", s)));
         }
 
         Ok(AssetId {

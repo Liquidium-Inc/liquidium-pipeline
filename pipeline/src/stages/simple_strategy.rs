@@ -7,6 +7,7 @@ use crate::config::ConfigTrait;
 use crate::executors::executor::ExecutorRequest;
 
 use crate::approval_state::ApprovalState;
+use crate::error::AppResult;
 use crate::liquidation::collateral_service::CollateralServiceTrait;
 use crate::stage::PipelineStage;
 
@@ -168,7 +169,7 @@ where
     }
 
     // Helper: Prefetch balances for all debt assets we might need
-    async fn prefetch_balances_for_users(&self, users: &[LiquidatebleUser]) -> Result<HashMap<String, Nat>, String> {
+    async fn prefetch_balances_for_users(&self, users: &[LiquidatebleUser]) -> AppResult<HashMap<String, Nat>> {
         let mut debt_assets: HashSet<ChainToken> = HashSet::new();
         for user in users.iter() {
             for pos in user.positions.iter() {
@@ -253,7 +254,7 @@ where
         work_users: &mut [LiquidatebleUser],
         result: &mut Vec<ExecutorRequest>,
         cleared_debts: &HashSet<String>,
-    ) -> Result<(), String> {
+    ) -> AppResult<()> {
         if bad_debts.is_empty() {
             return Ok(());
         }
@@ -280,7 +281,7 @@ where
             }
 
             if !matches!(debt_position.asset_type, AssetType::CkAsset(_)) {
-                return Err("invalid asset type".to_string());
+                return Err("invalid asset type".into());
             }
 
             let repayment_token = if let Some(tok) = resolve_token_for_position(self.registry.as_ref(), &debt_position)
@@ -397,7 +398,7 @@ where
     R: TokenRegistryTrait + 'static,
     U: CollateralServiceTrait,
 {
-    async fn process(&self, users: &'a Vec<LiquidatebleUser>) -> Result<Vec<ExecutorRequest>, String> {
+    async fn process(&self, users: &'a Vec<LiquidatebleUser>) -> AppResult<Vec<ExecutorRequest>> {
         let mut result: Vec<ExecutorRequest> = Vec::new();
 
         // Prefetch balances for all debt assets we might need
@@ -436,7 +437,7 @@ where
             if !matches!(debt_position.asset_type, AssetType::CkAsset(_))
                 || !matches!(collateral_position.asset_type, AssetType::CkAsset(_))
             {
-                return Err("invalid asset type".to_string());
+                return Err("invalid asset type".into());
             }
 
             let repayment_token = if let Some(tok) = resolve_token_for_position(self.registry.as_ref(), &debt_position)
@@ -871,10 +872,10 @@ mod tests {
         let mut account = MockAccountInfo::new();
         account
             .expect_sync_balance()
-            .returning(move |_t: &ChainToken| Err("boom".to_string()));
+            .returning(move |_t: &ChainToken| Err("boom".into()));
         account
             .expect_get_balance()
-            .returning(|_t: &ChainToken| Err("boom".to_string()));
+            .returning(|_t: &ChainToken| Err("boom".into()));
 
         let mut swapper = MockSwapInterface::new();
         swapper

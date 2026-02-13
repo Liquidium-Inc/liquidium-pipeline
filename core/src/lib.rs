@@ -1,5 +1,6 @@
 pub mod account;
 pub mod balance_service;
+pub mod error;
 pub mod ray_math;
 pub mod tokens;
 pub mod transfer;

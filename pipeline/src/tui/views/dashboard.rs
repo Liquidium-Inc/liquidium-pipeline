@@ -168,7 +168,7 @@ fn draw_configuration(f: &mut Frame<'_>, area: Rect, app: &App) {
 
 fn draw_profits_panel(f: &mut Frame<'_>, area: Rect, app: &App) {
     let wal_hint = if let Some(err) = &app.wal_error {
-        format!("WAL error: {}", truncate(err, 32))
+        format!("WAL error: {}", truncate(&err.to_string(), 32))
     } else if let Some(wal) = &app.wal {
         format!(
             "WAL @ {} inflight={} wait={} ok={} fail={}",

@@ -13,6 +13,7 @@ use log::{debug, info, warn};
 
 use liquidium_pipeline_connectors::pipeline_agent::PipelineAgent;
 
+use crate::error::AppResult;
 use crate::{approval_state::ApprovalState, persistance::WalStore, utils::max_for_ledger};
 
 pub struct BasicExecutor<A: PipelineAgent, D: WalStore + Sync + Send> {
@@ -42,7 +43,7 @@ impl<A: PipelineAgent, D: WalStore> BasicExecutor<A, D> {
         }
     }
 
-    pub async fn init(&mut self, tokens: &[Principal]) -> Result<(), String> {
+    pub async fn init(&mut self, tokens: &[Principal]) -> AppResult<()> {
         let spender = self.lending_canister;
         let this = &*self;
 
@@ -67,7 +68,7 @@ impl<A: PipelineAgent, D: WalStore> BasicExecutor<A, D> {
         Ok(())
     }
 
-    pub async fn refresh_allowances(&self, tokens: &[Principal]) -> Result<(), String> {
+    pub async fn refresh_allowances(&self, tokens: &[Principal]) -> AppResult<()> {
         let spender = self.lending_canister;
         let this = self;
 
@@ -135,7 +136,7 @@ impl<A: PipelineAgent, D: WalStore> BasicExecutor<A, D> {
         allowance
     }
 
-    async fn approve(&self, ledger: &Principal, spender: Account) -> Result<Nat, String> {
+    async fn approve(&self, ledger: &Principal, spender: Account) -> AppResult<Nat> {
         let args = ApproveArgs {
             from_subaccount: None,
             spender,

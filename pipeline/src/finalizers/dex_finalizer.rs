@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 use log::debug;
 
+use crate::error::AppResult;
 use crate::{
     finalizers::finalizer::{Finalizer, FinalizerResult},
     persistance::WalStore,
@@ -24,10 +25,10 @@ fn slippage_for_retry(retry: u32, explicit_cap: Option<u32>) -> u32 {
 
 #[async_trait]
 pub trait DexFinalizerLogic: Send + Sync {
-    async fn swap(&self, req: &SwapRequest) -> Result<SwapExecution, String>;
+    async fn swap(&self, req: &SwapRequest) -> AppResult<SwapExecution>;
 
-    async fn swap_with_slippage_retry(&self, swap_req: SwapRequest) -> Result<SwapExecution, String> {
-        let mut last_err: Option<String> = None;
+    async fn swap_with_slippage_retry(&self, swap_req: SwapRequest) -> AppResult<SwapExecution> {
+        let mut last_err: Option<crate::error::AppError> = None;
 
         for retry in 0..=MAX_SLIPPAGE_RETRIES {
             let mut req = swap_req.clone();
@@ -45,13 +46,13 @@ pub trait DexFinalizerLogic: Send + Sync {
             }
         }
 
-        Err(last_err.unwrap_or_else(|| "swap failed with no error".to_string()))
+        Err(last_err.unwrap_or_else(|| "swap failed with no error".into()))
     }
 }
 
 #[async_trait]
 impl Finalizer for dyn DexFinalizerLogic {
-    async fn finalize(&self, _: &dyn WalStore, receipt: ExecutionReceipt) -> Result<FinalizerResult, String> {
+    async fn finalize(&self, _: &dyn WalStore, receipt: ExecutionReceipt) -> AppResult<FinalizerResult> {
         // Only finalize successful executions
         if !matches!(receipt.status, ExecutionStatus::Success) {
             return Ok(FinalizerResult::noop());

@@ -2,6 +2,8 @@ use candid::CandidType;
 use icrc_ledger_types::icrc1::account::Account;
 use serde::{Deserialize, Serialize};
 
+use crate::error::{AppError, error_codes};
+
 #[derive(Clone, Debug, Serialize, Deserialize, CandidType, PartialEq, Eq)]
 pub enum Chain {
     Icp,
@@ -25,7 +27,7 @@ impl std::fmt::Display for Chain {
 }
 
 impl std::str::FromStr for Chain {
-    type Err = String;
+    type Err = AppError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         let lower = s.to_ascii_lowercase();
@@ -36,14 +38,16 @@ impl std::str::FromStr for Chain {
 
         if let Some(rest) = lower.strip_prefix("evm:") {
             if rest.is_empty() {
-                return Err("invalid chain: empty evm chain name".into());
+                return Err(
+                    AppError::from_def(error_codes::INVALID_INPUT).with_context("invalid chain: empty evm chain name")
+                );
             }
             return Ok(Chain::Evm {
                 chain: rest.to_string(),
             });
         }
 
-        Err(format!("invalid chain: {s}"))
+        Err(AppError::from_def(error_codes::INVALID_INPUT).with_context(format!("invalid chain: {s}")))
     }
 }
 
