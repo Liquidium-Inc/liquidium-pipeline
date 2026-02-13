@@ -48,7 +48,7 @@ const SCAN_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(300);
 const PANIC_RECOVERY_DELAY: Duration = Duration::from_secs(1);
 const TIMEOUT_RECOVERY_DELAY: Duration = Duration::from_secs(1);
 const PAUSED_LOOP_DELAY: Duration = Duration::from_secs(2);
-const RUNNING_LOOP_DELAY: Duration = Duration::from_secs(3);
+const RUNNING_LOOP_DELAY: Duration = Duration::from_secs(2);
 
 /// Prints the startup banner when an interactive terminal is available.
 pub(crate) fn print_banner() {
@@ -320,14 +320,13 @@ pub(crate) async fn run_daemon_cycle_loop(
             consecutive_timed_out_cycles = 0;
         }
 
-        let delay = if outcome.had_timeout {
-            TIMEOUT_RECOVERY_DELAY
+        if outcome.had_timeout {
+            sleep(TIMEOUT_RECOVERY_DELAY).await;
         } else if outcome.is_paused {
-            PAUSED_LOOP_DELAY
+            sleep(PAUSED_LOOP_DELAY).await;
         } else {
-            RUNNING_LOOP_DELAY
-        };
-        sleep(delay).await;
+            sleep(RUNNING_LOOP_DELAY).await;
+        }
     }
 }
 
@@ -399,7 +398,6 @@ async fn run_single_daemon_cycle(
             };
 
         if !opportunities.is_empty() {
-            sleep(Duration::from_secs(2)).await;
             if let Some(s) = spinner.as_ref() {
                 s.finish_and_clear();
             }
