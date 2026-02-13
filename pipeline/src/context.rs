@@ -81,9 +81,9 @@ fn should_fallback_to_empty_registry(err: &PipelineContextError) -> bool {
 
 impl<P: Provider<AnyNetwork> + WalletProvider<AnyNetwork> + Clone + 'static> PipelineContextBuilder<P> {
     pub async fn new() -> AppResult<Self> {
-        let config = Config::load()
-            .await
-            .map_err(|e| AppError::from_def(error_codes::CONFIG_ERROR).with_context(format!("config load failed: {e}")))?;
+        let config = Config::load().await.map_err(|e| {
+            AppError::from_def(error_codes::CONFIG_ERROR).with_context(format!("config load failed: {e}"))
+        })?;
         Ok(Self {
             config,
             evm_provider_main: None,
@@ -265,13 +265,11 @@ impl<P: Provider<AnyNetwork> + WalletProvider<AnyNetwork> + Clone + 'static> Pip
 
 fn setup_agents_and_provider(
     config: &Config,
-) -> AppResult<
-    (
-        Arc<Agent>,
-        Arc<Agent>,
-        impl Provider<AnyNetwork> + WalletProvider<AnyNetwork> + Clone + 'static,
-    ),
-> {
+) -> AppResult<(
+    Arc<Agent>,
+    Arc<Agent>,
+    impl Provider<AnyNetwork> + WalletProvider<AnyNetwork> + Clone + 'static,
+)> {
     let agent_main = Arc::new(
         Agent::builder()
             .with_url(config.ic_url.clone())
@@ -354,9 +352,7 @@ pub async fn init_context_best_effort() -> AppResult<PipelineContext> {
             fallback
                 .build_with_registry_override(Some(empty_registry))
                 .await
-                .map_err(|err| {
-                    AppError::from_def(error_codes::INTERNAL_ERROR).with_context(err.to_string())
-                })
+                .map_err(|err| AppError::from_def(error_codes::INTERNAL_ERROR).with_context(err.to_string()))
         }
         Err(err) => Err(AppError::from_def(error_codes::INTERNAL_ERROR).with_context(err.to_string())),
     }

@@ -29,22 +29,14 @@ impl BalanceService {
             let accounts = self.accounts.clone();
 
             async move {
-                let token = self
-                    .registry
-                    .get(&asset_id)
-                    .clone()
-                    .ok_or_else(|| {
-                        AppError::from_def(error_codes::NOT_FOUND)
-                            .with_context(format!("unknown asset {}", asset_id))
-                    })?;
+                let token = self.registry.get(&asset_id).clone().ok_or_else(|| {
+                    AppError::from_def(error_codes::NOT_FOUND).with_context(format!("unknown asset {}", asset_id))
+                })?;
 
-                let bal = accounts
-                    .sync_balance(&token)
-                    .await
-                    .map_err(|e| {
-                        AppError::from_def(error_codes::EXTERNAL_CALL_FAILED)
-                            .with_context(format!("sync_balance failed for {}: {}", asset_id, e))
-                    })?;
+                let bal = accounts.sync_balance(&token).await.map_err(|e| {
+                    AppError::from_def(error_codes::EXTERNAL_CALL_FAILED)
+                        .with_context(format!("sync_balance failed for {}: {}", asset_id, e))
+                })?;
 
                 Ok::<_, AppError>((asset_id, bal))
             }
@@ -82,13 +74,10 @@ impl BalanceService {
             })?
             .clone();
 
-        self.accounts
-            .sync_balance(&token)
-            .await
-            .map_err(|e| {
-                AppError::from_def(error_codes::EXTERNAL_CALL_FAILED)
-                    .with_context(format!("sync_balance failed for {}: {}", asset_id, e))
-            })
+        self.accounts.sync_balance(&token).await.map_err(|e| {
+            AppError::from_def(error_codes::EXTERNAL_CALL_FAILED)
+                .with_context(format!("sync_balance failed for {}: {}", asset_id, e))
+        })
     }
 
     // Expose the underlying registry if needed by callers.

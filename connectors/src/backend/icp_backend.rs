@@ -16,8 +16,7 @@ use serde::{Deserialize, de::DeserializeOwned};
 pub trait IcpBackend: Send + Sync {
     async fn icrc1_balance(&self, ledger: Principal, account: &Account) -> AppResult<Nat>;
 
-    async fn icrc1_transfer(&self, ledger: Principal, from: &Account, to: &Account, amount: Nat)
-    -> AppResult<Nat>;
+    async fn icrc1_transfer(&self, ledger: Principal, from: &Account, to: &Account, amount: Nat) -> AppResult<Nat>;
 
     async fn icp_transfer(&self, ledger: Principal, to_account_id_hex: &str, amount_e8s: Nat) -> AppResult<u64>;
 
@@ -61,13 +60,7 @@ impl<A: PipelineAgent> IcpBackend for IcpBackendImpl<A> {
         self.query::<Nat>(ledger, "icrc1_balance_of", *account).await
     }
 
-    async fn icrc1_transfer(
-        &self,
-        ledger: Principal,
-        from: &Account,
-        to: &Account,
-        amount: Nat,
-    ) -> AppResult<Nat> {
+    async fn icrc1_transfer(&self, ledger: Principal, from: &Account, to: &Account, amount: Nat) -> AppResult<Nat> {
         let arg = TransferArg {
             from_subaccount: from.subaccount,
             to: *to,
@@ -128,12 +121,9 @@ impl<A: PipelineAgent> IcpBackend for IcpBackendImpl<A> {
 
         let fee = Tokens { e8s: 10_000 }; // default ICP fee
 
-        let e8s = amount_e8s
-            .0
-            .to_u64()
-            .ok_or_else(|| {
-                AppError::from_def(error_codes::INVALID_INPUT).with_context("amount too large for ICP transfer")
-            })?;
+        let e8s = amount_e8s.0.to_u64().ok_or_else(|| {
+            AppError::from_def(error_codes::INVALID_INPUT).with_context("amount too large for ICP transfer")
+        })?;
         let amount = Tokens { e8s };
 
         let arg = TransferArgs {

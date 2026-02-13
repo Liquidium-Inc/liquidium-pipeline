@@ -372,7 +372,10 @@ where
                     warn!("Failed to persist WAL profit snapshot for liq_id {}: {}", liq.id, err);
                 }
             } else {
-                warn!("Skipping WAL profit snapshot persistence: missing WAL id for liq_id {}", liq.id);
+                warn!(
+                    "Skipping WAL profit snapshot persistence: missing WAL id for liq_id {}",
+                    liq.id
+                );
             }
 
             outcomes.push(LiquidationOutcome {

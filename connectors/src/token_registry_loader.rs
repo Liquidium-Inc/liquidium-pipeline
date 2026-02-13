@@ -232,8 +232,7 @@ mod tests {
         let _env = EnvGuard::set("icp:aaaaa-aa:ICP", "icp:aaaaa-aa:ICP");
 
         let mut icp = MockIcpBackend::new();
-        icp.expect_icrc1_decimals()
-            .returning(|_| Err("decimals-failed".into()));
+        icp.expect_icrc1_decimals().returning(|_| Err("decimals-failed".into()));
 
         let evm = MockEvmBackend::new();
 
@@ -257,8 +256,7 @@ mod tests {
 
         let mut icp = MockIcpBackend::new();
         icp.expect_icrc1_decimals().returning(|_| Ok(8));
-        icp.expect_icrc1_fee()
-            .returning(|_| Err("fee-failed".into()));
+        icp.expect_icrc1_fee().returning(|_| Err("fee-failed".into()));
 
         let evm = MockEvmBackend::new();
 

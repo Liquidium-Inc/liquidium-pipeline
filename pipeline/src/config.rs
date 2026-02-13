@@ -205,41 +205,34 @@ impl Config {
         let export_path_raw = env::var("EXPORT_PATH").unwrap_or(format!("{}/executions.csv", home));
         let export_path = expand_tilde(&export_path_raw).to_string_lossy().into_owned();
 
-        let mnemonic_path = expand_tilde(
-            &env::var("MNEMONIC_FILE")
-                .map_err(|_| AppError::from_def(error_codes::CONFIG_ERROR).with_context("MNEMONIC_FILE not configured"))?,
-        );
+        let mnemonic_path =
+            expand_tilde(&env::var("MNEMONIC_FILE").map_err(|_| {
+                AppError::from_def(error_codes::CONFIG_ERROR).with_context("MNEMONIC_FILE not configured")
+            })?);
 
         let mnemonic = std::fs::read_to_string(&mnemonic_path)
             .map_err(|e| {
-                AppError::from_def(error_codes::CONFIG_ERROR)
-                    .with_context(format!("failed to read mnemonic file: {e}"))
+                AppError::from_def(error_codes::CONFIG_ERROR).with_context(format!("failed to read mnemonic file: {e}"))
             })?
             .trim()
             .to_string();
 
-        let liquidator_identity =
-            derive_icp_identity(&mnemonic, 0, 0).map_err(|e| {
-                AppError::from_def(error_codes::CONFIG_ERROR)
-                    .with_context(format!("could not create liquidator identity: {e}"))
-            })?;
-        let liquidator_principal = liquidator_identity
-            .sender()
-            .map_err(|e| {
-                AppError::from_def(error_codes::CONFIG_ERROR)
-                    .with_context(format!("could not decode liquidator principal: {e}"))
-            })?;
+        let liquidator_identity = derive_icp_identity(&mnemonic, 0, 0).map_err(|e| {
+            AppError::from_def(error_codes::CONFIG_ERROR)
+                .with_context(format!("could not create liquidator identity: {e}"))
+        })?;
+        let liquidator_principal = liquidator_identity.sender().map_err(|e| {
+            AppError::from_def(error_codes::CONFIG_ERROR)
+                .with_context(format!("could not decode liquidator principal: {e}"))
+        })?;
 
-        let trader_identity =
-            derive_icp_identity(&mnemonic, 0, 1).map_err(|e| {
-                AppError::from_def(error_codes::CONFIG_ERROR).with_context(format!("could not create trader identity: {e}"))
-            })?;
-        let trader_principal = trader_identity
-            .sender()
-            .map_err(|e| {
-                AppError::from_def(error_codes::CONFIG_ERROR)
-                    .with_context(format!("could not decode trader principal: {e}"))
-            })?;
+        let trader_identity = derive_icp_identity(&mnemonic, 0, 1).map_err(|e| {
+            AppError::from_def(error_codes::CONFIG_ERROR).with_context(format!("could not create trader identity: {e}"))
+        })?;
+        let trader_principal = trader_identity.sender().map_err(|e| {
+            AppError::from_def(error_codes::CONFIG_ERROR)
+                .with_context(format!("could not decode trader principal: {e}"))
+        })?;
 
         let buy_bad_debt = env::var("BUY_BAD_DEBT")
             .map(|v| v.parse().unwrap_or(false))
@@ -249,13 +242,13 @@ impl Config {
         debug!("Trader ID {}", trader_principal);
 
         // Load the asset maps
-        let lending_canister_str = env::var("LENDING_CANISTER")
-            .map_err(|_| AppError::from_def(error_codes::CONFIG_ERROR).with_context("LENDING_CANISTER not configured"))?;
-        let lending_canister = Principal::from_text(&lending_canister_str)
-            .map_err(|e| {
-                AppError::from_def(error_codes::CONFIG_ERROR)
-                    .with_context(format!("invalid LENDING_CANISTER principal: {e}"))
-            })?;
+        let lending_canister_str = env::var("LENDING_CANISTER").map_err(|_| {
+            AppError::from_def(error_codes::CONFIG_ERROR).with_context("LENDING_CANISTER not configured")
+        })?;
+        let lending_canister = Principal::from_text(&lending_canister_str).map_err(|e| {
+            AppError::from_def(error_codes::CONFIG_ERROR)
+                .with_context(format!("invalid LENDING_CANISTER principal: {e}"))
+        })?;
 
         // The db path
         let db_path_raw = env::var("DB_PATH").unwrap_or(format!("{}/wal.db", home));

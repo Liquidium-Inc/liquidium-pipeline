@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
+use crate::error::{AppError, AppResult, error_codes};
 use async_trait::async_trait;
 use candid::{Encode, Nat, Principal};
-use crate::error::{AppError, AppResult, error_codes};
 use liquidium_pipeline_connectors::pipeline_agent::PipelineAgent;
 
 #[cfg_attr(test, mockall::automock)]
@@ -39,6 +39,8 @@ impl<A: PipelineAgent> PriceOracle for LiquidationPriceOracle<A> {
             .agent
             .call_query::<Result<(Nat, u32), String>>(&self.lending_canister, "get_price", args)
             .await?;
-        res.map_err(|e| AppError::from_def(error_codes::EXTERNAL_CALL_FAILED).with_context(format!("get_price error: {e}")))
+        res.map_err(|e| {
+            AppError::from_def(error_codes::EXTERNAL_CALL_FAILED).with_context(format!("get_price error: {e}"))
+        })
     }
 }

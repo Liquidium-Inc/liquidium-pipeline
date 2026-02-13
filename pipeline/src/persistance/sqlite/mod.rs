@@ -81,10 +81,9 @@ impl SqliteWalStore {
 
     fn get_conn(&self) -> AppResult<r2d2::PooledConnection<ConnectionManager<SqliteConnection>>> {
         let mode = if self.read_only { "ro" } else { "rw" };
-        let mut conn = self
-            .pool
-            .get()
-            .map_err(|e| with_persistence_context(format!("open sqlite connection (mode={mode} path={})", self.db_path), e))?;
+        let mut conn = self.pool.get().map_err(|e| {
+            with_persistence_context(format!("open sqlite connection (mode={mode} path={})", self.db_path), e)
+        })?;
         if self.read_only {
             apply_read_only_pragmas(&mut conn, self.busy_timeout_ms)?;
         } else {

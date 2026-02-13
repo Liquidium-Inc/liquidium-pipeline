@@ -339,9 +339,9 @@ impl Finalizer for dyn CexFinalizerLogic {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::{AppError, AppResult};
     use async_trait::async_trait;
     use candid::{Nat, Principal};
-    use crate::error::{AppError, AppResult};
     use liquidium_pipeline_core::tokens::{chain_token::ChainToken, chain_token_amount::ChainTokenAmount};
     use liquidium_pipeline_core::types::protocol_types::{
         AssetType, LiquidationAmounts, LiquidationRequest, LiquidationResult, LiquidationStatus, TransferStatus,

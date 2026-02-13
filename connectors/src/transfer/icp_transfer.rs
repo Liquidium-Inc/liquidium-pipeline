@@ -80,14 +80,10 @@ impl<B: IcpBackend + Send + Sync> TransferActions for IcpTransferAdapter<B> {
                 Ok(block_index.to_string())
             }
 
-            (ChainToken::Icp { .. }, _) => Err(
-                AppError::from_def(error_codes::INVALID_INPUT)
-                    .with_context("IcpTransferAdapter: destination chain must be ICP"),
-            ),
-            _ => Err(
-                AppError::from_def(error_codes::UNSUPPORTED)
-                    .with_context("IcpTransferAdapter only supports ChainToken::Icp"),
-            ),
+            (ChainToken::Icp { .. }, _) => Err(AppError::from_def(error_codes::INVALID_INPUT)
+                .with_context("IcpTransferAdapter: destination chain must be ICP")),
+            _ => Err(AppError::from_def(error_codes::UNSUPPORTED)
+                .with_context("IcpTransferAdapter only supports ChainToken::Icp")),
         }
     }
 
@@ -108,14 +104,10 @@ impl<B: IcpBackend + Send + Sync> TransferActions for IcpTransferAdapter<B> {
                 let block_index = self.backend.icrc2_approve(*ledger, args).await?;
                 Ok(block_index.to_string())
             }
-            (ChainToken::Icp { .. }, _) => Err(
-                AppError::from_def(error_codes::INVALID_INPUT)
-                    .with_context("IcpTransferAdapter: spender must be an ICP account"),
-            ),
-            _ => Err(
-                AppError::from_def(error_codes::UNSUPPORTED)
-                    .with_context("IcpTransferAdapter only supports ChainToken::Icp"),
-            ),
+            (ChainToken::Icp { .. }, _) => Err(AppError::from_def(error_codes::INVALID_INPUT)
+                .with_context("IcpTransferAdapter: spender must be an ICP account")),
+            _ => Err(AppError::from_def(error_codes::UNSUPPORTED)
+                .with_context("IcpTransferAdapter only supports ChainToken::Icp")),
         }
     }
 }

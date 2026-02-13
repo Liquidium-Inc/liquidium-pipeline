@@ -53,10 +53,8 @@ impl<B: EvmBackend> AccountInfo for EvmAccountInfoAdapter<B> {
                     value: amount_native,
                 })
             }
-            _ => Err(
-                AppError::from_def(error_codes::UNSUPPORTED)
-                    .with_context("EvmAccountInfoAdapter only supports EvmNative and EvmErc20 tokens"),
-            ),
+            _ => Err(AppError::from_def(error_codes::UNSUPPORTED)
+                .with_context("EvmAccountInfoAdapter only supports EvmNative and EvmErc20 tokens")),
         }
     }
 
@@ -72,13 +70,9 @@ impl<B: EvmBackend> AccountInfo for EvmAccountInfoAdapter<B> {
         };
 
         if let Some((chain, addr)) = cache_key {
-            let mut lock = self
-                .cache
-                .lock()
-                .map_err(|_| {
-                    AppError::from_def(error_codes::INTERNAL_ERROR)
-                        .with_context("evm balance cache poisoned")
-                })?;
+            let mut lock = self.cache.lock().map_err(|_| {
+                AppError::from_def(error_codes::INTERNAL_ERROR).with_context("evm balance cache poisoned")
+            })?;
             lock.insert((chain, addr), (bal.clone(), Instant::now()));
         }
 

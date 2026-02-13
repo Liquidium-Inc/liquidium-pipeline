@@ -1,7 +1,7 @@
 use bip32::{DerivationPath, XPrv};
 use bip39::{Language, Mnemonic};
 use k256::SecretKey;
-use liquidium_pipeline_core::error::{error_codes, AppError, AppResult};
+use liquidium_pipeline_core::error::{AppError, AppResult, error_codes};
 use std::str::FromStr;
 
 // Derive a raw Ethereum private key from a mnemonic and BIP32 path.

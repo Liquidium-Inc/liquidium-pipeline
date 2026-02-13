@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
-use crate::error::{error_codes, AppError, AppResult};
+use crate::error::{AppError, AppResult, error_codes};
 use crate::tokens::{asset_id::AssetId, chain_token::ChainToken};
 
 // In-memory registry of all supported tokens.

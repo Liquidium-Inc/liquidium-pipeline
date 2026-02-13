@@ -48,15 +48,9 @@ impl PipelineAgent for ic_agent::Agent {
         method: &str,
         arg: Vec<u8>,
     ) -> AppResult<R> {
-        let res = self
-            .query(canister, method)
-            .with_arg(arg)
-            .call()
-            .await
-            .map_err(|e| {
-                AppError::from_def(error_codes::EXTERNAL_CALL_FAILED)
-                    .with_context(format!("Query call failed: {e}"))
-            })?;
+        let res = self.query(canister, method).with_arg(arg).call().await.map_err(|e| {
+            AppError::from_def(error_codes::EXTERNAL_CALL_FAILED).with_context(format!("Query call failed: {e}"))
+        })?;
 
         // Decode the candid response
         let res = Decode!(&res, R).map_err(|e| {
@@ -72,15 +66,9 @@ impl PipelineAgent for ic_agent::Agent {
         method: &str,
         arg: Vec<u8>,
     ) -> AppResult<R> {
-        let res = self
-            .query(canister, method)
-            .with_arg(arg)
-            .call()
-            .await
-            .map_err(|e| {
-                AppError::from_def(error_codes::EXTERNAL_CALL_FAILED)
-                    .with_context(format!("Query call failed: {e}"))
-            })?;
+        let res = self.query(canister, method).with_arg(arg).call().await.map_err(|e| {
+            AppError::from_def(error_codes::EXTERNAL_CALL_FAILED).with_context(format!("Query call failed: {e}"))
+        })?;
 
         let res = candid::utils::decode_one::<R>(&res).map_err(|e| {
             AppError::from_def(error_codes::DECODE_ERROR).with_context(format!("Candid decode error: {}", e))

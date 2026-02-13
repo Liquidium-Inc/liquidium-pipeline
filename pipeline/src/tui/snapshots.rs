@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use chrono::Local;
 use crate::error::{AppError, AppResult};
+use chrono::Local;
 
 use liquidium_pipeline_core::tokens::asset_id::AssetId;
 use liquidium_pipeline_core::tokens::token_registry::TokenRegistry;
@@ -11,9 +11,7 @@ use liquidium_pipeline_core::tokens::token_registry::TokenRegistryTrait;
 use super::app::{BalanceRowData, BalancesSnapshot, ProfitBySymbol, ProfitsSnapshot};
 use super::format;
 
-pub(super) async fn fetch_balances_snapshot(
-    ctx: Arc<crate::context::PipelineContext>,
-) -> AppResult<BalancesSnapshot> {
+pub(super) async fn fetch_balances_snapshot(ctx: Arc<crate::context::PipelineContext>) -> AppResult<BalancesSnapshot> {
     let mut asset_ids: Vec<AssetId> = ctx.registry.all().into_iter().map(|(id, _)| id).collect();
     asset_ids.sort_by(|a, b| {
         a.chain

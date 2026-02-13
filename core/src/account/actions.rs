@@ -1,6 +1,6 @@
+use crate::error::AppResult;
 use crate::tokens::chain_token::ChainToken;
 use crate::tokens::chain_token_amount::ChainTokenAmount;
-use crate::error::AppResult;
 
 use async_trait::async_trait;
 

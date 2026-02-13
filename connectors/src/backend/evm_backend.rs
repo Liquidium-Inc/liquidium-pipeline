@@ -28,13 +28,7 @@ pub trait EvmBackend: Send + Sync {
     async fn native_balance(&self, chain: &str) -> AppResult<Nat>;
 
     // ERC20 transfer from the pipeline wallet.
-    async fn erc20_transfer(
-        &self,
-        chain: &str,
-        token_address: &str,
-        to: &str,
-        amount_wei: Nat,
-    ) -> AppResult<String>; // tx hash
+    async fn erc20_transfer(&self, chain: &str, token_address: &str, to: &str, amount_wei: Nat) -> AppResult<String>; // tx hash
 
     // Native transfer from the pipeline wallet.
     async fn native_transfer(&self, chain: &str, to: &str, amount_wei: Nat) -> AppResult<String>;
@@ -73,51 +67,32 @@ where
     async fn erc20_balance(&self, _chain: &str, token_address: &str) -> AppResult<Nat> {
         let owner = self.provider.wallet().default_signer_address();
 
-        let token_addr: Address = token_address
-            .parse()
-            .map_err(|e| {
-                AppError::from_def(error_codes::INVALID_INPUT).with_context(format!("invalid token address: {e}"))
-            })?;
+        let token_addr: Address = token_address.parse().map_err(|e| {
+            AppError::from_def(error_codes::INVALID_INPUT).with_context(format!("invalid token address: {e}"))
+        })?;
 
         let contract = IERC20::new(token_addr, self.provider.clone());
 
-        let res = contract
-            .balanceOf(owner)
-            .call()
-            .await
-            .map_err(|e| {
-                AppError::from_def(error_codes::EXTERNAL_CALL_FAILED)
-                    .with_context(format!("erc20 balanceOf failed: {e}"))
-            })?;
+        let res = contract.balanceOf(owner).call().await.map_err(|e| {
+            AppError::from_def(error_codes::EXTERNAL_CALL_FAILED).with_context(format!("erc20 balanceOf failed: {e}"))
+        })?;
 
         Ok(u256_to_nat(res))
     }
 
     async fn native_balance(&self, _chain: &str) -> AppResult<Nat> {
-        let bal: U256 = self
-            .provider
-            .get_balance(self.wallet_address())
-            .await
-            .map_err(|e| {
-                AppError::from_def(error_codes::EXTERNAL_CALL_FAILED)
-                    .with_context(format!("native get_balance failed: {e}"))
-            })?;
+        let bal: U256 = self.provider.get_balance(self.wallet_address()).await.map_err(|e| {
+            AppError::from_def(error_codes::EXTERNAL_CALL_FAILED)
+                .with_context(format!("native get_balance failed: {e}"))
+        })?;
 
         Ok(u256_to_nat(bal))
     }
 
-    async fn erc20_transfer(
-        &self,
-        _chain: &str,
-        token_address: &str,
-        to: &str,
-        amount_wei: Nat,
-    ) -> AppResult<String> {
-        let token_addr: Address = token_address
-            .parse()
-            .map_err(|e| {
-                AppError::from_def(error_codes::INVALID_INPUT).with_context(format!("invalid token address: {e}"))
-            })?;
+    async fn erc20_transfer(&self, _chain: &str, token_address: &str, to: &str, amount_wei: Nat) -> AppResult<String> {
+        let token_addr: Address = token_address.parse().map_err(|e| {
+            AppError::from_def(error_codes::INVALID_INPUT).with_context(format!("invalid token address: {e}"))
+        })?;
         let to_addr: Address = to.parse().map_err(|e| {
             AppError::from_def(error_codes::INVALID_INPUT).with_context(format!("invalid recipient address: {e}"))
         })?;
@@ -126,14 +101,10 @@ where
 
         let contract = IERC20::new(token_addr, self.provider.clone());
 
-        let tx = contract
-            .transfer(to_addr, amount)
-            .send()
-            .await
-            .map_err(|e| {
-                AppError::from_def(error_codes::EXTERNAL_CALL_FAILED)
-                    .with_context(format!("erc20 transfer send failed: {e}"))
-            })?;
+        let tx = contract.transfer(to_addr, amount).send().await.map_err(|e| {
+            AppError::from_def(error_codes::EXTERNAL_CALL_FAILED)
+                .with_context(format!("erc20 transfer send failed: {e}"))
+        })?;
 
         let tx_hash = format!("{:#x}", tx.tx_hash());
         Ok(tx_hash)
@@ -147,43 +118,29 @@ where
 
         let tx = TransactionRequest::default().with_to(to_addr).with_value(amount);
 
-        let pending = self
-            .provider
-            .send_transaction(tx.into())
-            .await
-            .map_err(|e| {
-                AppError::from_def(error_codes::EXTERNAL_CALL_FAILED)
-                    .with_context(format!("native transfer send failed: {e}"))
-            })?;
+        let pending = self.provider.send_transaction(tx.into()).await.map_err(|e| {
+            AppError::from_def(error_codes::EXTERNAL_CALL_FAILED)
+                .with_context(format!("native transfer send failed: {e}"))
+        })?;
 
-        let tx_hash = pending
-            .watch()
-            .await
-            .map_err(|e| {
-                AppError::from_def(error_codes::EXTERNAL_CALL_FAILED)
-                    .with_context(format!("native transfer watch failed: {e}"))
-            })?;
+        let tx_hash = pending.watch().await.map_err(|e| {
+            AppError::from_def(error_codes::EXTERNAL_CALL_FAILED)
+                .with_context(format!("native transfer watch failed: {e}"))
+        })?;
 
         Ok(format!("{:#x}", tx_hash))
     }
 
     async fn erc20_decimals(&self, _chain: &str, token_address: &str) -> AppResult<u8> {
-        let token_addr: Address = token_address
-            .parse()
-            .map_err(|e| {
-                AppError::from_def(error_codes::INVALID_INPUT).with_context(format!("invalid token address: {e}"))
-            })?;
+        let token_addr: Address = token_address.parse().map_err(|e| {
+            AppError::from_def(error_codes::INVALID_INPUT).with_context(format!("invalid token address: {e}"))
+        })?;
 
         let contract = IERC20::new(token_addr, self.provider.clone());
 
-        let res = contract
-            .decimals()
-            .call()
-            .await
-            .map_err(|e| {
-                AppError::from_def(error_codes::EXTERNAL_CALL_FAILED)
-                    .with_context(format!("erc20 decimals() failed: {e}"))
-            })?;
+        let res = contract.decimals().call().await.map_err(|e| {
+            AppError::from_def(error_codes::EXTERNAL_CALL_FAILED).with_context(format!("erc20 decimals() failed: {e}"))
+        })?;
 
         Ok(res)
     }

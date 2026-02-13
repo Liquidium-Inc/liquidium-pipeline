@@ -490,11 +490,7 @@ impl MexcClient {
             if let Some(min_qty) = f.min_qty
                 && adjusted < min_qty
             {
-                return Err(format!(
-                    "quantity {} below min_qty {} for {}",
-                    adjusted, min_qty, symbol
-                )
-                .into());
+                return Err(format!("quantity {} below min_qty {} for {}", adjusted, min_qty, symbol).into());
             }
         }
 
@@ -912,7 +908,7 @@ impl CexBackend for MexcClient {
                 )
                 .await?
             }
-             _ => return Err(format!("unsupported side: {}", side).into()),
+            _ => return Err(format!("unsupported side: {}", side).into()),
         };
 
         // Try multiple candidate symbols for MEXC quirks, then fetch the filled amount.
@@ -1125,13 +1121,7 @@ impl CexBackend for MexcClient {
             .ok_or_else(|| "could not convert balance to f64".to_string().into())
     }
 
-    async fn withdraw(
-        &self,
-        asset: &str,
-        network: &str,
-        address: &str,
-        amount: f64,
-    ) -> AppResult<WithdrawalReceipt> {
+    async fn withdraw(&self, asset: &str, network: &str, address: &str, amount: f64) -> AppResult<WithdrawalReceipt> {
         let ex = self.inner.lock().await;
         let push_unique = |list: &mut Vec<String>, value: String| {
             if !list.iter().any(|item| item.eq_ignore_ascii_case(&value)) {
@@ -1205,7 +1195,12 @@ impl CexBackend for MexcClient {
 
         let res = match res {
             Some(res) => res,
-            None => return Err(hard_err.or(last_err).unwrap_or_else(|| "withdraw failed".to_string()).into()),
+            None => {
+                return Err(hard_err
+                    .or(last_err)
+                    .unwrap_or_else(|| "withdraw failed".to_string())
+                    .into());
+            }
         };
 
         Ok(WithdrawalReceipt {

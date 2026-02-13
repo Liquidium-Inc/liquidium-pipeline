@@ -2,8 +2,8 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use candid::Nat;
-use liquidium_pipeline_core::error::{AppError, AppResult, error_codes};
 use liquidium_pipeline_core::account::model::ChainAccount;
+use liquidium_pipeline_core::error::{AppError, AppResult, error_codes};
 use liquidium_pipeline_core::tokens::chain_token::ChainToken;
 use liquidium_pipeline_core::transfer::actions::TransferActions;
 use tracing::instrument;
@@ -34,9 +34,7 @@ where
             (ChainToken::EvmNative { .. } | ChainToken::EvmErc20 { .. }, ChainAccount::Evm(_)) => {
                 self.evm.transfer(token, to, amount_native).await
             }
-            _ => Err(
-                AppError::from_def(error_codes::INVALID_INPUT).with_context("invalid transfer configuration"),
-            ),
+            _ => Err(AppError::from_def(error_codes::INVALID_INPUT).with_context("invalid transfer configuration")),
         }
     }
 

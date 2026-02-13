@@ -291,12 +291,7 @@ where
     }
 
     /// Simulate one leg with current orderbook for route previews.
-    pub(super) async fn preview_leg(
-        &self,
-        market: &str,
-        side: &str,
-        amount_in: f64,
-    ) -> AppResult<(f64, f64, f64)> {
+    pub(super) async fn preview_leg(&self, market: &str, side: &str, amount_in: f64) -> AppResult<(f64, f64, f64)> {
         let orderbook = self
             .backend
             .get_orderbook(market, Some(DEFAULT_ORDERBOOK_LIMIT))
@@ -951,12 +946,7 @@ where
     }
 
     /// Convert fill amounts into execution price according to side semantics.
-    pub(super) fn exec_price_from_fill(
-        market: &str,
-        side: &str,
-        chunk_in: f64,
-        filled_out: f64,
-    ) -> AppResult<f64> {
+    pub(super) fn exec_price_from_fill(market: &str, side: &str, chunk_in: f64, filled_out: f64) -> AppResult<f64> {
         let exec_price = if side.eq_ignore_ascii_case("sell") {
             if chunk_in > 0.0 { filled_out / chunk_in } else { 0.0 }
         } else if filled_out > 0.0 {

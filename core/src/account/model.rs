@@ -2,7 +2,7 @@ use candid::CandidType;
 use icrc_ledger_types::icrc1::account::Account;
 use serde::{Deserialize, Serialize};
 
-use crate::error::{error_codes, AppError};
+use crate::error::{AppError, error_codes};
 
 #[derive(Clone, Debug, Serialize, Deserialize, CandidType, PartialEq, Eq)]
 pub enum Chain {

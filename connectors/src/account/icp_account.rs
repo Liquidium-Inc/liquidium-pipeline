@@ -98,35 +98,25 @@ where
     async fn sync_balance(&self, token: &ChainToken) -> AppResult<ChainTokenAmount> {
         match token {
             ChainToken::Icp { ledger, symbol, .. } => {
-                let amount = self
-                    .backend
-                    .icrc1_balance(*ledger, self.account())
-                    .await
-                    .map_err(|e| {
-                        AppError::from_def(error_codes::EXTERNAL_CALL_FAILED)
-                            .with_context(format!("icp get_balance failed: {e}"))
-                    })?;
+                let amount = self.backend.icrc1_balance(*ledger, self.account()).await.map_err(|e| {
+                    AppError::from_def(error_codes::EXTERNAL_CALL_FAILED)
+                        .with_context(format!("icp get_balance failed: {e}"))
+                })?;
 
                 let balance = ChainTokenAmount {
                     token: token.clone(),
                     value: amount,
                 };
 
-                let mut cache = self
-                    .cache
-                    .lock()
-                    .map_err(|_| {
-                        AppError::from_def(error_codes::INTERNAL_ERROR)
-                            .with_context("icp balance cache poisoned")
-                    })?;
+                let mut cache = self.cache.lock().map_err(|_| {
+                    AppError::from_def(error_codes::INTERNAL_ERROR).with_context("icp balance cache poisoned")
+                })?;
                 cache.insert((*ledger, symbol.clone()), (balance.clone(), Instant::now()));
 
                 Ok(balance)
             }
-            _ => Err(
-                AppError::from_def(error_codes::UNSUPPORTED)
-                    .with_context("IcpAccountInfoAdapter only supports ChainToken::Icp"),
-            ),
+            _ => Err(AppError::from_def(error_codes::UNSUPPORTED)
+                .with_context("IcpAccountInfoAdapter only supports ChainToken::Icp")),
         }
     }
 

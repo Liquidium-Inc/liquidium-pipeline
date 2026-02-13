@@ -68,14 +68,8 @@ where
     }
 
     async fn tick(&self) -> AppResult<()> {
-        let mut rows = self
-            .wal
-            .list_by_status(ResultStatus::WaitingCollateral, 100)
-            .await?;
-        let mut profit_rows = self
-            .wal
-            .list_by_status(ResultStatus::WaitingProfit, 100)
-            .await?;
+        let mut rows = self.wal.list_by_status(ResultStatus::WaitingCollateral, 100).await?;
+        let mut profit_rows = self.wal.list_by_status(ResultStatus::WaitingProfit, 100).await?;
         rows.append(&mut profit_rows);
 
         for row in rows {
@@ -136,25 +130,19 @@ where
         }
 
         if receipt.request.swap_args.is_none() {
-            self.wal
-                .update_status(&row.id, ResultStatus::Succeeded, true)
-                .await?;
+            self.wal.update_status(&row.id, ResultStatus::Succeeded, true).await?;
             return Ok(());
         }
 
         if receipt.request.liquidation.buy_bad_debt {
-            self.wal
-                .update_status(&row.id, ResultStatus::Enqueued, true)
-                .await?;
+            self.wal.update_status(&row.id, ResultStatus::Enqueued, true).await?;
             return Ok(());
         }
 
         // DEX quote-based profitability gating is only valid in pure DEX mode.
         // In CEX/Hybrid modes, finalizer-side previews decide route viability.
         if !matches!(self.swapper_mode, SwapperMode::Dex) {
-            self.wal
-                .update_status(&row.id, ResultStatus::Enqueued, true)
-                .await?;
+            self.wal.update_status(&row.id, ResultStatus::Enqueued, true).await?;
             info!(
                 "[settlement] ✅ liq_id={} mode={:?} -> enqueued without DEX quote gate",
                 liq.id, self.swapper_mode
@@ -181,9 +169,7 @@ where
         let profitable = matches!((recv, debt), (Some(r), Some(d)) if r >= d);
 
         if profitable {
-            self.wal
-                .update_status(&row.id, ResultStatus::Enqueued, true)
-                .await?;
+            self.wal.update_status(&row.id, ResultStatus::Enqueued, true).await?;
             info!("[settlement] ✅ liq_id={} profitable -> enqueued", liq.id);
             return Ok(());
         }

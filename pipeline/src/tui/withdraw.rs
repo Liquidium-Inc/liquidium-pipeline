@@ -204,10 +204,8 @@ async fn execute_withdraw(
         WithdrawDestinationKind::Main => ctx.config.liquidator_principal.into(),
         WithdrawDestinationKind::Trader => ctx.config.trader_principal.into(),
         WithdrawDestinationKind::Recovery => ctx.config.get_recovery_account(),
-        WithdrawDestinationKind::Manual => {
-            Account::from_str(manual_destination.trim())
-                .map_err(|_| AppError::from("invalid destination ICP account"))?
-        }
+        WithdrawDestinationKind::Manual => Account::from_str(manual_destination.trim())
+            .map_err(|_| AppError::from("invalid destination ICP account"))?,
     };
 
     let amount_native: Nat = if amount.trim().eq_ignore_ascii_case("all") {
@@ -237,10 +235,11 @@ fn compute_withdraw_amount_native(balance: Nat, fee: Nat, amount: &str, decimals
         }
         Ok(Nat::from(bal_u128 - fee_u128))
     } else {
-        let units = format::decimal_to_units(amount.trim(), decimals)
-            .ok_or_else(|| {
-                AppError::from(format!("invalid amount (expected decimal with <= {decimals} decimals, or 'all')"))
-            })?;
+        let units = format::decimal_to_units(amount.trim(), decimals).ok_or_else(|| {
+            AppError::from(format!(
+                "invalid amount (expected decimal with <= {decimals} decimals, or 'all')"
+            ))
+        })?;
         Ok(Nat::from(units))
     }
 }

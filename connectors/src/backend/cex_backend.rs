@@ -98,13 +98,7 @@ pub trait CexBackend: Send + Sync {
     async fn get_deposit_address(&self, asset: &str, network: &str) -> AppResult<DepositAddress>;
 
     // withdrawals
-    async fn withdraw(
-        &self,
-        asset: &str,
-        network: &str,
-        address: &str,
-        amount: f64,
-    ) -> AppResult<WithdrawalReceipt>;
+    async fn withdraw(&self, asset: &str, network: &str, address: &str, amount: f64) -> AppResult<WithdrawalReceipt>;
 
     // balance
     async fn get_balance(&self, asset: &str) -> AppResult<f64>;

@@ -44,24 +44,15 @@ impl<B: EvmBackend + Send + Sync> TransferActions for EvmTransferAdapter<B> {
                 Ok(tx_hash)
             }
             (ChainToken::EvmNative { .. } | ChainToken::EvmErc20 { .. }, _) => {
-                Err(
-                    AppError::from_def(error_codes::INVALID_INPUT)
-                        .with_context("EvmTransferAdapter: destination chain must be EVM"),
-                )
+                Err(AppError::from_def(error_codes::INVALID_INPUT)
+                    .with_context("EvmTransferAdapter: destination chain must be EVM"))
             }
-            _ => Err(
-                AppError::from_def(error_codes::UNSUPPORTED)
-                    .with_context("EvmTransferAdapter only supports EvmNative and EvmErc20 tokens"),
-            ),
+            _ => Err(AppError::from_def(error_codes::UNSUPPORTED)
+                .with_context("EvmTransferAdapter only supports EvmNative and EvmErc20 tokens")),
         }
     }
 
-    async fn approve(
-        &self,
-        _token: &ChainToken,
-        _spender: &ChainAccount,
-        _amount_native: Nat,
-    ) -> AppResult<String> {
+    async fn approve(&self, _token: &ChainToken, _spender: &ChainAccount, _amount_native: Nat) -> AppResult<String> {
         Err(AppError::from_def(error_codes::UNSUPPORTED).with_context("EvmTransferAdapter does not support approve"))
     }
 }

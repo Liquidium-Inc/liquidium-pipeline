@@ -36,13 +36,10 @@ impl TransferService {
             })?
             .clone();
 
-        self.actions
-            .transfer(&token, &to, amount_native)
-            .await
-            .map_err(|e| {
-                AppError::from_def(error_codes::TRANSFER_FAILED)
-                    .with_context(format!("transfer failed for {}: {}", asset_id, e))
-            })
+        self.actions.transfer(&token, &to, amount_native).await.map_err(|e| {
+            AppError::from_def(error_codes::TRANSFER_FAILED)
+                .with_context(format!("transfer failed for {}: {}", asset_id, e))
+        })
     }
 
     // Expose the underlying registry if needed by callers.
