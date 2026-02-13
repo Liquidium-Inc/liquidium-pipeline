@@ -4,6 +4,7 @@ use diesel::{
     dsl::count_star,
     prelude::*,
     r2d2::{ConnectionManager, Pool},
+    sql_types::{BigInt, Integer},
 };
 use std::collections::HashMap;
 
@@ -20,14 +21,16 @@ use self::schema::liquidation_results as tbl;
 pub struct SqliteWalStore {
     pool: Pool<ConnectionManager<SqliteConnection>>,
     busy_timeout_ms: i64,
+    read_only: bool,
+    db_path: String,
 }
 
 fn persistence_error(context: impl Into<String>) -> AppError {
     AppError::from_def(error_codes::PERSISTENCE_ERROR).with_context(context)
 }
 
-fn with_persistence_context(context: &str, err: impl std::fmt::Display) -> AppError {
-    persistence_error(format!("{}: {}", context, err))
+fn with_persistence_context(context: impl Into<String>, err: impl std::fmt::Display) -> AppError {
+    persistence_error(format!("{}: {}", context.into(), err))
 }
 
 fn serialize_wal_error(err: &AppError) -> String {
@@ -44,22 +47,57 @@ impl SqliteWalStore {
         let pool = Pool::builder()
             .max_size(2)
             .build(manager)
-            .map_err(|e| with_persistence_context("failed to build sqlite pool", e))?;
+            .map_err(|e| with_persistence_context(format!("open sqlite pool (mode=rw path={path})"), e))?;
         let mut conn = pool
             .get()
-            .map_err(|e| with_persistence_context("failed to get sqlite connection", e))?;
+            .map_err(|e| with_persistence_context(format!("open sqlite connection (mode=rw path={path})"), e))?;
         initialize_schema(&mut conn)?;
         apply_pragmas(&mut conn, busy_timeout_ms)?;
-        Ok(Self { pool, busy_timeout_ms })
+        Ok(Self {
+            pool,
+            busy_timeout_ms,
+            read_only: false,
+            db_path: path.to_string(),
+        })
+    }
+
+    pub fn new_read_only_with_busy_timeout(path: &str, busy_timeout_ms: i64) -> AppResult<Self> {
+        let manager = ConnectionManager::<SqliteConnection>::new(read_only_dsn(path));
+        let pool = Pool::builder()
+            .max_size(2)
+            .build(manager)
+            .map_err(|e| with_persistence_context(format!("open sqlite pool (mode=ro path={path})"), e))?;
+        let mut conn = pool
+            .get()
+            .map_err(|e| with_persistence_context(format!("open sqlite connection (mode=ro path={path})"), e))?;
+        apply_read_only_pragmas(&mut conn, busy_timeout_ms)?;
+        Ok(Self {
+            pool,
+            busy_timeout_ms,
+            read_only: true,
+            db_path: path.to_string(),
+        })
     }
 
     fn get_conn(&self) -> AppResult<r2d2::PooledConnection<ConnectionManager<SqliteConnection>>> {
+        let mode = if self.read_only { "ro" } else { "rw" };
         let mut conn = self
             .pool
             .get()
-            .map_err(|e| with_persistence_context("failed to get sqlite connection", e))?;
-        apply_pragmas(&mut conn, self.busy_timeout_ms)?;
+            .map_err(|e| with_persistence_context(format!("open sqlite connection (mode={mode} path={})", self.db_path), e))?;
+        if self.read_only {
+            apply_read_only_pragmas(&mut conn, self.busy_timeout_ms)?;
+        } else {
+            apply_pragmas(&mut conn, self.busy_timeout_ms)?;
+        }
         Ok(conn)
+    }
+
+    fn ensure_writable(&self) -> AppResult<()> {
+        if self.read_only {
+            return Err(persistence_error("wal store opened read-only"));
+        }
+        Ok(())
     }
 
     fn to_row(r: &LiqResultRecord) -> Row {
@@ -131,11 +169,56 @@ impl SqliteWalStore {
             .map_err(|e| with_persistence_context("failed to load recent rows", e))?;
         Ok(rows.into_iter().map(Self::from_row).collect())
     }
+
+    pub fn set_daemon_paused(&self, paused: bool) -> AppResult<()> {
+        self.ensure_writable()?;
+        let mut conn = self.get_conn()?;
+        diesel::sql_query(
+            r#"
+            INSERT INTO daemon_control_state (singleton_id, paused, updated_at)
+            VALUES (1, ?, ?)
+            ON CONFLICT(singleton_id) DO UPDATE SET
+                paused = excluded.paused,
+                updated_at = excluded.updated_at
+        "#,
+        )
+        .bind::<Integer, _>(if paused { 1 } else { 0 })
+        .bind::<BigInt, _>(now_secs())
+        .execute(&mut conn)
+        .map_err(|e| with_persistence_context("failed to persist daemon paused state", e))?;
+        Ok(())
+    }
+
+    pub fn daemon_paused(&self) -> AppResult<bool> {
+        #[derive(QueryableByName)]
+        struct StateRow {
+            #[diesel(sql_type = Integer)]
+            paused: i32,
+        }
+
+        let mut conn = self.get_conn()?;
+        match diesel::sql_query("SELECT paused FROM daemon_control_state WHERE singleton_id = 1 LIMIT 1")
+            .get_result::<StateRow>(&mut conn)
+            .optional()
+        {
+            Ok(Some(row)) => Ok(row.paused != 0),
+            Ok(None) => Ok(false),
+            Err(err) => {
+                let msg = err.to_string();
+                if msg.contains("no such table: daemon_control_state") {
+                    Ok(false)
+                } else {
+                    Err(with_persistence_context("failed to read daemon paused state", err))
+                }
+            }
+        }
+    }
 }
 
 #[async_trait]
 impl WalStore for SqliteWalStore {
     async fn get_pending(&self, limit: usize) -> AppResult<Vec<LiqResultRecord>> {
+        self.ensure_writable()?;
         let mut conn = self.get_conn()?;
         let now = now_secs();
         let inflight_stale_cutoff = now.saturating_sub(240);
@@ -166,6 +249,7 @@ impl WalStore for SqliteWalStore {
     }
 
     async fn upsert_result(&self, row: LiqResultRecord) -> AppResult<()> {
+        self.ensure_writable()?;
         let mut conn = self.get_conn()?;
         diesel::insert_into(tbl::table)
             .values(&Self::to_row(&row))
@@ -206,6 +290,7 @@ impl WalStore for SqliteWalStore {
     }
 
     async fn update_status(&self, liq_id: &str, next: ResultStatus, bump_attempt: bool) -> AppResult<()> {
+        self.ensure_writable()?;
         let mut conn = self.get_conn()?;
         let now = now_secs();
         let attempt_delta = if bump_attempt { 1 } else { 0 };
@@ -235,6 +320,7 @@ impl WalStore for SqliteWalStore {
         last_error: AppError,
         bump_attempt: bool,
     ) -> AppResult<()> {
+        self.ensure_writable()?;
         let mut conn = self.get_conn()?;
         let now = now_secs();
         let attempt_delta = if bump_attempt { 1 } else { 0 };
@@ -262,6 +348,7 @@ impl WalStore for SqliteWalStore {
     }
 
     async fn delete(&self, liq_id: &str) -> AppResult<()> {
+        self.ensure_writable()?;
         let mut conn = self.get_conn()?;
         diesel::delete(tbl::table.find(liq_id.to_string()))
             .execute(&mut conn)
@@ -285,6 +372,14 @@ pub fn initialize_schema(conn: &mut SqliteConnection) -> AppResult<()> {
             PRIMARY KEY (liq_id)
         );
         CREATE INDEX IF NOT EXISTS idx_liq_status ON liquidation_results(status);
+
+        CREATE TABLE IF NOT EXISTS daemon_control_state (
+            singleton_id INTEGER PRIMARY KEY CHECK (singleton_id = 1),
+            paused INTEGER NOT NULL DEFAULT 0 CHECK (paused IN (0, 1)),
+            updated_at BIGINT NOT NULL
+        );
+        INSERT OR IGNORE INTO daemon_control_state (singleton_id, paused, updated_at)
+        VALUES (1, 0, CAST(strftime('%s','now') AS INTEGER));
     "#,
     )
     .map_err(|e| with_persistence_context("failed to initialize sqlite schema", e))?;
@@ -308,4 +403,120 @@ pub fn apply_pragmas(conn: &mut SqliteConnection, busy_timeout_ms: i64) -> AppRe
     ))
     .map_err(|e| with_persistence_context("failed to apply sqlite pragmas", e))?;
     Ok(())
+}
+
+fn read_only_dsn(path: &str) -> String {
+    format!("file:{}?mode=ro", path)
+}
+
+fn apply_read_only_pragmas(conn: &mut SqliteConnection, busy_timeout_ms: i64) -> AppResult<()> {
+    conn.batch_execute(&format!(
+        r#"
+        PRAGMA query_only=ON;
+        PRAGMA temp_store=FILE;
+        PRAGMA cache_size=1000;
+        PRAGMA mmap_size=0;
+        PRAGMA busy_timeout={};
+    "#,
+        busy_timeout_ms
+    ))
+    .map_err(|e| with_persistence_context("failed to apply sqlite read-only pragmas", e))?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use crate::persistance::{LiqResultRecord, ResultStatus, WalStore, now_secs};
+
+    use super::SqliteWalStore;
+
+    #[test]
+    fn read_only_store_can_read_counts_and_rows() {
+        let temp = tempfile::NamedTempFile::new().expect("tmp db");
+        let path = temp.path().display().to_string();
+
+        let writer = SqliteWalStore::new_with_busy_timeout(&path, 5_000).expect("writer");
+        let now = now_secs();
+        let row = LiqResultRecord {
+            id: "liq-1".to_string(),
+            status: ResultStatus::Enqueued,
+            attempt: 0,
+            error_count: 0,
+            last_error: None,
+            created_at: now,
+            updated_at: now,
+            meta_json: "{}".to_string(),
+        };
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        rt.block_on(async {
+            writer.upsert_result(row).await.expect("upsert");
+        });
+
+        let reader = SqliteWalStore::new_read_only_with_busy_timeout(&path, 5_000).expect("reader");
+        let counts = reader.status_counts().expect("counts");
+        assert_eq!(*counts.get(&ResultStatus::Enqueued).unwrap_or(&0), 1);
+        let rows = reader.list_recent(10).expect("rows");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, "liq-1");
+    }
+
+    #[test]
+    fn read_only_store_blocks_writes() {
+        let temp = tempfile::NamedTempFile::new().expect("tmp db");
+        let path = temp.path().display().to_string();
+        let writer = SqliteWalStore::new_with_busy_timeout(&path, 5_000).expect("writer");
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+
+        // Ensure schema exists.
+        rt.block_on(async {
+            writer
+                .upsert_result(LiqResultRecord {
+                    id: "liq-1".to_string(),
+                    status: ResultStatus::Enqueued,
+                    attempt: 0,
+                    error_count: 0,
+                    last_error: None,
+                    created_at: now_secs(),
+                    updated_at: now_secs(),
+                    meta_json: "{}".to_string(),
+                })
+                .await
+                .expect("seed");
+        });
+
+        let reader = Arc::new(SqliteWalStore::new_read_only_with_busy_timeout(&path, 5_000).expect("reader"));
+        let err = rt
+            .block_on(async { reader.delete("liq-1").await })
+            .expect_err("write should fail");
+        assert!(err.to_string().contains("read-only"));
+    }
+
+    #[test]
+    fn daemon_pause_state_roundtrip_in_writable_and_read_only_store() {
+        let temp = tempfile::NamedTempFile::new().expect("tmp db");
+        let path = temp.path().display().to_string();
+
+        let writer = SqliteWalStore::new_with_busy_timeout(&path, 5_000).expect("writer");
+        assert!(!writer.daemon_paused().expect("default state"));
+        writer.set_daemon_paused(true).expect("set paused");
+        assert!(writer.daemon_paused().expect("paused state"));
+
+        let reader = SqliteWalStore::new_read_only_with_busy_timeout(&path, 5_000).expect("reader");
+        assert!(reader.daemon_paused().expect("read-only read paused state"));
+    }
+
+    #[test]
+    fn read_only_store_blocks_daemon_state_writes() {
+        let temp = tempfile::NamedTempFile::new().expect("tmp db");
+        let path = temp.path().display().to_string();
+
+        let writer = SqliteWalStore::new_with_busy_timeout(&path, 5_000).expect("writer");
+        writer.set_daemon_paused(false).expect("seed state");
+
+        let reader = SqliteWalStore::new_read_only_with_busy_timeout(&path, 5_000).expect("reader");
+        let err = reader.set_daemon_paused(true).expect_err("write should fail");
+        assert!(err.to_string().contains("read-only"));
+    }
 }

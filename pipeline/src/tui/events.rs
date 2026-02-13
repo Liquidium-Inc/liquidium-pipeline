@@ -1,6 +1,5 @@
 use crossterm::event::KeyEvent;
 
-use crate::commands::liquidation_loop::LoopEvent;
 use crate::error::AppResult;
 use liquidium_pipeline_connectors::backend::cex_backend::DepositAddress;
 
@@ -10,7 +9,9 @@ pub(super) enum UiEvent {
     Input(KeyEvent),
     Paste(String),
     Tick,
-    Engine(LoopEvent),
+    AppendLogLines(Vec<String>),
+    PrependLogLines(Vec<String>),
+    DaemonPaused(AppResult<bool>),
     Wal(AppResult<WalSnapshot>),
     Balances(AppResult<BalancesSnapshot>),
     Profits(AppResult<ProfitsSnapshot>),

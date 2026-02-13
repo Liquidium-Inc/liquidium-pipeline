@@ -32,6 +32,7 @@ tracing = { version = "0.1.44", features = ["attributes"] }
 tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
 tracing-opentelemetry = "0.32.1"
 tracing-log = "0.2.0"
+tracing-appender = "0.2"
 opentelemetry = "0.31.0"
 opentelemetry_sdk = { version = "0.31.0", features = ["rt-tokio", "logs"] }
 opentelemetry-otlp = { version = "0.31.0", features = [

@@ -380,20 +380,48 @@ Stages are implemented with `async-trait` for composability.
 
 ```bash
 liquidator run
+# optional: custom control socket
+liquidator run --sock-path /run/liquidator/ctl.sock
+# optional: enable file sink at default path
+liquidator run --log-file
+# optional: enable file sink at custom path
+liquidator run --log-file ./liquidator.log
+# optional: explicitly disable file sink
+liquidator run --no-log-file
 ```
 
-Starts the main liquidation loop that continuously monitors and executes liquidations.
+Starts the foreground daemon loop (systemd-supervised) that continuously monitors and executes liquidations.
+The control socket accepts `pause` / `resume` from attachable clients.
+By default, `liquidator run` does not write a local log file.
+Passing `--log-file` (without a value) enables file logging at the default path:
+`<temp>/liquidator/liquidator.log` (for example, `/tmp/liquidator/liquidator.log` on Linux).
+Passing `--log-file /custom/path.log` writes to that custom file.
+`--log-file` and `--no-log-file` are mutually exclusive.
+
+Default control socket path:
+- Linux: `/run/liquidator/ctl.sock`
+- non-Linux: `<temp>/liquidator/ctl.sock`
+
+Linux note (non-systemd runs): `/run/liquidator` may not exist or may not be writable.
+If you are not using systemd `RuntimeDirectory`, either create `/run/liquidator` with appropriate ownership/permissions, or pass a user-writable socket path via `--sock-path` (for example `--sock-path /tmp/liquidator/ctl.sock`).
 
 ### Start the TUI
 
 ```bash
 liquidator tui
+# optional: custom socket/unit/file source
+liquidator tui --sock-path /run/liquidator/ctl.sock --unit-name liquidator.service --log-file /path/to/log
 ```
 
-Launches a terminal UI to **start/pause** the loop, view **WAL status**, **profits** (from `EXPORT_PATH`), **balances**, and run **withdrawals** (ICP tokens only).
+Launches an attachable terminal UI to **pause/resume** the daemon, view **WAL status**, **profits** (from `EXPORT_PATH`), **balances**, and run **withdrawals** (ICP tokens only).
+Log source selection:
+- If `--log-file` is provided, TUI tails that file on any OS.
+- If running on Linux with no `--log-file`, TUI prefers `journalctl -u <unit-name>` (default unit: `liquidator.service`).
+- If that unit is inactive on Linux, TUI may auto-tail `<temp>/liquidator/liquidator.log` if the file exists and was updated recently.
+- On non-Linux systems without `--log-file`, TUI tails `<temp>/liquidator/liquidator.log` if present, otherwise it shows a no-log-source notice.
 
 **Key bindings:**
-- `r` — start/pause
+- `r` — pause/resume
 - `b` — refresh balances
 - `p` — refresh profits
 - `w` — withdraw (from balances)
@@ -507,6 +535,66 @@ RUST_LOG=info ./target/release/liquidator run
 
 In `plain-logs` builds, interactive withdraw prompts are disabled; use non-interactive `liquidator withdraw --source ... --destination ... --asset ... --amount ...` flags.
 
+### Daemon + systemd Example
+
+Use the sample unit at `dev/liquidator.service`:
+
+```ini
+[Service]
+RuntimeDirectory=liquidator
+RuntimeDirectoryMode=0770
+ExecStart=/home/liquidator/.local/bin/liquidator run --sock-path /run/liquidator/ctl.sock
+Restart=always
+```
+
+Use an absolute binary path in `ExecStart` (systemd does not expand `~`).
+If you installed with `install.sh`, the typical binary entrypoint is `~/.local/bin/liquidator` for that user; resolve it with `command -v liquidator` and place that absolute path in the unit.
+
+Validate daemon logs:
+
+```bash
+journalctl -u liquidator.service -f -o short
+```
+
+Attach the TUI at any time:
+
+```bash
+liquidator tui --sock-path /run/liquidator/ctl.sock --unit-name liquidator.service
+```
+
+Convenience installer for Linux:
+
+```bash
+./dev/install-daemon.sh
+```
+
+`install-daemon.sh` requires sudo/root because it writes `/etc/systemd/system/*.service`,
+may create the `liquidator` user/group, runs `systemctl daemon-reload`, enables the unit,
+and restarts it.
+
+This installs/updates `/etc/systemd/system/liquidator.service`, creates the
+`liquidator` user/group if missing, runs `systemctl daemon-reload`, enables the
+unit, and restarts it.
+
+How binary path is handled:
+- `install-daemon.sh` does **not** copy the binary into `/usr/local/bin`.
+- It uses `--bin-path` if provided; otherwise it uses `command -v liquidator` and writes that absolute path into `ExecStart`.
+- The separate `install.sh` script builds a release binary under `~/.liquidium-pipeline/releases/...` and symlinks `~/.local/bin/liquidator` to it.
+
+Linux non-service mode with file tail:
+
+```bash
+liquidator run --log-file
+liquidator tui
+```
+
+On macOS/dev, use file fallback explicitly:
+
+```bash
+liquidator run --log-file ./liquidator.log
+liquidator tui --log-file ./liquidator.log
+```
+
 ---
 
 ## Security
@@ -523,6 +611,8 @@ In `plain-logs` builds, interactive withdraw prompts are disabled; use non-inter
 - CEX calls failing in `hybrid`/`cex` mode: verify `CEX_MEXC_API_KEY` and `CEX_MEXC_API_SECRET`.
 - Noisy terminal output in containerized logging stacks: build and run with `--features plain-logs`.
 - Missing diagnostic detail: rerun with `RUST_LOG=debug`.
+- Runtime socket permission mismatch under systemd: run `systemctl daemon-reload` and restart `liquidator.service`; ensure `RuntimeDirectory=liquidator` and `RuntimeDirectoryMode=0770` are set on the active unit.
+- `liquidator run` exits immediately saying systemd unit is already active: this is intentional duplicate-daemon protection; stop the unit first or use `liquidator tui` to attach.
 
 ## Notes
 

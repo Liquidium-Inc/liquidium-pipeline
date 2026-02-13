@@ -10,7 +10,7 @@ use crate::{
     error::{AppError, AppResult, error_codes},
     executors::{basic::basic_executor::BasicExecutor, executor::ExecutorRequest},
     finalizers::{finalizer::FinalizerResult, liquidation_outcome::LiquidationOutcome},
-    persistance::{LiqMetaWrapper, LiqResultRecord, ResultStatus, WalStore},
+    persistance::{LiqMetaWrapper, LiqResultRecord, ResultStatus, WalProfitSnapshot, WalStore},
     stage::PipelineStage,
     utils::now_ts,
     wal::{encode_meta, liq_id_from_receipt},
@@ -220,6 +220,13 @@ impl<A: PipelineAgent, D: WalStore> BasicExecutor<A, D> {
             receipt: receipt.clone(),
             meta: Vec::new(),
             finalizer_decision: None,
+            profit_snapshot: Some(WalProfitSnapshot {
+                expected_profit_raw: executor_request.expected_profit.to_string(),
+                realized_profit_raw: None,
+                debt_symbol: executor_request.debt_asset.symbol().to_string(),
+                debt_decimals: executor_request.debt_asset.decimals(),
+                updated_at: now_ts(),
+            }),
         };
         let _ = encode_meta(&mut result_record, &wrapper);
         self.wal

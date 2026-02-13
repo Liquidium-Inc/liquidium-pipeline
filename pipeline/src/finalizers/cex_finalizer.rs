@@ -740,6 +740,7 @@ mod tests {
             receipt: receipt.clone(),
             meta: Vec::new(),
             finalizer_decision: None,
+            profit_snapshot: None,
         };
 
         let mut row = LiqResultRecord {
@@ -781,6 +782,7 @@ mod tests {
             receipt: receipt.clone(),
             meta: Vec::new(),
             finalizer_decision: None,
+            profit_snapshot: None,
         };
 
         let mut row = LiqResultRecord {
@@ -931,6 +933,7 @@ mod tests {
             receipt: receipt.clone(),
             meta: serde_json::to_vec(&legacy_value).expect("legacy meta encoding"),
             finalizer_decision: None,
+            profit_snapshot: None,
         };
 
         let mut row = LiqResultRecord {

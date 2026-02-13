@@ -81,10 +81,13 @@ where
                 source: e.to_string(),
             })?;
 
-        let fee = icp_backend.icrc1_fee(ledger).await.map_err(|e| RegistryLoadError::MissingIcpFee {
-            spec: spec.to_string(),
-            source: e.to_string(),
-        })?;
+        let fee = icp_backend
+            .icrc1_fee(ledger)
+            .await
+            .map_err(|e| RegistryLoadError::MissingIcpFee {
+                spec: spec.to_string(),
+                source: e.to_string(),
+            })?;
 
         Ok(ChainToken::Icp {
             ledger,
@@ -203,10 +206,7 @@ mod tests {
                 std::env::set_var("DEBT_ASSETS", debt);
                 std::env::set_var("COLLATERAL_ASSETS", coll);
             }
-            Self {
-                debt_prev,
-                coll_prev,
-            }
+            Self { debt_prev, coll_prev }
         }
     }
 

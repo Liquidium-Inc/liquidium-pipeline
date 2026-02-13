@@ -9,7 +9,7 @@ use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, Wrap};
 use serde_json::Value;
 
 use crate::finalizers::liquidation_outcome::LiquidationOutcome;
-use crate::persistance::{LiqMetaWrapper, ResultStatus};
+use crate::persistance::{LiqMetaWrapper, ResultStatus, WalProfitSnapshot};
 use crate::stages::executor::{ExecutionReceipt, ExecutionStatus};
 use crate::wal::liq_id_from_receipt;
 
@@ -532,6 +532,12 @@ fn format_ts(secs: i64) -> String {
 }
 
 fn profit_cell_for_row(row: &ExecutionRowData, app: &App) -> Cell<'static> {
+    if let Some(snapshot) = profit_snapshot_from_meta(&row.meta_json)
+        && let Some((formatted, style)) = profit_display_from_snapshot(&snapshot)
+    {
+        return Cell::new(formatted).style(style);
+    }
+
     if let Some(outcome) = latest_outcome_for(app, &row.liq_id) {
         let delta = outcome.realized_profit - outcome.expected_profit;
         let style = profit_style_from_delta(delta);
@@ -545,6 +551,31 @@ fn profit_cell_for_row(row: &ExecutionRowData, app: &App) -> Cell<'static> {
     }
 
     Cell::new("-").style(Style::default().fg(Color::DarkGray))
+}
+
+fn profit_snapshot_from_meta(raw: &str) -> Option<WalProfitSnapshot> {
+    if raw.trim().is_empty() || raw.trim() == "{}" {
+        return None;
+    }
+    serde_json::from_str::<LiqMetaWrapper>(raw)
+        .ok()
+        .and_then(|wrapper| wrapper.profit_snapshot)
+}
+
+fn profit_display_from_snapshot(snapshot: &WalProfitSnapshot) -> Option<(String, Style)> {
+    let expected = snapshot.expected_profit_raw.parse::<i128>().ok()?;
+    let symbol = snapshot.debt_symbol.as_str();
+    let decimals = snapshot.debt_decimals;
+
+    if let Some(realized_raw) = snapshot.realized_profit_raw.as_deref()
+        && let Ok(realized) = realized_raw.parse::<i128>()
+    {
+        let style = profit_style_from_delta(realized - expected);
+        return Some((format_profit(realized, decimals, symbol), style));
+    }
+
+    let style = profit_style_from_delta(expected);
+    Some((format_profit(expected, decimals, symbol), style))
 }
 
 fn latest_outcome_for<'a>(app: &'a App, liq_id: &str) -> Option<&'a LiquidationOutcome> {
@@ -594,7 +625,8 @@ fn format_profit(amount: i128, decimals: u8, symbol: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::truncate;
+    use super::{WalProfitSnapshot, profit_display_from_snapshot, truncate};
+    use ratatui::style::Color;
 
     #[test]
     fn truncate_no_change_when_within_limit() {
@@ -620,5 +652,48 @@ mod tests {
     fn truncate_handles_multibyte_utf8_without_panic() {
         assert_eq!(truncate("é漢🧪abc", 4), "é...");
         assert_eq!(truncate("é漢🧪abc", 5), "é漢...");
+    }
+
+    #[test]
+    fn profit_snapshot_prefers_realized_and_colors_by_delta() {
+        let snapshot = WalProfitSnapshot {
+            expected_profit_raw: "1000".to_string(),
+            realized_profit_raw: Some("1200".to_string()),
+            debt_symbol: "ckUSDT".to_string(),
+            debt_decimals: 2,
+            updated_at: 0,
+        };
+
+        let (text, style) = profit_display_from_snapshot(&snapshot).expect("display should parse");
+        assert_eq!(text, "12 ckUSDT");
+        assert_eq!(style.fg, Some(Color::Green));
+    }
+
+    #[test]
+    fn profit_snapshot_falls_back_to_expected_when_realized_missing() {
+        let snapshot = WalProfitSnapshot {
+            expected_profit_raw: "-250".to_string(),
+            realized_profit_raw: None,
+            debt_symbol: "ckUSDT".to_string(),
+            debt_decimals: 2,
+            updated_at: 0,
+        };
+
+        let (text, style) = profit_display_from_snapshot(&snapshot).expect("display should parse");
+        assert_eq!(text, "-2.5 ckUSDT");
+        assert_eq!(style.fg, Some(Color::Red));
+    }
+
+    #[test]
+    fn malformed_profit_snapshot_returns_none() {
+        let snapshot = WalProfitSnapshot {
+            expected_profit_raw: "not-a-number".to_string(),
+            realized_profit_raw: Some("1200".to_string()),
+            debt_symbol: "ckUSDT".to_string(),
+            debt_decimals: 2,
+            updated_at: 0,
+        };
+
+        assert!(profit_display_from_snapshot(&snapshot).is_none());
     }
 }

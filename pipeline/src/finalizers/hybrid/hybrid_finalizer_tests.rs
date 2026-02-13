@@ -107,6 +107,7 @@ impl TestWal {
             receipt: receipt.clone(),
             meta: Vec::new(),
             finalizer_decision: None,
+            profit_snapshot: None,
         })
     }
 
@@ -115,6 +116,7 @@ impl TestWal {
             receipt: receipt.clone(),
             meta,
             finalizer_decision: None,
+            profit_snapshot: None,
         })
     }
 
