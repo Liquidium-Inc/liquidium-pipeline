@@ -5,6 +5,7 @@ use chrono::{DateTime, Local};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 
 use crate::commands::liquidation_loop::LoopControl;
+use crate::error::AppError;
 use crate::finalizers::liquidation_outcome::LiquidationOutcome;
 use crate::persistance::ResultStatus;
 use liquidium_pipeline_connectors::backend::cex_backend::DepositAddress;
@@ -178,7 +179,7 @@ pub(super) struct WithdrawState {
     pub(super) editing: Option<WithdrawField>,
     pub(super) edit_backup: Option<String>,
     pub(super) in_flight: bool,
-    pub(super) last_result: Option<Result<String, String>>,
+    pub(super) last_result: Option<Result<String, AppError>>,
 }
 
 impl WithdrawState {
@@ -219,7 +220,7 @@ pub(super) struct DepositState {
     pub(super) asset: Option<AssetId>,
     pub(super) network: Option<String>,
     pub(super) at: Option<DateTime<Local>>,
-    pub(super) last: Option<Result<DepositAddress, String>>,
+    pub(super) last: Option<Result<DepositAddress, AppError>>,
 }
 
 pub(super) struct App {
@@ -249,17 +250,17 @@ pub(super) struct App {
     pub(super) last_tick: Instant,
 
     pub(super) wal: Option<WalSnapshot>,
-    pub(super) wal_error: Option<String>,
+    pub(super) wal_error: Option<AppError>,
 
     pub(super) balances: Option<BalancesSnapshot>,
-    pub(super) balances_error: Option<String>,
+    pub(super) balances_error: Option<AppError>,
     pub(super) balances_selected: usize,
 
     pub(super) profits: Option<ProfitsSnapshot>,
-    pub(super) profits_error: Option<String>,
+    pub(super) profits_error: Option<AppError>,
 
     pub(super) executions: Option<ExecutionsSnapshot>,
-    pub(super) executions_error: Option<String>,
+    pub(super) executions_error: Option<AppError>,
     pub(super) executions_selected: usize,
     pub(super) executions_details_scroll: u16,
 

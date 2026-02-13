@@ -5,6 +5,7 @@ use candid::{Encode, Principal};
 use liquidium_pipeline_connectors::pipeline_agent::PipelineAgent;
 use liquidium_pipeline_core::types::protocol_types::{AssetType, LiquidatebleUser, ScanResult};
 
+use crate::error::AppResult;
 use crate::stage::PipelineStage;
 
 pub struct OpportunityFinder<A: PipelineAgent> {
@@ -28,7 +29,7 @@ impl<'a, A> PipelineStage<'a, Vec<String>, Vec<LiquidatebleUser>> for Opportunit
 where
     A: PipelineAgent,
 {
-    async fn process(&self, supported_assets: &'a Vec<String>) -> Result<Vec<LiquidatebleUser>, String> {
+    async fn process(&self, supported_assets: &'a Vec<String>) -> AppResult<Vec<LiquidatebleUser>> {
         let max_results: u64 = 500; // stop once we find this many risky users
         let scan_limit: u64 = 100; // how many accounts to scan per call
 

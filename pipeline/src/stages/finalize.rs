@@ -5,6 +5,7 @@ use async_trait::async_trait;
 use candid::{Encode, Principal};
 use tracing::{debug, info, warn};
 
+use crate::error::AppResult;
 use crate::finalizers::finalizer::{Finalizer, FinalizerResult};
 use crate::finalizers::liquidation_outcome::LiquidationOutcome;
 use crate::finalizers::profit_calculator::ProfitCalculator;
@@ -87,7 +88,7 @@ where
         }
     }
 
-    async fn refresh_liquidation(&self, liq_id: u128) -> Result<LiquidationResult, String> {
+    async fn refresh_liquidation(&self, liq_id: u128) -> AppResult<LiquidationResult> {
         let args = Encode!(&liq_id).map_err(|e| format!("get_liquidation encode error: {e}"))?;
         let res = self
             .agent
@@ -95,12 +96,12 @@ where
             .await?;
         match res {
             Ok(liq) => Ok(liq),
-            Err(err) => Err(format!("get_liquidation error: {err:?}")),
+            Err(err) => Err(format!("get_liquidation error: {err:?}").into()),
         }
     }
 
-    async fn update_receipt_meta(&self, liq_id: &str, receipt: &ExecutionReceipt) -> Result<(), String> {
-        let row = self.wal.get_result(liq_id).await.map_err(|e| e.to_string())?;
+    async fn update_receipt_meta(&self, liq_id: &str, receipt: &ExecutionReceipt) -> AppResult<()> {
+        let row = self.wal.get_result(liq_id).await?;
         if let Some(mut row) = row {
             let wrapper = LiqMetaWrapper {
                 receipt: receipt.clone(),
@@ -109,7 +110,7 @@ where
             };
             encode_meta(&mut row, &wrapper)?;
             row.updated_at = now_ts();
-            self.wal.upsert_result(row).await.map_err(|e| e.to_string())?;
+            self.wal.upsert_result(row).await?;
         }
         Ok(())
     }
@@ -123,9 +124,9 @@ where
     P: ProfitCalculator + Sync + Send,
     A: PipelineAgent + Sync + Send,
 {
-    async fn process(&self, _: &'a ()) -> Result<Vec<LiquidationOutcome>, String> {
+    async fn process(&self, _: &'a ()) -> AppResult<Vec<LiquidationOutcome>> {
         // Load pending entries from WAL
-        let rows = self.wal.get_pending(100).await.map_err(|e| e.to_string())?;
+        let rows = self.wal.get_pending(100).await?;
         debug!("Finalizing rows {:?}", rows);
         if rows.is_empty() {
             return Ok(vec![]);
@@ -286,7 +287,7 @@ where
 
                     debug!("Failed finalization {}", err_msg);
                     if next_errors >= MAX_FINALIZER_ERRORS {
-                        let _ = wal_mark_permanent_failed(&*self.wal, wal_id, err_msg.clone()).await;
+                        let _ = wal_mark_permanent_failed(&*self.wal, wal_id, err_msg.clone().into()).await;
 
                         let mut failed_receipt = receipt.clone();
                         failed_receipt.status =
@@ -301,7 +302,7 @@ where
                             failed_receipt,
                         ));
                     } else {
-                        let _ = wal_mark_retryable_failed(&*self.wal, wal_id, err_msg.clone()).await;
+                        let _ = wal_mark_retryable_failed(&*self.wal, wal_id, err_msg.clone().into()).await;
                     }
 
                     debug!("Finalization failed for receipt; continuing: {}", err_msg);
@@ -371,7 +372,7 @@ mod tests {
 
     #[async_trait::async_trait]
     impl Finalizer for NoopFinalizer {
-        async fn finalize(&self, _: &dyn WalStore, _: ExecutionReceipt) -> Result<FinalizerResult, String> {
+        async fn finalize(&self, _: &dyn WalStore, _: ExecutionReceipt) -> AppResult<FinalizerResult> {
             let mut calls = self.calls.lock().unwrap();
             *calls += 1;
             Ok(FinalizerResult {

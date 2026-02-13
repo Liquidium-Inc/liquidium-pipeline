@@ -8,6 +8,7 @@ use tracing::instrument;
 use tracing::{info, warn};
 
 use crate::config::SwapperMode;
+use crate::error::AppResult;
 use crate::persistance::{LiqMetaWrapper, LiqResultRecord, ResultStatus, WalStore};
 use crate::stages::executor::ExecutionReceipt;
 use crate::stages::executor::ExecutionStatus;
@@ -66,17 +67,15 @@ where
         }
     }
 
-    async fn tick(&self) -> Result<(), String> {
+    async fn tick(&self) -> AppResult<()> {
         let mut rows = self
             .wal
             .list_by_status(ResultStatus::WaitingCollateral, 100)
-            .await
-            .map_err(|e| e.to_string())?;
+            .await?;
         let mut profit_rows = self
             .wal
             .list_by_status(ResultStatus::WaitingProfit, 100)
-            .await
-            .map_err(|e| e.to_string())?;
+            .await?;
         rows.append(&mut profit_rows);
 
         for row in rows {
@@ -88,7 +87,7 @@ where
     }
 
     #[instrument(name = "settlement.process_row", skip_all, err, fields(row_id = %row.id))]
-    async fn process_row(&self, row: LiqResultRecord) -> Result<(), String> {
+    async fn process_row(&self, row: LiqResultRecord) -> AppResult<()> {
         let meta = decode_receipt_wrapper(&row)?
             .ok_or_else(|| format!("receipt not found in WAL meta_json for {}", row.id))?;
         let mut receipt: ExecutionReceipt = meta.receipt;
@@ -131,8 +130,7 @@ where
             if row.status != ResultStatus::WaitingCollateral {
                 self.wal
                     .update_status(&row.id, ResultStatus::WaitingCollateral, false)
-                    .await
-                    .map_err(|e| e.to_string())?;
+                    .await?;
             }
             return Ok(());
         }
@@ -140,16 +138,14 @@ where
         if receipt.request.swap_args.is_none() {
             self.wal
                 .update_status(&row.id, ResultStatus::Succeeded, true)
-                .await
-                .map_err(|e| e.to_string())?;
+                .await?;
             return Ok(());
         }
 
         if receipt.request.liquidation.buy_bad_debt {
             self.wal
                 .update_status(&row.id, ResultStatus::Enqueued, true)
-                .await
-                .map_err(|e| e.to_string())?;
+                .await?;
             return Ok(());
         }
 
@@ -158,8 +154,7 @@ where
         if !matches!(self.swapper_mode, SwapperMode::Dex) {
             self.wal
                 .update_status(&row.id, ResultStatus::Enqueued, true)
-                .await
-                .map_err(|e| e.to_string())?;
+                .await?;
             info!(
                 "[settlement] ✅ liq_id={} mode={:?} -> enqueued without DEX quote gate",
                 liq.id, self.swapper_mode
@@ -188,8 +183,7 @@ where
         if profitable {
             self.wal
                 .update_status(&row.id, ResultStatus::Enqueued, true)
-                .await
-                .map_err(|e| e.to_string())?;
+                .await?;
             info!("[settlement] ✅ liq_id={} profitable -> enqueued", liq.id);
             return Ok(());
         }
@@ -197,12 +191,11 @@ where
         self.handle_unprofitable(&row, liq.id).await
     }
 
-    async fn handle_unprofitable(&self, row: &LiqResultRecord, liq_id: u128) -> Result<(), String> {
+    async fn handle_unprofitable(&self, row: &LiqResultRecord, liq_id: u128) -> AppResult<()> {
         if row.status != ResultStatus::WaitingProfit {
             self.wal
                 .update_status(&row.id, ResultStatus::WaitingProfit, false)
-                .await
-                .map_err(|e| e.to_string())?;
+                .await?;
             info!("[settlement] ⏳ liq_id={} not profitable -> waiting", liq_id);
             return Ok(());
         }
@@ -213,17 +206,16 @@ where
                 .update_failure(
                     &row.id,
                     ResultStatus::FailedPermanent,
-                    "unprofitable after 180s".to_string(),
+                    "unprofitable after 180s".into(),
                     true,
                 )
-                .await
-                .map_err(|e| e.to_string())?;
+                .await?;
             warn!("[settlement] ❌ liq_id={} unprofitable > 180s -> failed", liq_id);
         }
         Ok(())
     }
 
-    async fn refresh_liquidation(&self, liq_id: u128) -> Result<LiquidationResult, String> {
+    async fn refresh_liquidation(&self, liq_id: u128) -> AppResult<LiquidationResult> {
         let args = Encode!(&liq_id).map_err(|e| format!("get_liquidation encode error: {e}"))?;
         let res = self
             .agent
@@ -231,7 +223,7 @@ where
             .await?;
         match res {
             Ok(liq) => Ok(liq),
-            Err(err) => Err(format!("get_liquidation error: {err:?}")),
+            Err(err) => Err(format!("get_liquidation error: {err:?}").into()),
         }
     }
 
@@ -240,7 +232,7 @@ where
         row: &LiqResultRecord,
         receipt: &ExecutionReceipt,
         touch: bool,
-    ) -> Result<(), String> {
+    ) -> AppResult<()> {
         let mut row = row.clone();
         let wrapper = LiqMetaWrapper {
             receipt: receipt.clone(),
@@ -251,7 +243,7 @@ where
         if touch {
             row.updated_at = now_ts();
         }
-        self.wal.upsert_result(row).await.map_err(|e| e.to_string())?;
+        self.wal.upsert_result(row).await?;
         Ok(())
     }
 }
@@ -580,7 +572,7 @@ mod tests {
             .with(
                 eq(row_id.clone()),
                 eq(ResultStatus::FailedPermanent),
-                eq("unprofitable after 180s".to_string()),
+                eq(crate::error::AppError::from("unprofitable after 180s")),
                 eq(true),
             )
             .times(1)

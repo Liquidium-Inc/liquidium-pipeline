@@ -6,8 +6,9 @@ use liquidium_pipeline_core::tokens::{asset_id::AssetId, chain_token_amount::Cha
 
 use crate::config::ConfigTrait;
 use crate::context::init_context;
+use crate::error::AppResult;
 use crate::output::plain_logs_enabled;
-pub async fn funds() -> Result<(), String> {
+pub async fn funds() -> AppResult<()> {
     let ctx = init_context().await?;
 
     const HEADER_LABEL_WIDTH: usize = 22;
@@ -104,7 +105,7 @@ pub async fn funds() -> Result<(), String> {
     Ok(())
 }
 
-fn format_balance_result(res: Option<&Result<(AssetId, ChainTokenAmount), String>>) -> String {
+fn format_balance_result(res: Option<&AppResult<(AssetId, ChainTokenAmount)>>) -> String {
     match res {
         Some(Ok((_, bal))) => format_chain_balance(bal),
         Some(Err(e)) => format!("error: {}", e),

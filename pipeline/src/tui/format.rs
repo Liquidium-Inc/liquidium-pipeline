@@ -1,7 +1,8 @@
+use crate::error::AppError;
 use liquidium_pipeline_core::tokens::asset_id::AssetId;
 use liquidium_pipeline_core::tokens::chain_token_amount::ChainTokenAmount;
 
-pub(super) fn format_balance_result(res: Option<&Result<(AssetId, ChainTokenAmount), String>>) -> String {
+pub(super) fn format_balance_result(res: Option<&Result<(AssetId, ChainTokenAmount), AppError>>) -> String {
     match res {
         Some(Ok((_, bal))) => format_chain_balance(bal),
         Some(Err(e)) => format!("err: {}", e),

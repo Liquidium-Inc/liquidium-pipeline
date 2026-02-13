@@ -35,6 +35,7 @@ use crate::{
     swappers::{mexc::mexc_adapter::MexcClient, router::SwapRouter},
     watchdog::{WatchdogEvent, account_monitor_watchdog, webhook_watchdog_from_env},
 };
+use crate::error::AppResult;
 use ic_agent::Agent;
 
 use liquidium_pipeline_core::tokens::{
@@ -569,7 +570,7 @@ pub async fn run_liquidation_loop_controlled(
     ctx: Arc<PipelineContext>,
     mut control_rx: watch::Receiver<LoopControl>,
     event_tx: mpsc::UnboundedSender<LoopEvent>,
-) -> Result<(), String> {
+) -> AppResult<()> {
     let config = ctx.config.clone();
 
     let (finder, strategy, executor, exporter, finalizer) = init(ctx.clone()).await?;

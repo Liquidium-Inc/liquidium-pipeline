@@ -4,6 +4,7 @@ use async_trait::async_trait;
 use csv::WriterBuilder;
 use serde::Serialize;
 
+use crate::error::AppResult;
 use crate::{finalizers::liquidation_outcome::LiquidationOutcome, stage::PipelineStage};
 
 pub struct ExportStage {
@@ -31,7 +32,7 @@ struct ExecutionAnalyticsRow {
 
 #[async_trait]
 impl<'a> PipelineStage<'a, Vec<LiquidationOutcome>, ()> for ExportStage {
-    async fn process(&self, input: &'a Vec<LiquidationOutcome>) -> Result<(), String> {
+    async fn process(&self, input: &'a Vec<LiquidationOutcome>) -> AppResult<()> {
         let file = OpenOptions::new()
             .create(true)
             .append(true)

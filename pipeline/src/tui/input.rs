@@ -509,7 +509,7 @@ pub(super) async fn handle_key(
                 let res = tokio::task::spawn_blocking(move || compute_profits_snapshot(&export_path, &registry)).await;
                 let msg = match res {
                     Ok(v) => UiEvent::Profits(v),
-                    Err(e) => UiEvent::Profits(Err(format!("profit task failed: {e}"))),
+                    Err(e) => UiEvent::Profits(Err(format!("profit task failed: {e}").into())),
                 };
                 let _ = ui_tx.send(msg);
             });

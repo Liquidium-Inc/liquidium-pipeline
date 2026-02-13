@@ -2,11 +2,12 @@ use liquidium_pipeline_core::types::protocol_types::LiquidationResult;
 use serde::Serialize;
 
 use crate::{
+    error::{AppError, AppResult, error_codes},
     persistance::{LiqMetaWrapper, LiqResultRecord, ResultStatus, WalStore},
     stages::executor::ExecutionReceipt,
 };
 
-pub fn decode_receipt_wrapper(row: &LiqResultRecord) -> Result<Option<LiqMetaWrapper>, String> {
+pub fn decode_receipt_wrapper(row: &LiqResultRecord) -> AppResult<Option<LiqMetaWrapper>> {
     if row.meta_json.is_empty() || row.meta_json == "{}" {
         return Ok(None);
     }
@@ -19,17 +20,19 @@ pub fn decode_receipt_wrapper(row: &LiqResultRecord) -> Result<Option<LiqMetaWra
                 meta: Vec::new(),
                 finalizer_decision: None,
             })),
-            Err(receipt_err) => Err(format!(
+            Err(receipt_err) => Err(AppError::from_def(error_codes::SERIALIZATION_ERROR).with_context(format!(
                 "invalid meta_json for {}: wrapper_err={}; receipt_err={}",
                 row.id, wrapper_err, receipt_err
-            )),
+            ))),
         },
     }
 }
 
-pub fn encode_meta<T: Serialize>(row: &mut LiqResultRecord, meta: &T) -> Result<(), String> {
-    row.meta_json =
-        serde_json::to_string(meta).map_err(|e| format!("failed to serialize meta_json for {}: {}", row.id, e))?;
+pub fn encode_meta<T: Serialize>(row: &mut LiqResultRecord, meta: &T) -> AppResult<()> {
+    row.meta_json = serde_json::to_string(meta).map_err(|e| {
+        AppError::from_def(error_codes::SERIALIZATION_ERROR)
+            .with_context(format!("failed to serialize meta_json for {}: {}", row.id, e))
+    })?;
     Ok(())
 }
 
@@ -37,11 +40,13 @@ pub fn encode_meta<T: Serialize>(row: &mut LiqResultRecord, meta: &T) -> Result<
 // Helper to extract liq_id from ExecutionReceipt
 //
 
-pub fn liq_id_from_receipt(receipt: &ExecutionReceipt) -> Result<String, String> {
+pub fn liq_id_from_receipt(receipt: &ExecutionReceipt) -> AppResult<String> {
     let liq: &LiquidationResult = receipt
         .liquidation_result
         .as_ref()
-        .ok_or_else(|| "missing liquidation_result in receipt".to_string())?;
+        .ok_or_else(|| {
+            AppError::from_def(error_codes::INVALID_INPUT).with_context("missing liquidation_result in receipt")
+        })?;
 
     Ok(liq.id.to_string())
 }
@@ -49,38 +54,33 @@ pub fn liq_id_from_receipt(receipt: &ExecutionReceipt) -> Result<String, String>
 //
 // WAL wrappers for finalizer
 //
-pub async fn wal_load(wal: &dyn WalStore, liq_id: &str) -> Result<Option<LiqResultRecord>, String> {
-    wal.get_result(liq_id).await.map_err(|e| e.to_string())
+pub async fn wal_load(wal: &dyn WalStore, liq_id: &str) -> AppResult<Option<LiqResultRecord>> {
+    wal.get_result(liq_id).await
 }
 
-pub async fn wal_mark_inflight(wal: &dyn WalStore, liq_id: &str) -> Result<(), String> {
+pub async fn wal_mark_inflight(wal: &dyn WalStore, liq_id: &str) -> AppResult<()> {
     wal.update_status(liq_id, ResultStatus::InFlight, true)
         .await
-        .map_err(|e| e.to_string())
 }
 
-pub async fn wal_mark_succeeded(wal: &dyn WalStore, liq_id: &str) -> Result<(), String> {
+pub async fn wal_mark_succeeded(wal: &dyn WalStore, liq_id: &str) -> AppResult<()> {
     wal.update_status(liq_id, ResultStatus::Succeeded, true)
         .await
-        .map_err(|e| e.to_string())
 }
 
-pub async fn wal_mark_retryable_failed(wal: &dyn WalStore, liq_id: &str, last_error: String) -> Result<(), String> {
+pub async fn wal_mark_retryable_failed(wal: &dyn WalStore, liq_id: &str, last_error: AppError) -> AppResult<()> {
     wal.update_failure(liq_id, ResultStatus::FailedRetryable, last_error, true)
         .await
-        .map_err(|e| e.to_string())
 }
 
-pub async fn wal_mark_permanent_failed(wal: &dyn WalStore, liq_id: &str, last_error: String) -> Result<(), String> {
+pub async fn wal_mark_permanent_failed(wal: &dyn WalStore, liq_id: &str, last_error: AppError) -> AppResult<()> {
     wal.update_failure(liq_id, ResultStatus::FailedPermanent, last_error, true)
         .await
-        .map_err(|e| e.to_string())
 }
 
-pub async fn wal_mark_enqueued(wal: &dyn WalStore, liq_id: &str) -> Result<(), String> {
+pub async fn wal_mark_enqueued(wal: &dyn WalStore, liq_id: &str) -> AppResult<()> {
     wal.update_status(liq_id, ResultStatus::Enqueued, true)
         .await
-        .map_err(|e| e.to_string())
 }
 
 #[cfg(test)]

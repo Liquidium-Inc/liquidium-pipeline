@@ -233,7 +233,7 @@ mod tests {
 
         let mut icp = MockIcpBackend::new();
         icp.expect_icrc1_decimals()
-            .returning(|_| Err("decimals-failed".to_string()));
+            .returning(|_| Err("decimals-failed".into()));
 
         let evm = MockEvmBackend::new();
 
@@ -244,7 +244,7 @@ mod tests {
         match err {
             RegistryLoadError::MissingIcpDecimals { spec, source } => {
                 assert_eq!(spec, "icp:aaaaa-aa:ICP");
-                assert_eq!(source, "decimals-failed");
+                assert!(source.contains("decimals-failed"));
             }
             other => panic!("unexpected error: {other:?}"),
         }
@@ -258,7 +258,7 @@ mod tests {
         let mut icp = MockIcpBackend::new();
         icp.expect_icrc1_decimals().returning(|_| Ok(8));
         icp.expect_icrc1_fee()
-            .returning(|_| Err("fee-failed".to_string()));
+            .returning(|_| Err("fee-failed".into()));
 
         let evm = MockEvmBackend::new();
 
@@ -269,7 +269,7 @@ mod tests {
         match err {
             RegistryLoadError::MissingIcpFee { spec, source } => {
                 assert_eq!(spec, "icp:aaaaa-aa:ICP");
-                assert_eq!(source, "fee-failed");
+                assert!(source.contains("fee-failed"));
             }
             other => panic!("unexpected error: {other:?}"),
         }

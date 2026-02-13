@@ -1,4 +1,5 @@
 use super::*;
+use crate::error::AppResult;
 
 struct PendingSliceRequest {
     requested_in: f64,
@@ -18,7 +19,7 @@ where
     C: CexBackend,
 {
     /// Phase-B deposit confirmation by balance delta against the captured baseline.
-    pub(super) async fn check_deposit(&self, state: &mut CexState) -> Result<(), String> {
+    pub(super) async fn check_deposit(&self, state: &mut CexState) -> AppResult<()> {
         let symbol = state.deposit.deposit_asset.symbol();
         let current_balance = self.backend.get_balance(&symbol).await?;
 
@@ -57,7 +58,7 @@ where
         Ok(())
     }
 
-    async fn resolve_direct_leg(&self, deposit_symbol: &str, withdraw_symbol: &str) -> Result<TradeLeg, String> {
+    async fn resolve_direct_leg(&self, deposit_symbol: &str, withdraw_symbol: &str) -> AppResult<TradeLeg> {
         let deposit = deposit_symbol.to_ascii_uppercase();
         let withdraw = withdraw_symbol.to_ascii_uppercase();
 
@@ -104,11 +105,12 @@ where
             deposit,
             withdraw,
             errors.join(" | ")
-        ))
+        )
+        .into())
     }
 
     /// Resolve one or more market legs for deposit-asset -> withdraw-asset conversion.
-    pub(super) async fn resolve_trade_legs(&self, state: &CexState) -> Result<Vec<TradeLeg>, String> {
+    pub(super) async fn resolve_trade_legs(&self, state: &CexState) -> AppResult<Vec<TradeLeg>> {
         let deposit = state.deposit.deposit_asset.symbol();
         let withdraw = state.withdraw.withdraw_asset.symbol();
 
@@ -134,7 +136,7 @@ where
     }
 
     /// Convert an amount in `symbol` units to USD for min-notional checks.
-    async fn amount_symbol_to_usd(&self, symbol: &str, amount: f64) -> Result<f64, String> {
+    async fn amount_symbol_to_usd(&self, symbol: &str, amount: f64) -> AppResult<f64> {
         if amount <= 0.0 {
             return Ok(0.0);
         }
@@ -151,7 +153,7 @@ where
                     .await?;
                 let best_bid = orderbook.bids.first().map(|l| l.price).unwrap_or(0.0);
                 if best_bid <= 0.0 {
-                    return Err("cannot convert BTC to USD: BTC_USDC has no bids".to_string());
+                    return Err("cannot convert BTC to USD: BTC_USDC has no bids".into());
                 }
                 Ok(amount * best_bid)
             }
@@ -163,7 +165,7 @@ where
                     .await?;
                 let best_ckbtc_bid_btc = ckb_btc.bids.first().map(|l| l.price).unwrap_or(0.0);
                 if best_ckbtc_bid_btc <= 0.0 {
-                    return Err("cannot convert CKBTC to USD: CKBTC_BTC has no bids".to_string());
+                    return Err("cannot convert CKBTC to USD: CKBTC_BTC has no bids".into());
                 }
                 let btc_amount = amount * best_ckbtc_bid_btc;
                 let btc_usdc = self
@@ -172,7 +174,7 @@ where
                     .await?;
                 let best_btc_bid = btc_usdc.bids.first().map(|l| l.price).unwrap_or(0.0);
                 if best_btc_bid <= 0.0 {
-                    return Err("cannot convert CKBTC to USD: BTC_USDC has no bids".to_string());
+                    return Err("cannot convert CKBTC to USD: BTC_USDC has no bids".into());
                 }
                 Ok(btc_amount * best_btc_bid)
             }
@@ -183,7 +185,7 @@ where
                     .await?;
                 let best_bid = orderbook.bids.first().map(|l| l.price).unwrap_or(0.0);
                 if best_bid <= 0.0 {
-                    return Err("cannot convert CKUSDT to USD: CKUSDT_USDT has no bids".to_string());
+                    return Err("cannot convert CKUSDT to USD: CKUSDT_USDT has no bids".into());
                 }
                 Ok(amount * best_bid)
             }
@@ -194,16 +196,16 @@ where
                     .await?;
                 let best_bid = orderbook.bids.first().map(|l| l.price).unwrap_or(0.0);
                 if best_bid <= 0.0 {
-                    return Err("cannot convert CKUSDC to USD: CKUSDC_USDC has no bids".to_string());
+                    return Err("cannot convert CKUSDC to USD: CKUSDC_USDC has no bids".into());
                 }
                 Ok(amount * best_bid)
             }
-            _ => Err(format!("cannot convert {} to USD: unsupported quote", symbol)),
+            _ => Err(format!("cannot convert {} to USD: unsupported quote", symbol).into()),
         }
     }
 
     /// Estimate USD notional of one input slice for a given market/side.
-    pub(super) async fn input_slice_usd(&self, market: &str, side: &str, amount_in: f64) -> Result<f64, String> {
+    pub(super) async fn input_slice_usd(&self, market: &str, side: &str, amount_in: f64) -> AppResult<f64> {
         let (_base, quote) =
             parse_market_symbols(market).ok_or_else(|| format!("invalid market format '{}'", market))?;
 
@@ -214,7 +216,7 @@ where
                 .await?;
             let best_bid = orderbook.bids.first().map(|l| l.price).unwrap_or(0.0);
             if best_bid <= 0.0 {
-                return Err(format!("no bids available for market {}", market));
+                return Err(format!("no bids available for market {}", market).into());
             }
             let quote_amount = amount_in * best_bid;
             return self.amount_symbol_to_usd(&quote, quote_amount).await;
@@ -232,7 +234,7 @@ where
     /// - impact is at or below `target_bps`
     fn max_chunk_for_target_with_simulator<F>(max_input: f64, target_bps: f64, mut simulate: F) -> f64
     where
-        F: FnMut(f64) -> Result<(f64, f64), String>,
+        F: FnMut(f64) -> AppResult<(f64, f64)>,
     {
         if max_input <= LIQUIDITY_EPS {
             return 0.0;
@@ -294,7 +296,7 @@ where
         market: &str,
         side: &str,
         amount_in: f64,
-    ) -> Result<(f64, f64, f64), String> {
+    ) -> AppResult<(f64, f64, f64)> {
         let orderbook = self
             .backend
             .get_orderbook(market, Some(DEFAULT_ORDERBOOK_LIMIT))
@@ -306,7 +308,8 @@ where
                 return Err(format!(
                     "not enough bid liquidity for {} (needed {}, missing {})",
                     market, amount_in, unfilled
-                ));
+                )
+                .into());
             }
             return Ok((out, avg, impact));
         }
@@ -316,7 +319,8 @@ where
             return Err(format!(
                 "not enough ask liquidity for {} (needed {}, missing {})",
                 market, amount_in, unspent
-            ));
+            )
+            .into());
         }
 
         Ok((out, avg, impact))
@@ -629,7 +633,7 @@ where
         total_legs: usize,
         amount_in: f64,
         target_bps: f64,
-    ) -> Result<(f64, f64), String> {
+    ) -> AppResult<(f64, f64)> {
         // Resume from persisted per-leg progress if available.
         let mut remaining_in = state.trade.trade_progress_remaining_in.unwrap_or(amount_in);
         let mut total_out = state.trade.trade_progress_total_out.unwrap_or(0.0);
@@ -650,7 +654,7 @@ where
             if slice_round_count > MAX_SLICE_EXECUTION_ROUNDS {
                 let err = format!("trade slicing exceeded max rounds for market {}", leg.market);
                 state.last_error = Some(err.clone());
-                return Err(err);
+                return Err(err.into());
             }
 
             // Preview the next executable chunk using live orderbook depth.
@@ -658,7 +662,7 @@ where
             let preview = match self.preview_trade_slice(leg, remaining_in, target_bps).await {
                 Ok(preview) => preview,
                 Err(err) => {
-                    state.last_error = Some(err.clone());
+                    state.last_error = Some(err.to_string());
                     return Err(err);
                 }
             };
@@ -712,7 +716,7 @@ where
                 {
                     Ok(price) => price,
                     Err(err) => {
-                        state.last_error = Some(err.clone());
+                        state.last_error = Some(err.to_string());
                         return Err(err);
                     }
                 };
@@ -738,7 +742,7 @@ where
                     exec_price
                 );
                 state.last_error = Some(err.clone());
-                return Err(err);
+                return Err(err.into());
             }
 
             // Update weighted route-level aggregates used by finish/export summaries.
@@ -800,7 +804,7 @@ where
         leg: &TradeLeg,
         remaining_in: f64,
         target_bps: f64,
-    ) -> Result<SlicePreview, String> {
+    ) -> AppResult<SlicePreview> {
         let orderbook = self
             .backend
             .get_orderbook(&leg.market, Some(DEFAULT_ORDERBOOK_LIMIT))
@@ -820,7 +824,7 @@ where
         bids: &[OrderBookLevel],
         remaining_in: f64,
         target_bps: f64,
-    ) -> Result<SlicePreview, String> {
+    ) -> AppResult<SlicePreview> {
         let candidate = self.max_sell_chunk_for_target(bids, remaining_in, target_bps);
         let chunk =
             self.resolve_chunk_with_hard_cap_fallback(&leg.market, "sell", remaining_in, candidate, |amount| {
@@ -840,7 +844,7 @@ where
         asks: &[OrderBookLevel],
         remaining_in: f64,
         target_bps: f64,
-    ) -> Result<SlicePreview, String> {
+    ) -> AppResult<SlicePreview> {
         let candidate = self.max_buy_chunk_for_target(asks, remaining_in, target_bps);
         let chunk =
             self.resolve_chunk_with_hard_cap_fallback(&leg.market, "buy", remaining_in, candidate, |amount| {
@@ -871,9 +875,9 @@ where
         remaining_in: f64,
         candidate_chunk: f64,
         mut simulate_impact: F,
-    ) -> Result<f64, String>
+    ) -> AppResult<f64>
     where
-        F: FnMut(f64) -> Result<(f64, f64), String>,
+        F: FnMut(f64) -> AppResult<(f64, f64)>,
     {
         if candidate_chunk > LIQUIDITY_EPS {
             return Ok(candidate_chunk);
@@ -888,7 +892,8 @@ where
         Err(format!(
             "cannot find {} chunk under impact target for {} (remaining={}, impact={:.2}bps)",
             side, market, remaining_in, impact
-        ))
+        )
+        .into())
     }
 
     /// Build final preview object and assert visible depth can fully fill `chunk`.
@@ -898,16 +903,17 @@ where
         liquidity_side: &str,
         chunk: f64,
         mut simulate_fill: F,
-    ) -> Result<SlicePreview, String>
+    ) -> AppResult<SlicePreview>
     where
-        F: FnMut(f64) -> Result<(f64, f64, f64, f64), String>,
+        F: FnMut(f64) -> AppResult<(f64, f64, f64, f64)>,
     {
         let (_out, avg_price, impact, residual) = simulate_fill(chunk)?;
         if residual > LIQUIDITY_EPS {
             return Err(format!(
                 "not enough {} liquidity for {} (needed {}, missing {})",
                 liquidity_side, market, chunk, residual
-            ));
+            )
+            .into());
         }
 
         Ok(SlicePreview {
@@ -924,7 +930,7 @@ where
         leg: &TradeLeg,
         chunk_in: f64,
         remaining_in: f64,
-    ) -> Result<bool, String> {
+    ) -> AppResult<bool> {
         let chunk_usd = self.input_slice_usd(&leg.market, &leg.side, chunk_in).await?;
         if chunk_usd >= self.cex_min_exec_usd {
             return Ok(false);
@@ -950,7 +956,7 @@ where
         side: &str,
         chunk_in: f64,
         filled_out: f64,
-    ) -> Result<f64, String> {
+    ) -> AppResult<f64> {
         let exec_price = if side.eq_ignore_ascii_case("sell") {
             if chunk_in > 0.0 { filled_out / chunk_in } else { 0.0 }
         } else if filled_out > 0.0 {
@@ -960,7 +966,7 @@ where
         };
 
         if exec_price <= 0.0 || !exec_price.is_finite() {
-            return Err(format!("invalid execution price for {} {}", market, side));
+            return Err(format!("invalid execution price for {} {}", market, side).into());
         }
         Ok(exec_price)
     }

@@ -21,6 +21,7 @@ use tokio::sync::{mpsc, watch};
 
 use crate::commands::liquidation_loop::{LoopControl, LoopEvent, run_liquidation_loop_controlled};
 use crate::context::init_context_best_effort;
+use crate::error::AppError;
 use crate::persistance::sqlite::SqliteWalStore;
 
 use self::app::{App, ConfigSummary, ExecutionRowData, ExecutionsSnapshot, RecentOutcome, WalCounts, WalSnapshot};
@@ -89,7 +90,7 @@ pub async fn run() -> anyhow::Result<()> {
             let store = match SqliteWalStore::new_with_busy_timeout(&db_path, 30_000) {
                 Ok(s) => Arc::new(s),
                 Err(e) => {
-                    let _ = ui_tx.send(UiEvent::Wal(Err(format!("db open failed: {e}"))));
+                    let _ = ui_tx.send(UiEvent::Wal(Err(format!("db open failed: {e}").into())));
                     return;
                 }
             };
@@ -103,9 +104,9 @@ pub async fn run() -> anyhow::Result<()> {
 
                 let store = store.clone();
                 let res = tokio::task::spawn_blocking(move || {
-                    let counts = store.status_counts().map_err(|e| e.to_string())?;
-                    let rows = store.list_recent(200).map_err(|e| e.to_string())?;
-                    Ok::<_, String>((counts, rows))
+                    let counts = store.status_counts()?;
+                    let rows = store.list_recent(200)?;
+                    Ok::<_, AppError>((counts, rows))
                 })
                 .await;
                 match res {
@@ -133,12 +134,12 @@ pub async fn run() -> anyhow::Result<()> {
                         let _ = ui_tx.send(UiEvent::Executions(Ok(exec_snapshot)));
                     }
                     Ok(Err(e)) => {
-                        let _ = ui_tx.send(UiEvent::Wal(Err(format!("db query failed: {e}"))));
-                        let _ = ui_tx.send(UiEvent::Executions(Err(format!("db query failed: {e}"))));
+                        let _ = ui_tx.send(UiEvent::Wal(Err(format!("db query failed: {e}").into())));
+                        let _ = ui_tx.send(UiEvent::Executions(Err(format!("db query failed: {e}").into())));
                     }
                     Err(e) => {
-                        let _ = ui_tx.send(UiEvent::Wal(Err(format!("db task failed: {e}"))));
-                        let _ = ui_tx.send(UiEvent::Executions(Err(format!("db task failed: {e}"))));
+                        let _ = ui_tx.send(UiEvent::Wal(Err(format!("db task failed: {e}").into())));
+                        let _ = ui_tx.send(UiEvent::Executions(Err(format!("db task failed: {e}").into())));
                     }
                 }
             }
@@ -170,7 +171,7 @@ pub async fn run() -> anyhow::Result<()> {
                         let _ = ui_tx.send(UiEvent::Profits(Err(e)));
                     }
                     Err(e) => {
-                        let _ = ui_tx.send(UiEvent::Profits(Err(format!("profit task failed: {e}"))));
+                        let _ = ui_tx.send(UiEvent::Profits(Err(format!("profit task failed: {e}").into())));
                     }
                 }
             }

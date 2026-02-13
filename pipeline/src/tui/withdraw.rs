@@ -7,6 +7,7 @@ use num_traits::ToPrimitive;
 use tokio::sync::mpsc;
 
 use crate::config::ConfigTrait;
+use crate::error::{AppError, AppResult};
 use crate::swappers::mexc::mexc_adapter::MexcClient;
 use liquidium_pipeline_connectors::backend::cex_backend::CexBackend;
 use liquidium_pipeline_core::account::model::ChainAccount;
@@ -183,14 +184,14 @@ async fn execute_withdraw(
     manual_destination: String,
     asset: AssetId,
     amount: String,
-) -> Result<String, String> {
+) -> AppResult<String> {
     let token = ctx
         .registry
         .get(&asset)
         .ok_or_else(|| format!("unknown asset: {}", asset))?;
 
     let ChainToken::Icp { decimals, fee, .. } = token else {
-        return Err("TUI withdraw currently supports ICP tokens only".to_string());
+        return Err("TUI withdraw currently supports ICP tokens only".into());
     };
 
     let (transfers, balances) = match source {
@@ -204,7 +205,8 @@ async fn execute_withdraw(
         WithdrawDestinationKind::Trader => ctx.config.trader_principal.into(),
         WithdrawDestinationKind::Recovery => ctx.config.get_recovery_account(),
         WithdrawDestinationKind::Manual => {
-            Account::from_str(manual_destination.trim()).map_err(|_| "invalid destination ICP account".to_string())?
+            Account::from_str(manual_destination.trim())
+                .map_err(|_| AppError::from("invalid destination ICP account"))?
         }
     };
 
@@ -220,23 +222,25 @@ async fn execute_withdraw(
         .await
 }
 
-fn compute_withdraw_amount_native(balance: Nat, fee: Nat, amount: &str, decimals: u8) -> Result<Nat, String> {
+fn compute_withdraw_amount_native(balance: Nat, fee: Nat, amount: &str, decimals: u8) -> AppResult<Nat> {
     if amount.trim().eq_ignore_ascii_case("all") {
         let bal_u128 = balance
             .0
             .to_u128()
-            .ok_or_else(|| "balance too large for u128".to_string())?;
+            .ok_or_else(|| AppError::from("balance too large for u128"))?;
         let fee_u128 = fee
             .0
             .to_u128()
-            .ok_or_else(|| "fee too large to represent".to_string())?;
+            .ok_or_else(|| AppError::from("fee too large to represent"))?;
         if bal_u128 <= fee_u128 {
-            return Err("balance too low to cover fee".to_string());
+            return Err("balance too low to cover fee".into());
         }
         Ok(Nat::from(bal_u128 - fee_u128))
     } else {
         let units = format::decimal_to_units(amount.trim(), decimals)
-            .ok_or_else(|| format!("invalid amount (expected decimal with <= {decimals} decimals, or 'all')"))?;
+            .ok_or_else(|| {
+                AppError::from(format!("invalid amount (expected decimal with <= {decimals} decimals, or 'all')"))
+            })?;
         Ok(Nat::from(units))
     }
 }

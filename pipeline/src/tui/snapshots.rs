@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use chrono::Local;
+use crate::error::{AppError, AppResult};
 
 use liquidium_pipeline_core::tokens::asset_id::AssetId;
 use liquidium_pipeline_core::tokens::token_registry::TokenRegistry;
@@ -12,7 +13,7 @@ use super::format;
 
 pub(super) async fn fetch_balances_snapshot(
     ctx: Arc<crate::context::PipelineContext>,
-) -> Result<BalancesSnapshot, String> {
+) -> AppResult<BalancesSnapshot> {
     let mut asset_ids: Vec<AssetId> = ctx.registry.all().into_iter().map(|(id, _)| id).collect();
     asset_ids.sort_by(|a, b| {
         a.chain
@@ -54,7 +55,7 @@ struct ExecutionCsvRow {
     status: Option<String>,
 }
 
-pub(super) fn compute_profits_snapshot(export_path: &str, registry: &TokenRegistry) -> Result<ProfitsSnapshot, String> {
+pub(super) fn compute_profits_snapshot(export_path: &str, registry: &TokenRegistry) -> AppResult<ProfitsSnapshot> {
     let mut totals: HashMap<String, (usize, i128, i128)> = HashMap::new();
 
     let mut rdr = match csv::ReaderBuilder::new().from_path(export_path) {
@@ -69,12 +70,12 @@ pub(super) fn compute_profits_snapshot(export_path: &str, registry: &TokenRegist
                     at: Local::now(),
                 });
             }
-            return Err(format!("csv open failed: {e}"));
+            return Err(format!("csv open failed: {e}").into());
         }
     };
 
     for rec in rdr.deserialize::<ExecutionCsvRow>() {
-        let row = rec.map_err(|e| format!("csv parse failed: {e}"))?;
+        let row = rec.map_err(|e| AppError::from(format!("csv parse failed: {e}")))?;
         // Only count finalized rows; keep it simple.
         let status = row.status.unwrap_or_default();
         if status.is_empty() {

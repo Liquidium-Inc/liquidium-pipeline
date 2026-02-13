@@ -1,5 +1,6 @@
 use candid::{CandidType, Decode, Principal};
 use ic_agent::Agent;
+use liquidium_pipeline_core::error::{AppError, AppResult, error_codes};
 use serde::de::DeserializeOwned;
 
 #[mockall::automock]
@@ -10,7 +11,7 @@ pub trait PipelineAgent: Send + Sync {
         canister: &Principal,
         method: &str,
         arg: Vec<u8>,
-    ) -> Result<R, String>;
+    ) -> AppResult<R>;
 
     #[allow(dead_code)]
     async fn call_query_tuple<R: Sized + CandidType + DeserializeOwned + 'static>(
@@ -18,22 +19,21 @@ pub trait PipelineAgent: Send + Sync {
         canister: &Principal,
         method: &str,
         arg: Vec<u8>,
-    ) -> Result<R, String>;
+    ) -> AppResult<R>;
 
-    async fn call_update_raw(&self, canister: &Principal, method: &str, arg: Vec<u8>) -> Result<Vec<u8>, String>;
+    async fn call_update_raw(&self, canister: &Principal, method: &str, arg: Vec<u8>) -> AppResult<Vec<u8>>;
 
     async fn call_update<R: Sized + CandidType + DeserializeOwned + 'static>(
         &self,
         canister: &Principal,
         method: &str,
         arg: Vec<u8>,
-    ) -> Result<R, String> {
-        let res = self
-            .call_update_raw(canister, method, arg)
-            .await
-            .map_err(|e| format!("Call error: {e}"))?;
+    ) -> AppResult<R> {
+        let res = self.call_update_raw(canister, method, arg).await?;
         // Decode the candid response
-        let res = Decode!(&res, R).map_err(|e| format!("Candid decode error: {e}"))?;
+        let res = Decode!(&res, R).map_err(|e| {
+            AppError::from_def(error_codes::DECODE_ERROR).with_context(format!("Candid decode error: {e}"))
+        })?;
         Ok(res)
     }
 
@@ -47,16 +47,21 @@ impl PipelineAgent for ic_agent::Agent {
         canister: &Principal,
         method: &str,
         arg: Vec<u8>,
-    ) -> Result<R, String> {
+    ) -> AppResult<R> {
         let res = self
             .query(canister, method)
             .with_arg(arg)
             .call()
             .await
-            .map_err(|e| format!("Query call failed: {e}"))?;
+            .map_err(|e| {
+                AppError::from_def(error_codes::EXTERNAL_CALL_FAILED)
+                    .with_context(format!("Query call failed: {e}"))
+            })?;
 
         // Decode the candid response
-        let res = Decode!(&res, R).map_err(|e| format!("Candid decode error: {e}"))?;
+        let res = Decode!(&res, R).map_err(|e| {
+            AppError::from_def(error_codes::DECODE_ERROR).with_context(format!("Candid decode error: {e}"))
+        })?;
 
         Ok(res)
     }
@@ -66,22 +71,29 @@ impl PipelineAgent for ic_agent::Agent {
         canister: &Principal,
         method: &str,
         arg: Vec<u8>,
-    ) -> Result<R, String> {
+    ) -> AppResult<R> {
         let res = self
             .query(canister, method)
             .with_arg(arg)
             .call()
             .await
-            .map_err(|e| format!("Query call failed: {e}"))?;
+            .map_err(|e| {
+                AppError::from_def(error_codes::EXTERNAL_CALL_FAILED)
+                    .with_context(format!("Query call failed: {e}"))
+            })?;
 
-        let res = candid::utils::decode_one::<R>(&res).map_err(|e| format!("Candid decode error: {}", e))?;
+        let res = candid::utils::decode_one::<R>(&res).map_err(|e| {
+            AppError::from_def(error_codes::DECODE_ERROR).with_context(format!("Candid decode error: {}", e))
+        })?;
 
         Ok(res)
     }
 
-    async fn call_update_raw(&self, canister: &Principal, method: &str, arg: Vec<u8>) -> Result<Vec<u8>, String> {
+    async fn call_update_raw(&self, canister: &Principal, method: &str, arg: Vec<u8>) -> AppResult<Vec<u8>> {
         let res = self.update(canister, method).with_arg(arg).call_and_wait().await;
-        res.map_err(|e| e.to_string())
+        res.map_err(|e| {
+            AppError::from_def(error_codes::EXTERNAL_CALL_FAILED).with_context(format!("Update call failed: {}", e))
+        })
     }
 
     fn agent(&self) -> Agent {

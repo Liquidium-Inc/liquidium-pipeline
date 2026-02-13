@@ -1,5 +1,7 @@
 use candid::Nat;
 
+use crate::error::AppResult;
+
 pub const BPS_ONE: u64 = 10_000; // 100% in basis points
 
 #[inline]
@@ -36,7 +38,7 @@ pub fn compute_liquidation_amounts(
     coll_decimals: u64,
     bonus_bps: u64,
     fee_bps: u64,
-) -> Result<(Nat, Nat), String> {
+) -> AppResult<(Nat, Nat)> {
     // Guards
     if *price_coll_ray == 0u8 {
         return Err("Zero collateral price".into());
@@ -124,7 +126,7 @@ pub fn max_repay_from_collateral(
     coll_decimals: u64,
     bonus_bps: u64,
     fee_bps: u64,
-) -> Result<Nat, String> {
+) -> AppResult<Nat> {
     if *price_debt_ray == 0u8 {
         return Err("Zero debt price".into());
     }

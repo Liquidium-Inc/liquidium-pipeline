@@ -3,6 +3,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use candid::Nat;
 use liquidium_pipeline_core::account::model::ChainAccount;
+use liquidium_pipeline_core::error::{AppError, AppResult, error_codes};
 use liquidium_pipeline_core::tokens::chain_token::ChainToken;
 use liquidium_pipeline_core::transfer::actions::TransferActions;
 
@@ -20,7 +21,7 @@ impl<B: EvmBackend> EvmTransferAdapter<B> {
 
 #[async_trait]
 impl<B: EvmBackend + Send + Sync> TransferActions for EvmTransferAdapter<B> {
-    async fn transfer(&self, token: &ChainToken, to: &ChainAccount, amount_native: Nat) -> Result<String, String> {
+    async fn transfer(&self, token: &ChainToken, to: &ChainAccount, amount_native: Nat) -> AppResult<String> {
         match (token, to) {
             (ChainToken::EvmNative { chain, .. }, ChainAccount::Evm(to_address)) => {
                 let amount = amount_native;
@@ -43,9 +44,15 @@ impl<B: EvmBackend + Send + Sync> TransferActions for EvmTransferAdapter<B> {
                 Ok(tx_hash)
             }
             (ChainToken::EvmNative { .. } | ChainToken::EvmErc20 { .. }, _) => {
-                Err("EvmTransferAdapter: destination chain must be EVM".to_string())
+                Err(
+                    AppError::from_def(error_codes::INVALID_INPUT)
+                        .with_context("EvmTransferAdapter: destination chain must be EVM"),
+                )
             }
-            _ => Err("EvmTransferAdapter only supports EvmNative and EvmErc20 tokens".to_string()),
+            _ => Err(
+                AppError::from_def(error_codes::UNSUPPORTED)
+                    .with_context("EvmTransferAdapter only supports EvmNative and EvmErc20 tokens"),
+            ),
         }
     }
 
@@ -54,7 +61,7 @@ impl<B: EvmBackend + Send + Sync> TransferActions for EvmTransferAdapter<B> {
         _token: &ChainToken,
         _spender: &ChainAccount,
         _amount_native: Nat,
-    ) -> Result<String, String> {
-        Err("EvmTransferAdapter does not support approve".to_string())
+    ) -> AppResult<String> {
+        Err(AppError::from_def(error_codes::UNSUPPORTED).with_context("EvmTransferAdapter does not support approve"))
     }
 }
