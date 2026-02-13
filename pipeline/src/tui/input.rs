@@ -1,18 +1,29 @@
+use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use tokio::sync::{mpsc, watch};
+use tokio::sync::mpsc;
+use tokio::time::timeout;
 
 use crate::commands::liquidation_loop::LoopControl;
+use crate::control_plane::{ControlCommand, send_control_command};
 
 use super::app::{App, BalancesPanel, Tab, UiFocus, WithdrawField};
 use super::events::UiEvent;
+use super::log_source::LogControlHandle;
 use super::snapshots::{compute_profits_snapshot, fetch_balances_snapshot};
 use super::views::logs::{scroll_down_by_entries, scroll_up_by_entries};
 use super::withdraw::{open_deposit_panel, open_withdraw_panel, refresh_withdraw_deposit_address, submit_withdraw};
 
 const PAGE_SCROLL_ENTRIES: usize = 10;
+const CONTROL_COMMAND_TIMEOUT: Duration = Duration::from_secs(2);
+
+enum ControlSendError {
+    Timeout,
+    Control(String),
+}
 
 fn reset_log_focus(app: &mut App) {
     app.ui_focus = UiFocus::Tabs;
@@ -33,9 +44,11 @@ fn reset_executions_focus(app: &mut App) {
     app.executions_details_scroll = 0;
 }
 
-fn scroll_logs_up(app: &mut App, entries: usize) {
+fn scroll_logs_up(app: &mut App, entries: usize) -> bool {
+    let before = app.logs_scroll;
     app.logs_follow = false;
     app.logs_scroll = scroll_up_by_entries(&app.logs, app.logs_content_width, app.logs_scroll, entries);
+    app.logs_scroll == before
 }
 
 fn scroll_logs_down(app: &mut App, entries: usize) {
@@ -45,7 +58,8 @@ fn scroll_logs_down(app: &mut App, entries: usize) {
     }
 }
 
-fn scroll_dashboard_logs_up(app: &mut App, entries: usize) {
+fn scroll_dashboard_logs_up(app: &mut App, entries: usize) -> bool {
+    let before = app.dashboard_logs_scroll;
     app.dashboard_logs_follow = false;
     app.dashboard_logs_scroll = scroll_up_by_entries(
         &app.logs,
@@ -53,6 +67,7 @@ fn scroll_dashboard_logs_up(app: &mut App, entries: usize) {
         app.dashboard_logs_scroll,
         entries,
     );
+    app.dashboard_logs_scroll == before
 }
 
 fn scroll_dashboard_logs_down(app: &mut App, entries: usize) {
@@ -67,10 +82,22 @@ fn scroll_dashboard_logs_down(app: &mut App, entries: usize) {
     }
 }
 
+async fn send_control_command_timed(
+    sock_path: &Path,
+    cmd: ControlCommand,
+) -> std::result::Result<(), ControlSendError> {
+    match timeout(CONTROL_COMMAND_TIMEOUT, send_control_command(sock_path, cmd)).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(err)) => Err(ControlSendError::Control(err)),
+        Err(_) => Err(ControlSendError::Timeout),
+    }
+}
+
 pub(super) async fn handle_key(
     app: &mut App,
     key: KeyEvent,
-    engine_tx: &watch::Sender<LoopControl>,
+    sock_path: &Path,
+    log_control: &LogControlHandle,
     ui_tx: &mpsc::UnboundedSender<UiEvent>,
     ctx: &Arc<crate::context::PipelineContext>,
 ) -> Result<bool> {
@@ -89,9 +116,18 @@ pub(super) async fn handle_key(
                 if input.trim().eq_ignore_ascii_case("yes") {
                     app.bad_debt_confirmed = true;
                     app.bad_debt_confirm_input = None;
-                    app.engine = LoopControl::Running;
-                    let _ = engine_tx.send(LoopControl::Running);
-                    app.push_log("bad debt: confirmed (engine started)");
+                    match send_control_command_timed(sock_path, ControlCommand::Resume).await {
+                        Ok(()) => {
+                            app.engine = LoopControl::Running;
+                            app.push_log("bad debt: confirmed (engine resumed)");
+                        }
+                        Err(ControlSendError::Timeout) => {
+                            app.push_log("control timeout: daemon did not respond within 2s");
+                        }
+                        Err(ControlSendError::Control(err)) => {
+                            app.push_log(format!("control error: {}", err));
+                        }
+                    }
                 } else {
                     app.push_log("bad debt: type 'yes' and press Enter to start");
                 }
@@ -229,7 +265,9 @@ pub(super) async fn handle_key(
         (KeyCode::Up, KeyModifiers::NONE)
             if matches!(app.tab, Tab::Logs) && matches!(app.ui_focus, UiFocus::Logs) && app.logs_scroll_active =>
         {
-            scroll_logs_up(app, 1);
+            if scroll_logs_up(app, 1) {
+                log_control.request_older();
+            }
         }
         (KeyCode::Down, KeyModifiers::NONE)
             if matches!(app.tab, Tab::Logs) && matches!(app.ui_focus, UiFocus::Logs) && app.logs_scroll_active =>
@@ -239,7 +277,9 @@ pub(super) async fn handle_key(
         (KeyCode::Char('k'), KeyModifiers::NONE)
             if matches!(app.tab, Tab::Logs) && matches!(app.ui_focus, UiFocus::Logs) && app.logs_scroll_active =>
         {
-            scroll_logs_up(app, 1);
+            if scroll_logs_up(app, 1) {
+                log_control.request_older();
+            }
         }
         (KeyCode::Char('j'), KeyModifiers::NONE)
             if matches!(app.tab, Tab::Logs) && matches!(app.ui_focus, UiFocus::Logs) && app.logs_scroll_active =>
@@ -249,7 +289,9 @@ pub(super) async fn handle_key(
         (KeyCode::PageUp, KeyModifiers::NONE)
             if matches!(app.tab, Tab::Logs) && matches!(app.ui_focus, UiFocus::Logs) && app.logs_scroll_active =>
         {
-            scroll_logs_up(app, PAGE_SCROLL_ENTRIES);
+            if scroll_logs_up(app, PAGE_SCROLL_ENTRIES) {
+                log_control.request_older();
+            }
         }
         (KeyCode::PageDown, KeyModifiers::NONE)
             if matches!(app.tab, Tab::Logs) && matches!(app.ui_focus, UiFocus::Logs) && app.logs_scroll_active =>
@@ -259,7 +301,9 @@ pub(super) async fn handle_key(
         (KeyCode::Char('u'), KeyModifiers::CONTROL)
             if matches!(app.tab, Tab::Logs) && matches!(app.ui_focus, UiFocus::Logs) && app.logs_scroll_active =>
         {
-            scroll_logs_up(app, PAGE_SCROLL_ENTRIES);
+            if scroll_logs_up(app, PAGE_SCROLL_ENTRIES) {
+                log_control.request_older();
+            }
         }
         (KeyCode::Char('d'), KeyModifiers::CONTROL)
             if matches!(app.tab, Tab::Logs) && matches!(app.ui_focus, UiFocus::Logs) && app.logs_scroll_active =>
@@ -273,6 +317,7 @@ pub(super) async fn handle_key(
                 app.logs_g_pending = false;
                 app.logs_follow = false;
                 app.logs_scroll = u16::MAX;
+                log_control.request_older();
             } else {
                 app.logs_g_pending = true;
             }
@@ -289,6 +334,7 @@ pub(super) async fn handle_key(
         {
             app.logs_follow = false;
             app.logs_scroll = u16::MAX;
+            log_control.request_older();
         }
         (KeyCode::End, KeyModifiers::NONE)
             if matches!(app.tab, Tab::Logs) && matches!(app.ui_focus, UiFocus::Logs) && app.logs_scroll_active =>
@@ -301,7 +347,9 @@ pub(super) async fn handle_key(
                 && matches!(app.ui_focus, UiFocus::Logs)
                 && app.dashboard_logs_scroll_active =>
         {
-            scroll_dashboard_logs_up(app, 1);
+            if scroll_dashboard_logs_up(app, 1) {
+                log_control.request_older();
+            }
         }
         (KeyCode::Down, KeyModifiers::NONE)
             if matches!(app.tab, Tab::Dashboard)
@@ -315,7 +363,9 @@ pub(super) async fn handle_key(
                 && matches!(app.ui_focus, UiFocus::Logs)
                 && app.dashboard_logs_scroll_active =>
         {
-            scroll_dashboard_logs_up(app, 1);
+            if scroll_dashboard_logs_up(app, 1) {
+                log_control.request_older();
+            }
         }
         (KeyCode::Char('j'), KeyModifiers::NONE)
             if matches!(app.tab, Tab::Dashboard)
@@ -329,7 +379,9 @@ pub(super) async fn handle_key(
                 && matches!(app.ui_focus, UiFocus::Logs)
                 && app.dashboard_logs_scroll_active =>
         {
-            scroll_dashboard_logs_up(app, PAGE_SCROLL_ENTRIES);
+            if scroll_dashboard_logs_up(app, PAGE_SCROLL_ENTRIES) {
+                log_control.request_older();
+            }
         }
         (KeyCode::PageDown, KeyModifiers::NONE)
             if matches!(app.tab, Tab::Dashboard)
@@ -343,7 +395,9 @@ pub(super) async fn handle_key(
                 && matches!(app.ui_focus, UiFocus::Logs)
                 && app.dashboard_logs_scroll_active =>
         {
-            scroll_dashboard_logs_up(app, PAGE_SCROLL_ENTRIES);
+            if scroll_dashboard_logs_up(app, PAGE_SCROLL_ENTRIES) {
+                log_control.request_older();
+            }
         }
         (KeyCode::Char('d'), KeyModifiers::CONTROL)
             if matches!(app.tab, Tab::Dashboard)
@@ -361,6 +415,7 @@ pub(super) async fn handle_key(
                 app.dashboard_logs_g_pending = false;
                 app.dashboard_logs_follow = false;
                 app.dashboard_logs_scroll = u16::MAX;
+                log_control.request_older();
             } else {
                 app.dashboard_logs_g_pending = true;
             }
@@ -484,13 +539,30 @@ pub(super) async fn handle_key(
                 return Ok(false);
             }
 
-            app.engine = next;
-            let _ = engine_tx.send(next);
-            app.push_log(match next {
-                LoopControl::Running => "engine: RUNNING".to_string(),
-                LoopControl::Paused => "engine: PAUSED".to_string(),
-                LoopControl::Stopping => "engine: STOPPING".to_string(),
-            });
+            let command = match next {
+                LoopControl::Running => Some(ControlCommand::Resume),
+                LoopControl::Paused => Some(ControlCommand::Pause),
+                LoopControl::Stopping => None,
+            };
+
+            if let Some(command) = command {
+                match send_control_command_timed(sock_path, command).await {
+                    Ok(()) => {
+                        app.engine = next;
+                        app.push_log(match next {
+                            LoopControl::Running => "engine: RUNNING".to_string(),
+                            LoopControl::Paused => "engine: PAUSED".to_string(),
+                            LoopControl::Stopping => "engine: STOPPING".to_string(),
+                        });
+                    }
+                    Err(ControlSendError::Timeout) => {
+                        app.push_log("control timeout: daemon did not respond within 2s");
+                    }
+                    Err(ControlSendError::Control(err)) => {
+                        app.push_log(format!("control error: {}", err));
+                    }
+                }
+            }
         }
         (KeyCode::Char('b'), KeyModifiers::NONE) => {
             let ui_tx = ui_tx.clone();
@@ -519,6 +591,11 @@ pub(super) async fn handle_key(
             reset_log_focus(app);
             reset_executions_focus(app);
             app.tab = Tab::Executions;
+        }
+        (KeyCode::Char('c'), KeyModifiers::NONE) => {
+            reset_log_focus(app);
+            reset_executions_focus(app);
+            app.tab = Tab::Configuration;
         }
         (KeyCode::Char('w'), KeyModifiers::NONE) => {
             reset_log_focus(app);
@@ -722,5 +799,58 @@ pub(super) fn handle_paste(app: &mut App, text: String) {
             }
             _ => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{scroll_dashboard_logs_up, scroll_logs_up};
+    use crate::commands::liquidation_loop::LoopControl;
+    use crate::tui::app::{App, ConfigSummary};
+
+    fn sample_config() -> ConfigSummary {
+        ConfigSummary {
+            ic_url: "https://ic0.app".to_string(),
+            liquidator_principal: "aaaaa-aa".to_string(),
+            trader_principal: "bbbbb-bb".to_string(),
+            evm_address: "0x0".to_string(),
+            swapper_mode: "Hybrid".to_string(),
+            max_dex_slippage_bps: 500,
+            max_cex_slippage_bps: 200,
+            buy_bad_debt: false,
+            opportunity_filter: vec![],
+            control_socket: "/tmp/liquidator/ctl.sock".to_string(),
+            log_source: "Log source file: /tmp/liquidator/liquidator.log".to_string(),
+            db_path: "./wal.db".to_string(),
+            export_path: "executions.csv".to_string(),
+        }
+    }
+
+    #[test]
+    fn logs_scroll_up_reports_top_edge() {
+        let mut app = App::new(vec![], sample_config());
+        app.engine = LoopControl::Running;
+        app.logs_scroll_active = true;
+        app.logs_follow = false;
+        app.logs_content_width = 120;
+        app.logs.push_back("INFO line1".to_string());
+        app.logs.push_back("INFO line2".to_string());
+
+        app.logs_scroll = u16::MAX;
+        assert!(scroll_logs_up(&mut app, 1));
+    }
+
+    #[test]
+    fn dashboard_scroll_up_reports_top_edge() {
+        let mut app = App::new(vec![], sample_config());
+        app.engine = LoopControl::Running;
+        app.dashboard_logs_scroll_active = true;
+        app.dashboard_logs_follow = false;
+        app.dashboard_logs_content_width = 120;
+        app.logs.push_back("INFO line1".to_string());
+        app.logs.push_back("INFO line2".to_string());
+
+        app.dashboard_logs_scroll = u16::MAX;
+        assert!(scroll_dashboard_logs_up(&mut app, 1));
     }
 }

@@ -1,4 +1,5 @@
-use std::fs::{OpenOptions, metadata};
+use std::fs::OpenOptions;
+use std::path::Path;
 
 use async_trait::async_trait;
 use csv::WriterBuilder;
@@ -32,13 +33,24 @@ struct ExecutionAnalyticsRow {
 #[async_trait]
 impl<'a> PipelineStage<'a, Vec<LiquidationOutcome>, ()> for ExportStage {
     async fn process(&self, input: &'a Vec<LiquidationOutcome>) -> Result<(), String> {
+        let path = Path::new(&self.path);
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format_file_error("create export parent directory", path, &e))?;
+        }
+
         let file = OpenOptions::new()
             .create(true)
             .append(true)
-            .open(&self.path)
-            .map_err(|e| format!("File error: {}", e))?;
+            .open(path)
+            .map_err(|e| format_file_error("open export file", path, &e))?;
 
-        let is_empty = metadata(&self.path).map(|m| m.len() == 0).unwrap_or(true);
+        let is_empty = file
+            .metadata()
+            .map(|m| m.len() == 0)
+            .map_err(|e| format_file_error("read export file metadata", path, &e))?;
         let mut wtr = WriterBuilder::new();
         if !is_empty {
             wtr.has_headers(false);
@@ -97,5 +109,16 @@ impl<'a> PipelineStage<'a, Vec<LiquidationOutcome>, ()> for ExportStage {
 
         wtr.flush().map_err(|e| format!("CSV flush error: {}", e))?;
         Ok(())
+    }
+}
+
+fn format_file_error(action: &str, path: &Path, err: &std::io::Error) -> String {
+    if err.kind() == std::io::ErrorKind::PermissionDenied {
+        format!(
+            "{action} '{}' failed: permission denied (check owner/group/mode and parent directory permissions)",
+            path.display()
+        )
+    } else {
+        format!("{action} '{}' failed: {err}", path.display())
     }
 }

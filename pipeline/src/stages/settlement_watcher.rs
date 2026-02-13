@@ -242,11 +242,13 @@ where
         touch: bool,
     ) -> Result<(), String> {
         let mut row = row.clone();
-        let wrapper = LiqMetaWrapper {
+        let mut wrapper = decode_receipt_wrapper(&row)?.unwrap_or(LiqMetaWrapper {
             receipt: receipt.clone(),
             meta: Vec::new(),
             finalizer_decision: None,
-        };
+            profit_snapshot: None,
+        });
+        wrapper.receipt = receipt.clone();
         encode_meta(&mut row, &wrapper)?;
         if touch {
             row.updated_at = now_ts();
@@ -261,7 +263,9 @@ mod tests {
     use super::*;
 
     use crate::executors::executor::ExecutorRequest;
-    use crate::persistance::{MockWalStore, ResultStatus};
+    use crate::persistance::{
+        FinalizerDecisionSnapshot, LiqMetaWrapper, MockWalStore, ResultStatus, WalProfitSnapshot,
+    };
     use crate::stages::executor::ExecutionStatus;
     use crate::swappers::model::{SwapQuote, SwapRequest};
     use crate::swappers::swap_interface::MockSwapInterface;
@@ -366,6 +370,7 @@ mod tests {
             receipt,
             meta: Vec::new(),
             finalizer_decision: None,
+            profit_snapshot: None,
         };
         encode_meta(&mut row, &wrapper).expect("encode_meta should succeed");
         row
@@ -622,5 +627,76 @@ mod tests {
         );
 
         watcher.tick().await.expect("tick should succeed");
+    }
+
+    #[tokio::test]
+    async fn update_receipt_meta_preserves_wrapper_extensions() {
+        let liq_id = 13u128;
+        let old_receipt = ExecutionReceipt {
+            request: make_request(false, Some(make_swap_args())),
+            liquidation_result: Some(make_liq_result(liq_id, TransferStatus::Pending)),
+            status: ExecutionStatus::CollateralTransferFailed("pending".to_string()),
+            change_received: true,
+        };
+        let new_receipt = ExecutionReceipt {
+            request: make_request(false, Some(make_swap_args())),
+            liquidation_result: Some(make_liq_result(liq_id, TransferStatus::Success)),
+            status: ExecutionStatus::Success,
+            change_received: true,
+        };
+
+        let mut row = make_row(ResultStatus::WaitingCollateral, old_receipt.clone());
+        let wrapper = LiqMetaWrapper {
+            receipt: old_receipt,
+            meta: vec![7, 8, 9],
+            finalizer_decision: Some(FinalizerDecisionSnapshot {
+                mode: "hybrid".to_string(),
+                chosen: "cex".to_string(),
+                reason: "test".to_string(),
+                min_required_bps: 25.0,
+                dex_preview_gross_bps: Some(40.0),
+                dex_preview_net_bps: Some(28.0),
+                cex_preview_gross_bps: Some(33.0),
+                cex_preview_net_bps: Some(26.0),
+                ts: 123,
+            }),
+            profit_snapshot: Some(WalProfitSnapshot {
+                expected_profit_raw: "1000".to_string(),
+                realized_profit_raw: Some("900".to_string()),
+                debt_symbol: "ckBTC".to_string(),
+                debt_decimals: 8,
+                updated_at: 123,
+            }),
+        };
+        encode_meta(&mut row, &wrapper).expect("encode wrapper");
+
+        let mut wal = MockWalStore::new();
+        wal.expect_upsert_result().times(1).returning(move |updated_row| {
+            let updated_wrapper = decode_receipt_wrapper(&updated_row)
+                .expect("decode wrapper")
+                .expect("wrapper exists");
+            assert_eq!(updated_wrapper.meta, vec![7, 8, 9]);
+            assert!(updated_wrapper.finalizer_decision.is_some());
+            assert!(updated_wrapper.profit_snapshot.is_some());
+            assert!(
+                matches!(updated_wrapper.receipt.status, ExecutionStatus::Success),
+                "receipt status should be updated"
+            );
+            Ok(())
+        });
+
+        let watcher = SettlementWatcher::new(
+            Arc::new(wal),
+            Arc::new(MockPipelineAgent::new()),
+            Arc::new(MockSwapInterface::new()),
+            Principal::anonymous(),
+            Duration::from_secs(3),
+            SwapperMode::Dex,
+        );
+
+        watcher
+            .update_receipt_meta(&row, &new_receipt, true)
+            .await
+            .expect("receipt meta update should succeed");
     }
 }

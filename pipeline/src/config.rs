@@ -199,7 +199,8 @@ impl Config {
         let home = config_dir();
 
         let ic_url = env::var("IC_URL").map_err(|_| "IC_URL not configured".to_string())?;
-        let export_path = env::var("EXPORT_PATH").unwrap_or("executions.csv".to_string());
+        let export_path_raw = env::var("EXPORT_PATH").unwrap_or(format!("{}/executions.csv", home));
+        let export_path = expand_tilde(&export_path_raw).to_string_lossy().into_owned();
 
         let mnemonic_path =
             expand_tilde(&env::var("MNEMONIC_FILE").map_err(|_| "MNEMONIC_FILE not configured".to_string())?);
@@ -235,7 +236,8 @@ impl Config {
             .map_err(|e| format!("invalid LENDING_CANISTER principal: {e}"))?;
 
         // The db path
-        let db_path = env::var("DB_PATH").unwrap_or(format!("{}/wal.db", home));
+        let db_path_raw = env::var("DB_PATH").unwrap_or(format!("{}/wal.db", home));
+        let db_path = expand_tilde(&db_path_raw).to_string_lossy().into_owned();
 
         // Derive EVM private key
         let sk = derive_evm_private_key(&mnemonic, 0, 0)?;
@@ -630,5 +632,22 @@ mod tests {
         let parsed = parse_cex_tunables_from_env();
         assert_eq!(parsed.retry_base_secs, 300);
         assert_eq!(parsed.retry_max_secs, 300);
+    }
+
+    #[test]
+    fn expand_tilde_uses_home_prefix() {
+        let _guard = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        let prev_home = env::var("HOME").ok();
+        unsafe { env::set_var("HOME", "/tmp/liquidator-home-test") };
+
+        let expanded = expand_tilde("~/wal.db");
+        assert_eq!(expanded, std::path::PathBuf::from("/tmp/liquidator-home-test/wal.db"));
+
+        unsafe {
+            match prev_home {
+                Some(home) => env::set_var("HOME", home),
+                None => env::remove_var("HOME"),
+            }
+        }
     }
 }

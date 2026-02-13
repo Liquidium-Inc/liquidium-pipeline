@@ -23,6 +23,17 @@ pub struct LiqMetaWrapper {
     pub meta: Vec<u8>,
     #[serde(default)]
     pub finalizer_decision: Option<FinalizerDecisionSnapshot>,
+    #[serde(default)]
+    pub profit_snapshot: Option<WalProfitSnapshot>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct WalProfitSnapshot {
+    pub expected_profit_raw: String,
+    pub realized_profit_raw: Option<String>,
+    pub debt_symbol: String,
+    pub debt_decimals: u8,
+    pub updated_at: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

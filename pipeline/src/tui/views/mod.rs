@@ -2,19 +2,23 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph, Tabs};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph, Tabs};
 
 use crate::commands::liquidation_loop::LoopControl;
 
 use super::app::{App, Tab};
 
 mod balances;
+mod configuration;
 mod dashboard;
 mod executions;
 pub(super) mod logs;
 mod profits;
 
 pub(super) fn draw_ui(f: &mut Frame<'_>, app: &App) {
+    // Clear the full frame first so shorter renders do not leave stale glyphs.
+    f.render_widget(Clear, f.size());
+
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(1), Constraint::Length(3), Constraint::Min(0)])
@@ -43,7 +47,7 @@ fn draw_header(f: &mut Frame<'_>, area: Rect, app: &App) {
         Span::raw("  |  engine="),
         status,
         Span::raw(
-            "  |  keys: r start/pause · b balances · p profits · e executions · w withdraw · d deposit/refresh · tab switch · q quit",
+            "  |  keys: r pause/resume · c config · b balances · p profits · e executions · w withdraw · d deposit/refresh · tab switch · q quit",
         ),
     ]);
 
@@ -65,6 +69,7 @@ fn draw_tabs(f: &mut Frame<'_>, area: Rect, app: &App) {
 fn draw_body(f: &mut Frame<'_>, area: Rect, app: &App) {
     match app.tab {
         Tab::Dashboard => dashboard::draw_dashboard(f, area, app),
+        Tab::Configuration => configuration::draw_configuration(f, area, app),
         Tab::Balances => balances::draw_balances(f, area, app),
         Tab::Profits => profits::draw_profits(f, area, app),
         Tab::Executions => executions::draw_executions(f, area, app),
