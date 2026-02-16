@@ -33,10 +33,7 @@ impl BalanceService {
                     AppError::from_def(error_codes::NOT_FOUND).with_context(format!("unknown asset {}", asset_id))
                 })?;
 
-                let bal = accounts.sync_balance(&token).await.map_err(|e| {
-                    AppError::from_def(error_codes::EXTERNAL_CALL_FAILED)
-                        .with_context(format!("sync_balance failed for {}: {}", asset_id, e))
-                })?;
+                let bal = accounts.sync_balance(&token).await?;
 
                 Ok::<_, AppError>((asset_id, bal))
             }
@@ -74,10 +71,7 @@ impl BalanceService {
             })?
             .clone();
 
-        self.accounts.sync_balance(&token).await.map_err(|e| {
-            AppError::from_def(error_codes::EXTERNAL_CALL_FAILED)
-                .with_context(format!("sync_balance failed for {}: {}", asset_id, e))
-        })
+        self.accounts.sync_balance(&token).await
     }
 
     // Expose the underlying registry if needed by callers.
