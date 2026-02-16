@@ -102,9 +102,7 @@ where
         receipt: &ExecutionReceipt,
     ) -> Result<FinalizerResult, AppError> {
         let id = liq_id_from_receipt(receipt)?;
-        wal.update_status(&id, ResultStatus::Succeeded, true)
-            .await
-            .map_err(|e| format!("wal update failed: {e}"))?;
+        wal.update_status(&id, ResultStatus::Succeeded, true).await?;
         Ok(FinalizerResult {
             finalized: true,
             swap_result: None,

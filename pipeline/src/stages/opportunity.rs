@@ -5,7 +5,7 @@ use candid::{Encode, Principal};
 use liquidium_pipeline_connectors::pipeline_agent::PipelineAgent;
 use liquidium_pipeline_core::types::protocol_types::{AssetType, LiquidatebleUser, ScanResult};
 
-use crate::error::AppError;
+use crate::error::{AppError, error_codes};
 use crate::stage::PipelineStage;
 
 pub struct OpportunityFinder<A: PipelineAgent> {
@@ -37,7 +37,9 @@ where
         let mut opportunities: Vec<LiquidatebleUser> = Vec::new();
 
         loop {
-            let args = Encode!(&cursor, &scan_limit, &max_results).map_err(|e| e.to_string())?;
+            let args = Encode!(&cursor, &scan_limit, &max_results).map_err(|e| {
+                AppError::from_def(error_codes::ENCODE_ERROR).with_context(format!("candid encode error: {e}"))
+            })?;
 
             let ScanResult {
                 users: mut page_users,
@@ -48,7 +50,10 @@ where
                 .agent
                 .call_query::<ScanResult>(&self.canister_id, "scan_at_risk_positions", args)
                 .await
-                .map_err(|e| format!("Agent query error: {e}"))?;
+                .map_err(|e| {
+                    AppError::from_def(error_codes::EXTERNAL_CALL_FAILED)
+                        .with_context(format!("agent query error: {e}"))
+                })?;
 
             opportunities.append(&mut page_users);
 

@@ -220,7 +220,7 @@ mod tests {
 
         let err = finalizer.swap(&req).await.expect_err("swap should fail");
 
-        assert_eq!(err, "boom".to_string());
+        assert!(err.to_string().contains("boom"));
     }
 
     #[tokio::test]
@@ -272,6 +272,6 @@ mod tests {
             .await
             .expect_err("finalize should fail");
 
-        assert_eq!(err, "boom".to_string());
+        assert!(err.to_string().contains("boom"));
     }
 }

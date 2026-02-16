@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use csv::WriterBuilder;
 use serde::Serialize;
 
-use crate::error::AppError;
+use crate::error::{AppError, error_codes};
 use crate::{finalizers::liquidation_outcome::LiquidationOutcome, stage::PipelineStage};
 
 pub struct ExportStage {
@@ -38,19 +38,29 @@ impl<'a> PipelineStage<'a, Vec<LiquidationOutcome>, ()> for ExportStage {
         if let Some(parent) = path.parent()
             && !parent.as_os_str().is_empty()
         {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| format_file_error("create export parent directory", path, &e))?;
+            std::fs::create_dir_all(parent).map_err(|e| {
+                AppError::from_def(error_codes::PERSISTENCE_ERROR).with_context(format_file_error(
+                    "create export parent directory",
+                    path,
+                    &e,
+                ))
+            })?;
         }
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)
-            .map_err(|e| format_file_error("open export file", path, &e))?;
+        let file = OpenOptions::new().create(true).append(true).open(path).map_err(|e| {
+            AppError::from_def(error_codes::PERSISTENCE_ERROR).with_context(format_file_error(
+                "open export file",
+                path,
+                &e,
+            ))
+        })?;
 
-        let is_empty = file
-            .metadata()
-            .map(|m| m.len() == 0)
-            .map_err(|e| format_file_error("read export file metadata", path, &e))?;
+        let is_empty = file.metadata().map(|m| m.len() == 0).map_err(|e| {
+            AppError::from_def(error_codes::PERSISTENCE_ERROR).with_context(format_file_error(
+                "read export file metadata",
+                path,
+                &e,
+            ))
+        })?;
         let mut wtr = WriterBuilder::new();
         if !is_empty {
             wtr.has_headers(false);
@@ -104,10 +114,14 @@ impl<'a> PipelineStage<'a, Vec<LiquidationOutcome>, ()> for ExportStage {
                 slippage: r.finalizer_result.swap_result.as_ref().map(|s| s.slippage),
                 swap_ts: r.finalizer_result.swap_result.as_ref().map(|s| s.ts),
             };
-            wtr.serialize(row).map_err(|e| format!("CSV serialize error: {}", e))?;
+            wtr.serialize(row).map_err(|e| {
+                AppError::from_def(error_codes::SERIALIZATION_ERROR).with_context(format!("CSV serialize error: {e}"))
+            })?;
         }
 
-        wtr.flush().map_err(|e| format!("CSV flush error: {}", e))?;
+        wtr.flush().map_err(|e| {
+            AppError::from_def(error_codes::PERSISTENCE_ERROR).with_context(format!("CSV flush error: {e}"))
+        })?;
         Ok(())
     }
 }

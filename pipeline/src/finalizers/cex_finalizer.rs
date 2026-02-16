@@ -289,7 +289,7 @@ impl Finalizer for dyn CexFinalizerLogic {
                 // Persist last known state for journaling before exiting.
                 meta.meta = serde_json::to_vec(&cex_state).map_err(|e| e.to_string())?;
                 encode_meta(&mut row_after, &meta)?;
-                wal.upsert_result(row_after.clone()).await.map_err(|e| e.to_string())?;
+                wal.upsert_result(row_after.clone()).await?;
                 return Err(err);
             }
 
@@ -301,7 +301,7 @@ impl Finalizer for dyn CexFinalizerLogic {
             // Persist state after each successful step so we can resume safely on crash.
             meta.meta = serde_json::to_vec(&cex_state).map_err(|e| e.to_string())?;
             encode_meta(&mut row_after, &meta)?;
-            wal.upsert_result(row_after.clone()).await.map_err(|e| e.to_string())?;
+            wal.upsert_result(row_after.clone()).await?;
 
             if matches!(cex_state.step, CexStep::DepositPending) {
                 break;
@@ -314,7 +314,7 @@ impl Finalizer for dyn CexFinalizerLogic {
             row_after.status = ResultStatus::Succeeded;
             meta.meta = serde_json::to_vec(&cex_state).map_err(|e| e.to_string())?;
             encode_meta(&mut row_after, &meta)?;
-            wal.upsert_result(row_after).await.map_err(|e| e.to_string())?;
+            wal.upsert_result(row_after).await?;
 
             let swap_exec = self.finish(&receipt, &cex_state).await?;
             FinalizerResult {
@@ -324,7 +324,7 @@ impl Finalizer for dyn CexFinalizerLogic {
             }
         } else {
             // Minimal change: just persist the updated state (already done in-loop).
-            wal.upsert_result(row_after).await.map_err(|e| e.to_string())?;
+            wal.upsert_result(row_after).await?;
             info!(
                 "[cex] ⏸️ liq_id={} finalize paused at step={:?}",
                 cex_state.liq_id, cex_state.step

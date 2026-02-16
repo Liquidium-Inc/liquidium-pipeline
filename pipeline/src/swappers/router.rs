@@ -3,7 +3,7 @@ use std::{collections::HashMap, sync::Arc};
 use async_trait::async_trait;
 use tracing::instrument;
 
-use crate::error::AppError;
+use crate::error::{AppError, error_codes};
 use crate::swappers::{
     model::{SwapExecution, SwapQuote, SwapRequest},
     swap_interface::SwapInterface,
@@ -61,7 +61,8 @@ impl SwapRouter {
         if errors.is_empty() {
             Ok(())
         } else {
-            Err(format!("swap venue init errors: {}", errors.join("; ")).into())
+            Err(AppError::from_def(error_codes::INTERNAL_ERROR)
+                .with_context(format!("swap venue init errors: {}", errors.join("; "))))
         }
     }
 

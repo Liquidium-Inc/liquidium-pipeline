@@ -144,7 +144,7 @@ impl<C: CexBackend> SwapVenue for MexcSwapVenue<C> {
     }
 
     async fn init(&self) -> Result<(), AppError> {
-        // Epmty impl;
+        // Empty impl
 
         Ok(())
     }

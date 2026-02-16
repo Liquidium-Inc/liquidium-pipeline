@@ -279,7 +279,9 @@ fn setup_agents_and_provider(
             .with_identity(config.liquidator_identity.clone())
             .with_max_tcp_error_retries(3)
             .build()
-            .map_err(|e| format!("ic agent(main) build: {e}"))?,
+            .map_err(|e| {
+                AppError::from_def(error_codes::CONFIG_ERROR).with_context(format!("ic agent(main) build failed: {e}"))
+            })?,
     );
 
     let agent_trader = Arc::new(
@@ -288,24 +290,23 @@ fn setup_agents_and_provider(
             .with_identity(config.trader_identity.clone())
             .with_max_tcp_error_retries(3)
             .build()
-            .map_err(|e| format!("ic agent(trader) build: {e}"))?,
+            .map_err(|e| {
+                AppError::from_def(error_codes::CONFIG_ERROR)
+                    .with_context(format!("ic agent(trader) build failed: {e}"))
+            })?,
     );
 
     // Build a wallet-backed EVM RootProvider from config.evm_url and config.evm_private_key.
-    let signer: PrivateKeySigner = config
-        .evm_private_key
-        .parse()
-        .map_err(|e| format!("failed parsing evm private key: {e}"))?;
+    let signer: PrivateKeySigner = config.evm_private_key.parse().map_err(|e| {
+        AppError::from_def(error_codes::CONFIG_ERROR).with_context(format!("failed parsing evm private key: {e}"))
+    })?;
 
     let main_provider = ProviderBuilder::new()
         .network::<AnyNetwork>()
         .wallet(signer)
-        .connect_http(
-            config
-                .evm_rpc_url
-                .parse()
-                .map_err(|e| format!("invalid evm rpc url: {e}"))?,
-        );
+        .connect_http(config.evm_rpc_url.parse().map_err(|e| {
+            AppError::from_def(error_codes::CONFIG_ERROR).with_context(format!("invalid evm rpc url: {e}"))
+        })?);
 
     Ok((agent_main, agent_trader, main_provider))
 }

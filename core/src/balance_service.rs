@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use futures::future::join_all;
-use tracing::instrument;
+use tracing::{instrument, warn};
 
 use crate::{
     account::actions::AccountInfo,
@@ -55,6 +55,10 @@ impl BalanceService {
             .into_iter()
             .filter_map(|r| match r {
                 Ok((id, bal)) if bal.value > 0u128 => Some((id, bal)),
+                Err(err) => {
+                    warn!("non_zero dropped sync error: {}", err);
+                    None
+                }
                 _ => None,
             })
             .collect()

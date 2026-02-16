@@ -84,7 +84,9 @@ impl<'a, A: PipelineAgent, D: WalStore> PipelineStage<'a, Vec<ExecutorRequest>, 
                     liq_req.buy_bad_debt
                 );
 
-                let args = Encode!(&liq_req).map_err(|e| e.to_string())?;
+                let args = Encode!(&liq_req).map_err(|e| {
+                    AppError::from_def(error_codes::ENCODE_ERROR).with_context(format!("candid encode error: {e}"))
+                })?;
 
                 let liq_call = match self
                     .agent
