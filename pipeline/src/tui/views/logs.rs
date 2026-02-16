@@ -5,7 +5,6 @@ use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
-use unicode_width::UnicodeWidthStr;
 
 use super::super::app::{App, UiFocus};
 
@@ -338,8 +337,8 @@ pub(crate) fn wrapped_row_count_for_entry(line: &str, content_width: usize) -> u
         return 1;
     }
 
-    // Keep empty lines visible as one visual row.
-    let width = line.trim_end_matches('\r').width().max(1);
+    // Keep row estimation in lockstep with what ratatui actually renders.
+    let width = log_to_line(line).width().max(1);
     width.div_ceil(content_width)
 }
 
@@ -458,9 +457,11 @@ pub(super) fn draw_logs(f: &mut Frame<'_>, area: Rect, app: &App) {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::VecDeque;
+
     use ratatui::style::Color;
 
-    use super::log_to_line;
+    use super::{log_to_line, scroll_up_by_entries, wrapped_row_count_for_entry};
 
     #[test]
     fn highlights_lowercase_level_after_timestamp() {
@@ -514,5 +515,25 @@ mod tests {
         assert!(has_success_green, "Success should be highlighted in green");
         assert!(has_negative_profit_red, "negative profit should be highlighted in red");
         assert!(has_positive_profit_green, "positive profit should be highlighted in green");
+    }
+
+    #[test]
+    fn wrapped_row_count_uses_rendered_width_for_deduped_prefix_lines() {
+        let raw = "2026-02-12T14:07:05.072810Z INFO  2026-02-12T14:07:05.071699Z INFO liquidation.init: Initializing liquidations stage";
+        let rendered = log_to_line(raw);
+        let rendered_width = rendered.width().max(1);
+
+        assert_eq!(wrapped_row_count_for_entry(raw, rendered_width), 1);
+    }
+
+    #[test]
+    fn scroll_up_moves_by_one_rendered_entry_even_when_raw_line_is_longer() {
+        let raw = "2026-02-12T14:07:05.072810Z INFO  2026-02-12T14:07:05.071699Z INFO liquidation.init: Initializing liquidations stage";
+        let rendered_width = log_to_line(raw).width().max(1);
+        let mut logs = VecDeque::new();
+        logs.push_back(raw.to_string());
+
+        let next = scroll_up_by_entries(&logs, rendered_width, 0, 1);
+        assert_eq!(next, 1);
     }
 }
