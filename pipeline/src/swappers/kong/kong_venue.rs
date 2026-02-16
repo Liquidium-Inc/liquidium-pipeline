@@ -6,7 +6,7 @@ use liquidium_pipeline_connectors::pipeline_agent::PipelineAgent;
 use liquidium_pipeline_core::tokens::chain_token::ChainToken;
 use log::{info, warn};
 
-use crate::error::AppResult;
+use crate::error::AppError;
 use crate::swappers::kong::kong_swapper::KongSwapSwapper;
 use crate::swappers::kong::kong_types::{
     SwapAmountsReply as KongSwapAmountsReply, SwapArgs as KongSwapArgs, SwapReply as KongSwapReply,
@@ -27,7 +27,7 @@ impl<A: PipelineAgent> KongVenue<A> {
         Self { swapper, tokens }
     }
 
-    fn find_token(&self, symbol: &str) -> AppResult<ChainToken> {
+    fn find_token(&self, symbol: &str) -> Result<ChainToken, AppError> {
         self.tokens
             .iter()
             .find(|t| t.symbol() == symbol)
@@ -45,7 +45,7 @@ where
         "kong"
     }
 
-    async fn init(&self) -> AppResult<()> {
+    async fn init(&self) -> Result<(), AppError> {
         let kong_tokens = self
             .tokens
             .iter()
@@ -63,7 +63,7 @@ where
         Ok(())
     }
 
-    async fn quote(&self, req: &SwapRequest) -> AppResult<SwapQuote> {
+    async fn quote(&self, req: &SwapRequest) -> Result<SwapQuote, AppError> {
         let token_out = self.find_token(&req.receive_asset.symbol)?;
         let token_in = self.find_token(&req.pay_asset.symbol)?;
 
@@ -85,7 +85,7 @@ where
         Ok(SwapQuote::from(kong_reply))
     }
 
-    async fn execute(&self, req: &SwapRequest) -> AppResult<SwapExecution> {
+    async fn execute(&self, req: &SwapRequest) -> Result<SwapExecution, AppError> {
         let token_in = self.find_token(&req.pay_asset.symbol)?;
 
         let mut kong_req: KongSwapArgs = KongSwapArgs::from(req.clone());

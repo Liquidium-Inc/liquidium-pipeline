@@ -2,12 +2,12 @@ use liquidium_pipeline_core::types::protocol_types::LiquidationResult;
 use serde::Serialize;
 
 use crate::{
-    error::{AppError, AppResult, error_codes},
+    error::{AppError, error_codes},
     persistance::{LiqMetaWrapper, LiqResultRecord, ResultStatus, WalStore},
     stages::executor::ExecutionReceipt,
 };
 
-pub fn decode_receipt_wrapper(row: &LiqResultRecord) -> AppResult<Option<LiqMetaWrapper>> {
+pub fn decode_receipt_wrapper(row: &LiqResultRecord) -> Result<Option<LiqMetaWrapper>, AppError> {
     if row.meta_json.is_empty() || row.meta_json == "{}" {
         return Ok(None);
     }
@@ -31,7 +31,7 @@ pub fn decode_receipt_wrapper(row: &LiqResultRecord) -> AppResult<Option<LiqMeta
     }
 }
 
-pub fn encode_meta<T: Serialize>(row: &mut LiqResultRecord, meta: &T) -> AppResult<()> {
+pub fn encode_meta<T: Serialize>(row: &mut LiqResultRecord, meta: &T) -> Result<(), AppError> {
     row.meta_json = serde_json::to_string(meta).map_err(|e| {
         AppError::from_def(error_codes::SERIALIZATION_ERROR)
             .with_context(format!("failed to serialize meta_json for {}: {}", row.id, e))
@@ -43,7 +43,7 @@ pub fn encode_meta<T: Serialize>(row: &mut LiqResultRecord, meta: &T) -> AppResu
 // Helper to extract liq_id from ExecutionReceipt
 //
 
-pub fn liq_id_from_receipt(receipt: &ExecutionReceipt) -> AppResult<String> {
+pub fn liq_id_from_receipt(receipt: &ExecutionReceipt) -> Result<String, AppError> {
     let liq: &LiquidationResult = receipt.liquidation_result.as_ref().ok_or_else(|| {
         AppError::from_def(error_codes::INVALID_INPUT).with_context("missing liquidation_result in receipt")
     })?;
@@ -54,29 +54,29 @@ pub fn liq_id_from_receipt(receipt: &ExecutionReceipt) -> AppResult<String> {
 //
 // WAL wrappers for finalizer
 //
-pub async fn wal_load(wal: &dyn WalStore, liq_id: &str) -> AppResult<Option<LiqResultRecord>> {
+pub async fn wal_load(wal: &dyn WalStore, liq_id: &str) -> Result<Option<LiqResultRecord>, AppError> {
     wal.get_result(liq_id).await
 }
 
-pub async fn wal_mark_inflight(wal: &dyn WalStore, liq_id: &str) -> AppResult<()> {
+pub async fn wal_mark_inflight(wal: &dyn WalStore, liq_id: &str) -> Result<(), AppError> {
     wal.update_status(liq_id, ResultStatus::InFlight, true).await
 }
 
-pub async fn wal_mark_succeeded(wal: &dyn WalStore, liq_id: &str) -> AppResult<()> {
+pub async fn wal_mark_succeeded(wal: &dyn WalStore, liq_id: &str) -> Result<(), AppError> {
     wal.update_status(liq_id, ResultStatus::Succeeded, true).await
 }
 
-pub async fn wal_mark_retryable_failed(wal: &dyn WalStore, liq_id: &str, last_error: AppError) -> AppResult<()> {
+pub async fn wal_mark_retryable_failed(wal: &dyn WalStore, liq_id: &str, last_error: AppError) -> Result<(), AppError> {
     wal.update_failure(liq_id, ResultStatus::FailedRetryable, last_error, true)
         .await
 }
 
-pub async fn wal_mark_permanent_failed(wal: &dyn WalStore, liq_id: &str, last_error: AppError) -> AppResult<()> {
+pub async fn wal_mark_permanent_failed(wal: &dyn WalStore, liq_id: &str, last_error: AppError) -> Result<(), AppError> {
     wal.update_failure(liq_id, ResultStatus::FailedPermanent, last_error, true)
         .await
 }
 
-pub async fn wal_mark_enqueued(wal: &dyn WalStore, liq_id: &str) -> AppResult<()> {
+pub async fn wal_mark_enqueued(wal: &dyn WalStore, liq_id: &str) -> Result<(), AppError> {
     wal.update_status(liq_id, ResultStatus::Enqueued, true).await
 }
 

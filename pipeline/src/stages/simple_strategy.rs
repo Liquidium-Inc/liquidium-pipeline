@@ -7,7 +7,7 @@ use crate::config::ConfigTrait;
 use crate::executors::executor::ExecutorRequest;
 
 use crate::approval_state::ApprovalState;
-use crate::error::AppResult;
+use crate::error::AppError;
 use crate::liquidation::collateral_service::CollateralServiceTrait;
 use crate::stage::PipelineStage;
 
@@ -169,7 +169,7 @@ where
     }
 
     // Helper: Prefetch balances for all debt assets we might need
-    async fn prefetch_balances_for_users(&self, users: &[LiquidatebleUser]) -> AppResult<HashMap<String, Nat>> {
+    async fn prefetch_balances_for_users(&self, users: &[LiquidatebleUser]) -> Result<HashMap<String, Nat>, AppError> {
         let mut debt_assets: HashSet<ChainToken> = HashSet::new();
         for user in users.iter() {
             for pos in user.positions.iter() {
@@ -254,7 +254,7 @@ where
         work_users: &mut [LiquidatebleUser],
         result: &mut Vec<ExecutorRequest>,
         cleared_debts: &HashSet<String>,
-    ) -> AppResult<()> {
+    ) -> Result<(), AppError> {
         if bad_debts.is_empty() {
             return Ok(());
         }
@@ -398,7 +398,7 @@ where
     R: TokenRegistryTrait + 'static,
     U: CollateralServiceTrait,
 {
-    async fn process(&self, users: &'a Vec<LiquidatebleUser>) -> AppResult<Vec<ExecutorRequest>> {
+    async fn process(&self, users: &'a Vec<LiquidatebleUser>) -> Result<Vec<ExecutorRequest>, AppError> {
         let mut result: Vec<ExecutorRequest> = Vec::new();
 
         // Prefetch balances for all debt assets we might need

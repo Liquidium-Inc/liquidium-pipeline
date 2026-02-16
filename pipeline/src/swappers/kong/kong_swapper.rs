@@ -19,7 +19,7 @@ use log::{debug, info, warn};
 use liquidium_pipeline_connectors::pipeline_agent::PipelineAgent;
 
 use crate::approval_state::ApprovalState;
-use crate::error::AppResult;
+use crate::error::AppError;
 use crate::swappers::kong::kong_types::{SwapAmountsReply, SwapArgs, SwapReply, SwapResult};
 use crate::utils::max_for_ledger;
 
@@ -48,7 +48,7 @@ impl<A: PipelineAgent> KongSwapSwapper<A> {
         }
     }
 
-    pub async fn ensure_allowance(&self, token: &ChainToken) -> AppResult<bool> {
+    pub async fn ensure_allowance(&self, token: &ChainToken) -> Result<bool, AppError> {
         let ledger = match token {
             ChainToken::Icp { ledger, .. } => *ledger,
             _ => return Ok(false),
@@ -110,7 +110,7 @@ impl<A: PipelineAgent> KongSwapSwapper<A> {
         Ok(true)
     }
 
-    pub async fn init(&self, tokens: &[Principal]) -> AppResult<()> {
+    pub async fn init(&self, tokens: &[Principal]) -> Result<(), AppError> {
         let owner = self.dex_account.owner;
         let this = self;
 
@@ -193,7 +193,7 @@ impl<A: PipelineAgent> KongSwapSwapper<A> {
         token_in: &ChainToken,
         token_out: &ChainToken,
         amount: &ChainTokenAmount,
-    ) -> AppResult<SwapAmountsReply> {
+    ) -> Result<SwapAmountsReply, AppError> {
         let dex_principal = Principal::from_str(DEX_PRINCIPAL).expect("invalid DEX_PRINCIPAL");
 
         info!(
@@ -236,7 +236,7 @@ impl<A: PipelineAgent> KongSwapSwapper<A> {
         Ok(result)
     }
 
-    pub async fn balance_of(&self, token: &ChainToken) -> AppResult<Nat> {
+    pub async fn balance_of(&self, token: &ChainToken) -> Result<Nat, AppError> {
         let ledger = match token {
             ChainToken::Icp { ledger, .. } => *ledger,
             _ => return Err("unsupported token type for balance query".into()),
@@ -260,7 +260,7 @@ impl<A: PipelineAgent> KongSwapSwapper<A> {
         Ok(result)
     }
 
-    pub async fn swap(&self, swap_args: SwapArgs) -> AppResult<SwapReply> {
+    pub async fn swap(&self, swap_args: SwapArgs) -> Result<SwapReply, AppError> {
         debug!("Swap args {:#?}", swap_args);
         let pay_amount = swap_args.pay_amount.clone();
         let pay_token = swap_args.pay_token.clone();
@@ -299,7 +299,7 @@ impl<A: PipelineAgent> KongSwapSwapper<A> {
 }
 
 impl<A: PipelineAgent> KongSwapSwapper<A> {
-    async fn approve(&self, ledger: &Principal, spender: Account) -> AppResult<Nat> {
+    async fn approve(&self, ledger: &Principal, spender: Account) -> Result<Nat, AppError> {
         let args = ApproveArgs {
             from_subaccount: None,
             spender,

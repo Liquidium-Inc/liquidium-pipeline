@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
-use crate::error::AppResult;
+use crate::error::AppError;
 use crate::{
     finalizers::dex_finalizer::DexFinalizerLogic,
     swappers::{
@@ -32,7 +32,7 @@ impl<S> DexFinalizerLogic for KongSwapFinalizer<S>
 where
     S: SwapInterface + Send + Sync,
 {
-    async fn swap(&self, req: &SwapRequest) -> AppResult<SwapExecution> {
+    async fn swap(&self, req: &SwapRequest) -> Result<SwapExecution, AppError> {
         self.swapper.execute(req).await
     }
 }

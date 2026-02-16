@@ -1,7 +1,7 @@
 use candid::Nat;
 use liquidium_pipeline_connectors::backend::cex_backend::OrderBookLevel;
 
-use crate::error::AppResult;
+use crate::error::AppError;
 
 /// Floating-point epsilon used for liquidity comparisons.
 pub(super) const LIQUIDITY_EPS: f64 = 1e-9;
@@ -49,7 +49,10 @@ pub(super) fn f64_to_nat(v: f64) -> Nat {
 
 /// Simulate selling `amount_in_base` into `bids`.
 /// Returns `(quote_out, avg_price, impact_bps, unfilled_base)`.
-pub(super) fn simulate_sell_from_bids(bids: &[OrderBookLevel], amount_in_base: f64) -> AppResult<(f64, f64, f64, f64)> {
+pub(super) fn simulate_sell_from_bids(
+    bids: &[OrderBookLevel],
+    amount_in_base: f64,
+) -> Result<(f64, f64, f64, f64), AppError> {
     if amount_in_base <= 0.0 {
         return Err("amount_in_base must be positive".into());
     }
@@ -84,7 +87,7 @@ pub(super) fn simulate_sell_from_bids(bids: &[OrderBookLevel], amount_in_base: f
 
 /// Simulate buying base with `quote_in` from `asks`.
 /// Returns `(base_out, avg_price, impact_bps, unspent_quote)`.
-pub(super) fn simulate_buy_from_asks(asks: &[OrderBookLevel], quote_in: f64) -> AppResult<(f64, f64, f64, f64)> {
+pub(super) fn simulate_buy_from_asks(asks: &[OrderBookLevel], quote_in: f64) -> Result<(f64, f64, f64, f64), AppError> {
     if quote_in <= 0.0 {
         return Err("quote_in must be positive".into());
     }

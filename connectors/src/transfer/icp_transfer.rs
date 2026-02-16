@@ -5,7 +5,7 @@ use candid::Nat;
 use icrc_ledger_types::icrc1::account::Account;
 use icrc_ledger_types::icrc2::approve::ApproveArgs;
 use liquidium_pipeline_core::account::model::ChainAccount;
-use liquidium_pipeline_core::error::{AppError, AppResult, error_codes};
+use liquidium_pipeline_core::error::{AppError, error_codes};
 use liquidium_pipeline_core::tokens::chain_token::ChainToken;
 use liquidium_pipeline_core::transfer::actions::TransferActions;
 use log::info;
@@ -25,7 +25,7 @@ impl<B: IcpBackend> IcpTransferAdapter<B> {
 
 #[async_trait]
 impl<B: IcpBackend + Send + Sync> TransferActions for IcpTransferAdapter<B> {
-    async fn transfer(&self, token: &ChainToken, to: &ChainAccount, amount_native: Nat) -> AppResult<String> {
+    async fn transfer(&self, token: &ChainToken, to: &ChainAccount, amount_native: Nat) -> Result<String, AppError> {
         let from_owner = self.account.owner.to_text();
         let from_subaccount = if self.account.subaccount.is_some() {
             "some"
@@ -87,7 +87,12 @@ impl<B: IcpBackend + Send + Sync> TransferActions for IcpTransferAdapter<B> {
         }
     }
 
-    async fn approve(&self, token: &ChainToken, spender: &ChainAccount, amount_native: Nat) -> AppResult<String> {
+    async fn approve(
+        &self,
+        token: &ChainToken,
+        spender: &ChainAccount,
+        amount_native: Nat,
+    ) -> Result<String, AppError> {
         match (token, spender) {
             (ChainToken::Icp { ledger, .. }, ChainAccount::Icp(spender_account)) => {
                 let args = ApproveArgs {

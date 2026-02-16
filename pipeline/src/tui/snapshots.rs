@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::error::{AppError, AppResult};
+use crate::error::AppError;
 use chrono::Local;
 
 use liquidium_pipeline_core::tokens::asset_id::AssetId;
@@ -11,7 +11,9 @@ use liquidium_pipeline_core::tokens::token_registry::TokenRegistryTrait;
 use super::app::{BalanceRowData, BalancesSnapshot, ProfitBySymbol, ProfitsSnapshot};
 use super::format;
 
-pub(super) async fn fetch_balances_snapshot(ctx: Arc<crate::context::PipelineContext>) -> AppResult<BalancesSnapshot> {
+pub(super) async fn fetch_balances_snapshot(
+    ctx: Arc<crate::context::PipelineContext>,
+) -> Result<BalancesSnapshot, AppError> {
     let mut asset_ids: Vec<AssetId> = ctx.registry.all().into_iter().map(|(id, _)| id).collect();
     asset_ids.sort_by(|a, b| {
         a.chain
@@ -53,7 +55,10 @@ struct ExecutionCsvRow {
     status: Option<String>,
 }
 
-pub(super) fn compute_profits_snapshot(export_path: &str, registry: &TokenRegistry) -> AppResult<ProfitsSnapshot> {
+pub(super) fn compute_profits_snapshot(
+    export_path: &str,
+    registry: &TokenRegistry,
+) -> Result<ProfitsSnapshot, AppError> {
     let mut totals: HashMap<String, (usize, i128, i128)> = HashMap::new();
 
     let mut rdr = match csv::ReaderBuilder::new().from_path(export_path) {

@@ -3,7 +3,7 @@ use std::sync::Arc;
 use candid::Nat;
 
 use crate::account::model::ChainAccount;
-use crate::error::{AppError, AppResult, error_codes};
+use crate::error::{AppError, error_codes};
 use crate::tokens::asset_id::AssetId;
 use crate::tokens::token_registry::{TokenRegistry, TokenRegistryTrait};
 use crate::transfer::actions::TransferActions;
@@ -27,7 +27,7 @@ impl TransferService {
         asset_id: &AssetId,
         to: ChainAccount,
         amount_native: Nat,
-    ) -> AppResult<String> {
+    ) -> Result<String, AppError> {
         let token = self
             .registry
             .get(asset_id)

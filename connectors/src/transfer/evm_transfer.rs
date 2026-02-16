@@ -3,7 +3,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use candid::Nat;
 use liquidium_pipeline_core::account::model::ChainAccount;
-use liquidium_pipeline_core::error::{AppError, AppResult, error_codes};
+use liquidium_pipeline_core::error::{AppError, error_codes};
 use liquidium_pipeline_core::tokens::chain_token::ChainToken;
 use liquidium_pipeline_core::transfer::actions::TransferActions;
 
@@ -21,7 +21,7 @@ impl<B: EvmBackend> EvmTransferAdapter<B> {
 
 #[async_trait]
 impl<B: EvmBackend + Send + Sync> TransferActions for EvmTransferAdapter<B> {
-    async fn transfer(&self, token: &ChainToken, to: &ChainAccount, amount_native: Nat) -> AppResult<String> {
+    async fn transfer(&self, token: &ChainToken, to: &ChainAccount, amount_native: Nat) -> Result<String, AppError> {
         match (token, to) {
             (ChainToken::EvmNative { chain, .. }, ChainAccount::Evm(to_address)) => {
                 let amount = amount_native;
@@ -52,7 +52,12 @@ impl<B: EvmBackend + Send + Sync> TransferActions for EvmTransferAdapter<B> {
         }
     }
 
-    async fn approve(&self, _token: &ChainToken, _spender: &ChainAccount, _amount_native: Nat) -> AppResult<String> {
+    async fn approve(
+        &self,
+        _token: &ChainToken,
+        _spender: &ChainAccount,
+        _amount_native: Nat,
+    ) -> Result<String, AppError> {
         Err(AppError::from_def(error_codes::UNSUPPORTED).with_context("EvmTransferAdapter does not support approve"))
     }
 }

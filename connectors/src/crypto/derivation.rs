@@ -1,11 +1,11 @@
 use bip32::{DerivationPath, XPrv};
 use bip39::{Language, Mnemonic};
 use k256::SecretKey;
-use liquidium_pipeline_core::error::{AppError, AppResult, error_codes};
+use liquidium_pipeline_core::error::{AppError, error_codes};
 use std::str::FromStr;
 
 // Derive a raw Ethereum private key from a mnemonic and BIP32 path.
-pub fn derive_evm_private_key(mnemonic: &str, account: u32, index: u32) -> AppResult<SecretKey> {
+pub fn derive_evm_private_key(mnemonic: &str, account: u32, index: u32) -> Result<SecretKey, AppError> {
     // Parse mnemonic
     let mnemonic = Mnemonic::parse_in(Language::English, mnemonic)
         .map_err(|e| AppError::from_def(error_codes::INVALID_INPUT).with_context(format!("invalid mnemonic: {e}")))?;

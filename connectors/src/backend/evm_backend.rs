@@ -7,7 +7,7 @@ use alloy::{
 };
 use async_trait::async_trait;
 use candid::Nat;
-use liquidium_pipeline_core::error::{AppError, AppResult, error_codes};
+use liquidium_pipeline_core::error::{AppError, error_codes};
 
 sol! {
     #[sol(rpc)]
@@ -22,22 +22,28 @@ sol! {
 #[async_trait]
 pub trait EvmBackend: Send + Sync {
     // ERC20 balance for the pipeline wallet on a given chain.
-    async fn erc20_balance(&self, chain: &str, token_address: &str) -> AppResult<Nat>;
+    async fn erc20_balance(&self, chain: &str, token_address: &str) -> Result<Nat, AppError>;
 
     // Native coin balance (ETH, ARB, etc) for the pipeline wallet.
-    async fn native_balance(&self, chain: &str) -> AppResult<Nat>;
+    async fn native_balance(&self, chain: &str) -> Result<Nat, AppError>;
 
     // ERC20 transfer from the pipeline wallet.
-    async fn erc20_transfer(&self, chain: &str, token_address: &str, to: &str, amount_wei: Nat) -> AppResult<String>; // tx hash
+    async fn erc20_transfer(
+        &self,
+        chain: &str,
+        token_address: &str,
+        to: &str,
+        amount_wei: Nat,
+    ) -> Result<String, AppError>; // tx hash
 
     // Native transfer from the pipeline wallet.
-    async fn native_transfer(&self, chain: &str, to: &str, amount_wei: Nat) -> AppResult<String>;
+    async fn native_transfer(&self, chain: &str, to: &str, amount_wei: Nat) -> Result<String, AppError>;
 
     // Decimals
-    async fn erc20_decimals(&self, chain: &str, token_address: &str) -> AppResult<u8>;
+    async fn erc20_decimals(&self, chain: &str, token_address: &str) -> Result<u8, AppError>;
 }
 
-fn nat_to_u256(n: &Nat) -> AppResult<U256> {
+fn nat_to_u256(n: &Nat) -> Result<U256, AppError> {
     let bytes: Vec<u8> = n.0.to_bytes_be();
     if bytes.len() > 32 {
         return Err(AppError::from_def(error_codes::INVALID_INPUT).with_context("Nat too large for U256"));
@@ -64,7 +70,7 @@ impl<P> EvmBackend for EvmBackendImpl<P>
 where
     P: Provider<AnyNetwork> + WalletProvider<AnyNetwork> + Send + Sync + Clone + 'static,
 {
-    async fn erc20_balance(&self, _chain: &str, token_address: &str) -> AppResult<Nat> {
+    async fn erc20_balance(&self, _chain: &str, token_address: &str) -> Result<Nat, AppError> {
         let owner = self.provider.wallet().default_signer_address();
 
         let token_addr: Address = token_address.parse().map_err(|e| {
@@ -80,7 +86,7 @@ where
         Ok(u256_to_nat(res))
     }
 
-    async fn native_balance(&self, _chain: &str) -> AppResult<Nat> {
+    async fn native_balance(&self, _chain: &str) -> Result<Nat, AppError> {
         let bal: U256 = self.provider.get_balance(self.wallet_address()).await.map_err(|e| {
             AppError::from_def(error_codes::EXTERNAL_CALL_FAILED)
                 .with_context(format!("native get_balance failed: {e}"))
@@ -89,7 +95,13 @@ where
         Ok(u256_to_nat(bal))
     }
 
-    async fn erc20_transfer(&self, _chain: &str, token_address: &str, to: &str, amount_wei: Nat) -> AppResult<String> {
+    async fn erc20_transfer(
+        &self,
+        _chain: &str,
+        token_address: &str,
+        to: &str,
+        amount_wei: Nat,
+    ) -> Result<String, AppError> {
         let token_addr: Address = token_address.parse().map_err(|e| {
             AppError::from_def(error_codes::INVALID_INPUT).with_context(format!("invalid token address: {e}"))
         })?;
@@ -110,7 +122,7 @@ where
         Ok(tx_hash)
     }
 
-    async fn native_transfer(&self, _chain: &str, to: &str, amount_wei: Nat) -> AppResult<String> {
+    async fn native_transfer(&self, _chain: &str, to: &str, amount_wei: Nat) -> Result<String, AppError> {
         let to_addr: Address = to.parse().map_err(|e| {
             AppError::from_def(error_codes::INVALID_INPUT).with_context(format!("invalid recipient address: {e}"))
         })?;
@@ -131,7 +143,7 @@ where
         Ok(format!("{:#x}", tx_hash))
     }
 
-    async fn erc20_decimals(&self, _chain: &str, token_address: &str) -> AppResult<u8> {
+    async fn erc20_decimals(&self, _chain: &str, token_address: &str) -> Result<u8, AppError> {
         let token_addr: Address = token_address.parse().map_err(|e| {
             AppError::from_def(error_codes::INVALID_INPUT).with_context(format!("invalid token address: {e}"))
         })?;

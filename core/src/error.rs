@@ -97,8 +97,6 @@ pub struct AppError {
     pub context: Option<String>,
 }
 
-pub type AppResult<T> = Result<T, AppError>;
-
 impl AppError {
     pub fn from_def(def: ErrorDef) -> Self {
         Self {

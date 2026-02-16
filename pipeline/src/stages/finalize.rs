@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use candid::{Encode, Principal};
 use tracing::{debug, info, warn};
 
-use crate::error::AppResult;
+use crate::error::AppError;
 use crate::finalizers::finalizer::{Finalizer, FinalizerResult};
 use crate::finalizers::liquidation_outcome::LiquidationOutcome;
 use crate::finalizers::profit_calculator::ProfitCalculator;
@@ -88,7 +88,7 @@ where
         }
     }
 
-    async fn refresh_liquidation(&self, liq_id: u128) -> AppResult<LiquidationResult> {
+    async fn refresh_liquidation(&self, liq_id: u128) -> Result<LiquidationResult, AppError> {
         let args = Encode!(&liq_id).map_err(|e| format!("get_liquidation encode error: {e}"))?;
         let res = self
             .agent
@@ -100,7 +100,7 @@ where
         }
     }
 
-    async fn update_receipt_meta(&self, liq_id: &str, receipt: &ExecutionReceipt) -> AppResult<()> {
+    async fn update_receipt_meta(&self, liq_id: &str, receipt: &ExecutionReceipt) -> Result<(), AppError> {
         let row = self.wal.get_result(liq_id).await?;
         if let Some(mut row) = row {
             let mut wrapper = decode_receipt_wrapper(&row)?.unwrap_or(LiqMetaWrapper {
@@ -123,7 +123,7 @@ where
         receipt: &ExecutionReceipt,
         expected_profit: i128,
         realized_profit: i128,
-    ) -> AppResult<()> {
+    ) -> Result<(), AppError> {
         let row = self.wal.get_result(liq_id).await?;
         let Some(mut row) = row else {
             return Err(format!("missing WAL row for liq_id {liq_id}").into());
@@ -158,7 +158,7 @@ where
     P: ProfitCalculator + Sync + Send,
     A: PipelineAgent + Sync + Send,
 {
-    async fn process(&self, _: &'a ()) -> AppResult<Vec<LiquidationOutcome>> {
+    async fn process(&self, _: &'a ()) -> Result<Vec<LiquidationOutcome>, AppError> {
         // Load pending entries from WAL
         let rows = self.wal.get_pending(100).await?;
         debug!("Finalizing rows {:?}", rows);
@@ -422,7 +422,7 @@ mod tests {
 
     #[async_trait::async_trait]
     impl Finalizer for NoopFinalizer {
-        async fn finalize(&self, _: &dyn WalStore, _: ExecutionReceipt) -> AppResult<FinalizerResult> {
+        async fn finalize(&self, _: &dyn WalStore, _: ExecutionReceipt) -> Result<FinalizerResult, AppError> {
             let mut calls = self.calls.lock().unwrap();
             *calls += 1;
             Ok(FinalizerResult {

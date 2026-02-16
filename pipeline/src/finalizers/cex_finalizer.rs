@@ -4,7 +4,7 @@ use liquidium_pipeline_core::tokens::{chain_token::ChainToken, chain_token_amoun
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    error::AppResult,
+    error::AppError,
     finalizers::finalizer::{Finalizer, FinalizerResult},
     persistance::{LiqMetaWrapper, LiqResultRecord, ResultStatus, WalStore},
     stages::executor::{ExecutionReceipt, ExecutionStatus},
@@ -150,27 +150,27 @@ pub struct CexState {
 #[async_trait]
 pub trait CexFinalizerLogic: Send + Sync {
     // Build the initial CEX state for this liquidation from the receipt
-    async fn prepare(&self, liq_id: &str, receipt: &ExecutionReceipt) -> AppResult<CexState>;
+    async fn prepare(&self, liq_id: &str, receipt: &ExecutionReceipt) -> Result<CexState, AppError>;
 
     // On chain: collateral -> CEX deposit asset, send to deposit address
-    async fn deposit(&self, state: &mut CexState) -> AppResult<()>;
+    async fn deposit(&self, state: &mut CexState) -> Result<(), AppError>;
 
     // On CEX: deposit asset -> withdraw asset
-    async fn trade(&self, state: &mut CexState) -> AppResult<()>;
+    async fn trade(&self, state: &mut CexState) -> Result<(), AppError>;
 
     // On CEX: withdraw to chain
-    async fn withdraw(&self, state: &mut CexState) -> AppResult<()>;
+    async fn withdraw(&self, state: &mut CexState) -> Result<(), AppError>;
 
     // Build final SwapExecution to hand back to pipeline when Completed
-    async fn finish(&self, receipt: &ExecutionReceipt, state: &CexState) -> AppResult<SwapExecution>;
+    async fn finish(&self, receipt: &ExecutionReceipt, state: &CexState) -> Result<SwapExecution, AppError>;
 
     // Preview route feasibility and slippage using current orderbook depth.
-    async fn preview_route(&self, receipt: &ExecutionReceipt) -> AppResult<CexRoutePreview>;
+    async fn preview_route(&self, receipt: &ExecutionReceipt) -> Result<CexRoutePreview, AppError>;
 }
 
 #[async_trait]
 impl Finalizer for dyn CexFinalizerLogic {
-    async fn finalize(&self, wal: &dyn WalStore, receipt: ExecutionReceipt) -> AppResult<FinalizerResult> {
+    async fn finalize(&self, wal: &dyn WalStore, receipt: ExecutionReceipt) -> Result<FinalizerResult, AppError> {
         // Only finalize successful executions
         if !matches!(receipt.status, ExecutionStatus::Success) {
             debug!("[cex] ⏭️ skip: execution status not successful: {:?}", receipt.status);
@@ -339,7 +339,7 @@ impl Finalizer for dyn CexFinalizerLogic {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::error::{AppError, AppResult};
+    use crate::error::AppError;
     use async_trait::async_trait;
     use candid::{Nat, Principal};
     use liquidium_pipeline_core::tokens::{chain_token::ChainToken, chain_token_amount::ChainTokenAmount};
@@ -374,24 +374,24 @@ mod tests {
 
     #[async_trait]
     impl WalStore for TestWal {
-        async fn upsert_result(&self, row: LiqResultRecord) -> AppResult<()> {
+        async fn upsert_result(&self, row: LiqResultRecord) -> Result<(), AppError> {
             *self.row.lock().unwrap() = Some(row);
             Ok(())
         }
 
-        async fn get_result(&self, _liq_id: &str) -> AppResult<Option<LiqResultRecord>> {
+        async fn get_result(&self, _liq_id: &str) -> Result<Option<LiqResultRecord>, AppError> {
             Ok(self.row.lock().unwrap().clone())
         }
 
-        async fn list_by_status(&self, _status: ResultStatus, _limit: usize) -> AppResult<Vec<LiqResultRecord>> {
+        async fn list_by_status(&self, _status: ResultStatus, _limit: usize) -> Result<Vec<LiqResultRecord>, AppError> {
             Ok(vec![])
         }
 
-        async fn get_pending(&self, _limit: usize) -> AppResult<Vec<LiqResultRecord>> {
+        async fn get_pending(&self, _limit: usize) -> Result<Vec<LiqResultRecord>, AppError> {
             Ok(vec![])
         }
 
-        async fn update_status(&self, _liq_id: &str, _next: ResultStatus, _bump_attempt: bool) -> AppResult<()> {
+        async fn update_status(&self, _liq_id: &str, _next: ResultStatus, _bump_attempt: bool) -> Result<(), AppError> {
             Ok(())
         }
 
@@ -401,11 +401,11 @@ mod tests {
             _next: ResultStatus,
             _last_error: AppError,
             _bump_attempt: bool,
-        ) -> AppResult<()> {
+        ) -> Result<(), AppError> {
             Ok(())
         }
 
-        async fn delete(&self, _liq_id: &str) -> AppResult<()> {
+        async fn delete(&self, _liq_id: &str) -> Result<(), AppError> {
             Ok(())
         }
     }
@@ -417,7 +417,7 @@ mod tests {
 
     #[async_trait]
     impl CexFinalizerLogic for DummyCexFinalizer {
-        async fn prepare(&self, liq_id: &str, _receipt: &ExecutionReceipt) -> AppResult<CexState> {
+        async fn prepare(&self, liq_id: &str, _receipt: &ExecutionReceipt) -> Result<CexState, AppError> {
             let pay = ChainToken::Icp {
                 ledger: Principal::anonymous(),
                 symbol: "ckBTC".to_string(),
@@ -478,11 +478,11 @@ mod tests {
             })
         }
 
-        async fn deposit(&self, _state: &mut CexState) -> AppResult<()> {
+        async fn deposit(&self, _state: &mut CexState) -> Result<(), AppError> {
             Ok(())
         }
 
-        async fn trade(&self, state: &mut CexState) -> AppResult<()> {
+        async fn trade(&self, state: &mut CexState) -> Result<(), AppError> {
             let mut calls = self.trade_calls.lock().unwrap();
             *calls += 1;
 
@@ -499,11 +499,11 @@ mod tests {
             Ok(())
         }
 
-        async fn withdraw(&self, _state: &mut CexState) -> AppResult<()> {
+        async fn withdraw(&self, _state: &mut CexState) -> Result<(), AppError> {
             Ok(())
         }
 
-        async fn finish(&self, _receipt: &ExecutionReceipt, state: &CexState) -> AppResult<SwapExecution> {
+        async fn finish(&self, _receipt: &ExecutionReceipt, state: &CexState) -> Result<SwapExecution, AppError> {
             let pay = state.deposit.deposit_asset.asset_id();
             let recv = state.withdraw.withdraw_asset.asset_id();
             Ok(SwapExecution {
@@ -523,7 +523,7 @@ mod tests {
             })
         }
 
-        async fn preview_route(&self, _receipt: &ExecutionReceipt) -> AppResult<CexRoutePreview> {
+        async fn preview_route(&self, _receipt: &ExecutionReceipt) -> Result<CexRoutePreview, AppError> {
             Ok(CexRoutePreview {
                 is_executable: true,
                 estimated_receive_amount: 0.0,
@@ -540,7 +540,7 @@ mod tests {
 
     #[async_trait]
     impl CexFinalizerLogic for FailThenResumeFinalizer {
-        async fn prepare(&self, liq_id: &str, _receipt: &ExecutionReceipt) -> AppResult<CexState> {
+        async fn prepare(&self, liq_id: &str, _receipt: &ExecutionReceipt) -> Result<CexState, AppError> {
             *self.prepare_calls.lock().unwrap() += 1;
 
             let pay = ChainToken::Icp {
@@ -603,11 +603,11 @@ mod tests {
             })
         }
 
-        async fn deposit(&self, _state: &mut CexState) -> AppResult<()> {
+        async fn deposit(&self, _state: &mut CexState) -> Result<(), AppError> {
             Ok(())
         }
 
-        async fn trade(&self, state: &mut CexState) -> AppResult<()> {
+        async fn trade(&self, state: &mut CexState) -> Result<(), AppError> {
             let mut calls = self.trade_calls.lock().unwrap();
             *calls += 1;
 
@@ -631,11 +631,11 @@ mod tests {
             Ok(())
         }
 
-        async fn withdraw(&self, _state: &mut CexState) -> AppResult<()> {
+        async fn withdraw(&self, _state: &mut CexState) -> Result<(), AppError> {
             Ok(())
         }
 
-        async fn finish(&self, _receipt: &ExecutionReceipt, state: &CexState) -> AppResult<SwapExecution> {
+        async fn finish(&self, _receipt: &ExecutionReceipt, state: &CexState) -> Result<SwapExecution, AppError> {
             Ok(SwapExecution {
                 swap_id: 0,
                 request_id: 0,
@@ -653,7 +653,7 @@ mod tests {
             })
         }
 
-        async fn preview_route(&self, _receipt: &ExecutionReceipt) -> AppResult<CexRoutePreview> {
+        async fn preview_route(&self, _receipt: &ExecutionReceipt) -> Result<CexRoutePreview, AppError> {
             Ok(CexRoutePreview {
                 is_executable: true,
                 estimated_receive_amount: 0.0,

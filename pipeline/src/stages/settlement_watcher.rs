@@ -8,7 +8,7 @@ use tracing::instrument;
 use tracing::{info, warn};
 
 use crate::config::SwapperMode;
-use crate::error::AppResult;
+use crate::error::AppError;
 use crate::persistance::{LiqMetaWrapper, LiqResultRecord, ResultStatus, WalStore};
 use crate::stages::executor::ExecutionReceipt;
 use crate::stages::executor::ExecutionStatus;
@@ -67,7 +67,7 @@ where
         }
     }
 
-    async fn tick(&self) -> AppResult<()> {
+    async fn tick(&self) -> Result<(), AppError> {
         let mut rows = self.wal.list_by_status(ResultStatus::WaitingCollateral, 100).await?;
         let mut profit_rows = self.wal.list_by_status(ResultStatus::WaitingProfit, 100).await?;
         rows.append(&mut profit_rows);
@@ -81,7 +81,7 @@ where
     }
 
     #[instrument(name = "settlement.process_row", skip_all, err, fields(row_id = %row.id))]
-    async fn process_row(&self, row: LiqResultRecord) -> AppResult<()> {
+    async fn process_row(&self, row: LiqResultRecord) -> Result<(), AppError> {
         let meta = decode_receipt_wrapper(&row)?
             .ok_or_else(|| format!("receipt not found in WAL meta_json for {}", row.id))?;
         let mut receipt: ExecutionReceipt = meta.receipt;
@@ -177,7 +177,7 @@ where
         self.handle_unprofitable(&row, liq.id).await
     }
 
-    async fn handle_unprofitable(&self, row: &LiqResultRecord, liq_id: u128) -> AppResult<()> {
+    async fn handle_unprofitable(&self, row: &LiqResultRecord, liq_id: u128) -> Result<(), AppError> {
         if row.status != ResultStatus::WaitingProfit {
             self.wal
                 .update_status(&row.id, ResultStatus::WaitingProfit, false)
@@ -201,7 +201,7 @@ where
         Ok(())
     }
 
-    async fn refresh_liquidation(&self, liq_id: u128) -> AppResult<LiquidationResult> {
+    async fn refresh_liquidation(&self, liq_id: u128) -> Result<LiquidationResult, AppError> {
         let args = Encode!(&liq_id).map_err(|e| format!("get_liquidation encode error: {e}"))?;
         let res = self
             .agent
@@ -218,7 +218,7 @@ where
         row: &LiqResultRecord,
         receipt: &ExecutionReceipt,
         touch: bool,
-    ) -> AppResult<()> {
+    ) -> Result<(), AppError> {
         let mut row = row.clone();
         let mut wrapper = decode_receipt_wrapper(&row)?.unwrap_or(LiqMetaWrapper {
             receipt: receipt.clone(),

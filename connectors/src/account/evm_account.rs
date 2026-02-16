@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use liquidium_pipeline_core::error::{AppError, AppResult, error_codes};
+use liquidium_pipeline_core::error::{AppError, error_codes};
 
 // All these come from core
 use liquidium_pipeline_core::account::actions::AccountInfo;
@@ -33,7 +33,7 @@ impl<B: EvmBackend> EvmAccountInfoAdapter<B> {
 
 #[async_trait]
 impl<B: EvmBackend> AccountInfo for EvmAccountInfoAdapter<B> {
-    async fn get_balance(&self, token: &ChainToken) -> AppResult<ChainTokenAmount> {
+    async fn get_balance(&self, token: &ChainToken) -> Result<ChainTokenAmount, AppError> {
         match token {
             ChainToken::EvmNative { chain, .. } => {
                 let amount_native = self.backend.native_balance(chain).await?;
@@ -58,7 +58,7 @@ impl<B: EvmBackend> AccountInfo for EvmAccountInfoAdapter<B> {
         }
     }
 
-    async fn sync_balance(&self, token: &ChainToken) -> AppResult<ChainTokenAmount> {
+    async fn sync_balance(&self, token: &ChainToken) -> Result<ChainTokenAmount, AppError> {
         let bal = self.get_balance(token).await?;
 
         let cache_key = match token {

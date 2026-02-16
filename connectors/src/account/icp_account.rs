@@ -7,7 +7,7 @@ use std::{
 use crate::backend::icp_backend::IcpBackend;
 use crate::crypto::derivation::derive_evm_private_key;
 use async_trait::async_trait;
-use liquidium_pipeline_core::error::{AppError, AppResult, error_codes};
+use liquidium_pipeline_core::error::{AppError, error_codes};
 use liquidium_pipeline_core::{
     account::actions::AccountInfo,
     tokens::{chain_token::ChainToken, chain_token_amount::ChainTokenAmount},
@@ -20,7 +20,7 @@ use icrc_ledger_types::icrc1::account::Account;
 
 use icrc_ledger_types::icrc1::account::Subaccount;
 
-pub fn create_identity_from_pem_file(pem_file: &str) -> AppResult<Box<dyn Identity>> {
+pub fn create_identity_from_pem_file(pem_file: &str) -> Result<Box<dyn Identity>, AppError> {
     match BasicIdentity::from_pem_file(pem_file) {
         Ok(basic_identity) => Ok(Box::new(basic_identity)),
         Err(_) => match Secp256k1Identity::from_pem_file(pem_file) {
@@ -33,12 +33,12 @@ pub fn create_identity_from_pem_file(pem_file: &str) -> AppResult<Box<dyn Identi
     }
 }
 
-pub fn derive_icp_identity(mnemonic: &str, account: u32, index: u32) -> AppResult<Secp256k1Identity> {
+pub fn derive_icp_identity(mnemonic: &str, account: u32, index: u32) -> Result<Secp256k1Identity, AppError> {
     let sk = derive_evm_private_key(mnemonic, account, index)?;
     Ok(Secp256k1Identity::from_private_key(sk))
 }
 
-pub fn derive_icp_principal(mnemonic: &str, account: u32, index: u32) -> AppResult<Principal> {
+pub fn derive_icp_principal(mnemonic: &str, account: u32, index: u32) -> Result<Principal, AppError> {
     let id = derive_icp_identity(mnemonic, account, index)?;
     id.sender().map_err(|e| {
         AppError::from_def(error_codes::DECODE_ERROR).with_context(format!("could not decode principal: {e}"))
@@ -50,7 +50,7 @@ pub fn derive_icp_account(
     account: u32,
     index: u32,
     subaccount: Option<[u8; 32]>,
-) -> AppResult<Account> {
+) -> Result<Account, AppError> {
     let owner = derive_icp_principal(mnemonic, account, index)?;
     Ok(Account { owner, subaccount })
 }
@@ -88,14 +88,14 @@ impl<B> AccountInfo for IcpAccountInfoAdapter<B>
 where
     B: IcpBackend + Send + Sync,
 {
-    async fn get_balance(&self, token: &ChainToken) -> AppResult<ChainTokenAmount> {
+    async fn get_balance(&self, token: &ChainToken) -> Result<ChainTokenAmount, AppError> {
         if let Some(cached) = self.get_cached_balance(token) {
             return Ok(cached);
         }
         self.sync_balance(token).await
     }
 
-    async fn sync_balance(&self, token: &ChainToken) -> AppResult<ChainTokenAmount> {
+    async fn sync_balance(&self, token: &ChainToken) -> Result<ChainTokenAmount, AppError> {
         match token {
             ChainToken::Icp { ledger, symbol, .. } => {
                 let amount = self.backend.icrc1_balance(*ledger, self.account()).await.map_err(|e| {

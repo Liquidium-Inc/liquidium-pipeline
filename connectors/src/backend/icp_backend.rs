@@ -7,23 +7,29 @@ use candid::{CandidType, Encode, Nat, Principal};
 use icrc_ledger_types::icrc1::account::Account;
 use icrc_ledger_types::icrc1::transfer::{TransferArg, TransferError};
 use icrc_ledger_types::icrc2::approve::{ApproveArgs, ApproveError};
-use liquidium_pipeline_core::error::{AppError, AppResult, error_codes};
+use liquidium_pipeline_core::error::{AppError, error_codes};
 use num_traits::ToPrimitive;
 use serde::{Deserialize, de::DeserializeOwned};
 
 #[cfg_attr(test, mockall::automock)]
 #[async_trait]
 pub trait IcpBackend: Send + Sync {
-    async fn icrc1_balance(&self, ledger: Principal, account: &Account) -> AppResult<Nat>;
+    async fn icrc1_balance(&self, ledger: Principal, account: &Account) -> Result<Nat, AppError>;
 
-    async fn icrc1_transfer(&self, ledger: Principal, from: &Account, to: &Account, amount: Nat) -> AppResult<Nat>;
+    async fn icrc1_transfer(
+        &self,
+        ledger: Principal,
+        from: &Account,
+        to: &Account,
+        amount: Nat,
+    ) -> Result<Nat, AppError>;
 
-    async fn icp_transfer(&self, ledger: Principal, to_account_id_hex: &str, amount_e8s: Nat) -> AppResult<u64>;
+    async fn icp_transfer(&self, ledger: Principal, to_account_id_hex: &str, amount_e8s: Nat) -> Result<u64, AppError>;
 
-    async fn icrc1_decimals(&self, ledger: Principal) -> AppResult<u8>;
-    async fn icrc1_fee(&self, ledger: Principal) -> AppResult<Nat>;
+    async fn icrc1_decimals(&self, ledger: Principal) -> Result<u8, AppError>;
+    async fn icrc1_fee(&self, ledger: Principal) -> Result<Nat, AppError>;
 
-    async fn icrc2_approve(&self, ledger: Principal, args: ApproveArgs) -> AppResult<Nat>;
+    async fn icrc2_approve(&self, ledger: Principal, args: ApproveArgs) -> Result<Nat, AppError>;
 }
 
 pub struct IcpBackendImpl<A: PipelineAgent> {
@@ -35,7 +41,7 @@ impl<A: PipelineAgent> IcpBackendImpl<A> {
         Self { agent }
     }
 
-    async fn query<R>(&self, ledger: Principal, method: &str, arg: impl CandidType) -> AppResult<R>
+    async fn query<R>(&self, ledger: Principal, method: &str, arg: impl CandidType) -> Result<R, AppError>
     where
         R: CandidType + DeserializeOwned + 'static,
     {
@@ -44,7 +50,7 @@ impl<A: PipelineAgent> IcpBackendImpl<A> {
         self.agent.call_query::<R>(&ledger, method, arg_blob).await
     }
 
-    async fn update<R>(&self, ledger: Principal, method: &str, arg: impl CandidType) -> AppResult<R>
+    async fn update<R>(&self, ledger: Principal, method: &str, arg: impl CandidType) -> Result<R, AppError>
     where
         R: CandidType + DeserializeOwned + 'static,
     {
@@ -56,11 +62,17 @@ impl<A: PipelineAgent> IcpBackendImpl<A> {
 
 #[async_trait]
 impl<A: PipelineAgent> IcpBackend for IcpBackendImpl<A> {
-    async fn icrc1_balance(&self, ledger: Principal, account: &Account) -> AppResult<Nat> {
+    async fn icrc1_balance(&self, ledger: Principal, account: &Account) -> Result<Nat, AppError> {
         self.query::<Nat>(ledger, "icrc1_balance_of", *account).await
     }
 
-    async fn icrc1_transfer(&self, ledger: Principal, from: &Account, to: &Account, amount: Nat) -> AppResult<Nat> {
+    async fn icrc1_transfer(
+        &self,
+        ledger: Principal,
+        from: &Account,
+        to: &Account,
+        amount: Nat,
+    ) -> Result<Nat, AppError> {
         let arg = TransferArg {
             from_subaccount: from.subaccount,
             to: *to,
@@ -79,7 +91,7 @@ impl<A: PipelineAgent> IcpBackend for IcpBackendImpl<A> {
         }
     }
 
-    async fn icp_transfer(&self, ledger: Principal, to_account_id_hex: &str, amount_e8s: Nat) -> AppResult<u64> {
+    async fn icp_transfer(&self, ledger: Principal, to_account_id_hex: &str, amount_e8s: Nat) -> Result<u64, AppError> {
         #[derive(CandidType, Deserialize, Debug)]
         struct Tokens {
             e8s: u64,
@@ -145,7 +157,7 @@ impl<A: PipelineAgent> IcpBackend for IcpBackendImpl<A> {
         }
     }
 
-    async fn icrc2_approve(&self, ledger: Principal, args: ApproveArgs) -> AppResult<Nat> {
+    async fn icrc2_approve(&self, ledger: Principal, args: ApproveArgs) -> Result<Nat, AppError> {
         let result: Result<Nat, ApproveError> = self.update(ledger, "icrc2_approve", args).await?;
         match result {
             Ok(idx) => Ok(idx),
@@ -156,11 +168,11 @@ impl<A: PipelineAgent> IcpBackend for IcpBackendImpl<A> {
         }
     }
 
-    async fn icrc1_decimals(&self, ledger: Principal) -> AppResult<u8> {
+    async fn icrc1_decimals(&self, ledger: Principal) -> Result<u8, AppError> {
         self.query::<u8>(ledger, "icrc1_decimals", ()).await
     }
 
-    async fn icrc1_fee(&self, ledger: Principal) -> AppResult<Nat> {
+    async fn icrc1_fee(&self, ledger: Principal) -> Result<Nat, AppError> {
         self.query::<Nat>(ledger, "icrc1_fee", ()).await
     }
 }

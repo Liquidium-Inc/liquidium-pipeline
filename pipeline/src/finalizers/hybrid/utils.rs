@@ -4,7 +4,7 @@ use liquidium_pipeline_core::tokens::chain_token_amount::ChainTokenAmount;
 use num_traits::ToPrimitive;
 
 use crate::{
-    error::{AppError, AppResult, error_codes},
+    error::{AppError, error_codes},
     persistance::{FinalizerDecisionSnapshot, now_secs},
     stages::executor::ExecutionReceipt,
     swappers::model::SwapRequest,
@@ -68,7 +68,7 @@ pub(crate) fn preview_gross_edge_bps(estimated_receive_amount: f64, debt_repaid_
     ((estimated_receive_amount - debt_repaid_amount) / debt_repaid_amount) * BPS_PER_RATIO_UNIT
 }
 
-pub(crate) fn debt_repaid_f64(receipt: &ExecutionReceipt) -> AppResult<f64> {
+pub(crate) fn debt_repaid_f64(receipt: &ExecutionReceipt) -> Result<f64, AppError> {
     let liquidation_result = receipt.liquidation_result.as_ref().ok_or_else(|| {
         AppError::from_def(error_codes::INVALID_INPUT).with_context("missing liquidation_result in receipt")
     })?;

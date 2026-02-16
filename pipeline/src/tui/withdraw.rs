@@ -7,7 +7,7 @@ use num_traits::ToPrimitive;
 use tokio::sync::mpsc;
 
 use crate::config::ConfigTrait;
-use crate::error::{AppError, AppResult};
+use crate::error::AppError;
 use crate::swappers::mexc::mexc_adapter::MexcClient;
 use liquidium_pipeline_connectors::backend::cex_backend::CexBackend;
 use liquidium_pipeline_core::account::model::ChainAccount;
@@ -184,7 +184,7 @@ async fn execute_withdraw(
     manual_destination: String,
     asset: AssetId,
     amount: String,
-) -> AppResult<String> {
+) -> Result<String, AppError> {
     let token = ctx
         .registry
         .get(&asset)
@@ -220,7 +220,7 @@ async fn execute_withdraw(
         .await
 }
 
-fn compute_withdraw_amount_native(balance: Nat, fee: Nat, amount: &str, decimals: u8) -> AppResult<Nat> {
+fn compute_withdraw_amount_native(balance: Nat, fee: Nat, amount: &str, decimals: u8) -> Result<Nat, AppError> {
     if amount.trim().eq_ignore_ascii_case("all") {
         let bal_u128 = balance
             .0

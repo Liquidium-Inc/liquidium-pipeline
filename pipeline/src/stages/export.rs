@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use csv::WriterBuilder;
 use serde::Serialize;
 
-use crate::error::AppResult;
+use crate::error::AppError;
 use crate::{finalizers::liquidation_outcome::LiquidationOutcome, stage::PipelineStage};
 
 pub struct ExportStage {
@@ -33,7 +33,7 @@ struct ExecutionAnalyticsRow {
 
 #[async_trait]
 impl<'a> PipelineStage<'a, Vec<LiquidationOutcome>, ()> for ExportStage {
-    async fn process(&self, input: &'a Vec<LiquidationOutcome>) -> AppResult<()> {
+    async fn process(&self, input: &'a Vec<LiquidationOutcome>) -> Result<(), AppError> {
         let path = Path::new(&self.path);
         if let Some(parent) = path.parent()
             && !parent.as_os_str().is_empty()

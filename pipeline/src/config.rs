@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use std::env;
 use std::sync::Arc;
 
-use crate::error::{AppError, AppResult, error_codes};
+use crate::error::{AppError, error_codes};
 
 fn expand_tilde(p: &str) -> std::path::PathBuf {
     if let Some(stripped) = p.strip_prefix("~/")
@@ -101,7 +101,7 @@ pub trait ConfigTrait: Send + Sync {
     #[allow(dead_code)]
     fn get_recovery_account(&self) -> Account;
     fn get_swapper_mode(&self) -> SwapperMode;
-    fn get_cex_credentials(&self, cex: &str) -> AppResult<(String, String)>;
+    fn get_cex_credentials(&self, cex: &str) -> Result<(String, String), AppError>;
 }
 
 impl ConfigTrait for Config {
@@ -188,7 +188,7 @@ impl ConfigTrait for Config {
         self.swapper
     }
 
-    fn get_cex_credentials(&self, cex: &str) -> AppResult<(String, String)> {
+    fn get_cex_credentials(&self, cex: &str) -> Result<(String, String), AppError> {
         self.cex_credentials
             .get(cex)
             .ok_or_else(|| AppError::from_def(error_codes::CONFIG_ERROR).with_context("Cex credentials not found"))
@@ -197,7 +197,7 @@ impl ConfigTrait for Config {
 }
 
 impl Config {
-    pub async fn load() -> AppResult<Arc<Self>> {
+    pub async fn load() -> Result<Arc<Self>, AppError> {
         let home = config_dir();
 
         let ic_url = env::var("IC_URL")

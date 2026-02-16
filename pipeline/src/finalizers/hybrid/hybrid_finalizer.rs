@@ -9,7 +9,7 @@ use super::utils::{
 };
 use crate::{
     config::{ConfigTrait, SwapperMode},
-    error::AppResult,
+    error::AppError,
     finalizers::{
         cex_finalizer::CexFinalizerLogic,
         dex_finalizer::DexFinalizerLogic,
@@ -100,7 +100,7 @@ where
         &self,
         wal: &dyn WalStore,
         receipt: &ExecutionReceipt,
-    ) -> AppResult<FinalizerResult> {
+    ) -> Result<FinalizerResult, AppError> {
         let id = liq_id_from_receipt(receipt)?;
         wal.update_status(&id, ResultStatus::Succeeded, true)
             .await
@@ -112,12 +112,20 @@ where
         })
     }
 
-    async fn finalize_via_dex(&self, wal: &dyn WalStore, receipt: ExecutionReceipt) -> AppResult<FinalizerResult> {
+    async fn finalize_via_dex(
+        &self,
+        wal: &dyn WalStore,
+        receipt: ExecutionReceipt,
+    ) -> Result<FinalizerResult, AppError> {
         // Delegate full DEX settlement logic to the underlying DEX finalizer.
         self.dex_finalizer.finalize(wal, receipt).await
     }
 
-    async fn finalize_via_cex(&self, wal: &dyn WalStore, receipt: ExecutionReceipt) -> AppResult<FinalizerResult> {
+    async fn finalize_via_cex(
+        &self,
+        wal: &dyn WalStore,
+        receipt: ExecutionReceipt,
+    ) -> Result<FinalizerResult, AppError> {
         // Delegate full CEX settlement logic to the underlying CEX finalizer.
         let finalizer = self
             .cex_finalizer
@@ -127,7 +135,7 @@ where
         finalizer.finalize(wal, receipt).await
     }
 
-    async fn finalize_to_recovery(&self, receipt: &ExecutionReceipt) -> AppResult<FinalizerResult> {
+    async fn finalize_to_recovery(&self, receipt: &ExecutionReceipt) -> Result<FinalizerResult, AppError> {
         let liq = receipt
             .liquidation_result
             .as_ref()
@@ -190,7 +198,7 @@ where
         receipt: ExecutionReceipt,
         venue: RouteVenue,
         reason: Option<&str>,
-    ) -> AppResult<FinalizerResult> {
+    ) -> Result<FinalizerResult, AppError> {
         let mut res = match venue {
             RouteVenue::Dex => self.finalize_via_dex(wal, receipt).await?,
             RouteVenue::Cex => self.finalize_via_cex(wal, receipt).await?,
@@ -215,7 +223,7 @@ where
         receipt: &ExecutionReceipt,
         swap_req: &SwapRequest,
         debt_repaid_amount: f64,
-    ) -> AppResult<Option<RouteCandidate>> {
+    ) -> Result<Option<RouteCandidate>, AppError> {
         match self.dex_swapper.quote(swap_req).await {
             Ok(quote) => {
                 let estimated_receive_amount =
@@ -246,7 +254,7 @@ where
         &self,
         receipt: &ExecutionReceipt,
         debt_repaid_amount: f64,
-    ) -> AppResult<Option<RouteCandidate>> {
+    ) -> Result<Option<RouteCandidate>, AppError> {
         let Some(cex_finalizer) = self.cex_finalizer.as_ref() else {
             info!("[hybrid] cex preview unavailable: missing cex finalizer");
             return Ok(None);
@@ -291,7 +299,7 @@ where
         wal: &dyn WalStore,
         receipt: &ExecutionReceipt,
         snapshot: FinalizerDecisionSnapshot,
-    ) -> AppResult<()> {
+    ) -> Result<(), AppError> {
         let liq_id = liq_id_from_receipt(receipt)?;
         let Some(mut row) = wal_load(wal, &liq_id).await? else {
             info!(
@@ -317,7 +325,7 @@ where
         receipt: ExecutionReceipt,
         venue: RouteVenue,
         reason: String,
-    ) -> AppResult<FinalizerResult> {
+    ) -> Result<FinalizerResult, AppError> {
         let chosen = match venue {
             RouteVenue::Dex => "dex",
             RouteVenue::Cex => "cex",
@@ -332,7 +340,7 @@ where
         ctx: FinalizationContext<'_>,
         receipt: ExecutionReceipt,
         reason: String,
-    ) -> AppResult<FinalizerResult> {
+    ) -> Result<FinalizerResult, AppError> {
         info!(
             "[hybrid] routing -> recovery reason={} dex_preview_net_bps={:?} cex_preview_net_bps={:?} min_required_bps={:.2}",
             reason,
@@ -351,7 +359,7 @@ where
         receipt: &ExecutionReceipt,
         reason: String,
         error: String,
-    ) -> AppResult<FinalizerResult> {
+    ) -> Result<FinalizerResult, AppError> {
         let snapshot = ctx.snapshot("error", reason);
         self.persist_decision_snapshot(ctx.wal, receipt, snapshot).await?;
         Err(error.into())
@@ -364,7 +372,7 @@ where
     C: ConfigTrait + Send + Sync,
 {
     #[instrument(name = "hybrid.finalize", skip_all, err)]
-    async fn finalize(&self, wal: &dyn WalStore, receipt: ExecutionReceipt) -> AppResult<FinalizerResult> {
+    async fn finalize(&self, wal: &dyn WalStore, receipt: ExecutionReceipt) -> Result<FinalizerResult, AppError> {
         // 1) No swap request:
         // The liquidation is complete and there is nothing to route/swap.
         // We still mark WAL as succeeded to close the lifecycle deterministically.

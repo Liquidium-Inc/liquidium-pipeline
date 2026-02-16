@@ -5,7 +5,7 @@ use tracing::instrument;
 
 use crate::{
     account::actions::AccountInfo,
-    error::{AppError, AppResult, error_codes},
+    error::{AppError, error_codes},
     tokens::{asset_id::AssetId, chain_token_amount::ChainTokenAmount, token_registry::TokenRegistryTrait},
 };
 
@@ -24,7 +24,7 @@ impl BalanceService {
 
     // Sync a custom list of assets for this account.
     #[instrument(name = "balance_service.sync_assets", skip_all, fields(asset_count = assets.len()))]
-    pub async fn sync_assets(&self, assets: &[AssetId]) -> Vec<AppResult<(AssetId, ChainTokenAmount)>> {
+    pub async fn sync_assets(&self, assets: &[AssetId]) -> Vec<Result<(AssetId, ChainTokenAmount), AppError>> {
         let futs = assets.iter().cloned().map(|asset_id| {
             let accounts = self.accounts.clone();
 
@@ -46,7 +46,7 @@ impl BalanceService {
     }
 
     // Sync all assets from the registry for this account.
-    pub async fn sync_all(&self) -> Vec<AppResult<(AssetId, ChainTokenAmount)>> {
+    pub async fn sync_all(&self) -> Vec<Result<(AssetId, ChainTokenAmount), AppError>> {
         let asset_ids: Vec<AssetId> = self.registry.all().iter().map(|item| item.0.clone()).collect();
         self.sync_assets(&asset_ids).await
     }
@@ -65,7 +65,7 @@ impl BalanceService {
 
     // Get the balance for a single AssetId.
     #[instrument(name = "balance_service.get_balance", skip(self), err, fields(asset = %asset_id))]
-    pub async fn get_balance(&self, asset_id: &AssetId) -> AppResult<ChainTokenAmount> {
+    pub async fn get_balance(&self, asset_id: &AssetId) -> Result<ChainTokenAmount, AppError> {
         let token = self
             .registry
             .get(asset_id)

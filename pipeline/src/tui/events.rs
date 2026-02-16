@@ -1,6 +1,6 @@
 use crossterm::event::KeyEvent;
 
-use crate::error::AppResult;
+use crate::error::AppError;
 use liquidium_pipeline_connectors::backend::cex_backend::DepositAddress;
 
 use super::app::{BalancesSnapshot, ExecutionsSnapshot, ProfitsSnapshot, WalSnapshot};
@@ -11,11 +11,11 @@ pub(super) enum UiEvent {
     Tick,
     AppendLogLines(Vec<String>),
     PrependLogLines(Vec<String>),
-    DaemonPaused(AppResult<bool>),
-    Wal(AppResult<WalSnapshot>),
-    Balances(AppResult<BalancesSnapshot>),
-    Profits(AppResult<ProfitsSnapshot>),
-    Executions(AppResult<ExecutionsSnapshot>),
-    Withdraw(AppResult<String>),
-    Deposit(AppResult<DepositAddress>),
+    DaemonPaused(Result<bool, AppError>),
+    Wal(Result<WalSnapshot, AppError>),
+    Balances(Result<BalancesSnapshot, AppError>),
+    Profits(Result<ProfitsSnapshot, AppError>),
+    Executions(Result<ExecutionsSnapshot, AppError>),
+    Withdraw(Result<String, AppError>),
+    Deposit(Result<DepositAddress, AppError>),
 }

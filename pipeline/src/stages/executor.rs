@@ -7,7 +7,7 @@ use tracing::instrument;
 use tracing::{debug, info, warn};
 
 use crate::{
-    error::{AppError, AppResult, error_codes},
+    error::{AppError, error_codes},
     executors::{basic::basic_executor::BasicExecutor, executor::ExecutorRequest},
     finalizers::{finalizer::FinalizerResult, liquidation_outcome::LiquidationOutcome},
     persistance::{LiqMetaWrapper, LiqResultRecord, ResultStatus, WalProfitSnapshot, WalStore},
@@ -59,7 +59,7 @@ impl<'a, A: PipelineAgent, D: WalStore> PipelineStage<'a, Vec<ExecutorRequest>, 
     for BasicExecutor<A, D>
 {
     #[instrument(name = "executor.process", skip_all, err, fields(request_count = executor_requests.len()))]
-    async fn process(&self, executor_requests: &'a Vec<ExecutorRequest>) -> AppResult<Vec<ExecutionReceipt>> {
+    async fn process(&self, executor_requests: &'a Vec<ExecutorRequest>) -> Result<Vec<ExecutionReceipt>, AppError> {
         debug!("Executing request {:?}", executor_requests);
         // One future per request, all run concurrently
         let futures = executor_requests.iter().map(|executor_request| {
@@ -192,7 +192,7 @@ impl<A: PipelineAgent, D: WalStore> BasicExecutor<A, D> {
         receipt: &ExecutionReceipt,
         executor_request: &ExecutorRequest,
         status: ResultStatus,
-    ) -> AppResult<()> {
+    ) -> Result<(), AppError> {
         debug!("Storing execution log...");
         let liq_id = liq_id_from_receipt(receipt)?;
 

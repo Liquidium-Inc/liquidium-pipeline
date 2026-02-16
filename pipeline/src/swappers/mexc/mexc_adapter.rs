@@ -11,7 +11,7 @@ use log::{debug, info, warn};
 use rust_decimal::{Decimal, RoundingStrategy};
 use serde_json::Value;
 
-use crate::error::AppResult;
+use crate::error::AppError;
 
 /// Default orderbook depth level used for quote-cost and preview estimations.
 const DEFAULT_ORDERBOOK_DEPTH_LIMIT: u32 = 50;
@@ -224,14 +224,14 @@ impl MexcClient {
         }
     }
 
-    pub fn from_env() -> AppResult<Self> {
+    pub fn from_env() -> Result<Self, AppError> {
         let api_key = env::var("CEX_MEXC_API_KEY").map_err(|_| "CEX_MEXC_API_KEY not set".to_string())?;
         let api_secret = env::var("CEX_MEXC_API_SECRET").map_err(|_| "CEX_MEXC_API_SECRET not set".to_string())?;
 
         Ok(Self::new(&api_key, &api_secret))
     }
 
-    async fn fetch_symbol_info(&self, symbol: &str) -> AppResult<Option<(Value, String)>> {
+    async fn fetch_symbol_info(&self, symbol: &str) -> Result<Option<(Value, String)>, AppError> {
         let mut direct_error = None;
         let url = format!("https://api.mexc.com/api/v3/exchangeInfo?symbol={}", symbol);
         let resp = self.http.get(url).send().await.map_err(|e| e.to_string())?;
@@ -297,7 +297,7 @@ impl MexcClient {
         }))
     }
 
-    async fn get_symbol_filters(&self, symbol: &str) -> AppResult<Option<SymbolFilters>> {
+    async fn get_symbol_filters(&self, symbol: &str) -> Result<Option<SymbolFilters>, AppError> {
         let cache = self.symbol_filters.lock().await;
         if let Some(filters) = cache.get(symbol).cloned() {
             return Ok(Some(filters));
@@ -347,7 +347,7 @@ impl MexcClient {
         &self,
         ex: &MexcSpotApiClientWithAuthentication,
         api_symbol: &str,
-    ) -> AppResult<Vec<(Decimal, Decimal)>> {
+    ) -> Result<Vec<(Decimal, Decimal)>, AppError> {
         let orderbook_depth = ex
             .depth(DepthParams {
                 limit: Some(DEFAULT_ORDERBOOK_DEPTH_LIMIT),
@@ -370,7 +370,7 @@ impl MexcClient {
     fn estimate_buy_quantity_from_levels(
         ask_levels: &[(Decimal, Decimal)],
         quote_amount: Decimal,
-    ) -> AppResult<Decimal> {
+    ) -> Result<Decimal, AppError> {
         if ask_levels.is_empty() {
             return Err("no asks".into());
         }
@@ -400,7 +400,7 @@ impl MexcClient {
     fn estimate_buy_quote_cost_from_levels(
         ask_levels: &[(Decimal, Decimal)],
         base_quantity: Decimal,
-    ) -> AppResult<Decimal> {
+    ) -> Result<Decimal, AppError> {
         if ask_levels.is_empty() {
             return Err("no asks".into());
         }
@@ -448,7 +448,7 @@ impl MexcClient {
     }
 
     // Enforce notional minimums against the intended spend amount.
-    fn ensure_min_notional(filters: Option<&SymbolFilters>, amount: Decimal, symbol: &str) -> AppResult<()> {
+    fn ensure_min_notional(filters: Option<&SymbolFilters>, amount: Decimal, symbol: &str) -> Result<(), AppError> {
         if let Some(f) = filters
             && let Some(min_notional) = f.min_notional
             && amount < min_notional
@@ -468,13 +468,13 @@ impl MexcClient {
         ex: &MexcSpotApiClientWithAuthentication,
         api_symbol: &str,
         quote_amount: Decimal,
-    ) -> AppResult<Decimal> {
+    ) -> Result<Decimal, AppError> {
         let ask_levels = self.fetch_ask_levels(ex, api_symbol).await?;
         Self::estimate_buy_quantity_from_levels(&ask_levels, quote_amount)
     }
 
     // Apply step size/base precision and min_qty checks to a computed base amount.
-    fn adjust_buy_quantity(qty: Decimal, filters: Option<&SymbolFilters>, symbol: &str) -> AppResult<Decimal> {
+    fn adjust_buy_quantity(qty: Decimal, filters: Option<&SymbolFilters>, symbol: &str) -> Result<Decimal, AppError> {
         let mut adjusted = qty;
         if let Some(f) = filters {
             if let Some(step) = f.step_size {
@@ -516,7 +516,7 @@ impl MexcClient {
         amount_dec: Decimal,
         filters: Option<&SymbolFilters>,
         symbol: &str,
-    ) -> AppResult<(OrderSide, Option<Decimal>, Option<Decimal>)> {
+    ) -> Result<(OrderSide, Option<Decimal>, Option<Decimal>), AppError> {
         let mut qty = amount_dec;
         if let Some(f) = filters {
             if let Some(step) = f.step_size {
@@ -563,7 +563,7 @@ impl MexcClient {
         market: &str,
         side: &str,
         _amount_in: f64,
-    ) -> AppResult<(String, String)> {
+    ) -> Result<(String, String), AppError> {
         let mut last_err: Option<String> = None;
         for candidate in candidates {
             match ex
@@ -613,7 +613,7 @@ impl MexcClient {
         side_norm: &str,
         executed_quantity: Decimal,
         cummulative_quote_quantity: Decimal,
-    ) -> AppResult<SwapFillReport> {
+    ) -> Result<SwapFillReport, AppError> {
         if executed_quantity <= Decimal::ZERO {
             return Err("order has zero executed quantity".into());
         }
@@ -648,7 +648,7 @@ impl MexcClient {
         symbol: &str,
         order_id: &str,
         side_norm: &str,
-    ) -> AppResult<SwapFillReport> {
+    ) -> Result<SwapFillReport, AppError> {
         let order_res = ex
             .get_order(GetOrderParams {
                 symbol,
@@ -679,7 +679,7 @@ impl MexcClient {
         symbol: &str,
         client_order_id: &str,
         side_norm: &str,
-    ) -> AppResult<Option<SwapFillReport>> {
+    ) -> Result<Option<SwapFillReport>, AppError> {
         let order_res = ex
             .get_order(GetOrderParams {
                 symbol,
@@ -734,7 +734,7 @@ impl MexcClient {
         candidates: &[String],
         client_order_id: &str,
         side_norm: &str,
-    ) -> AppResult<Option<SwapFillReport>> {
+    ) -> Result<Option<SwapFillReport>, AppError> {
         for candidate in candidates {
             if let Some(report) = self
                 .try_fetch_fill_report_by_client_order_id(ex, candidate, client_order_id, side_norm)
@@ -756,7 +756,7 @@ impl MexcClient {
         symbol: &str,
         buy_mode: BuyOrderInputMode,
         max_quote_overspend_bps: Option<f64>,
-    ) -> AppResult<(OrderSide, Option<Decimal>, Option<Decimal>)> {
+    ) -> Result<(OrderSide, Option<Decimal>, Option<Decimal>), AppError> {
         if amount_dec <= Decimal::ZERO {
             return Err(format!("quote amount {} not valid for {}", amount_dec, symbol).into());
         }
@@ -817,7 +817,7 @@ impl MexcClient {
 
 #[async_trait]
 impl CexBackend for MexcClient {
-    async fn get_quote(&self, market: &str, amount_in: f64) -> AppResult<f64> {
+    async fn get_quote(&self, market: &str, amount_in: f64) -> Result<f64, AppError> {
         let ex = self.inner.lock().await;
 
         let symbol = normalize_market_symbol(market);
@@ -860,12 +860,17 @@ impl CexBackend for MexcClient {
         cost.to_f64().ok_or_else(|| "f64 conversion failed".into())
     }
 
-    async fn execute_swap(&self, market: &str, side: &str, amount_in: f64) -> AppResult<f64> {
+    async fn execute_swap(&self, market: &str, side: &str, amount_in: f64) -> Result<f64, AppError> {
         let report = self.execute_swap_detailed(market, side, amount_in).await?;
         Ok(report.output_received)
     }
 
-    async fn execute_swap_detailed(&self, market: &str, side: &str, amount_in: f64) -> AppResult<SwapFillReport> {
+    async fn execute_swap_detailed(
+        &self,
+        market: &str,
+        side: &str,
+        amount_in: f64,
+    ) -> Result<SwapFillReport, AppError> {
         self.execute_swap_detailed_with_options(market, side, amount_in, SwapExecutionOptions::default())
             .await
     }
@@ -876,7 +881,7 @@ impl CexBackend for MexcClient {
         side: &str,
         amount_in: f64,
         options: SwapExecutionOptions,
-    ) -> AppResult<SwapFillReport> {
+    ) -> Result<SwapFillReport, AppError> {
         let market_symbol = market.trim().to_ascii_uppercase();
         let symbol = normalize_market_symbol(&market_symbol);
         // Determine order params (side, quantity vs quote quantity) using filters.
@@ -994,7 +999,7 @@ impl CexBackend for MexcClient {
         }
     }
 
-    async fn get_orderbook(&self, market: &str, limit: Option<u32>) -> AppResult<OrderBook> {
+    async fn get_orderbook(&self, market: &str, limit: Option<u32>) -> Result<OrderBook, AppError> {
         let ex = self.inner.lock().await;
         let symbol = normalize_market_symbol(market);
         let ob = ex
@@ -1010,7 +1015,7 @@ impl CexBackend for MexcClient {
                 let quantity = level.quantity.to_f64().ok_or("orderbook bid qty to f64 failed")?;
                 Ok(OrderBookLevel { price, quantity })
             })
-            .collect::<AppResult<Vec<_>>>()?;
+            .collect::<Result<Vec<_>, AppError>>()?;
 
         let asks = ob
             .asks
@@ -1020,12 +1025,12 @@ impl CexBackend for MexcClient {
                 let quantity = level.quantity.to_f64().ok_or("orderbook ask qty to f64 failed")?;
                 Ok(OrderBookLevel { price, quantity })
             })
-            .collect::<AppResult<Vec<_>>>()?;
+            .collect::<Result<Vec<_>, AppError>>()?;
 
         Ok(OrderBook { bids, asks })
     }
 
-    async fn get_deposit_address(&self, asset: &str, network: &str) -> AppResult<DepositAddress> {
+    async fn get_deposit_address(&self, asset: &str, network: &str) -> Result<DepositAddress, AppError> {
         let ex = self.inner.lock().await;
 
         let candidates = mexc_network_candidates(asset, network);
@@ -1088,7 +1093,7 @@ impl CexBackend for MexcClient {
         .into())
     }
 
-    async fn get_balance(&self, asset: &str) -> AppResult<f64> {
+    async fn get_balance(&self, asset: &str) -> Result<f64, AppError> {
         let ex = self.inner.lock().await;
 
         let res = ex.account_information().await.map_err(|e| e.to_string())?;
@@ -1121,7 +1126,13 @@ impl CexBackend for MexcClient {
             .ok_or_else(|| "could not convert balance to f64".to_string().into())
     }
 
-    async fn withdraw(&self, asset: &str, network: &str, address: &str, amount: f64) -> AppResult<WithdrawalReceipt> {
+    async fn withdraw(
+        &self,
+        asset: &str,
+        network: &str,
+        address: &str,
+        amount: f64,
+    ) -> Result<WithdrawalReceipt, AppError> {
         let ex = self.inner.lock().await;
         let push_unique = |list: &mut Vec<String>, value: String| {
             if !list.iter().any(|item| item.eq_ignore_ascii_case(&value)) {
@@ -1212,7 +1223,7 @@ impl CexBackend for MexcClient {
         })
     }
 
-    async fn get_withdraw_status_by_id(&self, coin: &str, withdraw_id: &str) -> AppResult<WithdrawStatus> {
+    async fn get_withdraw_status_by_id(&self, coin: &str, withdraw_id: &str) -> Result<WithdrawStatus, AppError> {
         let ex = self.inner.lock().await;
         let records = ex
             .withdraw_history(WithdrawHistoryRequest {

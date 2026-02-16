@@ -27,7 +27,7 @@ use liquidium_pipeline_connectors::{
 
 use crate::approval_state::ApprovalState;
 use crate::config::{Config, ConfigTrait};
-use crate::error::{AppError, AppResult, error_codes};
+use crate::error::{AppError, error_codes};
 use crate::swappers::kong::kong_swapper::KongSwapSwapper;
 use crate::swappers::kong::kong_venue::KongVenue;
 use crate::swappers::router::{SwapRouter, SwapVenue};
@@ -80,7 +80,7 @@ fn should_fallback_to_empty_registry(err: &PipelineContextError) -> bool {
 }
 
 impl<P: Provider<AnyNetwork> + WalletProvider<AnyNetwork> + Clone + 'static> PipelineContextBuilder<P> {
-    pub async fn new() -> AppResult<Self> {
+    pub async fn new() -> Result<Self, AppError> {
         let config = Config::load().await.map_err(|e| {
             AppError::from_def(error_codes::CONFIG_ERROR).with_context(format!("config load failed: {e}"))
         })?;
@@ -107,7 +107,7 @@ impl<P: Provider<AnyNetwork> + WalletProvider<AnyNetwork> + Clone + 'static> Pip
         self
     }
 
-    pub async fn build(self) -> AppResult<PipelineContext> {
+    pub async fn build(self) -> Result<PipelineContext, AppError> {
         self.build_with_registry_override(None)
             .await
             .map_err(|e| AppError::from_def(error_codes::INTERNAL_ERROR).with_context(format_with_code(&e)))
@@ -265,11 +265,14 @@ impl<P: Provider<AnyNetwork> + WalletProvider<AnyNetwork> + Clone + 'static> Pip
 
 fn setup_agents_and_provider(
     config: &Config,
-) -> AppResult<(
-    Arc<Agent>,
-    Arc<Agent>,
-    impl Provider<AnyNetwork> + WalletProvider<AnyNetwork> + Clone + 'static,
-)> {
+) -> Result<
+    (
+        Arc<Agent>,
+        Arc<Agent>,
+        impl Provider<AnyNetwork> + WalletProvider<AnyNetwork> + Clone + 'static,
+    ),
+    AppError,
+> {
     let agent_main = Arc::new(
         Agent::builder()
             .with_url(config.ic_url.clone())
@@ -307,7 +310,7 @@ fn setup_agents_and_provider(
     Ok((agent_main, agent_trader, main_provider))
 }
 
-pub async fn init_context() -> AppResult<PipelineContext> {
+pub async fn init_context() -> Result<PipelineContext, AppError> {
     // Start from the builder so we keep one place that owns Config.
     let mut builder = PipelineContextBuilder::new().await?;
     let config = builder.config.clone();
@@ -322,7 +325,7 @@ pub async fn init_context() -> AppResult<PipelineContext> {
     builder.build().await
 }
 
-pub async fn init_context_best_effort() -> AppResult<PipelineContext> {
+pub async fn init_context_best_effort() -> Result<PipelineContext, AppError> {
     let mut builder = PipelineContextBuilder::new().await?;
     let config = builder.config.clone();
     let (agent_main, agent_trader, main_provider) = setup_agents_and_provider(&config)?;
