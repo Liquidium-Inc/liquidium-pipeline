@@ -34,6 +34,8 @@ pub(super) fn draw_configuration(f: &mut Frame<'_>, area: Rect, app: &App) {
         ]),
         Line::from(""),
         Line::from(format!("Network: {}", app.config.ic_url)),
+        Line::from(format!("LENDING_CANISTER: {}", app.config.lending_canister)),
+        Line::from(format!("KONG_BACKEND: {}", app.config.kong_backend)),
         Line::from(format!("Liquidator principal: {}", app.config.liquidator_principal)),
         Line::from(format!("Trader principal: {}", app.config.trader_principal)),
         Line::from(format!("Liquidator EVM: {}", app.config.evm_address)),

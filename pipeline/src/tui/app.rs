@@ -18,6 +18,8 @@ const MAX_LOG_LINE_CHARS: usize = 4096;
 #[derive(Clone, Debug)]
 pub(super) struct ConfigSummary {
     pub(super) ic_url: String,
+    pub(super) lending_canister: String,
+    pub(super) kong_backend: String,
     pub(super) liquidator_principal: String,
     pub(super) trader_principal: String,
     pub(super) evm_address: String,
@@ -483,6 +485,8 @@ mod tests {
     fn sample_config() -> ConfigSummary {
         ConfigSummary {
             ic_url: "https://ic0.app".to_string(),
+            lending_canister: "nja4y-2yaaa-aaaae-qddxa-cai".to_string(),
+            kong_backend: "2ipq2-uqaaa-aaaar-qailq-cai".to_string(),
             liquidator_principal: "aaaaa-aa".to_string(),
             trader_principal: "bbbbb-bb".to_string(),
             evm_address: "0x0".to_string(),
