@@ -6,6 +6,7 @@ use liquidium_pipeline_connectors::backend::cex_backend::{CexBackend, OrderBookL
 use liquidium_pipeline_core::tokens::asset_id::AssetId;
 use log::{debug, info};
 
+use crate::error::AppError;
 use crate::swappers::model::{SwapExecution, SwapQuote, SwapQuoteLeg, SwapRequest};
 use crate::swappers::router::SwapVenue;
 
@@ -16,9 +17,9 @@ fn f64_to_nat(v: f64) -> Nat {
 const DEFAULT_ORDERBOOK_LIMIT: u32 = 50;
 const LIQUIDITY_EPS: f64 = 1e-9;
 
-fn quote_sell_from_bids(bids: &[OrderBookLevel], amount_in: f64) -> Result<f64, String> {
+fn quote_sell_from_bids(bids: &[OrderBookLevel], amount_in: f64) -> Result<f64, AppError> {
     if amount_in <= 0.0 {
-        return Err("amount_in must be positive".to_string());
+        return Err("amount_in must be positive".into());
     }
 
     let mut remaining = amount_in;
@@ -38,15 +39,15 @@ fn quote_sell_from_bids(bids: &[OrderBookLevel], amount_in: f64) -> Result<f64, 
     }
 
     if remaining > LIQUIDITY_EPS {
-        return Err("not enough bid liquidity".to_string());
+        return Err("not enough bid liquidity".into());
     }
 
     Ok(proceeds)
 }
 
-fn quote_buy_from_asks(asks: &[OrderBookLevel], quote_in: f64) -> Result<f64, String> {
+fn quote_buy_from_asks(asks: &[OrderBookLevel], quote_in: f64) -> Result<f64, AppError> {
     if quote_in <= 0.0 {
-        return Err("amount_in must be positive".to_string());
+        return Err("amount_in must be positive".into());
     }
 
     let mut remaining_quote = quote_in;
@@ -68,7 +69,7 @@ fn quote_buy_from_asks(asks: &[OrderBookLevel], quote_in: f64) -> Result<f64, St
     }
 
     if remaining_quote > LIQUIDITY_EPS {
-        return Err("not enough ask liquidity".to_string());
+        return Err("not enough ask liquidity".into());
     }
 
     Ok(base_out)
@@ -88,7 +89,7 @@ impl<C: CexBackend> MexcSwapVenue<C> {
         pay_asset: &AssetId,
         receive_asset: &AssetId,
         amount_in: f64,
-    ) -> Result<(String, String, f64), String> {
+    ) -> Result<(String, String, f64), AppError> {
         let pay = pay_asset.symbol.to_ascii_uppercase();
         let recv = receive_asset.symbol.to_ascii_uppercase();
 
@@ -131,7 +132,8 @@ impl<C: CexBackend> MexcSwapVenue<C> {
             pay,
             recv,
             errors.join(" | ")
-        ))
+        )
+        .into())
     }
 }
 
@@ -141,13 +143,13 @@ impl<C: CexBackend> SwapVenue for MexcSwapVenue<C> {
         "mexc"
     }
 
-    async fn init(&self) -> Result<(), String> {
-        // Epmty impl;
+    async fn init(&self) -> Result<(), AppError> {
+        // Empty impl
 
         Ok(())
     }
 
-    async fn quote(&self, req: &SwapRequest) -> Result<SwapQuote, String> {
+    async fn quote(&self, req: &SwapRequest) -> Result<SwapQuote, AppError> {
         let amount_in_f = req.pay_amount.to_f64();
         let (market, side, out_f) = self
             .resolve_trade(&req.pay_asset, &req.receive_asset, amount_in_f)
@@ -193,7 +195,7 @@ impl<C: CexBackend> SwapVenue for MexcSwapVenue<C> {
         })
     }
 
-    async fn execute(&self, req: &SwapRequest) -> Result<SwapExecution, String> {
+    async fn execute(&self, req: &SwapRequest) -> Result<SwapExecution, AppError> {
         let amount_in_f = req.pay_amount.to_f64();
         let (market, side, _out_f) = self
             .resolve_trade(&req.pay_asset, &req.receive_asset, amount_in_f)

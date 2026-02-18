@@ -11,6 +11,8 @@ use std::collections::HashMap;
 use std::env;
 use std::sync::Arc;
 
+use crate::error::{AppError, error_codes};
+
 fn expand_tilde(p: &str) -> std::path::PathBuf {
     if let Some(stripped) = p.strip_prefix("~/")
         && let Ok(home) = std::env::var("HOME")
@@ -99,7 +101,7 @@ pub trait ConfigTrait: Send + Sync {
     #[allow(dead_code)]
     fn get_recovery_account(&self) -> Account;
     fn get_swapper_mode(&self) -> SwapperMode;
-    fn get_cex_credentials(&self, cex: &str) -> Result<(String, String), String>;
+    fn get_cex_credentials(&self, cex: &str) -> Result<(String, String), AppError>;
 }
 
 impl ConfigTrait for Config {
@@ -186,41 +188,51 @@ impl ConfigTrait for Config {
         self.swapper
     }
 
-    fn get_cex_credentials(&self, cex: &str) -> Result<(String, String), String> {
+    fn get_cex_credentials(&self, cex: &str) -> Result<(String, String), AppError> {
         self.cex_credentials
             .get(cex)
-            .ok_or("Cex credentials not found".to_string())
+            .ok_or_else(|| AppError::from_def(error_codes::CONFIG_ERROR).with_context("Cex credentials not found"))
             .cloned()
     }
 }
 
 impl Config {
-    pub async fn load() -> Result<Arc<Self>, String> {
+    pub async fn load() -> Result<Arc<Self>, AppError> {
         let home = config_dir();
 
-        let ic_url = env::var("IC_URL").map_err(|_| "IC_URL not configured".to_string())?;
+        let ic_url = env::var("IC_URL")
+            .map_err(|_| AppError::from_def(error_codes::CONFIG_ERROR).with_context("IC_URL not configured"))?;
         let export_path_raw = env::var("EXPORT_PATH").unwrap_or(format!("{}/executions.csv", home));
         let export_path = expand_tilde(&export_path_raw).to_string_lossy().into_owned();
 
         let mnemonic_path =
-            expand_tilde(&env::var("MNEMONIC_FILE").map_err(|_| "MNEMONIC_FILE not configured".to_string())?);
+            expand_tilde(&env::var("MNEMONIC_FILE").map_err(|_| {
+                AppError::from_def(error_codes::CONFIG_ERROR).with_context("MNEMONIC_FILE not configured")
+            })?);
 
         let mnemonic = std::fs::read_to_string(&mnemonic_path)
-            .map_err(|e| format!("failed to read mnemonic file: {e}"))?
+            .map_err(|e| {
+                AppError::from_def(error_codes::CONFIG_ERROR).with_context(format!("failed to read mnemonic file: {e}"))
+            })?
             .trim()
             .to_string();
 
-        let liquidator_identity =
-            derive_icp_identity(&mnemonic, 0, 0).map_err(|e| format!("could not create liquidator identity: {e}"))?;
-        let liquidator_principal = liquidator_identity
-            .sender()
-            .map_err(|e| format!("could not decode liquidator principal: {e}"))?;
+        let liquidator_identity = derive_icp_identity(&mnemonic, 0, 0).map_err(|e| {
+            AppError::from_def(error_codes::CONFIG_ERROR)
+                .with_context(format!("could not create liquidator identity: {e}"))
+        })?;
+        let liquidator_principal = liquidator_identity.sender().map_err(|e| {
+            AppError::from_def(error_codes::CONFIG_ERROR)
+                .with_context(format!("could not decode liquidator principal: {e}"))
+        })?;
 
-        let trader_identity =
-            derive_icp_identity(&mnemonic, 0, 1).map_err(|e| format!("could not create trader identity: {e}"))?;
-        let trader_principal = trader_identity
-            .sender()
-            .map_err(|e| format!("could not decode trader principal: {e}"))?;
+        let trader_identity = derive_icp_identity(&mnemonic, 0, 1).map_err(|e| {
+            AppError::from_def(error_codes::CONFIG_ERROR).with_context(format!("could not create trader identity: {e}"))
+        })?;
+        let trader_principal = trader_identity.sender().map_err(|e| {
+            AppError::from_def(error_codes::CONFIG_ERROR)
+                .with_context(format!("could not decode trader principal: {e}"))
+        })?;
 
         let buy_bad_debt = env::var("BUY_BAD_DEBT")
             .map(|v| v.parse().unwrap_or(false))
@@ -230,10 +242,13 @@ impl Config {
         debug!("Trader ID {}", trader_principal);
 
         // Load the asset maps
-        let lending_canister_str =
-            env::var("LENDING_CANISTER").map_err(|_| "LENDING_CANISTER not configured".to_string())?;
-        let lending_canister = Principal::from_text(&lending_canister_str)
-            .map_err(|e| format!("invalid LENDING_CANISTER principal: {e}"))?;
+        let lending_canister_str = env::var("LENDING_CANISTER").map_err(|_| {
+            AppError::from_def(error_codes::CONFIG_ERROR).with_context("LENDING_CANISTER not configured")
+        })?;
+        let lending_canister = Principal::from_text(&lending_canister_str).map_err(|e| {
+            AppError::from_def(error_codes::CONFIG_ERROR)
+                .with_context(format!("invalid LENDING_CANISTER principal: {e}"))
+        })?;
 
         // The db path
         let db_path_raw = env::var("DB_PATH").unwrap_or(format!("{}/wal.db", home));
@@ -241,7 +256,9 @@ impl Config {
 
         // Derive EVM private key
         let sk = derive_evm_private_key(&mnemonic, 0, 0)?;
-        let evm_signer: PrivateKeySigner = PrivateKeySigner::from_slice(&sk.to_bytes()).map_err(|e| e.to_string())?;
+        let evm_signer: PrivateKeySigner = PrivateKeySigner::from_slice(&sk.to_bytes()).map_err(|e| {
+            AppError::from_def(error_codes::CONFIG_ERROR).with_context(format!("failed to build evm signer: {e}"))
+        })?;
         let hex = evm_signer.to_bytes().encode_hex();
         let evm_private_key = format!("{:#}", hex);
 
@@ -291,7 +308,8 @@ impl Config {
             Err(_) => vec![],
         };
 
-        let evm_rpc_url = env::var("EVM_RPC_URL").map_err(|_| "EVM_RPC_URL not configured".to_string())?;
+        let evm_rpc_url = env::var("EVM_RPC_URL")
+            .map_err(|_| AppError::from_def(error_codes::CONFIG_ERROR).with_context("EVM_RPC_URL not configured"))?;
 
         Ok(Arc::new(Config {
             evm_private_key,

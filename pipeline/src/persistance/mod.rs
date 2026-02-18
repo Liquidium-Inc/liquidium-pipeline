@@ -1,7 +1,7 @@
-use anyhow::Result;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
+use crate::error::AppError;
 use crate::stages::executor::ExecutionReceipt;
 pub mod sqlite;
 
@@ -65,19 +65,19 @@ pub struct LiqResultRecord {
 #[cfg_attr(test, mockall::automock)]
 #[async_trait]
 pub trait WalStore: Send + Sync {
-    async fn upsert_result(&self, row: LiqResultRecord) -> Result<()>;
-    async fn get_result(&self, liq_id: &str) -> Result<Option<LiqResultRecord>>;
-    async fn list_by_status(&self, status: ResultStatus, limit: usize) -> Result<Vec<LiqResultRecord>>;
-    async fn get_pending(&self, limit: usize) -> Result<Vec<LiqResultRecord>>;
-    async fn update_status(&self, liq_id: &str, next: ResultStatus, bump_attempt: bool) -> Result<()>;
+    async fn upsert_result(&self, row: LiqResultRecord) -> Result<(), AppError>;
+    async fn get_result(&self, liq_id: &str) -> Result<Option<LiqResultRecord>, AppError>;
+    async fn list_by_status(&self, status: ResultStatus, limit: usize) -> Result<Vec<LiqResultRecord>, AppError>;
+    async fn get_pending(&self, limit: usize) -> Result<Vec<LiqResultRecord>, AppError>;
+    async fn update_status(&self, liq_id: &str, next: ResultStatus, bump_attempt: bool) -> Result<(), AppError>;
     async fn update_failure(
         &self,
         liq_id: &str,
         next: ResultStatus,
-        last_error: String,
+        last_error: AppError,
         bump_attempt: bool,
-    ) -> Result<()>;
-    async fn delete(&self, liq_id: &str) -> Result<()>;
+    ) -> Result<(), AppError>;
+    async fn delete(&self, liq_id: &str) -> Result<(), AppError>;
 }
 
 pub fn now_secs() -> i64 {

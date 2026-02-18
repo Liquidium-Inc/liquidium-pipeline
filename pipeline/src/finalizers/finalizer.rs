@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
+use crate::error::AppError;
 use crate::{persistance::WalStore, stages::executor::ExecutionReceipt, swappers::model::SwapExecution};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -24,5 +25,5 @@ impl FinalizerResult {
 
 #[async_trait]
 pub trait Finalizer: Send + Sync {
-    async fn finalize(&self, wal: &dyn WalStore, receipt: ExecutionReceipt) -> Result<FinalizerResult, String>;
+    async fn finalize(&self, wal: &dyn WalStore, receipt: ExecutionReceipt) -> Result<FinalizerResult, AppError>;
 }

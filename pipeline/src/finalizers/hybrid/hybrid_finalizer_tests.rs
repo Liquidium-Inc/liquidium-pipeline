@@ -15,6 +15,7 @@ use std::sync::{
 };
 
 use crate::config::MockConfigTrait;
+use crate::error::AppError;
 use crate::executors::executor::ExecutorRequest;
 use crate::finalizers::cex_finalizer::{CexFinalizerLogic, CexRoutePreview, CexState};
 use crate::finalizers::dex_finalizer::DexFinalizerLogic;
@@ -30,8 +31,8 @@ struct NoopDexFinalizer;
 
 #[async_trait]
 impl DexFinalizerLogic for NoopDexFinalizer {
-    async fn swap(&self, _req: &SwapRequest) -> Result<SwapExecution, String> {
-        Err("dex finalizer should not run".to_string())
+    async fn swap(&self, _req: &SwapRequest) -> Result<SwapExecution, AppError> {
+        Err("dex finalizer should not run".into())
     }
 }
 
@@ -41,7 +42,7 @@ struct RecordingDexFinalizer {
 
 #[async_trait]
 impl DexFinalizerLogic for RecordingDexFinalizer {
-    async fn swap(&self, req: &SwapRequest) -> Result<SwapExecution, String> {
+    async fn swap(&self, req: &SwapRequest) -> Result<SwapExecution, AppError> {
         self.swap_calls.fetch_add(1, Ordering::SeqCst);
         Ok(SwapExecution {
             swap_id: 1,
@@ -62,32 +63,32 @@ impl DexFinalizerLogic for RecordingDexFinalizer {
 }
 
 struct StubCexFinalizer {
-    preview: Result<CexRoutePreview, String>,
+    preview: Result<CexRoutePreview, AppError>,
 }
 
 #[async_trait]
 impl CexFinalizerLogic for StubCexFinalizer {
-    async fn prepare(&self, _liq_id: &str, _receipt: &ExecutionReceipt) -> Result<CexState, String> {
-        Err("unused in hybrid tests".to_string())
+    async fn prepare(&self, _liq_id: &str, _receipt: &ExecutionReceipt) -> Result<CexState, AppError> {
+        Err("unused in hybrid tests".into())
     }
 
-    async fn deposit(&self, _state: &mut CexState) -> Result<(), String> {
-        Err("unused in hybrid tests".to_string())
+    async fn deposit(&self, _state: &mut CexState) -> Result<(), AppError> {
+        Err("unused in hybrid tests".into())
     }
 
-    async fn trade(&self, _state: &mut CexState) -> Result<(), String> {
-        Err("unused in hybrid tests".to_string())
+    async fn trade(&self, _state: &mut CexState) -> Result<(), AppError> {
+        Err("unused in hybrid tests".into())
     }
 
-    async fn withdraw(&self, _state: &mut CexState) -> Result<(), String> {
-        Err("unused in hybrid tests".to_string())
+    async fn withdraw(&self, _state: &mut CexState) -> Result<(), AppError> {
+        Err("unused in hybrid tests".into())
     }
 
-    async fn finish(&self, _receipt: &ExecutionReceipt, _state: &CexState) -> Result<SwapExecution, String> {
-        Err("unused in hybrid tests".to_string())
+    async fn finish(&self, _receipt: &ExecutionReceipt, _state: &CexState) -> Result<SwapExecution, AppError> {
+        Err("unused in hybrid tests".into())
     }
 
-    async fn preview_route(&self, _receipt: &ExecutionReceipt) -> Result<CexRoutePreview, String> {
+    async fn preview_route(&self, _receipt: &ExecutionReceipt) -> Result<CexRoutePreview, AppError> {
         self.preview.clone()
     }
 }
@@ -144,12 +145,12 @@ impl TestWal {
 
 #[async_trait]
 impl WalStore for TestWal {
-    async fn upsert_result(&self, row: LiqResultRecord) -> anyhow::Result<()> {
+    async fn upsert_result(&self, row: LiqResultRecord) -> Result<(), AppError> {
         *self.row.lock().expect("row lock poisoned") = Some(row);
         Ok(())
     }
 
-    async fn get_result(&self, liq_id: &str) -> anyhow::Result<Option<LiqResultRecord>> {
+    async fn get_result(&self, liq_id: &str) -> Result<Option<LiqResultRecord>, AppError> {
         Ok(self
             .row
             .lock()
@@ -158,7 +159,7 @@ impl WalStore for TestWal {
             .filter(|row| row.id == liq_id))
     }
 
-    async fn list_by_status(&self, status: ResultStatus, limit: usize) -> anyhow::Result<Vec<LiqResultRecord>> {
+    async fn list_by_status(&self, status: ResultStatus, limit: usize) -> Result<Vec<LiqResultRecord>, AppError> {
         if limit == 0 {
             return Ok(vec![]);
         }
@@ -172,7 +173,7 @@ impl WalStore for TestWal {
             .collect())
     }
 
-    async fn get_pending(&self, limit: usize) -> anyhow::Result<Vec<LiqResultRecord>> {
+    async fn get_pending(&self, limit: usize) -> Result<Vec<LiqResultRecord>, AppError> {
         if limit == 0 {
             return Ok(vec![]);
         }
@@ -191,7 +192,7 @@ impl WalStore for TestWal {
             .collect())
     }
 
-    async fn update_status(&self, liq_id: &str, next: ResultStatus, bump_attempt: bool) -> anyhow::Result<()> {
+    async fn update_status(&self, liq_id: &str, next: ResultStatus, bump_attempt: bool) -> Result<(), AppError> {
         if let Some(row) = self
             .row
             .lock()
@@ -211,9 +212,9 @@ impl WalStore for TestWal {
         &self,
         liq_id: &str,
         next: ResultStatus,
-        last_error: String,
+        last_error: AppError,
         bump_attempt: bool,
-    ) -> anyhow::Result<()> {
+    ) -> Result<(), AppError> {
         if let Some(row) = self
             .row
             .lock()
@@ -222,7 +223,7 @@ impl WalStore for TestWal {
             .filter(|row| row.id == liq_id)
         {
             row.status = next;
-            row.last_error = Some(last_error);
+            row.last_error = Some(last_error.to_string());
             if bump_attempt {
                 row.attempt += 1;
             }
@@ -230,7 +231,7 @@ impl WalStore for TestWal {
         Ok(())
     }
 
-    async fn delete(&self, liq_id: &str) -> anyhow::Result<()> {
+    async fn delete(&self, liq_id: &str) -> Result<(), AppError> {
         let mut row = self.row.lock().expect("row lock poisoned");
         if row.as_ref().is_some_and(|existing| existing.id == liq_id) {
             *row = None;
@@ -549,7 +550,7 @@ async fn hybrid_both_preview_errors_returns_error() {
     dex_swapper
         .expect_quote()
         .times(1)
-        .returning(|_| Err("dex unavailable".to_string()));
+        .returning(|_| Err("dex unavailable".into()));
     dex_swapper.expect_execute().times(0);
 
     let mut transfers = MockTransferActions::new();
@@ -563,7 +564,7 @@ async fn hybrid_both_preview_errors_returns_error() {
         dex_swapper: Arc::new(dex_swapper),
         dex_finalizer: Arc::new(NoopDexFinalizer),
         cex_finalizer: Some(Arc::new(StubCexFinalizer {
-            preview: Err("cex unavailable".to_string()),
+            preview: Err("cex unavailable".into()),
         })),
     };
 
@@ -593,7 +594,7 @@ async fn hybrid_recovery_transfer_failure_returns_error() {
     transfers
         .expect_transfer()
         .times(1)
-        .returning(|_, _, _| Err("boom".to_string()));
+        .returning(|_, _, _| Err("boom".into()));
     transfers.expect_approve().times(0);
 
     let mut dex_swapper = MockSwapInterface::new();
@@ -667,7 +668,7 @@ async fn forced_preview_error_persists_snapshot_and_errors() {
     dex_swapper
         .expect_quote()
         .times(1)
-        .returning(|_| Err("dex api timeout".to_string()));
+        .returning(|_| Err("dex api timeout".into()));
     dex_swapper.expect_execute().times(0);
 
     let mut transfers = MockTransferActions::new();
@@ -884,7 +885,7 @@ async fn hybrid_one_preview_error_uses_other_preview() {
     dex_swapper
         .expect_quote()
         .times(1)
-        .returning(|_| Err("dex unavailable".to_string()));
+        .returning(|_| Err("dex unavailable".into()));
     dex_swapper.expect_execute().times(0);
 
     let mut transfers = MockTransferActions::new();

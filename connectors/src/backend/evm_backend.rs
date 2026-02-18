@@ -7,6 +7,7 @@ use alloy::{
 };
 use async_trait::async_trait;
 use candid::Nat;
+use liquidium_pipeline_core::error::{AppError, error_codes};
 
 sol! {
     #[sol(rpc)]
@@ -21,10 +22,10 @@ sol! {
 #[async_trait]
 pub trait EvmBackend: Send + Sync {
     // ERC20 balance for the pipeline wallet on a given chain.
-    async fn erc20_balance(&self, chain: &str, token_address: &str) -> Result<Nat, String>;
+    async fn erc20_balance(&self, chain: &str, token_address: &str) -> Result<Nat, AppError>;
 
     // Native coin balance (ETH, ARB, etc) for the pipeline wallet.
-    async fn native_balance(&self, chain: &str) -> Result<Nat, String>;
+    async fn native_balance(&self, chain: &str) -> Result<Nat, AppError>;
 
     // ERC20 transfer from the pipeline wallet.
     async fn erc20_transfer(
@@ -33,19 +34,19 @@ pub trait EvmBackend: Send + Sync {
         token_address: &str,
         to: &str,
         amount_wei: Nat,
-    ) -> Result<String, String>; // tx hash
+    ) -> Result<String, AppError>; // tx hash
 
     // Native transfer from the pipeline wallet.
-    async fn native_transfer(&self, chain: &str, to: &str, amount_wei: Nat) -> Result<String, String>;
+    async fn native_transfer(&self, chain: &str, to: &str, amount_wei: Nat) -> Result<String, AppError>;
 
     // Decimals
-    async fn erc20_decimals(&self, chain: &str, token_address: &str) -> Result<u8, String>;
+    async fn erc20_decimals(&self, chain: &str, token_address: &str) -> Result<u8, AppError>;
 }
 
-fn nat_to_u256(n: &Nat) -> Result<U256, String> {
+fn nat_to_u256(n: &Nat) -> Result<U256, AppError> {
     let bytes: Vec<u8> = n.0.to_bytes_be();
     if bytes.len() > 32 {
-        return Err("Nat too large for U256".into());
+        return Err(AppError::from_def(error_codes::INVALID_INPUT).with_context("Nat too large for U256"));
     }
     Ok(U256::from_be_slice(&bytes))
 }
@@ -69,30 +70,27 @@ impl<P> EvmBackend for EvmBackendImpl<P>
 where
     P: Provider<AnyNetwork> + WalletProvider<AnyNetwork> + Send + Sync + Clone + 'static,
 {
-    async fn erc20_balance(&self, _chain: &str, token_address: &str) -> Result<Nat, String> {
+    async fn erc20_balance(&self, _chain: &str, token_address: &str) -> Result<Nat, AppError> {
         let owner = self.provider.wallet().default_signer_address();
 
-        let token_addr: Address = token_address
-            .parse()
-            .map_err(|e| format!("invalid token address: {e}"))?;
+        let token_addr: Address = token_address.parse().map_err(|e| {
+            AppError::from_def(error_codes::INVALID_INPUT).with_context(format!("invalid token address: {e}"))
+        })?;
 
         let contract = IERC20::new(token_addr, self.provider.clone());
 
-        let res = contract
-            .balanceOf(owner)
-            .call()
-            .await
-            .map_err(|e| format!("erc20 balanceOf failed: {e}"))?;
+        let res = contract.balanceOf(owner).call().await.map_err(|e| {
+            AppError::from_def(error_codes::EXTERNAL_CALL_FAILED).with_context(format!("erc20 balanceOf failed: {e}"))
+        })?;
 
         Ok(u256_to_nat(res))
     }
 
-    async fn native_balance(&self, _chain: &str) -> Result<Nat, String> {
-        let bal: U256 = self
-            .provider
-            .get_balance(self.wallet_address())
-            .await
-            .map_err(|e| format!("native get_balance failed: {e}"))?;
+    async fn native_balance(&self, _chain: &str) -> Result<Nat, AppError> {
+        let bal: U256 = self.provider.get_balance(self.wallet_address()).await.map_err(|e| {
+            AppError::from_def(error_codes::EXTERNAL_CALL_FAILED)
+                .with_context(format!("native get_balance failed: {e}"))
+        })?;
 
         Ok(u256_to_nat(bal))
     }
@@ -103,58 +101,58 @@ where
         token_address: &str,
         to: &str,
         amount_wei: Nat,
-    ) -> Result<String, String> {
-        let token_addr: Address = token_address
-            .parse()
-            .map_err(|e| format!("invalid token address: {e}"))?;
-        let to_addr: Address = to.parse().map_err(|e| format!("invalid recipient address: {e}"))?;
+    ) -> Result<String, AppError> {
+        let token_addr: Address = token_address.parse().map_err(|e| {
+            AppError::from_def(error_codes::INVALID_INPUT).with_context(format!("invalid token address: {e}"))
+        })?;
+        let to_addr: Address = to.parse().map_err(|e| {
+            AppError::from_def(error_codes::INVALID_INPUT).with_context(format!("invalid recipient address: {e}"))
+        })?;
 
         let amount = nat_to_u256(&amount_wei)?;
 
         let contract = IERC20::new(token_addr, self.provider.clone());
 
-        let tx = contract
-            .transfer(to_addr, amount)
-            .send()
-            .await
-            .map_err(|e| format!("erc20 transfer send failed: {e}"))?;
+        let tx = contract.transfer(to_addr, amount).send().await.map_err(|e| {
+            AppError::from_def(error_codes::EXTERNAL_CALL_FAILED)
+                .with_context(format!("erc20 transfer send failed: {e}"))
+        })?;
 
         let tx_hash = format!("{:#x}", tx.tx_hash());
         Ok(tx_hash)
     }
 
-    async fn native_transfer(&self, _chain: &str, to: &str, amount_wei: Nat) -> Result<String, String> {
-        let to_addr: Address = to.parse().map_err(|e| format!("invalid recipient address: {e}"))?;
+    async fn native_transfer(&self, _chain: &str, to: &str, amount_wei: Nat) -> Result<String, AppError> {
+        let to_addr: Address = to.parse().map_err(|e| {
+            AppError::from_def(error_codes::INVALID_INPUT).with_context(format!("invalid recipient address: {e}"))
+        })?;
         let amount = nat_to_u256(&amount_wei)?;
 
         let tx = TransactionRequest::default().with_to(to_addr).with_value(amount);
 
-        let pending = self
-            .provider
-            .send_transaction(tx.into())
-            .await
-            .map_err(|e| format!("native transfer send failed: {e}"))?;
+        let pending = self.provider.send_transaction(tx.into()).await.map_err(|e| {
+            AppError::from_def(error_codes::EXTERNAL_CALL_FAILED)
+                .with_context(format!("native transfer send failed: {e}"))
+        })?;
 
-        let tx_hash = pending
-            .watch()
-            .await
-            .map_err(|e| format!("native transfer watch failed: {e}"))?;
+        let tx_hash = pending.watch().await.map_err(|e| {
+            AppError::from_def(error_codes::EXTERNAL_CALL_FAILED)
+                .with_context(format!("native transfer watch failed: {e}"))
+        })?;
 
         Ok(format!("{:#x}", tx_hash))
     }
 
-    async fn erc20_decimals(&self, _chain: &str, token_address: &str) -> Result<u8, String> {
-        let token_addr: Address = token_address
-            .parse()
-            .map_err(|e| format!("invalid token address: {e}"))?;
+    async fn erc20_decimals(&self, _chain: &str, token_address: &str) -> Result<u8, AppError> {
+        let token_addr: Address = token_address.parse().map_err(|e| {
+            AppError::from_def(error_codes::INVALID_INPUT).with_context(format!("invalid token address: {e}"))
+        })?;
 
         let contract = IERC20::new(token_addr, self.provider.clone());
 
-        let res = contract
-            .decimals()
-            .call()
-            .await
-            .map_err(|e| format!("erc20 decimals() failed: {e}"))?;
+        let res = contract.decimals().call().await.map_err(|e| {
+            AppError::from_def(error_codes::EXTERNAL_CALL_FAILED).with_context(format!("erc20 decimals() failed: {e}"))
+        })?;
 
         Ok(res)
     }

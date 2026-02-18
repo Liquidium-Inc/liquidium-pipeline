@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
+use crate::error::AppError;
 use crate::{
     finalizers::dex_finalizer::DexFinalizerLogic,
     swappers::{
@@ -31,7 +32,7 @@ impl<S> DexFinalizerLogic for KongSwapFinalizer<S>
 where
     S: SwapInterface + Send + Sync,
 {
-    async fn swap(&self, req: &SwapRequest) -> Result<SwapExecution, String> {
+    async fn swap(&self, req: &SwapRequest) -> Result<SwapExecution, AppError> {
         self.swapper.execute(req).await
     }
 }
@@ -209,7 +210,7 @@ mod tests {
         mock_swapper
             .expect_execute()
             .times(1)
-            .returning(|_req: &SwapRequest| Err("boom".to_string()));
+            .returning(|_req: &SwapRequest| Err("boom".into()));
 
         let finalizer = KongSwapFinalizer {
             swapper: Arc::new(mock_swapper),
@@ -219,7 +220,7 @@ mod tests {
 
         let err = finalizer.swap(&req).await.expect_err("swap should fail");
 
-        assert_eq!(err, "boom".to_string());
+        assert!(err.to_string().contains("boom"));
     }
 
     #[tokio::test]
@@ -258,7 +259,7 @@ mod tests {
 
         swapper
             .expect_execute()
-            .returning(|_req: &SwapRequest| Err("boom".to_string()));
+            .returning(|_req: &SwapRequest| Err("boom".into()));
 
         let finalizer = KongSwapFinalizer {
             swapper: Arc::new(swapper),
@@ -271,6 +272,6 @@ mod tests {
             .await
             .expect_err("finalize should fail");
 
-        assert_eq!(err, "boom".to_string());
+        assert!(err.to_string().contains("boom"));
     }
 }

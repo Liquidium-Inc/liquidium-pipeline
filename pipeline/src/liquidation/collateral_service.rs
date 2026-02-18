@@ -5,6 +5,7 @@ use candid::Nat;
 use log::debug;
 
 use crate::{
+    error::AppError,
     liquidation::liquidation_math::{compute_liquidation_amounts, max_repay_from_collateral},
     price_oracle::price_oracle::PriceOracle,
 };
@@ -30,7 +31,7 @@ pub trait CollateralServiceTrait: Send + Sync {
         debt_position: &LiquidateblePosition,
         collateral_position: &LiquidateblePosition,
         user: &mut LiquidatebleUser,
-    ) -> Result<LiquidationEstimation, String>;
+    ) -> Result<LiquidationEstimation, AppError>;
 }
 
 pub struct CollateralService<P: PriceOracle> {
@@ -50,22 +51,24 @@ impl<P: PriceOracle> CollateralServiceTrait for CollateralService<P> {
         debt_position: &LiquidateblePosition,
         collateral_position: &LiquidateblePosition,
         user: &mut LiquidatebleUser,
-    ) -> Result<LiquidationEstimation, String> {
+    ) -> Result<LiquidationEstimation, AppError> {
         let debt_symbol = debt_position.asset.symbol();
         let collateral_symbol = collateral_position.asset.symbol();
 
         // Fetch oracle prices: (raw, decimals)
-        let (price_debt_ray, _) = self
-            .price_oracle
-            .get_price(&debt_symbol, "USDT")
-            .await
-            .map_err(|e| format!("Could not get debt price: {}", e))?;
+        let (price_debt_ray, _) = self.price_oracle.get_price(&debt_symbol, "USDT").await.map_err(|e| {
+            let context = format!("Could not get debt price for {}: {}", debt_symbol, e);
+            e.with_context(context)
+        })?;
 
         let (price_coll_ray, _) = self
             .price_oracle
             .get_price(&collateral_symbol, "USDT")
             .await
-            .map_err(|e| format!("Could not get collateral price: {}", e))?;
+            .map_err(|e| {
+                let context = format!("Could not get collateral price for {}: {}", collateral_symbol, e);
+                e.with_context(context)
+            })?;
 
         // Decimals for tokens
         let debt_decimals = debt_position.asset.decimals();
@@ -115,7 +118,10 @@ impl<P: PriceOracle> CollateralServiceTrait for CollateralService<P> {
             bonus_bps,
             fee_bps,
         )
-        .map_err(|e| format!("max_repay_from_collateral: {}", e))?;
+        .map_err(|e| {
+            let context = format!("max_repay_from_collateral failed: {}", e);
+            e.with_context(context)
+        })?;
 
         debug!("[debug] repay_cap_by_coll={} ", repay_cap_by_coll);
 
@@ -131,7 +137,10 @@ impl<P: PriceOracle> CollateralServiceTrait for CollateralService<P> {
             bonus_bps,
             fee_bps,
         )
-        .map_err(|e| format!("compute_liquidation_amounts: {}", e))?;
+        .map_err(|e| {
+            let context = format!("compute_liquidation_amounts failed: {}", e);
+            e.with_context(context)
+        })?;
 
         debug!("[debug] seized_native={} fee_native={}", seized_native, fee_native);
 
@@ -167,11 +176,10 @@ impl<P: PriceOracle> CollateralServiceTrait for CollateralService<P> {
 
         for pos in &user.positions {
             let sym = pos.asset.symbol();
-            let (p_ray, _) = self
-                .price_oracle
-                .get_price(&sym, "USDT")
-                .await
-                .map_err(|e| format!("Could not get price for {}: {}", sym, e))?;
+            let (p_ray, _) = self.price_oracle.get_price(&sym, "USDT").await.map_err(|e| {
+                let context = format!("Could not get price for {}: {}", sym, e);
+                e.with_context(context)
+            })?;
             let dec = pos.asset.decimals();
             let scale = Nat::from(10u128.pow(dec));
 
@@ -190,11 +198,10 @@ impl<P: PriceOracle> CollateralServiceTrait for CollateralService<P> {
         let mut new_debt_quote = Nat::from(0u8);
         for pos in &user.positions {
             let sym = pos.asset.symbol();
-            let (p_ray, _) = self
-                .price_oracle
-                .get_price(&sym, "USDT")
-                .await
-                .map_err(|e| format!("Could not get price for {}: {}", sym, e))?;
+            let (p_ray, _) = self.price_oracle.get_price(&sym, "USDT").await.map_err(|e| {
+                let context = format!("Could not get price for {}: {}", sym, e);
+                e.with_context(context)
+            })?;
             let dec = pos.asset.decimals();
             let scale = Nat::from(10u128.pow(dec));
             // p_ray is RAY; dividing only by scale keeps debt quote in RAY

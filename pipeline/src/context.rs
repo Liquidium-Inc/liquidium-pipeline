@@ -27,6 +27,7 @@ use liquidium_pipeline_connectors::{
 
 use crate::approval_state::ApprovalState;
 use crate::config::{Config, ConfigTrait};
+use crate::error::{AppError, error_codes};
 use crate::swappers::kong::kong_swapper::KongSwapSwapper;
 use crate::swappers::kong::kong_venue::KongVenue;
 use crate::swappers::router::{SwapRouter, SwapVenue};
@@ -79,8 +80,10 @@ fn should_fallback_to_empty_registry(err: &PipelineContextError) -> bool {
 }
 
 impl<P: Provider<AnyNetwork> + WalletProvider<AnyNetwork> + Clone + 'static> PipelineContextBuilder<P> {
-    pub async fn new() -> Result<Self, String> {
-        let config = Config::load().await.map_err(|e| format!("config load failed: {e}"))?;
+    pub async fn new() -> Result<Self, AppError> {
+        let config = Config::load().await.map_err(|e| {
+            AppError::from_def(error_codes::CONFIG_ERROR).with_context(format!("config load failed: {e}"))
+        })?;
         Ok(Self {
             config,
             evm_provider_main: None,
@@ -104,10 +107,10 @@ impl<P: Provider<AnyNetwork> + WalletProvider<AnyNetwork> + Clone + 'static> Pip
         self
     }
 
-    pub async fn build(self) -> Result<PipelineContext, String> {
+    pub async fn build(self) -> Result<PipelineContext, AppError> {
         self.build_with_registry_override(None)
             .await
-            .map_err(|e| format_with_code(&e))
+            .map_err(|e| AppError::from_def(error_codes::INTERNAL_ERROR).with_context(format_with_code(&e)))
     }
 
     pub async fn build_with_registry_override(
@@ -268,7 +271,7 @@ fn setup_agents_and_provider(
         Arc<Agent>,
         impl Provider<AnyNetwork> + WalletProvider<AnyNetwork> + Clone + 'static,
     ),
-    String,
+    AppError,
 > {
     let agent_main = Arc::new(
         Agent::builder()
@@ -276,7 +279,9 @@ fn setup_agents_and_provider(
             .with_identity(config.liquidator_identity.clone())
             .with_max_tcp_error_retries(3)
             .build()
-            .map_err(|e| format!("ic agent(main) build: {e}"))?,
+            .map_err(|e| {
+                AppError::from_def(error_codes::CONFIG_ERROR).with_context(format!("ic agent(main) build failed: {e}"))
+            })?,
     );
 
     let agent_trader = Arc::new(
@@ -285,29 +290,28 @@ fn setup_agents_and_provider(
             .with_identity(config.trader_identity.clone())
             .with_max_tcp_error_retries(3)
             .build()
-            .map_err(|e| format!("ic agent(trader) build: {e}"))?,
+            .map_err(|e| {
+                AppError::from_def(error_codes::CONFIG_ERROR)
+                    .with_context(format!("ic agent(trader) build failed: {e}"))
+            })?,
     );
 
     // Build a wallet-backed EVM RootProvider from config.evm_url and config.evm_private_key.
-    let signer: PrivateKeySigner = config
-        .evm_private_key
-        .parse()
-        .map_err(|e| format!("failed parsing evm private key: {e}"))?;
+    let signer: PrivateKeySigner = config.evm_private_key.parse().map_err(|e| {
+        AppError::from_def(error_codes::CONFIG_ERROR).with_context(format!("failed parsing evm private key: {e}"))
+    })?;
 
     let main_provider = ProviderBuilder::new()
         .network::<AnyNetwork>()
         .wallet(signer)
-        .connect_http(
-            config
-                .evm_rpc_url
-                .parse()
-                .map_err(|e| format!("invalid evm rpc url: {e}"))?,
-        );
+        .connect_http(config.evm_rpc_url.parse().map_err(|e| {
+            AppError::from_def(error_codes::CONFIG_ERROR).with_context(format!("invalid evm rpc url: {e}"))
+        })?);
 
     Ok((agent_main, agent_trader, main_provider))
 }
 
-pub async fn init_context() -> Result<PipelineContext, String> {
+pub async fn init_context() -> Result<PipelineContext, AppError> {
     // Start from the builder so we keep one place that owns Config.
     let mut builder = PipelineContextBuilder::new().await?;
     let config = builder.config.clone();
@@ -322,7 +326,7 @@ pub async fn init_context() -> Result<PipelineContext, String> {
     builder.build().await
 }
 
-pub async fn init_context_best_effort() -> Result<PipelineContext, String> {
+pub async fn init_context_best_effort() -> Result<PipelineContext, AppError> {
     let mut builder = PipelineContextBuilder::new().await?;
     let config = builder.config.clone();
     let (agent_main, agent_trader, main_provider) = setup_agents_and_provider(&config)?;
@@ -352,9 +356,9 @@ pub async fn init_context_best_effort() -> Result<PipelineContext, String> {
             fallback
                 .build_with_registry_override(Some(empty_registry))
                 .await
-                .map_err(|err| err.to_string())
+                .map_err(|err| AppError::from_def(error_codes::INTERNAL_ERROR).with_context(err.to_string()))
         }
-        Err(err) => Err(err.to_string()),
+        Err(err) => Err(AppError::from_def(error_codes::INTERNAL_ERROR).with_context(err.to_string())),
     }
 }
 

@@ -22,6 +22,7 @@ use super::mexc_utils::{
     parse_market_symbols, simulate_buy_from_asks, simulate_sell_from_bids,
 };
 use crate::{
+    error::AppError,
     finalizers::cex_finalizer::{
         CexDepositState, CexFinalizerLogic, CexRoutePreview, CexState, CexStep, CexTradeSlice, CexTradeState,
         CexWithdrawState,
@@ -149,7 +150,7 @@ impl<B> CexFinalizerLogic for MexcFinalizer<B>
 where
     B: CexBackend,
 {
-    async fn prepare(&self, liq_id: &str, receipt: &ExecutionReceipt) -> Result<CexState, String> {
+    async fn prepare(&self, liq_id: &str, receipt: &ExecutionReceipt) -> Result<CexState, AppError> {
         let amount = &receipt
             .liquidation_result
             .as_ref()
@@ -213,7 +214,7 @@ where
         })
     }
 
-    async fn deposit(&self, state: &mut CexState) -> Result<(), String> {
+    async fn deposit(&self, state: &mut CexState) -> Result<(), AppError> {
         debug!(
             "[mexc] liq_id={} step=Deposit asset={} network={}",
             state.liq_id,
@@ -268,7 +269,8 @@ where
                         amount.formatted(),
                         fee_amount.formatted(),
                         state.deposit.deposit_asset.symbol()
-                    ));
+                    )
+                    .into());
                 }
                 amount.value.clone() - fee.clone()
             } else {
@@ -369,7 +371,7 @@ where
     ///
     /// Error path:
     /// - returns `Err` and stores a descriptive `state.last_error` where applicable
-    async fn trade(&self, state: &mut CexState) -> Result<(), String> {
+    async fn trade(&self, state: &mut CexState) -> Result<(), AppError> {
         // 1) Trace function entry with the currently persisted trade snapshot.
         debug!(
             "[mexc] liq_id={} step=Trade market={} side={} size_in={}",
@@ -494,7 +496,7 @@ where
         Ok(())
     }
 
-    async fn withdraw(&self, state: &mut CexState) -> Result<(), String> {
+    async fn withdraw(&self, state: &mut CexState) -> Result<(), AppError> {
         let expected_address = self.liquidator_principal.to_text();
         if state.withdraw.withdraw_address != expected_address {
             debug!(
@@ -534,7 +536,8 @@ where
             return Err(format!(
                 "withdrawal amount is zero or negative for liq_id {} (amount={})",
                 state.liq_id, amount
-            ));
+            )
+            .into());
         }
 
         // Execute withdrawal on MEXC via the backend.
@@ -567,7 +570,7 @@ where
         Ok(())
     }
 
-    async fn finish(&self, _receipt: &ExecutionReceipt, state: &CexState) -> Result<SwapExecution, String> {
+    async fn finish(&self, _receipt: &ExecutionReceipt, state: &CexState) -> Result<SwapExecution, AppError> {
         let receive_amount = state
             .withdraw
             .size_out
@@ -647,7 +650,7 @@ where
         Ok(exec)
     }
 
-    async fn preview_route(&self, receipt: &ExecutionReceipt) -> Result<CexRoutePreview, String> {
+    async fn preview_route(&self, receipt: &ExecutionReceipt) -> Result<CexRoutePreview, AppError> {
         let state = self.prepare("preview", receipt).await?;
         let legs = self.resolve_trade_legs(&state).await?;
         let mut amount_in = state.size_in.to_f64();

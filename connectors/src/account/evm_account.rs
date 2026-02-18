@@ -3,6 +3,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
+use liquidium_pipeline_core::error::{AppError, error_codes};
 
 // All these come from core
 use liquidium_pipeline_core::account::actions::AccountInfo;
@@ -32,7 +33,7 @@ impl<B: EvmBackend> EvmAccountInfoAdapter<B> {
 
 #[async_trait]
 impl<B: EvmBackend> AccountInfo for EvmAccountInfoAdapter<B> {
-    async fn get_balance(&self, token: &ChainToken) -> Result<ChainTokenAmount, String> {
+    async fn get_balance(&self, token: &ChainToken) -> Result<ChainTokenAmount, AppError> {
         match token {
             ChainToken::EvmNative { chain, .. } => {
                 let amount_native = self.backend.native_balance(chain).await?;
@@ -52,11 +53,12 @@ impl<B: EvmBackend> AccountInfo for EvmAccountInfoAdapter<B> {
                     value: amount_native,
                 })
             }
-            _ => Err("EvmAccountInfoAdapter only supports EvmNative and EvmErc20 tokens".to_string()),
+            _ => Err(AppError::from_def(error_codes::UNSUPPORTED)
+                .with_context("EvmAccountInfoAdapter only supports EvmNative and EvmErc20 tokens")),
         }
     }
 
-    async fn sync_balance(&self, token: &ChainToken) -> Result<ChainTokenAmount, String> {
+    async fn sync_balance(&self, token: &ChainToken) -> Result<ChainTokenAmount, AppError> {
         let bal = self.get_balance(token).await?;
 
         let cache_key = match token {
@@ -68,10 +70,9 @@ impl<B: EvmBackend> AccountInfo for EvmAccountInfoAdapter<B> {
         };
 
         if let Some((chain, addr)) = cache_key {
-            let mut lock = self
-                .cache
-                .lock()
-                .map_err(|_| "evm balance cache poisoned".to_string())?;
+            let mut lock = self.cache.lock().map_err(|_| {
+                AppError::from_def(error_codes::INTERNAL_ERROR).with_context("evm balance cache poisoned")
+            })?;
             lock.insert((chain, addr), (bal.clone(), Instant::now()));
         }
 

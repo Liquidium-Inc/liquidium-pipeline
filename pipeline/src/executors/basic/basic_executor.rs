@@ -13,6 +13,7 @@ use log::{debug, info, warn};
 
 use liquidium_pipeline_connectors::pipeline_agent::PipelineAgent;
 
+use crate::error::{AppError, error_codes};
 use crate::{approval_state::ApprovalState, persistance::WalStore, utils::max_for_ledger};
 
 pub struct BasicExecutor<A: PipelineAgent, D: WalStore + Sync + Send> {
@@ -42,7 +43,7 @@ impl<A: PipelineAgent, D: WalStore> BasicExecutor<A, D> {
         }
     }
 
-    pub async fn init(&mut self, tokens: &[Principal]) -> Result<(), String> {
+    pub async fn init(&mut self, tokens: &[Principal]) -> Result<(), AppError> {
         let spender = self.lending_canister;
         let this = &*self;
 
@@ -67,7 +68,7 @@ impl<A: PipelineAgent, D: WalStore> BasicExecutor<A, D> {
         Ok(())
     }
 
-    pub async fn refresh_allowances(&self, tokens: &[Principal]) -> Result<(), String> {
+    pub async fn refresh_allowances(&self, tokens: &[Principal]) -> Result<(), AppError> {
         let spender = self.lending_canister;
         let this = self;
 
@@ -135,7 +136,7 @@ impl<A: PipelineAgent, D: WalStore> BasicExecutor<A, D> {
         allowance
     }
 
-    async fn approve(&self, ledger: &Principal, spender: Account) -> Result<Nat, String> {
+    async fn approve(&self, ledger: &Principal, spender: Account) -> Result<Nat, AppError> {
         let args = ApproveArgs {
             from_subaccount: None,
             spender,
@@ -146,14 +147,21 @@ impl<A: PipelineAgent, D: WalStore> BasicExecutor<A, D> {
             memo: None,
             created_at_time: None,
         };
-        let args = Encode!(&args).map_err(|e| format!("Encode error: {}", e))?;
+        let args = Encode!(&args).map_err(|e| {
+            AppError::from_def(error_codes::ENCODE_ERROR).with_context(format!("encode approve args: {e}"))
+        })?;
 
         let result = self
             .agent
             .call_update::<Result<Nat, ApproveError>>(ledger, "icrc2_approve", args)
             .await
-            .map_err(|e| format!("Approve call error: {}", e))?
-            .map_err(|e| format!("Approve call canister error: {}", e))?;
+            .map_err(|e| {
+                AppError::from_def(error_codes::EXTERNAL_CALL_FAILED).with_context(format!("approve call error: {e}"))
+            })?
+            .map_err(|e| {
+                AppError::from_def(error_codes::EXTERNAL_CALL_FAILED)
+                    .with_context(format!("approve call canister error: {e}"))
+            })?;
 
         Ok(result)
     }

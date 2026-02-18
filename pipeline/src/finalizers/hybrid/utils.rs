@@ -4,6 +4,7 @@ use liquidium_pipeline_core::tokens::chain_token_amount::ChainTokenAmount;
 use num_traits::ToPrimitive;
 
 use crate::{
+    error::{AppError, error_codes},
     persistance::{FinalizerDecisionSnapshot, now_secs},
     stages::executor::ExecutionReceipt,
     swappers::model::SwapRequest,
@@ -67,18 +68,19 @@ pub(crate) fn preview_gross_edge_bps(estimated_receive_amount: f64, debt_repaid_
     ((estimated_receive_amount - debt_repaid_amount) / debt_repaid_amount) * BPS_PER_RATIO_UNIT
 }
 
-pub(crate) fn debt_repaid_f64(receipt: &ExecutionReceipt) -> Result<f64, String> {
-    let liquidation_result = receipt
-        .liquidation_result
-        .as_ref()
-        .ok_or_else(|| "missing liquidation_result in receipt".to_string())?;
+pub(crate) fn debt_repaid_f64(receipt: &ExecutionReceipt) -> Result<f64, AppError> {
+    let liquidation_result = receipt.liquidation_result.as_ref().ok_or_else(|| {
+        AppError::from_def(error_codes::INVALID_INPUT).with_context("missing liquidation_result in receipt")
+    })?;
     let debt_repaid_amount = ChainTokenAmount::from_raw(
         receipt.request.debt_asset.clone(),
         liquidation_result.amounts.debt_repaid.clone(),
     )
     .to_f64();
     if debt_repaid_amount <= 0.0 {
-        return Err("invalid debt_repaid amount in receipt".to_string());
+        return Err(
+            AppError::from_def(error_codes::INVALID_INPUT).with_context("invalid debt_repaid amount in receipt")
+        );
     }
     Ok(debt_repaid_amount)
 }

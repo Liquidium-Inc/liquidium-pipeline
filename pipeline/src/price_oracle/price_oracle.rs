@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use crate::error::{AppError, error_codes};
 use async_trait::async_trait;
 use candid::{Encode, Nat, Principal};
 use liquidium_pipeline_connectors::pipeline_agent::PipelineAgent;
@@ -7,7 +8,7 @@ use liquidium_pipeline_connectors::pipeline_agent::PipelineAgent;
 #[cfg_attr(test, mockall::automock)]
 #[async_trait]
 pub trait PriceOracle: Sync + Send {
-    async fn get_price(&self, token_in: &str, token_out: &str) -> Result<(Nat, u32), String>;
+    async fn get_price(&self, token_in: &str, token_out: &str) -> Result<(Nat, u32), AppError>;
 }
 
 pub struct LiquidationPriceOracle<A: PipelineAgent> {
@@ -30,10 +31,16 @@ where
 #[async_trait]
 impl<A: PipelineAgent> PriceOracle for LiquidationPriceOracle<A> {
     // Fetches price data from the lending canister
-    async fn get_price(&self, token_in: &str, token_out: &str) -> Result<(Nat, u32), String> {
-        let args = Encode!(&token_in, &token_out).map_err(|e| format!("price query encode error: {}", e))?;
-        self.agent
+    async fn get_price(&self, token_in: &str, token_out: &str) -> Result<(Nat, u32), AppError> {
+        let args = Encode!(&token_in, &token_out).map_err(|e| {
+            AppError::from_def(error_codes::ENCODE_ERROR).with_context(format!("price query encode error: {}", e))
+        })?;
+        let res = self
+            .agent
             .call_query::<Result<(Nat, u32), String>>(&self.lending_canister, "get_price", args)
-            .await?
+            .await?;
+        res.map_err(|e| {
+            AppError::from_def(error_codes::EXTERNAL_CALL_FAILED).with_context(format!("get_price error: {e}"))
+        })
     }
 }

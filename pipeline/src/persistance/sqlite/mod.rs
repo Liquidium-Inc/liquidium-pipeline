@@ -1,4 +1,3 @@
-use anyhow::{Context as _, Result};
 use async_trait::async_trait;
 use diesel::{
     connection::SimpleConnection,
@@ -8,6 +7,8 @@ use diesel::{
     sql_types::{BigInt, Integer},
 };
 use std::collections::HashMap;
+
+use crate::error::{AppError, error_codes};
 
 mod models;
 mod schema;
@@ -24,23 +25,34 @@ pub struct SqliteWalStore {
     db_path: String,
 }
 
+fn persistence_error(context: impl Into<String>) -> AppError {
+    AppError::from_def(error_codes::PERSISTENCE_ERROR).with_context(context)
+}
+
+fn with_persistence_context(context: impl Into<String>, err: impl std::fmt::Display) -> AppError {
+    persistence_error(format!("{}: {}", context.into(), err))
+}
+
+fn serialize_wal_error(err: &AppError) -> String {
+    serde_json::to_string(err).unwrap_or_else(|_| err.to_string())
+}
+
 impl SqliteWalStore {
-    pub fn new(path: &str) -> Result<Self> {
+    pub fn new(path: &str) -> Result<Self, AppError> {
         Self::new_with_busy_timeout(path, 5_000)
     }
 
-    pub fn new_with_busy_timeout(path: &str, busy_timeout_ms: i64) -> Result<Self> {
+    pub fn new_with_busy_timeout(path: &str, busy_timeout_ms: i64) -> Result<Self, AppError> {
         let manager = ConnectionManager::<SqliteConnection>::new(path);
         let pool = Pool::builder()
             .max_size(2)
             .build(manager)
-            .with_context(|| format!("open sqlite pool (mode=rw path={path})"))?;
+            .map_err(|e| with_persistence_context(format!("open sqlite pool (mode=rw path={path})"), e))?;
         let mut conn = pool
             .get()
-            .with_context(|| format!("open sqlite connection (mode=rw path={path})"))?;
-        initialize_schema(&mut conn).with_context(|| format!("initialize sqlite schema (path={path})"))?;
-        apply_pragmas(&mut conn, busy_timeout_ms)
-            .with_context(|| format!("apply sqlite pragmas (mode=rw path={path})"))?;
+            .map_err(|e| with_persistence_context(format!("open sqlite connection (mode=rw path={path})"), e))?;
+        initialize_schema(&mut conn)?;
+        apply_pragmas(&mut conn, busy_timeout_ms)?;
         Ok(Self {
             pool,
             busy_timeout_ms,
@@ -49,17 +61,16 @@ impl SqliteWalStore {
         })
     }
 
-    pub fn new_read_only_with_busy_timeout(path: &str, busy_timeout_ms: i64) -> Result<Self> {
+    pub fn new_read_only_with_busy_timeout(path: &str, busy_timeout_ms: i64) -> Result<Self, AppError> {
         let manager = ConnectionManager::<SqliteConnection>::new(read_only_dsn(path));
         let pool = Pool::builder()
             .max_size(2)
             .build(manager)
-            .with_context(|| format!("open sqlite pool (mode=ro path={path})"))?;
+            .map_err(|e| with_persistence_context(format!("open sqlite pool (mode=ro path={path})"), e))?;
         let mut conn = pool
             .get()
-            .with_context(|| format!("open sqlite connection (mode=ro path={path})"))?;
-        apply_read_only_pragmas(&mut conn, busy_timeout_ms)
-            .with_context(|| format!("apply sqlite pragmas (mode=ro path={path})"))?;
+            .map_err(|e| with_persistence_context(format!("open sqlite connection (mode=ro path={path})"), e))?;
+        apply_read_only_pragmas(&mut conn, busy_timeout_ms)?;
         Ok(Self {
             pool,
             busy_timeout_ms,
@@ -68,25 +79,22 @@ impl SqliteWalStore {
         })
     }
 
-    fn get_conn(&self) -> Result<r2d2::PooledConnection<ConnectionManager<SqliteConnection>>> {
+    fn get_conn(&self) -> Result<r2d2::PooledConnection<ConnectionManager<SqliteConnection>>, AppError> {
         let mode = if self.read_only { "ro" } else { "rw" };
-        let mut conn = self
-            .pool
-            .get()
-            .with_context(|| format!("open sqlite connection (mode={mode} path={})", self.db_path))?;
+        let mut conn = self.pool.get().map_err(|e| {
+            with_persistence_context(format!("open sqlite connection (mode={mode} path={})", self.db_path), e)
+        })?;
         if self.read_only {
-            apply_read_only_pragmas(&mut conn, self.busy_timeout_ms)
-                .with_context(|| format!("apply sqlite pragmas (mode=ro path={})", self.db_path))?;
+            apply_read_only_pragmas(&mut conn, self.busy_timeout_ms)?;
         } else {
-            apply_pragmas(&mut conn, self.busy_timeout_ms)
-                .with_context(|| format!("apply sqlite pragmas (mode=rw path={})", self.db_path))?;
+            apply_pragmas(&mut conn, self.busy_timeout_ms)?;
         }
         Ok(conn)
     }
 
-    fn ensure_writable(&self) -> Result<()> {
+    fn ensure_writable(&self) -> Result<(), AppError> {
         if self.read_only {
-            anyhow::bail!("wal store opened read-only");
+            return Err(persistence_error("wal store opened read-only"));
         }
         Ok(())
     }
@@ -126,12 +134,13 @@ impl SqliteWalStore {
         }
     }
 
-    pub fn status_counts(&self) -> Result<HashMap<ResultStatus, i64>> {
+    pub fn status_counts(&self) -> Result<HashMap<ResultStatus, i64>, AppError> {
         let mut conn = self.get_conn()?;
         let rows: Vec<(i32, i64)> = tbl::table
             .group_by(tbl::status)
             .select((tbl::status, count_star()))
-            .load(&mut conn)?;
+            .load(&mut conn)
+            .map_err(|e| with_persistence_context("failed to load status counts", e))?;
 
         let mut out: HashMap<ResultStatus, i64> = HashMap::new();
         for (status, count) in rows {
@@ -150,16 +159,17 @@ impl SqliteWalStore {
         Ok(out)
     }
 
-    pub fn list_recent(&self, limit: usize) -> Result<Vec<LiqResultRecord>> {
+    pub fn list_recent(&self, limit: usize) -> Result<Vec<LiqResultRecord>, AppError> {
         let mut conn = self.get_conn()?;
         let rows = tbl::table
             .order(tbl::updated_at.desc())
             .limit(limit as i64)
-            .load::<Row>(&mut conn)?;
+            .load::<Row>(&mut conn)
+            .map_err(|e| with_persistence_context("failed to load recent rows", e))?;
         Ok(rows.into_iter().map(Self::from_row).collect())
     }
 
-    pub fn set_daemon_paused(&self, paused: bool) -> Result<()> {
+    pub fn set_daemon_paused(&self, paused: bool) -> Result<(), AppError> {
         self.ensure_writable()?;
         let mut conn = self.get_conn()?;
         diesel::sql_query(
@@ -173,11 +183,12 @@ impl SqliteWalStore {
         )
         .bind::<Integer, _>(if paused { 1 } else { 0 })
         .bind::<BigInt, _>(now_secs())
-        .execute(&mut conn)?;
+        .execute(&mut conn)
+        .map_err(|e| with_persistence_context("failed to persist daemon paused state", e))?;
         Ok(())
     }
 
-    pub fn daemon_paused(&self) -> Result<bool> {
+    pub fn daemon_paused(&self) -> Result<bool, AppError> {
         #[derive(QueryableByName)]
         struct StateRow {
             #[diesel(sql_type = Integer)]
@@ -196,7 +207,7 @@ impl SqliteWalStore {
                 if msg.contains("no such table: daemon_control_state") {
                     Ok(false)
                 } else {
-                    Err(err.into())
+                    Err(with_persistence_context("failed to read daemon paused state", err))
                 }
             }
         }
@@ -205,7 +216,7 @@ impl SqliteWalStore {
 
 #[async_trait]
 impl WalStore for SqliteWalStore {
-    async fn get_pending(&self, limit: usize) -> Result<Vec<LiqResultRecord>> {
+    async fn get_pending(&self, limit: usize) -> Result<Vec<LiqResultRecord>, AppError> {
         self.ensure_writable()?;
         let mut conn = self.get_conn()?;
         let now = now_secs();
@@ -220,7 +231,8 @@ impl WalStore for SqliteWalStore {
             ),
         )
         .set((tbl::status.eq(ResultStatus::Enqueued as i32), tbl::updated_at.eq(now)))
-        .execute(&mut conn)?;
+        .execute(&mut conn)
+        .map_err(|e| with_persistence_context("failed to requeue stale in-flight rows", e))?;
 
         let rows = tbl::table
             .filter(
@@ -230,11 +242,12 @@ impl WalStore for SqliteWalStore {
             )
             .order(tbl::created_at.asc())
             .limit(limit as i64)
-            .load::<Row>(&mut conn)?;
+            .load::<Row>(&mut conn)
+            .map_err(|e| with_persistence_context("failed to load pending rows", e))?;
         Ok(rows.into_iter().map(Self::from_row).collect())
     }
 
-    async fn upsert_result(&self, row: LiqResultRecord) -> Result<()> {
+    async fn upsert_result(&self, row: LiqResultRecord) -> Result<(), AppError> {
         self.ensure_writable()?;
         let mut conn = self.get_conn()?;
         diesel::insert_into(tbl::table)
@@ -249,27 +262,33 @@ impl WalStore for SqliteWalStore {
                 tbl::updated_at.eq(row.updated_at),
                 tbl::meta_json.eq(row.meta_json.clone()),
             ))
-            .execute(&mut conn)?;
+            .execute(&mut conn)
+            .map_err(|e| with_persistence_context("failed to upsert wal row", e))?;
         Ok(())
     }
 
-    async fn get_result(&self, liq_id: &str) -> Result<Option<LiqResultRecord>> {
+    async fn get_result(&self, liq_id: &str) -> Result<Option<LiqResultRecord>, AppError> {
         let mut conn = self.get_conn()?;
-        let res = tbl::table.find(liq_id.to_string()).first::<Row>(&mut conn).optional()?;
+        let res = tbl::table
+            .find(liq_id.to_string())
+            .first::<Row>(&mut conn)
+            .optional()
+            .map_err(|e| with_persistence_context("failed to fetch wal row", e))?;
         Ok(res.map(Self::from_row))
     }
 
-    async fn list_by_status(&self, status: ResultStatus, limit: usize) -> Result<Vec<LiqResultRecord>> {
+    async fn list_by_status(&self, status: ResultStatus, limit: usize) -> Result<Vec<LiqResultRecord>, AppError> {
         let mut conn = self.get_conn()?;
         let rows = tbl::table
             .filter(tbl::status.eq(status as i32))
             .order(tbl::created_at.asc())
             .limit(limit as i64)
-            .load::<Row>(&mut conn)?;
+            .load::<Row>(&mut conn)
+            .map_err(|e| with_persistence_context("failed to list wal rows by status", e))?;
         Ok(rows.into_iter().map(Self::from_row).collect())
     }
 
-    async fn update_status(&self, liq_id: &str, next: ResultStatus, bump_attempt: bool) -> Result<()> {
+    async fn update_status(&self, liq_id: &str, next: ResultStatus, bump_attempt: bool) -> Result<(), AppError> {
         self.ensure_writable()?;
         let mut conn = self.get_conn()?;
         let now = now_secs();
@@ -278,7 +297,8 @@ impl WalStore for SqliteWalStore {
             .find(liq_id.to_string())
             .select(tbl::attempt)
             .first::<i32>(&mut conn)
-            .optional()?;
+            .optional()
+            .map_err(|e| with_persistence_context("failed to read wal attempt", e))?;
         let new_attempt = current.unwrap_or(0) + attempt_delta;
 
         diesel::update(tbl::table.find(liq_id.to_string()))
@@ -287,7 +307,8 @@ impl WalStore for SqliteWalStore {
                 tbl::attempt.eq(new_attempt),
                 tbl::updated_at.eq(now),
             ))
-            .execute(&mut conn)?;
+            .execute(&mut conn)
+            .map_err(|e| with_persistence_context("failed to update wal status", e))?;
         Ok(())
     }
 
@@ -295,9 +316,9 @@ impl WalStore for SqliteWalStore {
         &self,
         liq_id: &str,
         next: ResultStatus,
-        last_error: String,
+        last_error: AppError,
         bump_attempt: bool,
-    ) -> Result<()> {
+    ) -> Result<(), AppError> {
         self.ensure_writable()?;
         let mut conn = self.get_conn()?;
         let now = now_secs();
@@ -306,7 +327,8 @@ impl WalStore for SqliteWalStore {
             .find(liq_id.to_string())
             .select((tbl::attempt, tbl::error_count))
             .first::<(i32, i32)>(&mut conn)
-            .optional()?;
+            .optional()
+            .map_err(|e| with_persistence_context("failed to read wal failure counters", e))?;
         let (cur_attempt, cur_error) = current.unwrap_or((0, 0));
         let new_attempt = cur_attempt + attempt_delta;
         let new_error_count = cur_error + 1;
@@ -316,22 +338,25 @@ impl WalStore for SqliteWalStore {
                 tbl::status.eq(next as i32),
                 tbl::attempt.eq(new_attempt),
                 tbl::error_count.eq(new_error_count),
-                tbl::last_error.eq(Some(last_error)),
+                tbl::last_error.eq(Some(serialize_wal_error(&last_error))),
                 tbl::updated_at.eq(now),
             ))
-            .execute(&mut conn)?;
+            .execute(&mut conn)
+            .map_err(|e| with_persistence_context("failed to update wal failure state", e))?;
         Ok(())
     }
 
-    async fn delete(&self, liq_id: &str) -> anyhow::Result<()> {
+    async fn delete(&self, liq_id: &str) -> Result<(), AppError> {
         self.ensure_writable()?;
         let mut conn = self.get_conn()?;
-        diesel::delete(tbl::table.find(liq_id.to_string())).execute(&mut conn)?;
+        diesel::delete(tbl::table.find(liq_id.to_string()))
+            .execute(&mut conn)
+            .map_err(|e| with_persistence_context("failed to delete wal row", e))?;
         Ok(())
     }
 }
 
-pub fn initialize_schema(conn: &mut SqliteConnection) -> Result<()> {
+pub fn initialize_schema(conn: &mut SqliteConnection) -> Result<(), AppError> {
     conn.batch_execute(
         r#"
         CREATE TABLE IF NOT EXISTS liquidation_results (
@@ -355,11 +380,12 @@ pub fn initialize_schema(conn: &mut SqliteConnection) -> Result<()> {
         INSERT OR IGNORE INTO daemon_control_state (singleton_id, paused, updated_at)
         VALUES (1, 0, CAST(strftime('%s','now') AS INTEGER));
     "#,
-    )?;
+    )
+    .map_err(|e| with_persistence_context("failed to initialize sqlite schema", e))?;
     Ok(())
 }
 
-pub fn apply_pragmas(conn: &mut SqliteConnection, busy_timeout_ms: i64) -> Result<()> {
+pub fn apply_pragmas(conn: &mut SqliteConnection, busy_timeout_ms: i64) -> Result<(), AppError> {
     conn.batch_execute(&format!(
         r#"
         PRAGMA journal_mode=DELETE;
@@ -373,7 +399,8 @@ pub fn apply_pragmas(conn: &mut SqliteConnection, busy_timeout_ms: i64) -> Resul
         PRAGMA busy_timeout={};
     "#,
         busy_timeout_ms
-    ))?;
+    ))
+    .map_err(|e| with_persistence_context("failed to apply sqlite pragmas", e))?;
     Ok(())
 }
 
@@ -381,7 +408,7 @@ fn read_only_dsn(path: &str) -> String {
     format!("file:{}?mode=ro", path)
 }
 
-fn apply_read_only_pragmas(conn: &mut SqliteConnection, busy_timeout_ms: i64) -> Result<()> {
+fn apply_read_only_pragmas(conn: &mut SqliteConnection, busy_timeout_ms: i64) -> Result<(), AppError> {
     conn.batch_execute(&format!(
         r#"
         PRAGMA query_only=ON;
@@ -391,7 +418,8 @@ fn apply_read_only_pragmas(conn: &mut SqliteConnection, busy_timeout_ms: i64) ->
         PRAGMA busy_timeout={};
     "#,
         busy_timeout_ms
-    ))?;
+    ))
+    .map_err(|e| with_persistence_context("failed to apply sqlite read-only pragmas", e))?;
     Ok(())
 }
 

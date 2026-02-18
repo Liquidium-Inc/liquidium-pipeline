@@ -1,12 +1,13 @@
 use async_trait::async_trait;
 use candid::Encode;
 
-use futures::{TryFutureExt, future::join_all};
+use futures::future::join_all;
 use serde::{Deserialize, Serialize};
 use tracing::instrument;
 use tracing::{debug, info, warn};
 
 use crate::{
+    error::{AppError, error_codes},
     executors::{basic::basic_executor::BasicExecutor, executor::ExecutorRequest},
     finalizers::{finalizer::FinalizerResult, liquidation_outcome::LiquidationOutcome},
     persistance::{LiqMetaWrapper, LiqResultRecord, ResultStatus, WalProfitSnapshot, WalStore},
@@ -58,7 +59,7 @@ impl<'a, A: PipelineAgent, D: WalStore> PipelineStage<'a, Vec<ExecutorRequest>, 
     for BasicExecutor<A, D>
 {
     #[instrument(name = "executor.process", skip_all, err, fields(request_count = executor_requests.len()))]
-    async fn process(&self, executor_requests: &'a Vec<ExecutorRequest>) -> Result<Vec<ExecutionReceipt>, String> {
+    async fn process(&self, executor_requests: &'a Vec<ExecutorRequest>) -> Result<Vec<ExecutionReceipt>, AppError> {
         debug!("Executing request {:?}", executor_requests);
         // One future per request, all run concurrently
         let futures = executor_requests.iter().map(|executor_request| {
@@ -83,7 +84,9 @@ impl<'a, A: PipelineAgent, D: WalStore> PipelineStage<'a, Vec<ExecutorRequest>, 
                     liq_req.buy_bad_debt
                 );
 
-                let args = Encode!(&liq_req).map_err(|e| e.to_string())?;
+                let args = Encode!(&liq_req).map_err(|e| {
+                    AppError::from_def(error_codes::ENCODE_ERROR).with_context(format!("candid encode error: {e}"))
+                })?;
 
                 let liq_call = match self
                     .agent
@@ -97,8 +100,8 @@ impl<'a, A: PipelineAgent, D: WalStore> PipelineStage<'a, Vec<ExecutorRequest>, 
                     Ok(v) => v,
                     Err(err) => {
                         warn!("Liquidation call failed {err}");
-                        receipt.status = ExecutionStatus::LiquidationCallFailed(err);
-                        return Ok::<ExecutionReceipt, String>(receipt);
+                        receipt.status = ExecutionStatus::LiquidationCallFailed(err.to_string());
+                        return Ok::<ExecutionReceipt, AppError>(receipt);
                     }
                 };
 
@@ -106,14 +109,14 @@ impl<'a, A: PipelineAgent, D: WalStore> PipelineStage<'a, Vec<ExecutorRequest>, 
                     Ok(v) => v,
                     Err(err) => {
                         receipt.status = ExecutionStatus::FailedLiquidation(format!("{:?}", err));
-                        return Ok::<ExecutionReceipt, String>(receipt);
+                        return Ok::<ExecutionReceipt, AppError>(receipt);
                     }
                 };
 
                 receipt.liquidation_result = Some(liq.clone());
                 if let LiquidationStatus::FailedLiquidation(err) = liq.status {
                     receipt.status = ExecutionStatus::FailedLiquidation(err);
-                    return Ok::<ExecutionReceipt, String>(receipt);
+                    return Ok::<ExecutionReceipt, AppError>(receipt);
                 }
 
                 if matches!(
@@ -125,7 +128,7 @@ impl<'a, A: PipelineAgent, D: WalStore> PipelineStage<'a, Vec<ExecutorRequest>, 
                         liq.change_tx.status, liq.id
                     );
                     receipt.change_received = false;
-                    return Ok::<ExecutionReceipt, String>(receipt);
+                    return Ok::<ExecutionReceipt, AppError>(receipt);
                 }
 
                 match &liq.collateral_tx.status {
@@ -142,7 +145,7 @@ impl<'a, A: PipelineAgent, D: WalStore> PipelineStage<'a, Vec<ExecutorRequest>, 
                         {
                             warn!("Failed to store to WAL: {}", err);
                         }
-                        return Ok::<ExecutionReceipt, String>(receipt);
+                        return Ok::<ExecutionReceipt, AppError>(receipt);
                     }
                     TransferStatus::Failed(err) => {
                         info!(
@@ -156,7 +159,7 @@ impl<'a, A: PipelineAgent, D: WalStore> PipelineStage<'a, Vec<ExecutorRequest>, 
                         {
                             warn!("Failed to store to WAL: {}", err);
                         }
-                        return Ok::<ExecutionReceipt, String>(receipt);
+                        return Ok::<ExecutionReceipt, AppError>(receipt);
                     }
                 }
 
@@ -168,7 +171,7 @@ impl<'a, A: PipelineAgent, D: WalStore> PipelineStage<'a, Vec<ExecutorRequest>, 
                     warn!("Failed to store to WAL: {}", err);
                 }
 
-                Ok::<ExecutionReceipt, String>(receipt)
+                Ok::<ExecutionReceipt, AppError>(receipt)
             }
         });
 
@@ -191,7 +194,7 @@ impl<A: PipelineAgent, D: WalStore> BasicExecutor<A, D> {
         receipt: &ExecutionReceipt,
         executor_request: &ExecutorRequest,
         status: ResultStatus,
-    ) -> Result<(), String> {
+    ) -> Result<(), AppError> {
         debug!("Storing execution log...");
         let liq_id = liq_id_from_receipt(receipt)?;
 
@@ -228,6 +231,9 @@ impl<A: PipelineAgent, D: WalStore> BasicExecutor<A, D> {
             }),
         };
         let _ = encode_meta(&mut result_record, &wrapper);
-        self.wal.upsert_result(result_record).map_err(|e| e.to_string()).await
+        self.wal
+            .upsert_result(result_record)
+            .await
+            .map_err(|e| AppError::from_def(error_codes::PERSISTENCE_ERROR).with_context(e.to_string()))
     }
 }

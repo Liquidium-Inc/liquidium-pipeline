@@ -3,6 +3,7 @@ use std::sync::Arc;
 use candid::Nat;
 
 use crate::account::model::ChainAccount;
+use crate::error::{AppError, error_codes};
 use crate::tokens::asset_id::AssetId;
 use crate::tokens::token_registry::{TokenRegistry, TokenRegistryTrait};
 use crate::transfer::actions::TransferActions;
@@ -26,17 +27,19 @@ impl TransferService {
         asset_id: &AssetId,
         to: ChainAccount,
         amount_native: Nat,
-    ) -> Result<String, String> {
+    ) -> Result<String, AppError> {
         let token = self
             .registry
             .get(asset_id)
-            .ok_or_else(|| format!("unknown asset {}", asset_id))?
+            .ok_or_else(|| {
+                AppError::from_def(error_codes::NOT_FOUND).with_context(format!("unknown asset {}", asset_id))
+            })?
             .clone();
 
-        self.actions
-            .transfer(&token, &to, amount_native)
-            .await
-            .map_err(|e| format!("transfer failed for {}: {}", asset_id, e))
+        self.actions.transfer(&token, &to, amount_native).await.map_err(|e| {
+            AppError::from_def(error_codes::TRANSFER_FAILED)
+                .with_context(format!("transfer failed for {}: {}", asset_id, e))
+        })
     }
 
     // Expose the underlying registry if needed by callers.

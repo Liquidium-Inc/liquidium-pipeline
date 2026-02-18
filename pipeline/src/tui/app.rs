@@ -7,6 +7,7 @@ use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use super::log_sanitize::sanitize_log_line;
 use super::log_source::LOG_BUFFER_MAX;
 use crate::commands::liquidation_loop::LoopControl;
+use crate::error::AppError;
 use crate::finalizers::liquidation_outcome::LiquidationOutcome;
 use crate::persistance::ResultStatus;
 use liquidium_pipeline_connectors::backend::cex_backend::DepositAddress;
@@ -194,7 +195,7 @@ pub(super) struct WithdrawState {
     pub(super) editing: Option<WithdrawField>,
     pub(super) edit_backup: Option<String>,
     pub(super) in_flight: bool,
-    pub(super) last_result: Option<Result<String, String>>,
+    pub(super) last_result: Option<Result<String, AppError>>,
 }
 
 impl WithdrawState {
@@ -235,7 +236,7 @@ pub(super) struct DepositState {
     pub(super) asset: Option<AssetId>,
     pub(super) network: Option<String>,
     pub(super) at: Option<DateTime<Local>>,
-    pub(super) last: Option<Result<DepositAddress, String>>,
+    pub(super) last: Option<Result<DepositAddress, AppError>>,
 }
 
 pub(super) struct App {
@@ -265,17 +266,17 @@ pub(super) struct App {
     pub(super) last_tick: Instant,
 
     pub(super) wal: Option<WalSnapshot>,
-    pub(super) wal_error: Option<String>,
+    pub(super) wal_error: Option<AppError>,
 
     pub(super) balances: Option<BalancesSnapshot>,
-    pub(super) balances_error: Option<String>,
+    pub(super) balances_error: Option<AppError>,
     pub(super) balances_selected: usize,
 
     pub(super) profits: Option<ProfitsSnapshot>,
-    pub(super) profits_error: Option<String>,
+    pub(super) profits_error: Option<AppError>,
 
     pub(super) executions: Option<ExecutionsSnapshot>,
-    pub(super) executions_error: Option<String>,
+    pub(super) executions_error: Option<AppError>,
     pub(super) executions_selected: usize,
     pub(super) executions_details_scroll: u16,
 
@@ -384,8 +385,9 @@ impl App {
     fn append_log_entry(&mut self, part: String, bump_logs_scroll: bool, bump_dashboard_scroll: bool) {
         if self.logs.len() >= LOG_MAX_ENTRIES {
             if let Some(removed) = self.logs.pop_front() {
-                let removed_logs_rows = super::views::logs::wrapped_row_count_for_entry(&removed, self.logs_content_width)
-                    .min(usize::from(u16::MAX)) as u16;
+                let removed_logs_rows =
+                    super::views::logs::wrapped_row_count_for_entry(&removed, self.logs_content_width)
+                        .min(usize::from(u16::MAX)) as u16;
                 let removed_dashboard_rows =
                     super::views::logs::wrapped_row_count_for_entry(&removed, self.dashboard_logs_content_width)
                         .min(usize::from(u16::MAX)) as u16;

@@ -1,5 +1,7 @@
 use candid::Nat;
 
+use crate::error::{AppError, error_codes};
+
 pub const BPS_ONE: u64 = 10_000; // 100% in basis points
 
 #[inline]
@@ -36,19 +38,19 @@ pub fn compute_liquidation_amounts(
     coll_decimals: u64,
     bonus_bps: u64,
     fee_bps: u64,
-) -> Result<(Nat, Nat), String> {
+) -> Result<(Nat, Nat), AppError> {
     // Guards
     if *price_coll_ray == 0u8 {
-        return Err("Zero collateral price".into());
+        return Err(AppError::from_def(error_codes::INVALID_INPUT).with_context("zero collateral price"));
     }
     if *price_debt_ray == 0u8 {
-        return Err("Zero debt price".into());
+        return Err(AppError::from_def(error_codes::INVALID_INPUT).with_context("zero debt price"));
     }
     if bonus_bps > BPS_ONE || fee_bps > BPS_ONE {
-        return Err("bps out of range".into());
+        return Err(AppError::from_def(error_codes::INVALID_INPUT).with_context("bps out of range"));
     }
     if debt_decimals > 38 || coll_decimals > 38 {
-        return Err("decimals too large".into());
+        return Err(AppError::from_def(error_codes::INVALID_INPUT).with_context("decimals too large"));
     }
 
     let debt_scale = pow10(debt_decimals);
@@ -124,18 +126,18 @@ pub fn max_repay_from_collateral(
     coll_decimals: u64,
     bonus_bps: u64,
     fee_bps: u64,
-) -> Result<Nat, String> {
+) -> Result<Nat, AppError> {
     if *price_debt_ray == 0u8 {
-        return Err("Zero debt price".into());
+        return Err(AppError::from_def(error_codes::INVALID_INPUT).with_context("zero debt price"));
     }
     if *price_coll_ray == 0u8 {
-        return Err("Zero collateral price".into());
+        return Err(AppError::from_def(error_codes::INVALID_INPUT).with_context("zero collateral price"));
     }
     if bonus_bps > BPS_ONE || fee_bps > BPS_ONE {
-        return Err("bps out of range".into());
+        return Err(AppError::from_def(error_codes::INVALID_INPUT).with_context("bps out of range"));
     }
     if debt_decimals > 38 || coll_decimals > 38 {
-        return Err("decimals too large".into());
+        return Err(AppError::from_def(error_codes::INVALID_INPUT).with_context("decimals too large"));
     }
 
     let debt_scale = pow10(debt_decimals);
@@ -152,7 +154,7 @@ pub fn max_repay_from_collateral(
     let bonus_fee = (bonus.clone() * fee.clone()) / one_bps.clone();
     let denom_bps = one_bps.clone() + bonus - bonus_fee; // >= 10_000
     if denom_bps == 0u8 {
-        return Err("Invalid liquidation params".into());
+        return Err(AppError::from_def(error_codes::INVALID_INPUT).with_context("invalid liquidation params"));
     }
 
     // r_max_quote_ray = coll_cap_quote_ray * 10_000 / denom_bps   (still RAY)
