@@ -105,14 +105,39 @@ impl<'a, A: PipelineAgent, D: WalStore> PipelineStage<'a, Vec<ExecutorRequest>, 
                 let liq = match liq_call {
                     Ok(v) => v,
                     Err(err) => {
+                        warn!(
+                            "[executor] liquidate rejected by canister | borrower={} | debt_pool={} | collateral_pool={} | debt={} | err={:?}",
+                            liq_req.borrower.to_text(),
+                            liq_req.debt_pool_id.to_text(),
+                            liq_req.collateral_pool_id.to_text(),
+                            liq_req.debt_amount,
+                            err
+                        );
                         receipt.status = ExecutionStatus::FailedLiquidation(format!("{:?}", err));
                         return Ok::<ExecutionReceipt, String>(receipt);
                     }
                 };
 
                 receipt.liquidation_result = Some(liq.clone());
-                if let LiquidationStatus::FailedLiquidation(err) = liq.status {
-                    receipt.status = ExecutionStatus::FailedLiquidation(err);
+                if let LiquidationStatus::FailedLiquidation(err) = &liq.status {
+                    warn!(
+                        "[executor] liquidate returned FailedLiquidation | liq_id={} | borrower={} | debt_pool={} | collateral_pool={} | debt={} | err={}",
+                        liq.id,
+                        liq_req.borrower.to_text(),
+                        liq_req.debt_pool_id.to_text(),
+                        liq_req.collateral_pool_id.to_text(),
+                        liq_req.debt_amount,
+                        err
+                    );
+
+                    receipt.status = ExecutionStatus::FailedLiquidation(err.clone());
+                    if let Err(store_err) = self
+                        .store_to_wal(&receipt, &executor_request, ResultStatus::FailedPermanent)
+                        .await
+                    {
+                        warn!("Failed to store failed liquidation to WAL: {}", store_err);
+                    }
+                    
                     return Ok::<ExecutionReceipt, String>(receipt);
                 }
 
