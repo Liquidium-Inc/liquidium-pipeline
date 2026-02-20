@@ -7,6 +7,7 @@ mod liquidation;
 mod output;
 mod persistance;
 mod price_oracle;
+mod notifications;
 mod stage;
 mod stages;
 pub mod swappers;

@@ -19,6 +19,7 @@ use crate::executors::basic::basic_executor::BasicExecutor;
 use crate::finalizers::liquidation_outcome::LiquidationOutcome;
 use crate::finalizers::{hybrid::hybrid_finalizer::HybridFinalizer, profit_calculator::SimpleProfitCalculator};
 use crate::liquidation::collateral_service::CollateralService;
+use crate::notifications::LiquidationNotifier;
 use crate::output::human_output_enabled;
 use crate::persistance::sqlite::SqliteWalStore;
 use crate::price_oracle::price_oracle::LiquidationPriceOracle;
@@ -43,6 +44,7 @@ const LIQUIDATION_CYCLE_TIMEOUT: Duration = Duration::from_secs(300);
 const FINALIZER_STAGE_TIMEOUT: Duration = Duration::from_secs(300);
 const EXPORT_STAGE_TIMEOUT: Duration = Duration::from_secs(20);
 const WATCHDOG_STAGE_TIMEOUT: Duration = Duration::from_secs(10);
+const NOTIFIER_STAGE_TIMEOUT: Duration = Duration::from_secs(10);
 const REFRESH_ALLOWANCES_TIMEOUT: Duration = Duration::from_secs(45);
 const SCAN_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(300);
 const PANIC_RECOVERY_DELAY: Duration = Duration::from_secs(1);
@@ -256,7 +258,7 @@ pub(crate) fn bootstrap_control_plane(sock_path: &Path, db_path: &str, paused: A
 /// Auditor notes:
 /// - Paused mode suppresses only opportunity discovery/initiation.
 /// - Finalization/export and housekeeping always run to keep WAL state convergent.
-/// - The loop is intentionally infinite; process lifecycle is handled by supervisor.
+/// - The loop runs until a shutdown signal toggles `stopping`.
 /// - Stage timeouts and panic recovery keep the daemon responsive during partial
 ///   downstream outages or unexpected runtime faults.
 pub(crate) async fn run_daemon_cycle_loop(
@@ -271,7 +273,9 @@ pub(crate) async fn run_daemon_cycle_loop(
     exporter: &Arc<ExportStage>,
     finalizer: &Arc<FinalizeStage<HybridFinalizer<Config>, SqliteWalStore, SimpleProfitCalculator, Agent>>,
     liq_dog: &Arc<dyn Watchdog>,
+    liquidation_notifier: &Arc<dyn LiquidationNotifier>,
     paused: Arc<AtomicBool>,
+    stopping: Arc<AtomicBool>,
     debt_assets: &Vec<String>,
     debt_asset_principals: &[Principal],
     ui_enabled: bool,
@@ -281,6 +285,11 @@ pub(crate) async fn run_daemon_cycle_loop(
     let mut consecutive_timed_out_cycles: u32 = 0;
 
     loop {
+        if stopping.load(Ordering::Relaxed) {
+            info!("Shutdown requested; leaving daemon cycle loop");
+            break;
+        }
+
         let cycle = run_single_daemon_cycle(
             finder,
             strategy,
@@ -288,6 +297,7 @@ pub(crate) async fn run_daemon_cycle_loop(
             exporter,
             finalizer,
             liq_dog,
+            liquidation_notifier,
             paused.as_ref(),
             debt_assets,
             debt_asset_principals,
@@ -318,6 +328,11 @@ pub(crate) async fn run_daemon_cycle_loop(
             }
         } else {
             consecutive_timed_out_cycles = 0;
+        }
+
+        if stopping.load(Ordering::Relaxed) {
+            info!("Shutdown requested; stopping before next daemon sleep");
+            break;
         }
 
         if outcome.had_timeout {
@@ -364,6 +379,7 @@ async fn run_single_daemon_cycle(
     exporter: &Arc<ExportStage>,
     finalizer: &Arc<FinalizeStage<HybridFinalizer<Config>, SqliteWalStore, SimpleProfitCalculator, Agent>>,
     liq_dog: &Arc<dyn Watchdog>,
+    liquidation_notifier: &Arc<dyn LiquidationNotifier>,
     paused: &AtomicBool,
     debt_assets: &Vec<String>,
     debt_asset_principals: &[Principal],
@@ -460,9 +476,22 @@ async fn run_single_daemon_cycle(
             }
         }
         log_execution_results(&outcomes);
+
         if ui_enabled {
             print_execution_results(outcomes.clone());
         }
+
+        if stage_with_timeout(
+            "liquidation.notifier",
+            NOTIFIER_STAGE_TIMEOUT,
+            liquidation_notifier.notify_liquidations(&outcomes),
+        )
+        .await
+        .is_none()
+        {
+            had_timeout = true;
+        }
+        
         *spinner = start_spinner(ui_enabled);
         set_spinner_message(spinner, is_paused);
     }
@@ -479,6 +508,7 @@ async fn run_single_daemon_cycle(
     {
         had_timeout = true;
     }
+
     match stage_with_timeout(
         "allowance.refresh",
         REFRESH_ALLOWANCES_TIMEOUT,

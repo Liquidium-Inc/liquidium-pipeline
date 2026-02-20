@@ -1,7 +1,10 @@
 use icrc_ledger_types::icrc1::account::Account;
 use std::{
     path::PathBuf,
-    sync::{Arc, atomic::AtomicBool},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 use tracing::instrument;
@@ -21,6 +24,7 @@ use crate::{
         profit_calculator::SimpleProfitCalculator,
     },
     liquidation::collateral_service::CollateralService,
+    notifications::telegram::telegram_notifier_from_env,
     persistance::sqlite::SqliteWalStore,
     price_oracle::price_oracle::LiquidationPriceOracle,
     stages::{
@@ -273,6 +277,10 @@ pub async fn run_liquidation_loop(sock_path: PathBuf) {
 
     // Setup liquidity monitor
     let liq_dog = account_monitor_watchdog(Duration::from_secs(5), ctx.config.liquidator_principal);
+    let liquidation_notifier = telegram_notifier_from_env();
+    let stopping = Arc::new(AtomicBool::new(false));
+    register_shutdown_signal_listener(stopping.clone());
+    liquidation_notifier.notify_startup().await;
     // Steady-state operation is delegated to a helper to keep this entrypoint
     // focused on bootstrap wiring and lifecycle boundaries.
     run_daemon_cycle_loop(
@@ -282,12 +290,52 @@ pub async fn run_liquidation_loop(sock_path: PathBuf) {
         &exporter,
         &finalizer,
         &liq_dog,
+        &liquidation_notifier,
         paused,
+        stopping,
         &debt_assets,
         &debt_asset_principals,
         ui_enabled,
     )
     .await;
+    liquidation_notifier.notify_shutdown().await;
+}
+
+fn register_shutdown_signal_listener(stopping: Arc<AtomicBool>) {
+    tokio::spawn(async move {
+        wait_for_shutdown_signal().await;
+        info!("Shutdown signal received; draining current cycle and stopping");
+        stopping.store(true, Ordering::Relaxed);
+    });
+}
+
+async fn wait_for_shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+
+        match signal(SignalKind::terminate()) {
+            Ok(mut sigterm) => {
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {}
+                    _ = sigterm.recv() => {}
+                }
+            }
+            Err(err) => {
+                warn!("Failed to install SIGTERM handler ({}); falling back to Ctrl+C only", err);
+                if let Err(ctrl_c_err) = tokio::signal::ctrl_c().await {
+                    warn!("Ctrl+C signal handling failed: {}", ctrl_c_err);
+                }
+            }
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        if let Err(err) = tokio::signal::ctrl_c().await {
+            warn!("Ctrl+C signal handling failed: {}", err);
+        }
+    }
 }
 
 #[allow(dead_code)]

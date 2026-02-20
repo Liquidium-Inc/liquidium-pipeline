@@ -122,6 +122,8 @@ BUY_BAD_DEBT=false
 DB_PATH=./wal.db
 EXPORT_PATH=executions.csv
 WATCHDOG_WEBHOOK=https://your-webhook-url.com/endpoint
+TELEGRAM_BOT_TOKEN=1234567890:your_bot_token
+TELEGRAM_CHAT_ID=-1001234567890
 ```
 
 ### Swap Configuration
@@ -273,9 +275,13 @@ BUY_BAD_DEBT=false  # Set to true to liquidate even if not profitable
 
 ```bash
 WATCHDOG_WEBHOOK=https://your-webhook-url.com/endpoint
+TELEGRAM_BOT_TOKEN=1234567890:your_bot_token
+TELEGRAM_CHAT_ID=-1001234567890
 ```
 
 > `WATCHDOG_WEBHOOK`: if set, the bot sends POST requests with JSON payloads for monitoring and alerting (for example: Slack, Discord, or custom services).
+>
+> `TELEGRAM_BOT_TOKEN` + `TELEGRAM_CHAT_ID`: if both are set, the bot sends a Telegram message for each finalized liquidation outcome.
 
 ---
 
@@ -488,6 +494,7 @@ liquidator withdraw --source main --destination abc123-xyz --asset ckUSDT --amou
 3. Enable monitoring and inspect output artifacts:
 
    - Configure `WATCHDOG_WEBHOOK` for alerts.
+   - Configure `TELEGRAM_BOT_TOKEN` + `TELEGRAM_CHAT_ID` for liquidation notifications in Telegram.
    - Check CSV exports at `EXPORT_PATH` and WAL state at `DB_PATH`.
 
 4. Move funds operationally when needed:
