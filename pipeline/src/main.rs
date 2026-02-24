@@ -22,9 +22,9 @@ use liquidium_pipeline_commons::env::load_env;
 use liquidium_pipeline_commons::telemetry::{init_telemetry_from_env, init_telemetry_from_env_with_log_file};
 use std::path::PathBuf;
 #[cfg(target_os = "linux")]
-use std::time::{Duration, SystemTime};
-#[cfg(target_os = "linux")]
 use std::process::Command;
+#[cfg(target_os = "linux")]
+use std::time::{Duration, SystemTime};
 
 use crate::commands::liquidation_loop::run_liquidation_loop;
 
@@ -131,9 +131,7 @@ async fn main() {
     let _telemetry_guard = match &cli.command {
         Commands::Tui { .. } => None,
         Commands::Run {
-            log_file,
-            no_log_file,
-            ..
+            log_file, no_log_file, ..
         } => {
             let mut telemetry_log_file = effective_run_log_file(log_file.clone(), *no_log_file);
             if let Some(path) = telemetry_log_file.as_deref()
@@ -410,9 +408,7 @@ mod tests {
         let parsed = Cli::try_parse_from(["liquidator", "run"]).expect("run should parse");
         match parsed.command {
             Commands::Run {
-                log_file,
-                no_log_file,
-                ..
+                log_file, no_log_file, ..
             } => {
                 assert_eq!(log_file, None);
                 assert!(!no_log_file);
@@ -423,8 +419,7 @@ mod tests {
 
     #[test]
     fn cli_parse_run_log_file_flag_without_value() {
-        let parsed =
-            Cli::try_parse_from(["liquidator", "run", "--log-file"]).expect("run --log-file should parse");
+        let parsed = Cli::try_parse_from(["liquidator", "run", "--log-file"]).expect("run --log-file should parse");
         match parsed.command {
             Commands::Run { log_file, .. } => {
                 assert_eq!(log_file, Some(None));

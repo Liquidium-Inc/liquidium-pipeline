@@ -479,6 +479,7 @@ async fn run_single_daemon_cycle(
     {
         had_timeout = true;
     }
+
     match stage_with_timeout(
         "allowance.refresh",
         REFRESH_ALLOWANCES_TIMEOUT,
