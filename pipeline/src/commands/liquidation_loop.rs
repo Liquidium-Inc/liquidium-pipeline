@@ -243,7 +243,7 @@ pub async fn run_liquidation_loop(sock_path: PathBuf) {
         Duration::from_secs(3),
         config.swapper,
     );
-    
+
     tokio::spawn(async move { watcher.run().await });
 
     let debt_asset_principals = debt_asset_principals(&ctx.registry);

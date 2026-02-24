@@ -1,4 +1,4 @@
-use std::{collections::HashMap, sync::Arc};
+use std::sync::Arc;
 
 use candid::{Encode, Nat, Principal};
 use icrc_ledger_types::{
@@ -36,7 +36,6 @@ pub struct BasicExecutor<A: PipelineAgent, D: WalStore + Sync + Send> {
     pub lending_canister: Principal,
     pub wal: Arc<D>,
     pub approval_state: Arc<ApprovalState>,
-    pub allowances: HashMap<(Principal, Principal), Nat>,
 }
 
 impl<A: PipelineAgent, D: WalStore> BasicExecutor<A, D> {
@@ -53,7 +52,6 @@ impl<A: PipelineAgent, D: WalStore> BasicExecutor<A, D> {
             lending_canister,
             wal,
             approval_state,
-            allowances: HashMap::new(),
         }
     }
 
@@ -94,7 +92,7 @@ impl<A: PipelineAgent, D: WalStore> BasicExecutor<A, D> {
                 self.spender_account_text(),
                 approve_result
             );
-            allowance_after = self.allowance(&ledger, spender_account).await?;
+            allowance_after = approve_result;
         }
 
         self.approval_state
@@ -205,13 +203,11 @@ impl<A: PipelineAgent, D: WalStore> BasicExecutor<A, D> {
                     stats.approved += 1;
                 }
                 self.log_startup_allowance_success(ledger, &res);
-                self.allowances
-                    .insert((ledger, self.lending_spender()), res.allowance_after.clone());
             }
             Err(err) => {
                 stats.failed += 1;
                 self.log_startup_allowance_failure(ledger, &err);
-                self.cache_zero_allowance_for_startup(ledger);
+                self.set_zero_allowance_for_startup_failure(ledger);
             }
         }
     }
@@ -223,9 +219,8 @@ impl<A: PipelineAgent, D: WalStore> BasicExecutor<A, D> {
         }
     }
 
-    fn cache_zero_allowance_for_startup(&mut self, ledger: Principal) {
+    fn set_zero_allowance_for_startup_failure(&mut self, ledger: Principal) {
         let spender = self.lending_spender();
-        self.allowances.insert((ledger, spender), Nat::from(0u8));
         self.approval_state.set_allowance(ledger, spender, Nat::from(0u8));
     }
 
@@ -320,34 +315,23 @@ mod tests {
         let spender = p("nja4y-2yaaa-aaaae-qddxa-cai");
 
         let mut agent = MockPipelineAgent::new();
-        let query_count = Arc::new(std::sync::Mutex::new(0usize));
-        let query_count_handle = query_count.clone();
 
         agent
             .expect_call_query::<Allowance>()
             .withf(move |canister, method, _| *canister == ledger && method == "icrc2_allowance")
-            .times(2)
+            .times(1)
             .returning(move |_, _, _| {
-                let mut count = query_count_handle.lock().expect("query mutex poisoned");
-                *count += 1;
-                if *count == 1 {
-                    Ok(Allowance {
-                        allowance: Nat::from(0u8),
-                        expires_at: None,
-                    })
-                } else {
-                    Ok(Allowance {
-                        allowance: Nat::from(u64::MAX),
-                        expires_at: None,
-                    })
-                }
+                Ok(Allowance {
+                    allowance: Nat::from(0u8),
+                    expires_at: None,
+                })
             });
 
         agent
             .expect_call_update::<Result<Nat, ApproveError>>()
             .withf(move |canister, method, _| *canister == ledger && method == "icrc2_approve")
             .times(1)
-            .returning(move |_, _, _| Ok(Ok(Nat::from(1u64))));
+            .returning(move |_, _, _| Ok(Ok(Nat::from(u64::MAX))));
 
         let executor = make_executor(agent);
         executor
@@ -408,6 +392,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn refresh_allowances_uses_approve_result_without_post_check_query() {
+        let ledger = p("mxzaz-hqaaa-aaaar-qaada-cai"); // ckBTC
+        let spender = p("nja4y-2yaaa-aaaae-qddxa-cai");
+
+        let mut agent = MockPipelineAgent::new();
+
+        agent
+            .expect_call_query::<Allowance>()
+            .withf(move |canister, method, _| *canister == ledger && method == "icrc2_allowance")
+            .times(1)
+            .returning(move |_, _, _| {
+                Ok(Allowance {
+                    allowance: Nat::from(0u8),
+                    expires_at: None,
+                })
+            });
+
+        agent
+            .expect_call_update::<Result<Nat, ApproveError>>()
+            .withf(move |canister, method, _| *canister == ledger && method == "icrc2_approve")
+            .times(1)
+            .returning(move |_, _, _| Ok(Ok(Nat::from(u64::MAX))));
+
+        let executor = make_executor(agent);
+        executor
+            .refresh_allowances(&[ledger])
+            .await
+            .expect("refresh_allowances should use approve result directly");
+
+        let got = executor
+            .approval_state
+            .get_allowance(ledger, spender)
+            .expect("allowance state should be set from approve fallback");
+        assert_eq!(got, Nat::from(u64::MAX));
+    }
+
+    #[tokio::test]
     async fn init_logs_failures_but_does_not_fail_startup() {
         let failing_ledger = p("mxzaz-hqaaa-aaaar-qaada-cai");
         let healthy_ledger = p("ryjl3-tyaaa-aaaaa-aaaba-cai");
@@ -440,14 +461,14 @@ mod tests {
             .expect("startup should continue even when one token allowance ensure fails");
 
         assert_eq!(
-            executor.allowances.get(&(failing_ledger, spender)),
+            executor.approval_state.get_allowance(failing_ledger, spender).as_ref(),
             Some(&Nat::from(0u8)),
-            "failed token should be cached at zero so strategy keeps requiring approval"
+            "failed token should set approval_state to zero so strategy keeps requiring approval"
         );
         assert_eq!(
-            executor.allowances.get(&(healthy_ledger, spender)),
+            executor.approval_state.get_allowance(healthy_ledger, spender).as_ref(),
             Some(&Nat::from(u64::MAX)),
-            "healthy token should have its resolved allowance cached"
+            "healthy token should have its resolved allowance in approval_state"
         );
     }
 }
