@@ -84,15 +84,19 @@ impl<A: PipelineAgent, D: WalStore> BasicExecutor<A, D> {
 
         if allowance_before < threshold {
             approval_attempted = true;
-            let approve_result = self.approve(&ledger, spender_account).await?;
+            let approved_amount = max_for_ledger(&ledger);
+            let approve_result = self
+                .approve(&ledger, spender_account, approved_amount.clone())
+                .await?;
             debug!(
-                "[executor] allowance approve | ledger={} account={} spender={} amount={}",
+                "[executor] allowance approve | ledger={} account={} spender={} approved_amount={} block_index={}",
                 ledger.to_text(),
                 self.source_account_text(),
                 self.spender_account_text(),
+                approved_amount,
                 approve_result
             );
-            allowance_after = approve_result;
+            allowance_after = approved_amount;
         }
 
         self.approval_state
@@ -106,11 +110,11 @@ impl<A: PipelineAgent, D: WalStore> BasicExecutor<A, D> {
         })
     }
 
-    async fn approve(&self, ledger: &Principal, spender: Account) -> Result<Nat, String> {
+    async fn approve(&self, ledger: &Principal, spender: Account, amount: Nat) -> Result<Nat, String> {
         let args = ApproveArgs {
             from_subaccount: None,
             spender,
-            amount: max_for_ledger(ledger),
+            amount,
             expected_allowance: None,
             expires_at: None,
             fee: None,
@@ -392,7 +396,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn refresh_allowances_uses_approve_result_without_post_check_query() {
+    async fn refresh_allowances_caches_approved_amount_not_approve_block_index() {
         let ledger = p("mxzaz-hqaaa-aaaar-qaada-cai"); // ckBTC
         let spender = p("nja4y-2yaaa-aaaae-qddxa-cai");
 
@@ -413,18 +417,18 @@ mod tests {
             .expect_call_update::<Result<Nat, ApproveError>>()
             .withf(move |canister, method, _| *canister == ledger && method == "icrc2_approve")
             .times(1)
-            .returning(move |_, _, _| Ok(Ok(Nat::from(u64::MAX))));
+            .returning(move |_, _, _| Ok(Ok(Nat::from(42u8))));
 
         let executor = make_executor(agent);
         executor
             .refresh_allowances(&[ledger])
             .await
-            .expect("refresh_allowances should use approve result directly");
+            .expect("refresh_allowances should cache approved amount");
 
         let got = executor
             .approval_state
             .get_allowance(ledger, spender)
-            .expect("allowance state should be set from approve fallback");
+            .expect("allowance state should be set from approved amount");
         assert_eq!(got, Nat::from(u64::MAX));
     }
 
