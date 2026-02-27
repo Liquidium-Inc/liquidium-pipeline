@@ -438,7 +438,9 @@ fn split_once_ws(s: &str) -> Option<(&str, &str)> {
 #[cfg(target_os = "linux")]
 fn looks_like_timestamp(token: &str) -> bool {
     token.len() >= 19
-        && token.get(0..4).is_some_and(|prefix| prefix.chars().all(|c| c.is_ascii_digit()))
+        && token
+            .get(0..4)
+            .is_some_and(|prefix| prefix.chars().all(|c| c.is_ascii_digit()))
         && token.contains(':')
         && (token.contains('T') || token.contains(' '))
 }
@@ -853,10 +855,7 @@ mod tests {
         .to_string();
 
         let record = super::parse_journal_record(&raw).expect("record parse");
-        assert_eq!(
-            record.line,
-            "2026-02-12T13:16:03.444303Z INFO Found 1 opportunities"
-        );
+        assert_eq!(record.line, "2026-02-12T13:16:03.444303Z INFO Found 1 opportunities");
     }
 
     #[cfg(not(target_os = "linux"))]
