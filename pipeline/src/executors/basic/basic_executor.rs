@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use candid::{Encode, Nat, Principal};
+use futures::future::join_all;
 use icrc_ledger_types::{
     icrc1::account::Account as IcrcAccount,
     icrc1::account::Account,
@@ -156,11 +157,10 @@ impl<A: PipelineAgent, D: WalStore> BasicExecutor<A, D> {
         &self,
         tokens: &[Principal],
     ) -> Vec<(Principal, Result<EnsureAllowanceResult, String>)> {
-        let mut results = Vec::with_capacity(tokens.len());
-        for &token in tokens {
-            results.push((token, self.ensure_lending_allowance_for_ledger(token).await));
-        }
-        results
+        let allowance_futures = tokens.iter().copied().map(|token| async move {
+            (token, self.ensure_lending_allowance_for_ledger(token).await)
+        });
+        join_all(allowance_futures).await
     }
 
     fn lending_spender(&self) -> Principal {
