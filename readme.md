@@ -137,6 +137,9 @@ MAX_ALLOWED_DEX_SLIPPAGE=75  # 0.75% in basis points
 CEX_MEXC_API_KEY=your_api_key
 CEX_MEXC_API_SECRET=your_api_secret
 MAX_ALLOWED_CEX_SLIPPAGE_BPS=200  # 2.00% in basis points
+
+# Liquidation guard (bad debt only)
+BAD_DEBT_COLLATERAL_SLIPPAGE_BPS=500  # 5.00% haircut used for min collateral
 ```
 
 ### Advanced CEX/Hybrid Tuning
