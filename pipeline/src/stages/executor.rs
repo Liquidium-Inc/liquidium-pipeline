@@ -137,7 +137,7 @@ impl<'a, A: PipelineAgent, D: WalStore> PipelineStage<'a, Vec<ExecutorRequest>, 
                     {
                         warn!("Failed to store failed liquidation to WAL: {}", store_err);
                     }
-                    
+
                     return Ok::<ExecutionReceipt, String>(receipt);
                 }
 
@@ -254,5 +254,142 @@ impl<A: PipelineAgent, D: WalStore> BasicExecutor<A, D> {
         };
         let _ = encode_meta(&mut result_record, &wrapper);
         self.wal.upsert_result(result_record).map_err(|e| e.to_string()).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use std::sync::Arc;
+
+    use candid::{Nat, Principal};
+    use icrc_ledger_types::icrc1::account::Account;
+    use liquidium_pipeline_connectors::pipeline_agent::MockPipelineAgent;
+    use liquidium_pipeline_core::tokens::chain_token::ChainToken;
+    use liquidium_pipeline_core::types::protocol_types::{
+        AssetType, LiquidationAmounts, LiquidationRequest, LiquidationStatus, TxStatus,
+    };
+
+    use crate::{
+        approval_state::ApprovalState, persistance::MockWalStore, stage::PipelineStage, swappers::model::SwapRequest,
+    };
+
+    fn p(text: &str) -> Principal {
+        Principal::from_text(text).expect("invalid principal")
+    }
+
+    fn make_request(borrower: Principal, debt_asset: ChainToken) -> ExecutorRequest {
+        ExecutorRequest {
+            liquidation: LiquidationRequest {
+                borrower,
+                debt_pool_id: p("hkmli-faaaa-aaaar-qb4ba-cai"),
+                collateral_pool_id: p("hnnn4-iyaaa-aaaar-qb4bq-cai"),
+                debt_amount: Nat::from(11_244u64),
+                receiver_address: p("2vxsx-fae"),
+                buy_bad_debt: false,
+            },
+            swap_args: Some(SwapRequest {
+                pay_asset: debt_asset.asset_id(),
+                pay_amount: liquidium_pipeline_core::tokens::chain_token_amount::ChainTokenAmount::from_raw(
+                    debt_asset.clone(),
+                    Nat::from(1_000u64),
+                ),
+                receive_asset: debt_asset.asset_id(),
+                receive_address: None,
+                max_slippage_bps: None,
+                venue_hint: None,
+            }),
+            debt_asset: debt_asset.clone(),
+            collateral_asset: debt_asset,
+            expected_profit: 3,
+            ref_price: Nat::from(0u8),
+            debt_approval_needed: true,
+        }
+    }
+
+    fn make_liquidation_result(id: u128) -> LiquidationResult {
+        LiquidationResult {
+            amounts: LiquidationAmounts {
+                collateral_received: Nat::from(0u8),
+                debt_repaid: Nat::from(0u8),
+            },
+            collateral_asset: AssetType::Unknown,
+            debt_asset: AssetType::Unknown,
+            status: LiquidationStatus::Success,
+            timestamp: 0,
+            change_tx: TxStatus {
+                tx_id: None,
+                status: TransferStatus::Pending,
+            },
+            collateral_tx: TxStatus {
+                tx_id: None,
+                status: TransferStatus::Success,
+            },
+            id,
+        }
+    }
+
+    #[tokio::test]
+    async fn executor_calls_liquidate_without_allowance_preflight() {
+        let lending_canister = p("nja4y-2yaaa-aaaae-qddxa-cai");
+        let first_ledger = p("mxzaz-hqaaa-aaaar-qaada-cai");
+        let second_ledger = p("ryjl3-tyaaa-aaaaa-aaaba-cai");
+
+        let mut agent = MockPipelineAgent::new();
+
+        agent
+            .expect_call_update::<Result<LiquidationResult, ProtocolError>>()
+            .withf(move |canister, method, _| *canister == lending_canister && method == "liquidate")
+            .times(2)
+            .returning(move |_, _, _| Ok(Ok(make_liquidation_result(31u128))));
+
+        let executor = BasicExecutor::new(
+            Arc::new(agent),
+            Account {
+                owner: p("2vxsx-fae"),
+                subaccount: None,
+            },
+            lending_canister,
+            Arc::new(MockWalStore::new()),
+            Arc::new(ApprovalState::new()),
+        );
+
+        let request_fail = make_request(
+            p("tfeop-4aaaa-aaaaa-aaaaa-aaaaa-aaaaa-bdai"),
+            ChainToken::Icp {
+                ledger: first_ledger,
+                symbol: "ckBTC".to_string(),
+                decimals: 8,
+                fee: Nat::from(10u64),
+            },
+        );
+        let request_ok = make_request(
+            p("2vxsx-fae"),
+            ChainToken::Icp {
+                ledger: second_ledger,
+                symbol: "ICP".to_string(),
+                decimals: 8,
+                fee: Nat::from(10_000u64),
+            },
+        );
+
+        let receipts = executor
+            .process(&vec![request_fail.clone(), request_ok.clone()])
+            .await
+            .expect("executor process should succeed");
+        assert_eq!(receipts.len(), 2);
+
+        assert!(
+            matches!(receipts[0].status, ExecutionStatus::Success),
+            "first request should execute via direct liquidate call"
+        );
+        assert!(receipts[0].liquidation_result.is_some());
+
+        assert!(
+            matches!(receipts[1].status, ExecutionStatus::Success),
+            "second request should continue and execute"
+        );
+        assert!(receipts[1].liquidation_result.is_some());
     }
 }

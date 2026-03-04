@@ -161,10 +161,7 @@ fn highlight_structured_kv_message(msg: &str) -> Vec<Span<'static>> {
                 format!("{key}="),
                 Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
             ));
-            spans.push(Span::styled(
-                value.to_string(),
-                style_structured_value(key, value),
-            ));
+            spans.push(Span::styled(value.to_string(), style_structured_value(key, value)));
             continue;
         }
 
@@ -225,9 +222,7 @@ fn style_structured_word(word: &str) -> Style {
 
 fn status_word_style(word: &str) -> Option<Style> {
     match word.to_ascii_lowercase().as_str() {
-        "success" | "succeeded" | "ok" | "true" => {
-            Some(Style::default().fg(Color::Green).add_modifier(Modifier::BOLD))
-        }
+        "success" | "succeeded" | "ok" | "true" => Some(Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
         "failed" | "fail" | "error" | "panic" | "false" => {
             Some(Style::default().fg(Color::Red).add_modifier(Modifier::BOLD))
         }
@@ -514,7 +509,10 @@ mod tests {
 
         assert!(has_success_green, "Success should be highlighted in green");
         assert!(has_negative_profit_red, "negative profit should be highlighted in red");
-        assert!(has_positive_profit_green, "positive profit should be highlighted in green");
+        assert!(
+            has_positive_profit_green,
+            "positive profit should be highlighted in green"
+        );
     }
 
     #[test]

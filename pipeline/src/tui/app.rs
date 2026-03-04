@@ -386,11 +386,14 @@ impl App {
     fn append_log_entry(&mut self, part: String, bump_logs_scroll: bool, bump_dashboard_scroll: bool) {
         if self.logs.len() >= LOG_MAX_ENTRIES {
             if let Some(removed) = self.logs.pop_front() {
-                let removed_logs_rows = super::views::logs::wrapped_row_count_for_entry(&removed, self.logs_content_width)
-                    .min(usize::from(u16::MAX)) as u16;
+                let removed_logs_rows =
+                    super::views::logs::wrapped_row_count_for_entry(&removed, self.logs_content_width)
+                        .min(usize::from(u16::MAX)) as u16;
+
                 let removed_dashboard_rows =
                     super::views::logs::wrapped_row_count_for_entry(&removed, self.dashboard_logs_content_width)
                         .min(usize::from(u16::MAX)) as u16;
+
                 self.logs_scroll = self.logs_scroll.saturating_sub(removed_logs_rows);
                 self.dashboard_logs_scroll = self.dashboard_logs_scroll.saturating_sub(removed_dashboard_rows);
             }
