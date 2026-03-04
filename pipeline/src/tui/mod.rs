@@ -204,6 +204,7 @@ pub async fn run(opts: TuiOptions) -> anyhow::Result<()> {
         swapper_mode: format!("{:?}", cfg.swapper),
         max_dex_slippage_bps: cfg.max_allowed_dex_slippage,
         max_cex_slippage_bps: cfg.max_allowed_cex_slippage_bps,
+        bad_debt_collateral_slippage_bps: cfg.bad_debt_collateral_slippage_bps,
         buy_bad_debt: cfg.buy_bad_debt,
         opportunity_filter: cfg.opportunity_account_filter.iter().map(|p| p.to_text()).collect(),
         control_socket: sock_path.display().to_string(),

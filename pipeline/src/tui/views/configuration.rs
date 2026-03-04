@@ -27,6 +27,9 @@ pub(super) fn draw_configuration(f: &mut Frame<'_>, area: Rect, app: &App) {
                 "{}/{} bps",
                 app.config.max_dex_slippage_bps, app.config.max_cex_slippage_bps
             )),
+            Span::raw(" · "),
+            Span::styled("Bad Debt: ", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw(format!("{} bps", app.config.bad_debt_collateral_slippage_bps)),
         ]),
         Line::from(vec![
             Span::styled("BUY_BAD_DEBT: ", Style::default().add_modifier(Modifier::BOLD)),

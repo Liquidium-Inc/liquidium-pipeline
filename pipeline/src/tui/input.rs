@@ -819,6 +819,7 @@ mod tests {
             swapper_mode: "Hybrid".to_string(),
             max_dex_slippage_bps: 500,
             max_cex_slippage_bps: 200,
+            bad_debt_collateral_slippage_bps: 500,
             buy_bad_debt: false,
             opportunity_filter: vec![],
             control_socket: "/tmp/liquidator/ctl.sock".to_string(),
