@@ -135,6 +135,7 @@ mod tests {
             expected_profit: 1,
             ref_price: Nat::from(1u64),
             debt_approval_needed: false,
+            min_collateral_amount: Nat::from(0u8),
         };
 
         ExecutionReceipt {
@@ -235,5 +236,22 @@ mod tests {
         assert_eq!(snapshot.debt_symbol, "ckUSDT");
         assert_eq!(snapshot.debt_decimals, 6);
         assert_eq!(snapshot.updated_at, 123);
+    }
+
+    #[test]
+    fn decode_legacy_receipt_defaults_missing_min_collateral_amount() {
+        let receipt = make_receipt();
+        let mut legacy = serde_json::to_value(&receipt).expect("receipt json value should serialize");
+        let request = legacy["request"]
+            .as_object_mut()
+            .expect("legacy request should be object");
+        request.remove("min_collateral_amount");
+
+        let row = make_row(legacy.to_string());
+        let wrapper = decode_receipt_wrapper(&row)
+            .expect("legacy decode should succeed")
+            .expect("wrapper should exist");
+
+        assert_eq!(wrapper.receipt.request.min_collateral_amount, Nat::from(0u8));
     }
 }

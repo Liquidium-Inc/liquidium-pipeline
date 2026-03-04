@@ -312,6 +312,7 @@ fn make_receipt_with_collateral(
         expected_profit: 1,
         ref_price: Nat::from(ref_price_ray),
         debt_approval_needed: false,
+        min_collateral_amount: Nat::from(0u8),
     };
 
     ExecutionReceipt {
