@@ -8,6 +8,8 @@ struct PendingSliceRequest {
 
 /// Deposit is considered confirmed once balance delta reaches expected amount minus this epsilon.
 const DEPOSIT_CONFIRMATION_DELTA_EPSILON: f64 = 0.00001;
+/// After this wait window, allow a fallback confirmation from total free balance.
+const DEPOSIT_TOTAL_FREE_FALLBACK_SECS: i64 = 5;
 /// Hard stop to avoid unbounded per-leg slicing loops on pathological books.
 const MAX_SLICE_EXECUTION_ROUNDS: usize = 128;
 /// Basis points per 1.00 ratio value.
@@ -17,6 +19,47 @@ impl<C> MexcFinalizer<C>
 where
     C: CexBackend,
 {
+    /// Fallback confirmation path when delta-based confirmation misses due balance churn.
+    ///
+    /// This path is intentionally delayed to reduce false positives from pre-existing
+    /// inventory: only after a short window do we allow `current_free >= expected`.
+    fn maybe_confirm_deposit_via_total_free_fallback(
+        &self,
+        state: &mut CexState,
+        current_balance: f64,
+        expected_floor: f64,
+        expected_deposit_amount: f64,
+    ) -> bool {
+        if state.deposit.deposit_txid.is_none() {
+            return false;
+        }
+
+        let now = now_ts();
+        let sent_at = match state.deposit.deposit_sent_at_ts {
+            Some(ts) => ts,
+            None => {
+                state.deposit.deposit_sent_at_ts = Some(now);
+                info!(
+                    "[mexc] liq_id={} deposit fallback timer initialized at={} (legacy state without send timestamp)",
+                    state.liq_id, now
+                );
+                return false;
+            }
+        };
+
+        let elapsed = now.saturating_sub(sent_at);
+        if elapsed >= DEPOSIT_TOTAL_FREE_FALLBACK_SECS && current_balance >= expected_floor {
+            info!(
+                "[mexc] liq_id={} deposit confirmed via total-free fallback: current={} expected={} elapsed={}s",
+                state.liq_id, current_balance, expected_deposit_amount, elapsed
+            );
+            state.step = CexStep::Trade;
+            return true;
+        }
+
+        false
+    }
+
     /// Phase-B deposit confirmation by balance delta against the captured baseline.
     pub(super) async fn check_deposit(&self, state: &mut CexState) -> Result<(), String> {
         let symbol = state.deposit.deposit_asset.symbol();
@@ -28,9 +71,11 @@ where
                     .trade
                     .trade_next_amount_in
                     .unwrap_or_else(|| state.size_in.to_f64());
+                let expected_floor = expected_deposit_amount - DEPOSIT_CONFIRMATION_DELTA_EPSILON;
 
+                // Primary path: prove this deposit by balance delta from captured baseline.
                 let observed_balance_delta = current_balance - baseline_balance;
-                if observed_balance_delta >= expected_deposit_amount - DEPOSIT_CONFIRMATION_DELTA_EPSILON {
+                if observed_balance_delta >= expected_floor {
                     info!(
                         "[mexc] liq_id={} deposit confirmed: before={} after={} expected={}",
                         state.liq_id, baseline_balance, current_balance, expected_deposit_amount
@@ -38,6 +83,18 @@ where
                     state.step = CexStep::Trade;
                     return Ok(());
                 }
+
+                // Fallback path: after a short wait, allow progression if total free
+                // balance can fund this leg even when delta evidence is noisy.
+                if self.maybe_confirm_deposit_via_total_free_fallback(
+                    state,
+                    current_balance,
+                    expected_floor,
+                    expected_deposit_amount,
+                ) {
+                    return Ok(());
+                }
+
                 info!(
                     "[mexc] liq_id={} deposit pending: before={} current={} delta={} expected={}",
                     state.liq_id, baseline_balance, current_balance, observed_balance_delta, expected_deposit_amount
@@ -51,6 +108,9 @@ where
                     state.liq_id, current_balance
                 );
                 state.deposit.deposit_balance_before = Some(current_balance);
+                if state.deposit.deposit_txid.is_some() && state.deposit.deposit_sent_at_ts.is_none() {
+                    state.deposit.deposit_sent_at_ts = Some(now_ts());
+                }
             }
         }
 
