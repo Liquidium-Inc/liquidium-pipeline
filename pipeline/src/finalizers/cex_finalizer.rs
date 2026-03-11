@@ -57,6 +57,8 @@ pub struct CexDepositState {
     pub deposit_txid: Option<String>,
     pub deposit_balance_before: Option<f64>,
     #[serde(default)]
+    pub deposit_sent_at_ts: Option<i64>,
+    #[serde(default)]
     pub approval_bump_count: Option<u32>,
 }
 
@@ -440,6 +442,7 @@ mod tests {
                     deposit_asset: pay.clone(),
                     deposit_txid: None,
                     deposit_balance_before: None,
+                    deposit_sent_at_ts: None,
                     approval_bump_count: None,
                 },
                 trade: CexTradeState {
@@ -565,6 +568,7 @@ mod tests {
                     deposit_asset: pay.clone(),
                     deposit_txid: None,
                     deposit_balance_before: None,
+                    deposit_sent_at_ts: None,
                     approval_bump_count: None,
                 },
                 trade: CexTradeState {
