@@ -17,6 +17,10 @@ const DEFAULT_ORDERBOOK_DEPTH_LIMIT: u32 = 50;
 const DEFAULT_WITHDRAW_HISTORY_LIMIT: u32 = 50;
 /// Basis points per 1.00 ratio value.
 const BPS_PER_RATIO_UNIT: f64 = 10_000.0;
+/// MEXC spot fee assumption used to convert gross fills into net-usable output.
+const MEXC_SPOT_FEE_BPS: f64 = 5.01;
+/// Tiny safety increment to avoid borderline balance/rounding rejections between legs.
+const ROUND_HANDLER: f64 = 0.01;
 
 fn from_mexc_raw(s: &str) -> WithdrawStatus {
     match s {
@@ -76,6 +80,7 @@ struct SymbolFilters {
     min_notional: Option<Decimal>,
     quote_precision: Option<u32>,
     base_precision: Option<u32>,
+    taker_fee_bps: Option<f64>,
     resolved_symbol: Option<String>,
 }
 
@@ -91,6 +96,15 @@ fn parse_decimal(v: &Value, key: &str) -> Option<Decimal> {
     v.get(key)
         .and_then(|raw| raw.as_str())
         .and_then(|s| Decimal::from_str_exact(s).ok())
+}
+
+fn parse_decimal_flexible(v: &Value, key: &str) -> Option<Decimal> {
+    let raw = v.get(key)?;
+    match raw {
+        Value::String(s) => Decimal::from_str_exact(s).ok(),
+        Value::Number(n) => Decimal::from_str_exact(&n.to_string()).ok(),
+        _ => None,
+    }
 }
 
 fn parse_u32(v: &Value, key: &str) -> Option<u32> {
@@ -209,6 +223,42 @@ pub struct MexcClient {
 }
 
 impl MexcClient {
+    fn apply_output_fee(amount: Decimal, fee_bps: f64) -> Decimal {
+        if amount <= Decimal::ZERO {
+            return Decimal::ZERO;
+        }
+
+        let fee_ratio = Decimal::from_f64_retain(fee_bps / BPS_PER_RATIO_UNIT)
+            .unwrap_or(Decimal::ZERO)
+            .max(Decimal::ZERO)
+            .min(Decimal::ONE);
+
+        amount * (Decimal::ONE - fee_ratio)
+    }
+
+    fn parse_taker_fee_bps(info: &Value) -> Option<f64> {
+        let commission_ratio = parse_decimal_flexible(info, "takerCommission")?;
+        if commission_ratio < Decimal::ZERO {
+            return None;
+        }
+
+        let bps = commission_ratio * Decimal::from_i32(10_000)?;
+        let bps_f64 = bps.to_f64()?;
+        if bps_f64.is_finite() && bps_f64 >= 0.0 {
+            Some(bps_f64)
+        } else {
+            None
+        }
+    }
+
+    fn resolve_taker_fee_bps(filters: Option<&SymbolFilters>) -> (f64, bool) {
+        let bps = filters.and_then(|f| f.taker_fee_bps);
+        match bps {
+            Some(v) if v.is_finite() && v >= 0.0 => (v + ROUND_HANDLER, false),
+            _ => (MEXC_SPOT_FEE_BPS + ROUND_HANDLER, true),
+        }
+    }
+
     pub fn new(api_key: &str, secret: &str) -> Self {
         let api = MexcSpotApiClientWithAuthentication::new(
             mexc_rs::spot::MexcSpotApiEndpoint::Base,
@@ -329,6 +379,7 @@ impl MexcClient {
             .or_else(|| parse_u32(&info, "quoteAssetPrecision"))
             .or(filters.quote_precision);
         filters.base_precision = parse_u32(&info, "baseAssetPrecision").or(filters.base_precision);
+        filters.taker_fee_bps = Self::parse_taker_fee_bps(&info);
         filters.resolved_symbol = Some(resolved_symbol.clone());
 
         let mut cache = self.symbol_filters.lock().await;
@@ -609,10 +660,14 @@ impl MexcClient {
     ///
     /// - `buy`: input is quote spent (`cummulative_quote_quantity`), output is base received (`executed_quantity`)
     /// - `sell`: input is base sold (`executed_quantity`), output is quote received (`cummulative_quote_quantity`)
+    ///
+    /// Note: MEXC order aggregates are treated as gross amounts; we apply a taker-fee haircut
+    /// to `output_received` so downstream legs spend a net-usable amount.
     fn map_fill_report(
         side_norm: &str,
         executed_quantity: Decimal,
         cummulative_quote_quantity: Decimal,
+        fee_bps: f64,
     ) -> Result<SwapFillReport, String> {
         if executed_quantity <= Decimal::ZERO {
             return Err("order has zero executed quantity".into());
@@ -624,15 +679,21 @@ impl MexcClient {
         let cumulative_quote = cummulative_quote_quantity
             .to_f64()
             .ok_or("cannot convert cummulative_quote_quantity to f64".to_string())?;
+        let net_executed_base = Self::apply_output_fee(executed_quantity, fee_bps)
+            .to_f64()
+            .ok_or("cannot convert fee-adjusted executed_quantity to f64".to_string())?;
+        let net_cumulative_quote = Self::apply_output_fee(cummulative_quote_quantity, fee_bps)
+            .to_f64()
+            .ok_or("cannot convert fee-adjusted cummulative_quote_quantity to f64".to_string())?;
 
         match side_norm {
             "buy" => Ok(SwapFillReport {
                 input_consumed: cumulative_quote,
-                output_received: executed_base,
+                output_received: net_executed_base,
             }),
             "sell" => Ok(SwapFillReport {
                 input_consumed: executed_base,
-                output_received: cumulative_quote,
+                output_received: net_cumulative_quote,
             }),
             _ => Err(format!(
                 "invalid side_norm '{}' in map_fill_report(side_norm, executed_quantity, cummulative_quote_quantity)",
@@ -647,6 +708,7 @@ impl MexcClient {
         symbol: &str,
         order_id: &str,
         side_norm: &str,
+        fee_bps: f64,
     ) -> Result<SwapFillReport, String> {
         let order_res = ex
             .get_order(GetOrderParams {
@@ -669,6 +731,7 @@ impl MexcClient {
             side_norm,
             order_res.executed_quantity,
             order_res.cummulative_quote_quantity,
+            fee_bps,
         )
     }
 
@@ -678,6 +741,7 @@ impl MexcClient {
         symbol: &str,
         client_order_id: &str,
         side_norm: &str,
+        fee_bps: f64,
     ) -> Result<Option<SwapFillReport>, String> {
         let order_res = ex
             .get_order(GetOrderParams {
@@ -722,6 +786,7 @@ impl MexcClient {
             side_norm,
             order_res.executed_quantity,
             order_res.cummulative_quote_quantity,
+            fee_bps,
         )?;
         Ok(Some(report))
     }
@@ -732,10 +797,11 @@ impl MexcClient {
         candidates: &[String],
         client_order_id: &str,
         side_norm: &str,
+        fee_bps: f64,
     ) -> Result<Option<SwapFillReport>, String> {
         for candidate in candidates {
             if let Some(report) = self
-                .try_fetch_fill_report_by_client_order_id(ex, candidate, client_order_id, side_norm)
+                .try_fetch_fill_report_by_client_order_id(ex, candidate, client_order_id, side_norm, fee_bps)
                 .await?
             {
                 return Ok(Some(report));
@@ -883,6 +949,11 @@ impl CexBackend for MexcClient {
             .as_ref()
             .and_then(|f| f.resolved_symbol.as_deref())
             .unwrap_or(&symbol);
+        let (fee_bps, fee_bps_fallback) = Self::resolve_taker_fee_bps(filters.as_ref());
+        debug!(
+            "[mexc] fee source market={} symbol={} taker_fee_bps={} fallback={}",
+            market, api_symbol, fee_bps, fee_bps_fallback
+        );
 
         info!("Swapping {} {} {} (symbol={})", market, side, amount_in, api_symbol);
 
@@ -928,7 +999,8 @@ impl CexBackend for MexcClient {
             Ok((chosen_symbol, order_id)) => {
                 let fetch_res = {
                     let ex = self.inner.lock().await;
-                    self.fetch_fill_report(&ex, &chosen_symbol, &order_id, &side_norm).await
+                    self.fetch_fill_report(&ex, &chosen_symbol, &order_id, &side_norm, fee_bps)
+                        .await
                 };
                 match fetch_res {
                     Ok(report) => Ok(report),
@@ -941,6 +1013,7 @@ impl CexBackend for MexcClient {
                                     &candidates,
                                     client_order_id,
                                     &side_norm,
+                                    fee_bps,
                                 )
                                 .await
                             }?;
@@ -973,6 +1046,7 @@ impl CexBackend for MexcClient {
                             &candidates,
                             client_order_id,
                             &side_norm,
+                            fee_bps,
                         )
                         .await
                     }?;
@@ -1240,18 +1314,62 @@ mod tests {
 
     #[test]
     fn map_fill_report_buy_uses_quote_as_input_and_base_as_output() {
-        let report =
-            MexcClient::map_fill_report("buy", Decimal::new(185, 6), Decimal::new(1280, 2)).expect("map should work");
+        let report = MexcClient::map_fill_report(
+            "buy",
+            Decimal::new(185, 6),
+            Decimal::new(1280, 2),
+            MEXC_SPOT_FEE_BPS,
+        )
+        .expect("map should work");
+        let expected_output = MexcClient::apply_output_fee(Decimal::new(185, 6), MEXC_SPOT_FEE_BPS)
+            .to_f64()
+            .expect("convert expected buy output");
         assert!((report.input_consumed - 12.8).abs() < 1e-12);
-        assert!((report.output_received - 0.000185).abs() < 1e-12);
+        assert!((report.output_received - expected_output).abs() < 1e-12);
     }
 
     #[test]
     fn map_fill_report_sell_uses_base_as_input_and_quote_as_output() {
-        let report =
-            MexcClient::map_fill_report("sell", Decimal::new(185, 6), Decimal::new(1280, 2)).expect("map should work");
+        let report = MexcClient::map_fill_report(
+            "sell",
+            Decimal::new(185, 6),
+            Decimal::new(1280, 2),
+            MEXC_SPOT_FEE_BPS,
+        )
+        .expect("map should work");
+        let expected_output = MexcClient::apply_output_fee(Decimal::new(1280, 2), MEXC_SPOT_FEE_BPS)
+            .to_f64()
+            .expect("convert expected sell output");
         assert!((report.input_consumed - 0.000185).abs() < 1e-12);
-        assert!((report.output_received - 12.8).abs() < 1e-12);
+        assert!((report.output_received - expected_output).abs() < 1e-12);
+    }
+
+    #[test]
+    fn parse_taker_fee_bps_converts_ratio_to_bps() {
+        let info = serde_json::json!({
+            "takerCommission": "0.003"
+        });
+        let bps = MexcClient::parse_taker_fee_bps(&info).expect("bps");
+        assert!((bps - 30.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn resolve_taker_fee_bps_falls_back_to_default_when_missing() {
+        let filters = SymbolFilters::default();
+        let (bps, fallback) = MexcClient::resolve_taker_fee_bps(Some(&filters));
+        assert!((bps - (MEXC_SPOT_FEE_BPS + ROUND_HANDLER)).abs() < 1e-12);
+        assert!(fallback);
+    }
+
+    #[test]
+    fn resolve_taker_fee_bps_adds_round_handler_to_symbol_fee() {
+        let filters = SymbolFilters {
+            taker_fee_bps: Some(5.0),
+            ..SymbolFilters::default()
+        };
+        let (bps, fallback) = MexcClient::resolve_taker_fee_bps(Some(&filters));
+        assert!((bps - 5.01).abs() < 1e-12);
+        assert!(!fallback);
     }
 
     #[test]
