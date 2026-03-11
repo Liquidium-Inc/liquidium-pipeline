@@ -1316,6 +1316,7 @@ impl CexBackend for MexcClient {
 mod tests {
     use super::*;
 
+    // Buy fill mapping should keep quote as input-consumed and apply fee haircut to base output.
     #[test]
     fn map_fill_report_buy_uses_quote_as_input_and_base_as_output() {
         let report = MexcClient::map_fill_report(
@@ -1332,6 +1333,7 @@ mod tests {
         assert!((report.output_received - expected_output).abs() < 1e-12);
     }
 
+    // Sell fill mapping should keep base as input-consumed and apply fee haircut to quote output.
     #[test]
     fn map_fill_report_sell_uses_base_as_input_and_quote_as_output() {
         let report = MexcClient::map_fill_report(
@@ -1348,6 +1350,7 @@ mod tests {
         assert!((report.output_received - expected_output).abs() < 1e-12);
     }
 
+    // exchangeInfo returns takerCommission as ratio; we convert ratio -> bps.
     #[test]
     fn parse_taker_fee_bps_converts_ratio_to_bps() {
         let info = serde_json::json!({
@@ -1357,8 +1360,12 @@ mod tests {
         assert!((bps - 30.0).abs() < 1e-12);
     }
 
+    // Guard against mis-scaled fee payloads that would otherwise imply impossible fee rates.
     #[test]
     fn parse_taker_fee_bps_rejects_values_above_10000() {
+        // `takerCommission` is interpreted as a ratio; "2.0" means 200%.
+        // Converted to bps this is 20_000 bps, above MAX_TAKER_FEE_BPS (10_000),
+        // so parsing must fail and the caller should use fallback fee logic instead.
         let info = serde_json::json!({
             "takerCommission": "2.0"
         });
@@ -1366,6 +1373,7 @@ mod tests {
         assert!(bps.is_none());
     }
 
+    // Missing per-symbol fee must fall back to default fee plus round handler.
     #[test]
     fn resolve_taker_fee_bps_falls_back_to_default_when_missing() {
         let filters = SymbolFilters::default();
@@ -1374,6 +1382,7 @@ mod tests {
         assert!(fallback);
     }
 
+    // Valid symbol fee should be used and padded by round handler.
     #[test]
     fn resolve_taker_fee_bps_adds_round_handler_to_symbol_fee() {
         let filters = SymbolFilters {
@@ -1385,6 +1394,7 @@ mod tests {
         assert!(!fallback);
     }
 
+    // Out-of-range symbol fees must be discarded and replaced with default fallback.
     #[test]
     fn resolve_taker_fee_bps_falls_back_for_symbol_fee_above_10000() {
         let filters = SymbolFilters {
@@ -1396,6 +1406,7 @@ mod tests {
         assert!(fallback);
     }
 
+    // Even boundary values should fallback when adding round handler would exceed hard cap.
     #[test]
     fn resolve_taker_fee_bps_falls_back_when_round_handler_pushes_over_10000() {
         let filters = SymbolFilters {
