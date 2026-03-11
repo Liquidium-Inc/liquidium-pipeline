@@ -21,6 +21,8 @@ const BPS_PER_RATIO_UNIT: f64 = 10_000.0;
 const MEXC_SPOT_FEE_BPS: f64 = 5.01;
 /// Tiny safety increment to avoid borderline balance/rounding rejections between legs.
 const ROUND_HANDLER: f64 = 0.01;
+/// Hard cap for fee inputs; values above this are treated as invalid.
+const MAX_TAKER_FEE_BPS: f64 = 10_000.0;
 
 fn from_mexc_raw(s: &str) -> WithdrawStatus {
     match s {
@@ -244,7 +246,7 @@ impl MexcClient {
 
         let bps = commission_ratio * Decimal::from_i32(10_000)?;
         let bps_f64 = bps.to_f64()?;
-        if bps_f64.is_finite() && bps_f64 >= 0.0 {
+        if bps_f64.is_finite() && bps_f64 >= 0.0 && bps_f64 <= MAX_TAKER_FEE_BPS {
             Some(bps_f64)
         } else {
             None
@@ -254,7 +256,9 @@ impl MexcClient {
     fn resolve_taker_fee_bps(filters: Option<&SymbolFilters>) -> (f64, bool) {
         let bps = filters.and_then(|f| f.taker_fee_bps);
         match bps {
-            Some(v) if v.is_finite() && v >= 0.0 => (v + ROUND_HANDLER, false),
+            Some(v) if v.is_finite() && v >= 0.0 && v + ROUND_HANDLER <= MAX_TAKER_FEE_BPS => {
+                (v + ROUND_HANDLER, false)
+            }
             _ => (MEXC_SPOT_FEE_BPS + ROUND_HANDLER, true),
         }
     }
@@ -1354,6 +1358,15 @@ mod tests {
     }
 
     #[test]
+    fn parse_taker_fee_bps_rejects_values_above_10000() {
+        let info = serde_json::json!({
+            "takerCommission": "2.0"
+        });
+        let bps = MexcClient::parse_taker_fee_bps(&info);
+        assert!(bps.is_none());
+    }
+
+    #[test]
     fn resolve_taker_fee_bps_falls_back_to_default_when_missing() {
         let filters = SymbolFilters::default();
         let (bps, fallback) = MexcClient::resolve_taker_fee_bps(Some(&filters));
@@ -1370,6 +1383,28 @@ mod tests {
         let (bps, fallback) = MexcClient::resolve_taker_fee_bps(Some(&filters));
         assert!((bps - 5.01).abs() < 1e-12);
         assert!(!fallback);
+    }
+
+    #[test]
+    fn resolve_taker_fee_bps_falls_back_for_symbol_fee_above_10000() {
+        let filters = SymbolFilters {
+            taker_fee_bps: Some(10_000.01),
+            ..SymbolFilters::default()
+        };
+        let (bps, fallback) = MexcClient::resolve_taker_fee_bps(Some(&filters));
+        assert!((bps - (MEXC_SPOT_FEE_BPS + ROUND_HANDLER)).abs() < 1e-12);
+        assert!(fallback);
+    }
+
+    #[test]
+    fn resolve_taker_fee_bps_falls_back_when_round_handler_pushes_over_10000() {
+        let filters = SymbolFilters {
+            taker_fee_bps: Some(10_000.0),
+            ..SymbolFilters::default()
+        };
+        let (bps, fallback) = MexcClient::resolve_taker_fee_bps(Some(&filters));
+        assert!((bps - (MEXC_SPOT_FEE_BPS + ROUND_HANDLER)).abs() < 1e-12);
+        assert!(fallback);
     }
 
     #[test]
