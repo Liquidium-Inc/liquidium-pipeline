@@ -177,6 +177,7 @@ where
                 deposit_asset: receipt.request.collateral_asset.clone(),
                 deposit_txid: None,
                 deposit_balance_before: None,
+                deposit_sent_at_ts: None,
                 approval_bump_count: None,
             },
             trade: CexTradeState {
@@ -328,6 +329,7 @@ where
             }
 
             state.deposit.deposit_txid = Some(tx_id);
+            state.deposit.deposit_sent_at_ts = Some(now_ts());
             state.step = CexStep::DepositPending;
 
             // Keep step as Deposit. WAL will persist, and a later finalize run

@@ -13,7 +13,7 @@ use liquidium_pipeline_core::types::protocol_types::{
 };
 
 use crate::executors::executor::ExecutorRequest;
-use crate::finalizers::cex_finalizer::{CexState, CexStep};
+use crate::finalizers::cex_finalizer::{CexDepositState, CexState, CexStep};
 use crate::stages::executor::{ExecutionReceipt, ExecutionStatus};
 use proptest::prelude::*;
 
@@ -122,6 +122,7 @@ async fn mexc_prepare_builds_initial_cex_state() {
     assert_eq!(state.deposit.deposit_asset, receipt.request.collateral_asset);
     assert!(state.deposit.deposit_txid.is_none());
     assert!(state.deposit.deposit_balance_before.is_none());
+    assert!(state.deposit.deposit_sent_at_ts.is_none());
 
     // trade leg
     let expected_market = format!(
@@ -194,6 +195,7 @@ async fn mexc_deposit_phase_a_snapshots_baseline_and_sends_transfer() {
 
     assert_eq!(state.deposit.deposit_balance_before, Some(10.0));
     assert_eq!(state.deposit.deposit_txid.as_deref(), Some("tx-123"));
+    assert!(state.deposit.deposit_sent_at_ts.is_some());
     assert!(matches!(state.step, CexStep::DepositPending));
 }
 
@@ -233,6 +235,7 @@ async fn mexc_deposit_phase_b_without_baseline_sets_baseline_and_keeps_step() {
 
     assert_eq!(state.deposit.deposit_balance_before, Some(5.0));
     assert_eq!(state.deposit.deposit_txid.as_deref(), Some("tx-123"));
+    assert!(state.deposit.deposit_sent_at_ts.is_some());
     assert!(matches!(state.step, CexStep::DepositPending));
 }
 
@@ -310,7 +313,97 @@ async fn mexc_deposit_phase_b_stays_in_deposit_when_balance_unchanged() {
     // Since balance did not increase enough, we should still be in DepositPending.
     assert_eq!(state.deposit.deposit_balance_before, Some(5.0));
     assert_eq!(state.deposit.deposit_txid.as_deref(), Some("tx-123"));
+    assert!(state.deposit.deposit_sent_at_ts.is_some());
     assert!(matches!(state.step, CexStep::DepositPending));
+}
+
+#[tokio::test]
+async fn mexc_deposit_phase_b_confirms_via_total_free_fallback_after_wait_window() {
+    let mut backend = MockCexBackend::new();
+    let transfers = MockTransferActions::new();
+
+    // Total free covers expected, but delta from baseline does not.
+    backend.expect_get_balance().returning(|_symbol| Ok(10.0));
+
+    let finalizer = MexcFinalizer::new(
+        Arc::new(backend),
+        Arc::new(transfers),
+        Principal::anonymous(),
+        TEST_MAX_SELL_SLIPPAGE_BPS,
+        TEST_CEX_MIN_EXEC_USD,
+        TEST_CEX_SLICE_TARGET_RATIO,
+    );
+
+    let receipt = make_execution_receipt(42);
+    let mut state = finalizer.prepare("42", &receipt).await.expect("prepare should succeed");
+    state.deposit.deposit_txid = Some("tx-123".to_string());
+    state.deposit.deposit_balance_before = Some(4.0);
+    state.deposit.deposit_sent_at_ts = Some(crate::utils::now_ts().saturating_sub(10));
+    state.trade.trade_next_amount_in = Some(10.0);
+    state.step = CexStep::DepositPending;
+
+    finalizer
+        .deposit(&mut state)
+        .await
+        .expect("deposit should confirm via total-free fallback");
+    assert!(matches!(state.step, CexStep::Trade));
+}
+
+#[tokio::test]
+async fn mexc_deposit_phase_b_does_not_use_total_free_fallback_before_wait_window() {
+    let mut backend = MockCexBackend::new();
+    let transfers = MockTransferActions::new();
+
+    // Total free covers expected, but fallback window has not elapsed yet.
+    backend.expect_get_balance().returning(|_symbol| Ok(10.0));
+
+    let finalizer = MexcFinalizer::new(
+        Arc::new(backend),
+        Arc::new(transfers),
+        Principal::anonymous(),
+        TEST_MAX_SELL_SLIPPAGE_BPS,
+        TEST_CEX_MIN_EXEC_USD,
+        TEST_CEX_SLICE_TARGET_RATIO,
+    );
+
+    let receipt = make_execution_receipt(42);
+    let mut state = finalizer.prepare("42", &receipt).await.expect("prepare should succeed");
+    state.deposit.deposit_txid = Some("tx-123".to_string());
+    state.deposit.deposit_balance_before = Some(4.0);
+    state.deposit.deposit_sent_at_ts = Some(crate::utils::now_ts().saturating_sub(1));
+    state.trade.trade_next_amount_in = Some(10.0);
+    state.step = CexStep::DepositPending;
+
+    finalizer
+        .deposit(&mut state)
+        .await
+        .expect("deposit should stay pending before total-free fallback window");
+    assert!(matches!(state.step, CexStep::DepositPending));
+}
+
+#[test]
+fn cex_deposit_state_deserialize_defaults_missing_sent_timestamp() {
+    let original = CexDepositState {
+        deposit_asset: ChainToken::Icp {
+            ledger: Principal::anonymous(),
+            symbol: "ckBTC".to_string(),
+            decimals: 8,
+            fee: Nat::from(10u64),
+        },
+        deposit_txid: Some("tx-123".to_string()),
+        deposit_balance_before: Some(5.0),
+        deposit_sent_at_ts: Some(123),
+        approval_bump_count: Some(2),
+    };
+
+    let mut value = serde_json::to_value(&original).expect("serialize deposit state");
+    value
+        .as_object_mut()
+        .expect("deposit state should serialize to object")
+        .remove("deposit_sent_at_ts");
+
+    let decoded: CexDepositState = serde_json::from_value(value).expect("deserialize legacy payload");
+    assert_eq!(decoded.deposit_sent_at_ts, None);
 }
 
 #[tokio::test]
