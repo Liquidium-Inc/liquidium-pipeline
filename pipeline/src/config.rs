@@ -41,6 +41,7 @@ pub struct Config {
     pub db_path: String,
     pub max_allowed_dex_slippage: u32,
     pub max_allowed_cex_slippage_bps: u32,
+    pub bad_debt_collateral_slippage_bps: u32,
     /// Minimum USD notional allowed for a single CEX execution chunk.
     /// Chunks below this threshold are treated as dust.
     pub cex_min_exec_usd: f64,
@@ -82,6 +83,7 @@ pub trait ConfigTrait: Send + Sync {
     fn should_buy_bad_debt(&self) -> bool;
     fn get_max_allowed_dex_slippage(&self) -> u32;
     fn get_max_allowed_cex_slippage_bps(&self) -> u32;
+    fn get_bad_debt_collateral_slippage_bps(&self) -> u32;
     fn get_cex_min_exec_usd(&self) -> f64;
     fn get_cex_slice_target_ratio(&self) -> f64;
     fn get_cex_buy_truncation_trigger_ratio(&self) -> f64;
@@ -132,6 +134,10 @@ impl ConfigTrait for Config {
 
     fn get_max_allowed_cex_slippage_bps(&self) -> u32 {
         self.max_allowed_cex_slippage_bps
+    }
+
+    fn get_bad_debt_collateral_slippage_bps(&self) -> u32 {
+        self.bad_debt_collateral_slippage_bps
     }
 
     fn get_cex_min_exec_usd(&self) -> f64 {
@@ -256,6 +262,8 @@ impl Config {
             .ok()
             .and_then(|v| v.parse::<u32>().ok())
             .unwrap_or(200);
+
+        let bad_debt_collateral_slippage_bps = parse_bad_debt_collateral_slippage_bps_from_env();
         let cex_tunables = parse_cex_tunables_from_env();
 
         let swapper_raw = env::var("SWAPPER").unwrap_or_else(|_| "hybrid".to_string());
@@ -307,6 +315,7 @@ impl Config {
             db_path,
             max_allowed_dex_slippage,
             max_allowed_cex_slippage_bps,
+            bad_debt_collateral_slippage_bps,
             cex_min_exec_usd: cex_tunables.min_exec_usd,
             cex_slice_target_ratio: cex_tunables.slice_target_ratio,
             cex_buy_truncation_trigger_ratio: cex_tunables.buy_truncation_trigger_ratio,
@@ -380,9 +389,19 @@ const DEFAULT_CEX_MIN_NET_EDGE_BPS: u32 = 150;
 const DEFAULT_CEX_DELAY_BUFFER_BPS: u32 = 75;
 const DEFAULT_CEX_ROUTE_FEE_BPS: u32 = 25;
 const DEFAULT_CEX_FORCE_OVER_USD_THRESHOLD: f64 = 12.5;
+const DEFAULT_BAD_DEBT_COLLATERAL_SLIPPAGE_BPS: u32 = 500;
+const MAX_BPS: u32 = 10_000;
 const MIN_RATIO: f64 = 0.0;
 const MAX_RATIO: f64 = 1.0;
 const MIN_SLICE_TARGET_RATIO: f64 = 0.1;
+
+fn parse_bad_debt_collateral_slippage_bps_from_env() -> u32 {
+    env::var("BAD_DEBT_COLLATERAL_SLIPPAGE_BPS")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .map(|v| v.min(MAX_BPS))
+        .unwrap_or(DEFAULT_BAD_DEBT_COLLATERAL_SLIPPAGE_BPS)
+}
 
 fn parse_cex_tunables_from_env() -> CexTunables {
     // Defaults are conservative; env overrides are expected in .env.
@@ -496,6 +515,7 @@ mod tests {
             "CEX_DELAY_BUFFER_BPS",
             "CEX_ROUTE_FEE_BPS",
             "CEX_FORCE_OVER_USD_THRESHOLD",
+            "BAD_DEBT_COLLATERAL_SLIPPAGE_BPS",
         ];
         for key in vars {
             unsafe { env::remove_var(key) };
@@ -537,6 +557,7 @@ mod tests {
             env::set_var("CEX_DELAY_BUFFER_BPS", "90");
             env::set_var("CEX_ROUTE_FEE_BPS", "0");
             env::set_var("CEX_FORCE_OVER_USD_THRESHOLD", "5.75");
+            env::set_var("BAD_DEBT_COLLATERAL_SLIPPAGE_BPS", "350");
         }
 
         let parsed = parse_cex_tunables_from_env();
@@ -557,6 +578,7 @@ mod tests {
                 force_over_usd_threshold: 5.75,
             }
         );
+        assert_eq!(parse_bad_debt_collateral_slippage_bps_from_env(), 350);
     }
 
     #[test]
@@ -572,6 +594,7 @@ mod tests {
             env::set_var("CEX_RETRY_BASE_SECS", "10");
             env::set_var("CEX_RETRY_MAX_SECS", "1");
             env::set_var("CEX_FORCE_OVER_USD_THRESHOLD", "-1");
+            env::set_var("BAD_DEBT_COLLATERAL_SLIPPAGE_BPS", "20000");
         }
 
         let parsed = parse_cex_tunables_from_env();
@@ -584,6 +607,16 @@ mod tests {
         assert_eq!(parsed.retry_base_secs, 10);
         assert_eq!(parsed.retry_max_secs, 120);
         assert_eq!(parsed.force_over_usd_threshold, 12.5);
+        assert_eq!(parse_bad_debt_collateral_slippage_bps_from_env(), 10_000);
+    }
+
+    #[test]
+    fn parse_bad_debt_collateral_slippage_bps_defaults_to_500() {
+        let _guard = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        unsafe {
+            env::remove_var("BAD_DEBT_COLLATERAL_SLIPPAGE_BPS");
+        }
+        assert_eq!(parse_bad_debt_collateral_slippage_bps_from_env(), 500);
     }
 
     #[test]
