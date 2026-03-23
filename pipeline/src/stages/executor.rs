@@ -75,21 +75,22 @@ impl<'a, A: PipelineAgent, D: WalStore> PipelineStage<'a, Vec<ExecutorRequest>, 
                 let liq_req = executor_request.liquidation.clone();
 
                 info!(
-                    "[executor] ⚡ liquidation req | borrower={} | debt_pool={} | collateral_pool={} | debt={} | bad_debt={}",
+                    "[executor] ⚡ liquidation req | borrower={} | debt_pool={} | collateral_pool={} | debt={} | bad_debt={} | min_collateral_amount={}",
                     liq_req.borrower.to_text(),
                     liq_req.debt_pool_id.to_text(),
                     liq_req.collateral_pool_id.to_text(),
                     liq_req.debt_amount,
-                    liq_req.buy_bad_debt
+                    liq_req.buy_bad_debt,
+                    executor_request.min_collateral_amount
                 );
 
-                let args = Encode!(&liq_req).map_err(|e| e.to_string())?;
+                let args = Encode!(&liq_req, &executor_request.min_collateral_amount).map_err(|e| e.to_string())?;
 
                 let liq_call = match self
                     .agent
                     .call_update::<Result<LiquidationResult, ProtocolError>>(
                         &self.lending_canister,
-                        "liquidate",
+                        "liquidate_with_slippage",
                         args,
                     )
                     .await
@@ -106,11 +107,12 @@ impl<'a, A: PipelineAgent, D: WalStore> PipelineStage<'a, Vec<ExecutorRequest>, 
                     Ok(v) => v,
                     Err(err) => {
                         warn!(
-                            "[executor] liquidate rejected by canister | borrower={} | debt_pool={} | collateral_pool={} | debt={} | err={:?}",
+                            "[executor] liquidate_with_slippage rejected by canister | borrower={} | debt_pool={} | collateral_pool={} | debt={} | min_collateral_amount={} | err={:?}",
                             liq_req.borrower.to_text(),
                             liq_req.debt_pool_id.to_text(),
                             liq_req.collateral_pool_id.to_text(),
                             liq_req.debt_amount,
+                            executor_request.min_collateral_amount,
                             err
                         );
                         receipt.status = ExecutionStatus::FailedLiquidation(format!("{:?}", err));
@@ -121,12 +123,13 @@ impl<'a, A: PipelineAgent, D: WalStore> PipelineStage<'a, Vec<ExecutorRequest>, 
                 receipt.liquidation_result = Some(liq.clone());
                 if let LiquidationStatus::FailedLiquidation(err) = &liq.status {
                     warn!(
-                        "[executor] liquidate returned FailedLiquidation | liq_id={} | borrower={} | debt_pool={} | collateral_pool={} | debt={} | err={}",
+                        "[executor] liquidate_with_slippage returned FailedLiquidation | liq_id={} | borrower={} | debt_pool={} | collateral_pool={} | debt={} | min_collateral_amount={} | err={}",
                         liq.id,
                         liq_req.borrower.to_text(),
                         liq_req.debt_pool_id.to_text(),
                         liq_req.collateral_pool_id.to_text(),
                         liq_req.debt_amount,
+                        executor_request.min_collateral_amount,
                         err
                     );
 
@@ -263,7 +266,7 @@ mod tests {
 
     use std::sync::Arc;
 
-    use candid::{Nat, Principal};
+    use candid::{Decode, Nat, Principal};
     use icrc_ledger_types::icrc1::account::Account;
     use liquidium_pipeline_connectors::pipeline_agent::MockPipelineAgent;
     use liquidium_pipeline_core::tokens::chain_token::ChainToken;
@@ -305,6 +308,7 @@ mod tests {
             expected_profit: 3,
             ref_price: Nat::from(0u8),
             debt_approval_needed: true,
+            min_collateral_amount: Nat::from(42u64),
         }
     }
 
@@ -340,7 +344,18 @@ mod tests {
 
         agent
             .expect_call_update::<Result<LiquidationResult, ProtocolError>>()
-            .withf(move |canister, method, _| *canister == lending_canister && method == "liquidate")
+            .withf(move |canister, method, arg| {
+                if *canister != lending_canister || method != "liquidate_with_slippage" {
+                    return false;
+                }
+
+                match candid::Decode!(arg, LiquidationRequest, Nat) {
+                    Ok((liq_req, min_collateral_amount)) => {
+                        liq_req.debt_amount == Nat::from(11_244u64) && min_collateral_amount == Nat::from(42u64)
+                    }
+                    Err(_) => false,
+                }
+            })
             .times(2)
             .returning(move |_, _, _| Ok(Ok(make_liquidation_result(31u128))));
 
@@ -382,7 +397,7 @@ mod tests {
 
         assert!(
             matches!(receipts[0].status, ExecutionStatus::Success),
-            "first request should execute via direct liquidate call"
+            "first request should execute via liquidate_with_slippage call"
         );
         assert!(receipts[0].liquidation_result.is_some());
 

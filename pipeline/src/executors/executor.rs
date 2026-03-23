@@ -21,4 +21,6 @@ pub struct ExecutorRequest {
     pub ref_price: Nat,
     #[serde(default)]
     pub debt_approval_needed: bool,
+    #[serde(default)]
+    pub min_collateral_amount: Nat,
 }

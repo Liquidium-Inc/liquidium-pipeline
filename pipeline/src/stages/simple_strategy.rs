@@ -167,6 +167,15 @@ where
         (fee_native.clone() * price_coll_ray.clone() * debt_scale) / (coll_scale * price_debt_ray.clone())
     }
 
+    fn min_collateral_for_bad_debt(gross_collateral: Nat, slippage_bps: u32) -> Nat {
+        if gross_collateral == 0u8 {
+            return Nat::from(0u8);
+        }
+
+        let retained_bps = 10_000u32.saturating_sub(slippage_bps.min(10_000));
+        (gross_collateral * Nat::from(retained_bps)) / Nat::from(10_000u32)
+    }
+
     // Helper: Prefetch balances for all debt assets we might need
     async fn prefetch_balances_for_users(&self, users: &[LiquidatebleUser]) -> Result<HashMap<String, Nat>, String> {
         let mut debt_assets: HashSet<ChainToken> = HashSet::new();
@@ -381,6 +390,7 @@ where
                 swap_args: None,
                 expected_profit: profit.0.to_i128().unwrap_or(i128::MAX),
                 debt_approval_needed,
+                min_collateral_amount: Nat::from(0u8),
             });
         }
 
@@ -508,6 +518,7 @@ where
                 )
                 .await?;
 
+            let gross_estimated_collateral = estimation.received_collateral.clone();
             estimation.received_collateral = if estimation.received_collateral < collateral_token.fee() {
                 0u64.into()
             } else {
@@ -636,6 +647,15 @@ where
                 - Int::from(mexc_approval_fee_in_debt.clone());
             let is_bad_debt = profit <= 0;
 
+            let min_collateral_amount = if is_bad_debt {
+                Self::min_collateral_for_bad_debt(
+                    gross_estimated_collateral,
+                    self.config.get_bad_debt_collateral_slippage_bps(),
+                )
+            } else {
+                Nat::from(0u8)
+            };
+
             info!(
                 "📊 Profit: {} {}",
                 profit.0.to_f64().unwrap_or(0.0) / 10u32.pow(repayment_token.decimals() as u32) as f64,
@@ -679,6 +699,7 @@ where
                 swap_args,
                 expected_profit: profit.0.to_i128().unwrap_or(i128::MAX),
                 debt_approval_needed,
+                min_collateral_amount,
             });
 
             if estimation.repaid_debt >= debt_position.debt_amount {
@@ -841,6 +862,7 @@ mod tests {
         let req = &res[0];
         assert_eq!(req.liquidation.borrower, pos.account);
         assert!(req.swap_args.is_none(), "no swap expected when assets match");
+        assert_eq!(req.min_collateral_amount, Nat::from(0u8));
     }
 
     // Fails fast when balance fetch errors.
@@ -1062,6 +1084,7 @@ mod tests {
         cfg.expect_get_liquidator_principal().return_const(trader);
         cfg.expect_should_buy_bad_debt().return_const(true);
         cfg.expect_get_max_allowed_dex_slippage().return_const(2000u32);
+        cfg.expect_get_bad_debt_collateral_slippage_bps().return_const(500u32);
         cfg.expect_get_lending_canister()
             .return_const(p("mxzaz-hqaaa-aaaar-qaada-cai"));
 
@@ -1126,6 +1149,77 @@ mod tests {
             res[0].liquidation.buy_bad_debt,
             "negative-profit liquidation should be marked as bad debt"
         );
+        assert_eq!(
+            res[0].min_collateral_amount,
+            Nat::from(950u64),
+            "bad debt min collateral should use gross estimate haircut"
+        );
+    }
+
+    #[tokio::test]
+    async fn simple_strategy_pure_bad_debt_keeps_min_collateral_zero() {
+        let ledger = p("xevnm-gaaaa-aaaar-qafnq-cai");
+        let token = mk_icp_token("ckUSDC", 6);
+
+        let mut registry = MockTokenRegistryTrait::new();
+        registry
+            .expect_get()
+            .returning(move |_id: &AssetId| Some(token.clone()));
+
+        let mut cfg = MockConfigTrait::new();
+        let trader = p("aaaaa-aa");
+        cfg.expect_get_trader_principal().return_const(trader);
+        cfg.expect_get_liquidator_principal().return_const(trader);
+        cfg.expect_should_buy_bad_debt().return_const(true);
+        cfg.expect_get_lending_canister()
+            .return_const(p("mxzaz-hqaaa-aaaar-qaada-cai"));
+
+        let mut collateral = MockCollateralServiceTrait::new();
+        collateral
+            .expect_calculate_liquidation_amounts()
+            .returning(|_, _, _, _| panic!("collateral estimation should not run for pure bad debt"));
+
+        let mut account = MockAccountInfo::new();
+        account.expect_sync_balance().returning(move |_t: &ChainToken| {
+            Ok(ChainTokenAmount {
+                token: _t.clone(),
+                value: Nat::from(1_000_000u64),
+            })
+        });
+        account.expect_get_balance().returning(move |_t: &ChainToken| {
+            Ok(ChainTokenAmount {
+                token: _t.clone(),
+                value: Nat::from(1_000_000u64),
+            })
+        });
+
+        let mut swapper = MockSwapInterface::new();
+        swapper
+            .expect_quote()
+            .returning(|_req| panic!("quote should not be called for pure bad debt"));
+
+        let registry = Arc::new(registry);
+        let account = Arc::new(account);
+        let balance_service = Arc::new(BalanceService::new(registry.clone(), account.clone()));
+
+        let strategy = SimpleLiquidationStrategy::new(
+            Arc::new(cfg),
+            registry.clone(),
+            Arc::new(swapper),
+            Arc::new(collateral),
+            balance_service,
+            Arc::new(ApprovalState::new()),
+        );
+
+        let pool = p("mxzaz-hqaaa-aaaar-qaada-cai");
+        let borrower = p("user-pure-bad-debt");
+        let debt_pos = mk_position(pool, borrower, ledger, 1_000, 0, Assets::USDC);
+        let user = mk_user(vec![debt_pos], 1_000, 900);
+
+        let res = strategy.process(&vec![user]).await.unwrap();
+        assert_eq!(res.len(), 1);
+        assert!(res[0].liquidation.buy_bad_debt);
+        assert_eq!(res[0].min_collateral_amount, Nat::from(0u8));
     }
 
     // Balance budgeting across multiple combos uses one wallet and skips when funds fall below fee threshold.
