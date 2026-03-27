@@ -84,13 +84,18 @@ impl<'a, A: PipelineAgent, D: WalStore> PipelineStage<'a, Vec<ExecutorRequest>, 
                     executor_request.min_collateral_amount
                 );
 
-                let args = Encode!(&liq_req, &executor_request.min_collateral_amount).map_err(|e| e.to_string())?;
+                // TODO: Switch back to `liquidate_with_slippage` and include `min_collateral_amount`
+                // once the lending canister exposes that entrypoint.
+                // let args =
+                //     Encode!(&liq_req, &executor_request.min_collateral_amount).map_err(|e| e.to_string())?;
+                let args = Encode!(&liq_req).map_err(|e| e.to_string())?;
 
                 let liq_call = match self
                     .agent
                     .call_update::<Result<LiquidationResult, ProtocolError>>(
                         &self.lending_canister,
-                        "liquidate_with_slippage",
+                        // "liquidate_with_slippage",
+                        "liquidate",
                         args,
                     )
                     .await
@@ -107,7 +112,7 @@ impl<'a, A: PipelineAgent, D: WalStore> PipelineStage<'a, Vec<ExecutorRequest>, 
                     Ok(v) => v,
                     Err(err) => {
                         warn!(
-                            "[executor] liquidate_with_slippage rejected by canister | borrower={} | debt_pool={} | collateral_pool={} | debt={} | min_collateral_amount={} | err={:?}",
+                            "[executor] liquidate rejected by canister | borrower={} | debt_pool={} | collateral_pool={} | debt={} | min_collateral_amount={} | err={:?}",
                             liq_req.borrower.to_text(),
                             liq_req.debt_pool_id.to_text(),
                             liq_req.collateral_pool_id.to_text(),
@@ -123,7 +128,7 @@ impl<'a, A: PipelineAgent, D: WalStore> PipelineStage<'a, Vec<ExecutorRequest>, 
                 receipt.liquidation_result = Some(liq.clone());
                 if let LiquidationStatus::FailedLiquidation(err) = &liq.status {
                     warn!(
-                        "[executor] liquidate_with_slippage returned FailedLiquidation | liq_id={} | borrower={} | debt_pool={} | collateral_pool={} | debt={} | min_collateral_amount={} | err={}",
+                        "[executor] liquidate returned FailedLiquidation | liq_id={} | borrower={} | debt_pool={} | collateral_pool={} | debt={} | min_collateral_amount={} | err={}",
                         liq.id,
                         liq_req.borrower.to_text(),
                         liq_req.debt_pool_id.to_text(),
@@ -345,14 +350,19 @@ mod tests {
         agent
             .expect_call_update::<Result<LiquidationResult, ProtocolError>>()
             .withf(move |canister, method, arg| {
-                if *canister != lending_canister || method != "liquidate_with_slippage" {
+                // if *canister != lending_canister || method != "liquidate_with_slippage" {
+                if *canister != lending_canister || method != "liquidate" {
                     return false;
                 }
 
-                match candid::Decode!(arg, LiquidationRequest, Nat) {
-                    Ok((liq_req, min_collateral_amount)) => {
-                        liq_req.debt_amount == Nat::from(11_244u64) && min_collateral_amount == Nat::from(42u64)
-                    }
+                // match candid::Decode!(arg, LiquidationRequest, Nat) {
+                //     Ok((liq_req, min_collateral_amount)) => {
+                //         liq_req.debt_amount == Nat::from(11_244u64) && min_collateral_amount == Nat::from(42u64)
+                //     }
+                //     Err(_) => false,
+                // }
+                match candid::Decode!(arg, LiquidationRequest) {
+                    Ok(liq_req) => liq_req.debt_amount == Nat::from(11_244u64),
                     Err(_) => false,
                 }
             })
@@ -397,7 +407,7 @@ mod tests {
 
         assert!(
             matches!(receipts[0].status, ExecutionStatus::Success),
-            "first request should execute via liquidate_with_slippage call"
+            "first request should execute via liquidate call"
         );
         assert!(receipts[0].liquidation_result.is_some());
 
