@@ -322,6 +322,7 @@ impl Finalizer for dyn CexFinalizerLogic {
                 swap_result: Some(swap_exec),
                 finalized: true,
                 swapper: None,
+                reason: None,
             }
         } else {
             // Minimal change: just persist the updated state (already done in-loop).

@@ -71,8 +71,12 @@ async fn init(
         .map_err(|e| format!("executor token init failed: {e}"))?;
     let executor = Arc::new(executor);
 
-    if let Err(err) = ctx.swap_router.init().await {
-        warn!("Swap router init failed: {}", err);
+    if !matches!(config.swapper, SwapperMode::Cex) {
+        if let Err(err) = ctx.swap_router.init().await {
+            warn!("Swap router init failed: {}", err);
+        }
+    } else {
+        info!("Skipping swap router init in CEX mode");
     }
 
     // Base DEX finalizer (Kong swapper)

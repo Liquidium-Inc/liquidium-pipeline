@@ -26,7 +26,7 @@ Inspired by Artemis/MEV patterns and designed for permissionless, community-driv
 - **Pipeline Architecture** — Composable stages for discovery, strategy, execution, finalization, and export.
 - **Async Rust** — Highly concurrent and efficient with Tokio runtime.
 - **Multi-Chain** — Primary support for ICP with EVM (Arbitrum) integration.
-- **Flexible Swaps** — DEX (Kong), CEX (MEXC), or Hybrid strategies.
+- **Swap Execution** — CEX (MEXC) strategy.
 - **Extensible** — Add custom risk checks, strategies, swaps, or notification stages.
 - **Permissionless** — Anyone can run it.
 - **Multi-Account** — Separate liquidator, trader, and recovery identities for security.
@@ -35,7 +35,7 @@ Inspired by Artemis/MEV patterns and designed for permissionless, community-driv
 
 ## At a Glance
 
-- **Best first run:** use `SWAPPER=dex` until CEX credentials are configured.
+- **Best first run:** run `SWAPPER=cex` once CEX credentials are configured.
 - **Current config precedence:** shell env vars > local `.env` > `~/.liquidium-pipeline/config.env`.
 - **Required env vars (minimum):** `MNEMONIC_FILE`, `IC_URL`, `EVM_RPC_URL`, `LENDING_CANISTER`, `DEBT_ASSETS`, `COLLATERAL_ASSETS`.
 - **Primary operations:** `liquidator run`, `liquidator balance`, `liquidator withdraw`, `liquidator account show`.
@@ -127,11 +127,8 @@ WATCHDOG_WEBHOOK=https://your-webhook-url.com/endpoint
 ### Swap Configuration
 
 ```bash
-# Swap strategy: dex | cex | hybrid
-SWAPPER=hybrid
-
-# DEX (Kong)
-MAX_ALLOWED_DEX_SLIPPAGE=75  # 0.75% in basis points
+# Swap strategy: cex
+SWAPPER=cex
 
 # CEX (MEXC) - Optional
 CEX_MEXC_API_KEY=your_api_key
@@ -142,12 +139,12 @@ MAX_ALLOWED_CEX_SLIPPAGE_BPS=200  # 2.00% in basis points
 BAD_DEBT_COLLATERAL_SLIPPAGE_BPS=500  # 5.00% haircut used for min collateral
 ```
 
-### Advanced CEX/Hybrid Tuning
+### Advanced CEX Tuning
 
 ```bash
 # CEX trade slicing and execution controls
 # Skip execution chunks below this USD notional (treat as dust)
-CEX_MIN_EXEC_USD=2.0
+CEX_MIN_EXEC_USD=1.1
 # Per-slice impact target ratio of MAX_ALLOWED_CEX_SLIPPAGE_BPS
 CEX_SLICE_TARGET_RATIO=0.7
 # Arm adaptive buy fallback when truncation ratio is >= this value
@@ -167,7 +164,7 @@ CEX_MIN_NET_EDGE_BPS=150
 CEX_DELAY_BUFFER_BPS=75
 # Estimated route fee haircut applied to projected edge (bps)
 CEX_ROUTE_FEE_BPS=25
-# Hybrid shortcut: force CEX above this notional (USD), set 0 to disable
+# Reserved (currently unused while only SWAPPER=cex is supported)
 CEX_FORCE_OVER_USD_THRESHOLD=12.5
 ```
 
@@ -260,9 +257,8 @@ Route summary metrics are updated from slice notional, and weighted slippage is 
 
 **Supported swappers:**
 
-- **DEX (Kong)** — `SWAPPER=dex` (uses built-in Kong backend defaults)
-- **CEX (MEXC)** — `SWAPPER=cex` (requires MEXC API credentials)
-- **Hybrid** — `SWAPPER=hybrid` (tries DEX first, falls back to CEX)
+- **CEX (MEXC)** — `SWAPPER=cex` (required)
+- `SWAPPER=dex` and `SWAPPER=hybrid` are currently unsupported and return startup errors.
 
 ### Storage & Export
 
@@ -356,7 +352,7 @@ stateDiagram-v2
 | **Opportunity Discovery** | Polls lending canister for at-risk positions |
 | **Strategy Filter** | Filters opportunities by profitability and supported assets |
 | **Liquidation Execution** | Calls `liquidate()` on lending canister, seizes collateral |
-| **Swap Finalization** | Swaps collateral via DEX/CEX/Hybrid strategy |
+| **Swap Finalization** | Swaps collateral via CEX strategy |
 | **Export / Reporting** | Saves execution details to CSV |
 
 Stages are implemented with `async-trait` for composability.
@@ -365,9 +361,7 @@ Stages are implemented with `async-trait` for composability.
 
 | Strategy | Description |
 |----------|-------------|
-| **DEX** | Swaps via Kong on ICP. Retries with increasing slippage (0.75% → 5%). |
 | **CEX** | Deposits to MEXC, swaps, and withdraws. |
-| **Hybrid** | Tries DEX first, falls back to CEX on failure. |
 
 ### Retry & State Management
 
@@ -482,10 +476,10 @@ liquidator withdraw --source main --destination abc123-xyz --asset ckUSDT --amou
    liquidator balance
    ```
 
-2. Start with conservative routing while validating setup:
+2. Start the runner:
 
    ```bash
-   SWAPPER=dex liquidator run
+   SWAPPER=cex liquidator run
    ```
 
 3. Enable monitoring and inspect output artifacts:

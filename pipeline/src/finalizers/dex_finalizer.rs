@@ -68,6 +68,7 @@ impl Finalizer for dyn DexFinalizerLogic {
             swap_result: Some(swap_exec),
             finalized: true,
             swapper: None,
+            reason: None,
         };
 
         Ok(finlizer_result)

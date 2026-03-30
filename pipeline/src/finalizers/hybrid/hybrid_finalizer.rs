@@ -99,6 +99,7 @@ where
         &self,
         wal: &dyn WalStore,
         receipt: &ExecutionReceipt,
+        reason: Option<String>,
     ) -> Result<FinalizerResult, String> {
         let id = liq_id_from_receipt(receipt)?;
         wal.update_status(&id, ResultStatus::Succeeded, true)
@@ -108,6 +109,7 @@ where
             finalized: true,
             swap_result: None,
             swapper: Some("none".to_string()),
+            reason,
         })
     }
 
@@ -150,6 +152,7 @@ where
                 finalized: true,
                 swap_result: None,
                 swapper: Some("recovery".to_string()),
+                reason: None,
             });
         }
 
@@ -179,6 +182,7 @@ where
             finalized: true,
             swap_result: None,
             swapper: Some("recovery".to_string()),
+            reason: None,
         })
     }
 
@@ -344,6 +348,24 @@ where
         self.finalize_to_recovery(&receipt).await
     }
 
+    async fn finalize_with_no_swap_decision(
+        &self,
+        ctx: FinalizationContext<'_>,
+        receipt: ExecutionReceipt,
+        reason: String,
+    ) -> Result<FinalizerResult, String> {
+        info!(
+            "[hybrid] routing -> none reason={} dex_preview_net_bps={:?} cex_preview_net_bps={:?} min_required_bps={:.2}",
+            reason,
+            ctx.dex_preview.map(|candidate| candidate.net_edge_bps),
+            ctx.cex_preview.map(|candidate| candidate.net_edge_bps),
+            ctx.min_required_bps
+        );
+        let snapshot = ctx.snapshot("none", reason.clone());
+        self.persist_decision_snapshot(ctx.wal, &receipt, snapshot).await?;
+        self.finalize_without_swap(ctx.wal, &receipt, Some(reason)).await
+    }
+
     async fn finalize_with_error_decision(
         &self,
         ctx: FinalizationContext<'_>,
@@ -369,12 +391,33 @@ where
         // We still mark WAL as succeeded to close the lifecycle deterministically.
         let swap_req = match receipt.request.swap_args.clone() {
             Some(req) => req,
-            None => return self.finalize_without_swap(wal, &receipt).await,
+            None => return self.finalize_without_swap(wal, &receipt, None).await,
         };
 
         // Common decision inputs used by all branches below.
         let debt_repaid_amount = debt_repaid_f64(&receipt)?;
         let min_net_edge_bps = self.config.get_cex_min_net_edge_bps() as f64;
+        let cex_min_exec_usd = self.config.get_cex_min_exec_usd();
+
+        // Early CEX dust-hold gate:
+        // In non-DEX modes, tiny notionals below CEX execution floor are finalized
+        // as no-swap, keeping funds in trader wallet.
+        if !matches!(self.config.get_swapper_mode(), SwapperMode::Dex) {
+            let estimated_swap_value_usd = estimate_swap_value_usd(&receipt, &swap_req);
+            if estimated_swap_value_usd > 0.0 && estimated_swap_value_usd < cex_min_exec_usd {
+                let reason = format!(
+                    "cex_dust_hold est_value_usd={:.6} min_exec_usd={:.6}",
+                    estimated_swap_value_usd, cex_min_exec_usd
+                );
+                return self
+                    .finalize_with_no_swap_decision(
+                        FinalizationContext::new(wal, "cex_dust_hold", min_net_edge_bps),
+                        receipt,
+                        reason,
+                    )
+                    .await;
+            }
+        }
 
         // 2) Forced mode:
         // Respect operator-selected venue (DEX/CEX), but never execute blindly.
