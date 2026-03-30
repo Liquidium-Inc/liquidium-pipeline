@@ -130,7 +130,7 @@ pub(super) fn draw_executions(f: &mut Frame<'_>, area: Rect, app: &App) {
     };
 
     if let Some(row) = selected {
-        let lines = build_execution_details(row);
+        let lines = build_execution_details(row, app);
         let height = body_layout[1].height.saturating_sub(2) as usize;
         let content_width = body_layout[1].width.saturating_sub(2) as usize;
         let wrapped_lines = estimate_wrapped_lines(&lines, content_width);
@@ -238,7 +238,7 @@ fn estimate_wrapped_lines(lines: &[Line<'_>], content_width: usize) -> usize {
         .sum()
 }
 
-fn build_execution_details(row: &ExecutionRowData) -> Vec<Line<'static>> {
+fn build_execution_details(row: &ExecutionRowData, app: &App) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
 
     push_section_title(&mut lines, "WAL Row");
@@ -257,6 +257,11 @@ fn build_execution_details(row: &ExecutionRowData) -> Vec<Line<'static>> {
 
     if let Some(err) = row.last_error.as_deref() {
         lines.push(Line::from(format!("Last error: {}", err)));
+    }
+    if let Some(outcome) = latest_outcome_for(app, &row.liq_id)
+        && let Some(reason) = outcome.finalizer_result.reason.as_deref()
+    {
+        lines.push(Line::from(format!("Finalizer reason: {}", reason)));
     }
 
     append_receipt_from_meta(&mut lines, &row.meta_json);
