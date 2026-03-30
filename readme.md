@@ -49,6 +49,20 @@ Inspired by Artemis/MEV patterns and designed for permissionless, community-driv
 curl -fsSL https://raw.githubusercontent.com/Liquidium-Inc/liquidium-pipeline/main/install.sh | bash
 ```
 
+By default, this installs the latest released version (latest GitHub release tag).
+
+Install a specific tag:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Liquidium-Inc/liquidium-pipeline/main/install.sh | bash -s -- --tag v1.2.3
+```
+
+Install from a branch (dev/testing):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Liquidium-Inc/liquidium-pipeline/main/install.sh | bash -s -- --branch main
+```
+
 This will:
 
 - Clone/update the repo to `~/.liquidium-pipeline/repo`
@@ -63,11 +77,11 @@ This will:
 - User-only install (no sudo) that keeps everything under `~/.liquidium-pipeline`
 - Releases are stored in `~/.liquidium-pipeline/releases` and symlinked to `~/.local/bin/liquidator`
 - Re-running the script updates the repo + binary, but **does not overwrite** your existing `config.env`
-- You can customize with env/args: `BRANCH`, `BIN_NAME`, `INSTALL_DIR`, `SKIP_RUST`
+- You can customize with env/args: `TAG`, `BRANCH`, `BIN_NAME`, `INSTALL_DIR`, `SKIP_RUST`
 
 ### Upgrade and Compatibility
 
-- Re-running the install command is the recommended upgrade path.
+- Re-running the install command (without `--tag`/`--branch`) upgrades to the latest released tag.
 - `config.env` is preserved across upgrades; new config keys should be added manually when needed.
 - Legacy alias `CEX_BUY_INVERSE_OVESPEND_BPS` remains accepted, while `CEX_BUY_INVERSE_OVERSPEND_BPS` is canonical.
 

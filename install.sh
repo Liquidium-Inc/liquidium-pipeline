@@ -4,7 +4,8 @@ set -euo pipefail
 # ===== Config =====
 GH_USER="Liquidium-Inc"
 GH_REPO="liquidium-pipeline"
-BRANCH="${BRANCH:-main}"
+BRANCH="${BRANCH:-}"
+TAG="${TAG:-}"
 BIN_NAME="${BIN_NAME:-liquidator}"
 INSTALL_DIR="${INSTALL_DIR:-$HOME/.liquidium-pipeline}"
 REPO="https://github.com/${GH_USER}/${GH_REPO}.git"
@@ -19,22 +20,53 @@ usage() {
 Liquidator install script (user-only, no sudo).
 
 Usage (install/update):
-  curl -fsSL https://raw.githubusercontent.com/${GH_USER}/${GH_REPO}/${BRANCH}/install.sh | bash
+  curl -fsSL https://raw.githubusercontent.com/${GH_USER}/${GH_REPO}/main/install.sh | bash
 
 Options:
-  --branch <name>       (default: ${BRANCH})
+  --tag <tag>           Install exact git tag (overrides default latest resolution)
+  --branch <name>       Install explicit branch (dev/testing)
   --bin-name <name>     (default: ${BIN_NAME})
   --install-dir <path>  (default: ${INSTALL_DIR})
 
 Env:
+  TAG=<tag>        Same as --tag
+  BRANCH=<name>    Same as --branch
   SKIP_RUST=true   Skip Rust install
 EOF
   exit 1
 }
 
+resolve_latest_release_tag() {
+  local api_url response compact tag
+  api_url="https://api.github.com/repos/${GH_USER}/${GH_REPO}/releases/latest"
+
+  response="$(curl -fsSL "$api_url" 2>/dev/null || true)"
+  [[ -n "$response" ]] || return 1
+
+  compact="$(printf '%s' "$response" | tr -d '\n')"
+  tag="$(printf '%s' "$compact" | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]\+\)".*/\1/p' | head -n1)"
+  [[ -n "$tag" ]] || return 1
+
+  printf '%s\n' "$tag"
+}
+
+resolve_latest_semver_tag() {
+  local tag
+  tag="$(
+    git ls-remote --tags --refs --sort='-v:refname' "$REPO" 2>/dev/null \
+      | awk '{print $2}' \
+      | sed 's|refs/tags/||' \
+      | grep -E '^(v)?[0-9]+(\.[0-9]+){2}([.-][0-9A-Za-z.-]+)?$' \
+      | head -n1
+  )"
+  [[ -n "$tag" ]] || return 1
+  printf '%s\n' "$tag"
+}
+
 # Parse args
 while [[ $# -gt 0 ]]; do
   case "$1" in
+    --tag) TAG="$2"; shift 2;;
     --branch) BRANCH="$2"; shift 2;;
     --bin-name) BIN_NAME="$2"; shift 2;;
     --install-dir) INSTALL_DIR="$2"; shift 2;;
@@ -42,6 +74,47 @@ while [[ $# -gt 0 ]]; do
     *) echo "Unknown arg: $1"; usage;;
   esac
 done
+
+if [[ -n "$TAG" && -n "$BRANCH" ]]; then
+  echo "Error: --tag and --branch are mutually exclusive. Choose one."
+  exit 1
+fi
+
+REF_MODE=""
+SELECTED_REF=""
+SOURCE_MODE=""
+
+if [[ -n "$TAG" ]]; then
+  REF_MODE="tag"
+  SELECTED_REF="$TAG"
+  SOURCE_MODE="tag"
+elif [[ -n "$BRANCH" ]]; then
+  REF_MODE="branch"
+  SELECTED_REF="$BRANCH"
+  SOURCE_MODE="branch"
+else
+  latest_release_tag="$(resolve_latest_release_tag || true)"
+  if [[ -n "$latest_release_tag" ]]; then
+    REF_MODE="tag"
+    SELECTED_REF="$latest_release_tag"
+    SOURCE_MODE="latest->release-tag"
+  else
+    latest_semver_tag="$(resolve_latest_semver_tag || true)"
+    if [[ -n "$latest_semver_tag" ]]; then
+      REF_MODE="tag"
+      SELECTED_REF="$latest_semver_tag"
+      SOURCE_MODE="latest->semver-tag-fallback"
+      echo "⚠ Could not resolve latest GitHub release tag; falling back to highest semver tag: $SELECTED_REF"
+    else
+      echo "Error: could not resolve a latest version (release tag or semver tag)."
+      echo "Try again later or pass --tag <tag> explicitly."
+      exit 1
+    fi
+  fi
+fi
+
+echo "Install source mode: $SOURCE_MODE"
+echo "Resolved ref: $SELECTED_REF"
 
 # ===== Native toolchain (cc) =====
 if command -v cc >/dev/null 2>&1; then
@@ -115,12 +188,25 @@ command -v cargo >/dev/null || { echo "cargo not found; set SKIP_RUST=false or a
 # ===== Clone or update the repo =====
 if [[ -d "$REPO_DIR/.git" ]]; then
   echo "Updating repository..."
-  git -C "$REPO_DIR" fetch --all -q
-  git -C "$REPO_DIR" checkout "$BRANCH" -q
-  git -C "$REPO_DIR" pull -q --rebase
+  git -C "$REPO_DIR" fetch --all --tags -q
 else
   echo "Cloning repository..."
-  git clone --branch "$BRANCH" --depth 1 "$REPO" "$REPO_DIR"
+  git clone "$REPO" "$REPO_DIR"
+fi
+
+if [[ "$REF_MODE" == "branch" ]]; then
+  echo "Checking out branch: $SELECTED_REF"
+  git -C "$REPO_DIR" checkout "$SELECTED_REF" -q
+  git -C "$REPO_DIR" pull -q --rebase origin "$SELECTED_REF"
+else
+  echo "Checking out tag (detached): $SELECTED_REF"
+  if ! git -C "$REPO_DIR" rev-parse -q --verify "refs/tags/$SELECTED_REF" >/dev/null; then
+    git -C "$REPO_DIR" fetch -q origin "refs/tags/$SELECTED_REF:refs/tags/$SELECTED_REF" || {
+      echo "Error: tag '$SELECTED_REF' not found in repository."
+      exit 1
+    }
+  fi
+  git -C "$REPO_DIR" checkout --detach "tags/$SELECTED_REF" -q
 fi
 
 # ===== User config =====
@@ -163,6 +249,8 @@ hash -r 2>/dev/null || true
 echo ""
 echo "✅ Installed ${BIN_NAME} @ ${DST}"
 echo "➡  Symlinked: $USER_BIN/${BIN_NAME} -> ${DST}"
+echo "📌 Source: ${SOURCE_MODE} (${SELECTED_REF})"
+echo "🔖 Commit: ${GITSHA}"
 echo ""
 echo "Usage:"
 echo "  ${BIN_NAME} run"
