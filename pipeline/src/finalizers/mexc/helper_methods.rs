@@ -9,7 +9,7 @@ struct PendingSliceRequest {
 /// Deposit is considered confirmed once balance delta reaches expected amount minus this epsilon.
 const DEPOSIT_CONFIRMATION_DELTA_EPSILON: f64 = 0.00001;
 /// After this wait window, allow a fallback confirmation from total free balance.
-const DEPOSIT_TOTAL_FREE_FALLBACK_SECS: i64 = 5;
+const DEPOSIT_TOTAL_FREE_FALLBACK_SECS: i64 = 25;
 /// Hard stop to avoid unbounded per-leg slicing loops on pathological books.
 const MAX_SLICE_EXECUTION_ROUNDS: usize = 128;
 /// Basis points per 1.00 ratio value.
