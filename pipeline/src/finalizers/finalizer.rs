@@ -10,6 +10,8 @@ pub struct FinalizerResult {
     pub finalized: bool,
     #[serde(default)]
     pub swapper: Option<String>,
+    #[serde(default)]
+    pub reason: Option<String>,
 }
 
 impl FinalizerResult {
@@ -18,6 +20,7 @@ impl FinalizerResult {
             swap_result: None,
             finalized: false,
             swapper: None,
+            reason: None,
         }
     }
 }

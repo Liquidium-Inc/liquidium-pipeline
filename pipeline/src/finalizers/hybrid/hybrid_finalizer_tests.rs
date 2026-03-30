@@ -366,6 +366,7 @@ async fn forced_dex_non_positive_preview_routes_to_recovery_and_uses_recovery_ac
     let expected_recovery = recovery_account;
 
     let mut config = MockConfigTrait::new();
+    config.expect_get_cex_min_exec_usd().return_const(1.1f64);
     config.expect_get_swapper_mode().return_const(SwapperMode::Dex);
     config.expect_get_cex_min_net_edge_bps().return_const(150u32);
     config
@@ -416,6 +417,7 @@ async fn forced_cex_non_positive_preview_routes_to_recovery_and_uses_recovery_ac
     let expected_recovery = recovery_account;
 
     let mut config = MockConfigTrait::new();
+    config.expect_get_cex_min_exec_usd().return_const(1.1f64);
     config.expect_get_swapper_mode().return_const(SwapperMode::Cex);
     config.expect_get_cex_min_net_edge_bps().return_const(150u32);
     config.expect_get_cex_route_fee_bps().return_const(0u32);
@@ -460,6 +462,7 @@ async fn forced_cex_non_positive_preview_routes_to_recovery_and_uses_recovery_ac
 #[tokio::test]
 async fn hybrid_recovery_non_icp_does_not_transfer() {
     let mut config = MockConfigTrait::new();
+    config.expect_get_cex_min_exec_usd().return_const(1.1f64);
     config.expect_get_swapper_mode().return_const(SwapperMode::Dex);
     config.expect_get_cex_min_net_edge_bps().return_const(150u32);
     config.expect_get_recovery_account().times(0);
@@ -504,6 +507,7 @@ async fn forced_dex_positive_preview_executes_dex() {
     let swap_calls = Arc::new(AtomicUsize::new(0));
 
     let mut config = MockConfigTrait::new();
+    config.expect_get_cex_min_exec_usd().return_const(1.1f64);
     config.expect_get_swapper_mode().return_const(SwapperMode::Dex);
     config.expect_get_cex_min_net_edge_bps().return_const(150u32);
     config.expect_get_recovery_account().times(0);
@@ -541,6 +545,7 @@ async fn forced_dex_positive_preview_executes_dex() {
 #[tokio::test]
 async fn hybrid_both_preview_errors_returns_error() {
     let mut config = MockConfigTrait::new();
+    config.expect_get_cex_min_exec_usd().return_const(1.1f64);
     config.expect_get_swapper_mode().return_const(SwapperMode::Hybrid);
     config.expect_get_cex_force_over_usd_threshold().return_const(0.0);
     config.expect_get_cex_min_net_edge_bps().return_const(100u32);
@@ -583,6 +588,7 @@ async fn hybrid_recovery_transfer_failure_returns_error() {
     };
 
     let mut config = MockConfigTrait::new();
+    config.expect_get_cex_min_exec_usd().return_const(1.1f64);
     config.expect_get_swapper_mode().return_const(SwapperMode::Dex);
     config.expect_get_cex_min_net_edge_bps().return_const(150u32);
     config
@@ -623,6 +629,7 @@ async fn hybrid_recovery_transfer_failure_returns_error() {
 #[tokio::test]
 async fn hybrid_recovery_zero_transfer_amount_succeeds_without_transfer() {
     let mut config = MockConfigTrait::new();
+    config.expect_get_cex_min_exec_usd().return_const(1.1f64);
     config.expect_get_swapper_mode().return_const(SwapperMode::Dex);
     config.expect_get_cex_min_net_edge_bps().return_const(150u32);
     config.expect_get_recovery_account().times(0);
@@ -660,6 +667,7 @@ async fn hybrid_recovery_zero_transfer_amount_succeeds_without_transfer() {
 #[tokio::test]
 async fn forced_preview_error_persists_snapshot_and_errors() {
     let mut config = MockConfigTrait::new();
+    config.expect_get_cex_min_exec_usd().return_const(1.1f64);
     config.expect_get_swapper_mode().return_const(SwapperMode::Dex);
     config.expect_get_cex_min_net_edge_bps().return_const(150u32);
     config.expect_get_recovery_account().times(0);
@@ -700,6 +708,7 @@ async fn forced_preview_error_persists_snapshot_and_errors() {
 #[tokio::test]
 async fn forced_preview_none_persists_snapshot_and_errors() {
     let mut config = MockConfigTrait::new();
+    config.expect_get_cex_min_exec_usd().return_const(1.1f64);
     config.expect_get_swapper_mode().return_const(SwapperMode::Cex);
     config.expect_get_cex_min_net_edge_bps().return_const(150u32);
     config.expect_get_recovery_account().times(0);
@@ -742,8 +751,51 @@ async fn forced_preview_none_persists_snapshot_and_errors() {
 }
 
 #[tokio::test]
+async fn forced_cex_under_min_notional_short_circuits_to_no_swap() {
+    let mut config = MockConfigTrait::new();
+    config.expect_get_cex_min_exec_usd().return_const(1.1f64);
+    config.expect_get_swapper_mode().return_const(SwapperMode::Cex);
+    config.expect_get_cex_min_net_edge_bps().return_const(150u32);
+    config.expect_get_recovery_account().times(0);
+
+    let mut dex_swapper = MockSwapInterface::new();
+    dex_swapper.expect_quote().times(0);
+    dex_swapper.expect_execute().times(0);
+
+    let mut transfers = MockTransferActions::new();
+    transfers.expect_transfer().times(0);
+    transfers.expect_approve().times(0);
+
+    let receipt = make_receipt(0.9);
+    let wal = TestWal::with_receipt(&receipt);
+    let finalizer = HybridFinalizer {
+        config: Arc::new(config),
+        trader_transfers: Arc::new(transfers),
+        dex_swapper: Arc::new(dex_swapper),
+        dex_finalizer: Arc::new(NoopDexFinalizer),
+        cex_finalizer: Some(Arc::new(StubCexFinalizer {
+            preview: Err("preview should not be called".to_string()),
+        })),
+    };
+
+    let res = finalizer
+        .finalize(&wal, receipt)
+        .await
+        .expect("under-min forced cex should finalize as no-swap");
+    assert!(res.finalized);
+    assert_eq!(res.swapper.as_deref(), Some("none"));
+    assert!(res.reason.as_deref().unwrap_or("").contains("cex_dust_hold"));
+
+    let snapshot = wal_snapshot(&wal);
+    assert_eq!(snapshot.mode, "cex_dust_hold");
+    assert_eq!(snapshot.chosen, "none");
+    assert!(snapshot.reason.contains("cex_dust_hold"));
+}
+
+#[tokio::test]
 async fn forced_cex_positive_preview_executes_cex() {
     let mut config = MockConfigTrait::new();
+    config.expect_get_cex_min_exec_usd().return_const(1.1f64);
     config.expect_get_swapper_mode().return_const(SwapperMode::Cex);
     config.expect_get_cex_min_net_edge_bps().return_const(150u32);
     config.expect_get_cex_route_fee_bps().return_const(0u32);
@@ -785,6 +837,7 @@ async fn hybrid_both_non_positive_routes_to_recovery_and_uses_recovery_account()
     let expected_recovery = recovery_account;
 
     let mut config = MockConfigTrait::new();
+    config.expect_get_cex_min_exec_usd().return_const(1.1f64);
     config.expect_get_swapper_mode().return_const(SwapperMode::Hybrid);
     config.expect_get_cex_force_over_usd_threshold().return_const(0.0);
     config.expect_get_cex_min_net_edge_bps().return_const(150u32);
@@ -834,6 +887,7 @@ async fn hybrid_both_non_positive_routes_to_recovery_and_uses_recovery_account()
 #[tokio::test]
 async fn hybrid_positive_but_below_min_returns_no_viable_route() {
     let mut config = MockConfigTrait::new();
+    config.expect_get_cex_min_exec_usd().return_const(1.1f64);
     config.expect_get_swapper_mode().return_const(SwapperMode::Hybrid);
     config.expect_get_cex_force_over_usd_threshold().return_const(0.0);
     config.expect_get_cex_min_net_edge_bps().return_const(1_000u32);
@@ -874,6 +928,7 @@ async fn hybrid_positive_but_below_min_returns_no_viable_route() {
 #[tokio::test]
 async fn hybrid_one_preview_error_uses_other_preview() {
     let mut config = MockConfigTrait::new();
+    config.expect_get_cex_min_exec_usd().return_const(1.1f64);
     config.expect_get_swapper_mode().return_const(SwapperMode::Hybrid);
     config.expect_get_cex_force_over_usd_threshold().return_const(0.0);
     config.expect_get_cex_min_net_edge_bps().return_const(100u32);
@@ -918,6 +973,7 @@ async fn hybrid_recovery_persists_snapshot() {
     };
 
     let mut config = MockConfigTrait::new();
+    config.expect_get_cex_min_exec_usd().return_const(1.1f64);
     config.expect_get_swapper_mode().return_const(SwapperMode::Hybrid);
     config.expect_get_cex_force_over_usd_threshold().return_const(0.0);
     config.expect_get_cex_min_net_edge_bps().return_const(150u32);
@@ -970,6 +1026,7 @@ async fn hybrid_recovery_persists_snapshot() {
 #[tokio::test]
 async fn hybrid_no_viable_persists_snapshot() {
     let mut config = MockConfigTrait::new();
+    config.expect_get_cex_min_exec_usd().return_const(1.1f64);
     config.expect_get_swapper_mode().return_const(SwapperMode::Hybrid);
     config.expect_get_cex_force_over_usd_threshold().return_const(0.0);
     config.expect_get_cex_min_net_edge_bps().return_const(1_000u32);
@@ -1020,6 +1077,7 @@ async fn decision_snapshot_preserves_existing_meta_bytes() {
     };
 
     let mut config = MockConfigTrait::new();
+    config.expect_get_cex_min_exec_usd().return_const(1.1f64);
     config.expect_get_swapper_mode().return_const(SwapperMode::Dex);
     config.expect_get_cex_min_net_edge_bps().return_const(150u32);
     config

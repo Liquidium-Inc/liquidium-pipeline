@@ -20,6 +20,12 @@ fn expand_tilde(p: &str) -> std::path::PathBuf {
     std::path::PathBuf::from(p)
 }
 
+/// Runtime swapper mode used by strategy/finalization routing.
+///
+/// `Dex` and `Hybrid` are intentionally retained for backward compatibility with
+/// historical WAL/meta values and for potential future re-enablement.
+/// TODO(PIPE-154, target 2026-06): remove legacy variants once migration cleanup is complete.
+#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SwapperMode {
     Dex,
@@ -66,9 +72,8 @@ pub struct Config {
     pub cex_delay_buffer_bps: u32,
     /// Route fee estimate in bps subtracted from projected edge.
     pub cex_route_fee_bps: u32,
-    /// In hybrid mode, skip route candidate comparison and force CEX when
-    /// estimated swap notional is above this USD threshold.
-    /// Set to `0` to disable force-over-threshold behavior.
+    /// Reserved for hybrid mode force-over-threshold behavior.
+    /// Hybrid mode is currently disabled.
     pub cex_force_over_usd_threshold: f64,
     pub swapper: SwapperMode,
     pub cex_credentials: HashMap<String, (String, String)>,
@@ -266,17 +271,7 @@ impl Config {
         let bad_debt_collateral_slippage_bps = parse_bad_debt_collateral_slippage_bps_from_env();
         let cex_tunables = parse_cex_tunables_from_env();
 
-        let swapper_raw = env::var("SWAPPER").unwrap_or_else(|_| "hybrid".to_string());
-        let swapper = match swapper_raw.trim().to_lowercase().as_str() {
-            "" => SwapperMode::Hybrid,
-            "dex" => SwapperMode::Dex,
-            "cex" => SwapperMode::Cex,
-            "hybrid" => SwapperMode::Hybrid,
-            other => {
-                debug!("Unknown SWAPPER value '{}', defaulting to hybrid", other);
-                SwapperMode::Hybrid
-            }
-        };
+        let swapper = parse_swapper_mode_from_env()?;
 
         debug!("Loading cex credentials...");
         let cex_credentials = load_cex_credentials();
@@ -375,7 +370,7 @@ struct CexTunables {
     force_over_usd_threshold: f64,
 }
 
-const DEFAULT_CEX_MIN_EXEC_USD: f64 = 2.0;
+const DEFAULT_CEX_MIN_EXEC_USD: f64 = 1.1;
 const DEFAULT_CEX_SLICE_TARGET_RATIO: f64 = 0.7;
 const DEFAULT_CEX_BUY_TRUNCATION_TRIGGER_RATIO: f64 = 0.25;
 const DEFAULT_CEX_BUY_INVERSE_OVERSPEND_BPS: u32 = 10;
@@ -401,6 +396,18 @@ fn parse_bad_debt_collateral_slippage_bps_from_env() -> u32 {
         .and_then(|v| v.parse::<u32>().ok())
         .map(|v| v.min(MAX_BPS))
         .unwrap_or(DEFAULT_BAD_DEBT_COLLATERAL_SLIPPAGE_BPS)
+}
+
+fn parse_swapper_mode_from_env() -> Result<SwapperMode, String> {
+    let swapper_raw = env::var("SWAPPER").unwrap_or_else(|_| "cex".to_string());
+    match swapper_raw.trim().to_lowercase().as_str() {
+        "" => Ok(SwapperMode::Cex),
+        "cex" => Ok(SwapperMode::Cex),
+        other => Err(format!(
+            "SWAPPER='{}' is unsupported; only SWAPPER=cex is currently supported",
+            other
+        )),
+    }
 }
 
 fn parse_cex_tunables_from_env() -> CexTunables {
@@ -525,7 +532,7 @@ mod tests {
         assert_eq!(
             parsed,
             CexTunables {
-                min_exec_usd: 2.0,
+                min_exec_usd: 1.1,
                 slice_target_ratio: 0.7,
                 buy_truncation_trigger_ratio: 0.25,
                 buy_inverse_overspend_bps: 10,
@@ -598,7 +605,7 @@ mod tests {
         }
 
         let parsed = parse_cex_tunables_from_env();
-        assert_eq!(parsed.min_exec_usd, 2.0);
+        assert_eq!(parsed.min_exec_usd, 1.1);
         assert_eq!(parsed.slice_target_ratio, 1.0);
         assert_eq!(parsed.buy_truncation_trigger_ratio, 0.0);
         assert_eq!(parsed.buy_inverse_overspend_bps, 100);
@@ -665,6 +672,45 @@ mod tests {
         let parsed = parse_cex_tunables_from_env();
         assert_eq!(parsed.retry_base_secs, 300);
         assert_eq!(parsed.retry_max_secs, 300);
+    }
+
+    #[test]
+    fn parse_swapper_mode_defaults_to_cex_when_unset() {
+        let _guard = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        unsafe {
+            env::remove_var("SWAPPER");
+        }
+        assert_eq!(parse_swapper_mode_from_env().unwrap(), SwapperMode::Cex);
+    }
+
+    #[test]
+    fn parse_swapper_mode_rejects_unknown() {
+        let _guard = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        unsafe {
+            env::set_var("SWAPPER", "unknown-value");
+        }
+        let err = parse_swapper_mode_from_env().expect_err("unknown swapper mode should be rejected");
+        assert!(err.contains("only SWAPPER=cex"));
+    }
+
+    #[test]
+    fn parse_swapper_mode_rejects_dex() {
+        let _guard = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        unsafe {
+            env::set_var("SWAPPER", "dex");
+        }
+        let err = parse_swapper_mode_from_env().expect_err("dex mode should be rejected");
+        assert!(err.contains("only SWAPPER=cex"));
+    }
+
+    #[test]
+    fn parse_swapper_mode_rejects_hybrid() {
+        let _guard = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        unsafe {
+            env::set_var("SWAPPER", "hybrid");
+        }
+        let err = parse_swapper_mode_from_env().expect_err("hybrid mode should be rejected");
+        assert!(err.contains("only SWAPPER=cex"));
     }
 
     #[test]

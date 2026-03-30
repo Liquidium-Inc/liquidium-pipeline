@@ -263,6 +263,7 @@ where
                         swap_result: None,
                         finalized: true,
                         swapper: Some("none".to_string()),
+                        reason: None,
                     },
                     receipt,
                 ));
@@ -331,6 +332,7 @@ where
                                 swap_result: None,
                                 finalized: true,
                                 swapper: None,
+                                reason: Some(err_msg.clone()),
                             },
                             failed_receipt,
                         ));
@@ -428,6 +430,7 @@ mod tests {
                 swap_result: None,
                 finalized: true,
                 swapper: Some("noop".to_string()),
+                reason: None,
             })
         }
     }
