@@ -128,6 +128,7 @@ where
             return false;
         }
 
+        // Legacy Dex/Hybrid branches are intentionally retained; see `config::SwapperMode` docs.
         match self.config.get_swapper_mode() {
             crate::config::SwapperMode::Dex => false,
             crate::config::SwapperMode::Cex => true,

@@ -20,6 +20,11 @@ fn expand_tilde(p: &str) -> std::path::PathBuf {
     std::path::PathBuf::from(p)
 }
 
+/// Runtime swapper mode used by strategy/finalization routing.
+///
+/// `Dex` and `Hybrid` are intentionally retained for backward compatibility with
+/// historical WAL/meta values and for potential future re-enablement.
+/// TODO(PIPE-154, target 2026-06): remove legacy variants once migration cleanup is complete.
 #[allow(dead_code)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SwapperMode {

@@ -87,6 +87,7 @@ where
 {
     /// Return forced venue in non-hybrid modes.
     fn forced_mode_venue(&self) -> Option<RouteVenue> {
+        // Legacy Dex/Hybrid branches are intentionally retained; see `config::SwapperMode` docs.
         match self.config.get_swapper_mode() {
             SwapperMode::Dex => Some(RouteVenue::Dex),
             SwapperMode::Cex => Some(RouteVenue::Cex),

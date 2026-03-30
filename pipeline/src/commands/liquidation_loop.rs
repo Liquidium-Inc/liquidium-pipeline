@@ -12,7 +12,7 @@ use crate::{
         bootstrap_control_plane, console_ui_enabled, debt_asset_principals, debt_assets_as_text,
         ensure_runtime_file_permissions, print_banner, run_daemon_cycle_loop,
     },
-    config::{Config, ConfigTrait, SwapperMode},
+    config::{Config, ConfigTrait},
     context::{PipelineContext, init_context},
     executors::basic::basic_executor::BasicExecutor,
     finalizers::{
@@ -71,13 +71,7 @@ async fn init(
         .map_err(|e| format!("executor token init failed: {e}"))?;
     let executor = Arc::new(executor);
 
-    if !matches!(config.swapper, SwapperMode::Cex) {
-        if let Err(err) = ctx.swap_router.init().await {
-            warn!("Swap router init failed: {}", err);
-        }
-    } else {
-        info!("Skipping swap router init in CEX mode");
-    }
+    info!("Skipping swap router init in CEX mode");
 
     // Base DEX finalizer (Kong swapper)
     let kong_finalizer = Arc::new(KongSwapFinalizer::new(ctx.swap_router.clone()));
@@ -85,7 +79,7 @@ async fn init(
     let mexc_finalizer = match ctx.config.get_cex_credentials("mexc") {
         Ok((api_key, secret)) => {
             let mexc_client = Arc::new(MexcClient::new(&api_key, &secret));
-            let mexc_finalizer = Arc::new(MexcFinalizer::new_with_tunables(
+            Arc::new(MexcFinalizer::new_with_tunables(
                 mexc_client,
                 ctx.trader_transfers.actions(),
                 config.liquidator_principal,
@@ -96,15 +90,9 @@ async fn init(
                 config.cex_buy_inverse_overspend_bps,
                 config.cex_buy_inverse_max_retries,
                 config.cex_buy_inverse_enabled,
-            ));
-            Some(mexc_finalizer)
+            ))
         }
-        Err(err) => {
-            if config.swapper != SwapperMode::Dex {
-                return Err(format!("Cex credentials not found: {err}"));
-            }
-            None
-        }
+        Err(err) => return Err(format!("Cex credentials not found: {err}")),
     };
 
     // Hybrid finalizer composes DEX and CEX finalizers.
@@ -114,7 +102,7 @@ async fn init(
         trader_transfers: ctx.trader_transfers.actions(),
         dex_swapper: ctx.swap_router.clone(),
         dex_finalizer: kong_finalizer.clone(),
-        cex_finalizer: mexc_finalizer.clone().map(|f| f as Arc<dyn CexFinalizerLogic>),
+        cex_finalizer: Some(mexc_finalizer.clone() as Arc<dyn CexFinalizerLogic>),
     });
 
     // Profit calculator for expected/realized PnL

@@ -332,7 +332,7 @@ where
                                 swap_result: None,
                                 finalized: true,
                                 swapper: None,
-                                reason: None,
+                                reason: Some(err_msg.clone()),
                             },
                             failed_receipt,
                         ));
