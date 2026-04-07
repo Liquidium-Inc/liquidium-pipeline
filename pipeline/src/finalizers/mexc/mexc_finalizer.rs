@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -23,7 +23,8 @@ use super::mexc_utils::{
 };
 use crate::{
     finalizers::cex_finalizer::{
-        CexDepositState, CexFinalizerLogic, CexRoutePreview, CexState, CexStep, CexTradeSlice, CexTradeState,
+        CexDepositState, CexFinalizerLogic, CexRouteLeg, CexRoutePreview, CexState, CexStep, CexTradeSlice,
+        CexTradeState,
         CexWithdrawState,
     },
     stages::executor::ExecutionReceipt,
@@ -58,6 +59,10 @@ where
     pub cex_buy_inverse_max_retries: u32,
     /// Enables inverse buy fallback after truncation.
     pub cex_buy_inverse_enabled: bool,
+    /// Configured market universe used for route graph search.
+    pub cex_mexc_available_pairs: Vec<String>,
+    /// Maximum intermediate hops allowed in graph-based route discovery.
+    pub cex_mexc_max_hops: usize,
     /// `approve_bumps` is only touched in short synchronous sections.
     approve_bumps: Mutex<HashMap<String, u8>>,
     /// `market_locks` is acquired/held in async trade flow, so it uses Tokio's async mutex.
@@ -82,11 +87,51 @@ const DEFAULT_BUY_INVERSE_OVERSPEND_BPS: u32 = 10;
 const DEFAULT_BUY_INVERSE_MAX_RETRIES: u32 = 1;
 #[allow(dead_code)]
 const DEFAULT_BUY_INVERSE_ENABLED: bool = true;
+const DEFAULT_MEXC_MAX_HOPS: usize = 2;
+const MAX_MEXC_MAX_HOPS: usize = 4;
 
 impl<C> MexcFinalizer<C>
 where
     C: CexBackend,
 {
+    fn normalize_market_pair(raw: &str) -> Option<String> {
+        let normalized = raw
+            .trim()
+            .replace(['/', '-'], "_")
+            .to_ascii_uppercase();
+        if normalized.is_empty() {
+            return None;
+        }
+
+        let mut parts = normalized.split('_').filter(|part| !part.is_empty());
+        let base = parts.next()?;
+        let quote = parts.next()?;
+        if parts.next().is_some() {
+            return None;
+        }
+        Some(format!("{}_{}", base, quote))
+    }
+
+    fn normalize_market_pairs(markets: Vec<String>) -> Vec<String> {
+        let mut seen = HashSet::new();
+        let mut out = Vec::new();
+        for market in markets {
+            let Some(normalized) = Self::normalize_market_pair(&market) else {
+                continue;
+            };
+            if seen.insert(normalized.clone()) {
+                out.push(normalized);
+            }
+        }
+        out
+    }
+
+    pub fn with_route_config(mut self, available_pairs: Vec<String>, max_hops: usize) -> Self {
+        self.cex_mexc_available_pairs = Self::normalize_market_pairs(available_pairs);
+        self.cex_mexc_max_hops = max_hops.min(MAX_MEXC_MAX_HOPS);
+        self
+    }
+
     // used in tests
     #[allow(unused)]
     pub fn new(
@@ -135,6 +180,8 @@ where
             cex_buy_inverse_overspend_bps,
             cex_buy_inverse_max_retries,
             cex_buy_inverse_enabled,
+            cex_mexc_available_pairs: vec![],
+            cex_mexc_max_hops: DEFAULT_MEXC_MAX_HOPS,
             approve_bumps: Mutex::new(HashMap::new()),
             market_locks: TokioMutex::new(HashMap::new()),
         }
@@ -183,6 +230,7 @@ where
             trade: CexTradeState {
                 trade_leg_index: None,
                 trade_leg_total: None,
+                trade_resolved_legs: Vec::new(),
                 trade_last_market: None,
                 trade_last_side: None,
                 trade_last_amount_in: None,
@@ -382,7 +430,7 @@ where
         );
 
         // 2) Resolve the full conversion route (single leg or multi-hop).
-        let legs = self.resolve_trade_legs(state).await?;
+        let legs = self.resolve_or_load_trade_legs(state).await?;
 
         // 3) Persist total route length for telemetry / resumability.
         state.trade.trade_leg_total = Some(legs.len() as u32);
@@ -651,7 +699,11 @@ where
 
     async fn preview_route(&self, receipt: &ExecutionReceipt) -> Result<CexRoutePreview, String> {
         let state = self.prepare("preview", receipt).await?;
-        let legs = self.resolve_trade_legs(&state).await?;
+        let legs = self.resolve_trade_legs_for_symbols(
+            &state.deposit.deposit_asset.symbol(),
+            &state.withdraw.withdraw_asset.symbol(),
+        )
+        .await?;
         let mut amount_in = state.size_in.to_f64();
         if amount_in <= LIQUIDITY_EPS {
             return Ok(CexRoutePreview {

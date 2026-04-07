@@ -398,6 +398,8 @@ mod tests {
             cex_delay_buffer_bps: 15,
             cex_route_fee_bps: 12,
             cex_force_over_usd_threshold: 0.0,
+            cex_mexc_available_pairs: vec![],
+            cex_mexc_max_hops: 2,
             swapper: crate::config::SwapperMode::Hybrid,
             cex_credentials: HashMap::new(),
             opportunity_account_filter: vec![],

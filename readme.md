@@ -178,6 +178,10 @@ CEX_MIN_NET_EDGE_BPS=150
 CEX_DELAY_BUFFER_BPS=75
 # Estimated route fee haircut applied to projected edge (bps)
 CEX_ROUTE_FEE_BPS=25
+# Optional CSV market universe for MEXC hop discovery (`BASE_QUOTE` format)
+CEX_MEXC_AVAILABLE_PAIRS=CKBTC_BTC,BTC_USDC,USDC_USDT,CKUSDT_USDT
+# Max intermediate hops when searching configured pairs (0 disables hop fallback)
+CEX_MEXC_MAX_HOPS=2
 # Reserved (currently unused while only SWAPPER=cex is supported)
 CEX_FORCE_OVER_USD_THRESHOLD=12.5
 ```
@@ -197,6 +201,8 @@ Quick reference:
 | `CEX_MIN_NET_EDGE_BPS` | Minimum projected edge needed before choosing CEX path. |
 | `CEX_DELAY_BUFFER_BPS` | Extra haircut for execution-latency/price-move risk. |
 | `CEX_ROUTE_FEE_BPS` | Fee haircut applied during route edge estimation. |
+| `CEX_MEXC_AVAILABLE_PAIRS` | Configured market universe used for direct/hop route discovery. |
+| `CEX_MEXC_MAX_HOPS` | Max intermediate hops allowed in configured-pair route search. |
 | `CEX_FORCE_OVER_USD_THRESHOLD` | In hybrid mode, force CEX above this USD notional (`0` disables). |
 
 Note: `CEX_BUY_INVERSE_OVESPEND_BPS` is still accepted as a legacy alias, but `CEX_BUY_INVERSE_OVERSPEND_BPS` is the canonical key.
@@ -244,6 +250,16 @@ How config controls this risk:
 - `CEX_SLICE_TARGET_RATIO`: softer sizing target below hard limit (execution smoothness).
 - `CEX_MIN_EXEC_USD`: prevents low-notional micro-fills that usually have poor quality.
 - `CEX_BUY_*`: controls adaptive buy fallback when quote-mode truncation leaves meaningful residual.
+
+#### Route Resolution Order
+
+For each `deposit_symbol -> withdraw_symbol`, route selection is deterministic:
+
+1. Legacy special override (`CKBTC <-> CKUSDT`) when applicable.
+2. Direct market probe (`A_B` sell, then `B_A` buy fallback).
+3. Configured hop search over `CEX_MEXC_AVAILABLE_PAIRS` up to `CEX_MEXC_MAX_HOPS`.
+
+Resolved legs are persisted in CEX state and reused across retries.
 
 #### Execution Algorithm (Per Trade Leg)
 

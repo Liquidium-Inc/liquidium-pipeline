@@ -75,6 +75,12 @@ pub struct Config {
     /// Reserved for hybrid mode force-over-threshold behavior.
     /// Hybrid mode is currently disabled.
     pub cex_force_over_usd_threshold: f64,
+    /// Configured MEXC market universe for hop-based route discovery.
+    /// Markets are normalized as `BASE_QUOTE`.
+    pub cex_mexc_available_pairs: Vec<String>,
+    /// Maximum intermediate hops allowed for MEXC route discovery.
+    /// Example: `2` allows up to 3 legs total.
+    pub cex_mexc_max_hops: u8,
     pub swapper: SwapperMode,
     pub cex_credentials: HashMap<String, (String, String)>,
     pub opportunity_account_filter: Vec<Principal>,
@@ -101,6 +107,8 @@ pub trait ConfigTrait: Send + Sync {
     fn get_cex_delay_buffer_bps(&self) -> u32;
     fn get_cex_route_fee_bps(&self) -> u32;
     fn get_cex_force_over_usd_threshold(&self) -> f64;
+    fn get_cex_mexc_available_pairs(&self) -> Vec<String>;
+    fn get_cex_mexc_max_hops(&self) -> u8;
     #[allow(dead_code)]
     fn get_lending_canister(&self) -> Principal;
     #[allow(dead_code)]
@@ -193,6 +201,14 @@ impl ConfigTrait for Config {
         self.cex_force_over_usd_threshold
     }
 
+    fn get_cex_mexc_available_pairs(&self) -> Vec<String> {
+        self.cex_mexc_available_pairs.clone()
+    }
+
+    fn get_cex_mexc_max_hops(&self) -> u8 {
+        self.cex_mexc_max_hops
+    }
+
     fn get_swapper_mode(&self) -> SwapperMode {
         self.swapper
     }
@@ -270,6 +286,8 @@ impl Config {
 
         let bad_debt_collateral_slippage_bps = parse_bad_debt_collateral_slippage_bps_from_env();
         let cex_tunables = parse_cex_tunables_from_env();
+        let cex_mexc_available_pairs = parse_cex_mexc_available_pairs_from_env();
+        let cex_mexc_max_hops = parse_cex_mexc_max_hops_from_env();
 
         let swapper = parse_swapper_mode_from_env()?;
 
@@ -323,6 +341,8 @@ impl Config {
             cex_delay_buffer_bps: cex_tunables.delay_buffer_bps,
             cex_route_fee_bps: cex_tunables.route_fee_bps,
             cex_force_over_usd_threshold: cex_tunables.force_over_usd_threshold,
+            cex_mexc_available_pairs,
+            cex_mexc_max_hops,
             swapper,
             cex_credentials,
             opportunity_account_filter,
@@ -384,6 +404,8 @@ const DEFAULT_CEX_MIN_NET_EDGE_BPS: u32 = 150;
 const DEFAULT_CEX_DELAY_BUFFER_BPS: u32 = 75;
 const DEFAULT_CEX_ROUTE_FEE_BPS: u32 = 25;
 const DEFAULT_CEX_FORCE_OVER_USD_THRESHOLD: f64 = 12.5;
+const DEFAULT_CEX_MEXC_MAX_HOPS: u8 = 2;
+const MAX_CEX_MEXC_MAX_HOPS: u8 = 4;
 const DEFAULT_BAD_DEBT_COLLATERAL_SLIPPAGE_BPS: u32 = 500;
 const MAX_BPS: u32 = 10_000;
 const MIN_RATIO: f64 = 0.0;
@@ -408,6 +430,50 @@ fn parse_swapper_mode_from_env() -> Result<SwapperMode, String> {
             other
         )),
     }
+}
+
+fn normalize_cex_market_pair(raw: &str) -> Option<String> {
+    let normalized = raw
+        .trim()
+        .replace(['/', '-'], "_")
+        .to_ascii_uppercase();
+    if normalized.is_empty() {
+        return None;
+    }
+
+    let mut parts = normalized.split('_').filter(|part| !part.is_empty());
+    let base = parts.next()?;
+    let quote = parts.next()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    Some(format!("{}_{}", base, quote))
+}
+
+fn parse_cex_mexc_available_pairs_from_env() -> Vec<String> {
+    let raw = match env::var("CEX_MEXC_AVAILABLE_PAIRS") {
+        Ok(v) => v,
+        Err(_) => return vec![],
+    };
+
+    let mut out = Vec::new();
+    for token in raw.split(',') {
+        let Some(market) = normalize_cex_market_pair(token) else {
+            continue;
+        };
+        if !out.iter().any(|existing| existing == &market) {
+            out.push(market);
+        }
+    }
+    out
+}
+
+fn parse_cex_mexc_max_hops_from_env() -> u8 {
+    env::var("CEX_MEXC_MAX_HOPS")
+        .ok()
+        .and_then(|v| v.parse::<u8>().ok())
+        .map(|v| v.min(MAX_CEX_MEXC_MAX_HOPS))
+        .unwrap_or(DEFAULT_CEX_MEXC_MAX_HOPS)
 }
 
 fn parse_cex_tunables_from_env() -> CexTunables {
@@ -522,6 +588,8 @@ mod tests {
             "CEX_DELAY_BUFFER_BPS",
             "CEX_ROUTE_FEE_BPS",
             "CEX_FORCE_OVER_USD_THRESHOLD",
+            "CEX_MEXC_AVAILABLE_PAIRS",
+            "CEX_MEXC_MAX_HOPS",
             "BAD_DEBT_COLLATERAL_SLIPPAGE_BPS",
         ];
         for key in vars {
@@ -672,6 +740,56 @@ mod tests {
         let parsed = parse_cex_tunables_from_env();
         assert_eq!(parsed.retry_base_secs, 300);
         assert_eq!(parsed.retry_max_secs, 300);
+    }
+
+    #[test]
+    fn parse_cex_mexc_available_pairs_normalizes_and_dedupes() {
+        let _guard = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        unsafe {
+            env::set_var(
+                "CEX_MEXC_AVAILABLE_PAIRS",
+                "ckbtc/btc, BTC-USDC, invalid, USDC_USDT, CKBTC_BTC, , USDC__USDT",
+            );
+        }
+
+        let parsed = parse_cex_mexc_available_pairs_from_env();
+        assert_eq!(
+            parsed,
+            vec![
+                "CKBTC_BTC".to_string(),
+                "BTC_USDC".to_string(),
+                "USDC_USDT".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_cex_mexc_available_pairs_defaults_to_empty() {
+        let _guard = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        unsafe {
+            env::remove_var("CEX_MEXC_AVAILABLE_PAIRS");
+        }
+
+        assert!(parse_cex_mexc_available_pairs_from_env().is_empty());
+    }
+
+    #[test]
+    fn parse_cex_mexc_max_hops_uses_default_and_clamps() {
+        let _guard = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        unsafe {
+            env::remove_var("CEX_MEXC_MAX_HOPS");
+        }
+        assert_eq!(parse_cex_mexc_max_hops_from_env(), DEFAULT_CEX_MEXC_MAX_HOPS);
+
+        unsafe {
+            env::set_var("CEX_MEXC_MAX_HOPS", "9");
+        }
+        assert_eq!(parse_cex_mexc_max_hops_from_env(), MAX_CEX_MEXC_MAX_HOPS);
+
+        unsafe {
+            env::set_var("CEX_MEXC_MAX_HOPS", "1");
+        }
+        assert_eq!(parse_cex_mexc_max_hops_from_env(), 1);
     }
 
     #[test]
