@@ -1319,13 +1319,8 @@ mod tests {
     // Buy fill mapping should keep quote as input-consumed and apply fee haircut to base output.
     #[test]
     fn map_fill_report_buy_uses_quote_as_input_and_base_as_output() {
-        let report = MexcClient::map_fill_report(
-            "buy",
-            Decimal::new(185, 6),
-            Decimal::new(1280, 2),
-            MEXC_SPOT_FEE_BPS,
-        )
-        .expect("map should work");
+        let report = MexcClient::map_fill_report("buy", Decimal::new(185, 6), Decimal::new(1280, 2), MEXC_SPOT_FEE_BPS)
+            .expect("map should work");
         let expected_output = MexcClient::apply_output_fee(Decimal::new(185, 6), MEXC_SPOT_FEE_BPS)
             .to_f64()
             .expect("convert expected buy output");
@@ -1336,13 +1331,9 @@ mod tests {
     // Sell fill mapping should keep base as input-consumed and apply fee haircut to quote output.
     #[test]
     fn map_fill_report_sell_uses_base_as_input_and_quote_as_output() {
-        let report = MexcClient::map_fill_report(
-            "sell",
-            Decimal::new(185, 6),
-            Decimal::new(1280, 2),
-            MEXC_SPOT_FEE_BPS,
-        )
-        .expect("map should work");
+        let report =
+            MexcClient::map_fill_report("sell", Decimal::new(185, 6), Decimal::new(1280, 2), MEXC_SPOT_FEE_BPS)
+                .expect("map should work");
         let expected_output = MexcClient::apply_output_fee(Decimal::new(1280, 2), MEXC_SPOT_FEE_BPS)
             .to_f64()
             .expect("convert expected sell output");

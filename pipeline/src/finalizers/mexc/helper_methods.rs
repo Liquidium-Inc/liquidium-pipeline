@@ -214,11 +214,7 @@ where
 
             let side = leg.side.trim().to_ascii_lowercase();
             if side != "buy" && side != "sell" {
-                return Err(format!(
-                    "invalid persisted route leg {} side '{}'",
-                    idx + 1,
-                    leg.side
-                ));
+                return Err(format!("invalid persisted route leg {} side '{}'", idx + 1, leg.side));
             }
 
             out.push(TradeLeg { market, side });
@@ -270,16 +266,11 @@ where
         }
 
         out.sort_by(|left, right| {
-            (
-                left.0.as_str(),
-                left.1.market.as_str(),
-                left.1.side.as_str(),
-            )
-                .cmp(&(
-                    right.0.as_str(),
-                    right.1.market.as_str(),
-                    right.1.side.as_str(),
-                ))
+            (left.0.as_str(), left.1.market.as_str(), left.1.side.as_str()).cmp(&(
+                right.0.as_str(),
+                right.1.market.as_str(),
+                right.1.side.as_str(),
+            ))
         });
         out
     }
@@ -452,7 +443,7 @@ where
         ))
     }
 
-    pub(super) async fn resolve_trade_legs_for_symbols(
+    pub(crate) async fn resolve_trade_legs_for_symbols(
         &self,
         deposit_symbol: &str,
         withdraw_symbol: &str,

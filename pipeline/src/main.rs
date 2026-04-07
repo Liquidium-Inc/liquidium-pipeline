@@ -80,6 +80,22 @@ enum Commands {
         network: Option<String>,
     },
 
+    // Smoke test: route/execute ckBTC -> USDC on MEXC and withdraw USDC on ETH.
+    MexcSmokeSwapWithdraw {
+        // Amount of ckBTC to trade.
+        #[arg(long)]
+        amount_ckbtc: f64,
+        // Execute live side effects (swap + withdraw). If omitted, runs dry-run preflight only.
+        #[arg(long)]
+        execute: bool,
+        // Optional explicit withdraw destination (EVM address).
+        #[arg(long)]
+        withdraw_address: Option<String>,
+        // Withdraw network for USDC. Defaults to ETH.
+        #[arg(long, default_value = "ETH")]
+        withdraw_network: String,
+    },
+
     // Withdraws funds. Without flags, starts the interactive wizard.
     // With flags, performs a non-interactive withdrawal.
     Withdraw {
@@ -204,6 +220,23 @@ async fn main() {
         Commands::MexcDepositAddress { asset, network } => {
             if let Err(err) = commands::cex::mexc_deposit_address(&asset, network.as_deref()).await {
                 eprintln!("MEXC deposit address failed: {}", err);
+            }
+        }
+        Commands::MexcSmokeSwapWithdraw {
+            amount_ckbtc,
+            execute,
+            withdraw_address,
+            withdraw_network,
+        } => {
+            if let Err(err) = commands::cex::mexc_smoke_swap_withdraw(
+                amount_ckbtc,
+                execute,
+                withdraw_address.as_deref(),
+                &withdraw_network,
+            )
+            .await
+            {
+                eprintln!("MEXC smoke swap+withdraw failed: {}", err);
             }
         }
         Commands::Withdraw {
@@ -444,6 +477,65 @@ mod tests {
     fn cli_parse_run_conflicting_log_flags_fails() {
         let parsed = Cli::try_parse_from(["liquidator", "run", "--log-file", "--no-log-file"]);
         assert!(parsed.is_err(), "conflicting log flags should fail parsing");
+    }
+
+    #[test]
+    fn cli_parse_mexc_smoke_defaults_to_dry_run_and_eth_network() {
+        let parsed = Cli::try_parse_from(["liquidator", "mexc-smoke-swap-withdraw", "--amount-ckbtc", "0.001"])
+            .expect("mexc smoke command should parse");
+        match parsed.command {
+            Commands::MexcSmokeSwapWithdraw {
+                amount_ckbtc,
+                execute,
+                withdraw_address,
+                withdraw_network,
+            } => {
+                assert!((amount_ckbtc - 0.001).abs() < 1e-12);
+                assert!(!execute);
+                assert!(withdraw_address.is_none());
+                assert_eq!(withdraw_network, "ETH");
+            }
+            _ => panic!("expected mexc smoke swap withdraw command"),
+        }
+    }
+
+    #[test]
+    fn cli_parse_mexc_smoke_with_execute_and_overrides() {
+        let parsed = Cli::try_parse_from([
+            "liquidator",
+            "mexc-smoke-swap-withdraw",
+            "--amount-ckbtc",
+            "0.02",
+            "--execute",
+            "--withdraw-address",
+            "0x1111111111111111111111111111111111111111",
+            "--withdraw-network",
+            "ETH",
+        ])
+        .expect("mexc smoke command with execute should parse");
+        match parsed.command {
+            Commands::MexcSmokeSwapWithdraw {
+                amount_ckbtc,
+                execute,
+                withdraw_address,
+                withdraw_network,
+            } => {
+                assert!((amount_ckbtc - 0.02).abs() < 1e-12);
+                assert!(execute);
+                assert_eq!(
+                    withdraw_address.as_deref(),
+                    Some("0x1111111111111111111111111111111111111111")
+                );
+                assert_eq!(withdraw_network, "ETH");
+            }
+            _ => panic!("expected mexc smoke swap withdraw command"),
+        }
+    }
+
+    #[test]
+    fn cli_parse_mexc_smoke_missing_amount_fails() {
+        let parsed = Cli::try_parse_from(["liquidator", "mexc-smoke-swap-withdraw"]);
+        assert!(parsed.is_err(), "missing --amount-ckbtc should fail parsing");
     }
 
     #[cfg(target_os = "linux")]

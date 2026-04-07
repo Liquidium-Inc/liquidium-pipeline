@@ -86,9 +86,7 @@ impl<A: PipelineAgent, D: WalStore> BasicExecutor<A, D> {
         if allowance_before < threshold {
             approval_attempted = true;
             let approved_amount = max_for_ledger(&ledger);
-            let approve_result = self
-                .approve(&ledger, spender_account, approved_amount.clone())
-                .await?;
+            let approve_result = self.approve(&ledger, spender_account, approved_amount.clone()).await?;
             debug!(
                 "[executor] allowance approve | ledger={} account={} spender={} approved_amount={} block_index={}",
                 ledger.to_text(),
@@ -157,9 +155,10 @@ impl<A: PipelineAgent, D: WalStore> BasicExecutor<A, D> {
         &self,
         tokens: &[Principal],
     ) -> Vec<(Principal, Result<EnsureAllowanceResult, String>)> {
-        let allowance_futures = tokens.iter().copied().map(|token| async move {
-            (token, self.ensure_lending_allowance_for_ledger(token).await)
-        });
+        let allowance_futures = tokens
+            .iter()
+            .copied()
+            .map(|token| async move { (token, self.ensure_lending_allowance_for_ledger(token).await) });
         join_all(allowance_futures).await
     }
 

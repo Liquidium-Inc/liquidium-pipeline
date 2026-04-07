@@ -24,8 +24,7 @@ use super::mexc_utils::{
 use crate::{
     finalizers::cex_finalizer::{
         CexDepositState, CexFinalizerLogic, CexRouteLeg, CexRoutePreview, CexState, CexStep, CexTradeSlice,
-        CexTradeState,
-        CexWithdrawState,
+        CexTradeState, CexWithdrawState,
     },
     stages::executor::ExecutionReceipt,
     swappers::model::{SwapExecution, SwapQuoteLeg},
@@ -95,10 +94,7 @@ where
     C: CexBackend,
 {
     fn normalize_market_pair(raw: &str) -> Option<String> {
-        let normalized = raw
-            .trim()
-            .replace(['/', '-'], "_")
-            .to_ascii_uppercase();
+        let normalized = raw.trim().replace(['/', '-'], "_").to_ascii_uppercase();
         if normalized.is_empty() {
             return None;
         }
@@ -699,11 +695,12 @@ where
 
     async fn preview_route(&self, receipt: &ExecutionReceipt) -> Result<CexRoutePreview, String> {
         let state = self.prepare("preview", receipt).await?;
-        let legs = self.resolve_trade_legs_for_symbols(
-            &state.deposit.deposit_asset.symbol(),
-            &state.withdraw.withdraw_asset.symbol(),
-        )
-        .await?;
+        let legs = self
+            .resolve_trade_legs_for_symbols(
+                &state.deposit.deposit_asset.symbol(),
+                &state.withdraw.withdraw_asset.symbol(),
+            )
+            .await?;
         let mut amount_in = state.size_in.to_f64();
         if amount_in <= LIQUIDITY_EPS {
             return Ok(CexRoutePreview {

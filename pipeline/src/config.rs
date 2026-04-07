@@ -433,10 +433,7 @@ fn parse_swapper_mode_from_env() -> Result<SwapperMode, String> {
 }
 
 fn normalize_cex_market_pair(raw: &str) -> Option<String> {
-    let normalized = raw
-        .trim()
-        .replace(['/', '-'], "_")
-        .to_ascii_uppercase();
+    let normalized = raw.trim().replace(['/', '-'], "_").to_ascii_uppercase();
     if normalized.is_empty() {
         return None;
     }
@@ -755,11 +752,7 @@ mod tests {
         let parsed = parse_cex_mexc_available_pairs_from_env();
         assert_eq!(
             parsed,
-            vec![
-                "CKBTC_BTC".to_string(),
-                "BTC_USDC".to_string(),
-                "USDC_USDT".to_string(),
-            ]
+            vec!["CKBTC_BTC".to_string(), "BTC_USDC".to_string(), "USDC_USDT".to_string(),]
         );
     }
 

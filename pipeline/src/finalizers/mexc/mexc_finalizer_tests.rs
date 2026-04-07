@@ -1768,7 +1768,9 @@ async fn mexc_trade_errors_when_direct_market_cannot_be_resolved() {
         .await
         .expect_err("trade should fail when no direct leg can be resolved");
 
-    assert!(err.contains("could not resolve direct market") || err.contains("no configured MEXC pairs for hop discovery"));
+    assert!(
+        err.contains("could not resolve direct market") || err.contains("no configured MEXC pairs for hop discovery")
+    );
     assert!(matches!(state.step, CexStep::Trade));
 }
 
@@ -1829,11 +1831,7 @@ async fn mexc_trade_prefers_direct_route_over_hops_when_both_available() {
         TEST_CEX_SLICE_TARGET_RATIO,
     )
     .with_route_config(
-        vec![
-            "BTC_USDT".to_string(),
-            "BTC_USDC".to_string(),
-            "USDC_USDT".to_string(),
-        ],
+        vec!["BTC_USDT".to_string(), "BTC_USDC".to_string(), "USDC_USDT".to_string()],
         2,
     );
 
@@ -1851,7 +1849,10 @@ async fn mexc_trade_prefers_direct_route_over_hops_when_both_available() {
         fee: Nat::from(1_000u64),
     };
 
-    let mut state = finalizer.prepare("1001", &receipt).await.expect("prepare should succeed");
+    let mut state = finalizer
+        .prepare("1001", &receipt)
+        .await
+        .expect("prepare should succeed");
     state.step = CexStep::Trade;
 
     finalizer.trade(&mut state).await.expect("trade should succeed");
@@ -1886,11 +1887,13 @@ async fn mexc_trade_uses_configured_hop_route_when_direct_unavailable() {
         bids: vec![],
         asks: vec![],
     };
-    backend.expect_get_orderbook().returning(move |market, _limit| match market {
-        "BTC_CKUSDT" | "CKUSDT_BTC" => Ok(empty.clone()),
-        "BTC_USDC" | "USDC_USDT" | "CKUSDT_USDT" => Ok(liquid.clone()),
-        _ => Err(format!("unexpected market {}", market)),
-    });
+    backend
+        .expect_get_orderbook()
+        .returning(move |market, _limit| match market {
+            "BTC_CKUSDT" | "CKUSDT_BTC" => Ok(empty.clone()),
+            "BTC_USDC" | "USDC_USDT" | "CKUSDT_USDT" => Ok(liquid.clone()),
+            _ => Err(format!("unexpected market {}", market)),
+        });
 
     backend
         .expect_execute_swap_detailed_with_options()
@@ -1935,7 +1938,10 @@ async fn mexc_trade_uses_configured_hop_route_when_direct_unavailable() {
         fee: Nat::from(1_000u64),
     };
 
-    let mut state = finalizer.prepare("1002", &receipt).await.expect("prepare should succeed");
+    let mut state = finalizer
+        .prepare("1002", &receipt)
+        .await
+        .expect("prepare should succeed");
     state.step = CexStep::Trade;
 
     finalizer.trade(&mut state).await.expect("trade should succeed");
@@ -2039,7 +2045,10 @@ async fn mexc_trade_reuses_persisted_route_without_reprobing_direct_markets() {
         fee: Nat::from(1_000u64),
     };
 
-    let mut state = finalizer.prepare("1003", &receipt).await.expect("prepare should succeed");
+    let mut state = finalizer
+        .prepare("1003", &receipt)
+        .await
+        .expect("prepare should succeed");
     state.step = CexStep::Trade;
 
     finalizer
@@ -2066,7 +2075,9 @@ async fn mexc_trade_errors_when_no_hop_route_exists_in_configured_pairs() {
         bids: vec![],
         asks: vec![],
     };
-    backend.expect_get_orderbook().returning(move |_market, _limit| Ok(empty.clone()));
+    backend
+        .expect_get_orderbook()
+        .returning(move |_market, _limit| Ok(empty.clone()));
     backend.expect_execute_swap_detailed_with_options().times(0);
 
     let finalizer = MexcFinalizer::new(
@@ -2093,7 +2104,10 @@ async fn mexc_trade_errors_when_no_hop_route_exists_in_configured_pairs() {
         fee: Nat::from(1_000u64),
     };
 
-    let mut state = finalizer.prepare("1004", &receipt).await.expect("prepare should succeed");
+    let mut state = finalizer
+        .prepare("1004", &receipt)
+        .await
+        .expect("prepare should succeed");
     state.step = CexStep::Trade;
 
     let err = finalizer
@@ -2190,15 +2204,17 @@ async fn mexc_input_slice_usd_converts_non_hardcoded_quote_via_configured_hops()
         }],
     };
 
-    backend.expect_get_orderbook().returning(move |market, _limit| match market {
-        "SOL_ETH" => Ok(sol_eth.clone()),
-        "ETH_BTC" => Ok(eth_btc.clone()),
-        "BTC_USDC" => Ok(btc_usdc.clone()),
-        // Direct stable probes that should fail and force hop conversion.
-        "ETH_USDT" | "USDT_ETH" | "ETH_USDC" | "USDC_ETH" | "ETH_CKUSDT" | "CKUSDT_ETH" | "ETH_CKUSDC"
-        | "CKUSDC_ETH" | "ETH_USD" | "USD_ETH" => Ok(empty.clone()),
-        _ => Err(format!("unexpected market {}", market)),
-    });
+    backend
+        .expect_get_orderbook()
+        .returning(move |market, _limit| match market {
+            "SOL_ETH" => Ok(sol_eth.clone()),
+            "ETH_BTC" => Ok(eth_btc.clone()),
+            "BTC_USDC" => Ok(btc_usdc.clone()),
+            // Direct stable probes that should fail and force hop conversion.
+            "ETH_USDT" | "USDT_ETH" | "ETH_USDC" | "USDC_ETH" | "ETH_CKUSDT" | "CKUSDT_ETH" | "ETH_CKUSDC"
+            | "CKUSDC_ETH" | "ETH_USD" | "USD_ETH" => Ok(empty.clone()),
+            _ => Err(format!("unexpected market {}", market)),
+        });
 
     let finalizer = MexcFinalizer::new(
         Arc::new(backend),

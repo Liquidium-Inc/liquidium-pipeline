@@ -464,6 +464,30 @@ liquidator balance
 
 Displays **main**, **trader**, and **recovery** balances. Recovery balances are marked as "seized collateral (stale, pending withdrawal if swaps failed)".
 
+### MEXC Smoke Swap + Withdraw
+
+Dry-run preflight (no side effects):
+
+```bash
+liquidator mexc-smoke-swap-withdraw --amount-ckbtc 0.001
+```
+
+Live execution (swap + withdraw):
+
+```bash
+liquidator mexc-smoke-swap-withdraw \
+  --amount-ckbtc 0.001 \
+  --execute \
+  --withdraw-address 0x1111111111111111111111111111111111111111 \
+  --withdraw-network ETH
+```
+
+Behavior:
+- Fixed smoke pair: `ckBTC -> USDC`.
+- Uses existing free MEXC `CKBTC` balance (no on-chain deposit transfer step).
+- Route resolution mirrors production MEXC finalizer logic.
+- Without `--execute`, runs route/balance preflight only and exits.
+
 ### Withdraw Funds
 
 #### Interactive Wizard
