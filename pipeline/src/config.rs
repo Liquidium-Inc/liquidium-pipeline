@@ -41,6 +41,9 @@ pub struct Config {
     pub ic_url: String,
     pub evm_rpc_url: String,
     pub evm_private_key: String,
+    pub bridge_source_evm_address: String,
+    pub bridge_cketh_minter_canister: Principal,
+    pub bridge_usdc_eth_token_address: String,
     pub lending_canister: Principal,
     pub export_path: String,
     pub buy_bad_debt: bool,
@@ -271,6 +274,28 @@ impl Config {
         let evm_signer: PrivateKeySigner = PrivateKeySigner::from_slice(&sk.to_bytes()).map_err(|e| e.to_string())?;
         let hex = evm_signer.to_bytes().encode_hex();
         let evm_private_key = format!("{:#}", hex);
+        let default_bridge_source_evm_address = evm_signer.address().to_string();
+        let bridge_source_evm_address = env::var("BRIDGE_SOURCE_EVM_ADDRESS")
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+            .unwrap_or(default_bridge_source_evm_address);
+        let bridge_cketh_minter_canister_text = env::var("BRIDGE_CKETH_MINTER_CANISTER")
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| DEFAULT_BRIDGE_CKETH_MINTER_CANISTER.to_string());
+        let bridge_cketh_minter_canister = Principal::from_text(&bridge_cketh_minter_canister_text).map_err(|e| {
+            format!(
+                "invalid BRIDGE_CKETH_MINTER_CANISTER principal '{}': {e}",
+                bridge_cketh_minter_canister_text
+            )
+        })?;
+        let bridge_usdc_eth_token_address = env::var("BRIDGE_USDC_ETH_TOKEN_ADDRESS")
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| DEFAULT_BRIDGE_USDC_ETH_TOKEN_ADDRESS.to_string());
 
         let max_allowed_dex_slippage: u32 = std::env::var("MAX_ALLOWED_DEX_SLIPPAGE")
             .or_else(|_| std::env::var("MAX_ALLOWED_SLIPPAGE_BPS"))
@@ -317,6 +342,9 @@ impl Config {
         Ok(Arc::new(Config {
             evm_private_key,
             evm_rpc_url,
+            bridge_source_evm_address,
+            bridge_cketh_minter_canister,
+            bridge_usdc_eth_token_address,
             liquidator_identity: Arc::new(liquidator_identity),
             ic_url,
             liquidator_principal,
@@ -411,6 +439,8 @@ const MAX_BPS: u32 = 10_000;
 const MIN_RATIO: f64 = 0.0;
 const MAX_RATIO: f64 = 1.0;
 const MIN_SLICE_TARGET_RATIO: f64 = 0.1;
+const DEFAULT_BRIDGE_CKETH_MINTER_CANISTER: &str = "sv3dd-oaaaa-aaaar-qacoa-cai";
+const DEFAULT_BRIDGE_USDC_ETH_TOKEN_ADDRESS: &str = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48";
 
 fn parse_bad_debt_collateral_slippage_bps_from_env() -> u32 {
     env::var("BAD_DEBT_COLLATERAL_SLIPPAGE_BPS")

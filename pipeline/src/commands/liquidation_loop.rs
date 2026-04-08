@@ -1,3 +1,4 @@
+use alloy::{network::AnyNetwork, providers::ProviderBuilder, signers::local::PrivateKeySigner};
 use icrc_ledger_types::icrc1::account::Account;
 use std::{
     path::PathBuf,
@@ -24,15 +25,18 @@ use crate::{
     persistance::sqlite::SqliteWalStore,
     price_oracle::price_oracle::LiquidationPriceOracle,
     stages::{
-        export::ExportStage, finalize::FinalizeStage, opportunity::OpportunityFinder,
+        bridge_sweeper::BridgeSweeper, export::ExportStage, finalize::FinalizeStage, opportunity::OpportunityFinder,
         settlement_watcher::SettlementWatcher, simple_strategy::SimpleLiquidationStrategy,
     },
     swappers::{mexc::mexc_adapter::MexcClient, router::SwapRouter},
     watchdog::{WatchdogEvent, account_monitor_watchdog, webhook_watchdog_from_env},
 };
 use ic_agent::Agent;
+use liquidium_pipeline_connectors::backend::bridge_backend::CkUsdcBridgeBackend;
 
 use liquidium_pipeline_core::tokens::token_registry::TokenRegistry;
+
+const BRIDGE_SWEEPER_POLL_INTERVAL: Duration = Duration::from_secs(5);
 
 #[instrument(name = "liquidation.init", skip_all, err)]
 async fn init(
@@ -246,6 +250,54 @@ pub async fn run_liquidation_loop(sock_path: PathBuf) {
 
     tokio::spawn(async move { watcher.run().await });
 
+    // Bridge sweeper is intentionally independent from pause/resume.
+    // Even while paused, it can continue sweeping bridge wallet balances.
+    let bridge_signer: PrivateKeySigner = match config.evm_private_key.parse() {
+        Ok(signer) => signer,
+        Err(err) => {
+            tracing::error!("Failed to parse EVM private key for bridge backend: {}", err);
+            return;
+        }
+    };
+    let bridge_rpc_url = match config.evm_rpc_url.parse() {
+        Ok(url) => url,
+        Err(err) => {
+            tracing::error!("Invalid EVM RPC URL for bridge backend: {}", err);
+            return;
+        }
+    };
+    let bridge_provider = ProviderBuilder::new()
+        .network::<AnyNetwork>()
+        .wallet(bridge_signer)
+        .connect_http(bridge_rpc_url);
+    let bridge_backend = match CkUsdcBridgeBackend::new(
+        ctx.agent.clone(),
+        bridge_provider,
+        config.bridge_cketh_minter_canister,
+        &config.bridge_usdc_eth_token_address,
+    ) {
+        Ok(backend) => Arc::new(backend),
+        Err(err) => {
+            tracing::error!("Failed to initialize ckUSDC bridge backend: {}", err);
+            return;
+        }
+    };
+
+    let bridge_sweeper = BridgeSweeper::new(
+        bridge_backend,
+        config.bridge_source_evm_address.clone(),
+        config.liquidator_principal.to_text(),
+        BRIDGE_SWEEPER_POLL_INTERVAL,
+    );
+    info!(
+        bridge_source_evm_address = %config.bridge_source_evm_address,
+        bridge_cketh_minter_canister = %config.bridge_cketh_minter_canister.to_text(),
+        bridge_usdc_eth_token_address = %config.bridge_usdc_eth_token_address,
+        bridge_destination_account = %config.liquidator_principal.to_text(),
+        "Bridge sweeper started"
+    );
+    tokio::spawn(async move { bridge_sweeper.run().await });
+
     let debt_asset_principals = debt_asset_principals(&ctx.registry);
     let debt_assets = debt_assets_as_text(&debt_asset_principals);
 
@@ -302,6 +354,9 @@ pub enum LoopControl {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
+    use super::BRIDGE_SWEEPER_POLL_INTERVAL;
     use crate::commands::liquidation_loop_helpers::console_ui_enabled;
     use std::io::IsTerminal;
 
@@ -338,5 +393,10 @@ mod tests {
             std::io::stderr().is_terminal(),
         );
         assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn bridge_sweeper_poll_interval_is_fixed_to_five_seconds() {
+        assert_eq!(BRIDGE_SWEEPER_POLL_INTERVAL, Duration::from_secs(5));
     }
 }
