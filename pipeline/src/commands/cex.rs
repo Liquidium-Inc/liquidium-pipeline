@@ -1,12 +1,25 @@
-use std::sync::Arc;
+use std::{
+    str::FromStr,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
-use alloy::signers::local::PrivateKeySigner;
+use alloy::{
+    network::AnyNetwork, primitives::Address as EvmAddress, providers::ProviderBuilder,
+    signers::local::PrivateKeySigner,
+};
 use async_trait::async_trait;
-use candid::Nat;
+use candid::{Nat, Principal};
+use ic_agent::Agent;
+use icrc_ledger_types::icrc1::account::Account;
+use liquidium_pipeline_connectors::backend::bridge_backend::{
+    BridgeBackend, BridgeDestination, BridgeRequest, BridgeStatus, CkEthErc20BridgeBackend,
+};
 use liquidium_pipeline_connectors::backend::cex_backend::{CexBackend, SwapExecutionOptions};
 use liquidium_pipeline_core::{
     account::model::ChainAccount, tokens::chain_token::ChainToken, transfer::actions::TransferActions,
 };
+use tokio::time::sleep;
 
 use crate::{
     config::Config, finalizers::mexc::mexc_finalizer::MexcFinalizer, swappers::mexc::mexc_adapter::MexcClient,
@@ -14,6 +27,12 @@ use crate::{
 
 const SMOKE_FROM_ASSET: &str = "CKBTC";
 const SMOKE_TO_ASSET: &str = "USDC";
+const BRIDGE_SOURCE_CHAIN: &str = "ETH";
+const BRIDGE_TARGET_ASSET: &str = "ckUSDC";
+const BRIDGE_SOURCE_FUNDING_POLL_INTERVAL: Duration = Duration::from_secs(10);
+const BRIDGE_SOURCE_FUNDING_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+const BRIDGE_STATUS_POLL_INTERVAL: Duration = Duration::from_secs(5);
+const BRIDGE_STATUS_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 
 #[derive(Default)]
 struct NoopTransferActions;
@@ -68,6 +87,70 @@ fn resolve_withdraw_destination(withdraw_address: Option<&str>, evm_private_key:
     Ok(signer.address().to_string())
 }
 
+fn resolve_smoke_withdraw_destination(
+    config: &Config,
+    withdraw_address: Option<&str>,
+    bridge_after_withdraw: bool,
+) -> Result<String, String> {
+    if !bridge_after_withdraw {
+        return resolve_withdraw_destination(withdraw_address, &config.evm_private_key);
+    }
+
+    let bridge_address = config.bridge_evm_address.parse::<EvmAddress>().map_err(|e| {
+        format!(
+            "invalid configured bridge EVM address '{}': {e}",
+            config.bridge_evm_address
+        )
+    })?;
+    if let Some(address) = withdraw_address {
+        let parsed = address
+            .trim()
+            .parse::<EvmAddress>()
+            .map_err(|e| format!("invalid --withdraw-address '{}': {e}", address.trim()))?;
+        if parsed != bridge_address {
+            return Err(format!(
+                "bridge step requires withdraw destination to be bridge address {}; got {}",
+                config.bridge_evm_address,
+                address.trim()
+            ));
+        }
+    }
+
+    Ok(config.bridge_evm_address.clone())
+}
+
+fn resolve_bridge_destination_account(
+    destination: Option<&str>,
+    default_principal: Principal,
+) -> Result<Account, String> {
+    let Some(destination) = destination else {
+        return Ok(Account {
+            owner: default_principal,
+            subaccount: None,
+        });
+    };
+
+    let trimmed = destination.trim();
+    if trimmed.is_empty() {
+        return Err("bridge destination cannot be empty".to_string());
+    }
+
+    if let Ok(account) = Account::from_str(trimmed) {
+        return Ok(account);
+    }
+    if let Ok(owner) = Principal::from_text(trimmed) {
+        return Ok(Account {
+            owner,
+            subaccount: None,
+        });
+    }
+
+    Err(format!(
+        "invalid bridge destination '{}'; expected ICP account or principal",
+        trimmed
+    ))
+}
+
 fn with_route_resolution_hint(err: String) -> String {
     if err.contains("no configured hop route")
         || err.contains("no configured MEXC pairs for hop discovery")
@@ -102,13 +185,19 @@ pub async fn mexc_smoke_swap_withdraw(
     execute: bool,
     withdraw_address: Option<&str>,
     withdraw_network: &str,
+    bridge_after_withdraw: bool,
+    bridge_destination: Option<&str>,
 ) -> Result<(), String> {
+    if bridge_after_withdraw && !execute {
+        return Err("bridge step requires --execute".to_string());
+    }
+
     let config = Config::load().await.map_err(|e| format!("config load failed: {e}"))?;
     let backend = Arc::new(MexcClient::from_env()?);
     let finalizer = build_mexc_smoke_finalizer(backend.clone(), &config);
-    let destination = resolve_withdraw_destination(withdraw_address, &config.evm_private_key)?;
+    let destination = resolve_smoke_withdraw_destination(&config, withdraw_address, bridge_after_withdraw)?;
 
-    run_mexc_smoke_with_backend(
+    let maybe_withdrawn_amount = run_mexc_smoke_with_backend(
         backend,
         &finalizer,
         amount_ckbtc,
@@ -116,7 +205,15 @@ pub async fn mexc_smoke_swap_withdraw(
         &destination,
         withdraw_network,
     )
-    .await
+    .await?;
+
+    if bridge_after_withdraw {
+        let withdrawn_amount = maybe_withdrawn_amount.ok_or_else(|| "bridge step requires --execute".to_string())?;
+        let destination_account = resolve_bridge_destination_account(bridge_destination, config.liquidator_principal)?;
+        run_bridge_step_after_mexc_withdraw(&config, withdrawn_amount, destination_account).await?;
+    }
+
+    Ok(())
 }
 
 pub(crate) async fn run_mexc_smoke_with_backend<B: CexBackend>(
@@ -126,7 +223,7 @@ pub(crate) async fn run_mexc_smoke_with_backend<B: CexBackend>(
     execute: bool,
     withdraw_destination: &str,
     withdraw_network: &str,
-) -> Result<(), String> {
+) -> Result<Option<f64>, String> {
     if !amount_ckbtc.is_finite() || amount_ckbtc <= 0.0 {
         return Err("preflight failed: amount_ckbtc must be positive".to_string());
     }
@@ -168,7 +265,7 @@ pub(crate) async fn run_mexc_smoke_with_backend<B: CexBackend>(
 
     if !execute {
         println!("Dry-run complete: no side effects executed.");
-        return Ok(());
+        return Ok(None);
     }
 
     let mut current_in = amount_ckbtc;
@@ -228,7 +325,190 @@ pub(crate) async fn run_mexc_smoke_with_backend<B: CexBackend>(
     println!("  txid       : {}", receipt.txid.as_deref().unwrap_or("-"));
     println!("  internal_id: {}", receipt.internal_id.as_deref().unwrap_or("-"));
 
+    Ok(Some(receipt.amount))
+}
+
+async fn run_bridge_step_after_mexc_withdraw(
+    config: &Config,
+    amount: f64,
+    destination_account: Account,
+) -> Result<(), String> {
+    if !amount.is_finite() || amount <= 0.0 {
+        return Err(format!("bridge step amount must be positive; got {amount}"));
+    }
+
+    let bridge_signer: PrivateKeySigner = config
+        .bridge_evm_private_key
+        .parse()
+        .map_err(|err| format!("failed to parse bridge EVM private key: {err}"))?;
+    let bridge_rpc_url = config
+        .evm_rpc_url
+        .parse()
+        .map_err(|err| format!("invalid EVM RPC URL for bridge step: {err}"))?;
+    let bridge_provider = ProviderBuilder::new()
+        .network::<AnyNetwork>()
+        .wallet(bridge_signer)
+        .connect_http(bridge_rpc_url);
+
+    let bridge_agent = Arc::new(
+        Agent::builder()
+            .with_url(config.ic_url.clone())
+            .with_identity(config.bridge_ic_identity.clone())
+            .with_max_tcp_error_retries(3)
+            .build()
+            .map_err(|err| format!("failed to build IC agent for bridge step: {err}"))?,
+    );
+
+    let bridge_backend =
+        CkEthErc20BridgeBackend::new(bridge_agent, bridge_provider, config.bridge_cketh_minter_canister);
+
+    println!(
+        "Waiting for bridge source funds (timeout={}s, poll={}s)...",
+        BRIDGE_SOURCE_FUNDING_TIMEOUT.as_secs(),
+        BRIDGE_SOURCE_FUNDING_POLL_INTERVAL.as_secs()
+    );
+    let bridge_balance = wait_for_bridge_source_funding(&bridge_backend, &config.bridge_evm_address, amount).await?;
+    let bridge_submit_amount = bridge_balance;
+    println!("Bridge source funded");
+    println!("  available  : {}", bridge_balance);
+    println!("  min_needed : {}", amount);
+    println!("  submit_all : {}", bridge_submit_amount);
+    println!("  source     : {}", config.bridge_evm_address);
+
+    let request = BridgeRequest {
+        asset: SMOKE_TO_ASSET.to_string(),
+        source_chain: BRIDGE_SOURCE_CHAIN.to_string(),
+        source_address: config.bridge_evm_address.clone(),
+        target_asset: BRIDGE_TARGET_ASSET.to_string(),
+        destination: BridgeDestination::IcpAccount(destination_account.clone()),
+        amount: bridge_submit_amount,
+    };
+
+    println!("Starting bridge");
+    println!(
+        "  route      : {}@{} -> {}",
+        SMOKE_TO_ASSET, BRIDGE_SOURCE_CHAIN, BRIDGE_TARGET_ASSET
+    );
+    println!("  source     : {}", config.bridge_evm_address);
+    println!("  amount     : {}", bridge_submit_amount);
+    println!("  destination: {}", destination_account);
+
+    let submission = bridge_backend
+        .submit_bridge(request)
+        .await
+        .map_err(|err| format!("bridge step failed: {err}"))?;
+
+    println!("Bridge submitted");
+    println!(
+        "  route      : {}@{} -> {}",
+        SMOKE_TO_ASSET, BRIDGE_SOURCE_CHAIN, BRIDGE_TARGET_ASSET
+    );
+    println!("  source     : {}", config.bridge_evm_address);
+    println!("  amount     : {}", bridge_submit_amount);
+    println!("  bridge_id  : {}", submission.bridge_id);
+    println!(
+        "Waiting for bridge completion (timeout={}s, poll={}s)...",
+        BRIDGE_STATUS_TIMEOUT.as_secs(),
+        BRIDGE_STATUS_POLL_INTERVAL.as_secs()
+    );
+
+    wait_for_bridge_completion(&bridge_backend, &submission.bridge_id).await?;
+    println!("Bridge completed");
+    println!("  bridge_id  : {}", submission.bridge_id);
+
     Ok(())
+}
+
+async fn wait_for_bridge_source_funding<B>(
+    backend: &B,
+    source_address: &str,
+    minimum_required_amount: f64,
+) -> Result<f64, String>
+where
+    B: BridgeBackend + Send + Sync,
+{
+    let started = Instant::now();
+    let mut poll_count = 0u64;
+
+    loop {
+        let balance = backend
+            .get_source_balance(SMOKE_TO_ASSET, BRIDGE_SOURCE_CHAIN, source_address)
+            .await
+            .map_err(|err| format!("bridge source balance check failed: {err}"))?;
+
+        if balance.is_finite() && balance + 1e-12 >= minimum_required_amount {
+            return Ok(balance);
+        }
+
+        poll_count += 1;
+        println!(
+            "  bridge funding: available={} min_needed={} (poll={} elapsed={}s)",
+            balance,
+            minimum_required_amount,
+            poll_count,
+            started.elapsed().as_secs()
+        );
+
+        if started.elapsed() >= BRIDGE_SOURCE_FUNDING_TIMEOUT {
+            return Err(format!(
+                "timed out waiting for bridge source funds after {}s (available={} min_needed={} source={})",
+                BRIDGE_SOURCE_FUNDING_TIMEOUT.as_secs(),
+                balance,
+                minimum_required_amount,
+                source_address
+            ));
+        }
+
+        sleep(BRIDGE_SOURCE_FUNDING_POLL_INTERVAL).await;
+    }
+}
+
+async fn wait_for_bridge_completion<B>(backend: &B, bridge_id: &str) -> Result<(), String>
+where
+    B: BridgeBackend + Send + Sync,
+{
+    let started = Instant::now();
+    let mut poll_count = 0u64;
+
+    loop {
+        let status = backend
+            .get_bridge_status(bridge_id)
+            .await
+            .map_err(|err| format!("bridge status check failed for {bridge_id}: {err}"))?;
+
+        match status {
+            BridgeStatus::Completed => return Ok(()),
+            BridgeStatus::Failed { reason } => {
+                return Err(format!(
+                    "bridge failed for {bridge_id}: {}",
+                    reason.unwrap_or_else(|| "unknown failure".to_string())
+                ));
+            }
+            BridgeStatus::Canceled { reason } => {
+                return Err(format!(
+                    "bridge canceled for {bridge_id}: {}",
+                    reason.unwrap_or_else(|| "no reason provided".to_string())
+                ));
+            }
+            BridgeStatus::Pending | BridgeStatus::Unknown => {
+                poll_count += 1;
+                println!(
+                    "  bridge status: {:?} (poll={} elapsed={}s)",
+                    status,
+                    poll_count,
+                    started.elapsed().as_secs()
+                );
+            }
+        }
+
+        if started.elapsed() >= BRIDGE_STATUS_TIMEOUT {
+            return Err(format!(
+                "timed out waiting for bridge completion after {}s for bridge_id={bridge_id}",
+                BRIDGE_STATUS_TIMEOUT.as_secs()
+            ));
+        }
+        sleep(BRIDGE_STATUS_POLL_INTERVAL).await;
+    }
 }
 
 #[cfg(test)]
@@ -288,7 +568,7 @@ mod tests {
         let backend = Arc::new(backend);
         let finalizer = make_test_finalizer(backend.clone(), vec![], 2);
 
-        run_mexc_smoke_with_backend(
+        let result = run_mexc_smoke_with_backend(
             backend,
             &finalizer,
             0.01,
@@ -298,6 +578,7 @@ mod tests {
         )
         .await
         .expect("dry-run should succeed");
+        assert_eq!(result, None);
     }
 
     #[tokio::test]
@@ -374,7 +655,7 @@ mod tests {
             1,
         );
 
-        run_mexc_smoke_with_backend(
+        let result = run_mexc_smoke_with_backend(
             backend,
             &finalizer,
             0.5,
@@ -384,6 +665,7 @@ mod tests {
         )
         .await
         .expect("live smoke should succeed");
+        assert_eq!(result, Some(2_000.0));
     }
 
     #[test]
@@ -392,6 +674,33 @@ mod tests {
         let signer: PrivateKeySigner = evm_private_key.parse().expect("private key should parse");
         let got = resolve_withdraw_destination(None, evm_private_key).expect("should resolve from key");
         assert_eq!(got, signer.address().to_string());
+    }
+
+    #[test]
+    fn resolve_bridge_destination_account_defaults_to_liquidator_principal() {
+        let principal = Principal::management_canister();
+        let account = resolve_bridge_destination_account(None, principal).expect("default account");
+        assert_eq!(
+            account,
+            Account {
+                owner: principal,
+                subaccount: None,
+            }
+        );
+    }
+
+    #[test]
+    fn resolve_bridge_destination_account_accepts_principal_text() {
+        let principal = Principal::management_canister();
+        let account = resolve_bridge_destination_account(Some(&principal.to_text()), Principal::anonymous())
+            .expect("principal destination");
+        assert_eq!(
+            account,
+            Account {
+                owner: principal,
+                subaccount: None,
+            }
+        );
     }
 
     #[tokio::test]

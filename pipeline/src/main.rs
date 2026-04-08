@@ -94,15 +94,25 @@ enum Commands {
         // Withdraw network for USDC. Defaults to ETH.
         #[arg(long, default_value = "ETH")]
         withdraw_network: String,
+        // Optional final step: submit USDC@ETH -> ckUSDC bridge request.
+        // Requires --execute.
+        #[arg(long)]
+        bridge_after_withdraw: bool,
+        // Optional bridge destination ICP account/principal.
+        // Defaults to liquidator principal when omitted.
+        #[arg(long)]
+        bridge_destination: Option<String>,
     },
 
     // Withdraws funds. Without flags, starts the interactive wizard.
     // With flags, performs a non-interactive withdrawal.
     Withdraw {
-        // Source account: "main", "trader", or "recovery" (non-interactive)
+        // Source account: "main", "trader", "recovery", or "bridge" (non-interactive)
         #[arg(long)]
         source: Option<String>,
-        // Destination: "main", "trader", "recovery", or full Account string (non-interactive)
+        // Destination:
+        // - ICP assets: "main", "trader", "recovery", "bridge", or full Account string
+        // - EVM assets: "main", "bridge", or 0x... address
         #[arg(long)]
         destination: Option<String>,
         // Asset symbol (e.g., "ckUSDT") or "all" (non-interactive)
@@ -227,12 +237,16 @@ async fn main() {
             execute,
             withdraw_address,
             withdraw_network,
+            bridge_after_withdraw,
+            bridge_destination,
         } => {
             if let Err(err) = commands::cex::mexc_smoke_swap_withdraw(
                 amount_ckbtc,
                 execute,
                 withdraw_address.as_deref(),
                 &withdraw_network,
+                bridge_after_withdraw,
+                bridge_destination.as_deref(),
             )
             .await
             {
@@ -259,7 +273,7 @@ async fn main() {
                     }
                     _ => {
                         eprintln!(
-                            "Missing flags. Required for non-interactive: --source <main|trader|recovery> --destination <main|trader|recovery|ACCOUNT> --asset <SYMBOL|all> --amount <DECIMAL|all>.\nRun without flags to use the interactive wizard."
+                            "Missing flags. Required for non-interactive: --source <main|trader|recovery|bridge> --destination <main|trader|recovery|bridge|ACCOUNT|0xEVM_ADDRESS> --asset <SYMBOL|all> --amount <DECIMAL|all>.\nRun without flags to use the interactive wizard."
                         );
                     }
                 }
@@ -489,11 +503,15 @@ mod tests {
                 execute,
                 withdraw_address,
                 withdraw_network,
+                bridge_after_withdraw,
+                bridge_destination,
             } => {
                 assert!((amount_ckbtc - 0.001).abs() < 1e-12);
                 assert!(!execute);
                 assert!(withdraw_address.is_none());
                 assert_eq!(withdraw_network, "ETH");
+                assert!(!bridge_after_withdraw);
+                assert!(bridge_destination.is_none());
             }
             _ => panic!("expected mexc smoke swap withdraw command"),
         }
@@ -511,6 +529,9 @@ mod tests {
             "0x1111111111111111111111111111111111111111",
             "--withdraw-network",
             "ETH",
+            "--bridge-after-withdraw",
+            "--bridge-destination",
+            "aaaaa-aa",
         ])
         .expect("mexc smoke command with execute should parse");
         match parsed.command {
@@ -519,6 +540,8 @@ mod tests {
                 execute,
                 withdraw_address,
                 withdraw_network,
+                bridge_after_withdraw,
+                bridge_destination,
             } => {
                 assert!((amount_ckbtc - 0.02).abs() < 1e-12);
                 assert!(execute);
@@ -527,6 +550,8 @@ mod tests {
                     Some("0x1111111111111111111111111111111111111111")
                 );
                 assert_eq!(withdraw_network, "ETH");
+                assert!(bridge_after_withdraw);
+                assert_eq!(bridge_destination.as_deref(), Some("aaaaa-aa"));
             }
             _ => panic!("expected mexc smoke swap withdraw command"),
         }

@@ -37,6 +37,7 @@ pub enum SwapperMode {
 pub struct Config {
     pub liquidator_identity: Arc<dyn Identity>,
     pub trader_identity: Arc<dyn Identity>,
+    pub bridge_ic_identity: Arc<dyn Identity>,
     pub liquidator_principal: Principal,
     pub trader_principal: Principal,
     pub ic_url: String,
@@ -230,6 +231,23 @@ impl ConfigTrait for Config {
 }
 
 impl Config {
+    pub fn bridge_subaccount_for_symbol(&self, symbol: &str) -> Option<[u8; 32]> {
+        if symbol.eq_ignore_ascii_case("ckUSDC") {
+            Some(self.bridge_ic_ckusdc_subaccount)
+        } else if symbol.eq_ignore_ascii_case("ckBTC") {
+            Some(self.bridge_ic_ckbtc_subaccount)
+        } else {
+            None
+        }
+    }
+
+    pub fn bridge_ic_account_for_symbol(&self, symbol: &str) -> Account {
+        Account {
+            owner: self.bridge_ic_owner_principal,
+            subaccount: self.bridge_subaccount_for_symbol(symbol),
+        }
+    }
+
     pub async fn load() -> Result<Arc<Self>, String> {
         let home = config_dir();
 
@@ -289,8 +307,9 @@ impl Config {
         let bridge_evm_private_key = format!("{:#}", bridge_signer.to_bytes().encode_hex());
         let bridge_evm_address = bridge_signer.address().to_string();
 
-        let bridge_ic_owner_principal = derive_icp_identity(&mnemonic, BRIDGE_NAMESPACE_ACCOUNT, BRIDGE_ICP_INDEX)
-            .map_err(|e| format!("could not create bridge identity: {e}"))?
+        let bridge_ic_identity = derive_icp_identity(&mnemonic, BRIDGE_NAMESPACE_ACCOUNT, BRIDGE_ICP_INDEX)
+            .map_err(|e| format!("could not create bridge identity: {e}"))?;
+        let bridge_ic_owner_principal = bridge_ic_identity
             .sender()
             .map_err(|e| format!("could not decode bridge principal: {e}"))?;
 
@@ -363,6 +382,7 @@ impl Config {
             bridge_btc_address,
             bridge_cketh_minter_canister,
             liquidator_identity: Arc::new(liquidator_identity),
+            bridge_ic_identity: Arc::new(bridge_ic_identity),
             ic_url,
             liquidator_principal,
             trader_identity: Arc::new(trader_identity),

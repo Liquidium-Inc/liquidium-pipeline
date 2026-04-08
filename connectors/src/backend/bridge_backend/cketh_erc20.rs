@@ -1,6 +1,6 @@
 use alloy::{
-    network::AnyNetwork,
-    primitives::{Address, FixedBytes, U256},
+    network::{AnyNetwork, ReceiptResponse},
+    primitives::{Address, FixedBytes, TxHash, U256},
     providers::{Provider, WalletProvider},
     sol,
 };
@@ -302,8 +302,32 @@ where
         })
     }
 
-    async fn get_bridge_status(&self, _bridge_id: &str) -> Result<BridgeStatus, String> {
-        Ok(BridgeStatus::Unknown)
+    async fn get_bridge_status(&self, bridge_id: &str) -> Result<BridgeStatus, String> {
+        let tx_hash = bridge_id
+            .parse::<TxHash>()
+            .map_err(|e| format!("invalid bridge id '{}': expected EVM tx hash: {e}", bridge_id))?;
+
+        let receipt = self
+            .provider
+            .get_transaction_receipt(tx_hash)
+            .await
+            .map_err(|e| format!("failed to fetch transaction receipt for bridge id '{}': {e}", bridge_id))?;
+
+        let Some(receipt) = receipt else {
+            return Ok(BridgeStatus::Pending);
+        };
+
+        if receipt.status() {
+            return Ok(BridgeStatus::Completed);
+        }
+
+        Ok(BridgeStatus::Failed {
+            reason: Some(format!(
+                "bridge transaction {} reverted in block {}",
+                bridge_id,
+                receipt.block_number.unwrap_or_default()
+            )),
+        })
     }
 }
 

@@ -120,9 +120,9 @@ EVM_RPC_URL=https://arb1.arbitrum.io/rpc
 # Identity
 MNEMONIC_FILE=~/.liquidium-pipeline/wallets/key
 
-# Assets (comma-separated principal:symbol pairs)
-DEBT_ASSETS=principal1:ckBTC,principal2:ckUSDT,principal3:ICP
-COLLATERAL_ASSETS=principal1:ckBTC,principal2:ckUSDT,principal3:ICP
+# Assets (comma-separated chain:address:symbol entries)
+DEBT_ASSETS=icp:mxzaz-hqaaa-aaaar-qaada-cai:ckBTC,icp:cngnf-vqaaa-aaaar-qag4q-cai:ckUSDT,icp:xevnm-gaaaa-aaaar-qafnq-cai:ckUSDC,icp:ryjl3-tyaaa-aaaaa-aaaba-cai:ICP
+COLLATERAL_ASSETS=icp:mxzaz-hqaaa-aaaar-qaada-cai:ckBTC,icp:cngnf-vqaaa-aaaar-qag4q-cai:ckUSDT,icp:xevnm-gaaaa-aaaar-qafnq-cai:ckUSDC,icp:ryjl3-tyaaa-aaaaa-aaaba-cai:ICP
 
 # Optional: only scan specific borrower principals (comma-separated). Set to "none" to disable.
 OPPORTUNITY_ACCOUNT_FILTER=principal1,principal2
@@ -511,11 +511,24 @@ liquidator mexc-smoke-swap-withdraw \
   --withdraw-network ETH
 ```
 
+Live execution with final bridge step (USDC@ETH -> ckUSDC):
+
+```bash
+liquidator mexc-smoke-swap-withdraw \
+  --amount-ckbtc 0.001 \
+  --execute \
+  --bridge-after-withdraw \
+  --bridge-destination <ICP_ACCOUNT_OR_PRINCIPAL>
+```
+
 Behavior:
 - Fixed smoke pair: `ckBTC -> USDC`.
 - Uses existing free MEXC `CKBTC` balance (no on-chain deposit transfer step).
 - Route resolution mirrors production MEXC finalizer logic.
 - Without `--execute`, runs route/balance preflight only and exits.
+- `--bridge-after-withdraw` adds a final bridge submission `USDC@ETH -> ckUSDC`.
+- With bridge step enabled, withdraw destination is forced to the configured bridge EVM address.
+- If `--bridge-destination` is omitted, bridge destination defaults to liquidator principal.
 
 ### Withdraw Funds
 

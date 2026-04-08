@@ -179,7 +179,7 @@ fn spawn_bridge_sweeper(ctx: &Arc<PipelineContext>) -> Result<(), String> {
         .evm_rpc_url
         .parse()
         .map_err(|err| format!("Invalid EVM RPC URL for bridge backend: {err}"))?;
-    
+
     let bridge_provider = ProviderBuilder::new()
         .network::<AnyNetwork>()
         .wallet(bridge_signer)
