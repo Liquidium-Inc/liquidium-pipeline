@@ -10,7 +10,7 @@ use tokio::time::timeout;
 use crate::commands::liquidation_loop::LoopControl;
 use crate::control_plane::{ControlCommand, send_control_command};
 
-use super::app::{App, BalancesPanel, Tab, UiFocus, WithdrawField};
+use super::app::{App, BalancesPanel, Tab, UiFocus, WithdrawDestinationKind, WithdrawField};
 use super::events::UiEvent;
 use super::log_source::LogControlHandle;
 use super::snapshots::{compute_profits_snapshot, fetch_balances_snapshot};
@@ -79,6 +79,62 @@ fn scroll_dashboard_logs_down(app: &mut App, entries: usize) {
     );
     if app.dashboard_logs_scroll == 0 {
         app.dashboard_logs_follow = true;
+    }
+}
+
+fn selected_withdraw_asset_is_icp(app: &App) -> bool {
+    app.withdraw_assets
+        .get(app.withdraw.asset_idx)
+        .map(|asset| asset.chain.eq_ignore_ascii_case("icp"))
+        .unwrap_or(true)
+}
+
+fn normalize_destination_for_selected_asset(app: &mut App) {
+    if !selected_withdraw_asset_is_icp(app)
+        && matches!(
+            app.withdraw.destination,
+            WithdrawDestinationKind::Trader | WithdrawDestinationKind::Recovery
+        )
+    {
+        app.withdraw.destination = WithdrawDestinationKind::Main;
+    }
+}
+
+fn rotate_destination_left(current: WithdrawDestinationKind, allow_icp_destinations: bool) -> WithdrawDestinationKind {
+    if allow_icp_destinations {
+        match current {
+            WithdrawDestinationKind::Main => WithdrawDestinationKind::Manual,
+            WithdrawDestinationKind::Trader => WithdrawDestinationKind::Main,
+            WithdrawDestinationKind::Recovery => WithdrawDestinationKind::Trader,
+            WithdrawDestinationKind::Bridge => WithdrawDestinationKind::Recovery,
+            WithdrawDestinationKind::Manual => WithdrawDestinationKind::Bridge,
+        }
+    } else {
+        match current {
+            WithdrawDestinationKind::Main => WithdrawDestinationKind::Manual,
+            WithdrawDestinationKind::Bridge => WithdrawDestinationKind::Main,
+            WithdrawDestinationKind::Manual => WithdrawDestinationKind::Bridge,
+            WithdrawDestinationKind::Trader | WithdrawDestinationKind::Recovery => WithdrawDestinationKind::Main,
+        }
+    }
+}
+
+fn rotate_destination_right(current: WithdrawDestinationKind, allow_icp_destinations: bool) -> WithdrawDestinationKind {
+    if allow_icp_destinations {
+        match current {
+            WithdrawDestinationKind::Main => WithdrawDestinationKind::Trader,
+            WithdrawDestinationKind::Trader => WithdrawDestinationKind::Recovery,
+            WithdrawDestinationKind::Recovery => WithdrawDestinationKind::Bridge,
+            WithdrawDestinationKind::Bridge => WithdrawDestinationKind::Manual,
+            WithdrawDestinationKind::Manual => WithdrawDestinationKind::Main,
+        }
+    } else {
+        match current {
+            WithdrawDestinationKind::Main => WithdrawDestinationKind::Bridge,
+            WithdrawDestinationKind::Bridge => WithdrawDestinationKind::Manual,
+            WithdrawDestinationKind::Manual => WithdrawDestinationKind::Main,
+            WithdrawDestinationKind::Trader | WithdrawDestinationKind::Recovery => WithdrawDestinationKind::Main,
+        }
     }
 }
 
@@ -693,27 +749,21 @@ pub(super) async fn handle_key(
                 KeyCode::Left => match app.withdraw.field {
                     WithdrawField::Source => {
                         app.withdraw.source = match app.withdraw.source {
-                            super::app::WithdrawAccountKind::Main => super::app::WithdrawAccountKind::Recovery,
+                            super::app::WithdrawAccountKind::Main => super::app::WithdrawAccountKind::Bridge,
                             super::app::WithdrawAccountKind::Trader => super::app::WithdrawAccountKind::Main,
                             super::app::WithdrawAccountKind::Recovery => super::app::WithdrawAccountKind::Trader,
+                            super::app::WithdrawAccountKind::Bridge => super::app::WithdrawAccountKind::Recovery,
                         };
                     }
                     WithdrawField::Destination => {
-                        app.withdraw.destination = match app.withdraw.destination {
-                            super::app::WithdrawDestinationKind::Main => super::app::WithdrawDestinationKind::Manual,
-                            super::app::WithdrawDestinationKind::Trader => super::app::WithdrawDestinationKind::Main,
-                            super::app::WithdrawDestinationKind::Recovery => {
-                                super::app::WithdrawDestinationKind::Trader
-                            }
-                            super::app::WithdrawDestinationKind::Manual => {
-                                super::app::WithdrawDestinationKind::Recovery
-                            }
-                        };
+                        app.withdraw.destination =
+                            rotate_destination_left(app.withdraw.destination, selected_withdraw_asset_is_icp(app));
                     }
                     WithdrawField::Asset => {
                         if !app.withdraw_assets.is_empty() {
                             app.withdraw.asset_idx =
                                 (app.withdraw.asset_idx + app.withdraw_assets.len() - 1) % app.withdraw_assets.len();
+                            normalize_destination_for_selected_asset(app);
                         }
                     }
                     _ => {}
@@ -723,24 +773,18 @@ pub(super) async fn handle_key(
                         app.withdraw.source = match app.withdraw.source {
                             super::app::WithdrawAccountKind::Main => super::app::WithdrawAccountKind::Trader,
                             super::app::WithdrawAccountKind::Trader => super::app::WithdrawAccountKind::Recovery,
-                            super::app::WithdrawAccountKind::Recovery => super::app::WithdrawAccountKind::Main,
+                            super::app::WithdrawAccountKind::Recovery => super::app::WithdrawAccountKind::Bridge,
+                            super::app::WithdrawAccountKind::Bridge => super::app::WithdrawAccountKind::Main,
                         };
                     }
                     WithdrawField::Destination => {
-                        app.withdraw.destination = match app.withdraw.destination {
-                            super::app::WithdrawDestinationKind::Main => super::app::WithdrawDestinationKind::Trader,
-                            super::app::WithdrawDestinationKind::Trader => {
-                                super::app::WithdrawDestinationKind::Recovery
-                            }
-                            super::app::WithdrawDestinationKind::Recovery => {
-                                super::app::WithdrawDestinationKind::Manual
-                            }
-                            super::app::WithdrawDestinationKind::Manual => super::app::WithdrawDestinationKind::Main,
-                        };
+                        app.withdraw.destination =
+                            rotate_destination_right(app.withdraw.destination, selected_withdraw_asset_is_icp(app));
                     }
                     WithdrawField::Asset => {
                         if !app.withdraw_assets.is_empty() {
                             app.withdraw.asset_idx = (app.withdraw.asset_idx + 1) % app.withdraw_assets.len();
+                            normalize_destination_for_selected_asset(app);
                         }
                     }
                     _ => {}
@@ -816,6 +860,11 @@ mod tests {
             liquidator_principal: "aaaaa-aa".to_string(),
             trader_principal: "bbbbb-bb".to_string(),
             evm_address: "0x0".to_string(),
+            bridge_evm_address: "0xbridge".to_string(),
+            bridge_ic_owner_principal: "ccccc-cc".to_string(),
+            bridge_ic_ckusdc_subaccount: "00".to_string(),
+            bridge_ic_ckbtc_subaccount: "11".to_string(),
+            bridge_btc_address: "bc1qbridge".to_string(),
             swapper_mode: "Hybrid".to_string(),
             max_dex_slippage_bps: 500,
             max_cex_slippage_bps: 200,

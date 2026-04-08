@@ -1,6 +1,7 @@
 use std::str::FromStr;
 use std::sync::Arc;
 
+use alloy::primitives::Address as EvmAddress;
 use candid::Nat;
 use icrc_ledger_types::icrc1::account::Account;
 use num_traits::ToPrimitive;
@@ -18,17 +19,16 @@ use super::app::{App, BalancesPanel, WithdrawAccountKind, WithdrawDestinationKin
 use super::events::UiEvent;
 use super::format;
 
+const EVM_NATIVE_GAS_BUFFER_WEI: u128 = 200_000_000_000_000;
+
 pub(super) fn build_withdrawable_assets(ctx: &crate::context::PipelineContext) -> Vec<AssetId> {
-    let mut ids: Vec<AssetId> = ctx
-        .registry
-        .tokens
-        .iter()
-        .filter_map(|(id, tok)| match tok {
-            ChainToken::Icp { .. } => Some(id.clone()),
-            _ => None,
-        })
-        .collect();
-    ids.sort_by(|a, b| a.symbol.cmp(&b.symbol).then(a.address.cmp(&b.address)));
+    let mut ids: Vec<AssetId> = ctx.registry.tokens.keys().cloned().collect();
+    ids.sort_by(|a, b| {
+        a.chain
+            .cmp(&b.chain)
+            .then(a.symbol.cmp(&b.symbol))
+            .then(a.address.cmp(&b.address))
+    });
     ids
 }
 
@@ -37,6 +37,23 @@ pub(super) fn deposit_network_for_asset(asset: &AssetId) -> String {
         "ICP".to_string()
     } else {
         asset.chain.to_ascii_uppercase()
+    }
+}
+
+fn parse_evm_destination_address(value: &str) -> Result<String, String> {
+    let addr = EvmAddress::from_str(value).map_err(|_| "invalid destination EVM address".to_string())?;
+    Ok(addr.to_string())
+}
+
+fn validate_manual_destination(token: &ChainToken, destination: &str) -> Result<(), String> {
+    match token {
+        ChainToken::Icp { .. } => {
+            Account::from_str(destination).map_err(|_| "invalid destination ICP account".to_string())?;
+            Ok(())
+        }
+        ChainToken::EvmNative { .. } | ChainToken::EvmErc20 { .. } => {
+            parse_evm_destination_address(destination).map(|_| ())
+        }
     }
 }
 
@@ -153,11 +170,21 @@ pub(super) fn submit_withdraw(
         return;
     };
 
-    if matches!(app.withdraw.destination, WithdrawDestinationKind::Manual)
-        && app.withdraw.manual_destination.trim().is_empty()
-    {
-        app.push_log("withdraw: manual destination is empty");
-        return;
+    if matches!(app.withdraw.destination, WithdrawDestinationKind::Manual) {
+        let manual_destination = app.withdraw.manual_destination.trim();
+        if manual_destination.is_empty() {
+            app.push_log("withdraw: manual destination is empty");
+            return;
+        }
+
+        let Some(token) = ctx.registry.get(&asset) else {
+            app.push_log(format!("withdraw: unknown asset {}", asset));
+            return;
+        };
+        if let Err(err) = validate_manual_destination(&token, manual_destination) {
+            app.push_log(format!("withdraw: {}", err));
+            return;
+        }
     }
 
     app.withdraw.in_flight = true;
@@ -187,37 +214,86 @@ async fn execute_withdraw(
     let token = ctx
         .registry
         .get(&asset)
-        .ok_or_else(|| format!("unknown asset: {}", asset))?;
-
-    let ChainToken::Icp { decimals, fee, .. } = token else {
-        return Err("TUI withdraw currently supports ICP tokens only".to_string());
-    };
+        .ok_or_else(|| format!("unknown asset: {}", asset))?
+        .clone();
 
     let (transfers, balances) = match source {
         WithdrawAccountKind::Main => (ctx.main_transfers.clone(), ctx.main_service.clone()),
         WithdrawAccountKind::Trader => (ctx.trader_transfers.clone(), ctx.trader_service.clone()),
         WithdrawAccountKind::Recovery => (ctx.recovery_transfers.clone(), ctx.recovery_service.clone()),
+        WithdrawAccountKind::Bridge => (
+            ctx.bridge_transfer_service_for_symbol(&asset.symbol),
+            ctx.bridge_balance_service_for_symbol(&asset.symbol),
+        ),
     };
 
-    let dst_account: Account = match destination {
-        WithdrawDestinationKind::Main => ctx.config.liquidator_principal.into(),
-        WithdrawDestinationKind::Trader => ctx.config.trader_principal.into(),
-        WithdrawDestinationKind::Recovery => ctx.config.get_recovery_account(),
-        WithdrawDestinationKind::Manual => {
-            Account::from_str(manual_destination.trim()).map_err(|_| "invalid destination ICP account".to_string())?
+    let destination_account = resolve_destination_account(&ctx, &token, destination, manual_destination.trim())?;
+
+    let amount_native: Nat = match &token {
+        ChainToken::Icp { decimals, fee, .. } => {
+            if amount.trim().eq_ignore_ascii_case("all") {
+                let bal = balances.get_balance(&asset).await?;
+                compute_withdraw_amount_native(bal.value, fee.clone(), amount.trim(), *decimals)?
+            } else {
+                compute_withdraw_amount_native(Nat::from(0u8), fee.clone(), amount.trim(), *decimals)?
+            }
+        }
+        ChainToken::EvmNative { decimals, .. } => {
+            if amount.trim().eq_ignore_ascii_case("all") {
+                let bal = balances.get_balance(&asset).await?;
+                compute_evm_withdraw_amount_native(bal.value, amount.trim(), *decimals, true)?
+            } else {
+                compute_evm_withdraw_amount_native(Nat::from(0u8), amount.trim(), *decimals, true)?
+            }
+        }
+        ChainToken::EvmErc20 { decimals, .. } => {
+            if amount.trim().eq_ignore_ascii_case("all") {
+                let bal = balances.get_balance(&asset).await?;
+                compute_evm_withdraw_amount_native(bal.value, amount.trim(), *decimals, false)?
+            } else {
+                compute_evm_withdraw_amount_native(Nat::from(0u8), amount.trim(), *decimals, false)?
+            }
         }
     };
 
-    let amount_native: Nat = if amount.trim().eq_ignore_ascii_case("all") {
-        let bal = balances.get_balance(&asset).await?;
-        compute_withdraw_amount_native(bal.value, fee.clone(), amount.trim(), decimals)?
-    } else {
-        compute_withdraw_amount_native(Nat::from(0u8), fee.clone(), amount.trim(), decimals)?
-    };
-
     transfers
-        .transfer_by_asset_id(&asset, ChainAccount::Icp(dst_account), amount_native)
+        .transfer_by_asset_id(&asset, destination_account, amount_native)
         .await
+}
+
+fn resolve_destination_account(
+    ctx: &crate::context::PipelineContext,
+    token: &ChainToken,
+    destination: WithdrawDestinationKind,
+    manual_destination: &str,
+) -> Result<ChainAccount, String> {
+    match token {
+        ChainToken::Icp { .. } => {
+            let dst_account: Account = match destination {
+                WithdrawDestinationKind::Main => ctx.config.liquidator_principal.into(),
+                WithdrawDestinationKind::Trader => ctx.config.trader_principal.into(),
+                WithdrawDestinationKind::Recovery => ctx.config.get_recovery_account(),
+                WithdrawDestinationKind::Bridge => ctx.config.bridge_ic_account_for_symbol(&token.symbol()),
+                WithdrawDestinationKind::Manual => {
+                    Account::from_str(manual_destination).map_err(|_| "invalid destination ICP account".to_string())?
+                }
+            };
+            Ok(ChainAccount::Icp(dst_account))
+        }
+        ChainToken::EvmNative { .. } | ChainToken::EvmErc20 { .. } => {
+            let dst_address = match destination {
+                WithdrawDestinationKind::Main => ctx.evm_address.clone(),
+                WithdrawDestinationKind::Bridge => ctx.config.bridge_evm_address.clone(),
+                WithdrawDestinationKind::Manual => parse_evm_destination_address(manual_destination)?,
+                WithdrawDestinationKind::Trader | WithdrawDestinationKind::Recovery => {
+                    return Err(
+                        "destination trader/recovery is ICP-only; use main/bridge/manual for EVM assets".to_string(),
+                    );
+                }
+            };
+            Ok(ChainAccount::Evm(dst_address))
+        }
+    }
 }
 
 fn compute_withdraw_amount_native(balance: Nat, fee: Nat, amount: &str, decimals: u8) -> Result<Nat, String> {
@@ -241,13 +317,40 @@ fn compute_withdraw_amount_native(balance: Nat, fee: Nat, amount: &str, decimals
     }
 }
 
+fn compute_evm_withdraw_amount_native(
+    balance: Nat,
+    amount: &str,
+    decimals: u8,
+    reserve_native_gas: bool,
+) -> Result<Nat, String> {
+    if amount.trim().eq_ignore_ascii_case("all") {
+        if reserve_native_gas {
+            let bal_u128 = balance
+                .0
+                .to_u128()
+                .ok_or_else(|| "balance too large for u128".to_string())?;
+            let send_u128 = bal_u128.saturating_sub(EVM_NATIVE_GAS_BUFFER_WEI);
+            if send_u128 == 0 {
+                return Err("balance too low to cover EVM gas reserve".to_string());
+            }
+            Ok(Nat::from(send_u128))
+        } else {
+            Ok(balance)
+        }
+    } else {
+        let units = format::decimal_to_units(amount.trim(), decimals)
+            .ok_or_else(|| format!("invalid amount (expected decimal with <= {decimals} decimals, or 'all')"))?;
+        Ok(Nat::from(units))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::str::FromStr;
 
     use candid::Nat;
 
-    use super::compute_withdraw_amount_native;
+    use super::{EVM_NATIVE_GAS_BUFFER_WEI, compute_evm_withdraw_amount_native, compute_withdraw_amount_native};
 
     #[test]
     fn all_subtracts_fee_correctly() {
@@ -282,5 +385,19 @@ mod tests {
 
         let got = compute_withdraw_amount_native(Nat::from(0u8), Nat::from(0u8), "1.23", 2).expect("ok");
         assert_eq!(got, Nat::from(123u32));
+    }
+
+    #[test]
+    fn evm_native_all_reserves_gas_buffer() {
+        let balance = Nat::from(EVM_NATIVE_GAS_BUFFER_WEI + 123u128);
+        let got = compute_evm_withdraw_amount_native(balance, "all", 18, true).expect("ok");
+        assert_eq!(got, Nat::from(123u128));
+    }
+
+    #[test]
+    fn evm_native_all_rejects_when_only_gas_buffer_available() {
+        let err = compute_evm_withdraw_amount_native(Nat::from(EVM_NATIVE_GAS_BUFFER_WEI), "all", 18, true)
+            .expect_err("should fail");
+        assert_eq!(err, "balance too low to cover EVM gas reserve");
     }
 }
