@@ -32,6 +32,27 @@ pub async fn show() {
                     Ok(evm_signer) => {
                         let evm_address = evm_signer.address();
                         info!(role = "evm", principal = %evm_address, "Account identity");
+                        info!(
+                            role = "bridge-evm",
+                            principal = %config.bridge_evm_address,
+                            "Account identity"
+                        );
+                        info!(
+                            role = "bridge-ic-owner",
+                            principal = %config.bridge_ic_owner_principal,
+                            "Account identity"
+                        );
+                        info!(
+                            role = "bridge-ic-ckusdc-subaccount",
+                            principal = %hex::encode(config.bridge_ic_ckusdc_subaccount),
+                            "Account identity"
+                        );
+                        info!(
+                            role = "bridge-ic-ckbtc-subaccount",
+                            principal = %hex::encode(config.bridge_ic_ckbtc_subaccount),
+                            "Account identity"
+                        );
+                        info!(role = "bridge-btc", principal = %config.bridge_btc_address, "Account identity");
                     }
                     Err(_) => {
                         warn!(role = "evm", "Invalid EVM private key in config");
@@ -60,6 +81,26 @@ pub async fn show() {
                     table.add_row(Row::new(vec![
                         Cell::new("EVM Account"),
                         Cell::new(&format!("{evm_address}")),
+                    ]));
+                    table.add_row(Row::new(vec![
+                        Cell::new("Bridge EVM Account"),
+                        Cell::new(&config.bridge_evm_address),
+                    ]));
+                    table.add_row(Row::new(vec![
+                        Cell::new("Bridge ICP Owner"),
+                        Cell::new(&config.bridge_ic_owner_principal.to_string()),
+                    ]));
+                    table.add_row(Row::new(vec![
+                        Cell::new("Bridge ckUSDC Subaccount"),
+                        Cell::new(&hex::encode(config.bridge_ic_ckusdc_subaccount)),
+                    ]));
+                    table.add_row(Row::new(vec![
+                        Cell::new("Bridge ckBTC Subaccount"),
+                        Cell::new(&hex::encode(config.bridge_ic_ckbtc_subaccount)),
+                    ]));
+                    table.add_row(Row::new(vec![
+                        Cell::new("Bridge BTC Address"),
+                        Cell::new(&config.bridge_btc_address),
                     ]));
                 }
                 Err(_) => {

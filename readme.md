@@ -310,13 +310,42 @@ WATCHDOG_WEBHOOK=https://your-webhook-url.com/endpoint
 
 ## Identity Management
 
-The bot uses **three identities** derived from a BIP39 mnemonic for security:
+The bot derives identities/addresses from one BIP39 mnemonic using two namespaces:
 
-| Identity | Purpose | Description |
-|----------|---------|-------------|
-| **Liquidator** | Main account | Initiates liquidations, receives collateral |
-| **Trader** | Swap execution | Isolated swap operations (reduces MEV risk) |
-| **Recovery** | Fallback | Catches failed collateral transfers |
+| Namespace | Role | Path / Derivation | Purpose |
+|-----------|------|-------------------|---------|
+| **Operational** (`account=0`) | Liquidator | `m/44'/60'/0'/0/0` | Main liquidation operations |
+| **Operational** (`account=0`) | Trader | `m/44'/60'/0'/0/1` | Isolated swap execution |
+| **Operational** (`account=0`) | Recovery | `RECOVERY_ACCOUNT` fixed subaccount | Fallback custody for failed flows |
+| **Bridge** (`account=1`) | Bridge EVM signer | `m/44'/60'/1'/0/0` | Bridge source wallet signer |
+| **Bridge** (`account=1`) | Bridge ICP owner | `m/44'/60'/1'/0/1` | Bridge-side ICP owner principal |
+| **Bridge** (`account=1`) | Bridge BTC key/address | `m/84'/0'/1'/0/0` | Future BTC/ckBTC bridge routes |
+
+### Account Structure Diagram
+
+```text
+Mnemonic
+└── HD Key Tree
+    ├── Operational Namespace (account = 0)
+    │   ├── Liquidator (EVM signer)        m/44'/60'/0'/0/0
+    │   ├── Liquidator (ICP principal)     m/44'/60'/0'/0/0
+    │   ├── Trader (ICP principal)         m/44'/60'/0'/0/1
+    │   └── Recovery account               owner + RECOVERY_ACCOUNT subaccount (0xBEEF...00)
+    │       (recovery is a subaccount, not a separate HD index)
+    │
+    └── Bridge Namespace (account = 1)
+        ├── Bridge EVM signer/address      m/44'/60'/1'/0/0
+        ├── Bridge ICP owner principal     m/44'/60'/1'/0/1
+        ├── Bridge BTC key/address         m/84'/0'/1'/0/0
+        ├── Bridge ckUSDC subaccount       sha256("bridge/ckusdc")
+        └── Bridge ckBTC subaccount        sha256("bridge/ckbtc")
+```
+
+Current bridge sweeper wiring:
+- Source: derived `bridge_evm_address`
+- Destination: resolved per request in code (current default: liquidator ICP principal)
+- Routes: loaded from a code-level bridge catalog (`ckETH` ERC-20 forward routes); submissions are serialized to keep nonce ordering on the shared bridge signer.
+- Design details: `docs/bridge-architecture.md`
 
 ### Generate New Identities
 
@@ -324,7 +353,7 @@ The bot uses **three identities** derived from a BIP39 mnemonic for security:
 liquidator account new
 ```
 
-Creates new Ed25519/Secp256k1 identities for all three roles.
+Creates a new mnemonic used to deterministically derive all operational and bridge roles.
 
 ### Show Existing Identities
 

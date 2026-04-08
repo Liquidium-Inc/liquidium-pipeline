@@ -2,20 +2,23 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use liquidium_pipeline_connectors::backend::bridge_backend::{BridgeBackend, BridgeRequest, BridgeSubmission};
+use candid::Principal;
+use futures::future::join_all;
+use icrc_ledger_types::icrc1::account::Account;
+use liquidium_pipeline_connectors::backend::bridge_backend::{
+    BridgeBackend, BridgeDestination, BridgeRequest, BridgeSubmission, BridgeSweepRoute,
+};
 use tokio::time::sleep;
 use tracing::{info, warn};
-
-const SOURCE_ASSET: &str = "USDC";
-const SOURCE_CHAIN: &str = "ETH";
-const TARGET_ASSET: &str = "ckUSDC";
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct BridgeBalanceSnapshot {
     pub asset: String,
     pub source_chain: String,
     pub source_address: String,
+    pub target_asset: String,
     pub amount: f64,
+    pub min_sweep_amount: f64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -24,8 +27,19 @@ pub struct BridgeAction {
     pub source_chain: String,
     pub source_address: String,
     pub target_asset: String,
-    pub destination_account: String,
+    pub destination: BridgeDestination,
     pub amount: f64,
+}
+
+pub type BridgeDestinationResolver = Arc<dyn Fn(&BridgeBalanceSnapshot) -> BridgeDestination + Send + Sync>;
+
+pub fn liquidator_destination_resolver(liquidator_principal: Principal) -> BridgeDestinationResolver {
+    Arc::new(move |_snapshot: &BridgeBalanceSnapshot| {
+        BridgeDestination::IcpAccount(Account {
+            owner: liquidator_principal,
+            subaccount: None,
+        })
+    })
 }
 
 #[async_trait]
@@ -41,7 +55,8 @@ where
 {
     pub backend: Arc<B>,
     pub source_address: String,
-    pub destination_account: String,
+    pub routes: Vec<BridgeSweepRoute>,
+    pub destination_resolver: BridgeDestinationResolver,
     pub poll_interval: Duration,
 }
 
@@ -49,11 +64,18 @@ impl<B> BridgeSweeper<B>
 where
     B: BridgeBackend + Send + Sync,
 {
-    pub fn new(backend: Arc<B>, source_address: String, destination_account: String, poll_interval: Duration) -> Self {
+    pub fn new(
+        backend: Arc<B>,
+        source_address: String,
+        routes: Vec<BridgeSweepRoute>,
+        destination_resolver: BridgeDestinationResolver,
+        poll_interval: Duration,
+    ) -> Self {
         Self {
             backend,
             source_address,
-            destination_account,
+            routes,
+            destination_resolver,
             poll_interval,
         }
     }
@@ -77,29 +99,65 @@ where
         if self.source_address.trim().is_empty() {
             return Err("bridge sweeper source address is empty".to_string());
         }
-        if self.destination_account.trim().is_empty() {
-            return Err("bridge sweeper destination account is empty".to_string());
+        if self.routes.is_empty() {
+            return Err("bridge sweeper has no routes configured".to_string());
         }
 
-        let balance = self
-            .backend
-            .get_source_balance(SOURCE_ASSET, SOURCE_CHAIN, &self.source_address)
-            .await
-            .map_err(|e| format!("bridge balance read failed: {e}"))?;
-
-        let action = self.plan(BridgeBalanceSnapshot {
-            asset: SOURCE_ASSET.to_string(),
-            source_chain: SOURCE_CHAIN.to_string(),
-            source_address: self.source_address.clone(),
-            amount: balance,
+        // Parallel read phase: fetch balances for all routes in one async join.
+        let source_address = self.source_address.clone();
+        let backend = self.backend.clone();
+        let balance_reads = self.routes.iter().cloned().map(|route| {
+            let backend = backend.clone();
+            let source_address = source_address.clone();
+            async move {
+                let balance = backend
+                    .get_source_balance(&route.source_asset, &route.source_chain, &source_address)
+                    .await;
+                (route, balance)
+            }
         });
+        let balance_results = join_all(balance_reads).await;
 
-        if let Some(action) = action {
-            let submission = self.submit(action.clone()).await?;
-            info!(
-                "[bridge] submitted full sweep for {}@{} amount={} provider_bridge_id={}",
-                action.asset, action.source_chain, action.amount, submission.bridge_id
-            );
+        // Serial submission phase: preserve deterministic route order for nonce safety.
+        for (route, balance) in balance_results {
+            let balance = match balance {
+                Ok(v) => v,
+                Err(err) => {
+                    warn!(
+                        "[bridge] balance read failed for {}@{} -> {}: {}",
+                        route.source_asset, route.source_chain, route.target_asset, err
+                    );
+                    continue;
+                }
+            };
+
+            let action = self.plan(BridgeBalanceSnapshot {
+                asset: route.source_asset.clone(),
+                source_chain: route.source_chain.clone(),
+                source_address: self.source_address.clone(),
+                target_asset: route.target_asset.clone(),
+                amount: balance,
+                min_sweep_amount: route.min_sweep_amount,
+            });
+
+            let Some(action) = action else {
+                continue;
+            };
+
+            match self.submit(action.clone()).await {
+                Ok(submission) => {
+                    info!(
+                        "[bridge] submitted full sweep for {}@{} -> {} amount={} provider_bridge_id={}",
+                        action.asset, action.source_chain, action.target_asset, action.amount, submission.bridge_id
+                    );
+                }
+                Err(err) => {
+                    warn!(
+                        "[bridge] submission failed for {}@{} -> {}: {}",
+                        action.asset, action.source_chain, action.target_asset, err
+                    );
+                }
+            }
         }
 
         Ok(())
@@ -109,19 +167,17 @@ where
         if !balance_snapshot.amount.is_finite() || balance_snapshot.amount <= 0.0 {
             return None;
         }
-        if balance_snapshot.asset != SOURCE_ASSET {
-            return None;
-        }
-        if balance_snapshot.source_chain != SOURCE_CHAIN {
+        if balance_snapshot.amount <= balance_snapshot.min_sweep_amount {
             return None;
         }
 
+        let destination = (self.destination_resolver)(&balance_snapshot);
         Some(BridgeAction {
             asset: balance_snapshot.asset,
             source_chain: balance_snapshot.source_chain,
             source_address: balance_snapshot.source_address,
-            target_asset: TARGET_ASSET.to_string(),
-            destination_account: self.destination_account.clone(),
+            target_asset: balance_snapshot.target_asset,
+            destination,
             amount: balance_snapshot.amount,
         })
     }
@@ -132,7 +188,7 @@ where
             source_chain: action.source_chain,
             source_address: action.source_address,
             target_asset: action.target_asset,
-            destination_account: action.destination_account,
+            destination: action.destination,
             amount: action.amount,
         };
 
@@ -148,113 +204,182 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
-    use liquidium_pipeline_connectors::backend::bridge_backend::{BridgeSubmission, MockBridgeBackend};
+    use candid::Principal;
+    use liquidium_pipeline_connectors::backend::bridge_backend::{
+        BridgeDestination, BridgeSubmission, BridgeSweepRoute, MockBridgeBackend,
+    };
+    use mockall::Sequence;
 
-    use super::{BridgeBalanceSnapshot, BridgeService, BridgeSweeper};
+    use super::{BridgeBalanceSnapshot, BridgeService, BridgeSweeper, liquidator_destination_resolver};
 
-    fn make_sweeper(backend: Arc<MockBridgeBackend>) -> BridgeSweeper<MockBridgeBackend> {
+    fn route(source_asset: &str, target_asset: &str, min_sweep_amount: f64) -> BridgeSweepRoute {
+        BridgeSweepRoute {
+            source_asset: source_asset.to_string(),
+            source_chain: "ETH".to_string(),
+            target_asset: target_asset.to_string(),
+            min_sweep_amount,
+        }
+    }
+
+    fn make_sweeper(
+        backend: Arc<MockBridgeBackend>,
+        routes: Vec<BridgeSweepRoute>,
+    ) -> BridgeSweeper<MockBridgeBackend> {
         BridgeSweeper::new(
             backend,
             "0x1111111111111111111111111111111111111111".to_string(),
-            "aaaaa-aa".to_string(),
+            routes,
+            liquidator_destination_resolver(Principal::management_canister()),
             Duration::from_secs(5),
         )
     }
 
     #[test]
-    fn policy_plans_only_eth_usdc_and_sweeps_full_balance() {
+    fn plan_respects_min_sweep_threshold() {
         let backend = Arc::new(MockBridgeBackend::new());
-        let sweeper = make_sweeper(backend);
+        let sweeper = make_sweeper(backend, vec![route("USDC", "ckUSDC", 1.0)]);
 
-        let action = sweeper.plan(BridgeBalanceSnapshot {
-            asset: "USDC".to_string(),
-            source_chain: "ETH".to_string(),
-            source_address: "0xsource".to_string(),
-            amount: 42.0,
-        });
-        let action = action.expect("expected action for ETH-USDC");
-        assert_eq!(action.amount, 42.0);
-        assert_eq!(action.target_asset, "ckUSDC");
-        assert_eq!(action.destination_account, "aaaaa-aa");
-
-        assert!(
-            sweeper
-                .plan(BridgeBalanceSnapshot {
-                    asset: "USDT".to_string(),
-                    source_chain: "ETH".to_string(),
-                    source_address: "0xsource".to_string(),
-                    amount: 1.0,
-                })
-                .is_none()
-        );
         assert!(
             sweeper
                 .plan(BridgeBalanceSnapshot {
                     asset: "USDC".to_string(),
-                    source_chain: "ARB".to_string(),
+                    source_chain: "ETH".to_string(),
                     source_address: "0xsource".to_string(),
-                    amount: 1.0,
+                    target_asset: "ckUSDC".to_string(),
+                    amount: 0.5,
+                    min_sweep_amount: 1.0,
                 })
                 .is_none()
         );
+
+        let action = sweeper
+            .plan(BridgeBalanceSnapshot {
+                asset: "USDC".to_string(),
+                source_chain: "ETH".to_string(),
+                source_address: "0xsource".to_string(),
+                target_asset: "ckUSDC".to_string(),
+                amount: 2.0,
+                min_sweep_amount: 1.0,
+            })
+            .expect("expected action above threshold");
+        assert_eq!(action.asset, "USDC");
+        assert_eq!(action.target_asset, "ckUSDC");
     }
 
     #[tokio::test]
-    async fn tick_submits_bridge_when_balance_positive() {
+    async fn tick_processes_routes_in_serial_order() {
         let mut backend = MockBridgeBackend::new();
+        let mut seq = Sequence::new();
+
         backend
             .expect_get_source_balance()
             .times(1)
-            .returning(|asset, chain, address| {
-                assert_eq!(asset, "USDC");
-                assert_eq!(chain, "ETH");
-                assert_eq!(address, "0x1111111111111111111111111111111111111111");
-                Ok(3.5)
-            });
-        backend.expect_submit_bridge().times(1).returning(|request| {
-            assert_eq!(request.asset, "USDC");
-            assert_eq!(request.source_chain, "ETH");
-            assert_eq!(request.target_asset, "ckUSDC");
-            assert_eq!(request.amount, 3.5);
-            Ok(BridgeSubmission {
-                bridge_id: "bridge-123".to_string(),
+            .in_sequence(&mut seq)
+            .withf(|asset, chain, address| {
+                asset == "USDC" && chain == "ETH" && address == "0x1111111111111111111111111111111111111111"
             })
-        });
+            .returning(|_, _, _| Ok(3.5));
+        backend
+            .expect_get_source_balance()
+            .times(1)
+            .in_sequence(&mut seq)
+            .withf(|asset, chain, address| {
+                asset == "USDT" && chain == "ETH" && address == "0x1111111111111111111111111111111111111111"
+            })
+            .returning(|_, _, _| Ok(4.0));
+        backend
+            .expect_submit_bridge()
+            .times(1)
+            .in_sequence(&mut seq)
+            .withf(|request| request.asset == "USDC" && request.target_asset == "ckUSDC")
+            .returning(|request| {
+                assert_eq!(
+                    request.destination,
+                    BridgeDestination::IcpAccount(icrc_ledger_types::icrc1::account::Account {
+                        owner: Principal::management_canister(),
+                        subaccount: None,
+                    })
+                );
+                Ok(BridgeSubmission {
+                    bridge_id: "bridge-usdc".to_string(),
+                })
+            });
+        backend
+            .expect_submit_bridge()
+            .times(1)
+            .in_sequence(&mut seq)
+            .withf(|request| request.asset == "USDT" && request.target_asset == "ckUSDT")
+            .returning(|_| {
+                Ok(BridgeSubmission {
+                    bridge_id: "bridge-usdt".to_string(),
+                })
+            });
         backend.expect_get_bridge_status().times(0);
 
-        let sweeper = make_sweeper(Arc::new(backend));
-        sweeper.tick().await.expect("tick should submit");
+        let sweeper = make_sweeper(
+            Arc::new(backend),
+            vec![route("USDC", "ckUSDC", 0.0), route("USDT", "ckUSDT", 0.0)],
+        );
+        sweeper.tick().await.expect("tick should complete");
     }
 
     #[tokio::test]
-    async fn tick_skips_submission_when_balance_is_zero() {
+    async fn tick_skips_submission_when_balance_below_threshold() {
         let mut backend = MockBridgeBackend::new();
         backend
             .expect_get_source_balance()
             .times(1)
-            .returning(|_, _, _| Ok(0.0));
+            .returning(|_, _, _| Ok(0.5));
         backend.expect_submit_bridge().times(0);
         backend.expect_get_bridge_status().times(0);
 
-        let sweeper = make_sweeper(Arc::new(backend));
+        let sweeper = make_sweeper(Arc::new(backend), vec![route("USDC", "ckUSDC", 1.0)]);
         sweeper.tick().await.expect("tick should no-op");
     }
 
     #[tokio::test]
-    async fn provider_submit_error_bubbles() {
+    async fn tick_continues_when_a_route_fails() {
         let mut backend = MockBridgeBackend::new();
+        let mut seq = Sequence::new();
         backend
             .expect_get_source_balance()
             .times(1)
+            .in_sequence(&mut seq)
+            .withf(|asset, _, _| asset == "USDC")
+            .returning(|_, _, _| Err("provider down".to_string()));
+        backend
+            .expect_get_source_balance()
+            .times(1)
+            .in_sequence(&mut seq)
+            .withf(|asset, _, _| asset == "USDT")
             .returning(|_, _, _| Ok(2.0));
         backend
             .expect_submit_bridge()
             .times(1)
-            .returning(|_| Err("provider down".to_string()));
+            .in_sequence(&mut seq)
+            .withf(|request| request.asset == "USDT")
+            .returning(|_| {
+                Ok(BridgeSubmission {
+                    bridge_id: "bridge-usdt".to_string(),
+                })
+            });
         backend.expect_get_bridge_status().times(0);
 
-        let sweeper = make_sweeper(Arc::new(backend));
-        let err = sweeper.tick().await.expect_err("tick should fail");
-        assert!(err.contains("bridge submission failed"));
+        let sweeper = make_sweeper(
+            Arc::new(backend),
+            vec![route("USDC", "ckUSDC", 0.0), route("USDT", "ckUSDT", 0.0)],
+        );
+        sweeper
+            .tick()
+            .await
+            .expect("tick should continue across route failures");
+    }
+
+    #[tokio::test]
+    async fn tick_errors_when_no_routes_configured() {
+        let backend = Arc::new(MockBridgeBackend::new());
+        let sweeper = make_sweeper(backend, vec![]);
+        let err = sweeper.tick().await.expect_err("tick must fail");
+        assert!(err.contains("no routes configured"));
     }
 }
