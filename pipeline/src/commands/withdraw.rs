@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::Arc;
 
+use alloy::network::AnyNetwork;
 use candid::{Decode, Encode, Nat, Principal};
 use ic_agent::Agent;
 use icrc_ledger_types::icrc1::account::Account;
@@ -17,6 +18,8 @@ use liquidium_pipeline_core::tokens::{
 use liquidium_pipeline_core::account::model::ChainAccount;
 
 use alloy::primitives::Address as EvmAddress;
+use alloy::providers::{Provider, ProviderBuilder};
+use alloy::signers::local::PrivateKeySigner;
 
 use crate::config::ConfigTrait;
 use crate::context::{PipelineContext, init_context};
@@ -355,18 +358,52 @@ pub async fn withdraw() {
                     }
                     Nat::from(send_amount)
                 }
-                ChainToken::EvmErc20 { .. } => bal_opt.map(|b| b.value.clone()).unwrap_or(0u8.into()),
+                ChainToken::EvmErc20 { .. } => {
+                    let (gas_reserve_wei, native_balance_wei) = match estimate_evm_gas_reserve_and_native_balance_wei(
+                        &config,
+                        source_kind,
+                        EVM_ERC20_TRANSFER_GAS_LIMIT,
+                    )
+                    .await
+                    {
+                        Ok(v) => v,
+                        Err(err) => {
+                            println!("Failed to estimate EVM gas reserve: {err}; aborting.");
+                            return;
+                        }
+                    };
+                    if native_balance_wei <= gas_reserve_wei {
+                        println!(
+                            "Not enough native balance to cover gas for EVM token transfer; aborting. native_balance_wei={} gas_reserve_wei={}",
+                            native_balance_wei, gas_reserve_wei
+                        );
+                        return;
+                    }
+                    bal_opt.map(|b| b.value.clone()).unwrap_or(0u8.into())
+                }
 
                 // EVM native: reserve a gas buffer so the tx can actually be sent.
                 ChainToken::EvmNative { .. } => {
-                    let bal_native = bal_opt.map(|b| b.value.clone()).unwrap_or(0u8.into());
-
-                    // Simple fixed gas buffer in wei (e.g. ~0.0002 ETH).
-                    let gas_buffer_wei: u128 = 200_000_000_000_000u128;
-                    let send_native = bal_native.0.to_u128().unwrap().saturating_sub(gas_buffer_wei);
+                    let (gas_reserve_wei, native_balance_wei) = match estimate_evm_gas_reserve_and_native_balance_wei(
+                        &config,
+                        source_kind,
+                        EVM_NATIVE_TRANSFER_GAS_LIMIT,
+                    )
+                    .await
+                    {
+                        Ok(v) => v,
+                        Err(err) => {
+                            println!("Failed to estimate EVM gas reserve: {err}; aborting.");
+                            return;
+                        }
+                    };
+                    let send_native = native_balance_wei.saturating_sub(gas_reserve_wei);
 
                     if send_native == 0 {
-                        println!("Not enough native balance to cover gas for EVM transfer; aborting.");
+                        println!(
+                            "Not enough native balance to cover gas for EVM transfer; aborting. native_balance_wei={} gas_reserve_wei={}",
+                            native_balance_wei, gas_reserve_wei
+                        );
                         return;
                     }
 
@@ -598,6 +635,54 @@ async fn fetch_icrc1_fee(agent: Arc<Agent>, ledger: Principal) -> Nat {
 }
 
 const EVM_NATIVE_GAS_BUFFER_WEI: u128 = 200_000_000_000_000;
+const EVM_NATIVE_TRANSFER_GAS_LIMIT: u128 = 21_000;
+const EVM_ERC20_TRANSFER_GAS_LIMIT: u128 = 100_000;
+const EVM_GAS_RESERVE_MULTIPLIER: u128 = 2;
+
+fn evm_private_key_for_source<'a>(config: &'a crate::config::Config, source_kind: &str) -> &'a str {
+    if source_kind == "bridge" {
+        &config.bridge_evm_private_key
+    } else {
+        &config.evm_private_key
+    }
+}
+
+async fn estimate_evm_gas_reserve_and_native_balance_wei(
+    config: &crate::config::Config,
+    source_kind: &str,
+    gas_limit: u128,
+) -> Result<(u128, u128), String> {
+    let signer: PrivateKeySigner = evm_private_key_for_source(config, source_kind)
+        .parse()
+        .map_err(|e| format!("failed to parse EVM private key for source '{source_kind}': {e}"))?;
+    let signer_address = signer.address();
+    let rpc_url = config
+        .evm_rpc_url
+        .parse()
+        .map_err(|e| format!("invalid EVM RPC URL '{}': {e}", config.evm_rpc_url))?;
+
+    let provider = ProviderBuilder::new()
+        .network::<AnyNetwork>()
+        .wallet(signer)
+        .connect_http(rpc_url);
+
+    let gas_price_wei = provider
+        .get_gas_price()
+        .await
+        .map_err(|e| format!("failed to fetch EVM gas price: {e}"))?;
+    let dynamic_reserve = gas_price_wei
+        .saturating_mul(gas_limit)
+        .saturating_mul(EVM_GAS_RESERVE_MULTIPLIER);
+    let gas_reserve_wei = dynamic_reserve.max(EVM_NATIVE_GAS_BUFFER_WEI);
+
+    let native_balance_wei = provider
+        .get_balance(signer_address)
+        .await
+        .map_err(|e| format!("failed to fetch EVM native balance for {}: {e}", signer_address))?
+        .to::<u128>();
+
+    Ok((gas_reserve_wei, native_balance_wei))
+}
 
 fn format_chain_balance_plain(bal: &ChainTokenAmount) -> String {
     let raw = bal.value.clone();
@@ -871,17 +956,51 @@ pub async fn withdraw_noninteractive(source: &str, destination: &str, asset: &st
                 }
                 ChainToken::EvmErc20 { .. } => ChainTokenAmount {
                     token: token.clone(),
-                    value: bal_opt.map(|b| b.value).unwrap_or_else(|| Nat::from(0u8)),
+                    value: {
+                        let (gas_reserve_wei, native_balance_wei) =
+                            match estimate_evm_gas_reserve_and_native_balance_wei(
+                                &config,
+                                source_kind,
+                                EVM_ERC20_TRANSFER_GAS_LIMIT,
+                            )
+                            .await
+                            {
+                                Ok(v) => v,
+                                Err(err) => {
+                                    eprintln!("Failed to estimate EVM gas reserve: {err}");
+                                    return;
+                                }
+                            };
+                        if native_balance_wei <= gas_reserve_wei {
+                            eprintln!(
+                                "Not enough native balance to cover gas for EVM token transfer; aborting. native_balance_wei={} gas_reserve_wei={}",
+                                native_balance_wei, gas_reserve_wei
+                            );
+                            return;
+                        }
+                        bal_opt.map(|b| b.value).unwrap_or_else(|| Nat::from(0u8))
+                    },
                 },
                 ChainToken::EvmNative { .. } => {
-                    let bal_native = bal_opt.map(|b| b.value).unwrap_or_else(|| Nat::from(0u8));
-                    let send_native = bal_native
-                        .0
-                        .to_u128()
-                        .unwrap_or(0)
-                        .saturating_sub(EVM_NATIVE_GAS_BUFFER_WEI);
+                    let (gas_reserve_wei, native_balance_wei) = match estimate_evm_gas_reserve_and_native_balance_wei(
+                        &config,
+                        source_kind,
+                        EVM_NATIVE_TRANSFER_GAS_LIMIT,
+                    )
+                    .await
+                    {
+                        Ok(v) => v,
+                        Err(err) => {
+                            eprintln!("Failed to estimate EVM gas reserve: {err}");
+                            return;
+                        }
+                    };
+                    let send_native = native_balance_wei.saturating_sub(gas_reserve_wei);
                     if send_native == 0 {
-                        eprintln!("Not enough native balance to cover gas for EVM transfer; aborting.");
+                        eprintln!(
+                            "Not enough native balance to cover gas for EVM transfer; aborting. native_balance_wei={} gas_reserve_wei={}",
+                            native_balance_wei, gas_reserve_wei
+                        );
                         return;
                     }
                     ChainTokenAmount {

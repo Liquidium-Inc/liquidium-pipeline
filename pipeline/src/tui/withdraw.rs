@@ -1,7 +1,10 @@
 use std::str::FromStr;
 use std::sync::Arc;
 
+use alloy::network::AnyNetwork;
 use alloy::primitives::Address as EvmAddress;
+use alloy::providers::{Provider, ProviderBuilder};
+use alloy::signers::local::PrivateKeySigner;
 use candid::Nat;
 use icrc_ledger_types::icrc1::account::Account;
 use num_traits::ToPrimitive;
@@ -20,6 +23,59 @@ use super::events::UiEvent;
 use super::format;
 
 const EVM_NATIVE_GAS_BUFFER_WEI: u128 = 200_000_000_000_000;
+const EVM_NATIVE_TRANSFER_GAS_LIMIT: u128 = 21_000;
+const EVM_ERC20_TRANSFER_GAS_LIMIT: u128 = 100_000;
+const EVM_GAS_RESERVE_MULTIPLIER: u128 = 2;
+
+fn evm_private_key_for_source<'a>(config: &'a crate::config::Config, source: WithdrawAccountKind) -> &'a str {
+    match source {
+        WithdrawAccountKind::Bridge => &config.bridge_evm_private_key,
+        _ => &config.evm_private_key,
+    }
+}
+
+async fn estimate_evm_gas_reserve_and_native_balance_wei(
+    config: &crate::config::Config,
+    source: WithdrawAccountKind,
+    gas_limit: u128,
+) -> Result<(u128, u128), String> {
+    let source_label = match source {
+        WithdrawAccountKind::Main => "main",
+        WithdrawAccountKind::Trader => "trader",
+        WithdrawAccountKind::Recovery => "recovery",
+        WithdrawAccountKind::Bridge => "bridge",
+    };
+    let signer: PrivateKeySigner = evm_private_key_for_source(config, source)
+        .parse()
+        .map_err(|e| format!("failed to parse EVM private key for source '{source_label}': {e}"))?;
+    let signer_address = signer.address();
+    let rpc_url = config
+        .evm_rpc_url
+        .parse()
+        .map_err(|e| format!("invalid EVM RPC URL '{}': {e}", config.evm_rpc_url))?;
+
+    let provider = ProviderBuilder::new()
+        .network::<AnyNetwork>()
+        .wallet(signer)
+        .connect_http(rpc_url);
+
+    let gas_price_wei = provider
+        .get_gas_price()
+        .await
+        .map_err(|e| format!("failed to fetch EVM gas price: {e}"))?;
+    let dynamic_reserve = gas_price_wei
+        .saturating_mul(gas_limit)
+        .saturating_mul(EVM_GAS_RESERVE_MULTIPLIER);
+    let gas_reserve_wei = dynamic_reserve.max(EVM_NATIVE_GAS_BUFFER_WEI);
+
+    let native_balance_wei = provider
+        .get_balance(signer_address)
+        .await
+        .map_err(|e| format!("failed to fetch EVM native balance for {}: {e}", signer_address))?
+        .to::<u128>();
+
+    Ok((gas_reserve_wei, native_balance_wei))
+}
 
 pub(super) fn build_withdrawable_assets(ctx: &crate::context::PipelineContext) -> Vec<AssetId> {
     let mut ids: Vec<AssetId> = ctx.registry.tokens.keys().cloned().collect();
@@ -240,14 +296,33 @@ async fn execute_withdraw(
         }
         ChainToken::EvmNative { decimals, .. } => {
             if amount.trim().eq_ignore_ascii_case("all") {
-                let bal = balances.get_balance(&asset).await?;
-                compute_evm_withdraw_amount_native(bal.value, amount.trim(), *decimals, true)?
+                let (gas_reserve_wei, native_balance_wei) =
+                    estimate_evm_gas_reserve_and_native_balance_wei(&ctx.config, source, EVM_NATIVE_TRANSFER_GAS_LIMIT)
+                        .await?;
+                let send_native = native_balance_wei.saturating_sub(gas_reserve_wei);
+                if send_native == 0 {
+                    return Err(format!(
+                        "native balance too low to cover EVM gas reserve (native_balance_wei={} gas_reserve_wei={})",
+                        native_balance_wei, gas_reserve_wei
+                    ));
+                }
+                Nat::from(send_native)
             } else {
                 compute_evm_withdraw_amount_native(Nat::from(0u8), amount.trim(), *decimals, true)?
             }
         }
         ChainToken::EvmErc20 { decimals, .. } => {
             if amount.trim().eq_ignore_ascii_case("all") {
+                let (gas_reserve_wei, native_balance_wei) =
+                    estimate_evm_gas_reserve_and_native_balance_wei(&ctx.config, source, EVM_ERC20_TRANSFER_GAS_LIMIT)
+                        .await?;
+                    
+                if native_balance_wei <= gas_reserve_wei {
+                    return Err(format!(
+                        "native balance too low to cover EVM token transfer gas (native_balance_wei={} gas_reserve_wei={})",
+                        native_balance_wei, gas_reserve_wei
+                    ));
+                }
                 let bal = balances.get_balance(&asset).await?;
                 compute_evm_withdraw_amount_native(bal.value, amount.trim(), *decimals, false)?
             } else {
