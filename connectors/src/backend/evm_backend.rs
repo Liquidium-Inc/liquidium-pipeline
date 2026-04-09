@@ -1,6 +1,6 @@
 use alloy::{
     network::{AnyNetwork, NetworkWallet, TransactionBuilder},
-    primitives::{Address, U256},
+    primitives::{Address, TxHash, U256},
     providers::{Provider, WalletProvider},
     rpc::types::TransactionRequest,
     sol,
@@ -12,6 +12,7 @@ sol! {
     #[sol(rpc)]
     interface IERC20 {
         function balanceOf(address owner) external view returns (uint256);
+        function approve(address spender, uint256 amount) external returns (bool);
         function transfer(address to, uint256 amount) external returns (bool);
         function decimals() external view returns (uint8);
     }
@@ -64,6 +65,51 @@ impl<P: Provider<AnyNetwork>> EvmBackendImpl<P> {
     }
 }
 
+impl<P> EvmBackendImpl<P>
+where
+    P: Provider<AnyNetwork> + WalletProvider<AnyNetwork> + Send + Sync + Clone + 'static,
+{
+    pub(crate) async fn erc20_balance_of_raw(&self, token: Address, owner: Address) -> Result<U256, String> {
+        let contract = IERC20::new(token, self.provider.clone());
+        contract
+            .balanceOf(owner)
+            .call()
+            .await
+            .map_err(|e| format!("ERC20 balanceOf failed for token {token}: {e}"))
+    }
+
+    pub(crate) async fn erc20_decimals_raw(&self, token: Address) -> Result<u8, String> {
+        let contract = IERC20::new(token, self.provider.clone());
+        contract
+            .decimals()
+            .call()
+            .await
+            .map_err(|e| format!("ERC20 decimals() failed for token {token}: {e}"))
+    }
+
+    pub(crate) async fn erc20_approve_and_wait_raw(
+        &self,
+        token: Address,
+        spender: Address,
+        amount: U256,
+    ) -> Result<TxHash, String> {
+        let contract = IERC20::new(token, self.provider.clone());
+        let pending = contract
+            .approve(spender, amount)
+            .send()
+            .await
+            .map_err(|e| format!("ERC20 approve(spender={spender}) failed for token {token}: {e}"))?;
+        let tx_hash = *pending.tx_hash();
+
+        pending
+            .watch()
+            .await
+            .map_err(|e| format!("ERC20 approve confirmation failed for token {token}: {e}"))?;
+
+        Ok(tx_hash)
+    }
+}
+
 #[async_trait]
 impl<P> EvmBackend for EvmBackendImpl<P>
 where
@@ -76,13 +122,7 @@ where
             .parse()
             .map_err(|e| format!("invalid token address: {e}"))?;
 
-        let contract = IERC20::new(token_addr, self.provider.clone());
-
-        let res = contract
-            .balanceOf(owner)
-            .call()
-            .await
-            .map_err(|e| format!("erc20 balanceOf failed: {e}"))?;
+        let res = self.erc20_balance_of_raw(token_addr, owner).await?;
 
         Ok(u256_to_nat(res))
     }
@@ -148,15 +188,9 @@ where
             .parse()
             .map_err(|e| format!("invalid token address: {e}"))?;
 
-        let contract = IERC20::new(token_addr, self.provider.clone());
-
-        let res = contract
-            .decimals()
-            .call()
+        self.erc20_decimals_raw(token_addr)
             .await
-            .map_err(|e| format!("erc20 decimals() failed: {e}"))?;
-
-        Ok(res)
+            .map_err(|e| format!("erc20 decimals() failed: {e}"))
     }
 }
 

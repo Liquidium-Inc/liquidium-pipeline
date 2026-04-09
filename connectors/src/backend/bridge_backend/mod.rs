@@ -4,10 +4,12 @@ use bitcoin::{Address as BitcoinAddress, Network};
 use icrc_ledger_types::icrc1::account::Account;
 use std::str::FromStr;
 
-pub mod cketh_erc20;
-pub use cketh_erc20::CkEthErc20BridgeBackend;
+pub mod ckerc20_bridge;
+mod ckerc20_bridge_utils;
+pub use ckerc20_bridge::{BridgeEvmBackend, CkErc20BridgeBackend, EvmReceiptStatus};
 
 const USDC_ETH_TOKEN_ADDRESS: &str = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48";
+const CKUSDC_ICP_LEDGER_ID: &str = "xevnm-gaaaa-aaaar-qafnq-cai";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BridgeDestination {
@@ -36,6 +38,7 @@ impl BridgeDestination {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BridgeRouteKind {
     CkEthErc20Forward,
+    CkEthErc20Reverse,
     BtcToCkBtc,
     CkBtcToBtc,
 }
@@ -48,6 +51,7 @@ pub struct BridgeRouteSpec {
     pub destination_kind: BridgeDestinationKind,
     pub route_kind: BridgeRouteKind,
     pub evm_token_address: Option<&'static str>,
+    pub ckerc20_ledger_id: Option<&'static str>,
     pub min_sweep_amount: f64,
 }
 
@@ -59,7 +63,7 @@ pub struct BridgeSweepRoute {
     pub min_sweep_amount: f64,
 }
 
-const BRIDGE_ROUTE_CATALOG: [BridgeRouteSpec; 3] = [
+const BRIDGE_ROUTE_CATALOG: [BridgeRouteSpec; 4] = [
     BridgeRouteSpec {
         source_asset: "USDC",
         source_chain: "ETH",
@@ -67,6 +71,17 @@ const BRIDGE_ROUTE_CATALOG: [BridgeRouteSpec; 3] = [
         destination_kind: BridgeDestinationKind::IcpAccount,
         route_kind: BridgeRouteKind::CkEthErc20Forward,
         evm_token_address: Some(USDC_ETH_TOKEN_ADDRESS),
+        ckerc20_ledger_id: Some(CKUSDC_ICP_LEDGER_ID),
+        min_sweep_amount: 0.0,
+    },
+    BridgeRouteSpec {
+        source_asset: "ckUSDC",
+        source_chain: "ICP",
+        target_asset: "USDC",
+        destination_kind: BridgeDestinationKind::EvmAddress,
+        route_kind: BridgeRouteKind::CkEthErc20Reverse,
+        evm_token_address: Some(USDC_ETH_TOKEN_ADDRESS),
+        ckerc20_ledger_id: Some(CKUSDC_ICP_LEDGER_ID),
         min_sweep_amount: 0.0,
     },
     BridgeRouteSpec {
@@ -76,6 +91,7 @@ const BRIDGE_ROUTE_CATALOG: [BridgeRouteSpec; 3] = [
         destination_kind: BridgeDestinationKind::IcpAccount,
         route_kind: BridgeRouteKind::BtcToCkBtc,
         evm_token_address: None,
+        ckerc20_ledger_id: None,
         min_sweep_amount: 0.0,
     },
     BridgeRouteSpec {
@@ -85,6 +101,7 @@ const BRIDGE_ROUTE_CATALOG: [BridgeRouteSpec; 3] = [
         destination_kind: BridgeDestinationKind::BtcAddress,
         route_kind: BridgeRouteKind::CkBtcToBtc,
         evm_token_address: None,
+        ckerc20_ledger_id: None,
         min_sweep_amount: 0.0,
     },
 ];
@@ -108,10 +125,34 @@ pub fn resolve_cketh_forward_route_by_source(
     })
 }
 
+pub fn resolve_cketh_reverse_route_by_source(
+    source_asset: &str,
+    source_chain: &str,
+) -> Option<&'static BridgeRouteSpec> {
+    BRIDGE_ROUTE_CATALOG.iter().find(|route| {
+        route.route_kind == BridgeRouteKind::CkEthErc20Reverse
+            && source_asset.eq_ignore_ascii_case(route.source_asset)
+            && source_chain.eq_ignore_ascii_case(route.source_chain)
+    })
+}
+
 pub fn cketh_forward_routes() -> Vec<BridgeSweepRoute> {
     BRIDGE_ROUTE_CATALOG
         .iter()
         .filter(|route| route.route_kind == BridgeRouteKind::CkEthErc20Forward)
+        .map(|route| BridgeSweepRoute {
+            source_asset: route.source_asset.to_string(),
+            source_chain: route.source_chain.to_string(),
+            target_asset: route.target_asset.to_string(),
+            min_sweep_amount: route.min_sweep_amount,
+        })
+        .collect()
+}
+
+pub fn cketh_reverse_routes() -> Vec<BridgeSweepRoute> {
+    BRIDGE_ROUTE_CATALOG
+        .iter()
+        .filter(|route| route.route_kind == BridgeRouteKind::CkEthErc20Reverse)
         .map(|route| BridgeSweepRoute {
             source_asset: route.source_asset.to_string(),
             source_chain: route.source_chain.to_string(),
@@ -182,7 +223,13 @@ pub trait BridgeBackend: Send + Sync {
     /// Returns a human-readable source balance for a route input asset/account.
     async fn get_source_balance(&self, asset: &str, chain: &str, address: &str) -> Result<f64, String>;
 
-    /// Submits a bridge transfer and returns a provider-level submission id.
+    /// Submits a bridge transfer for a supported route and returns a tracking handle.
+    ///
+    /// The backend validates route metadata, source/destination constraints, and amount
+    /// conversion before sending provider calls.
+    ///
+    /// `bridge_id` in the returned [`BridgeSubmission`] is backend-specific and is later
+    /// consumed by [`BridgeBackend::get_bridge_status`] for polling.
     async fn submit_bridge(&self, request: BridgeRequest) -> Result<BridgeSubmission, String>;
 
     /// Polls current status for a previously submitted bridge operation.
@@ -192,8 +239,8 @@ pub trait BridgeBackend: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::{
-        BridgeDestination, BridgeDestinationKind, BridgeRouteKind, cketh_forward_routes, resolve_route,
-        validate_destination_for_route,
+        BridgeDestination, BridgeDestinationKind, BridgeRouteKind, cketh_forward_routes, cketh_reverse_routes,
+        resolve_route, validate_destination_for_route,
     };
     use icrc_ledger_types::icrc1::account::Account;
 
@@ -206,20 +253,29 @@ mod tests {
             usdc.evm_token_address,
             Some("0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48")
         );
+        assert_eq!(usdc.ckerc20_ledger_id, Some("xevnm-gaaaa-aaaar-qafnq-cai"));
         assert_eq!(usdc.min_sweep_amount, 0.0);
+
+        let ckusdc = resolve_route("ckUSDC", "ICP", "USDC").expect("ckUSDC reverse route");
+        assert_eq!(ckusdc.destination_kind, BridgeDestinationKind::EvmAddress);
+        assert_eq!(ckusdc.route_kind, BridgeRouteKind::CkEthErc20Reverse);
+        assert_eq!(ckusdc.ckerc20_ledger_id, Some("xevnm-gaaaa-aaaar-qafnq-cai"));
 
         let btc = resolve_route("BTC", "BTC", "ckBTC").expect("BTC route");
         assert_eq!(btc.route_kind, BridgeRouteKind::BtcToCkBtc);
         assert_eq!(btc.evm_token_address, None);
+        assert_eq!(btc.ckerc20_ledger_id, None);
 
         let ckbtc = resolve_route("ckBTC", "ICP", "BTC").expect("ckBTC route");
         assert_eq!(ckbtc.route_kind, BridgeRouteKind::CkBtcToBtc);
         assert_eq!(ckbtc.destination_kind, BridgeDestinationKind::BtcAddress);
+        assert_eq!(ckbtc.ckerc20_ledger_id, None);
     }
 
     #[test]
     fn route_resolution_is_case_insensitive() {
         assert!(resolve_route("usdc", "eth", "ckusdc").is_some());
+        assert!(resolve_route("ckusdc", "icp", "usdc").is_some());
         assert!(resolve_route("CKBTC", "icp", "btc").is_some());
         assert!(resolve_route("USDT", "ETH", "ckUSDT").is_none());
     }
@@ -232,6 +288,17 @@ mod tests {
         assert_eq!(route.source_asset, "USDC");
         assert_eq!(route.source_chain, "ETH");
         assert_eq!(route.target_asset, "ckUSDC");
+        assert_eq!(route.min_sweep_amount, 0.0);
+    }
+
+    #[test]
+    fn cketh_reverse_routes_contains_ckusdc_entry() {
+        let routes = cketh_reverse_routes();
+        assert_eq!(routes.len(), 1);
+        let route = &routes[0];
+        assert_eq!(route.source_asset, "ckUSDC");
+        assert_eq!(route.source_chain, "ICP");
+        assert_eq!(route.target_asset, "USDC");
         assert_eq!(route.min_sweep_amount, 0.0);
     }
 
