@@ -337,14 +337,14 @@ Mnemonic
         ├── Bridge EVM signer/address      m/44'/60'/1'/0/0
         ├── Bridge ICP owner principal     m/44'/60'/1'/0/1
         ├── Bridge BTC key/address         m/84'/0'/1'/0/0
-        ├── Bridge ckUSDC subaccount       sha256("bridge/ckusdc")
-        └── Bridge ckBTC subaccount        sha256("bridge/ckbtc")
+        └── Bridge ICP account             owner-only (subaccount = None)
 ```
 
 Current bridge sweeper wiring:
-- Source: derived `bridge_evm_address`
-- Destination: resolved per request in code (current default: liquidator ICP principal)
-- Routes: loaded from a code-level bridge catalog (`ckETH` ERC-20 forward routes); submissions are serialized to keep nonce ordering on the shared bridge signer.
+- Forward source: derived `bridge_evm_address` (`USDC@ETH -> ckUSDC`)
+- Reverse source: derived bridge ICP owner account (`ckUSDC@ICP -> USDC@ETH`)
+- Destination: resolved per request in code (forward default: liquidator ICP principal; reverse default: liquidator EVM address)
+- Routes: loaded from a code-level bridge catalog (`ckETH` ERC-20 routes); submissions are serialized per sweeper loop.
 - Design details: `docs/bridge-architecture.md`
 
 ### Generate New Identities
@@ -529,6 +529,30 @@ Behavior:
 - `--bridge-after-withdraw` adds a final bridge submission `USDC@ETH -> ckUSDC`.
 - With bridge step enabled, withdraw destination is forced to the configured bridge EVM address.
 - If `--bridge-destination` is omitted, bridge destination defaults to liquidator principal.
+
+### MEXC Smoke Bridge + Swap + Withdraw
+
+Dry-run preflight (no side effects):
+
+```bash
+liquidator mexc-smoke-bridge-swap-withdraw --amount-ckusdc 100
+```
+
+Live execution (bridge `ckUSDC@ICP -> USDC@ETH` to MEXC deposit, swap `USDC -> CKBTC`, withdraw `CKBTC`):
+
+```bash
+liquidator mexc-smoke-bridge-swap-withdraw \
+  --amount-ckusdc 100 \
+  --execute \
+  --withdraw-network ICP
+```
+
+Behavior:
+- Bridge source account is the configured bridge ICP owner account (principal-only).
+- MEXC USDC/ETH deposit address is fetched dynamically per request.
+- Waits for bridge source funding before submit, then waits for MEXC USDC balance credit.
+- Swaps credited USDC to CKBTC using production route logic.
+- Default withdraw destination is the liquidator principal; override with `--withdraw-address`.
 
 ### Withdraw Funds
 
