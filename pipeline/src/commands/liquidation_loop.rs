@@ -1,4 +1,3 @@
-use alloy::{network::AnyNetwork, providers::ProviderBuilder, signers::local::PrivateKeySigner};
 use icrc_ledger_types::icrc1::account::Account;
 use std::{
     path::PathBuf,
@@ -9,9 +8,12 @@ use tracing::instrument;
 use tracing::{info, warn};
 
 use crate::{
-    commands::liquidation_loop_helpers::{
-        bootstrap_control_plane, console_ui_enabled, debt_asset_principals, debt_assets_as_text,
-        ensure_runtime_file_permissions, print_banner, run_daemon_cycle_loop,
+    commands::{
+        liquidation_loop_bridge_sweepers::spawn_bridge_sweepers,
+        liquidation_loop_helpers::{
+            bootstrap_control_plane, console_ui_enabled, debt_asset_principals, debt_assets_as_text,
+            ensure_runtime_file_permissions, print_banner, run_daemon_cycle_loop,
+        },
     },
     config::{Config, ConfigTrait},
     context::{PipelineContext, init_context},
@@ -25,22 +27,15 @@ use crate::{
     persistance::sqlite::SqliteWalStore,
     price_oracle::price_oracle::LiquidationPriceOracle,
     stages::{
-        bridge_sweeper::{BridgeSweeper, liquidator_destination_resolver},
-        export::ExportStage,
-        finalize::FinalizeStage,
-        opportunity::OpportunityFinder,
-        settlement_watcher::SettlementWatcher,
-        simple_strategy::SimpleLiquidationStrategy,
+        export::ExportStage, finalize::FinalizeStage, opportunity::OpportunityFinder,
+        settlement_watcher::SettlementWatcher, simple_strategy::SimpleLiquidationStrategy,
     },
     swappers::{mexc::mexc_adapter::MexcClient, router::SwapRouter},
     watchdog::{WatchdogEvent, account_monitor_watchdog, webhook_watchdog_from_env},
 };
 use ic_agent::Agent;
-use liquidium_pipeline_connectors::backend::bridge_backend::{CkEthErc20BridgeBackend, cketh_forward_routes};
 
 use liquidium_pipeline_core::tokens::token_registry::TokenRegistry;
-
-const BRIDGE_SWEEPER_POLL_INTERVAL: Duration = Duration::from_secs(5);
 
 #[instrument(name = "liquidation.init", skip_all, err)]
 async fn init(
@@ -167,52 +162,6 @@ async fn init(
     Ok((finder, strategy, executor, exporter, finalizer))
 }
 
-fn spawn_bridge_sweeper(ctx: &Arc<PipelineContext>) -> Result<(), String> {
-    // Bridge sweeper is intentionally independent from pause/resume.
-    // Even while paused, it can continue sweeping bridge wallet balances.
-    let config = &ctx.config;
-    let bridge_signer: PrivateKeySigner = config
-        .bridge_evm_private_key
-        .parse()
-        .map_err(|err| format!("Failed to parse EVM private key for bridge backend: {err}"))?;
-    let bridge_rpc_url = config
-        .evm_rpc_url
-        .parse()
-        .map_err(|err| format!("Invalid EVM RPC URL for bridge backend: {err}"))?;
-
-    let bridge_provider = ProviderBuilder::new()
-        .network::<AnyNetwork>()
-        .wallet(bridge_signer)
-        .connect_http(bridge_rpc_url);
-
-    let bridge_backend =
-        CkEthErc20BridgeBackend::new(ctx.agent.clone(), bridge_provider, config.bridge_cketh_minter_canister);
-    let routes = cketh_forward_routes();
-
-    if routes.is_empty() {
-        return Err("No ckETH forward bridge routes configured".to_string());
-    }
-
-    let bridge_sweeper = BridgeSweeper::new(
-        Arc::new(bridge_backend),
-        config.bridge_evm_address.clone(),
-        routes.clone(),
-        liquidator_destination_resolver(config.liquidator_principal),
-        BRIDGE_SWEEPER_POLL_INTERVAL,
-    );
-
-    info!(
-        bridge_source_evm_address = %config.bridge_evm_address,
-        bridge_cketh_minter_canister = %config.bridge_cketh_minter_canister.to_text(),
-        bridge_route_count = routes.len(),
-        bridge_destination_account = %config.liquidator_principal.to_text(),
-        "Bridge sweeper started"
-    );
-    tokio::spawn(async move { bridge_sweeper.run().await });
-
-    Ok(())
-}
-
 pub async fn run_liquidation_loop(sock_path: PathBuf) {
     // Auditor note:
     // This function is the foreground daemon entrypoint. It does not fork/detach;
@@ -300,7 +249,7 @@ pub async fn run_liquidation_loop(sock_path: PathBuf) {
 
     tokio::spawn(async move { watcher.run().await });
 
-    if let Err(err) = spawn_bridge_sweeper(&ctx) {
+    if let Err(err) = spawn_bridge_sweepers(&ctx, None) {
         tracing::error!("{}", err);
         return;
     }
@@ -361,11 +310,7 @@ pub enum LoopControl {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
-
-    use super::BRIDGE_SWEEPER_POLL_INTERVAL;
     use crate::commands::liquidation_loop_helpers::console_ui_enabled;
-    use liquidium_pipeline_connectors::backend::bridge_backend::cketh_forward_routes;
     use std::io::IsTerminal;
 
     fn calc_console_ui_enabled(human_output: bool, stdout_is_tty: bool, stderr_is_tty: bool) -> bool {
@@ -401,19 +346,5 @@ mod tests {
             std::io::stderr().is_terminal(),
         );
         assert_eq!(actual, expected);
-    }
-
-    #[test]
-    fn bridge_sweeper_poll_interval_is_fixed_to_five_seconds() {
-        assert_eq!(BRIDGE_SWEEPER_POLL_INTERVAL, Duration::from_secs(5));
-    }
-
-    #[test]
-    fn bridge_route_catalog_boots_with_usdc_forward_route() {
-        let routes = cketh_forward_routes();
-        assert_eq!(routes.len(), 1);
-        assert_eq!(routes[0].source_asset, "USDC");
-        assert_eq!(routes[0].source_chain, "ETH");
-        assert_eq!(routes[0].target_asset, "ckUSDC");
     }
 }

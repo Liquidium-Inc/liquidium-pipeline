@@ -203,8 +203,6 @@ pub async fn run(opts: TuiOptions) -> anyhow::Result<()> {
         evm_address: ctx.evm_address.clone(),
         bridge_evm_address: cfg.bridge_evm_address.clone(),
         bridge_ic_owner_principal: cfg.bridge_ic_owner_principal.to_text(),
-        bridge_ic_ckusdc_subaccount: hex::encode(cfg.bridge_ic_ckusdc_subaccount),
-        bridge_ic_ckbtc_subaccount: hex::encode(cfg.bridge_ic_ckbtc_subaccount),
         bridge_btc_address: cfg.bridge_btc_address.clone(),
         swapper_mode: format!("{:?}", cfg.swapper),
         max_dex_slippage_bps: cfg.max_allowed_dex_slippage,

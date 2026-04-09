@@ -7,7 +7,6 @@ use liquidium_pipeline_commons::env::config_dir;
 use liquidium_pipeline_connectors::account::icp_account::{RECOVERY_ACCOUNT, derive_icp_identity};
 use liquidium_pipeline_connectors::crypto::derivation::{derive_btc_p2pkh_address, derive_evm_private_key};
 use log::debug;
-use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::env;
 use std::sync::Arc;
@@ -46,8 +45,6 @@ pub struct Config {
     pub bridge_evm_private_key: String,
     pub bridge_evm_address: String,
     pub bridge_ic_owner_principal: Principal,
-    pub bridge_ic_ckusdc_subaccount: [u8; 32],
-    pub bridge_ic_ckbtc_subaccount: [u8; 32],
     pub bridge_btc_address: String,
     pub bridge_cketh_minter_canister: Principal,
     pub lending_canister: Principal,
@@ -231,20 +228,10 @@ impl ConfigTrait for Config {
 }
 
 impl Config {
-    pub fn bridge_subaccount_for_symbol(&self, symbol: &str) -> Option<[u8; 32]> {
-        if symbol.eq_ignore_ascii_case("ckUSDC") {
-            Some(self.bridge_ic_ckusdc_subaccount)
-        } else if symbol.eq_ignore_ascii_case("ckBTC") {
-            Some(self.bridge_ic_ckbtc_subaccount)
-        } else {
-            None
-        }
-    }
-
-    pub fn bridge_ic_account_for_symbol(&self, symbol: &str) -> Account {
+    pub fn bridge_ic_account(&self) -> Account {
         Account {
             owner: self.bridge_ic_owner_principal,
-            subaccount: self.bridge_subaccount_for_symbol(symbol),
+            subaccount: None,
         }
     }
 
@@ -298,8 +285,6 @@ impl Config {
         let hex = evm_signer.to_bytes().encode_hex();
         let evm_private_key = format!("{:#}", hex);
 
-        ensure_legacy_bridge_source_not_set()?;
-
         // Derive dedicated bridge namespace identities.
         let bridge_sk = derive_evm_private_key(&mnemonic, BRIDGE_NAMESPACE_ACCOUNT, BRIDGE_EVM_INDEX)?;
         let bridge_signer = PrivateKeySigner::from_slice(&bridge_sk.to_bytes())
@@ -312,9 +297,6 @@ impl Config {
         let bridge_ic_owner_principal = bridge_ic_identity
             .sender()
             .map_err(|e| format!("could not decode bridge principal: {e}"))?;
-
-        let bridge_ic_ckusdc_subaccount = derive_named_subaccount(BRIDGE_SUBACCOUNT_CKUSDC_LABEL);
-        let bridge_ic_ckbtc_subaccount = derive_named_subaccount(BRIDGE_SUBACCOUNT_CKBTC_LABEL);
         let bridge_btc_address = derive_btc_p2pkh_address(&mnemonic, BRIDGE_NAMESPACE_ACCOUNT, BRIDGE_BTC_INDEX)
             .map_err(|e| format!("could not derive bridge BTC address: {e}"))?;
 
@@ -377,8 +359,6 @@ impl Config {
             bridge_evm_private_key,
             bridge_evm_address,
             bridge_ic_owner_principal,
-            bridge_ic_ckusdc_subaccount,
-            bridge_ic_ckbtc_subaccount,
             bridge_btc_address,
             bridge_cketh_minter_canister,
             liquidator_identity: Arc::new(liquidator_identity),
@@ -481,27 +461,6 @@ const BRIDGE_NAMESPACE_ACCOUNT: u32 = 1;
 const BRIDGE_EVM_INDEX: u32 = 0;
 const BRIDGE_ICP_INDEX: u32 = 1;
 const BRIDGE_BTC_INDEX: u32 = 0;
-const BRIDGE_SUBACCOUNT_CKUSDC_LABEL: &str = "bridge/ckusdc";
-const BRIDGE_SUBACCOUNT_CKBTC_LABEL: &str = "bridge/ckbtc";
-
-fn derive_named_subaccount(label: &str) -> [u8; 32] {
-    let digest = Sha256::digest(label.as_bytes());
-    digest.into()
-}
-
-fn ensure_legacy_bridge_source_not_set() -> Result<(), String> {
-    let legacy = env::var("BRIDGE_SOURCE_EVM_ADDRESS")
-        .ok()
-        .map(|v| v.trim().to_string())
-        .filter(|v| !v.is_empty());
-    if legacy.is_some() {
-        return Err(
-            "BRIDGE_SOURCE_EVM_ADDRESS is no longer supported; bridge source is derived from the bridge namespace"
-                .to_string(),
-        );
-    }
-    Ok(())
-}
 
 fn parse_bad_debt_collateral_slippage_bps_from_env() -> u32 {
     env::var("BAD_DEBT_COLLATERAL_SLIPPAGE_BPS")
@@ -913,32 +872,6 @@ mod tests {
         }
         let err = parse_swapper_mode_from_env().expect_err("hybrid mode should be rejected");
         assert!(err.contains("only SWAPPER=cex"));
-    }
-
-    #[test]
-    fn bridge_named_subaccounts_are_deterministic_and_distinct() {
-        let a = derive_named_subaccount(BRIDGE_SUBACCOUNT_CKUSDC_LABEL);
-        let b = derive_named_subaccount(BRIDGE_SUBACCOUNT_CKUSDC_LABEL);
-        let c = derive_named_subaccount(BRIDGE_SUBACCOUNT_CKBTC_LABEL);
-        assert_eq!(a, b);
-        assert_ne!(a, c);
-    }
-
-    #[test]
-    fn legacy_bridge_source_env_is_rejected() {
-        let _guard = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
-        unsafe {
-            env::set_var(
-                "BRIDGE_SOURCE_EVM_ADDRESS",
-                "0x1111111111111111111111111111111111111111",
-            );
-        }
-        let err = ensure_legacy_bridge_source_not_set().expect_err("legacy env must be rejected");
-        assert!(err.contains("BRIDGE_SOURCE_EVM_ADDRESS"));
-        unsafe {
-            env::remove_var("BRIDGE_SOURCE_EVM_ADDRESS");
-        }
-        ensure_legacy_bridge_source_not_set().expect("missing legacy env must pass");
     }
 
     #[test]

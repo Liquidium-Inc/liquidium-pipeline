@@ -105,8 +105,6 @@ fn draw_balances_actions(f: &mut Frame<'_>, area: Rect, app: &App) {
         Line::from("Bridge accounts:"),
         Line::from(format!("  EVM source : {}", app.config.bridge_evm_address)),
         Line::from(format!("  ICP owner  : {}", app.config.bridge_ic_owner_principal)),
-        Line::from(format!("  ckUSDC sub : {}", app.config.bridge_ic_ckusdc_subaccount)),
-        Line::from(format!("  ckBTC sub  : {}", app.config.bridge_ic_ckbtc_subaccount)),
         Line::from(format!("  BTC address: {}", app.config.bridge_btc_address)),
         Line::from(""),
     ];

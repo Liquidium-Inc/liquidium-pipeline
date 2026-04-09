@@ -1,6 +1,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use alloy::primitives::Address as EvmAddress;
 use async_trait::async_trait;
 use candid::Principal;
 use futures::future::join_all;
@@ -40,6 +41,10 @@ pub fn liquidator_destination_resolver(liquidator_principal: Principal) -> Bridg
             subaccount: None,
         })
     })
+}
+
+pub fn evm_destination_resolver(destination: EvmAddress) -> BridgeDestinationResolver {
+    Arc::new(move |_snapshot: &BridgeBalanceSnapshot| BridgeDestination::EvmAddress(destination))
 }
 
 #[async_trait]

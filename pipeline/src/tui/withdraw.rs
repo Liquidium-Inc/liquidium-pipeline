@@ -316,7 +316,7 @@ async fn execute_withdraw(
                 let (gas_reserve_wei, native_balance_wei) =
                     estimate_evm_gas_reserve_and_native_balance_wei(&ctx.config, source, EVM_ERC20_TRANSFER_GAS_LIMIT)
                         .await?;
-                    
+
                 if native_balance_wei <= gas_reserve_wei {
                     return Err(format!(
                         "native balance too low to cover EVM token transfer gas (native_balance_wei={} gas_reserve_wei={})",
@@ -348,7 +348,7 @@ fn resolve_destination_account(
                 WithdrawDestinationKind::Main => ctx.config.liquidator_principal.into(),
                 WithdrawDestinationKind::Trader => ctx.config.trader_principal.into(),
                 WithdrawDestinationKind::Recovery => ctx.config.get_recovery_account(),
-                WithdrawDestinationKind::Bridge => ctx.config.bridge_ic_account_for_symbol(&token.symbol()),
+                WithdrawDestinationKind::Bridge => ctx.config.bridge_ic_account(),
                 WithdrawDestinationKind::Manual => {
                     Account::from_str(manual_destination).map_err(|_| "invalid destination ICP account".to_string())?
                 }

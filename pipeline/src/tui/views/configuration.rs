@@ -44,14 +44,6 @@ pub(super) fn draw_configuration(f: &mut Frame<'_>, area: Rect, app: &App) {
         Line::from(format!("Liquidator EVM: {}", app.config.evm_address)),
         Line::from(format!("Bridge EVM: {}", app.config.bridge_evm_address)),
         Line::from(format!("Bridge ICP owner: {}", app.config.bridge_ic_owner_principal)),
-        Line::from(format!(
-            "Bridge ckUSDC subaccount: {}",
-            app.config.bridge_ic_ckusdc_subaccount
-        )),
-        Line::from(format!(
-            "Bridge ckBTC subaccount: {}",
-            app.config.bridge_ic_ckbtc_subaccount
-        )),
         Line::from(format!("Bridge BTC: {}", app.config.bridge_btc_address)),
         Line::from(format!(
             "DB: {}",

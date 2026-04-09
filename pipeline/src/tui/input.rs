@@ -862,8 +862,6 @@ mod tests {
             evm_address: "0x0".to_string(),
             bridge_evm_address: "0xbridge".to_string(),
             bridge_ic_owner_principal: "ccccc-cc".to_string(),
-            bridge_ic_ckusdc_subaccount: "00".to_string(),
-            bridge_ic_ckbtc_subaccount: "11".to_string(),
             bridge_btc_address: "bc1qbridge".to_string(),
             swapper_mode: "Hybrid".to_string(),
             max_dex_slippage_bps: 500,

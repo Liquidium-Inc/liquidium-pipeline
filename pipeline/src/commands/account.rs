@@ -42,16 +42,6 @@ pub async fn show() {
                             principal = %config.bridge_ic_owner_principal,
                             "Account identity"
                         );
-                        info!(
-                            role = "bridge-ic-ckusdc-subaccount",
-                            principal = %hex::encode(config.bridge_ic_ckusdc_subaccount),
-                            "Account identity"
-                        );
-                        info!(
-                            role = "bridge-ic-ckbtc-subaccount",
-                            principal = %hex::encode(config.bridge_ic_ckbtc_subaccount),
-                            "Account identity"
-                        );
                         info!(role = "bridge-btc", principal = %config.bridge_btc_address, "Account identity");
                     }
                     Err(_) => {
@@ -89,14 +79,6 @@ pub async fn show() {
                     table.add_row(Row::new(vec![
                         Cell::new("Bridge ICP Owner"),
                         Cell::new(&config.bridge_ic_owner_principal.to_string()),
-                    ]));
-                    table.add_row(Row::new(vec![
-                        Cell::new("Bridge ckUSDC Subaccount"),
-                        Cell::new(&hex::encode(config.bridge_ic_ckusdc_subaccount)),
-                    ]));
-                    table.add_row(Row::new(vec![
-                        Cell::new("Bridge ckBTC Subaccount"),
-                        Cell::new(&hex::encode(config.bridge_ic_ckbtc_subaccount)),
                     ]));
                     table.add_row(Row::new(vec![
                         Cell::new("Bridge BTC Address"),

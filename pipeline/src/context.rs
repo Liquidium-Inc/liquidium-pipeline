@@ -38,39 +38,23 @@ pub struct PipelineContext {
     pub trader_service: Arc<BalanceService>,
     pub recovery_service: Arc<BalanceService>,
     pub bridge_service: Arc<BalanceService>,
-    pub bridge_ckusdc_service: Arc<BalanceService>,
-    pub bridge_ckbtc_service: Arc<BalanceService>,
     pub agent: Arc<Agent>,
     pub main_transfers: Arc<TransferService>,
     pub trader_transfers: Arc<TransferService>,
     pub swap_router: Arc<SwapRouter>,
     pub recovery_transfers: Arc<TransferService>,
     pub bridge_transfers: Arc<TransferService>,
-    pub bridge_ckusdc_transfers: Arc<TransferService>,
-    pub bridge_ckbtc_transfers: Arc<TransferService>,
     pub evm_address: String,
     pub approval_state: Arc<ApprovalState>,
 }
 
 impl PipelineContext {
-    pub fn bridge_balance_service_for_symbol(&self, symbol: &str) -> Arc<BalanceService> {
-        if symbol.eq_ignore_ascii_case("ckUSDC") {
-            self.bridge_ckusdc_service.clone()
-        } else if symbol.eq_ignore_ascii_case("ckBTC") {
-            self.bridge_ckbtc_service.clone()
-        } else {
-            self.bridge_service.clone()
-        }
+    pub fn bridge_balance_service_for_symbol(&self, _symbol: &str) -> Arc<BalanceService> {
+        self.bridge_service.clone()
     }
 
-    pub fn bridge_transfer_service_for_symbol(&self, symbol: &str) -> Arc<TransferService> {
-        if symbol.eq_ignore_ascii_case("ckUSDC") {
-            self.bridge_ckusdc_transfers.clone()
-        } else if symbol.eq_ignore_ascii_case("ckBTC") {
-            self.bridge_ckbtc_transfers.clone()
-        } else {
-            self.bridge_transfers.clone()
-        }
+    pub fn bridge_transfer_service_for_symbol(&self, _symbol: &str) -> Arc<TransferService> {
+        self.bridge_transfers.clone()
     }
 }
 
@@ -213,9 +197,7 @@ impl<P: Provider<AnyNetwork> + WalletProvider<AnyNetwork> + Clone + 'static> Pip
         };
 
         let recovery_icp_account = config.get_recovery_account();
-        let bridge_icp_account = config.bridge_ic_account_for_symbol("");
-        let bridge_icp_ckusdc_account = config.bridge_ic_account_for_symbol("ckUSDC");
-        let bridge_icp_ckbtc_account = config.bridge_ic_account_for_symbol("ckBTC");
+        let bridge_icp_account = config.bridge_ic_account();
 
         let icp_info_main = Arc::new(IcpAccountInfoAdapter::new(icp_backend_main.clone(), main_icp_account));
         let evm_info_main = Arc::new(EvmAccountInfoAdapter::new(evm_backend_main.clone()));
@@ -246,32 +228,10 @@ impl<P: Provider<AnyNetwork> + WalletProvider<AnyNetwork> + Clone + 'static> Pip
         let bridge_accounts: Arc<dyn AccountInfo + Send + Sync> =
             Arc::new(MultiChainAccountInfoRouter::new(icp_info_bridge, evm_info_bridge));
 
-        let icp_info_bridge_ckusdc = Arc::new(IcpAccountInfoAdapter::new(
-            icp_backend_bridge.clone(),
-            bridge_icp_ckusdc_account,
-        ));
-        let evm_info_bridge_ckusdc = Arc::new(EvmAccountInfoAdapter::new(evm_backend_bridge.clone()));
-        let bridge_ckusdc_accounts: Arc<dyn AccountInfo + Send + Sync> = Arc::new(MultiChainAccountInfoRouter::new(
-            icp_info_bridge_ckusdc,
-            evm_info_bridge_ckusdc,
-        ));
-
-        let icp_info_bridge_ckbtc = Arc::new(IcpAccountInfoAdapter::new(
-            icp_backend_bridge.clone(),
-            bridge_icp_ckbtc_account,
-        ));
-        let evm_info_bridge_ckbtc = Arc::new(EvmAccountInfoAdapter::new(evm_backend_bridge.clone()));
-        let bridge_ckbtc_accounts: Arc<dyn AccountInfo + Send + Sync> = Arc::new(MultiChainAccountInfoRouter::new(
-            icp_info_bridge_ckbtc,
-            evm_info_bridge_ckbtc,
-        ));
-
         let main_service = BalanceService::new(registry.clone(), main_accounts);
         let trader_service = BalanceService::new(registry.clone(), trader_accounts);
         let recovery_service = BalanceService::new(registry.clone(), recovery_accounts);
         let bridge_service = BalanceService::new(registry.clone(), bridge_accounts);
-        let bridge_ckusdc_service = BalanceService::new(registry.clone(), bridge_ckusdc_accounts);
-        let bridge_ckbtc_service = BalanceService::new(registry.clone(), bridge_ckbtc_accounts);
 
         // Build transfer adapters and routers
         let icp_transfer_main = Arc::new(IcpTransferAdapter::new(icp_backend_main.clone(), main_icp_account));
@@ -300,28 +260,6 @@ impl<P: Provider<AnyNetwork> + WalletProvider<AnyNetwork> + Clone + 'static> Pip
         let evm_transfer_bridge = Arc::new(EvmTransferAdapter::new(evm_backend_bridge.clone()));
         let transfer_router_bridge = Arc::new(MultiChainTransferRouter::new(icp_transfer_bridge, evm_transfer_bridge));
         let bridge_transfers = TransferService::new(registry.clone(), transfer_router_bridge);
-
-        let icp_transfer_bridge_ckusdc = Arc::new(IcpTransferAdapter::new(
-            icp_backend_bridge.clone(),
-            bridge_icp_ckusdc_account,
-        ));
-        let evm_transfer_bridge_ckusdc = Arc::new(EvmTransferAdapter::new(evm_backend_bridge.clone()));
-        let transfer_router_bridge_ckusdc = Arc::new(MultiChainTransferRouter::new(
-            icp_transfer_bridge_ckusdc,
-            evm_transfer_bridge_ckusdc,
-        ));
-        let bridge_ckusdc_transfers = TransferService::new(registry.clone(), transfer_router_bridge_ckusdc);
-
-        let icp_transfer_bridge_ckbtc = Arc::new(IcpTransferAdapter::new(
-            icp_backend_bridge.clone(),
-            bridge_icp_ckbtc_account,
-        ));
-        let evm_transfer_bridge_ckbtc = Arc::new(EvmTransferAdapter::new(evm_backend_bridge.clone()));
-        let transfer_router_bridge_ckbtc = Arc::new(MultiChainTransferRouter::new(
-            icp_transfer_bridge_ckbtc,
-            evm_transfer_bridge_ckbtc,
-        ));
-        let bridge_ckbtc_transfers = TransferService::new(registry.clone(), transfer_router_bridge_ckbtc);
 
         let approval_state = Arc::new(ApprovalState::new());
 
@@ -362,14 +300,10 @@ impl<P: Provider<AnyNetwork> + WalletProvider<AnyNetwork> + Clone + 'static> Pip
             trader_service: Arc::new(trader_service),
             recovery_service: Arc::new(recovery_service),
             bridge_service: Arc::new(bridge_service),
-            bridge_ckusdc_service: Arc::new(bridge_ckusdc_service),
-            bridge_ckbtc_service: Arc::new(bridge_ckbtc_service),
             main_transfers: Arc::new(main_transfers),
             trader_transfers: Arc::new(trader_transfers),
             recovery_transfers: Arc::new(recovery_transfers),
             bridge_transfers: Arc::new(bridge_transfers),
-            bridge_ckusdc_transfers: Arc::new(bridge_ckusdc_transfers),
-            bridge_ckbtc_transfers: Arc::new(bridge_ckbtc_transfers),
             evm_address,
             approval_state,
             agent: main_agent.clone(),
@@ -500,8 +434,6 @@ mod tests {
             bridge_evm_private_key: "0x59c6995e998f97a5a0044976f53f58816f2f94f4a7f87b5c6a1f7fbf3f5e6be7".to_string(),
             bridge_evm_address: "0x1111111111111111111111111111111111111111".to_string(),
             bridge_ic_owner_principal: Principal::from_text("aaaaa-aa").expect("principal"),
-            bridge_ic_ckusdc_subaccount: [0u8; 32],
-            bridge_ic_ckbtc_subaccount: [1u8; 32],
             bridge_btc_address: "1BoatSLRHtKNngkdXEeobR76b53LETtpyT".to_string(),
             bridge_cketh_minter_canister: Principal::from_text("sv3dd-oaaaa-aaaar-qacoa-cai").expect("principal"),
             lending_canister: Principal::from_text("aaaaa-aa").expect("principal"),

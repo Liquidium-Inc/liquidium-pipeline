@@ -87,10 +87,7 @@ pub async fn withdraw() {
         "main" => (config.liquidator_identity.clone(), config.liquidator_principal.into()),
         "trader" => (config.trader_identity.clone(), config.trader_principal.into()),
         "recovery" => (config.trader_identity.clone(), config.get_recovery_account()),
-        "bridge" => (
-            config.bridge_ic_identity.clone(),
-            config.bridge_ic_account_for_symbol(""),
-        ),
+        "bridge" => (config.bridge_ic_identity.clone(), config.bridge_ic_account()),
         _ => (config.liquidator_identity.clone(), config.liquidator_principal.into()),
     };
 
@@ -167,12 +164,7 @@ pub async fn withdraw() {
             0 => config.liquidator_principal.into(),
             1 => config.trader_principal.into(),
             2 => config.get_recovery_account(),
-            3 => {
-                eprintln!(
-                    "Bridge destination for --asset all is ambiguous (route-specific subaccounts). Select a single asset."
-                );
-                return;
-            }
+            3 => config.bridge_ic_account(),
             _ => {
                 let manual_input: String = Input::with_theme(&theme)
                     .with_prompt("Enter destination ICP account (principal or account)")
@@ -206,7 +198,7 @@ pub async fn withdraw() {
         Destination::Icp(dst_account)
     } else {
         // Single-asset flow: destination depends on selected token chain.
-        let (id_selected, token_selected) = assets[asset_idx].clone();
+        let (_id_selected, token_selected) = assets[asset_idx].clone();
 
         match token_selected {
             ChainToken::Icp { .. } => {
@@ -222,7 +214,7 @@ pub async fn withdraw() {
                     0 => config.liquidator_principal.into(),
                     1 => config.trader_principal.into(),
                     2 => config.get_recovery_account(),
-                    3 => config.bridge_ic_account_for_symbol(&id_selected.symbol),
+                    3 => config.bridge_ic_account(),
                     _ => {
                         let manual_input: String = Input::with_theme(&theme)
                             .with_prompt("Enter destination ICP account (principal or account)")
@@ -429,7 +421,7 @@ pub async fn withdraw() {
         let src_str = match tok {
             ChainToken::Icp { .. } => {
                 if source_kind == "bridge" {
-                    config.bridge_ic_account_for_symbol(&asset_id.symbol).to_string()
+                    config.bridge_ic_account().to_string()
                 } else {
                     account.to_string()
                 }
@@ -477,7 +469,7 @@ pub async fn withdraw() {
         let src_str = match &token {
             ChainToken::Icp { .. } => {
                 if source_kind == "bridge" {
-                    config.bridge_ic_account_for_symbol(&asset_id.symbol).to_string()
+                    config.bridge_ic_account().to_string()
                 } else {
                     account.to_string()
                 }
@@ -733,11 +725,7 @@ fn transfer_service_for_source(
     }
 }
 
-fn resolve_icp_destination(
-    config: &crate::config::Config,
-    destination: &str,
-    asset_symbol: &str,
-) -> Result<Account, String> {
+fn resolve_icp_destination(config: &crate::config::Config, destination: &str) -> Result<Account, String> {
     if destination.eq_ignore_ascii_case("main") {
         Ok(config.liquidator_principal.into())
     } else if destination.eq_ignore_ascii_case("trader") {
@@ -745,7 +733,7 @@ fn resolve_icp_destination(
     } else if destination.eq_ignore_ascii_case("recovery") {
         Ok(config.get_recovery_account())
     } else if destination.eq_ignore_ascii_case("bridge") {
-        Ok(config.bridge_ic_account_for_symbol(asset_symbol))
+        Ok(config.bridge_ic_account())
     } else {
         Account::from_str(destination).map_err(|_| format!("Invalid destination ICP account: {destination}"))
     }
@@ -806,10 +794,7 @@ pub async fn withdraw_noninteractive(source: &str, destination: &str, asset: &st
         "main" => (config.liquidator_identity.clone(), config.liquidator_principal.into()),
         "trader" => (config.trader_identity.clone(), config.trader_principal.into()),
         "recovery" => (config.trader_identity.clone(), config.get_recovery_account()),
-        "bridge" => (
-            config.bridge_ic_identity.clone(),
-            config.bridge_ic_account_for_symbol(""),
-        ),
+        "bridge" => (config.bridge_ic_identity.clone(), config.bridge_ic_account()),
         _ => (config.liquidator_identity.clone(), config.liquidator_principal.into()),
     };
 
@@ -853,7 +838,7 @@ pub async fn withdraw_noninteractive(source: &str, destination: &str, asset: &st
                 continue;
             };
 
-            let dst_account = match resolve_icp_destination(&config, destination, &id.symbol) {
+            let dst_account = match resolve_icp_destination(&config, destination) {
                 Ok(account) => account,
                 Err(err) => {
                     eprintln!("{err}");
@@ -916,7 +901,7 @@ pub async fn withdraw_noninteractive(source: &str, destination: &str, asset: &st
             .unwrap_or_else(|| "n/a".to_string());
 
         let destination_account = match &token {
-            ChainToken::Icp { .. } => match resolve_icp_destination(&config, destination, &id.symbol) {
+            ChainToken::Icp { .. } => match resolve_icp_destination(&config, destination) {
                 Ok(dst_account) => ChainAccount::Icp(dst_account),
                 Err(err) => {
                     eprintln!("{err}");
@@ -1028,7 +1013,7 @@ pub async fn withdraw_noninteractive(source: &str, destination: &str, asset: &st
         let src = match token {
             ChainToken::Icp { .. } => {
                 if source_kind == "bridge" {
-                    config.bridge_ic_account_for_symbol(&asset_id.symbol).to_string()
+                    config.bridge_ic_account().to_string()
                 } else {
                     account.to_string()
                 }
@@ -1061,7 +1046,7 @@ pub async fn withdraw_noninteractive(source: &str, destination: &str, asset: &st
         let src = match token {
             ChainToken::Icp { .. } => {
                 if source_kind == "bridge" {
-                    config.bridge_ic_account_for_symbol(&asset_id.symbol).to_string()
+                    config.bridge_ic_account().to_string()
                 } else {
                     account.to_string()
                 }

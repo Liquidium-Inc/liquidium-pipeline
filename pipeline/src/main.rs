@@ -104,6 +104,23 @@ enum Commands {
         bridge_destination: Option<String>,
     },
 
+    // Smoke test: bridge ckUSDC -> USDC@ETH to MEXC, swap USDC -> CKBTC, withdraw CKBTC on ICP.
+    MexcSmokeBridgeSwapWithdraw {
+        // Amount of ckUSDC to bridge into MEXC.
+        #[arg(long)]
+        amount_ckusdc: f64,
+        // Execute live side effects (bridge + swap + withdraw). If omitted, runs dry-run preflight only.
+        #[arg(long)]
+        execute: bool,
+        // Optional explicit CKBTC withdraw destination (ICP principal/account text).
+        // Defaults to liquidator principal.
+        #[arg(long)]
+        withdraw_address: Option<String>,
+        // Withdraw network for CKBTC. Defaults to ICP.
+        #[arg(long, default_value = "ICP")]
+        withdraw_network: String,
+    },
+
     // Withdraws funds. Without flags, starts the interactive wizard.
     // With flags, performs a non-interactive withdrawal.
     Withdraw {
@@ -251,6 +268,23 @@ async fn main() {
             .await
             {
                 eprintln!("MEXC smoke swap+withdraw failed: {}", err);
+            }
+        }
+        Commands::MexcSmokeBridgeSwapWithdraw {
+            amount_ckusdc,
+            execute,
+            withdraw_address,
+            withdraw_network,
+        } => {
+            if let Err(err) = commands::cex::mexc_smoke_bridge_swap_withdraw(
+                amount_ckusdc,
+                execute,
+                withdraw_address.as_deref(),
+                &withdraw_network,
+            )
+            .await
+            {
+                eprintln!("MEXC smoke bridge+swap+withdraw failed: {}", err);
             }
         }
         Commands::Withdraw {
@@ -561,6 +595,67 @@ mod tests {
     fn cli_parse_mexc_smoke_missing_amount_fails() {
         let parsed = Cli::try_parse_from(["liquidator", "mexc-smoke-swap-withdraw"]);
         assert!(parsed.is_err(), "missing --amount-ckbtc should fail parsing");
+    }
+
+    #[test]
+    fn cli_parse_mexc_smoke_bridge_defaults_to_dry_run_and_icp_network() {
+        let parsed = Cli::try_parse_from([
+            "liquidator",
+            "mexc-smoke-bridge-swap-withdraw",
+            "--amount-ckusdc",
+            "250.0",
+        ])
+        .expect("mexc bridge smoke command should parse");
+        match parsed.command {
+            Commands::MexcSmokeBridgeSwapWithdraw {
+                amount_ckusdc,
+                execute,
+                withdraw_address,
+                withdraw_network,
+            } => {
+                assert!((amount_ckusdc - 250.0).abs() < 1e-12);
+                assert!(!execute);
+                assert!(withdraw_address.is_none());
+                assert_eq!(withdraw_network, "ICP");
+            }
+            _ => panic!("expected mexc smoke bridge swap withdraw command"),
+        }
+    }
+
+    #[test]
+    fn cli_parse_mexc_smoke_bridge_with_execute_and_overrides() {
+        let parsed = Cli::try_parse_from([
+            "liquidator",
+            "mexc-smoke-bridge-swap-withdraw",
+            "--amount-ckusdc",
+            "100.5",
+            "--execute",
+            "--withdraw-address",
+            "aaaaa-aa",
+            "--withdraw-network",
+            "ICP",
+        ])
+        .expect("mexc bridge smoke command with execute should parse");
+        match parsed.command {
+            Commands::MexcSmokeBridgeSwapWithdraw {
+                amount_ckusdc,
+                execute,
+                withdraw_address,
+                withdraw_network,
+            } => {
+                assert!((amount_ckusdc - 100.5).abs() < 1e-12);
+                assert!(execute);
+                assert_eq!(withdraw_address.as_deref(), Some("aaaaa-aa"));
+                assert_eq!(withdraw_network, "ICP");
+            }
+            _ => panic!("expected mexc smoke bridge swap withdraw command"),
+        }
+    }
+
+    #[test]
+    fn cli_parse_mexc_smoke_bridge_missing_amount_fails() {
+        let parsed = Cli::try_parse_from(["liquidator", "mexc-smoke-bridge-swap-withdraw"]);
+        assert!(parsed.is_err(), "missing --amount-ckusdc should fail parsing");
     }
 
     #[cfg(target_os = "linux")]
