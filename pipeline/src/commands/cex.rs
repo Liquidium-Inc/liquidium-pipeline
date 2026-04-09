@@ -398,14 +398,14 @@ async fn auto_fund_bridge_source_from_liquidator(
         .map_err(|e| format!("bridge auto-funding failed to initialize context: {e}"))?;
 
     let (ckusdc_id, ckusdc_token) = resolve_icp_asset_by_symbol(&ctx, REVERSE_BRIDGE_SOURCE_ASSET)?;
-    let required_ckusdc = ChainTokenAmount::from_formatted(ckusdc_token.clone(), amount_ckusdc).value;
+    let required_ckusdc = ChainTokenAmount::from_formatted(ckusdc_token.clone(), amount_ckusdc).value + ckusdc_token.fee();
     ensure_bridge_asset_funded_from_liquidator(
         &ctx,
         &ckusdc_id,
         &ckusdc_token,
         required_ckusdc,
         bridge_source_account,
-        "reverse bridge amount",
+        "reverse bridge amount + approve fee",
     )
     .await?;
 

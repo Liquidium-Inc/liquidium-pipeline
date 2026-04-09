@@ -31,6 +31,18 @@ pub async fn icrc1_decimals_with_context<B: IcpBackend + ?Sized>(
         .map_err(|e| format!("{context}: icrc1_decimals failed on ledger {ledger}: {e}"))
 }
 
+/// Reads ICRC-1 fee and enriches failures with call-site context.
+pub async fn icrc1_fee_with_context<B: IcpBackend + ?Sized>(
+    backend: &B,
+    ledger: Principal,
+    context: &str,
+) -> Result<Nat, String> {
+    backend
+        .icrc1_fee(ledger)
+        .await
+        .map_err(|e| format!("{context}: icrc1_fee failed on ledger {ledger}: {e}"))
+}
+
 /// Sends ICRC-2 approve and enriches failures with call-site context.
 pub async fn icrc2_approve_with_context<B: IcpBackend + ?Sized>(
     backend: &B,
@@ -52,7 +64,9 @@ mod tests {
         icrc2::approve::ApproveArgs,
     };
 
-    use super::{icrc1_balance_with_context, icrc1_decimals_with_context, icrc2_approve_with_context};
+    use super::{
+        icrc1_balance_with_context, icrc1_decimals_with_context, icrc1_fee_with_context, icrc2_approve_with_context,
+    };
     use crate::backend::icp_backend::MockIcpBackend;
 
     #[tokio::test]
@@ -110,5 +124,17 @@ mod tests {
         assert!(err.contains("bridge"));
         assert!(err.contains("icrc2_approve failed on ledger"));
         assert!(err.contains("approval boom"));
+    }
+
+    #[tokio::test]
+    async fn fee_wrapper_adds_context_and_ledger_on_error() {
+        let ledger = Principal::management_canister();
+        let mut backend = MockIcpBackend::new();
+        backend.expect_icrc1_fee().returning(|_| Err("fee boom".to_string()));
+
+        let err = icrc1_fee_with_context(&backend, ledger, "bridge").await.expect_err("must fail");
+        assert!(err.contains("bridge"));
+        assert!(err.contains("icrc1_fee failed on ledger"));
+        assert!(err.contains("fee boom"));
     }
 }

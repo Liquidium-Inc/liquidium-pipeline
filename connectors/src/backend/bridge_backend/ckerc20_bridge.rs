@@ -25,7 +25,9 @@ use crate::{
         },
         evm_backend::EvmBackendImpl,
         icp_backend::IcpBackend,
-        icp_backend_helpers::{icrc1_balance_with_context, icrc1_decimals_with_context, icrc2_approve_with_context},
+        icp_backend_helpers::{
+            icrc1_balance_with_context, icrc1_decimals_with_context, icrc1_fee_with_context, icrc2_approve_with_context,
+        },
     },
     pipeline_agent::PipelineAgent,
 };
@@ -453,6 +455,25 @@ where
         let ckusdc_decimals =
             icrc1_decimals_with_context(self.icp_backend.as_ref(), ckerc20_ledger_id, "ckerc20 bridge").await?;
         let amount_native = amount_to_nat_units_strict(request.amount, ckusdc_decimals)?;
+        let ckusdc_approve_fee = icrc1_fee_with_context(self.icp_backend.as_ref(), ckerc20_ledger_id, "ckerc20 bridge").await?;
+       
+        let ckusdc_required_budget = amount_native.clone() + ckusdc_approve_fee.clone();
+       
+        let available_ckusdc = icrc1_balance_with_context(
+            self.icp_backend.as_ref(),
+            ckerc20_ledger_id,
+            &source_account,
+            "ckerc20 bridge",
+        )
+        .await?;
+        if available_ckusdc < ckusdc_required_budget {
+            let available_formatted = nat_units_to_amount_via_core(&available_ckusdc, ckusdc_decimals)?;
+            let required_formatted = nat_units_to_amount_via_core(&ckusdc_required_budget, ckusdc_decimals)?;
+            return Err(format!(
+                "bridge amount preflight failed: ckUSDC balance is below required burn+approve budget (available={} required={} source={})",
+                available_formatted, required_formatted, request.source_address
+            ));
+        }
 
         let minter_info = self.minter_info().await?;
         let cketh_ledger_id = minter_info.cketh_ledger_id.ok_or_else(|| {
