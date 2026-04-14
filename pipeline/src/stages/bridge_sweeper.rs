@@ -12,6 +12,8 @@ use liquidium_pipeline_connectors::backend::bridge_backend::{
 use tokio::time::sleep;
 use tracing::{info, warn};
 
+use crate::stages::bridge_submit_lock::acquire_bridge_submit_lock;
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct BridgeBalanceSnapshot {
     pub asset: String,
@@ -188,6 +190,9 @@ where
     }
 
     async fn submit(&self, action: BridgeAction) -> Result<BridgeSubmission, String> {
+        let _submit_guard =
+            acquire_bridge_submit_lock(&action.asset, &action.source_chain, &action.source_address).await;
+
         let request = BridgeRequest {
             asset: action.asset,
             source_chain: action.source_chain,

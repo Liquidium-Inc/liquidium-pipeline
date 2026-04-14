@@ -5,14 +5,21 @@ use alloy::{
     sol,
 };
 use async_trait::async_trait;
-use candid::{CandidType, Encode, Nat, Principal};
-use icrc_ledger_types::{
-    icrc1::account::Account,
-    icrc2::approve::ApproveArgs,
-};
-use serde::Deserialize;
+use candid::{Encode, Nat, Principal};
+use icrc_ledger_types::{icrc1::account::Account, icrc2::approve::ApproveArgs};
 use std::sync::Arc;
 
+use super::{
+    ckerc20_bridge_utils::{
+        destination_to_bytes32, ensure_source_matches_bridge_owner, ensure_source_matches_signer,
+        expect_evm_destination, expect_icp_destination, parse_ckerc20_ledger_id, parse_evm_token_address,
+        parse_source_icp_account, resolve_cketh_route_for_request,
+    },
+    types::{
+        CkEthMinterInfo, Eip1559TransactionPrice, Eip1559TransactionPriceArg, EvmReceiptStatus, HelperContract,
+        LedgerError, WithdrawErc20Arg, WithdrawErc20Error, WithdrawErc20Ret,
+    },
+};
 use crate::{
     backend::{
         amount_utils::{
@@ -31,11 +38,6 @@ use crate::{
     },
     pipeline_agent::PipelineAgent,
 };
-use super::ckerc20_bridge_utils::{
-    destination_to_bytes32, ensure_source_matches_bridge_owner, ensure_source_matches_signer, expect_evm_destination,
-    expect_icp_destination, parse_ckerc20_ledger_id, parse_evm_token_address, parse_source_icp_account,
-    resolve_cketh_route_for_request,
-};
 
 sol! {
     #[sol(rpc)]
@@ -49,12 +51,6 @@ sol! {
     interface ICkErc20HelperWithSubaccount {
         function depositErc20(address erc20Address, uint256 amount, bytes32 principal, bytes32 subaccount) external;
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct EvmReceiptStatus {
-    pub success: bool,
-    pub block_number: Option<u64>,
 }
 
 #[cfg_attr(test, mockall::automock)]
@@ -152,96 +148,6 @@ where
             block_number: receipt.block_number,
         }))
     }
-}
-
-#[derive(CandidType, Deserialize, Clone, Debug)]
-struct CkEthMinterInfo {
-    #[serde(default)]
-    deposit_with_subaccount_helper_contract_address: Option<String>,
-    #[serde(default)]
-    erc20_helper_contract_address: Option<String>,
-    #[serde(default)]
-    cketh_ledger_id: Option<Principal>,
-}
-
-#[derive(Clone, Copy, Debug)]
-enum HelperContract {
-    WithSubaccount(Address),
-    Native(Address),
-}
-
-#[derive(CandidType, Deserialize, Clone, Debug)]
-struct Eip1559TransactionPriceArg {
-    ckerc20_ledger_id: Principal,
-}
-
-#[derive(CandidType, Deserialize, Clone, Debug)]
-struct Eip1559TransactionPrice {
-    max_priority_fee_per_gas: Nat,
-    max_fee_per_gas: Nat,
-    max_transaction_fee: Nat,
-    timestamp: Option<u64>,
-    gas_limit: Nat,
-}
-
-#[derive(CandidType, Deserialize, Clone, Debug)]
-struct WithdrawErc20Arg {
-    ckerc20_ledger_id: Principal,
-    recipient: String,
-    from_cketh_subaccount: Option<Vec<u8>>,
-    from_ckerc20_subaccount: Option<Vec<u8>>,
-    amount: Nat,
-}
-
-#[derive(CandidType, Deserialize, Clone, Debug)]
-struct RetrieveErc20Request {
-    ckerc20_block_index: Nat,
-    cketh_block_index: Nat,
-}
-
-#[derive(CandidType, Deserialize, Clone, Debug)]
-struct CkErc20Token {
-    erc20_contract_address: String,
-    ledger_canister_id: Principal,
-    ckerc20_token_symbol: String,
-}
-
-#[derive(CandidType, Deserialize, Clone, Debug)]
-enum LedgerError {
-    TemporarilyUnavailable(String),
-    InsufficientAllowance {
-        token_symbol: String,
-        ledger_id: Principal,
-        allowance: Nat,
-        failed_burn_amount: Nat,
-    },
-    AmountTooLow {
-        minimum_burn_amount: Nat,
-        token_symbol: String,
-        ledger_id: Principal,
-        failed_burn_amount: Nat,
-    },
-    InsufficientFunds {
-        balance: Nat,
-        token_symbol: String,
-        ledger_id: Principal,
-        failed_burn_amount: Nat,
-    },
-}
-
-#[derive(CandidType, Deserialize, Clone, Debug)]
-enum WithdrawErc20Error {
-    TokenNotSupported { supported_tokens: Vec<CkErc20Token> },
-    TemporarilyUnavailable(String),
-    CkErc20LedgerError { error: LedgerError, cketh_block_index: Nat },
-    CkEthLedgerError { error: LedgerError },
-    RecipientAddressBlocked { address: String },
-}
-
-#[derive(CandidType, Deserialize, Clone, Debug)]
-enum WithdrawErc20Ret {
-    Ok(RetrieveErc20Request),
-    Err(WithdrawErc20Error),
 }
 
 /// Bridge backend for `ERC20@ETH -> ckERC20` forward routes via ckETH minter helper contracts.
@@ -455,10 +361,11 @@ where
         let ckusdc_decimals =
             icrc1_decimals_with_context(self.icp_backend.as_ref(), ckerc20_ledger_id, "ckerc20 bridge").await?;
         let amount_native = amount_to_nat_units_strict(request.amount, ckusdc_decimals)?;
-        let ckusdc_approve_fee = icrc1_fee_with_context(self.icp_backend.as_ref(), ckerc20_ledger_id, "ckerc20 bridge").await?;
-       
+        let ckusdc_approve_fee =
+            icrc1_fee_with_context(self.icp_backend.as_ref(), ckerc20_ledger_id, "ckerc20 bridge").await?;
+
         let ckusdc_required_budget = amount_native.clone() + ckusdc_approve_fee.clone();
-       
+
         let available_ckusdc = icrc1_balance_with_context(
             self.icp_backend.as_ref(),
             ckerc20_ledger_id,
@@ -575,8 +482,7 @@ where
         if let Some(route) = resolve_cketh_reverse_route_by_source(asset, chain) {
             let ledger_id = parse_ckerc20_ledger_id(route)?;
             let source_account = parse_source_icp_account(address)?;
-            let decimals =
-                icrc1_decimals_with_context(self.icp_backend.as_ref(), ledger_id, "ckerc20 bridge").await?;
+            let decimals = icrc1_decimals_with_context(self.icp_backend.as_ref(), ledger_id, "ckerc20 bridge").await?;
             let balance =
                 icrc1_balance_with_context(self.icp_backend.as_ref(), ledger_id, &source_account, "ckerc20 bridge")
                     .await?;

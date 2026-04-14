@@ -21,6 +21,7 @@ pub enum CexStep {
     Trade,
     TradePending,
     Withdraw,
+    WithdrawPending,
     Completed,
     Failed,
 }
@@ -67,6 +68,26 @@ pub struct CexDepositState {
     pub deposit_sent_at_ts: Option<i64>,
     #[serde(default)]
     pub approval_bump_count: Option<u32>,
+    #[serde(flatten)]
+    pub bridge: CexDepositBridgeState,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct CexDepositBridgeState {
+    #[serde(default)]
+    pub deposit_planned_asset: Option<String>,
+    #[serde(default)]
+    pub deposit_planned_network: Option<String>,
+    #[serde(default)]
+    pub deposit_bridge_required: bool,
+    #[serde(default)]
+    pub deposit_bridge_id: Option<String>,
+    #[serde(default)]
+    pub deposit_bridge_submitted_at_ts: Option<i64>,
+    #[serde(default)]
+    pub deposit_bridge_polled_at_ts: Option<i64>,
+    #[serde(default)]
+    pub deposit_bridge_destination_snapshot: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -140,6 +161,26 @@ pub struct CexWithdrawState {
     pub withdraw_id: Option<String>,
     pub withdraw_txid: Option<String>,
     pub size_out: Option<ChainTokenAmount>,
+    #[serde(flatten)]
+    pub bridge: CexWithdrawBridgeState,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct CexWithdrawBridgeState {
+    #[serde(default)]
+    pub withdraw_planned_asset: Option<String>,
+    #[serde(default)]
+    pub withdraw_planned_network: Option<String>,
+    #[serde(default)]
+    pub withdraw_bridge_required: bool,
+    #[serde(default)]
+    pub withdraw_bridge_id: Option<String>,
+    #[serde(default)]
+    pub withdraw_bridge_submitted_at_ts: Option<i64>,
+    #[serde(default)]
+    pub withdraw_bridge_polled_at_ts: Option<i64>,
+    #[serde(default)]
+    pub withdraw_bridge_destination_snapshot: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -277,6 +318,10 @@ impl Finalizer for dyn CexFinalizerLogic {
                     debug!("[cex] 🏦 liq_id={} step=Withdraw", cex_state.liq_id);
                     self.withdraw(&mut cex_state).await
                 }
+                CexStep::WithdrawPending => {
+                    info!("[cex] ⏳ liq_id={} step=WithdrawPending", cex_state.liq_id);
+                    self.withdraw(&mut cex_state).await
+                }
                 CexStep::Completed => {
                     info!("[cex] 🎉 liq_id={} step=Completed", cex_state.liq_id);
                     debug!("[cex] liq_id={} step=Completed (noop)", cex_state.liq_id);
@@ -314,7 +359,7 @@ impl Finalizer for dyn CexFinalizerLogic {
             encode_meta(&mut row_after, &meta)?;
             wal.upsert_result(row_after.clone()).await.map_err(|e| e.to_string())?;
 
-            if matches!(cex_state.step, CexStep::DepositPending) {
+            if matches!(cex_state.step, CexStep::DepositPending | CexStep::WithdrawPending) {
                 break;
             }
         }
@@ -455,6 +500,15 @@ mod tests {
                     deposit_balance_before: None,
                     deposit_sent_at_ts: None,
                     approval_bump_count: None,
+                    bridge: CexDepositBridgeState {
+                        deposit_planned_asset: None,
+                        deposit_planned_network: None,
+                        deposit_bridge_required: false,
+                        deposit_bridge_id: None,
+                        deposit_bridge_submitted_at_ts: None,
+                        deposit_bridge_polled_at_ts: None,
+                        deposit_bridge_destination_snapshot: None,
+                    },
                 },
                 trade: CexTradeState {
                     trade_leg_index: None,
@@ -487,6 +541,15 @@ mod tests {
                     withdraw_id: None,
                     withdraw_txid: None,
                     size_out: None,
+                    bridge: CexWithdrawBridgeState {
+                        withdraw_planned_asset: None,
+                        withdraw_planned_network: None,
+                        withdraw_bridge_required: false,
+                        withdraw_bridge_id: None,
+                        withdraw_bridge_submitted_at_ts: None,
+                        withdraw_bridge_polled_at_ts: None,
+                        withdraw_bridge_destination_snapshot: None,
+                    },
                 },
             })
         }
@@ -582,6 +645,15 @@ mod tests {
                     deposit_balance_before: None,
                     deposit_sent_at_ts: None,
                     approval_bump_count: None,
+                    bridge: CexDepositBridgeState {
+                        deposit_planned_asset: None,
+                        deposit_planned_network: None,
+                        deposit_bridge_required: false,
+                        deposit_bridge_id: None,
+                        deposit_bridge_submitted_at_ts: None,
+                        deposit_bridge_polled_at_ts: None,
+                        deposit_bridge_destination_snapshot: None,
+                    },
                 },
                 trade: CexTradeState {
                     trade_leg_index: None,
@@ -614,6 +686,15 @@ mod tests {
                     withdraw_id: None,
                     withdraw_txid: None,
                     size_out: None,
+                    bridge: CexWithdrawBridgeState {
+                        withdraw_planned_asset: None,
+                        withdraw_planned_network: None,
+                        withdraw_bridge_required: false,
+                        withdraw_bridge_id: None,
+                        withdraw_bridge_submitted_at_ts: None,
+                        withdraw_bridge_polled_at_ts: None,
+                        withdraw_bridge_destination_snapshot: None,
+                    },
                 },
             })
         }

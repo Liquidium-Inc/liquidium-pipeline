@@ -1,4 +1,5 @@
 use super::*;
+use crate::finalizers::bridge_planner::BridgePlanner;
 
 struct PendingSliceRequest {
     requested_in: f64,
@@ -62,7 +63,7 @@ where
 
     /// Phase-B deposit confirmation by balance delta against the captured baseline.
     pub(super) async fn check_deposit(&self, state: &mut CexState) -> Result<(), String> {
-        let symbol = state.deposit.deposit_asset.symbol();
+        let symbol = <Self as BridgePlanner>::planned_deposit_asset(state);
         let current_balance = self.backend.get_balance(&symbol).await?;
 
         match state.deposit.deposit_balance_before {
@@ -482,8 +483,8 @@ where
 
         let legs = self
             .resolve_trade_legs_for_symbols(
-                &state.deposit.deposit_asset.symbol(),
-                &state.withdraw.withdraw_asset.symbol(),
+                &<Self as BridgePlanner>::planned_deposit_asset(state),
+                &<Self as BridgePlanner>::planned_withdraw_asset(state),
             )
             .await?;
         Self::persist_trade_legs(state, &legs);
