@@ -9,12 +9,9 @@ use tracing::instrument;
 use tracing::{info, warn};
 
 use crate::{
-    commands::{
-        liquidation_loop_bridge_sweepers::spawn_bridge_sweepers,
-        liquidation_loop_helpers::{
-            bootstrap_control_plane, console_ui_enabled, debt_asset_principals, debt_assets_as_text,
-            ensure_runtime_file_permissions, print_banner, run_daemon_cycle_loop,
-        },
+    commands::liquidation_loop_helpers::{
+        bootstrap_control_plane, console_ui_enabled, debt_asset_principals, debt_assets_as_text,
+        ensure_runtime_file_permissions, print_banner, run_daemon_cycle_loop,
     },
     config::{Config, ConfigTrait},
     context::{PipelineContext, init_context},
@@ -291,11 +288,6 @@ pub async fn run_liquidation_loop(sock_path: PathBuf) {
     );
 
     tokio::spawn(async move { watcher.run().await });
-
-    if let Err(err) = spawn_bridge_sweepers(&ctx, None) {
-        tracing::error!("{}", err);
-        return;
-    }
 
     let debt_asset_principals = debt_asset_principals(&ctx.registry);
     let debt_assets = debt_assets_as_text(&debt_asset_principals);

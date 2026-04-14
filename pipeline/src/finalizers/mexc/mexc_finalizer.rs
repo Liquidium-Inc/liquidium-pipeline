@@ -833,13 +833,13 @@ where
                 .withdraw_bridge_destination_snapshot
                 .clone()
                 .ok_or_else(|| "missing final destination snapshot for bridged withdraw".to_string())?;
-        
+
             let bridge_destination =
                 self.bridge_destination_for_final_liquidator(route.destination_kind, &final_destination_snapshot)?;
-         
+
             let _submit_guard =
                 acquire_bridge_submit_lock(route.source_asset, route.source_chain, &bridge_source_address).await;
-         
+
             let submission = bridge
                 .backend
                 .submit_bridge(BridgeRequest {
