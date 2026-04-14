@@ -3976,6 +3976,44 @@ dependencies = [
 ]
 
 [[package]]
+name = "mexc-rs"
+version = "0.6.5"
+source = "git+https://github.com/liquidium-Inc/mexc-rs.git?rev=5b8dc1e5e4261cab27772e32e2311ba4e70c1b13#5b8dc1e5e4261cab27772e32e2311ba4e70c1b13"
+dependencies = [
+ "anyhow",
+ "async-channel 1.9.0",
+ "async-stream",
+ "async-trait",
+ "chrono",
+ "dotenv",
+ "futures",
+ "hex",
+ "hmac",
+ "num",
+ "num-derive",
+ "num-traits",
+ "prost 0.13.5",
+ "reqwest 0.11.27",
+ "rust_decimal",
+ "serde",
+ "serde_json",
+ "serde_path_to_error",
+ "serde_repr",
+ "serde_urlencoded",
+ "serde_with",
+ "sha2 0.10.9",
+ "strum 0.25.0",
+ "strum_macros 0.25.3",
+ "thiserror 1.0.69",
+ "tokio",
+ "tokio-tungstenite",
+ "tokio-util",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
 name = "mime"
 version = "0.3.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"

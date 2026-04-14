@@ -3425,6 +3425,7 @@ mod fuzz {
                     decimals: 8,
                     fee: Nat::from(1_000u64),
                 };
+                state.withdraw.bridge.withdraw_planned_asset = Some("BTC".to_string());
 
                 finalizer.trade(&mut state).await.expect("trade should succeed");
 
@@ -3495,6 +3496,7 @@ mod fuzz {
                     decimals: 8,
                     fee: Nat::from(1_000u64),
                 };
+                state.withdraw.bridge.withdraw_planned_asset = Some("BTC".to_string());
 
                 finalizer.trade(&mut state).await.expect("trade should succeed");
 
@@ -3567,6 +3569,7 @@ mod fuzz {
                     decimals: 8,
                     fee: Nat::from(1_000u64),
                 };
+                state.withdraw.bridge.withdraw_planned_asset = Some("BTC".to_string());
 
                 let err = finalizer.trade(&mut state).await.expect_err("trade should fail");
                 assert!(err.contains("slice slippage too high"));
@@ -3650,6 +3653,7 @@ mod fuzz {
                     decimals: 8,
                     fee: Nat::from(1_000u64),
                 };
+                state.withdraw.bridge.withdraw_planned_asset = Some("BTC".to_string());
 
                 finalizer.trade(&mut state).await.expect("trade should succeed");
 
