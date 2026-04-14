@@ -25,13 +25,32 @@ const ROUND_HANDLER: f64 = 0.01;
 const MAX_TAKER_FEE_BPS: f64 = 10_000.0;
 
 fn from_mexc_raw(s: &str) -> WithdrawStatus {
-    match s {
+    let normalized = s.trim().to_ascii_uppercase();
+    match normalized.as_str() {
         // adjust to whatever MEXC actually returns
         "WAIT" | "PENDING" | "PROCESSING" => WithdrawStatus::Pending,
         "SUCCESS" | "FINISHED" | "DONE" => WithdrawStatus::Completed,
         "FAILED" | "FAIL" => WithdrawStatus::Failed,
         "CANCEL" | "CANCELED" => WithdrawStatus::Canceled,
         _ => WithdrawStatus::Unknown,
+    }
+}
+
+fn has_non_empty_text(value: Option<&str>) -> bool {
+    match value {
+        Some(text) => !text.trim().is_empty(),
+        None => false,
+    }
+}
+
+fn withdraw_status_from_mexc_record(status: &str, tx_id: Option<&str>, trans_hash: Option<&str>) -> WithdrawStatus {
+    let mapped = from_mexc_raw(status);
+    match mapped {
+        WithdrawStatus::Completed if !(has_non_empty_text(tx_id) || has_non_empty_text(trans_hash)) => {
+            // A completed status without chain txid is still in-flight from settlement perspective.
+            WithdrawStatus::Pending
+        }
+        other => other,
     }
 }
 
@@ -1307,7 +1326,7 @@ impl CexBackend for MexcClient {
             None => return Ok(WithdrawStatus::Unknown),
         };
 
-        let status = from_mexc_raw(rec.status.as_str());
+        let status = withdraw_status_from_mexc_record(rec.status.as_str(), rec.tx_id.as_deref(), rec.trans_hash.as_deref());
         Ok(status)
     }
 }
@@ -1424,5 +1443,53 @@ mod tests {
     fn candidate_symbols_are_normalized_and_deduped() {
         let candidates = MexcClient::candidate_symbols("CKBTCBTC", "CKBTC_BTC", "ckbtc-btc");
         assert_eq!(candidates, vec!["CKBTCBTC".to_string()]);
+    }
+
+    #[test]
+    fn from_mexc_raw_is_case_insensitive_and_trim_tolerant() {
+        assert_eq!(from_mexc_raw("Success"), WithdrawStatus::Completed);
+        assert_eq!(from_mexc_raw(" finished "), WithdrawStatus::Completed);
+        assert_eq!(from_mexc_raw("cAnCeLeD"), WithdrawStatus::Canceled);
+        assert_eq!(from_mexc_raw(" processing "), WithdrawStatus::Pending);
+    }
+
+    #[test]
+    fn withdraw_status_requires_txid_for_completed_statuses() {
+        assert_eq!(
+            withdraw_status_from_mexc_record("Success", None, None),
+            WithdrawStatus::Pending
+        );
+        assert_eq!(
+            withdraw_status_from_mexc_record("DONE", Some(" "), Some("   ")),
+            WithdrawStatus::Pending
+        );
+    }
+
+    #[test]
+    fn withdraw_status_accepts_tx_id_or_trans_hash_for_completion() {
+        assert_eq!(
+            withdraw_status_from_mexc_record("SUCCESS", Some("0xabc"), None),
+            WithdrawStatus::Completed
+        );
+        assert_eq!(
+            withdraw_status_from_mexc_record("FINISHED", None, Some("0xdef")),
+            WithdrawStatus::Completed
+        );
+    }
+
+    #[test]
+    fn withdraw_status_keeps_non_completed_states_unchanged() {
+        assert_eq!(
+            withdraw_status_from_mexc_record("FAILED", None, None),
+            WithdrawStatus::Failed
+        );
+        assert_eq!(
+            withdraw_status_from_mexc_record("PENDING", Some("0xabc"), None),
+            WithdrawStatus::Pending
+        );
+        assert_eq!(
+            withdraw_status_from_mexc_record("UNKNOWN_STATUS", Some("0xabc"), None),
+            WithdrawStatus::Unknown
+        );
     }
 }

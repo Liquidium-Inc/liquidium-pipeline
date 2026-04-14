@@ -487,6 +487,30 @@ fn append_meta_summary(lines: &mut Vec<Line<'static>>, meta: &[u8]) {
                 lines.push(Line::from(format!("CEX withdraw id: {}", withdraw_id)));
                 emitted = true;
             }
+            if let Some(deposit_bridge_id) = value
+                .get("deposit_bridge_id")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                lines.push(Line::from(format!(
+                    "Bridge deposit txid: {}",
+                    deposit_bridge_id
+                )));
+                emitted = true;
+            }
+            if let Some(withdraw_bridge_id) = value
+                .get("withdraw_bridge_id")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                lines.push(Line::from(format!(
+                    "Bridge withdraw txid: {}",
+                    withdraw_bridge_id
+                )));
+                emitted = true;
+            }
             if !emitted {
                 lines.push(Line::from(format!("State preview: {}", truncate(text, 180))));
             }
@@ -630,8 +654,21 @@ fn format_profit(amount: i128, decimals: u8, symbol: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{WalProfitSnapshot, profit_display_from_snapshot, truncate};
+    use super::{WalProfitSnapshot, append_meta_summary, profit_display_from_snapshot, truncate};
+    use ratatui::text::Line;
     use ratatui::style::Color;
+
+    fn lines_as_text(lines: &[Line<'_>]) -> Vec<String> {
+        lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect()
+    }
 
     #[test]
     fn truncate_no_change_when_within_limit() {
@@ -700,5 +737,55 @@ mod tests {
         };
 
         assert!(profit_display_from_snapshot(&snapshot).is_none());
+    }
+
+    #[test]
+    fn append_meta_summary_shows_both_bridge_txids_when_present() {
+        let mut lines = Vec::new();
+        let meta = br#"{"deposit_bridge_id":"0xabc123","withdraw_bridge_id":"0xdef456"}"#;
+        append_meta_summary(&mut lines, meta);
+
+        let text = lines_as_text(&lines);
+        assert!(text.iter().any(|line| line == "Bridge deposit txid: 0xabc123"));
+        assert!(text.iter().any(|line| line == "Bridge withdraw txid: 0xdef456"));
+        assert!(!text.iter().any(|line| line.starts_with("State preview: ")));
+    }
+
+    #[test]
+    fn append_meta_summary_shows_only_deposit_bridge_txid_when_only_deposit_is_present() {
+        let mut lines = Vec::new();
+        let meta = br#"{"deposit_bridge_id":"0xabc123"}"#;
+        append_meta_summary(&mut lines, meta);
+
+        let text = lines_as_text(&lines);
+        assert!(text.iter().any(|line| line == "Bridge deposit txid: 0xabc123"));
+        assert!(!text.iter().any(|line| line.starts_with("Bridge withdraw txid: ")));
+        assert!(!text.iter().any(|line| line.starts_with("State preview: ")));
+    }
+
+    #[test]
+    fn append_meta_summary_shows_only_withdraw_bridge_txid_when_only_withdraw_is_present() {
+        let mut lines = Vec::new();
+        let meta = br#"{"withdraw_bridge_id":"ic-withdraw:12:34"}"#;
+        append_meta_summary(&mut lines, meta);
+
+        let text = lines_as_text(&lines);
+        assert!(text
+            .iter()
+            .any(|line| line == "Bridge withdraw txid: ic-withdraw:12:34"));
+        assert!(!text.iter().any(|line| line.starts_with("Bridge deposit txid: ")));
+        assert!(!text.iter().any(|line| line.starts_with("State preview: ")));
+    }
+
+    #[test]
+    fn append_meta_summary_without_bridge_txids_preserves_state_preview_fallback() {
+        let mut lines = Vec::new();
+        let meta = br#"{"unrelated":"value"}"#;
+        append_meta_summary(&mut lines, meta);
+
+        let text = lines_as_text(&lines);
+        assert!(text.iter().any(|line| line.starts_with("State preview: ")));
+        assert!(!text.iter().any(|line| line.starts_with("Bridge deposit txid: ")));
+        assert!(!text.iter().any(|line| line.starts_with("Bridge withdraw txid: ")));
     }
 }

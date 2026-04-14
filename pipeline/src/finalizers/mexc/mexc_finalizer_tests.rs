@@ -1235,6 +1235,9 @@ async fn mexc_trade_marks_dust_and_skips_execution_for_small_residual() {
         decimals: 8,
         fee: Nat::from(1_000u64),
     };
+    state.withdraw.bridge.withdraw_planned_asset = Some("BTC".to_string());
+    state.withdraw.bridge.withdraw_planned_network = Some("ICP".to_string());
+    state.withdraw.bridge.withdraw_bridge_required = false;
 
     finalizer
         .trade(&mut state)
@@ -1463,6 +1466,9 @@ async fn mexc_trade_fails_when_realized_slice_slippage_exceeds_cap() {
         decimals: 8,
         fee: Nat::from(1_000u64),
     };
+    state.withdraw.bridge.withdraw_planned_asset = Some("BTC".to_string());
+    state.withdraw.bridge.withdraw_planned_network = Some("ICP".to_string());
+    state.withdraw.bridge.withdraw_bridge_required = false;
 
     let err = finalizer
         .trade(&mut state)
@@ -1557,12 +1563,18 @@ async fn mexc_trade_buy_truncation_mismatch_does_not_false_spike_slippage() {
         decimals: 8,
         fee: Nat::from(1_000u64),
     };
+    state.deposit.bridge.deposit_planned_asset = Some("BTC".to_string());
+    state.deposit.bridge.deposit_planned_network = Some("ICP".to_string());
+    state.deposit.bridge.deposit_bridge_required = false;
     state.withdraw.withdraw_asset = ChainToken::Icp {
         ledger: Principal::anonymous(),
         symbol: "CKBTC".to_string(),
         decimals: 8,
         fee: Nat::from(1_000u64),
     };
+    state.withdraw.bridge.withdraw_planned_asset = Some("CKBTC".to_string());
+    state.withdraw.bridge.withdraw_planned_network = Some("ICP".to_string());
+    state.withdraw.bridge.withdraw_bridge_required = false;
     state.size_in = ChainTokenAmount::from_formatted(state.deposit.deposit_asset.clone(), 0.000185);
     state.trade.trade_next_amount_in = None;
 
@@ -1728,12 +1740,18 @@ async fn mexc_trade_clamp_and_finish_under_consumed_buy_input_single_slice() {
         decimals: 8,
         fee: Nat::from(1_000u64),
     };
+    state.deposit.bridge.deposit_planned_asset = Some("BTC".to_string());
+    state.deposit.bridge.deposit_planned_network = Some("ICP".to_string());
+    state.deposit.bridge.deposit_bridge_required = false;
     state.withdraw.withdraw_asset = ChainToken::Icp {
         ledger: Principal::anonymous(),
         symbol: "CKBTC".to_string(),
         decimals: 8,
         fee: Nat::from(1_000u64),
     };
+    state.withdraw.bridge.withdraw_planned_asset = Some("CKBTC".to_string());
+    state.withdraw.bridge.withdraw_planned_network = Some("ICP".to_string());
+    state.withdraw.bridge.withdraw_bridge_required = false;
     state.size_in = ChainTokenAmount::from_formatted(state.deposit.deposit_asset.clone(), 0.000185);
 
     finalizer.trade(&mut state).await.expect("trade should succeed");
@@ -1815,6 +1833,9 @@ async fn mexc_trade_retries_current_leg_from_original_amount_after_mid_leg_error
         decimals: 8,
         fee: Nat::from(1_000u64),
     };
+    state.withdraw.bridge.withdraw_planned_asset = Some("BTC".to_string());
+    state.withdraw.bridge.withdraw_planned_network = Some("ICP".to_string());
+    state.withdraw.bridge.withdraw_bridge_required = false;
 
     let first_err = finalizer
         .trade(&mut state)
@@ -1903,6 +1924,9 @@ async fn mexc_trade_uses_resume_amount_when_trade_next_amount_in_is_present() {
         decimals: 8,
         fee: Nat::from(1_000u64),
     };
+    state.withdraw.bridge.withdraw_planned_asset = Some("BTC".to_string());
+    state.withdraw.bridge.withdraw_planned_network = Some("ICP".to_string());
+    state.withdraw.bridge.withdraw_bridge_required = false;
     state.trade.trade_next_amount_in = Some(0.0042);
 
     finalizer.trade(&mut state).await.expect("trade should succeed");
@@ -1980,6 +2004,9 @@ async fn mexc_trade_clears_legacy_pending_without_client_id_before_submit() {
         decimals: 8,
         fee: Nat::from(1_000u64),
     };
+    state.withdraw.bridge.withdraw_planned_asset = Some("BTC".to_string());
+    state.withdraw.bridge.withdraw_planned_network = Some("ICP".to_string());
+    state.withdraw.bridge.withdraw_bridge_required = false;
 
     // Simulate legacy WAL residue: pending markers persisted without client id.
     state.trade.trade_pending_market = Some("CKBTC_BTC".to_string());
@@ -2061,6 +2088,9 @@ async fn mexc_trade_clears_stale_pending_from_different_leg_before_submit() {
         decimals: 8,
         fee: Nat::from(1_000u64),
     };
+    state.withdraw.bridge.withdraw_planned_asset = Some("BTC".to_string());
+    state.withdraw.bridge.withdraw_planned_network = Some("ICP".to_string());
+    state.withdraw.bridge.withdraw_bridge_required = false;
 
     state.trade.trade_pending_client_order_id = Some("legacy-pending-id".to_string());
     state.trade.trade_pending_market = Some("OTHER_MARKET".to_string());
@@ -2141,6 +2171,9 @@ async fn mexc_trade_regenerates_invalid_pending_client_order_id() {
         decimals: 8,
         fee: Nat::from(1_000u64),
     };
+    state.withdraw.bridge.withdraw_planned_asset = Some("BTC".to_string());
+    state.withdraw.bridge.withdraw_planned_network = Some("ICP".to_string());
+    state.withdraw.bridge.withdraw_bridge_required = false;
 
     state.trade.trade_pending_client_order_id = Some(invalid_pending_id.to_string());
     state.trade.trade_pending_market = Some("CKBTC_BTC".to_string());
@@ -2223,12 +2256,18 @@ async fn mexc_trade_errors_when_direct_market_cannot_be_resolved() {
         decimals: 8,
         fee: Nat::from(1_000u64),
     };
+    state.deposit.bridge.deposit_planned_asset = Some("BTC".to_string());
+    state.deposit.bridge.deposit_planned_network = Some("ICP".to_string());
+    state.deposit.bridge.deposit_bridge_required = false;
     state.withdraw.withdraw_asset = ChainToken::Icp {
         ledger: Principal::anonymous(),
         symbol: "ETH".to_string(),
         decimals: 8,
         fee: Nat::from(1_000u64),
     };
+    state.withdraw.bridge.withdraw_planned_asset = Some("ETH".to_string());
+    state.withdraw.bridge.withdraw_planned_network = Some("ICP".to_string());
+    state.withdraw.bridge.withdraw_bridge_required = false;
     state.size_in = ChainTokenAmount::from_formatted(state.deposit.deposit_asset.clone(), 0.01);
 
     let err = finalizer
