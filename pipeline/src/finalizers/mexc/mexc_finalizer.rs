@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use candid::{Nat, Principal};
 use icrc_ledger_types::icrc1::account::Account;
 use liquidium_pipeline_connectors::backend::bridge_backend::{
-    BridgeBackend, BridgeRequest, BridgeStatus, resolve_route,
+    BridgeBackend, BridgeRequest, BridgeRouteKind, BridgeStatus, resolve_route,
 };
 use liquidium_pipeline_connectors::backend::cex_backend::{
     BuyOrderInputMode, CexBackend, OrderBookLevel, SwapExecutionOptions, WithdrawStatus,
@@ -475,24 +475,59 @@ where
                 &cex_destination.address,
             )?;
             let bridge_source_address = self.resolve_bridge_source_address(route.source_chain)?;
-            let bridge_amount = state
+            let mut bridge_amount = state
                 .trade
                 .trade_next_amount_in
                 .unwrap_or_else(|| state.size_in.to_f64());
 
+            // Reverse ckERC20 bridge burns source token and charges an ICRC2 approve fee
+            // on the same source account. Reserve one token fee unit upfront so the first
+            // submit_bridge attempt does not fail preflight on amount+approve budget.
+            if route.route_kind == BridgeRouteKind::CkEthErc20Reverse
+                && route.source_chain.eq_ignore_ascii_case("ICP")
+                && state.deposit.deposit_asset.symbol().eq_ignore_ascii_case(route.source_asset)
+                && state.deposit.deposit_asset.chain().eq_ignore_ascii_case(route.source_chain)
+            {
+                let approve_fee_reserve = ChainTokenAmount::from_raw(
+                    state.deposit.deposit_asset.clone(),
+                    state.deposit.deposit_asset.fee(),
+                )
+                .to_f64();
+
+                let source_available = bridge
+                    .backend
+                    .get_source_balance(route.source_asset, route.source_chain, &bridge_source_address)
+                    .await?;
+                let max_bridgeable = (source_available - approve_fee_reserve).max(0.0);
+
+                if max_bridgeable <= 0.0 {
+                    return Err(format!(
+                        "bridge amount preflight failed: source balance cannot cover approve fee reserve (available={} reserve={} source={})",
+                        source_available, approve_fee_reserve, bridge_source_address
+                    ));
+                }
+
+                if bridge_amount > max_bridgeable {
+                    info!(
+                        "[mexc] liq_id={} reserving approve fee before reverse bridge submit: amount {} -> {} (available={} reserve={})",
+                        state.liq_id, bridge_amount, max_bridgeable, source_available, approve_fee_reserve
+                    );
+                    bridge_amount = max_bridgeable;
+                    state.trade.trade_next_amount_in = Some(max_bridgeable);
+                }
+            }
+
             let _submit_guard =
                 acquire_bridge_submit_lock(route.source_asset, route.source_chain, &bridge_source_address).await;
-            let submission = bridge
-                .backend
-                .submit_bridge(BridgeRequest {
-                    asset: route.source_asset.to_string(),
-                    source_chain: route.source_chain.to_string(),
-                    source_address: bridge_source_address,
-                    target_asset: route.target_asset.to_string(),
-                    destination: bridge_destination,
-                    amount: bridge_amount,
-                })
-                .await?;
+            let submission = bridge.backend.submit_bridge(BridgeRequest {
+                asset: route.source_asset.to_string(),
+                source_chain: route.source_chain.to_string(),
+                source_address: bridge_source_address,
+                target_asset: route.target_asset.to_string(),
+                destination: bridge_destination,
+                amount: bridge_amount,
+            })
+            .await?;
 
             state.deposit.bridge.deposit_bridge_id = Some(submission.bridge_id);
             state.deposit.bridge.deposit_bridge_submitted_at_ts = Some(now_ts());
