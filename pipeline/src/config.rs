@@ -5,7 +5,7 @@ use ic_agent::Identity;
 use icrc_ledger_types::icrc1::account::Account;
 use liquidium_pipeline_commons::env::config_dir;
 use liquidium_pipeline_connectors::account::icp_account::{RECOVERY_ACCOUNT, derive_icp_identity};
-use liquidium_pipeline_connectors::crypto::derivation::{derive_btc_p2pkh_address, derive_evm_private_key};
+use liquidium_pipeline_connectors::crypto::derivation::{derive_btc_p2tr_address, derive_evm_private_key};
 use log::debug;
 use std::collections::HashMap;
 use std::env;
@@ -297,7 +297,7 @@ impl Config {
         let bridge_ic_owner_principal = bridge_ic_identity
             .sender()
             .map_err(|e| format!("could not decode bridge principal: {e}"))?;
-        let bridge_btc_address = derive_btc_p2pkh_address(&mnemonic, BRIDGE_NAMESPACE_ACCOUNT, BRIDGE_BTC_INDEX)
+        let bridge_btc_address = derive_btc_p2tr_address(&mnemonic, BRIDGE_NAMESPACE_ACCOUNT, BRIDGE_BTC_INDEX)
             .map_err(|e| format!("could not derive bridge BTC address: {e}"))?;
 
         let bridge_cketh_minter_canister_text = env::var("BRIDGE_CKETH_MINTER_CANISTER")

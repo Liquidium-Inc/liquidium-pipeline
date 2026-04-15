@@ -1,8 +1,8 @@
+use bitcoin::secp256k1::{Keypair, Secp256k1, SecretKey as Secp256k1SecretKey, XOnlyPublicKey};
+use bitcoin::{Address as BitcoinAddress, Network as BitcoinNetwork};
 use bip32::{DerivationPath, XPrv};
 use bip39::{Language, Mnemonic};
 use k256::SecretKey;
-use ripemd::{Digest as _, Ripemd160};
-use sha2::Sha256;
 use std::str::FromStr;
 
 fn derive_private_key_with_path(mnemonic: &str, path_str: &str) -> Result<SecretKey, String> {
@@ -26,36 +26,27 @@ pub fn derive_evm_private_key(mnemonic: &str, account: u32, index: u32) -> Resul
     derive_private_key_with_path(mnemonic, &path_str)
 }
 
-// Derive a raw Bitcoin private key from a mnemonic and BIP84 path.
+// Derive a raw Bitcoin private key from a mnemonic and BIP86 path.
 pub fn derive_btc_private_key(mnemonic: &str, account: u32, index: u32) -> Result<SecretKey, String> {
-    let path_str = format!("m/84'/0'/{}'/0/{}", account, index);
+    let path_str = format!("m/86'/0'/{}'/0/{}", account, index);
     derive_private_key_with_path(mnemonic, &path_str)
 }
 
-// Derive a deterministic Bitcoin mainnet P2PKH address from mnemonic.
-//
-// This is used for bridge account wiring and operator visibility only in this phase.
-pub fn derive_btc_p2pkh_address(mnemonic: &str, account: u32, index: u32) -> Result<String, String> {
+// Derive a deterministic Bitcoin mainnet P2TR address from mnemonic.
+pub fn derive_btc_p2tr_address(mnemonic: &str, account: u32, index: u32) -> Result<String, String> {
     let private_key = derive_btc_private_key(mnemonic, account, index)?;
-    let public_key = private_key.public_key();
-    let pubkey_bytes = public_key.to_sec1_bytes();
-
-    let sha = Sha256::digest(pubkey_bytes);
-    let ripe = Ripemd160::digest(sha);
-
-    // P2PKH payload: version(0x00) + HASH160(pubkey) + checksum.
-    let mut payload = Vec::with_capacity(25);
-    payload.push(0x00);
-    payload.extend_from_slice(ripe.as_slice());
-    let checksum_full = Sha256::digest(Sha256::digest(&payload));
-    payload.extend_from_slice(&checksum_full[..4]);
-
-    Ok(bs58::encode(payload).into_string())
+    let secp = Secp256k1::new();
+    let secret_key = Secp256k1SecretKey::from_slice(&private_key.to_bytes())
+        .map_err(|e| format!("failed to convert BTC secret key: {e}"))?;
+    let keypair = Keypair::from_secret_key(&secp, &secret_key);
+    let (xonly, _) = XOnlyPublicKey::from_keypair(&keypair);
+    let address = BitcoinAddress::p2tr(&secp, xonly, None, BitcoinNetwork::Bitcoin);
+    Ok(address.to_string())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{derive_btc_p2pkh_address, derive_btc_private_key, derive_evm_private_key};
+    use super::{derive_btc_p2tr_address, derive_btc_private_key, derive_evm_private_key};
 
     const TEST_MNEMONIC: &str =
         "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
@@ -76,10 +67,10 @@ mod tests {
 
     #[test]
     fn btc_address_derivation_is_stable_and_valid_shape() {
-        let a = derive_btc_p2pkh_address(TEST_MNEMONIC, 1, 0).expect("address");
-        let b = derive_btc_p2pkh_address(TEST_MNEMONIC, 1, 0).expect("address");
+        let a = derive_btc_p2tr_address(TEST_MNEMONIC, 1, 0).expect("address");
+        let b = derive_btc_p2tr_address(TEST_MNEMONIC, 1, 0).expect("address");
         assert_eq!(a, b);
-        assert!(a.starts_with('1'));
-        assert!(a.len() >= 26 && a.len() <= 35);
+        assert!(a.starts_with("bc1p"));
+        assert_eq!(a.len(), 62);
     }
 }
