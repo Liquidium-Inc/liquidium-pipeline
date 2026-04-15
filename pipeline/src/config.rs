@@ -301,13 +301,14 @@ impl Config {
             .map_err(|e| format!("could not derive bridge BTC address: {e}"))?;
 
         let bridge_cketh_minter_canister_text = env::var("BRIDGE_CKETH_MINTER_CANISTER")
-            .map_err(|_| "BRIDGE_CKETH_MINTER_CANISTER must be set and non-empty".to_string())?
+            .unwrap_or_else(|_| DEFAULT_BRIDGE_CKETH_MINTER_CANISTER.to_string())
             .trim()
             .to_string();
-      
-        if bridge_cketh_minter_canister_text.is_empty() {
-            return Err("BRIDGE_CKETH_MINTER_CANISTER must be set and non-empty".to_string());
-        }
+        let bridge_cketh_minter_canister_text = if bridge_cketh_minter_canister_text.is_empty() {
+            DEFAULT_BRIDGE_CKETH_MINTER_CANISTER.to_string()
+        } else {
+            bridge_cketh_minter_canister_text
+        };
         
         let bridge_cketh_minter_canister = Principal::from_text(&bridge_cketh_minter_canister_text).map_err(|e| {
             format!(
@@ -464,6 +465,7 @@ const BRIDGE_NAMESPACE_ACCOUNT: u32 = 1;
 const BRIDGE_EVM_INDEX: u32 = 0;
 const BRIDGE_ICP_INDEX: u32 = 1;
 const BRIDGE_BTC_INDEX: u32 = 0;
+const DEFAULT_BRIDGE_CKETH_MINTER_CANISTER: &str = "sv3dd-oaaaa-aaaar-qacoa-cai";
 
 fn parse_bad_debt_collateral_slippage_bps_from_env() -> u32 {
     env::var("BAD_DEBT_COLLATERAL_SLIPPAGE_BPS")
