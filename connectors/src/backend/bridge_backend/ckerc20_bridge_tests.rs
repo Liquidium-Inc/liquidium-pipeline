@@ -1,12 +1,18 @@
 use alloy::primitives::Address;
 use candid::Principal;
 use icrc_ledger_types::icrc1::account::{Account, principal_to_subaccount};
+use std::sync::Arc;
 
-use crate::backend::bridge_backend::BridgeDestination;
+use crate::backend::{
+    bridge_backend::{BridgeBackend, BridgeDestination, BridgeRequest},
+    icp_backend::MockIcpBackend,
+};
+use crate::pipeline_agent::MockPipelineAgent;
 
 use super::{
-    destination_to_bytes32, ensure_source_matches_bridge_owner, ensure_source_matches_signer,
-    parse_source_icp_account, resolve_cketh_route_for_request,
+    CkErc20BridgeBackend, CkEthMinterInfo, MockBridgeEvmBackend, destination_to_bytes32,
+    ensure_source_matches_bridge_owner, ensure_source_matches_signer, parse_source_icp_account,
+    resolve_cketh_route_for_request,
 };
 
 #[test]
@@ -148,4 +154,57 @@ fn reverse_source_must_match_bridge_owner_and_be_owner_only() {
     let err =
         ensure_source_matches_bridge_owner(&with_subaccount, Principal::management_canister()).expect_err("must fail");
     assert!(err.contains("subaccount must be None"));
+}
+
+#[tokio::test]
+async fn forward_bridge_rejects_subaccount_destination_when_native_helper_is_resolved() {
+    let signer = "0x1111111111111111111111111111111111111111"
+        .parse::<Address>()
+        .expect("address");
+    let native_helper = "0x2222222222222222222222222222222222222222".to_string();
+
+    let mut mock_agent = MockPipelineAgent::new();
+    mock_agent
+        .expect_call_query::<CkEthMinterInfo>()
+        .times(1)
+        .returning(move |_, _, _| {
+            Ok(CkEthMinterInfo {
+                deposit_with_subaccount_helper_contract_address: None,
+                erc20_helper_contract_address: Some(native_helper.clone()),
+                cketh_ledger_id: None,
+            })
+        });
+
+    let mut mock_evm = MockBridgeEvmBackend::new();
+    mock_evm.expect_signer_address().times(1).returning(move || signer);
+    mock_evm.expect_erc20_decimals_of().times(0);
+    mock_evm.expect_erc20_approve_and_wait().times(0);
+    mock_evm.expect_helper_deposit_native().times(0);
+    mock_evm.expect_helper_deposit_with_subaccount().times(0);
+    mock_evm.expect_receipt_status().times(0);
+
+    let mock_icp = MockIcpBackend::new();
+
+    let backend = CkErc20BridgeBackend::new(
+        Arc::new(mock_agent),
+        Arc::new(mock_icp),
+        Arc::new(mock_evm),
+        Principal::management_canister(),
+        Principal::management_canister(),
+    );
+
+    let request = BridgeRequest {
+        asset: "USDC".to_string(),
+        source_chain: "ETH".to_string(),
+        source_address: "0x1111111111111111111111111111111111111111".to_string(),
+        target_asset: "ckUSDC".to_string(),
+        destination: BridgeDestination::IcpAccount(Account {
+            owner: Principal::management_canister(),
+            subaccount: Some([7u8; 32]),
+        }),
+        amount: 1.0,
+    };
+
+    let err = backend.submit_bridge(request).await.expect_err("must fail");
+    assert!(err.contains("does not support subaccount destinations"));
 }

@@ -301,10 +301,14 @@ impl Config {
             .map_err(|e| format!("could not derive bridge BTC address: {e}"))?;
 
         let bridge_cketh_minter_canister_text = env::var("BRIDGE_CKETH_MINTER_CANISTER")
-            .ok()
-            .map(|v| v.trim().to_string())
-            .filter(|v| !v.is_empty())
-            .unwrap_or_else(|| DEFAULT_BRIDGE_CKETH_MINTER_CANISTER.to_string());
+            .map_err(|_| "BRIDGE_CKETH_MINTER_CANISTER must be set and non-empty".to_string())?
+            .trim()
+            .to_string();
+      
+        if bridge_cketh_minter_canister_text.is_empty() {
+            return Err("BRIDGE_CKETH_MINTER_CANISTER must be set and non-empty".to_string());
+        }
+        
         let bridge_cketh_minter_canister = Principal::from_text(&bridge_cketh_minter_canister_text).map_err(|e| {
             format!(
                 "invalid BRIDGE_CKETH_MINTER_CANISTER principal '{}': {e}",
@@ -456,7 +460,6 @@ const MAX_BPS: u32 = 10_000;
 const MIN_RATIO: f64 = 0.0;
 const MAX_RATIO: f64 = 1.0;
 const MIN_SLICE_TARGET_RATIO: f64 = 0.1;
-const DEFAULT_BRIDGE_CKETH_MINTER_CANISTER: &str = "sv3dd-oaaaa-aaaar-qacoa-cai";
 const BRIDGE_NAMESPACE_ACCOUNT: u32 = 1;
 const BRIDGE_EVM_INDEX: u32 = 0;
 const BRIDGE_ICP_INDEX: u32 = 1;

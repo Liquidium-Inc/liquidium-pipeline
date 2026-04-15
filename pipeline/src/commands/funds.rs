@@ -28,7 +28,7 @@ pub async fn funds() -> Result<(), String> {
         );
         info!("Recovery account holds seized collateral from failed swaps.");
     } else {
-        println!("\n=== Balances (Main | Trader | Recovery) ===");
+        println!("\n=== Balances (Main | Trader | Recovery | Bridge) ===");
         println!(
             "{: <HEADER_LABEL_WIDTH$}: {}",
             "Main ICP principal",

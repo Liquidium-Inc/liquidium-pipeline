@@ -45,17 +45,38 @@ pub fn amount_to_base_units_strict(amount: f64, decimals: u8) -> Result<U256, St
 
 /// Converts ICRC native units into human amount using `core::ChainTokenAmount`.
 ///
-/// Accepted tradeoff: values larger than `u128` map to `0.0` because
-/// `ChainTokenAmount::to_f64()` is currently `u128`-bounded.
+/// Rejects values that cannot be represented by the current `core::ChainTokenAmount`
+/// conversion path instead of silently returning `0.0`.
 pub fn nat_units_to_amount_via_core(amount_native: &Nat, decimals: u8) -> Result<f64, String> {
+    if amount_native > &Nat::from(u128::MAX) {
+        return Err(format!(
+            "amount out of range: native amount {} exceeds u128::MAX",
+            amount_native
+        ));
+    }
+
     let token = synthetic_token_with_decimals(decimals);
     let amount = ChainTokenAmount::from_raw(token, amount_native.clone());
-    Ok(amount.to_f64())
+    let human = amount.to_f64();
+
+    if !human.is_finite() {
+        return Err(format!(
+            "amount out of range: native amount {} is not representable as finite f64",
+            amount_native
+        ));
+    }
+
+    if amount_native != &Nat::from(0u8) && human == 0.0 {
+        return Err(format!(
+            "amount out of range: non-zero native amount {} cannot be represented as f64",
+            amount_native
+        ));
+    }
+
+    Ok(human)
 }
 
 /// Converts EVM base units into human amount using `core::ChainTokenAmount`.
-///
-/// Accepted tradeoff: values larger than `u128` map to `0.0`.
 pub fn base_units_to_amount_via_core(base_units: U256, decimals: u8) -> Result<f64, String> {
     let raw_nat: Nat = base_units
         .to_string()
@@ -124,10 +145,16 @@ mod tests {
     }
 
     #[test]
-    fn core_read_converter_returns_zero_above_u128_limit_documented_tradeoff() {
-        // Accepted behavior: core to_f64 uses u128 conversion and returns 0 for larger values.
+    fn core_read_converter_rejects_values_above_u128_limit() {
         let too_large = Nat::from(u128::MAX) + Nat::from(1u8);
-        let human = nat_units_to_amount_via_core(&too_large, 0).expect("convert");
-        assert_eq!(human, 0.0);
+        let err = nat_units_to_amount_via_core(&too_large, 0).expect_err("should fail");
+        assert!(err.contains("amount out of range"));
+    }
+
+    #[test]
+    fn core_base_converter_rejects_values_above_u128_limit() {
+        let too_large = U256::from(u128::MAX) + U256::from(1u8);
+        let err = base_units_to_amount_via_core(too_large, 0).expect_err("should fail");
+        assert!(err.contains("amount out of range"));
     }
 }

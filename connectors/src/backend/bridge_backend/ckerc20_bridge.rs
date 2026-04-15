@@ -308,6 +308,12 @@ where
 
         // Prefer helper with subaccount support when minter exposes it; fall back to native helper otherwise.
         let helper = self.helper_contract().await?;
+        if destination_account.subaccount.is_some() && matches!(helper, HelperContract::Native(_)) {
+            return Err(format!(
+                "destination {:?} includes an ICP subaccount, but native helper contract does not support subaccount destinations",
+                request.destination
+            ));
+        }
         let helper_address = match helper {
             HelperContract::WithSubaccount(address) | HelperContract::Native(address) => address,
         };

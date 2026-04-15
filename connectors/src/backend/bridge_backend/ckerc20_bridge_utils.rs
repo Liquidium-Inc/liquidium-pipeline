@@ -4,8 +4,8 @@ use icrc_ledger_types::icrc1::account::{Account, principal_to_subaccount};
 use std::str::FromStr;
 
 use crate::backend::bridge_backend::{
-    BridgeDestination, BridgeDestinationKind, BridgeRequest, BridgeRouteKind, BridgeRouteSpec,
-    resolve_route, validate_destination_for_route,
+    BridgeDestination, BridgeDestinationKind, BridgeRequest, BridgeRouteKind, BridgeRouteSpec, resolve_route,
+    validate_destination_for_route,
 };
 
 /// Encodes an ICP account into the `bytes32` principal/subaccount tuple expected by
@@ -82,7 +82,10 @@ pub(super) fn parse_source_icp_account(source_address: &str) -> Result<Account, 
 
 /// Verifies reverse-route source account ownership and enforces principal-only source
 /// accounts for bridge flow safety.
-pub(super) fn ensure_source_matches_bridge_owner(source_account: &Account, bridge_owner: Principal) -> Result<(), String> {
+pub(super) fn ensure_source_matches_bridge_owner(
+    source_account: &Account,
+    bridge_owner: Principal,
+) -> Result<(), String> {
     if source_account.owner != bridge_owner {
         return Err(format!(
             "source ICP account owner {} does not match configured bridge owner {}",

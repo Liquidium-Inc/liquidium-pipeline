@@ -1,6 +1,11 @@
-use alloy::{network::AnyNetwork, providers::ProviderBuilder, signers::local::PrivateKeySigner};
+use alloy::{
+    network::AnyNetwork,
+    providers::{Provider, ProviderBuilder},
+    signers::local::PrivateKeySigner,
+};
 use icrc_ledger_types::icrc1::account::Account;
 use std::{
+    collections::BTreeSet,
     path::PathBuf,
     sync::{Arc, atomic::AtomicBool},
     time::Duration,
@@ -35,7 +40,9 @@ use crate::{
 };
 use ic_agent::Agent;
 use liquidium_pipeline_connectors::backend::{
-    bridge_backend::CkErc20BridgeBackend, evm_backend::EvmBackendImpl, icp_backend::IcpBackendImpl,
+    bridge_backend::{CkErc20BridgeBackend, cketh_forward_routes},
+    evm_backend::EvmBackendImpl,
+    icp_backend::IcpBackendImpl,
 };
 
 use liquidium_pipeline_core::tokens::token_registry::TokenRegistry;
@@ -87,6 +94,28 @@ async fn init(
     let mexc_finalizer = match ctx.config.get_cex_credentials("mexc") {
         Ok((api_key, secret)) => {
             let mexc_client = Arc::new(MexcClient::new(&api_key, &secret));
+            // The liquidation-loop bridge wiring currently supports one EVM provider.
+            // Validate that ckETH forward routes all map to one known EVM chain.
+            let mut required_chain_ids = BTreeSet::new();
+            for route in cketh_forward_routes() {
+                let expected_chain_id = match route.source_chain.trim().to_ascii_uppercase().as_str() {
+                    "ETH" | "ETHEREUM" => 1u64,
+                    other => {
+                        return Err(format!(
+                            "bridge route {}@{} -> {} requires unsupported EVM source chain '{}' for single-provider mode; configure per-chain bridge providers",
+                            route.source_asset, route.source_chain, route.target_asset, other
+                        ));
+                    }
+                };
+                required_chain_ids.insert(expected_chain_id);
+            }
+            if required_chain_ids.len() > 1 {
+                return Err(format!(
+                    "bridge route catalog requires multiple EVM chains {:?}, but liquidation loop configures a single bridge provider from EVM_RPC_URL; configure per-chain bridge providers",
+                    required_chain_ids
+                ));
+            }
+
             let bridge_signer: PrivateKeySigner = config
                 .bridge_evm_private_key
                 .parse()
@@ -99,6 +128,20 @@ async fn init(
                 .network::<AnyNetwork>()
                 .wallet(bridge_signer)
                 .connect_http(bridge_rpc_url);
+            if let Some(expected_chain_id) = required_chain_ids.first().copied() {
+                let rpc_chain_id = bridge_provider.get_chain_id().await.map_err(|err| {
+                    format!(
+                        "failed to read chain id from EVM_RPC_URL '{}' for MEXC bridge finalizer: {err}",
+                        config.evm_rpc_url
+                    )
+                })?;
+                if rpc_chain_id != expected_chain_id {
+                    return Err(format!(
+                        "EVM_RPC_URL '{}' resolved chain id {}, but ckETH forward bridge routes require chain id {}; configure the correct RPC endpoint or per-chain bridge providers",
+                        config.evm_rpc_url, rpc_chain_id, expected_chain_id
+                    ));
+                }
+            }
             let bridge_agent = Arc::new(
                 Agent::builder()
                     .with_url(config.ic_url.clone())

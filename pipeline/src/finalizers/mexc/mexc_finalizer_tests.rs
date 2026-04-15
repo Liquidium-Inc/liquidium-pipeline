@@ -10,6 +10,7 @@ use liquidium_pipeline_connectors::backend::bridge_backend::{
 use liquidium_pipeline_connectors::backend::cex_backend::{
     BuyOrderInputMode, DepositAddress, MockCexBackend, OrderBook, OrderBookLevel, SwapFillReport, WithdrawStatus,
 };
+use liquidium_pipeline_core::account::model::ChainAccount;
 use liquidium_pipeline_core::tokens::{chain_token::ChainToken, chain_token_amount::ChainTokenAmount};
 use liquidium_pipeline_core::transfer::actions::MockTransferActions;
 use liquidium_pipeline_core::types::protocol_types::{
@@ -287,6 +288,106 @@ async fn mexc_deposit_phase_a_snapshots_baseline_and_sends_transfer() {
     assert_eq!(state.deposit.deposit_txid.as_deref(), Some("tx-123"));
     assert!(state.deposit.deposit_sent_at_ts.is_some());
     assert!(matches!(state.step, CexStep::DepositPending));
+}
+
+#[tokio::test]
+async fn mexc_deposit_phase_a_uses_evm_destination_for_evm_assets() {
+    let mut backend = MockCexBackend::new();
+    let mut transfers = MockTransferActions::new();
+
+    backend.expect_get_balance().times(1).returning(|asset| {
+        assert_eq!(asset, "USDC");
+        Ok(10.0)
+    });
+
+    backend.expect_get_deposit_address().times(1).returning(|asset, network| {
+        assert_eq!(asset, "USDC");
+        assert_eq!(network, "evm-eth");
+        Ok(DepositAddress {
+            asset: "USDC".to_string(),
+            network: "ERC20".to_string(),
+            address: "0x1111111111111111111111111111111111111111".to_string(),
+            tag: None,
+        })
+    });
+
+    transfers
+        .expect_transfer()
+        .times(1)
+        .returning(|token, destination, amount| {
+            assert!(matches!(token, ChainToken::EvmErc20 { symbol, .. } if symbol == "USDC"));
+            match destination {
+                ChainAccount::Evm(address) => {
+                    assert_eq!(address, "0x1111111111111111111111111111111111111111");
+                }
+                other => panic!("expected EVM deposit destination, got {:?}", other),
+            }
+            assert_eq!(amount, Nat::from(1_000_000u64));
+            Ok("tx-evm-123".to_string())
+        });
+
+    let finalizer = MexcFinalizer::new(
+        Arc::new(backend),
+        Arc::new(transfers),
+        Principal::anonymous(),
+        TEST_MAX_SELL_SLIPPAGE_BPS,
+        TEST_CEX_MIN_EXEC_USD,
+        TEST_CEX_SLICE_TARGET_RATIO,
+    );
+
+    let collateral = ChainToken::EvmErc20 {
+        chain: "eth".to_string(),
+        token_address: "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48".to_string(),
+        symbol: "USDC".to_string(),
+        decimals: 6,
+        fee: Nat::from(0u8),
+    };
+    let receipt = make_execution_receipt_with_assets(43, collateral, ckbtc_token());
+    let mut state = finalizer.prepare("43", &receipt).await.expect("prepare should succeed");
+
+    finalizer.deposit(&mut state).await.expect("deposit should succeed");
+
+    assert_eq!(state.deposit.deposit_txid.as_deref(), Some("tx-evm-123"));
+    assert!(matches!(state.step, CexStep::DepositPending));
+}
+
+#[tokio::test]
+async fn mexc_deposit_phase_a_rejects_invalid_evm_deposit_address() {
+    let mut backend = MockCexBackend::new();
+    let mut transfers = MockTransferActions::new();
+
+    backend.expect_get_balance().times(1).returning(|_asset| Ok(10.0));
+    backend.expect_get_deposit_address().times(1).returning(|_asset, _network| {
+        Ok(DepositAddress {
+            asset: "USDC".to_string(),
+            network: "ERC20".to_string(),
+            address: "not-an-evm-address".to_string(),
+            tag: None,
+        })
+    });
+    transfers.expect_transfer().times(0);
+
+    let finalizer = MexcFinalizer::new(
+        Arc::new(backend),
+        Arc::new(transfers),
+        Principal::anonymous(),
+        TEST_MAX_SELL_SLIPPAGE_BPS,
+        TEST_CEX_MIN_EXEC_USD,
+        TEST_CEX_SLICE_TARGET_RATIO,
+    );
+
+    let collateral = ChainToken::EvmErc20 {
+        chain: "eth".to_string(),
+        token_address: "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48".to_string(),
+        symbol: "USDC".to_string(),
+        decimals: 6,
+        fee: Nat::from(0u8),
+    };
+    let receipt = make_execution_receipt_with_assets(44, collateral, ckbtc_token());
+    let mut state = finalizer.prepare("44", &receipt).await.expect("prepare should succeed");
+
+    let err = finalizer.deposit(&mut state).await.expect_err("deposit should fail");
+    assert!(err.contains("invalid MEXC EVM deposit address"));
 }
 
 #[test]
@@ -702,6 +803,99 @@ async fn mexc_non_bridge_withdraw_behavior_unchanged() {
         .expect("direct withdraw should still complete in one call");
     assert!(matches!(state.step, CexStep::Completed));
     assert_eq!(state.withdraw.withdraw_id.as_deref(), Some("withdraw-direct"));
+}
+
+#[tokio::test]
+async fn mexc_non_bridge_withdraw_keeps_evm_destination_address() {
+    let mut cex = MockCexBackend::new();
+    let transfers = MockTransferActions::new();
+    let expected_address = "0x1111111111111111111111111111111111111111".to_string();
+
+    cex.expect_withdraw()
+        .times(1)
+        .returning(move |asset, network, address, amount| {
+            assert_eq!(asset, "USDC");
+            assert_eq!(network, "evm-eth");
+            assert_eq!(address, expected_address);
+            assert!(amount > 0.0);
+            Ok(liquidium_pipeline_connectors::backend::cex_backend::WithdrawalReceipt {
+                asset: asset.to_string(),
+                network: network.to_string(),
+                amount,
+                txid: Some("tx-evm-direct".to_string()),
+                internal_id: Some("withdraw-evm-direct".to_string()),
+            })
+        });
+
+    let finalizer = MexcFinalizer::new(
+        Arc::new(cex),
+        Arc::new(transfers),
+        Principal::anonymous(),
+        TEST_MAX_SELL_SLIPPAGE_BPS,
+        TEST_CEX_MIN_EXEC_USD,
+        TEST_CEX_SLICE_TARGET_RATIO,
+    );
+
+    let debt_token = ChainToken::EvmErc20 {
+        chain: "eth".to_string(),
+        token_address: "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48".to_string(),
+        symbol: "USDC".to_string(),
+        decimals: 6,
+        fee: Nat::from(0u8),
+    };
+    let receipt = make_execution_receipt_with_assets(14, ckbtc_token(), debt_token);
+    let mut state = finalizer.prepare("14", &receipt).await.expect("prepare should succeed");
+    state.step = CexStep::Withdraw;
+    state.withdraw.withdraw_address = "0x1111111111111111111111111111111111111111".to_string();
+    state.withdraw.size_out = Some(ChainTokenAmount::from_formatted(
+        state.withdraw.withdraw_asset.clone(),
+        1.0,
+    ));
+
+    finalizer
+        .withdraw(&mut state)
+        .await
+        .expect("direct EVM withdraw should complete");
+    assert!(matches!(state.step, CexStep::Completed));
+    assert_eq!(state.withdraw.withdraw_id.as_deref(), Some("withdraw-evm-direct"));
+}
+
+#[tokio::test]
+async fn mexc_non_bridge_withdraw_rejects_invalid_evm_destination_address() {
+    let mut cex = MockCexBackend::new();
+    let transfers = MockTransferActions::new();
+    cex.expect_withdraw().times(0);
+
+    let finalizer = MexcFinalizer::new(
+        Arc::new(cex),
+        Arc::new(transfers),
+        Principal::anonymous(),
+        TEST_MAX_SELL_SLIPPAGE_BPS,
+        TEST_CEX_MIN_EXEC_USD,
+        TEST_CEX_SLICE_TARGET_RATIO,
+    );
+
+    let debt_token = ChainToken::EvmErc20 {
+        chain: "eth".to_string(),
+        token_address: "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48".to_string(),
+        symbol: "USDC".to_string(),
+        decimals: 6,
+        fee: Nat::from(0u8),
+    };
+    let receipt = make_execution_receipt_with_assets(15, ckbtc_token(), debt_token);
+    let mut state = finalizer.prepare("15", &receipt).await.expect("prepare should succeed");
+    state.step = CexStep::Withdraw;
+    state.withdraw.withdraw_address = "not-an-evm-address".to_string();
+    state.withdraw.size_out = Some(ChainTokenAmount::from_formatted(
+        state.withdraw.withdraw_asset.clone(),
+        1.0,
+    ));
+
+    let err = finalizer
+        .withdraw(&mut state)
+        .await
+        .expect_err("invalid EVM destination should fail");
+    assert!(err.contains("invalid EVM withdraw destination"));
 }
 
 #[tokio::test]
@@ -2358,6 +2552,28 @@ async fn mexc_trade_errors_when_direct_market_cannot_be_resolved() {
         err.contains("could not resolve direct market") || err.contains("no configured MEXC pairs for hop discovery")
     );
     assert!(matches!(state.step, CexStep::Trade));
+}
+
+#[tokio::test]
+async fn resolve_trade_legs_for_identical_symbols_is_noop() {
+    let backend = MockCexBackend::new();
+    let transfers = MockTransferActions::new();
+
+    let finalizer = MexcFinalizer::new(
+        Arc::new(backend),
+        Arc::new(transfers),
+        Principal::anonymous(),
+        TEST_MAX_SELL_SLIPPAGE_BPS,
+        TEST_CEX_MIN_EXEC_USD,
+        TEST_CEX_SLICE_TARGET_RATIO,
+    );
+
+    let legs = finalizer
+        .resolve_trade_legs_for_symbols(" usdc ", "USDC")
+        .await
+        .expect("identical symbols should resolve as no-op");
+
+    assert!(legs.is_empty());
 }
 
 #[tokio::test]

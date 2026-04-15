@@ -452,6 +452,10 @@ where
         let deposit = Self::normalize_symbol(deposit_symbol);
         let withdraw = Self::normalize_symbol(withdraw_symbol);
 
+        if deposit == withdraw {
+            return Ok(vec![]);
+        }
+
         // 1) High-priority compatibility override for legacy ck routes.
         if let Some(legs) = mexc_special_trade_legs(&deposit, &withdraw) {
             return Ok(legs);

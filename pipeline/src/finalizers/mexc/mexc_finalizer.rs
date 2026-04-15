@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use alloy::primitives::Address as EvmAddress;
 use async_trait::async_trait;
 use candid::{Nat, Principal};
 use icrc_ledger_types::icrc1::account::Account;
@@ -113,6 +114,81 @@ impl<C> MexcFinalizer<C>
 where
     C: CexBackend,
 {
+    fn direct_deposit_destination_account(
+        token: &ChainToken,
+        planned_network: &str,
+        address: &str,
+    ) -> Result<ChainAccount, String> {
+        let destination = address.trim();
+        if destination.is_empty() {
+            return Err(format!(
+                "invalid MEXC deposit address for network '{}': address is empty",
+                planned_network
+            ));
+        }
+
+        match token {
+            ChainToken::Icp { .. } => {
+                if !planned_network.eq_ignore_ascii_case("ICP") {
+                    return Err(format!(
+                        "unsupported MEXC deposit network '{}' for ICP asset {}; expected ICP",
+                        planned_network,
+                        token.symbol()
+                    ));
+                }
+                let owner = Principal::from_text(destination).map_err(|e| {
+                    format!(
+                        "invalid MEXC ICP deposit address '{}' for network '{}': {e}",
+                        destination, planned_network
+                    )
+                })?;
+                Ok(ChainAccount::Icp(Account {
+                    owner,
+                    subaccount: None,
+                }))
+            }
+            ChainToken::EvmNative { .. } | ChainToken::EvmErc20 { .. } => {
+                if planned_network.eq_ignore_ascii_case("ICP") {
+                    return Err(format!(
+                        "unsupported MEXC deposit network '{}' for EVM asset {}; expected EVM-compatible network",
+                        planned_network,
+                        token.symbol()
+                    ));
+                }
+                let evm_address = destination.parse::<EvmAddress>().map_err(|e| {
+                    format!(
+                        "invalid MEXC EVM deposit address '{}' for network '{}': {e}",
+                        destination, planned_network
+                    )
+                })?;
+                Ok(ChainAccount::Evm(evm_address.to_string()))
+            }
+        }
+    }
+
+    fn compute_fee_adjusted_deposit_transfer(
+        deposit_asset: &ChainToken,
+        size_in: &ChainTokenAmount,
+    ) -> Result<(Nat, ChainTokenAmount), String> {
+        let fee = deposit_asset.fee() * MEXC_DEPOSIT_FEE_MULTIPLIER;
+        let transfer_value = if fee > Nat::from(0u8) {
+            if size_in.value.clone() <= fee {
+                let fee_amount = ChainTokenAmount::from_raw(deposit_asset.clone(), fee.clone());
+                return Err(format!(
+                    "deposit amount {} too small to cover fee {} for {}",
+                    size_in.formatted(),
+                    fee_amount.formatted(),
+                    deposit_asset.symbol()
+                ));
+            }
+            size_in.value.clone() - fee
+        } else {
+            size_in.value.clone()
+        };
+        let transfer_amount = ChainTokenAmount::from_raw(deposit_asset.clone(), transfer_value.clone());
+        Ok((transfer_value, transfer_amount))
+    }
+
     fn normalize_market_pair(raw: &str) -> Option<String> {
         let normalized = raw.trim().replace(['/', '-'], "_").to_ascii_uppercase();
         if normalized.is_empty() {
@@ -345,36 +421,19 @@ where
                     .await?;
                 state.deposit.bridge.deposit_bridge_destination_snapshot = Some(addr.address.clone());
 
-                let amount = &state.size_in;
-                let fee = state.deposit.deposit_asset.fee() * MEXC_DEPOSIT_FEE_MULTIPLIER;
-                let fee_amount = ChainTokenAmount::from_raw(state.deposit.deposit_asset.clone(), fee.clone());
-
-                let zero = Nat::from(0u8);
-                let transfer_value = if fee > zero {
-                    if amount.value.clone() <= fee {
-                        return Err(format!(
-                            "deposit amount {} too small to cover fee {} for {}",
-                            amount.formatted(),
-                            fee_amount.formatted(),
-                            state.deposit.deposit_asset.symbol()
-                        ));
-                    }
-                    amount.value.clone() - fee.clone()
-                } else {
-                    amount.value.clone()
-                };
-                let transfer_amount =
-                    ChainTokenAmount::from_raw(state.deposit.deposit_asset.clone(), transfer_value.clone());
+                let (transfer_value, transfer_amount) =
+                    Self::compute_fee_adjusted_deposit_transfer(&state.deposit.deposit_asset, &state.size_in)?;
+                let destination = Self::direct_deposit_destination_account(
+                    &state.deposit.deposit_asset,
+                    &planned_network,
+                    &addr.address,
+                )?;
 
                 let tx_id = self
                     .transfer_service
                     .transfer(
                         &state.deposit.deposit_asset,
-                        &ChainAccount::Icp(Account {
-                            owner: Principal::from_text(addr.address)
-                                .map_err(|e| format!("invalid deposit address: {e}"))?,
-                            subaccount: None,
-                        }),
+                        &destination,
                         transfer_value.clone(),
                     )
                     .await?;
@@ -432,25 +491,8 @@ where
                 &bridge_source_address,
             )?;
 
-            let amount = &state.size_in;
-            let fee = state.deposit.deposit_asset.fee() * MEXC_DEPOSIT_FEE_MULTIPLIER;
-            let fee_amount = ChainTokenAmount::from_raw(state.deposit.deposit_asset.clone(), fee.clone());
-            let zero = Nat::from(0u8);
-            let transfer_value = if fee > zero {
-                if amount.value.clone() <= fee {
-                    return Err(format!(
-                        "deposit amount {} too small to cover fee {} for {}",
-                        amount.formatted(),
-                        fee_amount.formatted(),
-                        state.deposit.deposit_asset.symbol()
-                    ));
-                }
-                amount.value.clone() - fee.clone()
-            } else {
-                amount.value.clone()
-            };
-            let transfer_amount =
-                ChainTokenAmount::from_raw(state.deposit.deposit_asset.clone(), transfer_value.clone());
+            let (transfer_value, transfer_amount) =
+                Self::compute_fee_adjusted_deposit_transfer(&state.deposit.deposit_asset, &state.size_in)?;
 
             let tx_id = self
                 .transfer_service
@@ -736,11 +778,6 @@ where
         let planned_asset = <Self as BridgePlanner>::planned_withdraw_asset(state);
         let planned_network = <Self as BridgePlanner>::planned_withdraw_network(state);
 
-        let default_direct_address = self.liquidator_principal.to_text();
-        if state.withdraw.withdraw_address.trim().is_empty() {
-            state.withdraw.withdraw_address = default_direct_address.clone();
-        }
-
         debug!(
             "[mexc] liq_id={} step={:?} source_asset={} source_network={} final_asset={} final_network={} withdraw_address={} bridge_required={}",
             state.liq_id,
@@ -767,9 +804,39 @@ where
         }
 
         if !state.withdraw.bridge.withdraw_bridge_required {
-            let expected_address = self.liquidator_principal.to_text();
-            if state.withdraw.withdraw_address != expected_address {
-                state.withdraw.withdraw_address = expected_address;
+            let direct_destination = if planned_network.eq_ignore_ascii_case("ICP") {
+                self.liquidator_principal.to_text()
+            } else if planned_network.eq_ignore_ascii_case("ETH")
+                || planned_network.to_ascii_lowercase().starts_with("evm")
+            {
+                let raw = state.withdraw.withdraw_address.trim();
+                if raw.is_empty() {
+                    return Err(format!(
+                        "missing EVM withdraw destination for {}@{}",
+                        planned_asset, planned_network
+                    ));
+                }
+                raw.parse::<EvmAddress>()
+                    .map_err(|e| {
+                        format!(
+                            "invalid EVM withdraw destination '{}' for {}@{}: {e}",
+                            raw, planned_asset, planned_network
+                        )
+                    })?
+                    .to_string()
+            } else {
+                let raw = state.withdraw.withdraw_address.trim();
+                if raw.is_empty() {
+                    return Err(format!(
+                        "missing withdraw destination for {}@{}",
+                        planned_asset, planned_network
+                    ));
+                }
+                raw.to_string()
+            };
+
+            if state.withdraw.withdraw_address != direct_destination {
+                state.withdraw.withdraw_address = direct_destination;
             }
 
             if state.withdraw.withdraw_id.is_some() || state.withdraw.withdraw_txid.is_some() {

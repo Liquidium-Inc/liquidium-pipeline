@@ -73,12 +73,12 @@ enum Commands {
     // Withdraws funds. Without flags, starts the interactive wizard.
     // With flags, performs a non-interactive withdrawal.
     Withdraw {
-        // Source account: "main", "trader", "recovery", or "bridge" (non-interactive)
+        /// Source account: "main", "trader", "recovery", or "bridge" (non-interactive)
         #[arg(long)]
         source: Option<String>,
-        // Destination:
-        // - ICP assets: "main", "trader", "recovery", "bridge", or full Account string
-        // - EVM assets: "main", "bridge", or 0x... address
+        /// Destination:
+        /// - ICP assets: "main", "trader", "recovery", "bridge", or full Account string
+        /// - EVM assets: "main", "bridge", or 0x... address
         #[arg(long)]
         destination: Option<String>,
         // Asset symbol (e.g., "ckUSDT") or "all" (non-interactive)
