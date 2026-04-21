@@ -939,6 +939,43 @@ where
             let bridge_destination =
                 self.bridge_destination_for_final_liquidator(route.destination_kind, &final_destination_snapshot)?;
 
+            let mut bridge_amount = amount;
+            let source_available = bridge
+                .backend
+                .get_source_balance(route.source_asset, route.source_chain, &bridge_source_address)
+                .await?;
+
+            // CEX withdrawals can arrive net of withdrawal/network fees, so bridge only what is
+            // actually available on the configured bridge source account.
+            if source_available <= LIQUIDITY_EPS {
+                info!(
+                    "[mexc] liq_id={} bridged withdraw waiting for source funding: available={} expected={} source={} route={}@{}->{}",
+                    state.liq_id,
+                    source_available,
+                    bridge_amount,
+                    bridge_source_address,
+                    route.source_asset,
+                    route.source_chain,
+                    route.target_asset,
+                );
+                state.step = CexStep::WithdrawPending;
+                return Ok(());
+            }
+
+            if bridge_amount > source_available {
+                info!(
+                    "[mexc] liq_id={} adjusting bridged withdraw amount to available source balance: amount {} -> {} (source={} route={}@{}->{}). This typically reflects CEX withdraw fee/net-credit drift.",
+                    state.liq_id,
+                    bridge_amount,
+                    source_available,
+                    bridge_source_address,
+                    route.source_asset,
+                    route.source_chain,
+                    route.target_asset,
+                );
+                bridge_amount = source_available;
+            }
+
             let _submit_guard =
                 acquire_bridge_submit_lock(route.source_asset, route.source_chain, &bridge_source_address).await;
 
@@ -950,7 +987,7 @@ where
                     source_address: bridge_source_address,
                     target_asset: route.target_asset.to_string(),
                     destination: bridge_destination,
-                    amount,
+                    amount: bridge_amount,
                 })
                 .await?;
             state.withdraw.bridge.withdraw_bridge_id = Some(submission.bridge_id);

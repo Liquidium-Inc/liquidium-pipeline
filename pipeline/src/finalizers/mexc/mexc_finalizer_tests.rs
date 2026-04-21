@@ -673,6 +673,16 @@ async fn mexc_withdraw_bridge_submit_resume_complete_and_idempotent() {
             }
         });
 
+    bridge
+        .expect_get_source_balance()
+        .times(1)
+        .returning(|asset, chain, address| {
+            assert_eq!(asset, "USDC");
+            assert_eq!(chain, "ETH");
+            assert_eq!(address, "0x2222222222222222222222222222222222222222");
+            Ok(1.5)
+        });
+
     bridge.expect_submit_bridge().times(1).returning(|request| {
         assert_eq!(request.asset, "USDC");
         assert_eq!(request.source_chain, "ETH");
@@ -757,6 +767,97 @@ async fn mexc_withdraw_bridge_submit_resume_complete_and_idempotent() {
         .await
         .expect("bridge completion should finish");
     assert!(matches!(state.step, CexStep::Completed));
+}
+
+#[tokio::test]
+async fn mexc_withdraw_bridge_caps_submit_amount_to_source_balance() {
+    let mut cex = MockCexBackend::new();
+    let mut bridge = MockBridgeBackend::new();
+    let transfers = MockTransferActions::new();
+    let liquidator = Principal::management_canister();
+
+    cex.expect_withdraw()
+        .times(1)
+        .returning(|asset, network, address, amount| {
+            assert_eq!(asset, "USDC");
+            assert_eq!(network, "ETH");
+            assert_eq!(address, "0x2222222222222222222222222222222222222222");
+            assert!((amount - 1.5).abs() < 1e-12);
+            Ok(liquidium_pipeline_connectors::backend::cex_backend::WithdrawalReceipt {
+                asset: asset.to_string(),
+                network: network.to_string(),
+                amount,
+                txid: Some("cex-tx-fee".to_string()),
+                internal_id: Some("withdraw-fee".to_string()),
+            })
+        });
+
+    cex.expect_get_withdraw_status_by_id()
+        .times(1)
+        .returning(|coin, withdraw_id| {
+            assert_eq!(coin, "USDC");
+            assert_eq!(withdraw_id, "withdraw-fee");
+            Ok(WithdrawStatus::Completed)
+        });
+
+    bridge
+        .expect_get_source_balance()
+        .times(1)
+        .returning(|asset, chain, address| {
+            assert_eq!(asset, "USDC");
+            assert_eq!(chain, "ETH");
+            assert_eq!(address, "0x2222222222222222222222222222222222222222");
+            // Simulate net credit after MEXC withdraw/network fee.
+            Ok(1.4)
+        });
+
+    bridge.expect_submit_bridge().times(1).returning(|request| {
+        assert_eq!(request.asset, "USDC");
+        assert_eq!(request.source_chain, "ETH");
+        assert_eq!(request.target_asset, "ckUSDC");
+        assert!((request.amount - 1.4).abs() < 1e-12);
+        Ok(BridgeSubmission {
+            bridge_id: "bridge-withdraw-fee".to_string(),
+        })
+    });
+    bridge.expect_get_bridge_status().times(0);
+
+    let finalizer = MexcFinalizer::new(
+        Arc::new(cex),
+        Arc::new(transfers),
+        liquidator,
+        TEST_MAX_SELL_SLIPPAGE_BPS,
+        TEST_CEX_MIN_EXEC_USD,
+        TEST_CEX_SLICE_TARGET_RATIO,
+    )
+    .with_bridge_dependencies(bridge_dependencies(Arc::new(bridge)));
+
+    let receipt = make_execution_receipt_with_assets(111, ckbtc_token(), ckusdc_token());
+    let mut state = finalizer.prepare("111", &receipt).await.expect("prepare should succeed");
+    assert!(state.withdraw.bridge.withdraw_bridge_required);
+    state.step = CexStep::Withdraw;
+    state.withdraw.size_out = Some(ChainTokenAmount::from_formatted(
+        state.withdraw.withdraw_asset.clone(),
+        1.5,
+    ));
+
+    finalizer
+        .withdraw(&mut state)
+        .await
+        .expect("withdraw submit should succeed");
+    assert!(matches!(state.step, CexStep::WithdrawPending));
+    assert_eq!(state.withdraw.withdraw_id.as_deref(), Some("withdraw-fee"));
+    assert!(state.withdraw.bridge.withdraw_bridge_id.is_none());
+
+    finalizer
+        .withdraw(&mut state)
+        .await
+        .expect("bridge submit should cap amount to available source balance");
+    assert!(matches!(state.step, CexStep::WithdrawPending));
+    assert_eq!(
+        state.withdraw.bridge.withdraw_bridge_id.as_deref(),
+        Some("bridge-withdraw-fee")
+    );
 }
 
 #[tokio::test]

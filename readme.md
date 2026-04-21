@@ -38,6 +38,7 @@ Inspired by Artemis/MEV patterns and designed for permissionless, community-driv
 - **Best first run:** run `SWAPPER=cex` once CEX credentials are configured.
 - **Current config precedence:** shell env vars > local `.env` > `~/.liquidium-pipeline/config.env`.
 - **Required env vars (minimum):** `MNEMONIC_FILE`, `IC_URL`, `EVM_RPC_URL`, `LENDING_CANISTER`, `DEBT_ASSETS`, `COLLATERAL_ASSETS`.
+- **New client env var:** `BRIDGE_CKETH_MINTER_CANISTER` (recommended to set explicitly; defaults to `sv3dd-oaaaa-aaaar-qacoa-cai` when unset/empty).
 - **Primary operations:** `liquidator run`, `liquidator balance`, `liquidator withdraw`, `liquidator account show`.
 - **Persistence:** SQLite WAL (`DB_PATH`) enables idempotent retries and resume-safe execution.
 
@@ -113,6 +114,7 @@ IC_URL=https://icp-api.io liquidator run
 # ICP Blockchain
 IC_URL=https://ic0.app
 LENDING_CANISTER=nja4y-2yaaa-aaaae-qddxa-cai
+BRIDGE_CKETH_MINTER_CANISTER=sv3dd-oaaaa-aaaar-qacoa-cai
 
 # EVM Blockchain
 EVM_RPC_URL=https://arb1.arbitrum.io/rpc
