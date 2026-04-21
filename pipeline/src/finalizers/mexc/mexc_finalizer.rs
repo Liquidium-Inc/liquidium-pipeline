@@ -487,7 +487,7 @@ where
                 &bridge_source_address,
             )?;
 
-            let (mut transfer_value, mut transfer_amount) =
+            let (transfer_value, mut transfer_amount) =
                 Self::compute_fee_adjusted_deposit_transfer(&state.deposit.deposit_asset, &state.size_in)?;
 
             // Reserve one source-token fee unit for reverse bridge ICRC2 approve.
@@ -520,16 +520,19 @@ where
                             state.deposit.deposit_asset.symbol()
                         ));
                     }
-                    transfer_value = transfer_value - approve_fee_reserve.clone();
+                    let bridge_amount_value = transfer_value.clone() - approve_fee_reserve.clone();
                     transfer_amount =
-                        ChainTokenAmount::from_raw(state.deposit.deposit_asset.clone(), transfer_value.clone());
+                        ChainTokenAmount::from_raw(state.deposit.deposit_asset.clone(), bridge_amount_value);
 
                     let reserve_amount =
                         ChainTokenAmount::from_raw(state.deposit.deposit_asset.clone(), approve_fee_reserve);
+                    let source_transfer_amount =
+                        ChainTokenAmount::from_raw(state.deposit.deposit_asset.clone(), transfer_value.clone());
                     info!(
-                        "[mexc] liq_id={} bridged deposit reserving reverse bridge approve fee: reserve={} net_transfer={} route={}@{}->{}",
+                        "[mexc] liq_id={} bridged deposit reserving reverse bridge approve fee: reserve={} source_transfer={} bridge_amount={} route={}@{}->{}",
                         state.liq_id,
                         reserve_amount.formatted(),
+                        source_transfer_amount.formatted(),
                         transfer_amount.formatted(),
                         route.source_asset,
                         route.source_chain,
