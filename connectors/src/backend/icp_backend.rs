@@ -6,6 +6,7 @@ use async_trait::async_trait;
 use candid::{CandidType, Encode, Nat, Principal};
 use icrc_ledger_types::icrc1::account::Account;
 use icrc_ledger_types::icrc1::transfer::{TransferArg, TransferError};
+use icrc_ledger_types::icrc2::allowance::{Allowance, AllowanceArgs};
 use icrc_ledger_types::icrc2::approve::{ApproveArgs, ApproveError};
 use num_traits::ToPrimitive;
 use serde::{Deserialize, de::DeserializeOwned};
@@ -22,6 +23,7 @@ pub trait IcpBackend: Send + Sync {
 
     async fn icrc1_decimals(&self, ledger: Principal) -> Result<u8, String>;
     async fn icrc1_fee(&self, ledger: Principal) -> Result<Nat, String>;
+    async fn icrc2_allowance(&self, ledger: Principal, account: &Account, spender: &Account) -> Result<Nat, String>;
 
     async fn icrc2_approve(&self, ledger: Principal, args: ApproveArgs) -> Result<Nat, String>;
 }
@@ -150,6 +152,15 @@ impl<A: PipelineAgent> IcpBackend for IcpBackendImpl<A> {
             Ok(idx) => Ok(idx),
             Err(e) => Err(format!("icrc2_approve error: {e}")),
         }
+    }
+
+    async fn icrc2_allowance(&self, ledger: Principal, account: &Account, spender: &Account) -> Result<Nat, String> {
+        let args = AllowanceArgs {
+            account: *account,
+            spender: *spender,
+        };
+        let result: Allowance = self.query(ledger, "icrc2_allowance", args).await?;
+        Ok(result.allowance)
     }
 
     async fn icrc1_decimals(&self, ledger: Principal) -> Result<u8, String> {

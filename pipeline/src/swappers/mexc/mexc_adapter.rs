@@ -5,7 +5,7 @@ use async_trait::async_trait;
 
 use liquidium_pipeline_connectors::backend::cex_backend::{
     BuyOrderInputMode, CexBackend, DepositAddress, OrderBook, OrderBookLevel, SwapExecutionOptions, SwapFillReport,
-    WithdrawStatus, WithdrawalReceipt,
+    WithdrawStatus, WithdrawStatusSnapshot, WithdrawalReceipt,
 };
 use log::{debug, info, warn};
 use rust_decimal::{Decimal, RoundingStrategy};
@@ -52,6 +52,18 @@ fn withdraw_status_from_mexc_record(status: &str, tx_id: Option<&str>, trans_has
         }
         other => other,
     }
+}
+
+fn parse_mexc_transaction_fee(raw: &str) -> Option<f64> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let parsed = trimmed.parse::<f64>().ok()?;
+    if !parsed.is_finite() || parsed < 0.0 {
+        return None;
+    }
+    Some(parsed)
 }
 
 fn normalize_market_symbol(market: &str) -> String {
@@ -1305,6 +1317,15 @@ impl CexBackend for MexcClient {
     }
 
     async fn get_withdraw_status_by_id(&self, coin: &str, withdraw_id: &str) -> Result<WithdrawStatus, String> {
+        let snapshot = self.get_withdraw_status_snapshot_by_id(coin, withdraw_id).await?;
+        Ok(snapshot.status)
+    }
+
+    async fn get_withdraw_status_snapshot_by_id(
+        &self,
+        coin: &str,
+        withdraw_id: &str,
+    ) -> Result<WithdrawStatusSnapshot, String> {
         let ex = self.inner.lock().await;
         let records = ex
             .withdraw_history(WithdrawHistoryRequest {
@@ -1323,11 +1344,50 @@ impl CexBackend for MexcClient {
 
         let rec = match rec {
             Some(r) => r,
-            None => return Ok(WithdrawStatus::Unknown),
+            None => {
+                return Ok(WithdrawStatusSnapshot {
+                    status: WithdrawStatus::Unknown,
+                    txid: None,
+                    transaction_fee: None,
+                });
+            }
         };
 
-        let status = withdraw_status_from_mexc_record(rec.status.as_str(), rec.tx_id.as_deref(), rec.trans_hash.as_deref());
-        Ok(status)
+        let status =
+            withdraw_status_from_mexc_record(rec.status.as_str(), rec.tx_id.as_deref(), rec.trans_hash.as_deref());
+        let txid = rec
+            .tx_id
+            .as_ref()
+            .filter(|value| !value.trim().is_empty())
+            .cloned()
+            .or_else(|| {
+                rec.trans_hash
+                    .as_ref()
+                    .filter(|value| !value.trim().is_empty())
+                    .cloned()
+            });
+        let transaction_fee = parse_mexc_transaction_fee(rec.transaction_fee.as_str());
+        if transaction_fee.is_none() && !rec.transaction_fee.trim().is_empty() {
+            warn!(
+                "mexc withdraw_history returned unparseable transaction_fee='{}' for coin={} withdraw_id={} status={}",
+                rec.transaction_fee, coin, withdraw_id, rec.status
+            );
+        }
+        if transaction_fee.is_none() && matches!(status, WithdrawStatus::Completed) {
+            warn!(
+                "mexc withdraw_history missing transaction fee for completed withdraw: coin={} withdraw_id={} status={} txid_present={}",
+                coin,
+                withdraw_id,
+                rec.status,
+                txid.is_some()
+            );
+        }
+
+        Ok(WithdrawStatusSnapshot {
+            status,
+            txid,
+            transaction_fee,
+        })
     }
 }
 
@@ -1491,5 +1551,18 @@ mod tests {
             withdraw_status_from_mexc_record("UNKNOWN_STATUS", Some("0xabc"), None),
             WithdrawStatus::Unknown
         );
+    }
+
+    #[test]
+    fn parse_mexc_transaction_fee_accepts_valid_values() {
+        assert_eq!(parse_mexc_transaction_fee("0"), Some(0.0));
+        assert_eq!(parse_mexc_transaction_fee(" 0.123 "), Some(0.123));
+    }
+
+    #[test]
+    fn parse_mexc_transaction_fee_rejects_invalid_values() {
+        assert_eq!(parse_mexc_transaction_fee(""), None);
+        assert_eq!(parse_mexc_transaction_fee("-0.1"), None);
+        assert_eq!(parse_mexc_transaction_fee("abc"), None);
     }
 }

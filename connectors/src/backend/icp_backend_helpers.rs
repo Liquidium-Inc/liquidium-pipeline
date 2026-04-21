@@ -1,8 +1,5 @@
 use candid::{Nat, Principal};
-use icrc_ledger_types::{
-    icrc1::account::Account,
-    icrc2::approve::ApproveArgs,
-};
+use icrc_ledger_types::{icrc1::account::Account, icrc2::allowance::AllowanceArgs, icrc2::approve::ApproveArgs};
 
 use crate::backend::icp_backend::IcpBackend;
 
@@ -56,16 +53,27 @@ pub async fn icrc2_approve_with_context<B: IcpBackend + ?Sized>(
         .map_err(|e| format!("{context}: icrc2_approve failed on ledger {ledger}: {e}"))
 }
 
+/// Reads ICRC-2 allowance and enriches failures with call-site context.
+pub async fn icrc2_allowance_with_context<B: IcpBackend + ?Sized>(
+    backend: &B,
+    ledger: Principal,
+    args: AllowanceArgs,
+    context: &str,
+) -> Result<Nat, String> {
+    backend
+        .icrc2_allowance(ledger, &args.account, &args.spender)
+        .await
+        .map_err(|e| format!("{context}: icrc2_allowance failed on ledger {ledger}: {e}"))
+}
+
 #[cfg(test)]
 mod tests {
     use candid::{Nat, Principal};
-    use icrc_ledger_types::{
-        icrc1::account::Account,
-        icrc2::approve::ApproveArgs,
-    };
+    use icrc_ledger_types::{icrc1::account::Account, icrc2::allowance::AllowanceArgs, icrc2::approve::ApproveArgs};
 
     use super::{
-        icrc1_balance_with_context, icrc1_decimals_with_context, icrc1_fee_with_context, icrc2_approve_with_context,
+        icrc1_balance_with_context, icrc1_decimals_with_context, icrc1_fee_with_context, icrc2_allowance_with_context,
+        icrc2_approve_with_context,
     };
     use crate::backend::icp_backend::MockIcpBackend;
 
@@ -78,11 +86,11 @@ mod tests {
         };
 
         let mut backend = MockIcpBackend::new();
-        backend
-            .expect_icrc1_balance()
-            .returning(|_, _| Err("boom".to_string()));
+        backend.expect_icrc1_balance().returning(|_, _| Err("boom".to_string()));
 
-        let err = icrc1_balance_with_context(&backend, ledger, &account, "bridge").await.expect_err("must fail");
+        let err = icrc1_balance_with_context(&backend, ledger, &account, "bridge")
+            .await
+            .expect_err("must fail");
         assert!(err.contains("bridge"));
         assert!(err.contains("icrc1_balance_of failed on ledger"));
         assert!(err.contains("boom"));
@@ -94,7 +102,9 @@ mod tests {
         let mut backend = MockIcpBackend::new();
         backend.expect_icrc1_decimals().returning(|_| Ok(6));
 
-        let decimals = icrc1_decimals_with_context(&backend, ledger, "bridge").await.expect("must pass");
+        let decimals = icrc1_decimals_with_context(&backend, ledger, "bridge")
+            .await
+            .expect("must pass");
         assert_eq!(decimals, 6);
     }
 
@@ -120,7 +130,9 @@ mod tests {
             .expect_icrc2_approve()
             .returning(|_, _| Err("approval boom".to_string()));
 
-        let err = icrc2_approve_with_context(&backend, ledger, args, "bridge").await.expect_err("must fail");
+        let err = icrc2_approve_with_context(&backend, ledger, args, "bridge")
+            .await
+            .expect_err("must fail");
         assert!(err.contains("bridge"));
         assert!(err.contains("icrc2_approve failed on ledger"));
         assert!(err.contains("approval boom"));
@@ -132,9 +144,38 @@ mod tests {
         let mut backend = MockIcpBackend::new();
         backend.expect_icrc1_fee().returning(|_| Err("fee boom".to_string()));
 
-        let err = icrc1_fee_with_context(&backend, ledger, "bridge").await.expect_err("must fail");
+        let err = icrc1_fee_with_context(&backend, ledger, "bridge")
+            .await
+            .expect_err("must fail");
         assert!(err.contains("bridge"));
         assert!(err.contains("icrc1_fee failed on ledger"));
         assert!(err.contains("fee boom"));
+    }
+
+    #[tokio::test]
+    async fn allowance_wrapper_adds_context_and_ledger_on_error() {
+        let ledger = Principal::management_canister();
+        let args = AllowanceArgs {
+            account: Account {
+                owner: Principal::anonymous(),
+                subaccount: None,
+            },
+            spender: Account {
+                owner: Principal::management_canister(),
+                subaccount: None,
+            },
+        };
+
+        let mut backend = MockIcpBackend::new();
+        backend
+            .expect_icrc2_allowance()
+            .returning(|_, _, _| Err("allowance boom".to_string()));
+
+        let err = icrc2_allowance_with_context(&backend, ledger, args, "bridge")
+            .await
+            .expect_err("must fail");
+        assert!(err.contains("bridge"));
+        assert!(err.contains("icrc2_allowance failed on ledger"));
+        assert!(err.contains("allowance boom"));
     }
 }

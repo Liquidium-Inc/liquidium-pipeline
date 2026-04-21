@@ -73,6 +73,13 @@ pub enum WithdrawStatus {
     Unknown,
 }
 
+#[derive(Debug, Clone)]
+pub struct WithdrawStatusSnapshot {
+    pub status: WithdrawStatus,
+    pub txid: Option<String>,
+    pub transaction_fee: Option<f64>,
+}
+
 #[mockall::automock]
 #[async_trait]
 pub trait CexBackend: Send + Sync {
@@ -110,4 +117,11 @@ pub trait CexBackend: Send + Sync {
 
     // withdrawal status
     async fn get_withdraw_status_by_id(&self, coin: &str, withdraw_id: &str) -> Result<WithdrawStatus, String>;
+
+    // withdrawal status with optional transfer metadata (txid, fee)
+    async fn get_withdraw_status_snapshot_by_id(
+        &self,
+        coin: &str,
+        withdraw_id: &str,
+    ) -> Result<WithdrawStatusSnapshot, String>;
 }

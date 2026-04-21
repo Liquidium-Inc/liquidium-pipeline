@@ -7,11 +7,18 @@ use alloy::{
 };
 use async_trait::async_trait;
 use candid::Nat;
+use tokio::time::{Duration, sleep};
+
+const ERC20_APPROVE_GAS_LIMIT: u64 = 120_000;
+const ERC20_APPROVE_GAS_BUFFER_BPS: u64 = 2_000; // +20%
+const NONCE_RETRY_MAX_ATTEMPTS: u8 = 3;
+const NONCE_RETRY_BASE_DELAY_MS: u64 = 200;
 
 sol! {
     #[sol(rpc)]
     interface IERC20 {
         function balanceOf(address owner) external view returns (uint256);
+        function allowance(address owner, address spender) external view returns (uint256);
         function approve(address spender, uint256 amount) external returns (bool);
         function transfer(address to, uint256 amount) external returns (bool);
         function decimals() external view returns (uint8);
@@ -55,6 +62,13 @@ fn u256_to_nat(v: U256) -> Nat {
     Nat::from(v.to::<u128>())
 }
 
+fn is_nonce_too_low_error(message: &str) -> bool {
+    let normalized = message.to_ascii_lowercase();
+    normalized.contains("nonce too low")
+        || normalized.contains("nonce has already been used")
+        || normalized.contains("invalid transaction nonce")
+}
+
 pub struct EvmBackendImpl<P> {
     pub provider: P,
 }
@@ -78,6 +92,20 @@ where
             .map_err(|e| format!("ERC20 balanceOf failed for token {token}: {e}"))
     }
 
+    pub(crate) async fn erc20_allowance_raw(
+        &self,
+        token: Address,
+        owner: Address,
+        spender: Address,
+    ) -> Result<U256, String> {
+        let contract = IERC20::new(token, self.provider.clone());
+        contract
+            .allowance(owner, spender)
+            .call()
+            .await
+            .map_err(|e| format!("ERC20 allowance(owner={owner}, spender={spender}) failed for token {token}: {e}"))
+    }
+
     pub(crate) async fn erc20_decimals_raw(&self, token: Address) -> Result<u8, String> {
         let contract = IERC20::new(token, self.provider.clone());
         contract
@@ -94,11 +122,38 @@ where
         amount: U256,
     ) -> Result<TxHash, String> {
         let contract = IERC20::new(token, self.provider.clone());
-        let pending = contract
-            .approve(spender, amount)
-            .send()
-            .await
-            .map_err(|e| format!("ERC20 approve(spender={spender}) failed for token {token}: {e}"))?;
+        let estimated_gas = contract.approve(spender, amount).estimate_gas().await.ok();
+        let gas_limit = estimated_gas
+            .map(|estimate| {
+                let extra = estimate.saturating_mul(ERC20_APPROVE_GAS_BUFFER_BPS) / 10_000;
+                estimate.saturating_add(extra).max(ERC20_APPROVE_GAS_LIMIT)
+            })
+            .unwrap_or(ERC20_APPROVE_GAS_LIMIT);
+
+        let mut attempt: u8 = 0;
+        let pending = loop {
+            attempt = attempt.saturating_add(1);
+            let send_result = contract
+                .approve(spender, amount)
+                // Some RPC/provider stacks under-estimate ERC20 approve gas, causing
+                // intermittent out-of-gas failures. Use estimated gas with headroom.
+                .gas(gas_limit)
+                .send()
+                .await;
+
+            match send_result {
+                Ok(pending) => break pending,
+                Err(err) => {
+                    let err_message = err.to_string();
+                    if attempt < NONCE_RETRY_MAX_ATTEMPTS && is_nonce_too_low_error(&err_message) {
+                        let backoff_ms = NONCE_RETRY_BASE_DELAY_MS.saturating_mul(attempt as u64);
+                        sleep(Duration::from_millis(backoff_ms)).await;
+                        continue;
+                    }
+                    return Err(format!("ERC20 approve(spender={spender}) failed for token {token}: {err}"));
+                }
+            }
+        };
         let tx_hash = *pending.tx_hash();
 
         pending
@@ -200,5 +255,20 @@ where
 {
     fn wallet_address(&self) -> Address {
         self.provider.default_signer_address()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_nonce_too_low_error;
+
+    #[test]
+    fn nonce_too_low_detector_matches_common_error_shapes() {
+        assert!(is_nonce_too_low_error("error code -32000: Nonce too low"));
+        assert!(is_nonce_too_low_error(
+            "transaction rejected: nonce has already been used"
+        ));
+        assert!(is_nonce_too_low_error("invalid transaction nonce"));
+        assert!(!is_nonce_too_low_error("insufficient funds for gas * price + value"));
     }
 }

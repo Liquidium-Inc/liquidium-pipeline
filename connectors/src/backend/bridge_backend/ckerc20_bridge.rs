@@ -6,7 +6,10 @@ use alloy::{
 };
 use async_trait::async_trait;
 use candid::{Encode, Nat, Principal};
-use icrc_ledger_types::{icrc1::account::Account, icrc2::approve::ApproveArgs};
+use icrc_ledger_types::{
+    icrc1::account::Account,
+    icrc2::{allowance::AllowanceArgs, approve::ApproveArgs},
+};
 use std::sync::Arc;
 
 use super::{
@@ -33,7 +36,8 @@ use crate::{
         evm_backend::EvmBackendImpl,
         icp_backend::IcpBackend,
         icp_backend_helpers::{
-            icrc1_balance_with_context, icrc1_decimals_with_context, icrc1_fee_with_context, icrc2_approve_with_context,
+            icrc1_balance_with_context, icrc1_decimals_with_context, icrc1_fee_with_context,
+            icrc2_allowance_with_context, icrc2_approve_with_context,
         },
     },
     pipeline_agent::PipelineAgent,
@@ -59,6 +63,7 @@ pub trait BridgeEvmBackend: Send + Sync {
     fn signer_address(&self) -> Address;
 
     async fn erc20_balance_of(&self, token: Address, owner: Address) -> Result<U256, String>;
+    async fn erc20_allowance_of(&self, token: Address, owner: Address, spender: Address) -> Result<U256, String>;
     async fn erc20_decimals_of(&self, token: Address) -> Result<u8, String>;
     async fn erc20_approve_and_wait(&self, token: Address, spender: Address, amount: U256) -> Result<TxHash, String>;
 
@@ -93,6 +98,10 @@ where
 
     async fn erc20_balance_of(&self, token: Address, owner: Address) -> Result<U256, String> {
         self.erc20_balance_of_raw(token, owner).await
+    }
+
+    async fn erc20_allowance_of(&self, token: Address, owner: Address, spender: Address) -> Result<U256, String> {
+        self.erc20_allowance_raw(token, owner, spender).await
     }
 
     async fn erc20_decimals_of(&self, token: Address) -> Result<u8, String> {
@@ -273,6 +282,31 @@ where
         Ok(())
     }
 
+    async fn minter_allowance(&self, source_account: &Account, ledger: Principal) -> Result<Nat, String> {
+        let allowance_args = AllowanceArgs {
+            account: *source_account,
+            spender: Account {
+                owner: self.cketh_minter_canister,
+                subaccount: None,
+            },
+        };
+        icrc2_allowance_with_context(self.icp_backend.as_ref(), ledger, allowance_args, "ckerc20 bridge").await
+    }
+
+    async fn ensure_minter_allowance(
+        &self,
+        source_account: &Account,
+        ledger: Principal,
+        required_allowance: Nat,
+    ) -> Result<(), String> {
+        let current_allowance = self.minter_allowance(source_account, ledger).await?;
+        if current_allowance >= required_allowance {
+            return Ok(());
+        }
+
+        self.approve_minter_spend(ledger, required_allowance).await
+    }
+
     fn with_fee_headroom(amount: &Nat) -> Nat {
         // Keep a modest buffer for quote drift between preflight and withdraw burn.
         amount.clone() + (amount.clone() / Nat::from(5u8))
@@ -320,12 +354,30 @@ where
 
         let decimals = self.token_decimals(token_address).await?;
         let amount_base_units = amount_to_base_units_strict(request.amount, decimals)?;
+        let signer_balance = self
+            .evm_backend
+            .erc20_balance_of(token_address, signer)
+            .await
+            .map_err(|e| format!("ERC20 balanceOf(signer={signer}) failed for token {token_address}: {e}"))?;
+        if signer_balance < amount_base_units {
+            return Err(format!(
+                "bridge amount preflight failed: ERC20 balance is below requested deposit amount (available={} required={} signer={} token={})",
+                signer_balance, amount_base_units, signer, token_address
+            ));
+        }
 
         // Helper must be approved before deposit call can transfer ERC20 from signer.
-        self.evm_backend
-            .erc20_approve_and_wait(token_address, helper_address, amount_base_units)
+        let helper_allowance = self
+            .evm_backend
+            .erc20_allowance_of(token_address, signer, helper_address)
             .await
-            .map_err(|e| format!("ERC20 approve(helper={helper_address}) failed: {e}"))?;
+            .map_err(|e| format!("ERC20 allowance(helper={helper_address}) failed: {e}"))?;
+        if helper_allowance < amount_base_units {
+            self.evm_backend
+                .erc20_approve_and_wait(token_address, helper_address, amount_base_units)
+                .await
+                .map_err(|e| format!("ERC20 approve(helper={helper_address}) failed: {e}"))?;
+        }
 
         let tx_hash = match helper {
             HelperContract::WithSubaccount(address) => self
@@ -421,10 +473,11 @@ where
         }
 
         // Approve ckERC20 amount to burn for withdrawal.
-        self.approve_minter_spend(ckerc20_ledger_id, amount_native.clone())
+        self.ensure_minter_allowance(&source_account, ckerc20_ledger_id, amount_native.clone())
             .await?;
         // Approve ckETH fee budget quoted by minter.
-        self.approve_minter_spend(cketh_ledger_id, required_fee_budget).await?;
+        self.ensure_minter_allowance(&source_account, cketh_ledger_id, required_fee_budget)
+            .await?;
 
         let withdraw_args = WithdrawErc20Arg {
             ckerc20_ledger_id,
@@ -443,7 +496,8 @@ where
                 // If fee drift exceeded pre-approved allowance, re-approve based on the
                 // failed burn amount and retry once.
                 let retry_fee_budget = Self::with_fee_headroom(&failed_burn_amount);
-                self.approve_minter_spend(cketh_ledger_id, retry_fee_budget).await?;
+                self.ensure_minter_allowance(&source_account, cketh_ledger_id, retry_fee_budget)
+                    .await?;
                 self.withdraw_erc20_call(&withdraw_args).await?
             }
             err @ WithdrawErc20Ret::Err(_) => err,
