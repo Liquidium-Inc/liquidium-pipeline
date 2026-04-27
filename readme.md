@@ -39,6 +39,7 @@ Inspired by Artemis/MEV patterns and designed for permissionless, community-driv
 - **Default venues:** `ENABLED_SWAP_VENUES=icpswap,mexc`; disable MEXC when credentials are not configured.
 - **Current config precedence:** shell env vars > local `.env` > `~/.liquidium-pipeline/config.env`.
 - **Required env vars (minimum):** `MNEMONIC_FILE`, `IC_URL`, `EVM_RPC_URL`, `LENDING_CANISTER`, `DEBT_ASSETS`, `COLLATERAL_ASSETS`.
+- **Optional Solana RPC env var:** `SOLANA_RPC_URL` (defaults to `https://api.mainnet-beta.solana.com` when unset).
 - **New client env var:** `BRIDGE_CKETH_MINTER_CANISTER` (recommended to set explicitly; defaults to `sv3dd-oaaaa-aaaar-qacoa-cai` when unset/empty).
 - **Primary operations:** `liquidator run`, `liquidator balance`, `liquidator withdraw`, `liquidator account show`.
 - **Persistence:** SQLite WAL (`DB_PATH`) enables idempotent retries and resume-safe execution.
@@ -122,6 +123,9 @@ EVM_RPC_URL=https://ethereum-rpc.example
 MEXC_DEFAULT_ROUTE_CHAIN_ID=1
 # Optional Arbitrum override for an Arbitrum EVM_RPC_URL:
 # MEXC_ROUTE_CHAIN_MAP=ETH=42161,ETHEREUM=42161,ARB=42161,ARBITRUM=42161
+
+# Solana Blockchain (optional; defaults to mainnet-beta if omitted)
+SOLANA_RPC_URL=https://api.mainnet-beta.solana.com
 
 # Identity
 MNEMONIC_FILE=~/.liquidium-pipeline/wallets/key

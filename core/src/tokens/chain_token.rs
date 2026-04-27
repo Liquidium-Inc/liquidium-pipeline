@@ -26,6 +26,17 @@ pub enum ChainToken {
         decimals: u8,
         fee: Nat,
     },
+    SolanaNative {
+        symbol: String, // "SOL"
+        decimals: u8,   // 9
+        fee: Nat,
+    },
+    SolanaSpl {
+        mint: String, // base58 token mint address
+        symbol: String,
+        decimals: u8,
+        fee: Nat,
+    },
 }
 
 impl ChainToken {
@@ -34,6 +45,8 @@ impl ChainToken {
             ChainToken::Icp { .. } => "ICP".to_string(),
             ChainToken::EvmNative { chain, .. } => format!("evm-{}", chain),
             ChainToken::EvmErc20 { chain, .. } => format!("evm-{}", chain),
+            ChainToken::SolanaNative { .. } => "sol".to_string(),
+            ChainToken::SolanaSpl { .. } => "sol".to_string(),
         }
     }
 
@@ -42,6 +55,8 @@ impl ChainToken {
             ChainToken::Icp { symbol, .. } => symbol.clone(),
             ChainToken::EvmNative { symbol, .. } => symbol.clone(),
             ChainToken::EvmErc20 { symbol, .. } => symbol.clone(),
+            ChainToken::SolanaNative { symbol, .. } => symbol.clone(),
+            ChainToken::SolanaSpl { symbol, .. } => symbol.clone(),
         }
     }
 
@@ -50,6 +65,8 @@ impl ChainToken {
             ChainToken::Icp { decimals, .. } => *decimals,
             ChainToken::EvmNative { decimals, .. } => *decimals,
             ChainToken::EvmErc20 { decimals, .. } => *decimals,
+            ChainToken::SolanaNative { decimals, .. } => *decimals,
+            ChainToken::SolanaSpl { decimals, .. } => *decimals,
         }
     }
 
@@ -58,6 +75,8 @@ impl ChainToken {
             ChainToken::Icp { fee, .. } => fee.clone(),
             ChainToken::EvmNative { fee, .. } => fee.clone(),
             ChainToken::EvmErc20 { fee, .. } => fee.clone(),
+            ChainToken::SolanaNative { fee, .. } => fee.clone(),
+            ChainToken::SolanaSpl { fee, .. } => fee.clone(),
         }
     }
 
@@ -85,6 +104,18 @@ impl ChainToken {
                 address: token_address.clone(),
                 symbol: symbol.clone(),
             },
+
+            ChainToken::SolanaNative { symbol, .. } => AssetId {
+                chain: "sol".to_string(),
+                address: "native".to_string(),
+                symbol: symbol.clone(),
+            },
+
+            ChainToken::SolanaSpl { mint, symbol, .. } => AssetId {
+                chain: "sol".to_string(),
+                address: mint.clone(),
+                symbol: symbol.clone(),
+            },
         }
     }
 }
@@ -106,6 +137,12 @@ impl fmt::Display for ChainToken {
             } => {
                 // format: EVM[chain]:symbol@address
                 write!(f, "EVM[{}]:{}@{}", chain, symbol, token_address)
+            }
+            ChainToken::SolanaNative { symbol, .. } => {
+                write!(f, "SOL:{}@native", symbol)
+            }
+            ChainToken::SolanaSpl { mint, symbol, .. } => {
+                write!(f, "SOL:{}@{}", symbol, mint)
             }
         }
     }
