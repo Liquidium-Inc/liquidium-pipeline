@@ -5,7 +5,9 @@ use ic_agent::Identity;
 use icrc_ledger_types::icrc1::account::Account;
 use liquidium_pipeline_commons::env::config_dir;
 use liquidium_pipeline_connectors::account::icp_account::{RECOVERY_ACCOUNT, derive_icp_identity};
-use liquidium_pipeline_connectors::crypto::derivation::{derive_btc_p2tr_address, derive_evm_private_key};
+use liquidium_pipeline_connectors::crypto::derivation::{
+    derive_btc_p2tr_address, derive_evm_private_key, derive_solana_private_key_bytes,
+};
 use log::debug;
 use std::collections::HashMap;
 use std::env;
@@ -41,8 +43,11 @@ pub struct Config {
     pub trader_principal: Principal,
     pub ic_url: String,
     pub evm_rpc_url: String,
+    pub solana_rpc_url: String,
     pub evm_private_key: String,
+    pub solana_private_key_bytes: [u8; 32],
     pub bridge_evm_private_key: String,
+    pub bridge_solana_private_key_bytes: [u8; 32],
     pub bridge_evm_address: String,
     pub bridge_ic_owner_principal: Principal,
     pub bridge_btc_address: String,
@@ -284,6 +289,7 @@ impl Config {
         let evm_signer: PrivateKeySigner = PrivateKeySigner::from_slice(&sk.to_bytes()).map_err(|e| e.to_string())?;
         let hex = evm_signer.to_bytes().encode_hex();
         let evm_private_key = format!("{:#}", hex);
+        let solana_private_key_bytes = derive_solana_private_key_bytes(&mnemonic, 0, 0)?;
 
         // Derive dedicated bridge namespace identities.
         let bridge_sk = derive_evm_private_key(&mnemonic, BRIDGE_NAMESPACE_ACCOUNT, BRIDGE_EVM_INDEX)?;
@@ -291,6 +297,8 @@ impl Config {
             .map_err(|e| format!("failed to create bridge EVM signer: {e}"))?;
         let bridge_evm_private_key = format!("{:#}", bridge_signer.to_bytes().encode_hex());
         let bridge_evm_address = bridge_signer.address().to_string();
+        let bridge_solana_private_key_bytes =
+            derive_solana_private_key_bytes(&mnemonic, BRIDGE_NAMESPACE_ACCOUNT, BRIDGE_SOLANA_INDEX)?;
 
         let bridge_ic_identity = derive_icp_identity(&mnemonic, BRIDGE_NAMESPACE_ACCOUNT, BRIDGE_ICP_INDEX)
             .map_err(|e| format!("could not create bridge identity: {e}"))?;
@@ -357,11 +365,16 @@ impl Config {
         };
 
         let evm_rpc_url = env::var("EVM_RPC_URL").map_err(|_| "EVM_RPC_URL not configured".to_string())?;
+        let solana_rpc_url =
+            env::var("SOLANA_RPC_URL").unwrap_or_else(|_| "https://api.mainnet-beta.solana.com".to_string());
 
         Ok(Arc::new(Config {
             evm_private_key,
             evm_rpc_url,
+            solana_rpc_url,
+            solana_private_key_bytes,
             bridge_evm_private_key,
+            bridge_solana_private_key_bytes,
             bridge_evm_address,
             bridge_ic_owner_principal,
             bridge_btc_address,
@@ -465,6 +478,7 @@ const BRIDGE_NAMESPACE_ACCOUNT: u32 = 1;
 const BRIDGE_EVM_INDEX: u32 = 0;
 const BRIDGE_ICP_INDEX: u32 = 1;
 const BRIDGE_BTC_INDEX: u32 = 0;
+const BRIDGE_SOLANA_INDEX: u32 = 0;
 const DEFAULT_BRIDGE_CKETH_MINTER_CANISTER: &str = "sv3dd-oaaaa-aaaar-qacoa-cai";
 
 fn parse_bad_debt_collateral_slippage_bps_from_env() -> u32 {

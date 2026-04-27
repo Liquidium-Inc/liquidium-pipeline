@@ -104,6 +104,7 @@ fn draw_balances_actions(f: &mut Frame<'_>, area: Rect, app: &App) {
         Line::from(""),
         Line::from("Bridge accounts:"),
         Line::from(format!("  EVM source : {}", app.config.bridge_evm_address)),
+        Line::from(format!("  SOL source : {}", app.config.bridge_solana_address)),
         Line::from(format!("  ICP owner  : {}", app.config.bridge_ic_owner_principal)),
         Line::from(format!("  BTC address: {}", app.config.bridge_btc_address)),
         Line::from(""),
@@ -119,6 +120,8 @@ fn draw_balances_actions(f: &mut Frame<'_>, area: Rect, app: &App) {
         lines.push(Line::from("Liquidator deposit address:"));
         if selected.asset.chain.eq_ignore_ascii_case("icp") {
             lines.push(Line::from(format!("  ICP: {}", app.config.liquidator_principal)));
+        } else if selected.asset.chain.eq_ignore_ascii_case("sol") {
+            lines.push(Line::from(format!("  SOL: {}", app.config.solana_address)));
         } else {
             lines.push(Line::from(format!(
                 "  {}: {}",
@@ -305,7 +308,7 @@ fn draw_withdraw(f: &mut Frame<'_>, area: Rect, app: &App) {
     ));
     if !is_icp_asset {
         footer_lines.push(Line::from(
-            "Destination options for EVM assets: main, bridge, or manual (0x...)",
+            "Destination options for non-ICP assets: main, bridge, or manual (EVM: 0x..., Solana: base58)",
         ));
     }
 

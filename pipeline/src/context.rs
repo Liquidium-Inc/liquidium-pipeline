@@ -9,7 +9,9 @@ use ic_agent::Agent;
 use icrc_ledger_types::icrc1::account::Account;
 use liquidium_pipeline_connectors::account::evm_account::EvmAccountInfoAdapter;
 use liquidium_pipeline_connectors::account::icp_account::IcpAccountInfoAdapter;
+use liquidium_pipeline_connectors::account::solana_account::SolanaAccountInfoAdapter;
 use liquidium_pipeline_connectors::backend::evm_backend::EvmBackendImpl;
+use liquidium_pipeline_connectors::backend::solana_backend::SolanaBackendImpl;
 use liquidium_pipeline_connectors::error_format::format_with_code;
 use liquidium_pipeline_core::balance_service::BalanceService;
 use liquidium_pipeline_core::tokens::chain_token::ChainToken;
@@ -22,7 +24,10 @@ use liquidium_pipeline_connectors::{
     account::router::MultiChainAccountInfoRouter,
     backend::icp_backend::IcpBackendImpl,
     token_registry_loader::{RegistryLoadError, load_token_registry},
-    transfer::{evm_transfer::EvmTransferAdapter, icp_transfer::IcpTransferAdapter, router::MultiChainTransferRouter},
+    transfer::{
+        evm_transfer::EvmTransferAdapter, icp_transfer::IcpTransferAdapter, router::MultiChainTransferRouter,
+        solana_transfer::SolanaTransferAdapter,
+    },
 };
 
 use crate::approval_state::ApprovalState;
@@ -167,10 +172,23 @@ impl<P: Provider<AnyNetwork> + WalletProvider<AnyNetwork> + Clone + 'static> Pip
             .wallet(bridge_signer)
             .connect_http(bridge_rpc_url);
         let evm_backend_bridge = Arc::new(EvmBackendImpl::new(bridge_provider));
+        let solana_backend_main = Arc::new(SolanaBackendImpl::from_url_and_secret_key(
+            config.solana_rpc_url.clone(),
+            config.solana_private_key_bytes,
+        ));
+        let solana_backend_trader = solana_backend_main.clone();
+        let solana_backend_bridge = Arc::new(SolanaBackendImpl::from_url_and_secret_key(
+            config.solana_rpc_url.clone(),
+            config.bridge_solana_private_key_bytes,
+        ));
 
         let registry = Arc::new(match registry_override {
             Some(registry) => registry,
-            None => load_token_registry(icp_backend_main.clone(), evm_backend_main.clone())
+            None => load_token_registry(
+                icp_backend_main.clone(),
+                evm_backend_main.clone(),
+                solana_backend_main.clone(),
+            )
                 .await
                 .map_err(PipelineContextError::RegistryLoad)?,
         });
@@ -201,32 +219,44 @@ impl<P: Provider<AnyNetwork> + WalletProvider<AnyNetwork> + Clone + 'static> Pip
 
         let icp_info_main = Arc::new(IcpAccountInfoAdapter::new(icp_backend_main.clone(), main_icp_account));
         let evm_info_main = Arc::new(EvmAccountInfoAdapter::new(evm_backend_main.clone()));
+        let sol_info_main = Arc::new(SolanaAccountInfoAdapter::new(solana_backend_main.clone()));
         let main_accounts: Arc<dyn AccountInfo + Send + Sync> =
-            Arc::new(MultiChainAccountInfoRouter::new(icp_info_main, evm_info_main));
+            Arc::new(MultiChainAccountInfoRouter::new(icp_info_main, evm_info_main, sol_info_main));
 
         let icp_info_trader = Arc::new(IcpAccountInfoAdapter::new(
             icp_backend_trader.clone(),
             trader_icp_account,
         ));
         let evm_info_trader = Arc::new(EvmAccountInfoAdapter::new(evm_backend_trader.clone()));
+        let sol_info_trader = Arc::new(SolanaAccountInfoAdapter::new(solana_backend_trader.clone()));
         let trader_accounts: Arc<dyn AccountInfo + Send + Sync> =
-            Arc::new(MultiChainAccountInfoRouter::new(icp_info_trader, evm_info_trader));
+            Arc::new(MultiChainAccountInfoRouter::new(
+                icp_info_trader,
+                evm_info_trader,
+                sol_info_trader,
+            ));
 
         let icp_info_recovery = Arc::new(IcpAccountInfoAdapter::new(
             icp_backend_trader.clone(),
             recovery_icp_account,
         ));
         let evm_info_recovery = Arc::new(EvmAccountInfoAdapter::new(evm_backend_trader.clone()));
+        let sol_info_recovery = Arc::new(SolanaAccountInfoAdapter::new(solana_backend_trader.clone()));
         let recovery_accounts: Arc<dyn AccountInfo + Send + Sync> =
-            Arc::new(MultiChainAccountInfoRouter::new(icp_info_recovery, evm_info_recovery));
+            Arc::new(MultiChainAccountInfoRouter::new(
+                icp_info_recovery,
+                evm_info_recovery,
+                sol_info_recovery,
+            ));
 
         let icp_info_bridge = Arc::new(IcpAccountInfoAdapter::new(
             icp_backend_bridge.clone(),
             bridge_icp_account,
         ));
         let evm_info_bridge = Arc::new(EvmAccountInfoAdapter::new(evm_backend_bridge.clone()));
+        let sol_info_bridge = Arc::new(SolanaAccountInfoAdapter::new(solana_backend_bridge.clone()));
         let bridge_accounts: Arc<dyn AccountInfo + Send + Sync> =
-            Arc::new(MultiChainAccountInfoRouter::new(icp_info_bridge, evm_info_bridge));
+            Arc::new(MultiChainAccountInfoRouter::new(icp_info_bridge, evm_info_bridge, sol_info_bridge));
 
         let main_service = BalanceService::new(registry.clone(), main_accounts);
         let trader_service = BalanceService::new(registry.clone(), trader_accounts);
@@ -236,12 +266,22 @@ impl<P: Provider<AnyNetwork> + WalletProvider<AnyNetwork> + Clone + 'static> Pip
         // Build transfer adapters and routers
         let icp_transfer_main = Arc::new(IcpTransferAdapter::new(icp_backend_main.clone(), main_icp_account));
         let evm_transfer_main = Arc::new(EvmTransferAdapter::new(evm_backend_main.clone()));
-        let transfer_router_main = Arc::new(MultiChainTransferRouter::new(icp_transfer_main, evm_transfer_main));
+        let solana_transfer_main = Arc::new(SolanaTransferAdapter::new(solana_backend_main.clone()));
+        let transfer_router_main = Arc::new(MultiChainTransferRouter::new(
+            icp_transfer_main,
+            evm_transfer_main,
+            solana_transfer_main,
+        ));
         let main_transfers = TransferService::new(registry.clone(), transfer_router_main);
 
         let icp_transfer_trader = Arc::new(IcpTransferAdapter::new(icp_backend_trader.clone(), trader_icp_account));
         let evm_transfer_trader = Arc::new(EvmTransferAdapter::new(evm_backend_trader.clone()));
-        let transfer_router_trader = Arc::new(MultiChainTransferRouter::new(icp_transfer_trader, evm_transfer_trader));
+        let solana_transfer_trader = Arc::new(SolanaTransferAdapter::new(solana_backend_trader.clone()));
+        let transfer_router_trader = Arc::new(MultiChainTransferRouter::new(
+            icp_transfer_trader,
+            evm_transfer_trader,
+            solana_transfer_trader,
+        ));
         let trader_transfers = TransferService::new(registry.clone(), transfer_router_trader);
 
         let icp_transfer_recovery = Arc::new(IcpTransferAdapter::new(
@@ -250,15 +290,22 @@ impl<P: Provider<AnyNetwork> + WalletProvider<AnyNetwork> + Clone + 'static> Pip
         ));
 
         let evm_transfer_recovery = Arc::new(EvmTransferAdapter::new(evm_backend_trader.clone()));
+        let solana_transfer_recovery = Arc::new(SolanaTransferAdapter::new(solana_backend_trader.clone()));
         let transfer_router_recovery = Arc::new(MultiChainTransferRouter::new(
             icp_transfer_recovery,
             evm_transfer_recovery,
+            solana_transfer_recovery,
         ));
         let recovery_transfers = TransferService::new(registry.clone(), transfer_router_recovery);
 
         let icp_transfer_bridge = Arc::new(IcpTransferAdapter::new(icp_backend_bridge.clone(), bridge_icp_account));
         let evm_transfer_bridge = Arc::new(EvmTransferAdapter::new(evm_backend_bridge.clone()));
-        let transfer_router_bridge = Arc::new(MultiChainTransferRouter::new(icp_transfer_bridge, evm_transfer_bridge));
+        let solana_transfer_bridge = Arc::new(SolanaTransferAdapter::new(solana_backend_bridge.clone()));
+        let transfer_router_bridge = Arc::new(MultiChainTransferRouter::new(
+            icp_transfer_bridge,
+            evm_transfer_bridge,
+            solana_transfer_bridge,
+        ));
         let bridge_transfers = TransferService::new(registry.clone(), transfer_router_bridge);
 
         let approval_state = Arc::new(ApprovalState::new());
@@ -430,8 +477,11 @@ mod tests {
             trader_principal: Principal::from_text("2vxsx-fae").expect("principal"),
             ic_url: "http://localhost:4943".to_string(),
             evm_rpc_url: "http://localhost:8545".to_string(),
+            solana_rpc_url: "http://localhost:8899".to_string(),
             evm_private_key: evm_test_private_key,
+            solana_private_key_bytes: [2u8; 32],
             bridge_evm_private_key: "0x59c6995e998f97a5a0044976f53f58816f2f94f4a7f87b5c6a1f7fbf3f5e6be7".to_string(),
+            bridge_solana_private_key_bytes: [3u8; 32],
             bridge_evm_address: "0x1111111111111111111111111111111111111111".to_string(),
             bridge_ic_owner_principal: Principal::from_text("aaaaa-aa").expect("principal"),
             bridge_btc_address: "1BoatSLRHtKNngkdXEeobR76b53LETtpyT".to_string(),

@@ -6,6 +6,7 @@ use tracing::info;
 use futures::future::join_all;
 use liquidium_pipeline_core::tokens::token_registry::TokenRegistryTrait;
 use liquidium_pipeline_core::tokens::{asset_id::AssetId, chain_token_amount::ChainTokenAmount};
+use solana_sdk::{signature::Keypair, signer::Signer};
 
 use crate::config::ConfigTrait;
 use crate::context::init_context;
@@ -16,6 +17,12 @@ pub async fn funds() -> Result<(), String> {
     const HEADER_LABEL_WIDTH: usize = 22;
 
     let recovery_account = ctx.config.get_recovery_account();
+    let solana_address = Keypair::new_from_array(ctx.config.solana_private_key_bytes)
+        .pubkey()
+        .to_string();
+    let bridge_solana_address = Keypair::new_from_array(ctx.config.bridge_solana_private_key_bytes)
+        .pubkey()
+        .to_string();
     let plain_logs = plain_logs_enabled();
 
     if plain_logs {
@@ -24,6 +31,8 @@ pub async fn funds() -> Result<(), String> {
             trader_icp_principal = %ctx.config.trader_principal.to_text(),
             recovery_account = %recovery_account,
             evm_address = %ctx.evm_address,
+            solana_address = %solana_address,
+            bridge_solana_address = %bridge_solana_address,
             "Balances header"
         );
         info!("Recovery account holds seized collateral from failed swaps.");
@@ -45,7 +54,12 @@ pub async fn funds() -> Result<(), String> {
         } else {
             println!("{: <HEADER_LABEL_WIDTH$}: {}", "Recovery account", recovery_account);
         }
-        println!("{: <HEADER_LABEL_WIDTH$}: {}\n", "EVM address", ctx.evm_address);
+        println!("{: <HEADER_LABEL_WIDTH$}: {}", "EVM address", ctx.evm_address);
+        println!("{: <HEADER_LABEL_WIDTH$}: {}", "Solana address", solana_address);
+        println!(
+            "{: <HEADER_LABEL_WIDTH$}: {}\n",
+            "Bridge Solana address", bridge_solana_address
+        );
         const ANSI_YELLOW: &str = "\x1b[33m";
         const ANSI_RESET: &str = "\x1b[0m";
         println!(

@@ -163,6 +163,11 @@ where
                 })?;
                 Ok(ChainAccount::Evm(evm_address.to_string()))
             }
+            ChainToken::SolanaNative { .. } | ChainToken::SolanaSpl { .. } => Err(format!(
+                "unsupported MEXC deposit network '{}' for Solana asset {}; Solana settlement is not wired yet",
+                planned_network,
+                token.symbol()
+            )),
         }
     }
 

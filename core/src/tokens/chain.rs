@@ -2,4 +2,5 @@
 pub enum Chain {
     Icp,
     Evm { chain: String }, // "ETH", "ARB", ...
+    Sol,
 }

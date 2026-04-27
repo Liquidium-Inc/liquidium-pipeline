@@ -8,6 +8,7 @@ use std::{env, io::Write, path::PathBuf};
 
 use alloy::signers::local::PrivateKeySigner;
 use bip39::{Language, Mnemonic};
+use solana_sdk::{signature::Keypair, signer::Signer};
 
 use prettytable::{Cell, Row, Table, format};
 use tracing::{info, warn};
@@ -25,9 +26,23 @@ pub async fn show() {
                 owner: config.liquidator_principal,
                 subaccount: Some(*RECOVERY_ACCOUNT),
             };
+            let solana_address = Keypair::new_from_array(config.solana_private_key_bytes)
+                .pubkey()
+                .to_string();
+            let bridge_solana_address = Keypair::new_from_array(config.bridge_solana_private_key_bytes)
+                .pubkey()
+                .to_string();
             if plain_logs_enabled() {
                 info!(role = "liquidator", principal = %config.liquidator_principal, "Account identity");
                 info!(role = "recovery", principal = %recovery, "Account identity");
+                info!(role = "solana", principal = %solana_address, "Account identity");
+                info!(role = "bridge-solana", principal = %bridge_solana_address, "Account identity");
+                info!(
+                    role = "bridge-ic-owner",
+                    principal = %config.bridge_ic_owner_principal,
+                    "Account identity"
+                );
+                info!(role = "bridge-btc", principal = %config.bridge_btc_address, "Account identity");
                 match config.evm_private_key.parse::<PrivateKeySigner>() {
                     Ok(evm_signer) => {
                         let evm_address = evm_signer.address();
@@ -37,12 +52,6 @@ pub async fn show() {
                             principal = %config.bridge_evm_address,
                             "Account identity"
                         );
-                        info!(
-                            role = "bridge-ic-owner",
-                            principal = %config.bridge_ic_owner_principal,
-                            "Account identity"
-                        );
-                        info!(role = "bridge-btc", principal = %config.bridge_btc_address, "Account identity");
                     }
                     Err(_) => {
                         warn!(role = "evm", "Invalid EVM private key in config");
@@ -64,6 +73,22 @@ pub async fn show() {
                 Cell::new("Recovery Account"),
                 Cell::new(&recovery.to_string()),
             ]));
+            table.add_row(Row::new(vec![
+                Cell::new("Solana Account"),
+                Cell::new(&solana_address),
+            ]));
+            table.add_row(Row::new(vec![
+                Cell::new("Bridge Solana Account"),
+                Cell::new(&bridge_solana_address),
+            ]));
+            table.add_row(Row::new(vec![
+                Cell::new("Bridge ICP Owner"),
+                Cell::new(&config.bridge_ic_owner_principal.to_string()),
+            ]));
+            table.add_row(Row::new(vec![
+                Cell::new("Bridge BTC Address"),
+                Cell::new(&config.bridge_btc_address),
+            ]));
 
             match config.evm_private_key.parse::<PrivateKeySigner>() {
                 Ok(evm_signer) => {
@@ -76,18 +101,14 @@ pub async fn show() {
                         Cell::new("Bridge EVM Account"),
                         Cell::new(&config.bridge_evm_address),
                     ]));
-                    table.add_row(Row::new(vec![
-                        Cell::new("Bridge ICP Owner"),
-                        Cell::new(&config.bridge_ic_owner_principal.to_string()),
-                    ]));
-                    table.add_row(Row::new(vec![
-                        Cell::new("Bridge BTC Address"),
-                        Cell::new(&config.bridge_btc_address),
-                    ]));
                 }
                 Err(_) => {
                     table.add_row(Row::new(vec![
                         Cell::new("EVM Account"),
+                        Cell::new("(invalid EVM private key in config)"),
+                    ]));
+                    table.add_row(Row::new(vec![
+                        Cell::new("Bridge EVM Account"),
                         Cell::new("(invalid EVM private key in config)"),
                     ]));
                 }

@@ -680,7 +680,7 @@ async fn reverse_bridge_approves_only_missing_icrc2_allowance() {
         .expect_icrc2_approve()
         .withf(move |ledger, args| {
             *ledger == cketh_ledger
-                && args.amount == Nat::from(120_000u64)
+                && args.amount == 120_000u64
                 && args.spender.owner == minter
                 && args.spender.subaccount.is_none()
         })

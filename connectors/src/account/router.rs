@@ -9,11 +9,16 @@ use liquidium_pipeline_core::{
 pub struct MultiChainAccountInfoRouter {
     pub icp: Arc<dyn AccountInfo + Send + Sync>,
     pub evm: Arc<dyn AccountInfo + Send + Sync>,
+    pub sol: Arc<dyn AccountInfo + Send + Sync>,
 }
 
 impl MultiChainAccountInfoRouter {
-    pub fn new(icp: Arc<dyn AccountInfo + Send + Sync>, evm: Arc<dyn AccountInfo + Send + Sync>) -> Self {
-        Self { icp, evm }
+    pub fn new(
+        icp: Arc<dyn AccountInfo + Send + Sync>,
+        evm: Arc<dyn AccountInfo + Send + Sync>,
+        sol: Arc<dyn AccountInfo + Send + Sync>,
+    ) -> Self {
+        Self { icp, evm, sol }
     }
 }
 
@@ -23,6 +28,7 @@ impl AccountInfo for MultiChainAccountInfoRouter {
         match token {
             ChainToken::Icp { .. } => self.icp.get_balance(token).await,
             ChainToken::EvmNative { .. } | ChainToken::EvmErc20 { .. } => self.evm.get_balance(token).await,
+            ChainToken::SolanaNative { .. } | ChainToken::SolanaSpl { .. } => self.sol.get_balance(token).await,
         }
     }
 
@@ -30,6 +36,7 @@ impl AccountInfo for MultiChainAccountInfoRouter {
         match token {
             ChainToken::Icp { .. } => self.icp.sync_balance(token).await,
             ChainToken::EvmNative { .. } | ChainToken::EvmErc20 { .. } => self.evm.sync_balance(token).await,
+            ChainToken::SolanaNative { .. } | ChainToken::SolanaSpl { .. } => self.sol.sync_balance(token).await,
         }
     }
 
@@ -37,6 +44,7 @@ impl AccountInfo for MultiChainAccountInfoRouter {
         match token {
             ChainToken::Icp { .. } => self.icp.get_cached_balance(token),
             ChainToken::EvmNative { .. } | ChainToken::EvmErc20 { .. } => self.evm.get_cached_balance(token),
+            ChainToken::SolanaNative { .. } | ChainToken::SolanaSpl { .. } => self.sol.get_cached_balance(token),
         }
     }
 }

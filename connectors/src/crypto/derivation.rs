@@ -5,7 +5,7 @@ use bip39::{Language, Mnemonic};
 use k256::SecretKey;
 use std::str::FromStr;
 
-fn derive_private_key_with_path(mnemonic: &str, path_str: &str) -> Result<SecretKey, String> {
+fn derive_private_key_bytes_with_path(mnemonic: &str, path_str: &str) -> Result<[u8; 32], String> {
     let mnemonic = Mnemonic::parse_in(Language::English, mnemonic).map_err(|e| format!("invalid mnemonic: {e}"))?;
     let seed = mnemonic.to_seed("");
     let master = XPrv::new(seed).map_err(|e| format!("xprv error: {e}"))?;
@@ -16,8 +16,12 @@ fn derive_private_key_with_path(mnemonic: &str, path_str: &str) -> Result<Secret
         node = node.derive_child(cn).map_err(|e| format!("derive_child error: {e}"))?;
     }
 
-    let raw = node.private_key().to_bytes();
-    SecretKey::from_bytes(&raw).map_err(|e| format!("secret key error: {e}"))
+    Ok(node.private_key().to_bytes().into())
+}
+
+fn derive_private_key_with_path(mnemonic: &str, path_str: &str) -> Result<SecretKey, String> {
+    let raw = derive_private_key_bytes_with_path(mnemonic, path_str)?;
+    SecretKey::from_bytes((&raw).into()).map_err(|e| format!("secret key error: {e}"))
 }
 
 // Derive a raw Ethereum private key from a mnemonic and BIP32 path.
@@ -30,6 +34,12 @@ pub fn derive_evm_private_key(mnemonic: &str, account: u32, index: u32) -> Resul
 pub fn derive_btc_private_key(mnemonic: &str, account: u32, index: u32) -> Result<SecretKey, String> {
     let path_str = format!("m/86'/0'/{}'/0/{}", account, index);
     derive_private_key_with_path(mnemonic, &path_str)
+}
+
+// Derive a raw Solana private key seed (32 bytes) from mnemonic and BIP44 path.
+pub fn derive_solana_private_key_bytes(mnemonic: &str, account: u32, index: u32) -> Result<[u8; 32], String> {
+    let path_str = format!("m/44'/501'/{}'/{}'", account, index);
+    derive_private_key_bytes_with_path(mnemonic, &path_str)
 }
 
 // Derive a deterministic Bitcoin mainnet P2TR address from mnemonic.
@@ -46,7 +56,9 @@ pub fn derive_btc_p2tr_address(mnemonic: &str, account: u32, index: u32) -> Resu
 
 #[cfg(test)]
 mod tests {
-    use super::{derive_btc_p2tr_address, derive_btc_private_key, derive_evm_private_key};
+    use super::{
+        derive_btc_p2tr_address, derive_btc_private_key, derive_evm_private_key, derive_solana_private_key_bytes,
+    };
 
     const TEST_MNEMONIC: &str =
         "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
@@ -72,5 +84,20 @@ mod tests {
         assert_eq!(a, b);
         assert!(a.starts_with("bc1p"));
         assert_eq!(a.len(), 62);
+    }
+
+    #[test]
+    fn solana_derivation_changes_with_index() {
+        let k0 = derive_solana_private_key_bytes(TEST_MNEMONIC, 0, 0).expect("key");
+        let k1 = derive_solana_private_key_bytes(TEST_MNEMONIC, 0, 1).expect("key");
+        assert_ne!(k0, k1);
+    }
+
+    #[test]
+    fn solana_and_evm_namespace_do_not_collide() {
+        let evm = derive_evm_private_key(TEST_MNEMONIC, 0, 0).expect("key");
+        let sol = derive_solana_private_key_bytes(TEST_MNEMONIC, 0, 0).expect("key");
+        let evm_bytes: [u8; 32] = evm.to_bytes().into();
+        assert_ne!(evm_bytes, sol);
     }
 }

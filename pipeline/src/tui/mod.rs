@@ -19,6 +19,7 @@ use chrono::Local;
 use crossterm::event::{self, Event as CrosstermEvent};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
+use solana_sdk::{signature::Keypair, signer::Signer};
 use tokio::sync::mpsc;
 
 use crate::commands::liquidation_loop::LoopControl;
@@ -194,6 +195,12 @@ pub async fn run(opts: TuiOptions) -> anyhow::Result<()> {
 
     let withdraw_assets = build_withdrawable_assets(&ctx);
     let cfg = &ctx.config;
+    let solana_address = Keypair::new_from_array(cfg.solana_private_key_bytes)
+        .pubkey()
+        .to_string();
+    let bridge_solana_address = Keypair::new_from_array(cfg.bridge_solana_private_key_bytes)
+        .pubkey()
+        .to_string();
     let config = ConfigSummary {
         ic_url: cfg.ic_url.clone(),
         lending_canister: cfg.lending_canister.to_text(),
@@ -201,7 +208,9 @@ pub async fn run(opts: TuiOptions) -> anyhow::Result<()> {
         liquidator_principal: cfg.liquidator_principal.to_text(),
         trader_principal: cfg.trader_principal.to_text(),
         evm_address: ctx.evm_address.clone(),
+        solana_address,
         bridge_evm_address: cfg.bridge_evm_address.clone(),
+        bridge_solana_address,
         bridge_ic_owner_principal: cfg.bridge_ic_owner_principal.to_text(),
         bridge_btc_address: cfg.bridge_btc_address.clone(),
         swapper_mode: format!("{:?}", cfg.swapper),
