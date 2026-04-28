@@ -189,8 +189,8 @@ impl<P: Provider<AnyNetwork> + WalletProvider<AnyNetwork> + Clone + 'static> Pip
                 evm_backend_main.clone(),
                 solana_backend_main.clone(),
             )
-                .await
-                .map_err(PipelineContextError::RegistryLoad)?,
+            .await
+            .map_err(PipelineContextError::RegistryLoad)?,
         });
 
         for (id, token) in registry.tokens.iter() {
@@ -220,8 +220,11 @@ impl<P: Provider<AnyNetwork> + WalletProvider<AnyNetwork> + Clone + 'static> Pip
         let icp_info_main = Arc::new(IcpAccountInfoAdapter::new(icp_backend_main.clone(), main_icp_account));
         let evm_info_main = Arc::new(EvmAccountInfoAdapter::new(evm_backend_main.clone()));
         let sol_info_main = Arc::new(SolanaAccountInfoAdapter::new(solana_backend_main.clone()));
-        let main_accounts: Arc<dyn AccountInfo + Send + Sync> =
-            Arc::new(MultiChainAccountInfoRouter::new(icp_info_main, evm_info_main, sol_info_main));
+        let main_accounts: Arc<dyn AccountInfo + Send + Sync> = Arc::new(MultiChainAccountInfoRouter::new(
+            icp_info_main,
+            evm_info_main,
+            sol_info_main,
+        ));
 
         let icp_info_trader = Arc::new(IcpAccountInfoAdapter::new(
             icp_backend_trader.clone(),
@@ -229,12 +232,11 @@ impl<P: Provider<AnyNetwork> + WalletProvider<AnyNetwork> + Clone + 'static> Pip
         ));
         let evm_info_trader = Arc::new(EvmAccountInfoAdapter::new(evm_backend_trader.clone()));
         let sol_info_trader = Arc::new(SolanaAccountInfoAdapter::new(solana_backend_trader.clone()));
-        let trader_accounts: Arc<dyn AccountInfo + Send + Sync> =
-            Arc::new(MultiChainAccountInfoRouter::new(
-                icp_info_trader,
-                evm_info_trader,
-                sol_info_trader,
-            ));
+        let trader_accounts: Arc<dyn AccountInfo + Send + Sync> = Arc::new(MultiChainAccountInfoRouter::new(
+            icp_info_trader,
+            evm_info_trader,
+            sol_info_trader,
+        ));
 
         let icp_info_recovery = Arc::new(IcpAccountInfoAdapter::new(
             icp_backend_trader.clone(),
@@ -242,12 +244,11 @@ impl<P: Provider<AnyNetwork> + WalletProvider<AnyNetwork> + Clone + 'static> Pip
         ));
         let evm_info_recovery = Arc::new(EvmAccountInfoAdapter::new(evm_backend_trader.clone()));
         let sol_info_recovery = Arc::new(SolanaAccountInfoAdapter::new(solana_backend_trader.clone()));
-        let recovery_accounts: Arc<dyn AccountInfo + Send + Sync> =
-            Arc::new(MultiChainAccountInfoRouter::new(
-                icp_info_recovery,
-                evm_info_recovery,
-                sol_info_recovery,
-            ));
+        let recovery_accounts: Arc<dyn AccountInfo + Send + Sync> = Arc::new(MultiChainAccountInfoRouter::new(
+            icp_info_recovery,
+            evm_info_recovery,
+            sol_info_recovery,
+        ));
 
         let icp_info_bridge = Arc::new(IcpAccountInfoAdapter::new(
             icp_backend_bridge.clone(),
@@ -255,8 +256,11 @@ impl<P: Provider<AnyNetwork> + WalletProvider<AnyNetwork> + Clone + 'static> Pip
         ));
         let evm_info_bridge = Arc::new(EvmAccountInfoAdapter::new(evm_backend_bridge.clone()));
         let sol_info_bridge = Arc::new(SolanaAccountInfoAdapter::new(solana_backend_bridge.clone()));
-        let bridge_accounts: Arc<dyn AccountInfo + Send + Sync> =
-            Arc::new(MultiChainAccountInfoRouter::new(icp_info_bridge, evm_info_bridge, sol_info_bridge));
+        let bridge_accounts: Arc<dyn AccountInfo + Send + Sync> = Arc::new(MultiChainAccountInfoRouter::new(
+            icp_info_bridge,
+            evm_info_bridge,
+            sol_info_bridge,
+        ));
 
         let main_service = BalanceService::new(registry.clone(), main_accounts);
         let trader_service = BalanceService::new(registry.clone(), trader_accounts);
@@ -486,6 +490,8 @@ mod tests {
             bridge_ic_owner_principal: Principal::from_text("aaaaa-aa").expect("principal"),
             bridge_btc_address: "1BoatSLRHtKNngkdXEeobR76b53LETtpyT".to_string(),
             bridge_cketh_minter_canister: Principal::from_text("sv3dd-oaaaa-aaaar-qacoa-cai").expect("principal"),
+            bridge_cksol_minter_canister: Principal::from_text("ljyxk-riaaa-aaaar-qb5mq-cai").expect("principal"),
+            bridge_cksol_ledger_canister: Principal::from_text("la34w-haaaa-aaaar-qb5na-cai").expect("principal"),
             lending_canister: Principal::from_text("aaaaa-aa").expect("principal"),
             export_path: "executions.csv".to_string(),
             buy_bad_debt: false,

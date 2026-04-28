@@ -152,6 +152,18 @@ mod tests {
         assert_eq!(ckbtc.route_kind, BridgeRouteKind::CkBtcToBtc);
         assert_eq!(ckbtc.destination_kind, BridgeDestinationKind::BtcAddress);
         assert_eq!(ckbtc.ckerc20_ledger_id, None);
+
+        let sol = resolve_route("SOL", "SOL", "ckSOL").expect("SOL route");
+        assert_eq!(sol.route_kind, BridgeRouteKind::SolanaToIcp);
+        assert_eq!(sol.destination_kind, BridgeDestinationKind::IcpAccount);
+        assert_eq!(sol.evm_token_address, None);
+        assert_eq!(sol.ckerc20_ledger_id, None);
+
+        let cksol = resolve_route("ckSOL", "ICP", "SOL").expect("ckSOL route");
+        assert_eq!(cksol.route_kind, BridgeRouteKind::IcpToSolana);
+        assert_eq!(cksol.destination_kind, BridgeDestinationKind::SolanaAddress);
+        assert_eq!(cksol.evm_token_address, None);
+        assert_eq!(cksol.ckerc20_ledger_id, None);
     }
 
     #[test]
@@ -159,6 +171,8 @@ mod tests {
         assert!(resolve_route("usdc", "eth", "ckusdc").is_some());
         assert!(resolve_route("ckusdc", "icp", "usdc").is_some());
         assert!(resolve_route("CKBTC", "icp", "btc").is_some());
+        assert!(resolve_route("sol", "sol", "cksol").is_some());
+        assert!(resolve_route("cksol", "icp", "sol").is_some());
         assert!(resolve_route("USDT", "ETH", "ckUSDT").is_none());
     }
 

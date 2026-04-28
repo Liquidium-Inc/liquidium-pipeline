@@ -52,6 +52,8 @@ pub struct Config {
     pub bridge_ic_owner_principal: Principal,
     pub bridge_btc_address: String,
     pub bridge_cketh_minter_canister: Principal,
+    pub bridge_cksol_minter_canister: Principal,
+    pub bridge_cksol_ledger_canister: Principal,
     pub lending_canister: Principal,
     pub export_path: String,
     pub buy_bad_debt: bool,
@@ -324,6 +326,36 @@ impl Config {
                 bridge_cketh_minter_canister_text
             )
         })?;
+        let bridge_cksol_minter_canister_text = env::var("BRIDGE_CKSOL_MINTER_CANISTER")
+            .unwrap_or_else(|_| DEFAULT_BRIDGE_CKSOL_MINTER_CANISTER.to_string())
+            .trim()
+            .to_string();
+        let bridge_cksol_minter_canister_text = if bridge_cksol_minter_canister_text.is_empty() {
+            DEFAULT_BRIDGE_CKSOL_MINTER_CANISTER.to_string()
+        } else {
+            bridge_cksol_minter_canister_text
+        };
+        let bridge_cksol_minter_canister = Principal::from_text(&bridge_cksol_minter_canister_text).map_err(|e| {
+            format!(
+                "invalid BRIDGE_CKSOL_MINTER_CANISTER principal '{}': {e}",
+                bridge_cksol_minter_canister_text
+            )
+        })?;
+        let bridge_cksol_ledger_canister_text = env::var("BRIDGE_CKSOL_LEDGER_CANISTER")
+            .unwrap_or_else(|_| DEFAULT_BRIDGE_CKSOL_LEDGER_CANISTER.to_string())
+            .trim()
+            .to_string();
+        let bridge_cksol_ledger_canister_text = if bridge_cksol_ledger_canister_text.is_empty() {
+            DEFAULT_BRIDGE_CKSOL_LEDGER_CANISTER.to_string()
+        } else {
+            bridge_cksol_ledger_canister_text
+        };
+        let bridge_cksol_ledger_canister = Principal::from_text(&bridge_cksol_ledger_canister_text).map_err(|e| {
+            format!(
+                "invalid BRIDGE_CKSOL_LEDGER_CANISTER principal '{}': {e}",
+                bridge_cksol_ledger_canister_text
+            )
+        })?;
         let max_allowed_dex_slippage: u32 = std::env::var("MAX_ALLOWED_DEX_SLIPPAGE")
             .or_else(|_| std::env::var("MAX_ALLOWED_SLIPPAGE_BPS"))
             .ok()
@@ -378,6 +410,8 @@ impl Config {
             bridge_ic_owner_principal,
             bridge_btc_address,
             bridge_cketh_minter_canister,
+            bridge_cksol_minter_canister,
+            bridge_cksol_ledger_canister,
             liquidator_identity: Arc::new(liquidator_identity),
             bridge_ic_identity: Arc::new(bridge_ic_identity),
             ic_url,
@@ -479,6 +513,8 @@ const BRIDGE_ICP_INDEX: u32 = 1;
 const BRIDGE_BTC_INDEX: u32 = 0;
 const BRIDGE_SOLANA_INDEX: u32 = 0;
 const DEFAULT_BRIDGE_CKETH_MINTER_CANISTER: &str = "sv3dd-oaaaa-aaaar-qacoa-cai";
+const DEFAULT_BRIDGE_CKSOL_MINTER_CANISTER: &str = "ljyxk-riaaa-aaaar-qb5mq-cai";
+const DEFAULT_BRIDGE_CKSOL_LEDGER_CANISTER: &str = "la34w-haaaa-aaaar-qb5na-cai";
 
 fn parse_bad_debt_collateral_slippage_bps_from_env() -> u32 {
     env::var("BAD_DEBT_COLLATERAL_SLIPPAGE_BPS")
