@@ -1,11 +1,13 @@
 mod catalog;
 pub mod ckerc20_bridge;
 mod ckerc20_bridge_utils;
+pub mod solana_bridge;
 mod types;
 mod utils;
 pub use ckerc20_bridge::{
     BRIDGE_AMOUNT_BELOW_MINIMUM_PREFIX, BridgeEvmBackend, CkErc20BridgeBackend, FINALIZER_PERMANENT_AMOUNT_FLOOR_PREFIX,
 };
+pub use solana_bridge::SolanaBridgeBackend;
 pub use types::{
     BridgeBackend, BridgeDestination, BridgeDestinationKind, BridgeFeeBudget, BridgeRequest, BridgeRouteKind,
     BridgeRouteSpec, BridgeStatus, BridgeSubmission, BridgeSweepRoute, EvmReceiptStatus, MockBridgeBackend,

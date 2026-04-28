@@ -365,8 +365,7 @@ impl Config {
         };
 
         let evm_rpc_url = env::var("EVM_RPC_URL").map_err(|_| "EVM_RPC_URL not configured".to_string())?;
-        let solana_rpc_url =
-            env::var("SOLANA_RPC_URL").unwrap_or_else(|_| "https://api.mainnet-beta.solana.com".to_string());
+        let solana_rpc_url = env::var("SOLANA_RPC_URL").unwrap_or_else(|_| "https://api.devnet.solana.com".to_string());
 
         Ok(Arc::new(Config {
             icpswap_mnemonic: Arc::from(mnemonic),
