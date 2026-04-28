@@ -317,7 +317,7 @@ impl Config {
         } else {
             bridge_cketh_minter_canister_text
         };
-        
+
         let bridge_cketh_minter_canister = Principal::from_text(&bridge_cketh_minter_canister_text).map_err(|e| {
             format!(
                 "invalid BRIDGE_CKETH_MINTER_CANISTER principal '{}': {e}",
@@ -365,8 +365,7 @@ impl Config {
         };
 
         let evm_rpc_url = env::var("EVM_RPC_URL").map_err(|_| "EVM_RPC_URL not configured".to_string())?;
-        let solana_rpc_url =
-            env::var("SOLANA_RPC_URL").unwrap_or_else(|_| "https://api.mainnet-beta.solana.com".to_string());
+        let solana_rpc_url = env::var("SOLANA_RPC_URL").unwrap_or_else(|_| "https://api.devnet.solana.com".to_string());
 
         Ok(Arc::new(Config {
             evm_private_key,

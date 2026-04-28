@@ -9,6 +9,7 @@ pub enum BridgeDestination {
     IcpAccount(Account),
     EvmAddress(Address),
     BtcAddress(String),
+    SolanaAddress(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -16,6 +17,7 @@ pub enum BridgeDestinationKind {
     IcpAccount,
     EvmAddress,
     BtcAddress,
+    SolanaAddress,
 }
 
 impl BridgeDestination {
@@ -24,6 +26,7 @@ impl BridgeDestination {
             Self::IcpAccount(_) => BridgeDestinationKind::IcpAccount,
             Self::EvmAddress(_) => BridgeDestinationKind::EvmAddress,
             Self::BtcAddress(_) => BridgeDestinationKind::BtcAddress,
+            Self::SolanaAddress(_) => BridgeDestinationKind::SolanaAddress,
         }
     }
 }
@@ -34,6 +37,8 @@ pub enum BridgeRouteKind {
     CkEthErc20Reverse,
     BtcToCkBtc,
     CkBtcToBtc,
+    SolanaToIcp,
+    IcpToSolana,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]

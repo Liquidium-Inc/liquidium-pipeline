@@ -47,6 +47,7 @@ pub(crate) trait BridgePlanner {
             BridgeDestinationKind::IcpAccount => "ICP".to_string(),
             BridgeDestinationKind::EvmAddress => "ETH".to_string(),
             BridgeDestinationKind::BtcAddress => "BTC".to_string(),
+            BridgeDestinationKind::SolanaAddress => "SOL".to_string(),
         }
     }
 
@@ -98,6 +99,9 @@ pub(crate) trait BridgePlanner {
                 .map(BridgeDestination::IcpAccount)
                 .map_err(|e| format!("invalid CEX deposit ICP destination '{}': {e}", cex_address)),
             BridgeDestinationKind::BtcAddress => Ok(BridgeDestination::BtcAddress(cex_address.to_string())),
+            BridgeDestinationKind::SolanaAddress => {
+                Err("solana bridge destinations are not wired in CEX bridge planner yet".to_string())
+            }
         }
     }
 
@@ -123,6 +127,9 @@ pub(crate) trait BridgePlanner {
                 Ok(BridgeDestination::EvmAddress(evm))
             }
             BridgeDestinationKind::BtcAddress => Ok(BridgeDestination::BtcAddress(direct_withdraw_address.to_string())),
+            BridgeDestinationKind::SolanaAddress => {
+                Err("solana bridge destinations are not wired in CEX bridge planner yet".to_string())
+            }
         }
     }
 

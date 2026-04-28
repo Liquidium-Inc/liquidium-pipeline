@@ -38,7 +38,7 @@ Inspired by Artemis/MEV patterns and designed for permissionless, community-driv
 - **Best first run:** run `SWAPPER=cex` once CEX credentials are configured.
 - **Current config precedence:** shell env vars > local `.env` > `~/.liquidium-pipeline/config.env`.
 - **Required env vars (minimum):** `MNEMONIC_FILE`, `IC_URL`, `EVM_RPC_URL`, `LENDING_CANISTER`, `DEBT_ASSETS`, `COLLATERAL_ASSETS`.
-- **Optional Solana RPC env var:** `SOLANA_RPC_URL` (defaults to `https://api.mainnet-beta.solana.com` when unset).
+- **Optional Solana RPC env var:** `SOLANA_RPC_URL` (defaults to `https://api.devnet.solana.com` when unset).
 - **New client env var:** `BRIDGE_CKETH_MINTER_CANISTER` (recommended to set explicitly; defaults to `sv3dd-oaaaa-aaaar-qacoa-cai` when unset/empty).
 - **Primary operations:** `liquidator run`, `liquidator balance`, `liquidator withdraw`, `liquidator account show`.
 - **Persistence:** SQLite WAL (`DB_PATH`) enables idempotent retries and resume-safe execution.
@@ -120,15 +120,15 @@ BRIDGE_CKETH_MINTER_CANISTER=sv3dd-oaaaa-aaaar-qacoa-cai
 # EVM Blockchain
 EVM_RPC_URL=https://arb1.arbitrum.io/rpc
 
-# Solana Blockchain (optional; defaults to mainnet-beta if omitted)
-SOLANA_RPC_URL=https://api.mainnet-beta.solana.com
+# Solana Blockchain (optional; defaults to devnet if omitted)
+SOLANA_RPC_URL=https://api.devnet.solana.com
 
 # Identity
 MNEMONIC_FILE=~/.liquidium-pipeline/wallets/key
 
 # Assets (comma-separated chain:address:symbol entries)
-DEBT_ASSETS=icp:mxzaz-hqaaa-aaaar-qaada-cai:ckBTC,icp:cngnf-vqaaa-aaaar-qag4q-cai:ckUSDT,icp:xevnm-gaaaa-aaaar-qafnq-cai:ckUSDC,icp:ryjl3-tyaaa-aaaaa-aaaba-cai:ICP
-COLLATERAL_ASSETS=icp:mxzaz-hqaaa-aaaar-qaada-cai:ckBTC,icp:cngnf-vqaaa-aaaar-qag4q-cai:ckUSDT,icp:xevnm-gaaaa-aaaar-qafnq-cai:ckUSDC,icp:ryjl3-tyaaa-aaaaa-aaaba-cai:ICP
+DEBT_ASSETS=icp:mxzaz-hqaaa-aaaar-qaada-cai:ckBTC,icp:cngnf-vqaaa-aaaar-qag4q-cai:ckUSDT,icp:xevnm-gaaaa-aaaar-qafnq-cai:ckUSDC,icp:ryjl3-tyaaa-aaaaa-aaaba-cai:ICP,sol:native:SOL
+COLLATERAL_ASSETS=icp:mxzaz-hqaaa-aaaar-qaada-cai:ckBTC,icp:cngnf-vqaaa-aaaar-qag4q-cai:ckUSDT,icp:xevnm-gaaaa-aaaar-qafnq-cai:ckUSDC,icp:ryjl3-tyaaa-aaaaa-aaaba-cai:ICP,sol:native:SOL
 
 # Optional: only scan specific borrower principals (comma-separated). Set to "none" to disable.
 OPPORTUNITY_ACCOUNT_FILTER=principal1,principal2
