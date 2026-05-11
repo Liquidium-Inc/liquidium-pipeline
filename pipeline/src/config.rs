@@ -44,6 +44,7 @@ pub struct Config {
     pub bridge_cketh_minter_canister: Principal,
     pub bridge_cksol_minter_canister: Principal,
     pub bridge_cksol_ledger_canister: Principal,
+    pub bridge_ic_proxy_canister: Option<Principal>,
     pub lending_canister: Principal,
     pub export_path: String,
     pub buy_bad_debt: bool,
@@ -352,6 +353,22 @@ impl Config {
                 bridge_cksol_ledger_canister_text
             )
         })?;
+        let bridge_ic_proxy_canister = match env::var("BRIDGE_IC_PROXY_CANISTER")
+            .or_else(|_| env::var("BRIDGE_IC_WALLET_CANISTER"))
+        {
+            Ok(value) => {
+                let trimmed = value.trim();
+                if trimmed.is_empty() {
+                    None
+                } else {
+                    Some(
+                        Principal::from_text(trimmed)
+                            .map_err(|e| format!("invalid BRIDGE_IC_PROXY_CANISTER principal '{}': {e}", trimmed))?,
+                    )
+                }
+            }
+            Err(_) => None,
+        };
         let max_allowed_dex_slippage =
             parse_slippage_bps_from_env("MAX_ALLOWED_DEX_SLIPPAGE", DEFAULT_MAX_ALLOWED_DEX_SLIPPAGE_BPS)?;
         let max_allowed_cex_slippage_bps =
@@ -413,6 +430,7 @@ impl Config {
             bridge_cketh_minter_canister,
             bridge_cksol_minter_canister,
             bridge_cksol_ledger_canister,
+            bridge_ic_proxy_canister,
             liquidator_identity: Arc::new(liquidator_identity),
             bridge_ic_identity: Arc::new(bridge_ic_identity),
             ic_url,

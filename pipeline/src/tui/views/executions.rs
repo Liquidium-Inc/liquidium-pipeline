@@ -379,7 +379,7 @@ fn format_recovery_destination(destination: &ChainAccount) -> String {
     match destination {
         ChainAccount::Icp(account) => account.to_string(),
         ChainAccount::IcpLedger(account_id_hex) => account_id_hex.clone(),
-        ChainAccount::Evm(address) => address.clone(),
+        ChainAccount::Evm(address) | ChainAccount::Solana(address) => address.clone(),
     }
 }
 

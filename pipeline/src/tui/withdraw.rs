@@ -113,6 +113,7 @@ pub(super) fn mexc_deposit_lookup_for_asset(asset: &AssetId) -> (String, String)
             BridgeDestinationKind::IcpAccount => "ICP",
             BridgeDestinationKind::EvmAddress => "ETH",
             BridgeDestinationKind::BtcAddress => "BTC",
+            BridgeDestinationKind::SolanaAddress => "SOL",
         };
         return (route.target_asset.to_string(), network.to_string());
     }

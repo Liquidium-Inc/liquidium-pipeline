@@ -20,20 +20,31 @@ impl<B: SolanaBackend> SolanaTransferAdapter<B> {
 
 #[async_trait]
 impl<B: SolanaBackend + Send + Sync> TransferActions for SolanaTransferAdapter<B> {
-    async fn transfer(&self, token: &ChainToken, to: &ChainAccount, amount_native: Nat) -> Result<String, TransferFailure> {
+    async fn transfer(
+        &self,
+        token: &ChainToken,
+        to: &ChainAccount,
+        amount_native: Nat,
+    ) -> Result<String, TransferFailure> {
         // The backend does not distinguish RPC confirmation failures from rejection;
         // funds may have moved, so callers must reconcile before retrying.
         match (token, to) {
-            (ChainToken::SolanaNative { .. }, ChainAccount::Solana(to_address)) => {
-                self.backend.native_transfer(to_address, amount_native).await.map_err(TransferFailure::Ambiguous)
-            }
-            (ChainToken::SolanaSpl { mint, .. }, ChainAccount::Solana(to_address)) => {
-                self.backend.spl_transfer(mint, to_address, amount_native).await.map_err(TransferFailure::Ambiguous)
-            }
-            (ChainToken::SolanaNative { .. } | ChainToken::SolanaSpl { .. }, _) => {
-                Err(TransferFailure::Rejected("SolanaTransferAdapter: destination chain must be Solana".to_string()))
-            }
-            _ => Err(TransferFailure::Rejected("SolanaTransferAdapter only supports Solana tokens".to_string())),
+            (ChainToken::SolanaNative { .. }, ChainAccount::Solana(to_address)) => self
+                .backend
+                .native_transfer(to_address, amount_native)
+                .await
+                .map_err(TransferFailure::Ambiguous),
+            (ChainToken::SolanaSpl { mint, .. }, ChainAccount::Solana(to_address)) => self
+                .backend
+                .spl_transfer(mint, to_address, amount_native)
+                .await
+                .map_err(TransferFailure::Ambiguous),
+            (ChainToken::SolanaNative { .. } | ChainToken::SolanaSpl { .. }, _) => Err(TransferFailure::Rejected(
+                "SolanaTransferAdapter: destination chain must be Solana".to_string(),
+            )),
+            _ => Err(TransferFailure::Rejected(
+                "SolanaTransferAdapter only supports Solana tokens".to_string(),
+            )),
         }
     }
 
