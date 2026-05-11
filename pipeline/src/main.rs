@@ -89,6 +89,70 @@ enum Commands {
         amount: Option<String>,
     },
 
+    // Temporary command for backend-first SOL <-> ckSOL bridge testing.
+    BridgeSolSubmit {
+        /// Direction: sol-to-cksol or cksol-to-sol
+        #[arg(long)]
+        direction: String,
+        /// Amount in SOL/ckSOL human units
+        #[arg(long)]
+        amount: f64,
+        /// Optional source override
+        #[arg(long)]
+        source: Option<String>,
+        /// Optional destination override
+        #[arg(long)]
+        destination: Option<String>,
+        /// If set, fetches an immediate status snapshot for the returned bridge id
+        #[arg(long)]
+        check_status: bool,
+        /// Skip auto-prefund step for sol-to-cksol.
+        #[arg(long, default_value_t = false)]
+        skip_prefund: bool,
+        /// Additional lamports to prefund above bridge amount before sol-to-cksol submit.
+        #[arg(long, default_value_t = 2_000_000u64)]
+        prefund_buffer_lamports: u64,
+        /// Optional proxy canister principal used for proxy-forwarded process_deposit cycles payment.
+        #[arg(long)]
+        proxy_canister: Option<String>,
+    },
+
+    // Temporary command to query status for a bridge id from BridgeSolSubmit.
+    BridgeSolStatus {
+        /// Bridge id returned by BridgeSolSubmit
+        #[arg(long)]
+        bridge_id: String,
+    },
+
+    // Temporary command to print recent Solana txs for a ckSOL deposit bridge id.
+    BridgeSolDepositTx {
+        /// ckSOL deposit bridge id returned by BridgeSolSubmit (sol-to-cksol)
+        #[arg(long)]
+        bridge_id: String,
+        /// Max number of recent signatures to print (1..100)
+        #[arg(long, default_value_t = 10)]
+        limit: usize,
+    },
+
+    // Manual retry for stuck SOL->ckSOL deposit processing via process_deposit.
+    BridgeSolProcessDeposit {
+        /// Solana transaction signature to process.
+        #[arg(long)]
+        signature: String,
+        /// Optional ckSOL deposit bridge id; when provided owner/subaccount are derived from it.
+        #[arg(long)]
+        bridge_id: Option<String>,
+        /// Optional explicit owner principal override.
+        #[arg(long)]
+        owner: Option<String>,
+        /// Optional subaccount override as 64-char hex, or "none".
+        #[arg(long)]
+        subaccount: Option<String>,
+        /// Optional proxy canister principal override.
+        #[arg(long)]
+        proxy_canister: Option<String>,
+    },
+
     // Account management commands
     Account {
         #[command(subcommand)]
@@ -220,6 +284,60 @@ async fn main() {
             } else {
                 // Interactive wizard
                 commands::withdraw::withdraw().await;
+            }
+        }
+        Commands::BridgeSolSubmit {
+            direction,
+            amount,
+            source,
+            destination,
+            check_status,
+            skip_prefund,
+            prefund_buffer_lamports,
+            proxy_canister,
+        } => {
+            if let Err(e) = commands::bridge_sol::submit(
+                &direction,
+                amount,
+                source.as_deref(),
+                destination.as_deref(),
+                check_status,
+                skip_prefund,
+                prefund_buffer_lamports,
+                proxy_canister.as_deref(),
+            )
+            .await
+            {
+                eprintln!("Bridge SOL submit failed: {}", e);
+            }
+        }
+        Commands::BridgeSolStatus { bridge_id } => {
+            if let Err(e) = commands::bridge_sol::status(&bridge_id).await {
+                eprintln!("Bridge SOL status failed: {}", e);
+            }
+        }
+        Commands::BridgeSolDepositTx { bridge_id, limit } => {
+            if let Err(e) = commands::bridge_sol::print_deposit_txs(&bridge_id, limit).await {
+                eprintln!("Bridge SOL deposit tx lookup failed: {}", e);
+            }
+        }
+        Commands::BridgeSolProcessDeposit {
+            signature,
+            bridge_id,
+            owner,
+            subaccount,
+            proxy_canister,
+        } => {
+            if let Err(e) = commands::bridge_sol::process_deposit(
+                &signature,
+                bridge_id.as_deref(),
+                owner.as_deref(),
+                subaccount.as_deref(),
+                proxy_canister.as_deref(),
+            )
+            .await
+            {
+                eprintln!("Bridge SOL process_deposit failed: {}", e);
             }
         }
         Commands::Account { subcommand } => match subcommand {

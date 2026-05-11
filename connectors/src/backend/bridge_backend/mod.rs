@@ -5,7 +5,7 @@ pub mod solana_bridge;
 mod types;
 mod utils;
 pub use ckerc20_bridge::{BridgeEvmBackend, CkErc20BridgeBackend};
-pub use solana_bridge::SolanaBridgeBackend;
+pub use solana_bridge::{DEFAULT_SOLANA_BRIDGE_FEE_BUFFER_LAMPORTS, SolanaBridgeBackend};
 pub use types::{
     BridgeBackend, BridgeDestination, BridgeDestinationKind, BridgeRequest, BridgeRouteKind, BridgeRouteSpec,
     BridgeStatus, BridgeSubmission, BridgeSweepRoute, EvmReceiptStatus, MockBridgeBackend,

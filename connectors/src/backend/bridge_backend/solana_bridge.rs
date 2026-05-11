@@ -20,12 +20,14 @@ use crate::{
             icrc1_balance_with_context, icrc1_decimals_with_context, icrc1_fee_with_context,
             icrc2_allowance_with_context, icrc2_approve_with_context,
         },
+        solana_backend::SolanaBackend,
     },
     pipeline_agent::PipelineAgent,
 };
 
 const WITHDRAW_BRIDGE_ID_PREFIX: &str = "cksol-withdraw:";
 const DEPOSIT_BRIDGE_ID_PREFIX: &str = "cksol-deposit:";
+pub const DEFAULT_SOLANA_BRIDGE_FEE_BUFFER_LAMPORTS: u64 = 2_000_000;
 
 #[derive(CandidType, Deserialize, Clone, Debug)]
 struct CkSolGetDepositAddressArgs {
@@ -34,13 +36,50 @@ struct CkSolGetDepositAddressArgs {
 }
 
 #[derive(CandidType, Deserialize, Clone, Debug)]
-struct CkSolUpdateBalanceArgs {
+struct CkSolProcessDepositArgs {
+    owner: Option<Principal>,
     subaccount: Option<[u8; 32]>,
+    signature: String,
 }
 
 #[derive(CandidType, Deserialize, Clone, Debug)]
-enum CkSolUpdateBalanceError {
-    QueueFull,
+struct CkSolInsufficientCyclesError {
+    expected: Nat,
+    received: Nat,
+}
+
+#[derive(CandidType, Deserialize, Clone, Debug)]
+struct CkSolDepositId {
+    signature: String,
+    account: Account,
+}
+
+#[derive(CandidType, Deserialize, Clone, Debug)]
+enum CkSolDepositStatus {
+    Processing {
+        deposit_amount: u64,
+        amount_to_mint: u64,
+        deposit_id: CkSolDepositId,
+    },
+    Quarantined(CkSolDepositId),
+    Minted {
+        block_index: u64,
+        minted_amount: u64,
+        deposit_id: CkSolDepositId,
+    },
+}
+
+#[derive(CandidType, Deserialize, Clone, Debug)]
+enum CkSolProcessDepositError {
+    InsufficientCycles(CkSolInsufficientCyclesError),
+    TemporarilyUnavailable(String),
+    AlreadyProcessing,
+    TransactionNotFound,
+    InvalidDepositTransaction(String),
+    ValueTooSmall {
+        minimum_deposit_amount: u64,
+        deposit_amount: u64,
+    },
 }
 
 #[derive(CandidType, Deserialize, Clone, Debug)]
@@ -113,38 +152,53 @@ struct DepositBridgePollState {
     account: Account,
     baseline: Nat,
     threshold: Nat,
+    transfer_signature: Option<String>,
 }
 
-pub struct SolanaBridgeBackend<A, B>
+pub struct SolanaBridgeBackend<A, B, S>
 where
     A: PipelineAgent,
     B: IcpBackend,
+    S: SolanaBackend,
 {
     pub agent: Arc<A>,
     pub icp_backend: Arc<B>,
+    pub solana_backend: Arc<S>,
     pub cksol_minter_canister: Principal,
     pub cksol_ledger_canister: Principal,
     pub bridge_ic_owner_principal: Principal,
+    pub bridge_proxy_canister: Option<Principal>,
+    pub bridge_solana_source_address: String,
+    pub fee_buffer_lamports: u64,
 }
 
-impl<A, B> SolanaBridgeBackend<A, B>
+impl<A, B, S> SolanaBridgeBackend<A, B, S>
 where
     A: PipelineAgent,
     B: IcpBackend,
+    S: SolanaBackend,
 {
     pub fn new(
         agent: Arc<A>,
         icp_backend: Arc<B>,
+        solana_backend: Arc<S>,
         cksol_minter_canister: Principal,
         cksol_ledger_canister: Principal,
         bridge_ic_owner_principal: Principal,
+        bridge_proxy_canister: Option<Principal>,
+        bridge_solana_source_address: String,
+        fee_buffer_lamports: u64,
     ) -> Self {
         Self {
             agent,
             icp_backend,
+            solana_backend,
             cksol_minter_canister,
             cksol_ledger_canister,
             bridge_ic_owner_principal,
+            bridge_proxy_canister,
+            bridge_solana_source_address: bridge_solana_source_address.trim().to_string(),
+            fee_buffer_lamports,
         }
     }
 
@@ -228,6 +282,20 @@ where
         Ok(source)
     }
 
+    fn ensure_configured_bridge_source(&self, source_address: &str) -> Result<(), String> {
+        let trimmed = source_address.trim();
+        Self::validate_solana_pubkey(trimmed, "source Solana address")?;
+
+        if trimmed != self.bridge_solana_source_address {
+            return Err(format!(
+                "source Solana address {} does not match configured bridge source {}",
+                trimmed, self.bridge_solana_source_address
+            ));
+        }
+
+        Ok(())
+    }
+
     fn expect_icp_destination<'a>(
         route: &BridgeRouteSpec,
         destination: &'a BridgeDestination,
@@ -282,14 +350,24 @@ where
     }
 
     fn encode_deposit_bridge_id(state: &DepositBridgePollState) -> String {
-        format!(
-            "{}{owner}:{subaccount}:{baseline}:{threshold}",
-            DEPOSIT_BRIDGE_ID_PREFIX,
-            owner = state.account.owner,
-            subaccount = Self::encode_subaccount(state.account.subaccount),
-            baseline = state.baseline,
-            threshold = state.threshold
-        )
+        match &state.transfer_signature {
+            Some(signature) => format!(
+                "{}{owner}:{subaccount}:{baseline}:{threshold}:{signature}",
+                DEPOSIT_BRIDGE_ID_PREFIX,
+                owner = state.account.owner,
+                subaccount = Self::encode_subaccount(state.account.subaccount),
+                baseline = state.baseline,
+                threshold = state.threshold
+            ),
+            None => format!(
+                "{}{owner}:{subaccount}:{baseline}:{threshold}",
+                DEPOSIT_BRIDGE_ID_PREFIX,
+                owner = state.account.owner,
+                subaccount = Self::encode_subaccount(state.account.subaccount),
+                baseline = state.baseline,
+                threshold = state.threshold
+            ),
+        }
     }
 
     fn parse_deposit_bridge_id(bridge_id: &str) -> Result<Option<DepositBridgePollState>, String> {
@@ -298,9 +376,9 @@ where
         };
 
         let parts: Vec<&str> = raw_state.split(':').collect();
-        if parts.len() != 4 {
+        if parts.len() != 4 && parts.len() != 5 {
             return Err(format!(
-                "invalid ckSOL deposit bridge id '{}': expected 4 fields",
+                "invalid ckSOL deposit bridge id '{}': expected 4 or 5 fields",
                 bridge_id
             ));
         }
@@ -320,11 +398,24 @@ where
                 parts[3], bridge_id
             )
         })?;
+        let transfer_signature = if parts.len() == 5 {
+            let signature = parts[4].trim();
+            if signature.is_empty() {
+                return Err(format!(
+                    "invalid transfer signature in ckSOL deposit bridge id '{}': empty signature field",
+                    bridge_id
+                ));
+            }
+            Some(signature.to_string())
+        } else {
+            None
+        };
 
         Ok(Some(DepositBridgePollState {
             account: Account { owner, subaccount },
             baseline,
             threshold,
+            transfer_signature,
         }))
     }
 
@@ -375,24 +466,66 @@ where
             })
     }
 
-    async fn update_balance(&self, args: CkSolUpdateBalanceArgs) -> Result<(), String> {
-        let arg_blob = Encode!(&args).map_err(|e| format!("encode update_balance args failed: {e}"))?;
-        let result: Result<(), CkSolUpdateBalanceError> = self
+    fn resolve_proxy_canister(&self) -> Result<Principal, String> {
+        self.bridge_proxy_canister.ok_or_else(|| {
+            "bridge proxy canister is not configured. Set BRIDGE_IC_PROXY_CANISTER or pass --proxy-canister to spend cycles for process_deposit"
+                .to_string()
+        })
+    }
+
+    fn map_process_deposit_error(err: CkSolProcessDepositError) -> String {
+        match err {
+            CkSolProcessDepositError::InsufficientCycles(detail) => format!(
+                "process_deposit rejected: InsufficientCycles (expected={}, received={})",
+                detail.expected, detail.received
+            ),
+            CkSolProcessDepositError::TemporarilyUnavailable(message) => {
+                format!("process_deposit rejected: TemporarilyUnavailable ({message})")
+            }
+            CkSolProcessDepositError::AlreadyProcessing => "process_deposit rejected: AlreadyProcessing".to_string(),
+            CkSolProcessDepositError::TransactionNotFound => {
+                "process_deposit rejected: TransactionNotFound".to_string()
+            }
+            CkSolProcessDepositError::InvalidDepositTransaction(message) => {
+                format!("process_deposit rejected: InvalidDepositTransaction ({message})")
+            }
+            CkSolProcessDepositError::ValueTooSmall {
+                minimum_deposit_amount,
+                deposit_amount,
+            } => format!(
+                "process_deposit rejected: ValueTooSmall (minimum_deposit_amount={}, deposit_amount={})",
+                minimum_deposit_amount, deposit_amount
+            ),
+        }
+    }
+
+    async fn process_deposit_via_proxy(
+        &self,
+        proxy_canister: &Principal,
+        args: CkSolProcessDepositArgs,
+        cycles: Nat,
+    ) -> Result<CkSolDepositStatus, String> {
+        let arg_blob = Encode!(&args).map_err(|e| format!("encode process_deposit args failed: {e}"))?;
+        let result: Result<CkSolDepositStatus, CkSolProcessDepositError> = self
             .agent
-            .call_update::<Result<(), CkSolUpdateBalanceError>>(&self.cksol_minter_canister, "update_balance", arg_blob)
+            .call_update_via_proxy::<Result<CkSolDepositStatus, CkSolProcessDepositError>>(
+                proxy_canister,
+                &self.cksol_minter_canister,
+                "process_deposit",
+                arg_blob,
+                cycles,
+            )
             .await
             .map_err(|e| {
                 format!(
-                    "update_balance call failed for minter {}: {e}",
-                    self.cksol_minter_canister
+                    "process_deposit proxy-forwarded call failed (proxy={} minter={}): {e}",
+                    proxy_canister, self.cksol_minter_canister
                 )
             })?;
 
         match result {
-            Ok(()) => Ok(()),
-            Err(CkSolUpdateBalanceError::QueueFull) => {
-                Err("update_balance rejected by ckSOL minter: monitored account queue is full".to_string())
-            }
+            Ok(status) => Ok(status),
+            Err(err) => Err(Self::map_process_deposit_error(err)),
         }
     }
 
@@ -497,8 +630,7 @@ where
         route: &BridgeRouteSpec,
         request: &BridgeRequest,
     ) -> Result<BridgeSubmission, String> {
-        let source_address = request.source_address.trim();
-        Self::validate_solana_pubkey(source_address, "source Solana address")?;
+        self.ensure_configured_bridge_source(&request.source_address)?;
 
         let destination = Self::expect_icp_destination(route, &request.destination)?;
         if destination.owner != self.bridge_ic_owner_principal {
@@ -507,6 +639,7 @@ where
                 destination.owner, self.bridge_ic_owner_principal
             ));
         }
+        let proxy_canister = self.resolve_proxy_canister()?;
 
         let expected_source = self
             .get_deposit_address(CkSolGetDepositAddressArgs {
@@ -514,16 +647,6 @@ where
                 subaccount: destination.subaccount,
             })
             .await?;
-
-        if source_address != expected_source {
-            return Err(format!(
-                "source Solana address {} does not match minter-derived deposit address {} for destination owner={} subaccount={}",
-                source_address,
-                expected_source,
-                destination.owner,
-                Self::encode_subaccount(destination.subaccount)
-            ));
-        }
 
         let decimals =
             icrc1_decimals_with_context(self.icp_backend.as_ref(), self.cksol_ledger_canister, "cksol bridge").await?;
@@ -542,10 +665,24 @@ where
                 amount_lamports, minter_info.minimum_deposit_amount
             ));
         }
-        if amount_lamports <= minter_info.automated_deposit_fee {
+        if amount_lamports <= minter_info.manual_deposit_fee {
             return Err(format!(
-                "bridge amount preflight failed: requested SOL amount must exceed automated deposit fee (requested={} lamports, automated_deposit_fee={} lamports)",
-                amount_lamports, minter_info.automated_deposit_fee
+                "bridge amount preflight failed: requested SOL amount must exceed manual deposit fee (requested={} lamports, manual_deposit_fee={} lamports)",
+                amount_lamports, minter_info.manual_deposit_fee
+            ));
+        }
+
+        let required_budget = amount_native.clone() + Nat::from(self.fee_buffer_lamports);
+        let available_balance = self.solana_backend.native_balance().await.map_err(|e| {
+            format!(
+                "bridge amount preflight failed: unable to read configured bridge source SOL balance (source={}): {}",
+                self.bridge_solana_source_address, e
+            )
+        })?;
+        if available_balance < required_budget {
+            return Err(format!(
+                "bridge amount preflight failed: configured bridge source SOL balance is below transfer+fee buffer budget (available={} lamports, required={} lamports, source={})",
+                available_balance, required_budget, self.bridge_solana_source_address
             ));
         }
 
@@ -557,17 +694,36 @@ where
         )
         .await?;
 
-        self.update_balance(CkSolUpdateBalanceArgs {
-            subaccount: destination.subaccount,
-        })
-        .await?;
+        let transfer_signature = self
+            .solana_backend
+            .native_transfer(&expected_source, amount_native.clone())
+            .await
+            .map_err(|e| {
+                format!(
+                    "SOL transfer from configured bridge source {} to ckSOL deposit address {} failed: {}",
+                    self.bridge_solana_source_address, expected_source, e
+                )
+            })?;
 
-        let expected_mint_lamports = amount_lamports - minter_info.automated_deposit_fee;
+        let _deposit_status = self
+            .process_deposit_via_proxy(
+                &proxy_canister,
+                CkSolProcessDepositArgs {
+                    owner: Some(destination.owner),
+                    subaccount: destination.subaccount,
+                    signature: transfer_signature.clone(),
+                },
+                minter_info.process_deposit_required_cycles.clone(),
+            )
+            .await?;
+
+        let expected_mint_lamports = amount_lamports - minter_info.manual_deposit_fee;
         let threshold = baseline.clone() + Nat::from(expected_mint_lamports);
         let bridge_id = Self::encode_deposit_bridge_id(&DepositBridgePollState {
             account: *destination,
             baseline,
             threshold,
+            transfer_signature: Some(transfer_signature),
         });
 
         Ok(BridgeSubmission { bridge_id })
@@ -629,10 +785,11 @@ where
 }
 
 #[async_trait]
-impl<A, B> BridgeBackend for SolanaBridgeBackend<A, B>
+impl<A, B, S> BridgeBackend for SolanaBridgeBackend<A, B, S>
 where
     A: PipelineAgent,
     B: IcpBackend,
+    S: SolanaBackend,
 {
     async fn get_source_balance(&self, asset: &str, chain: &str, address: &str) -> Result<f64, String> {
         let route = Self::solana_route_from_source(asset, chain)?;
@@ -641,7 +798,7 @@ where
             BridgeRouteKind::SolanaToIcp => {
                 Self::validate_solana_pubkey(address, "source Solana address")?;
                 Err(format!(
-                    "source balance is not supported for route {}@{} -> {}; use automated update_balance flow",
+                    "source balance is not supported for route {}@{} -> {}; sol-to-cksol uses manual process_deposit flow",
                     route.source_asset, route.source_chain, route.target_asset
                 ))
             }
@@ -720,11 +877,14 @@ where
 mod tests {
     use super::super::{BridgeBackend, BridgeDestination, BridgeRequest};
     use super::{
-        CkSolMinterInfo, CkSolTxFinalizedStatus, CkSolUpdateBalanceError, CkSolWithdrawalError, CkSolWithdrawalOk,
-        CkSolWithdrawalStatus, DEPOSIT_BRIDGE_ID_PREFIX, DepositBridgePollState, SolanaBridgeBackend,
-        WITHDRAW_BRIDGE_ID_PREFIX,
+        CkSolDepositId, CkSolDepositStatus, CkSolMinterInfo, CkSolProcessDepositError, CkSolTxFinalizedStatus,
+        CkSolWithdrawalError, CkSolWithdrawalOk, CkSolWithdrawalStatus, DEFAULT_SOLANA_BRIDGE_FEE_BUFFER_LAMPORTS,
+        DEPOSIT_BRIDGE_ID_PREFIX, DepositBridgePollState, SolanaBridgeBackend, WITHDRAW_BRIDGE_ID_PREFIX,
     };
-    use crate::{backend::icp_backend::MockIcpBackend, pipeline_agent::MockPipelineAgent};
+    use crate::{
+        backend::{icp_backend::MockIcpBackend, solana_backend::MockSolanaBackend},
+        pipeline_agent::MockPipelineAgent,
+    };
     use candid::{Nat, Principal};
     use icrc_ledger_types::icrc1::account::Account;
     use std::sync::{Arc, Mutex};
@@ -741,20 +901,51 @@ mod tests {
         Principal::from_text("la34w-haaaa-aaaar-qb5na-cai").expect("principal")
     }
 
+    fn proxy_canister() -> Principal {
+        Principal::from_text("rwlgt-iiaaa-aaaaa-aaaaa-cai").expect("principal")
+    }
+
     fn valid_solana_address() -> String {
         "So11111111111111111111111111111111111111112".to_string()
+    }
+
+    fn bridge_source_address() -> String {
+        "11111111111111111111111111111111".to_string()
+    }
+
+    fn deposit_address() -> String {
+        "SysvarC1ock11111111111111111111111111111111".to_string()
     }
 
     fn backend(
         mock_agent: MockPipelineAgent,
         mock_icp: MockIcpBackend,
-    ) -> SolanaBridgeBackend<MockPipelineAgent, MockIcpBackend> {
+        mock_solana: MockSolanaBackend,
+    ) -> SolanaBridgeBackend<MockPipelineAgent, MockIcpBackend, MockSolanaBackend> {
+        backend_with_fee(
+            mock_agent,
+            mock_icp,
+            mock_solana,
+            DEFAULT_SOLANA_BRIDGE_FEE_BUFFER_LAMPORTS,
+        )
+    }
+
+    fn backend_with_fee(
+        mock_agent: MockPipelineAgent,
+        mock_icp: MockIcpBackend,
+        mock_solana: MockSolanaBackend,
+        fee_buffer_lamports: u64,
+    ) -> SolanaBridgeBackend<MockPipelineAgent, MockIcpBackend, MockSolanaBackend> {
         SolanaBridgeBackend::new(
             Arc::new(mock_agent),
             Arc::new(mock_icp),
+            Arc::new(mock_solana),
             minter_canister(),
             ledger_canister(),
             bridge_owner(),
+            Some(proxy_canister()),
+            bridge_source_address(),
+            fee_buffer_lamports,
         )
     }
 
@@ -762,7 +953,7 @@ mod tests {
         BridgeRequest {
             asset: "SOL".to_string(),
             source_chain: "SOL".to_string(),
-            source_address: valid_solana_address(),
+            source_address: bridge_source_address(),
             target_asset: "ckSOL".to_string(),
             destination: BridgeDestination::IcpAccount(Account {
                 owner: destination_owner,
@@ -798,7 +989,11 @@ mod tests {
 
     #[tokio::test]
     async fn submit_bridge_rejects_non_solana_route_kind() {
-        let backend = backend(MockPipelineAgent::new(), MockIcpBackend::new());
+        let backend = backend(
+            MockPipelineAgent::new(),
+            MockIcpBackend::new(),
+            MockSolanaBackend::new(),
+        );
         let request = BridgeRequest {
             asset: "USDC".to_string(),
             source_chain: "ETH".to_string(),
@@ -820,7 +1015,11 @@ mod tests {
 
     #[tokio::test]
     async fn solana_to_icp_destination_owner_mismatch_fails() {
-        let backend = backend(MockPipelineAgent::new(), MockIcpBackend::new());
+        let backend = backend(
+            MockPipelineAgent::new(),
+            MockIcpBackend::new(),
+            MockSolanaBackend::new(),
+        );
         let request = sol_to_icp_request(Principal::anonymous(), None);
 
         let err = backend
@@ -832,44 +1031,66 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn solana_to_icp_source_must_match_minter_deposit_address() {
-        let mut mock_agent = MockPipelineAgent::new();
-        mock_agent
-            .expect_call_query::<String>()
-            .times(1)
-            .returning(|_, _, _| Ok("AnotherSource1111111111111111111111111111111".to_string()));
+    async fn solana_to_icp_source_must_match_configured_bridge_source() {
+        let mut request = sol_to_icp_request(bridge_owner(), Some([7u8; 32]));
+        request.source_address = valid_solana_address();
 
-        let backend = backend(mock_agent, MockIcpBackend::new());
-        let request = sol_to_icp_request(bridge_owner(), Some([7u8; 32]));
-
+        let backend = backend(
+            MockPipelineAgent::new(),
+            MockIcpBackend::new(),
+            MockSolanaBackend::new(),
+        );
         let err = backend
             .submit_bridge(request)
             .await
-            .expect_err("source/deposit address mismatch must fail");
-        assert!(err.contains("does not match minter-derived deposit address"));
+            .expect_err("source/configured bridge source mismatch must fail");
+        assert!(err.contains("does not match configured bridge source"));
     }
 
     #[tokio::test]
-    async fn solana_to_icp_happy_path_calls_update_balance_and_returns_synthetic_bridge_id() {
-        let source = valid_solana_address();
+    async fn solana_to_icp_happy_path_sends_transfer_then_calls_process_deposit_and_returns_synthetic_bridge_id() {
+        let source = bridge_source_address();
+        let derived_deposit = deposit_address();
+        let query_deposit = derived_deposit.clone();
+        let transfer_deposit = derived_deposit.clone();
         let subaccount = Some([9u8; 32]);
         let mut request = sol_to_icp_request(bridge_owner(), subaccount);
         request.source_address = source.clone();
         request.amount = 2.0;
+        let events = Arc::new(Mutex::new(Vec::<String>::new()));
+        let transfer_events = events.clone();
+        let process_events = events.clone();
 
         let mut mock_agent = MockPipelineAgent::new();
         mock_agent
             .expect_call_query::<String>()
             .times(1)
-            .returning(move |_, _, _| Ok(source.clone()));
+            .returning(move |_, _, _| Ok(query_deposit.clone()));
         mock_agent
             .expect_call_query::<CkSolMinterInfo>()
             .times(1)
             .returning(|_, _, _| Ok(default_minter_info()));
         mock_agent
-            .expect_call_update::<Result<(), CkSolUpdateBalanceError>>()
+            .expect_call_update_via_proxy::<Result<CkSolDepositStatus, CkSolProcessDepositError>>()
             .times(1)
-            .returning(|_, _, _| Ok(Ok(())));
+            .returning(move |proxy, canister, method, _, cycles| {
+                process_events.lock().expect("mutex").push("process".to_string());
+                assert_eq!(*proxy, proxy_canister());
+                assert_eq!(*canister, minter_canister());
+                assert_eq!(method, "process_deposit");
+                assert_eq!(cycles, Nat::from(1_000_000_000_000u64));
+                Ok(Ok(CkSolDepositStatus::Minted {
+                    block_index: 77,
+                    minted_amount: 1_999_990_000,
+                    deposit_id: CkSolDepositId {
+                        signature: "sig-123".to_string(),
+                        account: Account {
+                            owner: bridge_owner(),
+                            subaccount,
+                        },
+                    },
+                }))
+            });
 
         let mut mock_icp = MockIcpBackend::new();
         mock_icp.expect_icrc1_decimals().times(1).returning(|_| Ok(9));
@@ -878,25 +1099,171 @@ mod tests {
             .times(1)
             .returning(|_, _| Ok(Nat::from(1_000_000_000u64)));
 
-        let backend = backend(mock_agent, mock_icp);
+        let mut mock_solana = MockSolanaBackend::new();
+        mock_solana
+            .expect_native_balance()
+            .times(1)
+            .returning(|| Ok(Nat::from(3_000_000_000u64)));
+        mock_solana
+            .expect_native_transfer()
+            .times(1)
+            .returning(move |to, amount_lamports| {
+                transfer_events.lock().expect("mutex").push("transfer".to_string());
+                assert_eq!(to, transfer_deposit);
+                assert_eq!(amount_lamports, Nat::from(2_000_000_000u64));
+                Ok("sig-123".to_string())
+            });
+
+        let backend = backend(mock_agent, mock_icp, mock_solana);
         let submission = backend.submit_bridge(request).await.expect("bridge must submit");
+        assert_eq!(
+            events.lock().expect("mutex").as_slice(),
+            ["transfer", "process"],
+            "manual flow must transfer before process_deposit"
+        );
 
         assert!(submission.bridge_id.starts_with(DEPOSIT_BRIDGE_ID_PREFIX));
         let decoded =
-            SolanaBridgeBackend::<MockPipelineAgent, MockIcpBackend>::parse_deposit_bridge_id(&submission.bridge_id)
-                .expect("bridge id must decode")
-                .expect("bridge id must be deposit metadata");
+            SolanaBridgeBackend::<MockPipelineAgent, MockIcpBackend, MockSolanaBackend>::parse_deposit_bridge_id(
+                &submission.bridge_id,
+            )
+            .expect("bridge id must decode")
+            .expect("bridge id must be deposit metadata");
 
         assert_eq!(decoded.account.owner, bridge_owner());
         assert_eq!(decoded.account.subaccount, subaccount);
         assert_eq!(decoded.baseline, Nat::from(1_000_000_000u64));
-        // expected threshold = baseline + (2_000_000_000 - 10_000_000)
-        assert_eq!(decoded.threshold, Nat::from(2_990_000_000u64));
+        // expected threshold = baseline + (2_000_000_000 - 10_000)
+        assert_eq!(decoded.threshold, Nat::from(2_999_990_000u64));
+        assert_eq!(decoded.transfer_signature.as_deref(), Some("sig-123"));
+    }
+
+    #[tokio::test]
+    async fn solana_to_icp_insufficient_bridge_source_balance_fails_before_transfer_and_process_deposit() {
+        let mut request = sol_to_icp_request(bridge_owner(), Some([9u8; 32]));
+        request.amount = 2.0;
+
+        let mut mock_agent = MockPipelineAgent::new();
+        mock_agent
+            .expect_call_query::<String>()
+            .times(1)
+            .returning(|_, _, _| Ok(deposit_address()));
+        mock_agent
+            .expect_call_query::<CkSolMinterInfo>()
+            .times(1)
+            .returning(|_, _, _| Ok(default_minter_info()));
+        mock_agent
+            .expect_call_update_via_proxy::<Result<CkSolDepositStatus, CkSolProcessDepositError>>()
+            .times(0);
+
+        let mut mock_icp = MockIcpBackend::new();
+        mock_icp.expect_icrc1_decimals().times(1).returning(|_| Ok(9));
+        mock_icp.expect_icrc1_balance().times(0);
+
+        let mut mock_solana = MockSolanaBackend::new();
+        mock_solana
+            .expect_native_balance()
+            .times(1)
+            .returning(|| Ok(Nat::from(2_001_000_000u64)));
+        mock_solana.expect_native_transfer().times(0);
+
+        let backend = backend(mock_agent, mock_icp, mock_solana);
+        let err = backend
+            .submit_bridge(request)
+            .await
+            .expect_err("insufficient bridge source balance must fail");
+        assert!(err.contains("below transfer+fee buffer budget"));
+    }
+
+    #[tokio::test]
+    async fn solana_to_icp_transfer_failure_maps_to_clear_error_and_skips_process_deposit() {
+        let mut request = sol_to_icp_request(bridge_owner(), Some([9u8; 32]));
+        request.amount = 2.0;
+
+        let mut mock_agent = MockPipelineAgent::new();
+        mock_agent
+            .expect_call_query::<String>()
+            .times(1)
+            .returning(|_, _, _| Ok(deposit_address()));
+        mock_agent
+            .expect_call_query::<CkSolMinterInfo>()
+            .times(1)
+            .returning(|_, _, _| Ok(default_minter_info()));
+        mock_agent
+            .expect_call_update_via_proxy::<Result<CkSolDepositStatus, CkSolProcessDepositError>>()
+            .times(0);
+
+        let mut mock_icp = MockIcpBackend::new();
+        mock_icp.expect_icrc1_decimals().times(1).returning(|_| Ok(9));
+        mock_icp
+            .expect_icrc1_balance()
+            .times(1)
+            .returning(|_, _| Ok(Nat::from(1_000_000_000u64)));
+
+        let mut mock_solana = MockSolanaBackend::new();
+        mock_solana
+            .expect_native_balance()
+            .times(1)
+            .returning(|| Ok(Nat::from(3_500_000_000u64)));
+        mock_solana
+            .expect_native_transfer()
+            .times(1)
+            .returning(|_, _| Err("solana rpc failure".to_string()));
+
+        let backend = backend(mock_agent, mock_icp, mock_solana);
+        let err = backend
+            .submit_bridge(request)
+            .await
+            .expect_err("transfer failure must fail submission");
+        assert!(err.contains("SOL transfer from configured bridge source"));
+        assert!(err.contains("solana rpc failure"));
+    }
+
+    #[tokio::test]
+    async fn solana_to_icp_fails_fast_when_proxy_canister_is_not_configured() {
+        let mut request = sol_to_icp_request(bridge_owner(), Some([9u8; 32]));
+        request.amount = 2.0;
+
+        let mut mock_agent = MockPipelineAgent::new();
+        mock_agent.expect_call_query::<String>().times(0);
+        mock_agent.expect_call_query::<CkSolMinterInfo>().times(0);
+        mock_agent
+            .expect_call_update_via_proxy::<Result<CkSolDepositStatus, CkSolProcessDepositError>>()
+            .times(0);
+
+        let mut mock_icp = MockIcpBackend::new();
+        mock_icp.expect_icrc1_decimals().times(0);
+        mock_icp.expect_icrc1_balance().times(0);
+
+        let mut mock_solana = MockSolanaBackend::new();
+        mock_solana.expect_native_balance().times(0);
+        mock_solana.expect_native_transfer().times(0);
+
+        let backend = SolanaBridgeBackend::new(
+            Arc::new(mock_agent),
+            Arc::new(mock_icp),
+            Arc::new(mock_solana),
+            minter_canister(),
+            ledger_canister(),
+            bridge_owner(),
+            None,
+            bridge_source_address(),
+            DEFAULT_SOLANA_BRIDGE_FEE_BUFFER_LAMPORTS,
+        );
+        let err = backend
+            .submit_bridge(request)
+            .await
+            .expect_err("missing proxy canister should fail-fast");
+        assert!(err.contains("bridge proxy canister is not configured"));
     }
 
     #[tokio::test]
     async fn icp_to_solana_enforces_owner_and_principal_only_source() {
-        let backend = backend(MockPipelineAgent::new(), MockIcpBackend::new());
+        let backend = backend(
+            MockPipelineAgent::new(),
+            MockIcpBackend::new(),
+            MockSolanaBackend::new(),
+        );
 
         let wrong_owner = icp_to_sol_request(Principal::anonymous().to_text());
         let err = backend
@@ -944,7 +1311,7 @@ mod tests {
             .times(1)
             .returning(|_, _| Ok(Nat::from(7u8)));
 
-        let backend = backend(mock_agent, mock_icp);
+        let backend = backend(mock_agent, mock_icp, MockSolanaBackend::new());
         let submission = backend
             .submit_bridge(icp_to_sol_request(bridge_owner().to_text()))
             .await
@@ -976,7 +1343,7 @@ mod tests {
             .returning(|_, _, _| Ok(Nat::from(1_000_000_000u64)));
         mock_icp.expect_icrc2_approve().times(0);
 
-        let backend = backend(mock_agent, mock_icp);
+        let backend = backend(mock_agent, mock_icp, MockSolanaBackend::new());
         let err = backend
             .submit_bridge(icp_to_sol_request(bridge_owner().to_text()))
             .await
@@ -1013,7 +1380,7 @@ mod tests {
                 Ok(out)
             });
 
-        let backend = backend(mock_agent, MockIcpBackend::new());
+        let backend = backend(mock_agent, MockIcpBackend::new(), MockSolanaBackend::new());
 
         assert_eq!(
             backend
@@ -1061,8 +1428,12 @@ mod tests {
             },
             baseline: Nat::from(100u64),
             threshold: Nat::from(150u64),
+            transfer_signature: Some("sig-poll".to_string()),
         };
-        let bridge_id = SolanaBridgeBackend::<MockPipelineAgent, MockIcpBackend>::encode_deposit_bridge_id(&poll_state);
+        let bridge_id =
+            SolanaBridgeBackend::<MockPipelineAgent, MockIcpBackend, MockSolanaBackend>::encode_deposit_bridge_id(
+                &poll_state,
+            );
 
         let balance_call_count = Arc::new(Mutex::new(0u8));
         let balance_call_count_clone = balance_call_count.clone();
@@ -1078,7 +1449,7 @@ mod tests {
             Ok(out)
         });
 
-        let backend = backend(MockPipelineAgent::new(), mock_icp);
+        let backend = backend(MockPipelineAgent::new(), mock_icp, MockSolanaBackend::new());
 
         assert_eq!(
             backend.get_bridge_status(&bridge_id).await.expect("status"),
@@ -1099,7 +1470,7 @@ mod tests {
             .times(1)
             .returning(|_, _| Ok(Nat::from(123_000_000u64)));
 
-        let backend = backend(MockPipelineAgent::new(), mock_icp);
+        let backend = backend(MockPipelineAgent::new(), mock_icp, MockSolanaBackend::new());
         let balance = backend
             .get_source_balance("ckSOL", "ICP", &bridge_owner().to_text())
             .await
@@ -1109,10 +1480,14 @@ mod tests {
 
     #[tokio::test]
     async fn get_source_balance_for_solana_to_icp_is_explicitly_unsupported() {
-        let backend = backend(MockPipelineAgent::new(), MockIcpBackend::new());
+        let backend = backend(
+            MockPipelineAgent::new(),
+            MockIcpBackend::new(),
+            MockSolanaBackend::new(),
+        );
 
         let err = backend
-            .get_source_balance("SOL", "SOL", &valid_solana_address())
+            .get_source_balance("SOL", "SOL", &bridge_source_address())
             .await
             .expect_err("source balance on Solana side should be unsupported in this phase");
         assert!(err.contains("source balance is not supported"));
@@ -1127,12 +1502,35 @@ mod tests {
             },
             baseline: Nat::from(42u64),
             threshold: Nat::from(99u64),
+            transfer_signature: Some("sig-roundtrip".to_string()),
         };
 
-        let encoded = SolanaBridgeBackend::<MockPipelineAgent, MockIcpBackend>::encode_deposit_bridge_id(&state);
-        let decoded = SolanaBridgeBackend::<MockPipelineAgent, MockIcpBackend>::parse_deposit_bridge_id(&encoded)
+        let encoded =
+            SolanaBridgeBackend::<MockPipelineAgent, MockIcpBackend, MockSolanaBackend>::encode_deposit_bridge_id(
+                &state,
+            );
+        let decoded =
+            SolanaBridgeBackend::<MockPipelineAgent, MockIcpBackend, MockSolanaBackend>::parse_deposit_bridge_id(
+                &encoded,
+            )
             .expect("decode")
             .expect("some");
         assert_eq!(decoded, state);
+    }
+
+    #[test]
+    fn deposit_bridge_id_legacy_format_without_signature_still_parses() {
+        let legacy = format!("{}{}:none:10:20", DEPOSIT_BRIDGE_ID_PREFIX, bridge_owner());
+        let parsed =
+            SolanaBridgeBackend::<MockPipelineAgent, MockIcpBackend, MockSolanaBackend>::parse_deposit_bridge_id(
+                &legacy,
+            )
+            .expect("decode")
+            .expect("some");
+        assert_eq!(parsed.account.owner, bridge_owner());
+        assert_eq!(parsed.account.subaccount, None);
+        assert_eq!(parsed.baseline, Nat::from(10u64));
+        assert_eq!(parsed.threshold, Nat::from(20u64));
+        assert!(parsed.transfer_signature.is_none());
     }
 }

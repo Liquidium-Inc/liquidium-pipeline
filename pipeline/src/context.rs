@@ -492,6 +492,7 @@ mod tests {
             bridge_cketh_minter_canister: Principal::from_text("sv3dd-oaaaa-aaaar-qacoa-cai").expect("principal"),
             bridge_cksol_minter_canister: Principal::from_text("ljyxk-riaaa-aaaar-qb5mq-cai").expect("principal"),
             bridge_cksol_ledger_canister: Principal::from_text("la34w-haaaa-aaaar-qb5na-cai").expect("principal"),
+            bridge_ic_proxy_canister: None,
             lending_canister: Principal::from_text("aaaaa-aa").expect("principal"),
             export_path: "executions.csv".to_string(),
             buy_bad_debt: false,
