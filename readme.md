@@ -38,6 +38,7 @@ Inspired by Artemis/MEV patterns and designed for permissionless, community-driv
 - **Best first run:** run `SWAPPER=cex` once CEX credentials are configured.
 - **Current config precedence:** shell env vars > local `.env` > `~/.liquidium-pipeline/config.env`.
 - **Required env vars (minimum):** `MNEMONIC_FILE`, `IC_URL`, `EVM_RPC_URL`, `LENDING_CANISTER`, `DEBT_ASSETS`, `COLLATERAL_ASSETS`.
+- **New client env var:** `BRIDGE_CKETH_MINTER_CANISTER` (recommended to set explicitly; defaults to `sv3dd-oaaaa-aaaar-qacoa-cai` when unset/empty).
 - **Primary operations:** `liquidator run`, `liquidator balance`, `liquidator withdraw`, `liquidator account show`.
 - **Persistence:** SQLite WAL (`DB_PATH`) enables idempotent retries and resume-safe execution.
 
@@ -113,6 +114,7 @@ IC_URL=https://icp-api.io liquidator run
 # ICP Blockchain
 IC_URL=https://ic0.app
 LENDING_CANISTER=nja4y-2yaaa-aaaae-qddxa-cai
+BRIDGE_CKETH_MINTER_CANISTER=sv3dd-oaaaa-aaaar-qacoa-cai
 
 # EVM Blockchain
 EVM_RPC_URL=https://arb1.arbitrum.io/rpc
@@ -120,9 +122,9 @@ EVM_RPC_URL=https://arb1.arbitrum.io/rpc
 # Identity
 MNEMONIC_FILE=~/.liquidium-pipeline/wallets/key
 
-# Assets (comma-separated principal:symbol pairs)
-DEBT_ASSETS=principal1:ckBTC,principal2:ckUSDT,principal3:ICP
-COLLATERAL_ASSETS=principal1:ckBTC,principal2:ckUSDT,principal3:ICP
+# Assets (comma-separated chain:address:symbol entries)
+DEBT_ASSETS=icp:mxzaz-hqaaa-aaaar-qaada-cai:ckBTC,icp:cngnf-vqaaa-aaaar-qag4q-cai:ckUSDT,icp:xevnm-gaaaa-aaaar-qafnq-cai:ckUSDC,icp:ryjl3-tyaaa-aaaaa-aaaba-cai:ICP
+COLLATERAL_ASSETS=icp:mxzaz-hqaaa-aaaar-qaada-cai:ckBTC,icp:cngnf-vqaaa-aaaar-qag4q-cai:ckUSDT,icp:xevnm-gaaaa-aaaar-qafnq-cai:ckUSDC,icp:ryjl3-tyaaa-aaaaa-aaaba-cai:ICP
 
 # Optional: only scan specific borrower principals (comma-separated). Set to "none" to disable.
 OPPORTUNITY_ACCOUNT_FILTER=principal1,principal2
@@ -178,6 +180,10 @@ CEX_MIN_NET_EDGE_BPS=150
 CEX_DELAY_BUFFER_BPS=75
 # Estimated route fee haircut applied to projected edge (bps)
 CEX_ROUTE_FEE_BPS=25
+# Optional CSV market universe for MEXC hop discovery (`BASE_QUOTE` format)
+CEX_MEXC_AVAILABLE_PAIRS=CKBTC_BTC,BTC_USDC,USDC_USDT,CKUSDT_USDT
+# Max intermediate hops when searching configured pairs (0 disables hop fallback)
+CEX_MEXC_MAX_HOPS=2
 # Reserved (currently unused while only SWAPPER=cex is supported)
 CEX_FORCE_OVER_USD_THRESHOLD=12.5
 ```
@@ -197,6 +203,8 @@ Quick reference:
 | `CEX_MIN_NET_EDGE_BPS` | Minimum projected edge needed before choosing CEX path. |
 | `CEX_DELAY_BUFFER_BPS` | Extra haircut for execution-latency/price-move risk. |
 | `CEX_ROUTE_FEE_BPS` | Fee haircut applied during route edge estimation. |
+| `CEX_MEXC_AVAILABLE_PAIRS` | Configured market universe used for direct/hop route discovery. |
+| `CEX_MEXC_MAX_HOPS` | Max intermediate hops allowed in configured-pair route search. |
 | `CEX_FORCE_OVER_USD_THRESHOLD` | In hybrid mode, force CEX above this USD notional (`0` disables). |
 
 Note: `CEX_BUY_INVERSE_OVESPEND_BPS` is still accepted as a legacy alias, but `CEX_BUY_INVERSE_OVERSPEND_BPS` is the canonical key.
@@ -244,6 +252,16 @@ How config controls this risk:
 - `CEX_SLICE_TARGET_RATIO`: softer sizing target below hard limit (execution smoothness).
 - `CEX_MIN_EXEC_USD`: prevents low-notional micro-fills that usually have poor quality.
 - `CEX_BUY_*`: controls adaptive buy fallback when quote-mode truncation leaves meaningful residual.
+
+#### Route Resolution Order
+
+For each `deposit_symbol -> withdraw_symbol`, route selection is deterministic:
+
+1. Legacy special override (`CKBTC <-> CKUSDT`) when applicable.
+2. Direct market probe (`A_B` sell, then `B_A` buy fallback).
+3. Configured hop search over `CEX_MEXC_AVAILABLE_PAIRS` up to `CEX_MEXC_MAX_HOPS`.
+
+Resolved legs are persisted in CEX state and reused across retries.
 
 #### Execution Algorithm (Per Trade Leg)
 
@@ -294,13 +312,42 @@ WATCHDOG_WEBHOOK=https://your-webhook-url.com/endpoint
 
 ## Identity Management
 
-The bot uses **three identities** derived from a BIP39 mnemonic for security:
+The bot derives identities/addresses from one BIP39 mnemonic using two namespaces:
 
-| Identity | Purpose | Description |
-|----------|---------|-------------|
-| **Liquidator** | Main account | Initiates liquidations, receives collateral |
-| **Trader** | Swap execution | Isolated swap operations (reduces MEV risk) |
-| **Recovery** | Fallback | Catches failed collateral transfers |
+| Namespace | Role | Path / Derivation | Purpose |
+|-----------|------|-------------------|---------|
+| **Operational** (`account=0`) | Liquidator | `m/44'/60'/0'/0/0` | Main liquidation operations |
+| **Operational** (`account=0`) | Trader | `m/44'/60'/0'/0/1` | Isolated swap execution |
+| **Operational** (`account=0`) | Recovery | `RECOVERY_ACCOUNT` fixed subaccount | Fallback custody for failed flows |
+| **Bridge** (`account=1`) | Bridge EVM signer | `m/44'/60'/1'/0/0` | Bridge source wallet signer |
+| **Bridge** (`account=1`) | Bridge ICP owner | `m/44'/60'/1'/0/1` | Bridge-side ICP owner principal |
+| **Bridge** (`account=1`) | Bridge BTC key/address | `m/84'/0'/1'/0/0` | Future BTC/ckBTC bridge routes |
+
+### Account Structure Diagram
+
+```text
+Mnemonic
+└── HD Key Tree
+    ├── Operational Namespace (account = 0)
+    │   ├── Liquidator (EVM signer)        m/44'/60'/0'/0/0
+    │   ├── Liquidator (ICP principal)     m/44'/60'/0'/0/0
+    │   ├── Trader (ICP principal)         m/44'/60'/0'/0/1
+    │   └── Recovery account               owner + RECOVERY_ACCOUNT subaccount (0xBEEF...00)
+    │       (recovery is a subaccount, not a separate HD index)
+    │
+    └── Bridge Namespace (account = 1)
+        ├── Bridge EVM signer/address      m/44'/60'/1'/0/0
+        ├── Bridge ICP owner principal     m/44'/60'/1'/0/1
+        ├── Bridge BTC key/address         m/84'/0'/1'/0/0
+        └── Bridge ICP account             owner-only (subaccount = None)
+```
+
+Current bridge sweeper wiring:
+- Forward source: derived `bridge_evm_address` (`USDC@ETH -> ckUSDC`)
+- Reverse source: derived bridge ICP owner account (`ckUSDC@ICP -> USDC@ETH`)
+- Destination: resolved per request in code (forward default: liquidator ICP principal; reverse default: liquidator EVM address)
+- Routes: loaded from a code-level bridge catalog (`ckETH` ERC-20 routes); submissions are serialized per sweeper loop.
+- Design details: `docs/bridge-architecture.md`
 
 ### Generate New Identities
 
@@ -308,7 +355,7 @@ The bot uses **three identities** derived from a BIP39 mnemonic for security:
 liquidator account new
 ```
 
-Creates new Ed25519/Secp256k1 identities for all three roles.
+Creates a new mnemonic used to deterministically derive all operational and bridge roles.
 
 ### Show Existing Identities
 
@@ -447,6 +494,67 @@ liquidator balance
 ```
 
 Displays **main**, **trader**, and **recovery** balances. Recovery balances are marked as "seized collateral (stale, pending withdrawal if swaps failed)".
+
+### MEXC Smoke Swap + Withdraw
+
+Dry-run preflight (no side effects):
+
+```bash
+liquidator mexc-smoke-swap-withdraw --amount-ckbtc 0.001
+```
+
+Live execution (swap + withdraw):
+
+```bash
+liquidator mexc-smoke-swap-withdraw \
+  --amount-ckbtc 0.001 \
+  --execute \
+  --withdraw-address 0x1111111111111111111111111111111111111111 \
+  --withdraw-network ETH
+```
+
+Live execution with final bridge step (USDC@ETH -> ckUSDC):
+
+```bash
+liquidator mexc-smoke-swap-withdraw \
+  --amount-ckbtc 0.001 \
+  --execute \
+  --bridge-after-withdraw \
+  --bridge-destination <ICP_ACCOUNT_OR_PRINCIPAL>
+```
+
+Behavior:
+- Fixed smoke pair: `ckBTC -> USDC`.
+- Uses existing free MEXC `CKBTC` balance (no on-chain deposit transfer step).
+- Route resolution mirrors production MEXC finalizer logic.
+- Without `--execute`, runs route/balance preflight only and exits.
+- `--bridge-after-withdraw` adds a final bridge submission `USDC@ETH -> ckUSDC`.
+- With bridge step enabled, withdraw destination is forced to the configured bridge EVM address.
+- If `--bridge-destination` is omitted, bridge destination defaults to liquidator principal.
+
+### MEXC Smoke Bridge + Swap + Withdraw
+
+Dry-run preflight (no side effects):
+
+```bash
+liquidator mexc-smoke-bridge-swap-withdraw --amount-ckusdc 100
+```
+
+Live execution (bridge `ckUSDC@ICP -> USDC@ETH` to MEXC deposit, swap `USDC -> CKBTC`, withdraw `CKBTC`):
+
+```bash
+liquidator mexc-smoke-bridge-swap-withdraw \
+  --amount-ckusdc 100 \
+  --execute \
+  --withdraw-network ICP
+```
+
+Behavior:
+- Bridge source account is the configured bridge ICP owner account (principal-only).
+- MEXC USDC/ETH deposit address is fetched dynamically per request.
+- Waits for bridge source funding before submit, then waits for MEXC USDC balance credit.
+- Swaps credited USDC to CKBTC using production route logic.
+- Default withdraw destination is the liquidator principal; override with `--withdraw-address`.
 
 ### Withdraw Funds
 

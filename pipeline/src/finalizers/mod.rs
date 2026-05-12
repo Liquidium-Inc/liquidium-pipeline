@@ -1,3 +1,4 @@
+pub(crate) mod bridge_planner;
 pub mod cex_finalizer;
 pub mod dex_finalizer;
 pub mod finalizer;

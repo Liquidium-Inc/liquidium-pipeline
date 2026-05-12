@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use chrono::Local;
+use futures::future::join_all;
 
 use liquidium_pipeline_core::tokens::asset_id::AssetId;
 use liquidium_pipeline_core::tokens::token_registry::TokenRegistry;
@@ -26,18 +27,28 @@ pub(super) async fn fetch_balances_snapshot(
         ctx.trader_service.sync_assets(&asset_ids),
         ctx.recovery_service.sync_assets(&asset_ids),
     );
+    let bridge_results = join_all(asset_ids.iter().cloned().map(|asset_id| {
+        let ctx = ctx.clone();
+        async move {
+            let service = ctx.bridge_balance_service_for_symbol(&asset_id.symbol);
+            service.get_balance(&asset_id).await.map(|balance| (asset_id, balance))
+        }
+    }))
+    .await;
 
     let mut rows = Vec::with_capacity(asset_ids.len());
     for (idx, asset_id) in asset_ids.iter().enumerate() {
         let main_cell = format::format_balance_result(main_results.get(idx));
         let trader_cell = format::format_balance_result(trader_results.get(idx));
         let recovery_cell = format::format_balance_result(recovery_results.get(idx));
+        let bridge_cell = format::format_balance_result(bridge_results.get(idx));
 
         rows.push(BalanceRowData {
             asset: asset_id.clone(),
             main: main_cell,
             trader: trader_cell,
             recovery: recovery_cell,
+            bridge: bridge_cell,
         });
     }
 

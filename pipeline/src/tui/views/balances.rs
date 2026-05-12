@@ -48,6 +48,7 @@ pub(super) fn draw_balances(f: &mut Frame<'_>, area: Rect, app: &App) {
         Cell::new("Main"),
         Cell::new("Trader"),
         Cell::new("Recovery"),
+        Cell::new("Bridge"),
     ])
     .style(Style::default().add_modifier(Modifier::BOLD));
 
@@ -58,6 +59,7 @@ pub(super) fn draw_balances(f: &mut Frame<'_>, area: Rect, app: &App) {
             Cell::new(r.main.clone()),
             Cell::new(r.trader.clone()),
             Cell::new(r.recovery.clone()),
+            Cell::new(r.bridge.clone()),
         ]);
         if idx == app.balances_selected {
             row = row.style(Style::default().bg(Color::DarkGray));
@@ -68,10 +70,11 @@ pub(super) fn draw_balances(f: &mut Frame<'_>, area: Rect, app: &App) {
     let table = Table::new(
         rows,
         [
-            Constraint::Length(18),
-            Constraint::Percentage(27),
-            Constraint::Percentage(27),
-            Constraint::Percentage(27),
+            Constraint::Length(16),
+            Constraint::Percentage(21),
+            Constraint::Percentage(21),
+            Constraint::Percentage(21),
+            Constraint::Percentage(21),
         ],
     )
     .header(header)
@@ -95,9 +98,14 @@ pub(super) fn draw_balances(f: &mut Frame<'_>, area: Rect, app: &App) {
 fn draw_balances_actions(f: &mut Frame<'_>, area: Rect, app: &App) {
     let mut lines: Vec<Line> = vec![
         Line::from("Actions"),
-        Line::from("  w  withdraw selected (ICP only)"),
+        Line::from("  w  withdraw selected"),
         Line::from("  d  MEXC deposit address"),
         Line::from("  Esc  close panel"),
+        Line::from(""),
+        Line::from("Bridge accounts:"),
+        Line::from(format!("  EVM source : {}", app.config.bridge_evm_address)),
+        Line::from(format!("  ICP owner  : {}", app.config.bridge_ic_owner_principal)),
+        Line::from(format!("  BTC address: {}", app.config.bridge_btc_address)),
         Line::from(""),
     ];
 
@@ -215,21 +223,38 @@ fn draw_deposit(f: &mut Frame<'_>, area: Rect, app: &App) {
 fn draw_withdraw(f: &mut Frame<'_>, area: Rect, app: &App) {
     let mut rows: Vec<Row> = Vec::new();
 
+    let selected_asset = app.withdraw_assets.get(app.withdraw.asset_idx);
+    let is_icp_asset = selected_asset
+        .map(|asset| asset.chain.eq_ignore_ascii_case("icp"))
+        .unwrap_or(true);
+
     let source = match app.withdraw.source {
         WithdrawAccountKind::Main => "main",
         WithdrawAccountKind::Trader => "trader",
         WithdrawAccountKind::Recovery => "recovery",
+        WithdrawAccountKind::Bridge => "bridge",
     };
     let destination = match app.withdraw.destination {
         WithdrawDestinationKind::Main => "main",
-        WithdrawDestinationKind::Trader => "trader",
-        WithdrawDestinationKind::Recovery => "recovery",
+        WithdrawDestinationKind::Trader => {
+            if is_icp_asset {
+                "trader"
+            } else {
+                "trader (ICP-only)"
+            }
+        }
+        WithdrawDestinationKind::Recovery => {
+            if is_icp_asset {
+                "recovery"
+            } else {
+                "recovery (ICP-only)"
+            }
+        }
+        WithdrawDestinationKind::Bridge => "bridge",
         WithdrawDestinationKind::Manual => "manual",
     };
 
-    let asset_label = app
-        .withdraw_assets
-        .get(app.withdraw.asset_idx)
+    let asset_label = selected_asset
         .map(|a| format!("{}:{}", a.chain, a.symbol))
         .unwrap_or_else(|| "-".to_string());
 
@@ -269,7 +294,7 @@ fn draw_withdraw(f: &mut Frame<'_>, area: Rect, app: &App) {
     }
 
     let table = Table::new(rows, [Constraint::Length(14), Constraint::Min(0)])
-        .block(Block::default().borders(Borders::ALL).title("Withdraw (ICP-only)"))
+        .block(Block::default().borders(Borders::ALL).title("Withdraw"))
         .header(
             Row::new(vec![Cell::new("Field"), Cell::new("Value")]).style(Style::default().add_modifier(Modifier::BOLD)),
         );
@@ -278,6 +303,28 @@ fn draw_withdraw(f: &mut Frame<'_>, area: Rect, app: &App) {
     footer_lines.push(Line::from(
         "Controls: ↑/↓ select · ←/→ change · Enter edit/submit · d deposit · Esc close/cancel",
     ));
+    if !is_icp_asset {
+        footer_lines.push(Line::from(
+            "Destination options for EVM assets: main, bridge, or manual (0x...)",
+        ));
+    }
+
+    footer_lines.push(Line::from(""));
+    footer_lines.push(Line::from("Last withdraw result:"));
+    if let Some(res) = &app.withdraw.last_result {
+        match res {
+            Ok(tx) => footer_lines.push(Line::from(Span::styled(
+                format!("  ok: {}", tx),
+                Style::default().fg(Color::Green),
+            ))),
+            Err(e) => footer_lines.push(Line::from(Span::styled(
+                format!("  error: {}", e),
+                Style::default().fg(Color::Red),
+            ))),
+        }
+    } else {
+        footer_lines.push(Line::from("  -"));
+    }
 
     // Show MEXC deposit address for the selected withdraw asset (if available).
     if let Some(asset) = app.withdraw_assets.get(app.withdraw.asset_idx) {
@@ -326,22 +373,11 @@ fn draw_withdraw(f: &mut Frame<'_>, area: Rect, app: &App) {
             Style::default().fg(Color::Yellow),
         )));
     }
-    if let Some(res) = &app.withdraw.last_result {
-        match res {
-            Ok(tx) => footer_lines.push(Line::from(Span::styled(
-                format!("Last result: ok (tx={})", tx),
-                Style::default().fg(Color::Green),
-            ))),
-            Err(e) => footer_lines.push(Line::from(Span::styled(
-                format!("Last result: error ({})", e),
-                Style::default().fg(Color::Red),
-            ))),
-        }
-    }
+    let help_height = if app.withdraw.last_result.is_some() { 13 } else { 11 };
 
     let layout = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(0), Constraint::Length(11)])
+        .constraints([Constraint::Min(0), Constraint::Length(help_height)])
         .split(area);
 
     f.render_widget(table, layout[0]);

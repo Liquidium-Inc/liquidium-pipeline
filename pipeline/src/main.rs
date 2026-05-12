@@ -70,23 +70,15 @@ enum Commands {
     // Shows wallet token balances
     Balance,
 
-    // Test MEXC deposit address lookup
-    MexcDepositAddress {
-        // Asset symbol (e.g., ckUSDT, ckBTC)
-        #[arg(long)]
-        asset: String,
-        // Network hint (e.g., ICP, CKUSDT). Defaults to ICP.
-        #[arg(long)]
-        network: Option<String>,
-    },
-
     // Withdraws funds. Without flags, starts the interactive wizard.
     // With flags, performs a non-interactive withdrawal.
     Withdraw {
-        // Source account: "main", "trader", or "recovery" (non-interactive)
+        /// Source account: "main", "trader", "recovery", or "bridge" (non-interactive)
         #[arg(long)]
         source: Option<String>,
-        // Destination: "main", "trader", "recovery", or full Account string (non-interactive)
+        /// Destination:
+        /// - ICP assets: "main", "trader", "recovery", "bridge", or full Account string
+        /// - EVM assets: "main", "bridge", or 0x... address
         #[arg(long)]
         destination: Option<String>,
         // Asset symbol (e.g., "ckUSDT") or "all" (non-interactive)
@@ -201,11 +193,6 @@ async fn main() {
                 eprintln!("Balance check failed: {}", e);
             }
         }
-        Commands::MexcDepositAddress { asset, network } => {
-            if let Err(err) = commands::cex::mexc_deposit_address(&asset, network.as_deref()).await {
-                eprintln!("MEXC deposit address failed: {}", err);
-            }
-        }
         Commands::Withdraw {
             source,
             destination,
@@ -226,7 +213,7 @@ async fn main() {
                     }
                     _ => {
                         eprintln!(
-                            "Missing flags. Required for non-interactive: --source <main|trader|recovery> --destination <main|trader|recovery|ACCOUNT> --asset <SYMBOL|all> --amount <DECIMAL|all>.\nRun without flags to use the interactive wizard."
+                            "Missing flags. Required for non-interactive: --source <main|trader|recovery|bridge> --destination <main|trader|recovery|bridge|ACCOUNT|0xEVM_ADDRESS> --asset <SYMBOL|all> --amount <DECIMAL|all>.\nRun without flags to use the interactive wizard."
                         );
                     }
                 }

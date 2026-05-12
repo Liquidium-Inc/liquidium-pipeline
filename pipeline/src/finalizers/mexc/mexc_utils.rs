@@ -8,7 +8,7 @@ const BPS_PER_RATIO_UNIT: f64 = 10_000.0;
 
 /// One market leg in a routed CEX trade.
 #[derive(Debug, Clone)]
-pub(super) struct TradeLeg {
+pub(crate) struct TradeLeg {
     pub market: String,
     pub side: String,
 }

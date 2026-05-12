@@ -37,13 +37,25 @@ pub struct PipelineContext {
     pub main_service: Arc<BalanceService>,
     pub trader_service: Arc<BalanceService>,
     pub recovery_service: Arc<BalanceService>,
+    pub bridge_service: Arc<BalanceService>,
     pub agent: Arc<Agent>,
     pub main_transfers: Arc<TransferService>,
     pub trader_transfers: Arc<TransferService>,
     pub swap_router: Arc<SwapRouter>,
     pub recovery_transfers: Arc<TransferService>,
+    pub bridge_transfers: Arc<TransferService>,
     pub evm_address: String,
     pub approval_state: Arc<ApprovalState>,
+}
+
+impl PipelineContext {
+    pub fn bridge_balance_service_for_symbol(&self, _symbol: &str) -> Arc<BalanceService> {
+        self.bridge_service.clone()
+    }
+
+    pub fn bridge_transfer_service_for_symbol(&self, _symbol: &str) -> Arc<TransferService> {
+        self.bridge_transfers.clone()
+    }
 }
 
 pub struct PipelineContextBuilder<P: Provider<AnyNetwork>> {
@@ -124,6 +136,15 @@ impl<P: Provider<AnyNetwork> + WalletProvider<AnyNetwork> + Clone + 'static> Pip
             Arc::new(IcpBackendImpl::new(self.ic_agent_trader.ok_or_else(|| {
                 PipelineContextError::Other("missing IC Trader".to_string())
             })?));
+        let bridge_agent = Arc::new(
+            Agent::builder()
+                .with_url(config.ic_url.clone())
+                .with_identity(config.bridge_ic_identity.clone())
+                .with_max_tcp_error_retries(3)
+                .build()
+                .map_err(|e| PipelineContextError::Other(format!("ic agent(bridge) build: {e}")))?,
+        );
+        let icp_backend_bridge = Arc::new(IcpBackendImpl::new(bridge_agent));
 
         // Use provided EVM providers or fail
         let main_provider = self
@@ -133,6 +154,19 @@ impl<P: Provider<AnyNetwork> + WalletProvider<AnyNetwork> + Clone + 'static> Pip
 
         let evm_backend_main = Arc::new(EvmBackendImpl::new(main_provider));
         let evm_backend_trader = evm_backend_main.clone();
+        let bridge_signer: PrivateKeySigner = config
+            .bridge_evm_private_key
+            .parse()
+            .map_err(|e| PipelineContextError::Other(format!("failed parsing bridge evm private key: {e}")))?;
+        let bridge_rpc_url = config
+            .evm_rpc_url
+            .parse()
+            .map_err(|e| PipelineContextError::Other(format!("invalid evm rpc url: {e}")))?;
+        let bridge_provider = ProviderBuilder::new()
+            .network::<AnyNetwork>()
+            .wallet(bridge_signer)
+            .connect_http(bridge_rpc_url);
+        let evm_backend_bridge = Arc::new(EvmBackendImpl::new(bridge_provider));
 
         let registry = Arc::new(match registry_override {
             Some(registry) => registry,
@@ -163,6 +197,7 @@ impl<P: Provider<AnyNetwork> + WalletProvider<AnyNetwork> + Clone + 'static> Pip
         };
 
         let recovery_icp_account = config.get_recovery_account();
+        let bridge_icp_account = config.bridge_ic_account();
 
         let icp_info_main = Arc::new(IcpAccountInfoAdapter::new(icp_backend_main.clone(), main_icp_account));
         let evm_info_main = Arc::new(EvmAccountInfoAdapter::new(evm_backend_main.clone()));
@@ -185,9 +220,18 @@ impl<P: Provider<AnyNetwork> + WalletProvider<AnyNetwork> + Clone + 'static> Pip
         let recovery_accounts: Arc<dyn AccountInfo + Send + Sync> =
             Arc::new(MultiChainAccountInfoRouter::new(icp_info_recovery, evm_info_recovery));
 
+        let icp_info_bridge = Arc::new(IcpAccountInfoAdapter::new(
+            icp_backend_bridge.clone(),
+            bridge_icp_account,
+        ));
+        let evm_info_bridge = Arc::new(EvmAccountInfoAdapter::new(evm_backend_bridge.clone()));
+        let bridge_accounts: Arc<dyn AccountInfo + Send + Sync> =
+            Arc::new(MultiChainAccountInfoRouter::new(icp_info_bridge, evm_info_bridge));
+
         let main_service = BalanceService::new(registry.clone(), main_accounts);
         let trader_service = BalanceService::new(registry.clone(), trader_accounts);
         let recovery_service = BalanceService::new(registry.clone(), recovery_accounts);
+        let bridge_service = BalanceService::new(registry.clone(), bridge_accounts);
 
         // Build transfer adapters and routers
         let icp_transfer_main = Arc::new(IcpTransferAdapter::new(icp_backend_main.clone(), main_icp_account));
@@ -211,6 +255,11 @@ impl<P: Provider<AnyNetwork> + WalletProvider<AnyNetwork> + Clone + 'static> Pip
             evm_transfer_recovery,
         ));
         let recovery_transfers = TransferService::new(registry.clone(), transfer_router_recovery);
+
+        let icp_transfer_bridge = Arc::new(IcpTransferAdapter::new(icp_backend_bridge.clone(), bridge_icp_account));
+        let evm_transfer_bridge = Arc::new(EvmTransferAdapter::new(evm_backend_bridge.clone()));
+        let transfer_router_bridge = Arc::new(MultiChainTransferRouter::new(icp_transfer_bridge, evm_transfer_bridge));
+        let bridge_transfers = TransferService::new(registry.clone(), transfer_router_bridge);
 
         let approval_state = Arc::new(ApprovalState::new());
 
@@ -250,9 +299,11 @@ impl<P: Provider<AnyNetwork> + WalletProvider<AnyNetwork> + Clone + 'static> Pip
             main_service: Arc::new(main_service),
             trader_service: Arc::new(trader_service),
             recovery_service: Arc::new(recovery_service),
+            bridge_service: Arc::new(bridge_service),
             main_transfers: Arc::new(main_transfers),
             trader_transfers: Arc::new(trader_transfers),
             recovery_transfers: Arc::new(recovery_transfers),
+            bridge_transfers: Arc::new(bridge_transfers),
             evm_address,
             approval_state,
             agent: main_agent.clone(),
@@ -374,11 +425,17 @@ mod tests {
         Arc::new(Config {
             liquidator_identity: Arc::new(AnonymousIdentity {}),
             trader_identity: Arc::new(AnonymousIdentity {}),
+            bridge_ic_identity: Arc::new(AnonymousIdentity {}),
             liquidator_principal: Principal::from_text("aaaaa-aa").expect("principal"),
             trader_principal: Principal::from_text("2vxsx-fae").expect("principal"),
             ic_url: "http://localhost:4943".to_string(),
             evm_rpc_url: "http://localhost:8545".to_string(),
             evm_private_key: evm_test_private_key,
+            bridge_evm_private_key: "0x59c6995e998f97a5a0044976f53f58816f2f94f4a7f87b5c6a1f7fbf3f5e6be7".to_string(),
+            bridge_evm_address: "0x1111111111111111111111111111111111111111".to_string(),
+            bridge_ic_owner_principal: Principal::from_text("aaaaa-aa").expect("principal"),
+            bridge_btc_address: "1BoatSLRHtKNngkdXEeobR76b53LETtpyT".to_string(),
+            bridge_cketh_minter_canister: Principal::from_text("sv3dd-oaaaa-aaaar-qacoa-cai").expect("principal"),
             lending_canister: Principal::from_text("aaaaa-aa").expect("principal"),
             export_path: "executions.csv".to_string(),
             buy_bad_debt: false,
@@ -398,6 +455,8 @@ mod tests {
             cex_delay_buffer_bps: 15,
             cex_route_fee_bps: 12,
             cex_force_over_usd_threshold: 0.0,
+            cex_mexc_available_pairs: vec![],
+            cex_mexc_max_hops: 2,
             swapper: crate::config::SwapperMode::Hybrid,
             cex_credentials: HashMap::new(),
             opportunity_account_filter: vec![],

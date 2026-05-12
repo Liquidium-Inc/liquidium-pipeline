@@ -5,6 +5,7 @@ use std::{
 };
 
 use crate::backend::icp_backend::IcpBackend;
+use crate::backend::icp_backend_helpers::icrc1_balance_with_context;
 use crate::crypto::derivation::derive_evm_private_key;
 use async_trait::async_trait;
 use liquidium_pipeline_core::{
@@ -95,11 +96,8 @@ where
     async fn sync_balance(&self, token: &ChainToken) -> Result<ChainTokenAmount, String> {
         match token {
             ChainToken::Icp { ledger, symbol, .. } => {
-                let amount = self
-                    .backend
-                    .icrc1_balance(*ledger, self.account())
-                    .await
-                    .map_err(|e| format!("icp get_balance failed: {e}"))?;
+                let amount = icrc1_balance_with_context(self.backend.as_ref(), *ledger, self.account(), "icp get_balance")
+                    .await?;
 
                 let balance = ChainTokenAmount {
                     token: token.clone(),

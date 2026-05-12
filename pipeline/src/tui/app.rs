@@ -23,6 +23,9 @@ pub(super) struct ConfigSummary {
     pub(super) liquidator_principal: String,
     pub(super) trader_principal: String,
     pub(super) evm_address: String,
+    pub(super) bridge_evm_address: String,
+    pub(super) bridge_ic_owner_principal: String,
+    pub(super) bridge_btc_address: String,
     pub(super) swapper_mode: String,
     pub(super) max_dex_slippage_bps: u32,
     pub(super) max_cex_slippage_bps: u32,
@@ -75,6 +78,7 @@ pub(super) struct BalanceRowData {
     pub(super) main: String,
     pub(super) trader: String,
     pub(super) recovery: String,
+    pub(super) bridge: String,
 }
 
 #[derive(Clone, Debug)]
@@ -166,6 +170,7 @@ pub(super) enum WithdrawAccountKind {
     Main,
     Trader,
     Recovery,
+    Bridge,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -173,6 +178,7 @@ pub(super) enum WithdrawDestinationKind {
     Main,
     Trader,
     Recovery,
+    Bridge,
     Manual,
 }
 
@@ -494,6 +500,9 @@ mod tests {
             liquidator_principal: "aaaaa-aa".to_string(),
             trader_principal: "bbbbb-bb".to_string(),
             evm_address: "0x0".to_string(),
+            bridge_evm_address: "0xbridge".to_string(),
+            bridge_ic_owner_principal: "ccccc-cc".to_string(),
+            bridge_btc_address: "bc1qbridge".to_string(),
             swapper_mode: "Hybrid".to_string(),
             max_dex_slippage_bps: 500,
             max_cex_slippage_bps: 200,

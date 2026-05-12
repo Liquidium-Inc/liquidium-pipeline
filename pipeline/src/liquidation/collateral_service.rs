@@ -57,13 +57,13 @@ impl<P: PriceOracle> CollateralServiceTrait for CollateralService<P> {
         // Fetch oracle prices: (raw, decimals)
         let (price_debt_ray, _) = self
             .price_oracle
-            .get_price(&debt_symbol, "USDT")
+            .get_price(&debt_symbol, "USD")
             .await
             .map_err(|e| format!("Could not get debt price: {}", e))?;
 
         let (price_coll_ray, _) = self
             .price_oracle
-            .get_price(&collateral_symbol, "USDT")
+            .get_price(&collateral_symbol, "USD")
             .await
             .map_err(|e| format!("Could not get collateral price: {}", e))?;
 
@@ -169,7 +169,7 @@ impl<P: PriceOracle> CollateralServiceTrait for CollateralService<P> {
             let sym = pos.asset.symbol();
             let (p_ray, _) = self
                 .price_oracle
-                .get_price(&sym, "USDT")
+                .get_price(&sym, "USD")
                 .await
                 .map_err(|e| format!("Could not get price for {}: {}", sym, e))?;
             let dec = pos.asset.decimals();
@@ -192,7 +192,7 @@ impl<P: PriceOracle> CollateralServiceTrait for CollateralService<P> {
             let sym = pos.asset.symbol();
             let (p_ray, _) = self
                 .price_oracle
-                .get_price(&sym, "USDT")
+                .get_price(&sym, "USD")
                 .await
                 .map_err(|e| format!("Could not get price for {}: {}", sym, e))?;
             let dec = pos.asset.decimals();
@@ -268,13 +268,13 @@ mod test {
         // BTC -> USDT = $80,000 with RAY precision (1e27)
         mock_oracle
             .expect_get_price()
-            .with(eq("BTC"), eq("USDT"))
+            .with(eq("BTC"), eq("USD"))
             .returning(|_, _| Ok(((80_000u128 * 10u128.pow(27)).into(), 27)));
 
         // USDT -> USDT = $1.00 with RAY precision (1e27)
         mock_oracle
             .expect_get_price()
-            .with(eq("USDT"), eq("USDT"))
+            .with(eq("USDT"), eq("USD"))
             .returning(|_, _| Ok(((10u128.pow(27)).into(), 27)));
 
         let service = CollateralService::new(Arc::new(mock_oracle));
@@ -337,13 +337,13 @@ mod test {
         // USDT -> USDT = $1.00 with RAY precision (1e27)
         mock_oracle
             .expect_get_price()
-            .with(eq("USDT"), eq("USDT"))
+            .with(eq("USDT"), eq("USD"))
             .return_once(|_, _| Ok(((10u128.pow(27)).into(), 27)));
 
         // BTC -> USDT = $80,000.00 with RAY precision (1e27)
         mock_oracle
             .expect_get_price()
-            .with(eq("BTC"), eq("USDT"))
+            .with(eq("BTC"), eq("USD"))
             .return_once(|_, _| Ok(((80_000u128 * 10u128.pow(27)).into(), 27)));
 
         let service = CollateralService::new(Arc::new(mock_oracle));
@@ -408,13 +408,13 @@ mod test {
         // USDT -> USDT = $1.00 with RAY precision (1e27)
         mock_oracle
             .expect_get_price()
-            .with(eq("USDT"), eq("USDT"))
+            .with(eq("USDT"), eq("USD"))
             .return_once(|_, _| Ok(((10u128.pow(27)).into(), 27)));
 
         // BTC -> USDT = $80,000.00 with RAY precision (1e27)
         mock_oracle
             .expect_get_price()
-            .with(eq("BTC"), eq("USDT"))
+            .with(eq("BTC"), eq("USD"))
             .return_once(|_, _| Ok(((80_000u128 * 10u128.pow(27)).into(), 27)));
 
         let service = CollateralService::new(Arc::new(mock_oracle));
@@ -498,11 +498,11 @@ mod test {
         let mut mock_oracle = MockPriceOracle::new();
         mock_oracle
             .expect_get_price()
-            .with(eq("USDT"), eq("USDT"))
+            .with(eq("USDT"), eq("USD"))
             .returning(|_, _| Ok(((10u128.pow(27)).into(), 27)));
         mock_oracle
             .expect_get_price()
-            .with(eq("BTC"), eq("USDT"))
+            .with(eq("BTC"), eq("USD"))
             .returning(|_, _| Ok(((80_000u128 * 10u128.pow(27)).into(), 27)));
 
         let service = CollateralService::new(Arc::new(mock_oracle));
@@ -595,11 +595,11 @@ mod test {
         let mut mock_oracle = MockPriceOracle::new();
         mock_oracle
             .expect_get_price()
-            .with(eq("USDT"), eq("USDT"))
+            .with(eq("USDT"), eq("USD"))
             .returning(|_, _| Ok(((10u128.pow(27)).into(), 27)));
         mock_oracle
             .expect_get_price()
-            .with(eq("BTC"), eq("USDT"))
+            .with(eq("BTC"), eq("USD"))
             .returning(|_, _| Ok(((80_000u128 * 10u128.pow(27)).into(), 27)));
 
         let service = CollateralService::new(Arc::new(mock_oracle));

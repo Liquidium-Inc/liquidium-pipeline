@@ -1,11 +1,17 @@
 use super::*;
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use candid::{Nat, Principal};
-use liquidium_pipeline_connectors::backend::cex_backend::{
-    BuyOrderInputMode, DepositAddress, MockCexBackend, OrderBook, OrderBookLevel, SwapFillReport,
+use liquidium_pipeline_connectors::backend::bridge_backend::{
+    BridgeDestination, BridgeStatus, BridgeSubmission, MockBridgeBackend,
 };
+use liquidium_pipeline_connectors::backend::cex_backend::{
+    BuyOrderInputMode, DepositAddress, MockCexBackend, OrderBook, OrderBookLevel, SwapFillReport, WithdrawStatus,
+    WithdrawStatusSnapshot,
+};
+use liquidium_pipeline_core::account::model::ChainAccount;
 use liquidium_pipeline_core::tokens::{chain_token::ChainToken, chain_token_amount::ChainTokenAmount};
 use liquidium_pipeline_core::transfer::actions::MockTransferActions;
 use liquidium_pipeline_core::types::protocol_types::{
@@ -95,6 +101,91 @@ fn make_execution_receipt(liq_id: u128) -> ExecutionReceipt {
         liquidation_result: Some(liq_result),
         status: ExecutionStatus::Success,
         change_received: false,
+    }
+}
+
+fn make_execution_receipt_with_assets(
+    liq_id: u128,
+    collateral_token: ChainToken,
+    debt_token: ChainToken,
+) -> ExecutionReceipt {
+    let liquidation = LiquidationRequest {
+        borrower: Principal::anonymous(),
+        debt_pool_id: Principal::anonymous(),
+        collateral_pool_id: Principal::anonymous(),
+        debt_amount: Nat::from(0u32),
+        receiver_address: Principal::from_text("aaaaa-aa").unwrap(),
+        buy_bad_debt: false,
+    };
+
+    let liq_result = LiquidationResult {
+        id: liq_id,
+        timestamp: 0,
+        amounts: LiquidationAmounts {
+            collateral_received: Nat::from(1_000_000u64),
+            debt_repaid: Nat::from(2_000_000u64),
+        },
+        collateral_asset: AssetType::Unknown,
+        debt_asset: AssetType::Unknown,
+        status: LiquidationStatus::Success,
+        change_tx: TxStatus {
+            tx_id: None,
+            status: TransferStatus::Pending,
+        },
+        collateral_tx: TxStatus {
+            tx_id: None,
+            status: TransferStatus::Pending,
+        },
+    };
+
+    let req = ExecutorRequest {
+        liquidation,
+        swap_args: None,
+        debt_asset: debt_token,
+        collateral_asset: collateral_token,
+        expected_profit: 0,
+        ref_price: Nat::from(0u8),
+        debt_approval_needed: false,
+        min_collateral_amount: Nat::from(0u8),
+    };
+
+    ExecutionReceipt {
+        request: req,
+        liquidation_result: Some(liq_result),
+        status: ExecutionStatus::Success,
+        change_received: false,
+    }
+}
+
+fn ckusdc_token() -> ChainToken {
+    ChainToken::Icp {
+        ledger: Principal::anonymous(),
+        symbol: "ckUSDC".to_string(),
+        decimals: 6,
+        fee: Nat::from(10_000u64),
+    }
+}
+
+fn ckbtc_token() -> ChainToken {
+    ChainToken::Icp {
+        ledger: Principal::anonymous(),
+        symbol: "ckBTC".to_string(),
+        decimals: 8,
+        fee: Nat::from(1_000u64),
+    }
+}
+
+fn bridge_dependencies(backend: Arc<MockBridgeBackend>) -> MexcBridgeDependencies {
+    MexcBridgeDependencies {
+        backend,
+        config: MexcBridgeConfig {
+            bridge_ic_source_account: icrc_ledger_types::icrc1::account::Account {
+                owner: Principal::anonymous(),
+                subaccount: None,
+            },
+            bridge_evm_source_address: "0x2222222222222222222222222222222222222222".to_string(),
+            bridge_btc_source_address: "bc1qbridge000000000000000000000000000000000".to_string(),
+        },
     }
 }
 
@@ -198,6 +289,890 @@ async fn mexc_deposit_phase_a_snapshots_baseline_and_sends_transfer() {
     assert_eq!(state.deposit.deposit_txid.as_deref(), Some("tx-123"));
     assert!(state.deposit.deposit_sent_at_ts.is_some());
     assert!(matches!(state.step, CexStep::DepositPending));
+}
+
+#[tokio::test]
+async fn mexc_deposit_phase_a_uses_evm_destination_for_evm_assets() {
+    let mut backend = MockCexBackend::new();
+    let mut transfers = MockTransferActions::new();
+
+    backend.expect_get_balance().times(1).returning(|asset| {
+        assert_eq!(asset, "USDC");
+        Ok(10.0)
+    });
+
+    backend
+        .expect_get_deposit_address()
+        .times(1)
+        .returning(|asset, network| {
+            assert_eq!(asset, "USDC");
+            assert_eq!(network, "evm-eth");
+            Ok(DepositAddress {
+                asset: "USDC".to_string(),
+                network: "ERC20".to_string(),
+                address: "0x1111111111111111111111111111111111111111".to_string(),
+                tag: None,
+            })
+        });
+
+    transfers
+        .expect_transfer()
+        .times(1)
+        .returning(|token, destination, amount| {
+            assert!(matches!(token, ChainToken::EvmErc20 { symbol, .. } if symbol == "USDC"));
+            match destination {
+                ChainAccount::Evm(address) => {
+                    assert_eq!(address, "0x1111111111111111111111111111111111111111");
+                }
+                other => panic!("expected EVM deposit destination, got {:?}", other),
+            }
+            assert_eq!(amount, Nat::from(1_000_000u64));
+            Ok("tx-evm-123".to_string())
+        });
+
+    let finalizer = MexcFinalizer::new(
+        Arc::new(backend),
+        Arc::new(transfers),
+        Principal::anonymous(),
+        TEST_MAX_SELL_SLIPPAGE_BPS,
+        TEST_CEX_MIN_EXEC_USD,
+        TEST_CEX_SLICE_TARGET_RATIO,
+    );
+
+    let collateral = ChainToken::EvmErc20 {
+        chain: "eth".to_string(),
+        token_address: "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48".to_string(),
+        symbol: "USDC".to_string(),
+        decimals: 6,
+        fee: Nat::from(0u8),
+    };
+    let receipt = make_execution_receipt_with_assets(43, collateral, ckbtc_token());
+    let mut state = finalizer.prepare("43", &receipt).await.expect("prepare should succeed");
+
+    finalizer.deposit(&mut state).await.expect("deposit should succeed");
+
+    assert_eq!(state.deposit.deposit_txid.as_deref(), Some("tx-evm-123"));
+    assert!(matches!(state.step, CexStep::DepositPending));
+}
+
+#[tokio::test]
+async fn mexc_deposit_phase_a_rejects_invalid_evm_deposit_address() {
+    let mut backend = MockCexBackend::new();
+    let mut transfers = MockTransferActions::new();
+
+    backend.expect_get_balance().times(1).returning(|_asset| Ok(10.0));
+    backend
+        .expect_get_deposit_address()
+        .times(1)
+        .returning(|_asset, _network| {
+            Ok(DepositAddress {
+                asset: "USDC".to_string(),
+                network: "ERC20".to_string(),
+                address: "not-an-evm-address".to_string(),
+                tag: None,
+            })
+        });
+    transfers.expect_transfer().times(0);
+
+    let finalizer = MexcFinalizer::new(
+        Arc::new(backend),
+        Arc::new(transfers),
+        Principal::anonymous(),
+        TEST_MAX_SELL_SLIPPAGE_BPS,
+        TEST_CEX_MIN_EXEC_USD,
+        TEST_CEX_SLICE_TARGET_RATIO,
+    );
+
+    let collateral = ChainToken::EvmErc20 {
+        chain: "eth".to_string(),
+        token_address: "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48".to_string(),
+        symbol: "USDC".to_string(),
+        decimals: 6,
+        fee: Nat::from(0u8),
+    };
+    let receipt = make_execution_receipt_with_assets(44, collateral, ckbtc_token());
+    let mut state = finalizer.prepare("44", &receipt).await.expect("prepare should succeed");
+
+    let err = finalizer.deposit(&mut state).await.expect_err("deposit should fail");
+    assert!(err.contains("invalid MEXC EVM deposit address"));
+}
+
+#[test]
+fn mexc_bridge_planner_keeps_direct_path_when_no_bridge_route_matches() {
+    let finalizer = MexcFinalizer::new(
+        Arc::new(MockCexBackend::new()),
+        Arc::new(MockTransferActions::new()),
+        Principal::anonymous(),
+        TEST_MAX_SELL_SLIPPAGE_BPS,
+        TEST_CEX_MIN_EXEC_USD,
+        TEST_CEX_SLICE_TARGET_RATIO,
+    )
+    .with_bridge_dependencies(bridge_dependencies(Arc::new(MockBridgeBackend::new())));
+
+    let debt_token = ChainToken::Icp {
+        ledger: Principal::anonymous(),
+        symbol: "ckUSDT".to_string(),
+        decimals: 6,
+        fee: Nat::from(10_000u64),
+    };
+
+    let plan = finalizer.resolve_bridge_plan_for_assets(&ckbtc_token(), &debt_token);
+    assert!(!plan.deposit.bridge_required);
+    assert_eq!(plan.deposit.cex_asset, "ckBTC");
+    assert_eq!(plan.deposit.cex_network, "ICP");
+    assert!(!plan.withdraw.bridge_required);
+    assert_eq!(plan.withdraw.cex_asset, "ckUSDT");
+    assert_eq!(plan.withdraw.cex_network, "ICP");
+}
+
+#[test]
+fn mexc_bridge_planner_uses_bridge_fallback_for_ckusdc_deposit() {
+    let finalizer = MexcFinalizer::new(
+        Arc::new(MockCexBackend::new()),
+        Arc::new(MockTransferActions::new()),
+        Principal::anonymous(),
+        TEST_MAX_SELL_SLIPPAGE_BPS,
+        TEST_CEX_MIN_EXEC_USD,
+        TEST_CEX_SLICE_TARGET_RATIO,
+    )
+    .with_bridge_dependencies(bridge_dependencies(Arc::new(MockBridgeBackend::new())));
+
+    let plan = finalizer.resolve_bridge_plan_for_assets(&ckusdc_token(), &ckbtc_token());
+    assert!(plan.deposit.bridge_required);
+    assert_eq!(plan.deposit.cex_asset, "USDC");
+    assert_eq!(plan.deposit.cex_network, "ETH");
+    assert!(!plan.withdraw.bridge_required);
+    assert_eq!(plan.withdraw.cex_asset, "ckBTC");
+}
+
+#[test]
+fn mexc_bridge_planner_translates_ckusdc_symbol_both_directions() {
+    let finalizer = MexcFinalizer::new(
+        Arc::new(MockCexBackend::new()),
+        Arc::new(MockTransferActions::new()),
+        Principal::anonymous(),
+        TEST_MAX_SELL_SLIPPAGE_BPS,
+        TEST_CEX_MIN_EXEC_USD,
+        TEST_CEX_SLICE_TARGET_RATIO,
+    )
+    .with_bridge_dependencies(bridge_dependencies(Arc::new(MockBridgeBackend::new())));
+
+    let plan = finalizer.resolve_bridge_plan_for_assets(&ckusdc_token(), &ckusdc_token());
+    assert!(plan.deposit.bridge_required);
+    assert_eq!(plan.deposit.cex_asset, "USDC");
+    assert_eq!(plan.deposit.cex_network, "ETH");
+    assert!(plan.withdraw.bridge_required);
+    assert_eq!(plan.withdraw.cex_asset, "USDC");
+    assert_eq!(plan.withdraw.cex_network, "ETH");
+}
+
+#[tokio::test]
+async fn mexc_deposit_bridge_submit_resume_and_complete() {
+    let mut cex = MockCexBackend::new();
+    let mut bridge = MockBridgeBackend::new();
+    let mut transfers = MockTransferActions::new();
+
+    let balance_calls = Arc::new(std::sync::Mutex::new(0u8));
+    let balance_calls_clone = balance_calls.clone();
+    cex.expect_get_balance().times(2).returning(move |asset| {
+        assert_eq!(asset, "USDC");
+        let mut guard = balance_calls_clone.lock().expect("mutex");
+        *guard += 1;
+        if *guard == 1 { Ok(10.0) } else { Ok(100.0) }
+    });
+
+    cex.expect_get_deposit_address().times(1).returning(|asset, network| {
+        assert_eq!(asset, "USDC");
+        assert_eq!(network, "ETH");
+        Ok(DepositAddress {
+            asset: "USDC".to_string(),
+            network: "ETH".to_string(),
+            address: "0x1111111111111111111111111111111111111111".to_string(),
+            tag: None,
+        })
+    });
+
+    transfers
+        .expect_transfer()
+        .times(1)
+        .returning(|_token, _to, _amount| Ok("tx-bridge-fund".to_string()));
+
+    bridge.expect_get_source_balance().times(0);
+
+    bridge.expect_submit_bridge().times(1).returning(|request| {
+        assert_eq!(request.asset, "ckUSDC");
+        assert_eq!(request.source_chain, "ICP");
+        assert_eq!(request.target_asset, "USDC");
+        assert!((request.amount - 0.92).abs() < 1e-9);
+        match request.destination {
+            BridgeDestination::EvmAddress(_) => {}
+            other => panic!("unexpected bridge destination: {:?}", other),
+        }
+        Ok(BridgeSubmission {
+            bridge_id: "bridge-deposit-1".to_string(),
+        })
+    });
+
+    let status_calls = Arc::new(std::sync::Mutex::new(0u8));
+    let status_calls_clone = status_calls.clone();
+    bridge.expect_get_bridge_status().times(2).returning(move |bridge_id| {
+        assert_eq!(bridge_id, "bridge-deposit-1");
+        let mut guard = status_calls_clone.lock().expect("mutex");
+        *guard += 1;
+        if *guard == 1 {
+            Ok(BridgeStatus::Pending)
+        } else {
+            Ok(BridgeStatus::Completed)
+        }
+    });
+
+    let finalizer = MexcFinalizer::new(
+        Arc::new(cex),
+        Arc::new(transfers),
+        Principal::anonymous(),
+        TEST_MAX_SELL_SLIPPAGE_BPS,
+        TEST_CEX_MIN_EXEC_USD,
+        TEST_CEX_SLICE_TARGET_RATIO,
+    )
+    .with_bridge_dependencies(bridge_dependencies(Arc::new(bridge)));
+
+    let receipt = make_execution_receipt_with_assets(7, ckusdc_token(), ckbtc_token());
+    let mut state = finalizer.prepare("7", &receipt).await.expect("prepare should succeed");
+    assert!(state.deposit.bridge.deposit_bridge_required);
+
+    finalizer
+        .deposit(&mut state)
+        .await
+        .expect("first bridged deposit call should submit");
+    assert!(matches!(state.step, CexStep::DepositPending));
+    assert_eq!(
+        state.deposit.bridge.deposit_bridge_id.as_deref(),
+        Some("bridge-deposit-1")
+    );
+
+    finalizer
+        .deposit(&mut state)
+        .await
+        .expect("second bridged deposit call should poll pending");
+    assert!(matches!(state.step, CexStep::DepositPending));
+
+    finalizer
+        .deposit(&mut state)
+        .await
+        .expect("third bridged deposit call should complete");
+    assert!(matches!(state.step, CexStep::Trade));
+    assert!(state.deposit.bridge.deposit_bridge_submitted_at_ts.is_some());
+    assert!(state.deposit.bridge.deposit_bridge_polled_at_ts.is_some());
+}
+
+#[tokio::test]
+async fn mexc_deposit_bridge_reserves_reverse_bridge_approval_fee_in_trade_amount() {
+    let mut cex = MockCexBackend::new();
+    let mut bridge = MockBridgeBackend::new();
+    let mut transfers = MockTransferActions::new();
+
+    cex.expect_get_balance().times(1).returning(|asset| {
+        assert_eq!(asset, "USDC");
+        Ok(10.0)
+    });
+
+    cex.expect_get_deposit_address().times(1).returning(|asset, network| {
+        assert_eq!(asset, "USDC");
+        assert_eq!(network, "ETH");
+        Ok(DepositAddress {
+            asset: "USDC".to_string(),
+            network: "ETH".to_string(),
+            address: "0x1111111111111111111111111111111111111111".to_string(),
+            tag: None,
+        })
+    });
+
+    transfers
+        .expect_transfer()
+        .times(1)
+        .returning(|_token, _to, _amount| Ok("tx-bridge-fund".to_string()));
+
+    bridge.expect_get_source_balance().times(0);
+
+    bridge.expect_submit_bridge().times(1).returning(move |request| {
+        assert!(
+            (request.amount - 0.92).abs() < 1e-9,
+            "unexpected amount {}",
+            request.amount
+        );
+        Ok(BridgeSubmission {
+            bridge_id: "bridge-deposit-2".to_string(),
+        })
+    });
+
+    let finalizer = MexcFinalizer::new(
+        Arc::new(cex),
+        Arc::new(transfers),
+        Principal::anonymous(),
+        TEST_MAX_SELL_SLIPPAGE_BPS,
+        TEST_CEX_MIN_EXEC_USD,
+        TEST_CEX_SLICE_TARGET_RATIO,
+    )
+    .with_bridge_dependencies(bridge_dependencies(Arc::new(bridge)));
+
+    let receipt = make_execution_receipt_with_assets(8, ckusdc_token(), ckbtc_token());
+    let mut state = finalizer.prepare("8", &receipt).await.expect("prepare should succeed");
+    assert!(state.deposit.bridge.deposit_bridge_required);
+
+    finalizer
+        .deposit(&mut state)
+        .await
+        .expect("bridged deposit call should reserve reverse bridge approval fee before sizing trade");
+
+    assert!(matches!(state.step, CexStep::DepositPending));
+    assert_eq!(
+        state.deposit.bridge.deposit_bridge_id.as_deref(),
+        Some("bridge-deposit-2")
+    );
+    assert!((state.trade.trade_next_amount_in.unwrap_or_default() - 0.92).abs() < 1e-9);
+}
+
+#[tokio::test]
+async fn mexc_deposit_bridge_does_not_wait_on_source_funding_snapshot() {
+    let mut cex = MockCexBackend::new();
+    let mut bridge = MockBridgeBackend::new();
+    let mut transfers = MockTransferActions::new();
+
+    cex.expect_get_balance().times(1).returning(|asset| {
+        assert_eq!(asset, "USDC");
+        Ok(10.0)
+    });
+
+    cex.expect_get_deposit_address().times(1).returning(|asset, network| {
+        assert_eq!(asset, "USDC");
+        assert_eq!(network, "ETH");
+        Ok(DepositAddress {
+            asset: "USDC".to_string(),
+            network: "ETH".to_string(),
+            address: "0x1111111111111111111111111111111111111111".to_string(),
+            tag: None,
+        })
+    });
+
+    transfers
+        .expect_transfer()
+        .times(1)
+        .returning(|_token, _to, _amount| Ok("tx-bridge-fund-wait".to_string()));
+
+    bridge.expect_get_source_balance().times(0);
+    bridge.expect_submit_bridge().times(1).returning(|request| {
+        assert_eq!(request.asset, "ckUSDC");
+        assert_eq!(request.source_chain, "ICP");
+        assert!((request.amount - 0.92).abs() < 1e-9);
+        Ok(BridgeSubmission {
+            bridge_id: "bridge-deposit-funding".to_string(),
+        })
+    });
+    bridge.expect_get_bridge_status().times(0);
+
+    let finalizer = MexcFinalizer::new(
+        Arc::new(cex),
+        Arc::new(transfers),
+        Principal::anonymous(),
+        TEST_MAX_SELL_SLIPPAGE_BPS,
+        TEST_CEX_MIN_EXEC_USD,
+        TEST_CEX_SLICE_TARGET_RATIO,
+    )
+    .with_bridge_dependencies(bridge_dependencies(Arc::new(bridge)));
+
+    let receipt = make_execution_receipt_with_assets(81, ckusdc_token(), ckbtc_token());
+    let mut state = finalizer.prepare("81", &receipt).await.expect("prepare should succeed");
+    assert!(state.deposit.bridge.deposit_bridge_required);
+
+    finalizer
+        .deposit(&mut state)
+        .await
+        .expect("bridged deposit should submit without source funding preflight wait");
+
+    assert!(matches!(state.step, CexStep::DepositPending));
+    assert_eq!(state.deposit.deposit_txid.as_deref(), Some("tx-bridge-fund-wait"));
+    assert_eq!(
+        state.deposit.bridge.deposit_bridge_id.as_deref(),
+        Some("bridge-deposit-funding")
+    );
+}
+
+#[tokio::test]
+async fn mexc_withdraw_bridge_submit_resume_complete_and_idempotent() {
+    let mut cex = MockCexBackend::new();
+    let mut bridge = MockBridgeBackend::new();
+    let transfers = MockTransferActions::new();
+    let liquidator = Principal::management_canister();
+
+    cex.expect_withdraw()
+        .times(1)
+        .returning(|asset, network, address, amount| {
+            assert_eq!(asset, "USDC");
+            assert_eq!(network, "ETH");
+            assert_eq!(address, "0x2222222222222222222222222222222222222222");
+            assert!(amount > 0.0);
+            Ok(liquidium_pipeline_connectors::backend::cex_backend::WithdrawalReceipt {
+                asset: asset.to_string(),
+                network: network.to_string(),
+                amount,
+                txid: Some("cex-tx-1".to_string()),
+                internal_id: Some("withdraw-1".to_string()),
+            })
+        });
+
+    let withdraw_status_calls = Arc::new(std::sync::Mutex::new(0u8));
+    let withdraw_status_calls_clone = withdraw_status_calls.clone();
+    cex.expect_get_withdraw_status_snapshot_by_id()
+        .times(2)
+        .returning(move |coin, withdraw_id| {
+            assert_eq!(coin, "USDC");
+            assert_eq!(withdraw_id, "withdraw-1");
+            let mut guard = withdraw_status_calls_clone.lock().expect("mutex");
+            *guard += 1;
+            if *guard == 1 {
+                Ok(WithdrawStatusSnapshot {
+                    status: WithdrawStatus::Pending,
+                    txid: None,
+                    transaction_fee: None,
+                })
+            } else {
+                Ok(WithdrawStatusSnapshot {
+                    status: WithdrawStatus::Completed,
+                    txid: Some("0xcompleted".to_string()),
+                    transaction_fee: None,
+                })
+            }
+        });
+
+    bridge
+        .expect_get_source_balance()
+        .times(1)
+        .returning(|asset, chain, address| {
+            assert_eq!(asset, "USDC");
+            assert_eq!(chain, "ETH");
+            assert_eq!(address, "0x2222222222222222222222222222222222222222");
+            Ok(1.5)
+        });
+
+    bridge.expect_submit_bridge().times(1).returning(|request| {
+        assert_eq!(request.asset, "USDC");
+        assert_eq!(request.source_chain, "ETH");
+        assert_eq!(request.target_asset, "ckUSDC");
+        assert_eq!(request.source_address, "0x2222222222222222222222222222222222222222");
+        match request.destination {
+            BridgeDestination::IcpAccount(account) => {
+                assert_eq!(account.owner, Principal::management_canister());
+                assert!(account.subaccount.is_none());
+            }
+            other => panic!("unexpected bridge destination: {:?}", other),
+        }
+        Ok(BridgeSubmission {
+            bridge_id: "bridge-withdraw-1".to_string(),
+        })
+    });
+
+    let bridge_status_calls = Arc::new(std::sync::Mutex::new(0u8));
+    let bridge_status_calls_clone = bridge_status_calls.clone();
+    bridge.expect_get_bridge_status().times(2).returning(move |bridge_id| {
+        assert_eq!(bridge_id, "bridge-withdraw-1");
+        let mut guard = bridge_status_calls_clone.lock().expect("mutex");
+        *guard += 1;
+        if *guard == 1 {
+            Ok(BridgeStatus::Pending)
+        } else {
+            Ok(BridgeStatus::Completed)
+        }
+    });
+
+    let finalizer = MexcFinalizer::new(
+        Arc::new(cex),
+        Arc::new(transfers),
+        liquidator,
+        TEST_MAX_SELL_SLIPPAGE_BPS,
+        TEST_CEX_MIN_EXEC_USD,
+        TEST_CEX_SLICE_TARGET_RATIO,
+    )
+    .with_bridge_dependencies(bridge_dependencies(Arc::new(bridge)));
+
+    let receipt = make_execution_receipt_with_assets(11, ckbtc_token(), ckusdc_token());
+    let mut state = finalizer.prepare("11", &receipt).await.expect("prepare should succeed");
+    assert!(state.withdraw.bridge.withdraw_bridge_required);
+    state.step = CexStep::Withdraw;
+    state.withdraw.size_out = Some(ChainTokenAmount::from_formatted(
+        state.withdraw.withdraw_asset.clone(),
+        1.5,
+    ));
+
+    finalizer
+        .withdraw(&mut state)
+        .await
+        .expect("withdraw submit should succeed");
+    assert!(matches!(state.step, CexStep::WithdrawPending));
+    assert_eq!(state.withdraw.withdraw_id.as_deref(), Some("withdraw-1"));
+
+    finalizer
+        .withdraw(&mut state)
+        .await
+        .expect("withdraw pending poll should keep pending");
+    assert!(matches!(state.step, CexStep::WithdrawPending));
+    assert!(state.withdraw.bridge.withdraw_bridge_id.is_none());
+
+    finalizer
+        .withdraw(&mut state)
+        .await
+        .expect("withdraw completion should submit bridge once");
+    assert!(matches!(state.step, CexStep::WithdrawPending));
+    assert_eq!(
+        state.withdraw.bridge.withdraw_bridge_id.as_deref(),
+        Some("bridge-withdraw-1")
+    );
+
+    finalizer
+        .withdraw(&mut state)
+        .await
+        .expect("bridge pending should keep pending");
+    assert!(matches!(state.step, CexStep::WithdrawPending));
+
+    finalizer
+        .withdraw(&mut state)
+        .await
+        .expect("bridge completion should finish");
+    assert!(matches!(state.step, CexStep::Completed));
+}
+
+#[tokio::test]
+async fn mexc_withdraw_bridge_caps_submit_amount_to_source_balance() {
+    let mut cex = MockCexBackend::new();
+    let mut bridge = MockBridgeBackend::new();
+    let transfers = MockTransferActions::new();
+    let liquidator = Principal::management_canister();
+
+    cex.expect_withdraw()
+        .times(1)
+        .returning(|asset, network, address, amount| {
+            assert_eq!(asset, "USDC");
+            assert_eq!(network, "ETH");
+            assert_eq!(address, "0x2222222222222222222222222222222222222222");
+            assert!((amount - 1.5).abs() < 1e-12);
+            Ok(liquidium_pipeline_connectors::backend::cex_backend::WithdrawalReceipt {
+                asset: asset.to_string(),
+                network: network.to_string(),
+                amount,
+                txid: Some("cex-tx-fee".to_string()),
+                internal_id: Some("withdraw-fee".to_string()),
+            })
+        });
+
+    cex.expect_get_withdraw_status_snapshot_by_id()
+        .times(1)
+        .returning(|coin, withdraw_id| {
+            assert_eq!(coin, "USDC");
+            assert_eq!(withdraw_id, "withdraw-fee");
+            Ok(WithdrawStatusSnapshot {
+                status: WithdrawStatus::Completed,
+                txid: Some("0xcompleted".to_string()),
+                transaction_fee: None,
+            })
+        });
+
+    bridge
+        .expect_get_source_balance()
+        .times(1)
+        .returning(|asset, chain, address| {
+            assert_eq!(asset, "USDC");
+            assert_eq!(chain, "ETH");
+            assert_eq!(address, "0x2222222222222222222222222222222222222222");
+            // Simulate net credit after MEXC withdraw/network fee.
+            Ok(1.4)
+        });
+
+    bridge.expect_submit_bridge().times(1).returning(|request| {
+        assert_eq!(request.asset, "USDC");
+        assert_eq!(request.source_chain, "ETH");
+        assert_eq!(request.target_asset, "ckUSDC");
+        assert!((request.amount - 1.4).abs() < 1e-12);
+        Ok(BridgeSubmission {
+            bridge_id: "bridge-withdraw-fee".to_string(),
+        })
+    });
+    bridge.expect_get_bridge_status().times(0);
+
+    let finalizer = MexcFinalizer::new(
+        Arc::new(cex),
+        Arc::new(transfers),
+        liquidator,
+        TEST_MAX_SELL_SLIPPAGE_BPS,
+        TEST_CEX_MIN_EXEC_USD,
+        TEST_CEX_SLICE_TARGET_RATIO,
+    )
+    .with_bridge_dependencies(bridge_dependencies(Arc::new(bridge)));
+
+    let receipt = make_execution_receipt_with_assets(111, ckbtc_token(), ckusdc_token());
+    let mut state = finalizer
+        .prepare("111", &receipt)
+        .await
+        .expect("prepare should succeed");
+    assert!(state.withdraw.bridge.withdraw_bridge_required);
+    state.step = CexStep::Withdraw;
+    state.withdraw.size_out = Some(ChainTokenAmount::from_formatted(
+        state.withdraw.withdraw_asset.clone(),
+        1.5,
+    ));
+
+    finalizer
+        .withdraw(&mut state)
+        .await
+        .expect("withdraw submit should succeed");
+    assert!(matches!(state.step, CexStep::WithdrawPending));
+    assert_eq!(state.withdraw.withdraw_id.as_deref(), Some("withdraw-fee"));
+    assert!(state.withdraw.bridge.withdraw_bridge_id.is_none());
+
+    finalizer
+        .withdraw(&mut state)
+        .await
+        .expect("bridge submit should cap amount to available source balance");
+    assert!(matches!(state.step, CexStep::WithdrawPending));
+    assert_eq!(
+        state.withdraw.bridge.withdraw_bridge_id.as_deref(),
+        Some("bridge-withdraw-fee")
+    );
+}
+
+#[tokio::test]
+async fn mexc_withdraw_bridge_applies_cex_withdraw_fee_to_submit_amount() {
+    let mut cex = MockCexBackend::new();
+    let mut bridge = MockBridgeBackend::new();
+    let transfers = MockTransferActions::new();
+    let liquidator = Principal::management_canister();
+
+    cex.expect_withdraw()
+        .times(1)
+        .returning(|asset, network, address, amount| {
+            assert_eq!(asset, "USDC");
+            assert_eq!(network, "ETH");
+            assert_eq!(address, "0x2222222222222222222222222222222222222222");
+            assert!((amount - 1.5).abs() < 1e-12);
+            Ok(liquidium_pipeline_connectors::backend::cex_backend::WithdrawalReceipt {
+                asset: asset.to_string(),
+                network: network.to_string(),
+                amount,
+                txid: Some("cex-tx-fee-apply".to_string()),
+                internal_id: Some("withdraw-fee-apply".to_string()),
+            })
+        });
+
+    cex.expect_get_withdraw_status_snapshot_by_id()
+        .times(1)
+        .returning(|coin, withdraw_id| {
+            assert_eq!(coin, "USDC");
+            assert_eq!(withdraw_id, "withdraw-fee-apply");
+            Ok(WithdrawStatusSnapshot {
+                status: WithdrawStatus::Completed,
+                txid: Some("0xcompleted".to_string()),
+                transaction_fee: Some(0.1),
+            })
+        });
+
+    bridge
+        .expect_get_source_balance()
+        .times(1)
+        .returning(|asset, chain, address| {
+            assert_eq!(asset, "USDC");
+            assert_eq!(chain, "ETH");
+            assert_eq!(address, "0x2222222222222222222222222222222222222222");
+            // Available is higher than net amount after fee so this validates fee deduction (not source cap).
+            Ok(1.45)
+        });
+
+    bridge.expect_submit_bridge().times(1).returning(|request| {
+        assert_eq!(request.asset, "USDC");
+        assert_eq!(request.source_chain, "ETH");
+        assert_eq!(request.target_asset, "ckUSDC");
+        assert!((request.amount - 1.4).abs() < 1e-12);
+        Ok(BridgeSubmission {
+            bridge_id: "bridge-withdraw-fee-apply".to_string(),
+        })
+    });
+    bridge.expect_get_bridge_status().times(0);
+
+    let finalizer = MexcFinalizer::new(
+        Arc::new(cex),
+        Arc::new(transfers),
+        liquidator,
+        TEST_MAX_SELL_SLIPPAGE_BPS,
+        TEST_CEX_MIN_EXEC_USD,
+        TEST_CEX_SLICE_TARGET_RATIO,
+    )
+    .with_bridge_dependencies(bridge_dependencies(Arc::new(bridge)));
+
+    let receipt = make_execution_receipt_with_assets(112, ckbtc_token(), ckusdc_token());
+    let mut state = finalizer
+        .prepare("112", &receipt)
+        .await
+        .expect("prepare should succeed");
+    assert!(state.withdraw.bridge.withdraw_bridge_required);
+    state.step = CexStep::Withdraw;
+    state.withdraw.size_out = Some(ChainTokenAmount::from_formatted(
+        state.withdraw.withdraw_asset.clone(),
+        1.5,
+    ));
+
+    finalizer
+        .withdraw(&mut state)
+        .await
+        .expect("withdraw submit should succeed");
+    assert!(matches!(state.step, CexStep::WithdrawPending));
+    assert_eq!(state.withdraw.withdraw_id.as_deref(), Some("withdraw-fee-apply"));
+    assert!(state.withdraw.bridge.withdraw_bridge_id.is_none());
+
+    finalizer
+        .withdraw(&mut state)
+        .await
+        .expect("bridge submit should apply CEX withdraw fee to amount");
+    assert!(matches!(state.step, CexStep::WithdrawPending));
+    assert_eq!(
+        state.withdraw.bridge.withdraw_bridge_id.as_deref(),
+        Some("bridge-withdraw-fee-apply")
+    );
+}
+
+#[tokio::test]
+async fn mexc_non_bridge_withdraw_behavior_unchanged() {
+    let mut cex = MockCexBackend::new();
+    let transfers = MockTransferActions::new();
+
+    cex.expect_withdraw()
+        .times(1)
+        .returning(|asset, network, address, amount| {
+            assert_eq!(asset, "ckUSDT");
+            assert_eq!(network, "ICP");
+            assert_eq!(address, &Principal::anonymous().to_text());
+            assert!(amount > 0.0);
+            Ok(liquidium_pipeline_connectors::backend::cex_backend::WithdrawalReceipt {
+                asset: asset.to_string(),
+                network: network.to_string(),
+                amount,
+                txid: Some("tx-direct".to_string()),
+                internal_id: Some("withdraw-direct".to_string()),
+            })
+        });
+
+    let finalizer = MexcFinalizer::new(
+        Arc::new(cex),
+        Arc::new(transfers),
+        Principal::anonymous(),
+        TEST_MAX_SELL_SLIPPAGE_BPS,
+        TEST_CEX_MIN_EXEC_USD,
+        TEST_CEX_SLICE_TARGET_RATIO,
+    );
+
+    let receipt = make_execution_receipt(13);
+    let mut state = finalizer.prepare("13", &receipt).await.expect("prepare should succeed");
+    state.step = CexStep::Withdraw;
+    state.withdraw.size_out = Some(ChainTokenAmount::from_formatted(
+        state.withdraw.withdraw_asset.clone(),
+        1.0,
+    ));
+
+    finalizer
+        .withdraw(&mut state)
+        .await
+        .expect("direct withdraw should still complete in one call");
+    assert!(matches!(state.step, CexStep::Completed));
+    assert_eq!(state.withdraw.withdraw_id.as_deref(), Some("withdraw-direct"));
+}
+
+#[tokio::test]
+async fn mexc_non_bridge_withdraw_keeps_evm_destination_address() {
+    let mut cex = MockCexBackend::new();
+    let transfers = MockTransferActions::new();
+    let expected_address = "0x1111111111111111111111111111111111111111".to_string();
+
+    cex.expect_withdraw()
+        .times(1)
+        .returning(move |asset, network, address, amount| {
+            assert_eq!(asset, "USDC");
+            assert_eq!(network, "evm-eth");
+            assert_eq!(address, expected_address);
+            assert!(amount > 0.0);
+            Ok(liquidium_pipeline_connectors::backend::cex_backend::WithdrawalReceipt {
+                asset: asset.to_string(),
+                network: network.to_string(),
+                amount,
+                txid: Some("tx-evm-direct".to_string()),
+                internal_id: Some("withdraw-evm-direct".to_string()),
+            })
+        });
+
+    let finalizer = MexcFinalizer::new(
+        Arc::new(cex),
+        Arc::new(transfers),
+        Principal::anonymous(),
+        TEST_MAX_SELL_SLIPPAGE_BPS,
+        TEST_CEX_MIN_EXEC_USD,
+        TEST_CEX_SLICE_TARGET_RATIO,
+    );
+
+    let debt_token = ChainToken::EvmErc20 {
+        chain: "eth".to_string(),
+        token_address: "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48".to_string(),
+        symbol: "USDC".to_string(),
+        decimals: 6,
+        fee: Nat::from(0u8),
+    };
+    let receipt = make_execution_receipt_with_assets(14, ckbtc_token(), debt_token);
+    let mut state = finalizer.prepare("14", &receipt).await.expect("prepare should succeed");
+    state.step = CexStep::Withdraw;
+    state.withdraw.withdraw_address = "0x1111111111111111111111111111111111111111".to_string();
+    state.withdraw.size_out = Some(ChainTokenAmount::from_formatted(
+        state.withdraw.withdraw_asset.clone(),
+        1.0,
+    ));
+
+    finalizer
+        .withdraw(&mut state)
+        .await
+        .expect("direct EVM withdraw should complete");
+    assert!(matches!(state.step, CexStep::Completed));
+    assert_eq!(state.withdraw.withdraw_id.as_deref(), Some("withdraw-evm-direct"));
+}
+
+#[tokio::test]
+async fn mexc_non_bridge_withdraw_rejects_invalid_evm_destination_address() {
+    let mut cex = MockCexBackend::new();
+    let transfers = MockTransferActions::new();
+    cex.expect_withdraw().times(0);
+
+    let finalizer = MexcFinalizer::new(
+        Arc::new(cex),
+        Arc::new(transfers),
+        Principal::anonymous(),
+        TEST_MAX_SELL_SLIPPAGE_BPS,
+        TEST_CEX_MIN_EXEC_USD,
+        TEST_CEX_SLICE_TARGET_RATIO,
+    );
+
+    let debt_token = ChainToken::EvmErc20 {
+        chain: "eth".to_string(),
+        token_address: "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48".to_string(),
+        symbol: "USDC".to_string(),
+        decimals: 6,
+        fee: Nat::from(0u8),
+    };
+    let receipt = make_execution_receipt_with_assets(15, ckbtc_token(), debt_token);
+    let mut state = finalizer.prepare("15", &receipt).await.expect("prepare should succeed");
+    state.step = CexStep::Withdraw;
+    state.withdraw.withdraw_address = "not-an-evm-address".to_string();
+    state.withdraw.size_out = Some(ChainTokenAmount::from_formatted(
+        state.withdraw.withdraw_asset.clone(),
+        1.0,
+    ));
+
+    let err = finalizer
+        .withdraw(&mut state)
+        .await
+        .expect_err("invalid EVM destination should fail");
+    assert!(err.contains("invalid EVM withdraw destination"));
 }
 
 #[tokio::test]
@@ -339,7 +1314,7 @@ async fn mexc_deposit_phase_b_confirms_via_total_free_fallback_after_wait_window
     let mut state = finalizer.prepare("42", &receipt).await.expect("prepare should succeed");
     state.deposit.deposit_txid = Some("tx-123".to_string());
     state.deposit.deposit_balance_before = Some(4.0);
-    state.deposit.deposit_sent_at_ts = Some(crate::utils::now_ts().saturating_sub(10));
+    state.deposit.deposit_sent_at_ts = Some(crate::utils::now_ts().saturating_sub(30));
     state.trade.trade_next_amount_in = Some(10.0);
     state.step = CexStep::DepositPending;
 
@@ -395,6 +1370,15 @@ fn cex_deposit_state_deserialize_defaults_missing_sent_timestamp() {
         deposit_balance_before: Some(5.0),
         deposit_sent_at_ts: Some(123),
         approval_bump_count: Some(2),
+        bridge: crate::finalizers::cex_finalizer::CexDepositBridgeState {
+            deposit_planned_asset: Some("ckBTC".to_string()),
+            deposit_planned_network: Some("ICP".to_string()),
+            deposit_bridge_required: false,
+            deposit_bridge_id: None,
+            deposit_bridge_submitted_at_ts: None,
+            deposit_bridge_polled_at_ts: None,
+            deposit_bridge_destination_snapshot: None,
+        },
     };
 
     let mut value = serde_json::to_value(&original).expect("serialize deposit state");
@@ -402,9 +1386,44 @@ fn cex_deposit_state_deserialize_defaults_missing_sent_timestamp() {
         .as_object_mut()
         .expect("deposit state should serialize to object")
         .remove("deposit_sent_at_ts");
+    value
+        .as_object_mut()
+        .expect("deposit state should serialize to object")
+        .remove("deposit_planned_asset");
+    value
+        .as_object_mut()
+        .expect("deposit state should serialize to object")
+        .remove("deposit_planned_network");
+    value
+        .as_object_mut()
+        .expect("deposit state should serialize to object")
+        .remove("deposit_bridge_required");
+    value
+        .as_object_mut()
+        .expect("deposit state should serialize to object")
+        .remove("deposit_bridge_id");
+    value
+        .as_object_mut()
+        .expect("deposit state should serialize to object")
+        .remove("deposit_bridge_submitted_at_ts");
+    value
+        .as_object_mut()
+        .expect("deposit state should serialize to object")
+        .remove("deposit_bridge_polled_at_ts");
+    value
+        .as_object_mut()
+        .expect("deposit state should serialize to object")
+        .remove("deposit_bridge_destination_snapshot");
 
     let decoded: CexDepositState = serde_json::from_value(value).expect("deserialize legacy payload");
     assert_eq!(decoded.deposit_sent_at_ts, None);
+    assert_eq!(decoded.bridge.deposit_planned_asset, None);
+    assert_eq!(decoded.bridge.deposit_planned_network, None);
+    assert!(!decoded.bridge.deposit_bridge_required);
+    assert_eq!(decoded.bridge.deposit_bridge_id, None);
+    assert_eq!(decoded.bridge.deposit_bridge_submitted_at_ts, None);
+    assert_eq!(decoded.bridge.deposit_bridge_polled_at_ts, None);
+    assert_eq!(decoded.bridge.deposit_bridge_destination_snapshot, None);
 }
 
 #[tokio::test]
@@ -766,6 +1785,9 @@ async fn mexc_trade_marks_dust_and_skips_execution_for_small_residual() {
         decimals: 8,
         fee: Nat::from(1_000u64),
     };
+    state.withdraw.bridge.withdraw_planned_asset = Some("BTC".to_string());
+    state.withdraw.bridge.withdraw_planned_network = Some("ICP".to_string());
+    state.withdraw.bridge.withdraw_bridge_required = false;
 
     finalizer
         .trade(&mut state)
@@ -994,6 +2016,9 @@ async fn mexc_trade_fails_when_realized_slice_slippage_exceeds_cap() {
         decimals: 8,
         fee: Nat::from(1_000u64),
     };
+    state.withdraw.bridge.withdraw_planned_asset = Some("BTC".to_string());
+    state.withdraw.bridge.withdraw_planned_network = Some("ICP".to_string());
+    state.withdraw.bridge.withdraw_bridge_required = false;
 
     let err = finalizer
         .trade(&mut state)
@@ -1088,12 +2113,18 @@ async fn mexc_trade_buy_truncation_mismatch_does_not_false_spike_slippage() {
         decimals: 8,
         fee: Nat::from(1_000u64),
     };
+    state.deposit.bridge.deposit_planned_asset = Some("BTC".to_string());
+    state.deposit.bridge.deposit_planned_network = Some("ICP".to_string());
+    state.deposit.bridge.deposit_bridge_required = false;
     state.withdraw.withdraw_asset = ChainToken::Icp {
         ledger: Principal::anonymous(),
         symbol: "CKBTC".to_string(),
         decimals: 8,
         fee: Nat::from(1_000u64),
     };
+    state.withdraw.bridge.withdraw_planned_asset = Some("CKBTC".to_string());
+    state.withdraw.bridge.withdraw_planned_network = Some("ICP".to_string());
+    state.withdraw.bridge.withdraw_bridge_required = false;
     state.size_in = ChainTokenAmount::from_formatted(state.deposit.deposit_asset.clone(), 0.000185);
     state.trade.trade_next_amount_in = None;
 
@@ -1259,12 +2290,18 @@ async fn mexc_trade_clamp_and_finish_under_consumed_buy_input_single_slice() {
         decimals: 8,
         fee: Nat::from(1_000u64),
     };
+    state.deposit.bridge.deposit_planned_asset = Some("BTC".to_string());
+    state.deposit.bridge.deposit_planned_network = Some("ICP".to_string());
+    state.deposit.bridge.deposit_bridge_required = false;
     state.withdraw.withdraw_asset = ChainToken::Icp {
         ledger: Principal::anonymous(),
         symbol: "CKBTC".to_string(),
         decimals: 8,
         fee: Nat::from(1_000u64),
     };
+    state.withdraw.bridge.withdraw_planned_asset = Some("CKBTC".to_string());
+    state.withdraw.bridge.withdraw_planned_network = Some("ICP".to_string());
+    state.withdraw.bridge.withdraw_bridge_required = false;
     state.size_in = ChainTokenAmount::from_formatted(state.deposit.deposit_asset.clone(), 0.000185);
 
     finalizer.trade(&mut state).await.expect("trade should succeed");
@@ -1346,6 +2383,9 @@ async fn mexc_trade_retries_current_leg_from_original_amount_after_mid_leg_error
         decimals: 8,
         fee: Nat::from(1_000u64),
     };
+    state.withdraw.bridge.withdraw_planned_asset = Some("BTC".to_string());
+    state.withdraw.bridge.withdraw_planned_network = Some("ICP".to_string());
+    state.withdraw.bridge.withdraw_bridge_required = false;
 
     let first_err = finalizer
         .trade(&mut state)
@@ -1434,6 +2474,9 @@ async fn mexc_trade_uses_resume_amount_when_trade_next_amount_in_is_present() {
         decimals: 8,
         fee: Nat::from(1_000u64),
     };
+    state.withdraw.bridge.withdraw_planned_asset = Some("BTC".to_string());
+    state.withdraw.bridge.withdraw_planned_network = Some("ICP".to_string());
+    state.withdraw.bridge.withdraw_bridge_required = false;
     state.trade.trade_next_amount_in = Some(0.0042);
 
     finalizer.trade(&mut state).await.expect("trade should succeed");
@@ -1511,6 +2554,9 @@ async fn mexc_trade_clears_legacy_pending_without_client_id_before_submit() {
         decimals: 8,
         fee: Nat::from(1_000u64),
     };
+    state.withdraw.bridge.withdraw_planned_asset = Some("BTC".to_string());
+    state.withdraw.bridge.withdraw_planned_network = Some("ICP".to_string());
+    state.withdraw.bridge.withdraw_bridge_required = false;
 
     // Simulate legacy WAL residue: pending markers persisted without client id.
     state.trade.trade_pending_market = Some("CKBTC_BTC".to_string());
@@ -1592,6 +2638,9 @@ async fn mexc_trade_clears_stale_pending_from_different_leg_before_submit() {
         decimals: 8,
         fee: Nat::from(1_000u64),
     };
+    state.withdraw.bridge.withdraw_planned_asset = Some("BTC".to_string());
+    state.withdraw.bridge.withdraw_planned_network = Some("ICP".to_string());
+    state.withdraw.bridge.withdraw_bridge_required = false;
 
     state.trade.trade_pending_client_order_id = Some("legacy-pending-id".to_string());
     state.trade.trade_pending_market = Some("OTHER_MARKET".to_string());
@@ -1672,6 +2721,9 @@ async fn mexc_trade_regenerates_invalid_pending_client_order_id() {
         decimals: 8,
         fee: Nat::from(1_000u64),
     };
+    state.withdraw.bridge.withdraw_planned_asset = Some("BTC".to_string());
+    state.withdraw.bridge.withdraw_planned_network = Some("ICP".to_string());
+    state.withdraw.bridge.withdraw_bridge_required = false;
 
     state.trade.trade_pending_client_order_id = Some(invalid_pending_id.to_string());
     state.trade.trade_pending_market = Some("CKBTC_BTC".to_string());
@@ -1754,12 +2806,18 @@ async fn mexc_trade_errors_when_direct_market_cannot_be_resolved() {
         decimals: 8,
         fee: Nat::from(1_000u64),
     };
+    state.deposit.bridge.deposit_planned_asset = Some("BTC".to_string());
+    state.deposit.bridge.deposit_planned_network = Some("ICP".to_string());
+    state.deposit.bridge.deposit_bridge_required = false;
     state.withdraw.withdraw_asset = ChainToken::Icp {
         ledger: Principal::anonymous(),
         symbol: "ETH".to_string(),
         decimals: 8,
         fee: Nat::from(1_000u64),
     };
+    state.withdraw.bridge.withdraw_planned_asset = Some("ETH".to_string());
+    state.withdraw.bridge.withdraw_planned_network = Some("ICP".to_string());
+    state.withdraw.bridge.withdraw_bridge_required = false;
     state.size_in = ChainTokenAmount::from_formatted(state.deposit.deposit_asset.clone(), 0.01);
 
     let err = finalizer
@@ -1767,8 +2825,491 @@ async fn mexc_trade_errors_when_direct_market_cannot_be_resolved() {
         .await
         .expect_err("trade should fail when no direct leg can be resolved");
 
-    assert!(err.contains("could not resolve direct market"));
+    assert!(
+        err.contains("could not resolve direct market") || err.contains("no configured MEXC pairs for hop discovery")
+    );
     assert!(matches!(state.step, CexStep::Trade));
+}
+
+#[tokio::test]
+async fn resolve_trade_legs_for_identical_symbols_is_noop() {
+    let backend = MockCexBackend::new();
+    let transfers = MockTransferActions::new();
+
+    let finalizer = MexcFinalizer::new(
+        Arc::new(backend),
+        Arc::new(transfers),
+        Principal::anonymous(),
+        TEST_MAX_SELL_SLIPPAGE_BPS,
+        TEST_CEX_MIN_EXEC_USD,
+        TEST_CEX_SLICE_TARGET_RATIO,
+    );
+
+    let legs = finalizer
+        .resolve_trade_legs_for_symbols(" usdc ", "USDC")
+        .await
+        .expect("identical symbols should resolve as no-op");
+
+    assert!(legs.is_empty());
+}
+
+#[tokio::test]
+async fn mexc_trade_prefers_direct_route_over_hops_when_both_available() {
+    let mut backend = MockCexBackend::new();
+    let transfers = MockTransferActions::new();
+
+    let observed_markets = Arc::new(std::sync::Mutex::new(HashMap::<String, usize>::new()));
+    let observed_markets_handle = observed_markets.clone();
+    let liquid = OrderBook {
+        bids: vec![OrderBookLevel {
+            price: 100.0,
+            quantity: 1_000.0,
+        }],
+        asks: vec![OrderBookLevel {
+            price: 101.0,
+            quantity: 1_000.0,
+        }],
+    };
+    let empty = OrderBook {
+        bids: vec![],
+        asks: vec![],
+    };
+    backend.expect_get_orderbook().returning(move |market, _limit| {
+        *observed_markets_handle
+            .lock()
+            .unwrap()
+            .entry(market.to_string())
+            .or_insert(0) += 1;
+        match market {
+            "BTC_USDT" => Ok(liquid.clone()),
+            "USDT_BTC" => Ok(empty.clone()),
+            "BTC_USDC" => Ok(liquid.clone()),
+            "USDC_USDT" => Ok(liquid.clone()),
+            _ => Err(format!("unexpected market {}", market)),
+        }
+    });
+
+    backend
+        .expect_execute_swap_detailed_with_options()
+        .times(1)
+        .returning(|market, side, amount_in, _opts| {
+            assert_eq!(market, "BTC_USDT");
+            assert_eq!(side, "sell");
+            Ok(SwapFillReport {
+                input_consumed: amount_in,
+                output_received: amount_in * 100.0,
+            })
+        });
+
+    let finalizer = MexcFinalizer::new(
+        Arc::new(backend),
+        Arc::new(transfers),
+        Principal::anonymous(),
+        TEST_MAX_SELL_SLIPPAGE_BPS,
+        TEST_CEX_MIN_EXEC_USD,
+        TEST_CEX_SLICE_TARGET_RATIO,
+    )
+    .with_route_config(
+        vec!["BTC_USDT".to_string(), "BTC_USDC".to_string(), "USDC_USDT".to_string()],
+        2,
+    );
+
+    let mut receipt = make_execution_receipt(1001);
+    receipt.request.collateral_asset = ChainToken::Icp {
+        ledger: Principal::anonymous(),
+        symbol: "BTC".to_string(),
+        decimals: 8,
+        fee: Nat::from(1_000u64),
+    };
+    receipt.request.debt_asset = ChainToken::Icp {
+        ledger: Principal::anonymous(),
+        symbol: "USDT".to_string(),
+        decimals: 6,
+        fee: Nat::from(1_000u64),
+    };
+
+    let mut state = finalizer
+        .prepare("1001", &receipt)
+        .await
+        .expect("prepare should succeed");
+    state.step = CexStep::Trade;
+
+    finalizer.trade(&mut state).await.expect("trade should succeed");
+
+    assert_eq!(state.trade.trade_leg_total, Some(1));
+    assert_eq!(state.trade.trade_resolved_legs.len(), 1);
+    assert_eq!(state.trade.trade_resolved_legs[0].market, "BTC_USDT");
+    assert_eq!(state.trade.trade_resolved_legs[0].side, "sell");
+    assert!(matches!(state.step, CexStep::Withdraw));
+
+    let markets = observed_markets.lock().unwrap();
+    assert_eq!(markets.get("BTC_USDC").copied().unwrap_or(0), 0);
+    assert_eq!(markets.get("USDC_USDT").copied().unwrap_or(0), 0);
+}
+
+#[tokio::test]
+async fn mexc_trade_uses_configured_hop_route_when_direct_unavailable() {
+    let mut backend = MockCexBackend::new();
+    let transfers = MockTransferActions::new();
+
+    let liquid = OrderBook {
+        bids: vec![OrderBookLevel {
+            price: 1.0,
+            quantity: 1_000_000.0,
+        }],
+        asks: vec![OrderBookLevel {
+            price: 1.001,
+            quantity: 1_000_000.0,
+        }],
+    };
+    let empty = OrderBook {
+        bids: vec![],
+        asks: vec![],
+    };
+    backend
+        .expect_get_orderbook()
+        .returning(move |market, _limit| match market {
+            "BTC_CKUSDT" | "CKUSDT_BTC" => Ok(empty.clone()),
+            "BTC_USDC" | "USDC_USDT" | "CKUSDT_USDT" => Ok(liquid.clone()),
+            _ => Err(format!("unexpected market {}", market)),
+        });
+
+    backend
+        .expect_execute_swap_detailed_with_options()
+        .times(1)
+        .returning(|market, side, amount_in, _opts| {
+            assert_eq!(market, "BTC_USDC");
+            assert_eq!(side, "sell");
+            Ok(SwapFillReport {
+                input_consumed: amount_in,
+                output_received: amount_in,
+            })
+        });
+
+    let finalizer = MexcFinalizer::new(
+        Arc::new(backend),
+        Arc::new(transfers),
+        Principal::anonymous(),
+        TEST_MAX_SELL_SLIPPAGE_BPS,
+        TEST_CEX_MIN_EXEC_USD,
+        TEST_CEX_SLICE_TARGET_RATIO,
+    )
+    .with_route_config(
+        vec![
+            "BTC_USDC".to_string(),
+            "USDC_USDT".to_string(),
+            "CKUSDT_USDT".to_string(),
+        ],
+        2,
+    );
+
+    let mut receipt = make_execution_receipt(1002);
+    receipt.request.collateral_asset = ChainToken::Icp {
+        ledger: Principal::anonymous(),
+        symbol: "BTC".to_string(),
+        decimals: 8,
+        fee: Nat::from(1_000u64),
+    };
+    receipt.request.debt_asset = ChainToken::Icp {
+        ledger: Principal::anonymous(),
+        symbol: "CKUSDT".to_string(),
+        decimals: 6,
+        fee: Nat::from(1_000u64),
+    };
+
+    let mut state = finalizer
+        .prepare("1002", &receipt)
+        .await
+        .expect("prepare should succeed");
+    state.step = CexStep::Trade;
+
+    finalizer.trade(&mut state).await.expect("trade should succeed");
+
+    assert_eq!(state.trade.trade_leg_total, Some(3));
+    assert_eq!(state.trade.trade_leg_index, Some(1));
+    assert_eq!(state.trade.trade_resolved_legs.len(), 3);
+    assert_eq!(state.trade.trade_resolved_legs[0].market, "BTC_USDC");
+    assert_eq!(state.trade.trade_resolved_legs[1].market, "USDC_USDT");
+    assert_eq!(state.trade.trade_resolved_legs[2].market, "CKUSDT_USDT");
+    assert!(matches!(state.step, CexStep::TradePending));
+}
+
+#[tokio::test]
+async fn mexc_trade_reuses_persisted_route_without_reprobing_direct_markets() {
+    let mut backend = MockCexBackend::new();
+    let transfers = MockTransferActions::new();
+
+    let empty = OrderBook {
+        bids: vec![],
+        asks: vec![],
+    };
+    let liquid = OrderBook {
+        bids: vec![OrderBookLevel {
+            price: 1.0,
+            quantity: 1_000_000.0,
+        }],
+        asks: vec![OrderBookLevel {
+            price: 1.001,
+            quantity: 1_000_000.0,
+        }],
+    };
+
+    backend
+        .expect_get_orderbook()
+        .withf(|market, _| market == "BTC_CKUSDT")
+        .times(1)
+        .returning({
+            let empty = empty.clone();
+            move |_, _| Ok(empty.clone())
+        });
+    backend
+        .expect_get_orderbook()
+        .withf(|market, _| market == "CKUSDT_BTC")
+        .times(1)
+        .returning({
+            let empty = empty.clone();
+            move |_, _| Ok(empty.clone())
+        });
+    backend
+        .expect_get_orderbook()
+        .withf(|market, _| market != "BTC_CKUSDT" && market != "CKUSDT_BTC")
+        .returning(move |market, _limit| match market {
+            "BTC_USDC" | "USDC_USDT" | "CKUSDT_USDT" => Ok(liquid.clone()),
+            _ => Err(format!("unexpected market {}", market)),
+        });
+
+    backend
+        .expect_execute_swap_detailed_with_options()
+        .times(2)
+        .returning(|market, side, amount_in, _opts| {
+            match market {
+                "BTC_USDC" => assert_eq!(side, "sell"),
+                "USDC_USDT" => assert_eq!(side, "sell"),
+                _ => panic!("unexpected market {}", market),
+            }
+            Ok(SwapFillReport {
+                input_consumed: amount_in,
+                output_received: amount_in,
+            })
+        });
+
+    let finalizer = MexcFinalizer::new(
+        Arc::new(backend),
+        Arc::new(transfers),
+        Principal::anonymous(),
+        TEST_MAX_SELL_SLIPPAGE_BPS,
+        TEST_CEX_MIN_EXEC_USD,
+        TEST_CEX_SLICE_TARGET_RATIO,
+    )
+    .with_route_config(
+        vec![
+            "BTC_USDC".to_string(),
+            "USDC_USDT".to_string(),
+            "CKUSDT_USDT".to_string(),
+        ],
+        2,
+    );
+
+    let mut receipt = make_execution_receipt(1003);
+    receipt.request.collateral_asset = ChainToken::Icp {
+        ledger: Principal::anonymous(),
+        symbol: "BTC".to_string(),
+        decimals: 8,
+        fee: Nat::from(1_000u64),
+    };
+    receipt.request.debt_asset = ChainToken::Icp {
+        ledger: Principal::anonymous(),
+        symbol: "CKUSDT".to_string(),
+        decimals: 6,
+        fee: Nat::from(1_000u64),
+    };
+
+    let mut state = finalizer
+        .prepare("1003", &receipt)
+        .await
+        .expect("prepare should succeed");
+    state.step = CexStep::Trade;
+
+    finalizer
+        .trade(&mut state)
+        .await
+        .expect("first leg should resolve and execute");
+    assert_eq!(state.trade.trade_resolved_legs.len(), 3);
+    assert_eq!(state.trade.trade_leg_index, Some(1));
+
+    finalizer
+        .trade(&mut state)
+        .await
+        .expect("second leg should execute using persisted route");
+    assert_eq!(state.trade.trade_leg_index, Some(2));
+    assert_eq!(state.trade.trade_resolved_legs.len(), 3);
+}
+
+#[tokio::test]
+async fn mexc_trade_errors_when_no_hop_route_exists_in_configured_pairs() {
+    let mut backend = MockCexBackend::new();
+    let transfers = MockTransferActions::new();
+
+    let empty = OrderBook {
+        bids: vec![],
+        asks: vec![],
+    };
+    backend
+        .expect_get_orderbook()
+        .returning(move |_market, _limit| Ok(empty.clone()));
+    backend.expect_execute_swap_detailed_with_options().times(0);
+
+    let finalizer = MexcFinalizer::new(
+        Arc::new(backend),
+        Arc::new(transfers),
+        Principal::anonymous(),
+        TEST_MAX_SELL_SLIPPAGE_BPS,
+        TEST_CEX_MIN_EXEC_USD,
+        TEST_CEX_SLICE_TARGET_RATIO,
+    )
+    .with_route_config(vec!["BTC_USDC".to_string(), "USDC_USDT".to_string()], 2);
+
+    let mut receipt = make_execution_receipt(1004);
+    receipt.request.collateral_asset = ChainToken::Icp {
+        ledger: Principal::anonymous(),
+        symbol: "BTC".to_string(),
+        decimals: 8,
+        fee: Nat::from(1_000u64),
+    };
+    receipt.request.debt_asset = ChainToken::Icp {
+        ledger: Principal::anonymous(),
+        symbol: "ETH".to_string(),
+        decimals: 8,
+        fee: Nat::from(1_000u64),
+    };
+
+    let mut state = finalizer
+        .prepare("1004", &receipt)
+        .await
+        .expect("prepare should succeed");
+    state.step = CexStep::Trade;
+
+    let err = finalizer
+        .trade(&mut state)
+        .await
+        .expect_err("trade should fail when no configured hop route exists");
+    assert!(err.contains("no configured hop route"));
+}
+
+#[tokio::test]
+async fn mexc_preview_route_keeps_legacy_special_override_even_with_direct_pair_configured() {
+    let mut backend = MockCexBackend::new();
+    let transfers = MockTransferActions::new();
+
+    let observed_markets = Arc::new(std::sync::Mutex::new(HashMap::<String, usize>::new()));
+    let observed_markets_handle = observed_markets.clone();
+    let liquid = OrderBook {
+        bids: vec![OrderBookLevel {
+            price: 1.0,
+            quantity: 1_000.0,
+        }],
+        asks: vec![OrderBookLevel {
+            price: 1.001,
+            quantity: 1_000.0,
+        }],
+    };
+    backend.expect_get_orderbook().returning(move |market, _limit| {
+        *observed_markets_handle
+            .lock()
+            .unwrap()
+            .entry(market.to_string())
+            .or_insert(0) += 1;
+        match market {
+            "CKBTC_BTC" | "BTC_USDC" | "USDC_USDT" | "CKUSDT_USDT" | "CKBTC_CKUSDT" => Ok(liquid.clone()),
+            _ => Err(format!("unexpected market {}", market)),
+        }
+    });
+
+    let finalizer = MexcFinalizer::new(
+        Arc::new(backend),
+        Arc::new(transfers),
+        Principal::anonymous(),
+        TEST_MAX_SELL_SLIPPAGE_BPS,
+        TEST_CEX_MIN_EXEC_USD,
+        TEST_CEX_SLICE_TARGET_RATIO,
+    )
+    .with_route_config(vec!["CKBTC_CKUSDT".to_string()], 2);
+
+    let receipt = make_execution_receipt(1005);
+    let preview = finalizer.preview_route(&receipt).await.expect("preview should succeed");
+    assert!(preview.is_executable);
+
+    let markets = observed_markets.lock().unwrap();
+    assert_eq!(markets.get("CKBTC_CKUSDT").copied().unwrap_or(0), 0);
+}
+
+#[tokio::test]
+async fn mexc_input_slice_usd_converts_non_hardcoded_quote_via_configured_hops() {
+    let mut backend = MockCexBackend::new();
+    let transfers = MockTransferActions::new();
+
+    let empty = OrderBook {
+        bids: vec![],
+        asks: vec![],
+    };
+    let sol_eth = OrderBook {
+        bids: vec![OrderBookLevel {
+            price: 2.0,
+            quantity: 1_000.0,
+        }],
+        asks: vec![OrderBookLevel {
+            price: 2.1,
+            quantity: 1_000.0,
+        }],
+    };
+    let eth_btc = OrderBook {
+        bids: vec![OrderBookLevel {
+            price: 0.05,
+            quantity: 1_000.0,
+        }],
+        asks: vec![OrderBookLevel {
+            price: 0.051,
+            quantity: 1_000.0,
+        }],
+    };
+    let btc_usdc = OrderBook {
+        bids: vec![OrderBookLevel {
+            price: 70_000.0,
+            quantity: 1_000.0,
+        }],
+        asks: vec![OrderBookLevel {
+            price: 70_100.0,
+            quantity: 1_000.0,
+        }],
+    };
+
+    backend
+        .expect_get_orderbook()
+        .returning(move |market, _limit| match market {
+            "SOL_ETH" => Ok(sol_eth.clone()),
+            "ETH_BTC" => Ok(eth_btc.clone()),
+            "BTC_USDC" => Ok(btc_usdc.clone()),
+            // Direct stable probes that should fail and force hop conversion.
+            "ETH_USDT" | "USDT_ETH" | "ETH_USDC" | "USDC_ETH" | "ETH_CKUSDT" | "CKUSDT_ETH" | "ETH_CKUSDC"
+            | "CKUSDC_ETH" | "ETH_USD" | "USD_ETH" => Ok(empty.clone()),
+            _ => Err(format!("unexpected market {}", market)),
+        });
+
+    let finalizer = MexcFinalizer::new(
+        Arc::new(backend),
+        Arc::new(transfers),
+        Principal::anonymous(),
+        TEST_MAX_SELL_SLIPPAGE_BPS,
+        TEST_CEX_MIN_EXEC_USD,
+        TEST_CEX_SLICE_TARGET_RATIO,
+    )
+    .with_route_config(vec!["ETH_BTC".to_string(), "BTC_USDC".to_string()], 1);
+
+    let usd = finalizer
+        .input_slice_usd("SOL_ETH", "sell", 10.0)
+        .await
+        .expect("USD conversion should succeed");
+    assert!((usd - 70_000.0).abs() < 1e-6);
 }
 
 #[tokio::test]
@@ -2456,6 +3997,7 @@ mod fuzz {
                     decimals: 8,
                     fee: Nat::from(1_000u64),
                 };
+                state.withdraw.bridge.withdraw_planned_asset = Some("BTC".to_string());
 
                 finalizer.trade(&mut state).await.expect("trade should succeed");
 
@@ -2526,6 +4068,7 @@ mod fuzz {
                     decimals: 8,
                     fee: Nat::from(1_000u64),
                 };
+                state.withdraw.bridge.withdraw_planned_asset = Some("BTC".to_string());
 
                 finalizer.trade(&mut state).await.expect("trade should succeed");
 
@@ -2598,6 +4141,7 @@ mod fuzz {
                     decimals: 8,
                     fee: Nat::from(1_000u64),
                 };
+                state.withdraw.bridge.withdraw_planned_asset = Some("BTC".to_string());
 
                 let err = finalizer.trade(&mut state).await.expect_err("trade should fail");
                 assert!(err.contains("slice slippage too high"));
@@ -2681,6 +4225,7 @@ mod fuzz {
                     decimals: 8,
                     fee: Nat::from(1_000u64),
                 };
+                state.withdraw.bridge.withdraw_planned_asset = Some("BTC".to_string());
 
                 finalizer.trade(&mut state).await.expect("trade should succeed");
 

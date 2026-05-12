@@ -1,6 +1,9 @@
+use std::sync::Arc;
+
 use prettytable::{Cell, Row, Table, format};
 use tracing::info;
 
+use futures::future::join_all;
 use liquidium_pipeline_core::tokens::token_registry::TokenRegistryTrait;
 use liquidium_pipeline_core::tokens::{asset_id::AssetId, chain_token_amount::ChainTokenAmount};
 
@@ -8,7 +11,7 @@ use crate::config::ConfigTrait;
 use crate::context::init_context;
 use crate::output::plain_logs_enabled;
 pub async fn funds() -> Result<(), String> {
-    let ctx = init_context().await?;
+    let ctx = Arc::new(init_context().await?);
 
     const HEADER_LABEL_WIDTH: usize = 22;
 
@@ -25,7 +28,7 @@ pub async fn funds() -> Result<(), String> {
         );
         info!("Recovery account holds seized collateral from failed swaps.");
     } else {
-        println!("\n=== Balances (Main | Trader | Recovery) ===");
+        println!("\n=== Balances (Main | Trader | Recovery | Bridge) ===");
         println!(
             "{: <HEADER_LABEL_WIDTH$}: {}",
             "Main ICP principal",
@@ -58,18 +61,28 @@ pub async fn funds() -> Result<(), String> {
         ctx.trader_service.sync_assets(&asset_ids),
         ctx.recovery_service.sync_assets(&asset_ids),
     );
+    let bridge_results = join_all(asset_ids.iter().cloned().map(|asset_id| {
+        let ctx = ctx.clone();
+        async move {
+            let service = ctx.bridge_balance_service_for_symbol(&asset_id.symbol);
+            service.get_balance(&asset_id).await.map(|balance| (asset_id, balance))
+        }
+    }))
+    .await;
 
     if plain_logs {
         for (idx, asset_id) in asset_ids.iter().enumerate() {
             let main_cell = format_balance_result(main_results.get(idx));
             let trader_cell = format_balance_result(trader_results.get(idx));
             let recovery_cell = format_balance_result(recovery_results.get(idx));
+            let bridge_cell = format_balance_result(bridge_results.get(idx));
 
             info!(
                 asset = %asset_id,
                 main = %main_cell,
                 trader = %trader_cell,
                 recovery = %recovery_cell,
+                bridge = %bridge_cell,
                 "Balance row"
             );
         }
@@ -84,18 +97,21 @@ pub async fn funds() -> Result<(), String> {
         Cell::new("Main"),
         Cell::new("Trader"),
         Cell::new("Recovery"),
+        Cell::new("Bridge"),
     ]));
 
     for (idx, asset_id) in asset_ids.iter().enumerate() {
         let main_cell = format_balance_result(main_results.get(idx));
         let trader_cell = format_balance_result(trader_results.get(idx));
         let recovery_cell = format_balance_result(recovery_results.get(idx));
+        let bridge_cell = format_balance_result(bridge_results.get(idx));
 
         table.add_row(Row::new(vec![
             Cell::new(&asset_id.to_string()),
             Cell::new(&main_cell),
             Cell::new(&trader_cell),
             Cell::new(&recovery_cell),
+            Cell::new(&bridge_cell),
         ]));
     }
 

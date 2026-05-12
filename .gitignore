@@ -6,3 +6,5 @@ trader.pem
 key
 .hyper.env
 wal.db
+_key
+key_

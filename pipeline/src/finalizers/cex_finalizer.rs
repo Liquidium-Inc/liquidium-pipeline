@@ -21,6 +21,7 @@ pub enum CexStep {
     Trade,
     TradePending,
     Withdraw,
+    WithdrawPending,
     Completed,
     Failed,
 }
@@ -51,6 +52,13 @@ pub struct CexTradeSlice {
     pub slippage_bps: f64,
 }
 
+/// Persisted resolved route leg for deterministic trade resumes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CexRouteLeg {
+    pub market: String,
+    pub side: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CexDepositState {
     pub deposit_asset: ChainToken,
@@ -60,6 +68,26 @@ pub struct CexDepositState {
     pub deposit_sent_at_ts: Option<i64>,
     #[serde(default)]
     pub approval_bump_count: Option<u32>,
+    #[serde(flatten)]
+    pub bridge: CexDepositBridgeState,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct CexDepositBridgeState {
+    #[serde(default)]
+    pub deposit_planned_asset: Option<String>,
+    #[serde(default)]
+    pub deposit_planned_network: Option<String>,
+    #[serde(default)]
+    pub deposit_bridge_required: bool,
+    #[serde(default)]
+    pub deposit_bridge_id: Option<String>,
+    #[serde(default)]
+    pub deposit_bridge_submitted_at_ts: Option<i64>,
+    #[serde(default)]
+    pub deposit_bridge_polled_at_ts: Option<i64>,
+    #[serde(default)]
+    pub deposit_bridge_destination_snapshot: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -69,6 +97,9 @@ pub struct CexTradeState {
     pub trade_leg_index: Option<u32>,
     /// Total number of legs in the resolved route.
     pub trade_leg_total: Option<u32>,
+    /// Persisted resolved route used to keep retries deterministic.
+    #[serde(default)]
+    pub trade_resolved_legs: Vec<CexRouteLeg>,
     /// Market used by the most recently attempted leg/slice.
     pub trade_last_market: Option<String>,
     /// Side (`buy`/`sell`) used by the most recently attempted leg/slice.
@@ -130,6 +161,26 @@ pub struct CexWithdrawState {
     pub withdraw_id: Option<String>,
     pub withdraw_txid: Option<String>,
     pub size_out: Option<ChainTokenAmount>,
+    #[serde(flatten)]
+    pub bridge: CexWithdrawBridgeState,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct CexWithdrawBridgeState {
+    #[serde(default)]
+    pub withdraw_planned_asset: Option<String>,
+    #[serde(default)]
+    pub withdraw_planned_network: Option<String>,
+    #[serde(default)]
+    pub withdraw_bridge_required: bool,
+    #[serde(default)]
+    pub withdraw_bridge_id: Option<String>,
+    #[serde(default)]
+    pub withdraw_bridge_submitted_at_ts: Option<i64>,
+    #[serde(default)]
+    pub withdraw_bridge_polled_at_ts: Option<i64>,
+    #[serde(default)]
+    pub withdraw_bridge_destination_snapshot: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -267,6 +318,10 @@ impl Finalizer for dyn CexFinalizerLogic {
                     debug!("[cex] 🏦 liq_id={} step=Withdraw", cex_state.liq_id);
                     self.withdraw(&mut cex_state).await
                 }
+                CexStep::WithdrawPending => {
+                    info!("[cex] ⏳ liq_id={} step=WithdrawPending", cex_state.liq_id);
+                    self.withdraw(&mut cex_state).await
+                }
                 CexStep::Completed => {
                     info!("[cex] 🎉 liq_id={} step=Completed", cex_state.liq_id);
                     debug!("[cex] liq_id={} step=Completed (noop)", cex_state.liq_id);
@@ -304,7 +359,7 @@ impl Finalizer for dyn CexFinalizerLogic {
             encode_meta(&mut row_after, &meta)?;
             wal.upsert_result(row_after.clone()).await.map_err(|e| e.to_string())?;
 
-            if matches!(cex_state.step, CexStep::DepositPending) {
+            if matches!(cex_state.step, CexStep::DepositPending | CexStep::WithdrawPending) {
                 break;
             }
         }
@@ -445,10 +500,20 @@ mod tests {
                     deposit_balance_before: None,
                     deposit_sent_at_ts: None,
                     approval_bump_count: None,
+                    bridge: CexDepositBridgeState {
+                        deposit_planned_asset: None,
+                        deposit_planned_network: None,
+                        deposit_bridge_required: false,
+                        deposit_bridge_id: None,
+                        deposit_bridge_submitted_at_ts: None,
+                        deposit_bridge_polled_at_ts: None,
+                        deposit_bridge_destination_snapshot: None,
+                    },
                 },
                 trade: CexTradeState {
                     trade_leg_index: None,
                     trade_leg_total: None,
+                    trade_resolved_legs: Vec::new(),
                     trade_last_market: None,
                     trade_last_side: None,
                     trade_last_amount_in: None,
@@ -476,6 +541,15 @@ mod tests {
                     withdraw_id: None,
                     withdraw_txid: None,
                     size_out: None,
+                    bridge: CexWithdrawBridgeState {
+                        withdraw_planned_asset: None,
+                        withdraw_planned_network: None,
+                        withdraw_bridge_required: false,
+                        withdraw_bridge_id: None,
+                        withdraw_bridge_submitted_at_ts: None,
+                        withdraw_bridge_polled_at_ts: None,
+                        withdraw_bridge_destination_snapshot: None,
+                    },
                 },
             })
         }
@@ -571,10 +645,20 @@ mod tests {
                     deposit_balance_before: None,
                     deposit_sent_at_ts: None,
                     approval_bump_count: None,
+                    bridge: CexDepositBridgeState {
+                        deposit_planned_asset: None,
+                        deposit_planned_network: None,
+                        deposit_bridge_required: false,
+                        deposit_bridge_id: None,
+                        deposit_bridge_submitted_at_ts: None,
+                        deposit_bridge_polled_at_ts: None,
+                        deposit_bridge_destination_snapshot: None,
+                    },
                 },
                 trade: CexTradeState {
                     trade_leg_index: None,
                     trade_leg_total: None,
+                    trade_resolved_legs: Vec::new(),
                     trade_last_market: None,
                     trade_last_side: None,
                     trade_last_amount_in: None,
@@ -602,6 +686,15 @@ mod tests {
                     withdraw_id: None,
                     withdraw_txid: None,
                     size_out: None,
+                    bridge: CexWithdrawBridgeState {
+                        withdraw_planned_asset: None,
+                        withdraw_planned_network: None,
+                        withdraw_bridge_required: false,
+                        withdraw_bridge_id: None,
+                        withdraw_bridge_submitted_at_ts: None,
+                        withdraw_bridge_polled_at_ts: None,
+                        withdraw_bridge_destination_snapshot: None,
+                    },
                 },
             })
         }
@@ -874,6 +967,7 @@ mod tests {
 
         let mut value = serde_json::to_value(state).expect("serialize state");
         let map = value.as_object_mut().expect("state should serialize to object");
+        map.remove("trade_resolved_legs");
         map.remove("trade_progress_remaining_in");
         map.remove("trade_progress_total_out");
         map.remove("trade_pending_client_order_id");
@@ -885,6 +979,7 @@ mod tests {
         map.remove("trade_unexecutable_residual_in");
 
         let decoded: CexState = serde_json::from_value(value).expect("legacy deserialize should succeed");
+        assert!(decoded.trade.trade_resolved_legs.is_empty());
         assert_eq!(decoded.trade.trade_progress_remaining_in, None);
         assert_eq!(decoded.trade.trade_progress_total_out, None);
         assert_eq!(decoded.trade.trade_pending_client_order_id, None);
@@ -923,6 +1018,7 @@ mod tests {
 
         let mut legacy_value = serde_json::to_value(state).expect("serialize state");
         let map = legacy_value.as_object_mut().expect("state should serialize to object");
+        map.remove("trade_resolved_legs");
         map.remove("trade_progress_remaining_in");
         map.remove("trade_progress_total_out");
         map.remove("trade_pending_client_order_id");
