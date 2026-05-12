@@ -1562,8 +1562,12 @@ mod tests {
             WithdrawStatus::Pending
         );
         assert_eq!(
-            withdraw_status_from_mexc_record("UNKNOWN_STATUS", Some("0xabc"), None),
+            withdraw_status_from_mexc_record("UNKNOWN_STATUS", None, None),
             WithdrawStatus::Unknown
+        );
+        assert_eq!(
+            withdraw_status_from_mexc_record("UNKNOWN_STATUS", Some("0xabc"), None),
+            WithdrawStatus::Completed
         );
     }
 
