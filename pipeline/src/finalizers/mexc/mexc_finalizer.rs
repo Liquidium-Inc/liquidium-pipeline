@@ -921,11 +921,26 @@ where
                 .backend
                 .get_withdraw_status_snapshot_by_id(&planned_asset, &withdraw_id)
                 .await?;
+            debug!(
+                "[mexc] liq_id={} withdraw snapshot: withdraw_id={} status={:?} txid_present={} fee={:?}",
+                state.liq_id,
+                withdraw_id,
+                withdraw_snapshot.status,
+                withdraw_snapshot.txid.as_ref().is_some_and(|tx| !tx.trim().is_empty()),
+                withdraw_snapshot.transaction_fee,
+            );
 
             match withdraw_snapshot.status {
                 WithdrawStatus::Pending | WithdrawStatus::Unknown => {
-                    state.step = CexStep::WithdrawPending;
-                    return Ok(());
+                    if withdraw_snapshot.txid.is_some() {
+                        info!(
+                            "[mexc] liq_id={} withdraw status={:?} but txid is present for withdraw_id={}; proceeding to source-balance bridge preflight",
+                            state.liq_id, withdraw_snapshot.status, withdraw_id
+                        );
+                    } else {
+                        state.step = CexStep::WithdrawPending;
+                        return Ok(());
+                    }
                 }
                 WithdrawStatus::Failed => {
                     return Err(format!(
@@ -940,6 +955,12 @@ where
                     ));
                 }
                 WithdrawStatus::Completed => {}
+            }
+
+            // Keep the txid in state when available so operators can correlate
+            // pending bridge flow with the underlying CEX withdrawal broadcast.
+            if state.withdraw.withdraw_txid.is_none() {
+                state.withdraw.withdraw_txid = withdraw_snapshot.txid.clone();
             }
 
             let final_destination_snapshot = state
