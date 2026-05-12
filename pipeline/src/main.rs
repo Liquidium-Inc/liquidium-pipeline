@@ -256,36 +256,35 @@ fn effective_run_log_file(requested: Option<Option<PathBuf>>, no_log_file: bool)
     }
 }
 
+#[cfg(target_os = "linux")]
 fn infer_tui_log_file(requested: Option<PathBuf>, unit_name: &str) -> Option<PathBuf> {
     if requested.is_some() {
         return requested;
     }
 
-    #[cfg(target_os = "linux")]
-    {
-        match is_systemd_unit_active(unit_name) {
-            Ok(true) => return None,
-            Ok(false) => {
-                let candidate = control_plane::default_log_file_path();
-                if should_infer_tui_log_file(&candidate) {
-                    return Some(candidate);
-                }
-                return None;
-            }
-            Err(err) => {
-                eprintln!(
-                    "Warning: unable to query systemd unit state for '{unit_name}': {err}. Defaulting to journald."
-                );
-                return None;
+    match is_systemd_unit_active(unit_name) {
+        Ok(true) => None,
+        Ok(false) => {
+            let candidate = control_plane::default_log_file_path();
+            if should_infer_tui_log_file(&candidate) {
+                Some(candidate)
+            } else {
+                None
             }
         }
+        Err(err) => {
+            eprintln!("Warning: unable to query systemd unit state for '{unit_name}': {err}. Defaulting to journald.");
+            None
+        }
     }
+}
 
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = unit_name;
+#[cfg(not(target_os = "linux"))]
+fn infer_tui_log_file(requested: Option<PathBuf>, unit_name: &str) -> Option<PathBuf> {
+    if requested.is_some() {
+        return requested;
     }
-
+    let _ = unit_name;
     let candidate = control_plane::default_log_file_path();
     if candidate.is_file() { Some(candidate) } else { None }
 }

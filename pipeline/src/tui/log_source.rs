@@ -32,6 +32,7 @@ enum LogSource {
         unit_name: String,
     },
     FileTail(PathBuf),
+    #[cfg(not(target_os = "linux"))]
     Notice(String),
 }
 
@@ -67,6 +68,7 @@ pub(super) fn start_log_source(
         #[cfg(target_os = "linux")]
         LogSource::Journalctl { unit_name } => spawn_journalctl(ui_tx, unit_name, control_rx),
         LogSource::FileTail(path) => spawn_file_tail(ui_tx, path, control_rx),
+        #[cfg(not(target_os = "linux"))]
         LogSource::Notice(msg) => {
             let _ = ui_tx.send(UiEvent::AppendLogLines(vec![msg]));
         }
@@ -96,6 +98,7 @@ pub(super) fn describe_log_source(unit_name: &str, log_file: Option<&Path>) -> S
         #[cfg(target_os = "linux")]
         LogSource::Journalctl { unit_name } => format!("Log source unit: {}", unit_name),
         LogSource::FileTail(path) => format!("Log source file: {}", path.display()),
+        #[cfg(not(target_os = "linux"))]
         LogSource::Notice(msg) => format!("Log source: {}", msg),
     }
 }
@@ -170,7 +173,6 @@ fn spawn_journalctl(
 ) {
     tokio::spawn(async move {
         let mut oldest_cursor: Option<String> = None;
-        let mut has_more_older = false;
         let mut no_more_notice_sent = false;
 
         if let Some(records) = run_journalctl_batch(&ui_tx, &journal_initial_args(&unit_name), "history").await {
@@ -186,7 +188,7 @@ fn spawn_journalctl(
         {
             oldest_cursor = records.first().and_then(|r| r.cursor.clone());
         }
-        has_more_older = oldest_cursor.is_some();
+        let mut has_more_older = oldest_cursor.is_some();
 
         let follow_task = {
             let follow_ui_tx = ui_tx.clone();
