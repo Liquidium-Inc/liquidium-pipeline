@@ -1,4 +1,8 @@
 use std::sync::Arc;
+use std::{
+    collections::HashSet,
+    sync::Mutex,
+};
 
 use candid::{Encode, Nat, Principal};
 use futures::future::join_all;
@@ -37,6 +41,7 @@ pub struct BasicExecutor<A: PipelineAgent, D: WalStore + Sync + Send> {
     pub lending_canister: Principal,
     pub wal: Arc<D>,
     pub approval_state: Arc<ApprovalState>,
+    low_balance_allowance_warned_ledgers: Mutex<HashSet<Principal>>,
 }
 
 impl<A: PipelineAgent, D: WalStore> BasicExecutor<A, D> {
@@ -53,6 +58,7 @@ impl<A: PipelineAgent, D: WalStore> BasicExecutor<A, D> {
             lending_canister,
             wal,
             approval_state,
+            low_balance_allowance_warned_ledgers: Mutex::new(HashSet::new()),
         }
     }
 
@@ -210,6 +216,9 @@ impl<A: PipelineAgent, D: WalStore> BasicExecutor<A, D> {
             Err(err) => {
                 stats.failed += 1;
                 self.log_startup_allowance_failure(ledger, &err);
+                if is_zero_balance_allowance_error(&err) {
+                    self.mark_low_balance_warning_emitted(ledger);
+                }
                 self.set_zero_allowance_for_startup_failure(ledger);
             }
         }
@@ -275,6 +284,27 @@ impl<A: PipelineAgent, D: WalStore> BasicExecutor<A, D> {
     }
 
     fn log_refresh_allowance_failure(&self, ledger: Principal, err: &str) {
+        if is_zero_balance_allowance_error(err) {
+            if self.mark_low_balance_warning_emitted(ledger) {
+                warn!(
+                    "[executor] allowance refresh failed | ledger={} account={} spender={} err={} (suppressing repeated low-balance warnings for this ledger)",
+                    ledger.to_text(),
+                    self.source_account_text(),
+                    self.spender_account_text(),
+                    err
+                );
+            } else {
+                debug!(
+                    "[executor] allowance refresh skipped (low balance) | ledger={} account={} spender={} err={}",
+                    ledger.to_text(),
+                    self.source_account_text(),
+                    self.spender_account_text(),
+                    err
+                );
+            }
+            return;
+        }
+
         warn!(
             "[executor] allowance refresh failed | ledger={} account={} spender={} err={}",
             ledger.to_text(),
@@ -283,6 +313,19 @@ impl<A: PipelineAgent, D: WalStore> BasicExecutor<A, D> {
             err
         );
     }
+
+    fn mark_low_balance_warning_emitted(&self, ledger: Principal) -> bool {
+        let Ok(mut seen) = self.low_balance_allowance_warned_ledgers.lock() else {
+            return true;
+        };
+        seen.insert(ledger)
+    }
+}
+
+fn is_zero_balance_allowance_error(err: &str) -> bool {
+    err.contains("Approve call canister error")
+        && err.contains("doesn't have enough funds")
+        && err.contains("current balance: 0")
 }
 
 #[cfg(test)]
