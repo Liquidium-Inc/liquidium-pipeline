@@ -921,7 +921,7 @@ where
                 .backend
                 .get_withdraw_status_snapshot_by_id(&planned_asset, &withdraw_id)
                 .await?;
-            debug!(
+            info!(
                 "[mexc] liq_id={} withdraw snapshot: withdraw_id={} status={:?} txid_present={} fee={:?}",
                 state.liq_id,
                 withdraw_id,
