@@ -13,6 +13,8 @@ use liquidium_pipeline_core::types::protocol_types::{
     Asset, LiquidateblePosition, LiquidatebleUser, MAX_LIQUIDATION_RATIO,
 };
 
+const USD_QUOTE_CURRENCY: &str = "USDT";
+
 #[derive(Debug)]
 pub struct LiquidationEstimation {
     pub repaid_debt: Nat,
@@ -57,13 +59,13 @@ impl<P: PriceOracle> CollateralServiceTrait for CollateralService<P> {
         // Fetch oracle prices: (raw, decimals)
         let (price_debt_ray, _) = self
             .price_oracle
-            .get_price(&debt_symbol, "USD")
+            .get_price(&debt_symbol, USD_QUOTE_CURRENCY)
             .await
             .map_err(|e| format!("Could not get debt price: {}", e))?;
 
         let (price_coll_ray, _) = self
             .price_oracle
-            .get_price(&collateral_symbol, "USD")
+            .get_price(&collateral_symbol, USD_QUOTE_CURRENCY)
             .await
             .map_err(|e| format!("Could not get collateral price: {}", e))?;
 
@@ -169,7 +171,7 @@ impl<P: PriceOracle> CollateralServiceTrait for CollateralService<P> {
             let sym = pos.asset.symbol();
             let (p_ray, _) = self
                 .price_oracle
-                .get_price(&sym, "USD")
+                .get_price(&sym, USD_QUOTE_CURRENCY)
                 .await
                 .map_err(|e| format!("Could not get price for {}: {}", sym, e))?;
             let dec = pos.asset.decimals();
@@ -192,7 +194,7 @@ impl<P: PriceOracle> CollateralServiceTrait for CollateralService<P> {
             let sym = pos.asset.symbol();
             let (p_ray, _) = self
                 .price_oracle
-                .get_price(&sym, "USD")
+                .get_price(&sym, USD_QUOTE_CURRENCY)
                 .await
                 .map_err(|e| format!("Could not get price for {}: {}", sym, e))?;
             let dec = pos.asset.decimals();
