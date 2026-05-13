@@ -29,7 +29,7 @@ use crate::stages::{
     simple_strategy::SimpleLiquidationStrategy,
 };
 use crate::swappers::router::SwapRouter;
-use crate::watchdog::{Watchdog, WatchdogEvent};
+use crate::watchdog::{Watchdog, WatchdogEvent, balance_monitor::LowBalanceMonitor};
 use anyhow::Context as _;
 use futures::FutureExt;
 use ic_agent::Agent;
@@ -43,6 +43,7 @@ const LIQUIDATION_CYCLE_TIMEOUT: Duration = Duration::from_secs(300);
 const FINALIZER_STAGE_TIMEOUT: Duration = Duration::from_secs(300);
 const EXPORT_STAGE_TIMEOUT: Duration = Duration::from_secs(20);
 const WATCHDOG_STAGE_TIMEOUT: Duration = Duration::from_secs(10);
+const LOW_BALANCE_MONITOR_STAGE_TIMEOUT: Duration = Duration::from_secs(45);
 const REFRESH_ALLOWANCES_TIMEOUT: Duration = Duration::from_secs(45);
 const SCAN_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(300);
 const PANIC_RECOVERY_DELAY: Duration = Duration::from_secs(1);
@@ -271,6 +272,7 @@ pub(crate) async fn run_daemon_cycle_loop(
     exporter: &Arc<ExportStage>,
     finalizer: &Arc<FinalizeStage<HybridFinalizer<Config>, SqliteWalStore, SimpleProfitCalculator, Agent>>,
     liq_dog: &Arc<dyn Watchdog>,
+    low_balance_monitor: Option<Arc<LowBalanceMonitor>>,
     paused: Arc<AtomicBool>,
     debt_assets: &Vec<String>,
     debt_asset_principals: &[Principal],
@@ -288,6 +290,7 @@ pub(crate) async fn run_daemon_cycle_loop(
             exporter,
             finalizer,
             liq_dog,
+            low_balance_monitor.as_deref(),
             paused.as_ref(),
             debt_assets,
             debt_asset_principals,
@@ -364,6 +367,7 @@ async fn run_single_daemon_cycle(
     exporter: &Arc<ExportStage>,
     finalizer: &Arc<FinalizeStage<HybridFinalizer<Config>, SqliteWalStore, SimpleProfitCalculator, Agent>>,
     liq_dog: &Arc<dyn Watchdog>,
+    low_balance_monitor: Option<&LowBalanceMonitor>,
     paused: &AtomicBool,
     debt_assets: &Vec<String>,
     debt_asset_principals: &[Principal],
@@ -476,6 +480,18 @@ async fn run_single_daemon_cycle(
     )
     .await
     .is_none()
+    {
+        had_timeout = true;
+    }
+
+    if let Some(monitor) = low_balance_monitor
+        && stage_with_timeout(
+            "balance_monitor.low_balance",
+            LOW_BALANCE_MONITOR_STAGE_TIMEOUT,
+            monitor.check_if_due(),
+        )
+        .await
+        .is_none()
     {
         had_timeout = true;
     }

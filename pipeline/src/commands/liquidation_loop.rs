@@ -36,7 +36,11 @@ use crate::{
         settlement_watcher::SettlementWatcher, simple_strategy::SimpleLiquidationStrategy,
     },
     swappers::{mexc::mexc_adapter::MexcClient, router::SwapRouter},
-    watchdog::{WatchdogEvent, account_monitor_watchdog, webhook_watchdog_from_env},
+    watchdog::{
+        WatchdogEvent,
+        balance_monitor::{DEFAULT_LOW_BALANCE_ALERT_COOLDOWN, LowBalanceMonitor, MonitoredBalanceAccount},
+        slack_watchdog_from_env, slack_webhook_configured, webhook_watchdog_from_env,
+    },
 };
 use ic_agent::Agent;
 use liquidium_pipeline_connectors::backend::{
@@ -359,8 +363,34 @@ pub async fn run_liquidation_loop(sock_path: PathBuf) {
     }
     info!(sock_path = %sock_path.display(), "Control plane ready");
 
-    // Setup liquidity monitor
-    let liq_dog = account_monitor_watchdog(Duration::from_secs(5), ctx.config.liquidator_principal);
+    let liq_dog = webhook_watchdog_from_env(Duration::from_secs(300));
+    let low_balance_monitor = if slack_webhook_configured() {
+        let slack = slack_watchdog_from_env(DEFAULT_LOW_BALANCE_ALERT_COOLDOWN);
+        Some(Arc::new(LowBalanceMonitor::new(
+            vec![
+                MonitoredBalanceAccount {
+                    label: "main",
+                    service: ctx.main_service.clone(),
+                },
+                MonitoredBalanceAccount {
+                    label: "trader",
+                    service: ctx.trader_service.clone(),
+                },
+                MonitoredBalanceAccount {
+                    label: "recovery",
+                    service: ctx.recovery_service.clone(),
+                },
+                MonitoredBalanceAccount {
+                    label: "bridge",
+                    service: ctx.bridge_service.clone(),
+                },
+            ],
+            slack,
+        )))
+    } else {
+        None
+    };
+
     // Steady-state operation is delegated to a helper to keep this entrypoint
     // focused on bootstrap wiring and lifecycle boundaries.
     run_daemon_cycle_loop(
@@ -370,6 +400,7 @@ pub async fn run_liquidation_loop(sock_path: PathBuf) {
         &exporter,
         &finalizer,
         &liq_dog,
+        low_balance_monitor,
         paused,
         &debt_assets,
         &debt_asset_principals,
