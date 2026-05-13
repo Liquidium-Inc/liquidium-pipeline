@@ -353,19 +353,34 @@ pub async fn run_liquidation_loop(sock_path: PathBuf) {
     // Shared pause flag controlled by UDS commands.
     // `true` means: do not initiate new liquidations, but keep housekeeping alive.
     let paused = Arc::new(AtomicBool::new(false));
+    let slack_watchdog = if slack_webhook_configured() {
+        Some(slack_watchdog_from_env(DEFAULT_LOW_BALANCE_ALERT_COOLDOWN))
+    } else {
+        None
+    };
     // The helper encapsulates:
     // - persisted paused/running state bootstrap
     // - UDS bind + serve
     // - state persistence on pause/resume transitions
-    if let Err(err) = bootstrap_control_plane(&sock_path, &config.db_path, paused.clone()) {
+    if let Err(err) = bootstrap_control_plane(&sock_path, &config.db_path, paused.clone(), slack_watchdog.clone()) {
         tracing::error!("{}", err);
         return;
     }
     info!(sock_path = %sock_path.display(), "Control plane ready");
 
     let liq_dog = webhook_watchdog_from_env(Duration::from_secs(300));
-    let low_balance_monitor = if slack_webhook_configured() {
-        let slack = slack_watchdog_from_env(DEFAULT_LOW_BALANCE_ALERT_COOLDOWN);
+    if let Some(slack) = slack_watchdog.as_ref() {
+        slack.notify(WatchdogEvent::Lifecycle {
+            state: "started".to_string(),
+            details: format!(
+                "Liquidator started on {}; scanning for liquidation opportunities.",
+                config.ic_url
+            ),
+        })
+        .await;
+    }
+
+    let low_balance_monitor = if let Some(slack) = slack_watchdog.as_ref() {
         Some(Arc::new(LowBalanceMonitor::new(
             vec![
                 MonitoredBalanceAccount {
@@ -385,7 +400,7 @@ pub async fn run_liquidation_loop(sock_path: PathBuf) {
                     service: ctx.bridge_service.clone(),
                 },
             ],
-            slack,
+            slack.clone(),
         )))
     } else {
         None
@@ -400,6 +415,7 @@ pub async fn run_liquidation_loop(sock_path: PathBuf) {
         &exporter,
         &finalizer,
         &liq_dog,
+        slack_watchdog,
         low_balance_monitor,
         paused,
         &debt_assets,

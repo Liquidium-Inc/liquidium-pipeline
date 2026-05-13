@@ -36,6 +36,25 @@ pub enum WatchdogEvent<'a> {
         current: String,
         threshold: String,
     },
+    Lifecycle {
+        state: String,
+        details: String,
+    },
+    LiquidationFinalized {
+        liquidation_id: String,
+        borrower: String,
+        debt_asset: String,
+        collateral_asset: String,
+        status: String,
+        debt_repaid: String,
+        collateral_received: String,
+        swap_output: String,
+        swapper: String,
+        expected_profit: String,
+        realized_profit: String,
+        profit_delta: String,
+        round_trip_secs: String,
+    },
 }
 
 #[async_trait]
@@ -95,6 +114,10 @@ impl Watchdog for WebhookWatchdog {
             WatchdogEvent::BalanceMissing { asset } => format!("bal_missing:{asset}"),
             WatchdogEvent::InsufficientFunds { asset, .. } => format!("insuff:{asset}"),
             WatchdogEvent::LowBalance { account, asset_id, .. } => format!("low_balance:{account}:{asset_id}"),
+            WatchdogEvent::Lifecycle { state, .. } => format!("lifecycle:{state}"),
+            WatchdogEvent::LiquidationFinalized { liquidation_id, status, .. } => {
+                format!("liquidation_finalized:{liquidation_id}:{status}")
+            }
         };
         if !self.should_send(&key).await {
             return;
