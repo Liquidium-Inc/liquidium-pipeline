@@ -233,7 +233,12 @@ fn slack_payload_for_event_with_bot(ev: &WatchdogEvent<'_>, bot_name: &str) -> O
                             {
                                 "type": "mrkdwn",
                                 "text": format!("*Swap output*\n{swap_output}")
-                            },
+                            }
+                        ]
+                    },
+                    {
+                        "type": "section",
+                        "fields": [
                             {
                                 "type": "mrkdwn",
                                 "text": format!("*Swapper*\n{swapper}")

@@ -115,7 +115,9 @@ impl Watchdog for WebhookWatchdog {
             WatchdogEvent::InsufficientFunds { asset, .. } => format!("insuff:{asset}"),
             WatchdogEvent::LowBalance { account, asset_id, .. } => format!("low_balance:{account}:{asset_id}"),
             WatchdogEvent::Lifecycle { state, .. } => format!("lifecycle:{state}"),
-            WatchdogEvent::LiquidationFinalized { liquidation_id, status, .. } => {
+            WatchdogEvent::LiquidationFinalized {
+                liquidation_id, status, ..
+            } => {
                 format!("liquidation_finalized:{liquidation_id}:{status}")
             }
         };

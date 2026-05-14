@@ -168,7 +168,7 @@ fn threshold_for_token_with_overrides(token: &ChainToken, overrides: Option<&str
         "CKUSDT" | "USDT" => "100",
         "CKUSDC" | "USDC" => "100",
         "ICP" => "5",
-        "ETH" => "0.05",
+        "CKETH" | "ETH" => "0.05",
         _ => return None,
     };
 
@@ -320,6 +320,15 @@ mod tests {
         }
     }
 
+    fn icp_token_with_ledger(symbol: &str, decimals: u8, seed: u8) -> ChainToken {
+        ChainToken::Icp {
+            ledger: Principal::self_authenticating(&[seed]),
+            symbol: symbol.to_string(),
+            decimals,
+            fee: Nat::from(10u8),
+        }
+    }
+
     fn registry_with(token: ChainToken) -> Arc<TokenRegistry> {
         let id = token.asset_id();
         Arc::new(TokenRegistry::new(HashMap::from([(id, token)])))
@@ -327,10 +336,7 @@ mod tests {
 
     fn registry_with_tokens(tokens: Vec<ChainToken>) -> Arc<TokenRegistry> {
         Arc::new(TokenRegistry::new(
-            tokens
-                .into_iter()
-                .map(|token| (token.asset_id(), token))
-                .collect(),
+            tokens.into_iter().map(|token| (token.asset_id(), token)).collect(),
         ))
     }
 
@@ -349,26 +355,28 @@ mod tests {
     #[test]
     fn account_symbol_filter_limits_monitored_assets() {
         let registry = registry_with_tokens(vec![
-            icp_token("ckBTC", 8),
+            icp_token_with_ledger("ckBTC", 8, 1),
+            icp_token_with_ledger("ckETH", 18, 2),
             ChainToken::EvmNative {
                 chain: "eth".to_string(),
                 symbol: "ETH".to_string(),
                 decimals: 18,
                 fee: Nat::from(0u8),
             },
-            icp_token("ICP", 8),
+            icp_token_with_ledger("ICP", 8, 3),
         ]);
         let account = MockAccountInfo::new();
         let service = Arc::new(BalanceService::new(registry, Arc::new(account)));
         let monitored = MonitoredBalanceAccount {
             label: "bridge",
             service,
-            only_symbols: Some(vec!["ETH"]),
+            only_symbols: Some(vec!["ETH", "ckETH"]),
         };
 
         let assets = monitored_asset_ids_for_account(&monitored);
-        assert_eq!(assets.len(), 1);
-        assert_eq!(assets[0].symbol, "ETH");
+        let mut symbols: Vec<&str> = assets.iter().map(|asset| asset.symbol.as_str()).collect();
+        symbols.sort_unstable();
+        assert_eq!(symbols, vec!["ETH", "ckETH"]);
     }
 
     #[test]
@@ -391,34 +399,39 @@ mod tests {
             threshold_for_token(&eth).expect("threshold"),
             Nat::from(50_000_000_000_000_000u128)
         );
+
+        let cketh = icp_token("ckETH", 18);
+        assert_eq!(
+            threshold_for_token(&cketh).expect("threshold"),
+            Nat::from(50_000_000_000_000_000u128)
+        );
     }
 
     #[test]
     fn threshold_overrides_are_case_insensitive_and_use_native_units() {
         let ckbtc = icp_token("ckBTC", 8);
-        let threshold = threshold_for_token_with_overrides(&ckbtc, Some("ckbtc=0.002,ICP=10"))
-            .expect("override threshold");
+        let threshold =
+            threshold_for_token_with_overrides(&ckbtc, Some("ckbtc=0.002,ICP=10")).expect("override threshold");
         assert_eq!(threshold, Nat::from(200_000u128));
 
         let icp = icp_token("ICP", 8);
-        let threshold = threshold_for_token_with_overrides(&icp, Some("ckbtc=0.002,icp=10"))
-            .expect("override threshold");
+        let threshold =
+            threshold_for_token_with_overrides(&icp, Some("ckbtc=0.002,icp=10")).expect("override threshold");
         assert_eq!(threshold, Nat::from(1_000_000_000u128));
     }
 
     #[test]
     fn threshold_overrides_can_enable_unknown_symbols() {
         let token = icp_token("DOGE", 8);
-        let threshold = threshold_for_token_with_overrides(&token, Some("DOGE=25"))
-            .expect("unknown symbol override");
+        let threshold = threshold_for_token_with_overrides(&token, Some("DOGE=25")).expect("unknown symbol override");
         assert_eq!(threshold, Nat::from(2_500_000_000u128));
     }
 
     #[test]
     fn invalid_threshold_override_falls_back_to_default() {
         let token = icp_token("ICP", 8);
-        let threshold = threshold_for_token_with_overrides(&token, Some("ICP=not-a-number"))
-            .expect("default threshold");
+        let threshold =
+            threshold_for_token_with_overrides(&token, Some("ICP=not-a-number")).expect("default threshold");
         assert_eq!(threshold, Nat::from(500_000_000u128));
     }
 

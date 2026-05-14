@@ -380,8 +380,7 @@ pub async fn run_liquidation_loop(sock_path: PathBuf) {
         .await;
     }
 
-    let low_balance_monitor = if let Some(slack) = slack_watchdog.as_ref() {
-        Some(Arc::new(LowBalanceMonitor::new(
+    let low_balance_monitor = slack_watchdog.as_ref().map(|slack| Arc::new(LowBalanceMonitor::new(
             vec![
                 MonitoredBalanceAccount {
                     label: "main",
@@ -391,14 +390,11 @@ pub async fn run_liquidation_loop(sock_path: PathBuf) {
                 MonitoredBalanceAccount {
                     label: "bridge",
                     service: ctx.bridge_service.clone(),
-                    only_symbols: Some(vec!["ETH"]),
+                    only_symbols: Some(vec!["ETH", "ckETH"]),
                 },
             ],
             slack.clone(),
-        )))
-    } else {
-        None
-    };
+        )));
 
     // Steady-state operation is delegated to a helper to keep this entrypoint
     // focused on bootstrap wiring and lifecycle boundaries.
