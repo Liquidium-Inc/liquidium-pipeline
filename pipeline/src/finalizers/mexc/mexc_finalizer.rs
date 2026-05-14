@@ -25,6 +25,8 @@ use super::mexc_utils::{
     LIQUIDITY_EPS, SlicePreview, TradeLeg, f64_to_nat, is_usd_stable_symbol, mexc_special_trade_legs,
     parse_market_symbols, simulate_buy_from_asks, simulate_sell_from_bids,
 };
+const WITHDRAW_BRIDGE_SOURCE_BALANCE_TOLERANCE: f64 = LIQUIDITY_EPS;
+
 use crate::{
     finalizers::bridge_planner::BridgePlanner,
     finalizers::cex_finalizer::{
@@ -983,14 +985,16 @@ where
                 .get_source_balance(route.source_asset, route.source_chain, &bridge_source_address)
                 .await?;
 
-            // CEX withdrawals can arrive net of withdrawal/network fees, so bridge only what is
-            // actually available on the configured bridge source account.
-            if source_available <= LIQUIDITY_EPS {
+            // CEX withdrawals can arrive net of withdrawal/network fees; use the reported fee
+            // above to compute the expected net amount, then wait until the bridge source account
+            // actually covers that amount. Do not bridge arbitrary positive residual/dust balances.
+            if source_available + WITHDRAW_BRIDGE_SOURCE_BALANCE_TOLERANCE < bridge_amount {
                 info!(
-                    "[mexc] liq_id={} bridged withdraw waiting for source funding: available={} expected={} source={} route={}@{}->{}",
+                    "[mexc] liq_id={} bridged withdraw waiting for source funding: available={} expected={} tolerance={} source={} route={}@{}->{}",
                     state.liq_id,
                     source_available,
                     bridge_amount,
+                    WITHDRAW_BRIDGE_SOURCE_BALANCE_TOLERANCE,
                     bridge_source_address,
                     route.source_asset,
                     route.source_chain,
@@ -1000,12 +1004,13 @@ where
                 return Ok(());
             }
 
-            if bridge_amount > source_available {
+            if source_available < bridge_amount {
                 info!(
-                    "[mexc] liq_id={} adjusting bridged withdraw amount to available source balance: amount {} -> {} (source={} route={}@{}->{}). This typically reflects CEX withdraw fee/net-credit drift.",
+                    "[mexc] liq_id={} adjusting bridged withdraw amount within source balance tolerance: amount {} -> {} (tolerance={} source={} route={}@{}->{})",
                     state.liq_id,
                     bridge_amount,
                     source_available,
+                    WITHDRAW_BRIDGE_SOURCE_BALANCE_TOLERANCE,
                     bridge_source_address,
                     route.source_asset,
                     route.source_chain,

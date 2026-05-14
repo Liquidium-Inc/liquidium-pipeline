@@ -841,7 +841,7 @@ async fn mexc_withdraw_bridge_submit_resume_complete_and_idempotent() {
 }
 
 #[tokio::test]
-async fn mexc_withdraw_bridge_caps_submit_amount_to_source_balance() {
+async fn mexc_withdraw_bridge_waits_when_source_balance_below_expected_net() {
     let mut cex = MockCexBackend::new();
     let mut bridge = MockBridgeBackend::new();
     let transfers = MockTransferActions::new();
@@ -882,19 +882,11 @@ async fn mexc_withdraw_bridge_caps_submit_amount_to_source_balance() {
             assert_eq!(asset, "USDC");
             assert_eq!(chain, "ETH");
             assert_eq!(address, "0x2222222222222222222222222222222222222222");
-            // Simulate net credit after MEXC withdraw/network fee.
+            // Simulate a stale/dust bridge source balance before the expected withdrawal credit arrives.
             Ok(1.4)
         });
 
-    bridge.expect_submit_bridge().times(1).returning(|request| {
-        assert_eq!(request.asset, "USDC");
-        assert_eq!(request.source_chain, "ETH");
-        assert_eq!(request.target_asset, "ckUSDC");
-        assert!((request.amount - 1.4).abs() < 1e-12);
-        Ok(BridgeSubmission {
-            bridge_id: "bridge-withdraw-fee".to_string(),
-        })
-    });
+    bridge.expect_submit_bridge().times(0);
     bridge.expect_get_bridge_status().times(0);
 
     let finalizer = MexcFinalizer::new(
@@ -930,12 +922,9 @@ async fn mexc_withdraw_bridge_caps_submit_amount_to_source_balance() {
     finalizer
         .withdraw(&mut state)
         .await
-        .expect("bridge submit should cap amount to available source balance");
+        .expect("bridge submit should wait for expected source balance");
     assert!(matches!(state.step, CexStep::WithdrawPending));
-    assert_eq!(
-        state.withdraw.bridge.withdraw_bridge_id.as_deref(),
-        Some("bridge-withdraw-fee")
-    );
+    assert!(state.withdraw.bridge.withdraw_bridge_id.is_none());
 }
 
 #[tokio::test]
