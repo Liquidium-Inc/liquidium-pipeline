@@ -386,18 +386,12 @@ pub async fn run_liquidation_loop(sock_path: PathBuf) {
                 MonitoredBalanceAccount {
                     label: "main",
                     service: ctx.main_service.clone(),
-                },
-                MonitoredBalanceAccount {
-                    label: "trader",
-                    service: ctx.trader_service.clone(),
-                },
-                MonitoredBalanceAccount {
-                    label: "recovery",
-                    service: ctx.recovery_service.clone(),
+                    only_symbols: None,
                 },
                 MonitoredBalanceAccount {
                     label: "bridge",
                     service: ctx.bridge_service.clone(),
+                    only_symbols: Some(vec!["ETH"]),
                 },
             ],
             slack.clone(),

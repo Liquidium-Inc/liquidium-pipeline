@@ -1,5 +1,6 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use std::collections::HashMap;
 
 use candid::Nat;
 use log::{debug, warn};
@@ -21,6 +22,7 @@ pub const DEFAULT_LOW_BALANCE_ALERT_COOLDOWN: Duration = Duration::from_secs(30 
 pub struct MonitoredBalanceAccount {
     pub label: &'static str,
     pub service: Arc<BalanceService>,
+    pub only_symbols: Option<Vec<&'static str>>,
 }
 
 pub struct LowBalanceMonitor {
@@ -64,16 +66,12 @@ impl LowBalanceMonitor {
     }
 
     pub async fn check_now(&self) {
-        let Some(first_account) = self.accounts.first() else {
-            return;
-        };
-
-        let asset_ids = monitored_asset_ids(first_account.service.registry().as_ref());
-        if asset_ids.is_empty() {
-            return;
-        }
-
         for account in &self.accounts {
+            let asset_ids = monitored_asset_ids_for_account(account);
+            if asset_ids.is_empty() {
+                continue;
+            }
+
             let results = account.service.sync_assets(&asset_ids).await;
             for result in results {
                 match result {
@@ -89,6 +87,18 @@ impl LowBalanceMonitor {
             }
         }
     }
+}
+
+fn monitored_asset_ids_for_account(account: &MonitoredBalanceAccount) -> Vec<AssetId> {
+    let mut asset_ids = monitored_asset_ids(account.service.registry().as_ref());
+    if let Some(symbols) = &account.only_symbols {
+        asset_ids.retain(|asset_id| {
+            symbols
+                .iter()
+                .any(|symbol| asset_id.symbol.eq_ignore_ascii_case(symbol))
+        });
+    }
+    asset_ids
 }
 
 pub fn monitored_asset_ids(registry: &dyn TokenRegistryTrait) -> Vec<AssetId> {
@@ -132,7 +142,28 @@ pub fn low_balance_event(
 }
 
 pub fn threshold_for_token(token: &ChainToken) -> Option<Nat> {
-    let threshold = match token.symbol().trim().to_ascii_uppercase().as_str() {
+    let overrides = std::env::var("LOW_BALANCE_THRESHOLDS").ok();
+    threshold_for_token_with_overrides(token, overrides.as_deref())
+}
+
+fn threshold_for_token_with_overrides(token: &ChainToken, overrides: Option<&str>) -> Option<Nat> {
+    let symbol = token.symbol();
+    let normalized_symbol = symbol.trim().to_ascii_uppercase();
+
+    if let Some(overrides) = overrides
+        && let Some(raw_threshold) = parse_threshold_overrides(overrides).get(&normalized_symbol)
+    {
+        match decimal_to_native_units(raw_threshold, token.decimals()) {
+            Some(threshold) => return Some(threshold),
+            None => warn!(
+                "Invalid LOW_BALANCE_THRESHOLDS override for {}: {}; falling back to default if available",
+                symbol,
+                raw_threshold
+            ),
+        }
+    }
+
+    let threshold = match normalized_symbol.as_str() {
         "CKBTC" | "BTC" => "0.001",
         "CKUSDT" | "USDT" => "100",
         "CKUSDC" | "USDC" => "100",
@@ -142,6 +173,20 @@ pub fn threshold_for_token(token: &ChainToken) -> Option<Nat> {
     };
 
     decimal_to_native_units(threshold, token.decimals())
+}
+
+fn parse_threshold_overrides(raw: &str) -> HashMap<String, String> {
+    raw.split(',')
+        .filter_map(|entry| {
+            let (symbol, threshold) = entry.split_once('=')?;
+            let symbol = symbol.trim();
+            let threshold = threshold.trim();
+            if symbol.is_empty() || threshold.is_empty() {
+                return None;
+            }
+            Some((symbol.to_ascii_uppercase(), threshold.to_string()))
+        })
+        .collect()
 }
 
 pub fn decimal_to_native_units(value: &str, decimals: u8) -> Option<Nat> {
@@ -280,6 +325,15 @@ mod tests {
         Arc::new(TokenRegistry::new(HashMap::from([(id, token)])))
     }
 
+    fn registry_with_tokens(tokens: Vec<ChainToken>) -> Arc<TokenRegistry> {
+        Arc::new(TokenRegistry::new(
+            tokens
+                .into_iter()
+                .map(|token| (token.asset_id(), token))
+                .collect(),
+        ))
+    }
+
     fn balance_service(token: ChainToken, raw_balance: u128) -> Arc<BalanceService> {
         let registry = registry_with(token);
         let mut account = MockAccountInfo::new();
@@ -290,6 +344,31 @@ mod tests {
             })
         });
         Arc::new(BalanceService::new(registry, Arc::new(account)))
+    }
+
+    #[test]
+    fn account_symbol_filter_limits_monitored_assets() {
+        let registry = registry_with_tokens(vec![
+            icp_token("ckBTC", 8),
+            ChainToken::EvmNative {
+                chain: "eth".to_string(),
+                symbol: "ETH".to_string(),
+                decimals: 18,
+                fee: Nat::from(0u8),
+            },
+            icp_token("ICP", 8),
+        ]);
+        let account = MockAccountInfo::new();
+        let service = Arc::new(BalanceService::new(registry, Arc::new(account)));
+        let monitored = MonitoredBalanceAccount {
+            label: "bridge",
+            service,
+            only_symbols: Some(vec!["ETH"]),
+        };
+
+        let assets = monitored_asset_ids_for_account(&monitored);
+        assert_eq!(assets.len(), 1);
+        assert_eq!(assets[0].symbol, "ETH");
     }
 
     #[test]
@@ -312,6 +391,35 @@ mod tests {
             threshold_for_token(&eth).expect("threshold"),
             Nat::from(50_000_000_000_000_000u128)
         );
+    }
+
+    #[test]
+    fn threshold_overrides_are_case_insensitive_and_use_native_units() {
+        let ckbtc = icp_token("ckBTC", 8);
+        let threshold = threshold_for_token_with_overrides(&ckbtc, Some("ckbtc=0.002,ICP=10"))
+            .expect("override threshold");
+        assert_eq!(threshold, Nat::from(200_000u128));
+
+        let icp = icp_token("ICP", 8);
+        let threshold = threshold_for_token_with_overrides(&icp, Some("ckbtc=0.002,icp=10"))
+            .expect("override threshold");
+        assert_eq!(threshold, Nat::from(1_000_000_000u128));
+    }
+
+    #[test]
+    fn threshold_overrides_can_enable_unknown_symbols() {
+        let token = icp_token("DOGE", 8);
+        let threshold = threshold_for_token_with_overrides(&token, Some("DOGE=25"))
+            .expect("unknown symbol override");
+        assert_eq!(threshold, Nat::from(2_500_000_000u128));
+    }
+
+    #[test]
+    fn invalid_threshold_override_falls_back_to_default() {
+        let token = icp_token("ICP", 8);
+        let threshold = threshold_for_token_with_overrides(&token, Some("ICP=not-a-number"))
+            .expect("default threshold");
+        assert_eq!(threshold, Nat::from(500_000_000u128));
     }
 
     #[test]
@@ -366,7 +474,11 @@ mod tests {
         let service = balance_service(token, 0);
         let recorder = Arc::new(RecordingWatchdog::new());
         let monitor = LowBalanceMonitor::with_interval(
-            vec![MonitoredBalanceAccount { label: "main", service }],
+            vec![MonitoredBalanceAccount {
+                label: "main",
+                service,
+                only_symbols: None,
+            }],
             recorder.clone(),
             Duration::from_secs(60),
         );

@@ -10,8 +10,11 @@ use tokio::sync::Mutex;
 
 use super::{WATCHDOG_HTTP_TIMEOUT_SECS, Watchdog, WatchdogEvent, noop_watchdog};
 
+const DEFAULT_BOT_NAME: &str = "liquidator";
+
 pub struct SlackWatchdog {
     url: String,
+    bot_name: String,
     cooldown: Duration,
     last: Mutex<HashMap<String, Instant>>,
     client: reqwest::Client,
@@ -30,6 +33,7 @@ impl SlackWatchdog {
 
         Self {
             url: url.into(),
+            bot_name: bot_name_from_env(),
             cooldown,
             last: Mutex::new(HashMap::new()),
             client,
@@ -58,16 +62,16 @@ impl Watchdog for SlackWatchdog {
             }
         }
 
-        let Some(payload) = slack_payload_for_event(&ev) else {
+        let Some(payload) = slack_payload_for_event_with_bot(&ev, &self.bot_name) else {
             return;
         };
 
         match self.client.post(&self.url).json(&payload).send().await {
             Ok(resp) if !resp.status().is_success() => {
-                warn!("Slack low-balance notification failed with status {}", resp.status());
+                warn!("Slack notification failed with status {}", resp.status());
             }
             Err(err) => {
-                warn!("Slack low-balance notification failed: {}", err);
+                warn!("Slack notification failed: {}", err);
             }
             _ => {}
         }
@@ -94,7 +98,20 @@ pub fn slack_webhook_configured() -> bool {
         .unwrap_or(false)
 }
 
-pub(crate) fn slack_payload_for_event(ev: &WatchdogEvent<'_>) -> Option<serde_json::Value> {
+#[cfg(test)]
+fn slack_payload_for_event(ev: &WatchdogEvent<'_>) -> Option<serde_json::Value> {
+    slack_payload_for_event_with_bot(ev, DEFAULT_BOT_NAME)
+}
+
+fn bot_name_from_env() -> String {
+    std::env::var("BOT_NAME")
+        .ok()
+        .map(|name| name.trim().to_string())
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| DEFAULT_BOT_NAME.to_string())
+}
+
+fn slack_payload_for_event_with_bot(ev: &WatchdogEvent<'_>, bot_name: &str) -> Option<serde_json::Value> {
     match ev {
         WatchdogEvent::LowBalance {
             account,
@@ -103,7 +120,7 @@ pub(crate) fn slack_payload_for_event(ev: &WatchdogEvent<'_>) -> Option<serde_js
             current,
             threshold,
         } => {
-            let text = format!("Low balance: {account} {asset} is {current}, below {threshold}");
+            let text = format!("[{bot_name}] Low balance: {account} {asset} is {current}, below {threshold}");
             Some(serde_json::json!({
                 "text": text,
                 "blocks": [
@@ -111,7 +128,7 @@ pub(crate) fn slack_payload_for_event(ev: &WatchdogEvent<'_>) -> Option<serde_js
                         "type": "section",
                         "text": {
                             "type": "mrkdwn",
-                            "text": format!("*Low balance*: `{account}` `{asset}`")
+                            "text": format!("*{bot_name}* - Low balance: `{account}` `{asset}`")
                         }
                     },
                     {
@@ -143,7 +160,7 @@ pub(crate) fn slack_payload_for_event(ev: &WatchdogEvent<'_>) -> Option<serde_js
             }))
         }
         WatchdogEvent::Lifecycle { state, details } => {
-            let text = format!("Liquidator {state}: {details}");
+            let text = format!("[{bot_name}] Liquidator {state}: {details}");
             Some(serde_json::json!({
                 "text": text,
                 "blocks": [
@@ -151,7 +168,7 @@ pub(crate) fn slack_payload_for_event(ev: &WatchdogEvent<'_>) -> Option<serde_js
                         "type": "section",
                         "text": {
                             "type": "mrkdwn",
-                            "text": format!("*Liquidator {state}*")
+                            "text": format!("*{bot_name}* - Liquidator {state}")
                         }
                     },
                     {
@@ -179,7 +196,7 @@ pub(crate) fn slack_payload_for_event(ev: &WatchdogEvent<'_>) -> Option<serde_js
             profit_delta,
             round_trip_secs,
         } => {
-            let text = format!("Liquidation finalized: {status} {liquidation_id}");
+            let text = format!("[{bot_name}] Liquidation finalized: {status} {liquidation_id}");
             Some(serde_json::json!({
                 "text": text,
                 "blocks": [
@@ -187,7 +204,7 @@ pub(crate) fn slack_payload_for_event(ev: &WatchdogEvent<'_>) -> Option<serde_js
                         "type": "section",
                         "text": {
                             "type": "mrkdwn",
-                            "text": format!("*Liquidation finalized*: `{status}`")
+                            "text": format!("*{bot_name}* - Liquidation finalized: `{status}`")
                         }
                     },
                     {
@@ -261,8 +278,20 @@ mod tests {
         };
 
         let payload = slack_payload_for_event(&ev).expect("low balance should format");
-        assert_eq!(payload["text"], "Low balance: main ckBTC is 0 ckBTC, below 0.001 ckBTC");
+        assert_eq!(payload["text"], "[liquidator] Low balance: main ckBTC is 0 ckBTC, below 0.001 ckBTC");
         assert_eq!(payload["blocks"][0]["type"], "section");
+    }
+
+    #[test]
+    fn slack_payload_includes_custom_bot_name() {
+        let ev = WatchdogEvent::Lifecycle {
+            state: "started".to_string(),
+            details: "Liquidator started.".to_string(),
+        };
+
+        let payload = slack_payload_for_event_with_bot(&ev, "prod-liquidator").expect("payload");
+        assert_eq!(payload["text"], "[prod-liquidator] Liquidator started: Liquidator started.");
+        assert_eq!(payload["blocks"][0]["text"]["text"], "*prod-liquidator* - Liquidator started");
     }
 
     #[test]
@@ -273,8 +302,8 @@ mod tests {
         };
 
         let payload = slack_payload_for_event(&ev).expect("lifecycle should format");
-        assert_eq!(payload["text"], "Liquidator started: Liquidator started on https://ic0.app.");
-        assert_eq!(payload["blocks"][0]["text"]["text"], "*Liquidator started*");
+        assert_eq!(payload["text"], "[liquidator] Liquidator started: Liquidator started on https://ic0.app.");
+        assert_eq!(payload["blocks"][0]["text"]["text"], "*liquidator* - Liquidator started");
     }
 
     #[test]
@@ -296,8 +325,8 @@ mod tests {
         };
 
         let payload = slack_payload_for_event(&ev).expect("liquidation should format");
-        assert_eq!(payload["text"], "Liquidation finalized: Success 42");
-        assert_eq!(payload["blocks"][0]["text"]["text"], "*Liquidation finalized*: `Success`");
+        assert_eq!(payload["text"], "[liquidator] Liquidation finalized: Success 42");
+        assert_eq!(payload["blocks"][0]["text"]["text"], "*liquidator* - Liquidation finalized: `Success`");
     }
 
     #[test]
@@ -319,10 +348,13 @@ mod tests {
         };
 
         let payload = slack_payload_for_event(&ev).expect("failed liquidation should format");
-        assert_eq!(payload["text"], "Liquidation finalized: SwapFailed: insufficient liquidity n/a");
+        assert_eq!(
+            payload["text"],
+            "[liquidator] Liquidation finalized: SwapFailed: insufficient liquidity n/a"
+        );
         assert_eq!(
             payload["blocks"][0]["text"]["text"],
-            "*Liquidation finalized*: `SwapFailed: insufficient liquidity`"
+            "*liquidator* - Liquidation finalized: `SwapFailed: insufficient liquidity`"
         );
     }
 
