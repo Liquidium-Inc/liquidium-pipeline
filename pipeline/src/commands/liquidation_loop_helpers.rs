@@ -29,7 +29,7 @@ use crate::stages::{
     simple_strategy::SimpleLiquidationStrategy,
 };
 use crate::swappers::router::SwapRouter;
-use crate::watchdog::{Watchdog, WatchdogEvent};
+use crate::watchdog::{Watchdog, WatchdogEvent, balance_monitor::LowBalanceMonitor};
 use anyhow::Context as _;
 use futures::FutureExt;
 use ic_agent::Agent;
@@ -43,6 +43,7 @@ const LIQUIDATION_CYCLE_TIMEOUT: Duration = Duration::from_secs(300);
 const FINALIZER_STAGE_TIMEOUT: Duration = Duration::from_secs(300);
 const EXPORT_STAGE_TIMEOUT: Duration = Duration::from_secs(20);
 const WATCHDOG_STAGE_TIMEOUT: Duration = Duration::from_secs(10);
+const LOW_BALANCE_MONITOR_STAGE_TIMEOUT: Duration = Duration::from_secs(45);
 const REFRESH_ALLOWANCES_TIMEOUT: Duration = Duration::from_secs(45);
 const SCAN_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(300);
 const PANIC_RECOVERY_DELAY: Duration = Duration::from_secs(1);
@@ -220,7 +221,12 @@ fn probe_rw_file(path: &Path, label: &str, append: bool) -> anyhow::Result<()> {
 ///   mirroring the transition semantics in `control_plane`.
 /// - The server is fire-and-forget; failures after bootstrap are surfaced via
 ///   structured error logs while the daemon process keeps running.
-pub(crate) fn bootstrap_control_plane(sock_path: &Path, db_path: &str, paused: Arc<AtomicBool>) -> anyhow::Result<()> {
+pub(crate) fn bootstrap_control_plane(
+    sock_path: &Path,
+    db_path: &str,
+    paused: Arc<AtomicBool>,
+    lifecycle_watchdog: Option<Arc<dyn Watchdog>>,
+) -> anyhow::Result<()> {
     let control_state_store =
         Arc::new(SqliteWalStore::new_with_busy_timeout(db_path, 30_000).context("initialize control-state store")?);
 
@@ -238,6 +244,24 @@ pub(crate) fn bootstrap_control_plane(sock_path: &Path, db_path: &str, paused: A
         let on_transition = Arc::new(move |is_paused: bool| {
             if let Err(err) = state_store.set_daemon_paused(is_paused) {
                 tracing::error!(paused = is_paused, "Failed to persist daemon pause state: {}", err);
+            }
+
+            if let Some(watchdog) = lifecycle_watchdog.as_ref() {
+                let watchdog = watchdog.clone();
+                let (state, details) = if is_paused {
+                    (
+                        "paused".to_string(),
+                        "Liquidation initiation suspended; queued finalization and housekeeping continue.".to_string(),
+                    )
+                } else {
+                    (
+                        "resumed".to_string(),
+                        "Liquidation initiation enabled.".to_string(),
+                    )
+                };
+                tokio::spawn(async move {
+                    watchdog.notify(WatchdogEvent::Lifecycle { state, details }).await;
+                });
             }
         });
 
@@ -271,6 +295,8 @@ pub(crate) async fn run_daemon_cycle_loop(
     exporter: &Arc<ExportStage>,
     finalizer: &Arc<FinalizeStage<HybridFinalizer<Config>, SqliteWalStore, SimpleProfitCalculator, Agent>>,
     liq_dog: &Arc<dyn Watchdog>,
+    slack_watchdog: Option<Arc<dyn Watchdog>>,
+    low_balance_monitor: Option<Arc<LowBalanceMonitor>>,
     paused: Arc<AtomicBool>,
     debt_assets: &Vec<String>,
     debt_asset_principals: &[Principal],
@@ -288,6 +314,8 @@ pub(crate) async fn run_daemon_cycle_loop(
             exporter,
             finalizer,
             liq_dog,
+            slack_watchdog.as_ref(),
+            low_balance_monitor.as_deref(),
             paused.as_ref(),
             debt_assets,
             debt_asset_principals,
@@ -364,6 +392,8 @@ async fn run_single_daemon_cycle(
     exporter: &Arc<ExportStage>,
     finalizer: &Arc<FinalizeStage<HybridFinalizer<Config>, SqliteWalStore, SimpleProfitCalculator, Agent>>,
     liq_dog: &Arc<dyn Watchdog>,
+    slack_watchdog: Option<&Arc<dyn Watchdog>>,
+    low_balance_monitor: Option<&LowBalanceMonitor>,
     paused: &AtomicBool,
     debt_assets: &Vec<String>,
     debt_asset_principals: &[Principal],
@@ -460,6 +490,7 @@ async fn run_single_daemon_cycle(
             }
         }
         log_execution_results(&outcomes);
+        notify_liquidation_outcomes(slack_watchdog, &outcomes).await;
         if ui_enabled {
             print_execution_results(outcomes.clone());
         }
@@ -476,6 +507,18 @@ async fn run_single_daemon_cycle(
     )
     .await
     .is_none()
+    {
+        had_timeout = true;
+    }
+
+    if let Some(monitor) = low_balance_monitor
+        && stage_with_timeout(
+            "balance_monitor.low_balance",
+            LOW_BALANCE_MONITOR_STAGE_TIMEOUT,
+            monitor.check_if_due(),
+        )
+        .await
+        .is_none()
     {
         had_timeout = true;
     }
@@ -497,6 +540,41 @@ async fn run_single_daemon_cycle(
     }
 
     CycleOutcome { is_paused, had_timeout }
+}
+
+async fn notify_liquidation_outcomes(slack_watchdog: Option<&Arc<dyn Watchdog>>, outcomes: &[LiquidationOutcome]) {
+    let Some(watchdog) = slack_watchdog else {
+        return;
+    };
+
+    for outcome in outcomes {
+        watchdog.notify(liquidation_finalized_event(outcome)).await;
+    }
+}
+
+fn liquidation_finalized_event(outcome: &LiquidationOutcome) -> WatchdogEvent<'static> {
+    let liquidation_id = outcome
+        .execution_receipt
+        .liquidation_result
+        .as_ref()
+        .map(|v| v.id.to_string())
+        .unwrap_or_else(|| "n/a".to_string());
+
+    WatchdogEvent::LiquidationFinalized {
+        liquidation_id,
+        borrower: outcome.request.liquidation.borrower.to_text(),
+        debt_asset: outcome.request.debt_asset.symbol(),
+        collateral_asset: outcome.request.collateral_asset.symbol(),
+        status: outcome.status.description(),
+        debt_repaid: outcome.formatted_debt_repaid(),
+        collateral_received: outcome.formatted_received_collateral(),
+        swap_output: outcome.formatted_swap_output(),
+        swapper: outcome.formatted_swapper(),
+        expected_profit: outcome.formatted_expected_profit(),
+        realized_profit: outcome.formatted_realized_profit(),
+        profit_delta: outcome.formatted_profit_delta(),
+        round_trip_secs: outcome.formatted_round_trip_secs(),
+    }
 }
 
 pub(crate) fn print_execution_results(results: Vec<LiquidationOutcome>) {

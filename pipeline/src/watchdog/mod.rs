@@ -10,13 +10,51 @@ use std::{
 };
 use tokio::sync::Mutex;
 
-const WATCHDOG_HTTP_TIMEOUT_SECS: u64 = 5;
+pub mod balance_monitor;
+pub mod slack;
+
+pub(crate) const WATCHDOG_HTTP_TIMEOUT_SECS: u64 = 5;
+
+pub use slack::{slack_watchdog_from_env, slack_webhook_configured};
 
 #[derive(Debug, Clone, Serialize)]
 pub enum WatchdogEvent<'a> {
-    Heartbeat { stage: &'a str },
-    BalanceMissing { asset: &'a str },
-    InsufficientFunds { asset: &'a str, available: String },
+    Heartbeat {
+        stage: &'a str,
+    },
+    BalanceMissing {
+        asset: &'a str,
+    },
+    InsufficientFunds {
+        asset: &'a str,
+        available: String,
+    },
+    LowBalance {
+        account: String,
+        asset: String,
+        asset_id: String,
+        current: String,
+        threshold: String,
+    },
+    Lifecycle {
+        state: String,
+        details: String,
+    },
+    LiquidationFinalized {
+        liquidation_id: String,
+        borrower: String,
+        debt_asset: String,
+        collateral_asset: String,
+        status: String,
+        debt_repaid: String,
+        collateral_received: String,
+        swap_output: String,
+        swapper: String,
+        expected_profit: String,
+        realized_profit: String,
+        profit_delta: String,
+        round_trip_secs: String,
+    },
 }
 
 #[async_trait]
@@ -75,6 +113,13 @@ impl Watchdog for WebhookWatchdog {
             WatchdogEvent::Heartbeat { stage } => format!("hb:{stage}"),
             WatchdogEvent::BalanceMissing { asset } => format!("bal_missing:{asset}"),
             WatchdogEvent::InsufficientFunds { asset, .. } => format!("insuff:{asset}"),
+            WatchdogEvent::LowBalance { account, asset_id, .. } => format!("low_balance:{account}:{asset_id}"),
+            WatchdogEvent::Lifecycle { state, .. } => format!("lifecycle:{state}"),
+            WatchdogEvent::LiquidationFinalized {
+                liquidation_id, status, ..
+            } => {
+                format!("liquidation_finalized:{liquidation_id}:{status}")
+            }
         };
         if !self.should_send(&key).await {
             return;
@@ -94,11 +139,6 @@ impl Watchdog for WebhookWatchdog {
 // helpers for wiring
 pub fn noop_watchdog() -> Arc<dyn Watchdog> {
     Arc::new(NoopWatchdog)
-}
-
-pub fn account_monitor_watchdog(default_cooldown: Duration, account: Principal) -> Arc<dyn Watchdog> {
-    let url = "TODO".to_string();
-    Arc::new(WebhookWatchdog::new(url, default_cooldown, Some(account)))
 }
 
 pub fn webhook_watchdog_from_env(default_cooldown: Duration) -> Arc<dyn Watchdog> {

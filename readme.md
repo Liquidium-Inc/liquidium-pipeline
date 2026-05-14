@@ -138,6 +138,9 @@ BUY_BAD_DEBT=false
 DB_PATH=./wal.db
 EXPORT_PATH=executions.csv
 WATCHDOG_WEBHOOK=https://your-webhook-url.com/endpoint
+SLACK_WEBHOOK_URL=https://hooks.slack.com/services/...
+BOT_NAME=prod-liquidator
+LOW_BALANCE_THRESHOLDS=ckBTC=0.001,ckUSDT=100,ckUSDC=100,ICP=5,ETH=0.05
 ```
 
 ### Swap Configuration
@@ -304,9 +307,15 @@ BUY_BAD_DEBT=false  # Set to true to liquidate even if not profitable
 
 ```bash
 WATCHDOG_WEBHOOK=https://your-webhook-url.com/endpoint
+SLACK_WEBHOOK_URL=https://hooks.slack.com/services/...
+BOT_NAME=prod-liquidator
+LOW_BALANCE_THRESHOLDS=ckBTC=0.001,ckUSDT=100,ckUSDC=100,ICP=5,ETH=0.05
 ```
 
 > `WATCHDOG_WEBHOOK`: if set, the bot sends POST requests with JSON payloads for monitoring and alerting (for example: Slack, Discord, or custom services).
+> `SLACK_WEBHOOK_URL`: if set, the daemon sends Slack incoming-webhook alerts for main low balances, bridge ETH low balance, lifecycle changes, and finalized liquidations.
+> `BOT_NAME`: optional Slack label used in notifications so shared channels can identify which bot emitted the alert.
+> `LOW_BALANCE_THRESHOLDS`: optional comma-separated symbol thresholds in token units. Missing symbols use defaults; unknown symbols are monitored only when explicitly listed.
 
 ---
 
@@ -606,7 +615,7 @@ liquidator withdraw --source main --destination abc123-xyz --asset ckUSDT --amou
 
 3. Enable monitoring and inspect output artifacts:
 
-   - Configure `WATCHDOG_WEBHOOK` for alerts.
+   - Configure `WATCHDOG_WEBHOOK` for generic alerts and `SLACK_WEBHOOK_URL` for Slack alerts.
    - Check CSV exports at `EXPORT_PATH` and WAL state at `DB_PATH`.
 
 4. Move funds operationally when needed:
