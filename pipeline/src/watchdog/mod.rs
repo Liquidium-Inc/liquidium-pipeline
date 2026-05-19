@@ -10,13 +10,51 @@ use std::{
 };
 use tokio::sync::Mutex;
 
-const WATCHDOG_HTTP_TIMEOUT_SECS: u64 = 5;
+pub mod balance_monitor;
+pub mod slack;
+
+pub(crate) const WATCHDOG_HTTP_TIMEOUT_SECS: u64 = 5;
+
+pub use slack::{slack_watchdog_from_env, slack_webhook_configured};
 
 #[derive(Debug, Clone, Serialize)]
 pub enum WatchdogEvent<'a> {
-    Heartbeat { stage: &'a str },
-    BalanceMissing { asset: &'a str },
-    InsufficientFunds { asset: &'a str, available: String },
+    Heartbeat {
+        stage: &'a str,
+    },
+    BalanceMissing {
+        asset: &'a str,
+    },
+    InsufficientFunds {
+        asset: &'a str,
+        available: String,
+    },
+    LowBalance {
+        account: String,
+        asset: String,
+        asset_id: String,
+        current: String,
+        threshold: String,
+    },
+    Lifecycle {
+        state: String,
+        details: String,
+    },
+    LiquidationFinalized {
+        liquidation_id: String,
+        borrower: String,
+        debt_asset: String,
+        collateral_asset: String,
+        status: String,
+        debt_repaid: String,
+        collateral_received: String,
+        swap_output: String,
+        swapper: String,
+        expected_profit: String,
+        realized_profit: String,
+        profit_delta: String,
+        round_trip_secs: String,
+    },
 }
 
 #[async_trait]
@@ -55,17 +93,17 @@ impl WebhookWatchdog {
         }
     }
 
-    async fn should_send(&self, key: &str) -> bool {
+    async fn reserve_for_send(&self, key: &str) -> Option<Instant> {
         let mut m = self.last.lock().await;
         let now = Instant::now();
-        match m.get(key) {
-            Some(&t) if now.duration_since(t) < self.cooldown => false,
-            _ => {
-                m.insert(key.to_string(), now);
-                true
-            }
+        m.retain(|_, ts| now.duration_since(*ts) < self.cooldown);
+        if matches!(m.get(key), Some(&t) if now.duration_since(t) < self.cooldown) {
+            return None;
         }
+        m.insert(key.to_string(), now);
+        Some(now)
     }
+
 }
 
 #[async_trait]
@@ -75,10 +113,17 @@ impl Watchdog for WebhookWatchdog {
             WatchdogEvent::Heartbeat { stage } => format!("hb:{stage}"),
             WatchdogEvent::BalanceMissing { asset } => format!("bal_missing:{asset}"),
             WatchdogEvent::InsufficientFunds { asset, .. } => format!("insuff:{asset}"),
+            WatchdogEvent::LowBalance { account, asset_id, .. } => format!("low_balance:{account}:{asset_id}"),
+            WatchdogEvent::Lifecycle { state, .. } => format!("lifecycle:{state}"),
+            WatchdogEvent::LiquidationFinalized {
+                liquidation_id, status, ..
+            } => {
+                format!("liquidation_finalized:{liquidation_id}:{status}")
+            }
         };
-        if !self.should_send(&key).await {
+        let Some(_reserved_at) = self.reserve_for_send(&key).await else {
             return;
-        }
+        };
 
         let payload = serde_json::json!({
             "ts": chrono::Utc::now().timestamp(),
@@ -86,8 +131,31 @@ impl Watchdog for WebhookWatchdog {
             "event": ev,
         });
 
-        // fire-and-forget; non-fatal on error
-        let _ = self.client.post(&self.url).json(&payload).send().await;
+        match self.client.post(&self.url).json(&payload).send().await {
+            Ok(resp) if resp.status().is_success() => {}
+            Ok(resp) => {
+                let status = resp.status();
+                let body = resp
+                    .text()
+                    .await
+                    .unwrap_or_else(|err| format!("<failed to read response body: {err}>"));
+                tracing::error!(
+                    key = %key,
+                    url = %self.url,
+                    status = %status,
+                    body = %body,
+                    "Webhook notification failed with non-success status"
+                );
+            }
+            Err(err) => {
+                tracing::error!(
+                    key = %key,
+                    url = %self.url,
+                    error = %err,
+                    "Webhook notification transport failed"
+                );
+            }
+        }
     }
 }
 
@@ -96,15 +164,23 @@ pub fn noop_watchdog() -> Arc<dyn Watchdog> {
     Arc::new(NoopWatchdog)
 }
 
-pub fn account_monitor_watchdog(default_cooldown: Duration, account: Principal) -> Arc<dyn Watchdog> {
-    let url = "TODO".to_string();
-    Arc::new(WebhookWatchdog::new(url, default_cooldown, Some(account)))
-}
-
 pub fn webhook_watchdog_from_env(default_cooldown: Duration) -> Arc<dyn Watchdog> {
     if let Ok(url) = std::env::var("WATCHDOG_WEBHOOK") {
         Arc::new(WebhookWatchdog::new(url, default_cooldown, None))
     } else {
         noop_watchdog()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn webhook_watchdog_attempt_reservation_consumes_cooldown() {
+        let wd = WebhookWatchdog::new("http://localhost/webhook", Duration::from_secs(60), None);
+
+        assert!(wd.reserve_for_send("hb:Running").await.is_some());
+        assert!(wd.reserve_for_send("hb:Running").await.is_none());
     }
 }

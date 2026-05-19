@@ -3,9 +3,10 @@ use alloy::{
     providers::{Provider, ProviderBuilder},
     signers::local::PrivateKeySigner,
 };
+use candid::{Nat, Principal};
 use icrc_ledger_types::icrc1::account::Account;
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeSet, HashMap},
     path::PathBuf,
     sync::{Arc, atomic::AtomicBool},
     time::Duration,
@@ -36,7 +37,11 @@ use crate::{
         settlement_watcher::SettlementWatcher, simple_strategy::SimpleLiquidationStrategy,
     },
     swappers::{mexc::mexc_adapter::MexcClient, router::SwapRouter},
-    watchdog::{WatchdogEvent, account_monitor_watchdog, webhook_watchdog_from_env},
+    watchdog::{
+        WatchdogEvent,
+        balance_monitor::{DEFAULT_LOW_BALANCE_ALERT_COOLDOWN, LowBalanceMonitor, MonitoredBalanceAccount},
+        slack_watchdog_from_env, slack_webhook_configured, webhook_watchdog_from_env,
+    },
 };
 use ic_agent::Agent;
 use liquidium_pipeline_connectors::backend::{
@@ -45,7 +50,12 @@ use liquidium_pipeline_connectors::backend::{
     icp_backend::IcpBackendImpl,
 };
 
-use liquidium_pipeline_core::tokens::token_registry::TokenRegistry;
+use liquidium_pipeline_core::{
+    balance_service::BalanceService,
+    tokens::{chain_token::ChainToken, token_registry::TokenRegistry},
+};
+
+const BRIDGE_CKETH_LEDGER_ID: &str = "ss2fx-dyaaa-aaaar-qacoq-cai";
 
 #[instrument(name = "liquidation.init", skip_all, err)]
 async fn init(
@@ -245,6 +255,31 @@ async fn init(
     Ok((finder, strategy, executor, exporter, finalizer))
 }
 
+fn bridge_low_balance_service(ctx: &PipelineContext) -> Arc<BalanceService> {
+    let tokens = vec![
+        ChainToken::EvmNative {
+            chain: "eth".to_string(),
+            symbol: "ETH".to_string(),
+            decimals: 18,
+            fee: Nat::from(0u8),
+        },
+        ChainToken::Icp {
+            ledger: Principal::from_text(BRIDGE_CKETH_LEDGER_ID).expect("valid ckETH ledger principal"),
+            symbol: "ckETH".to_string(),
+            decimals: 18,
+            fee: Nat::from(0u8),
+        },
+    ];
+    let registry = TokenRegistry::new(
+        tokens
+            .into_iter()
+            .map(|token| (token.asset_id(), token))
+            .collect::<HashMap<_, _>>(),
+    );
+
+    Arc::new(BalanceService::new(Arc::new(registry), ctx.bridge_service.accounts()))
+}
+
 pub async fn run_liquidation_loop(sock_path: PathBuf) {
     // Auditor note:
     // This function is the foreground daemon entrypoint. It does not fork/detach;
@@ -349,18 +384,49 @@ pub async fn run_liquidation_loop(sock_path: PathBuf) {
     // Shared pause flag controlled by UDS commands.
     // `true` means: do not initiate new liquidations, but keep housekeeping alive.
     let paused = Arc::new(AtomicBool::new(false));
+    let slack_watchdog = if slack_webhook_configured() {
+        Some(slack_watchdog_from_env(DEFAULT_LOW_BALANCE_ALERT_COOLDOWN))
+    } else {
+        None
+    };
     // The helper encapsulates:
     // - persisted paused/running state bootstrap
     // - UDS bind + serve
     // - state persistence on pause/resume transitions
-    if let Err(err) = bootstrap_control_plane(&sock_path, &config.db_path, paused.clone()) {
+    if let Err(err) = bootstrap_control_plane(&sock_path, &config.db_path, paused.clone(), slack_watchdog.clone()) {
         tracing::error!("{}", err);
         return;
     }
     info!(sock_path = %sock_path.display(), "Control plane ready");
 
-    // Setup liquidity monitor
-    let liq_dog = account_monitor_watchdog(Duration::from_secs(5), ctx.config.liquidator_principal);
+    let liq_dog = webhook_watchdog_from_env(Duration::from_secs(300));
+    if let Some(slack) = slack_watchdog.as_ref() {
+        slack.notify(WatchdogEvent::Lifecycle {
+            state: "started".to_string(),
+            details: format!(
+                "Liquidator started on {}; scanning for liquidation opportunities.",
+                config.ic_url
+            ),
+        })
+        .await;
+    }
+
+    let low_balance_monitor = slack_watchdog.as_ref().map(|slack| Arc::new(LowBalanceMonitor::new(
+            vec![
+                MonitoredBalanceAccount {
+                    label: "main",
+                    service: ctx.main_service.clone(),
+                    only_symbols: None,
+                },
+                MonitoredBalanceAccount {
+                    label: "bridge",
+                    service: bridge_low_balance_service(&ctx),
+                    only_symbols: None,
+                },
+            ],
+            slack.clone(),
+        )));
+
     // Steady-state operation is delegated to a helper to keep this entrypoint
     // focused on bootstrap wiring and lifecycle boundaries.
     run_daemon_cycle_loop(
@@ -370,6 +436,8 @@ pub async fn run_liquidation_loop(sock_path: PathBuf) {
         &exporter,
         &finalizer,
         &liq_dog,
+        slack_watchdog,
+        low_balance_monitor,
         paused,
         &debt_assets,
         &debt_asset_principals,
