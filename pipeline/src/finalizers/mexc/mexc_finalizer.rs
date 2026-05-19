@@ -27,7 +27,7 @@ use super::mexc_utils::{
 };
 
 const WITHDRAW_BRIDGE_SOURCE_BALANCE_TOLERANCE: f64 = LIQUIDITY_EPS;
-const MEXC_WITHDRAW_BELOW_MIN_MESSAGE: &str = "Withdrawal shall not be less than the Min amount of";
+const MEXC_WITHDRAW_BELOW_MIN_RAW_CODE: i64 = 10254;
 
 use crate::{
     finalizers::bridge_planner::BridgePlanner,
@@ -55,7 +55,17 @@ pub struct MexcBridgeDependencies {
 }
 
 fn is_mexc_withdraw_below_min_error(err: &str) -> bool {
-    err.contains(MEXC_WITHDRAW_BELOW_MIN_MESSAGE)
+    // The CEX backend trait currently erases MEXC's typed error into a string.
+    // Recover the stable raw code instead of matching MEXC's human-readable text.
+    parse_mexc_raw_code(err) == Some(MEXC_WITHDRAW_BELOW_MIN_RAW_CODE)
+}
+
+fn parse_mexc_raw_code(err: &str) -> Option<i64> {
+    let value = err.split("raw_code:").nth(1)?.trim_start();
+    let end = value
+        .find(|ch: char| !ch.is_ascii_digit() && ch != '-')
+        .unwrap_or(value.len());
+    value.get(..end)?.parse().ok()
 }
 
 // MEXC-specific implementation of the generic CEX finalizer logic.

@@ -41,6 +41,16 @@ fn is_valid_mexc_client_order_id(value: &str) -> bool {
         .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
 }
 
+#[test]
+fn mexc_withdraw_below_min_detection_uses_raw_code() {
+    assert!(is_mexc_withdraw_below_min_error(
+        r#"Error response: ErrorResponse { code: InvalidResponse, raw_code: 10254, msg: "localized or changed text", _extend: None }"#
+    ));
+    assert!(!is_mexc_withdraw_below_min_error(
+        "Withdrawal shall not be less than the Min amount of:0.00002"
+    ));
+}
+
 fn make_execution_receipt(liq_id: u128) -> ExecutionReceipt {
     let collateral_token = ChainToken::Icp {
         ledger: Principal::anonymous(),
