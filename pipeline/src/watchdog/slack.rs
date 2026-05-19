@@ -43,20 +43,23 @@ impl SlackWatchdog {
     async fn should_send(&self, key: &str) -> bool {
         let mut m = self.last.lock().await;
         let now = Instant::now();
-        match m.get(key) {
-            Some(&t) if now.duration_since(t) < self.cooldown => false,
-            _ => {
-                m.insert(key.to_string(), now);
-                true
-            }
-        }
+        m.retain(|_, ts| now.duration_since(*ts) < self.cooldown);
+        !matches!(m.get(key), Some(&t) if now.duration_since(t) < self.cooldown)
+    }
+
+    async fn mark_sent(&self, key: &str) {
+        let mut m = self.last.lock().await;
+        let now = Instant::now();
+        m.retain(|_, ts| now.duration_since(*ts) < self.cooldown);
+        m.insert(key.to_string(), now);
     }
 }
 
 #[async_trait]
 impl Watchdog for SlackWatchdog {
     async fn notify(&self, ev: WatchdogEvent<'_>) {
-        if let Some(key) = slack_cooldown_key(&ev) {
+        let cooldown_key = slack_cooldown_key(&ev);
+        if let Some(key) = cooldown_key.as_deref() {
             if !self.should_send(&key).await {
                 return;
             }
@@ -67,6 +70,11 @@ impl Watchdog for SlackWatchdog {
         };
 
         match self.client.post(&self.url).json(&payload).send().await {
+            Ok(resp) if resp.status().is_success() => {
+                if let Some(key) = cooldown_key.as_deref() {
+                    self.mark_sent(key).await;
+                }
+            }
             Ok(resp) if !resp.status().is_success() => {
                 warn!("Slack notification failed with status {}", resp.status());
             }
@@ -378,6 +386,8 @@ mod tests {
         let wd = SlackWatchdog::new("http://localhost/slack", Duration::from_secs(60));
 
         assert!(wd.should_send("low_balance:main:ckBTC").await);
+        assert!(wd.should_send("low_balance:main:ckBTC").await);
+        wd.mark_sent("low_balance:main:ckBTC").await;
         assert!(!wd.should_send("low_balance:main:ckBTC").await);
         assert!(wd.should_send("low_balance:trader:ckBTC").await);
     }

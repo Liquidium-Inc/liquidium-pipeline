@@ -96,13 +96,15 @@ impl WebhookWatchdog {
     async fn should_send(&self, key: &str) -> bool {
         let mut m = self.last.lock().await;
         let now = Instant::now();
-        match m.get(key) {
-            Some(&t) if now.duration_since(t) < self.cooldown => false,
-            _ => {
-                m.insert(key.to_string(), now);
-                true
-            }
-        }
+        m.retain(|_, ts| now.duration_since(*ts) < self.cooldown);
+        !matches!(m.get(key), Some(&t) if now.duration_since(t) < self.cooldown)
+    }
+
+    async fn mark_sent(&self, key: &str) {
+        let mut m = self.last.lock().await;
+        let now = Instant::now();
+        m.retain(|_, ts| now.duration_since(*ts) < self.cooldown);
+        m.insert(key.to_string(), now);
     }
 }
 
@@ -131,8 +133,12 @@ impl Watchdog for WebhookWatchdog {
             "event": ev,
         });
 
-        // fire-and-forget; non-fatal on error
-        let _ = self.client.post(&self.url).json(&payload).send().await;
+        match self.client.post(&self.url).json(&payload).send().await {
+            Ok(resp) if resp.status().is_success() => {
+                self.mark_sent(&key).await;
+            }
+            _ => {}
+        }
     }
 }
 
@@ -146,5 +152,20 @@ pub fn webhook_watchdog_from_env(default_cooldown: Duration) -> Arc<dyn Watchdog
         Arc::new(WebhookWatchdog::new(url, default_cooldown, None))
     } else {
         noop_watchdog()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn webhook_watchdog_cooldown_is_marked_only_after_success() {
+        let wd = WebhookWatchdog::new("http://localhost/webhook", Duration::from_secs(60), None);
+
+        assert!(wd.should_send("hb:Running").await);
+        assert!(wd.should_send("hb:Running").await);
+        wd.mark_sent("hb:Running").await;
+        assert!(!wd.should_send("hb:Running").await);
     }
 }
