@@ -1072,6 +1072,55 @@ async fn mexc_non_bridge_withdraw_behavior_unchanged() {
 }
 
 #[tokio::test]
+async fn mexc_non_bridge_withdraw_below_min_completes_as_zero_output_dust() {
+    let mut cex = MockCexBackend::new();
+    let transfers = MockTransferActions::new();
+
+    cex.expect_withdraw()
+        .times(1)
+        .returning(|_asset, _network, _address, _amount| {
+            Err(
+                r#"Error response: ErrorResponse { code: InvalidResponse, raw_code: 10254, msg: "Withdrawal shall not be less than the Min amount of:0.00002", _extend: None }"#
+                    .to_string(),
+            )
+        });
+
+    let finalizer = MexcFinalizer::new(
+        Arc::new(cex),
+        Arc::new(transfers),
+        Principal::anonymous(),
+        TEST_MAX_SELL_SLIPPAGE_BPS,
+        TEST_CEX_MIN_EXEC_USD,
+        TEST_CEX_SLICE_TARGET_RATIO,
+    );
+
+    let receipt = make_execution_receipt(13);
+    let mut state = finalizer.prepare("13", &receipt).await.expect("prepare should succeed");
+    state.step = CexStep::Withdraw;
+    state.withdraw.size_out = Some(ChainTokenAmount::from_formatted(
+        state.withdraw.withdraw_asset.clone(),
+        0.00001,
+    ));
+
+    finalizer
+        .withdraw(&mut state)
+        .await
+        .expect("below-min withdraw should be treated as terminal CEX dust");
+
+    assert!(matches!(state.step, CexStep::Completed));
+    assert!(state.withdraw.withdraw_id.is_none());
+    assert!(state.withdraw.withdraw_txid.is_none());
+    assert_eq!(state.withdraw.size_out.as_ref().unwrap().value, Nat::from(0u8));
+    assert!(
+        state
+            .last_error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("mexc withdraw below minimum")
+    );
+}
+
+#[tokio::test]
 async fn mexc_non_bridge_withdraw_keeps_evm_destination_address() {
     let mut cex = MockCexBackend::new();
     let transfers = MockTransferActions::new();

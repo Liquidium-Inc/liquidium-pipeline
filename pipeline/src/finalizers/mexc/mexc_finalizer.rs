@@ -27,6 +27,7 @@ use super::mexc_utils::{
 };
 
 const WITHDRAW_BRIDGE_SOURCE_BALANCE_TOLERANCE: f64 = LIQUIDITY_EPS;
+const MEXC_WITHDRAW_BELOW_MIN_MESSAGE: &str = "Withdrawal shall not be less than the Min amount of";
 
 use crate::{
     finalizers::bridge_planner::BridgePlanner,
@@ -51,6 +52,10 @@ pub struct MexcBridgeConfig {
 pub struct MexcBridgeDependencies {
     pub backend: Arc<dyn BridgeBackend>,
     pub config: MexcBridgeConfig,
+}
+
+fn is_mexc_withdraw_below_min_error(err: &str) -> bool {
+    err.contains(MEXC_WITHDRAW_BELOW_MIN_MESSAGE)
 }
 
 // MEXC-specific implementation of the generic CEX finalizer logic.
@@ -117,6 +122,26 @@ impl<C> MexcFinalizer<C>
 where
     C: CexBackend,
 {
+    fn complete_withdraw_as_below_min_dust(
+        state: &mut CexState,
+        planned_asset: &str,
+        planned_network: &str,
+        amount: f64,
+        err: &str,
+    ) {
+        let msg = format!(
+            "mexc withdraw below minimum; treating residual as CEX dust for liq_id {} asset={} network={} amount={} err={}",
+            state.liq_id, planned_asset, planned_network, amount, err
+        );
+        warn!("{}", msg);
+        state.last_error = Some(msg);
+        state.withdraw.size_out = Some(ChainTokenAmount::from_raw(
+            state.withdraw.withdraw_asset.clone(),
+            Nat::from(0u8),
+        ));
+        state.step = CexStep::Completed;
+    }
+
     fn direct_deposit_destination_account(
         token: &ChainToken,
         planned_network: &str,
@@ -859,7 +884,7 @@ where
                 return Ok(());
             }
 
-            let receipt = self
+            let receipt = match self
                 .backend
                 .withdraw(
                     &planned_asset,
@@ -867,7 +892,21 @@ where
                     &state.withdraw.withdraw_address,
                     amount,
                 )
-                .await?;
+                .await
+            {
+                Ok(receipt) => receipt,
+                Err(err) if is_mexc_withdraw_below_min_error(&err) => {
+                    Self::complete_withdraw_as_below_min_dust(
+                        state,
+                        &planned_asset,
+                        &planned_network,
+                        amount,
+                        &err,
+                    );
+                    return Ok(());
+                }
+                Err(err) => return Err(err),
+            };
             state.withdraw.withdraw_id = receipt.internal_id.clone();
             state.withdraw.withdraw_txid = receipt.txid.clone();
             state.step = CexStep::Completed;
@@ -897,7 +936,7 @@ where
 
         // Submit CEX withdraw once (to bridge source), then keep polling in WithdrawPending.
         if state.withdraw.withdraw_id.is_none() && state.withdraw.withdraw_txid.is_none() {
-            let receipt = self
+            let receipt = match self
                 .backend
                 .withdraw(
                     &planned_asset,
@@ -905,7 +944,21 @@ where
                     &state.withdraw.withdraw_address,
                     amount,
                 )
-                .await?;
+                .await
+            {
+                Ok(receipt) => receipt,
+                Err(err) if is_mexc_withdraw_below_min_error(&err) => {
+                    Self::complete_withdraw_as_below_min_dust(
+                        state,
+                        &planned_asset,
+                        &planned_network,
+                        amount,
+                        &err,
+                    );
+                    return Ok(());
+                }
+                Err(err) => return Err(err),
+            };
             state.withdraw.withdraw_id = receipt.internal_id.clone();
             state.withdraw.withdraw_txid = receipt.txid.clone();
             state.step = CexStep::WithdrawPending;
