@@ -31,7 +31,7 @@ use crate::stages::{
 use crate::swappers::router::SwapRouter;
 use crate::watchdog::{Watchdog, WatchdogEvent, balance_monitor::LowBalanceMonitor};
 use anyhow::Context as _;
-use futures::FutureExt;
+use futures::{FutureExt, StreamExt, stream};
 use ic_agent::Agent;
 use liquidium_pipeline_core::tokens::{
     chain_token::ChainToken,
@@ -43,6 +43,8 @@ const LIQUIDATION_CYCLE_TIMEOUT: Duration = Duration::from_secs(300);
 const FINALIZER_STAGE_TIMEOUT: Duration = Duration::from_secs(300);
 const EXPORT_STAGE_TIMEOUT: Duration = Duration::from_secs(20);
 const WATCHDOG_STAGE_TIMEOUT: Duration = Duration::from_secs(10);
+const LIQUIDATION_NOTIFY_STAGE_TIMEOUT: Duration = Duration::from_secs(10);
+const LIQUIDATION_NOTIFY_CONCURRENCY: usize = 4;
 const LOW_BALANCE_MONITOR_STAGE_TIMEOUT: Duration = Duration::from_secs(45);
 const REFRESH_ALLOWANCES_TIMEOUT: Duration = Duration::from_secs(45);
 const SCAN_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(300);
@@ -490,7 +492,17 @@ async fn run_single_daemon_cycle(
             }
         }
         log_execution_results(&outcomes);
-        notify_liquidation_outcomes(slack_watchdog, &outcomes).await;
+        if stage_with_timeout(
+            "watchdog.liquidation_notifications",
+            LIQUIDATION_NOTIFY_STAGE_TIMEOUT,
+            notify_liquidation_outcomes(slack_watchdog, &outcomes),
+        )
+        .await
+        .is_none()
+        {
+            had_timeout = true;
+        }
+
         if ui_enabled {
             print_execution_results(outcomes.clone());
         }
@@ -547,9 +559,11 @@ async fn notify_liquidation_outcomes(slack_watchdog: Option<&Arc<dyn Watchdog>>,
         return;
     };
 
-    for outcome in outcomes {
-        watchdog.notify(liquidation_finalized_event(outcome)).await;
-    }
+    stream::iter(outcomes)
+        .for_each_concurrent(LIQUIDATION_NOTIFY_CONCURRENCY, |outcome| async move {
+            watchdog.notify(liquidation_finalized_event(outcome)).await;
+        })
+        .await;
 }
 
 fn liquidation_finalized_event(outcome: &LiquidationOutcome) -> WatchdogEvent<'static> {

@@ -81,6 +81,16 @@ impl Watchdog for SlackWatchdog {
 fn slack_cooldown_key(ev: &WatchdogEvent<'_>) -> Option<String> {
     match ev {
         WatchdogEvent::LowBalance { account, asset_id, .. } => Some(format!("low_balance:{account}:{asset_id}")),
+        WatchdogEvent::LiquidationFinalized {
+            liquidation_id,
+            borrower,
+            debt_asset,
+            collateral_asset,
+            status,
+            ..
+        } => Some(format!(
+            "liquidation_finalized:{liquidation_id}:{borrower}:{debt_asset}:{collateral_asset}:{status}"
+        )),
         _ => None,
     }
 }
@@ -373,7 +383,7 @@ mod tests {
     }
 
     #[test]
-    fn lifecycle_and_liquidation_events_are_not_cooldown_keyed() {
+    fn lifecycle_events_are_not_cooldown_keyed_but_liquidations_are() {
         let lifecycle = WatchdogEvent::Lifecycle {
             state: "paused".to_string(),
             details: "Liquidation initiation suspended.".to_string(),
@@ -395,6 +405,9 @@ mod tests {
         };
 
         assert!(slack_cooldown_key(&lifecycle).is_none());
-        assert!(slack_cooldown_key(&liquidation).is_none());
+        assert_eq!(
+            slack_cooldown_key(&liquidation),
+            Some("liquidation_finalized:7:aaaaa-aa:ICP:ckBTC:Success".to_string())
+        );
     }
 }
