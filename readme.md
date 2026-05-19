@@ -313,9 +313,9 @@ LOW_BALANCE_THRESHOLDS=ckBTC=0.001,ckUSDT=100,ckUSDC=100,ICP=5,ETH=0.05
 ```
 
 > `WATCHDOG_WEBHOOK`: if set, the bot sends POST requests with JSON payloads for monitoring and alerting (for example: Slack, Discord, or custom services).
-> `SLACK_WEBHOOK_URL`: if set, the daemon sends Slack incoming-webhook alerts for main low balances, bridge ETH low balance, lifecycle changes, and finalized liquidations.
+> `SLACK_WEBHOOK_URL`: if set, the daemon sends Slack incoming-webhook alerts for main low balances, bridge ETH/ckETH low balance, lifecycle changes, and finalized liquidations.
 > `BOT_NAME`: optional Slack label used in notifications so shared channels can identify which bot emitted the alert.
-> `LOW_BALANCE_THRESHOLDS`: optional comma-separated symbol thresholds in token units. Missing symbols use defaults; unknown symbols are monitored only when explicitly listed.
+> `LOW_BALANCE_THRESHOLDS`: optional comma-separated symbol thresholds in token units, applied only when Slack monitoring is enabled with `SLACK_WEBHOOK_URL`. If `SLACK_WEBHOOK_URL` is not provided, no Slack low-balance alerts are sent even when `LOW_BALANCE_THRESHOLDS` is configured. Missing symbols use defaults; unknown symbols are monitored only when explicitly listed.
 
 ---
 
