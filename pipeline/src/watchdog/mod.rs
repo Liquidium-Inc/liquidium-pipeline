@@ -93,18 +93,22 @@ impl WebhookWatchdog {
         }
     }
 
-    async fn should_send(&self, key: &str) -> bool {
+    async fn reserve_for_send(&self, key: &str) -> Option<Instant> {
         let mut m = self.last.lock().await;
         let now = Instant::now();
         m.retain(|_, ts| now.duration_since(*ts) < self.cooldown);
-        !matches!(m.get(key), Some(&t) if now.duration_since(t) < self.cooldown)
+        if matches!(m.get(key), Some(&t) if now.duration_since(t) < self.cooldown) {
+            return None;
+        }
+        m.insert(key.to_string(), now);
+        Some(now)
     }
 
-    async fn mark_sent(&self, key: &str) {
+    async fn release_reservation(&self, key: &str, reserved_at: Instant) {
         let mut m = self.last.lock().await;
-        let now = Instant::now();
-        m.retain(|_, ts| now.duration_since(*ts) < self.cooldown);
-        m.insert(key.to_string(), now);
+        if m.get(key).is_some_and(|ts| *ts == reserved_at) {
+            m.remove(key);
+        }
     }
 }
 
@@ -123,9 +127,9 @@ impl Watchdog for WebhookWatchdog {
                 format!("liquidation_finalized:{liquidation_id}:{status}")
             }
         };
-        if !self.should_send(&key).await {
+        let Some(reserved_at) = self.reserve_for_send(&key).await else {
             return;
-        }
+        };
 
         let payload = serde_json::json!({
             "ts": chrono::Utc::now().timestamp(),
@@ -134,10 +138,31 @@ impl Watchdog for WebhookWatchdog {
         });
 
         match self.client.post(&self.url).json(&payload).send().await {
-            Ok(resp) if resp.status().is_success() => {
-                self.mark_sent(&key).await;
+            Ok(resp) if resp.status().is_success() => {}
+            Ok(resp) => {
+                let status = resp.status();
+                let body = resp
+                    .text()
+                    .await
+                    .unwrap_or_else(|err| format!("<failed to read response body: {err}>"));
+                tracing::error!(
+                    key = %key,
+                    url = %self.url,
+                    status = %status,
+                    body = %body,
+                    "Webhook notification failed with non-success status"
+                );
+                self.release_reservation(&key, reserved_at).await;
             }
-            _ => {}
+            Err(err) => {
+                tracing::error!(
+                    key = %key,
+                    url = %self.url,
+                    error = %err,
+                    "Webhook notification transport failed"
+                );
+                self.release_reservation(&key, reserved_at).await;
+            }
         }
     }
 }
@@ -163,9 +188,9 @@ mod tests {
     async fn webhook_watchdog_cooldown_is_marked_only_after_success() {
         let wd = WebhookWatchdog::new("http://localhost/webhook", Duration::from_secs(60), None);
 
-        assert!(wd.should_send("hb:Running").await);
-        assert!(wd.should_send("hb:Running").await);
-        wd.mark_sent("hb:Running").await;
-        assert!(!wd.should_send("hb:Running").await);
+        let reserved_at = wd.reserve_for_send("hb:Running").await.expect("first reserve");
+        assert!(wd.reserve_for_send("hb:Running").await.is_none());
+        wd.release_reservation("hb:Running", reserved_at).await;
+        assert!(wd.reserve_for_send("hb:Running").await.is_some());
     }
 }
