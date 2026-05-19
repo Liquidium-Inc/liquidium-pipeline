@@ -3,9 +3,10 @@ use alloy::{
     providers::{Provider, ProviderBuilder},
     signers::local::PrivateKeySigner,
 };
+use candid::{Nat, Principal};
 use icrc_ledger_types::icrc1::account::Account;
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeSet, HashMap},
     path::PathBuf,
     sync::{Arc, atomic::AtomicBool},
     time::Duration,
@@ -49,7 +50,12 @@ use liquidium_pipeline_connectors::backend::{
     icp_backend::IcpBackendImpl,
 };
 
-use liquidium_pipeline_core::tokens::token_registry::TokenRegistry;
+use liquidium_pipeline_core::{
+    balance_service::BalanceService,
+    tokens::{chain_token::ChainToken, token_registry::TokenRegistry},
+};
+
+const BRIDGE_CKETH_LEDGER_ID: &str = "ss2fx-dyaaa-aaaar-qacoq-cai";
 
 #[instrument(name = "liquidation.init", skip_all, err)]
 async fn init(
@@ -249,6 +255,31 @@ async fn init(
     Ok((finder, strategy, executor, exporter, finalizer))
 }
 
+fn bridge_low_balance_service(ctx: &PipelineContext) -> Arc<BalanceService> {
+    let tokens = vec![
+        ChainToken::EvmNative {
+            chain: "eth".to_string(),
+            symbol: "ETH".to_string(),
+            decimals: 18,
+            fee: Nat::from(0u8),
+        },
+        ChainToken::Icp {
+            ledger: Principal::from_text(BRIDGE_CKETH_LEDGER_ID).expect("valid ckETH ledger principal"),
+            symbol: "ckETH".to_string(),
+            decimals: 18,
+            fee: Nat::from(0u8),
+        },
+    ];
+    let registry = TokenRegistry::new(
+        tokens
+            .into_iter()
+            .map(|token| (token.asset_id(), token))
+            .collect::<HashMap<_, _>>(),
+    );
+
+    Arc::new(BalanceService::new(Arc::new(registry), ctx.bridge_service.accounts()))
+}
+
 pub async fn run_liquidation_loop(sock_path: PathBuf) {
     // Auditor note:
     // This function is the foreground daemon entrypoint. It does not fork/detach;
@@ -389,8 +420,8 @@ pub async fn run_liquidation_loop(sock_path: PathBuf) {
                 },
                 MonitoredBalanceAccount {
                     label: "bridge",
-                    service: ctx.bridge_service.clone(),
-                    only_symbols: Some(vec!["ETH", "ckETH"]),
+                    service: bridge_low_balance_service(&ctx),
+                    only_symbols: None,
                 },
             ],
             slack.clone(),

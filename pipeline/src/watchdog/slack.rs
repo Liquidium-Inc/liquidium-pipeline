@@ -50,31 +50,21 @@ impl SlackWatchdog {
         m.insert(key.to_string(), now);
         Some(now)
     }
-
-    async fn release_reservation(&self, key: &str, reserved_at: Instant) {
-        let mut m = self.last.lock().await;
-        if m.get(key).is_some_and(|ts| *ts == reserved_at) {
-            m.remove(key);
-        }
-    }
 }
 
 #[async_trait]
 impl Watchdog for SlackWatchdog {
     async fn notify(&self, ev: WatchdogEvent<'_>) {
         let cooldown_key = slack_cooldown_key(&ev);
-        let reservation = match cooldown_key.as_deref() {
+        match cooldown_key.as_deref() {
             Some(key) => match self.reserve_for_send(key).await {
-                Some(reserved_at) => Some((key.to_string(), reserved_at)),
+                Some(_) => {}
                 None => return,
             },
-            None => None,
-        };
+            None => {}
+        }
 
         let Some(payload) = slack_payload_for_event_with_bot(&ev, &self.bot_name) else {
-            if let Some((key, reserved_at)) = reservation {
-                self.release_reservation(&key, reserved_at).await;
-            }
             return;
         };
 
@@ -82,15 +72,9 @@ impl Watchdog for SlackWatchdog {
             Ok(resp) if resp.status().is_success() => {}
             Ok(resp) if !resp.status().is_success() => {
                 warn!("Slack notification failed with status {}", resp.status());
-                if let Some((key, reserved_at)) = reservation {
-                    self.release_reservation(&key, reserved_at).await;
-                }
             }
             Err(err) => {
                 warn!("Slack notification failed: {}", err);
-                if let Some((key, reserved_at)) = reservation {
-                    self.release_reservation(&key, reserved_at).await;
-                }
             }
             _ => {}
         }
@@ -396,14 +380,9 @@ mod tests {
     async fn slack_watchdog_cooldown_suppresses_repeated_keys() {
         let wd = SlackWatchdog::new("http://localhost/slack", Duration::from_secs(60));
 
-        let reserved_at = wd
-            .reserve_for_send("low_balance:main:ckBTC")
-            .await
-            .expect("first reserve");
+        assert!(wd.reserve_for_send("low_balance:main:ckBTC").await.is_some());
         assert!(wd.reserve_for_send("low_balance:main:ckBTC").await.is_none());
         assert!(wd.reserve_for_send("low_balance:trader:ckBTC").await.is_some());
-        wd.release_reservation("low_balance:main:ckBTC", reserved_at).await;
-        assert!(wd.reserve_for_send("low_balance:main:ckBTC").await.is_some());
     }
 
     #[test]

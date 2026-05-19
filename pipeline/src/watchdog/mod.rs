@@ -104,12 +104,6 @@ impl WebhookWatchdog {
         Some(now)
     }
 
-    async fn release_reservation(&self, key: &str, reserved_at: Instant) {
-        let mut m = self.last.lock().await;
-        if m.get(key).is_some_and(|ts| *ts == reserved_at) {
-            m.remove(key);
-        }
-    }
 }
 
 #[async_trait]
@@ -127,7 +121,7 @@ impl Watchdog for WebhookWatchdog {
                 format!("liquidation_finalized:{liquidation_id}:{status}")
             }
         };
-        let Some(reserved_at) = self.reserve_for_send(&key).await else {
+        let Some(_reserved_at) = self.reserve_for_send(&key).await else {
             return;
         };
 
@@ -152,7 +146,6 @@ impl Watchdog for WebhookWatchdog {
                     body = %body,
                     "Webhook notification failed with non-success status"
                 );
-                self.release_reservation(&key, reserved_at).await;
             }
             Err(err) => {
                 tracing::error!(
@@ -161,7 +154,6 @@ impl Watchdog for WebhookWatchdog {
                     error = %err,
                     "Webhook notification transport failed"
                 );
-                self.release_reservation(&key, reserved_at).await;
             }
         }
     }
@@ -185,12 +177,10 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn webhook_watchdog_cooldown_is_marked_only_after_success() {
+    async fn webhook_watchdog_attempt_reservation_consumes_cooldown() {
         let wd = WebhookWatchdog::new("http://localhost/webhook", Duration::from_secs(60), None);
 
-        let reserved_at = wd.reserve_for_send("hb:Running").await.expect("first reserve");
-        assert!(wd.reserve_for_send("hb:Running").await.is_none());
-        wd.release_reservation("hb:Running", reserved_at).await;
         assert!(wd.reserve_for_send("hb:Running").await.is_some());
+        assert!(wd.reserve_for_send("hb:Running").await.is_none());
     }
 }
