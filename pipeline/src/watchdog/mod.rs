@@ -164,8 +164,24 @@ pub fn noop_watchdog() -> Arc<dyn Watchdog> {
     Arc::new(NoopWatchdog)
 }
 
+fn normalize_webhook_url(raw: &str) -> Option<String> {
+    let url = raw.trim();
+    if url.is_empty() {
+        return None;
+    }
+    match reqwest::Url::parse(url) {
+        Ok(_) => Some(url.to_string()),
+        Err(err) => {
+            warn!("Ignoring invalid WATCHDOG_WEBHOOK URL: {}", err);
+            None
+        }
+    }
+}
+
 pub fn webhook_watchdog_from_env(default_cooldown: Duration) -> Arc<dyn Watchdog> {
-    if let Ok(url) = std::env::var("WATCHDOG_WEBHOOK") {
+    if let Ok(raw_url) = std::env::var("WATCHDOG_WEBHOOK")
+        && let Some(url) = normalize_webhook_url(&raw_url)
+    {
         Arc::new(WebhookWatchdog::new(url, default_cooldown, None))
     } else {
         noop_watchdog()
@@ -182,5 +198,24 @@ mod tests {
 
         assert!(wd.reserve_for_send("hb:Running").await.is_some());
         assert!(wd.reserve_for_send("hb:Running").await.is_none());
+    }
+
+    #[test]
+    fn normalize_webhook_url_ignores_blank_values() {
+        assert_eq!(normalize_webhook_url(""), None);
+        assert_eq!(normalize_webhook_url("   "), None);
+    }
+
+    #[test]
+    fn normalize_webhook_url_rejects_malformed_values() {
+        assert_eq!(normalize_webhook_url("not a url"), None);
+    }
+
+    #[test]
+    fn normalize_webhook_url_accepts_valid_values() {
+        assert_eq!(
+            normalize_webhook_url(" https://example.com/webhook "),
+            Some("https://example.com/webhook".to_string())
+        );
     }
 }

@@ -23,6 +23,7 @@ pub struct MonitoredBalanceAccount {
     pub label: &'static str,
     pub service: Arc<BalanceService>,
     pub only_symbols: Option<Vec<&'static str>>,
+    pub exclude_symbols: Option<Vec<String>>,
 }
 
 pub struct LowBalanceMonitor {
@@ -98,7 +99,40 @@ fn monitored_asset_ids_for_account(account: &MonitoredBalanceAccount) -> Vec<Ass
                 .any(|symbol| asset_id.symbol.eq_ignore_ascii_case(symbol))
         });
     }
+    if let Some(symbols) = &account.exclude_symbols {
+        asset_ids.retain(|asset_id| {
+            !symbols
+                .iter()
+                .any(|symbol| asset_id.symbol.eq_ignore_ascii_case(symbol))
+        });
+    }
     asset_ids
+}
+
+pub fn balance_check_exclude_from_env() -> Option<Vec<String>> {
+    std::env::var("BALANCE_CHECK_EXCLUDE")
+        .ok()
+        .and_then(|raw| parse_balance_check_exclude(&raw))
+}
+
+fn parse_balance_check_exclude(raw: &str) -> Option<Vec<String>> {
+    let symbols = raw
+        .split(',')
+        .filter_map(|symbol| {
+            let symbol = symbol.trim();
+            if symbol.is_empty() {
+                None
+            } else {
+                Some(symbol.to_ascii_uppercase())
+            }
+        })
+        .collect::<Vec<_>>();
+
+    if symbols.is_empty() {
+        None
+    } else {
+        Some(symbols)
+    }
 }
 
 pub fn monitored_asset_ids(registry: &dyn TokenRegistryTrait) -> Vec<AssetId> {
@@ -371,12 +405,48 @@ mod tests {
             label: "bridge",
             service,
             only_symbols: Some(vec!["ETH", "ckETH"]),
+            exclude_symbols: None,
         };
 
         let assets = monitored_asset_ids_for_account(&monitored);
         let mut symbols: Vec<&str> = assets.iter().map(|asset| asset.symbol.as_str()).collect();
         symbols.sort_unstable();
         assert_eq!(symbols, vec!["ETH", "ckETH"]);
+    }
+
+    #[test]
+    fn parse_balance_check_exclude_ignores_empty_values() {
+        assert_eq!(parse_balance_check_exclude(""), None);
+        assert_eq!(parse_balance_check_exclude(" , , "), None);
+    }
+
+    #[test]
+    fn parse_balance_check_exclude_normalizes_symbols() {
+        assert_eq!(
+            parse_balance_check_exclude("ckETH, ETH , icp"),
+            Some(vec!["CKETH".to_string(), "ETH".to_string(), "ICP".to_string()])
+        );
+    }
+
+    #[test]
+    fn account_symbol_exclude_limits_monitored_assets() {
+        let registry = registry_with_tokens(vec![
+            icp_token_with_ledger("ckBTC", 8, 1),
+            icp_token_with_ledger("ckETH", 18, 2),
+            icp_token_with_ledger("ICP", 8, 3),
+        ]);
+        let account = MockAccountInfo::new();
+        let service = Arc::new(BalanceService::new(registry, Arc::new(account)));
+        let monitored = MonitoredBalanceAccount {
+            label: "main",
+            service,
+            only_symbols: None,
+            exclude_symbols: Some(vec!["CKETH".to_string(), "ICP".to_string()]),
+        };
+
+        let assets = monitored_asset_ids_for_account(&monitored);
+        let symbols: Vec<&str> = assets.iter().map(|asset| asset.symbol.as_str()).collect();
+        assert_eq!(symbols, vec!["ckBTC"]);
     }
 
     #[test]
@@ -491,6 +561,7 @@ mod tests {
                 label: "main",
                 service,
                 only_symbols: None,
+                exclude_symbols: None,
             }],
             recorder.clone(),
             Duration::from_secs(60),

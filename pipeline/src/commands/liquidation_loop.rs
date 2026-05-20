@@ -39,7 +39,9 @@ use crate::{
     swappers::{mexc::mexc_adapter::MexcClient, router::SwapRouter},
     watchdog::{
         WatchdogEvent,
-        balance_monitor::{DEFAULT_LOW_BALANCE_ALERT_COOLDOWN, LowBalanceMonitor, MonitoredBalanceAccount},
+        balance_monitor::{
+            DEFAULT_LOW_BALANCE_ALERT_COOLDOWN, LowBalanceMonitor, MonitoredBalanceAccount, balance_check_exclude_from_env,
+        },
         slack_watchdog_from_env, slack_webhook_configured, webhook_watchdog_from_env,
     },
 };
@@ -417,11 +419,13 @@ pub async fn run_liquidation_loop(sock_path: PathBuf) {
                     label: "main",
                     service: ctx.main_service.clone(),
                     only_symbols: None,
+                    exclude_symbols: balance_check_exclude_from_env(),
                 },
                 MonitoredBalanceAccount {
                     label: "bridge",
                     service: bridge_low_balance_service(&ctx),
                     only_symbols: None,
+                    exclude_symbols: None,
                 },
             ],
             slack.clone(),
