@@ -41,6 +41,16 @@ fn is_valid_mexc_client_order_id(value: &str) -> bool {
         .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
 }
 
+#[test]
+fn mexc_withdraw_below_min_detection_uses_raw_code() {
+    assert!(is_mexc_withdraw_below_min_error(
+        r#"Error response: ErrorResponse { code: InvalidResponse, raw_code: 10254, msg: "localized or changed text", _extend: None }"#
+    ));
+    assert!(!is_mexc_withdraw_below_min_error(
+        "Withdrawal shall not be less than the Min amount of:0.00002"
+    ));
+}
+
 fn make_execution_receipt(liq_id: u128) -> ExecutionReceipt {
     let collateral_token = ChainToken::Icp {
         ledger: Principal::anonymous(),
@@ -1106,6 +1116,62 @@ async fn mexc_non_bridge_withdraw_below_min_completes_as_zero_output_dust() {
         .withdraw(&mut state)
         .await
         .expect("below-min withdraw should be treated as terminal CEX dust");
+
+    assert!(matches!(state.step, CexStep::Completed));
+    assert!(state.withdraw.withdraw_id.is_none());
+    assert!(state.withdraw.withdraw_txid.is_none());
+    assert_eq!(state.withdraw.size_out.as_ref().unwrap().value, Nat::from(0u8));
+    assert!(
+        state
+            .last_error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("mexc withdraw below minimum")
+    );
+}
+
+#[tokio::test]
+async fn mexc_bridged_withdraw_below_min_completes_as_zero_output_dust() {
+    let mut cex = MockCexBackend::new();
+    let bridge = MockBridgeBackend::new();
+    let transfers = MockTransferActions::new();
+
+    cex.expect_withdraw()
+        .times(1)
+        .returning(|asset, network, address, amount| {
+            assert_eq!(asset, "USDC");
+            assert_eq!(network, "ETH");
+            assert_eq!(address, "0x2222222222222222222222222222222222222222");
+            assert_eq!(amount, 0.00001);
+            Err(
+                r#"Error response: ErrorResponse { code: InvalidResponse, raw_code: 10254, msg: "localized or changed text", _extend: None }"#
+                    .to_string(),
+            )
+        });
+
+    let finalizer = MexcFinalizer::new(
+        Arc::new(cex),
+        Arc::new(transfers),
+        Principal::anonymous(),
+        TEST_MAX_SELL_SLIPPAGE_BPS,
+        TEST_CEX_MIN_EXEC_USD,
+        TEST_CEX_SLICE_TARGET_RATIO,
+    )
+    .with_bridge_dependencies(bridge_dependencies(Arc::new(bridge)));
+
+    let receipt = make_execution_receipt_with_assets(14, ckbtc_token(), ckusdc_token());
+    let mut state = finalizer.prepare("14", &receipt).await.expect("prepare should succeed");
+    assert!(state.withdraw.bridge.withdraw_bridge_required);
+    state.step = CexStep::Withdraw;
+    state.withdraw.size_out = Some(ChainTokenAmount::from_formatted(
+        state.withdraw.withdraw_asset.clone(),
+        0.00001,
+    ));
+
+    finalizer
+        .withdraw(&mut state)
+        .await
+        .expect("bridged below-min withdraw should be treated as terminal CEX dust");
 
     assert!(matches!(state.step, CexStep::Completed));
     assert!(state.withdraw.withdraw_id.is_none());
