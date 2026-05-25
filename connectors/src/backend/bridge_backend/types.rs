@@ -32,6 +32,8 @@ impl BridgeDestination {
 pub enum BridgeRouteKind {
     CkEthErc20Forward,
     CkEthErc20Reverse,
+    EthToCkEth,
+    CkEthToEth,
     BtcToCkBtc,
     CkBtcToBtc,
 }
@@ -114,9 +116,13 @@ pub(super) struct CkEthMinterInfo {
     #[serde(default)]
     pub deposit_with_subaccount_helper_contract_address: Option<String>,
     #[serde(default)]
+    pub eth_helper_contract_address: Option<String>,
+    #[serde(default)]
     pub erc20_helper_contract_address: Option<String>,
     #[serde(default)]
     pub cketh_ledger_id: Option<Principal>,
+    #[serde(default)]
+    pub minimum_withdrawal_amount: Option<Nat>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -149,9 +155,21 @@ pub(super) struct WithdrawErc20Arg {
 }
 
 #[derive(CandidType, Deserialize, Clone, Debug)]
+pub(super) struct WithdrawalArg {
+    pub amount: Nat,
+    pub recipient: String,
+    pub from_subaccount: Option<Vec<u8>>,
+}
+
+#[derive(CandidType, Deserialize, Clone, Debug)]
 pub(super) struct RetrieveErc20Request {
     pub ckerc20_block_index: Nat,
     pub cketh_block_index: Nat,
+}
+
+#[derive(CandidType, Deserialize, Clone, Debug)]
+pub(super) struct RetrieveEthRequest {
+    pub block_index: Nat,
 }
 
 #[derive(CandidType, Deserialize, Clone, Debug)]
@@ -194,7 +212,23 @@ pub(super) enum WithdrawErc20Error {
 }
 
 #[derive(CandidType, Deserialize, Clone, Debug)]
+pub(super) enum WithdrawalError {
+    AmountTooLow { min_withdrawal_amount: Nat },
+    InsufficientFunds { balance: Nat },
+    InsufficientAllowance { allowance: Nat },
+    TemporarilyUnavailable(String),
+    RecipientAddressBlocked { address: String },
+    GenericError { error_code: Nat, message: String },
+}
+
+#[derive(CandidType, Deserialize, Clone, Debug)]
 pub(super) enum WithdrawErc20Ret {
     Ok(RetrieveErc20Request),
     Err(WithdrawErc20Error),
+}
+
+#[derive(CandidType, Deserialize, Clone, Debug)]
+pub(super) enum WithdrawalRet {
+    Ok(RetrieveEthRequest),
+    Err(WithdrawalError),
 }

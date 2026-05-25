@@ -123,8 +123,8 @@ EVM_RPC_URL=https://arb1.arbitrum.io/rpc
 MNEMONIC_FILE=~/.liquidium-pipeline/wallets/key
 
 # Assets (comma-separated chain:address:symbol entries)
-DEBT_ASSETS=icp:mxzaz-hqaaa-aaaar-qaada-cai:ckBTC,icp:cngnf-vqaaa-aaaar-qag4q-cai:ckUSDT,icp:xevnm-gaaaa-aaaar-qafnq-cai:ckUSDC,icp:ryjl3-tyaaa-aaaaa-aaaba-cai:ICP
-COLLATERAL_ASSETS=icp:mxzaz-hqaaa-aaaar-qaada-cai:ckBTC,icp:cngnf-vqaaa-aaaar-qag4q-cai:ckUSDT,icp:xevnm-gaaaa-aaaar-qafnq-cai:ckUSDC,icp:ryjl3-tyaaa-aaaaa-aaaba-cai:ICP
+DEBT_ASSETS=icp:mxzaz-hqaaa-aaaar-qaada-cai:ckBTC,icp:cngnf-vqaaa-aaaar-qag4q-cai:ckUSDT,icp:xevnm-gaaaa-aaaar-qafnq-cai:ckUSDC,icp:ss2fx-dyaaa-aaaar-qacoq-cai:ckETH,icp:ryjl3-tyaaa-aaaaa-aaaba-cai:ICP
+COLLATERAL_ASSETS=icp:mxzaz-hqaaa-aaaar-qaada-cai:ckBTC,icp:cngnf-vqaaa-aaaar-qag4q-cai:ckUSDT,icp:xevnm-gaaaa-aaaar-qafnq-cai:ckUSDC,icp:ss2fx-dyaaa-aaaar-qacoq-cai:ckETH,icp:ryjl3-tyaaa-aaaaa-aaaba-cai:ICP
 
 # Optional: only scan specific borrower principals (comma-separated). Set to "none" to disable.
 OPPORTUNITY_ACCOUNT_FILTER=principal1,principal2
@@ -354,11 +354,11 @@ Mnemonic
         └── Bridge ICP account             owner-only (subaccount = None)
 ```
 
-Current bridge sweeper wiring:
-- Forward source: derived `bridge_evm_address` (`USDC@ETH -> ckUSDC`)
-- Reverse source: derived bridge ICP owner account (`ckUSDC@ICP -> USDC@ETH`)
+Current bridge/finalizer wiring:
+- Forward source: derived `bridge_evm_address` (`ETH@ETH -> ckETH`, `USDC@ETH -> ckUSDC`)
+- Reverse source: derived bridge ICP owner account (`ckETH@ICP -> ETH@ETH`, `ckUSDC@ICP -> USDC@ETH`)
 - Destination: resolved per request in code (forward default: liquidator ICP principal; reverse default: liquidator EVM address)
-- Routes: loaded from a code-level bridge catalog (`ckETH` ERC-20 routes); submissions are serialized per sweeper loop.
+- Routes: loaded from a code-level bridge catalog (`ckETH` native and ERC-20 routes); submissions are serialized per bridge source.
 - Design details: `docs/bridge-architecture.md`
 
 ### Generate New Identities

@@ -176,6 +176,15 @@ fn ckusdc_token() -> ChainToken {
     }
 }
 
+fn cketh_token() -> ChainToken {
+    ChainToken::Icp {
+        ledger: Principal::from_text("ss2fx-dyaaa-aaaar-qacoq-cai").expect("ledger"),
+        symbol: "ckETH".to_string(),
+        decimals: 18,
+        fee: Nat::from(2_000_000_000_000u64),
+    }
+}
+
 fn ckbtc_token() -> ChainToken {
     ChainToken::Icp {
         ledger: Principal::anonymous(),
@@ -246,6 +255,56 @@ async fn mexc_prepare_builds_initial_cex_state() {
     assert!(state.withdraw.withdraw_id.is_none());
     assert!(state.withdraw.withdraw_txid.is_none());
     assert!(state.withdraw.size_out.is_none());
+}
+
+#[tokio::test]
+async fn mexc_prepare_maps_cketh_collateral_to_eth_deposit_bridge_plan() {
+    let backend = Arc::new(MockCexBackend::new());
+    let transfer_service = Arc::new(MockTransferActions::new());
+    let finalizer = MexcFinalizer::new(
+        backend,
+        transfer_service,
+        Principal::anonymous(),
+        TEST_MAX_SELL_SLIPPAGE_BPS,
+        TEST_CEX_MIN_EXEC_USD,
+        TEST_CEX_SLICE_TARGET_RATIO,
+    )
+    .with_bridge_dependencies(bridge_dependencies(Arc::new(MockBridgeBackend::new())));
+
+    let receipt = make_execution_receipt_with_assets(43, cketh_token(), ckbtc_token());
+    let state = finalizer.prepare("43", &receipt).await.expect("prepare should succeed");
+
+    assert_eq!(state.deposit.bridge.deposit_planned_asset.as_deref(), Some("ETH"));
+    assert_eq!(state.deposit.bridge.deposit_planned_network.as_deref(), Some("ETH"));
+    assert!(state.deposit.bridge.deposit_bridge_required);
+    assert_eq!(state.withdraw.bridge.withdraw_planned_asset.as_deref(), Some("ckBTC"));
+    assert!(!state.withdraw.bridge.withdraw_bridge_required);
+    assert_eq!(state.market, "ETH_ckBTC");
+}
+
+#[tokio::test]
+async fn mexc_prepare_maps_cketh_debt_to_eth_withdraw_bridge_plan() {
+    let backend = Arc::new(MockCexBackend::new());
+    let transfer_service = Arc::new(MockTransferActions::new());
+    let finalizer = MexcFinalizer::new(
+        backend,
+        transfer_service,
+        Principal::anonymous(),
+        TEST_MAX_SELL_SLIPPAGE_BPS,
+        TEST_CEX_MIN_EXEC_USD,
+        TEST_CEX_SLICE_TARGET_RATIO,
+    )
+    .with_bridge_dependencies(bridge_dependencies(Arc::new(MockBridgeBackend::new())));
+
+    let receipt = make_execution_receipt_with_assets(44, ckbtc_token(), cketh_token());
+    let state = finalizer.prepare("44", &receipt).await.expect("prepare should succeed");
+
+    assert_eq!(state.deposit.bridge.deposit_planned_asset.as_deref(), Some("ckBTC"));
+    assert!(!state.deposit.bridge.deposit_bridge_required);
+    assert_eq!(state.withdraw.bridge.withdraw_planned_asset.as_deref(), Some("ETH"));
+    assert_eq!(state.withdraw.bridge.withdraw_planned_network.as_deref(), Some("ETH"));
+    assert!(state.withdraw.bridge.withdraw_bridge_required);
+    assert_eq!(state.market, "ckBTC_ETH");
 }
 
 #[tokio::test]

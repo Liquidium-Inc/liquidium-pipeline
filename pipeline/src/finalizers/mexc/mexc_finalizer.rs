@@ -531,8 +531,10 @@ where
             // Reserve one source-token fee unit for reverse bridge ICRC2 approve.
             // This keeps swap sizing conservative so bridge submit preflight does not
             // fail on burn+approve budget when source balance is tight.
-            if route.route_kind == BridgeRouteKind::CkEthErc20Reverse
-                && route.source_chain.eq_ignore_ascii_case("ICP")
+            if matches!(
+                route.route_kind,
+                BridgeRouteKind::CkEthErc20Reverse | BridgeRouteKind::CkEthToEth
+            ) && route.source_chain.eq_ignore_ascii_case("ICP")
                 && state
                     .deposit
                     .deposit_asset
@@ -906,13 +908,7 @@ where
             {
                 Ok(receipt) => receipt,
                 Err(err) if is_mexc_withdraw_below_min_error(&err) => {
-                    Self::complete_withdraw_as_below_min_dust(
-                        state,
-                        &planned_asset,
-                        &planned_network,
-                        amount,
-                        &err,
-                    );
+                    Self::complete_withdraw_as_below_min_dust(state, &planned_asset, &planned_network, amount, &err);
                     return Ok(());
                 }
                 Err(err) => return Err(err),
@@ -958,13 +954,7 @@ where
             {
                 Ok(receipt) => receipt,
                 Err(err) if is_mexc_withdraw_below_min_error(&err) => {
-                    Self::complete_withdraw_as_below_min_dust(
-                        state,
-                        &planned_asset,
-                        &planned_network,
-                        amount,
-                        &err,
-                    );
+                    Self::complete_withdraw_as_below_min_dust(state, &planned_asset, &planned_network, amount, &err);
                     return Ok(());
                 }
                 Err(err) => return Err(err),

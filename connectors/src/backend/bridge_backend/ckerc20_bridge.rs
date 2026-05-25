@@ -20,7 +20,7 @@ use super::{
     },
     types::{
         CkEthMinterInfo, Eip1559TransactionPrice, Eip1559TransactionPriceArg, EvmReceiptStatus, HelperContract,
-        LedgerError, WithdrawErc20Arg, WithdrawErc20Error, WithdrawErc20Ret,
+        LedgerError, WithdrawErc20Arg, WithdrawErc20Error, WithdrawErc20Ret, WithdrawalArg, WithdrawalRet,
     },
 };
 use crate::{
@@ -46,6 +46,7 @@ use crate::{
 sol! {
     #[sol(rpc)]
     interface ICkErc20HelperNative {
+        function deposit(bytes32 principal) external payable;
         function deposit(address token, uint256 amount, bytes32 principal) external;
     }
 }
@@ -57,11 +58,22 @@ sol! {
     }
 }
 
+sol! {
+    #[sol(rpc)]
+    interface ICkEthHelperWithSubaccount {
+        function depositEth(bytes32 principal, bytes32 subaccount) external payable;
+    }
+}
+
+const ETH_DECIMALS: u8 = 18;
+const ETH_FORWARD_GAS_RESERVE_WEI: u128 = 5_000_000_000_000_000;
+
 #[cfg_attr(test, mockall::automock)]
 #[async_trait]
 pub trait BridgeEvmBackend: Send + Sync {
     fn signer_address(&self) -> Address;
 
+    async fn native_balance_of(&self, owner: Address) -> Result<U256, String>;
     async fn erc20_balance_of(&self, token: Address, owner: Address) -> Result<U256, String>;
     async fn erc20_allowance_of(&self, token: Address, owner: Address, spender: Address) -> Result<U256, String>;
     async fn erc20_decimals_of(&self, token: Address) -> Result<u8, String>;
@@ -84,6 +96,21 @@ pub trait BridgeEvmBackend: Send + Sync {
         recipient_subaccount: FixedBytes<32>,
     ) -> Result<TxHash, String>;
 
+    async fn helper_deposit_eth_native(
+        &self,
+        helper: Address,
+        amount: U256,
+        recipient_principal: FixedBytes<32>,
+    ) -> Result<TxHash, String>;
+
+    async fn helper_deposit_eth_with_subaccount(
+        &self,
+        helper: Address,
+        amount: U256,
+        recipient_principal: FixedBytes<32>,
+        recipient_subaccount: FixedBytes<32>,
+    ) -> Result<TxHash, String>;
+
     async fn receipt_status(&self, tx_hash: TxHash) -> Result<Option<EvmReceiptStatus>, String>;
 }
 
@@ -94,6 +121,13 @@ where
 {
     fn signer_address(&self) -> Address {
         self.provider.default_signer_address()
+    }
+
+    async fn native_balance_of(&self, owner: Address) -> Result<U256, String> {
+        self.provider
+            .get_balance(owner)
+            .await
+            .map_err(|e| format!("native get_balance(owner={owner}) failed: {e}"))
     }
 
     async fn erc20_balance_of(&self, token: Address, owner: Address) -> Result<U256, String> {
@@ -121,7 +155,7 @@ where
     ) -> Result<TxHash, String> {
         let helper_contract = ICkErc20HelperNative::new(helper, self.provider.clone());
         let pending = helper_contract
-            .deposit(token, amount, recipient_principal)
+            .deposit_1(token, amount, recipient_principal)
             .send()
             .await
             .map_err(|e| format!("native helper deposit failed (helper={helper}, token={token}): {e}"))?;
@@ -145,6 +179,39 @@ where
         Ok(*pending.tx_hash())
     }
 
+    async fn helper_deposit_eth_native(
+        &self,
+        helper: Address,
+        amount: U256,
+        recipient_principal: FixedBytes<32>,
+    ) -> Result<TxHash, String> {
+        let helper_contract = ICkErc20HelperNative::new(helper, self.provider.clone());
+        let pending = helper_contract
+            .deposit_0(recipient_principal)
+            .value(amount)
+            .send()
+            .await
+            .map_err(|e| format!("native ETH helper deposit failed (helper={helper}): {e}"))?;
+        Ok(*pending.tx_hash())
+    }
+
+    async fn helper_deposit_eth_with_subaccount(
+        &self,
+        helper: Address,
+        amount: U256,
+        recipient_principal: FixedBytes<32>,
+        recipient_subaccount: FixedBytes<32>,
+    ) -> Result<TxHash, String> {
+        let helper_contract = ICkEthHelperWithSubaccount::new(helper, self.provider.clone());
+        let pending = helper_contract
+            .depositEth(recipient_principal, recipient_subaccount)
+            .value(amount)
+            .send()
+            .await
+            .map_err(|e| format!("ETH helper depositEth failed (helper={helper}): {e}"))?;
+        Ok(*pending.tx_hash())
+    }
+
     async fn receipt_status(&self, tx_hash: TxHash) -> Result<Option<EvmReceiptStatus>, String> {
         let receipt = self
             .provider
@@ -159,7 +226,7 @@ where
     }
 }
 
-/// Bridge backend for `ERC20@ETH -> ckERC20` forward routes via ckETH minter helper contracts.
+/// Bridge backend for native ETH/ckETH and `ERC20@ETH -> ckERC20` routes via ckETH minter helper contracts.
 ///
 /// Token and route selection are resolved from bridge route metadata.
 pub struct CkErc20BridgeBackend<A, B, E>
@@ -241,12 +308,36 @@ where
         ))
     }
 
+    async fn eth_helper_contract(&self) -> Result<HelperContract, String> {
+        let info = self.minter_info().await?;
+
+        if let Some(addr) = info.deposit_with_subaccount_helper_contract_address {
+            let parsed = addr
+                .parse::<Address>()
+                .map_err(|e| format!("invalid deposit_with_subaccount helper address '{addr}': {e}"))?;
+            return Ok(HelperContract::WithSubaccount(parsed));
+        }
+
+        if let Some(addr) = info.eth_helper_contract_address {
+            let parsed = addr
+                .parse::<Address>()
+                .map_err(|e| format!("invalid eth helper address '{addr}': {e}"))?;
+            return Ok(HelperContract::Native(parsed));
+        }
+
+        Err(format!(
+            "minter {} returned no ETH helper contract address in get_minter_info",
+            self.cketh_minter_canister
+        ))
+    }
+
     async fn eip_1559_transaction_price(
         &self,
-        ckerc20_ledger_id: Principal,
+        ckerc20_ledger_id: Option<Principal>,
     ) -> Result<Eip1559TransactionPrice, String> {
-        let args = Encode!(&Some(Eip1559TransactionPriceArg { ckerc20_ledger_id }))
-            .map_err(|e| format!("encode eip_1559_transaction_price args failed: {e}"))?;
+        let args =
+            Encode!(&ckerc20_ledger_id.map(|ckerc20_ledger_id| Eip1559TransactionPriceArg { ckerc20_ledger_id }))
+                .map_err(|e| format!("encode eip_1559_transaction_price args failed: {e}"))?;
         self.agent
             .call_query::<Eip1559TransactionPrice>(&self.cketh_minter_canister, "eip_1559_transaction_price", args)
             .await
@@ -256,6 +347,16 @@ where
                     self.cketh_minter_canister, e
                 )
             })
+    }
+
+    async fn cketh_ledger_id(&self) -> Result<Principal, String> {
+        let minter_info = self.minter_info().await?;
+        minter_info.cketh_ledger_id.ok_or_else(|| {
+            format!(
+                "minter {} returned no cketh_ledger_id in get_minter_info",
+                self.cketh_minter_canister
+            )
+        })
     }
 
     async fn token_decimals(&self, token: Address) -> Result<u8, String> {
@@ -312,6 +413,11 @@ where
         amount.clone() + (amount.clone() / Nat::from(5u8))
     }
 
+    async fn quoted_cketh_fee_budget(&self, quote_for_ledger: Option<Principal>) -> Result<Nat, String> {
+        let fee_quote = self.eip_1559_transaction_price(quote_for_ledger).await?;
+        Ok(Self::with_fee_headroom(&fee_quote.max_transaction_fee))
+    }
+
     async fn withdraw_erc20_call(&self, args: &WithdrawErc20Arg) -> Result<WithdrawErc20Ret, String> {
         let arg_blob = Encode!(args).map_err(|e| format!("encode withdraw_erc20 args failed: {e}"))?;
         self.agent
@@ -320,6 +426,19 @@ where
             .map_err(|e| {
                 format!(
                     "withdraw_erc20 call failed for minter {}: {}",
+                    self.cketh_minter_canister, e
+                )
+            })
+    }
+
+    async fn withdraw_eth_call(&self, args: &WithdrawalArg) -> Result<WithdrawalRet, String> {
+        let arg_blob = Encode!(args).map_err(|e| format!("encode withdraw_eth args failed: {e}"))?;
+        self.agent
+            .call_update::<WithdrawalRet>(&self.cketh_minter_canister, "withdraw_eth", arg_blob)
+            .await
+            .map_err(|e| {
+                format!(
+                    "withdraw_eth call failed for minter {}: {}",
                     self.cketh_minter_canister, e
                 )
             })
@@ -404,6 +523,78 @@ where
         })
     }
 
+    /// Submits native ETH forward bridge flow (`ETH@ETH -> ckETH@ICP`).
+    ///
+    /// Behavior:
+    /// - Source must match the configured EVM signer.
+    /// - Destination must be an ICP account.
+    /// - If the minter exposes `deposit_with_subaccount_helper_contract_address`,
+    ///   we call `depositEth(bytes32 principal, bytes32 subaccount)`.
+    /// - Otherwise we fall back to `eth_helper_contract_address` and call
+    ///   `deposit(bytes32 principal)`, which only supports owner-only destinations.
+    ///
+    /// Safety invariant:
+    /// - Preflight requires `signer_balance >= amount + ETH_FORWARD_GAS_RESERVE_WEI`
+    ///   so we never attempt to bridge the entire ETH balance and strand gas.
+    async fn submit_native_forward_bridge(
+        &self,
+        route: &BridgeRouteSpec,
+        request: &BridgeRequest,
+    ) -> Result<BridgeSubmission, String> {
+        let signer = self.evm_backend.signer_address();
+        ensure_source_matches_signer(&request.source_address, signer)?;
+
+        let destination_account = expect_icp_destination(route, &request.destination)?;
+        let (recipient_principal_bytes32, recipient_subaccount_bytes32) = destination_to_bytes32(destination_account);
+
+        let helper = self.eth_helper_contract().await?;
+        if destination_account.subaccount.is_some() && matches!(helper, HelperContract::Native(_)) {
+            return Err(format!(
+                "destination {:?} includes an ICP subaccount, but native ETH helper contract does not support subaccount destinations",
+                request.destination
+            ));
+        }
+
+        let amount_wei = amount_to_base_units_strict(request.amount, ETH_DECIMALS)?;
+        let gas_reserve = U256::from(ETH_FORWARD_GAS_RESERVE_WEI);
+        let required_balance = amount_wei
+            .checked_add(gas_reserve)
+            .ok_or_else(|| "ETH bridge amount plus gas reserve overflowed U256".to_string())?;
+        let signer_balance = self
+            .evm_backend
+            .native_balance_of(signer)
+            .await
+            .map_err(|e| format!("native ETH balance preflight failed for signer={signer}: {e}"))?;
+        if signer_balance < required_balance {
+            return Err(format!(
+                "bridge amount preflight failed: ETH balance is below requested deposit amount plus gas reserve (available={} required={} amount={} gas_reserve={} signer={})",
+                signer_balance, required_balance, amount_wei, gas_reserve, signer
+            ));
+        }
+
+        let tx_hash = match helper {
+            HelperContract::WithSubaccount(address) => self
+                .evm_backend
+                .helper_deposit_eth_with_subaccount(
+                    address,
+                    amount_wei,
+                    recipient_principal_bytes32,
+                    recipient_subaccount_bytes32,
+                )
+                .await
+                .map_err(|e| format!("ETH helper depositEth failed: {e}"))?,
+            HelperContract::Native(address) => self
+                .evm_backend
+                .helper_deposit_eth_native(address, amount_wei, recipient_principal_bytes32)
+                .await
+                .map_err(|e| format!("native ETH helper deposit failed: {e}"))?,
+        };
+
+        Ok(BridgeSubmission {
+            bridge_id: format!("{:#x}", tx_hash),
+        })
+    }
+
     async fn submit_reverse_bridge(
         &self,
         route: &BridgeRouteSpec,
@@ -440,16 +631,8 @@ where
             ));
         }
 
-        let minter_info = self.minter_info().await?;
-        let cketh_ledger_id = minter_info.cketh_ledger_id.ok_or_else(|| {
-            format!(
-                "minter {} returned no cketh_ledger_id in get_minter_info",
-                self.cketh_minter_canister
-            )
-        })?;
-        let fee_quote = self.eip_1559_transaction_price(ckerc20_ledger_id).await?;
-        let required_fee = fee_quote.max_transaction_fee;
-        let required_fee_budget = Self::with_fee_headroom(&required_fee);
+        let cketh_ledger_id = self.cketh_ledger_id().await?;
+        let required_fee_budget = self.quoted_cketh_fee_budget(Some(ckerc20_ledger_id)).await?;
 
         // Minter withdraw burns ckERC20 and consumes ckETH for the EVM execution fee.
         let available_cketh = icrc1_balance_with_context(
@@ -514,6 +697,69 @@ where
             WithdrawErc20Ret::Err(err) => Err(format!("withdraw_erc20 error: {:?}", err)),
         }
     }
+
+    /// Submits native reverse bridge flow (`ckETH@ICP -> ETH@ETH`).
+    ///
+    /// Behavior:
+    /// - Source must be the configured bridge ICP owner account with `subaccount = None`.
+    /// - Destination must be an EVM address.
+    /// - Uses the ckETH ledger from route metadata and calls minter `withdraw_eth`.
+    ///
+    /// Preflight and approval:
+    /// - Requires source ckETH balance to cover
+    ///   `withdraw_amount + ICRC-1 approve fee + quoted minter tx fee budget`.
+    /// - Ensures minter allowance for `withdraw_amount + quoted fee budget` before submission.
+    ///
+    /// Submission handle:
+    /// - Returns bridge id in `ic-withdraw-eth:<block_index>` format for status tracking.
+    async fn submit_native_reverse_bridge(
+        &self,
+        route: &BridgeRouteSpec,
+        request: &BridgeRequest,
+    ) -> Result<BridgeSubmission, String> {
+        let source_account = parse_source_icp_account(&request.source_address)?;
+        ensure_source_matches_bridge_owner(&source_account, self.bridge_ic_owner_principal)?;
+
+        let destination = expect_evm_destination(route, &request.destination)?;
+        let cketh_ledger_id = parse_ckerc20_ledger_id(route)?;
+        let amount_native = amount_to_nat_units_strict(request.amount, ETH_DECIMALS)?;
+        let approve_fee = icrc1_fee_with_context(self.icp_backend.as_ref(), cketh_ledger_id, "cketh bridge").await?;
+        let required_fee_budget = self.quoted_cketh_fee_budget(None).await?;
+        let required_budget = amount_native.clone() + approve_fee.clone() + required_fee_budget.clone();
+
+        let available_cketh = icrc1_balance_with_context(
+            self.icp_backend.as_ref(),
+            cketh_ledger_id,
+            &source_account,
+            "cketh bridge",
+        )
+        .await?;
+        if available_cketh < required_budget {
+            let available_formatted = nat_units_to_amount_via_core(&available_cketh, ETH_DECIMALS)?;
+            let required_formatted = nat_units_to_amount_via_core(&required_budget, ETH_DECIMALS)?;
+            return Err(format!(
+                "bridge amount preflight failed: ckETH balance is below required withdraw+approve+fee budget (available={} required={} source={})",
+                available_formatted, required_formatted, request.source_address
+            ));
+        }
+
+        let required_allowance = amount_native.clone() + required_fee_budget.clone();
+        self.ensure_minter_allowance(&source_account, cketh_ledger_id, required_allowance)
+            .await?;
+
+        let withdraw_args = WithdrawalArg {
+            amount: amount_native,
+            recipient: destination.to_string(),
+            from_subaccount: None,
+        };
+
+        match self.withdraw_eth_call(&withdraw_args).await? {
+            WithdrawalRet::Ok(request_id) => Ok(BridgeSubmission {
+                bridge_id: format!("ic-withdraw-eth:{}", request_id.block_index),
+            }),
+            WithdrawalRet::Err(err) => Err(format!("withdraw_eth error: {:?}", err)),
+        }
+    }
 }
 
 #[async_trait]
@@ -525,6 +771,19 @@ where
 {
     async fn get_source_balance(&self, asset: &str, chain: &str, address: &str) -> Result<f64, String> {
         if let Some(route) = resolve_cketh_forward_route_by_source(asset, chain) {
+            if route.route_kind == BridgeRouteKind::EthToCkEth {
+                let owner = address
+                    .parse::<Address>()
+                    .map_err(|e| format!("invalid source address '{address}': {e}"))?;
+                let balance = self
+                    .evm_backend
+                    .native_balance_of(owner)
+                    .await
+                    .map_err(|e| format!("native ETH balance failed for owner {owner}: {e}"))?;
+                let bridgeable = balance.saturating_sub(U256::from(ETH_FORWARD_GAS_RESERVE_WEI));
+                return base_units_to_amount_via_core(bridgeable, ETH_DECIMALS);
+            }
+
             let token_address = parse_evm_token_address(route)?;
             let owner = address
                 .parse::<Address>()
@@ -550,13 +809,12 @@ where
         }
 
         Err(format!(
-            "unsupported source route {}@{} for ckETH ERC20 bridge backend",
+            "unsupported source route {}@{} for ckETH minter bridge backend",
             asset, chain
         ))
     }
 
-    /// Executes a ckETH minter bridge submission for forward (`USDC@ETH -> ckUSDC@ICP`)
-    /// or reverse (`ckUSDC@ICP -> USDC@ETH`) routes.
+    /// Executes a ckETH minter bridge submission for native ETH/ckETH and ckERC20 routes.
     ///
     /// Returns a [`BridgeSubmission`] with:
     /// - EVM tx hash for forward helper deposits.
@@ -570,6 +828,8 @@ where
         match route.route_kind {
             BridgeRouteKind::CkEthErc20Forward => self.submit_forward_bridge(route, &request).await,
             BridgeRouteKind::CkEthErc20Reverse => self.submit_reverse_bridge(route, &request).await,
+            BridgeRouteKind::EthToCkEth => self.submit_native_forward_bridge(route, &request).await,
+            BridgeRouteKind::CkEthToEth => self.submit_native_reverse_bridge(route, &request).await,
             _ => Err(format!(
                 "route {}@{} -> {} is not supported by CkErc20BridgeBackend",
                 route.source_asset, route.source_chain, route.target_asset
@@ -578,7 +838,7 @@ where
     }
 
     async fn get_bridge_status(&self, bridge_id: &str) -> Result<BridgeStatus, String> {
-        if bridge_id.starts_with("ic-withdraw:") {
+        if bridge_id.starts_with("ic-withdraw:") || bridge_id.starts_with("ic-withdraw-eth:") {
             return Ok(BridgeStatus::Completed);
         }
 

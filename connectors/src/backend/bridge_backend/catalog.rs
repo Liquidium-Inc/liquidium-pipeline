@@ -2,8 +2,29 @@ use super::{BridgeDestinationKind, BridgeRouteKind, BridgeRouteSpec};
 
 const USDC_ETH_TOKEN_ADDRESS: &str = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48";
 const CKUSDC_ICP_LEDGER_ID: &str = "xevnm-gaaaa-aaaar-qafnq-cai";
+const CKETH_ICP_LEDGER_ID: &str = "ss2fx-dyaaa-aaaar-qacoq-cai";
 
-pub(super) const BRIDGE_ROUTE_CATALOG: [BridgeRouteSpec; 4] = [
+pub(super) const BRIDGE_ROUTE_CATALOG: [BridgeRouteSpec; 6] = [
+    BridgeRouteSpec {
+        source_asset: "ETH",
+        source_chain: "ETH",
+        target_asset: "ckETH",
+        destination_kind: BridgeDestinationKind::IcpAccount,
+        route_kind: BridgeRouteKind::EthToCkEth,
+        evm_token_address: None,
+        ckerc20_ledger_id: Some(CKETH_ICP_LEDGER_ID),
+        min_sweep_amount: 0.0,
+    },
+    BridgeRouteSpec {
+        source_asset: "ckETH",
+        source_chain: "ICP",
+        target_asset: "ETH",
+        destination_kind: BridgeDestinationKind::EvmAddress,
+        route_kind: BridgeRouteKind::CkEthToEth,
+        evm_token_address: None,
+        ckerc20_ledger_id: Some(CKETH_ICP_LEDGER_ID),
+        min_sweep_amount: 0.0,
+    },
     BridgeRouteSpec {
         source_asset: "USDC",
         source_chain: "ETH",

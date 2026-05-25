@@ -135,7 +135,7 @@ pub(super) fn expect_evm_destination<'a>(
 }
 
 /// Resolves route metadata for a bridge request and validates that the route is one of
-/// the supported ckETH ERC-20 forward/reverse types.
+/// the supported ckETH minter forward/reverse types.
 pub(super) fn resolve_cketh_route_for_request(request: &BridgeRequest) -> Result<&'static BridgeRouteSpec, String> {
     let Some(route) = resolve_route(&request.asset, &request.source_chain, &request.target_asset) else {
         return Err(format!(
@@ -143,8 +143,13 @@ pub(super) fn resolve_cketh_route_for_request(request: &BridgeRequest) -> Result
             request.asset, request.source_chain, request.target_asset
         ));
     };
-    if route.route_kind != BridgeRouteKind::CkEthErc20Forward && route.route_kind != BridgeRouteKind::CkEthErc20Reverse
-    {
+    if !matches!(
+        route.route_kind,
+        BridgeRouteKind::CkEthErc20Forward
+            | BridgeRouteKind::CkEthErc20Reverse
+            | BridgeRouteKind::EthToCkEth
+            | BridgeRouteKind::CkEthToEth
+    ) {
         return Err(format!(
             "route {}@{} -> {} is not supported by CkErc20BridgeBackend",
             request.asset, request.source_chain, request.target_asset
@@ -155,6 +160,9 @@ pub(super) fn resolve_cketh_route_for_request(request: &BridgeRequest) -> Result
         let _ = parse_evm_token_address(route)?;
     }
     if route.route_kind == BridgeRouteKind::CkEthErc20Reverse {
+        let _ = parse_ckerc20_ledger_id(route)?;
+    }
+    if route.route_kind == BridgeRouteKind::CkEthToEth {
         let _ = parse_ckerc20_ledger_id(route)?;
     }
     Ok(route)
