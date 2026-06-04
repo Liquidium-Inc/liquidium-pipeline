@@ -94,6 +94,16 @@ enum Commands {
         #[command(subcommand)]
         subcommand: AccountCommands,
     },
+
+    // Smoke: bridge ckETH -> MEXC swap to USDC -> bridge out as ckUSDC
+    MexcSmokeBridgeSwapWithdrawCketh {
+        /// Amount in ckETH units
+        #[arg(long)]
+        amount_cketh: f64,
+        /// Execute live transfers/trades (without this flag, preflight only)
+        #[arg(long, default_value_t = false)]
+        execute: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -230,6 +240,16 @@ async fn main() {
                 commands::account::new().await;
             }
         },
+        Commands::MexcSmokeBridgeSwapWithdrawCketh {
+            amount_cketh,
+            execute,
+        } => {
+            if let Err(err) =
+                commands::mexc_smoke::mexc_smoke_bridge_swap_withdraw_cketh(amount_cketh, execute).await
+            {
+                eprintln!("MEXC ckETH smoke command failed: {}", err);
+            }
+        }
     }
 }
 

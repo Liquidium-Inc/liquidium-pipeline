@@ -1,12 +1,7 @@
-use alloy::{
-    network::AnyNetwork,
-    providers::{Provider, ProviderBuilder},
-    signers::local::PrivateKeySigner,
-};
 use candid::{Nat, Principal};
 use icrc_ledger_types::icrc1::account::Account;
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::HashMap,
     path::PathBuf,
     sync::{Arc, atomic::AtomicBool},
     time::Duration,
@@ -19,14 +14,14 @@ use crate::{
         bootstrap_control_plane, console_ui_enabled, debt_asset_principals, debt_assets_as_text,
         ensure_runtime_file_permissions, print_banner, run_daemon_cycle_loop,
     },
-    config::{Config, ConfigTrait},
+    commands::mexc_runtime::build_mexc_finalizer,
+    config::Config,
     context::{PipelineContext, init_context},
     executors::basic::basic_executor::BasicExecutor,
     finalizers::{
         cex_finalizer::CexFinalizerLogic,
         hybrid::hybrid_finalizer::HybridFinalizer,
         kong_swap::kong_swap_finalizer::KongSwapFinalizer,
-        mexc::mexc_finalizer::{MexcBridgeConfig, MexcBridgeDependencies, MexcFinalizer},
         profit_calculator::SimpleProfitCalculator,
     },
     liquidation::collateral_service::CollateralService,
@@ -36,7 +31,7 @@ use crate::{
         export::ExportStage, finalize::FinalizeStage, opportunity::OpportunityFinder,
         settlement_watcher::SettlementWatcher, simple_strategy::SimpleLiquidationStrategy,
     },
-    swappers::{mexc::mexc_adapter::MexcClient, router::SwapRouter},
+    swappers::router::SwapRouter,
     watchdog::{
         WatchdogEvent,
         balance_monitor::{
@@ -46,12 +41,6 @@ use crate::{
     },
 };
 use ic_agent::Agent;
-use liquidium_pipeline_connectors::backend::{
-    bridge_backend::{CkErc20BridgeBackend, cketh_forward_routes},
-    evm_backend::EvmBackendImpl,
-    icp_backend::IcpBackendImpl,
-};
-
 use liquidium_pipeline_core::{
     balance_service::BalanceService,
     tokens::{chain_token::ChainToken, token_registry::TokenRegistry},
@@ -103,103 +92,7 @@ async fn init(
     // Base DEX finalizer (Kong swapper)
     let kong_finalizer = Arc::new(KongSwapFinalizer::new(ctx.swap_router.clone()));
 
-    let mexc_finalizer = match ctx.config.get_cex_credentials("mexc") {
-        Ok((api_key, secret)) => {
-            let mexc_client = Arc::new(MexcClient::new(&api_key, &secret));
-            // The liquidation-loop bridge wiring currently supports one EVM provider.
-            // Validate that ckETH forward routes all map to one known EVM chain.
-            let mut required_chain_ids = BTreeSet::new();
-            for route in cketh_forward_routes() {
-                let expected_chain_id = match route.source_chain.trim().to_ascii_uppercase().as_str() {
-                    "ETH" | "ETHEREUM" => 1u64,
-                    other => {
-                        return Err(format!(
-                            "bridge route {}@{} -> {} requires unsupported EVM source chain '{}' for single-provider mode; configure per-chain bridge providers",
-                            route.source_asset, route.source_chain, route.target_asset, other
-                        ));
-                    }
-                };
-                required_chain_ids.insert(expected_chain_id);
-            }
-            if required_chain_ids.len() > 1 {
-                return Err(format!(
-                    "bridge route catalog requires multiple EVM chains {:?}, but liquidation loop configures a single bridge provider from EVM_RPC_URL; configure per-chain bridge providers",
-                    required_chain_ids
-                ));
-            }
-
-            let bridge_signer: PrivateKeySigner = config
-                .bridge_evm_private_key
-                .parse()
-                .map_err(|err| format!("Failed to parse bridge EVM private key for MEXC bridge finalizer: {err}"))?;
-            let bridge_rpc_url = config
-                .evm_rpc_url
-                .parse()
-                .map_err(|err| format!("Invalid EVM RPC URL for MEXC bridge finalizer: {err}"))?;
-            let bridge_provider = ProviderBuilder::new()
-                .network::<AnyNetwork>()
-                .wallet(bridge_signer)
-                .connect_http(bridge_rpc_url);
-            if let Some(expected_chain_id) = required_chain_ids.first().copied() {
-                let rpc_chain_id = bridge_provider.get_chain_id().await.map_err(|err| {
-                    format!(
-                        "failed to read chain id from EVM_RPC_URL '{}' for MEXC bridge finalizer: {err}",
-                        config.evm_rpc_url
-                    )
-                })?;
-                if rpc_chain_id != expected_chain_id {
-                    return Err(format!(
-                        "EVM_RPC_URL '{}' resolved chain id {}, but ckETH forward bridge routes require chain id {}; configure the correct RPC endpoint or per-chain bridge providers",
-                        config.evm_rpc_url, rpc_chain_id, expected_chain_id
-                    ));
-                }
-            }
-            let bridge_agent = Arc::new(
-                Agent::builder()
-                    .with_url(config.ic_url.clone())
-                    .with_identity(config.bridge_ic_identity.clone())
-                    .with_max_tcp_error_retries(3)
-                    .build()
-                    .map_err(|e| format!("ic agent(bridge finalizer) build: {e}"))?,
-            );
-            let bridge_backend = Arc::new(CkErc20BridgeBackend::new(
-                bridge_agent.clone(),
-                Arc::new(IcpBackendImpl::new(bridge_agent)),
-                Arc::new(EvmBackendImpl::new(bridge_provider)),
-                config.bridge_cketh_minter_canister,
-                config.bridge_ic_owner_principal,
-            ));
-            let bridge_dependencies = MexcBridgeDependencies {
-                backend: bridge_backend,
-                config: MexcBridgeConfig {
-                    bridge_ic_source_account: config.bridge_ic_account(),
-                    bridge_evm_source_address: config.bridge_evm_address.clone(),
-                    bridge_btc_source_address: config.bridge_btc_address.clone(),
-                },
-            };
-
-            Arc::new(
-                MexcFinalizer::new_with_tunables(
-                    mexc_client,
-                    ctx.trader_transfers.actions(),
-                    config.liquidator_principal,
-                    config.max_allowed_cex_slippage_bps as f64,
-                    config.cex_min_exec_usd,
-                    config.cex_slice_target_ratio,
-                    config.cex_buy_truncation_trigger_ratio,
-                    config.cex_buy_inverse_overspend_bps,
-                    config.cex_buy_inverse_max_retries,
-                    config.cex_buy_inverse_enabled,
-                )
-                .with_bridge_dependencies(bridge_dependencies)
-                .with_route_config(
-                    config.cex_mexc_available_pairs.clone(),
-                    config.cex_mexc_max_hops as usize,
-                ),
-            )
-        }
-        Err(err) => return Err(format!("Cex credentials not found: {err}")),
-    };
+    let mexc_finalizer = build_mexc_finalizer(ctx.as_ref()).await?;
 
     // Hybrid finalizer composes DEX and CEX finalizers.
     // For now, CEX is wired to the same Kong finalizer; you can later swap in a dedicated CEX finalizer.

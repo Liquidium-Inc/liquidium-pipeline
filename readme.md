@@ -568,6 +568,25 @@ Behavior:
 - Swaps credited USDC to CKBTC using production route logic.
 - Default withdraw destination is the liquidator principal; override with `--withdraw-address`.
 
+### MEXC Smoke ckETH -> USDC -> ckUSDC
+
+Dry-run preflight (no side effects):
+
+```bash
+liquidator mexc-smoke-bridge-swap-withdraw-cketh --amount-cketh 0.05
+```
+
+Live execution (bridge `ckETH@ICP -> ETH@ETH` to MEXC deposit, swap `ETH -> USDC`, withdraw to bridge source, then bridge `USDC@ETH -> ckUSDC@ICP`):
+
+```bash
+liquidator mexc-smoke-bridge-swap-withdraw-cketh --amount-cketh 0.05 --execute
+```
+
+Behavior:
+- Uses the production MEXC finalizer bridge/trade/withdraw path and route discovery.
+- Uses configured `CEX_MEXC_AVAILABLE_PAIRS` for market routing.
+- Final bridged asset is `ckUSDC@ICP` to the liquidator principal account.
+
 ### Withdraw Funds
 
 #### Interactive Wizard
