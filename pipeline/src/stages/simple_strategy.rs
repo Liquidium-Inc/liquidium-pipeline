@@ -28,7 +28,7 @@ use log::{debug, info};
 use num_traits::ToPrimitive;
 
 use crate::swappers::model::SwapRequest;
-use crate::utils::max_for_ledger;
+use crate::utils::{ICP_LEDGER_PRINCIPAL, max_for_ledger};
 use crate::watchdog::{Watchdog, WatchdogEvent, noop_watchdog};
 use async_trait::async_trait;
 
@@ -37,10 +37,17 @@ use itertools::Itertools;
 const WIPEOUT_THRESHOLD: u32 = 975;
 
 fn resolve_token_for_position(registry: &dyn TokenRegistryTrait, pos: &LiquidateblePosition) -> Option<ChainToken> {
+    if pos.asset.symbol().eq_ignore_ascii_case("ICP") {
+        let id = AssetId {
+            chain: "icp".to_string(),
+            address: ICP_LEDGER_PRINCIPAL.to_string(),
+            symbol: "ICP".to_string(),
+        };
+        return registry.get(&id);
+    }
+
     match pos.asset_type {
         AssetType::CkAsset(principal) => {
-            // Build the AssetId the same way you did when populating the registry.
-            // Adjust this to your actual AssetId shape / constructors.
             let id = AssetId {
                 chain: "icp".to_string(),
                 address: principal.to_text(),
@@ -50,6 +57,10 @@ fn resolve_token_for_position(registry: &dyn TokenRegistryTrait, pos: &Liquidate
         }
         _ => None,
     }
+}
+
+fn is_supported_position_asset_type(pos: &LiquidateblePosition) -> bool {
+    pos.asset.symbol().eq_ignore_ascii_case("ICP") || matches!(pos.asset_type, AssetType::CkAsset(_))
 }
 
 pub struct SimpleLiquidationStrategy<T, C, R, U>
@@ -289,7 +300,7 @@ where
                 continue;
             }
 
-            if !matches!(debt_position.asset_type, AssetType::CkAsset(_)) {
+            if !is_supported_position_asset_type(&debt_position) {
                 return Err("invalid asset type".to_string());
             }
 
@@ -444,8 +455,8 @@ where
                 continue;
             }
 
-            if !matches!(debt_position.asset_type, AssetType::CkAsset(_))
-                || !matches!(collateral_position.asset_type, AssetType::CkAsset(_))
+            if !is_supported_position_asset_type(&debt_position)
+                || !is_supported_position_asset_type(&collateral_position)
             {
                 return Err("invalid asset type".to_string());
             }
@@ -617,10 +628,13 @@ where
 
             let inverse_price = if price > 0.0 { 1.0 / price } else { 0.0 };
             info!(
-                "💱 Quote: repay={} {} | received={} {} | price={} inverse_price={} (collateral={} -> debt={})",
+                "💱 Quote: repay_debt={} {} | seized_collateral={} {} | estimated_swap_out={} {} | price={} inverse_price={} | swap={} -> {}",
                 estimation.repaid_debt.0.to_f64().unwrap_or(f64::MAX)
                     / 10u32.pow(repayment_token.decimals() as u32) as f64,
                 repayment_token.symbol(),
+                estimation.received_collateral.0.to_f64().unwrap_or(f64::MAX)
+                    / 10u32.pow(collateral_token.decimals() as u32) as f64,
+                collateral_token.symbol(),
                 amount_received.0.to_f64().unwrap_or(f64::MAX) / 10u32.pow(repayment_token.decimals() as u32) as f64,
                 repayment_token.symbol(),
                 price,
@@ -766,6 +780,25 @@ mod tests {
             collateral_amount: Nat::from(coll),
             asset,
             asset_type: AssetType::CkAsset(ledger),
+            account,
+            liquidation_bonus: 1000,
+            liquidation_threshold: 8500,
+            protocol_fee: 200,
+        }
+    }
+
+    fn mk_unknown_native_icp_position(
+        pool: Principal,
+        account: Principal,
+        debt: u64,
+        coll: u64,
+    ) -> LiquidateblePosition {
+        LiquidateblePosition {
+            pool_id: pool,
+            debt_amount: Nat::from(debt),
+            collateral_amount: Nat::from(coll),
+            asset: Assets::ICP,
+            asset_type: AssetType::Unknown,
             account,
             liquidation_bonus: 1000,
             liquidation_threshold: 8500,
@@ -995,6 +1028,113 @@ mod tests {
         let res = strategy.process(&vec![user]).await;
         assert!(res.is_err());
         assert_eq!(res.unwrap_err(), "invalid asset type");
+    }
+
+    #[tokio::test]
+    async fn simple_strategy_allows_native_icp_unknown_collateral() {
+        let ckusdc_ledger = p("xevnm-gaaaa-aaaar-qafnq-cai");
+        let icp_ledger = p(ICP_LEDGER_PRINCIPAL);
+        let icp_pool = p("en2mt-fyaaa-aaaae-qkefq-cai");
+        let ckusdc_token = ChainToken::Icp {
+            ledger: ckusdc_ledger,
+            symbol: "ckUSDC".to_string(),
+            decimals: 6,
+            fee: Nat::from(10_000u64),
+        };
+        let icp_token = ChainToken::Icp {
+            ledger: icp_ledger,
+            symbol: "ICP".to_string(),
+            decimals: 8,
+            fee: Nat::from(10_000u64),
+        };
+
+        let mut registry = MockTokenRegistryTrait::new();
+        registry.expect_get().returning({
+            let ckusdc_token = ckusdc_token.clone();
+            let icp_token = icp_token.clone();
+            move |id: &AssetId| {
+                if id.address == ckusdc_ledger.to_text() {
+                    Some(ckusdc_token.clone())
+                } else if id.address == ICP_LEDGER_PRINCIPAL {
+                    Some(icp_token.clone())
+                } else {
+                    None
+                }
+            }
+        });
+
+        let mut cfg = MockConfigTrait::new();
+        let trader = p("aaaaa-aa");
+        cfg.expect_get_trader_principal().return_const(trader);
+        cfg.expect_get_liquidator_principal().return_const(trader);
+        cfg.expect_should_buy_bad_debt().return_const(false);
+        cfg.expect_get_max_allowed_dex_slippage().return_const(2000u32);
+        cfg.expect_get_swapper_mode()
+            .return_const(crate::config::SwapperMode::Cex);
+        cfg.expect_get_lending_canister()
+            .return_const(p("mxzaz-hqaaa-aaaar-qaada-cai"));
+
+        let mut collateral = MockCollateralServiceTrait::new();
+        collateral
+            .expect_calculate_liquidation_amounts()
+            .returning(|_max_balance, _debt_pos, coll_pos, _user| {
+                assert_eq!(coll_pos.asset, Assets::ICP);
+                Ok(LiquidationEstimation {
+                    received_collateral: Nat::from(200_000_000u64),
+                    repaid_debt: Nat::from(1_000_000u64),
+                    ref_price: Nat::from(10_000_000_000_000_000_000_000_000_000u128),
+                    debt_price: Nat::from(1_000_000_000_000_000_000_000_000_000u128),
+                })
+            });
+
+        let mut account = MockAccountInfo::new();
+        account.expect_sync_balance().returning(move |_t: &ChainToken| {
+            Ok(ChainTokenAmount {
+                token: _t.clone(),
+                value: Nat::from(10_000_000u64),
+            })
+        });
+        account.expect_get_balance().returning(move |_t: &ChainToken| {
+            Ok(ChainTokenAmount {
+                token: _t.clone(),
+                value: Nat::from(10_000_000u64),
+            })
+        });
+
+        let mut swapper = MockSwapInterface::new();
+        swapper
+            .expect_quote()
+            .returning(|_req| panic!("strategy builds swap args without quoting"));
+
+        let registry = Arc::new(registry);
+        let account = Arc::new(account);
+        let balance_service = Arc::new(BalanceService::new(registry.clone(), account.clone()));
+
+        let strategy = SimpleLiquidationStrategy::new(
+            Arc::new(cfg),
+            registry.clone(),
+            Arc::new(swapper),
+            Arc::new(collateral),
+            balance_service,
+            Arc::new(ApprovalState::new()),
+        );
+
+        let debt_pool = p("rw6tq-vyaaa-aaaae-qjx5a-cai");
+        let borrower = p("aaaaa-aa");
+        let debt_pos = mk_position(debt_pool, borrower, ckusdc_ledger, 1_000_000, 0, Assets::USDC);
+        let mut collateral_pos = mk_unknown_native_icp_position(icp_pool, borrower, 0, 200_000_000);
+        collateral_pos.asset_type = AssetType::CkAsset(icp_pool);
+        let user = mk_user(vec![debt_pos, collateral_pos], 1_000_000, 900);
+
+        let res = strategy.process(&vec![user]).await.unwrap();
+
+        assert_eq!(res.len(), 1);
+        let req = &res[0];
+        assert_eq!(req.debt_asset.symbol(), "ckUSDC");
+        assert_eq!(req.collateral_asset.symbol(), "ICP");
+        assert_eq!(req.liquidation.collateral_pool_id, icp_pool);
+        assert!(!req.liquidation.buy_bad_debt);
+        assert!(req.swap_args.is_some());
     }
 
     // HF at or above 1000: no liquidation attempts.
