@@ -166,5 +166,73 @@ pub(super) fn mexc_special_trade_legs(deposit_symbol: &str, withdraw_symbol: &st
         ]);
     }
 
+    if deposit == "CKBTC" && withdraw == "ICP" {
+        return Some(vec![
+            TradeLeg {
+                market: "CKBTC_BTC".to_string(),
+                side: "sell".to_string(),
+            },
+            TradeLeg {
+                market: "BTC_USDT".to_string(),
+                side: "sell".to_string(),
+            },
+            TradeLeg {
+                market: "ICP_USDT".to_string(),
+                side: "buy".to_string(),
+            },
+        ]);
+    }
+
+    if deposit == "ICP" && withdraw == "CKBTC" {
+        return Some(vec![
+            TradeLeg {
+                market: "ICP_USDT".to_string(),
+                side: "sell".to_string(),
+            },
+            TradeLeg {
+                market: "BTC_USDT".to_string(),
+                side: "buy".to_string(),
+            },
+            TradeLeg {
+                market: "CKBTC_BTC".to_string(),
+                side: "buy".to_string(),
+            },
+        ]);
+    }
+
+    if deposit == "CKUSDC" && withdraw == "ICP" {
+        return Some(vec![
+            TradeLeg {
+                market: "CKUSDC_USDC".to_string(),
+                side: "sell".to_string(),
+            },
+            TradeLeg {
+                market: "USDC_USDT".to_string(),
+                side: "sell".to_string(),
+            },
+            TradeLeg {
+                market: "ICP_USDT".to_string(),
+                side: "buy".to_string(),
+            },
+        ]);
+    }
+
+    if deposit == "ICP" && withdraw == "CKUSDC" {
+        return Some(vec![
+            TradeLeg {
+                market: "ICP_USDT".to_string(),
+                side: "sell".to_string(),
+            },
+            TradeLeg {
+                market: "USDC_USDT".to_string(),
+                side: "buy".to_string(),
+            },
+            TradeLeg {
+                market: "CKUSDC_USDC".to_string(),
+                side: "buy".to_string(),
+            },
+        ]);
+    }
+
     None
 }
