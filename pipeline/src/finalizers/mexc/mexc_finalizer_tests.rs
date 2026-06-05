@@ -6,7 +6,8 @@ use std::sync::Arc;
 use candid::{Nat, Principal};
 use ic_ledger_types::{AccountIdentifier, Subaccount};
 use liquidium_pipeline_connectors::backend::bridge_backend::{
-    BRIDGE_AMOUNT_BELOW_MINIMUM_PREFIX, BridgeDestination, BridgeStatus, BridgeSubmission, MockBridgeBackend,
+    BRIDGE_AMOUNT_BELOW_MINIMUM_PREFIX, BridgeDestination, BridgeFeeBudget, BridgeStatus, BridgeSubmission,
+    MockBridgeBackend,
 };
 use liquidium_pipeline_connectors::backend::cex_backend::{
     BuyOrderInputMode, DepositAddress, MockCexBackend, OrderBook, OrderBookLevel, SwapFillReport, WithdrawStatus,
@@ -734,13 +735,17 @@ async fn mexc_deposit_bridge_submit_resume_and_complete() {
 
     bridge.expect_get_source_balance().times(0);
     bridge
-        .expect_get_source_fee_budget()
+        .expect_get_fee_budget()
         .times(1)
         .returning(|asset, chain, target| {
             assert_eq!(asset, "ckUSDC");
             assert_eq!(chain, "ICP");
             assert_eq!(target, "USDC");
-            Ok(0.01)
+            Ok(BridgeFeeBudget {
+                source_fee_budget: 0.01,
+                destination_fee_budget: 0.0,
+                provider_fee_budget_native_units: None,
+            })
         });
     bridge
         .expect_get_minimum_bridge_amount()
@@ -751,16 +756,6 @@ async fn mexc_deposit_bridge_submit_resume_and_complete() {
             assert_eq!(target, "USDC");
             Ok(0.0)
         });
-    bridge
-        .expect_get_destination_fee_budget()
-        .times(1)
-        .returning(|asset, chain, target| {
-            assert_eq!(asset, "ckUSDC");
-            assert_eq!(chain, "ICP");
-            assert_eq!(target, "USDC");
-            Ok(0.0)
-        });
-
     bridge.expect_submit_bridge().times(1).returning(|request| {
         assert_eq!(request.asset, "ckUSDC");
         assert_eq!(request.source_chain, "ICP");
@@ -856,13 +851,17 @@ async fn mexc_deposit_bridge_reserves_reverse_bridge_approval_fee_in_trade_amoun
 
     bridge.expect_get_source_balance().times(0);
     bridge
-        .expect_get_source_fee_budget()
+        .expect_get_fee_budget()
         .times(1)
         .returning(|asset, chain, target| {
             assert_eq!(asset, "ckUSDC");
             assert_eq!(chain, "ICP");
             assert_eq!(target, "USDC");
-            Ok(0.01)
+            Ok(BridgeFeeBudget {
+                source_fee_budget: 0.01,
+                destination_fee_budget: 0.0,
+                provider_fee_budget_native_units: None,
+            })
         });
     bridge
         .expect_get_minimum_bridge_amount()
@@ -873,16 +872,6 @@ async fn mexc_deposit_bridge_reserves_reverse_bridge_approval_fee_in_trade_amoun
             assert_eq!(target, "USDC");
             Ok(0.0)
         });
-    bridge
-        .expect_get_destination_fee_budget()
-        .times(1)
-        .returning(|asset, chain, target| {
-            assert_eq!(asset, "ckUSDC");
-            assert_eq!(chain, "ICP");
-            assert_eq!(target, "USDC");
-            Ok(0.0)
-        });
-
     bridge.expect_submit_bridge().times(1).returning(move |request| {
         assert!(
             (request.amount - 0.92).abs() < 1e-9,
@@ -936,16 +925,19 @@ async fn mexc_deposit_bridge_rejects_source_fee_reserve_too_small_with_permanent
 
     bridge.expect_get_source_balance().times(0);
     bridge
-        .expect_get_source_fee_budget()
+        .expect_get_fee_budget()
         .times(1)
         .returning(|asset, chain, target| {
             assert_eq!(asset, "ckUSDC");
             assert_eq!(chain, "ICP");
             assert_eq!(target, "USDC");
-            Ok(2.0)
+            Ok(BridgeFeeBudget {
+                source_fee_budget: 2.0,
+                destination_fee_budget: 0.0,
+                provider_fee_budget_native_units: None,
+            })
         });
     bridge.expect_get_minimum_bridge_amount().times(0);
-    bridge.expect_get_destination_fee_budget().times(0);
     bridge.expect_submit_bridge().times(0);
     bridge.expect_get_bridge_status().times(0);
 
@@ -1002,13 +994,17 @@ async fn mexc_deposit_bridge_reserves_native_cketh_withdrawal_fee_budget() {
 
     bridge.expect_get_source_balance().times(0);
     bridge
-        .expect_get_source_fee_budget()
+        .expect_get_fee_budget()
         .times(1)
         .returning(|asset, chain, target| {
             assert_eq!(asset, "ckETH");
             assert_eq!(chain, "ICP");
             assert_eq!(target, "ETH");
-            Ok(0.000_051_900_885_02)
+            Ok(BridgeFeeBudget {
+                source_fee_budget: 0.000_051_900_885_02,
+                destination_fee_budget: 0.000_049_900_885_02,
+                provider_fee_budget_native_units: Some(Nat::from(49_900_885_020_000u64)),
+            })
         });
     bridge
         .expect_get_minimum_bridge_amount()
@@ -1019,16 +1015,6 @@ async fn mexc_deposit_bridge_reserves_native_cketh_withdrawal_fee_budget() {
             assert_eq!(target, "ETH");
             Ok(0.005)
         });
-    bridge
-        .expect_get_destination_fee_budget()
-        .times(1)
-        .returning(|asset, chain, target| {
-            assert_eq!(asset, "ckETH");
-            assert_eq!(chain, "ICP");
-            assert_eq!(target, "ETH");
-            Ok(0.000_102_660_089_196)
-        });
-
     bridge.expect_submit_bridge().times(1).returning(|request| {
         assert_eq!(request.asset, "ckETH");
         assert_eq!(request.source_chain, "ICP");
@@ -1037,6 +1023,10 @@ async fn mexc_deposit_bridge_reserves_native_cketh_withdrawal_fee_budget() {
             (request.amount - 0.005_034_099_114_98).abs() < 1e-15,
             "unexpected amount {}",
             request.amount
+        );
+        assert_eq!(
+            request.provider_fee_budget_native_units,
+            Some(Nat::from(49_900_885_020_000u64))
         );
         Ok(BridgeSubmission {
             bridge_id: "bridge-deposit-cketh".to_string(),
@@ -1078,9 +1068,9 @@ async fn mexc_deposit_bridge_reserves_native_cketh_withdrawal_fee_budget() {
         (state.deposit.bridge.deposit_bridge_submit_amount.unwrap_or_default() - 0.005_034_099_114_98).abs() < 1e-15
     );
     assert!(
-        (state.deposit.bridge.deposit_bridge_expected_amount.unwrap_or_default() - 0.004_931_439_025_784).abs() < 1e-15
+        (state.deposit.bridge.deposit_bridge_expected_amount.unwrap_or_default() - 0.004_984_198_229_96).abs() < 1e-15
     );
-    assert!((state.trade.trade_next_amount_in.unwrap_or_default() - 0.004_931_439_025_784).abs() < 1e-15);
+    assert!((state.trade.trade_next_amount_in.unwrap_or_default() - 0.004_984_198_229_96).abs() < 1e-15);
 }
 
 #[tokio::test]
@@ -1098,13 +1088,17 @@ async fn mexc_deposit_bridge_rejects_native_cketh_below_minimum_before_transfer(
 
     bridge.expect_get_source_balance().times(0);
     bridge
-        .expect_get_source_fee_budget()
+        .expect_get_fee_budget()
         .times(1)
         .returning(|asset, chain, target| {
             assert_eq!(asset, "ckETH");
             assert_eq!(chain, "ICP");
             assert_eq!(target, "ETH");
-            Ok(0.000_051_900_885_02)
+            Ok(BridgeFeeBudget {
+                source_fee_budget: 0.000_051_900_885_02,
+                destination_fee_budget: 0.0,
+                provider_fee_budget_native_units: Some(Nat::from(49_900_885_020_000u64)),
+            })
         });
     bridge
         .expect_get_minimum_bridge_amount()
@@ -1162,13 +1156,17 @@ async fn mexc_deposit_bridge_rejects_native_cketh_when_destination_fee_consumes_
 
     bridge.expect_get_source_balance().times(0);
     bridge
-        .expect_get_source_fee_budget()
+        .expect_get_fee_budget()
         .times(1)
         .returning(|asset, chain, target| {
             assert_eq!(asset, "ckETH");
             assert_eq!(chain, "ICP");
             assert_eq!(target, "ETH");
-            Ok(0.000_051_900_885_02)
+            Ok(BridgeFeeBudget {
+                source_fee_budget: 0.000_051_900_885_02,
+                destination_fee_budget: 0.006,
+                provider_fee_budget_native_units: Some(Nat::from(49_900_885_020_000u64)),
+            })
         });
     bridge
         .expect_get_minimum_bridge_amount()
@@ -1178,15 +1176,6 @@ async fn mexc_deposit_bridge_rejects_native_cketh_when_destination_fee_consumes_
             assert_eq!(chain, "ICP");
             assert_eq!(target, "ETH");
             Ok(0.005)
-        });
-    bridge
-        .expect_get_destination_fee_budget()
-        .times(1)
-        .returning(|asset, chain, target| {
-            assert_eq!(asset, "ckETH");
-            assert_eq!(chain, "ICP");
-            assert_eq!(target, "ETH");
-            Ok(0.006)
         });
     bridge.expect_submit_bridge().times(0);
     bridge.expect_get_bridge_status().times(0);
@@ -1249,25 +1238,20 @@ async fn mexc_deposit_bridge_does_not_wait_on_source_funding_snapshot() {
 
     bridge.expect_get_source_balance().times(0);
     bridge
-        .expect_get_source_fee_budget()
+        .expect_get_fee_budget()
         .times(1)
         .returning(|asset, chain, target| {
             assert_eq!(asset, "ckUSDC");
             assert_eq!(chain, "ICP");
             assert_eq!(target, "USDC");
-            Ok(0.01)
+            Ok(BridgeFeeBudget {
+                source_fee_budget: 0.01,
+                destination_fee_budget: 0.0,
+                provider_fee_budget_native_units: None,
+            })
         });
     bridge
         .expect_get_minimum_bridge_amount()
-        .times(1)
-        .returning(|asset, chain, target| {
-            assert_eq!(asset, "ckUSDC");
-            assert_eq!(chain, "ICP");
-            assert_eq!(target, "USDC");
-            Ok(0.0)
-        });
-    bridge
-        .expect_get_destination_fee_budget()
         .times(1)
         .returning(|asset, chain, target| {
             assert_eq!(asset, "ckUSDC");
@@ -2274,6 +2258,7 @@ fn cex_deposit_state_deserialize_defaults_missing_sent_timestamp() {
             deposit_bridge_destination_snapshot: None,
             deposit_bridge_submit_amount: None,
             deposit_bridge_expected_amount: None,
+            deposit_bridge_provider_fee_budget_native_units: None,
         },
     };
 
@@ -2318,6 +2303,10 @@ fn cex_deposit_state_deserialize_defaults_missing_sent_timestamp() {
         .as_object_mut()
         .expect("deposit state should serialize to object")
         .remove("deposit_bridge_expected_amount");
+    value
+        .as_object_mut()
+        .expect("deposit state should serialize to object")
+        .remove("deposit_bridge_provider_fee_budget_native_units");
 
     let decoded: CexDepositState = serde_json::from_value(value).expect("deserialize legacy payload");
     assert_eq!(decoded.deposit_sent_at_ts, None);
@@ -2329,6 +2318,7 @@ fn cex_deposit_state_deserialize_defaults_missing_sent_timestamp() {
     assert_eq!(decoded.bridge.deposit_bridge_polled_at_ts, None);
     assert_eq!(decoded.bridge.deposit_bridge_submit_amount, None);
     assert_eq!(decoded.bridge.deposit_bridge_expected_amount, None);
+    assert_eq!(decoded.bridge.deposit_bridge_provider_fee_budget_native_units, None);
     assert_eq!(decoded.bridge.deposit_bridge_destination_snapshot, None);
 }
 

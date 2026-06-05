@@ -67,6 +67,16 @@ pub struct BridgeRequest {
     pub target_asset: String,
     pub destination: BridgeDestination,
     pub amount: f64,
+    /// Optional exact provider fee quote, in source-native base units, captured during
+    /// preflight sizing and reused at submit time to avoid quote drift.
+    pub provider_fee_budget_native_units: Option<Nat>,
+}
+
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct BridgeFeeBudget {
+    pub source_fee_budget: f64,
+    pub destination_fee_budget: f64,
+    pub provider_fee_budget_native_units: Option<Nat>,
 }
 
 /// Provider submission handle returned after a bridge transaction is sent.
@@ -104,6 +114,16 @@ pub trait BridgeBackend: Send + Sync {
     async fn get_destination_fee_budget(&self, asset: &str, chain: &str, target_asset: &str) -> Result<f64, String> {
         let _ = (asset, chain, target_asset);
         Ok(0.0)
+    }
+
+    /// Returns source and destination fee budgets from one coherent quote when
+    /// the backend can share an underlying provider quote across both values.
+    async fn get_fee_budget(&self, asset: &str, chain: &str, target_asset: &str) -> Result<BridgeFeeBudget, String> {
+        Ok(BridgeFeeBudget {
+            source_fee_budget: self.get_source_fee_budget(asset, chain, target_asset).await?,
+            destination_fee_budget: self.get_destination_fee_budget(asset, chain, target_asset).await?,
+            provider_fee_budget_native_units: None,
+        })
     }
 
     /// Returns the minimum bridge amount for a route input. Routes without a

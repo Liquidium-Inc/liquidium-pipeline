@@ -5,8 +5,8 @@ mod types;
 mod utils;
 pub use ckerc20_bridge::{BRIDGE_AMOUNT_BELOW_MINIMUM_PREFIX, BridgeEvmBackend, CkErc20BridgeBackend};
 pub use types::{
-    BridgeBackend, BridgeDestination, BridgeDestinationKind, BridgeRequest, BridgeRouteKind, BridgeRouteSpec,
-    BridgeStatus, BridgeSubmission, BridgeSweepRoute, EvmReceiptStatus, MockBridgeBackend,
+    BridgeBackend, BridgeDestination, BridgeDestinationKind, BridgeFeeBudget, BridgeRequest, BridgeRouteKind,
+    BridgeRouteSpec, BridgeStatus, BridgeSubmission, BridgeSweepRoute, EvmReceiptStatus, MockBridgeBackend,
 };
 pub use utils::{
     cketh_forward_routes, cketh_reverse_routes, resolve_cketh_forward_route_by_source,

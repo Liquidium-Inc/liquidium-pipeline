@@ -30,8 +30,8 @@ use crate::{
             nat_units_to_amount_via_core,
         },
         bridge_backend::{
-            BridgeBackend, BridgeRequest, BridgeRouteKind, BridgeRouteSpec, BridgeStatus, BridgeSubmission,
-            resolve_cketh_forward_route_by_source, resolve_cketh_reverse_route_by_source,
+            BridgeBackend, BridgeFeeBudget, BridgeRequest, BridgeRouteKind, BridgeRouteSpec, BridgeStatus,
+            BridgeSubmission, resolve_cketh_forward_route_by_source, resolve_cketh_reverse_route_by_source,
         },
         evm_backend::EvmBackendImpl,
         icp_backend::IcpBackend,
@@ -759,7 +759,10 @@ where
         self.ensure_native_cketh_withdrawal_minimum(route, &amount_native, request.amount)
             .await?;
         let approve_fee = icrc1_fee_with_context(self.icp_backend.as_ref(), cketh_ledger_id, "cketh bridge").await?;
-        let required_fee_budget = self.quoted_cketh_fee_budget(None).await?;
+        let required_fee_budget = match &request.provider_fee_budget_native_units {
+            Some(quoted) => quoted.clone(),
+            None => self.quoted_cketh_fee_budget(None).await?,
+        };
         let required_budget = amount_native.clone() + approve_fee.clone() + required_fee_budget.clone();
 
         let available_cketh = icrc1_balance_with_context(
@@ -895,6 +898,45 @@ where
 
         let withdrawal_fee_budget = self.quoted_cketh_fee_budget(None).await?;
         nat_units_to_amount_via_core(&withdrawal_fee_budget, ETH_DECIMALS)
+    }
+
+    async fn get_fee_budget(&self, asset: &str, chain: &str, target_asset: &str) -> Result<BridgeFeeBudget, String> {
+        let Some(route) = resolve_cketh_reverse_route_by_source(asset, chain) else {
+            return Ok(BridgeFeeBudget::default());
+        };
+
+        if !route.target_asset.eq_ignore_ascii_case(target_asset) {
+            return Ok(BridgeFeeBudget::default());
+        }
+
+        match route.route_kind {
+            BridgeRouteKind::CkEthErc20Reverse => {
+                let ledger_id = parse_ckerc20_ledger_id(route)?;
+                let (decimals, approve_fee) = tokio::try_join!(
+                    icrc1_decimals_with_context(self.icp_backend.as_ref(), ledger_id, "ckerc20 bridge"),
+                    icrc1_fee_with_context(self.icp_backend.as_ref(), ledger_id, "ckerc20 bridge")
+                )?;
+                Ok(BridgeFeeBudget {
+                    source_fee_budget: nat_units_to_amount_via_core(&approve_fee, decimals)?,
+                    destination_fee_budget: 0.0,
+                    provider_fee_budget_native_units: None,
+                })
+            }
+            BridgeRouteKind::CkEthToEth => {
+                let ledger_id = parse_ckerc20_ledger_id(route)?;
+                let (approve_fee, withdrawal_fee_budget) = tokio::try_join!(
+                    icrc1_fee_with_context(self.icp_backend.as_ref(), ledger_id, "cketh bridge"),
+                    self.quoted_cketh_fee_budget(None)
+                )?;
+                let total_budget = approve_fee + withdrawal_fee_budget.clone();
+                Ok(BridgeFeeBudget {
+                    source_fee_budget: nat_units_to_amount_via_core(&total_budget, ETH_DECIMALS)?,
+                    destination_fee_budget: nat_units_to_amount_via_core(&withdrawal_fee_budget, ETH_DECIMALS)?,
+                    provider_fee_budget_native_units: Some(withdrawal_fee_budget),
+                })
+            }
+            _ => Ok(BridgeFeeBudget::default()),
+        }
     }
 
     async fn get_minimum_bridge_amount(&self, asset: &str, chain: &str, target_asset: &str) -> Result<f64, String> {

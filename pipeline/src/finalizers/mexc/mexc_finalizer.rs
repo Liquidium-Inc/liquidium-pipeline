@@ -269,12 +269,12 @@ where
     /// available for the bridge submit itself: ckERC20 routes need the source ledger approval fee,
     /// while native `ckETH -> ETH` also needs the quoted minter withdrawal fee budget. This helper
     /// returns the reserved amount and the net amount that can be submitted to the bridge.
-    async fn compute_reverse_bridge_source_fee_reserve(
-        bridge: &MexcBridgeDependencies,
+    fn compute_reverse_bridge_source_fee_reserve(
         route: &BridgeRouteSpec,
         deposit_asset: &ChainToken,
         transfer_value: &Nat,
         transfer_amount: &ChainTokenAmount,
+        source_fee_budget: f64,
     ) -> Result<Option<(ChainTokenAmount, ChainTokenAmount)>, String> {
         if !matches!(
             route.route_kind,
@@ -285,11 +285,6 @@ where
         {
             return Ok(None);
         }
-
-        let source_fee_budget = bridge
-            .backend
-            .get_source_fee_budget(route.source_asset, route.source_chain, route.target_asset)
-            .await?;
 
         let source_fee_reserve = ChainTokenAmount::from_formatted(deposit_asset.clone(), source_fee_budget);
         if source_fee_reserve.value == Nat::from(0u8) {
@@ -340,15 +335,11 @@ where
         Ok(())
     }
 
-    async fn compute_expected_bridge_deposit_amount(
-        bridge: &MexcBridgeDependencies,
+    fn compute_expected_bridge_deposit_amount(
         route: &BridgeRouteSpec,
         bridge_amount: f64,
+        destination_fee_budget: f64,
     ) -> Result<f64, String> {
-        let destination_fee_budget = bridge
-            .backend
-            .get_destination_fee_budget(route.source_asset, route.source_chain, route.target_asset)
-            .await?;
         if destination_fee_budget <= 0.0 {
             return Ok(bridge_amount);
         }
@@ -515,6 +506,7 @@ where
                     deposit_bridge_destination_snapshot: None,
                     deposit_bridge_submit_amount: None,
                     deposit_bridge_expected_amount: None,
+                    deposit_bridge_provider_fee_budget_native_units: None,
                 },
             },
             trade: CexTradeState {
@@ -685,15 +677,18 @@ where
             let (transfer_value, mut transfer_amount) =
                 Self::compute_fee_adjusted_deposit_transfer(&state.deposit.deposit_asset, &state.size_in)?;
 
+            let fee_budget = bridge
+                .backend
+                .get_fee_budget(route.source_asset, route.source_chain, route.target_asset)
+                .await?;
+
             if let Some((source_fee_reserve, bridge_amount)) = Self::compute_reverse_bridge_source_fee_reserve(
-                bridge,
                 route,
                 &state.deposit.deposit_asset,
                 &transfer_value,
                 &transfer_amount,
-            )
-            .await?
-            {
+                fee_budget.source_fee_budget,
+            )? {
                 transfer_amount = bridge_amount;
                 let source_transfer_amount =
                     ChainTokenAmount::from_raw(state.deposit.deposit_asset.clone(), transfer_value.clone());
@@ -711,8 +706,11 @@ where
 
             Self::ensure_minimum_bridge_amount(bridge, route, &transfer_amount).await?;
             let bridge_submit_amount = transfer_amount.to_f64();
-            let bridge_expected_amount =
-                Self::compute_expected_bridge_deposit_amount(bridge, route, bridge_submit_amount).await?;
+            let bridge_expected_amount = Self::compute_expected_bridge_deposit_amount(
+                route,
+                bridge_submit_amount,
+                fee_budget.destination_fee_budget,
+            )?;
 
             let tx_id = self
                 .transfer_service
@@ -721,6 +719,8 @@ where
 
             state.deposit.bridge.deposit_bridge_submit_amount = Some(bridge_submit_amount);
             state.deposit.bridge.deposit_bridge_expected_amount = Some(bridge_expected_amount);
+            state.deposit.bridge.deposit_bridge_provider_fee_budget_native_units =
+                fee_budget.provider_fee_budget_native_units;
             state.deposit.deposit_txid = Some(tx_id);
             state.deposit.deposit_sent_at_ts = Some(now_ts());
         }
@@ -755,6 +755,11 @@ where
                     target_asset: route.target_asset.to_string(),
                     destination: bridge_destination,
                     amount: bridge_amount,
+                    provider_fee_budget_native_units: state
+                        .deposit
+                        .bridge
+                        .deposit_bridge_provider_fee_budget_native_units
+                        .clone(),
                 })
                 .await?;
 
@@ -1243,6 +1248,7 @@ where
                     target_asset: route.target_asset.to_string(),
                     destination: bridge_destination,
                     amount: bridge_amount,
+                    provider_fee_budget_native_units: None,
                 })
                 .await?;
             state.withdraw.bridge.withdraw_bridge_id = Some(submission.bridge_id);

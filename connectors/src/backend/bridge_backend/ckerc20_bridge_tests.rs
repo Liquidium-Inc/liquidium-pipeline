@@ -65,6 +65,7 @@ fn route_validation_enforces_icp_destination_for_forward_route() {
             subaccount: None,
         }),
         amount: 1.0,
+        provider_fee_budget_native_units: None,
     };
     resolve_cketh_route_for_request(&request).expect("route must validate");
 
@@ -87,6 +88,7 @@ fn route_validation_rejects_non_forward_route_kind() {
         target_asset: "BTC".to_string(),
         destination: BridgeDestination::BtcAddress("1BoatSLRHtKNngkdXEeobR76b53LETtpyT".to_string()),
         amount: 1.0,
+        provider_fee_budget_native_units: None,
     };
     let err = resolve_cketh_route_for_request(&request).expect_err("must fail");
     assert!(err.contains("not supported by CkErc20BridgeBackend"));
@@ -105,6 +107,7 @@ fn route_validation_enforces_evm_destination_for_reverse_route() {
                 .expect("address"),
         ),
         amount: 1.0,
+        provider_fee_budget_native_units: None,
     };
     resolve_cketh_route_for_request(&request).expect("route must validate");
 
@@ -208,6 +211,7 @@ async fn forward_bridge_rejects_subaccount_destination_when_native_helper_is_res
             subaccount: Some([7u8; 32]),
         }),
         amount: 1.0,
+        provider_fee_budget_native_units: None,
     };
 
     let err = backend.submit_bridge(request).await.expect_err("must fail");
@@ -290,6 +294,7 @@ async fn forward_bridge_skips_approve_when_allowance_is_sufficient() {
             subaccount: None,
         }),
         amount: 1.0,
+        provider_fee_budget_native_units: None,
     };
 
     let submission = backend.submit_bridge(request).await.expect("bridge must submit");
@@ -376,6 +381,7 @@ async fn forward_bridge_approves_when_allowance_is_insufficient() {
             subaccount: None,
         }),
         amount: 1.0,
+        provider_fee_budget_native_units: None,
     };
 
     let submission = backend.submit_bridge(request).await.expect("bridge must submit");
@@ -446,6 +452,7 @@ async fn forward_bridge_fails_preflight_when_balance_is_insufficient() {
             subaccount: None,
         }),
         amount: 1.0,
+        provider_fee_budget_native_units: None,
     };
 
     let err = backend
@@ -523,6 +530,7 @@ async fn native_forward_bridge_uses_deposit_eth_with_subaccount_helper() {
             subaccount: Some([7u8; 32]),
         }),
         amount: 1.0,
+        provider_fee_budget_native_units: None,
     };
 
     let submission = backend.submit_bridge(request).await.expect("bridge must submit");
@@ -587,6 +595,7 @@ async fn native_forward_bridge_falls_back_to_legacy_eth_helper_for_default_subac
             subaccount: None,
         }),
         amount: 1.0,
+        provider_fee_budget_native_units: None,
     };
 
     let submission = backend.submit_bridge(request).await.expect("bridge must submit");
@@ -646,6 +655,7 @@ async fn native_forward_bridge_rejects_insufficient_eth_after_gas_reserve() {
             subaccount: None,
         }),
         amount: 1.0,
+        provider_fee_budget_native_units: None,
     };
 
     let err = backend
@@ -779,6 +789,7 @@ async fn reverse_bridge_skips_approvals_when_icrc2_allowances_are_sufficient() {
                 .expect("address"),
         ),
         amount: 1.0,
+        provider_fee_budget_native_units: None,
     };
 
     let submission = backend.submit_bridge(request).await.expect("bridge must submit");
@@ -918,6 +929,7 @@ async fn reverse_bridge_approves_only_missing_icrc2_allowance() {
                 .expect("address"),
         ),
         amount: 1.0,
+        provider_fee_budget_native_units: None,
     };
 
     let submission = backend.submit_bridge(request).await.expect("bridge must submit");
@@ -1023,6 +1035,7 @@ async fn native_reverse_bridge_approves_cketh_and_calls_withdraw_eth() {
                 .expect("address"),
         ),
         amount: 1.0,
+        provider_fee_budget_native_units: None,
     };
 
     let submission = backend.submit_bridge(request).await.expect("bridge must submit");
@@ -1063,6 +1076,7 @@ async fn native_reverse_bridge_rejects_below_minimum_before_allowance_or_withdra
                 .expect("address"),
         ),
         amount: 0.004_999,
+        provider_fee_budget_native_units: None,
     };
 
     let err = backend
@@ -1085,16 +1099,7 @@ async fn native_reverse_bridge_allows_exact_minimum() {
     let mut mock_agent = MockPipelineAgent::new();
     mock_agent
         .expect_call_query::<Eip1559TransactionPrice>()
-        .times(1)
-        .returning(|_, _, _| {
-            Ok(Eip1559TransactionPrice {
-                max_priority_fee_per_gas: Nat::from(1u8),
-                max_fee_per_gas: Nat::from(2u8),
-                max_transaction_fee: Nat::from(100_000u64),
-                timestamp: Some(1),
-                gas_limit: Nat::from(21_000u64),
-            })
-        });
+        .times(0);
     mock_agent
         .expect_call_update::<WithdrawalRet>()
         .times(1)
@@ -1162,6 +1167,7 @@ async fn native_reverse_bridge_allows_exact_minimum() {
                 .expect("address"),
         ),
         amount: 0.005,
+        provider_fee_budget_native_units: Some(Nat::from(120_000u64)),
     };
 
     let submission = backend.submit_bridge(request).await.expect("minimum should submit");
@@ -1222,6 +1228,54 @@ async fn native_reverse_bridge_destination_fee_budget_uses_quote() {
 }
 
 #[tokio::test]
+async fn native_reverse_bridge_fee_budget_reuses_one_provider_quote() {
+    let bridge_owner = Principal::management_canister();
+    let minter = Principal::anonymous();
+    let cketh_ledger = Principal::from_text("ss2fx-dyaaa-aaaar-qacoq-cai").expect("ledger");
+    let mut mock_agent = MockPipelineAgent::new();
+    mock_agent
+        .expect_call_query::<Eip1559TransactionPrice>()
+        .times(1)
+        .returning(|_, _, _| {
+            Ok(Eip1559TransactionPrice {
+                max_priority_fee_per_gas: Nat::from(1u8),
+                max_fee_per_gas: Nat::from(2u8),
+                max_transaction_fee: Nat::from(100_000_000_000_000u64),
+                timestamp: Some(1),
+                gas_limit: Nat::from(21_000u64),
+            })
+        });
+
+    let mut mock_icp = MockIcpBackend::new();
+    mock_icp.expect_icrc1_fee().times(1).returning(move |ledger| {
+        if ledger == cketh_ledger {
+            Ok(Nat::from(2_000_000_000_000u64))
+        } else {
+            Err(format!("unexpected fee ledger {ledger}"))
+        }
+    });
+
+    let backend = CkErc20BridgeBackend::new(
+        Arc::new(mock_agent),
+        Arc::new(mock_icp),
+        Arc::new(MockBridgeEvmBackend::new()),
+        minter,
+        bridge_owner,
+    );
+
+    let fee_budget = backend
+        .get_fee_budget("ckETH", "ICP", "ETH")
+        .await
+        .expect("fee budget should resolve");
+    assert!((fee_budget.source_fee_budget - 0.000122).abs() < 1e-18);
+    assert!((fee_budget.destination_fee_budget - 0.00012).abs() < 1e-18);
+    assert_eq!(
+        fee_budget.provider_fee_budget_native_units,
+        Some(Nat::from(120_000_000_000_000u64))
+    );
+}
+
+#[tokio::test]
 async fn erc20_reverse_bridge_destination_fee_budget_is_zero() {
     let bridge_owner = Principal::management_canister();
     let minter = Principal::anonymous();
@@ -1264,6 +1318,7 @@ async fn native_reverse_bridge_rejects_wrong_bridge_owner() {
                 .expect("address"),
         ),
         amount: 1.0,
+        provider_fee_budget_native_units: None,
     };
 
     let err = backend.submit_bridge(request).await.expect_err("must fail");
