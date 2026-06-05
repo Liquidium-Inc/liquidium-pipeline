@@ -5,6 +5,7 @@ use std::time::Duration;
 use alloy::primitives::Address as EvmAddress;
 use async_trait::async_trait;
 use candid::{Nat, Principal};
+use ic_ledger_types::{AccountIdentifier, Subaccount};
 use icrc_ledger_types::icrc1::account::Account;
 use liquidium_pipeline_connectors::backend::bridge_backend::{
     BridgeBackend, BridgeRequest, BridgeRouteKind, BridgeStatus, resolve_route,
@@ -38,7 +39,7 @@ use crate::{
     stages::bridge_submit_lock::acquire_bridge_submit_lock,
     stages::executor::ExecutionReceipt,
     swappers::model::{SwapExecution, SwapQuoteLeg},
-    utils::now_ts,
+    utils::{ICP_LEDGER_PRINCIPAL, now_ts},
 };
 
 #[derive(Debug, Clone)]
@@ -132,6 +133,35 @@ impl<C> MexcFinalizer<C>
 where
     C: CexBackend,
 {
+    fn is_native_icp_token(token: &ChainToken) -> bool {
+        match token {
+            ChainToken::Icp { ledger, symbol, .. } => {
+                symbol.eq_ignore_ascii_case("ICP")
+                    && Principal::from_text(ICP_LEDGER_PRINCIPAL).is_ok_and(|icp_ledger| *ledger == icp_ledger)
+            }
+            _ => false,
+        }
+    }
+
+    fn principal_default_account_id_hex(owner: Principal) -> String {
+        AccountIdentifier::new(&owner, &Subaccount([0; 32])).to_hex()
+    }
+
+    fn validate_icp_account_id_hex(address: &str, context: &str) -> Result<String, String> {
+        let normalized = address.trim().to_ascii_lowercase();
+        AccountIdentifier::from_hex(&normalized).map_err(|err| {
+            format!(
+                "invalid native ICP ledger account id '{}' for {}: {}",
+                address, context, err
+            )
+        })?;
+        Ok(normalized)
+    }
+
+    fn native_icp_direct_withdraw_address(&self) -> String {
+        Self::principal_default_account_id_hex(self.liquidator_principal)
+    }
+
     fn complete_withdraw_as_below_min_dust(
         state: &mut CexState,
         planned_asset: &str,
@@ -173,6 +203,10 @@ where
                         planned_network,
                         token.symbol()
                     ));
+                }
+                if Self::is_native_icp_token(token) {
+                    let account_id_hex = Self::validate_icp_account_id_hex(destination, "MEXC ICP deposit")?;
+                    return Ok(ChainAccount::IcpLedger(account_id_hex));
                 }
                 let owner = Principal::from_text(destination).map_err(|e| {
                     format!(
@@ -457,6 +491,17 @@ where
                     .backend
                     .get_deposit_address(&planned_asset, &planned_network)
                     .await?;
+
+                if Self::is_native_icp_token(&state.deposit.deposit_asset)
+                    && addr.tag.as_deref().is_some_and(|tag| !tag.trim().is_empty())
+                {
+                    let tag = addr.tag.clone().unwrap_or_default();
+                    return Err(format!(
+                        "native ICP MEXC deposit returned unsupported memo/tag for liq_id {} asset={} network={} address={} tag={}",
+                        state.liq_id, planned_asset, planned_network, addr.address, tag
+                    ));
+                }
+
                 state.deposit.bridge.deposit_bridge_destination_snapshot = Some(addr.address.clone());
 
                 let (transfer_value, transfer_amount) =
@@ -476,10 +521,13 @@ where
                 state.deposit.deposit_txid = Some(tx_id);
                 state.deposit.deposit_sent_at_ts = Some(now_ts());
 
-                if matches!(state.deposit.deposit_asset, ChainToken::Icp { .. }) {
+                if matches!(state.deposit.deposit_asset, ChainToken::Icp { .. })
+                    && !Self::is_native_icp_token(&state.deposit.deposit_asset)
+                {
                     let approved = self
                         .maybe_bump_mexc_approval(&state.liq_id, &state.deposit.deposit_asset)
                         .await;
+
                     if approved > 0 {
                         state.deposit.approval_bump_count = Some(approved);
                     }
@@ -857,7 +905,11 @@ where
 
         if !state.withdraw.bridge.withdraw_bridge_required {
             let direct_destination = if planned_network.eq_ignore_ascii_case("ICP") {
-                self.liquidator_principal.to_text()
+                if Self::is_native_icp_token(&state.withdraw.withdraw_asset) {
+                    self.native_icp_direct_withdraw_address()
+                } else {
+                    self.liquidator_principal.to_text()
+                }
             } else if planned_network.eq_ignore_ascii_case("ETH")
                 || planned_network.to_ascii_lowercase().starts_with("evm")
             {

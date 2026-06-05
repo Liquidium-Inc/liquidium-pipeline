@@ -244,13 +244,15 @@ where
             }
 
             info!(
-                "[finalize] 🧾 executing receipt: liq_id={} pay={} recv={} debt_repaid={} collateral_received={} swap={}",
+                "[finalize] 🧾 executing receipt: liq_id={} debt_asset={} collateral_asset={} debt_repaid={} collateral_received={} swap={} swap_pay={} swap_recv={}",
                 liq_id,
-                receipt.request.collateral_asset.symbol(),
                 receipt.request.debt_asset.symbol(),
+                receipt.request.collateral_asset.symbol(),
                 liq.amounts.debt_repaid,
                 liq.amounts.collateral_received,
-                receipt.request.swap_args.is_some()
+                receipt.request.swap_args.is_some(),
+                receipt.request.collateral_asset.symbol(),
+                receipt.request.debt_asset.symbol()
             );
 
             if receipt.request.swap_args.is_none() {

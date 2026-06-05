@@ -24,6 +24,7 @@ pub trait Asset {
 #[derive(Debug, CandidType, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub enum Assets {
     BTC,
+    ICP,
     SOL,
     USDC,
     USDT,
@@ -39,6 +40,7 @@ impl Asset for Assets {
     fn decimals(&self) -> u32 {
         match self {
             Assets::BTC => 8,
+            Assets::ICP => 8,
             Assets::SOL => 18,
             Assets::USDC => 6,
             Assets::USDT => 6,
@@ -48,6 +50,7 @@ impl Asset for Assets {
     fn symbol(&self) -> String {
         match self {
             Assets::BTC => "BTC".to_string(),
+            Assets::ICP => "ICP".to_string(),
             Assets::SOL => "SOL".to_string(),
             Assets::USDC => "USDC".to_string(),
             Assets::USDT => "USDT".to_string(),

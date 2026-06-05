@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use candid::{Nat, Principal};
+use ic_ledger_types::{AccountIdentifier, Subaccount};
 use liquidium_pipeline_connectors::backend::bridge_backend::{
     BridgeDestination, BridgeStatus, BridgeSubmission, MockBridgeBackend,
 };
@@ -21,9 +22,11 @@ use liquidium_pipeline_core::types::protocol_types::{
 use crate::executors::executor::ExecutorRequest;
 use crate::finalizers::cex_finalizer::{CexDepositState, CexState, CexStep};
 use crate::stages::executor::{ExecutionReceipt, ExecutionStatus};
+use crate::utils::ICP_LEDGER_PRINCIPAL;
 use proptest::prelude::*;
 
 const TEST_MAX_SELL_SLIPPAGE_BPS: f64 = 200.0;
+const MEXC_ICP_DEPOSIT_ACCOUNT_ID_HEX: &str = "f0b4ad64ab441cc8792da85f948281a4b78b0038120081766aefcd29519bf2f6";
 /// Minimum USD chunk used by test finalizer instances.
 /// Keep tiny so tests do not trigger dust skipping unless explicitly intended.
 const TEST_CEX_MIN_EXEC_USD: f64 = 0.0001;
@@ -191,6 +194,28 @@ fn ckbtc_token() -> ChainToken {
         symbol: "ckBTC".to_string(),
         decimals: 8,
         fee: Nat::from(1_000u64),
+    }
+}
+
+fn native_icp_token() -> ChainToken {
+    ChainToken::Icp {
+        ledger: Principal::from_text(ICP_LEDGER_PRINCIPAL).expect("ICP ledger principal"),
+        symbol: "ICP".to_string(),
+        decimals: 8,
+        fee: Nat::from(10_000u64),
+    }
+}
+
+fn liquid_orderbook() -> OrderBook {
+    OrderBook {
+        bids: vec![OrderBookLevel {
+            price: 1.0,
+            quantity: 1_000_000.0,
+        }],
+        asks: vec![OrderBookLevel {
+            price: 1.001,
+            quantity: 1_000_000.0,
+        }],
     }
 }
 
@@ -464,6 +489,147 @@ async fn mexc_deposit_phase_a_rejects_invalid_evm_deposit_address() {
 
     let err = finalizer.deposit(&mut state).await.expect_err("deposit should fail");
     assert!(err.contains("invalid MEXC EVM deposit address"));
+}
+
+#[tokio::test]
+async fn mexc_native_icp_deposit_uses_ledger_account_id_destination() {
+    AccountIdentifier::from_hex(MEXC_ICP_DEPOSIT_ACCOUNT_ID_HEX).expect("test MEXC ICP account id should be valid");
+
+    let mut backend = MockCexBackend::new();
+    let mut transfers = MockTransferActions::new();
+
+    backend.expect_get_balance().times(1).returning(|asset| {
+        assert_eq!(asset, "ICP");
+        Ok(10.0)
+    });
+
+    backend
+        .expect_get_deposit_address()
+        .times(1)
+        .returning(|asset, network| {
+            assert_eq!(asset, "ICP");
+            assert_eq!(network, "ICP");
+            Ok(DepositAddress {
+                asset: "ICP".to_string(),
+                network: "ICP".to_string(),
+                address: MEXC_ICP_DEPOSIT_ACCOUNT_ID_HEX.to_string(),
+                tag: None,
+            })
+        });
+
+    transfers
+        .expect_transfer()
+        .times(1)
+        .returning(|token, destination, amount| {
+            assert!(MexcFinalizer::<MockCexBackend>::is_native_icp_token(token));
+            match destination {
+                ChainAccount::IcpLedger(account_id_hex) => {
+                    assert_eq!(account_id_hex, MEXC_ICP_DEPOSIT_ACCOUNT_ID_HEX);
+                }
+                other => panic!("expected native ICP ledger account destination, got {:?}", other),
+            }
+            assert_eq!(amount, Nat::from(930_000u64));
+            Ok("tx-native-icp".to_string())
+        });
+    transfers.expect_approve().times(0);
+
+    let finalizer = MexcFinalizer::new(
+        Arc::new(backend),
+        Arc::new(transfers),
+        Principal::anonymous(),
+        TEST_MAX_SELL_SLIPPAGE_BPS,
+        TEST_CEX_MIN_EXEC_USD,
+        TEST_CEX_SLICE_TARGET_RATIO,
+    );
+
+    let receipt = make_execution_receipt_with_assets(45, native_icp_token(), ckbtc_token());
+    let mut state = finalizer.prepare("45", &receipt).await.expect("prepare should succeed");
+
+    finalizer
+        .deposit(&mut state)
+        .await
+        .expect("native ICP deposit should succeed");
+
+    assert_eq!(state.deposit.deposit_txid.as_deref(), Some("tx-native-icp"));
+    assert!(matches!(state.step, CexStep::DepositPending));
+}
+
+#[tokio::test]
+async fn mexc_native_icp_deposit_rejects_invalid_ledger_account_id() {
+    let mut backend = MockCexBackend::new();
+    let mut transfers = MockTransferActions::new();
+
+    backend.expect_get_balance().times(1).returning(|_asset| Ok(10.0));
+    backend
+        .expect_get_deposit_address()
+        .times(1)
+        .returning(|_asset, _network| {
+            Ok(DepositAddress {
+                asset: "ICP".to_string(),
+                network: "ICP".to_string(),
+                address: "not-a-ledger-account-id".to_string(),
+                tag: None,
+            })
+        });
+    transfers.expect_transfer().times(0);
+    transfers.expect_approve().times(0);
+
+    let finalizer = MexcFinalizer::new(
+        Arc::new(backend),
+        Arc::new(transfers),
+        Principal::anonymous(),
+        TEST_MAX_SELL_SLIPPAGE_BPS,
+        TEST_CEX_MIN_EXEC_USD,
+        TEST_CEX_SLICE_TARGET_RATIO,
+    );
+
+    let receipt = make_execution_receipt_with_assets(46, native_icp_token(), ckbtc_token());
+    let mut state = finalizer.prepare("46", &receipt).await.expect("prepare should succeed");
+
+    let err = finalizer
+        .deposit(&mut state)
+        .await
+        .expect_err("invalid native ICP account id should fail");
+    assert!(err.contains("invalid native ICP ledger account id"));
+}
+
+#[tokio::test]
+async fn mexc_native_icp_deposit_rejects_memo_tag_before_transfer() {
+    let mut backend = MockCexBackend::new();
+    let mut transfers = MockTransferActions::new();
+
+    backend.expect_get_balance().times(1).returning(|_asset| Ok(10.0));
+    backend
+        .expect_get_deposit_address()
+        .times(1)
+        .returning(|_asset, _network| {
+            Ok(DepositAddress {
+                asset: "ICP".to_string(),
+                network: "ICP".to_string(),
+                address: MEXC_ICP_DEPOSIT_ACCOUNT_ID_HEX.to_string(),
+                tag: Some("memo-not-supported".to_string()),
+            })
+        });
+    transfers.expect_transfer().times(0);
+    transfers.expect_approve().times(0);
+
+    let finalizer = MexcFinalizer::new(
+        Arc::new(backend),
+        Arc::new(transfers),
+        Principal::anonymous(),
+        TEST_MAX_SELL_SLIPPAGE_BPS,
+        TEST_CEX_MIN_EXEC_USD,
+        TEST_CEX_SLICE_TARGET_RATIO,
+    );
+
+    let receipt = make_execution_receipt_with_assets(47, native_icp_token(), ckbtc_token());
+    let mut state = finalizer.prepare("47", &receipt).await.expect("prepare should succeed");
+
+    let err = finalizer
+        .deposit(&mut state)
+        .await
+        .expect_err("native ICP memo/tag should fail before transfer");
+    assert!(err.contains("unsupported memo/tag"));
 }
 
 #[test]
@@ -1138,6 +1304,59 @@ async fn mexc_non_bridge_withdraw_behavior_unchanged() {
         .expect("direct withdraw should still complete in one call");
     assert!(matches!(state.step, CexStep::Completed));
     assert_eq!(state.withdraw.withdraw_id.as_deref(), Some("withdraw-direct"));
+}
+
+#[tokio::test]
+async fn mexc_native_icp_non_bridge_withdraw_uses_liquidator_account_id_hex() {
+    let mut cex = MockCexBackend::new();
+    let transfers = MockTransferActions::new();
+    let liquidator = Principal::management_canister();
+    let expected_account_id = AccountIdentifier::new(&liquidator, &Subaccount([0; 32])).to_hex();
+
+    cex.expect_withdraw()
+        .times(1)
+        .returning(move |asset, network, address, amount| {
+            assert_eq!(asset, "ICP");
+            assert_eq!(network, "ICP");
+            assert_eq!(address, expected_account_id);
+            assert!(amount > 0.0);
+            Ok(liquidium_pipeline_connectors::backend::cex_backend::WithdrawalReceipt {
+                asset: asset.to_string(),
+                network: network.to_string(),
+                amount,
+                txid: Some("tx-native-icp-withdraw".to_string()),
+                internal_id: Some("withdraw-native-icp".to_string()),
+            })
+        });
+
+    let finalizer = MexcFinalizer::new(
+        Arc::new(cex),
+        Arc::new(transfers),
+        liquidator,
+        TEST_MAX_SELL_SLIPPAGE_BPS,
+        TEST_CEX_MIN_EXEC_USD,
+        TEST_CEX_SLICE_TARGET_RATIO,
+    );
+
+    let receipt = make_execution_receipt_with_assets(131, ckbtc_token(), native_icp_token());
+    let mut state = finalizer
+        .prepare("131", &receipt)
+        .await
+        .expect("prepare should succeed");
+    state.step = CexStep::Withdraw;
+    state.withdraw.size_out = Some(ChainTokenAmount::from_formatted(
+        state.withdraw.withdraw_asset.clone(),
+        1.0,
+    ));
+
+    finalizer
+        .withdraw(&mut state)
+        .await
+        .expect("native ICP direct withdraw should complete in one call");
+
+    assert!(matches!(state.step, CexStep::Completed));
+    assert_eq!(state.withdraw.withdraw_id.as_deref(), Some("withdraw-native-icp"));
+    assert_ne!(state.withdraw.withdraw_address, liquidator.to_text());
 }
 
 #[tokio::test]
@@ -3014,6 +3233,176 @@ async fn resolve_trade_legs_for_identical_symbols_is_noop() {
         .expect("identical symbols should resolve as no-op");
 
     assert!(legs.is_empty());
+}
+
+#[tokio::test]
+async fn mexc_resolves_icp_to_ckbtc_route_from_configured_pairs() {
+    let mut backend = MockCexBackend::new();
+    let transfers = MockTransferActions::new();
+    let liquid = liquid_orderbook();
+    let empty = OrderBook {
+        bids: vec![],
+        asks: vec![],
+    };
+
+    backend
+        .expect_get_orderbook()
+        .returning(move |market, _limit| match market {
+            "ICP_CKBTC" | "CKBTC_ICP" => Ok(empty.clone()),
+            "ICP_USDC" | "BTC_USDC" | "CKBTC_BTC" => Ok(liquid.clone()),
+            other => Err(format!("unexpected market {}", other)),
+        });
+
+    let finalizer = MexcFinalizer::new(
+        Arc::new(backend),
+        Arc::new(transfers),
+        Principal::anonymous(),
+        TEST_MAX_SELL_SLIPPAGE_BPS,
+        TEST_CEX_MIN_EXEC_USD,
+        TEST_CEX_SLICE_TARGET_RATIO,
+    )
+    .with_route_config(
+        vec!["ICP_USDC".to_string(), "BTC_USDC".to_string(), "CKBTC_BTC".to_string()],
+        2,
+    );
+
+    let legs = finalizer
+        .resolve_trade_legs_for_symbols("ICP", "ckBTC")
+        .await
+        .expect("ICP -> ckBTC route should resolve");
+
+    assert_eq!(legs.len(), 3);
+    assert_eq!(legs[0].market, "ICP_USDC");
+    assert_eq!(legs[0].side, "sell");
+    assert_eq!(legs[1].market, "BTC_USDC");
+    assert_eq!(legs[1].side, "buy");
+    assert_eq!(legs[2].market, "CKBTC_BTC");
+    assert_eq!(legs[2].side, "buy");
+}
+
+#[tokio::test]
+async fn mexc_resolves_ckbtc_to_icp_route_from_configured_pairs() {
+    let mut backend = MockCexBackend::new();
+    let transfers = MockTransferActions::new();
+    let liquid = liquid_orderbook();
+    let empty = OrderBook {
+        bids: vec![],
+        asks: vec![],
+    };
+
+    backend
+        .expect_get_orderbook()
+        .returning(move |market, _limit| match market {
+            "CKBTC_ICP" | "ICP_CKBTC" => Ok(empty.clone()),
+            "CKBTC_BTC" | "BTC_USDC" | "ICP_USDC" => Ok(liquid.clone()),
+            other => Err(format!("unexpected market {}", other)),
+        });
+
+    let finalizer = MexcFinalizer::new(
+        Arc::new(backend),
+        Arc::new(transfers),
+        Principal::anonymous(),
+        TEST_MAX_SELL_SLIPPAGE_BPS,
+        TEST_CEX_MIN_EXEC_USD,
+        TEST_CEX_SLICE_TARGET_RATIO,
+    )
+    .with_route_config(
+        vec!["CKBTC_BTC".to_string(), "BTC_USDC".to_string(), "ICP_USDC".to_string()],
+        2,
+    );
+
+    let legs = finalizer
+        .resolve_trade_legs_for_symbols("ckBTC", "ICP")
+        .await
+        .expect("ckBTC -> ICP route should resolve");
+
+    assert_eq!(legs.len(), 3);
+    assert_eq!(legs[0].market, "CKBTC_BTC");
+    assert_eq!(legs[0].side, "sell");
+    assert_eq!(legs[1].market, "BTC_USDC");
+    assert_eq!(legs[1].side, "sell");
+    assert_eq!(legs[2].market, "ICP_USDC");
+    assert_eq!(legs[2].side, "buy");
+}
+
+#[tokio::test]
+async fn mexc_resolves_icp_to_ckusdt_route_from_configured_pairs() {
+    let mut backend = MockCexBackend::new();
+    let transfers = MockTransferActions::new();
+    let liquid = liquid_orderbook();
+    let empty = OrderBook {
+        bids: vec![],
+        asks: vec![],
+    };
+
+    backend
+        .expect_get_orderbook()
+        .returning(move |market, _limit| match market {
+            "ICP_CKUSDT" | "CKUSDT_ICP" => Ok(empty.clone()),
+            "ICP_USDT" | "CKUSDT_USDT" => Ok(liquid.clone()),
+            other => Err(format!("unexpected market {}", other)),
+        });
+
+    let finalizer = MexcFinalizer::new(
+        Arc::new(backend),
+        Arc::new(transfers),
+        Principal::anonymous(),
+        TEST_MAX_SELL_SLIPPAGE_BPS,
+        TEST_CEX_MIN_EXEC_USD,
+        TEST_CEX_SLICE_TARGET_RATIO,
+    )
+    .with_route_config(vec!["ICP_USDT".to_string(), "CKUSDT_USDT".to_string()], 1);
+
+    let legs = finalizer
+        .resolve_trade_legs_for_symbols("ICP", "ckUSDT")
+        .await
+        .expect("ICP -> ckUSDT route should resolve");
+
+    assert_eq!(legs.len(), 2);
+    assert_eq!(legs[0].market, "ICP_USDT");
+    assert_eq!(legs[0].side, "sell");
+    assert_eq!(legs[1].market, "CKUSDT_USDT");
+    assert_eq!(legs[1].side, "buy");
+}
+
+#[tokio::test]
+async fn mexc_resolves_ckusdt_to_icp_route_from_configured_pairs() {
+    let mut backend = MockCexBackend::new();
+    let transfers = MockTransferActions::new();
+    let liquid = liquid_orderbook();
+    let empty = OrderBook {
+        bids: vec![],
+        asks: vec![],
+    };
+
+    backend
+        .expect_get_orderbook()
+        .returning(move |market, _limit| match market {
+            "CKUSDT_ICP" | "ICP_CKUSDT" => Ok(empty.clone()),
+            "CKUSDT_USDT" | "ICP_USDT" => Ok(liquid.clone()),
+            other => Err(format!("unexpected market {}", other)),
+        });
+
+    let finalizer = MexcFinalizer::new(
+        Arc::new(backend),
+        Arc::new(transfers),
+        Principal::anonymous(),
+        TEST_MAX_SELL_SLIPPAGE_BPS,
+        TEST_CEX_MIN_EXEC_USD,
+        TEST_CEX_SLICE_TARGET_RATIO,
+    )
+    .with_route_config(vec!["CKUSDT_USDT".to_string(), "ICP_USDT".to_string()], 1);
+
+    let legs = finalizer
+        .resolve_trade_legs_for_symbols("ckUSDT", "ICP")
+        .await
+        .expect("ckUSDT -> ICP route should resolve");
+
+    assert_eq!(legs.len(), 2);
+    assert_eq!(legs[0].market, "CKUSDT_USDT");
+    assert_eq!(legs[0].side, "sell");
+    assert_eq!(legs[1].market, "ICP_USDT");
+    assert_eq!(legs[1].side, "buy");
 }
 
 #[tokio::test]

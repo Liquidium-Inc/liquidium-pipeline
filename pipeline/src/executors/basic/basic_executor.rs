@@ -2,6 +2,7 @@ use std::sync::Arc;
 use std::{
     collections::HashSet,
     sync::Mutex,
+    time::Duration,
 };
 
 use candid::{Encode, Nat, Principal};
@@ -15,10 +16,13 @@ use icrc_ledger_types::{
     },
 };
 use log::{debug, info, warn};
+use tokio::time::timeout;
 
 use liquidium_pipeline_connectors::pipeline_agent::PipelineAgent;
 
 use crate::{approval_state::ApprovalState, persistance::WalStore, utils::max_for_ledger};
+
+const ALLOWANCE_LEDGER_TIMEOUT: Duration = Duration::from_secs(20);
 
 #[derive(Clone, Debug)]
 struct EnsureAllowanceResult {
@@ -161,10 +165,22 @@ impl<A: PipelineAgent, D: WalStore> BasicExecutor<A, D> {
         &self,
         tokens: &[Principal],
     ) -> Vec<(Principal, Result<EnsureAllowanceResult, String>)> {
-        let allowance_futures = tokens
-            .iter()
-            .copied()
-            .map(|token| async move { (token, self.ensure_lending_allowance_for_ledger(token).await) });
+        let allowance_futures = tokens.iter().copied().map(|token| async move {
+            let result = match timeout(
+                ALLOWANCE_LEDGER_TIMEOUT,
+                self.ensure_lending_allowance_for_ledger(token),
+            )
+            .await
+            {
+                Ok(result) => result,
+                Err(_) => Err(format!(
+                    "Allowance ensure timed out after {}s",
+                    ALLOWANCE_LEDGER_TIMEOUT.as_secs()
+                )),
+            };
+
+            (token, result)
+        });
         join_all(allowance_futures).await
     }
 
