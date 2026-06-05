@@ -3,9 +3,12 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use candid::{Encode, Principal};
 use liquidium_pipeline_connectors::pipeline_agent::PipelineAgent;
-use liquidium_pipeline_core::types::protocol_types::{AssetType, LiquidatebleUser, ScanResult};
+use liquidium_pipeline_core::types::protocol_types::{
+    AssetType, Assets, LiquidateblePosition, LiquidatebleUser, ScanResult,
+};
 
 use crate::stage::PipelineStage;
+use crate::utils::ICP_LEDGER_PRINCIPAL;
 
 pub struct OpportunityFinder<A: PipelineAgent> {
     pub agent: Arc<A>,
@@ -19,6 +22,17 @@ impl<A: PipelineAgent> OpportunityFinder<A> {
             agent,
             canister_id,
             account_filter,
+        }
+    }
+
+    fn is_supported_position(pos: &LiquidateblePosition, supported_assets: &[String]) -> bool {
+        if pos.asset == Assets::ICP {
+            return supported_assets.iter().any(|asset| asset == ICP_LEDGER_PRINCIPAL);
+        }
+
+        match pos.asset_type {
+            AssetType::CkAsset(asset_principal) => supported_assets.contains(&asset_principal.to_text()),
+            AssetType::Unknown => false,
         }
     }
 }
@@ -66,14 +80,7 @@ where
             user.positions = user
                 .positions
                 .iter()
-                .filter(|item| matches!(item.asset_type, AssetType::CkAsset(_))) // Only liquidated ck asset collaterals
-                .filter(|item| {
-                    let AssetType::CkAsset(asset_principal) = item.asset_type else {
-                        return false;
-                    };
-
-                    supported_assets.contains(&asset_principal.to_string()) // Filter out any unsupported assets
-                })
+                .filter(|item| Self::is_supported_position(item, supported_assets))
                 .cloned()
                 .collect();
         });
@@ -180,6 +187,59 @@ mod tests {
         assert!(all_positions.iter().any(|p| p.asset == Assets::BTC));
         assert!(all_positions.iter().any(|p| p.asset == Assets::USDC));
         assert!(!all_positions.iter().any(|p| p.asset == Assets::SOL));
+    }
+
+    #[tokio::test]
+    async fn opportunity_finder_keeps_supported_native_icp_pool_asset_type_positions() {
+        let canister_id = Principal::anonymous();
+        let ckbtc_principal = Principal::from_text("mxzaz-hqaaa-aaaar-qaada-cai").unwrap();
+        let icp_pool_principal = Principal::from_text("en2mt-fyaaa-aaaae-qkefq-cai").unwrap();
+
+        let pos_ckbtc = LiquidateblePosition {
+            pool_id: Principal::anonymous(),
+            debt_amount: Nat::from(1_000u64),
+            collateral_amount: Nat::from(0u64),
+            asset: Assets::BTC,
+            asset_type: AssetType::CkAsset(ckbtc_principal),
+            account: Principal::anonymous(),
+            liquidation_bonus: 60,
+            liquidation_threshold: 8500,
+            protocol_fee: 200,
+        };
+
+        let pos_icp_collateral = LiquidateblePosition {
+            asset: Assets::ICP,
+            asset_type: AssetType::CkAsset(icp_pool_principal),
+            debt_amount: Nat::from(0u64),
+            collateral_amount: Nat::from(2_000u64),
+            ..pos_ckbtc.clone()
+        };
+
+        let users = vec![LiquidatebleUser {
+            account: Principal::anonymous(),
+            health_factor: Nat::from(1u64),
+            weighted_liquidation_threshold: Nat::from(8500u64),
+            total_debt: Nat::from(1_000u64),
+            positions: vec![pos_ckbtc, pos_icp_collateral],
+        }];
+
+        let mut agent = MockPipelineAgent::new();
+        agent.expect_call_query::<ScanResult>().returning(move |_, _, _| {
+            Ok(ScanResult {
+                users: users.clone(),
+                next_cursor: None,
+                scanned: 1,
+            })
+        });
+
+        let finder = OpportunityFinder::new(Arc::new(agent), canister_id, vec![]);
+        let supported_assets = vec![ckbtc_principal.to_string(), ICP_LEDGER_PRINCIPAL.to_string()];
+
+        let result = finder.process(&supported_assets).await.unwrap();
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].positions.len(), 2);
+        assert!(result[0].positions.iter().any(|p| p.asset == Assets::ICP));
     }
 
     #[tokio::test]
