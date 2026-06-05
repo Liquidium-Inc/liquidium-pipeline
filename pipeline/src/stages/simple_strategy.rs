@@ -1122,8 +1122,7 @@ mod tests {
         let debt_pool = p("rw6tq-vyaaa-aaaae-qjx5a-cai");
         let borrower = p("aaaaa-aa");
         let debt_pos = mk_position(debt_pool, borrower, ckusdc_ledger, 1_000_000, 0, Assets::USDC);
-        let mut collateral_pos = mk_unknown_native_icp_position(icp_pool, borrower, 0, 200_000_000);
-        collateral_pos.asset_type = AssetType::CkAsset(icp_pool);
+        let collateral_pos = mk_unknown_native_icp_position(icp_pool, borrower, 0, 200_000_000);
         let user = mk_user(vec![debt_pos, collateral_pos], 1_000_000, 900);
 
         let res = strategy.process(&vec![user]).await.unwrap();
