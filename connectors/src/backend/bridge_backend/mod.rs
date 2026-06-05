@@ -3,7 +3,7 @@ pub mod ckerc20_bridge;
 mod ckerc20_bridge_utils;
 mod types;
 mod utils;
-pub use ckerc20_bridge::{BridgeEvmBackend, CkErc20BridgeBackend};
+pub use ckerc20_bridge::{BRIDGE_AMOUNT_BELOW_MINIMUM_PREFIX, BridgeEvmBackend, CkErc20BridgeBackend};
 pub use types::{
     BridgeBackend, BridgeDestination, BridgeDestinationKind, BridgeRequest, BridgeRouteKind, BridgeRouteSpec,
     BridgeStatus, BridgeSubmission, BridgeSweepRoute, EvmReceiptStatus, MockBridgeBackend,

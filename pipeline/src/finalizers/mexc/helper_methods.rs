@@ -50,6 +50,9 @@ where
 
         let elapsed = now.saturating_sub(sent_at);
         if elapsed >= DEPOSIT_TOTAL_FREE_FALLBACK_SECS && current_balance >= expected_floor {
+            if let Some(expected_amount) = state.deposit.bridge.deposit_bridge_expected_amount {
+                state.trade.trade_next_amount_in = Some(expected_amount);
+            }
             info!(
                 "[mexc] liq_id={} deposit confirmed via total-free fallback: current={} expected={} elapsed={}s",
                 state.liq_id, current_balance, expected_deposit_amount, elapsed
@@ -69,14 +72,24 @@ where
         match state.deposit.deposit_balance_before {
             Some(baseline_balance) => {
                 let expected_deposit_amount = state
-                    .trade
-                    .trade_next_amount_in
+                    .deposit
+                    .bridge
+                    .deposit_bridge_expected_amount
+                    .or(state.trade.trade_next_amount_in)
                     .unwrap_or_else(|| state.size_in.to_f64());
                 let expected_floor = expected_deposit_amount - DEPOSIT_CONFIRMATION_DELTA_EPSILON;
 
                 // Primary path: prove this deposit by balance delta from captured baseline.
                 let observed_balance_delta = current_balance - baseline_balance;
                 if observed_balance_delta >= expected_floor {
+                    if state.deposit.bridge.deposit_bridge_required {
+                        let cap = state
+                            .deposit
+                            .bridge
+                            .deposit_bridge_submit_amount
+                            .unwrap_or(expected_deposit_amount);
+                        state.trade.trade_next_amount_in = Some(observed_balance_delta.max(0.0).min(cap));
+                    }
                     info!(
                         "[mexc] liq_id={} deposit confirmed: before={} after={} expected={}",
                         state.liq_id, baseline_balance, current_balance, expected_deposit_amount

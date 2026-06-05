@@ -88,6 +88,10 @@ pub struct CexDepositBridgeState {
     pub deposit_bridge_polled_at_ts: Option<i64>,
     #[serde(default)]
     pub deposit_bridge_destination_snapshot: Option<String>,
+    #[serde(default)]
+    pub deposit_bridge_submit_amount: Option<f64>,
+    #[serde(default)]
+    pub deposit_bridge_expected_amount: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -508,6 +512,8 @@ mod tests {
                         deposit_bridge_submitted_at_ts: None,
                         deposit_bridge_polled_at_ts: None,
                         deposit_bridge_destination_snapshot: None,
+                        deposit_bridge_submit_amount: None,
+                        deposit_bridge_expected_amount: None,
                     },
                 },
                 trade: CexTradeState {
@@ -653,6 +659,8 @@ mod tests {
                         deposit_bridge_submitted_at_ts: None,
                         deposit_bridge_polled_at_ts: None,
                         deposit_bridge_destination_snapshot: None,
+                        deposit_bridge_submit_amount: None,
+                        deposit_bridge_expected_amount: None,
                     },
                 },
                 trade: CexTradeState {

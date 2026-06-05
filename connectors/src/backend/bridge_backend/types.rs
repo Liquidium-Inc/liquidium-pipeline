@@ -92,6 +92,27 @@ pub trait BridgeBackend: Send + Sync {
     /// Returns a human-readable source balance for a route input asset/account.
     async fn get_source_balance(&self, asset: &str, chain: &str, address: &str) -> Result<f64, String>;
 
+    /// Returns the source-asset amount that must remain on the source account
+    /// in addition to the submitted bridge amount.
+    async fn get_source_fee_budget(&self, asset: &str, chain: &str, target_asset: &str) -> Result<f64, String> {
+        let _ = (asset, chain, target_asset);
+        Ok(0.0)
+    }
+
+    /// Returns the target-asset amount expected to be deducted before the bridge
+    /// credit arrives at the destination.
+    async fn get_destination_fee_budget(&self, asset: &str, chain: &str, target_asset: &str) -> Result<f64, String> {
+        let _ = (asset, chain, target_asset);
+        Ok(0.0)
+    }
+
+    /// Returns the minimum bridge amount for a route input. Routes without a
+    /// provider-enforced floor return zero.
+    async fn get_minimum_bridge_amount(&self, asset: &str, chain: &str, target_asset: &str) -> Result<f64, String> {
+        let _ = (asset, chain, target_asset);
+        Ok(0.0)
+    }
+
     /// Submits a bridge transfer for a supported route and returns a tracking handle.
     ///
     /// The backend validates route metadata, source/destination constraints, and amount

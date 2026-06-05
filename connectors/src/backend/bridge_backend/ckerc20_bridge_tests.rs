@@ -12,9 +12,10 @@ use crate::backend::{
 use crate::pipeline_agent::MockPipelineAgent;
 
 use super::{
-    CkErc20BridgeBackend, CkEthMinterInfo, ETH_FORWARD_GAS_RESERVE_WEI, Eip1559TransactionPrice, MockBridgeEvmBackend,
-    WithdrawErc20Ret, WithdrawalRet, destination_to_bytes32, ensure_source_matches_bridge_owner,
-    ensure_source_matches_signer, parse_source_icp_account, resolve_cketh_route_for_request,
+    BRIDGE_AMOUNT_BELOW_MINIMUM_PREFIX, CkErc20BridgeBackend, CkEthMinterInfo, ETH_FORWARD_GAS_RESERVE_WEI,
+    Eip1559TransactionPrice, MockBridgeEvmBackend, WithdrawErc20Ret, WithdrawalRet, destination_to_bytes32,
+    ensure_source_matches_bridge_owner, ensure_source_matches_signer, parse_source_icp_account,
+    resolve_cketh_route_for_request,
 };
 
 #[test]
@@ -1026,6 +1027,218 @@ async fn native_reverse_bridge_approves_cketh_and_calls_withdraw_eth() {
 
     let submission = backend.submit_bridge(request).await.expect("bridge must submit");
     assert_eq!(submission.bridge_id, "ic-withdraw-eth:77");
+}
+
+#[tokio::test]
+async fn native_reverse_bridge_rejects_below_minimum_before_allowance_or_withdraw() {
+    let bridge_owner = Principal::management_canister();
+    let minter = Principal::anonymous();
+
+    let mut mock_agent = MockPipelineAgent::new();
+    mock_agent.expect_call_query::<Eip1559TransactionPrice>().times(0);
+    mock_agent.expect_call_update::<WithdrawalRet>().times(0);
+
+    let mut mock_icp = MockIcpBackend::new();
+    mock_icp.expect_icrc1_fee().times(0);
+    mock_icp.expect_icrc1_balance().times(0);
+    mock_icp.expect_icrc2_allowance().times(0);
+    mock_icp.expect_icrc2_approve().times(0);
+
+    let backend = CkErc20BridgeBackend::new(
+        Arc::new(mock_agent),
+        Arc::new(mock_icp),
+        Arc::new(MockBridgeEvmBackend::new()),
+        minter,
+        bridge_owner,
+    );
+
+    let request = BridgeRequest {
+        asset: "ckETH".to_string(),
+        source_chain: "ICP".to_string(),
+        source_address: bridge_owner.to_text(),
+        target_asset: "ETH".to_string(),
+        destination: BridgeDestination::EvmAddress(
+            "0x1111111111111111111111111111111111111111"
+                .parse::<Address>()
+                .expect("address"),
+        ),
+        amount: 0.004_999,
+    };
+
+    let err = backend
+        .submit_bridge(request)
+        .await
+        .expect_err("below minimum must fail");
+    assert!(err.starts_with(BRIDGE_AMOUNT_BELOW_MINIMUM_PREFIX));
+}
+
+#[tokio::test]
+async fn native_reverse_bridge_allows_exact_minimum() {
+    let bridge_owner = Principal::management_canister();
+    let minter = Principal::anonymous();
+    let cketh_ledger = Principal::from_text("ss2fx-dyaaa-aaaar-qacoq-cai").expect("ledger");
+    let source_account = Account {
+        owner: bridge_owner,
+        subaccount: None,
+    };
+
+    let mut mock_agent = MockPipelineAgent::new();
+    mock_agent
+        .expect_call_query::<Eip1559TransactionPrice>()
+        .times(1)
+        .returning(|_, _, _| {
+            Ok(Eip1559TransactionPrice {
+                max_priority_fee_per_gas: Nat::from(1u8),
+                max_fee_per_gas: Nat::from(2u8),
+                max_transaction_fee: Nat::from(100_000u64),
+                timestamp: Some(1),
+                gas_limit: Nat::from(21_000u64),
+            })
+        });
+    mock_agent
+        .expect_call_update::<WithdrawalRet>()
+        .times(1)
+        .returning(|_, _, _| {
+            Ok(WithdrawalRet::Ok(RetrieveEthRequest {
+                block_index: Nat::from(78u8),
+            }))
+        });
+
+    let mut mock_icp = MockIcpBackend::new();
+    mock_icp.expect_icrc1_fee().times(1).returning(move |ledger| {
+        if ledger == cketh_ledger {
+            Ok(Nat::from(2_000_000_000_000u64))
+        } else {
+            Err(format!("unexpected fee ledger {ledger}"))
+        }
+    });
+    let source_account_for_balance = source_account;
+    mock_icp
+        .expect_icrc1_balance()
+        .times(1)
+        .returning(move |ledger, account| {
+            if ledger != cketh_ledger {
+                return Err(format!("unexpected balance ledger {ledger}"));
+            }
+            if *account != source_account_for_balance {
+                return Err("unexpected balance account".to_string());
+            }
+            Ok(Nat::from(10_000_000_000_000_000u128))
+        });
+    let source_account_for_allowance = source_account;
+    mock_icp
+        .expect_icrc2_allowance()
+        .times(1)
+        .returning(move |ledger, account, spender| {
+            if ledger != cketh_ledger {
+                return Err(format!("unexpected allowance ledger {ledger}"));
+            }
+            if *account != source_account_for_allowance {
+                return Err("unexpected allowance account".to_string());
+            }
+            if spender.owner != minter || spender.subaccount.is_some() {
+                return Err("unexpected spender".to_string());
+            }
+            Ok(Nat::from(5_000_000_000_120_000u128))
+        });
+    mock_icp.expect_icrc2_approve().times(0);
+
+    let backend = CkErc20BridgeBackend::new(
+        Arc::new(mock_agent),
+        Arc::new(mock_icp),
+        Arc::new(MockBridgeEvmBackend::new()),
+        minter,
+        bridge_owner,
+    );
+
+    let request = BridgeRequest {
+        asset: "ckETH".to_string(),
+        source_chain: "ICP".to_string(),
+        source_address: bridge_owner.to_text(),
+        target_asset: "ETH".to_string(),
+        destination: BridgeDestination::EvmAddress(
+            "0x1111111111111111111111111111111111111111"
+                .parse::<Address>()
+                .expect("address"),
+        ),
+        amount: 0.005,
+    };
+
+    let submission = backend.submit_bridge(request).await.expect("minimum should submit");
+    assert_eq!(submission.bridge_id, "ic-withdraw-eth:78");
+}
+
+#[tokio::test]
+async fn native_reverse_bridge_minimum_uses_default_without_minter_lookup() {
+    let bridge_owner = Principal::management_canister();
+    let minter = Principal::anonymous();
+
+    let backend = CkErc20BridgeBackend::new(
+        Arc::new(MockPipelineAgent::new()),
+        Arc::new(MockIcpBackend::new()),
+        Arc::new(MockBridgeEvmBackend::new()),
+        minter,
+        bridge_owner,
+    );
+
+    let minimum = backend
+        .get_minimum_bridge_amount("ckETH", "ICP", "ETH")
+        .await
+        .expect("minimum should resolve");
+    assert_eq!(minimum, 0.005);
+}
+
+#[tokio::test]
+async fn native_reverse_bridge_destination_fee_budget_uses_quote() {
+    let bridge_owner = Principal::management_canister();
+    let minter = Principal::anonymous();
+    let mut mock_agent = MockPipelineAgent::new();
+    mock_agent
+        .expect_call_query::<Eip1559TransactionPrice>()
+        .times(1)
+        .returning(|_, _, _| {
+            Ok(Eip1559TransactionPrice {
+                max_priority_fee_per_gas: Nat::from(1u8),
+                max_fee_per_gas: Nat::from(2u8),
+                max_transaction_fee: Nat::from(100_000_000_000_000u64),
+                timestamp: Some(1),
+                gas_limit: Nat::from(21_000u64),
+            })
+        });
+
+    let backend = CkErc20BridgeBackend::new(
+        Arc::new(mock_agent),
+        Arc::new(MockIcpBackend::new()),
+        Arc::new(MockBridgeEvmBackend::new()),
+        minter,
+        bridge_owner,
+    );
+
+    let fee_budget = backend
+        .get_destination_fee_budget("ckETH", "ICP", "ETH")
+        .await
+        .expect("destination fee budget should resolve");
+    assert!((fee_budget - 0.00012).abs() < 1e-18);
+}
+
+#[tokio::test]
+async fn erc20_reverse_bridge_destination_fee_budget_is_zero() {
+    let bridge_owner = Principal::management_canister();
+    let minter = Principal::anonymous();
+
+    let backend = CkErc20BridgeBackend::new(
+        Arc::new(MockPipelineAgent::new()),
+        Arc::new(MockIcpBackend::new()),
+        Arc::new(MockBridgeEvmBackend::new()),
+        minter,
+        bridge_owner,
+    );
+
+    let fee_budget = backend
+        .get_destination_fee_budget("ckUSDC", "ICP", "USDC")
+        .await
+        .expect("destination fee budget should resolve");
+    assert_eq!(fee_budget, 0.0);
 }
 
 #[tokio::test]

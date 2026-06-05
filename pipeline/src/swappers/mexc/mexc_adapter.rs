@@ -710,8 +710,6 @@ impl MexcClient {
     /// - `buy`: input is quote spent (`cummulative_quote_quantity`), output is base received (`executed_quantity`)
     /// - `sell`: input is base sold (`executed_quantity`), output is quote received (`cummulative_quote_quantity`)
     ///
-    /// Note: MEXC order aggregates are treated as gross amounts; we apply a taker-fee haircut
-    /// to `output_received` so downstream legs spend a net-usable amount.
     fn map_fill_report(
         side_norm: &str,
         executed_quantity: Decimal,

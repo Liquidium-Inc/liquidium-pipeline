@@ -8,7 +8,8 @@ use candid::{Nat, Principal};
 use ic_ledger_types::{AccountIdentifier, Subaccount};
 use icrc_ledger_types::icrc1::account::Account;
 use liquidium_pipeline_connectors::backend::bridge_backend::{
-    BridgeBackend, BridgeRequest, BridgeRouteKind, BridgeStatus, resolve_route,
+    BRIDGE_AMOUNT_BELOW_MINIMUM_PREFIX, BridgeBackend, BridgeRequest, BridgeRouteKind, BridgeRouteSpec, BridgeStatus,
+    resolve_route,
 };
 use liquidium_pipeline_connectors::backend::cex_backend::{
     BuyOrderInputMode, CexBackend, OrderBookLevel, SwapExecutionOptions, WithdrawStatus,
@@ -261,6 +262,112 @@ where
         Ok((transfer_value, transfer_amount))
     }
 
+    /// Computes the source-token reserve needed before submitting an ICP reverse bridge.
+    ///
+    /// Bridged deposits first transfer seized collateral into the configured bridge source account.
+    /// For ckETH-minter reverse routes, that same source account must keep enough source token
+    /// available for the bridge submit itself: ckERC20 routes need the source ledger approval fee,
+    /// while native `ckETH -> ETH` also needs the quoted minter withdrawal fee budget. This helper
+    /// returns the reserved amount and the net amount that can be submitted to the bridge.
+    async fn compute_reverse_bridge_source_fee_reserve(
+        bridge: &MexcBridgeDependencies,
+        route: &BridgeRouteSpec,
+        deposit_asset: &ChainToken,
+        transfer_value: &Nat,
+        transfer_amount: &ChainTokenAmount,
+    ) -> Result<Option<(ChainTokenAmount, ChainTokenAmount)>, String> {
+        if !matches!(
+            route.route_kind,
+            BridgeRouteKind::CkEthErc20Reverse | BridgeRouteKind::CkEthToEth
+        ) || !route.source_chain.eq_ignore_ascii_case("ICP")
+            || !deposit_asset.symbol().eq_ignore_ascii_case(route.source_asset)
+            || !deposit_asset.chain().eq_ignore_ascii_case(route.source_chain)
+        {
+            return Ok(None);
+        }
+
+        let source_fee_budget = bridge
+            .backend
+            .get_source_fee_budget(route.source_asset, route.source_chain, route.target_asset)
+            .await?;
+
+        let source_fee_reserve = ChainTokenAmount::from_formatted(deposit_asset.clone(), source_fee_budget);
+        if source_fee_reserve.value == Nat::from(0u8) {
+            return Ok(None);
+        }
+
+        if transfer_value.clone() <= source_fee_reserve.value.clone() {
+            return Err(format!(
+                "{}: deposit amount {} too small to reserve reverse bridge source fee budget {} for {}",
+                BRIDGE_AMOUNT_BELOW_MINIMUM_PREFIX,
+                transfer_amount.formatted(),
+                source_fee_reserve.formatted(),
+                deposit_asset.symbol()
+            ));
+        }
+
+        let bridge_amount_value = transfer_value.clone() - source_fee_reserve.value.clone();
+        let bridge_amount = ChainTokenAmount::from_raw(deposit_asset.clone(), bridge_amount_value);
+        Ok(Some((source_fee_reserve, bridge_amount)))
+    }
+
+    async fn ensure_minimum_bridge_amount(
+        bridge: &MexcBridgeDependencies,
+        route: &BridgeRouteSpec,
+        amount: &ChainTokenAmount,
+    ) -> Result<(), String> {
+        let minimum = bridge
+            .backend
+            .get_minimum_bridge_amount(route.source_asset, route.source_chain, route.target_asset)
+            .await?;
+        if minimum <= 0.0 {
+            return Ok(());
+        }
+
+        let current = amount.to_f64();
+        if current < minimum {
+            return Err(format!(
+                "{}: {}@{} -> {} amount below minimum withdrawal (amount={} minimum={})",
+                BRIDGE_AMOUNT_BELOW_MINIMUM_PREFIX,
+                route.source_asset,
+                route.source_chain,
+                route.target_asset,
+                current,
+                minimum
+            ));
+        }
+
+        Ok(())
+    }
+
+    async fn compute_expected_bridge_deposit_amount(
+        bridge: &MexcBridgeDependencies,
+        route: &BridgeRouteSpec,
+        bridge_amount: f64,
+    ) -> Result<f64, String> {
+        let destination_fee_budget = bridge
+            .backend
+            .get_destination_fee_budget(route.source_asset, route.source_chain, route.target_asset)
+            .await?;
+        if destination_fee_budget <= 0.0 {
+            return Ok(bridge_amount);
+        }
+
+        if bridge_amount <= destination_fee_budget {
+            return Err(format!(
+                "{}: bridge amount {} too small to cover destination fee budget {} for {}@{} -> {}",
+                BRIDGE_AMOUNT_BELOW_MINIMUM_PREFIX,
+                bridge_amount,
+                destination_fee_budget,
+                route.source_asset,
+                route.source_chain,
+                route.target_asset
+            ));
+        }
+
+        Ok(bridge_amount - destination_fee_budget)
+    }
+
     fn normalize_market_pair(raw: &str) -> Option<String> {
         let normalized = raw.trim().replace(['/', '-'], "_").to_ascii_uppercase();
         if normalized.is_empty() {
@@ -406,6 +513,8 @@ where
                     deposit_bridge_submitted_at_ts: None,
                     deposit_bridge_polled_at_ts: None,
                     deposit_bridge_destination_snapshot: None,
+                    deposit_bridge_submit_amount: None,
+                    deposit_bridge_expected_amount: None,
                 },
             },
             trade: CexTradeState {
@@ -576,65 +685,42 @@ where
             let (transfer_value, mut transfer_amount) =
                 Self::compute_fee_adjusted_deposit_transfer(&state.deposit.deposit_asset, &state.size_in)?;
 
-            // Reserve one source-token fee unit for reverse bridge ICRC2 approve.
-            // This keeps swap sizing conservative so bridge submit preflight does not
-            // fail on burn+approve budget when source balance is tight.
-            if matches!(
-                route.route_kind,
-                BridgeRouteKind::CkEthErc20Reverse | BridgeRouteKind::CkEthToEth
-            ) && route.source_chain.eq_ignore_ascii_case("ICP")
-                && state
-                    .deposit
-                    .deposit_asset
-                    .symbol()
-                    .eq_ignore_ascii_case(route.source_asset)
-                && state
-                    .deposit
-                    .deposit_asset
-                    .chain()
-                    .eq_ignore_ascii_case(route.source_chain)
+            if let Some((source_fee_reserve, bridge_amount)) = Self::compute_reverse_bridge_source_fee_reserve(
+                bridge,
+                route,
+                &state.deposit.deposit_asset,
+                &transfer_value,
+                &transfer_amount,
+            )
+            .await?
             {
-                let approve_fee_reserve = state.deposit.deposit_asset.fee();
-                if approve_fee_reserve > Nat::from(0u8) {
-                    if transfer_value <= approve_fee_reserve {
-                        let reserve_amount = ChainTokenAmount::from_raw(
-                            state.deposit.deposit_asset.clone(),
-                            approve_fee_reserve.clone(),
-                        );
-                        return Err(format!(
-                            "deposit amount {} too small to reserve reverse bridge approve fee {} for {}",
-                            transfer_amount.formatted(),
-                            reserve_amount.formatted(),
-                            state.deposit.deposit_asset.symbol()
-                        ));
-                    }
-                    let bridge_amount_value = transfer_value.clone() - approve_fee_reserve.clone();
-                    transfer_amount =
-                        ChainTokenAmount::from_raw(state.deposit.deposit_asset.clone(), bridge_amount_value);
-
-                    let reserve_amount =
-                        ChainTokenAmount::from_raw(state.deposit.deposit_asset.clone(), approve_fee_reserve);
-                    let source_transfer_amount =
-                        ChainTokenAmount::from_raw(state.deposit.deposit_asset.clone(), transfer_value.clone());
-                    info!(
-                        "[mexc] liq_id={} bridged deposit reserving reverse bridge approve fee: reserve={} source_transfer={} bridge_amount={} route={}@{}->{}",
-                        state.liq_id,
-                        reserve_amount.formatted(),
-                        source_transfer_amount.formatted(),
-                        transfer_amount.formatted(),
-                        route.source_asset,
-                        route.source_chain,
-                        route.target_asset,
-                    );
-                }
+                transfer_amount = bridge_amount;
+                let source_transfer_amount =
+                    ChainTokenAmount::from_raw(state.deposit.deposit_asset.clone(), transfer_value.clone());
+                info!(
+                    "[mexc] liq_id={} bridged deposit reserving reverse bridge source fee budget: reserve={} source_transfer={} bridge_amount={} route={}@{}->{}",
+                    state.liq_id,
+                    source_fee_reserve.formatted(),
+                    source_transfer_amount.formatted(),
+                    transfer_amount.formatted(),
+                    route.source_asset,
+                    route.source_chain,
+                    route.target_asset,
+                );
             }
+
+            Self::ensure_minimum_bridge_amount(bridge, route, &transfer_amount).await?;
+            let bridge_submit_amount = transfer_amount.to_f64();
+            let bridge_expected_amount =
+                Self::compute_expected_bridge_deposit_amount(bridge, route, bridge_submit_amount).await?;
 
             let tx_id = self
                 .transfer_service
                 .transfer(&state.deposit.deposit_asset, &bridge_destination, transfer_value)
                 .await?;
 
-            state.trade.trade_next_amount_in = Some(transfer_amount.to_f64());
+            state.deposit.bridge.deposit_bridge_submit_amount = Some(bridge_submit_amount);
+            state.deposit.bridge.deposit_bridge_expected_amount = Some(bridge_expected_amount);
             state.deposit.deposit_txid = Some(tx_id);
             state.deposit.deposit_sent_at_ts = Some(now_ts());
         }
@@ -653,8 +739,9 @@ where
             )?;
             let bridge_source_address = self.resolve_bridge_source_address(route.source_chain)?;
             let bridge_amount = state
-                .trade
-                .trade_next_amount_in
+                .deposit
+                .bridge
+                .deposit_bridge_submit_amount
                 .unwrap_or_else(|| state.size_in.to_f64());
             let _submit_guard =
                 acquire_bridge_submit_lock(route.source_asset, route.source_chain, &bridge_source_address).await;
@@ -673,6 +760,7 @@ where
 
             state.deposit.bridge.deposit_bridge_id = Some(submission.bridge_id);
             state.deposit.bridge.deposit_bridge_submitted_at_ts = Some(now_ts());
+            state.trade.trade_next_amount_in = state.deposit.bridge.deposit_bridge_expected_amount;
             state.step = CexStep::DepositPending;
             return Ok(());
         }

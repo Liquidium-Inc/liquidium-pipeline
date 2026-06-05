@@ -67,6 +67,8 @@ sol! {
 
 const ETH_DECIMALS: u8 = 18;
 const ETH_FORWARD_GAS_RESERVE_WEI: u128 = 5_000_000_000_000_000;
+const DEFAULT_CKETH_MIN_WITHDRAWAL_WEI: u128 = 5_000_000_000_000_000;
+pub const BRIDGE_AMOUNT_BELOW_MINIMUM_PREFIX: &str = "bridge_amount_below_minimum";
 
 #[cfg_attr(test, mockall::automock)]
 #[async_trait]
@@ -418,6 +420,37 @@ where
         Ok(Self::with_fee_headroom(&fee_quote.max_transaction_fee))
     }
 
+    fn native_cketh_minimum_withdrawal_amount() -> Nat {
+        Nat::from(DEFAULT_CKETH_MIN_WITHDRAWAL_WEI)
+    }
+
+    fn below_minimum_bridge_error(asset: &str, chain: &str, target_asset: &str, amount: f64, minimum: f64) -> String {
+        format!(
+            "{BRIDGE_AMOUNT_BELOW_MINIMUM_PREFIX}: {}@{} -> {} amount below minimum withdrawal (amount={} minimum={})",
+            asset, chain, target_asset, amount, minimum
+        )
+    }
+
+    async fn ensure_native_cketh_withdrawal_minimum(
+        &self,
+        route: &BridgeRouteSpec,
+        amount_native: &Nat,
+        amount: f64,
+    ) -> Result<(), String> {
+        let minimum_native = Self::native_cketh_minimum_withdrawal_amount();
+        if amount_native < &minimum_native {
+            let minimum = nat_units_to_amount_via_core(&minimum_native, ETH_DECIMALS)?;
+            return Err(Self::below_minimum_bridge_error(
+                route.source_asset,
+                route.source_chain,
+                route.target_asset,
+                amount,
+                minimum,
+            ));
+        }
+        Ok(())
+    }
+
     async fn withdraw_erc20_call(&self, args: &WithdrawErc20Arg) -> Result<WithdrawErc20Ret, String> {
         let arg_blob = Encode!(args).map_err(|e| format!("encode withdraw_erc20 args failed: {e}"))?;
         self.agent
@@ -723,6 +756,8 @@ where
         let destination = expect_evm_destination(route, &request.destination)?;
         let cketh_ledger_id = parse_ckerc20_ledger_id(route)?;
         let amount_native = amount_to_nat_units_strict(request.amount, ETH_DECIMALS)?;
+        self.ensure_native_cketh_withdrawal_minimum(route, &amount_native, request.amount)
+            .await?;
         let approve_fee = icrc1_fee_with_context(self.icp_backend.as_ref(), cketh_ledger_id, "cketh bridge").await?;
         let required_fee_budget = self.quoted_cketh_fee_budget(None).await?;
         let required_budget = amount_native.clone() + approve_fee.clone() + required_fee_budget.clone();
@@ -812,6 +847,71 @@ where
             "unsupported source route {}@{} for ckETH minter bridge backend",
             asset, chain
         ))
+    }
+
+    async fn get_source_fee_budget(&self, asset: &str, chain: &str, target_asset: &str) -> Result<f64, String> {
+        let Some(route) = resolve_cketh_reverse_route_by_source(asset, chain) else {
+            return Ok(0.0);
+        };
+
+        if !route.target_asset.eq_ignore_ascii_case(target_asset) {
+            return Ok(0.0);
+        }
+
+        match route.route_kind {
+            BridgeRouteKind::CkEthErc20Reverse => {
+                let ledger_id = parse_ckerc20_ledger_id(route)?;
+                let (decimals, approve_fee) = tokio::try_join!(
+                    icrc1_decimals_with_context(self.icp_backend.as_ref(), ledger_id, "ckerc20 bridge"),
+                    icrc1_fee_with_context(self.icp_backend.as_ref(), ledger_id, "ckerc20 bridge")
+                )?;
+                nat_units_to_amount_via_core(&approve_fee, decimals)
+            }
+            BridgeRouteKind::CkEthToEth => {
+                let ledger_id = parse_ckerc20_ledger_id(route)?;
+                let (approve_fee, withdrawal_fee_budget) = tokio::try_join!(
+                    icrc1_fee_with_context(self.icp_backend.as_ref(), ledger_id, "cketh bridge"),
+                    self.quoted_cketh_fee_budget(None)
+                )?;
+                let total_budget = approve_fee + withdrawal_fee_budget;
+                nat_units_to_amount_via_core(&total_budget, ETH_DECIMALS)
+            }
+            _ => Ok(0.0),
+        }
+    }
+
+    async fn get_destination_fee_budget(&self, asset: &str, chain: &str, target_asset: &str) -> Result<f64, String> {
+        let Some(route) = resolve_cketh_reverse_route_by_source(asset, chain) else {
+            return Ok(0.0);
+        };
+
+        if !route.target_asset.eq_ignore_ascii_case(target_asset) {
+            return Ok(0.0);
+        }
+
+        if route.route_kind != BridgeRouteKind::CkEthToEth {
+            return Ok(0.0);
+        }
+
+        let withdrawal_fee_budget = self.quoted_cketh_fee_budget(None).await?;
+        nat_units_to_amount_via_core(&withdrawal_fee_budget, ETH_DECIMALS)
+    }
+
+    async fn get_minimum_bridge_amount(&self, asset: &str, chain: &str, target_asset: &str) -> Result<f64, String> {
+        let Some(route) = resolve_cketh_reverse_route_by_source(asset, chain) else {
+            return Ok(0.0);
+        };
+
+        if !route.target_asset.eq_ignore_ascii_case(target_asset) {
+            return Ok(0.0);
+        }
+
+        if route.route_kind != BridgeRouteKind::CkEthToEth {
+            return Ok(0.0);
+        }
+
+        let minimum_native = Self::native_cketh_minimum_withdrawal_amount();
+        nat_units_to_amount_via_core(&minimum_native, ETH_DECIMALS)
     }
 
     /// Executes a ckETH minter bridge submission for native ETH/ckETH and ckERC20 routes.
