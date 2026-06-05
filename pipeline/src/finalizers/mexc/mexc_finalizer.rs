@@ -8,8 +8,8 @@ use candid::{Nat, Principal};
 use ic_ledger_types::{AccountIdentifier, Subaccount};
 use icrc_ledger_types::icrc1::account::Account;
 use liquidium_pipeline_connectors::backend::bridge_backend::{
-    BRIDGE_AMOUNT_BELOW_MINIMUM_PREFIX, BridgeBackend, BridgeRequest, BridgeRouteKind, BridgeRouteSpec, BridgeStatus,
-    resolve_route,
+    BridgeBackend, BridgeRequest, BridgeRouteKind, BridgeRouteSpec, BridgeStatus,
+    FINALIZER_PERMANENT_AMOUNT_FLOOR_PREFIX, resolve_route,
 };
 use liquidium_pipeline_connectors::backend::cex_backend::{
     BuyOrderInputMode, CexBackend, OrderBookLevel, SwapExecutionOptions, WithdrawStatus,
@@ -248,7 +248,8 @@ where
             if size_in.value.clone() <= fee {
                 let fee_amount = ChainTokenAmount::from_raw(deposit_asset.clone(), fee.clone());
                 return Err(format!(
-                    "deposit amount {} too small to cover fee {} for {}",
+                    "{}: deposit amount {} too small to cover fee {} for {}",
+                    FINALIZER_PERMANENT_AMOUNT_FLOOR_PREFIX,
                     size_in.formatted(),
                     fee_amount.formatted(),
                     deposit_asset.symbol()
@@ -294,7 +295,7 @@ where
         if transfer_value.clone() <= source_fee_reserve.value.clone() {
             return Err(format!(
                 "{}: deposit amount {} too small to reserve reverse bridge source fee budget {} for {}",
-                BRIDGE_AMOUNT_BELOW_MINIMUM_PREFIX,
+                FINALIZER_PERMANENT_AMOUNT_FLOOR_PREFIX,
                 transfer_amount.formatted(),
                 source_fee_reserve.formatted(),
                 deposit_asset.symbol()
@@ -323,7 +324,7 @@ where
         if current < minimum {
             return Err(format!(
                 "{}: {}@{} -> {} amount below minimum withdrawal (amount={} minimum={})",
-                BRIDGE_AMOUNT_BELOW_MINIMUM_PREFIX,
+                FINALIZER_PERMANENT_AMOUNT_FLOOR_PREFIX,
                 route.source_asset,
                 route.source_chain,
                 route.target_asset,
@@ -347,7 +348,7 @@ where
         if bridge_amount <= destination_fee_budget {
             return Err(format!(
                 "{}: bridge amount {} too small to cover destination fee budget {} for {}@{} -> {}",
-                BRIDGE_AMOUNT_BELOW_MINIMUM_PREFIX,
+                FINALIZER_PERMANENT_AMOUNT_FLOOR_PREFIX,
                 bridge_amount,
                 destination_fee_budget,
                 route.source_asset,

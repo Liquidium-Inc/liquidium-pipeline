@@ -6,7 +6,7 @@ use std::sync::Arc;
 use candid::{Nat, Principal};
 use ic_ledger_types::{AccountIdentifier, Subaccount};
 use liquidium_pipeline_connectors::backend::bridge_backend::{
-    BRIDGE_AMOUNT_BELOW_MINIMUM_PREFIX, BridgeDestination, BridgeFeeBudget, BridgeStatus, BridgeSubmission,
+    BridgeDestination, BridgeFeeBudget, BridgeStatus, BridgeSubmission, FINALIZER_PERMANENT_AMOUNT_FLOOR_PREFIX,
     MockBridgeBackend,
 };
 use liquidium_pipeline_connectors::backend::cex_backend::{
@@ -384,6 +384,58 @@ async fn mexc_deposit_phase_a_snapshots_baseline_and_sends_transfer() {
     assert_eq!(state.deposit.deposit_txid.as_deref(), Some("tx-123"));
     assert!(state.deposit.deposit_sent_at_ts.is_some());
     assert!(matches!(state.step, CexStep::DepositPending));
+}
+
+#[tokio::test]
+async fn mexc_deposit_phase_a_rejects_fee_consumed_deposit_with_permanent_prefix() {
+    let mut backend = MockCexBackend::new();
+    let mut transfers = MockTransferActions::new();
+
+    backend.expect_get_balance().times(1).returning(|asset| {
+        assert_eq!(asset, "ckUSDC");
+        Ok(10.0)
+    });
+    backend
+        .expect_get_deposit_address()
+        .times(1)
+        .returning(|asset, network| {
+            assert_eq!(asset, "ckUSDC");
+            assert_eq!(network, "ICP");
+            Ok(DepositAddress {
+                asset: "ckUSDC".to_string(),
+                network: "ICP".to_string(),
+                address: Principal::anonymous().to_text(),
+                tag: None,
+            })
+        });
+    transfers.expect_transfer().times(0);
+
+    let finalizer = MexcFinalizer::new(
+        Arc::new(backend),
+        Arc::new(transfers),
+        Principal::anonymous(),
+        TEST_MAX_SELL_SLIPPAGE_BPS,
+        TEST_CEX_MIN_EXEC_USD,
+        TEST_CEX_SLICE_TARGET_RATIO,
+    );
+
+    let mut receipt = make_execution_receipt_with_assets(85, ckusdc_token(), ckbtc_token());
+    receipt
+        .liquidation_result
+        .as_mut()
+        .expect("liquidation result")
+        .amounts
+        .collateral_received = Nat::from(70_000u64);
+    let mut state = finalizer.prepare("85", &receipt).await.expect("prepare should succeed");
+
+    let err = finalizer
+        .deposit(&mut state)
+        .await
+        .expect_err("deposit consumed by fee must fail before transfer");
+
+    assert!(err.starts_with(FINALIZER_PERMANENT_AMOUNT_FLOOR_PREFIX));
+    assert!(err.contains("too small to cover fee"));
+    assert!(state.deposit.deposit_txid.is_none());
 }
 
 #[tokio::test]
@@ -959,7 +1011,7 @@ async fn mexc_deposit_bridge_rejects_source_fee_reserve_too_small_with_permanent
         .await
         .expect_err("source fee reserve consuming deposit must fail");
 
-    assert!(err.starts_with(BRIDGE_AMOUNT_BELOW_MINIMUM_PREFIX));
+    assert!(err.starts_with(FINALIZER_PERMANENT_AMOUNT_FLOOR_PREFIX));
     assert!(err.contains("too small to reserve reverse bridge source fee budget"));
     assert!(state.deposit.deposit_txid.is_none());
     assert!(state.deposit.bridge.deposit_bridge_id.is_none());
@@ -1136,7 +1188,7 @@ async fn mexc_deposit_bridge_rejects_native_cketh_below_minimum_before_transfer(
         .await
         .expect_err("below minimum should fail before funding bridge source");
 
-    assert!(err.starts_with(BRIDGE_AMOUNT_BELOW_MINIMUM_PREFIX));
+    assert!(err.starts_with(FINALIZER_PERMANENT_AMOUNT_FLOOR_PREFIX));
     assert!(state.deposit.deposit_txid.is_none());
     assert!(state.deposit.bridge.deposit_bridge_id.is_none());
 }
@@ -1203,7 +1255,7 @@ async fn mexc_deposit_bridge_rejects_native_cketh_when_destination_fee_consumes_
         .deposit(&mut state)
         .await
         .expect_err("destination fee consuming expected deposit must fail");
-    assert!(err.starts_with(BRIDGE_AMOUNT_BELOW_MINIMUM_PREFIX));
+    assert!(err.starts_with(FINALIZER_PERMANENT_AMOUNT_FLOOR_PREFIX));
     assert!(err.contains("too small to cover destination fee budget"));
     assert!(state.deposit.deposit_txid.is_none());
     assert!(state.deposit.bridge.deposit_bridge_id.is_none());

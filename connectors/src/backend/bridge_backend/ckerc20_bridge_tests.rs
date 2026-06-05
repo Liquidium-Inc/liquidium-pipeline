@@ -12,10 +12,10 @@ use crate::backend::{
 use crate::pipeline_agent::MockPipelineAgent;
 
 use super::{
-    BRIDGE_AMOUNT_BELOW_MINIMUM_PREFIX, CkErc20BridgeBackend, CkEthMinterInfo, ETH_FORWARD_GAS_RESERVE_WEI,
-    Eip1559TransactionPrice, MockBridgeEvmBackend, WithdrawErc20Ret, WithdrawalRet, destination_to_bytes32,
-    ensure_source_matches_bridge_owner, ensure_source_matches_signer, parse_source_icp_account,
-    resolve_cketh_route_for_request,
+    CkErc20BridgeBackend, CkEthMinterInfo, Eip1559TransactionPrice, FINALIZER_PERMANENT_AMOUNT_FLOOR_PREFIX,
+    MIN_ETH_FORWARD_GAS_RESERVE_WEI, MockBridgeEvmBackend, WithdrawErc20Ret, WithdrawalRet, destination_to_bytes32,
+    ensure_source_matches_bridge_owner, ensure_source_matches_signer, eth_forward_gas_reserve_from_price,
+    parse_source_icp_account, resolve_cketh_route_for_request,
 };
 
 #[test]
@@ -77,6 +77,18 @@ fn route_validation_enforces_icp_destination_for_forward_route() {
     );
     let err = resolve_cketh_route_for_request(&bad_destination).expect_err("must fail");
     assert!(err.contains("invalid destination type"));
+}
+
+#[test]
+fn eth_forward_gas_reserve_uses_floor_when_gas_is_cheap() {
+    let reserve = eth_forward_gas_reserve_from_price(1_000_000_000, 150_000);
+    assert_eq!(reserve, U256::from(MIN_ETH_FORWARD_GAS_RESERVE_WEI));
+}
+
+#[test]
+fn eth_forward_gas_reserve_scales_when_gas_is_expensive() {
+    let reserve = eth_forward_gas_reserve_from_price(100_000_000_000, 150_000);
+    assert_eq!(reserve, U256::from(30_000_000_000_000_000u128));
 }
 
 #[test]
@@ -473,6 +485,7 @@ async fn native_forward_bridge_uses_deposit_eth_with_subaccount_helper() {
         .parse::<Address>()
         .expect("address");
     let amount_wei = U256::from(1_000_000_000_000_000_000u128);
+    let gas_reserve = U256::from(12_000_000_000_000_000u128);
     let tx_hash = TxHash::from([0x44u8; 32]);
 
     let mut mock_agent = MockPipelineAgent::new();
@@ -492,10 +505,15 @@ async fn native_forward_bridge_uses_deposit_eth_with_subaccount_helper() {
     let mut mock_evm = MockBridgeEvmBackend::new();
     mock_evm.expect_signer_address().times(1).returning(move || signer);
     mock_evm
+        .expect_native_tx_gas_reserve()
+        .with(eq(150_000u128))
+        .times(1)
+        .returning(move |_| Ok(gas_reserve));
+    mock_evm
         .expect_native_balance_of()
         .with(eq(signer))
         .times(1)
-        .returning(|_| Ok(U256::from(1_000_000_000_000_000_000u128 + ETH_FORWARD_GAS_RESERVE_WEI)));
+        .returning(move |_| Ok(amount_wei + gas_reserve));
     mock_evm
         .expect_helper_deposit_eth_with_subaccount()
         .withf(move |seen_helper, seen_amount, _principal, subaccount| {
@@ -546,6 +564,7 @@ async fn native_forward_bridge_falls_back_to_legacy_eth_helper_for_default_subac
         .parse::<Address>()
         .expect("address");
     let amount_wei = U256::from(1_000_000_000_000_000_000u128);
+    let gas_reserve = U256::from(MIN_ETH_FORWARD_GAS_RESERVE_WEI);
     let tx_hash = TxHash::from([0x45u8; 32]);
 
     let mut mock_agent = MockPipelineAgent::new();
@@ -565,10 +584,15 @@ async fn native_forward_bridge_falls_back_to_legacy_eth_helper_for_default_subac
     let mut mock_evm = MockBridgeEvmBackend::new();
     mock_evm.expect_signer_address().times(1).returning(move || signer);
     mock_evm
+        .expect_native_tx_gas_reserve()
+        .with(eq(150_000u128))
+        .times(1)
+        .returning(move |_| Ok(gas_reserve));
+    mock_evm
         .expect_native_balance_of()
         .with(eq(signer))
         .times(1)
-        .returning(|_| Ok(U256::from(1_000_000_000_000_000_000u128 + ETH_FORWARD_GAS_RESERVE_WEI)));
+        .returning(move |_| Ok(amount_wei + gas_reserve));
     mock_evm
         .expect_helper_deposit_eth_native()
         .withf(move |seen_helper, seen_amount, _principal| *seen_helper == helper && *seen_amount == amount_wei)
@@ -608,6 +632,7 @@ async fn native_forward_bridge_rejects_insufficient_eth_after_gas_reserve() {
         .parse::<Address>()
         .expect("address");
     let helper = "0x2222222222222222222222222222222222222222".to_string();
+    let gas_reserve = U256::from(15_000_000_000_000_000u128);
 
     let mut mock_agent = MockPipelineAgent::new();
     mock_agent
@@ -626,14 +651,15 @@ async fn native_forward_bridge_rejects_insufficient_eth_after_gas_reserve() {
     let mut mock_evm = MockBridgeEvmBackend::new();
     mock_evm.expect_signer_address().times(1).returning(move || signer);
     mock_evm
+        .expect_native_tx_gas_reserve()
+        .with(eq(150_000u128))
+        .times(1)
+        .returning(move |_| Ok(gas_reserve));
+    mock_evm
         .expect_native_balance_of()
         .with(eq(signer))
         .times(1)
-        .returning(|_| {
-            Ok(U256::from(
-                1_000_000_000_000_000_000u128 + ETH_FORWARD_GAS_RESERVE_WEI - 1,
-            ))
-        });
+        .returning(move |_| Ok(U256::from(1_000_000_000_000_000_000u128) + gas_reserve - U256::from(1u8)));
     mock_evm.expect_helper_deposit_eth_native().times(0);
     mock_evm.expect_helper_deposit_eth_with_subaccount().times(0);
 
@@ -663,6 +689,133 @@ async fn native_forward_bridge_rejects_insufficient_eth_after_gas_reserve() {
         .await
         .expect_err("bridge must fail preflight");
     assert!(err.contains("ETH balance is below requested deposit amount plus gas reserve"));
+}
+
+#[tokio::test]
+async fn native_forward_bridge_propagates_dynamic_gas_reserve_errors() {
+    let signer = "0x1111111111111111111111111111111111111111"
+        .parse::<Address>()
+        .expect("address");
+    let helper = "0x2222222222222222222222222222222222222222".to_string();
+
+    let mut mock_agent = MockPipelineAgent::new();
+    mock_agent
+        .expect_call_query::<CkEthMinterInfo>()
+        .times(1)
+        .returning(move |_, _, _| {
+            Ok(CkEthMinterInfo {
+                deposit_with_subaccount_helper_contract_address: Some(helper.clone()),
+                eth_helper_contract_address: None,
+                erc20_helper_contract_address: None,
+                cketh_ledger_id: None,
+                minimum_withdrawal_amount: None,
+            })
+        });
+
+    let mut mock_evm = MockBridgeEvmBackend::new();
+    mock_evm.expect_signer_address().times(1).returning(move || signer);
+    mock_evm
+        .expect_native_tx_gas_reserve()
+        .with(eq(150_000u128))
+        .times(1)
+        .returning(|_| Err("native gas price fetch failed: rpc unavailable".to_string()));
+    mock_evm.expect_native_balance_of().times(0);
+    mock_evm.expect_helper_deposit_eth_native().times(0);
+    mock_evm.expect_helper_deposit_eth_with_subaccount().times(0);
+
+    let backend = CkErc20BridgeBackend::new(
+        Arc::new(mock_agent),
+        Arc::new(MockIcpBackend::new()),
+        Arc::new(mock_evm),
+        Principal::management_canister(),
+        Principal::management_canister(),
+    );
+
+    let request = BridgeRequest {
+        asset: "ETH".to_string(),
+        source_chain: "ETH".to_string(),
+        source_address: signer.to_string(),
+        target_asset: "ckETH".to_string(),
+        destination: BridgeDestination::IcpAccount(Account {
+            owner: Principal::management_canister(),
+            subaccount: None,
+        }),
+        amount: 1.0,
+        provider_fee_budget_native_units: None,
+    };
+
+    let err = backend
+        .submit_bridge(request)
+        .await
+        .expect_err("gas reserve failure should stop native forward bridge");
+    assert!(err.contains("native gas price fetch failed"));
+}
+
+#[tokio::test]
+async fn get_source_balance_eth_forward_subtracts_dynamic_gas_reserve() {
+    let owner = "0x1111111111111111111111111111111111111111"
+        .parse::<Address>()
+        .expect("address");
+    let gas_reserve = U256::from(30_000_000_000_000_000u128);
+
+    let mut mock_evm = MockBridgeEvmBackend::new();
+    mock_evm
+        .expect_native_balance_of()
+        .with(eq(owner))
+        .times(1)
+        .returning(move |_| Ok(U256::from(1_000_000_000_000_000_000u128) + gas_reserve));
+    mock_evm
+        .expect_native_tx_gas_reserve()
+        .with(eq(150_000u128))
+        .times(1)
+        .returning(move |_| Ok(gas_reserve));
+
+    let backend = CkErc20BridgeBackend::new(
+        Arc::new(MockPipelineAgent::new()),
+        Arc::new(MockIcpBackend::new()),
+        Arc::new(mock_evm),
+        Principal::management_canister(),
+        Principal::management_canister(),
+    );
+
+    let bridgeable = backend
+        .get_source_balance("ETH", "ETH", &owner.to_string())
+        .await
+        .expect("source balance should resolve");
+    assert!((bridgeable - 1.0).abs() < 1e-18);
+}
+
+#[tokio::test]
+async fn get_source_balance_eth_forward_propagates_dynamic_gas_reserve_errors() {
+    let owner = "0x1111111111111111111111111111111111111111"
+        .parse::<Address>()
+        .expect("address");
+
+    let mut mock_evm = MockBridgeEvmBackend::new();
+    mock_evm
+        .expect_native_balance_of()
+        .with(eq(owner))
+        .times(1)
+        .returning(|_| Ok(U256::from(1_000_000_000_000_000_000u128)));
+    mock_evm
+        .expect_native_tx_gas_reserve()
+        .with(eq(150_000u128))
+        .times(1)
+        .returning(|_| Err("native gas price fetch failed: rpc unavailable".to_string()));
+
+    let backend = CkErc20BridgeBackend::new(
+        Arc::new(MockPipelineAgent::new()),
+        Arc::new(MockIcpBackend::new()),
+        Arc::new(mock_evm),
+        Principal::management_canister(),
+        Principal::management_canister(),
+    );
+
+    let err = backend
+        .get_source_balance("ETH", "ETH", &owner.to_string())
+        .await
+        .expect_err("gas reserve failure should stop source balance sizing");
+    assert!(err.contains("native gas price fetch failed"));
 }
 
 #[tokio::test]
@@ -1083,7 +1236,7 @@ async fn native_reverse_bridge_rejects_below_minimum_before_allowance_or_withdra
         .submit_bridge(request)
         .await
         .expect_err("below minimum must fail");
-    assert!(err.starts_with(BRIDGE_AMOUNT_BELOW_MINIMUM_PREFIX));
+    assert!(err.starts_with(FINALIZER_PERMANENT_AMOUNT_FLOOR_PREFIX));
 }
 
 #[tokio::test]
@@ -1097,9 +1250,7 @@ async fn native_reverse_bridge_allows_exact_minimum() {
     };
 
     let mut mock_agent = MockPipelineAgent::new();
-    mock_agent
-        .expect_call_query::<Eip1559TransactionPrice>()
-        .times(0);
+    mock_agent.expect_call_query::<Eip1559TransactionPrice>().times(0);
     mock_agent
         .expect_call_update::<WithdrawalRet>()
         .times(1)

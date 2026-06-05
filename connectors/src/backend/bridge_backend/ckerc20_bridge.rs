@@ -66,9 +66,19 @@ sol! {
 }
 
 const ETH_DECIMALS: u8 = 18;
-const ETH_FORWARD_GAS_RESERVE_WEI: u128 = 5_000_000_000_000_000;
+const MIN_ETH_FORWARD_GAS_RESERVE_WEI: u128 = 5_000_000_000_000_000;
+const ETH_FORWARD_HELPER_GAS_LIMIT: u128 = 150_000;
+const ETH_FORWARD_GAS_RESERVE_MULTIPLIER: u128 = 2;
 const DEFAULT_CKETH_MIN_WITHDRAWAL_WEI: u128 = 5_000_000_000_000_000;
-pub const BRIDGE_AMOUNT_BELOW_MINIMUM_PREFIX: &str = "bridge_amount_below_minimum";
+pub const FINALIZER_PERMANENT_AMOUNT_FLOOR_PREFIX: &str = "finalizer_permanent_amount_floor";
+pub const BRIDGE_AMOUNT_BELOW_MINIMUM_PREFIX: &str = FINALIZER_PERMANENT_AMOUNT_FLOOR_PREFIX;
+
+fn eth_forward_gas_reserve_from_price(gas_price_wei: u128, gas_limit: u128) -> U256 {
+    let dynamic_reserve = U256::from(gas_price_wei)
+        .saturating_mul(U256::from(gas_limit))
+        .saturating_mul(U256::from(ETH_FORWARD_GAS_RESERVE_MULTIPLIER));
+    dynamic_reserve.max(U256::from(MIN_ETH_FORWARD_GAS_RESERVE_WEI))
+}
 
 #[cfg_attr(test, mockall::automock)]
 #[async_trait]
@@ -76,6 +86,7 @@ pub trait BridgeEvmBackend: Send + Sync {
     fn signer_address(&self) -> Address;
 
     async fn native_balance_of(&self, owner: Address) -> Result<U256, String>;
+    async fn native_tx_gas_reserve(&self, gas_limit: u128) -> Result<U256, String>;
     async fn erc20_balance_of(&self, token: Address, owner: Address) -> Result<U256, String>;
     async fn erc20_allowance_of(&self, token: Address, owner: Address, spender: Address) -> Result<U256, String>;
     async fn erc20_decimals_of(&self, token: Address) -> Result<u8, String>;
@@ -130,6 +141,15 @@ where
             .get_balance(owner)
             .await
             .map_err(|e| format!("native get_balance(owner={owner}) failed: {e}"))
+    }
+
+    async fn native_tx_gas_reserve(&self, gas_limit: u128) -> Result<U256, String> {
+        let gas_price_wei = self
+            .provider
+            .get_gas_price()
+            .await
+            .map_err(|e| format!("native gas price fetch failed: {e}"))?;
+        Ok(eth_forward_gas_reserve_from_price(gas_price_wei, gas_limit))
     }
 
     async fn erc20_balance_of(&self, token: Address, owner: Address) -> Result<U256, String> {
@@ -426,7 +446,7 @@ where
 
     fn below_minimum_bridge_error(asset: &str, chain: &str, target_asset: &str, amount: f64, minimum: f64) -> String {
         format!(
-            "{BRIDGE_AMOUNT_BELOW_MINIMUM_PREFIX}: {}@{} -> {} amount below minimum withdrawal (amount={} minimum={})",
+            "{FINALIZER_PERMANENT_AMOUNT_FLOOR_PREFIX}: {}@{} -> {} amount below minimum withdrawal (amount={} minimum={})",
             asset, chain, target_asset, amount, minimum
         )
     }
@@ -567,7 +587,7 @@ where
     ///   `deposit(bytes32 principal)`, which only supports owner-only destinations.
     ///
     /// Safety invariant:
-    /// - Preflight requires `signer_balance >= amount + ETH_FORWARD_GAS_RESERVE_WEI`
+    /// - Preflight requires `signer_balance >= amount + dynamic gas reserve`
     ///   so we never attempt to bridge the entire ETH balance and strand gas.
     async fn submit_native_forward_bridge(
         &self,
@@ -589,7 +609,10 @@ where
         }
 
         let amount_wei = amount_to_base_units_strict(request.amount, ETH_DECIMALS)?;
-        let gas_reserve = U256::from(ETH_FORWARD_GAS_RESERVE_WEI);
+        let gas_reserve = self
+            .evm_backend
+            .native_tx_gas_reserve(ETH_FORWARD_HELPER_GAS_LIMIT)
+            .await?;
         let required_balance = amount_wei
             .checked_add(gas_reserve)
             .ok_or_else(|| "ETH bridge amount plus gas reserve overflowed U256".to_string())?;
@@ -818,7 +841,11 @@ where
                     .native_balance_of(owner)
                     .await
                     .map_err(|e| format!("native ETH balance failed for owner {owner}: {e}"))?;
-                let bridgeable = balance.saturating_sub(U256::from(ETH_FORWARD_GAS_RESERVE_WEI));
+                let gas_reserve = self
+                    .evm_backend
+                    .native_tx_gas_reserve(ETH_FORWARD_HELPER_GAS_LIMIT)
+                    .await?;
+                let bridgeable = balance.saturating_sub(gas_reserve);
                 return base_units_to_amount_via_core(bridgeable, ETH_DECIMALS);
             }
 

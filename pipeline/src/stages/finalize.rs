@@ -17,7 +17,7 @@ use crate::wal::{
     decode_receipt_wrapper, encode_meta, wal_mark_enqueued, wal_mark_inflight, wal_mark_permanent_failed,
     wal_mark_retryable_failed, wal_mark_succeeded,
 };
-use liquidium_pipeline_connectors::backend::bridge_backend::BRIDGE_AMOUNT_BELOW_MINIMUM_PREFIX;
+use liquidium_pipeline_connectors::backend::bridge_backend::FINALIZER_PERMANENT_AMOUNT_FLOOR_PREFIX;
 use liquidium_pipeline_connectors::pipeline_agent::PipelineAgent;
 use liquidium_pipeline_core::types::protocol_types::{LiquidationResult, ProtocolError, TransferStatus};
 
@@ -41,7 +41,7 @@ fn retry_delay_secs(base: u64, max: u64, error_count: i32) -> u64 {
 }
 
 fn is_permanent_finalizer_error(err: &str) -> bool {
-    err.starts_with(BRIDGE_AMOUNT_BELOW_MINIMUM_PREFIX)
+    err.starts_with(FINALIZER_PERMANENT_AMOUNT_FLOOR_PREFIX)
 }
 
 //
@@ -579,7 +579,7 @@ mod tests {
 
         let err = format!(
             "{}: ckETH@ICP -> ETH amount below minimum withdrawal (amount=0.0049 minimum=0.005)",
-            BRIDGE_AMOUNT_BELOW_MINIMUM_PREFIX
+            FINALIZER_PERMANENT_AMOUNT_FLOOR_PREFIX
         );
         let err_for_failure = err.clone();
 
