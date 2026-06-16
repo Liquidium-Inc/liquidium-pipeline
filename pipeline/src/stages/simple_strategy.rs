@@ -35,6 +35,7 @@ use async_trait::async_trait;
 use itertools::Itertools;
 
 const WIPEOUT_THRESHOLD: u32 = 975;
+const CKETH_MIN_WITHDRAWAL_WEI: u128 = 5_000_000_000_000_000;
 
 fn resolve_token_for_position(registry: &dyn TokenRegistryTrait, pos: &LiquidateblePosition) -> Option<ChainToken> {
     if pos.asset.symbol().eq_ignore_ascii_case("ICP") {
@@ -186,6 +187,32 @@ where
 
         let retained_bps = 10_000u32.saturating_sub(slippage_bps.min(10_000));
         (gross_collateral * Nat::from(retained_bps)) / Nat::from(10_000u32)
+    }
+
+    fn is_native_cketh_on_icp(token: &ChainToken) -> bool {
+        token.symbol().eq_ignore_ascii_case("ckETH") && token.chain().eq_ignore_ascii_case("icp")
+    }
+
+    fn below_native_cketh_bridge_floor(token: &ChainToken, amount: &Nat) -> bool {
+        Self::is_native_cketh_on_icp(token) && amount < &Nat::from(CKETH_MIN_WITHDRAWAL_WEI)
+    }
+
+    fn native_to_units(amount: &Nat, decimals: u8) -> f64 {
+        let scale = 10f64.powi(decimals as i32);
+        if scale > 0.0 {
+            amount.0.to_f64().unwrap_or(f64::MAX) / scale
+        } else {
+            0.0
+        }
+    }
+
+    fn signed_native_to_units(amount: &Int, decimals: u8) -> f64 {
+        let scale = 10f64.powi(decimals as i32);
+        if scale > 0.0 {
+            amount.0.to_f64().unwrap_or(0.0) / scale
+        } else {
+            0.0
+        }
     }
 
     // Helper: Prefetch balances for all debt assets we might need
@@ -367,9 +394,9 @@ where
 
             info!(
                 "🧯 Bad debt buy: repay={} {} | profit={} {}",
-                repay_amount.0.to_f64().unwrap_or(f64::MAX) / 10u32.pow(repayment_token.decimals() as u32) as f64,
+                Self::native_to_units(&repay_amount, repayment_token.decimals()),
                 repayment_token.symbol(),
-                profit.0.to_f64().unwrap_or(0.0) / 10u32.pow(repayment_token.decimals() as u32) as f64,
+                Self::signed_native_to_units(&profit, repayment_token.decimals()),
                 repayment_token.symbol()
             );
 
@@ -629,13 +656,11 @@ where
             let inverse_price = if price > 0.0 { 1.0 / price } else { 0.0 };
             info!(
                 "💱 Quote: repay_debt={} {} | seized_collateral={} {} | estimated_swap_out={} {} | price={} inverse_price={} | swap={} -> {}",
-                estimation.repaid_debt.0.to_f64().unwrap_or(f64::MAX)
-                    / 10u32.pow(repayment_token.decimals() as u32) as f64,
+                Self::native_to_units(&estimation.repaid_debt, repayment_token.decimals()),
                 repayment_token.symbol(),
-                estimation.received_collateral.0.to_f64().unwrap_or(f64::MAX)
-                    / 10u32.pow(collateral_token.decimals() as u32) as f64,
+                Self::native_to_units(&estimation.received_collateral, collateral_token.decimals()),
                 collateral_token.symbol(),
-                amount_received.0.to_f64().unwrap_or(f64::MAX) / 10u32.pow(repayment_token.decimals() as u32) as f64,
+                Self::native_to_units(&amount_received, repayment_token.decimals()),
                 repayment_token.symbol(),
                 price,
                 inverse_price,
@@ -661,8 +686,23 @@ where
                 - Int::from(debt_fee_total.clone())
                 - Int::from(mexc_approval_fee_in_debt.clone());
             let is_bad_debt = profit <= 0;
+            let below_bridge_floor =
+                use_cex && Self::below_native_cketh_bridge_floor(&collateral_token, &amount_in_effective);
 
-            let min_collateral_amount = if is_bad_debt {
+            if below_bridge_floor && !self.config.should_buy_bad_debt() {
+                info!(
+                    "⏭️ Skipping liquidation below ckETH bridge minimum: collateral={} {} minimum={} {}",
+                    Self::native_to_units(&amount_in_effective, collateral_token.decimals()),
+                    collateral_token.symbol(),
+                    Self::native_to_units(&Nat::from(CKETH_MIN_WITHDRAWAL_WEI), collateral_token.decimals()),
+                    collateral_token.symbol()
+                );
+                continue;
+            }
+
+            let buy_bad_debt = is_bad_debt || below_bridge_floor;
+
+            let min_collateral_amount = if buy_bad_debt {
                 Self::min_collateral_for_bad_debt(
                     gross_estimated_collateral,
                     self.config.get_bad_debt_collateral_slippage_bps(),
@@ -673,7 +713,7 @@ where
 
             info!(
                 "📊 Profit: {} {}",
-                profit.0.to_f64().unwrap_or(0.0) / 10u32.pow(repayment_token.decimals() as u32) as f64,
+                Self::signed_native_to_units(&profit, repayment_token.decimals()),
                 repayment_token.symbol()
             );
 
@@ -708,7 +748,7 @@ where
                     collateral_pool_id: collateral_position.pool_id,
                     debt_amount: estimation.repaid_debt.clone(),
                     receiver_address: self.config.get_trader_principal(),
-                    buy_bad_debt: is_bad_debt,
+                    buy_bad_debt,
                 },
                 ref_price: estimation.ref_price,
                 swap_args,
@@ -724,9 +764,14 @@ where
             if is_bad_debt && self.config.should_buy_bad_debt() {
                 info!(
                     "🧯 Buying bad debt: repaid={} {}",
-                    estimation.repaid_debt.0.to_f64().unwrap_or(f64::MAX)
-                        / 10u32.pow(repayment_token.decimals() as u32) as f64,
+                    Self::native_to_units(&estimation.repaid_debt, repayment_token.decimals()),
                     repayment_token.symbol()
+                );
+            } else if below_bridge_floor && self.config.should_buy_bad_debt() {
+                info!(
+                    "🧯 Buying sub-bridge-threshold liquidation in bad debt mode: collateral={} {}",
+                    Self::native_to_units(&amount_in_effective, collateral_token.decimals()),
+                    collateral_token.symbol()
                 );
             }
         }
@@ -1294,6 +1339,202 @@ mod tests {
             Nat::from(950u64),
             "bad debt min collateral should use gross estimate haircut"
         );
+    }
+
+    #[tokio::test]
+    async fn simple_strategy_skips_cketh_below_bridge_floor_when_bad_debt_disabled() {
+        let ckusdc_ledger = p("xevnm-gaaaa-aaaar-qafnq-cai");
+        let cketh_ledger = p("ss2fx-dyaaa-aaaar-qacoq-cai");
+        let ckusdc_token = ChainToken::Icp {
+            ledger: ckusdc_ledger,
+            symbol: "ckUSDC".to_string(),
+            decimals: 6,
+            fee: Nat::from(1_000u64),
+        };
+        let cketh_token = ChainToken::Icp {
+            ledger: cketh_ledger,
+            symbol: "ckETH".to_string(),
+            decimals: 18,
+            fee: Nat::from(1_000u64),
+        };
+
+        let mut registry = MockTokenRegistryTrait::new();
+        registry.expect_get().returning({
+            let ckusdc_token = ckusdc_token.clone();
+            let cketh_token = cketh_token.clone();
+            move |id: &AssetId| {
+                if id.address == ckusdc_ledger.to_text() {
+                    Some(ckusdc_token.clone())
+                } else if id.address == cketh_ledger.to_text() {
+                    Some(cketh_token.clone())
+                } else {
+                    None
+                }
+            }
+        });
+
+        let mut cfg = MockConfigTrait::new();
+        let trader = p("aaaaa-aa");
+        cfg.expect_get_trader_principal().return_const(trader);
+        cfg.expect_get_liquidator_principal().return_const(trader);
+        cfg.expect_should_buy_bad_debt().return_const(false);
+        cfg.expect_get_max_allowed_dex_slippage().return_const(2000u32);
+        cfg.expect_get_swapper_mode()
+            .return_const(crate::config::SwapperMode::Cex);
+        cfg.expect_get_lending_canister()
+            .return_const(p("mxzaz-hqaaa-aaaar-qaada-cai"));
+
+        let mut collateral = MockCollateralServiceTrait::new();
+        collateral
+            .expect_calculate_liquidation_amounts()
+            .returning(|_max_balance, _debt_pos, _coll_pos, _user| {
+                Ok(LiquidationEstimation {
+                    received_collateral: Nat::from(4_900_000_000_000_000u64),
+                    repaid_debt: Nat::from(1_000_000u64),
+                    ref_price: Nat::from(2_000_000_000_000_000_000_000_000_000_000u128),
+                    debt_price: Nat::from(1_000_000_000_000_000_000_000_000_000u128),
+                })
+            });
+
+        let mut account = MockAccountInfo::new();
+        account.expect_sync_balance().returning(move |_t: &ChainToken| {
+            Ok(ChainTokenAmount {
+                token: _t.clone(),
+                value: Nat::from(10_000_000u64),
+            })
+        });
+        account.expect_get_balance().returning(move |_t: &ChainToken| {
+            Ok(ChainTokenAmount {
+                token: _t.clone(),
+                value: Nat::from(10_000_000u64),
+            })
+        });
+
+        let mut swapper = MockSwapInterface::new();
+        swapper
+            .expect_quote()
+            .returning(|_req| panic!("strategy builds CEX swap args without quoting"));
+
+        let registry = Arc::new(registry);
+        let account = Arc::new(account);
+        let balance_service = Arc::new(BalanceService::new(registry.clone(), account.clone()));
+        let strategy = SimpleLiquidationStrategy::new(
+            Arc::new(cfg),
+            registry.clone(),
+            Arc::new(swapper),
+            Arc::new(collateral),
+            balance_service,
+            Arc::new(ApprovalState::new()),
+        );
+
+        let pool = p("mxzaz-hqaaa-aaaar-qaada-cai");
+        let borrower = p("user-sub-bridge");
+        let debt_pos = mk_position(pool, borrower, ckusdc_ledger, 1_000_000, 0, Assets::USDC);
+        let collateral_pos = mk_position(pool, borrower, cketh_ledger, 0, 4_900_000_000_000_000, Assets::ETH);
+        let user = mk_user(vec![debt_pos, collateral_pos], 1_000_000, 900);
+
+        let res = strategy.process(&vec![user]).await.unwrap();
+        assert!(res.is_empty(), "normal mode should skip ckETH below bridge minimum");
+    }
+
+    #[tokio::test]
+    async fn simple_strategy_allows_cketh_below_bridge_floor_in_bad_debt_mode() {
+        let ckusdc_ledger = p("xevnm-gaaaa-aaaar-qafnq-cai");
+        let cketh_ledger = p("ss2fx-dyaaa-aaaar-qacoq-cai");
+        let ckusdc_token = ChainToken::Icp {
+            ledger: ckusdc_ledger,
+            symbol: "ckUSDC".to_string(),
+            decimals: 6,
+            fee: Nat::from(1_000u64),
+        };
+        let cketh_token = ChainToken::Icp {
+            ledger: cketh_ledger,
+            symbol: "ckETH".to_string(),
+            decimals: 18,
+            fee: Nat::from(1_000u64),
+        };
+
+        let mut registry = MockTokenRegistryTrait::new();
+        registry.expect_get().returning({
+            let ckusdc_token = ckusdc_token.clone();
+            let cketh_token = cketh_token.clone();
+            move |id: &AssetId| {
+                if id.address == ckusdc_ledger.to_text() {
+                    Some(ckusdc_token.clone())
+                } else if id.address == cketh_ledger.to_text() {
+                    Some(cketh_token.clone())
+                } else {
+                    None
+                }
+            }
+        });
+
+        let mut cfg = MockConfigTrait::new();
+        let trader = p("aaaaa-aa");
+        cfg.expect_get_trader_principal().return_const(trader);
+        cfg.expect_get_liquidator_principal().return_const(trader);
+        cfg.expect_should_buy_bad_debt().return_const(true);
+        cfg.expect_get_max_allowed_dex_slippage().return_const(2000u32);
+        cfg.expect_get_bad_debt_collateral_slippage_bps().return_const(500u32);
+        cfg.expect_get_swapper_mode()
+            .return_const(crate::config::SwapperMode::Cex);
+        cfg.expect_get_lending_canister()
+            .return_const(p("mxzaz-hqaaa-aaaar-qaada-cai"));
+
+        let mut collateral = MockCollateralServiceTrait::new();
+        collateral
+            .expect_calculate_liquidation_amounts()
+            .returning(|_max_balance, _debt_pos, _coll_pos, _user| {
+                Ok(LiquidationEstimation {
+                    received_collateral: Nat::from(4_900_000_000_000_000u64),
+                    repaid_debt: Nat::from(1_000_000u64),
+                    ref_price: Nat::from(2_000_000_000_000_000_000_000_000_000_000u128),
+                    debt_price: Nat::from(1_000_000_000_000_000_000_000_000_000u128),
+                })
+            });
+
+        let mut account = MockAccountInfo::new();
+        account.expect_sync_balance().returning(move |_t: &ChainToken| {
+            Ok(ChainTokenAmount {
+                token: _t.clone(),
+                value: Nat::from(10_000_000u64),
+            })
+        });
+        account.expect_get_balance().returning(move |_t: &ChainToken| {
+            Ok(ChainTokenAmount {
+                token: _t.clone(),
+                value: Nat::from(10_000_000u64),
+            })
+        });
+
+        let mut swapper = MockSwapInterface::new();
+        swapper
+            .expect_quote()
+            .returning(|_req| panic!("strategy builds CEX swap args without quoting"));
+
+        let registry = Arc::new(registry);
+        let account = Arc::new(account);
+        let balance_service = Arc::new(BalanceService::new(registry.clone(), account.clone()));
+        let strategy = SimpleLiquidationStrategy::new(
+            Arc::new(cfg),
+            registry.clone(),
+            Arc::new(swapper),
+            Arc::new(collateral),
+            balance_service,
+            Arc::new(ApprovalState::new()),
+        );
+
+        let pool = p("mxzaz-hqaaa-aaaar-qaada-cai");
+        let borrower = p("user-sub-bridge");
+        let debt_pos = mk_position(pool, borrower, ckusdc_ledger, 1_000_000, 0, Assets::USDC);
+        let collateral_pos = mk_position(pool, borrower, cketh_ledger, 0, 4_900_000_000_000_000, Assets::ETH);
+        let user = mk_user(vec![debt_pos, collateral_pos], 1_000_000, 900);
+
+        let res = strategy.process(&vec![user]).await.unwrap();
+        assert_eq!(res.len(), 1, "bad debt mode should allow the sub-threshold liquidation");
+        assert!(res[0].liquidation.buy_bad_debt);
+        assert!(res[0].expected_profit > 0, "paper profit should still be positive in this setup");
+        assert_eq!(res[0].min_collateral_amount, Nat::from(4_655_000_000_000_000u64));
     }
 
     #[tokio::test]
