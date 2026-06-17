@@ -185,7 +185,7 @@ CEX_DELAY_BUFFER_BPS=75
 # Estimated route fee haircut applied to projected edge (bps)
 CEX_ROUTE_FEE_BPS=25
 # Optional CSV market universe for MEXC hop discovery (`BASE_QUOTE` format)
-CEX_MEXC_AVAILABLE_PAIRS=CKBTC_BTC,BTC_USDC,USDC_USDT,CKUSDT_USDT,ICP_USDT,ICP_USDC
+CEX_MEXC_AVAILABLE_PAIRS=CKBTC_BTC,BTC_USDC,BTC_USDT,USDC_USDT,CKUSDT_USDT,ICP_USDT,ICP_USDC,ETH_USDT
 # Max intermediate hops when searching configured pairs (0 disables hop fallback)
 CEX_MEXC_MAX_HOPS=2
 # Reserved (currently unused while only SWAPPER=cex is supported)

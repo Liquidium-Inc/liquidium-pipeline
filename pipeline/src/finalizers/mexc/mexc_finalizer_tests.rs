@@ -3932,6 +3932,136 @@ async fn mexc_resolves_icp_to_ckusdt_route_from_configured_pairs() {
 }
 
 #[tokio::test]
+async fn mexc_resolves_icp_to_eth_route_from_configured_pairs() {
+    let mut backend = MockCexBackend::new();
+    let transfers = MockTransferActions::new();
+    let liquid = liquid_orderbook();
+    let empty = OrderBook {
+        bids: vec![],
+        asks: vec![],
+    };
+
+    backend
+        .expect_get_orderbook()
+        .returning(move |market, _limit| match market {
+            "ICP_ETH" | "ETH_ICP" => Ok(empty.clone()),
+            "ICP_USDT" | "ETH_USDT" => Ok(liquid.clone()),
+            other => Err(format!("unexpected market {}", other)),
+        });
+
+    let finalizer = MexcFinalizer::new(
+        Arc::new(backend),
+        Arc::new(transfers),
+        Principal::anonymous(),
+        TEST_MAX_SELL_SLIPPAGE_BPS,
+        TEST_CEX_MIN_EXEC_USD,
+        TEST_CEX_SLICE_TARGET_RATIO,
+    )
+    .with_route_config(vec!["ICP_USDT".to_string(), "ETH_USDT".to_string()], 1);
+
+    let legs = finalizer
+        .resolve_trade_legs_for_symbols("ICP", "ETH")
+        .await
+        .expect("ICP -> ETH route should resolve");
+
+    assert_eq!(legs.len(), 2);
+    assert_eq!(legs[0].market, "ICP_USDT");
+    assert_eq!(legs[0].side, "sell");
+    assert_eq!(legs[1].market, "ETH_USDT");
+    assert_eq!(legs[1].side, "buy");
+}
+
+#[tokio::test]
+async fn mexc_resolves_ckbtc_to_eth_route_from_configured_pairs() {
+    let mut backend = MockCexBackend::new();
+    let transfers = MockTransferActions::new();
+    let liquid = liquid_orderbook();
+    let empty = OrderBook {
+        bids: vec![],
+        asks: vec![],
+    };
+
+    backend
+        .expect_get_orderbook()
+        .returning(move |market, _limit| match market {
+            "CKBTC_ETH" | "ETH_CKBTC" => Ok(empty.clone()),
+            "CKBTC_BTC" | "BTC_USDT" | "ETH_USDT" => Ok(liquid.clone()),
+            other => Err(format!("unexpected market {}", other)),
+        });
+
+    let finalizer = MexcFinalizer::new(
+        Arc::new(backend),
+        Arc::new(transfers),
+        Principal::anonymous(),
+        TEST_MAX_SELL_SLIPPAGE_BPS,
+        TEST_CEX_MIN_EXEC_USD,
+        TEST_CEX_SLICE_TARGET_RATIO,
+    )
+    .with_route_config(
+        vec!["CKBTC_BTC".to_string(), "BTC_USDT".to_string(), "ETH_USDT".to_string()],
+        2,
+    );
+
+    let legs = finalizer
+        .resolve_trade_legs_for_symbols("ckBTC", "ETH")
+        .await
+        .expect("ckBTC -> ETH route should resolve");
+
+    assert_eq!(legs.len(), 3);
+    assert_eq!(legs[0].market, "CKBTC_BTC");
+    assert_eq!(legs[0].side, "sell");
+    assert_eq!(legs[1].market, "BTC_USDT");
+    assert_eq!(legs[1].side, "sell");
+    assert_eq!(legs[2].market, "ETH_USDT");
+    assert_eq!(legs[2].side, "buy");
+}
+
+#[tokio::test]
+async fn mexc_resolves_eth_to_ckbtc_route_from_configured_pairs() {
+    let mut backend = MockCexBackend::new();
+    let transfers = MockTransferActions::new();
+    let liquid = liquid_orderbook();
+    let empty = OrderBook {
+        bids: vec![],
+        asks: vec![],
+    };
+
+    backend
+        .expect_get_orderbook()
+        .returning(move |market, _limit| match market {
+            "ETH_CKBTC" | "CKBTC_ETH" => Ok(empty.clone()),
+            "ETH_USDT" | "BTC_USDT" | "CKBTC_BTC" => Ok(liquid.clone()),
+            other => Err(format!("unexpected market {}", other)),
+        });
+
+    let finalizer = MexcFinalizer::new(
+        Arc::new(backend),
+        Arc::new(transfers),
+        Principal::anonymous(),
+        TEST_MAX_SELL_SLIPPAGE_BPS,
+        TEST_CEX_MIN_EXEC_USD,
+        TEST_CEX_SLICE_TARGET_RATIO,
+    )
+    .with_route_config(
+        vec!["CKBTC_BTC".to_string(), "BTC_USDT".to_string(), "ETH_USDT".to_string()],
+        2,
+    );
+
+    let legs = finalizer
+        .resolve_trade_legs_for_symbols("ETH", "ckBTC")
+        .await
+        .expect("ETH -> ckBTC route should resolve");
+
+    assert_eq!(legs.len(), 3);
+    assert_eq!(legs[0].market, "ETH_USDT");
+    assert_eq!(legs[0].side, "sell");
+    assert_eq!(legs[1].market, "BTC_USDT");
+    assert_eq!(legs[1].side, "buy");
+    assert_eq!(legs[2].market, "CKBTC_BTC");
+    assert_eq!(legs[2].side, "buy");
+}
+
+#[tokio::test]
 async fn mexc_resolves_ckusdt_to_icp_route_from_configured_pairs() {
     let mut backend = MockCexBackend::new();
     let transfers = MockTransferActions::new();
