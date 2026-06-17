@@ -1677,6 +1677,105 @@ async fn mexc_withdraw_bridge_applies_cex_withdraw_fee_to_submit_amount() {
 }
 
 #[tokio::test]
+async fn mexc_native_eth_withdraw_bridge_uses_bridgeable_balance_after_gas_reserve() {
+    let mut cex = MockCexBackend::new();
+    let mut bridge = MockBridgeBackend::new();
+    let transfers = MockTransferActions::new();
+    let liquidator = Principal::management_canister();
+
+    cex.expect_withdraw()
+        .times(1)
+        .returning(|asset, network, address, amount| {
+            assert_eq!(asset, "ETH");
+            assert_eq!(network, "ETH");
+            assert_eq!(address, "0x2222222222222222222222222222222222222222");
+            assert!(amount > 0.0);
+            Ok(liquidium_pipeline_connectors::backend::cex_backend::WithdrawalReceipt {
+                asset: asset.to_string(),
+                network: network.to_string(),
+                amount,
+                txid: Some("cex-native-eth-tx".to_string()),
+                internal_id: Some("withdraw-native-eth".to_string()),
+            })
+        });
+
+    cex.expect_get_withdraw_status_snapshot_by_id()
+        .times(1)
+        .returning(|coin, withdraw_id| {
+            assert_eq!(coin, "ETH");
+            assert_eq!(withdraw_id, "withdraw-native-eth");
+            Ok(WithdrawStatusSnapshot {
+                status: WithdrawStatus::Completed,
+                txid: Some("0xcompleted".to_string()),
+                transaction_fee: Some(0.000043),
+            })
+        });
+
+    bridge
+        .expect_get_source_balance()
+        .times(1)
+        .returning(|asset, chain, address| {
+            assert_eq!(asset, "ETH");
+            assert_eq!(chain, "ETH");
+            assert_eq!(address, "0x2222222222222222222222222222222222222222");
+            // ETH source balance is reported after reserving gas for the bridge transaction.
+            Ok(0.016425721728152685)
+        });
+
+    bridge.expect_submit_bridge().times(1).returning(|request| {
+        assert_eq!(request.asset, "ETH");
+        assert_eq!(request.source_chain, "ETH");
+        assert_eq!(request.target_asset, "ckETH");
+        assert_eq!(request.source_address, "0x2222222222222222222222222222222222222222");
+        assert!((request.amount - 0.016425721728151685).abs() < 1e-18);
+        Ok(BridgeSubmission {
+            bridge_id: "bridge-native-eth".to_string(),
+        })
+    });
+    bridge.expect_get_bridge_status().times(0);
+
+    let finalizer = MexcFinalizer::new(
+        Arc::new(cex),
+        Arc::new(transfers),
+        liquidator,
+        TEST_MAX_SELL_SLIPPAGE_BPS,
+        TEST_CEX_MIN_EXEC_USD,
+        TEST_CEX_SLICE_TARGET_RATIO,
+    )
+    .with_bridge_dependencies(bridge_dependencies(Arc::new(bridge)));
+
+    let receipt = make_execution_receipt_with_assets(113, native_icp_token(), cketh_token());
+    let mut state = finalizer
+        .prepare("113", &receipt)
+        .await
+        .expect("prepare should succeed");
+    assert!(state.withdraw.bridge.withdraw_bridge_required);
+    state.step = CexStep::Withdraw;
+    state.withdraw.size_out = Some(ChainTokenAmount::from_formatted(
+        state.withdraw.withdraw_asset.clone(),
+        0.0200899299,
+    ));
+
+    finalizer
+        .withdraw(&mut state)
+        .await
+        .expect("withdraw submit should succeed");
+    assert!(matches!(state.step, CexStep::WithdrawPending));
+    assert_eq!(state.withdraw.withdraw_id.as_deref(), Some("withdraw-native-eth"));
+    assert!(state.withdraw.bridge.withdraw_bridge_id.is_none());
+
+    finalizer
+        .withdraw(&mut state)
+        .await
+        .expect("bridge submit should use bridgeable source balance");
+    assert!(matches!(state.step, CexStep::WithdrawPending));
+    assert_eq!(
+        state.withdraw.bridge.withdraw_bridge_id.as_deref(),
+        Some("bridge-native-eth")
+    );
+}
+
+#[tokio::test]
 async fn mexc_non_bridge_withdraw_behavior_unchanged() {
     let mut cex = MockCexBackend::new();
     let transfers = MockTransferActions::new();

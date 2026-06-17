@@ -29,6 +29,7 @@ use super::mexc_utils::{
 };
 
 const WITHDRAW_BRIDGE_SOURCE_BALANCE_TOLERANCE: f64 = LIQUIDITY_EPS;
+const NATIVE_ETH_BRIDGEABLE_SAFETY_MARGIN: f64 = 1e-15;
 const MEXC_WITHDRAW_BELOW_MIN_RAW_CODE: i64 = 10254;
 
 use crate::{
@@ -1207,22 +1208,58 @@ where
                 .await?;
 
             // CEX withdrawals can arrive net of withdrawal/network fees; use the reported fee
-            // above to compute the expected net amount, then wait until the bridge source account
-            // actually covers that amount. Do not bridge arbitrary positive residual/dust balances.
+            // above to compute the expected net amount. Native ETH source balances are reported
+            // as bridgeable balance after reserving gas, so submit that bridgeable amount instead
+            // of waiting forever for the gross source balance to become bridgeable.
             if source_available + WITHDRAW_BRIDGE_SOURCE_BALANCE_TOLERANCE < bridge_amount {
-                info!(
-                    "[mexc] liq_id={} bridged withdraw waiting for source funding: available={} expected={} tolerance={} source={} route={}@{}->{}",
-                    state.liq_id,
-                    source_available,
-                    bridge_amount,
-                    WITHDRAW_BRIDGE_SOURCE_BALANCE_TOLERANCE,
-                    bridge_source_address,
-                    route.source_asset,
-                    route.source_chain,
-                    route.target_asset,
-                );
-                state.step = CexStep::WithdrawPending;
-                return Ok(());
+                if matches!(route.route_kind, BridgeRouteKind::EthToCkEth)
+                    && source_available > WITHDRAW_BRIDGE_SOURCE_BALANCE_TOLERANCE
+                {
+                    let adjusted_source_available = (source_available - NATIVE_ETH_BRIDGEABLE_SAFETY_MARGIN).max(0.0);
+                    if adjusted_source_available <= WITHDRAW_BRIDGE_SOURCE_BALANCE_TOLERANCE {
+                        info!(
+                            "[mexc] liq_id={} bridged native ETH withdraw waiting for source funding after safety margin: available={} adjusted={} expected={} tolerance={} source={} route={}@{}->{}",
+                            state.liq_id,
+                            source_available,
+                            adjusted_source_available,
+                            bridge_amount,
+                            WITHDRAW_BRIDGE_SOURCE_BALANCE_TOLERANCE,
+                            bridge_source_address,
+                            route.source_asset,
+                            route.source_chain,
+                            route.target_asset,
+                        );
+                        state.step = CexStep::WithdrawPending;
+                        return Ok(());
+                    }
+                    info!(
+                        "[mexc] liq_id={} bridged native ETH withdraw adjusting to bridgeable source balance: amount {} -> {} (source includes gas reserve; safety_margin={} tolerance={} source={} route={}@{}->{})",
+                        state.liq_id,
+                        bridge_amount,
+                        adjusted_source_available,
+                        NATIVE_ETH_BRIDGEABLE_SAFETY_MARGIN,
+                        WITHDRAW_BRIDGE_SOURCE_BALANCE_TOLERANCE,
+                        bridge_source_address,
+                        route.source_asset,
+                        route.source_chain,
+                        route.target_asset,
+                    );
+                    bridge_amount = adjusted_source_available;
+                } else {
+                    info!(
+                        "[mexc] liq_id={} bridged withdraw waiting for source funding: available={} expected={} tolerance={} source={} route={}@{}->{}",
+                        state.liq_id,
+                        source_available,
+                        bridge_amount,
+                        WITHDRAW_BRIDGE_SOURCE_BALANCE_TOLERANCE,
+                        bridge_source_address,
+                        route.source_asset,
+                        route.source_chain,
+                        route.target_asset,
+                    );
+                    state.step = CexStep::WithdrawPending;
+                    return Ok(());
+                }
             }
 
             if source_available < bridge_amount {
