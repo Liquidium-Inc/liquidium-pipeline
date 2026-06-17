@@ -34,8 +34,10 @@ use async_trait::async_trait;
 
 use itertools::Itertools;
 
+#[cfg(test)]
 const WIPEOUT_THRESHOLD: u32 = 975;
 const CKETH_MIN_WITHDRAWAL_WEI: u128 = 5_000_000_000_000_000;
+const WIPEOUT_REPAY_BUFFER_WEI: u64 = 300_000_000_000;
 
 fn resolve_token_for_position(registry: &dyn TokenRegistryTrait, pos: &LiquidateblePosition) -> Option<ChainToken> {
     if pos.asset.symbol().eq_ignore_ascii_case("ICP") {
@@ -573,15 +575,20 @@ where
                 continue;
             }
 
-            if self.config.should_buy_bad_debt() && work_users[user_idx].health_factor <= WIPEOUT_THRESHOLD {
-                let desired_repay = debt_position.debt_amount.clone().min(max_balance.clone());
-                if estimation.repaid_debt < desired_repay {
-                    debug!(
-                        "Wipeout bad-debt repay override: {} -> {}",
-                        estimation.repaid_debt, desired_repay,
-                    );
-                    estimation.repaid_debt = desired_repay;
-                }
+            // Add a small repay buffer on every liquidation to cover rounding/dust so the
+            // position is fully repaid. The buffer is only meaningful for 18-decimal tokens
+            // (e.g. ETH/wei-denominated debt); for others it's zero (no buffer).
+            let repay_buffer = if repayment_token.decimals() == 18 {
+                Nat::from(WIPEOUT_REPAY_BUFFER_WEI)
+            } else {
+                Nat::from(0u8)
+            };
+            // Target = full debt plus the buffer, but never more than what we can actually spend.
+            let desired_repay = (debt_position.debt_amount.clone() + repay_buffer).min(max_balance.clone());
+            // Only bump up the repay amount; never reduce what the estimator already chose.
+            if estimation.repaid_debt < desired_repay {
+                debug!("Repay buffer override: {} -> {}", estimation.repaid_debt, desired_repay,);
+                estimation.repaid_debt = desired_repay;
             }
 
             let amount_in = ChainTokenAmount {
@@ -1342,6 +1349,89 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn simple_strategy_wipeout_full_close_adds_18_decimal_repay_buffer() {
+        let ledger = p("ss2fx-dyaaa-aaaar-qacoq-cai");
+        let token = ChainToken::Icp {
+            ledger,
+            symbol: "ckETH".to_string(),
+            decimals: 18,
+            fee: Nat::from(1_000u64),
+        };
+
+        let mut registry = MockTokenRegistryTrait::new();
+        registry
+            .expect_get()
+            .returning(move |_id: &AssetId| Some(token.clone()));
+
+        let mut cfg = MockConfigTrait::new();
+        let trader = p("aaaaa-aa");
+        cfg.expect_get_trader_principal().return_const(trader);
+        cfg.expect_get_liquidator_principal().return_const(trader);
+        cfg.expect_should_buy_bad_debt().return_const(true);
+        cfg.expect_get_max_allowed_dex_slippage().return_const(2000u32);
+        cfg.expect_get_lending_canister()
+            .return_const(p("mxzaz-hqaaa-aaaar-qaada-cai"));
+
+        let scanned_debt = Nat::from(5_000_000_000u64);
+        let mut collateral = MockCollateralServiceTrait::new();
+        collateral.expect_calculate_liquidation_amounts().returning(
+            move |_max_balance, _debt_pos, _coll_pos, _user| {
+                Ok(LiquidationEstimation {
+                    received_collateral: Nat::from(400_000_000_000u64),
+                    repaid_debt: scanned_debt.clone(),
+                    ref_price: Nat::from(0u8),
+                    debt_price: Nat::from(0u8),
+                })
+            },
+        );
+
+        let mut account = MockAccountInfo::new();
+        account.expect_sync_balance().returning(move |_t: &ChainToken| {
+            Ok(ChainTokenAmount {
+                token: _t.clone(),
+                value: Nat::from(1_000_000_000_000u64),
+            })
+        });
+        account.expect_get_balance().returning(move |_t: &ChainToken| {
+            Ok(ChainTokenAmount {
+                token: _t.clone(),
+                value: Nat::from(1_000_000_000_000u64),
+            })
+        });
+
+        let mut swapper = MockSwapInterface::new();
+        swapper
+            .expect_quote()
+            .returning(|_req| panic!("quote should not be called when assets are equal"));
+
+        let registry = Arc::new(registry);
+        let account = Arc::new(account);
+        let balance_service = Arc::new(BalanceService::new(registry.clone(), account.clone()));
+
+        let strategy = SimpleLiquidationStrategy::new(
+            Arc::new(cfg),
+            registry.clone(),
+            Arc::new(swapper),
+            Arc::new(collateral),
+            balance_service,
+            Arc::new(ApprovalState::new()),
+        );
+
+        let pool = p("jrgdg-siaaa-aaaae-qkfmq-cai");
+        let borrower = p("user-wipeout-buffer");
+        let pos = mk_position(pool, borrower, ledger, 5_000_000_000, 400_000_000_000, Assets::ETH);
+        let user = mk_user(vec![pos], 5_000_000_000, WIPEOUT_THRESHOLD as u64);
+
+        let res = strategy.process(&vec![user]).await.unwrap();
+        assert_eq!(res.len(), 1);
+        assert_eq!(
+            res[0].liquidation.debt_amount,
+            Nat::from(305_000_000_000u64),
+            "wipeout full-close offer should add a 300 gwei buffer for 18-decimal debt"
+        );
+    }
+
+    #[tokio::test]
     async fn simple_strategy_skips_cketh_below_bridge_floor_when_bad_debt_disabled() {
         let ckusdc_ledger = p("xevnm-gaaaa-aaaar-qafnq-cai");
         let cketh_ledger = p("ss2fx-dyaaa-aaaar-qacoq-cai");
@@ -1533,7 +1623,10 @@ mod tests {
         let res = strategy.process(&vec![user]).await.unwrap();
         assert_eq!(res.len(), 1, "bad debt mode should allow the sub-threshold liquidation");
         assert!(res[0].liquidation.buy_bad_debt);
-        assert!(res[0].expected_profit > 0, "paper profit should still be positive in this setup");
+        assert!(
+            res[0].expected_profit > 0,
+            "paper profit should still be positive in this setup"
+        );
         assert_eq!(res[0].min_collateral_amount, Nat::from(4_655_000_000_000_000u64));
     }
 
