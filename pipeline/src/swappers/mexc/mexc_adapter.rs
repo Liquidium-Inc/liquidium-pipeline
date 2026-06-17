@@ -194,6 +194,10 @@ fn mexc_network_candidates(asset: &str, network: &str) -> Vec<String> {
         push_unique(network_norm.clone());
     }
 
+    if is_evm_network_alias(&network_norm) {
+        push_unique("ERC20".to_string());
+    }
+
     // If requested network is ICP, include ICP and CK-asset network names.
     if network.eq_ignore_ascii_case("icp") {
         push_unique("ICP".to_string());
@@ -201,6 +205,10 @@ fn mexc_network_candidates(asset: &str, network: &str) -> Vec<String> {
     }
 
     candidates
+}
+
+fn is_evm_network_alias(network_norm: &str) -> bool {
+    network_norm == "ETH" || network_norm == "ETHEREUM" || network_norm.starts_with("EVM")
 }
 
 fn mexc_withdraw_network(asset: &str, network: &str) -> String {
@@ -214,6 +222,11 @@ fn mexc_withdraw_network(asset: &str, network: &str) -> String {
         if !asset_norm.is_empty() {
             return asset_norm;
         }
+    }
+
+    let network_norm = network.trim().to_ascii_uppercase();
+    if is_evm_network_alias(&network_norm) {
+        return "ERC20".to_string();
     }
 
     network.to_string()
@@ -1515,6 +1528,26 @@ mod tests {
     fn candidate_symbols_are_normalized_and_deduped() {
         let candidates = MexcClient::candidate_symbols("CKBTCBTC", "CKBTC_BTC", "ckbtc-btc");
         assert_eq!(candidates, vec!["CKBTCBTC".to_string()]);
+    }
+
+    #[test]
+    fn evm_network_candidates_include_erc20_alias() {
+        assert_eq!(
+            mexc_network_candidates("ETH", "ETH"),
+            vec!["ETH".to_string(), "ERC20".to_string()]
+        );
+        assert_eq!(
+            mexc_network_candidates("USDC", "evm-eth"),
+            vec!["EVM-ETH".to_string(), "ERC20".to_string()]
+        );
+    }
+
+    #[test]
+    fn evm_withdraw_network_uses_erc20_address_book_network() {
+        assert_eq!(mexc_withdraw_network("ETH", "ETH"), "ERC20");
+        assert_eq!(mexc_withdraw_network("USDC", "evm-eth"), "ERC20");
+        assert_eq!(mexc_withdraw_network("ICP", "ICP"), "ICP");
+        assert_eq!(mexc_withdraw_network("ckBTC", "ICP"), "CKBTC");
     }
 
     #[test]
