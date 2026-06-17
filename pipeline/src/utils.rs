@@ -6,6 +6,7 @@ pub const ICP_LEDGER_PRINCIPAL: &str = "ryjl3-tyaaa-aaaaa-aaaba-cai";
 pub const CKUSDT_LEDGER_PRINCIPAL: &str = "cngnf-vqaaa-aaaar-qag4q-cai";
 pub const CKUSDC_LEDGER_PRINCIPAL: &str = "xevnm-gaaaa-aaaar-qafnq-cai";
 pub const CKBTC_LEDGER_PRINCIPAL: &str = "mxzaz-hqaaa-aaaar-qaada-cai";
+pub const CKETH_LEDGER_PRINCIPAL: &str = "ss2fx-dyaaa-aaaar-qacoq-cai";
 
 pub const CKUSDT_MAX_ALLOWANCE: u128 = 340_282_366_920_938_463_463_374_607_431_768_211_455;
 
@@ -26,6 +27,10 @@ pub fn max_for_ledger(token: &Principal) -> Nat {
         return Nat::from(u64::MAX);
     }
 
+    if *token == Principal::from_text(CKETH_LEDGER_PRINCIPAL).expect("invalid ckETH ledger principal") {
+        return Nat::from(CKUSDT_MAX_ALLOWANCE);
+    }
+
     Nat::from(0u8)
 }
 
@@ -34,4 +39,15 @@ pub fn now_ts() -> i64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs() as i64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cketh_has_nonzero_max_allowance() {
+        let ledger = Principal::from_text(CKETH_LEDGER_PRINCIPAL).expect("valid ckETH ledger principal");
+        assert!(max_for_ledger(&ledger) > Nat::from(0u8));
+    }
 }
