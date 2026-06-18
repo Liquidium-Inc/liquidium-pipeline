@@ -785,7 +785,14 @@ async fn mexc_deposit_bridge_submit_resume_and_complete() {
         .times(1)
         .returning(|_token, _to, _amount| Ok("tx-bridge-fund".to_string()));
 
-    bridge.expect_get_source_balance().times(0);
+    bridge
+        .expect_get_source_balance()
+        .times(1)
+        .returning(|asset, chain, _address| {
+            assert_eq!(asset, "ckUSDC");
+            assert_eq!(chain, "ICP");
+            Ok(0.93)
+        });
     bridge
         .expect_get_fee_budget()
         .times(1)
@@ -901,7 +908,14 @@ async fn mexc_deposit_bridge_reserves_reverse_bridge_approval_fee_in_trade_amoun
         .times(1)
         .returning(|_token, _to, _amount| Ok("tx-bridge-fund".to_string()));
 
-    bridge.expect_get_source_balance().times(0);
+    bridge
+        .expect_get_source_balance()
+        .times(1)
+        .returning(|asset, chain, _address| {
+            assert_eq!(asset, "ckUSDC");
+            assert_eq!(chain, "ICP");
+            Ok(0.93)
+        });
     bridge
         .expect_get_fee_budget()
         .times(1)
@@ -1044,7 +1058,14 @@ async fn mexc_deposit_bridge_reserves_native_cketh_withdrawal_fee_budget() {
         Ok("tx-bridge-fund-cketh".to_string())
     });
 
-    bridge.expect_get_source_balance().times(0);
+    bridge
+        .expect_get_source_balance()
+        .times(1)
+        .returning(|asset, chain, _address| {
+            assert_eq!(asset, "ckETH");
+            assert_eq!(chain, "ICP");
+            Ok(0.005_086)
+        });
     bridge
         .expect_get_fee_budget()
         .times(1)
@@ -1262,7 +1283,7 @@ async fn mexc_deposit_bridge_rejects_native_cketh_when_destination_fee_consumes_
 }
 
 #[tokio::test]
-async fn mexc_deposit_bridge_does_not_wait_on_source_funding_snapshot() {
+async fn mexc_deposit_bridge_waits_for_source_funding_snapshot() {
     let mut cex = MockCexBackend::new();
     let mut bridge = MockBridgeBackend::new();
     let mut transfers = MockTransferActions::new();
@@ -1288,7 +1309,14 @@ async fn mexc_deposit_bridge_does_not_wait_on_source_funding_snapshot() {
         .times(1)
         .returning(|_token, _to, _amount| Ok("tx-bridge-fund-wait".to_string()));
 
-    bridge.expect_get_source_balance().times(0);
+    bridge
+        .expect_get_source_balance()
+        .times(1)
+        .returning(|asset, chain, _address| {
+            assert_eq!(asset, "ckUSDC");
+            assert_eq!(chain, "ICP");
+            Ok(0.000_001)
+        });
     bridge
         .expect_get_fee_budget()
         .times(1)
@@ -1311,14 +1339,7 @@ async fn mexc_deposit_bridge_does_not_wait_on_source_funding_snapshot() {
             assert_eq!(target, "USDC");
             Ok(0.0)
         });
-    bridge.expect_submit_bridge().times(1).returning(|request| {
-        assert_eq!(request.asset, "ckUSDC");
-        assert_eq!(request.source_chain, "ICP");
-        assert!((request.amount - 0.92).abs() < 1e-9);
-        Ok(BridgeSubmission {
-            bridge_id: "bridge-deposit-funding".to_string(),
-        })
-    });
+    bridge.expect_submit_bridge().times(0);
     bridge.expect_get_bridge_status().times(0);
 
     let finalizer = MexcFinalizer::new(
@@ -1338,14 +1359,98 @@ async fn mexc_deposit_bridge_does_not_wait_on_source_funding_snapshot() {
     finalizer
         .deposit(&mut state)
         .await
-        .expect("bridged deposit should submit without source funding preflight wait");
+        .expect("bridged deposit should wait until source funding is visible");
 
     assert!(matches!(state.step, CexStep::DepositPending));
     assert_eq!(state.deposit.deposit_txid.as_deref(), Some("tx-bridge-fund-wait"));
-    assert_eq!(
-        state.deposit.bridge.deposit_bridge_id.as_deref(),
-        Some("bridge-deposit-funding")
-    );
+    assert!(state.deposit.bridge.deposit_bridge_id.is_none());
+}
+
+#[tokio::test]
+async fn mexc_deposit_bridge_waits_for_cketh_fee_funding_snapshot() {
+    let mut cex = MockCexBackend::new();
+    let mut bridge = MockBridgeBackend::new();
+    let mut transfers = MockTransferActions::new();
+
+    cex.expect_get_balance().times(1).returning(|asset| {
+        assert_eq!(asset, "USDC");
+        Ok(10.0)
+    });
+
+    cex.expect_get_deposit_address().times(1).returning(|asset, network| {
+        assert_eq!(asset, "USDC");
+        assert_eq!(network, "ETH");
+        Ok(DepositAddress {
+            asset: "USDC".to_string(),
+            network: "ETH".to_string(),
+            address: "0x1111111111111111111111111111111111111111".to_string(),
+            tag: None,
+        })
+    });
+
+    transfers
+        .expect_transfer()
+        .times(1)
+        .returning(|_token, _to, _amount| Ok("tx-bridge-fund-fee-wait".to_string()));
+
+    bridge
+        .expect_get_source_balance()
+        .times(2)
+        .returning(|asset, chain, _address| {
+            assert_eq!(chain, "ICP");
+            match asset {
+                "ckUSDC" => Ok(0.93),
+                "ckETH" => Ok(0.000_080_356_126_532_001),
+                other => panic!("unexpected source balance asset {other}"),
+            }
+        });
+    bridge
+        .expect_get_fee_budget()
+        .times(1)
+        .returning(|asset, chain, target| {
+            assert_eq!(asset, "ckUSDC");
+            assert_eq!(chain, "ICP");
+            assert_eq!(target, "USDC");
+            Ok(BridgeFeeBudget {
+                source_fee_budget: 0.01,
+                destination_fee_budget: 0.0,
+                provider_fee_budget_native_units: Some(Nat::from(138_541_176_852_000u64)),
+            })
+        });
+    bridge
+        .expect_get_minimum_bridge_amount()
+        .times(1)
+        .returning(|asset, chain, target| {
+            assert_eq!(asset, "ckUSDC");
+            assert_eq!(chain, "ICP");
+            assert_eq!(target, "USDC");
+            Ok(0.0)
+        });
+    bridge.expect_submit_bridge().times(0);
+    bridge.expect_get_bridge_status().times(0);
+
+    let finalizer = MexcFinalizer::new(
+        Arc::new(cex),
+        Arc::new(transfers),
+        Principal::anonymous(),
+        TEST_MAX_SELL_SLIPPAGE_BPS,
+        TEST_CEX_MIN_EXEC_USD,
+        TEST_CEX_SLICE_TARGET_RATIO,
+    )
+    .with_bridge_dependencies(bridge_dependencies(Arc::new(bridge)));
+
+    let receipt = make_execution_receipt_with_assets(84, ckusdc_token(), ckbtc_token());
+    let mut state = finalizer.prepare("84", &receipt).await.expect("prepare should succeed");
+    assert!(state.deposit.bridge.deposit_bridge_required);
+
+    finalizer
+        .deposit(&mut state)
+        .await
+        .expect("bridged deposit should wait until ckETH fee funding is visible");
+
+    assert!(matches!(state.step, CexStep::DepositPending));
+    assert_eq!(state.deposit.deposit_txid.as_deref(), Some("tx-bridge-fund-fee-wait"));
+    assert!(state.deposit.bridge.deposit_bridge_id.is_none());
 }
 
 #[tokio::test]

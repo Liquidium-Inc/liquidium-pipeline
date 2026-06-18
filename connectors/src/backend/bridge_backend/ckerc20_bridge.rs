@@ -688,7 +688,10 @@ where
         }
 
         let cketh_ledger_id = self.cketh_ledger_id().await?;
-        let required_fee_budget = self.quoted_cketh_fee_budget(Some(ckerc20_ledger_id)).await?;
+        let required_fee_budget = match &request.provider_fee_budget_native_units {
+            Some(quoted) => quoted.clone(),
+            None => self.quoted_cketh_fee_budget(Some(ckerc20_ledger_id)).await?,
+        };
 
         // Minter withdraw burns ckERC20 and consumes ckETH for the EVM execution fee.
         let available_cketh = icrc1_balance_with_context(
@@ -939,14 +942,15 @@ where
         match route.route_kind {
             BridgeRouteKind::CkEthErc20Reverse => {
                 let ledger_id = parse_ckerc20_ledger_id(route)?;
-                let (decimals, approve_fee) = tokio::try_join!(
+                let (decimals, approve_fee, withdrawal_fee_budget) = tokio::try_join!(
                     icrc1_decimals_with_context(self.icp_backend.as_ref(), ledger_id, "ckerc20 bridge"),
-                    icrc1_fee_with_context(self.icp_backend.as_ref(), ledger_id, "ckerc20 bridge")
+                    icrc1_fee_with_context(self.icp_backend.as_ref(), ledger_id, "ckerc20 bridge"),
+                    self.quoted_cketh_fee_budget(Some(ledger_id))
                 )?;
                 Ok(BridgeFeeBudget {
                     source_fee_budget: nat_units_to_amount_via_core(&approve_fee, decimals)?,
                     destination_fee_budget: 0.0,
-                    provider_fee_budget_native_units: None,
+                    provider_fee_budget_native_units: Some(withdrawal_fee_budget),
                 })
             }
             BridgeRouteKind::CkEthToEth => {

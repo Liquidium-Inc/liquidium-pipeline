@@ -1427,6 +1427,61 @@ async fn native_reverse_bridge_fee_budget_reuses_one_provider_quote() {
 }
 
 #[tokio::test]
+async fn erc20_reverse_bridge_fee_budget_includes_cketh_provider_quote() {
+    let bridge_owner = Principal::management_canister();
+    let minter = Principal::anonymous();
+    let ckusdc_ledger = Principal::from_text("xevnm-gaaaa-aaaar-qafnq-cai").expect("ledger");
+    let mut mock_agent = MockPipelineAgent::new();
+    mock_agent
+        .expect_call_query::<Eip1559TransactionPrice>()
+        .times(1)
+        .returning(|_, _, _| {
+            Ok(Eip1559TransactionPrice {
+                max_priority_fee_per_gas: Nat::from(1u8),
+                max_fee_per_gas: Nat::from(2u8),
+                max_transaction_fee: Nat::from(100_000_000_000_000u64),
+                timestamp: Some(1),
+                gas_limit: Nat::from(21_000u64),
+            })
+        });
+
+    let mut mock_icp = MockIcpBackend::new();
+    mock_icp.expect_icrc1_decimals().times(1).returning(move |ledger| {
+        if ledger == ckusdc_ledger {
+            Ok(6)
+        } else {
+            Err(format!("unexpected decimals ledger {ledger}"))
+        }
+    });
+    mock_icp.expect_icrc1_fee().times(1).returning(move |ledger| {
+        if ledger == ckusdc_ledger {
+            Ok(Nat::from(10_000u64))
+        } else {
+            Err(format!("unexpected fee ledger {ledger}"))
+        }
+    });
+
+    let backend = CkErc20BridgeBackend::new(
+        Arc::new(mock_agent),
+        Arc::new(mock_icp),
+        Arc::new(MockBridgeEvmBackend::new()),
+        minter,
+        bridge_owner,
+    );
+
+    let fee_budget = backend
+        .get_fee_budget("ckUSDC", "ICP", "USDC")
+        .await
+        .expect("fee budget should resolve");
+    assert!((fee_budget.source_fee_budget - 0.01).abs() < 1e-18);
+    assert_eq!(fee_budget.destination_fee_budget, 0.0);
+    assert_eq!(
+        fee_budget.provider_fee_budget_native_units,
+        Some(Nat::from(120_000_000_000_000u64))
+    );
+}
+
+#[tokio::test]
 async fn erc20_reverse_bridge_destination_fee_budget_is_zero() {
     let bridge_owner = Principal::management_canister();
     let minter = Principal::anonymous();

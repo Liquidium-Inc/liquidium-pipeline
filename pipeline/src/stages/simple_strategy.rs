@@ -37,7 +37,7 @@ use itertools::Itertools;
 #[cfg(test)]
 const WIPEOUT_THRESHOLD: u32 = 975;
 const CKETH_MIN_WITHDRAWAL_WEI: u128 = 5_000_000_000_000_000;
-const WIPEOUT_REPAY_BUFFER_WEI: u64 = 300_000_000_000;
+const REPAY_BUFFER_WEI: u64 = 300_000_000_000;
 
 fn resolve_token_for_position(registry: &dyn TokenRegistryTrait, pos: &LiquidateblePosition) -> Option<ChainToken> {
     if pos.asset.symbol().eq_ignore_ascii_case("ICP") {
@@ -579,7 +579,7 @@ where
             // position is fully repaid. The buffer is only meaningful for 18-decimal tokens
             // (e.g. ETH/wei-denominated debt); for others it's zero (no buffer).
             let repay_buffer = if repayment_token.decimals() == 18 {
-                Nat::from(WIPEOUT_REPAY_BUFFER_WEI)
+                Nat::from(REPAY_BUFFER_WEI)
             } else {
                 Nat::from(0u8)
             };
