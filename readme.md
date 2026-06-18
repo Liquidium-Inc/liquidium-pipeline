@@ -117,7 +117,10 @@ LENDING_CANISTER=nja4y-2yaaa-aaaae-qddxa-cai
 BRIDGE_CKETH_MINTER_CANISTER=sv3dd-oaaaa-aaaar-qacoa-cai
 
 # EVM Blockchain
-EVM_RPC_URL=https://arb1.arbitrum.io/rpc
+EVM_RPC_URL=https://ethereum-rpc.example
+MEXC_DEFAULT_ROUTE_CHAIN_ID=1
+# Optional Arbitrum override for an Arbitrum EVM_RPC_URL:
+# MEXC_ROUTE_CHAIN_MAP=ETH=42161,ETHEREUM=42161,ARB=42161,ARBITRUM=42161
 
 # Identity
 MNEMONIC_FILE=~/.liquidium-pipeline/wallets/key
