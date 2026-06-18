@@ -4,6 +4,7 @@ use std::{
 };
 
 use crate::config::ConfigTrait;
+use crate::constants::repay_buffer_native_units;
 use crate::executors::executor::ExecutorRequest;
 
 use crate::approval_state::ApprovalState;
@@ -37,7 +38,6 @@ use itertools::Itertools;
 #[cfg(test)]
 const WIPEOUT_THRESHOLD: u32 = 975;
 const CKETH_MIN_WITHDRAWAL_WEI: u128 = 5_000_000_000_000_000;
-const REPAY_BUFFER_WEI: u64 = 300_000_000_000;
 
 fn resolve_token_for_position(registry: &dyn TokenRegistryTrait, pos: &LiquidateblePosition) -> Option<ChainToken> {
     if pos.asset.symbol().eq_ignore_ascii_case("ICP") {
@@ -575,14 +575,10 @@ where
                 continue;
             }
 
-            // Add a small repay buffer on every liquidation to cover rounding/dust so the
-            // position is fully repaid. The buffer is only meaningful for 18-decimal tokens
-            // (e.g. ETH/wei-denominated debt); for others it's zero (no buffer).
-            let repay_buffer = if repayment_token.decimals() == 18 {
-                Nat::from(REPAY_BUFFER_WEI)
-            } else {
-                Nat::from(0u8)
-            };
+            // Add only explicitly configured repay buffers; unspecified assets get no bump.
+            let repay_buffer = repay_buffer_native_units(&repayment_token.symbol())
+                .map(Nat::from)
+                .unwrap_or_else(|| Nat::from(0u8));
             // Target = full debt plus the buffer, but never more than what we can actually spend.
             let desired_repay = (debt_position.debt_amount.clone() + repay_buffer).min(max_balance.clone());
             // Only bump up the repay amount; never reduce what the estimator already chose.
@@ -890,13 +886,13 @@ mod tests {
         cfg.expect_get_lending_canister()
             .return_const(p("mxzaz-hqaaa-aaaar-qaada-cai"));
 
-        // Collateral service: repay 1_000, receive 2_000 collateral
+        // Collateral service: repay 1_000, receive 4_000 collateral
         let mut collateral = MockCollateralServiceTrait::new();
         collateral
             .expect_calculate_liquidation_amounts()
             .returning(|_max_balance, _debt_pos, _coll_pos, _user| {
                 Ok(LiquidationEstimation {
-                    received_collateral: Nat::from(2_000u64),
+                    received_collateral: Nat::from(4_000u64),
                     repaid_debt: Nat::from(1_000u64),
                     ref_price: Nat::from(0u8),
                     debt_price: Nat::from(0u8),
@@ -940,13 +936,14 @@ mod tests {
 
         let pool = p("mxzaz-hqaaa-aaaar-qaada-cai");
         let borrower = p("user-valid");
-        let pos = mk_position(pool, borrower, ledger, 1_000, 2_000, Assets::USDC);
+        let pos = mk_position(pool, borrower, ledger, 1_000, 4_000, Assets::USDC);
         let user = mk_user(vec![pos.clone()], 1_000, 900);
 
         let res = strategy.process(&vec![user]).await.unwrap();
         assert_eq!(res.len(), 1);
         let req = &res[0];
         assert_eq!(req.liquidation.borrower, pos.account);
+        assert_eq!(req.liquidation.debt_amount, Nat::from(2_000u64));
         assert!(req.swap_args.is_none(), "no swap expected when assets match");
         assert_eq!(req.min_collateral_amount, Nat::from(0u8));
     }
