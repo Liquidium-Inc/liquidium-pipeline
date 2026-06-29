@@ -117,14 +117,17 @@ LENDING_CANISTER=nja4y-2yaaa-aaaae-qddxa-cai
 BRIDGE_CKETH_MINTER_CANISTER=sv3dd-oaaaa-aaaar-qacoa-cai
 
 # EVM Blockchain
-EVM_RPC_URL=https://arb1.arbitrum.io/rpc
+EVM_RPC_URL=https://ethereum-rpc.example
+MEXC_DEFAULT_ROUTE_CHAIN_ID=1
+# Optional Arbitrum override for an Arbitrum EVM_RPC_URL:
+# MEXC_ROUTE_CHAIN_MAP=ETH=42161,ETHEREUM=42161,ARB=42161,ARBITRUM=42161
 
 # Identity
 MNEMONIC_FILE=~/.liquidium-pipeline/wallets/key
 
 # Assets (comma-separated chain:address:symbol entries)
-DEBT_ASSETS=icp:mxzaz-hqaaa-aaaar-qaada-cai:ckBTC,icp:cngnf-vqaaa-aaaar-qag4q-cai:ckUSDT,icp:xevnm-gaaaa-aaaar-qafnq-cai:ckUSDC,icp:ryjl3-tyaaa-aaaaa-aaaba-cai:ICP
-COLLATERAL_ASSETS=icp:mxzaz-hqaaa-aaaar-qaada-cai:ckBTC,icp:cngnf-vqaaa-aaaar-qag4q-cai:ckUSDT,icp:xevnm-gaaaa-aaaar-qafnq-cai:ckUSDC,icp:ryjl3-tyaaa-aaaaa-aaaba-cai:ICP
+DEBT_ASSETS=icp:mxzaz-hqaaa-aaaar-qaada-cai:ckBTC,icp:cngnf-vqaaa-aaaar-qag4q-cai:ckUSDT,icp:xevnm-gaaaa-aaaar-qafnq-cai:ckUSDC,icp:ss2fx-dyaaa-aaaar-qacoq-cai:ckETH,icp:ryjl3-tyaaa-aaaaa-aaaba-cai:ICP
+COLLATERAL_ASSETS=icp:mxzaz-hqaaa-aaaar-qaada-cai:ckBTC,icp:cngnf-vqaaa-aaaar-qag4q-cai:ckUSDT,icp:xevnm-gaaaa-aaaar-qafnq-cai:ckUSDC,icp:ss2fx-dyaaa-aaaar-qacoq-cai:ckETH,icp:ryjl3-tyaaa-aaaaa-aaaba-cai:ICP
 
 # Optional: only scan specific borrower principals (comma-separated). Set to "none" to disable.
 OPPORTUNITY_ACCOUNT_FILTER=principal1,principal2
@@ -185,7 +188,7 @@ CEX_DELAY_BUFFER_BPS=75
 # Estimated route fee haircut applied to projected edge (bps)
 CEX_ROUTE_FEE_BPS=25
 # Optional CSV market universe for MEXC hop discovery (`BASE_QUOTE` format)
-CEX_MEXC_AVAILABLE_PAIRS=CKBTC_BTC,BTC_USDC,USDC_USDT,CKUSDT_USDT,ICP_USDT,ICP_USDC
+CEX_MEXC_AVAILABLE_PAIRS=CKBTC_BTC,BTC_USDC,BTC_USDT,USDC_USDT,CKUSDT_USDT,ICP_USDT,ICP_USDC,ETH_USDT
 # Max intermediate hops when searching configured pairs (0 disables hop fallback)
 CEX_MEXC_MAX_HOPS=2
 # Reserved (currently unused while only SWAPPER=cex is supported)
@@ -354,11 +357,11 @@ Mnemonic
         └── Bridge ICP account             owner-only (subaccount = None)
 ```
 
-Current bridge sweeper wiring:
-- Forward source: derived `bridge_evm_address` (`USDC@ETH -> ckUSDC`)
-- Reverse source: derived bridge ICP owner account (`ckUSDC@ICP -> USDC@ETH`)
+Current bridge/finalizer wiring:
+- Forward source: derived `bridge_evm_address` (`ETH@ETH -> ckETH`, `USDC@ETH -> ckUSDC`)
+- Reverse source: derived bridge ICP owner account (`ckETH@ICP -> ETH@ETH`, `ckUSDC@ICP -> USDC@ETH`)
 - Destination: resolved per request in code (forward default: liquidator ICP principal; reverse default: liquidator EVM address)
-- Routes: loaded from a code-level bridge catalog (`ckETH` ERC-20 routes); submissions are serialized per sweeper loop.
+- Routes: loaded from a code-level bridge catalog (`ckETH` native and ERC-20 routes); submissions are serialized per bridge source.
 - Design details: `docs/bridge-architecture.md`
 
 ### Generate New Identities
@@ -567,6 +570,25 @@ Behavior:
 - Waits for bridge source funding before submit, then waits for MEXC USDC balance credit.
 - Swaps credited USDC to CKBTC using production route logic.
 - Default withdraw destination is the liquidator principal; override with `--withdraw-address`.
+
+### MEXC Smoke ckETH -> USDC -> ckUSDC
+
+Dry-run preflight (no side effects):
+
+```bash
+liquidator mexc-smoke-bridge-swap-withdraw-cketh --amount-cketh 0.05
+```
+
+Live execution (bridge `ckETH@ICP -> ETH@ETH` to MEXC deposit, swap `ETH -> USDC`, withdraw to bridge source, then bridge `USDC@ETH -> ckUSDC@ICP`):
+
+```bash
+liquidator mexc-smoke-bridge-swap-withdraw-cketh --amount-cketh 0.05 --execute
+```
+
+Behavior:
+- Uses the production MEXC finalizer bridge/trade/withdraw path and route discovery.
+- Uses configured `CEX_MEXC_AVAILABLE_PAIRS` for market routing.
+- Final bridged asset is `ckUSDC@ICP` to the liquidator principal account.
 
 ### Withdraw Funds
 

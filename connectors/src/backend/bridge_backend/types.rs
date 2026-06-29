@@ -32,6 +32,8 @@ impl BridgeDestination {
 pub enum BridgeRouteKind {
     CkEthErc20Forward,
     CkEthErc20Reverse,
+    EthToCkEth,
+    CkEthToEth,
     BtcToCkBtc,
     CkBtcToBtc,
 }
@@ -65,6 +67,16 @@ pub struct BridgeRequest {
     pub target_asset: String,
     pub destination: BridgeDestination,
     pub amount: f64,
+    /// Optional exact provider fee quote, in source-native base units, captured during
+    /// preflight sizing and reused at submit time to avoid quote drift.
+    pub provider_fee_budget_native_units: Option<Nat>,
+}
+
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct BridgeFeeBudget {
+    pub source_fee_budget: f64,
+    pub destination_fee_budget: f64,
+    pub provider_fee_budget_native_units: Option<Nat>,
 }
 
 /// Provider submission handle returned after a bridge transaction is sent.
@@ -90,6 +102,37 @@ pub trait BridgeBackend: Send + Sync {
     /// Returns a human-readable source balance for a route input asset/account.
     async fn get_source_balance(&self, asset: &str, chain: &str, address: &str) -> Result<f64, String>;
 
+    /// Returns the source-asset amount that must remain on the source account
+    /// in addition to the submitted bridge amount.
+    async fn get_source_fee_budget(&self, asset: &str, chain: &str, target_asset: &str) -> Result<f64, String> {
+        let _ = (asset, chain, target_asset);
+        Ok(0.0)
+    }
+
+    /// Returns the target-asset amount expected to be deducted before the bridge
+    /// credit arrives at the destination.
+    async fn get_destination_fee_budget(&self, asset: &str, chain: &str, target_asset: &str) -> Result<f64, String> {
+        let _ = (asset, chain, target_asset);
+        Ok(0.0)
+    }
+
+    /// Returns source and destination fee budgets from one coherent quote when
+    /// the backend can share an underlying provider quote across both values.
+    async fn get_fee_budget(&self, asset: &str, chain: &str, target_asset: &str) -> Result<BridgeFeeBudget, String> {
+        Ok(BridgeFeeBudget {
+            source_fee_budget: self.get_source_fee_budget(asset, chain, target_asset).await?,
+            destination_fee_budget: self.get_destination_fee_budget(asset, chain, target_asset).await?,
+            provider_fee_budget_native_units: None,
+        })
+    }
+
+    /// Returns the minimum bridge amount for a route input. Routes without a
+    /// provider-enforced floor return zero.
+    async fn get_minimum_bridge_amount(&self, asset: &str, chain: &str, target_asset: &str) -> Result<f64, String> {
+        let _ = (asset, chain, target_asset);
+        Ok(0.0)
+    }
+
     /// Submits a bridge transfer for a supported route and returns a tracking handle.
     ///
     /// The backend validates route metadata, source/destination constraints, and amount
@@ -114,9 +157,13 @@ pub(super) struct CkEthMinterInfo {
     #[serde(default)]
     pub deposit_with_subaccount_helper_contract_address: Option<String>,
     #[serde(default)]
+    pub eth_helper_contract_address: Option<String>,
+    #[serde(default)]
     pub erc20_helper_contract_address: Option<String>,
     #[serde(default)]
     pub cketh_ledger_id: Option<Principal>,
+    #[serde(default)]
+    pub minimum_withdrawal_amount: Option<Nat>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -149,9 +196,21 @@ pub(super) struct WithdrawErc20Arg {
 }
 
 #[derive(CandidType, Deserialize, Clone, Debug)]
+pub(super) struct WithdrawalArg {
+    pub amount: Nat,
+    pub recipient: String,
+    pub from_subaccount: Option<Vec<u8>>,
+}
+
+#[derive(CandidType, Deserialize, Clone, Debug)]
 pub(super) struct RetrieveErc20Request {
     pub ckerc20_block_index: Nat,
     pub cketh_block_index: Nat,
+}
+
+#[derive(CandidType, Deserialize, Clone, Debug)]
+pub(super) struct RetrieveEthRequest {
+    pub block_index: Nat,
 }
 
 #[derive(CandidType, Deserialize, Clone, Debug)]
@@ -194,7 +253,23 @@ pub(super) enum WithdrawErc20Error {
 }
 
 #[derive(CandidType, Deserialize, Clone, Debug)]
+pub(super) enum WithdrawalError {
+    AmountTooLow { min_withdrawal_amount: Nat },
+    InsufficientFunds { balance: Nat },
+    InsufficientAllowance { allowance: Nat },
+    TemporarilyUnavailable(String),
+    RecipientAddressBlocked { address: String },
+    GenericError { error_code: Nat, message: String },
+}
+
+#[derive(CandidType, Deserialize, Clone, Debug)]
 pub(super) enum WithdrawErc20Ret {
     Ok(RetrieveErc20Request),
     Err(WithdrawErc20Error),
+}
+
+#[derive(CandidType, Deserialize, Clone, Debug)]
+pub(super) enum WithdrawalRet {
+    Ok(RetrieveEthRequest),
+    Err(WithdrawalError),
 }

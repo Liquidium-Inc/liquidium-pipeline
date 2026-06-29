@@ -43,7 +43,7 @@ where
     A: PipelineAgent,
 {
     async fn process(&self, supported_assets: &'a Vec<String>) -> Result<Vec<LiquidatebleUser>, String> {
-        let max_results: u64 = 500; // stop once we find this many risky users
+        let max_results: u64 = 500; // stop once we find this many supported risky users
         let scan_limit: u64 = 100; // how many accounts to scan per call
 
         let mut cursor: Option<Principal> = None;
@@ -53,7 +53,7 @@ where
             let args = Encode!(&cursor, &scan_limit, &max_results).map_err(|e| e.to_string())?;
 
             let ScanResult {
-                users: mut page_users,
+                users: page_users,
                 next_cursor,
                 scanned,
                 ..
@@ -63,34 +63,35 @@ where
                 .await
                 .map_err(|e| format!("Agent query error: {e}"))?;
 
-            opportunities.append(&mut page_users);
+            for mut user in page_users {
+                user.positions
+                    .retain(|item| Self::is_supported_position(item, supported_assets));
 
-            if opportunities.len() as u64 >= max_results {
-                break;
+                if user.positions.is_empty() {
+                    continue;
+                }
+
+                if !self.account_filter.is_empty() && !self.account_filter.contains(&user.account) {
+                    continue;
+                }
+
+                opportunities.push(user);
+
+                if opportunities.len() as u64 >= max_results {
+                    break;
+                }
             }
 
             // End of keyspace or scan made no progress.
-            if next_cursor.is_none() || scanned == 0 || next_cursor == cursor {
+            if opportunities.len() as u64 >= max_results
+                || next_cursor.is_none()
+                || scanned == 0
+                || next_cursor == cursor
+            {
                 break;
             }
             cursor = next_cursor;
         }
-
-        opportunities.iter_mut().for_each(|user| {
-            user.positions = user
-                .positions
-                .iter()
-                .filter(|item| Self::is_supported_position(item, supported_assets))
-                .cloned()
-                .collect();
-        });
-
-        let opportunities: Vec<LiquidatebleUser> = opportunities
-            .iter()
-            .filter(|item| !item.positions.is_empty())
-            .filter(|item| self.account_filter.is_empty() || self.account_filter.contains(&item.account))
-            .cloned()
-            .collect();
 
         Ok(opportunities)
     }
@@ -104,6 +105,7 @@ mod tests {
     use liquidium_pipeline_core::types::protocol_types::{
         AssetType, Assets, LiquidateblePosition, LiquidatebleUser, ScanResult,
     };
+    use std::{collections::VecDeque, sync::Mutex};
 
     #[tokio::test]
     async fn opportunity_finder_filters_supported_ck_assets_by_principal() {
@@ -366,5 +368,84 @@ mod tests {
 
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].account, target_account);
+    }
+
+    #[tokio::test]
+    async fn opportunity_finder_caps_after_supported_filtering() {
+        let canister_id = Principal::anonymous();
+        let supported_principal = Principal::from_text("mxzaz-hqaaa-aaaar-qaada-cai").unwrap();
+        let unsupported_principal = Principal::from_text("ryjl3-tyaaa-aaaaa-aaaba-cai").unwrap();
+
+        let unsupported_pos = LiquidateblePosition {
+            pool_id: Principal::anonymous(),
+            debt_amount: Nat::from(1_000u64),
+            collateral_amount: Nat::from(2_000u64),
+            asset: Assets::BTC,
+            asset_type: AssetType::CkAsset(unsupported_principal),
+            account: Principal::anonymous(),
+            liquidation_bonus: 60,
+            liquidation_threshold: 8500,
+            protocol_fee: 200,
+        };
+
+        let supported_pos = LiquidateblePosition {
+            asset_type: AssetType::CkAsset(supported_principal),
+            ..unsupported_pos.clone()
+        };
+
+        let unsupported_user = LiquidatebleUser {
+            account: Principal::anonymous(),
+            health_factor: Nat::from(1u64),
+            weighted_liquidation_threshold: Nat::from(8500u64),
+            total_debt: Nat::from(1_000u64),
+            positions: vec![unsupported_pos],
+        };
+
+        let supported_user = LiquidatebleUser {
+            positions: vec![supported_pos],
+            ..unsupported_user.clone()
+        };
+
+        let mut pages = VecDeque::new();
+        for i in 1..=5 {
+            pages.push_back(ScanResult {
+                users: vec![unsupported_user.clone(); 100],
+                next_cursor: Some(Principal::from_slice(&[i; 29])),
+                scanned: 100,
+            });
+        }
+        pages.push_back(ScanResult {
+            users: vec![supported_user],
+            next_cursor: None,
+            scanned: 1,
+        });
+
+        let pages = Arc::new(Mutex::new(pages));
+        let pages_for_mock = pages.clone();
+
+        let mut agent = MockPipelineAgent::new();
+        agent
+            .expect_call_query::<ScanResult>()
+            .times(6)
+            .returning(move |_, _, _| {
+                pages_for_mock
+                    .lock()
+                    .unwrap()
+                    .pop_front()
+                    .ok_or_else(|| "unexpected extra scan".to_string())
+            });
+
+        let finder = OpportunityFinder::new(Arc::new(agent), canister_id, vec![]);
+        let supported_assets = vec![supported_principal.to_string()];
+
+        let result = finder.process(&supported_assets).await.unwrap();
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].positions.len(), 1);
+        assert_eq!(
+            result[0].positions[0].asset_type,
+            AssetType::CkAsset(supported_principal)
+        );
+        assert!(pages.lock().unwrap().is_empty());
     }
 }

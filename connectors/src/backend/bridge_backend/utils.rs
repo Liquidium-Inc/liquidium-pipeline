@@ -16,8 +16,10 @@ pub fn resolve_cketh_forward_route_by_source(
     source_chain: &str,
 ) -> Option<&'static BridgeRouteSpec> {
     BRIDGE_ROUTE_CATALOG.iter().find(|route| {
-        route.route_kind == BridgeRouteKind::CkEthErc20Forward
-            && source_asset.eq_ignore_ascii_case(route.source_asset)
+        matches!(
+            route.route_kind,
+            BridgeRouteKind::CkEthErc20Forward | BridgeRouteKind::EthToCkEth
+        ) && source_asset.eq_ignore_ascii_case(route.source_asset)
             && source_chain.eq_ignore_ascii_case(route.source_chain)
     })
 }
@@ -27,22 +29,32 @@ pub fn resolve_cketh_reverse_route_by_source(
     source_chain: &str,
 ) -> Option<&'static BridgeRouteSpec> {
     BRIDGE_ROUTE_CATALOG.iter().find(|route| {
-        route.route_kind == BridgeRouteKind::CkEthErc20Reverse
-            && source_asset.eq_ignore_ascii_case(route.source_asset)
+        matches!(
+            route.route_kind,
+            BridgeRouteKind::CkEthErc20Reverse | BridgeRouteKind::CkEthToEth
+        ) && source_asset.eq_ignore_ascii_case(route.source_asset)
             && source_chain.eq_ignore_ascii_case(route.source_chain)
     })
 }
 
 pub fn resolve_cketh_forward_route_by_target(target_asset: &str) -> Option<&'static BridgeRouteSpec> {
     BRIDGE_ROUTE_CATALOG.iter().find(|route| {
-        route.route_kind == BridgeRouteKind::CkEthErc20Forward && target_asset.eq_ignore_ascii_case(route.target_asset)
+        matches!(
+            route.route_kind,
+            BridgeRouteKind::CkEthErc20Forward | BridgeRouteKind::EthToCkEth
+        ) && target_asset.eq_ignore_ascii_case(route.target_asset)
     })
 }
 
 pub fn cketh_forward_routes() -> Vec<BridgeSweepRoute> {
     BRIDGE_ROUTE_CATALOG
         .iter()
-        .filter(|route| route.route_kind == BridgeRouteKind::CkEthErc20Forward)
+        .filter(|route| {
+            matches!(
+                route.route_kind,
+                BridgeRouteKind::CkEthErc20Forward | BridgeRouteKind::EthToCkEth
+            )
+        })
         .map(|route| BridgeSweepRoute {
             source_asset: route.source_asset.to_string(),
             source_chain: route.source_chain.to_string(),
@@ -55,7 +67,12 @@ pub fn cketh_forward_routes() -> Vec<BridgeSweepRoute> {
 pub fn cketh_reverse_routes() -> Vec<BridgeSweepRoute> {
     BRIDGE_ROUTE_CATALOG
         .iter()
-        .filter(|route| route.route_kind == BridgeRouteKind::CkEthErc20Reverse)
+        .filter(|route| {
+            matches!(
+                route.route_kind,
+                BridgeRouteKind::CkEthErc20Reverse | BridgeRouteKind::CkEthToEth
+            )
+        })
         .map(|route| BridgeSweepRoute {
             source_asset: route.source_asset.to_string(),
             source_chain: route.source_chain.to_string(),
@@ -118,6 +135,17 @@ mod tests {
         assert_eq!(ckusdc.route_kind, BridgeRouteKind::CkEthErc20Reverse);
         assert_eq!(ckusdc.ckerc20_ledger_id, Some("xevnm-gaaaa-aaaar-qafnq-cai"));
 
+        let eth = resolve_route("ETH", "ETH", "ckETH").expect("ETH route");
+        assert_eq!(eth.destination_kind, BridgeDestinationKind::IcpAccount);
+        assert_eq!(eth.route_kind, BridgeRouteKind::EthToCkEth);
+        assert_eq!(eth.evm_token_address, None);
+        assert_eq!(eth.ckerc20_ledger_id, Some("ss2fx-dyaaa-aaaar-qacoq-cai"));
+
+        let cketh = resolve_route("ckETH", "ICP", "ETH").expect("ckETH route");
+        assert_eq!(cketh.destination_kind, BridgeDestinationKind::EvmAddress);
+        assert_eq!(cketh.route_kind, BridgeRouteKind::CkEthToEth);
+        assert_eq!(cketh.ckerc20_ledger_id, Some("ss2fx-dyaaa-aaaar-qacoq-cai"));
+
         let btc = resolve_route("BTC", "BTC", "ckBTC").expect("BTC route");
         assert_eq!(btc.route_kind, BridgeRouteKind::BtcToCkBtc);
         assert_eq!(btc.evm_token_address, None);
@@ -133,6 +161,8 @@ mod tests {
     fn route_resolution_is_case_insensitive() {
         assert!(resolve_route("usdc", "eth", "ckusdc").is_some());
         assert!(resolve_route("ckusdc", "icp", "usdc").is_some());
+        assert!(resolve_route("eth", "eth", "cketh").is_some());
+        assert!(resolve_route("cketh", "icp", "eth").is_some());
         assert!(resolve_route("CKBTC", "icp", "btc").is_some());
         assert!(resolve_route("USDT", "ETH", "ckUSDT").is_none());
     }
@@ -149,23 +179,37 @@ mod tests {
     #[test]
     fn cketh_forward_routes_contains_usdc_entry() {
         let routes = cketh_forward_routes();
-        assert_eq!(routes.len(), 1);
-        let route = &routes[0];
-        assert_eq!(route.source_asset, "USDC");
-        assert_eq!(route.source_chain, "ETH");
-        assert_eq!(route.target_asset, "ckUSDC");
-        assert_eq!(route.min_sweep_amount, 0.0);
+        assert_eq!(routes.len(), 2);
+        assert!(routes.iter().any(|route| {
+            route.source_asset == "USDC"
+                && route.source_chain == "ETH"
+                && route.target_asset == "ckUSDC"
+                && route.min_sweep_amount == 0.0
+        }));
+        assert!(routes.iter().any(|route| {
+            route.source_asset == "ETH"
+                && route.source_chain == "ETH"
+                && route.target_asset == "ckETH"
+                && route.min_sweep_amount == 0.0
+        }));
     }
 
     #[test]
     fn cketh_reverse_routes_contains_ckusdc_entry() {
         let routes = cketh_reverse_routes();
-        assert_eq!(routes.len(), 1);
-        let route = &routes[0];
-        assert_eq!(route.source_asset, "ckUSDC");
-        assert_eq!(route.source_chain, "ICP");
-        assert_eq!(route.target_asset, "USDC");
-        assert_eq!(route.min_sweep_amount, 0.0);
+        assert_eq!(routes.len(), 2);
+        assert!(routes.iter().any(|route| {
+            route.source_asset == "ckUSDC"
+                && route.source_chain == "ICP"
+                && route.target_asset == "USDC"
+                && route.min_sweep_amount == 0.0
+        }));
+        assert!(routes.iter().any(|route| {
+            route.source_asset == "ckETH"
+                && route.source_chain == "ICP"
+                && route.target_asset == "ETH"
+                && route.min_sweep_amount == 0.0
+        }));
     }
 
     #[test]

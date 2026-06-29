@@ -28,6 +28,7 @@ pub enum Assets {
     SOL,
     USDC,
     USDT,
+    ETH,
 }
 
 impl fmt::Display for Assets {
@@ -44,6 +45,7 @@ impl Asset for Assets {
             Assets::SOL => 18,
             Assets::USDC => 6,
             Assets::USDT => 6,
+            Assets::ETH => 18,
         }
     }
 
@@ -54,6 +56,7 @@ impl Asset for Assets {
             Assets::SOL => "SOL".to_string(),
             Assets::USDC => "USDC".to_string(),
             Assets::USDT => "USDT".to_string(),
+            Assets::ETH => "ETH".to_string(),
         }
     }
 }

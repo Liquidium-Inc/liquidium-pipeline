@@ -166,5 +166,31 @@ pub(super) fn mexc_special_trade_legs(deposit_symbol: &str, withdraw_symbol: &st
         ]);
     }
 
+    if deposit == "ETH" && withdraw == "USDC" {
+        return Some(vec![
+            TradeLeg {
+                market: "ETH_USDT".to_string(),
+                side: "sell".to_string(),
+            },
+            TradeLeg {
+                market: "USDC_USDT".to_string(),
+                side: "buy".to_string(),
+            },
+        ]);
+    }
+
+    if deposit == "USDC" && withdraw == "ETH" {
+        return Some(vec![
+            TradeLeg {
+                market: "USDC_USDT".to_string(),
+                side: "sell".to_string(),
+            },
+            TradeLeg {
+                market: "ETH_USDT".to_string(),
+                side: "buy".to_string(),
+            },
+        ]);
+    }
+
     None
 }

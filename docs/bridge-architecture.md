@@ -1,4 +1,4 @@
-# Bridge Architecture (ckETH ERC-20)
+# Bridge Architecture (ckETH Minter)
 
 This is a quick guide to the new bridge design.
 
@@ -7,14 +7,15 @@ This is a quick guide to the new bridge design.
 Before:
 - Bridge flow was hardcoded for `USDC@ETH -> ckUSDC`.
 - Backend was `CkUsdcBridgeBackend` and required `BRIDGE_USDC_ETH_TOKEN_ADDRESS`.
-- Sweeper handled one fixed route.
 
 Now:
 - Bridge flow is catalog-driven.
-- Backend is generic for ckETH ERC-20 routes: `CkErc20BridgeBackend`.
-- Startup runs two serial sweepers:
-  - forward: `USDC@ETH -> ckUSDC`
-  - reverse: `ckUSDC@ICP -> USDC@ETH`
+- Backend supports ckETH minter native and ERC-20 routes: `CkErc20BridgeBackend`.
+- Supported catalog routes include:
+  - native forward: `ETH@ETH -> ckETH`
+  - native reverse: `ckETH@ICP -> ETH@ETH`
+  - ERC-20 forward: `USDC@ETH -> ckUSDC`
+  - ERC-20 reverse: `ckUSDC@ICP -> USDC@ETH`
 - Token/ledger metadata comes from route catalog constants (not runtime env).
 - Bridge ICP ownership is principal-only (`subaccount = None`).
 
@@ -25,6 +26,8 @@ Defined in `connectors/src/backend/bridge_backend/mod.rs`:
 - `BridgeRouteKind`
   - `CkEthErc20Forward`
   - `CkEthErc20Reverse`
+  - `EthToCkEth`
+  - `CkEthToEth`
   - `BtcToCkBtc`
   - `CkBtcToBtc`
 
@@ -39,7 +42,7 @@ Defined in `connectors/src/backend/bridge_backend/mod.rs`:
   - `min_sweep_amount`
 
 - `BridgeSweepRoute`
-  - Runtime sweeper input: source/target + min threshold.
+  - Runtime bridge route input: source/target + min threshold.
 
 - Helpers
   - `resolve_route(source_asset, source_chain, target_asset)`
@@ -48,44 +51,29 @@ Defined in `connectors/src/backend/bridge_backend/mod.rs`:
   - `cketh_forward_routes()`
   - `cketh_reverse_routes()`
 
-## Generic backend behavior
+## Backend behavior
 
 `connectors/src/backend/bridge_backend/ckerc20_bridge.rs`
 
-- Resolves route + token from catalog.
+- Resolves route + token/ledger metadata from catalog.
 - Validates destination type using route spec.
 - Enforces route-specific source invariants:
   - forward: request `source_address` must match EVM signer address.
   - reverse: request source ICP account owner must match bridge ICP owner principal and use no subaccount.
 - Uses ckETH minter helper contract discovery (`get_minter_info`) as before.
-- Forward submit: approves token and calls helper deposit method (`depositErc20` or native `deposit`).
-- Reverse submit: reads fee quote, preflights bridge ckETH fee balance, approves ckUSDC + ckETH on ledgers, calls minter `withdraw_erc20`.
-
-## Multi-asset sweeper behavior
-
-`pipeline/src/stages/bridge_sweeper.rs`
-
-- Each sweeper accepts `routes: Vec<BridgeSweepRoute>`.
-- Each tick:
-  - loops routes in order,
-  - reads source balance per route,
-  - applies `min_sweep_amount`,
-  - resolves destination dynamically,
-  - submits request.
-- Routes are processed serially in one task (no parallel submits), so signer ordering remains deterministic.
-- Per-route read/submit failures are logged and do not stop other routes in the same tick.
+- Native forward submit: calls `depositEth(bytes32, bytes32)` when available, or legacy `deposit(bytes32)` for owner-only destinations.
+- ERC-20 forward submit: approves token and calls helper deposit method (`depositErc20` or native `deposit`).
+- Native reverse submit: preflights ckETH amount + approve fee, approves ckETH, calls minter `withdraw_eth`.
+- ERC-20 reverse submit: reads fee quote, preflights bridge ckETH fee balance, approves ckERC20 + ckETH, calls minter `withdraw_erc20`.
 
 ## Startup wiring
 
 `pipeline/src/commands/liquidation_loop.rs`
 
 - Builds one `CkErc20BridgeBackend`.
-- Loads forward routes via `cketh_forward_routes()`.
-- Loads reverse routes via `cketh_reverse_routes()`.
-- Creates two `BridgeSweeper` instances:
-  - forward source: bridge EVM address, destination resolver: liquidator ICP account.
-  - reverse source: bridge ICP owner account text, destination resolver: EVM address (default: liquidator EVM).
-- Starts both tasks and logs each route count.
+- Validates configured forward EVM routes use the single Ethereum RPC provider.
+- Wires the backend into the MEXC finalizer for per-liquidation bridge submissions.
+- CEX bridge submissions are serialized by source via `bridge_submit_lock`.
 
 ## Config changes
 
@@ -104,4 +92,4 @@ Add one `BridgeRouteSpec` entry in the catalog with:
 - `evm_token_address` and/or `ckerc20_ledger_id` metadata
 - desired `min_sweep_amount`
 
-No sweeper/backend refactor is needed after that.
+No planner/backend refactor is needed after that for standard ckERC20 routes.

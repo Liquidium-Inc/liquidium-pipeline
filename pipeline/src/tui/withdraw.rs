@@ -12,6 +12,9 @@ use tokio::sync::mpsc;
 
 use crate::config::ConfigTrait;
 use crate::swappers::mexc::mexc_adapter::MexcClient;
+use liquidium_pipeline_connectors::backend::bridge_backend::{
+    BridgeDestinationKind, resolve_cketh_reverse_route_by_source,
+};
 use liquidium_pipeline_connectors::backend::cex_backend::CexBackend;
 use liquidium_pipeline_core::account::model::ChainAccount;
 use liquidium_pipeline_core::tokens::asset_id::AssetId;
@@ -96,6 +99,20 @@ pub(super) fn deposit_network_for_asset(asset: &AssetId) -> String {
     }
 }
 
+pub(super) fn mexc_deposit_lookup_for_asset(asset: &AssetId) -> (String, String) {
+    let source_network = deposit_network_for_asset(asset);
+    if let Some(route) = resolve_cketh_reverse_route_by_source(&asset.symbol, &source_network) {
+        let network = match route.destination_kind {
+            BridgeDestinationKind::IcpAccount => "ICP",
+            BridgeDestinationKind::EvmAddress => "ETH",
+            BridgeDestinationKind::BtcAddress => "BTC",
+        };
+        return (route.target_asset.to_string(), network.to_string());
+    }
+
+    (asset.symbol.clone(), source_network)
+}
+
 fn parse_evm_destination_address(value: &str) -> Result<String, String> {
     let addr = EvmAddress::from_str(value).map_err(|_| "invalid destination EVM address".to_string())?;
     Ok(addr.to_string())
@@ -117,6 +134,7 @@ fn request_mexc_deposit_address(
     app: &mut App,
     ui_tx: &mpsc::UnboundedSender<UiEvent>,
     asset: AssetId,
+    mexc_asset: String,
     network: String,
     force: bool,
     log: bool,
@@ -140,7 +158,14 @@ fn request_mexc_deposit_address(
     app.deposit.network = Some(network.clone());
 
     if log {
-        app.push_log(format!("deposit: fetching {} on {}", asset.symbol, network));
+        if asset.symbol.eq_ignore_ascii_case(&mexc_asset) {
+            app.push_log(format!("deposit: fetching {} on {}", asset.symbol, network));
+        } else {
+            app.push_log(format!(
+                "deposit: fetching {} via {} on {}",
+                asset.symbol, mexc_asset, network
+            ));
+        }
     }
 
     let ui_tx = ui_tx.clone();
@@ -153,7 +178,7 @@ fn request_mexc_deposit_address(
             }
         };
 
-        let res = client.get_deposit_address(&asset.symbol, &network).await;
+        let res = client.get_deposit_address(&mexc_asset, &network).await;
         let _ = ui_tx.send(UiEvent::Deposit(res));
     });
 }
@@ -162,8 +187,8 @@ pub(super) fn ensure_withdraw_deposit_address(app: &mut App, ui_tx: &mpsc::Unbou
     let Some(asset) = app.withdraw_assets.get(app.withdraw.asset_idx).cloned() else {
         return;
     };
-    let network = deposit_network_for_asset(&asset);
-    request_mexc_deposit_address(app, ui_tx, asset, network, false, false);
+    let (mexc_asset, network) = mexc_deposit_lookup_for_asset(&asset);
+    request_mexc_deposit_address(app, ui_tx, asset, mexc_asset, network, false, false);
 }
 
 pub(super) fn refresh_withdraw_deposit_address(app: &mut App, ui_tx: &mpsc::UnboundedSender<UiEvent>) {
@@ -171,8 +196,8 @@ pub(super) fn refresh_withdraw_deposit_address(app: &mut App, ui_tx: &mpsc::Unbo
         app.push_log("deposit: no withdraw asset selected");
         return;
     };
-    let network = deposit_network_for_asset(&asset);
-    request_mexc_deposit_address(app, ui_tx, asset, network, true, true);
+    let (mexc_asset, network) = mexc_deposit_lookup_for_asset(&asset);
+    request_mexc_deposit_address(app, ui_tx, asset, mexc_asset, network, true, true);
 }
 
 pub(super) fn open_withdraw_panel(app: &mut App, ui_tx: &mpsc::UnboundedSender<UiEvent>) {
@@ -206,10 +231,10 @@ pub(super) fn open_deposit_panel(app: &mut App, ui_tx: &mpsc::UnboundedSender<Ui
     };
 
     let asset = selected.asset.clone();
-    let network = deposit_network_for_asset(&asset);
+    let (mexc_asset, network) = mexc_deposit_lookup_for_asset(&asset);
 
     app.balances_panel = BalancesPanel::Deposit;
-    request_mexc_deposit_address(app, ui_tx, asset, network, true, true);
+    request_mexc_deposit_address(app, ui_tx, asset, mexc_asset, network, true, true);
 }
 
 pub(super) fn submit_withdraw(
@@ -425,7 +450,12 @@ mod tests {
 
     use candid::Nat;
 
-    use super::{EVM_NATIVE_GAS_BUFFER_WEI, compute_evm_withdraw_amount_native, compute_withdraw_amount_native};
+    use liquidium_pipeline_core::tokens::asset_id::AssetId;
+
+    use super::{
+        EVM_NATIVE_GAS_BUFFER_WEI, compute_evm_withdraw_amount_native, compute_withdraw_amount_native,
+        mexc_deposit_lookup_for_asset,
+    };
 
     #[test]
     fn all_subtracts_fee_correctly() {
@@ -460,6 +490,39 @@ mod tests {
 
         let got = compute_withdraw_amount_native(Nat::from(0u8), Nat::from(0u8), "1.23", 2).expect("ok");
         assert_eq!(got, Nat::from(123u32));
+    }
+
+    #[test]
+    fn mexc_deposit_lookup_maps_cketh_to_eth_network() {
+        let asset = AssetId {
+            chain: "icp".to_string(),
+            address: "ss2fx-dyaaa-aaaar-qacoq-cai".to_string(),
+            symbol: "ckETH".to_string(),
+        };
+
+        assert_eq!(mexc_deposit_lookup_for_asset(&asset), ("ETH".to_string(), "ETH".to_string()));
+    }
+
+    #[test]
+    fn mexc_deposit_lookup_maps_ckusdc_to_usdc_eth_network() {
+        let asset = AssetId {
+            chain: "icp".to_string(),
+            address: "xevnm-gaaaa-aaaar-qafnq-cai".to_string(),
+            symbol: "ckUSDC".to_string(),
+        };
+
+        assert_eq!(mexc_deposit_lookup_for_asset(&asset), ("USDC".to_string(), "ETH".to_string()));
+    }
+
+    #[test]
+    fn mexc_deposit_lookup_keeps_direct_assets_unchanged() {
+        let asset = AssetId {
+            chain: "icp".to_string(),
+            address: "ryjl3-tyaaa-aaaaa-aaaba-cai".to_string(),
+            symbol: "ICP".to_string(),
+        };
+
+        assert_eq!(mexc_deposit_lookup_for_asset(&asset), ("ICP".to_string(), "ICP".to_string()));
     }
 
     #[test]

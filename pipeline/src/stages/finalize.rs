@@ -17,6 +17,7 @@ use crate::wal::{
     decode_receipt_wrapper, encode_meta, wal_mark_enqueued, wal_mark_inflight, wal_mark_permanent_failed,
     wal_mark_retryable_failed, wal_mark_succeeded,
 };
+use liquidium_pipeline_connectors::backend::bridge_backend::FINALIZER_PERMANENT_AMOUNT_FLOOR_PREFIX;
 use liquidium_pipeline_connectors::pipeline_agent::PipelineAgent;
 use liquidium_pipeline_core::types::protocol_types::{LiquidationResult, ProtocolError, TransferStatus};
 
@@ -37,6 +38,10 @@ fn retry_delay_secs(base: u64, max: u64, error_count: i32) -> u64 {
         1u64 << exponent
     };
     base.saturating_mul(multiplier).min(capped_max)
+}
+
+fn is_permanent_finalizer_error(err: &str) -> bool {
+    err.starts_with(FINALIZER_PERMANENT_AMOUNT_FLOOR_PREFIX)
 }
 
 //
@@ -322,7 +327,19 @@ where
                         .ok_or_else(|| format!("missing WAL id for liquidation {}", liq_id))?;
 
                     debug!("Failed finalization {}", err_msg);
-                    if next_errors >= MAX_FINALIZER_ERRORS {
+                    if is_permanent_finalizer_error(&err_msg) && receipt.request.liquidation.buy_bad_debt {
+                        let _ = wal_mark_succeeded(&*self.wal, wal_id).await;
+
+                        fin_results.push((
+                            FinalizerResult {
+                                swap_result: None,
+                                finalized: true,
+                                swapper: None,
+                                reason: Some(format!("bad debt finalizer amount floor accepted: {}", err_msg)),
+                            },
+                            receipt.clone(),
+                        ));
+                    } else if is_permanent_finalizer_error(&err_msg) || next_errors >= MAX_FINALIZER_ERRORS {
                         let _ = wal_mark_permanent_failed(&*self.wal, wal_id, err_msg.clone()).await;
 
                         let mut failed_receipt = receipt.clone();
@@ -437,6 +454,18 @@ mod tests {
         }
     }
 
+    #[derive(Clone)]
+    struct ErrorFinalizer {
+        error: String,
+    }
+
+    #[async_trait::async_trait]
+    impl Finalizer for ErrorFinalizer {
+        async fn finalize(&self, _: &dyn WalStore, _: ExecutionReceipt) -> Result<FinalizerResult, String> {
+            Err(self.error.clone())
+        }
+    }
+
     fn make_request() -> ExecutorRequest {
         let debt_asset = ChainToken::Icp {
             ledger: Principal::anonymous(),
@@ -502,6 +531,17 @@ mod tests {
         }
     }
 
+    fn make_swapping_receipt(liq_id: u128) -> ExecutionReceipt {
+        let mut request = make_request();
+        request.swap_args = Some(make_swap_request(&request));
+        ExecutionReceipt {
+            request,
+            liquidation_result: Some(make_liq_result(liq_id, TransferStatus::Success, 0)),
+            status: ExecutionStatus::Success,
+            change_received: true,
+        }
+    }
+
     fn make_row(liq_id: u128, receipt: ExecutionReceipt) -> LiqResultRecord {
         let mut row = LiqResultRecord {
             id: liq_id.to_string(),
@@ -537,6 +577,168 @@ mod tests {
         assert_eq!(retry_delay_secs(5, 120, 6), 120);
         assert_eq!(retry_delay_secs(5, 120, 7), 120);
         assert_eq!(retry_delay_secs(10, 10, 4), 10);
+    }
+
+    #[tokio::test]
+    async fn finalize_marks_below_minimum_bridge_error_permanent_immediately() {
+        let liq_id = 910u128;
+        let receipt = make_swapping_receipt(liq_id);
+        let row = make_row(liq_id, receipt.clone());
+        let row_pending = row.clone();
+        let row_for_profit = row.clone();
+        let liq_id_str = liq_id.to_string();
+        let liq_id_for_failure = liq_id_str.clone();
+
+        let err = format!(
+            "{}: ckETH@ICP -> ETH amount below minimum withdrawal (amount=0.0049 minimum=0.005)",
+            FINALIZER_PERMANENT_AMOUNT_FLOOR_PREFIX
+        );
+        let err_for_failure = err.clone();
+
+        let mut wal = MockWalStore::new();
+        wal.expect_get_pending()
+            .with(eq(100usize))
+            .times(1)
+            .returning(move |_| Ok(vec![row_pending.clone()]));
+        wal.expect_update_status()
+            .withf(move |id, status, bump| id == liq_id_str.as_str() && *status == ResultStatus::InFlight && *bump)
+            .times(1)
+            .returning(|_, _, _| Ok(()));
+        wal.expect_update_failure()
+            .withf(move |id, status, last_error, bump| {
+                id == liq_id_for_failure.as_str()
+                    && *status == ResultStatus::FailedPermanent
+                    && last_error == &err_for_failure
+                    && *bump
+            })
+            .times(1)
+            .returning(|_, _, _, _| Ok(()));
+        wal.expect_get_result()
+            .withf(move |id| id == liq_id.to_string().as_str())
+            .times(1)
+            .returning(move |_| Ok(Some(row_for_profit.clone())));
+        wal.expect_upsert_result().times(1).returning(|_| Ok(()));
+
+        let stage = FinalizeStage::new(
+            Arc::new(wal),
+            Arc::new(ErrorFinalizer { error: err }),
+            Arc::new(SimpleProfitCalculator),
+            Arc::new(MockPipelineAgent::new()),
+            Principal::anonymous(),
+            5,
+            120,
+        );
+
+        let outcomes = stage.process(&()).await.expect("process should succeed");
+        assert_eq!(outcomes.len(), 1);
+        assert!(matches!(outcomes[0].status, ExecutionStatus::SwapFailed(_)));
+    }
+
+    #[tokio::test]
+    async fn finalize_accepts_below_minimum_bridge_error_for_bad_debt() {
+        let liq_id = 912u128;
+        let mut receipt = make_swapping_receipt(liq_id);
+        receipt.request.liquidation.buy_bad_debt = true;
+        let row = make_row(liq_id, receipt.clone());
+        let row_pending = row.clone();
+        let row_for_profit = row.clone();
+        let liq_id_str = liq_id.to_string();
+        let liq_id_for_success = liq_id_str.clone();
+
+        let err = format!(
+            "{}: ckETH@ICP -> ETH amount below minimum withdrawal (amount=0.0049 minimum=0.005)",
+            FINALIZER_PERMANENT_AMOUNT_FLOOR_PREFIX
+        );
+
+        let mut wal = MockWalStore::new();
+        wal.expect_get_pending()
+            .with(eq(100usize))
+            .times(1)
+            .returning(move |_| Ok(vec![row_pending.clone()]));
+        wal.expect_update_status()
+            .withf(move |id, status, bump| id == liq_id_str.as_str() && *status == ResultStatus::InFlight && *bump)
+            .times(1)
+            .returning(|_, _, _| Ok(()));
+        wal.expect_update_status()
+            .withf(move |id, status, bump| {
+                id == liq_id_for_success.as_str() && *status == ResultStatus::Succeeded && *bump
+            })
+            .times(1)
+            .returning(|_, _, _| Ok(()));
+        wal.expect_update_failure().times(0);
+        wal.expect_get_result()
+            .withf(move |id| id == liq_id.to_string().as_str())
+            .times(1)
+            .returning(move |_| Ok(Some(row_for_profit.clone())));
+        wal.expect_upsert_result().times(1).returning(|_| Ok(()));
+
+        let stage = FinalizeStage::new(
+            Arc::new(wal),
+            Arc::new(ErrorFinalizer { error: err.clone() }),
+            Arc::new(SimpleProfitCalculator),
+            Arc::new(MockPipelineAgent::new()),
+            Principal::anonymous(),
+            5,
+            120,
+        );
+
+        let outcomes = stage.process(&()).await.expect("process should succeed");
+        assert_eq!(outcomes.len(), 1);
+        assert!(matches!(outcomes[0].status, ExecutionStatus::Success));
+        assert!(outcomes[0].finalizer_result.finalized);
+        assert!(
+            outcomes[0]
+                .finalizer_result
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("bad debt finalizer amount floor accepted"))
+        );
+    }
+
+    #[tokio::test]
+    async fn finalize_keeps_ordinary_finalizer_error_retryable() {
+        let liq_id = 911u128;
+        let receipt = make_swapping_receipt(liq_id);
+        let row = make_row(liq_id, receipt);
+        let row_pending = row.clone();
+        let liq_id_str = liq_id.to_string();
+        let liq_id_for_failure = liq_id_str.clone();
+        let err = "temporary bridge transport failure".to_string();
+        let err_for_failure = err.clone();
+
+        let mut wal = MockWalStore::new();
+        wal.expect_get_pending()
+            .with(eq(100usize))
+            .times(1)
+            .returning(move |_| Ok(vec![row_pending.clone()]));
+        wal.expect_update_status()
+            .withf(move |id, status, bump| id == liq_id_str.as_str() && *status == ResultStatus::InFlight && *bump)
+            .times(1)
+            .returning(|_, _, _| Ok(()));
+        wal.expect_update_failure()
+            .withf(move |id, status, last_error, bump| {
+                id == liq_id_for_failure.as_str()
+                    && *status == ResultStatus::FailedRetryable
+                    && last_error == &err_for_failure
+                    && *bump
+            })
+            .times(1)
+            .returning(|_, _, _, _| Ok(()));
+        wal.expect_get_result().times(0);
+        wal.expect_upsert_result().times(0);
+
+        let stage = FinalizeStage::new(
+            Arc::new(wal),
+            Arc::new(ErrorFinalizer { error: err }),
+            Arc::new(SimpleProfitCalculator),
+            Arc::new(MockPipelineAgent::new()),
+            Principal::anonymous(),
+            5,
+            120,
+        );
+
+        let outcomes = stage.process(&()).await.expect("process should succeed");
+        assert!(outcomes.is_empty());
     }
 
     #[tokio::test]

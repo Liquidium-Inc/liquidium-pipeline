@@ -5,7 +5,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table, Wrap};
 
 use super::super::app::{App, BalancesPanel, WithdrawAccountKind, WithdrawDestinationKind, WithdrawField};
-use super::super::withdraw::deposit_network_for_asset;
+use super::super::withdraw::mexc_deposit_lookup_for_asset;
 
 pub(super) fn draw_balances(f: &mut Frame<'_>, area: Rect, app: &App) {
     let mut lines: Vec<Line> = Vec::new();
@@ -328,7 +328,7 @@ fn draw_withdraw(f: &mut Frame<'_>, area: Rect, app: &App) {
 
     // Show MEXC deposit address for the selected withdraw asset (if available).
     if let Some(asset) = app.withdraw_assets.get(app.withdraw.asset_idx) {
-        let expected_network = deposit_network_for_asset(asset);
+        let (_, expected_network) = mexc_deposit_lookup_for_asset(asset);
         let matches = app.deposit.asset.as_ref() == Some(asset)
             && app.deposit.network.as_deref() == Some(expected_network.as_str());
 
