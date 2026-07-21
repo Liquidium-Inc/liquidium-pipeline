@@ -85,11 +85,10 @@ impl<C: IcpswapReadClient> IcpswapVenue<C> {
             icp_ledger(&input.token).ok_or_else(|| IcpswapQuoteError::MissingToken(request.pay_asset.to_string()))?;
         let token_out = icp_ledger(&output.token)
             .ok_or_else(|| IcpswapQuoteError::MissingToken(request.receive_asset.to_string()))?;
-        let output_fee = self
-            .client
-            .ledger_fee(token_out)
-            .await
-            .map_err(IcpswapQuoteError::LedgerFee)?;
+        let (input_fee, output_fee) =
+            futures::join!(self.client.ledger_fee(token_in), self.client.ledger_fee(token_out));
+        let input_fee = input_fee.map_err(IcpswapQuoteError::LedgerFee)?;
+        let output_fee = output_fee.map_err(IcpswapQuoteError::LedgerFee)?;
         let max_slippage_bps = request.max_slippage_bps.unwrap_or(self.default_max_slippage_bps);
         amount_out_minimum(&Nat::from(0u8), max_slippage_bps)?;
 
@@ -106,7 +105,9 @@ impl<C: IcpswapReadClient> IcpswapVenue<C> {
             let input_descriptor = input_descriptor.clone();
             let output_descriptor = output_descriptor.clone();
             let output_token = output.token.clone();
+            let input_token = input.token.clone();
             let amount_in = request.pay_amount.clone();
+            let input_fee = input_fee.clone();
             let output_fee = output_fee.clone();
             async move {
                 let pool = self
@@ -154,6 +155,7 @@ impl<C: IcpswapReadClient> IcpswapVenue<C> {
                     token1,
                     fee_tier,
                     amount_in,
+                    ChainTokenAmount::from_raw(input_token, input_fee),
                     ChainTokenAmount::from_raw(output_token.clone(), gross),
                     ChainTokenAmount::from_raw(output_token, output_fee),
                     max_slippage_bps,

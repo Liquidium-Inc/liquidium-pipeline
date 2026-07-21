@@ -17,6 +17,7 @@ impl IcpswapExecutionPlan {
         token1: Principal,
         fee_tier: Nat,
         amount_in: ChainTokenAmount,
+        input_ledger_fee: ChainTokenAmount,
         gross_quoted_out: ChainTokenAmount,
         output_ledger_fee: ChainTokenAmount,
         max_slippage_bps: u32,
@@ -24,6 +25,11 @@ impl IcpswapExecutionPlan {
     ) -> Result<Self, IcpswapPlanError> {
         let token_in = icp_ledger(&amount_in.token)?;
         let token_out = icp_ledger(&gross_quoted_out.token)?;
+        if input_ledger_fee.token != amount_in.token {
+            return Err(IcpswapPlanError::InputTokenMismatch {
+                field: "input_ledger_fee",
+            });
+        }
         if output_ledger_fee.token != gross_quoted_out.token {
             return Err(IcpswapPlanError::OutputTokenMismatch {
                 field: "output_ledger_fee",
@@ -44,6 +50,7 @@ impl IcpswapExecutionPlan {
             zero_for_one,
             fee_tier,
             amount_in,
+            input_ledger_fee,
             gross_quoted_out,
             output_ledger_fee,
             net_expected_output: ChainTokenAmount::from_raw(output_token.clone(), net_value),
@@ -52,6 +59,13 @@ impl IcpswapExecutionPlan {
             quoted_at,
         })
     }
+}
+
+/// ICRC-2 charges the transfer fee to the allowance in addition to the
+/// transfer amount. `Nat` is arbitrary precision, so this addition cannot
+/// overflow.
+pub fn required_allowance(plan: &IcpswapExecutionPlan) -> Nat {
+    plan.amount_in.value.clone() + plan.input_ledger_fee.value.clone()
 }
 
 pub fn resolve_direction(

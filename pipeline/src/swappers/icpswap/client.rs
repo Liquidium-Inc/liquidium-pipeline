@@ -1,11 +1,13 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use candid::{Encode, Nat, Principal};
+use candid::{Decode, Encode, Nat, Principal};
+use icrc_ledger_types::{icrc1::account::Account, icrc2::approve::ApproveArgs};
 use liquidium_pipeline_connectors::{backend::icp_backend::IcpBackend, pipeline_agent::PipelineAgent};
 
 use super::types::{
-    IcpswapClientError, IcpswapGetPoolArgs, IcpswapPoolData, IcpswapResult, IcpswapSwapArgs, IcpswapToken,
+    IcpswapApprovalRequest, IcpswapClientError, IcpswapDepositAndSwapArgs, IcpswapExecutionClientError,
+    IcpswapGetPoolArgs, IcpswapPoolData, IcpswapResult, IcpswapSwapArgs, IcpswapToken,
 };
 
 #[cfg_attr(test, mockall::automock)]
@@ -26,14 +28,56 @@ pub trait IcpswapReadClient: Send + Sync {
 #[cfg_attr(test, mockall::automock)]
 #[async_trait]
 pub trait IcpswapLedgerClient: Send + Sync {
-    async fn output_ledger_fee(&self, ledger: Principal) -> Result<Nat, String>;
+    async fn ledger_fee(&self, ledger: Principal) -> Result<Nat, String>;
+    async fn allowance(&self, ledger: Principal, owner: &Account, spender: &Account) -> Result<Nat, String>;
+    async fn approve(&self, request: IcpswapApprovalRequest) -> Result<Nat, String>;
 }
 
 #[async_trait]
 impl<T: IcpBackend> IcpswapLedgerClient for T {
-    async fn output_ledger_fee(&self, ledger: Principal) -> Result<Nat, String> {
+    async fn ledger_fee(&self, ledger: Principal) -> Result<Nat, String> {
         self.icrc1_fee(ledger).await
     }
+
+    async fn allowance(&self, ledger: Principal, owner: &Account, spender: &Account) -> Result<Nat, String> {
+        self.icrc2_allowance(ledger, owner, spender).await
+    }
+
+    async fn approve(&self, request: IcpswapApprovalRequest) -> Result<Nat, String> {
+        self.icrc2_approve(
+            request.ledger,
+            ApproveArgs {
+                from_subaccount: request.owner.subaccount,
+                spender: request.spender,
+                amount: request.required_allowance,
+                expected_allowance: Some(request.current_allowance),
+                expires_at: None,
+                fee: None,
+                memo: None,
+                created_at_time: Some(request.created_at_time),
+            },
+        )
+        .await
+    }
+}
+
+#[cfg_attr(test, mockall::automock)]
+#[async_trait]
+pub trait IcpswapExecutionClient: Send + Sync {
+    async fn allowance(
+        &self,
+        ledger: Principal,
+        owner: &Account,
+        spender: &Account,
+    ) -> Result<Nat, IcpswapExecutionClientError>;
+
+    async fn approve(&self, request: IcpswapApprovalRequest) -> Result<Nat, IcpswapExecutionClientError>;
+
+    async fn deposit_from_and_swap(
+        &self,
+        pool: Principal,
+        args: &IcpswapDepositAndSwapArgs,
+    ) -> Result<Nat, IcpswapExecutionClientError>;
 }
 
 pub struct IcpswapClient<A: PipelineAgent, B: IcpswapLedgerClient> {
@@ -114,8 +158,63 @@ impl<A: PipelineAgent, B: IcpswapLedgerClient> IcpswapReadClient for IcpswapClie
 
     async fn ledger_fee(&self, ledger: Principal) -> Result<Nat, IcpswapClientError> {
         self.icp_backend
-            .output_ledger_fee(ledger)
+            .ledger_fee(ledger)
             .await
             .map_err(|message| IcpswapClientError::LedgerFee { ledger, message })
+    }
+}
+
+#[async_trait]
+impl<A: PipelineAgent, B: IcpswapLedgerClient> IcpswapExecutionClient for IcpswapClient<A, B> {
+    async fn allowance(
+        &self,
+        ledger: Principal,
+        owner: &Account,
+        spender: &Account,
+    ) -> Result<Nat, IcpswapExecutionClientError> {
+        self.icp_backend
+            .allowance(ledger, owner, spender)
+            .await
+            .map_err(|message| IcpswapExecutionClientError::Allowance { ledger, message })
+    }
+
+    async fn approve(&self, request: IcpswapApprovalRequest) -> Result<Nat, IcpswapExecutionClientError> {
+        let ledger = request.ledger;
+        self.icp_backend
+            .approve(request)
+            .await
+            .map_err(|message| IcpswapExecutionClientError::Approval { ledger, message })
+    }
+
+    async fn deposit_from_and_swap(
+        &self,
+        pool: Principal,
+        args: &IcpswapDepositAndSwapArgs,
+    ) -> Result<Nat, IcpswapExecutionClientError> {
+        const METHOD: &str = "depositFromAndSwap";
+        let encoded = Encode!(args).map_err(|error| IcpswapExecutionClientError::Encode {
+            method: METHOD,
+            message: error.to_string(),
+        })?;
+        let response = self
+            .agent
+            .call_update_raw(&pool, METHOD, encoded)
+            .await
+            .map_err(|message| IcpswapExecutionClientError::SubmissionUnknown {
+                pool,
+                method: METHOD,
+                message,
+            })?;
+        let result =
+            Decode!(&response, IcpswapResult<Nat>).map_err(|error| IcpswapExecutionClientError::SubmissionUnknown {
+                pool,
+                method: METHOD,
+                message: format!("Candid decode error: {error}"),
+            })?;
+
+        match result {
+            IcpswapResult::Ok(amount) => Ok(amount),
+            IcpswapResult::Err(error) => Err(IcpswapExecutionClientError::Protocol { method: METHOD, error }),
+        }
     }
 }

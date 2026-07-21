@@ -1,4 +1,5 @@
 use candid::{CandidType, Int, Nat, Principal};
+use icrc_ledger_types::icrc1::account::Account;
 use liquidium_pipeline_core::tokens::{chain_token::ChainToken, chain_token_amount::ChainTokenAmount};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -82,6 +83,7 @@ pub struct IcpswapExecutionPlan {
     pub zero_for_one: bool,
     pub fee_tier: Nat,
     pub amount_in: ChainTokenAmount,
+    pub input_ledger_fee: ChainTokenAmount,
     pub gross_quoted_out: ChainTokenAmount,
     pub output_ledger_fee: ChainTokenAmount,
     pub net_expected_output: ChainTokenAmount,
@@ -117,6 +119,8 @@ pub struct IcpswapExecutionState {
     #[serde(default)]
     pub approval_block_index: Option<Nat>,
     #[serde(default)]
+    pub approval_created_at: Option<u64>,
+    #[serde(default)]
     pub submitted_at: Option<u64>,
     #[serde(default)]
     pub recovery_attempted: bool,
@@ -143,6 +147,8 @@ pub enum IcpswapPlanError {
     OutputFeeExceedsQuote { gross: Nat, fee: Nat },
     #[error("{field} token does not match quoted output token")]
     OutputTokenMismatch { field: &'static str },
+    #[error("{field} token does not match quoted input token")]
+    InputTokenMismatch { field: &'static str },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
@@ -159,6 +165,46 @@ pub enum IcpswapClientError {
     Protocol { method: &'static str, error: IcpswapError },
     #[error("ICRC-1 fee lookup failed on ledger {ledger}: {message}")]
     LedgerFee { ledger: Principal, message: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum IcpswapExecutionClientError {
+    #[error("ICRC-2 allowance lookup failed on ledger {ledger}: {message}")]
+    Allowance { ledger: Principal, message: String },
+    #[error("ICRC-2 approval failed on ledger {ledger}: {message}")]
+    Approval { ledger: Principal, message: String },
+    #[error("failed to encode arguments for ICPSwap {method}: {message}")]
+    Encode { method: &'static str, message: String },
+    #[error("ICPSwap {method} submission to {pool} has an ambiguous outcome: {message}")]
+    SubmissionUnknown {
+        pool: Principal,
+        method: &'static str,
+        message: String,
+    },
+    #[error("ICPSwap {method} returned an error: {error:?}")]
+    Protocol { method: &'static str, error: IcpswapError },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum IcpswapExecutionError {
+    #[error(transparent)]
+    Client(#[from] IcpswapExecutionClientError),
+    #[error("failed to persist ICPSwap execution state: {0}")]
+    Persistence(String),
+    #[error("ICPSwap execution cannot submit from phase {0:?}")]
+    SubmissionAlreadyStarted(IcpswapExecutionPhase),
+    #[error("no persisted ICPSwap execution state or new execution plan was provided")]
+    MissingPlan,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IcpswapApprovalRequest {
+    pub ledger: Principal,
+    pub owner: Account,
+    pub spender: Account,
+    pub current_allowance: Nat,
+    pub required_allowance: Nat,
+    pub created_at_time: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -195,7 +241,7 @@ pub enum IcpswapQuoteError {
         expected: Nat,
         actual: Nat,
     },
-    #[error("output ledger fee lookup failed: {0}")]
+    #[error("ledger fee lookup failed: {0}")]
     LedgerFee(IcpswapClientError),
     #[error(transparent)]
     Plan(#[from] IcpswapPlanError),

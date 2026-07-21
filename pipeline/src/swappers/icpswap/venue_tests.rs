@@ -74,11 +74,10 @@ async fn selects_highest_net_output_across_all_fee_tiers() {
     let output_ledger = principal(2);
 
     let mut client = MockIcpswapReadClient::new();
-    client
-        .expect_ledger_fee()
-        .withf(move |ledger| *ledger == output_ledger)
-        .times(1)
-        .return_once(|_| Ok(Nat::from(10u64)));
+    client.expect_ledger_fee().times(2).returning(move |ledger| {
+        assert!(ledger == input_ledger || ledger == output_ledger);
+        Ok(Nat::from(10u64))
+    });
     client.expect_get_pool().times(3).returning(move |_, _, fee| {
         let (pool, _) = pools_for_discovery.get(fee).expect("configured fee");
         let (token0, token1) = if fee == &Nat::from(500u64) {
@@ -114,6 +113,7 @@ async fn selects_highest_net_output_across_all_fee_tiers() {
     assert_eq!(result.plan.pool, principal(6));
     assert_eq!(result.plan.fee_tier, Nat::from(3_000u64));
     assert_eq!(result.plan.gross_quoted_out.value, Nat::from(1_100u64));
+    assert_eq!(result.plan.input_ledger_fee.value, Nat::from(10u64));
     assert_eq!(result.plan.output_ledger_fee.value, Nat::from(10u64));
     assert_eq!(result.plan.net_expected_output.value, Nat::from(1_090u64));
     assert_eq!(result.plan.amount_out_minimum.value, Nat::from(1_089u64));
@@ -131,7 +131,7 @@ async fn keeps_usable_quote_when_another_fee_tier_fails() {
     let output_ledger = principal(2);
 
     let mut client = MockIcpswapReadClient::new();
-    client.expect_ledger_fee().return_once(|_| Ok(Nat::from(10u64)));
+    client.expect_ledger_fee().times(2).returning(|_| Ok(Nat::from(10u64)));
     client.expect_get_pool().times(2).returning(move |_, _, fee| {
         if fee == &Nat::from(500u64) {
             Err(IcpswapClientError::Protocol {
@@ -169,7 +169,7 @@ async fn reports_every_failure_when_no_pool_is_usable() {
     let output = chain_token(principal(2), "OUTPUT", 10);
 
     let mut client = MockIcpswapReadClient::new();
-    client.expect_ledger_fee().return_once(|_| Ok(Nat::from(10u64)));
+    client.expect_ledger_fee().times(2).returning(|_| Ok(Nat::from(10u64)));
     client.expect_get_pool().times(2).returning(|_, _, _| {
         Err(IcpswapClientError::Protocol {
             method: "getPool",
@@ -201,7 +201,7 @@ async fn equal_outputs_choose_lower_fee_tier_deterministically() {
     let output_ledger = principal(2);
 
     let mut client = MockIcpswapReadClient::new();
-    client.expect_ledger_fee().return_once(|_| Ok(Nat::from(10u64)));
+    client.expect_ledger_fee().times(2).returning(|_| Ok(Nat::from(10u64)));
     client.expect_get_pool().times(2).returning(move |_, _, fee| {
         let pool = if fee == &Nat::from(500u64) {
             principal(5)

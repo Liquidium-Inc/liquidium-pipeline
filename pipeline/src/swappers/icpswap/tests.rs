@@ -6,11 +6,12 @@ use liquidium_pipeline_core::tokens::{chain_token::ChainToken, chain_token_amoun
 use serde::Deserialize;
 
 use super::{
-    client::{IcpswapClient, IcpswapReadClient, MockIcpswapLedgerClient},
+    client::{IcpswapClient, IcpswapExecutionClient, IcpswapReadClient, MockIcpswapLedgerClient},
     plan::{amount_out_minimum, nat_to_decimal_text, net_expected_output, resolve_direction},
     types::{
-        IcpswapClientError, IcpswapError, IcpswapExecutionPhase, IcpswapExecutionPlan, IcpswapExecutionState,
-        IcpswapGetPoolArgs, IcpswapPlanError, IcpswapPoolData, IcpswapResult, IcpswapSwapArgs, IcpswapToken,
+        IcpswapClientError, IcpswapDepositAndSwapArgs, IcpswapError, IcpswapExecutionClientError,
+        IcpswapExecutionPhase, IcpswapExecutionPlan, IcpswapExecutionState, IcpswapGetPoolArgs, IcpswapPlanError,
+        IcpswapPoolData, IcpswapResult, IcpswapSwapArgs, IcpswapToken,
     },
 };
 
@@ -97,7 +98,8 @@ fn builds_complete_plan_for_reversed_direction() {
         token0,
         token1,
         Nat::from(3_000u64),
-        ChainTokenAmount::from_raw(input, Nat::from(50_000u64)),
+        ChainTokenAmount::from_raw(input.clone(), Nat::from(50_000u64)),
+        ChainTokenAmount::from_raw(input, Nat::from(10u64)),
         ChainTokenAmount::from_raw(output.clone(), Nat::from(10_000u64)),
         ChainTokenAmount::from_raw(output, Nat::from(5u64)),
         100,
@@ -121,7 +123,8 @@ fn planned_state_starts_before_any_external_side_effect() {
         token0,
         token1,
         Nat::from(3_000u64),
-        ChainTokenAmount::from_raw(input, Nat::from(50_000u64)),
+        ChainTokenAmount::from_raw(input.clone(), Nat::from(50_000u64)),
+        ChainTokenAmount::from_raw(input, Nat::from(10u64)),
         ChainTokenAmount::from_raw(output.clone(), Nat::from(10_000u64)),
         ChainTokenAmount::from_raw(output, Nat::from(5u64)),
         100,
@@ -137,6 +140,7 @@ fn planned_state_starts_before_any_external_side_effect() {
     assert!(state.input_balance_before.is_none());
     assert!(state.output_balance_before.is_none());
     assert!(state.approval_block_index.is_none());
+    assert!(state.approval_created_at.is_none());
     assert!(state.submitted_at.is_none());
     assert!(!state.recovery_attempted);
     assert!(state.last_error.is_none());
@@ -155,6 +159,7 @@ fn rejects_fee_denominated_in_the_wrong_token() {
         token1,
         Nat::from(3_000u64),
         ChainTokenAmount::from_raw(input.clone(), Nat::from(50_000u64)),
+        ChainTokenAmount::from_raw(input.clone(), Nat::from(10u64)),
         ChainTokenAmount::from_raw(output, Nat::from(10_000u64)),
         ChainTokenAmount::from_raw(input, Nat::from(5u64)),
         100,
@@ -442,7 +447,7 @@ async fn client_reuses_icp_backend_for_ledger_fee() {
     let agent = MockPipelineAgent::new();
     let mut backend = MockIcpswapLedgerClient::new();
     backend
-        .expect_output_ledger_fee()
+        .expect_ledger_fee()
         .withf(move |actual| *actual == ledger)
         .times(1)
         .return_once(|_| Ok(Nat::from(10u64)));
@@ -458,7 +463,7 @@ async fn client_adds_ledger_context_to_fee_error() {
     let agent = MockPipelineAgent::new();
     let mut backend = MockIcpswapLedgerClient::new();
     backend
-        .expect_output_ledger_fee()
+        .expect_ledger_fee()
         .return_once(|_| Err("fee query rejected".to_string()));
     let client = IcpswapClient::new(Arc::new(agent), Arc::new(backend), factory);
 
@@ -469,4 +474,64 @@ async fn client_adds_ledger_context_to_fee_error() {
             message: "fee query rejected".to_string(),
         })
     );
+}
+
+#[tokio::test]
+async fn client_submits_exact_deposit_from_and_swap_call() {
+    let factory = principal(7);
+    let pool = principal(8);
+    let args = IcpswapDepositAndSwapArgs {
+        zero_for_one: false,
+        token_in_fee: Nat::from(10u64),
+        token_out_fee: Nat::from(5u64),
+        amount_in: "100000".to_string(),
+        amount_out_minimum: "99000".to_string(),
+    };
+    let expected_args = args.clone();
+    let response = Encode!(&IcpswapResult::Ok(Nat::from(99_500u64))).expect("response");
+
+    let mut agent = MockPipelineAgent::new();
+    agent
+        .expect_call_update_raw()
+        .times(1)
+        .withf(move |canister, method, encoded| {
+            *canister == pool
+                && method == "depositFromAndSwap"
+                && Decode!(encoded, IcpswapDepositAndSwapArgs).is_ok_and(|decoded| decoded == expected_args)
+        })
+        .return_once(move |_, _, _| Ok(response));
+    let client = IcpswapClient::new(Arc::new(agent), Arc::new(MockIcpswapLedgerClient::new()), factory);
+
+    assert_eq!(
+        client.deposit_from_and_swap(pool, &args).await,
+        Ok(Nat::from(99_500u64))
+    );
+}
+
+#[tokio::test]
+async fn malformed_update_response_is_treated_as_ambiguous() {
+    let factory = principal(7);
+    let pool = principal(8);
+    let args = IcpswapDepositAndSwapArgs {
+        zero_for_one: true,
+        token_in_fee: Nat::from(10u64),
+        token_out_fee: Nat::from(5u64),
+        amount_in: "100000".to_string(),
+        amount_out_minimum: "99000".to_string(),
+    };
+    let mut agent = MockPipelineAgent::new();
+    agent
+        .expect_call_update_raw()
+        .times(1)
+        .return_once(|_, _, _| Ok(vec![0xde, 0xad, 0xbe, 0xef]));
+    let client = IcpswapClient::new(Arc::new(agent), Arc::new(MockIcpswapLedgerClient::new()), factory);
+
+    assert!(matches!(
+        client.deposit_from_and_swap(pool, &args).await,
+        Err(IcpswapExecutionClientError::SubmissionUnknown {
+            pool: actual_pool,
+            method: "depositFromAndSwap",
+            ..
+        }) if actual_pool == pool
+    ));
 }

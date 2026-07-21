@@ -97,8 +97,8 @@ mod tests {
     use serde_json::json;
 
     use crate::executors::executor::ExecutorRequest;
-    use crate::stages::executor::ExecutionStatus;
     use crate::persistance::VenueExecutionState;
+    use crate::stages::executor::ExecutionStatus;
     use crate::swappers::icpswap::types::{IcpswapExecutionPhase, IcpswapExecutionPlan, IcpswapExecutionState};
     use crate::swappers::model::SwapRequest;
 
@@ -234,6 +234,7 @@ mod tests {
             Principal::from_slice(&[2]),
             Nat::from(3_000u64),
             ChainTokenAmount::from_raw(token_in.clone(), Nat::from(100_000u64)),
+            ChainTokenAmount::from_raw(token_in.clone(), Nat::from(10u64)),
             ChainTokenAmount::from_raw(token_out.clone(), Nat::from(120_000u64)),
             ChainTokenAmount::from_raw(token_out.clone(), Nat::from(20u64)),
             100,
@@ -246,6 +247,7 @@ mod tests {
         state.input_balance_before = Some(ChainTokenAmount::from_raw(token_in, Nat::from(500_000u64)));
         state.output_balance_before = Some(ChainTokenAmount::from_raw(token_out, Nat::from(42u64)));
         state.approval_block_index = Some(Nat::from(77u64));
+        state.approval_created_at = Some(400);
         state.submitted_at = Some(456);
         state.last_error = Some("waiting for asynchronous output".to_string());
 
@@ -266,10 +268,7 @@ mod tests {
             .expect("decode wrapper")
             .expect("wrapper exists");
         assert_eq!(decoded.meta, vec![1, 2, 3]);
-        assert_eq!(
-            decoded.venue_execution,
-            Some(VenueExecutionState::Icpswap(state))
-        );
+        assert_eq!(decoded.venue_execution, Some(VenueExecutionState::Icpswap(state)));
         let Some(VenueExecutionState::Icpswap(decoded_state)) = decoded.venue_execution else {
             panic!("ICPSwap state should exist");
         };

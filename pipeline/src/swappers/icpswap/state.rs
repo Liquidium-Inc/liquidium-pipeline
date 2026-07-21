@@ -9,6 +9,7 @@ impl IcpswapExecutionState {
             input_balance_before: None,
             output_balance_before: None,
             approval_block_index: None,
+            approval_created_at: None,
             submitted_at: None,
             recovery_attempted: false,
             last_error: None,
