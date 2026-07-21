@@ -71,9 +71,18 @@ fn owner() -> Account {
     }
 }
 
+fn expect_transaction_cursor(client: &mut MockIcpswapExecutionClient) {
+    client
+        .expect_latest_transaction_id()
+        .times(1)
+        .withf(|pool, transaction_owner| *pool == principal(9) && *transaction_owner == principal(4))
+        .return_once(|_, _| Ok(Some(Nat::from(41u64))));
+}
+
 #[tokio::test]
 async fn approves_exact_pool_for_amount_plus_input_fee_then_submits_exact_args() {
     let mut client = MockIcpswapExecutionClient::new();
+    expect_transaction_cursor(&mut client);
     client
         .expect_allowance()
         .times(1)
@@ -127,6 +136,7 @@ async fn approves_exact_pool_for_amount_plus_input_fee_then_submits_exact_args()
             IcpswapExecutionPhase::Planned,
             IcpswapExecutionPhase::Planned,
             IcpswapExecutionPhase::Approved,
+            IcpswapExecutionPhase::Approved,
             IcpswapExecutionPhase::SubmissionUnknown,
             IcpswapExecutionPhase::AwaitingOutput,
         ]
@@ -136,6 +146,7 @@ async fn approves_exact_pool_for_amount_plus_input_fee_then_submits_exact_args()
 #[tokio::test]
 async fn sufficient_allowance_skips_approval() {
     let mut client = MockIcpswapExecutionClient::new();
+    expect_transaction_cursor(&mut client);
     client
         .expect_allowance()
         .times(1)
@@ -190,6 +201,7 @@ async fn ambiguous_approval_rechecks_allowance_before_submission() {
     let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let allowance_calls = calls.clone();
     let mut client = MockIcpswapExecutionClient::new();
+    expect_transaction_cursor(&mut client);
     client.expect_allowance().times(2).returning(move |_, _, _| {
         let call = allowance_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         Ok(if call == 0 {
@@ -222,6 +234,7 @@ async fn ambiguous_approval_rechecks_allowance_before_submission() {
 #[tokio::test]
 async fn ambiguous_submission_is_checkpointed_and_never_resubmitted() {
     let mut client = MockIcpswapExecutionClient::new();
+    expect_transaction_cursor(&mut client);
     client
         .expect_allowance()
         .times(1)
@@ -260,6 +273,7 @@ async fn ambiguous_submission_is_checkpointed_and_never_resubmitted() {
 #[tokio::test]
 async fn protocol_error_moves_to_refund_pending() {
     let mut client = MockIcpswapExecutionClient::new();
+    expect_transaction_cursor(&mut client);
     client
         .expect_allowance()
         .times(1)

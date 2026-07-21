@@ -7,7 +7,8 @@ use liquidium_pipeline_connectors::{backend::icp_backend::IcpBackend, pipeline_a
 
 use super::types::{
     IcpswapApprovalRequest, IcpswapClientError, IcpswapDepositAndSwapArgs, IcpswapExecutionClientError,
-    IcpswapGetPoolArgs, IcpswapPoolData, IcpswapResult, IcpswapSwapArgs, IcpswapToken,
+    IcpswapGetPoolArgs, IcpswapPoolData, IcpswapResult, IcpswapSwapArgs, IcpswapToken, IcpswapTransaction,
+    IcpswapUnusedBalance,
 };
 
 #[cfg_attr(test, mockall::automock)]
@@ -64,6 +65,12 @@ impl<T: IcpBackend> IcpswapLedgerClient for T {
 #[cfg_attr(test, mockall::automock)]
 #[async_trait]
 pub trait IcpswapExecutionClient: Send + Sync {
+    async fn latest_transaction_id(
+        &self,
+        pool: Principal,
+        owner: Principal,
+    ) -> Result<Option<Nat>, IcpswapExecutionClientError>;
+
     async fn allowance(
         &self,
         ledger: Principal,
@@ -78,6 +85,18 @@ pub trait IcpswapExecutionClient: Send + Sync {
         pool: Principal,
         args: &IcpswapDepositAndSwapArgs,
     ) -> Result<Nat, IcpswapExecutionClientError>;
+}
+
+#[cfg_attr(test, mockall::automock)]
+#[async_trait]
+pub trait IcpswapReconciliationClient: Send + Sync {
+    async fn transactions_by_owner(
+        &self,
+        pool: Principal,
+        owner: Principal,
+    ) -> Result<Vec<(Nat, IcpswapTransaction)>, String>;
+
+    async fn unused_balance(&self, pool: Principal, owner: Principal) -> Result<IcpswapUnusedBalance, String>;
 }
 
 pub struct IcpswapClient<A: PipelineAgent, B: IcpswapLedgerClient> {
@@ -166,6 +185,17 @@ impl<A: PipelineAgent, B: IcpswapLedgerClient> IcpswapReadClient for IcpswapClie
 
 #[async_trait]
 impl<A: PipelineAgent, B: IcpswapLedgerClient> IcpswapExecutionClient for IcpswapClient<A, B> {
+    async fn latest_transaction_id(
+        &self,
+        pool: Principal,
+        owner: Principal,
+    ) -> Result<Option<Nat>, IcpswapExecutionClientError> {
+        self.transactions_by_owner(pool, owner)
+            .await
+            .map(|transactions| transactions.into_iter().map(|(id, _)| id).max())
+            .map_err(|message| IcpswapExecutionClientError::TransactionQuery { pool, message })
+    }
+
     async fn allowance(
         &self,
         ledger: Principal,
@@ -215,6 +245,39 @@ impl<A: PipelineAgent, B: IcpswapLedgerClient> IcpswapExecutionClient for Icpswa
         match result {
             IcpswapResult::Ok(amount) => Ok(amount),
             IcpswapResult::Err(error) => Err(IcpswapExecutionClientError::Protocol { method: METHOD, error }),
+        }
+    }
+}
+
+#[async_trait]
+impl<A: PipelineAgent, B: IcpswapLedgerClient> IcpswapReconciliationClient for IcpswapClient<A, B> {
+    async fn transactions_by_owner(
+        &self,
+        pool: Principal,
+        owner: Principal,
+    ) -> Result<Vec<(Nat, IcpswapTransaction)>, String> {
+        const METHOD: &str = "getTransactionsByOwner";
+        let encoded = Encode!(&owner).map_err(|error| format!("failed to encode {METHOD}: {error}"))?;
+        match self
+            .agent
+            .call_query::<IcpswapResult<Vec<(Nat, IcpswapTransaction)>>>(&pool, METHOD, encoded)
+            .await?
+        {
+            IcpswapResult::Ok(transactions) => Ok(transactions),
+            IcpswapResult::Err(error) => Err(format!("{METHOD} returned {error:?}")),
+        }
+    }
+
+    async fn unused_balance(&self, pool: Principal, owner: Principal) -> Result<IcpswapUnusedBalance, String> {
+        const METHOD: &str = "getUserUnusedBalance";
+        let encoded = Encode!(&owner).map_err(|error| format!("failed to encode {METHOD}: {error}"))?;
+        match self
+            .agent
+            .call_query::<IcpswapResult<IcpswapUnusedBalance>>(&pool, METHOD, encoded)
+            .await?
+        {
+            IcpswapResult::Ok(balance) => Ok(balance),
+            IcpswapResult::Err(error) => Err(format!("{METHOD} returned {error:?}")),
         }
     }
 }

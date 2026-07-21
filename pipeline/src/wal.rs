@@ -248,6 +248,13 @@ mod tests {
         state.output_balance_before = Some(ChainTokenAmount::from_raw(token_out, Nat::from(42u64)));
         state.approval_block_index = Some(Nat::from(77u64));
         state.approval_created_at = Some(400);
+        state.pool_transaction_start = Some(Nat::from(80u64));
+        state.pool_transaction_id = Some(Nat::from(81u64));
+        state.settlement_ledger_block_index = Some(Nat::from(900u64));
+        state.recovery_amount = Some(ChainTokenAmount::from_raw(
+            state.plan.amount_in.token.clone(),
+            Nat::from(99_990u64),
+        ));
         state.submitted_at = Some(456);
         state.last_error = Some("waiting for asynchronous output".to_string());
 

@@ -153,6 +153,15 @@ pub async fn approve_and_submit(
         amount_out_minimum: nat_to_decimal_text(&state.plan.amount_out_minimum.value),
     };
 
+    if state.pool_transaction_start.is_none() {
+        let latest = client.latest_transaction_id(state.plan.pool, owner.owner).await?;
+        state.pool_transaction_start = Some(match latest {
+            Some(id) => id + candid::Nat::from(1u8),
+            None => candid::Nat::from(0u8),
+        });
+        persist(store, liquidation_id, &state).await?;
+    }
+
     // This write-ahead marker is deliberately persisted before the update
     // call. If the process stops after submission, retries reconcile rather
     // than submitting the swap a second time.

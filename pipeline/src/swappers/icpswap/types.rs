@@ -1,4 +1,4 @@
-use candid::{CandidType, Int, Nat, Principal};
+use candid::{CandidType, Int, Nat, Principal, Reserved};
 use icrc_ledger_types::icrc1::account::Account;
 use liquidium_pipeline_core::tokens::{chain_token::ChainToken, chain_token_amount::ChainTokenAmount};
 use serde::{Deserialize, Serialize};
@@ -121,6 +121,18 @@ pub struct IcpswapExecutionState {
     #[serde(default)]
     pub approval_created_at: Option<u64>,
     #[serde(default)]
+    pub pool_transaction_start: Option<Nat>,
+    #[serde(default)]
+    pub pool_transaction_id: Option<Nat>,
+    #[serde(default)]
+    pub settlement_ledger_block_index: Option<Nat>,
+    #[serde(default)]
+    pub refund_transaction_id: Option<Nat>,
+    #[serde(default)]
+    pub refund_ledger_block_index: Option<Nat>,
+    #[serde(default)]
+    pub recovery_amount: Option<ChainTokenAmount>,
+    #[serde(default)]
     pub submitted_at: Option<u64>,
     #[serde(default)]
     pub recovery_attempted: bool,
@@ -169,6 +181,8 @@ pub enum IcpswapClientError {
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum IcpswapExecutionClientError {
+    #[error("ICPSwap transaction cursor query failed on pool {pool}: {message}")]
+    TransactionQuery { pool: Principal, message: String },
     #[error("ICRC-2 allowance lookup failed on ledger {ledger}: {message}")]
     Allowance { ledger: Principal, message: String },
     #[error("ICRC-2 approval failed on ledger {ledger}: {message}")]
@@ -205,6 +219,163 @@ pub struct IcpswapApprovalRequest {
     pub current_allowance: Nat,
     pub required_allowance: Nat,
     pub created_at_time: u64,
+}
+
+#[derive(CandidType, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IcpswapPoolToken {
+    pub address: Principal,
+    pub standard: String,
+}
+
+#[derive(CandidType, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IcpswapTransfer {
+    pub token: Principal,
+    pub standard: String,
+    pub from: Account,
+    pub to: Account,
+    pub amount: Nat,
+    pub fee: Nat,
+    pub memo: Option<Vec<u8>>,
+    pub index: Nat,
+}
+
+#[derive(CandidType, Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum IcpswapDepositStatus {
+    Created,
+    TransferCompleted,
+    Completed,
+    Failed,
+}
+
+#[derive(CandidType, Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum IcpswapWithdrawStatus {
+    Created,
+    CreditCompleted,
+    Completed,
+    Failed,
+}
+
+#[derive(CandidType, Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum IcpswapRefundStatus {
+    Created,
+    CreditCompleted,
+    Completed,
+    Failed,
+}
+
+#[derive(CandidType, Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum IcpswapSwapStatus {
+    Created,
+    Completed,
+    Failed,
+}
+
+#[derive(CandidType, Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum IcpswapOneStepSwapStatus {
+    Created,
+    DepositTransferCompleted,
+    DepositCreditCompleted,
+    PreSwapCompleted,
+    SwapCompleted,
+    WithdrawCreditCompleted,
+    Completed,
+    Failed,
+}
+
+#[derive(CandidType, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IcpswapDepositInfo {
+    pub transfer: IcpswapTransfer,
+    pub status: IcpswapDepositStatus,
+    pub err: Option<String>,
+}
+
+#[derive(CandidType, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IcpswapWithdrawInfo {
+    pub transfer: IcpswapTransfer,
+    pub status: IcpswapWithdrawStatus,
+    pub err: Option<String>,
+}
+
+#[derive(CandidType, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IcpswapSwapInfo {
+    #[serde(rename = "tokenIn")]
+    pub token_in: IcpswapPoolToken,
+    #[serde(rename = "tokenOut")]
+    pub token_out: IcpswapPoolToken,
+    #[serde(rename = "amountIn")]
+    pub amount_in: Nat,
+    #[serde(rename = "amountOut")]
+    pub amount_out: Nat,
+    #[serde(rename = "amountInFee")]
+    pub amount_in_fee: Nat,
+    #[serde(rename = "amountOutFee")]
+    pub amount_out_fee: Nat,
+    pub status: IcpswapSwapStatus,
+    pub err: Option<String>,
+}
+
+#[derive(CandidType, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IcpswapOneStepSwapInfo {
+    pub deposit: IcpswapDepositInfo,
+    pub withdraw: IcpswapWithdrawInfo,
+    pub swap: IcpswapSwapInfo,
+    pub status: IcpswapOneStepSwapStatus,
+    pub err: Option<String>,
+}
+
+#[derive(CandidType, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IcpswapRefundInfo {
+    #[serde(rename = "relatedIndex")]
+    pub related_index: Nat,
+    pub transfer: IcpswapTransfer,
+    pub status: IcpswapRefundStatus,
+    pub err: Option<String>,
+}
+
+#[derive(CandidType, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum IcpswapTransactionAction {
+    Deposit(Reserved),
+    Withdraw(Reserved),
+    Refund(IcpswapRefundInfo),
+    AddLiquidity(Reserved),
+    DecreaseLiquidity(Reserved),
+    Claim(Reserved),
+    Swap(Reserved),
+    OneStepSwap(IcpswapOneStepSwapInfo),
+    TransferPosition(Reserved),
+    AddLimitOrder(Reserved),
+    RemoveLimitOrder(Reserved),
+    ExecuteLimitOrder(Reserved),
+}
+
+#[derive(CandidType, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IcpswapTransaction {
+    pub id: Nat,
+    pub timestamp: Int,
+    pub owner: Principal,
+    #[serde(rename = "canisterId")]
+    pub canister_id: Principal,
+    pub action: IcpswapTransactionAction,
+}
+
+#[derive(CandidType, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IcpswapUnusedBalance {
+    pub balance0: Nat,
+    pub balance1: Nat,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum IcpswapReconciliationError {
+    #[error("ICPSwap reconciliation query failed: {0}")]
+    Query(String),
+    #[error("multiple ICPSwap transactions match the persisted execution plan")]
+    AmbiguousTransaction,
+    #[error("ICPSwap transaction {0} does not match the persisted execution plan")]
+    TransactionMismatch(Nat),
+    #[error("ICPSwap execution state has no pre-submission transaction cursor")]
+    MissingTransactionCursor,
+    #[error("failed to persist ICPSwap reconciliation state: {0}")]
+    Persistence(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
