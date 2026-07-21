@@ -15,12 +15,12 @@ pub struct SwapRequest {
     pub receive_asset: AssetId,
     pub receive_address: Option<String>,
     pub max_slippage_bps: Option<u32>, // 100 = 1%
-    pub venue_hint: Option<String>,    // "kong", "mexc", etc (optional)
+    pub venue_hint: Option<String>,    // "icpswap", "mexc", etc (optional)
 }
 
 #[derive(CandidType, Debug, Clone, Serialize, Deserialize)]
 pub struct SwapQuoteLeg {
-    pub venue: String,    // "kong", "mexc", "raydium"
+    pub venue: String,    // "icpswap", "mexc", etc
     pub route_id: String, // pool id, market symbol, etc
 
     pub pay_chain: String,

@@ -87,6 +87,8 @@ pub struct Config {
     /// Maximum intermediate hops allowed for MEXC route discovery.
     /// Example: `2` allows up to 3 legs total.
     pub cex_mexc_max_hops: u8,
+    pub icpswap_factory_canister: Principal,
+    pub icpswap_fee_tiers: Vec<candid::Nat>,
     pub swapper: SwapperMode,
     pub cex_credentials: HashMap<String, (String, String)>,
     pub opportunity_account_filter: Vec<Principal>,
@@ -332,6 +334,8 @@ impl Config {
         let cex_tunables = parse_cex_tunables_from_env();
         let cex_mexc_available_pairs = parse_cex_mexc_available_pairs_from_env();
         let cex_mexc_max_hops = parse_cex_mexc_max_hops_from_env();
+        let icpswap_factory_canister = parse_icpswap_factory_from_env()?;
+        let icpswap_fee_tiers = parse_icpswap_fee_tiers_from_env()?;
 
         let swapper = parse_swapper_mode_from_env()?;
 
@@ -393,6 +397,8 @@ impl Config {
             cex_force_over_usd_threshold: cex_tunables.force_over_usd_threshold,
             cex_mexc_available_pairs,
             cex_mexc_max_hops,
+            icpswap_factory_canister,
+            icpswap_fee_tiers,
             swapper,
             cex_credentials,
             opportunity_account_filter,
@@ -466,6 +472,8 @@ const BRIDGE_EVM_INDEX: u32 = 0;
 const BRIDGE_ICP_INDEX: u32 = 1;
 const BRIDGE_BTC_INDEX: u32 = 0;
 const DEFAULT_BRIDGE_CKETH_MINTER_CANISTER: &str = "sv3dd-oaaaa-aaaar-qacoa-cai";
+pub const DEFAULT_ICPSWAP_FACTORY_CANISTER: &str = "4mmnk-kiaaa-aaaag-qbllq-cai";
+const DEFAULT_ICPSWAP_FEE_TIERS: &str = "100,500,3000,10000";
 
 fn parse_bad_debt_collateral_slippage_bps_from_env() -> u32 {
     env::var("BAD_DEBT_COLLATERAL_SLIPPAGE_BPS")
@@ -485,6 +493,45 @@ fn parse_swapper_mode_from_env() -> Result<SwapperMode, String> {
             other
         )),
     }
+}
+
+fn parse_icpswap_factory_from_env() -> Result<Principal, String> {
+    let raw = env::var("ICPSWAP_FACTORY_CANISTER").unwrap_or_else(|_| DEFAULT_ICPSWAP_FACTORY_CANISTER.to_string());
+    let trimmed = raw.trim();
+    Principal::from_text(trimmed)
+        .map_err(|error| format!("invalid ICPSWAP_FACTORY_CANISTER principal '{trimmed}': {error}"))
+}
+
+fn parse_icpswap_fee_tiers_from_env() -> Result<Vec<candid::Nat>, String> {
+    let raw = env::var("ICPSWAP_FEE_TIERS").unwrap_or_else(|_| DEFAULT_ICPSWAP_FEE_TIERS.to_string());
+    parse_icpswap_fee_tiers(&raw)
+}
+
+fn parse_icpswap_fee_tiers(raw: &str) -> Result<Vec<candid::Nat>, String> {
+    let mut tiers = raw
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| {
+            value
+                .parse::<u32>()
+                .map_err(|error| format!("invalid ICPSWAP fee tier '{value}': {error}"))
+                .and_then(|fee| {
+                    if fee == 0 {
+                        Err("ICPSWAP fee tiers must be greater than zero".to_string())
+                    } else {
+                        Ok(candid::Nat::from(fee))
+                    }
+                })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    tiers.sort();
+    tiers.dedup();
+    if tiers.is_empty() {
+        return Err("ICPSWAP_FEE_TIERS must contain at least one positive integer".to_string());
+    }
+    Ok(tiers)
 }
 
 fn normalize_cex_market_pair(raw: &str) -> Option<String> {
@@ -877,6 +924,35 @@ mod tests {
         }
         let err = parse_swapper_mode_from_env().expect_err("hybrid mode should be rejected");
         assert!(err.contains("only SWAPPER=cex"));
+    }
+
+    #[test]
+    fn parse_icpswap_fee_tiers_sorts_and_deduplicates() {
+        assert_eq!(
+            parse_icpswap_fee_tiers("3000, 500,3000,100").unwrap(),
+            vec![
+                candid::Nat::from(100u32),
+                candid::Nat::from(500u32),
+                candid::Nat::from(3000u32),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_icpswap_fee_tiers_rejects_empty_zero_and_invalid_values() {
+        assert!(parse_icpswap_fee_tiers(" , ").is_err());
+        assert!(parse_icpswap_fee_tiers("0").is_err());
+        assert!(parse_icpswap_fee_tiers("500,nope").is_err());
+    }
+
+    #[test]
+    fn default_icpswap_factory_is_a_valid_principal() {
+        assert_eq!(
+            Principal::from_text(DEFAULT_ICPSWAP_FACTORY_CANISTER)
+                .unwrap()
+                .to_text(),
+            DEFAULT_ICPSWAP_FACTORY_CANISTER
+        );
     }
 
     #[test]

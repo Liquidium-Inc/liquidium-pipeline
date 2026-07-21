@@ -538,7 +538,7 @@ async fn forced_dex_positive_preview_executes_dex() {
         .finalize(&wal, make_receipt(10.0))
         .await
         .expect("forced dex positive should execute dex");
-    assert_eq!(res.swapper.as_deref(), Some("kong"));
+    assert_eq!(res.swapper.as_deref(), Some("icpswap"));
     assert_eq!(swap_calls.load(Ordering::SeqCst), 1);
 }
 

@@ -11,10 +11,9 @@ use crate::approval_state::ApprovalState;
 use crate::liquidation::collateral_service::CollateralServiceTrait;
 use crate::stage::PipelineStage;
 
-use crate::swappers::kong::kong_swapper::DEX_PRINCIPAL;
 use crate::swappers::swap_interface::SwapInterface;
 
-use candid::{Int, Nat, Principal};
+use candid::{Int, Nat};
 use futures::TryFutureExt;
 use liquidium_pipeline_core::{
     balance_service::BalanceService,
@@ -121,20 +120,6 @@ where
         let threshold = max_for_ledger(ledger) / Nat::from(2u8);
         self.approval_state
             .needs_approval(*ledger, self.config.get_lending_canister(), &threshold)
-    }
-
-    fn dex_approval_needed(&self, token: &ChainToken) -> bool {
-        let ChainToken::Icp { ledger, .. } = token else {
-            return false;
-        };
-
-        let spender = match Principal::from_text(DEX_PRINCIPAL) {
-            Ok(p) => p,
-            Err(_) => return false,
-        };
-
-        let threshold = max_for_ledger(ledger) / Nat::from(2u8);
-        self.approval_state.needs_approval(*ledger, spender, &threshold)
     }
 
     fn should_use_cex(&self, swap_needed: bool, amount_in: &ChainTokenAmount, ref_price: &Nat) -> bool {
@@ -615,7 +600,10 @@ where
                     if matches!(collateral_token, ChainToken::Icp { .. }) {
                         mexc_approval_count = crate::finalizers::mexc::mexc_finalizer::APPROVE_BUMP_MAX_COUNT as u32;
                     }
-                } else if self.dex_approval_needed(&collateral_token) {
+                } else if matches!(collateral_token, ChainToken::Icp { .. }) {
+                    // ICPSwap's spender is the dynamically selected pool. Reserve
+                    // one possible approval fee here; the actual allowance check
+                    // happens only after the execution plan has selected a pool.
                     let approval_fee = collateral_token.fee();
                     if amount_in_effective <= approval_fee {
                         amount_in_effective = Nat::from(0u8);

@@ -1,5 +1,4 @@
 pub mod icpswap;
-pub mod kong;
 pub mod mexc;
 pub mod model;
 pub mod router;

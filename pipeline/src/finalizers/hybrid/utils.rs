@@ -46,7 +46,7 @@ pub(crate) struct RouteCandidate {
 /// Convert internal route venue into external swapper id used by exports/UI.
 pub(crate) fn swapper_id(venue: RouteVenue) -> &'static str {
     match venue {
-        RouteVenue::Dex => "kong",
+        RouteVenue::Dex => "icpswap",
         RouteVenue::Cex => "mexc",
     }
 }
@@ -83,10 +83,10 @@ pub(crate) fn debt_repaid_f64(receipt: &ExecutionReceipt) -> Result<f64, String>
     Ok(debt_repaid_amount)
 }
 
-/// Normalize quote slippage into basis points.
+/// Normalize legacy percentage-point quote slippage into basis points.
 pub(crate) fn dex_slippage_bps(slippage: f64) -> f64 {
-    // Kong reports slippage in percentage points, e.g. 0.72 => 0.72%.
-    // 1% = 100 bps, hence *100.
+    // The common quote abstraction currently represents this field in
+    // percentage points. 1% = 100 bps.
     (slippage.max(0.0)) * BPS_PER_PERCENTAGE_POINT
 }
 

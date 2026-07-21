@@ -7,7 +7,7 @@ use serde::Deserialize;
 
 use super::{
     client::{IcpswapClient, IcpswapReadClient, MockIcpswapLedgerClient},
-    plan::{amount_out_minimum, net_expected_output, resolve_direction},
+    plan::{amount_out_minimum, nat_to_decimal_text, net_expected_output, resolve_direction},
     types::{
         IcpswapClientError, IcpswapError, IcpswapExecutionPlan, IcpswapGetPoolArgs, IcpswapPlanError, IcpswapPoolData,
         IcpswapResult, IcpswapSwapArgs, IcpswapToken,
@@ -62,6 +62,11 @@ fn slippage_math_supports_values_larger_than_u128() {
         .parse()
         .expect("valid Nat");
     assert_eq!(amount_out_minimum(&gross, 250), Ok(expected));
+}
+
+#[test]
+fn nat_decimal_text_has_no_display_separators() {
+    assert_eq!(nat_to_decimal_text(&Nat::from(100_000u64)), "100000");
 }
 
 #[test]

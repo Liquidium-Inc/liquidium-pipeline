@@ -1,5 +1,5 @@
 use candid::{CandidType, Int, Nat, Principal};
-use liquidium_pipeline_core::tokens::chain_token_amount::ChainTokenAmount;
+use liquidium_pipeline_core::tokens::{chain_token::ChainToken, chain_token_amount::ChainTokenAmount};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -125,4 +125,46 @@ pub enum IcpswapClientError {
     Protocol { method: &'static str, error: IcpswapError },
     #[error("ICRC-1 fee lookup failed on ledger {ledger}: {message}")]
     LedgerFee { ledger: Principal, message: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IcpswapTokenMetadata {
+    pub token: ChainToken,
+    pub standard: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct IcpswapQuoteResult {
+    pub quote: super::super::model::SwapQuote,
+    pub plan: IcpswapExecutionPlan,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum IcpswapQuoteError {
+    #[error("ICPSwap fee tiers cannot be empty")]
+    EmptyFeeTiers,
+    #[error("default ICPSwap slippage {0} bps exceeds 10000 bps")]
+    InvalidDefaultSlippage(u32),
+    #[error("ICPSwap token metadata is missing for {0}")]
+    MissingToken(String),
+    #[error("swap request pay asset does not match pay amount token")]
+    PayAssetMismatch,
+    #[error("invalid principal '{address}' returned as {field}: {message}")]
+    InvalidPoolPrincipal {
+        field: &'static str,
+        address: String,
+        message: String,
+    },
+    #[error("pool {pool} returned fee tier {actual}, expected {expected}")]
+    PoolFeeMismatch {
+        pool: Principal,
+        expected: Nat,
+        actual: Nat,
+    },
+    #[error("output ledger fee lookup failed: {0}")]
+    LedgerFee(IcpswapClientError),
+    #[error(transparent)]
+    Plan(#[from] IcpswapPlanError),
+    #[error("no usable ICPSwap pool quote: {failures:?}")]
+    NoUsablePools { failures: Vec<String> },
 }

@@ -5,6 +5,10 @@ use super::types::{IcpswapExecutionPlan, IcpswapPlanError};
 
 const BASIS_POINTS_DENOMINATOR: u32 = 10_000;
 
+pub fn nat_to_decimal_text(value: &Nat) -> String {
+    value.0.to_str_radix(10)
+}
+
 impl IcpswapExecutionPlan {
     #[allow(clippy::too_many_arguments)]
     pub fn new(

@@ -20,7 +20,7 @@ use crate::{
     finalizers::{
         cex_finalizer::CexFinalizerLogic,
         hybrid::hybrid_finalizer::HybridFinalizer,
-        kong_swap::kong_swap_finalizer::KongSwapFinalizer,
+        icpswap_finalizer::IcpswapFinalizer,
         mexc::runtime::build_mexc_finalizer,
         profit_calculator::SimpleProfitCalculator,
     },
@@ -89,18 +89,18 @@ async fn init(
         warn!("Swap router init failed: {}", err);
     }
 
-    // Base DEX finalizer (Kong swapper)
-    let kong_finalizer = Arc::new(KongSwapFinalizer::new(ctx.swap_router.clone()));
+    // ICPSwap is the only production DEX venue. Its execution path remains
+    // disabled until durable settlement and recovery are implemented.
+    let icpswap_finalizer = Arc::new(IcpswapFinalizer::new(ctx.swap_router.clone()));
 
     let mexc_finalizer = build_mexc_finalizer(ctx.as_ref()).await?;
 
-    // Hybrid finalizer composes DEX and CEX finalizers.
-    // For now, CEX is wired to the same Kong finalizer; you can later swap in a dedicated CEX finalizer.
+    // Hybrid finalizer composes the ICPSwap preview path and MEXC finalizer.
     let hybrid_finalizer = Arc::new(HybridFinalizer {
         config: config.clone(),
         trader_transfers: ctx.trader_transfers.actions(),
         dex_swapper: ctx.swap_router.clone(),
-        dex_finalizer: kong_finalizer.clone(),
+        dex_finalizer: icpswap_finalizer.clone(),
         cex_finalizer: Some(mexc_finalizer.clone() as Arc<dyn CexFinalizerLogic>),
     });
 

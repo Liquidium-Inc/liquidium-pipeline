@@ -8,6 +8,8 @@ use crate::swappers::{
     swap_interface::SwapInterface,
 };
 
+pub const DEFAULT_DEX_VENUE: &str = "icpswap";
+
 #[async_trait]
 pub trait SwapVenue: Send + Sync {
     fn venue_name(&self) -> &'static str;
@@ -43,7 +45,10 @@ impl SwapRouter {
     }
 
     fn pick_venue<'a>(&'a self, req: &SwapRequest) -> Result<&'a Arc<dyn SwapVenue>, String> {
-        let name = req.venue_hint.clone().unwrap_or_else(|| "kong".to_owned());
+        let name = req
+            .venue_hint
+            .clone()
+            .unwrap_or_else(|| DEFAULT_DEX_VENUE.to_owned());
         self.venues
             .get(&name)
             .ok_or_else(|| format!("{} venue not found", name))
@@ -78,5 +83,15 @@ impl SwapRouter {
 impl Default for SwapRouter {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::DEFAULT_DEX_VENUE;
+
+    #[test]
+    fn production_default_dex_venue_is_icpswap() {
+        assert_eq!(DEFAULT_DEX_VENUE, "icpswap");
     }
 }

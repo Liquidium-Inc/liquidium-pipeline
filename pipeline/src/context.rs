@@ -27,9 +27,8 @@ use liquidium_pipeline_connectors::{
 
 use crate::approval_state::ApprovalState;
 use crate::config::{Config, ConfigTrait};
-use crate::swappers::kong::kong_swapper::KongSwapSwapper;
-use crate::swappers::kong::kong_venue::KongVenue;
-use crate::swappers::router::{SwapRouter, SwapVenue};
+use crate::swappers::icpswap::{client::IcpswapClient, types::IcpswapTokenMetadata, venue::IcpswapVenue};
+use crate::swappers::router::{DEFAULT_DEX_VENUE, SwapRouter, SwapVenue};
 
 pub struct PipelineContext {
     pub config: Arc<Config>,
@@ -191,11 +190,6 @@ impl<P: Provider<AnyNetwork> + WalletProvider<AnyNetwork> + Clone + 'static> Pip
             subaccount: None,
         };
 
-        let main_trader_account = Account {
-            owner: config.trader_principal,
-            subaccount: None,
-        };
-
         let recovery_icp_account = config.get_recovery_account();
         let bridge_icp_account = config.bridge_ic_account();
 
@@ -263,32 +257,40 @@ impl<P: Provider<AnyNetwork> + WalletProvider<AnyNetwork> + Clone + 'static> Pip
 
         let approval_state = Arc::new(ApprovalState::new());
 
-        // Setup swap venue
-
-        // Kong swapper uses the trader agent/backend, adjust ctor args to your real API
-        let kong_swapper = KongSwapSwapper::new(
-            icp_backend_trader.agent.clone(),
-            main_trader_account,
-            approval_state.clone(),
-        );
-        // Build Kong venue (ICP)
-        let icp_tokens: Vec<ChainToken> = registry
+        // ICPSwap quoting uses the trader identity and is read-only until durable
+        // execution state and settlement recovery are wired into the finalizer.
+        let icpswap_tokens: Vec<IcpswapTokenMetadata> = registry
             .tokens
             .values()
             .filter_map(|t| match t {
-                ChainToken::Icp { .. } => Some(t.clone()),
+                ChainToken::Icp { .. } => Some(IcpswapTokenMetadata {
+                    token: t.clone(),
+                    standard: "ICRC2".to_string(),
+                }),
                 _ => None,
             })
             .collect();
 
-        let kong_swapper = Arc::new(kong_swapper);
-        let kong_venue: Arc<dyn SwapVenue> = Arc::new(KongVenue::new(kong_swapper, icp_tokens));
+        let icpswap_client = Arc::new(IcpswapClient::new(
+            icp_backend_trader.agent.clone(),
+            icp_backend_trader.clone(),
+            config.icpswap_factory_canister,
+        ));
+        let icpswap_venue: Arc<dyn SwapVenue> = Arc::new(
+            IcpswapVenue::new(
+                icpswap_client,
+                icpswap_tokens,
+                config.icpswap_fee_tiers.clone(),
+                config.max_allowed_dex_slippage,
+            )
+            .map_err(|error| PipelineContextError::Other(format!("invalid ICPSwap configuration: {error}")))?,
+        );
 
         // let mexc_client = Arc::new(MexcClient::from_env()?);
         // let mexc_venue: Arc<dyn SwapVenue> = Arc::new(MexcSwapVenue::new(mexc_client));
 
         // Build router
-        let swap_router = SwapRouter::new().with_venue("kong", kong_venue);
+        let swap_router = SwapRouter::new().with_venue(DEFAULT_DEX_VENUE, icpswap_venue);
 
         let swap_router = Arc::new(swap_router);
 
@@ -457,6 +459,9 @@ mod tests {
             cex_force_over_usd_threshold: 0.0,
             cex_mexc_available_pairs: vec![],
             cex_mexc_max_hops: 2,
+            icpswap_factory_canister: Principal::from_text(crate::config::DEFAULT_ICPSWAP_FACTORY_CANISTER)
+                .expect("principal"),
+            icpswap_fee_tiers: vec![candid::Nat::from(500u32), candid::Nat::from(3000u32)],
             swapper: crate::config::SwapperMode::Hybrid,
             cex_credentials: HashMap::new(),
             opportunity_account_filter: vec![],

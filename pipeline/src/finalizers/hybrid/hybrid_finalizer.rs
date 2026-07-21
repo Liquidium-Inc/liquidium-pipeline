@@ -36,7 +36,7 @@ where
     pub trader_transfers: Arc<dyn TransferActions + Send + Sync>,
     // Used only for getting DEX quotes; actual DEX execution is delegated to dex_finalizer.
     pub dex_swapper: Arc<dyn SwapInterface>,
-    pub dex_finalizer: Arc<dyn DexFinalizerLogic>, // e.g. KongSwapFinalizer
+    pub dex_finalizer: Arc<dyn DexFinalizerLogic>,
     pub cex_finalizer: Option<Arc<dyn CexFinalizerLogic>>, // existing CEX finalizer
 }
 
