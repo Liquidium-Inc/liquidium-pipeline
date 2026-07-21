@@ -9,8 +9,8 @@ use super::{
     client::{IcpswapClient, IcpswapReadClient, MockIcpswapLedgerClient},
     plan::{amount_out_minimum, nat_to_decimal_text, net_expected_output, resolve_direction},
     types::{
-        IcpswapClientError, IcpswapError, IcpswapExecutionPlan, IcpswapGetPoolArgs, IcpswapPlanError, IcpswapPoolData,
-        IcpswapResult, IcpswapSwapArgs, IcpswapToken,
+        IcpswapClientError, IcpswapError, IcpswapExecutionPhase, IcpswapExecutionPlan, IcpswapExecutionState,
+        IcpswapGetPoolArgs, IcpswapPlanError, IcpswapPoolData, IcpswapResult, IcpswapSwapArgs, IcpswapToken,
     },
 };
 
@@ -108,6 +108,38 @@ fn builds_complete_plan_for_reversed_direction() {
     assert!(!plan.zero_for_one);
     assert_eq!(plan.amount_out_minimum.value, Nat::from(9_900u64));
     assert_eq!(plan.net_expected_output.value, Nat::from(9_995u64));
+}
+
+#[test]
+fn planned_state_starts_before_any_external_side_effect() {
+    let token0 = principal(1);
+    let token1 = principal(2);
+    let input = icp_token(token0, "IN", 10);
+    let output = icp_token(token1, "OUT", 5);
+    let plan = IcpswapExecutionPlan::new(
+        principal(9),
+        token0,
+        token1,
+        Nat::from(3_000u64),
+        ChainTokenAmount::from_raw(input, Nat::from(50_000u64)),
+        ChainTokenAmount::from_raw(output.clone(), Nat::from(10_000u64)),
+        ChainTokenAmount::from_raw(output, Nat::from(5u64)),
+        100,
+        123,
+    )
+    .expect("valid plan");
+
+    let state = IcpswapExecutionState::planned(plan.clone());
+
+    assert_eq!(state.plan, plan);
+    assert_eq!(state.phase, IcpswapExecutionPhase::Planned);
+    assert!(state.gross_swap_output.is_none());
+    assert!(state.input_balance_before.is_none());
+    assert!(state.output_balance_before.is_none());
+    assert!(state.approval_block_index.is_none());
+    assert!(state.submitted_at.is_none());
+    assert!(!state.recovery_attempted);
+    assert!(state.last_error.is_none());
 }
 
 #[test]

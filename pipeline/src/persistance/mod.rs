@@ -3,6 +3,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 use crate::stages::executor::ExecutionReceipt;
+use crate::swappers::icpswap::types::IcpswapExecutionState;
 pub mod sqlite;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -25,6 +26,14 @@ pub struct LiqMetaWrapper {
     pub finalizer_decision: Option<FinalizerDecisionSnapshot>,
     #[serde(default)]
     pub profit_snapshot: Option<WalProfitSnapshot>,
+    #[serde(default)]
+    pub venue_execution: Option<VenueExecutionState>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "venue", content = "state", rename_all = "snake_case")]
+pub enum VenueExecutionState {
+    Icpswap(IcpswapExecutionState),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

@@ -112,6 +112,7 @@ where
                 meta: Vec::new(),
                 finalizer_decision: None,
                 profit_snapshot: None,
+                venue_execution: None,
             });
             wrapper.receipt = receipt.clone();
             encode_meta(&mut row, &wrapper)?;
@@ -138,6 +139,7 @@ where
             meta: Vec::new(),
             finalizer_decision: None,
             profit_snapshot: None,
+            venue_execution: None,
         });
         wrapper.receipt = receipt.clone();
         wrapper.profit_snapshot = Some(WalProfitSnapshot {
@@ -558,6 +560,7 @@ mod tests {
             meta: Vec::new(),
             finalizer_decision: None,
             profit_snapshot: None,
+            venue_execution: None,
         };
         encode_meta(&mut row, &wrapper).expect("encode_meta should succeed");
         row
@@ -1042,6 +1045,7 @@ mod tests {
                 debt_decimals: 8,
                 updated_at: 1,
             }),
+            venue_execution: None,
         };
         encode_meta(&mut row, &wrapper).expect("encode wrapper");
 

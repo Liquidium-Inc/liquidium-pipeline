@@ -19,6 +19,7 @@ pub fn decode_receipt_wrapper(row: &LiqResultRecord) -> Result<Option<LiqMetaWra
                 meta: Vec::new(),
                 finalizer_decision: None,
                 profit_snapshot: None,
+                venue_execution: None,
             })),
             Err(receipt_err) => Err(format!(
                 "invalid meta_json for {}: wrapper_err={}; receipt_err={}",
@@ -97,6 +98,8 @@ mod tests {
 
     use crate::executors::executor::ExecutorRequest;
     use crate::stages::executor::ExecutionStatus;
+    use crate::persistance::VenueExecutionState;
+    use crate::swappers::icpswap::types::{IcpswapExecutionPhase, IcpswapExecutionPlan, IcpswapExecutionState};
     use crate::swappers::model::SwapRequest;
 
     fn make_receipt() -> ExecutionReceipt {
@@ -193,6 +196,7 @@ mod tests {
             .expect("wrapper should exist");
         assert!(wrapper.finalizer_decision.is_none());
         assert!(wrapper.profit_snapshot.is_none());
+        assert!(wrapper.venue_execution.is_none());
     }
 
     #[test]
@@ -205,7 +209,71 @@ mod tests {
             .expect("wrapper should exist");
         assert!(wrapper.finalizer_decision.is_none());
         assert!(wrapper.profit_snapshot.is_none());
+        assert!(wrapper.venue_execution.is_none());
         assert!(wrapper.meta.is_empty());
+    }
+
+    #[test]
+    fn icpswap_execution_state_round_trips_in_existing_meta_json() {
+        let receipt = make_receipt();
+        let token_in = ChainToken::Icp {
+            ledger: Principal::from_slice(&[1]),
+            symbol: "INPUT".to_string(),
+            decimals: 8,
+            fee: Nat::from(10u64),
+        };
+        let token_out = ChainToken::Icp {
+            ledger: Principal::from_slice(&[2]),
+            symbol: "OUTPUT".to_string(),
+            decimals: 6,
+            fee: Nat::from(20u64),
+        };
+        let plan = IcpswapExecutionPlan::new(
+            Principal::from_slice(&[3]),
+            Principal::from_slice(&[1]),
+            Principal::from_slice(&[2]),
+            Nat::from(3_000u64),
+            ChainTokenAmount::from_raw(token_in.clone(), Nat::from(100_000u64)),
+            ChainTokenAmount::from_raw(token_out.clone(), Nat::from(120_000u64)),
+            ChainTokenAmount::from_raw(token_out.clone(), Nat::from(20u64)),
+            100,
+            123,
+        )
+        .expect("plan");
+        let mut state = IcpswapExecutionState::planned(plan.clone());
+        state.phase = IcpswapExecutionPhase::AwaitingOutput;
+        state.gross_swap_output = Some(ChainTokenAmount::from_raw(token_out.clone(), Nat::from(119_500u64)));
+        state.input_balance_before = Some(ChainTokenAmount::from_raw(token_in, Nat::from(500_000u64)));
+        state.output_balance_before = Some(ChainTokenAmount::from_raw(token_out, Nat::from(42u64)));
+        state.approval_block_index = Some(Nat::from(77u64));
+        state.submitted_at = Some(456);
+        state.last_error = Some("waiting for asynchronous output".to_string());
+
+        let mut row = make_row("{}".to_string());
+        let wrapper = LiqMetaWrapper {
+            receipt,
+            meta: vec![1, 2, 3],
+            finalizer_decision: None,
+            profit_snapshot: None,
+            venue_execution: Some(VenueExecutionState::Icpswap(state.clone())),
+        };
+        encode_meta(&mut row, &wrapper).expect("encode wrapper");
+        let encoded: serde_json::Value = serde_json::from_str(&row.meta_json).expect("encoded wrapper json");
+        assert_eq!(encoded["venue_execution"]["venue"], "icpswap");
+        assert!(encoded["venue_execution"]["state"].is_object());
+
+        let decoded = decode_receipt_wrapper(&row)
+            .expect("decode wrapper")
+            .expect("wrapper exists");
+        assert_eq!(decoded.meta, vec![1, 2, 3]);
+        assert_eq!(
+            decoded.venue_execution,
+            Some(VenueExecutionState::Icpswap(state))
+        );
+        let Some(VenueExecutionState::Icpswap(decoded_state)) = decoded.venue_execution else {
+            panic!("ICPSwap state should exist");
+        };
+        assert_eq!(decoded_state.plan, plan);
     }
 
     #[test]

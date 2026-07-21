@@ -851,6 +851,7 @@ mod tests {
             meta: Vec::new(),
             finalizer_decision: None,
             profit_snapshot: None,
+            venue_execution: None,
         };
 
         let mut row = LiqResultRecord {
@@ -893,6 +894,7 @@ mod tests {
             meta: Vec::new(),
             finalizer_decision: None,
             profit_snapshot: None,
+            venue_execution: None,
         };
 
         let mut row = LiqResultRecord {
@@ -1047,6 +1049,7 @@ mod tests {
             meta: serde_json::to_vec(&legacy_value).expect("legacy meta encoding"),
             finalizer_decision: None,
             profit_snapshot: None,
+            venue_execution: None,
         };
 
         let mut row = LiqResultRecord {

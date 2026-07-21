@@ -107,6 +107,7 @@ impl TestWal {
             meta: Vec::new(),
             finalizer_decision: None,
             profit_snapshot: None,
+            venue_execution: None,
         })
     }
 
@@ -116,6 +117,7 @@ impl TestWal {
             meta,
             finalizer_decision: None,
             profit_snapshot: None,
+            venue_execution: None,
         })
     }
 

@@ -90,6 +90,40 @@ pub struct IcpswapExecutionPlan {
     pub quoted_at: u64,
 }
 
+#[derive(CandidType, Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum IcpswapExecutionPhase {
+    Planned,
+    Approved,
+    SubmissionUnknown,
+    AwaitingOutput,
+    RefundPending,
+    FundsInPool,
+    RecoveryWithdrawSubmitted,
+    Completed,
+    Refunded,
+    FailedTerminal,
+}
+
+#[derive(CandidType, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IcpswapExecutionState {
+    pub plan: IcpswapExecutionPlan,
+    pub phase: IcpswapExecutionPhase,
+    #[serde(default)]
+    pub gross_swap_output: Option<ChainTokenAmount>,
+    #[serde(default)]
+    pub input_balance_before: Option<ChainTokenAmount>,
+    #[serde(default)]
+    pub output_balance_before: Option<ChainTokenAmount>,
+    #[serde(default)]
+    pub approval_block_index: Option<Nat>,
+    #[serde(default)]
+    pub submitted_at: Option<u64>,
+    #[serde(default)]
+    pub recovery_attempted: bool,
+    #[serde(default)]
+    pub last_error: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum IcpswapPlanError {
     #[error("ICPSwap only supports ICP ledger tokens, got {0}")]
