@@ -17,20 +17,124 @@ use std::sync::{
 use crate::config::MockConfigTrait;
 use crate::executors::executor::ExecutorRequest;
 use crate::finalizers::cex_finalizer::{CexFinalizerLogic, CexRoutePreview, CexState};
-use crate::finalizers::dex_finalizer::DexFinalizerLogic;
-use crate::finalizers::finalizer::Finalizer;
+use crate::finalizers::dex_finalizer::{DexExecutionPlan, DexRouteFinalizer, DexRoutePreview};
+use crate::finalizers::finalizer::{Finalizer, FinalizerResult};
 use crate::finalizers::hybrid::utils::{RAY_PRICE_SCALE, RouteCandidate, RouteVenue, choose_best_route};
-use crate::persistance::{FinalizerDecisionSnapshot, LiqMetaWrapper, LiqResultRecord, ResultStatus, WalStore};
+use crate::persistance::{
+    FinalizerDecisionSnapshot, LiqMetaWrapper, LiqResultRecord, ResultStatus, VenueExecutionState, WalStore,
+};
 use crate::stages::executor::{ExecutionReceipt, ExecutionStatus};
+use crate::swappers::icpswap::plan::IcpswapPlanner;
+use crate::swappers::icpswap::types::{
+    IcpswapExecutionPlan, IcpswapExecutionState, IcpswapQuoteError, IcpswapQuoteResult,
+};
 use crate::swappers::model::{SwapExecution, SwapQuote, SwapRequest};
-use crate::swappers::swap_interface::MockSwapInterface;
+use crate::swappers::swap_interface::{MockSwapInterface, SwapInterface};
 use crate::wal::{encode_meta, liq_id_from_receipt};
+
+struct TestPlanner(MockSwapInterface);
+
+#[async_trait]
+impl IcpswapPlanner for TestPlanner {
+    async fn quote_with_plan(&self, request: &SwapRequest) -> Result<IcpswapQuoteResult, IcpswapQuoteError> {
+        let quote = self
+            .0
+            .quote(request)
+            .await
+            .map_err(|error| IcpswapQuoteError::NoUsablePools { failures: vec![error] })?;
+        let token_in = request.pay_amount.token.clone();
+        let ChainToken::Icp {
+            ledger: token_in_ledger,
+            ..
+        } = &token_in
+        else {
+            return Err(IcpswapQuoteError::MissingToken(request.pay_asset.to_string()));
+        };
+        let token_out_ledger = Principal::from_text(&request.receive_asset.address).map_err(|error| {
+            IcpswapQuoteError::InvalidPoolPrincipal {
+                field: "token_out",
+                address: request.receive_asset.address.clone(),
+                message: error.to_string(),
+            }
+        })?;
+        let token_out = ChainToken::Icp {
+            ledger: token_out_ledger,
+            symbol: request.receive_asset.symbol.clone(),
+            decimals: 8,
+            fee: Nat::from(0u8),
+        };
+        let plan = IcpswapExecutionPlan::new(
+            Principal::from_slice(&[9]),
+            *token_in_ledger,
+            token_out_ledger,
+            Nat::from(3_000u64),
+            request.pay_amount.clone(),
+            ChainTokenAmount::from_raw(token_in, Nat::from(0u8)),
+            ChainTokenAmount::from_raw(token_out.clone(), quote.receive_amount.clone()),
+            ChainTokenAmount::from_raw(token_out, Nat::from(0u8)),
+            request.max_slippage_bps.unwrap_or(100),
+            123,
+        )?;
+        Ok(IcpswapQuoteResult { quote, plan })
+    }
+}
+
+struct TestDexRouteFinalizer {
+    planner: TestPlanner,
+    finalizer: Arc<dyn Finalizer>,
+}
+
+#[async_trait]
+impl Finalizer for TestDexRouteFinalizer {
+    async fn finalize(&self, wal: &dyn WalStore, receipt: ExecutionReceipt) -> Result<FinalizerResult, String> {
+        self.finalizer.finalize(wal, receipt).await
+    }
+}
+
+#[async_trait]
+impl DexRouteFinalizer for TestDexRouteFinalizer {
+    async fn preview_route(&self, request: &SwapRequest) -> Result<DexRoutePreview, IcpswapQuoteError> {
+        let quoted = self.planner.quote_with_plan(request).await?;
+        Ok(DexRoutePreview {
+            quote: quoted.quote,
+            plan: DexExecutionPlan::Icpswap(quoted.plan),
+        })
+    }
+
+    async fn commit_route(
+        &self,
+        wal: &dyn WalStore,
+        receipt: &ExecutionReceipt,
+        decision: FinalizerDecisionSnapshot,
+        preview: DexRoutePreview,
+    ) -> Result<(), String> {
+        let DexExecutionPlan::Icpswap(plan) = preview.plan;
+        let liquidation_id = liq_id_from_receipt(receipt)?;
+        let mut row = wal
+            .get_result(&liquidation_id)
+            .await
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| format!("missing WAL row for liquidation {liquidation_id}"))?;
+        let mut wrapper: LiqMetaWrapper = serde_json::from_str(&row.meta_json).map_err(|error| error.to_string())?;
+        wrapper.venue_execution = Some(VenueExecutionState::Icpswap(IcpswapExecutionState::planned(plan)));
+        wrapper.finalizer_decision = Some(decision);
+        encode_meta(&mut row, &wrapper)?;
+        wal.upsert_result(row).await.map_err(|error| error.to_string())
+    }
+}
+
+fn dex_route_finalizer(planner: MockSwapInterface, finalizer: impl Finalizer + 'static) -> Arc<dyn DexRouteFinalizer> {
+    Arc::new(TestDexRouteFinalizer {
+        planner: TestPlanner(planner),
+        finalizer: Arc::new(finalizer),
+    })
+}
 
 struct NoopDexFinalizer;
 
 #[async_trait]
-impl DexFinalizerLogic for NoopDexFinalizer {
-    async fn swap(&self, _req: &SwapRequest) -> Result<SwapExecution, String> {
+impl Finalizer for NoopDexFinalizer {
+    async fn finalize(&self, _wal: &dyn WalStore, _receipt: ExecutionReceipt) -> Result<FinalizerResult, String> {
         Err("dex finalizer should not run".to_string())
     }
 }
@@ -40,23 +144,29 @@ struct RecordingDexFinalizer {
 }
 
 #[async_trait]
-impl DexFinalizerLogic for RecordingDexFinalizer {
-    async fn swap(&self, req: &SwapRequest) -> Result<SwapExecution, String> {
+impl Finalizer for RecordingDexFinalizer {
+    async fn finalize(&self, _wal: &dyn WalStore, receipt: ExecutionReceipt) -> Result<FinalizerResult, String> {
         self.swap_calls.fetch_add(1, Ordering::SeqCst);
-        Ok(SwapExecution {
-            swap_id: 1,
-            request_id: 1,
-            status: "completed".to_string(),
-            pay_asset: req.pay_asset.clone(),
-            pay_amount: req.pay_amount.value.clone(),
-            receive_asset: req.receive_asset.clone(),
-            receive_amount: Nat::from(1_100u64),
-            mid_price: 1.0,
-            exec_price: 1.0,
-            slippage: 0.0,
-            legs: vec![],
-            approval_count: None,
-            ts: 0,
+        let req = receipt.request.swap_args.expect("swap request");
+        Ok(FinalizerResult {
+            finalized: true,
+            swapper: Some("icpswap".to_string()),
+            reason: None,
+            swap_result: Some(SwapExecution {
+                swap_id: 1,
+                request_id: 1,
+                status: "completed".to_string(),
+                pay_asset: req.pay_asset.clone(),
+                pay_amount: req.pay_amount.value.clone(),
+                receive_asset: req.receive_asset.clone(),
+                receive_amount: Nat::from(1_100u64),
+                mid_price: 1.0,
+                exec_price: 1.0,
+                slippage: 0.0,
+                legs: vec![],
+                approval_count: None,
+                ts: 0,
+            }),
         })
     }
 }
@@ -397,8 +507,7 @@ async fn forced_dex_non_positive_preview_routes_to_recovery_and_uses_recovery_ac
     let finalizer = HybridFinalizer {
         config: Arc::new(config),
         trader_transfers: Arc::new(transfers),
-        dex_swapper: Arc::new(dex_swapper),
-        dex_finalizer: Arc::new(NoopDexFinalizer),
+        dex_finalizer: dex_route_finalizer(dex_swapper, NoopDexFinalizer),
         cex_finalizer: None,
     };
 
@@ -447,8 +556,7 @@ async fn forced_cex_non_positive_preview_routes_to_recovery_and_uses_recovery_ac
     let finalizer = HybridFinalizer {
         config: Arc::new(config),
         trader_transfers: Arc::new(transfers),
-        dex_swapper: Arc::new(dex_swapper),
-        dex_finalizer: Arc::new(NoopDexFinalizer),
+        dex_finalizer: dex_route_finalizer(dex_swapper, NoopDexFinalizer),
         cex_finalizer: Some(Arc::new(StubCexFinalizer {
             preview: Ok(cex_preview(900.0)),
         })),
@@ -492,8 +600,7 @@ async fn hybrid_recovery_non_icp_does_not_transfer() {
     let finalizer = HybridFinalizer {
         config: Arc::new(config),
         trader_transfers: Arc::new(transfers),
-        dex_swapper: Arc::new(dex_swapper),
-        dex_finalizer: Arc::new(NoopDexFinalizer),
+        dex_finalizer: dex_route_finalizer(dex_swapper, NoopDexFinalizer),
         cex_finalizer: None,
     };
 
@@ -529,10 +636,12 @@ async fn forced_dex_positive_preview_executes_dex() {
     let finalizer = HybridFinalizer {
         config: Arc::new(config),
         trader_transfers: Arc::new(transfers),
-        dex_swapper: Arc::new(dex_swapper),
-        dex_finalizer: Arc::new(RecordingDexFinalizer {
-            swap_calls: swap_calls.clone(),
-        }),
+        dex_finalizer: dex_route_finalizer(
+            dex_swapper,
+            RecordingDexFinalizer {
+                swap_calls: swap_calls.clone(),
+            },
+        ),
         cex_finalizer: None,
     };
 
@@ -568,8 +677,7 @@ async fn hybrid_both_preview_errors_returns_error() {
     let finalizer = HybridFinalizer {
         config: Arc::new(config),
         trader_transfers: Arc::new(transfers),
-        dex_swapper: Arc::new(dex_swapper),
-        dex_finalizer: Arc::new(NoopDexFinalizer),
+        dex_finalizer: dex_route_finalizer(dex_swapper, NoopDexFinalizer),
         cex_finalizer: Some(Arc::new(StubCexFinalizer {
             preview: Err("cex unavailable".to_string()),
         })),
@@ -616,8 +724,7 @@ async fn hybrid_recovery_transfer_failure_returns_error() {
     let finalizer = HybridFinalizer {
         config: Arc::new(config),
         trader_transfers: Arc::new(transfers),
-        dex_swapper: Arc::new(dex_swapper),
-        dex_finalizer: Arc::new(NoopDexFinalizer),
+        dex_finalizer: dex_route_finalizer(dex_swapper, NoopDexFinalizer),
         cex_finalizer: None,
     };
 
@@ -651,8 +758,7 @@ async fn hybrid_recovery_zero_transfer_amount_succeeds_without_transfer() {
     let finalizer = HybridFinalizer {
         config: Arc::new(config),
         trader_transfers: Arc::new(transfers),
-        dex_swapper: Arc::new(dex_swapper),
-        dex_finalizer: Arc::new(NoopDexFinalizer),
+        dex_finalizer: dex_route_finalizer(dex_swapper, NoopDexFinalizer),
         cex_finalizer: None,
     };
 
@@ -690,8 +796,7 @@ async fn forced_preview_error_persists_snapshot_and_errors() {
     let finalizer = HybridFinalizer {
         config: Arc::new(config),
         trader_transfers: Arc::new(transfers),
-        dex_swapper: Arc::new(dex_swapper),
-        dex_finalizer: Arc::new(NoopDexFinalizer),
+        dex_finalizer: dex_route_finalizer(dex_swapper, NoopDexFinalizer),
         cex_finalizer: None,
     };
 
@@ -728,8 +833,7 @@ async fn forced_preview_none_persists_snapshot_and_errors() {
     let finalizer = HybridFinalizer {
         config: Arc::new(config),
         trader_transfers: Arc::new(transfers),
-        dex_swapper: Arc::new(dex_swapper),
-        dex_finalizer: Arc::new(NoopDexFinalizer),
+        dex_finalizer: dex_route_finalizer(dex_swapper, NoopDexFinalizer),
         cex_finalizer: Some(Arc::new(StubCexFinalizer {
             preview: Ok(CexRoutePreview {
                 is_executable: false,
@@ -773,8 +877,7 @@ async fn forced_cex_under_min_notional_short_circuits_to_no_swap() {
     let finalizer = HybridFinalizer {
         config: Arc::new(config),
         trader_transfers: Arc::new(transfers),
-        dex_swapper: Arc::new(dex_swapper),
-        dex_finalizer: Arc::new(NoopDexFinalizer),
+        dex_finalizer: dex_route_finalizer(dex_swapper, NoopDexFinalizer),
         cex_finalizer: Some(Arc::new(StubCexFinalizer {
             preview: Err("preview should not be called".to_string()),
         })),
@@ -816,8 +919,7 @@ async fn forced_cex_positive_preview_executes_cex() {
     let finalizer = HybridFinalizer {
         config: Arc::new(config),
         trader_transfers: Arc::new(transfers),
-        dex_swapper: Arc::new(dex_swapper),
-        dex_finalizer: Arc::new(NoopDexFinalizer),
+        dex_finalizer: dex_route_finalizer(dex_swapper, NoopDexFinalizer),
         cex_finalizer: Some(Arc::new(StubCexFinalizer {
             preview: Ok(cex_preview(1_200.0)),
         })),
@@ -872,8 +974,7 @@ async fn hybrid_both_non_positive_routes_to_recovery_and_uses_recovery_account()
     let finalizer = HybridFinalizer {
         config: Arc::new(config),
         trader_transfers: Arc::new(transfers),
-        dex_swapper: Arc::new(dex_swapper),
-        dex_finalizer: Arc::new(NoopDexFinalizer),
+        dex_finalizer: dex_route_finalizer(dex_swapper, NoopDexFinalizer),
         cex_finalizer: Some(Arc::new(StubCexFinalizer {
             preview: Ok(cex_preview(900.0)),
         })),
@@ -913,8 +1014,7 @@ async fn hybrid_positive_but_below_min_returns_no_viable_route() {
     let finalizer = HybridFinalizer {
         config: Arc::new(config),
         trader_transfers: Arc::new(transfers),
-        dex_swapper: Arc::new(dex_swapper),
-        dex_finalizer: Arc::new(NoopDexFinalizer),
+        dex_finalizer: dex_route_finalizer(dex_swapper, NoopDexFinalizer),
         cex_finalizer: Some(Arc::new(StubCexFinalizer {
             preview: Ok(cex_preview(1_040.0)),
         })),
@@ -953,8 +1053,7 @@ async fn hybrid_one_preview_error_uses_other_preview() {
     let finalizer = HybridFinalizer {
         config: Arc::new(config),
         trader_transfers: Arc::new(transfers),
-        dex_swapper: Arc::new(dex_swapper),
-        dex_finalizer: Arc::new(NoopDexFinalizer),
+        dex_finalizer: dex_route_finalizer(dex_swapper, NoopDexFinalizer),
         cex_finalizer: Some(Arc::new(StubCexFinalizer {
             preview: Ok(cex_preview(1_200.0)),
         })),
@@ -1006,8 +1105,7 @@ async fn hybrid_recovery_persists_snapshot() {
     let finalizer = HybridFinalizer {
         config: Arc::new(config),
         trader_transfers: Arc::new(transfers),
-        dex_swapper: Arc::new(dex_swapper),
-        dex_finalizer: Arc::new(NoopDexFinalizer),
+        dex_finalizer: dex_route_finalizer(dex_swapper, NoopDexFinalizer),
         cex_finalizer: Some(Arc::new(StubCexFinalizer {
             preview: Ok(cex_preview(900.0)),
         })),
@@ -1052,8 +1150,7 @@ async fn hybrid_no_viable_persists_snapshot() {
     let finalizer = HybridFinalizer {
         config: Arc::new(config),
         trader_transfers: Arc::new(transfers),
-        dex_swapper: Arc::new(dex_swapper),
-        dex_finalizer: Arc::new(NoopDexFinalizer),
+        dex_finalizer: dex_route_finalizer(dex_swapper, NoopDexFinalizer),
         cex_finalizer: Some(Arc::new(StubCexFinalizer {
             preview: Ok(cex_preview(1_040.0)),
         })),
@@ -1107,8 +1204,7 @@ async fn decision_snapshot_preserves_existing_meta_bytes() {
     let finalizer = HybridFinalizer {
         config: Arc::new(config),
         trader_transfers: Arc::new(transfers),
-        dex_swapper: Arc::new(dex_swapper),
-        dex_finalizer: Arc::new(NoopDexFinalizer),
+        dex_finalizer: dex_route_finalizer(dex_swapper, NoopDexFinalizer),
         cex_finalizer: None,
     };
 
@@ -1132,12 +1228,14 @@ fn choose_best_route_prefers_higher_net_edge_candidate() {
         gross_edge_bps: DEX_NET_EDGE_BPS,
         net_edge_bps: DEX_NET_EDGE_BPS,
         reason: "dex".to_string(),
+        dex_preview: None,
     };
     let cex_candidate = RouteCandidate {
         venue: RouteVenue::Cex,
         gross_edge_bps: CEX_NET_EDGE_BPS,
         net_edge_bps: CEX_NET_EDGE_BPS,
         reason: "cex".to_string(),
+        dex_preview: None,
     };
 
     let selected =
@@ -1156,12 +1254,14 @@ fn choose_best_route_returns_available_candidate_when_other_missing() {
         gross_edge_bps: DEX_NET_EDGE_BPS,
         net_edge_bps: DEX_NET_EDGE_BPS,
         reason: "dex".to_string(),
+        dex_preview: None,
     };
     let cex_candidate = RouteCandidate {
         venue: RouteVenue::Cex,
         gross_edge_bps: CEX_NET_EDGE_BPS,
         net_edge_bps: CEX_NET_EDGE_BPS,
         reason: "cex".to_string(),
+        dex_preview: None,
     };
 
     let selected = choose_best_route(Some(dex_candidate.clone()), None).expect("dex candidate should be selected");

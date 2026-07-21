@@ -11,12 +11,12 @@ use crate::{
     config::{ConfigTrait, SwapperMode},
     finalizers::{
         cex_finalizer::CexFinalizerLogic,
-        dex_finalizer::DexFinalizerLogic,
+        dex_finalizer::DexRouteFinalizer,
         finalizer::{Finalizer, FinalizerResult},
     },
-    persistance::{FinalizerDecisionSnapshot, ResultStatus, WalStore},
+    persistance::{FinalizerDecisionSnapshot, ResultStatus, VenueExecutionState, WalStore},
     stages::executor::ExecutionReceipt,
-    swappers::{model::SwapRequest, swap_interface::SwapInterface},
+    swappers::model::SwapRequest,
     wal::{decode_receipt_wrapper, encode_meta, liq_id_from_receipt, wal_load},
 };
 
@@ -34,9 +34,7 @@ where
 {
     pub config: Arc<C>,
     pub trader_transfers: Arc<dyn TransferActions + Send + Sync>,
-    // Used only for getting DEX quotes; actual DEX execution is delegated to dex_finalizer.
-    pub dex_swapper: Arc<dyn SwapInterface>,
-    pub dex_finalizer: Arc<dyn DexFinalizerLogic>,
+    pub dex_finalizer: Arc<dyn DexRouteFinalizer>,
     pub cex_finalizer: Option<Arc<dyn CexFinalizerLogic>>, // existing CEX finalizer
 }
 
@@ -220,8 +218,9 @@ where
         swap_req: &SwapRequest,
         debt_repaid_amount: f64,
     ) -> Result<Option<RouteCandidate>, String> {
-        match self.dex_swapper.quote(swap_req).await {
-            Ok(quote) => {
+        match self.dex_finalizer.preview_route(swap_req).await {
+            Ok(quoted) => {
+                let quote = &quoted.quote;
                 let estimated_receive_amount =
                     ChainTokenAmount::from_raw(receipt.request.debt_asset.clone(), quote.receive_amount.clone())
                         .to_f64();
@@ -238,6 +237,7 @@ where
                     gross_edge_bps,
                     net_edge_bps,
                     reason: format!("dex preview net edge {:.2} bps", net_edge_bps),
+                    dex_preview: Some(quoted),
                 }))
             }
             Err(err) => Err(format!("dex preview failed: {}", err)),
@@ -277,6 +277,7 @@ where
                     gross_edge_bps,
                     net_edge_bps,
                     reason: format!("cex preview net edge {:.2} bps", net_edge_bps),
+                    dex_preview: None,
                 }))
             }
             Ok(preview) => {
@@ -297,7 +298,11 @@ where
         snapshot: FinalizerDecisionSnapshot,
     ) -> Result<(), String> {
         let liq_id = liq_id_from_receipt(receipt)?;
+        let commits_route = matches!(snapshot.chosen.as_str(), "dex" | "cex");
         let Some(mut row) = wal_load(wal, &liq_id).await? else {
+            if commits_route {
+                return Err(format!("missing WAL row for liquidation {liq_id}"));
+            }
             info!(
                 "[hybrid] decision snapshot skipped; missing wal row liq_id={} chosen={} mode={}",
                 liq_id, snapshot.chosen, snapshot.mode
@@ -307,12 +312,56 @@ where
 
         let mut wrapper = decode_receipt_wrapper(&row)?
             .ok_or_else(|| format!("missing receipt wrapper in WAL meta_json for {}", row.id))?;
+
+        if commits_route {
+            if let Some(existing) = &wrapper.finalizer_decision
+                && matches!(existing.chosen.as_str(), "dex" | "cex")
+                && existing.chosen != snapshot.chosen
+            {
+                return Err(format!(
+                    "refusing to replace persisted {} route with {} for liquidation {liq_id}",
+                    existing.chosen, snapshot.chosen
+                ));
+            }
+            if snapshot.chosen == "cex" && wrapper.venue_execution.is_some() {
+                return Err(format!(
+                    "refusing to select CEX after DEX execution state was persisted for liquidation {liq_id}"
+                ));
+            }
+        }
+
         wrapper.finalizer_decision = Some(snapshot);
         encode_meta(&mut row, &wrapper)?;
         wal.upsert_result(row)
             .await
             .map_err(|e| format!("wal decision snapshot upsert failed for {}: {}", liq_id, e))?;
         Ok(())
+    }
+
+    /// Returns a previously committed side-effecting route. ICPSwap state has
+    /// priority because its existence proves a typed DEX plan was committed.
+    async fn load_committed_route(
+        &self,
+        wal: &dyn WalStore,
+        receipt: &ExecutionReceipt,
+    ) -> Result<Option<RouteVenue>, String> {
+        let liquidation_id = liq_id_from_receipt(receipt)?;
+        let Some(row) = wal_load(wal, &liquidation_id).await? else {
+            return Ok(None);
+        };
+        let Some(wrapper) = decode_receipt_wrapper(&row)? else {
+            return Ok(None);
+        };
+        if matches!(wrapper.venue_execution, Some(VenueExecutionState::Icpswap(_))) {
+            return Ok(Some(RouteVenue::Dex));
+        }
+        Ok(wrapper
+            .finalizer_decision
+            .and_then(|decision| match decision.chosen.as_str() {
+                "dex" => Some(RouteVenue::Dex),
+                "cex" => Some(RouteVenue::Cex),
+                _ => None,
+            }))
     }
 
     async fn finalize_with_route_decision(
@@ -327,7 +376,18 @@ where
             RouteVenue::Cex => "cex",
         };
         let snapshot = ctx.snapshot(chosen, reason.clone());
-        self.persist_decision_snapshot(ctx.wal, &receipt, snapshot).await?;
+        match venue {
+            RouteVenue::Dex => {
+                let preview = ctx
+                    .dex_preview
+                    .and_then(|candidate| candidate.dex_preview.clone())
+                    .ok_or_else(|| "selected DEX candidate has no execution preview".to_string())?;
+                self.dex_finalizer
+                    .commit_route(ctx.wal, &receipt, snapshot, preview)
+                    .await?;
+            }
+            RouteVenue::Cex => self.persist_decision_snapshot(ctx.wal, &receipt, snapshot).await?,
+        }
         self.execute_route(ctx.wal, receipt, venue, Some(&reason)).await
     }
 
@@ -394,6 +454,15 @@ where
             Some(req) => req,
             None => return self.finalize_without_swap(wal, &receipt, None).await,
         };
+
+        // A committed DEX/CEX route is sticky. Resume it before reading any
+        // mutable quote or routing configuration, so restarts cannot switch
+        // venues or replace the selected ICPSwap pool.
+        if let Some(venue) = self.load_committed_route(wal, &receipt).await? {
+            return self
+                .execute_route(wal, receipt, venue, Some("resume persisted route"))
+                .await;
+        }
 
         // Common decision inputs used by all branches below.
         let debt_repaid_amount = debt_repaid_f64(&receipt)?;

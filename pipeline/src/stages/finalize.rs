@@ -6,6 +6,7 @@ use candid::{Encode, Principal};
 use tracing::{debug, info, warn};
 
 use crate::finalizers::finalizer::{Finalizer, FinalizerResult};
+use crate::finalizers::icpswap::finalizer::ICPSWAP_FINALIZER_PERMANENT_PREFIX;
 use crate::finalizers::liquidation_outcome::LiquidationOutcome;
 use crate::finalizers::profit_calculator::ProfitCalculator;
 
@@ -41,6 +42,10 @@ fn retry_delay_secs(base: u64, max: u64, error_count: i32) -> u64 {
 }
 
 fn is_permanent_finalizer_error(err: &str) -> bool {
+    err.starts_with(FINALIZER_PERMANENT_AMOUNT_FLOOR_PREFIX) || err.starts_with(ICPSWAP_FINALIZER_PERMANENT_PREFIX)
+}
+
+fn is_bad_debt_amount_floor(err: &str) -> bool {
     err.starts_with(FINALIZER_PERMANENT_AMOUNT_FLOOR_PREFIX)
 }
 
@@ -329,7 +334,7 @@ where
                         .ok_or_else(|| format!("missing WAL id for liquidation {}", liq_id))?;
 
                     debug!("Failed finalization {}", err_msg);
-                    if is_permanent_finalizer_error(&err_msg) && receipt.request.liquidation.buy_bad_debt {
+                    if is_bad_debt_amount_floor(&err_msg) && receipt.request.liquidation.buy_bad_debt {
                         let _ = wal_mark_succeeded(&*self.wal, wal_id).await;
 
                         fin_results.push((
@@ -436,6 +441,13 @@ mod tests {
     };
     use mockall::predicate::eq;
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn icpswap_terminal_error_is_classified_permanent() {
+        let error = format!("{ICPSWAP_FINALIZER_PERMANENT_PREFIX}ambiguous withdrawal");
+        assert!(is_permanent_finalizer_error(&error));
+        assert!(!is_bad_debt_amount_floor(&error));
+    }
 
     #[derive(Clone)]
     struct NoopFinalizer {

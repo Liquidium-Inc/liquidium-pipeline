@@ -3,6 +3,7 @@ use std::{collections::HashMap, sync::Arc, time::SystemTime};
 use async_trait::async_trait;
 use candid::{Nat, Principal};
 use futures::future::join_all;
+use icrc_ledger_types::icrc1::account::Account;
 use liquidium_pipeline_core::tokens::{
     asset_id::AssetId, chain_token::ChainToken, chain_token_amount::ChainTokenAmount,
 };
@@ -13,11 +14,16 @@ use crate::swappers::{
 };
 
 use super::{
-    client::IcpswapReadClient,
+    client::{
+        IcpswapExecutionClient, IcpswapReadClient, IcpswapReconciliationClient, IcpswapRecoveryClient,
+        IcpswapRecoveryTransferClient, IcpswapWorkflowClient,
+    },
     plan::{IcpswapPlanner, amount_out_minimum, nat_to_decimal_text},
     types::{
-        IcpswapExecutionPlan, IcpswapQuoteError, IcpswapQuoteResult, IcpswapSwapArgs, IcpswapToken,
-        IcpswapTokenMetadata,
+        IcpswapApprovalRequest, IcpswapDepositAndSwapArgs, IcpswapExecutionClientError, IcpswapExecutionPlan,
+        IcpswapQuoteError, IcpswapQuoteResult, IcpswapRecoveryClientError, IcpswapRecoveryTransferClientError,
+        IcpswapRecoveryTransferOutcome, IcpswapRecoveryTransferRequest, IcpswapSwapArgs, IcpswapToken,
+        IcpswapTokenMetadata, IcpswapTransaction, IcpswapUnusedBalance, IcpswapWithdrawArgs,
     },
 };
 
@@ -27,6 +33,10 @@ pub struct IcpswapVenue<C: IcpswapReadClient> {
     fee_tiers: Vec<Nat>,
     default_max_slippage_bps: u32,
 }
+
+pub trait IcpswapVenueService: IcpswapPlanner + IcpswapWorkflowClient {}
+
+impl<T> IcpswapVenueService for T where T: IcpswapPlanner + IcpswapWorkflowClient {}
 
 impl<C: IcpswapReadClient> IcpswapVenue<C> {
     pub fn new(
@@ -219,6 +229,94 @@ impl<C: IcpswapReadClient + 'static> SwapVenue for IcpswapVenue<C> {
 
     async fn execute(&self, _request: &SwapRequest) -> Result<SwapExecution, String> {
         Err("ICPSwap execution is disabled until durable settlement and recovery are implemented".to_string())
+    }
+}
+
+#[async_trait]
+impl<C> IcpswapExecutionClient for IcpswapVenue<C>
+where
+    C: IcpswapReadClient + IcpswapExecutionClient,
+{
+    async fn latest_transaction_id(
+        &self,
+        pool: Principal,
+        owner: Principal,
+    ) -> Result<Option<Nat>, IcpswapExecutionClientError> {
+        self.client.latest_transaction_id(pool, owner).await
+    }
+
+    async fn allowance(
+        &self,
+        ledger: Principal,
+        owner: &Account,
+        spender: &Account,
+    ) -> Result<Nat, IcpswapExecutionClientError> {
+        self.client.allowance(ledger, owner, spender).await
+    }
+
+    async fn approve(&self, request: IcpswapApprovalRequest) -> Result<Nat, IcpswapExecutionClientError> {
+        self.client.approve(request).await
+    }
+
+    async fn deposit_from_and_swap(
+        &self,
+        pool: Principal,
+        args: &IcpswapDepositAndSwapArgs,
+    ) -> Result<Nat, IcpswapExecutionClientError> {
+        self.client.deposit_from_and_swap(pool, args).await
+    }
+}
+
+#[async_trait]
+impl<C> IcpswapReconciliationClient for IcpswapVenue<C>
+where
+    C: IcpswapReadClient + IcpswapReconciliationClient,
+{
+    async fn transactions_by_owner(
+        &self,
+        pool: Principal,
+        owner: Principal,
+    ) -> Result<Vec<(Nat, IcpswapTransaction)>, String> {
+        IcpswapReconciliationClient::transactions_by_owner(self.client.as_ref(), pool, owner).await
+    }
+
+    async fn unused_balance(&self, pool: Principal, owner: Principal) -> Result<IcpswapUnusedBalance, String> {
+        IcpswapReconciliationClient::unused_balance(self.client.as_ref(), pool, owner).await
+    }
+}
+
+#[async_trait]
+impl<C> IcpswapRecoveryClient for IcpswapVenue<C>
+where
+    C: IcpswapReadClient + IcpswapRecoveryClient,
+{
+    async fn transactions_by_owner(
+        &self,
+        pool: Principal,
+        owner: Principal,
+    ) -> Result<Vec<(Nat, IcpswapTransaction)>, String> {
+        IcpswapRecoveryClient::transactions_by_owner(self.client.as_ref(), pool, owner).await
+    }
+
+    async fn unused_balance(&self, pool: Principal, owner: Principal) -> Result<IcpswapUnusedBalance, String> {
+        IcpswapRecoveryClient::unused_balance(self.client.as_ref(), pool, owner).await
+    }
+
+    async fn withdraw(&self, pool: Principal, args: &IcpswapWithdrawArgs) -> Result<Nat, IcpswapRecoveryClientError> {
+        self.client.withdraw(pool, args).await
+    }
+}
+
+#[async_trait]
+impl<C> IcpswapRecoveryTransferClient for IcpswapVenue<C>
+where
+    C: IcpswapReadClient + IcpswapRecoveryTransferClient,
+{
+    async fn transfer_recovered_funds(
+        &self,
+        request: &IcpswapRecoveryTransferRequest,
+    ) -> Result<IcpswapRecoveryTransferOutcome, IcpswapRecoveryTransferClientError> {
+        self.client.transfer_recovered_funds(request).await
     }
 }
 

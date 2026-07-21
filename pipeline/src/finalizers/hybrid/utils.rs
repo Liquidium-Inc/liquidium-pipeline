@@ -4,6 +4,7 @@ use liquidium_pipeline_core::tokens::chain_token_amount::ChainTokenAmount;
 use num_traits::ToPrimitive;
 
 use crate::{
+    finalizers::dex_finalizer::DexRoutePreview,
     persistance::{FinalizerDecisionSnapshot, now_secs},
     stages::executor::ExecutionReceipt,
     swappers::model::SwapRequest,
@@ -41,6 +42,7 @@ pub(crate) struct RouteCandidate {
     pub(crate) gross_edge_bps: f64,
     pub(crate) net_edge_bps: f64,
     pub(crate) reason: String,
+    pub(crate) dex_preview: Option<DexRoutePreview>,
 }
 
 /// Convert internal route venue into external swapper id used by exports/UI.

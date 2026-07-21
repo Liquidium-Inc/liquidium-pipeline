@@ -8,8 +8,6 @@ use crate::swappers::{
     swap_interface::SwapInterface,
 };
 
-pub const DEFAULT_DEX_VENUE: &str = "icpswap";
-
 #[async_trait]
 pub trait SwapVenue: Send + Sync {
     fn venue_name(&self) -> &'static str;
@@ -31,27 +29,37 @@ impl SwapInterface for SwapRouter {
 }
 
 pub struct SwapRouter {
-    pub venues: HashMap<String, Arc<dyn SwapVenue>>,
+    venues: HashMap<String, Arc<dyn SwapVenue>>,
+    default_venue: Option<String>,
 }
 
 impl SwapRouter {
     pub fn new() -> Self {
-        Self { venues: HashMap::new() }
+        Self {
+            venues: HashMap::new(),
+            default_venue: None,
+        }
     }
 
-    pub fn with_venue(mut self, name: &str, venue: Arc<dyn SwapVenue>) -> Self {
-        self.venues.insert(name.to_string(), venue);
+    pub fn with_venue(mut self, venue: Arc<dyn SwapVenue>) -> Self {
+        self.venues.insert(venue.venue_name().to_string(), venue);
+        self
+    }
+
+    pub fn with_default_venue(mut self, venue: Arc<dyn SwapVenue>) -> Self {
+        let name = venue.venue_name().to_string();
+        self.venues.insert(name.clone(), venue);
+        self.default_venue = Some(name);
         self
     }
 
     fn pick_venue<'a>(&'a self, req: &SwapRequest) -> Result<&'a Arc<dyn SwapVenue>, String> {
         let name = req
             .venue_hint
-            .clone()
-            .unwrap_or_else(|| DEFAULT_DEX_VENUE.to_owned());
-        self.venues
-            .get(&name)
-            .ok_or_else(|| format!("{} venue not found", name))
+            .as_ref()
+            .or(self.default_venue.as_ref())
+            .ok_or_else(|| "no default swap venue configured".to_string())?;
+        self.venues.get(name).ok_or_else(|| format!("{} venue not found", name))
     }
 
     #[instrument(name = "swap_router.init", skip_all, err)]
@@ -88,10 +96,34 @@ impl Default for SwapRouter {
 
 #[cfg(test)]
 mod tests {
-    use super::DEFAULT_DEX_VENUE;
+    use super::*;
+
+    struct TestVenue;
+
+    #[async_trait]
+    impl SwapVenue for TestVenue {
+        fn venue_name(&self) -> &'static str {
+            "test"
+        }
+
+        async fn init(&self) -> Result<(), String> {
+            Ok(())
+        }
+
+        async fn quote(&self, _req: &SwapRequest) -> Result<SwapQuote, String> {
+            unreachable!()
+        }
+
+        async fn execute(&self, _req: &SwapRequest) -> Result<SwapExecution, String> {
+            unreachable!()
+        }
+    }
 
     #[test]
-    fn production_default_dex_venue_is_icpswap() {
-        assert_eq!(DEFAULT_DEX_VENUE, "icpswap");
+    fn default_venue_is_registered_through_the_common_abstraction() {
+        let router = SwapRouter::new().with_default_venue(Arc::new(TestVenue));
+
+        assert_eq!(router.default_venue.as_deref(), Some("test"));
+        assert!(router.venues.contains_key("test"));
     }
 }

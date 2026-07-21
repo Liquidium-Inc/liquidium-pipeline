@@ -20,7 +20,6 @@ use crate::{
     finalizers::{
         cex_finalizer::CexFinalizerLogic,
         hybrid::hybrid_finalizer::HybridFinalizer,
-        icpswap_finalizer::IcpswapFinalizer,
         mexc::runtime::build_mexc_finalizer,
         profit_calculator::SimpleProfitCalculator,
     },
@@ -89,18 +88,13 @@ async fn init(
         warn!("Swap router init failed: {}", err);
     }
 
-    // ICPSwap is the only production DEX venue. Its execution path remains
-    // disabled until durable settlement and recovery are implemented.
-    let icpswap_finalizer = Arc::new(IcpswapFinalizer::new(ctx.swap_router.clone()));
-
     let mexc_finalizer = build_mexc_finalizer(ctx.as_ref()).await?;
 
     // Hybrid finalizer composes the ICPSwap preview path and MEXC finalizer.
     let hybrid_finalizer = Arc::new(HybridFinalizer {
         config: config.clone(),
         trader_transfers: ctx.trader_transfers.actions(),
-        dex_swapper: ctx.swap_router.clone(),
-        dex_finalizer: icpswap_finalizer.clone(),
+        dex_finalizer: ctx.dex_route_finalizer.clone(),
         cex_finalizer: Some(mexc_finalizer.clone() as Arc<dyn CexFinalizerLogic>),
     });
 

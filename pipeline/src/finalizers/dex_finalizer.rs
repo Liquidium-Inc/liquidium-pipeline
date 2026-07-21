@@ -3,10 +3,39 @@ use log::debug;
 
 use crate::{
     finalizers::finalizer::{Finalizer, FinalizerResult},
-    persistance::WalStore,
+    persistance::{FinalizerDecisionSnapshot, WalStore},
     stages::executor::{ExecutionReceipt, ExecutionStatus},
-    swappers::model::{SwapExecution, SwapRequest},
+    swappers::{
+        icpswap::types::{IcpswapExecutionPlan, IcpswapQuoteError},
+        model::{SwapExecution, SwapQuote, SwapRequest},
+    },
 };
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DexExecutionPlan {
+    Icpswap(IcpswapExecutionPlan),
+}
+
+#[derive(Debug, Clone)]
+pub struct DexRoutePreview {
+    pub quote: SwapQuote,
+    pub plan: DexExecutionPlan,
+}
+
+/// One coherent DEX dependency for previewing and executing a persisted plan.
+/// A future implementation may aggregate several DEX venues behind this trait.
+#[async_trait]
+pub trait DexRouteFinalizer: Finalizer + Send + Sync {
+    async fn preview_route(&self, request: &SwapRequest) -> Result<DexRoutePreview, IcpswapQuoteError>;
+
+    async fn commit_route(
+        &self,
+        wal: &dyn WalStore,
+        receipt: &ExecutionReceipt,
+        decision: FinalizerDecisionSnapshot,
+        preview: DexRoutePreview,
+    ) -> Result<(), String>;
+}
 
 // Tunables
 const BASE_SLIPPAGE_BPS: u32 = 125; // 1.25%

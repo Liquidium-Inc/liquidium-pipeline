@@ -27,8 +27,12 @@ use liquidium_pipeline_connectors::{
 
 use crate::approval_state::ApprovalState;
 use crate::config::{Config, ConfigTrait};
+use crate::finalizers::{dex_finalizer::DexRouteFinalizer, icpswap::finalizer::IcpswapFinalizer};
 use crate::swappers::icpswap::{client::IcpswapClient, types::IcpswapTokenMetadata, venue::IcpswapVenue};
-use crate::swappers::router::{DEFAULT_DEX_VENUE, SwapRouter, SwapVenue};
+use crate::swappers::router::SwapRouter;
+
+const ICPSWAP_AUTOMATIC_REFUND_WAIT_NANOS: u64 = 120_000_000_000;
+const ICPSWAP_RECOVERY_TIMEOUT_NANOS: u64 = 300_000_000_000;
 
 pub struct PipelineContext {
     pub config: Arc<Config>,
@@ -41,6 +45,7 @@ pub struct PipelineContext {
     pub main_transfers: Arc<TransferService>,
     pub trader_transfers: Arc<TransferService>,
     pub swap_router: Arc<SwapRouter>,
+    pub dex_route_finalizer: Arc<dyn DexRouteFinalizer>,
     pub recovery_transfers: Arc<TransferService>,
     pub bridge_transfers: Arc<TransferService>,
     pub evm_address: String,
@@ -276,7 +281,7 @@ impl<P: Provider<AnyNetwork> + WalletProvider<AnyNetwork> + Clone + 'static> Pip
             icp_backend_trader.clone(),
             config.icpswap_factory_canister,
         ));
-        let icpswap_venue: Arc<dyn SwapVenue> = Arc::new(
+        let icpswap_venue = Arc::new(
             IcpswapVenue::new(
                 icpswap_client,
                 icpswap_tokens,
@@ -289,14 +294,26 @@ impl<P: Provider<AnyNetwork> + WalletProvider<AnyNetwork> + Clone + 'static> Pip
         // let mexc_client = Arc::new(MexcClient::from_env()?);
         // let mexc_venue: Arc<dyn SwapVenue> = Arc::new(MexcSwapVenue::new(mexc_client));
 
-        // Build router
-        let swap_router = SwapRouter::new().with_venue(DEFAULT_DEX_VENUE, icpswap_venue);
+        let dex_route_finalizer: Arc<dyn DexRouteFinalizer> = Arc::new(IcpswapFinalizer::new(
+            icpswap_venue.clone(),
+            Account {
+                owner: config.trader_principal,
+                subaccount: None,
+            },
+            config.get_recovery_account(),
+            ICPSWAP_AUTOMATIC_REFUND_WAIT_NANOS,
+            ICPSWAP_RECOVERY_TIMEOUT_NANOS,
+        ));
+
+        // The router only sees ICPSwap through the common venue abstraction.
+        let swap_router = SwapRouter::new().with_default_venue(icpswap_venue);
 
         let swap_router = Arc::new(swap_router);
 
         Ok(PipelineContext {
             config: config.clone(),
             swap_router,
+            dex_route_finalizer,
             registry,
             main_service: Arc::new(main_service),
             trader_service: Arc::new(trader_service),

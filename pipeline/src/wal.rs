@@ -89,6 +89,7 @@ pub async fn wal_mark_enqueued(wal: &dyn WalStore, liq_id: &str) -> Result<(), S
 mod tests {
     use super::*;
     use candid::{Nat, Principal};
+    use icrc_ledger_types::icrc1::account::Account;
     use liquidium_pipeline_core::tokens::{chain_token::ChainToken, chain_token_amount::ChainTokenAmount};
     use liquidium_pipeline_core::types::protocol_types::{
         AssetType, LiquidationAmounts, LiquidationRequest, LiquidationResult, LiquidationStatus, TransferStatus,
@@ -255,6 +256,24 @@ mod tests {
             state.plan.amount_in.token.clone(),
             Nat::from(99_990u64),
         ));
+        state.recovery_transaction_start = Some(Nat::from(82u64));
+        state.recovery_transaction_id = Some(Nat::from(83u64));
+        state.recovery_ledger_block_index = Some(Nat::from(901u64));
+        state.recovery_submitted_at = Some(455);
+        state.returned_gross_amount = Some(ChainTokenAmount::from_raw(
+            state.plan.amount_in.token.clone(),
+            Nat::from(99_990u64),
+        ));
+        state.recovery_destination = Some(Account {
+            owner: Principal::from_slice(&[4]),
+            subaccount: Some([7; 32]),
+        });
+        state.recovery_transfer_amount = Some(ChainTokenAmount::from_raw(
+            state.plan.amount_in.token.clone(),
+            Nat::from(99_970u64),
+        ));
+        state.recovery_transfer_created_at = Some(457);
+        state.recovery_transfer_block_index = Some(Nat::from(902u64));
         state.submitted_at = Some(456);
         state.last_error = Some("waiting for asynchronous output".to_string());
 

@@ -129,6 +129,29 @@ pub trait IcpswapRecoveryTransferClient: Send + Sync {
     ) -> Result<IcpswapRecoveryTransferOutcome, IcpswapRecoveryTransferClientError>;
 }
 
+/// Complete client capability required by the durable ICPSwap workflow.
+/// Individual algorithms depend on the narrower traits above; composition
+/// roots and routers can hold this single opaque client view.
+pub trait IcpswapWorkflowClient:
+    IcpswapExecutionClient
+    + IcpswapReconciliationClient
+    + IcpswapRecoveryClient
+    + IcpswapRecoveryTransferClient
+    + Send
+    + Sync
+{
+}
+
+impl<T> IcpswapWorkflowClient for T where
+    T: IcpswapExecutionClient
+        + IcpswapReconciliationClient
+        + IcpswapRecoveryClient
+        + IcpswapRecoveryTransferClient
+        + Send
+        + Sync
+{
+}
+
 pub struct IcpswapClient<A: PipelineAgent, B: IcpswapLedgerClient> {
     agent: Arc<A>,
     icp_backend: Arc<B>,
