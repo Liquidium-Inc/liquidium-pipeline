@@ -6,7 +6,8 @@ use icrc_ledger_types::icrc1::account::Account;
 use liquidium_pipeline_core::tokens::{chain_token::ChainToken, chain_token_amount::ChainTokenAmount};
 
 use super::{
-    client::MockIcpswapReconciliationClient, execution::IcpswapExecutionStateStore, reconciliation::reconcile, types::*,
+    client::MockIcpswapReconciliationClient, execution::IcpswapExecutionStateStore,
+    settlement::reconcile_swap_settlement, types::*,
 };
 
 fn p(id: u8) -> Principal {
@@ -160,7 +161,7 @@ async fn completed_pool_transaction_confirms_exact_output_and_block_index() {
         .return_once(|_, _| Ok(vec![swap_transaction(42, IcpswapOneStepSwapStatus::Completed)]));
     let store = Store(Mutex::new(state()));
 
-    let result = reconcile(&client, &store, "liq", account(p(4)), 1_000, 500)
+    let result = reconcile_swap_settlement(&client, &store, "liq", account(p(4)), 1_000, 500)
         .await
         .expect("reconciled");
 
@@ -181,13 +182,14 @@ async fn failed_swap_waits_for_and_then_confirms_linked_refund() {
     });
     let store = Store(Mutex::new(state()));
 
-    let result = reconcile(&client, &store, "liq", account(p(4)), 1_000, 500)
+    let result = reconcile_swap_settlement(&client, &store, "liq", account(p(4)), 1_000, 500)
         .await
         .expect("reconciled");
 
     assert_eq!(result.phase, IcpswapExecutionPhase::Refunded);
     assert_eq!(result.refund_transaction_id, Some(Nat::from(43u64)));
     assert_eq!(result.refund_ledger_block_index, Some(Nat::from(901u64)));
+    assert_eq!(result.returned_gross_amount.unwrap().value, Nat::from(100_000u64));
 }
 
 #[tokio::test]
@@ -199,7 +201,7 @@ async fn cursor_excludes_old_identical_transaction() {
         .return_once(|_, _| Ok(vec![swap_transaction(41, IcpswapOneStepSwapStatus::Completed)]));
     let store = Store(Mutex::new(state()));
 
-    let result = reconcile(&client, &store, "liq", account(p(4)), 1_000, 500)
+    let result = reconcile_swap_settlement(&client, &store, "liq", account(p(4)), 1_000, 500)
         .await
         .expect("pending");
 
@@ -218,7 +220,7 @@ async fn multiple_matching_new_transactions_are_rejected_as_ambiguous() {
     });
     let store = Store(Mutex::new(state()));
 
-    let error = reconcile(&client, &store, "liq", account(p(4)), 1_000, 500)
+    let error = reconcile_swap_settlement(&client, &store, "liq", account(p(4)), 1_000, 500)
         .await
         .unwrap_err();
     assert_eq!(error, IcpswapReconciliationError::AmbiguousTransaction);
@@ -234,7 +236,7 @@ async fn failed_swap_waits_before_inspecting_unused_balance() {
     client.expect_unused_balance().times(0);
     let store = Store(Mutex::new(state()));
 
-    let result = reconcile(&client, &store, "liq", account(p(4)), 599, 500)
+    let result = reconcile_swap_settlement(&client, &store, "liq", account(p(4)), 599, 500)
         .await
         .expect("refund pending");
 
@@ -261,7 +263,7 @@ async fn failed_swap_caps_recovery_at_this_liquidation_input() {
         });
     let store = Store(Mutex::new(state()));
 
-    let result = reconcile(&client, &store, "liq", account(p(4)), 600, 500)
+    let result = reconcile_swap_settlement(&client, &store, "liq", account(p(4)), 600, 500)
         .await
         .expect("funds discovered");
 
@@ -287,7 +289,7 @@ async fn recovery_uses_balance_matching_input_side_of_pool() {
     });
     let store = Store(Mutex::new(execution_state));
 
-    let result = reconcile(&client, &store, "liq", account(p(4)), 600, 500)
+    let result = reconcile_swap_settlement(&client, &store, "liq", account(p(4)), 600, 500)
         .await
         .expect("funds discovered");
 
@@ -310,7 +312,7 @@ async fn balance_too_small_to_pay_input_fee_remains_refund_pending() {
     });
     let store = Store(Mutex::new(state()));
 
-    let result = reconcile(&client, &store, "liq", account(p(4)), 600, 500)
+    let result = reconcile_swap_settlement(&client, &store, "liq", account(p(4)), 600, 500)
         .await
         .expect("refund pending");
 

@@ -1,5 +1,3 @@
-use std::sync::Arc;
-
 use async_trait::async_trait;
 use candid::Principal;
 use icrc_ledger_types::icrc1::account::Account;
@@ -26,18 +24,18 @@ pub trait IcpswapExecutionStateStore: Send + Sync {
     async fn persist(&self, liquidation_id: &str, state: &IcpswapExecutionState) -> Result<(), String>;
 }
 
-pub struct WalIcpswapExecutionStateStore<W: WalStore + ?Sized> {
-    wal: Arc<W>,
+pub struct WalIcpswapExecutionStateStore<'a> {
+    wal: &'a dyn WalStore,
 }
 
-impl<W: WalStore + ?Sized> WalIcpswapExecutionStateStore<W> {
-    pub fn new(wal: Arc<W>) -> Self {
+impl<'a> WalIcpswapExecutionStateStore<'a> {
+    pub fn new(wal: &'a dyn WalStore) -> Self {
         Self { wal }
     }
 }
 
 #[async_trait]
-impl<W: WalStore + ?Sized> IcpswapExecutionStateStore for WalIcpswapExecutionStateStore<W> {
+impl IcpswapExecutionStateStore for WalIcpswapExecutionStateStore<'_> {
     async fn load(&self, liquidation_id: &str) -> Result<Option<IcpswapExecutionState>, String> {
         let Some(row) = self
             .wal

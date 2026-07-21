@@ -57,7 +57,7 @@ use super::{
 /// explicit time snapshot with the persisted `submitted_at`. It prevents a
 /// manual recovery decision before ICPSwap has had enough time to create its
 /// automatic refund, and makes the timeout behavior deterministic in tests.
-pub async fn reconcile(
+pub async fn reconcile_swap_settlement(
     // Read-only ICPSwap client used to inspect the selected pool's history.
     client: &dyn IcpswapReconciliationClient,
     // Durable state store backed by the liquidation WAL in production.
@@ -378,6 +378,10 @@ fn apply_refund(
         if refund.transfer.amount <= refund.transfer.fee {
             return Err(IcpswapReconciliationError::TransactionMismatch(swap_tx_id.clone()));
         }
+        state.returned_gross_amount = Some(ChainTokenAmount::from_raw(
+            state.plan.amount_in.token.clone(),
+            refund.transfer.amount.clone(),
+        ));
         state.refund_ledger_block_index = Some(refund.transfer.index.clone());
         state.phase = IcpswapExecutionPhase::Refunded;
         state.last_error = None;

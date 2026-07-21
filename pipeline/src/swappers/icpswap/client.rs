@@ -2,13 +2,20 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use candid::{Decode, Encode, Nat, Principal};
-use icrc_ledger_types::{icrc1::account::Account, icrc2::approve::ApproveArgs};
+use icrc_ledger_types::{
+    icrc1::{
+        account::Account,
+        transfer::{TransferArg, TransferError},
+    },
+    icrc2::approve::ApproveArgs,
+};
 use liquidium_pipeline_connectors::{backend::icp_backend::IcpBackend, pipeline_agent::PipelineAgent};
 
 use super::types::{
     IcpswapApprovalRequest, IcpswapClientError, IcpswapDepositAndSwapArgs, IcpswapExecutionClientError,
-    IcpswapGetPoolArgs, IcpswapPoolData, IcpswapResult, IcpswapSwapArgs, IcpswapToken, IcpswapTransaction,
-    IcpswapUnusedBalance,
+    IcpswapGetPoolArgs, IcpswapPoolData, IcpswapRecoveryClientError, IcpswapRecoveryTransferClientError,
+    IcpswapRecoveryTransferOutcome, IcpswapRecoveryTransferRequest, IcpswapResult, IcpswapSwapArgs, IcpswapToken,
+    IcpswapTransaction, IcpswapUnusedBalance, IcpswapWithdrawArgs,
 };
 
 #[cfg_attr(test, mockall::automock)]
@@ -97,6 +104,29 @@ pub trait IcpswapReconciliationClient: Send + Sync {
     ) -> Result<Vec<(Nat, IcpswapTransaction)>, String>;
 
     async fn unused_balance(&self, pool: Principal, owner: Principal) -> Result<IcpswapUnusedBalance, String>;
+}
+
+#[cfg_attr(test, mockall::automock)]
+#[async_trait]
+pub trait IcpswapRecoveryClient: Send + Sync {
+    async fn transactions_by_owner(
+        &self,
+        pool: Principal,
+        owner: Principal,
+    ) -> Result<Vec<(Nat, IcpswapTransaction)>, String>;
+
+    async fn unused_balance(&self, pool: Principal, owner: Principal) -> Result<IcpswapUnusedBalance, String>;
+
+    async fn withdraw(&self, pool: Principal, args: &IcpswapWithdrawArgs) -> Result<Nat, IcpswapRecoveryClientError>;
+}
+
+#[cfg_attr(test, mockall::automock)]
+#[async_trait]
+pub trait IcpswapRecoveryTransferClient: Send + Sync {
+    async fn transfer_recovered_funds(
+        &self,
+        request: &IcpswapRecoveryTransferRequest,
+    ) -> Result<IcpswapRecoveryTransferOutcome, IcpswapRecoveryTransferClientError>;
 }
 
 pub struct IcpswapClient<A: PipelineAgent, B: IcpswapLedgerClient> {
@@ -190,7 +220,7 @@ impl<A: PipelineAgent, B: IcpswapLedgerClient> IcpswapExecutionClient for Icpswa
         pool: Principal,
         owner: Principal,
     ) -> Result<Option<Nat>, IcpswapExecutionClientError> {
-        self.transactions_by_owner(pool, owner)
+        IcpswapReconciliationClient::transactions_by_owner(self, pool, owner)
             .await
             .map(|transactions| transactions.into_iter().map(|(id, _)| id).max())
             .map_err(|message| IcpswapExecutionClientError::TransactionQuery { pool, message })
@@ -278,6 +308,92 @@ impl<A: PipelineAgent, B: IcpswapLedgerClient> IcpswapReconciliationClient for I
         {
             IcpswapResult::Ok(balance) => Ok(balance),
             IcpswapResult::Err(error) => Err(format!("{METHOD} returned {error:?}")),
+        }
+    }
+}
+
+#[async_trait]
+impl<A: PipelineAgent, B: IcpswapLedgerClient> IcpswapRecoveryClient for IcpswapClient<A, B> {
+    async fn transactions_by_owner(
+        &self,
+        pool: Principal,
+        owner: Principal,
+    ) -> Result<Vec<(Nat, IcpswapTransaction)>, String> {
+        IcpswapReconciliationClient::transactions_by_owner(self, pool, owner).await
+    }
+
+    async fn unused_balance(&self, pool: Principal, owner: Principal) -> Result<IcpswapUnusedBalance, String> {
+        IcpswapReconciliationClient::unused_balance(self, pool, owner).await
+    }
+
+    async fn withdraw(&self, pool: Principal, args: &IcpswapWithdrawArgs) -> Result<Nat, IcpswapRecoveryClientError> {
+        const METHOD: &str = "withdraw";
+        let encoded = Encode!(args).map_err(|error| IcpswapRecoveryClientError::Encode {
+            method: METHOD,
+            message: error.to_string(),
+        })?;
+        let response = self
+            .agent
+            .call_update_raw(&pool, METHOD, encoded)
+            .await
+            .map_err(|message| IcpswapRecoveryClientError::SubmissionUnknown {
+                pool,
+                method: METHOD,
+                message,
+            })?;
+        let result =
+            Decode!(&response, IcpswapResult<Nat>).map_err(|error| IcpswapRecoveryClientError::SubmissionUnknown {
+                pool,
+                method: METHOD,
+                message: format!("Candid decode error: {error}"),
+            })?;
+
+        match result {
+            IcpswapResult::Ok(amount) => Ok(amount),
+            IcpswapResult::Err(error) => Err(IcpswapRecoveryClientError::Protocol { method: METHOD, error }),
+        }
+    }
+}
+
+#[async_trait]
+impl<A: PipelineAgent, B: IcpswapLedgerClient> IcpswapRecoveryTransferClient for IcpswapClient<A, B> {
+    async fn transfer_recovered_funds(
+        &self,
+        request: &IcpswapRecoveryTransferRequest,
+    ) -> Result<IcpswapRecoveryTransferOutcome, IcpswapRecoveryTransferClientError> {
+        let args = TransferArg {
+            from_subaccount: request.from.subaccount,
+            to: request.to,
+            amount: request.amount.clone(),
+            fee: Some(request.fee.clone()),
+            memo: None,
+            created_at_time: Some(request.created_at_time),
+        };
+        let encoded = Encode!(&args).map_err(|error| IcpswapRecoveryTransferClientError::Encode(error.to_string()))?;
+        let response = self
+            .agent
+            .call_update_raw(&request.ledger, "icrc1_transfer", encoded)
+            .await
+            .map_err(|message| IcpswapRecoveryTransferClientError::SubmissionUnknown {
+                ledger: request.ledger,
+                message,
+            })?;
+        let result = Decode!(&response, Result<Nat, TransferError>).map_err(|error| {
+            IcpswapRecoveryTransferClientError::SubmissionUnknown {
+                ledger: request.ledger,
+                message: format!("Candid decode error: {error}"),
+            }
+        })?;
+
+        match result {
+            Ok(block_index) => Ok(IcpswapRecoveryTransferOutcome::Completed(block_index)),
+            Err(TransferError::Duplicate { duplicate_of }) => {
+                Ok(IcpswapRecoveryTransferOutcome::Duplicate(duplicate_of))
+            }
+            Err(error) => Err(IcpswapRecoveryTransferClientError::Rejected {
+                ledger: request.ledger,
+                message: error.to_string(),
+            }),
         }
     }
 }

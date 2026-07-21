@@ -1,17 +1,25 @@
 use std::sync::Arc;
 
 use candid::{CandidType, Decode, Encode, Int, Nat, Principal};
+use icrc_ledger_types::icrc1::{
+    account::Account,
+    transfer::{TransferArg, TransferError},
+};
 use liquidium_pipeline_connectors::pipeline_agent::MockPipelineAgent;
 use liquidium_pipeline_core::tokens::{chain_token::ChainToken, chain_token_amount::ChainTokenAmount};
 use serde::Deserialize;
 
 use super::{
-    client::{IcpswapClient, IcpswapExecutionClient, IcpswapReadClient, MockIcpswapLedgerClient},
+    client::{
+        IcpswapClient, IcpswapExecutionClient, IcpswapReadClient, IcpswapRecoveryTransferClient,
+        MockIcpswapLedgerClient,
+    },
     plan::{amount_out_minimum, nat_to_decimal_text, net_expected_output, resolve_direction},
     types::{
         IcpswapClientError, IcpswapDepositAndSwapArgs, IcpswapError, IcpswapExecutionClientError,
         IcpswapExecutionPhase, IcpswapExecutionPlan, IcpswapExecutionState, IcpswapGetPoolArgs, IcpswapPlanError,
-        IcpswapPoolData, IcpswapResult, IcpswapSwapArgs, IcpswapToken,
+        IcpswapPoolData, IcpswapRecoveryTransferOutcome, IcpswapRecoveryTransferRequest, IcpswapResult,
+        IcpswapSwapArgs, IcpswapToken,
     },
 };
 
@@ -534,4 +542,85 @@ async fn malformed_update_response_is_treated_as_ambiguous() {
             ..
         }) if actual_pool == pool
     ));
+}
+
+#[tokio::test]
+async fn client_submits_exact_deduplicated_recovery_transfer() {
+    let factory = principal(7);
+    let ledger = principal(1);
+    let destination = Account {
+        owner: principal(4),
+        subaccount: Some([7; 32]),
+    };
+    let request = IcpswapRecoveryTransferRequest {
+        ledger,
+        from: Account {
+            owner: principal(4),
+            subaccount: None,
+        },
+        to: destination,
+        amount: Nat::from(99_980u64),
+        fee: Nat::from(10u64),
+        created_at_time: 600,
+    };
+    let response = Encode!(&Result::<Nat, TransferError>::Ok(Nat::from(902u64))).expect("response");
+
+    let mut agent = MockPipelineAgent::new();
+    agent
+        .expect_call_update_raw()
+        .times(1)
+        .withf(move |canister, method, encoded| {
+            *canister == ledger
+                && method == "icrc1_transfer"
+                && Decode!(encoded, TransferArg).is_ok_and(|args| {
+                    args.from_subaccount.is_none()
+                        && args.to == destination
+                        && args.amount == Nat::from(99_980u64)
+                        && args.fee == Some(Nat::from(10u64))
+                        && args.memo.is_none()
+                        && args.created_at_time == Some(600)
+                })
+        })
+        .return_once(move |_, _, _| Ok(response));
+    let client = IcpswapClient::new(Arc::new(agent), Arc::new(MockIcpswapLedgerClient::new()), factory);
+
+    assert_eq!(
+        client.transfer_recovered_funds(&request).await,
+        Ok(IcpswapRecoveryTransferOutcome::Completed(Nat::from(902u64)))
+    );
+}
+
+#[tokio::test]
+async fn client_preserves_duplicate_recovery_transfer_block() {
+    let factory = principal(7);
+    let ledger = principal(1);
+    let request = IcpswapRecoveryTransferRequest {
+        ledger,
+        from: Account {
+            owner: principal(4),
+            subaccount: None,
+        },
+        to: Account {
+            owner: principal(4),
+            subaccount: Some([7; 32]),
+        },
+        amount: Nat::from(99_980u64),
+        fee: Nat::from(10u64),
+        created_at_time: 600,
+    };
+    let response = Encode!(&Result::<Nat, TransferError>::Err(TransferError::Duplicate {
+        duplicate_of: Nat::from(902u64),
+    }))
+    .expect("response");
+    let mut agent = MockPipelineAgent::new();
+    agent
+        .expect_call_update_raw()
+        .times(1)
+        .return_once(move |_, _, _| Ok(response));
+    let client = IcpswapClient::new(Arc::new(agent), Arc::new(MockIcpswapLedgerClient::new()), factory);
+
+    assert_eq!(
+        client.transfer_recovered_funds(&request).await,
+        Ok(IcpswapRecoveryTransferOutcome::Duplicate(Nat::from(902u64)))
+    );
 }

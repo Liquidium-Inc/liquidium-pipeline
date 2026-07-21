@@ -14,7 +14,7 @@ use crate::swappers::{
 
 use super::{
     client::IcpswapReadClient,
-    plan::{amount_out_minimum, nat_to_decimal_text},
+    plan::{IcpswapPlanner, amount_out_minimum, nat_to_decimal_text},
     types::{
         IcpswapExecutionPlan, IcpswapQuoteError, IcpswapQuoteResult, IcpswapSwapArgs, IcpswapToken,
         IcpswapTokenMetadata,
@@ -190,6 +190,13 @@ impl<C: IcpswapReadClient> IcpswapVenue<C> {
             quote: common_quote(request, &plan),
             plan,
         })
+    }
+}
+
+#[async_trait]
+impl<C: IcpswapReadClient + 'static> IcpswapPlanner for IcpswapVenue<C> {
+    async fn quote_with_plan(&self, request: &SwapRequest) -> Result<IcpswapQuoteResult, IcpswapQuoteError> {
+        IcpswapVenue::quote_with_plan(self, request).await
     }
 }
 

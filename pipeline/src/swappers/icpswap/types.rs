@@ -71,6 +71,13 @@ pub struct IcpswapDepositAndSwapArgs {
     pub amount_out_minimum: String,
 }
 
+#[derive(CandidType, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IcpswapWithdrawArgs {
+    pub token: String,
+    pub fee: Nat,
+    pub amount: Nat,
+}
+
 /// Complete pool-specific quote data needed by a later durable execution.
 /// All token quantities remain in ledger-native integer units.
 #[derive(CandidType, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -103,6 +110,9 @@ pub enum IcpswapExecutionPhase {
     RecoveryWithdrawSubmitted,
     Completed,
     Refunded,
+    RecoveryTransferPending,
+    RecoveryTransferSubmitted,
+    Recovered,
     FailedTerminal,
 }
 
@@ -132,6 +142,24 @@ pub struct IcpswapExecutionState {
     pub refund_ledger_block_index: Option<Nat>,
     #[serde(default)]
     pub recovery_amount: Option<ChainTokenAmount>,
+    #[serde(default)]
+    pub recovery_transaction_start: Option<Nat>,
+    #[serde(default)]
+    pub recovery_transaction_id: Option<Nat>,
+    #[serde(default)]
+    pub recovery_ledger_block_index: Option<Nat>,
+    #[serde(default)]
+    pub recovery_submitted_at: Option<u64>,
+    #[serde(default)]
+    pub returned_gross_amount: Option<ChainTokenAmount>,
+    #[serde(default)]
+    pub recovery_destination: Option<Account>,
+    #[serde(default)]
+    pub recovery_transfer_amount: Option<ChainTokenAmount>,
+    #[serde(default)]
+    pub recovery_transfer_created_at: Option<u64>,
+    #[serde(default)]
+    pub recovery_transfer_block_index: Option<Nat>,
     #[serde(default)]
     pub submitted_at: Option<u64>,
     #[serde(default)]
@@ -197,6 +225,86 @@ pub enum IcpswapExecutionClientError {
     },
     #[error("ICPSwap {method} returned an error: {error:?}")]
     Protocol { method: &'static str, error: IcpswapError },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum IcpswapRecoveryClientError {
+    #[error("failed to encode arguments for ICPSwap {method}: {message}")]
+    Encode { method: &'static str, message: String },
+    #[error("ICPSwap {method} submission to {pool} has an ambiguous outcome: {message}")]
+    SubmissionUnknown {
+        pool: Principal,
+        method: &'static str,
+        message: String,
+    },
+    #[error("ICPSwap {method} returned an error: {error:?}")]
+    Protocol { method: &'static str, error: IcpswapError },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum IcpswapRecoveryError {
+    #[error(transparent)]
+    Client(#[from] IcpswapRecoveryClientError),
+    #[error("ICPSwap recovery query failed: {0}")]
+    Query(String),
+    #[error("failed to persist ICPSwap recovery state: {0}")]
+    Persistence(String),
+    #[error("no persisted ICPSwap recovery state exists")]
+    MissingState,
+    #[error("ICPSwap recovery requires phase FundsInPool or RecoveryWithdrawSubmitted, got {0:?}")]
+    InvalidPhase(IcpswapExecutionPhase),
+    #[error("ICPSwap recovery state has no recoverable amount")]
+    MissingRecoveryAmount,
+    #[error("ICPSwap recovery state has no swap transaction ID")]
+    MissingSwapTransactionId,
+    #[error("ICPSwap recovery state has no recovery transaction cursor")]
+    MissingRecoveryTransactionCursor,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IcpswapRecoveryTransferRequest {
+    pub ledger: Principal,
+    pub from: Account,
+    pub to: Account,
+    pub amount: Nat,
+    pub fee: Nat,
+    pub created_at_time: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IcpswapRecoveryTransferOutcome {
+    Completed(Nat),
+    Duplicate(Nat),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum IcpswapRecoveryTransferClientError {
+    #[error("failed to encode ICRC-1 recovery transfer arguments: {0}")]
+    Encode(String),
+    #[error("ICRC-1 recovery transfer submission to ledger {ledger} has an ambiguous outcome: {message}")]
+    SubmissionUnknown { ledger: Principal, message: String },
+    #[error("ICRC-1 recovery transfer was rejected by ledger {ledger}: {message}")]
+    Rejected { ledger: Principal, message: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum IcpswapRecoveryTransferError {
+    #[error(transparent)]
+    Client(#[from] IcpswapRecoveryTransferClientError),
+    #[error("failed to persist ICPSwap recovery transfer state: {0}")]
+    Persistence(String),
+    #[error("no persisted ICPSwap recovery state exists")]
+    MissingState,
+    #[error("ICPSwap recovery transfer cannot run from phase {0:?}")]
+    InvalidPhase(IcpswapExecutionPhase),
+    #[error("confirmed ICPSwap refund has no persisted gross returned amount")]
+    MissingReturnedAmount,
+    #[error("persisted recovery destination {persisted} differs from configured destination {configured}")]
+    DestinationMismatch { persisted: Account, configured: Account },
+    #[error("ICPSwap recovery transfer must originate from the trader root account")]
+    NonRootTraderAccount,
+    #[error("invalid persisted ICPSwap recovery transfer state: {0}")]
+    InvalidPersistedState(&'static str),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
@@ -335,7 +443,7 @@ pub struct IcpswapRefundInfo {
 #[derive(CandidType, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum IcpswapTransactionAction {
     Deposit(Reserved),
-    Withdraw(Reserved),
+    Withdraw(IcpswapWithdrawInfo),
     Refund(IcpswapRefundInfo),
     AddLiquidity(Reserved),
     DecreaseLiquidity(Reserved),
