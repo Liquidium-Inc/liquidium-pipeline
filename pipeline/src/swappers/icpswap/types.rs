@@ -110,3 +110,19 @@ pub enum IcpswapPlanError {
     #[error("{field} token does not match quoted output token")]
     OutputTokenMismatch { field: &'static str },
 }
+
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum IcpswapClientError {
+    #[error("failed to encode arguments for ICPSwap {method}: {message}")]
+    Encode { method: &'static str, message: String },
+    #[error("ICPSwap {method} call to {canister} failed: {message}")]
+    Transport {
+        canister: Principal,
+        method: &'static str,
+        message: String,
+    },
+    #[error("ICPSwap {method} returned an error: {error:?}")]
+    Protocol { method: &'static str, error: IcpswapError },
+    #[error("ICRC-1 fee lookup failed on ledger {ledger}: {message}")]
+    LedgerFee { ledger: Principal, message: String },
+}

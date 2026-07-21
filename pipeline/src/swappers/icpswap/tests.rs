@@ -1,12 +1,16 @@
+use std::sync::Arc;
+
 use candid::{CandidType, Decode, Encode, Int, Nat, Principal};
+use liquidium_pipeline_connectors::pipeline_agent::MockPipelineAgent;
 use liquidium_pipeline_core::tokens::{chain_token::ChainToken, chain_token_amount::ChainTokenAmount};
 use serde::Deserialize;
 
 use super::{
+    client::{IcpswapClient, IcpswapReadClient, MockIcpswapLedgerClient},
     plan::{amount_out_minimum, net_expected_output, resolve_direction},
     types::{
-        IcpswapError, IcpswapExecutionPlan, IcpswapPlanError, IcpswapPoolData, IcpswapResult, IcpswapSwapArgs,
-        IcpswapToken,
+        IcpswapClientError, IcpswapError, IcpswapExecutionPlan, IcpswapGetPoolArgs, IcpswapPlanError, IcpswapPoolData,
+        IcpswapResult, IcpswapSwapArgs, IcpswapToken,
     },
 };
 
@@ -203,4 +207,229 @@ fn result_encodes_with_lowercase_official_variant_labels() {
     let decoded = Decode!(&encoded, OfficialNatResult).expect("official Candid result shape");
 
     assert!(matches!(decoded, OfficialNatResult::ok(value) if value == Nat::from(42u8)));
+}
+
+fn pool_data(pool: Principal, token0: &IcpswapToken, token1: &IcpswapToken, fee: Nat) -> IcpswapPoolData {
+    IcpswapPoolData {
+        key: format!("{}_{}_{}", token0.address, token1.address, fee),
+        token0: token0.clone(),
+        token1: token1.clone(),
+        fee,
+        tick_spacing: Int::from(60),
+        canister_id: pool,
+    }
+}
+
+#[tokio::test]
+async fn client_discovers_pool_with_exact_factory_arguments() {
+    let factory = principal(7);
+    let pool = principal(8);
+    let token0 = IcpswapToken {
+        address: principal(1).to_text(),
+        standard: "ICRC2".to_string(),
+    };
+    let token1 = IcpswapToken {
+        address: principal(2).to_text(),
+        standard: "ICRC2".to_string(),
+    };
+    let fee = Nat::from(3_000u64);
+    let expected = pool_data(pool, &token0, &token1, fee.clone());
+    let response = expected.clone();
+    let expected_token0 = token0.clone();
+    let expected_token1 = token1.clone();
+    let expected_fee = fee.clone();
+
+    let mut agent = MockPipelineAgent::new();
+    agent
+        .expect_call_query::<IcpswapResult<IcpswapPoolData>>()
+        .times(1)
+        .withf(move |canister, method, encoded| {
+            if *canister != factory || method != "getPool" {
+                return false;
+            }
+            let Ok(args) = Decode!(encoded, IcpswapGetPoolArgs) else {
+                return false;
+            };
+            args.token0 == expected_token0 && args.token1 == expected_token1 && args.fee == expected_fee
+        })
+        .return_once(move |_, _, _| Ok(IcpswapResult::Ok(response)));
+
+    let client = IcpswapClient::new(Arc::new(agent), Arc::new(MockIcpswapLedgerClient::new()), factory);
+    let actual = client.get_pool(&token0, &token1, &fee).await.expect("pool");
+
+    assert_eq!(actual, expected);
+    assert_eq!(client.factory(), factory);
+}
+
+#[tokio::test]
+async fn client_surfaces_factory_protocol_error() {
+    let factory = principal(7);
+    let token0 = IcpswapToken {
+        address: principal(1).to_text(),
+        standard: "ICRC2".to_string(),
+    };
+    let token1 = IcpswapToken {
+        address: principal(2).to_text(),
+        standard: "ICRC2".to_string(),
+    };
+
+    let mut agent = MockPipelineAgent::new();
+    agent
+        .expect_call_query::<IcpswapResult<IcpswapPoolData>>()
+        .return_once(|_, _, _| Ok(IcpswapResult::Err(IcpswapError::CommonError)));
+    let client = IcpswapClient::new(Arc::new(agent), Arc::new(MockIcpswapLedgerClient::new()), factory);
+
+    let error = client.get_pool(&token0, &token1, &Nat::from(500u64)).await.unwrap_err();
+    assert_eq!(
+        error,
+        IcpswapClientError::Protocol {
+            method: "getPool",
+            error: IcpswapError::CommonError,
+        }
+    );
+}
+
+#[tokio::test]
+async fn client_surfaces_malformed_factory_response() {
+    let factory = principal(7);
+    let token0 = IcpswapToken {
+        address: principal(1).to_text(),
+        standard: "ICRC2".to_string(),
+    };
+    let token1 = IcpswapToken {
+        address: principal(2).to_text(),
+        standard: "ICRC2".to_string(),
+    };
+
+    let mut agent = MockPipelineAgent::new();
+    agent
+        .expect_call_query::<IcpswapResult<IcpswapPoolData>>()
+        .return_once(|_, _, _| Err("Candid decode error: unexpected record field".to_string()));
+    let client = IcpswapClient::new(Arc::new(agent), Arc::new(MockIcpswapLedgerClient::new()), factory);
+
+    assert_eq!(
+        client.get_pool(&token0, &token1, &Nat::from(500u64)).await,
+        Err(IcpswapClientError::Transport {
+            canister: factory,
+            method: "getPool",
+            message: "Candid decode error: unexpected record field".to_string(),
+        })
+    );
+}
+
+#[tokio::test]
+async fn client_quotes_pool_with_native_integer_strings() {
+    let factory = principal(7);
+    let pool = principal(8);
+    let args = IcpswapSwapArgs {
+        zero_for_one: false,
+        amount_in: "100000000".to_string(),
+        amount_out_minimum: "0".to_string(),
+    };
+    let expected_args = args.clone();
+
+    let mut agent = MockPipelineAgent::new();
+    agent
+        .expect_call_query::<IcpswapResult<Nat>>()
+        .times(1)
+        .withf(move |canister, method, encoded| {
+            if *canister != pool || method != "quote" {
+                return false;
+            }
+            Decode!(encoded, IcpswapSwapArgs).is_ok_and(|decoded| decoded == expected_args)
+        })
+        .return_once(|_, _, _| Ok(IcpswapResult::Ok(Nat::from(42_000u64))));
+    let client = IcpswapClient::new(Arc::new(agent), Arc::new(MockIcpswapLedgerClient::new()), factory);
+
+    assert_eq!(client.quote(pool, &args).await, Ok(Nat::from(42_000u64)));
+}
+
+#[tokio::test]
+async fn client_surfaces_quote_transport_error() {
+    let factory = principal(7);
+    let pool = principal(8);
+    let args = IcpswapSwapArgs {
+        zero_for_one: true,
+        amount_in: "1".to_string(),
+        amount_out_minimum: "0".to_string(),
+    };
+
+    let mut agent = MockPipelineAgent::new();
+    agent
+        .expect_call_query::<IcpswapResult<Nat>>()
+        .return_once(|_, _, _| Err("replica unavailable".to_string()));
+    let client = IcpswapClient::new(Arc::new(agent), Arc::new(MockIcpswapLedgerClient::new()), factory);
+
+    let error = client.quote(pool, &args).await.unwrap_err();
+    assert_eq!(
+        error,
+        IcpswapClientError::Transport {
+            canister: pool,
+            method: "quote",
+            message: "replica unavailable".to_string(),
+        }
+    );
+}
+
+#[tokio::test]
+async fn client_surfaces_quote_protocol_error() {
+    let factory = principal(7);
+    let pool = principal(8);
+    let args = IcpswapSwapArgs {
+        zero_for_one: true,
+        amount_in: "1".to_string(),
+        amount_out_minimum: "0".to_string(),
+    };
+
+    let mut agent = MockPipelineAgent::new();
+    agent.expect_call_query::<IcpswapResult<Nat>>().return_once(|_, _, _| {
+        Ok(IcpswapResult::Err(IcpswapError::InternalError(
+            "pool unavailable".to_string(),
+        )))
+    });
+    let client = IcpswapClient::new(Arc::new(agent), Arc::new(MockIcpswapLedgerClient::new()), factory);
+
+    assert_eq!(
+        client.quote(pool, &args).await,
+        Err(IcpswapClientError::Protocol {
+            method: "quote",
+            error: IcpswapError::InternalError("pool unavailable".to_string()),
+        })
+    );
+}
+
+#[tokio::test]
+async fn client_reuses_icp_backend_for_ledger_fee() {
+    let factory = principal(7);
+    let ledger = principal(3);
+    let agent = MockPipelineAgent::new();
+    let mut backend = MockIcpswapLedgerClient::new();
+    backend
+        .expect_output_ledger_fee()
+        .withf(move |actual| *actual == ledger)
+        .times(1)
+        .return_once(|_| Ok(Nat::from(10u64)));
+    let client = IcpswapClient::new(Arc::new(agent), Arc::new(backend), factory);
+
+    assert_eq!(client.ledger_fee(ledger).await, Ok(Nat::from(10u64)));
+}
+
+#[tokio::test]
+async fn client_adds_ledger_context_to_fee_error() {
+    let factory = principal(7);
+    let ledger = principal(3);
+    let agent = MockPipelineAgent::new();
+    let mut backend = MockIcpswapLedgerClient::new();
+    backend
+        .expect_output_ledger_fee()
+        .return_once(|_| Err("fee query rejected".to_string()));
+    let client = IcpswapClient::new(Arc::new(agent), Arc::new(backend), factory);
+
+    assert_eq!(
+        client.ledger_fee(ledger).await,
+        Err(IcpswapClientError::LedgerFee {
+            ledger,
+            message: "fee query rejected".to_string(),
+        })
+    );
 }
