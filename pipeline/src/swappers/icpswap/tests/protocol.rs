@@ -587,6 +587,59 @@ async fn client_submits_exact_manual_pool_updates() {
 }
 
 #[tokio::test]
+async fn client_treats_replica_confirmed_swap_trap_as_a_definite_protocol_failure() {
+    let factory = principal(7);
+    let pool = principal(8);
+    let args = IcpswapSwapArgs {
+        zero_for_one: true,
+        amount_in: "100000".to_string(),
+        amount_out_minimum: "99000".to_string(),
+    };
+    let message = "The replica returned a rejection error: reject code CanisterError, reject message Canister called `ic0.trap` with message: 'swap failed: swap \"Illegal deposit balance in pool\"', error code Some(\"IC0503\")".to_string();
+    let expected_message = message.clone();
+    let mut agent = MockPipelineAgent::new();
+    agent
+        .expect_call_update_raw()
+        .times(1)
+        .return_once(move |_, _, _| Err(message));
+    let client = IcpswapClient::new(Arc::new(agent), Arc::new(MockIcpBackend::new()), factory);
+
+    assert_eq!(
+        client.swap(pool, &args).await,
+        Err(IcpswapClientError::Protocol {
+            method: "swap",
+            error: IcpswapError::InternalError(expected_message),
+        })
+    );
+}
+
+#[tokio::test]
+async fn client_keeps_swap_transport_failure_ambiguous() {
+    let factory = principal(7);
+    let pool = principal(8);
+    let args = IcpswapSwapArgs {
+        zero_for_one: true,
+        amount_in: "100000".to_string(),
+        amount_out_minimum: "99000".to_string(),
+    };
+    let mut agent = MockPipelineAgent::new();
+    agent
+        .expect_call_update_raw()
+        .times(1)
+        .return_once(|_, _, _| Err("request status timed out".to_string()));
+    let client = IcpswapClient::new(Arc::new(agent), Arc::new(MockIcpBackend::new()), factory);
+
+    assert_eq!(
+        client.swap(pool, &args).await,
+        Err(IcpswapClientError::SubmissionUnknown {
+            pool,
+            method: "swap",
+            message: "request status timed out".to_string(),
+        })
+    );
+}
+
+#[tokio::test]
 async fn client_submits_exact_deduplicated_ledger_transfer() {
     let ledger = principal(1);
     let owner = Account {

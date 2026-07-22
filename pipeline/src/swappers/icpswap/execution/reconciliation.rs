@@ -160,7 +160,9 @@ pub(crate) fn handle_unconfirmed_trade(
             "pending swap produced inconsistent input/output balance deltas".to_string(),
         );
     } else if state.trade.unchanged_observations >= MIN_UNCHANGED_TRADE_OBSERVATIONS {
-        if trade_replay_is_single_spend(state) {
+        if deposited_input_is_below_plan(state) {
+            recover_after_insufficient_deposit(state);
+        } else if trade_replay_is_single_spend(state) {
             schedule_trade_retry_or_recovery(
                 state,
                 now_nanos,
@@ -185,6 +187,33 @@ fn trade_replay_is_single_spend(state: &IcpswapState) -> bool {
     };
     let amount = &state.plan.amount_in.value;
     input_before >= amount && input_before < &(amount.clone() * Nat::from(2u8))
+}
+
+fn deposited_input_is_below_plan(state: &IcpswapState) -> bool {
+    state
+        .trade
+        .input_pool_balance_before
+        .as_ref()
+        .is_some_and(|input_before| input_before < &state.plan.amount_in.value)
+}
+
+/// A swap cannot consume the planned amount when its persisted pre-call input
+/// balance was already smaller. Once read-only reconciliation still sees both
+/// balances unchanged, recovery is safe and replaying the oversized swap is not.
+fn recover_after_insufficient_deposit(state: &mut IcpswapState) {
+    let input_before = state
+        .trade
+        .input_pool_balance_before
+        .as_ref()
+        .map(ToString::to_string)
+        .unwrap_or_else(|| "unknown".to_string());
+    state.step = IcpswapStep::Recover;
+    state.operator_pending_step = None;
+    state.trade.pending_since_nanos = None;
+    state.last_error = Some(format!(
+        "pool held {input_before} input units before the rejected swap, below the planned {}; recovering the available input",
+        state.plan.amount_in.value
+    ));
 }
 
 pub(crate) async fn observe_output_withdrawal(
@@ -277,11 +306,13 @@ pub(crate) async fn reconcile_operator_required(
                 complete_deposit(state);
             }
         }
-        Some(IcpswapStep::TradePending) => {
-            if let TradeObservation::Succeeded(gross_output) = observe_trade(client, state).await? {
-                complete_trade(state, gross_output);
+        Some(IcpswapStep::TradePending) => match observe_trade(client, state).await? {
+            TradeObservation::Succeeded(gross_output) => complete_trade(state, gross_output),
+            TradeObservation::Unchanged if deposited_input_is_below_plan(state) => {
+                recover_after_insufficient_deposit(state);
             }
-        }
+            TradeObservation::Unchanged | TradeObservation::Inconsistent => {}
+        },
         Some(IcpswapStep::WithdrawPending) => {
             if let Some(wallet_credit) = observe_output_withdrawal(client, state).await? {
                 complete_output_withdrawal(state, wallet_credit);

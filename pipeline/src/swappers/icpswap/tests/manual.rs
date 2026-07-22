@@ -126,8 +126,9 @@ async fn manual_success_persists_deposit_trade_and_withdraw_boundaries() {
     client.expect_deposit().times(1).return_once(move |_, args| {
         let persisted = observed.state();
         assert_eq!(persisted.step, IcpswapStep::DepositPending);
-        assert_eq!(args.amount, Nat::from(100_000u64));
-        Ok(args.amount.clone())
+        assert_eq!(args.amount, Nat::from(100_010u64));
+        assert_eq!(args.fee, Nat::from(10u64));
+        Ok(args.amount.clone() - args.fee.clone())
     });
     client.expect_swap().times(1).return_once(|_, args| {
         assert_eq!(args.amount_out_minimum, "118500");
@@ -258,12 +259,35 @@ async fn confirmed_deposit_advances_without_an_extra_balance_query() {
     client
         .expect_deposit()
         .times(1)
-        .return_once(|_, args| Ok(args.amount.clone()));
+        .return_once(|_, args| Ok(args.amount.clone() - args.fee.clone()));
 
     let confirmed = advance_manual(&client, store.as_ref(), "run-1", owner(), 2_000)
         .await
         .expect("confirmed deposit");
     assert_eq!(confirmed.step, IcpswapStep::Trade);
+}
+
+#[tokio::test]
+async fn unexpected_deposit_credit_recovers_instead_of_submitting_an_oversized_swap() {
+    let store = Arc::new(Store::new());
+    store.0.lock().unwrap().step = IcpswapStep::Deposit;
+
+    let mut client = MockIcpswapManualClient::new();
+    client
+        .expect_unused_balance()
+        .times(1)
+        .return_once(|_, _| Ok(unused(0, 0)));
+    client
+        .expect_deposit()
+        .times(1)
+        .return_once(|_, _| Ok(Nat::from(99_990u64)));
+    client.expect_swap().times(0);
+
+    let result = advance_manual(&client, store.as_ref(), "run-1", owner(), 2_000)
+        .await
+        .expect("definite short deposit");
+    assert_eq!(result.step, IcpswapStep::Recover);
+    assert!(result.last_error.unwrap().contains("recovering the deposited input"));
 }
 
 #[tokio::test]
@@ -530,6 +554,32 @@ async fn ambiguous_swap_with_enough_input_for_two_trades_requires_operator() {
         .expect("operator transition");
     assert_eq!(result.step, IcpswapStep::OperatorRequired);
     assert!(result.last_error.unwrap().contains("multiple swaps"));
+}
+
+#[tokio::test]
+async fn operator_reconciliation_recovers_input_when_deposit_was_one_fee_short() {
+    let store = Arc::new(Store::new());
+    {
+        let mut state = store.0.lock().unwrap();
+        state.step = IcpswapStep::OperatorRequired;
+        state.operator_pending_step = Some(IcpswapStep::TradePending);
+        state.trade.input_pool_balance_before = Some(Nat::from(99_990u64));
+        state.trade.output_pool_balance_before = Some(Nat::from(0u8));
+        state.last_error = Some("legacy swap trap classified as ambiguous".to_string());
+    }
+    let mut client = MockIcpswapManualClient::new();
+    client
+        .expect_unused_balance()
+        .times(1)
+        .return_once(|_, _| Ok(unused(99_990, 0)));
+
+    let result = advance_manual(&client, store.as_ref(), "run-1", owner(), 1_000)
+        .await
+        .expect("read-only recovery decision");
+
+    assert_eq!(result.step, IcpswapStep::Recover);
+    assert_eq!(result.operator_pending_step, None);
+    assert!(result.last_error.unwrap().contains("below the planned"));
 }
 
 #[tokio::test]

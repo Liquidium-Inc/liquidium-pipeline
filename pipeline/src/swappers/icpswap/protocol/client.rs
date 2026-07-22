@@ -193,7 +193,7 @@ async fn call_manual_update<A: PipelineAgent, T: candid::CandidType>(
     let response = agent
         .call_update_raw(&pool, method, encoded)
         .await
-        .map_err(|message| IcpswapClientError::SubmissionUnknown { pool, method, message })?;
+        .map_err(|message| classify_update_failure(pool, method, message))?;
     let result = Decode!(&response, IcpswapResult<Nat>).map_err(|error| IcpswapClientError::SubmissionUnknown {
         pool,
         method,
@@ -202,5 +202,23 @@ async fn call_manual_update<A: PipelineAgent, T: candid::CandidType>(
     match result {
         IcpswapResult::Ok(amount) => Ok(amount),
         IcpswapResult::Err(error) => Err(IcpswapClientError::Protocol { method, error }),
+    }
+}
+
+/// A replica-confirmed trap from `swap` is a definite rejection: the pool
+/// message rolled back rather than committing a trade. Transport failures stay
+/// ambiguous. This is deliberately swap-specific because deposit and withdraw
+/// can perform awaited ledger calls before they fail.
+fn classify_update_failure(pool: Principal, method: &'static str, message: String) -> IcpswapClientError {
+    let replica_confirmed_swap_trap = method == "swap"
+        && message.contains("reject code CanisterError")
+        && (message.contains("ic0.trap") || message.contains("IC0503"));
+    if replica_confirmed_swap_trap {
+        IcpswapClientError::Protocol {
+            method,
+            error: crate::swappers::icpswap::types::IcpswapError::InternalError(message),
+        }
+    } else {
+        IcpswapClientError::SubmissionUnknown { pool, method, message }
     }
 }

@@ -262,7 +262,9 @@ async fn deposit(
     state.deposit.input_pool_balance_before = Some(recon::input_balance(&state.plan, &unused));
     let args = IcpswapDepositArgs {
         token: state.plan.token_in.to_text(),
-        amount: state.plan.amount_in.value.clone(),
+        // ICPSwap credits `amount - fee` when it sweeps this subaccount.
+        // Include the sweep fee so the credited balance equals the swap input.
+        amount: state.plan.amount_in.value.clone() + state.plan.input_ledger_fee.value.clone(),
         fee: state.plan.input_ledger_fee.value.clone(),
     };
     state.step = IcpswapStep::DepositPending;
@@ -280,9 +282,17 @@ async fn submit_deposit(
     args: IcpswapDepositArgs,
 ) -> Result<(), String> {
     match client.deposit(state.plan.pool, &args).await {
-        Ok(_) => {
+        Ok(credited) if credited == state.plan.amount_in.value => {
             state.step = IcpswapStep::Trade;
             state.last_error = None;
+            return persist(store, execution_id, state).await;
+        }
+        Ok(credited) => {
+            state.step = IcpswapStep::Recover;
+            state.last_error = Some(format!(
+                "ICPSwap deposit credited {credited}, expected {}; recovering the deposited input instead of submitting an oversized swap",
+                state.plan.amount_in.value
+            ));
             return persist(store, execution_id, state).await;
         }
         Err(error @ IcpswapClientError::SubmissionUnknown { .. }) => {
