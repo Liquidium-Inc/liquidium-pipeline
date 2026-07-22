@@ -1,18 +1,7 @@
-use async_trait::async_trait;
 use candid::{Nat, Principal};
 use liquidium_pipeline_core::tokens::{chain_token::ChainToken, chain_token_amount::ChainTokenAmount};
 
 use super::types::{IcpswapExecutionPlan, IcpswapPlanError};
-use crate::swappers::{
-    icpswap::types::{IcpswapQuoteError, IcpswapQuoteResult},
-    model::SwapRequest,
-};
-
-#[cfg_attr(test, mockall::automock)]
-#[async_trait]
-pub trait IcpswapPlanner: Send + Sync {
-    async fn quote_with_plan(&self, request: &SwapRequest) -> Result<IcpswapQuoteResult, IcpswapQuoteError>;
-}
 
 const BASIS_POINTS_DENOMINATOR: u32 = 10_000;
 

@@ -510,6 +510,40 @@ liquidator balance
 
 Displays **main**, **trader**, and **recovery** balances. Recovery balances are marked as "seized collateral (stale, pending withdrawal if swaps failed)".
 
+### ICPSwap ICP → ckUSDC Test
+
+Fetch a live quote without moving tokens:
+
+```bash
+liquidator icpswap --amount 0.1
+```
+
+Execute the quoted swap after reviewing the pool, fees, expected output, and interactive confirmation:
+
+```bash
+liquidator icpswap --amount 0.1 --execute
+```
+
+`--amount` is the maximum ICP debit, including the ICRC-2 approval and transfer-from fees. Executions use ICPSwap's manual `depositFrom → swap → withdraw` flow. The configured slippage is a hard cap: the first attempt uses a tighter limit, and up to three confirmed-slippage failures are requoted and retried without crossing the original minimum-output floor.
+
+The command uses the configured liquidator identity and writes resumable checkpoints under `~/.liquidium-pipeline/icpswap-runs/`. If an execution is interrupted or times out, resume it without replaying an ambiguous pool update:
+
+```bash
+liquidator icpswap --resume <RUN_ID>
+```
+
+Checkpoints from the removed `depositFromAndSwap` one-step implementation are not supported and cannot be resumed.
+
+From the repository, the equivalent smoke-test commands are:
+
+```bash
+cargo run -p liquidium-pipeline -- icpswap --amount 0.1
+cargo run -p liquidium-pipeline -- icpswap --amount 0.1 --execute
+cargo run -p liquidium-pipeline -- icpswap --resume <RUN_ID>
+```
+
+This is a real-funds mainnet smoke test and is intentionally excluded from automated CI. If the manual swap fails, the deposited ICP is withdrawn from the pool and confirmed back in the liquidator account.
+
 ### MEXC Smoke Swap + Withdraw
 
 Dry-run preflight (no side effects):

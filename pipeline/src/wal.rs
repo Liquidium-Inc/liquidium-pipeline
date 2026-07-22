@@ -100,7 +100,7 @@ mod tests {
     use crate::executors::executor::ExecutorRequest;
     use crate::persistance::VenueExecutionState;
     use crate::stages::executor::ExecutionStatus;
-    use crate::swappers::icpswap::types::{IcpswapExecutionPhase, IcpswapExecutionPlan, IcpswapExecutionState};
+    use crate::swappers::icpswap::types::{IcpswapExecutionPlan, IcpswapExecutionState, IcpswapStep};
     use crate::swappers::model::SwapRequest;
 
     fn make_receipt() -> ExecutionReceipt {
@@ -218,7 +218,7 @@ mod tests {
     fn icpswap_execution_state_round_trips_in_existing_meta_json() {
         #[derive(serde::Deserialize)]
         #[serde(tag = "venue", content = "state", rename_all = "snake_case")]
-        enum LegacyVenueExecutionState {
+        enum TaggedVenueExecutionState {
             Icpswap(IcpswapExecutionState),
         }
 
@@ -248,39 +248,18 @@ mod tests {
             123,
         )
         .expect("plan");
-        let mut state = IcpswapExecutionState::planned(plan.clone());
-        state.phase = IcpswapExecutionPhase::AwaitingOutput;
-        state.gross_swap_output = Some(ChainTokenAmount::from_raw(token_out.clone(), Nat::from(119_500u64)));
-        state.input_balance_before = Some(ChainTokenAmount::from_raw(token_in, Nat::from(500_000u64)));
-        state.output_balance_before = Some(ChainTokenAmount::from_raw(token_out, Nat::from(42u64)));
-        state.approval_block_index = Some(Nat::from(77u64));
-        state.approval_created_at = Some(400);
-        state.pool_transaction_start = Some(Nat::from(80u64));
-        state.pool_transaction_id = Some(Nat::from(81u64));
-        state.settlement_ledger_block_index = Some(Nat::from(900u64));
-        state.recovery_amount = Some(ChainTokenAmount::from_raw(
-            state.plan.amount_in.token.clone(),
-            Nat::from(99_990u64),
-        ));
-        state.recovery_transaction_start = Some(Nat::from(82u64));
-        state.recovery_transaction_id = Some(Nat::from(83u64));
-        state.recovery_ledger_block_index = Some(Nat::from(901u64));
-        state.recovery_submitted_at = Some(455);
-        state.returned_gross_amount = Some(ChainTokenAmount::from_raw(
-            state.plan.amount_in.token.clone(),
-            Nat::from(99_990u64),
-        ));
-        state.recovery_destination = Some(Account {
+        let owner = Account {
             owner: Principal::from_slice(&[4]),
-            subaccount: Some([7; 32]),
-        });
-        state.recovery_transfer_amount = Some(ChainTokenAmount::from_raw(
-            state.plan.amount_in.token.clone(),
-            Nat::from(99_970u64),
-        ));
-        state.recovery_transfer_created_at = Some(457);
-        state.recovery_transfer_block_index = Some(Nat::from(902u64));
-        state.submitted_at = Some(456);
+            subaccount: None,
+        };
+        let mut state = IcpswapExecutionState::prepare("42", plan.clone(), owner);
+        state.step = IcpswapStep::TradePending;
+        state.deposit.approval_block_index = Some(Nat::from(77u64));
+        state.deposit.approval_created_at = Some(400);
+        state.trade.input_pool_balance_before = Some(Nat::from(100_000u64));
+        state.trade.output_pool_balance_before = Some(Nat::from(42u64));
+        state.trade.swap_returned_amount = Some(Nat::from(119_500u64));
+        state.trade.swap_submitted_at = Some(456);
         state.last_error = Some("waiting for asynchronous output".to_string());
 
         let mut row = make_row("{}".to_string());
@@ -295,10 +274,10 @@ mod tests {
         let encoded: serde_json::Value = serde_json::from_str(&row.meta_json).expect("encoded wrapper json");
         assert_eq!(encoded["venue_execution"]["venue"], "icpswap");
         assert!(encoded["venue_execution"]["state"].is_object());
-        let legacy: LegacyVenueExecutionState = serde_json::from_value(encoded["venue_execution"].clone())
+        let tagged: TaggedVenueExecutionState = serde_json::from_value(encoded["venue_execution"].clone())
             .expect("the previous tagged-enum schema must decode the new representation");
-        let LegacyVenueExecutionState::Icpswap(legacy_state) = legacy;
-        assert_eq!(legacy_state, state);
+        let TaggedVenueExecutionState::Icpswap(tagged_state) = tagged;
+        assert_eq!(tagged_state, state);
 
         let decoded = decode_receipt_wrapper(&row)
             .expect("decode wrapper")

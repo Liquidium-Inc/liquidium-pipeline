@@ -109,6 +109,17 @@ pub trait WalStore: Send + Sync {
         bump_attempt: bool,
     ) -> Result<()>;
     async fn delete(&self, liq_id: &str) -> Result<()>;
+
+    /// Atomically claims the single active manual ICPSwap slot for an owner.
+    /// Non-SQLite stores retain the compatibility default; the production
+    /// SQLite store overrides this with a durable primary-key lock.
+    async fn acquire_icpswap_owner_lock(&self, _owner: &str, _execution_id: &str) -> Result<bool> {
+        Ok(true)
+    }
+
+    async fn release_icpswap_owner_lock(&self, _owner: &str, _execution_id: &str) -> Result<()> {
+        Ok(())
+    }
 }
 
 pub fn now_secs() -> i64 {

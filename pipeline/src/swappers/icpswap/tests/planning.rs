@@ -106,19 +106,19 @@ async fn selects_highest_net_output_across_all_fee_tiers() {
     )
     .expect("venue");
     let result = venue
-        .quote_with_plan_at(&request(&input, &output), 123)
+        .preview_route_at(&request(&input, &output), 123)
         .await
         .expect("quote");
 
-    assert_eq!(result.plan.pool, principal(6));
-    assert_eq!(result.plan.fee_tier, Nat::from(3_000u64));
-    assert_eq!(result.plan.amount_in.value, Nat::from(99_980u64));
-    assert_eq!(result.plan.gross_quoted_out.value, Nat::from(1_100u64));
-    assert_eq!(result.plan.input_ledger_fee.value, Nat::from(10u64));
-    assert_eq!(result.plan.output_ledger_fee.value, Nat::from(10u64));
-    assert_eq!(result.plan.net_expected_output.value, Nat::from(1_090u64));
-    assert_eq!(result.plan.amount_out_minimum.value, Nat::from(1_089u64));
-    assert_eq!(result.plan.quoted_at, 123);
+    assert_eq!(result.route.pool, principal(6));
+    assert_eq!(result.route.fee_tier, Nat::from(3_000u64));
+    assert_eq!(result.route.amount_in.value, Nat::from(99_980u64));
+    assert_eq!(result.route.gross_quoted_out.value, Nat::from(1_100u64));
+    assert_eq!(result.route.input_ledger_fee.value, Nat::from(10u64));
+    assert_eq!(result.route.output_ledger_fee.value, Nat::from(10u64));
+    assert_eq!(result.route.net_expected_output.value, Nat::from(1_090u64));
+    assert_eq!(result.route.amount_out_minimum.value, Nat::from(1_089u64));
+    assert_eq!(result.route.quoted_at, 123);
     assert_eq!(result.quote.receive_amount, Nat::from(1_090u64));
     assert_eq!(result.quote.legs[0].route_id, principal(6).to_text());
     assert_eq!(result.quote.legs[0].gas_fee, Nat::from(10u64));
@@ -156,12 +156,12 @@ async fn keeps_usable_quote_when_another_fee_tier_fails() {
     )
     .expect("venue");
     let result = venue
-        .quote_with_plan_at(&request(&input, &output), 123)
+        .preview_route_at(&request(&input, &output), 123)
         .await
         .expect("quote");
 
-    assert_eq!(result.plan.pool, principal(6));
-    assert_eq!(result.plan.net_expected_output.value, Nat::from(990u64));
+    assert_eq!(result.route.pool, principal(6));
+    assert_eq!(result.route.net_expected_output.value, Nat::from(990u64));
 }
 
 #[tokio::test]
@@ -187,7 +187,7 @@ async fn reports_every_failure_when_no_pool_is_usable() {
     )
     .expect("venue");
     let error = venue
-        .quote_with_plan_at(&request(&input, &output), 123)
+        .preview_route_at(&request(&input, &output), 123)
         .await
         .unwrap_err();
 
@@ -214,7 +214,7 @@ async fn rejects_spend_budget_that_cannot_cover_approval_and_transfer_fees() {
     )
     .expect("venue");
 
-    let error = venue.quote_with_plan_at(&request, 123).await.unwrap_err();
+    let error = venue.preview_route_at(&request, 123).await.unwrap_err();
     assert_eq!(
         error,
         IcpswapQuoteError::InputFeesExceedBudget {
@@ -251,10 +251,10 @@ async fn equal_outputs_choose_lower_fee_tier_deterministically() {
     )
     .expect("venue");
     let result = venue
-        .quote_with_plan_at(&request(&input, &output), 123)
+        .preview_route_at(&request(&input, &output), 123)
         .await
         .expect("quote");
 
-    assert_eq!(result.plan.fee_tier, Nat::from(500u64));
-    assert_eq!(result.plan.pool, principal(5));
+    assert_eq!(result.route.fee_tier, Nat::from(500u64));
+    assert_eq!(result.route.pool, principal(5));
 }

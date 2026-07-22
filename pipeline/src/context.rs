@@ -31,9 +31,6 @@ use crate::finalizers::{dex_finalizer::DexRouteFinalizer, icpswap::finalizer::Ic
 use crate::swappers::icpswap::{client::IcpswapClient, types::IcpswapTokenMetadata, venue::IcpswapVenue};
 use crate::swappers::router::SwapRouter;
 
-const ICPSWAP_AUTOMATIC_REFUND_WAIT_NANOS: u64 = 120_000_000_000;
-const ICPSWAP_RECOVERY_TIMEOUT_NANOS: u64 = 300_000_000_000;
-
 pub struct PipelineContext {
     pub config: Arc<Config>,
     pub registry: Arc<TokenRegistry>,
@@ -300,9 +297,6 @@ impl<P: Provider<AnyNetwork> + WalletProvider<AnyNetwork> + Clone + 'static> Pip
                 owner: config.trader_principal,
                 subaccount: None,
             },
-            config.get_recovery_account(),
-            ICPSWAP_AUTOMATIC_REFUND_WAIT_NANOS,
-            ICPSWAP_RECOVERY_TIMEOUT_NANOS,
         ));
 
         // The router only sees ICPSwap through the common venue abstraction.

@@ -1,4 +1,4 @@
-use candid::{CandidType, Int, Nat, Principal, Reserved};
+use candid::{CandidType, Int, Nat, Principal};
 use icrc_ledger_types::icrc1::account::Account;
 use liquidium_pipeline_core::tokens::{chain_token::ChainToken, chain_token_amount::ChainTokenAmount};
 use serde::{Deserialize, Serialize};
@@ -58,17 +58,10 @@ pub struct IcpswapSwapArgs {
 }
 
 #[derive(CandidType, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct IcpswapDepositAndSwapArgs {
-    #[serde(rename = "zeroForOne")]
-    pub zero_for_one: bool,
-    #[serde(rename = "tokenInFee")]
-    pub token_in_fee: Nat,
-    #[serde(rename = "tokenOutFee")]
-    pub token_out_fee: Nat,
-    #[serde(rename = "amountIn")]
-    pub amount_in: String,
-    #[serde(rename = "amountOutMinimum")]
-    pub amount_out_minimum: String,
+pub struct IcpswapDepositArgs {
+    pub token: String,
+    pub amount: Nat,
+    pub fee: Nat,
 }
 
 #[derive(CandidType, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -100,73 +93,125 @@ pub struct IcpswapExecutionPlan {
 }
 
 #[derive(CandidType, Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum IcpswapExecutionPhase {
-    Planned,
-    Approved,
-    SubmissionUnknown,
-    AwaitingOutput,
-    RefundPending,
-    FundsInPool,
-    RecoveryWithdrawSubmitted,
+pub enum IcpswapStep {
+    Deposit,
+    DepositPending,
+    Trade,
+    TradePending,
+    Withdraw,
+    WithdrawPending,
+    Recover,
+    RecoverPending,
     Completed,
     Refunded,
-    RecoveryTransferPending,
-    RecoveryTransferSubmitted,
-    Recovered,
-    FailedTerminal,
+    OperatorRequired,
+    Failed,
+}
+
+#[derive(CandidType, Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct IcpswapDepositState {
+    #[serde(default, rename = "deposit_input_pool_balance_before")]
+    pub input_pool_balance_before: Option<Nat>,
+    #[serde(default, rename = "deposit_output_pool_balance_before")]
+    pub output_pool_balance_before: Option<Nat>,
+    #[serde(default, rename = "deposit_approval_block_index")]
+    pub approval_block_index: Option<Nat>,
+    #[serde(default, rename = "deposit_approval_created_at")]
+    pub approval_created_at: Option<u64>,
+    #[serde(default, rename = "deposit_args")]
+    pub deposit_args: Option<IcpswapDepositArgs>,
+    #[serde(default, rename = "deposit_returned_amount")]
+    pub deposit_returned_amount: Option<Nat>,
+    #[serde(default, rename = "deposit_submitted_at")]
+    pub deposit_submitted_at: Option<u64>,
 }
 
 #[derive(CandidType, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct IcpswapExecutionState {
-    pub plan: IcpswapExecutionPlan,
-    pub phase: IcpswapExecutionPhase,
+pub struct IcpswapTradeState {
+    /// Absolute gross-output floor accepted with the original route.
+    #[serde(rename = "trade_original_hard_minimum_out")]
+    pub original_hard_minimum_out: ChainTokenAmount,
+    /// Number of retry evaluations already entered after the initial attempt.
+    #[serde(default, rename = "trade_retry_count")]
+    pub retry_count: u32,
+    #[serde(default, rename = "trade_effective_slippage_bps")]
+    pub effective_slippage_bps: u32,
+    #[serde(default, rename = "trade_current_quote")]
+    pub current_quote: Option<ChainTokenAmount>,
+    #[serde(rename = "trade_current_amount_out_minimum")]
+    pub current_amount_out_minimum: ChainTokenAmount,
+    #[serde(default, rename = "trade_next_retry_at_nanos")]
+    pub next_retry_at_nanos: Option<u64>,
+    #[serde(default, rename = "trade_input_pool_balance_before")]
+    pub input_pool_balance_before: Option<Nat>,
+    #[serde(default, rename = "trade_output_pool_balance_before")]
+    pub output_pool_balance_before: Option<Nat>,
+    #[serde(default, rename = "trade_swap_args")]
+    pub swap_args: Option<IcpswapSwapArgs>,
+    #[serde(default, rename = "trade_swap_returned_amount")]
+    pub swap_returned_amount: Option<Nat>,
+    #[serde(default, rename = "trade_swap_protocol_error")]
+    pub swap_protocol_error: Option<IcpswapError>,
+    #[serde(default, rename = "trade_swap_submitted_at")]
+    pub swap_submitted_at: Option<u64>,
+}
+
+#[derive(CandidType, Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct IcpswapWithdrawState {
+    #[serde(default, rename = "withdraw_pool_balance_before")]
+    pub pool_balance_before: Option<Nat>,
+    #[serde(default, rename = "withdraw_wallet_balance_before")]
+    pub wallet_balance_before: Option<Nat>,
+    #[serde(default, rename = "withdraw_args")]
+    pub withdraw_args: Option<IcpswapWithdrawArgs>,
+    #[serde(default, rename = "withdraw_returned_amount")]
+    pub withdraw_returned_amount: Option<Nat>,
+    #[serde(default, rename = "withdraw_submitted_at")]
+    pub withdraw_submitted_at: Option<u64>,
+    #[serde(default, rename = "withdraw_wallet_credited_amount")]
+    pub wallet_credited_amount: Option<Nat>,
+}
+
+#[derive(CandidType, Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct IcpswapManualRecoveryState {
+    #[serde(default, rename = "recovery_pool_balance_before")]
+    pub pool_balance_before: Option<Nat>,
+    #[serde(default, rename = "recovery_wallet_balance_before")]
+    pub wallet_balance_before: Option<Nat>,
+    #[serde(default, rename = "recovery_withdraw_args")]
+    pub withdraw_args: Option<IcpswapWithdrawArgs>,
+    #[serde(default, rename = "recovery_withdraw_returned_amount")]
+    pub withdraw_returned_amount: Option<Nat>,
+    #[serde(default, rename = "recovery_withdraw_submitted_at")]
+    pub withdraw_submitted_at: Option<u64>,
+    #[serde(default, rename = "recovery_wallet_credited_amount")]
+    pub wallet_credited_amount: Option<Nat>,
+}
+
+/// CEX-style durable state for the official manual ICPSwap workflow.
+#[derive(CandidType, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IcpswapState {
+    pub execution_id: String,
+    pub owner: Account,
+    pub step: IcpswapStep,
     #[serde(default)]
-    pub gross_swap_output: Option<ChainTokenAmount>,
-    #[serde(default)]
-    pub input_balance_before: Option<ChainTokenAmount>,
-    #[serde(default)]
-    pub output_balance_before: Option<ChainTokenAmount>,
-    #[serde(default)]
-    pub approval_block_index: Option<Nat>,
-    #[serde(default)]
-    pub approval_created_at: Option<u64>,
-    #[serde(default)]
-    pub pool_transaction_start: Option<Nat>,
-    #[serde(default)]
-    pub pool_transaction_id: Option<Nat>,
-    #[serde(default)]
-    pub settlement_ledger_block_index: Option<Nat>,
-    #[serde(default)]
-    pub refund_transaction_id: Option<Nat>,
-    #[serde(default)]
-    pub refund_ledger_block_index: Option<Nat>,
-    #[serde(default)]
-    pub recovery_amount: Option<ChainTokenAmount>,
-    #[serde(default)]
-    pub recovery_transaction_start: Option<Nat>,
-    #[serde(default)]
-    pub recovery_transaction_id: Option<Nat>,
-    #[serde(default)]
-    pub recovery_ledger_block_index: Option<Nat>,
-    #[serde(default)]
-    pub recovery_submitted_at: Option<u64>,
-    #[serde(default)]
-    pub returned_gross_amount: Option<ChainTokenAmount>,
-    #[serde(default)]
-    pub recovery_destination: Option<Account>,
-    #[serde(default)]
-    pub recovery_transfer_amount: Option<ChainTokenAmount>,
-    #[serde(default)]
-    pub recovery_transfer_created_at: Option<u64>,
-    #[serde(default)]
-    pub recovery_transfer_block_index: Option<Nat>,
-    #[serde(default)]
-    pub submitted_at: Option<u64>,
-    #[serde(default)]
-    pub recovery_attempted: bool,
+    pub operator_pending_step: Option<IcpswapStep>,
     #[serde(default)]
     pub last_error: Option<String>,
+    pub plan: IcpswapExecutionPlan,
+    #[serde(flatten)]
+    pub deposit: IcpswapDepositState,
+    #[serde(flatten)]
+    pub trade: IcpswapTradeState,
+    #[serde(flatten)]
+    pub withdraw: IcpswapWithdrawState,
+    #[serde(flatten)]
+    pub recovery: IcpswapManualRecoveryState,
 }
+
+/// The only supported durable ICPSwap execution state. Older one-step records
+/// intentionally fail deserialization and cannot be resumed.
+pub type IcpswapExecutionState = IcpswapState;
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum IcpswapPlanError {
@@ -208,13 +253,19 @@ pub enum IcpswapClientError {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
-pub enum IcpswapExecutionClientError {
-    #[error("ICPSwap transaction cursor query failed on pool {pool}: {message}")]
-    TransactionQuery { pool: Principal, message: String },
+pub enum IcpswapManualClientError {
+    #[error("ICRC-1 balance lookup failed on ledger {ledger}: {message}")]
+    LedgerBalance { ledger: Principal, message: String },
     #[error("ICRC-2 allowance lookup failed on ledger {ledger}: {message}")]
     Allowance { ledger: Principal, message: String },
     #[error("ICRC-2 approval failed on ledger {ledger}: {message}")]
     Approval { ledger: Principal, message: String },
+    #[error("ICPSwap query {method} to {pool} failed: {message}")]
+    Query {
+        pool: Principal,
+        method: &'static str,
+        message: String,
+    },
     #[error("failed to encode arguments for ICPSwap {method}: {message}")]
     Encode { method: &'static str, message: String },
     #[error("ICPSwap {method} submission to {pool} has an ambiguous outcome: {message}")]
@@ -225,98 +276,6 @@ pub enum IcpswapExecutionClientError {
     },
     #[error("ICPSwap {method} returned an error: {error:?}")]
     Protocol { method: &'static str, error: IcpswapError },
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Error)]
-pub enum IcpswapRecoveryClientError {
-    #[error("failed to encode arguments for ICPSwap {method}: {message}")]
-    Encode { method: &'static str, message: String },
-    #[error("ICPSwap {method} submission to {pool} has an ambiguous outcome: {message}")]
-    SubmissionUnknown {
-        pool: Principal,
-        method: &'static str,
-        message: String,
-    },
-    #[error("ICPSwap {method} returned an error: {error:?}")]
-    Protocol { method: &'static str, error: IcpswapError },
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Error)]
-pub enum IcpswapRecoveryError {
-    #[error(transparent)]
-    Client(#[from] IcpswapRecoveryClientError),
-    #[error("ICPSwap recovery query failed: {0}")]
-    Query(String),
-    #[error("failed to persist ICPSwap recovery state: {0}")]
-    Persistence(String),
-    #[error("no persisted ICPSwap recovery state exists")]
-    MissingState,
-    #[error("ICPSwap recovery requires phase FundsInPool or RecoveryWithdrawSubmitted, got {0:?}")]
-    InvalidPhase(IcpswapExecutionPhase),
-    #[error("ICPSwap recovery state has no recoverable amount")]
-    MissingRecoveryAmount,
-    #[error("ICPSwap recovery state has no swap transaction ID")]
-    MissingSwapTransactionId,
-    #[error("ICPSwap recovery state has no recovery transaction cursor")]
-    MissingRecoveryTransactionCursor,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct IcpswapRecoveryTransferRequest {
-    pub ledger: Principal,
-    pub from: Account,
-    pub to: Account,
-    pub amount: Nat,
-    pub fee: Nat,
-    pub created_at_time: u64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum IcpswapRecoveryTransferOutcome {
-    Completed(Nat),
-    Duplicate(Nat),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Error)]
-pub enum IcpswapRecoveryTransferClientError {
-    #[error("failed to encode ICRC-1 recovery transfer arguments: {0}")]
-    Encode(String),
-    #[error("ICRC-1 recovery transfer submission to ledger {ledger} has an ambiguous outcome: {message}")]
-    SubmissionUnknown { ledger: Principal, message: String },
-    #[error("ICRC-1 recovery transfer was rejected by ledger {ledger}: {message}")]
-    Rejected { ledger: Principal, message: String },
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Error)]
-pub enum IcpswapRecoveryTransferError {
-    #[error(transparent)]
-    Client(#[from] IcpswapRecoveryTransferClientError),
-    #[error("failed to persist ICPSwap recovery transfer state: {0}")]
-    Persistence(String),
-    #[error("no persisted ICPSwap recovery state exists")]
-    MissingState,
-    #[error("ICPSwap recovery transfer cannot run from phase {0:?}")]
-    InvalidPhase(IcpswapExecutionPhase),
-    #[error("confirmed ICPSwap refund has no persisted gross returned amount")]
-    MissingReturnedAmount,
-    #[error("persisted recovery destination {persisted} differs from configured destination {configured}")]
-    DestinationMismatch { persisted: Account, configured: Account },
-    #[error("ICPSwap recovery transfer must originate from the trader root account")]
-    NonRootTraderAccount,
-    #[error("invalid persisted ICPSwap recovery transfer state: {0}")]
-    InvalidPersistedState(&'static str),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Error)]
-pub enum IcpswapExecutionError {
-    #[error(transparent)]
-    Client(#[from] IcpswapExecutionClientError),
-    #[error("failed to persist ICPSwap execution state: {0}")]
-    Persistence(String),
-    #[error("ICPSwap execution cannot submit from phase {0:?}")]
-    SubmissionAlreadyStarted(IcpswapExecutionPhase),
-    #[error("no persisted ICPSwap execution state or new execution plan was provided")]
-    MissingPlan,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -330,160 +289,9 @@ pub struct IcpswapApprovalRequest {
 }
 
 #[derive(CandidType, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct IcpswapPoolToken {
-    pub address: Principal,
-    pub standard: String,
-}
-
-#[derive(CandidType, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct IcpswapTransfer {
-    pub token: Principal,
-    pub standard: String,
-    pub from: Account,
-    pub to: Account,
-    pub amount: Nat,
-    pub fee: Nat,
-    pub memo: Option<Vec<u8>>,
-    pub index: Nat,
-}
-
-#[derive(CandidType, Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum IcpswapDepositStatus {
-    Created,
-    TransferCompleted,
-    Completed,
-    Failed,
-}
-
-#[derive(CandidType, Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum IcpswapWithdrawStatus {
-    Created,
-    CreditCompleted,
-    Completed,
-    Failed,
-}
-
-#[derive(CandidType, Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum IcpswapRefundStatus {
-    Created,
-    CreditCompleted,
-    Completed,
-    Failed,
-}
-
-#[derive(CandidType, Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum IcpswapSwapStatus {
-    Created,
-    Completed,
-    Failed,
-}
-
-#[derive(CandidType, Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum IcpswapOneStepSwapStatus {
-    Created,
-    DepositTransferCompleted,
-    DepositCreditCompleted,
-    PreSwapCompleted,
-    SwapCompleted,
-    WithdrawCreditCompleted,
-    Completed,
-    Failed,
-}
-
-#[derive(CandidType, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct IcpswapDepositInfo {
-    pub transfer: IcpswapTransfer,
-    pub status: IcpswapDepositStatus,
-    pub err: Option<String>,
-}
-
-#[derive(CandidType, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct IcpswapWithdrawInfo {
-    pub transfer: IcpswapTransfer,
-    pub status: IcpswapWithdrawStatus,
-    pub err: Option<String>,
-}
-
-#[derive(CandidType, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct IcpswapSwapInfo {
-    #[serde(rename = "tokenIn")]
-    pub token_in: IcpswapPoolToken,
-    #[serde(rename = "tokenOut")]
-    pub token_out: IcpswapPoolToken,
-    #[serde(rename = "amountIn")]
-    pub amount_in: Nat,
-    #[serde(rename = "amountOut")]
-    pub amount_out: Nat,
-    #[serde(rename = "amountInFee")]
-    pub amount_in_fee: Nat,
-    #[serde(rename = "amountOutFee")]
-    pub amount_out_fee: Nat,
-    pub status: IcpswapSwapStatus,
-    pub err: Option<String>,
-}
-
-#[derive(CandidType, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct IcpswapOneStepSwapInfo {
-    pub deposit: IcpswapDepositInfo,
-    pub withdraw: IcpswapWithdrawInfo,
-    pub swap: IcpswapSwapInfo,
-    pub status: IcpswapOneStepSwapStatus,
-    pub err: Option<String>,
-}
-
-#[derive(CandidType, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct IcpswapRefundInfo {
-    #[serde(rename = "relatedIndex")]
-    pub related_index: Nat,
-    pub transfer: IcpswapTransfer,
-    pub status: IcpswapRefundStatus,
-    pub err: Option<String>,
-}
-
-#[derive(CandidType, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum IcpswapTransactionAction {
-    Deposit(Reserved),
-    Withdraw(IcpswapWithdrawInfo),
-    Refund(IcpswapRefundInfo),
-    AddLiquidity(Reserved),
-    DecreaseLiquidity(Reserved),
-    Claim(Reserved),
-    Swap(Reserved),
-    OneStepSwap(IcpswapOneStepSwapInfo),
-    TransferPosition(Reserved),
-    AddLimitOrder(Reserved),
-    RemoveLimitOrder(Reserved),
-    ExecuteLimitOrder(Reserved),
-}
-
-#[derive(CandidType, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct IcpswapTransaction {
-    pub id: Nat,
-    pub timestamp: Int,
-    pub owner: Principal,
-    #[serde(rename = "canisterId")]
-    pub canister_id: Principal,
-    pub action: IcpswapTransactionAction,
-}
-
-#[derive(CandidType, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IcpswapUnusedBalance {
     pub balance0: Nat,
     pub balance1: Nat,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Error)]
-pub enum IcpswapReconciliationError {
-    #[error("ICPSwap reconciliation query failed: {0}")]
-    Query(String),
-    #[error("multiple ICPSwap transactions match the persisted execution plan")]
-    AmbiguousTransaction,
-    #[error("ICPSwap transaction {0} does not match the persisted execution plan")]
-    TransactionMismatch(Nat),
-    #[error("ICPSwap execution state has no pre-submission transaction cursor")]
-    MissingTransactionCursor,
-    #[error("failed to persist ICPSwap reconciliation state: {0}")]
-    Persistence(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -493,9 +301,9 @@ pub struct IcpswapTokenMetadata {
 }
 
 #[derive(Debug, Clone)]
-pub struct IcpswapQuoteResult {
+pub struct IcpswapRoutePreview {
     pub quote: super::super::model::SwapQuote,
-    pub plan: IcpswapExecutionPlan,
+    pub route: IcpswapExecutionPlan,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]

@@ -1,10 +1,7 @@
 use std::{sync::Arc, time::SystemTime};
 
 use async_trait::async_trait;
-use candid::Nat;
 use icrc_ledger_types::icrc1::account::Account;
-use liquidium_pipeline_core::tokens::chain_token_amount::ChainTokenAmount;
-use num_traits::ToPrimitive;
 
 use crate::{
     finalizers::dex_finalizer::{DexRouteFinalizer, DexRoutePreview},
@@ -14,14 +11,11 @@ use crate::{
     swappers::{
         icpswap::{
             VENUE_ID,
-            execution::{IcpswapExecutionStateStore, WalIcpswapExecutionStateStore, approve_and_submit},
-            recovery::recover,
-            recovery_transfer::transfer_to_recovery,
-            settlement::reconcile_swap_settlement,
-            types::{IcpswapExecutionPhase, IcpswapExecutionState},
-            venue::IcpswapVenueService,
+            execution::{IcpswapExecutionStateStore, WalIcpswapExecutionStateStore},
+            types::{IcpswapExecutionPlan, IcpswapExecutionState, IcpswapStep},
+            venue::IcpswapFinalizerLogic,
         },
-        model::{SwapExecution, SwapQuoteLeg, SwapRequest},
+        model::SwapRequest,
     },
     wal::{decode_receipt_wrapper, encode_meta, liq_id_from_receipt, wal_load},
 };
@@ -30,52 +24,26 @@ pub(crate) const ICPSWAP_FINALIZER_PERMANENT_PREFIX: &str = "permanent ICPSwap f
 
 type Clock = dyn Fn() -> u64 + Send + Sync;
 
-/// WAL-backed finalizer for the complete ICPSwap execution lifecycle.
-///
-/// The phase persisted in the liquidation row is the sole dispatch key. In
-/// particular, phases at or after submission can only reconcile or recover;
-/// they can never return to swap submission.
+/// WAL-backed finalizer for the manual ICPSwap execution lifecycle.
 pub struct IcpswapFinalizer {
-    venue: Arc<dyn IcpswapVenueService>,
+    workflow: Arc<dyn IcpswapFinalizerLogic>,
     trader: Account,
-    recovery_destination: Account,
-    automatic_refund_wait_nanos: u64,
-    recovery_timeout_nanos: u64,
     clock: Arc<Clock>,
 }
 
 impl IcpswapFinalizer {
-    pub fn new(
-        venue: Arc<dyn IcpswapVenueService>,
-        trader: Account,
-        recovery_destination: Account,
-        automatic_refund_wait_nanos: u64,
-        recovery_timeout_nanos: u64,
-    ) -> Self {
-        Self::from_venue_with_clock(
-            venue,
-            trader,
-            recovery_destination,
-            automatic_refund_wait_nanos,
-            recovery_timeout_nanos,
-            Arc::new(system_time_nanos),
-        )
+    pub fn new(workflow: Arc<dyn IcpswapFinalizerLogic>, trader: Account) -> Self {
+        Self::from_workflow_with_clock(workflow, trader, Arc::new(system_time_nanos))
     }
 
-    pub fn from_venue_with_clock(
-        venue: Arc<dyn IcpswapVenueService>,
+    pub fn from_workflow_with_clock(
+        workflow: Arc<dyn IcpswapFinalizerLogic>,
         trader: Account,
-        recovery_destination: Account,
-        automatic_refund_wait_nanos: u64,
-        recovery_timeout_nanos: u64,
         clock: Arc<Clock>,
     ) -> Self {
         Self {
-            venue,
+            workflow,
             trader,
-            recovery_destination,
-            automatic_refund_wait_nanos,
-            recovery_timeout_nanos,
             clock,
         }
     }
@@ -91,38 +59,44 @@ impl IcpswapFinalizer {
             .ok_or_else(|| format!("missing persisted ICPSwap state for liquidation {liquidation_id}"))
     }
 
-    async fn persist_pending_error(
-        &self,
-        store: &dyn IcpswapExecutionStateStore,
-        liquidation_id: &str,
-        message: String,
-    ) -> Result<IcpswapExecutionState, String> {
-        let mut state = self.load_state(store, liquidation_id).await?;
-        state.last_error = Some(message);
-        store.persist(liquidation_id, &state).await?;
-        Ok(state)
-    }
-
-    fn result_for_state(
+    async fn result_for_state(
         &self,
         receipt: &ExecutionReceipt,
         state: &IcpswapExecutionState,
         now_nanos: u64,
     ) -> Result<FinalizerResult, String> {
-        match state.phase {
-            IcpswapExecutionPhase::Completed => Ok(FinalizerResult {
-                swap_result: Some(build_completed_execution(receipt, state, now_nanos)?),
+        match state.step {
+            IcpswapStep::Completed => Ok(FinalizerResult {
+                swap_result: Some(
+                    self.workflow
+                        .finish(
+                            receipt
+                                .request
+                                .swap_args
+                                .as_ref()
+                                .ok_or_else(|| permanent_message("completed receipt has no swap request"))?,
+                            state,
+                            now_nanos,
+                        )
+                        .await
+                        .map_err(|error| permanent_message(&error))?,
+                ),
                 finalized: true,
                 swapper: Some("icpswap".to_string()),
                 reason: None,
             }),
-            IcpswapExecutionPhase::Recovered => Ok(FinalizerResult {
+            IcpswapStep::Refunded => Ok(FinalizerResult {
                 swap_result: None,
                 finalized: true,
                 swapper: Some("recovery".to_string()),
-                reason: Some(recovery_reason(state)),
+                reason: Some("ICPSwap failed; deposited ICP was withdrawn back to the trader account".to_string()),
             }),
-            IcpswapExecutionPhase::FailedTerminal => Err(permanent_error(state)),
+            IcpswapStep::Failed => Err(permanent_message(
+                state
+                    .last_error
+                    .as_deref()
+                    .unwrap_or("manual ICPSwap failed without detail"),
+            )),
             _ => Ok(FinalizerResult::noop()),
         }
     }
@@ -137,78 +111,44 @@ impl Finalizer for IcpswapFinalizer {
 
         let liquidation_id = liq_id_from_receipt(&receipt)?;
         let store = WalIcpswapExecutionStateStore::new(wal);
-        let initial = self.load_state(&store, &liquidation_id).await?;
+        self.load_state(&store, &liquidation_id).await?;
         let now_nanos = (self.clock)();
 
-        let step = match initial.phase {
-            IcpswapExecutionPhase::Planned | IcpswapExecutionPhase::Approved => approve_and_submit(
-                self.venue.as_ref(),
-                &store,
-                &liquidation_id,
-                self.trader,
-                None,
-                now_nanos,
-            )
+        let owner_key = self.trader.owner.to_text();
+        if !wal
+            .acquire_icpswap_owner_lock(&owner_key, &liquidation_id)
             .await
-            .map_err(|error| error.to_string()),
-
-            IcpswapExecutionPhase::SubmissionUnknown
-            | IcpswapExecutionPhase::AwaitingOutput
-            | IcpswapExecutionPhase::RefundPending => reconcile_swap_settlement(
-                self.venue.as_ref(),
-                &store,
-                &liquidation_id,
-                self.trader,
-                now_nanos,
-                self.automatic_refund_wait_nanos,
-            )
+            .map_err(|error| format!("failed acquiring ICPSwap owner lock: {error}"))?
+        {
+            return Err(format!(
+                "another manual ICPSwap execution is active for owner {}",
+                self.trader.owner
+            ));
+        }
+        let state = match self
+            .workflow
+            .advance(&store, &liquidation_id, self.trader, now_nanos)
             .await
-            .map_err(|error| error.to_string()),
-            IcpswapExecutionPhase::FundsInPool | IcpswapExecutionPhase::RecoveryWithdrawSubmitted => recover(
-                self.venue.as_ref(),
-                &store,
-                &liquidation_id,
-                self.trader,
-                now_nanos,
-                self.recovery_timeout_nanos,
-            )
-            .await
-            .map_err(|error| error.to_string()),
-            IcpswapExecutionPhase::Refunded
-            | IcpswapExecutionPhase::RecoveryTransferPending
-            | IcpswapExecutionPhase::RecoveryTransferSubmitted => transfer_to_recovery(
-                self.venue.as_ref(),
-                &store,
-                &liquidation_id,
-                self.trader,
-                initial.recovery_destination.unwrap_or(self.recovery_destination),
-                now_nanos,
-                self.recovery_timeout_nanos,
-            )
-            .await
-            .map_err(|error| error.to_string()),
-            IcpswapExecutionPhase::Completed
-            | IcpswapExecutionPhase::Recovered
-            | IcpswapExecutionPhase::FailedTerminal => Ok(initial),
-        };
-
-        let state = match step {
+        {
             Ok(state) => state,
             Err(error) => {
-                let state = self
-                    .persist_pending_error(&store, &liquidation_id, error.clone())
-                    .await?;
-                if state.phase == IcpswapExecutionPhase::FailedTerminal {
-                    return Err(permanent_error(&state));
+                let mut state = self.load_state(&store, &liquidation_id).await?;
+                state.last_error = Some(error.clone());
+                store.persist(&liquidation_id, &state).await?;
+                if state.step == IcpswapStep::Failed {
+                    return Err(permanent_message(&error));
                 }
-                if phase_is_post_submission_pending(state.phase) {
-                    return Ok(FinalizerResult::noop());
-                }
-                return Err(error);
+                return Ok(FinalizerResult::noop());
             }
         };
 
-        self.result_for_state(&receipt, &state, now_nanos)
+        let result = self.result_for_state(&receipt, &state, now_nanos).await;
+        if matches!(state.step, IcpswapStep::Completed | IcpswapStep::Refunded) {
+            wal.release_icpswap_owner_lock(&owner_key, &liquidation_id)
+                .await
+                .map_err(|error| format!("failed releasing ICPSwap owner lock: {error}"))?;
+        }
+        result
     }
 
     fn classify_error(&self, error: &str) -> FinalizerErrorKind {
@@ -227,12 +167,12 @@ impl DexRouteFinalizer for IcpswapFinalizer {
     }
 
     async fn preview_route(&self, request: &SwapRequest) -> Result<DexRoutePreview, String> {
-        let quoted = self
-            .venue
-            .quote_with_plan(request)
+        let preview = self
+            .workflow
+            .preview_route(request)
             .await
             .map_err(|error| error.to_string())?;
-        Ok(DexRoutePreview::new(quoted.quote, quoted.plan))
+        DexRoutePreview::new(preview.quote, VENUE_ID, &preview.route)
     }
 
     async fn has_committed_route(&self, wal: &dyn WalStore, receipt: &ExecutionReceipt) -> Result<bool, String> {
@@ -256,10 +196,7 @@ impl DexRouteFinalizer for IcpswapFinalizer {
         decision: FinalizerDecisionSnapshot,
         preview: DexRoutePreview,
     ) -> Result<(), String> {
-        let plan = preview
-            .plan::<crate::swappers::icpswap::types::IcpswapExecutionPlan>()
-            .cloned()
-            .ok_or_else(|| "ICPSwap finalizer received a preview from another venue".to_string())?;
+        let route: IcpswapExecutionPlan = preview.route(VENUE_ID)?;
         if decision.chosen != "dex" {
             return Err(format!(
                 "ICPSwap route commit requires chosen=dex, got {}",
@@ -283,12 +220,13 @@ impl DexRouteFinalizer for IcpswapFinalizer {
             ));
         }
 
+        let mut acquired_owner_lock = false;
         match &wrapper.venue_execution {
             Some(record) if record.is_venue(VENUE_ID) => {
                 let existing = record
                     .decode::<IcpswapExecutionState>(VENUE_ID)?
                     .expect("venue was checked above");
-                if existing.plan != plan {
+                if existing.plan != route {
                     return Err(format!(
                         "refusing to replace persisted ICPSwap pool plan for liquidation {liquidation_id}"
                     ));
@@ -301,130 +239,43 @@ impl DexRouteFinalizer for IcpswapFinalizer {
                 ));
             }
             None => {
-                let mut state = IcpswapExecutionState::planned(plan);
-                state.recovery_destination = Some(self.recovery_destination);
+                let owner_key = self.trader.owner.to_text();
+                if !wal
+                    .acquire_icpswap_owner_lock(&owner_key, &liquidation_id)
+                    .await
+                    .map_err(|error| format!("failed acquiring ICPSwap owner lock: {error}"))?
+                {
+                    return Err(format!(
+                        "another manual ICPSwap execution is active for owner {}",
+                        self.trader.owner
+                    ));
+                }
+                acquired_owner_lock = true;
+                let state = self.workflow.prepare(&liquidation_id, route, self.trader);
                 wrapper.venue_execution = Some(VenueExecutionState::new(VENUE_ID, &state)?);
             }
         }
 
         wrapper.finalizer_decision = Some(decision);
-        encode_meta(&mut row, &wrapper)?;
-        wal.upsert_result(row)
+        if let Err(error) = encode_meta(&mut row, &wrapper) {
+            if acquired_owner_lock {
+                let _ = wal
+                    .release_icpswap_owner_lock(&self.trader.owner.to_text(), &liquidation_id)
+                    .await;
+            }
+            return Err(error);
+        }
+        let result = wal
+            .upsert_result(row)
             .await
-            .map_err(|error| format!("WAL ICPSwap route commit failed for {liquidation_id}: {error}"))
+            .map_err(|error| format!("WAL ICPSwap route commit failed for {liquidation_id}: {error}"));
+        if result.is_err() && acquired_owner_lock {
+            let _ = wal
+                .release_icpswap_owner_lock(&self.trader.owner.to_text(), &liquidation_id)
+                .await;
+        }
+        result
     }
-}
-
-fn phase_is_post_submission_pending(phase: IcpswapExecutionPhase) -> bool {
-    matches!(
-        phase,
-        IcpswapExecutionPhase::SubmissionUnknown
-            | IcpswapExecutionPhase::AwaitingOutput
-            | IcpswapExecutionPhase::RefundPending
-            | IcpswapExecutionPhase::FundsInPool
-            | IcpswapExecutionPhase::RecoveryWithdrawSubmitted
-            | IcpswapExecutionPhase::Refunded
-            | IcpswapExecutionPhase::RecoveryTransferPending
-            | IcpswapExecutionPhase::RecoveryTransferSubmitted
-    )
-}
-
-fn build_completed_execution(
-    receipt: &ExecutionReceipt,
-    state: &IcpswapExecutionState,
-    now_nanos: u64,
-) -> Result<SwapExecution, String> {
-    let gross = state
-        .gross_swap_output
-        .as_ref()
-        .ok_or_else(|| permanent_message("completed state has no gross swap output"))?;
-    if gross.token != state.plan.gross_quoted_out.token || gross.value <= state.plan.output_ledger_fee.value {
-        return Err(permanent_message("completed output cannot cover its ledger fee"));
-    }
-    let pool_transaction_id = state
-        .pool_transaction_id
-        .as_ref()
-        .ok_or_else(|| permanent_message("completed state has no pool transaction ID"))?;
-    let ledger_block = state
-        .settlement_ledger_block_index
-        .as_ref()
-        .ok_or_else(|| permanent_message("completed state has no settlement ledger block"))?;
-    let swap_id = nat_to_u64(pool_transaction_id, "pool transaction ID")?;
-    let request_id = nat_to_u64(ledger_block, "settlement ledger block")?;
-    let net_value = gross.value.clone() - state.plan.output_ledger_fee.value.clone();
-    let net_output = ChainTokenAmount::from_raw(gross.token.clone(), net_value.clone());
-    let pay = state.plan.amount_in.to_f64();
-    let receive = net_output.to_f64();
-    let expected = state.plan.net_expected_output.to_f64();
-    let exec_price = if pay > 0.0 { receive / pay } else { 0.0 };
-    let mid_price = if pay > 0.0 { expected / pay } else { 0.0 };
-    let slippage = if expected > 0.0 {
-        ((expected - receive) / expected).max(0.0)
-    } else {
-        0.0
-    };
-    let swap_request = receipt
-        .request
-        .swap_args
-        .as_ref()
-        .ok_or_else(|| permanent_message("completed receipt has no swap request"))?;
-
-    Ok(SwapExecution {
-        swap_id,
-        request_id,
-        status: "filled".to_string(),
-        pay_asset: state.plan.amount_in.token.asset_id(),
-        pay_amount: state.plan.amount_in.value.clone(),
-        receive_asset: net_output.token.asset_id(),
-        receive_amount: net_value.clone(),
-        mid_price,
-        exec_price,
-        slippage,
-        legs: vec![SwapQuoteLeg {
-            venue: "icpswap".to_string(),
-            route_id: format!(
-                "{}:transaction={pool_transaction_id}:ledger_block={ledger_block}",
-                state.plan.pool
-            ),
-            pay_chain: swap_request.pay_asset.chain.clone(),
-            pay_symbol: state.plan.amount_in.token.symbol(),
-            pay_amount: state.plan.amount_in.value.clone(),
-            receive_chain: swap_request.receive_asset.chain.clone(),
-            receive_symbol: net_output.token.symbol(),
-            receive_amount: net_value,
-            price: exec_price,
-            lp_fee: Nat::from(0u8),
-            gas_fee: state.plan.output_ledger_fee.value.clone(),
-        }],
-        approval_count: Some(u32::from(state.approval_block_index.is_some())),
-        ts: now_nanos / 1_000_000_000,
-    })
-}
-
-fn nat_to_u64(value: &Nat, field: &str) -> Result<u64, String> {
-    value
-        .0
-        .to_u64()
-        .ok_or_else(|| permanent_message(&format!("{field} does not fit in u64")))
-}
-
-fn recovery_reason(state: &IcpswapExecutionState) -> String {
-    if let Some(transaction_id) = &state.recovery_transaction_id {
-        format!("ICPSwap failed; pool withdrawal {transaction_id} was moved to the recovery account")
-    } else if let Some(transaction_id) = &state.refund_transaction_id {
-        format!("ICPSwap failed; automatic refund {transaction_id} was moved to the recovery account")
-    } else {
-        "ICPSwap failed; zero transferable refund was finalized for recovery".to_string()
-    }
-}
-
-fn permanent_error(state: &IcpswapExecutionState) -> String {
-    permanent_message(
-        state
-            .last_error
-            .as_deref()
-            .unwrap_or("terminal ICPSwap state has no error detail"),
-    )
 }
 
 fn permanent_message(message: &str) -> String {

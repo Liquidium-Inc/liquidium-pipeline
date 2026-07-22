@@ -1,7 +1,8 @@
-use std::{any::Any, fmt, sync::Arc};
+use std::{fmt, sync::Arc};
 
 use async_trait::async_trait;
 use log::debug;
+use serde::{Serialize, de::DeserializeOwned};
 
 use crate::{
     finalizers::finalizer::{Finalizer, FinalizerResult},
@@ -13,19 +14,30 @@ use crate::{
 #[derive(Clone)]
 pub struct DexRoutePreview {
     pub quote: SwapQuote,
-    plan: Arc<dyn Any + Send + Sync>,
+    venue: Arc<str>,
+    route: Arc<[u8]>,
 }
 
 impl DexRoutePreview {
-    pub fn new<T: Any + Send + Sync>(quote: SwapQuote, plan: T) -> Self {
-        Self {
+    pub fn new<T: Serialize>(quote: SwapQuote, venue: impl Into<Arc<str>>, route: &T) -> Result<Self, String> {
+        Ok(Self {
             quote,
-            plan: Arc::new(plan),
-        }
+            venue: venue.into(),
+            route: serde_json::to_vec(route)
+                .map_err(|error| format!("failed encoding DEX route preview: {error}"))?
+                .into(),
+        })
     }
 
-    pub(crate) fn plan<T: Any>(&self) -> Option<&T> {
-        self.plan.downcast_ref()
+    pub(crate) fn route<T: DeserializeOwned>(&self, expected_venue: &str) -> Result<T, String> {
+        if self.venue.as_ref() != expected_venue {
+            return Err(format!(
+                "DEX route belongs to venue {}, not {expected_venue}",
+                self.venue
+            ));
+        }
+        serde_json::from_slice(&self.route)
+            .map_err(|error| format!("failed decoding {} DEX route preview: {error}", self.venue))
     }
 }
 
@@ -34,11 +46,12 @@ impl fmt::Debug for DexRoutePreview {
         formatter
             .debug_struct("DexRoutePreview")
             .field("quote", &self.quote)
+            .field("venue", &self.venue)
             .finish_non_exhaustive()
     }
 }
 
-/// One coherent DEX dependency for previewing and executing a persisted plan.
+/// One coherent DEX dependency for previewing and executing a persisted route.
 /// A future implementation may aggregate several DEX venues behind this trait.
 #[async_trait]
 pub trait DexRouteFinalizer: Finalizer + Send + Sync {

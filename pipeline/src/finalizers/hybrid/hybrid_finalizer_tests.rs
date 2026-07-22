@@ -56,12 +56,13 @@ impl DexRouteFinalizer for TestDexRouteFinalizer {
 
     async fn preview_route(&self, request: &SwapRequest) -> Result<DexRoutePreview, String> {
         let quote = self.planner.0.quote(request).await?;
-        Ok(DexRoutePreview::new(
+        DexRoutePreview::new(
             quote,
-            TestDexPlan {
+            TEST_DEX_ID,
+            &TestDexPlan {
                 pay_amount: request.pay_amount.value.clone(),
             },
-        ))
+        )
     }
 
     async fn has_committed_route(&self, wal: &dyn WalStore, receipt: &ExecutionReceipt) -> Result<bool, String> {
@@ -87,10 +88,7 @@ impl DexRouteFinalizer for TestDexRouteFinalizer {
         decision: FinalizerDecisionSnapshot,
         preview: DexRoutePreview,
     ) -> Result<(), String> {
-        let plan = preview
-            .plan::<TestDexPlan>()
-            .cloned()
-            .ok_or_else(|| "unexpected preview type".to_string())?;
+        let plan: TestDexPlan = preview.route(TEST_DEX_ID)?;
         let liquidation_id = liq_id_from_receipt(receipt)?;
         let mut row = wal
             .get_result(&liquidation_id)

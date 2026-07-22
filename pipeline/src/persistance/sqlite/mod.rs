@@ -5,7 +5,7 @@ use diesel::{
     dsl::count_star,
     prelude::*,
     r2d2::{ConnectionManager, Pool},
-    sql_types::{BigInt, Integer},
+    sql_types::{BigInt, Integer, Text},
 };
 use std::collections::HashMap;
 
@@ -329,6 +329,43 @@ impl WalStore for SqliteWalStore {
         diesel::delete(tbl::table.find(liq_id.to_string())).execute(&mut conn)?;
         Ok(())
     }
+
+    async fn acquire_icpswap_owner_lock(&self, owner: &str, execution_id: &str) -> Result<bool> {
+        self.ensure_writable()?;
+        #[derive(QueryableByName)]
+        struct LockRow {
+            #[diesel(sql_type = Text)]
+            execution_id: String,
+        }
+
+        let mut conn = self.get_conn()?;
+        conn.transaction::<bool, diesel::result::Error, _>(|conn| {
+            diesel::sql_query(
+                "INSERT OR IGNORE INTO icpswap_execution_locks (owner_principal, execution_id, updated_at) VALUES (?, ?, ?)",
+            )
+            .bind::<Text, _>(owner)
+            .bind::<Text, _>(execution_id)
+            .bind::<BigInt, _>(now_secs())
+            .execute(conn)?;
+            let row = diesel::sql_query(
+                "SELECT execution_id FROM icpswap_execution_locks WHERE owner_principal = ? LIMIT 1",
+            )
+            .bind::<Text, _>(owner)
+            .get_result::<LockRow>(conn)?;
+            Ok(row.execution_id == execution_id)
+        })
+        .map_err(Into::into)
+    }
+
+    async fn release_icpswap_owner_lock(&self, owner: &str, execution_id: &str) -> Result<()> {
+        self.ensure_writable()?;
+        let mut conn = self.get_conn()?;
+        diesel::sql_query("DELETE FROM icpswap_execution_locks WHERE owner_principal = ? AND execution_id = ?")
+            .bind::<Text, _>(owner)
+            .bind::<Text, _>(execution_id)
+            .execute(&mut conn)?;
+        Ok(())
+    }
 }
 
 pub fn initialize_schema(conn: &mut SqliteConnection) -> Result<()> {
@@ -354,6 +391,12 @@ pub fn initialize_schema(conn: &mut SqliteConnection) -> Result<()> {
         );
         INSERT OR IGNORE INTO daemon_control_state (singleton_id, paused, updated_at)
         VALUES (1, 0, CAST(strftime('%s','now') AS INTEGER));
+
+        CREATE TABLE IF NOT EXISTS icpswap_execution_locks (
+            owner_principal TEXT NOT NULL PRIMARY KEY,
+            execution_id TEXT NOT NULL,
+            updated_at BIGINT NOT NULL
+        );
     "#,
     )?;
     Ok(())
@@ -476,6 +519,26 @@ mod tests {
 
         let reader = SqliteWalStore::new_read_only_with_busy_timeout(&path, 5_000).expect("reader");
         assert!(reader.daemon_paused().expect("read-only read paused state"));
+    }
+
+    #[test]
+    fn icpswap_owner_lock_is_atomic_and_execution_scoped() {
+        let temp = tempfile::NamedTempFile::new().expect("tmp db");
+        let path = temp.path().display().to_string();
+        let store = SqliteWalStore::new_with_busy_timeout(&path, 5_000).expect("store");
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+
+        rt.block_on(async {
+            assert!(store.acquire_icpswap_owner_lock("owner-1", "run-1").await.unwrap());
+            assert!(store.acquire_icpswap_owner_lock("owner-1", "run-1").await.unwrap());
+            assert!(!store.acquire_icpswap_owner_lock("owner-1", "run-2").await.unwrap());
+            assert!(store.acquire_icpswap_owner_lock("owner-2", "run-2").await.unwrap());
+
+            store.release_icpswap_owner_lock("owner-1", "wrong-run").await.unwrap();
+            assert!(!store.acquire_icpswap_owner_lock("owner-1", "run-2").await.unwrap());
+            store.release_icpswap_owner_lock("owner-1", "run-1").await.unwrap();
+            assert!(store.acquire_icpswap_owner_lock("owner-1", "run-2").await.unwrap());
+        });
     }
 
     #[test]

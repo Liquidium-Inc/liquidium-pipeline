@@ -1,25 +1,17 @@
 use std::sync::Arc;
 
 use candid::{CandidType, Decode, Encode, Int, Nat, Principal};
-use icrc_ledger_types::icrc1::{
-    account::Account,
-    transfer::{TransferArg, TransferError},
-};
 use liquidium_pipeline_connectors::pipeline_agent::MockPipelineAgent;
 use liquidium_pipeline_core::tokens::{chain_token::ChainToken, chain_token_amount::ChainTokenAmount};
 use serde::Deserialize;
 
 use super::{
-    client::{
-        IcpswapClient, IcpswapExecutionClient, IcpswapReadClient, IcpswapRecoveryTransferClient,
-        MockIcpswapLedgerClient,
-    },
+    client::{IcpswapClient, IcpswapManualClient, IcpswapReadClient, MockIcpswapLedgerClient},
     plan::{amount_out_minimum, nat_to_decimal_text, net_expected_output, resolve_direction},
     types::{
-        IcpswapClientError, IcpswapDepositAndSwapArgs, IcpswapError, IcpswapExecutionClientError,
-        IcpswapExecutionPhase, IcpswapExecutionPlan, IcpswapExecutionState, IcpswapGetPoolArgs, IcpswapPlanError,
-        IcpswapPoolData, IcpswapRecoveryTransferOutcome, IcpswapRecoveryTransferRequest, IcpswapResult,
-        IcpswapSwapArgs, IcpswapToken,
+        IcpswapClientError, IcpswapDepositArgs, IcpswapError, IcpswapExecutionPlan, IcpswapExecutionState,
+        IcpswapGetPoolArgs, IcpswapPlanError, IcpswapPoolData, IcpswapResult, IcpswapStep, IcpswapSwapArgs,
+        IcpswapToken, IcpswapWithdrawArgs,
     },
 };
 
@@ -121,7 +113,7 @@ fn builds_complete_plan_for_reversed_direction() {
 }
 
 #[test]
-fn planned_state_starts_before_any_external_side_effect() {
+fn manual_state_starts_before_any_external_side_effect() {
     let token0 = principal(1);
     let token1 = principal(2);
     let input = icp_token(token0, "IN", 10);
@@ -140,17 +132,17 @@ fn planned_state_starts_before_any_external_side_effect() {
     )
     .expect("valid plan");
 
-    let state = IcpswapExecutionState::planned(plan.clone());
+    let owner = icrc_ledger_types::icrc1::account::Account {
+        owner: principal(4),
+        subaccount: None,
+    };
+    let state = IcpswapExecutionState::prepare("run-1", plan.clone(), owner);
 
     assert_eq!(state.plan, plan);
-    assert_eq!(state.phase, IcpswapExecutionPhase::Planned);
-    assert!(state.gross_swap_output.is_none());
-    assert!(state.input_balance_before.is_none());
-    assert!(state.output_balance_before.is_none());
-    assert!(state.approval_block_index.is_none());
-    assert!(state.approval_created_at.is_none());
-    assert!(state.submitted_at.is_none());
-    assert!(!state.recovery_attempted);
+    assert_eq!(state.step, IcpswapStep::Deposit);
+    assert!(state.deposit.approval_block_index.is_none());
+    assert!(state.deposit.approval_created_at.is_none());
+    assert!(state.deposit.deposit_submitted_at.is_none());
     assert!(state.last_error.is_none());
 }
 
@@ -204,6 +196,27 @@ fn swap_args_encode_with_official_candid_field_names() {
     assert!(decoded.zeroForOne);
     assert_eq!(decoded.amountIn, "100000000");
     assert_eq!(decoded.amountOutMinimum, "99000000");
+}
+
+#[derive(CandidType, Deserialize)]
+struct OfficialDepositArgs {
+    token: String,
+    amount: Nat,
+    fee: Nat,
+}
+
+#[test]
+fn deposit_args_encode_with_official_candid_shape() {
+    let encoded = Encode!(&IcpswapDepositArgs {
+        token: principal(1).to_text(),
+        amount: Nat::from(100_000u64),
+        fee: Nat::from(10u64),
+    })
+    .expect("encode");
+    let decoded = Decode!(&encoded, OfficialDepositArgs).expect("official Candid shape");
+    assert_eq!(decoded.token, principal(1).to_text());
+    assert_eq!(decoded.amount, Nat::from(100_000u64));
+    assert_eq!(decoded.fee, Nat::from(10u64));
 }
 
 #[allow(non_snake_case)]
@@ -485,142 +498,69 @@ async fn client_adds_ledger_context_to_fee_error() {
 }
 
 #[tokio::test]
-async fn client_submits_exact_deposit_from_and_swap_call() {
+async fn client_submits_exact_manual_pool_updates() {
     let factory = principal(7);
     let pool = principal(8);
-    let args = IcpswapDepositAndSwapArgs {
-        zero_for_one: false,
-        token_in_fee: Nat::from(10u64),
-        token_out_fee: Nat::from(5u64),
+    let deposit = IcpswapDepositArgs {
+        token: principal(1).to_text(),
+        amount: Nat::from(100_000u64),
+        fee: Nat::from(10u64),
+    };
+    let swap = IcpswapSwapArgs {
+        zero_for_one: true,
         amount_in: "100000".to_string(),
         amount_out_minimum: "99000".to_string(),
     };
-    let expected_args = args.clone();
+    let withdraw = IcpswapWithdrawArgs {
+        token: principal(2).to_text(),
+        amount: Nat::from(99_500u64),
+        fee: Nat::from(5u64),
+    };
+    let expected_deposit = deposit.clone();
+    let expected_swap = swap.clone();
+    let expected_withdraw = withdraw.clone();
     let response = Encode!(&IcpswapResult::Ok(Nat::from(99_500u64))).expect("response");
-
+    let mut sequence = mockall::Sequence::new();
     let mut agent = MockPipelineAgent::new();
     agent
         .expect_call_update_raw()
         .times(1)
+        .in_sequence(&mut sequence)
         .withf(move |canister, method, encoded| {
             *canister == pool
-                && method == "depositFromAndSwap"
-                && Decode!(encoded, IcpswapDepositAndSwapArgs).is_ok_and(|decoded| decoded == expected_args)
+                && method == "depositFrom"
+                && Decode!(encoded, IcpswapDepositArgs).is_ok_and(|actual| actual == expected_deposit)
         })
-        .return_once(move |_, _, _| Ok(response));
-    let client = IcpswapClient::new(Arc::new(agent), Arc::new(MockIcpswapLedgerClient::new()), factory);
-
-    assert_eq!(
-        client.deposit_from_and_swap(pool, &args).await,
-        Ok(Nat::from(99_500u64))
-    );
-}
-
-#[tokio::test]
-async fn malformed_update_response_is_treated_as_ambiguous() {
-    let factory = principal(7);
-    let pool = principal(8);
-    let args = IcpswapDepositAndSwapArgs {
-        zero_for_one: true,
-        token_in_fee: Nat::from(10u64),
-        token_out_fee: Nat::from(5u64),
-        amount_in: "100000".to_string(),
-        amount_out_minimum: "99000".to_string(),
-    };
-    let mut agent = MockPipelineAgent::new();
+        .return_once({
+            let response = response.clone();
+            move |_, _, _| Ok(response)
+        });
     agent
         .expect_call_update_raw()
         .times(1)
-        .return_once(|_, _, _| Ok(vec![0xde, 0xad, 0xbe, 0xef]));
-    let client = IcpswapClient::new(Arc::new(agent), Arc::new(MockIcpswapLedgerClient::new()), factory);
-
-    assert!(matches!(
-        client.deposit_from_and_swap(pool, &args).await,
-        Err(IcpswapExecutionClientError::SubmissionUnknown {
-            pool: actual_pool,
-            method: "depositFromAndSwap",
-            ..
-        }) if actual_pool == pool
-    ));
-}
-
-#[tokio::test]
-async fn client_submits_exact_deduplicated_recovery_transfer() {
-    let factory = principal(7);
-    let ledger = principal(1);
-    let destination = Account {
-        owner: principal(4),
-        subaccount: Some([7; 32]),
-    };
-    let request = IcpswapRecoveryTransferRequest {
-        ledger,
-        from: Account {
-            owner: principal(4),
-            subaccount: None,
-        },
-        to: destination,
-        amount: Nat::from(99_980u64),
-        fee: Nat::from(10u64),
-        created_at_time: 600,
-    };
-    let response = Encode!(&Result::<Nat, TransferError>::Ok(Nat::from(902u64))).expect("response");
-
-    let mut agent = MockPipelineAgent::new();
-    agent
-        .expect_call_update_raw()
-        .times(1)
+        .in_sequence(&mut sequence)
         .withf(move |canister, method, encoded| {
-            *canister == ledger
-                && method == "icrc1_transfer"
-                && Decode!(encoded, TransferArg).is_ok_and(|args| {
-                    args.from_subaccount.is_none()
-                        && args.to == destination
-                        && args.amount == Nat::from(99_980u64)
-                        && args.fee == Some(Nat::from(10u64))
-                        && args.memo.is_none()
-                        && args.created_at_time == Some(600)
-                })
+            *canister == pool
+                && method == "swap"
+                && Decode!(encoded, IcpswapSwapArgs).is_ok_and(|actual| actual == expected_swap)
+        })
+        .return_once({
+            let response = response.clone();
+            move |_, _, _| Ok(response)
+        });
+    agent
+        .expect_call_update_raw()
+        .times(1)
+        .in_sequence(&mut sequence)
+        .withf(move |canister, method, encoded| {
+            *canister == pool
+                && method == "withdraw"
+                && Decode!(encoded, IcpswapWithdrawArgs).is_ok_and(|actual| actual == expected_withdraw)
         })
         .return_once(move |_, _, _| Ok(response));
     let client = IcpswapClient::new(Arc::new(agent), Arc::new(MockIcpswapLedgerClient::new()), factory);
 
-    assert_eq!(
-        client.transfer_recovered_funds(&request).await,
-        Ok(IcpswapRecoveryTransferOutcome::Completed(Nat::from(902u64)))
-    );
-}
-
-#[tokio::test]
-async fn client_preserves_duplicate_recovery_transfer_block() {
-    let factory = principal(7);
-    let ledger = principal(1);
-    let request = IcpswapRecoveryTransferRequest {
-        ledger,
-        from: Account {
-            owner: principal(4),
-            subaccount: None,
-        },
-        to: Account {
-            owner: principal(4),
-            subaccount: Some([7; 32]),
-        },
-        amount: Nat::from(99_980u64),
-        fee: Nat::from(10u64),
-        created_at_time: 600,
-    };
-    let response = Encode!(&Result::<Nat, TransferError>::Err(TransferError::Duplicate {
-        duplicate_of: Nat::from(902u64),
-    }))
-    .expect("response");
-    let mut agent = MockPipelineAgent::new();
-    agent
-        .expect_call_update_raw()
-        .times(1)
-        .return_once(move |_, _, _| Ok(response));
-    let client = IcpswapClient::new(Arc::new(agent), Arc::new(MockIcpswapLedgerClient::new()), factory);
-
-    assert_eq!(
-        client.transfer_recovered_funds(&request).await,
-        Ok(IcpswapRecoveryTransferOutcome::Duplicate(Nat::from(902u64)))
-    );
+    assert_eq!(client.deposit_from(pool, &deposit).await, Ok(Nat::from(99_500u64)));
+    assert_eq!(client.swap_manual(pool, &swap).await, Ok(Nat::from(99_500u64)));
+    assert_eq!(client.withdraw_manual(pool, &withdraw).await, Ok(Nat::from(99_500u64)));
 }

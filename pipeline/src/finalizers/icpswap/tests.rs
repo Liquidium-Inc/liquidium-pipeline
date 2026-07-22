@@ -10,6 +10,7 @@ use liquidium_pipeline_core::{
         TxStatus,
     },
 };
+use mockall::Sequence;
 
 use crate::{
     executors::executor::ExecutorRequest,
@@ -24,18 +25,15 @@ use crate::{
     stages::executor::{ExecutionReceipt, ExecutionStatus},
     swappers::{
         icpswap::{
-            client::{
-                IcpswapExecutionClient, IcpswapReconciliationClient, IcpswapRecoveryClient,
-                IcpswapRecoveryTransferClient, MockIcpswapExecutionClient, MockIcpswapReconciliationClient,
-                MockIcpswapRecoveryClient, MockIcpswapRecoveryTransferClient,
-            },
-            plan::IcpswapPlanner,
+            client::{IcpswapManualClient, MockIcpswapManualClient},
+            execution::IcpswapExecutionStateStore,
+            manual::{deposit_step, operator_step, recover_step, trade_step, withdraw_step},
             types::{
-                IcpswapApprovalRequest, IcpswapDepositAndSwapArgs, IcpswapExecutionClientError, IcpswapExecutionPhase,
-                IcpswapExecutionPlan, IcpswapExecutionState, IcpswapQuoteError, IcpswapQuoteResult,
-                IcpswapRecoveryClientError, IcpswapRecoveryTransferClientError, IcpswapRecoveryTransferOutcome,
-                IcpswapRecoveryTransferRequest, IcpswapTransaction, IcpswapUnusedBalance, IcpswapWithdrawArgs,
+                IcpswapApprovalRequest, IcpswapDepositArgs, IcpswapExecutionPlan, IcpswapExecutionState,
+                IcpswapManualClientError, IcpswapQuoteError, IcpswapRoutePreview, IcpswapStep, IcpswapSwapArgs,
+                IcpswapUnusedBalance, IcpswapWithdrawArgs,
             },
+            venue::IcpswapFinalizerLogic,
         },
         model::{SwapQuote, SwapRequest},
     },
@@ -53,13 +51,6 @@ fn trader() -> Account {
     }
 }
 
-fn recovery_destination() -> Account {
-    Account {
-        owner: p(4),
-        subaccount: Some([7; 32]),
-    }
-}
-
 fn token(ledger: Principal, symbol: &str, fee: u64) -> ChainToken {
     ChainToken::Icp {
         ledger,
@@ -69,28 +60,24 @@ fn token(ledger: Principal, symbol: &str, fee: u64) -> ChainToken {
     }
 }
 
-fn state(phase: IcpswapExecutionPhase) -> IcpswapExecutionState {
-    let input = token(p(1), "IN", 10);
-    let output = token(p(2), "OUT", 5);
-    let plan = IcpswapExecutionPlan::new(
+fn plan() -> IcpswapExecutionPlan {
+    IcpswapExecutionPlan::new(
         p(9),
         p(1),
         p(2),
         Nat::from(3_000u64),
-        ChainTokenAmount::from_raw(input, Nat::from(100_000u64)),
+        ChainTokenAmount::from_raw(token(p(1), "IN", 10), Nat::from(100_000u64)),
         ChainTokenAmount::from_raw(token(p(1), "IN", 10), Nat::from(10u64)),
-        ChainTokenAmount::from_raw(output, Nat::from(120_000u64)),
+        ChainTokenAmount::from_raw(token(p(2), "OUT", 5), Nat::from(120_000u64)),
         ChainTokenAmount::from_raw(token(p(2), "OUT", 5), Nat::from(5u64)),
         100,
         123,
     )
-    .expect("plan");
-    let mut state = IcpswapExecutionState::planned(plan);
-    state.phase = phase;
-    state.pool_transaction_start = Some(Nat::from(42u64));
-    state.pool_transaction_id = Some(Nat::from(42u64));
-    state.submitted_at = Some(100);
-    state
+    .expect("plan")
+}
+
+fn state() -> IcpswapExecutionState {
+    IcpswapExecutionState::prepare("42", plan(), trader())
 }
 
 fn receipt() -> ExecutionReceipt {
@@ -171,8 +158,7 @@ impl TestWal {
     }
 
     fn state(&self) -> IcpswapExecutionState {
-        let row = self.0.lock().unwrap().clone();
-        let wrapper = decode_receipt_wrapper(&row).unwrap().unwrap();
+        let wrapper = decode_receipt_wrapper(&self.0.lock().unwrap()).unwrap().unwrap();
         wrapper
             .venue_execution
             .expect("missing ICPSwap state")
@@ -227,130 +213,130 @@ impl WalStore for TestWal {
 }
 
 struct TestIcpswapClient {
-    execution: MockIcpswapExecutionClient,
-    settlement: MockIcpswapReconciliationClient,
-    recovery: MockIcpswapRecoveryClient,
-    transfer: MockIcpswapRecoveryTransferClient,
+    manual: MockIcpswapManualClient,
 }
 
 #[async_trait]
-impl IcpswapPlanner for TestIcpswapClient {
-    async fn quote_with_plan(&self, _request: &SwapRequest) -> Result<IcpswapQuoteResult, IcpswapQuoteError> {
+impl IcpswapFinalizerLogic for TestIcpswapClient {
+    async fn preview_route(&self, _request: &SwapRequest) -> Result<IcpswapRoutePreview, IcpswapQuoteError> {
         Err(IcpswapQuoteError::NoUsablePools {
-            failures: vec!["preview is not used by finalizer phase tests".to_string()],
+            failures: vec!["preview is not used by this test".to_string()],
         })
     }
+
+    async fn deposit(
+        &self,
+        store: &dyn IcpswapExecutionStateStore,
+        execution_id: &str,
+        state: &mut IcpswapExecutionState,
+        now_nanos: u64,
+    ) -> Result<(), String> {
+        deposit_step(self, store, execution_id, state, now_nanos).await
+    }
+
+    async fn trade(
+        &self,
+        store: &dyn IcpswapExecutionStateStore,
+        execution_id: &str,
+        state: &mut IcpswapExecutionState,
+        now_nanos: u64,
+    ) -> Result<(), String> {
+        trade_step(self, store, execution_id, state, now_nanos).await
+    }
+
+    async fn withdraw(
+        &self,
+        store: &dyn IcpswapExecutionStateStore,
+        execution_id: &str,
+        state: &mut IcpswapExecutionState,
+        now_nanos: u64,
+    ) -> Result<(), String> {
+        withdraw_step(self, store, execution_id, state, now_nanos).await
+    }
+
+    async fn recover(
+        &self,
+        store: &dyn IcpswapExecutionStateStore,
+        execution_id: &str,
+        state: &mut IcpswapExecutionState,
+        now_nanos: u64,
+    ) -> Result<(), String> {
+        recover_step(self, store, execution_id, state, now_nanos).await
+    }
+
+    async fn reconcile_operator(
+        &self,
+        store: &dyn IcpswapExecutionStateStore,
+        execution_id: &str,
+        state: &mut IcpswapExecutionState,
+    ) -> Result<(), String> {
+        operator_step(self, store, execution_id, state).await
+    }
 }
 
 #[async_trait]
-impl IcpswapExecutionClient for TestIcpswapClient {
-    async fn latest_transaction_id(
-        &self,
-        pool: Principal,
-        owner: Principal,
-    ) -> Result<Option<Nat>, IcpswapExecutionClientError> {
-        self.execution.latest_transaction_id(pool, owner).await
+impl IcpswapManualClient for TestIcpswapClient {
+    async fn quote_manual(&self, pool: Principal, args: &IcpswapSwapArgs) -> Result<Nat, IcpswapManualClientError> {
+        self.manual.quote_manual(pool, args).await
     }
 
-    async fn allowance(
+    async fn ledger_balance(&self, ledger: Principal, account: &Account) -> Result<Nat, IcpswapManualClientError> {
+        self.manual.ledger_balance(ledger, account).await
+    }
+
+    async fn manual_allowance(
         &self,
         ledger: Principal,
         owner: &Account,
         spender: &Account,
-    ) -> Result<Nat, IcpswapExecutionClientError> {
-        self.execution.allowance(ledger, owner, spender).await
+    ) -> Result<Nat, IcpswapManualClientError> {
+        self.manual.manual_allowance(ledger, owner, spender).await
     }
 
-    async fn approve(&self, request: IcpswapApprovalRequest) -> Result<Nat, IcpswapExecutionClientError> {
-        self.execution.approve(request).await
+    async fn manual_approve(&self, request: IcpswapApprovalRequest) -> Result<Nat, IcpswapManualClientError> {
+        self.manual.manual_approve(request).await
     }
 
-    async fn deposit_from_and_swap(
-        &self,
-        pool: Principal,
-        args: &IcpswapDepositAndSwapArgs,
-    ) -> Result<Nat, IcpswapExecutionClientError> {
-        self.execution.deposit_from_and_swap(pool, args).await
-    }
-}
-
-#[async_trait]
-impl IcpswapReconciliationClient for TestIcpswapClient {
-    async fn transactions_by_owner(
+    async fn manual_unused_balance(
         &self,
         pool: Principal,
         owner: Principal,
-    ) -> Result<Vec<(Nat, IcpswapTransaction)>, String> {
-        IcpswapReconciliationClient::transactions_by_owner(&self.settlement, pool, owner).await
+    ) -> Result<IcpswapUnusedBalance, IcpswapManualClientError> {
+        self.manual.manual_unused_balance(pool, owner).await
     }
 
-    async fn unused_balance(&self, pool: Principal, owner: Principal) -> Result<IcpswapUnusedBalance, String> {
-        IcpswapReconciliationClient::unused_balance(&self.settlement, pool, owner).await
+    async fn deposit_from(&self, pool: Principal, args: &IcpswapDepositArgs) -> Result<Nat, IcpswapManualClientError> {
+        self.manual.deposit_from(pool, args).await
     }
-}
 
-#[async_trait]
-impl IcpswapRecoveryClient for TestIcpswapClient {
-    async fn transactions_by_owner(
+    async fn swap_manual(&self, pool: Principal, args: &IcpswapSwapArgs) -> Result<Nat, IcpswapManualClientError> {
+        self.manual.swap_manual(pool, args).await
+    }
+
+    async fn withdraw_manual(
         &self,
         pool: Principal,
-        owner: Principal,
-    ) -> Result<Vec<(Nat, IcpswapTransaction)>, String> {
-        IcpswapRecoveryClient::transactions_by_owner(&self.recovery, pool, owner).await
-    }
-
-    async fn unused_balance(&self, pool: Principal, owner: Principal) -> Result<IcpswapUnusedBalance, String> {
-        IcpswapRecoveryClient::unused_balance(&self.recovery, pool, owner).await
-    }
-
-    async fn withdraw(&self, pool: Principal, args: &IcpswapWithdrawArgs) -> Result<Nat, IcpswapRecoveryClientError> {
-        self.recovery.withdraw(pool, args).await
+        args: &IcpswapWithdrawArgs,
+    ) -> Result<Nat, IcpswapManualClientError> {
+        self.manual.withdraw_manual(pool, args).await
     }
 }
 
-#[async_trait]
-impl IcpswapRecoveryTransferClient for TestIcpswapClient {
-    async fn transfer_recovered_funds(
-        &self,
-        request: &IcpswapRecoveryTransferRequest,
-    ) -> Result<IcpswapRecoveryTransferOutcome, IcpswapRecoveryTransferClientError> {
-        self.transfer.transfer_recovered_funds(request).await
-    }
-}
-
-fn finalizer(
-    execution: MockIcpswapExecutionClient,
-    settlement: MockIcpswapReconciliationClient,
-    recovery: MockIcpswapRecoveryClient,
-    transfer: MockIcpswapRecoveryTransferClient,
-) -> IcpswapFinalizer {
-    IcpswapFinalizer::from_venue_with_clock(
-        Arc::new(TestIcpswapClient {
-            execution,
-            settlement,
-            recovery,
-            transfer,
-        }),
+fn finalizer(manual: MockIcpswapManualClient) -> IcpswapFinalizer {
+    IcpswapFinalizer::from_workflow_with_clock(
+        Arc::new(TestIcpswapClient { manual }),
         trader(),
-        recovery_destination(),
-        120,
-        300,
         Arc::new(|| 1_000_000_000),
     )
 }
 
 #[tokio::test]
-async fn committing_dex_preview_creates_icpswap_state_inside_finalizer() {
+async fn committing_dex_preview_creates_manual_icpswap_state() {
     let receipt = receipt();
-    let plan = state(IcpswapExecutionPhase::Planned).plan;
-    let wal = TestWal::new(&receipt, IcpswapExecutionState::planned(plan.clone()));
+    let plan = plan();
+    let wal = TestWal::new(&receipt, state());
     wal.clear_execution_state();
-    let finalizer = finalizer(
-        MockIcpswapExecutionClient::new(),
-        MockIcpswapReconciliationClient::new(),
-        MockIcpswapRecoveryClient::new(),
-        MockIcpswapRecoveryTransferClient::new(),
-    );
+    let finalizer = finalizer(MockIcpswapManualClient::new());
     let decision = FinalizerDecisionSnapshot {
         mode: "hybrid".to_string(),
         chosen: "dex".to_string(),
@@ -373,182 +359,117 @@ async fn committing_dex_preview_creates_icpswap_state_inside_finalizer() {
             slippage: 0.0,
             legs: Vec::new(),
         },
-        plan.clone(),
-    );
+        crate::swappers::icpswap::VENUE_ID,
+        &plan,
+    )
+    .expect("encode route preview");
 
     finalizer
         .commit_route(&wal, &receipt, decision.clone(), preview)
         .await
         .expect("commit route");
 
-    let wrapper = wal.wrapper();
-    assert_eq!(wrapper.finalizer_decision, Some(decision));
-    let state: IcpswapExecutionState = wrapper
-        .venue_execution
-        .expect("missing ICPSwap execution state")
-        .decode(crate::swappers::icpswap::VENUE_ID)
-        .expect("decode state")
-        .expect("wrong venue");
+    assert_eq!(wal.wrapper().finalizer_decision, Some(decision));
+    let state = wal.state();
     assert_eq!(state.plan, plan);
-    assert_eq!(state.phase, IcpswapExecutionPhase::Planned);
-    assert_eq!(state.recovery_destination, Some(recovery_destination()));
+    assert_eq!(state.step, IcpswapStep::Deposit);
+    assert_eq!(state.owner, trader());
 }
 
 #[tokio::test]
-async fn completed_state_builds_net_execution_with_exact_attribution() {
+async fn finalizer_runs_deposit_trade_withdraw_and_builds_execution() {
     let receipt = receipt();
-    let mut state = state(IcpswapExecutionPhase::Completed);
-    state.gross_swap_output = Some(ChainTokenAmount::from_raw(
-        state.plan.gross_quoted_out.token.clone(),
-        Nat::from(119_500u64),
-    ));
-    state.settlement_ledger_block_index = Some(Nat::from(900u64));
-    state.approval_block_index = Some(Nat::from(77u64));
-    let wal = TestWal::new(&receipt, state);
-    let finalizer = finalizer(
-        MockIcpswapExecutionClient::new(),
-        MockIcpswapReconciliationClient::new(),
-        MockIcpswapRecoveryClient::new(),
-        MockIcpswapRecoveryTransferClient::new(),
-    );
+    let wal = TestWal::new(&receipt, state());
+    let mut manual = MockIcpswapManualClient::new();
+    manual
+        .expect_manual_allowance()
+        .times(1)
+        .return_once(|_, _, _| Ok(Nat::from(100_010u64)));
+    manual.expect_manual_approve().times(0);
+    manual.expect_quote_manual().times(0);
 
-    let result = finalizer.finalize(&wal, receipt).await.expect("completed");
-    let execution = result.swap_result.expect("swap execution");
+    let mut unused_sequence = Sequence::new();
+    for balance in [
+        IcpswapUnusedBalance {
+            balance0: Nat::from(0u8),
+            balance1: Nat::from(0u8),
+        },
+        IcpswapUnusedBalance {
+            balance0: Nat::from(100_000u64),
+            balance1: Nat::from(0u8),
+        },
+        IcpswapUnusedBalance {
+            balance0: Nat::from(100_000u64),
+            balance1: Nat::from(0u8),
+        },
+        IcpswapUnusedBalance {
+            balance0: Nat::from(0u8),
+            balance1: Nat::from(119_500u64),
+        },
+        IcpswapUnusedBalance {
+            balance0: Nat::from(0u8),
+            balance1: Nat::from(119_500u64),
+        },
+        IcpswapUnusedBalance {
+            balance0: Nat::from(0u8),
+            balance1: Nat::from(0u8),
+        },
+    ] {
+        manual
+            .expect_manual_unused_balance()
+            .times(1)
+            .in_sequence(&mut unused_sequence)
+            .return_once(move |_, _| Ok(balance));
+    }
+    manual
+        .expect_deposit_from()
+        .times(1)
+        .return_once(|_, args| Ok(args.amount.clone()));
+    manual.expect_swap_manual().times(1).return_once(|_, args| {
+        assert_eq!(args.amount_out_minimum, "118800");
+        Ok(Nat::from(119_500u64))
+    });
+    let mut balance_sequence = Sequence::new();
+    manual
+        .expect_ledger_balance()
+        .times(1)
+        .in_sequence(&mut balance_sequence)
+        .return_once(|_, _| Ok(Nat::from(10u64)));
+    manual
+        .expect_ledger_balance()
+        .times(1)
+        .in_sequence(&mut balance_sequence)
+        .return_once(|_, _| Ok(Nat::from(119_505u64)));
+    manual
+        .expect_withdraw_manual()
+        .times(1)
+        .return_once(|_, args| Ok(args.amount.clone()));
+    let finalizer = finalizer(manual);
+
+    assert!(!finalizer.finalize(&wal, receipt.clone()).await.unwrap().finalized);
+    assert_eq!(wal.state().step, IcpswapStep::Trade);
+    assert!(!finalizer.finalize(&wal, receipt.clone()).await.unwrap().finalized);
+    assert_eq!(wal.state().step, IcpswapStep::Withdraw);
+
+    let result = finalizer.finalize(&wal, receipt).await.expect("withdraw");
+    let execution = result.swap_result.expect("execution");
     assert!(result.finalized);
-    assert_eq!(result.swapper.as_deref(), Some("icpswap"));
     assert_eq!(execution.receive_amount, Nat::from(119_495u64));
-    assert_eq!(execution.swap_id, 42);
-    assert_eq!(execution.request_id, 900);
-    assert!(execution.legs[0].route_id.contains("transaction=42:ledger_block=900"));
+    assert!(execution.legs[0].route_id.contains("manual=42"));
 }
 
 #[tokio::test]
-async fn recovered_state_finalizes_without_swap() {
+async fn failed_state_returns_explicit_permanent_error() {
     let receipt = receipt();
-    let mut state = state(IcpswapExecutionPhase::Recovered);
-    state.recovery_transaction_id = Some(Nat::from(44u64));
-    let wal = TestWal::new(&receipt, state);
-    let finalizer = finalizer(
-        MockIcpswapExecutionClient::new(),
-        MockIcpswapReconciliationClient::new(),
-        MockIcpswapRecoveryClient::new(),
-        MockIcpswapRecoveryTransferClient::new(),
-    );
-
-    let result = finalizer.finalize(&wal, receipt).await.expect("recovered");
-    assert!(result.finalized);
-    assert!(result.swap_result.is_none());
-    assert_eq!(result.swapper.as_deref(), Some("recovery"));
-    assert!(result.reason.unwrap().contains("pool withdrawal 44"));
-}
-
-#[tokio::test]
-async fn terminal_state_returns_explicit_permanent_error() {
-    let receipt = receipt();
-    let mut state = state(IcpswapExecutionPhase::FailedTerminal);
+    let mut state = state();
+    state.step = IcpswapStep::Failed;
     state.last_error = Some("ambiguous withdrawal".to_string());
     let wal = TestWal::new(&receipt, state);
-    let finalizer = finalizer(
-        MockIcpswapExecutionClient::new(),
-        MockIcpswapReconciliationClient::new(),
-        MockIcpswapRecoveryClient::new(),
-        MockIcpswapRecoveryTransferClient::new(),
-    );
 
-    let error = finalizer.finalize(&wal, receipt).await.expect_err("permanent");
+    let error = finalizer(MockIcpswapManualClient::new())
+        .finalize(&wal, receipt)
+        .await
+        .expect_err("permanent");
     assert!(error.starts_with(ICPSWAP_FINALIZER_PERMANENT_PREFIX));
     assert!(error.contains("ambiguous withdrawal"));
-}
-
-#[tokio::test]
-async fn post_submission_query_error_is_persisted_and_returns_noop() {
-    let receipt = receipt();
-    let wal = TestWal::new(&receipt, state(IcpswapExecutionPhase::SubmissionUnknown));
-    let mut execution = MockIcpswapExecutionClient::new();
-    execution.expect_deposit_from_and_swap().times(0);
-    let mut settlement = MockIcpswapReconciliationClient::new();
-    settlement
-        .expect_transactions_by_owner()
-        .times(1)
-        .return_once(|_, _| Err("pool query unavailable".to_string()));
-    let finalizer = finalizer(
-        execution,
-        settlement,
-        MockIcpswapRecoveryClient::new(),
-        MockIcpswapRecoveryTransferClient::new(),
-    );
-
-    let result = finalizer.finalize(&wal, receipt).await.expect("pending noop");
-    assert!(!result.finalized);
-    let state = wal.state();
-    assert_eq!(state.phase, IcpswapExecutionPhase::SubmissionUnknown);
-    assert!(state.last_error.unwrap().contains("pool query unavailable"));
-}
-
-#[tokio::test]
-async fn planned_state_submits_once_then_returns_noop_for_settlement() {
-    let receipt = receipt();
-    let mut planned = state(IcpswapExecutionPhase::Planned);
-    planned.pool_transaction_start = None;
-    planned.pool_transaction_id = None;
-    let wal = TestWal::new(&receipt, planned);
-    let mut execution = MockIcpswapExecutionClient::new();
-    execution
-        .expect_allowance()
-        .times(1)
-        .return_once(|_, _, _| Ok(Nat::from(200_000u64)));
-    execution
-        .expect_latest_transaction_id()
-        .times(1)
-        .return_once(|_, _| Ok(Some(Nat::from(41u64))));
-    execution
-        .expect_deposit_from_and_swap()
-        .times(1)
-        .return_once(|_, _| Ok(Nat::from(119_500u64)));
-    execution.expect_approve().times(0);
-    let finalizer = finalizer(
-        execution,
-        MockIcpswapReconciliationClient::new(),
-        MockIcpswapRecoveryClient::new(),
-        MockIcpswapRecoveryTransferClient::new(),
-    );
-
-    let result = finalizer.finalize(&wal, receipt).await.expect("submitted");
-    assert!(!result.finalized);
-    let state = wal.state();
-    assert_eq!(state.phase, IcpswapExecutionPhase::AwaitingOutput);
-    assert_eq!(state.pool_transaction_start, Some(Nat::from(42u64)));
-    assert_eq!(state.submitted_at, Some(1_000_000_000));
-}
-
-#[tokio::test]
-async fn refunded_state_dispatches_deduplicated_recovery_transfer() {
-    let receipt = receipt();
-    let mut state = state(IcpswapExecutionPhase::Refunded);
-    state.refund_transaction_id = Some(Nat::from(43u64));
-    state.returned_gross_amount = Some(ChainTokenAmount::from_raw(
-        state.plan.amount_in.token.clone(),
-        Nat::from(100_000u64),
-    ));
-    let wal = TestWal::new(&receipt, state);
-    let mut transfer = MockIcpswapRecoveryTransferClient::new();
-    transfer
-        .expect_transfer_recovered_funds()
-        .times(1)
-        .return_once(|request| {
-            assert_eq!(request.amount, Nat::from(99_980u64));
-            assert_eq!(request.created_at_time, 1_000_000_000);
-            Ok(IcpswapRecoveryTransferOutcome::Completed(Nat::from(902u64)))
-        });
-    let finalizer = finalizer(
-        MockIcpswapExecutionClient::new(),
-        MockIcpswapReconciliationClient::new(),
-        MockIcpswapRecoveryClient::new(),
-        transfer,
-    );
-
-    let result = finalizer.finalize(&wal, receipt).await.expect("recovered");
-    assert!(result.finalized);
-    assert_eq!(result.swapper.as_deref(), Some("recovery"));
-    assert_eq!(wal.state().phase, IcpswapExecutionPhase::Recovered);
 }

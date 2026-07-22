@@ -311,7 +311,7 @@ impl Config {
         } else {
             bridge_cketh_minter_canister_text
         };
-        
+
         let bridge_cketh_minter_canister = Principal::from_text(&bridge_cketh_minter_canister_text).map_err(|e| {
             format!(
                 "invalid BRIDGE_CKETH_MINTER_CANISTER principal '{}': {e}",
@@ -495,14 +495,14 @@ fn parse_swapper_mode_from_env() -> Result<SwapperMode, String> {
     }
 }
 
-fn parse_icpswap_factory_from_env() -> Result<Principal, String> {
+pub(crate) fn parse_icpswap_factory_from_env() -> Result<Principal, String> {
     let raw = env::var("ICPSWAP_FACTORY_CANISTER").unwrap_or_else(|_| DEFAULT_ICPSWAP_FACTORY_CANISTER.to_string());
     let trimmed = raw.trim();
     Principal::from_text(trimmed)
         .map_err(|error| format!("invalid ICPSWAP_FACTORY_CANISTER principal '{trimmed}': {error}"))
 }
 
-fn parse_icpswap_fee_tiers_from_env() -> Result<Vec<candid::Nat>, String> {
+pub(crate) fn parse_icpswap_fee_tiers_from_env() -> Result<Vec<candid::Nat>, String> {
     let raw = env::var("ICPSWAP_FEE_TIERS").unwrap_or_else(|_| DEFAULT_ICPSWAP_FEE_TIERS.to_string());
     parse_icpswap_fee_tiers(&raw)
 }

@@ -9,21 +9,18 @@ use liquidium_pipeline_core::tokens::{
 };
 
 use crate::swappers::{
-    model::{SwapQuote, SwapQuoteLeg, SwapRequest},
+    model::{SwapExecution, SwapQuote, SwapQuoteLeg, SwapRequest},
     router::SwapVenue,
 };
 
 use super::{
-    client::{
-        IcpswapExecutionClient, IcpswapReadClient, IcpswapReconciliationClient, IcpswapRecoveryClient,
-        IcpswapRecoveryTransferClient, IcpswapWorkflowClient,
-    },
-    plan::{IcpswapPlanner, amount_out_minimum, nat_to_decimal_text},
+    client::{IcpswapManualClient, IcpswapReadClient},
+    execution::IcpswapExecutionStateStore,
+    manual::{deposit_step, operator_step, recover_step, trade_step, withdraw_step},
+    plan::{amount_out_minimum, nat_to_decimal_text},
     types::{
-        IcpswapApprovalRequest, IcpswapDepositAndSwapArgs, IcpswapExecutionClientError, IcpswapExecutionPlan,
-        IcpswapQuoteError, IcpswapQuoteResult, IcpswapRecoveryClientError, IcpswapRecoveryTransferClientError,
-        IcpswapRecoveryTransferOutcome, IcpswapRecoveryTransferRequest, IcpswapSwapArgs, IcpswapToken,
-        IcpswapTokenMetadata, IcpswapTransaction, IcpswapUnusedBalance, IcpswapWithdrawArgs,
+        IcpswapExecutionPlan, IcpswapQuoteError, IcpswapRoutePreview, IcpswapState, IcpswapSwapArgs, IcpswapToken,
+        IcpswapTokenMetadata,
     },
 };
 
@@ -34,9 +31,109 @@ pub struct IcpswapVenue<C: IcpswapReadClient> {
     default_max_slippage_bps: u32,
 }
 
-pub trait IcpswapVenueService: IcpswapPlanner + IcpswapWorkflowClient {}
+#[async_trait]
+pub trait IcpswapFinalizerLogic: Send + Sync {
+    async fn preview_route(&self, request: &SwapRequest) -> Result<IcpswapRoutePreview, IcpswapQuoteError>;
 
-impl<T> IcpswapVenueService for T where T: IcpswapPlanner + IcpswapWorkflowClient {}
+    fn prepare(&self, execution_id: &str, route: IcpswapExecutionPlan, owner: Account) -> IcpswapState {
+        IcpswapState::prepare(execution_id, route, owner)
+    }
+
+    async fn deposit(
+        &self,
+        store: &dyn IcpswapExecutionStateStore,
+        execution_id: &str,
+        state: &mut IcpswapState,
+        now_nanos: u64,
+    ) -> Result<(), String>;
+
+    async fn trade(
+        &self,
+        store: &dyn IcpswapExecutionStateStore,
+        execution_id: &str,
+        state: &mut IcpswapState,
+        now_nanos: u64,
+    ) -> Result<(), String>;
+
+    async fn withdraw(
+        &self,
+        store: &dyn IcpswapExecutionStateStore,
+        execution_id: &str,
+        state: &mut IcpswapState,
+        now_nanos: u64,
+    ) -> Result<(), String>;
+
+    async fn recover(
+        &self,
+        store: &dyn IcpswapExecutionStateStore,
+        execution_id: &str,
+        state: &mut IcpswapState,
+        now_nanos: u64,
+    ) -> Result<(), String>;
+
+    async fn reconcile_operator(
+        &self,
+        store: &dyn IcpswapExecutionStateStore,
+        execution_id: &str,
+        state: &mut IcpswapState,
+    ) -> Result<(), String>;
+
+    async fn advance(
+        &self,
+        store: &dyn IcpswapExecutionStateStore,
+        execution_id: &str,
+        owner: Account,
+        now_nanos: u64,
+    ) -> Result<IcpswapState, String> {
+        let mut state = store
+            .load(execution_id)
+            .await?
+            .ok_or_else(|| format!("missing persisted ICPSwap state for {execution_id}"))?;
+        if state.execution_id != execution_id {
+            return Err(format!(
+                "ICPSwap execution ID {} differs from state-store key {execution_id}",
+                state.execution_id
+            ));
+        }
+        if state.owner != owner {
+            return Err(format!(
+                "ICPSwap execution owner {} differs from configured owner {owner}",
+                state.owner
+            ));
+        }
+
+        match state.step {
+            super::types::IcpswapStep::Deposit | super::types::IcpswapStep::DepositPending => {
+                self.deposit(store, execution_id, &mut state, now_nanos).await?
+            }
+            super::types::IcpswapStep::Trade | super::types::IcpswapStep::TradePending => {
+                self.trade(store, execution_id, &mut state, now_nanos).await?
+            }
+            super::types::IcpswapStep::Withdraw | super::types::IcpswapStep::WithdrawPending => {
+                self.withdraw(store, execution_id, &mut state, now_nanos).await?
+            }
+            super::types::IcpswapStep::Recover | super::types::IcpswapStep::RecoverPending => {
+                self.recover(store, execution_id, &mut state, now_nanos).await?
+            }
+            super::types::IcpswapStep::OperatorRequired => {
+                self.reconcile_operator(store, execution_id, &mut state).await?
+            }
+            super::types::IcpswapStep::Completed
+            | super::types::IcpswapStep::Refunded
+            | super::types::IcpswapStep::Failed => {}
+        }
+        Ok(state)
+    }
+
+    async fn finish(
+        &self,
+        request: &SwapRequest,
+        state: &IcpswapState,
+        now_nanos: u64,
+    ) -> Result<SwapExecution, String> {
+        completed_execution(request, state, now_nanos)
+    }
+}
 
 impl<C: IcpswapReadClient> IcpswapVenue<C> {
     pub fn new(
@@ -66,19 +163,19 @@ impl<C: IcpswapReadClient> IcpswapVenue<C> {
         })
     }
 
-    pub async fn quote_with_plan(&self, request: &SwapRequest) -> Result<IcpswapQuoteResult, IcpswapQuoteError> {
+    pub async fn preview_route(&self, request: &SwapRequest) -> Result<IcpswapRoutePreview, IcpswapQuoteError> {
         let quoted_at = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
-        self.quote_with_plan_at(request, quoted_at).await
+        self.preview_route_at(request, quoted_at).await
     }
 
-    pub async fn quote_with_plan_at(
+    pub async fn preview_route_at(
         &self,
         request: &SwapRequest,
         quoted_at: u64,
-    ) -> Result<IcpswapQuoteResult, IcpswapQuoteError> {
+    ) -> Result<IcpswapRoutePreview, IcpswapQuoteError> {
         if request.pay_amount.token.asset_id() != request.pay_asset {
             return Err(IcpswapQuoteError::PayAssetMismatch);
         }
@@ -210,17 +307,69 @@ impl<C: IcpswapReadClient> IcpswapVenue<C> {
         });
         let plan = candidates.remove(0);
 
-        Ok(IcpswapQuoteResult {
+        Ok(IcpswapRoutePreview {
             quote: common_quote(request, &plan),
-            plan,
+            route: plan,
         })
     }
 }
 
 #[async_trait]
-impl<C: IcpswapReadClient + 'static> IcpswapPlanner for IcpswapVenue<C> {
-    async fn quote_with_plan(&self, request: &SwapRequest) -> Result<IcpswapQuoteResult, IcpswapQuoteError> {
-        IcpswapVenue::quote_with_plan(self, request).await
+impl<C> IcpswapFinalizerLogic for IcpswapVenue<C>
+where
+    C: IcpswapReadClient + IcpswapManualClient + 'static,
+{
+    async fn preview_route(&self, request: &SwapRequest) -> Result<IcpswapRoutePreview, IcpswapQuoteError> {
+        IcpswapVenue::preview_route(self, request).await
+    }
+
+    async fn deposit(
+        &self,
+        store: &dyn IcpswapExecutionStateStore,
+        execution_id: &str,
+        state: &mut IcpswapState,
+        now_nanos: u64,
+    ) -> Result<(), String> {
+        deposit_step(self.client.as_ref(), store, execution_id, state, now_nanos).await
+    }
+
+    async fn trade(
+        &self,
+        store: &dyn IcpswapExecutionStateStore,
+        execution_id: &str,
+        state: &mut IcpswapState,
+        now_nanos: u64,
+    ) -> Result<(), String> {
+        trade_step(self.client.as_ref(), store, execution_id, state, now_nanos).await
+    }
+
+    async fn withdraw(
+        &self,
+        store: &dyn IcpswapExecutionStateStore,
+        execution_id: &str,
+        state: &mut IcpswapState,
+        now_nanos: u64,
+    ) -> Result<(), String> {
+        withdraw_step(self.client.as_ref(), store, execution_id, state, now_nanos).await
+    }
+
+    async fn recover(
+        &self,
+        store: &dyn IcpswapExecutionStateStore,
+        execution_id: &str,
+        state: &mut IcpswapState,
+        now_nanos: u64,
+    ) -> Result<(), String> {
+        recover_step(self.client.as_ref(), store, execution_id, state, now_nanos).await
+    }
+
+    async fn reconcile_operator(
+        &self,
+        store: &dyn IcpswapExecutionStateStore,
+        execution_id: &str,
+        state: &mut IcpswapState,
+    ) -> Result<(), String> {
+        operator_step(self.client.as_ref(), store, execution_id, state).await
     }
 }
 
@@ -235,99 +384,67 @@ impl<C: IcpswapReadClient + 'static> SwapVenue for IcpswapVenue<C> {
     }
 
     async fn quote(&self, request: &SwapRequest) -> Result<SwapQuote, String> {
-        self.quote_with_plan(request)
+        self.preview_route(request)
             .await
             .map(|result| result.quote)
             .map_err(|error| error.to_string())
     }
 }
 
-#[async_trait]
-impl<C> IcpswapExecutionClient for IcpswapVenue<C>
-where
-    C: IcpswapReadClient + IcpswapExecutionClient,
-{
-    async fn latest_transaction_id(
-        &self,
-        pool: Principal,
-        owner: Principal,
-    ) -> Result<Option<Nat>, IcpswapExecutionClientError> {
-        self.client.latest_transaction_id(pool, owner).await
+fn completed_execution(request: &SwapRequest, state: &IcpswapState, now_nanos: u64) -> Result<SwapExecution, String> {
+    let gross = state
+        .trade
+        .swap_returned_amount
+        .as_ref()
+        .ok_or_else(|| "completed manual swap has no gross output".to_string())?;
+    if gross <= &state.plan.output_ledger_fee.value {
+        return Err("completed manual output cannot cover its ledger fee".to_string());
     }
+    let net = state
+        .withdraw
+        .wallet_credited_amount
+        .as_ref()
+        .ok_or_else(|| "completed manual swap has no confirmed wallet credit".to_string())?;
+    let pay = state.plan.amount_in.to_f64();
+    let receive_token = state.plan.net_expected_output.token.clone();
+    let receive_amount = ChainTokenAmount::from_raw(receive_token.clone(), net.clone());
+    let receive = receive_amount.to_f64();
+    let expected = state.plan.net_expected_output.to_f64();
+    let exec_price = if pay > 0.0 { receive / pay } else { 0.0 };
+    let mid_price = if pay > 0.0 { expected / pay } else { 0.0 };
+    let slippage = if expected > 0.0 {
+        ((expected - receive) / expected).max(0.0)
+    } else {
+        0.0
+    };
 
-    async fn allowance(
-        &self,
-        ledger: Principal,
-        owner: &Account,
-        spender: &Account,
-    ) -> Result<Nat, IcpswapExecutionClientError> {
-        self.client.allowance(ledger, owner, spender).await
-    }
-
-    async fn approve(&self, request: IcpswapApprovalRequest) -> Result<Nat, IcpswapExecutionClientError> {
-        self.client.approve(request).await
-    }
-
-    async fn deposit_from_and_swap(
-        &self,
-        pool: Principal,
-        args: &IcpswapDepositAndSwapArgs,
-    ) -> Result<Nat, IcpswapExecutionClientError> {
-        self.client.deposit_from_and_swap(pool, args).await
-    }
-}
-
-#[async_trait]
-impl<C> IcpswapReconciliationClient for IcpswapVenue<C>
-where
-    C: IcpswapReadClient + IcpswapReconciliationClient,
-{
-    async fn transactions_by_owner(
-        &self,
-        pool: Principal,
-        owner: Principal,
-    ) -> Result<Vec<(Nat, IcpswapTransaction)>, String> {
-        IcpswapReconciliationClient::transactions_by_owner(self.client.as_ref(), pool, owner).await
-    }
-
-    async fn unused_balance(&self, pool: Principal, owner: Principal) -> Result<IcpswapUnusedBalance, String> {
-        IcpswapReconciliationClient::unused_balance(self.client.as_ref(), pool, owner).await
-    }
-}
-
-#[async_trait]
-impl<C> IcpswapRecoveryClient for IcpswapVenue<C>
-where
-    C: IcpswapReadClient + IcpswapRecoveryClient,
-{
-    async fn transactions_by_owner(
-        &self,
-        pool: Principal,
-        owner: Principal,
-    ) -> Result<Vec<(Nat, IcpswapTransaction)>, String> {
-        IcpswapRecoveryClient::transactions_by_owner(self.client.as_ref(), pool, owner).await
-    }
-
-    async fn unused_balance(&self, pool: Principal, owner: Principal) -> Result<IcpswapUnusedBalance, String> {
-        IcpswapRecoveryClient::unused_balance(self.client.as_ref(), pool, owner).await
-    }
-
-    async fn withdraw(&self, pool: Principal, args: &IcpswapWithdrawArgs) -> Result<Nat, IcpswapRecoveryClientError> {
-        self.client.withdraw(pool, args).await
-    }
-}
-
-#[async_trait]
-impl<C> IcpswapRecoveryTransferClient for IcpswapVenue<C>
-where
-    C: IcpswapReadClient + IcpswapRecoveryTransferClient,
-{
-    async fn transfer_recovered_funds(
-        &self,
-        request: &IcpswapRecoveryTransferRequest,
-    ) -> Result<IcpswapRecoveryTransferOutcome, IcpswapRecoveryTransferClientError> {
-        self.client.transfer_recovered_funds(request).await
-    }
+    Ok(SwapExecution {
+        swap_id: 0,
+        request_id: 0,
+        status: "filled".to_string(),
+        pay_asset: state.plan.amount_in.token.asset_id(),
+        pay_amount: state.plan.amount_in.value.clone(),
+        receive_asset: receive_token.asset_id(),
+        receive_amount: net.clone(),
+        mid_price,
+        exec_price,
+        slippage,
+        legs: vec![SwapQuoteLeg {
+            venue: "icpswap".to_string(),
+            route_id: format!("{}:manual={}", state.plan.pool, state.execution_id),
+            pay_chain: request.pay_asset.chain.clone(),
+            pay_symbol: state.plan.amount_in.token.symbol(),
+            pay_amount: state.plan.amount_in.value.clone(),
+            receive_chain: request.receive_asset.chain.clone(),
+            receive_symbol: receive_token.symbol(),
+            receive_amount: net.clone(),
+            price: exec_price,
+            lp_fee: Nat::from(0u8),
+            gas_fee: state.plan.output_ledger_fee.value.clone(),
+        }],
+        approval_count: Some(u32::from(state.deposit.approval_block_index.is_some())),
+        ts: now_nanos / 1_000_000_000,
+    })
 }
 
 fn common_quote(request: &SwapRequest, plan: &IcpswapExecutionPlan) -> SwapQuote {
