@@ -7,7 +7,7 @@ use liquidium_pipeline_core::tokens::asset_id::AssetId;
 use log::{debug, info};
 
 use crate::swappers::model::{SwapExecution, SwapQuote, SwapQuoteLeg, SwapRequest};
-use crate::swappers::router::SwapVenue;
+use crate::swappers::router::{ExecutableSwapVenue, SwapVenue};
 
 fn f64_to_nat(v: f64) -> Nat {
     Nat::from(v as u128)
@@ -192,7 +192,10 @@ impl<C: CexBackend> SwapVenue for MexcSwapVenue<C> {
             legs: vec![leg],
         })
     }
+}
 
+#[async_trait]
+impl<C: CexBackend> ExecutableSwapVenue for MexcSwapVenue<C> {
     async fn execute(&self, req: &SwapRequest) -> Result<SwapExecution, String> {
         let amount_in_f = req.pay_amount.to_f64();
         let (market, side, _out_f) = self

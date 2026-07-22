@@ -1,9 +1,9 @@
 use anyhow::Result;
 use async_trait::async_trait;
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 use crate::stages::executor::ExecutionReceipt;
-use crate::swappers::icpswap::types::IcpswapExecutionState;
 pub mod sqlite;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -31,9 +31,31 @@ pub struct LiqMetaWrapper {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(tag = "venue", content = "state", rename_all = "snake_case")]
-pub enum VenueExecutionState {
-    Icpswap(IcpswapExecutionState),
+pub struct VenueExecutionState {
+    pub venue: String,
+    pub state: serde_json::Value,
+}
+
+impl VenueExecutionState {
+    pub fn new<T: Serialize>(venue: impl Into<String>, state: &T) -> Result<Self, String> {
+        Ok(Self {
+            venue: venue.into(),
+            state: serde_json::to_value(state).map_err(|error| format!("failed to encode venue state: {error}"))?,
+        })
+    }
+
+    pub fn is_venue(&self, venue: &str) -> bool {
+        self.venue == venue
+    }
+
+    pub fn decode<T: DeserializeOwned>(&self, venue: &str) -> Result<Option<T>, String> {
+        if !self.is_venue(venue) {
+            return Ok(None);
+        }
+        serde_json::from_value(self.state.clone())
+            .map(Some)
+            .map_err(|error| format!("failed to decode {venue} execution state: {error}"))
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

@@ -14,7 +14,7 @@ use liquidium_pipeline_core::{
 use crate::{
     executors::executor::ExecutorRequest,
     finalizers::{
-        dex_finalizer::{DexExecutionPlan, DexRouteFinalizer, DexRoutePreview},
+        dex_finalizer::{DexRouteFinalizer, DexRoutePreview},
         finalizer::Finalizer,
         icpswap::finalizer::{ICPSWAP_FINALIZER_PERMANENT_PREFIX, IcpswapFinalizer},
     },
@@ -154,7 +154,7 @@ impl TestWal {
             meta: Vec::new(),
             finalizer_decision: None,
             profit_snapshot: None,
-            venue_execution: Some(VenueExecutionState::Icpswap(state)),
+            venue_execution: Some(VenueExecutionState::new(crate::swappers::icpswap::VENUE_ID, &state).unwrap()),
         };
         let mut row = LiqResultRecord {
             id: "42".to_string(),
@@ -173,10 +173,12 @@ impl TestWal {
     fn state(&self) -> IcpswapExecutionState {
         let row = self.0.lock().unwrap().clone();
         let wrapper = decode_receipt_wrapper(&row).unwrap().unwrap();
-        let Some(VenueExecutionState::Icpswap(state)) = wrapper.venue_execution else {
-            panic!("missing ICPSwap state")
-        };
-        state
+        wrapper
+            .venue_execution
+            .expect("missing ICPSwap state")
+            .decode(crate::swappers::icpswap::VENUE_ID)
+            .expect("decode state")
+            .expect("wrong venue")
     }
 
     fn clear_execution_state(&self) {
@@ -360,8 +362,8 @@ async fn committing_dex_preview_creates_icpswap_state_inside_finalizer() {
         cex_preview_net_bps: Some(140.0),
         ts: 123,
     };
-    let preview = DexRoutePreview {
-        quote: SwapQuote {
+    let preview = DexRoutePreview::new(
+        SwapQuote {
             pay_asset: receipt.request.swap_args.as_ref().unwrap().pay_asset.clone(),
             pay_amount: plan.amount_in.value.clone(),
             receive_asset: receipt.request.swap_args.as_ref().unwrap().receive_asset.clone(),
@@ -371,8 +373,8 @@ async fn committing_dex_preview_creates_icpswap_state_inside_finalizer() {
             slippage: 0.0,
             legs: Vec::new(),
         },
-        plan: DexExecutionPlan::Icpswap(plan.clone()),
-    };
+        plan.clone(),
+    );
 
     finalizer
         .commit_route(&wal, &receipt, decision.clone(), preview)
@@ -381,9 +383,12 @@ async fn committing_dex_preview_creates_icpswap_state_inside_finalizer() {
 
     let wrapper = wal.wrapper();
     assert_eq!(wrapper.finalizer_decision, Some(decision));
-    let Some(VenueExecutionState::Icpswap(state)) = wrapper.venue_execution else {
-        panic!("missing ICPSwap execution state");
-    };
+    let state: IcpswapExecutionState = wrapper
+        .venue_execution
+        .expect("missing ICPSwap execution state")
+        .decode(crate::swappers::icpswap::VENUE_ID)
+        .expect("decode state")
+        .expect("wrong venue");
     assert_eq!(state.plan, plan);
     assert_eq!(state.phase, IcpswapExecutionPhase::Planned);
     assert_eq!(state.recovery_destination, Some(recovery_destination()));

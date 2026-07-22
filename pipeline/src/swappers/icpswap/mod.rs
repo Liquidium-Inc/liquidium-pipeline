@@ -19,6 +19,8 @@ pub mod types;
 #[path = "planning/venue.rs"]
 pub mod venue;
 
+pub const VENUE_ID: &str = "icpswap";
+
 #[cfg(test)]
 #[path = "tests/execution.rs"]
 mod execution_tests;

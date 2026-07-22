@@ -5,7 +5,7 @@ use tracing::instrument;
 
 use crate::swappers::{
     model::{SwapExecution, SwapQuote, SwapRequest},
-    swap_interface::SwapInterface,
+    swap_interface::{QuoteInterface, SwapInterface},
 };
 
 #[async_trait]
@@ -13,18 +13,28 @@ pub trait SwapVenue: Send + Sync {
     fn venue_name(&self) -> &'static str;
     async fn init(&self) -> Result<(), String>;
     async fn quote(&self, req: &SwapRequest) -> Result<SwapQuote, String>;
+}
+
+#[async_trait]
+pub trait ExecutableSwapVenue: SwapVenue {
     async fn execute(&self, req: &SwapRequest) -> Result<SwapExecution, String>;
 }
 
 #[async_trait]
-impl SwapInterface for SwapRouter {
+impl QuoteInterface for SwapRouter {
     async fn quote(&self, req: &SwapRequest) -> Result<SwapQuote, String> {
-        // delegate to inherent method to avoid recursion
         SwapRouter::quote(self, req).await
+    }
+}
+
+#[async_trait]
+impl<T: ExecutableSwapVenue + ?Sized> SwapInterface for T {
+    async fn quote(&self, req: &SwapRequest) -> Result<SwapQuote, String> {
+        SwapVenue::quote(self, req).await
     }
 
     async fn execute(&self, req: &SwapRequest) -> Result<SwapExecution, String> {
-        SwapRouter::execute(self, req).await
+        ExecutableSwapVenue::execute(self, req).await
     }
 }
 
@@ -81,11 +91,6 @@ impl SwapRouter {
     pub async fn quote(&self, req: &SwapRequest) -> Result<SwapQuote, String> {
         self.pick_venue(req)?.quote(req).await
     }
-
-    #[instrument(name = "swap_router.execute", skip_all, err, fields(pay = %req.pay_asset.symbol, receive = %req.receive_asset.symbol))]
-    pub async fn execute(&self, req: &SwapRequest) -> Result<SwapExecution, String> {
-        self.pick_venue(req)?.execute(req).await
-    }
 }
 
 impl Default for SwapRouter {
@@ -111,10 +116,6 @@ mod tests {
         }
 
         async fn quote(&self, _req: &SwapRequest) -> Result<SwapQuote, String> {
-            unreachable!()
-        }
-
-        async fn execute(&self, _req: &SwapRequest) -> Result<SwapExecution, String> {
             unreachable!()
         }
     }

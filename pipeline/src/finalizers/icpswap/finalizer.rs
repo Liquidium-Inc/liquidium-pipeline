@@ -7,12 +7,13 @@ use liquidium_pipeline_core::tokens::chain_token_amount::ChainTokenAmount;
 use num_traits::ToPrimitive;
 
 use crate::{
-    finalizers::dex_finalizer::{DexExecutionPlan, DexRouteFinalizer, DexRoutePreview},
-    finalizers::finalizer::{Finalizer, FinalizerResult},
+    finalizers::dex_finalizer::{DexRouteFinalizer, DexRoutePreview},
+    finalizers::finalizer::{Finalizer, FinalizerErrorKind, FinalizerResult},
     persistance::{FinalizerDecisionSnapshot, VenueExecutionState, WalStore},
     stages::executor::{ExecutionReceipt, ExecutionStatus},
     swappers::{
         icpswap::{
+            VENUE_ID,
             execution::{IcpswapExecutionStateStore, WalIcpswapExecutionStateStore, approve_and_submit},
             recovery::recover,
             recovery_transfer::transfer_to_recovery,
@@ -25,7 +26,7 @@ use crate::{
     wal::{decode_receipt_wrapper, encode_meta, liq_id_from_receipt, wal_load},
 };
 
-pub const ICPSWAP_FINALIZER_PERMANENT_PREFIX: &str = "permanent ICPSwap finalizer: ";
+pub(crate) const ICPSWAP_FINALIZER_PERMANENT_PREFIX: &str = "permanent ICPSwap finalizer: ";
 
 type Clock = dyn Fn() -> u64 + Send + Sync;
 
@@ -209,19 +210,43 @@ impl Finalizer for IcpswapFinalizer {
 
         self.result_for_state(&receipt, &state, now_nanos)
     }
+
+    fn classify_error(&self, error: &str) -> FinalizerErrorKind {
+        if error.starts_with(ICPSWAP_FINALIZER_PERMANENT_PREFIX) {
+            FinalizerErrorKind::Permanent
+        } else {
+            FinalizerErrorKind::Retryable
+        }
+    }
 }
 
 #[async_trait]
 impl DexRouteFinalizer for IcpswapFinalizer {
-    async fn preview_route(
-        &self,
-        request: &SwapRequest,
-    ) -> Result<DexRoutePreview, crate::swappers::icpswap::types::IcpswapQuoteError> {
-        let quoted = self.venue.quote_with_plan(request).await?;
-        Ok(DexRoutePreview {
-            quote: quoted.quote,
-            plan: DexExecutionPlan::Icpswap(quoted.plan),
-        })
+    fn venue_id(&self) -> &'static str {
+        VENUE_ID
+    }
+
+    async fn preview_route(&self, request: &SwapRequest) -> Result<DexRoutePreview, String> {
+        let quoted = self
+            .venue
+            .quote_with_plan(request)
+            .await
+            .map_err(|error| error.to_string())?;
+        Ok(DexRoutePreview::new(quoted.quote, quoted.plan))
+    }
+
+    async fn has_committed_route(&self, wal: &dyn WalStore, receipt: &ExecutionReceipt) -> Result<bool, String> {
+        let liquidation_id = liq_id_from_receipt(receipt)?;
+        let Some(row) = wal_load(wal, &liquidation_id).await? else {
+            return Ok(false);
+        };
+        let Some(wrapper) = decode_receipt_wrapper(&row)? else {
+            return Ok(false);
+        };
+        Ok(wrapper
+            .venue_execution
+            .as_ref()
+            .is_some_and(|record| record.is_venue(VENUE_ID)))
     }
 
     async fn commit_route(
@@ -231,7 +256,10 @@ impl DexRouteFinalizer for IcpswapFinalizer {
         decision: FinalizerDecisionSnapshot,
         preview: DexRoutePreview,
     ) -> Result<(), String> {
-        let DexExecutionPlan::Icpswap(plan) = preview.plan;
+        let plan = preview
+            .plan::<crate::swappers::icpswap::types::IcpswapExecutionPlan>()
+            .cloned()
+            .ok_or_else(|| "ICPSwap finalizer received a preview from another venue".to_string())?;
         if decision.chosen != "dex" {
             return Err(format!(
                 "ICPSwap route commit requires chosen=dex, got {}",
@@ -256,16 +284,26 @@ impl DexRouteFinalizer for IcpswapFinalizer {
         }
 
         match &wrapper.venue_execution {
-            Some(VenueExecutionState::Icpswap(existing)) if existing.plan != plan => {
+            Some(record) if record.is_venue(VENUE_ID) => {
+                let existing = record
+                    .decode::<IcpswapExecutionState>(VENUE_ID)?
+                    .expect("venue was checked above");
+                if existing.plan != plan {
+                    return Err(format!(
+                        "refusing to replace persisted ICPSwap pool plan for liquidation {liquidation_id}"
+                    ));
+                }
+            }
+            Some(record) => {
                 return Err(format!(
-                    "refusing to replace persisted ICPSwap pool plan for liquidation {liquidation_id}"
+                    "refusing to replace persisted {} execution state for liquidation {liquidation_id}",
+                    record.venue
                 ));
             }
-            Some(VenueExecutionState::Icpswap(_)) => {}
             None => {
                 let mut state = IcpswapExecutionState::planned(plan);
                 state.recovery_destination = Some(self.recovery_destination);
-                wrapper.venue_execution = Some(VenueExecutionState::Icpswap(state));
+                wrapper.venue_execution = Some(VenueExecutionState::new(VENUE_ID, &state)?);
             }
         }
 

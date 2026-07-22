@@ -5,8 +5,7 @@ use async_trait::async_trait;
 use candid::{Encode, Principal};
 use tracing::{debug, info, warn};
 
-use crate::finalizers::finalizer::{Finalizer, FinalizerResult};
-use crate::finalizers::icpswap::finalizer::ICPSWAP_FINALIZER_PERMANENT_PREFIX;
+use crate::finalizers::finalizer::{Finalizer, FinalizerErrorKind, FinalizerResult};
 use crate::finalizers::liquidation_outcome::LiquidationOutcome;
 use crate::finalizers::profit_calculator::ProfitCalculator;
 
@@ -18,7 +17,6 @@ use crate::wal::{
     decode_receipt_wrapper, encode_meta, wal_mark_enqueued, wal_mark_inflight, wal_mark_permanent_failed,
     wal_mark_retryable_failed, wal_mark_succeeded,
 };
-use liquidium_pipeline_connectors::backend::bridge_backend::FINALIZER_PERMANENT_AMOUNT_FLOOR_PREFIX;
 use liquidium_pipeline_connectors::pipeline_agent::PipelineAgent;
 use liquidium_pipeline_core::types::protocol_types::{LiquidationResult, ProtocolError, TransferStatus};
 
@@ -39,14 +37,6 @@ fn retry_delay_secs(base: u64, max: u64, error_count: i32) -> u64 {
         1u64 << exponent
     };
     base.saturating_mul(multiplier).min(capped_max)
-}
-
-fn is_permanent_finalizer_error(err: &str) -> bool {
-    err.starts_with(FINALIZER_PERMANENT_AMOUNT_FLOOR_PREFIX) || err.starts_with(ICPSWAP_FINALIZER_PERMANENT_PREFIX)
-}
-
-fn is_bad_debt_amount_floor(err: &str) -> bool {
-    err.starts_with(FINALIZER_PERMANENT_AMOUNT_FLOOR_PREFIX)
 }
 
 //
@@ -328,13 +318,15 @@ where
                     let base_errors = error_count_by_liq.get(&liq_id).copied().unwrap_or(0);
                     let next_errors = base_errors + 1;
                     let err_msg = e.to_string();
+                    let error_kind = self.finalizer.classify_error(&err_msg);
 
                     let wal_id = wal_id_by_liq
                         .get(&liq_id)
                         .ok_or_else(|| format!("missing WAL id for liquidation {}", liq_id))?;
 
                     debug!("Failed finalization {}", err_msg);
-                    if is_bad_debt_amount_floor(&err_msg) && receipt.request.liquidation.buy_bad_debt {
+                    if error_kind == FinalizerErrorKind::BadDebtAmountFloor && receipt.request.liquidation.buy_bad_debt
+                    {
                         let _ = wal_mark_succeeded(&*self.wal, wal_id).await;
 
                         fin_results.push((
@@ -346,7 +338,11 @@ where
                             },
                             receipt.clone(),
                         ));
-                    } else if is_permanent_finalizer_error(&err_msg) || next_errors >= MAX_FINALIZER_ERRORS {
+                    } else if matches!(
+                        error_kind,
+                        FinalizerErrorKind::Permanent | FinalizerErrorKind::BadDebtAmountFloor
+                    ) || next_errors >= MAX_FINALIZER_ERRORS
+                    {
                         let _ = wal_mark_permanent_failed(&*self.wal, wal_id, err_msg.clone()).await;
 
                         let mut failed_receipt = receipt.clone();
@@ -433,6 +429,7 @@ mod tests {
     use crate::stages::executor::ExecutionStatus;
     use crate::swappers::model::SwapRequest;
     use candid::{Encode, Nat};
+    use liquidium_pipeline_connectors::backend::bridge_backend::FINALIZER_PERMANENT_AMOUNT_FLOOR_PREFIX;
     use liquidium_pipeline_connectors::pipeline_agent::MockPipelineAgent;
     use liquidium_pipeline_core::tokens::{chain_token::ChainToken, chain_token_amount::ChainTokenAmount};
     use liquidium_pipeline_core::types::protocol_types::{
@@ -441,13 +438,6 @@ mod tests {
     };
     use mockall::predicate::eq;
     use std::sync::{Arc, Mutex};
-
-    #[test]
-    fn icpswap_terminal_error_is_classified_permanent() {
-        let error = format!("{ICPSWAP_FINALIZER_PERMANENT_PREFIX}ambiguous withdrawal");
-        assert!(is_permanent_finalizer_error(&error));
-        assert!(!is_bad_debt_amount_floor(&error));
-    }
 
     #[derive(Clone)]
     struct NoopFinalizer {
@@ -471,12 +461,17 @@ mod tests {
     #[derive(Clone)]
     struct ErrorFinalizer {
         error: String,
+        kind: FinalizerErrorKind,
     }
 
     #[async_trait::async_trait]
     impl Finalizer for ErrorFinalizer {
         async fn finalize(&self, _: &dyn WalStore, _: ExecutionReceipt) -> Result<FinalizerResult, String> {
             Err(self.error.clone())
+        }
+
+        fn classify_error(&self, _error: &str) -> FinalizerErrorKind {
+            self.kind
         }
     }
 
@@ -636,7 +631,10 @@ mod tests {
 
         let stage = FinalizeStage::new(
             Arc::new(wal),
-            Arc::new(ErrorFinalizer { error: err }),
+            Arc::new(ErrorFinalizer {
+                error: err,
+                kind: FinalizerErrorKind::BadDebtAmountFloor,
+            }),
             Arc::new(SimpleProfitCalculator),
             Arc::new(MockPipelineAgent::new()),
             Principal::anonymous(),
@@ -689,7 +687,10 @@ mod tests {
 
         let stage = FinalizeStage::new(
             Arc::new(wal),
-            Arc::new(ErrorFinalizer { error: err.clone() }),
+            Arc::new(ErrorFinalizer {
+                error: err.clone(),
+                kind: FinalizerErrorKind::BadDebtAmountFloor,
+            }),
             Arc::new(SimpleProfitCalculator),
             Arc::new(MockPipelineAgent::new()),
             Principal::anonymous(),
@@ -744,7 +745,10 @@ mod tests {
 
         let stage = FinalizeStage::new(
             Arc::new(wal),
-            Arc::new(ErrorFinalizer { error: err }),
+            Arc::new(ErrorFinalizer {
+                error: err,
+                kind: FinalizerErrorKind::Retryable,
+            }),
             Arc::new(SimpleProfitCalculator),
             Arc::new(MockPipelineAgent::new()),
             Principal::anonymous(),

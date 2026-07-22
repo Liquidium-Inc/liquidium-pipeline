@@ -3,7 +3,7 @@ use std::{collections::HashMap, sync::Arc};
 use candid::{Int, Nat, Principal};
 use liquidium_pipeline_core::tokens::{chain_token::ChainToken, chain_token_amount::ChainTokenAmount};
 
-use crate::swappers::{model::SwapRequest, router::SwapVenue};
+use crate::swappers::model::SwapRequest;
 
 use super::{
     client::MockIcpswapReadClient,
@@ -93,7 +93,7 @@ async fn selects_highest_net_output_across_all_fee_tiers() {
         } else {
             assert!(args.zero_for_one);
         }
-        assert_eq!(args.amount_in, "100000");
+        assert_eq!(args.amount_in, "99980");
         assert_eq!(args.amount_out_minimum, "0");
         Ok(outputs_by_pool.get(&pool).expect("known pool").clone())
     });
@@ -112,6 +112,7 @@ async fn selects_highest_net_output_across_all_fee_tiers() {
 
     assert_eq!(result.plan.pool, principal(6));
     assert_eq!(result.plan.fee_tier, Nat::from(3_000u64));
+    assert_eq!(result.plan.amount_in.value, Nat::from(99_980u64));
     assert_eq!(result.plan.gross_quoted_out.value, Nat::from(1_100u64));
     assert_eq!(result.plan.input_ledger_fee.value, Nat::from(10u64));
     assert_eq!(result.plan.output_ledger_fee.value, Nat::from(10u64));
@@ -194,6 +195,36 @@ async fn reports_every_failure_when_no_pool_is_usable() {
 }
 
 #[tokio::test]
+async fn rejects_spend_budget_that_cannot_cover_approval_and_transfer_fees() {
+    let input = chain_token(principal(1), "INPUT", 10);
+    let output = chain_token(principal(2), "OUTPUT", 10);
+    let mut request = request(&input, &output);
+    request.pay_amount.value = Nat::from(20u64);
+
+    let mut client = MockIcpswapReadClient::new();
+    client.expect_ledger_fee().times(2).returning(|_| Ok(Nat::from(10u64)));
+    client.expect_get_pool().times(0);
+    client.expect_quote().times(0);
+
+    let venue = IcpswapVenue::new(
+        Arc::new(client),
+        vec![metadata(input), metadata(output)],
+        vec![Nat::from(3_000u64)],
+        100,
+    )
+    .expect("venue");
+
+    let error = venue.quote_with_plan_at(&request, 123).await.unwrap_err();
+    assert_eq!(
+        error,
+        IcpswapQuoteError::InputFeesExceedBudget {
+            budget: Nat::from(20u64),
+            fees: Nat::from(20u64),
+        }
+    );
+}
+
+#[tokio::test]
 async fn equal_outputs_choose_lower_fee_tier_deterministically() {
     let input = chain_token(principal(1), "INPUT", 10);
     let output = chain_token(principal(2), "OUTPUT", 10);
@@ -226,20 +257,4 @@ async fn equal_outputs_choose_lower_fee_tier_deterministically() {
 
     assert_eq!(result.plan.fee_tier, Nat::from(500u64));
     assert_eq!(result.plan.pool, principal(5));
-}
-
-#[tokio::test]
-async fn swap_venue_execution_remains_disabled() {
-    let input = chain_token(principal(1), "INPUT", 10);
-    let output = chain_token(principal(2), "OUTPUT", 10);
-    let venue = IcpswapVenue::new(
-        Arc::new(MockIcpswapReadClient::new()),
-        vec![metadata(input.clone()), metadata(output.clone())],
-        vec![Nat::from(3_000u64)],
-        100,
-    )
-    .expect("venue");
-
-    let error = venue.execute(&request(&input, &output)).await.unwrap_err();
-    assert!(error.contains("execution is disabled"));
 }

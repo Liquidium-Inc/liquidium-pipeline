@@ -17,66 +17,23 @@ use std::sync::{
 use crate::config::MockConfigTrait;
 use crate::executors::executor::ExecutorRequest;
 use crate::finalizers::cex_finalizer::{CexFinalizerLogic, CexRoutePreview, CexState};
-use crate::finalizers::dex_finalizer::{DexExecutionPlan, DexRouteFinalizer, DexRoutePreview};
+use crate::finalizers::dex_finalizer::{DexRouteFinalizer, DexRoutePreview};
 use crate::finalizers::finalizer::{Finalizer, FinalizerResult};
 use crate::finalizers::hybrid::utils::{RAY_PRICE_SCALE, RouteCandidate, RouteVenue, choose_best_route};
 use crate::persistance::{
     FinalizerDecisionSnapshot, LiqMetaWrapper, LiqResultRecord, ResultStatus, VenueExecutionState, WalStore,
 };
 use crate::stages::executor::{ExecutionReceipt, ExecutionStatus};
-use crate::swappers::icpswap::plan::IcpswapPlanner;
-use crate::swappers::icpswap::types::{
-    IcpswapExecutionPlan, IcpswapExecutionState, IcpswapQuoteError, IcpswapQuoteResult,
-};
 use crate::swappers::model::{SwapExecution, SwapQuote, SwapRequest};
 use crate::swappers::swap_interface::{MockSwapInterface, SwapInterface};
 use crate::wal::{encode_meta, liq_id_from_receipt};
 
 struct TestPlanner(MockSwapInterface);
+const TEST_DEX_ID: &str = "test-dex";
 
-#[async_trait]
-impl IcpswapPlanner for TestPlanner {
-    async fn quote_with_plan(&self, request: &SwapRequest) -> Result<IcpswapQuoteResult, IcpswapQuoteError> {
-        let quote = self
-            .0
-            .quote(request)
-            .await
-            .map_err(|error| IcpswapQuoteError::NoUsablePools { failures: vec![error] })?;
-        let token_in = request.pay_amount.token.clone();
-        let ChainToken::Icp {
-            ledger: token_in_ledger,
-            ..
-        } = &token_in
-        else {
-            return Err(IcpswapQuoteError::MissingToken(request.pay_asset.to_string()));
-        };
-        let token_out_ledger = Principal::from_text(&request.receive_asset.address).map_err(|error| {
-            IcpswapQuoteError::InvalidPoolPrincipal {
-                field: "token_out",
-                address: request.receive_asset.address.clone(),
-                message: error.to_string(),
-            }
-        })?;
-        let token_out = ChainToken::Icp {
-            ledger: token_out_ledger,
-            symbol: request.receive_asset.symbol.clone(),
-            decimals: 8,
-            fee: Nat::from(0u8),
-        };
-        let plan = IcpswapExecutionPlan::new(
-            Principal::from_slice(&[9]),
-            *token_in_ledger,
-            token_out_ledger,
-            Nat::from(3_000u64),
-            request.pay_amount.clone(),
-            ChainTokenAmount::from_raw(token_in, Nat::from(0u8)),
-            ChainTokenAmount::from_raw(token_out.clone(), quote.receive_amount.clone()),
-            ChainTokenAmount::from_raw(token_out, Nat::from(0u8)),
-            request.max_slippage_bps.unwrap_or(100),
-            123,
-        )?;
-        Ok(IcpswapQuoteResult { quote, plan })
-    }
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct TestDexPlan {
+    pay_amount: Nat,
 }
 
 struct TestDexRouteFinalizer {
@@ -93,12 +50,34 @@ impl Finalizer for TestDexRouteFinalizer {
 
 #[async_trait]
 impl DexRouteFinalizer for TestDexRouteFinalizer {
-    async fn preview_route(&self, request: &SwapRequest) -> Result<DexRoutePreview, IcpswapQuoteError> {
-        let quoted = self.planner.quote_with_plan(request).await?;
-        Ok(DexRoutePreview {
-            quote: quoted.quote,
-            plan: DexExecutionPlan::Icpswap(quoted.plan),
-        })
+    fn venue_id(&self) -> &'static str {
+        TEST_DEX_ID
+    }
+
+    async fn preview_route(&self, request: &SwapRequest) -> Result<DexRoutePreview, String> {
+        let quote = self.planner.0.quote(request).await?;
+        Ok(DexRoutePreview::new(
+            quote,
+            TestDexPlan {
+                pay_amount: request.pay_amount.value.clone(),
+            },
+        ))
+    }
+
+    async fn has_committed_route(&self, wal: &dyn WalStore, receipt: &ExecutionReceipt) -> Result<bool, String> {
+        let liquidation_id = liq_id_from_receipt(receipt)?;
+        let Some(row) = wal
+            .get_result(&liquidation_id)
+            .await
+            .map_err(|error| error.to_string())?
+        else {
+            return Ok(false);
+        };
+        let wrapper: LiqMetaWrapper = serde_json::from_str(&row.meta_json).map_err(|error| error.to_string())?;
+        Ok(wrapper
+            .venue_execution
+            .as_ref()
+            .is_some_and(|record| record.is_venue(TEST_DEX_ID)))
     }
 
     async fn commit_route(
@@ -108,7 +87,10 @@ impl DexRouteFinalizer for TestDexRouteFinalizer {
         decision: FinalizerDecisionSnapshot,
         preview: DexRoutePreview,
     ) -> Result<(), String> {
-        let DexExecutionPlan::Icpswap(plan) = preview.plan;
+        let plan = preview
+            .plan::<TestDexPlan>()
+            .cloned()
+            .ok_or_else(|| "unexpected preview type".to_string())?;
         let liquidation_id = liq_id_from_receipt(receipt)?;
         let mut row = wal
             .get_result(&liquidation_id)
@@ -116,7 +98,7 @@ impl DexRouteFinalizer for TestDexRouteFinalizer {
             .map_err(|error| error.to_string())?
             .ok_or_else(|| format!("missing WAL row for liquidation {liquidation_id}"))?;
         let mut wrapper: LiqMetaWrapper = serde_json::from_str(&row.meta_json).map_err(|error| error.to_string())?;
-        wrapper.venue_execution = Some(VenueExecutionState::Icpswap(IcpswapExecutionState::planned(plan)));
+        wrapper.venue_execution = Some(VenueExecutionState::new(TEST_DEX_ID, &plan)?);
         wrapper.finalizer_decision = Some(decision);
         encode_meta(&mut row, &wrapper)?;
         wal.upsert_result(row).await.map_err(|error| error.to_string())
@@ -177,6 +159,10 @@ struct StubCexFinalizer {
 
 #[async_trait]
 impl CexFinalizerLogic for StubCexFinalizer {
+    fn venue_id(&self) -> &'static str {
+        "mexc"
+    }
+
     async fn prepare(&self, _liq_id: &str, _receipt: &ExecutionReceipt) -> Result<CexState, String> {
         Err("unused in hybrid tests".to_string())
     }
@@ -219,6 +205,12 @@ impl TestWal {
             profit_snapshot: None,
             venue_execution: None,
         })
+    }
+
+    fn with_succeeded_receipt(receipt: &ExecutionReceipt) -> Self {
+        let wal = Self::with_receipt(receipt);
+        wal.row.lock().expect("row lock poisoned").as_mut().unwrap().status = ResultStatus::Succeeded;
+        wal
     }
 
     fn with_receipt_and_meta(receipt: &ExecutionReceipt, meta: Vec<u8>) -> Self {
@@ -503,7 +495,8 @@ async fn forced_dex_non_positive_preview_routes_to_recovery_and_uses_recovery_ac
         .returning(|_, _, _| Ok("tx-1".to_string()));
     transfers.expect_approve().times(0);
 
-    let wal = TestWal::empty();
+    let receipt = make_receipt(10.0);
+    let wal = TestWal::with_receipt(&receipt);
     let finalizer = HybridFinalizer {
         config: Arc::new(config),
         trader_transfers: Arc::new(transfers),
@@ -512,7 +505,7 @@ async fn forced_dex_non_positive_preview_routes_to_recovery_and_uses_recovery_ac
     };
 
     let res = finalizer
-        .finalize(&wal, make_receipt(10.0))
+        .finalize(&wal, receipt)
         .await
         .expect("forced dex non-positive should route to recovery");
     assert!(res.finalized);
@@ -552,7 +545,8 @@ async fn forced_cex_non_positive_preview_routes_to_recovery_and_uses_recovery_ac
         .returning(|_, _, _| Ok("tx-1".to_string()));
     transfers.expect_approve().times(0);
 
-    let wal = TestWal::empty();
+    let receipt = make_receipt(10.0);
+    let wal = TestWal::with_receipt(&receipt);
     let finalizer = HybridFinalizer {
         config: Arc::new(config),
         trader_transfers: Arc::new(transfers),
@@ -563,7 +557,7 @@ async fn forced_cex_non_positive_preview_routes_to_recovery_and_uses_recovery_ac
     };
 
     let res = finalizer
-        .finalize(&wal, make_receipt(10.0))
+        .finalize(&wal, receipt)
         .await
         .expect("forced cex non-positive should route to recovery");
     assert_eq!(res.swapper.as_deref(), Some("recovery"));
@@ -595,7 +589,7 @@ async fn hybrid_recovery_non_icp_does_not_transfer() {
         fee: Nat::from(100u64),
     };
     let receipt = make_receipt_with_collateral(10.0, collateral, 1_000u64);
-    let wal = TestWal::empty();
+    let wal = TestWal::with_receipt(&receipt);
 
     let finalizer = HybridFinalizer {
         config: Arc::new(config),
@@ -632,7 +626,8 @@ async fn forced_dex_positive_preview_executes_dex() {
     transfers.expect_transfer().times(0);
     transfers.expect_approve().times(0);
 
-    let wal = TestWal::empty();
+    let receipt = make_receipt(10.0);
+    let wal = TestWal::with_receipt(&receipt);
     let finalizer = HybridFinalizer {
         config: Arc::new(config),
         trader_transfers: Arc::new(transfers),
@@ -646,7 +641,7 @@ async fn forced_dex_positive_preview_executes_dex() {
     };
 
     let res = finalizer
-        .finalize(&wal, make_receipt(10.0))
+        .finalize(&wal, receipt)
         .await
         .expect("forced dex positive should execute dex");
     assert_eq!(res.swapper.as_deref(), Some("icpswap"));
@@ -673,7 +668,8 @@ async fn hybrid_both_preview_errors_returns_error() {
     transfers.expect_transfer().times(0);
     transfers.expect_approve().times(0);
 
-    let wal = TestWal::empty();
+    let receipt = make_receipt(10.0);
+    let wal = TestWal::with_receipt(&receipt);
     let finalizer = HybridFinalizer {
         config: Arc::new(config),
         trader_transfers: Arc::new(transfers),
@@ -684,7 +680,7 @@ async fn hybrid_both_preview_errors_returns_error() {
     };
 
     let err = finalizer
-        .finalize(&wal, make_receipt(10.0))
+        .finalize(&wal, receipt)
         .await
         .expect_err("both preview failures should bubble as route preview failure");
     assert!(err.contains("route preview failed on both venues"));
@@ -720,7 +716,8 @@ async fn hybrid_recovery_transfer_failure_returns_error() {
         .returning(|req| Ok(quote_from_req(req, 900u64, 5.0)));
     dex_swapper.expect_execute().times(0);
 
-    let wal = TestWal::empty();
+    let receipt = make_receipt(10.0);
+    let wal = TestWal::with_receipt(&receipt);
     let finalizer = HybridFinalizer {
         config: Arc::new(config),
         trader_transfers: Arc::new(transfers),
@@ -729,7 +726,7 @@ async fn hybrid_recovery_transfer_failure_returns_error() {
     };
 
     let err = finalizer
-        .finalize(&wal, make_receipt(10.0))
+        .finalize(&wal, receipt)
         .await
         .expect_err("recovery transfer should fail");
     assert!(err.contains("recovery transfer failed"));
@@ -915,7 +912,8 @@ async fn forced_cex_positive_preview_executes_cex() {
     transfers.expect_transfer().times(0);
     transfers.expect_approve().times(0);
 
-    let wal = TestWal::empty();
+    let receipt = make_receipt(10.0);
+    let wal = TestWal::with_succeeded_receipt(&receipt);
     let finalizer = HybridFinalizer {
         config: Arc::new(config),
         trader_transfers: Arc::new(transfers),
@@ -926,7 +924,7 @@ async fn forced_cex_positive_preview_executes_cex() {
     };
 
     let res = finalizer
-        .finalize(&wal, make_receipt(10.0))
+        .finalize(&wal, receipt)
         .await
         .expect("forced cex positive should execute cex");
     assert_eq!(res.swapper.as_deref(), Some("mexc"));
@@ -1049,7 +1047,8 @@ async fn hybrid_one_preview_error_uses_other_preview() {
     transfers.expect_transfer().times(0);
     transfers.expect_approve().times(0);
 
-    let wal = TestWal::empty();
+    let receipt = make_receipt(10.0);
+    let wal = TestWal::with_succeeded_receipt(&receipt);
     let finalizer = HybridFinalizer {
         config: Arc::new(config),
         trader_transfers: Arc::new(transfers),
@@ -1060,7 +1059,7 @@ async fn hybrid_one_preview_error_uses_other_preview() {
     };
 
     let res = finalizer
-        .finalize(&wal, make_receipt(10.0))
+        .finalize(&wal, receipt)
         .await
         .expect("cex should be used when dex preview fails");
     assert_eq!(res.swapper.as_deref(), Some("mexc"));

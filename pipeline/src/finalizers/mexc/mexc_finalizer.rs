@@ -481,6 +481,10 @@ impl<B> CexFinalizerLogic for MexcFinalizer<B>
 where
     B: CexBackend,
 {
+    fn venue_id(&self) -> &'static str {
+        "mexc"
+    }
+
     async fn prepare(&self, liq_id: &str, receipt: &ExecutionReceipt) -> Result<CexState, String> {
         let amount = &receipt
             .liquidation_result

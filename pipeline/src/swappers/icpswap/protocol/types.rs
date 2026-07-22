@@ -508,6 +508,8 @@ pub enum IcpswapQuoteError {
     MissingToken(String),
     #[error("swap request pay asset does not match pay amount token")]
     PayAssetMismatch,
+    #[error("ICPSwap input budget {budget} cannot cover approval and transfer fees totaling {fees}")]
+    InputFeesExceedBudget { budget: Nat, fees: Nat },
     #[error("invalid principal '{address}' returned as {field}: {message}")]
     InvalidPoolPrincipal {
         field: &'static str,

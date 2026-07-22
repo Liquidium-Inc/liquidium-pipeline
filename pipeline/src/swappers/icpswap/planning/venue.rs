@@ -9,7 +9,7 @@ use liquidium_pipeline_core::tokens::{
 };
 
 use crate::swappers::{
-    model::{SwapExecution, SwapQuote, SwapQuoteLeg, SwapRequest},
+    model::{SwapQuote, SwapQuoteLeg, SwapRequest},
     router::SwapVenue,
 };
 
@@ -99,6 +99,20 @@ impl<C: IcpswapReadClient> IcpswapVenue<C> {
             futures::join!(self.client.ledger_fee(token_in), self.client.ledger_fee(token_out));
         let input_fee = input_fee.map_err(IcpswapQuoteError::LedgerFee)?;
         let output_fee = output_fee.map_err(IcpswapQuoteError::LedgerFee)?;
+        // `SwapRequest::pay_amount` is the total spend budget. An ICRC-2
+        // execution can charge once for approval and once for transfer-from,
+        // so the venue—not the strategy—derives the amount safe to swap.
+        let input_operation_fees = input_fee.clone() * Nat::from(2u8);
+        if request.pay_amount.value <= input_operation_fees {
+            return Err(IcpswapQuoteError::InputFeesExceedBudget {
+                budget: request.pay_amount.value.clone(),
+                fees: input_operation_fees,
+            });
+        }
+        let amount_in = ChainTokenAmount::from_raw(
+            request.pay_amount.token.clone(),
+            request.pay_amount.value.clone() - input_operation_fees,
+        );
         let max_slippage_bps = request.max_slippage_bps.unwrap_or(self.default_max_slippage_bps);
         amount_out_minimum(&Nat::from(0u8), max_slippage_bps)?;
 
@@ -116,7 +130,7 @@ impl<C: IcpswapReadClient> IcpswapVenue<C> {
             let output_descriptor = output_descriptor.clone();
             let output_token = output.token.clone();
             let input_token = input.token.clone();
-            let amount_in = request.pay_amount.clone();
+            let amount_in = amount_in.clone();
             let input_fee = input_fee.clone();
             let output_fee = output_fee.clone();
             async move {
@@ -225,10 +239,6 @@ impl<C: IcpswapReadClient + 'static> SwapVenue for IcpswapVenue<C> {
             .await
             .map(|result| result.quote)
             .map_err(|error| error.to_string())
-    }
-
-    async fn execute(&self, _request: &SwapRequest) -> Result<SwapExecution, String> {
-        Err("ICPSwap execution is disabled until durable settlement and recovery are implemented".to_string())
     }
 }
 

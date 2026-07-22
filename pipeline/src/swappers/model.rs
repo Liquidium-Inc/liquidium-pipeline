@@ -11,6 +11,7 @@ pub enum TxRef {
 #[derive(CandidType, Debug, Clone, Serialize, Deserialize)]
 pub struct SwapRequest {
     pub pay_asset: AssetId,
+    /// Maximum amount the venue may spend, including venue-required ledger operations.
     pub pay_amount: ChainTokenAmount,
     pub receive_asset: AssetId,
     pub receive_address: Option<String>,

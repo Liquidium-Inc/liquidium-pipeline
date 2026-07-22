@@ -5,7 +5,7 @@ use liquidium_pipeline_core::tokens::{chain_token::ChainToken, chain_token_amoun
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    finalizers::finalizer::{Finalizer, FinalizerResult},
+    finalizers::finalizer::{Finalizer, FinalizerErrorKind, FinalizerResult},
     persistance::{LiqMetaWrapper, LiqResultRecord, ResultStatus, WalStore},
     stages::executor::{ExecutionReceipt, ExecutionStatus},
     swappers::model::SwapExecution,
@@ -208,6 +208,8 @@ pub struct CexState {
 
 #[async_trait]
 pub trait CexFinalizerLogic: Send + Sync {
+    fn venue_id(&self) -> &'static str;
+
     // Build the initial CEX state for this liquidation from the receipt
     async fn prepare(&self, liq_id: &str, receipt: &ExecutionReceipt) -> Result<CexState, String>;
 
@@ -398,6 +400,16 @@ impl Finalizer for dyn CexFinalizerLogic {
 
         Ok(res)
     }
+
+    fn classify_error(&self, error: &str) -> FinalizerErrorKind {
+        if error.starts_with(
+            liquidium_pipeline_connectors::backend::bridge_backend::FINALIZER_PERMANENT_AMOUNT_FLOOR_PREFIX,
+        ) {
+            FinalizerErrorKind::BadDebtAmountFloor
+        } else {
+            FinalizerErrorKind::Retryable
+        }
+    }
 }
 
 #[cfg(test)]
@@ -480,6 +492,10 @@ mod tests {
 
     #[async_trait]
     impl CexFinalizerLogic for DummyCexFinalizer {
+        fn venue_id(&self) -> &'static str {
+            "dummy"
+        }
+
         async fn prepare(&self, liq_id: &str, _receipt: &ExecutionReceipt) -> Result<CexState, String> {
             let pay = ChainToken::Icp {
                 ledger: Principal::anonymous(),
@@ -626,6 +642,10 @@ mod tests {
 
     #[async_trait]
     impl CexFinalizerLogic for FailThenResumeFinalizer {
+        fn venue_id(&self) -> &'static str {
+            "test-cex"
+        }
+
         async fn prepare(&self, liq_id: &str, _receipt: &ExecutionReceipt) -> Result<CexState, String> {
             *self.prepare_calls.lock().unwrap() += 1;
 

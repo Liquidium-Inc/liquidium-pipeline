@@ -11,7 +11,7 @@ use crate::swappers::kong::kong_types::{
     SwapAmountsReply as KongSwapAmountsReply, SwapArgs as KongSwapArgs, SwapReply as KongSwapReply,
 };
 use crate::swappers::model::{SwapExecution, SwapQuote, SwapRequest};
-use crate::swappers::router::SwapVenue;
+use crate::swappers::router::{ExecutableSwapVenue, SwapVenue};
 
 /// KongVenue is a generic venue wrapper over the KongSwapSwapper.
 /// It takes a generic SwapRequest / SwapQuote / SwapExecution and
@@ -83,7 +83,13 @@ where
         // Convert KongSwapAmountsReply -> generic SwapQuote via adapter
         Ok(SwapQuote::from(kong_reply))
     }
+}
 
+#[async_trait]
+impl<A> ExecutableSwapVenue for KongVenue<A>
+where
+    A: PipelineAgent + Send + Sync + 'static,
+{
     async fn execute(&self, req: &SwapRequest) -> Result<SwapExecution, String> {
         let token_in = self.find_token(&req.pay_asset.symbol)?;
 

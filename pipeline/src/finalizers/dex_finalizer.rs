@@ -1,3 +1,5 @@
+use std::{any::Any, fmt, sync::Arc};
+
 use async_trait::async_trait;
 use log::debug;
 
@@ -5,28 +7,46 @@ use crate::{
     finalizers::finalizer::{Finalizer, FinalizerResult},
     persistance::{FinalizerDecisionSnapshot, WalStore},
     stages::executor::{ExecutionReceipt, ExecutionStatus},
-    swappers::{
-        icpswap::types::{IcpswapExecutionPlan, IcpswapQuoteError},
-        model::{SwapExecution, SwapQuote, SwapRequest},
-    },
+    swappers::model::{SwapExecution, SwapQuote, SwapRequest},
 };
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum DexExecutionPlan {
-    Icpswap(IcpswapExecutionPlan),
-}
-
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct DexRoutePreview {
     pub quote: SwapQuote,
-    pub plan: DexExecutionPlan,
+    plan: Arc<dyn Any + Send + Sync>,
+}
+
+impl DexRoutePreview {
+    pub fn new<T: Any + Send + Sync>(quote: SwapQuote, plan: T) -> Self {
+        Self {
+            quote,
+            plan: Arc::new(plan),
+        }
+    }
+
+    pub(crate) fn plan<T: Any>(&self) -> Option<&T> {
+        self.plan.downcast_ref()
+    }
+}
+
+impl fmt::Debug for DexRoutePreview {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("DexRoutePreview")
+            .field("quote", &self.quote)
+            .finish_non_exhaustive()
+    }
 }
 
 /// One coherent DEX dependency for previewing and executing a persisted plan.
 /// A future implementation may aggregate several DEX venues behind this trait.
 #[async_trait]
 pub trait DexRouteFinalizer: Finalizer + Send + Sync {
-    async fn preview_route(&self, request: &SwapRequest) -> Result<DexRoutePreview, IcpswapQuoteError>;
+    fn venue_id(&self) -> &'static str;
+
+    async fn preview_route(&self, request: &SwapRequest) -> Result<DexRoutePreview, String>;
+
+    async fn has_committed_route(&self, wal: &dyn WalStore, receipt: &ExecutionReceipt) -> Result<bool, String>;
 
     async fn commit_route(
         &self,

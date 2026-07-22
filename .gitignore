@@ -1,4 +1,5 @@
 /target
+.DS_Store
 id.pem
 .env
 executions.csv

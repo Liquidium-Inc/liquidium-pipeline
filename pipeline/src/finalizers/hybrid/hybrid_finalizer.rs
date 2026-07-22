@@ -5,16 +5,16 @@ use std::sync::Arc;
 use super::utils::{
     DEX_DUST_MAX_USD, RouteCandidate, RouteVenue, choose_best_route, debt_repaid_f64, dex_slippage_bps,
     estimate_swap_value_usd, is_dust_swap, make_snapshot, net_edge_bps, preview_gross_edge_bps,
-    should_force_cex_over_threshold, swapper_id,
+    should_force_cex_over_threshold,
 };
 use crate::{
     config::{ConfigTrait, SwapperMode},
     finalizers::{
         cex_finalizer::CexFinalizerLogic,
         dex_finalizer::DexRouteFinalizer,
-        finalizer::{Finalizer, FinalizerResult},
+        finalizer::{Finalizer, FinalizerErrorKind, FinalizerResult},
     },
-    persistance::{FinalizerDecisionSnapshot, ResultStatus, VenueExecutionState, WalStore},
+    persistance::{FinalizerDecisionSnapshot, ResultStatus, WalStore},
     stages::executor::ExecutionReceipt,
     swappers::model::SwapRequest,
     wal::{decode_receipt_wrapper, encode_meta, liq_id_from_receipt, wal_load},
@@ -199,7 +199,15 @@ where
         };
 
         if res.swapper.is_none() {
-            res.swapper = Some(swapper_id(venue).to_string());
+            let venue_id = match venue {
+                RouteVenue::Dex => self.dex_finalizer.venue_id(),
+                RouteVenue::Cex => self
+                    .cex_finalizer
+                    .as_ref()
+                    .map(|finalizer| finalizer.venue_id())
+                    .unwrap_or("cex"),
+            };
+            res.swapper = Some(venue_id.to_string());
         }
 
         if let Some(reason) = reason {
@@ -352,7 +360,7 @@ where
         let Some(wrapper) = decode_receipt_wrapper(&row)? else {
             return Ok(None);
         };
-        if matches!(wrapper.venue_execution, Some(VenueExecutionState::Icpswap(_))) {
+        if self.dex_finalizer.has_committed_route(wal, receipt).await? {
             return Ok(Some(RouteVenue::Dex));
         }
         Ok(wrapper
@@ -806,6 +814,17 @@ where
             error,
         )
         .await
+    }
+
+    fn classify_error(&self, error: &str) -> FinalizerErrorKind {
+        let dex_kind = self.dex_finalizer.classify_error(error);
+        if dex_kind != FinalizerErrorKind::Retryable {
+            return dex_kind;
+        }
+        self.cex_finalizer
+            .as_ref()
+            .map(|finalizer| finalizer.classify_error(error))
+            .unwrap_or(FinalizerErrorKind::Retryable)
     }
 }
 

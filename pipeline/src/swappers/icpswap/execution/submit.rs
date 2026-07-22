@@ -16,6 +16,7 @@ use super::{
         IcpswapExecutionPhase, IcpswapExecutionPlan, IcpswapExecutionState,
     },
 };
+use crate::swappers::icpswap::VENUE_ID;
 
 #[cfg_attr(test, mockall::automock)]
 #[async_trait]
@@ -46,10 +47,11 @@ impl IcpswapExecutionStateStore for WalIcpswapExecutionStateStore<'_> {
             return Err(format!("missing WAL row for liquidation {liquidation_id}"));
         };
         let wrapper = decode_receipt_wrapper(&row)?;
-        Ok(wrapper.and_then(|wrapper| match wrapper.venue_execution {
-            Some(VenueExecutionState::Icpswap(state)) => Some(state),
-            None => None,
-        }))
+        wrapper
+            .and_then(|wrapper| wrapper.venue_execution)
+            .map(|record| record.decode(VENUE_ID))
+            .transpose()
+            .map(Option::flatten)
     }
 
     async fn persist(&self, liquidation_id: &str, state: &IcpswapExecutionState) -> Result<(), String> {
@@ -62,15 +64,18 @@ impl IcpswapExecutionStateStore for WalIcpswapExecutionStateStore<'_> {
         let mut wrapper = decode_receipt_wrapper(&row)?
             .ok_or_else(|| format!("missing receipt metadata for liquidation {liquidation_id}"))?;
 
-        if let Some(VenueExecutionState::Icpswap(existing)) = &wrapper.venue_execution
-            && existing.plan != state.plan
-        {
-            return Err(format!(
-                "refusing to replace persisted ICPSwap plan for liquidation {liquidation_id}"
-            ));
+        if let Some(record) = &wrapper.venue_execution {
+            let existing = record
+                .decode::<IcpswapExecutionState>(VENUE_ID)?
+                .ok_or_else(|| format!("liquidation {liquidation_id} belongs to venue {}", record.venue))?;
+            if existing.plan != state.plan {
+                return Err(format!(
+                    "refusing to replace persisted ICPSwap plan for liquidation {liquidation_id}"
+                ));
+            }
         }
 
-        wrapper.venue_execution = Some(VenueExecutionState::Icpswap(state.clone()));
+        wrapper.venue_execution = Some(VenueExecutionState::new(VENUE_ID, state)?);
         encode_meta(&mut row, &wrapper)?;
         self.wal.upsert_result(row).await.map_err(|error| error.to_string())
     }

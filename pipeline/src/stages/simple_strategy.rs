@@ -11,7 +11,7 @@ use crate::approval_state::ApprovalState;
 use crate::liquidation::collateral_service::CollateralServiceTrait;
 use crate::stage::PipelineStage;
 
-use crate::swappers::swap_interface::SwapInterface;
+use crate::swappers::swap_interface::QuoteInterface;
 
 use candid::{Int, Nat};
 use futures::TryFutureExt;
@@ -67,7 +67,7 @@ fn is_supported_position_asset_type(pos: &LiquidateblePosition) -> bool {
 
 pub struct SimpleLiquidationStrategy<T, C, R, U>
 where
-    T: SwapInterface + Send + Sync,
+    T: QuoteInterface + Send + Sync,
     C: ConfigTrait,
     R: TokenRegistryTrait,
     U: CollateralServiceTrait,
@@ -83,7 +83,7 @@ where
 
 impl<T, C, R, U> SimpleLiquidationStrategy<T, C, R, U>
 where
-    T: SwapInterface,
+    T: QuoteInterface,
     C: ConfigTrait,
     R: TokenRegistryTrait,
     U: CollateralServiceTrait,
@@ -428,7 +428,7 @@ where
 impl<'a, T, C, R, U> PipelineStage<'a, Vec<LiquidatebleUser>, Vec<ExecutorRequest>>
     for SimpleLiquidationStrategy<T, C, R, U>
 where
-    T: SwapInterface,
+    T: QuoteInterface,
     C: ConfigTrait,
     R: TokenRegistryTrait + 'static,
     U: CollateralServiceTrait,
@@ -599,16 +599,6 @@ where
 
                     if matches!(collateral_token, ChainToken::Icp { .. }) {
                         mexc_approval_count = crate::finalizers::mexc::mexc_finalizer::APPROVE_BUMP_MAX_COUNT as u32;
-                    }
-                } else if matches!(collateral_token, ChainToken::Icp { .. }) {
-                    // ICPSwap's spender is the dynamically selected pool. Reserve
-                    // one possible approval fee here; the actual allowance check
-                    // happens only after the execution plan has selected a pool.
-                    let approval_fee = collateral_token.fee();
-                    if amount_in_effective <= approval_fee {
-                        amount_in_effective = Nat::from(0u8);
-                    } else {
-                        amount_in_effective -= approval_fee;
                     }
                 }
             }

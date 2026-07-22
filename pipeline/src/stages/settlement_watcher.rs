@@ -11,7 +11,7 @@ use crate::config::SwapperMode;
 use crate::persistance::{LiqMetaWrapper, LiqResultRecord, ResultStatus, WalStore};
 use crate::stages::executor::ExecutionReceipt;
 use crate::stages::executor::ExecutionStatus;
-use crate::swappers::swap_interface::SwapInterface;
+use crate::swappers::swap_interface::QuoteInterface;
 use crate::utils::now_ts;
 use crate::wal::{decode_receipt_wrapper, encode_meta};
 use liquidium_pipeline_connectors::pipeline_agent::PipelineAgent;
@@ -21,7 +21,7 @@ const MAX_UNPROFITABLE_SECS: i64 = 180;
 pub struct SettlementWatcher<A, S, D>
 where
     A: PipelineAgent,
-    S: SwapInterface,
+    S: QuoteInterface,
     D: WalStore,
 {
     pub wal: Arc<D>,
@@ -36,7 +36,7 @@ where
 impl<A, S, D> SettlementWatcher<A, S, D>
 where
     A: PipelineAgent + Send + Sync,
-    S: SwapInterface + Send + Sync,
+    S: QuoteInterface + Send + Sync,
     D: WalStore + Send + Sync,
 {
     pub fn new(

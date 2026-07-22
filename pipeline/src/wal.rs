@@ -216,6 +216,12 @@ mod tests {
 
     #[test]
     fn icpswap_execution_state_round_trips_in_existing_meta_json() {
+        #[derive(serde::Deserialize)]
+        #[serde(tag = "venue", content = "state", rename_all = "snake_case")]
+        enum LegacyVenueExecutionState {
+            Icpswap(IcpswapExecutionState),
+        }
+
         let receipt = make_receipt();
         let token_in = ChainToken::Icp {
             ledger: Principal::from_slice(&[1]),
@@ -283,21 +289,29 @@ mod tests {
             meta: vec![1, 2, 3],
             finalizer_decision: None,
             profit_snapshot: None,
-            venue_execution: Some(VenueExecutionState::Icpswap(state.clone())),
+            venue_execution: Some(VenueExecutionState::new(crate::swappers::icpswap::VENUE_ID, &state).unwrap()),
         };
         encode_meta(&mut row, &wrapper).expect("encode wrapper");
         let encoded: serde_json::Value = serde_json::from_str(&row.meta_json).expect("encoded wrapper json");
         assert_eq!(encoded["venue_execution"]["venue"], "icpswap");
         assert!(encoded["venue_execution"]["state"].is_object());
+        let legacy: LegacyVenueExecutionState = serde_json::from_value(encoded["venue_execution"].clone())
+            .expect("the previous tagged-enum schema must decode the new representation");
+        let LegacyVenueExecutionState::Icpswap(legacy_state) = legacy;
+        assert_eq!(legacy_state, state);
 
         let decoded = decode_receipt_wrapper(&row)
             .expect("decode wrapper")
             .expect("wrapper exists");
         assert_eq!(decoded.meta, vec![1, 2, 3]);
-        assert_eq!(decoded.venue_execution, Some(VenueExecutionState::Icpswap(state)));
-        let Some(VenueExecutionState::Icpswap(decoded_state)) = decoded.venue_execution else {
-            panic!("ICPSwap state should exist");
-        };
+        let encoded_state = VenueExecutionState::new(crate::swappers::icpswap::VENUE_ID, &state).unwrap();
+        assert_eq!(decoded.venue_execution, Some(encoded_state));
+        let decoded_state: IcpswapExecutionState = decoded
+            .venue_execution
+            .expect("ICPSwap state should exist")
+            .decode(crate::swappers::icpswap::VENUE_ID)
+            .expect("decode state")
+            .expect("wrong venue");
         assert_eq!(decoded_state.plan, plan);
     }
 

@@ -45,14 +45,6 @@ pub(crate) struct RouteCandidate {
     pub(crate) dex_preview: Option<DexRoutePreview>,
 }
 
-/// Convert internal route venue into external swapper id used by exports/UI.
-pub(crate) fn swapper_id(venue: RouteVenue) -> &'static str {
-    match venue {
-        RouteVenue::Dex => "icpswap",
-        RouteVenue::Cex => "mexc",
-    }
-}
-
 /// Net edge in bps after configured CEX-specific haircuts.
 ///
 /// Note: slippage is intentionally not a parameter because CEX gross edge is
