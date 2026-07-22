@@ -30,6 +30,7 @@ use crate::config::{Config, ConfigTrait};
 use crate::finalizers::{dex_finalizer::DexRouteFinalizer, icpswap::finalizer::IcpswapFinalizer};
 use crate::swappers::icpswap::{client::IcpswapClient, types::IcpswapTokenMetadata, venue::IcpswapVenue};
 use crate::swappers::router::SwapRouter;
+use crate::watchdog::{balance_monitor::DEFAULT_LOW_BALANCE_ALERT_COOLDOWN, slack_watchdog_from_env};
 
 pub struct PipelineContext {
     pub config: Arc<Config>,
@@ -291,13 +292,16 @@ impl<P: Provider<AnyNetwork> + WalletProvider<AnyNetwork> + Clone + 'static> Pip
         // let mexc_client = Arc::new(MexcClient::from_env()?);
         // let mexc_venue: Arc<dyn SwapVenue> = Arc::new(MexcSwapVenue::new(mexc_client));
 
-        let dex_route_finalizer: Arc<dyn DexRouteFinalizer> = Arc::new(IcpswapFinalizer::new(
-            icpswap_venue.clone(),
-            Account {
-                owner: config.trader_principal,
-                subaccount: None,
-            },
-        ));
+        let dex_route_finalizer: Arc<dyn DexRouteFinalizer> = Arc::new(
+            IcpswapFinalizer::new(
+                icpswap_venue.clone(),
+                Account {
+                    owner: config.trader_principal,
+                    subaccount: None,
+                },
+            )
+            .with_watchdog(slack_watchdog_from_env(DEFAULT_LOW_BALANCE_ALERT_COOLDOWN)),
+        );
 
         // The router only sees ICPSwap through the common venue abstraction.
         let swap_router = SwapRouter::new().with_default_venue(icpswap_venue);

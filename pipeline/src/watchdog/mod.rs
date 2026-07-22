@@ -40,6 +40,13 @@ pub enum WatchdogEvent<'a> {
         state: String,
         details: String,
     },
+    OperatorRequired {
+        execution_id: String,
+        venue: String,
+        pending_step: String,
+        owner: String,
+        details: String,
+    },
     LiquidationFinalized {
         liquidation_id: String,
         borrower: String,
@@ -103,7 +110,6 @@ impl WebhookWatchdog {
         m.insert(key.to_string(), now);
         Some(now)
     }
-
 }
 
 #[async_trait]
@@ -115,6 +121,12 @@ impl Watchdog for WebhookWatchdog {
             WatchdogEvent::InsufficientFunds { asset, .. } => format!("insuff:{asset}"),
             WatchdogEvent::LowBalance { account, asset_id, .. } => format!("low_balance:{account}:{asset_id}"),
             WatchdogEvent::Lifecycle { state, .. } => format!("lifecycle:{state}"),
+            WatchdogEvent::OperatorRequired {
+                execution_id,
+                venue,
+                pending_step,
+                ..
+            } => format!("operator_required:{venue}:{execution_id}:{pending_step}"),
             WatchdogEvent::LiquidationFinalized {
                 liquidation_id, status, ..
             } => {

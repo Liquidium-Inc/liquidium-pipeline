@@ -3,9 +3,8 @@ use std::{
     fs::{self, OpenOptions},
     io::{self, BufRead, Write},
     path::{Path, PathBuf},
-    str::FromStr,
     sync::Arc,
-    time::{Duration, Instant, SystemTime},
+    time::{Duration, Instant},
 };
 
 use async_trait::async_trait;
@@ -17,7 +16,11 @@ use liquidium_pipeline_connectors::{
     account::icp_account::derive_icp_identity,
     backend::icp_backend::{IcpBackend, IcpBackendImpl},
 };
-use liquidium_pipeline_core::tokens::{chain_token::ChainToken, chain_token_amount::ChainTokenAmount};
+use liquidium_pipeline_core::tokens::{
+    chain_token::ChainToken,
+    chain_token_amount::ChainTokenAmount,
+    exact_amount::{format_units, parse_decimal_units},
+};
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -26,19 +29,19 @@ use crate::{
         icpswap::{
             client::IcpswapClient,
             execution::IcpswapExecutionStateStore,
-            state::initial_slippage_bps,
+            state::{initial_slippage_bps, validate_execution_state},
             types::{IcpswapExecutionPlan, IcpswapExecutionState, IcpswapStep, IcpswapTokenMetadata},
             venue::{IcpswapFinalizerLogic, IcpswapVenue},
         },
         model::SwapRequest,
     },
-    utils::{CKUSDC_LEDGER_PRINCIPAL, ICP_LEDGER_PRINCIPAL},
+    utils::{CKUSDC_LEDGER_PRINCIPAL, ICP_LEDGER_PRINCIPAL, now_nanos},
 };
 
 const DEFAULT_SLIPPAGE_BPS: u32 = 125;
 const POLL_INTERVAL: Duration = Duration::from_secs(5);
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(600);
-const RUN_FILE_VERSION: u32 = 2;
+const RUN_FILE_VERSION: u32 = 4;
 
 #[derive(Debug)]
 pub struct IcpswapCommandOptions {
@@ -60,9 +63,7 @@ struct Runtime {
 #[derive(Debug, Serialize, Deserialize)]
 struct RunFile {
     version: u32,
-    run_id: String,
     endpoint: String,
-    owner: Account,
     state: IcpswapExecutionState,
 }
 
@@ -164,31 +165,18 @@ impl FileStateStore {
                 run.version, RUN_FILE_VERSION
             ));
         }
-        if run.run_id != self.run_id {
-            return Err(format!("run file contains ID {}, expected {}", run.run_id, self.run_id));
-        }
         if run.endpoint != self.endpoint {
             return Err(format!(
                 "run endpoint {} differs from configured IC_URL {}",
                 run.endpoint, self.endpoint
             ));
         }
-        if run.owner != self.owner {
-            return Err(format!(
-                "run owner {} differs from configured liquidator {}",
-                run.owner, self.owner
-            ));
-        }
-        if run.state.execution_id != self.run_id || run.state.owner != self.owner {
-            return Err("run ID or owner does not match its persisted ICPSwap state".to_string());
-        }
+        validate_execution_state(&run.state, &self.run_id, self.owner)?;
         validate_fixed_pair(&run.state.plan)
     }
 
     fn write_run(&self, state: &IcpswapExecutionState) -> Result<(), String> {
-        if state.execution_id != self.run_id || state.owner != self.owner {
-            return Err("run ID or owner does not match its persisted ICPSwap state".to_string());
-        }
+        validate_execution_state(state, &self.run_id, self.owner)?;
         if let Some(existing) = self.read_run()?
             && existing.state.plan != state.plan
         {
@@ -203,15 +191,13 @@ impl FileStateStore {
             .map_err(|error| format!("failed creating run directory {}: {error}", parent.display()))?;
         let run = RunFile {
             version: RUN_FILE_VERSION,
-            run_id: self.run_id.clone(),
             endpoint: self.endpoint.clone(),
-            owner: self.owner,
             state: state.clone(),
         };
         let bytes = serde_json::to_vec_pretty(&run).map_err(|error| format!("failed encoding run state: {error}"))?;
         let temporary = self
             .path
-            .with_extension(format!("tmp-{}-{}", std::process::id(), system_time_nanos()));
+            .with_extension(format!("tmp-{}-{}", std::process::id(), now_nanos()));
 
         let mut options = OpenOptions::new();
         options.write(true).create_new(true);
@@ -389,7 +375,7 @@ async fn drive_to_terminal(
                         .ok_or_else(|| "completed swap has no confirmed wallet credit".to_string())?;
                     println!(
                         "ICPSwap completed: received {} ckUSDC in the liquidator account.",
-                        format_units(credited, state.plan.net_expected_output.token.decimals())
+                        format_units(credited, state.plan.net_expected_output().token.decimals())
                     );
                     owner_lock.release()?;
                     return Ok(());
@@ -420,14 +406,18 @@ async fn drive_to_terminal(
             }
         }
 
-        let now = system_time_nanos();
+        let now = now_nanos();
         let advance = async {
-            if store.load(run_id).await?.is_none() {
-                let fresh_plan = plan.take().ok_or_else(|| "missing initial ICPSwap plan".to_string())?;
-                let state = workflow.prepare(run_id, fresh_plan, owner);
-                store.persist(run_id, &state).await?;
-            }
-            workflow.advance(store, run_id, owner, now).await
+            let state = match state {
+                Some(state) => state,
+                None => {
+                    let fresh_plan = plan.take().ok_or_else(|| "missing initial ICPSwap plan".to_string())?;
+                    let state = workflow.prepare(run_id, fresh_plan, owner);
+                    store.persist(run_id, &state).await?;
+                    state
+                }
+            };
+            workflow.advance_loaded(store, run_id, owner, now, state).await
         };
 
         tokio::select! {
@@ -566,10 +556,12 @@ async fn build_runtime() -> Result<Runtime, String> {
 }
 
 fn print_quote(runtime: &Runtime, budget: &Nat, plan: &IcpswapExecutionPlan) {
+    let expected_output = plan.net_expected_output();
     println!("\n=== ICPSwap ICP -> ckUSDC ===\n");
     println!("Endpoint:             {}", runtime.endpoint);
     println!("Liquidator:           {}", runtime.owner);
     println!("Pool:                 {}", plan.pool);
+    println!("Funding flow:         ICRC-1 transfer -> pool subaccount -> deposit");
     println!("Fee tier:             {}", plan.fee_tier);
     println!(
         "Maximum ICP debit:    {} ICP",
@@ -593,7 +585,7 @@ fn print_quote(runtime: &Runtime, budget: &Nat, plan: &IcpswapExecutionPlan) {
     );
     println!(
         "Expected net output:  {} ckUSDC (gross quoted output - ledger fee)",
-        format_units(&plan.net_expected_output.value, runtime.ckusdc.decimals())
+        format_units(&expected_output.value, runtime.ckusdc.decimals())
     );
     println!(
         "ckUSDC ledger fee:    {} ckUSDC",
@@ -620,7 +612,7 @@ fn print_quote(runtime: &Runtime, budget: &Nat, plan: &IcpswapExecutionPlan) {
         )
     );
     println!(
-        "Pool slippage cap:    {} bps (up to 3 confirmed-slippage retries)",
+        "Pool slippage cap:    {} bps (up to 3 balance-reconciled retries)",
         plan.max_slippage_bps
     );
 }
@@ -677,55 +669,6 @@ fn validate_fixed_pair(plan: &IcpswapExecutionPlan) -> Result<(), String> {
     Ok(())
 }
 
-fn parse_decimal_units(value: &str, decimals: u8) -> Result<Nat, String> {
-    let value = value.trim();
-    if value.is_empty() || value.starts_with('-') || value.starts_with('+') || value.contains(['e', 'E']) {
-        return Err(format!("invalid decimal amount '{value}'"));
-    }
-    let mut parts = value.split('.');
-    let whole = parts.next().unwrap_or_default();
-    let fraction = parts.next().unwrap_or_default();
-    if parts.next().is_some()
-        || (whole.is_empty() && fraction.is_empty())
-        || !whole.chars().all(|character| character.is_ascii_digit())
-        || !fraction.chars().all(|character| character.is_ascii_digit())
-    {
-        return Err(format!("invalid decimal amount '{value}'"));
-    }
-    if fraction.len() > usize::from(decimals) {
-        return Err(format!("amount '{value}' has more than {decimals} decimal places"));
-    }
-    let whole = if whole.is_empty() { "0" } else { whole };
-    let mut raw = whole.to_string();
-    raw.push_str(fraction);
-    raw.extend(std::iter::repeat_n('0', usize::from(decimals) - fraction.len()));
-    Nat::from_str(raw.trim_start_matches('0'))
-        .or_else(|_| Nat::from_str("0"))
-        .map_err(|error| format!("amount '{value}' is too large: {error}"))
-}
-
-fn format_units(value: &Nat, decimals: u8) -> String {
-    // `Nat`'s Display implementation inserts `_` digit separators; wire and
-    // human decimal formatting must operate on the underlying base-10 digits.
-    let mut digits = value.to_string().replace('_', "");
-    if decimals == 0 {
-        return digits;
-    }
-    let decimals = usize::from(decimals);
-    if digits.len() <= decimals {
-        digits.insert_str(0, &"0".repeat(decimals + 1 - digits.len()));
-    }
-    let split = digits.len() - decimals;
-    digits.insert(split, '.');
-    while digits.ends_with('0') {
-        digits.pop();
-    }
-    if digits.ends_with('.') {
-        digits.pop();
-    }
-    digits
-}
-
 fn subtract_or_zero(value: &Nat, fee: &Nat) -> Nat {
     if value > fee {
         value.clone() - fee.clone()
@@ -747,16 +690,7 @@ fn validate_run_id(run_id: &str) -> Result<(), String> {
 }
 
 fn new_run_id() -> String {
-    format!("icpswap-{}-{}", system_time_nanos(), std::process::id())
-}
-
-fn system_time_nanos() -> u64 {
-    SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos()
-        .try_into()
-        .unwrap_or(u64::MAX)
+    format!("icpswap-{}-{}", now_nanos(), std::process::id())
 }
 
 fn expand_tilde(path: &str) -> PathBuf {
@@ -802,7 +736,6 @@ mod tests {
             ChainTokenAmount::from_raw(ckusdc.clone(), Nat::from(5_000_000u64)),
             ChainTokenAmount::from_raw(ckusdc, Nat::from(10_000u64)),
             125,
-            1,
         )
         .unwrap()
     }
@@ -926,7 +859,7 @@ mod tests {
         assert!(wrong_owner.load("run-1").await.is_err());
 
         let mut changed = state;
-        changed.plan.quoted_at += 1;
+        changed.plan.fee_tier += Nat::from(1u8);
         assert!(original.persist("run-1", &changed).await.is_err());
     }
 

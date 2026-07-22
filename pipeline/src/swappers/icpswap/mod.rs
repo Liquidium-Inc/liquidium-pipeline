@@ -8,6 +8,8 @@ pub mod execution;
 pub mod manual;
 #[path = "planning/plan.rs"]
 pub mod plan;
+#[path = "execution/reconciliation.rs"]
+pub(crate) mod reconciliation;
 #[path = "execution/state.rs"]
 pub mod state;
 #[path = "protocol/types.rs"]

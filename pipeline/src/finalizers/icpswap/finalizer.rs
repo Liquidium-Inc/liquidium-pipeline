@@ -1,4 +1,4 @@
-use std::{sync::Arc, time::SystemTime};
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use icrc_ledger_types::icrc1::account::Account;
@@ -17,7 +17,9 @@ use crate::{
         },
         model::SwapRequest,
     },
+    utils::now_nanos,
     wal::{decode_receipt_wrapper, encode_meta, liq_id_from_receipt, wal_load},
+    watchdog::{Watchdog, WatchdogEvent, noop_watchdog},
 };
 
 pub(crate) const ICPSWAP_FINALIZER_PERMANENT_PREFIX: &str = "permanent ICPSwap finalizer: ";
@@ -29,11 +31,12 @@ pub struct IcpswapFinalizer {
     workflow: Arc<dyn IcpswapFinalizerLogic>,
     trader: Account,
     clock: Arc<Clock>,
+    watchdog: Arc<dyn Watchdog>,
 }
 
 impl IcpswapFinalizer {
     pub fn new(workflow: Arc<dyn IcpswapFinalizerLogic>, trader: Account) -> Self {
-        Self::from_workflow_with_clock(workflow, trader, Arc::new(system_time_nanos))
+        Self::from_workflow_with_clock(workflow, trader, Arc::new(now_nanos))
     }
 
     pub fn from_workflow_with_clock(
@@ -45,7 +48,13 @@ impl IcpswapFinalizer {
             workflow,
             trader,
             clock,
+            watchdog: noop_watchdog(),
         }
+    }
+
+    pub fn with_watchdog(mut self, watchdog: Arc<dyn Watchdog>) -> Self {
+        self.watchdog = watchdog;
+        self
     }
 
     async fn load_state(
@@ -100,6 +109,32 @@ impl IcpswapFinalizer {
             _ => Ok(FinalizerResult::noop()),
         }
     }
+
+    async fn notify_operator_required(
+        &self,
+        execution_id: &str,
+        previous_step: IcpswapStep,
+        state: &IcpswapExecutionState,
+    ) {
+        if previous_step == IcpswapStep::OperatorRequired || state.step != IcpswapStep::OperatorRequired {
+            return;
+        }
+        self.watchdog
+            .notify(WatchdogEvent::OperatorRequired {
+                execution_id: execution_id.to_string(),
+                venue: VENUE_ID.to_string(),
+                pending_step: state
+                    .operator_pending_step
+                    .map(|step| format!("{step:?}"))
+                    .unwrap_or_else(|| "unknown".to_string()),
+                owner: state.owner.to_string(),
+                details: state
+                    .last_error
+                    .clone()
+                    .unwrap_or_else(|| "ICPSwap requires operator reconciliation".to_string()),
+            })
+            .await;
+    }
 }
 
 #[async_trait]
@@ -111,7 +146,8 @@ impl Finalizer for IcpswapFinalizer {
 
         let liquidation_id = liq_id_from_receipt(&receipt)?;
         let store = WalIcpswapExecutionStateStore::new(wal);
-        self.load_state(&store, &liquidation_id).await?;
+        let loaded_state = self.load_state(&store, &liquidation_id).await?;
+        let previous_step = loaded_state.step;
         let now_nanos = (self.clock)();
 
         let owner_key = self.trader.owner.to_text();
@@ -127,7 +163,7 @@ impl Finalizer for IcpswapFinalizer {
         }
         let state = match self
             .workflow
-            .advance(&store, &liquidation_id, self.trader, now_nanos)
+            .advance_loaded(&store, &liquidation_id, self.trader, now_nanos, loaded_state)
             .await
         {
             Ok(state) => state,
@@ -135,12 +171,17 @@ impl Finalizer for IcpswapFinalizer {
                 let mut state = self.load_state(&store, &liquidation_id).await?;
                 state.last_error = Some(error.clone());
                 store.persist(&liquidation_id, &state).await?;
+                self.notify_operator_required(&liquidation_id, previous_step, &state)
+                    .await;
                 if state.step == IcpswapStep::Failed {
                     return Err(permanent_message(&error));
                 }
                 return Ok(FinalizerResult::noop());
             }
         };
+
+        self.notify_operator_required(&liquidation_id, previous_step, &state)
+            .await;
 
         let result = self.result_for_state(&receipt, &state, now_nanos).await;
         if matches!(state.step, IcpswapStep::Completed | IcpswapStep::Refunded) {
@@ -196,6 +237,9 @@ impl DexRouteFinalizer for IcpswapFinalizer {
         decision: FinalizerDecisionSnapshot,
         preview: DexRoutePreview,
     ) -> Result<(), String> {
+        if self.trader.subaccount.is_some() {
+            return Err("ICPSwap route commit requires the trader's default ledger account".to_string());
+        }
         let route: IcpswapExecutionPlan = preview.route(VENUE_ID)?;
         if decision.chosen != "dex" {
             return Err(format!(
@@ -280,13 +324,4 @@ impl DexRouteFinalizer for IcpswapFinalizer {
 
 fn permanent_message(message: &str) -> String {
     format!("{ICPSWAP_FINALIZER_PERMANENT_PREFIX}{message}")
-}
-
-fn system_time_nanos() -> u64 {
-    SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos()
-        .try_into()
-        .unwrap_or(u64::MAX)
 }

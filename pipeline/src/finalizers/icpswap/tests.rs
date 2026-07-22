@@ -2,7 +2,7 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use candid::{Nat, Principal};
-use icrc_ledger_types::icrc1::account::Account;
+use icrc_ledger_types::icrc1::{account::Account, transfer::TransferArg};
 use liquidium_pipeline_core::{
     tokens::{chain_token::ChainToken, chain_token_amount::ChainTokenAmount},
     types::protocol_types::{
@@ -27,17 +27,17 @@ use crate::{
         icpswap::{
             client::{IcpswapManualClient, MockIcpswapManualClient},
             execution::IcpswapExecutionStateStore,
-            manual::{deposit_step, operator_step, recover_step, trade_step, withdraw_step},
+            manual::{deposit_step, operator_step, recover_step, trade_step, transfer_step, withdraw_step},
             types::{
-                IcpswapApprovalRequest, IcpswapDepositArgs, IcpswapExecutionPlan, IcpswapExecutionState,
-                IcpswapManualClientError, IcpswapQuoteError, IcpswapRoutePreview, IcpswapStep, IcpswapSwapArgs,
-                IcpswapUnusedBalance, IcpswapWithdrawArgs,
+                IcpswapClientError, IcpswapDepositArgs, IcpswapExecutionPlan, IcpswapExecutionState, IcpswapQuoteError,
+                IcpswapRoutePreview, IcpswapStep, IcpswapSwapArgs, IcpswapUnusedBalance, IcpswapWithdrawArgs,
             },
             venue::IcpswapFinalizerLogic,
         },
         model::{SwapQuote, SwapRequest},
     },
     wal::{decode_receipt_wrapper, encode_meta},
+    watchdog::{Watchdog, WatchdogEvent},
 };
 
 fn p(id: u8) -> Principal {
@@ -71,7 +71,6 @@ fn plan() -> IcpswapExecutionPlan {
         ChainTokenAmount::from_raw(token(p(2), "OUT", 5), Nat::from(120_000u64)),
         ChainTokenAmount::from_raw(token(p(2), "OUT", 5), Nat::from(5u64)),
         100,
-        123,
     )
     .expect("plan")
 }
@@ -216,12 +215,50 @@ struct TestIcpswapClient {
     manual: MockIcpswapManualClient,
 }
 
+#[derive(Default)]
+struct RecordingWatchdog(Mutex<Vec<(String, String, String, String, String)>>);
+
+impl RecordingWatchdog {
+    fn events(&self) -> Vec<(String, String, String, String, String)> {
+        self.0.lock().unwrap().clone()
+    }
+}
+
+#[async_trait]
+impl Watchdog for RecordingWatchdog {
+    async fn notify(&self, event: WatchdogEvent<'_>) {
+        if let WatchdogEvent::OperatorRequired {
+            execution_id,
+            venue,
+            pending_step,
+            owner,
+            details,
+        } = event
+        {
+            self.0
+                .lock()
+                .unwrap()
+                .push((execution_id, venue, pending_step, owner, details));
+        }
+    }
+}
+
 #[async_trait]
 impl IcpswapFinalizerLogic for TestIcpswapClient {
     async fn preview_route(&self, _request: &SwapRequest) -> Result<IcpswapRoutePreview, IcpswapQuoteError> {
         Err(IcpswapQuoteError::NoUsablePools {
             failures: vec!["preview is not used by this test".to_string()],
         })
+    }
+
+    async fn transfer(
+        &self,
+        store: &dyn IcpswapExecutionStateStore,
+        execution_id: &str,
+        state: &mut IcpswapExecutionState,
+        now_nanos: u64,
+    ) -> Result<(), String> {
+        transfer_step(self, store, execution_id, state, now_nanos).await
     }
 
     async fn deposit(
@@ -276,49 +313,36 @@ impl IcpswapFinalizerLogic for TestIcpswapClient {
 
 #[async_trait]
 impl IcpswapManualClient for TestIcpswapClient {
-    async fn quote_manual(&self, pool: Principal, args: &IcpswapSwapArgs) -> Result<Nat, IcpswapManualClientError> {
-        self.manual.quote_manual(pool, args).await
+    async fn requote(&self, pool: Principal, args: &IcpswapSwapArgs) -> Result<Nat, IcpswapClientError> {
+        self.manual.requote(pool, args).await
     }
 
-    async fn ledger_balance(&self, ledger: Principal, account: &Account) -> Result<Nat, IcpswapManualClientError> {
+    async fn ledger_balance(&self, ledger: Principal, account: &Account) -> Result<Nat, IcpswapClientError> {
         self.manual.ledger_balance(ledger, account).await
     }
 
-    async fn manual_allowance(
-        &self,
-        ledger: Principal,
-        owner: &Account,
-        spender: &Account,
-    ) -> Result<Nat, IcpswapManualClientError> {
-        self.manual.manual_allowance(ledger, owner, spender).await
+    async fn ledger_transfer(&self, ledger: Principal, args: TransferArg) -> Result<Nat, IcpswapClientError> {
+        self.manual.ledger_transfer(ledger, args).await
     }
 
-    async fn manual_approve(&self, request: IcpswapApprovalRequest) -> Result<Nat, IcpswapManualClientError> {
-        self.manual.manual_approve(request).await
-    }
-
-    async fn manual_unused_balance(
+    async fn unused_balance(
         &self,
         pool: Principal,
         owner: Principal,
-    ) -> Result<IcpswapUnusedBalance, IcpswapManualClientError> {
-        self.manual.manual_unused_balance(pool, owner).await
+    ) -> Result<IcpswapUnusedBalance, IcpswapClientError> {
+        self.manual.unused_balance(pool, owner).await
     }
 
-    async fn deposit_from(&self, pool: Principal, args: &IcpswapDepositArgs) -> Result<Nat, IcpswapManualClientError> {
-        self.manual.deposit_from(pool, args).await
+    async fn deposit(&self, pool: Principal, args: &IcpswapDepositArgs) -> Result<Nat, IcpswapClientError> {
+        self.manual.deposit(pool, args).await
     }
 
-    async fn swap_manual(&self, pool: Principal, args: &IcpswapSwapArgs) -> Result<Nat, IcpswapManualClientError> {
-        self.manual.swap_manual(pool, args).await
+    async fn swap(&self, pool: Principal, args: &IcpswapSwapArgs) -> Result<Nat, IcpswapClientError> {
+        self.manual.swap(pool, args).await
     }
 
-    async fn withdraw_manual(
-        &self,
-        pool: Principal,
-        args: &IcpswapWithdrawArgs,
-    ) -> Result<Nat, IcpswapManualClientError> {
-        self.manual.withdraw_manual(pool, args).await
+    async fn withdraw(&self, pool: Principal, args: &IcpswapWithdrawArgs) -> Result<Nat, IcpswapClientError> {
+        self.manual.withdraw(pool, args).await
     }
 }
 
@@ -353,7 +377,7 @@ async fn committing_dex_preview_creates_manual_icpswap_state() {
             pay_asset: receipt.request.swap_args.as_ref().unwrap().pay_asset.clone(),
             pay_amount: plan.amount_in.value.clone(),
             receive_asset: receipt.request.swap_args.as_ref().unwrap().receive_asset.clone(),
-            receive_amount: plan.net_expected_output.value.clone(),
+            receive_amount: plan.net_expected_output().value,
             mid_price: 0.0,
             exec_price: 0.0,
             slippage: 0.0,
@@ -372,7 +396,7 @@ async fn committing_dex_preview_creates_manual_icpswap_state() {
     assert_eq!(wal.wrapper().finalizer_decision, Some(decision));
     let state = wal.state();
     assert_eq!(state.plan, plan);
-    assert_eq!(state.step, IcpswapStep::Deposit);
+    assert_eq!(state.step, IcpswapStep::Transfer);
     assert_eq!(state.owner, trader());
 }
 
@@ -381,12 +405,14 @@ async fn finalizer_runs_deposit_trade_withdraw_and_builds_execution() {
     let receipt = receipt();
     let wal = TestWal::new(&receipt, state());
     let mut manual = MockIcpswapManualClient::new();
-    manual
-        .expect_manual_allowance()
-        .times(1)
-        .return_once(|_, _, _| Ok(Nat::from(100_010u64)));
-    manual.expect_manual_approve().times(0);
-    manual.expect_quote_manual().times(0);
+    manual.expect_ledger_transfer().times(1).return_once(|ledger, args| {
+        assert_eq!(ledger, p(1));
+        assert_eq!(args.amount, Nat::from(100_010u64));
+        assert_eq!(args.fee, Some(Nat::from(10u64)));
+        assert_eq!(args.created_at_time, Some(1_000_000_000));
+        Ok(Nat::from(77u64))
+    });
+    manual.expect_requote().times(0);
 
     let mut unused_sequence = Sequence::new();
     for balance in [
@@ -399,14 +425,6 @@ async fn finalizer_runs_deposit_trade_withdraw_and_builds_execution() {
             balance1: Nat::from(0u8),
         },
         IcpswapUnusedBalance {
-            balance0: Nat::from(100_000u64),
-            balance1: Nat::from(0u8),
-        },
-        IcpswapUnusedBalance {
-            balance0: Nat::from(0u8),
-            balance1: Nat::from(119_500u64),
-        },
-        IcpswapUnusedBalance {
             balance0: Nat::from(0u8),
             balance1: Nat::from(119_500u64),
         },
@@ -416,16 +434,16 @@ async fn finalizer_runs_deposit_trade_withdraw_and_builds_execution() {
         },
     ] {
         manual
-            .expect_manual_unused_balance()
+            .expect_unused_balance()
             .times(1)
             .in_sequence(&mut unused_sequence)
             .return_once(move |_, _| Ok(balance));
     }
     manual
-        .expect_deposit_from()
+        .expect_deposit()
         .times(1)
         .return_once(|_, args| Ok(args.amount.clone()));
-    manual.expect_swap_manual().times(1).return_once(|_, args| {
+    manual.expect_swap().times(1).return_once(|_, args| {
         assert_eq!(args.amount_out_minimum, "118800");
         Ok(Nat::from(119_500u64))
     });
@@ -441,11 +459,13 @@ async fn finalizer_runs_deposit_trade_withdraw_and_builds_execution() {
         .in_sequence(&mut balance_sequence)
         .return_once(|_, _| Ok(Nat::from(119_505u64)));
     manual
-        .expect_withdraw_manual()
+        .expect_withdraw()
         .times(1)
         .return_once(|_, args| Ok(args.amount.clone()));
     let finalizer = finalizer(manual);
 
+    assert!(!finalizer.finalize(&wal, receipt.clone()).await.unwrap().finalized);
+    assert_eq!(wal.state().step, IcpswapStep::Deposit);
     assert!(!finalizer.finalize(&wal, receipt.clone()).await.unwrap().finalized);
     assert_eq!(wal.state().step, IcpswapStep::Trade);
     assert!(!finalizer.finalize(&wal, receipt.clone()).await.unwrap().finalized);
@@ -472,4 +492,32 @@ async fn failed_state_returns_explicit_permanent_error() {
         .expect_err("permanent");
     assert!(error.starts_with(ICPSWAP_FINALIZER_PERMANENT_PREFIX));
     assert!(error.contains("ambiguous withdrawal"));
+}
+
+#[tokio::test]
+async fn operator_required_transition_sends_one_watchdog_notification() {
+    let receipt = receipt();
+    let mut pending = state();
+    pending.step = IcpswapStep::DepositPending;
+    pending.deposit.input_pool_balance_before = Some(Nat::from(0u8));
+    let wal = TestWal::new(&receipt, pending);
+    let mut manual = MockIcpswapManualClient::new();
+    manual.expect_unused_balance().times(2).returning(|_, _| {
+        Ok(IcpswapUnusedBalance {
+            balance0: Nat::from(0u8),
+            balance1: Nat::from(0u8),
+        })
+    });
+    let watchdog = Arc::new(RecordingWatchdog::default());
+    let finalizer = finalizer(manual).with_watchdog(watchdog.clone());
+
+    assert!(!finalizer.finalize(&wal, receipt.clone()).await.unwrap().finalized);
+    assert_eq!(wal.state().step, IcpswapStep::OperatorRequired);
+    assert_eq!(watchdog.events().len(), 1);
+    assert_eq!(watchdog.events()[0].0, "42");
+    assert_eq!(watchdog.events()[0].1, "icpswap");
+    assert_eq!(watchdog.events()[0].2, "DepositPending");
+
+    assert!(!finalizer.finalize(&wal, receipt).await.unwrap().finalized);
+    assert_eq!(watchdog.events().len(), 1, "reconciliation must not resend the alert");
 }

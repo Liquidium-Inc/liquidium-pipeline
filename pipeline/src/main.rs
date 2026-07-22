@@ -73,7 +73,7 @@ enum Commands {
 
     /// Quotes or executes a mainnet ICP -> ckUSDC swap through ICPSwap.
     Icpswap {
-        /// Maximum ICP debit, including approval and transfer-from ledger fees.
+        /// Maximum ICP debit, including transfer and pool-deposit ledger fees.
         #[arg(long, required_unless_present = "resume", conflicts_with = "resume")]
         amount: Option<String>,
         /// Maximum tolerated slippage in basis points.

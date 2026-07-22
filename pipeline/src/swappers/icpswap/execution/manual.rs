@@ -1,22 +1,29 @@
 //! Durable implementation of ICPSwap's official
-//! `depositFrom -> swap -> withdraw` workflow.
+//! `transfer -> deposit -> swap -> withdraw` workflow.
 
-use candid::Nat;
+use candid::Principal;
 #[cfg(test)]
 use icrc_ledger_types::icrc1::account::Account;
+use icrc_ledger_types::icrc1::{
+    account::{Account as IcrcAccount, principal_to_subaccount},
+    transfer::TransferArg,
+};
 use liquidium_pipeline_core::tokens::chain_token_amount::ChainTokenAmount;
 
 use crate::swappers::icpswap::{
     client::IcpswapManualClient,
-    execution::{IcpswapExecutionStateStore, pool_spender},
-    plan::{amount_out_minimum, nat_to_decimal_text, required_allowance},
-    state::{MAX_MANUAL_SLIPPAGE_RETRIES, retry_backoff_nanos, retry_slippage_bps},
+    execution::IcpswapExecutionStateStore,
+    plan::{amount_out_minimum, nat_to_decimal_text},
+    reconciliation as recon,
+    state::retry_slippage_bps,
     types::{
-        IcpswapApprovalRequest, IcpswapDepositArgs, IcpswapError, IcpswapManualClientError, IcpswapState, IcpswapStep,
-        IcpswapSwapArgs, IcpswapUnusedBalance, IcpswapWithdrawArgs,
+        IcpswapClientError, IcpswapDepositArgs, IcpswapError, IcpswapState, IcpswapStep, IcpswapSwapArgs,
+        IcpswapWithdrawArgs,
     },
 };
 
+#[cfg(test)]
+use crate::swappers::icpswap::state::validate_execution_state;
 #[cfg(test)]
 use crate::swappers::icpswap::types::IcpswapExecutionState;
 
@@ -32,41 +39,43 @@ pub(crate) async fn advance_manual(
         .load(execution_id)
         .await?
         .ok_or_else(|| format!("missing persisted ICPSwap state for {execution_id}"))?;
-    validate_state(&state, execution_id, owner)?;
+    validate_execution_state(&state, execution_id, owner)?;
 
     match state.step {
-        IcpswapStep::Deposit => deposit(client, store, execution_id, &mut state, now_nanos).await?,
-        IcpswapStep::DepositPending => {
-            reconcile_deposit(client, &mut state).await?;
-            persist(store, execution_id, &state).await?;
+        IcpswapStep::Transfer | IcpswapStep::TransferPending => {
+            transfer_step(client, store, execution_id, &mut state, now_nanos).await?
         }
-        IcpswapStep::Trade => trade(client, store, execution_id, &mut state, now_nanos).await?,
-        IcpswapStep::TradePending => {
-            if !reconcile_trade(client, &mut state).await?
-                && let Some(error) = state.trade.swap_protocol_error.clone()
-            {
-                handle_persisted_swap_protocol_error(client, &mut state, error, now_nanos).await?;
-            }
-            persist(store, execution_id, &state).await?;
+        IcpswapStep::Deposit | IcpswapStep::DepositPending => {
+            deposit_step(client, store, execution_id, &mut state, now_nanos).await?
         }
-        IcpswapStep::Withdraw => withdraw_output(client, store, execution_id, &mut state, now_nanos).await?,
-        IcpswapStep::WithdrawPending => {
-            reconcile_output_withdrawal(client, &mut state).await?;
-            persist(store, execution_id, &state).await?;
+        IcpswapStep::Trade | IcpswapStep::TradePending => {
+            trade_step(client, store, execution_id, &mut state, now_nanos).await?
         }
-        IcpswapStep::Recover => recover_input(client, store, execution_id, &mut state, now_nanos).await?,
-        IcpswapStep::RecoverPending => {
-            reconcile_recovery(client, &mut state).await?;
-            persist(store, execution_id, &state).await?;
+        IcpswapStep::Withdraw | IcpswapStep::WithdrawPending => {
+            withdraw_step(client, store, execution_id, &mut state, now_nanos).await?
         }
-        IcpswapStep::OperatorRequired => {
-            reconcile_operator_required(client, &mut state).await?;
-            persist(store, execution_id, &state).await?;
+        IcpswapStep::Recover | IcpswapStep::RecoverPending => {
+            recover_step(client, store, execution_id, &mut state, now_nanos).await?
         }
+        IcpswapStep::OperatorRequired => operator_step(client, store, execution_id, &mut state).await?,
         IcpswapStep::Completed | IcpswapStep::Refunded | IcpswapStep::Failed => {}
     }
 
     Ok(state)
+}
+
+pub(crate) async fn transfer_step(
+    client: &dyn IcpswapManualClient,
+    store: &dyn IcpswapExecutionStateStore,
+    execution_id: &str,
+    state: &mut IcpswapState,
+    now_nanos: u64,
+) -> Result<(), String> {
+    match state.step {
+        IcpswapStep::Transfer => transfer_input(client, store, execution_id, state, now_nanos).await,
+        IcpswapStep::TransferPending => resume_transfer(client, store, execution_id, state).await,
+        _ => Err(format!("transfer cannot handle ICPSwap step {:?}", state.step)),
+    }
 }
 
 pub(crate) async fn deposit_step(
@@ -79,7 +88,14 @@ pub(crate) async fn deposit_step(
     match state.step {
         IcpswapStep::Deposit => deposit(client, store, execution_id, state, now_nanos).await,
         IcpswapStep::DepositPending => {
-            reconcile_deposit(client, state).await?;
+            if !recon::observe_deposit(client, state).await? {
+                let message =
+                    "pending deposit could not be proven from the pool balance; automatic replay is unsafe".to_string();
+                recon::require_operator(state, IcpswapStep::DepositPending, message.clone());
+                persist(store, execution_id, state).await?;
+                return Err(message);
+            }
+            recon::complete_deposit(state);
             persist(store, execution_id, state).await
         }
         _ => Err(format!("deposit cannot handle ICPSwap step {:?}", state.step)),
@@ -96,10 +112,22 @@ pub(crate) async fn trade_step(
     match state.step {
         IcpswapStep::Trade => trade(client, store, execution_id, state, now_nanos).await,
         IcpswapStep::TradePending => {
-            if !reconcile_trade(client, state).await?
-                && let Some(error) = state.trade.swap_protocol_error.clone()
-            {
-                handle_persisted_swap_protocol_error(client, state, error, now_nanos).await?;
+            match recon::observe_trade(client, state).await? {
+                recon::TradeObservation::Succeeded(gross_output) => recon::complete_trade(state, gross_output),
+                recon::TradeObservation::Unchanged => {
+                    if let Some(error) = state.trade.swap_protocol_error.clone() {
+                        recon::resolve_swap_protocol_error(state, error, recon::TradeObservation::Unchanged, now_nanos);
+                    } else {
+                        recon::handle_unconfirmed_trade(
+                            state,
+                            now_nanos,
+                            recon::UnconfirmedTradeObservation::Unchanged,
+                        );
+                    }
+                }
+                recon::TradeObservation::Inconsistent => {
+                    recon::handle_unconfirmed_trade(state, now_nanos, recon::UnconfirmedTradeObservation::Inconsistent)
+                }
             }
             persist(store, execution_id, state).await
         }
@@ -117,7 +145,9 @@ pub(crate) async fn withdraw_step(
     match state.step {
         IcpswapStep::Withdraw => withdraw_output(client, store, execution_id, state, now_nanos).await,
         IcpswapStep::WithdrawPending => {
-            reconcile_output_withdrawal(client, state).await?;
+            if let Some(wallet_credit) = recon::observe_output_withdrawal(client, state).await? {
+                recon::complete_output_withdrawal(state, wallet_credit);
+            }
             persist(store, execution_id, state).await
         }
         _ => Err(format!("withdraw cannot handle ICPSwap step {:?}", state.step)),
@@ -134,7 +164,9 @@ pub(crate) async fn recover_step(
     match state.step {
         IcpswapStep::Recover => recover_input(client, store, execution_id, state, now_nanos).await,
         IcpswapStep::RecoverPending => {
-            reconcile_recovery(client, state).await?;
+            if let Some(wallet_credit) = recon::observe_recovery(client, state).await? {
+                recon::complete_recovery(state, wallet_credit);
+            }
             persist(store, execution_id, state).await
         }
         _ => Err(format!("recover cannot handle ICPSwap step {:?}", state.step)),
@@ -153,8 +185,67 @@ pub(crate) async fn operator_step(
             state.step
         ));
     }
-    reconcile_operator_required(client, state).await?;
+    recon::reconcile_operator_required(client, state).await?;
     persist(store, execution_id, state).await
+}
+
+async fn transfer_input(
+    client: &dyn IcpswapManualClient,
+    store: &dyn IcpswapExecutionStateStore,
+    execution_id: &str,
+    state: &mut IcpswapState,
+    now_nanos: u64,
+) -> Result<(), String> {
+    let destination = pool_user_account(state.plan.pool, state.owner.owner);
+    let args = TransferArg {
+        from_subaccount: state.owner.subaccount,
+        to: destination,
+        fee: Some(state.plan.input_ledger_fee.value.clone()),
+        created_at_time: Some(now_nanos),
+        memo: None,
+        amount: state.plan.amount_in.value.clone() + state.plan.input_ledger_fee.value.clone(),
+    };
+    state.transfer.args = Some(args.clone());
+    state.step = IcpswapStep::TransferPending;
+    state.last_error = None;
+    persist(store, execution_id, state).await?;
+    submit_transfer(client, store, execution_id, state, args).await
+}
+
+async fn resume_transfer(
+    client: &dyn IcpswapManualClient,
+    store: &dyn IcpswapExecutionStateStore,
+    execution_id: &str,
+    state: &mut IcpswapState,
+) -> Result<(), String> {
+    let args = state
+        .transfer
+        .args
+        .clone()
+        .ok_or_else(|| "pending ICPSwap transfer is missing its persisted arguments".to_string())?;
+    submit_transfer(client, store, execution_id, state, args).await
+}
+
+async fn submit_transfer(
+    client: &dyn IcpswapManualClient,
+    store: &dyn IcpswapExecutionStateStore,
+    execution_id: &str,
+    state: &mut IcpswapState,
+    args: TransferArg,
+) -> Result<(), String> {
+    match client.ledger_transfer(state.plan.token_in, args).await {
+        Ok(block_index) => {
+            state.transfer.block_index = Some(block_index);
+            state.step = IcpswapStep::Deposit;
+            state.last_error = None;
+            persist(store, execution_id, state).await
+        }
+        Err(error) => {
+            state.last_error = Some(error.to_string());
+            persist(store, execution_id, state).await?;
+            Err(error.to_string())
+        }
+    }
 }
 
 async fn deposit(
@@ -162,111 +253,53 @@ async fn deposit(
     store: &dyn IcpswapExecutionStateStore,
     execution_id: &str,
     state: &mut IcpswapState,
-    now_nanos: u64,
+    _now_nanos: u64,
 ) -> Result<(), String> {
-    let spender = pool_spender(state.plan.pool);
-    let required = required_allowance(&state.plan);
-    let current = client
-        .manual_allowance(state.plan.token_in, &state.owner, &spender)
-        .await
-        .map_err(|error| error.to_string())?;
-    if current < required {
-        let created_at = match state.deposit.approval_created_at {
-            Some(value) => value,
-            None => {
-                state.deposit.approval_created_at = Some(now_nanos);
-                persist(store, execution_id, state).await?;
-                now_nanos
-            }
-        };
-        match client
-            .manual_approve(IcpswapApprovalRequest {
-                ledger: state.plan.token_in,
-                owner: state.owner,
-                spender,
-                current_allowance: current,
-                required_allowance: required.clone(),
-                created_at_time: created_at,
-            })
-            .await
-        {
-            Ok(block) => state.deposit.approval_block_index = Some(block),
-            Err(error) => {
-                let refreshed = client
-                    .manual_allowance(state.plan.token_in, &state.owner, &spender)
-                    .await
-                    .map_err(|query| query.to_string())?;
-                if refreshed < required {
-                    state.last_error = Some(error.to_string());
-                    persist(store, execution_id, state).await?;
-                    return Err(error.to_string());
-                }
-            }
-        }
-    }
-
     let unused = client
-        .manual_unused_balance(state.plan.pool, state.owner.owner)
+        .unused_balance(state.plan.pool, state.owner.owner)
         .await
         .map_err(|error| error.to_string())?;
-    state.deposit.input_pool_balance_before = Some(input_balance(&state.plan, &unused));
-    state.deposit.output_pool_balance_before = Some(output_balance(&state.plan, &unused));
+    state.deposit.input_pool_balance_before = Some(recon::input_balance(&state.plan, &unused));
     let args = IcpswapDepositArgs {
         token: state.plan.token_in.to_text(),
         amount: state.plan.amount_in.value.clone(),
         fee: state.plan.input_ledger_fee.value.clone(),
     };
-    state.deposit.deposit_args = Some(args.clone());
-    state.deposit.deposit_submitted_at = Some(now_nanos);
     state.step = IcpswapStep::DepositPending;
     state.last_error = None;
     persist(store, execution_id, state).await?;
 
-    match client.deposit_from(state.plan.pool, &args).await {
-        Ok(amount) => {
-            state.deposit.deposit_returned_amount = Some(amount);
-            persist(store, execution_id, state).await?;
+    submit_deposit(client, store, execution_id, state, args).await
+}
+
+async fn submit_deposit(
+    client: &dyn IcpswapManualClient,
+    store: &dyn IcpswapExecutionStateStore,
+    execution_id: &str,
+    state: &mut IcpswapState,
+    args: IcpswapDepositArgs,
+) -> Result<(), String> {
+    match client.deposit(state.plan.pool, &args).await {
+        Ok(_) => {
+            state.step = IcpswapStep::Trade;
+            state.last_error = None;
+            return persist(store, execution_id, state).await;
         }
-        Err(error @ IcpswapManualClientError::SubmissionUnknown { .. }) => {
-            require_operator(state, IcpswapStep::DepositPending, error.to_string());
-            persist(store, execution_id, state).await?;
-            reconcile_deposit(client, state).await?;
+        Err(error @ IcpswapClientError::SubmissionUnknown { .. }) => {
+            if recon::observe_deposit(client, state).await? {
+                recon::complete_deposit(state);
+            } else {
+                recon::require_operator(state, IcpswapStep::DepositPending, error.to_string());
+            }
             persist(store, execution_id, state).await?;
             return Err(error.to_string());
         }
         Err(error) => {
-            state.step = IcpswapStep::Deposit;
-            state.deposit.deposit_args = None;
-            state.deposit.deposit_submitted_at = None;
             state.last_error = Some(error.to_string());
             persist(store, execution_id, state).await?;
             return Err(error.to_string());
         }
     }
-    reconcile_deposit(client, state).await?;
-    persist(store, execution_id, state).await
-}
-
-async fn reconcile_deposit(client: &dyn IcpswapManualClient, state: &mut IcpswapState) -> Result<bool, String> {
-    let before = state
-        .deposit
-        .input_pool_balance_before
-        .clone()
-        .ok_or_else(|| "manual deposit is missing its input-pool baseline".to_string())?;
-    let unused = client
-        .manual_unused_balance(state.plan.pool, state.owner.owner)
-        .await
-        .map_err(|error| error.to_string())?;
-    let current = input_balance(&state.plan, &unused);
-    if current >= before + state.plan.amount_in.value.clone() {
-        state.trade.input_pool_balance_before = Some(current);
-        state.trade.output_pool_balance_before = Some(output_balance(&state.plan, &unused));
-        state.step = IcpswapStep::Trade;
-        state.operator_pending_step = None;
-        state.last_error = None;
-        return Ok(true);
-    }
-    Ok(false)
 }
 
 async fn trade(
@@ -281,11 +314,88 @@ async fn trade(
         return Ok(());
     }
 
-    let quote = if state.trade.retry_count == 0 {
+    let Some(args) = prepare_trade_attempt(client, state, now_nanos).await? else {
+        persist(store, execution_id, state).await?;
+        return Ok(());
+    };
+
+    // The pending attempt and its exact arguments must be durable before the
+    // non-idempotent pool call is submitted.
+    persist(store, execution_id, state).await?;
+
+    match client.swap(state.plan.pool, &args).await {
+        Ok(amount) => {
+            recon::complete_trade(state, amount);
+            persist(store, execution_id, state).await
+        }
+        Err(error @ IcpswapClientError::SubmissionUnknown { .. }) => {
+            state.last_error = Some(error.to_string());
+            persist(store, execution_id, state).await?;
+            let settled = match recon::observe_trade(client, state).await? {
+                recon::TradeObservation::Succeeded(gross_output) => {
+                    recon::complete_trade(state, gross_output);
+                    true
+                }
+                recon::TradeObservation::Unchanged => {
+                    recon::handle_unconfirmed_trade(state, now_nanos, recon::UnconfirmedTradeObservation::Unchanged);
+                    false
+                }
+                recon::TradeObservation::Inconsistent => {
+                    recon::handle_unconfirmed_trade(state, now_nanos, recon::UnconfirmedTradeObservation::Inconsistent);
+                    false
+                }
+            };
+            persist(store, execution_id, state).await?;
+            if settled {
+                return Ok(());
+            }
+            return Err(error.to_string());
+        }
+        Err(IcpswapClientError::Protocol {
+            method,
+            error: protocol,
+        }) => {
+            let error = IcpswapClientError::Protocol {
+                method,
+                error: protocol.clone(),
+            };
+            state.trade.swap_protocol_error = Some(protocol.clone());
+            state.last_error = Some(error.to_string());
+            persist(store, execution_id, state).await?;
+            return handle_swap_protocol_error(client, store, execution_id, state, error, protocol, now_nanos).await;
+        }
+        Err(error @ IcpswapClientError::Encode { .. }) => {
+            state.step = IcpswapStep::Trade;
+            state.trade.swap_args = None;
+            state.trade.pending_since_nanos = None;
+            state.last_error = Some(error.to_string());
+            persist(store, execution_id, state).await?;
+            return Err(error.to_string());
+        }
+        Err(error) => {
+            recon::require_operator(state, IcpswapStep::TradePending, error.to_string());
+            persist(store, execution_id, state).await?;
+            return Err(error.to_string());
+        }
+    }
+}
+
+/// Prepares one swap attempt without submitting it.
+///
+/// `None` means the current quote violated the immutable output floor and the
+/// state was moved to either a delayed retry or recovery. `Some(args)` means
+/// all reconciliation baselines and the exact call arguments are recorded in
+/// `state` as `TradePending`, ready to be persisted before submission.
+async fn prepare_trade_attempt(
+    client: &dyn IcpswapManualClient,
+    state: &mut IcpswapState,
+    now_nanos: u64,
+) -> Result<Option<IcpswapSwapArgs>, String> {
+    let quote = if state.trade.retry_evaluation_count == 0 {
         state.plan.gross_quoted_out.value.clone()
     } else {
         client
-            .quote_manual(
+            .requote(
                 state.plan.pool,
                 &IcpswapSwapArgs {
                     zero_for_one: state.plan.zero_for_one,
@@ -296,75 +406,42 @@ async fn trade(
             .await
             .map_err(|error| error.to_string())?
     };
-    state.trade.current_quote = Some(ChainTokenAmount::from_raw(
-        state.plan.gross_quoted_out.token.clone(),
-        quote.clone(),
-    ));
-
-    if quote < state.trade.original_hard_minimum_out.value {
-        consume_retry_without_submission(state, now_nanos, "fresh quote is below the original hard output floor");
-        persist(store, execution_id, state).await?;
-        return Ok(());
+    if quote < state.plan.amount_out_minimum.value {
+        recon::schedule_trade_retry_or_recovery(
+            state,
+            now_nanos,
+            recon::TradeRetryCause::QuoteBelowHardFloor,
+            "fresh quote is below the original hard output floor".to_string(),
+        );
+        return Ok(None);
     }
 
-    let effective = retry_slippage_bps(state.plan.max_slippage_bps, state.trade.retry_count);
+    let effective = retry_slippage_bps(state.plan.max_slippage_bps, state.trade.slippage_retry_count);
     let fresh_minimum = amount_out_minimum(&quote, effective).map_err(|error| error.to_string())?;
-    let minimum = std::cmp::max(fresh_minimum, state.trade.original_hard_minimum_out.value.clone());
-    state.trade.effective_slippage_bps = effective;
+    let minimum = std::cmp::max(fresh_minimum, state.plan.amount_out_minimum.value.clone());
     state.trade.current_amount_out_minimum =
         ChainTokenAmount::from_raw(state.plan.gross_quoted_out.token.clone(), minimum.clone());
 
     let unused = client
-        .manual_unused_balance(state.plan.pool, state.owner.owner)
+        .unused_balance(state.plan.pool, state.owner.owner)
         .await
         .map_err(|error| error.to_string())?;
-    state.trade.input_pool_balance_before = Some(input_balance(&state.plan, &unused));
-    state.trade.output_pool_balance_before = Some(output_balance(&state.plan, &unused));
+    state.trade.input_pool_balance_before = Some(recon::input_balance(&state.plan, &unused));
+    state.trade.output_pool_balance_before = Some(recon::output_balance(&state.plan, &unused));
     let args = IcpswapSwapArgs {
         zero_for_one: state.plan.zero_for_one,
         amount_in: nat_to_decimal_text(&state.plan.amount_in.value),
         amount_out_minimum: nat_to_decimal_text(&minimum),
     };
     state.trade.swap_args = Some(args.clone());
-    state.trade.swap_returned_amount = None;
+    state.trade.gross_output_amount = None;
     state.trade.swap_protocol_error = None;
-    state.trade.swap_submitted_at = Some(now_nanos);
     state.trade.next_retry_at_nanos = None;
+    state.trade.pending_since_nanos = Some(now_nanos);
+    state.trade.unchanged_observations = 0;
     state.step = IcpswapStep::TradePending;
     state.last_error = None;
-    persist(store, execution_id, state).await?;
-
-    match client.swap_manual(state.plan.pool, &args).await {
-        Ok(amount) => {
-            state.trade.swap_returned_amount = Some(amount);
-            persist(store, execution_id, state).await?;
-        }
-        Err(error @ IcpswapManualClientError::SubmissionUnknown { .. }) => {
-            require_operator(state, IcpswapStep::TradePending, error.to_string());
-            persist(store, execution_id, state).await?;
-            reconcile_trade(client, state).await?;
-            persist(store, execution_id, state).await?;
-            return Err(error.to_string());
-        }
-        Err(error @ IcpswapManualClientError::Protocol { .. }) => {
-            if let IcpswapManualClientError::Protocol { error: protocol, .. } = &error {
-                state.trade.swap_protocol_error = Some(protocol.clone());
-            }
-            state.last_error = Some(error.to_string());
-            persist(store, execution_id, state).await?;
-            return handle_swap_protocol_error(client, store, execution_id, state, error, now_nanos).await;
-        }
-        Err(error) => {
-            state.step = IcpswapStep::Trade;
-            state.trade.swap_args = None;
-            state.trade.swap_submitted_at = None;
-            state.last_error = Some(error.to_string());
-            persist(store, execution_id, state).await?;
-            return Err(error.to_string());
-        }
-    }
-    reconcile_trade(client, state).await?;
-    persist(store, execution_id, state).await
+    Ok(Some(args))
 }
 
 async fn handle_swap_protocol_error(
@@ -372,85 +449,14 @@ async fn handle_swap_protocol_error(
     store: &dyn IcpswapExecutionStateStore,
     execution_id: &str,
     state: &mut IcpswapState,
-    error: IcpswapManualClientError,
+    error: IcpswapClientError,
+    protocol: IcpswapError,
     now_nanos: u64,
 ) -> Result<(), String> {
-    let protocol = match &error {
-        IcpswapManualClientError::Protocol { error, .. } => error.clone(),
-        _ => unreachable!("only protocol errors reach this handler"),
-    };
-    handle_persisted_swap_protocol_error(client, state, protocol, now_nanos).await?;
+    let observation = recon::observe_trade(client, state).await?;
+    recon::resolve_swap_protocol_error(state, protocol, observation, now_nanos);
     persist(store, execution_id, state).await?;
     Err(error.to_string())
-}
-
-async fn handle_persisted_swap_protocol_error(
-    client: &dyn IcpswapManualClient,
-    state: &mut IcpswapState,
-    error: IcpswapError,
-    now_nanos: u64,
-) -> Result<(), String> {
-    let unchanged = trade_balances_unchanged(client, state).await?;
-    let retryable_slippage = matches!(&error, IcpswapError::InternalError(message) if is_slippage_error(message));
-    let message = format!("ICPSwap swap returned an error: {error:?}");
-    if !unchanged {
-        require_operator(state, IcpswapStep::TradePending, message);
-    } else if retryable_slippage {
-        schedule_retry_or_recovery(state, now_nanos, message);
-    } else {
-        state.step = IcpswapStep::Recover;
-        state.last_error = Some(message);
-    }
-    Ok(())
-}
-
-async fn reconcile_trade(client: &dyn IcpswapManualClient, state: &mut IcpswapState) -> Result<bool, String> {
-    let input_before = state
-        .trade
-        .input_pool_balance_before
-        .clone()
-        .ok_or_else(|| "manual swap is missing its input-pool baseline".to_string())?;
-    let output_before = state
-        .trade
-        .output_pool_balance_before
-        .clone()
-        .ok_or_else(|| "manual swap is missing its output-pool baseline".to_string())?;
-    let unused = client
-        .manual_unused_balance(state.plan.pool, state.owner.owner)
-        .await
-        .map_err(|error| error.to_string())?;
-    let input_now = input_balance(&state.plan, &unused);
-    let output_now = output_balance(&state.plan, &unused);
-    let expected_input_max = nat_saturating_sub(&input_before, &state.plan.amount_in.value);
-    let output_delta = nat_saturating_sub(&output_now, &output_before);
-    if input_now <= expected_input_max && output_delta >= state.trade.current_amount_out_minimum.value {
-        state.trade.swap_returned_amount = Some(output_delta.clone());
-        state.withdraw.pool_balance_before = Some(output_now);
-        state.step = IcpswapStep::Withdraw;
-        state.trade.swap_protocol_error = None;
-        state.operator_pending_step = None;
-        state.last_error = None;
-        return Ok(true);
-    }
-    Ok(false)
-}
-
-async fn trade_balances_unchanged(client: &dyn IcpswapManualClient, state: &IcpswapState) -> Result<bool, String> {
-    let input_before = state
-        .trade
-        .input_pool_balance_before
-        .as_ref()
-        .ok_or_else(|| "manual swap is missing its input-pool baseline".to_string())?;
-    let output_before = state
-        .trade
-        .output_pool_balance_before
-        .as_ref()
-        .ok_or_else(|| "manual swap is missing its output-pool baseline".to_string())?;
-    let unused = client
-        .manual_unused_balance(state.plan.pool, state.owner.owner)
-        .await
-        .map_err(|error| error.to_string())?;
-    Ok(input_balance(&state.plan, &unused) == *input_before && output_balance(&state.plan, &unused) == *output_before)
 }
 
 async fn withdraw_output(
@@ -458,11 +464,11 @@ async fn withdraw_output(
     store: &dyn IcpswapExecutionStateStore,
     execution_id: &str,
     state: &mut IcpswapState,
-    now_nanos: u64,
+    _now_nanos: u64,
 ) -> Result<(), String> {
     let amount = state
         .trade
-        .swap_returned_amount
+        .gross_output_amount
         .clone()
         .ok_or_else(|| "manual swap has no confirmed gross output".to_string())?;
     if amount <= state.plan.output_ledger_fee.value {
@@ -471,10 +477,10 @@ async fn withdraw_output(
         return persist(store, execution_id, state).await;
     }
     let unused = client
-        .manual_unused_balance(state.plan.pool, state.owner.owner)
+        .unused_balance(state.plan.pool, state.owner.owner)
         .await
         .map_err(|error| error.to_string())?;
-    state.withdraw.pool_balance_before = Some(output_balance(&state.plan, &unused));
+    state.withdraw.pool_balance_before = Some(recon::output_balance(&state.plan, &unused));
     state.withdraw.wallet_balance_before = Some(
         client
             .ledger_balance(state.plan.token_out, &state.owner)
@@ -487,67 +493,32 @@ async fn withdraw_output(
         amount: amount.clone(),
     };
     state.withdraw.withdraw_args = Some(args.clone());
-    state.withdraw.withdraw_submitted_at = Some(now_nanos);
     state.step = IcpswapStep::WithdrawPending;
     state.last_error = None;
     persist(store, execution_id, state).await?;
-    match client.withdraw_manual(state.plan.pool, &args).await {
-        Ok(returned) => {
-            state.withdraw.withdraw_returned_amount = Some(returned);
+    match client.withdraw(state.plan.pool, &args).await {
+        Ok(_) => {
             persist(store, execution_id, state).await?;
         }
-        Err(error @ IcpswapManualClientError::SubmissionUnknown { .. }) => {
-            require_operator(state, IcpswapStep::WithdrawPending, error.to_string());
+        Err(error @ IcpswapClientError::SubmissionUnknown { .. }) => {
+            recon::require_operator(state, IcpswapStep::WithdrawPending, error.to_string());
             persist(store, execution_id, state).await?;
-            reconcile_output_withdrawal(client, state).await?;
+            if let Some(wallet_credit) = recon::observe_output_withdrawal(client, state).await? {
+                recon::complete_output_withdrawal(state, wallet_credit);
+            }
             persist(store, execution_id, state).await?;
             return Err(error.to_string());
         }
         Err(error) => {
-            require_operator(state, IcpswapStep::WithdrawPending, error.to_string());
+            recon::require_operator(state, IcpswapStep::WithdrawPending, error.to_string());
             persist(store, execution_id, state).await?;
             return Err(error.to_string());
         }
     }
-    reconcile_output_withdrawal(client, state).await?;
-    persist(store, execution_id, state).await
-}
-
-async fn reconcile_output_withdrawal(
-    client: &dyn IcpswapManualClient,
-    state: &mut IcpswapState,
-) -> Result<bool, String> {
-    let args = state
-        .withdraw
-        .withdraw_args
-        .as_ref()
-        .ok_or_else(|| "manual output withdrawal is missing its arguments".to_string())?;
-    let pool_before = state
-        .withdraw
-        .pool_balance_before
-        .as_ref()
-        .ok_or_else(|| "manual output withdrawal is missing its pool baseline".to_string())?;
-    let wallet_before = state
-        .withdraw
-        .wallet_balance_before
-        .as_ref()
-        .ok_or_else(|| "manual output withdrawal is missing its wallet baseline".to_string())?;
-    let (unused, wallet_now) = tokio::try_join!(
-        client.manual_unused_balance(state.plan.pool, state.owner.owner),
-        client.ledger_balance(state.plan.token_out, &state.owner),
-    )
-    .map_err(|error| error.to_string())?;
-    let pool_now = output_balance(&state.plan, &unused);
-    let expected_credit = nat_saturating_sub(&args.amount, &args.fee);
-    let wallet_delta = nat_saturating_sub(&wallet_now, wallet_before);
-    if pool_now <= nat_saturating_sub(pool_before, &args.amount) && wallet_delta >= expected_credit {
-        state.withdraw.wallet_credited_amount = Some(expected_credit);
-        state.step = IcpswapStep::Completed;
-        state.operator_pending_step = None;
-        state.last_error = None;
-        return Ok(true);
+    if let Some(wallet_credit) = recon::observe_output_withdrawal(client, state).await? {
+        recon::complete_output_withdrawal(state, wallet_credit);
     }
-    Ok(false)
+    persist(store, execution_id, state).await
 }
 
 async fn recover_input(
@@ -555,13 +526,16 @@ async fn recover_input(
     store: &dyn IcpswapExecutionStateStore,
     execution_id: &str,
     state: &mut IcpswapState,
-    now_nanos: u64,
+    _now_nanos: u64,
 ) -> Result<(), String> {
     let unused = client
-        .manual_unused_balance(state.plan.pool, state.owner.owner)
+        .unused_balance(state.plan.pool, state.owner.owner)
         .await
         .map_err(|error| error.to_string())?;
-    let amount = std::cmp::min(input_balance(&state.plan, &unused), state.plan.amount_in.value.clone());
+    let amount = std::cmp::min(
+        recon::input_balance(&state.plan, &unused),
+        state.plan.amount_in.value.clone(),
+    );
     if amount <= state.plan.input_ledger_fee.value {
         state.step = IcpswapStep::Failed;
         state.last_error = Some(format!(
@@ -570,7 +544,7 @@ async fn recover_input(
         ));
         return persist(store, execution_id, state).await;
     }
-    state.recovery.pool_balance_before = Some(input_balance(&state.plan, &unused));
+    state.recovery.pool_balance_before = Some(recon::input_balance(&state.plan, &unused));
     state.recovery.wallet_balance_before = Some(
         client
             .ledger_balance(state.plan.token_in, &state.owner)
@@ -583,111 +557,31 @@ async fn recover_input(
         amount,
     };
     state.recovery.withdraw_args = Some(args.clone());
-    state.recovery.withdraw_submitted_at = Some(now_nanos);
     state.step = IcpswapStep::RecoverPending;
     persist(store, execution_id, state).await?;
-    match client.withdraw_manual(state.plan.pool, &args).await {
-        Ok(returned) => {
-            state.recovery.withdraw_returned_amount = Some(returned);
+    match client.withdraw(state.plan.pool, &args).await {
+        Ok(_) => {
             persist(store, execution_id, state).await?;
         }
-        Err(error @ IcpswapManualClientError::SubmissionUnknown { .. }) => {
-            require_operator(state, IcpswapStep::RecoverPending, error.to_string());
+        Err(error @ IcpswapClientError::SubmissionUnknown { .. }) => {
+            recon::require_operator(state, IcpswapStep::RecoverPending, error.to_string());
             persist(store, execution_id, state).await?;
-            reconcile_recovery(client, state).await?;
+            if let Some(wallet_credit) = recon::observe_recovery(client, state).await? {
+                recon::complete_recovery(state, wallet_credit);
+            }
             persist(store, execution_id, state).await?;
             return Err(error.to_string());
         }
         Err(error) => {
-            require_operator(state, IcpswapStep::RecoverPending, error.to_string());
+            recon::require_operator(state, IcpswapStep::RecoverPending, error.to_string());
             persist(store, execution_id, state).await?;
             return Err(error.to_string());
         }
     }
-    reconcile_recovery(client, state).await?;
+    if let Some(wallet_credit) = recon::observe_recovery(client, state).await? {
+        recon::complete_recovery(state, wallet_credit);
+    }
     persist(store, execution_id, state).await
-}
-
-async fn reconcile_recovery(client: &dyn IcpswapManualClient, state: &mut IcpswapState) -> Result<bool, String> {
-    let args = state
-        .recovery
-        .withdraw_args
-        .as_ref()
-        .ok_or_else(|| "manual recovery is missing its arguments".to_string())?;
-    let pool_before = state
-        .recovery
-        .pool_balance_before
-        .as_ref()
-        .ok_or_else(|| "manual recovery is missing its pool baseline".to_string())?;
-    let wallet_before = state
-        .recovery
-        .wallet_balance_before
-        .as_ref()
-        .ok_or_else(|| "manual recovery is missing its wallet baseline".to_string())?;
-    let (unused, wallet_now) = tokio::try_join!(
-        client.manual_unused_balance(state.plan.pool, state.owner.owner),
-        client.ledger_balance(state.plan.token_in, &state.owner),
-    )
-    .map_err(|error| error.to_string())?;
-    let pool_now = input_balance(&state.plan, &unused);
-    let expected_credit = nat_saturating_sub(&args.amount, &args.fee);
-    let wallet_delta = nat_saturating_sub(&wallet_now, wallet_before);
-    if pool_now <= nat_saturating_sub(pool_before, &args.amount) && wallet_delta >= expected_credit {
-        state.recovery.wallet_credited_amount = Some(expected_credit);
-        state.step = IcpswapStep::Refunded;
-        state.operator_pending_step = None;
-        state.last_error = None;
-        return Ok(true);
-    }
-    Ok(false)
-}
-
-async fn reconcile_operator_required(client: &dyn IcpswapManualClient, state: &mut IcpswapState) -> Result<(), String> {
-    match state.operator_pending_step {
-        Some(IcpswapStep::DepositPending) => {
-            reconcile_deposit(client, state).await?;
-        }
-        Some(IcpswapStep::TradePending) => {
-            reconcile_trade(client, state).await?;
-        }
-        Some(IcpswapStep::WithdrawPending) => {
-            reconcile_output_withdrawal(client, state).await?;
-        }
-        Some(IcpswapStep::RecoverPending) => {
-            reconcile_recovery(client, state).await?;
-        }
-        _ => {}
-    }
-    Ok(())
-}
-
-fn schedule_retry_or_recovery(state: &mut IcpswapState, now_nanos: u64, message: String) {
-    if state.trade.retry_count >= MAX_MANUAL_SLIPPAGE_RETRIES {
-        state.step = IcpswapStep::Recover;
-        state.trade.next_retry_at_nanos = None;
-    } else {
-        state.trade.retry_count += 1;
-        state.trade.next_retry_at_nanos = Some(now_nanos.saturating_add(retry_backoff_nanos(state.trade.retry_count)));
-        state.step = IcpswapStep::Trade;
-    }
-    state.last_error = Some(message);
-}
-
-fn consume_retry_without_submission(state: &mut IcpswapState, now_nanos: u64, message: &str) {
-    if state.trade.retry_count >= MAX_MANUAL_SLIPPAGE_RETRIES {
-        state.step = IcpswapStep::Recover;
-        state.trade.next_retry_at_nanos = None;
-    } else {
-        state.trade.retry_count += 1;
-        state.trade.next_retry_at_nanos = Some(now_nanos.saturating_add(retry_backoff_nanos(state.trade.retry_count)));
-    }
-    state.last_error = Some(message.to_string());
-}
-
-fn require_operator(state: &mut IcpswapState, pending: IcpswapStep, message: String) {
-    state.operator_pending_step = Some(pending);
-    state.step = IcpswapStep::OperatorRequired;
-    state.last_error = Some(message);
 }
 
 async fn persist(
@@ -698,52 +592,9 @@ async fn persist(
     store.persist(execution_id, state).await
 }
 
-#[cfg(test)]
-fn validate_state(state: &IcpswapExecutionState, execution_id: &str, owner: Account) -> Result<(), String> {
-    if state.execution_id != execution_id {
-        return Err(format!(
-            "ICPSwap execution ID {} differs from state-store key {execution_id}",
-            state.execution_id
-        ));
+pub(crate) fn pool_user_account(pool: Principal, owner: Principal) -> IcrcAccount {
+    IcrcAccount {
+        owner: pool,
+        subaccount: Some(principal_to_subaccount(owner)),
     }
-    if state.owner != owner {
-        return Err(format!(
-            "ICPSwap execution owner {} differs from configured owner {owner}",
-            state.owner
-        ));
-    }
-    Ok(())
-}
-
-fn input_balance(plan: &crate::swappers::icpswap::types::IcpswapExecutionPlan, unused: &IcpswapUnusedBalance) -> Nat {
-    if plan.token_in == plan.token0 {
-        unused.balance0.clone()
-    } else {
-        unused.balance1.clone()
-    }
-}
-
-fn output_balance(plan: &crate::swappers::icpswap::types::IcpswapExecutionPlan, unused: &IcpswapUnusedBalance) -> Nat {
-    if plan.token_out == plan.token0 {
-        unused.balance0.clone()
-    } else {
-        unused.balance1.clone()
-    }
-}
-
-fn nat_saturating_sub(left: &Nat, right: &Nat) -> Nat {
-    if left > right {
-        left.clone() - right.clone()
-    } else {
-        Nat::from(0u8)
-    }
-}
-
-pub fn is_slippage_error(message: &str) -> bool {
-    let normalized = message.to_ascii_lowercase();
-    normalized.contains("slippage")
-        || normalized.contains("amountoutminimum")
-        || normalized.contains("amount out minimum")
-        || normalized.contains("too little received")
-        || normalized.contains("price limit")
 }

@@ -524,15 +524,15 @@ Execute the quoted swap after reviewing the pool, fees, expected output, and int
 liquidator icpswap --amount 0.1 --execute
 ```
 
-`--amount` is the maximum ICP debit, including the ICRC-2 approval and transfer-from fees. Executions use ICPSwap's manual `depositFrom → swap → withdraw` flow. The configured slippage is a hard cap: the first attempt uses a tighter limit, and up to three confirmed-slippage failures are requoted and retried without crossing the original minimum-output floor.
+`--amount` is the maximum ICP debit, including the ICRC-1 transfer and pool-deposit fees. Executions use ICPSwap's manual `transfer → deposit → swap → withdraw` flow. The configured slippage is a hard cap: the first attempt uses a tighter limit, and up to three failed swaps are requoted with wider slippage without crossing the original minimum-output floor. A decoded slippage error retries immediately after balance reconciliation; an ambiguous swap retries only after its pool balances remain unchanged through the two-minute reconciliation window.
 
-The command uses the configured liquidator identity and writes resumable checkpoints under `~/.liquidium-pipeline/icpswap-runs/`. If an execution is interrupted or times out, resume it without replaying an ambiguous pool update:
+The command uses the configured liquidator identity and writes resumable checkpoints under `~/.liquidium-pipeline/icpswap-runs/`. The initial ICRC-1 transfer persists its `created_at_time` and ledger block index so an interrupted transfer can be retried with ledger deduplication. If an execution is interrupted or times out, resume it with:
 
 ```bash
 liquidator icpswap --resume <RUN_ID>
 ```
 
-Checkpoints from the removed `depositFromAndSwap` one-step implementation are not supported and cannot be resumed.
+Checkpoints from the removed `depositFromAndSwap` and `depositFrom → swap → withdraw` implementations are not supported and cannot be resumed.
 
 From the repository, the equivalent smoke-test commands are:
 

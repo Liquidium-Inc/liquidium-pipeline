@@ -3,8 +3,8 @@ use icrc_ledger_types::icrc1::account::Account;
 use super::{
     plan::amount_out_minimum,
     types::{
-        IcpswapDepositState, IcpswapExecutionPlan, IcpswapManualRecoveryState, IcpswapState, IcpswapStep,
-        IcpswapTradeState, IcpswapWithdrawState,
+        ICPSWAP_STATE_VERSION, IcpswapDepositState, IcpswapExecutionPlan, IcpswapRecoveryState, IcpswapState,
+        IcpswapStep, IcpswapTradeState, IcpswapTransferState, IcpswapWithdrawState,
     },
 };
 
@@ -20,50 +20,98 @@ impl IcpswapState {
         Self {
             execution_id: execution_id.into(),
             owner,
-            step: IcpswapStep::Deposit,
+            schema_version: ICPSWAP_STATE_VERSION,
+            step: IcpswapStep::Transfer,
             operator_pending_step: None,
             last_error: None,
-            plan: plan.clone(),
+            plan,
+            transfer: IcpswapTransferState::default(),
             deposit: IcpswapDepositState::default(),
             trade: IcpswapTradeState {
-                original_hard_minimum_out: plan.amount_out_minimum.clone(),
-                retry_count: 0,
-                effective_slippage_bps: initial_slippage,
-                current_quote: Some(plan.gross_quoted_out.clone()),
+                retry_evaluation_count: 0,
+                slippage_retry_count: 0,
                 current_amount_out_minimum: initial_minimum,
                 next_retry_at_nanos: None,
+                pending_since_nanos: None,
+                unchanged_observations: 0,
                 input_pool_balance_before: None,
                 output_pool_balance_before: None,
                 swap_args: None,
-                swap_returned_amount: None,
+                gross_output_amount: None,
                 swap_protocol_error: None,
-                swap_submitted_at: None,
             },
             withdraw: IcpswapWithdrawState::default(),
-            recovery: IcpswapManualRecoveryState::default(),
+            recovery: IcpswapRecoveryState::default(),
         }
     }
 }
 
+pub fn validate_execution_state(state: &IcpswapState, execution_id: &str, owner: Account) -> Result<(), String> {
+    if state.schema_version != ICPSWAP_STATE_VERSION {
+        return Err(format!(
+            "unsupported ICPSwap state version {}; expected {ICPSWAP_STATE_VERSION}",
+            state.schema_version
+        ));
+    }
+    if state.execution_id != execution_id {
+        return Err(format!(
+            "ICPSwap execution ID {} differs from state-store key {execution_id}",
+            state.execution_id
+        ));
+    }
+    if owner.subaccount.is_some() || state.owner.subaccount.is_some() {
+        return Err("ICPSwap execution requires the owner's default ledger account".to_string());
+    }
+    if state.owner != owner {
+        return Err(format!(
+            "ICPSwap execution owner {} differs from configured owner {owner}",
+            state.owner
+        ));
+    }
+    Ok(())
+}
+
+/// Tight slippage tolerance used by the initial swap attempt. If the configured
+/// hard cap is lower than 125 bps, the configured cap wins.
 pub const INITIAL_MANUAL_SLIPPAGE_BPS: u32 = 125;
-pub const MAX_MANUAL_SLIPPAGE_RETRIES: u32 = 3;
+
+/// Maximum number of automatic trade retry evaluations after the initial
+/// attempt. A retry can follow confirmed slippage, an unchanged ambiguous
+/// submission, or a fresh quote that cannot satisfy the original hard floor.
+pub const MAX_MANUAL_TRADE_RETRIES: u32 = 3;
+
+/// Number of confirmed-slippage widening steps between the initial tolerance
+/// and the configured hard cap. This is independent of the general retry
+/// budget so non-slippage retries cannot widen the accepted price range.
+pub const MAX_MANUAL_SLIPPAGE_STEPS: u32 = 3;
+
+/// How long an ambiguous swap may show no pool-balance movement before it can
+/// be considered for a safe replay at the existing slippage tolerance.
+pub const PENDING_TRADE_RECONCILIATION_TIMEOUT_NANOS: u64 = 120_000_000_000;
+
+/// Independent unchanged-balance reads required before an ambiguous swap can
+/// be retried, preventing a single stale query from triggering resubmission.
+pub const MIN_UNCHANGED_TRADE_OBSERVATIONS: u32 = 2;
 
 pub fn initial_slippage_bps(cap: u32) -> u32 {
     cap.min(INITIAL_MANUAL_SLIPPAGE_BPS)
 }
 
-pub fn retry_slippage_bps(cap: u32, retry_count: u32) -> u32 {
-    let retry_count = retry_count.min(MAX_MANUAL_SLIPPAGE_RETRIES);
+pub fn retry_slippage_bps(cap: u32, slippage_retry_count: u32) -> u32 {
+    let slippage_retry_count = slippage_retry_count.min(MAX_MANUAL_SLIPPAGE_STEPS);
     let initial = initial_slippage_bps(cap);
-    if cap <= initial || retry_count == 0 {
+    if cap <= initial || slippage_retry_count == 0 {
         return initial;
     }
     let width = cap - initial;
-    initial + width.saturating_mul(retry_count).div_ceil(MAX_MANUAL_SLIPPAGE_RETRIES)
+    initial
+        + width
+            .saturating_mul(slippage_retry_count)
+            .div_ceil(MAX_MANUAL_SLIPPAGE_STEPS)
 }
 
-pub fn retry_backoff_nanos(retry_count: u32) -> u64 {
-    match retry_count {
+pub fn retry_backoff_nanos(retry_evaluation_count: u32) -> u64 {
+    match retry_evaluation_count {
         0 => 0,
         1 => 2_000_000_000,
         2 => 4_000_000_000,

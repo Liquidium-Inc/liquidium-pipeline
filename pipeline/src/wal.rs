@@ -245,7 +245,6 @@ mod tests {
             ChainTokenAmount::from_raw(token_out.clone(), Nat::from(120_000u64)),
             ChainTokenAmount::from_raw(token_out.clone(), Nat::from(20u64)),
             100,
-            123,
         )
         .expect("plan");
         let owner = Account {
@@ -254,12 +253,10 @@ mod tests {
         };
         let mut state = IcpswapExecutionState::prepare("42", plan.clone(), owner);
         state.step = IcpswapStep::TradePending;
-        state.deposit.approval_block_index = Some(Nat::from(77u64));
-        state.deposit.approval_created_at = Some(400);
+        state.transfer.block_index = Some(Nat::from(77u64));
         state.trade.input_pool_balance_before = Some(Nat::from(100_000u64));
         state.trade.output_pool_balance_before = Some(Nat::from(42u64));
-        state.trade.swap_returned_amount = Some(Nat::from(119_500u64));
-        state.trade.swap_submitted_at = Some(456);
+        state.trade.gross_output_amount = Some(Nat::from(119_500u64));
         state.last_error = Some("waiting for asynchronous output".to_string());
 
         let mut row = make_row("{}".to_string());

@@ -1,4 +1,4 @@
-use std::{collections::HashMap, sync::Arc, time::SystemTime};
+use std::{collections::HashMap, sync::Arc};
 
 use async_trait::async_trait;
 use candid::{Nat, Principal};
@@ -16,8 +16,9 @@ use crate::swappers::{
 use super::{
     client::{IcpswapManualClient, IcpswapReadClient},
     execution::IcpswapExecutionStateStore,
-    manual::{deposit_step, operator_step, recover_step, trade_step, withdraw_step},
+    manual::{deposit_step, operator_step, recover_step, trade_step, transfer_step, withdraw_step},
     plan::{amount_out_minimum, nat_to_decimal_text},
+    state::validate_execution_state,
     types::{
         IcpswapExecutionPlan, IcpswapQuoteError, IcpswapRoutePreview, IcpswapState, IcpswapSwapArgs, IcpswapToken,
         IcpswapTokenMetadata,
@@ -38,6 +39,14 @@ pub trait IcpswapFinalizerLogic: Send + Sync {
     fn prepare(&self, execution_id: &str, route: IcpswapExecutionPlan, owner: Account) -> IcpswapState {
         IcpswapState::prepare(execution_id, route, owner)
     }
+
+    async fn transfer(
+        &self,
+        store: &dyn IcpswapExecutionStateStore,
+        execution_id: &str,
+        state: &mut IcpswapState,
+        now_nanos: u64,
+    ) -> Result<(), String>;
 
     async fn deposit(
         &self,
@@ -85,24 +94,27 @@ pub trait IcpswapFinalizerLogic: Send + Sync {
         owner: Account,
         now_nanos: u64,
     ) -> Result<IcpswapState, String> {
-        let mut state = store
+        let state = store
             .load(execution_id)
             .await?
             .ok_or_else(|| format!("missing persisted ICPSwap state for {execution_id}"))?;
-        if state.execution_id != execution_id {
-            return Err(format!(
-                "ICPSwap execution ID {} differs from state-store key {execution_id}",
-                state.execution_id
-            ));
-        }
-        if state.owner != owner {
-            return Err(format!(
-                "ICPSwap execution owner {} differs from configured owner {owner}",
-                state.owner
-            ));
-        }
+        self.advance_loaded(store, execution_id, owner, now_nanos, state).await
+    }
+
+    async fn advance_loaded(
+        &self,
+        store: &dyn IcpswapExecutionStateStore,
+        execution_id: &str,
+        owner: Account,
+        now_nanos: u64,
+        mut state: IcpswapState,
+    ) -> Result<IcpswapState, String> {
+        validate_execution_state(&state, execution_id, owner)?;
 
         match state.step {
+            super::types::IcpswapStep::Transfer | super::types::IcpswapStep::TransferPending => {
+                self.transfer(store, execution_id, &mut state, now_nanos).await?
+            }
             super::types::IcpswapStep::Deposit | super::types::IcpswapStep::DepositPending => {
                 self.deposit(store, execution_id, &mut state, now_nanos).await?
             }
@@ -164,18 +176,6 @@ impl<C: IcpswapReadClient> IcpswapVenue<C> {
     }
 
     pub async fn preview_route(&self, request: &SwapRequest) -> Result<IcpswapRoutePreview, IcpswapQuoteError> {
-        let quoted_at = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        self.preview_route_at(request, quoted_at).await
-    }
-
-    pub async fn preview_route_at(
-        &self,
-        request: &SwapRequest,
-        quoted_at: u64,
-    ) -> Result<IcpswapRoutePreview, IcpswapQuoteError> {
         if request.pay_amount.token.asset_id() != request.pay_asset {
             return Err(IcpswapQuoteError::PayAssetMismatch);
         }
@@ -196,9 +196,9 @@ impl<C: IcpswapReadClient> IcpswapVenue<C> {
             futures::join!(self.client.ledger_fee(token_in), self.client.ledger_fee(token_out));
         let input_fee = input_fee.map_err(IcpswapQuoteError::LedgerFee)?;
         let output_fee = output_fee.map_err(IcpswapQuoteError::LedgerFee)?;
-        // `SwapRequest::pay_amount` is the total spend budget. An ICRC-2
-        // execution can charge once for approval and once for transfer-from,
-        // so the venue—not the strategy—derives the amount safe to swap.
+        // `SwapRequest::pay_amount` is the total spend budget. The ICRC-1
+        // workflow charges once for the transfer into the pool subaccount and
+        // once for the pool's deposit sweep.
         let input_operation_fees = input_fee.clone() * Nat::from(2u8);
         if request.pay_amount.value <= input_operation_fees {
             return Err(IcpswapQuoteError::InputFeesExceedBudget {
@@ -280,7 +280,6 @@ impl<C: IcpswapReadClient> IcpswapVenue<C> {
                     ChainTokenAmount::from_raw(output_token.clone(), gross),
                     ChainTokenAmount::from_raw(output_token, output_fee),
                     max_slippage_bps,
-                    quoted_at,
                 )
                 .map_err(|error| format!("pool {}: {error}", pool.canister_id))
             }
@@ -299,9 +298,9 @@ impl<C: IcpswapReadClient> IcpswapVenue<C> {
         }
         candidates.sort_by(|left, right| {
             right
-                .net_expected_output
+                .net_expected_output()
                 .value
-                .cmp(&left.net_expected_output.value)
+                .cmp(&left.net_expected_output().value)
                 .then_with(|| left.fee_tier.cmp(&right.fee_tier))
                 .then_with(|| left.pool.to_text().cmp(&right.pool.to_text()))
         });
@@ -321,6 +320,16 @@ where
 {
     async fn preview_route(&self, request: &SwapRequest) -> Result<IcpswapRoutePreview, IcpswapQuoteError> {
         IcpswapVenue::preview_route(self, request).await
+    }
+
+    async fn transfer(
+        &self,
+        store: &dyn IcpswapExecutionStateStore,
+        execution_id: &str,
+        state: &mut IcpswapState,
+        now_nanos: u64,
+    ) -> Result<(), String> {
+        transfer_step(self.client.as_ref(), store, execution_id, state, now_nanos).await
     }
 
     async fn deposit(
@@ -394,7 +403,7 @@ impl<C: IcpswapReadClient + 'static> SwapVenue for IcpswapVenue<C> {
 fn completed_execution(request: &SwapRequest, state: &IcpswapState, now_nanos: u64) -> Result<SwapExecution, String> {
     let gross = state
         .trade
-        .swap_returned_amount
+        .gross_output_amount
         .as_ref()
         .ok_or_else(|| "completed manual swap has no gross output".to_string())?;
     if gross <= &state.plan.output_ledger_fee.value {
@@ -406,10 +415,11 @@ fn completed_execution(request: &SwapRequest, state: &IcpswapState, now_nanos: u
         .as_ref()
         .ok_or_else(|| "completed manual swap has no confirmed wallet credit".to_string())?;
     let pay = state.plan.amount_in.to_f64();
-    let receive_token = state.plan.net_expected_output.token.clone();
+    let expected_output = state.plan.net_expected_output();
+    let receive_token = expected_output.token.clone();
     let receive_amount = ChainTokenAmount::from_raw(receive_token.clone(), net.clone());
     let receive = receive_amount.to_f64();
-    let expected = state.plan.net_expected_output.to_f64();
+    let expected = expected_output.to_f64();
     let exec_price = if pay > 0.0 { receive / pay } else { 0.0 };
     let mid_price = if pay > 0.0 { expected / pay } else { 0.0 };
     let slippage = if expected > 0.0 {
@@ -442,19 +452,20 @@ fn completed_execution(request: &SwapRequest, state: &IcpswapState, now_nanos: u
             lp_fee: Nat::from(0u8),
             gas_fee: state.plan.output_ledger_fee.value.clone(),
         }],
-        approval_count: Some(u32::from(state.deposit.approval_block_index.is_some())),
+        approval_count: Some(0),
         ts: now_nanos / 1_000_000_000,
     })
 }
 
 fn common_quote(request: &SwapRequest, plan: &IcpswapExecutionPlan) -> SwapQuote {
     let pay_symbol = plan.amount_in.token.symbol();
-    let receive_symbol = plan.net_expected_output.token.symbol();
+    let expected_output = plan.net_expected_output();
+    let receive_symbol = expected_output.token.symbol();
     SwapQuote {
         pay_asset: request.pay_asset.clone(),
         pay_amount: plan.amount_in.value.clone(),
         receive_asset: request.receive_asset.clone(),
-        receive_amount: plan.net_expected_output.value.clone(),
+        receive_amount: expected_output.value.clone(),
         mid_price: 0.0,
         exec_price: 0.0,
         slippage: 0.0,
@@ -466,7 +477,7 @@ fn common_quote(request: &SwapRequest, plan: &IcpswapExecutionPlan) -> SwapQuote
             pay_amount: plan.amount_in.value.clone(),
             receive_chain: "ICP".to_string(),
             receive_symbol,
-            receive_amount: plan.net_expected_output.value.clone(),
+            receive_amount: expected_output.value,
             price: 0.0,
             lp_fee: Nat::from(0u8),
             gas_fee: plan.output_ledger_fee.value.clone(),

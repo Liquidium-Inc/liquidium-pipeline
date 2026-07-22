@@ -1,6 +1,4 @@
 use async_trait::async_trait;
-use candid::Principal;
-use icrc_ledger_types::icrc1::account::Account;
 
 use crate::{
     persistance::{VenueExecutionState, WalStore},
@@ -77,12 +75,5 @@ impl IcpswapExecutionStateStore for WalIcpswapExecutionStateStore<'_> {
         wrapper.venue_execution = Some(VenueExecutionState::new(VENUE_ID, state)?);
         encode_meta(&mut row, &wrapper)?;
         self.wal.upsert_result(row).await.map_err(|error| error.to_string())
-    }
-}
-
-pub fn pool_spender(pool: Principal) -> Account {
-    Account {
-        owner: pool,
-        subaccount: None,
     }
 }

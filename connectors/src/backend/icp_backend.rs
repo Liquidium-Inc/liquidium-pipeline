@@ -19,6 +19,8 @@ pub trait IcpBackend: Send + Sync {
     async fn icrc1_transfer(&self, ledger: Principal, from: &Account, to: &Account, amount: Nat)
     -> Result<Nat, String>;
 
+    async fn icrc1_transfer_with_args(&self, ledger: Principal, args: TransferArg) -> Result<Nat, String>;
+
     async fn icp_transfer(&self, ledger: Principal, to_account_id_hex: &str, amount_e8s: Nat) -> Result<u64, String>;
 
     async fn icrc1_decimals(&self, ledger: Principal) -> Result<u8, String>;
@@ -76,9 +78,14 @@ impl<A: PipelineAgent> IcpBackend for IcpBackendImpl<A> {
             created_at_time: None,
         };
 
-        let result: Result<Nat, TransferError> = self.update(ledger, "icrc1_transfer", arg).await?;
+        self.icrc1_transfer_with_args(ledger, arg).await
+    }
+
+    async fn icrc1_transfer_with_args(&self, ledger: Principal, args: TransferArg) -> Result<Nat, String> {
+        let result: Result<Nat, TransferError> = self.update(ledger, "icrc1_transfer", args).await?;
         match result {
             Ok(idx) => Ok(idx),
+            Err(TransferError::Duplicate { duplicate_of }) => Ok(duplicate_of),
             Err(e) => Err(format!("icrc1_transfer error: {e}")),
         }
     }
@@ -169,5 +176,42 @@ impl<A: PipelineAgent> IcpBackend for IcpBackendImpl<A> {
 
     async fn icrc1_fee(&self, ledger: Principal) -> Result<Nat, String> {
         self.query::<Nat>(ledger, "icrc1_fee", ()).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pipeline_agent::MockPipelineAgent;
+
+    #[tokio::test]
+    async fn deduplicated_transfer_returns_the_original_block_index() {
+        let ledger = Principal::from_slice(&[1]);
+        let duplicate_of = Nat::from(77u64);
+        let duplicate_response = duplicate_of.clone();
+        let mut agent = MockPipelineAgent::new();
+        agent
+            .expect_call_update::<Result<Nat, TransferError>>()
+            .times(1)
+            .withf(move |canister, method, _| *canister == ledger && method == "icrc1_transfer")
+            .return_once(move |_, _, _| {
+                Ok(Err(TransferError::Duplicate {
+                    duplicate_of: duplicate_response,
+                }))
+            });
+        let backend = IcpBackendImpl::new(Arc::new(agent));
+        let args = TransferArg {
+            from_subaccount: None,
+            to: Account {
+                owner: Principal::from_slice(&[2]),
+                subaccount: Some([3; 32]),
+            },
+            amount: Nat::from(100u64),
+            fee: Some(Nat::from(10u64)),
+            memo: None,
+            created_at_time: Some(123),
+        };
+
+        assert_eq!(backend.icrc1_transfer_with_args(ledger, args).await, Ok(duplicate_of));
     }
 }

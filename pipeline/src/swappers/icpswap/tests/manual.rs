@@ -2,23 +2,40 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use candid::{Nat, Principal};
-use icrc_ledger_types::icrc1::account::Account;
+use icrc_ledger_types::icrc1::{
+    account::{Account, principal_to_subaccount},
+    transfer::TransferArg,
+};
 use liquidium_pipeline_core::tokens::{chain_token::ChainToken, chain_token_amount::ChainTokenAmount};
 use mockall::Sequence;
 
 use super::{
     client::MockIcpswapManualClient,
     execution::IcpswapExecutionStateStore,
-    manual::{advance_manual, is_slippage_error},
-    state::{initial_slippage_bps, retry_backoff_nanos, retry_slippage_bps},
+    manual::advance_manual,
+    reconciliation::is_slippage_error,
+    state::{
+        PENDING_TRADE_RECONCILIATION_TIMEOUT_NANOS, initial_slippage_bps, retry_backoff_nanos, retry_slippage_bps,
+    },
     types::{
-        IcpswapError, IcpswapExecutionPlan, IcpswapExecutionState, IcpswapManualClientError, IcpswapStep,
+        IcpswapClientError, IcpswapError, IcpswapExecutionPlan, IcpswapExecutionState, IcpswapStep,
         IcpswapUnusedBalance,
     },
 };
 
 fn p(id: u8) -> Principal {
     Principal::from_slice(&[id])
+}
+
+#[test]
+fn pool_subaccount_uses_the_documented_principal_encoding() {
+    let principal = p(4);
+    let bytes = principal.as_slice();
+    let subaccount = principal_to_subaccount(principal);
+
+    assert_eq!(subaccount[0], bytes.len() as u8);
+    assert_eq!(&subaccount[1..=bytes.len()], bytes);
+    assert!(subaccount[bytes.len() + 1..].iter().all(|byte| *byte == 0));
 }
 
 fn owner() -> Account {
@@ -48,7 +65,6 @@ fn plan() -> IcpswapExecutionPlan {
         ChainTokenAmount::from_raw(token(p(2), "ckUSDC", 5), Nat::from(120_000u64)),
         ChainTokenAmount::from_raw(token(p(2), "ckUSDC", 5), Nat::from(5u64)),
         500,
-        123,
     )
     .expect("plan")
 }
@@ -88,35 +104,32 @@ impl IcpswapExecutionStateStore for Store {
 async fn manual_success_persists_deposit_trade_and_withdraw_boundaries() {
     let store = Arc::new(Store::new());
     let observed = store.clone();
+    let observed_transfer = store.clone();
     let mut client = MockIcpswapManualClient::new();
-    client
-        .expect_manual_allowance()
-        .times(1)
-        .return_once(|_, _, _| Ok(Nat::from(100_010u64)));
-    client.expect_manual_approve().times(0);
+    client.expect_ledger_transfer().times(1).return_once(move |_, args| {
+        let persisted = observed_transfer.state();
+        assert_eq!(persisted.step, IcpswapStep::TransferPending);
+        assert_eq!(args.amount, Nat::from(100_010u64));
+        assert_eq!(args.fee, Some(Nat::from(10u64)));
+        assert_eq!(args.created_at_time, Some(1_000));
+        Ok(Nat::from(77u64))
+    });
 
     let mut unused_sequence = Sequence::new();
-    for value in [
-        unused(0, 0),
-        unused(100_000, 0),
-        unused(100_000, 0),
-        unused(0, 119_000),
-        unused(0, 119_000),
-        unused(0, 0),
-    ] {
+    for value in [unused(0, 0), unused(100_000, 0), unused(0, 119_000), unused(0, 0)] {
         client
-            .expect_manual_unused_balance()
+            .expect_unused_balance()
             .times(1)
             .in_sequence(&mut unused_sequence)
             .return_once(move |_, _| Ok(value));
     }
-    client.expect_deposit_from().times(1).return_once(move |_, args| {
+    client.expect_deposit().times(1).return_once(move |_, args| {
         let persisted = observed.state();
         assert_eq!(persisted.step, IcpswapStep::DepositPending);
         assert_eq!(args.amount, Nat::from(100_000u64));
         Ok(args.amount.clone())
     });
-    client.expect_swap_manual().times(1).return_once(|_, args| {
+    client.expect_swap().times(1).return_once(|_, args| {
         assert_eq!(args.amount_out_minimum, "118500");
         Ok(Nat::from(119_000u64))
     });
@@ -131,26 +144,177 @@ async fn manual_success_persists_deposit_trade_and_withdraw_boundaries() {
         .times(1)
         .in_sequence(&mut balance_sequence)
         .return_once(|_, _| Ok(Nat::from(119_005u64)));
-    client.expect_withdraw_manual().times(1).return_once(|_, args| {
+    client.expect_withdraw().times(1).return_once(|_, args| {
         assert_eq!(args.amount, Nat::from(119_000u64));
         assert_eq!(args.fee, Nat::from(5u64));
         Ok(args.amount.clone())
     });
-    client.expect_quote_manual().times(0);
+    client.expect_requote().times(0);
 
     let first = advance_manual(&client, store.as_ref(), "run-1", owner(), 1_000)
         .await
-        .expect("deposit");
-    assert_eq!(first.step, IcpswapStep::Trade);
+        .expect("transfer");
+    assert_eq!(first.step, IcpswapStep::Deposit);
     let second = advance_manual(&client, store.as_ref(), "run-1", owner(), 2_000)
         .await
-        .expect("trade");
-    assert_eq!(second.step, IcpswapStep::Withdraw);
+        .expect("deposit");
+    assert_eq!(second.step, IcpswapStep::Trade);
     let third = advance_manual(&client, store.as_ref(), "run-1", owner(), 3_000)
         .await
+        .expect("trade");
+    assert_eq!(third.step, IcpswapStep::Withdraw);
+    assert_eq!(third.trade.gross_output_amount, Some(Nat::from(119_000u64)));
+    let fourth = advance_manual(&client, store.as_ref(), "run-1", owner(), 4_000)
+        .await
         .expect("withdraw");
-    assert_eq!(third.step, IcpswapStep::Completed);
-    assert_eq!(third.withdraw.wallet_credited_amount, Some(Nat::from(118_995u64)));
+    assert_eq!(fourth.step, IcpswapStep::Completed);
+    assert_eq!(fourth.withdraw.wallet_credited_amount, Some(Nat::from(118_995u64)));
+}
+
+#[tokio::test]
+async fn ambiguous_transfer_resume_reuses_the_persisted_deduplication_arguments() {
+    let store = Arc::new(Store::new());
+    let first_args = Arc::new(Mutex::new(None::<TransferArg>));
+    let mut client = MockIcpswapManualClient::new();
+
+    let mut transfer_sequence = Sequence::new();
+    let captured = first_args.clone();
+    client
+        .expect_ledger_transfer()
+        .times(1)
+        .in_sequence(&mut transfer_sequence)
+        .return_once(move |ledger, args| {
+            assert_eq!(ledger, p(1));
+            *captured.lock().unwrap() = Some(args);
+            Err(IcpswapClientError::LedgerTransfer {
+                ledger,
+                message: "response lost".to_string(),
+            })
+        });
+    let expected = first_args.clone();
+    client
+        .expect_ledger_transfer()
+        .times(1)
+        .in_sequence(&mut transfer_sequence)
+        .return_once(move |_, args| {
+            assert_eq!(Some(args), *expected.lock().unwrap());
+            Ok(Nat::from(88u64))
+        });
+
+    advance_manual(&client, store.as_ref(), "run-1", owner(), 1_000)
+        .await
+        .expect_err("first transfer response is ambiguous");
+    assert_eq!(store.state().step, IcpswapStep::TransferPending);
+
+    let resumed = advance_manual(&client, store.as_ref(), "run-1", owner(), 9_000)
+        .await
+        .expect("deduplicated transfer retry");
+    assert_eq!(resumed.step, IcpswapStep::Deposit);
+    assert_eq!(resumed.transfer.block_index, Some(Nat::from(88u64)));
+    assert_eq!(resumed.transfer.args.unwrap().created_at_time, Some(1_000));
+}
+
+#[tokio::test]
+async fn ambiguous_deposit_requires_operator_without_replaying() {
+    let store = Arc::new(Store::new());
+    {
+        let mut state = store.0.lock().unwrap();
+        state.step = IcpswapStep::Deposit;
+        state.transfer.block_index = Some(Nat::from(77u64));
+    }
+
+    let mut client = MockIcpswapManualClient::new();
+    let mut unused_sequence = Sequence::new();
+    for value in [unused(0, 0), unused(0, 0)] {
+        client
+            .expect_unused_balance()
+            .times(1)
+            .in_sequence(&mut unused_sequence)
+            .return_once(move |_, _| Ok(value));
+    }
+    client.expect_deposit().times(1).return_once(|pool, _| {
+        Err(IcpswapClientError::SubmissionUnknown {
+            pool,
+            method: "deposit",
+            message: "response lost".to_string(),
+        })
+    });
+    advance_manual(&client, store.as_ref(), "run-1", owner(), 2_000)
+        .await
+        .expect_err("first deposit response is ambiguous");
+    assert_eq!(store.state().step, IcpswapStep::OperatorRequired);
+}
+
+#[tokio::test]
+async fn confirmed_deposit_advances_without_an_extra_balance_query() {
+    let store = Arc::new(Store::new());
+    store.0.lock().unwrap().step = IcpswapStep::Deposit;
+
+    let mut client = MockIcpswapManualClient::new();
+    client
+        .expect_unused_balance()
+        .times(1)
+        .return_once(|_, _| Ok(unused(0, 0)));
+    client
+        .expect_deposit()
+        .times(1)
+        .return_once(|_, args| Ok(args.amount.clone()));
+
+    let confirmed = advance_manual(&client, store.as_ref(), "run-1", owner(), 2_000)
+        .await
+        .expect("confirmed deposit");
+    assert_eq!(confirmed.step, IcpswapStep::Trade);
+}
+
+#[tokio::test]
+async fn pre_submission_swap_error_does_not_consume_retry_or_widen_slippage() {
+    let store = Arc::new(Store::new());
+    store.0.lock().unwrap().step = IcpswapStep::Trade;
+
+    let mut client = MockIcpswapManualClient::new();
+    client
+        .expect_unused_balance()
+        .times(1)
+        .return_once(|_, _| Ok(unused(100_000, 0)));
+    client.expect_swap().times(1).return_once(|_, _| {
+        Err(IcpswapClientError::Encode {
+            method: "swap",
+            message: "invalid arguments".to_string(),
+        })
+    });
+    client.expect_requote().times(0);
+
+    advance_manual(&client, store.as_ref(), "run-1", owner(), 1_000)
+        .await
+        .expect_err("encoding failure");
+    let state = store.state();
+    assert_eq!(state.step, IcpswapStep::Trade);
+    assert_eq!(state.trade.retry_evaluation_count, 0);
+    assert_eq!(state.trade.slippage_retry_count, 0);
+    assert_eq!(state.trade.pending_since_nanos, None);
+}
+
+#[tokio::test]
+async fn decoded_swap_success_advances_without_a_reconciliation_query() {
+    let store = Arc::new(Store::new());
+    store.0.lock().unwrap().step = IcpswapStep::Trade;
+
+    let mut client = MockIcpswapManualClient::new();
+    client
+        .expect_unused_balance()
+        .times(1)
+        .return_once(|_, _| Ok(unused(100_000, 0)));
+    client
+        .expect_swap()
+        .times(1)
+        .return_once(|_, _| Ok(Nat::from(119_000u64)));
+    client.expect_requote().times(0);
+
+    let state = advance_manual(&client, store.as_ref(), "run-1", owner(), 1_000)
+        .await
+        .expect("decoded swap success");
+    assert_eq!(state.step, IcpswapStep::Withdraw);
+    assert_eq!(state.trade.gross_output_amount, Some(Nat::from(119_000u64)));
 }
 
 #[tokio::test]
@@ -161,32 +325,27 @@ async fn confirmed_slippage_requotes_and_retries_without_crossing_original_floor
     }
     let mut client = MockIcpswapManualClient::new();
     let mut unused_sequence = Sequence::new();
-    for value in [
-        unused(100_000, 0),
-        unused(100_000, 0),
-        unused(100_000, 0),
-        unused(0, 116_000),
-    ] {
+    for value in [unused(100_000, 0), unused(100_000, 0), unused(100_000, 0)] {
         client
-            .expect_manual_unused_balance()
+            .expect_unused_balance()
             .times(1)
             .in_sequence(&mut unused_sequence)
             .return_once(move |_, _| Ok(value));
     }
     let mut swap_sequence = Sequence::new();
     client
-        .expect_swap_manual()
+        .expect_swap()
         .times(1)
         .in_sequence(&mut swap_sequence)
         .return_once(|_, args| {
             assert_eq!(args.amount_out_minimum, "118500");
-            Err(IcpswapManualClientError::Protocol {
+            Err(IcpswapClientError::Protocol {
                 method: "swap",
                 error: IcpswapError::InternalError("slippage check failed".to_string()),
             })
         });
     client
-        .expect_swap_manual()
+        .expect_swap()
         .times(1)
         .in_sequence(&mut swap_sequence)
         .return_once(|_, args| {
@@ -194,7 +353,7 @@ async fn confirmed_slippage_requotes_and_retries_without_crossing_original_floor
             Ok(Nat::from(116_000u64))
         });
     client
-        .expect_quote_manual()
+        .expect_requote()
         .times(1)
         .return_once(|_, _| Ok(Nat::from(118_000u64)));
 
@@ -204,7 +363,8 @@ async fn confirmed_slippage_requotes_and_retries_without_crossing_original_floor
     assert!(error.contains("slippage"));
     let after_failure = store.state();
     let trade = &after_failure.trade;
-    assert_eq!(trade.retry_count, 1);
+    assert_eq!(trade.retry_evaluation_count, 1);
+    assert_eq!(trade.slippage_retry_count, 1);
     assert_eq!(trade.next_retry_at_nanos, Some(2_000_001_000));
 
     let waiting = advance_manual(&client, store.as_ref(), "run-1", owner(), 2_000_000_000)
@@ -216,7 +376,7 @@ async fn confirmed_slippage_requotes_and_retries_without_crossing_original_floor
         .await
         .expect("retry");
     assert_eq!(retried.step, IcpswapStep::Withdraw);
-    assert!(retried.trade.current_amount_out_minimum.value >= retried.trade.original_hard_minimum_out.value);
+    assert!(retried.trade.current_amount_out_minimum.value >= retried.plan.amount_out_minimum.value);
 }
 
 #[tokio::test]
@@ -228,35 +388,33 @@ async fn decoded_slippage_survives_an_immediate_reconciliation_query_failure() {
     let mut client = MockIcpswapManualClient::new();
     let mut unused_sequence = Sequence::new();
     client
-        .expect_manual_unused_balance()
+        .expect_unused_balance()
         .times(1)
         .in_sequence(&mut unused_sequence)
         .return_once(|_, _| Ok(unused(100_000, 0)));
     client
-        .expect_manual_unused_balance()
+        .expect_unused_balance()
         .times(1)
         .in_sequence(&mut unused_sequence)
         .return_once(|pool, _| {
-            Err(IcpswapManualClientError::Query {
-                pool,
+            Err(IcpswapClientError::Transport {
+                canister: pool,
                 method: "getUserUnusedBalance",
                 message: "temporarily unavailable".to_string(),
             })
         });
-    for value in [unused(100_000, 0), unused(100_000, 0)] {
-        client
-            .expect_manual_unused_balance()
-            .times(1)
-            .in_sequence(&mut unused_sequence)
-            .return_once(move |_, _| Ok(value));
-    }
-    client.expect_swap_manual().times(1).return_once(|_, _| {
-        Err(IcpswapManualClientError::Protocol {
+    client
+        .expect_unused_balance()
+        .times(1)
+        .in_sequence(&mut unused_sequence)
+        .return_once(|_, _| Ok(unused(100_000, 0)));
+    client.expect_swap().times(1).return_once(|_, _| {
+        Err(IcpswapClientError::Protocol {
             method: "swap",
             error: IcpswapError::InternalError("slippage check failed".to_string()),
         })
     });
-    client.expect_quote_manual().times(0);
+    client.expect_requote().times(0);
 
     advance_manual(&client, store.as_ref(), "run-1", owner(), 1_000)
         .await
@@ -269,42 +427,175 @@ async fn decoded_slippage_survives_an_immediate_reconciliation_query_failure() {
         .await
         .expect("resume decoded error");
     assert_eq!(resumed.step, IcpswapStep::Trade);
-    assert_eq!(resumed.trade.retry_count, 1);
+    assert_eq!(resumed.trade.retry_evaluation_count, 1);
+    assert_eq!(resumed.trade.slippage_retry_count, 1);
 }
 
 #[tokio::test]
-async fn ambiguous_swap_enters_operator_required_and_resume_never_resubmits() {
+async fn ambiguous_swap_is_reconciled_then_requoted_without_widening_slippage() {
     let store = Arc::new(Store::new());
     {
         store.0.lock().unwrap().step = IcpswapStep::Trade;
     }
     let mut client = MockIcpswapManualClient::new();
     let mut unused_sequence = Sequence::new();
-    for value in [unused(100_000, 0), unused(100_000, 0), unused(100_000, 0)] {
+    for value in [
+        unused(100_000, 0),
+        unused(100_000, 0),
+        unused(100_000, 0),
+        unused(100_000, 0),
+        unused(100_000, 0),
+    ] {
         client
-            .expect_manual_unused_balance()
+            .expect_unused_balance()
             .times(1)
             .in_sequence(&mut unused_sequence)
             .return_once(move |_, _| Ok(value));
     }
-    client.expect_swap_manual().times(1).return_once(|_, _| {
-        Err(IcpswapManualClientError::SubmissionUnknown {
+    let mut swap_sequence = Sequence::new();
+    client
+        .expect_swap()
+        .times(1)
+        .in_sequence(&mut swap_sequence)
+        .return_once(|_, _| {
+            Err(IcpswapClientError::SubmissionUnknown {
+                pool: p(9),
+                method: "swap",
+                message: "timeout".to_string(),
+            })
+        });
+    client
+        .expect_swap()
+        .times(1)
+        .in_sequence(&mut swap_sequence)
+        .return_once(|_, args| {
+            assert_eq!(args.amount_out_minimum, "116525");
+            Ok(Nat::from(117_000u64))
+        });
+    client
+        .expect_requote()
+        .times(1)
+        .return_once(|_, _| Ok(Nat::from(118_000u64)));
+
+    advance_manual(&client, store.as_ref(), "run-1", owner(), 1_000)
+        .await
+        .expect_err("ambiguous");
+    assert_eq!(store.state().step, IcpswapStep::TradePending);
+
+    let waiting = advance_manual(&client, store.as_ref(), "run-1", owner(), 2_000)
+        .await
+        .expect("read-only reconciliation");
+    assert_eq!(waiting.step, IcpswapStep::TradePending);
+
+    let timeout_at = 1_000 + PENDING_TRADE_RECONCILIATION_TIMEOUT_NANOS;
+    let scheduled = advance_manual(&client, store.as_ref(), "run-1", owner(), timeout_at)
+        .await
+        .expect("schedule retry");
+    assert_eq!(scheduled.step, IcpswapStep::Trade);
+    assert_eq!(scheduled.trade.retry_evaluation_count, 1);
+    assert_eq!(scheduled.trade.slippage_retry_count, 0);
+
+    let retried = advance_manual(&client, store.as_ref(), "run-1", owner(), timeout_at + 2_000_000_000)
+        .await
+        .expect("same-slippage retry");
+    assert_eq!(retried.step, IcpswapStep::Withdraw);
+}
+
+#[tokio::test]
+async fn ambiguous_swap_with_enough_input_for_two_trades_requires_operator() {
+    let store = Arc::new(Store::new());
+    store.0.lock().unwrap().step = IcpswapStep::Trade;
+    let mut client = MockIcpswapManualClient::new();
+    for value in [unused(200_000, 0), unused(200_000, 0), unused(200_000, 0)] {
+        client
+            .expect_unused_balance()
+            .times(1)
+            .return_once(move |_, _| Ok(value));
+    }
+    client.expect_swap().times(1).return_once(|_, _| {
+        Err(IcpswapClientError::SubmissionUnknown {
             pool: p(9),
             method: "swap",
             message: "timeout".to_string(),
         })
     });
-    client.expect_quote_manual().times(0);
+    client.expect_requote().times(0);
 
     advance_manual(&client, store.as_ref(), "run-1", owner(), 1_000)
         .await
         .expect_err("ambiguous");
-    assert_eq!(store.state().step, IcpswapStep::OperatorRequired);
-
-    let resumed = advance_manual(&client, store.as_ref(), "run-1", owner(), 2_000)
+    let timeout_at = 1_000 + PENDING_TRADE_RECONCILIATION_TIMEOUT_NANOS;
+    let result = advance_manual(&client, store.as_ref(), "run-1", owner(), timeout_at)
         .await
-        .expect("read-only reconcile");
-    assert_eq!(resumed.step, IcpswapStep::OperatorRequired);
+        .expect("operator transition");
+    assert_eq!(result.step, IcpswapStep::OperatorRequired);
+    assert!(result.last_error.unwrap().contains("multiple swaps"));
+}
+
+#[tokio::test]
+async fn partial_trade_balance_deltas_require_operator_after_timeout() {
+    let store = Arc::new(Store::new());
+    store.0.lock().unwrap().step = IcpswapStep::Trade;
+    let mut client = MockIcpswapManualClient::new();
+    let mut unused_sequence = Sequence::new();
+    for value in [unused(100_000, 0), unused(50_000, 50_000), unused(50_000, 50_000)] {
+        client
+            .expect_unused_balance()
+            .times(1)
+            .in_sequence(&mut unused_sequence)
+            .return_once(move |_, _| Ok(value));
+    }
+    client.expect_swap().times(1).return_once(|_, _| {
+        Err(IcpswapClientError::SubmissionUnknown {
+            pool: p(9),
+            method: "swap",
+            message: "timeout".to_string(),
+        })
+    });
+
+    advance_manual(&client, store.as_ref(), "run-1", owner(), 1_000)
+        .await
+        .expect_err("ambiguous");
+    assert_eq!(store.state().step, IcpswapStep::TradePending);
+
+    let timeout_at = 1_000 + PENDING_TRADE_RECONCILIATION_TIMEOUT_NANOS;
+    let result = advance_manual(&client, store.as_ref(), "run-1", owner(), timeout_at)
+        .await
+        .expect("operator transition");
+    assert_eq!(result.step, IcpswapStep::OperatorRequired);
+    assert!(result.last_error.unwrap().contains("inconsistent"));
+}
+
+#[tokio::test]
+async fn ambiguous_swap_that_settles_is_never_resubmitted() {
+    let store = Arc::new(Store::new());
+    store.0.lock().unwrap().step = IcpswapStep::Trade;
+    let mut client = MockIcpswapManualClient::new();
+    let mut unused_sequence = Sequence::new();
+    for value in [unused(100_000, 0), unused(100_000, 0), unused(0, 119_000)] {
+        client
+            .expect_unused_balance()
+            .times(1)
+            .in_sequence(&mut unused_sequence)
+            .return_once(move |_, _| Ok(value));
+    }
+    client.expect_swap().times(1).return_once(|_, _| {
+        Err(IcpswapClientError::SubmissionUnknown {
+            pool: p(9),
+            method: "swap",
+            message: "timeout".to_string(),
+        })
+    });
+    client.expect_requote().times(0);
+
+    advance_manual(&client, store.as_ref(), "run-1", owner(), 1_000)
+        .await
+        .expect_err("ambiguous");
+    let result = advance_manual(&client, store.as_ref(), "run-1", owner(), 2_000)
+        .await
+        .expect("settlement reconciliation");
+    assert_eq!(result.step, IcpswapStep::Withdraw);
+    assert_eq!(result.trade.gross_output_amount, Some(Nat::from(119_000u64)));
 }
 
 #[tokio::test]
@@ -317,13 +608,13 @@ async fn non_slippage_swap_failure_withdraws_icp_back_to_owner() {
     let mut unused_sequence = Sequence::new();
     for value in [unused(100_000, 0), unused(100_000, 0), unused(100_000, 0), unused(0, 0)] {
         client
-            .expect_manual_unused_balance()
+            .expect_unused_balance()
             .times(1)
             .in_sequence(&mut unused_sequence)
             .return_once(move |_, _| Ok(value));
     }
-    client.expect_swap_manual().times(1).return_once(|_, _| {
-        Err(IcpswapManualClientError::Protocol {
+    client.expect_swap().times(1).return_once(|_, _| {
+        Err(IcpswapClientError::Protocol {
             method: "swap",
             error: IcpswapError::InternalError("pool temporarily unavailable".to_string()),
         })
@@ -340,10 +631,10 @@ async fn non_slippage_swap_failure_withdraws_icp_back_to_owner() {
         .in_sequence(&mut balance_sequence)
         .return_once(|_, _| Ok(Nat::from(99_990u64)));
     client
-        .expect_withdraw_manual()
+        .expect_withdraw()
         .times(1)
         .return_once(|_, args| Ok(args.amount.clone()));
-    client.expect_quote_manual().times(0);
+    client.expect_requote().times(0);
 
     advance_manual(&client, store.as_ref(), "run-1", owner(), 1_000)
         .await
@@ -363,20 +654,21 @@ async fn third_retry_quote_below_hard_floor_moves_to_recovery_without_submission
     {
         let mut state = store.0.lock().unwrap();
         state.step = IcpswapStep::Trade;
-        state.trade.retry_count = 3;
+        state.trade.retry_evaluation_count = 3;
     }
     let mut client = MockIcpswapManualClient::new();
     client
-        .expect_quote_manual()
+        .expect_requote()
         .times(1)
         .return_once(|_, _| Ok(Nat::from(113_999u64)));
-    client.expect_manual_unused_balance().times(0);
-    client.expect_swap_manual().times(0);
+    client.expect_unused_balance().times(0);
+    client.expect_swap().times(0);
 
     let result = advance_manual(&client, store.as_ref(), "run-1", owner(), 10_000)
         .await
         .expect("quote evaluation");
     assert_eq!(result.step, IcpswapStep::Recover);
+    assert_eq!(result.trade.slippage_retry_count, 0);
 }
 
 #[test]
@@ -406,8 +698,47 @@ fn legacy_one_step_records_are_rejected() {
 }
 
 #[test]
+fn incompatible_state_versions_are_rejected_instead_of_silently_migrated() {
+    let state = IcpswapExecutionState::prepare("run-1", plan(), owner());
+    let mut json = serde_json::to_value(state).unwrap();
+    json.as_object_mut().unwrap().remove("schema_version");
+
+    assert!(serde_json::from_value::<IcpswapExecutionState>(json).is_err());
+}
+
+#[tokio::test]
+async fn unsupported_state_version_is_rejected_before_any_external_call() {
+    let store = Arc::new(Store::new());
+    store.0.lock().unwrap().schema_version += 1;
+    let client = MockIcpswapManualClient::new();
+
+    let error = advance_manual(&client, store.as_ref(), "run-1", owner(), 1_000)
+        .await
+        .expect_err("version mismatch");
+
+    assert!(error.contains("unsupported ICPSwap state version"));
+}
+
+#[tokio::test]
+async fn non_default_owner_is_rejected_before_any_external_call() {
+    let store = Arc::new(Store::new());
+    let client = MockIcpswapManualClient::new();
+    let configured_owner = Account {
+        owner: owner().owner,
+        subaccount: Some([7; 32]),
+    };
+
+    let error = advance_manual(&client, store.as_ref(), "run-1", configured_owner, 1_000)
+        .await
+        .expect_err("non-default owner");
+
+    assert!(error.contains("default ledger account"));
+}
+
+#[test]
 fn flattened_manual_state_uses_unique_step_prefixed_wire_fields() {
     let mut state = IcpswapExecutionState::prepare("run-1", plan(), owner());
+    state.transfer.block_index = Some(Nat::from(5u8));
     state.deposit.input_pool_balance_before = Some(Nat::from(11u8));
     state.trade.input_pool_balance_before = Some(Nat::from(22u8));
     state.withdraw.pool_balance_before = Some(Nat::from(33u8));
@@ -415,6 +746,10 @@ fn flattened_manual_state_uses_unique_step_prefixed_wire_fields() {
 
     let json = serde_json::to_value(&state).unwrap();
     let state_json = json.as_object().unwrap();
+    assert_eq!(
+        state_json["transfer_block_index"],
+        serde_json::to_value(Nat::from(5u8)).unwrap()
+    );
     assert_eq!(
         state_json["deposit_input_pool_balance_before"],
         serde_json::to_value(Nat::from(11u8)).unwrap()
@@ -434,4 +769,18 @@ fn flattened_manual_state_uses_unique_step_prefixed_wire_fields() {
 
     let decoded: IcpswapExecutionState = serde_json::from_value(json).unwrap();
     assert_eq!(decoded, state);
+}
+
+#[test]
+fn persisted_gross_output_accepts_the_previous_wire_field_name() {
+    let mut state = IcpswapExecutionState::prepare("run-1", plan(), owner());
+    state.trade.gross_output_amount = Some(Nat::from(119_000u64));
+
+    let mut json = serde_json::to_value(&state).unwrap();
+    let fields = json.as_object_mut().unwrap();
+    let gross = fields.remove("trade_gross_output_amount").unwrap();
+    fields.insert("trade_swap_returned_amount".to_string(), gross);
+
+    let decoded: IcpswapExecutionState = serde_json::from_value(json).unwrap();
+    assert_eq!(decoded.trade.gross_output_amount, Some(Nat::from(119_000u64)));
 }
