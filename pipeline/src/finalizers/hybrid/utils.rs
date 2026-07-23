@@ -118,7 +118,10 @@ pub(crate) fn should_force_cex_over_threshold(
 pub(crate) fn choose_best_route(dex: Option<RouteCandidate>, cex: Option<RouteCandidate>) -> Option<RouteCandidate> {
     match (dex, cex) {
         (Some(dex), Some(cex)) => {
-            if cex.net_edge_bps > dex.net_edge_bps {
+            // `total_cmp` rather than `>`: a NaN would make every comparison
+            // false and silently hand the trade to DEX. Inputs are finite today,
+            // but this is the decision that picks where the money goes.
+            if cex.net_edge_bps.total_cmp(&dex.net_edge_bps).is_gt() {
                 Some(cex)
             } else {
                 Some(dex)

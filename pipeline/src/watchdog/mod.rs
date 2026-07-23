@@ -100,15 +100,31 @@ impl WebhookWatchdog {
         }
     }
 
-    async fn reserve_for_send(&self, key: &str) -> Option<Instant> {
+    /// Claims the cooldown slot for `key`, returning the timestamp it displaced
+    /// so a failed send can put it back. Reserving up front keeps the check and
+    /// the claim atomic under one lock; [`Self::release_reservation`] undoes it
+    /// when the send fails, so a dropped alert is retried on the next attempt
+    /// rather than silently consuming the whole cooldown window.
+    async fn reserve_for_send(&self, key: &str) -> Option<Option<Instant>> {
         let mut m = self.last.lock().await;
         let now = Instant::now();
         m.retain(|_, ts| now.duration_since(*ts) < self.cooldown);
         if matches!(m.get(key), Some(&t) if now.duration_since(t) < self.cooldown) {
             return None;
         }
-        m.insert(key.to_string(), now);
-        Some(now)
+        Some(m.insert(key.to_string(), now))
+    }
+
+    async fn release_reservation(&self, key: &str, displaced: Option<Instant>) {
+        let mut m = self.last.lock().await;
+        match displaced {
+            Some(previous) => {
+                m.insert(key.to_string(), previous);
+            }
+            None => {
+                m.remove(key);
+            }
+        }
     }
 }
 
@@ -133,7 +149,7 @@ impl Watchdog for WebhookWatchdog {
                 format!("liquidation_finalized:{liquidation_id}:{status}")
             }
         };
-        let Some(_reserved_at) = self.reserve_for_send(&key).await else {
+        let Some(displaced) = self.reserve_for_send(&key).await else {
             return;
         };
 
@@ -143,8 +159,10 @@ impl Watchdog for WebhookWatchdog {
             "event": ev,
         });
 
-        match self.client.post(&self.url).json(&payload).send().await {
-            Ok(resp) if resp.status().is_success() => {}
+        // `WATCHDOG_WEBHOOK` commonly embeds a secret token in its path, so the
+        // URL is never logged -- only the event key and the failure itself.
+        let delivered = match self.client.post(&self.url).json(&payload).send().await {
+            Ok(resp) if resp.status().is_success() => true,
             Ok(resp) => {
                 let status = resp.status();
                 let body = resp
@@ -153,20 +171,23 @@ impl Watchdog for WebhookWatchdog {
                     .unwrap_or_else(|err| format!("<failed to read response body: {err}>"));
                 tracing::error!(
                     key = %key,
-                    url = %self.url,
                     status = %status,
                     body = %body,
                     "Webhook notification failed with non-success status"
                 );
+                false
             }
             Err(err) => {
-                tracing::error!(
-                    key = %key,
-                    url = %self.url,
-                    error = %err,
-                    "Webhook notification transport failed"
-                );
+                tracing::error!(key = %key, error = %err, "Webhook notification transport failed");
+                false
             }
+        };
+
+        // An undelivered alert must not burn its cooldown: callers re-notify while
+        // a condition persists, and swallowing the failure here is what turns a
+        // stuck execution into one nobody is ever told about.
+        if !delivered {
+            self.release_reservation(&key, displaced).await;
         }
     }
 }
@@ -210,6 +231,35 @@ mod tests {
 
         assert!(wd.reserve_for_send("hb:Running").await.is_some());
         assert!(wd.reserve_for_send("hb:Running").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn webhook_watchdog_undelivered_alert_does_not_burn_its_cooldown() {
+        // Port 0 is never connectable, so `send()` fails at the transport layer.
+        let wd = WebhookWatchdog::new("http://127.0.0.1:0/webhook", Duration::from_secs(60), None);
+
+        wd.notify(WatchdogEvent::Heartbeat { stage: "Running" }).await;
+
+        // A consumed cooldown here would mean the next hour of alerts is silently
+        // dropped because one POST failed -- the failure mode F3 describes.
+        assert!(
+            wd.reserve_for_send("hb:Running").await.is_some(),
+            "a failed send must leave the cooldown slot free to retry"
+        );
+    }
+
+    #[tokio::test]
+    async fn webhook_watchdog_release_restores_a_displaced_reservation() {
+        let wd = WebhookWatchdog::new("http://localhost/webhook", Duration::from_secs(60), None);
+
+        let first = wd.reserve_for_send("hb:Running").await.expect("first reservation");
+        assert!(first.is_none(), "nothing displaced on a fresh key");
+        wd.release_reservation("hb:Running", first).await;
+
+        assert!(
+            wd.reserve_for_send("hb:Running").await.is_some(),
+            "releasing a fresh reservation must clear the key entirely"
+        );
     }
 
     #[test]

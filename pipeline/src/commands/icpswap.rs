@@ -136,6 +136,24 @@ impl CliOwnerLock {
     }
 }
 
+/// Reports a run's final outcome and frees the owner slot.
+///
+/// Every terminal step goes through here, `Failed` included: the lock is
+/// deliberately persistent across restarts so `--resume` can re-acquire it, so
+/// release has to be driven by reaching a terminal state rather than by scope
+/// (which is also why `CliOwnerLock` has no `Drop`). Releasing before the
+/// outcome is reported keeps a formatting failure from stranding the lock, and
+/// a release error is only warned about -- leaving a stale file behind is far
+/// better than reporting a completed swap as a failed command.
+fn finish_terminal(owner_lock: &CliOwnerLock, outcome: Result<String, String>) -> Result<(), String> {
+    if let Err(error) = owner_lock.release() {
+        eprintln!("warning: {error}");
+    }
+    let message = outcome?;
+    println!("{message}");
+    Ok(())
+}
+
 impl FileStateStore {
     fn new(path: PathBuf, run_id: String, endpoint: String, owner: Account) -> Self {
         Self {
@@ -372,13 +390,16 @@ async fn drive_to_terminal(
                         .withdraw
                         .wallet_credited_amount
                         .as_ref()
-                        .ok_or_else(|| "completed swap has no confirmed wallet credit".to_string())?;
-                    println!(
-                        "ICPSwap completed: received {} ckUSDC in the liquidator account.",
-                        format_units(credited, state.plan.net_expected_output().token.decimals())
+                        .map(|amount| format_units(amount, state.plan.net_expected_output().token.decimals()));
+                    return finish_terminal(
+                        owner_lock,
+                        match credited {
+                            Some(credited) => Ok(format!(
+                                "ICPSwap completed: received {credited} ckUSDC in the liquidator account."
+                            )),
+                            None => Err(format!("run {run_id} completed without a confirmed wallet credit")),
+                        },
                     );
-                    owner_lock.release()?;
-                    return Ok(());
                 }
                 IcpswapStep::Refunded => {
                     let credited = state
@@ -387,9 +408,12 @@ async fn drive_to_terminal(
                         .as_ref()
                         .map(|amount| format_units(amount, state.plan.amount_in.token.decimals()))
                         .unwrap_or_else(|| "unknown".to_string());
-                    println!("ICPSwap failed, but {credited} ICP was confirmed returned to the liquidator account.");
-                    owner_lock.release()?;
-                    return Ok(());
+                    return finish_terminal(
+                        owner_lock,
+                        Ok(format!(
+                            "ICPSwap failed, but {credited} ICP was confirmed returned to the liquidator account."
+                        )),
+                    );
                 }
                 IcpswapStep::OperatorRequired => {
                     // Run one read-only reconciliation pass below. If it
@@ -397,10 +421,13 @@ async fn drive_to_terminal(
                     // replaying the pending update.
                 }
                 IcpswapStep::Failed => {
-                    return Err(format!(
-                        "run {run_id} reached a terminal failure: {}",
-                        state.last_error.as_deref().unwrap_or("unknown error")
-                    ));
+                    return finish_terminal(
+                        owner_lock,
+                        Err(format!(
+                            "run {run_id} reached a terminal failure: {}",
+                            state.last_error.as_deref().unwrap_or("unknown error")
+                        )),
+                    );
                 }
                 _ => {}
             }
@@ -420,8 +447,17 @@ async fn drive_to_terminal(
             workflow.advance_loaded(store, run_id, owner, now, state).await
         };
 
+        // Bound the call itself, not just the gap between iterations: the deadline
+        // check at the top of the loop cannot fire while a stalled IC call is
+        // in flight, leaving Ctrl-C as the only way out.
+        let advance = tokio::time::timeout(deadline.saturating_duration_since(Instant::now()), advance);
+
         tokio::select! {
             result = advance => {
+                let Ok(result) = result else {
+                    print_resume(run_id, "Timed out while waiting for a terminal result.");
+                    return Err(format!("run {run_id} remains resumable"));
+                };
                 match result {
                     Ok(state) => {
                         println!("ICPSwap run {run_id}: step {:?}", state.step);

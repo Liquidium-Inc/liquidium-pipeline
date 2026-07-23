@@ -189,6 +189,14 @@ pub struct IcpswapState {
     pub operator_pending_step: Option<IcpswapStep>,
     #[serde(default)]
     pub last_error: Option<String>,
+    /// Earliest time the finalizer may advance this execution again.
+    ///
+    /// A non-terminal step that errors re-enqueues the row without consuming the
+    /// finalize stage's retry budget, so nothing else paces it -- the exponential
+    /// backoff there only gates `FailedRetryable`. Without this, a persistently
+    /// failing step re-runs every daemon cycle indefinitely.
+    #[serde(default)]
+    pub next_attempt_at_nanos: Option<u64>,
     pub plan: IcpswapExecutionPlan,
     #[serde(flatten)]
     pub transfer: IcpswapTransferState,

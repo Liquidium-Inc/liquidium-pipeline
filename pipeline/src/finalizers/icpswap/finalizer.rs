@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use icrc_ledger_types::icrc1::account::Account;
+use tracing::{debug, warn};
 
 use crate::{
     finalizers::dex_finalizer::{DexRouteFinalizer, DexRoutePreview},
@@ -24,7 +25,25 @@ use crate::{
 
 pub(crate) const ICPSWAP_FINALIZER_PERMANENT_PREFIX: &str = "permanent ICPSwap finalizer: ";
 
+/// Cooldown applied after a non-terminal step fails.
+///
+/// Such a failure re-enqueues the row without consuming the finalize stage's
+/// retry budget, so nothing else paces it -- the exponential backoff there only
+/// gates `FailedRetryable`. Roughly one order of magnitude above the daemon
+/// cycle, so a persistently failing step backs off instead of re-running every
+/// two seconds, while a transient blip still recovers promptly.
+const RETRY_COOLDOWN_NANOS: u64 = 20 * 1_000_000_000;
+
 type Clock = dyn Fn() -> u64 + Send + Sync;
+
+/// Terminal steps own the per-owner lock release: the execution is over, so the
+/// slot must be freed whether it ended in success, refund, or failure.
+fn is_terminal_step(step: IcpswapStep) -> bool {
+    matches!(
+        step,
+        IcpswapStep::Completed | IcpswapStep::Refunded | IcpswapStep::Failed
+    )
+}
 
 /// WAL-backed finalizer for the manual ICPSwap execution lifecycle.
 pub struct IcpswapFinalizer {
@@ -110,13 +129,28 @@ impl IcpswapFinalizer {
         }
     }
 
-    async fn notify_operator_required(
-        &self,
-        execution_id: &str,
-        previous_step: IcpswapStep,
-        state: &IcpswapExecutionState,
-    ) {
-        if previous_step == IcpswapStep::OperatorRequired || state.step != IcpswapStep::OperatorRequired {
+    /// Frees the per-owner slot once an execution is over. `release` deletes by
+    /// `(owner, execution_id)` so it is idempotent, and a failure is logged
+    /// rather than propagated: surfacing it would mask the execution's real
+    /// outcome, and a completed swap must not be reported as a finalizer error.
+    async fn release_owner_lock(&self, wal: &dyn WalStore, owner_key: &str, liquidation_id: &str) {
+        if let Err(error) = wal.release_icpswap_owner_lock(owner_key, liquidation_id).await {
+            warn!(
+                owner = %owner_key,
+                liquidation_id,
+                %error,
+                "failed releasing ICPSwap owner lock; the venue stays blocked until it is cleared"
+            );
+        }
+    }
+
+    /// Alerts for as long as the execution stays parked, not just on the way in.
+    /// A parked swap holds the owner lock and keeps polling, so it looks healthy
+    /// from the outside; alerting once means a single dropped webhook hides a
+    /// stalled venue indefinitely. The watchdog's cooldown key throttles this
+    /// into a periodic re-escalation.
+    async fn notify_operator_required(&self, execution_id: &str, state: &IcpswapExecutionState) {
+        if state.step != IcpswapStep::OperatorRequired {
             return;
         }
         self.watchdog
@@ -146,9 +180,22 @@ impl Finalizer for IcpswapFinalizer {
 
         let liquidation_id = liq_id_from_receipt(&receipt)?;
         let store = WalIcpswapExecutionStateStore::new(wal);
-        let loaded_state = self.load_state(&store, &liquidation_id).await?;
-        let previous_step = loaded_state.step;
+        let mut loaded_state = self.load_state(&store, &liquidation_id).await?;
         let now_nanos = (self.clock)();
+
+        // Back off after a failed step instead of re-running it every cycle. The
+        // owner lock is deliberately not taken yet: a cooling-down execution
+        // still holds it, and re-acquiring here would be a no-op anyway.
+        if loaded_state
+            .next_attempt_at_nanos
+            .is_some_and(|ready_at| now_nanos < ready_at)
+        {
+            // Escalation is driven by persisted state, not by making progress, so
+            // it must not be throttled by this cooldown -- a parked execution
+            // going quiet is exactly the failure this alert exists to surface.
+            self.notify_operator_required(&liquidation_id, &loaded_state).await;
+            return Ok(FinalizerResult::noop());
+        }
 
         let owner_key = self.trader.owner.to_text();
         if !wal
@@ -156,40 +203,56 @@ impl Finalizer for IcpswapFinalizer {
             .await
             .map_err(|error| format!("failed acquiring ICPSwap owner lock: {error}"))?
         {
-            return Err(format!(
-                "another manual ICPSwap execution is active for owner {}",
-                self.trader.owner
-            ));
+            // Contention, not failure. Returning `Err` here would count toward
+            // the finalize stage's bounded retry budget and permanently fail a
+            // valid liquidation for merely waiting its turn.
+            debug!(
+                owner = %self.trader.owner,
+                liquidation_id, "ICPSwap owner busy; deferring to a later cycle"
+            );
+            return Ok(FinalizerResult::noop());
         }
-        let state = match self
+        // Cleared before advancing, not after, so the workflow's own persist
+        // carries the reset -- a successful step must not inherit the cooldown
+        // left behind by the failure that preceded it.
+        loaded_state.next_attempt_at_nanos = None;
+
+        // One step per call. Each step is an IC update round trip (~seconds of
+        // consensus), and the finalize stage runs inline on the daemon cycle
+        // ahead of the next opportunity scan. Driving further here would delay
+        // claiming -- which is competitive -- by a full round trip per extra
+        // step, so the state machine advances once and resumes next cycle.
+        let (state, advance_error) = match self
             .workflow
             .advance_loaded(&store, &liquidation_id, self.trader, now_nanos, loaded_state)
             .await
         {
-            Ok(state) => state,
+            Ok(state) => (state, None),
             Err(error) => {
                 let mut state = self.load_state(&store, &liquidation_id).await?;
                 state.last_error = Some(error.clone());
-                store.persist(&liquidation_id, &state).await?;
-                self.notify_operator_required(&liquidation_id, previous_step, &state)
-                    .await;
-                if state.step == IcpswapStep::Failed {
-                    return Err(permanent_message(&error));
+                if !is_terminal_step(state.step) {
+                    state.next_attempt_at_nanos = Some(now_nanos.saturating_add(RETRY_COOLDOWN_NANOS));
                 }
-                return Ok(FinalizerResult::noop());
+                store.persist(&liquidation_id, &state).await?;
+                (state, Some(error))
             }
         };
 
-        self.notify_operator_required(&liquidation_id, previous_step, &state)
-            .await;
+        self.notify_operator_required(&liquidation_id, &state).await;
 
-        let result = self.result_for_state(&receipt, &state, now_nanos).await;
-        if matches!(state.step, IcpswapStep::Completed | IcpswapStep::Refunded) {
-            wal.release_icpswap_owner_lock(&owner_key, &liquidation_id)
-                .await
-                .map_err(|error| format!("failed releasing ICPSwap owner lock: {error}"))?;
+        if is_terminal_step(state.step) {
+            self.release_owner_lock(wal, &owner_key, &liquidation_id).await;
         }
-        result
+
+        if let Some(error) = advance_error {
+            if state.step == IcpswapStep::Failed {
+                return Err(permanent_message(&error));
+            }
+            return Ok(FinalizerResult::noop());
+        }
+
+        self.result_for_state(&receipt, &state, now_nanos).await
     }
 
     fn classify_error(&self, error: &str) -> FinalizerErrorKind {
@@ -264,12 +327,11 @@ impl DexRouteFinalizer for IcpswapFinalizer {
             ));
         }
 
-        let mut acquired_owner_lock = false;
         match &wrapper.venue_execution {
             Some(record) if record.is_venue(VENUE_ID) => {
-                let existing = record
-                    .decode::<IcpswapExecutionState>(VENUE_ID)?
-                    .expect("venue was checked above");
+                let existing = record.decode::<IcpswapExecutionState>(VENUE_ID)?.ok_or_else(|| {
+                    format!("ICPSwap execution state for liquidation {liquidation_id} decoded to the wrong venue")
+                })?;
                 if existing.plan != route {
                     return Err(format!(
                         "refusing to replace persisted ICPSwap pool plan for liquidation {liquidation_id}"
@@ -283,42 +345,21 @@ impl DexRouteFinalizer for IcpswapFinalizer {
                 ));
             }
             None => {
-                let owner_key = self.trader.owner.to_text();
-                if !wal
-                    .acquire_icpswap_owner_lock(&owner_key, &liquidation_id)
-                    .await
-                    .map_err(|error| format!("failed acquiring ICPSwap owner lock: {error}"))?
-                {
-                    return Err(format!(
-                        "another manual ICPSwap execution is active for owner {}",
-                        self.trader.owner
-                    ));
-                }
-                acquired_owner_lock = true;
+                // Committing only records this liquidation's own plan in its own
+                // WAL row -- no pool account is touched -- so the owner lock is
+                // left to `finalize`, which is where the IC calls happen. Taking
+                // it here would reserve the venue before any work exists to do,
+                // and turn a routine wait into a finalizer error.
                 let state = self.workflow.prepare(&liquidation_id, route, self.trader);
                 wrapper.venue_execution = Some(VenueExecutionState::new(VENUE_ID, &state)?);
             }
         }
 
         wrapper.finalizer_decision = Some(decision);
-        if let Err(error) = encode_meta(&mut row, &wrapper) {
-            if acquired_owner_lock {
-                let _ = wal
-                    .release_icpswap_owner_lock(&self.trader.owner.to_text(), &liquidation_id)
-                    .await;
-            }
-            return Err(error);
-        }
-        let result = wal
-            .upsert_result(row)
+        encode_meta(&mut row, &wrapper)?;
+        wal.upsert_result(row)
             .await
-            .map_err(|error| format!("WAL ICPSwap route commit failed for {liquidation_id}: {error}"));
-        if result.is_err() && acquired_owner_lock {
-            let _ = wal
-                .release_icpswap_owner_lock(&self.trader.owner.to_text(), &liquidation_id)
-                .await;
-        }
-        result
+            .map_err(|error| format!("WAL ICPSwap route commit failed for {liquidation_id}: {error}"))
     }
 }
 

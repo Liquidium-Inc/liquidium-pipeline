@@ -1,9 +1,11 @@
 use std::collections::HashMap;
+use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use candid::{Encode, Principal};
-use tracing::{debug, info, warn};
+use futures::FutureExt;
+use tracing::{debug, error, info, warn};
 
 use crate::finalizers::finalizer::{Finalizer, FinalizerErrorKind, FinalizerResult};
 use crate::finalizers::liquidation_outcome::LiquidationOutcome;
@@ -20,7 +22,7 @@ use crate::wal::{
 use liquidium_pipeline_connectors::pipeline_agent::PipelineAgent;
 use liquidium_pipeline_core::types::protocol_types::{LiquidationResult, ProtocolError, TransferStatus};
 
-const MAX_FINALIZER_ERRORS: i32 = 5;
+pub(crate) const MAX_FINALIZER_ERRORS: i32 = 5;
 /// Maximum safe left-shift for `u64` multipliers in retry backoff.
 const MAX_U64_SHIFT: u32 = 63;
 
@@ -297,7 +299,24 @@ where
                 wal_mark_inflight(&*self.wal, wal_id).await?;
             }
 
-            match self.finalizer.finalize(&*self.wal, receipt.clone()).await {
+            // A panic in one row must not abort the batch. Without this the
+            // unwind escapes `process()` entirely, taking export, heartbeat and
+            // every remaining row with it -- and `tokio::time::timeout` does not
+            // catch panics, so a deterministic one would repeat every cycle.
+            let outcome = AssertUnwindSafe(self.finalizer.finalize(&*self.wal, receipt.clone()))
+                .catch_unwind()
+                .await
+                .unwrap_or_else(|panic| {
+                    let detail = panic
+                        .downcast_ref::<&str>()
+                        .map(|s| (*s).to_string())
+                        .or_else(|| panic.downcast_ref::<String>().cloned())
+                        .unwrap_or_else(|| "unknown panic".to_string());
+                    error!("[finalize] 💥 finalizer panicked liq_id={} detail={}", liq_id, detail);
+                    Err(format!("finalizer panicked: {detail}"))
+                });
+
+            match outcome {
                 Ok(res) => {
                     if res.finalized {
                         let wal_id = wal_id_by_liq

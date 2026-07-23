@@ -55,11 +55,15 @@ impl IcpswapExecutionPlan {
         })
     }
 
+    /// `gross >= fee` is enforced in [`Self::new`], but the plan derives
+    /// `Deserialize` and is reloaded from the WAL without revalidating, so a
+    /// corrupted record would reach an unchecked `Nat` subtraction -- which
+    /// panics on underflow. Saturating keeps a bad record from taking down the
+    /// whole finalize cycle; `new` remains the place the invariant is enforced.
     pub fn net_expected_output(&self) -> ChainTokenAmount {
-        ChainTokenAmount::from_raw(
-            self.gross_quoted_out.token.clone(),
-            self.gross_quoted_out.value.clone() - self.output_ledger_fee.value.clone(),
-        )
+        let net = net_expected_output(&self.gross_quoted_out.value, &self.output_ledger_fee.value)
+            .unwrap_or_else(|_| Nat::from(0u8));
+        ChainTokenAmount::from_raw(self.gross_quoted_out.token.clone(), net)
     }
 }
 

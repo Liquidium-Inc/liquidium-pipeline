@@ -16,6 +16,7 @@ use crate::{
     },
     persistance::{FinalizerDecisionSnapshot, ResultStatus, WalStore},
     stages::executor::ExecutionReceipt,
+    stages::finalize::MAX_FINALIZER_ERRORS,
     swappers::model::SwapRequest,
     wal::{decode_receipt_wrapper, encode_meta, liq_id_from_receipt, wal_load},
 };
@@ -397,6 +398,20 @@ where
             RouteVenue::Cex => self.persist_decision_snapshot(ctx.wal, &receipt, snapshot).await?,
         }
         self.execute_route(ctx.wal, receipt, venue, Some(&reason)).await
+    }
+
+    /// Whether the next retryable error would exhaust this row's retry budget and
+    /// permanently fail it. Read from the WAL rather than tracked here, because
+    /// the finalize stage owns the counter. A missing row is treated as "not
+    /// exhausted": erring toward one more retry is cheaper than recovering early.
+    async fn retries_exhausted(&self, wal: &dyn WalStore, receipt: &ExecutionReceipt) -> bool {
+        let Ok(liq_id) = liq_id_from_receipt(receipt) else {
+            return false;
+        };
+        match wal_load(wal, &liq_id).await {
+            Ok(Some(row)) => row.error_count + 1 >= MAX_FINALIZER_ERRORS,
+            _ => false,
+        }
     }
 
     async fn finalize_with_recovery_decision(
@@ -781,7 +796,27 @@ where
                     .await;
             }
 
-            // Positive but below required policy threshold: do not execute, return no-viable.
+            // Positive but below required policy threshold. Retrying is worth it --
+            // the edge may widen -- but the last attempt must not simply fail:
+            // permanently failing here leaves the collateral sitting in the trader
+            // wallet, whereas the non-positive branch above recovers it. Route the
+            // terminal give-up to recovery so a persistently marginal liquidation
+            // ends the same way an unprofitable one does.
+            if self.retries_exhausted(wal, &receipt).await {
+                let reason = format!(
+                    "hybrid_positive_below_min_exhausted best_venue={} preview_net_bps={:.2} min_required_bps={:.2}",
+                    chosen.venue, chosen.net_edge_bps, min_net_edge_bps
+                );
+                return self
+                    .finalize_with_recovery_decision(
+                        FinalizationContext::new(wal, "hybrid", min_net_edge_bps)
+                            .with_previews(dex_candidate.as_ref(), cex_candidate.as_ref()),
+                        receipt,
+                        reason,
+                    )
+                    .await;
+            }
+
             let error = format!(
                 "no viable route: preview_best_net_edge_bps={:.2}, min_required_bps={:.2}",
                 chosen.net_edge_bps, min_net_edge_bps

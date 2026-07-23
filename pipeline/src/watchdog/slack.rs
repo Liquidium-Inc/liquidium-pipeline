@@ -40,15 +40,31 @@ impl SlackWatchdog {
         }
     }
 
-    async fn reserve_for_send(&self, key: &str) -> Option<Instant> {
+    /// Claims the cooldown slot for `key`, returning the timestamp it displaced
+    /// so a failed send can put it back. Reserving up front keeps the check and
+    /// the claim atomic under one lock; [`Self::release_reservation`] undoes it
+    /// when the send fails, so a dropped alert is retried on the next attempt
+    /// rather than silently consuming the whole cooldown window.
+    async fn reserve_for_send(&self, key: &str) -> Option<Option<Instant>> {
         let mut m = self.last.lock().await;
         let now = Instant::now();
         m.retain(|_, ts| now.duration_since(*ts) < self.cooldown);
         if matches!(m.get(key), Some(&t) if now.duration_since(t) < self.cooldown) {
             return None;
         }
-        m.insert(key.to_string(), now);
-        Some(now)
+        Some(m.insert(key.to_string(), now))
+    }
+
+    async fn release_reservation(&self, key: &str, displaced: Option<Instant>) {
+        let mut m = self.last.lock().await;
+        match displaced {
+            Some(previous) => {
+                m.insert(key.to_string(), previous);
+            }
+            None => {
+                m.remove(key);
+            }
+        }
     }
 }
 
@@ -56,27 +72,40 @@ impl SlackWatchdog {
 impl Watchdog for SlackWatchdog {
     async fn notify(&self, ev: WatchdogEvent<'_>) {
         let cooldown_key = slack_cooldown_key(&ev);
-        match cooldown_key.as_deref() {
+        let reservation = match cooldown_key.as_deref() {
             Some(key) => match self.reserve_for_send(key).await {
-                Some(_) => {}
+                Some(displaced) => Some((key.to_string(), displaced)),
                 None => return,
             },
-            None => {}
-        }
+            None => None,
+        };
 
         let Some(payload) = slack_payload_for_event_with_bot(&ev, &self.bot_name) else {
+            if let Some((key, displaced)) = reservation {
+                self.release_reservation(&key, displaced).await;
+            }
             return;
         };
 
-        match self.client.post(&self.url).json(&payload).send().await {
-            Ok(resp) if resp.status().is_success() => {}
-            Ok(resp) if !resp.status().is_success() => {
+        let delivered = match self.client.post(&self.url).json(&payload).send().await {
+            Ok(resp) if resp.status().is_success() => true,
+            Ok(resp) => {
                 warn!("Slack notification failed with status {}", resp.status());
+                false
             }
             Err(err) => {
                 warn!("Slack notification failed: {}", err);
+                false
             }
-            _ => {}
+        };
+
+        // An undelivered alert must not burn its cooldown: the caller re-notifies
+        // every cycle while a condition persists, and swallowing the failure here
+        // is what turns a stuck swap into one nobody is ever told about.
+        if !delivered
+            && let Some((key, displaced)) = reservation
+        {
+            self.release_reservation(&key, displaced).await;
         }
     }
 }

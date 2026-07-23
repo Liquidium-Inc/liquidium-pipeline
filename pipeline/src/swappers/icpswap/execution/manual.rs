@@ -305,6 +305,13 @@ async fn submit_deposit(
             return Err(error.to_string());
         }
         Err(error) => {
+            // Deliberately left at `DepositPending`. Only `Encode` and `Protocol`
+            // reach this arm -- every transport failure is classified
+            // `SubmissionUnknown` above -- and a `Protocol` error is not a clean
+            // rollback: `classify_update_failure` notes that deposit "can perform
+            // awaited ledger calls before it fails", so the subaccount sweep may
+            // already have happened. Resetting to `Deposit` would resubmit on top
+            // of that. Reconciliation by balance is the safe resolution.
             state.last_error = Some(error.to_string());
             persist(store, execution_id, state).await?;
             return Err(error.to_string());

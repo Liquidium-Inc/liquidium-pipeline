@@ -70,6 +70,13 @@ impl IcpswapExecutionStateStore for WalIcpswapExecutionStateStore<'_> {
                     "refusing to replace persisted ICPSwap plan for liquidation {liquidation_id}"
                 ));
             }
+            // Waiting states re-persist identical bytes on every poll, and the
+            // store runs `synchronous=FULL` with `fullfsync=ON`, so each of those
+            // is a real disk sync. The decode above already gives us the
+            // comparison for free.
+            if existing == *state {
+                return Ok(());
+            }
         }
 
         wrapper.venue_execution = Some(VenueExecutionState::new(VENUE_ID, state)?);

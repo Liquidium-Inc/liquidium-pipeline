@@ -24,6 +24,7 @@ impl IcpswapState {
             step: IcpswapStep::Transfer,
             operator_pending_step: None,
             last_error: None,
+            next_attempt_at_nanos: None,
             plan,
             transfer: IcpswapTransferState::default(),
             deposit: IcpswapDepositState::default(),
