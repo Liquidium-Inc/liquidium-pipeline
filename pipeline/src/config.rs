@@ -318,17 +318,10 @@ impl Config {
                 bridge_cketh_minter_canister_text
             )
         })?;
-        let max_allowed_dex_slippage: u32 = std::env::var("MAX_ALLOWED_DEX_SLIPPAGE")
-            .or_else(|_| std::env::var("MAX_ALLOWED_SLIPPAGE_BPS"))
-            .ok()
-            .and_then(|v| v.parse::<u32>().ok())
-            .unwrap_or(125); // default 1.25%
-
-        let max_allowed_cex_slippage_bps: u32 = std::env::var("MAX_ALLOWED_CEX_SLIPPAGE_BPS")
-            .or_else(|_| std::env::var("MAX_ALLOWED_SLIPPAGE_BPS"))
-            .ok()
-            .and_then(|v| v.parse::<u32>().ok())
-            .unwrap_or(200);
+        let max_allowed_dex_slippage =
+            parse_slippage_bps_from_env("MAX_ALLOWED_DEX_SLIPPAGE", DEFAULT_MAX_ALLOWED_DEX_SLIPPAGE_BPS)?;
+        let max_allowed_cex_slippage_bps =
+            parse_slippage_bps_from_env("MAX_ALLOWED_CEX_SLIPPAGE_BPS", DEFAULT_MAX_ALLOWED_CEX_SLIPPAGE_BPS)?;
 
         let bad_debt_collateral_slippage_bps = parse_bad_debt_collateral_slippage_bps_from_env();
         let cex_tunables = parse_cex_tunables_from_env();
@@ -483,13 +476,54 @@ fn parse_bad_debt_collateral_slippage_bps_from_env() -> u32 {
         .unwrap_or(DEFAULT_BAD_DEBT_COLLATERAL_SLIPPAGE_BPS)
 }
 
+/// Ceiling for any configured slippage allowance. These values become on-chain
+/// `amount_out_minimum` floors, so a fat-fingered order of magnitude is the
+/// difference between a 1.25% cap and effectively none at all.
+const MAX_CONFIGURABLE_SLIPPAGE_BPS: u32 = 2_000;
+const DEFAULT_MAX_ALLOWED_DEX_SLIPPAGE_BPS: u32 = 125;
+const DEFAULT_MAX_ALLOWED_CEX_SLIPPAGE_BPS: u32 = 200;
+
+/// Reads a basis-point slippage allowance, falling back to the shared
+/// `MAX_ALLOWED_SLIPPAGE_BPS` and then to `default_bps`.
+///
+/// A *set but unparseable* value is an error rather than a silent fallback:
+/// `"1.25"` or `"0.5%"` are natural ways to write this, and quietly substituting
+/// the default would leave an operator believing they had tightened a cap they
+/// had in fact left at its default.
+fn parse_slippage_bps_from_env(primary: &str, default_bps: u32) -> Result<u32, String> {
+    const SHARED: &str = "MAX_ALLOWED_SLIPPAGE_BPS";
+    let Some((name, raw)) = env::var(primary)
+        .ok()
+        .map(|value| (primary, value))
+        .or_else(|| env::var(SHARED).ok().map(|value| (SHARED, value)))
+    else {
+        return Ok(default_bps);
+    };
+
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(default_bps);
+    }
+    let parsed: u32 = trimmed.parse().map_err(|_| {
+        format!("{name}='{trimmed}' is not a whole number of basis points (e.g. 125 for 1.25%)")
+    })?;
+    if parsed > MAX_CONFIGURABLE_SLIPPAGE_BPS {
+        return Err(format!(
+            "{name}={parsed} exceeds the maximum {MAX_CONFIGURABLE_SLIPPAGE_BPS} bps allowed for a slippage cap"
+        ));
+    }
+    Ok(parsed)
+}
+
 fn parse_swapper_mode_from_env() -> Result<SwapperMode, String> {
     let swapper_raw = env::var("SWAPPER").unwrap_or_else(|_| "cex".to_string());
     match swapper_raw.trim().to_lowercase().as_str() {
         "" => Ok(SwapperMode::Cex),
         "cex" => Ok(SwapperMode::Cex),
+        "dex" => Ok(SwapperMode::Dex),
+        "hybrid" => Ok(SwapperMode::Hybrid),
         other => Err(format!(
-            "SWAPPER='{}' is unsupported; only SWAPPER=cex is currently supported",
+            "SWAPPER='{}' is unsupported; expected one of cex, dex, hybrid",
             other
         )),
     }
@@ -903,27 +937,58 @@ mod tests {
             env::set_var("SWAPPER", "unknown-value");
         }
         let err = parse_swapper_mode_from_env().expect_err("unknown swapper mode should be rejected");
-        assert!(err.contains("only SWAPPER=cex"));
+        assert!(err.contains("expected one of cex, dex, hybrid"));
     }
 
     #[test]
-    fn parse_swapper_mode_rejects_dex() {
+    fn parse_swapper_mode_accepts_dex_and_hybrid() {
         let _guard = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
         unsafe {
             env::set_var("SWAPPER", "dex");
         }
-        let err = parse_swapper_mode_from_env().expect_err("dex mode should be rejected");
-        assert!(err.contains("only SWAPPER=cex"));
+        assert_eq!(parse_swapper_mode_from_env().unwrap(), SwapperMode::Dex);
+        unsafe {
+            env::set_var("SWAPPER", "  HYBRID  ");
+        }
+        assert_eq!(parse_swapper_mode_from_env().unwrap(), SwapperMode::Hybrid);
+        unsafe {
+            env::remove_var("SWAPPER");
+        }
     }
 
     #[test]
-    fn parse_swapper_mode_rejects_hybrid() {
+    fn parse_slippage_bps_rejects_malformed_and_oversized_values() {
         let _guard = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
         unsafe {
-            env::set_var("SWAPPER", "hybrid");
+            env::remove_var("MAX_ALLOWED_SLIPPAGE_BPS");
+            env::remove_var("SLIPPAGE_TEST_BPS");
         }
-        let err = parse_swapper_mode_from_env().expect_err("hybrid mode should be rejected");
-        assert!(err.contains("only SWAPPER=cex"));
+        assert_eq!(parse_slippage_bps_from_env("SLIPPAGE_TEST_BPS", 125).unwrap(), 125);
+
+        // A percentage or decimal is the natural way to get this wrong, and
+        // silently falling back would hide a cap the operator believes they set.
+        for bad in ["1.25", "0.5%", "abc"] {
+            unsafe {
+                env::set_var("SLIPPAGE_TEST_BPS", bad);
+            }
+            assert!(
+                parse_slippage_bps_from_env("SLIPPAGE_TEST_BPS", 125).is_err(),
+                "{bad} must be rejected rather than silently defaulted"
+            );
+        }
+
+        unsafe {
+            env::set_var("SLIPPAGE_TEST_BPS", "9999");
+        }
+        assert!(parse_slippage_bps_from_env("SLIPPAGE_TEST_BPS", 125).is_err());
+
+        unsafe {
+            env::set_var("SLIPPAGE_TEST_BPS", " 300 ");
+        }
+        assert_eq!(parse_slippage_bps_from_env("SLIPPAGE_TEST_BPS", 125).unwrap(), 300);
+        unsafe {
+            env::remove_var("SLIPPAGE_TEST_BPS");
+        }
     }
 
     #[test]
