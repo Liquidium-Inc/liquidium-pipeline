@@ -43,6 +43,7 @@ pub struct PipelineContext {
     pub main_transfers: Arc<TransferService>,
     pub trader_transfers: Arc<TransferService>,
     pub swap_router: Arc<SwapRouter>,
+    pub icpswap_finalizer: Arc<IcpswapFinalizer>,
     pub dex_route_finalizer: Arc<dyn DexRouteFinalizer>,
     pub recovery_transfers: Arc<TransferService>,
     pub bridge_transfers: Arc<TransferService>,
@@ -292,7 +293,7 @@ impl<P: Provider<AnyNetwork> + WalletProvider<AnyNetwork> + Clone + 'static> Pip
         // let mexc_client = Arc::new(MexcClient::from_env()?);
         // let mexc_venue: Arc<dyn SwapVenue> = Arc::new(MexcSwapVenue::new(mexc_client));
 
-        let dex_route_finalizer: Arc<dyn DexRouteFinalizer> = Arc::new(
+        let icpswap_finalizer = Arc::new(
             IcpswapFinalizer::new(
                 icpswap_venue.clone(),
                 Account {
@@ -302,6 +303,7 @@ impl<P: Provider<AnyNetwork> + WalletProvider<AnyNetwork> + Clone + 'static> Pip
             )
             .with_watchdog(slack_watchdog_from_env(DEFAULT_LOW_BALANCE_ALERT_COOLDOWN)),
         );
+        let dex_route_finalizer: Arc<dyn DexRouteFinalizer> = icpswap_finalizer.clone();
 
         // The router only sees ICPSwap through the common venue abstraction.
         let swap_router = SwapRouter::new().with_default_venue(icpswap_venue);
@@ -311,6 +313,7 @@ impl<P: Provider<AnyNetwork> + WalletProvider<AnyNetwork> + Clone + 'static> Pip
         Ok(PipelineContext {
             config: config.clone(),
             swap_router,
+            icpswap_finalizer,
             dex_route_finalizer,
             registry,
             main_service: Arc::new(main_service),

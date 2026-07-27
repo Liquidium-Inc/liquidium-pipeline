@@ -14,13 +14,12 @@ use crate::{
         bootstrap_control_plane, console_ui_enabled, debt_asset_principals, debt_assets_as_text,
         ensure_runtime_file_permissions, print_banner, run_daemon_cycle_loop,
     },
-    config::Config,
+    config::{Config, ConfigTrait},
     context::{PipelineContext, init_context},
     executors::basic::basic_executor::BasicExecutor,
     finalizers::{
-        cex_finalizer::CexFinalizerLogic,
-        hybrid::hybrid_finalizer::HybridFinalizer,
         mexc::runtime::build_mexc_finalizer,
+        multi_venue::{IcpswapFirstPlannerConfig, MEXC_VENUE_ID, MultiVenueAdapter, MultiVenueFinalizer},
         profit_calculator::SimpleProfitCalculator,
     },
     liquidation::collateral_service::CollateralService,
@@ -56,7 +55,7 @@ async fn init(
         SimpleLiquidationStrategy<SwapRouter, Config, TokenRegistry, CollateralService<LiquidationPriceOracle<Agent>>>,
         Arc<BasicExecutor<Agent, SqliteWalStore>>,
         Arc<ExportStage>,
-        Arc<FinalizeStage<HybridFinalizer<Config>, SqliteWalStore, SimpleProfitCalculator, Agent>>,
+        Arc<FinalizeStage<MultiVenueFinalizer, SqliteWalStore, SimpleProfitCalculator, Agent>>,
     ),
     String,
 > {
@@ -89,14 +88,19 @@ async fn init(
     }
 
     let mexc_finalizer = build_mexc_finalizer(ctx.as_ref()).await?;
-
-    // Hybrid finalizer composes the ICPSwap preview path and MEXC finalizer.
-    let hybrid_finalizer = Arc::new(HybridFinalizer {
-        config: config.clone(),
-        trader_transfers: ctx.trader_transfers.actions(),
-        dex_finalizer: ctx.dex_route_finalizer.clone(),
-        cex_finalizer: Some(mexc_finalizer.clone() as Arc<dyn CexFinalizerLogic>),
-    });
+    let multi_venue_finalizer = Arc::new(MultiVenueFinalizer::new(
+        vec![
+            ctx.icpswap_finalizer.clone() as Arc<dyn MultiVenueAdapter>,
+            mexc_finalizer.clone() as Arc<dyn MultiVenueAdapter>,
+        ],
+        IcpswapFirstPlannerConfig {
+            max_price_impact_bps: 100.0,
+            max_search_iterations: 16,
+            cex_min_exec_usd: config.get_cex_min_exec_usd(),
+            min_net_edge_bps: config.get_cex_min_net_edge_bps(),
+            overflow_venue_ids: vec![MEXC_VENUE_ID.to_string()],
+        },
+    )?);
 
     // Profit calculator for expected/realized PnL
     let profit_calc = Arc::new(SimpleProfitCalculator); //todo implement real profit calculator
@@ -104,7 +108,7 @@ async fn init(
     // FinalizeStage wires WAL + finalizer + profit calculation
     let finalizer = Arc::new(FinalizeStage::new(
         db.clone(),
-        hybrid_finalizer,
+        multi_venue_finalizer,
         profit_calc,
         agent.clone(),
         config.lending_canister,

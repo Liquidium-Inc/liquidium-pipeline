@@ -17,7 +17,7 @@ use tracing::{Instrument, info, info_span, warn};
 use crate::config::Config;
 use crate::executors::basic::basic_executor::BasicExecutor;
 use crate::finalizers::liquidation_outcome::LiquidationOutcome;
-use crate::finalizers::{hybrid::hybrid_finalizer::HybridFinalizer, profit_calculator::SimpleProfitCalculator};
+use crate::finalizers::{multi_venue::MultiVenueFinalizer, profit_calculator::SimpleProfitCalculator};
 use crate::liquidation::collateral_service::CollateralService;
 use crate::output::human_output_enabled;
 use crate::persistance::sqlite::SqliteWalStore;
@@ -295,7 +295,7 @@ pub(crate) async fn run_daemon_cycle_loop(
     >,
     executor: &Arc<BasicExecutor<Agent, SqliteWalStore>>,
     exporter: &Arc<ExportStage>,
-    finalizer: &Arc<FinalizeStage<HybridFinalizer<Config>, SqliteWalStore, SimpleProfitCalculator, Agent>>,
+    finalizer: &Arc<FinalizeStage<MultiVenueFinalizer, SqliteWalStore, SimpleProfitCalculator, Agent>>,
     liq_dog: &Arc<dyn Watchdog>,
     slack_watchdog: Option<Arc<dyn Watchdog>>,
     low_balance_monitor: Option<Arc<LowBalanceMonitor>>,
@@ -392,7 +392,7 @@ async fn run_single_daemon_cycle(
     >,
     executor: &Arc<BasicExecutor<Agent, SqliteWalStore>>,
     exporter: &Arc<ExportStage>,
-    finalizer: &Arc<FinalizeStage<HybridFinalizer<Config>, SqliteWalStore, SimpleProfitCalculator, Agent>>,
+    finalizer: &Arc<FinalizeStage<MultiVenueFinalizer, SqliteWalStore, SimpleProfitCalculator, Agent>>,
     liq_dog: &Arc<dyn Watchdog>,
     slack_watchdog: Option<&Arc<dyn Watchdog>>,
     low_balance_monitor: Option<&LowBalanceMonitor>,

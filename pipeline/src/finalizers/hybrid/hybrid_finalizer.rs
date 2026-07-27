@@ -1,3 +1,5 @@
+#![allow(deprecated)]
+
 use async_trait::async_trait;
 use candid::Nat;
 use std::sync::Arc;
@@ -28,6 +30,7 @@ use liquidium_pipeline_core::{
 use tracing::info;
 use tracing::instrument;
 
+#[deprecated(note = "use MultiVenueFinalizer; retained only for forced modes and committed legacy WAL rows")]
 pub struct HybridFinalizer<C>
 where
     C: ConfigTrait,
@@ -346,8 +349,8 @@ where
         Ok(())
     }
 
-    /// Returns a previously committed side-effecting route. ICPSwap state has
-    /// priority because its existence proves a typed DEX plan was committed.
+    /// Returns a previously committed legacy route. The caller checks meta_v2
+    /// first; typed DEX state then precedes legacy CEX state and snapshots.
     async fn load_committed_route(
         &self,
         wal: &dyn WalStore,
@@ -360,8 +363,11 @@ where
         let Some(wrapper) = decode_receipt_wrapper(&row)? else {
             return Ok(None);
         };
-        if self.dex_finalizer.has_committed_route(wal, receipt).await? {
+        if wrapper.venue_execution.is_some() || self.dex_finalizer.has_committed_route(wal, receipt).await? {
             return Ok(Some(RouteVenue::Dex));
+        }
+        if !wrapper.meta.is_empty() {
+            return Ok(Some(RouteVenue::Cex));
         }
         Ok(wrapper
             .finalizer_decision

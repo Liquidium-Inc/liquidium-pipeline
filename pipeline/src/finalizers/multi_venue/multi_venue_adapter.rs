@@ -49,5 +49,6 @@ pub trait MultiVenueAdapter: Send + Sync {
     async fn advance(&self, leg: &VenueLegState) -> Result<VenueLegProgress, String>;
 
     /// Reconciles or recovers only the supplied leg after restart or failure.
+    #[allow(dead_code)]
     async fn recover(&self, leg: &VenueLegState) -> Result<VenueLegProgress, String>;
 }
