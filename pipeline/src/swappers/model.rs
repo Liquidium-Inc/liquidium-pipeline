@@ -3,6 +3,7 @@ use liquidium_pipeline_core::tokens::{asset_id::AssetId, chain_token_amount::Cha
 use serde::{Deserialize, Serialize};
 
 const BPS_PER_RATIO_UNIT: f64 = 10_000.0;
+pub const BASIS_POINTS_DENOMINATOR: u32 = 10_000;
 
 /// Normalized adverse quote impact for prices expressed in receive units per
 /// pay unit. Better-than-reference quotes are clamped to zero.
@@ -11,6 +12,15 @@ pub fn adverse_price_impact_bps(reference_price: f64, execution_price: f64) -> f
         return f64::INFINITY;
     }
     ((reference_price - execution_price) / reference_price * BPS_PER_RATIO_UNIT).max(0.0)
+}
+
+/// Applies a strict basis-point haircut using integer arithmetic. Values above
+/// 10,000 bps are rejected instead of being silently clamped.
+pub fn amount_after_bps_haircut(amount: &Nat, haircut_bps: u32) -> Result<Nat, String> {
+    let retained_bps = BASIS_POINTS_DENOMINATOR
+        .checked_sub(haircut_bps)
+        .ok_or_else(|| format!("basis-point haircut {haircut_bps} exceeds {BASIS_POINTS_DENOMINATOR}"))?;
+    Ok((amount.clone() * Nat::from(retained_bps)) / Nat::from(BASIS_POINTS_DENOMINATOR))
 }
 
 #[derive(CandidType, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -204,5 +214,14 @@ mod tests {
         let reencoded = serde_json::to_value(decoded).expect("serialize normalized execution");
         assert_eq!(reencoded["realized_slippage_bps"], 75.0);
         assert!(reencoded.get("slippage").is_none());
+    }
+
+    #[test]
+    fn amount_haircut_uses_strict_basis_point_validation() {
+        assert_eq!(
+            amount_after_bps_haircut(&Nat::from(20_000u64), 100).expect("valid haircut"),
+            Nat::from(19_800u64)
+        );
+        assert!(amount_after_bps_haircut(&Nat::from(20_000u64), 10_001).is_err());
     }
 }

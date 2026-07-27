@@ -2,8 +2,7 @@ use candid::{Nat, Principal};
 use liquidium_pipeline_core::tokens::{chain_token::ChainToken, chain_token_amount::ChainTokenAmount};
 
 use super::types::{IcpswapExecutionPlan, IcpswapPlanError};
-
-const BASIS_POINTS_DENOMINATOR: u32 = 10_000;
+use crate::swappers::model::amount_after_bps_haircut;
 
 pub fn nat_to_decimal_text(value: &Nat) -> String {
     value.0.to_str_radix(10)
@@ -88,10 +87,8 @@ pub fn resolve_direction(
 }
 
 pub fn amount_out_minimum(gross_quote: &Nat, max_slippage_bps: u32) -> Result<Nat, IcpswapPlanError> {
-    let retained_bps = BASIS_POINTS_DENOMINATOR
-        .checked_sub(max_slippage_bps)
-        .ok_or(IcpswapPlanError::InvalidSlippage(max_slippage_bps))?;
-    Ok((gross_quote.clone() * Nat::from(retained_bps)) / Nat::from(BASIS_POINTS_DENOMINATOR))
+    amount_after_bps_haircut(gross_quote, max_slippage_bps)
+        .map_err(|_| IcpswapPlanError::InvalidSlippage(max_slippage_bps))
 }
 
 pub fn net_expected_output(gross_quote: &Nat, output_ledger_fee: &Nat) -> Result<Nat, IcpswapPlanError> {

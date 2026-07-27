@@ -496,7 +496,9 @@ async fn multi_venue_preview_returns_initialized_tagged_leg_state() {
 
     assert_eq!(preview.venue_id, crate::swappers::icpswap::VENUE_ID);
     assert_eq!(state.step, IcpswapStep::Transfer);
-    assert!(state.execution_id.starts_with("icpswap-1000000000-"));
+    assert!(state.execution_id.starts_with("icpswap-"));
+    uuid::Uuid::parse_str(state.execution_id.trim_start_matches("icpswap-"))
+        .expect("execution ID should contain a restart-safe UUID");
     assert_eq!(preview.conservative_receive.value, Nat::from(118_795u64));
 }
 

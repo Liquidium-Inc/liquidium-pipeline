@@ -26,6 +26,9 @@ impl VenueRegistry {
             if !venue_ids.insert(venue_id) {
                 return Err(format!("duplicate venue adapter `{venue_id}`"));
             }
+            adapter
+                .validate_configuration()
+                .map_err(|error| format!("venue adapter `{venue_id}` is not configured: {error}"))?;
         }
 
         Ok(Self { adapters })

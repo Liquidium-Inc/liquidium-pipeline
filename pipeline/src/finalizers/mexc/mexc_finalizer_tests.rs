@@ -1979,6 +1979,30 @@ async fn mexc_native_icp_non_bridge_withdraw_uses_liquidator_account_id_hex() {
     assert_ne!(state.withdraw.withdraw_address, liquidator.to_text());
 }
 
+#[test]
+fn mexc_native_icp_withdraw_converts_the_persisted_per_leg_destination() {
+    let finalizer = MexcFinalizer::new(
+        Arc::new(MockCexBackend::new()),
+        Arc::new(MockTransferActions::new()),
+        Principal::anonymous(),
+        TEST_MAX_SELL_SLIPPAGE_BPS,
+        TEST_CEX_MIN_EXEC_USD,
+        TEST_CEX_SLICE_TARGET_RATIO,
+    );
+    let requested = Account {
+        owner: Principal::from_slice(&[42]),
+        subaccount: Some([7; 32]),
+    };
+    let expected = AccountIdentifier::new(&requested.owner, &Subaccount([7; 32])).to_hex();
+
+    assert_eq!(
+        finalizer
+            .native_icp_direct_withdraw_address(&requested.to_string())
+            .expect("valid per-leg destination"),
+        expected
+    );
+}
+
 #[tokio::test]
 async fn mexc_non_bridge_withdraw_below_min_completes_as_zero_output_dust() {
     let mut cex = MockCexBackend::new();

@@ -222,6 +222,17 @@ pub trait CexFinalizerLogic: Send + Sync {
     // On CEX: withdraw to chain
     async fn withdraw(&self, state: &mut CexState) -> Result<(), String>;
 
+    /// Executes one phase of the shared CEX state machine. Venue adapters and
+    /// the legacy WAL finalizer use this same dispatch to avoid behavior drift.
+    async fn advance_current_step(&self, state: &mut CexState) -> Result<(), String> {
+        match state.step {
+            CexStep::Deposit | CexStep::DepositPending => self.deposit(state).await,
+            CexStep::Trade | CexStep::TradePending => self.trade(state).await,
+            CexStep::Withdraw | CexStep::WithdrawPending => self.withdraw(state).await,
+            CexStep::Completed | CexStep::Failed => Ok(()),
+        }
+    }
+
     // Build final SwapExecution to hand back to pipeline when Completed
     async fn finish(&self, receipt: &ExecutionReceipt, state: &CexState) -> Result<SwapExecution, String>;
 
@@ -305,35 +316,9 @@ impl Finalizer for dyn CexFinalizerLogic {
 
         let mut row_after = row;
         loop {
-            let step_res = match cex_state.step {
-                CexStep::Deposit => {
-                    debug!("[cex] 💰 liq_id={} step=Deposit", cex_state.liq_id);
-                    self.deposit(&mut cex_state).await
-                }
-                CexStep::DepositPending => {
-                    info!("[cex] ⏳ liq_id={} step=DepositPending", cex_state.liq_id);
-                    // Re-check deposit arrival on the CEX.
-                    self.deposit(&mut cex_state).await
-                }
-                CexStep::Trade => {
-                    debug!("[cex] 🔁 liq_id={} step=Trade", cex_state.liq_id);
-                    self.trade(&mut cex_state).await
-                }
-                CexStep::TradePending => {
-                    debug!("[cex] ⏳ liq_id={} step=TradePending", cex_state.liq_id);
-                    self.trade(&mut cex_state).await
-                }
-                CexStep::Withdraw => {
-                    debug!("[cex] 🏦 liq_id={} step=Withdraw", cex_state.liq_id);
-                    self.withdraw(&mut cex_state).await
-                }
-                CexStep::WithdrawPending => {
-                    info!("[cex] ⏳ liq_id={} step=WithdrawPending", cex_state.liq_id);
-                    self.withdraw(&mut cex_state).await
-                }
+            match cex_state.step {
                 CexStep::Completed => {
                     info!("[cex] 🎉 liq_id={} step=Completed", cex_state.liq_id);
-                    debug!("[cex] liq_id={} step=Completed (noop)", cex_state.liq_id);
                     break;
                 }
                 CexStep::Failed => {
@@ -343,7 +328,10 @@ impl Finalizer for dyn CexFinalizerLogic {
                     );
                     break;
                 }
-            };
+                step => debug!("[cex] liq_id={} step={step:?}", cex_state.liq_id),
+            }
+
+            let step_res = self.advance_current_step(&mut cex_state).await;
 
             // If the current leg failed, stop and handle retry / permanent fail below.
             if let Err(err) = step_res {

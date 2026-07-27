@@ -1,5 +1,7 @@
 use super::*;
 use crate::finalizers::bridge_planner::BridgePlanner;
+use crate::finalizers::cex_finalizer::{CexRouteLeg, CexTradeSlice};
+use crate::finalizers::mexc::mexc_utils::parse_market_symbols;
 
 struct PendingSliceRequest {
     requested_in: f64,
@@ -699,7 +701,7 @@ where
     }
 
     /// Simulate one leg with current orderbook for route previews.
-    pub(super) async fn preview_leg(
+    pub(in crate::finalizers::mexc) async fn preview_leg(
         &self,
         market: &str,
         side: &str,

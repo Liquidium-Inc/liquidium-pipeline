@@ -1,6 +1,6 @@
 use std::sync::{
     Mutex,
-    atomic::{AtomicBool, AtomicU64, Ordering},
+    atomic::{AtomicBool, Ordering},
 };
 
 use async_trait::async_trait;
@@ -24,7 +24,6 @@ use crate::{
 };
 
 const PERSIST_BEFORE_SIDE_EFFECT: &str = "ICPSwap leg pending state ready for parent persistence";
-static EXECUTION_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 /// Leg-local store used to reuse the existing ICPSwap state machine without
 /// letting it write the parent WAL row. For a non-pending input step, the first
@@ -204,11 +203,7 @@ impl MultiVenueAdapter for IcpswapFinalizer {
         );
         // The selected preview is persisted before execution, so its generated
         // ID becomes the durable idempotency key used for every later advance.
-        let execution_id = format!(
-            "icpswap-{}-{}",
-            (self.clock)(),
-            EXECUTION_SEQUENCE.fetch_add(1, Ordering::Relaxed)
-        );
+        let execution_id = crate::utils::new_venue_execution_id(VENUE_ID);
         let state = self.workflow.prepare(&execution_id, preview.route, self.trader);
         Ok(VenueRoutePreview {
             venue_id: VENUE_ID.to_string(),

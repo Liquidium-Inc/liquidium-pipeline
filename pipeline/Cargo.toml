@@ -49,6 +49,7 @@ alloy = { workspace = true }
 futures = { workspace = true }
 bip39 = { workspace = true }
 thiserror = { workspace = true }
+uuid = { workspace = true }
 
 
 mexc-rs = { git = "https://github.com/liquidium-Inc/mexc-rs.git", rev = "5b8dc1e5e4261cab27772e32e2311ba4e70c1b13" }

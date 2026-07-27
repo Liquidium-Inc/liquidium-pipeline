@@ -162,6 +162,7 @@ where
 {
     let mut adapter = MockMultiVenueAdapter::new();
     adapter.expect_venue_id().return_const(venue_id);
+    adapter.expect_validate_configuration().returning(|| Ok(()));
     adapter.expect_preview().returning(move |request| {
         calls
             .lock()
@@ -270,6 +271,20 @@ async fn registry_previews_concurrently_and_preserves_registration_order() {
     assert_eq!(previews[1].venue_id, KRAKEN_VENUE_ID);
     assert!(matches!(previews[0].outcome, VenuePreviewOutcome::Unavailable(_)));
     assert!(matches!(previews[1].outcome, VenuePreviewOutcome::Unavailable(_)));
+}
+
+#[test]
+fn registry_rejects_an_adapter_with_missing_runtime_configuration() {
+    let mut adapter = MockMultiVenueAdapter::new();
+    adapter.expect_venue_id().return_const(MEXC_VENUE_ID);
+    adapter
+        .expect_validate_configuration()
+        .returning(|| Err("token registry is required".to_string()));
+
+    let error = VenueRegistry::new(vec![Arc::new(adapter)])
+        .err()
+        .expect("invalid adapter configuration");
+    assert!(error.contains("token registry is required"));
 }
 
 #[tokio::test]
@@ -717,6 +732,7 @@ async fn mexc_unavailable_allows_only_a_normally_safe_full_icpswap_quote() {
 async fn non_native_icp_is_mexc_only_and_never_previews_icpswap() {
     let mut icpswap = MockMultiVenueAdapter::new();
     icpswap.expect_venue_id().return_const(ICPSWAP_VENUE_ID);
+    icpswap.expect_validate_configuration().returning(|| Ok(()));
     icpswap.expect_preview().times(0);
     let mexc_calls = Arc::new(Mutex::new(Vec::new()));
     let mexc_calls_for_assert = mexc_calls.clone();

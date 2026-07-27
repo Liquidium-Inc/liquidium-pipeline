@@ -35,6 +35,12 @@ pub trait MultiVenueAdapter: Send + Sync {
     /// Stable identifier persisted in venue legs and used for adapter lookup.
     fn venue_id(&self) -> &'static str;
 
+    /// Rejects an adapter with missing runtime dependencies when the venue
+    /// registry is built, before any liquidation reaches quote planning.
+    fn validate_configuration(&self) -> Result<(), String> {
+        Ok(())
+    }
+
     /// Produces an amount-scoped quote and initial execution state without
     /// submitting transfers, orders, or swaps.
     async fn preview(&self, request: &SwapRequest) -> Result<VenueRoutePreview, String>;

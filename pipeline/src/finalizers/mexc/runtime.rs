@@ -253,6 +253,7 @@ pub async fn build_mexc_finalizer(ctx: &PipelineContext) -> Result<Arc<MexcFinal
             config.cex_buy_inverse_max_retries,
             config.cex_buy_inverse_enabled,
         )
+        .with_token_registry(ctx.registry.clone())
         .with_bridge_dependencies(bridge_dependencies)
         .with_route_config(
             config.cex_mexc_available_pairs.clone(),

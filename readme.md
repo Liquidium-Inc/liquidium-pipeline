@@ -11,6 +11,7 @@ Inspired by Artemis/MEV patterns and designed for permissionless, community-driv
 - [Configuration](#configuration)
 - [Identity Management](#identity-management)
 - [Architecture Overview](#architecture-overview)
+- [Multi-Venue Swap Pipeline](#multi-venue-swap-pipeline)
 - [CLI Commands](#cli-commands)
 - [Operations Runbook](#operations-runbook)
 - [Developer Setup](#developer-setup)
@@ -432,6 +433,12 @@ stateDiagram-v2
 | **Export / Reporting** | Saves execution details to CSV |
 
 Stages are implemented with `async-trait` for composability.
+
+### Multi-Venue Swap Pipeline
+
+An extensible multi-venue finalization path is being introduced to quote ICPSwap, MEXC, and future exchanges through one amount-scoped adapter contract. Allocation policy, exchange mechanics, WAL orchestration, and result aggregation remain separate layers.
+
+The current staged implementation is not yet the production routing path. See [Multi-Venue Swap Pipeline](docs/multi-venue-swap-pipeline.md) for the architecture diagrams, persisted model, `icpswap_first` policy, restart behavior, extension contract, and implementation status.
 
 ### Swap Strategies
 

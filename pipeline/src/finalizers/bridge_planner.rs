@@ -29,9 +29,6 @@ pub(crate) trait BridgePlanner {
     fn bridge_enabled(&self) -> bool;
     /// Resolves the configured bridge source address/account string for a given source chain.
     fn resolve_bridge_source_address(&self, source_chain: &str) -> Result<String, String>;
-    /// Returns the liquidator principal used when a bridge leg targets an ICP account.
-    fn bridge_liquidator_principal(&self) -> Principal;
-
     /// Builds a direct (non-bridged) transport plan from the provided asset.
     fn plan_from_direct_asset(asset: &ChainToken) -> BridgeTransportPlan {
         BridgeTransportPlan {
@@ -108,10 +105,14 @@ pub(crate) trait BridgePlanner {
         direct_withdraw_address: &str,
     ) -> Result<BridgeDestination, String> {
         match destination_kind {
-            BridgeDestinationKind::IcpAccount => Ok(BridgeDestination::IcpAccount(Account {
-                owner: self.bridge_liquidator_principal(),
-                subaccount: None,
-            })),
+            BridgeDestinationKind::IcpAccount => Self::parse_icp_account_like(direct_withdraw_address)
+                .map(BridgeDestination::IcpAccount)
+                .map_err(|error| {
+                    format!(
+                        "invalid final ICP destination '{}' for bridge withdraw: {error}",
+                        direct_withdraw_address
+                    )
+                }),
 
             BridgeDestinationKind::EvmAddress => {
                 let evm = direct_withdraw_address.parse::<EvmAddress>().map_err(|e| {
@@ -221,5 +222,35 @@ pub(crate) trait BridgePlanner {
             "unsupported bridge source chain '{}' for transfer destination",
             source_chain
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct TestBridgePlanner;
+
+    impl BridgePlanner for TestBridgePlanner {
+        fn bridge_enabled(&self) -> bool {
+            true
+        }
+
+        fn resolve_bridge_source_address(&self, _source_chain: &str) -> Result<String, String> {
+            unreachable!("not needed by destination test")
+        }
+    }
+
+    #[test]
+    fn bridged_icp_destination_uses_the_persisted_per_leg_account() {
+        let expected = Account {
+            owner: Principal::from_slice(&[42]),
+            subaccount: Some([7; 32]),
+        };
+        let destination = TestBridgePlanner
+            .bridge_destination_for_final_liquidator(BridgeDestinationKind::IcpAccount, &expected.to_string())
+            .expect("valid ICP destination");
+
+        assert_eq!(destination, BridgeDestination::IcpAccount(expected));
     }
 }
