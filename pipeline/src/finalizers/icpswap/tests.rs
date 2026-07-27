@@ -157,6 +157,7 @@ impl TestWal {
             finalizer_decision: None,
             profit_snapshot: None,
             venue_execution: Some(VenueExecutionState::new(crate::swappers::icpswap::VENUE_ID, &state).unwrap()),
+            meta_v2: None,
         };
         let mut row = LiqResultRecord {
             id: "42".to_string(),
@@ -403,6 +404,7 @@ async fn committing_dex_preview_creates_manual_icpswap_state() {
         cex_preview_gross_bps: Some(150.0),
         cex_preview_net_bps: Some(140.0),
         ts: 123,
+        multi_venue_allocation: None,
     };
     let preview = DexRoutePreview::new(
         SwapQuote {

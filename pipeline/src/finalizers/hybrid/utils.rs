@@ -151,5 +151,6 @@ pub(crate) fn make_snapshot(
         cex_preview_gross_bps: cex_preview.map(|candidate| candidate.gross_edge_bps),
         cex_preview_net_bps: cex_preview.map(|candidate| candidate.net_edge_bps),
         ts: now_secs(),
+        multi_venue_allocation: None,
     }
 }

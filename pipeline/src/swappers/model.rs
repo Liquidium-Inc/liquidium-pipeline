@@ -8,7 +8,7 @@ pub enum TxRef {
     TxHash { chain: String, hash: String },
 }
 
-#[derive(CandidType, Debug, Clone, Serialize, Deserialize)]
+#[derive(CandidType, Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SwapRequest {
     pub pay_asset: AssetId,
     /// Maximum amount the venue may spend, including venue-required ledger operations.
@@ -19,7 +19,7 @@ pub struct SwapRequest {
     pub venue_hint: Option<String>,    // "icpswap", "mexc", etc (optional)
 }
 
-#[derive(CandidType, Debug, Clone, Serialize, Deserialize)]
+#[derive(CandidType, Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SwapQuoteLeg {
     pub venue: String,    // "icpswap", "mexc", etc
     pub route_id: String, // pool id, market symbol, etc
@@ -58,7 +58,7 @@ pub struct TransferRecord {
     pub tx_ref: TxRef,
 }
 
-#[derive(CandidType, Debug, Clone, Serialize, Deserialize)]
+#[derive(CandidType, Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SwapExecution {
     pub swap_id: u64,
     pub request_id: u64,

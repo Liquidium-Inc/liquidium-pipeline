@@ -248,6 +248,7 @@ where
             finalizer_decision: None,
             profit_snapshot: None,
             venue_execution: None,
+            meta_v2: None,
         });
         wrapper.receipt = receipt.clone();
         encode_meta(&mut row, &wrapper)?;
@@ -374,6 +375,7 @@ mod tests {
             finalizer_decision: None,
             profit_snapshot: None,
             venue_execution: None,
+            meta_v2: None,
         };
         encode_meta(&mut row, &wrapper).expect("encode_meta should succeed");
         row
@@ -662,6 +664,7 @@ mod tests {
                 cex_preview_gross_bps: Some(33.0),
                 cex_preview_net_bps: Some(26.0),
                 ts: 123,
+                multi_venue_allocation: None,
             }),
             profit_snapshot: Some(WalProfitSnapshot {
                 expected_profit_raw: "1000".to_string(),
@@ -671,6 +674,7 @@ mod tests {
                 updated_at: 123,
             }),
             venue_execution: None,
+            meta_v2: None,
         };
         encode_meta(&mut row, &wrapper).expect("encode wrapper");
 

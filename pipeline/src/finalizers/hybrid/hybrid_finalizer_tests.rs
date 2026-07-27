@@ -202,6 +202,7 @@ impl TestWal {
             finalizer_decision: None,
             profit_snapshot: None,
             venue_execution: None,
+            meta_v2: None,
         })
     }
 
@@ -218,6 +219,7 @@ impl TestWal {
             finalizer_decision: None,
             profit_snapshot: None,
             venue_execution: None,
+            meta_v2: None,
         })
     }
 

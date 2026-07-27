@@ -20,6 +20,7 @@ pub fn decode_receipt_wrapper(row: &LiqResultRecord) -> Result<Option<LiqMetaWra
                 finalizer_decision: None,
                 profit_snapshot: None,
                 venue_execution: None,
+                meta_v2: None,
             })),
             Err(receipt_err) => Err(format!(
                 "invalid meta_json for {}: wrapper_err={}; receipt_err={}",
@@ -198,6 +199,7 @@ mod tests {
         assert!(wrapper.finalizer_decision.is_none());
         assert!(wrapper.profit_snapshot.is_none());
         assert!(wrapper.venue_execution.is_none());
+        assert!(wrapper.meta_v2.is_none());
     }
 
     #[test]
@@ -211,6 +213,7 @@ mod tests {
         assert!(wrapper.finalizer_decision.is_none());
         assert!(wrapper.profit_snapshot.is_none());
         assert!(wrapper.venue_execution.is_none());
+        assert!(wrapper.meta_v2.is_none());
         assert!(wrapper.meta.is_empty());
     }
 
@@ -266,6 +269,7 @@ mod tests {
             finalizer_decision: None,
             profit_snapshot: None,
             venue_execution: Some(VenueExecutionState::new(crate::swappers::icpswap::VENUE_ID, &state).unwrap()),
+            meta_v2: None,
         };
         encode_meta(&mut row, &wrapper).expect("encode wrapper");
         let encoded: serde_json::Value = serde_json::from_str(&row.meta_json).expect("encoded wrapper json");

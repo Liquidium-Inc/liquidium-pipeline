@@ -872,6 +872,7 @@ mod tests {
             finalizer_decision: None,
             profit_snapshot: None,
             venue_execution: None,
+            meta_v2: None,
         };
 
         let mut row = LiqResultRecord {
@@ -915,6 +916,7 @@ mod tests {
             finalizer_decision: None,
             profit_snapshot: None,
             venue_execution: None,
+            meta_v2: None,
         };
 
         let mut row = LiqResultRecord {
@@ -1070,6 +1072,7 @@ mod tests {
             finalizer_decision: None,
             profit_snapshot: None,
             venue_execution: None,
+            meta_v2: None,
         };
 
         let mut row = LiqResultRecord {
