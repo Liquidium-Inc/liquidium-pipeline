@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use icrc_ledger_types::icrc1::account::Account;
-use tracing::{debug, warn};
+use tracing::debug;
 
 use crate::{
     finalizers::dex_finalizer::{DexRouteFinalizer, DexRoutePreview},
@@ -24,6 +24,7 @@ use crate::{
 };
 
 pub(crate) const ICPSWAP_FINALIZER_PERMANENT_PREFIX: &str = "permanent ICPSwap finalizer: ";
+const ICPSWAP_LOCK_CLEANUP_PREFIX: &str = "ICPSwap lock cleanup: ";
 
 /// Cooldown applied after a non-terminal step fails.
 ///
@@ -131,19 +132,29 @@ impl IcpswapFinalizer {
         }
     }
 
-    /// Frees the per-owner slot once an execution is over. `release` deletes by
-    /// `(owner, execution_id)` so it is idempotent, and a failure is logged
-    /// rather than propagated: surfacing it would mask the execution's real
-    /// outcome, and a completed swap must not be reported as a finalizer error.
-    async fn release_owner_lock(&self, wal: &dyn WalStore, owner_key: &str, liquidation_id: &str) {
-        if let Err(error) = wal.release_icpswap_owner_lock(owner_key, liquidation_id).await {
-            warn!(
-                owner = %owner_key,
-                liquidation_id,
-                %error,
-                "failed releasing ICPSwap owner lock; the venue stays blocked until it is cleared"
-            );
+    /// Frees the owner slot after terminal state is durable. Deletion is
+    /// idempotent, so propagating a failure keeps the WAL row retryable and the
+    /// next cycle can perform cleanup without replaying any IC side effect.
+    async fn release_execution_lock(
+        &self,
+        wal: &dyn WalStore,
+        owner_key: &str,
+        liquidation_id: &str,
+    ) -> Result<(), String> {
+        if let Err(error) = wal.release_icpswap_execution_lock(owner_key, liquidation_id).await {
+            let detail = format!("failed releasing terminal ICPSwap owner lock: {error}");
+            self.watchdog
+                .notify(WatchdogEvent::OperatorRequired {
+                    execution_id: liquidation_id.to_string(),
+                    venue: VENUE_ID.to_string(),
+                    pending_step: "lock_cleanup".to_string(),
+                    owner: owner_key.to_string(),
+                    details: detail.clone(),
+                })
+                .await;
+            return Err(format!("{ICPSWAP_LOCK_CLEANUP_PREFIX}{detail}"));
         }
+        Ok(())
     }
 
     /// Alerts for as long as the execution stays parked, not just on the way in.
@@ -184,6 +195,16 @@ impl Finalizer for IcpswapFinalizer {
         let store = WalIcpswapExecutionStateStore::new(wal);
         let mut loaded_state = self.load_state(&store, &liquidation_id).await?;
         let now_nanos = (self.clock)();
+        let owner_key = loaded_state.owner.owner.to_text();
+
+        // A prior cycle may have persisted terminal state and then failed to
+        // delete the durable lock. Retry only that idempotent cleanup; never
+        // call the venue workflow again for a terminal execution.
+        if is_terminal_step(loaded_state.step) {
+            self.release_execution_lock(wal, &owner_key, &liquidation_id)
+                .await?;
+            return self.result_for_state(&receipt, &loaded_state, now_nanos).await;
+        }
 
         // Back off after a failed step instead of re-running it every cycle. The
         // owner lock is deliberately not taken yet: a cooling-down execution
@@ -199,9 +220,8 @@ impl Finalizer for IcpswapFinalizer {
             return Ok(FinalizerResult::noop());
         }
 
-        let owner_key = self.trader.owner.to_text();
         if !wal
-            .acquire_icpswap_owner_lock(&owner_key, &liquidation_id)
+            .acquire_icpswap_execution_lock(&owner_key, &liquidation_id)
             .await
             .map_err(|error| format!("failed acquiring ICPSwap owner lock: {error}"))?
         {
@@ -244,7 +264,8 @@ impl Finalizer for IcpswapFinalizer {
         self.notify_operator_required(&liquidation_id, &state).await;
 
         if is_terminal_step(state.step) {
-            self.release_owner_lock(wal, &owner_key, &liquidation_id).await;
+            self.release_execution_lock(wal, &owner_key, &liquidation_id)
+                .await?;
         }
 
         if let Some(error) = advance_error {
@@ -260,6 +281,8 @@ impl Finalizer for IcpswapFinalizer {
     fn classify_error(&self, error: &str) -> FinalizerErrorKind {
         if error.starts_with(ICPSWAP_FINALIZER_PERMANENT_PREFIX) {
             FinalizerErrorKind::Permanent
+        } else if error.starts_with(ICPSWAP_LOCK_CLEANUP_PREFIX) {
+            FinalizerErrorKind::LockCleanup
         } else {
             FinalizerErrorKind::Retryable
         }

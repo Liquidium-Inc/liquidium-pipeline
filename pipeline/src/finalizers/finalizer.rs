@@ -6,6 +6,7 @@ use crate::{persistance::WalStore, stages::executor::ExecutionReceipt, swappers:
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FinalizerErrorKind {
     Retryable,
+    LockCleanup,
     Permanent,
     BadDebtAmountFloor,
 }

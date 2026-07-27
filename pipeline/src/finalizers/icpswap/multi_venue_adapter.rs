@@ -231,7 +231,7 @@ impl MultiVenueAdapter for IcpswapFinalizer {
     fn execution_lock(&self, leg: &VenueLegState) -> Result<Option<VenueExecutionLock>, String> {
         let state = self.decode_leg_state(leg)?;
         Ok(Some(VenueExecutionLock {
-            owner_key: self.trader.owner.to_text(),
+            owner_key: state.owner.owner.to_text(),
             execution_id: state.execution_id,
         }))
     }

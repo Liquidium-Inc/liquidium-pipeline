@@ -110,6 +110,7 @@ async fn init(
                 overflow_venue_ids: vec![MEXC_VENUE_ID.to_string()],
             },
         )?
+        .with_watchdog(slack_watchdog_from_env(DEFAULT_LOW_BALANCE_ALERT_COOLDOWN))
         .with_routing(routing)?,
     );
 

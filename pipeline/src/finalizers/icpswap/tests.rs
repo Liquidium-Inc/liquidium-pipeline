@@ -19,7 +19,7 @@ use crate::{
     executors::executor::ExecutorRequest,
     finalizers::{
         dex_finalizer::{DexRouteFinalizer, DexRoutePreview},
-        finalizer::Finalizer,
+        finalizer::{Finalizer, FinalizerErrorKind},
         icpswap::finalizer::{ICPSWAP_FINALIZER_PERMANENT_PREFIX, IcpswapFinalizer},
         multi_venue::MultiVenueAdapter,
     },
@@ -139,7 +139,11 @@ fn receipt() -> ExecutionReceipt {
 
 /// WAL double whose owner-lock table mirrors the SQLite store: one holder per
 /// owner, re-entrant for the holding execution, released only by its holder.
-struct TestWal(Mutex<LiqResultRecord>, Mutex<HashMap<String, String>>);
+struct TestWal(
+    Mutex<LiqResultRecord>,
+    Mutex<HashMap<String, String>>,
+    Mutex<u32>,
+);
 
 impl TestWal {
     fn lock_holder(&self, owner: &str) -> Option<String> {
@@ -151,6 +155,10 @@ impl TestWal {
             .lock()
             .unwrap()
             .insert(owner.to_string(), execution_id.to_string());
+    }
+
+    fn fail_next_lock_releases(&self, count: u32) {
+        *self.2.lock().unwrap() = count;
     }
 
     fn new(receipt: &ExecutionReceipt, state: IcpswapExecutionState) -> Self {
@@ -173,7 +181,7 @@ impl TestWal {
             meta_json: String::new(),
         };
         encode_meta(&mut row, &wrapper).expect("encode WAL");
-        Self(Mutex::new(row), Mutex::new(HashMap::new()))
+        Self(Mutex::new(row), Mutex::new(HashMap::new()), Mutex::new(0))
     }
 
     fn state(&self) -> IcpswapExecutionState {
@@ -230,7 +238,11 @@ impl WalStore for TestWal {
         Ok(())
     }
 
-    async fn acquire_icpswap_owner_lock(&self, owner: &str, execution_id: &str) -> anyhow::Result<bool> {
+    async fn acquire_icpswap_execution_lock(
+        &self,
+        owner: &str,
+        execution_id: &str,
+    ) -> anyhow::Result<bool> {
         let mut locks = self.1.lock().unwrap();
         let holder = locks
             .entry(owner.to_string())
@@ -238,7 +250,17 @@ impl WalStore for TestWal {
         Ok(holder == execution_id)
     }
 
-    async fn release_icpswap_owner_lock(&self, owner: &str, execution_id: &str) -> anyhow::Result<()> {
+    async fn release_icpswap_execution_lock(
+        &self,
+        owner: &str,
+        execution_id: &str,
+    ) -> anyhow::Result<()> {
+        let mut failures = self.2.lock().unwrap();
+        if *failures > 0 {
+            *failures -= 1;
+            anyhow::bail!("injected lock release failure");
+        }
+        drop(failures);
         let mut locks = self.1.lock().unwrap();
         if locks.get(owner).is_some_and(|holder| holder == execution_id) {
             locks.remove(owner);
@@ -919,7 +941,7 @@ async fn failed_execution_releases_the_owner_lock_for_the_next_liquidation() {
 
     // The next liquidation for this owner must be able to claim the slot.
     assert!(
-        wal.acquire_icpswap_owner_lock(&owner, "next-liquidation")
+        wal.acquire_icpswap_execution_lock(&owner, "next-liquidation")
             .await
             .unwrap(),
         "a leaked lock blocks every later ICPSwap liquidation for this owner"
@@ -927,9 +949,52 @@ async fn failed_execution_releases_the_owner_lock_for_the_next_liquidation() {
 }
 
 #[tokio::test]
+async fn terminal_state_retries_lock_cleanup_without_replaying_the_workflow() {
+    let receipt = receipt();
+    let mut terminal = state();
+    terminal.step = IcpswapStep::Refunded;
+    let wal = TestWal::new(&receipt, terminal);
+    let owner = trader().owner.to_text();
+    wal.hold_lock_for(&owner, "42");
+    wal.fail_next_lock_releases(1);
+    let watchdog = Arc::new(RecordingWatchdog::default());
+    let finalizer = IcpswapFinalizer::from_workflow_with_clock(
+        Arc::new(TestIcpswapClient {
+            manual: MockIcpswapManualClient::new(),
+            preview: None,
+        }),
+        Account {
+            owner: p(99),
+            subaccount: None,
+        },
+        Arc::new(|| 1_000_000_000),
+    )
+    .with_watchdog(watchdog.clone());
+
+    let first = finalizer
+        .finalize(&wal, receipt.clone())
+        .await
+        .expect_err("failed cleanup must keep the WAL row retryable");
+    assert!(first.contains("failed releasing terminal ICPSwap owner lock"));
+    assert_eq!(finalizer.classify_error(&first), FinalizerErrorKind::LockCleanup);
+    assert_eq!(wal.lock_holder(&owner).as_deref(), Some("42"));
+    let events = watchdog.events();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].2, "lock_cleanup");
+
+    let second = finalizer
+        .finalize(&wal, receipt)
+        .await
+        .expect("the next cycle should retry only the idempotent delete");
+    assert!(second.finalized);
+    assert_eq!(wal.lock_holder(&owner), None);
+}
+
+#[tokio::test]
 async fn owner_lock_contention_holds_the_row_instead_of_failing_it() {
     let receipt = receipt();
-    let wal = TestWal::new(&receipt, state());
+    let initial = state();
+    let wal = TestWal::new(&receipt, initial);
     wal.hold_lock_for(&trader().owner.to_text(), "other-liquidation");
 
     // No mock expectations: contention must be detected before any IC call.

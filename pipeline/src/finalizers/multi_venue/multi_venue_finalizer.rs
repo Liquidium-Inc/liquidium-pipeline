@@ -10,6 +10,7 @@ use crate::{
     stages::executor::ExecutionReceipt,
     utils::now_ts,
     wal::{decode_receipt_wrapper, encode_meta, liq_id_from_receipt, wal_load},
+    watchdog::{Watchdog, WatchdogEvent, noop_watchdog},
 };
 use async_trait::async_trait;
 use candid::Nat;
@@ -20,6 +21,7 @@ use super::{
 };
 
 const MULTI_VENUE_PERMANENT_PREFIX: &str = "permanent multi-venue finalizer: ";
+const MULTI_VENUE_LOCK_CLEANUP_PREFIX: &str = "multi-venue lock cleanup: ";
 
 /// WAL orchestrator for a committed generic multi-venue execution plan.
 ///
@@ -29,6 +31,7 @@ pub struct MultiVenueFinalizer {
     planner: IcpswapFirstPlanner,
     venues: VenueRegistry,
     routing: MultiVenueRouting,
+    watchdog: Arc<dyn Watchdog>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -48,7 +51,30 @@ impl MultiVenueFinalizer {
             planner,
             venues,
             routing: MultiVenueRouting::IcpswapFirst,
+            watchdog: noop_watchdog(),
         })
+    }
+
+    pub fn with_watchdog(mut self, watchdog: Arc<dyn Watchdog>) -> Self {
+        self.watchdog = watchdog;
+        self
+    }
+
+    async fn notify_lock_cleanup_required(
+        &self,
+        lock: &super::VenueExecutionLock,
+        venue_id: &str,
+        detail: &str,
+    ) {
+        self.watchdog
+            .notify(WatchdogEvent::OperatorRequired {
+                execution_id: lock.execution_id.clone(),
+                venue: venue_id.to_string(),
+                pending_step: "lock_cleanup".to_string(),
+                owner: lock.owner_key.clone(),
+                details: detail.to_string(),
+            })
+            .await;
     }
 
     pub fn with_routing(mut self, routing: MultiVenueRouting) -> Result<Self, String> {
@@ -166,15 +192,21 @@ impl MultiVenueFinalizer {
         state: &mut MultiVenueExecutionState,
     ) -> Result<(), String> {
         let mut retryable_errors = Vec::new();
+        let mut lock_cleanup_failed = false;
         for index in 0..state.legs.len() {
-            if !matches!(
-                state.legs[index].status,
+            let current = state.legs[index].clone();
+            let terminal = matches!(
+                current.status,
+                VenueLegStatus::Completed | VenueLegStatus::Recovered | VenueLegStatus::FailedPermanent
+            );
+            let runnable = matches!(
+                current.status,
                 VenueLegStatus::Planned | VenueLegStatus::Running | VenueLegStatus::OperatorRequired
-            ) {
+            );
+            if !terminal && !runnable {
                 continue;
             }
 
-            let current = state.legs[index].clone();
             let adapter = self.venues.adapter(&current.venue_id).ok_or_else(|| {
                 format!(
                     "{MULTI_VENUE_PERMANENT_PREFIX}no adapter registered for committed venue `{}`",
@@ -182,9 +214,30 @@ impl MultiVenueFinalizer {
                 )
             })?;
             let execution_lock = adapter.execution_lock(&current)?;
+
+            // Terminal state was already persisted in an earlier transition.
+            // Retrying this idempotent delete lets a previous release failure
+            // recover without advancing or replaying the venue leg.
+            if terminal {
+                if let Some(lock) = &execution_lock
+                    && let Err(error) = wal
+                        .release_icpswap_execution_lock(&lock.owner_key, &lock.execution_id)
+                        .await
+                {
+                    lock_cleanup_failed = true;
+                    let detail = format!(
+                        "{} leg `{}` failed releasing terminal execution lock: {error}",
+                        current.venue_id, current.leg_id
+                    );
+                    self.notify_lock_cleanup_required(lock, &current.venue_id, &detail).await;
+                    retryable_errors.push(detail);
+                }
+                continue;
+            }
+
             if let Some(lock) = &execution_lock
                 && !wal
-                    .acquire_icpswap_owner_lock(&lock.owner_key, &lock.execution_id)
+                    .acquire_icpswap_execution_lock(&lock.owner_key, &lock.execution_id)
                     .await
                     .map_err(|error| format!("failed acquiring venue execution lock: {error}"))?
             {
@@ -208,15 +261,17 @@ impl MultiVenueFinalizer {
             ) && let Some(lock) = &execution_lock
             {
                 if let Err(error) = wal
-                    .release_icpswap_owner_lock(&lock.owner_key, &lock.execution_id)
+                    .release_icpswap_execution_lock(&lock.owner_key, &lock.execution_id)
                     .await
                 {
-                    tracing::warn!(
-                        owner_key = %lock.owner_key,
-                        execution_id = %lock.execution_id,
-                        %error,
-                        "failed releasing terminal venue execution lock"
+                    lock_cleanup_failed = true;
+                    let detail = format!(
+                        "{} leg `{}` failed releasing terminal execution lock: {error}",
+                        state.legs[index].venue_id, state.legs[index].leg_id
                     );
+                    self.notify_lock_cleanup_required(lock, &state.legs[index].venue_id, &detail)
+                        .await;
+                    retryable_errors.push(detail);
                 }
             }
 
@@ -233,6 +288,11 @@ impl MultiVenueFinalizer {
         state.outcome = derive_outcome(&state.legs);
         if retryable_errors.is_empty() {
             Ok(())
+        } else if lock_cleanup_failed {
+            Err(format!(
+                "{MULTI_VENUE_LOCK_CLEANUP_PREFIX}{}",
+                retryable_errors.join("; ")
+            ))
         } else {
             Err(retryable_errors.join("; "))
         }
@@ -403,6 +463,8 @@ impl Finalizer for MultiVenueFinalizer {
     fn classify_error(&self, error: &str) -> FinalizerErrorKind {
         if error.starts_with(MULTI_VENUE_PERMANENT_PREFIX) {
             FinalizerErrorKind::Permanent
+        } else if error.starts_with(MULTI_VENUE_LOCK_CLEANUP_PREFIX) {
+            FinalizerErrorKind::LockCleanup
         } else {
             FinalizerErrorKind::Retryable
         }

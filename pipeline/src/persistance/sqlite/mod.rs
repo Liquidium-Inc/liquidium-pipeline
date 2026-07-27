@@ -332,7 +332,7 @@ impl WalStore for SqliteWalStore {
         Ok(())
     }
 
-    async fn acquire_icpswap_owner_lock(&self, owner: &str, execution_id: &str) -> Result<bool> {
+    async fn acquire_icpswap_execution_lock(&self, owner: &str, execution_id: &str) -> Result<bool> {
         self.ensure_writable()?;
         #[derive(QueryableByName)]
         struct LockRow {
@@ -342,12 +342,22 @@ impl WalStore for SqliteWalStore {
 
         let mut conn = self.get_conn()?;
         conn.transaction::<bool, diesel::result::Error, _>(|conn| {
+            let now = now_secs();
             diesel::sql_query(
                 "INSERT OR IGNORE INTO icpswap_execution_locks (owner_principal, execution_id, updated_at) VALUES (?, ?, ?)",
             )
             .bind::<Text, _>(owner)
             .bind::<Text, _>(execution_id)
-            .bind::<BigInt, _>(now_secs())
+            .bind::<BigInt, _>(now)
+            .execute(conn)?;
+            // Re-acquisition by the persisted holder is a heartbeat. A
+            // different execution cannot refresh or steal the row.
+            diesel::sql_query(
+                "UPDATE icpswap_execution_locks SET updated_at = ? WHERE owner_principal = ? AND execution_id = ?",
+            )
+            .bind::<BigInt, _>(now)
+            .bind::<Text, _>(owner)
+            .bind::<Text, _>(execution_id)
             .execute(conn)?;
             let row = diesel::sql_query(
                 "SELECT execution_id FROM icpswap_execution_locks WHERE owner_principal = ? LIMIT 1",
@@ -359,13 +369,30 @@ impl WalStore for SqliteWalStore {
         .map_err(Into::into)
     }
 
-    async fn release_icpswap_owner_lock(&self, owner: &str, execution_id: &str) -> Result<()> {
+    async fn release_icpswap_execution_lock(&self, owner: &str, execution_id: &str) -> Result<()> {
         self.ensure_writable()?;
+        #[derive(QueryableByName)]
+        struct CountRow {
+            #[diesel(sql_type = BigInt)]
+            count: i64,
+        }
+
         let mut conn = self.get_conn()?;
-        diesel::sql_query("DELETE FROM icpswap_execution_locks WHERE owner_principal = ? AND execution_id = ?")
-            .bind::<Text, _>(owner)
-            .bind::<Text, _>(execution_id)
-            .execute(&mut conn)?;
+        let remaining = conn.transaction::<i64, diesel::result::Error, _>(|conn| {
+            diesel::sql_query("DELETE FROM icpswap_execution_locks WHERE owner_principal = ? AND execution_id = ?")
+                .bind::<Text, _>(owner)
+                .bind::<Text, _>(execution_id)
+                .execute(conn)?;
+            let row = diesel::sql_query("SELECT COUNT(*) AS count FROM icpswap_execution_locks WHERE execution_id = ?")
+                .bind::<Text, _>(execution_id)
+                .get_result::<CountRow>(conn)?;
+            Ok(row.count)
+        })?;
+        if remaining != 0 {
+            anyhow::bail!(
+                "ICPSwap execution lock `{execution_id}` still exists after release for persisted owner `{owner}`"
+            );
+        }
         Ok(())
     }
 }
@@ -443,6 +470,8 @@ fn apply_read_only_pragmas(conn: &mut SqliteConnection, busy_timeout_ms: i64) ->
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+
+    use diesel::{QueryableByName, RunQueryDsl, sql_types::BigInt};
 
     use crate::persistance::{LiqResultRecord, ResultStatus, WalStore, now_secs};
 
@@ -531,15 +560,83 @@ mod tests {
         let rt = tokio::runtime::Runtime::new().expect("runtime");
 
         rt.block_on(async {
-            assert!(store.acquire_icpswap_owner_lock("owner-1", "run-1").await.unwrap());
-            assert!(store.acquire_icpswap_owner_lock("owner-1", "run-1").await.unwrap());
-            assert!(!store.acquire_icpswap_owner_lock("owner-1", "run-2").await.unwrap());
-            assert!(store.acquire_icpswap_owner_lock("owner-2", "run-2").await.unwrap());
+            assert!(store.acquire_icpswap_execution_lock("owner-1", "run-1").await.unwrap());
+            assert!(store.acquire_icpswap_execution_lock("owner-1", "run-1").await.unwrap());
+            assert!(!store.acquire_icpswap_execution_lock("owner-1", "run-2").await.unwrap());
+            assert!(store.acquire_icpswap_execution_lock("owner-2", "run-2").await.unwrap());
 
-            store.release_icpswap_owner_lock("owner-1", "wrong-run").await.unwrap();
-            assert!(!store.acquire_icpswap_owner_lock("owner-1", "run-2").await.unwrap());
-            store.release_icpswap_owner_lock("owner-1", "run-1").await.unwrap();
-            assert!(store.acquire_icpswap_owner_lock("owner-1", "run-2").await.unwrap());
+            store.release_icpswap_execution_lock("owner-1", "wrong-run").await.unwrap();
+            assert!(!store.acquire_icpswap_execution_lock("owner-1", "run-2").await.unwrap());
+            store.release_icpswap_execution_lock("owner-1", "run-1").await.unwrap();
+            assert!(store.acquire_icpswap_execution_lock("owner-1", "run-2").await.unwrap());
+        });
+    }
+
+    #[test]
+    fn icpswap_owner_lock_heartbeat_only_refreshes_the_current_holder() {
+        #[derive(QueryableByName)]
+        struct LockTimestamp {
+            #[diesel(sql_type = BigInt)]
+            updated_at: i64,
+        }
+
+        let temp = tempfile::NamedTempFile::new().expect("tmp db");
+        let path = temp.path().display().to_string();
+        let store = SqliteWalStore::new_with_busy_timeout(&path, 5_000).expect("store");
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+
+        rt.block_on(async {
+            assert!(store.acquire_icpswap_execution_lock("owner", "holder").await.unwrap());
+            let mut conn = store.get_conn().expect("connection");
+            diesel::sql_query("UPDATE icpswap_execution_locks SET updated_at = 1 WHERE owner_principal = 'owner'")
+                .execute(&mut conn)
+                .expect("age lock");
+            drop(conn);
+
+            assert!(store.acquire_icpswap_execution_lock("owner", "holder").await.unwrap());
+            let mut conn = store.get_conn().expect("connection");
+            let refreshed = diesel::sql_query(
+                "SELECT updated_at FROM icpswap_execution_locks WHERE owner_principal = 'owner'",
+            )
+            .get_result::<LockTimestamp>(&mut conn)
+            .expect("refreshed timestamp")
+            .updated_at;
+            assert!(refreshed > 1);
+
+            diesel::sql_query("UPDATE icpswap_execution_locks SET updated_at = 1 WHERE owner_principal = 'owner'")
+                .execute(&mut conn)
+                .expect("age lock again");
+            drop(conn);
+            assert!(!store.acquire_icpswap_execution_lock("owner", "contender").await.unwrap());
+            let mut conn = store.get_conn().expect("connection");
+            let unchanged = diesel::sql_query(
+                "SELECT updated_at FROM icpswap_execution_locks WHERE owner_principal = 'owner'",
+            )
+            .get_result::<LockTimestamp>(&mut conn)
+            .expect("unchanged timestamp")
+            .updated_at;
+            assert_eq!(unchanged, 1);
+        });
+    }
+
+    #[test]
+    fn lock_release_rejects_a_key_that_does_not_match_the_persisted_owner() {
+        let temp = tempfile::NamedTempFile::new().expect("tmp db");
+        let path = temp.path().display().to_string();
+        let store = SqliteWalStore::new_with_busy_timeout(&path, 5_000).expect("store");
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+
+        rt.block_on(async {
+            assert!(store.acquire_icpswap_execution_lock("persisted-owner", "run").await.unwrap());
+            let error = store
+                .release_icpswap_execution_lock("configured-owner", "run")
+                .await
+                .expect_err("wrong owner must not look like successful idempotent cleanup");
+            assert!(error.to_string().contains("still exists"));
+            store
+                .release_icpswap_execution_lock("persisted-owner", "run")
+                .await
+                .unwrap();
         });
     }
 

@@ -71,22 +71,6 @@ enum Commands {
     // Shows wallet token balances
     Balance,
 
-    /// Quotes or executes a mainnet ICP -> ckUSDC swap through ICPSwap.
-    Icpswap {
-        /// Maximum ICP debit, including transfer and pool-deposit ledger fees.
-        #[arg(long, required_unless_present = "resume", conflicts_with = "resume")]
-        amount: Option<String>,
-        /// Maximum tolerated slippage in basis points.
-        #[arg(long, conflicts_with = "resume")]
-        slippage_bps: Option<u32>,
-        /// Submit the quoted swap after interactive confirmation.
-        #[arg(long, conflicts_with = "resume")]
-        execute: bool,
-        /// Resume a previously checkpointed live swap by run ID.
-        #[arg(long, conflicts_with_all = ["amount", "slippage_bps", "execute"])]
-        resume: Option<String>,
-    },
-
     // Withdraws funds. Without flags, starts the interactive wizard.
     // With flags, performs a non-interactive withdrawal.
     Withdraw {
@@ -208,22 +192,6 @@ async fn main() {
         Commands::Balance => {
             if let Err(e) = commands::funds::funds().await {
                 eprintln!("Balance check failed: {}", e);
-            }
-        }
-        Commands::Icpswap {
-            amount,
-            slippage_bps,
-            execute,
-            resume,
-        } => {
-            let options = commands::icpswap::IcpswapCommandOptions {
-                amount,
-                slippage_bps,
-                execute,
-                resume,
-            };
-            if let Err(error) = commands::icpswap::run(options).await {
-                eprintln!("ICPSwap command failed: {error}");
             }
         }
         Commands::Withdraw {
@@ -463,43 +431,6 @@ mod tests {
     fn cli_parse_run_conflicting_log_flags_fails() {
         let parsed = Cli::try_parse_from(["liquidator", "run", "--log-file", "--no-log-file"]);
         assert!(parsed.is_err(), "conflicting log flags should fail parsing");
-    }
-
-    #[test]
-    fn cli_parse_icpswap_quote_and_execute() {
-        let parsed = Cli::try_parse_from([
-            "liquidator",
-            "icpswap",
-            "--amount",
-            "0.1",
-            "--slippage-bps",
-            "100",
-            "--execute",
-        ])
-        .expect("ICPSwap execution should parse");
-        match parsed.command {
-            Commands::Icpswap {
-                amount,
-                slippage_bps,
-                execute,
-                resume,
-            } => {
-                assert_eq!(amount.as_deref(), Some("0.1"));
-                assert_eq!(slippage_bps, Some(100));
-                assert!(execute);
-                assert_eq!(resume, None);
-            }
-            _ => panic!("expected ICPSwap command"),
-        }
-    }
-
-    #[test]
-    fn cli_parse_icpswap_resume_is_exclusive() {
-        let parsed = Cli::try_parse_from(["liquidator", "icpswap", "--resume", "icpswap-123"])
-            .expect("ICPSwap resume should parse");
-        assert!(matches!(parsed.command, Commands::Icpswap { resume: Some(_), .. }));
-        assert!(Cli::try_parse_from(["liquidator", "icpswap", "--resume", "icpswap-123", "--amount", "0.1",]).is_err());
-        assert!(Cli::try_parse_from(["liquidator", "icpswap"]).is_err());
     }
 
     #[cfg(target_os = "linux")]

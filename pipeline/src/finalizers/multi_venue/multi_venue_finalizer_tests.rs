@@ -29,14 +29,33 @@ use crate::{
     swappers::model::{SwapExecution, SwapQuote, SwapQuoteLeg, SwapRequest},
     utils::ICP_LEDGER_PRINCIPAL,
     wal::{decode_receipt_wrapper, encode_meta, liq_id_from_receipt},
+    watchdog::{Watchdog, WatchdogEvent},
 };
 
 const TOTAL_PAY: u64 = 100_000_000;
 const DEBT_REPAID: u64 = 190_000_000;
 
+#[derive(Default)]
+struct RecordingWatchdog(Mutex<Vec<(String, String)>>);
+
+#[async_trait]
+impl Watchdog for RecordingWatchdog {
+    async fn notify(&self, event: WatchdogEvent<'_>) {
+        if let WatchdogEvent::OperatorRequired {
+            execution_id,
+            pending_step,
+            ..
+        } = event
+        {
+            self.0.lock().expect("watchdog lock").push((execution_id, pending_step));
+        }
+    }
+}
+
 struct TestWal {
     row: Mutex<Option<LiqResultRecord>>,
     lock_available: AtomicBool,
+    lock_release_available: AtomicBool,
     lock_acquisitions: AtomicUsize,
     lock_releases: AtomicUsize,
 }
@@ -69,6 +88,7 @@ impl TestWal {
         Self {
             row: Mutex::new(Some(row)),
             lock_available: AtomicBool::new(true),
+            lock_release_available: AtomicBool::new(true),
             lock_acquisitions: AtomicUsize::new(0),
             lock_releases: AtomicUsize::new(0),
         }
@@ -131,13 +151,24 @@ impl WalStore for TestWal {
         Ok(())
     }
 
-    async fn acquire_icpswap_owner_lock(&self, _owner: &str, _execution_id: &str) -> anyhow::Result<bool> {
+    async fn acquire_icpswap_execution_lock(
+        &self,
+        _owner: &str,
+        _execution_id: &str,
+    ) -> anyhow::Result<bool> {
         self.lock_acquisitions.fetch_add(1, Ordering::SeqCst);
         Ok(self.lock_available.load(Ordering::SeqCst))
     }
 
-    async fn release_icpswap_owner_lock(&self, _owner: &str, _execution_id: &str) -> anyhow::Result<()> {
+    async fn release_icpswap_execution_lock(
+        &self,
+        _owner: &str,
+        _execution_id: &str,
+    ) -> anyhow::Result<()> {
         self.lock_releases.fetch_add(1, Ordering::SeqCst);
+        if !self.lock_release_available.load(Ordering::SeqCst) {
+            anyhow::bail!("injected lock release failure");
+        }
         Ok(())
     }
 }
@@ -650,4 +681,39 @@ async fn exclusive_venue_leg_waits_for_its_durable_owner_lock() {
     assert!(completed.finalized);
     assert_eq!(icpswap.calls(), 1);
     assert_eq!(wal.lock_releases.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn terminal_leg_retries_lock_cleanup_without_readvancing_the_venue() {
+    let receipt = receipt();
+    let wal = TestWal::with_receipt(&receipt);
+    wal.lock_release_available.store(false, Ordering::SeqCst);
+    let icpswap = Arc::new(
+        ScriptedAdapter::new(ICPSWAP_VENUE_ID, None, vec![VenueLegStatus::Completed])
+            .with_execution_lock("trader", "icpswap-execution"),
+    );
+    let mexc = Arc::new(ScriptedAdapter::new(MEXC_VENUE_ID, None, Vec::new()));
+    let watchdog = Arc::new(RecordingWatchdog::default());
+    let finalizer = finalizer(vec![icpswap.clone(), mexc]).with_watchdog(watchdog.clone());
+
+    let first = finalizer
+        .finalize(&wal, receipt.clone())
+        .await
+        .expect_err("failed cleanup must keep the parent WAL row retryable");
+    assert_eq!(finalizer.classify_error(&first), FinalizerErrorKind::LockCleanup);
+    assert_eq!(wal.leg_statuses(), vec![VenueLegStatus::Completed]);
+    assert_eq!(icpswap.calls(), 1);
+    assert_eq!(watchdog.0.lock().expect("watchdog lock").as_slice(), &[(
+        "icpswap-execution".to_string(),
+        "lock_cleanup".to_string(),
+    )]);
+
+    wal.lock_release_available.store(true, Ordering::SeqCst);
+    let second = finalizer
+        .finalize(&wal, receipt)
+        .await
+        .expect("the next cycle should retry only lock cleanup");
+    assert!(second.finalized);
+    assert_eq!(icpswap.calls(), 1);
+    assert_eq!(wal.lock_releases.load(Ordering::SeqCst), 2);
 }
