@@ -115,6 +115,7 @@ impl SqliteWalStore {
                 4 => ResultStatus::FailedPermanent,
                 5 => ResultStatus::WaitingCollateral,
                 6 => ResultStatus::WaitingProfit,
+                7 => ResultStatus::OperatorRequired,
                 _ => ResultStatus::FailedPermanent,
             },
             attempt: r.attempt,
@@ -143,6 +144,7 @@ impl SqliteWalStore {
                 4 => ResultStatus::FailedPermanent,
                 5 => ResultStatus::WaitingCollateral,
                 6 => ResultStatus::WaitingProfit,
+                7 => ResultStatus::OperatorRequired,
                 _ => ResultStatus::FailedPermanent,
             };
             *out.entry(status).or_insert(0) += count;
@@ -552,5 +554,47 @@ mod tests {
         let reader = SqliteWalStore::new_read_only_with_busy_timeout(&path, 5_000).expect("reader");
         let err = reader.set_daemon_paused(true).expect_err("write should fail");
         assert!(err.to_string().contains("read-only"));
+    }
+
+    #[test]
+    fn operator_required_rows_are_persisted_but_not_returned_as_pending() {
+        let temp = tempfile::NamedTempFile::new().expect("tmp db");
+        let path = temp.path().display().to_string();
+        let store = SqliteWalStore::new_with_busy_timeout(&path, 5_000).expect("store");
+        let now = now_secs();
+        let make_row = |id: &str, status| LiqResultRecord {
+            id: id.to_string(),
+            status,
+            attempt: 0,
+            error_count: 0,
+            last_error: None,
+            created_at: now,
+            updated_at: now,
+            meta_json: "{}".to_string(),
+        };
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+
+        rt.block_on(async {
+            store
+                .upsert_result(make_row("runnable", ResultStatus::Enqueued))
+                .await
+                .expect("seed runnable row");
+            store
+                .upsert_result(make_row("parked", ResultStatus::OperatorRequired))
+                .await
+                .expect("seed operator-required row");
+
+            let pending = store.get_pending(10).await.expect("pending rows");
+            assert_eq!(pending.len(), 1);
+            assert_eq!(pending[0].id, "runnable");
+
+            let parked = store
+                .list_by_status(ResultStatus::OperatorRequired, 10)
+                .await
+                .expect("operator-required rows");
+            assert_eq!(parked.len(), 1);
+            assert_eq!(parked[0].id, "parked");
+            assert_eq!(parked[0].status, ResultStatus::OperatorRequired);
+        });
     }
 }

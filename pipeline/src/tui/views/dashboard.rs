@@ -174,10 +174,11 @@ fn draw_profits_panel(f: &mut Frame<'_>, area: Rect, app: &App) {
         format!("WAL error: {}", truncate(err, 32))
     } else if let Some(wal) = &app.wal {
         format!(
-            "WAL @ {} inflight={} wait={} ok={} fail={}",
+            "WAL @ {} inflight={} wait={} operator={} ok={} fail={}",
             wal.at.format("%H:%M:%S"),
             wal.counts.inflight,
             wal.counts.waiting_collateral + wal.counts.waiting_profit,
+            wal.counts.operator_required,
             wal.counts.succeeded,
             wal.counts.failed_retryable + wal.counts.failed_permanent
         )
@@ -397,6 +398,7 @@ fn status_short(status: ResultStatus) -> &'static str {
         ResultStatus::FailedPermanent => "failed(p)",
         ResultStatus::WaitingCollateral => "wait_collat",
         ResultStatus::WaitingProfit => "wait_profit",
+        ResultStatus::OperatorRequired => "operator",
     }
 }
 
@@ -406,6 +408,7 @@ fn status_style(status: ResultStatus) -> Style {
         ResultStatus::FailedRetryable | ResultStatus::FailedPermanent => Style::default().fg(Color::Red),
         ResultStatus::InFlight => Style::default().fg(Color::Yellow),
         ResultStatus::WaitingCollateral | ResultStatus::WaitingProfit => Style::default().fg(Color::Cyan),
+        ResultStatus::OperatorRequired => Style::default().fg(Color::Magenta),
         ResultStatus::Enqueued => Style::default().fg(Color::DarkGray),
     }
 }

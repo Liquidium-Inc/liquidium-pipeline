@@ -211,7 +211,15 @@ where
         request: &SwapRequest,
     ) -> Result<MexcPreparedPreview, String> {
         let mut state = self.prepare_swap_request(execution_id, request)?;
-        let initial_amount = state.size_in.to_f64();
+        if state.size_in.value == Nat::from(0u8) {
+            return Err("MEXC cannot quote a non-positive pay amount".to_string());
+        }
+        if let Some(requested_bps) = request.max_slippage_bps {
+            amount_after_bps_haircut(&Nat::from(0u8), requested_bps)?;
+        }
+        let (_, executable_pay) =
+            Self::compute_fee_adjusted_deposit_transfer(&state.deposit.deposit_asset, &state.size_in)?;
+        let initial_amount = executable_pay.to_f64();
         if initial_amount <= LIQUIDITY_EPS {
             return Err("MEXC cannot quote a non-positive pay amount".to_string());
         }
@@ -270,10 +278,12 @@ where
                 gas_fee: Nat::from(0u8),
             }],
         };
-        let max_slippage_bps = request
-            .max_slippage_bps
-            .unwrap_or(self.max_sell_slippage_bps.max(0.0) as u32);
-        let conservative_value = amount_after_bps_haircut(&receive_amount.value, max_slippage_bps)?;
+        let execution_slippage_bps = self.max_sell_slippage_bps.max(0.0) as u32;
+        let conservative_haircut_bps = execution_slippage_bps
+            .checked_add(self.quote_route_fee_bps)
+            .and_then(|bps| bps.checked_add(self.quote_delay_buffer_bps))
+            .ok_or_else(|| "MEXC conservative quote haircut overflowed u32".to_string())?;
+        let conservative_value = amount_after_bps_haircut(&receive_amount.value, conservative_haircut_bps)?;
 
         Ok(MexcPreparedPreview {
             state,

@@ -1,4 +1,5 @@
 #![allow(deprecated)]
+#![allow(dead_code)]
 
 use async_trait::async_trait;
 use candid::Nat;
@@ -11,7 +12,7 @@ use super::utils::{
 use crate::{
     config::{ConfigTrait, SwapperMode},
     finalizers::{
-        cex_finalizer::CexFinalizerLogic,
+        cex_finalizer::{CexFinalizerLogic, CexState},
         dex_finalizer::DexRouteFinalizer,
         finalizer::{Finalizer, FinalizerErrorKind, FinalizerResult},
     },
@@ -109,6 +110,7 @@ where
             .map_err(|e| format!("wal update failed: {e}"))?;
         Ok(FinalizerResult {
             finalized: true,
+            operator_required: false,
             swap_result: None,
             swapper: Some("none".to_string()),
             reason,
@@ -152,6 +154,7 @@ where
             );
             return Ok(FinalizerResult {
                 finalized: true,
+                operator_required: false,
                 swap_result: None,
                 swapper: Some("recovery".to_string()),
                 reason: None,
@@ -182,6 +185,7 @@ where
 
         Ok(FinalizerResult {
             finalized: true,
+            operator_required: false,
             swap_result: None,
             swapper: Some("recovery".to_string()),
             reason: None,
@@ -366,7 +370,10 @@ where
         if wrapper.venue_execution.is_some() || self.dex_finalizer.has_committed_route(wal, receipt).await? {
             return Ok(Some(RouteVenue::Dex));
         }
-        if !wrapper.meta.is_empty() {
+        // `meta` predates typed venue state and has also carried unrelated
+        // finalizer bytes. Treat it as CEX only when it actually decodes as the
+        // legacy CEX state; arbitrary metadata must not commit a route.
+        if !wrapper.meta.is_empty() && serde_json::from_slice::<CexState>(&wrapper.meta).is_ok() {
             return Ok(Some(RouteVenue::Cex));
         }
         Ok(wrapper

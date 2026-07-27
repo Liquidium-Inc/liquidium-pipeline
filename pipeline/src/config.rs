@@ -80,6 +80,7 @@ pub struct Config {
     pub cex_route_fee_bps: u32,
     /// Reserved for hybrid mode force-over-threshold behavior.
     /// Hybrid mode is currently disabled.
+    #[allow(dead_code)]
     pub cex_force_over_usd_threshold: f64,
     /// Configured MEXC market universe for hop-based route discovery.
     /// Markets are normalized as `BASE_QUOTE`.

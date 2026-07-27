@@ -16,8 +16,8 @@ use crate::stage::PipelineStage;
 use crate::stages::executor::{ExecutionReceipt, ExecutionStatus};
 use crate::utils::now_ts;
 use crate::wal::{
-    decode_receipt_wrapper, encode_meta, wal_mark_enqueued, wal_mark_inflight, wal_mark_permanent_failed,
-    wal_mark_retryable_failed, wal_mark_succeeded,
+    decode_receipt_wrapper, encode_meta, wal_mark_enqueued, wal_mark_inflight, wal_mark_operator_required,
+    wal_mark_permanent_failed, wal_mark_retryable_failed, wal_mark_succeeded,
 };
 use liquidium_pipeline_connectors::pipeline_agent::PipelineAgent;
 use liquidium_pipeline_core::types::protocol_types::{LiquidationResult, ProtocolError, TransferStatus};
@@ -183,14 +183,34 @@ where
         let mut receipts: Vec<ExecutionReceipt> = vec![];
 
         for row in rows {
-            let meta = decode_receipt_wrapper(&row)?
-                .ok_or_else(|| format!("receipt not found in WAL meta_json for {}", row.id))?;
+            let meta = match decode_receipt_wrapper(&row) {
+                Ok(Some(meta)) => meta,
+                Ok(None) => {
+                    let error = format!("receipt not found in WAL meta_json for {}", row.id);
+                    if let Err(mark_error) = wal_mark_permanent_failed(&*self.wal, &row.id, error.clone()).await {
+                        warn!("Failed to quarantine malformed WAL row {}: {}", row.id, mark_error);
+                    }
+                    error!("[finalize] quarantined malformed WAL row {}: {}", row.id, error);
+                    continue;
+                }
+                Err(error) => {
+                    if let Err(mark_error) = wal_mark_permanent_failed(&*self.wal, &row.id, error.clone()).await {
+                        warn!("Failed to quarantine malformed WAL row {}: {}", row.id, mark_error);
+                    }
+                    error!("[finalize] quarantined malformed WAL row {}: {}", row.id, error);
+                    continue;
+                }
+            };
             let receipt: ExecutionReceipt = meta.receipt;
 
-            let liq = receipt
-                .liquidation_result
-                .as_ref()
-                .ok_or_else(|| format!("missing liquidation_result for WAL id {}", row.id))?;
+            let Some(liq) = receipt.liquidation_result.as_ref() else {
+                let error = format!("missing liquidation_result for WAL id {}", row.id);
+                if let Err(mark_error) = wal_mark_permanent_failed(&*self.wal, &row.id, error.clone()).await {
+                    warn!("Failed to quarantine malformed WAL row {}: {}", row.id, mark_error);
+                }
+                error!("[finalize] quarantined malformed WAL row {}: {}", row.id, error);
+                continue;
+            };
 
             let liq_id = liq.id;
             wal_id_by_liq.insert(liq_id, row.id.clone());
@@ -270,6 +290,7 @@ where
                     FinalizerResult {
                         swap_result: None,
                         finalized: true,
+                        operator_required: false,
                         swapper: Some("none".to_string()),
                         reason: None,
                     },
@@ -320,7 +341,20 @@ where
 
             match outcome {
                 Ok(res) => {
-                    if res.finalized {
+                    if res.operator_required {
+                        let wal_id = wal_id_by_liq
+                            .get(&liq_id)
+                            .ok_or_else(|| format!("missing WAL id for liquidation {}", liq_id))?;
+                        if let Err(error) = wal_mark_operator_required(&*self.wal, wal_id).await {
+                            warn!("Failed to park operator-required WAL row {}: {}", wal_id, error);
+                        } else {
+                            warn!(
+                                "[finalize] operator reconciliation required liq_id={} reason={}",
+                                liq_id,
+                                res.reason.as_deref().unwrap_or("unspecified")
+                            );
+                        }
+                    } else if res.finalized {
                         let wal_id = wal_id_by_liq
                             .get(&liq_id)
                             .ok_or_else(|| format!("missing WAL id for liquidation {}", liq_id))?;
@@ -332,7 +366,9 @@ where
                             .get(&liq_id)
                             .ok_or_else(|| format!("missing WAL id for liquidation {}", liq_id))?;
 
-                        let _ = wal_mark_enqueued(&*self.wal, wal_id).await;
+                        if let Err(error) = wal_mark_enqueued(&*self.wal, wal_id).await {
+                            warn!("Failed to re-enqueue unfinished WAL row {}: {}", wal_id, error);
+                        }
                     }
                 }
                 Err(e) => {
@@ -354,6 +390,7 @@ where
                             FinalizerResult {
                                 swap_result: None,
                                 finalized: true,
+                                operator_required: false,
                                 swapper: None,
                                 reason: Some(format!("bad debt finalizer amount floor accepted: {}", err_msg)),
                             },
@@ -374,6 +411,7 @@ where
                             FinalizerResult {
                                 swap_result: None,
                                 finalized: true,
+                                operator_required: false,
                                 swapper: None,
                                 reason: Some(err_msg.clone()),
                             },
@@ -473,6 +511,7 @@ mod tests {
             Ok(FinalizerResult {
                 swap_result: None,
                 finalized: true,
+                operator_required: false,
                 swapper: Some("noop".to_string()),
                 reason: None,
             })
@@ -483,6 +522,21 @@ mod tests {
     struct ErrorFinalizer {
         error: String,
         kind: FinalizerErrorKind,
+    }
+
+    struct OperatorRequiredFinalizer;
+
+    #[async_trait::async_trait]
+    impl Finalizer for OperatorRequiredFinalizer {
+        async fn finalize(&self, _: &dyn WalStore, _: ExecutionReceipt) -> Result<FinalizerResult, String> {
+            Ok(FinalizerResult {
+                swap_result: None,
+                finalized: false,
+                operator_required: true,
+                swapper: Some("mexc".to_string()),
+                reason: Some("ambiguous MEXC submission".to_string()),
+            })
+        }
     }
 
     #[async_trait::async_trait]
@@ -593,6 +647,107 @@ mod tests {
         };
         encode_meta(&mut row, &wrapper).expect("encode_meta should succeed");
         row
+    }
+
+    #[tokio::test]
+    async fn malformed_row_is_quarantined_without_blocking_valid_rows() {
+        let malformed_id = "malformed-row".to_string();
+        let malformed = LiqResultRecord {
+            id: malformed_id.clone(),
+            status: ResultStatus::Enqueued,
+            attempt: 0,
+            error_count: 0,
+            last_error: None,
+            created_at: 0,
+            updated_at: 0,
+            meta_json: "{not-json".to_string(),
+        };
+        let valid_liq_id = 920u128;
+        let valid_receipt = make_swapping_receipt(valid_liq_id);
+        let valid = make_row(valid_liq_id, valid_receipt);
+        let valid_for_profit = valid.clone();
+        let valid_id = valid.id.clone();
+        let valid_id_for_success = valid_id.clone();
+
+        let mut wal = MockWalStore::new();
+        wal.expect_get_pending()
+            .with(eq(100usize))
+            .times(1)
+            .return_once(move |_| Ok(vec![malformed, valid]));
+        wal.expect_update_failure()
+            .withf(move |id, status, error, bump| {
+                id == malformed_id
+                    && *status == ResultStatus::FailedPermanent
+                    && error.contains("invalid meta_json")
+                    && *bump
+            })
+            .times(1)
+            .returning(|_, _, _, _| Ok(()));
+        wal.expect_update_status()
+            .withf(move |id, status, bump| id == valid_id && *status == ResultStatus::InFlight && *bump)
+            .times(1)
+            .returning(|_, _, _| Ok(()));
+        wal.expect_update_status()
+            .withf(move |id, status, bump| id == valid_id_for_success && *status == ResultStatus::Succeeded && *bump)
+            .times(1)
+            .returning(|_, _, _| Ok(()));
+        wal.expect_get_result()
+            .times(1)
+            .returning(move |_| Ok(Some(valid_for_profit.clone())));
+        wal.expect_upsert_result().times(1).returning(|_| Ok(()));
+
+        let calls = Arc::new(Mutex::new(0usize));
+        let stage = FinalizeStage::new(
+            Arc::new(wal),
+            Arc::new(NoopFinalizer { calls: calls.clone() }),
+            Arc::new(SimpleProfitCalculator),
+            Arc::new(MockPipelineAgent::new()),
+            Principal::anonymous(),
+            5,
+            120,
+        );
+
+        let outcomes = stage.process(&()).await.expect("valid row should still finalize");
+
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(*calls.lock().expect("calls lock"), 1);
+    }
+
+    #[tokio::test]
+    async fn operator_required_result_is_parked_outside_the_runnable_queue() {
+        let liq_id = 921u128;
+        let row = make_row(liq_id, make_swapping_receipt(liq_id));
+        let row_id = row.id.clone();
+        let row_id_for_operator = row_id.clone();
+
+        let mut wal = MockWalStore::new();
+        wal.expect_get_pending()
+            .with(eq(100usize))
+            .times(1)
+            .return_once(move |_| Ok(vec![row]));
+        wal.expect_update_status()
+            .withf(move |id, status, bump| id == row_id && *status == ResultStatus::InFlight && *bump)
+            .times(1)
+            .returning(|_, _, _| Ok(()));
+        wal.expect_update_status()
+            .withf(move |id, status, bump| {
+                id == row_id_for_operator && *status == ResultStatus::OperatorRequired && !*bump
+            })
+            .times(1)
+            .returning(|_, _, _| Ok(()));
+
+        let stage = FinalizeStage::new(
+            Arc::new(wal),
+            Arc::new(OperatorRequiredFinalizer),
+            Arc::new(SimpleProfitCalculator),
+            Arc::new(MockPipelineAgent::new()),
+            Principal::anonymous(),
+            5,
+            120,
+        );
+
+        let outcomes = stage.process(&()).await.expect("operator row should park cleanly");
+        assert!(outcomes.is_empty());
     }
 
     #[test]

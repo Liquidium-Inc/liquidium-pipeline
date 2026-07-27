@@ -21,6 +21,16 @@ pub struct VenueLegProgress {
     pub status: VenueLegStatus,
     pub result: Option<SwapExecution>,
     pub last_error: Option<String>,
+    /// Error from this specific advance attempt. The orchestrator persists the
+    /// updated leg first, then returns this error so normal finalizer backoff
+    /// and retry accounting apply without losing the venue's latest state.
+    pub retryable_error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VenueExecutionLock {
+    pub owner_key: String,
+    pub execution_id: String,
 }
 
 /// Amount-scoped interface for one independently persisted venue leg.
@@ -44,6 +54,12 @@ pub trait MultiVenueAdapter: Send + Sync {
     /// Produces an amount-scoped quote and initial execution state without
     /// submitting transfers, orders, or swaps.
     async fn preview(&self, request: &SwapRequest) -> Result<VenueRoutePreview, String>;
+
+    /// Optional durable exclusivity key acquired by the parent orchestrator.
+    /// Adapters remain unable to write the parent WAL row.
+    fn execution_lock(&self, _leg: &VenueLegState) -> Result<Option<VenueExecutionLock>, String> {
+        Ok(None)
+    }
 
     /// Advances only the supplied persisted leg by one idempotent transition.
     async fn advance(&self, leg: &VenueLegState) -> Result<VenueLegProgress, String>;

@@ -130,6 +130,7 @@ impl Finalizer for RecordingDexFinalizer {
         let req = receipt.request.swap_args.expect("swap request");
         Ok(FinalizerResult {
             finalized: true,
+            operator_required: false,
             swapper: Some("icpswap".to_string()),
             reason: None,
             swap_result: Some(SwapExecution {

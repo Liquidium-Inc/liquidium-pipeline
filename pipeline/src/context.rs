@@ -27,7 +27,7 @@ use liquidium_pipeline_connectors::{
 
 use crate::approval_state::ApprovalState;
 use crate::config::{Config, ConfigTrait};
-use crate::finalizers::{dex_finalizer::DexRouteFinalizer, icpswap::finalizer::IcpswapFinalizer};
+use crate::finalizers::icpswap::finalizer::IcpswapFinalizer;
 use crate::swappers::icpswap::{client::IcpswapClient, types::IcpswapTokenMetadata, venue::IcpswapVenue};
 use crate::swappers::router::SwapRouter;
 use crate::watchdog::{balance_monitor::DEFAULT_LOW_BALANCE_ALERT_COOLDOWN, slack_watchdog_from_env};
@@ -44,7 +44,6 @@ pub struct PipelineContext {
     pub trader_transfers: Arc<TransferService>,
     pub swap_router: Arc<SwapRouter>,
     pub icpswap_finalizer: Arc<IcpswapFinalizer>,
-    pub dex_route_finalizer: Arc<dyn DexRouteFinalizer>,
     pub recovery_transfers: Arc<TransferService>,
     pub bridge_transfers: Arc<TransferService>,
     pub evm_address: String,
@@ -303,8 +302,6 @@ impl<P: Provider<AnyNetwork> + WalletProvider<AnyNetwork> + Clone + 'static> Pip
             )
             .with_watchdog(slack_watchdog_from_env(DEFAULT_LOW_BALANCE_ALERT_COOLDOWN)),
         );
-        let dex_route_finalizer: Arc<dyn DexRouteFinalizer> = icpswap_finalizer.clone();
-
         // The router only sees ICPSwap through the common venue abstraction.
         let swap_router = SwapRouter::new().with_default_venue(icpswap_venue);
 
@@ -314,7 +311,6 @@ impl<P: Provider<AnyNetwork> + WalletProvider<AnyNetwork> + Clone + 'static> Pip
             config: config.clone(),
             swap_router,
             icpswap_finalizer,
-            dex_route_finalizer,
             registry,
             main_service: Arc::new(main_service),
             trader_service: Arc::new(trader_service),

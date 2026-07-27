@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use std::{fmt, sync::Arc};
 
 use async_trait::async_trait;
@@ -129,6 +131,7 @@ impl Finalizer for dyn DexFinalizerLogic {
         let finlizer_result = FinalizerResult {
             swap_result: Some(swap_exec),
             finalized: true,
+            operator_required: false,
             swapper: None,
             reason: None,
         };

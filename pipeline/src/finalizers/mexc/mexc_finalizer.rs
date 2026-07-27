@@ -111,6 +111,10 @@ where
     pub cex_mexc_available_pairs: Vec<String>,
     /// Maximum intermediate hops allowed in graph-based route discovery.
     pub cex_mexc_max_hops: usize,
+    /// Extra end-to-end route costs included in conservative planner output.
+    pub quote_route_fee_bps: u32,
+    /// Price-move buffer for deposit/trade/withdraw latency.
+    pub quote_delay_buffer_bps: u32,
     /// Optional bridge runtime used by liquidation-linked bridge submit/poll flows.
     pub bridge: Option<MexcBridgeDependencies>,
     /// Resolves the receive-side `AssetId` supplied by the generic venue
@@ -121,6 +125,10 @@ where
     approve_bumps: Mutex<HashMap<String, u8>>,
     /// `market_locks` is acquired/held in async trade flow, so it uses Tokio's async mutex.
     market_locks: TokioMutex<HashMap<String, Arc<TokioMutex<()>>>>,
+    /// Process-local proof that a persisted multi-venue intent came from this
+    /// live adapter. Missing proof after restart means the external call may
+    /// already have happened, so the leg is parked instead of repeated.
+    pub(super) multi_venue_armed_intents: Mutex<HashSet<String>>,
 }
 
 /// Number of orderbook levels used for impact simulation.
@@ -263,7 +271,7 @@ where
         }
     }
 
-    fn compute_fee_adjusted_deposit_transfer(
+    pub(super) fn compute_fee_adjusted_deposit_transfer(
         deposit_asset: &ChainToken,
         size_in: &ChainTokenAmount,
     ) -> Result<(Nat, ChainTokenAmount), String> {
@@ -429,6 +437,12 @@ where
         self
     }
 
+    pub fn with_quote_costs(mut self, route_fee_bps: u32, delay_buffer_bps: u32) -> Self {
+        self.quote_route_fee_bps = route_fee_bps;
+        self.quote_delay_buffer_bps = delay_buffer_bps;
+        self
+    }
+
     // used in tests
     #[allow(unused)]
     pub fn new(
@@ -479,10 +493,13 @@ where
             cex_buy_inverse_enabled,
             cex_mexc_available_pairs: vec![],
             cex_mexc_max_hops: DEFAULT_MEXC_MAX_HOPS,
+            quote_route_fee_bps: 0,
+            quote_delay_buffer_bps: 0,
             bridge: None,
             token_registry: None,
             approve_bumps: Mutex::new(HashMap::new()),
             market_locks: TokioMutex::new(HashMap::new()),
+            multi_venue_armed_intents: Mutex::new(HashSet::new()),
         }
     }
 }

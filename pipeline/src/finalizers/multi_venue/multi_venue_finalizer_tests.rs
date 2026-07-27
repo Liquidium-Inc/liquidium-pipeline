@@ -4,7 +4,7 @@ use std::{
     collections::VecDeque,
     sync::{
         Arc, Mutex, Weak,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
 };
 
@@ -21,10 +21,12 @@ use num_traits::ToPrimitive;
 
 use crate::{
     executors::executor::ExecutorRequest,
-    finalizers::multi_venue::{ICPSWAP_VENUE_ID, MEXC_VENUE_ID, VenueLegProgress, VenueRoutePreview},
+    finalizers::multi_venue::{
+        ICPSWAP_VENUE_ID, MEXC_VENUE_ID, VenueExecutionLock, VenueLegProgress, VenueRoutePreview,
+    },
     persistance::{LiqResultRecord, ResultStatus, VenueExecutionState},
     stages::executor::{ExecutionReceipt, ExecutionStatus},
-    swappers::model::{SwapExecution, SwapQuote, SwapRequest},
+    swappers::model::{SwapExecution, SwapQuote, SwapQuoteLeg, SwapRequest},
     utils::ICP_LEDGER_PRINCIPAL,
     wal::{decode_receipt_wrapper, encode_meta, liq_id_from_receipt},
 };
@@ -34,6 +36,9 @@ const DEBT_REPAID: u64 = 190_000_000;
 
 struct TestWal {
     row: Mutex<Option<LiqResultRecord>>,
+    lock_available: AtomicBool,
+    lock_acquisitions: AtomicUsize,
+    lock_releases: AtomicUsize,
 }
 
 impl TestWal {
@@ -63,6 +68,9 @@ impl TestWal {
         encode_meta(&mut row, &wrapper).expect("encode wrapper");
         Self {
             row: Mutex::new(Some(row)),
+            lock_available: AtomicBool::new(true),
+            lock_acquisitions: AtomicUsize::new(0),
+            lock_releases: AtomicUsize::new(0),
         }
     }
 
@@ -122,15 +130,28 @@ impl WalStore for TestWal {
     async fn delete(&self, _liq_id: &str) -> anyhow::Result<()> {
         Ok(())
     }
+
+    async fn acquire_icpswap_owner_lock(&self, _owner: &str, _execution_id: &str) -> anyhow::Result<bool> {
+        self.lock_acquisitions.fetch_add(1, Ordering::SeqCst);
+        Ok(self.lock_available.load(Ordering::SeqCst))
+    }
+
+    async fn release_icpswap_owner_lock(&self, _owner: &str, _execution_id: &str) -> anyhow::Result<()> {
+        self.lock_releases.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
 }
 
 struct ScriptedAdapter {
     venue_id: &'static str,
     safe_through: Option<u64>,
     progresses: Mutex<VecDeque<VenueLegStatus>>,
+    retryable_errors: Mutex<VecDeque<Option<String>>>,
     advance_calls: AtomicUsize,
+    recover_calls: AtomicUsize,
     wal: Mutex<Weak<TestWal>>,
     observed_statuses: Mutex<Vec<Vec<VenueLegStatus>>>,
+    execution_lock: Option<VenueExecutionLock>,
 }
 
 impl ScriptedAdapter {
@@ -139,9 +160,12 @@ impl ScriptedAdapter {
             venue_id,
             safe_through,
             progresses: Mutex::new(progresses.into()),
+            retryable_errors: Mutex::new(VecDeque::new()),
             advance_calls: AtomicUsize::new(0),
+            recover_calls: AtomicUsize::new(0),
             wal: Mutex::new(Weak::new()),
             observed_statuses: Mutex::new(Vec::new()),
+            execution_lock: None,
         }
     }
 
@@ -149,8 +173,25 @@ impl ScriptedAdapter {
         *self.wal.lock().expect("observer lock") = Arc::downgrade(wal);
     }
 
+    fn with_retryable_errors(self, errors: Vec<Option<String>>) -> Self {
+        *self.retryable_errors.lock().expect("retry errors lock") = errors.into();
+        self
+    }
+
+    fn with_execution_lock(mut self, owner_key: &str, execution_id: &str) -> Self {
+        self.execution_lock = Some(VenueExecutionLock {
+            owner_key: owner_key.to_string(),
+            execution_id: execution_id.to_string(),
+        });
+        self
+    }
+
     fn calls(&self) -> usize {
         self.advance_calls.load(Ordering::SeqCst)
+    }
+
+    fn recovery_calls(&self) -> usize {
+        self.recover_calls.load(Ordering::SeqCst)
     }
 }
 
@@ -193,6 +234,10 @@ impl MultiVenueAdapter for ScriptedAdapter {
         })
     }
 
+    fn execution_lock(&self, _leg: &VenueLegState) -> Result<Option<VenueExecutionLock>, String> {
+        Ok(self.execution_lock.clone())
+    }
+
     async fn advance(&self, leg: &VenueLegState) -> Result<VenueLegProgress, String> {
         self.advance_calls.fetch_add(1, Ordering::SeqCst);
         if let Some(wal) = self.wal.lock().expect("observer lock").upgrade() {
@@ -208,6 +253,12 @@ impl MultiVenueAdapter for ScriptedAdapter {
             .pop_front()
             .unwrap_or(VenueLegStatus::Running);
         let result = (status == VenueLegStatus::Completed).then(|| execution_for(leg));
+        let retryable_error = self
+            .retryable_errors
+            .lock()
+            .expect("retry errors lock")
+            .pop_front()
+            .flatten();
         Ok(VenueLegProgress {
             execution: VenueExecutionState {
                 venue: self.venue_id.to_string(),
@@ -215,12 +266,20 @@ impl MultiVenueAdapter for ScriptedAdapter {
             },
             status,
             result,
-            last_error: None,
+            last_error: retryable_error.clone(),
+            retryable_error,
         })
     }
 
     async fn recover(&self, leg: &VenueLegState) -> Result<VenueLegProgress, String> {
-        self.advance(leg).await
+        self.recover_calls.fetch_add(1, Ordering::SeqCst);
+        Ok(VenueLegProgress {
+            execution: leg.execution.clone(),
+            status: VenueLegStatus::OperatorRequired,
+            result: None,
+            last_error: leg.last_error.clone(),
+            retryable_error: None,
+        })
     }
 }
 
@@ -306,7 +365,19 @@ fn execution_for(leg: &VenueLegState) -> SwapExecution {
         mid_price: 2.0,
         exec_price: 2.0,
         realized_slippage_bps: 0.0,
-        legs: Vec::new(),
+        legs: vec![SwapQuoteLeg {
+            venue: leg.venue_id.clone(),
+            route_id: leg.quote.route_id.clone(),
+            pay_chain: leg.request.pay_amount.token.chain(),
+            pay_symbol: leg.request.pay_amount.token.symbol(),
+            pay_amount: leg.request.pay_amount.value.clone(),
+            receive_chain: leg.quote.estimated_receive.token.chain(),
+            receive_symbol: leg.quote.estimated_receive.token.symbol(),
+            receive_amount: leg.quote.estimated_receive.value.clone(),
+            price: 2.0,
+            lp_fee: Nat::from(0u8),
+            gas_fee: Nat::from(0u8),
+        }],
         approval_count: None,
         ts: 0,
     }
@@ -375,6 +446,13 @@ async fn commits_plan_before_effects_and_journals_legs_in_vector_order() {
 
     let second = finalizer.finalize(wal.as_ref(), receipt).await.expect("second cycle");
     assert!(second.finalized);
+    let aggregate = second.swap_result.expect("split result should be aggregated");
+    assert_eq!(aggregate.pay_amount, Nat::from(TOTAL_PAY));
+    assert_eq!(aggregate.receive_amount, Nat::from(TOTAL_PAY * 2));
+    assert_eq!(
+        aggregate.legs.iter().map(|leg| leg.venue.as_str()).collect::<Vec<_>>(),
+        vec![ICPSWAP_VENUE_ID, MEXC_VENUE_ID]
+    );
     assert_eq!(icpswap.calls(), 1);
     assert_eq!(mexc.calls(), 2);
     let second_state = committed_state(&wal);
@@ -431,6 +509,7 @@ async fn operator_required_leg_is_parked_across_restarts() {
             .finalized
     );
     assert_eq!(icpswap.calls(), 1);
+    assert_eq!(icpswap.recovery_calls(), 1);
     assert!(matches!(
         committed_state(&wal).outcome,
         MultiVenueExecutionOutcome::OperatorRequired { .. }
@@ -498,4 +577,77 @@ async fn committed_legacy_state_is_rejected_without_being_upgraded() {
     assert_eq!(adapter.calls(), 0);
     assert_eq!(mexc.calls(), 0);
     assert!(wal.wrapper().meta_v2.is_none());
+}
+
+#[tokio::test]
+async fn adapter_error_is_persisted_before_retry_backoff_is_requested() {
+    let receipt = receipt();
+    let wal = TestWal::with_receipt(&receipt);
+    let icpswap = Arc::new(
+        ScriptedAdapter::new(ICPSWAP_VENUE_ID, None, vec![VenueLegStatus::Running])
+            .with_retryable_errors(vec![Some("temporary pool outage".to_string())]),
+    );
+    let mexc = Arc::new(ScriptedAdapter::new(MEXC_VENUE_ID, None, Vec::new()));
+    let finalizer = finalizer(vec![icpswap, mexc]);
+
+    let error = finalizer
+        .finalize(&wal, receipt)
+        .await
+        .expect_err("operational error should reach FinalizeStage backoff");
+
+    assert_eq!(finalizer.classify_error(&error), FinalizerErrorKind::Retryable);
+    let state = committed_state(&wal);
+    assert_eq!(state.legs[0].status, VenueLegStatus::Running);
+    assert_eq!(state.legs[0].last_error.as_deref(), Some("temporary pool outage"));
+}
+
+#[tokio::test]
+async fn forced_cex_mode_commits_a_single_mexc_leg() {
+    let receipt = receipt();
+    let wal = TestWal::with_receipt(&receipt);
+    let icpswap = Arc::new(ScriptedAdapter::new(ICPSWAP_VENUE_ID, None, Vec::new()));
+    let mexc = Arc::new(ScriptedAdapter::new(
+        MEXC_VENUE_ID,
+        None,
+        vec![VenueLegStatus::Completed],
+    ));
+    let finalizer = MultiVenueFinalizer::new(vec![icpswap, mexc], planner_config())
+        .expect("valid finalizer")
+        .with_routing(MultiVenueRouting::ForcedVenue(MEXC_VENUE_ID.to_string()))
+        .expect("registered forced venue");
+
+    let result = finalizer.finalize(&wal, receipt).await.expect("forced MEXC execution");
+
+    assert!(result.finalized);
+    let state = committed_state(&wal);
+    assert_eq!(state.plan.strategy_id, "forced_mexc");
+    assert_eq!(state.legs.len(), 1);
+    assert_eq!(state.legs[0].venue_id, MEXC_VENUE_ID);
+}
+
+#[tokio::test]
+async fn exclusive_venue_leg_waits_for_its_durable_owner_lock() {
+    let receipt = receipt();
+    let wal = TestWal::with_receipt(&receipt);
+    wal.lock_available.store(false, Ordering::SeqCst);
+    let icpswap = Arc::new(
+        ScriptedAdapter::new(ICPSWAP_VENUE_ID, None, vec![VenueLegStatus::Completed])
+            .with_execution_lock("trader", "icpswap-execution"),
+    );
+    let mexc = Arc::new(ScriptedAdapter::new(MEXC_VENUE_ID, None, Vec::new()));
+    let finalizer = finalizer(vec![icpswap.clone(), mexc]);
+
+    let waiting = finalizer
+        .finalize(&wal, receipt.clone())
+        .await
+        .expect("lock contention is not a finalizer failure");
+    assert!(!waiting.finalized);
+    assert_eq!(icpswap.calls(), 0);
+    assert_eq!(wal.lock_acquisitions.load(Ordering::SeqCst), 1);
+
+    wal.lock_available.store(true, Ordering::SeqCst);
+    let completed = finalizer.finalize(&wal, receipt).await.expect("lock owner may advance");
+    assert!(completed.finalized);
+    assert_eq!(icpswap.calls(), 1);
+    assert_eq!(wal.lock_releases.load(Ordering::SeqCst), 1);
 }

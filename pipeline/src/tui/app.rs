@@ -135,6 +135,7 @@ pub(super) struct WalCounts {
     pub(super) failed_permanent: i64,
     pub(super) waiting_collateral: i64,
     pub(super) waiting_profit: i64,
+    pub(super) operator_required: i64,
     pub(super) total: i64,
 }
 
@@ -148,13 +149,15 @@ impl WalCounts {
         out.failed_permanent = *map.get(&ResultStatus::FailedPermanent).unwrap_or(&0);
         out.waiting_collateral = *map.get(&ResultStatus::WaitingCollateral).unwrap_or(&0);
         out.waiting_profit = *map.get(&ResultStatus::WaitingProfit).unwrap_or(&0);
+        out.operator_required = *map.get(&ResultStatus::OperatorRequired).unwrap_or(&0);
         out.total = out.enqueued
             + out.inflight
             + out.succeeded
             + out.failed_retryable
             + out.failed_permanent
             + out.waiting_collateral
-            + out.waiting_profit;
+            + out.waiting_profit
+            + out.operator_required;
         out
     }
 }

@@ -7,9 +7,9 @@ use async_trait::async_trait;
 use candid::Principal;
 use liquidium_pipeline_core::tokens::chain_token::ChainToken;
 
-use super::finalizer::IcpswapFinalizer;
+use super::finalizer::{IcpswapFinalizer, RETRY_COOLDOWN_NANOS, is_terminal_step};
 use crate::{
-    finalizers::multi_venue::{MultiVenueAdapter, VenueLegProgress, VenueRoutePreview},
+    finalizers::multi_venue::{MultiVenueAdapter, VenueExecutionLock, VenueLegProgress, VenueRoutePreview},
     persistance::{VenueExecutionState, VenueLegState, VenueLegStatus},
     swappers::{
         icpswap::{
@@ -147,12 +147,13 @@ impl IcpswapFinalizer {
         } else {
             None
         };
-        let last_error = advance_error.or_else(|| state.last_error.clone());
+        let last_error = advance_error.clone().or_else(|| state.last_error.clone());
         Ok(VenueLegProgress {
             execution: VenueExecutionState::new(VENUE_ID, &state)?,
             status,
             result,
             last_error,
+            retryable_error: advance_error,
         })
     }
 
@@ -160,19 +161,32 @@ impl IcpswapFinalizer {
     /// A pre-side-effect persistence sentinel is an expected yielded transition,
     /// while operational failures remain attached to the returned leg state.
     async fn advance_leg(&self, leg: &VenueLegState) -> Result<VenueLegProgress, String> {
-        let state = self.decode_leg_state(leg)?;
+        let mut state = self.decode_leg_state(leg)?;
         let execution_id = state.execution_id.clone();
+
+        let now_nanos = (self.clock)();
+        if state.next_attempt_at_nanos.is_some_and(|ready_at| now_nanos < ready_at) {
+            self.notify_operator_required(&execution_id, &state).await;
+            return self.progress_for(leg, state, None).await;
+        }
+
+        state.next_attempt_at_nanos = None;
         let store = LegStateStore::new(state.clone(), needs_parent_persist_before_advance(state.step));
         let result = self
             .workflow
-            .advance_loaded(&store, &execution_id, self.trader, (self.clock)(), state)
+            .advance_loaded(&store, &execution_id, self.trader, now_nanos, state)
             .await;
         let advance_error = match result {
             Ok(_) => None,
             Err(error) if error == PERSIST_BEFORE_SIDE_EFFECT => None,
             Err(error) => Some(error),
         };
-        self.progress_for(leg, store.snapshot()?, advance_error).await
+        let mut state = store.snapshot()?;
+        if advance_error.is_some() && !is_terminal_step(state.step) {
+            state.next_attempt_at_nanos = Some(now_nanos.saturating_add(RETRY_COOLDOWN_NANOS));
+        }
+        self.notify_operator_required(&execution_id, &state).await;
+        self.progress_for(leg, state, advance_error).await
     }
 }
 
@@ -212,6 +226,14 @@ impl MultiVenueAdapter for IcpswapFinalizer {
             conservative_receive,
             initial_execution_state: VenueExecutionState::new(VENUE_ID, &state)?,
         })
+    }
+
+    fn execution_lock(&self, leg: &VenueLegState) -> Result<Option<VenueExecutionLock>, String> {
+        let state = self.decode_leg_state(leg)?;
+        Ok(Some(VenueExecutionLock {
+            owner_key: self.trader.owner.to_text(),
+            execution_id: state.execution_id,
+        }))
     }
 
     async fn advance(&self, leg: &VenueLegState) -> Result<VenueLegProgress, String> {

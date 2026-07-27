@@ -310,7 +310,7 @@ async fn full_icpswap_below_limit_wins_even_when_mexc_output_is_better() {
 }
 
 #[tokio::test]
-async fn full_preview_quotes_newly_registered_venues_without_planner_changes() {
+async fn safe_full_icpswap_does_not_quote_any_overflow_venue() {
     let icpswap = mock_adapter(ICPSWAP_VENUE_ID, Arc::new(Mutex::new(Vec::new())), |request| {
         Ok(proportional_preview(request, ICPSWAP_VENUE_ID, 99.0, 2))
     });
@@ -338,14 +338,8 @@ async fn full_preview_quotes_newly_registered_venues_without_planner_changes() {
         .expect("ICPSwap plan");
 
     assert_eq!(state.legs[0].venue_id, ICPSWAP_VENUE_ID);
-    assert_eq!(
-        mexc_calls_for_assert.lock().expect("calls lock").as_slice(),
-        &[TOTAL_PAY]
-    );
-    assert_eq!(
-        kraken_calls_for_assert.lock().expect("calls lock").as_slice(),
-        &[TOTAL_PAY]
-    );
+    assert!(mexc_calls_for_assert.lock().expect("calls lock").is_empty());
+    assert!(kraken_calls_for_assert.lock().expect("calls lock").is_empty());
 }
 
 #[tokio::test]
@@ -392,8 +386,7 @@ async fn binary_search_builds_and_requotes_an_exact_split() {
     assert!(calls.iter().filter(|amount| **amount == icpswap_pay).count() >= 2);
     let mexc_calls = mexc_calls_for_assert.lock().expect("calls lock");
     let mexc_remainder = TOTAL_PAY - icpswap_pay;
-    assert_eq!(mexc_calls.first(), Some(&TOTAL_PAY));
-    assert_eq!(mexc_calls.last(), Some(&mexc_remainder));
+    assert_eq!(mexc_calls.as_slice(), &[mexc_remainder]);
 }
 
 #[tokio::test]
@@ -546,9 +539,9 @@ async fn malformed_final_split_icpswap_quote_falls_back_to_fresh_full_overflow_q
     assert_eq!(state.legs[0].venue_id, MEXC_VENUE_ID);
     assert_eq!(state.legs[0].request.pay_amount.value, Nat::from(TOTAL_PAY));
     let mexc_calls = mexc_calls_for_assert.lock().expect("calls lock");
-    assert_eq!(mexc_calls.first(), Some(&TOTAL_PAY));
+    assert_ne!(mexc_calls.first(), Some(&TOTAL_PAY));
     assert_eq!(mexc_calls.last(), Some(&TOTAL_PAY));
-    assert!(mexc_calls.len() >= 3);
+    assert_eq!(mexc_calls.len(), 2);
 }
 
 #[tokio::test]
@@ -591,7 +584,7 @@ async fn dust_reason_records_every_skipped_overflow_venue() {
 }
 
 #[tokio::test]
-async fn safe_value_zero_requotes_mexc_after_binary_search_instead_of_reusing_stale_preview() {
+async fn safe_value_zero_quotes_mexc_once_after_binary_search() {
     let icpswap = mock_adapter(ICPSWAP_VENUE_ID, Arc::new(Mutex::new(Vec::new())), |request| {
         Ok(proportional_preview(request, ICPSWAP_VENUE_ID, 100.0, 2))
     });
@@ -601,8 +594,8 @@ async fn safe_value_zero_requotes_mexc_after_binary_search_instead_of_reusing_st
         let pay = request.pay_amount.value.0.to_u64().expect("u64 pay");
         let mut count = mexc_call_count.lock().expect("count lock");
         *count += 1;
-        // The re-quote taken after the (immediately-unsafe) search reflects the
-        // fresher price; the stale initial quote must not be reused.
+        // MEXC is not quoted until the immediately-unsafe ICPSwap search has
+        // established that the full amount must go to overflow.
         let receive = if *count > 1 { pay * 3 } else { pay * 2 };
         Ok(preview(request, MEXC_VENUE_ID, 0.0, receive, receive))
     });
@@ -614,7 +607,8 @@ async fn safe_value_zero_requotes_mexc_after_binary_search_instead_of_reusing_st
 
     assert_eq!(state.legs.len(), 1);
     assert_eq!(state.legs[0].venue_id, MEXC_VENUE_ID);
-    assert_eq!(state.legs[0].quote.estimated_receive.value, Nat::from(TOTAL_PAY * 3));
+    assert_eq!(state.legs[0].quote.estimated_receive.value, Nat::from(TOTAL_PAY * 2));
+    assert_eq!(*call_count.lock().expect("count lock"), 1);
 }
 
 #[tokio::test]

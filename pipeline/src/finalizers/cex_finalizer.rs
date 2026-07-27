@@ -28,6 +28,7 @@ pub enum CexStep {
 }
 
 /// Route-level CEX feasibility and cost preview used by hybrid routing decisions.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CexRoutePreview {
     /// Whether the route is executable against current orderbook depth.
@@ -208,6 +209,7 @@ pub struct CexState {
 
 #[async_trait]
 pub trait CexFinalizerLogic: Send + Sync {
+    #[allow(dead_code)]
     fn venue_id(&self) -> &'static str;
 
     // Build the initial CEX state for this liquidation from the receipt
@@ -237,6 +239,7 @@ pub trait CexFinalizerLogic: Send + Sync {
     async fn finish(&self, receipt: &ExecutionReceipt, state: &CexState) -> Result<SwapExecution, String>;
 
     // Preview route feasibility and slippage using current orderbook depth.
+    #[allow(dead_code)]
     async fn preview_route(&self, receipt: &ExecutionReceipt) -> Result<CexRoutePreview, String>;
 }
 
@@ -267,6 +270,7 @@ impl Finalizer for dyn CexFinalizerLogic {
                     ResultStatus::WaitingCollateral | ResultStatus::WaitingProfit => {
                         return Ok(FinalizerResult::noop());
                     }
+                    ResultStatus::OperatorRequired => return Ok(FinalizerResult::noop()),
                     ResultStatus::FailedPermanent => {
                         return Err(format!("invalid WAL state {:?} for liq_id {}", row.status, row.id));
                     }
@@ -373,6 +377,7 @@ impl Finalizer for dyn CexFinalizerLogic {
             FinalizerResult {
                 swap_result: Some(swap_exec),
                 finalized: true,
+                operator_required: false,
                 swapper: None,
                 reason: None,
             }

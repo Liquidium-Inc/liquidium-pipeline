@@ -32,13 +32,13 @@ pub(crate) const ICPSWAP_FINALIZER_PERMANENT_PREFIX: &str = "permanent ICPSwap f
 /// gates `FailedRetryable`. Roughly one order of magnitude above the daemon
 /// cycle, so a persistently failing step backs off instead of re-running every
 /// two seconds, while a transient blip still recovers promptly.
-const RETRY_COOLDOWN_NANOS: u64 = 20 * 1_000_000_000;
+pub(super) const RETRY_COOLDOWN_NANOS: u64 = 20 * 1_000_000_000;
 
 type Clock = dyn Fn() -> u64 + Send + Sync;
 
 /// Terminal steps own the per-owner lock release: the execution is over, so the
 /// slot must be freed whether it ended in success, refund, or failure.
-fn is_terminal_step(step: IcpswapStep) -> bool {
+pub(super) fn is_terminal_step(step: IcpswapStep) -> bool {
     matches!(
         step,
         IcpswapStep::Completed | IcpswapStep::Refunded | IcpswapStep::Failed
@@ -50,7 +50,7 @@ pub struct IcpswapFinalizer {
     pub(super) workflow: Arc<dyn IcpswapFinalizerLogic>,
     pub(super) trader: Account,
     pub(super) clock: Arc<Clock>,
-    watchdog: Arc<dyn Watchdog>,
+    pub(super) watchdog: Arc<dyn Watchdog>,
 }
 
 impl IcpswapFinalizer {
@@ -110,12 +110,14 @@ impl IcpswapFinalizer {
                         .map_err(|error| permanent_message(&error))?,
                 ),
                 finalized: true,
+                operator_required: false,
                 swapper: Some("icpswap".to_string()),
                 reason: None,
             }),
             IcpswapStep::Refunded => Ok(FinalizerResult {
                 swap_result: None,
                 finalized: true,
+                operator_required: false,
                 swapper: Some("recovery".to_string()),
                 reason: Some("ICPSwap failed; deposited ICP was withdrawn back to the trader account".to_string()),
             }),
@@ -149,7 +151,7 @@ impl IcpswapFinalizer {
     /// from the outside; alerting once means a single dropped webhook hides a
     /// stalled venue indefinitely. The watchdog's cooldown key throttles this
     /// into a periodic re-escalation.
-    async fn notify_operator_required(&self, execution_id: &str, state: &IcpswapExecutionState) {
+    pub(super) async fn notify_operator_required(&self, execution_id: &str, state: &IcpswapExecutionState) {
         if state.step != IcpswapStep::OperatorRequired {
             return;
         }

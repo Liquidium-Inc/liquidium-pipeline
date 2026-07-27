@@ -247,7 +247,17 @@ impl IcpswapFirstPlanner {
             return self.plan_overflow_only(input, quoted_at).await;
         }
 
-        let quotes = self.preview_all(input, input.total_pay.value.clone()).await;
+        // The common safe-ICPSwap path needs no CEX data. Quote ICPSwap alone
+        // first so adding overflow venues does not add unconditional latency or
+        // API load to every liquidation.
+        let quotes = self
+            .venues
+            .preview_venues(&[ICPSWAP_VENUE_ID.to_string()], |venue_id| {
+                input.request_for(venue_id, input.total_pay.value.clone())
+            })
+            .await
+            .map_err(IcpswapFirstPlannerError::InvalidInput)?;
+        let quotes = self.drop_invalid_quotes(quotes);
         let icpswap = quotes
             .get(ICPSWAP_VENUE_ID)
             .ok_or_else(|| IcpswapFirstPlannerError::InvalidInput("ICPSwap full preview is missing".to_string()))?;
@@ -263,17 +273,20 @@ impl IcpswapFirstPlanner {
             ),
             VenuePreviewOutcome::Quoted(_) => self.plan_split_or_fallback(input, quoted_at).await,
             VenuePreviewOutcome::Unavailable(icpswap_error) | VenuePreviewOutcome::Invalid(icpswap_error) => {
-                let overflow = self.best_executable_overflow(input, &quotes).ok_or_else(|| {
+                let overflow_quotes = self.preview_overflow(input, input.total_pay.value.clone()).await?;
+                let overflow = self.best_executable_overflow(input, &overflow_quotes).ok_or_else(|| {
                     IcpswapFirstPlannerError::NoViableRoute(format!(
                         "ICPSwap quote rejected ({icpswap_error}); {}",
-                        self.overflow_failure_summary(&quotes)
+                        self.overflow_failure_summary(&overflow_quotes)
                     ))
                 })?;
-                let unavailable_venue_ids = quotes
-                    .iter()
-                    .filter(|preview| !matches!(preview.outcome, VenuePreviewOutcome::Quoted(_)))
-                    .map(|preview| preview.venue_id.clone())
-                    .collect();
+                let mut unavailable_venue_ids = vec![ICPSWAP_VENUE_ID.to_string()];
+                unavailable_venue_ids.extend(
+                    overflow_quotes
+                        .iter()
+                        .filter(|preview| !matches!(preview.outcome, VenuePreviewOutcome::Quoted(_)))
+                        .map(|preview| preview.venue_id.clone()),
+                );
                 self.build_state(
                     input,
                     vec![overflow.clone()],
@@ -285,6 +298,48 @@ impl IcpswapFirstPlanner {
                 )
             }
         }
+    }
+
+    /// Builds a forced single-venue plan while retaining the same amount,
+    /// quote validation, minimum-size, and conservative-edge checks used by
+    /// hybrid routing.
+    pub async fn plan_single_venue(
+        &self,
+        input: &IcpswapFirstPlanInput,
+        venue_id: &str,
+        quoted_at: i64,
+    ) -> Result<MultiVenueExecutionState, IcpswapFirstPlannerError> {
+        input.validate()?;
+        if venue_id == ICPSWAP_VENUE_ID && !input.is_native_icp() {
+            return Err(IcpswapFirstPlannerError::InvalidInput(
+                "forced ICPSwap routing only accepts native ICP collateral".to_string(),
+            ));
+        }
+        if self
+            .config
+            .overflow_venue_ids
+            .iter()
+            .any(|configured| configured == venue_id)
+            && !input.meets_cex_minimum(&input.total_pay, self.config.cex_min_exec_usd)
+        {
+            return Err(IcpswapFirstPlannerError::NoViableRoute(format!(
+                "forced venue `{venue_id}` amount is below its minimum execution size"
+            )));
+        }
+
+        let request = input.request_for(venue_id, input.total_pay.value.clone());
+        let preview = self.preview_exact(venue_id, &request).await?;
+        let mut state = self.build_state(
+            input,
+            vec![preview],
+            MultiVenueAllocationReason::SingleVenue {
+                venue_id: venue_id.to_string(),
+            },
+            quoted_at,
+        )?;
+        state.plan.strategy_id = format!("forced_{venue_id}");
+        state.validate().map_err(IcpswapFirstPlannerError::InvalidInput)?;
+        Ok(state)
     }
 
     // Non-native ICP collateral cannot use ICPSwap, so choose the executable
@@ -487,16 +542,6 @@ impl IcpswapFirstPlanner {
         })?;
         validate_preview(adapter.venue_id(), request, &preview)?;
         Ok(preview)
-    }
-
-    // Requests the same full amount from every registered venue concurrently,
-    // preserving registration order in the resulting quote book.
-    async fn preview_all(&self, input: &IcpswapFirstPlanInput, pay_value: Nat) -> VenueQuoteBook {
-        let quotes = self
-            .venues
-            .preview_all(|venue_id| input.request_for(venue_id, pay_value.clone()))
-            .await;
-        self.drop_invalid_quotes(quotes)
     }
 
     // Quotes configured overflow venues for the exact amount left after the

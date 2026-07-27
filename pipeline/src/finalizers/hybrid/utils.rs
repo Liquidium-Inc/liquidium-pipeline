@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use std::{fmt, fmt::Display};
 
 use liquidium_pipeline_core::tokens::chain_token_amount::ChainTokenAmount;

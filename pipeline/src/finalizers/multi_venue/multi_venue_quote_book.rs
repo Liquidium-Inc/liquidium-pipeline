@@ -47,6 +47,7 @@ impl VenueRegistry {
 
     // Starts every registered preview before awaiting the combined result.
     // `join_all` preserves input order even when venues finish out of order.
+    #[cfg(test)]
     pub(super) async fn preview_all<F>(&self, request_for: F) -> VenueQuoteBook
     where
         F: Fn(&str) -> SwapRequest,

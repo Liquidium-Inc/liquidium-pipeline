@@ -86,6 +86,12 @@ pub async fn wal_mark_enqueued(wal: &dyn WalStore, liq_id: &str) -> Result<(), S
         .map_err(|e| e.to_string())
 }
 
+pub async fn wal_mark_operator_required(wal: &dyn WalStore, liq_id: &str) -> Result<(), String> {
+    wal.update_status(liq_id, ResultStatus::OperatorRequired, false)
+        .await
+        .map_err(|e| e.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

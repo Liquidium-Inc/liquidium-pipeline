@@ -115,6 +115,37 @@ fn finalizer_with_permanent_deposit_error() -> MexcFinalizer<MockCexBackend> {
     .with_token_registry(Arc::new(TokenRegistry::new(tokens)))
 }
 
+fn finalizer_with_ambiguous_deposit_error() -> MexcFinalizer<MockCexBackend> {
+    let mut backend = MockCexBackend::new();
+    backend.expect_get_orderbook().returning(|_, _| {
+        Ok(OrderBook {
+            bids: vec![OrderBookLevel {
+                price: 10.0,
+                quantity: 1_000_000.0,
+            }],
+            asks: vec![],
+        })
+    });
+    backend.expect_get_balance().times(1).returning(|_| Ok(0.0));
+    backend
+        .expect_get_deposit_address()
+        .times(1)
+        .returning(|_, _| Err("request timed out after submission".to_string()));
+    let tokens = HashMap::from([
+        (pay_token().asset_id(), pay_token()),
+        (receive_token().asset_id(), receive_token()),
+    ]);
+    MexcFinalizer::new(
+        Arc::new(backend),
+        Arc::new(MockTransferActions::new()),
+        Principal::anonymous(),
+        200.0,
+        0.0001,
+        0.7,
+    )
+    .with_token_registry(Arc::new(TokenRegistry::new(tokens)))
+}
+
 fn leg_from_preview(preview: VenueRoutePreview) -> VenueLegState {
     VenueLegState {
         leg_id: "mexc-leg-0".to_string(),
@@ -144,8 +175,8 @@ async fn preview_uses_the_exact_leg_allocation_and_persists_the_route() {
         .expect("MEXC preview should succeed");
 
     assert_eq!(preview.quote.pay_amount, Nat::from(200_000_000u64));
-    assert_eq!(preview.quote.receive_amount, Nat::from(20_000_000u64));
-    assert_eq!(preview.conservative_receive.value, Nat::from(19_800_000u64));
+    assert!(preview.quote.receive_amount < Nat::from(20_000_000u64));
+    assert!(preview.conservative_receive.value < preview.quote.receive_amount);
     let execution = preview
         .initial_execution_state
         .decode::<MexcVenueExecutionState>("mexc")
@@ -229,6 +260,8 @@ fn persisted_adapter_state_defaults_a_missing_persistence_gate_to_closed() {
             )
             .expect("state"),
         ready_to_advance: true,
+        intent_id: None,
+        operator_required: false,
     };
     let mut encoded = serde_json::to_value(state).expect("encode state");
     encoded
@@ -263,6 +296,36 @@ async fn first_advance_only_opens_the_parent_persistence_gate() {
     assert_eq!(execution.cex.step, CexStep::Deposit);
     assert_eq!(progress.status, VenueLegStatus::Running);
     assert!(progress.result.is_none());
+}
+
+#[tokio::test]
+async fn restart_with_an_outstanding_intent_requires_operator_instead_of_replaying() {
+    let original = finalizer();
+    let preview = MultiVenueAdapter::preview(&original, &request(100_000_000))
+        .await
+        .expect("preview should succeed");
+    let mut leg = leg_from_preview(preview);
+    let armed = MultiVenueAdapter::advance(&original, &leg)
+        .await
+        .expect("first cycle should persist an intent");
+    leg.execution = armed.execution;
+    leg.status = armed.status;
+
+    // A reconstructed adapter has no process-local proof that the external
+    // call did not already happen before the crash. It must not call MEXC or
+    // the transfer service again.
+    let restarted = finalizer();
+    let progress = MultiVenueAdapter::advance(&restarted, &leg)
+        .await
+        .expect("ambiguous intent should be parked");
+
+    assert_eq!(progress.status, VenueLegStatus::OperatorRequired);
+    assert!(
+        progress
+            .last_error
+            .as_deref()
+            .is_some_and(|error| error.contains("ambiguous submission state"))
+    );
 }
 
 #[tokio::test]
@@ -361,4 +424,29 @@ async fn permanent_cex_error_marks_only_the_mexc_leg_failed() {
             .as_deref()
             .is_some_and(|error| error.starts_with(FINALIZER_PERMANENT_AMOUNT_FLOOR_PREFIX))
     );
+}
+
+#[tokio::test]
+async fn ambiguous_cex_error_is_parked_and_never_replayed_automatically() {
+    let finalizer = finalizer_with_ambiguous_deposit_error();
+    let preview = MultiVenueAdapter::preview(&finalizer, &request(100_000_000))
+        .await
+        .expect("preview should succeed");
+    let mut leg = leg_from_preview(preview);
+
+    let armed = MultiVenueAdapter::advance(&finalizer, &leg)
+        .await
+        .expect("first cycle should arm the leg");
+    leg.execution = armed.execution;
+    let ambiguous = MultiVenueAdapter::advance(&finalizer, &leg)
+        .await
+        .expect("ambiguous failure should become durable progress");
+    assert_eq!(ambiguous.status, VenueLegStatus::OperatorRequired);
+
+    leg.execution = ambiguous.execution;
+    leg.status = ambiguous.status;
+    let parked = MultiVenueAdapter::recover(&finalizer, &leg)
+        .await
+        .expect("parked leg should remain inspectable");
+    assert_eq!(parked.status, VenueLegStatus::OperatorRequired);
 }

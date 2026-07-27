@@ -14,12 +14,15 @@ use crate::{
         bootstrap_control_plane, console_ui_enabled, debt_asset_principals, debt_assets_as_text,
         ensure_runtime_file_permissions, print_banner, run_daemon_cycle_loop,
     },
-    config::{Config, ConfigTrait},
+    config::{Config, ConfigTrait, SwapperMode},
     context::{PipelineContext, init_context},
     executors::basic::basic_executor::BasicExecutor,
     finalizers::{
         mexc::runtime::build_mexc_finalizer,
-        multi_venue::{IcpswapFirstPlannerConfig, MEXC_VENUE_ID, MultiVenueAdapter, MultiVenueFinalizer},
+        multi_venue::{
+            ICPSWAP_VENUE_ID, IcpswapFirstPlannerConfig, MEXC_VENUE_ID, MultiVenueAdapter, MultiVenueFinalizer,
+            MultiVenueRouting,
+        },
         profit_calculator::SimpleProfitCalculator,
     },
     liquidation::collateral_service::CollateralService,
@@ -88,19 +91,27 @@ async fn init(
     }
 
     let mexc_finalizer = build_mexc_finalizer(ctx.as_ref()).await?;
-    let multi_venue_finalizer = Arc::new(MultiVenueFinalizer::new(
-        vec![
-            ctx.icpswap_finalizer.clone() as Arc<dyn MultiVenueAdapter>,
-            mexc_finalizer.clone() as Arc<dyn MultiVenueAdapter>,
-        ],
-        IcpswapFirstPlannerConfig {
-            max_price_impact_bps: 100.0,
-            max_search_iterations: 16,
-            cex_min_exec_usd: config.get_cex_min_exec_usd(),
-            min_net_edge_bps: config.get_cex_min_net_edge_bps(),
-            overflow_venue_ids: vec![MEXC_VENUE_ID.to_string()],
-        },
-    )?);
+    let routing = match config.get_swapper_mode() {
+        SwapperMode::Dex => MultiVenueRouting::ForcedVenue(ICPSWAP_VENUE_ID.to_string()),
+        SwapperMode::Cex => MultiVenueRouting::ForcedVenue(MEXC_VENUE_ID.to_string()),
+        SwapperMode::Hybrid => MultiVenueRouting::IcpswapFirst,
+    };
+    let multi_venue_finalizer = Arc::new(
+        MultiVenueFinalizer::new(
+            vec![
+                ctx.icpswap_finalizer.clone() as Arc<dyn MultiVenueAdapter>,
+                mexc_finalizer.clone() as Arc<dyn MultiVenueAdapter>,
+            ],
+            IcpswapFirstPlannerConfig {
+                max_price_impact_bps: 100.0,
+                max_search_iterations: 16,
+                cex_min_exec_usd: config.get_cex_min_exec_usd(),
+                min_net_edge_bps: config.get_cex_min_net_edge_bps(),
+                overflow_venue_ids: vec![MEXC_VENUE_ID.to_string()],
+            },
+        )?
+        .with_routing(routing)?,
+    );
 
     // Profit calculator for expected/realized PnL
     let profit_calc = Arc::new(SimpleProfitCalculator); //todo implement real profit calculator

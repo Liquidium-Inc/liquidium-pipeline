@@ -23,6 +23,10 @@ struct MexcVenueExecutionState {
     cex: CexState,
     #[serde(default)]
     ready_to_advance: bool,
+    #[serde(default)]
+    intent_id: Option<String>,
+    #[serde(default)]
+    operator_required: bool,
 }
 
 // Step 6 registers this implementation in the live venue registry. Until then
@@ -40,6 +44,8 @@ where
         let execution = MexcVenueExecutionState {
             cex: preview.state,
             ready_to_advance: false,
+            intent_id: None,
+            operator_required: false,
         };
 
         Ok(VenueRoutePreview {
@@ -86,12 +92,43 @@ where
             let last_error = execution.cex.last_error.clone();
             return self.progress_for(execution, last_error);
         }
+        if execution.operator_required {
+            let error = execution
+                .cex
+                .last_error
+                .clone()
+                .unwrap_or_else(|| "MEXC leg requires operator reconciliation".to_string());
+            return self.operator_required_progress(execution, error);
+        }
 
         if !execution.ready_to_advance {
             execution.ready_to_advance = true;
+            let intent_id = crate::utils::new_venue_execution_id("mexc-intent");
+            execution.intent_id = Some(intent_id.clone());
+            self.multi_venue_armed_intents
+                .lock()
+                .map_err(|_| "MEXC multi-venue intent lock poisoned".to_string())?
+                .insert(intent_id);
             return self.progress_for(execution, None);
         }
+
+        let intent_id = execution
+            .intent_id
+            .clone()
+            .ok_or_else(|| "persisted MEXC execution gate has no intent ID".to_string())?;
+        let armed_here = self
+            .multi_venue_armed_intents
+            .lock()
+            .map_err(|_| "MEXC multi-venue intent lock poisoned".to_string())?
+            .remove(&intent_id);
+        if !armed_here {
+            return self.operator_required_progress(
+                execution,
+                format!("persisted MEXC intent `{intent_id}` has ambiguous submission state after restart"),
+            );
+        }
         execution.ready_to_advance = false;
+        execution.intent_id = None;
         execution.cex.last_error = None;
 
         let result = self.advance_current_step(&mut execution.cex).await;
@@ -100,6 +137,11 @@ where
             execution.cex.last_error = Some(error.clone());
             if error.starts_with(FINALIZER_PERMANENT_AMOUNT_FLOOR_PREFIX) {
                 execution.cex.step = CexStep::Failed;
+            } else {
+                return self.operator_required_progress(
+                    execution,
+                    format!("MEXC intent `{intent_id}` returned an ambiguous external outcome: {error}"),
+                );
             }
         }
         self.progress_for(execution, error)
@@ -122,12 +164,29 @@ where
         } else {
             None
         };
-        let last_error = error.or_else(|| execution.cex.last_error.clone());
+        let last_error = error.clone().or_else(|| execution.cex.last_error.clone());
         Ok(VenueLegProgress {
             execution: VenueExecutionState::new(VENUE_ID, &execution)?,
             status,
             result,
             last_error,
+            retryable_error: error,
+        })
+    }
+
+    fn operator_required_progress(
+        &self,
+        mut execution: MexcVenueExecutionState,
+        error: String,
+    ) -> Result<VenueLegProgress, String> {
+        execution.operator_required = true;
+        execution.cex.last_error = Some(error.clone());
+        Ok(VenueLegProgress {
+            execution: VenueExecutionState::new(VENUE_ID, &execution)?,
+            status: VenueLegStatus::OperatorRequired,
+            result: None,
+            last_error: Some(error),
+            retryable_error: None,
         })
     }
 }

@@ -12,6 +12,7 @@ use crate::{
     wal::{decode_receipt_wrapper, encode_meta, liq_id_from_receipt, wal_load},
 };
 use async_trait::async_trait;
+use candid::Nat;
 
 use super::{
     IcpswapFirstPlanInput, IcpswapFirstPlanner, IcpswapFirstPlannerConfig, MultiVenueAdapter,
@@ -27,6 +28,13 @@ const MULTI_VENUE_PERMANENT_PREFIX: &str = "permanent multi-venue finalizer: ";
 pub struct MultiVenueFinalizer {
     planner: IcpswapFirstPlanner,
     venues: VenueRegistry,
+    routing: MultiVenueRouting,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MultiVenueRouting {
+    IcpswapFirst,
+    ForcedVenue(String),
 }
 
 impl MultiVenueFinalizer {
@@ -36,7 +44,21 @@ impl MultiVenueFinalizer {
     ) -> Result<Self, String> {
         let venues = VenueRegistry::new(adapters.clone())?;
         let planner = IcpswapFirstPlanner::new(adapters, planner_config).map_err(|error| error.to_string())?;
-        Ok(Self { planner, venues })
+        Ok(Self {
+            planner,
+            venues,
+            routing: MultiVenueRouting::IcpswapFirst,
+        })
+    }
+
+    pub fn with_routing(mut self, routing: MultiVenueRouting) -> Result<Self, String> {
+        if let MultiVenueRouting::ForcedVenue(venue_id) = &routing
+            && !self.venues.contains(venue_id)
+        {
+            return Err(format!("forced venue adapter `{venue_id}` is not registered"));
+        }
+        self.routing = routing;
+        Ok(self)
     }
 
     /// Loads a committed plan or creates and atomically persists a new plan
@@ -63,7 +85,8 @@ impl MultiVenueFinalizer {
         if wrapper.meta_v2.is_some() {
             let state = {
                 let meta = wrapper.meta_v2.as_ref().expect("meta_v2 checked above");
-                meta.validate()?;
+                meta.validate()
+                    .map_err(|error| format!("{MULTI_VENUE_PERMANENT_PREFIX}{error}"))?;
                 let FinalizerMetaPayload::MultiVenueSwap(state) = &meta.payload;
                 state.clone()
             };
@@ -89,11 +112,18 @@ impl MultiVenueFinalizer {
         // This is the pure routing decision: quote the registered venues and
         // produce the immutable allocation plan plus initialized venue legs.
         // No swap, transfer, or order side effect is submitted by `plan`.
-        let state = self
-            .planner
-            .plan(&input, now_ts())
-            .await
-            .map_err(|error| error.to_string())?;
+        let state = match &self.routing {
+            MultiVenueRouting::IcpswapFirst => self.planner.plan(&input, now_ts()).await,
+            MultiVenueRouting::ForcedVenue(venue_id) => {
+                self.planner.plan_single_venue(&input, venue_id, now_ts()).await
+            }
+        }
+        .map_err(|error| match error {
+            super::IcpswapFirstPlannerError::InvalidInput(_) => {
+                format!("{MULTI_VENUE_PERMANENT_PREFIX}{error}")
+            }
+            super::IcpswapFirstPlannerError::NoViableRoute(_) => error.to_string(),
+        })?;
 
         // Commit the entire decision and every initialized leg atomically.
         // Venue execution may begin only after this WAL write succeeds, so a
@@ -135,28 +165,77 @@ impl MultiVenueFinalizer {
         wrapper: &mut LiqMetaWrapper,
         state: &mut MultiVenueExecutionState,
     ) -> Result<(), String> {
+        let mut retryable_errors = Vec::new();
         for index in 0..state.legs.len() {
             if !matches!(
                 state.legs[index].status,
-                VenueLegStatus::Planned | VenueLegStatus::Running
+                VenueLegStatus::Planned | VenueLegStatus::Running | VenueLegStatus::OperatorRequired
             ) {
                 continue;
             }
 
             let current = state.legs[index].clone();
-            let adapter = self
-                .venues
-                .adapter(&current.venue_id)
-                .ok_or_else(|| format!("no adapter registered for committed venue `{}`", current.venue_id))?;
-            let progress = adapter.advance(&current).await?;
+            let adapter = self.venues.adapter(&current.venue_id).ok_or_else(|| {
+                format!(
+                    "{MULTI_VENUE_PERMANENT_PREFIX}no adapter registered for committed venue `{}`",
+                    current.venue_id
+                )
+            })?;
+            let execution_lock = adapter.execution_lock(&current)?;
+            if let Some(lock) = &execution_lock
+                && !wal
+                    .acquire_icpswap_owner_lock(&lock.owner_key, &lock.execution_id)
+                    .await
+                    .map_err(|error| format!("failed acquiring venue execution lock: {error}"))?
+            {
+                continue;
+            }
+            let progress = if current.status == VenueLegStatus::OperatorRequired {
+                adapter.recover(&current).await?
+            } else {
+                adapter.advance(&current).await?
+            };
+            let retryable_error = progress.retryable_error.clone();
 
-            apply_progress(&mut state.legs[index], progress)?;
+            apply_progress(&mut state.legs[index], progress)
+                .map_err(|error| format!("{MULTI_VENUE_PERMANENT_PREFIX}{error}"))?;
             state.outcome = derive_outcome(&state.legs);
             self.persist_state(wal, row, wrapper, state).await?;
+
+            if matches!(
+                state.legs[index].status,
+                VenueLegStatus::Completed | VenueLegStatus::Recovered | VenueLegStatus::FailedPermanent
+            ) && let Some(lock) = &execution_lock
+            {
+                if let Err(error) = wal
+                    .release_icpswap_owner_lock(&lock.owner_key, &lock.execution_id)
+                    .await
+                {
+                    tracing::warn!(
+                        owner_key = %lock.owner_key,
+                        execution_id = %lock.execution_id,
+                        %error,
+                        "failed releasing terminal venue execution lock"
+                    );
+                }
+            }
+
+            if state.legs[index].status != VenueLegStatus::FailedPermanent
+                && let Some(error) = retryable_error
+            {
+                retryable_errors.push(format!(
+                    "{} leg `{}`: {error}",
+                    state.legs[index].venue_id, state.legs[index].leg_id
+                ));
+            }
         }
 
         state.outcome = derive_outcome(&state.legs);
-        Ok(())
+        if retryable_errors.is_empty() {
+            Ok(())
+        } else {
+            Err(retryable_errors.join("; "))
+        }
     }
 
     fn result_for_state(&self, state: &MultiVenueExecutionState) -> Result<FinalizerResult, String> {
@@ -164,12 +243,14 @@ impl MultiVenueFinalizer {
             MultiVenueExecutionOutcome::Running => Ok(FinalizerResult {
                 swap_result: None,
                 finalized: false,
+                operator_required: false,
                 swapper: Some("multi_venue".to_string()),
                 reason: None,
             }),
             MultiVenueExecutionOutcome::OperatorRequired { leg_ids } => Ok(FinalizerResult {
                 swap_result: None,
                 finalized: false,
+                operator_required: true,
                 swapper: Some("multi_venue".to_string()),
                 reason: Some(format!("operator required for venue legs: {}", leg_ids.join(","))),
             }),
@@ -183,22 +264,20 @@ impl MultiVenueFinalizer {
                     .iter()
                     .filter(|leg| leg.status == VenueLegStatus::Completed)
                     .map(|leg| {
-                        leg.result
-                            .clone()
-                            .ok_or_else(|| format!("completed venue leg `{}` has no execution result", leg.leg_id))
+                        leg.result.clone().ok_or_else(|| {
+                            format!(
+                                "{MULTI_VENUE_PERMANENT_PREFIX}completed venue leg `{}` has no execution result",
+                                leg.leg_id
+                            )
+                        })
                     })
                     .collect::<Result<Vec<_>, _>>()?;
 
-                // Step 7 replaces this single-result compatibility projection
-                // with aggregation across every completed venue leg.
-                let swap_result = if completed_results.len() == 1 {
-                    completed_results.into_iter().next()
-                } else {
-                    None
-                };
+                let swap_result = aggregate_swap_executions(&state.legs, completed_results)?;
                 Ok(FinalizerResult {
                     swap_result,
                     finalized: true,
+                    operator_required: false,
                     swapper: Some("multi_venue".to_string()),
                     reason: None,
                 })
@@ -215,12 +294,75 @@ impl MultiVenueFinalizer {
     ) -> Result<FinalizerResult, String> {
         let (mut row, mut wrapper, mut state) = self.load_or_commit_plan(wal, &receipt).await?;
         self.advance_legs(wal, &mut row, &mut wrapper, &mut state).await?;
-
-        // Persist a derived parent outcome even when no leg was runnable during
-        // this cycle, for example after restart into OperatorRequired.
-        self.persist_state(wal, &mut row, &mut wrapper, &state).await?;
         self.result_for_state(&state)
     }
+}
+
+/// Projects completed venue legs into the pipeline's existing single execution
+/// shape while preserving the committed venue-leg order for audit/export.
+fn aggregate_swap_executions(
+    legs: &[VenueLegState],
+    executions: Vec<crate::swappers::model::SwapExecution>,
+) -> Result<Option<crate::swappers::model::SwapExecution>, String> {
+    if executions.is_empty() {
+        return Ok(None);
+    }
+
+    let first = executions.first().expect("non-empty executions").clone();
+    if executions
+        .iter()
+        .any(|execution| execution.pay_asset != first.pay_asset || execution.receive_asset != first.receive_asset)
+    {
+        return Err(format!(
+            "{MULTI_VENUE_PERMANENT_PREFIX}completed venue legs use different asset pairs"
+        ));
+    }
+
+    let mut pay_amount = Nat::from(0u8);
+    let mut receive_amount = Nat::from(0u8);
+    let mut pay_weight = 0.0;
+    let mut mid_notional = 0.0;
+    let mut exec_notional = 0.0;
+    let mut slippage_notional = 0.0;
+    let mut quote_legs = Vec::new();
+    let mut approval_count = None;
+    let mut ts = 0;
+
+    for (leg, execution) in legs
+        .iter()
+        .filter(|leg| leg.status == VenueLegStatus::Completed)
+        .zip(executions)
+    {
+        let weight = leg.request.pay_amount.to_f64();
+        pay_amount += execution.pay_amount.clone();
+        receive_amount += execution.receive_amount.clone();
+        pay_weight += weight;
+        mid_notional += execution.mid_price * weight;
+        exec_notional += execution.exec_price * weight;
+        slippage_notional += execution.realized_slippage_bps * weight;
+        quote_legs.extend(execution.legs);
+        if let Some(count) = execution.approval_count {
+            approval_count = Some(approval_count.unwrap_or(0u32).saturating_add(count));
+        }
+        ts = ts.max(execution.ts);
+    }
+
+    let weighted = |notional: f64| if pay_weight > 0.0 { notional / pay_weight } else { 0.0 };
+    Ok(Some(crate::swappers::model::SwapExecution {
+        swap_id: first.swap_id,
+        request_id: first.request_id,
+        status: "completed".to_string(),
+        pay_asset: first.pay_asset,
+        pay_amount,
+        receive_asset: first.receive_asset,
+        receive_amount,
+        mid_price: weighted(mid_notional),
+        exec_price: weighted(exec_notional),
+        realized_slippage_bps: weighted(slippage_notional),
+        legs: quote_legs,
+        approval_count,
+        ts,
+    }))
 }
 
 #[async_trait]
@@ -321,7 +463,8 @@ fn set_meta_v2(wrapper: &mut LiqMetaWrapper, state: &MultiVenueExecutionState) -
         version: FINALIZER_META_V2_VERSION,
         payload: FinalizerMetaPayload::MultiVenueSwap(state.clone()),
     };
-    meta.validate()?;
+    meta.validate()
+        .map_err(|error| format!("{MULTI_VENUE_PERMANENT_PREFIX}{error}"))?;
     wrapper.meta_v2 = Some(meta);
     Ok(())
 }

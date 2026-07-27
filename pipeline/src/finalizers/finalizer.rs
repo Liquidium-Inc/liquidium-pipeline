@@ -16,6 +16,8 @@ pub struct FinalizerResult {
     pub swap_result: Option<SwapExecution>,
     pub finalized: bool,
     #[serde(default)]
+    pub operator_required: bool,
+    #[serde(default)]
     pub swapper: Option<String>,
     #[serde(default)]
     pub reason: Option<String>,
@@ -26,6 +28,7 @@ impl FinalizerResult {
         Self {
             swap_result: None,
             finalized: false,
+            operator_required: false,
             swapper: None,
             reason: None,
         }

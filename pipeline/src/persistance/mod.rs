@@ -19,6 +19,9 @@ pub enum ResultStatus {
     FailedPermanent = 4,
     WaitingCollateral = 5,
     WaitingProfit = 6,
+    /// External custody is ambiguous and must be reconciled before retrying.
+    /// Pending selection deliberately excludes this status.
+    OperatorRequired = 7,
 }
 
 #[derive(Debug, Clone, Serialize, serde::Deserialize)]
