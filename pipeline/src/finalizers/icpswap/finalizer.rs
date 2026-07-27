@@ -47,9 +47,9 @@ fn is_terminal_step(step: IcpswapStep) -> bool {
 
 /// WAL-backed finalizer for the manual ICPSwap execution lifecycle.
 pub struct IcpswapFinalizer {
-    workflow: Arc<dyn IcpswapFinalizerLogic>,
-    trader: Account,
-    clock: Arc<Clock>,
+    pub(super) workflow: Arc<dyn IcpswapFinalizerLogic>,
+    pub(super) trader: Account,
+    pub(super) clock: Arc<Clock>,
     watchdog: Arc<dyn Watchdog>,
 }
 

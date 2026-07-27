@@ -6,8 +6,8 @@ use icrc_ledger_types::icrc1::{account::Account, transfer::TransferArg};
 use liquidium_pipeline_connectors::{backend::icp_backend::IcpBackend, pipeline_agent::PipelineAgent};
 
 use super::types::{
-    IcpswapClientError, IcpswapDepositArgs, IcpswapGetPoolArgs, IcpswapPoolData, IcpswapResult, IcpswapSwapArgs,
-    IcpswapToken, IcpswapUnusedBalance, IcpswapWithdrawArgs,
+    IcpswapClientError, IcpswapDepositArgs, IcpswapGetPoolArgs, IcpswapPoolData, IcpswapPoolMetadata, IcpswapResult,
+    IcpswapSwapArgs, IcpswapToken, IcpswapUnusedBalance, IcpswapWithdrawArgs,
 };
 
 #[cfg_attr(test, mockall::automock)]
@@ -21,6 +21,8 @@ pub trait IcpswapReadClient: Send + Sync {
     ) -> Result<IcpswapPoolData, IcpswapClientError>;
 
     async fn quote(&self, pool: Principal, args: &IcpswapSwapArgs) -> Result<Nat, IcpswapClientError>;
+
+    async fn pool_metadata(&self, pool: Principal) -> Result<IcpswapPoolMetadata, IcpswapClientError>;
 
     async fn ledger_fee(&self, ledger: Principal) -> Result<Nat, IcpswapClientError>;
 }
@@ -110,6 +112,28 @@ impl<A: PipelineAgent, B: IcpBackend> IcpswapReadClient for IcpswapClient<A, B> 
 
         match result {
             IcpswapResult::Ok(amount) => Ok(amount),
+            IcpswapResult::Err(error) => Err(IcpswapClientError::Protocol { method: METHOD, error }),
+        }
+    }
+
+    async fn pool_metadata(&self, pool: Principal) -> Result<IcpswapPoolMetadata, IcpswapClientError> {
+        const METHOD: &str = "metadata";
+        let encoded = Encode!().map_err(|error| IcpswapClientError::Encode {
+            method: METHOD,
+            message: error.to_string(),
+        })?;
+        let result = self
+            .agent
+            .call_query::<IcpswapResult<IcpswapPoolMetadata>>(&pool, METHOD, encoded)
+            .await
+            .map_err(|message| IcpswapClientError::Transport {
+                canister: pool,
+                method: METHOD,
+                message,
+            })?;
+
+        match result {
+            IcpswapResult::Ok(metadata) => Ok(metadata),
             IcpswapResult::Err(error) => Err(IcpswapClientError::Protocol { method: METHOD, error }),
         }
     }

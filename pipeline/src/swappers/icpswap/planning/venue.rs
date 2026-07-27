@@ -7,11 +7,13 @@ use icrc_ledger_types::icrc1::account::Account;
 use liquidium_pipeline_core::tokens::{
     asset_id::AssetId, chain_token::ChainToken, chain_token_amount::ChainTokenAmount,
 };
+use num_traits::ToPrimitive;
 
 use crate::swappers::{
     model::{SwapExecution, SwapQuote, SwapQuoteLeg, SwapRequest},
     router::SwapVenue,
 };
+use crate::utils::ICP_LEDGER_PRINCIPAL;
 
 use super::{
     client::{IcpswapManualClient, IcpswapReadClient},
@@ -20,8 +22,8 @@ use super::{
     plan::{amount_out_minimum, nat_to_decimal_text},
     state::validate_execution_state,
     types::{
-        IcpswapExecutionPlan, IcpswapQuoteError, IcpswapRoutePreview, IcpswapState, IcpswapSwapArgs, IcpswapToken,
-        IcpswapTokenMetadata,
+        IcpswapExecutionPlan, IcpswapPoolData, IcpswapPoolMetadata, IcpswapQuoteError, IcpswapRoutePreview,
+        IcpswapState, IcpswapSwapArgs, IcpswapToken, IcpswapTokenMetadata,
     },
 };
 
@@ -30,6 +32,27 @@ pub struct IcpswapVenue<C: IcpswapReadClient> {
     tokens: HashMap<AssetId, IcpswapTokenMetadata>,
     fee_tiers: Vec<Nat>,
     default_max_slippage_bps: u32,
+}
+
+/// Request-scoped values shared by every fee-tier preview. Owning the token
+/// values keeps concurrent pool attempts independent and easy to audit.
+struct IcpswapQuoteContext {
+    token_in: Principal,
+    token_out: Principal,
+    input_token: ChainToken,
+    output_token: ChainToken,
+    input_descriptor: IcpswapToken,
+    output_descriptor: IcpswapToken,
+    input_fee: Nat,
+    output_fee: Nat,
+    amount_in: ChainTokenAmount,
+    max_slippage_bps: u32,
+}
+
+struct IcpswapQuoteCandidate {
+    plan: IcpswapExecutionPlan,
+    estimated_price_impact_bps: f64,
+    spot_output: Nat,
 }
 
 #[async_trait]
@@ -175,10 +198,31 @@ impl<C: IcpswapReadClient> IcpswapVenue<C> {
         })
     }
 
+    /// Orchestrates a read-only ICPSwap preview from request preparation through
+    /// deterministic pool selection; each detailed stage lives below.
     pub async fn preview_route(&self, request: &SwapRequest) -> Result<IcpswapRoutePreview, IcpswapQuoteError> {
+        let context = self.prepare_quote_context(request).await?;
+        let candidate = self.preview_best_pool(&context).await?;
+
+        Ok(IcpswapRoutePreview {
+            quote: common_quote(
+                request,
+                &candidate.plan,
+                candidate.estimated_price_impact_bps,
+                &candidate.spot_output,
+            ),
+            route: candidate.plan,
+        })
+    }
+
+    /// Validates the request and resolves the token, fee, and spend values that
+    /// are identical for every pool fee-tier attempt.
+    async fn prepare_quote_context(&self, request: &SwapRequest) -> Result<IcpswapQuoteContext, IcpswapQuoteError> {
         if request.pay_amount.token.asset_id() != request.pay_asset {
             return Err(IcpswapQuoteError::PayAssetMismatch);
         }
+
+        validate_native_icp_input(request)?;
 
         let input = self
             .tokens
@@ -196,100 +240,47 @@ impl<C: IcpswapReadClient> IcpswapVenue<C> {
             futures::join!(self.client.ledger_fee(token_in), self.client.ledger_fee(token_out));
         let input_fee = input_fee.map_err(IcpswapQuoteError::LedgerFee)?;
         let output_fee = output_fee.map_err(IcpswapQuoteError::LedgerFee)?;
-        // `SwapRequest::pay_amount` is the total spend budget. The ICRC-1
-        // workflow charges once for the transfer into the pool subaccount and
-        // once for the pool's deposit sweep.
-        let input_operation_fees = input_fee.clone() * Nat::from(2u8);
-        if request.pay_amount.value <= input_operation_fees {
-            return Err(IcpswapQuoteError::InputFeesExceedBudget {
-                budget: request.pay_amount.value.clone(),
-                fees: input_operation_fees,
-            });
-        }
-        let amount_in = ChainTokenAmount::from_raw(
-            request.pay_amount.token.clone(),
-            request.pay_amount.value.clone() - input_operation_fees,
-        );
+        let amount_in = executable_input_amount(request, &input_fee)?;
         let max_slippage_bps = request.max_slippage_bps.unwrap_or(self.default_max_slippage_bps);
         amount_out_minimum(&Nat::from(0u8), max_slippage_bps)?;
 
-        let input_descriptor = IcpswapToken {
-            address: token_in.to_text(),
-            standard: input.standard.clone(),
-        };
-        let output_descriptor = IcpswapToken {
-            address: token_out.to_text(),
-            standard: output.standard.clone(),
-        };
+        Ok(IcpswapQuoteContext {
+            token_in,
+            token_out,
+            input_token: input.token.clone(),
+            output_token: output.token.clone(),
+            input_descriptor: IcpswapToken {
+                address: token_in.to_text(),
+                standard: input.standard.clone(),
+            },
+            output_descriptor: IcpswapToken {
+                address: token_out.to_text(),
+                standard: output.standard.clone(),
+            },
+            input_fee,
+            output_fee,
+            amount_in,
+            max_slippage_bps,
+        })
+    }
 
-        let attempts = self.fee_tiers.iter().cloned().map(|fee_tier| {
-            let input_descriptor = input_descriptor.clone();
-            let output_descriptor = output_descriptor.clone();
-            let output_token = output.token.clone();
-            let input_token = input.token.clone();
-            let amount_in = amount_in.clone();
-            let input_fee = input_fee.clone();
-            let output_fee = output_fee.clone();
-            async move {
-                let pool = self
-                    .client
-                    .get_pool(&input_descriptor, &output_descriptor, &fee_tier)
-                    .await
-                    .map_err(|error| format!("fee {fee_tier}: {error}"))?;
-                if pool.fee != fee_tier {
-                    return Err(IcpswapQuoteError::PoolFeeMismatch {
-                        pool: pool.canister_id,
-                        expected: fee_tier,
-                        actual: pool.fee,
-                    }
-                    .to_string());
-                }
-
-                let token0 = parse_pool_principal("token0", &pool.token0.address).map_err(|error| error.to_string())?;
-                let token1 = parse_pool_principal("token1", &pool.token1.address).map_err(|error| error.to_string())?;
-                let zero_for_one = if token_in == token0 && token_out == token1 {
-                    true
-                } else if token_in == token1 && token_out == token0 {
-                    false
-                } else {
-                    return Err(format!(
-                        "pool {} token pair does not match {} -> {}",
-                        pool.canister_id, token_in, token_out
-                    ));
-                };
-                let gross = self
-                    .client
-                    .quote(
-                        pool.canister_id,
-                        &IcpswapSwapArgs {
-                            zero_for_one,
-                            amount_in: nat_to_decimal_text(&amount_in.value),
-                            amount_out_minimum: "0".to_string(),
-                        },
-                    )
-                    .await
-                    .map_err(|error| format!("pool {}: {error}", pool.canister_id))?;
-
-                IcpswapExecutionPlan::new(
-                    pool.canister_id,
-                    token0,
-                    token1,
-                    fee_tier,
-                    amount_in,
-                    ChainTokenAmount::from_raw(input_token, input_fee),
-                    ChainTokenAmount::from_raw(output_token.clone(), gross),
-                    ChainTokenAmount::from_raw(output_token, output_fee),
-                    max_slippage_bps,
-                )
-                .map_err(|error| format!("pool {}: {error}", pool.canister_id))
-            }
-        });
+    /// Previews every configured fee tier concurrently, then selects the route
+    /// with the greatest net output using stable tie-breakers.
+    async fn preview_best_pool(
+        &self,
+        context: &IcpswapQuoteContext,
+    ) -> Result<IcpswapQuoteCandidate, IcpswapQuoteError> {
+        let attempts = self
+            .fee_tiers
+            .iter()
+            .cloned()
+            .map(|fee_tier| self.preview_pool(context, fee_tier));
 
         let mut candidates = Vec::new();
         let mut failures = Vec::new();
         for attempt in join_all(attempts).await {
             match attempt {
-                Ok(plan) => candidates.push(plan),
+                Ok(candidate) => candidates.push(candidate),
                 Err(error) => failures.push(error),
             }
         }
@@ -298,17 +289,69 @@ impl<C: IcpswapReadClient> IcpswapVenue<C> {
         }
         candidates.sort_by(|left, right| {
             right
+                .plan
                 .net_expected_output()
                 .value
-                .cmp(&left.net_expected_output().value)
-                .then_with(|| left.fee_tier.cmp(&right.fee_tier))
-                .then_with(|| left.pool.to_text().cmp(&right.pool.to_text()))
+                .cmp(&left.plan.net_expected_output().value)
+                .then_with(|| left.plan.fee_tier.cmp(&right.plan.fee_tier))
+                .then_with(|| left.plan.pool.to_text().cmp(&right.plan.pool.to_text()))
         });
-        let plan = candidates.remove(0);
+        Ok(candidates.remove(0))
+    }
 
-        Ok(IcpswapRoutePreview {
-            quote: common_quote(request, &plan),
-            route: plan,
+    /// Builds one complete pool candidate. Quote output and pool metadata are
+    /// queried concurrently because neither depends on the other.
+    async fn preview_pool(
+        &self,
+        context: &IcpswapQuoteContext,
+        fee_tier: Nat,
+    ) -> Result<IcpswapQuoteCandidate, String> {
+        let pool = self
+            .client
+            .get_pool(&context.input_descriptor, &context.output_descriptor, &fee_tier)
+            .await
+            .map_err(|error| format!("fee {fee_tier}: {error}"))?;
+        
+        validate_pool_fee(&pool, &fee_tier)?;
+
+        let (token0, token1, zero_for_one) = resolve_pool_direction(&pool, context.token_in, context.token_out)?;
+        let quote_args = IcpswapSwapArgs {
+            zero_for_one,
+            amount_in: nat_to_decimal_text(&context.amount_in.value),
+            amount_out_minimum: "0".to_string(),
+        };
+        let (gross, metadata) = futures::join!(
+            self.client.quote(pool.canister_id, &quote_args),
+            self.client.pool_metadata(pool.canister_id),
+        );
+        let gross = gross.map_err(|error| format!("pool {}: {error}", pool.canister_id))?;
+        let metadata = metadata.map_err(|error| format!("pool {} metadata: {error}", pool.canister_id))?;
+        validate_pool_metadata(&pool, token0, token1, &metadata)?;
+
+        let spot_output = spot_output_amount(
+            &context.amount_in.value,
+            &metadata.sqrt_price_x96,
+            zero_for_one,
+            pool.canister_id,
+        )?;
+        let estimated_price_impact_bps = quoted_price_impact_bps(&spot_output, &gross);
+        let plan = IcpswapExecutionPlan::new(
+            pool.canister_id,
+            token0,
+            token1,
+            fee_tier,
+            context.amount_in.clone(),
+            ChainTokenAmount::from_raw(context.input_token.clone(), context.input_fee.clone()),
+            ChainTokenAmount::from_raw(context.output_token.clone(), gross),
+            ChainTokenAmount::from_raw(context.output_token.clone(), context.output_fee.clone()),
+            context.max_slippage_bps,
+        )
+        .map_err(|error| format!("pool {}: {error}", pool.canister_id))?;
+
+        Ok(IcpswapQuoteCandidate {
+            plan,
+            estimated_price_impact_bps,
+            spot_output,
         })
     }
 }
@@ -461,18 +504,28 @@ fn execution_slippage_bps(expected: f64, receive: f64) -> f64 {
     }
 }
 
-fn common_quote(request: &SwapRequest, plan: &IcpswapExecutionPlan) -> SwapQuote {
+fn common_quote(
+    request: &SwapRequest,
+    plan: &IcpswapExecutionPlan,
+    estimated_slippage_bps: f64,
+    spot_output: &Nat,
+) -> SwapQuote {
     let pay_symbol = plan.amount_in.token.symbol();
     let expected_output = plan.net_expected_output();
     let receive_symbol = expected_output.token.symbol();
+    let pay = plan.amount_in.value.0.to_f64().unwrap_or(0.0);
+    let spot_receive = spot_output.0.to_f64().unwrap_or(0.0);
+    let quoted_receive = plan.gross_quoted_out.value.0.to_f64().unwrap_or(0.0);
+    let mid_price = if pay > 0.0 { spot_receive / pay } else { 0.0 };
+    let exec_price = if pay > 0.0 { quoted_receive / pay } else { 0.0 };
     SwapQuote {
         pay_asset: request.pay_asset.clone(),
         pay_amount: plan.amount_in.value.clone(),
         receive_asset: request.receive_asset.clone(),
         receive_amount: expected_output.value.clone(),
-        mid_price: 0.0,
-        exec_price: 0.0,
-        estimated_slippage_bps: 0.0,
+        mid_price,
+        exec_price,
+        estimated_slippage_bps,
         legs: vec![SwapQuoteLeg {
             venue: "icpswap".to_string(),
             route_id: plan.pool.to_text(),
@@ -482,10 +535,124 @@ fn common_quote(request: &SwapRequest, plan: &IcpswapExecutionPlan) -> SwapQuote
             receive_chain: "ICP".to_string(),
             receive_symbol,
             receive_amount: expected_output.value,
-            price: 0.0,
+            price: exec_price,
             lp_fee: Nat::from(0u8),
             gas_fee: plan.output_ledger_fee.value.clone(),
         }],
+    }
+}
+
+/// Converts the pool's Q96 square-root price into the raw output amount for
+/// this direction. Raw ledger units are intentional: ICPSwap's quote uses the
+/// same units, so token decimals cancel when the two outputs are compared.
+fn spot_output_amount(
+    amount_in: &Nat,
+    sqrt_price_x96: &Nat,
+    zero_for_one: bool,
+    pool: Principal,
+) -> Result<Nat, String> {
+    if sqrt_price_x96 == &Nat::from(0u8) {
+        return Err(IcpswapQuoteError::InvalidPoolPrice { pool }.to_string());
+    }
+    let price_x192 = &sqrt_price_x96.0 * &sqrt_price_x96.0;
+    let q192 = Nat::from(1u8).0 << 192usize;
+    let output = if zero_for_one {
+        (&amount_in.0 * &price_x192) / &q192
+    } else {
+        (&amount_in.0 * &q192) / &price_x192
+    };
+    Ok(Nat(output))
+}
+
+/// Measures planning-time price impact against pool spot. This is deliberately
+/// independent from `amount_out_minimum`, which protects execution-time drift.
+fn quoted_price_impact_bps(spot_output: &Nat, gross_quote: &Nat) -> f64 {
+    let spot = spot_output.0.to_f64().unwrap_or(f64::INFINITY);
+    let quoted = gross_quote.0.to_f64().unwrap_or(0.0);
+    if !spot.is_finite() || spot <= 0.0 || !quoted.is_finite() {
+        return f64::INFINITY;
+    }
+    ((spot - quoted) / spot).max(0.0) * 10_000.0
+}
+
+fn validate_native_icp_input(request: &SwapRequest) -> Result<(), IcpswapQuoteError> {
+    let expected =
+        Principal::from_text(ICP_LEDGER_PRINCIPAL).expect("configured native ICP ledger principal must be valid");
+    let actual = icp_ledger(&request.pay_amount.token)
+        .ok_or_else(|| IcpswapQuoteError::MissingToken(request.pay_asset.to_string()))?;
+    if actual == expected {
+        Ok(())
+    } else {
+        Err(IcpswapQuoteError::UnsupportedInputLedger { expected, actual })
+    }
+}
+
+/// Converts the total allocation into the amount sent through the pool after
+/// reserving the wallet transfer and pool deposit-sweep ledger fees.
+fn executable_input_amount(request: &SwapRequest, input_fee: &Nat) -> Result<ChainTokenAmount, IcpswapQuoteError> {
+    let input_operation_fees = input_fee.clone() * Nat::from(2u8);
+    if request.pay_amount.value <= input_operation_fees {
+        return Err(IcpswapQuoteError::InputFeesExceedBudget {
+            budget: request.pay_amount.value.clone(),
+            fees: input_operation_fees,
+        });
+    }
+    Ok(ChainTokenAmount::from_raw(
+        request.pay_amount.token.clone(),
+        request.pay_amount.value.clone() - input_operation_fees,
+    ))
+}
+
+fn validate_pool_fee(pool: &IcpswapPoolData, expected: &Nat) -> Result<(), String> {
+    if &pool.fee == expected {
+        Ok(())
+    } else {
+        Err(IcpswapQuoteError::PoolFeeMismatch {
+            pool: pool.canister_id,
+            expected: expected.clone(),
+            actual: pool.fee.clone(),
+        }
+        .to_string())
+    }
+}
+
+fn resolve_pool_direction(
+    pool: &IcpswapPoolData,
+    token_in: Principal,
+    token_out: Principal,
+) -> Result<(Principal, Principal, bool), String> {
+    let token0 = parse_pool_principal("token0", &pool.token0.address).map_err(|error| error.to_string())?;
+    let token1 = parse_pool_principal("token1", &pool.token1.address).map_err(|error| error.to_string())?;
+    let zero_for_one = if token_in == token0 && token_out == token1 {
+        true
+    } else if token_in == token1 && token_out == token0 {
+        false
+    } else {
+        return Err(format!(
+            "pool {} token pair does not match {} -> {}",
+            pool.canister_id, token_in, token_out
+        ));
+    };
+    Ok((token0, token1, zero_for_one))
+}
+
+fn validate_pool_metadata(
+    pool: &IcpswapPoolData,
+    token0: Principal,
+    token1: Principal,
+    metadata: &IcpswapPoolMetadata,
+) -> Result<(), String> {
+    let metadata_token0 =
+        parse_pool_principal("metadata.token0", &metadata.token0.address).map_err(|error| error.to_string())?;
+    let metadata_token1 =
+        parse_pool_principal("metadata.token1", &metadata.token1.address).map_err(|error| error.to_string())?;
+    if metadata_token0 == token0 && metadata_token1 == token1 {
+        Ok(())
+    } else {
+        Err(format!(
+            "pool {} metadata token pair does not match discovered pool",
+            pool.canister_id
+        ))
     }
 }
 

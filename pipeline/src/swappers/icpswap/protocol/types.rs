@@ -31,6 +31,15 @@ pub struct IcpswapPoolData {
     pub canister_id: Principal,
 }
 
+/// Price-bearing subset of the ICPSwap pool's public `metadata` response.
+#[derive(CandidType, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IcpswapPoolMetadata {
+    pub token0: IcpswapToken,
+    pub token1: IcpswapToken,
+    #[serde(rename = "sqrtPriceX96")]
+    pub sqrt_price_x96: Nat,
+}
+
 #[derive(CandidType, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum IcpswapError {
     CommonError,
@@ -293,6 +302,10 @@ pub enum IcpswapQuoteError {
     PayAssetMismatch,
     #[error("ICPSwap input budget {budget} cannot cover transfer and deposit fees totaling {fees}")]
     InputFeesExceedBudget { budget: Nat, fees: Nat },
+    #[error("ICPSwap only accepts native ICP from ledger {expected}, got {actual}")]
+    UnsupportedInputLedger { expected: Principal, actual: Principal },
+    #[error("ICPSwap pool {pool} returned an invalid zero spot price")]
+    InvalidPoolPrice { pool: Principal },
     #[error("invalid principal '{address}' returned as {field}: {message}")]
     InvalidPoolPrincipal {
         field: &'static str,

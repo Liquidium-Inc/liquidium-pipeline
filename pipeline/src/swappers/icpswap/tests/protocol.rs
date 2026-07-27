@@ -12,8 +12,8 @@ use super::{
     plan::{amount_out_minimum, nat_to_decimal_text, net_expected_output, resolve_direction},
     types::{
         IcpswapClientError, IcpswapDepositArgs, IcpswapError, IcpswapExecutionPlan, IcpswapExecutionState,
-        IcpswapGetPoolArgs, IcpswapPlanError, IcpswapPoolData, IcpswapResult, IcpswapStep, IcpswapSwapArgs,
-        IcpswapToken, IcpswapWithdrawArgs,
+        IcpswapGetPoolArgs, IcpswapPlanError, IcpswapPoolData, IcpswapPoolMetadata, IcpswapResult, IcpswapStep,
+        IcpswapSwapArgs, IcpswapToken, IcpswapWithdrawArgs,
     },
 };
 
@@ -426,6 +426,37 @@ async fn client_quotes_pool_with_native_integer_strings() {
     let client = IcpswapClient::new(Arc::new(agent), Arc::new(MockIcpBackend::new()), factory);
 
     assert_eq!(client.quote(pool, &args).await, Ok(Nat::from(42_000u64)));
+}
+
+#[tokio::test]
+async fn client_reads_pool_price_metadata_with_empty_query_arguments() {
+    let factory = principal(7);
+    let pool = principal(8);
+    let expected = IcpswapPoolMetadata {
+        token0: IcpswapToken {
+            address: principal(1).to_text(),
+            standard: "ICRC2".to_string(),
+        },
+        token1: IcpswapToken {
+            address: principal(2).to_text(),
+            standard: "ICRC2".to_string(),
+        },
+        sqrt_price_x96: Nat::from(1u128 << 96),
+    };
+    let response = expected.clone();
+    let empty_args = Encode!().expect("encode empty Candid arguments");
+
+    let mut agent = MockPipelineAgent::new();
+    agent
+        .expect_call_query::<IcpswapResult<IcpswapPoolMetadata>>()
+        .times(1)
+        .withf(move |canister, method, encoded| {
+            *canister == pool && method == "metadata" && encoded.as_slice() == empty_args.as_slice()
+        })
+        .return_once(move |_, _, _| Ok(IcpswapResult::Ok(response)));
+    let client = IcpswapClient::new(Arc::new(agent), Arc::new(MockIcpBackend::new()), factory);
+
+    assert_eq!(client.pool_metadata(pool).await, Ok(expected));
 }
 
 #[tokio::test]
