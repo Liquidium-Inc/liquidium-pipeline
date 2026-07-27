@@ -2,7 +2,7 @@ use std::collections::HashSet;
 
 use candid::Nat;
 use liquidium_pipeline_core::tokens::{asset_id::AssetId, chain_token_amount::ChainTokenAmount};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::{
     persistance::VenueExecutionState,
@@ -125,13 +125,31 @@ pub enum MultiVenueAllocationReason {
     },
     PriceImpactSplit,
     RemainderBelowMinimum {
-        skipped_venue_id: String,
+        #[serde(alias = "skipped_venue_id", deserialize_with = "deserialize_venue_ids")]
+        skipped_venue_ids: Vec<String>,
         selected_venue_id: String,
     },
     VenueUnavailable {
         selected_venue_id: String,
         unavailable_venue_ids: Vec<String>,
     },
+}
+
+fn deserialize_venue_ids<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum OneOrMany {
+        One(String),
+        Many(Vec<String>),
+    }
+
+    Ok(match OneOrMany::deserialize(deserializer)? {
+        OneOrMany::One(venue_id) => vec![venue_id],
+        OneOrMany::Many(venue_ids) => venue_ids,
+    })
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

@@ -32,11 +32,16 @@ pub struct VenueLegProgress {
 #[cfg_attr(test, mockall::automock)]
 #[async_trait]
 pub trait MultiVenueAdapter: Send + Sync {
+    /// Stable identifier persisted in venue legs and used for adapter lookup.
     fn venue_id(&self) -> &'static str;
 
+    /// Produces an amount-scoped quote and initial execution state without
+    /// submitting transfers, orders, or swaps.
     async fn preview(&self, request: &SwapRequest) -> Result<VenueRoutePreview, String>;
 
+    /// Advances only the supplied persisted leg by one idempotent transition.
     async fn advance(&self, leg: &VenueLegState) -> Result<VenueLegProgress, String>;
 
+    /// Reconciles or recovers only the supplied leg after restart or failure.
     async fn recover(&self, leg: &VenueLegState) -> Result<VenueLegProgress, String>;
 }

@@ -145,6 +145,47 @@ fn arbitrary_venue_id_round_trips_without_schema_changes() {
 }
 
 #[test]
+fn below_minimum_reason_round_trips_all_skipped_venue_ids() {
+    let mut original = envelope(state_with_venues(&[("icpswap", 100)]));
+    let FinalizerMetaPayload::MultiVenueSwap(state) = &mut original.payload;
+    state.plan.allocation_reason = MultiVenueAllocationReason::RemainderBelowMinimum {
+        skipped_venue_ids: vec!["mexc".to_string(), "kraken".to_string()],
+        selected_venue_id: "icpswap".to_string(),
+    };
+
+    let encoded = serde_json::to_value(&original).expect("serialize envelope");
+    assert_eq!(
+        encoded["state"]["plan"]["allocation_reason"]["skipped_venue_ids"],
+        json!(["mexc", "kraken"])
+    );
+    let decoded: FinalizerMetaV2 = serde_json::from_value(encoded).expect("deserialize envelope");
+
+    assert_eq!(decoded, original);
+}
+
+#[test]
+fn below_minimum_reason_decodes_legacy_singular_skipped_venue_id() {
+    let mut encoded =
+        serde_json::to_value(envelope(state_with_venues(&[("icpswap", 100)]))).expect("serialize envelope");
+    encoded["state"]["plan"]["allocation_reason"] = json!({
+        "reason": "remainder_below_minimum",
+        "skipped_venue_id": "mexc",
+        "selected_venue_id": "icpswap"
+    });
+
+    let decoded: FinalizerMetaV2 = serde_json::from_value(encoded).expect("decode legacy singular field");
+    let FinalizerMetaPayload::MultiVenueSwap(state) = decoded.payload;
+
+    assert_eq!(
+        state.plan.allocation_reason,
+        MultiVenueAllocationReason::RemainderBelowMinimum {
+            skipped_venue_ids: vec!["mexc".to_string()],
+            selected_venue_id: "icpswap".to_string(),
+        }
+    );
+}
+
+#[test]
 fn legacy_decision_snapshot_defaults_multi_venue_allocation_to_none() {
     let snapshot: FinalizerDecisionSnapshot = serde_json::from_value(json!({
         "mode": "hybrid",
