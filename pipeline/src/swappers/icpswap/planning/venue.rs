@@ -422,11 +422,7 @@ fn completed_execution(request: &SwapRequest, state: &IcpswapState, now_nanos: u
     let expected = expected_output.to_f64();
     let exec_price = if pay > 0.0 { receive / pay } else { 0.0 };
     let mid_price = if pay > 0.0 { expected / pay } else { 0.0 };
-    let slippage = if expected > 0.0 {
-        ((expected - receive) / expected).max(0.0)
-    } else {
-        0.0
-    };
+    let realized_slippage_bps = execution_slippage_bps(expected, receive);
 
     Ok(SwapExecution {
         swap_id: 0,
@@ -438,7 +434,7 @@ fn completed_execution(request: &SwapRequest, state: &IcpswapState, now_nanos: u
         receive_amount: net.clone(),
         mid_price,
         exec_price,
-        slippage,
+        realized_slippage_bps,
         legs: vec![SwapQuoteLeg {
             venue: "icpswap".to_string(),
             route_id: format!("{}:manual={}", state.plan.pool, state.execution_id),
@@ -457,6 +453,14 @@ fn completed_execution(request: &SwapRequest, state: &IcpswapState, now_nanos: u
     })
 }
 
+fn execution_slippage_bps(expected: f64, receive: f64) -> f64 {
+    if expected > 0.0 {
+        ((expected - receive) / expected).max(0.0) * 10_000.0
+    } else {
+        0.0
+    }
+}
+
 fn common_quote(request: &SwapRequest, plan: &IcpswapExecutionPlan) -> SwapQuote {
     let pay_symbol = plan.amount_in.token.symbol();
     let expected_output = plan.net_expected_output();
@@ -468,7 +472,7 @@ fn common_quote(request: &SwapRequest, plan: &IcpswapExecutionPlan) -> SwapQuote
         receive_amount: expected_output.value.clone(),
         mid_price: 0.0,
         exec_price: 0.0,
-        slippage: 0.0,
+        estimated_slippage_bps: 0.0,
         legs: vec![SwapQuoteLeg {
             venue: "icpswap".to_string(),
             route_id: plan.pool.to_text(),
@@ -497,5 +501,17 @@ fn icp_ledger(token: &ChainToken) -> Option<Principal> {
     match token {
         ChainToken::Icp { ledger, .. } => Some(*ledger),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod unit_tests {
+    use super::execution_slippage_bps;
+
+    #[test]
+    fn execution_ratio_is_normalized_to_basis_points() {
+        assert!((execution_slippage_bps(100.0, 99.0) - 100.0).abs() < f64::EPSILON);
+        assert_eq!(execution_slippage_bps(100.0, 101.0), 0.0);
+        assert_eq!(execution_slippage_bps(0.0, 0.0), 0.0);
     }
 }

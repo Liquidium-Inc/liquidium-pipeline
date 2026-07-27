@@ -101,7 +101,11 @@ impl<'a> PipelineStage<'a, Vec<LiquidationOutcome>, ()> for ExportStage {
                     .as_ref()
                     .map(|s| s.receive_amount.to_string()),
                 price: r.finalizer_result.swap_result.as_ref().map(|s| s.exec_price),
-                slippage: r.finalizer_result.swap_result.as_ref().map(|s| s.slippage),
+                slippage: r
+                    .finalizer_result
+                    .swap_result
+                    .as_ref()
+                    .map(|s| s.realized_slippage_bps),
                 swap_ts: r.finalizer_result.swap_result.as_ref().map(|s| s.ts),
             };
             wtr.serialize(row).map_err(|e| format!("CSV serialize error: {}", e))?;

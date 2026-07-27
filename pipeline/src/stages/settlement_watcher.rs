@@ -426,7 +426,7 @@ mod tests {
             receive_amount: Nat::from(2_000_000u64),
             mid_price: 1.0,
             exec_price: 1.0,
-            slippage: 0.0,
+            estimated_slippage_bps: 0.0,
             legs: vec![],
         };
         swapper
@@ -613,7 +613,7 @@ mod tests {
             receive_amount: Nat::from(1u64),
             mid_price: 1.0,
             exec_price: 1.0,
-            slippage: 0.0,
+            estimated_slippage_bps: 0.0,
             legs: vec![],
         };
         swapper

@@ -1458,7 +1458,7 @@ where
             exec_price
         };
 
-        let slippage = state.trade.trade_weighted_slippage_bps.unwrap_or(0.0);
+        let realized_slippage_bps = state.trade.trade_weighted_slippage_bps.unwrap_or(0.0);
         let legs: Vec<SwapQuoteLeg> = state
             .trade
             .trade_slices
@@ -1502,7 +1502,7 @@ where
             receive_amount: receive_amount.value,
             mid_price,
             exec_price,
-            slippage,
+            realized_slippage_bps,
             legs,
             approval_count: state.deposit.approval_bump_count,
             ts: now_ts().max(0) as u64,

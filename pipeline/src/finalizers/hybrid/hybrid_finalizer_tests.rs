@@ -142,7 +142,7 @@ impl Finalizer for RecordingDexFinalizer {
                 receive_amount: Nat::from(1_100u64),
                 mid_price: 1.0,
                 exec_price: 1.0,
-                slippage: 0.0,
+                realized_slippage_bps: 0.0,
                 legs: vec![],
                 approval_count: None,
                 ts: 0,
@@ -427,7 +427,7 @@ fn make_receipt_with_collateral(
     }
 }
 
-fn quote_from_req(req: &SwapRequest, receive_amount: u64, slippage: f64) -> SwapQuote {
+fn quote_from_req(req: &SwapRequest, receive_amount: u64, estimated_slippage_bps: f64) -> SwapQuote {
     SwapQuote {
         pay_asset: req.pay_asset.clone(),
         pay_amount: req.pay_amount.value.clone(),
@@ -435,7 +435,7 @@ fn quote_from_req(req: &SwapRequest, receive_amount: u64, slippage: f64) -> Swap
         receive_amount: Nat::from(receive_amount),
         mid_price: 1.0,
         exec_price: 1.0,
-        slippage,
+        estimated_slippage_bps,
         legs: vec![],
     }
 }

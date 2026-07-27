@@ -58,7 +58,7 @@ fn execution(pay: &ChainTokenAmount, receive: &ChainTokenAmount) -> SwapExecutio
         receive_amount: receive.value.clone(),
         mid_price: 1.0,
         exec_price: 0.99,
-        slippage: 100.0,
+        realized_slippage_bps: 100.0,
         legs: Vec::new(),
         approval_count: None,
         ts: 123,

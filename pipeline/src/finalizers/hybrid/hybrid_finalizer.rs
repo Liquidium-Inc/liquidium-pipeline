@@ -3,7 +3,7 @@ use candid::Nat;
 use std::sync::Arc;
 
 use super::utils::{
-    DEX_DUST_MAX_USD, RouteCandidate, RouteVenue, choose_best_route, debt_repaid_f64, dex_slippage_bps,
+    DEX_DUST_MAX_USD, RouteCandidate, RouteVenue, choose_best_route, debt_repaid_f64,
     estimate_swap_value_usd, is_dust_swap, make_snapshot, net_edge_bps, preview_gross_edge_bps,
     should_force_cex_over_threshold,
 };
@@ -234,7 +234,7 @@ where
                     ChainTokenAmount::from_raw(receipt.request.debt_asset.clone(), quote.receive_amount.clone())
                         .to_f64();
                 let gross_edge_bps = preview_gross_edge_bps(estimated_receive_amount, debt_repaid_amount);
-                let slippage_bps = dex_slippage_bps(quote.slippage);
+                let slippage_bps = quote.estimated_slippage_bps;
                 // DEX quote receive amount already includes execution impact; avoid double-counting slippage.
                 let net_edge_bps = gross_edge_bps;
                 info!(

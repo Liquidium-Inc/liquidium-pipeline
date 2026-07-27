@@ -414,7 +414,7 @@ async fn committing_dex_preview_creates_manual_icpswap_state() {
             receive_amount: plan.net_expected_output().value,
             mid_price: 0.0,
             exec_price: 0.0,
-            slippage: 0.0,
+            estimated_slippage_bps: 0.0,
             legs: Vec::new(),
         },
         crate::swappers::icpswap::VENUE_ID,

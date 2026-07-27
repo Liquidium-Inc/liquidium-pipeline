@@ -5308,6 +5308,7 @@ async fn mexc_finish_builds_synthetic_swap_execution_from_state() {
         state.withdraw.withdraw_asset.clone(),
         2.0,
     ));
+    state.trade.trade_weighted_slippage_bps = Some(42.5);
 
     let swap = finalizer.finish(&receipt, &state).await.expect("finish should succeed");
 
@@ -5331,6 +5332,7 @@ async fn mexc_finish_builds_synthetic_swap_execution_from_state() {
 
     assert!((swap.exec_price - expected_price).abs() < 1e-9);
     assert!((swap.mid_price - expected_price).abs() < 1e-9);
+    assert_eq!(swap.realized_slippage_bps, 42.5);
 
     // Status and legs should reflect a single synthetic CEX hop.
     assert_eq!(swap.status, "completed".to_string());

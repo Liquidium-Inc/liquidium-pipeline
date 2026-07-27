@@ -37,7 +37,7 @@ pub struct SwapQuoteLeg {
     pub gas_fee: Nat,
 }
 
-#[derive(CandidType, Debug, Clone, Serialize, Deserialize)]
+#[derive(CandidType, Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SwapQuote {
     pub pay_asset: AssetId,
     pub pay_amount: Nat,
@@ -45,7 +45,8 @@ pub struct SwapQuote {
     pub receive_amount: Nat,
     pub mid_price: f64,
     pub exec_price: f64,
-    pub slippage: f64,
+    #[serde(default, alias = "slippage")]
+    pub estimated_slippage_bps: f64,
 
     pub legs: Vec<SwapQuoteLeg>,
 }
@@ -71,10 +72,111 @@ pub struct SwapExecution {
 
     pub mid_price: f64,
     pub exec_price: f64,
-    pub slippage: f64,
+    #[serde(default, alias = "slippage")]
+    pub realized_slippage_bps: f64,
 
     pub legs: Vec<SwapQuoteLeg>,
     #[serde(default)]
     pub approval_count: Option<u32>,
     pub ts: u64,
+}
+
+#[cfg(test)]
+mod tests {
+    use candid::Nat;
+    use liquidium_pipeline_core::tokens::{
+        chain_token::ChainToken, chain_token_amount::ChainTokenAmount,
+    };
+
+    use super::*;
+
+    fn request() -> SwapRequest {
+        let pay_token = ChainToken::EvmNative {
+            chain: "test".to_string(),
+            symbol: "PAY".to_string(),
+            decimals: 8,
+            fee: Nat::from(1u8),
+        };
+        let receive_asset = AssetId {
+            chain: "test".to_string(),
+            address: "receive".to_string(),
+            symbol: "RECEIVE".to_string(),
+        };
+
+        SwapRequest {
+            pay_asset: pay_token.asset_id(),
+            pay_amount: ChainTokenAmount::from_raw(pay_token, Nat::from(100u64)),
+            receive_asset,
+            receive_address: None,
+            max_slippage_bps: Some(100),
+            venue_hint: None,
+        }
+    }
+
+    fn quote() -> SwapQuote {
+        let request = request();
+        SwapQuote {
+            pay_asset: request.pay_asset,
+            pay_amount: request.pay_amount.value,
+            receive_asset: request.receive_asset,
+            receive_amount: Nat::from(200u64),
+            mid_price: 2.0,
+            exec_price: 1.99,
+            estimated_slippage_bps: 50.0,
+            legs: Vec::new(),
+        }
+    }
+
+    fn execution() -> SwapExecution {
+        let quote = quote();
+        SwapExecution {
+            swap_id: 1,
+            request_id: 2,
+            status: "completed".to_string(),
+            pay_asset: quote.pay_asset,
+            pay_amount: quote.pay_amount,
+            receive_asset: quote.receive_asset,
+            receive_amount: quote.receive_amount,
+            mid_price: quote.mid_price,
+            exec_price: quote.exec_price,
+            realized_slippage_bps: 75.0,
+            legs: Vec::new(),
+            approval_count: None,
+            ts: 3,
+        }
+    }
+
+    #[test]
+    fn quote_reads_legacy_slippage_and_writes_basis_point_name() {
+        let mut encoded = serde_json::to_value(quote()).expect("serialize quote");
+        let object = encoded.as_object_mut().expect("quote object");
+        let value = object
+            .remove("estimated_slippage_bps")
+            .expect("new slippage field");
+        object.insert("slippage".to_string(), value);
+
+        let decoded: SwapQuote = serde_json::from_value(encoded).expect("decode legacy quote");
+        assert_eq!(decoded.estimated_slippage_bps, 50.0);
+
+        let reencoded = serde_json::to_value(decoded).expect("serialize normalized quote");
+        assert_eq!(reencoded["estimated_slippage_bps"], 50.0);
+        assert!(reencoded.get("slippage").is_none());
+    }
+
+    #[test]
+    fn execution_reads_legacy_slippage_and_writes_basis_point_name() {
+        let mut encoded = serde_json::to_value(execution()).expect("serialize execution");
+        let object = encoded.as_object_mut().expect("execution object");
+        let value = object
+            .remove("realized_slippage_bps")
+            .expect("new slippage field");
+        object.insert("slippage".to_string(), value);
+
+        let decoded: SwapExecution = serde_json::from_value(encoded).expect("decode legacy execution");
+        assert_eq!(decoded.realized_slippage_bps, 75.0);
+
+        let reencoded = serde_json::to_value(decoded).expect("serialize normalized execution");
+        assert_eq!(reencoded["realized_slippage_bps"], 75.0);
+        assert!(reencoded.get("slippage").is_none());
+    }
 }

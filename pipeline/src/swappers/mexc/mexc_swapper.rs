@@ -188,7 +188,7 @@ impl<C: CexBackend> SwapVenue for MexcSwapVenue<C> {
             receive_amount: leg.receive_amount.clone(),
             mid_price: leg.price,
             exec_price: leg.price,
-            slippage: 0.0, // you can compute from orderbook later
+            estimated_slippage_bps: 0.0, // you can compute from orderbook later
             legs: vec![leg],
         })
     }
@@ -244,7 +244,7 @@ impl<C: CexBackend> ExecutableSwapVenue for MexcSwapVenue<C> {
 
             mid_price: price,
             exec_price: price,
-            slippage: 0.0,
+            realized_slippage_bps: 0.0,
 
             legs: vec![leg],
             approval_count: None,
