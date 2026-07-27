@@ -35,7 +35,7 @@ pub struct CexRoutePreview {
     /// Estimated output amount in final receive-asset native units.
     pub estimated_receive_amount: f64,
     /// Estimated end-to-end route slippage in basis points.
-    pub estimated_slippage_bps: f64,
+    pub estimated_price_impact_bps: f64,
     /// Optional reason when preview cannot be executed.
     pub reason: Option<String>,
 }
@@ -629,7 +629,7 @@ mod tests {
             Ok(CexRoutePreview {
                 is_executable: true,
                 estimated_receive_amount: 0.0,
-                estimated_slippage_bps: 0.0,
+                estimated_price_impact_bps: 0.0,
                 reason: None,
             })
         }
@@ -786,7 +786,7 @@ mod tests {
             Ok(CexRoutePreview {
                 is_executable: true,
                 estimated_receive_amount: 0.0,
-                estimated_slippage_bps: 0.0,
+                estimated_price_impact_bps: 0.0,
                 reason: None,
             })
         }

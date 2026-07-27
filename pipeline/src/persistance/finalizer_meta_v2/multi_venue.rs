@@ -102,7 +102,8 @@ pub struct VenueLegQuote {
     pub pay_amount: ChainTokenAmount,
     pub estimated_receive: ChainTokenAmount,
     pub conservative_receive: ChainTokenAmount,
-    pub estimated_slippage_bps: f64,
+    #[serde(default, alias = "estimated_slippage_bps")]
+    pub estimated_price_impact_bps: f64,
     pub route_id: String,
 }
 
@@ -180,6 +181,7 @@ pub struct VenueAllocationSnapshot {
     pub pay_amount: ChainTokenAmount,
     pub estimated_receive: ChainTokenAmount,
     pub conservative_receive: ChainTokenAmount,
-    pub estimated_slippage_bps: Option<f64>,
+    #[serde(default, alias = "estimated_slippage_bps")]
+    pub estimated_price_impact_bps: Option<f64>,
     pub route_id: String,
 }

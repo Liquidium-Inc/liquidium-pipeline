@@ -77,7 +77,7 @@ impl From<KongSwapAmountsReply> for SwapQuote {
             receive_amount: k.receive_amount,
             mid_price: k.mid_price,
             exec_price: k.price,
-            estimated_slippage_bps: percentage_points_to_bps(k.slippage),
+            estimated_price_impact_bps: percentage_points_to_bps(k.slippage),
             legs,
         }
     }

@@ -3,9 +3,8 @@ use candid::Nat;
 use std::sync::Arc;
 
 use super::utils::{
-    DEX_DUST_MAX_USD, RouteCandidate, RouteVenue, choose_best_route, debt_repaid_f64,
-    estimate_swap_value_usd, is_dust_swap, make_snapshot, net_edge_bps, preview_gross_edge_bps,
-    should_force_cex_over_threshold,
+    DEX_DUST_MAX_USD, RouteCandidate, RouteVenue, choose_best_route, debt_repaid_f64, estimate_swap_value_usd,
+    is_dust_swap, make_snapshot, net_edge_bps, preview_gross_edge_bps, should_force_cex_over_threshold,
 };
 use crate::{
     config::{ConfigTrait, SwapperMode},
@@ -234,12 +233,12 @@ where
                     ChainTokenAmount::from_raw(receipt.request.debt_asset.clone(), quote.receive_amount.clone())
                         .to_f64();
                 let gross_edge_bps = preview_gross_edge_bps(estimated_receive_amount, debt_repaid_amount);
-                let slippage_bps = quote.estimated_slippage_bps;
+                let price_impact_bps = quote.estimated_price_impact_bps;
                 // DEX quote receive amount already includes execution impact; avoid double-counting slippage.
                 let net_edge_bps = gross_edge_bps;
                 info!(
-                    "[hybrid] dex preview preview_gross_bps={:.2} slippage_bps={:.2} preview_net_bps={:.2}",
-                    gross_edge_bps, slippage_bps, net_edge_bps
+                    "[hybrid] dex preview preview_gross_bps={:.2} price_impact_bps={:.2} preview_net_bps={:.2}",
+                    gross_edge_bps, price_impact_bps, net_edge_bps
                 );
                 Ok(Some(RouteCandidate {
                     venue: RouteVenue::Dex,
@@ -270,13 +269,13 @@ where
                 let gross_edge_bps = preview_gross_edge_bps(preview.estimated_receive_amount, debt_repaid_amount);
                 let route_fee_bps = self.config.get_cex_route_fee_bps() as f64;
                 let execution_delay_buffer_bps = self.config.get_cex_delay_buffer_bps() as f64;
-                // `gross_edge_bps` already reflects previewed execution output (slippage included),
+                // `gross_edge_bps` already reflects amount-scoped execution output (price impact included),
                 // so only fixed route fee and delay-risk haircut are subtracted here.
                 let net_edge_bps = net_edge_bps(gross_edge_bps, route_fee_bps, execution_delay_buffer_bps);
                 info!(
-                    "[hybrid] cex preview preview_gross_bps={:.2} slippage_bps={:.2} fee_bps={:.2} delay_bps={:.2} preview_net_bps={:.2}",
+                    "[hybrid] cex preview preview_gross_bps={:.2} price_impact_bps={:.2} fee_bps={:.2} delay_bps={:.2} preview_net_bps={:.2}",
                     gross_edge_bps,
-                    preview.estimated_slippage_bps,
+                    preview.estimated_price_impact_bps,
                     route_fee_bps,
                     execution_delay_buffer_bps,
                     net_edge_bps

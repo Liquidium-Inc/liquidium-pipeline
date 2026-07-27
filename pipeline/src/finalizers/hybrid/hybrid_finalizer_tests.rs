@@ -427,7 +427,7 @@ fn make_receipt_with_collateral(
     }
 }
 
-fn quote_from_req(req: &SwapRequest, receive_amount: u64, estimated_slippage_bps: f64) -> SwapQuote {
+fn quote_from_req(req: &SwapRequest, receive_amount: u64, estimated_price_impact_bps: f64) -> SwapQuote {
     SwapQuote {
         pay_asset: req.pay_asset.clone(),
         pay_amount: req.pay_amount.value.clone(),
@@ -435,7 +435,7 @@ fn quote_from_req(req: &SwapRequest, receive_amount: u64, estimated_slippage_bps
         receive_amount: Nat::from(receive_amount),
         mid_price: 1.0,
         exec_price: 1.0,
-        estimated_slippage_bps,
+        estimated_price_impact_bps,
         legs: vec![],
     }
 }
@@ -445,7 +445,7 @@ fn cex_preview(estimated_receive_native: f64) -> CexRoutePreview {
         is_executable: true,
         // CEX preview returns decimal token units; tests define inputs in native debt units.
         estimated_receive_amount: estimated_receive_native / 1_000_000.0,
-        estimated_slippage_bps: 0.0,
+        estimated_price_impact_bps: 0.0,
         reason: None,
     }
 }
@@ -835,7 +835,7 @@ async fn forced_preview_none_persists_snapshot_and_errors() {
             preview: Ok(CexRoutePreview {
                 is_executable: false,
                 estimated_receive_amount: 0.0,
-                estimated_slippage_bps: 0.0,
+                estimated_price_impact_bps: 0.0,
                 reason: Some("book empty".to_string()),
             }),
         })),

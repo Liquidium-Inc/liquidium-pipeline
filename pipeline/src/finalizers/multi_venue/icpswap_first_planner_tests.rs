@@ -96,7 +96,7 @@ fn input_with_pay_token(pay_token: ChainToken) -> IcpswapFirstPlanInput {
 
 fn config(cex_min_exec_usd: f64) -> IcpswapFirstPlannerConfig {
     IcpswapFirstPlannerConfig {
-        max_quoted_slippage_bps: 100.0,
+        max_price_impact_bps: 100.0,
         max_search_iterations: 16,
         cex_min_exec_usd,
         min_net_edge_bps: 150,
@@ -107,7 +107,7 @@ fn config(cex_min_exec_usd: f64) -> IcpswapFirstPlannerConfig {
 fn preview(
     request: &SwapRequest,
     venue_id: &str,
-    estimated_slippage_bps: f64,
+    estimated_price_impact_bps: f64,
     receive_amount: u64,
     conservative_receive_amount: u64,
 ) -> VenueRoutePreview {
@@ -122,7 +122,7 @@ fn preview(
             receive_amount: Nat::from(receive_amount),
             mid_price: 1.0,
             exec_price: 1.0,
-            estimated_slippage_bps,
+            estimated_price_impact_bps,
             legs: vec![SwapQuoteLeg {
                 venue: venue_id.to_string(),
                 route_id: format!("{venue_id}-route"),
@@ -382,7 +382,7 @@ async fn binary_search_builds_and_requotes_an_exact_split() {
 }
 
 #[tokio::test]
-async fn exact_slippage_limit_is_excluded() {
+async fn exact_price_impact_limit_is_excluded() {
     let icpswap = mock_adapter(ICPSWAP_VENUE_ID, Arc::new(Mutex::new(Vec::new())), |request| {
         Ok(proportional_preview(request, ICPSWAP_VENUE_ID, 100.0, 2))
     });
@@ -417,7 +417,7 @@ async fn sub_minimum_mexc_remainder_uses_full_icpswap_as_dust_exception() {
 
     assert_eq!(state.legs.len(), 1);
     assert_eq!(state.legs[0].venue_id, ICPSWAP_VENUE_ID);
-    assert!(state.legs[0].quote.estimated_slippage_bps >= 100.0);
+    assert!(state.legs[0].quote.estimated_price_impact_bps >= 100.0);
     assert_eq!(
         state.plan.allocation_reason,
         MultiVenueAllocationReason::RemainderBelowMinimum {

@@ -26,7 +26,7 @@ use tokio::time::sleep;
 
 use super::mexc_utils::{
     LIQUIDITY_EPS, SlicePreview, TradeLeg, f64_to_nat, is_usd_stable_symbol, mexc_special_trade_legs,
-    parse_market_symbols, simulate_buy_from_asks, simulate_sell_from_bids,
+    parse_market_symbols,
 };
 
 const WITHDRAW_BRIDGE_SOURCE_BALANCE_TOLERANCE: f64 = LIQUIDITY_EPS;
@@ -44,7 +44,10 @@ use crate::{
     },
     stages::bridge_submit_lock::acquire_bridge_submit_lock,
     stages::executor::ExecutionReceipt,
-    swappers::model::{SwapExecution, SwapQuoteLeg},
+    swappers::{
+        mexc::orderbook_quote::{simulate_buy_from_asks, simulate_sell_from_bids},
+        model::{SwapExecution, SwapQuoteLeg},
+    },
     utils::{ICP_LEDGER_PRINCIPAL, now_ts},
 };
 
@@ -1524,12 +1527,12 @@ where
             return Ok(CexRoutePreview {
                 is_executable: false,
                 estimated_receive_amount: 0.0,
-                estimated_slippage_bps: 0.0,
+                estimated_price_impact_bps: 0.0,
                 reason: Some("non-positive amount_in".to_string()),
             });
         }
 
-        let mut weighted_slippage_sum = 0.0;
+        let mut weighted_price_impact_sum = 0.0;
         let mut weighted_notional_usd = 0.0;
         for leg in &legs {
             let (out, _avg_price, impact_bps) = self.preview_leg(&leg.market, &leg.side, amount_in).await?;
@@ -1537,13 +1540,13 @@ where
                 .input_slice_usd(&leg.market, &leg.side, amount_in)
                 .await
                 .unwrap_or(0.0);
-            weighted_slippage_sum += impact_bps * leg_notional_usd;
+            weighted_price_impact_sum += impact_bps * leg_notional_usd;
             weighted_notional_usd += leg_notional_usd;
             amount_in = out;
         }
 
-        let route_slippage_bps = if weighted_notional_usd > LIQUIDITY_EPS {
-            weighted_slippage_sum / weighted_notional_usd
+        let route_price_impact_bps = if weighted_notional_usd > LIQUIDITY_EPS {
+            weighted_price_impact_sum / weighted_notional_usd
         } else {
             0.0
         };
@@ -1551,7 +1554,7 @@ where
         Ok(CexRoutePreview {
             is_executable: true,
             estimated_receive_amount: amount_in,
-            estimated_slippage_bps: route_slippage_bps,
+            estimated_price_impact_bps: route_price_impact_bps,
             reason: None,
         })
     }

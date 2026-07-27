@@ -43,9 +43,9 @@ pub(super) fn validate_preview(
             "{expected_venue} conservative output exceeds estimated output"
         )));
     }
-    if !preview.quote.estimated_slippage_bps.is_finite() || preview.quote.estimated_slippage_bps < 0.0 {
+    if !preview.quote.estimated_price_impact_bps.is_finite() || preview.quote.estimated_price_impact_bps < 0.0 {
         return Err(IcpswapFirstPlannerError::InvalidInput(format!(
-            "{expected_venue} quote slippage must be finite and non-negative"
+            "{expected_venue} quote price impact must be finite and non-negative"
         )));
     }
     Ok(())
@@ -78,7 +78,7 @@ pub(super) fn preview_to_leg(preview: VenueRoutePreview) -> VenueLegState {
             pay_amount: preview.request.pay_amount,
             estimated_receive,
             conservative_receive: preview.conservative_receive,
-            estimated_slippage_bps: preview.quote.estimated_slippage_bps,
+            estimated_price_impact_bps: preview.quote.estimated_price_impact_bps,
             route_id,
         },
         execution: preview.initial_execution_state,

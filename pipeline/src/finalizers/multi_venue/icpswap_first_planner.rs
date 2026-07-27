@@ -31,7 +31,7 @@ const RAY_PRICE_SCALE: f64 = 1e27;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct IcpswapFirstPlannerConfig {
-    pub max_quoted_slippage_bps: f64,
+    pub max_price_impact_bps: f64,
     pub max_search_iterations: u8,
     pub cex_min_exec_usd: f64,
     pub min_net_edge_bps: u32,
@@ -41,9 +41,9 @@ pub struct IcpswapFirstPlannerConfig {
 impl IcpswapFirstPlannerConfig {
     // Rejects configuration that could make allocation ambiguous or unsafe.
     fn validate(&self) -> Result<(), IcpswapFirstPlannerError> {
-        if !self.max_quoted_slippage_bps.is_finite() || self.max_quoted_slippage_bps <= 0.0 {
+        if !self.max_price_impact_bps.is_finite() || self.max_price_impact_bps <= 0.0 {
             return Err(IcpswapFirstPlannerError::InvalidInput(
-                "max quoted ICPSwap slippage must be finite and positive".to_string(),
+                "maximum ICPSwap price impact must be finite and positive".to_string(),
             ));
         }
         if self.max_search_iterations == 0 {
@@ -406,7 +406,7 @@ impl IcpswapFirstPlanner {
         if !self.is_safe_icpswap(&icpswap) {
             return Err(IcpswapFirstPlannerError::NoViableRoute(format!(
                 "exact ICPSwap allocation impact {:.2} bps is not below {:.2} bps",
-                icpswap.quote.estimated_slippage_bps, self.config.max_quoted_slippage_bps
+                icpswap.quote.estimated_price_impact_bps, self.config.max_price_impact_bps
             )));
         }
 
@@ -469,7 +469,7 @@ impl IcpswapFirstPlanner {
 
     // The threshold is strict: exactly 100 bps is not below a 100 bps limit.
     fn is_safe_icpswap(&self, preview: &VenueRoutePreview) -> bool {
-        preview.quote.estimated_slippage_bps < self.config.max_quoted_slippage_bps
+        preview.quote.estimated_price_impact_bps < self.config.max_price_impact_bps
     }
 
     // Re-quotes one venue for an exact allocation and verifies that its state,

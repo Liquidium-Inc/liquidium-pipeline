@@ -5360,7 +5360,7 @@ async fn mexc_preview_route_returns_non_executable_for_zero_amount() {
     let preview = finalizer.preview_route(&receipt).await.expect("preview should succeed");
     assert!(!preview.is_executable);
     assert_eq!(preview.estimated_receive_amount, 0.0);
-    assert_eq!(preview.estimated_slippage_bps, 0.0);
+    assert_eq!(preview.estimated_price_impact_bps, 0.0);
     assert_eq!(preview.reason.as_deref(), Some("non-positive amount_in"));
 }
 
@@ -5427,7 +5427,7 @@ async fn mexc_preview_route_resolves_direct_buy_leg_when_sell_book_empty() {
     let preview = finalizer.preview_route(&receipt).await.expect("preview should succeed");
     assert!(preview.is_executable);
     assert!(preview.estimated_receive_amount > 0.0);
-    assert!(preview.estimated_slippage_bps >= 0.0);
+    assert!(preview.estimated_price_impact_bps >= 0.0);
 }
 
 mod fuzz {

@@ -2,6 +2,17 @@ use candid::{CandidType, Nat};
 use liquidium_pipeline_core::tokens::{asset_id::AssetId, chain_token_amount::ChainTokenAmount};
 use serde::{Deserialize, Serialize};
 
+const BPS_PER_RATIO_UNIT: f64 = 10_000.0;
+
+/// Normalized adverse quote impact for prices expressed in receive units per
+/// pay unit. Better-than-reference quotes are clamped to zero.
+pub fn adverse_price_impact_bps(reference_price: f64, execution_price: f64) -> f64 {
+    if !reference_price.is_finite() || reference_price <= 0.0 || !execution_price.is_finite() || execution_price < 0.0 {
+        return f64::INFINITY;
+    }
+    ((reference_price - execution_price) / reference_price * BPS_PER_RATIO_UNIT).max(0.0)
+}
+
 #[derive(CandidType, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TxRef {
     IcBlockIndex { ledger: String, block_index: Nat },
@@ -43,10 +54,16 @@ pub struct SwapQuote {
     pub pay_amount: Nat,
     pub receive_asset: AssetId,
     pub receive_amount: Nat,
+    /// Venue reference price before size impact, expressed as receive units per
+    /// pay unit. DEX adapters use pool spot; CEX adapters use the best side.
     pub mid_price: f64,
+    /// Expected amount-scoped execution price in receive units per pay unit.
+    /// For a CEX this is the order-book VWAP, normalized for trade direction.
     pub exec_price: f64,
-    #[serde(default, alias = "slippage")]
-    pub estimated_slippage_bps: f64,
+    /// Adverse difference between `mid_price` and `exec_price`. This is known at
+    /// quote time and is distinct from drift between quote and actual execution.
+    #[serde(default, alias = "estimated_slippage_bps", alias = "slippage")]
+    pub estimated_price_impact_bps: f64,
 
     pub legs: Vec<SwapQuoteLeg>,
 }
@@ -84,9 +101,7 @@ pub struct SwapExecution {
 #[cfg(test)]
 mod tests {
     use candid::Nat;
-    use liquidium_pipeline_core::tokens::{
-        chain_token::ChainToken, chain_token_amount::ChainTokenAmount,
-    };
+    use liquidium_pipeline_core::tokens::{chain_token::ChainToken, chain_token_amount::ChainTokenAmount};
 
     use super::*;
 
@@ -122,7 +137,7 @@ mod tests {
             receive_amount: Nat::from(200u64),
             mid_price: 2.0,
             exec_price: 1.99,
-            estimated_slippage_bps: 50.0,
+            estimated_price_impact_bps: 50.0,
             legs: Vec::new(),
         }
     }
@@ -147,29 +162,40 @@ mod tests {
     }
 
     #[test]
-    fn quote_reads_legacy_slippage_and_writes_basis_point_name() {
+    fn quote_reads_previous_price_impact_name_and_writes_normalized_name() {
         let mut encoded = serde_json::to_value(quote()).expect("serialize quote");
         let object = encoded.as_object_mut().expect("quote object");
         let value = object
-            .remove("estimated_slippage_bps")
-            .expect("new slippage field");
+            .remove("estimated_price_impact_bps")
+            .expect("new price-impact field");
+        object.insert("estimated_slippage_bps".to_string(), value);
+
+        let decoded: SwapQuote = serde_json::from_value(encoded).expect("decode legacy quote");
+        assert_eq!(decoded.estimated_price_impact_bps, 50.0);
+
+        let reencoded = serde_json::to_value(decoded).expect("serialize normalized quote");
+        assert_eq!(reencoded["estimated_price_impact_bps"], 50.0);
+        assert!(reencoded.get("estimated_slippage_bps").is_none());
+    }
+
+    #[test]
+    fn quote_still_reads_legacy_unqualified_slippage_name() {
+        let mut encoded = serde_json::to_value(quote()).expect("serialize quote");
+        let object = encoded.as_object_mut().expect("quote object");
+        let value = object
+            .remove("estimated_price_impact_bps")
+            .expect("new price-impact field");
         object.insert("slippage".to_string(), value);
 
         let decoded: SwapQuote = serde_json::from_value(encoded).expect("decode legacy quote");
-        assert_eq!(decoded.estimated_slippage_bps, 50.0);
-
-        let reencoded = serde_json::to_value(decoded).expect("serialize normalized quote");
-        assert_eq!(reencoded["estimated_slippage_bps"], 50.0);
-        assert!(reencoded.get("slippage").is_none());
+        assert_eq!(decoded.estimated_price_impact_bps, 50.0);
     }
 
     #[test]
     fn execution_reads_legacy_slippage_and_writes_basis_point_name() {
         let mut encoded = serde_json::to_value(execution()).expect("serialize execution");
         let object = encoded.as_object_mut().expect("execution object");
-        let value = object
-            .remove("realized_slippage_bps")
-            .expect("new slippage field");
+        let value = object.remove("realized_slippage_bps").expect("new slippage field");
         object.insert("slippage".to_string(), value);
 
         let decoded: SwapExecution = serde_json::from_value(encoded).expect("decode legacy execution");

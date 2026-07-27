@@ -149,7 +149,7 @@ async fn selects_highest_net_output_across_all_fee_tiers() {
     assert_eq!(result.quote.legs[0].route_id, principal(6).to_text());
     assert_eq!(result.quote.legs[0].gas_fee, Nat::from(10u64));
     let expected_impact = (99_980.0 - 1_100.0) / 99_980.0 * 10_000.0;
-    assert!((result.quote.estimated_slippage_bps - expected_impact).abs() < 0.000_001);
+    assert!((result.quote.estimated_price_impact_bps - expected_impact).abs() < 0.000_001);
 }
 
 #[tokio::test]

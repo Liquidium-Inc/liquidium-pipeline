@@ -507,7 +507,7 @@ fn execution_slippage_bps(expected: f64, receive: f64) -> f64 {
 fn common_quote(
     request: &SwapRequest,
     plan: &IcpswapExecutionPlan,
-    estimated_slippage_bps: f64,
+    estimated_price_impact_bps: f64,
     spot_output: &Nat,
 ) -> SwapQuote {
     let pay_symbol = plan.amount_in.token.symbol();
@@ -525,7 +525,7 @@ fn common_quote(
         receive_amount: expected_output.value.clone(),
         mid_price,
         exec_price,
-        estimated_slippage_bps,
+        estimated_price_impact_bps,
         legs: vec![SwapQuoteLeg {
             venue: "icpswap".to_string(),
             route_id: plan.pool.to_text(),

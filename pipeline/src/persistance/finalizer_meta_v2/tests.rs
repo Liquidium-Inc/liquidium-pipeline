@@ -37,7 +37,7 @@ fn leg(leg_id: &str, venue_id: &str, pay: &ChainTokenAmount, receive: &ChainToke
             pay_amount: pay.clone(),
             estimated_receive: receive.clone(),
             conservative_receive: receive.clone(),
-            estimated_slippage_bps: 50.0,
+            estimated_price_impact_bps: 50.0,
             route_id: format!("{venue_id}-route"),
         },
         execution: VenueExecutionState::new(venue_id, &json!({ "step": "planned" })).expect("execution state"),
