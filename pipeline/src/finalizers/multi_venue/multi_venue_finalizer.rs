@@ -14,6 +14,7 @@ use crate::{
 };
 use async_trait::async_trait;
 use candid::Nat;
+use tracing::info;
 
 use super::{
     IcpswapFirstPlanInput, IcpswapFirstPlanner, IcpswapFirstPlannerConfig, MultiVenueAdapter,
@@ -241,6 +242,18 @@ impl MultiVenueFinalizer {
 
             apply_progress(&mut state.legs[index], progress)
                 .map_err(|error| format!("{MULTI_VENUE_PERMANENT_PREFIX}{error}"))?;
+            info!(
+                event = "multi_venue_leg_transition",
+                liquidation_id = %row.id,
+                strategy_id = %state.plan.strategy_id,
+                leg_id = %state.legs[index].leg_id,
+                venue_id = %state.legs[index].venue_id,
+                pay_amount = %state.legs[index].request.pay_amount.value,
+                previous_status = ?current.status,
+                status = ?state.legs[index].status,
+                last_error = ?state.legs[index].last_error,
+                "Multi-venue leg advanced"
+            );
             state.outcome = derive_outcome(&state.legs);
             self.persist_state(wal, row, wrapper, state).await?;
 
@@ -312,7 +325,20 @@ impl MultiVenueFinalizer {
                 reason: Some(format!("operator required for venue legs: {}", leg_ids.join(","))),
             }),
             MultiVenueExecutionOutcome::PartialRecovered { failed_leg_ids } => {
-                let context = format!("venue legs failed permanently: {}", failed_leg_ids.join(","));
+                let failed_legs = failed_leg_ids
+                    .iter()
+                    .map(|leg_id| {
+                        state
+                            .legs
+                            .iter()
+                            .find(|leg| &leg.leg_id == leg_id)
+                            .and_then(|leg| leg.last_error.as_deref())
+                            .map(|error| format!("{leg_id}: {error}"))
+                            .unwrap_or_else(|| leg_id.clone())
+                    })
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                let context = format!("venue legs failed permanently: {failed_legs}");
                 // Whatever the surviving legs produced is real money already in
                 // the wallet. Reporting only the permanent failure would hand the
                 // pipeline `swap_result: None`, dropping those proceeds out of

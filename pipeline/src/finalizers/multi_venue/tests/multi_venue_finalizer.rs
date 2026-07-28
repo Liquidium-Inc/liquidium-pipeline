@@ -821,6 +821,7 @@ async fn permanent_failure_is_not_readvanced_or_rerouted() {
     let wal = TestWal::with_receipt(&receipt);
     let icpswap = Arc::new(
         ScriptedAdapter::new(ICPSWAP_VENUE_ID, None, vec![VenueLegStatus::FailedPermanent])
+            .with_retryable_errors(vec![Some("deposit outcome could not be proven".to_string())])
             .with_execution_lock("shared-trader", "failed-execution"),
     );
     let mexc = Arc::new(ScriptedAdapter::new(MEXC_VENUE_ID, None, Vec::new()));
@@ -831,6 +832,7 @@ async fn permanent_failure_is_not_readvanced_or_rerouted() {
         .await
         .expect_err("permanent failure");
     assert_eq!(finalizer.classify_error(&first_error), FinalizerErrorKind::Permanent);
+    assert!(first_error.contains("icpswap-0: deposit outcome could not be proven"));
     assert_eq!(wal.lock_acquisitions.load(Ordering::SeqCst), 1);
     assert_eq!(wal.lock_releases.load(Ordering::SeqCst), 1);
     finalizer
