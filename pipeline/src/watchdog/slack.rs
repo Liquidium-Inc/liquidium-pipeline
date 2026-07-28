@@ -237,41 +237,47 @@ fn slack_payload_for_event_with_bot(ev: &WatchdogEvent<'_>, bot_name: &str) -> O
             details,
         } => {
             let text = format!("[{bot_name}] Operator action required: {venue} {execution_id} ({pending_step})");
+            let mut blocks = vec![
+                serde_json::json!({
+                    "type": "section",
+                    "text": {
+                        "type": "mrkdwn",
+                        "text": format!("*{bot_name}* - Operator action required for `{venue}`")
+                    }
+                }),
+                serde_json::json!({
+                    "type": "section",
+                    "fields": [
+                        {
+                            "type": "mrkdwn",
+                            "text": format!("*Execution ID*\n`{execution_id}`")
+                        },
+                        {
+                            "type": "mrkdwn",
+                            "text": format!("*Pending step*\n`{pending_step}`")
+                        },
+                        {
+                            "type": "mrkdwn",
+                            "text": format!("*Owner*\n`{owner}`")
+                        }
+                    ]
+                }),
+            ];
+            // Slack rejects a section block with empty text and drops the whole
+            // message, so a blank detail string would silently swallow the very
+            // alert that says a swap is stuck. Omit the block instead.
+            if !details.trim().is_empty() {
+                blocks.push(serde_json::json!({
+                    "type": "section",
+                    "text": {
+                        "type": "mrkdwn",
+                        "text": details
+                    }
+                }));
+            }
             Some(serde_json::json!({
                 "text": text,
-                "blocks": [
-                    {
-                        "type": "section",
-                        "text": {
-                            "type": "mrkdwn",
-                            "text": format!("*{bot_name}* - Operator action required for `{venue}`")
-                        }
-                    },
-                    {
-                        "type": "section",
-                        "fields": [
-                            {
-                                "type": "mrkdwn",
-                                "text": format!("*Execution ID*\n`{execution_id}`")
-                            },
-                            {
-                                "type": "mrkdwn",
-                                "text": format!("*Pending step*\n`{pending_step}`")
-                            },
-                            {
-                                "type": "mrkdwn",
-                                "text": format!("*Owner*\n`{owner}`")
-                            }
-                        ]
-                    },
-                    {
-                        "type": "section",
-                        "text": {
-                            "type": "mrkdwn",
-                            "text": details
-                        }
-                    }
-                ]
+                "blocks": blocks
             }))
         }
         WatchdogEvent::LiquidationFinalized {
@@ -435,10 +441,27 @@ mod tests {
             "[liquidator] Operator action required: icpswap 42 (DepositPending)"
         );
         assert_eq!(payload["blocks"][1]["fields"][0]["text"], "*Execution ID*\n`42`");
+        assert_eq!(payload["blocks"][2]["text"]["text"], "deposit outcome is ambiguous");
         assert_eq!(
             slack_cooldown_key(&ev),
             Some("operator_required:icpswap:42:DepositPending".to_string())
         );
+    }
+
+    #[test]
+    fn slack_payload_omits_empty_operator_details_block() {
+        let ev = WatchdogEvent::OperatorRequired {
+            execution_id: "42".to_string(),
+            venue: "icpswap".to_string(),
+            pending_step: "DepositPending".to_string(),
+            owner: "aaaaa-aa".to_string(),
+            details: String::new(),
+        };
+
+        let payload = slack_payload_for_event(&ev).expect("operator alert should format");
+        let blocks = payload["blocks"].as_array().expect("blocks array");
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[1]["fields"][0]["text"], "*Execution ID*\n`42`");
     }
 
     #[test]

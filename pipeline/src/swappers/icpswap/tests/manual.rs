@@ -173,6 +173,88 @@ async fn manual_success_persists_deposit_trade_and_withdraw_boundaries() {
 }
 
 #[tokio::test]
+async fn ambiguous_output_withdrawal_returns_success_when_reconciliation_completes() {
+    let store = Arc::new(Store::new());
+    {
+        let mut state = store.0.lock().unwrap();
+        state.step = IcpswapStep::Withdraw;
+        state.trade.gross_output_amount = Some(Nat::from(119_000u64));
+    }
+
+    let mut client = MockIcpswapManualClient::new();
+    let mut unused_sequence = Sequence::new();
+    for value in [unused(0, 119_000), unused(0, 0)] {
+        client
+            .expect_unused_balance()
+            .times(1)
+            .in_sequence(&mut unused_sequence)
+            .return_once(move |_, _| Ok(value));
+    }
+    let mut balance_sequence = Sequence::new();
+    for value in [10u64, 119_005] {
+        client
+            .expect_ledger_balance()
+            .times(1)
+            .in_sequence(&mut balance_sequence)
+            .return_once(move |_, _| Ok(Nat::from(value)));
+    }
+    client.expect_withdraw().times(1).return_once(|pool, _| {
+        Err(IcpswapClientError::SubmissionUnknown {
+            pool,
+            method: "withdraw",
+            message: "response lost".to_string(),
+        })
+    });
+
+    let result = advance_manual(&client, store.as_ref(), "run-1", owner(), 4_000)
+        .await
+        .expect("observed output withdrawal is terminal");
+
+    assert_eq!(result.step, IcpswapStep::Completed);
+    assert_eq!(result.withdraw.wallet_credited_amount, Some(Nat::from(118_995u64)));
+    assert_eq!(result.last_error, None);
+}
+
+#[tokio::test]
+async fn ambiguous_recovery_returns_success_when_reconciliation_completes() {
+    let store = Arc::new(Store::new());
+    store.0.lock().unwrap().step = IcpswapStep::Recover;
+
+    let mut client = MockIcpswapManualClient::new();
+    let mut unused_sequence = Sequence::new();
+    for value in [unused(100_000, 0), unused(0, 0)] {
+        client
+            .expect_unused_balance()
+            .times(1)
+            .in_sequence(&mut unused_sequence)
+            .return_once(move |_, _| Ok(value));
+    }
+    let mut balance_sequence = Sequence::new();
+    for value in [10u64, 100_000] {
+        client
+            .expect_ledger_balance()
+            .times(1)
+            .in_sequence(&mut balance_sequence)
+            .return_once(move |_, _| Ok(Nat::from(value)));
+    }
+    client.expect_withdraw().times(1).return_once(|pool, _| {
+        Err(IcpswapClientError::SubmissionUnknown {
+            pool,
+            method: "withdraw",
+            message: "response lost".to_string(),
+        })
+    });
+
+    let result = advance_manual(&client, store.as_ref(), "run-1", owner(), 4_000)
+        .await
+        .expect("observed recovery is terminal");
+
+    assert_eq!(result.step, IcpswapStep::Refunded);
+    assert_eq!(result.recovery.wallet_credited_amount, Some(Nat::from(99_990u64)));
+    assert_eq!(result.last_error, None);
+}
+
+#[tokio::test]
 async fn ambiguous_transfer_resume_reuses_the_persisted_deduplication_arguments() {
     let store = Arc::new(Store::new());
     let first_args = Arc::new(Mutex::new(None::<TransferArg>));

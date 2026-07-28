@@ -17,7 +17,7 @@ pub trait SwapVenue: Send + Sync {
 }
 
 /// Optional immediate-execution contract retained for standalone venue
-/// implementations such as Kong. Multi-venue execution uses persisted legs.
+/// implementations such as MEXC. Multi-venue execution uses persisted legs.
 #[async_trait]
 pub trait ExecutableSwapVenue: SwapVenue {
     async fn execute(&self, req: &SwapRequest) -> Result<SwapExecution, String>;

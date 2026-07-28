@@ -524,6 +524,9 @@ async fn withdraw_output(
                 recon::complete_output_withdrawal(state, wallet_credit);
             }
             persist(store, execution_id, state).await?;
+            if state.step == IcpswapStep::Completed {
+                return Ok(());
+            }
             return Err(error.to_string());
         }
         Err(error) => {
@@ -587,6 +590,9 @@ async fn recover_input(
                 recon::complete_recovery(state, wallet_credit);
             }
             persist(store, execution_id, state).await?;
+            if state.step == IcpswapStep::Refunded {
+                return Ok(());
+            }
             return Err(error.to_string());
         }
         Err(error) => {
