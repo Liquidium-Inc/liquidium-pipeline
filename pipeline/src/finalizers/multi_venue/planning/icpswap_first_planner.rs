@@ -7,12 +7,8 @@ use liquidium_pipeline_core::tokens::{
 use num_traits::ToPrimitive;
 use thiserror::Error;
 
-use super::{
-    MultiVenueAdapter, VenueRoutePreview,
-    icpswap_first_planner_utils::{edge_bps, meets_minimum_edge, preview_to_leg, sum_leg_outputs, validate_preview},
-    multi_venue_quote_book::{VenuePreviewOutcome, VenueQuoteBook, VenueRegistry},
-};
 use crate::{
+    finalizers::multi_venue::{MultiVenueAdapter, VenueRoutePreview},
     persistance::{
         MultiVenueAllocationReason, MultiVenueExecutionOutcome, MultiVenueExecutionPlan, MultiVenueExecutionState,
         VenueLegState,
@@ -20,6 +16,11 @@ use crate::{
     stages::executor::{ExecutionReceipt, ExecutionStatus},
     swappers::model::SwapRequest,
     utils::ICP_LEDGER_PRINCIPAL,
+};
+
+use super::{
+    icpswap_first_planner_utils::{edge_bps, meets_minimum_edge, preview_to_leg, sum_leg_outputs, validate_preview},
+    venue_registry::{VenuePreviewOutcome, VenueQuoteBook, VenueRegistry},
 };
 
 pub const ICPSWAP_FIRST_STRATEGY_ID: &str = "icpswap_first";
@@ -124,7 +125,7 @@ impl IcpswapFirstPlanInput {
     }
 
     // Verifies the amount and asset invariants required by every venue quote.
-    pub(super) fn validate(&self) -> Result<(), IcpswapFirstPlannerError> {
+    pub(in crate::finalizers::multi_venue) fn validate(&self) -> Result<(), IcpswapFirstPlannerError> {
         if self.total_pay.value == Nat::from(0u8) {
             return Err(IcpswapFirstPlannerError::InvalidInput(
                 "total pay amount must be positive".to_string(),
@@ -151,7 +152,7 @@ impl IcpswapFirstPlanInput {
     }
 
     // Produces an amount-scoped request tagged for one specific venue.
-    pub(super) fn request_for(&self, venue_id: &str, pay_value: Nat) -> SwapRequest {
+    pub(in crate::finalizers::multi_venue) fn request_for(&self, venue_id: &str, pay_value: Nat) -> SwapRequest {
         SwapRequest {
             pay_asset: self.total_pay.token.asset_id(),
             pay_amount: ChainTokenAmount::from_raw(self.total_pay.token.clone(), pay_value),
@@ -190,7 +191,7 @@ impl IcpswapFirstPlanInput {
 /// Converts a RAY-scaled receipt price into USD, or `None` when it cannot size a
 /// notional. Zero, negative, and values `to_f64` cannot represent (it saturates
 /// to infinity) are all absent prices, not cheap ones.
-pub(super) fn reference_price_usd(ref_price_ray: &Nat) -> Option<f64> {
+pub(in crate::finalizers::multi_venue) fn reference_price_usd(ref_price_ray: &Nat) -> Option<f64> {
     let price = ref_price_ray.0.to_f64()? / RAY_PRICE_SCALE;
     (price.is_finite() && price > 0.0).then_some(price)
 }
@@ -221,7 +222,7 @@ impl IcpswapFirstPlanner {
         Self::from_registry(venues, config)
     }
 
-    pub(super) fn from_registry(
+    pub(in crate::finalizers::multi_venue) fn from_registry(
         venues: Arc<VenueRegistry>,
         config: IcpswapFirstPlannerConfig,
     ) -> Result<Self, IcpswapFirstPlannerError> {
@@ -605,9 +606,7 @@ impl IcpswapFirstPlanner {
             // Replace the current selection only for a strictly better quote,
             // so an exact tie keeps the first venue from environment order.
             .fold(None, |best, candidate| match best {
-                Some(current)
-                    if current.conservative_receive.value >= candidate.conservative_receive.value =>
-                {
+                Some(current) if current.conservative_receive.value >= candidate.conservative_receive.value => {
                     Some(current)
                 }
                 _ => Some(candidate),
@@ -616,8 +615,7 @@ impl IcpswapFirstPlanner {
 
     // Explains why none of the configured overflow venues can execute.
     fn overflow_failure_summary(&self, quotes: &VenueQuoteBook) -> String {
-        self
-            .overflow_venue_ids
+        self.overflow_venue_ids
             .iter()
             .map(|venue_id| match quotes.get(venue_id).map(|venue| &venue.outcome) {
                 Some(VenuePreviewOutcome::Unavailable(error)) => {

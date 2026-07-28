@@ -161,20 +161,12 @@ impl WalStore for TestWal {
         Ok(())
     }
 
-    async fn acquire_icpswap_execution_lock(
-        &self,
-        _owner: &str,
-        _execution_id: &str,
-    ) -> anyhow::Result<bool> {
+    async fn acquire_icpswap_execution_lock(&self, _owner: &str, _execution_id: &str) -> anyhow::Result<bool> {
         self.lock_acquisitions.fetch_add(1, Ordering::SeqCst);
         Ok(self.lock_available.load(Ordering::SeqCst))
     }
 
-    async fn release_icpswap_execution_lock(
-        &self,
-        _owner: &str,
-        _execution_id: &str,
-    ) -> anyhow::Result<()> {
+    async fn release_icpswap_execution_lock(&self, _owner: &str, _execution_id: &str) -> anyhow::Result<()> {
         self.lock_releases.fetch_add(1, Ordering::SeqCst);
         if !self.lock_release_available.load(Ordering::SeqCst) {
             anyhow::bail!("injected lock release failure");
@@ -252,11 +244,7 @@ impl BatchWal {
     }
 
     fn lock_holder(&self, owner: &str) -> Option<String> {
-        self.icpswap_locks
-            .lock()
-            .expect("batch lock table")
-            .get(owner)
-            .cloned()
+        self.icpswap_locks.lock().expect("batch lock table").get(owner).cloned()
     }
 }
 
@@ -340,10 +328,7 @@ impl WalStore for BatchWal {
     }
 
     async fn delete(&self, liq_id: &str) -> anyhow::Result<()> {
-        self.rows
-            .lock()
-            .expect("batch WAL lock")
-            .retain(|row| row.id != liq_id);
+        self.rows.lock().expect("batch WAL lock").retain(|row| row.id != liq_id);
         Ok(())
     }
 
@@ -487,13 +472,21 @@ impl MultiVenueAdapter for ScriptedAdapter {
     }
 
     fn execution_lock(&self, leg: &VenueLegState) -> Result<Option<VenueExecutionLock>, String> {
-        Ok(self.execution_lock_owner.as_ref().map(|owner_key| VenueExecutionLock {
-            owner_key: owner_key.clone(),
-            execution_id: format!("{}-execution", leg.leg_id),
-        }).or_else(|| self.execution_lock.clone()))
+        Ok(self
+            .execution_lock_owner
+            .as_ref()
+            .map(|owner_key| VenueExecutionLock {
+                owner_key: owner_key.clone(),
+                execution_id: format!("{}-execution", leg.leg_id),
+            })
+            .or_else(|| self.execution_lock.clone()))
     }
 
-    async fn advance(&self, leg: &VenueLegState) -> Result<VenueLegProgress, String> {
+    async fn advance(
+        &self,
+        leg: &VenueLegState,
+        _checkpoint: &dyn VenueLegCheckpoint,
+    ) -> Result<VenueLegProgress, String> {
         self.advance_calls.fetch_add(1, Ordering::SeqCst);
         if let Some(error) = &self.advance_failure {
             return Err(error.clone());
@@ -529,7 +522,11 @@ impl MultiVenueAdapter for ScriptedAdapter {
         })
     }
 
-    async fn recover(&self, leg: &VenueLegState) -> Result<VenueLegProgress, String> {
+    async fn recover(
+        &self,
+        leg: &VenueLegState,
+        _checkpoint: &dyn VenueLegCheckpoint,
+    ) -> Result<VenueLegProgress, String> {
         self.recover_calls.fetch_add(1, Ordering::SeqCst);
         let status = self
             .recovery_progresses
@@ -1083,10 +1080,10 @@ async fn terminal_leg_retries_lock_cleanup_without_readvancing_the_venue() {
     assert_eq!(finalizer.classify_error(&first), FinalizerErrorKind::LockCleanup);
     assert_eq!(wal.leg_statuses(), vec![VenueLegStatus::Completed]);
     assert_eq!(icpswap.calls(), 1);
-    assert_eq!(watchdog.0.lock().expect("watchdog lock").as_slice(), &[(
-        "icpswap-execution".to_string(),
-        "lock_cleanup".to_string(),
-    )]);
+    assert_eq!(
+        watchdog.0.lock().expect("watchdog lock").as_slice(),
+        &[("icpswap-execution".to_string(), "lock_cleanup".to_string(),)]
+    );
 
     wal.lock_release_available.store(true, Ordering::SeqCst);
     let second = finalizer

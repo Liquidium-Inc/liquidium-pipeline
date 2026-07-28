@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use candid::{CandidType, Decode, Encode, Int, Nat, Principal};
+use ic_ledger_types::{AccountIdentifier, Subaccount};
 use icrc_ledger_types::icrc1::{account::Account, transfer::TransferArg};
 use icrc_ledger_types::icrc2::approve::ApproveArgs;
 use liquidium_pipeline_connectors::{
@@ -26,6 +27,7 @@ mockall::mock! {
     #[async_trait::async_trait]
     impl IcpBackend for IcpBackend {
         async fn icrc1_balance(&self, ledger: Principal, account: &Account) -> Result<Nat, String>;
+        async fn icp_account_balance(&self, ledger: Principal, account_id_hex: &str) -> Result<Nat, String>;
         async fn icrc1_transfer(
             &self,
             ledger: Principal,
@@ -550,6 +552,37 @@ async fn client_adds_ledger_context_to_fee_error() {
             ledger,
             message: "fee query rejected".to_string(),
         })
+    );
+}
+
+#[tokio::test]
+async fn client_reads_native_icp_through_the_legacy_account_identifier() {
+    let ledger = Principal::from_text(crate::utils::ICP_LEDGER_PRINCIPAL).expect("native ICP ledger");
+    let account = Account {
+        owner: principal(8),
+        subaccount: Some([9; 32]),
+    };
+    let expected_account_id = AccountIdentifier::new(&account.owner, &Subaccount([9; 32])).to_hex();
+    let expected_for_mock = expected_account_id.clone();
+    let mut backend = MockIcpBackend::new();
+    backend.expect_icrc1_balance().times(0);
+    backend
+        .expect_icp_account_balance()
+        .times(1)
+        .withf(move |actual_ledger, actual_account_id| {
+            *actual_ledger == ledger && actual_account_id == expected_for_mock
+        })
+        .return_once(|_, _| Ok(Nat::from(1_211_132_827u64)));
+    let client = IcpswapClient::new(
+        Arc::new(MockPipelineAgent::new()),
+        Arc::new(backend),
+        principal(7),
+    );
+
+    assert_eq!(
+        client.ledger_balance(ledger, &account).await,
+        Ok(Nat::from(1_211_132_827u64)),
+        "native ICP must use the same legacy account identifier as the pool and explorer"
     );
 }
 

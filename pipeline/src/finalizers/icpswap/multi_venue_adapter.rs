@@ -1,7 +1,4 @@
-use std::sync::{
-    Mutex,
-    atomic::{AtomicBool, Ordering},
-};
+use std::sync::Mutex;
 
 use async_trait::async_trait;
 use candid::Principal;
@@ -9,7 +6,9 @@ use liquidium_pipeline_core::tokens::chain_token::ChainToken;
 
 use super::finalizer::{IcpswapFinalizer, RETRY_COOLDOWN_NANOS, is_terminal_step};
 use crate::{
-    finalizers::multi_venue::{MultiVenueAdapter, VenueExecutionLock, VenueLegProgress, VenueRoutePreview},
+    finalizers::multi_venue::{
+        MultiVenueAdapter, VenueExecutionLock, VenueLegCheckpoint, VenueLegProgress, VenueRoutePreview,
+    },
     persistance::{VenueExecutionState, VenueLegState, VenueLegStatus},
     swappers::{
         icpswap::{
@@ -23,23 +22,18 @@ use crate::{
     utils::ICP_LEDGER_PRINCIPAL,
 };
 
-const PERSIST_BEFORE_SIDE_EFFECT: &str = "ICPSwap leg pending state ready for parent persistence";
-
-/// Leg-local store used to reuse the existing ICPSwap state machine without
-/// letting it write the parent WAL row. For a non-pending input step, the first
-/// persist is captured and deliberately stops execution before the side effect.
-struct LegStateStore {
+/// ICPSwap-local state store whose persists are checkpointed into the complete
+/// parent envelope, allowing `advance_loaded` to drive the whole workflow.
+struct CheckpointedLegStateStore<'a> {
     state: Mutex<IcpswapExecutionState>,
-    stop_after_first_persist: bool,
-    stopped: AtomicBool,
+    checkpoint: &'a dyn VenueLegCheckpoint,
 }
 
-impl LegStateStore {
-    fn new(state: IcpswapExecutionState, stop_after_first_persist: bool) -> Self {
+impl<'a> CheckpointedLegStateStore<'a> {
+    fn new(state: IcpswapExecutionState, checkpoint: &'a dyn VenueLegCheckpoint) -> Self {
         Self {
             state: Mutex::new(state),
-            stop_after_first_persist,
-            stopped: AtomicBool::new(false),
+            checkpoint,
         }
     }
 
@@ -47,12 +41,12 @@ impl LegStateStore {
         self.state
             .lock()
             .map(|state| state.clone())
-            .map_err(|_| "ICPSwap leg state lock poisoned".to_string())
+            .map_err(|_| "ICPSwap checkpointed leg state lock poisoned".to_string())
     }
 }
 
 #[async_trait]
-impl IcpswapExecutionStateStore for LegStateStore {
+impl IcpswapExecutionStateStore for CheckpointedLegStateStore<'_> {
     async fn load(&self, execution_id: &str) -> Result<Option<IcpswapExecutionState>, String> {
         let state = self.snapshot()?;
         if state.execution_id != execution_id {
@@ -74,26 +68,30 @@ impl IcpswapExecutionStateStore for LegStateStore {
         *self
             .state
             .lock()
-            .map_err(|_| "ICPSwap leg state lock poisoned".to_string())? = state.clone();
+            .map_err(|_| "ICPSwap checkpointed leg state lock poisoned".to_string())? = state.clone();
 
-        if self.stop_after_first_persist && !self.stopped.swap(true, Ordering::SeqCst) {
-            return Err(PERSIST_BEFORE_SIDE_EFFECT.to_string());
+        // Completed/refunded results are constructed by the adapter after the
+        // workflow returns. Persisting them here would briefly create a
+        // terminal parent leg without its required aggregate result. If the
+        // process crashes first, the preceding pending checkpoint is resumed
+        // and reconciled safely.
+        if matches!(
+            leg_status(state.step),
+            VenueLegStatus::Completed | VenueLegStatus::Recovered | VenueLegStatus::FailedPermanent
+        ) {
+            return Ok(());
         }
-        Ok(())
-    }
-}
 
-/// Identifies transitions whose next workflow action can move funds. These
-/// transitions are intentionally split across two orchestrator cycles.
-fn needs_parent_persist_before_advance(step: IcpswapStep) -> bool {
-    matches!(
-        step,
-        IcpswapStep::Transfer
-            | IcpswapStep::Deposit
-            | IcpswapStep::Trade
-            | IcpswapStep::Withdraw
-            | IcpswapStep::Recover
-    )
+        self.checkpoint
+            .checkpoint(VenueLegProgress {
+                execution: VenueExecutionState::new(VENUE_ID, state)?,
+                status: leg_status(state.step),
+                result: None,
+                last_error: state.last_error.clone(),
+                retryable_error: None,
+            })
+            .await
+    }
 }
 
 /// Projects ICPSwap's detailed state machine onto the generic leg lifecycle.
@@ -161,10 +159,15 @@ impl IcpswapFinalizer {
         })
     }
 
-    /// Runs one leg-local workflow transition without access to the parent WAL.
-    /// A pre-side-effect persistence sentinel is an expected yielded transition,
-    /// while operational failures remain attached to the returned leg state.
-    async fn advance_leg(&self, leg: &VenueLegState) -> Result<VenueLegProgress, String> {
+    /// Drives this leg through all immediately runnable ICPSwap phases. The
+    /// workflow persists prepared intent state through the narrow checkpoint
+    /// before every external side effect and stops on delay, error, or terminal
+    /// state so the next daemon tick can resume safely.
+    async fn advance_leg(
+        &self,
+        leg: &VenueLegState,
+        checkpoint: &dyn VenueLegCheckpoint,
+    ) -> Result<VenueLegProgress, String> {
         let mut state = self.decode_leg_state(leg)?;
         let execution_id = state.execution_id.clone();
 
@@ -175,19 +178,16 @@ impl IcpswapFinalizer {
         }
 
         state.next_attempt_at_nanos = None;
-        let store = LegStateStore::new(state.clone(), needs_parent_persist_before_advance(state.step));
+        let store = CheckpointedLegStateStore::new(state.clone(), checkpoint);
         let result = self
             .workflow
             .advance_loaded(&store, &execution_id, self.trader, now_nanos, state)
             .await;
-        let advance_error = match result {
-            Ok(_) => None,
-            Err(error) if error == PERSIST_BEFORE_SIDE_EFFECT => None,
-            Err(error) => Some(error),
-        };
+        let advance_error = result.err();
         let mut state = store.snapshot()?;
         if advance_error.is_some() && !is_terminal_step(state.step) {
             state.next_attempt_at_nanos = Some(now_nanos.saturating_add(RETRY_COOLDOWN_NANOS));
+            store.persist(&execution_id, &state).await?;
         }
         self.notify_operator_required(&execution_id, &state).await;
         self.progress_for(leg, state, advance_error).await
@@ -240,11 +240,19 @@ impl MultiVenueAdapter for IcpswapFinalizer {
         }))
     }
 
-    async fn advance(&self, leg: &VenueLegState) -> Result<VenueLegProgress, String> {
-        self.advance_leg(leg).await
+    async fn advance(
+        &self,
+        leg: &VenueLegState,
+        checkpoint: &dyn VenueLegCheckpoint,
+    ) -> Result<VenueLegProgress, String> {
+        self.advance_leg(leg, checkpoint).await
     }
 
-    async fn recover(&self, leg: &VenueLegState) -> Result<VenueLegProgress, String> {
+    async fn recover(
+        &self,
+        leg: &VenueLegState,
+        checkpoint: &dyn VenueLegCheckpoint,
+    ) -> Result<VenueLegProgress, String> {
         let state = self.decode_leg_state(leg)?;
         if !matches!(
             state.step,
@@ -256,6 +264,6 @@ impl MultiVenueAdapter for IcpswapFinalizer {
         ) {
             return Err(format!("ICPSwap leg at {:?} is not in recovery", state.step));
         }
-        self.advance_leg(leg).await
+        self.advance_leg(leg, checkpoint).await
     }
 }

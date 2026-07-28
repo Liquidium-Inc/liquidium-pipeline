@@ -129,6 +129,20 @@ pub struct IcpswapTransferState {
 pub struct IcpswapDepositState {
     #[serde(default, rename = "deposit_input_pool_balance_before")]
     pub input_pool_balance_before: Option<Nat>,
+    /// Ledger balance of the pool deposit subaccount immediately before the
+    /// canister deposit call. An unchanged value proves that no sweep occurred.
+    #[serde(default, rename = "deposit_input_ledger_balance_before")]
+    pub input_ledger_balance_before: Option<Nat>,
+    /// The deposit intent and both reconciliation baselines are durable, but
+    /// the canister call has not yet been attempted by the current state.
+    #[serde(default, rename = "deposit_ready_to_submit")]
+    pub ready_to_submit: bool,
+    /// Read-only reconciliation attempts made after an ambiguous deposit call.
+    #[serde(default, rename = "deposit_observation_attempts")]
+    pub observation_attempts: u32,
+    /// Safe deposit-only resubmissions made after proving no sweep occurred.
+    #[serde(default, rename = "deposit_submission_retry_count")]
+    pub submission_retry_count: u32,
 }
 
 #[derive(CandidType, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

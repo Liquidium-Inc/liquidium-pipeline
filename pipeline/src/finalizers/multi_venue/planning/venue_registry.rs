@@ -2,18 +2,20 @@ use std::{collections::HashSet, sync::Arc};
 
 use futures::future::join_all;
 
-use super::{MultiVenueAdapter, VenueRoutePreview};
-use crate::swappers::model::SwapRequest;
+use crate::{
+    finalizers::multi_venue::{MultiVenueAdapter, VenueRoutePreview},
+    swappers::model::SwapRequest,
+};
 
 #[derive(Clone)]
-pub(super) struct VenueRegistry {
+pub(in crate::finalizers::multi_venue) struct VenueRegistry {
     adapters: Vec<Arc<dyn MultiVenueAdapter>>,
 }
 
 impl VenueRegistry {
     // Registration order is retained because it gives quote collection and
     // later execution planning a deterministic venue order.
-    pub(super) fn new(adapters: Vec<Arc<dyn MultiVenueAdapter>>) -> Result<Self, String> {
+    pub(in crate::finalizers::multi_venue) fn new(adapters: Vec<Arc<dyn MultiVenueAdapter>>) -> Result<Self, String> {
         if adapters.is_empty() {
             return Err("venue registry must contain at least one adapter".to_string());
         }
@@ -35,18 +37,18 @@ impl VenueRegistry {
         Ok(Self { adapters })
     }
 
-    pub(super) fn contains(&self, venue_id: &str) -> bool {
+    pub(in crate::finalizers::multi_venue) fn contains(&self, venue_id: &str) -> bool {
         self.adapters.iter().any(|adapter| adapter.venue_id() == venue_id)
     }
 
-    pub(super) fn adapter(&self, venue_id: &str) -> Option<&dyn MultiVenueAdapter> {
+    pub(in crate::finalizers::multi_venue) fn adapter(&self, venue_id: &str) -> Option<&dyn MultiVenueAdapter> {
         self.adapters
             .iter()
             .find(|adapter| adapter.venue_id() == venue_id)
             .map(AsRef::as_ref)
     }
 
-    pub(super) fn venue_ids(&self) -> Vec<String> {
+    pub(in crate::finalizers::multi_venue) fn venue_ids(&self) -> Vec<String> {
         self.adapters
             .iter()
             .map(|adapter| adapter.venue_id().to_string())
@@ -56,7 +58,7 @@ impl VenueRegistry {
     // Starts every registered preview before awaiting the combined result.
     // `join_all` preserves input order even when venues finish out of order.
     #[cfg(test)]
-    pub(super) async fn preview_all<F>(&self, request_for: F) -> VenueQuoteBook
+    pub(in crate::finalizers::multi_venue) async fn preview_all<F>(&self, request_for: F) -> VenueQuoteBook
     where
         F: Fn(&str) -> SwapRequest,
     {
@@ -83,7 +85,11 @@ impl VenueRegistry {
 
     // Quotes a strategy-selected subset concurrently while preserving the
     // order supplied by strategy configuration.
-    pub(super) async fn preview_venues<F>(&self, venue_ids: &[String], request_for: F) -> Result<VenueQuoteBook, String>
+    pub(in crate::finalizers::multi_venue) async fn preview_venues<F>(
+        &self,
+        venue_ids: &[String],
+        request_for: F,
+    ) -> Result<VenueQuoteBook, String>
     where
         F: Fn(&str) -> SwapRequest,
     {
@@ -119,32 +125,32 @@ impl VenueRegistry {
     }
 }
 
-pub(super) struct VenueQuoteBook {
+pub(in crate::finalizers::multi_venue) struct VenueQuoteBook {
     previews: Vec<VenuePreview>,
 }
 
 impl VenueQuoteBook {
     // Iteration follows deterministic registry/configuration order.
-    pub(super) fn iter(&self) -> impl Iterator<Item = &VenuePreview> {
+    pub(in crate::finalizers::multi_venue) fn iter(&self) -> impl Iterator<Item = &VenuePreview> {
         self.previews.iter()
     }
 
-    pub(super) fn get(&self, venue_id: &str) -> Option<&VenuePreview> {
+    pub(in crate::finalizers::multi_venue) fn get(&self, venue_id: &str) -> Option<&VenuePreview> {
         self.previews.iter().find(|preview| preview.venue_id == venue_id)
     }
 
-    pub(super) fn iter_mut(&mut self) -> impl Iterator<Item = &mut VenuePreview> {
+    pub(in crate::finalizers::multi_venue) fn iter_mut(&mut self) -> impl Iterator<Item = &mut VenuePreview> {
         self.previews.iter_mut()
     }
 }
 
-pub(super) struct VenuePreview {
-    pub(super) venue_id: String,
-    pub(super) request: SwapRequest,
-    pub(super) outcome: VenuePreviewOutcome,
+pub(in crate::finalizers::multi_venue) struct VenuePreview {
+    pub(in crate::finalizers::multi_venue) venue_id: String,
+    pub(in crate::finalizers::multi_venue) request: SwapRequest,
+    pub(in crate::finalizers::multi_venue) outcome: VenuePreviewOutcome,
 }
 
-pub(super) enum VenuePreviewOutcome {
+pub(in crate::finalizers::multi_venue) enum VenuePreviewOutcome {
     // The adapter returned a response; strategy validation happens afterward.
     Quoted(VenueRoutePreview),
     // The adapter could not produce a response, for example during an outage.

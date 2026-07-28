@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use candid::{Decode, Encode, Nat, Principal};
+use ic_ledger_types::{AccountIdentifier, Subaccount};
 use icrc_ledger_types::icrc1::{account::Account, transfer::TransferArg};
 use liquidium_pipeline_connectors::{
     backend::icp_backend::{IcpBackend, IcrcTransferError},
@@ -12,6 +13,7 @@ use super::types::{
     IcpswapClientError, IcpswapDepositArgs, IcpswapGetPoolArgs, IcpswapPoolData, IcpswapPoolMetadata, IcpswapResult,
     IcpswapSwapArgs, IcpswapToken, IcpswapUnusedBalance, IcpswapWithdrawArgs,
 };
+use crate::utils::ICP_LEDGER_PRINCIPAL;
 
 #[cfg_attr(test, mockall::automock)]
 #[async_trait]
@@ -156,10 +158,23 @@ impl<A: PipelineAgent, B: IcpBackend> IcpswapManualClient for IcpswapClient<A, B
     }
 
     async fn ledger_balance(&self, ledger: Principal, account: &Account) -> Result<Nat, IcpswapClientError> {
-        self.icp_backend
-            .icrc1_balance(ledger, account)
-            .await
-            .map_err(|message| IcpswapClientError::LedgerBalance { ledger, message })
+        let native_icp = Principal::from_text(ICP_LEDGER_PRINCIPAL).map_err(|error| {
+            IcpswapClientError::LedgerBalance {
+                ledger,
+                message: format!("invalid native ICP ledger principal: {error}"),
+            }
+        })?;
+        let balance = if ledger == native_icp {
+            let account_id = AccountIdentifier::new(
+                &account.owner,
+                &Subaccount(account.subaccount.unwrap_or([0; 32])),
+            )
+            .to_hex();
+            self.icp_backend.icp_account_balance(ledger, &account_id).await
+        } else {
+            self.icp_backend.icrc1_balance(ledger, account).await
+        };
+        balance.map_err(|message| IcpswapClientError::LedgerBalance { ledger, message })
     }
 
     async fn ledger_transfer(&self, ledger: Principal, args: TransferArg) -> Result<Nat, IcpswapClientError> {

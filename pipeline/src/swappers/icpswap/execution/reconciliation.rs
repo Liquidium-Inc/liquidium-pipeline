@@ -2,6 +2,7 @@
 //! durable manual ICPSwap workflow.
 
 use candid::Nat;
+use tracing::info;
 
 use crate::swappers::icpswap::{
     client::IcpswapManualClient,
@@ -44,6 +45,15 @@ pub(crate) enum TradeRetryCause {
     QuoteBelowHardFloor,
 }
 
+/// Checks whether ICPSwap credited the complete planned input to the owner's
+/// unused pool balance.
+///
+/// The persisted pre-deposit pool balance isolates this execution from funds
+/// that were already present. A result of `true` proves that at least
+/// `amount_in` was added and the workflow may advance to the trade step. A
+/// result of `false` only means the credit is not visible yet; it does not prove
+/// that the deposit call was never submitted or make replay safe. Replay safety
+/// is established separately from the ledger deposit-subaccount balance.
 pub(crate) async fn observe_deposit(client: &dyn IcpswapManualClient, state: &IcpswapState) -> Result<bool, String> {
     let before = state
         .deposit
@@ -55,10 +65,26 @@ pub(crate) async fn observe_deposit(client: &dyn IcpswapManualClient, state: &Ic
         .await
         .map_err(|error| error.to_string())?;
     let current = input_balance(&state.plan, &unused);
-    Ok(current >= before + state.plan.amount_in.value.clone())
+    let required = before.clone() + state.plan.amount_in.value.clone();
+    let confirmed = current >= required;
+    info!(
+        event = "icpswap_deposit_observation",
+        execution_id = %state.execution_id,
+        pool = %state.plan.pool,
+        balance_before = %before,
+        balance_current = %current,
+        balance_required = %required,
+        confirmed,
+        "Observed ICPSwap deposit balance"
+    );
+    Ok(confirmed)
 }
 
 pub(crate) fn complete_deposit(state: &mut IcpswapState) {
+    state.deposit.ready_to_submit = false;
+    state.deposit.observation_attempts = 0;
+    state.deposit.submission_retry_count = 0;
+    state.next_attempt_at_nanos = None;
     state.step = IcpswapStep::Trade;
     state.operator_pending_step = None;
     state.last_error = None;

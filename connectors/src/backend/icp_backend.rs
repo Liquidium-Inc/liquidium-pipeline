@@ -43,6 +43,12 @@ pub enum IcrcTransferError {
 pub trait IcpBackend: Send + Sync {
     async fn icrc1_balance(&self, ledger: Principal, account: &Account) -> Result<Nat, String>;
 
+    /// Reads a native ICP balance by its legacy 32-byte account identifier.
+    async fn icp_account_balance(&self, ledger: Principal, account_id_hex: &str) -> Result<Nat, String> {
+        let _ = (ledger, account_id_hex);
+        Err("legacy ICP account balance is not implemented by this backend".to_string())
+    }
+
     async fn icrc1_transfer(&self, ledger: Principal, from: &Account, to: &Account, amount: Nat)
     -> Result<Nat, String>;
 
@@ -88,6 +94,22 @@ impl<A: PipelineAgent> IcpBackendImpl<A> {
 impl<A: PipelineAgent> IcpBackend for IcpBackendImpl<A> {
     async fn icrc1_balance(&self, ledger: Principal, account: &Account) -> Result<Nat, String> {
         self.query::<Nat>(ledger, "icrc1_balance_of", *account).await
+    }
+
+    async fn icp_account_balance(&self, ledger: Principal, account_id_hex: &str) -> Result<Nat, String> {
+        #[derive(CandidType)]
+        struct AccountBalanceArgs {
+            account: Vec<u8>,
+        }
+
+        #[derive(CandidType, Deserialize)]
+        struct Tokens {
+            e8s: u64,
+        }
+
+        let account = hex::decode(account_id_hex).map_err(|error| error.to_string())?;
+        let balance: Tokens = self.query(ledger, "account_balance", AccountBalanceArgs { account }).await?;
+        Ok(Nat::from(balance.e8s))
     }
 
     async fn icrc1_transfer(

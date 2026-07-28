@@ -7,7 +7,7 @@ use super::mexc_finalizer::MexcFinalizer;
 use crate::{
     finalizers::{
         cex_finalizer::{CexFinalizerLogic, CexState, CexStep},
-        multi_venue::{MultiVenueAdapter, VenueLegProgress, VenueRoutePreview},
+        multi_venue::{MultiVenueAdapter, VenueLegCheckpoint, VenueLegProgress, VenueRoutePreview},
     },
     persistance::{VenueExecutionState, VenueLegState, VenueLegStatus},
     swappers::model::SwapRequest,
@@ -216,11 +216,19 @@ where
         self.preview_leg_request(request).await
     }
 
-    async fn advance(&self, leg: &VenueLegState) -> Result<VenueLegProgress, String> {
+    async fn advance(
+        &self,
+        leg: &VenueLegState,
+        _checkpoint: &dyn VenueLegCheckpoint,
+    ) -> Result<VenueLegProgress, String> {
         self.advance_leg(leg).await
     }
 
-    async fn recover(&self, leg: &VenueLegState) -> Result<VenueLegProgress, String> {
+    async fn recover(
+        &self,
+        leg: &VenueLegState,
+        _checkpoint: &dyn VenueLegCheckpoint,
+    ) -> Result<VenueLegProgress, String> {
         let mut execution = self.decode_leg_state(leg)?;
         if execution.cex.step == CexStep::Completed {
             return Err("completed MEXC leg does not require recovery".to_string());

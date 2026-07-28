@@ -81,6 +81,16 @@ pub const INITIAL_MANUAL_SLIPPAGE_BPS: u32 = 125;
 /// submission, or a fresh quote that cannot satisfy the original hard floor.
 pub const MAX_MANUAL_TRADE_RETRIES: u32 = 3;
 
+/// Read-only pool-balance observations allowed after an ambiguous deposit.
+pub const MAX_DEPOSIT_OBSERVATION_ATTEMPTS: u32 = 4;
+
+/// Deposit-only resubmissions allowed when the ledger subaccount proves that
+/// the preceding canister call did not sweep any funds.
+pub const MAX_DEPOSIT_SUBMISSION_RETRIES: u32 = 3;
+
+/// Delay between ambiguous-deposit balance observations.
+pub const DEPOSIT_OBSERVATION_RETRY_NANOS: u64 = 2_000_000_000;
+
 /// Number of confirmed-slippage widening steps between the initial tolerance
 /// and the configured hard cap. This is independent of the general retry
 /// budget so non-slippage retries cannot widen the accepted price range.

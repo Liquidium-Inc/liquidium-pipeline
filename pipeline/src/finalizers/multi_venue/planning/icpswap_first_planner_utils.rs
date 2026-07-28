@@ -2,14 +2,13 @@ use candid::Nat;
 use liquidium_pipeline_core::tokens::chain_token_amount::ChainTokenAmount;
 use num_traits::ToPrimitive;
 
-use super::{
-    VenueRoutePreview,
-    icpswap_first_planner::{BPS_DENOMINATOR, IcpswapFirstPlannerError},
-};
 use crate::{
+    finalizers::multi_venue::VenueRoutePreview,
     persistance::{VenueLegQuote, VenueLegState, VenueLegStatus},
     swappers::model::SwapRequest,
 };
+
+use super::icpswap_first_planner::{BPS_DENOMINATOR, IcpswapFirstPlannerError};
 
 // Ensures an adapter response describes the exact venue, request, assets, and
 // conservative output that the planner can safely persist and execute.

@@ -15,6 +15,7 @@ use super::{
     manual::advance_manual,
     reconciliation::is_slippage_error,
     state::{
+        DEPOSIT_OBSERVATION_RETRY_NANOS, MAX_DEPOSIT_OBSERVATION_ATTEMPTS, MAX_DEPOSIT_SUBMISSION_RETRIES,
         PENDING_TRADE_RECONCILIATION_TIMEOUT_NANOS, initial_slippage_bps, retry_backoff_nanos, retry_slippage_bps,
     },
     types::{
@@ -88,6 +89,19 @@ impl Store {
     }
 }
 
+fn set_deposit_step(store: &Store) {
+    let mut state = store.0.lock().unwrap();
+    state.step = IcpswapStep::Deposit;
+    state.transfer.args = Some(TransferArg {
+        from_subaccount: None,
+        to: owner(),
+        fee: Some(Nat::from(10u64)),
+        created_at_time: Some(1_000),
+        memo: None,
+        amount: Nat::from(100_010u64),
+    });
+}
+
 #[async_trait]
 impl IcpswapExecutionStateStore for Store {
     async fn load(&self, _: &str) -> Result<Option<IcpswapExecutionState>, String> {
@@ -130,6 +144,10 @@ async fn manual_success_persists_deposit_trade_and_withdraw_boundaries() {
         assert_eq!(args.fee, Nat::from(10u64));
         Ok(args.amount.clone() - args.fee.clone())
     });
+    client
+        .expect_ledger_balance()
+        .times(1)
+        .return_once(|_, _| Ok(Nat::from(100_010u64)));
     client.expect_swap().times(1).return_once(|_, args| {
         assert_eq!(args.amount_out_minimum, "118500");
         Ok(Nat::from(119_000u64))
@@ -390,17 +408,234 @@ async fn pending_transfer_without_persisted_arguments_requires_an_operator() {
 }
 
 #[tokio::test]
-async fn ambiguous_deposit_requires_operator_without_replaying() {
+async fn ambiguous_deposit_is_resubmitted_when_the_deposit_account_is_unchanged() {
     let store = Arc::new(Store::new());
-    {
-        let mut state = store.0.lock().unwrap();
-        state.step = IcpswapStep::Deposit;
-        state.transfer.block_index = Some(Nat::from(77u64));
-    }
+    set_deposit_step(store.as_ref());
+    store.0.lock().unwrap().transfer.block_index = Some(Nat::from(77u64));
 
     let mut client = MockIcpswapManualClient::new();
     let mut unused_sequence = Sequence::new();
-    for value in [unused(0, 0), unused(0, 0)] {
+    for value in [
+        unused(0, 0),
+        unused(0, 0),
+        unused(0, 0),
+        unused(0, 0),
+        unused(0, 0),
+        unused(0, 0),
+    ] {
+        client
+            .expect_unused_balance()
+            .times(1)
+            .in_sequence(&mut unused_sequence)
+            .return_once(move |_, _| Ok(value));
+    }
+    let mut deposit_sequence = Sequence::new();
+    client
+        .expect_deposit()
+        .times(1)
+        .in_sequence(&mut deposit_sequence)
+        .return_once(|pool, _| {
+            Err(IcpswapClientError::SubmissionUnknown {
+                pool,
+                method: "deposit",
+                message: "response lost".to_string(),
+            })
+        });
+    client
+        .expect_deposit()
+        .times(1)
+        .in_sequence(&mut deposit_sequence)
+        .return_once(|_, args| Ok(args.amount.clone() - args.fee.clone()));
+    let mut ledger_sequence = Sequence::new();
+    for balance in [100_010u64, 100_010u64, 100_010u64] {
+        client
+            .expect_ledger_balance()
+            .times(1)
+            .in_sequence(&mut ledger_sequence)
+            .return_once(move |_, _| Ok(Nat::from(balance)));
+    }
+    let submitted_at = 2_000;
+    advance_manual(&client, store.as_ref(), "run-1", owner(), submitted_at)
+        .await
+        .expect("ambiguous submission should schedule observation");
+    let pending = store.state();
+    assert_eq!(pending.step, IcpswapStep::DepositPending);
+    assert_eq!(pending.deposit.observation_attempts, 0);
+    assert_eq!(
+        pending.next_attempt_at_nanos,
+        Some(submitted_at + DEPOSIT_OBSERVATION_RETRY_NANOS)
+    );
+
+    advance_manual(
+        &client,
+        store.as_ref(),
+        "run-1",
+        owner(),
+        submitted_at + DEPOSIT_OBSERVATION_RETRY_NANOS - 1,
+    )
+    .await
+    .expect("early polling should not observe or submit");
+    assert_eq!(store.state().deposit.observation_attempts, 0);
+
+    for attempt in 1..MAX_DEPOSIT_OBSERVATION_ATTEMPTS {
+        let now = submitted_at + DEPOSIT_OBSERVATION_RETRY_NANOS * u64::from(attempt);
+        advance_manual(&client, store.as_ref(), "run-1", owner(), now)
+            .await
+            .expect("non-final observation should remain pending");
+        let pending = store.state();
+        assert_eq!(pending.step, IcpswapStep::DepositPending);
+        assert_eq!(pending.deposit.observation_attempts, attempt);
+        assert_eq!(pending.next_attempt_at_nanos, Some(now + DEPOSIT_OBSERVATION_RETRY_NANOS));
+    }
+
+    let final_observation_at = submitted_at
+        + DEPOSIT_OBSERVATION_RETRY_NANOS * u64::from(MAX_DEPOSIT_OBSERVATION_ATTEMPTS);
+    advance_manual(&client, store.as_ref(), "run-1", owner(), final_observation_at)
+        .await
+        .expect("an unchanged deposit account makes deposit-only replay safe");
+    let scheduled = store.state();
+    assert_eq!(scheduled.step, IcpswapStep::DepositPending);
+    assert!(scheduled.deposit.ready_to_submit);
+    assert_eq!(scheduled.deposit.observation_attempts, 0);
+    assert_eq!(scheduled.deposit.submission_retry_count, 1);
+    assert_eq!(
+        scheduled.next_attempt_at_nanos,
+        Some(final_observation_at + DEPOSIT_OBSERVATION_RETRY_NANOS)
+    );
+
+    advance_manual(
+        &client,
+        store.as_ref(),
+        "run-1",
+        owner(),
+        final_observation_at + DEPOSIT_OBSERVATION_RETRY_NANOS - 1,
+    )
+    .await
+    .expect("an early poll must not resubmit the deposit");
+    assert_eq!(store.state().step, IcpswapStep::DepositPending);
+
+    let completed_retry = advance_manual(
+        &client,
+        store.as_ref(),
+        "run-1",
+        owner(),
+        final_observation_at + DEPOSIT_OBSERVATION_RETRY_NANOS,
+    )
+    .await
+    .expect("the due deposit-only retry should execute");
+    assert_eq!(completed_retry.step, IcpswapStep::Trade);
+    assert!(!completed_retry.deposit.ready_to_submit);
+    assert_eq!(completed_retry.deposit.submission_retry_count, 0);
+}
+
+#[tokio::test]
+async fn ambiguous_deposit_with_a_moved_deposit_account_requires_an_operator() {
+    let store = Arc::new(Store::new());
+    set_deposit_step(store.as_ref());
+
+    let mut client = MockIcpswapManualClient::new();
+    client
+        .expect_unused_balance()
+        .times(1 + MAX_DEPOSIT_OBSERVATION_ATTEMPTS as usize)
+        .returning(|_, _| Ok(unused(0, 0)));
+    client.expect_deposit().times(1).return_once(|pool, _| {
+        Err(IcpswapClientError::SubmissionUnknown {
+            pool,
+            method: "deposit",
+            message: "response lost".to_string(),
+        })
+    });
+    let mut ledger_sequence = Sequence::new();
+    for balance in [100_010u64, 0u64] {
+        client
+            .expect_ledger_balance()
+            .times(1)
+            .in_sequence(&mut ledger_sequence)
+            .return_once(move |_, _| Ok(Nat::from(balance)));
+    }
+
+    let submitted_at = 2_000;
+    advance_manual(&client, store.as_ref(), "run-1", owner(), submitted_at)
+        .await
+        .expect("ambiguous submission");
+    for attempt in 1..=MAX_DEPOSIT_OBSERVATION_ATTEMPTS {
+        let result = advance_manual(
+            &client,
+            store.as_ref(),
+            "run-1",
+            owner(),
+            submitted_at + DEPOSIT_OBSERVATION_RETRY_NANOS * u64::from(attempt),
+        )
+        .await;
+        if attempt < MAX_DEPOSIT_OBSERVATION_ATTEMPTS {
+            result.expect("non-final observation");
+        } else {
+            result.expect_err("a moved deposit account makes replay unsafe");
+        }
+    }
+
+    let parked = store.state();
+    assert_eq!(parked.step, IcpswapStep::OperatorRequired);
+    assert_eq!(parked.operator_pending_step, Some(IcpswapStep::DepositPending));
+    assert!(parked.last_error.unwrap().contains("balance moved"));
+}
+
+#[tokio::test]
+async fn ambiguous_deposit_retries_are_bounded() {
+    let store = Arc::new(Store::new());
+    set_deposit_step(store.as_ref());
+    store.0.lock().unwrap().deposit.submission_retry_count = MAX_DEPOSIT_SUBMISSION_RETRIES;
+
+    let mut client = MockIcpswapManualClient::new();
+    client
+        .expect_unused_balance()
+        .times(1 + MAX_DEPOSIT_OBSERVATION_ATTEMPTS as usize)
+        .returning(|_, _| Ok(unused(0, 0)));
+    client
+        .expect_ledger_balance()
+        .times(1)
+        .return_once(|_, _| Ok(Nat::from(100_010u64)));
+    client.expect_deposit().times(1).return_once(|pool, _| {
+        Err(IcpswapClientError::SubmissionUnknown {
+            pool,
+            method: "deposit",
+            message: "response lost".to_string(),
+        })
+    });
+
+    let submitted_at = 2_000;
+    advance_manual(&client, store.as_ref(), "run-1", owner(), submitted_at)
+        .await
+        .expect("ambiguous submission");
+    for attempt in 1..=MAX_DEPOSIT_OBSERVATION_ATTEMPTS {
+        let result = advance_manual(
+            &client,
+            store.as_ref(),
+            "run-1",
+            owner(),
+            submitted_at + DEPOSIT_OBSERVATION_RETRY_NANOS * u64::from(attempt),
+        )
+        .await;
+        if attempt < MAX_DEPOSIT_OBSERVATION_ATTEMPTS {
+            result.expect("non-final observation");
+        } else {
+            result.expect_err("the retry budget must park the leg");
+        }
+    }
+
+    let parked = store.state();
+    assert_eq!(parked.step, IcpswapStep::OperatorRequired);
+    assert_eq!(parked.deposit.submission_retry_count, MAX_DEPOSIT_SUBMISSION_RETRIES);
+}
+
+#[tokio::test]
+async fn ambiguous_deposit_that_appears_during_retry_advances_without_replaying() {
+    let store = Arc::new(Store::new());
+    set_deposit_step(store.as_ref());
+
+    let mut client = MockIcpswapManualClient::new();
+    let mut unused_sequence = Sequence::new();
+    for value in [unused(0, 0), unused(100_000, 0)] {
         client
             .expect_unused_balance()
             .times(1)
@@ -414,16 +649,33 @@ async fn ambiguous_deposit_requires_operator_without_replaying() {
             message: "response lost".to_string(),
         })
     });
-    advance_manual(&client, store.as_ref(), "run-1", owner(), 2_000)
+    client
+        .expect_ledger_balance()
+        .times(1)
+        .return_once(|_, _| Ok(Nat::from(100_010u64)));
+
+    let submitted_at = 2_000;
+    advance_manual(&client, store.as_ref(), "run-1", owner(), submitted_at)
         .await
-        .expect_err("first deposit response is ambiguous");
-    assert_eq!(store.state().step, IcpswapStep::OperatorRequired);
+        .expect("ambiguous submission should schedule observation");
+    let confirmed = advance_manual(
+        &client,
+        store.as_ref(),
+        "run-1",
+        owner(),
+        submitted_at + DEPOSIT_OBSERVATION_RETRY_NANOS,
+    )
+    .await
+    .expect("delayed deposit credit should reconcile");
+    assert_eq!(confirmed.step, IcpswapStep::Trade);
+    assert_eq!(confirmed.deposit.observation_attempts, 0);
+    assert_eq!(confirmed.next_attempt_at_nanos, None);
 }
 
 #[tokio::test]
 async fn confirmed_deposit_advances_without_an_extra_balance_query() {
     let store = Arc::new(Store::new());
-    store.0.lock().unwrap().step = IcpswapStep::Deposit;
+    set_deposit_step(store.as_ref());
 
     let mut client = MockIcpswapManualClient::new();
     client
@@ -434,6 +686,10 @@ async fn confirmed_deposit_advances_without_an_extra_balance_query() {
         .expect_deposit()
         .times(1)
         .return_once(|_, args| Ok(args.amount.clone() - args.fee.clone()));
+    client
+        .expect_ledger_balance()
+        .times(1)
+        .return_once(|_, _| Ok(Nat::from(100_010u64)));
 
     let confirmed = advance_manual(&client, store.as_ref(), "run-1", owner(), 2_000)
         .await
@@ -444,7 +700,7 @@ async fn confirmed_deposit_advances_without_an_extra_balance_query() {
 #[tokio::test]
 async fn unexpected_deposit_credit_recovers_instead_of_submitting_an_oversized_swap() {
     let store = Arc::new(Store::new());
-    store.0.lock().unwrap().step = IcpswapStep::Deposit;
+    set_deposit_step(store.as_ref());
 
     let mut client = MockIcpswapManualClient::new();
     client
@@ -455,6 +711,10 @@ async fn unexpected_deposit_credit_recovers_instead_of_submitting_an_oversized_s
         .expect_deposit()
         .times(1)
         .return_once(|_, _| Ok(Nat::from(99_990u64)));
+    client
+        .expect_ledger_balance()
+        .times(1)
+        .return_once(|_, _| Ok(Nat::from(100_010u64)));
     client.expect_swap().times(0);
 
     let result = advance_manual(&client, store.as_ref(), "run-1", owner(), 2_000)
@@ -964,6 +1224,9 @@ fn flattened_manual_state_uses_unique_step_prefixed_wire_fields() {
     let mut state = IcpswapExecutionState::prepare("run-1", plan(), owner());
     state.transfer.block_index = Some(Nat::from(5u8));
     state.deposit.input_pool_balance_before = Some(Nat::from(11u8));
+    state.deposit.input_ledger_balance_before = Some(Nat::from(12u8));
+    state.deposit.ready_to_submit = true;
+    state.deposit.submission_retry_count = 2;
     state.trade.input_pool_balance_before = Some(Nat::from(22u8));
     state.withdraw.pool_balance_before = Some(Nat::from(33u8));
     state.recovery.pool_balance_before = Some(Nat::from(44u8));
@@ -978,6 +1241,13 @@ fn flattened_manual_state_uses_unique_step_prefixed_wire_fields() {
         state_json["deposit_input_pool_balance_before"],
         serde_json::to_value(Nat::from(11u8)).unwrap()
     );
+    assert_eq!(
+        state_json["deposit_input_ledger_balance_before"],
+        serde_json::to_value(Nat::from(12u8)).unwrap()
+    );
+    assert_eq!(state_json["deposit_ready_to_submit"], true);
+    assert_eq!(state_json["deposit_observation_attempts"], 0);
+    assert_eq!(state_json["deposit_submission_retry_count"], 2);
     assert_eq!(
         state_json["trade_input_pool_balance_before"],
         serde_json::to_value(Nat::from(22u8)).unwrap()

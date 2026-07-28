@@ -16,7 +16,8 @@ use liquidium_pipeline_core::{
 use num_traits::ToPrimitive;
 use tokio::sync::Barrier;
 
-use super::super::multi_venue_quote_book::{VenuePreviewOutcome, VenueRegistry};
+use super::super::planning::reference_price_usd;
+use super::super::planning::venue_registry::{VenuePreviewOutcome, VenueRegistry};
 use super::super::*;
 use crate::{
     executors::executor::ExecutorRequest,
@@ -35,6 +36,52 @@ struct BarrierAdapter {
     barrier: Arc<Barrier>,
 }
 
+type PreviewResponder = dyn Fn(&SwapRequest) -> Result<VenueRoutePreview, String> + Send + Sync;
+
+struct PlannerAdapter {
+    venue_id: &'static str,
+    calls: Arc<Mutex<Vec<u64>>>,
+    responder: Box<PreviewResponder>,
+    validation_error: Option<String>,
+    preview_forbidden: bool,
+}
+
+#[async_trait]
+impl MultiVenueAdapter for PlannerAdapter {
+    fn venue_id(&self) -> &'static str {
+        self.venue_id
+    }
+
+    fn validate_configuration(&self) -> Result<(), String> {
+        self.validation_error.clone().map_or(Ok(()), Err)
+    }
+
+    async fn preview(&self, request: &SwapRequest) -> Result<VenueRoutePreview, String> {
+        assert!(!self.preview_forbidden, "{} must not be previewed", self.venue_id);
+        self.calls
+            .lock()
+            .expect("calls lock")
+            .push(request.pay_amount.value.0.to_u64().expect("test pay amount fits u64"));
+        (self.responder)(request)
+    }
+
+    async fn advance(
+        &self,
+        _leg: &VenueLegState,
+        _checkpoint: &dyn VenueLegCheckpoint,
+    ) -> Result<VenueLegProgress, String> {
+        Err("not used by planner test".to_string())
+    }
+
+    async fn recover(
+        &self,
+        _leg: &VenueLegState,
+        _checkpoint: &dyn VenueLegCheckpoint,
+    ) -> Result<VenueLegProgress, String> {
+        Err("not used by planner test".to_string())
+    }
+}
+
 #[async_trait]
 impl MultiVenueAdapter for BarrierAdapter {
     fn venue_id(&self) -> &'static str {
@@ -46,11 +93,19 @@ impl MultiVenueAdapter for BarrierAdapter {
         Err(format!("{} unavailable", self.venue_id))
     }
 
-    async fn advance(&self, _leg: &VenueLegState) -> Result<VenueLegProgress, String> {
+    async fn advance(
+        &self,
+        _leg: &VenueLegState,
+        _checkpoint: &dyn VenueLegCheckpoint,
+    ) -> Result<VenueLegProgress, String> {
         Err("not used by planner test".to_string())
     }
 
-    async fn recover(&self, _leg: &VenueLegState) -> Result<VenueLegProgress, String> {
+    async fn recover(
+        &self,
+        _leg: &VenueLegState,
+        _checkpoint: &dyn VenueLegCheckpoint,
+    ) -> Result<VenueLegProgress, String> {
         Err("not used by planner test".to_string())
     }
 }
@@ -155,26 +210,22 @@ fn proportional_preview(
     preview(request, venue_id, slippage_bps, receive, receive)
 }
 
-fn mock_adapter<F>(venue_id: &'static str, calls: Arc<Mutex<Vec<u64>>>, responder: F) -> MockMultiVenueAdapter
+fn mock_adapter<F>(venue_id: &'static str, calls: Arc<Mutex<Vec<u64>>>, responder: F) -> PlannerAdapter
 where
     F: Fn(&SwapRequest) -> Result<VenueRoutePreview, String> + Send + Sync + 'static,
 {
-    let mut adapter = MockMultiVenueAdapter::new();
-    adapter.expect_venue_id().return_const(venue_id);
-    adapter.expect_validate_configuration().returning(|| Ok(()));
-    adapter.expect_preview().returning(move |request| {
-        calls
-            .lock()
-            .expect("calls lock")
-            .push(request.pay_amount.value.0.to_u64().expect("test pay amount fits u64"));
-        responder(request)
-    });
-    adapter
+    PlannerAdapter {
+        venue_id,
+        calls,
+        responder: Box::new(responder),
+        validation_error: None,
+        preview_forbidden: false,
+    }
 }
 
 fn planner(
-    icpswap: MockMultiVenueAdapter,
-    mexc: MockMultiVenueAdapter,
+    icpswap: PlannerAdapter,
+    mexc: PlannerAdapter,
     planner_config: IcpswapFirstPlannerConfig,
 ) -> IcpswapFirstPlanner {
     IcpswapFirstPlanner::new(vec![Arc::new(icpswap), Arc::new(mexc)], planner_config).expect("valid planner")
@@ -274,11 +325,13 @@ async fn registry_previews_concurrently_and_preserves_registration_order() {
 
 #[test]
 fn registry_rejects_an_adapter_with_missing_runtime_configuration() {
-    let mut adapter = MockMultiVenueAdapter::new();
-    adapter.expect_venue_id().return_const(MEXC_VENUE_ID);
-    adapter
-        .expect_validate_configuration()
-        .returning(|| Err("token registry is required".to_string()));
+    let adapter = PlannerAdapter {
+        venue_id: MEXC_VENUE_ID,
+        calls: Arc::new(Mutex::new(Vec::new())),
+        responder: Box::new(|_| Err("not used".to_string())),
+        validation_error: Some("token registry is required".to_string()),
+        preview_forbidden: true,
+    };
 
     let error = VenueRegistry::new(vec![Arc::new(adapter)])
         .err()
@@ -520,9 +573,15 @@ async fn missing_reference_price_splits_instead_of_forcing_full_icpswap() {
 
     let mut input = input_with_pay_token(native_icp());
     input.pay_reference_price_usd = None;
-    let state = planner(icpswap, mexc, config(1.1)).plan(&input, 123).await.expect("split plan");
+    let state = planner(icpswap, mexc, config(1.1))
+        .plan(&input, 123)
+        .await
+        .expect("split plan");
 
-    assert_eq!(state.plan.allocation_reason, MultiVenueAllocationReason::PriceImpactSplit);
+    assert_eq!(
+        state.plan.allocation_reason,
+        MultiVenueAllocationReason::PriceImpactSplit
+    );
     assert_eq!(state.legs.len(), 2);
     assert!(state.legs.iter().any(|leg| leg.venue_id == MEXC_VENUE_ID));
     // The ICPSwap leg stays inside the impact limit.
@@ -618,11 +677,7 @@ async fn below_minimum_requote_uses_full_icpswap_only_when_the_fresh_quote_is_sa
         } else {
             pay as f64 / 900_000.0
         };
-        let receive = if refreshed_full_quote {
-            pay * 3
-        } else {
-            pay * 2
-        };
+        let receive = if refreshed_full_quote { pay * 3 } else { pay * 2 };
         Ok(preview(request, ICPSWAP_VENUE_ID, impact, receive, receive))
     });
     let mexc = mock_adapter(MEXC_VENUE_ID, Arc::new(Mutex::new(Vec::new())), |request| {
@@ -937,7 +992,11 @@ async fn below_minimum_remainder_rejects_when_full_icpswap_is_unsafe_and_overflo
         .await
         .expect_err("no unsafe full-ICPSwap fallback is allowed");
 
-    assert!(error.to_string().contains("full ICPSwap quote exceeds the price-impact limit"));
+    assert!(
+        error
+            .to_string()
+            .contains("full ICPSwap quote exceeds the price-impact limit")
+    );
     assert!(error.to_string().contains("MEXC unavailable"));
 }
 
@@ -945,10 +1004,13 @@ async fn below_minimum_remainder_rejects_when_full_icpswap_is_unsafe_and_overflo
 
 #[tokio::test]
 async fn non_native_icp_is_mexc_only_and_never_previews_icpswap() {
-    let mut icpswap = MockMultiVenueAdapter::new();
-    icpswap.expect_venue_id().return_const(ICPSWAP_VENUE_ID);
-    icpswap.expect_validate_configuration().returning(|| Ok(()));
-    icpswap.expect_preview().times(0);
+    let icpswap = PlannerAdapter {
+        venue_id: ICPSWAP_VENUE_ID,
+        calls: Arc::new(Mutex::new(Vec::new())),
+        responder: Box::new(|_| Err("not used".to_string())),
+        validation_error: None,
+        preview_forbidden: true,
+    };
     let mexc_calls = Arc::new(Mutex::new(Vec::new()));
     let mexc_calls_for_assert = mexc_calls.clone();
     let mexc = mock_adapter(MEXC_VENUE_ID, mexc_calls, |request| {

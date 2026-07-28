@@ -2,6 +2,10 @@ use std::sync::Arc;
 
 use crate::{
     finalizers::finalizer::{Finalizer, FinalizerErrorKind, FinalizerResult},
+    finalizers::multi_venue::{
+        IcpswapFirstPlanInput, IcpswapFirstPlanner, IcpswapFirstPlannerConfig, IcpswapFirstPlannerError,
+        MultiVenueAdapter, VenueExecutionLock, VenueLegProgress,
+    },
     persistance::{
         FINALIZER_META_V2_VERSION, FinalizerDecisionSnapshot, FinalizerMetaPayload, FinalizerMetaV2, LiqMetaWrapper,
         MultiVenueAllocationSnapshot, MultiVenueExecutionOutcome, MultiVenueExecutionState, VenueAllocationSnapshot,
@@ -16,14 +20,40 @@ use async_trait::async_trait;
 use candid::Nat;
 use tracing::info;
 
-use super::{
-    IcpswapFirstPlanInput, IcpswapFirstPlanner, IcpswapFirstPlannerConfig, MultiVenueAdapter,
-    multi_venue_quote_book::VenueRegistry,
-};
+use super::parent_leg_checkpoint::ParentLegCheckpoint;
+use crate::finalizers::multi_venue::planning::venue_registry::VenueRegistry;
 
-const MULTI_VENUE_PERMANENT_PREFIX: &str = "permanent multi-venue finalizer: ";
+pub(super) const MULTI_VENUE_PERMANENT_PREFIX: &str = "permanent multi-venue finalizer: ";
 const MULTI_VENUE_LOCK_CLEANUP_PREFIX: &str = "multi-venue lock cleanup: ";
 const MULTI_VENUE_CUSTODY_PREFIX: &str = "multi-venue venue custody: ";
+
+/// Mutable parent state shared by one multi-venue finalization invocation.
+///
+/// Keeping the WAL handle, encoded wrapper, row, and decoded execution state
+/// together prevents orchestration helpers from accepting mismatched pieces
+/// from different liquidations.
+struct MultiVenueFinalizationContext<'a> {
+    wal: &'a dyn WalStore,
+    row: crate::persistance::LiqResultRecord,
+    wrapper: LiqMetaWrapper,
+    state: MultiVenueExecutionState,
+}
+
+impl<'a> MultiVenueFinalizationContext<'a> {
+    fn new(
+        wal: &'a dyn WalStore,
+        row: crate::persistance::LiqResultRecord,
+        wrapper: LiqMetaWrapper,
+        state: MultiVenueExecutionState,
+    ) -> Self {
+        Self {
+            wal,
+            row,
+            wrapper,
+            state,
+        }
+    }
+}
 
 /// WAL orchestrator for a committed generic multi-venue execution plan.
 ///
@@ -41,8 +71,8 @@ impl MultiVenueFinalizer {
         planner_config: IcpswapFirstPlannerConfig,
     ) -> Result<Self, String> {
         let venues = Arc::new(VenueRegistry::new(adapters)?);
-        let planner = IcpswapFirstPlanner::from_registry(venues.clone(), planner_config)
-            .map_err(|error| error.to_string())?;
+        let planner =
+            IcpswapFirstPlanner::from_registry(venues.clone(), planner_config).map_err(|error| error.to_string())?;
         Ok(Self {
             planner,
             venues,
@@ -55,12 +85,7 @@ impl MultiVenueFinalizer {
         self
     }
 
-    async fn notify_lock_cleanup_required(
-        &self,
-        lock: &super::VenueExecutionLock,
-        venue_id: &str,
-        detail: &str,
-    ) {
+    async fn notify_lock_cleanup_required(&self, lock: &VenueExecutionLock, venue_id: &str, detail: &str) {
         self.watchdog
             .notify(WatchdogEvent::OperatorRequired {
                 execution_id: lock.execution_id.clone(),
@@ -139,10 +164,10 @@ impl MultiVenueFinalizer {
         // produce the immutable allocation plan plus initialized venue legs.
         // No swap, transfer, or order side effect is submitted by `plan`.
         let state = self.planner.plan(&input, now_ts()).await.map_err(|error| match error {
-            super::IcpswapFirstPlannerError::InvalidInput(_) => {
+            IcpswapFirstPlannerError::InvalidInput(_) => {
                 format!("{MULTI_VENUE_PERMANENT_PREFIX}{error}")
             }
-            super::IcpswapFirstPlannerError::NoViableRoute(_) => error.to_string(),
+            IcpswapFirstPlannerError::NoViableRoute(_) => error.to_string(),
         })?;
 
         // Commit the entire decision and every initialized leg atomically.
@@ -178,13 +203,11 @@ impl MultiVenueFinalizer {
 
     /// Advances each runnable leg once in committed vector order and journals
     /// every transition before another venue is touched.
-    async fn advance_legs(
-        &self,
-        wal: &dyn WalStore,
-        row: &mut crate::persistance::LiqResultRecord,
-        wrapper: &mut LiqMetaWrapper,
-        state: &mut MultiVenueExecutionState,
-    ) -> Result<(), String> {
+    async fn advance_legs(&self, context: &mut MultiVenueFinalizationContext<'_>) -> Result<(), String> {
+        let wal = context.wal;
+        let row = &mut context.row;
+        let wrapper = &mut context.wrapper;
+        let state = &mut context.state;
         let mut retryable_errors = Vec::new();
         let mut lock_cleanup_failed = false;
         for index in 0..state.legs.len() {
@@ -193,10 +216,7 @@ impl MultiVenueFinalizer {
                 current.status,
                 VenueLegStatus::Completed | VenueLegStatus::Recovered | VenueLegStatus::FailedPermanent
             );
-            let runnable = matches!(
-                current.status,
-                VenueLegStatus::Planned | VenueLegStatus::Running
-            );
+            let runnable = matches!(current.status, VenueLegStatus::Planned | VenueLegStatus::Running);
             if !terminal && !runnable {
                 continue;
             }
@@ -223,7 +243,8 @@ impl MultiVenueFinalizer {
                         "{} leg `{}` failed releasing terminal execution lock: {error}",
                         current.venue_id, current.leg_id
                     );
-                    self.notify_lock_cleanup_required(lock, &current.venue_id, &detail).await;
+                    self.notify_lock_cleanup_required(lock, &current.venue_id, &detail)
+                        .await;
                     retryable_errors.push(detail);
                 }
                 continue;
@@ -237,8 +258,19 @@ impl MultiVenueFinalizer {
             {
                 continue;
             }
-            let progress = adapter.advance(&current).await?;
+            let checkpoint = ParentLegCheckpoint::new(wal, index, row, wrapper, state);
+            let execution_result = adapter.advance(&current, &checkpoint).await;
+            // Venue-local checkpoints may have committed several transitions
+            // before the adapter returns, including when its final call fails.
+            // Synchronize those durable snapshots before handling the result.
+            let (checkpointed_row, checkpointed_wrapper, checkpointed_state) = checkpoint.snapshot().await;
+            *row = checkpointed_row;
+            *wrapper = checkpointed_wrapper;
+            *state = checkpointed_state;
+
+            let progress = execution_result?;
             let retryable_error = progress.retryable_error.clone();
+            let current = state.legs[index].clone();
 
             apply_progress(&mut state.legs[index], progress)
                 .map_err(|error| format!("{MULTI_VENUE_PERMANENT_PREFIX}{error}"))?;
@@ -372,11 +404,12 @@ impl MultiVenueFinalizer {
         wal: &dyn WalStore,
         receipt: ExecutionReceipt,
     ) -> Result<FinalizerResult, String> {
-        let (mut row, mut wrapper, mut state) = self.load_or_commit_plan(wal, &receipt).await?;
-        if let Err(error) = self.advance_legs(wal, &mut row, &mut wrapper, &mut state).await {
-            return Err(tag_custody_error(&state, error));
+        let (row, wrapper, state) = self.load_or_commit_plan(wal, &receipt).await?;
+        let mut context = MultiVenueFinalizationContext::new(wal, row, wrapper, state);
+        if let Err(error) = self.advance_legs(&mut context).await {
+            return Err(tag_custody_error(&context.state, error));
         }
-        self.result_for_state(&state)
+        self.result_for_state(&context.state)
     }
 }
 
@@ -536,12 +569,10 @@ fn tag_custody_error(state: &MultiVenueExecutionState, error: String) -> String 
         return error;
     }
 
-    let holds_custody = state.legs.iter().any(|leg| {
-        matches!(
-            leg.status,
-            VenueLegStatus::Running | VenueLegStatus::OperatorRequired
-        )
-    });
+    let holds_custody = state
+        .legs
+        .iter()
+        .any(|leg| matches!(leg.status, VenueLegStatus::Running | VenueLegStatus::OperatorRequired));
     if holds_custody {
         format!("{MULTI_VENUE_CUSTODY_PREFIX}{error}")
     } else {
@@ -549,7 +580,7 @@ fn tag_custody_error(state: &MultiVenueExecutionState, error: String) -> String 
     }
 }
 
-fn apply_progress(leg: &mut VenueLegState, progress: super::VenueLegProgress) -> Result<(), String> {
+pub(super) fn apply_progress(leg: &mut VenueLegState, progress: VenueLegProgress) -> Result<(), String> {
     if progress.execution.venue != leg.venue_id {
         return Err(format!(
             "adapter returned venue `{}` for committed leg `{}` at venue `{}`",
@@ -563,7 +594,7 @@ fn apply_progress(leg: &mut VenueLegState, progress: super::VenueLegProgress) ->
     Ok(())
 }
 
-fn derive_outcome(legs: &[VenueLegState]) -> MultiVenueExecutionOutcome {
+pub(super) fn derive_outcome(legs: &[VenueLegState]) -> MultiVenueExecutionOutcome {
     let operator_leg_ids = legs
         .iter()
         .filter(|leg| leg.status == VenueLegStatus::OperatorRequired)
@@ -598,7 +629,7 @@ fn derive_outcome(legs: &[VenueLegState]) -> MultiVenueExecutionOutcome {
     }
 }
 
-fn set_meta_v2(wrapper: &mut LiqMetaWrapper, state: &MultiVenueExecutionState) -> Result<(), String> {
+pub(super) fn set_meta_v2(wrapper: &mut LiqMetaWrapper, state: &MultiVenueExecutionState) -> Result<(), String> {
     let meta = FinalizerMetaV2 {
         version: FINALIZER_META_V2_VERSION,
         payload: FinalizerMetaPayload::MultiVenueSwap(state.clone()),

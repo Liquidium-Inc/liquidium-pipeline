@@ -1,14 +1,13 @@
-mod icpswap_first_planner;
-mod icpswap_first_planner_utils;
-mod multi_venue_adapter;
-mod multi_venue_finalizer;
-mod multi_venue_quote_book;
+//! Generic venue selection and persisted multi-venue execution.
+
+mod contracts;
+mod execution;
+mod planning;
 
 #[allow(unused_imports)]
-pub use icpswap_first_planner::*;
-#[allow(unused_imports)]
-pub use multi_venue_adapter::*;
-pub use multi_venue_finalizer::*;
+pub use contracts::*;
+pub use execution::*;
+pub use planning::*;
 
 #[cfg(test)]
 mod tests;

@@ -33,13 +33,20 @@ pub struct VenueExecutionLock {
     pub execution_id: String,
 }
 
+/// Parent-owned persistence boundary exposed to a venue while it drives its
+/// own internal workflow. Each checkpoint atomically replaces only this leg
+/// inside the complete committed `meta_v2` envelope.
+#[async_trait]
+pub trait VenueLegCheckpoint: Send + Sync {
+    async fn checkpoint(&self, progress: VenueLegProgress) -> Result<(), String>;
+}
+
 /// Amount-scoped interface for one independently persisted venue leg.
 ///
 /// Implementations do not own the WAL or the parent liquidation status. An
 /// external side effect may only be submitted when the incoming leg already
 /// contains its persisted pending/idempotency state; otherwise `advance`
 /// returns that state for the orchestrator to persist first.
-#[cfg_attr(test, mockall::automock)]
 #[async_trait]
 pub trait MultiVenueAdapter: Send + Sync {
     /// Stable identifier persisted in venue legs and used for adapter lookup.
@@ -61,10 +68,20 @@ pub trait MultiVenueAdapter: Send + Sync {
         Ok(None)
     }
 
-    /// Advances only the supplied persisted leg by one idempotent transition.
-    async fn advance(&self, leg: &VenueLegState) -> Result<VenueLegProgress, String>;
+    /// Advances the supplied leg as far as this venue considers immediately
+    /// safe. Multi-step venues checkpoint every prepared intent before its
+    /// side effect; single-step venues may ignore the checkpoint and return.
+    async fn advance(
+        &self,
+        leg: &VenueLegState,
+        checkpoint: &dyn VenueLegCheckpoint,
+    ) -> Result<VenueLegProgress, String>;
 
     /// Reconciles or recovers only the supplied leg after restart or failure.
     #[allow(dead_code)]
-    async fn recover(&self, leg: &VenueLegState) -> Result<VenueLegProgress, String>;
+    async fn recover(
+        &self,
+        leg: &VenueLegState,
+        checkpoint: &dyn VenueLegCheckpoint,
+    ) -> Result<VenueLegProgress, String>;
 }

@@ -15,7 +15,10 @@ use crate::swappers::icpswap::{
     execution::IcpswapExecutionStateStore,
     plan::{amount_out_minimum, nat_to_decimal_text},
     reconciliation as recon,
-    state::retry_slippage_bps,
+    state::{
+        DEPOSIT_OBSERVATION_RETRY_NANOS, MAX_DEPOSIT_OBSERVATION_ATTEMPTS, MAX_DEPOSIT_SUBMISSION_RETRIES,
+        retry_slippage_bps,
+    },
     types::{
         IcpswapClientError, IcpswapDepositArgs, IcpswapError, IcpswapState, IcpswapStep, IcpswapSwapArgs,
         IcpswapWithdrawArgs,
@@ -86,17 +89,41 @@ pub(crate) async fn deposit_step(
     now_nanos: u64,
 ) -> Result<(), String> {
     match state.step {
-        IcpswapStep::Deposit => deposit(client, store, execution_id, state, now_nanos).await,
-        IcpswapStep::DepositPending => {
-            if !recon::observe_deposit(client, state).await? {
-                let message =
-                    "pending deposit could not be proven from the pool balance; automatic replay is unsafe".to_string();
-                recon::require_operator(state, IcpswapStep::DepositPending, message.clone());
-                persist(store, execution_id, state).await?;
-                return Err(message);
+        IcpswapStep::Deposit => {
+            if state.next_attempt_at_nanos.is_some_and(|ready_at| now_nanos < ready_at) {
+                return persist(store, execution_id, state).await;
             }
-            recon::complete_deposit(state);
-            persist(store, execution_id, state).await
+            state.next_attempt_at_nanos = None;
+            deposit(client, store, execution_id, state, now_nanos).await
+        }
+        IcpswapStep::DepositPending => {
+            if state.next_attempt_at_nanos.is_some_and(|ready_at| now_nanos < ready_at) {
+                return persist(store, execution_id, state).await;
+            }
+            state.next_attempt_at_nanos = None;
+            if state.deposit.ready_to_submit {
+                return submit_prepared_deposit(client, store, execution_id, state, now_nanos).await;
+            }
+            match recon::observe_deposit(client, state).await {
+                Ok(true) => {
+                    recon::complete_deposit(state);
+                    persist(store, execution_id, state).await
+                }
+                Ok(false) => {
+                    schedule_deposit_observation_retry(
+                        client,
+                        store,
+                        execution_id,
+                        state,
+                        now_nanos,
+                        "pool balance has not reached the required deposit credit".to_string(),
+                    )
+                    .await
+                }
+                Err(error) => {
+                    schedule_deposit_observation_retry(client, store, execution_id, state, now_nanos, error).await
+                }
+            }
         }
         _ => Err(format!("deposit cannot handle ICPSwap step {:?}", state.step)),
     }
@@ -285,13 +312,27 @@ async fn deposit(
     store: &dyn IcpswapExecutionStateStore,
     execution_id: &str,
     state: &mut IcpswapState,
-    _now_nanos: u64,
+    now_nanos: u64,
 ) -> Result<(), String> {
     let unused = client
         .unused_balance(state.plan.pool, state.owner.owner)
         .await
         .map_err(|error| error.to_string())?;
     state.deposit.input_pool_balance_before = Some(recon::input_balance(&state.plan, &unused));
+    let deposit_account = state
+        .transfer
+        .args
+        .as_ref()
+        .map(|args| args.to)
+        .ok_or_else(|| "ICPSwap deposit is missing its persisted ledger destination".to_string())?;
+    state.deposit.input_ledger_balance_before = Some(
+        client
+            .ledger_balance(state.plan.token_in, &deposit_account)
+            .await
+            .map_err(|error| error.to_string())?,
+    );
+    state.deposit.ready_to_submit = true;
+    state.deposit.observation_attempts = 0;
     let args = IcpswapDepositArgs {
         token: state.plan.token_in.to_text(),
         // ICPSwap credits `amount - fee` when it sweeps this subaccount.
@@ -303,7 +344,56 @@ async fn deposit(
     state.last_error = None;
     persist(store, execution_id, state).await?;
 
-    submit_deposit(client, store, execution_id, state, args).await
+    state.deposit.ready_to_submit = false;
+    submit_deposit(client, store, execution_id, state, args, now_nanos).await
+}
+
+/// Resumes a deposit intent that was durably prepared before its side effect.
+/// A prior process may have crashed while submitting it, so balances are
+/// reconciled before the call is allowed to run.
+async fn submit_prepared_deposit(
+    client: &dyn IcpswapManualClient,
+    store: &dyn IcpswapExecutionStateStore,
+    execution_id: &str,
+    state: &mut IcpswapState,
+    now_nanos: u64,
+) -> Result<(), String> {
+    if recon::observe_deposit(client, state).await? {
+        recon::complete_deposit(state);
+        return persist(store, execution_id, state).await;
+    }
+
+    let deposit_account = state
+        .transfer
+        .args
+        .as_ref()
+        .map(|args| args.to)
+        .ok_or_else(|| "prepared ICPSwap deposit is missing its persisted ledger destination".to_string())?;
+    let ledger_before = state
+        .deposit
+        .input_ledger_balance_before
+        .clone()
+        .ok_or_else(|| "prepared ICPSwap deposit is missing its ledger-balance baseline".to_string())?;
+    let ledger_current = client
+        .ledger_balance(state.plan.token_in, &deposit_account)
+        .await
+        .map_err(|error| error.to_string())?;
+    if ledger_current != ledger_before {
+        state.deposit.ready_to_submit = false;
+        state.next_attempt_at_nanos = Some(now_nanos.saturating_add(DEPOSIT_OBSERVATION_RETRY_NANOS));
+        state.last_error = Some(format!(
+            "deposit subaccount balance moved from {ledger_before} to {ledger_current}; observing for delayed pool credit"
+        ));
+        return persist(store, execution_id, state).await;
+    }
+
+    let args = IcpswapDepositArgs {
+        token: state.plan.token_in.to_text(),
+        amount: state.plan.amount_in.value.clone() + state.plan.input_ledger_fee.value.clone(),
+        fee: state.plan.input_ledger_fee.value.clone(),
+    };
+    state.deposit.ready_to_submit = false;
+    submit_deposit(client, store, execution_id, state, args, now_nanos).await
 }
 
 async fn submit_deposit(
@@ -312,11 +402,11 @@ async fn submit_deposit(
     execution_id: &str,
     state: &mut IcpswapState,
     args: IcpswapDepositArgs,
+    now_nanos: u64,
 ) -> Result<(), String> {
     match client.deposit(state.plan.pool, &args).await {
         Ok(credited) if credited == state.plan.amount_in.value => {
-            state.step = IcpswapStep::Trade;
-            state.last_error = None;
+            recon::complete_deposit(state);
             return persist(store, execution_id, state).await;
         }
         Ok(credited) => {
@@ -328,13 +418,10 @@ async fn submit_deposit(
             return persist(store, execution_id, state).await;
         }
         Err(error @ IcpswapClientError::SubmissionUnknown { .. }) => {
-            if recon::observe_deposit(client, state).await? {
-                recon::complete_deposit(state);
-            } else {
-                recon::require_operator(state, IcpswapStep::DepositPending, error.to_string());
-            }
-            persist(store, execution_id, state).await?;
-            return Err(error.to_string());
+            state.deposit.observation_attempts = 0;
+            state.next_attempt_at_nanos = Some(now_nanos.saturating_add(DEPOSIT_OBSERVATION_RETRY_NANOS));
+            state.last_error = Some(error.to_string());
+            persist(store, execution_id, state).await
         }
         Err(error) => {
             // Deliberately left at `DepositPending`. Only `Encode` and `Protocol`
@@ -344,11 +431,85 @@ async fn submit_deposit(
             // awaited ledger calls before it fails", so the subaccount sweep may
             // already have happened. Resetting to `Deposit` would resubmit on top
             // of that. Reconciliation by balance is the safe resolution.
+            state.deposit.observation_attempts = 0;
+            state.next_attempt_at_nanos = Some(now_nanos.saturating_add(DEPOSIT_OBSERVATION_RETRY_NANOS));
             state.last_error = Some(error.to_string());
-            persist(store, execution_id, state).await?;
-            return Err(error.to_string());
+            persist(store, execution_id, state).await
         }
     }
+}
+
+/// Records one unsuccessful read-only deposit observation. After four spaced
+/// observations, the deposit call is retried only when the ledger proves that
+/// the pool has not swept the deposit subaccount. Retries are bounded; any
+/// balance movement or inability to prove safety parks the leg.
+async fn schedule_deposit_observation_retry(
+    client: &dyn IcpswapManualClient,
+    store: &dyn IcpswapExecutionStateStore,
+    execution_id: &str,
+    state: &mut IcpswapState,
+    now_nanos: u64,
+    detail: String,
+) -> Result<(), String> {
+    state.deposit.observation_attempts = state.deposit.observation_attempts.saturating_add(1);
+    if state.deposit.observation_attempts >= MAX_DEPOSIT_OBSERVATION_ATTEMPTS {
+        let deposit_account = state.transfer.args.as_ref().map(|args| args.to);
+        let ledger_before = state.deposit.input_ledger_balance_before.clone();
+        if let (Some(deposit_account), Some(ledger_before)) = (deposit_account, ledger_before)
+            && state.deposit.submission_retry_count < MAX_DEPOSIT_SUBMISSION_RETRIES
+        {
+            match client.ledger_balance(state.plan.token_in, &deposit_account).await {
+                Ok(ledger_current) if ledger_current == ledger_before => {
+                    state.deposit.submission_retry_count += 1;
+                    state.deposit.observation_attempts = 0;
+                    state.deposit.ready_to_submit = true;
+                    state.step = IcpswapStep::DepositPending;
+                    state.operator_pending_step = None;
+                    state.next_attempt_at_nanos =
+                        Some(now_nanos.saturating_add(DEPOSIT_OBSERVATION_RETRY_NANOS));
+                    state.last_error = Some(format!(
+                        "deposit remained unswept after {MAX_DEPOSIT_OBSERVATION_ATTEMPTS} observations; scheduling safe deposit resubmission {}/{}",
+                        state.deposit.submission_retry_count, MAX_DEPOSIT_SUBMISSION_RETRIES
+                    ));
+                    return persist(store, execution_id, state).await;
+                }
+                Ok(ledger_current) => {
+                    state.deposit.ready_to_submit = false;
+                    let message = format!(
+                        "deposit subaccount balance moved from {ledger_before} to {ledger_current}; automatic deposit replay is unsafe"
+                    );
+                    recon::require_operator(state, IcpswapStep::DepositPending, message.clone());
+                    persist(store, execution_id, state).await?;
+                    return Err(message);
+                }
+                Err(error) => {
+                    state.deposit.ready_to_submit = false;
+                    let message = format!(
+                        "could not verify the deposit subaccount before replay: {error}"
+                    );
+                    recon::require_operator(state, IcpswapStep::DepositPending, message.clone());
+                    persist(store, execution_id, state).await?;
+                    return Err(message);
+                }
+            }
+        }
+
+        state.deposit.ready_to_submit = false;
+        let message = format!(
+            "pending deposit could not be proven after {} balance observations; automatic replay is unsafe: {detail}",
+            state.deposit.observation_attempts
+        );
+        recon::require_operator(state, IcpswapStep::DepositPending, message.clone());
+        persist(store, execution_id, state).await?;
+        return Err(message);
+    }
+
+    state.next_attempt_at_nanos = Some(now_nanos.saturating_add(DEPOSIT_OBSERVATION_RETRY_NANOS));
+    state.last_error = Some(format!(
+        "deposit observation {}/{} was not confirmed; retrying after 2 seconds: {detail}",
+        state.deposit.observation_attempts, MAX_DEPOSIT_OBSERVATION_ATTEMPTS
+    ));
+    persist(store, execution_id, state).await
 }
 
 async fn trade(

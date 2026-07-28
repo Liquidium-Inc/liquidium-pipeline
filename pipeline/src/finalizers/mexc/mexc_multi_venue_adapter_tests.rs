@@ -10,10 +10,19 @@ use liquidium_pipeline_core::{
 
 use super::*;
 use crate::{
-    finalizers::multi_venue::MultiVenueAdapter,
+    finalizers::multi_venue::{MultiVenueAdapter, VenueLegCheckpoint, VenueLegProgress},
     persistance::{VenueLegQuote, VenueLegState, VenueLegStatus},
     swappers::model::SwapRequest,
 };
+
+struct NoopCheckpoint;
+
+#[async_trait::async_trait]
+impl VenueLegCheckpoint for NoopCheckpoint {
+    async fn checkpoint(&self, _progress: VenueLegProgress) -> Result<(), String> {
+        Ok(())
+    }
+}
 
 fn pay_token() -> ChainToken {
     ChainToken::Icp {
@@ -283,7 +292,7 @@ async fn first_advance_only_opens_the_parent_persistence_gate() {
 
     // No transfer/backend side-effect expectations are configured. Any such
     // call would fail this test; the first cycle must only return durable state.
-    let progress = MultiVenueAdapter::advance(&finalizer, &leg)
+    let progress = MultiVenueAdapter::advance(&finalizer, &leg, &NoopCheckpoint)
         .await
         .expect("gate transition should succeed");
     let execution = progress
@@ -305,7 +314,7 @@ async fn restart_with_an_outstanding_intent_requires_operator_instead_of_replayi
         .await
         .expect("preview should succeed");
     let mut leg = leg_from_preview(preview);
-    let armed = MultiVenueAdapter::advance(&original, &leg)
+    let armed = MultiVenueAdapter::advance(&original, &leg, &NoopCheckpoint)
         .await
         .expect("first cycle should persist an intent");
     leg.execution = armed.execution;
@@ -315,7 +324,7 @@ async fn restart_with_an_outstanding_intent_requires_operator_instead_of_replayi
     // call did not already happen before the crash. It must not call MEXC or
     // the transfer service again.
     let restarted = finalizer();
-    let progress = MultiVenueAdapter::advance(&restarted, &leg)
+    let progress = MultiVenueAdapter::advance(&restarted, &leg, &NoopCheckpoint)
         .await
         .expect("ambiguous intent should be parked");
 
@@ -331,7 +340,7 @@ async fn restart_with_an_outstanding_intent_requires_operator_instead_of_replayi
     // the stale process-local intent and persists a fresh gate before retrying.
     leg.execution = progress.execution;
     leg.status = progress.status;
-    let rearmed = MultiVenueAdapter::recover(&restarted, &leg)
+    let rearmed = MultiVenueAdapter::recover(&restarted, &leg, &NoopCheckpoint)
         .await
         .expect("explicit recovery should re-arm after restart");
     let execution = rearmed
@@ -361,7 +370,7 @@ async fn completed_leg_returns_a_result_without_parent_wal_access() {
     execution.cex.withdraw.size_out = Some(ChainTokenAmount::from_raw(receive_token(), Nat::from(10_000_000u64)));
     leg.execution = VenueExecutionState::new("mexc", &execution).expect("state should encode");
 
-    let progress = MultiVenueAdapter::advance(&finalizer, &leg)
+    let progress = MultiVenueAdapter::advance(&finalizer, &leg, &NoopCheckpoint)
         .await
         .expect("completed leg should project to a result");
 
@@ -381,7 +390,7 @@ async fn adapter_rejects_a_mutated_committed_allocation() {
     let mut leg = leg_from_preview(preview);
     leg.request.pay_amount.value = Nat::from(200_000_000u64);
 
-    let error = MultiVenueAdapter::advance(&finalizer, &leg)
+    let error = MultiVenueAdapter::advance(&finalizer, &leg, &NoopCheckpoint)
         .await
         .expect_err("mutated allocation must be rejected");
     assert!(error.contains("persisted allocation"));
@@ -403,7 +412,7 @@ async fn recover_accepts_each_durable_pending_reconciliation_phase() {
         execution.cex.step = pending_step;
         leg.execution = VenueExecutionState::new("mexc", &execution).expect("state should encode");
 
-        let progress = MultiVenueAdapter::recover(&finalizer, &leg)
+        let progress = MultiVenueAdapter::recover(&finalizer, &leg, &NoopCheckpoint)
             .await
             .expect("pending leg should enter reconciliation");
         let recovered = progress
@@ -426,11 +435,11 @@ async fn permanent_cex_error_marks_only_the_mexc_leg_failed() {
         .expect("preview should succeed");
     let mut leg = leg_from_preview(preview);
 
-    let armed = MultiVenueAdapter::advance(&finalizer, &leg)
+    let armed = MultiVenueAdapter::advance(&finalizer, &leg, &NoopCheckpoint)
         .await
         .expect("first cycle should arm the leg");
     leg.execution = armed.execution;
-    let failed = MultiVenueAdapter::advance(&finalizer, &leg)
+    let failed = MultiVenueAdapter::advance(&finalizer, &leg, &NoopCheckpoint)
         .await
         .expect("permanent failure should be returned as leg progress");
 
@@ -447,7 +456,7 @@ async fn permanent_cex_error_marks_only_the_mexc_leg_failed() {
     // A leg already persisted as failed reports the same way when re-advanced.
     leg.execution = failed.execution;
     leg.status = failed.status;
-    let replayed = MultiVenueAdapter::advance(&finalizer, &leg)
+    let replayed = MultiVenueAdapter::advance(&finalizer, &leg, &NoopCheckpoint)
         .await
         .expect("an already failed leg re-reports its terminal state");
     assert_eq!(replayed.status, VenueLegStatus::FailedPermanent);
@@ -463,11 +472,11 @@ async fn ordinary_cex_error_remains_retryable_without_operator_intervention() {
         .expect("preview should succeed");
     let mut leg = leg_from_preview(preview);
 
-    let armed = MultiVenueAdapter::advance(&finalizer, &leg)
+    let armed = MultiVenueAdapter::advance(&finalizer, &leg, &NoopCheckpoint)
         .await
         .expect("first cycle should arm the leg");
     leg.execution = armed.execution;
-    let retryable = MultiVenueAdapter::advance(&finalizer, &leg)
+    let retryable = MultiVenueAdapter::advance(&finalizer, &leg, &NoopCheckpoint)
         .await
         .expect("ordinary CEX failure should become durable retryable progress");
     assert_eq!(retryable.status, VenueLegStatus::Running);

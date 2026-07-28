@@ -134,30 +134,51 @@ pub trait IcpswapFinalizerLogic: Send + Sync {
     ) -> Result<IcpswapState, String> {
         validate_execution_state(&state, execution_id, owner)?;
 
-        match state.step {
-            super::types::IcpswapStep::Transfer | super::types::IcpswapStep::TransferPending => {
-                self.transfer(store, execution_id, &mut state, now_nanos).await?
+        const MAX_IMMEDIATE_TRANSITIONS: usize = 16;
+        for _ in 0..MAX_IMMEDIATE_TRANSITIONS {
+            if matches!(
+                state.step,
+                super::types::IcpswapStep::Completed
+                    | super::types::IcpswapStep::Refunded
+                    | super::types::IcpswapStep::Failed
+            ) || state.next_attempt_at_nanos.is_some_and(|ready_at| now_nanos < ready_at)
+            {
+                return Ok(state);
             }
-            super::types::IcpswapStep::Deposit | super::types::IcpswapStep::DepositPending => {
-                self.deposit(store, execution_id, &mut state, now_nanos).await?
+
+            let before = state.clone();
+            match state.step {
+                super::types::IcpswapStep::Transfer | super::types::IcpswapStep::TransferPending => {
+                    self.transfer(store, execution_id, &mut state, now_nanos).await?
+                }
+                super::types::IcpswapStep::Deposit | super::types::IcpswapStep::DepositPending => {
+                    self.deposit(store, execution_id, &mut state, now_nanos).await?
+                }
+                super::types::IcpswapStep::Trade | super::types::IcpswapStep::TradePending => {
+                    self.trade(store, execution_id, &mut state, now_nanos).await?
+                }
+                super::types::IcpswapStep::Withdraw | super::types::IcpswapStep::WithdrawPending => {
+                    self.withdraw(store, execution_id, &mut state, now_nanos).await?
+                }
+                super::types::IcpswapStep::Recover | super::types::IcpswapStep::RecoverPending => {
+                    self.recover(store, execution_id, &mut state, now_nanos).await?
+                }
+                super::types::IcpswapStep::OperatorRequired => {
+                    self.reconcile_operator(store, execution_id, &mut state).await?
+                }
+                super::types::IcpswapStep::Completed
+                | super::types::IcpswapStep::Refunded
+                | super::types::IcpswapStep::Failed => return Ok(state),
             }
-            super::types::IcpswapStep::Trade | super::types::IcpswapStep::TradePending => {
-                self.trade(store, execution_id, &mut state, now_nanos).await?
+
+            if state == before {
+                return Ok(state);
             }
-            super::types::IcpswapStep::Withdraw | super::types::IcpswapStep::WithdrawPending => {
-                self.withdraw(store, execution_id, &mut state, now_nanos).await?
-            }
-            super::types::IcpswapStep::Recover | super::types::IcpswapStep::RecoverPending => {
-                self.recover(store, execution_id, &mut state, now_nanos).await?
-            }
-            super::types::IcpswapStep::OperatorRequired => {
-                self.reconcile_operator(store, execution_id, &mut state).await?
-            }
-            super::types::IcpswapStep::Completed
-            | super::types::IcpswapStep::Refunded
-            | super::types::IcpswapStep::Failed => {}
         }
-        Ok(state)
+
+        Err(format!(
+            "ICPSwap exceeded {MAX_IMMEDIATE_TRANSITIONS} immediately runnable transitions"
+        ))
     }
 
     async fn finish(
