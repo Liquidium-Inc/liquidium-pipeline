@@ -431,10 +431,17 @@ impl IcpswapFirstPlanner {
             .best_executable_overflow(input, &overflow_quotes)
             .ok_or_else(|| IcpswapFirstPlannerError::NoViableRoute(self.overflow_failure_summary(&overflow_quotes)))?;
         if !self.is_safe_icpswap(&icpswap) {
-            return Err(IcpswapFirstPlannerError::NoViableRoute(format!(
+            // An exact quote that comes back unsafe is no more usable than one
+            // that failed outright, so it takes the same route: re-quote the full
+            // amount on overflow venues instead of abandoning a liquidation that
+            // a single venue could still execute.
+            let error = IcpswapFirstPlannerError::NoViableRoute(format!(
                 "exact ICPSwap allocation impact {:.2} bps is not below {:.2} bps",
                 icpswap.quote.estimated_price_impact_bps, self.config.max_price_impact_bps
-            )));
+            ));
+            return self
+                .plan_full_overflow_after_icpswap_failure(input, quoted_at, &error)
+                .await;
         }
 
         self.build_state(

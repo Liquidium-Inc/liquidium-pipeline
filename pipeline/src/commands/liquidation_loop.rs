@@ -166,8 +166,8 @@ async fn init(
         MultiVenueFinalizer::new(
             venue_adapters,
             IcpswapFirstPlannerConfig {
-                max_price_impact_bps: 100.0,
-                max_search_iterations: 16,
+                max_price_impact_bps: config.get_icpswap_max_price_impact_bps(),
+                max_search_iterations: config.get_icpswap_max_search_iterations(),
                 cex_min_exec_usd: config.get_cex_min_exec_usd(),
                 min_net_edge_bps: config.get_cex_min_net_edge_bps(),
             },

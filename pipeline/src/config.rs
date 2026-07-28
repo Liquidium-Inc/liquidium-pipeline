@@ -73,6 +73,12 @@ pub struct Config {
     pub cex_mexc_max_hops: u8,
     pub icpswap_factory_canister: Principal,
     pub icpswap_fee_tiers: Vec<candid::Nat>,
+    /// Highest ICPSwap price impact an allocation may carry, in bps. The limit is
+    /// strict: an allocation quoted exactly at it is rejected.
+    pub icpswap_max_price_impact_bps: f64,
+    /// Iteration budget for the planner's binary search for the largest safe
+    /// ICPSwap allocation. Each iteration costs one pool quote.
+    pub icpswap_max_search_iterations: u8,
     /// Ordered venue IDs eligible for new multi-venue plans.
     pub enabled_swap_venues: Vec<String>,
     pub cex_credentials: HashMap<String, (String, String)>,
@@ -101,6 +107,8 @@ pub trait ConfigTrait: Send + Sync {
     fn get_cex_route_fee_bps(&self) -> u32;
     fn get_cex_mexc_available_pairs(&self) -> Vec<String>;
     fn get_cex_mexc_max_hops(&self) -> u8;
+    fn get_icpswap_max_price_impact_bps(&self) -> f64;
+    fn get_icpswap_max_search_iterations(&self) -> u8;
     #[allow(dead_code)]
     fn get_lending_canister(&self) -> Principal;
     #[allow(dead_code)]
@@ -195,6 +203,14 @@ impl ConfigTrait for Config {
 
     fn get_cex_mexc_max_hops(&self) -> u8 {
         self.cex_mexc_max_hops
+    }
+
+    fn get_icpswap_max_price_impact_bps(&self) -> f64 {
+        self.icpswap_max_price_impact_bps
+    }
+
+    fn get_icpswap_max_search_iterations(&self) -> u8 {
+        self.icpswap_max_search_iterations
     }
 
     fn get_enabled_swap_venues(&self) -> Vec<String> {
@@ -377,6 +393,8 @@ impl Config {
             cex_mexc_max_hops,
             icpswap_factory_canister,
             icpswap_fee_tiers,
+            icpswap_max_price_impact_bps: parse_icpswap_max_price_impact_bps_from_env(),
+            icpswap_max_search_iterations: parse_icpswap_max_search_iterations_from_env(),
             enabled_swap_venues,
             cex_credentials,
             opportunity_account_filter,
@@ -450,6 +468,8 @@ const BRIDGE_BTC_INDEX: u32 = 0;
 const DEFAULT_BRIDGE_CKETH_MINTER_CANISTER: &str = "sv3dd-oaaaa-aaaar-qacoa-cai";
 pub const DEFAULT_ICPSWAP_FACTORY_CANISTER: &str = "4mmnk-kiaaa-aaaag-qbllq-cai";
 const DEFAULT_ICPSWAP_FEE_TIERS: &str = "100,500,3000,10000";
+const DEFAULT_ICPSWAP_MAX_PRICE_IMPACT_BPS: f64 = 100.0;
+const DEFAULT_ICPSWAP_MAX_SEARCH_ITERATIONS: u8 = 16;
 const DEFAULT_ENABLED_SWAP_VENUES: &str = "icpswap,mexc";
 const SUPPORTED_SWAP_VENUES: [&str; 2] = ["icpswap", "mexc"];
 
@@ -533,6 +553,27 @@ pub(crate) fn parse_icpswap_factory_from_env() -> Result<Principal, String> {
     let trimmed = raw.trim();
     Principal::from_text(trimmed)
         .map_err(|error| format!("invalid ICPSWAP_FACTORY_CANISTER principal '{trimmed}': {error}"))
+}
+
+/// Mirrors `IcpswapFirstPlannerConfig::validate`: a non-finite or non-positive
+/// limit would be rejected by the planner constructor, so an unusable override
+/// falls back to the default instead of failing startup.
+fn parse_icpswap_max_price_impact_bps_from_env() -> f64 {
+    env::var("ICPSWAP_MAX_PRICE_IMPACT_BPS")
+        .ok()
+        .and_then(|value| value.trim().parse::<f64>().ok())
+        .filter(|value| value.is_finite() && *value > 0.0)
+        .unwrap_or(DEFAULT_ICPSWAP_MAX_PRICE_IMPACT_BPS)
+}
+
+/// The planner rejects a zero iteration budget, so zero falls back to the
+/// default rather than producing an unconstructable planner.
+fn parse_icpswap_max_search_iterations_from_env() -> u8 {
+    env::var("ICPSWAP_MAX_SEARCH_ITERATIONS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u8>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_ICPSWAP_MAX_SEARCH_ITERATIONS)
 }
 
 pub(crate) fn parse_icpswap_fee_tiers_from_env() -> Result<Vec<candid::Nat>, String> {

@@ -576,6 +576,50 @@ async fn permanent_failure_is_not_readvanced_or_rerouted() {
 }
 
 #[tokio::test]
+async fn partial_recovery_still_reports_the_completed_leg_proceeds() {
+    let receipt = receipt();
+    let wal = TestWal::with_receipt(&receipt);
+    // A split plan where ICPSwap completes and MEXC fails permanently.
+    let icpswap = Arc::new(ScriptedAdapter::new(
+        ICPSWAP_VENUE_ID,
+        Some(TOTAL_PAY / 2),
+        vec![VenueLegStatus::Completed],
+    ));
+    let mexc = Arc::new(ScriptedAdapter::new(
+        MEXC_VENUE_ID,
+        None,
+        vec![VenueLegStatus::FailedPermanent],
+    ));
+    let finalizer = finalizer(vec![icpswap.clone(), mexc.clone()]);
+
+    let result = finalizer
+        .finalize(&wal, receipt)
+        .await
+        .expect("partial recovery keeps the completed proceeds");
+
+    let state = committed_state(&wal);
+    assert!(matches!(
+        state.outcome,
+        MultiVenueExecutionOutcome::PartialRecovered { .. }
+    ));
+    // The permanent failure is reported as context, not as a lost execution.
+    assert!(result.finalized);
+    assert!(!result.operator_required);
+    assert!(
+        result
+            .reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("failed permanently"))
+    );
+    let aggregate = result.swap_result.expect("completed leg proceeds are aggregated");
+    assert_eq!(aggregate.pay_amount, Nat::from(TOTAL_PAY / 2));
+    assert_eq!(
+        aggregate.legs.iter().map(|leg| leg.venue.as_str()).collect::<Vec<_>>(),
+        vec![ICPSWAP_VENUE_ID]
+    );
+}
+
+#[tokio::test]
 async fn committed_legacy_state_is_rejected_without_being_upgraded() {
     let receipt = receipt();
     let mut wrapper = LiqMetaWrapper {

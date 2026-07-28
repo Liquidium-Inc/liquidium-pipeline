@@ -132,14 +132,6 @@ where
             return Ok(());
         }
 
-        if receipt.request.liquidation.buy_bad_debt {
-            self.wal
-                .update_status(&row.id, ResultStatus::Enqueued, true)
-                .await
-                .map_err(|e| e.to_string())?;
-            return Ok(());
-        }
-
         self.wal
             .update_status(&row.id, ResultStatus::Enqueued, true)
             .await
@@ -457,7 +449,7 @@ mod tests {
     async fn watcher_reenqueues_legacy_waiting_profit_rows() {
         let liq_id = 12u128;
         let swap_args = make_swap_args();
-        let mut row = make_row(
+        let row = make_row(
             ResultStatus::WaitingProfit,
             ExecutionReceipt {
                 request: make_request(false, Some(swap_args.clone())),
@@ -466,7 +458,6 @@ mod tests {
                 change_received: true,
             },
         );
-        row.updated_at = now_ts() - 181;
         let row_id = row.id.clone();
 
         let mut wal = MockWalStore::new();

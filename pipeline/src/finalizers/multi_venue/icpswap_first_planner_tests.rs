@@ -535,6 +535,44 @@ async fn missing_reference_price_splits_instead_of_forcing_full_icpswap() {
     assert!(icpswap_leg.quote.estimated_price_impact_bps < 100.0);
 }
 
+#[tokio::test]
+async fn unsafe_exact_icpswap_requote_falls_back_to_full_overflow() {
+    // Safe on first sight, unsafe when the exact allocation is re-quoted: the
+    // price moved between the binary search and the confirming quote.
+    let quoted_amounts = Arc::new(Mutex::new(Vec::<u64>::new()));
+    let icpswap = mock_adapter(ICPSWAP_VENUE_ID, Arc::new(Mutex::new(Vec::new())), move |request| {
+        let pay = request.pay_amount.value.0.to_u64().expect("u64 pay");
+        let mut seen = quoted_amounts.lock().expect("quoted amounts lock");
+        let repeat = seen.contains(&pay);
+        seen.push(pay);
+        // Anything above half is unsafe, so the search settles on a half-sized
+        // allocation with a remainder large enough for MEXC. Re-quoting that
+        // same allocation then comes back unsafe.
+        let impact = if pay > TOTAL_PAY / 2 || repeat { 200.0 } else { 50.0 };
+        Ok(proportional_preview(request, ICPSWAP_VENUE_ID, impact, 2))
+    });
+    let mexc = mock_adapter(MEXC_VENUE_ID, Arc::new(Mutex::new(Vec::new())), |request| {
+        Ok(proportional_preview(request, MEXC_VENUE_ID, 0.0, 2))
+    });
+
+    let state = planner(icpswap, mexc, config(1.1))
+        .plan(&input_with_pay_token(native_icp()), 123)
+        .await
+        .expect("full overflow fallback");
+
+    assert_eq!(state.legs.len(), 1);
+    assert_eq!(state.legs[0].venue_id, MEXC_VENUE_ID);
+    // The whole amount moves to the overflow venue, not just the remainder.
+    assert_eq!(state.legs[0].request.pay_amount.value, Nat::from(TOTAL_PAY));
+    assert_eq!(
+        state.plan.allocation_reason,
+        MultiVenueAllocationReason::VenueUnavailable {
+            selected_venue_id: MEXC_VENUE_ID.to_string(),
+            unavailable_venue_ids: vec![ICPSWAP_VENUE_ID.to_string()],
+        }
+    );
+}
+
 #[test]
 fn unusable_reference_prices_are_absent_rather_than_zero() {
     // RAY-scaled: 10 * 1e27 is $10.

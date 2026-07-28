@@ -291,34 +291,31 @@ impl MultiVenueFinalizer {
                 swapper: Some("multi_venue".to_string()),
                 reason: Some(format!("operator required for venue legs: {}", leg_ids.join(","))),
             }),
-            MultiVenueExecutionOutcome::PartialRecovered { failed_leg_ids } => Err(format!(
-                "{MULTI_VENUE_PERMANENT_PREFIX}venue legs failed permanently: {}",
-                failed_leg_ids.join(",")
-            )),
-            MultiVenueExecutionOutcome::Completed | MultiVenueExecutionOutcome::Recovered => {
-                let completed_results = state
-                    .legs
-                    .iter()
-                    .filter(|leg| leg.status == VenueLegStatus::Completed)
-                    .map(|leg| {
-                        leg.result.clone().ok_or_else(|| {
-                            format!(
-                                "{MULTI_VENUE_PERMANENT_PREFIX}completed venue leg `{}` has no execution result",
-                                leg.leg_id
-                            )
-                        })
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
-
-                let swap_result = aggregate_swap_executions(&state.legs, completed_results)?;
-                Ok(FinalizerResult {
-                    swap_result,
-                    finalized: true,
-                    operator_required: false,
-                    swapper: Some("multi_venue".to_string()),
-                    reason: None,
-                })
+            MultiVenueExecutionOutcome::PartialRecovered { failed_leg_ids } => {
+                let context = format!("venue legs failed permanently: {}", failed_leg_ids.join(","));
+                // Whatever the surviving legs produced is real money already in
+                // the wallet. Reporting only the permanent failure would hand the
+                // pipeline `swap_result: None`, dropping those proceeds out of
+                // profit accounting and the analytics export for good. Fail hard
+                // only when there is nothing to account for.
+                match aggregate_completed_legs(state)? {
+                    Some(swap_result) => Ok(FinalizerResult {
+                        swap_result: Some(swap_result),
+                        finalized: true,
+                        operator_required: false,
+                        swapper: Some("multi_venue".to_string()),
+                        reason: Some(context),
+                    }),
+                    None => Err(format!("{MULTI_VENUE_PERMANENT_PREFIX}{context}")),
+                }
             }
+            MultiVenueExecutionOutcome::Completed | MultiVenueExecutionOutcome::Recovered => Ok(FinalizerResult {
+                swap_result: aggregate_completed_legs(state)?,
+                finalized: true,
+                operator_required: false,
+                swapper: Some("multi_venue".to_string()),
+                reason: None,
+            }),
         }
     }
 }
@@ -333,6 +330,29 @@ impl MultiVenueFinalizer {
         self.advance_legs(wal, &mut row, &mut wrapper, &mut state).await?;
         self.result_for_state(&state)
     }
+}
+
+/// Collects every completed leg's execution result and folds them into the one
+/// swap shape the pipeline records. A completed leg with no result is a broken
+/// invariant, not an empty aggregate.
+fn aggregate_completed_legs(
+    state: &MultiVenueExecutionState,
+) -> Result<Option<crate::swappers::model::SwapExecution>, String> {
+    let completed_results = state
+        .legs
+        .iter()
+        .filter(|leg| leg.status == VenueLegStatus::Completed)
+        .map(|leg| {
+            leg.result.clone().ok_or_else(|| {
+                format!(
+                    "{MULTI_VENUE_PERMANENT_PREFIX}completed venue leg `{}` has no execution result",
+                    leg.leg_id
+                )
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    aggregate_swap_executions(&state.legs, completed_results)
 }
 
 /// Projects completed venue legs into the pipeline's existing single execution
