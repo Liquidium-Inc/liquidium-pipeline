@@ -90,7 +90,7 @@ fn input_with_pay_token(pay_token: ChainToken) -> IcpswapFirstPlanInput {
         debt_repaid: ChainTokenAmount::from_raw(debt, Nat::from(DEBT_REPAID)),
         receive_address: Some("receiver".to_string()),
         max_execution_slippage_bps: Some(500),
-        pay_reference_price_usd: 10.0,
+        pay_reference_price_usd: Some(10.0),
     }
 }
 
@@ -503,6 +503,66 @@ async fn sub_minimum_mexc_remainder_uses_full_icpswap_as_dust_exception() {
             selected_venue_id: ICPSWAP_VENUE_ID.to_string(),
         }
     );
+}
+
+#[tokio::test]
+async fn missing_reference_price_splits_instead_of_forcing_full_icpswap() {
+    // Same shape as the dust-exception test, but with no usable reference price.
+    // A price of zero would make the remainder look sub-minimum and send the
+    // whole amount to ICPSwap at an impact the full quote already failed.
+    let icpswap = mock_adapter(ICPSWAP_VENUE_ID, Arc::new(Mutex::new(Vec::new())), |request| {
+        let pay = request.pay_amount.value.0.to_u64().expect("u64 pay");
+        let impact = pay as f64 / 900_000.0;
+        Ok(proportional_preview(request, ICPSWAP_VENUE_ID, impact, 2))
+    });
+    let mexc = mock_adapter(MEXC_VENUE_ID, Arc::new(Mutex::new(Vec::new())), |request| {
+        Ok(proportional_preview(request, MEXC_VENUE_ID, 0.0, 2))
+    });
+
+    let mut input = input_with_pay_token(native_icp());
+    input.pay_reference_price_usd = None;
+    let state = planner(icpswap, mexc, config(1.1)).plan(&input, 123).await.expect("split plan");
+
+    assert_eq!(state.plan.allocation_reason, MultiVenueAllocationReason::PriceImpactSplit);
+    assert_eq!(state.legs.len(), 2);
+    assert!(state.legs.iter().any(|leg| leg.venue_id == MEXC_VENUE_ID));
+    // The ICPSwap leg stays inside the impact limit, unlike the dust exception.
+    let icpswap_leg = state
+        .legs
+        .iter()
+        .find(|leg| leg.venue_id == ICPSWAP_VENUE_ID)
+        .expect("icpswap leg");
+    assert!(icpswap_leg.quote.estimated_price_impact_bps < 100.0);
+}
+
+#[test]
+fn unusable_reference_prices_are_absent_rather_than_zero() {
+    // RAY-scaled: 10 * 1e27 is $10.
+    assert_eq!(
+        reference_price_usd(&Nat::from(10_000_000_000_000_000_000_000_000_000u128)),
+        Some(10.0)
+    );
+    assert_eq!(reference_price_usd(&Nat::from(0u8)), None);
+
+    // Large enough that `to_f64` cannot represent it as a finite price.
+    let overflowing = Nat::parse(format!("1{}", "0".repeat(400)).as_bytes()).expect("huge nat");
+    assert_eq!(reference_price_usd(&overflowing), None);
+}
+
+#[test]
+fn present_but_non_positive_reference_price_is_rejected() {
+    let mut input = input_with_pay_token(native_icp());
+    input.pay_reference_price_usd = Some(0.0);
+    assert!(matches!(
+        input.validate(),
+        Err(IcpswapFirstPlannerError::InvalidInput(_))
+    ));
+
+    input.pay_reference_price_usd = Some(f64::NAN);
+    assert!(matches!(
+        input.validate(),
+        Err(IcpswapFirstPlannerError::InvalidInput(_))
+    ));
 }
 
 #[tokio::test]

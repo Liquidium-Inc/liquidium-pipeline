@@ -72,7 +72,10 @@ pub struct IcpswapFirstPlanInput {
     pub debt_repaid: ChainTokenAmount,
     pub receive_address: Option<String>,
     pub max_execution_slippage_bps: Option<u32>,
-    pub pay_reference_price_usd: f64,
+    /// USD price of the pay asset, or `None` when the receipt carries no usable
+    /// price. Absent must stay absent rather than collapse to `0.0`, because a
+    /// zero price makes every notional look below the CEX minimum.
+    pub pay_reference_price_usd: Option<f64>,
 }
 
 impl IcpswapFirstPlanInput {
@@ -106,7 +109,7 @@ impl IcpswapFirstPlanInput {
                 "swap pay asset does not match received collateral".to_string(),
             ));
         }
-        let pay_reference_price_usd = receipt.request.ref_price.0.to_f64().unwrap_or(0.0) / RAY_PRICE_SCALE;
+        let pay_reference_price_usd = reference_price_usd(&receipt.request.ref_price);
 
         let input = Self {
             total_pay,
@@ -121,7 +124,7 @@ impl IcpswapFirstPlanInput {
     }
 
     // Verifies the amount and asset invariants required by every venue quote.
-    fn validate(&self) -> Result<(), IcpswapFirstPlannerError> {
+    pub(super) fn validate(&self) -> Result<(), IcpswapFirstPlannerError> {
         if self.total_pay.value == Nat::from(0u8) {
             return Err(IcpswapFirstPlannerError::InvalidInput(
                 "total pay amount must be positive".to_string(),
@@ -137,9 +140,11 @@ impl IcpswapFirstPlanInput {
                 "debt repaid token does not match receive asset".to_string(),
             ));
         }
-        if !self.pay_reference_price_usd.is_finite() || self.pay_reference_price_usd < 0.0 {
+        if let Some(price) = self.pay_reference_price_usd
+            && (!price.is_finite() || price <= 0.0)
+        {
             return Err(IcpswapFirstPlannerError::InvalidInput(
-                "pay reference price must be finite and non-negative".to_string(),
+                "pay reference price must be finite and positive when present".to_string(),
             ));
         }
         Ok(())
@@ -168,9 +173,26 @@ impl IcpswapFirstPlanInput {
         if minimum_usd <= 0.0 {
             return true;
         }
-        let notional = amount.to_f64() * self.pay_reference_price_usd;
+        // An unusable price makes the notional unknown, not zero. Reporting
+        // unknown as below-minimum would filter every overflow venue out of
+        // `best_executable_overflow` and push `plan_split_or_fallback` into
+        // forcing the whole amount through ICPSwap at an impact it already
+        // rejected. Defer to normal sizing and let the venue apply its own
+        // minimum instead.
+        let Some(price) = self.pay_reference_price_usd else {
+            return true;
+        };
+        let notional = amount.to_f64() * price;
         notional.is_finite() && notional >= minimum_usd
     }
+}
+
+/// Converts a RAY-scaled receipt price into USD, or `None` when it cannot size a
+/// notional. Zero, negative, and values `to_f64` cannot represent (it saturates
+/// to infinity) are all absent prices, not cheap ones.
+pub(super) fn reference_price_usd(ref_price_ray: &Nat) -> Option<f64> {
+    let price = ref_price_ray.0.to_f64()? / RAY_PRICE_SCALE;
+    (price.is_finite() && price > 0.0).then_some(price)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
