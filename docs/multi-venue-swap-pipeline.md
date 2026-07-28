@@ -403,3 +403,51 @@ No change should be needed to:
 - Older binaries do not understand the operational meaning of active `meta_v2` rows and cannot safely continue them.
 - Before rolling back to a binary that does not understand `meta_v2`, drain or manually recover all active multi-venue rows.
 - Before disabling a venue, finish or recover every unfinished committed leg for it. Startup rejects a disabled venue referenced by an unfinished `meta_v2` row.
+
+### Upgrading from a pre-multi-venue binary
+
+The multi-venue finalizer refuses to continue a legacy in-flight execution: a
+row carrying legacy MEXC `meta`, a legacy `venue_execution`, or a `dex`/`cex`
+`finalizer_decision` is failed permanently rather than resumed on a state
+machine that no longer exists. That is the safe outcome, but it strands
+whatever the legacy execution was holding, possibly on the exchange.
+
+**Drain before cutover.** Pause the old binary, let the finalizer run until no
+row is `Enqueued`, `InFlight`, or `FailedRetryable`, then deploy. Do not cut
+over while legacy swaps are in flight.
+
+Note also that `SWAPPER` is ignored by this binary and `ENABLED_SWAP_VENUES`
+defaults to `icpswap,mexc`. A CEX-only deployment that upgrades without editing
+its config will start routing ICP collateral through ICPSwap. Set
+`ENABLED_SWAP_VENUES=mexc` explicitly for a behavior-preserving first deploy.
+
+## Rows Outside the Runnable Queue
+
+`OperatorRequired` and `FailedPermanent` are both excluded from pending
+selection, so nothing in the daemon moves such a row again. Two paths lead there
+while a venue may still hold funds:
+
+- A venue reports ambiguous custody and parks its leg. The orchestrator raises
+  an `OperatorRequired` alert on that transition.
+- The finalize stage's retry budget runs out while a leg is past `Planned`. The
+  error carries a custody tag so this parks the row instead of failing it
+  permanently, which would have removed the custody from every queue with
+  nothing tracking it.
+
+A parked row produces no finalized outcome, so it appears in neither the CSV
+export nor the liquidation-finalized notification. Both park paths therefore
+raise their own `OperatorRequired` alert; a park is never log-only.
+
+> **Open item:** there is currently no supported command to return a parked row
+> to the queue; doing so requires editing the WAL by hand. An operator recovery
+> command is tracked separately.
+
+### The ICPSwap owner lock
+
+ICPSwap executions are serialized by a per-owner lock, because the workflow
+observes the trader's shared pool subaccount balances. The lock has no expiry. A
+leg that parked while holding it would therefore stall *every* later ICPSwap
+liquidation, silently, so `leg_status` maps ICPSwap's `OperatorRequired` onto a
+terminal leg status: the lock is released and later liquidations continue. The
+detailed ambiguous state is preserved inside `VenueExecutionState` so the
+abandoned leg can still be told apart from a decided failure.

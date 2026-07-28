@@ -179,15 +179,18 @@ async fn init(
     let profit_calc = Arc::new(SimpleProfitCalculator); //todo implement real profit calculator
 
     // FinalizeStage wires WAL + finalizer + profit calculation
-    let finalizer = Arc::new(FinalizeStage::new(
-        db.clone(),
-        multi_venue_finalizer,
-        profit_calc,
-        agent.clone(),
-        config.lending_canister,
-        config.cex_retry_base_secs,
-        config.cex_retry_max_secs,
-    ));
+    let finalizer = Arc::new(
+        FinalizeStage::new(
+            db.clone(),
+            multi_venue_finalizer,
+            profit_calc,
+            agent.clone(),
+            config.lending_canister,
+            config.cex_retry_base_secs,
+            config.cex_retry_max_secs,
+        )
+        .with_watchdog(slack_watchdog_from_env(DEFAULT_LOW_BALANCE_ALERT_COOLDOWN)),
+    );
 
     info!("Initializing searcher stage ...");
     let finder = OpportunityFinder::new(

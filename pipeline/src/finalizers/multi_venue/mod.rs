@@ -11,4 +11,4 @@ pub use multi_venue_adapter::*;
 pub use multi_venue_finalizer::*;
 
 #[cfg(test)]
-mod icpswap_first_planner_tests;
+mod tests;

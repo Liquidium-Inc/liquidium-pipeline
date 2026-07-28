@@ -21,7 +21,7 @@ use crate::{
         dex_finalizer::{DexRouteFinalizer, DexRoutePreview},
         finalizer::{Finalizer, FinalizerErrorKind},
         icpswap::finalizer::{ICPSWAP_FINALIZER_PERMANENT_PREFIX, IcpswapFinalizer},
-        multi_venue::MultiVenueAdapter,
+        multi_venue::{ICPSWAP_VENUE_ID, MultiVenueAdapter},
     },
     persistance::{
         FinalizerDecisionSnapshot, LiqMetaWrapper, LiqResultRecord, ResultStatus, VenueExecutionState, VenueLegQuote,
@@ -677,11 +677,12 @@ async fn multi_venue_preview_rejects_trader_with_a_non_default_subaccount() {
 }
 
 #[tokio::test]
-async fn multi_venue_operator_required_leg_maps_to_operator_required_status() {
+async fn multi_venue_operator_required_state_is_preserved_but_outer_leg_is_abandoned() {
     let route = native_plan();
     let request = native_request(&route);
     let mut state = IcpswapExecutionState::prepare("leg-execution-42", route, trader());
     state.step = IcpswapStep::OperatorRequired;
+    state.last_error = Some("withdrawal outcome is ambiguous".to_string());
     let leg = venue_leg(state, request);
 
     let progress = finalizer(MockIcpswapManualClient::new())
@@ -689,8 +690,15 @@ async fn multi_venue_operator_required_leg_maps_to_operator_required_status() {
         .await
         .expect("operator-required leg advances without any client call");
 
-    assert_eq!(progress.status, VenueLegStatus::OperatorRequired);
+    assert_eq!(progress.status, VenueLegStatus::FailedPermanent);
     assert!(progress.result.is_none());
+    assert_eq!(progress.last_error.as_deref(), Some("withdrawal outcome is ambiguous"));
+    let persisted = progress
+        .execution
+        .decode::<IcpswapExecutionState>(ICPSWAP_VENUE_ID)
+        .expect("decode persisted ICPSwap state")
+        .expect("ICPSwap state");
+    assert_eq!(persisted.step, IcpswapStep::OperatorRequired);
 }
 
 #[tokio::test]

@@ -92,6 +92,19 @@ pub async fn wal_mark_operator_required(wal: &dyn WalStore, liq_id: &str) -> Res
         .map_err(|e| e.to_string())
 }
 
+/// Parks a row for an operator while preserving the failure that caused it.
+/// Used when the retry budget runs out on a row whose venue leg may still hold
+/// funds, where the diagnostic matters as much as the status change.
+pub async fn wal_mark_operator_required_with_error(
+    wal: &dyn WalStore,
+    liq_id: &str,
+    last_error: String,
+) -> Result<(), String> {
+    wal.update_failure(liq_id, ResultStatus::OperatorRequired, last_error, false)
+        .await
+        .map_err(|e| e.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

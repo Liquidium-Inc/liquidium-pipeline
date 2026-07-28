@@ -115,7 +115,7 @@ fn finalizer_with_permanent_deposit_error() -> MexcFinalizer<MockCexBackend> {
     .with_token_registry(Arc::new(TokenRegistry::new(tokens)))
 }
 
-fn finalizer_with_ambiguous_deposit_error() -> MexcFinalizer<MockCexBackend> {
+fn finalizer_with_retryable_deposit_error() -> MexcFinalizer<MockCexBackend> {
     let mut backend = MockCexBackend::new();
     backend.expect_get_orderbook().returning(|_, _| {
         Ok(OrderBook {
@@ -130,7 +130,7 @@ fn finalizer_with_ambiguous_deposit_error() -> MexcFinalizer<MockCexBackend> {
     backend
         .expect_get_deposit_address()
         .times(1)
-        .returning(|_, _| Err("request timed out after submission".to_string()));
+        .returning(|_, _| Err("deposit address request timed out".to_string()));
     let tokens = HashMap::from([
         (pay_token().asset_id(), pay_token()),
         (receive_token().asset_id(), receive_token()),
@@ -326,6 +326,23 @@ async fn restart_with_an_outstanding_intent_requires_operator_instead_of_replayi
             .as_deref()
             .is_some_and(|error| error.contains("ambiguous submission state"))
     );
+
+    // Once an operator explicitly re-enqueues the parked row, recovery clears
+    // the stale process-local intent and persists a fresh gate before retrying.
+    leg.execution = progress.execution;
+    leg.status = progress.status;
+    let rearmed = MultiVenueAdapter::recover(&restarted, &leg)
+        .await
+        .expect("explicit recovery should re-arm after restart");
+    let execution = rearmed
+        .execution
+        .decode::<MexcVenueExecutionState>(VENUE_ID)
+        .expect("decode re-armed state")
+        .expect("MEXC state");
+    assert_eq!(rearmed.status, VenueLegStatus::Running);
+    assert!(!execution.operator_required);
+    assert!(execution.ready_to_advance);
+    assert!(execution.intent_id.is_some());
 }
 
 #[tokio::test]
@@ -439,8 +456,8 @@ async fn permanent_cex_error_marks_only_the_mexc_leg_failed() {
 }
 
 #[tokio::test]
-async fn ambiguous_cex_error_is_parked_and_never_replayed_automatically() {
-    let finalizer = finalizer_with_ambiguous_deposit_error();
+async fn ordinary_cex_error_remains_retryable_without_operator_intervention() {
+    let finalizer = finalizer_with_retryable_deposit_error();
     let preview = MultiVenueAdapter::preview(&finalizer, &request(100_000_000))
         .await
         .expect("preview should succeed");
@@ -450,15 +467,18 @@ async fn ambiguous_cex_error_is_parked_and_never_replayed_automatically() {
         .await
         .expect("first cycle should arm the leg");
     leg.execution = armed.execution;
-    let ambiguous = MultiVenueAdapter::advance(&finalizer, &leg)
+    let retryable = MultiVenueAdapter::advance(&finalizer, &leg)
         .await
-        .expect("ambiguous failure should become durable progress");
-    assert_eq!(ambiguous.status, VenueLegStatus::OperatorRequired);
-
-    leg.execution = ambiguous.execution;
-    leg.status = ambiguous.status;
-    let parked = MultiVenueAdapter::recover(&finalizer, &leg)
-        .await
-        .expect("parked leg should remain inspectable");
-    assert_eq!(parked.status, VenueLegStatus::OperatorRequired);
+        .expect("ordinary CEX failure should become durable retryable progress");
+    assert_eq!(retryable.status, VenueLegStatus::Running);
+    assert_eq!(retryable.retryable_error.as_deref(), Some("deposit address request timed out"));
+    let execution = retryable
+        .execution
+        .decode::<MexcVenueExecutionState>("mexc")
+        .expect("decode retryable state")
+        .expect("MEXC state");
+    assert!(!execution.operator_required);
+    assert!(!execution.ready_to_advance);
+    assert!(execution.intent_id.is_none());
+    assert_eq!(execution.cex.last_error, Some("deposit address request timed out".to_string()));
 }

@@ -137,11 +137,6 @@ where
             execution.cex.last_error = Some(error.clone());
             if error.starts_with(FINALIZER_PERMANENT_AMOUNT_FLOOR_PREFIX) {
                 execution.cex.step = CexStep::Failed;
-            } else {
-                return self.operator_required_progress(
-                    execution,
-                    format!("MEXC intent `{intent_id}` returned an ambiguous external outcome: {error}"),
-                );
             }
         }
         self.progress_for(execution, error)
@@ -226,9 +221,19 @@ where
     }
 
     async fn recover(&self, leg: &VenueLegState) -> Result<VenueLegProgress, String> {
-        let execution = self.decode_leg_state(leg)?;
+        let mut execution = self.decode_leg_state(leg)?;
         if execution.cex.step == CexStep::Completed {
             return Err("completed MEXC leg does not require recovery".to_string());
+        }
+        // OperatorRequired rows are excluded from automatic WAL polling. An
+        // explicit re-enqueue is therefore the operator's authorization to
+        // discard the old in-memory submission token and retry the persisted
+        // CEX step through a newly persisted intent. This call only arms that
+        // intent; the external action still happens in a later WAL cycle.
+        if execution.operator_required {
+            execution.operator_required = false;
+            execution.ready_to_advance = false;
+            execution.intent_id = None;
         }
         // The legacy CEX machine uses its Pending phases as durable restart
         // reconciliation points; unlike ICPSwap it has no separate Recover

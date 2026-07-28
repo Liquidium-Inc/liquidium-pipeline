@@ -101,7 +101,11 @@ fn leg_status(step: IcpswapStep) -> VenueLegStatus {
     match step {
         IcpswapStep::Completed => VenueLegStatus::Completed,
         IcpswapStep::Refunded => VenueLegStatus::Recovered,
-        IcpswapStep::OperatorRequired => VenueLegStatus::OperatorRequired,
+        // ICPSwap uses a shared trader account, so parking this outer leg would
+        // retain the venue-wide owner lock indefinitely. Preserve the detailed
+        // ambiguous state inside `VenueExecutionState`, but abandon this leg so
+        // the orchestrator can release the lock and later liquidations continue.
+        IcpswapStep::OperatorRequired => VenueLegStatus::FailedPermanent,
         IcpswapStep::Failed => VenueLegStatus::FailedPermanent,
         _ => VenueLegStatus::Running,
     }

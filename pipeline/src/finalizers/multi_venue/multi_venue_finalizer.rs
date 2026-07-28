@@ -22,6 +22,7 @@ use super::{
 
 const MULTI_VENUE_PERMANENT_PREFIX: &str = "permanent multi-venue finalizer: ";
 const MULTI_VENUE_LOCK_CLEANUP_PREFIX: &str = "multi-venue lock cleanup: ";
+const MULTI_VENUE_CUSTODY_PREFIX: &str = "multi-venue venue custody: ";
 
 /// WAL orchestrator for a committed generic multi-venue execution plan.
 ///
@@ -66,6 +67,21 @@ impl MultiVenueFinalizer {
                 pending_step: "lock_cleanup".to_string(),
                 owner: lock.owner_key.clone(),
                 details: detail.to_string(),
+            })
+            .await;
+    }
+
+    async fn notify_operator_required_leg(&self, leg: &VenueLegState) {
+        self.watchdog
+            .notify(WatchdogEvent::OperatorRequired {
+                execution_id: leg.leg_id.clone(),
+                venue: leg.venue_id.clone(),
+                pending_step: "venue_reconciliation".to_string(),
+                owner: leg.venue_id.clone(),
+                details: leg
+                    .last_error
+                    .clone()
+                    .unwrap_or_else(|| "venue leg requires operator reconciliation".to_string()),
             })
             .await;
     }
@@ -232,6 +248,14 @@ impl MultiVenueFinalizer {
             state.outcome = derive_outcome(&state.legs);
             self.persist_state(wal, row, wrapper, state).await?;
 
+            // Alert only when entering the parked state. A direct retry of the
+            // same committed row must not emit a duplicate notification.
+            if current.status != VenueLegStatus::OperatorRequired
+                && state.legs[index].status == VenueLegStatus::OperatorRequired
+            {
+                self.notify_operator_required_leg(&state.legs[index]).await;
+            }
+
             if matches!(
                 state.legs[index].status,
                 VenueLegStatus::Completed | VenueLegStatus::Recovered | VenueLegStatus::FailedPermanent
@@ -327,7 +351,9 @@ impl MultiVenueFinalizer {
         receipt: ExecutionReceipt,
     ) -> Result<FinalizerResult, String> {
         let (mut row, mut wrapper, mut state) = self.load_or_commit_plan(wal, &receipt).await?;
-        self.advance_legs(wal, &mut row, &mut wrapper, &mut state).await?;
+        if let Err(error) = self.advance_legs(wal, &mut row, &mut wrapper, &mut state).await {
+            return Err(tag_custody_error(&state, error));
+        }
         self.result_for_state(&state)
     }
 }
@@ -462,9 +488,42 @@ impl Finalizer for MultiVenueFinalizer {
             FinalizerErrorKind::Permanent
         } else if error.starts_with(MULTI_VENUE_LOCK_CLEANUP_PREFIX) {
             FinalizerErrorKind::LockCleanup
+        } else if error.starts_with(MULTI_VENUE_CUSTODY_PREFIX) {
+            FinalizerErrorKind::VenueCustody
         } else {
             FinalizerErrorKind::Retryable
         }
+    }
+}
+
+/// Marks a retryable failure raised while a leg has already begun executing.
+///
+/// A leg that is past `Planned` may have moved funds to a pool subaccount or an
+/// exchange. Failing such a row permanently once the retry budget runs out
+/// removes it from the runnable queue forever, so the custody would never be
+/// reconciled by anything. Tagging it routes budget exhaustion to an operator
+/// park instead, which stays visible and can be requeued.
+///
+/// Errors that already carry a classification keep it: a permanent decision and
+/// a lock-cleanup retry are both more specific than "a leg is running".
+fn tag_custody_error(state: &MultiVenueExecutionState, error: String) -> String {
+    if error.starts_with(MULTI_VENUE_PERMANENT_PREFIX)
+        || error.starts_with(MULTI_VENUE_LOCK_CLEANUP_PREFIX)
+        || error.starts_with(MULTI_VENUE_CUSTODY_PREFIX)
+    {
+        return error;
+    }
+
+    let holds_custody = state.legs.iter().any(|leg| {
+        matches!(
+            leg.status,
+            VenueLegStatus::Running | VenueLegStatus::OperatorRequired
+        )
+    });
+    if holds_custody {
+        format!("{MULTI_VENUE_CUSTODY_PREFIX}{error}")
+    } else {
+        error
     }
 }
 
@@ -562,7 +621,3 @@ fn decision_snapshot(state: &MultiVenueExecutionState) -> FinalizerDecisionSnaps
         }),
     }
 }
-
-#[cfg(test)]
-#[path = "multi_venue_finalizer_tests.rs"]
-mod tests;

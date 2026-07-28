@@ -17,8 +17,9 @@ use crate::stages::executor::{ExecutionReceipt, ExecutionStatus};
 use crate::utils::now_ts;
 use crate::wal::{
     decode_receipt_wrapper, encode_meta, wal_mark_enqueued, wal_mark_inflight, wal_mark_operator_required,
-    wal_mark_permanent_failed, wal_mark_retryable_failed, wal_mark_succeeded,
+    wal_mark_operator_required_with_error, wal_mark_permanent_failed, wal_mark_retryable_failed, wal_mark_succeeded,
 };
+use crate::watchdog::{Watchdog, WatchdogEvent, noop_watchdog};
 use liquidium_pipeline_connectors::pipeline_agent::PipelineAgent;
 use liquidium_pipeline_core::types::protocol_types::{LiquidationResult, ProtocolError, TransferStatus};
 
@@ -60,6 +61,9 @@ where
     pub cex_retry_base_secs: u64,
     /// Maximum retry delay cap for retryable finalizer failures, in seconds.
     pub cex_retry_max_secs: u64,
+    /// Escalation channel for rows this stage removes from the runnable queue
+    /// while a venue may still hold their funds.
+    pub watchdog: Arc<dyn Watchdog>,
 }
 
 impl<F, D, P, A> FinalizeStage<F, D, P, A>
@@ -86,7 +90,13 @@ where
             lending_canister,
             cex_retry_base_secs,
             cex_retry_max_secs,
+            watchdog: noop_watchdog(),
         }
+    }
+
+    pub fn with_watchdog(mut self, watchdog: Arc<dyn Watchdog>) -> Self {
+        self.watchdog = watchdog;
+        self
     }
 
     async fn refresh_liquidation(&self, liq_id: u128) -> Result<LiquidationResult, String> {
@@ -118,6 +128,26 @@ where
             self.wal.upsert_result(row).await.map_err(|e| e.to_string())?;
         }
         Ok(())
+    }
+
+    /// Escalates a liquidation parked because its retry budget ran out while a
+    /// venue leg may still hold the funds.
+    ///
+    /// The venue itself is not known here -- this stage is generic over the
+    /// finalizer -- but the tagged error carries the venue and leg, so it goes
+    /// in `details` while `venue` names the component that made the decision.
+    async fn escalate_custody_park(&self, receipt: &ExecutionReceipt, liq_id: u128, error: &str) {
+        self.watchdog
+            .notify(WatchdogEvent::OperatorRequired {
+                execution_id: liq_id.to_string(),
+                venue: "finalizer".to_string(),
+                pending_step: "retry_budget_exhausted".to_string(),
+                owner: receipt.request.liquidation.borrower.to_text(),
+                details: format!(
+                    "Liquidation {liq_id} was parked after {MAX_FINALIZER_ERRORS} failed finalize attempts while a venue leg may still hold its funds. It will not be retried automatically. Last error: {error}"
+                ),
+            })
+            .await;
     }
 
     async fn persist_profit_snapshot(
@@ -401,6 +431,31 @@ where
                         // venue effects. Keep retrying under capped backoff;
                         // watchdog notifications provide operator escalation.
                         let _ = wal_mark_retryable_failed(&*self.wal, wal_id, err_msg.clone()).await;
+                    } else if error_kind == FinalizerErrorKind::VenueCustody
+                        && next_errors >= MAX_FINALIZER_ERRORS
+                    {
+                        // The retry budget is spent, but a venue leg may still
+                        // hold this liquidation's funds. Failing permanently
+                        // would drop the row out of the runnable queue and
+                        // leave that custody with nothing tracking it, so park
+                        // it for an operator instead. Parking is terminal until
+                        // someone requeues the row, which is deliberate: the
+                        // venue side has to be understood before a retry.
+                        if let Err(error) =
+                            wal_mark_operator_required_with_error(&*self.wal, wal_id, err_msg.clone()).await
+                        {
+                            warn!("Failed to park custody-holding WAL row {}: {}", wal_id, error);
+                        } else {
+                            error!(
+                                "[finalize] 🅿️ retry budget exhausted while a venue leg holds funds; parked for operator liq_id={} err={}",
+                                liq_id, err_msg
+                            );
+                            // A parked row produces no finalized outcome, so it
+                            // reaches neither the CSV export nor the
+                            // liquidation-finalized notification. Without this
+                            // the only trace of stranded custody is a log line.
+                            self.escalate_custody_park(&receipt, liq_id, &err_msg).await;
+                        }
                     } else if matches!(
                         error_kind,
                         FinalizerErrorKind::Permanent | FinalizerErrorKind::BadDebtAmountFloor
@@ -502,6 +557,34 @@ mod tests {
     };
     use mockall::predicate::eq;
     use std::sync::{Arc, Mutex};
+
+    /// Captures operator escalations as `(execution_id, pending_step, details)`.
+    #[derive(Default)]
+    struct RecordingWatchdog(Mutex<Vec<(String, String, String)>>);
+
+    impl RecordingWatchdog {
+        fn operator_alerts(&self) -> Vec<(String, String, String)> {
+            self.0.lock().expect("watchdog lock").clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Watchdog for RecordingWatchdog {
+        async fn notify(&self, event: WatchdogEvent<'_>) {
+            if let WatchdogEvent::OperatorRequired {
+                execution_id,
+                pending_step,
+                details,
+                ..
+            } = event
+            {
+                self.0
+                    .lock()
+                    .expect("watchdog lock")
+                    .push((execution_id, pending_step, details));
+            }
+        }
+    }
 
     #[derive(Clone)]
     struct NoopFinalizer {
@@ -797,6 +880,110 @@ mod tests {
 
         let outcomes = stage.process(&()).await.expect("cleanup failure should remain retryable");
         assert!(outcomes.is_empty());
+    }
+
+    /// A permanently failed row leaves the runnable queue for good. When the
+    /// budget runs out on a row whose venue leg may still hold the funds, that
+    /// would strand the custody with nothing tracking it, so the row must be
+    /// parked for an operator instead -- and, because a parked row produces no
+    /// finalized outcome, the park has to raise its own alert.
+    #[tokio::test]
+    async fn exhausted_retries_park_a_custody_holding_row_and_escalate_it() {
+        let liq_id = 923u128;
+        let mut row = make_row(liq_id, make_swapping_receipt(liq_id));
+        row.error_count = MAX_FINALIZER_ERRORS - 1;
+        let row_id = row.id.clone();
+        let row_id_for_park = row_id.clone();
+
+        let mut wal = MockWalStore::new();
+        wal.expect_get_pending()
+            .with(eq(100usize))
+            .times(1)
+            .return_once(move |_| Ok(vec![row]));
+        wal.expect_update_status()
+            .withf(move |id, status, bump| id == row_id && *status == ResultStatus::InFlight && *bump)
+            .times(1)
+            .returning(|_, _, _| Ok(()));
+        wal.expect_update_failure()
+            .withf(move |id, status, error, _| {
+                id == row_id_for_park
+                    && *status == ResultStatus::OperatorRequired
+                    && error.contains("venue still holds the input")
+            })
+            .times(1)
+            .returning(|_, _, _, _| Ok(()));
+
+        let watchdog = Arc::new(RecordingWatchdog::default());
+        let stage = FinalizeStage::new(
+            Arc::new(wal),
+            Arc::new(ErrorFinalizer {
+                error: "venue still holds the input".to_string(),
+                kind: FinalizerErrorKind::VenueCustody,
+            }),
+            Arc::new(SimpleProfitCalculator),
+            Arc::new(MockPipelineAgent::new()),
+            Principal::anonymous(),
+            5,
+            120,
+        )
+        .with_watchdog(watchdog.clone());
+
+        let outcomes = stage.process(&()).await.expect("custody row should park cleanly");
+        assert!(outcomes.is_empty());
+
+        let alerts = watchdog.operator_alerts();
+        assert_eq!(alerts.len(), 1, "a parked custody row must raise exactly one alert");
+        let (execution_id, pending_step, details) = &alerts[0];
+        assert_eq!(execution_id, &liq_id.to_string());
+        assert_eq!(pending_step, "retry_budget_exhausted");
+        assert!(details.contains("venue still holds the input"));
+        assert!(details.contains("will not be retried automatically"));
+    }
+
+    /// Below the limit the same error is an ordinary retry: parking early would
+    /// bury a row that a transient venue outage would have resolved by itself,
+    /// and alerting on it would train operators to ignore the alert.
+    #[tokio::test]
+    async fn custody_error_below_the_limit_stays_retryable_and_silent() {
+        let liq_id = 924u128;
+        let row = make_row(liq_id, make_swapping_receipt(liq_id));
+        let row_id = row.id.clone();
+        let row_id_for_retry = row_id.clone();
+
+        let mut wal = MockWalStore::new();
+        wal.expect_get_pending()
+            .with(eq(100usize))
+            .times(1)
+            .return_once(move |_| Ok(vec![row]));
+        wal.expect_update_status()
+            .withf(move |id, status, bump| id == row_id && *status == ResultStatus::InFlight && *bump)
+            .times(1)
+            .returning(|_, _, _| Ok(()));
+        wal.expect_update_failure()
+            .withf(move |id, status, _, bump| {
+                id == row_id_for_retry && *status == ResultStatus::FailedRetryable && *bump
+            })
+            .times(1)
+            .returning(|_, _, _, _| Ok(()));
+
+        let watchdog = Arc::new(RecordingWatchdog::default());
+        let stage = FinalizeStage::new(
+            Arc::new(wal),
+            Arc::new(ErrorFinalizer {
+                error: "venue still holds the input".to_string(),
+                kind: FinalizerErrorKind::VenueCustody,
+            }),
+            Arc::new(SimpleProfitCalculator),
+            Arc::new(MockPipelineAgent::new()),
+            Principal::anonymous(),
+            5,
+            120,
+        )
+        .with_watchdog(watchdog.clone());
+
+        let outcomes = stage.process(&()).await.expect("custody row should retry");
+        assert!(outcomes.is_empty());
+        assert!(watchdog.operator_alerts().is_empty());
     }
 
     #[test]
