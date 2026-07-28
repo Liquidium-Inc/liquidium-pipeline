@@ -445,6 +445,7 @@ where
                             wal_mark_operator_required_with_error(&*self.wal, wal_id, err_msg.clone()).await
                         {
                             warn!("Failed to park custody-holding WAL row {}: {}", wal_id, error);
+                            self.escalate_custody_park(&receipt, liq_id, &err_msg).await;
                         } else {
                             error!(
                                 "[finalize] 🅿️ retry budget exhausted while a venue leg holds funds; parked for operator liq_id={} err={}",
@@ -938,6 +939,58 @@ mod tests {
         assert_eq!(pending_step, "retry_budget_exhausted");
         assert!(details.contains("venue still holds the input"));
         assert!(details.contains("will not be retried automatically"));
+    }
+
+    #[tokio::test]
+    async fn exhausted_custody_retries_escalate_when_the_park_write_fails() {
+        let liq_id = 925u128;
+        let mut row = make_row(liq_id, make_swapping_receipt(liq_id));
+        row.error_count = MAX_FINALIZER_ERRORS - 1;
+        let row_id = row.id.clone();
+        let row_id_for_park = row_id.clone();
+
+        let mut wal = MockWalStore::new();
+        wal.expect_get_pending()
+            .with(eq(100usize))
+            .times(1)
+            .return_once(move |_| Ok(vec![row]));
+        wal.expect_update_status()
+            .withf(move |id, status, bump| id == row_id && *status == ResultStatus::InFlight && *bump)
+            .times(1)
+            .returning(|_, _, _| Ok(()));
+        wal.expect_update_failure()
+            .withf(move |id, status, error, _| {
+                id == row_id_for_park
+                    && *status == ResultStatus::OperatorRequired
+                    && error.contains("venue still holds the input")
+            })
+            .times(1)
+            .returning(|_, _, _, _| Err(anyhow::anyhow!("WAL unavailable")));
+
+        let watchdog = Arc::new(RecordingWatchdog::default());
+        let stage = FinalizeStage::new(
+            Arc::new(wal),
+            Arc::new(ErrorFinalizer {
+                error: "venue still holds the input".to_string(),
+                kind: FinalizerErrorKind::VenueCustody,
+            }),
+            Arc::new(SimpleProfitCalculator),
+            Arc::new(MockPipelineAgent::new()),
+            Principal::anonymous(),
+            5,
+            120,
+        )
+        .with_watchdog(watchdog.clone());
+
+        let outcomes = stage.process(&()).await.expect("failed park write should not suppress processing");
+        assert!(outcomes.is_empty());
+
+        let alerts = watchdog.operator_alerts();
+        assert_eq!(alerts.len(), 1, "a failed park write must still alert an operator");
+        let (execution_id, pending_step, details) = &alerts[0];
+        assert_eq!(execution_id, &liq_id.to_string());
+        assert_eq!(pending_step, "retry_budget_exhausted");
+        assert!(details.contains("venue still holds the input"));
     }
 
     /// Below the limit the same error is an ordinary retry: parking early would
