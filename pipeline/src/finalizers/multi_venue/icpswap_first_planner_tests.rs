@@ -478,7 +478,7 @@ async fn exact_price_impact_limit_is_excluded() {
 }
 
 #[tokio::test]
-async fn sub_minimum_mexc_remainder_uses_full_icpswap_as_dust_exception() {
+async fn sub_minimum_mexc_remainder_uses_full_mexc_when_full_icpswap_is_unsafe() {
     let icpswap = mock_adapter(ICPSWAP_VENUE_ID, Arc::new(Mutex::new(Vec::new())), |request| {
         let pay = request.pay_amount.value.0.to_u64().expect("u64 pay");
         let impact = pay as f64 / 900_000.0;
@@ -491,25 +491,24 @@ async fn sub_minimum_mexc_remainder_uses_full_icpswap_as_dust_exception() {
     let state = planner(icpswap, mexc, config(1.1))
         .plan(&input_with_pay_token(native_icp()), 123)
         .await
-        .expect("dust exception plan");
+        .expect("safe full-venue fallback");
 
     assert_eq!(state.legs.len(), 1);
-    assert_eq!(state.legs[0].venue_id, ICPSWAP_VENUE_ID);
-    assert!(state.legs[0].quote.estimated_price_impact_bps >= 100.0);
+    assert_eq!(state.legs[0].venue_id, MEXC_VENUE_ID);
+    assert_eq!(state.legs[0].request.pay_amount.value, Nat::from(TOTAL_PAY));
     assert_eq!(
         state.plan.allocation_reason,
         MultiVenueAllocationReason::RemainderBelowMinimum {
-            skipped_venue_ids: vec![MEXC_VENUE_ID.to_string()],
-            selected_venue_id: ICPSWAP_VENUE_ID.to_string(),
+            skipped_venue_ids: vec![ICPSWAP_VENUE_ID.to_string()],
+            selected_venue_id: MEXC_VENUE_ID.to_string(),
         }
     );
 }
 
 #[tokio::test]
 async fn missing_reference_price_splits_instead_of_forcing_full_icpswap() {
-    // Same shape as the dust-exception test, but with no usable reference price.
-    // A price of zero would make the remainder look sub-minimum and send the
-    // whole amount to ICPSwap at an impact the full quote already failed.
+    // With no usable reference price, the planner cannot classify the CEX
+    // remainder as below-minimum, so it keeps the confirmed-safe split.
     let icpswap = mock_adapter(ICPSWAP_VENUE_ID, Arc::new(Mutex::new(Vec::new())), |request| {
         let pay = request.pay_amount.value.0.to_u64().expect("u64 pay");
         let impact = pay as f64 / 900_000.0;
@@ -526,7 +525,7 @@ async fn missing_reference_price_splits_instead_of_forcing_full_icpswap() {
     assert_eq!(state.plan.allocation_reason, MultiVenueAllocationReason::PriceImpactSplit);
     assert_eq!(state.legs.len(), 2);
     assert!(state.legs.iter().any(|leg| leg.venue_id == MEXC_VENUE_ID));
-    // The ICPSwap leg stays inside the impact limit, unlike the dust exception.
+    // The ICPSwap leg stays inside the impact limit.
     let icpswap_leg = state
         .legs
         .iter()
@@ -604,17 +603,22 @@ fn present_but_non_positive_reference_price_is_rejected() {
 }
 
 #[tokio::test]
-async fn dust_exception_requotes_icpswap_after_binary_search_instead_of_reusing_stale_preview() {
+async fn below_minimum_requote_uses_full_icpswap_only_when_the_fresh_quote_is_safe() {
     let call_count = Arc::new(Mutex::new(0u32));
     let icpswap_call_count = call_count.clone();
     let icpswap = mock_adapter(ICPSWAP_VENUE_ID, Arc::new(Mutex::new(Vec::new())), move |request| {
         let pay = request.pay_amount.value.0.to_u64().expect("u64 pay");
-        let impact = pay as f64 / 900_000.0;
         let mut count = icpswap_call_count.lock().expect("count lock");
         *count += 1;
         // Only the re-quote for the full amount taken *after* the binary search
         // (the second call at pay == TOTAL_PAY) reflects the fresher price.
-        let receive = if pay == TOTAL_PAY && *count > 1 {
+        let refreshed_full_quote = pay == TOTAL_PAY && *count > 1;
+        let impact = if refreshed_full_quote {
+            50.0
+        } else {
+            pay as f64 / 900_000.0
+        };
+        let receive = if refreshed_full_quote {
             pay * 3
         } else {
             pay * 2
@@ -628,7 +632,7 @@ async fn dust_exception_requotes_icpswap_after_binary_search_instead_of_reusing_
     let state = planner(icpswap, mexc, config(1.1))
         .plan(&input_with_pay_token(native_icp()), 123)
         .await
-        .expect("dust exception plan");
+        .expect("fresh safe full ICPSwap plan");
 
     assert_eq!(state.legs.len(), 1);
     assert_eq!(state.legs[0].venue_id, ICPSWAP_VENUE_ID);
@@ -713,7 +717,7 @@ async fn malformed_final_split_icpswap_quote_falls_back_to_fresh_full_overflow_q
 }
 
 #[tokio::test]
-async fn dust_reason_records_every_skipped_overflow_venue() {
+async fn below_minimum_overflow_fallback_records_every_skipped_venue() {
     let icpswap = mock_adapter(ICPSWAP_VENUE_ID, Arc::new(Mutex::new(Vec::new())), |request| {
         let pay = request.pay_amount.value.0.to_u64().expect("u64 pay");
         Ok(proportional_preview(
@@ -739,13 +743,13 @@ async fn dust_reason_records_every_skipped_overflow_venue() {
     let state = planner
         .plan(&input_with_pay_token(native_icp()), 123)
         .await
-        .expect("dust exception plan");
+        .expect("full overflow fallback");
 
     assert_eq!(
         state.plan.allocation_reason,
         MultiVenueAllocationReason::RemainderBelowMinimum {
-            skipped_venue_ids: vec![MEXC_VENUE_ID.to_string(), KRAKEN_VENUE_ID.to_string()],
-            selected_venue_id: ICPSWAP_VENUE_ID.to_string(),
+            skipped_venue_ids: vec![ICPSWAP_VENUE_ID.to_string(), KRAKEN_VENUE_ID.to_string()],
+            selected_venue_id: MEXC_VENUE_ID.to_string(),
         }
     );
 }
@@ -779,10 +783,18 @@ async fn safe_value_zero_quotes_mexc_once_after_binary_search() {
 }
 
 #[tokio::test]
-async fn dust_exception_still_requires_the_profit_floor() {
-    let icpswap = mock_adapter(ICPSWAP_VENUE_ID, Arc::new(Mutex::new(Vec::new())), |request| {
+async fn safe_full_icpswap_below_minimum_still_requires_the_profit_floor() {
+    let call_count = Arc::new(Mutex::new(0u32));
+    let icpswap_call_count = call_count.clone();
+    let icpswap = mock_adapter(ICPSWAP_VENUE_ID, Arc::new(Mutex::new(Vec::new())), move |request| {
         let pay = request.pay_amount.value.0.to_u64().expect("u64 pay");
-        let impact = pay as f64 / 900_000.0;
+        let mut count = icpswap_call_count.lock().expect("count lock");
+        *count += 1;
+        let impact = if pay == TOTAL_PAY && *count > 1 {
+            50.0
+        } else {
+            pay as f64 / 900_000.0
+        };
         Ok(preview(request, ICPSWAP_VENUE_ID, impact, 180_000_000, 180_000_000))
     });
     let mexc = mock_adapter(MEXC_VENUE_ID, Arc::new(Mutex::new(Vec::new())), |request| {
@@ -792,7 +804,7 @@ async fn dust_exception_still_requires_the_profit_floor() {
     let error = planner(icpswap, mexc, config(1.1))
         .plan(&input_with_pay_token(native_icp()), 123)
         .await
-        .expect_err("unprofitable dust exception must fail");
+        .expect_err("unprofitable full ICPSwap route must fail");
 
     assert!(error.to_string().contains("below required 150 bps"));
 }
@@ -901,7 +913,31 @@ async fn mexc_unavailable_allows_only_a_normally_safe_full_icpswap_quote() {
     let error = planner(icpswap, mexc, config(1.1))
         .plan(&input_with_pay_token(native_icp()), 123)
         .await
-        .expect_err("unsafe ICPSwap must not use dust exception when MEXC is unavailable");
+        .expect_err("unsafe ICPSwap must not be forced when MEXC is unavailable");
+    assert!(error.to_string().contains("MEXC unavailable"));
+}
+
+#[tokio::test]
+async fn below_minimum_remainder_rejects_when_full_icpswap_is_unsafe_and_overflow_is_unavailable() {
+    let icpswap = mock_adapter(ICPSWAP_VENUE_ID, Arc::new(Mutex::new(Vec::new())), |request| {
+        let pay = request.pay_amount.value.0.to_u64().expect("u64 pay");
+        Ok(proportional_preview(
+            request,
+            ICPSWAP_VENUE_ID,
+            pay as f64 / 900_000.0,
+            2,
+        ))
+    });
+    let mexc = mock_adapter(MEXC_VENUE_ID, Arc::new(Mutex::new(Vec::new())), |_request| {
+        Err("exchange unavailable".to_string())
+    });
+
+    let error = planner(icpswap, mexc, config(1.1))
+        .plan(&input_with_pay_token(native_icp()), 123)
+        .await
+        .expect_err("no unsafe full-ICPSwap fallback is allowed");
+
+    assert!(error.to_string().contains("full ICPSwap quote exceeds the price-impact limit"));
     assert!(error.to_string().contains("MEXC unavailable"));
 }
 

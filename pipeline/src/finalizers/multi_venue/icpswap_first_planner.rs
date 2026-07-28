@@ -363,7 +363,8 @@ impl IcpswapFirstPlanner {
     }
 
     // Finds the largest safe ICPSwap leg, then either sends the remainder to
-    // the best overflow venue or applies the below-minimum remainder rule.
+    // the best overflow venue or selects one safe full-amount venue when the
+    // remainder cannot meet the overflow minimum.
     async fn plan_split_or_fallback(
         &self,
         input: &IcpswapFirstPlanInput,
@@ -387,12 +388,38 @@ impl IcpswapFirstPlanner {
                         .await;
                 }
             };
+            if self.is_safe_icpswap(&icpswap) {
+                return self.build_state(
+                    input,
+                    vec![icpswap],
+                    MultiVenueAllocationReason::RemainderBelowMinimum {
+                        skipped_venue_ids: self.overflow_venue_ids.clone(),
+                        selected_venue_id: ICPSWAP_VENUE_ID.to_string(),
+                    },
+                    quoted_at,
+                );
+            }
+
+            let overflow_quotes = self.preview_overflow(input, input.total_pay.value.clone()).await?;
+            let overflow = self.best_executable_overflow(input, &overflow_quotes).ok_or_else(|| {
+                IcpswapFirstPlannerError::NoViableRoute(format!(
+                    "full ICPSwap quote exceeds the price-impact limit and the below-minimum remainder cannot be split; {}",
+                    self.overflow_failure_summary(&overflow_quotes)
+                ))
+            })?;
+            let mut skipped_venue_ids = vec![ICPSWAP_VENUE_ID.to_string()];
+            skipped_venue_ids.extend(
+                self.overflow_venue_ids
+                    .iter()
+                    .filter(|venue_id| venue_id.as_str() != overflow.venue_id.as_str())
+                    .cloned(),
+            );
             return self.build_state(
                 input,
-                vec![icpswap],
+                vec![overflow.clone()],
                 MultiVenueAllocationReason::RemainderBelowMinimum {
-                    skipped_venue_ids: self.overflow_venue_ids.clone(),
-                    selected_venue_id: ICPSWAP_VENUE_ID.to_string(),
+                    skipped_venue_ids,
+                    selected_venue_id: overflow.venue_id.clone(),
                 },
                 quoted_at,
             );

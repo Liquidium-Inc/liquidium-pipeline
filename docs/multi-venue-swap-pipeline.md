@@ -161,10 +161,21 @@ venue plan         on ICPSwap
                        yes               no
                        |                  |
                        v                  v
-               ICPSwap + overflow   Full ICPSwap
-                    split           dust exception
-                       \                 /
-                        +-------+--------+
+               ICPSwap + overflow   Re-quote full ICPSwap
+                    split             /          \
+                                  safe          unsafe
+                                   |              |
+                                   v              v
+                            Full ICPSwap    Quote full overflow
+                                                   |
+                                           executable venue?
+                                             /           \
+                                           yes            no
+                                            |              |
+                                            v              v
+                                    Full best overflow  Reject route
+                       \                    /
+                        +---------+--------+
                                 |
                                 v
                   Conservative edge >= 150 bps?
@@ -183,7 +194,7 @@ Important policy rules:
 4. If the full quote is unsafe, search for the largest confirmed-safe ICPSwap allocation.
 5. Binary search is bounded to 16 iterations and retains the last safe lower bound.
 6. Exact final allocations are quoted again before commitment.
-7. A remainder below `CEX_MIN_EXEC_USD` is sent entirely to ICPSwap; ICPSwap allocation is not reduced to manufacture a minimum CEX order.
+7. When the remainder is below `CEX_MIN_EXEC_USD`, use a refreshed full ICPSwap quote only if it remains below 100 bps; otherwise send the full amount to the best executable overflow venue or reject the route.
 8. A better MEXC price does not reduce the policy's ICPSwap allocation.
 9. The combined conservative output must satisfy the configured net-edge floor, currently 150 bps.
 10. Invalid venue previews are discarded; valid venues remain eligible.
