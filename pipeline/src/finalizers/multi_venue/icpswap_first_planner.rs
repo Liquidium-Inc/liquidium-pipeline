@@ -1,4 +1,4 @@
-use std::{cmp::max, collections::HashSet, sync::Arc};
+use std::{cmp::max, sync::Arc};
 
 use candid::{Nat, Principal};
 use liquidium_pipeline_core::tokens::{
@@ -35,7 +35,6 @@ pub struct IcpswapFirstPlannerConfig {
     pub max_search_iterations: u8,
     pub cex_min_exec_usd: f64,
     pub min_net_edge_bps: u32,
-    pub overflow_venue_ids: Vec<String>,
 }
 
 impl IcpswapFirstPlannerConfig {
@@ -61,29 +60,6 @@ impl IcpswapFirstPlannerConfig {
                 "minimum net edge {} bps exceeds {} bps",
                 self.min_net_edge_bps, BPS_DENOMINATOR
             )));
-        }
-        if self.overflow_venue_ids.is_empty() {
-            return Err(IcpswapFirstPlannerError::InvalidInput(
-                "at least one overflow venue is required".to_string(),
-            ));
-        }
-        let mut venue_ids = HashSet::new();
-        for venue_id in &self.overflow_venue_ids {
-            if venue_id.is_empty() {
-                return Err(IcpswapFirstPlannerError::InvalidInput(
-                    "overflow venue ID cannot be empty".to_string(),
-                ));
-            }
-            if venue_id == ICPSWAP_VENUE_ID {
-                return Err(IcpswapFirstPlannerError::InvalidInput(
-                    "ICPSwap cannot also be an overflow venue".to_string(),
-                ));
-            }
-            if !venue_ids.insert(venue_id) {
-                return Err(IcpswapFirstPlannerError::InvalidInput(format!(
-                    "duplicate overflow venue `{venue_id}`"
-                )));
-            }
         }
         Ok(())
     }
@@ -206,32 +182,38 @@ pub enum IcpswapFirstPlannerError {
 }
 
 pub struct IcpswapFirstPlanner {
-    venues: VenueRegistry,
+    venues: Arc<VenueRegistry>,
+    overflow_venue_ids: Vec<String>,
     config: IcpswapFirstPlannerConfig,
 }
 
 impl IcpswapFirstPlanner {
     /// Builds a planner from an ordered adapter list and verifies that every
     /// venue required by the strategy is registered exactly once.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn new(
         adapters: Vec<Arc<dyn MultiVenueAdapter>>,
         config: IcpswapFirstPlannerConfig,
     ) -> Result<Self, IcpswapFirstPlannerError> {
+        let venues = Arc::new(VenueRegistry::new(adapters).map_err(IcpswapFirstPlannerError::InvalidInput)?);
+        Self::from_registry(venues, config)
+    }
+
+    pub(super) fn from_registry(
+        venues: Arc<VenueRegistry>,
+        config: IcpswapFirstPlannerConfig,
+    ) -> Result<Self, IcpswapFirstPlannerError> {
         config.validate()?;
-        let venues = VenueRegistry::new(adapters).map_err(IcpswapFirstPlannerError::InvalidInput)?;
-        if !venues.contains(ICPSWAP_VENUE_ID) {
-            return Err(IcpswapFirstPlannerError::InvalidInput(
-                "ICPSwap adapter is not registered".to_string(),
-            ));
-        }
-        for venue_id in &config.overflow_venue_ids {
-            if !venues.contains(venue_id) {
-                return Err(IcpswapFirstPlannerError::InvalidInput(format!(
-                    "overflow venue adapter `{venue_id}` is not registered"
-                )));
-            }
-        }
-        Ok(Self { venues, config })
+        let overflow_venue_ids = venues
+            .venue_ids()
+            .into_iter()
+            .filter(|venue_id| venue_id != ICPSWAP_VENUE_ID)
+            .collect();
+        Ok(Self {
+            venues,
+            overflow_venue_ids,
+            config,
+        })
     }
 
     /// Quotes eligible venues and applies the ICPSwap-first allocation policy
@@ -243,7 +225,7 @@ impl IcpswapFirstPlanner {
     ) -> Result<MultiVenueExecutionState, IcpswapFirstPlannerError> {
         input.validate()?;
 
-        if !input.is_native_icp() {
+        if !input.is_native_icp() || !self.venues.contains(ICPSWAP_VENUE_ID) {
             return self.plan_overflow_only(input, quoted_at).await;
         }
 
@@ -271,6 +253,11 @@ impl IcpswapFirstPlanner {
                 },
                 quoted_at,
             ),
+            VenuePreviewOutcome::Quoted(_) if self.overflow_venue_ids.is_empty() => {
+                Err(IcpswapFirstPlannerError::NoViableRoute(
+                    "ICPSwap full quote exceeds the price-impact limit and no overflow venue is enabled".to_string(),
+                ))
+            }
             VenuePreviewOutcome::Quoted(_) => self.plan_split_or_fallback(input, quoted_at).await,
             VenuePreviewOutcome::Unavailable(icpswap_error) | VenuePreviewOutcome::Invalid(icpswap_error) => {
                 let overflow_quotes = self.preview_overflow(input, input.total_pay.value.clone()).await?;
@@ -300,48 +287,6 @@ impl IcpswapFirstPlanner {
         }
     }
 
-    /// Builds a forced single-venue plan while retaining the same amount,
-    /// quote validation, minimum-size, and conservative-edge checks used by
-    /// hybrid routing.
-    pub async fn plan_single_venue(
-        &self,
-        input: &IcpswapFirstPlanInput,
-        venue_id: &str,
-        quoted_at: i64,
-    ) -> Result<MultiVenueExecutionState, IcpswapFirstPlannerError> {
-        input.validate()?;
-        if venue_id == ICPSWAP_VENUE_ID && !input.is_native_icp() {
-            return Err(IcpswapFirstPlannerError::InvalidInput(
-                "forced ICPSwap routing only accepts native ICP collateral".to_string(),
-            ));
-        }
-        if self
-            .config
-            .overflow_venue_ids
-            .iter()
-            .any(|configured| configured == venue_id)
-            && !input.meets_cex_minimum(&input.total_pay, self.config.cex_min_exec_usd)
-        {
-            return Err(IcpswapFirstPlannerError::NoViableRoute(format!(
-                "forced venue `{venue_id}` amount is below its minimum execution size"
-            )));
-        }
-
-        let request = input.request_for(venue_id, input.total_pay.value.clone());
-        let preview = self.preview_exact(venue_id, &request).await?;
-        let mut state = self.build_state(
-            input,
-            vec![preview],
-            MultiVenueAllocationReason::SingleVenue {
-                venue_id: venue_id.to_string(),
-            },
-            quoted_at,
-        )?;
-        state.plan.strategy_id = format!("forced_{venue_id}");
-        state.validate().map_err(IcpswapFirstPlannerError::InvalidInput)?;
-        Ok(state)
-    }
-
     // Non-native ICP collateral cannot use ICPSwap, so choose the executable
     // overflow venue with the highest conservative output.
     async fn plan_overflow_only(
@@ -349,6 +294,11 @@ impl IcpswapFirstPlanner {
         input: &IcpswapFirstPlanInput,
         quoted_at: i64,
     ) -> Result<MultiVenueExecutionState, IcpswapFirstPlannerError> {
+        if self.overflow_venue_ids.is_empty() {
+            return Err(IcpswapFirstPlannerError::NoViableRoute(
+                "no enabled venue can accept this collateral asset".to_string(),
+            ));
+        }
         let quotes = self.preview_overflow(input, input.total_pay.value.clone()).await?;
         let preview = self
             .best_executable_overflow(input, &quotes)
@@ -419,7 +369,7 @@ impl IcpswapFirstPlanner {
                 input,
                 vec![icpswap],
                 MultiVenueAllocationReason::RemainderBelowMinimum {
-                    skipped_venue_ids: self.config.overflow_venue_ids.clone(),
+                    skipped_venue_ids: self.overflow_venue_ids.clone(),
                     selected_venue_id: ICPSWAP_VENUE_ID.to_string(),
                 },
                 quoted_at,
@@ -553,7 +503,7 @@ impl IcpswapFirstPlanner {
     ) -> Result<VenueQuoteBook, IcpswapFirstPlannerError> {
         let quotes = self
             .venues
-            .preview_venues(&self.config.overflow_venue_ids, |venue_id| {
+            .preview_venues(&self.overflow_venue_ids, |venue_id| {
                 input.request_for(venue_id, pay_value.clone())
             })
             .await
@@ -585,8 +535,7 @@ impl IcpswapFirstPlanner {
         input: &IcpswapFirstPlanInput,
         quotes: &'a VenueQuoteBook,
     ) -> Option<&'a VenueRoutePreview> {
-        self.config
-            .overflow_venue_ids
+        self.overflow_venue_ids
             .iter()
             .filter_map(|venue_id| quotes.get(venue_id))
             .filter_map(|venue| match &venue.outcome {
@@ -597,12 +546,21 @@ impl IcpswapFirstPlanner {
                 }
                 _ => None,
             })
-            .max_by(|left, right| left.conservative_receive.value.cmp(&right.conservative_receive.value))
+            // Replace the current selection only for a strictly better quote,
+            // so an exact tie keeps the first venue from environment order.
+            .fold(None, |best, candidate| match best {
+                Some(current)
+                    if current.conservative_receive.value >= candidate.conservative_receive.value =>
+                {
+                    Some(current)
+                }
+                _ => Some(candidate),
+            })
     }
 
     // Explains why none of the configured overflow venues can execute.
     fn overflow_failure_summary(&self, quotes: &VenueQuoteBook) -> String {
-        self.config
+        self
             .overflow_venue_ids
             .iter()
             .map(|venue_id| match quotes.get(venue_id).map(|venue| &venue.outcome) {

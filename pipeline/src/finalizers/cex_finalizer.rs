@@ -27,7 +27,7 @@ pub enum CexStep {
     Failed,
 }
 
-/// Route-level CEX feasibility and cost preview used by hybrid routing decisions.
+/// Route-level CEX feasibility and cost preview used by multi-venue planning.
 #[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CexRoutePreview {

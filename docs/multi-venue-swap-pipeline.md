@@ -1,8 +1,8 @@
 # Multi-Venue Swap Pipeline
 
-This document explains the extensible swap-finalization pipeline being introduced for hybrid liquidation execution.
+This document explains the production multi-venue swap-finalization pipeline.
 
-> **Deployment status:** the persisted model, venue contract, allocation planner, and ICPSwap adapter are implemented. The MEXC adapter is under review. The generic WAL orchestrator and aggregate-result wiring are not enabled yet, so production routing still follows the legacy finalizer path.
+Venue eligibility is configured with an ordered list, for example `ENABLED_SWAP_VENUES=icpswap,mexc`. There is no CEX/DEX/Hybrid routing mode.
 
 ## Goals
 
@@ -29,6 +29,9 @@ The pipeline is designed to:
 | Successful           |   +-------------------------------+
 | liquidation receipt  +-->| Allocation strategy           |
 +----------------------+   |              |                |
+                           |              v                |
+                           | ENABLED_SWAP_VENUES             |
+                           |              |                |
                            |              v                |
                            |       Venue registry           |
                            |        /     |      \          |
@@ -108,7 +111,7 @@ Allocation planner          Venue registry         Venue adapters
         |                          |                       |
         | validate quotes and allocate exact amounts       |
 
-The venue previews above run concurrently.
+Strategy-selected venue subsets run concurrently. The common safe-ICPSwap path quotes ICPSwap first and avoids unnecessary exchange calls.
 ```
 
 ### Unified quote semantics
@@ -184,6 +187,8 @@ Important policy rules:
 8. A better MEXC price does not reduce the policy's ICPSwap allocation.
 9. The combined conservative output must satisfy the configured net-edge floor, currently 150 bps.
 10. Invalid venue previews are discarded; valid venues remain eligible.
+11. With ICPSwap alone, a full quote at or above 100 bps is rejected rather than forced.
+12. Without ICPSwap, the best executable enabled overflow venue receives the full amount.
 
 The strategy is replaceable. A future best-price strategy can make different allocation decisions while reusing the same adapters, persisted state, and orchestrator.
 
@@ -260,7 +265,7 @@ The actual persisted legs also contain their complete request, quote, initialize
 
 ## WAL Commitment and Execution
 
-The orchestrator introduced in the next stage will own the parent lifecycle. Venue adapters return progress but never write the WAL or mark the liquidation successful.
+The orchestrator owns the parent lifecycle. Venue adapters return progress but never write the WAL or mark the liquidation successful.
 
 ```text
 Multi-venue orchestrator          SQLite WAL             Venue adapter
@@ -341,8 +346,8 @@ Adding Kraken should require the following work only:
 2. Convert exact `SwapRequest` amounts into Kraken's internal decimal representation.
 3. Return the normalized `SwapQuote` and initialized tagged `VenueExecutionState`.
 4. Keep Kraken order IDs, deposits, withdrawals, and recovery state inside its leg.
-5. Register the adapter in `VenueRegistry`.
-6. Add `"kraken"` to a strategy's configured overflow venues if desired.
+5. Add the adapter factory and supported venue ID to startup registration.
+6. Add `"kraken"` to `ENABLED_SWAP_VENUES` when it should receive new plans.
 7. Add adapter contract tests and restart-boundary tests.
 
 No change should be needed to:
@@ -375,14 +380,15 @@ No change should be needed to:
 | Generic venue contract and registry | Implemented |
 | Pure `icpswap_first` allocation planner | Implemented |
 | ICPSwap adapter | Implemented |
-| MEXC adapter | Under review |
-| Generic multi-venue WAL orchestrator | Pending |
-| Aggregate result and legacy hybrid removal | Pending |
-| Restart-boundary and full compatibility verification | Pending |
+| MEXC adapter | Implemented |
+| Generic multi-venue WAL orchestrator | Implemented |
+| Aggregate result and legacy router removal | Implemented |
+| Enabled-venue runtime selection | Implemented |
+| Restart-boundary and full compatibility verification | Implemented |
 
 ## Rollout and Rollback
 
 - No SQLite migration is required because `meta_v2` is stored inside existing JSON metadata.
 - Older binaries do not understand the operational meaning of active `meta_v2` rows and cannot safely continue them.
 - Before rolling back to a binary that does not understand `meta_v2`, drain or manually recover all active multi-venue rows.
-- Existing legacy MEXC `meta` and ICPSwap `venue_execution` rows must remain resumable throughout rollout.
+- Before disabling a venue, finish or recover every unfinished committed leg for it. Startup rejects a disabled venue referenced by an unfinished `meta_v2` row.

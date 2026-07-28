@@ -161,6 +161,24 @@ impl SqliteWalStore {
         Ok(rows.into_iter().map(Self::from_row).collect())
     }
 
+    /// Returns rows whose committed venue work may still require execution or
+    /// reconciliation. Startup uses this to prevent disabling an adapter that
+    /// an immutable multi-venue plan still references.
+    pub fn list_unfinished_execution_rows(&self) -> Result<Vec<LiqResultRecord>> {
+        let mut conn = self.get_conn()?;
+        let statuses = [
+            ResultStatus::Enqueued as i32,
+            ResultStatus::InFlight as i32,
+            ResultStatus::FailedRetryable as i32,
+            ResultStatus::OperatorRequired as i32,
+        ];
+        let rows = tbl::table
+            .filter(tbl::status.eq_any(statuses))
+            .order(tbl::created_at.asc())
+            .load::<Row>(&mut conn)?;
+        Ok(rows.into_iter().map(Self::from_row).collect())
+    }
+
     pub fn set_daemon_paused(&self, paused: bool) -> Result<()> {
         self.ensure_writable()?;
         let mut conn = self.get_conn()?;
@@ -693,5 +711,45 @@ mod tests {
             assert_eq!(parked[0].id, "parked");
             assert_eq!(parked[0].status, ResultStatus::OperatorRequired);
         });
+    }
+
+    #[test]
+    fn unfinished_execution_scan_includes_only_resumable_or_operator_rows() {
+        let temp = tempfile::NamedTempFile::new().expect("tmp db");
+        let path = temp.path().display().to_string();
+        let store = SqliteWalStore::new_with_busy_timeout(&path, 5_000).expect("store");
+        let now = now_secs();
+        let row = |id: &str, status| LiqResultRecord {
+            id: id.to_string(),
+            status,
+            attempt: 0,
+            error_count: 0,
+            last_error: None,
+            created_at: now,
+            updated_at: now,
+            meta_json: "{}".to_string(),
+        };
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        rt.block_on(async {
+            for (id, status) in [
+                ("enqueued", ResultStatus::Enqueued),
+                ("in-flight", ResultStatus::InFlight),
+                ("retryable", ResultStatus::FailedRetryable),
+                ("operator", ResultStatus::OperatorRequired),
+                ("waiting", ResultStatus::WaitingCollateral),
+                ("succeeded", ResultStatus::Succeeded),
+                ("permanent", ResultStatus::FailedPermanent),
+            ] {
+                store.upsert_result(row(id, status)).await.expect("seed row");
+            }
+        });
+
+        let ids = store
+            .list_unfinished_execution_rows()
+            .expect("unfinished rows")
+            .into_iter()
+            .map(|row| row.id)
+            .collect::<Vec<_>>();
+        assert_eq!(ids, vec!["enqueued", "in-flight", "retryable", "operator"]);
     }
 }

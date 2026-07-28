@@ -29,15 +29,8 @@ const MULTI_VENUE_LOCK_CLEANUP_PREFIX: &str = "multi-venue lock cleanup: ";
 /// amount-scoped adapter for exactly one persisted leg.
 pub struct MultiVenueFinalizer {
     planner: IcpswapFirstPlanner,
-    venues: VenueRegistry,
-    routing: MultiVenueRouting,
+    venues: Arc<VenueRegistry>,
     watchdog: Arc<dyn Watchdog>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum MultiVenueRouting {
-    IcpswapFirst,
-    ForcedVenue(String),
 }
 
 impl MultiVenueFinalizer {
@@ -45,12 +38,12 @@ impl MultiVenueFinalizer {
         adapters: Vec<Arc<dyn MultiVenueAdapter>>,
         planner_config: IcpswapFirstPlannerConfig,
     ) -> Result<Self, String> {
-        let venues = VenueRegistry::new(adapters.clone())?;
-        let planner = IcpswapFirstPlanner::new(adapters, planner_config).map_err(|error| error.to_string())?;
+        let venues = Arc::new(VenueRegistry::new(adapters)?);
+        let planner = IcpswapFirstPlanner::from_registry(venues.clone(), planner_config)
+            .map_err(|error| error.to_string())?;
         Ok(Self {
             planner,
             venues,
-            routing: MultiVenueRouting::IcpswapFirst,
             watchdog: noop_watchdog(),
         })
     }
@@ -75,16 +68,6 @@ impl MultiVenueFinalizer {
                 details: detail.to_string(),
             })
             .await;
-    }
-
-    pub fn with_routing(mut self, routing: MultiVenueRouting) -> Result<Self, String> {
-        if let MultiVenueRouting::ForcedVenue(venue_id) = &routing
-            && !self.venues.contains(venue_id)
-        {
-            return Err(format!("forced venue adapter `{venue_id}` is not registered"));
-        }
-        self.routing = routing;
-        Ok(self)
     }
 
     /// Loads a committed plan or creates and atomically persists a new plan
@@ -138,13 +121,7 @@ impl MultiVenueFinalizer {
         // This is the pure routing decision: quote the registered venues and
         // produce the immutable allocation plan plus initialized venue legs.
         // No swap, transfer, or order side effect is submitted by `plan`.
-        let state = match &self.routing {
-            MultiVenueRouting::IcpswapFirst => self.planner.plan(&input, now_ts()).await,
-            MultiVenueRouting::ForcedVenue(venue_id) => {
-                self.planner.plan_single_venue(&input, venue_id, now_ts()).await
-            }
-        }
-        .map_err(|error| match error {
+        let state = self.planner.plan(&input, now_ts()).await.map_err(|error| match error {
             super::IcpswapFirstPlannerError::InvalidInput(_) => {
                 format!("{MULTI_VENUE_PERMANENT_PREFIX}{error}")
             }
@@ -533,7 +510,7 @@ fn set_meta_v2(wrapper: &mut LiqMetaWrapper, state: &MultiVenueExecutionState) -
 
 fn decision_snapshot(state: &MultiVenueExecutionState) -> FinalizerDecisionSnapshot {
     FinalizerDecisionSnapshot {
-        mode: "hybrid".to_string(),
+        mode: "multi_venue".to_string(),
         chosen: "multi_venue".to_string(),
         reason: format!("{} allocation committed", state.plan.strategy_id),
         min_required_bps: f64::from(state.plan.min_net_edge_bps),

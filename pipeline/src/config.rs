@@ -6,8 +6,8 @@ use icrc_ledger_types::icrc1::account::Account;
 use liquidium_pipeline_commons::env::config_dir;
 use liquidium_pipeline_connectors::account::icp_account::{RECOVERY_ACCOUNT, derive_icp_identity};
 use liquidium_pipeline_connectors::crypto::derivation::{derive_btc_p2tr_address, derive_evm_private_key};
-use log::debug;
-use std::collections::HashMap;
+use log::{debug, warn};
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::sync::Arc;
 
@@ -18,19 +18,6 @@ fn expand_tilde(p: &str) -> std::path::PathBuf {
         return std::path::PathBuf::from(home).join(stripped);
     }
     std::path::PathBuf::from(p)
-}
-
-/// Runtime swapper mode used by strategy/finalization routing.
-///
-/// `Dex` and `Hybrid` are intentionally retained for backward compatibility with
-/// historical WAL/meta values and for potential future re-enablement.
-/// TODO(PIPE-154, target 2026-06): remove legacy variants once migration cleanup is complete.
-#[allow(dead_code)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SwapperMode {
-    Dex,
-    Cex,
-    Hybrid,
 }
 
 pub struct Config {
@@ -78,10 +65,6 @@ pub struct Config {
     pub cex_delay_buffer_bps: u32,
     /// Route fee estimate in bps subtracted from projected edge.
     pub cex_route_fee_bps: u32,
-    /// Reserved for hybrid mode force-over-threshold behavior.
-    /// Hybrid mode is currently disabled.
-    #[allow(dead_code)]
-    pub cex_force_over_usd_threshold: f64,
     /// Configured MEXC market universe for hop-based route discovery.
     /// Markets are normalized as `BASE_QUOTE`.
     pub cex_mexc_available_pairs: Vec<String>,
@@ -90,7 +73,8 @@ pub struct Config {
     pub cex_mexc_max_hops: u8,
     pub icpswap_factory_canister: Principal,
     pub icpswap_fee_tiers: Vec<candid::Nat>,
-    pub swapper: SwapperMode,
+    /// Ordered venue IDs eligible for new multi-venue plans.
+    pub enabled_swap_venues: Vec<String>,
     pub cex_credentials: HashMap<String, (String, String)>,
     pub opportunity_account_filter: Vec<Principal>,
 }
@@ -115,14 +99,13 @@ pub trait ConfigTrait: Send + Sync {
     fn get_cex_min_net_edge_bps(&self) -> u32;
     fn get_cex_delay_buffer_bps(&self) -> u32;
     fn get_cex_route_fee_bps(&self) -> u32;
-    fn get_cex_force_over_usd_threshold(&self) -> f64;
     fn get_cex_mexc_available_pairs(&self) -> Vec<String>;
     fn get_cex_mexc_max_hops(&self) -> u8;
     #[allow(dead_code)]
     fn get_lending_canister(&self) -> Principal;
     #[allow(dead_code)]
     fn get_recovery_account(&self) -> Account;
-    fn get_swapper_mode(&self) -> SwapperMode;
+    fn get_enabled_swap_venues(&self) -> Vec<String>;
     fn get_cex_credentials(&self, cex: &str) -> Result<(String, String), String>;
 }
 
@@ -206,10 +189,6 @@ impl ConfigTrait for Config {
         self.cex_route_fee_bps
     }
 
-    fn get_cex_force_over_usd_threshold(&self) -> f64 {
-        self.cex_force_over_usd_threshold
-    }
-
     fn get_cex_mexc_available_pairs(&self) -> Vec<String> {
         self.cex_mexc_available_pairs.clone()
     }
@@ -218,8 +197,8 @@ impl ConfigTrait for Config {
         self.cex_mexc_max_hops
     }
 
-    fn get_swapper_mode(&self) -> SwapperMode {
-        self.swapper
+    fn get_enabled_swap_venues(&self) -> Vec<String> {
+        self.enabled_swap_venues.clone()
     }
 
     fn get_cex_credentials(&self, cex: &str) -> Result<(String, String), String> {
@@ -331,7 +310,13 @@ impl Config {
         let icpswap_factory_canister = parse_icpswap_factory_from_env()?;
         let icpswap_fee_tiers = parse_icpswap_fee_tiers_from_env()?;
 
-        let swapper = parse_swapper_mode_from_env()?;
+        let enabled_swap_venues = parse_enabled_swap_venues_from_env()?;
+        if let Ok(legacy) = env::var("SWAPPER") {
+            warn!(
+                "SWAPPER={} is ignored; configure ENABLED_SWAP_VENUES instead",
+                legacy
+            );
+        }
 
         debug!("Loading cex credentials...");
         let cex_credentials = load_cex_credentials();
@@ -388,12 +373,11 @@ impl Config {
             cex_min_net_edge_bps: cex_tunables.min_net_edge_bps,
             cex_delay_buffer_bps: cex_tunables.delay_buffer_bps,
             cex_route_fee_bps: cex_tunables.route_fee_bps,
-            cex_force_over_usd_threshold: cex_tunables.force_over_usd_threshold,
             cex_mexc_available_pairs,
             cex_mexc_max_hops,
             icpswap_factory_canister,
             icpswap_fee_tiers,
-            swapper,
+            enabled_swap_venues,
             cex_credentials,
             opportunity_account_filter,
         }))
@@ -437,7 +421,6 @@ struct CexTunables {
     min_net_edge_bps: u32,
     delay_buffer_bps: u32,
     route_fee_bps: u32,
-    force_over_usd_threshold: f64,
 }
 
 const DEFAULT_CEX_MIN_EXEC_USD: f64 = 1.1;
@@ -453,7 +436,6 @@ const DEFAULT_CEX_RETRY_MAX_SECS: u64 = 120;
 const DEFAULT_CEX_MIN_NET_EDGE_BPS: u32 = 150;
 const DEFAULT_CEX_DELAY_BUFFER_BPS: u32 = 75;
 const DEFAULT_CEX_ROUTE_FEE_BPS: u32 = 25;
-const DEFAULT_CEX_FORCE_OVER_USD_THRESHOLD: f64 = 12.5;
 const DEFAULT_CEX_MEXC_MAX_HOPS: u8 = 2;
 const MAX_CEX_MEXC_MAX_HOPS: u8 = 4;
 const DEFAULT_BAD_DEBT_COLLATERAL_SLIPPAGE_BPS: u32 = 500;
@@ -468,6 +450,8 @@ const BRIDGE_BTC_INDEX: u32 = 0;
 const DEFAULT_BRIDGE_CKETH_MINTER_CANISTER: &str = "sv3dd-oaaaa-aaaar-qacoa-cai";
 pub const DEFAULT_ICPSWAP_FACTORY_CANISTER: &str = "4mmnk-kiaaa-aaaag-qbllq-cai";
 const DEFAULT_ICPSWAP_FEE_TIERS: &str = "100,500,3000,10000";
+const DEFAULT_ENABLED_SWAP_VENUES: &str = "icpswap,mexc";
+const SUPPORTED_SWAP_VENUES: [&str; 2] = ["icpswap", "mexc"];
 
 fn parse_bad_debt_collateral_slippage_bps_from_env() -> u32 {
     env::var("BAD_DEBT_COLLATERAL_SLIPPAGE_BPS")
@@ -516,18 +500,32 @@ fn parse_slippage_bps_from_env(primary: &str, default_bps: u32) -> Result<u32, S
     Ok(parsed)
 }
 
-fn parse_swapper_mode_from_env() -> Result<SwapperMode, String> {
-    let swapper_raw = env::var("SWAPPER").unwrap_or_else(|_| "cex".to_string());
-    match swapper_raw.trim().to_lowercase().as_str() {
-        "" => Ok(SwapperMode::Cex),
-        "cex" => Ok(SwapperMode::Cex),
-        "dex" => Ok(SwapperMode::Dex),
-        "hybrid" => Ok(SwapperMode::Hybrid),
-        other => Err(format!(
-            "SWAPPER='{}' is unsupported; expected one of cex, dex, hybrid",
-            other
-        )),
+fn parse_enabled_swap_venues_from_env() -> Result<Vec<String>, String> {
+    let raw = env::var("ENABLED_SWAP_VENUES").unwrap_or_else(|_| DEFAULT_ENABLED_SWAP_VENUES.to_string());
+    let mut seen = HashSet::new();
+    let mut venues = Vec::new();
+
+    for entry in raw.split(',') {
+        let venue_id = entry.trim().to_ascii_lowercase();
+        if venue_id.is_empty() {
+            return Err("ENABLED_SWAP_VENUES contains an empty venue ID".to_string());
+        }
+        if !SUPPORTED_SWAP_VENUES.contains(&venue_id.as_str()) {
+            return Err(format!(
+                "ENABLED_SWAP_VENUES contains unsupported venue `{venue_id}`; expected one of {}",
+                SUPPORTED_SWAP_VENUES.join(", ")
+            ));
+        }
+        if !seen.insert(venue_id.clone()) {
+            return Err(format!("ENABLED_SWAP_VENUES contains duplicate venue `{venue_id}`"));
+        }
+        venues.push(venue_id);
     }
+
+    if venues.is_empty() {
+        return Err("ENABLED_SWAP_VENUES must enable at least one venue".to_string());
+    }
+    Ok(venues)
 }
 
 pub(crate) fn parse_icpswap_factory_from_env() -> Result<Principal, String> {
@@ -676,12 +674,6 @@ fn parse_cex_tunables_from_env() -> CexTunables {
         .and_then(|v| v.parse::<u32>().ok())
         .unwrap_or(DEFAULT_CEX_ROUTE_FEE_BPS);
 
-    let force_over_usd_threshold = env::var("CEX_FORCE_OVER_USD_THRESHOLD")
-        .ok()
-        .and_then(|v| v.parse::<f64>().ok())
-        .filter(|v| *v >= MIN_RATIO)
-        .unwrap_or(DEFAULT_CEX_FORCE_OVER_USD_THRESHOLD);
-
     CexTunables {
         min_exec_usd,
         slice_target_ratio,
@@ -694,7 +686,6 @@ fn parse_cex_tunables_from_env() -> CexTunables {
         min_net_edge_bps,
         delay_buffer_bps,
         route_fee_bps,
-        force_over_usd_threshold,
     }
 }
 
@@ -721,7 +712,6 @@ mod tests {
             "CEX_MIN_NET_EDGE_BPS",
             "CEX_DELAY_BUFFER_BPS",
             "CEX_ROUTE_FEE_BPS",
-            "CEX_FORCE_OVER_USD_THRESHOLD",
             "CEX_MEXC_AVAILABLE_PAIRS",
             "CEX_MEXC_MAX_HOPS",
             "BAD_DEBT_COLLATERAL_SLIPPAGE_BPS",
@@ -745,7 +735,6 @@ mod tests {
                 min_net_edge_bps: 150,
                 delay_buffer_bps: 75,
                 route_fee_bps: 25,
-                force_over_usd_threshold: 12.5,
             }
         );
     }
@@ -765,7 +754,6 @@ mod tests {
             env::set_var("CEX_MIN_NET_EDGE_BPS", "160");
             env::set_var("CEX_DELAY_BUFFER_BPS", "90");
             env::set_var("CEX_ROUTE_FEE_BPS", "0");
-            env::set_var("CEX_FORCE_OVER_USD_THRESHOLD", "5.75");
             env::set_var("BAD_DEBT_COLLATERAL_SLIPPAGE_BPS", "350");
         }
 
@@ -784,7 +772,6 @@ mod tests {
                 min_net_edge_bps: 160,
                 delay_buffer_bps: 90,
                 route_fee_bps: 0,
-                force_over_usd_threshold: 5.75,
             }
         );
         assert_eq!(parse_bad_debt_collateral_slippage_bps_from_env(), 350);
@@ -802,7 +789,6 @@ mod tests {
             env::set_var("CEX_BUY_INVERSE_ENABLED", "not-a-bool");
             env::set_var("CEX_RETRY_BASE_SECS", "10");
             env::set_var("CEX_RETRY_MAX_SECS", "1");
-            env::set_var("CEX_FORCE_OVER_USD_THRESHOLD", "-1");
             env::set_var("BAD_DEBT_COLLATERAL_SLIPPAGE_BPS", "20000");
         }
 
@@ -815,7 +801,6 @@ mod tests {
         assert!(parsed.buy_inverse_enabled);
         assert_eq!(parsed.retry_base_secs, 10);
         assert_eq!(parsed.retry_max_secs, 120);
-        assert_eq!(parsed.force_over_usd_threshold, 12.5);
         assert_eq!(parse_bad_debt_collateral_slippage_bps_from_env(), 10_000);
     }
 
@@ -826,17 +811,6 @@ mod tests {
             env::remove_var("BAD_DEBT_COLLATERAL_SLIPPAGE_BPS");
         }
         assert_eq!(parse_bad_debt_collateral_slippage_bps_from_env(), 500);
-    }
-
-    #[test]
-    fn parse_cex_tunables_allows_zero_force_threshold_for_disable() {
-        let _guard = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
-        unsafe {
-            env::set_var("CEX_FORCE_OVER_USD_THRESHOLD", "0");
-        }
-
-        let parsed = parse_cex_tunables_from_env();
-        assert_eq!(parsed.force_over_usd_threshold, 0.0);
     }
 
     #[test]
@@ -923,37 +897,63 @@ mod tests {
     }
 
     #[test]
-    fn parse_swapper_mode_defaults_to_cex_when_unset() {
+    fn enabled_swap_venues_default_to_icpswap_then_mexc() {
         let _guard = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
         unsafe {
-            env::remove_var("SWAPPER");
+            env::remove_var("ENABLED_SWAP_VENUES");
         }
-        assert_eq!(parse_swapper_mode_from_env().unwrap(), SwapperMode::Cex);
+        assert_eq!(
+            parse_enabled_swap_venues_from_env().unwrap(),
+            vec!["icpswap".to_string(), "mexc".to_string()]
+        );
     }
 
     #[test]
-    fn parse_swapper_mode_rejects_unknown() {
+    fn enabled_swap_venues_normalize_and_preserve_order() {
         let _guard = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
         unsafe {
-            env::set_var("SWAPPER", "unknown-value");
+            env::set_var("ENABLED_SWAP_VENUES", " MEXC, IcPsWaP ");
         }
-        let err = parse_swapper_mode_from_env().expect_err("unknown swapper mode should be rejected");
-        assert!(err.contains("expected one of cex, dex, hybrid"));
+        assert_eq!(
+            parse_enabled_swap_venues_from_env().unwrap(),
+            vec!["mexc".to_string(), "icpswap".to_string()]
+        );
+        unsafe {
+            env::remove_var("ENABLED_SWAP_VENUES");
+        }
     }
 
     #[test]
-    fn parse_swapper_mode_accepts_dex_and_hybrid() {
+    fn enabled_swap_venues_reject_invalid_lists() {
+        let _guard = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        for (raw, expected) in [
+            ("", "empty venue ID"),
+            ("mexc,", "empty venue ID"),
+            ("mexc,MEXC", "duplicate venue"),
+            ("kraken", "unsupported venue"),
+        ] {
+            unsafe {
+                env::set_var("ENABLED_SWAP_VENUES", raw);
+            }
+            let error = parse_enabled_swap_venues_from_env().expect_err("invalid venue list must fail");
+            assert!(error.contains(expected), "unexpected error: {error}");
+        }
+        unsafe {
+            env::remove_var("ENABLED_SWAP_VENUES");
+        }
+    }
+
+    #[test]
+    fn legacy_swapper_does_not_affect_enabled_venues() {
         let _guard = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
         unsafe {
             env::set_var("SWAPPER", "dex");
+            env::set_var("ENABLED_SWAP_VENUES", "mexc");
         }
-        assert_eq!(parse_swapper_mode_from_env().unwrap(), SwapperMode::Dex);
-        unsafe {
-            env::set_var("SWAPPER", "  HYBRID  ");
-        }
-        assert_eq!(parse_swapper_mode_from_env().unwrap(), SwapperMode::Hybrid);
+        assert_eq!(parse_enabled_swap_venues_from_env().unwrap(), vec!["mexc"]);
         unsafe {
             env::remove_var("SWAPPER");
+            env::remove_var("ENABLED_SWAP_VENUES");
         }
     }
 

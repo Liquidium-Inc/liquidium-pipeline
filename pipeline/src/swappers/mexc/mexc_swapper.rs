@@ -8,7 +8,7 @@ use log::{debug, info};
 
 use crate::swappers::mexc::orderbook_quote::{simulate_buy_from_asks, simulate_sell_from_bids};
 use crate::swappers::model::{SwapExecution, SwapQuote, SwapQuoteLeg, SwapRequest, adverse_price_impact_bps};
-use crate::swappers::router::{ExecutableSwapVenue, SwapVenue};
+use crate::swappers::venue::{ExecutableSwapVenue, SwapVenue};
 
 fn f64_to_nat(v: f64) -> Nat {
     Nat::from(v as u128)

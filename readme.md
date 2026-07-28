@@ -27,7 +27,7 @@ Inspired by Artemis/MEV patterns and designed for permissionless, community-driv
 - **Pipeline Architecture** — Composable stages for discovery, strategy, execution, finalization, and export.
 - **Async Rust** — Highly concurrent and efficient with Tokio runtime.
 - **Multi-Chain** — Primary support for ICP with EVM (Arbitrum) integration.
-- **Swap Execution** — CEX (MEXC) strategy.
+- **Swap Execution** — Enabled-venue planning across ICPSwap and MEXC.
 - **Extensible** — Add custom risk checks, strategies, swaps, or notification stages.
 - **Permissionless** — Anyone can run it.
 - **Multi-Account** — Separate liquidator, trader, and recovery identities for security.
@@ -36,7 +36,7 @@ Inspired by Artemis/MEV patterns and designed for permissionless, community-driv
 
 ## At a Glance
 
-- **Best first run:** run `SWAPPER=cex` once CEX credentials are configured.
+- **Default venues:** `ENABLED_SWAP_VENUES=icpswap,mexc`; disable MEXC when credentials are not configured.
 - **Current config precedence:** shell env vars > local `.env` > `~/.liquidium-pipeline/config.env`.
 - **Required env vars (minimum):** `MNEMONIC_FILE`, `IC_URL`, `EVM_RPC_URL`, `LENDING_CANISTER`, `DEBT_ASSETS`, `COLLATERAL_ASSETS`.
 - **New client env var:** `BRIDGE_CKETH_MINTER_CANISTER` (recommended to set explicitly; defaults to `sv3dd-oaaaa-aaaar-qacoa-cai` when unset/empty).
@@ -151,8 +151,8 @@ BALANCE_CHECK_EXCLUDE=ckETH,ETH
 ### Swap Configuration
 
 ```bash
-# Swap strategy: cex
-SWAPPER=cex
+# Ordered venues eligible for new plans. Omit to enable both by default.
+ENABLED_SWAP_VENUES=icpswap,mexc
 
 # CEX (MEXC) - Optional
 CEX_MEXC_API_KEY=your_api_key
@@ -192,8 +192,6 @@ CEX_ROUTE_FEE_BPS=25
 CEX_MEXC_AVAILABLE_PAIRS=CKBTC_BTC,BTC_USDC,BTC_USDT,USDC_USDT,CKUSDT_USDT,ICP_USDT,ICP_USDC,ETH_USDT
 # Max intermediate hops when searching configured pairs (0 disables hop fallback)
 CEX_MEXC_MAX_HOPS=2
-# Reserved (currently unused while only SWAPPER=cex is supported)
-CEX_FORCE_OVER_USD_THRESHOLD=12.5
 ```
 
 Quick reference:
@@ -213,7 +211,6 @@ Quick reference:
 | `CEX_ROUTE_FEE_BPS` | Fee haircut applied during route edge estimation. |
 | `CEX_MEXC_AVAILABLE_PAIRS` | Configured market universe used for direct/hop route discovery. |
 | `CEX_MEXC_MAX_HOPS` | Max intermediate hops allowed in configured-pair route search. |
-| `CEX_FORCE_OVER_USD_THRESHOLD` | In hybrid mode, force CEX above this USD notional (`0` disables). |
 
 Note: `CEX_BUY_INVERSE_OVESPEND_BPS` is still accepted as a legacy alias, but `CEX_BUY_INVERSE_OVERSPEND_BPS` is the canonical key.
 
@@ -295,10 +292,11 @@ For each leg, the finalizer runs a resumable slice loop:
 
 Route summary metrics are updated from slice notional, and weighted slippage is tracked for post-trade reporting.
 
-**Supported swappers:**
+**Supported venues:**
 
-- **CEX (MEXC)** — `SWAPPER=cex` (required)
-- `SWAPPER=dex` and `SWAPPER=hybrid` are currently unsupported and return startup errors.
+- `icpswap` — native ICP input only.
+- `mexc` — requires `CEX_MEXC_API_KEY` and `CEX_MEXC_API_SECRET` when enabled.
+- Venue IDs are ordered, comma-separated, and validated at startup. `SWAPPER` is obsolete and ignored.
 
 ### Storage & Export
 
@@ -404,20 +402,12 @@ stateDiagram-v2
     StrategyBuild --> ExecuteLiquidation
     ExecuteLiquidation --> WalRecord
 
-    WalRecord --> Finalize
-    Finalize --> SwapDecision
-
-    SwapDecision --> DexSwap: swap_args and dex
-    SwapDecision --> CexSwap: swap_args and cex or hybrid
-    SwapDecision --> NoSwap: no swap_args
-
-    DexSwap --> Finalize
-    CexSwap --> Finalize
-    NoSwap --> Finalize
-
+    WalRecord --> SettlementWatch
+    SettlementWatch --> MultiVenuePlan: collateral confirmed
+    MultiVenuePlan --> VenueLegs: commit immutable plan
+    VenueLegs --> VenueLegs: advance and persist each leg
+    VenueLegs --> Finalize: all legs complete or recovered
     Finalize --> WalUpdate
-    WalUpdate --> SettlementWatch
-    SettlementWatch --> Finalize: pending or retryable
     SettlementWatch --> Export: succeeded
 
     Finalize --> Export
@@ -429,22 +419,20 @@ stateDiagram-v2
 | **Opportunity Discovery** | Polls lending canister for at-risk positions |
 | **Strategy Filter** | Filters opportunities by profitability and supported assets |
 | **Liquidation Execution** | Calls `liquidate()` on lending canister, seizes collateral |
-| **Swap Finalization** | Swaps collateral via CEX strategy |
+| **Swap Finalization** | Plans and executes enabled venue legs through one persisted orchestrator |
 | **Export / Reporting** | Saves execution details to CSV |
 
 Stages are implemented with `async-trait` for composability.
 
 ### Multi-Venue Swap Pipeline
 
-An extensible multi-venue finalization path is being introduced to quote ICPSwap, MEXC, and future exchanges through one amount-scoped adapter contract. Allocation policy, exchange mechanics, WAL orchestration, and result aggregation remain separate layers.
-
-The current staged implementation is not yet the production routing path. See [Multi-Venue Swap Pipeline](docs/multi-venue-swap-pipeline.md) for the architecture diagrams, persisted model, `icpswap_first` policy, restart behavior, extension contract, and implementation status.
+The production finalizer quotes enabled venues through one amount-scoped adapter contract. Allocation policy, exchange mechanics, WAL orchestration, and result aggregation remain separate layers. See [Multi-Venue Swap Pipeline](docs/multi-venue-swap-pipeline.md) for the persisted model, `icpswap_first` policy, restart behavior, and extension contract.
 
 ### Swap Strategies
 
 | Strategy | Description |
 |----------|-------------|
-| **CEX** | Deposits to MEXC, swaps, and withdraws. |
+| **ICPSwap first** | Uses ICPSwap below the impact cap and allocates executable overflow to enabled exchanges. |
 
 ### Retry & State Management
 
@@ -676,7 +664,7 @@ liquidator withdraw --source main --destination abc123-xyz --asset ckUSDT --amou
 2. Start the runner:
 
    ```bash
-   SWAPPER=cex liquidator run
+   ENABLED_SWAP_VENUES=icpswap,mexc liquidator run
    ```
 
 3. Enable monitoring and inspect output artifacts:
@@ -802,7 +790,7 @@ liquidator tui --log-file ./liquidator.log
 
 - `LENDING_CANISTER not configured` / `EVM_RPC_URL not configured`: confirm required env vars are set in `.env` or `config.env`.
 - `Invalid source account` / destination parse errors during withdraw: use `main|trader|recovery` aliases or valid account/principal text.
-- CEX calls failing in `hybrid`/`cex` mode: verify `CEX_MEXC_API_KEY` and `CEX_MEXC_API_SECRET`.
+- MEXC initialization failing while `mexc` is enabled: verify `CEX_MEXC_API_KEY` and `CEX_MEXC_API_SECRET`, or remove `mexc` from `ENABLED_SWAP_VENUES`.
 - Noisy terminal output in containerized logging stacks: build and run with `--features plain-logs`.
 - Missing diagnostic detail: rerun with `RUST_LOG=debug`.
 - Runtime socket permission mismatch under systemd: run `systemctl daemon-reload` and restart `liquidator.service`; ensure `RuntimeDirectory=liquidator` and `RuntimeDirectoryMode=0770` are set on the active unit.

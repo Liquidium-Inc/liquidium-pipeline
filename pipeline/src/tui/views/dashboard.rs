@@ -137,8 +137,8 @@ fn draw_configuration(f: &mut Frame<'_>, area: Rect, app: &App) {
 
     let lines = vec![
         Line::from(vec![
-            Span::styled("Swapper: ", Style::default().add_modifier(Modifier::BOLD)),
-            Span::raw(app.config.swapper_mode.clone()),
+            Span::styled("Venues: ", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw(app.config.enabled_swap_venues.clone()),
             Span::raw(" · "),
             Span::styled("DEX/CEX: ", Style::default().add_modifier(Modifier::BOLD)),
             Span::raw(format!(

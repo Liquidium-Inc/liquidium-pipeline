@@ -420,7 +420,6 @@ fn planner_config() -> IcpswapFirstPlannerConfig {
         max_search_iterations: 16,
         cex_min_exec_usd: 0.01,
         min_net_edge_bps: 150,
-        overflow_venue_ids: vec![MEXC_VENUE_ID.to_string()],
     }
 }
 
@@ -633,25 +632,21 @@ async fn adapter_error_is_persisted_before_retry_backoff_is_requested() {
 }
 
 #[tokio::test]
-async fn forced_cex_mode_commits_a_single_mexc_leg() {
+async fn mexc_only_registry_commits_a_single_mexc_leg() {
     let receipt = receipt();
     let wal = TestWal::with_receipt(&receipt);
-    let icpswap = Arc::new(ScriptedAdapter::new(ICPSWAP_VENUE_ID, None, Vec::new()));
     let mexc = Arc::new(ScriptedAdapter::new(
         MEXC_VENUE_ID,
         None,
         vec![VenueLegStatus::Completed],
     ));
-    let finalizer = MultiVenueFinalizer::new(vec![icpswap, mexc], planner_config())
-        .expect("valid finalizer")
-        .with_routing(MultiVenueRouting::ForcedVenue(MEXC_VENUE_ID.to_string()))
-        .expect("registered forced venue");
+    let finalizer = MultiVenueFinalizer::new(vec![mexc], planner_config()).expect("valid finalizer");
 
-    let result = finalizer.finalize(&wal, receipt).await.expect("forced MEXC execution");
+    let result = finalizer.finalize(&wal, receipt).await.expect("MEXC execution");
 
     assert!(result.finalized);
     let state = committed_state(&wal);
-    assert_eq!(state.plan.strategy_id, "forced_mexc");
+    assert_eq!(state.plan.strategy_id, "icpswap_first");
     assert_eq!(state.legs.len(), 1);
     assert_eq!(state.legs[0].venue_id, MEXC_VENUE_ID);
 }

@@ -28,7 +28,6 @@ use crate::stages::{
     export::ExportStage, finalize::FinalizeStage, opportunity::OpportunityFinder,
     simple_strategy::SimpleLiquidationStrategy,
 };
-use crate::swappers::router::SwapRouter;
 use crate::watchdog::{Watchdog, WatchdogEvent, balance_monitor::LowBalanceMonitor};
 use anyhow::Context as _;
 use futures::{FutureExt, StreamExt, stream};
@@ -287,12 +286,7 @@ pub(crate) fn bootstrap_control_plane(
 ///   downstream outages or unexpected runtime faults.
 pub(crate) async fn run_daemon_cycle_loop(
     finder: &OpportunityFinder<Agent>,
-    strategy: &SimpleLiquidationStrategy<
-        SwapRouter,
-        Config,
-        TokenRegistry,
-        CollateralService<LiquidationPriceOracle<Agent>>,
-    >,
+    strategy: &SimpleLiquidationStrategy<Config, TokenRegistry, CollateralService<LiquidationPriceOracle<Agent>>>,
     executor: &Arc<BasicExecutor<Agent, SqliteWalStore>>,
     exporter: &Arc<ExportStage>,
     finalizer: &Arc<FinalizeStage<MultiVenueFinalizer, SqliteWalStore, SimpleProfitCalculator, Agent>>,
@@ -384,12 +378,7 @@ where
 
 async fn run_single_daemon_cycle(
     finder: &OpportunityFinder<Agent>,
-    strategy: &SimpleLiquidationStrategy<
-        SwapRouter,
-        Config,
-        TokenRegistry,
-        CollateralService<LiquidationPriceOracle<Agent>>,
-    >,
+    strategy: &SimpleLiquidationStrategy<Config, TokenRegistry, CollateralService<LiquidationPriceOracle<Agent>>>,
     executor: &Arc<BasicExecutor<Agent, SqliteWalStore>>,
     exporter: &Arc<ExportStage>,
     finalizer: &Arc<FinalizeStage<MultiVenueFinalizer, SqliteWalStore, SimpleProfitCalculator, Agent>>,

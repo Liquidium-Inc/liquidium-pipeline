@@ -11,7 +11,7 @@ use crate::swappers::kong::kong_types::{
     SwapAmountsReply as KongSwapAmountsReply, SwapArgs as KongSwapArgs, SwapReply as KongSwapReply,
 };
 use crate::swappers::model::{SwapExecution, SwapQuote, SwapRequest};
-use crate::swappers::router::{ExecutableSwapVenue, SwapVenue};
+use crate::swappers::venue::{ExecutableSwapVenue, SwapVenue};
 
 /// KongVenue is a generic venue wrapper over the KongSwapSwapper.
 /// It takes a generic SwapRequest / SwapQuote / SwapExecution and
@@ -170,7 +170,7 @@ where
 #[cfg(test)]
 mod tests {
     use crate::approval_state::ApprovalState;
-    use crate::swappers::router::SwapVenue;
+    use crate::swappers::venue::SwapVenue;
     use candid::{Decode, Nat, Principal};
     use icrc_ledger_types::icrc1::account::Account;
     use icrc_ledger_types::icrc2::allowance::Allowance;

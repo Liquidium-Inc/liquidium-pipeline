@@ -203,7 +203,7 @@ pub async fn run(opts: TuiOptions) -> anyhow::Result<()> {
         bridge_evm_address: cfg.bridge_evm_address.clone(),
         bridge_ic_owner_principal: cfg.bridge_ic_owner_principal.to_text(),
         bridge_btc_address: cfg.bridge_btc_address.clone(),
-        swapper_mode: format!("{:?}", cfg.swapper),
+        enabled_swap_venues: cfg.enabled_swap_venues.join(","),
         max_dex_slippage_bps: cfg.max_allowed_dex_slippage,
         max_cex_slippage_bps: cfg.max_allowed_cex_slippage_bps,
         bad_debt_collateral_slippage_bps: cfg.bad_debt_collateral_slippage_bps,

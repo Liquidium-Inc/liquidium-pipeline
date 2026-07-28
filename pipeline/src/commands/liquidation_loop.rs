@@ -1,7 +1,7 @@
 use candid::{Nat, Principal};
 use icrc_ledger_types::icrc1::account::Account;
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     path::PathBuf,
     sync::{Arc, atomic::AtomicBool},
     time::Duration,
@@ -14,25 +14,25 @@ use crate::{
         bootstrap_control_plane, console_ui_enabled, debt_asset_principals, debt_assets_as_text,
         ensure_runtime_file_permissions, print_banner, run_daemon_cycle_loop,
     },
-    config::{Config, ConfigTrait, SwapperMode},
+    config::{Config, ConfigTrait},
     context::{PipelineContext, init_context},
     executors::basic::basic_executor::BasicExecutor,
     finalizers::{
         mexc::runtime::build_mexc_finalizer,
         multi_venue::{
-            ICPSWAP_VENUE_ID, IcpswapFirstPlannerConfig, MEXC_VENUE_ID, MultiVenueAdapter, MultiVenueFinalizer,
-            MultiVenueRouting,
+            ICPSWAP_VENUE_ID, IcpswapFirstPlannerConfig, MEXC_VENUE_ID, MultiVenueAdapter,
+            MultiVenueFinalizer,
         },
         profit_calculator::SimpleProfitCalculator,
     },
     liquidation::collateral_service::CollateralService,
-    persistance::sqlite::SqliteWalStore,
+    persistance::{FinalizerMetaPayload, MultiVenueExecutionOutcome, sqlite::SqliteWalStore},
     price_oracle::price_oracle::LiquidationPriceOracle,
     stages::{
         export::ExportStage, finalize::FinalizeStage, opportunity::OpportunityFinder,
         settlement_watcher::SettlementWatcher, simple_strategy::SimpleLiquidationStrategy,
     },
-    swappers::router::SwapRouter,
+    wal::decode_receipt_wrapper,
     watchdog::{
         WatchdogEvent,
         balance_monitor::{
@@ -49,13 +49,76 @@ use liquidium_pipeline_core::{
 
 const BRIDGE_CKETH_LEDGER_ID: &str = "ss2fx-dyaaa-aaaar-qacoq-cai";
 
+fn disabled_venue_ids<'a>(
+    outcome: &MultiVenueExecutionOutcome,
+    venue_ids: impl IntoIterator<Item = &'a str>,
+    enabled: &HashSet<&str>,
+) -> Vec<String> {
+    if matches!(
+        outcome,
+        MultiVenueExecutionOutcome::Completed | MultiVenueExecutionOutcome::Recovered
+    ) {
+        return Vec::new();
+    }
+
+    let mut disabled = Vec::new();
+    for venue_id in venue_ids {
+        if !enabled.contains(venue_id) && !disabled.iter().any(|existing| existing == venue_id) {
+            disabled.push(venue_id.to_string());
+        }
+    }
+    disabled
+}
+
+fn ensure_committed_venues_are_enabled(db: &SqliteWalStore, enabled_venues: &[String]) -> Result<(), String> {
+    let enabled: HashSet<&str> = enabled_venues.iter().map(String::as_str).collect();
+    let mut conflicts = Vec::new();
+
+    for row in db
+        .list_unfinished_execution_rows()
+        .map_err(|error| format!("failed to inspect unfinished venue executions: {error}"))?
+    {
+        let wrapper = match decode_receipt_wrapper(&row) {
+            Ok(Some(wrapper)) => wrapper,
+            Ok(None) => continue,
+            Err(error) => {
+                return Err(format!(
+                    "cannot verify enabled venues for unfinished WAL row {} because its metadata is malformed: {error}",
+                    row.id
+                ));
+            }
+        };
+        let Some(meta) = wrapper.meta_v2 else {
+            continue;
+        };
+        let FinalizerMetaPayload::MultiVenueSwap(state) = meta.payload;
+        let disabled = disabled_venue_ids(
+            &state.outcome,
+            state.legs.iter().map(|leg| leg.venue_id.as_str()),
+            &enabled,
+        );
+        if !disabled.is_empty() {
+            conflicts.push(format!("{} [{}]", row.id, disabled.join(",")));
+        }
+    }
+
+    if conflicts.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "unfinished multi-venue WAL rows reference disabled venues: {}; re-enable those venues or finish recovery before startup",
+            conflicts.join("; ")
+        ))
+    }
+}
+
 #[instrument(name = "liquidation.init", skip_all, err)]
 async fn init(
     ctx: Arc<PipelineContext>,
 ) -> Result<
     (
         OpportunityFinder<Agent>,
-        SimpleLiquidationStrategy<SwapRouter, Config, TokenRegistry, CollateralService<LiquidationPriceOracle<Agent>>>,
+        SimpleLiquidationStrategy<Config, TokenRegistry, CollateralService<LiquidationPriceOracle<Agent>>>,
         Arc<BasicExecutor<Agent, SqliteWalStore>>,
         Arc<ExportStage>,
         Arc<FinalizeStage<MultiVenueFinalizer, SqliteWalStore, SimpleProfitCalculator, Agent>>,
@@ -66,6 +129,7 @@ async fn init(
     let agent = ctx.agent.clone();
     let registry = ctx.registry.clone();
     let db = Arc::new(SqliteWalStore::new(&config.db_path).map_err(|e| format!("could not connect to db: {e}"))?);
+    ensure_committed_venues_are_enabled(db.as_ref(), &config.enabled_swap_venues)?;
 
     let tokens = debt_asset_principals(&registry);
 
@@ -86,32 +150,29 @@ async fn init(
         .map_err(|e| format!("executor token init failed: {e}"))?;
     let executor = Arc::new(executor);
 
-    if let Err(err) = ctx.swap_router.init().await {
-        warn!("Swap router init failed: {}", err);
+    let mut venue_adapters: Vec<Arc<dyn MultiVenueAdapter>> = Vec::new();
+    for venue_id in config.get_enabled_swap_venues() {
+        match venue_id.as_str() {
+            ICPSWAP_VENUE_ID => venue_adapters.push(
+                ctx.icpswap_finalizer
+                    .clone()
+                    .ok_or_else(|| "ICPSwap is enabled but its adapter was not initialized".to_string())?,
+            ),
+            MEXC_VENUE_ID => venue_adapters.push(build_mexc_finalizer(ctx.as_ref()).await?),
+            _ => return Err(format!("unsupported enabled swap venue `{venue_id}`")),
+        }
     }
-
-    let mexc_finalizer = build_mexc_finalizer(ctx.as_ref()).await?;
-    let routing = match config.get_swapper_mode() {
-        SwapperMode::Dex => MultiVenueRouting::ForcedVenue(ICPSWAP_VENUE_ID.to_string()),
-        SwapperMode::Cex => MultiVenueRouting::ForcedVenue(MEXC_VENUE_ID.to_string()),
-        SwapperMode::Hybrid => MultiVenueRouting::IcpswapFirst,
-    };
     let multi_venue_finalizer = Arc::new(
         MultiVenueFinalizer::new(
-            vec![
-                ctx.icpswap_finalizer.clone() as Arc<dyn MultiVenueAdapter>,
-                mexc_finalizer.clone() as Arc<dyn MultiVenueAdapter>,
-            ],
+            venue_adapters,
             IcpswapFirstPlannerConfig {
                 max_price_impact_bps: 100.0,
                 max_search_iterations: 16,
                 cex_min_exec_usd: config.get_cex_min_exec_usd(),
                 min_net_edge_bps: config.get_cex_min_net_edge_bps(),
-                overflow_venue_ids: vec![MEXC_VENUE_ID.to_string()],
             },
         )?
-        .with_watchdog(slack_watchdog_from_env(DEFAULT_LOW_BALANCE_ALERT_COOLDOWN))
-        .with_routing(routing)?,
+        .with_watchdog(slack_watchdog_from_env(DEFAULT_LOW_BALANCE_ALERT_COOLDOWN)),
     );
 
     // Profit calculator for expected/realized PnL
@@ -146,7 +207,6 @@ async fn init(
     let strategy = SimpleLiquidationStrategy::new(
         config.clone(),
         registry.clone(),
-        ctx.swap_router.clone(),
         collateral_service.clone(),
         ctx.main_service.clone(),
         ctx.approval_state.clone(),
@@ -264,10 +324,8 @@ pub async fn run_liquidation_loop(sock_path: PathBuf) {
     let watcher = SettlementWatcher::new(
         watcher_wal,
         ctx.agent.clone(),
-        ctx.swap_router.clone(),
         config.lending_canister,
         Duration::from_secs(3),
-        config.swapper,
     );
 
     tokio::spawn(async move { watcher.run().await });
@@ -278,7 +336,7 @@ pub async fn run_liquidation_loop(sock_path: PathBuf) {
     info!(
         network = %config.ic_url,
         liquidator_principal = %config.liquidator_principal.to_text(),
-        swapper_mode = ?config.swapper,
+        enabled_swap_venues = ?config.enabled_swap_venues,
         max_dex_slippage_bps = config.max_allowed_dex_slippage,
         max_cex_slippage_bps = config.max_allowed_cex_slippage_bps,
         buy_bad_debt = config.buy_bad_debt,
@@ -363,7 +421,10 @@ pub enum LoopControl {
 
 #[cfg(test)]
 mod tests {
+    use super::disabled_venue_ids;
     use crate::commands::liquidation_loop_helpers::console_ui_enabled;
+    use crate::persistance::MultiVenueExecutionOutcome;
+    use std::collections::HashSet;
     use std::io::IsTerminal;
 
     fn calc_console_ui_enabled(human_output: bool, stdout_is_tty: bool, stderr_is_tty: bool) -> bool {
@@ -399,5 +460,27 @@ mod tests {
             std::io::stderr().is_terminal(),
         );
         assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn unfinished_plans_report_disabled_venues_once_in_leg_order() {
+        let enabled = HashSet::from(["icpswap"]);
+        let disabled = disabled_venue_ids(
+            &MultiVenueExecutionOutcome::Running,
+            ["icpswap", "mexc", "mexc", "kraken"],
+            &enabled,
+        );
+        assert_eq!(disabled, vec!["mexc".to_string(), "kraken".to_string()]);
+    }
+
+    #[test]
+    fn completed_plans_do_not_block_disabling_a_venue() {
+        let enabled = HashSet::from(["icpswap"]);
+        let disabled = disabled_venue_ids(
+            &MultiVenueExecutionOutcome::Completed,
+            ["mexc"],
+            &enabled,
+        );
+        assert!(disabled.is_empty());
     }
 }

@@ -11,7 +11,7 @@ use num_traits::ToPrimitive;
 
 use crate::swappers::{
     model::{SwapExecution, SwapQuote, SwapQuoteLeg, SwapRequest},
-    router::SwapVenue,
+    venue::SwapVenue,
 };
 use crate::utils::ICP_LEDGER_PRINCIPAL;
 

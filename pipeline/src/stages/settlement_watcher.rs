@@ -2,58 +2,45 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use candid::{Encode, Principal};
-use num_traits::ToPrimitive;
 use tokio::time::sleep;
 use tracing::instrument;
 use tracing::{info, warn};
 
-use crate::config::SwapperMode;
 use crate::persistance::{LiqMetaWrapper, LiqResultRecord, ResultStatus, WalStore};
 use crate::stages::executor::ExecutionReceipt;
 use crate::stages::executor::ExecutionStatus;
-use crate::swappers::swap_interface::QuoteInterface;
 use crate::utils::now_ts;
 use crate::wal::{decode_receipt_wrapper, encode_meta};
 use liquidium_pipeline_connectors::pipeline_agent::PipelineAgent;
 use liquidium_pipeline_core::types::protocol_types::{LiquidationResult, ProtocolError, TransferStatus};
-const MAX_UNPROFITABLE_SECS: i64 = 180;
 
-pub struct SettlementWatcher<A, S, D>
+pub struct SettlementWatcher<A, D>
 where
     A: PipelineAgent,
-    S: QuoteInterface,
     D: WalStore,
 {
     pub wal: Arc<D>,
     pub agent: Arc<A>,
-    pub swapper: Arc<S>,
     pub lending_canister: Principal,
     pub poll_interval: Duration,
-    /// Active swapper mode used to decide whether DEX profitability gating applies.
-    pub swapper_mode: SwapperMode,
 }
 
-impl<A, S, D> SettlementWatcher<A, S, D>
+impl<A, D> SettlementWatcher<A, D>
 where
     A: PipelineAgent + Send + Sync,
-    S: QuoteInterface + Send + Sync,
     D: WalStore + Send + Sync,
 {
     pub fn new(
         wal: Arc<D>,
         agent: Arc<A>,
-        swapper: Arc<S>,
         lending_canister: Principal,
         poll_interval: Duration,
-        swapper_mode: SwapperMode,
     ) -> Self {
         Self {
             wal,
             agent,
-            swapper,
             lending_canister,
             poll_interval,
-            swapper_mode,
         }
     }
 
@@ -153,73 +140,11 @@ where
             return Ok(());
         }
 
-        // DEX quote-based profitability gating is only valid in pure DEX mode.
-        // In CEX/Hybrid modes, finalizer-side previews decide route viability.
-        if !matches!(self.swapper_mode, SwapperMode::Dex) {
-            self.wal
-                .update_status(&row.id, ResultStatus::Enqueued, true)
-                .await
-                .map_err(|e| e.to_string())?;
-            info!(
-                "[settlement] ✅ liq_id={} mode={:?} -> enqueued without DEX quote gate",
-                liq.id, self.swapper_mode
-            );
-            return Ok(());
-        }
-
-        let swap_req = receipt
-            .request
-            .swap_args
-            .as_ref()
-            .ok_or_else(|| "missing swap args".to_string())?;
-
-        let quote = match self.swapper.quote(swap_req).await {
-            Ok(q) => q,
-            Err(err) => {
-                warn!("[settlement] quote failed liq_id={} err={}", liq.id, err);
-                return self.handle_unprofitable(&row, liq.id).await;
-            }
-        };
-
-        let recv = quote.receive_amount.0.to_i128();
-        let debt = liq.amounts.debt_repaid.0.to_i128();
-        let profitable = matches!((recv, debt), (Some(r), Some(d)) if r >= d);
-
-        if profitable {
-            self.wal
-                .update_status(&row.id, ResultStatus::Enqueued, true)
-                .await
-                .map_err(|e| e.to_string())?;
-            info!("[settlement] ✅ liq_id={} profitable -> enqueued", liq.id);
-            return Ok(());
-        }
-
-        self.handle_unprofitable(&row, liq.id).await
-    }
-
-    async fn handle_unprofitable(&self, row: &LiqResultRecord, liq_id: u128) -> Result<(), String> {
-        if row.status != ResultStatus::WaitingProfit {
-            self.wal
-                .update_status(&row.id, ResultStatus::WaitingProfit, false)
-                .await
-                .map_err(|e| e.to_string())?;
-            info!("[settlement] ⏳ liq_id={} not profitable -> waiting", liq_id);
-            return Ok(());
-        }
-
-        let elapsed = now_ts().saturating_sub(row.updated_at);
-        if elapsed >= MAX_UNPROFITABLE_SECS {
-            self.wal
-                .update_failure(
-                    &row.id,
-                    ResultStatus::FailedPermanent,
-                    "unprofitable after 180s".to_string(),
-                    true,
-                )
-                .await
-                .map_err(|e| e.to_string())?;
-            warn!("[settlement] ❌ liq_id={} unprofitable > 180s -> failed", liq_id);
-        }
+        self.wal
+            .update_status(&row.id, ResultStatus::Enqueued, true)
+            .await
+            .map_err(|e| e.to_string())?;
+        info!("[settlement] ✅ liq_id={} -> enqueued for multi-venue planning", liq.id);
         Ok(())
     }
 
@@ -269,8 +194,7 @@ mod tests {
         FinalizerDecisionSnapshot, LiqMetaWrapper, MockWalStore, ResultStatus, WalProfitSnapshot,
     };
     use crate::stages::executor::ExecutionStatus;
-    use crate::swappers::model::{SwapQuote, SwapRequest};
-    use crate::swappers::swap_interface::MockSwapInterface;
+    use crate::swappers::model::SwapRequest;
     use candid::Nat;
     use liquidium_pipeline_connectors::pipeline_agent::MockPipelineAgent;
     use liquidium_pipeline_core::tokens::asset_id::AssetId;
@@ -382,7 +306,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn watcher_enqueues_when_profitable() {
+    async fn watcher_enqueues_for_multi_venue_planning() {
         let liq_id = 9u128;
         let swap_args = make_swap_args();
         let receipt = ExecutionReceipt {
@@ -418,37 +342,18 @@ mod tests {
             .times(1)
             .returning(move |_, _, _| Ok(Ok(fresh.clone())));
 
-        let mut swapper = MockSwapInterface::new();
-        let quote = SwapQuote {
-            pay_asset: swap_args.pay_asset.clone(),
-            pay_amount: swap_args.pay_amount.value.clone(),
-            receive_asset: swap_args.receive_asset.clone(),
-            receive_amount: Nat::from(2_000_000u64),
-            mid_price: 1.0,
-            exec_price: 1.0,
-            estimated_price_impact_bps: 0.0,
-            legs: vec![],
-        };
-        swapper
-            .expect_quote()
-            .withf(move |req| req.pay_asset.symbol == "ckBTC" && req.receive_asset.symbol == "ckUSDT")
-            .times(1)
-            .returning(move |_| Ok(quote.clone()));
-
         let watcher = SettlementWatcher::new(
             Arc::new(wal),
             Arc::new(agent),
-            Arc::new(swapper),
             Principal::anonymous(),
             Duration::from_secs(3),
-            SwapperMode::Dex,
         );
 
         watcher.tick().await.expect("tick should succeed");
     }
 
     #[tokio::test]
-    async fn watcher_bypasses_dex_quote_gate_in_hybrid_mode() {
+    async fn watcher_enqueues_settled_swap_rows_without_a_quote_dependency() {
         let liq_id = 10u128;
         let swap_args = make_swap_args();
         let receipt = ExecutionReceipt {
@@ -484,26 +389,19 @@ mod tests {
             .times(1)
             .returning(move |_, _, _| Ok(Ok(fresh.clone())));
 
-        let mut swapper = MockSwapInterface::new();
-        swapper.expect_quote().times(0);
-
         let watcher = SettlementWatcher::new(
             Arc::new(wal),
             Arc::new(agent),
-            Arc::new(swapper),
             Principal::anonymous(),
             Duration::from_secs(3),
-            SwapperMode::Hybrid,
         );
 
         watcher.tick().await.expect("tick should succeed");
     }
 
-    /// Given: Settlement watcher runs in pure CEX mode with a ready liquidation row.
-    /// When: One watcher tick is executed.
-    /// Then: It enqueues without calling DEX quote gating.
+    /// A ready settled row is handed to the finalizer without venue-specific routing.
     #[tokio::test]
-    async fn watcher_bypasses_dex_quote_gate_in_cex_mode() {
+    async fn watcher_enqueue_behavior_is_independent_of_venue_selection() {
         // given
         const LIQUIDATION_ID: u128 = 11;
         const WAL_BATCH_LIMIT: usize = 100;
@@ -542,27 +440,21 @@ mod tests {
             .times(1)
             .returning(move |_, _, _| Ok(Ok(fresh.clone())));
 
-        let mut swapper = MockSwapInterface::new();
-        swapper.expect_quote().times(0);
-
         let watcher = SettlementWatcher::new(
             Arc::new(wal),
             Arc::new(agent),
-            Arc::new(swapper),
             Principal::anonymous(),
             Duration::from_secs(3),
-            SwapperMode::Cex,
         );
 
         // when
         watcher.tick().await.expect("tick should succeed");
 
-        // then
-        // Expectations above assert: no quote calls and Enqueued transition.
+        // Expectations above assert the Enqueued transition.
     }
 
     #[tokio::test]
-    async fn watcher_fails_after_unprofitable_window() {
+    async fn watcher_reenqueues_legacy_waiting_profit_rows() {
         let liq_id = 12u128;
         let swap_args = make_swap_args();
         let mut row = make_row(
@@ -586,15 +478,10 @@ mod tests {
             .with(eq(ResultStatus::WaitingProfit), eq(100usize))
             .times(1)
             .returning(move |_, _| Ok(vec![row.clone()]));
-        wal.expect_update_failure()
-            .with(
-                eq(row_id.clone()),
-                eq(ResultStatus::FailedPermanent),
-                eq("unprofitable after 180s".to_string()),
-                eq(true),
-            )
+        wal.expect_update_status()
+            .with(eq(row_id.clone()), eq(ResultStatus::Enqueued), eq(true))
             .times(1)
-            .returning(|_, _, _, _| Ok(()));
+            .returning(|_, _, _| Ok(()));
 
         let mut agent = MockPipelineAgent::new();
         let args = Encode!(&liq_id).unwrap();
@@ -605,30 +492,11 @@ mod tests {
             .times(1)
             .returning(move |_, _, _| Ok(Ok(fresh.clone())));
 
-        let mut swapper = MockSwapInterface::new();
-        let quote = SwapQuote {
-            pay_asset: swap_args.pay_asset.clone(),
-            pay_amount: swap_args.pay_amount.value.clone(),
-            receive_asset: swap_args.receive_asset.clone(),
-            receive_amount: Nat::from(1u64),
-            mid_price: 1.0,
-            exec_price: 1.0,
-            estimated_price_impact_bps: 0.0,
-            legs: vec![],
-        };
-        swapper
-            .expect_quote()
-            .withf(move |req| req.pay_asset.symbol == "ckBTC" && req.receive_asset.symbol == "ckUSDT")
-            .times(1)
-            .returning(move |_| Ok(quote.clone()));
-
         let watcher = SettlementWatcher::new(
             Arc::new(wal),
             Arc::new(agent),
-            Arc::new(swapper),
             Principal::anonymous(),
             Duration::from_secs(3),
-            SwapperMode::Dex,
         );
 
         watcher.tick().await.expect("tick should succeed");
@@ -696,10 +564,8 @@ mod tests {
         let watcher = SettlementWatcher::new(
             Arc::new(wal),
             Arc::new(MockPipelineAgent::new()),
-            Arc::new(MockSwapInterface::new()),
             Principal::anonymous(),
             Duration::from_secs(3),
-            SwapperMode::Dex,
         );
 
         watcher

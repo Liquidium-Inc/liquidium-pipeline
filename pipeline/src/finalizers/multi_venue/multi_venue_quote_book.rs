@@ -5,6 +5,7 @@ use futures::future::join_all;
 use super::{MultiVenueAdapter, VenueRoutePreview};
 use crate::swappers::model::SwapRequest;
 
+#[derive(Clone)]
 pub(super) struct VenueRegistry {
     adapters: Vec<Arc<dyn MultiVenueAdapter>>,
 }
@@ -43,6 +44,13 @@ impl VenueRegistry {
             .iter()
             .find(|adapter| adapter.venue_id() == venue_id)
             .map(AsRef::as_ref)
+    }
+
+    pub(super) fn venue_ids(&self) -> Vec<String> {
+        self.adapters
+            .iter()
+            .map(|adapter| adapter.venue_id().to_string())
+            .collect()
     }
 
     // Starts every registered preview before awaiting the combined result.

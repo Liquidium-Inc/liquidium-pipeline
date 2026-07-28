@@ -100,7 +100,6 @@ fn config(cex_min_exec_usd: f64) -> IcpswapFirstPlannerConfig {
         max_search_iterations: 16,
         cex_min_exec_usd,
         min_net_edge_bps: 150,
-        overflow_venue_ids: vec![MEXC_VENUE_ID.to_string()],
     }
 }
 
@@ -310,6 +309,78 @@ async fn full_icpswap_below_limit_wins_even_when_mexc_output_is_better() {
 }
 
 #[tokio::test]
+async fn icpswap_only_accepts_a_safe_native_icp_quote() {
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let calls_for_assert = calls.clone();
+    let icpswap = mock_adapter(ICPSWAP_VENUE_ID, calls, |request| {
+        Ok(proportional_preview(request, ICPSWAP_VENUE_ID, 99.0, 2))
+    });
+    let planner = IcpswapFirstPlanner::new(vec![Arc::new(icpswap)], config(1.1)).expect("ICPSwap-only planner");
+
+    let state = planner
+        .plan(&input_with_pay_token(native_icp()), 123)
+        .await
+        .expect("safe ICPSwap quote");
+
+    assert_eq!(state.legs.len(), 1);
+    assert_eq!(state.legs[0].venue_id, ICPSWAP_VENUE_ID);
+    assert_eq!(calls_for_assert.lock().expect("calls lock").as_slice(), &[TOTAL_PAY]);
+}
+
+#[tokio::test]
+async fn icpswap_only_rejects_an_unsafe_quote_without_searching() {
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let calls_for_assert = calls.clone();
+    let icpswap = mock_adapter(ICPSWAP_VENUE_ID, calls, |request| {
+        Ok(proportional_preview(request, ICPSWAP_VENUE_ID, 100.0, 2))
+    });
+    let planner = IcpswapFirstPlanner::new(vec![Arc::new(icpswap)], config(1.1)).expect("ICPSwap-only planner");
+
+    let error = planner
+        .plan(&input_with_pay_token(native_icp()), 123)
+        .await
+        .expect_err("unsafe ICPSwap quote requires an overflow venue");
+
+    assert!(matches!(error, IcpswapFirstPlannerError::NoViableRoute(_)));
+    assert!(error.to_string().contains("no overflow venue is enabled"));
+    assert_eq!(calls_for_assert.lock().expect("calls lock").as_slice(), &[TOTAL_PAY]);
+}
+
+#[tokio::test]
+async fn icpswap_only_rejects_non_native_collateral_without_quoting() {
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let calls_for_assert = calls.clone();
+    let icpswap = mock_adapter(ICPSWAP_VENUE_ID, calls, |request| {
+        Ok(proportional_preview(request, ICPSWAP_VENUE_ID, 0.0, 2))
+    });
+    let planner = IcpswapFirstPlanner::new(vec![Arc::new(icpswap)], config(1.1)).expect("ICPSwap-only planner");
+
+    let error = planner
+        .plan(&input_with_pay_token(non_native_icp_token()), 123)
+        .await
+        .expect_err("non-native collateral has no enabled venue");
+
+    assert!(matches!(error, IcpswapFirstPlannerError::NoViableRoute(_)));
+    assert!(calls_for_assert.lock().expect("calls lock").is_empty());
+}
+
+#[tokio::test]
+async fn mexc_only_plans_native_icp_without_icpswap() {
+    let mexc = mock_adapter(MEXC_VENUE_ID, Arc::new(Mutex::new(Vec::new())), |request| {
+        Ok(proportional_preview(request, MEXC_VENUE_ID, 0.0, 2))
+    });
+    let planner = IcpswapFirstPlanner::new(vec![Arc::new(mexc)], config(1.1)).expect("MEXC-only planner");
+
+    let state = planner
+        .plan(&input_with_pay_token(native_icp()), 123)
+        .await
+        .expect("MEXC-only plan");
+
+    assert_eq!(state.legs.len(), 1);
+    assert_eq!(state.legs[0].venue_id, MEXC_VENUE_ID);
+}
+
+#[tokio::test]
 async fn safe_full_icpswap_does_not_quote_any_overflow_venue() {
     let icpswap = mock_adapter(ICPSWAP_VENUE_ID, Arc::new(Mutex::new(Vec::new())), |request| {
         Ok(proportional_preview(request, ICPSWAP_VENUE_ID, 99.0, 2))
@@ -324,8 +395,7 @@ async fn safe_full_icpswap_does_not_quote_any_overflow_venue() {
     let kraken = mock_adapter(KRAKEN_VENUE_ID, kraken_calls, |request| {
         Ok(proportional_preview(request, KRAKEN_VENUE_ID, 0.0, 4))
     });
-    let mut planner_config = config(1.1);
-    planner_config.overflow_venue_ids.push(KRAKEN_VENUE_ID.to_string());
+    let planner_config = config(1.1);
     let planner = IcpswapFirstPlanner::new(
         vec![Arc::new(icpswap), Arc::new(mexc), Arc::new(kraken)],
         planner_config,
@@ -561,8 +631,7 @@ async fn dust_reason_records_every_skipped_overflow_venue() {
     let kraken = mock_adapter(KRAKEN_VENUE_ID, Arc::new(Mutex::new(Vec::new())), |request| {
         Ok(proportional_preview(request, KRAKEN_VENUE_ID, 0.0, 2))
     });
-    let mut planner_config = config(1.1);
-    planner_config.overflow_venue_ids.push(KRAKEN_VENUE_ID.to_string());
+    let planner_config = config(1.1);
     let planner = IcpswapFirstPlanner::new(
         vec![Arc::new(icpswap), Arc::new(mexc), Arc::new(kraken)],
         planner_config,
@@ -668,8 +737,7 @@ async fn icpswap_unavailable_selects_the_best_configured_overflow_venue() {
     let kraken = mock_adapter(KRAKEN_VENUE_ID, Arc::new(Mutex::new(Vec::new())), |request| {
         Ok(proportional_preview(request, KRAKEN_VENUE_ID, 0.0, 3))
     });
-    let mut planner_config = config(1.1);
-    planner_config.overflow_venue_ids.push(KRAKEN_VENUE_ID.to_string());
+    let planner_config = config(1.1);
     let planner = IcpswapFirstPlanner::new(
         vec![Arc::new(icpswap), Arc::new(mexc), Arc::new(kraken)],
         planner_config,
@@ -690,6 +758,25 @@ async fn icpswap_unavailable_selects_the_best_configured_overflow_venue() {
             unavailable_venue_ids: vec![ICPSWAP_VENUE_ID.to_string()],
         }
     );
+}
+
+#[tokio::test]
+async fn equal_overflow_quotes_keep_environment_order() {
+    let kraken = mock_adapter(KRAKEN_VENUE_ID, Arc::new(Mutex::new(Vec::new())), |request| {
+        Ok(proportional_preview(request, KRAKEN_VENUE_ID, 0.0, 2))
+    });
+    let mexc = mock_adapter(MEXC_VENUE_ID, Arc::new(Mutex::new(Vec::new())), |request| {
+        Ok(proportional_preview(request, MEXC_VENUE_ID, 0.0, 2))
+    });
+    let planner = IcpswapFirstPlanner::new(vec![Arc::new(kraken), Arc::new(mexc)], config(1.1))
+        .expect("valid overflow-only planner");
+
+    let state = planner
+        .plan(&input_with_pay_token(native_icp()), 123)
+        .await
+        .expect("first equal quote is selected");
+
+    assert_eq!(state.legs[0].venue_id, KRAKEN_VENUE_ID);
 }
 
 #[tokio::test]
