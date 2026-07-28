@@ -194,7 +194,7 @@ impl MultiVenueFinalizer {
             );
             let runnable = matches!(
                 current.status,
-                VenueLegStatus::Planned | VenueLegStatus::Running | VenueLegStatus::OperatorRequired
+                VenueLegStatus::Planned | VenueLegStatus::Running
             );
             if !terminal && !runnable {
                 continue;
@@ -236,11 +236,7 @@ impl MultiVenueFinalizer {
             {
                 continue;
             }
-            let progress = if current.status == VenueLegStatus::OperatorRequired {
-                adapter.recover(&current).await?
-            } else {
-                adapter.advance(&current).await?
-            };
+            let progress = adapter.advance(&current).await?;
             let retryable_error = progress.retryable_error.clone();
 
             apply_progress(&mut state.legs[index], progress)

@@ -804,7 +804,7 @@ async fn operator_required_mexc_leg_is_parked_across_restarts() {
             .finalized
     );
     assert_eq!(mexc.calls(), 1);
-    assert_eq!(mexc.recovery_calls(), 1);
+    assert_eq!(mexc.recovery_calls(), 0);
     assert_eq!(
         watchdog.0.lock().expect("watchdog lock").as_slice(),
         &[("mexc-0".to_string(), "venue_reconciliation".to_string())]
@@ -1232,7 +1232,7 @@ async fn retryable_mexc_row_resumes_its_committed_plan_after_backoff() {
 }
 
 #[tokio::test]
-async fn manually_reenqueued_mexc_row_recovers_before_advancing_again() {
+async fn reenqueuing_the_parent_row_does_not_rearm_an_operator_required_mexc_leg() {
     const LIQUIDATION_ID: u128 = 806;
     let wal = Arc::new(BatchWal::new([receipt_with_id(LIQUIDATION_ID)]));
     let mexc = Arc::new(
@@ -1259,15 +1259,10 @@ async fn manually_reenqueued_mexc_row_recovers_before_advancing_again() {
     assert_eq!(mexc.calls(), 1);
 
     wal.set_status(LIQUIDATION_ID, ResultStatus::Enqueued);
-    assert!(stage.process(&()).await.expect("manual recovery cycle").is_empty());
-    assert_eq!(wal.status(LIQUIDATION_ID), ResultStatus::Enqueued);
-    assert_eq!(mexc.recovery_calls(), 1);
-    assert_eq!(mexc.calls(), 1, "recovery must persist before another advance");
-
-    let outcomes = stage.process(&()).await.expect("post-recovery advance cycle");
-    assert_eq!(wal.status(LIQUIDATION_ID), ResultStatus::Succeeded);
-    assert_eq!(outcomes.len(), 1);
-    assert_eq!(mexc.calls(), 2);
+    assert!(stage.process(&()).await.expect("polling cycle").is_empty());
+    assert_eq!(wal.status(LIQUIDATION_ID), ResultStatus::OperatorRequired);
+    assert_eq!(mexc.recovery_calls(), 0);
+    assert_eq!(mexc.calls(), 1);
     assert_eq!(mexc.previews(), 1);
 }
 
