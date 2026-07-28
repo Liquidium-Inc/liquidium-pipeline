@@ -3,7 +3,10 @@ use std::sync::Arc;
 use candid::{CandidType, Decode, Encode, Int, Nat, Principal};
 use icrc_ledger_types::icrc1::{account::Account, transfer::TransferArg};
 use icrc_ledger_types::icrc2::approve::ApproveArgs;
-use liquidium_pipeline_connectors::{backend::icp_backend::IcpBackend, pipeline_agent::MockPipelineAgent};
+use liquidium_pipeline_connectors::{
+    backend::icp_backend::{IcpBackend, IcrcTransferError},
+    pipeline_agent::MockPipelineAgent,
+};
 use liquidium_pipeline_core::tokens::{chain_token::ChainToken, chain_token_amount::ChainTokenAmount};
 use serde::Deserialize;
 
@@ -30,7 +33,8 @@ mockall::mock! {
             to: &Account,
             amount: Nat,
         ) -> Result<Nat, String>;
-        async fn icrc1_transfer_with_args(&self, ledger: Principal, args: TransferArg) -> Result<Nat, String>;
+        async fn icrc1_transfer_with_args(&self, ledger: Principal, args: TransferArg)
+            -> Result<Nat, IcrcTransferError>;
         async fn icp_transfer(&self, ledger: Principal, to_account_id_hex: &str, amount_e8s: Nat)
             -> Result<u64, String>;
         async fn icrc1_decimals(&self, ledger: Principal) -> Result<u8, String>;
@@ -699,4 +703,53 @@ async fn client_submits_exact_deduplicated_ledger_transfer() {
     let client = IcpswapClient::new(Arc::new(MockPipelineAgent::new()), Arc::new(backend), principal(7));
 
     assert_eq!(client.ledger_transfer(ledger, args).await, Ok(Nat::from(77u64)));
+}
+
+#[tokio::test]
+async fn client_keeps_transfer_window_rejections_out_of_the_generic_failure_arm() {
+    let ledger = principal(1);
+    let args = TransferArg {
+        from_subaccount: None,
+        to: Account {
+            owner: principal(8),
+            subaccount: Some([9; 32]),
+        },
+        fee: Some(Nat::from(10u64)),
+        created_at_time: Some(123),
+        memo: None,
+        amount: Nat::from(100_010u64),
+    };
+
+    for (backend_error, expected) in [
+        (
+            IcrcTransferError::TooOld,
+            IcpswapClientError::LedgerTransferTooOld {
+                ledger,
+                message: IcrcTransferError::TooOld.to_string(),
+            },
+        ),
+        (
+            IcrcTransferError::CreatedInFuture { ledger_time: 42 },
+            IcpswapClientError::LedgerTransferCreatedInFuture {
+                ledger,
+                message: IcrcTransferError::CreatedInFuture { ledger_time: 42 }.to_string(),
+            },
+        ),
+        (
+            IcrcTransferError::Other("response lost".to_string()),
+            IcpswapClientError::LedgerTransfer {
+                ledger,
+                message: "response lost".to_string(),
+            },
+        ),
+    ] {
+        let mut backend = MockIcpBackend::new();
+        backend
+            .expect_icrc1_transfer_with_args()
+            .times(1)
+            .return_once(move |_, _| Err(backend_error));
+        let client = IcpswapClient::new(Arc::new(MockPipelineAgent::new()), Arc::new(backend), principal(7));
+
+        assert_eq!(client.ledger_transfer(ledger, args.clone()).await, Err(expected));
+    }
 }

@@ -3,7 +3,10 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use candid::{Decode, Encode, Nat, Principal};
 use icrc_ledger_types::icrc1::{account::Account, transfer::TransferArg};
-use liquidium_pipeline_connectors::{backend::icp_backend::IcpBackend, pipeline_agent::PipelineAgent};
+use liquidium_pipeline_connectors::{
+    backend::icp_backend::{IcpBackend, IcrcTransferError},
+    pipeline_agent::PipelineAgent,
+};
 
 use super::types::{
     IcpswapClientError, IcpswapDepositArgs, IcpswapGetPoolArgs, IcpswapPoolData, IcpswapPoolMetadata, IcpswapResult,
@@ -163,7 +166,16 @@ impl<A: PipelineAgent, B: IcpBackend> IcpswapManualClient for IcpswapClient<A, B
         self.icp_backend
             .icrc1_transfer_with_args(ledger, args)
             .await
-            .map_err(|message| IcpswapClientError::LedgerTransfer { ledger, message })
+            .map_err(|error| {
+                let message = error.to_string();
+                match error {
+                    IcrcTransferError::TooOld => IcpswapClientError::LedgerTransferTooOld { ledger, message },
+                    IcrcTransferError::CreatedInFuture { .. } => {
+                        IcpswapClientError::LedgerTransferCreatedInFuture { ledger, message }
+                    }
+                    IcrcTransferError::Other(_) => IcpswapClientError::LedgerTransfer { ledger, message },
+                }
+            })
     }
 
     async fn unused_balance(

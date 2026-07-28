@@ -218,11 +218,15 @@ async fn resume_transfer(
     execution_id: &str,
     state: &mut IcpswapState,
 ) -> Result<(), String> {
-    let args = state
-        .transfer
-        .args
-        .clone()
-        .ok_or_else(|| "pending ICPSwap transfer is missing its persisted arguments".to_string())?;
+    let Some(args) = state.transfer.args.clone() else {
+        // Without the original arguments there is nothing to deduplicate against,
+        // so a fresh transfer could move the input a second time. Returning the
+        // error alone would repeat this cycle forever; park it for an operator.
+        let message = "pending ICPSwap transfer is missing its persisted arguments".to_string();
+        recon::require_operator(state, IcpswapStep::TransferPending, message.clone());
+        persist(store, execution_id, state).await?;
+        return Err(message);
+    };
     submit_transfer(client, store, execution_id, state, args).await
 }
 
@@ -234,13 +238,41 @@ async fn submit_transfer(
     args: TransferArg,
 ) -> Result<(), String> {
     match client.ledger_transfer(state.plan.token_in, args).await {
+        // A ledger-deduplicated replay also lands here: the connector reports the
+        // original block index rather than a `Duplicate` error, so a resumed
+        // transfer completes exactly like a first-time submission.
         Ok(block_index) => {
             state.transfer.block_index = Some(block_index);
             state.step = IcpswapStep::Deposit;
             state.last_error = None;
             persist(store, execution_id, state).await
         }
+        Err(error @ IcpswapClientError::LedgerTransferCreatedInFuture { .. }) => {
+            // Ledger time only moves forward, so a timestamp the ledger reads as
+            // future-dated cannot have been accepted by an earlier identical
+            // submission either: nothing moved. Discarding the arguments is
+            // therefore safe, and it is the only way this transfer is ever
+            // accepted -- replaying the same future timestamp stays rejected.
+            state.step = IcpswapStep::Transfer;
+            state.transfer.args = None;
+            state.last_error = Some(error.to_string());
+            persist(store, execution_id, state).await?;
+            Err(error.to_string())
+        }
+        Err(error @ IcpswapClientError::LedgerTransferTooOld { .. }) => {
+            // The transaction window that made replay safe has closed: the ledger
+            // refuses these arguments permanently, and deduplication can no longer
+            // say whether an earlier attempt moved the input. Re-timestamping here
+            // would risk transferring twice, so park for reconciliation instead of
+            // retrying a call that can never succeed again.
+            recon::require_operator(state, IcpswapStep::TransferPending, error.to_string());
+            persist(store, execution_id, state).await?;
+            Err(error.to_string())
+        }
         Err(error) => {
+            // Deliberately left at `TransferPending` with its arguments intact:
+            // the outcome is ambiguous, and replaying the identical arguments is
+            // what lets ledger deduplication settle it on a later cycle.
             state.last_error = Some(error.to_string());
             persist(store, execution_id, state).await?;
             Err(error.to_string())

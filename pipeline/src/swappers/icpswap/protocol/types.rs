@@ -252,6 +252,15 @@ pub enum IcpswapClientError {
     LedgerBalance { ledger: Principal, message: String },
     #[error("ICRC-1 transfer failed on ledger {ledger}: {message}")]
     LedgerTransfer { ledger: Principal, message: String },
+    /// The persisted `created_at_time` has aged out of the ledger's transaction
+    /// window. Replaying these arguments is refused permanently, and the
+    /// deduplication that made the replay safe expired with the window.
+    #[error("ICRC-1 transfer on ledger {ledger} is outside the deduplication window: {message}")]
+    LedgerTransferTooOld { ledger: Principal, message: String },
+    /// The ledger considers `created_at_time` future-dated, so this transfer was
+    /// definitely not applied -- by this attempt or any earlier identical one.
+    #[error("ICRC-1 transfer on ledger {ledger} was created in the future: {message}")]
+    LedgerTransferCreatedInFuture { ledger: Principal, message: String },
     #[error("failed to encode arguments for ICPSwap {method}: {message}")]
     Encode { method: &'static str, message: String },
     #[error("ICPSwap {method} call to {canister} failed: {message}")]

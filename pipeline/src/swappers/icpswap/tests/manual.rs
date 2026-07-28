@@ -298,6 +298,98 @@ async fn ambiguous_transfer_resume_reuses_the_persisted_deduplication_arguments(
 }
 
 #[tokio::test]
+async fn transfer_aged_out_of_the_deduplication_window_requires_an_operator() {
+    let store = Arc::new(Store::new());
+    let mut client = MockIcpswapManualClient::new();
+    client.expect_ledger_transfer().times(1).return_once(|ledger, _| {
+        Err(IcpswapClientError::LedgerTransferTooOld {
+            ledger,
+            message: "created_at_time is too far in the past".to_string(),
+        })
+    });
+
+    advance_manual(&client, store.as_ref(), "run-1", owner(), 1_000)
+        .await
+        .expect_err("a stale transfer window cannot be replayed");
+
+    // Parked rather than left pending: replaying is refused forever and
+    // deduplication can no longer prove whether the input moved.
+    let parked = store.state();
+    assert_eq!(parked.step, IcpswapStep::OperatorRequired);
+    assert_eq!(parked.operator_pending_step, Some(IcpswapStep::TransferPending));
+    assert_eq!(parked.transfer.block_index, None);
+
+    // A further cycle reconciles instead of resubmitting the doomed arguments.
+    let mut parked_client = MockIcpswapManualClient::new();
+    parked_client.expect_ledger_transfer().times(0);
+    let resumed = advance_manual(&parked_client, store.as_ref(), "run-1", owner(), 9_000)
+        .await
+        .expect("operator reconciliation is a no-op for a pending transfer");
+    assert_eq!(resumed.step, IcpswapStep::OperatorRequired);
+}
+
+#[tokio::test]
+async fn future_dated_transfer_is_resubmitted_with_refreshed_arguments() {
+    let store = Arc::new(Store::new());
+    let mut client = MockIcpswapManualClient::new();
+    let mut transfer_sequence = Sequence::new();
+    client
+        .expect_ledger_transfer()
+        .times(1)
+        .in_sequence(&mut transfer_sequence)
+        .return_once(|ledger, args| {
+            assert_eq!(args.created_at_time, Some(5_000));
+            Err(IcpswapClientError::LedgerTransferCreatedInFuture {
+                ledger,
+                message: "current ledger time is 1000".to_string(),
+            })
+        });
+    client
+        .expect_ledger_transfer()
+        .times(1)
+        .in_sequence(&mut transfer_sequence)
+        .return_once(|_, args| {
+            // Nothing landed under the rejected timestamp, so the retry carries a
+            // current one instead of replaying a timestamp the ledger refuses.
+            assert_eq!(args.created_at_time, Some(6_000));
+            Ok(Nat::from(88u64))
+        });
+
+    advance_manual(&client, store.as_ref(), "run-1", owner(), 5_000)
+        .await
+        .expect_err("a future-dated transfer is rejected outright");
+    let rejected = store.state();
+    assert_eq!(rejected.step, IcpswapStep::Transfer);
+    assert_eq!(rejected.transfer.args, None);
+
+    let resumed = advance_manual(&client, store.as_ref(), "run-1", owner(), 6_000)
+        .await
+        .expect("refreshed transfer arguments are accepted");
+    assert_eq!(resumed.step, IcpswapStep::Deposit);
+    assert_eq!(resumed.transfer.block_index, Some(Nat::from(88u64)));
+}
+
+#[tokio::test]
+async fn pending_transfer_without_persisted_arguments_requires_an_operator() {
+    let store = Arc::new(Store::new());
+    {
+        let mut state = store.0.lock().unwrap();
+        state.step = IcpswapStep::TransferPending;
+        state.transfer.args = None;
+    }
+
+    let mut client = MockIcpswapManualClient::new();
+    client.expect_ledger_transfer().times(0);
+
+    advance_manual(&client, store.as_ref(), "run-1", owner(), 1_000)
+        .await
+        .expect_err("a pending transfer without arguments cannot be replayed");
+    let parked = store.state();
+    assert_eq!(parked.step, IcpswapStep::OperatorRequired);
+    assert_eq!(parked.operator_pending_step, Some(IcpswapStep::TransferPending));
+}
+
+#[tokio::test]
 async fn ambiguous_deposit_requires_operator_without_replaying() {
     let store = Arc::new(Store::new());
     {
