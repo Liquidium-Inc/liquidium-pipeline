@@ -424,6 +424,18 @@ async fn permanent_cex_error_marks_only_the_mexc_leg_failed() {
             .as_deref()
             .is_some_and(|error| error.starts_with(FINALIZER_PERMANENT_AMOUNT_FLOOR_PREFIX))
     );
+    // Diagnostics only: a permanent failure must not also ask to be retried.
+    assert_eq!(failed.retryable_error, None);
+
+    // A leg already persisted as failed reports the same way when re-advanced.
+    leg.execution = failed.execution;
+    leg.status = failed.status;
+    let replayed = MultiVenueAdapter::advance(&finalizer, &leg)
+        .await
+        .expect("an already failed leg re-reports its terminal state");
+    assert_eq!(replayed.status, VenueLegStatus::FailedPermanent);
+    assert!(replayed.last_error.is_some());
+    assert_eq!(replayed.retryable_error, None);
 }
 
 #[tokio::test]

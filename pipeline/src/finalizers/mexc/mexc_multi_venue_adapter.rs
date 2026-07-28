@@ -165,12 +165,22 @@ where
             None
         };
         let last_error = error.clone().or_else(|| execution.cex.last_error.clone());
+        // A permanently failed leg keeps its error for diagnostics but must never
+        // advertise it as retryable. Both paths that reach here with an error --
+        // the `CexStep::Failed` short-circuit and the amount-floor rejection --
+        // describe a swap that cannot succeed on a later cycle, so the retry
+        // signal has to be dropped at the source rather than relying on the
+        // orchestrator to filter it back out.
+        let retryable_error = match status {
+            VenueLegStatus::FailedPermanent => None,
+            _ => error,
+        };
         Ok(VenueLegProgress {
             execution: VenueExecutionState::new(VENUE_ID, &execution)?,
             status,
             result,
             last_error,
-            retryable_error: error,
+            retryable_error,
         })
     }
 
