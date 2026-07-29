@@ -18,7 +18,7 @@ use crate::{
 };
 use async_trait::async_trait;
 use candid::Nat;
-use tracing::info;
+use tracing::{debug, info};
 
 use super::parent_leg_checkpoint::ParentLegCheckpoint;
 use crate::finalizers::multi_venue::planning::venue_registry::VenueRegistry;
@@ -225,18 +225,31 @@ impl MultiVenueFinalizer {
 
             apply_progress(&mut state.legs[index], progress)
                 .map_err(|error| format!("{MULTI_VENUE_PERMANENT_PREFIX}{error}"))?;
-            info!(
-                event = "multi_venue_leg_transition",
-                liquidation_id = %row.id,
-                strategy_id = %state.plan.strategy_id,
-                leg_id = %state.legs[index].leg_id,
-                venue_id = %state.legs[index].venue_id,
-                pay_amount = %state.legs[index].request.pay_amount.value,
-                previous_status = ?current.status,
-                status = ?state.legs[index].status,
-                last_error = ?state.legs[index].last_error,
-                "Multi-venue leg advanced"
-            );
+            let advanced = &state.legs[index];
+            if current.status != advanced.status || current.last_error != advanced.last_error {
+                info!(
+                    event = "multi_venue_leg_transition",
+                    liquidation_id = %row.id,
+                    strategy_id = %state.plan.strategy_id,
+                    leg_id = %advanced.leg_id,
+                    venue_id = %advanced.venue_id,
+                    pay_amount = %advanced.request.pay_amount.value,
+                    previous_status = ?current.status,
+                    status = ?advanced.status,
+                    last_error = ?advanced.last_error,
+                    "Multi-venue leg advanced"
+                );
+            } else {
+                debug!(
+                    event = "multi_venue_leg_transition",
+                    liquidation_id = %row.id,
+                    strategy_id = %state.plan.strategy_id,
+                    leg_id = %advanced.leg_id,
+                    venue_id = %advanced.venue_id,
+                    status = ?advanced.status,
+                    "Multi-venue leg made internal progress"
+                );
+            }
             state.outcome = derive_outcome(&state.legs);
             self.persist_state(wal, row, wrapper, state).await?;
 

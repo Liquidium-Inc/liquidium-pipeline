@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use tokio::sync::Mutex;
-use tracing::info;
+use tracing::{debug, info};
 
 use super::multi_venue_finalizer::{MULTI_VENUE_PERMANENT_PREFIX, apply_progress, derive_outcome, set_meta_v2};
 use crate::{
@@ -83,16 +83,29 @@ impl VenueLegCheckpoint for ParentLegCheckpoint<'_> {
             .upsert_result(inner.row.clone())
             .await
             .map_err(|error| format!("failed to checkpoint venue leg {}: {error}", previous.leg_id))?;
-        info!(
-            event = "multi_venue_leg_checkpoint",
-            liquidation_id = %inner.row.id,
-            strategy_id = %inner.execution.plan.strategy_id,
-            leg_id = %inner.execution.legs[self.leg_index].leg_id,
-            venue_id = %inner.execution.legs[self.leg_index].venue_id,
-            previous_status = ?previous.status,
-            status = ?inner.execution.legs[self.leg_index].status,
-            "Checkpointed venue-local transition"
-        );
+        let current = &inner.execution.legs[self.leg_index];
+        if previous.status != current.status {
+            info!(
+                event = "multi_venue_leg_checkpoint",
+                liquidation_id = %inner.row.id,
+                strategy_id = %inner.execution.plan.strategy_id,
+                leg_id = %current.leg_id,
+                venue_id = %current.venue_id,
+                previous_status = ?previous.status,
+                status = ?current.status,
+                "Checkpointed venue status transition"
+            );
+        } else {
+            debug!(
+                event = "multi_venue_leg_checkpoint",
+                liquidation_id = %inner.row.id,
+                strategy_id = %inner.execution.plan.strategy_id,
+                leg_id = %current.leg_id,
+                venue_id = %current.venue_id,
+                status = ?current.status,
+                "Checkpointed venue-local state"
+            );
+        }
         Ok(())
     }
 }

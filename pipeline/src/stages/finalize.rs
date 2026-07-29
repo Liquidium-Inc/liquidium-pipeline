@@ -299,7 +299,7 @@ where
                 continue;
             }
 
-            info!(
+            debug!(
                 "[finalize] 🧾 executing receipt: liq_id={} debt_asset={} collateral_asset={} debt_repaid={} collateral_received={} swap={} swap_pay={} swap_recv={}",
                 liq_id,
                 receipt.request.debt_asset.symbol(),
