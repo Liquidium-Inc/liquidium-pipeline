@@ -132,28 +132,16 @@ fn execution_state(execution_id: &str, plan: IcpswapExecutionPlan) -> IcpswapExe
         owner: identity.principal,
         subaccount: None,
     };
-    let fee = plan.input_ledger_fee.value.clone();
-    let funding = IcpswapFundingState {
-        source: trader(),
-        destination: child,
-        fee: plan.input_ledger_fee.clone(),
-        transfer: IcpswapLedgerTransferState {
-            args: Some(TransferArg {
-                from_subaccount: None,
-                to: child,
-                amount: plan.amount_in.value.clone() + fee.clone() * Nat::from(2u8),
-                fee: Some(fee),
-                memo: None,
-                created_at_time: None,
-            }),
-            ..Default::default()
-        },
-    };
+    let funding = IcpswapFundingState::new(trader(), child, plan.input_ledger_fee.clone());
     let settlement = IcpswapSettlementState {
         kind: None,
         destination: receiver(),
         fee: plan.output_ledger_fee.clone(),
         transfer: IcpswapLedgerTransferState::default(),
+        interrupted_transfer: None,
+        interrupted_observed_debit: None,
+        recovery_credit: None,
+        residual_dust: None,
     };
     IcpswapExecutionState::prepare(execution_id, plan, identity, funding, settlement).expect("state")
 }

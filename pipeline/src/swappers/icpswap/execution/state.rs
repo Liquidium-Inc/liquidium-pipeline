@@ -1,4 +1,5 @@
 use icrc_ledger_types::icrc1::account::Account;
+use liquidium_pipeline_connectors::account::icp_account::RECOVERY_ACCOUNT;
 
 use super::{
     identity::IcpswapExecutionIdentity,
@@ -100,6 +101,19 @@ fn validate_state_fields(state: &IcpswapState) -> Result<(), String> {
     }
     if state.funding.source.subaccount.is_some() || state.funding.destination.subaccount.is_some() {
         return Err("ICPSwap funding requires default ledger accounts".to_string());
+    }
+    if state.funding.surplus_destination
+        != (Account {
+            owner: state.funding.source.owner,
+            subaccount: Some(*RECOVERY_ACCOUNT),
+        })
+    {
+        return Err("ICPSwap funding surplus destination is not the trader recovery account".to_string());
+    }
+    if state.settlement.kind == Some(super::transfer_state::IcpswapSettlementKind::OutputRecovery)
+        && state.settlement.destination != state.funding.surplus_destination
+    {
+        return Err("ICPSwap output recovery is not addressed to the trader recovery account".to_string());
     }
     Ok(())
 }

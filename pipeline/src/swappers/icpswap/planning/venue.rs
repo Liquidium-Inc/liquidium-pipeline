@@ -84,7 +84,9 @@ pub trait IcpswapFinalizerLogic: Send + Sync {
 
             let before = state.clone();
             match state.step {
-                super::types::IcpswapStep::Funding | super::types::IcpswapStep::FundingPending => {
+                super::types::IcpswapStep::Funding
+                | super::types::IcpswapStep::FundingPending
+                | super::types::IcpswapStep::FundingSurplusPending => {
                     funding_step(session.funder.as_ref(), store, execution_id, &mut state, now_nanos).await?
                 }
                 super::types::IcpswapStep::Transfer | super::types::IcpswapStep::TransferPending => {

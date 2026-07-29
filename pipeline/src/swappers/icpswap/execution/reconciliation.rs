@@ -282,6 +282,10 @@ pub(crate) fn complete_output_withdrawal(state: &mut IcpswapState, wallet_credit
     settlement.kind = Some(IcpswapSettlementKind::Output);
     settlement.fee = state.plan.output_ledger_fee.clone();
     settlement.transfer = IcpswapLedgerTransferState::default();
+    settlement.interrupted_transfer = None;
+    settlement.interrupted_observed_debit = None;
+    settlement.recovery_credit = None;
+    settlement.residual_dust = None;
     state.step = IcpswapStep::Forward;
     state.operator_pending_step = None;
     state.last_error = None;
@@ -327,6 +331,10 @@ pub(crate) fn complete_recovery(state: &mut IcpswapState, wallet_credit: Nat) {
     settlement.destination = state.funding.source;
     settlement.fee = state.plan.input_ledger_fee.clone();
     settlement.transfer = IcpswapLedgerTransferState::default();
+    settlement.interrupted_transfer = None;
+    settlement.interrupted_observed_debit = None;
+    settlement.recovery_credit = None;
+    settlement.residual_dust = None;
     state.step = IcpswapStep::Forward;
     state.operator_pending_step = None;
     state.last_error = None;

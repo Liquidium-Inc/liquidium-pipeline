@@ -286,15 +286,14 @@ mod tests {
             "42",
             plan.clone(),
             identity,
-            IcpswapFundingState {
-                source: Account {
+            IcpswapFundingState::new(
+                Account {
                     owner: Principal::from_slice(&[4]),
                     subaccount: None,
                 },
-                destination: owner,
-                fee: plan.input_ledger_fee.clone(),
-                transfer: IcpswapLedgerTransferState::default(),
-            },
+                owner,
+                plan.input_ledger_fee.clone(),
+            ),
             IcpswapSettlementState {
                 kind: None,
                 destination: Account {
@@ -303,6 +302,10 @@ mod tests {
                 },
                 fee: plan.output_ledger_fee.clone(),
                 transfer: IcpswapLedgerTransferState::default(),
+                interrupted_transfer: None,
+                interrupted_observed_debit: None,
+                recovery_credit: None,
+                residual_dust: None,
             },
         )
         .expect("state");

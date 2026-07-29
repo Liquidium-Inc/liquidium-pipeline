@@ -177,15 +177,14 @@ fn manual_state_starts_before_any_external_side_effect() {
         "run-1",
         plan.clone(),
         identity,
-        IcpswapFundingState {
-            source: Account {
+        IcpswapFundingState::new(
+            Account {
                 owner: principal(4),
                 subaccount: None,
             },
-            destination: owner,
-            fee: plan.input_ledger_fee.clone(),
-            transfer: IcpswapLedgerTransferState::default(),
-        },
+            owner,
+            plan.input_ledger_fee.clone(),
+        ),
         IcpswapSettlementState {
             kind: None,
             destination: Account {
@@ -194,6 +193,10 @@ fn manual_state_starts_before_any_external_side_effect() {
             },
             fee: plan.output_ledger_fee.clone(),
             transfer: IcpswapLedgerTransferState::default(),
+            interrupted_transfer: None,
+            interrupted_observed_debit: None,
+            recovery_credit: None,
+            residual_dust: None,
         },
     )
     .expect("state");
@@ -603,11 +606,7 @@ async fn client_reads_native_icp_through_the_legacy_account_identifier() {
             *actual_ledger == ledger && actual_account_id == expected_for_mock
         })
         .return_once(|_, _| Ok(Nat::from(1_211_132_827u64)));
-    let client = IcpswapClient::new(
-        Arc::new(MockPipelineAgent::new()),
-        Arc::new(backend),
-        principal(7),
-    );
+    let client = IcpswapClient::new(Arc::new(MockPipelineAgent::new()), Arc::new(backend), principal(7));
 
     assert_eq!(
         client.ledger_balance(ledger, &account).await,

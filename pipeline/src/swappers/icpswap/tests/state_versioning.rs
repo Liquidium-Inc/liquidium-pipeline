@@ -56,17 +56,16 @@ fn state() -> IcpswapExecutionState {
         owner: identity.principal,
         subaccount: None,
     };
-    let funding = IcpswapFundingState {
-        source: funding_trader(),
-        destination: child,
-        fee: plan.input_ledger_fee.clone(),
-        transfer: IcpswapLedgerTransferState::default(),
-    };
+    let funding = IcpswapFundingState::new(funding_trader(), child, plan.input_ledger_fee.clone());
     let settlement = IcpswapSettlementState {
         kind: None,
         destination: funding_trader(),
         fee: plan.output_ledger_fee.clone(),
         transfer: IcpswapLedgerTransferState::default(),
+        interrupted_transfer: None,
+        interrupted_observed_debit: None,
+        recovery_credit: None,
+        residual_dust: None,
     };
     IcpswapExecutionState::prepare("run", plan, identity, funding, settlement).expect("state")
 }
@@ -96,6 +95,10 @@ fn transfer_evidence_round_trips_without_private_material() {
             credited_amount: Some(Nat::from(95u8)),
             ..Default::default()
         },
+        interrupted_transfer: None,
+        interrupted_observed_debit: None,
+        recovery_credit: None,
+        residual_dust: None,
     };
 
     let json = serde_json::to_value(&state).expect("serialize state");

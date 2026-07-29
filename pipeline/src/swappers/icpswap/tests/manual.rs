@@ -19,12 +19,11 @@ use super::{
         DEPOSIT_OBSERVATION_RETRY_NANOS, MAX_DEPOSIT_OBSERVATION_ATTEMPTS, MAX_DEPOSIT_SUBMISSION_RETRIES,
         PENDING_TRADE_RECONCILIATION_TIMEOUT_NANOS, initial_slippage_bps, retry_backoff_nanos, retry_slippage_bps,
     },
+    transfer_state::{IcpswapFundingState, IcpswapLedgerTransferState, IcpswapSettlementState},
     types::{
         ICPSWAP_STATE_VERSION, IcpswapClientError, IcpswapError, IcpswapExecutionPlan, IcpswapExecutionState,
-        IcpswapStep,
-        IcpswapUnusedBalance,
+        IcpswapStep, IcpswapUnusedBalance,
     },
-    transfer_state::{IcpswapFundingState, IcpswapLedgerTransferState, IcpswapSettlementState},
 };
 
 const TEST_MNEMONIC: &str =
@@ -84,15 +83,14 @@ fn prepared_pool_state() -> IcpswapExecutionState {
         owner: identity.principal,
         subaccount: None,
     };
-    let funding = IcpswapFundingState {
-        source: Account {
+    let funding = IcpswapFundingState::new(
+        Account {
             owner: p(8),
             subaccount: None,
         },
-        destination: child,
-        fee: plan.input_ledger_fee.clone(),
-        transfer: IcpswapLedgerTransferState::default(),
-    };
+        child,
+        plan.input_ledger_fee.clone(),
+    );
     let settlement = IcpswapSettlementState {
         kind: None,
         destination: Account {
@@ -101,6 +99,10 @@ fn prepared_pool_state() -> IcpswapExecutionState {
         },
         fee: plan.output_ledger_fee.clone(),
         transfer: IcpswapLedgerTransferState::default(),
+        interrupted_transfer: None,
+        interrupted_observed_debit: None,
+        recovery_credit: None,
+        residual_dust: None,
     };
     let mut state = IcpswapExecutionState::prepare("run-1", plan, identity, funding, settlement).expect("state");
     // These tests audit only the existing child-to-pool workflow. Funding and
@@ -524,11 +526,14 @@ async fn ambiguous_deposit_is_resubmitted_when_the_deposit_account_is_unchanged(
         let pending = store.state();
         assert_eq!(pending.step, IcpswapStep::DepositPending);
         assert_eq!(pending.deposit.observation_attempts, attempt);
-        assert_eq!(pending.next_attempt_at_nanos, Some(now + DEPOSIT_OBSERVATION_RETRY_NANOS));
+        assert_eq!(
+            pending.next_attempt_at_nanos,
+            Some(now + DEPOSIT_OBSERVATION_RETRY_NANOS)
+        );
     }
 
-    let final_observation_at = submitted_at
-        + DEPOSIT_OBSERVATION_RETRY_NANOS * u64::from(MAX_DEPOSIT_OBSERVATION_ATTEMPTS);
+    let final_observation_at =
+        submitted_at + DEPOSIT_OBSERVATION_RETRY_NANOS * u64::from(MAX_DEPOSIT_OBSERVATION_ATTEMPTS);
     advance_manual(&client, store.as_ref(), "run-1", owner(), final_observation_at)
         .await
         .expect("an unchanged deposit account makes deposit-only replay safe");

@@ -106,6 +106,7 @@ pub struct IcpswapExecutionPlan {
 pub enum IcpswapStep {
     Funding,
     FundingPending,
+    FundingSurplusPending,
     Transfer,
     TransferPending,
     Deposit,

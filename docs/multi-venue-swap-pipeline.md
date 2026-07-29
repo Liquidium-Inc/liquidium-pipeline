@@ -358,25 +358,43 @@ ICPSwap derivation namespace + liquidation ID
         v
 Derived child principal
         |
-        +-- funding trader --ICP input--> child default account
-        |                                  |
-        |                                  v
+        +-- shortage <-- funding trader ----+
+        |                                    |
+        +-- surplus --> trader recovery      |
+        |                                    v
+        |                         exact committed budget
+        |                                    |
+        |                                    v
         |                         child ICPSwap deposit account
-        |                                  |
-        |                       deposit -> swap -> withdraw
-        |                                  |
-        |                                  v
-        +<-- recovery input ---------- child default account
-                                           |
-                                           +-- exact output credit --> request.receive_address
+        |                                    |
+        |                         deposit -> swap -> withdraw
+        |                                    |
+        +<-- recovery input ------------ child default account
+                                             |
+                                             +-- exact output credit --> request.receive_address
 ```
 
 The child signs its own pool transfer, deposit, swap, withdrawal, and final
 forwarding transfer. Consequently, both the ICPSwap deposit account and pool
 balances are isolated per liquidation. Recovery forwards only the recorded
 input credit to the funding trader; successful settlement forwards only the
-recorded output credit to the request receiver. Unrelated child balances are
-never swept.
+recorded output credit to the request receiver.
+
+Before the pool transfer, funding normalizes the child account to the immutable
+committed budget. A shortage is topped up by exactly the missing amount. A
+surplus is durably transferred to the trader's recovery subaccount; surplus too
+small to pay its own ledger fee is recorded as residual dust and does not block
+the trade. This makes the isolated child balance sufficient evidence for aged
+funding reconciliation without requiring the shared trader account to remain
+unchanged.
+
+An aged final forwarding transfer also uses the isolated child as its source of
+truth. If the observed debit is neither zero nor the exact intended debit, the
+WAL retains the interrupted intent and observed amount, then redirects only the
+remaining execution credit to the trader recovery subaccount. A remainder too
+small to pay its forwarding fee is recorded as settlement dust. This discrepancy
+finishes as a recovered leg rather than parking later liquidations for an
+operator.
 
 Funding and forwarding persist their exact `TransferArg`, timestamp, source
 balance baseline, and destination balance baseline before submission. A restart

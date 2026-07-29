@@ -3,7 +3,6 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use candid::Nat;
 use icrc_ledger_types::icrc1::account::Account;
-use icrc_ledger_types::icrc1::transfer::TransferArg;
 
 use crate::{
     finalizers::dex_finalizer::{DexRouteFinalizer, DexRoutePreview},
@@ -100,22 +99,7 @@ impl IcpswapFinalizer {
                 "ICPSwap allocation {allocation} does not equal pool input plus three ledger fees {required}"
             ));
         }
-        let funding = IcpswapFundingState {
-            source: self.trader,
-            destination: child,
-            fee: plan.input_ledger_fee.clone(),
-            transfer: IcpswapLedgerTransferState {
-                args: Some(TransferArg {
-                    from_subaccount: self.trader.subaccount,
-                    to: child,
-                    amount: allocation - fee.clone(),
-                    fee: Some(fee),
-                    memo: None,
-                    created_at_time: None,
-                }),
-                ..Default::default()
-            },
-        };
+        let funding = IcpswapFundingState::new(self.trader, child, plan.input_ledger_fee.clone());
         let address = request
             .receive_address
             .as_deref()
@@ -130,6 +114,10 @@ impl IcpswapFinalizer {
             destination,
             fee: plan.output_ledger_fee.clone(),
             transfer: IcpswapLedgerTransferState::default(),
+            interrupted_transfer: None,
+            interrupted_observed_debit: None,
+            recovery_credit: None,
+            residual_dust: None,
         };
         IcpswapExecutionState::prepare(execution_id, plan, identity, funding, settlement)
     }

@@ -50,6 +50,7 @@ pub(crate) async fn advance_manual(
     match state.step {
         IcpswapStep::Funding
         | IcpswapStep::FundingPending
+        | IcpswapStep::FundingSurplusPending
         | IcpswapStep::Forward
         | IcpswapStep::ForwardPending => {
             return Err("ICPSwap funding and forwarding are outside the pool-only test driver".to_string());
@@ -474,8 +475,7 @@ async fn schedule_deposit_observation_retry(
                     state.deposit.ready_to_submit = true;
                     state.step = IcpswapStep::DepositPending;
                     state.operator_pending_step = None;
-                    state.next_attempt_at_nanos =
-                        Some(now_nanos.saturating_add(DEPOSIT_OBSERVATION_RETRY_NANOS));
+                    state.next_attempt_at_nanos = Some(now_nanos.saturating_add(DEPOSIT_OBSERVATION_RETRY_NANOS));
                     state.last_error = Some(format!(
                         "deposit remained unswept after {MAX_DEPOSIT_OBSERVATION_ATTEMPTS} observations; scheduling safe deposit resubmission {}/{}",
                         state.deposit.submission_retry_count, MAX_DEPOSIT_SUBMISSION_RETRIES
@@ -493,9 +493,7 @@ async fn schedule_deposit_observation_retry(
                 }
                 Err(error) => {
                     state.deposit.ready_to_submit = false;
-                    let message = format!(
-                        "could not verify the deposit subaccount before replay: {error}"
-                    );
+                    let message = format!("could not verify the deposit subaccount before replay: {error}");
                     recon::require_operator(state, IcpswapStep::DepositPending, message.clone());
                     persist(store, execution_id, state).await?;
                     return Err(message);
