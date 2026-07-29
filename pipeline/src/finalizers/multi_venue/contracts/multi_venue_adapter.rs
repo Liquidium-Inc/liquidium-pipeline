@@ -34,12 +34,6 @@ pub struct VenueLegProgress {
     pub retryable_error: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct VenueExecutionLock {
-    pub owner_key: String,
-    pub execution_id: String,
-}
-
 /// Parent-owned persistence boundary exposed to a venue while it drives its
 /// own internal workflow. Each checkpoint atomically replaces only this leg
 /// inside the complete committed `meta_v2` envelope.
@@ -69,12 +63,6 @@ pub trait MultiVenueAdapter: Send + Sync {
     /// submitting transfers, orders, or swaps.
     async fn preview(&self, context: &VenuePlanningContext, request: &SwapRequest)
     -> Result<VenueRoutePreview, String>;
-
-    /// Optional durable exclusivity key acquired by the parent orchestrator.
-    /// Adapters remain unable to write the parent WAL row.
-    fn execution_lock(&self, _leg: &VenueLegState) -> Result<Option<VenueExecutionLock>, String> {
-        Ok(None)
-    }
 
     /// Advances the supplied leg as far as this venue considers immediately
     /// safe. Multi-step venues checkpoint every prepared intent before its

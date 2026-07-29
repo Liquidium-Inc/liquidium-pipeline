@@ -145,9 +145,11 @@ async fn selects_highest_net_output_across_all_fee_tiers() {
     assert_eq!(result.route.output_ledger_fee.value, Nat::from(10u64));
     assert_eq!(result.route.net_expected_output().value, Nat::from(1_080u64));
     assert_eq!(result.route.amount_out_minimum.value, Nat::from(1_089u64));
+    assert_eq!(result.quote.pay_amount, Nat::from(100_000u64));
     assert_eq!(result.quote.receive_amount, Nat::from(1_080u64));
+    assert_eq!(result.quote.legs[0].pay_amount, Nat::from(99_970u64));
     assert_eq!(result.quote.legs[0].route_id, principal(6).to_text());
-    assert_eq!(result.quote.legs[0].gas_fee, Nat::from(10u64));
+    assert_eq!(result.quote.legs[0].gas_fee, Nat::from(20u64));
     let expected_impact = (99_970.0 - 1_100.0) / 99_970.0 * 10_000.0;
     assert!((result.quote.estimated_price_impact_bps - expected_impact).abs() < 0.000_001);
 }

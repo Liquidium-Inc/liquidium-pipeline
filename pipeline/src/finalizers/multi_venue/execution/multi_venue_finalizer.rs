@@ -4,7 +4,7 @@ use crate::{
     finalizers::finalizer::{Finalizer, FinalizerErrorKind, FinalizerResult},
     finalizers::multi_venue::{
         IcpswapFirstPlanInput, IcpswapFirstPlanner, IcpswapFirstPlannerConfig, IcpswapFirstPlannerError,
-        MultiVenueAdapter, VenueExecutionLock, VenueLegProgress,
+        MultiVenueAdapter, VenueLegProgress,
     },
     persistance::{
         FINALIZER_META_V2_VERSION, FinalizerDecisionSnapshot, FinalizerMetaPayload, FinalizerMetaV2, LiqMetaWrapper,
@@ -24,7 +24,6 @@ use super::parent_leg_checkpoint::ParentLegCheckpoint;
 use crate::finalizers::multi_venue::planning::venue_registry::VenueRegistry;
 
 pub(super) const MULTI_VENUE_PERMANENT_PREFIX: &str = "permanent multi-venue finalizer: ";
-const MULTI_VENUE_LOCK_CLEANUP_PREFIX: &str = "multi-venue lock cleanup: ";
 const MULTI_VENUE_CUSTODY_PREFIX: &str = "multi-venue venue custody: ";
 
 /// Mutable parent state shared by one multi-venue finalization invocation.
@@ -83,18 +82,6 @@ impl MultiVenueFinalizer {
     pub fn with_watchdog(mut self, watchdog: Arc<dyn Watchdog>) -> Self {
         self.watchdog = watchdog;
         self
-    }
-
-    async fn notify_lock_cleanup_required(&self, lock: &VenueExecutionLock, venue_id: &str, detail: &str) {
-        self.watchdog
-            .notify(WatchdogEvent::OperatorRequired {
-                execution_id: lock.execution_id.clone(),
-                venue: venue_id.to_string(),
-                pending_step: "lock_cleanup".to_string(),
-                owner: lock.owner_key.clone(),
-                details: detail.to_string(),
-            })
-            .await;
     }
 
     async fn notify_operator_required_leg(&self, leg: &VenueLegState) {
@@ -209,15 +196,10 @@ impl MultiVenueFinalizer {
         let wrapper = &mut context.wrapper;
         let state = &mut context.state;
         let mut retryable_errors = Vec::new();
-        let mut lock_cleanup_failed = false;
         for index in 0..state.legs.len() {
             let current = state.legs[index].clone();
-            let terminal = matches!(
-                current.status,
-                VenueLegStatus::Completed | VenueLegStatus::Recovered | VenueLegStatus::FailedPermanent
-            );
             let runnable = matches!(current.status, VenueLegStatus::Planned | VenueLegStatus::Running);
-            if !terminal && !runnable {
+            if !runnable {
                 continue;
             }
 
@@ -227,37 +209,6 @@ impl MultiVenueFinalizer {
                     current.venue_id
                 )
             })?;
-            let execution_lock = adapter.execution_lock(&current)?;
-
-            // Terminal state was already persisted in an earlier transition.
-            // Retrying this idempotent delete lets a previous release failure
-            // recover without advancing or replaying the venue leg.
-            if terminal {
-                if let Some(lock) = &execution_lock
-                    && let Err(error) = wal
-                        .release_icpswap_execution_lock(&lock.owner_key, &lock.execution_id)
-                        .await
-                {
-                    lock_cleanup_failed = true;
-                    let detail = format!(
-                        "{} leg `{}` failed releasing terminal execution lock: {error}",
-                        current.venue_id, current.leg_id
-                    );
-                    self.notify_lock_cleanup_required(lock, &current.venue_id, &detail)
-                        .await;
-                    retryable_errors.push(detail);
-                }
-                continue;
-            }
-
-            if let Some(lock) = &execution_lock
-                && !wal
-                    .acquire_icpswap_execution_lock(&lock.owner_key, &lock.execution_id)
-                    .await
-                    .map_err(|error| format!("failed acquiring venue execution lock: {error}"))?
-            {
-                continue;
-            }
             let checkpoint = ParentLegCheckpoint::new(wal, index, row, wrapper, state);
             let execution_result = adapter.advance(&current, &checkpoint).await;
             // Venue-local checkpoints may have committed several transitions
@@ -297,26 +248,6 @@ impl MultiVenueFinalizer {
                 self.notify_operator_required_leg(&state.legs[index]).await;
             }
 
-            if matches!(
-                state.legs[index].status,
-                VenueLegStatus::Completed | VenueLegStatus::Recovered | VenueLegStatus::FailedPermanent
-            ) && let Some(lock) = &execution_lock
-            {
-                if let Err(error) = wal
-                    .release_icpswap_execution_lock(&lock.owner_key, &lock.execution_id)
-                    .await
-                {
-                    lock_cleanup_failed = true;
-                    let detail = format!(
-                        "{} leg `{}` failed releasing terminal execution lock: {error}",
-                        state.legs[index].venue_id, state.legs[index].leg_id
-                    );
-                    self.notify_lock_cleanup_required(lock, &state.legs[index].venue_id, &detail)
-                        .await;
-                    retryable_errors.push(detail);
-                }
-            }
-
             if state.legs[index].status != VenueLegStatus::FailedPermanent
                 && let Some(error) = retryable_error
             {
@@ -330,11 +261,6 @@ impl MultiVenueFinalizer {
         state.outcome = derive_outcome(&state.legs);
         if retryable_errors.is_empty() {
             Ok(())
-        } else if lock_cleanup_failed {
-            Err(format!(
-                "{MULTI_VENUE_LOCK_CLEANUP_PREFIX}{}",
-                retryable_errors.join("; ")
-            ))
         } else {
             Err(retryable_errors.join("; "))
         }
@@ -541,8 +467,6 @@ impl Finalizer for MultiVenueFinalizer {
     fn classify_error(&self, error: &str) -> FinalizerErrorKind {
         if error.starts_with(MULTI_VENUE_PERMANENT_PREFIX) {
             FinalizerErrorKind::Permanent
-        } else if error.starts_with(MULTI_VENUE_LOCK_CLEANUP_PREFIX) {
-            FinalizerErrorKind::LockCleanup
         } else if error.starts_with(MULTI_VENUE_CUSTODY_PREFIX) {
             FinalizerErrorKind::VenueCustody
         } else {
@@ -559,13 +483,10 @@ impl Finalizer for MultiVenueFinalizer {
 /// reconciled by anything. Tagging it routes budget exhaustion to an operator
 /// park instead, which stays visible and can be requeued.
 ///
-/// Errors that already carry a classification keep it: a permanent decision and
-/// a lock-cleanup retry are both more specific than "a leg is running".
+/// Errors that already carry a classification keep it because a permanent
+/// decision is more specific than "a leg is running".
 fn tag_custody_error(state: &MultiVenueExecutionState, error: String) -> String {
-    if error.starts_with(MULTI_VENUE_PERMANENT_PREFIX)
-        || error.starts_with(MULTI_VENUE_LOCK_CLEANUP_PREFIX)
-        || error.starts_with(MULTI_VENUE_CUSTODY_PREFIX)
-    {
+    if error.starts_with(MULTI_VENUE_PERMANENT_PREFIX) || error.starts_with(MULTI_VENUE_CUSTODY_PREFIX) {
         return error;
     }
 

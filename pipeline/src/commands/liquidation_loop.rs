@@ -26,12 +26,13 @@ use crate::{
         profit_calculator::SimpleProfitCalculator,
     },
     liquidation::collateral_service::CollateralService,
-    persistance::{FinalizerMetaPayload, MultiVenueExecutionOutcome, sqlite::SqliteWalStore},
+    persistance::{FinalizerMetaPayload, MultiVenueExecutionOutcome, VenueLegStatus, sqlite::SqliteWalStore},
     price_oracle::price_oracle::LiquidationPriceOracle,
     stages::{
         export::ExportStage, finalize::FinalizeStage, opportunity::OpportunityFinder,
         settlement_watcher::SettlementWatcher, simple_strategy::SimpleLiquidationStrategy,
     },
+    swappers::icpswap::{identity::IcpswapExecutionIdentity, types::IcpswapExecutionState},
     wal::decode_receipt_wrapper,
     watchdog::{
         WatchdogEvent,
@@ -70,7 +71,15 @@ fn disabled_venue_ids<'a>(
     disabled
 }
 
-fn ensure_committed_venues_are_enabled(db: &SqliteWalStore, enabled_venues: &[String]) -> Result<(), String> {
+fn validate_icpswap_identity(identity: &IcpswapExecutionIdentity, configured_mnemonic: &str) -> Result<(), String> {
+    identity.validate_and_derive(configured_mnemonic).map(|_| ())
+}
+
+fn ensure_committed_venues_are_resumable(
+    db: &SqliteWalStore,
+    enabled_venues: &[String],
+    configured_icpswap_mnemonic: &str,
+) -> Result<(), String> {
     let enabled: HashSet<&str> = enabled_venues.iter().map(String::as_str).collect();
     let mut conflicts = Vec::new();
 
@@ -99,6 +108,42 @@ fn ensure_committed_venues_are_enabled(db: &SqliteWalStore, enabled_venues: &[St
         );
         if !disabled.is_empty() {
             conflicts.push(format!("{} [{}]", row.id, disabled.join(",")));
+        }
+
+        // Every runnable or parked ICPSwap leg must still derive the principal
+        // committed before its first side effect. Detect mnemonic or descriptor
+        // drift at startup rather than waiting for the next execution cycle.
+        for leg in &state.legs {
+            if leg.venue_id != ICPSWAP_VENUE_ID
+                || !enabled.contains(ICPSWAP_VENUE_ID)
+                || matches!(
+                    leg.status,
+                    VenueLegStatus::Completed | VenueLegStatus::Recovered | VenueLegStatus::FailedPermanent
+                )
+            {
+                continue;
+            }
+            let execution = leg
+                .execution
+                .decode::<IcpswapExecutionState>(ICPSWAP_VENUE_ID)
+                .map_err(|error| {
+                    format!(
+                        "cannot resume unfinished WAL row {} ICPSwap leg `{}` because its execution state is malformed: {error}",
+                        row.id, leg.leg_id
+                    )
+                })?
+                .ok_or_else(|| {
+                    format!(
+                        "cannot resume unfinished WAL row {} ICPSwap leg `{}` because its execution state is missing",
+                        row.id, leg.leg_id
+                    )
+                })?;
+            validate_icpswap_identity(&execution.identity, configured_icpswap_mnemonic).map_err(|error| {
+                format!(
+                    "cannot resume unfinished WAL row {} ICPSwap leg `{}` because its derived principal cannot be reproduced: {error}",
+                    row.id, leg.leg_id
+                )
+            })?;
         }
     }
 
@@ -129,7 +174,11 @@ async fn init(
     let agent = ctx.agent.clone();
     let registry = ctx.registry.clone();
     let db = Arc::new(SqliteWalStore::new(&config.db_path).map_err(|e| format!("could not connect to db: {e}"))?);
-    ensure_committed_venues_are_enabled(db.as_ref(), &config.enabled_swap_venues)?;
+    ensure_committed_venues_are_resumable(
+        db.as_ref(),
+        &config.enabled_swap_venues,
+        &config.icpswap_mnemonic,
+    )?;
 
     let tokens = debt_asset_principals(&registry);
 
@@ -424,9 +473,10 @@ pub enum LoopControl {
 
 #[cfg(test)]
 mod tests {
-    use super::disabled_venue_ids;
+    use super::{disabled_venue_ids, validate_icpswap_identity};
     use crate::commands::liquidation_loop_helpers::console_ui_enabled;
     use crate::persistance::MultiVenueExecutionOutcome;
+    use crate::swappers::icpswap::identity::IcpswapExecutionIdentity;
     use std::collections::HashSet;
     use std::io::IsTerminal;
 
@@ -485,5 +535,19 @@ mod tests {
             &enabled,
         );
         assert!(disabled.is_empty());
+    }
+
+    #[test]
+    fn startup_identity_check_rejects_a_different_configured_mnemonic() {
+        const COMMITTED_MNEMONIC: &str =
+            "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+        const DIFFERENT_MNEMONIC: &str = "legal winner thank year wave sausage worth useful legal winner thank yellow";
+        let (identity, _) = IcpswapExecutionIdentity::derive(COMMITTED_MNEMONIC, "1536").expect("identity");
+
+        validate_icpswap_identity(&identity, COMMITTED_MNEMONIC).expect("matching mnemonic");
+        let error = validate_icpswap_identity(&identity, DIFFERENT_MNEMONIC)
+            .expect_err("startup must reject a principal mismatch");
+
+        assert!(error.contains("does not match the configured mnemonic"));
     }
 }

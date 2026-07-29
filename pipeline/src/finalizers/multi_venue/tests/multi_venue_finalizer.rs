@@ -1,10 +1,10 @@
 use super::super::*;
 
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::VecDeque,
     sync::{
         Arc, Mutex, Weak,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicUsize, Ordering},
     },
 };
 
@@ -24,7 +24,7 @@ use crate::{
     executors::executor::ExecutorRequest,
     finalizers::{
         finalizer::{Finalizer, FinalizerErrorKind},
-        multi_venue::{ICPSWAP_VENUE_ID, MEXC_VENUE_ID, VenueExecutionLock, VenueLegProgress, VenueRoutePreview},
+        multi_venue::{ICPSWAP_VENUE_ID, MEXC_VENUE_ID, VenueLegProgress, VenueRoutePreview},
         profit_calculator::SimpleProfitCalculator,
     },
     persistance::{
@@ -64,10 +64,6 @@ impl Watchdog for RecordingWatchdog {
 
 struct TestWal {
     row: Mutex<Option<LiqResultRecord>>,
-    lock_available: AtomicBool,
-    lock_release_available: AtomicBool,
-    lock_acquisitions: AtomicUsize,
-    lock_releases: AtomicUsize,
 }
 
 impl TestWal {
@@ -97,10 +93,6 @@ impl TestWal {
         encode_meta(&mut row, &wrapper).expect("encode wrapper");
         Self {
             row: Mutex::new(Some(row)),
-            lock_available: AtomicBool::new(true),
-            lock_release_available: AtomicBool::new(true),
-            lock_acquisitions: AtomicUsize::new(0),
-            lock_releases: AtomicUsize::new(0),
         }
     }
 
@@ -160,33 +152,18 @@ impl WalStore for TestWal {
     async fn delete(&self, _liq_id: &str) -> anyhow::Result<()> {
         Ok(())
     }
-
-    async fn acquire_icpswap_execution_lock(&self, _owner: &str, _execution_id: &str) -> anyhow::Result<bool> {
-        self.lock_acquisitions.fetch_add(1, Ordering::SeqCst);
-        Ok(self.lock_available.load(Ordering::SeqCst))
-    }
-
-    async fn release_icpswap_execution_lock(&self, _owner: &str, _execution_id: &str) -> anyhow::Result<()> {
-        self.lock_releases.fetch_add(1, Ordering::SeqCst);
-        if !self.lock_release_available.load(Ordering::SeqCst) {
-            anyhow::bail!("injected lock release failure");
-        }
-        Ok(())
-    }
 }
 
 /// Multi-row WAL used to prove that one parked or retryable venue execution
 /// cannot prevent the outer finalize batch from advancing the following row.
 struct BatchWal {
     rows: Mutex<Vec<LiqResultRecord>>,
-    icpswap_locks: Mutex<HashMap<String, String>>,
 }
 
 impl BatchWal {
     fn new(receipts: impl IntoIterator<Item = ExecutionReceipt>) -> Self {
         Self {
             rows: Mutex::new(receipts.into_iter().map(row_for_receipt).collect()),
-            icpswap_locks: Mutex::new(HashMap::new()),
         }
     }
 
@@ -241,10 +218,6 @@ impl BatchWal {
             .expect("batch WAL wrapper");
         let FinalizerMetaPayload::MultiVenueSwap(state) = wrapper.meta_v2.expect("committed meta_v2").payload;
         state
-    }
-
-    fn lock_holder(&self, owner: &str) -> Option<String> {
-        self.icpswap_locks.lock().expect("batch lock table").get(owner).cloned()
     }
 }
 
@@ -331,22 +304,6 @@ impl WalStore for BatchWal {
         self.rows.lock().expect("batch WAL lock").retain(|row| row.id != liq_id);
         Ok(())
     }
-
-    async fn acquire_icpswap_execution_lock(&self, owner: &str, execution_id: &str) -> anyhow::Result<bool> {
-        let mut locks = self.icpswap_locks.lock().expect("batch lock table");
-        let holder = locks
-            .entry(owner.to_string())
-            .or_insert_with(|| execution_id.to_string());
-        Ok(holder == execution_id)
-    }
-
-    async fn release_icpswap_execution_lock(&self, owner: &str, execution_id: &str) -> anyhow::Result<()> {
-        let mut locks = self.icpswap_locks.lock().expect("batch lock table");
-        if locks.get(owner).is_some_and(|holder| holder == execution_id) {
-            locks.remove(owner);
-        }
-        Ok(())
-    }
 }
 
 struct ScriptedAdapter {
@@ -360,8 +317,6 @@ struct ScriptedAdapter {
     recover_calls: AtomicUsize,
     wal: Mutex<Weak<TestWal>>,
     observed_statuses: Mutex<Vec<Vec<VenueLegStatus>>>,
-    execution_lock: Option<VenueExecutionLock>,
-    execution_lock_owner: Option<String>,
     /// Makes `advance` fail structurally, the way a decode or dispatch error
     /// does: the leg is never touched, so it cannot be holding funds.
     advance_failure: Option<String>,
@@ -380,8 +335,6 @@ impl ScriptedAdapter {
             recover_calls: AtomicUsize::new(0),
             wal: Mutex::new(Weak::new()),
             observed_statuses: Mutex::new(Vec::new()),
-            execution_lock: None,
-            execution_lock_owner: None,
             advance_failure: None,
         }
     }
@@ -402,19 +355,6 @@ impl ScriptedAdapter {
 
     fn with_recovery_progresses(self, progresses: Vec<VenueLegStatus>) -> Self {
         *self.recovery_progresses.lock().expect("recovery progress lock") = progresses.into();
-        self
-    }
-
-    fn with_execution_lock(mut self, owner_key: &str, execution_id: &str) -> Self {
-        self.execution_lock = Some(VenueExecutionLock {
-            owner_key: owner_key.to_string(),
-            execution_id: execution_id.to_string(),
-        });
-        self
-    }
-
-    fn with_execution_lock_owner(mut self, owner_key: &str) -> Self {
-        self.execution_lock_owner = Some(owner_key.to_string());
         self
     }
 
@@ -473,17 +413,6 @@ impl MultiVenueAdapter for ScriptedAdapter {
                 state: serde_json::json!({ "step": "planned" }),
             },
         })
-    }
-
-    fn execution_lock(&self, leg: &VenueLegState) -> Result<Option<VenueExecutionLock>, String> {
-        Ok(self
-            .execution_lock_owner
-            .as_ref()
-            .map(|owner_key| VenueExecutionLock {
-                owner_key: owner_key.clone(),
-                execution_id: format!("{}-execution", leg.leg_id),
-            })
-            .or_else(|| self.execution_lock.clone()))
     }
 
     async fn advance(
@@ -822,8 +751,7 @@ async fn permanent_failure_is_not_readvanced_or_rerouted() {
     let wal = TestWal::with_receipt(&receipt);
     let icpswap = Arc::new(
         ScriptedAdapter::new(ICPSWAP_VENUE_ID, None, vec![VenueLegStatus::FailedPermanent])
-            .with_retryable_errors(vec![Some("deposit outcome could not be proven".to_string())])
-            .with_execution_lock("shared-trader", "failed-execution"),
+            .with_retryable_errors(vec![Some("deposit outcome could not be proven".to_string())]),
     );
     let mexc = Arc::new(ScriptedAdapter::new(MEXC_VENUE_ID, None, Vec::new()));
     let finalizer = finalizer(vec![icpswap.clone(), mexc.clone()]);
@@ -834,16 +762,12 @@ async fn permanent_failure_is_not_readvanced_or_rerouted() {
         .expect_err("permanent failure");
     assert_eq!(finalizer.classify_error(&first_error), FinalizerErrorKind::Permanent);
     assert!(first_error.contains("icpswap-0: deposit outcome could not be proven"));
-    assert_eq!(wal.lock_acquisitions.load(Ordering::SeqCst), 1);
-    assert_eq!(wal.lock_releases.load(Ordering::SeqCst), 1);
     finalizer
         .finalize(&wal, receipt)
         .await
         .expect_err("restart remains failed");
     assert_eq!(icpswap.calls(), 1);
     assert_eq!(mexc.calls(), 0);
-    assert_eq!(wal.lock_acquisitions.load(Ordering::SeqCst), 1);
-    assert_eq!(wal.lock_releases.load(Ordering::SeqCst), 2);
     assert!(matches!(
         committed_state(&wal).outcome,
         MultiVenueExecutionOutcome::PartialRecovered { .. }
@@ -895,17 +819,14 @@ async fn partial_recovery_still_reports_the_completed_leg_proceeds() {
 }
 
 #[tokio::test]
-async fn failed_icpswap_leg_releases_its_lock_while_the_split_mexc_leg_completes() {
+async fn failed_icpswap_leg_does_not_prevent_the_split_mexc_leg_from_completing() {
     let receipt = receipt();
     let wal = TestWal::with_receipt(&receipt);
-    let icpswap = Arc::new(
-        ScriptedAdapter::new(
-            ICPSWAP_VENUE_ID,
-            Some(TOTAL_PAY / 2),
-            vec![VenueLegStatus::FailedPermanent],
-        )
-        .with_execution_lock("shared-trader", "failed-split-leg"),
-    );
+    let icpswap = Arc::new(ScriptedAdapter::new(
+        ICPSWAP_VENUE_ID,
+        Some(TOTAL_PAY / 2),
+        vec![VenueLegStatus::FailedPermanent],
+    ));
     let mexc = Arc::new(ScriptedAdapter::new(
         MEXC_VENUE_ID,
         None,
@@ -922,8 +843,6 @@ async fn failed_icpswap_leg_releases_its_lock_while_the_split_mexc_leg_completes
     assert!(!result.operator_required);
     assert_eq!(icpswap.calls(), 1);
     assert_eq!(mexc.calls(), 1);
-    assert_eq!(wal.lock_acquisitions.load(Ordering::SeqCst), 1);
-    assert_eq!(wal.lock_releases.load(Ordering::SeqCst), 1);
     assert!(matches!(
         committed_state(&wal).outcome,
         MultiVenueExecutionOutcome::PartialRecovered { .. }
@@ -1035,68 +954,6 @@ async fn mexc_only_registry_commits_a_single_mexc_leg() {
     assert_eq!(state.plan.strategy_id, "icpswap_first");
     assert_eq!(state.legs.len(), 1);
     assert_eq!(state.legs[0].venue_id, MEXC_VENUE_ID);
-}
-
-#[tokio::test]
-async fn exclusive_venue_leg_waits_for_its_durable_owner_lock() {
-    let receipt = receipt();
-    let wal = TestWal::with_receipt(&receipt);
-    wal.lock_available.store(false, Ordering::SeqCst);
-    let icpswap = Arc::new(
-        ScriptedAdapter::new(ICPSWAP_VENUE_ID, None, vec![VenueLegStatus::Completed])
-            .with_execution_lock("trader", "icpswap-execution"),
-    );
-    let mexc = Arc::new(ScriptedAdapter::new(MEXC_VENUE_ID, None, Vec::new()));
-    let finalizer = finalizer(vec![icpswap.clone(), mexc]);
-
-    let waiting = finalizer
-        .finalize(&wal, receipt.clone())
-        .await
-        .expect("lock contention is not a finalizer failure");
-    assert!(!waiting.finalized);
-    assert_eq!(icpswap.calls(), 0);
-    assert_eq!(wal.lock_acquisitions.load(Ordering::SeqCst), 1);
-
-    wal.lock_available.store(true, Ordering::SeqCst);
-    let completed = finalizer.finalize(&wal, receipt).await.expect("lock owner may advance");
-    assert!(completed.finalized);
-    assert_eq!(icpswap.calls(), 1);
-    assert_eq!(wal.lock_releases.load(Ordering::SeqCst), 1);
-}
-
-#[tokio::test]
-async fn terminal_leg_retries_lock_cleanup_without_readvancing_the_venue() {
-    let receipt = receipt();
-    let wal = TestWal::with_receipt(&receipt);
-    wal.lock_release_available.store(false, Ordering::SeqCst);
-    let icpswap = Arc::new(
-        ScriptedAdapter::new(ICPSWAP_VENUE_ID, None, vec![VenueLegStatus::Completed])
-            .with_execution_lock("trader", "icpswap-execution"),
-    );
-    let mexc = Arc::new(ScriptedAdapter::new(MEXC_VENUE_ID, None, Vec::new()));
-    let watchdog = Arc::new(RecordingWatchdog::default());
-    let finalizer = finalizer(vec![icpswap.clone(), mexc]).with_watchdog(watchdog.clone());
-
-    let first = finalizer
-        .finalize(&wal, receipt.clone())
-        .await
-        .expect_err("failed cleanup must keep the parent WAL row retryable");
-    assert_eq!(finalizer.classify_error(&first), FinalizerErrorKind::LockCleanup);
-    assert_eq!(wal.leg_statuses(), vec![VenueLegStatus::Completed]);
-    assert_eq!(icpswap.calls(), 1);
-    assert_eq!(
-        watchdog.0.lock().expect("watchdog lock").as_slice(),
-        &[("icpswap-execution".to_string(), "lock_cleanup".to_string(),)]
-    );
-
-    wal.lock_release_available.store(true, Ordering::SeqCst);
-    let second = finalizer
-        .finalize(&wal, receipt)
-        .await
-        .expect("the next cycle should retry only lock cleanup");
-    assert!(second.finalized);
-    assert_eq!(icpswap.calls(), 1);
-    assert_eq!(wal.lock_releases.load(Ordering::SeqCst), 2);
 }
 
 #[tokio::test]
@@ -1270,22 +1127,18 @@ async fn reenqueuing_the_parent_row_does_not_rearm_an_operator_required_mexc_leg
 }
 
 #[tokio::test]
-async fn abandoned_icpswap_row_releases_the_owner_for_the_next_batch_row() {
-    const ABANDONED_ID: u128 = 807;
+async fn operator_required_isolated_icpswap_row_does_not_block_the_next_batch_row() {
+    const PARKED_ID: u128 = 807;
     const SUCCEEDING_ID: u128 = 808;
-    const OWNER: &str = "shared-icpswap-trader";
     let wal = Arc::new(BatchWal::new([
-        receipt_with_id(ABANDONED_ID),
+        receipt_with_id(PARKED_ID),
         receipt_with_id(SUCCEEDING_ID),
     ]));
-    let icpswap = Arc::new(
-        ScriptedAdapter::new(
-            ICPSWAP_VENUE_ID,
-            None,
-            vec![VenueLegStatus::FailedPermanent, VenueLegStatus::Completed],
-        )
-        .with_execution_lock_owner(OWNER),
-    );
+    let icpswap = Arc::new(ScriptedAdapter::new(
+        ICPSWAP_VENUE_ID,
+        None,
+        vec![VenueLegStatus::OperatorRequired, VenueLegStatus::Completed],
+    ));
     let finalizer = Arc::new(
         MultiVenueFinalizer::new(vec![icpswap.clone()], planner_config()).expect("valid ICPSwap-only finalizer"),
     );
@@ -1301,11 +1154,19 @@ async fn abandoned_icpswap_row_releases_the_owner_for_the_next_batch_row() {
 
     let outcomes = stage.process(&()).await.expect("the next ICPSwap row should continue");
 
-    assert_eq!(wal.status(ABANDONED_ID), ResultStatus::FailedPermanent);
+    assert_eq!(wal.status(PARKED_ID), ResultStatus::OperatorRequired);
     assert_eq!(wal.status(SUCCEEDING_ID), ResultStatus::Succeeded);
     assert_eq!(icpswap.calls(), 2);
-    assert_eq!(outcomes.len(), 2);
-    assert_eq!(wal.lock_holder(OWNER), None);
+    assert_eq!(outcomes.len(), 1);
+    assert_eq!(
+        outcomes[0]
+            .execution_receipt
+            .liquidation_result
+            .as_ref()
+            .expect("successful liquidation result")
+            .id,
+        SUCCEEDING_ID
+    );
 }
 
 #[tokio::test]

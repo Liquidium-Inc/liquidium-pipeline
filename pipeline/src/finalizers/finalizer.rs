@@ -6,7 +6,6 @@ use crate::{persistance::WalStore, stages::executor::ExecutionReceipt, swappers:
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FinalizerErrorKind {
     Retryable,
-    LockCleanup,
     /// Retryable, but raised while a venue leg may still hold the liquidation's
     /// funds. Exhausting the retry budget must park the row for an operator
     /// rather than fail it permanently, because a permanently failed row leaves

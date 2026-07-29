@@ -4,7 +4,6 @@ use async_trait::async_trait;
 use candid::Nat;
 use icrc_ledger_types::icrc1::account::Account;
 use icrc_ledger_types::icrc1::transfer::TransferArg;
-use tracing::debug;
 
 use crate::{
     finalizers::dex_finalizer::{DexRouteFinalizer, DexRoutePreview},
@@ -28,7 +27,6 @@ use crate::{
 };
 
 pub(crate) const ICPSWAP_FINALIZER_PERMANENT_PREFIX: &str = "permanent ICPSwap finalizer: ";
-const ICPSWAP_LOCK_CLEANUP_PREFIX: &str = "ICPSwap lock cleanup: ";
 
 /// Cooldown applied after a non-terminal step fails.
 ///
@@ -41,8 +39,7 @@ pub(super) const RETRY_COOLDOWN_NANOS: u64 = 20 * 1_000_000_000;
 
 type Clock = dyn Fn() -> u64 + Send + Sync;
 
-/// Terminal steps own the per-owner lock release: the execution is over, so the
-/// slot must be freed whether it ended in success, refund, or failure.
+/// Steps after which no ICPSwap side effect may be submitted again.
 pub(super) fn is_terminal_step(step: IcpswapStep) -> bool {
     matches!(
         step,
@@ -201,36 +198,10 @@ impl IcpswapFinalizer {
         }
     }
 
-    /// Frees the owner slot after terminal state is durable. Deletion is
-    /// idempotent, so propagating a failure keeps the WAL row retryable and the
-    /// next cycle can perform cleanup without replaying any IC side effect.
-    async fn release_execution_lock(
-        &self,
-        wal: &dyn WalStore,
-        owner_key: &str,
-        liquidation_id: &str,
-    ) -> Result<(), String> {
-        if let Err(error) = wal.release_icpswap_execution_lock(owner_key, liquidation_id).await {
-            let detail = format!("failed releasing terminal ICPSwap owner lock: {error}");
-            self.watchdog
-                .notify(WatchdogEvent::OperatorRequired {
-                    execution_id: liquidation_id.to_string(),
-                    venue: VENUE_ID.to_string(),
-                    pending_step: "lock_cleanup".to_string(),
-                    owner: owner_key.to_string(),
-                    details: detail.clone(),
-                })
-                .await;
-            return Err(format!("{ICPSWAP_LOCK_CLEANUP_PREFIX}{detail}"));
-        }
-        Ok(())
-    }
-
     /// Alerts for as long as the execution stays parked, not just on the way in.
-    /// A parked swap holds the owner lock and keeps polling, so it looks healthy
-    /// from the outside; alerting once means a single dropped webhook hides a
-    /// stalled venue indefinitely. The watchdog's cooldown key throttles this
-    /// into a periodic re-escalation.
+    /// Alerting once means a single dropped webhook can hide ambiguous custody
+    /// indefinitely. The watchdog's cooldown key throttles repeated polls into
+    /// a periodic re-escalation.
     pub(super) async fn notify_operator_required(&self, execution_id: &str, state: &IcpswapExecutionState) {
         if state.step != IcpswapStep::OperatorRequired {
             return;
@@ -264,19 +235,11 @@ impl Finalizer for IcpswapFinalizer {
         let store = WalIcpswapExecutionStateStore::new(wal);
         let mut loaded_state = self.load_state(&store, &liquidation_id).await?;
         let now_nanos = (self.clock)();
-        let owner_key = loaded_state.owner.owner.to_text();
-
-        // A prior cycle may have persisted terminal state and then failed to
-        // delete the durable lock. Retry only that idempotent cleanup; never
-        // call the venue workflow again for a terminal execution.
         if is_terminal_step(loaded_state.step) {
-            self.release_execution_lock(wal, &owner_key, &liquidation_id).await?;
             return self.result_for_state(&receipt, &loaded_state, now_nanos).await;
         }
 
-        // Back off after a failed step instead of re-running it every cycle. The
-        // owner lock is deliberately not taken yet: a cooling-down execution
-        // still holds it, and re-acquiring here would be a no-op anyway.
+        // Back off after a failed step instead of re-running it every cycle.
         if loaded_state
             .next_attempt_at_nanos
             .is_some_and(|ready_at| now_nanos < ready_at)
@@ -288,20 +251,6 @@ impl Finalizer for IcpswapFinalizer {
             return Ok(FinalizerResult::noop());
         }
 
-        if !wal
-            .acquire_icpswap_execution_lock(&owner_key, &liquidation_id)
-            .await
-            .map_err(|error| format!("failed acquiring ICPSwap owner lock: {error}"))?
-        {
-            // Contention, not failure. Returning `Err` here would count toward
-            // the finalize stage's bounded retry budget and permanently fail a
-            // valid liquidation for merely waiting its turn.
-            debug!(
-                owner = %self.trader.owner,
-                liquidation_id, "ICPSwap owner busy; deferring to a later cycle"
-            );
-            return Ok(FinalizerResult::noop());
-        }
         // Cleared before advancing, not after, so the workflow's own persist
         // carries the reset -- a successful step must not inherit the cooldown
         // left behind by the failure that preceded it.
@@ -332,10 +281,6 @@ impl Finalizer for IcpswapFinalizer {
 
         self.notify_operator_required(&liquidation_id, &state).await;
 
-        if is_terminal_step(state.step) {
-            self.release_execution_lock(wal, &owner_key, &liquidation_id).await?;
-        }
-
         if let Some(error) = advance_error {
             if state.step == IcpswapStep::Failed {
                 return Err(permanent_message(&error));
@@ -349,8 +294,6 @@ impl Finalizer for IcpswapFinalizer {
     fn classify_error(&self, error: &str) -> FinalizerErrorKind {
         if error.starts_with(ICPSWAP_FINALIZER_PERMANENT_PREFIX) {
             FinalizerErrorKind::Permanent
-        } else if error.starts_with(ICPSWAP_LOCK_CLEANUP_PREFIX) {
-            FinalizerErrorKind::LockCleanup
         } else {
             FinalizerErrorKind::Retryable
         }
@@ -438,11 +381,9 @@ impl DexRouteFinalizer for IcpswapFinalizer {
                 ));
             }
             None => {
-                // Committing only records this liquidation's own plan in its own
-                // WAL row -- no pool account is touched -- so the owner lock is
-                // left to `finalize`, which is where the IC calls happen. Taking
-                // it here would reserve the venue before any work exists to do,
-                // and turn a routine wait into a finalizer error.
+                // Committing only records this liquidation's plan in its WAL
+                // row. No pool account is touched until `finalize` advances the
+                // persisted state.
                 let request = receipt
                     .request
                     .swap_args

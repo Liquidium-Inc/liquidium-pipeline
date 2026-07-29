@@ -13,7 +13,8 @@ The pipeline is designed to:
 - Split one seized-collateral amount into independently persisted venue legs.
 - Resume each leg safely after process restarts.
 - Add venues such as Kraken without changing the WAL schema or orchestrator.
-- Preserve legacy in-progress MEXC and ICPSwap executions during rollout.
+- Reject incompatible pre-isolation ICPSwap execution state instead of silently
+  changing its signing identity mid-flight.
 
 ## Architecture at a Glance
 
@@ -78,17 +79,20 @@ pub trait MultiVenueAdapter {
 
     async fn preview(
         &self,
+        context: &VenuePlanningContext,
         request: &SwapRequest,
     ) -> Result<VenueRoutePreview, String>;
 
     async fn advance(
         &self,
         leg: &VenueLegState,
+        checkpoint: &dyn VenueLegCheckpoint,
     ) -> Result<VenueLegProgress, String>;
 
     async fn recover(
         &self,
         leg: &VenueLegState,
+        checkpoint: &dyn VenueLegCheckpoint,
     ) -> Result<VenueLegProgress, String>;
 }
 ```
@@ -338,6 +342,49 @@ An adapter may not:
 - Select a fallback venue.
 - Mark the parent WAL row successful.
 
+### Per-liquidation ICPSwap identity
+
+Every newly planned ICPSwap leg derives a deterministic secp256k1 child
+principal from the configured mnemonic and the liquidation ID. The mnemonic and
+private key are never persisted; the WAL stores only the derivation scheme,
+liquidation ID, path, and derived principal.
+
+```text
+Configured mnemonic
+        |
+        v
+ICPSwap derivation namespace + liquidation ID
+        |
+        v
+Derived child principal
+        |
+        +-- funding trader --ICP input--> child default account
+        |                                  |
+        |                                  v
+        |                         child ICPSwap deposit account
+        |                                  |
+        |                       deposit -> swap -> withdraw
+        |                                  |
+        |                                  v
+        +<-- recovery input ---------- child default account
+                                           |
+                                           +-- exact output credit --> request.receive_address
+```
+
+The child signs its own pool transfer, deposit, swap, withdrawal, and final
+forwarding transfer. Consequently, both the ICPSwap deposit account and pool
+balances are isolated per liquidation. Recovery forwards only the recorded
+input credit to the funding trader; successful settlement forwards only the
+recorded output credit to the request receiver. Unrelated child balances are
+never swept.
+
+Funding and forwarding persist their exact `TransferArg`, timestamp, source
+balance baseline, and destination balance baseline before submission. A restart
+can therefore reconcile a lost response without inventing a second transfer.
+Before daemon startup, every unfinished ICPSwap leg is decoded and its persisted
+principal is re-derived from the configured mnemonic. Startup fails with the WAL
+row and leg IDs if the identity cannot be reproduced.
+
 ## Result Aggregation
 
 Downstream consumers continue to receive one `SwapExecution`. The aggregator will:
@@ -403,6 +450,9 @@ No change should be needed to:
 - Older binaries do not understand the operational meaning of active `meta_v2` rows and cannot safely continue them.
 - Before rolling back to a binary that does not understand `meta_v2`, drain or manually recover all active multi-venue rows.
 - Before disabling a venue, finish or recover every unfinished committed leg for it. Startup rejects a disabled venue referenced by an unfinished `meta_v2` row.
+- A binary without the isolated-principal ICPSwap state cannot safely resume
+  these legs. Drain or manually recover every active ICPSwap leg before rolling
+  back to an older binary.
 
 ### Upgrading from a pre-multi-venue binary
 
@@ -442,12 +492,14 @@ raise their own `OperatorRequired` alert; a park is never log-only.
 > to the queue; doing so requires editing the WAL by hand. An operator recovery
 > command is tracked separately.
 
-### The ICPSwap owner lock
+### ICPSwap concurrency
 
-ICPSwap executions are serialized by a per-owner lock, because the workflow
-observes the trader's shared pool subaccount balances. The lock has no expiry. A
-leg that parked while holding it would therefore stall *every* later ICPSwap
-liquidation, silently, so `leg_status` maps ICPSwap's `OperatorRequired` onto a
-terminal leg status: the lock is released and later liquidations continue. The
-detailed ambiguous state is preserved inside `VenueExecutionState` so the
-abandoned leg can still be told apart from a decided failure.
+The active multi-venue ICPSwap adapter no longer needs a venue-wide owner lock.
+The parent has one WAL writer, and every leg has a different derived principal,
+deposit account, and pool balance. An `OperatorRequired` leg therefore parks
+only its own liquidation and cannot take ICPSwap offline for later rows.
+
+The standalone ICPSwap entrypoint follows the same model. The old WAL/SQLite
+owner-lock machinery has been removed; existing databases may retain an unused
+`icpswap_execution_locks` table, but this binary never reads or writes it and
+new databases no longer create it.

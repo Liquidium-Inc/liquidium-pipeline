@@ -1,7 +1,4 @@
-use std::{
-    collections::HashMap,
-    sync::{Arc, Mutex},
-};
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use candid::{Nat, Principal};
@@ -25,7 +22,7 @@ use crate::{
     executors::executor::ExecutorRequest,
     finalizers::{
         dex_finalizer::{DexRouteFinalizer, DexRoutePreview},
-        finalizer::{Finalizer, FinalizerErrorKind},
+        finalizer::Finalizer,
         icpswap::finalizer::{ICPSWAP_FINALIZER_PERMANENT_PREFIX, IcpswapFinalizer},
         multi_venue::{
             ICPSWAP_VENUE_ID, MultiVenueAdapter, VenueLegCheckpoint, VenueLegProgress, VenuePlanningContext,
@@ -223,26 +220,9 @@ fn receipt() -> ExecutionReceipt {
     }
 }
 
-/// WAL double whose owner-lock table mirrors the SQLite store: one holder per
-/// owner, re-entrant for the holding execution, released only by its holder.
-struct TestWal(Mutex<LiqResultRecord>, Mutex<HashMap<String, String>>, Mutex<u32>);
+struct TestWal(Mutex<LiqResultRecord>);
 
 impl TestWal {
-    fn lock_holder(&self, owner: &str) -> Option<String> {
-        self.1.lock().unwrap().get(owner).cloned()
-    }
-
-    fn hold_lock_for(&self, owner: &str, execution_id: &str) {
-        self.1
-            .lock()
-            .unwrap()
-            .insert(owner.to_string(), execution_id.to_string());
-    }
-
-    fn fail_next_lock_releases(&self, count: u32) {
-        *self.2.lock().unwrap() = count;
-    }
-
     fn new(receipt: &ExecutionReceipt, state: IcpswapExecutionState) -> Self {
         let wrapper = LiqMetaWrapper {
             receipt: receipt.clone(),
@@ -263,7 +243,7 @@ impl TestWal {
             meta_json: String::new(),
         };
         encode_meta(&mut row, &wrapper).expect("encode WAL");
-        Self(Mutex::new(row), Mutex::new(HashMap::new()), Mutex::new(0))
+        Self(Mutex::new(row))
     }
 
     fn state(&self) -> IcpswapExecutionState {
@@ -317,28 +297,6 @@ impl WalStore for TestWal {
     }
 
     async fn delete(&self, _: &str) -> anyhow::Result<()> {
-        Ok(())
-    }
-
-    async fn acquire_icpswap_execution_lock(&self, owner: &str, execution_id: &str) -> anyhow::Result<bool> {
-        let mut locks = self.1.lock().unwrap();
-        let holder = locks
-            .entry(owner.to_string())
-            .or_insert_with(|| execution_id.to_string());
-        Ok(holder == execution_id)
-    }
-
-    async fn release_icpswap_execution_lock(&self, owner: &str, execution_id: &str) -> anyhow::Result<()> {
-        let mut failures = self.2.lock().unwrap();
-        if *failures > 0 {
-            *failures -= 1;
-            anyhow::bail!("injected lock release failure");
-        }
-        drop(failures);
-        let mut locks = self.1.lock().unwrap();
-        if locks.get(owner).is_some_and(|holder| holder == execution_id) {
-            locks.remove(owner);
-        }
         Ok(())
     }
 }
@@ -1110,11 +1068,6 @@ async fn finalizer_drives_immediately_runnable_steps_and_builds_execution() {
     assert_eq!(wal.state().step, IcpswapStep::Completed);
     assert_eq!(execution.receive_amount, Nat::from(119_490u64));
     assert!(execution.legs[0].route_id.contains("manual=42"));
-    assert_eq!(
-        wal.lock_holder(&trader().owner.to_text()),
-        None,
-        "a terminal execution must free the owner slot"
-    );
 }
 
 #[tokio::test]
@@ -1131,101 +1084,6 @@ async fn failed_state_returns_explicit_permanent_error() {
         .expect_err("permanent");
     assert!(error.starts_with(ICPSWAP_FINALIZER_PERMANENT_PREFIX));
     assert!(error.contains("ambiguous withdrawal"));
-    assert_eq!(
-        wal.lock_holder(&trader().owner.to_text()),
-        None,
-        "a failed execution must free the owner slot, not wedge the venue"
-    );
-}
-
-#[tokio::test]
-async fn failed_execution_releases_the_owner_lock_for_the_next_liquidation() {
-    let receipt = receipt();
-    let mut state = state();
-    state.step = IcpswapStep::Failed;
-    state.last_error = Some("gross swap output cannot cover the ckUSDC ledger fee".to_string());
-    let wal = TestWal::new(&receipt, state);
-    let owner = trader().owner.to_text();
-
-    let _ = finalizer(MockIcpswapManualClient::new())
-        .finalize(&wal, receipt.clone())
-        .await;
-
-    // The next liquidation for this owner must be able to claim the slot.
-    assert!(
-        wal.acquire_icpswap_execution_lock(&owner, "next-liquidation")
-            .await
-            .unwrap(),
-        "a leaked lock blocks every later ICPSwap liquidation for this owner"
-    );
-}
-
-#[tokio::test]
-async fn terminal_state_retries_lock_cleanup_without_replaying_the_workflow() {
-    let receipt = receipt();
-    let mut terminal = state();
-    terminal.step = IcpswapStep::Refunded;
-    let owner = terminal.owner.owner.to_text();
-    let wal = TestWal::new(&receipt, terminal);
-    wal.hold_lock_for(&owner, "42");
-    wal.fail_next_lock_releases(1);
-    let watchdog = Arc::new(RecordingWatchdog::default());
-    let finalizer = test_finalizer(
-        Arc::new(TestIcpswapClient {
-            manual: MockIcpswapManualClient::new(),
-            preview: None,
-        }),
-        Account {
-            owner: p(99),
-            subaccount: None,
-        },
-    )
-    .with_watchdog(watchdog.clone());
-
-    let first = finalizer
-        .finalize(&wal, receipt.clone())
-        .await
-        .expect_err("failed cleanup must keep the WAL row retryable");
-    assert!(first.contains("failed releasing terminal ICPSwap owner lock"));
-    assert_eq!(finalizer.classify_error(&first), FinalizerErrorKind::LockCleanup);
-    assert_eq!(wal.lock_holder(&owner).as_deref(), Some("42"));
-    let events = watchdog.events();
-    assert_eq!(events.len(), 1);
-    assert_eq!(events[0].2, "lock_cleanup");
-
-    let second = finalizer
-        .finalize(&wal, receipt)
-        .await
-        .expect("the next cycle should retry only the idempotent delete");
-    assert!(second.finalized);
-    assert_eq!(wal.lock_holder(&owner), None);
-}
-
-#[tokio::test]
-async fn owner_lock_contention_holds_the_row_instead_of_failing_it() {
-    let receipt = receipt();
-    let initial = state();
-    let owner = initial.owner.owner.to_text();
-    let wal = TestWal::new(&receipt, initial);
-    wal.hold_lock_for(&owner, "other-liquidation");
-
-    // No mock expectations: contention must be detected before any IC call.
-    let result = finalizer(MockIcpswapManualClient::new())
-        .finalize(&wal, receipt)
-        .await
-        .expect("contention is backpressure, not a finalizer error");
-
-    assert!(!result.finalized);
-    assert_eq!(
-        wal.state().step,
-        IcpswapStep::Transfer,
-        "a waiting execution must not advance"
-    );
-    assert_eq!(
-        wal.lock_holder(&owner).as_deref(),
-        Some("other-liquidation"),
-        "waiting must not steal the holder's lock"
-    );
 }
 
 #[tokio::test]
@@ -1255,10 +1113,9 @@ async fn operator_required_realerts_every_cycle_while_parked() {
     assert_eq!(watchdog.events()[0].1, "icpswap");
     assert_eq!(watchdog.events()[0].2, "DepositPending");
 
-    // A parked execution holds the owner lock and keeps polling, so it looks
-    // healthy from outside. The finalizer therefore re-alerts on every cycle and
-    // leaves throttling to the watchdog's cooldown key -- alerting once means a
-    // single dropped webhook hides a stalled venue for good.
+    // The finalizer re-alerts on every parked cycle and leaves throttling to the
+    // watchdog's cooldown key. Alerting only once would let a dropped webhook
+    // hide custody that still requires intervention.
     assert!(!finalizer.finalize(&wal, receipt).await.unwrap().finalized);
     assert_eq!(
         watchdog.events().len(),

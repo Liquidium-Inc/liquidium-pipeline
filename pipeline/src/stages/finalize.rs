@@ -426,14 +426,7 @@ where
                             },
                             receipt.clone(),
                         ));
-                    } else if error_kind == FinalizerErrorKind::LockCleanup {
-                        // Terminal lock deletion is idempotent and cannot replay
-                        // venue effects. Keep retrying under capped backoff;
-                        // watchdog notifications provide operator escalation.
-                        let _ = wal_mark_retryable_failed(&*self.wal, wal_id, err_msg.clone()).await;
-                    } else if error_kind == FinalizerErrorKind::VenueCustody
-                        && next_errors >= MAX_FINALIZER_ERRORS
-                    {
+                    } else if error_kind == FinalizerErrorKind::VenueCustody && next_errors >= MAX_FINALIZER_ERRORS {
                         // The retry budget is spent, but a venue leg may still
                         // hold this liquidation's funds. Failing permanently
                         // would drop the row out of the runnable queue and
@@ -839,50 +832,6 @@ mod tests {
         assert!(outcomes.is_empty());
     }
 
-    #[tokio::test]
-    async fn lock_cleanup_remains_retryable_after_the_ordinary_error_limit() {
-        let liq_id = 922u128;
-        let mut row = make_row(liq_id, make_swapping_receipt(liq_id));
-        row.error_count = MAX_FINALIZER_ERRORS - 1;
-        let row_id = row.id.clone();
-        let row_id_for_retry = row_id.clone();
-
-        let mut wal = MockWalStore::new();
-        wal.expect_get_pending()
-            .with(eq(100usize))
-            .times(1)
-            .return_once(move |_| Ok(vec![row]));
-        wal.expect_update_status()
-            .withf(move |id, status, bump| id == row_id && *status == ResultStatus::InFlight && *bump)
-            .times(1)
-            .returning(|_, _, _| Ok(()));
-        wal.expect_update_failure()
-            .withf(move |id, status, error, bump| {
-                id == row_id_for_retry
-                    && *status == ResultStatus::FailedRetryable
-                    && error.contains("lock cleanup unavailable")
-                    && *bump
-            })
-            .times(1)
-            .returning(|_, _, _, _| Ok(()));
-
-        let stage = FinalizeStage::new(
-            Arc::new(wal),
-            Arc::new(ErrorFinalizer {
-                error: "lock cleanup unavailable".to_string(),
-                kind: FinalizerErrorKind::LockCleanup,
-            }),
-            Arc::new(SimpleProfitCalculator),
-            Arc::new(MockPipelineAgent::new()),
-            Principal::anonymous(),
-            5,
-            120,
-        );
-
-        let outcomes = stage.process(&()).await.expect("cleanup failure should remain retryable");
-        assert!(outcomes.is_empty());
-    }
-
     /// A permanently failed row leaves the runnable queue for good. When the
     /// budget runs out on a row whose venue leg may still hold the funds, that
     /// would strand the custody with nothing tracking it, so the row must be
@@ -982,7 +931,10 @@ mod tests {
         )
         .with_watchdog(watchdog.clone());
 
-        let outcomes = stage.process(&()).await.expect("failed park write should not suppress processing");
+        let outcomes = stage
+            .process(&())
+            .await
+            .expect("failed park write should not suppress processing");
         assert!(outcomes.is_empty());
 
         let alerts = watchdog.operator_alerts();

@@ -401,7 +401,7 @@ fn completed_execution(request: &SwapRequest, state: &IcpswapState, now_nanos: u
             receive_amount: net.clone(),
             price: exec_price,
             lp_fee: Nat::from(0u8),
-            gas_fee: state.plan.output_ledger_fee.value.clone(),
+            gas_fee: state.plan.output_ledger_fee.value.clone() * Nat::from(2u8),
         }],
         approval_count: Some(0),
         ts: now_nanos / 1_000_000_000,
@@ -416,6 +416,17 @@ fn execution_slippage_bps(expected: f64, receive: f64) -> f64 {
     }
 }
 
+/// Converts an ICPSwap pool plan into the venue-neutral quote consumed by the
+/// multi-venue planner.
+///
+/// The top-level quote describes the complete venue allocation: its pay amount
+/// includes the three reserved input-ledger fees, and its receive amount is the
+/// expected destination credit after both output-ledger fees. The nested route
+/// leg intentionally records only the amount that reaches the pool so the WAL
+/// preserves the distinction between total spend and executable swap input.
+/// Pool price impact remains based on the pool's spot and quoted gross outputs;
+/// `exec_price` instead reflects the final expected output against the all-in
+/// allocation.
 fn common_quote(
     request: &SwapRequest,
     plan: &IcpswapExecutionPlan,
@@ -425,14 +436,21 @@ fn common_quote(
     let pay_symbol = plan.amount_in.token.symbol();
     let expected_output = plan.net_expected_output();
     let receive_symbol = expected_output.token.symbol();
-    let pay = plan.amount_in.value.0.to_f64().unwrap_or(0.0);
+    let all_in_pay = request.pay_amount.value.0.to_f64().unwrap_or(0.0);
+    let pool_pay = plan.amount_in.value.0.to_f64().unwrap_or(0.0);
     let spot_receive = spot_output.0.to_f64().unwrap_or(0.0);
-    let quoted_receive = plan.gross_quoted_out.value.0.to_f64().unwrap_or(0.0);
-    let mid_price = if pay > 0.0 { spot_receive / pay } else { 0.0 };
-    let exec_price = if pay > 0.0 { quoted_receive / pay } else { 0.0 };
+    let forwarded_receive = expected_output.value.0.to_f64().unwrap_or(0.0);
+    let mid_price = if pool_pay > 0.0 { spot_receive / pool_pay } else { 0.0 };
+    let exec_price = if all_in_pay > 0.0 {
+        forwarded_receive / all_in_pay
+    } else {
+        0.0
+    };
     SwapQuote {
         pay_asset: request.pay_asset.clone(),
-        pay_amount: plan.amount_in.value.clone(),
+        // The venue-level quote consumes the committed all-in allocation. The
+        // smaller amount that reaches the pool remains visible on the route leg.
+        pay_amount: request.pay_amount.value.clone(),
         receive_asset: request.receive_asset.clone(),
         receive_amount: expected_output.value.clone(),
         mid_price,
@@ -449,7 +467,7 @@ fn common_quote(
             receive_amount: expected_output.value,
             price: exec_price,
             lp_fee: Nat::from(0u8),
-            gas_fee: plan.output_ledger_fee.value.clone(),
+            gas_fee: plan.output_ledger_fee.value.clone() * Nat::from(2u8),
         }],
     }
 }

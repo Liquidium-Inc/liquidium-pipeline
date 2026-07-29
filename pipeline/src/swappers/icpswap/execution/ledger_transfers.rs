@@ -189,7 +189,7 @@ async fn submit_transfer(
         .args
         .clone()
         .ok_or_else(|| "ICPSwap pending ledger transfer is missing its persisted arguments".to_string())?;
-    
+
     match client.icrc1_transfer_with_args(ledger, args.clone()).await {
         Ok(block_index) => {
             let transfer = transfer_state_mut(state, kind);
@@ -239,29 +239,61 @@ async fn reconcile_aged_transfer(
     let destination_before = transfer
         .destination_balance_before
         .ok_or_else(|| "aged ICPSwap transfer is missing its destination baseline".to_string())?;
-    let (source_now, destination_now) = tokio::try_join!(
+    let (source_now, destination_now) = tokio::join!(
         client.icrc1_balance(ledger, &source),
         client.icrc1_balance(ledger, &destination),
-    )
-    .map_err(|balance_error| balance_error.to_string())?;
+    );
     let expected_debit = args.amount.clone() + args.fee.clone().unwrap_or_else(|| Nat::from(0u8));
-    let source_debit = saturating_sub(&source_before, &source_now);
-    let destination_credit = saturating_sub(&destination_now, &destination_before);
+    let (isolated_delta, expected_isolated_delta, isolated_unchanged, shared_delta) = match kind {
+        DurableTransferKind::Funding => {
+            let destination_now = destination_now
+                .map_err(|error| format!("failed reading isolated funding destination balance: {error}"))?;
+            let destination_credit = saturating_sub(&destination_now, &destination_before);
+            let destination_unchanged = destination_now == destination_before;
+            let source_debit = source_now
+                .ok()
+                .map(|source_now| saturating_sub(&source_before, &source_now));
+            (
+                destination_credit,
+                args.amount.clone(),
+                destination_unchanged,
+                source_debit,
+            )
+        }
+        DurableTransferKind::Settlement(_) => {
+            let source_now =
+                source_now.map_err(|error| format!("failed reading isolated settlement source balance: {error}"))?;
+            let source_debit = saturating_sub(&source_before, &source_now);
+            let source_unchanged = source_now == source_before;
+            let destination_credit = destination_now
+                .ok()
+                .map(|destination_now| saturating_sub(&destination_now, &destination_before));
+            (source_debit, expected_debit, source_unchanged, destination_credit)
+        }
+    };
 
-    if source_debit == expected_debit && destination_credit == args.amount {
+    tracing::debug!(
+        execution_id,
+        isolated_delta = %isolated_delta,
+        expected_isolated_delta = %expected_isolated_delta,
+        shared_delta = ?shared_delta,
+        "Reconciled aged ICPSwap transfer from its isolated endpoint"
+    );
+
+    if isolated_delta == expected_isolated_delta {
         let transfer = transfer_state_mut(state, kind);
-        transfer.credited_amount = Some(destination_credit);
+        transfer.credited_amount = Some(args.amount);
         complete_transfer(state, kind);
         return persist(store, execution_id, state).await;
     }
-    if source_now == source_before && destination_now == destination_before {
+    if isolated_unchanged {
         reset_for_fresh_timestamp(state, kind);
         state.last_error = Some(error);
         return persist(store, execution_id, state).await;
     }
 
     let message = format!(
-        "aged ICPSwap transfer has inconsistent balance deltas: source debit {source_debit}, destination credit {destination_credit}"
+        "aged ICPSwap transfer has inconsistent isolated balance delta {isolated_delta}; expected {expected_isolated_delta}; shared delta {shared_delta:?}"
     );
     reconciliation::require_operator(state, pending_step(kind), message.clone());
     persist(store, execution_id, state).await?;
