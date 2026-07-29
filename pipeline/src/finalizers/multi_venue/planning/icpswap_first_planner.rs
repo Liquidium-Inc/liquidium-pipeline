@@ -8,7 +8,7 @@ use num_traits::ToPrimitive;
 use thiserror::Error;
 
 use crate::{
-    finalizers::multi_venue::{MultiVenueAdapter, VenueRoutePreview},
+    finalizers::multi_venue::{MultiVenueAdapter, VenuePlanningContext, VenueRoutePreview},
     persistance::{
         MultiVenueAllocationReason, MultiVenueExecutionOutcome, MultiVenueExecutionPlan, MultiVenueExecutionState,
         VenueLegState,
@@ -68,6 +68,7 @@ impl IcpswapFirstPlannerConfig {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct IcpswapFirstPlanInput {
+    pub liquidation_id: String,
     pub total_pay: ChainTokenAmount,
     pub receive_asset: AssetId,
     pub debt_repaid: ChainTokenAmount,
@@ -113,6 +114,7 @@ impl IcpswapFirstPlanInput {
         let pay_reference_price_usd = reference_price_usd(&receipt.request.ref_price);
 
         let input = Self {
+            liquidation_id: liquidation.id.to_string(),
             total_pay,
             receive_asset: swap.receive_asset.clone(),
             debt_repaid,
@@ -126,6 +128,17 @@ impl IcpswapFirstPlanInput {
 
     // Verifies the amount and asset invariants required by every venue quote.
     pub(in crate::finalizers::multi_venue) fn validate(&self) -> Result<(), IcpswapFirstPlannerError> {
+        let parsed_liquidation_id = self.liquidation_id.parse::<u128>().map_err(|error| {
+            IcpswapFirstPlannerError::InvalidInput(format!(
+                "liquidation ID `{}` is not a u128: {error}",
+                self.liquidation_id
+            ))
+        })?;
+        if parsed_liquidation_id.to_string() != self.liquidation_id {
+            return Err(IcpswapFirstPlannerError::InvalidInput(
+                "liquidation ID must use canonical unsigned decimal notation".to_string(),
+            ));
+        }
         if self.total_pay.value == Nat::from(0u8) {
             return Err(IcpswapFirstPlannerError::InvalidInput(
                 "total pay amount must be positive".to_string(),
@@ -149,6 +162,12 @@ impl IcpswapFirstPlanInput {
             ));
         }
         Ok(())
+    }
+
+    pub(in crate::finalizers::multi_venue) fn planning_context(&self) -> VenuePlanningContext {
+        VenuePlanningContext {
+            liquidation_id: self.liquidation_id.clone(),
+        }
     }
 
     // Produces an amount-scoped request tagged for one specific venue.
@@ -247,6 +266,7 @@ impl IcpswapFirstPlanner {
         quoted_at: i64,
     ) -> Result<MultiVenueExecutionState, IcpswapFirstPlannerError> {
         input.validate()?;
+        let context = input.planning_context();
 
         if !input.is_native_icp() || !self.venues.contains(ICPSWAP_VENUE_ID) {
             return self.plan_overflow_only(input, quoted_at).await;
@@ -257,7 +277,7 @@ impl IcpswapFirstPlanner {
         // API load to every liquidation.
         let quotes = self
             .venues
-            .preview_venues(&[ICPSWAP_VENUE_ID.to_string()], |venue_id| {
+            .preview_venues(&context, &[ICPSWAP_VENUE_ID.to_string()], |venue_id| {
                 input.request_for(venue_id, input.total_pay.value.clone())
             })
             .await
@@ -381,7 +401,7 @@ impl IcpswapFirstPlanner {
 
         if !input.meets_cex_minimum(&remainder, self.config.cex_min_exec_usd) {
             let icpswap_request = input.request_for(ICPSWAP_VENUE_ID, input.total_pay.value.clone());
-            let icpswap = match self.preview_exact(ICPSWAP_VENUE_ID, &icpswap_request).await {
+            let icpswap = match self.preview_exact(input, ICPSWAP_VENUE_ID, &icpswap_request).await {
                 Ok(icpswap) => icpswap,
                 Err(error) => {
                     return self
@@ -443,7 +463,7 @@ impl IcpswapFirstPlanner {
 
         let icpswap_request = input.request_for(ICPSWAP_VENUE_ID, safe_value);
         let (icpswap_result, overflow_result) = tokio::join!(
-            self.preview_exact(ICPSWAP_VENUE_ID, &icpswap_request),
+            self.preview_exact(input, ICPSWAP_VENUE_ID, &icpswap_request),
             self.preview_overflow(input, remainder_value),
         );
         let icpswap = match icpswap_result {
@@ -514,7 +534,7 @@ impl IcpswapFirstPlanner {
                 break;
             }
             let request = input.request_for(ICPSWAP_VENUE_ID, midpoint.clone());
-            match self.preview_exact(ICPSWAP_VENUE_ID, &request).await {
+            match self.preview_exact(input, ICPSWAP_VENUE_ID, &request).await {
                 Ok(preview) if self.is_safe_icpswap(&preview) => {
                     // Safe midpoint: retain its quote and search higher.
                     lower = midpoint;
@@ -538,13 +558,15 @@ impl IcpswapFirstPlanner {
     // request, and assets match what the planner asked for.
     async fn preview_exact(
         &self,
+        input: &IcpswapFirstPlanInput,
         venue_id: &str,
         request: &SwapRequest,
     ) -> Result<VenueRoutePreview, IcpswapFirstPlannerError> {
         let adapter = self.venues.adapter(venue_id).ok_or_else(|| {
             IcpswapFirstPlannerError::InvalidInput(format!("venue adapter `{venue_id}` is not registered"))
         })?;
-        let preview = adapter.preview(request).await.map_err(|error| {
+        let context = input.planning_context();
+        let preview = adapter.preview(&context, request).await.map_err(|error| {
             IcpswapFirstPlannerError::NoViableRoute(format!("{} preview failed: {error}", adapter.venue_id()))
         })?;
         validate_preview(adapter.venue_id(), request, &preview)?;
@@ -558,9 +580,10 @@ impl IcpswapFirstPlanner {
         input: &IcpswapFirstPlanInput,
         pay_value: Nat,
     ) -> Result<VenueQuoteBook, IcpswapFirstPlannerError> {
+        let context = input.planning_context();
         let quotes = self
             .venues
-            .preview_venues(&self.overflow_venue_ids, |venue_id| {
+            .preview_venues(&context, &self.overflow_venue_ids, |venue_id| {
                 input.request_for(venue_id, pay_value.clone())
             })
             .await

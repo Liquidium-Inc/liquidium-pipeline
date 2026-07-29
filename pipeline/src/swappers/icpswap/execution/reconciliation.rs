@@ -10,6 +10,7 @@ use crate::swappers::icpswap::{
         MAX_MANUAL_SLIPPAGE_STEPS, MAX_MANUAL_TRADE_RETRIES, MIN_UNCHANGED_TRADE_OBSERVATIONS,
         PENDING_TRADE_RECONCILIATION_TIMEOUT_NANOS, retry_backoff_nanos,
     },
+    transfer_state::{IcpswapLedgerTransferState, IcpswapSettlementKind},
     types::{IcpswapError, IcpswapExecutionPlan, IcpswapState, IcpswapStep, IcpswapUnusedBalance},
 };
 
@@ -277,7 +278,11 @@ pub(crate) async fn observe_output_withdrawal(
 
 pub(crate) fn complete_output_withdrawal(state: &mut IcpswapState, wallet_credit: Nat) {
     state.withdraw.wallet_credited_amount = Some(wallet_credit);
-    state.step = IcpswapStep::Completed;
+    let settlement = &mut state.settlement;
+    settlement.kind = Some(IcpswapSettlementKind::Output);
+    settlement.fee = state.plan.output_ledger_fee.clone();
+    settlement.transfer = IcpswapLedgerTransferState::default();
+    state.step = IcpswapStep::Forward;
     state.operator_pending_step = None;
     state.last_error = None;
 }
@@ -317,7 +322,12 @@ pub(crate) async fn observe_recovery(
 
 pub(crate) fn complete_recovery(state: &mut IcpswapState, wallet_credit: Nat) {
     state.recovery.wallet_credited_amount = Some(wallet_credit);
-    state.step = IcpswapStep::Refunded;
+    let settlement = &mut state.settlement;
+    settlement.kind = Some(IcpswapSettlementKind::Recovery);
+    settlement.destination = state.funding.source;
+    settlement.fee = state.plan.input_ledger_fee.clone();
+    settlement.transfer = IcpswapLedgerTransferState::default();
+    state.step = IcpswapStep::Forward;
     state.operator_pending_step = None;
     state.last_error = None;
 }

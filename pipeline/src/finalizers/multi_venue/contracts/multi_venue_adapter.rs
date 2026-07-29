@@ -6,6 +6,13 @@ use crate::{
     swappers::model::{SwapExecution, SwapQuote, SwapRequest},
 };
 
+/// Immutable liquidation metadata supplied to every amount-scoped venue
+/// preview without adding routing-only fields to the persisted `SwapRequest`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VenuePlanningContext {
+    pub liquidation_id: String,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct VenueRoutePreview {
     pub venue_id: String,
@@ -60,7 +67,8 @@ pub trait MultiVenueAdapter: Send + Sync {
 
     /// Produces an amount-scoped quote and initial execution state without
     /// submitting transfers, orders, or swaps.
-    async fn preview(&self, request: &SwapRequest) -> Result<VenueRoutePreview, String>;
+    async fn preview(&self, context: &VenuePlanningContext, request: &SwapRequest)
+    -> Result<VenueRoutePreview, String>;
 
     /// Optional durable exclusivity key acquired by the parent orchestrator.
     /// Adapters remain unable to write the parent WAL row.

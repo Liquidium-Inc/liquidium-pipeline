@@ -1,7 +1,9 @@
 use icrc_ledger_types::icrc1::account::Account;
 
 use super::{
+    identity::IcpswapExecutionIdentity,
     plan::amount_out_minimum,
+    transfer_state::{IcpswapFundingState, IcpswapSettlementState},
     types::{
         ICPSWAP_STATE_VERSION, IcpswapDepositState, IcpswapExecutionPlan, IcpswapRecoveryState, IcpswapState,
         IcpswapStep, IcpswapTradeState, IcpswapTransferState, IcpswapWithdrawState,
@@ -9,7 +11,25 @@ use super::{
 };
 
 impl IcpswapState {
-    pub fn prepare(execution_id: impl Into<String>, plan: IcpswapExecutionPlan, owner: Account) -> Self {
+    /// Constructs the sole supported isolated-principal workflow.
+    pub fn prepare(
+        execution_id: impl Into<String>,
+        plan: IcpswapExecutionPlan,
+        identity: IcpswapExecutionIdentity,
+        funding: IcpswapFundingState,
+        settlement: IcpswapSettlementState,
+    ) -> Result<Self, String> {
+        identity.validate_descriptor()?;
+        let owner = Account {
+            owner: identity.principal,
+            subaccount: None,
+        };
+        if funding.destination != owner {
+            return Err("ICPSwap funding destination does not match the derived execution principal".to_string());
+        }
+        if funding.source.subaccount.is_some() || funding.destination.subaccount.is_some() {
+            return Err("ICPSwap funding requires default ledger accounts".to_string());
+        }
         let initial_slippage = initial_slippage_bps(plan.max_slippage_bps);
         let initial_minimum_value = amount_out_minimum(&plan.gross_quoted_out.value, initial_slippage)
             .expect("validated plan slippage must remain valid");
@@ -17,15 +37,18 @@ impl IcpswapState {
             plan.gross_quoted_out.token.clone(),
             std::cmp::max(initial_minimum_value, plan.amount_out_minimum.value.clone()),
         );
-        Self {
+        Ok(Self {
             execution_id: execution_id.into(),
             owner,
             schema_version: ICPSWAP_STATE_VERSION,
-            step: IcpswapStep::Transfer,
+            step: IcpswapStep::Funding,
             operator_pending_step: None,
             last_error: None,
             next_attempt_at_nanos: None,
             plan,
+            identity,
+            funding,
+            settlement,
             transfer: IcpswapTransferState::default(),
             deposit: IcpswapDepositState::default(),
             trade: IcpswapTradeState {
@@ -43,31 +66,40 @@ impl IcpswapState {
             },
             withdraw: IcpswapWithdrawState::default(),
             recovery: IcpswapRecoveryState::default(),
-        }
+        })
     }
 }
 
-pub fn validate_execution_state(state: &IcpswapState, execution_id: &str, owner: Account) -> Result<(), String> {
-    if state.schema_version != ICPSWAP_STATE_VERSION {
-        return Err(format!(
-            "unsupported ICPSwap state version {}; expected {ICPSWAP_STATE_VERSION}",
-            state.schema_version
-        ));
-    }
+pub fn validate_execution_state(state: &IcpswapState, execution_id: &str) -> Result<(), String> {
     if state.execution_id != execution_id {
         return Err(format!(
             "ICPSwap execution ID {} differs from state-store key {execution_id}",
             state.execution_id
         ));
     }
-    if owner.subaccount.is_some() || state.owner.subaccount.is_some() {
+    if state.owner.subaccount.is_some() {
         return Err("ICPSwap execution requires the owner's default ledger account".to_string());
     }
-    if state.owner != owner {
+
+    if state.schema_version != ICPSWAP_STATE_VERSION {
         return Err(format!(
-            "ICPSwap execution owner {} differs from configured owner {owner}",
-            state.owner
+            "unsupported ICPSwap state version {}; expected {ICPSWAP_STATE_VERSION}",
+            state.schema_version
         ));
+    }
+    validate_state_fields(state)
+}
+
+fn validate_state_fields(state: &IcpswapState) -> Result<(), String> {
+    state.identity.validate_descriptor()?;
+    if state.owner.owner != state.identity.principal {
+        return Err("ICPSwap owner does not match its derived execution principal".to_string());
+    }
+    if state.funding.destination != state.owner {
+        return Err("ICPSwap funding destination does not match its execution owner".to_string());
+    }
+    if state.funding.source.subaccount.is_some() || state.funding.destination.subaccount.is_some() {
+        return Err("ICPSwap funding requires default ledger accounts".to_string());
     }
     Ok(())
 }

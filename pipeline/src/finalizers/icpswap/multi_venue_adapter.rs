@@ -6,15 +6,13 @@ use liquidium_pipeline_core::tokens::chain_token::ChainToken;
 
 use super::finalizer::{IcpswapFinalizer, RETRY_COOLDOWN_NANOS, is_terminal_step};
 use crate::{
-    finalizers::multi_venue::{
-        MultiVenueAdapter, VenueExecutionLock, VenueLegCheckpoint, VenueLegProgress, VenueRoutePreview,
-    },
+    finalizers::multi_venue::{MultiVenueAdapter, VenueLegCheckpoint, VenueLegProgress, VenueRoutePreview},
     persistance::{VenueExecutionState, VenueLegState, VenueLegStatus},
     swappers::{
         icpswap::{
             VENUE_ID,
             execution::IcpswapExecutionStateStore,
-            plan::net_expected_output,
+            plan::net_forwarded_output,
             types::{IcpswapExecutionState, IcpswapStep},
         },
         model::SwapExecution,
@@ -77,7 +75,10 @@ impl IcpswapExecutionStateStore for CheckpointedLegStateStore<'_> {
         // and reconciled safely.
         if matches!(
             leg_status(state.step),
-            VenueLegStatus::Completed | VenueLegStatus::Recovered | VenueLegStatus::FailedPermanent
+            VenueLegStatus::Completed
+                | VenueLegStatus::Recovered
+                | VenueLegStatus::OperatorRequired
+                | VenueLegStatus::FailedPermanent
         ) {
             return Ok(());
         }
@@ -99,11 +100,10 @@ fn leg_status(step: IcpswapStep) -> VenueLegStatus {
     match step {
         IcpswapStep::Completed => VenueLegStatus::Completed,
         IcpswapStep::Refunded => VenueLegStatus::Recovered,
-        // ICPSwap uses a shared trader account, so parking this outer leg would
-        // retain the venue-wide owner lock indefinitely. Preserve the detailed
-        // ambiguous state inside `VenueExecutionState`, but abandon this leg so
-        // the orchestrator can release the lock and later liquidations continue.
-        IcpswapStep::OperatorRequired => VenueLegStatus::FailedPermanent,
+        // Each execution has its own signer and pool account. Ambiguous custody
+        // can therefore remain parked for an operator without blocking later
+        // ICPSwap liquidations.
+        IcpswapStep::OperatorRequired => VenueLegStatus::OperatorRequired,
         IcpswapStep::Failed => VenueLegStatus::FailedPermanent,
         _ => VenueLegStatus::Running,
     }
@@ -179,9 +179,13 @@ impl IcpswapFinalizer {
 
         state.next_attempt_at_nanos = None;
         let store = CheckpointedLegStateStore::new(state.clone(), checkpoint);
+        // Opening the session re-derives the signer from the configured
+        // mnemonic and verifies it against the persisted descriptor before any
+        // identity-bound ICPSwap call is made.
+        let session = self.execution_session(&state)?;
         let result = self
             .workflow
-            .advance_loaded(&store, &execution_id, self.trader, now_nanos, state)
+            .advance_loaded(&session, &store, &execution_id, now_nanos, state)
             .await;
         let advance_error = result.err();
         let mut state = store.snapshot()?;
@@ -200,7 +204,11 @@ impl MultiVenueAdapter for IcpswapFinalizer {
         VENUE_ID
     }
 
-    async fn preview(&self, request: &crate::swappers::model::SwapRequest) -> Result<VenueRoutePreview, String> {
+    async fn preview(
+        &self,
+        context: &crate::finalizers::multi_venue::VenuePlanningContext,
+        request: &crate::swappers::model::SwapRequest,
+    ) -> Result<VenueRoutePreview, String> {
         require_native_icp(request)?;
         if self.trader.subaccount.is_some() {
             return Err("ICPSwap requires the trader's default ledger account".to_string());
@@ -210,7 +218,7 @@ impl MultiVenueAdapter for IcpswapFinalizer {
             .preview_route(request)
             .await
             .map_err(|error| error.to_string())?;
-        let conservative_value = net_expected_output(
+        let conservative_value = net_forwarded_output(
             &preview.route.amount_out_minimum.value,
             &preview.route.output_ledger_fee.value,
         )
@@ -222,7 +230,7 @@ impl MultiVenueAdapter for IcpswapFinalizer {
         // The selected preview is persisted before execution, so its generated
         // ID becomes the durable idempotency key used for every later advance.
         let execution_id = crate::utils::new_venue_execution_id(VENUE_ID);
-        let state = self.workflow.prepare(&execution_id, preview.route, self.trader);
+        let state = self.prepare_execution_state(&execution_id, &context.liquidation_id, request, preview.route)?;
         Ok(VenueRoutePreview {
             venue_id: VENUE_ID.to_string(),
             request: request.clone(),
@@ -230,14 +238,6 @@ impl MultiVenueAdapter for IcpswapFinalizer {
             conservative_receive,
             initial_execution_state: VenueExecutionState::new(VENUE_ID, &state)?,
         })
-    }
-
-    fn execution_lock(&self, leg: &VenueLegState) -> Result<Option<VenueExecutionLock>, String> {
-        let state = self.decode_leg_state(leg)?;
-        Ok(Some(VenueExecutionLock {
-            owner_key: state.owner.owner.to_text(),
-            execution_id: state.execution_id,
-        }))
     }
 
     async fn advance(

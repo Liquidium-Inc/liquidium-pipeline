@@ -437,7 +437,11 @@ impl MultiVenueAdapter for ScriptedAdapter {
         self.venue_id
     }
 
-    async fn preview(&self, request: &SwapRequest) -> Result<VenueRoutePreview, String> {
+    async fn preview(
+        &self,
+        _context: &VenuePlanningContext,
+        request: &SwapRequest,
+    ) -> Result<VenueRoutePreview, String> {
         self.preview_calls.fetch_add(1, Ordering::SeqCst);
         let pay = request
             .pay_amount

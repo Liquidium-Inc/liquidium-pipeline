@@ -4,6 +4,11 @@ use liquidium_pipeline_core::tokens::{chain_token::ChainToken, chain_token_amoun
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use super::identity::IcpswapExecutionIdentity;
+pub use super::transfer_state::{
+    IcpswapFundingState, IcpswapLedgerTransferState, IcpswapSettlementKind, IcpswapSettlementState,
+};
+
 /// ICPSwap's public token descriptor. The address is text in the upstream
 /// Candid interface even though it contains a ledger principal.
 #[derive(CandidType, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -99,6 +104,8 @@ pub struct IcpswapExecutionPlan {
 
 #[derive(CandidType, Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum IcpswapStep {
+    Funding,
+    FundingPending,
     Transfer,
     TransferPending,
     Deposit,
@@ -109,13 +116,15 @@ pub enum IcpswapStep {
     WithdrawPending,
     Recover,
     RecoverPending,
+    Forward,
+    ForwardPending,
     Completed,
     Refunded,
     OperatorRequired,
     Failed,
 }
 
-pub const ICPSWAP_STATE_VERSION: u32 = 1;
+pub const ICPSWAP_STATE_VERSION: u32 = 2;
 
 #[derive(CandidType, Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct IcpswapTransferState {
@@ -221,6 +230,9 @@ pub struct IcpswapState {
     #[serde(default)]
     pub next_attempt_at_nanos: Option<u64>,
     pub plan: IcpswapExecutionPlan,
+    pub identity: IcpswapExecutionIdentity,
+    pub funding: IcpswapFundingState,
+    pub settlement: IcpswapSettlementState,
     #[serde(flatten)]
     pub transfer: IcpswapTransferState,
     #[serde(flatten)]

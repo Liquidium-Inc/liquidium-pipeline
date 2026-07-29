@@ -10,12 +10,18 @@ use liquidium_pipeline_core::{
 
 use super::*;
 use crate::{
-    finalizers::multi_venue::{MultiVenueAdapter, VenueLegCheckpoint, VenueLegProgress},
+    finalizers::multi_venue::{MultiVenueAdapter, VenueLegCheckpoint, VenueLegProgress, VenuePlanningContext},
     persistance::{VenueLegQuote, VenueLegState, VenueLegStatus},
     swappers::model::SwapRequest,
 };
 
 struct NoopCheckpoint;
+
+fn planning_context() -> VenuePlanningContext {
+    VenuePlanningContext {
+        liquidation_id: "42".to_string(),
+    }
+}
 
 #[async_trait::async_trait]
 impl VenueLegCheckpoint for NoopCheckpoint {
@@ -179,7 +185,7 @@ async fn preview_uses_the_exact_leg_allocation_and_persists_the_route() {
     let finalizer = finalizer();
     let request = request(200_000_000); // 2 PAY, not the liquidation's full receipt amount.
 
-    let preview = MultiVenueAdapter::preview(&finalizer, &request)
+    let preview = MultiVenueAdapter::preview(&finalizer, &planning_context(), &request)
         .await
         .expect("MEXC preview should succeed");
 
@@ -204,7 +210,7 @@ async fn preview_persists_the_per_leg_receive_address() {
     let mut request = request(100_000_000);
     request.receive_address = Some(Principal::from_slice(&[42]).to_text());
 
-    let preview = MultiVenueAdapter::preview(&finalizer, &request)
+    let preview = MultiVenueAdapter::preview(&finalizer, &planning_context(), &request)
         .await
         .expect("MEXC preview should succeed");
     let execution = preview
@@ -237,7 +243,7 @@ async fn preview_rejects_zero_amount_before_orderbook_io() {
 
     // This backend has no orderbook expectation, so any route-resolution I/O
     // before the amount check would fail the test.
-    let error = MultiVenueAdapter::preview(&finalizer, &request(0))
+    let error = MultiVenueAdapter::preview(&finalizer, &planning_context(), &request(0))
         .await
         .expect_err("zero amount must be rejected");
 
@@ -250,7 +256,7 @@ async fn preview_rejects_slippage_above_ten_thousand_bps() {
     let mut request = request(100_000_000);
     request.max_slippage_bps = Some(10_001);
 
-    let error = MultiVenueAdapter::preview(&finalizer, &request)
+    let error = MultiVenueAdapter::preview(&finalizer, &planning_context(), &request)
         .await
         .expect_err("invalid basis-point limit must not be clamped");
 
@@ -285,7 +291,7 @@ fn persisted_adapter_state_defaults_a_missing_persistence_gate_to_closed() {
 #[tokio::test]
 async fn first_advance_only_opens_the_parent_persistence_gate() {
     let finalizer = finalizer();
-    let preview = MultiVenueAdapter::preview(&finalizer, &request(100_000_000))
+    let preview = MultiVenueAdapter::preview(&finalizer, &planning_context(), &request(100_000_000))
         .await
         .expect("preview should succeed");
     let leg = leg_from_preview(preview);
@@ -310,7 +316,7 @@ async fn first_advance_only_opens_the_parent_persistence_gate() {
 #[tokio::test]
 async fn restart_with_an_outstanding_intent_requires_operator_instead_of_replaying() {
     let original = finalizer();
-    let preview = MultiVenueAdapter::preview(&original, &request(100_000_000))
+    let preview = MultiVenueAdapter::preview(&original, &planning_context(), &request(100_000_000))
         .await
         .expect("preview should succeed");
     let mut leg = leg_from_preview(preview);
@@ -357,7 +363,7 @@ async fn restart_with_an_outstanding_intent_requires_operator_instead_of_replayi
 #[tokio::test]
 async fn completed_leg_returns_a_result_without_parent_wal_access() {
     let finalizer = finalizer();
-    let preview = MultiVenueAdapter::preview(&finalizer, &request(100_000_000))
+    let preview = MultiVenueAdapter::preview(&finalizer, &planning_context(), &request(100_000_000))
         .await
         .expect("preview should succeed");
     let mut leg = leg_from_preview(preview);
@@ -384,7 +390,7 @@ async fn completed_leg_returns_a_result_without_parent_wal_access() {
 #[tokio::test]
 async fn adapter_rejects_a_mutated_committed_allocation() {
     let finalizer = finalizer();
-    let preview = MultiVenueAdapter::preview(&finalizer, &request(100_000_000))
+    let preview = MultiVenueAdapter::preview(&finalizer, &planning_context(), &request(100_000_000))
         .await
         .expect("preview should succeed");
     let mut leg = leg_from_preview(preview);
@@ -400,7 +406,7 @@ async fn adapter_rejects_a_mutated_committed_allocation() {
 async fn recover_accepts_each_durable_pending_reconciliation_phase() {
     let finalizer = finalizer();
     for pending_step in [CexStep::DepositPending, CexStep::TradePending, CexStep::WithdrawPending] {
-        let preview = MultiVenueAdapter::preview(&finalizer, &request(100_000_000))
+        let preview = MultiVenueAdapter::preview(&finalizer, &planning_context(), &request(100_000_000))
             .await
             .expect("preview should succeed");
         let mut leg = leg_from_preview(preview);
@@ -430,7 +436,7 @@ async fn recover_accepts_each_durable_pending_reconciliation_phase() {
 #[tokio::test]
 async fn permanent_cex_error_marks_only_the_mexc_leg_failed() {
     let finalizer = finalizer_with_permanent_deposit_error();
-    let preview = MultiVenueAdapter::preview(&finalizer, &request(100_000_000))
+    let preview = MultiVenueAdapter::preview(&finalizer, &planning_context(), &request(100_000_000))
         .await
         .expect("preview should succeed");
     let mut leg = leg_from_preview(preview);
@@ -467,7 +473,7 @@ async fn permanent_cex_error_marks_only_the_mexc_leg_failed() {
 #[tokio::test]
 async fn ordinary_cex_error_remains_retryable_without_operator_intervention() {
     let finalizer = finalizer_with_retryable_deposit_error();
-    let preview = MultiVenueAdapter::preview(&finalizer, &request(100_000_000))
+    let preview = MultiVenueAdapter::preview(&finalizer, &planning_context(), &request(100_000_000))
         .await
         .expect("preview should succeed");
     let mut leg = leg_from_preview(preview);
@@ -480,7 +486,10 @@ async fn ordinary_cex_error_remains_retryable_without_operator_intervention() {
         .await
         .expect("ordinary CEX failure should become durable retryable progress");
     assert_eq!(retryable.status, VenueLegStatus::Running);
-    assert_eq!(retryable.retryable_error.as_deref(), Some("deposit address request timed out"));
+    assert_eq!(
+        retryable.retryable_error.as_deref(),
+        Some("deposit address request timed out")
+    );
     let execution = retryable
         .execution
         .decode::<MexcVenueExecutionState>("mexc")
@@ -489,5 +498,8 @@ async fn ordinary_cex_error_remains_retryable_without_operator_intervention() {
     assert!(!execution.operator_required);
     assert!(!execution.ready_to_advance);
     assert!(execution.intent_id.is_none());
-    assert_eq!(execution.cex.last_error, Some("deposit address request timed out".to_string()));
+    assert_eq!(
+        execution.cex.last_error,
+        Some("deposit address request timed out".to_string())
+    );
 }

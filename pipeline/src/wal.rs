@@ -120,7 +120,11 @@ mod tests {
     use crate::executors::executor::ExecutorRequest;
     use crate::persistance::VenueExecutionState;
     use crate::stages::executor::ExecutionStatus;
-    use crate::swappers::icpswap::types::{IcpswapExecutionPlan, IcpswapExecutionState, IcpswapStep};
+    use crate::swappers::icpswap::{
+        identity::IcpswapExecutionIdentity,
+        transfer_state::{IcpswapFundingState, IcpswapLedgerTransferState, IcpswapSettlementState},
+        types::{IcpswapExecutionPlan, IcpswapExecutionState, IcpswapStep},
+    };
     use crate::swappers::model::SwapRequest;
 
     fn make_receipt() -> ExecutionReceipt {
@@ -269,11 +273,39 @@ mod tests {
             100,
         )
         .expect("plan");
+        let (identity, _) = IcpswapExecutionIdentity::derive(
+            "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about",
+            "42",
+        )
+        .expect("identity");
         let owner = Account {
-            owner: Principal::from_slice(&[4]),
+            owner: identity.principal,
             subaccount: None,
         };
-        let mut state = IcpswapExecutionState::prepare("42", plan.clone(), owner);
+        let mut state = IcpswapExecutionState::prepare(
+            "42",
+            plan.clone(),
+            identity,
+            IcpswapFundingState {
+                source: Account {
+                    owner: Principal::from_slice(&[4]),
+                    subaccount: None,
+                },
+                destination: owner,
+                fee: plan.input_ledger_fee.clone(),
+                transfer: IcpswapLedgerTransferState::default(),
+            },
+            IcpswapSettlementState {
+                kind: None,
+                destination: Account {
+                    owner: Principal::from_slice(&[5]),
+                    subaccount: None,
+                },
+                fee: plan.output_ledger_fee.clone(),
+                transfer: IcpswapLedgerTransferState::default(),
+            },
+        )
+        .expect("state");
         state.step = IcpswapStep::TradePending;
         state.transfer.block_index = Some(Nat::from(77u64));
         state.trade.input_pool_balance_before = Some(Nat::from(100_000u64));

@@ -7,7 +7,9 @@ use super::mexc_finalizer::MexcFinalizer;
 use crate::{
     finalizers::{
         cex_finalizer::{CexFinalizerLogic, CexState, CexStep},
-        multi_venue::{MultiVenueAdapter, VenueLegCheckpoint, VenueLegProgress, VenueRoutePreview},
+        multi_venue::{
+            MultiVenueAdapter, VenueLegCheckpoint, VenueLegProgress, VenuePlanningContext, VenueRoutePreview,
+        },
     },
     persistance::{VenueExecutionState, VenueLegState, VenueLegStatus},
     swappers::model::SwapRequest,
@@ -212,7 +214,11 @@ where
         Ok(())
     }
 
-    async fn preview(&self, request: &SwapRequest) -> Result<VenueRoutePreview, String> {
+    async fn preview(
+        &self,
+        _context: &VenuePlanningContext,
+        request: &SwapRequest,
+    ) -> Result<VenueRoutePreview, String> {
         self.preview_leg_request(request).await
     }
 

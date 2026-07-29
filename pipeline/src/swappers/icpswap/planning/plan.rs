@@ -36,7 +36,7 @@ impl IcpswapExecutionPlan {
 
         let zero_for_one = resolve_direction(token_in, token_out, token0, token1)?;
         let minimum_value = amount_out_minimum(&gross_quoted_out.value, max_slippage_bps)?;
-        net_expected_output(&gross_quoted_out.value, &output_ledger_fee.value)?;
+        net_forwarded_output(&gross_quoted_out.value, &output_ledger_fee.value)?;
         let output_token = gross_quoted_out.token.clone();
 
         Ok(Self {
@@ -60,7 +60,7 @@ impl IcpswapExecutionPlan {
     /// panics on underflow. Saturating keeps a bad record from taking down the
     /// whole finalize cycle; `new` remains the place the invariant is enforced.
     pub fn net_expected_output(&self) -> ChainTokenAmount {
-        let net = net_expected_output(&self.gross_quoted_out.value, &self.output_ledger_fee.value)
+        let net = net_forwarded_output(&self.gross_quoted_out.value, &self.output_ledger_fee.value)
             .unwrap_or_else(|_| Nat::from(0u8));
         ChainTokenAmount::from_raw(self.gross_quoted_out.token.clone(), net)
     }
@@ -99,6 +99,12 @@ pub fn net_expected_output(gross_quote: &Nat, output_ledger_fee: &Nat) -> Result
         });
     }
     Ok(gross_quote.clone() - output_ledger_fee.clone())
+}
+
+/// Net credit after the pool withdrawal and the child-to-recipient forwarding
+/// transfer each consume one output-ledger fee.
+pub fn net_forwarded_output(gross_quote: &Nat, output_ledger_fee: &Nat) -> Result<Nat, IcpswapPlanError> {
+    net_expected_output(gross_quote, &(output_ledger_fee.clone() * Nat::from(2u8)))
 }
 
 fn icp_ledger(token: &ChainToken) -> Result<Principal, IcpswapPlanError> {

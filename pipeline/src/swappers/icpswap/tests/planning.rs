@@ -116,7 +116,7 @@ async fn selects_highest_net_output_across_all_fee_tiers() {
         } else {
             assert!(args.zero_for_one);
         }
-        assert_eq!(args.amount_in, "99980");
+        assert_eq!(args.amount_in, "99970");
         assert_eq!(args.amount_out_minimum, "0");
         Ok(outputs_by_pool.get(&pool).expect("known pool").clone())
     });
@@ -139,16 +139,16 @@ async fn selects_highest_net_output_across_all_fee_tiers() {
 
     assert_eq!(result.route.pool, principal(6));
     assert_eq!(result.route.fee_tier, Nat::from(3_000u64));
-    assert_eq!(result.route.amount_in.value, Nat::from(99_980u64));
+    assert_eq!(result.route.amount_in.value, Nat::from(99_970u64));
     assert_eq!(result.route.gross_quoted_out.value, Nat::from(1_100u64));
     assert_eq!(result.route.input_ledger_fee.value, Nat::from(10u64));
     assert_eq!(result.route.output_ledger_fee.value, Nat::from(10u64));
-    assert_eq!(result.route.net_expected_output().value, Nat::from(1_090u64));
+    assert_eq!(result.route.net_expected_output().value, Nat::from(1_080u64));
     assert_eq!(result.route.amount_out_minimum.value, Nat::from(1_089u64));
-    assert_eq!(result.quote.receive_amount, Nat::from(1_090u64));
+    assert_eq!(result.quote.receive_amount, Nat::from(1_080u64));
     assert_eq!(result.quote.legs[0].route_id, principal(6).to_text());
     assert_eq!(result.quote.legs[0].gas_fee, Nat::from(10u64));
-    let expected_impact = (99_980.0 - 1_100.0) / 99_980.0 * 10_000.0;
+    let expected_impact = (99_970.0 - 1_100.0) / 99_970.0 * 10_000.0;
     assert!((result.quote.estimated_price_impact_bps - expected_impact).abs() < 0.000_001);
 }
 
@@ -190,7 +190,7 @@ async fn keeps_usable_quote_when_another_fee_tier_fails() {
     let result = venue.preview_route(&request(&input, &output)).await.expect("quote");
 
     assert_eq!(result.route.pool, principal(6));
-    assert_eq!(result.route.net_expected_output().value, Nat::from(990u64));
+    assert_eq!(result.route.net_expected_output().value, Nat::from(980u64));
 }
 
 #[tokio::test]
@@ -247,7 +247,7 @@ async fn rejects_spend_budget_that_cannot_cover_transfer_and_deposit_fees() {
         error,
         IcpswapQuoteError::InputFeesExceedBudget {
             budget: Nat::from(20u64),
-            fees: Nat::from(20u64),
+            fees: Nat::from(30u64),
         }
     );
 }

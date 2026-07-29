@@ -13,7 +13,9 @@ use serde::Deserialize;
 
 use super::{
     client::{IcpswapClient, IcpswapManualClient, IcpswapReadClient},
+    identity::IcpswapExecutionIdentity,
     plan::{amount_out_minimum, nat_to_decimal_text, net_expected_output, resolve_direction},
+    transfer_state::{IcpswapFundingState, IcpswapLedgerTransferState, IcpswapSettlementState},
     types::{
         IcpswapClientError, IcpswapDepositArgs, IcpswapError, IcpswapExecutionPlan, IcpswapExecutionState,
         IcpswapGetPoolArgs, IcpswapPlanError, IcpswapPoolData, IcpswapPoolMetadata, IcpswapResult, IcpswapStep,
@@ -140,7 +142,7 @@ fn builds_complete_plan_for_reversed_direction() {
 
     assert!(!plan.zero_for_one);
     assert_eq!(plan.amount_out_minimum.value, Nat::from(9_900u64));
-    assert_eq!(plan.net_expected_output().value, Nat::from(9_995u64));
+    assert_eq!(plan.net_expected_output().value, Nat::from(9_990u64));
 }
 
 #[test]
@@ -162,14 +164,42 @@ fn manual_state_starts_before_any_external_side_effect() {
     )
     .expect("valid plan");
 
-    let owner = icrc_ledger_types::icrc1::account::Account {
-        owner: principal(4),
+    let (identity, _) = IcpswapExecutionIdentity::derive(
+        "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about",
+        "1",
+    )
+    .expect("identity");
+    let owner = Account {
+        owner: identity.principal,
         subaccount: None,
     };
-    let state = IcpswapExecutionState::prepare("run-1", plan.clone(), owner);
+    let state = IcpswapExecutionState::prepare(
+        "run-1",
+        plan.clone(),
+        identity,
+        IcpswapFundingState {
+            source: Account {
+                owner: principal(4),
+                subaccount: None,
+            },
+            destination: owner,
+            fee: plan.input_ledger_fee.clone(),
+            transfer: IcpswapLedgerTransferState::default(),
+        },
+        IcpswapSettlementState {
+            kind: None,
+            destination: Account {
+                owner: principal(5),
+                subaccount: None,
+            },
+            fee: plan.output_ledger_fee.clone(),
+            transfer: IcpswapLedgerTransferState::default(),
+        },
+    )
+    .expect("state");
 
     assert_eq!(state.plan, plan);
-    assert_eq!(state.step, IcpswapStep::Transfer);
+    assert_eq!(state.step, IcpswapStep::Funding);
     assert!(state.transfer.block_index.is_none());
     assert!(state.transfer.args.is_none());
     assert!(state.last_error.is_none());

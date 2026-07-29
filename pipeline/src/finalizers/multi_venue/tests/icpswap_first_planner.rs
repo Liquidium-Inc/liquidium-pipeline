@@ -36,6 +36,13 @@ struct BarrierAdapter {
     barrier: Arc<Barrier>,
 }
 
+/// Narrow test double used only to prove that every quote phase receives the
+/// same liquidation-scoped planning context.
+struct ContextRecordingAdapter {
+    venue_id: &'static str,
+    contexts: Arc<Mutex<Vec<String>>>,
+}
+
 type PreviewResponder = dyn Fn(&SwapRequest) -> Result<VenueRoutePreview, String> + Send + Sync;
 
 struct PlannerAdapter {
@@ -56,7 +63,11 @@ impl MultiVenueAdapter for PlannerAdapter {
         self.validation_error.clone().map_or(Ok(()), Err)
     }
 
-    async fn preview(&self, request: &SwapRequest) -> Result<VenueRoutePreview, String> {
+    async fn preview(
+        &self,
+        _context: &VenuePlanningContext,
+        request: &SwapRequest,
+    ) -> Result<VenueRoutePreview, String> {
         assert!(!self.preview_forbidden, "{} must not be previewed", self.venue_id);
         self.calls
             .lock()
@@ -88,9 +99,54 @@ impl MultiVenueAdapter for BarrierAdapter {
         self.venue_id
     }
 
-    async fn preview(&self, _request: &SwapRequest) -> Result<VenueRoutePreview, String> {
+    async fn preview(
+        &self,
+        _context: &VenuePlanningContext,
+        _request: &SwapRequest,
+    ) -> Result<VenueRoutePreview, String> {
         self.barrier.wait().await;
         Err(format!("{} unavailable", self.venue_id))
+    }
+
+    async fn advance(
+        &self,
+        _leg: &VenueLegState,
+        _checkpoint: &dyn VenueLegCheckpoint,
+    ) -> Result<VenueLegProgress, String> {
+        Err("not used by planner test".to_string())
+    }
+
+    async fn recover(
+        &self,
+        _leg: &VenueLegState,
+        _checkpoint: &dyn VenueLegCheckpoint,
+    ) -> Result<VenueLegProgress, String> {
+        Err("not used by planner test".to_string())
+    }
+}
+
+#[async_trait]
+impl MultiVenueAdapter for ContextRecordingAdapter {
+    fn venue_id(&self) -> &'static str {
+        self.venue_id
+    }
+
+    async fn preview(
+        &self,
+        context: &VenuePlanningContext,
+        request: &SwapRequest,
+    ) -> Result<VenueRoutePreview, String> {
+        self.contexts
+            .lock()
+            .expect("contexts lock")
+            .push(context.liquidation_id.clone());
+        let pay = request.pay_amount.value.0.to_u64().expect("test amount");
+        let impact = match self.venue_id {
+            ICPSWAP_VENUE_ID if pay > TOTAL_PAY / 2 => 200.0,
+            ICPSWAP_VENUE_ID => 50.0,
+            _ => 0.0,
+        };
+        Ok(proportional_preview(request, self.venue_id, impact, 2))
     }
 
     async fn advance(
@@ -140,6 +196,7 @@ fn debt_token() -> ChainToken {
 fn input_with_pay_token(pay_token: ChainToken) -> IcpswapFirstPlanInput {
     let debt = debt_token();
     IcpswapFirstPlanInput {
+        liquidation_id: "42".to_string(),
         total_pay: ChainTokenAmount::from_raw(pay_token, Nat::from(TOTAL_PAY)),
         receive_asset: debt.asset_id(),
         debt_repaid: ChainTokenAmount::from_raw(debt, Nat::from(DEBT_REPAID)),
@@ -288,6 +345,7 @@ fn receipt_input_uses_actual_collateral_received_not_estimated_swap_amount() {
     };
 
     let input = IcpswapFirstPlanInput::from_receipt(&receipt).expect("planner input");
+    assert_eq!(input.liquidation_id, "1");
     assert_eq!(input.total_pay.value, actual_received);
 }
 
@@ -311,7 +369,9 @@ async fn registry_previews_concurrently_and_preserves_registration_order() {
 
     let quotes = tokio::time::timeout(
         Duration::from_secs(1),
-        registry.preview_all(|venue_id| input.request_for(venue_id, Nat::from(TOTAL_PAY))),
+        registry.preview_all(&input.planning_context(), |venue_id| {
+            input.request_for(venue_id, Nat::from(TOTAL_PAY))
+        }),
     )
     .await
     .expect("both previews must be polled concurrently");
@@ -321,6 +381,38 @@ async fn registry_previews_concurrently_and_preserves_registration_order() {
     assert_eq!(previews[1].venue_id, KRAKEN_VENUE_ID);
     assert!(matches!(previews[0].outcome, VenuePreviewOutcome::Unavailable(_)));
     assert!(matches!(previews[1].outcome, VenuePreviewOutcome::Unavailable(_)));
+}
+
+#[tokio::test]
+async fn liquidation_context_reaches_full_search_exact_and_overflow_previews() {
+    let icpswap_contexts = Arc::new(Mutex::new(Vec::new()));
+    let mexc_contexts = Arc::new(Mutex::new(Vec::new()));
+    let icpswap = ContextRecordingAdapter {
+        venue_id: ICPSWAP_VENUE_ID,
+        contexts: icpswap_contexts.clone(),
+    };
+    let mexc = ContextRecordingAdapter {
+        venue_id: MEXC_VENUE_ID,
+        contexts: mexc_contexts.clone(),
+    };
+
+    let planner = IcpswapFirstPlanner::new(vec![Arc::new(icpswap), Arc::new(mexc)], config(0.0))
+        .expect("valid planner");
+    let state = planner
+        .plan(&input_with_pay_token(native_icp()), 123)
+        .await
+        .expect("split plan");
+
+    assert_eq!(state.legs.len(), 2);
+    let icpswap_contexts = icpswap_contexts.lock().expect("contexts lock");
+    let mexc_contexts = mexc_contexts.lock().expect("contexts lock");
+    assert!(
+        icpswap_contexts.len() > 2,
+        "full quote, search, and exact quote must run"
+    );
+    assert!(!mexc_contexts.is_empty(), "overflow preview must run");
+    assert!(icpswap_contexts.iter().all(|id| id == "42"));
+    assert!(mexc_contexts.iter().all(|id| id == "42"));
 }
 
 #[test]

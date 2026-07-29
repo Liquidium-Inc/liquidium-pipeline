@@ -29,7 +29,9 @@ use crate::approval_state::ApprovalState;
 use crate::config::{Config, ConfigTrait};
 use crate::finalizers::icpswap::finalizer::IcpswapFinalizer;
 use crate::finalizers::multi_venue::ICPSWAP_VENUE_ID;
-use crate::swappers::icpswap::{client::IcpswapClient, types::IcpswapTokenMetadata, venue::IcpswapVenue};
+use crate::swappers::icpswap::{
+    client::IcpswapClient, session::IcpswapAgentSessionFactory, types::IcpswapTokenMetadata, venue::IcpswapVenue,
+};
 use crate::watchdog::{balance_monitor::DEFAULT_LOW_BALANCE_ALERT_COOLDOWN, slack_watchdog_from_env};
 
 pub struct PipelineContext {
@@ -262,11 +264,7 @@ impl<P: Provider<AnyNetwork> + WalletProvider<AnyNetwork> + Clone + 'static> Pip
         // Construct ICPSwap only when it is enabled. In particular, a MEXC-only
         // process should not initialize clients or validate configuration for a
         // venue that cannot be selected.
-        let icpswap_finalizer = if config
-            .enabled_swap_venues
-            .iter()
-            .any(|venue| venue == ICPSWAP_VENUE_ID)
-        {
+        let icpswap_finalizer = if config.enabled_swap_venues.iter().any(|venue| venue == ICPSWAP_VENUE_ID) {
             let icpswap_tokens: Vec<IcpswapTokenMetadata> = registry
                 .tokens
                 .values()
@@ -284,6 +282,12 @@ impl<P: Provider<AnyNetwork> + WalletProvider<AnyNetwork> + Clone + 'static> Pip
                 icp_backend_trader.clone(),
                 config.icpswap_factory_canister,
             ));
+            let icpswap_sessions = Arc::new(IcpswapAgentSessionFactory::new(
+                config.icpswap_mnemonic.clone(),
+                config.ic_url.clone(),
+                config.icpswap_factory_canister,
+                icp_backend_trader.clone(),
+            ));
             let icpswap_venue = Arc::new(
                 IcpswapVenue::new(
                     icpswap_client,
@@ -291,9 +295,7 @@ impl<P: Provider<AnyNetwork> + WalletProvider<AnyNetwork> + Clone + 'static> Pip
                     config.icpswap_fee_tiers.clone(),
                     config.max_allowed_dex_slippage,
                 )
-                .map_err(|error| {
-                    PipelineContextError::Other(format!("invalid ICPSwap configuration: {error}"))
-                })?,
+                .map_err(|error| PipelineContextError::Other(format!("invalid ICPSwap configuration: {error}")))?,
             );
 
             Some(Arc::new(
@@ -303,6 +305,7 @@ impl<P: Provider<AnyNetwork> + WalletProvider<AnyNetwork> + Clone + 'static> Pip
                         owner: config.trader_principal,
                         subaccount: None,
                     },
+                    icpswap_sessions,
                 )
                 .with_watchdog(slack_watchdog_from_env(DEFAULT_LOW_BALANCE_ALERT_COOLDOWN)),
             ))
@@ -440,6 +443,9 @@ mod tests {
         let evm_test_private_key = std::env::var("EVM_TEST_PRIVATE_KEY").unwrap_or_default();
 
         Arc::new(Config {
+            icpswap_mnemonic: Arc::from(
+                "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about",
+            ),
             liquidator_identity: Arc::new(AnonymousIdentity {}),
             trader_identity: Arc::new(AnonymousIdentity {}),
             bridge_ic_identity: Arc::new(AnonymousIdentity {}),

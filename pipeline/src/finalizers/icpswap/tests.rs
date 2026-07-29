@@ -5,10 +5,13 @@ use std::{
 
 use async_trait::async_trait;
 use candid::{Nat, Principal};
+use ic_agent::Identity;
 use icrc_ledger_types::icrc1::{
     account::{Account, principal_to_subaccount},
     transfer::TransferArg,
 };
+use icrc_ledger_types::icrc2::approve::ApproveArgs;
+use liquidium_pipeline_connectors::backend::icp_backend::{IcpBackend, IcrcTransferError};
 use liquidium_pipeline_core::{
     tokens::{chain_token::ChainToken, chain_token_amount::ChainTokenAmount},
     types::protocol_types::{
@@ -24,7 +27,9 @@ use crate::{
         dex_finalizer::{DexRouteFinalizer, DexRoutePreview},
         finalizer::{Finalizer, FinalizerErrorKind},
         icpswap::finalizer::{ICPSWAP_FINALIZER_PERMANENT_PREFIX, IcpswapFinalizer},
-        multi_venue::{ICPSWAP_VENUE_ID, MultiVenueAdapter, VenueLegCheckpoint, VenueLegProgress},
+        multi_venue::{
+            ICPSWAP_VENUE_ID, MultiVenueAdapter, VenueLegCheckpoint, VenueLegProgress, VenuePlanningContext,
+        },
     },
     persistance::{
         FinalizerDecisionSnapshot, LiqMetaWrapper, LiqResultRecord, ResultStatus, VenueExecutionState, VenueLegQuote,
@@ -34,9 +39,10 @@ use crate::{
     swappers::{
         icpswap::{
             client::{IcpswapManualClient, MockIcpswapManualClient},
-            execution::IcpswapExecutionStateStore,
-            manual::{deposit_step, operator_step, recover_step, trade_step, transfer_step, withdraw_step},
+            identity::IcpswapExecutionIdentity,
+            session::{IcpswapExecutionSession, IcpswapExecutionSessionFactory},
             state::MAX_DEPOSIT_OBSERVATION_ATTEMPTS,
+            transfer_state::{IcpswapFundingState, IcpswapLedgerTransferState, IcpswapSettlementState},
             types::{
                 IcpswapClientError, IcpswapDepositArgs, IcpswapExecutionPlan, IcpswapExecutionState, IcpswapQuoteError,
                 IcpswapRoutePreview, IcpswapStep, IcpswapSwapArgs, IcpswapUnusedBalance, IcpswapWithdrawArgs,
@@ -83,6 +89,22 @@ fn trader() -> Account {
     }
 }
 
+fn receiver() -> Account {
+    Account {
+        owner: p(5),
+        subaccount: None,
+    }
+}
+
+const TEST_MNEMONIC: &str =
+    "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+
+fn planning_context() -> VenuePlanningContext {
+    VenuePlanningContext {
+        liquidation_id: "42".to_string(),
+    }
+}
+
 fn token(ledger: Principal, symbol: &str, fee: u64) -> ChainToken {
     ChainToken::Icp {
         ledger,
@@ -107,8 +129,46 @@ fn plan() -> IcpswapExecutionPlan {
     .expect("plan")
 }
 
+fn execution_state(execution_id: &str, plan: IcpswapExecutionPlan) -> IcpswapExecutionState {
+    let (identity, _) = IcpswapExecutionIdentity::derive(TEST_MNEMONIC, "42").expect("identity");
+    let child = Account {
+        owner: identity.principal,
+        subaccount: None,
+    };
+    let fee = plan.input_ledger_fee.value.clone();
+    let funding = IcpswapFundingState {
+        source: trader(),
+        destination: child,
+        fee: plan.input_ledger_fee.clone(),
+        transfer: IcpswapLedgerTransferState {
+            args: Some(TransferArg {
+                from_subaccount: None,
+                to: child,
+                amount: plan.amount_in.value.clone() + fee.clone() * Nat::from(2u8),
+                fee: Some(fee),
+                memo: None,
+                created_at_time: None,
+            }),
+            ..Default::default()
+        },
+    };
+    let settlement = IcpswapSettlementState {
+        kind: None,
+        destination: receiver(),
+        fee: plan.output_ledger_fee.clone(),
+        transfer: IcpswapLedgerTransferState::default(),
+    };
+    IcpswapExecutionState::prepare(execution_id, plan, identity, funding, settlement).expect("state")
+}
+
+fn pool_state(execution_id: &str, plan: IcpswapExecutionPlan) -> IcpswapExecutionState {
+    let mut state = execution_state(execution_id, plan);
+    state.step = IcpswapStep::Transfer;
+    state
+}
+
 fn state() -> IcpswapExecutionState {
-    IcpswapExecutionState::prepare("42", plan(), trader())
+    pool_state("42", plan())
 }
 
 fn receipt() -> ExecutionReceipt {
@@ -128,7 +188,7 @@ fn receipt() -> ExecutionReceipt {
                 pay_asset: collateral.asset_id(),
                 pay_amount: ChainTokenAmount::from_raw(collateral.clone(), Nat::from(100_000u64)),
                 receive_asset: debt.asset_id(),
-                receive_address: None,
+                receive_address: Some(receiver().owner.to_text()),
                 max_slippage_bps: Some(100),
                 venue_hint: Some("icpswap".to_string()),
             }),
@@ -323,65 +383,6 @@ impl IcpswapFinalizerLogic for TestIcpswapClient {
             failures: vec!["preview is not configured by this test".to_string()],
         })
     }
-
-    async fn transfer(
-        &self,
-        store: &dyn IcpswapExecutionStateStore,
-        execution_id: &str,
-        state: &mut IcpswapExecutionState,
-        now_nanos: u64,
-    ) -> Result<(), String> {
-        transfer_step(self, store, execution_id, state, now_nanos).await
-    }
-
-    async fn deposit(
-        &self,
-        store: &dyn IcpswapExecutionStateStore,
-        execution_id: &str,
-        state: &mut IcpswapExecutionState,
-        now_nanos: u64,
-    ) -> Result<(), String> {
-        deposit_step(self, store, execution_id, state, now_nanos).await
-    }
-
-    async fn trade(
-        &self,
-        store: &dyn IcpswapExecutionStateStore,
-        execution_id: &str,
-        state: &mut IcpswapExecutionState,
-        now_nanos: u64,
-    ) -> Result<(), String> {
-        trade_step(self, store, execution_id, state, now_nanos).await
-    }
-
-    async fn withdraw(
-        &self,
-        store: &dyn IcpswapExecutionStateStore,
-        execution_id: &str,
-        state: &mut IcpswapExecutionState,
-        now_nanos: u64,
-    ) -> Result<(), String> {
-        withdraw_step(self, store, execution_id, state, now_nanos).await
-    }
-
-    async fn recover(
-        &self,
-        store: &dyn IcpswapExecutionStateStore,
-        execution_id: &str,
-        state: &mut IcpswapExecutionState,
-        now_nanos: u64,
-    ) -> Result<(), String> {
-        recover_step(self, store, execution_id, state, now_nanos).await
-    }
-
-    async fn reconcile_operator(
-        &self,
-        store: &dyn IcpswapExecutionStateStore,
-        execution_id: &str,
-        state: &mut IcpswapExecutionState,
-    ) -> Result<(), String> {
-        operator_step(self, store, execution_id, state).await
-    }
 }
 
 #[async_trait]
@@ -419,22 +420,96 @@ impl IcpswapManualClient for TestIcpswapClient {
     }
 }
 
+#[async_trait]
+impl IcpBackend for TestIcpswapClient {
+    async fn icrc1_balance(&self, ledger: Principal, account: &Account) -> Result<Nat, String> {
+        IcpswapManualClient::ledger_balance(self, ledger, account)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    async fn icp_account_balance(&self, _: Principal, _: &str) -> Result<Nat, String> {
+        Err("native ICP backend balance is not used by this finalizer test double".to_string())
+    }
+
+    async fn icrc1_transfer(&self, _: Principal, _: &Account, _: &Account, _: Nat) -> Result<Nat, String> {
+        Err("plain ICRC-1 transfer is not used by this finalizer test double".to_string())
+    }
+
+    async fn icrc1_transfer_with_args(&self, ledger: Principal, args: TransferArg) -> Result<Nat, IcrcTransferError> {
+        IcpswapManualClient::ledger_transfer(self, ledger, args)
+            .await
+            .map_err(|error| match error {
+                IcpswapClientError::LedgerTransferTooOld { .. } => IcrcTransferError::TooOld,
+                IcpswapClientError::LedgerTransferCreatedInFuture { .. } => {
+                    IcrcTransferError::CreatedInFuture { ledger_time: 0 }
+                }
+                other => IcrcTransferError::Other(other.to_string()),
+            })
+    }
+
+    async fn icp_transfer(&self, _: Principal, _: &str, _: Nat) -> Result<u64, String> {
+        Err("legacy ICP transfer is not used by this finalizer test double".to_string())
+    }
+
+    async fn icrc1_decimals(&self, _: Principal) -> Result<u8, String> {
+        Err("ledger decimals are not used by this finalizer test double".to_string())
+    }
+
+    async fn icrc1_fee(&self, _: Principal) -> Result<Nat, String> {
+        Err("ledger fees are not used by this finalizer test double".to_string())
+    }
+
+    async fn icrc2_allowance(&self, _: Principal, _: &Account, _: &Account) -> Result<Nat, String> {
+        Err("ICRC-2 allowance is not used by this finalizer test double".to_string())
+    }
+
+    async fn icrc2_approve(&self, _: Principal, _: ApproveArgs) -> Result<Nat, String> {
+        Err("ICRC-2 approval is not used by this finalizer test double".to_string())
+    }
+}
+
+struct TestSessionFactory {
+    client: Arc<TestIcpswapClient>,
+}
+
+impl IcpswapExecutionSessionFactory for TestSessionFactory {
+    fn descriptor(&self, liquidation_id: &str) -> Result<IcpswapExecutionIdentity, String> {
+        IcpswapExecutionIdentity::derive(TEST_MNEMONIC, liquidation_id).map(|(descriptor, _)| descriptor)
+    }
+
+    fn derive_identity(&self, descriptor: &IcpswapExecutionIdentity) -> Result<Arc<dyn Identity>, String> {
+        descriptor
+            .validate_and_derive(TEST_MNEMONIC)
+            .map(|identity| Arc::new(identity) as Arc<dyn Identity>)
+    }
+
+    fn open(&self, descriptor: &IcpswapExecutionIdentity) -> Result<IcpswapExecutionSession, String> {
+        self.derive_identity(descriptor)?;
+        Ok(IcpswapExecutionSession {
+            funder: self.client.clone(),
+            child_ledger: self.client.clone(),
+            child: self.client.clone(),
+        })
+    }
+}
+
+fn test_finalizer(client: Arc<TestIcpswapClient>, trader: Account) -> IcpswapFinalizer {
+    let sessions = Arc::new(TestSessionFactory { client: client.clone() });
+    IcpswapFinalizer::from_workflow_with_clock(client, trader, sessions, Arc::new(|| 1_000_000_000))
+}
+
 fn finalizer(manual: MockIcpswapManualClient) -> IcpswapFinalizer {
-    IcpswapFinalizer::from_workflow_with_clock(
-        Arc::new(TestIcpswapClient { manual, preview: None }),
-        trader(),
-        Arc::new(|| 1_000_000_000),
-    )
+    test_finalizer(Arc::new(TestIcpswapClient { manual, preview: None }), trader())
 }
 
 fn finalizer_with_preview(preview: IcpswapRoutePreview) -> IcpswapFinalizer {
-    IcpswapFinalizer::from_workflow_with_clock(
+    test_finalizer(
         Arc::new(TestIcpswapClient {
             manual: MockIcpswapManualClient::new(),
             preview: Some(preview),
         }),
         trader(),
-        Arc::new(|| 1_000_000_000),
     )
 }
 
@@ -459,9 +534,9 @@ fn native_plan() -> IcpswapExecutionPlan {
 fn native_request(route: &IcpswapExecutionPlan) -> SwapRequest {
     SwapRequest {
         pay_asset: route.amount_in.token.asset_id(),
-        pay_amount: ChainTokenAmount::from_raw(route.amount_in.token.clone(), Nat::from(100_020u64)),
+        pay_amount: ChainTokenAmount::from_raw(route.amount_in.token.clone(), Nat::from(100_030u64)),
         receive_asset: route.gross_quoted_out.token.asset_id(),
-        receive_address: None,
+        receive_address: Some(receiver().owner.to_text()),
         max_slippage_bps: Some(100),
         venue_hint: Some(crate::swappers::icpswap::VENUE_ID.to_string()),
     }
@@ -504,7 +579,8 @@ fn venue_leg(state: IcpswapExecutionState, request: SwapRequest) -> VenueLegStat
             estimated_receive: state.plan.net_expected_output(),
             conservative_receive: ChainTokenAmount::from_raw(
                 state.plan.amount_out_minimum.token.clone(),
-                state.plan.amount_out_minimum.value.clone() - state.plan.output_ledger_fee.value.clone(),
+                state.plan.amount_out_minimum.value.clone()
+                    - state.plan.output_ledger_fee.value.clone() * Nat::from(2u8),
             ),
             estimated_price_impact_bps: 25.0,
             route_id: state.plan.pool.to_text(),
@@ -523,7 +599,10 @@ async fn multi_venue_preview_returns_initialized_tagged_leg_state() {
     let request = native_request(&route);
     let adapter = finalizer_with_preview(route_preview(&request, route));
 
-    let preview = adapter.preview(&request).await.expect("adapter preview");
+    let preview = adapter
+        .preview(&planning_context(), &request)
+        .await
+        .expect("adapter preview");
     let state = preview
         .initial_execution_state
         .decode::<IcpswapExecutionState>(crate::swappers::icpswap::VENUE_ID)
@@ -531,18 +610,33 @@ async fn multi_venue_preview_returns_initialized_tagged_leg_state() {
         .expect("ICPSwap state");
 
     assert_eq!(preview.venue_id, crate::swappers::icpswap::VENUE_ID);
-    assert_eq!(state.step, IcpswapStep::Transfer);
+    assert_eq!(state.step, IcpswapStep::Funding);
     assert!(state.execution_id.starts_with("icpswap-"));
     uuid::Uuid::parse_str(state.execution_id.trim_start_matches("icpswap-"))
         .expect("execution ID should contain a restart-safe UUID");
-    assert_eq!(preview.conservative_receive.value, Nat::from(118_795u64));
+    assert_eq!(preview.conservative_receive.value, Nat::from(118_790u64));
+}
+
+#[tokio::test]
+async fn multi_venue_preview_requires_an_explicit_receive_address() {
+    let route = native_plan();
+    let mut request = native_request(&route);
+    request.receive_address = None;
+    let adapter = finalizer_with_preview(route_preview(&request, route));
+
+    let error = adapter
+        .preview(&planning_context(), &request)
+        .await
+        .expect_err("ICPSwap preparation must reject a missing receive address");
+
+    assert!(error.contains("missing receive_address"));
 }
 
 #[tokio::test]
 async fn multi_venue_preview_rejects_non_native_icp_at_adapter_boundary() {
     let request = receipt().request.swap_args.expect("request");
     let error = finalizer(MockIcpswapManualClient::new())
-        .preview(&request)
+        .preview(&planning_context(), &request)
         .await
         .expect_err("non-native ICP must be rejected");
 
@@ -553,7 +647,7 @@ async fn multi_venue_preview_rejects_non_native_icp_at_adapter_boundary() {
 async fn multi_venue_checkpoints_pending_state_before_transfer_side_effect() {
     let route = native_plan();
     let request = native_request(&route);
-    let state = IcpswapExecutionState::prepare("leg-execution-42", route, trader());
+    let state = pool_state("leg-execution-42", route);
     let leg = venue_leg(state, request);
     let checkpoint = RecordingCheckpoint::default();
     let observed = checkpoint.progresses.clone();
@@ -594,7 +688,7 @@ async fn multi_venue_checkpoints_pending_state_before_transfer_side_effect() {
 async fn multi_venue_submits_deposit_after_checkpoint_in_the_same_cycle() {
     let route = native_plan();
     let request = native_request(&route);
-    let mut state = IcpswapExecutionState::prepare("leg-execution-42", route, trader());
+    let mut state = pool_state("leg-execution-42", route);
     state.step = IcpswapStep::Deposit;
     state.transfer.args = Some(TransferArg {
         from_subaccount: None,
@@ -658,10 +752,11 @@ async fn multi_venue_submits_deposit_after_checkpoint_in_the_same_cycle() {
 async fn multi_venue_completed_leg_returns_its_own_execution_result() {
     let route = native_plan();
     let request = native_request(&route);
-    let mut state = IcpswapExecutionState::prepare("leg-execution-42", route, trader());
+    let mut state = pool_state("leg-execution-42", route);
     state.step = IcpswapStep::Completed;
     state.trade.gross_output_amount = Some(Nat::from(120_000u64));
     state.withdraw.wallet_credited_amount = Some(Nat::from(119_995u64));
+    state.settlement.transfer.credited_amount = Some(Nat::from(119_990u64));
     let leg = venue_leg(state, request);
 
     let progress = finalizer(MockIcpswapManualClient::new())
@@ -672,7 +767,7 @@ async fn multi_venue_completed_leg_returns_its_own_execution_result() {
     assert_eq!(progress.status, VenueLegStatus::Completed);
     assert_eq!(
         progress.result.expect("execution result").receive_amount,
-        Nat::from(119_995u64)
+        Nat::from(119_990u64)
     );
 }
 
@@ -680,7 +775,7 @@ async fn multi_venue_completed_leg_returns_its_own_execution_result() {
 async fn multi_venue_recover_maps_refunded_leg_without_parent_state() {
     let route = native_plan();
     let request = native_request(&route);
-    let mut state = IcpswapExecutionState::prepare("leg-execution-42", route, trader());
+    let mut state = pool_state("leg-execution-42", route);
     state.step = IcpswapStep::Refunded;
     let leg = venue_leg(state, request);
 
@@ -707,7 +802,7 @@ async fn multi_venue_preview_rejects_non_icp_chain_tokens_at_adapter_boundary() 
     request.pay_amount = ChainTokenAmount::from_raw(evm_token, Nat::from(100_020u64));
 
     let error = finalizer(MockIcpswapManualClient::new())
-        .preview(&request)
+        .preview(&planning_context(), &request)
         .await
         .expect_err("a non-ICP chain token must be rejected before any client call");
 
@@ -718,7 +813,7 @@ async fn multi_venue_preview_rejects_non_icp_chain_tokens_at_adapter_boundary() 
 async fn multi_venue_advance_rejects_leg_tagged_for_a_different_venue() {
     let route = native_plan();
     let request = native_request(&route);
-    let state = IcpswapExecutionState::prepare("leg-execution-42", route, trader());
+    let state = pool_state("leg-execution-42", route);
     let mut leg = venue_leg(state, request);
     leg.venue_id = "mexc".to_string();
 
@@ -735,7 +830,7 @@ async fn multi_venue_recover_rejects_a_leg_that_is_not_in_recovery() {
     let route = native_plan();
     let request = native_request(&route);
     // Defaults to `Transfer`: still mid-flight, not failed or parked.
-    let state = IcpswapExecutionState::prepare("leg-execution-42", route, trader());
+    let state = pool_state("leg-execution-42", route);
     let leg = venue_leg(state, request);
 
     let error = finalizer(MockIcpswapManualClient::new())
@@ -754,17 +849,16 @@ async fn multi_venue_preview_rejects_trader_with_a_non_default_subaccount() {
         owner: p(4),
         subaccount: Some([7u8; 32]),
     };
-    let adapter = IcpswapFinalizer::from_workflow_with_clock(
+    let adapter = test_finalizer(
         Arc::new(TestIcpswapClient {
             manual: MockIcpswapManualClient::new(),
             preview: None,
         }),
         trader_with_subaccount,
-        Arc::new(|| 1_000_000_000),
     );
 
     let error = adapter
-        .preview(&request)
+        .preview(&planning_context(), &request)
         .await
         .expect_err("a non-default trader subaccount must be rejected");
 
@@ -772,10 +866,10 @@ async fn multi_venue_preview_rejects_trader_with_a_non_default_subaccount() {
 }
 
 #[tokio::test]
-async fn multi_venue_operator_required_state_is_preserved_but_outer_leg_is_abandoned() {
+async fn multi_venue_operator_required_state_parks_only_its_isolated_leg() {
     let route = native_plan();
     let request = native_request(&route);
-    let mut state = IcpswapExecutionState::prepare("leg-execution-42", route, trader());
+    let mut state = pool_state("leg-execution-42", route);
     state.step = IcpswapStep::OperatorRequired;
     state.last_error = Some("withdrawal outcome is ambiguous".to_string());
     let leg = venue_leg(state, request);
@@ -785,7 +879,7 @@ async fn multi_venue_operator_required_state_is_preserved_but_outer_leg_is_aband
         .await
         .expect("operator-required leg advances without any client call");
 
-    assert_eq!(progress.status, VenueLegStatus::FailedPermanent);
+    assert_eq!(progress.status, VenueLegStatus::OperatorRequired);
     assert!(progress.result.is_none());
     assert_eq!(progress.last_error.as_deref(), Some("withdrawal outcome is ambiguous"));
     let persisted = progress
@@ -800,7 +894,7 @@ async fn multi_venue_operator_required_state_is_preserved_but_outer_leg_is_aband
 async fn multi_venue_failed_leg_maps_to_failed_permanent_and_keeps_its_error() {
     let route = native_plan();
     let request = native_request(&route);
-    let mut state = IcpswapExecutionState::prepare("leg-execution-42", route, trader());
+    let mut state = pool_state("leg-execution-42", route);
     state.step = IcpswapStep::Failed;
     state.last_error = Some("gross swap output cannot cover the output ledger fee".to_string());
     let leg = venue_leg(state, request);
@@ -822,7 +916,7 @@ async fn multi_venue_failed_leg_maps_to_failed_permanent_and_keeps_its_error() {
 async fn multi_venue_advance_surfaces_operational_error_without_losing_leg_progress() {
     let route = native_plan();
     let request = native_request(&route);
-    let state = IcpswapExecutionState::prepare("leg-execution-42", route, trader());
+    let state = pool_state("leg-execution-42", route);
     let leg = venue_leg(state, request.clone());
 
     let mut manual = MockIcpswapManualClient::new();
@@ -859,7 +953,14 @@ async fn multi_venue_advance_surfaces_operational_error_without_losing_leg_progr
 
 #[tokio::test]
 async fn committing_dex_preview_creates_manual_icpswap_state() {
-    let receipt = receipt();
+    let mut receipt = receipt();
+    receipt
+        .request
+        .swap_args
+        .as_mut()
+        .expect("swap request")
+        .pay_amount
+        .value = Nat::from(100_030u64);
     let plan = plan();
     let wal = TestWal::new(&receipt, state());
     wal.clear_execution_state();
@@ -900,8 +1001,9 @@ async fn committing_dex_preview_creates_manual_icpswap_state() {
     assert_eq!(wal.wrapper().finalizer_decision, Some(decision));
     let state = wal.state();
     assert_eq!(state.plan, plan);
-    assert_eq!(state.step, IcpswapStep::Transfer);
-    assert_eq!(state.owner, trader());
+    assert_eq!(state.step, IcpswapStep::Funding);
+    assert_ne!(state.owner, trader());
+    assert_eq!(state.funding.source, trader());
 }
 
 #[tokio::test]
@@ -970,9 +1072,25 @@ async fn finalizer_drives_immediately_runnable_steps_and_builds_execution() {
         .in_sequence(&mut balance_sequence)
         .return_once(|_, _| Ok(Nat::from(119_505u64)));
     manual
+        .expect_ledger_balance()
+        .times(1)
+        .in_sequence(&mut balance_sequence)
+        .return_once(|_, _| Ok(Nat::from(119_495u64)));
+    manual
+        .expect_ledger_balance()
+        .times(1)
+        .in_sequence(&mut balance_sequence)
+        .return_once(|_, _| Ok(Nat::from(0u8)));
+    manual
         .expect_withdraw()
         .times(1)
         .return_once(|_, args| Ok(args.amount.clone()));
+    manual.expect_ledger_transfer().times(1).return_once(|ledger, args| {
+        assert_eq!(ledger, p(2));
+        assert_eq!(args.to, receiver());
+        assert_eq!(args.amount, Nat::from(119_490u64));
+        Ok(Nat::from(78u64))
+    });
     let finalizer = finalizer(manual);
 
     // Every successful phase remains immediately runnable, so the finalizer
@@ -990,7 +1108,7 @@ async fn finalizer_drives_immediately_runnable_steps_and_builds_execution() {
 
     assert_eq!(calls, 1);
     assert_eq!(wal.state().step, IcpswapStep::Completed);
-    assert_eq!(execution.receive_amount, Nat::from(119_495u64));
+    assert_eq!(execution.receive_amount, Nat::from(119_490u64));
     assert!(execution.legs[0].route_id.contains("manual=42"));
     assert_eq!(
         wal.lock_holder(&trader().owner.to_text()),
@@ -1047,12 +1165,12 @@ async fn terminal_state_retries_lock_cleanup_without_replaying_the_workflow() {
     let receipt = receipt();
     let mut terminal = state();
     terminal.step = IcpswapStep::Refunded;
+    let owner = terminal.owner.owner.to_text();
     let wal = TestWal::new(&receipt, terminal);
-    let owner = trader().owner.to_text();
     wal.hold_lock_for(&owner, "42");
     wal.fail_next_lock_releases(1);
     let watchdog = Arc::new(RecordingWatchdog::default());
-    let finalizer = IcpswapFinalizer::from_workflow_with_clock(
+    let finalizer = test_finalizer(
         Arc::new(TestIcpswapClient {
             manual: MockIcpswapManualClient::new(),
             preview: None,
@@ -1061,7 +1179,6 @@ async fn terminal_state_retries_lock_cleanup_without_replaying_the_workflow() {
             owner: p(99),
             subaccount: None,
         },
-        Arc::new(|| 1_000_000_000),
     )
     .with_watchdog(watchdog.clone());
 
@@ -1088,8 +1205,9 @@ async fn terminal_state_retries_lock_cleanup_without_replaying_the_workflow() {
 async fn owner_lock_contention_holds_the_row_instead_of_failing_it() {
     let receipt = receipt();
     let initial = state();
+    let owner = initial.owner.owner.to_text();
     let wal = TestWal::new(&receipt, initial);
-    wal.hold_lock_for(&trader().owner.to_text(), "other-liquidation");
+    wal.hold_lock_for(&owner, "other-liquidation");
 
     // No mock expectations: contention must be detected before any IC call.
     let result = finalizer(MockIcpswapManualClient::new())
@@ -1104,7 +1222,7 @@ async fn owner_lock_contention_holds_the_row_instead_of_failing_it() {
         "a waiting execution must not advance"
     );
     assert_eq!(
-        wal.lock_holder(&trader().owner.to_text()).as_deref(),
+        wal.lock_holder(&owner).as_deref(),
         Some("other-liquidation"),
         "waiting must not steal the holder's lock"
     );

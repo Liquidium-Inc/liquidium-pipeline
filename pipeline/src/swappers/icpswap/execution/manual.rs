@@ -42,9 +42,18 @@ pub(crate) async fn advance_manual(
         .load(execution_id)
         .await?
         .ok_or_else(|| format!("missing persisted ICPSwap state for {execution_id}"))?;
-    validate_execution_state(&state, execution_id, owner)?;
+    validate_execution_state(&state, execution_id)?;
+    if state.owner != owner {
+        return Err("ICPSwap execution owner differs from the supplied client owner".to_string());
+    }
 
     match state.step {
+        IcpswapStep::Funding
+        | IcpswapStep::FundingPending
+        | IcpswapStep::Forward
+        | IcpswapStep::ForwardPending => {
+            return Err("ICPSwap funding and forwarding are outside the pool-only test driver".to_string());
+        }
         IcpswapStep::Transfer | IcpswapStep::TransferPending => {
             transfer_step(client, store, execution_id, &mut state, now_nanos).await?
         }
@@ -717,7 +726,7 @@ async fn withdraw_output(
                 recon::complete_output_withdrawal(state, wallet_credit);
             }
             persist(store, execution_id, state).await?;
-            if state.step == IcpswapStep::Completed {
+            if state.step == IcpswapStep::Forward {
                 return Ok(());
             }
             return Err(error.to_string());
@@ -783,7 +792,7 @@ async fn recover_input(
                 recon::complete_recovery(state, wallet_credit);
             }
             persist(store, execution_id, state).await?;
-            if state.step == IcpswapStep::Refunded {
+            if state.step == IcpswapStep::Forward {
                 return Ok(());
             }
             return Err(error.to_string());

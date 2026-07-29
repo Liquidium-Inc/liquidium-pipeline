@@ -21,6 +21,9 @@ fn expand_tilde(p: &str) -> std::path::PathBuf {
 }
 
 pub struct Config {
+    /// Mnemonic retained only for deterministic, per-liquidation ICPSwap
+    /// session derivation. It is never serialized or logged.
+    pub(crate) icpswap_mnemonic: Arc<str>,
     pub liquidator_identity: Arc<dyn Identity>,
     pub trader_identity: Arc<dyn Identity>,
     pub bridge_ic_identity: Arc<dyn Identity>,
@@ -358,6 +361,7 @@ impl Config {
         let evm_rpc_url = env::var("EVM_RPC_URL").map_err(|_| "EVM_RPC_URL not configured".to_string())?;
 
         Ok(Arc::new(Config {
+            icpswap_mnemonic: Arc::from(mnemonic),
             evm_private_key,
             evm_rpc_url,
             bridge_evm_private_key,

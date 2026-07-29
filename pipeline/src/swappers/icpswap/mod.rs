@@ -4,6 +4,14 @@
 pub mod client;
 #[path = "execution/store.rs"]
 pub mod execution;
+#[path = "execution/identity.rs"]
+pub mod identity;
+#[path = "execution/ledger_transfers.rs"]
+pub mod ledger_transfers;
+#[path = "execution/session.rs"]
+pub mod session;
+#[path = "execution/transfer_state.rs"]
+pub mod transfer_state;
 #[path = "execution/manual.rs"]
 pub mod manual;
 #[path = "planning/plan.rs"]
@@ -28,3 +36,9 @@ mod tests;
 #[cfg(test)]
 #[path = "tests/planning.rs"]
 mod venue_tests;
+#[cfg(test)]
+#[path = "tests/state_versioning.rs"]
+mod state_versioning_tests;
+#[cfg(test)]
+#[path = "tests/ledger_transfers.rs"]
+mod ledger_transfer_tests;

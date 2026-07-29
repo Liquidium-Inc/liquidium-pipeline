@@ -1,7 +1,9 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use candid::Nat;
 use icrc_ledger_types::icrc1::account::Account;
+use icrc_ledger_types::icrc1::transfer::TransferArg;
 use tracing::debug;
 
 use crate::{
@@ -13,6 +15,8 @@ use crate::{
         icpswap::{
             VENUE_ID,
             execution::{IcpswapExecutionStateStore, WalIcpswapExecutionStateStore},
+            session::{IcpswapExecutionSession, IcpswapExecutionSessionFactory},
+            transfer_state::{IcpswapFundingState, IcpswapLedgerTransferState, IcpswapSettlementState},
             types::{IcpswapExecutionPlan, IcpswapExecutionState, IcpswapStep},
             venue::IcpswapFinalizerLogic,
         },
@@ -50,26 +54,91 @@ pub(super) fn is_terminal_step(step: IcpswapStep) -> bool {
 pub struct IcpswapFinalizer {
     pub(super) workflow: Arc<dyn IcpswapFinalizerLogic>,
     pub(super) trader: Account,
+    pub(super) sessions: Arc<dyn IcpswapExecutionSessionFactory>,
     pub(super) clock: Arc<Clock>,
     pub(super) watchdog: Arc<dyn Watchdog>,
 }
 
 impl IcpswapFinalizer {
-    pub fn new(workflow: Arc<dyn IcpswapFinalizerLogic>, trader: Account) -> Self {
-        Self::from_workflow_with_clock(workflow, trader, Arc::new(now_nanos))
+    pub fn new(
+        workflow: Arc<dyn IcpswapFinalizerLogic>,
+        trader: Account,
+        sessions: Arc<dyn IcpswapExecutionSessionFactory>,
+    ) -> Self {
+        Self::from_workflow_with_clock(workflow, trader, sessions, Arc::new(now_nanos))
     }
 
     pub fn from_workflow_with_clock(
         workflow: Arc<dyn IcpswapFinalizerLogic>,
         trader: Account,
+        sessions: Arc<dyn IcpswapExecutionSessionFactory>,
         clock: Arc<Clock>,
     ) -> Self {
         Self {
             workflow,
             trader,
+            sessions,
             clock,
             watchdog: noop_watchdog(),
         }
+    }
+
+    pub(super) fn prepare_execution_state(
+        &self,
+        execution_id: &str,
+        liquidation_id: &str,
+        request: &SwapRequest,
+        plan: IcpswapExecutionPlan,
+    ) -> Result<IcpswapExecutionState, String> {
+        let identity = self.sessions.descriptor(liquidation_id)?;
+        let child = Account {
+            owner: identity.principal,
+            subaccount: None,
+        };
+        let allocation = request.pay_amount.value.clone();
+        let fee = plan.input_ledger_fee.value.clone();
+        let required = plan.amount_in.value.clone() + fee.clone() * Nat::from(3u8);
+        if allocation != required {
+            return Err(format!(
+                "ICPSwap allocation {allocation} does not equal pool input plus three ledger fees {required}"
+            ));
+        }
+        let funding = IcpswapFundingState {
+            source: self.trader,
+            destination: child,
+            fee: plan.input_ledger_fee.clone(),
+            transfer: IcpswapLedgerTransferState {
+                args: Some(TransferArg {
+                    from_subaccount: self.trader.subaccount,
+                    to: child,
+                    amount: allocation - fee.clone(),
+                    fee: Some(fee),
+                    memo: None,
+                    created_at_time: None,
+                }),
+                ..Default::default()
+            },
+        };
+        let address = request
+            .receive_address
+            .as_deref()
+            .ok_or_else(|| "ICPSwap request is missing receive_address".to_string())?;
+        let destination = Account {
+            owner: candid::Principal::from_text(address)
+                .map_err(|error| format!("invalid ICPSwap receive principal `{address}`: {error}"))?,
+            subaccount: None,
+        };
+        let settlement = IcpswapSettlementState {
+            kind: None,
+            destination,
+            fee: plan.output_ledger_fee.clone(),
+            transfer: IcpswapLedgerTransferState::default(),
+        };
+        IcpswapExecutionState::prepare(execution_id, plan, identity, funding, settlement)
+    }
+
+    pub(super) fn execution_session(&self, state: &IcpswapExecutionState) -> Result<IcpswapExecutionSession, String> {
+        self.sessions.open(&state.identity)
     }
 
     pub fn with_watchdog(mut self, watchdog: Arc<dyn Watchdog>) -> Self {
@@ -201,8 +270,7 @@ impl Finalizer for IcpswapFinalizer {
         // delete the durable lock. Retry only that idempotent cleanup; never
         // call the venue workflow again for a terminal execution.
         if is_terminal_step(loaded_state.step) {
-            self.release_execution_lock(wal, &owner_key, &liquidation_id)
-                .await?;
+            self.release_execution_lock(wal, &owner_key, &liquidation_id).await?;
             return self.result_for_state(&receipt, &loaded_state, now_nanos).await;
         }
 
@@ -244,9 +312,10 @@ impl Finalizer for IcpswapFinalizer {
         // ahead of the next opportunity scan. Driving further here would delay
         // claiming -- which is competitive -- by a full round trip per extra
         // step, so the state machine advances once and resumes next cycle.
+        let session = self.execution_session(&loaded_state)?;
         let (state, advance_error) = match self
             .workflow
-            .advance_loaded(&store, &liquidation_id, self.trader, now_nanos, loaded_state)
+            .advance_loaded(&session, &store, &liquidation_id, now_nanos, loaded_state)
             .await
         {
             Ok(state) => (state, None),
@@ -264,8 +333,7 @@ impl Finalizer for IcpswapFinalizer {
         self.notify_operator_required(&liquidation_id, &state).await;
 
         if is_terminal_step(state.step) {
-            self.release_execution_lock(wal, &owner_key, &liquidation_id)
-                .await?;
+            self.release_execution_lock(wal, &owner_key, &liquidation_id).await?;
         }
 
         if let Some(error) = advance_error {
@@ -375,7 +443,12 @@ impl DexRouteFinalizer for IcpswapFinalizer {
                 // left to `finalize`, which is where the IC calls happen. Taking
                 // it here would reserve the venue before any work exists to do,
                 // and turn a routine wait into a finalizer error.
-                let state = self.workflow.prepare(&liquidation_id, route, self.trader);
+                let request = receipt
+                    .request
+                    .swap_args
+                    .as_ref()
+                    .ok_or_else(|| "ICPSwap route commit receipt has no swap request".to_string())?;
+                let state = self.prepare_execution_state(&liquidation_id, &liquidation_id, request, route)?;
                 wrapper.venue_execution = Some(VenueExecutionState::new(VENUE_ID, &state)?);
             }
         }

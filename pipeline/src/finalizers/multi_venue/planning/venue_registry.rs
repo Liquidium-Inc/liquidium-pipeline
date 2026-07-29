@@ -3,7 +3,7 @@ use std::{collections::HashSet, sync::Arc};
 use futures::future::join_all;
 
 use crate::{
-    finalizers::multi_venue::{MultiVenueAdapter, VenueRoutePreview},
+    finalizers::multi_venue::{MultiVenueAdapter, VenuePlanningContext, VenueRoutePreview},
     swappers::model::SwapRequest,
 };
 
@@ -58,7 +58,11 @@ impl VenueRegistry {
     // Starts every registered preview before awaiting the combined result.
     // `join_all` preserves input order even when venues finish out of order.
     #[cfg(test)]
-    pub(in crate::finalizers::multi_venue) async fn preview_all<F>(&self, request_for: F) -> VenueQuoteBook
+    pub(in crate::finalizers::multi_venue) async fn preview_all<F>(
+        &self,
+        context: &VenuePlanningContext,
+        request_for: F,
+    ) -> VenueQuoteBook
     where
         F: Fn(&str) -> SwapRequest,
     {
@@ -66,7 +70,7 @@ impl VenueRegistry {
             let venue_id = adapter.venue_id().to_string();
             let request = request_for(&venue_id);
             async move {
-                let outcome = match adapter.preview(&request).await {
+                let outcome = match adapter.preview(context, &request).await {
                     Ok(preview) => VenuePreviewOutcome::Quoted(preview),
                     Err(error) => VenuePreviewOutcome::Unavailable(error),
                 };
@@ -87,6 +91,7 @@ impl VenueRegistry {
     // order supplied by strategy configuration.
     pub(in crate::finalizers::multi_venue) async fn preview_venues<F>(
         &self,
+        context: &VenuePlanningContext,
         venue_ids: &[String],
         request_for: F,
     ) -> Result<VenueQuoteBook, String>
@@ -107,7 +112,7 @@ impl VenueRegistry {
             let venue_id = adapter.venue_id().to_string();
             let request = request_for(&venue_id);
             async move {
-                let outcome = match adapter.preview(&request).await {
+                let outcome = match adapter.preview(context, &request).await {
                     Ok(preview) => VenuePreviewOutcome::Quoted(preview),
                     Err(error) => VenuePreviewOutcome::Unavailable(error),
                 };

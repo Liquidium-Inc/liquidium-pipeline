@@ -3,7 +3,6 @@ use std::{collections::HashMap, sync::Arc};
 use async_trait::async_trait;
 use candid::{Nat, Principal};
 use futures::future::join_all;
-use icrc_ledger_types::icrc1::account::Account;
 use liquidium_pipeline_core::tokens::{
     asset_id::AssetId, chain_token::ChainToken, chain_token_amount::ChainTokenAmount,
 };
@@ -18,8 +17,10 @@ use crate::utils::ICP_LEDGER_PRINCIPAL;
 use super::{
     client::{IcpswapManualClient, IcpswapReadClient},
     execution::IcpswapExecutionStateStore,
+    ledger_transfers::{forward_step, funding_step},
     manual::{deposit_step, operator_step, recover_step, trade_step, transfer_step, withdraw_step},
     plan::{amount_out_minimum, nat_to_decimal_text},
+    session::IcpswapExecutionSession,
     state::validate_execution_state,
     types::{
         IcpswapExecutionPlan, IcpswapPoolData, IcpswapPoolMetadata, IcpswapQuoteError, IcpswapRoutePreview,
@@ -59,80 +60,15 @@ struct IcpswapQuoteCandidate {
 pub trait IcpswapFinalizerLogic: Send + Sync {
     async fn preview_route(&self, request: &SwapRequest) -> Result<IcpswapRoutePreview, IcpswapQuoteError>;
 
-    fn prepare(&self, execution_id: &str, route: IcpswapExecutionPlan, owner: Account) -> IcpswapState {
-        IcpswapState::prepare(execution_id, route, owner)
-    }
-
-    async fn transfer(
-        &self,
-        store: &dyn IcpswapExecutionStateStore,
-        execution_id: &str,
-        state: &mut IcpswapState,
-        now_nanos: u64,
-    ) -> Result<(), String>;
-
-    async fn deposit(
-        &self,
-        store: &dyn IcpswapExecutionStateStore,
-        execution_id: &str,
-        state: &mut IcpswapState,
-        now_nanos: u64,
-    ) -> Result<(), String>;
-
-    async fn trade(
-        &self,
-        store: &dyn IcpswapExecutionStateStore,
-        execution_id: &str,
-        state: &mut IcpswapState,
-        now_nanos: u64,
-    ) -> Result<(), String>;
-
-    async fn withdraw(
-        &self,
-        store: &dyn IcpswapExecutionStateStore,
-        execution_id: &str,
-        state: &mut IcpswapState,
-        now_nanos: u64,
-    ) -> Result<(), String>;
-
-    async fn recover(
-        &self,
-        store: &dyn IcpswapExecutionStateStore,
-        execution_id: &str,
-        state: &mut IcpswapState,
-        now_nanos: u64,
-    ) -> Result<(), String>;
-
-    async fn reconcile_operator(
-        &self,
-        store: &dyn IcpswapExecutionStateStore,
-        execution_id: &str,
-        state: &mut IcpswapState,
-    ) -> Result<(), String>;
-
-    async fn advance(
-        &self,
-        store: &dyn IcpswapExecutionStateStore,
-        execution_id: &str,
-        owner: Account,
-        now_nanos: u64,
-    ) -> Result<IcpswapState, String> {
-        let state = store
-            .load(execution_id)
-            .await?
-            .ok_or_else(|| format!("missing persisted ICPSwap state for {execution_id}"))?;
-        self.advance_loaded(store, execution_id, owner, now_nanos, state).await
-    }
-
     async fn advance_loaded(
         &self,
+        session: &IcpswapExecutionSession,
         store: &dyn IcpswapExecutionStateStore,
         execution_id: &str,
-        owner: Account,
         now_nanos: u64,
         mut state: IcpswapState,
     ) -> Result<IcpswapState, String> {
-        validate_execution_state(&state, execution_id, owner)?;
+        validate_execution_state(&state, execution_id)?;
 
         const MAX_IMMEDIATE_TRANSITIONS: usize = 16;
         for _ in 0..MAX_IMMEDIATE_TRANSITIONS {
@@ -148,23 +84,36 @@ pub trait IcpswapFinalizerLogic: Send + Sync {
 
             let before = state.clone();
             match state.step {
+                super::types::IcpswapStep::Funding | super::types::IcpswapStep::FundingPending => {
+                    funding_step(session.funder.as_ref(), store, execution_id, &mut state, now_nanos).await?
+                }
                 super::types::IcpswapStep::Transfer | super::types::IcpswapStep::TransferPending => {
-                    self.transfer(store, execution_id, &mut state, now_nanos).await?
+                    transfer_step(session.child.as_ref(), store, execution_id, &mut state, now_nanos).await?
                 }
                 super::types::IcpswapStep::Deposit | super::types::IcpswapStep::DepositPending => {
-                    self.deposit(store, execution_id, &mut state, now_nanos).await?
+                    deposit_step(session.child.as_ref(), store, execution_id, &mut state, now_nanos).await?
                 }
                 super::types::IcpswapStep::Trade | super::types::IcpswapStep::TradePending => {
-                    self.trade(store, execution_id, &mut state, now_nanos).await?
+                    trade_step(session.child.as_ref(), store, execution_id, &mut state, now_nanos).await?
                 }
                 super::types::IcpswapStep::Withdraw | super::types::IcpswapStep::WithdrawPending => {
-                    self.withdraw(store, execution_id, &mut state, now_nanos).await?
+                    withdraw_step(session.child.as_ref(), store, execution_id, &mut state, now_nanos).await?
                 }
                 super::types::IcpswapStep::Recover | super::types::IcpswapStep::RecoverPending => {
-                    self.recover(store, execution_id, &mut state, now_nanos).await?
+                    recover_step(session.child.as_ref(), store, execution_id, &mut state, now_nanos).await?
+                }
+                super::types::IcpswapStep::Forward | super::types::IcpswapStep::ForwardPending => {
+                    forward_step(
+                        session.child_ledger.as_ref(),
+                        store,
+                        execution_id,
+                        &mut state,
+                        now_nanos,
+                    )
+                    .await?
                 }
                 super::types::IcpswapStep::OperatorRequired => {
-                    self.reconcile_operator(store, execution_id, &mut state).await?
+                    operator_step(session.child.as_ref(), store, execution_id, &mut state).await?
                 }
                 super::types::IcpswapStep::Completed
                 | super::types::IcpswapStep::Refunded
@@ -332,7 +281,7 @@ impl<C: IcpswapReadClient> IcpswapVenue<C> {
             .get_pool(&context.input_descriptor, &context.output_descriptor, &fee_tier)
             .await
             .map_err(|error| format!("fee {fee_tier}: {error}"))?;
-        
+
         validate_pool_fee(&pool, &fee_tier)?;
 
         let (token0, token1, zero_for_one) = resolve_pool_direction(&pool, context.token_in, context.token_out)?;
@@ -385,65 +334,6 @@ where
     async fn preview_route(&self, request: &SwapRequest) -> Result<IcpswapRoutePreview, IcpswapQuoteError> {
         IcpswapVenue::preview_route(self, request).await
     }
-
-    async fn transfer(
-        &self,
-        store: &dyn IcpswapExecutionStateStore,
-        execution_id: &str,
-        state: &mut IcpswapState,
-        now_nanos: u64,
-    ) -> Result<(), String> {
-        transfer_step(self.client.as_ref(), store, execution_id, state, now_nanos).await
-    }
-
-    async fn deposit(
-        &self,
-        store: &dyn IcpswapExecutionStateStore,
-        execution_id: &str,
-        state: &mut IcpswapState,
-        now_nanos: u64,
-    ) -> Result<(), String> {
-        deposit_step(self.client.as_ref(), store, execution_id, state, now_nanos).await
-    }
-
-    async fn trade(
-        &self,
-        store: &dyn IcpswapExecutionStateStore,
-        execution_id: &str,
-        state: &mut IcpswapState,
-        now_nanos: u64,
-    ) -> Result<(), String> {
-        trade_step(self.client.as_ref(), store, execution_id, state, now_nanos).await
-    }
-
-    async fn withdraw(
-        &self,
-        store: &dyn IcpswapExecutionStateStore,
-        execution_id: &str,
-        state: &mut IcpswapState,
-        now_nanos: u64,
-    ) -> Result<(), String> {
-        withdraw_step(self.client.as_ref(), store, execution_id, state, now_nanos).await
-    }
-
-    async fn recover(
-        &self,
-        store: &dyn IcpswapExecutionStateStore,
-        execution_id: &str,
-        state: &mut IcpswapState,
-        now_nanos: u64,
-    ) -> Result<(), String> {
-        recover_step(self.client.as_ref(), store, execution_id, state, now_nanos).await
-    }
-
-    async fn reconcile_operator(
-        &self,
-        store: &dyn IcpswapExecutionStateStore,
-        execution_id: &str,
-        state: &mut IcpswapState,
-    ) -> Result<(), String> {
-        operator_step(self.client.as_ref(), store, execution_id, state).await
-    }
 }
 
 #[async_trait]
@@ -474,11 +364,12 @@ fn completed_execution(request: &SwapRequest, state: &IcpswapState, now_nanos: u
         return Err("completed manual output cannot cover its ledger fee".to_string());
     }
     let net = state
-        .withdraw
-        .wallet_credited_amount
+        .settlement
+        .transfer
+        .credited_amount
         .as_ref()
-        .ok_or_else(|| "completed manual swap has no confirmed wallet credit".to_string())?;
-    let pay = state.plan.amount_in.to_f64();
+        .ok_or_else(|| "completed manual swap has no confirmed destination credit".to_string())?;
+    let pay = request.pay_amount.to_f64();
     let expected_output = state.plan.net_expected_output();
     let receive_token = expected_output.token.clone();
     let receive_amount = ChainTokenAmount::from_raw(receive_token.clone(), net.clone());
@@ -492,8 +383,8 @@ fn completed_execution(request: &SwapRequest, state: &IcpswapState, now_nanos: u
         swap_id: 0,
         request_id: 0,
         status: "filled".to_string(),
-        pay_asset: state.plan.amount_in.token.asset_id(),
-        pay_amount: state.plan.amount_in.value.clone(),
+        pay_asset: request.pay_asset.clone(),
+        pay_amount: request.pay_amount.value.clone(),
         receive_asset: receive_token.asset_id(),
         receive_amount: net.clone(),
         mid_price,
@@ -611,7 +502,9 @@ fn validate_native_icp_input(request: &SwapRequest) -> Result<(), IcpswapQuoteEr
 /// Converts the total allocation into the amount sent through the pool after
 /// reserving the wallet transfer and pool deposit-sweep ledger fees.
 fn executable_input_amount(request: &SwapRequest, input_fee: &Nat) -> Result<ChainTokenAmount, IcpswapQuoteError> {
-    let input_operation_fees = input_fee.clone() * Nat::from(2u8);
+    // Funding trader -> child, child -> pool deposit account, and the pool's
+    // deposit sweep each consume one input-ledger fee.
+    let input_operation_fees = input_fee.clone() * Nat::from(3u8);
     if request.pay_amount.value <= input_operation_fees {
         return Err(IcpswapQuoteError::InputFeesExceedBudget {
             budget: request.pay_amount.value.clone(),

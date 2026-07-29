@@ -12,6 +12,7 @@ use mockall::Sequence;
 use super::{
     client::MockIcpswapManualClient,
     execution::IcpswapExecutionStateStore,
+    identity::IcpswapExecutionIdentity,
     manual::advance_manual,
     reconciliation::is_slippage_error,
     state::{
@@ -19,10 +20,15 @@ use super::{
         PENDING_TRADE_RECONCILIATION_TIMEOUT_NANOS, initial_slippage_bps, retry_backoff_nanos, retry_slippage_bps,
     },
     types::{
-        IcpswapClientError, IcpswapError, IcpswapExecutionPlan, IcpswapExecutionState, IcpswapStep,
+        ICPSWAP_STATE_VERSION, IcpswapClientError, IcpswapError, IcpswapExecutionPlan, IcpswapExecutionState,
+        IcpswapStep,
         IcpswapUnusedBalance,
     },
+    transfer_state::{IcpswapFundingState, IcpswapLedgerTransferState, IcpswapSettlementState},
 };
+
+const TEST_MNEMONIC: &str =
+    "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
 
 fn p(id: u8) -> Principal {
     Principal::from_slice(&[id])
@@ -40,8 +46,9 @@ fn pool_subaccount_uses_the_documented_principal_encoding() {
 }
 
 fn owner() -> Account {
+    let (identity, _) = IcpswapExecutionIdentity::derive(TEST_MNEMONIC, "1").expect("identity");
     Account {
-        owner: p(4),
+        owner: identity.principal,
         subaccount: None,
     }
 }
@@ -70,6 +77,38 @@ fn plan() -> IcpswapExecutionPlan {
     .expect("plan")
 }
 
+fn prepared_pool_state() -> IcpswapExecutionState {
+    let plan = plan();
+    let (identity, _) = IcpswapExecutionIdentity::derive(TEST_MNEMONIC, "1").expect("identity");
+    let child = Account {
+        owner: identity.principal,
+        subaccount: None,
+    };
+    let funding = IcpswapFundingState {
+        source: Account {
+            owner: p(8),
+            subaccount: None,
+        },
+        destination: child,
+        fee: plan.input_ledger_fee.clone(),
+        transfer: IcpswapLedgerTransferState::default(),
+    };
+    let settlement = IcpswapSettlementState {
+        kind: None,
+        destination: Account {
+            owner: p(7),
+            subaccount: None,
+        },
+        fee: plan.output_ledger_fee.clone(),
+        transfer: IcpswapLedgerTransferState::default(),
+    };
+    let mut state = IcpswapExecutionState::prepare("run-1", plan, identity, funding, settlement).expect("state");
+    // These tests audit only the existing child-to-pool workflow. Funding and
+    // final forwarding have dedicated tests at the session boundary.
+    state.step = IcpswapStep::Transfer;
+    state
+}
+
 fn unused(input: u64, output: u64) -> IcpswapUnusedBalance {
     IcpswapUnusedBalance {
         balance0: Nat::from(input),
@@ -81,7 +120,7 @@ struct Store(Mutex<IcpswapExecutionState>);
 
 impl Store {
     fn new() -> Self {
-        Self(Mutex::new(IcpswapExecutionState::prepare("run-1", plan(), owner())))
+        Self(Mutex::new(prepared_pool_state()))
     }
 
     fn state(&self) -> IcpswapExecutionState {
@@ -186,7 +225,7 @@ async fn manual_success_persists_deposit_trade_and_withdraw_boundaries() {
     let fourth = advance_manual(&client, store.as_ref(), "run-1", owner(), 4_000)
         .await
         .expect("withdraw");
-    assert_eq!(fourth.step, IcpswapStep::Completed);
+    assert_eq!(fourth.step, IcpswapStep::Forward);
     assert_eq!(fourth.withdraw.wallet_credited_amount, Some(Nat::from(118_995u64)));
 }
 
@@ -228,7 +267,7 @@ async fn ambiguous_output_withdrawal_returns_success_when_reconciliation_complet
         .await
         .expect("observed output withdrawal is terminal");
 
-    assert_eq!(result.step, IcpswapStep::Completed);
+    assert_eq!(result.step, IcpswapStep::Forward);
     assert_eq!(result.withdraw.wallet_credited_amount, Some(Nat::from(118_995u64)));
     assert_eq!(result.last_error, None);
 }
@@ -267,7 +306,7 @@ async fn ambiguous_recovery_returns_success_when_reconciliation_completes() {
         .await
         .expect("observed recovery is terminal");
 
-    assert_eq!(result.step, IcpswapStep::Refunded);
+    assert_eq!(result.step, IcpswapStep::Forward);
     assert_eq!(result.recovery.wallet_credited_amount, Some(Nat::from(99_990u64)));
     assert_eq!(result.last_error, None);
 }
@@ -1128,7 +1167,7 @@ async fn non_slippage_swap_failure_withdraws_icp_back_to_owner() {
     let recovered = advance_manual(&client, store.as_ref(), "run-1", owner(), 2_000)
         .await
         .expect("recovery");
-    assert_eq!(recovered.step, IcpswapStep::Refunded);
+    assert_eq!(recovered.step, IcpswapStep::Forward);
     assert_eq!(recovered.recovery.wallet_credited_amount, Some(Nat::from(99_990u64)));
 }
 
@@ -1183,7 +1222,7 @@ fn legacy_one_step_records_are_rejected() {
 
 #[test]
 fn incompatible_state_versions_are_rejected_instead_of_silently_migrated() {
-    let state = IcpswapExecutionState::prepare("run-1", plan(), owner());
+    let state = prepared_pool_state();
     let mut json = serde_json::to_value(state).unwrap();
     json.as_object_mut().unwrap().remove("schema_version");
 
@@ -1193,7 +1232,7 @@ fn incompatible_state_versions_are_rejected_instead_of_silently_migrated() {
 #[tokio::test]
 async fn unsupported_state_version_is_rejected_before_any_external_call() {
     let store = Arc::new(Store::new());
-    store.0.lock().unwrap().schema_version += 1;
+    store.0.lock().unwrap().schema_version = ICPSWAP_STATE_VERSION + 1;
     let client = MockIcpswapManualClient::new();
 
     let error = advance_manual(&client, store.as_ref(), "run-1", owner(), 1_000)
@@ -1216,12 +1255,12 @@ async fn non_default_owner_is_rejected_before_any_external_call() {
         .await
         .expect_err("non-default owner");
 
-    assert!(error.contains("default ledger account"));
+    assert!(error.contains("differs from the supplied client owner"));
 }
 
 #[test]
 fn flattened_manual_state_uses_unique_step_prefixed_wire_fields() {
-    let mut state = IcpswapExecutionState::prepare("run-1", plan(), owner());
+    let mut state = prepared_pool_state();
     state.transfer.block_index = Some(Nat::from(5u8));
     state.deposit.input_pool_balance_before = Some(Nat::from(11u8));
     state.deposit.input_ledger_balance_before = Some(Nat::from(12u8));
@@ -1267,7 +1306,7 @@ fn flattened_manual_state_uses_unique_step_prefixed_wire_fields() {
 
 #[test]
 fn persisted_gross_output_accepts_the_previous_wire_field_name() {
-    let mut state = IcpswapExecutionState::prepare("run-1", plan(), owner());
+    let mut state = prepared_pool_state();
     state.trade.gross_output_amount = Some(Nat::from(119_000u64));
 
     let mut json = serde_json::to_value(&state).unwrap();
