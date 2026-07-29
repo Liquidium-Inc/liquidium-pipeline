@@ -467,7 +467,13 @@ No change should be needed to:
 - No SQLite migration is required because `meta_v2` is stored inside existing JSON metadata.
 - Older binaries do not understand the operational meaning of active `meta_v2` rows and cannot safely continue them.
 - Before rolling back to a binary that does not understand `meta_v2`, drain or manually recover all active multi-venue rows.
-- Before disabling a venue, finish or recover every unfinished committed leg for it. Startup rejects a disabled venue referenced by an unfinished `meta_v2` row.
+- If an unfinished committed leg references a disabled venue, or its persisted
+  execution identity cannot be reproduced, startup marks that WAL row
+  `Unresumable`, logs a warning, and continues processing unrelated rows. The
+  row stays visible in Executions and is excluded from automatic polling.
+- Re-enabling the venue or correcting the identity configuration does not
+  silently replay an `Unresumable` row. Inspect it first, then explicitly
+  re-enqueue it when recovery is safe.
 - A binary without the isolated-principal ICPSwap state cannot safely resume
   these legs. Drain or manually recover every active ICPSwap leg before rolling
   back to an older binary.

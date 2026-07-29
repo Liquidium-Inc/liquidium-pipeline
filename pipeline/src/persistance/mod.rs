@@ -22,6 +22,9 @@ pub enum ResultStatus {
     /// External custody is ambiguous and must be reconciled before retrying.
     /// Pending selection deliberately excludes this status.
     OperatorRequired = 7,
+    /// The committed route cannot be reconstructed with the current binary or
+    /// configuration. The row is visible to operators but never auto-polled.
+    Unresumable = 8,
 }
 
 #[derive(Debug, Clone, Serialize, serde::Deserialize)]

@@ -136,6 +136,7 @@ pub(super) struct WalCounts {
     pub(super) waiting_collateral: i64,
     pub(super) waiting_profit: i64,
     pub(super) operator_required: i64,
+    pub(super) unresumable: i64,
     pub(super) total: i64,
 }
 
@@ -150,6 +151,7 @@ impl WalCounts {
         out.waiting_collateral = *map.get(&ResultStatus::WaitingCollateral).unwrap_or(&0);
         out.waiting_profit = *map.get(&ResultStatus::WaitingProfit).unwrap_or(&0);
         out.operator_required = *map.get(&ResultStatus::OperatorRequired).unwrap_or(&0);
+        out.unresumable = *map.get(&ResultStatus::Unresumable).unwrap_or(&0);
         out.total = out.enqueued
             + out.inflight
             + out.succeeded
@@ -157,7 +159,8 @@ impl WalCounts {
             + out.failed_permanent
             + out.waiting_collateral
             + out.waiting_profit
-            + out.operator_required;
+            + out.operator_required
+            + out.unresumable;
         out
     }
 }
@@ -493,7 +496,9 @@ impl App {
 
 #[cfg(test)]
 mod tests {
-    use super::{App, ConfigSummary};
+    use super::{App, ConfigSummary, WalCounts};
+    use crate::persistance::ResultStatus;
+    use std::collections::HashMap;
 
     fn sample_config() -> ConfigSummary {
         ConfigSummary {
@@ -517,6 +522,17 @@ mod tests {
             db_path: "./wal.db".to_string(),
             export_path: "executions.csv".to_string(),
         }
+    }
+
+    #[test]
+    fn wal_counts_include_unresumable_rows() {
+        let counts = WalCounts::from_map(&HashMap::from([
+            (ResultStatus::Succeeded, 2),
+            (ResultStatus::Unresumable, 1),
+        ]));
+
+        assert_eq!(counts.unresumable, 1);
+        assert_eq!(counts.total, 3);
     }
 
     #[test]

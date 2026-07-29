@@ -20,13 +20,15 @@ use crate::{
     finalizers::{
         mexc::runtime::build_mexc_finalizer,
         multi_venue::{
-            ICPSWAP_VENUE_ID, IcpswapFirstPlannerConfig, MEXC_VENUE_ID, MultiVenueAdapter,
-            MultiVenueFinalizer,
+            ICPSWAP_VENUE_ID, IcpswapFirstPlannerConfig, MEXC_VENUE_ID, MultiVenueAdapter, MultiVenueFinalizer,
         },
         profit_calculator::SimpleProfitCalculator,
     },
     liquidation::collateral_service::CollateralService,
-    persistance::{FinalizerMetaPayload, MultiVenueExecutionOutcome, VenueLegStatus, sqlite::SqliteWalStore},
+    persistance::{
+        FinalizerMetaPayload, MultiVenueExecutionOutcome, ResultStatus, VenueLegStatus, WalStore,
+        sqlite::SqliteWalStore,
+    },
     price_oracle::price_oracle::LiquidationPriceOracle,
     stages::{
         export::ExportStage, finalize::FinalizeStage, opportunity::OpportunityFinder,
@@ -37,7 +39,8 @@ use crate::{
     watchdog::{
         WatchdogEvent,
         balance_monitor::{
-            DEFAULT_LOW_BALANCE_ALERT_COOLDOWN, LowBalanceMonitor, MonitoredBalanceAccount, balance_check_exclude_from_env,
+            DEFAULT_LOW_BALANCE_ALERT_COOLDOWN, LowBalanceMonitor, MonitoredBalanceAccount,
+            balance_check_exclude_from_env,
         },
         slack_watchdog_from_env, slack_webhook_configured, webhook_watchdog_from_env,
     },
@@ -75,13 +78,12 @@ fn validate_icpswap_identity(identity: &IcpswapExecutionIdentity, configured_mne
     identity.validate_and_derive(configured_mnemonic).map(|_| ())
 }
 
-fn ensure_committed_venues_are_resumable(
+async fn park_unresumable_committed_rows(
     db: &SqliteWalStore,
     enabled_venues: &[String],
     configured_icpswap_mnemonic: &str,
 ) -> Result<(), String> {
     let enabled: HashSet<&str> = enabled_venues.iter().map(String::as_str).collect();
-    let mut conflicts = Vec::new();
 
     for row in db
         .list_unfinished_execution_rows()
@@ -91,23 +93,27 @@ fn ensure_committed_venues_are_resumable(
             Ok(Some(wrapper)) => wrapper,
             Ok(None) => continue,
             Err(error) => {
-                return Err(format!(
-                    "cannot verify enabled venues for unfinished WAL row {} because its metadata is malformed: {error}",
-                    row.id
-                ));
+                park_unresumable_row(
+                    db,
+                    &row.id,
+                    format!("cannot inspect committed route because WAL metadata is malformed: {error}"),
+                )
+                .await?;
+                continue;
             }
         };
         let Some(meta) = wrapper.meta_v2 else {
             continue;
         };
         let FinalizerMetaPayload::MultiVenueSwap(state) = meta.payload;
+        let mut reasons = Vec::new();
         let disabled = disabled_venue_ids(
             &state.outcome,
             state.legs.iter().map(|leg| leg.venue_id.as_str()),
             &enabled,
         );
         if !disabled.is_empty() {
-            conflicts.push(format!("{} [{}]", row.id, disabled.join(",")));
+            reasons.push(format!("committed route uses disabled venues [{}]", disabled.join(",")));
         }
 
         // Every runnable or parked ICPSwap leg must still derive the principal
@@ -123,38 +129,47 @@ fn ensure_committed_venues_are_resumable(
             {
                 continue;
             }
-            let execution = leg
-                .execution
-                .decode::<IcpswapExecutionState>(ICPSWAP_VENUE_ID)
-                .map_err(|error| {
-                    format!(
-                        "cannot resume unfinished WAL row {} ICPSwap leg `{}` because its execution state is malformed: {error}",
-                        row.id, leg.leg_id
-                    )
-                })?
-                .ok_or_else(|| {
-                    format!(
-                        "cannot resume unfinished WAL row {} ICPSwap leg `{}` because its execution state is missing",
-                        row.id, leg.leg_id
-                    )
-                })?;
-            validate_icpswap_identity(&execution.identity, configured_icpswap_mnemonic).map_err(|error| {
-                format!(
-                    "cannot resume unfinished WAL row {} ICPSwap leg `{}` because its derived principal cannot be reproduced: {error}",
-                    row.id, leg.leg_id
-                )
-            })?;
+            let execution = match leg.execution.decode::<IcpswapExecutionState>(ICPSWAP_VENUE_ID) {
+                Ok(Some(execution)) => execution,
+                Ok(None) => {
+                    reasons.push(format!("ICPSwap leg `{}` has no ICPSwap execution state", leg.leg_id));
+                    continue;
+                }
+                Err(error) => {
+                    reasons.push(format!(
+                        "ICPSwap leg `{}` has malformed execution state: {error}",
+                        leg.leg_id
+                    ));
+                    continue;
+                }
+            };
+            if let Err(error) = validate_icpswap_identity(&execution.identity, configured_icpswap_mnemonic) {
+                reasons.push(format!(
+                    "ICPSwap leg `{}` derived principal cannot be reproduced: {error}",
+                    leg.leg_id
+                ));
+            }
+        }
+
+        if !reasons.is_empty() {
+            park_unresumable_row(db, &row.id, reasons.join("; ")).await?;
         }
     }
 
-    if conflicts.is_empty() {
-        Ok(())
-    } else {
-        Err(format!(
-            "unfinished multi-venue WAL rows reference disabled venues: {}; re-enable those venues or finish recovery before startup",
-            conflicts.join("; ")
-        ))
-    }
+    Ok(())
+}
+
+/// Durably removes one incompatible row from automatic polling while keeping
+/// its full WAL state visible in Executions for manual recovery.
+async fn park_unresumable_row(db: &SqliteWalStore, row_id: &str, reason: String) -> Result<(), String> {
+    warn!(
+        liquidation_id = row_id,
+        reason = %reason,
+        "Committed swap route is unresumable; parking row and continuing startup"
+    );
+    db.update_failure(row_id, ResultStatus::Unresumable, reason, false)
+        .await
+        .map_err(|error| format!("failed to mark unfinished WAL row {row_id} unresumable: {error}"))
 }
 
 #[instrument(name = "liquidation.init", skip_all, err)]
@@ -174,11 +189,7 @@ async fn init(
     let agent = ctx.agent.clone();
     let registry = ctx.registry.clone();
     let db = Arc::new(SqliteWalStore::new(&config.db_path).map_err(|e| format!("could not connect to db: {e}"))?);
-    ensure_committed_venues_are_resumable(
-        db.as_ref(),
-        &config.enabled_swap_venues,
-        &config.icpswap_mnemonic,
-    )?;
+    park_unresumable_committed_rows(db.as_ref(), &config.enabled_swap_venues, &config.icpswap_mnemonic).await?;
 
     let tokens = debt_asset_principals(&registry);
 
@@ -416,17 +427,19 @@ pub async fn run_liquidation_loop(sock_path: PathBuf) {
 
     let liq_dog = webhook_watchdog_from_env(Duration::from_secs(300));
     if let Some(slack) = slack_watchdog.as_ref() {
-        slack.notify(WatchdogEvent::Lifecycle {
-            state: "started".to_string(),
-            details: format!(
-                "Liquidator started on {}; scanning for liquidation opportunities.",
-                config.ic_url
-            ),
-        })
-        .await;
+        slack
+            .notify(WatchdogEvent::Lifecycle {
+                state: "started".to_string(),
+                details: format!(
+                    "Liquidator started on {}; scanning for liquidation opportunities.",
+                    config.ic_url
+                ),
+            })
+            .await;
     }
 
-    let low_balance_monitor = slack_watchdog.as_ref().map(|slack| Arc::new(LowBalanceMonitor::new(
+    let low_balance_monitor = slack_watchdog.as_ref().map(|slack| {
+        Arc::new(LowBalanceMonitor::new(
             vec![
                 MonitoredBalanceAccount {
                     label: "main",
@@ -442,7 +455,8 @@ pub async fn run_liquidation_loop(sock_path: PathBuf) {
                 },
             ],
             slack.clone(),
-        )));
+        ))
+    });
 
     // Steady-state operation is delegated to a helper to keep this entrypoint
     // focused on bootstrap wiring and lifecycle boundaries.
@@ -473,12 +487,188 @@ pub enum LoopControl {
 
 #[cfg(test)]
 mod tests {
-    use super::{disabled_venue_ids, validate_icpswap_identity};
+    use super::{disabled_venue_ids, park_unresumable_committed_rows, validate_icpswap_identity};
     use crate::commands::liquidation_loop_helpers::console_ui_enabled;
-    use crate::persistance::MultiVenueExecutionOutcome;
-    use crate::swappers::icpswap::identity::IcpswapExecutionIdentity;
+    use crate::{
+        executors::executor::ExecutorRequest,
+        persistance::sqlite::SqliteWalStore,
+        persistance::{
+            FINALIZER_META_V2_VERSION, FinalizerMetaPayload, FinalizerMetaV2, LiqMetaWrapper, LiqResultRecord,
+            MultiVenueAllocationReason, MultiVenueExecutionOutcome, MultiVenueExecutionPlan, MultiVenueExecutionState,
+            ResultStatus, VenueExecutionState, VenueLegQuote, VenueLegState, VenueLegStatus, WalStore,
+        },
+        stages::executor::{ExecutionReceipt, ExecutionStatus},
+        swappers::{
+            icpswap::{
+                identity::IcpswapExecutionIdentity,
+                transfer_state::{IcpswapFundingState, IcpswapLedgerTransferState, IcpswapSettlementState},
+                types::{IcpswapExecutionPlan, IcpswapExecutionState},
+            },
+            model::SwapRequest,
+        },
+    };
+    use candid::{Nat, Principal};
+    use icrc_ledger_types::icrc1::account::Account;
+    use liquidium_pipeline_core::{
+        tokens::{chain_token::ChainToken, chain_token_amount::ChainTokenAmount},
+        types::protocol_types::LiquidationRequest,
+    };
     use std::collections::HashSet;
     use std::io::IsTerminal;
+
+    const COMMITTED_MNEMONIC: &str =
+        "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+    const DIFFERENT_MNEMONIC: &str = "legal winner thank year wave sausage worth useful legal winner thank yellow";
+
+    fn startup_test_token(ledger: u8, symbol: &str, fee: u64) -> ChainToken {
+        ChainToken::Icp {
+            ledger: Principal::from_slice(&[ledger]),
+            symbol: symbol.to_string(),
+            decimals: 8,
+            fee: Nat::from(fee),
+        }
+    }
+
+    fn startup_test_row(id: &str, status: ResultStatus, mnemonic: &str) -> LiqResultRecord {
+        let input = startup_test_token(1, "ICP", 10);
+        let output = startup_test_token(2, "ckUSDC", 5);
+        let pool_input = ChainTokenAmount::from_raw(input.clone(), Nat::from(100_000u64));
+        let input_fee = ChainTokenAmount::from_raw(input.clone(), Nat::from(10u64));
+        let quoted_output = ChainTokenAmount::from_raw(output.clone(), Nat::from(120_000u64));
+        let output_fee = ChainTokenAmount::from_raw(output.clone(), Nat::from(5u64));
+        let route = IcpswapExecutionPlan::new(
+            Principal::from_slice(&[9]),
+            Principal::from_slice(&[1]),
+            Principal::from_slice(&[2]),
+            Nat::from(3_000u64),
+            pool_input,
+            input_fee,
+            quoted_output.clone(),
+            output_fee,
+            100,
+        )
+        .expect("ICPSwap route");
+        let (identity, _) = IcpswapExecutionIdentity::derive(mnemonic, "1536").expect("execution identity");
+        let child = Account {
+            owner: identity.principal,
+            subaccount: None,
+        };
+        let execution = IcpswapExecutionState::prepare(
+            "icpswap-startup-test",
+            route.clone(),
+            identity,
+            IcpswapFundingState::new(
+                Account {
+                    owner: Principal::from_slice(&[4]),
+                    subaccount: None,
+                },
+                child,
+                route.input_ledger_fee.clone(),
+            ),
+            IcpswapSettlementState {
+                kind: None,
+                destination: Account {
+                    owner: Principal::from_slice(&[5]),
+                    subaccount: None,
+                },
+                fee: route.output_ledger_fee.clone(),
+                transfer: IcpswapLedgerTransferState::default(),
+                interrupted_transfer: None,
+                interrupted_observed_debit: None,
+                recovery_credit: None,
+                residual_dust: None,
+            },
+        )
+        .expect("execution state");
+        let allocation = ChainTokenAmount::from_raw(input.clone(), Nat::from(100_030u64));
+        let receive = ChainTokenAmount::from_raw(output.clone(), Nat::from(119_990u64));
+        let request = SwapRequest {
+            pay_asset: input.asset_id(),
+            pay_amount: allocation.clone(),
+            receive_asset: output.asset_id(),
+            receive_address: Some(Principal::from_slice(&[5]).to_text()),
+            max_slippage_bps: Some(100),
+            venue_hint: Some("icpswap".to_string()),
+        };
+        let leg = VenueLegState {
+            leg_id: "icpswap-0".to_string(),
+            venue_id: "icpswap".to_string(),
+            request: request.clone(),
+            quote: VenueLegQuote {
+                pay_amount: allocation.clone(),
+                estimated_receive: quoted_output.clone(),
+                conservative_receive: receive.clone(),
+                estimated_price_impact_bps: 50.0,
+                route_id: "icpswap-route".to_string(),
+            },
+            execution: VenueExecutionState::new("icpswap", &execution).expect("tag execution"),
+            status: VenueLegStatus::Running,
+            result: None,
+            last_error: None,
+        };
+        let meta_v2 = FinalizerMetaV2 {
+            version: FINALIZER_META_V2_VERSION,
+            payload: FinalizerMetaPayload::MultiVenueSwap(MultiVenueExecutionState {
+                plan: MultiVenueExecutionPlan {
+                    strategy_id: "icpswap_first".to_string(),
+                    total_pay: allocation,
+                    receive_asset: output.asset_id(),
+                    debt_repaid: ChainTokenAmount::from_raw(output.clone(), Nat::from(100_000u64)),
+                    allocation_reason: MultiVenueAllocationReason::SingleVenue {
+                        venue_id: "icpswap".to_string(),
+                    },
+                    min_net_edge_bps: 150,
+                    estimated_receive: quoted_output,
+                    conservative_receive: receive,
+                    combined_net_edge_bps: 175.0,
+                    quoted_at: 123,
+                },
+                legs: vec![leg],
+                outcome: MultiVenueExecutionOutcome::Running,
+            }),
+        };
+        let receipt = ExecutionReceipt {
+            request: ExecutorRequest {
+                liquidation: LiquidationRequest {
+                    borrower: Principal::from_slice(&[6]),
+                    debt_pool_id: Principal::from_slice(&[7]),
+                    collateral_pool_id: Principal::from_slice(&[8]),
+                    debt_amount: Nat::from(100_000u64),
+                    receiver_address: Principal::from_slice(&[4]),
+                    buy_bad_debt: false,
+                },
+                swap_args: Some(request),
+                debt_asset: output,
+                collateral_asset: input,
+                expected_profit: 1,
+                ref_price: Nat::from(1u8),
+                debt_approval_needed: false,
+                min_collateral_amount: Nat::from(0u8),
+            },
+            liquidation_result: None,
+            status: ExecutionStatus::Success,
+            change_received: true,
+        };
+        let wrapper = LiqMetaWrapper {
+            receipt,
+            meta: Vec::new(),
+            finalizer_decision: None,
+            profit_snapshot: None,
+            venue_execution: None,
+            meta_v2: Some(meta_v2),
+        };
+
+        LiqResultRecord {
+            id: id.to_string(),
+            status,
+            attempt: 0,
+            error_count: 0,
+            last_error: None,
+            created_at: 1,
+            updated_at: 1,
+            meta_json: serde_json::to_string(&wrapper).expect("encode startup row"),
+        }
+    }
 
     fn calc_console_ui_enabled(human_output: bool, stdout_is_tty: bool, stderr_is_tty: bool) -> bool {
         human_output && stdout_is_tty && stderr_is_tty
@@ -529,19 +719,12 @@ mod tests {
     #[test]
     fn completed_plans_do_not_block_disabling_a_venue() {
         let enabled = HashSet::from(["icpswap"]);
-        let disabled = disabled_venue_ids(
-            &MultiVenueExecutionOutcome::Completed,
-            ["mexc"],
-            &enabled,
-        );
+        let disabled = disabled_venue_ids(&MultiVenueExecutionOutcome::Completed, ["mexc"], &enabled);
         assert!(disabled.is_empty());
     }
 
     #[test]
     fn startup_identity_check_rejects_a_different_configured_mnemonic() {
-        const COMMITTED_MNEMONIC: &str =
-            "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
-        const DIFFERENT_MNEMONIC: &str = "legal winner thank year wave sausage worth useful legal winner thank yellow";
         let (identity, _) = IcpswapExecutionIdentity::derive(COMMITTED_MNEMONIC, "1536").expect("identity");
 
         validate_icpswap_identity(&identity, COMMITTED_MNEMONIC).expect("matching mnemonic");
@@ -549,5 +732,121 @@ mod tests {
             .expect_err("startup must reject a principal mismatch");
 
         assert!(error.contains("does not match the configured mnemonic"));
+    }
+
+    #[tokio::test]
+    async fn startup_wal_accepts_a_reproducible_unfinished_icpswap_identity() {
+        let db_file = tempfile::NamedTempFile::new().expect("temporary WAL");
+        let db = SqliteWalStore::new(db_file.path().to_str().expect("database path")).expect("WAL store");
+        db.upsert_result(startup_test_row(
+            "valid-unfinished",
+            ResultStatus::Enqueued,
+            COMMITTED_MNEMONIC,
+        ))
+        .await
+        .expect("seed unfinished row");
+
+        park_unresumable_committed_rows(&db, &["icpswap".to_string()], COMMITTED_MNEMONIC)
+            .await
+            .expect("matching identity must resume");
+        assert_eq!(
+            db.get_result("valid-unfinished")
+                .await
+                .expect("read row")
+                .expect("row")
+                .status,
+            ResultStatus::Enqueued
+        );
+    }
+
+    #[tokio::test]
+    async fn startup_wal_parks_an_unreproducible_identity_without_blocking_startup() {
+        let db_file = tempfile::NamedTempFile::new().expect("temporary WAL");
+        let db = SqliteWalStore::new(db_file.path().to_str().expect("database path")).expect("WAL store");
+        db.upsert_result(startup_test_row(
+            "mismatched-unfinished",
+            ResultStatus::OperatorRequired,
+            COMMITTED_MNEMONIC,
+        ))
+        .await
+        .expect("seed unfinished row");
+
+        park_unresumable_committed_rows(&db, &["icpswap".to_string()], DIFFERENT_MNEMONIC)
+            .await
+            .expect("mismatched row must not block startup");
+
+        let parked = db
+            .get_result("mismatched-unfinished")
+            .await
+            .expect("read row")
+            .expect("parked row");
+        assert_eq!(parked.status, ResultStatus::Unresumable);
+        let reason = parked.last_error.expect("unresumable reason");
+        assert!(reason.contains("icpswap-0"));
+        assert!(reason.contains("cannot be reproduced"));
+        assert!(db.get_pending(10).await.expect("pending rows").is_empty());
+    }
+
+    #[tokio::test]
+    async fn startup_wal_parks_a_row_for_a_disabled_committed_venue() {
+        let db_file = tempfile::NamedTempFile::new().expect("temporary WAL");
+        let db = SqliteWalStore::new(db_file.path().to_str().expect("database path")).expect("WAL store");
+        db.upsert_result(startup_test_row(
+            "disabled-venue",
+            ResultStatus::FailedRetryable,
+            COMMITTED_MNEMONIC,
+        ))
+        .await
+        .expect("seed unfinished row");
+
+        park_unresumable_committed_rows(&db, &["mexc".to_string()], COMMITTED_MNEMONIC)
+            .await
+            .expect("disabled committed venue must not block startup");
+
+        let parked = db
+            .get_result("disabled-venue")
+            .await
+            .expect("read row")
+            .expect("parked row");
+        assert_eq!(parked.status, ResultStatus::Unresumable);
+        assert!(parked.last_error.expect("reason").contains("disabled venues [icpswap]"));
+    }
+
+    #[tokio::test]
+    async fn startup_wal_parks_malformed_metadata_without_blocking_startup() {
+        let db_file = tempfile::NamedTempFile::new().expect("temporary WAL");
+        let db = SqliteWalStore::new(db_file.path().to_str().expect("database path")).expect("WAL store");
+        let mut row = startup_test_row("malformed-metadata", ResultStatus::InFlight, COMMITTED_MNEMONIC);
+        row.meta_json = "not-json".to_string();
+        db.upsert_result(row).await.expect("seed malformed row");
+
+        park_unresumable_committed_rows(&db, &["icpswap".to_string(), "mexc".to_string()], COMMITTED_MNEMONIC)
+            .await
+            .expect("malformed historical row must not block startup");
+
+        let parked = db
+            .get_result("malformed-metadata")
+            .await
+            .expect("read row")
+            .expect("parked row");
+        assert_eq!(parked.status, ResultStatus::Unresumable);
+        assert!(parked.last_error.expect("reason").contains("metadata is malformed"));
+    }
+
+    #[tokio::test]
+    async fn startup_wal_ignores_a_terminal_row_with_an_old_icpswap_identity() {
+        let db_file = tempfile::NamedTempFile::new().expect("temporary WAL");
+        let db = SqliteWalStore::new(db_file.path().to_str().expect("database path")).expect("WAL store");
+        db.upsert_result(startup_test_row(
+            "completed-row",
+            ResultStatus::Succeeded,
+            COMMITTED_MNEMONIC,
+        ))
+        .await
+        .expect("seed completed row");
+
+        park_unresumable_committed_rows(&db, &["icpswap".to_string()], DIFFERENT_MNEMONIC)
+            .await
+            .expect("terminal rows no longer require identity reproduction");
     }
 }

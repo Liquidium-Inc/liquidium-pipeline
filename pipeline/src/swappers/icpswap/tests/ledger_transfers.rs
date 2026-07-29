@@ -129,6 +129,12 @@ impl Store {
     }
 }
 
+/// Serializes and decodes the state exactly as a daemon restart would through
+/// the WAL JSON envelope.
+fn restart(state: &IcpswapExecutionState) -> IcpswapExecutionState {
+    serde_json::from_value(serde_json::to_value(state).expect("encode restart state")).expect("decode restart state")
+}
+
 #[async_trait]
 impl IcpswapExecutionStateStore for Store {
     async fn load(&self, _: &str) -> Result<Option<IcpswapExecutionState>, String> {
@@ -179,6 +185,130 @@ async fn funding_intent_and_balance_baselines_are_durable_before_submission() {
     let persisted = store.state();
     assert_eq!(persisted.step, IcpswapStep::Transfer);
     assert_eq!(persisted.funding.transfer.block_index, Some(Nat::from(77u64)));
+}
+
+#[tokio::test]
+async fn restart_resumes_the_persisted_funding_intent_without_repreparing_it() {
+    let mut initial = state();
+    initial.step = IcpswapStep::FundingPending;
+    initial.funding.transfer = IcpswapLedgerTransferState {
+        args: Some(TransferArg {
+            from_subaccount: initial.funding.source.subaccount,
+            to: initial.funding.destination,
+            amount: Nat::from(100_020u64),
+            fee: Some(Nat::from(10u64)),
+            memo: None,
+            created_at_time: Some(1_000),
+        }),
+        source_balance_before: Some(Nat::from(1_000_000u64)),
+        destination_balance_before: Some(Nat::from(0u8)),
+        ..Default::default()
+    };
+    let persisted_args = initial.funding.transfer.args.clone().expect("funding intent");
+    let store = Store::new(restart(&initial));
+    let mut client = MockIcpBackend::new();
+    client.expect_icrc1_balance().times(0);
+    client
+        .expect_icrc1_transfer_with_args()
+        .times(1)
+        .withf(move |_, args| args == &persisted_args)
+        .return_once(|_, _| Ok(Nat::from(77u64)));
+
+    let mut current = store.state();
+    funding_step(&client, &store, "run", &mut current, 9_999)
+        .await
+        .expect("resume funding intent");
+
+    assert_eq!(store.state().step, IcpswapStep::Transfer);
+    assert_eq!(store.state().funding.transfer.block_index, Some(Nat::from(77u64)));
+}
+
+#[tokio::test]
+async fn restart_resumes_the_persisted_surplus_recovery_without_repreparing_it() {
+    let mut initial = state();
+    initial.step = IcpswapStep::FundingSurplusPending;
+    initial.funding.surplus_transfer = IcpswapLedgerTransferState {
+        args: Some(TransferArg {
+            from_subaccount: initial.funding.destination.subaccount,
+            to: initial.funding.surplus_destination,
+            amount: Nat::from(90u64),
+            fee: Some(Nat::from(10u64)),
+            memo: None,
+            created_at_time: Some(1_000),
+        }),
+        source_balance_before: Some(Nat::from(100_120u64)),
+        destination_balance_before: Some(Nat::from(50u64)),
+        ..Default::default()
+    };
+    let persisted_args = initial
+        .funding
+        .surplus_transfer
+        .args
+        .clone()
+        .expect("surplus recovery intent");
+    let store = Store::new(restart(&initial));
+    let mut client = MockIcpBackend::new();
+    client.expect_icrc1_balance().times(0);
+    client
+        .expect_icrc1_transfer_with_args()
+        .times(1)
+        .withf(move |_, args| args == &persisted_args)
+        .return_once(|_, _| Ok(Nat::from(91u64)));
+
+    let mut current = store.state();
+    funding_step(&client, &store, "run", &mut current, 9_999)
+        .await
+        .expect("resume surplus recovery intent");
+
+    assert_eq!(store.state().step, IcpswapStep::Funding);
+    assert_eq!(
+        store.state().funding.surplus_transfer.block_index,
+        Some(Nat::from(91u64))
+    );
+}
+
+#[tokio::test]
+async fn restart_resumes_the_persisted_output_recovery_without_repreparing_it() {
+    let mut initial = state();
+    initial.step = IcpswapStep::ForwardPending;
+    initial.settlement.kind = Some(IcpswapSettlementKind::OutputRecovery);
+    initial.settlement.destination = initial.funding.surplus_destination;
+    initial.settlement.recovery_credit = Some(Nat::from(50u64));
+    initial.settlement.transfer = IcpswapLedgerTransferState {
+        args: Some(TransferArg {
+            from_subaccount: initial.owner.subaccount,
+            to: initial.settlement.destination,
+            amount: Nat::from(45u64),
+            fee: Some(Nat::from(5u64)),
+            memo: None,
+            created_at_time: Some(2_000),
+        }),
+        source_balance_before: Some(Nat::from(950u64)),
+        destination_balance_before: Some(Nat::from(5u64)),
+        ..Default::default()
+    };
+    let persisted_args = initial
+        .settlement
+        .transfer
+        .args
+        .clone()
+        .expect("output recovery intent");
+    let store = Store::new(restart(&initial));
+    let mut client = MockIcpBackend::new();
+    client.expect_icrc1_balance().times(0);
+    client
+        .expect_icrc1_transfer_with_args()
+        .times(1)
+        .withf(move |ledger, args| *ledger == principal(2) && args == &persisted_args)
+        .return_once(|_, _| Ok(Nat::from(99u64)));
+
+    let mut current = store.state();
+    forward_step(&client, &store, "run", &mut current, 9_999)
+        .await
+        .expect("resume output recovery intent");
+
+    assert_eq!(store.state().step, IcpswapStep::Refunded);
+    assert_eq!(store.state().settlement.transfer.block_index, Some(Nat::from(99u64)));
 }
 
 #[tokio::test]

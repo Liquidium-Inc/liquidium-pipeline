@@ -697,7 +697,10 @@ async fn multi_venue_submits_deposit_after_checkpoint_in_the_same_cycle() {
 #[tokio::test]
 async fn multi_venue_completed_leg_returns_its_own_execution_result() {
     let route = native_plan();
+    let expected_pool_input = route.amount_in.value.clone();
+    let expected_output_fees = route.output_ledger_fee.value.clone() * Nat::from(2u8);
     let request = native_request(&route);
+    let expected_all_in_pay = request.pay_amount.value.clone();
     let mut state = pool_state("leg-execution-42", route);
     state.step = IcpswapStep::Completed;
     state.trade.gross_output_amount = Some(Nat::from(120_000u64));
@@ -711,10 +714,12 @@ async fn multi_venue_completed_leg_returns_its_own_execution_result() {
         .expect("completed leg");
 
     assert_eq!(progress.status, VenueLegStatus::Completed);
-    assert_eq!(
-        progress.result.expect("execution result").receive_amount,
-        Nat::from(119_990u64)
-    );
+    let result = progress.result.expect("execution result");
+    assert_eq!(result.pay_amount, expected_all_in_pay);
+    assert_eq!(result.receive_amount, Nat::from(119_990u64));
+    assert_eq!(result.legs[0].pay_amount, expected_pool_input);
+    assert_eq!(result.legs[0].receive_amount, Nat::from(119_990u64));
+    assert_eq!(result.legs[0].gas_fee, expected_output_fees);
 }
 
 #[tokio::test]

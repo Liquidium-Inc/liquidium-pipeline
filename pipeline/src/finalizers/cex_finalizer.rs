@@ -270,7 +270,9 @@ impl Finalizer for dyn CexFinalizerLogic {
                     ResultStatus::WaitingCollateral | ResultStatus::WaitingProfit => {
                         return Ok(FinalizerResult::noop());
                     }
-                    ResultStatus::OperatorRequired => return Ok(FinalizerResult::noop()),
+                    ResultStatus::OperatorRequired | ResultStatus::Unresumable => {
+                        return Ok(FinalizerResult::noop());
+                    }
                     ResultStatus::FailedPermanent => {
                         return Err(format!("invalid WAL state {:?} for liq_id {}", row.status, row.id));
                     }

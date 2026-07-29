@@ -6,11 +6,15 @@ use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, Wrap};
+use serde::Deserialize;
 use serde_json::Value;
 
 use crate::finalizers::liquidation_outcome::LiquidationOutcome;
-use crate::persistance::{LiqMetaWrapper, ResultStatus, WalProfitSnapshot};
+use crate::persistance::{
+    FinalizerMetaPayload, FinalizerMetaV2, LiqMetaWrapper, ResultStatus, VenueExecutionState, WalProfitSnapshot,
+};
 use crate::stages::executor::{ExecutionReceipt, ExecutionStatus};
+use crate::swappers::icpswap::{VENUE_ID as ICPSWAP_VENUE_ID, identity::IcpswapExecutionIdentity};
 use crate::wal::liq_id_from_receipt;
 
 use super::super::app::{App, ExecutionRowData, UiFocus};
@@ -29,9 +33,10 @@ pub(super) fn draw_executions(f: &mut Frame<'_>, area: Rect, app: &App) {
 
     if let Some(wal) = &app.wal {
         lines.push(Line::from(format!(
-            "WAL: inflight={} wait={} ok={} fail={} total={}",
+            "WAL: inflight={} wait={} unresumable={} ok={} fail={} total={}",
             wal.counts.inflight,
             wal.counts.waiting_collateral + wal.counts.waiting_profit,
+            wal.counts.unresumable,
             wal.counts.succeeded,
             wal.counts.failed_retryable + wal.counts.failed_permanent,
             wal.counts.total
@@ -187,6 +192,7 @@ fn status_label(status: ResultStatus) -> &'static str {
         ResultStatus::WaitingCollateral => "wait-col",
         ResultStatus::WaitingProfit => "wait-prof",
         ResultStatus::OperatorRequired => "operator",
+        ResultStatus::Unresumable => "unresumable",
     }
 }
 
@@ -198,6 +204,7 @@ fn status_style(status: ResultStatus) -> Style {
         ResultStatus::InFlight => Style::default().fg(Color::Cyan),
         ResultStatus::WaitingCollateral | ResultStatus::WaitingProfit => Style::default().fg(Color::Yellow),
         ResultStatus::OperatorRequired => Style::default().fg(Color::Magenta),
+        ResultStatus::Unresumable => Style::default().fg(Color::Red),
         ResultStatus::Enqueued => Style::default().fg(Color::DarkGray),
     }
 }
@@ -292,6 +299,7 @@ fn append_receipt_from_meta(lines: &mut Vec<Line<'static>>, raw: &str) {
         Ok(wrapper) => {
             append_receipt_lines(lines, &wrapper.receipt);
             append_finalizer_decision(lines, wrapper.finalizer_decision.as_ref());
+            append_multi_venue_summary(lines, wrapper.meta_v2.as_ref());
             append_meta_summary(lines, &wrapper.meta);
         }
         Err(wrapper_err) => match serde_json::from_str::<ExecutionReceipt>(raw) {
@@ -339,6 +347,47 @@ fn append_receipt_from_meta(lines: &mut Vec<Line<'static>>, raw: &str) {
             }
         },
     }
+}
+
+/// Displays the identity that actually signs each persisted ICPSwap leg. This
+/// is the account operators need when checking isolated balances or recovering
+/// a specific liquidation.
+fn append_multi_venue_summary(lines: &mut Vec<Line<'static>>, meta: Option<&FinalizerMetaV2>) {
+    let Some(meta) = meta else {
+        return;
+    };
+    let FinalizerMetaPayload::MultiVenueSwap(state) = &meta.payload;
+
+    push_section_title(lines, "Multi-Venue Execution");
+    for leg in &state.legs {
+        lines.push(Line::from(format!(
+            "Leg {}: venue={} status={:?}",
+            leg.leg_id, leg.venue_id, leg.status
+        )));
+        if leg.venue_id == ICPSWAP_VENUE_ID {
+            match icpswap_account_principal(&leg.execution) {
+                Ok(principal) => lines.push(Line::from(format!("ICPSwap account principal: {principal}"))),
+                Err(error) => lines.push(Line::from(Span::styled(
+                    format!("ICPSwap account principal: <unavailable: {}>", truncate(&error, 140)),
+                    Style::default().fg(Color::Yellow),
+                ))),
+            }
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct IcpswapIdentityView {
+    identity: IcpswapExecutionIdentity,
+}
+
+/// Decodes only the stable identity portion of the venue state. Ignoring the
+/// remaining fields keeps the TUI useful while execution-state details evolve.
+fn icpswap_account_principal(execution: &VenueExecutionState) -> Result<String, String> {
+    execution
+        .decode::<IcpswapIdentityView>(ICPSWAP_VENUE_ID)?
+        .map(|state| state.identity.principal.to_text())
+        .ok_or_else(|| "execution state is tagged for a different venue".to_string())
 }
 
 fn append_receipt_lines(lines: &mut Vec<Line<'static>>, receipt: &ExecutionReceipt) {
@@ -495,10 +544,7 @@ fn append_meta_summary(lines: &mut Vec<Line<'static>>, meta: &[u8]) {
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
             {
-                lines.push(Line::from(format!(
-                    "Bridge deposit txid: {}",
-                    deposit_bridge_id
-                )));
+                lines.push(Line::from(format!("Bridge deposit txid: {}", deposit_bridge_id)));
                 emitted = true;
             }
             if let Some(withdraw_bridge_id) = value
@@ -507,10 +553,7 @@ fn append_meta_summary(lines: &mut Vec<Line<'static>>, meta: &[u8]) {
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
             {
-                lines.push(Line::from(format!(
-                    "Bridge withdraw txid: {}",
-                    withdraw_bridge_id
-                )));
+                lines.push(Line::from(format!("Bridge withdraw txid: {}", withdraw_bridge_id)));
                 emitted = true;
             }
             if !emitted {
@@ -656,20 +699,46 @@ fn format_profit(amount: i128, decimals: u8, symbol: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{WalProfitSnapshot, append_meta_summary, profit_display_from_snapshot, truncate};
-    use ratatui::text::Line;
+    use super::{
+        WalProfitSnapshot, append_meta_summary, icpswap_account_principal, profit_display_from_snapshot, status_label,
+        truncate,
+    };
+    use crate::{
+        persistance::{ResultStatus, VenueExecutionState},
+        swappers::icpswap::identity::{IcpswapDerivationScheme, IcpswapExecutionIdentity},
+    };
+    use candid::Principal;
     use ratatui::style::Color;
+    use ratatui::text::Line;
 
     fn lines_as_text(lines: &[Line<'_>]) -> Vec<String> {
         lines
             .iter()
-            .map(|line| {
-                line.spans
-                    .iter()
-                    .map(|span| span.content.as_ref())
-                    .collect::<String>()
-            })
+            .map(|line| line.spans.iter().map(|span| span.content.as_ref()).collect::<String>())
             .collect()
+    }
+
+    #[test]
+    fn unresumable_status_is_visible_in_executions() {
+        assert_eq!(status_label(ResultStatus::Unresumable), "unresumable");
+    }
+
+    #[test]
+    fn decoded_icpswap_view_shows_the_execution_account_principal() {
+        let principal = Principal::from_slice(&[1, 2, 3, 4]);
+        let identity = IcpswapExecutionIdentity {
+            scheme: IcpswapDerivationScheme::Bip32Secp256k1V1,
+            liquidation_id: "1536".to_string(),
+            derivation_path: "m/44'/223'/1001'/1'/1536'".to_string(),
+            principal,
+        };
+        let execution = VenueExecutionState::new("icpswap", &serde_json::json!({ "identity": identity }))
+            .expect("encode execution state");
+
+        assert_eq!(
+            icpswap_account_principal(&execution).expect("decode principal"),
+            principal.to_text()
+        );
     }
 
     #[test]
@@ -772,9 +841,10 @@ mod tests {
         append_meta_summary(&mut lines, meta);
 
         let text = lines_as_text(&lines);
-        assert!(text
-            .iter()
-            .any(|line| line == "Bridge withdraw txid: ic-withdraw:12:34"));
+        assert!(
+            text.iter()
+                .any(|line| line == "Bridge withdraw txid: ic-withdraw:12:34")
+        );
         assert!(!text.iter().any(|line| line.starts_with("Bridge deposit txid: ")));
         assert!(!text.iter().any(|line| line.starts_with("State preview: ")));
     }

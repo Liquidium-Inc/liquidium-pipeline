@@ -116,6 +116,7 @@ impl SqliteWalStore {
                 5 => ResultStatus::WaitingCollateral,
                 6 => ResultStatus::WaitingProfit,
                 7 => ResultStatus::OperatorRequired,
+                8 => ResultStatus::Unresumable,
                 _ => ResultStatus::FailedPermanent,
             },
             attempt: r.attempt,
@@ -145,6 +146,7 @@ impl SqliteWalStore {
                 5 => ResultStatus::WaitingCollateral,
                 6 => ResultStatus::WaitingProfit,
                 7 => ResultStatus::OperatorRequired,
+                8 => ResultStatus::Unresumable,
                 _ => ResultStatus::FailedPermanent,
             };
             *out.entry(status).or_insert(0) += count;
@@ -162,8 +164,8 @@ impl SqliteWalStore {
     }
 
     /// Returns rows whose committed venue work may still require execution or
-    /// reconciliation. Startup uses this to prevent disabling an adapter that
-    /// an immutable multi-venue plan still references.
+    /// reconciliation. Startup inspects these rows and parks incompatible ones
+    /// as `Unresumable` before normal polling begins.
     pub fn list_unfinished_execution_rows(&self) -> Result<Vec<LiqResultRecord>> {
         let mut conn = self.get_conn()?;
         let statuses = [
@@ -577,6 +579,7 @@ mod tests {
                 ("in-flight", ResultStatus::InFlight),
                 ("retryable", ResultStatus::FailedRetryable),
                 ("operator", ResultStatus::OperatorRequired),
+                ("unresumable", ResultStatus::Unresumable),
                 ("waiting", ResultStatus::WaitingCollateral),
                 ("succeeded", ResultStatus::Succeeded),
                 ("permanent", ResultStatus::FailedPermanent),
@@ -592,5 +595,33 @@ mod tests {
             .map(|row| row.id)
             .collect::<Vec<_>>();
         assert_eq!(ids, vec!["enqueued", "in-flight", "retryable", "operator"]);
+    }
+
+    #[test]
+    fn unresumable_rows_round_trip_but_are_never_pending() {
+        let temp = tempfile::NamedTempFile::new().expect("tmp db");
+        let path = temp.path().display().to_string();
+        let store = SqliteWalStore::new_with_busy_timeout(&path, 5_000).expect("store");
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        rt.block_on(async {
+            store
+                .upsert_result(LiqResultRecord {
+                    id: "unresumable".to_string(),
+                    status: ResultStatus::Unresumable,
+                    attempt: 0,
+                    error_count: 1,
+                    last_error: Some("disabled venue".to_string()),
+                    created_at: now_secs(),
+                    updated_at: now_secs(),
+                    meta_json: "{}".to_string(),
+                })
+                .await
+                .expect("seed row");
+
+            let stored = store.get_result("unresumable").await.expect("read").expect("row");
+            assert_eq!(stored.status, ResultStatus::Unresumable);
+            assert_eq!(stored.last_error.as_deref(), Some("disabled venue"));
+            assert!(store.get_pending(10).await.expect("pending").is_empty());
+        });
     }
 }
