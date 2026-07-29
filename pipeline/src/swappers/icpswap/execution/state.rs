@@ -110,10 +110,17 @@ fn validate_state_fields(state: &IcpswapState) -> Result<(), String> {
     {
         return Err("ICPSwap funding surplus destination is not the trader recovery account".to_string());
     }
-    if state.settlement.kind == Some(super::transfer_state::IcpswapSettlementKind::OutputRecovery)
-        && state.settlement.destination != state.funding.surplus_destination
-    {
-        return Err("ICPSwap output recovery is not addressed to the trader recovery account".to_string());
+    if state.settlement.kind == Some(super::transfer_state::IcpswapSettlementKind::OutputRecovery) {
+        let original_destination = state
+            .settlement
+            .interrupted_transfer
+            .as_ref()
+            .and_then(|transfer| transfer.args.as_ref())
+            .map(|args| args.to)
+            .ok_or_else(|| "ICPSwap output recovery is missing its original forwarding intent".to_string())?;
+        if state.settlement.destination != original_destination {
+            return Err("ICPSwap output recovery changed the committed receiver".to_string());
+        }
     }
     Ok(())
 }

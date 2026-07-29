@@ -371,14 +371,16 @@ Derived child principal
         |                                    |
         +<-- recovery input ------------ child default account
                                              |
-                                             +-- exact output credit --> request.receive_address
+                                             +-- output balance --> request.receive_address
 ```
 
 The child signs its own pool transfer, deposit, swap, withdrawal, and final
 forwarding transfer. Consequently, both the ICPSwap deposit account and pool
 balances are isolated per liquidation. Recovery forwards only the recorded
 input credit to the funding trader; successful settlement forwards only the
-recorded output credit to the request receiver.
+recorded output credit to the request receiver. If that final transfer becomes
+ambiguous after aging out, the one-use child drains its current output balance,
+minus the ledger fee, to the same committed receiver.
 
 Before the pool transfer, funding normalizes the child account to the immutable
 committed budget. A shortage is topped up by exactly the missing amount. A
@@ -389,19 +391,20 @@ funding reconciliation without requiring the shared trader account to remain
 unchanged.
 
 An aged final forwarding transfer also uses the isolated child as its source of
-truth. If the observed debit is neither zero nor the exact intended debit, the
-WAL retains the interrupted intent and observed amount, then redirects only the
-remaining execution credit to the trader recovery subaccount. A remainder too
-small to pay its forwarding fee is recorded as settlement dust. This discrepancy
-finishes as a recovered leg rather than parking later liquidations for an
-operator.
+truth. If its net debit is unexpected, the WAL retains the interrupted intent
+and observed amount, reads the child's actual current balance, and durably
+drains that balance to the original `request.receive_address`. It never infers
+a partial ICRC-1 transfer and never redirects swap output to the trader recovery
+account. A remaining balance too small to pay its forwarding fee parks only
+that isolated leg for operator fee funding.
 
 Funding and forwarding persist their exact `TransferArg`, timestamp, source
 balance baseline, and destination balance baseline before submission. A restart
 can therefore reconcile a lost response without inventing a second transfer.
 Before daemon startup, every unfinished ICPSwap leg is decoded and its persisted
-principal is re-derived from the configured mnemonic. Startup fails with the WAL
-row and leg IDs if the identity cannot be reproduced.
+principal is re-derived from the configured mnemonic. If the identity cannot
+be reproduced, that WAL row is marked `Unresumable` with the exact reason and
+startup continues for unrelated liquidations.
 
 ## Result Aggregation
 

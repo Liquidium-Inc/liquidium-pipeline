@@ -87,7 +87,15 @@ pub trait IcpswapFinalizerLogic: Send + Sync {
                 super::types::IcpswapStep::Funding
                 | super::types::IcpswapStep::FundingPending
                 | super::types::IcpswapStep::FundingSurplusPending => {
-                    funding_step(session.funder.as_ref(), store, execution_id, &mut state, now_nanos).await?
+                    funding_step(
+                        session.funder.as_ref(),
+                        session.child_ledger.as_ref(),
+                        store,
+                        execution_id,
+                        &mut state,
+                        now_nanos,
+                    )
+                    .await?
                 }
                 super::types::IcpswapStep::Transfer | super::types::IcpswapStep::TransferPending => {
                     transfer_step(session.child.as_ref(), store, execution_id, &mut state, now_nanos).await?

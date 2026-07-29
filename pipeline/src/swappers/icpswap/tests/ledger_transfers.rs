@@ -151,17 +151,17 @@ impl IcpswapExecutionStateStore for Store {
 async fn funding_intent_and_balance_baselines_are_durable_before_submission() {
     let store = Arc::new(Store::new(state()));
     let observed = store.clone();
-    let mut client = MockIcpBackend::new();
-    let mut balances = Sequence::new();
-    // Funding first observes the isolated child, then the shared source.
-    for value in [7u64, 1_000_000u64] {
-        client
-            .expect_icrc1_balance()
-            .times(1)
-            .in_sequence(&mut balances)
-            .return_once(move |_, _| Ok(Nat::from(value)));
-    }
-    client
+    let mut funder = MockIcpBackend::new();
+    let mut child = MockIcpBackend::new();
+    child
+        .expect_icrc1_balance()
+        .times(1)
+        .return_once(|_, _| Ok(Nat::from(7u64)));
+    funder
+        .expect_icrc1_balance()
+        .times(1)
+        .return_once(|_, _| Ok(Nat::from(1_000_000u64)));
+    funder
         .expect_icrc1_transfer_with_args()
         .times(1)
         .return_once(move |ledger, args| {
@@ -178,7 +178,7 @@ async fn funding_intent_and_balance_baselines_are_durable_before_submission() {
         });
 
     let mut current = store.state();
-    funding_step(&client, store.as_ref(), "run", &mut current, 1_000)
+    funding_step(&funder, &child, store.as_ref(), "run", &mut current, 1_000)
         .await
         .expect("funding");
 
@@ -206,16 +206,17 @@ async fn restart_resumes_the_persisted_funding_intent_without_repreparing_it() {
     };
     let persisted_args = initial.funding.transfer.args.clone().expect("funding intent");
     let store = Store::new(restart(&initial));
-    let mut client = MockIcpBackend::new();
-    client.expect_icrc1_balance().times(0);
-    client
+    let mut funder = MockIcpBackend::new();
+    let child = MockIcpBackend::new();
+    funder.expect_icrc1_balance().times(0);
+    funder
         .expect_icrc1_transfer_with_args()
         .times(1)
         .withf(move |_, args| args == &persisted_args)
         .return_once(|_, _| Ok(Nat::from(77u64)));
 
     let mut current = store.state();
-    funding_step(&client, &store, "run", &mut current, 9_999)
+    funding_step(&funder, &child, &store, "run", &mut current, 9_999)
         .await
         .expect("resume funding intent");
 
@@ -247,16 +248,17 @@ async fn restart_resumes_the_persisted_surplus_recovery_without_repreparing_it()
         .clone()
         .expect("surplus recovery intent");
     let store = Store::new(restart(&initial));
-    let mut client = MockIcpBackend::new();
-    client.expect_icrc1_balance().times(0);
-    client
+    let funder = MockIcpBackend::new();
+    let mut child = MockIcpBackend::new();
+    child.expect_icrc1_balance().times(0);
+    child
         .expect_icrc1_transfer_with_args()
         .times(1)
         .withf(move |_, args| args == &persisted_args)
         .return_once(|_, _| Ok(Nat::from(91u64)));
 
     let mut current = store.state();
-    funding_step(&client, &store, "run", &mut current, 9_999)
+    funding_step(&funder, &child, &store, "run", &mut current, 9_999)
         .await
         .expect("resume surplus recovery intent");
 
@@ -272,7 +274,17 @@ async fn restart_resumes_the_persisted_output_recovery_without_repreparing_it() 
     let mut initial = state();
     initial.step = IcpswapStep::ForwardPending;
     initial.settlement.kind = Some(IcpswapSettlementKind::OutputRecovery);
-    initial.settlement.destination = initial.funding.surplus_destination;
+    initial.settlement.interrupted_transfer = Some(IcpswapLedgerTransferState {
+        args: Some(TransferArg {
+            from_subaccount: initial.owner.subaccount,
+            to: initial.settlement.destination,
+            amount: Nat::from(95u64),
+            fee: Some(Nat::from(5u64)),
+            memo: None,
+            created_at_time: Some(1_000),
+        }),
+        ..Default::default()
+    });
     initial.settlement.recovery_credit = Some(Nat::from(50u64));
     initial.settlement.transfer = IcpswapLedgerTransferState {
         args: Some(TransferArg {
@@ -307,7 +319,7 @@ async fn restart_resumes_the_persisted_output_recovery_without_repreparing_it() 
         .await
         .expect("resume output recovery intent");
 
-    assert_eq!(store.state().step, IcpswapStep::Refunded);
+    assert_eq!(store.state().step, IcpswapStep::Completed);
     assert_eq!(store.state().settlement.transfer.block_index, Some(Nat::from(99u64)));
 }
 
@@ -373,7 +385,7 @@ async fn too_old_funding_transfer_is_retried_when_the_isolated_child_is_unchange
         .return_once(|_, _| Err(IcrcTransferError::TooOld));
 
     let mut current = store.state();
-    funding_step(&client, store.as_ref(), "run", &mut current, 1_000)
+    funding_step(&client, &client, store.as_ref(), "run", &mut current, 1_000)
         .await
         .expect("unchanged balances permit a fresh attempt");
 
@@ -402,7 +414,7 @@ async fn too_old_funding_transfer_with_expected_deltas_is_confirmed() {
         .return_once(|_, _| Err(IcrcTransferError::TooOld));
 
     let mut current = store.state();
-    funding_step(&client, store.as_ref(), "run", &mut current, 1_000)
+    funding_step(&client, &client, store.as_ref(), "run", &mut current, 1_000)
         .await
         .expect("balance deltas prove the aged transfer succeeded");
 
@@ -429,7 +441,7 @@ async fn future_dated_funding_transfer_is_reset_with_a_retry_delay() {
         .return_once(|_, _| Err(IcrcTransferError::CreatedInFuture { ledger_time: 900 }));
 
     let mut current = store.state();
-    funding_step(&client, store.as_ref(), "run", &mut current, 1_000)
+    funding_step(&client, &client, store.as_ref(), "run", &mut current, 1_000)
         .await
         .expect_err("future timestamp must pause this attempt");
 
@@ -530,7 +542,7 @@ async fn unexpected_aged_funding_delta_reenters_balance_normalization() {
         .return_once(|_, _| Err(IcrcTransferError::TooOld));
 
     let mut current = store.state();
-    funding_step(&client, store.as_ref(), "run", &mut current, 1_000)
+    funding_step(&client, &client, store.as_ref(), "run", &mut current, 1_000)
         .await
         .expect("isolated child balance can be normalized on the next advance");
 
@@ -549,18 +561,21 @@ async fn funding_sweeps_surplus_to_recovery_before_pool_transfer() {
     let store = Arc::new(Store::new(state()));
     let expected_recovery = store.state().funding.surplus_destination;
     let observed = store.clone();
-    let mut client = MockIcpBackend::new();
+    // Keep signers distinct: a surplus belongs to the child and must never be
+    // submitted by the shared trader backend.
+    let funder = MockIcpBackend::new();
+    let mut child = MockIcpBackend::new();
     let mut balances = Sequence::new();
     // The exact child target is 100,020. Its extra 100 units can forward 90
     // after paying the 10-unit recovery transfer fee.
     for value in [100_120u64, 50u64, 100_020u64] {
-        client
+        child
             .expect_icrc1_balance()
             .times(1)
             .in_sequence(&mut balances)
             .return_once(move |_, _| Ok(Nat::from(value)));
     }
-    client
+    child
         .expect_icrc1_transfer_with_args()
         .times(1)
         .return_once(move |ledger, args| {
@@ -575,7 +590,7 @@ async fn funding_sweeps_surplus_to_recovery_before_pool_transfer() {
         });
 
     let mut current = store.state();
-    funding_step(&client, store.as_ref(), "run", &mut current, 1_000)
+    funding_step(&funder, &child, store.as_ref(), "run", &mut current, 1_000)
         .await
         .expect("surplus recovery");
 
@@ -587,7 +602,7 @@ async fn funding_sweeps_surplus_to_recovery_before_pool_transfer() {
     );
 
     let mut current = persisted;
-    funding_step(&client, store.as_ref(), "run", &mut current, 1_001)
+    funding_step(&funder, &child, store.as_ref(), "run", &mut current, 1_001)
         .await
         .expect("normalized balance advances to the pool transfer");
     assert_eq!(store.state().step, IcpswapStep::Transfer);
@@ -604,7 +619,7 @@ async fn funding_records_surplus_too_small_to_sweep() {
     client.expect_icrc1_transfer_with_args().times(0);
 
     let mut current = store.state();
-    funding_step(&client, store.as_ref(), "run", &mut current, 1_000)
+    funding_step(&client, &client, store.as_ref(), "run", &mut current, 1_000)
         .await
         .expect("unsweepable dust does not block the trade");
 
@@ -614,7 +629,7 @@ async fn funding_records_surplus_too_small_to_sweep() {
 }
 
 #[tokio::test]
-async fn unexpected_aged_settlement_delta_recovers_the_remaining_output() {
+async fn unexpected_aged_output_drains_the_child_balance_to_the_original_receiver() {
     let mut initial = state();
     initial.step = IcpswapStep::Forward;
     initial.withdraw.wallet_credited_amount = Some(Nat::from(100u64));
@@ -622,9 +637,10 @@ async fn unexpected_aged_settlement_delta_recovers_the_remaining_output() {
     let store = Arc::new(Store::new(initial));
     let mut client = MockIcpBackend::new();
     let mut balances = Sequence::new();
-    // The forward should debit 100 total, but the isolated child only moved by
-    // 50. Settlement cannot safely infer where the execution output went.
-    for value in [1_000u64, 20u64, 950u64, 500u64, 950u64, 5u64] {
+    // The original 100-unit output transfer becomes ambiguous, then the child
+    // contains 120 units. Recovery deliberately drains that actual one-use
+    // account balance rather than inferring a partial atomic transfer.
+    for value in [100u64, 20u64, 120u64, 20u64, 120u64, 20u64] {
         client
             .expect_icrc1_balance()
             .times(1)
@@ -637,15 +653,15 @@ async fn unexpected_aged_settlement_delta_recovers_the_remaining_output() {
         .times(1)
         .in_sequence(&mut transfers)
         .return_once(|_, _| Err(IcrcTransferError::TooOld));
-    let recovery_destination = store.state().funding.surplus_destination;
+    let original_receiver = store.state().settlement.destination;
     client
         .expect_icrc1_transfer_with_args()
         .times(1)
         .in_sequence(&mut transfers)
         .return_once(move |ledger, args| {
             assert_eq!(ledger, principal(2));
-            assert_eq!(args.to, recovery_destination);
-            assert_eq!(args.amount, Nat::from(45u64));
+            assert_eq!(args.to, original_receiver);
+            assert_eq!(args.amount, Nat::from(115u64));
             assert_eq!(args.fee, Some(Nat::from(5u64)));
             Ok(Nat::from(99u64))
         });
@@ -653,14 +669,14 @@ async fn unexpected_aged_settlement_delta_recovers_the_remaining_output() {
     let mut current = store.state();
     forward_step(&client, store.as_ref(), "run", &mut current, 2_000)
         .await
-        .expect("unexpected output movement enters recovery");
+        .expect("unexpected output movement enters receiver drain");
 
     let recovered = store.state();
     assert_eq!(recovered.step, IcpswapStep::Forward);
     assert_eq!(recovered.settlement.kind, Some(IcpswapSettlementKind::OutputRecovery));
-    assert_eq!(recovered.settlement.destination, recovery_destination);
-    assert_eq!(recovered.settlement.interrupted_observed_debit, Some(Nat::from(50u64)));
-    assert_eq!(recovered.settlement.recovery_credit, Some(Nat::from(50u64)));
+    assert_eq!(recovered.settlement.destination, original_receiver);
+    assert_eq!(recovered.settlement.interrupted_observed_debit, Some(Nat::from(0u8)));
+    assert_eq!(recovered.settlement.recovery_credit, Some(Nat::from(120u64)));
     assert_eq!(
         recovered
             .settlement
@@ -674,12 +690,12 @@ async fn unexpected_aged_settlement_delta_recovers_the_remaining_output() {
     let mut current = recovered;
     forward_step(&client, store.as_ref(), "run", &mut current, 2_001)
         .await
-        .expect("remaining output recovery transfer");
-    assert_eq!(store.state().step, IcpswapStep::Refunded);
+        .expect("remaining output drain transfer");
+    assert_eq!(store.state().step, IcpswapStep::Completed);
 }
 
 #[tokio::test]
-async fn unexpected_aged_settlement_records_an_unsweepable_remainder_as_dust() {
+async fn unexpected_aged_output_parks_when_the_child_balance_cannot_pay_its_fee() {
     let mut initial = state();
     initial.step = IcpswapStep::Forward;
     initial.withdraw.wallet_credited_amount = Some(Nat::from(100u64));
@@ -687,9 +703,9 @@ async fn unexpected_aged_settlement_records_an_unsweepable_remainder_as_dust() {
     let store = Arc::new(Store::new(initial));
     let mut client = MockIcpBackend::new();
     let mut balances = Sequence::new();
-    // The expected total debit is 100. Observing 96 leaves only four units,
-    // which cannot pay the output ledger's five-unit forwarding fee.
-    for value in [1_000u64, 20u64, 904u64, 500u64] {
+    // Only four units remain in the child, which cannot pay the output
+    // ledger's five-unit forwarding fee.
+    for value in [100u64, 20u64, 4u64, 20u64] {
         client
             .expect_icrc1_balance()
             .times(1)
@@ -704,11 +720,12 @@ async fn unexpected_aged_settlement_records_an_unsweepable_remainder_as_dust() {
     let mut current = store.state();
     forward_step(&client, store.as_ref(), "run", &mut current, 2_000)
         .await
-        .expect("unsweepable settlement remainder is recorded without parking");
+        .expect_err("unsweepable output needs operator fee funding");
 
     let persisted = store.state();
-    assert_eq!(persisted.step, IcpswapStep::Refunded);
+    assert_eq!(persisted.step, IcpswapStep::OperatorRequired);
     assert_eq!(persisted.settlement.recovery_credit, Some(Nat::from(4u64)));
     assert_eq!(persisted.settlement.residual_dust, Some(Nat::from(4u64)));
-    assert_eq!(persisted.operator_pending_step, None);
+    assert_eq!(persisted.operator_pending_step, Some(IcpswapStep::Forward));
+    assert_eq!(persisted.settlement.destination, account(5));
 }

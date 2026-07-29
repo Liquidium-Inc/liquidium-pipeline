@@ -60,8 +60,8 @@ impl IcpswapFundingState {
 pub enum IcpswapSettlementKind {
     Output,
     Recovery,
-    /// Remaining output from an ambiguous forwarding attempt is returned to
-    /// the trader recovery account instead of parking the liquidation.
+    /// Output still held by the one-use child after an ambiguous forwarding
+    /// attempt is drained to the original committed receiver.
     OutputRecovery,
 }
 
@@ -82,7 +82,7 @@ pub struct IcpswapSettlementState {
     /// Debit observed while reconciling `interrupted_transfer`.
     #[serde(default)]
     pub interrupted_observed_debit: Option<Nat>,
-    /// Exact remaining execution credit eligible for recovery forwarding.
+    /// Current isolated balance eligible for a durable settlement drain.
     #[serde(default)]
     pub recovery_credit: Option<Nat>,
     /// Remaining credit too small to pay a recovery forwarding fee.

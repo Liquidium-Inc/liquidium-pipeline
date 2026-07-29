@@ -705,9 +705,15 @@ mod tests {
     };
     use crate::{
         persistance::{ResultStatus, VenueExecutionState},
-        swappers::icpswap::identity::{IcpswapDerivationScheme, IcpswapExecutionIdentity},
+        swappers::icpswap::{
+            identity::IcpswapExecutionIdentity,
+            transfer_state::{IcpswapFundingState, IcpswapLedgerTransferState, IcpswapSettlementState},
+            types::{IcpswapExecutionPlan, IcpswapExecutionState},
+        },
     };
-    use candid::Principal;
+    use candid::{Nat, Principal};
+    use icrc_ledger_types::icrc1::account::Account;
+    use liquidium_pipeline_core::tokens::{chain_token::ChainToken, chain_token_amount::ChainTokenAmount};
     use ratatui::style::Color;
     use ratatui::text::Line;
 
@@ -725,15 +731,68 @@ mod tests {
 
     #[test]
     fn decoded_icpswap_view_shows_the_execution_account_principal() {
-        let principal = Principal::from_slice(&[1, 2, 3, 4]);
-        let identity = IcpswapExecutionIdentity {
-            scheme: IcpswapDerivationScheme::Bip32Secp256k1V1,
-            liquidation_id: "1536".to_string(),
-            derivation_path: "m/44'/223'/1001'/1'/1536'".to_string(),
-            principal,
+        let input = ChainToken::Icp {
+            ledger: Principal::from_slice(&[1]),
+            symbol: "ICP".to_string(),
+            decimals: 8,
+            fee: Nat::from(10u64),
         };
-        let execution = VenueExecutionState::new("icpswap", &serde_json::json!({ "identity": identity }))
-            .expect("encode execution state");
+        let output = ChainToken::Icp {
+            ledger: Principal::from_slice(&[2]),
+            symbol: "ckUSDC".to_string(),
+            decimals: 6,
+            fee: Nat::from(5u64),
+        };
+        let plan = IcpswapExecutionPlan::new(
+            Principal::from_slice(&[9]),
+            Principal::from_slice(&[1]),
+            Principal::from_slice(&[2]),
+            Nat::from(3_000u64),
+            ChainTokenAmount::from_raw(input.clone(), Nat::from(100_000u64)),
+            ChainTokenAmount::from_raw(input, Nat::from(10u64)),
+            ChainTokenAmount::from_raw(output.clone(), Nat::from(120_000u64)),
+            ChainTokenAmount::from_raw(output, Nat::from(5u64)),
+            100,
+        )
+        .expect("ICPSwap plan");
+        let (identity, _) = IcpswapExecutionIdentity::derive(
+            "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about",
+            "1536",
+        )
+        .expect("derive execution identity");
+        let principal = identity.principal;
+        let child = Account {
+            owner: principal,
+            subaccount: None,
+        };
+        let state = IcpswapExecutionState::prepare(
+            "icpswap-tui-test",
+            plan.clone(),
+            identity,
+            IcpswapFundingState::new(
+                Account {
+                    owner: Principal::from_slice(&[4]),
+                    subaccount: None,
+                },
+                child,
+                plan.input_ledger_fee.clone(),
+            ),
+            IcpswapSettlementState {
+                kind: None,
+                destination: Account {
+                    owner: Principal::from_slice(&[5]),
+                    subaccount: None,
+                },
+                fee: plan.output_ledger_fee.clone(),
+                transfer: IcpswapLedgerTransferState::default(),
+                interrupted_transfer: None,
+                interrupted_observed_debit: None,
+                recovery_credit: None,
+                residual_dust: None,
+            },
+        )
+        .expect("prepare persisted execution state");
+        let execution = VenueExecutionState::new("icpswap", &state).expect("encode execution state");
 
         assert_eq!(
             icpswap_account_principal(&execution).expect("decode principal"),

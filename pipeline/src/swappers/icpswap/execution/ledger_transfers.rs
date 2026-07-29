@@ -38,20 +38,22 @@ enum FundingBalanceIntent {
     RetainDust { dust_amount: Nat },
 }
 
-/// Funds the isolated principal, persisting balances and exact deduplication
-/// arguments before the shared trader submits the transfer.
+/// Normalizes the isolated principal using the signer that owns each source:
+/// the shared trader funds shortages, while the child returns its own surplus.
+/// Every exact transfer intent remains durable before submission.
 pub(crate) async fn funding_step(
-    client: &dyn IcpBackend,
+    funder: &dyn IcpBackend,
+    child: &dyn IcpBackend,
     store: &dyn IcpswapExecutionStateStore,
     execution_id: &str,
     state: &mut IcpswapState,
     now_nanos: u64,
 ) -> Result<(), String> {
     match state.step {
-        IcpswapStep::Funding => normalize_funding_balance(client, store, execution_id, state, now_nanos).await,
+        IcpswapStep::Funding => normalize_funding_balance(funder, child, store, execution_id, state, now_nanos).await,
         IcpswapStep::FundingPending => {
             submit_transfer(
-                client,
+                funder,
                 store,
                 execution_id,
                 state,
@@ -62,7 +64,7 @@ pub(crate) async fn funding_step(
         }
         IcpswapStep::FundingSurplusPending => {
             submit_transfer(
-                client,
+                child,
                 store,
                 execution_id,
                 state,
@@ -109,7 +111,8 @@ pub(crate) async fn forward_step(
 /// to reach the committed pool budget. Transfer intents are persisted by their
 /// respective helpers before submission.
 async fn normalize_funding_balance(
-    client: &dyn IcpBackend,
+    funder: &dyn IcpBackend,
+    child_client: &dyn IcpBackend,
     store: &dyn IcpswapExecutionStateStore,
     execution_id: &str,
     state: &mut IcpswapState,
@@ -117,7 +120,7 @@ async fn normalize_funding_balance(
 ) -> Result<(), String> {
     let ledger = state.plan.token_in;
     let child = state.funding.destination;
-    let child_balance = client
+    let child_balance = child_client
         .icrc1_balance(ledger, &child)
         .await
         .map_err(|error| format!("failed reading isolated funding balance: {error}"))?;
@@ -130,7 +133,7 @@ async fn normalize_funding_balance(
         }
         FundingBalanceIntent::TopUp { transfer_amount } => {
             persist_and_submit_top_up(
-                client,
+                funder,
                 store,
                 execution_id,
                 state,
@@ -142,7 +145,7 @@ async fn normalize_funding_balance(
         }
         FundingBalanceIntent::RecoverSurplus { transfer_amount } => {
             persist_and_submit_surplus_recovery(
-                client,
+                child_client,
                 store,
                 execution_id,
                 state,
@@ -328,7 +331,7 @@ async fn prepare_forward(
             settlement
                 .recovery_credit
                 .clone()
-                .ok_or_else(|| "ICPSwap output recovery has no remaining credit".to_string())?,
+                .ok_or_else(|| "ICPSwap output recovery has no recorded child balance".to_string())?,
         ),
     };
     if execution_credit <= fee.value {
@@ -436,7 +439,7 @@ async fn reconcile_aged_transfer(
         client.icrc1_balance(ledger, &destination),
     );
     let expected_debit = args.amount.clone() + args.fee.clone().unwrap_or_else(|| Nat::from(0u8));
-    let (observation, shared_delta) = match kind {
+    let (observation, shared_delta, isolated_balance) = match kind {
         DurableTransferKind::Funding => {
             let destination_now = destination_now
                 .map_err(|error| format!("failed reading isolated funding destination balance: {error}"))?;
@@ -448,6 +451,7 @@ async fn reconcile_aged_transfer(
             (
                 classify_isolated_delta(destination_credit, args.amount.clone(), destination_unchanged),
                 source_debit,
+                None,
             )
         }
         DurableTransferKind::FundingSurplus | DurableTransferKind::Settlement(_) => {
@@ -461,6 +465,7 @@ async fn reconcile_aged_transfer(
             (
                 classify_isolated_delta(source_debit, expected_debit, source_unchanged),
                 destination_credit,
+                Some(source_now),
             )
         }
     };
@@ -491,29 +496,42 @@ async fn reconcile_aged_transfer(
             persist(store, execution_id, state).await
         }
         IsolatedTransferObservation::Unexpected { observed, expected } => {
-            recover_unsettled_credit(store, execution_id, state, kind, observed, expected, shared_delta).await
+            let isolated_balance = isolated_balance
+                .ok_or_else(|| "ICPSwap settlement reconciliation lost the isolated balance".to_string())?;
+            drain_unsettled_credit(
+                store,
+                execution_id,
+                state,
+                kind,
+                observed,
+                expected,
+                isolated_balance,
+                shared_delta,
+            )
+            .await
         }
     }
 }
 
-/// An isolated child can safely recover the unspent portion of an ambiguous
-/// settlement. The original intent and observed debit remain in the WAL while
-/// only the mathematically remaining execution credit is redirected.
-async fn recover_unsettled_credit(
+/// Drains the child account to the original settlement destination after an
+/// aged transfer produces an unexpected net delta. The child is one-use, so we
+/// use its actual remaining balance instead of inventing a partial ICRC-1
+/// transfer from balance arithmetic.
+async fn drain_unsettled_credit(
     store: &dyn IcpswapExecutionStateStore,
     execution_id: &str,
     state: &mut IcpswapState,
     kind: DurableTransferKind,
     observed: Nat,
     expected: Nat,
+    isolated_balance: Nat,
     shared_delta: Option<Nat>,
 ) -> Result<(), String> {
     let DurableTransferKind::Settlement(settlement_kind) = kind else {
         return Err("ICPSwap funding discrepancy reached settlement recovery".to_string());
     };
-    let remaining = saturating_sub(&expected, &observed);
     let message = format!(
-        "aged ICPSwap settlement observed isolated debit {observed}, expected {expected}; shared delta {shared_delta:?}; redirecting remaining credit {remaining} to recovery"
+        "aged ICPSwap settlement observed isolated debit {observed}, expected {expected}; shared delta {shared_delta:?}; draining current child balance {isolated_balance} to the committed receiver"
     );
 
     // Keep the first interrupted intent: it contains the original requested
@@ -522,9 +540,16 @@ async fn recover_unsettled_credit(
         state.settlement.interrupted_transfer = Some(state.settlement.transfer.clone());
         state.settlement.interrupted_observed_debit = Some(observed.clone());
     }
-    state.settlement.recovery_credit = Some(remaining.clone());
+    let original_destination = state
+        .settlement
+        .interrupted_transfer
+        .as_ref()
+        .and_then(|transfer| transfer.args.as_ref())
+        .map(|args| args.to)
+        .ok_or_else(|| "ambiguous ICPSwap settlement is missing its original destination".to_string())?;
+    state.settlement.recovery_credit = Some(isolated_balance.clone());
     state.settlement.transfer = IcpswapLedgerTransferState::default();
-    state.settlement.destination = state.funding.surplus_destination;
+    state.settlement.destination = original_destination;
     state.settlement.kind = Some(match settlement_kind {
         IcpswapSettlementKind::Output | IcpswapSettlementKind::OutputRecovery => IcpswapSettlementKind::OutputRecovery,
         IcpswapSettlementKind::Recovery => IcpswapSettlementKind::Recovery,
@@ -533,8 +558,20 @@ async fn recover_unsettled_credit(
     state.next_attempt_at_nanos = None;
     state.last_error = Some(message);
 
-    if remaining <= state.settlement.fee.value {
-        state.settlement.residual_dust = Some(remaining);
+    if isolated_balance <= state.settlement.fee.value {
+        state.settlement.residual_dust = Some(isolated_balance.clone());
+        if matches!(
+            settlement_kind,
+            IcpswapSettlementKind::Output | IcpswapSettlementKind::OutputRecovery
+        ) {
+            let message = format!(
+                "ICPSwap child output balance {isolated_balance} cannot cover forwarding fee {}; operator funding is required to drain it to the committed receiver",
+                state.settlement.fee.value
+            );
+            reconciliation::require_operator(state, IcpswapStep::Forward, message.clone());
+            persist(store, execution_id, state).await?;
+            return Err(message);
+        }
         state.step = IcpswapStep::Refunded;
     } else {
         state.settlement.residual_dust = None;
@@ -604,10 +641,10 @@ fn complete_transfer(state: &mut IcpswapState, kind: DurableTransferKind) {
     state.step = match kind {
         DurableTransferKind::Funding => IcpswapStep::Transfer,
         DurableTransferKind::FundingSurplus => IcpswapStep::Funding,
-        DurableTransferKind::Settlement(IcpswapSettlementKind::Output) => IcpswapStep::Completed,
-        DurableTransferKind::Settlement(IcpswapSettlementKind::Recovery | IcpswapSettlementKind::OutputRecovery) => {
-            IcpswapStep::Refunded
+        DurableTransferKind::Settlement(IcpswapSettlementKind::Output | IcpswapSettlementKind::OutputRecovery) => {
+            IcpswapStep::Completed
         }
+        DurableTransferKind::Settlement(IcpswapSettlementKind::Recovery) => IcpswapStep::Refunded,
     };
 }
 

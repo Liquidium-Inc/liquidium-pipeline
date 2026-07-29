@@ -670,6 +670,14 @@ mod tests {
         }
     }
 
+    fn set_startup_leg_status(row: &mut LiqResultRecord, status: VenueLegStatus) {
+        let mut wrapper: LiqMetaWrapper = serde_json::from_str(&row.meta_json).expect("decode startup fixture");
+        let meta = wrapper.meta_v2.as_mut().expect("multi-venue metadata");
+        let FinalizerMetaPayload::MultiVenueSwap(state) = &mut meta.payload;
+        state.legs.first_mut().expect("ICPSwap leg").status = status;
+        row.meta_json = serde_json::to_string(&wrapper).expect("encode startup fixture");
+    }
+
     fn calc_console_ui_enabled(human_output: bool, stdout_is_tty: bool, stderr_is_tty: bool) -> bool {
         human_output && stdout_is_tty && stderr_is_tty
     }
@@ -848,5 +856,110 @@ mod tests {
         park_unresumable_committed_rows(&db, &["icpswap".to_string()], DIFFERENT_MNEMONIC)
             .await
             .expect("terminal rows no longer require identity reproduction");
+
+        let stored = db
+            .get_result("completed-row")
+            .await
+            .expect("read row")
+            .expect("completed row");
+        assert_eq!(stored.status, ResultStatus::Succeeded);
+        assert_eq!(stored.last_error, None);
+    }
+
+    #[tokio::test]
+    async fn startup_wal_skips_identity_checks_for_a_terminal_leg_in_a_runnable_parent() {
+        let db_file = tempfile::NamedTempFile::new().expect("temporary WAL");
+        let db = SqliteWalStore::new(db_file.path().to_str().expect("database path")).expect("WAL store");
+        let mut row = startup_test_row("completed-leg", ResultStatus::Enqueued, COMMITTED_MNEMONIC);
+        set_startup_leg_status(&mut row, VenueLegStatus::Completed);
+        db.upsert_result(row).await.expect("seed completed leg");
+
+        park_unresumable_committed_rows(&db, &["icpswap".to_string()], DIFFERENT_MNEMONIC)
+            .await
+            .expect("terminal leg must not require identity reproduction");
+
+        assert_eq!(
+            db.get_result("completed-leg")
+                .await
+                .expect("read row")
+                .expect("completed leg row")
+                .status,
+            ResultStatus::Enqueued
+        );
+    }
+
+    #[tokio::test]
+    async fn startup_wal_parks_only_the_incompatible_row() {
+        let db_file = tempfile::NamedTempFile::new().expect("temporary WAL");
+        let db = SqliteWalStore::new(db_file.path().to_str().expect("database path")).expect("WAL store");
+        db.upsert_result(startup_test_row(
+            "compatible-row",
+            ResultStatus::Enqueued,
+            DIFFERENT_MNEMONIC,
+        ))
+        .await
+        .expect("seed compatible row");
+        db.upsert_result(startup_test_row(
+            "incompatible-row",
+            ResultStatus::Enqueued,
+            COMMITTED_MNEMONIC,
+        ))
+        .await
+        .expect("seed incompatible row");
+
+        park_unresumable_committed_rows(&db, &["icpswap".to_string()], DIFFERENT_MNEMONIC)
+            .await
+            .expect("one incompatible row must not block startup");
+
+        assert_eq!(
+            db.get_result("compatible-row")
+                .await
+                .expect("read compatible row")
+                .expect("compatible row")
+                .status,
+            ResultStatus::Enqueued
+        );
+        assert_eq!(
+            db.get_result("incompatible-row")
+                .await
+                .expect("read incompatible row")
+                .expect("incompatible row")
+                .status,
+            ResultStatus::Unresumable
+        );
+        let pending = db.get_pending(10).await.expect("pending rows");
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].id, "compatible-row");
+    }
+
+    #[tokio::test]
+    async fn startup_wal_fails_if_an_incompatible_row_cannot_be_parked() {
+        let db_file = tempfile::NamedTempFile::new().expect("temporary WAL");
+        let path = db_file.path().to_str().expect("database path");
+        let writer = SqliteWalStore::new(path).expect("writable WAL store");
+        writer
+            .upsert_result(startup_test_row(
+                "incompatible-read-only-row",
+                ResultStatus::Enqueued,
+                COMMITTED_MNEMONIC,
+            ))
+            .await
+            .expect("seed incompatible row");
+        let reader = SqliteWalStore::new_read_only_with_busy_timeout(path, 5_000).expect("read-only WAL store");
+
+        let error = park_unresumable_committed_rows(&reader, &["icpswap".to_string()], DIFFERENT_MNEMONIC)
+            .await
+            .expect_err("startup must fail when parking cannot be persisted");
+
+        assert!(error.contains("failed to mark unfinished WAL row incompatible-read-only-row unresumable"));
+        assert_eq!(
+            writer
+                .get_result("incompatible-read-only-row")
+                .await
+                .expect("read original row")
+                .expect("original row")
+                .status,
+            ResultStatus::Enqueued
+        );
     }
 }

@@ -1,5 +1,5 @@
 use candid::{Nat, Principal};
-use icrc_ledger_types::icrc1::account::Account;
+use icrc_ledger_types::icrc1::{account::Account, transfer::TransferArg};
 use liquidium_pipeline_core::tokens::{chain_token::ChainToken, chain_token_amount::ChainTokenAmount};
 
 use crate::swappers::icpswap::{
@@ -120,5 +120,37 @@ fn validation_rejects_identity_mismatch_and_unsupported_versions() {
         validate_execution_state(&state, "run")
             .expect_err("unsupported version")
             .contains("unsupported ICPSwap state version")
+    );
+}
+
+#[test]
+fn output_recovery_must_keep_the_original_committed_receiver() {
+    let mut state = state();
+    let receiver = Account {
+        owner: principal(5),
+        subaccount: None,
+    };
+    state.settlement.kind = Some(IcpswapSettlementKind::OutputRecovery);
+    state.settlement.destination = receiver;
+    state.settlement.recovery_credit = Some(Nat::from(100u64));
+    state.settlement.interrupted_transfer = Some(IcpswapLedgerTransferState {
+        args: Some(TransferArg {
+            from_subaccount: state.owner.subaccount,
+            to: receiver,
+            amount: Nat::from(95u64),
+            fee: Some(Nat::from(5u64)),
+            memo: None,
+            created_at_time: Some(1_000),
+        }),
+        ..Default::default()
+    });
+
+    validate_execution_state(&state, "run").expect("original receiver remains valid");
+
+    state.settlement.destination = state.funding.surplus_destination;
+    assert!(
+        validate_execution_state(&state, "run")
+            .expect_err("output recovery cannot redirect funds")
+            .contains("changed the committed receiver")
     );
 }
