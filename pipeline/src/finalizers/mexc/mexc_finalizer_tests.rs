@@ -106,6 +106,8 @@ fn make_execution_receipt(liq_id: u128) -> ExecutionReceipt {
         collateral_asset: collateral_token.clone(),
         expected_profit: 0,
         ref_price: Nat::from(0u8),
+        debt_ref_price: Nat::from(0u8),
+        ref_price_at: 0,
         debt_approval_needed: false,
         min_collateral_amount: Nat::from(0u8),
     };
@@ -159,6 +161,8 @@ fn make_execution_receipt_with_assets(
         collateral_asset: collateral_token,
         expected_profit: 0,
         ref_price: Nat::from(0u8),
+        debt_ref_price: Nat::from(0u8),
+        ref_price_at: 0,
         debt_approval_needed: false,
         min_collateral_amount: Nat::from(0u8),
     };

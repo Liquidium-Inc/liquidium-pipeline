@@ -11,6 +11,7 @@ use crate::{
         MultiVenueAllocationSnapshot, MultiVenueExecutionOutcome, MultiVenueExecutionState, VenueAllocationSnapshot,
         VenueLegState, VenueLegStatus, WalStore,
     },
+    price_oracle::price_oracle::PriceOracle,
     stages::executor::ExecutionReceipt,
     utils::now_ts,
     wal::{decode_receipt_wrapper, encode_meta, liq_id_from_receipt, wal_load},
@@ -81,6 +82,13 @@ impl MultiVenueFinalizer {
 
     pub fn with_watchdog(mut self, watchdog: Arc<dyn Watchdog>) -> Self {
         self.watchdog = watchdog;
+        self
+    }
+
+    /// Lets the planner bound venue quotes against a live oracle read instead of
+    /// the prices recorded when the liquidation was detected.
+    pub fn with_price_oracle(mut self, price_oracle: Arc<dyn PriceOracle>) -> Self {
+        self.planner = self.planner.with_price_oracle(price_oracle);
         self
     }
 

@@ -222,6 +222,10 @@ async fn init(
             _ => return Err(format!("unsupported enabled swap venue `{venue_id}`")),
         }
     }
+    // Shared by the strategy's collateral sizing and the multi-venue planner's
+    // quote guard, so both price a liquidation from the same oracle.
+    let price_oracle = Arc::new(LiquidationPriceOracle::new(agent.clone(), config.lending_canister));
+
     let multi_venue_finalizer = Arc::new(
         MultiVenueFinalizer::new(
             venue_adapters,
@@ -231,11 +235,14 @@ async fn init(
                 dust_fallback_max_price_impact_bps: config
                     .get_icpswap_dust_fallback_max_price_impact_bps(),
                 cex_min_exec_usd: config.get_cex_min_exec_usd(),
-                min_net_edge_bps: config.get_cex_min_net_edge_bps(),
+                min_net_edge_bps: config.get_multi_venue_min_net_edge_bps(),
+                max_oracle_discount_bps: config.get_multi_venue_max_oracle_discount_bps(),
+                oracle_snapshot_max_age_secs: config.get_multi_venue_oracle_snapshot_max_age_secs(),
                 icpswap_test_allocation_usd: config.get_icpswap_test_allocation_usd(),
             },
         )?
-        .with_watchdog(slack_watchdog_from_env(DEFAULT_LOW_BALANCE_ALERT_COOLDOWN)),
+        .with_watchdog(slack_watchdog_from_env(DEFAULT_LOW_BALANCE_ALERT_COOLDOWN))
+        .with_price_oracle(price_oracle.clone()),
     );
 
     // Profit calculator for expected/realized PnL
@@ -263,8 +270,6 @@ async fn init(
     );
 
     info!("Initializing liquidations stage ...");
-    let price_oracle = Arc::new(LiquidationPriceOracle::new(agent.clone(), config.lending_canister));
-
     let collateral_service = Arc::new(CollateralService::new(price_oracle));
 
     let wd = webhook_watchdog_from_env(Duration::from_secs(300));
@@ -645,6 +650,8 @@ mod tests {
                 collateral_asset: input,
                 expected_profit: 1,
                 ref_price: Nat::from(1u8),
+                debt_ref_price: Nat::from(0u8),
+                ref_price_at: 0,
                 debt_approval_needed: false,
                 min_collateral_amount: Nat::from(0u8),
             },

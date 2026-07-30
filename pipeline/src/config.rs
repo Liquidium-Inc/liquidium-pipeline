@@ -62,8 +62,14 @@ pub struct Config {
     pub cex_retry_base_secs: u64,
     /// Maximum retry delay cap, in seconds.
     pub cex_retry_max_secs: u64,
-    /// Minimum projected net edge required to execute, in bps.
-    pub cex_min_net_edge_bps: u32,
+    /// Minimum projected net edge required for any multi-venue plan, in bps.
+    pub multi_venue_min_net_edge_bps: u32,
+    /// Maximum downside from the oracle-implied output allowed for any venue
+    /// quote, in bps. Applied centrally after venue quote normalization.
+    pub multi_venue_max_oracle_discount_bps: u32,
+    /// How old a recorded price may be, in seconds, before the venue quote guard
+    /// stops using it as a fallback for a live oracle read.
+    pub multi_venue_oracle_snapshot_max_age_secs: i64,
     /// Extra safety haircut for price-move risk during execution latency, in bps.
     pub cex_delay_buffer_bps: u32,
     /// Route fee estimate in bps subtracted from projected edge.
@@ -111,7 +117,9 @@ pub trait ConfigTrait: Send + Sync {
     fn get_cex_buy_inverse_enabled(&self) -> bool;
     fn get_cex_retry_base_secs(&self) -> u64;
     fn get_cex_retry_max_secs(&self) -> u64;
-    fn get_cex_min_net_edge_bps(&self) -> u32;
+    fn get_multi_venue_min_net_edge_bps(&self) -> u32;
+    fn get_multi_venue_max_oracle_discount_bps(&self) -> u32;
+    fn get_multi_venue_oracle_snapshot_max_age_secs(&self) -> i64;
     fn get_cex_delay_buffer_bps(&self) -> u32;
     fn get_cex_route_fee_bps(&self) -> u32;
     fn get_cex_mexc_available_pairs(&self) -> Vec<String>;
@@ -196,8 +204,16 @@ impl ConfigTrait for Config {
         self.cex_retry_max_secs
     }
 
-    fn get_cex_min_net_edge_bps(&self) -> u32 {
-        self.cex_min_net_edge_bps
+    fn get_multi_venue_min_net_edge_bps(&self) -> u32 {
+        self.multi_venue_min_net_edge_bps
+    }
+
+    fn get_multi_venue_max_oracle_discount_bps(&self) -> u32 {
+        self.multi_venue_max_oracle_discount_bps
+    }
+
+    fn get_multi_venue_oracle_snapshot_max_age_secs(&self) -> i64 {
+        self.multi_venue_oracle_snapshot_max_age_secs
     }
 
     fn get_cex_delay_buffer_bps(&self) -> u32 {
@@ -412,7 +428,9 @@ impl Config {
             cex_buy_inverse_enabled: cex_tunables.buy_inverse_enabled,
             cex_retry_base_secs: cex_tunables.retry_base_secs,
             cex_retry_max_secs: cex_tunables.retry_max_secs,
-            cex_min_net_edge_bps: cex_tunables.min_net_edge_bps,
+            multi_venue_min_net_edge_bps: parse_multi_venue_min_net_edge_bps_from_env(),
+            multi_venue_max_oracle_discount_bps: parse_multi_venue_max_oracle_discount_bps_from_env(),
+            multi_venue_oracle_snapshot_max_age_secs: parse_multi_venue_oracle_snapshot_max_age_secs_from_env(),
             cex_delay_buffer_bps: cex_tunables.delay_buffer_bps,
             cex_route_fee_bps: cex_tunables.route_fee_bps,
             cex_mexc_available_pairs,
@@ -465,7 +483,6 @@ struct CexTunables {
     buy_inverse_enabled: bool,
     retry_base_secs: u64,
     retry_max_secs: u64,
-    min_net_edge_bps: u32,
     delay_buffer_bps: u32,
     route_fee_bps: u32,
 }
@@ -480,7 +497,9 @@ const MAX_CEX_BUY_INVERSE_MAX_RETRIES: u32 = 3;
 const DEFAULT_CEX_BUY_INVERSE_ENABLED: bool = true;
 const DEFAULT_CEX_RETRY_BASE_SECS: u64 = 5;
 const DEFAULT_CEX_RETRY_MAX_SECS: u64 = 120;
-const DEFAULT_CEX_MIN_NET_EDGE_BPS: u32 = 150;
+const DEFAULT_MULTI_VENUE_MIN_NET_EDGE_BPS: u32 = 150;
+const DEFAULT_MULTI_VENUE_MAX_ORACLE_DISCOUNT_BPS: u32 = 250;
+const DEFAULT_MULTI_VENUE_ORACLE_SNAPSHOT_MAX_AGE_SECS: i64 = 300;
 const DEFAULT_CEX_DELAY_BUFFER_BPS: u32 = 75;
 const DEFAULT_CEX_ROUTE_FEE_BPS: u32 = 25;
 const DEFAULT_CEX_MEXC_MAX_HOPS: u8 = 2;
@@ -502,6 +521,33 @@ const DEFAULT_ICPSWAP_DUST_FALLBACK_MAX_PRICE_IMPACT_BPS: f64 = 150.0;
 const DEFAULT_ICPSWAP_MAX_SEARCH_ITERATIONS: u8 = 16;
 const DEFAULT_ENABLED_SWAP_VENUES: &str = "icpswap,mexc";
 const SUPPORTED_SWAP_VENUES: [&str; 2] = ["icpswap", "mexc"];
+
+fn parse_multi_venue_min_net_edge_bps_from_env() -> u32 {
+    env::var("MULTI_VENUE_MIN_NET_EDGE_BPS")
+        .or_else(|_| env::var("CEX_MIN_NET_EDGE_BPS"))
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok())
+        .unwrap_or(DEFAULT_MULTI_VENUE_MIN_NET_EDGE_BPS)
+        .min(MAX_BPS)
+}
+
+/// A discount of `MAX_BPS` accepts any output at all, so out-of-range values
+/// fall back to the default instead of being clamped into disabling the guard.
+fn parse_multi_venue_max_oracle_discount_bps_from_env() -> u32 {
+    env::var("MULTI_VENUE_MAX_ORACLE_DISCOUNT_BPS")
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok())
+        .filter(|value| *value < MAX_BPS)
+        .unwrap_or(DEFAULT_MULTI_VENUE_MAX_ORACLE_DISCOUNT_BPS)
+}
+
+fn parse_multi_venue_oracle_snapshot_max_age_secs_from_env() -> i64 {
+    env::var("MULTI_VENUE_ORACLE_SNAPSHOT_MAX_AGE_SECS")
+        .ok()
+        .and_then(|value| value.parse::<i64>().ok())
+        .filter(|value| *value >= 0)
+        .unwrap_or(DEFAULT_MULTI_VENUE_ORACLE_SNAPSHOT_MAX_AGE_SECS)
+}
 
 fn parse_bad_debt_collateral_slippage_bps_from_env() -> u32 {
     env::var("BAD_DEBT_COLLATERAL_SLIPPAGE_BPS")
@@ -757,11 +803,6 @@ fn parse_cex_tunables_from_env() -> CexTunables {
         .unwrap_or(DEFAULT_CEX_RETRY_MAX_SECS)
         .max(retry_base_secs);
 
-    let min_net_edge_bps = env::var("CEX_MIN_NET_EDGE_BPS")
-        .ok()
-        .and_then(|v| v.parse::<u32>().ok())
-        .unwrap_or(DEFAULT_CEX_MIN_NET_EDGE_BPS);
-
     let delay_buffer_bps = env::var("CEX_DELAY_BUFFER_BPS")
         .ok()
         .and_then(|v| v.parse::<u32>().ok())
@@ -781,7 +822,6 @@ fn parse_cex_tunables_from_env() -> CexTunables {
         buy_inverse_enabled,
         retry_base_secs,
         retry_max_secs,
-        min_net_edge_bps,
         delay_buffer_bps,
         route_fee_bps,
     }
@@ -807,7 +847,10 @@ mod tests {
             "CEX_BUY_INVERSE_ENABLED",
             "CEX_RETRY_BASE_SECS",
             "CEX_RETRY_MAX_SECS",
+            "MULTI_VENUE_MIN_NET_EDGE_BPS",
             "CEX_MIN_NET_EDGE_BPS",
+            "MULTI_VENUE_MAX_ORACLE_DISCOUNT_BPS",
+            "MULTI_VENUE_ORACLE_SNAPSHOT_MAX_AGE_SECS",
             "CEX_DELAY_BUFFER_BPS",
             "CEX_ROUTE_FEE_BPS",
             "CEX_MEXC_AVAILABLE_PAIRS",
@@ -830,11 +873,12 @@ mod tests {
                 buy_inverse_enabled: true,
                 retry_base_secs: 5,
                 retry_max_secs: 120,
-                min_net_edge_bps: 150,
                 delay_buffer_bps: 75,
                 route_fee_bps: 25,
             }
         );
+        assert_eq!(parse_multi_venue_min_net_edge_bps_from_env(), 150);
+        assert_eq!(parse_multi_venue_oracle_snapshot_max_age_secs_from_env(), 300);
     }
 
     #[test]
@@ -849,7 +893,9 @@ mod tests {
             env::set_var("CEX_BUY_INVERSE_ENABLED", "false");
             env::set_var("CEX_RETRY_BASE_SECS", "7");
             env::set_var("CEX_RETRY_MAX_SECS", "240");
-            env::set_var("CEX_MIN_NET_EDGE_BPS", "160");
+            env::set_var("MULTI_VENUE_MIN_NET_EDGE_BPS", "160");
+            env::set_var("MULTI_VENUE_MAX_ORACLE_DISCOUNT_BPS", "175");
+            env::set_var("MULTI_VENUE_ORACLE_SNAPSHOT_MAX_AGE_SECS", "45");
             env::set_var("CEX_DELAY_BUFFER_BPS", "90");
             env::set_var("CEX_ROUTE_FEE_BPS", "0");
             env::set_var("BAD_DEBT_COLLATERAL_SLIPPAGE_BPS", "350");
@@ -867,12 +913,66 @@ mod tests {
                 buy_inverse_enabled: false,
                 retry_base_secs: 7,
                 retry_max_secs: 240,
-                min_net_edge_bps: 160,
                 delay_buffer_bps: 90,
                 route_fee_bps: 0,
             }
         );
         assert_eq!(parse_bad_debt_collateral_slippage_bps_from_env(), 350);
+        assert_eq!(parse_multi_venue_min_net_edge_bps_from_env(), 160);
+        assert_eq!(parse_multi_venue_max_oracle_discount_bps_from_env(), 175);
+        assert_eq!(parse_multi_venue_oracle_snapshot_max_age_secs_from_env(), 45);
+
+        unsafe {
+            env::remove_var("MULTI_VENUE_MIN_NET_EDGE_BPS");
+            env::remove_var("MULTI_VENUE_MAX_ORACLE_DISCOUNT_BPS");
+            env::remove_var("MULTI_VENUE_ORACLE_SNAPSHOT_MAX_AGE_SECS");
+        }
+    }
+
+    #[test]
+    fn legacy_cex_min_edge_key_remains_a_fallback() {
+        let _guard = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        unsafe {
+            env::remove_var("MULTI_VENUE_MIN_NET_EDGE_BPS");
+            env::set_var("CEX_MIN_NET_EDGE_BPS", "165");
+        }
+
+        assert_eq!(parse_multi_venue_min_net_edge_bps_from_env(), 165);
+
+        unsafe { env::remove_var("CEX_MIN_NET_EDGE_BPS") };
+    }
+
+    #[test]
+    fn oracle_discount_defaults_to_250_and_rejects_a_guard_disabling_value() {
+        let _guard = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        unsafe { env::remove_var("MULTI_VENUE_MAX_ORACLE_DISCOUNT_BPS") };
+        assert_eq!(parse_multi_venue_max_oracle_discount_bps_from_env(), 250);
+
+        // 10_000 bps and above would accept any output at all, so out-of-range
+        // values fall back to the default instead of turning the guard off.
+        for value in ["10000", "20000", "not-a-number"] {
+            unsafe { env::set_var("MULTI_VENUE_MAX_ORACLE_DISCOUNT_BPS", value) };
+            assert_eq!(
+                parse_multi_venue_max_oracle_discount_bps_from_env(),
+                250,
+                "`{value}` must not disable the oracle guard"
+            );
+        }
+        unsafe { env::remove_var("MULTI_VENUE_MAX_ORACLE_DISCOUNT_BPS") };
+    }
+
+    #[test]
+    fn oracle_snapshot_max_age_defaults_and_rejects_negative_values() {
+        let _guard = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        unsafe { env::remove_var("MULTI_VENUE_ORACLE_SNAPSHOT_MAX_AGE_SECS") };
+        assert_eq!(parse_multi_venue_oracle_snapshot_max_age_secs_from_env(), 300);
+
+        unsafe { env::set_var("MULTI_VENUE_ORACLE_SNAPSHOT_MAX_AGE_SECS", "0") };
+        assert_eq!(parse_multi_venue_oracle_snapshot_max_age_secs_from_env(), 0);
+
+        unsafe { env::set_var("MULTI_VENUE_ORACLE_SNAPSHOT_MAX_AGE_SECS", "-1") };
+        assert_eq!(parse_multi_venue_oracle_snapshot_max_age_secs_from_env(), 300);
+        unsafe { env::remove_var("MULTI_VENUE_ORACLE_SNAPSHOT_MAX_AGE_SECS") };
     }
 
     #[test]

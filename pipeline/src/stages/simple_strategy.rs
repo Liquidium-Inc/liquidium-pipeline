@@ -25,8 +25,9 @@ use log::{debug, info};
 
 use num_traits::ToPrimitive;
 
+use crate::liquidation::liquidation_math::oracle_implied_output;
 use crate::swappers::model::SwapRequest;
-use crate::utils::{ICP_LEDGER_PRINCIPAL, max_for_ledger};
+use crate::utils::{ICP_LEDGER_PRINCIPAL, max_for_ledger, now_ts};
 use crate::watchdog::{Watchdog, WatchdogEvent, noop_watchdog};
 use async_trait::async_trait;
 
@@ -352,6 +353,8 @@ where
                     buy_bad_debt: true,
                 },
                 ref_price: 0u32.into(),
+                debt_ref_price: 0u32.into(),
+                ref_price_at: now_ts(),
                 swap_args: None,
                 expected_profit: profit.0.to_i128().unwrap_or(i128::MAX),
                 debt_approval_needed,
@@ -539,14 +542,16 @@ where
                     if debt_f > 0.0 { coll_f / debt_f } else { 0.0 }
                 };
 
-                let amount_received = if price_coll_ray == 0u8 || price_debt_ray == 0u8 {
-                    Nat::from(0u8)
-                } else {
-                    let coll_scale = Nat::from(10u128.pow(collateral_token.decimals() as u32));
-                    let debt_scale = Nat::from(10u128.pow(repayment_token.decimals() as u32));
-                    (amount_in.value.clone() * price_coll_ray.clone() * debt_scale)
-                        / (coll_scale * price_debt_ray.clone())
-                };
+                // The multi-venue quote guard compares against this same
+                // conversion, so both use one implementation.
+                let amount_received = oracle_implied_output(
+                    &amount_in.value,
+                    &price_coll_ray,
+                    &price_debt_ray,
+                    u64::from(collateral_token.decimals()),
+                    u64::from(repayment_token.decimals()),
+                )
+                .unwrap_or_else(|_| Nat::from(0u8));
 
                 (Some(swap_request), amount_received, price)
             };
@@ -621,6 +626,10 @@ where
                     buy_bad_debt,
                 },
                 ref_price: estimation.ref_price,
+                debt_ref_price: estimation.debt_price,
+                // Our own clock, not the canister's: the finalizer uses this to
+                // decide whether these prices are still fresh.
+                ref_price_at: now_ts(),
                 swap_args,
                 expected_profit: profit.0.to_i128().unwrap_or(i128::MAX),
                 debt_approval_needed,

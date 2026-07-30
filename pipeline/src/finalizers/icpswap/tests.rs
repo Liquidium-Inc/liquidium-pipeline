@@ -181,6 +181,8 @@ fn receipt() -> ExecutionReceipt {
             collateral_asset: collateral,
             expected_profit: 1,
             ref_price: Nat::from(1u8),
+            debt_ref_price: Nat::from(0u8),
+            ref_price_at: 0,
             debt_approval_needed: false,
             min_collateral_amount: Nat::from(0u8),
         },

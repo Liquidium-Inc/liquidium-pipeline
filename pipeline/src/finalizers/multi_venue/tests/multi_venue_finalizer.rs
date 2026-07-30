@@ -524,6 +524,8 @@ fn receipt_with_id(liquidation_id: u128) -> ExecutionReceipt {
             collateral_asset: collateral,
             expected_profit: 0,
             ref_price: Nat::from(10_000_000_000_000_000_000_000_000_000u128),
+            debt_ref_price: Nat::from(0u8),
+            ref_price_at: 0,
             debt_approval_needed: false,
             min_collateral_amount: Nat::from(0u8),
         },
@@ -614,6 +616,8 @@ fn planner_config() -> IcpswapFirstPlannerConfig {
         dust_fallback_max_price_impact_bps: 150.0,
         cex_min_exec_usd: 0.01,
         min_net_edge_bps: 150,
+        max_oracle_discount_bps: 250,
+        oracle_snapshot_max_age_secs: 300,
         icpswap_test_allocation_usd: None,
     }
 }
@@ -626,6 +630,34 @@ fn committed_state(wal: &TestWal) -> MultiVenueExecutionState {
     let meta = wal.wrapper().meta_v2.expect("committed meta_v2");
     let FinalizerMetaPayload::MultiVenueSwap(state) = meta.payload;
     state
+}
+
+#[tokio::test]
+async fn bad_debt_below_minimum_edge_never_advances_a_venue_leg() {
+    let mut receipt = receipt();
+    receipt.request.liquidation.buy_bad_debt = true;
+    receipt
+        .liquidation_result
+        .as_mut()
+        .expect("liquidation result")
+        .amounts
+        .debt_repaid = Nat::from(199_000_000u64);
+    let wal = TestWal::with_receipt(&receipt);
+    let icpswap = Arc::new(ScriptedAdapter::new(ICPSWAP_VENUE_ID, None, Vec::new()));
+    let mexc = Arc::new(ScriptedAdapter::new(MEXC_VENUE_ID, None, Vec::new()));
+    let finalizer = finalizer(vec![icpswap.clone(), mexc.clone()]);
+
+    let error = finalizer
+        .finalize(&wal, receipt)
+        .await
+        .expect_err("a bad-debt receipt does not bypass the swap edge floor");
+
+    assert!(error.contains("below required 150 bps"));
+    assert_eq!(icpswap.previews(), 1);
+    assert_eq!(mexc.previews(), 0);
+    assert_eq!(icpswap.calls(), 0);
+    assert_eq!(mexc.calls(), 0);
+    assert!(wal.wrapper().meta_v2.is_none(), "a rejected plan must not be committed");
 }
 
 #[tokio::test]

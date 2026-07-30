@@ -13,7 +13,9 @@ use liquidium_pipeline_core::{
         TxStatus,
     },
 };
+use mockall::predicate::eq;
 use num_traits::ToPrimitive;
+use proptest::prelude::*;
 use tokio::sync::Barrier;
 
 use super::super::planning::reference_price_usd;
@@ -21,7 +23,9 @@ use super::super::planning::venue_registry::{VenuePreviewOutcome, VenueRegistry}
 use super::super::*;
 use crate::{
     executors::executor::ExecutorRequest,
+    liquidation::collateral_service::USD_QUOTE_CURRENCY,
     persistance::{MultiVenueAllocationReason, VenueExecutionState, VenueLegState},
+    price_oracle::price_oracle::MockPriceOracle,
     stages::executor::{ExecutionReceipt, ExecutionStatus},
     swappers::model::{SwapQuote, SwapQuoteLeg, SwapRequest},
     utils::{CKUSDC_LEDGER_PRINCIPAL, CKUSDT_LEDGER_PRINCIPAL, ICP_LEDGER_PRINCIPAL},
@@ -30,6 +34,10 @@ use crate::{
 const TOTAL_PAY: u64 = 100_000_000;
 const DEBT_REPAID: u64 = 190_000_000;
 const KRAKEN_VENUE_ID: &str = "kraken";
+const RAY: u128 = 1_000_000_000_000_000_000_000_000_000;
+/// The planning timestamp every test passes to `plan`. Inputs record prices at
+/// this instant, so they read as fresh unless a test ages them.
+const QUOTED_AT: i64 = 123;
 
 struct BarrierAdapter {
     venue_id: &'static str,
@@ -203,6 +211,9 @@ fn input_with_pay_token(pay_token: ChainToken) -> IcpswapFirstPlanInput {
         receive_address: Some("receiver".to_string()),
         max_execution_slippage_bps: Some(500),
         pay_reference_price_usd: Some(10.0),
+        pay_reference_price_ray: None,
+        receive_reference_price_ray: None,
+        reference_price_captured_at: Some(QUOTED_AT),
     }
 }
 
@@ -221,6 +232,9 @@ fn native_icp_to_ckusdt_input() -> IcpswapFirstPlanInput {
         receive_address: Some("receiver".to_string()),
         max_execution_slippage_bps: Some(500),
         pay_reference_price_usd: Some(10.0),
+        pay_reference_price_ray: None,
+        receive_reference_price_ray: None,
+        reference_price_captured_at: Some(QUOTED_AT),
     }
 }
 
@@ -235,7 +249,18 @@ fn ckusdc_to_native_icp_input() -> IcpswapFirstPlanInput {
         receive_address: Some("receiver".to_string()),
         max_execution_slippage_bps: Some(500),
         pay_reference_price_usd: Some(1.0),
+        pay_reference_price_ray: None,
+        receive_reference_price_ray: None,
+        reference_price_captured_at: Some(QUOTED_AT),
     }
+}
+
+fn native_icp_to_ckusdc_with_oracle() -> IcpswapFirstPlanInput {
+    let mut input = input_with_pay_token(native_icp());
+    input.debt_repaid.value = Nat::from(1_000_000u64);
+    input.pay_reference_price_ray = Some(Nat::from(2 * RAY));
+    input.receive_reference_price_ray = Some(Nat::from(RAY));
+    input
 }
 
 fn config(cex_min_exec_usd: f64) -> IcpswapFirstPlannerConfig {
@@ -245,7 +270,18 @@ fn config(cex_min_exec_usd: f64) -> IcpswapFirstPlannerConfig {
         dust_fallback_max_price_impact_bps: 150.0,
         cex_min_exec_usd,
         min_net_edge_bps: 150,
+        // Must stay above the 150 bps dust fallback impact cap, which already
+        // includes the pool fee.
+        max_oracle_discount_bps: 200,
+        oracle_snapshot_max_age_secs: 300,
         icpswap_test_allocation_usd: None,
+    }
+}
+
+fn production_oracle_config(cex_min_exec_usd: f64) -> IcpswapFirstPlannerConfig {
+    IcpswapFirstPlannerConfig {
+        max_oracle_discount_bps: 250,
+        ..config(cex_min_exec_usd)
     }
 }
 
@@ -357,6 +393,8 @@ fn receipt_input_uses_actual_collateral_received_not_estimated_swap_amount() {
             collateral_asset: collateral,
             expected_profit: 0,
             ref_price: Nat::from(10_000_000_000_000_000_000_000_000_000u128),
+            debt_ref_price: Nat::from(RAY),
+            ref_price_at: 0,
             debt_approval_needed: false,
             min_collateral_amount: Nat::from(0u8),
         },
@@ -386,6 +424,8 @@ fn receipt_input_uses_actual_collateral_received_not_estimated_swap_amount() {
     let input = IcpswapFirstPlanInput::from_receipt(&receipt).expect("planner input");
     assert_eq!(input.liquidation_id, "1");
     assert_eq!(input.total_pay.value, actual_received);
+    assert_eq!(input.pay_reference_price_ray, Some(Nat::from(10 * RAY)));
+    assert_eq!(input.receive_reference_price_ray, Some(Nat::from(RAY)));
 }
 
 // Allocation decisions
@@ -521,6 +561,59 @@ async fn test_usd_override_sends_one_dollar_to_icpswap_and_exact_remainder_to_me
         state.plan.allocation_reason,
         MultiVenueAllocationReason::PriceImpactSplit
     );
+}
+
+#[tokio::test]
+async fn test_usd_override_accepts_an_exact_eight_dollar_mexc_remainder() {
+    let icpswap_calls = Arc::new(Mutex::new(Vec::new()));
+    let mexc_calls = Arc::new(Mutex::new(Vec::new()));
+    let icpswap = mock_adapter(ICPSWAP_VENUE_ID, icpswap_calls.clone(), |request| {
+        Ok(proportional_preview(request, ICPSWAP_VENUE_ID, 10.0, 2))
+    });
+    let mexc = mock_adapter(MEXC_VENUE_ID, mexc_calls.clone(), |request| {
+        Ok(proportional_preview(request, MEXC_VENUE_ID, 0.0, 2))
+    });
+    let mut planner_config = config(8.0);
+    planner_config.icpswap_test_allocation_usd = Some(2.0);
+
+    let state = planner(icpswap, mexc, planner_config)
+        .plan(&input_with_pay_token(native_icp()), 123)
+        .await
+        .expect("an exact $8 remainder meets the MEXC minimum");
+
+    assert_eq!(*icpswap_calls.lock().expect("ICPSwap calls"), vec![20_000_000]);
+    assert_eq!(*mexc_calls.lock().expect("MEXC calls"), vec![80_000_000]);
+    assert_eq!(state.legs.len(), 2);
+}
+
+#[tokio::test]
+async fn test_usd_override_routes_a_one_native_unit_below_eight_dollars_to_dust_fallback() {
+    let icpswap_calls = Arc::new(Mutex::new(Vec::new()));
+    let mexc_calls = Arc::new(Mutex::new(Vec::new()));
+    let icpswap = mock_adapter(ICPSWAP_VENUE_ID, icpswap_calls.clone(), |request| {
+        Ok(proportional_preview(request, ICPSWAP_VENUE_ID, 150.0, 2))
+    });
+    let mexc = mock_adapter(MEXC_VENUE_ID, mexc_calls.clone(), |request| {
+        Ok(proportional_preview(request, MEXC_VENUE_ID, 0.0, 2))
+    });
+    let mut planner_config = config(8.0);
+    // At $10/ICP this becomes 20,000,001 native ICP units, leaving
+    // 79,999,999 units = $7.9999999 for MEXC.
+    planner_config.icpswap_test_allocation_usd = Some(2.000_000_1);
+
+    let state = planner(icpswap, mexc, planner_config)
+        .plan(&input_with_pay_token(native_icp()), 123)
+        .await
+        .expect("a sub-$8 remainder should use the inclusive dust fallback");
+
+    assert_eq!(*icpswap_calls.lock().expect("ICPSwap calls"), vec![TOTAL_PAY]);
+    assert!(mexc_calls.lock().expect("MEXC calls").is_empty());
+    assert_eq!(state.legs.len(), 1);
+    assert_eq!(state.legs[0].venue_id, ICPSWAP_VENUE_ID);
+    assert!(matches!(
+        state.plan.allocation_reason,
+        MultiVenueAllocationReason::RemainderBelowMinimum { .. }
+    ));
 }
 
 #[tokio::test]
@@ -845,6 +938,91 @@ fn present_but_non_positive_reference_price_is_rejected() {
         input.validate(),
         Err(IcpswapFirstPlannerError::InvalidInput(_))
     ));
+}
+
+/// A quote at a perfect price whose only shortfall is the three input ledger
+/// fees ICPSwap reserves before the pool sees the money. Impact is reported as
+/// zero, so whatever the guard sees here is pure fee drag.
+fn ledger_fee_only_preview(request: &SwapRequest, receive_token: ChainToken) -> VenueRoutePreview {
+    let pay = request.pay_amount.value.0.to_u64().expect("test pay fits u64");
+    let input_fee = request.pay_amount.token.fee().0.to_u64().expect("fee fits u64");
+    let executable = pay - 3 * input_fee;
+    // Both prices are $1, so value is preserved and only the decimal scale moves.
+    let pay_scale = 10u64.pow(u32::from(request.pay_amount.token.decimals()));
+    let receive_scale = 10u64.pow(u32::from(receive_token.decimals()));
+    let receive = executable / pay_scale * receive_scale + (executable % pay_scale) * receive_scale / pay_scale;
+    let mut route = preview(request, ICPSWAP_VENUE_ID, 0.0, receive, receive);
+    route.conservative_receive.token = receive_token;
+    route
+}
+
+/// The guard measures a quote against the *full* allocation, but ICPSwap swaps
+/// the allocation minus three input ledger fees. That gap is a share of the leg,
+/// so it grows as the leg shrinks -- and how fast depends on the pay token's fee
+/// relative to its unit value.
+#[tokio::test]
+async fn input_ledger_fee_drag_is_a_share_of_the_leg_and_depends_on_the_pay_token() {
+    // One dollar of ICP: three 0.0001 ICP fees against 0.1 ICP is 30 bps.
+    let mut icp_leg = input_with_pay_token(native_icp());
+    icp_leg.total_pay.value = Nat::from(10_000_000u64);
+    icp_leg.debt_repaid.value = Nat::from(1u8);
+    icp_leg.pay_reference_price_ray = Some(Nat::from(RAY));
+    icp_leg.receive_reference_price_ray = Some(Nat::from(RAY));
+    let icpswap = mock_adapter(ICPSWAP_VENUE_ID, Arc::new(Mutex::new(Vec::new())), |request| {
+        Ok(ledger_fee_only_preview(request, debt_token()))
+    });
+    let state = IcpswapFirstPlanner::new(vec![Arc::new(icpswap)], production_oracle_config(0.0))
+        .expect("planner")
+        .plan(&icp_leg, QUOTED_AT)
+        .await
+        .expect("30 bps of fee drag fits inside a 250 bps budget");
+    assert_eq!(state.legs[0].quote.estimated_receive.value, Nat::from(99_700u64));
+
+    // One dollar of ckUSDC: three $0.01 fees against $1 is 300 bps, which spends
+    // the whole budget on fees before impact or basis is considered.
+    let mut ckusdc_leg = ckusdc_to_native_icp_input();
+    ckusdc_leg.total_pay.value = Nat::from(1_000_000u64);
+    ckusdc_leg.debt_repaid.value = Nat::from(1u8);
+    ckusdc_leg.pay_reference_price_ray = Some(Nat::from(RAY));
+    ckusdc_leg.receive_reference_price_ray = Some(Nat::from(RAY));
+    let icpswap = mock_adapter(ICPSWAP_VENUE_ID, Arc::new(Mutex::new(Vec::new())), |request| {
+        Ok(ledger_fee_only_preview(request, native_icp()))
+    });
+    let error = IcpswapFirstPlanner::new(vec![Arc::new(icpswap)], production_oracle_config(0.0))
+        .expect("planner")
+        .plan(&ckusdc_leg, QUOTED_AT)
+        .await
+        .expect_err("a one dollar ckUSDC leg cannot clear a 250 bps budget on fees alone");
+    assert!(
+        error.to_string().contains("300.00 bps below oracle-implied output"),
+        "unexpected error: {error}"
+    );
+}
+
+#[test]
+fn oracle_discount_limit_must_leave_room_above_the_impact_caps() {
+    // A venue's reported impact already contains its pool fee, so a limit at or
+    // below the dust fallback cap would reject max-impact quotes that the impact
+    // policy allows -- with no room left for ledger fees or oracle basis.
+    let too_tight = IcpswapFirstPlannerConfig {
+        max_oracle_discount_bps: 150,
+        ..config(0.0)
+    };
+    let adapter = mock_adapter(ICPSWAP_VENUE_ID, Arc::new(Mutex::new(Vec::new())), |request| {
+        Ok(preview(request, ICPSWAP_VENUE_ID, 10.0, 1, 1))
+    });
+    let error = match IcpswapFirstPlanner::new(vec![Arc::new(adapter)], too_tight) {
+        Ok(_) => panic!("a limit at the dust fallback cap must be rejected"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("must exceed the 150.00 bps dust fallback"));
+
+    // The shipped pairing leaves 100 bps above the cap.
+    assert!(config(0.0).max_oracle_discount_bps as f64 > config(0.0).dust_fallback_max_price_impact_bps);
+    assert!(
+        production_oracle_config(0.0).max_oracle_discount_bps as f64
+            > production_oracle_config(0.0).dust_fallback_max_price_impact_bps
+    );
 }
 
 #[tokio::test]
@@ -1266,6 +1444,447 @@ async fn ckusdc_to_native_icp_remains_eligible_for_icpswap() {
 }
 
 #[tokio::test]
+async fn oracle_discount_rejects_icpswap_and_falls_back_to_valid_mexc() {
+    let icpswap = mock_adapter(ICPSWAP_VENUE_ID, Arc::new(Mutex::new(Vec::new())), |request| {
+        Ok(preview(request, ICPSWAP_VENUE_ID, 10.0, 1_000_000, 1_000_000))
+    });
+    let mexc = mock_adapter(MEXC_VENUE_ID, Arc::new(Mutex::new(Vec::new())), |request| {
+        Ok(preview(request, MEXC_VENUE_ID, 0.0, 2_000_000, 1_990_000))
+    });
+
+    let state = planner(icpswap, mexc, config(0.0))
+        .plan(&native_icp_to_ckusdc_with_oracle(), 123)
+        .await
+        .expect("MEXC should survive the central oracle guard");
+
+    assert_eq!(state.legs.len(), 1);
+    assert_eq!(state.legs[0].venue_id, MEXC_VENUE_ID);
+    assert!(matches!(
+        state.plan.allocation_reason,
+        MultiVenueAllocationReason::VenueUnavailable { .. }
+    ));
+}
+
+#[tokio::test]
+async fn oracle_discount_guard_rejects_mexc_at_the_same_top_level_boundary() {
+    let icpswap = mock_adapter(ICPSWAP_VENUE_ID, Arc::new(Mutex::new(Vec::new())), |request| {
+        Ok(preview(request, ICPSWAP_VENUE_ID, 10.0, 1_000_000, 1_000_000))
+    });
+    let mexc = mock_adapter(MEXC_VENUE_ID, Arc::new(Mutex::new(Vec::new())), |request| {
+        Ok(preview(request, MEXC_VENUE_ID, 0.0, 1_500_000, 1_490_000))
+    });
+
+    let error = planner(icpswap, mexc, config(0.0))
+        .plan(&native_icp_to_ckusdc_with_oracle(), 123)
+        .await
+        .expect_err("both below-oracle venue quotes must be rejected");
+
+    assert!(error.to_string().contains("MEXC quote rejected"));
+    assert!(error.to_string().contains("below oracle-implied output"));
+}
+
+/// An oracle answering both sides of the ICP -> ckUSDC pair at fixed prices.
+///
+/// The receive leg is keyed by `USDC`, not `ckUSDC`: a planner asking for the
+/// ledger symbol gets no match here and falls back to the recorded price.
+fn mock_oracle(icp_usd: u128, usdc_usd: u128) -> Arc<MockPriceOracle> {
+    let mut oracle = MockPriceOracle::new();
+    oracle
+        .expect_get_price()
+        .with(eq("ICP"), eq(USD_QUOTE_CURRENCY))
+        .returning(move |_, _| Ok((Nat::from(icp_usd * RAY), 27)));
+    oracle
+        .expect_get_price()
+        .with(eq("USDC"), eq(USD_QUOTE_CURRENCY))
+        .returning(move |_, _| Ok((Nat::from(usdc_usd * RAY), 27)));
+    Arc::new(oracle)
+}
+
+#[test]
+fn oracle_guard_waiver_banner_names_the_setting_and_the_way_out() {
+    let banner = oracle_guard_waiver_banner(1.0);
+    assert!(banner.contains("ORACLE QUOTE GUARD DISABLED"), "{banner}");
+    assert!(banner.contains("ICPSWAP_TEST_ALLOCATION_USD=$1.00"), "{banner}");
+    assert!(banner.contains("$10.00 minimum"), "{banner}");
+    // An operator must not read this as "no quote is checked".
+    assert!(banner.contains("remainder is still checked"), "{banner}");
+    assert!(banner.contains("clear ICPSWAP_TEST_ALLOCATION_USD"), "{banner}");
+}
+
+#[test]
+fn oracle_symbols_drop_the_chain_key_prefix() {
+    assert_eq!(oracle_price_symbol(&native_icp()), "ICP");
+    assert_eq!(oracle_price_symbol(&debt_token()), "USDC");
+    assert_eq!(oracle_price_symbol(&non_native_icp_token()), "BTC");
+}
+
+/// An oracle that fails, standing in for a canister call that cannot be made.
+fn failing_oracle() -> Arc<MockPriceOracle> {
+    let mut oracle = MockPriceOracle::new();
+    oracle
+        .expect_get_price()
+        .returning(|_, _| Err("oracle unavailable".to_string()));
+    Arc::new(oracle)
+}
+
+#[tokio::test]
+async fn live_oracle_price_replaces_a_stale_recorded_price() {
+    // Recorded at $2/ICP, so the snapshot implies 2 ckUSDC and would reject this
+    // quote. The market has since halved: at the live $1/ICP the same quote is
+    // 2.5% *above* the oracle, and the collateral still gets swapped.
+    let icpswap = mock_adapter(ICPSWAP_VENUE_ID, Arc::new(Mutex::new(Vec::new())), |request| {
+        Ok(preview(request, ICPSWAP_VENUE_ID, 10.0, 1_025_000, 1_025_000))
+    });
+
+    let state = IcpswapFirstPlanner::new(vec![Arc::new(icpswap)], production_oracle_config(0.0))
+        .expect("planner")
+        .with_price_oracle(mock_oracle(1, 1))
+        .plan(&native_icp_to_ckusdc_with_oracle(), QUOTED_AT)
+        .await
+        .expect("a quote honest at the live price must not be rejected by a stale one");
+
+    assert_eq!(state.legs[0].quote.estimated_receive.value, Nat::from(1_025_000u64));
+}
+
+#[tokio::test]
+async fn live_oracle_price_rejects_a_quote_the_recorded_price_would_have_accepted() {
+    // The reverse case: recorded at $2/ICP this quote sits inside the limit, but
+    // ICP has since doubled, so 2 ckUSDC for 1 ICP is now 50% below the market.
+    let icpswap = mock_adapter(ICPSWAP_VENUE_ID, Arc::new(Mutex::new(Vec::new())), |request| {
+        Ok(preview(request, ICPSWAP_VENUE_ID, 10.0, 2_000_000, 2_000_000))
+    });
+
+    let error = IcpswapFirstPlanner::new(vec![Arc::new(icpswap)], production_oracle_config(0.0))
+        .expect("planner")
+        .with_price_oracle(mock_oracle(4, 1))
+        .plan(&native_icp_to_ckusdc_with_oracle(), QUOTED_AT)
+        .await
+        .expect_err("the guard must bound the quote against the live price");
+
+    assert!(error.to_string().contains("below oracle-implied output"));
+}
+
+#[tokio::test]
+async fn recorded_price_is_used_while_fresh_when_the_oracle_is_unavailable() {
+    let icpswap = mock_adapter(ICPSWAP_VENUE_ID, Arc::new(Mutex::new(Vec::new())), |request| {
+        Ok(preview(request, ICPSWAP_VENUE_ID, 10.0, 1_500_000, 1_500_000))
+    });
+
+    let error = IcpswapFirstPlanner::new(vec![Arc::new(icpswap)], production_oracle_config(0.0))
+        .expect("planner")
+        .with_price_oracle(failing_oracle())
+        .plan(&native_icp_to_ckusdc_with_oracle(), QUOTED_AT)
+        .await
+        .expect_err("a fresh recorded price still bounds the quote");
+
+    assert!(error.to_string().contains("below oracle-implied output"));
+}
+
+#[tokio::test]
+async fn stale_recorded_price_stands_the_guard_down_instead_of_blocking_the_swap() {
+    // Nothing can price this quote: the oracle is down and the recorded price is
+    // older than the configured window. Blocking here would strand collateral
+    // the liquidation already holds, so the remaining planner checks decide.
+    let icpswap = mock_adapter(ICPSWAP_VENUE_ID, Arc::new(Mutex::new(Vec::new())), |request| {
+        Ok(preview(request, ICPSWAP_VENUE_ID, 10.0, 1_500_000, 1_500_000))
+    });
+    let mut input = native_icp_to_ckusdc_with_oracle();
+    input.reference_price_captured_at = Some(QUOTED_AT - 301);
+
+    let state = IcpswapFirstPlanner::new(vec![Arc::new(icpswap)], production_oracle_config(0.0))
+        .expect("planner")
+        .with_price_oracle(failing_oracle())
+        .plan(&input, QUOTED_AT)
+        .await
+        .expect("an unpriceable plan must fall back to the non-oracle checks");
+
+    assert_eq!(state.legs[0].quote.estimated_receive.value, Nat::from(1_500_000u64));
+}
+
+#[tokio::test]
+async fn an_unknown_recorded_price_age_is_treated_as_stale() {
+    let icpswap = mock_adapter(ICPSWAP_VENUE_ID, Arc::new(Mutex::new(Vec::new())), |request| {
+        Ok(preview(request, ICPSWAP_VENUE_ID, 10.0, 1_500_000, 1_500_000))
+    });
+    let mut input = native_icp_to_ckusdc_with_oracle();
+    input.reference_price_captured_at = None;
+
+    let state = IcpswapFirstPlanner::new(vec![Arc::new(icpswap)], production_oracle_config(0.0))
+        .expect("planner")
+        .with_price_oracle(failing_oracle())
+        .plan(&input, QUOTED_AT)
+        .await
+        .expect("a price that cannot be dated cannot be shown to describe the market");
+
+    assert_eq!(state.legs[0].quote.estimated_receive.value, Nat::from(1_500_000u64));
+}
+
+#[tokio::test]
+async fn one_missing_oracle_side_falls_back_instead_of_mixing_two_instants() {
+    // Only the pay side answers. Pairing a live price with a recorded one would
+    // measure the pair across two different instants, so the read is discarded
+    // and the fresh snapshot decides -- which rejects this quote.
+    let mut oracle = MockPriceOracle::new();
+    oracle
+        .expect_get_price()
+        .with(eq("ICP"), eq(USD_QUOTE_CURRENCY))
+        .returning(|_, _| Ok((Nat::from(RAY), 27)));
+    oracle
+        .expect_get_price()
+        .with(eq("USDC"), eq(USD_QUOTE_CURRENCY))
+        .returning(|_, _| Err("no USDC feed".to_string()));
+
+    let icpswap = mock_adapter(ICPSWAP_VENUE_ID, Arc::new(Mutex::new(Vec::new())), |request| {
+        Ok(preview(request, ICPSWAP_VENUE_ID, 10.0, 1_025_000, 1_025_000))
+    });
+
+    let error = IcpswapFirstPlanner::new(vec![Arc::new(icpswap)], production_oracle_config(0.0))
+        .expect("planner")
+        .with_price_oracle(Arc::new(oracle))
+        .plan(&native_icp_to_ckusdc_with_oracle(), QUOTED_AT)
+        .await
+        .expect_err("a half-answered oracle read must not be used");
+
+    assert!(error.to_string().contains("below oracle-implied output"));
+}
+
+#[tokio::test]
+async fn a_non_positive_live_price_falls_back_to_the_recorded_price() {
+    let icpswap = mock_adapter(ICPSWAP_VENUE_ID, Arc::new(Mutex::new(Vec::new())), |request| {
+        Ok(preview(request, ICPSWAP_VENUE_ID, 10.0, 1_500_000, 1_500_000))
+    });
+
+    let error = IcpswapFirstPlanner::new(vec![Arc::new(icpswap)], production_oracle_config(0.0))
+        .expect("planner")
+        .with_price_oracle(mock_oracle(0, 1))
+        .plan(&native_icp_to_ckusdc_with_oracle(), QUOTED_AT)
+        .await
+        .expect_err("a zero price cannot bound anything, so the snapshot decides");
+
+    assert!(error.to_string().contains("below oracle-implied output"));
+}
+
+#[tokio::test]
+async fn oracle_discount_guard_accepts_quote_within_inclusive_limit() {
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let icpswap = mock_adapter(ICPSWAP_VENUE_ID, calls, |request| {
+        // Oracle output is 2 ckUSDC. Exactly 2% below it is accepted.
+        Ok(preview(request, ICPSWAP_VENUE_ID, 10.0, 1_960_000, 1_950_000))
+    });
+
+    let state = IcpswapFirstPlanner::new(vec![Arc::new(icpswap)], config(0.0))
+        .expect("planner")
+        .plan(&native_icp_to_ckusdc_with_oracle(), 123)
+        .await
+        .expect("boundary quote should pass");
+
+    assert_eq!(state.legs[0].venue_id, ICPSWAP_VENUE_ID);
+}
+
+#[tokio::test]
+async fn production_oracle_discount_accepts_exactly_250_bps_but_rejects_one_native_unit_less() {
+    let exact = mock_adapter(ICPSWAP_VENUE_ID, Arc::new(Mutex::new(Vec::new())), |request| {
+        // Oracle output is 2,000,000 units; 1,950,000 is exactly 2.5% below it.
+        Ok(preview(request, ICPSWAP_VENUE_ID, 10.0, 1_950_000, 1_950_000))
+    });
+    let accepted = IcpswapFirstPlanner::new(vec![Arc::new(exact)], production_oracle_config(0.0))
+        .expect("planner")
+        .plan(&native_icp_to_ckusdc_with_oracle(), 123)
+        .await
+        .expect("the inclusive 250 bps boundary should pass");
+    assert_eq!(accepted.legs[0].quote.estimated_receive.value, Nat::from(1_950_000u64));
+
+    let one_less = mock_adapter(ICPSWAP_VENUE_ID, Arc::new(Mutex::new(Vec::new())), |request| {
+        Ok(preview(request, ICPSWAP_VENUE_ID, 10.0, 1_949_999, 1_949_999))
+    });
+    let error = IcpswapFirstPlanner::new(vec![Arc::new(one_less)], production_oracle_config(0.0))
+        .expect("planner")
+        .plan(&native_icp_to_ckusdc_with_oracle(), 123)
+        .await
+        .expect_err("one native output unit below the boundary must fail");
+    assert!(error.to_string().contains("exceeding the 250 bps limit"));
+}
+
+#[tokio::test]
+async fn oracle_discount_guard_accepts_a_quote_better_than_oracle() {
+    let icpswap = mock_adapter(ICPSWAP_VENUE_ID, Arc::new(Mutex::new(Vec::new())), |request| {
+        Ok(preview(request, ICPSWAP_VENUE_ID, 10.0, 2_100_000, 2_100_000))
+    });
+
+    let state = IcpswapFirstPlanner::new(vec![Arc::new(icpswap)], production_oracle_config(0.0))
+        .expect("planner")
+        .plan(&native_icp_to_ckusdc_with_oracle(), 123)
+        .await
+        .expect("a better-than-oracle quote should pass the one-sided guard");
+
+    assert_eq!(state.legs[0].quote.estimated_receive.value, Nat::from(2_100_000u64));
+}
+
+/// A forced leg under $10 is too small for the guard to price, so it is waived.
+/// The MEXC remainder holds the rest of the collateral and stays checked, which
+/// `forced_test_split_rejects_a_bad_mexc_leg_even_when_icpswap_is_valid` covers.
+#[tokio::test]
+async fn forced_test_split_waives_the_oracle_guard_for_a_sub_ten_dollar_icpswap_leg() {
+    let icpswap = mock_adapter(ICPSWAP_VENUE_ID, Arc::new(Mutex::new(Vec::new())), |request| {
+        // The $1 leg is 0.1 ICP, whose oracle output is 200,000 ckUSDC units.
+        // 194,999 is past the 250 bps limit and would be rejected at full size.
+        Ok(preview(request, ICPSWAP_VENUE_ID, 10.0, 194_999, 194_999))
+    });
+    let mexc = mock_adapter(MEXC_VENUE_ID, Arc::new(Mutex::new(Vec::new())), |request| {
+        Ok(preview(request, MEXC_VENUE_ID, 0.0, 1_800_000, 1_800_000))
+    });
+    let mut planner_config = production_oracle_config(8.0);
+    planner_config.icpswap_test_allocation_usd = Some(1.0);
+
+    let state = planner(icpswap, mexc, planner_config)
+        .plan(&native_icp_to_ckusdc_with_oracle(), QUOTED_AT)
+        .await
+        .expect("a sub-$10 forced leg is exempt from the oracle guard");
+
+    assert_eq!(state.legs.len(), 2);
+    assert_eq!(state.legs[0].quote.estimated_receive.value, Nat::from(194_999u64));
+    assert_eq!(state.legs[1].venue_id, MEXC_VENUE_ID);
+}
+
+#[tokio::test]
+async fn forced_test_split_still_guards_a_ten_dollar_icpswap_leg() {
+    let icpswap = mock_adapter(ICPSWAP_VENUE_ID, Arc::new(Mutex::new(Vec::new())), |request| {
+        // The $10 leg is 1 ICP, whose oracle output is 2,000,000 ckUSDC units.
+        Ok(preview(request, ICPSWAP_VENUE_ID, 10.0, 1_900_000, 1_900_000))
+    });
+    let mexc = mock_adapter(MEXC_VENUE_ID, Arc::new(Mutex::new(Vec::new())), |request| {
+        Ok(preview(request, MEXC_VENUE_ID, 0.0, 8_000_000, 8_000_000))
+    });
+    let mut planner_config = production_oracle_config(8.0);
+    planner_config.icpswap_test_allocation_usd = Some(10.0);
+    // 5 ICP at $10 leaves a $40 MEXC remainder after the $10 forced leg.
+    let mut input = native_icp_to_ckusdc_with_oracle();
+    input.total_pay.value = Nat::from(500_000_000u64);
+
+    let error = planner(icpswap, mexc, planner_config)
+        .plan(&input, QUOTED_AT)
+        .await
+        .expect_err("at $10 the forced leg is priced by the guard again");
+
+    assert!(error.to_string().contains("icpswap quote is"));
+    assert!(error.to_string().contains("250 bps limit"));
+}
+
+#[tokio::test]
+async fn forced_test_split_rejects_a_bad_mexc_leg_even_when_icpswap_is_valid() {
+    let icpswap = mock_adapter(ICPSWAP_VENUE_ID, Arc::new(Mutex::new(Vec::new())), |request| {
+        Ok(preview(request, ICPSWAP_VENUE_ID, 10.0, 200_000, 200_000))
+    });
+    let mexc = mock_adapter(MEXC_VENUE_ID, Arc::new(Mutex::new(Vec::new())), |request| {
+        // The remainder is 0.9 ICP, whose oracle output is 1,800,000 units.
+        Ok(preview(request, MEXC_VENUE_ID, 0.0, 1_754_999, 1_754_999))
+    });
+    let mut planner_config = production_oracle_config(8.0);
+    planner_config.icpswap_test_allocation_usd = Some(1.0);
+
+    let error = planner(icpswap, mexc, planner_config)
+        .plan(&native_icp_to_ckusdc_with_oracle(), 123)
+        .await
+        .expect_err("a rejected MEXC leg must prevent the forced split");
+
+    assert!(error.to_string().contains("MEXC quote rejected"));
+    assert!(error.to_string().contains("250 bps limit"));
+}
+
+#[tokio::test]
+async fn legacy_receipt_without_debt_oracle_price_skips_only_the_oracle_guard() {
+    let collateral = native_icp();
+    let debt = debt_token();
+    let receipt = ExecutionReceipt {
+        request: ExecutorRequest {
+            liquidation: LiquidationRequest {
+                borrower: Principal::anonymous(),
+                debt_pool_id: Principal::anonymous(),
+                collateral_pool_id: Principal::anonymous(),
+                debt_amount: Nat::from(1_000_000u64),
+                receiver_address: Principal::anonymous(),
+                buy_bad_debt: false,
+            },
+            swap_args: Some(SwapRequest {
+                pay_asset: collateral.asset_id(),
+                pay_amount: ChainTokenAmount::from_raw(collateral.clone(), Nat::from(1u8)),
+                receive_asset: debt.asset_id(),
+                receive_address: Some("receiver".to_string()),
+                max_slippage_bps: Some(500),
+                venue_hint: None,
+            }),
+            debt_asset: debt,
+            collateral_asset: collateral,
+            expected_profit: 0,
+            ref_price: Nat::from(2 * RAY),
+            debt_ref_price: Nat::from(0u8),
+            ref_price_at: 0,
+            debt_approval_needed: false,
+            min_collateral_amount: Nat::from(0u8),
+        },
+        liquidation_result: Some(LiquidationResult {
+            id: 1,
+            timestamp: 0,
+            amounts: LiquidationAmounts {
+                collateral_received: Nat::from(TOTAL_PAY),
+                debt_repaid: Nat::from(1_000_000u64),
+            },
+            collateral_asset: AssetType::Unknown,
+            debt_asset: AssetType::Unknown,
+            status: LiquidationStatus::Success,
+            change_tx: TxStatus {
+                tx_id: None,
+                status: TransferStatus::Success,
+            },
+            collateral_tx: TxStatus {
+                tx_id: None,
+                status: TransferStatus::Success,
+            },
+        }),
+        status: ExecutionStatus::Success,
+        change_received: true,
+    };
+    let input = IcpswapFirstPlanInput::from_receipt(&receipt).expect("legacy planner input");
+    assert_eq!(input.pay_reference_price_ray, None);
+    assert_eq!(input.receive_reference_price_ray, None);
+
+    let icpswap = mock_adapter(ICPSWAP_VENUE_ID, Arc::new(Mutex::new(Vec::new())), |request| {
+        // This would be 25% below the 2 ICP -> 2 ckUSDC oracle output if the
+        // missing receive-side oracle price had been available.
+        Ok(preview(request, ICPSWAP_VENUE_ID, 10.0, 1_500_000, 1_500_000))
+    });
+    let state = IcpswapFirstPlanner::new(vec![Arc::new(icpswap)], production_oracle_config(0.0))
+        .expect("planner")
+        .plan(&input, 123)
+        .await
+        .expect("legacy receipt should retain non-oracle planner protections");
+
+    assert_eq!(state.legs[0].quote.estimated_receive.value, Nat::from(1_500_000u64));
+    assert!(state.plan.combined_net_edge_bps >= 1_500.0);
+}
+
+#[tokio::test]
+async fn oracle_discount_guard_handles_ckusdc_to_icp_decimals_and_direction() {
+    let mut input = ckusdc_to_native_icp_input();
+    input.debt_repaid.value = Nat::from(4_000_000_000u64);
+    input.pay_reference_price_ray = Some(Nat::from(RAY));
+    input.receive_reference_price_ray = Some(Nat::from(2 * RAY));
+    let icpswap = mock_adapter(ICPSWAP_VENUE_ID, Arc::new(Mutex::new(Vec::new())), |request| {
+        let mut route = preview(request, ICPSWAP_VENUE_ID, 10.0, 4_950_000_000, 4_900_000_000);
+        route.conservative_receive.token = native_icp();
+        Ok(route)
+    });
+
+    let state = IcpswapFirstPlanner::new(vec![Arc::new(icpswap)], config(0.0))
+        .expect("planner")
+        .plan(&input, 123)
+        .await
+        .expect("reverse quote within oracle limit should pass");
+
+    assert_eq!(state.legs[0].venue_id, ICPSWAP_VENUE_ID);
+}
+
+#[tokio::test]
 async fn malformed_icpswap_preview_is_dropped_and_mexc_remains_available() {
     let icpswap = mock_adapter(ICPSWAP_VENUE_ID, Arc::new(Mutex::new(Vec::new())), |request| {
         let mut preview = proportional_preview(request, ICPSWAP_VENUE_ID, 99.0, 2);
@@ -1325,4 +1944,102 @@ async fn planning_fails_when_every_quote_is_invalid() {
 
     assert!(matches!(error, IcpswapFirstPlannerError::NoViableRoute(_)));
     assert!(error.to_string().contains("quote rejected"));
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(64))]
+
+    #[test]
+    fn oracle_guard_is_exact_across_generated_decimals_and_both_directions(
+        pay_decimals in 0u8..=12,
+        receive_decimals in 0u8..=12,
+        whole_pay in 1u64..=100,
+        pay_price in 1u64..=20,
+        receive_price in 1u64..=20,
+        reverse in any::<bool>(),
+    ) {
+        let mut pay_token = if reverse { debt_token() } else { native_icp() };
+        let mut receive_token = if reverse { native_icp() } else { debt_token() };
+        let ChainToken::Icp { decimals, .. } = &mut pay_token else {
+            unreachable!("test tokens are ICP-family tokens")
+        };
+        *decimals = pay_decimals;
+        let ChainToken::Icp { decimals, .. } = &mut receive_token else {
+            unreachable!("test tokens are ICP-family tokens")
+        };
+        *decimals = receive_decimals;
+
+        let pay_scale = 10u64.pow(u32::from(pay_decimals));
+        let receive_scale = 10u64.pow(u32::from(receive_decimals));
+        let pay_value = whole_pay.checked_mul(pay_scale).expect("generated pay fits u64");
+        let oracle_output = u128::from(whole_pay) * u128::from(pay_price) * u128::from(receive_scale)
+            / u128::from(receive_price);
+        prop_assume!(oracle_output <= u128::from(u64::MAX));
+        let oracle_output = oracle_output as u64;
+
+        // The validator compares actual*10,000 with oracle*9,750. Therefore
+        // the smallest accepted integer amount is the ceiling of that ratio.
+        let minimum_accepted = (u128::from(oracle_output) * 9_750 + 9_999) / 10_000;
+        prop_assume!(minimum_accepted >= 2 && minimum_accepted <= u128::from(u64::MAX));
+        let minimum_accepted = minimum_accepted as u64;
+
+        let make_input = || IcpswapFirstPlanInput {
+            liquidation_id: "42".to_string(),
+            total_pay: ChainTokenAmount::from_raw(pay_token.clone(), Nat::from(pay_value)),
+            receive_asset: receive_token.asset_id(),
+            debt_repaid: ChainTokenAmount::from_raw(receive_token.clone(), Nat::from(1u8)),
+            receive_address: Some("receiver".to_string()),
+            max_execution_slippage_bps: Some(500),
+            pay_reference_price_usd: Some(pay_price as f64),
+            pay_reference_price_ray: Some(Nat::from(u128::from(pay_price) * RAY)),
+            receive_reference_price_ray: Some(Nat::from(u128::from(receive_price) * RAY)),
+            reference_price_captured_at: Some(QUOTED_AT),
+        };
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+
+        let accepted_receive_token = receive_token.clone();
+        let accepted_adapter = mock_adapter(ICPSWAP_VENUE_ID, Arc::new(Mutex::new(Vec::new())), move |request| {
+            let mut route = preview(
+                request,
+                ICPSWAP_VENUE_ID,
+                10.0,
+                minimum_accepted,
+                minimum_accepted,
+            );
+            route.conservative_receive.token = accepted_receive_token.clone();
+            Ok(route)
+        });
+        let accepted = runtime.block_on(async {
+            IcpswapFirstPlanner::new(vec![Arc::new(accepted_adapter)], production_oracle_config(0.0))
+                .expect("planner")
+                .plan(&make_input(), 123)
+                .await
+        });
+        prop_assert!(accepted.is_ok(), "minimum integer boundary should pass: {accepted:?}");
+
+        let rejected_amount = minimum_accepted - 1;
+        let rejected_receive_token = receive_token.clone();
+        let rejected_adapter = mock_adapter(ICPSWAP_VENUE_ID, Arc::new(Mutex::new(Vec::new())), move |request| {
+            let mut route = preview(
+                request,
+                ICPSWAP_VENUE_ID,
+                10.0,
+                rejected_amount,
+                rejected_amount,
+            );
+            route.conservative_receive.token = rejected_receive_token.clone();
+            Ok(route)
+        });
+        let rejected = runtime.block_on(async {
+            IcpswapFirstPlanner::new(vec![Arc::new(rejected_adapter)], production_oracle_config(0.0))
+                .expect("planner")
+                .plan(&make_input(), 123)
+                .await
+        });
+        prop_assert!(rejected.is_err(), "one unit below the integer boundary must fail");
+        prop_assert!(rejected.unwrap_err().to_string().contains("250 bps limit"));
+    }
 }

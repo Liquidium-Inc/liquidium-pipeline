@@ -156,6 +156,10 @@ ENABLED_SWAP_VENUES=icpswap,mexc
 
 # Optional test-only split override. Unset in production.
 # Sends approximately $1 of native ICP to ICPSwap and the remainder to MEXC.
+# Below $10 the forced leg's quote is NOT checked against the oracle: its three
+# fixed ledger fees are a larger share of the leg than the whole discount budget,
+# so the check cannot judge the price. The remainder leg is still checked, and a
+# loud warning is logged at startup whenever this waiver is active.
 ICPSWAP_TEST_ALLOCATION_USD=1
 # Allow full ICPSwap up to 1.5% impact only when the MEXC remainder is dust.
 ICPSWAP_DUST_FALLBACK_MAX_PRICE_IMPACT_BPS=150
@@ -188,8 +192,12 @@ CEX_BUY_INVERSE_ENABLED=true
 # Retry backoff base and cap (seconds) for retryable CEX errors
 CEX_RETRY_BASE_SECS=5
 CEX_RETRY_MAX_SECS=120
-# Minimum projected net edge required before executing on CEX (bps)
-CEX_MIN_NET_EDGE_BPS=150
+# Minimum projected net edge required before executing any venue plan (bps)
+MULTI_VENUE_MIN_NET_EDGE_BPS=150
+# Reject a venue quote this far below the oracle-implied output (bps)
+MULTI_VENUE_MAX_ORACLE_DISCOUNT_BPS=250
+# How long a price recorded on a receipt may stand in for a live oracle read (seconds)
+MULTI_VENUE_ORACLE_SNAPSHOT_MAX_AGE_SECS=300
 # Additional latency-risk haircut applied to projected edge (bps)
 CEX_DELAY_BUFFER_BPS=75
 # Estimated route fee haircut applied to projected edge (bps)
@@ -212,7 +220,9 @@ Quick reference:
 | `CEX_BUY_INVERSE_ENABLED` | Master toggle for adaptive buy fallback. |
 | `CEX_RETRY_BASE_SECS` | Initial retry delay after retryable CEX errors. |
 | `CEX_RETRY_MAX_SECS` | Maximum retry delay cap. |
-| `CEX_MIN_NET_EDGE_BPS` | Minimum projected edge needed before choosing CEX path. |
+| `MULTI_VENUE_MIN_NET_EDGE_BPS` | Minimum conservative edge required for any ICPSwap, MEXC, or split plan. |
+| `MULTI_VENUE_MAX_ORACLE_DISCOUNT_BPS` | Maximum amount any venue quote may fall below the oracle-implied output. Values at or above 10000 would accept anything, so they fall back to the default. |
+| `MULTI_VENUE_ORACLE_SNAPSHOT_MAX_AGE_SECS` | How stale a price recorded at detection may be before it stops standing in for a failed live oracle read. Past this age the quote guard stands down rather than block a liquidation that already holds collateral. |
 | `CEX_DELAY_BUFFER_BPS` | Extra haircut for execution-latency/price-move risk. |
 | `CEX_ROUTE_FEE_BPS` | Fee haircut applied during route edge estimation. |
 | `CEX_MEXC_AVAILABLE_PAIRS` | Configured market universe used for direct/hop route discovery. |

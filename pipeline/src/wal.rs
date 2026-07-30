@@ -162,6 +162,8 @@ mod tests {
             collateral_asset: collateral,
             expected_profit: 1,
             ref_price: Nat::from(1u64),
+            debt_ref_price: Nat::from(0u8),
+            ref_price_at: 0,
             debt_approval_needed: false,
             min_collateral_amount: Nat::from(0u8),
         };
@@ -380,13 +382,14 @@ mod tests {
     }
 
     #[test]
-    fn decode_legacy_receipt_defaults_missing_min_collateral_amount() {
+    fn decode_legacy_receipt_defaults_missing_request_fields() {
         let receipt = make_receipt();
         let mut legacy = serde_json::to_value(&receipt).expect("receipt json value should serialize");
         let request = legacy["request"]
             .as_object_mut()
             .expect("legacy request should be object");
         request.remove("min_collateral_amount");
+        request.remove("debt_ref_price");
 
         let row = make_row(legacy.to_string());
         let wrapper = decode_receipt_wrapper(&row)
@@ -394,5 +397,6 @@ mod tests {
             .expect("wrapper should exist");
 
         assert_eq!(wrapper.receipt.request.min_collateral_amount, Nat::from(0u8));
+        assert_eq!(wrapper.receipt.request.debt_ref_price, Nat::from(0u8));
     }
 }

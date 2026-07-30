@@ -1,16 +1,21 @@
 use std::{cmp::max, sync::Arc};
 
 use candid::Nat;
-use liquidium_pipeline_core::tokens::{asset_id::AssetId, chain_token_amount::ChainTokenAmount};
+use liquidium_pipeline_core::tokens::{
+    asset_id::AssetId, chain_token::ChainToken, chain_token_amount::ChainTokenAmount,
+};
 use num_traits::ToPrimitive;
 use thiserror::Error;
+use tracing::{debug, warn};
 
 use crate::{
     finalizers::multi_venue::{MultiVenueAdapter, VenuePlanningContext, VenueRoutePreview},
+    liquidation::{collateral_service::USD_QUOTE_CURRENCY, liquidation_math::oracle_implied_output},
     persistance::{
         MultiVenueAllocationReason, MultiVenueExecutionOutcome, MultiVenueExecutionPlan, MultiVenueExecutionState,
         VenueLegState,
     },
+    price_oracle::price_oracle::PriceOracle,
     stages::executor::{ExecutionReceipt, ExecutionStatus},
     swappers::{icpswap::supports_pair, model::SwapRequest},
 };
@@ -26,6 +31,9 @@ pub const MEXC_VENUE_ID: &str = "mexc";
 
 pub(super) const BPS_DENOMINATOR: u32 = 10_000;
 const RAY_PRICE_SCALE: f64 = 1e27;
+/// Smallest forced ICPSwap test allocation the oracle quote guard is applied to,
+/// in USD. See `oracle_guard_waived_for_test_leg`.
+const ORACLE_GUARD_MIN_TEST_ALLOCATION_USD: f64 = 10.0;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct IcpswapFirstPlannerConfig {
@@ -34,6 +42,10 @@ pub struct IcpswapFirstPlannerConfig {
     pub dust_fallback_max_price_impact_bps: f64,
     pub cex_min_exec_usd: f64,
     pub min_net_edge_bps: u32,
+    pub max_oracle_discount_bps: u32,
+    /// How old a recorded price may be, in seconds, before the guard stops using
+    /// it as a fallback for a live oracle read.
+    pub oracle_snapshot_max_age_secs: i64,
     pub icpswap_test_allocation_usd: Option<f64>,
 }
 
@@ -70,6 +82,30 @@ impl IcpswapFirstPlannerConfig {
                 self.min_net_edge_bps, BPS_DENOMINATOR
             )));
         }
+        // A discount of exactly BPS_DENOMINATOR permits any output at all, which
+        // silently disables the guard rather than loosening it.
+        if self.max_oracle_discount_bps >= BPS_DENOMINATOR {
+            return Err(IcpswapFirstPlannerError::InvalidInput(format!(
+                "maximum oracle discount {} bps must stay below {} bps",
+                self.max_oracle_discount_bps, BPS_DENOMINATOR
+            )));
+        }
+        // A venue's reported price impact already includes its pool fee, because
+        // impact is measured against a fee-free pool spot. The oracle guard sees
+        // that same shortfall plus the input ledger fees and the pool-versus-
+        // oracle basis, so its limit has to sit above the impact caps or it would
+        // reject the quotes those caps deliberately allow.
+        if f64::from(self.max_oracle_discount_bps) <= self.dust_fallback_max_price_impact_bps {
+            return Err(IcpswapFirstPlannerError::InvalidInput(format!(
+                "maximum oracle discount {} bps must exceed the {:.2} bps dust fallback impact cap",
+                self.max_oracle_discount_bps, self.dust_fallback_max_price_impact_bps
+            )));
+        }
+        if self.oracle_snapshot_max_age_secs < 0 {
+            return Err(IcpswapFirstPlannerError::InvalidInput(
+                "oracle snapshot max age must not be negative".to_string(),
+            ));
+        }
         if let Some(value) = self.icpswap_test_allocation_usd
             && (!value.is_finite() || value <= 0.0)
         {
@@ -93,6 +129,14 @@ pub struct IcpswapFirstPlanInput {
     /// price. Absent must stay absent rather than collapse to `0.0`, because a
     /// zero price makes every notional look below the CEX minimum.
     pub pay_reference_price_usd: Option<f64>,
+    /// Raw RAY oracle prices retained for exact, direction-neutral venue quote
+    /// validation. Missing values are supported for legacy WAL receipts.
+    pub pay_reference_price_ray: Option<Nat>,
+    pub receive_reference_price_ray: Option<Nat>,
+    /// Unix seconds when the prices above were recorded, or `None` when the
+    /// receipt predates the field. Used to decide whether they are still fresh
+    /// enough to bound a venue quote.
+    pub reference_price_captured_at: Option<i64>,
 }
 
 impl IcpswapFirstPlanInput {
@@ -127,6 +171,13 @@ impl IcpswapFirstPlanInput {
             ));
         }
         let pay_reference_price_usd = reference_price_usd(&receipt.request.ref_price);
+        let (pay_reference_price_ray, receive_reference_price_ray) = match (
+            positive_price(&receipt.request.ref_price),
+            positive_price(&receipt.request.debt_ref_price),
+        ) {
+            (Some(pay), Some(receive)) => (Some(pay), Some(receive)),
+            _ => (None, None),
+        };
 
         let input = Self {
             liquidation_id: liquidation.id.to_string(),
@@ -136,6 +187,9 @@ impl IcpswapFirstPlanInput {
             receive_address: swap.receive_address.clone(),
             max_execution_slippage_bps: swap.max_slippage_bps,
             pay_reference_price_usd,
+            pay_reference_price_ray,
+            receive_reference_price_ray,
+            reference_price_captured_at: (receipt.request.ref_price_at > 0).then_some(receipt.request.ref_price_at),
         };
         input.validate()?;
         Ok(input)
@@ -174,6 +228,11 @@ impl IcpswapFirstPlanInput {
         {
             return Err(IcpswapFirstPlannerError::InvalidInput(
                 "pay reference price must be finite and positive when present".to_string(),
+            ));
+        }
+        if self.pay_reference_price_ray.is_some() != self.receive_reference_price_ray.is_some() {
+            return Err(IcpswapFirstPlannerError::InvalidInput(
+                "oracle pay and receive prices must either both be present or both be absent".to_string(),
             ));
         }
         Ok(())
@@ -227,6 +286,43 @@ pub(in crate::finalizers::multi_venue) fn reference_price_usd(ref_price_ray: &Na
     (price.is_finite() && price > 0.0).then_some(price)
 }
 
+fn positive_price(price_ray: &Nat) -> Option<Nat> {
+    (price_ray > &Nat::from(0u8)).then(|| price_ray.clone())
+}
+
+/// Startup notice that a configured test allocation has switched the oracle
+/// quote guard off for that leg. Loud on purpose: it is a live routing setting,
+/// not a test-harness flag, so it can reach production unnoticed.
+pub(in crate::finalizers::multi_venue) fn oracle_guard_waiver_banner(target_usd: f64) -> String {
+    let rule = "=".repeat(66);
+    format!(
+        "\n{rule}\n\
+         ⚠️  ORACLE QUOTE GUARD DISABLED FOR THE ICPSWAP TEST LEG  ⚠️\n\
+         {rule}\n\
+         ICPSWAP_TEST_ALLOCATION_USD=${target_usd:.2} is below the \
+         ${ORACLE_GUARD_MIN_TEST_ALLOCATION_USD:.2} minimum, so that leg's\n\
+         quote is NOT priced against the oracle on any liquidation. At this size\n\
+         its fixed ledger fees are a larger share of the leg than the whole\n\
+         discount budget, so the check cannot say anything about the price.\n\
+         The overflow remainder is still checked. Raise the allocation to \
+         ${ORACLE_GUARD_MIN_TEST_ALLOCATION_USD:.2} or\n\
+         clear ICPSWAP_TEST_ALLOCATION_USD to price every leg again.\n\
+         {rule}"
+    )
+}
+
+/// Maps a ledger token onto the symbol the price oracle is keyed by.
+///
+/// The registry names chain-key wrappers after their ledger (`ckUSDC`) while the
+/// oracle prices the underlying asset (`USDC`), so the prefix is stripped here.
+pub(in crate::finalizers::multi_venue) fn oracle_price_symbol(token: &ChainToken) -> String {
+    let symbol = token.symbol();
+    match symbol.strip_prefix("ck") {
+        Some(underlying) if !underlying.is_empty() => underlying.to_string(),
+        _ => symbol,
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum IcpswapFirstPlannerError {
     #[error("invalid ICPSwap-first planner input: {0}")]
@@ -239,6 +335,7 @@ pub struct IcpswapFirstPlanner {
     venues: Arc<VenueRegistry>,
     overflow_venue_ids: Vec<String>,
     config: IcpswapFirstPlannerConfig,
+    price_oracle: Option<Arc<dyn PriceOracle>>,
 }
 
 impl IcpswapFirstPlanner {
@@ -258,6 +355,11 @@ impl IcpswapFirstPlanner {
         config: IcpswapFirstPlannerConfig,
     ) -> Result<Self, IcpswapFirstPlannerError> {
         config.validate()?;
+        if let Some(target_usd) = config.icpswap_test_allocation_usd
+            && target_usd < ORACLE_GUARD_MIN_TEST_ALLOCATION_USD
+        {
+            warn!("{}", oracle_guard_waiver_banner(target_usd));
+        }
         let overflow_venue_ids = venues
             .venue_ids()
             .into_iter()
@@ -267,7 +369,16 @@ impl IcpswapFirstPlanner {
             venues,
             overflow_venue_ids,
             config,
+            price_oracle: None,
         })
+    }
+
+    /// Supplies the oracle the venue guard reads at planning time. Without one
+    /// the guard falls back to the receipt prices while they are younger than
+    /// `oracle_snapshot_max_age_secs`.
+    pub(in crate::finalizers::multi_venue) fn with_price_oracle(mut self, price_oracle: Arc<dyn PriceOracle>) -> Self {
+        self.price_oracle = Some(price_oracle);
+        self
     }
 
     /// Quotes eligible venues and applies the ICPSwap-first allocation policy
@@ -278,6 +389,11 @@ impl IcpswapFirstPlanner {
         quoted_at: i64,
     ) -> Result<MultiVenueExecutionState, IcpswapFirstPlannerError> {
         input.validate()?;
+
+        // Resolve the guard's oracle prices once, before any venue is quoted, so
+        // every leg of one plan is bounded against the same reference.
+        let resolved = self.resolve_oracle_prices(input, quoted_at).await;
+        let input = &resolved;
         let context = input.planning_context();
 
         if !input.is_icpswap_supported_pair() || !self.venues.contains(ICPSWAP_VENUE_ID) {
@@ -298,7 +414,7 @@ impl IcpswapFirstPlanner {
             })
             .await
             .map_err(IcpswapFirstPlannerError::InvalidInput)?;
-        let quotes = self.drop_invalid_quotes(quotes);
+        let quotes = self.drop_invalid_quotes(input, quotes);
         let icpswap = quotes
             .get(ICPSWAP_VENUE_ID)
             .ok_or_else(|| IcpswapFirstPlannerError::InvalidInput("ICPSwap full preview is missing".to_string()))?;
@@ -385,8 +501,21 @@ impl IcpswapFirstPlanner {
         }
 
         let icpswap_request = input.request_for(ICPSWAP_VENUE_ID, icpswap_value);
+        // Only the forced leg is exempted; the MEXC remainder holds the bulk of
+        // the collateral and is large enough for the guard to mean something.
+        let unguarded_input = self.oracle_guard_waived_for_test_leg(target_usd).then(|| {
+            warn!(
+                "[multi-venue] liq_id={} oracle quote guard waived for the ${target_usd:.2} ICPSwap test leg",
+                input.liquidation_id
+            );
+            let mut unguarded = input.clone();
+            unguarded.pay_reference_price_ray = None;
+            unguarded.receive_reference_price_ray = None;
+            unguarded
+        });
+        let icpswap_input = unguarded_input.as_ref().unwrap_or(input);
         let (icpswap_result, overflow_result) = tokio::join!(
-            self.preview_exact(input, ICPSWAP_VENUE_ID, &icpswap_request),
+            self.preview_exact(icpswap_input, ICPSWAP_VENUE_ID, &icpswap_request),
             self.preview_overflow(input, remainder_value),
         );
         let icpswap = icpswap_result?;
@@ -639,6 +768,18 @@ impl IcpswapFirstPlanner {
         Ok(last_safe)
     }
 
+    /// Whether the forced test leg is too small for the oracle guard to say
+    /// anything about its price.
+    ///
+    /// ICPSwap reserves three input ledger fees before the pool sees the money,
+    /// and the guard measures against the whole allocation. That gap is a share
+    /// of the leg, so on a small one it can exceed the entire discount budget by
+    /// itself -- three ckUSDC transfers are 3% of a $1 leg -- and the guard would
+    /// reject a quote priced perfectly.
+    fn oracle_guard_waived_for_test_leg(&self, target_usd: f64) -> bool {
+        target_usd < ORACLE_GUARD_MIN_TEST_ALLOCATION_USD
+    }
+
     // The threshold is strict: exactly 100 bps is not below a 100 bps limit.
     fn is_safe_icpswap(&self, preview: &VenueRoutePreview) -> bool {
         preview.quote.estimated_price_impact_bps < self.config.max_price_impact_bps
@@ -665,7 +806,7 @@ impl IcpswapFirstPlanner {
         let preview = adapter.preview(&context, request).await.map_err(|error| {
             IcpswapFirstPlannerError::NoViableRoute(format!("{} preview failed: {error}", adapter.venue_id()))
         })?;
-        validate_preview(adapter.venue_id(), request, &preview)?;
+        self.validate_venue_preview(input, adapter.venue_id(), request, &preview)?;
         Ok(preview)
     }
 
@@ -684,17 +825,17 @@ impl IcpswapFirstPlanner {
             })
             .await
             .map_err(IcpswapFirstPlannerError::InvalidInput)?;
-        Ok(self.drop_invalid_quotes(quotes))
+        Ok(self.drop_invalid_quotes(input, quotes))
     }
 
     // Converts malformed responses into per-venue Invalid outcomes so one bad
     // quote cannot prevent valid venues from being considered.
-    fn drop_invalid_quotes(&self, mut quotes: VenueQuoteBook) -> VenueQuoteBook {
+    fn drop_invalid_quotes(&self, input: &IcpswapFirstPlanInput, mut quotes: VenueQuoteBook) -> VenueQuoteBook {
         for venue in quotes.iter_mut() {
             let validation_error = match &venue.outcome {
-                VenuePreviewOutcome::Quoted(preview) => {
-                    validate_preview(&venue.venue_id, &venue.request, preview).err()
-                }
+                VenuePreviewOutcome::Quoted(preview) => self
+                    .validate_venue_preview(input, &venue.venue_id, &venue.request, preview)
+                    .err(),
                 VenuePreviewOutcome::Unavailable(_) | VenuePreviewOutcome::Invalid(_) => None,
             };
             if let Some(error) = validation_error {
@@ -702,6 +843,143 @@ impl IcpswapFirstPlanner {
             }
         }
         quotes
+    }
+
+    /// Prefers a live oracle read over the prices recorded on the receipt.
+    ///
+    /// The recorded prices are captured before the liquidation executes, so by
+    /// planning time the market may have moved and a one-sided guard would
+    /// reject quotes that are honest at the current price. They are used only as
+    /// a fallback, and only while young enough; past that the guard stands down
+    /// instead of blocking collateral the liquidation already holds.
+    async fn resolve_oracle_prices(&self, input: &IcpswapFirstPlanInput, quoted_at: i64) -> IcpswapFirstPlanInput {
+        let mut resolved = input.clone();
+        if let Some((pay_price, receive_price)) = self.live_oracle_prices(input).await {
+            debug!(
+                "[multi-venue] liq_id={} using live oracle prices for the venue quote guard",
+                input.liquidation_id
+            );
+            resolved.pay_reference_price_ray = Some(pay_price);
+            resolved.receive_reference_price_ray = Some(receive_price);
+            return resolved;
+        }
+        if resolved.pay_reference_price_ray.is_none() {
+            return resolved;
+        }
+
+        // An unknown capture time is treated as too old: it cannot be shown to
+        // describe the current market.
+        let age_secs = input
+            .reference_price_captured_at
+            .map(|captured_at| quoted_at.saturating_sub(captured_at));
+        match age_secs {
+            Some(age) if age <= self.config.oracle_snapshot_max_age_secs => {
+                debug!(
+                    "[multi-venue] liq_id={} oracle unavailable; using recorded prices from {age}s ago",
+                    input.liquidation_id
+                );
+            }
+            _ => {
+                warn!(
+                    "[multi-venue] liq_id={} oracle unavailable and recorded prices are stale (age={:?}s, max={}s); skipping the venue quote oracle guard",
+                    input.liquidation_id, age_secs, self.config.oracle_snapshot_max_age_secs
+                );
+                resolved.pay_reference_price_ray = None;
+                resolved.receive_reference_price_ray = None;
+            }
+        }
+        resolved
+    }
+
+    /// Reads both sides of the pair from the oracle, or `None` when no oracle is
+    /// configured, or when either price is missing or unusable. A partial answer
+    /// is never mixed with a recorded price: the two must describe one instant.
+    async fn live_oracle_prices(&self, input: &IcpswapFirstPlanInput) -> Option<(Nat, Nat)> {
+        let oracle = self.price_oracle.as_ref()?;
+        let pay_symbol = oracle_price_symbol(&input.total_pay.token);
+        let receive_symbol = oracle_price_symbol(&input.debt_repaid.token);
+        let (pay, receive) = tokio::join!(
+            oracle.get_price(&pay_symbol, USD_QUOTE_CURRENCY),
+            oracle.get_price(&receive_symbol, USD_QUOTE_CURRENCY),
+        );
+        match (pay, receive) {
+            (Ok((pay_price, _)), Ok((receive_price, _))) => {
+                match (positive_price(&pay_price), positive_price(&receive_price)) {
+                    (Some(pay_price), Some(receive_price)) => Some((pay_price, receive_price)),
+                    _ => {
+                        warn!(
+                            "[multi-venue] liq_id={} oracle returned a non-positive price for {pay_symbol} or {receive_symbol}",
+                            input.liquidation_id
+                        );
+                        None
+                    }
+                }
+            }
+            (pay, receive) => {
+                warn!(
+                    "[multi-venue] liq_id={} live oracle read failed ({pay_symbol}: {:?}, {receive_symbol}: {:?})",
+                    input.liquidation_id,
+                    pay.err(),
+                    receive.err()
+                );
+                None
+            }
+        }
+    }
+
+    /// Checks every venue quote in one place, including ICPSwap and MEXC.
+    ///
+    /// The quote must match what was asked for and must not sit far below the
+    /// oracle-implied output. Venue code only builds the quote, so no venue can
+    /// skip either half.
+    ///
+    /// The bound applies to the estimated output. `meets_minimum_edge` is the
+    /// floor on the conservative output, which legitimately sits an execution
+    /// slippage and a ledger fee below the estimate.
+    fn validate_venue_preview(
+        &self,
+        input: &IcpswapFirstPlanInput,
+        venue_id: &str,
+        request: &SwapRequest,
+        preview: &VenueRoutePreview,
+    ) -> Result<(), IcpswapFirstPlannerError> {
+        // Reject a malformed quote or one that belongs to a different request.
+        validate_preview(venue_id, request, preview)?;
+
+        // With no usable oracle prices there is nothing to compare against.
+        let Some(oracle_output) = oracle_expected_output(input, request, preview)? else {
+            return Ok(());
+        };
+        // A zero baseline cannot express a meaningful minimum output.
+        if oracle_output == Nat::from(0u8) {
+            return Ok(());
+        }
+
+        // With a 250 bps limit the quote must return at least 9,750 / 10,000 of
+        // the oracle-implied output. Both sides are multiplied out so the
+        // decision stays in exact integer token units.
+        let allowed_bps = BPS_DENOMINATOR - self.config.max_oracle_discount_bps;
+        let actual_scaled = preview.quote.receive_amount.clone() * Nat::from(BPS_DENOMINATOR);
+        let minimum_scaled = oracle_output.clone() * Nat::from(allowed_bps);
+        if actual_scaled >= minimum_scaled {
+            return Ok(());
+        }
+
+        // Floating point only describes the rejection; the decision above was
+        // already made exactly. An unrepresentable ratio reports an infinite
+        // discount rather than a misleading number.
+        let expected = oracle_output.0.to_f64().unwrap_or(f64::INFINITY);
+        let actual = preview.quote.receive_amount.0.to_f64().unwrap_or(0.0);
+        let discount_bps = if expected.is_finite() && expected > 0.0 && actual.is_finite() {
+            ((expected - actual) / expected).max(0.0) * f64::from(BPS_DENOMINATOR)
+        } else {
+            f64::INFINITY
+        };
+
+        Err(IcpswapFirstPlannerError::NoViableRoute(format!(
+            "{venue_id} quote is {:.2} bps below oracle-implied output, exceeding the {} bps limit",
+            discount_bps, self.config.max_oracle_discount_bps
+        )))
     }
 
     // Excludes unavailable, invalid, and below-minimum overflow quotes, then
@@ -792,4 +1070,32 @@ impl IcpswapFirstPlanner {
         state.validate().map_err(IcpswapFirstPlannerError::InvalidInput)?;
         Ok(state)
     }
+}
+
+/// Converts one venue's pay allocation into receive-token native units at the
+/// resolved oracle prices.
+///
+/// The scales come from the tokens carried by the two amounts being compared:
+/// `AssetId` equality ignores decimals, so reading them off the plan input could
+/// silently rescale the bound.
+fn oracle_expected_output(
+    input: &IcpswapFirstPlanInput,
+    request: &SwapRequest,
+    preview: &VenueRoutePreview,
+) -> Result<Option<Nat>, IcpswapFirstPlannerError> {
+    let (Some(pay_price), Some(receive_price)) = (
+        input.pay_reference_price_ray.as_ref(),
+        input.receive_reference_price_ray.as_ref(),
+    ) else {
+        return Ok(None);
+    };
+    oracle_implied_output(
+        &request.pay_amount.value,
+        pay_price,
+        receive_price,
+        u64::from(request.pay_amount.token.decimals()),
+        u64::from(preview.conservative_receive.token.decimals()),
+    )
+    .map(Some)
+    .map_err(IcpswapFirstPlannerError::InvalidInput)
 }
