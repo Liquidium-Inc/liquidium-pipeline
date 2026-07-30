@@ -110,7 +110,7 @@ where
                     return Ok(());
                 }
 
-                info!(
+                debug!(
                     "[mexc] liq_id={} deposit pending: before={} current={} delta={} expected={}",
                     state.liq_id, baseline_balance, current_balance, observed_balance_delta, expected_deposit_amount
                 );
