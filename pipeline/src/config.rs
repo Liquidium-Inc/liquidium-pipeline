@@ -64,6 +64,9 @@ pub struct Config {
     pub cex_retry_max_secs: u64,
     /// Minimum projected net edge required for any multi-venue plan, in bps.
     pub multi_venue_min_net_edge_bps: u32,
+    /// Signed edge floor used only for bad-debt liquidations. See
+    /// `parse_multi_venue_bad_debt_min_net_edge_bps_from_env`.
+    pub multi_venue_bad_debt_min_net_edge_bps: i32,
     /// Maximum downside from the oracle-implied output allowed for any venue
     /// quote, in bps. Applied centrally after venue quote normalization.
     pub multi_venue_max_oracle_discount_bps: u32,
@@ -386,6 +389,7 @@ impl Config {
             cex_retry_base_secs: cex_tunables.retry_base_secs,
             cex_retry_max_secs: cex_tunables.retry_max_secs,
             multi_venue_min_net_edge_bps: parse_multi_venue_min_net_edge_bps_from_env(),
+            multi_venue_bad_debt_min_net_edge_bps: parse_multi_venue_bad_debt_min_net_edge_bps_from_env(),
             multi_venue_max_oracle_discount_bps: parse_multi_venue_max_oracle_discount_bps_from_env(),
             multi_venue_oracle_snapshot_max_age_secs: parse_multi_venue_oracle_snapshot_max_age_secs_from_env(),
             cex_delay_buffer_bps: cex_tunables.delay_buffer_bps,
@@ -454,7 +458,10 @@ const DEFAULT_CEX_BUY_INVERSE_ENABLED: bool = true;
 const DEFAULT_CEX_RETRY_BASE_SECS: u64 = 5;
 const DEFAULT_CEX_RETRY_MAX_SECS: u64 = 120;
 const DEFAULT_MULTI_VENUE_MIN_NET_EDGE_BPS: u32 = 150;
-const DEFAULT_MULTI_VENUE_MAX_ORACLE_DISCOUNT_BPS: u32 = 250;
+/// Bad debt may return this much less than it repaid and still be recycled
+/// automatically; anything further underwater is escalated to an operator.
+const DEFAULT_MULTI_VENUE_BAD_DEBT_MIN_NET_EDGE_BPS: i32 = -500;
+const DEFAULT_MULTI_VENUE_MAX_ORACLE_DISCOUNT_BPS: u32 = 500;
 const DEFAULT_MULTI_VENUE_ORACLE_SNAPSHOT_MAX_AGE_SECS: i64 = 300;
 const DEFAULT_CEX_DELAY_BUFFER_BPS: u32 = 75;
 const DEFAULT_CEX_ROUTE_FEE_BPS: u32 = 25;
@@ -485,6 +492,27 @@ fn parse_multi_venue_min_net_edge_bps_from_env() -> u32 {
         .and_then(|value| value.parse::<u32>().ok())
         .unwrap_or(DEFAULT_MULTI_VENUE_MIN_NET_EDGE_BPS)
         .min(MAX_BPS)
+}
+
+/// Edge floor for collateral bought as bad debt, which repays more than the
+/// collateral is worth by construction.
+///
+/// It mirrors `MULTI_VENUE_MIN_NET_EDGE_BPS` in sign, not in value: a
+/// profitable liquidation must clear the debt by 150 bps, while bad debt may
+/// fall short of it by 150 bps and still be recycled without a human. Anything
+/// further underwater is escalated instead of sold automatically.
+///
+/// Deliberately a constant rather than the negation of the profitable floor:
+/// raising the profit bar is a tightening, and must not silently widen how much
+/// loss the swap-back will accept. The quote is priced against the oracle
+/// regardless, so this governs recycling, never fill quality.
+fn parse_multi_venue_bad_debt_min_net_edge_bps_from_env() -> i32 {
+    let limit = i32::try_from(MAX_BPS).unwrap_or(i32::MAX);
+    env::var("MULTI_VENUE_BAD_DEBT_MIN_NET_EDGE_BPS")
+        .ok()
+        .and_then(|value| value.parse::<i32>().ok())
+        .filter(|bps| *bps >= -limit && *bps <= limit)
+        .unwrap_or(DEFAULT_MULTI_VENUE_BAD_DEBT_MIN_NET_EDGE_BPS)
 }
 
 /// A discount of `MAX_BPS` accepts any output at all, so out-of-range values
@@ -804,6 +832,7 @@ mod tests {
             "CEX_RETRY_BASE_SECS",
             "CEX_RETRY_MAX_SECS",
             "MULTI_VENUE_MIN_NET_EDGE_BPS",
+            "MULTI_VENUE_BAD_DEBT_MIN_NET_EDGE_BPS",
             "CEX_MIN_NET_EDGE_BPS",
             "MULTI_VENUE_MAX_ORACLE_DISCOUNT_BPS",
             "MULTI_VENUE_ORACLE_SNAPSHOT_MAX_AGE_SECS",
@@ -834,7 +863,28 @@ mod tests {
             }
         );
         assert_eq!(parse_multi_venue_min_net_edge_bps_from_env(), 150);
+        // The same 150 bps, mirrored: a profitable liquidation must clear the
+        // debt by that much, bad debt may fall short of it by that much.
+        assert_eq!(parse_multi_venue_bad_debt_min_net_edge_bps_from_env(), -500);
         assert_eq!(parse_multi_venue_oracle_snapshot_max_age_secs_from_env(), 300);
+    }
+
+    #[test]
+    fn bad_debt_edge_floor_accepts_negatives_and_rejects_out_of_range() {
+        let _guard = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+
+        unsafe { env::set_var("MULTI_VENUE_BAD_DEBT_MIN_NET_EDGE_BPS", "-6000") };
+        assert_eq!(parse_multi_venue_bad_debt_min_net_edge_bps_from_env(), -6000);
+
+        // Beyond ±10000 the floor would stop meaning anything, so a bad value
+        // falls back to the default instead of silently disabling the check.
+        unsafe { env::set_var("MULTI_VENUE_BAD_DEBT_MIN_NET_EDGE_BPS", "-20000") };
+        assert_eq!(parse_multi_venue_bad_debt_min_net_edge_bps_from_env(), -500);
+
+        unsafe { env::set_var("MULTI_VENUE_BAD_DEBT_MIN_NET_EDGE_BPS", "not-a-number") };
+        assert_eq!(parse_multi_venue_bad_debt_min_net_edge_bps_from_env(), -500);
+
+        unsafe { env::remove_var("MULTI_VENUE_BAD_DEBT_MIN_NET_EDGE_BPS") };
     }
 
     #[test]
@@ -899,10 +949,10 @@ mod tests {
     }
 
     #[test]
-    fn oracle_discount_defaults_to_250_and_rejects_a_guard_disabling_value() {
+    fn oracle_discount_defaults_to_500_and_rejects_a_guard_disabling_value() {
         let _guard = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
         unsafe { env::remove_var("MULTI_VENUE_MAX_ORACLE_DISCOUNT_BPS") };
-        assert_eq!(parse_multi_venue_max_oracle_discount_bps_from_env(), 250);
+        assert_eq!(parse_multi_venue_max_oracle_discount_bps_from_env(), 500);
 
         // 10_000 bps and above would accept any output at all, so out-of-range
         // values fall back to the default instead of turning the guard off.
@@ -910,7 +960,7 @@ mod tests {
             unsafe { env::set_var("MULTI_VENUE_MAX_ORACLE_DISCOUNT_BPS", value) };
             assert_eq!(
                 parse_multi_venue_max_oracle_discount_bps_from_env(),
-                250,
+                500,
                 "`{value}` must not disable the oracle guard"
             );
         }

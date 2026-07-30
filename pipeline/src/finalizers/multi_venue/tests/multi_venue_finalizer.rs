@@ -25,7 +25,7 @@ use num_traits::ToPrimitive;
 use crate::{
     executors::executor::ExecutorRequest,
     finalizers::{
-        finalizer::{Finalizer, FinalizerError},
+        finalizer::{Finalizer, FinalizerError, FinalizerResult},
         multi_venue::{ICPSWAP_VENUE_ID, MEXC_VENUE_ID, VenueLegProgress, VenueRoutePreview},
         profit_calculator::SimpleProfitCalculator,
     },
@@ -694,6 +694,7 @@ fn planner_config() -> IcpswapFirstPlannerConfig {
         dust_fallback_max_price_impact_bps: 150.0,
         cex_min_exec_usd: 0.01,
         min_net_edge_bps: 150,
+        bad_debt_min_net_edge_bps: 150,
         max_oracle_discount_bps: 250,
         oracle_snapshot_max_age_secs: 300,
         icpswap_test_allocation_usd: None,
@@ -1133,6 +1134,46 @@ async fn bad_debt_below_minimum_edge_never_advances_a_venue_leg() {
     assert_eq!(icpswap.calls(), 0);
     assert_eq!(mexc.calls(), 0);
     assert!(wal.wrapper().meta_v2.is_none(), "a rejected plan must not be committed");
+}
+
+/// Bad debt repays more than the collateral is worth by construction, so a
+/// non-negative floor strands it forever. A negative floor opts into recycling
+/// that collateral, and applies only to rows actually bought as bad debt.
+#[tokio::test]
+async fn a_negative_bad_debt_floor_recycles_collateral_a_positive_one_strands() {
+    async fn plan_with(bad_debt_floor: i32, buy_bad_debt: bool) -> Result<FinalizerResult, FinalizerError> {
+        let mut receipt = receipt();
+        receipt.request.liquidation.buy_bad_debt = buy_bad_debt;
+        receipt
+            .liquidation_result
+            .as_mut()
+            .expect("liquidation result")
+            .amounts
+            .debt_repaid = Nat::from(199_000_000u64);
+        let wal = TestWal::with_receipt(&receipt);
+        let icpswap = Arc::new(ScriptedAdapter::new(ICPSWAP_VENUE_ID, None, Vec::new()));
+        let config = IcpswapFirstPlannerConfig {
+            bad_debt_min_net_edge_bps: bad_debt_floor,
+            ..planner_config()
+        };
+        let finalizer = MultiVenueFinalizer::new(vec![icpswap], config).expect("valid finalizer");
+        finalizer.finalize(&wal, receipt).await
+    }
+
+    // The row from the existing test: underwater, and rejected while the
+    // bad-debt floor still demands a profit.
+    let error = plan_with(150, true).await.expect_err("a positive floor strands it");
+    assert!(error.message().contains("below required 150 bps"));
+
+    // The same row clears once the floor states how much shortfall may recycle.
+    plan_with(-6000, true).await.expect("a negative floor recycles it");
+
+    // A normal liquidation is untouched by the bad-debt floor: it keeps being
+    // measured against min_net_edge_bps, so it is still rejected.
+    let error = plan_with(-6000, false)
+        .await
+        .expect_err("a profitable-liquidation row keeps its own floor");
+    assert!(error.message().contains("below required 150 bps"));
 }
 
 #[tokio::test]

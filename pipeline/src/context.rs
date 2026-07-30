@@ -475,6 +475,7 @@ mod tests {
             cex_retry_base_secs: 5,
             cex_retry_max_secs: 120,
             multi_venue_min_net_edge_bps: 25,
+            multi_venue_bad_debt_min_net_edge_bps: 25,
             multi_venue_max_oracle_discount_bps: 250,
             multi_venue_oracle_snapshot_max_age_secs: 300,
             cex_delay_buffer_bps: 15,

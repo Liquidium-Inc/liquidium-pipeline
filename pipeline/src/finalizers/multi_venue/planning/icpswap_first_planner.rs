@@ -45,6 +45,12 @@ pub struct IcpswapFirstPlannerConfig {
     pub dust_fallback_max_price_impact_bps: f64,
     pub cex_min_exec_usd: f64,
     pub min_net_edge_bps: u32,
+    /// Edge floor applied instead of `min_net_edge_bps` when the liquidation was
+    /// bought as bad debt. Signed, because such a row repays more than the
+    /// collateral is worth by construction: a non-negative floor can never be
+    /// met and would leave the collateral stranded. `-10000` recycles it
+    /// whatever the shortfall; the quote is still bounded by the oracle guard.
+    pub bad_debt_min_net_edge_bps: i32,
     pub max_oracle_discount_bps: u32,
     /// How old a recorded price may be, in seconds, before the guard stops using
     /// it as a fallback for a live oracle read.
@@ -83,6 +89,13 @@ impl IcpswapFirstPlannerConfig {
             return Err(IcpswapFirstPlannerError::InvalidInput(format!(
                 "minimum net edge {} bps exceeds {} bps",
                 self.min_net_edge_bps, BPS_DENOMINATOR
+            )));
+        }
+        let bps_limit = i32::try_from(BPS_DENOMINATOR).unwrap_or(i32::MAX);
+        if self.bad_debt_min_net_edge_bps > bps_limit || self.bad_debt_min_net_edge_bps < -bps_limit {
+            return Err(IcpswapFirstPlannerError::InvalidInput(format!(
+                "bad-debt minimum net edge {} bps must stay within ±{} bps",
+                self.bad_debt_min_net_edge_bps, BPS_DENOMINATOR
             )));
         }
         // A discount of exactly BPS_DENOMINATOR permits any output at all, which
@@ -140,6 +153,10 @@ pub struct IcpswapFirstPlanInput {
     /// receipt predates the field. Used to decide whether they are still fresh
     /// enough to bound a venue quote.
     pub reference_price_captured_at: Option<i64>,
+    /// Whether this liquidation was bought as bad debt. Such a row repays more
+    /// than the collateral is worth by design, so it is held to its own edge
+    /// floor rather than the profitable-liquidation one.
+    pub buy_bad_debt: bool,
 }
 
 impl IcpswapFirstPlanInput {
@@ -193,6 +210,7 @@ impl IcpswapFirstPlanInput {
             pay_reference_price_ray,
             receive_reference_price_ray,
             reference_price_captured_at: (receipt.request.ref_price_at > 0).then_some(receipt.request.ref_price_at),
+            buy_bad_debt: receipt.request.liquidation.buy_bad_debt,
         };
         input.validate()?;
         Ok(input)
@@ -1077,10 +1095,20 @@ impl IcpswapFirstPlanner {
         let conservative_receive = sum_leg_outputs(&legs, true)?;
         let combined_net_edge_bps = edge_bps(&conservative_receive, &input.debt_repaid)?;
 
-        if !meets_minimum_edge(&conservative_receive, &input.debt_repaid, self.config.min_net_edge_bps)? {
+        // Bad debt is bought at a known loss, so measuring the swap against the
+        // debt it repaid can only ever reject it. Its own floor decides how much
+        // of that shortfall may be recycled without a human; the quote is still
+        // held to the oracle by `validate_venue_preview`.
+        let required_edge_bps = if input.buy_bad_debt {
+            self.config.bad_debt_min_net_edge_bps
+        } else {
+            i32::try_from(self.config.min_net_edge_bps).unwrap_or(i32::MAX)
+        };
+
+        if !meets_minimum_edge(&conservative_receive, &input.debt_repaid, required_edge_bps)? {
             return Err(IcpswapFirstPlannerError::NoViableRoute(format!(
                 "combined conservative output has {:.2} bps edge, below required {} bps",
-                combined_net_edge_bps, self.config.min_net_edge_bps
+                combined_net_edge_bps, required_edge_bps
             )));
         }
 
