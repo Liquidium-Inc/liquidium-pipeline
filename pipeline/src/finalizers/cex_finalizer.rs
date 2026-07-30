@@ -5,7 +5,7 @@ use liquidium_pipeline_core::tokens::{chain_token::ChainToken, chain_token_amoun
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    finalizers::finalizer::{Finalizer, FinalizerErrorKind, FinalizerResult},
+    finalizers::finalizer::{Finalizer, FinalizerError, FinalizerResult},
     persistance::{LiqMetaWrapper, LiqResultRecord, ResultStatus, WalStore},
     stages::executor::{ExecutionReceipt, ExecutionStatus},
     swappers::model::SwapExecution,
@@ -245,7 +245,26 @@ pub trait CexFinalizerLogic: Send + Sync {
 
 #[async_trait]
 impl Finalizer for dyn CexFinalizerLogic {
-    async fn finalize(&self, wal: &dyn WalStore, receipt: ExecutionReceipt) -> Result<FinalizerResult, String> {
+    async fn finalize(
+        &self,
+        wal: &dyn WalStore,
+        receipt: ExecutionReceipt,
+    ) -> Result<FinalizerResult, FinalizerError> {
+        self.finalize_inner(wal, receipt).await.map_err(|error| {
+            // Classify once here; the bridge's sentinel never reaches the stage.
+            if error.starts_with(
+                liquidium_pipeline_connectors::backend::bridge_backend::FINALIZER_PERMANENT_AMOUNT_FLOOR_PREFIX,
+            ) {
+                FinalizerError::BadDebtAmountFloor(error)
+            } else {
+                FinalizerError::Retryable(error)
+            }
+        })
+    }
+}
+
+impl dyn CexFinalizerLogic {
+    async fn finalize_inner(&self, wal: &dyn WalStore, receipt: ExecutionReceipt) -> Result<FinalizerResult, String> {
         // Only finalize successful executions
         if !matches!(receipt.status, ExecutionStatus::Success) {
             debug!("[cex] ⏭️ skip: execution status not successful: {:?}", receipt.status);
@@ -394,16 +413,6 @@ impl Finalizer for dyn CexFinalizerLogic {
         };
 
         Ok(res)
-    }
-
-    fn classify_error(&self, error: &str) -> FinalizerErrorKind {
-        if error.starts_with(
-            liquidium_pipeline_connectors::backend::bridge_backend::FINALIZER_PERMANENT_AMOUNT_FLOOR_PREFIX,
-        ) {
-            FinalizerErrorKind::BadDebtAmountFloor
-        } else {
-            FinalizerErrorKind::Retryable
-        }
     }
 }
 
@@ -941,7 +950,7 @@ mod tests {
             .finalize(&wal, receipt.clone())
             .await
             .expect_err("first finalize should fail");
-        assert!(first_err.contains("trade exploded once"));
+        assert!(first_err.message().contains("trade exploded once"));
 
         assert_eq!(*prepare_calls.lock().unwrap(), 1);
         assert_eq!(*trade_calls.lock().unwrap(), 1);

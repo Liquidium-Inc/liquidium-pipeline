@@ -1,24 +1,31 @@
 use std::sync::Arc;
 
 use crate::{
-    finalizers::finalizer::{Finalizer, FinalizerErrorKind, FinalizerResult},
+    finalizers::finalizer::{Finalizer, FinalizerError, FinalizerResult},
     finalizers::multi_venue::{
         IcpswapFirstPlanInput, IcpswapFirstPlanner, IcpswapFirstPlannerConfig, IcpswapFirstPlannerError,
         MultiVenueAdapter, VenueLegProgress,
     },
     persistance::{
         FINALIZER_META_V2_VERSION, FinalizerDecisionSnapshot, FinalizerMetaPayload, FinalizerMetaV2, LiqMetaWrapper,
-        MultiVenueAllocationSnapshot, MultiVenueExecutionOutcome, MultiVenueExecutionState, VenueAllocationSnapshot,
-        VenueLegState, VenueLegStatus, WalStore,
+        MultiVenueAllocationSnapshot, MultiVenueExecutionOutcome, MultiVenueExecutionState, RecoverySweepState,
+        RecoverySweepStatus, VenueAllocationSnapshot, VenueLegState, VenueLegStatus, WalStore,
     },
     price_oracle::price_oracle::PriceOracle,
     stages::executor::ExecutionReceipt,
-    utils::now_ts,
+    utils::{ICP_LEDGER_PRINCIPAL, now_ts},
     wal::{decode_receipt_wrapper, encode_meta, liq_id_from_receipt, wal_load},
     watchdog::{Watchdog, WatchdogEvent, noop_watchdog},
 };
 use async_trait::async_trait;
 use candid::Nat;
+use ic_ledger_types::{AccountIdentifier, Subaccount};
+use icrc_ledger_types::icrc1::account::Account;
+use liquidium_pipeline_core::{
+    account::model::ChainAccount,
+    tokens::{chain_token::ChainToken, chain_token_amount::ChainTokenAmount},
+    transfer::actions::{TransferActions, TransferFailure},
+};
 use tracing::{debug, info};
 
 use super::parent_leg_checkpoint::ParentLegCheckpoint;
@@ -26,6 +33,27 @@ use crate::finalizers::multi_venue::planning::venue_registry::VenueRegistry;
 
 pub(super) const MULTI_VENUE_PERMANENT_PREFIX: &str = "permanent multi-venue finalizer: ";
 const MULTI_VENUE_CUSTODY_PREFIX: &str = "multi-venue venue custody: ";
+const MULTI_VENUE_UNRESUMABLE_PREFIX: &str = "unresumable multi-venue finalizer: ";
+
+struct RecoverySweepRuntime {
+    trader_transfers: Arc<dyn TransferActions + Send + Sync>,
+    recovery_account: Account,
+}
+
+/// One liquidation's committed finalization envelope, plus whether this
+/// invocation is the one that planned it.
+///
+/// `freshly_planned` is the submission gate for recovery sweeps: only the call
+/// that durably wrote the transfer may submit it. Anything that reads the same
+/// state back — a later cycle, a restarted process, a cancelled stage — cannot
+/// distinguish "never submitted" from "submitted with an unknown outcome", so
+/// it parks for an operator instead.
+struct LoadedFinalization {
+    row: crate::persistance::LiqResultRecord,
+    wrapper: LiqMetaWrapper,
+    payload: FinalizerMetaPayload,
+    freshly_planned: bool,
+}
 
 /// Mutable parent state shared by one multi-venue finalization invocation.
 ///
@@ -63,6 +91,7 @@ pub struct MultiVenueFinalizer {
     planner: IcpswapFirstPlanner,
     venues: Arc<VenueRegistry>,
     watchdog: Arc<dyn Watchdog>,
+    recovery: Option<RecoverySweepRuntime>,
 }
 
 impl MultiVenueFinalizer {
@@ -77,6 +106,7 @@ impl MultiVenueFinalizer {
             planner,
             venues,
             watchdog: noop_watchdog(),
+            recovery: None,
         })
     }
 
@@ -89,6 +119,18 @@ impl MultiVenueFinalizer {
     /// the prices recorded when the liquidation was detected.
     pub fn with_price_oracle(mut self, price_oracle: Arc<dyn PriceOracle>) -> Self {
         self.planner = self.planner.with_price_oracle(price_oracle);
+        self
+    }
+
+    pub fn with_recovery_sweep(
+        mut self,
+        trader_transfers: Arc<dyn TransferActions + Send + Sync>,
+        recovery_account: Account,
+    ) -> Self {
+        self.recovery = Some(RecoverySweepRuntime {
+            trader_transfers,
+            recovery_account,
+        });
         self
     }
 
@@ -113,14 +155,7 @@ impl MultiVenueFinalizer {
         &self,
         wal: &dyn WalStore,
         receipt: &ExecutionReceipt,
-    ) -> Result<
-        (
-            crate::persistance::LiqResultRecord,
-            LiqMetaWrapper,
-            MultiVenueExecutionState,
-        ),
-        String,
-    > {
+    ) -> Result<LoadedFinalization, String> {
         let liquidation_id = liq_id_from_receipt(receipt)?;
         let mut row = wal_load(wal, &liquidation_id)
             .await?
@@ -129,14 +164,23 @@ impl MultiVenueFinalizer {
             .ok_or_else(|| format!("missing receipt wrapper for multi-venue liquidation {liquidation_id}"))?;
 
         if wrapper.meta_v2.is_some() {
-            let state = {
+            let payload = {
                 let meta = wrapper.meta_v2.as_ref().expect("meta_v2 checked above");
-                meta.validate()
-                    .map_err(|error| format!("{MULTI_VENUE_PERMANENT_PREFIX}{error}"))?;
-                let FinalizerMetaPayload::MultiVenueSwap(state) = &meta.payload;
-                state.clone()
+                // Committed state this binary cannot read is a code or config
+                // mismatch, not a dead liquidation. Failing it here would drop a
+                // row whose venue legs may still hold funds out of the queue,
+                // so it is parked for an operator instead.
+                meta.validate().map_err(|error| {
+                    format!("{MULTI_VENUE_UNRESUMABLE_PREFIX}committed finalizer state cannot be read by this build: {error}")
+                })?;
+                meta.payload.clone()
             };
-            return Ok((row, wrapper, state));
+            return Ok(LoadedFinalization {
+                row,
+                wrapper,
+                payload,
+                freshly_planned: false,
+            });
         }
 
         if wrapper.venue_execution.is_some()
@@ -153,30 +197,77 @@ impl MultiVenueFinalizer {
 
         // Planning starts here. Build the planner input from the confirmed
         // liquidation result, including the collateral amount actually received.
-        let input = IcpswapFirstPlanInput::from_receipt(receipt).map_err(|error| error.to_string())?;
+        //
+        // Every rejection here is structural — a missing swap request, a
+        // mismatched pay asset, an unsuccessful execution — and no retry can
+        // change it, so the row fails once instead of spending its whole budget.
+        let input = IcpswapFirstPlanInput::from_receipt(receipt)
+            .map_err(|error| format!("{MULTI_VENUE_PERMANENT_PREFIX}{error}"))?;
 
         // This is the pure routing decision: quote the registered venues and
         // produce the immutable allocation plan plus initialized venue legs.
         // No swap, transfer, or order side effect is submitted by `plan`.
-        let state = self.planner.plan(&input, now_ts()).await.map_err(|error| match error {
-            IcpswapFirstPlannerError::InvalidInput(_) => {
-                format!("{MULTI_VENUE_PERMANENT_PREFIX}{error}")
+        let state = match self.planner.plan(&input, now_ts()).await {
+            Ok(state) => state,
+            Err(IcpswapFirstPlannerError::BelowVenueMinimum(reason)) => {
+                let recovery = self.recovery.as_ref().ok_or_else(|| {
+                    format!(
+                        "{MULTI_VENUE_PERMANENT_PREFIX}no venue can execute this amount and recovery sweep is unavailable: {reason}"
+                    )
+                })?;
+                let destination = recovery_destination(&input.total_pay.token, &recovery.recovery_account)?;
+                let fee = input.total_pay.token.fee();
+                let amount = if input.total_pay.value > fee {
+                    input.total_pay.value.clone() - fee
+                } else {
+                    Nat::from(0u8)
+                };
+                let recovery_state = RecoverySweepState {
+                    liquidation_id: liquidation_id.clone(),
+                    reason: format!("no venue can execute this amount: {reason}"),
+                    amount: ChainTokenAmount::from_raw(input.total_pay.token.clone(), amount.clone()),
+                    destination,
+                    // Collateral that cannot pay its own transfer fee never
+                    // moves, so the sweep is finished the moment it is planned.
+                    status: if amount == 0u8 {
+                        RecoverySweepStatus::Completed
+                    } else {
+                        RecoverySweepStatus::ReadyToSubmit
+                    },
+                    txid: None,
+                    last_error: None,
+                };
+                wrapper.finalizer_decision = Some(recovery_decision_snapshot(&recovery_state));
+                // The exact transfer is durable before the caller submits it.
+                self.persist_recovery_state(wal, &mut row, &mut wrapper, &recovery_state)
+                    .await?;
+                return Ok(LoadedFinalization {
+                    row,
+                    wrapper,
+                    payload: FinalizerMetaPayload::RecoverySweep(recovery_state),
+                    freshly_planned: true,
+                });
             }
-            IcpswapFirstPlannerError::NoViableRoute(_) => error.to_string(),
-        })?;
+            Err(IcpswapFirstPlannerError::InvalidInput(error)) => {
+                return Err(format!("{MULTI_VENUE_PERMANENT_PREFIX}{error}"));
+            }
+            Err(IcpswapFirstPlannerError::NoViableRoute(reason)) => {
+                return Err(format!("no viable ICPSwap-first route: {reason}"));
+            }
+        };
 
         // Commit the entire decision and every initialized leg atomically.
         // Venue execution may begin only after this WAL write succeeds, so a
         // restart always resumes the same allocations instead of replanning.
         wrapper.finalizer_decision = Some(decision_snapshot(&state));
-        set_meta_v2(&mut wrapper, &state)?;
-        row.updated_at = now_ts();
-        encode_meta(&mut row, &wrapper)?;
-        wal.upsert_result(row.clone())
-            .await
-            .map_err(|error| format!("failed to commit multi-venue plan for {liquidation_id}: {error}"))?;
+        self.persist_state(wal, &mut row, &mut wrapper, &state).await?;
 
-        Ok((row, wrapper, state))
+        Ok(LoadedFinalization {
+            row,
+            wrapper,
+            payload: FinalizerMetaPayload::MultiVenueSwap(state),
+            freshly_planned: true,
+        })
     }
 
     /// Persists the complete envelope after one leg transition. Only the
@@ -189,11 +280,126 @@ impl MultiVenueFinalizer {
         state: &MultiVenueExecutionState,
     ) -> Result<(), String> {
         set_meta_v2(wrapper, state)?;
+        self.persist_wrapper(wal, row, wrapper).await
+    }
+
+    async fn persist_recovery_state(
+        &self,
+        wal: &dyn WalStore,
+        row: &mut crate::persistance::LiqResultRecord,
+        wrapper: &mut LiqMetaWrapper,
+        state: &RecoverySweepState,
+    ) -> Result<(), String> {
+        set_recovery_meta_v2(wrapper, state)?;
+        self.persist_wrapper(wal, row, wrapper).await
+    }
+
+    /// The single point where a finalization envelope reaches the WAL. Callers
+    /// stage their payload transition into `wrapper` first.
+    async fn persist_wrapper(
+        &self,
+        wal: &dyn WalStore,
+        row: &mut crate::persistance::LiqResultRecord,
+        wrapper: &LiqMetaWrapper,
+    ) -> Result<(), String> {
         row.updated_at = now_ts();
         encode_meta(row, wrapper)?;
         wal.upsert_result(row.clone())
             .await
-            .map_err(|error| format!("failed to persist multi-venue state for {}: {error}", row.id))
+            .map_err(|error| format!("failed to persist finalizer state for {}: {error}", row.id))
+    }
+
+    async fn finalize_recovery_sweep(
+        &self,
+        wal: &dyn WalStore,
+        mut row: crate::persistance::LiqResultRecord,
+        mut wrapper: LiqMetaWrapper,
+        mut state: RecoverySweepState,
+        freshly_planned: bool,
+    ) -> Result<FinalizerResult, String> {
+        if state.status != RecoverySweepStatus::ReadyToSubmit {
+            return Ok(recovery_result(&state));
+        }
+
+        // Only the invocation that durably wrote this transfer may submit it.
+        // Any other reader — a later cycle, a restarted process, a cancelled
+        // stage — cannot tell "never submitted" from "submitted with an unknown
+        // outcome", so it hands the sweep to an operator rather than guessing.
+        if !freshly_planned {
+            return self
+                .park_recovery_sweep(
+                    wal,
+                    &mut row,
+                    &mut wrapper,
+                    &mut state,
+                    "recovery transfer was loaded from the WAL instead of being submitted by the invocation that planned it; verify the trader and recovery ledger balances before requeueing".to_string(),
+                )
+                .await;
+        }
+
+        let runtime = self.recovery.as_ref().ok_or_else(|| {
+            format!("{MULTI_VENUE_PERMANENT_PREFIX}committed recovery sweep has no configured runtime")
+        })?;
+        match runtime
+            .trader_transfers
+            .transfer(&state.amount.token, &state.destination, state.amount.value.clone())
+            .await
+        {
+            Ok(txid) => {
+                state.txid = Some(txid);
+                state.status = RecoverySweepStatus::Completed;
+                self.persist_recovery_state(wal, &mut row, &mut wrapper, &state).await?;
+                Ok(recovery_result(&state))
+            }
+            // A refusal and a lost answer both stop the sweep, but they cost an
+            // operator very different amounts of work, so say which happened.
+            // Never automatically repeat a transfer that may already have been
+            // applied.
+            Err(failure) => {
+                let reason = match &failure {
+                    TransferFailure::Rejected(error) => format!(
+                        "the ledger refused the recovery transfer and moved nothing, so the trader balance is intact: {error}"
+                    ),
+                    TransferFailure::Ambiguous(error) => format!(
+                        "the recovery transfer got no decided answer and may already have been applied: {error}; compare the trader and recovery ledger balances before requeueing"
+                    ),
+                };
+                self.park_recovery_sweep(wal, &mut row, &mut wrapper, &mut state, reason)
+                    .await
+            }
+        }
+    }
+
+    /// Records why a sweep cannot proceed automatically and escalates it. The
+    /// transfer is never retried from this state without an operator.
+    async fn park_recovery_sweep(
+        &self,
+        wal: &dyn WalStore,
+        row: &mut crate::persistance::LiqResultRecord,
+        wrapper: &mut LiqMetaWrapper,
+        state: &mut RecoverySweepState,
+        reason: String,
+    ) -> Result<FinalizerResult, String> {
+        state.status = RecoverySweepStatus::OperatorRequired;
+        state.last_error = Some(reason);
+        self.persist_recovery_state(wal, row, wrapper, state).await?;
+        self.notify_recovery_operator_required(state).await;
+        Ok(recovery_result(state))
+    }
+
+    async fn notify_recovery_operator_required(&self, state: &RecoverySweepState) {
+        self.watchdog
+            .notify(WatchdogEvent::OperatorRequired {
+                execution_id: format!("recovery-{}", state.liquidation_id),
+                venue: "recovery".to_string(),
+                pending_step: "recovery_transfer_reconciliation".to_string(),
+                owner: "trader".to_string(),
+                details: state
+                    .last_error
+                    .clone()
+                    .unwrap_or_else(|| "recovery transfer requires reconciliation".to_string()),
+            })
+            .await;
     }
 
     /// Advances each runnable leg once in committed vector order and journals
@@ -358,12 +564,65 @@ impl MultiVenueFinalizer {
         wal: &dyn WalStore,
         receipt: ExecutionReceipt,
     ) -> Result<FinalizerResult, String> {
-        let (row, wrapper, state) = self.load_or_commit_plan(wal, &receipt).await?;
-        let mut context = MultiVenueFinalizationContext::new(wal, row, wrapper, state);
-        if let Err(error) = self.advance_legs(&mut context).await {
-            return Err(tag_custody_error(&context.state, error));
+        let LoadedFinalization {
+            row,
+            wrapper,
+            payload,
+            freshly_planned,
+        } = self.load_or_commit_plan(wal, &receipt).await?;
+        match payload {
+            FinalizerMetaPayload::MultiVenueSwap(state) => {
+                let mut context = MultiVenueFinalizationContext::new(wal, row, wrapper, state);
+                if let Err(error) = self.advance_legs(&mut context).await {
+                    return Err(tag_custody_error(&context.state, error));
+                }
+                self.result_for_state(&context.state)
+            }
+            FinalizerMetaPayload::RecoverySweep(state) => {
+                self.finalize_recovery_sweep(wal, row, wrapper, state, freshly_planned)
+                    .await
+            }
         }
-        self.result_for_state(&context.state)
+    }
+}
+
+fn recovery_destination(token: &ChainToken, recovery: &Account) -> Result<ChainAccount, String> {
+    let ChainToken::Icp { ledger, .. } = token else {
+        return Err(format!(
+            "{MULTI_VENUE_PERMANENT_PREFIX}automatic recovery sweep has no distinct destination for EVM collateral"
+        ));
+    };
+    if ledger.to_text() == ICP_LEDGER_PRINCIPAL {
+        let subaccount = Subaccount(recovery.subaccount.unwrap_or([0; 32]));
+        Ok(ChainAccount::IcpLedger(
+            AccountIdentifier::new(&recovery.owner, &subaccount).to_hex(),
+        ))
+    } else {
+        Ok(ChainAccount::Icp(*recovery))
+    }
+}
+
+fn recovery_result(state: &RecoverySweepState) -> FinalizerResult {
+    FinalizerResult {
+        swap_result: None,
+        finalized: state.status == RecoverySweepStatus::Completed,
+        operator_required: state.status == RecoverySweepStatus::OperatorRequired,
+        swapper: Some("recovery".to_string()),
+        reason: Some(match (state.status, state.txid.as_ref()) {
+            (RecoverySweepStatus::Completed, Some(txid)) => {
+                format!("unrouteable collateral swept to recovery (tx {txid})")
+            }
+            // Collateral below its own transfer fee stays in the trader account.
+            (RecoverySweepStatus::Completed, None) => format!(
+                "unrouteable collateral {} is below its transfer fee and was left in place",
+                state.amount.formatted()
+            ),
+            (RecoverySweepStatus::OperatorRequired, _) => state
+                .last_error
+                .clone()
+                .unwrap_or_else(|| "recovery sweep requires operator reconciliation".to_string()),
+            (RecoverySweepStatus::ReadyToSubmit, _) => "unrouteable collateral recovery sweep is prepared".to_string(),
+        }),
     }
 }
 
@@ -457,9 +716,37 @@ fn aggregate_swap_executions(
     }))
 }
 
+/// Converts this finalizer's internal error text into the decision the pipeline
+/// acts on.
+///
+/// The sentinels are private to this module and never leave it: `finalize`
+/// classifies once, at the boundary, so no caller re-derives a decision from a
+/// message. New code should prefer building the variant directly.
+fn classify(error: String) -> FinalizerError {
+    if error.starts_with(MULTI_VENUE_PERMANENT_PREFIX) {
+        FinalizerError::Permanent(error)
+    } else if error.starts_with(MULTI_VENUE_UNRESUMABLE_PREFIX) {
+        FinalizerError::Unresumable(error)
+    } else if error.starts_with(MULTI_VENUE_CUSTODY_PREFIX) {
+        FinalizerError::VenueCustody(error)
+    } else {
+        FinalizerError::Retryable(error)
+    }
+}
+
 #[async_trait]
 impl Finalizer for MultiVenueFinalizer {
-    async fn finalize(&self, wal: &dyn WalStore, receipt: ExecutionReceipt) -> Result<FinalizerResult, String> {
+    async fn finalize(
+        &self,
+        wal: &dyn WalStore,
+        receipt: ExecutionReceipt,
+    ) -> Result<FinalizerResult, FinalizerError> {
+        self.finalize_inner(wal, receipt).await.map_err(classify)
+    }
+}
+
+impl MultiVenueFinalizer {
+    async fn finalize_inner(&self, wal: &dyn WalStore, receipt: ExecutionReceipt) -> Result<FinalizerResult, String> {
         if receipt.request.swap_args.is_none() {
             return Err(format!("{MULTI_VENUE_PERMANENT_PREFIX}receipt has no swap request"));
         }
@@ -490,16 +777,6 @@ impl Finalizer for MultiVenueFinalizer {
         }
 
         self.finalize_multi_venue(wal, receipt).await
-    }
-
-    fn classify_error(&self, error: &str) -> FinalizerErrorKind {
-        if error.starts_with(MULTI_VENUE_PERMANENT_PREFIX) {
-            FinalizerErrorKind::Permanent
-        } else if error.starts_with(MULTI_VENUE_CUSTODY_PREFIX) {
-            FinalizerErrorKind::VenueCustody
-        } else {
-            FinalizerErrorKind::Retryable
-        }
     }
 }
 
@@ -587,6 +864,32 @@ pub(super) fn set_meta_v2(wrapper: &mut LiqMetaWrapper, state: &MultiVenueExecut
         .map_err(|error| format!("{MULTI_VENUE_PERMANENT_PREFIX}{error}"))?;
     wrapper.meta_v2 = Some(meta);
     Ok(())
+}
+
+fn set_recovery_meta_v2(wrapper: &mut LiqMetaWrapper, state: &RecoverySweepState) -> Result<(), String> {
+    let meta = FinalizerMetaV2 {
+        version: FINALIZER_META_V2_VERSION,
+        payload: FinalizerMetaPayload::RecoverySweep(state.clone()),
+    };
+    meta.validate()
+        .map_err(|error| format!("{MULTI_VENUE_PERMANENT_PREFIX}{error}"))?;
+    wrapper.meta_v2 = Some(meta);
+    Ok(())
+}
+
+fn recovery_decision_snapshot(state: &RecoverySweepState) -> FinalizerDecisionSnapshot {
+    FinalizerDecisionSnapshot {
+        mode: "recovery".to_string(),
+        chosen: "recovery".to_string(),
+        reason: state.reason.clone(),
+        min_required_bps: 0.0,
+        dex_preview_gross_bps: None,
+        dex_preview_net_bps: None,
+        cex_preview_gross_bps: None,
+        cex_preview_net_bps: None,
+        ts: now_ts(),
+        multi_venue_allocation: None,
+    }
 }
 
 fn decision_snapshot(state: &MultiVenueExecutionState) -> FinalizerDecisionSnapshot {

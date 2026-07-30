@@ -1,8 +1,10 @@
 use serde::{Deserialize, Serialize};
 
 mod multi_venue;
+mod recovery_sweep;
 
 pub use multi_venue::*;
+pub use recovery_sweep::*;
 
 pub const FINALIZER_META_V2_VERSION: u32 = 2;
 
@@ -18,6 +20,7 @@ pub struct FinalizerMetaV2 {
 #[serde(tag = "kind", content = "state", rename_all = "snake_case")]
 pub enum FinalizerMetaPayload {
     MultiVenueSwap(MultiVenueExecutionState),
+    RecoverySweep(RecoverySweepState),
 }
 
 impl FinalizerMetaV2 {
@@ -31,6 +34,7 @@ impl FinalizerMetaV2 {
 
         match &self.payload {
             FinalizerMetaPayload::MultiVenueSwap(state) => state.validate(),
+            FinalizerMetaPayload::RecoverySweep(state) => state.validate(),
         }
     }
 }

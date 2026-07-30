@@ -6,7 +6,7 @@ use icrc_ledger_types::icrc1::account::Account;
 use icrc_ledger_types::icrc2::approve::ApproveArgs;
 use liquidium_pipeline_core::account::model::ChainAccount;
 use liquidium_pipeline_core::tokens::chain_token::ChainToken;
-use liquidium_pipeline_core::transfer::actions::TransferActions;
+use liquidium_pipeline_core::transfer::actions::{TransferActions, TransferFailure};
 use log::info;
 
 use crate::backend::icp_backend::IcpBackend;
@@ -24,7 +24,12 @@ impl<B: IcpBackend> IcpTransferAdapter<B> {
 
 #[async_trait]
 impl<B: IcpBackend + Send + Sync> TransferActions for IcpTransferAdapter<B> {
-    async fn transfer(&self, token: &ChainToken, to: &ChainAccount, amount_native: Nat) -> Result<String, String> {
+    async fn transfer(
+        &self,
+        token: &ChainToken,
+        to: &ChainAccount,
+        amount_native: Nat,
+    ) -> Result<String, TransferFailure> {
         let from_owner = self.account.owner.to_text();
         let from_subaccount = if self.account.subaccount.is_some() {
             "some"
@@ -79,8 +84,13 @@ impl<B: IcpBackend + Send + Sync> TransferActions for IcpTransferAdapter<B> {
                 Ok(block_index.to_string())
             }
 
-            (ChainToken::Icp { .. }, _) => Err("IcpTransferAdapter: destination chain must be ICP".to_string()),
-            _ => Err("IcpTransferAdapter only supports ChainToken::Icp".to_string()),
+            // Routing refusals never reach a ledger, so nothing moved.
+            (ChainToken::Icp { .. }, _) => Err(TransferFailure::Rejected(
+                "IcpTransferAdapter: destination chain must be ICP".to_string(),
+            )),
+            _ => Err(TransferFailure::Rejected(
+                "IcpTransferAdapter only supports ChainToken::Icp".to_string(),
+            )),
         }
     }
 

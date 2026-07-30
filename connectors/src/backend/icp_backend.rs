@@ -8,6 +8,7 @@ use icrc_ledger_types::icrc1::account::Account;
 use icrc_ledger_types::icrc1::transfer::{TransferArg, TransferError};
 use icrc_ledger_types::icrc2::allowance::{Allowance, AllowanceArgs};
 use icrc_ledger_types::icrc2::approve::{ApproveArgs, ApproveError};
+use liquidium_pipeline_core::transfer::actions::TransferFailure;
 use num_traits::ToPrimitive;
 use serde::{Deserialize, de::DeserializeOwned};
 use thiserror::Error;
@@ -33,9 +34,31 @@ pub enum IcrcTransferError {
     /// earlier either.
     #[error("icrc1_transfer rejected a created_at_time in the future; ledger time is {ledger_time}")]
     CreatedInFuture { ledger_time: u64 },
-    /// Every other rejection or transport failure, ambiguous by default.
+    /// The ledger evaluated the transfer and refused it. Nothing was applied,
+    /// so there is no ambiguity for a replay to resolve.
+    #[error("{0}")]
+    Rejected(String),
+    /// Every remaining failure, ambiguous by default: the transfer may already
+    /// have been applied and only a replay can reveal it.
     #[error("{0}")]
     Other(String),
+}
+
+impl From<IcrcTransferError> for TransferFailure {
+    fn from(error: IcrcTransferError) -> Self {
+        let message = error.to_string();
+        match error {
+            // Ledger time only moves forward, so no submission carrying a
+            // future timestamp can have been applied earlier either.
+            IcrcTransferError::CreatedInFuture { .. } | IcrcTransferError::Rejected(_) => {
+                TransferFailure::Rejected(message)
+            }
+            // `TooOld` refuses this submission, but it also means the
+            // deduplication window can no longer say whether an identical
+            // earlier one landed. Stay on the safe side of that.
+            IcrcTransferError::TooOld | IcrcTransferError::Other(_) => TransferFailure::Ambiguous(message),
+        }
+    }
 }
 
 #[cfg_attr(test, mockall::automock)]
@@ -49,13 +72,23 @@ pub trait IcpBackend: Send + Sync {
         Err("legacy ICP account balance is not implemented by this backend".to_string())
     }
 
-    async fn icrc1_transfer(&self, ledger: Principal, from: &Account, to: &Account, amount: Nat)
-    -> Result<Nat, String>;
+    async fn icrc1_transfer(
+        &self,
+        ledger: Principal,
+        from: &Account,
+        to: &Account,
+        amount: Nat,
+    ) -> Result<Nat, TransferFailure>;
 
     async fn icrc1_transfer_with_args(&self, ledger: Principal, args: TransferArg)
     -> Result<Nat, IcrcTransferError>;
 
-    async fn icp_transfer(&self, ledger: Principal, to_account_id_hex: &str, amount_e8s: Nat) -> Result<u64, String>;
+    async fn icp_transfer(
+        &self,
+        ledger: Principal,
+        to_account_id_hex: &str,
+        amount_e8s: Nat,
+    ) -> Result<u64, TransferFailure>;
 
     async fn icrc1_decimals(&self, ledger: Principal) -> Result<u8, String>;
     async fn icrc1_fee(&self, ledger: Principal) -> Result<Nat, String>;
@@ -118,7 +151,7 @@ impl<A: PipelineAgent> IcpBackend for IcpBackendImpl<A> {
         from: &Account,
         to: &Account,
         amount: Nat,
-    ) -> Result<Nat, String> {
+    ) -> Result<Nat, TransferFailure> {
         let arg = TransferArg {
             from_subaccount: from.subaccount,
             to: *to,
@@ -130,7 +163,7 @@ impl<A: PipelineAgent> IcpBackend for IcpBackendImpl<A> {
 
         self.icrc1_transfer_with_args(ledger, arg)
             .await
-            .map_err(|error| error.to_string())
+            .map_err(TransferFailure::from)
     }
 
     async fn icrc1_transfer_with_args(
@@ -151,11 +184,18 @@ impl<A: PipelineAgent> IcpBackend for IcpBackendImpl<A> {
             Err(TransferError::CreatedInFuture { ledger_time }) => {
                 Err(IcrcTransferError::CreatedInFuture { ledger_time })
             }
-            Err(e) => Err(IcrcTransferError::Other(format!("icrc1_transfer error: {e}"))),
+            // The ledger answered. Whatever it refused, it refused without
+            // applying anything.
+            Err(e) => Err(IcrcTransferError::Rejected(format!("icrc1_transfer error: {e}"))),
         }
     }
 
-    async fn icp_transfer(&self, ledger: Principal, to_account_id_hex: &str, amount_e8s: Nat) -> Result<u64, String> {
+    async fn icp_transfer(
+        &self,
+        ledger: Principal,
+        to_account_id_hex: &str,
+        amount_e8s: Nat,
+    ) -> Result<u64, TransferFailure> {
         #[derive(CandidType, Deserialize, Debug)]
         struct Tokens {
             e8s: u64,
@@ -191,14 +231,16 @@ impl<A: PipelineAgent> IcpBackend for IcpBackendImpl<A> {
             Err(TransferError1),
         }
 
-        let to = hex::decode(to_account_id_hex).map_err(|e| e.to_string())?;
+        // Nothing below this point has been submitted yet, so every early
+        // return is a refusal that moved no funds.
+        let to = hex::decode(to_account_id_hex).map_err(|e| TransferFailure::Rejected(e.to_string()))?;
 
         let fee = Tokens { e8s: 10_000 }; // default ICP fee
 
         let e8s = amount_e8s
             .0
             .to_u64()
-            .ok_or_else(|| "amount too large for ICP transfer".to_string())?;
+            .ok_or_else(|| TransferFailure::Rejected("amount too large for ICP transfer".to_string()))?;
         let amount = Tokens { e8s };
 
         let arg = TransferArgs {
@@ -210,11 +252,17 @@ impl<A: PipelineAgent> IcpBackend for IcpBackendImpl<A> {
             amount,
         };
 
-        let res: Result6 = self.update(ledger, "transfer", arg).await?;
+        // A failed call may still have been executed, so it stays ambiguous.
+        let res: Result6 = self
+            .update(ledger, "transfer", arg)
+            .await
+            .map_err(TransferFailure::Ambiguous)?;
 
         match res {
             Result6::Ok(block_index) => Ok(block_index),
-            Result6::Err(e) => Err(format!("icp_transfer error: {e:?}")),
+            // The ledger answered. Whatever it refused, it refused without
+            // applying anything.
+            Result6::Err(e) => Err(TransferFailure::Rejected(format!("icp_transfer error: {e:?}"))),
         }
     }
 
@@ -289,9 +337,11 @@ mod tests {
                 TransferError::CreatedInFuture { ledger_time: 42 },
                 IcrcTransferError::CreatedInFuture { ledger_time: 42 },
             ),
+            // The ledger answered, so nothing was applied. It stays separate
+            // from the two timestamp verdicts without becoming ambiguous.
             (
                 TransferError::TemporarilyUnavailable,
-                IcrcTransferError::Other("icrc1_transfer error: the ledger is temporarily unavailable".to_string()),
+                IcrcTransferError::Rejected("icrc1_transfer error: the ledger is temporarily unavailable".to_string()),
             ),
         ];
 
@@ -316,5 +366,45 @@ mod tests {
 
             assert_eq!(backend.icrc1_transfer_with_args(ledger, args).await, Err(expected));
         }
+    }
+
+    /// A call that never returns a verdict is the one case where the transfer
+    /// may already have been applied. It must not be reported as a refusal.
+    #[tokio::test]
+    async fn a_failed_call_stays_ambiguous_while_a_ledger_verdict_does_not() {
+        let ledger = Principal::from_slice(&[1]);
+        let mut agent = MockPipelineAgent::new();
+        agent
+            .expect_call_update::<Result<Nat, TransferError>>()
+            .times(1)
+            .return_once(|_, _, _| Err("replica timed out".to_string()));
+        let backend = IcpBackendImpl::new(Arc::new(agent));
+        let args = TransferArg {
+            from_subaccount: None,
+            to: Account {
+                owner: Principal::from_slice(&[2]),
+                subaccount: None,
+            },
+            amount: Nat::from(100u64),
+            fee: Some(Nat::from(10u64)),
+            memo: None,
+            created_at_time: Some(123),
+        };
+
+        let error = backend
+            .icrc1_transfer_with_args(ledger, args)
+            .await
+            .expect_err("a failed call must not report success");
+
+        assert_eq!(error, IcrcTransferError::Other("replica timed out".to_string()));
+        assert_eq!(
+            TransferFailure::from(error),
+            TransferFailure::Ambiguous("replica timed out".to_string())
+        );
+        // Whereas anything the ledger decided is known to have moved nothing.
+        assert_eq!(
+            TransferFailure::from(IcrcTransferError::Rejected("insufficient funds".to_string())),
+            TransferFailure::Rejected("insufficient funds".to_string())
+        );
     }
 }

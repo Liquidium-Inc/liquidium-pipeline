@@ -80,6 +80,17 @@ pub async fn wal_mark_permanent_failed(wal: &dyn WalStore, liq_id: &str, last_er
         .map_err(|e| e.to_string())
 }
 
+/// Parks a row this build cannot resume, keeping the reason visible.
+///
+/// Distinct from a permanent failure: nothing about the liquidation is wrong,
+/// so the row stays available for an operator to requeue once the binary or
+/// configuration can read it again.
+pub async fn wal_mark_unresumable(wal: &dyn WalStore, liq_id: &str, last_error: String) -> Result<(), String> {
+    wal.update_failure(liq_id, ResultStatus::Unresumable, last_error, false)
+        .await
+        .map_err(|e| e.to_string())
+}
+
 pub async fn wal_mark_enqueued(wal: &dyn WalStore, liq_id: &str) -> Result<(), String> {
     wal.update_status(liq_id, ResultStatus::Enqueued, true)
         .await

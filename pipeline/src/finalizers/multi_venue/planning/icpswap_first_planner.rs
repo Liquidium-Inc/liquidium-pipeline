@@ -324,6 +324,16 @@ pub enum IcpswapFirstPlannerError {
     InvalidInput(String),
     #[error("no viable ICPSwap-first route: {0}")]
     NoViableRoute(String),
+    /// Every venue that could take this collateral answered, and the only
+    /// reason none can execute is that the amount is below their execution
+    /// minimum. Unlike `NoViableRoute` this is a property of the amount rather
+    /// than of venue availability, so retrying cannot resolve it and the
+    /// caller may move the collateral out of the swap path.
+    ///
+    /// Never construct this while any venue failed to quote: an outage may end,
+    /// and a retry would then produce a real route.
+    #[error("no venue can execute this amount: {0}")]
+    BelowVenueMinimum(String),
 }
 
 pub struct IcpswapFirstPlanner {
@@ -590,21 +600,43 @@ impl IcpswapFirstPlanner {
     }
 
     // Quotes the complete allocation on every overflow venue and returns the
-    // best executable one. `context` prefixes the rejection summary when the
-    // caller reached this path because another venue fell through.
+    // best executable one.
+    //
+    // `fallthrough_reason` prefixes the rejection summary when the caller
+    // reached this path because another venue fell through. Its presence is
+    // load-bearing, not cosmetic: every caller that supplies one arrived here
+    // through a venue state a later retry could resolve, so those failures are
+    // never reported as a permanent below-minimum dead end.
     async fn full_amount_overflow(
         &self,
         input: &IcpswapFirstPlanInput,
-        context: Option<String>,
+        fallthrough_reason: Option<String>,
     ) -> Result<VenueRoutePreview, IcpswapFirstPlannerError> {
         let quotes = self.preview_overflow(input, input.total_pay.value.clone()).await?;
         self.best_executable_overflow(input, &quotes).cloned().ok_or_else(|| {
             let summary = self.overflow_failure_summary(&quotes);
-            IcpswapFirstPlannerError::NoViableRoute(match context {
-                Some(context) => format!("{context}; {summary}"),
-                None => summary,
-            })
+            match fallthrough_reason {
+                Some(reason) => IcpswapFirstPlannerError::NoViableRoute(format!("{reason}; {summary}")),
+                None if self.every_overflow_venue_quoted(&quotes) => {
+                    IcpswapFirstPlannerError::BelowVenueMinimum(summary)
+                }
+                None => IcpswapFirstPlannerError::NoViableRoute(summary),
+            }
         })
+    }
+
+    // Whether every configured overflow venue actually answered. Combined with
+    // `best_executable_overflow` returning nothing, this is what distinguishes
+    // "all venues are healthy and this amount is simply too small" from "a
+    // venue is down", which is not a permanent property of the amount.
+    fn every_overflow_venue_quoted(&self, quotes: &VenueQuoteBook) -> bool {
+        !self.overflow_venue_ids.is_empty()
+            && self.overflow_venue_ids.iter().all(|venue_id| {
+                matches!(
+                    quotes.get(venue_id).map(|venue| &venue.outcome),
+                    Some(VenuePreviewOutcome::Quoted(_))
+                )
+            })
     }
 
     // Non-native ICP collateral cannot use ICPSwap, so choose the executable

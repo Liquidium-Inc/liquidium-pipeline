@@ -188,7 +188,12 @@ impl<A: PipelineAgent, B: IcpBackend> IcpswapManualClient for IcpswapClient<A, B
                     IcrcTransferError::CreatedInFuture { .. } => {
                         IcpswapClientError::LedgerTransferCreatedInFuture { ledger, message }
                     }
-                    IcrcTransferError::Other(_) => IcpswapClientError::LedgerTransfer { ledger, message },
+                    // ICPSwap reconciles a failed transfer from the balances it
+                    // recorded before submitting, so it resolves a decided
+                    // rejection the same way it resolves an ambiguous one.
+                    IcrcTransferError::Rejected(_) | IcrcTransferError::Other(_) => {
+                        IcpswapClientError::LedgerTransfer { ledger, message }
+                    }
                 }
             })
     }
