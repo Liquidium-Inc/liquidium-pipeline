@@ -34,8 +34,10 @@ const RAY_PRICE_SCALE: f64 = 1e27;
 pub struct IcpswapFirstPlannerConfig {
     pub max_price_impact_bps: f64,
     pub max_search_iterations: u8,
+    pub dust_fallback_max_price_impact_bps: f64,
     pub cex_min_exec_usd: f64,
     pub min_net_edge_bps: u32,
+    pub icpswap_test_allocation_usd: Option<f64>,
 }
 
 impl IcpswapFirstPlannerConfig {
@@ -51,6 +53,15 @@ impl IcpswapFirstPlannerConfig {
                 "max search iterations must be positive".to_string(),
             ));
         }
+        if !self.dust_fallback_max_price_impact_bps.is_finite()
+            || self.dust_fallback_max_price_impact_bps < self.max_price_impact_bps
+            || self.dust_fallback_max_price_impact_bps > f64::from(BPS_DENOMINATOR)
+        {
+            return Err(IcpswapFirstPlannerError::InvalidInput(format!(
+                "dust fallback ICPSwap impact must be between {:.2} and {} bps",
+                self.max_price_impact_bps, BPS_DENOMINATOR
+            )));
+        }
         if !self.cex_min_exec_usd.is_finite() || self.cex_min_exec_usd < 0.0 {
             return Err(IcpswapFirstPlannerError::InvalidInput(
                 "CEX minimum execution USD must be finite and non-negative".to_string(),
@@ -61,6 +72,13 @@ impl IcpswapFirstPlannerConfig {
                 "minimum net edge {} bps exceeds {} bps",
                 self.min_net_edge_bps, BPS_DENOMINATOR
             )));
+        }
+        if let Some(value) = self.icpswap_test_allocation_usd
+            && (!value.is_finite() || value <= 0.0)
+        {
+            return Err(IcpswapFirstPlannerError::InvalidInput(
+                "test ICPSwap allocation USD must be finite and positive".to_string(),
+            ));
         }
         Ok(())
     }
@@ -272,6 +290,10 @@ impl IcpswapFirstPlanner {
             return self.plan_overflow_only(input, quoted_at).await;
         }
 
+        if let Some(target_usd) = self.config.icpswap_test_allocation_usd {
+            return self.plan_test_fixed_icpswap_split(input, quoted_at, target_usd).await;
+        }
+
         // The common safe-ICPSwap path needs no CEX data. Quote ICPSwap alone
         // first so adding overflow venues does not add unconditional latency or
         // API load to every liquidation.
@@ -328,6 +350,123 @@ impl IcpswapFirstPlanner {
                 )
             }
         }
+    }
+
+    /// Test-only deterministic split used to exercise concurrent venue status
+    /// and execution. Normal price-impact allocation remains unchanged when
+    /// the override is absent.
+    async fn plan_test_fixed_icpswap_split(
+        &self,
+        input: &IcpswapFirstPlanInput,
+        quoted_at: i64,
+        target_usd: f64,
+    ) -> Result<MultiVenueExecutionState, IcpswapFirstPlannerError> {
+        if self.overflow_venue_ids.is_empty() {
+            return Err(IcpswapFirstPlannerError::NoViableRoute(
+                "test ICPSwap split requires an enabled overflow venue".to_string(),
+            ));
+        }
+        let reference_price = input.pay_reference_price_usd.ok_or_else(|| {
+            IcpswapFirstPlannerError::NoViableRoute(
+                "test ICPSwap USD split requires a positive collateral reference price".to_string(),
+            )
+        })?;
+        let icpswap_value =
+            ChainTokenAmount::from_formatted(input.total_pay.token.clone(), target_usd / reference_price).value;
+        if icpswap_value == Nat::from(0u8) {
+            return Err(IcpswapFirstPlannerError::NoViableRoute(format!(
+                "test ICPSwap allocation ${target_usd:.2} rounds to zero native units"
+            )));
+        }
+        if icpswap_value >= input.total_pay.value {
+            return Err(IcpswapFirstPlannerError::NoViableRoute(format!(
+                "received collateral is too small to split ${target_usd:.2} to ICPSwap and leave a MEXC remainder"
+            )));
+        }
+
+        let remainder_value = input.total_pay.value.clone() - icpswap_value.clone();
+        let remainder = ChainTokenAmount::from_raw(input.total_pay.token.clone(), remainder_value.clone());
+        if !input.meets_cex_minimum(&remainder, self.config.cex_min_exec_usd) {
+            return self.plan_below_minimum_remainder(input, quoted_at).await;
+        }
+
+        let icpswap_request = input.request_for(ICPSWAP_VENUE_ID, icpswap_value);
+        let (icpswap_result, overflow_result) = tokio::join!(
+            self.preview_exact(input, ICPSWAP_VENUE_ID, &icpswap_request),
+            self.preview_overflow(input, remainder_value),
+        );
+        let icpswap = icpswap_result?;
+        if !self.is_safe_icpswap(&icpswap) {
+            return Err(IcpswapFirstPlannerError::NoViableRoute(format!(
+                "test ICPSwap allocation impact {:.2} bps is not below {:.2} bps",
+                icpswap.quote.estimated_price_impact_bps, self.config.max_price_impact_bps
+            )));
+        }
+        let overflow_quotes = overflow_result?;
+        let overflow = self
+            .best_executable_overflow(input, &overflow_quotes)
+            .ok_or_else(|| IcpswapFirstPlannerError::NoViableRoute(self.overflow_failure_summary(&overflow_quotes)))?;
+
+        self.build_state(
+            input,
+            vec![icpswap, overflow.clone()],
+            MultiVenueAllocationReason::PriceImpactSplit,
+            quoted_at,
+        )
+    }
+
+    // Avoids a dust overflow leg by re-quoting the full amount on ICPSwap with
+    // the narrowly relaxed fallback cap. If that quote is still too expensive,
+    // the full amount is sent to the best executable overflow venue.
+    async fn plan_below_minimum_remainder(
+        &self,
+        input: &IcpswapFirstPlanInput,
+        quoted_at: i64,
+    ) -> Result<MultiVenueExecutionState, IcpswapFirstPlannerError> {
+        let icpswap_request = input.request_for(ICPSWAP_VENUE_ID, input.total_pay.value.clone());
+        let icpswap = match self.preview_exact(input, ICPSWAP_VENUE_ID, &icpswap_request).await {
+            Ok(icpswap) => icpswap,
+            Err(error) => {
+                return self
+                    .plan_full_overflow_after_icpswap_failure(input, quoted_at, &error)
+                    .await;
+            }
+        };
+        if self.is_safe_dust_fallback_icpswap(&icpswap) {
+            return self.build_state(
+                input,
+                vec![icpswap],
+                MultiVenueAllocationReason::RemainderBelowMinimum {
+                    skipped_venue_ids: self.overflow_venue_ids.clone(),
+                    selected_venue_id: ICPSWAP_VENUE_ID.to_string(),
+                },
+                quoted_at,
+            );
+        }
+
+        let overflow_quotes = self.preview_overflow(input, input.total_pay.value.clone()).await?;
+        let overflow = self.best_executable_overflow(input, &overflow_quotes).ok_or_else(|| {
+            IcpswapFirstPlannerError::NoViableRoute(format!(
+                "full ICPSwap quote exceeds the dust-fallback price-impact limit and the below-minimum remainder cannot be split; {}",
+                self.overflow_failure_summary(&overflow_quotes)
+            ))
+        })?;
+        let mut skipped_venue_ids = vec![ICPSWAP_VENUE_ID.to_string()];
+        skipped_venue_ids.extend(
+            self.overflow_venue_ids
+                .iter()
+                .filter(|venue_id| venue_id.as_str() != overflow.venue_id.as_str())
+                .cloned(),
+        );
+        self.build_state(
+            input,
+            vec![overflow.clone()],
+            MultiVenueAllocationReason::RemainderBelowMinimum {
+                skipped_venue_ids,
+                selected_venue_id: overflow.venue_id.clone(),
+            },
+            quoted_at,
+        )
     }
 
     // Non-native ICP collateral cannot use ICPSwap, so choose the executable
@@ -400,50 +539,7 @@ impl IcpswapFirstPlanner {
         let remainder = ChainTokenAmount::from_raw(input.total_pay.token.clone(), remainder_value.clone());
 
         if !input.meets_cex_minimum(&remainder, self.config.cex_min_exec_usd) {
-            let icpswap_request = input.request_for(ICPSWAP_VENUE_ID, input.total_pay.value.clone());
-            let icpswap = match self.preview_exact(input, ICPSWAP_VENUE_ID, &icpswap_request).await {
-                Ok(icpswap) => icpswap,
-                Err(error) => {
-                    return self
-                        .plan_full_overflow_after_icpswap_failure(input, quoted_at, &error)
-                        .await;
-                }
-            };
-            if self.is_safe_icpswap(&icpswap) {
-                return self.build_state(
-                    input,
-                    vec![icpswap],
-                    MultiVenueAllocationReason::RemainderBelowMinimum {
-                        skipped_venue_ids: self.overflow_venue_ids.clone(),
-                        selected_venue_id: ICPSWAP_VENUE_ID.to_string(),
-                    },
-                    quoted_at,
-                );
-            }
-
-            let overflow_quotes = self.preview_overflow(input, input.total_pay.value.clone()).await?;
-            let overflow = self.best_executable_overflow(input, &overflow_quotes).ok_or_else(|| {
-                IcpswapFirstPlannerError::NoViableRoute(format!(
-                    "full ICPSwap quote exceeds the price-impact limit and the below-minimum remainder cannot be split; {}",
-                    self.overflow_failure_summary(&overflow_quotes)
-                ))
-            })?;
-            let mut skipped_venue_ids = vec![ICPSWAP_VENUE_ID.to_string()];
-            skipped_venue_ids.extend(
-                self.overflow_venue_ids
-                    .iter()
-                    .filter(|venue_id| venue_id.as_str() != overflow.venue_id.as_str())
-                    .cloned(),
-            );
-            return self.build_state(
-                input,
-                vec![overflow.clone()],
-                MultiVenueAllocationReason::RemainderBelowMinimum {
-                    skipped_venue_ids,
-                    selected_venue_id: overflow.venue_id.clone(),
-                },
-                quoted_at,
-            );
+            return self.plan_below_minimum_remainder(input, quoted_at).await;
         }
 
         if safe_value == Nat::from(0u8) {
@@ -552,6 +648,12 @@ impl IcpswapFirstPlanner {
     // The threshold is strict: exactly 100 bps is not below a 100 bps limit.
     fn is_safe_icpswap(&self, preview: &VenueRoutePreview) -> bool {
         preview.quote.estimated_price_impact_bps < self.config.max_price_impact_bps
+    }
+
+    // This relaxed cap applies only when the overflow remainder cannot meet
+    // its venue minimum. "Up to" is inclusive at exactly the configured cap.
+    fn is_safe_dust_fallback_icpswap(&self, preview: &VenueRoutePreview) -> bool {
+        preview.quote.estimated_price_impact_bps <= self.config.dust_fallback_max_price_impact_bps
     }
 
     // Re-quotes one venue for an exact allocation and verifies that its state,

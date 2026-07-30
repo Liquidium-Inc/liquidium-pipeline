@@ -484,6 +484,8 @@ mod tests {
             icpswap_fee_tiers: vec![candid::Nat::from(500u32), candid::Nat::from(3000u32)],
             icpswap_max_price_impact_bps: 100.0,
             icpswap_max_search_iterations: 16,
+            icpswap_dust_fallback_max_price_impact_bps: 150.0,
+            icpswap_test_allocation_usd: None,
             enabled_swap_venues: vec!["icpswap".to_string(), "mexc".to_string()],
             cex_credentials: HashMap::new(),
             opportunity_account_filter: vec![],

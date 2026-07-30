@@ -228,8 +228,11 @@ async fn init(
             IcpswapFirstPlannerConfig {
                 max_price_impact_bps: config.get_icpswap_max_price_impact_bps(),
                 max_search_iterations: config.get_icpswap_max_search_iterations(),
+                dust_fallback_max_price_impact_bps: config
+                    .get_icpswap_dust_fallback_max_price_impact_bps(),
                 cex_min_exec_usd: config.get_cex_min_exec_usd(),
                 min_net_edge_bps: config.get_cex_min_net_edge_bps(),
+                icpswap_test_allocation_usd: config.get_icpswap_test_allocation_usd(),
             },
         )?
         .with_watchdog(slack_watchdog_from_env(DEFAULT_LOW_BALANCE_ALERT_COOLDOWN)),

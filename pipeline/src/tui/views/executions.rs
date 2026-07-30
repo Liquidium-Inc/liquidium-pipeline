@@ -11,7 +11,8 @@ use serde_json::Value;
 
 use crate::finalizers::liquidation_outcome::LiquidationOutcome;
 use crate::persistance::{
-    FinalizerMetaPayload, FinalizerMetaV2, LiqMetaWrapper, ResultStatus, VenueExecutionState, WalProfitSnapshot,
+    FinalizerMetaPayload, FinalizerMetaV2, LiqMetaWrapper, ResultStatus, VenueExecutionState, VenueLegState,
+    VenueLegStatus, WalProfitSnapshot,
 };
 use crate::stages::executor::{ExecutionReceipt, ExecutionStatus};
 use crate::swappers::icpswap::{VENUE_ID as ICPSWAP_VENUE_ID, identity::IcpswapExecutionIdentity};
@@ -359,20 +360,78 @@ fn append_multi_venue_summary(lines: &mut Vec<Line<'static>>, meta: Option<&Fina
     let FinalizerMetaPayload::MultiVenueSwap(state) = &meta.payload;
 
     push_section_title(lines, "Multi-Venue Execution");
-    for leg in &state.legs {
-        lines.push(Line::from(format!(
-            "Leg {}: venue={} status={:?}",
-            leg.leg_id, leg.venue_id, leg.status
-        )));
+    lines.push(Line::from(format!(
+        "Strategy: {} | outcome: {:?}",
+        state.plan.strategy_id, state.outcome
+    )));
+    lines.push(Line::from(format!(
+        "Allocation: {:?} | conservative edge: {:.2} bps",
+        state.plan.allocation_reason, state.plan.combined_net_edge_bps
+    )));
+
+    let last = state.legs.len().saturating_sub(1);
+    for (index, leg) in state.legs.iter().enumerate() {
+        append_venue_leg_summary(lines, leg, index == last);
         if leg.venue_id == ICPSWAP_VENUE_ID {
             match icpswap_account_principal(&leg.execution) {
-                Ok(principal) => lines.push(Line::from(format!("ICPSwap account principal: {principal}"))),
+                Ok(principal) => lines.push(Line::from(format!("   Execution principal: {principal}"))),
                 Err(error) => lines.push(Line::from(Span::styled(
-                    format!("ICPSwap account principal: <unavailable: {}>", truncate(&error, 140)),
+                    format!("   Execution principal: <unavailable: {}>", truncate(&error, 140)),
                     Style::default().fg(Color::Yellow),
                 ))),
             }
         }
+    }
+}
+
+fn append_venue_leg_summary(lines: &mut Vec<Line<'static>>, leg: &VenueLegState, is_last: bool) {
+    let branch = if is_last { "└─" } else { "├─" };
+    let stage = super::dashboard::venue_leg_stage(leg);
+    let style = venue_detail_style(leg.status);
+    lines.push(Line::from(vec![
+        Span::styled(
+            format!("{branch} {}", super::dashboard::venue_display_name(&leg.venue_id)),
+            style.add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(" · "),
+        Span::styled(stage, style),
+    ]));
+    lines.push(Line::from(format!(
+        "   Allocation: {}",
+        leg.request.pay_amount.formatted()
+    )));
+    lines.push(Line::from(format!(
+        "   Quote: expected {} | conservative {} | impact {:.2} bps",
+        leg.quote.estimated_receive.formatted(),
+        leg.quote.conservative_receive.formatted(),
+        leg.quote.estimated_price_impact_bps
+    )));
+    lines.push(Line::from(format!("   Route: {}", leg.quote.route_id)));
+
+    if let Some(result) = &leg.result {
+        let mut received = leg.quote.estimated_receive.clone();
+        received.value = result.receive_amount.clone();
+        lines.push(Line::from(Span::styled(
+            format!("   Realized: {} | status: {}", received.formatted(), result.status),
+            Style::default().fg(Color::Green),
+        )));
+    }
+    if let Some(error) = leg.last_error.as_deref() {
+        lines.push(Line::from(Span::styled(
+            format!("   Last error: {error}"),
+            Style::default().fg(Color::Red),
+        )));
+    }
+}
+
+fn venue_detail_style(status: VenueLegStatus) -> Style {
+    match status {
+        VenueLegStatus::Completed => Style::default().fg(Color::Green),
+        VenueLegStatus::Recovered => Style::default().fg(Color::Cyan),
+        VenueLegStatus::OperatorRequired => Style::default().fg(Color::Magenta),
+        VenueLegStatus::FailedPermanent => Style::default().fg(Color::Red),
+        VenueLegStatus::Running => Style::default().fg(Color::Yellow),
+        VenueLegStatus::Planned => Style::default().fg(Color::DarkGray),
     }
 }
 
@@ -700,16 +759,17 @@ fn format_profit(amount: i128, decimals: u8, symbol: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        WalProfitSnapshot, append_meta_summary, icpswap_account_principal, profit_display_from_snapshot, status_label,
-        truncate,
+        WalProfitSnapshot, append_meta_summary, append_venue_leg_summary, icpswap_account_principal,
+        profit_display_from_snapshot, status_label, truncate,
     };
     use crate::{
-        persistance::{ResultStatus, VenueExecutionState},
+        persistance::{ResultStatus, VenueExecutionState, VenueLegQuote, VenueLegState, VenueLegStatus},
         swappers::icpswap::{
             identity::IcpswapExecutionIdentity,
             transfer_state::{IcpswapFundingState, IcpswapLedgerTransferState, IcpswapSettlementState},
             types::{IcpswapExecutionPlan, IcpswapExecutionState},
         },
+        swappers::model::SwapRequest,
     };
     use candid::{Nat, Principal};
     use icrc_ledger_types::icrc1::account::Account;
@@ -727,6 +787,60 @@ mod tests {
     #[test]
     fn unresumable_status_is_visible_in_executions() {
         assert_eq!(status_label(ResultStatus::Unresumable), "unresumable");
+    }
+
+    #[test]
+    fn execution_details_show_venue_branch_stage_quote_route_and_error() {
+        let pay_token = ChainToken::EvmNative {
+            chain: "ICP".to_string(),
+            symbol: "ICP".to_string(),
+            decimals: 2,
+            fee: Nat::from(1u8),
+        };
+        let receive_token = ChainToken::EvmNative {
+            chain: "ICP".to_string(),
+            symbol: "ckUSDC".to_string(),
+            decimals: 2,
+            fee: Nat::from(1u8),
+        };
+        let pay_amount = ChainTokenAmount::from_raw(pay_token.clone(), Nat::from(720u64));
+        let receive_amount = ChainTokenAmount::from_raw(receive_token.clone(), Nat::from(810u64));
+        let leg = VenueLegState {
+            leg_id: "mexc-0".to_string(),
+            venue_id: "mexc".to_string(),
+            request: SwapRequest {
+                pay_asset: pay_token.asset_id(),
+                pay_amount: pay_amount.clone(),
+                receive_asset: receive_token.asset_id(),
+                receive_address: None,
+                max_slippage_bps: Some(100),
+                venue_hint: Some("mexc".to_string()),
+            },
+            quote: VenueLegQuote {
+                pay_amount,
+                estimated_receive: receive_amount.clone(),
+                conservative_receive: receive_amount,
+                estimated_price_impact_bps: 12.5,
+                route_id: "ICP_USDC".to_string(),
+            },
+            execution: VenueExecutionState {
+                venue: "mexc".to_string(),
+                state: serde_json::json!({ "cex": { "step": "WithdrawPending" } }),
+            },
+            status: VenueLegStatus::Running,
+            result: None,
+            last_error: Some("waiting for bridge".to_string()),
+        };
+
+        let mut lines = Vec::new();
+        append_venue_leg_summary(&mut lines, &leg, true);
+        let text = lines_as_text(&lines);
+
+        assert_eq!(text[0], "└─ MEXC · withdraw pending");
+        assert!(text.iter().any(|line| line == "   Allocation: ICP: 7.20"));
+        assert!(text.iter().any(|line| line.contains("impact 12.50 bps")));
+        assert!(text.iter().any(|line| line == "   Route: ICP_USDC"));
+        assert!(text.iter().any(|line| line == "   Last error: waiting for bridge"));
     }
 
     #[test]

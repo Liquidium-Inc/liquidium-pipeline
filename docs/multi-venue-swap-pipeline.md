@@ -198,7 +198,7 @@ Important policy rules:
 4. If the full quote is unsafe, search for the largest confirmed-safe ICPSwap allocation.
 5. Binary search is bounded to 16 iterations and retains the last safe lower bound.
 6. Exact final allocations are quoted again before commitment.
-7. When the remainder is below `CEX_MIN_EXEC_USD`, use a refreshed full ICPSwap quote only if it remains below 100 bps; otherwise send the full amount to the best executable overflow venue or reject the route.
+7. When the remainder is below `CEX_MIN_EXEC_USD`, use a refreshed full ICPSwap quote when it is at or below `ICPSWAP_DUST_FALLBACK_MAX_PRICE_IMPACT_BPS` (150 bps by default); otherwise send the full amount to the best executable overflow venue or reject the route.
 8. A better MEXC price does not reduce the policy's ICPSwap allocation.
 9. The combined conservative output must satisfy the configured net-edge floor, currently 150 bps.
 10. Invalid venue previews are discarded; valid venues remain eligible.

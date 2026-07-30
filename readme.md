@@ -154,6 +154,12 @@ BALANCE_CHECK_EXCLUDE=ckETH,ETH
 # Ordered venues eligible for new plans. Omit to enable both by default.
 ENABLED_SWAP_VENUES=icpswap,mexc
 
+# Optional test-only split override. Unset in production.
+# Sends approximately $1 of native ICP to ICPSwap and the remainder to MEXC.
+ICPSWAP_TEST_ALLOCATION_USD=1
+# Allow full ICPSwap up to 1.5% impact only when the MEXC remainder is dust.
+ICPSWAP_DUST_FALLBACK_MAX_PRICE_IMPACT_BPS=150
+
 # CEX (MEXC) - Optional
 CEX_MEXC_API_KEY=your_api_key
 CEX_MEXC_API_SECRET=your_api_secret
@@ -168,7 +174,7 @@ BAD_DEBT_COLLATERAL_SLIPPAGE_BPS=500  # 5.00% haircut used for min collateral
 ```bash
 # CEX trade slicing and execution controls
 # Skip execution chunks below this USD notional (treat as dust)
-CEX_MIN_EXEC_USD=1.1
+CEX_MIN_EXEC_USD=8
 # Per-slice impact target ratio of MAX_ALLOWED_CEX_SLIPPAGE_BPS
 CEX_SLICE_TARGET_RATIO=0.7
 # Arm adaptive buy fallback when truncation ratio is >= this value

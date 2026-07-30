@@ -82,6 +82,12 @@ pub struct Config {
     /// Iteration budget for the planner's binary search for the largest safe
     /// ICPSwap allocation. Each iteration costs one pool quote.
     pub icpswap_max_search_iterations: u8,
+    /// Higher ICPSwap impact cap used only when an overflow remainder is below
+    /// the venue minimum and the planner considers sending the full amount DEX-side.
+    pub icpswap_dust_fallback_max_price_impact_bps: f64,
+    /// Test-only fixed USD allocation sent to ICPSwap before routing the
+    /// remainder to an overflow venue. Unset preserves the normal policy.
+    pub icpswap_test_allocation_usd: Option<f64>,
     /// Ordered venue IDs eligible for new multi-venue plans.
     pub enabled_swap_venues: Vec<String>,
     pub cex_credentials: HashMap<String, (String, String)>,
@@ -112,6 +118,8 @@ pub trait ConfigTrait: Send + Sync {
     fn get_cex_mexc_max_hops(&self) -> u8;
     fn get_icpswap_max_price_impact_bps(&self) -> f64;
     fn get_icpswap_max_search_iterations(&self) -> u8;
+    fn get_icpswap_dust_fallback_max_price_impact_bps(&self) -> f64;
+    fn get_icpswap_test_allocation_usd(&self) -> Option<f64>;
     #[allow(dead_code)]
     fn get_lending_canister(&self) -> Principal;
     #[allow(dead_code)]
@@ -214,6 +222,14 @@ impl ConfigTrait for Config {
 
     fn get_icpswap_max_search_iterations(&self) -> u8 {
         self.icpswap_max_search_iterations
+    }
+
+    fn get_icpswap_dust_fallback_max_price_impact_bps(&self) -> f64 {
+        self.icpswap_dust_fallback_max_price_impact_bps
+    }
+
+    fn get_icpswap_test_allocation_usd(&self) -> Option<f64> {
+        self.icpswap_test_allocation_usd
     }
 
     fn get_enabled_swap_venues(&self) -> Vec<String> {
@@ -328,6 +344,12 @@ impl Config {
         let cex_mexc_max_hops = parse_cex_mexc_max_hops_from_env();
         let icpswap_factory_canister = parse_icpswap_factory_from_env()?;
         let icpswap_fee_tiers = parse_icpswap_fee_tiers_from_env()?;
+        let icpswap_test_allocation_usd = parse_icpswap_test_allocation_usd_from_env()?;
+        if let Some(value) = icpswap_test_allocation_usd {
+            warn!(
+                "TEST-ONLY ICPSwap split is enabled: approximately ${value:.2} goes to ICPSwap and the remainder to MEXC"
+            );
+        }
 
         let enabled_swap_venues = parse_enabled_swap_venues_from_env()?;
         if let Ok(legacy) = env::var("SWAPPER") {
@@ -399,6 +421,9 @@ impl Config {
             icpswap_fee_tiers,
             icpswap_max_price_impact_bps: parse_icpswap_max_price_impact_bps_from_env(),
             icpswap_max_search_iterations: parse_icpswap_max_search_iterations_from_env(),
+            icpswap_dust_fallback_max_price_impact_bps:
+                parse_icpswap_dust_fallback_max_price_impact_bps_from_env(),
+            icpswap_test_allocation_usd,
             enabled_swap_venues,
             cex_credentials,
             opportunity_account_filter,
@@ -445,7 +470,7 @@ struct CexTunables {
     route_fee_bps: u32,
 }
 
-const DEFAULT_CEX_MIN_EXEC_USD: f64 = 1.1;
+const DEFAULT_CEX_MIN_EXEC_USD: f64 = 8.0;
 const DEFAULT_CEX_SLICE_TARGET_RATIO: f64 = 0.7;
 const DEFAULT_CEX_BUY_TRUNCATION_TRIGGER_RATIO: f64 = 0.25;
 const DEFAULT_CEX_BUY_INVERSE_OVERSPEND_BPS: u32 = 10;
@@ -473,6 +498,7 @@ const DEFAULT_BRIDGE_CKETH_MINTER_CANISTER: &str = "sv3dd-oaaaa-aaaar-qacoa-cai"
 pub const DEFAULT_ICPSWAP_FACTORY_CANISTER: &str = "4mmnk-kiaaa-aaaag-qbllq-cai";
 const DEFAULT_ICPSWAP_FEE_TIERS: &str = "100,500,3000,10000";
 const DEFAULT_ICPSWAP_MAX_PRICE_IMPACT_BPS: f64 = 100.0;
+const DEFAULT_ICPSWAP_DUST_FALLBACK_MAX_PRICE_IMPACT_BPS: f64 = 150.0;
 const DEFAULT_ICPSWAP_MAX_SEARCH_ITERATIONS: u8 = 16;
 const DEFAULT_ENABLED_SWAP_VENUES: &str = "icpswap,mexc";
 const SUPPORTED_SWAP_VENUES: [&str; 2] = ["icpswap", "mexc"];
@@ -578,6 +604,33 @@ fn parse_icpswap_max_search_iterations_from_env() -> u8 {
         .and_then(|value| value.trim().parse::<u8>().ok())
         .filter(|value| *value > 0)
         .unwrap_or(DEFAULT_ICPSWAP_MAX_SEARCH_ITERATIONS)
+}
+
+fn parse_icpswap_dust_fallback_max_price_impact_bps_from_env() -> f64 {
+    env::var("ICPSWAP_DUST_FALLBACK_MAX_PRICE_IMPACT_BPS")
+        .ok()
+        .and_then(|value| value.trim().parse::<f64>().ok())
+        .filter(|value| value.is_finite() && *value > 0.0)
+        .unwrap_or(DEFAULT_ICPSWAP_DUST_FALLBACK_MAX_PRICE_IMPACT_BPS)
+}
+
+fn parse_icpswap_test_allocation_usd_from_env() -> Result<Option<f64>, String> {
+    let Ok(raw) = env::var("ICPSWAP_TEST_ALLOCATION_USD") else {
+        return Ok(None);
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    let value = trimmed
+        .parse::<f64>()
+        .map_err(|_| format!("ICPSWAP_TEST_ALLOCATION_USD='{trimmed}' must be a positive USD amount"))?;
+    if !value.is_finite() || value <= 0.0 {
+        return Err(format!(
+            "ICPSWAP_TEST_ALLOCATION_USD='{trimmed}' must be finite and positive"
+        ));
+    }
+    Ok(Some(value))
 }
 
 pub(crate) fn parse_icpswap_fee_tiers_from_env() -> Result<Vec<candid::Nat>, String> {
@@ -769,7 +822,7 @@ mod tests {
         assert_eq!(
             parsed,
             CexTunables {
-                min_exec_usd: 1.1,
+                min_exec_usd: 8.0,
                 slice_target_ratio: 0.7,
                 buy_truncation_trigger_ratio: 0.25,
                 buy_inverse_overspend_bps: 10,
@@ -838,7 +891,7 @@ mod tests {
         }
 
         let parsed = parse_cex_tunables_from_env();
-        assert_eq!(parsed.min_exec_usd, 1.1);
+        assert_eq!(parsed.min_exec_usd, 8.0);
         assert_eq!(parsed.slice_target_ratio, 1.0);
         assert_eq!(parsed.buy_truncation_trigger_ratio, 0.0);
         assert_eq!(parsed.buy_inverse_overspend_bps, 100);
@@ -856,6 +909,33 @@ mod tests {
             env::remove_var("BAD_DEBT_COLLATERAL_SLIPPAGE_BPS");
         }
         assert_eq!(parse_bad_debt_collateral_slippage_bps_from_env(), 500);
+    }
+
+    #[test]
+    fn parse_icpswap_test_allocation_is_optional_and_strictly_positive() {
+        let _guard = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        unsafe { env::remove_var("ICPSWAP_TEST_ALLOCATION_USD") };
+        assert_eq!(parse_icpswap_test_allocation_usd_from_env().unwrap(), None);
+
+        unsafe { env::set_var("ICPSWAP_TEST_ALLOCATION_USD", "1") };
+        assert_eq!(parse_icpswap_test_allocation_usd_from_env().unwrap(), Some(1.0));
+
+        unsafe { env::set_var("ICPSWAP_TEST_ALLOCATION_USD", "0") };
+        assert!(parse_icpswap_test_allocation_usd_from_env().is_err());
+
+        unsafe { env::remove_var("ICPSWAP_TEST_ALLOCATION_USD") };
+    }
+
+    #[test]
+    fn parse_icpswap_dust_fallback_impact_defaults_to_150_and_accepts_override() {
+        let _guard = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        unsafe { env::remove_var("ICPSWAP_DUST_FALLBACK_MAX_PRICE_IMPACT_BPS") };
+        assert_eq!(parse_icpswap_dust_fallback_max_price_impact_bps_from_env(), 150.0);
+
+        unsafe { env::set_var("ICPSWAP_DUST_FALLBACK_MAX_PRICE_IMPACT_BPS", "175") };
+        assert_eq!(parse_icpswap_dust_fallback_max_price_impact_bps_from_env(), 175.0);
+
+        unsafe { env::remove_var("ICPSWAP_DUST_FALLBACK_MAX_PRICE_IMPACT_BPS") };
     }
 
     #[test]

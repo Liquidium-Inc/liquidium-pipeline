@@ -611,8 +611,10 @@ fn planner_config() -> IcpswapFirstPlannerConfig {
     IcpswapFirstPlannerConfig {
         max_price_impact_bps: 100.0,
         max_search_iterations: 16,
+        dust_fallback_max_price_impact_bps: 150.0,
         cex_min_exec_usd: 0.01,
         min_net_edge_bps: 150,
+        icpswap_test_allocation_usd: None,
     }
 }
 

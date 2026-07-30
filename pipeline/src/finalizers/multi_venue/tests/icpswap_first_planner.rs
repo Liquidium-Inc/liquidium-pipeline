@@ -210,8 +210,10 @@ fn config(cex_min_exec_usd: f64) -> IcpswapFirstPlannerConfig {
     IcpswapFirstPlannerConfig {
         max_price_impact_bps: 100.0,
         max_search_iterations: 16,
+        dust_fallback_max_price_impact_bps: 150.0,
         cex_min_exec_usd,
         min_net_edge_bps: 150,
+        icpswap_test_allocation_usd: None,
     }
 }
 
@@ -454,6 +456,37 @@ async fn full_icpswap_below_limit_wins_even_when_mexc_output_is_better() {
 }
 
 #[tokio::test]
+async fn test_usd_override_sends_one_dollar_to_icpswap_and_exact_remainder_to_mexc() {
+    let icpswap_calls = Arc::new(Mutex::new(Vec::new()));
+    let mexc_calls = Arc::new(Mutex::new(Vec::new()));
+    let icpswap = mock_adapter(ICPSWAP_VENUE_ID, icpswap_calls.clone(), |request| {
+        Ok(proportional_preview(request, ICPSWAP_VENUE_ID, 10.0, 2))
+    });
+    let mexc = mock_adapter(MEXC_VENUE_ID, mexc_calls.clone(), |request| {
+        Ok(proportional_preview(request, MEXC_VENUE_ID, 10.0, 2))
+    });
+    let mut planner_config = config(8.0);
+    planner_config.icpswap_test_allocation_usd = Some(1.0);
+
+    let state = planner(icpswap, mexc, planner_config)
+        .plan(&input_with_pay_token(native_icp()), 123)
+        .await
+        .expect("forced test split");
+
+    // The test reference price is $10/ICP and ICP has 8 decimals, so $1 is
+    // exactly 0.1 ICP = 10_000_000 native units.
+    assert_eq!(*icpswap_calls.lock().expect("ICPSwap calls"), vec![10_000_000]);
+    assert_eq!(*mexc_calls.lock().expect("MEXC calls"), vec![90_000_000]);
+    assert_eq!(state.legs.len(), 2);
+    assert_eq!(state.legs[0].venue_id, ICPSWAP_VENUE_ID);
+    assert_eq!(state.legs[1].venue_id, MEXC_VENUE_ID);
+    assert_eq!(
+        state.plan.allocation_reason,
+        MultiVenueAllocationReason::PriceImpactSplit
+    );
+}
+
+#[tokio::test]
 async fn icpswap_only_accepts_a_safe_native_icp_quote() {
     let calls = Arc::new(Mutex::new(Vec::new()));
     let calls_for_assert = calls.clone();
@@ -626,14 +659,14 @@ async fn exact_price_impact_limit_is_excluded() {
 async fn sub_minimum_mexc_remainder_uses_full_mexc_when_full_icpswap_is_unsafe() {
     let icpswap = mock_adapter(ICPSWAP_VENUE_ID, Arc::new(Mutex::new(Vec::new())), |request| {
         let pay = request.pay_amount.value.0.to_u64().expect("u64 pay");
-        let impact = pay as f64 / 900_000.0;
+        let impact = pay as f64 / 625_000.0;
         Ok(proportional_preview(request, ICPSWAP_VENUE_ID, impact, 2))
     });
     let mexc = mock_adapter(MEXC_VENUE_ID, Arc::new(Mutex::new(Vec::new())), |request| {
         Ok(proportional_preview(request, MEXC_VENUE_ID, 0.0, 2))
     });
 
-    let state = planner(icpswap, mexc, config(1.1))
+    let state = planner(icpswap, mexc, config(8.0))
         .plan(&input_with_pay_token(native_icp()), 123)
         .await
         .expect("safe full-venue fallback");
@@ -648,6 +681,30 @@ async fn sub_minimum_mexc_remainder_uses_full_mexc_when_full_icpswap_is_unsafe()
             selected_venue_id: MEXC_VENUE_ID.to_string(),
         }
     );
+}
+
+#[tokio::test]
+async fn below_minimum_remainder_allows_full_icpswap_at_the_150_bps_buffer() {
+    let icpswap = mock_adapter(ICPSWAP_VENUE_ID, Arc::new(Mutex::new(Vec::new())), |request| {
+        let pay = request.pay_amount.value.0.to_u64().expect("u64 pay");
+        let impact = pay as f64 / TOTAL_PAY as f64 * 150.0;
+        Ok(proportional_preview(request, ICPSWAP_VENUE_ID, impact, 2))
+    });
+    let mexc_calls = Arc::new(Mutex::new(Vec::new()));
+    let mexc_calls_for_assert = mexc_calls.clone();
+    let mexc = mock_adapter(MEXC_VENUE_ID, mexc_calls, |request| {
+        Ok(proportional_preview(request, MEXC_VENUE_ID, 0.0, 2))
+    });
+
+    let state = planner(icpswap, mexc, config(8.0))
+        .plan(&input_with_pay_token(native_icp()), 123)
+        .await
+        .expect("buffered full ICPSwap fallback");
+
+    assert_eq!(state.legs.len(), 1);
+    assert_eq!(state.legs[0].venue_id, ICPSWAP_VENUE_ID);
+    assert_eq!(state.legs[0].quote.estimated_price_impact_bps, 150.0);
+    assert!(mexc_calls_for_assert.lock().expect("MEXC calls").is_empty());
 }
 
 #[tokio::test]
@@ -870,7 +927,7 @@ async fn below_minimum_overflow_fallback_records_every_skipped_venue() {
         Ok(proportional_preview(
             request,
             ICPSWAP_VENUE_ID,
-            pay as f64 / 900_000.0,
+            pay as f64 / 625_000.0,
             2,
         ))
     });
@@ -880,7 +937,7 @@ async fn below_minimum_overflow_fallback_records_every_skipped_venue() {
     let kraken = mock_adapter(KRAKEN_VENUE_ID, Arc::new(Mutex::new(Vec::new())), |request| {
         Ok(proportional_preview(request, KRAKEN_VENUE_ID, 0.0, 2))
     });
-    let planner_config = config(1.1);
+    let planner_config = config(8.0);
     let planner = IcpswapFirstPlanner::new(
         vec![Arc::new(icpswap), Arc::new(mexc), Arc::new(kraken)],
         planner_config,
@@ -1071,7 +1128,7 @@ async fn below_minimum_remainder_rejects_when_full_icpswap_is_unsafe_and_overflo
         Ok(proportional_preview(
             request,
             ICPSWAP_VENUE_ID,
-            pay as f64 / 900_000.0,
+            pay as f64 / 625_000.0,
             2,
         ))
     });
@@ -1079,7 +1136,7 @@ async fn below_minimum_remainder_rejects_when_full_icpswap_is_unsafe_and_overflo
         Err("exchange unavailable".to_string())
     });
 
-    let error = planner(icpswap, mexc, config(1.1))
+    let error = planner(icpswap, mexc, config(8.0))
         .plan(&input_with_pay_token(native_icp()), 123)
         .await
         .expect_err("no unsafe full-ICPSwap fallback is allowed");
@@ -1087,7 +1144,7 @@ async fn below_minimum_remainder_rejects_when_full_icpswap_is_unsafe_and_overflo
     assert!(
         error
             .to_string()
-            .contains("full ICPSwap quote exceeds the price-impact limit")
+            .contains("full ICPSwap quote exceeds the dust-fallback price-impact limit")
     );
     assert!(error.to_string().contains("MEXC unavailable"));
 }
