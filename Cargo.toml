@@ -26,6 +26,7 @@ futures = "0.3"
 bip39 = { version = "2.2.0", features = ["rand"] }
 thiserror = "2.0.17"
 hex = "0.4.3"
+uuid = { version = "1.18.1", features = ["v4"] }
 
 # Telemetry
 tracing = { version = "0.1.44", features = ["attributes"] }

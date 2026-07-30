@@ -140,6 +140,24 @@ impl SqliteWalStore {
         Ok(rows.into_iter().map(Self::from_row).collect())
     }
 
+    /// Returns rows whose committed venue work may still require execution or
+    /// reconciliation. Startup inspects these rows and parks incompatible ones
+    /// as `Unresumable` before normal polling begins.
+    pub fn list_unfinished_execution_rows(&self) -> Result<Vec<LiqResultRecord>> {
+        let mut conn = self.get_conn()?;
+        let statuses = [
+            ResultStatus::Enqueued as i32,
+            ResultStatus::InFlight as i32,
+            ResultStatus::FailedRetryable as i32,
+            ResultStatus::OperatorRequired as i32,
+        ];
+        let rows = tbl::table
+            .filter(tbl::status.eq_any(statuses))
+            .order(tbl::created_at.asc())
+            .load::<Row>(&mut conn)?;
+        Ok(rows.into_iter().map(Self::from_row).collect())
+    }
+
     pub fn set_daemon_paused(&self, paused: bool) -> Result<()> {
         self.ensure_writable()?;
         let mut conn = self.get_conn()?;
@@ -335,6 +353,7 @@ pub fn initialize_schema(conn: &mut SqliteConnection) -> Result<()> {
         );
         INSERT OR IGNORE INTO daemon_control_state (singleton_id, paused, updated_at)
         VALUES (1, 0, CAST(strftime('%s','now') AS INTEGER));
+
     "#,
     )?;
     Ok(())
@@ -470,5 +489,116 @@ mod tests {
         let reader = SqliteWalStore::new_read_only_with_busy_timeout(&path, 5_000).expect("reader");
         let err = reader.set_daemon_paused(true).expect_err("write should fail");
         assert!(err.to_string().contains("read-only"));
+    }
+
+    #[test]
+    fn operator_required_rows_are_persisted_but_not_returned_as_pending() {
+        let temp = tempfile::NamedTempFile::new().expect("tmp db");
+        let path = temp.path().display().to_string();
+        let store = SqliteWalStore::new_with_busy_timeout(&path, 5_000).expect("store");
+        let now = now_secs();
+        let make_row = |id: &str, status| LiqResultRecord {
+            id: id.to_string(),
+            status,
+            attempt: 0,
+            error_count: 0,
+            last_error: None,
+            created_at: now,
+            updated_at: now,
+            meta_json: "{}".to_string(),
+        };
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+
+        rt.block_on(async {
+            store
+                .upsert_result(make_row("runnable", ResultStatus::Enqueued))
+                .await
+                .expect("seed runnable row");
+            store
+                .upsert_result(make_row("parked", ResultStatus::OperatorRequired))
+                .await
+                .expect("seed operator-required row");
+
+            let pending = store.get_pending(10).await.expect("pending rows");
+            assert_eq!(pending.len(), 1);
+            assert_eq!(pending[0].id, "runnable");
+
+            let parked = store
+                .list_by_status(ResultStatus::OperatorRequired, 10)
+                .await
+                .expect("operator-required rows");
+            assert_eq!(parked.len(), 1);
+            assert_eq!(parked[0].id, "parked");
+            assert_eq!(parked[0].status, ResultStatus::OperatorRequired);
+        });
+    }
+
+    #[test]
+    fn unfinished_execution_scan_includes_only_resumable_or_operator_rows() {
+        let temp = tempfile::NamedTempFile::new().expect("tmp db");
+        let path = temp.path().display().to_string();
+        let store = SqliteWalStore::new_with_busy_timeout(&path, 5_000).expect("store");
+        let now = now_secs();
+        let row = |id: &str, status| LiqResultRecord {
+            id: id.to_string(),
+            status,
+            attempt: 0,
+            error_count: 0,
+            last_error: None,
+            created_at: now,
+            updated_at: now,
+            meta_json: "{}".to_string(),
+        };
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        rt.block_on(async {
+            for (id, status) in [
+                ("enqueued", ResultStatus::Enqueued),
+                ("in-flight", ResultStatus::InFlight),
+                ("retryable", ResultStatus::FailedRetryable),
+                ("operator", ResultStatus::OperatorRequired),
+                ("unresumable", ResultStatus::Unresumable),
+                ("waiting", ResultStatus::WaitingCollateral),
+                ("succeeded", ResultStatus::Succeeded),
+                ("permanent", ResultStatus::FailedPermanent),
+            ] {
+                store.upsert_result(row(id, status)).await.expect("seed row");
+            }
+        });
+
+        let ids = store
+            .list_unfinished_execution_rows()
+            .expect("unfinished rows")
+            .into_iter()
+            .map(|row| row.id)
+            .collect::<Vec<_>>();
+        assert_eq!(ids, vec!["enqueued", "in-flight", "retryable", "operator"]);
+    }
+
+    #[test]
+    fn unresumable_rows_round_trip_but_are_never_pending() {
+        let temp = tempfile::NamedTempFile::new().expect("tmp db");
+        let path = temp.path().display().to_string();
+        let store = SqliteWalStore::new_with_busy_timeout(&path, 5_000).expect("store");
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        rt.block_on(async {
+            store
+                .upsert_result(LiqResultRecord {
+                    id: "unresumable".to_string(),
+                    status: ResultStatus::Unresumable,
+                    attempt: 0,
+                    error_count: 1,
+                    last_error: Some("disabled venue".to_string()),
+                    created_at: now_secs(),
+                    updated_at: now_secs(),
+                    meta_json: "{}".to_string(),
+                })
+                .await
+                .expect("seed row");
+
+            let stored = store.get_result("unresumable").await.expect("read").expect("row");
+            assert_eq!(stored.status, ResultStatus::Unresumable);
+            assert_eq!(stored.last_error.as_deref(), Some("disabled venue"));
+            assert!(store.get_pending(10).await.expect("pending").is_empty());
+        });
     }
 }

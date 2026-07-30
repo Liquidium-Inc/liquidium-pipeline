@@ -120,6 +120,7 @@ where
                 finalizer_decision: None,
                 profit_snapshot: None,
                 venue_execution: None,
+                meta_v2: None,
             });
             wrapper.receipt = receipt.clone();
             encode_meta(&mut row, &wrapper)?;
@@ -176,6 +177,7 @@ where
             finalizer_decision: None,
             profit_snapshot: None,
             venue_execution: None,
+            meta_v2: None,
         });
         wrapper.receipt = receipt.clone();
         wrapper.profit_snapshot = Some(WalProfitSnapshot {
@@ -654,6 +656,8 @@ mod tests {
             collateral_asset,
             expected_profit: 0,
             ref_price: Nat::from(0u8),
+            debt_ref_price: Nat::from(0u8),
+            ref_price_at: 0,
             debt_approval_needed: false,
             min_collateral_amount: Nat::from(0u8),
         }
@@ -720,6 +724,7 @@ mod tests {
             finalizer_decision: None,
             profit_snapshot: None,
             venue_execution: None,
+            meta_v2: None,
         };
         encode_meta(&mut row, &wrapper).expect("encode_meta should succeed");
         row
@@ -1465,6 +1470,7 @@ mod tests {
                 cex_preview_gross_bps: None,
                 cex_preview_net_bps: None,
                 ts: 1,
+                multi_venue_allocation: None,
             }),
             profit_snapshot: Some(WalProfitSnapshot {
                 expected_profit_raw: "10".to_string(),
@@ -1474,6 +1480,7 @@ mod tests {
                 updated_at: 1,
             }),
             venue_execution: None,
+            meta_v2: None,
         };
         encode_meta(&mut row, &wrapper).expect("encode wrapper");
 

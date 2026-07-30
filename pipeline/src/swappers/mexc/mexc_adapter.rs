@@ -11,12 +11,12 @@ use log::{debug, info, warn};
 use rust_decimal::{Decimal, RoundingStrategy};
 use serde_json::Value;
 
+use crate::swappers::model::BPS_PER_RATIO_UNIT;
+
 /// Default orderbook depth level used for quote-cost and preview estimations.
 const DEFAULT_ORDERBOOK_DEPTH_LIMIT: u32 = 50;
 /// Default record limit for withdrawal history lookups.
 const DEFAULT_WITHDRAW_HISTORY_LIMIT: u32 = 50;
-/// Basis points per 1.00 ratio value.
-const BPS_PER_RATIO_UNIT: f64 = 10_000.0;
 /// MEXC spot fee assumption used to convert gross fills into net-usable output.
 const MEXC_SPOT_FEE_BPS: f64 = 5.01;
 /// Tiny safety increment to avoid borderline balance/rounding rejections between legs.

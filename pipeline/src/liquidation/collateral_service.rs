@@ -13,7 +13,7 @@ use liquidium_pipeline_core::types::protocol_types::{
     Asset, LiquidateblePosition, LiquidatebleUser, MAX_LIQUIDATION_RATIO,
 };
 
-const USD_QUOTE_CURRENCY: &str = "USDT";
+pub(crate) const USD_QUOTE_CURRENCY: &str = "USDT";
 
 #[derive(Debug)]
 pub struct LiquidationEstimation {

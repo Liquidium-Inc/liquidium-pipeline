@@ -19,14 +19,14 @@ const MAX_LOG_LINE_CHARS: usize = 4096;
 pub(super) struct ConfigSummary {
     pub(super) ic_url: String,
     pub(super) lending_canister: String,
-    pub(super) kong_backend: String,
+    pub(super) icpswap_factory: String,
     pub(super) liquidator_principal: String,
     pub(super) trader_principal: String,
     pub(super) evm_address: String,
     pub(super) bridge_evm_address: String,
     pub(super) bridge_ic_owner_principal: String,
     pub(super) bridge_btc_address: String,
-    pub(super) swapper_mode: String,
+    pub(super) enabled_swap_venues: String,
     pub(super) max_dex_slippage_bps: u32,
     pub(super) max_cex_slippage_bps: u32,
     pub(super) bad_debt_collateral_slippage_bps: u32,
@@ -135,6 +135,8 @@ pub(super) struct WalCounts {
     pub(super) failed_permanent: i64,
     pub(super) waiting_collateral: i64,
     pub(super) waiting_profit: i64,
+    pub(super) operator_required: i64,
+    pub(super) unresumable: i64,
     pub(super) total: i64,
 }
 
@@ -148,13 +150,17 @@ impl WalCounts {
         out.failed_permanent = *map.get(&ResultStatus::FailedPermanent).unwrap_or(&0);
         out.waiting_collateral = *map.get(&ResultStatus::WaitingCollateral).unwrap_or(&0);
         out.waiting_profit = *map.get(&ResultStatus::WaitingProfit).unwrap_or(&0);
+        out.operator_required = *map.get(&ResultStatus::OperatorRequired).unwrap_or(&0);
+        out.unresumable = *map.get(&ResultStatus::Unresumable).unwrap_or(&0);
         out.total = out.enqueued
             + out.inflight
             + out.succeeded
             + out.failed_retryable
             + out.failed_permanent
             + out.waiting_collateral
-            + out.waiting_profit;
+            + out.waiting_profit
+            + out.operator_required
+            + out.unresumable;
         out
     }
 }
@@ -490,20 +496,22 @@ impl App {
 
 #[cfg(test)]
 mod tests {
-    use super::{App, ConfigSummary};
+    use super::{App, ConfigSummary, WalCounts};
+    use crate::persistance::ResultStatus;
+    use std::collections::HashMap;
 
     fn sample_config() -> ConfigSummary {
         ConfigSummary {
             ic_url: "https://ic0.app".to_string(),
             lending_canister: "nja4y-2yaaa-aaaae-qddxa-cai".to_string(),
-            kong_backend: "2ipq2-uqaaa-aaaar-qailq-cai".to_string(),
+            icpswap_factory: "4mmnk-kiaaa-aaaag-qbllq-cai".to_string(),
             liquidator_principal: "aaaaa-aa".to_string(),
             trader_principal: "bbbbb-bb".to_string(),
             evm_address: "0x0".to_string(),
             bridge_evm_address: "0xbridge".to_string(),
             bridge_ic_owner_principal: "ccccc-cc".to_string(),
             bridge_btc_address: "bc1qbridge".to_string(),
-            swapper_mode: "Hybrid".to_string(),
+            enabled_swap_venues: "icpswap,mexc".to_string(),
             max_dex_slippage_bps: 500,
             max_cex_slippage_bps: 200,
             bad_debt_collateral_slippage_bps: 500,
@@ -514,6 +522,17 @@ mod tests {
             db_path: "./wal.db".to_string(),
             export_path: "executions.csv".to_string(),
         }
+    }
+
+    #[test]
+    fn wal_counts_include_unresumable_rows() {
+        let counts = WalCounts::from_map(&HashMap::from([
+            (ResultStatus::Succeeded, 2),
+            (ResultStatus::Unresumable, 1),
+        ]));
+
+        assert_eq!(counts.unresumable, 1);
+        assert_eq!(counts.total, 3);
     }
 
     #[test]

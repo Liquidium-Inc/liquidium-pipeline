@@ -4,7 +4,10 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 use crate::stages::executor::ExecutionReceipt;
+pub mod finalizer_meta_v2;
 pub mod sqlite;
+
+pub use finalizer_meta_v2::*;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(i32)]
@@ -19,6 +22,9 @@ pub enum ResultStatus {
     /// External custody is ambiguous and must be reconciled before retrying.
     /// Pending selection deliberately excludes this status.
     OperatorRequired = 7,
+    /// The committed route cannot be reconstructed with the current binary or
+    /// configuration. The row is visible to operators but never auto-polled.
+    Unresumable = 8,
 }
 
 impl From<i32> for ResultStatus {
@@ -34,6 +40,7 @@ impl From<i32> for ResultStatus {
             5 => ResultStatus::WaitingCollateral,
             6 => ResultStatus::WaitingProfit,
             7 => ResultStatus::OperatorRequired,
+            8 => ResultStatus::Unresumable,
             _ => ResultStatus::FailedPermanent,
         }
     }
@@ -49,6 +56,8 @@ pub struct LiqMetaWrapper {
     pub profit_snapshot: Option<WalProfitSnapshot>,
     #[serde(default)]
     pub venue_execution: Option<VenueExecutionState>,
+    #[serde(default)]
+    pub meta_v2: Option<FinalizerMetaV2>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -99,6 +108,8 @@ pub struct FinalizerDecisionSnapshot {
     pub cex_preview_gross_bps: Option<f64>,
     pub cex_preview_net_bps: Option<f64>,
     pub ts: i64,
+    #[serde(default)]
+    pub multi_venue_allocation: Option<MultiVenueAllocationSnapshot>,
 }
 
 #[derive(Debug, Clone)]

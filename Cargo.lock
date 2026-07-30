@@ -3825,6 +3825,7 @@ dependencies = [
  "tracing-log",
  "tracing-subscriber",
  "unicode-width 0.2.1",
+ "uuid",
 ]
 
 [[package]]
