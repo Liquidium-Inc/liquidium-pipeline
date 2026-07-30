@@ -6,7 +6,7 @@ use std::{
 
 use crate::backend::icp_backend::IcpBackend;
 use crate::backend::icp_backend_helpers::icrc1_balance_with_context;
-use crate::crypto::derivation::derive_evm_private_key;
+use crate::crypto::derivation::{derive_evm_private_key, derive_private_key_with_path};
 use async_trait::async_trait;
 use liquidium_pipeline_core::{
     account::actions::AccountInfo,
@@ -36,6 +36,14 @@ pub fn create_identity_from_pem_file(pem_file: &str) -> Result<Box<dyn Identity>
 pub fn derive_icp_identity(mnemonic: &str, account: u32, index: u32) -> Result<Secp256k1Identity, String> {
     let sk = derive_evm_private_key(mnemonic, account, index)?;
     Ok(Secp256k1Identity::from_private_key(sk))
+}
+
+/// Derives an IC secp256k1 identity at a caller-owned, explicit BIP-32 path.
+/// This is used by versioned protocols whose derivation contract must remain
+/// stable independently of the legacy fixed trader-account convention.
+pub fn derive_icp_identity_at_path(mnemonic: &str, path: &str) -> Result<Secp256k1Identity, String> {
+    let secret_key = derive_private_key_with_path(mnemonic, path)?;
+    Ok(Secp256k1Identity::from_private_key(secret_key))
 }
 
 pub fn derive_icp_principal(mnemonic: &str, account: u32, index: u32) -> Result<Principal, String> {
