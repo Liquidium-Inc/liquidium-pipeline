@@ -121,13 +121,22 @@ pub(super) fn sum_leg_outputs(
 
 // Uses integer arithmetic for the pass/fail edge decision so floating-point
 // rounding cannot approve an otherwise unprofitable plan.
+//
+// `minimum_bps` is signed because collateral bought as bad debt can only ever
+// return less than the debt it repaid — the loss was taken when the debt was
+// bought, not by this swap. A negative floor states how much of that shortfall
+// may be recycled automatically; at or below -10000 bps nothing is required.
 pub(super) fn meets_minimum_edge(
     conservative: &ChainTokenAmount,
     debt_repaid: &ChainTokenAmount,
-    minimum_bps: u32,
+    minimum_bps: i32,
 ) -> Result<bool, IcpswapFirstPlannerError> {
     ensure_same_output_token(conservative, debt_repaid)?;
-    let required = debt_repaid.value.clone() * Nat::from(BPS_DENOMINATOR + minimum_bps);
+    let required_bps = i64::from(BPS_DENOMINATOR) + i64::from(minimum_bps);
+    if required_bps <= 0 {
+        return Ok(true);
+    }
+    let required = debt_repaid.value.clone() * Nat::from(required_bps as u64);
     let actual = conservative.value.clone() * Nat::from(BPS_DENOMINATOR);
     Ok(actual >= required)
 }

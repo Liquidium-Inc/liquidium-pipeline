@@ -214,6 +214,7 @@ fn input_with_pay_token(pay_token: ChainToken) -> IcpswapFirstPlanInput {
         pay_reference_price_ray: None,
         receive_reference_price_ray: None,
         reference_price_captured_at: Some(QUOTED_AT),
+        buy_bad_debt: false,
     }
 }
 
@@ -235,6 +236,7 @@ fn native_icp_to_ckusdt_input() -> IcpswapFirstPlanInput {
         pay_reference_price_ray: None,
         receive_reference_price_ray: None,
         reference_price_captured_at: Some(QUOTED_AT),
+        buy_bad_debt: false,
     }
 }
 
@@ -252,6 +254,7 @@ fn ckusdc_to_native_icp_input() -> IcpswapFirstPlanInput {
         pay_reference_price_ray: None,
         receive_reference_price_ray: None,
         reference_price_captured_at: Some(QUOTED_AT),
+        buy_bad_debt: false,
     }
 }
 
@@ -270,6 +273,7 @@ fn config(cex_min_exec_usd: f64) -> IcpswapFirstPlannerConfig {
         dust_fallback_max_price_impact_bps: 150.0,
         cex_min_exec_usd,
         min_net_edge_bps: 150,
+        bad_debt_min_net_edge_bps: 150,
         // Must stay above the 150 bps dust fallback impact cap, which already
         // includes the pool fee.
         max_oracle_discount_bps: 200,
@@ -1994,6 +1998,7 @@ proptest! {
             pay_reference_price_ray: Some(Nat::from(u128::from(pay_price) * RAY)),
             receive_reference_price_ray: Some(Nat::from(u128::from(receive_price) * RAY)),
             reference_price_captured_at: Some(QUOTED_AT),
+            buy_bad_debt: false,
         };
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
