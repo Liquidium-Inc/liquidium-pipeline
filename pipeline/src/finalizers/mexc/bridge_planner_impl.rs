@@ -29,8 +29,4 @@ where
 
         Err(format!("unsupported bridge source chain '{}'", source_chain))
     }
-
-    fn bridge_liquidator_principal(&self) -> Principal {
-        self.liquidator_principal
-    }
 }

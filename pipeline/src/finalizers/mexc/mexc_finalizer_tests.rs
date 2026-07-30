@@ -106,6 +106,8 @@ fn make_execution_receipt(liq_id: u128) -> ExecutionReceipt {
         collateral_asset: collateral_token.clone(),
         expected_profit: 0,
         ref_price: Nat::from(0u8),
+        debt_ref_price: Nat::from(0u8),
+        ref_price_at: 0,
         debt_approval_needed: false,
         min_collateral_amount: Nat::from(0u8),
     };
@@ -159,6 +161,8 @@ fn make_execution_receipt_with_assets(
         collateral_asset: collateral_token,
         expected_profit: 0,
         ref_price: Nat::from(0u8),
+        debt_ref_price: Nat::from(0u8),
+        ref_price_at: 0,
         debt_approval_needed: false,
         min_collateral_amount: Nat::from(0u8),
     };
@@ -1977,6 +1981,30 @@ async fn mexc_native_icp_non_bridge_withdraw_uses_liquidator_account_id_hex() {
     assert!(matches!(state.step, CexStep::Completed));
     assert_eq!(state.withdraw.withdraw_id.as_deref(), Some("withdraw-native-icp"));
     assert_ne!(state.withdraw.withdraw_address, liquidator.to_text());
+}
+
+#[test]
+fn mexc_native_icp_withdraw_converts_the_persisted_per_leg_destination() {
+    let finalizer = MexcFinalizer::new(
+        Arc::new(MockCexBackend::new()),
+        Arc::new(MockTransferActions::new()),
+        Principal::anonymous(),
+        TEST_MAX_SELL_SLIPPAGE_BPS,
+        TEST_CEX_MIN_EXEC_USD,
+        TEST_CEX_SLICE_TARGET_RATIO,
+    );
+    let requested = Account {
+        owner: Principal::from_slice(&[42]),
+        subaccount: Some([7; 32]),
+    };
+    let expected = AccountIdentifier::new(&requested.owner, &Subaccount([7; 32])).to_hex();
+
+    assert_eq!(
+        finalizer
+            .native_icp_direct_withdraw_address(&requested.to_string())
+            .expect("valid per-leg destination"),
+        expected
+    );
 }
 
 #[tokio::test]
@@ -5308,6 +5336,7 @@ async fn mexc_finish_builds_synthetic_swap_execution_from_state() {
         state.withdraw.withdraw_asset.clone(),
         2.0,
     ));
+    state.trade.trade_weighted_slippage_bps = Some(42.5);
 
     let swap = finalizer.finish(&receipt, &state).await.expect("finish should succeed");
 
@@ -5331,6 +5360,7 @@ async fn mexc_finish_builds_synthetic_swap_execution_from_state() {
 
     assert!((swap.exec_price - expected_price).abs() < 1e-9);
     assert!((swap.mid_price - expected_price).abs() < 1e-9);
+    assert_eq!(swap.realized_slippage_bps, 42.5);
 
     // Status and legs should reflect a single synthetic CEX hop.
     assert_eq!(swap.status, "completed".to_string());
@@ -5358,7 +5388,7 @@ async fn mexc_preview_route_returns_non_executable_for_zero_amount() {
     let preview = finalizer.preview_route(&receipt).await.expect("preview should succeed");
     assert!(!preview.is_executable);
     assert_eq!(preview.estimated_receive_amount, 0.0);
-    assert_eq!(preview.estimated_slippage_bps, 0.0);
+    assert_eq!(preview.estimated_price_impact_bps, 0.0);
     assert_eq!(preview.reason.as_deref(), Some("non-positive amount_in"));
 }
 
@@ -5425,7 +5455,7 @@ async fn mexc_preview_route_resolves_direct_buy_leg_when_sell_book_empty() {
     let preview = finalizer.preview_route(&receipt).await.expect("preview should succeed");
     assert!(preview.is_executable);
     assert!(preview.estimated_receive_amount > 0.0);
-    assert!(preview.estimated_slippage_bps >= 0.0);
+    assert!(preview.estimated_price_impact_bps >= 0.0);
 }
 
 mod fuzz {

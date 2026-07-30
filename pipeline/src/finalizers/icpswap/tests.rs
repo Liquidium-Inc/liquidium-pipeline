@@ -3,7 +3,10 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use candid::{Nat, Principal};
 use ic_agent::Identity;
-use icrc_ledger_types::icrc1::{account::Account, transfer::TransferArg};
+use icrc_ledger_types::icrc1::{
+    account::{Account, principal_to_subaccount},
+    transfer::TransferArg,
+};
 use icrc_ledger_types::icrc2::approve::ApproveArgs;
 use liquidium_pipeline_connectors::backend::icp_backend::{IcpBackend, IcrcTransferError};
 use liquidium_pipeline_core::{
@@ -21,9 +24,13 @@ use crate::{
         dex_finalizer::{DexRouteFinalizer, DexRoutePreview},
         finalizer::Finalizer,
         icpswap::finalizer::{ICPSWAP_FINALIZER_PERMANENT_PREFIX, IcpswapFinalizer},
+        multi_venue::{
+            ICPSWAP_VENUE_ID, MultiVenueAdapter, VenueLegCheckpoint, VenueLegProgress, VenuePlanningContext,
+        },
     },
     persistance::{
-        FinalizerDecisionSnapshot, LiqMetaWrapper, LiqResultRecord, ResultStatus, VenueExecutionState, WalStore,
+        FinalizerDecisionSnapshot, LiqMetaWrapper, LiqResultRecord, ResultStatus, VenueExecutionState, VenueLegQuote,
+        VenueLegState, VenueLegStatus, WalStore,
     },
     stages::executor::{ExecutionReceipt, ExecutionStatus},
     swappers::{
@@ -39,12 +46,34 @@ use crate::{
             },
             venue::IcpswapFinalizerLogic,
         },
-        model::{SwapQuote, SwapRequest},
+        model::{SwapQuote, SwapQuoteLeg, SwapRequest},
     },
     utils::{CKUSDC_LEDGER_PRINCIPAL, ICP_LEDGER_PRINCIPAL},
     wal::{decode_receipt_wrapper, encode_meta},
     watchdog::{Watchdog, WatchdogEvent},
 };
+
+struct NoopCheckpoint;
+
+#[async_trait]
+impl VenueLegCheckpoint for NoopCheckpoint {
+    async fn checkpoint(&self, _progress: VenueLegProgress) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+#[derive(Clone, Default)]
+struct RecordingCheckpoint {
+    progresses: Arc<Mutex<Vec<VenueLegProgress>>>,
+}
+
+#[async_trait]
+impl VenueLegCheckpoint for RecordingCheckpoint {
+    async fn checkpoint(&self, progress: VenueLegProgress) -> Result<(), String> {
+        self.progresses.lock().expect("checkpoint lock").push(progress);
+        Ok(())
+    }
+}
 
 fn p(id: u8) -> Principal {
     Principal::from_slice(&[id])
@@ -66,6 +95,12 @@ fn receiver() -> Account {
 
 const TEST_MNEMONIC: &str =
     "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+
+fn planning_context() -> VenuePlanningContext {
+    VenuePlanningContext {
+        liquidation_id: "42".to_string(),
+    }
+}
 
 fn token(ledger: Principal, symbol: &str, fee: u64) -> ChainToken {
     ChainToken::Icp {
@@ -146,6 +181,8 @@ fn receipt() -> ExecutionReceipt {
             collateral_asset: collateral,
             expected_profit: 1,
             ref_price: Nat::from(1u8),
+            debt_ref_price: Nat::from(0u8),
+            ref_price_at: 0,
             debt_approval_needed: false,
             min_collateral_amount: Nat::from(0u8),
         },
@@ -183,6 +220,7 @@ impl TestWal {
             finalizer_decision: None,
             profit_snapshot: None,
             venue_execution: Some(VenueExecutionState::new(crate::swappers::icpswap::VENUE_ID, &state).unwrap()),
+            meta_v2: None,
         };
         let mut row = LiqResultRecord {
             id: "42".to_string(),
@@ -413,6 +451,16 @@ fn finalizer(manual: MockIcpswapManualClient) -> IcpswapFinalizer {
     test_finalizer(Arc::new(TestIcpswapClient { manual, preview: None }), trader())
 }
 
+fn finalizer_with_preview(preview: IcpswapRoutePreview) -> IcpswapFinalizer {
+    test_finalizer(
+        Arc::new(TestIcpswapClient {
+            manual: MockIcpswapManualClient::new(),
+            preview: Some(preview),
+        }),
+        trader(),
+    )
+}
+
 fn native_plan() -> IcpswapExecutionPlan {
     let native_ledger = Principal::from_text(ICP_LEDGER_PRINCIPAL).expect("native ICP ledger");
     let ckusdc_ledger = Principal::from_text(CKUSDC_LEDGER_PRINCIPAL).expect("ckUSDC ledger");
@@ -443,6 +491,420 @@ fn native_request(route: &IcpswapExecutionPlan) -> SwapRequest {
     }
 }
 
+fn route_preview(request: &SwapRequest, route: IcpswapExecutionPlan) -> IcpswapRoutePreview {
+    IcpswapRoutePreview {
+        quote: SwapQuote {
+            pay_asset: request.pay_asset.clone(),
+            pay_amount: route.amount_in.value.clone(),
+            receive_asset: request.receive_asset.clone(),
+            receive_amount: route.net_expected_output().value,
+            mid_price: 1.2,
+            exec_price: 1.2,
+            estimated_price_impact_bps: 25.0,
+            legs: vec![SwapQuoteLeg {
+                venue: crate::swappers::icpswap::VENUE_ID.to_string(),
+                route_id: route.pool.to_text(),
+                pay_chain: request.pay_asset.chain.clone(),
+                pay_symbol: route.amount_in.token.symbol(),
+                pay_amount: route.amount_in.value.clone(),
+                receive_chain: request.receive_asset.chain.clone(),
+                receive_symbol: route.gross_quoted_out.token.symbol(),
+                receive_amount: route.net_expected_output().value,
+                price: 1.2,
+                lp_fee: Nat::from(0u8),
+                gas_fee: route.output_ledger_fee.value.clone(),
+            }],
+        },
+        route,
+    }
+}
+
+fn venue_leg(state: IcpswapExecutionState, request: SwapRequest) -> VenueLegState {
+    VenueLegState {
+        leg_id: "icpswap-0".to_string(),
+        venue_id: crate::swappers::icpswap::VENUE_ID.to_string(),
+        quote: VenueLegQuote {
+            pay_amount: request.pay_amount.clone(),
+            estimated_receive: state.plan.net_expected_output(),
+            conservative_receive: ChainTokenAmount::from_raw(
+                state.plan.amount_out_minimum.token.clone(),
+                state.plan.amount_out_minimum.value.clone()
+                    - state.plan.output_ledger_fee.value.clone() * Nat::from(2u8),
+            ),
+            estimated_price_impact_bps: 25.0,
+            route_id: state.plan.pool.to_text(),
+        },
+        execution: VenueExecutionState::new(crate::swappers::icpswap::VENUE_ID, &state).expect("state"),
+        request,
+        status: VenueLegStatus::Planned,
+        result: None,
+        last_error: None,
+    }
+}
+
+#[tokio::test]
+async fn multi_venue_preview_returns_initialized_tagged_leg_state() {
+    let route = native_plan();
+    let request = native_request(&route);
+    let adapter = finalizer_with_preview(route_preview(&request, route));
+
+    let preview = adapter
+        .preview(&planning_context(), &request)
+        .await
+        .expect("adapter preview");
+    let state = preview
+        .initial_execution_state
+        .decode::<IcpswapExecutionState>(crate::swappers::icpswap::VENUE_ID)
+        .expect("decode")
+        .expect("ICPSwap state");
+
+    assert_eq!(preview.venue_id, crate::swappers::icpswap::VENUE_ID);
+    assert_eq!(state.step, IcpswapStep::Funding);
+    assert!(state.execution_id.starts_with("icpswap-"));
+    uuid::Uuid::parse_str(state.execution_id.trim_start_matches("icpswap-"))
+        .expect("execution ID should contain a restart-safe UUID");
+    assert_eq!(preview.conservative_receive.value, Nat::from(118_790u64));
+}
+
+#[tokio::test]
+async fn multi_venue_preview_requires_an_explicit_receive_address() {
+    let route = native_plan();
+    let mut request = native_request(&route);
+    request.receive_address = None;
+    let adapter = finalizer_with_preview(route_preview(&request, route));
+
+    let error = adapter
+        .preview(&planning_context(), &request)
+        .await
+        .expect_err("ICPSwap preparation must reject a missing receive address");
+
+    assert!(error.contains("missing receive_address"));
+}
+
+#[tokio::test]
+async fn multi_venue_preview_rejects_unsupported_pair_at_adapter_boundary() {
+    let request = receipt().request.swap_args.expect("request");
+    let error = finalizer(MockIcpswapManualClient::new())
+        .preview(&planning_context(), &request)
+        .await
+        .expect_err("unsupported IC token pair must be rejected");
+
+    assert!(error.contains("only supports canonical ICP <-> ckUSDC"));
+}
+
+#[tokio::test]
+async fn multi_venue_checkpoints_pending_state_before_transfer_side_effect() {
+    let route = native_plan();
+    let request = native_request(&route);
+    let state = pool_state("leg-execution-42", route);
+    let leg = venue_leg(state, request);
+    let checkpoint = RecordingCheckpoint::default();
+    let observed = checkpoint.progresses.clone();
+    let mut manual = MockIcpswapManualClient::new();
+    manual.expect_ledger_transfer().times(1).return_once(move |_, _| {
+        let checkpoints = observed.lock().expect("checkpoint lock");
+        let persisted = checkpoints
+            .last()
+            .expect("transfer intent must be checkpointed before submission")
+            .execution
+            .decode::<IcpswapExecutionState>(ICPSWAP_VENUE_ID)
+            .expect("decode checkpoint")
+            .expect("ICPSwap checkpoint");
+        assert_eq!(persisted.step, IcpswapStep::TransferPending);
+        assert!(persisted.transfer.args.is_some());
+        Err(IcpswapClientError::LedgerTransfer {
+            ledger: p(1),
+            message: "stop after checkpoint".to_string(),
+        })
+    });
+
+    let progress = finalizer(manual).advance(&leg, &checkpoint).await.expect("advance leg");
+    let pending = progress
+        .execution
+        .decode::<IcpswapExecutionState>(crate::swappers::icpswap::VENUE_ID)
+        .expect("decode")
+        .expect("ICPSwap state");
+
+    assert_eq!(progress.status, VenueLegStatus::Running);
+    assert_eq!(pending.step, IcpswapStep::TransferPending);
+    assert!(
+        pending.transfer.args.is_some(),
+        "deduplication arguments must be persisted"
+    );
+}
+
+#[tokio::test]
+async fn multi_venue_submits_deposit_after_checkpoint_in_the_same_cycle() {
+    let route = native_plan();
+    let request = native_request(&route);
+    let mut state = pool_state("leg-execution-42", route);
+    state.step = IcpswapStep::Deposit;
+    state.transfer.args = Some(TransferArg {
+        from_subaccount: None,
+        to: Account {
+            owner: state.plan.pool,
+            subaccount: Some(principal_to_subaccount(trader().owner)),
+        },
+        amount: Nat::from(100_010u64),
+        fee: Some(Nat::from(10u64)),
+        memo: None,
+        created_at_time: Some(1_000_000_000),
+    });
+    let leg = venue_leg(state, request);
+
+    let checkpoint = RecordingCheckpoint::default();
+    let observed = checkpoint.progresses.clone();
+    let mut manual = MockIcpswapManualClient::new();
+    manual.expect_unused_balance().times(1).return_once(|_, _| {
+        Ok(IcpswapUnusedBalance {
+            balance0: Nat::from(0u8),
+            balance1: Nat::from(0u8),
+        })
+    });
+    manual
+        .expect_ledger_balance()
+        .times(1)
+        .return_once(|_, _| Ok(Nat::from(100_010u64)));
+    manual.expect_deposit().times(1).return_once(move |pool, _| {
+        let checkpoints = observed.lock().expect("checkpoint lock");
+        let persisted = checkpoints
+            .last()
+            .expect("deposit intent must be checkpointed before submission")
+            .execution
+            .decode::<IcpswapExecutionState>(ICPSWAP_VENUE_ID)
+            .expect("decode checkpoint")
+            .expect("ICPSwap checkpoint");
+        assert_eq!(persisted.step, IcpswapStep::DepositPending);
+        assert!(persisted.deposit.ready_to_submit);
+        Err(IcpswapClientError::SubmissionUnknown {
+            pool,
+            method: "deposit",
+            message: "stop after submission".to_string(),
+        })
+    });
+
+    let submitted = finalizer(manual)
+        .advance(&leg, &checkpoint)
+        .await
+        .expect("submit checkpointed deposit");
+    let submitted_state = submitted
+        .execution
+        .decode::<IcpswapExecutionState>(ICPSWAP_VENUE_ID)
+        .expect("decode")
+        .expect("ICPSwap state");
+    assert_eq!(submitted_state.step, IcpswapStep::DepositPending);
+    assert!(!submitted_state.deposit.ready_to_submit);
+    assert!(submitted_state.next_attempt_at_nanos.is_some());
+}
+
+#[tokio::test]
+async fn multi_venue_completed_leg_returns_its_own_execution_result() {
+    let route = native_plan();
+    let expected_pool_input = route.amount_in.value.clone();
+    let expected_output_fees = route.output_ledger_fee.value.clone() * Nat::from(2u8);
+    let request = native_request(&route);
+    let expected_all_in_pay = request.pay_amount.value.clone();
+    let mut state = pool_state("leg-execution-42", route);
+    state.step = IcpswapStep::Completed;
+    state.trade.gross_output_amount = Some(Nat::from(120_000u64));
+    state.withdraw.wallet_credited_amount = Some(Nat::from(119_995u64));
+    state.settlement.transfer.credited_amount = Some(Nat::from(119_990u64));
+    let leg = venue_leg(state, request);
+
+    let progress = finalizer(MockIcpswapManualClient::new())
+        .advance(&leg, &NoopCheckpoint)
+        .await
+        .expect("completed leg");
+
+    assert_eq!(progress.status, VenueLegStatus::Completed);
+    let result = progress.result.expect("execution result");
+    assert_eq!(result.pay_amount, expected_all_in_pay);
+    assert_eq!(result.receive_amount, Nat::from(119_990u64));
+    assert_eq!(result.legs[0].pay_amount, expected_pool_input);
+    assert_eq!(result.legs[0].receive_amount, Nat::from(119_990u64));
+    assert_eq!(result.legs[0].gas_fee, expected_output_fees);
+}
+
+#[tokio::test]
+async fn multi_venue_recover_maps_refunded_leg_without_parent_state() {
+    let route = native_plan();
+    let request = native_request(&route);
+    let mut state = pool_state("leg-execution-42", route);
+    state.step = IcpswapStep::Refunded;
+    let leg = venue_leg(state, request);
+
+    let progress = finalizer(MockIcpswapManualClient::new())
+        .recover(&leg, &NoopCheckpoint)
+        .await
+        .expect("refunded leg");
+
+    assert_eq!(progress.status, VenueLegStatus::Recovered);
+    assert!(progress.result.is_none());
+}
+
+#[tokio::test]
+async fn multi_venue_preview_rejects_non_icp_chain_tokens_at_adapter_boundary() {
+    let route = native_plan();
+    let mut request = native_request(&route);
+    let evm_token = ChainToken::EvmNative {
+        chain: "eth".to_string(),
+        symbol: "ETH".to_string(),
+        decimals: 18,
+        fee: Nat::from(0u8),
+    };
+    request.pay_asset = evm_token.asset_id();
+    request.pay_amount = ChainTokenAmount::from_raw(evm_token, Nat::from(100_020u64));
+
+    let error = finalizer(MockIcpswapManualClient::new())
+        .preview(&planning_context(), &request)
+        .await
+        .expect_err("a non-ICP chain token must be rejected before any client call");
+
+    assert!(error.contains("only supports canonical ICP <-> ckUSDC"));
+}
+
+#[tokio::test]
+async fn multi_venue_advance_rejects_leg_tagged_for_a_different_venue() {
+    let route = native_plan();
+    let request = native_request(&route);
+    let state = pool_state("leg-execution-42", route);
+    let mut leg = venue_leg(state, request);
+    leg.venue_id = "mexc".to_string();
+
+    let error = finalizer(MockIcpswapManualClient::new())
+        .advance(&leg, &NoopCheckpoint)
+        .await
+        .expect_err("a leg tagged for another venue must not be advanced");
+
+    assert!(error.contains("cannot advance venue"));
+}
+
+#[tokio::test]
+async fn multi_venue_recover_rejects_a_leg_that_is_not_in_recovery() {
+    let route = native_plan();
+    let request = native_request(&route);
+    // Defaults to `Transfer`: still mid-flight, not failed or parked.
+    let state = pool_state("leg-execution-42", route);
+    let leg = venue_leg(state, request);
+
+    let error = finalizer(MockIcpswapManualClient::new())
+        .recover(&leg, &NoopCheckpoint)
+        .await
+        .expect_err("a leg mid-flight must not be treated as recovering");
+
+    assert!(error.contains("is not in recovery"));
+}
+
+#[tokio::test]
+async fn multi_venue_preview_rejects_trader_with_a_non_default_subaccount() {
+    let route = native_plan();
+    let request = native_request(&route);
+    let trader_with_subaccount = Account {
+        owner: p(4),
+        subaccount: Some([7u8; 32]),
+    };
+    let adapter = test_finalizer(
+        Arc::new(TestIcpswapClient {
+            manual: MockIcpswapManualClient::new(),
+            preview: None,
+        }),
+        trader_with_subaccount,
+    );
+
+    let error = adapter
+        .preview(&planning_context(), &request)
+        .await
+        .expect_err("a non-default trader subaccount must be rejected");
+
+    assert!(error.contains("default ledger account"));
+}
+
+#[tokio::test]
+async fn multi_venue_operator_required_state_parks_only_its_isolated_leg() {
+    let route = native_plan();
+    let request = native_request(&route);
+    let mut state = pool_state("leg-execution-42", route);
+    state.step = IcpswapStep::OperatorRequired;
+    state.last_error = Some("withdrawal outcome is ambiguous".to_string());
+    let leg = venue_leg(state, request);
+
+    let progress = finalizer(MockIcpswapManualClient::new())
+        .advance(&leg, &NoopCheckpoint)
+        .await
+        .expect("operator-required leg advances without any client call");
+
+    assert_eq!(progress.status, VenueLegStatus::OperatorRequired);
+    assert!(progress.result.is_none());
+    assert_eq!(progress.last_error.as_deref(), Some("withdrawal outcome is ambiguous"));
+    let persisted = progress
+        .execution
+        .decode::<IcpswapExecutionState>(ICPSWAP_VENUE_ID)
+        .expect("decode persisted ICPSwap state")
+        .expect("ICPSwap state");
+    assert_eq!(persisted.step, IcpswapStep::OperatorRequired);
+}
+
+#[tokio::test]
+async fn multi_venue_failed_leg_maps_to_failed_permanent_and_keeps_its_error() {
+    let route = native_plan();
+    let request = native_request(&route);
+    let mut state = pool_state("leg-execution-42", route);
+    state.step = IcpswapStep::Failed;
+    state.last_error = Some("gross swap output cannot cover the output ledger fee".to_string());
+    let leg = venue_leg(state, request);
+
+    let progress = finalizer(MockIcpswapManualClient::new())
+        .advance(&leg, &NoopCheckpoint)
+        .await
+        .expect("a failed leg still advances cleanly");
+
+    assert_eq!(progress.status, VenueLegStatus::FailedPermanent);
+    assert!(progress.result.is_none());
+    assert_eq!(
+        progress.last_error.as_deref(),
+        Some("gross swap output cannot cover the output ledger fee")
+    );
+}
+
+#[tokio::test]
+async fn multi_venue_advance_surfaces_operational_error_without_losing_leg_progress() {
+    let route = native_plan();
+    let request = native_request(&route);
+    let state = pool_state("leg-execution-42", route);
+    let leg = venue_leg(state, request.clone());
+
+    let mut manual = MockIcpswapManualClient::new();
+    manual.expect_ledger_transfer().times(1).return_once(|_, _| {
+        Err(IcpswapClientError::LedgerTransfer {
+            ledger: p(1),
+            message: "network unreachable".to_string(),
+        })
+    });
+
+    let progress = finalizer(manual)
+        .advance(&leg, &NoopCheckpoint)
+        .await
+        .expect("advance leg");
+    let after = progress
+        .execution
+        .decode::<IcpswapExecutionState>(crate::swappers::icpswap::VENUE_ID)
+        .expect("decode")
+        .expect("ICPSwap state");
+
+    assert_eq!(progress.status, VenueLegStatus::Running);
+    assert_eq!(
+        after.step,
+        IcpswapStep::TransferPending,
+        "a failed transfer must stay retryable, not silently reset"
+    );
+    assert!(
+        progress
+            .last_error
+            .expect("the operational error must reach the orchestrator")
+            .contains("network unreachable")
+    );
+}
+
 #[tokio::test]
 async fn committing_dex_preview_creates_manual_icpswap_state() {
     let mut receipt = receipt();
@@ -464,6 +926,7 @@ async fn committing_dex_preview_creates_manual_icpswap_state() {
         cex_preview_gross_bps: Some(150.0),
         cex_preview_net_bps: Some(140.0),
         ts: 123,
+        multi_venue_allocation: None,
     };
     let preview = DexRoutePreview::new(
         SwapQuote {

@@ -11,10 +11,7 @@ use crate::approval_state::ApprovalState;
 use crate::liquidation::collateral_service::CollateralServiceTrait;
 use crate::stage::PipelineStage;
 
-use crate::swappers::kong::kong_swapper::DEX_PRINCIPAL;
-use crate::swappers::swap_interface::SwapInterface;
-
-use candid::{Int, Nat, Principal};
+use candid::{Int, Nat};
 use futures::TryFutureExt;
 use liquidium_pipeline_core::{
     balance_service::BalanceService,
@@ -28,8 +25,9 @@ use log::{debug, info};
 
 use num_traits::ToPrimitive;
 
-use crate::swappers::model::SwapRequest;
-use crate::utils::{ICP_LEDGER_PRINCIPAL, max_for_ledger};
+use crate::liquidation::liquidation_math::oracle_implied_output;
+use crate::swappers::model::{BASIS_POINTS_DENOMINATOR, SwapRequest, amount_after_bps_haircut};
+use crate::utils::{ICP_LEDGER_PRINCIPAL, max_for_ledger, now_ts};
 use crate::watchdog::{Watchdog, WatchdogEvent, noop_watchdog};
 use async_trait::async_trait;
 
@@ -37,7 +35,6 @@ use itertools::Itertools;
 
 #[cfg(test)]
 const WIPEOUT_THRESHOLD: u32 = 975;
-const CKETH_MIN_WITHDRAWAL_WEI: u128 = 5_000_000_000_000_000;
 
 fn resolve_token_for_position(registry: &dyn TokenRegistryTrait, pos: &LiquidateblePosition) -> Option<ChainToken> {
     if pos.asset.symbol().eq_ignore_ascii_case("ICP") {
@@ -66,25 +63,22 @@ fn is_supported_position_asset_type(pos: &LiquidateblePosition) -> bool {
     pos.asset.symbol().eq_ignore_ascii_case("ICP") || matches!(pos.asset_type, AssetType::CkAsset(_))
 }
 
-pub struct SimpleLiquidationStrategy<T, C, R, U>
+pub struct SimpleLiquidationStrategy<C, R, U>
 where
-    T: SwapInterface + Send + Sync,
     C: ConfigTrait,
     R: TokenRegistryTrait,
     U: CollateralServiceTrait,
 {
     pub config: Arc<C>,
     pub registry: Arc<R>,
-    pub _swapper: Arc<T>,
     pub collateral_service: Arc<U>,
     pub account_service: Arc<BalanceService>,
     pub approval_state: Arc<ApprovalState>,
     pub watchdog: Arc<dyn Watchdog>,
 }
 
-impl<T, C, R, U> SimpleLiquidationStrategy<T, C, R, U>
+impl<C, R, U> SimpleLiquidationStrategy<C, R, U>
 where
-    T: SwapInterface,
     C: ConfigTrait,
     R: TokenRegistryTrait,
     U: CollateralServiceTrait,
@@ -92,7 +86,6 @@ where
     pub fn new(
         config: Arc<C>,
         registry: Arc<R>,
-        swapper: Arc<T>,
         collateral_service: Arc<U>,
         balance_service: Arc<BalanceService>,
         approval_state: Arc<ApprovalState>,
@@ -100,7 +93,6 @@ where
         Self {
             config,
             registry,
-            _swapper: swapper,
             collateral_service,
             account_service: balance_service,
             approval_state,
@@ -123,80 +115,9 @@ where
             .needs_approval(*ledger, self.config.get_lending_canister(), &threshold)
     }
 
-    fn dex_approval_needed(&self, token: &ChainToken) -> bool {
-        let ChainToken::Icp { ledger, .. } = token else {
-            return false;
-        };
-
-        let spender = match Principal::from_text(DEX_PRINCIPAL) {
-            Ok(p) => p,
-            Err(_) => return false,
-        };
-
-        let threshold = max_for_ledger(ledger) / Nat::from(2u8);
-        self.approval_state.needs_approval(*ledger, spender, &threshold)
-    }
-
-    fn should_use_cex(&self, swap_needed: bool, amount_in: &ChainTokenAmount, ref_price: &Nat) -> bool {
-        if !swap_needed {
-            return false;
-        }
-
-        // Legacy Dex/Hybrid branches are intentionally retained; see `config::SwapperMode` docs.
-        match self.config.get_swapper_mode() {
-            crate::config::SwapperMode::Dex => false,
-            crate::config::SwapperMode::Cex => true,
-            crate::config::SwapperMode::Hybrid => {
-                let ref_price_f64 = ref_price.0.to_f64().unwrap_or(0.0) / 1e27f64;
-                let pay_amount = amount_in.value.0.to_f64().unwrap_or(0.0);
-                let pay_scale = 10f64.powi(amount_in.token.decimals() as i32);
-                let pay_units = if pay_scale > 0.0 { pay_amount / pay_scale } else { 0.0 };
-                let est_value_usd = pay_units * ref_price_f64;
-                est_value_usd >= 2.5
-            }
-        }
-    }
-
-    fn fee_in_debt(
-        &self,
-        fee_native: &Nat,
-        fee_token: &ChainToken,
-        debt_token: &ChainToken,
-        price_coll_ray: &Nat,
-        price_debt_ray: &Nat,
-    ) -> Nat {
-        if fee_native == &Nat::from(0u8) {
-            return Nat::from(0u8);
-        }
-
-        if fee_token.asset_id().address == debt_token.asset_id().address {
-            return fee_native.clone();
-        }
-
-        if price_coll_ray == &Nat::from(0u8) || price_debt_ray == &Nat::from(0u8) {
-            return Nat::from(0u8);
-        }
-
-        let coll_scale = Nat::from(10u128.pow(fee_token.decimals() as u32));
-        let debt_scale = Nat::from(10u128.pow(debt_token.decimals() as u32));
-        (fee_native.clone() * price_coll_ray.clone() * debt_scale) / (coll_scale * price_debt_ray.clone())
-    }
-
     fn min_collateral_for_bad_debt(gross_collateral: Nat, slippage_bps: u32) -> Nat {
-        if gross_collateral == 0u8 {
-            return Nat::from(0u8);
-        }
-
-        let retained_bps = 10_000u32.saturating_sub(slippage_bps.min(10_000));
-        (gross_collateral * Nat::from(retained_bps)) / Nat::from(10_000u32)
-    }
-
-    fn is_native_cketh_on_icp(token: &ChainToken) -> bool {
-        token.symbol().eq_ignore_ascii_case("ckETH") && token.chain().eq_ignore_ascii_case("icp")
-    }
-
-    fn below_native_cketh_bridge_floor(token: &ChainToken, amount: &Nat) -> bool {
-        Self::is_native_cketh_on_icp(token) && amount < &Nat::from(CKETH_MIN_WITHDRAWAL_WEI)
+        amount_after_bps_haircut(&gross_collateral, slippage_bps.min(BASIS_POINTS_DENOMINATOR))
+            .unwrap_or_else(|_| Nat::from(0u8))
     }
 
     fn native_to_units(amount: &Nat, decimals: u8) -> f64 {
@@ -428,6 +349,8 @@ where
                     buy_bad_debt: true,
                 },
                 ref_price: 0u32.into(),
+                debt_ref_price: 0u32.into(),
+                ref_price_at: now_ts(),
                 swap_args: None,
                 expected_profit: profit.0.to_i128().unwrap_or(i128::MAX),
                 debt_approval_needed,
@@ -440,10 +363,8 @@ where
 }
 
 #[async_trait]
-impl<'a, T, C, R, U> PipelineStage<'a, Vec<LiquidatebleUser>, Vec<ExecutorRequest>>
-    for SimpleLiquidationStrategy<T, C, R, U>
+impl<'a, C, R, U> PipelineStage<'a, Vec<LiquidatebleUser>, Vec<ExecutorRequest>> for SimpleLiquidationStrategy<C, R, U>
 where
-    T: SwapInterface,
     C: ConfigTrait,
     R: TokenRegistryTrait + 'static,
     U: CollateralServiceTrait,
@@ -597,34 +518,6 @@ where
             let price_debt_ray = estimation.debt_price.clone();
             let max_slippage_bps = self.config.get_max_allowed_dex_slippage();
             let swap_needed = estimation.received_collateral != 0u32 && !same_asset;
-            let use_cex = self.should_use_cex(swap_needed, &amount_in, &estimation.ref_price);
-
-            let mut amount_in_effective = amount_in.value.clone();
-            let mut mexc_approval_count: u32 = 0;
-
-            if swap_needed {
-                if use_cex {
-                    let deposit_fee = collateral_token.fee()
-                        * Nat::from(crate::finalizers::mexc::mexc_finalizer::MEXC_DEPOSIT_FEE_MULTIPLIER);
-                    if amount_in_effective <= deposit_fee {
-                        amount_in_effective = Nat::from(0u8);
-                    } else {
-                        amount_in_effective -= deposit_fee;
-                    }
-
-                    if matches!(collateral_token, ChainToken::Icp { .. }) {
-                        mexc_approval_count = crate::finalizers::mexc::mexc_finalizer::APPROVE_BUMP_MAX_COUNT as u32;
-                    }
-                } else if self.dex_approval_needed(&collateral_token) {
-                    let approval_fee = collateral_token.fee();
-                    if amount_in_effective <= approval_fee {
-                        amount_in_effective = Nat::from(0u8);
-                    } else {
-                        amount_in_effective -= approval_fee;
-                    }
-                }
-            }
-
             let (swap_args, amount_received, price) = if !swap_needed {
                 (None, amount_in.value.clone(), 1f64)
             } else {
@@ -644,14 +537,16 @@ where
                     if debt_f > 0.0 { coll_f / debt_f } else { 0.0 }
                 };
 
-                let amount_received = if price_coll_ray == 0u8 || price_debt_ray == 0u8 {
-                    Nat::from(0u8)
-                } else {
-                    let coll_scale = Nat::from(10u128.pow(collateral_token.decimals() as u32));
-                    let debt_scale = Nat::from(10u128.pow(repayment_token.decimals() as u32));
-                    (amount_in_effective.clone() * price_coll_ray.clone() * debt_scale)
-                        / (coll_scale * price_debt_ray.clone())
-                };
+                // The multi-venue quote guard compares against this same
+                // conversion, so both use one implementation.
+                let amount_received = oracle_implied_output(
+                    &amount_in.value,
+                    &price_coll_ray,
+                    &price_debt_ray,
+                    u64::from(collateral_token.decimals()),
+                    u64::from(repayment_token.decimals()),
+                )
+                .unwrap_or_else(|_| Nat::from(0u8));
 
                 (Some(swap_request), amount_received, price)
             };
@@ -671,39 +566,11 @@ where
                 repayment_token.symbol()
             );
 
-            let mexc_approval_fee_in_debt = if mexc_approval_count > 0 {
-                let fee_native = collateral_token.fee() * Nat::from(mexc_approval_count);
-                self.fee_in_debt(
-                    &fee_native,
-                    &collateral_token,
-                    &repayment_token,
-                    &price_coll_ray,
-                    &price_debt_ray,
-                )
-            } else {
-                Nat::from(0u8)
-            };
-
             let profit = Int::from(amount_received)
                 - Int::from(estimation.repaid_debt.clone())
-                - Int::from(debt_fee_total.clone())
-                - Int::from(mexc_approval_fee_in_debt.clone());
+                - Int::from(debt_fee_total.clone());
             let is_bad_debt = profit <= 0;
-            let below_bridge_floor =
-                use_cex && Self::below_native_cketh_bridge_floor(&collateral_token, &amount_in_effective);
-
-            if below_bridge_floor && !self.config.should_buy_bad_debt() {
-                info!(
-                    "⏭️ Skipping liquidation below ckETH bridge minimum: collateral={} {} minimum={} {}",
-                    Self::native_to_units(&amount_in_effective, collateral_token.decimals()),
-                    collateral_token.symbol(),
-                    Self::native_to_units(&Nat::from(CKETH_MIN_WITHDRAWAL_WEI), collateral_token.decimals()),
-                    collateral_token.symbol()
-                );
-                continue;
-            }
-
-            let buy_bad_debt = is_bad_debt || below_bridge_floor;
+            let buy_bad_debt = is_bad_debt;
 
             let min_collateral_amount = if buy_bad_debt {
                 Self::min_collateral_for_bad_debt(
@@ -754,6 +621,10 @@ where
                     buy_bad_debt,
                 },
                 ref_price: estimation.ref_price,
+                debt_ref_price: estimation.debt_price,
+                // Our own clock, not the canister's: the finalizer uses this to
+                // decide whether these prices are still fresh.
+                ref_price_at: now_ts(),
                 swap_args,
                 expected_profit: profit.0.to_i128().unwrap_or(i128::MAX),
                 debt_approval_needed,
@@ -769,12 +640,6 @@ where
                     "🧯 Buying bad debt: repaid={} {}",
                     Self::native_to_units(&estimation.repaid_debt, repayment_token.decimals()),
                     repayment_token.symbol()
-                );
-            } else if below_bridge_floor && self.config.should_buy_bad_debt() {
-                info!(
-                    "🧯 Buying sub-bridge-threshold liquidation in bad debt mode: collateral={} {}",
-                    Self::native_to_units(&amount_in_effective, collateral_token.decimals()),
-                    collateral_token.symbol()
                 );
             }
         }
@@ -792,7 +657,6 @@ mod tests {
     use crate::approval_state::ApprovalState;
     use crate::config::MockConfigTrait;
     use crate::liquidation::collateral_service::{LiquidationEstimation, MockCollateralServiceTrait};
-    use crate::swappers::swap_interface::MockSwapInterface;
     use candid::{Nat, Principal};
     use liquidium_pipeline_core::account::actions::MockAccountInfo;
     use liquidium_pipeline_core::tokens::token_registry::MockTokenRegistryTrait;
@@ -915,12 +779,6 @@ mod tests {
             })
         });
 
-        // Swapper should not be called because asset ids match (no swap path).
-        let mut swapper = MockSwapInterface::new();
-        swapper
-            .expect_quote()
-            .returning(|_req| panic!("quote should not be called in same-asset happy path"));
-
         let registry = Arc::new(registry);
         let account = Arc::new(account);
         let balance_service = Arc::new(BalanceService::new(registry.clone(), account.clone()));
@@ -928,7 +786,6 @@ mod tests {
         let strategy = SimpleLiquidationStrategy::new(
             Arc::new(cfg),
             registry.clone(),
-            Arc::new(swapper),
             Arc::new(collateral),
             balance_service,
             Arc::new(ApprovalState::new()),
@@ -981,11 +838,6 @@ mod tests {
             .expect_get_balance()
             .returning(|_t: &ChainToken| Err("boom".to_string()));
 
-        let mut swapper = MockSwapInterface::new();
-        swapper
-            .expect_quote()
-            .returning(|_req| panic!("quote should not be called when balance fetch fails"));
-
         let registry = Arc::new(registry);
         let account = Arc::new(account);
         let balance_service = Arc::new(BalanceService::new(registry.clone(), account.clone()));
@@ -993,7 +845,6 @@ mod tests {
         let strategy = SimpleLiquidationStrategy::new(
             Arc::new(cfg),
             registry.clone(),
-            Arc::new(swapper),
             Arc::new(collateral),
             balance_service,
             Arc::new(ApprovalState::new()),
@@ -1041,11 +892,6 @@ mod tests {
             .expect_get_balance()
             .returning(|_t: &ChainToken| panic!("balance should not be fetched for invalid asset type"));
 
-        let mut swapper = MockSwapInterface::new();
-        swapper
-            .expect_quote()
-            .returning(|_req| panic!("quote should not be called for invalid asset type"));
-
         let registry = Arc::new(registry);
         let account = Arc::new(account);
         let balance_service = Arc::new(BalanceService::new(registry.clone(), account.clone()));
@@ -1053,7 +899,6 @@ mod tests {
         let strategy = SimpleLiquidationStrategy::new(
             Arc::new(cfg),
             registry.clone(),
-            Arc::new(swapper),
             Arc::new(collateral),
             balance_service,
             Arc::new(ApprovalState::new()),
@@ -1118,8 +963,6 @@ mod tests {
         cfg.expect_get_liquidator_principal().return_const(trader);
         cfg.expect_should_buy_bad_debt().return_const(false);
         cfg.expect_get_max_allowed_dex_slippage().return_const(2000u32);
-        cfg.expect_get_swapper_mode()
-            .return_const(crate::config::SwapperMode::Cex);
         cfg.expect_get_lending_canister()
             .return_const(p("mxzaz-hqaaa-aaaar-qaada-cai"));
 
@@ -1150,11 +993,6 @@ mod tests {
             })
         });
 
-        let mut swapper = MockSwapInterface::new();
-        swapper
-            .expect_quote()
-            .returning(|_req| panic!("strategy builds swap args without quoting"));
-
         let registry = Arc::new(registry);
         let account = Arc::new(account);
         let balance_service = Arc::new(BalanceService::new(registry.clone(), account.clone()));
@@ -1162,7 +1000,6 @@ mod tests {
         let strategy = SimpleLiquidationStrategy::new(
             Arc::new(cfg),
             registry.clone(),
-            Arc::new(swapper),
             Arc::new(collateral),
             balance_service,
             Arc::new(ApprovalState::new()),
@@ -1224,11 +1061,6 @@ mod tests {
             })
         });
 
-        let mut swapper = MockSwapInterface::new();
-        swapper
-            .expect_quote()
-            .returning(|_req| panic!("quote should not be called when HF >= 1000"));
-
         let registry = Arc::new(registry);
         let account = Arc::new(account);
         let balance_service = Arc::new(BalanceService::new(registry.clone(), account.clone()));
@@ -1236,7 +1068,6 @@ mod tests {
         let strategy = SimpleLiquidationStrategy::new(
             Arc::new(cfg),
             registry.clone(),
-            Arc::new(swapper),
             Arc::new(collateral),
             balance_service,
             Arc::new(ApprovalState::new()),
@@ -1303,11 +1134,6 @@ mod tests {
             })
         });
 
-        let mut swapper = MockSwapInterface::new();
-        swapper
-            .expect_quote()
-            .returning(|_req| panic!("quote should not be called when assets are equal"));
-
         let registry = Arc::new(registry);
         let account = Arc::new(account);
         let balance_service = Arc::new(BalanceService::new(registry.clone(), account.clone()));
@@ -1315,7 +1141,6 @@ mod tests {
         let strategy = SimpleLiquidationStrategy::new(
             Arc::new(cfg),
             registry.clone(),
-            Arc::new(swapper),
             Arc::new(collateral),
             balance_service,
             Arc::new(ApprovalState::new()),
@@ -1396,11 +1221,6 @@ mod tests {
             })
         });
 
-        let mut swapper = MockSwapInterface::new();
-        swapper
-            .expect_quote()
-            .returning(|_req| panic!("quote should not be called when assets are equal"));
-
         let registry = Arc::new(registry);
         let account = Arc::new(account);
         let balance_service = Arc::new(BalanceService::new(registry.clone(), account.clone()));
@@ -1408,7 +1228,6 @@ mod tests {
         let strategy = SimpleLiquidationStrategy::new(
             Arc::new(cfg),
             registry.clone(),
-            Arc::new(swapper),
             Arc::new(collateral),
             balance_service,
             Arc::new(ApprovalState::new()),
@@ -1429,7 +1248,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn simple_strategy_skips_cketh_below_bridge_floor_when_bad_debt_disabled() {
+    async fn simple_strategy_leaves_cketh_bridge_viability_to_the_venue_planner() {
         let ckusdc_ledger = p("xevnm-gaaaa-aaaar-qafnq-cai");
         let cketh_ledger = p("ss2fx-dyaaa-aaaar-qacoq-cai");
         let ckusdc_token = ChainToken::Icp {
@@ -1466,8 +1285,6 @@ mod tests {
         cfg.expect_get_liquidator_principal().return_const(trader);
         cfg.expect_should_buy_bad_debt().return_const(false);
         cfg.expect_get_max_allowed_dex_slippage().return_const(2000u32);
-        cfg.expect_get_swapper_mode()
-            .return_const(crate::config::SwapperMode::Cex);
         cfg.expect_get_lending_canister()
             .return_const(p("mxzaz-hqaaa-aaaar-qaada-cai"));
 
@@ -1497,18 +1314,12 @@ mod tests {
             })
         });
 
-        let mut swapper = MockSwapInterface::new();
-        swapper
-            .expect_quote()
-            .returning(|_req| panic!("strategy builds CEX swap args without quoting"));
-
         let registry = Arc::new(registry);
         let account = Arc::new(account);
         let balance_service = Arc::new(BalanceService::new(registry.clone(), account.clone()));
         let strategy = SimpleLiquidationStrategy::new(
             Arc::new(cfg),
             registry.clone(),
-            Arc::new(swapper),
             Arc::new(collateral),
             balance_service,
             Arc::new(ApprovalState::new()),
@@ -1521,11 +1332,16 @@ mod tests {
         let user = mk_user(vec![debt_pos, collateral_pos], 1_000_000, 900);
 
         let res = strategy.process(&vec![user]).await.unwrap();
-        assert!(res.is_empty(), "normal mode should skip ckETH below bridge minimum");
+        assert_eq!(
+            res.len(),
+            1,
+            "venue-neutral strategy should not apply a MEXC bridge floor"
+        );
+        assert!(!res[0].liquidation.buy_bad_debt);
     }
 
     #[tokio::test]
-    async fn simple_strategy_allows_cketh_below_bridge_floor_in_bad_debt_mode() {
+    async fn profitable_cketh_is_not_marked_bad_debt_by_venue_specific_costs() {
         let ckusdc_ledger = p("xevnm-gaaaa-aaaar-qafnq-cai");
         let cketh_ledger = p("ss2fx-dyaaa-aaaar-qacoq-cai");
         let ckusdc_token = ChainToken::Icp {
@@ -1563,8 +1379,6 @@ mod tests {
         cfg.expect_should_buy_bad_debt().return_const(true);
         cfg.expect_get_max_allowed_dex_slippage().return_const(2000u32);
         cfg.expect_get_bad_debt_collateral_slippage_bps().return_const(500u32);
-        cfg.expect_get_swapper_mode()
-            .return_const(crate::config::SwapperMode::Cex);
         cfg.expect_get_lending_canister()
             .return_const(p("mxzaz-hqaaa-aaaar-qaada-cai"));
 
@@ -1594,18 +1408,12 @@ mod tests {
             })
         });
 
-        let mut swapper = MockSwapInterface::new();
-        swapper
-            .expect_quote()
-            .returning(|_req| panic!("strategy builds CEX swap args without quoting"));
-
         let registry = Arc::new(registry);
         let account = Arc::new(account);
         let balance_service = Arc::new(BalanceService::new(registry.clone(), account.clone()));
         let strategy = SimpleLiquidationStrategy::new(
             Arc::new(cfg),
             registry.clone(),
-            Arc::new(swapper),
             Arc::new(collateral),
             balance_service,
             Arc::new(ApprovalState::new()),
@@ -1618,13 +1426,13 @@ mod tests {
         let user = mk_user(vec![debt_pos, collateral_pos], 1_000_000, 900);
 
         let res = strategy.process(&vec![user]).await.unwrap();
-        assert_eq!(res.len(), 1, "bad debt mode should allow the sub-threshold liquidation");
-        assert!(res[0].liquidation.buy_bad_debt);
+        assert_eq!(res.len(), 1);
+        assert!(!res[0].liquidation.buy_bad_debt);
         assert!(
             res[0].expected_profit > 0,
             "paper profit should still be positive in this setup"
         );
-        assert_eq!(res[0].min_collateral_amount, Nat::from(4_655_000_000_000_000u64));
+        assert_eq!(res[0].min_collateral_amount, Nat::from(0u8));
     }
 
     #[tokio::test]
@@ -1664,11 +1472,6 @@ mod tests {
             })
         });
 
-        let mut swapper = MockSwapInterface::new();
-        swapper
-            .expect_quote()
-            .returning(|_req| panic!("quote should not be called for pure bad debt"));
-
         let registry = Arc::new(registry);
         let account = Arc::new(account);
         let balance_service = Arc::new(BalanceService::new(registry.clone(), account.clone()));
@@ -1676,7 +1479,6 @@ mod tests {
         let strategy = SimpleLiquidationStrategy::new(
             Arc::new(cfg),
             registry.clone(),
-            Arc::new(swapper),
             Arc::new(collateral),
             balance_service,
             Arc::new(ApprovalState::new()),
@@ -1742,11 +1544,6 @@ mod tests {
             })
         });
 
-        let mut swapper = MockSwapInterface::new();
-        swapper
-            .expect_quote()
-            .returning(|_req| panic!("quote should not be called when assets match"));
-
         let registry = Arc::new(registry);
         let account = Arc::new(account);
         let balance_service = Arc::new(BalanceService::new(registry.clone(), account.clone()));
@@ -1754,7 +1551,6 @@ mod tests {
         let strategy = SimpleLiquidationStrategy::new(
             Arc::new(cfg),
             registry.clone(),
-            Arc::new(swapper),
             Arc::new(collateral),
             balance_service,
             Arc::new(ApprovalState::new()),
@@ -1825,11 +1621,6 @@ mod tests {
             })
         });
 
-        let mut swapper = MockSwapInterface::new();
-        swapper
-            .expect_quote()
-            .returning(|_req| panic!("quote should not be called when assets match"));
-
         let registry = Arc::new(registry);
         let account = Arc::new(account);
         let balance_service = Arc::new(BalanceService::new(registry.clone(), account.clone()));
@@ -1837,7 +1628,6 @@ mod tests {
         let strategy = SimpleLiquidationStrategy::new(
             Arc::new(cfg),
             registry.clone(),
-            Arc::new(swapper),
             Arc::new(collateral),
             balance_service,
             Arc::new(ApprovalState::new()),
@@ -1913,11 +1703,6 @@ mod tests {
             })
         });
 
-        let mut swapper = MockSwapInterface::new();
-        swapper
-            .expect_quote()
-            .returning(|_req| panic!("quote should not be called when assets match"));
-
         let registry = Arc::new(registry);
         let account = Arc::new(account);
         let balance_service = Arc::new(BalanceService::new(registry.clone(), account.clone()));
@@ -1925,7 +1710,6 @@ mod tests {
         let strategy = SimpleLiquidationStrategy::new(
             Arc::new(cfg),
             registry.clone(),
-            Arc::new(swapper),
             Arc::new(collateral),
             balance_service,
             Arc::new(ApprovalState::new()),
@@ -2002,11 +1786,6 @@ mod tests {
             })
         });
 
-        let mut swapper = MockSwapInterface::new();
-        swapper
-            .expect_quote()
-            .returning(|_req| panic!("quote should not be called when assets match"));
-
         let registry = Arc::new(registry);
         let account = Arc::new(account);
         let balance_service = Arc::new(BalanceService::new(registry.clone(), account.clone()));
@@ -2014,7 +1793,6 @@ mod tests {
         let strategy = SimpleLiquidationStrategy::new(
             Arc::new(cfg),
             registry.clone(),
-            Arc::new(swapper),
             Arc::new(collateral),
             balance_service,
             Arc::new(ApprovalState::new()),

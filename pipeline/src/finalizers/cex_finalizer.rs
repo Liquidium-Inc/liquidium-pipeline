@@ -5,7 +5,7 @@ use liquidium_pipeline_core::tokens::{chain_token::ChainToken, chain_token_amoun
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    finalizers::finalizer::{Finalizer, FinalizerResult},
+    finalizers::finalizer::{Finalizer, FinalizerErrorKind, FinalizerResult},
     persistance::{LiqMetaWrapper, LiqResultRecord, ResultStatus, WalStore},
     stages::executor::{ExecutionReceipt, ExecutionStatus},
     swappers::model::SwapExecution,
@@ -27,7 +27,8 @@ pub enum CexStep {
     Failed,
 }
 
-/// Route-level CEX feasibility and cost preview used by hybrid routing decisions.
+/// Route-level CEX feasibility and cost preview used by multi-venue planning.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CexRoutePreview {
     /// Whether the route is executable against current orderbook depth.
@@ -35,7 +36,7 @@ pub struct CexRoutePreview {
     /// Estimated output amount in final receive-asset native units.
     pub estimated_receive_amount: f64,
     /// Estimated end-to-end route slippage in basis points.
-    pub estimated_slippage_bps: f64,
+    pub estimated_price_impact_bps: f64,
     /// Optional reason when preview cannot be executed.
     pub reason: Option<String>,
 }
@@ -208,6 +209,9 @@ pub struct CexState {
 
 #[async_trait]
 pub trait CexFinalizerLogic: Send + Sync {
+    #[allow(dead_code)]
+    fn venue_id(&self) -> &'static str;
+
     // Build the initial CEX state for this liquidation from the receipt
     async fn prepare(&self, liq_id: &str, receipt: &ExecutionReceipt) -> Result<CexState, String>;
 
@@ -220,10 +224,22 @@ pub trait CexFinalizerLogic: Send + Sync {
     // On CEX: withdraw to chain
     async fn withdraw(&self, state: &mut CexState) -> Result<(), String>;
 
+    /// Executes one phase of the shared CEX state machine. Venue adapters and
+    /// the legacy WAL finalizer use this same dispatch to avoid behavior drift.
+    async fn advance_current_step(&self, state: &mut CexState) -> Result<(), String> {
+        match state.step {
+            CexStep::Deposit | CexStep::DepositPending => self.deposit(state).await,
+            CexStep::Trade | CexStep::TradePending => self.trade(state).await,
+            CexStep::Withdraw | CexStep::WithdrawPending => self.withdraw(state).await,
+            CexStep::Completed | CexStep::Failed => Ok(()),
+        }
+    }
+
     // Build final SwapExecution to hand back to pipeline when Completed
     async fn finish(&self, receipt: &ExecutionReceipt, state: &CexState) -> Result<SwapExecution, String>;
 
     // Preview route feasibility and slippage using current orderbook depth.
+    #[allow(dead_code)]
     async fn preview_route(&self, receipt: &ExecutionReceipt) -> Result<CexRoutePreview, String>;
 }
 
@@ -254,7 +270,7 @@ impl Finalizer for dyn CexFinalizerLogic {
                     ResultStatus::WaitingCollateral | ResultStatus::WaitingProfit => {
                         return Ok(FinalizerResult::noop());
                     }
-                    ResultStatus::OperatorRequired => {
+                    ResultStatus::OperatorRequired | ResultStatus::Unresumable => {
                         return Ok(FinalizerResult::noop());
                     }
                     ResultStatus::FailedPermanent => {
@@ -306,35 +322,9 @@ impl Finalizer for dyn CexFinalizerLogic {
 
         let mut row_after = row;
         loop {
-            let step_res = match cex_state.step {
-                CexStep::Deposit => {
-                    debug!("[cex] 💰 liq_id={} step=Deposit", cex_state.liq_id);
-                    self.deposit(&mut cex_state).await
-                }
-                CexStep::DepositPending => {
-                    info!("[cex] ⏳ liq_id={} step=DepositPending", cex_state.liq_id);
-                    // Re-check deposit arrival on the CEX.
-                    self.deposit(&mut cex_state).await
-                }
-                CexStep::Trade => {
-                    debug!("[cex] 🔁 liq_id={} step=Trade", cex_state.liq_id);
-                    self.trade(&mut cex_state).await
-                }
-                CexStep::TradePending => {
-                    debug!("[cex] ⏳ liq_id={} step=TradePending", cex_state.liq_id);
-                    self.trade(&mut cex_state).await
-                }
-                CexStep::Withdraw => {
-                    debug!("[cex] 🏦 liq_id={} step=Withdraw", cex_state.liq_id);
-                    self.withdraw(&mut cex_state).await
-                }
-                CexStep::WithdrawPending => {
-                    info!("[cex] ⏳ liq_id={} step=WithdrawPending", cex_state.liq_id);
-                    self.withdraw(&mut cex_state).await
-                }
+            match cex_state.step {
                 CexStep::Completed => {
                     info!("[cex] 🎉 liq_id={} step=Completed", cex_state.liq_id);
-                    debug!("[cex] liq_id={} step=Completed (noop)", cex_state.liq_id);
                     break;
                 }
                 CexStep::Failed => {
@@ -344,7 +334,10 @@ impl Finalizer for dyn CexFinalizerLogic {
                     );
                     break;
                 }
-            };
+                step => debug!("[cex] liq_id={} step={step:?}", cex_state.liq_id),
+            }
+
+            let step_res = self.advance_current_step(&mut cex_state).await;
 
             // If the current leg failed, stop and handle retry / permanent fail below.
             if let Err(err) = step_res {
@@ -401,6 +394,16 @@ impl Finalizer for dyn CexFinalizerLogic {
         };
 
         Ok(res)
+    }
+
+    fn classify_error(&self, error: &str) -> FinalizerErrorKind {
+        if error.starts_with(
+            liquidium_pipeline_connectors::backend::bridge_backend::FINALIZER_PERMANENT_AMOUNT_FLOOR_PREFIX,
+        ) {
+            FinalizerErrorKind::BadDebtAmountFloor
+        } else {
+            FinalizerErrorKind::Retryable
+        }
     }
 }
 
@@ -484,6 +487,10 @@ mod tests {
 
     #[async_trait]
     impl CexFinalizerLogic for DummyCexFinalizer {
+        fn venue_id(&self) -> &'static str {
+            "dummy"
+        }
+
         async fn prepare(&self, liq_id: &str, _receipt: &ExecutionReceipt) -> Result<CexState, String> {
             let pay = ChainToken::Icp {
                 ledger: Principal::anonymous(),
@@ -617,7 +624,7 @@ mod tests {
             Ok(CexRoutePreview {
                 is_executable: true,
                 estimated_receive_amount: 0.0,
-                estimated_slippage_bps: 0.0,
+                estimated_price_impact_bps: 0.0,
                 reason: None,
             })
         }
@@ -630,6 +637,10 @@ mod tests {
 
     #[async_trait]
     impl CexFinalizerLogic for FailThenResumeFinalizer {
+        fn venue_id(&self) -> &'static str {
+            "test-cex"
+        }
+
         async fn prepare(&self, liq_id: &str, _receipt: &ExecutionReceipt) -> Result<CexState, String> {
             *self.prepare_calls.lock().unwrap() += 1;
 
@@ -770,7 +781,7 @@ mod tests {
             Ok(CexRoutePreview {
                 is_executable: true,
                 estimated_receive_amount: 0.0,
-                estimated_slippage_bps: 0.0,
+                estimated_price_impact_bps: 0.0,
                 reason: None,
             })
         }
@@ -815,6 +826,8 @@ mod tests {
             collateral_asset: pay_token.clone(),
             expected_profit: 0,
             ref_price: Nat::from(0u8),
+            debt_ref_price: Nat::from(0u8),
+            ref_price_at: 0,
             debt_approval_needed: false,
             min_collateral_amount: Nat::from(0u8),
         };
@@ -856,6 +869,7 @@ mod tests {
             finalizer_decision: None,
             profit_snapshot: None,
             venue_execution: None,
+            meta_v2: None,
         };
 
         let mut row = LiqResultRecord {
@@ -899,6 +913,7 @@ mod tests {
             finalizer_decision: None,
             profit_snapshot: None,
             venue_execution: None,
+            meta_v2: None,
         };
 
         let mut row = LiqResultRecord {
@@ -1054,6 +1069,7 @@ mod tests {
             finalizer_decision: None,
             profit_snapshot: None,
             venue_execution: None,
+            meta_v2: None,
         };
 
         let mut row = LiqResultRecord {

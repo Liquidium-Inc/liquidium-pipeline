@@ -20,6 +20,7 @@ pub fn decode_receipt_wrapper(row: &LiqResultRecord) -> Result<Option<LiqMetaWra
                 finalizer_decision: None,
                 profit_snapshot: None,
                 venue_execution: None,
+                meta_v2: None,
             })),
             Err(receipt_err) => Err(format!(
                 "invalid meta_json for {}: wrapper_err={}; receipt_err={}",
@@ -108,6 +109,7 @@ pub async fn wal_mark_operator_required_with_error(
 mod tests {
     use super::*;
     use candid::{Nat, Principal};
+    use icrc_ledger_types::icrc1::account::Account;
     use liquidium_pipeline_core::tokens::{chain_token::ChainToken, chain_token_amount::ChainTokenAmount};
     use liquidium_pipeline_core::types::protocol_types::{
         AssetType, LiquidationAmounts, LiquidationRequest, LiquidationResult, LiquidationStatus, TransferStatus,
@@ -116,7 +118,13 @@ mod tests {
     use serde_json::json;
 
     use crate::executors::executor::ExecutorRequest;
+    use crate::persistance::VenueExecutionState;
     use crate::stages::executor::ExecutionStatus;
+    use crate::swappers::icpswap::{
+        identity::IcpswapExecutionIdentity,
+        transfer_state::{IcpswapFundingState, IcpswapLedgerTransferState, IcpswapSettlementState},
+        types::{IcpswapExecutionPlan, IcpswapExecutionState, IcpswapStep},
+    };
     use crate::swappers::model::SwapRequest;
 
     fn make_receipt() -> ExecutionReceipt {
@@ -154,6 +162,8 @@ mod tests {
             collateral_asset: collateral,
             expected_profit: 1,
             ref_price: Nat::from(1u64),
+            debt_ref_price: Nat::from(0u8),
+            ref_price_at: 0,
             debt_approval_needed: false,
             min_collateral_amount: Nat::from(0u8),
         };
@@ -213,6 +223,8 @@ mod tests {
             .expect("wrapper should exist");
         assert!(wrapper.finalizer_decision.is_none());
         assert!(wrapper.profit_snapshot.is_none());
+        assert!(wrapper.venue_execution.is_none());
+        assert!(wrapper.meta_v2.is_none());
     }
 
     #[test]
@@ -225,7 +237,118 @@ mod tests {
             .expect("wrapper should exist");
         assert!(wrapper.finalizer_decision.is_none());
         assert!(wrapper.profit_snapshot.is_none());
+        assert!(wrapper.venue_execution.is_none());
+        assert!(wrapper.meta_v2.is_none());
         assert!(wrapper.meta.is_empty());
+    }
+
+    #[test]
+    fn icpswap_execution_state_round_trips_in_existing_meta_json() {
+        #[derive(serde::Deserialize)]
+        #[serde(tag = "venue", content = "state", rename_all = "snake_case")]
+        enum TaggedVenueExecutionState {
+            Icpswap(IcpswapExecutionState),
+        }
+
+        let receipt = make_receipt();
+        let token_in = ChainToken::Icp {
+            ledger: Principal::from_slice(&[1]),
+            symbol: "INPUT".to_string(),
+            decimals: 8,
+            fee: Nat::from(10u64),
+        };
+        let token_out = ChainToken::Icp {
+            ledger: Principal::from_slice(&[2]),
+            symbol: "OUTPUT".to_string(),
+            decimals: 6,
+            fee: Nat::from(20u64),
+        };
+        let plan = IcpswapExecutionPlan::new(
+            Principal::from_slice(&[3]),
+            Principal::from_slice(&[1]),
+            Principal::from_slice(&[2]),
+            Nat::from(3_000u64),
+            ChainTokenAmount::from_raw(token_in.clone(), Nat::from(100_000u64)),
+            ChainTokenAmount::from_raw(token_in.clone(), Nat::from(10u64)),
+            ChainTokenAmount::from_raw(token_out.clone(), Nat::from(120_000u64)),
+            ChainTokenAmount::from_raw(token_out.clone(), Nat::from(20u64)),
+            100,
+        )
+        .expect("plan");
+        let (identity, _) = IcpswapExecutionIdentity::derive(
+            "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about",
+            "42",
+        )
+        .expect("identity");
+        let owner = Account {
+            owner: identity.principal,
+            subaccount: None,
+        };
+        let mut state = IcpswapExecutionState::prepare(
+            "42",
+            plan.clone(),
+            identity,
+            IcpswapFundingState::new(
+                Account {
+                    owner: Principal::from_slice(&[4]),
+                    subaccount: None,
+                },
+                owner,
+                plan.input_ledger_fee.clone(),
+            ),
+            IcpswapSettlementState {
+                kind: None,
+                destination: Account {
+                    owner: Principal::from_slice(&[5]),
+                    subaccount: None,
+                },
+                fee: plan.output_ledger_fee.clone(),
+                transfer: IcpswapLedgerTransferState::default(),
+                interrupted_transfer: None,
+                interrupted_observed_debit: None,
+                recovery_credit: None,
+                residual_dust: None,
+            },
+        )
+        .expect("state");
+        state.step = IcpswapStep::TradePending;
+        state.transfer.block_index = Some(Nat::from(77u64));
+        state.trade.input_pool_balance_before = Some(Nat::from(100_000u64));
+        state.trade.output_pool_balance_before = Some(Nat::from(42u64));
+        state.trade.gross_output_amount = Some(Nat::from(119_500u64));
+        state.last_error = Some("waiting for asynchronous output".to_string());
+
+        let mut row = make_row("{}".to_string());
+        let wrapper = LiqMetaWrapper {
+            receipt,
+            meta: vec![1, 2, 3],
+            finalizer_decision: None,
+            profit_snapshot: None,
+            venue_execution: Some(VenueExecutionState::new(crate::swappers::icpswap::VENUE_ID, &state).unwrap()),
+            meta_v2: None,
+        };
+        encode_meta(&mut row, &wrapper).expect("encode wrapper");
+        let encoded: serde_json::Value = serde_json::from_str(&row.meta_json).expect("encoded wrapper json");
+        assert_eq!(encoded["venue_execution"]["venue"], "icpswap");
+        assert!(encoded["venue_execution"]["state"].is_object());
+        let tagged: TaggedVenueExecutionState = serde_json::from_value(encoded["venue_execution"].clone())
+            .expect("the previous tagged-enum schema must decode the new representation");
+        let TaggedVenueExecutionState::Icpswap(tagged_state) = tagged;
+        assert_eq!(tagged_state, state);
+
+        let decoded = decode_receipt_wrapper(&row)
+            .expect("decode wrapper")
+            .expect("wrapper exists");
+        assert_eq!(decoded.meta, vec![1, 2, 3]);
+        let encoded_state = VenueExecutionState::new(crate::swappers::icpswap::VENUE_ID, &state).unwrap();
+        assert_eq!(decoded.venue_execution, Some(encoded_state));
+        let decoded_state: IcpswapExecutionState = decoded
+            .venue_execution
+            .expect("ICPSwap state should exist")
+            .decode(crate::swappers::icpswap::VENUE_ID)
+            .expect("decode state")
+            .expect("wrong venue");
+        assert_eq!(decoded_state.plan, plan);
     }
 
     #[test]
@@ -259,13 +382,14 @@ mod tests {
     }
 
     #[test]
-    fn decode_legacy_receipt_defaults_missing_min_collateral_amount() {
+    fn decode_legacy_receipt_defaults_missing_request_fields() {
         let receipt = make_receipt();
         let mut legacy = serde_json::to_value(&receipt).expect("receipt json value should serialize");
         let request = legacy["request"]
             .as_object_mut()
             .expect("legacy request should be object");
         request.remove("min_collateral_amount");
+        request.remove("debt_ref_price");
 
         let row = make_row(legacy.to_string());
         let wrapper = decode_receipt_wrapper(&row)
@@ -273,5 +397,6 @@ mod tests {
             .expect("wrapper should exist");
 
         assert_eq!(wrapper.receipt.request.min_collateral_amount, Nat::from(0u8));
+        assert_eq!(wrapper.receipt.request.debt_ref_price, Nat::from(0u8));
     }
 }

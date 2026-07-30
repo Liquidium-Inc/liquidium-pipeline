@@ -256,6 +256,7 @@ impl<A: PipelineAgent, D: WalStore> BasicExecutor<A, D> {
                 updated_at: now_ts(),
             }),
             venue_execution: None,
+            meta_v2: None,
         };
         let _ = encode_meta(&mut result_record, &wrapper);
         self.wal.upsert_result(result_record).map_err(|e| e.to_string()).await
@@ -309,6 +310,8 @@ mod tests {
             collateral_asset: debt_asset,
             expected_profit: 3,
             ref_price: Nat::from(0u8),
+            debt_ref_price: Nat::from(0u8),
+            ref_price_at: 0,
             debt_approval_needed: true,
             min_collateral_amount: Nat::from(42u64),
         }
