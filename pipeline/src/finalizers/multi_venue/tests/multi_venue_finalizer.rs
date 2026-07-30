@@ -37,7 +37,7 @@ use crate::{
         finalize::{FinalizeStage, MAX_FINALIZER_ERRORS},
     },
     swappers::model::{SwapExecution, SwapQuote, SwapQuoteLeg, SwapRequest},
-    utils::ICP_LEDGER_PRINCIPAL,
+    utils::{CKUSDC_LEDGER_PRINCIPAL, ICP_LEDGER_PRINCIPAL},
     wal::{decode_receipt_wrapper, encode_meta, liq_id_from_receipt},
     watchdog::{Watchdog, WatchdogEvent},
 };
@@ -488,7 +488,7 @@ fn native_icp() -> ChainToken {
 
 fn debt_token() -> ChainToken {
     ChainToken::Icp {
-        ledger: Principal::from_slice(&[2]),
+        ledger: Principal::from_text(CKUSDC_LEDGER_PRINCIPAL).expect("ckUSDC ledger"),
         symbol: "ckUSDC".to_string(),
         decimals: 6,
         fee: Nat::from(10u64),

@@ -1,9 +1,5 @@
 use std::sync::Mutex;
 
-use async_trait::async_trait;
-use candid::Principal;
-use liquidium_pipeline_core::tokens::chain_token::ChainToken;
-
 use super::finalizer::{IcpswapFinalizer, RETRY_COOLDOWN_NANOS, is_terminal_step};
 use crate::{
     finalizers::multi_venue::{MultiVenueAdapter, VenueLegCheckpoint, VenueLegProgress, VenueRoutePreview},
@@ -13,12 +9,13 @@ use crate::{
             VENUE_ID,
             execution::IcpswapExecutionStateStore,
             plan::net_forwarded_output,
+            supports_pair,
             types::{IcpswapExecutionState, IcpswapStep},
         },
         model::SwapExecution,
     },
-    utils::ICP_LEDGER_PRINCIPAL,
 };
+use async_trait::async_trait;
 
 /// ICPSwap-local state store whose persists are checkpointed into the complete
 /// parent envelope, allowing `advance_loaded` to drive the whole workflow.
@@ -109,18 +106,16 @@ fn leg_status(step: IcpswapStep) -> VenueLegStatus {
     }
 }
 
-/// Rejects every IC token except the canonical native ICP ledger. Keeping this
-/// check at the adapter boundary means a future planner or forced-venue caller
-/// cannot bypass ICPSwap's initial ICP-only policy.
-fn require_native_icp(request: &crate::swappers::model::SwapRequest) -> Result<(), String> {
-    let native_ledger = Principal::from_text(ICP_LEDGER_PRINCIPAL)
-        .map_err(|error| format!("invalid configured native ICP ledger principal: {error}"))?;
-    match &request.pay_amount.token {
-        ChainToken::Icp { ledger, .. } if *ledger == native_ledger => Ok(()),
-        ChainToken::Icp { ledger, .. } => Err(format!(
-            "ICPSwap only accepts native ICP input ledger {native_ledger}; received {ledger}"
-        )),
-        _ => Err("ICPSwap only accepts native ICP input".to_string()),
+/// Re-checks the pair at the execution adapter boundary so a future planner or
+/// forced-venue caller cannot bypass the venue policy.
+fn require_supported_pair(request: &crate::swappers::model::SwapRequest) -> Result<(), String> {
+    if supports_pair(&request.pay_amount.token, &request.receive_asset) {
+        Ok(())
+    } else {
+        Err(format!(
+            "ICPSwap only supports canonical ICP <-> ckUSDC swaps; received {} -> {}",
+            request.pay_asset, request.receive_asset
+        ))
     }
 }
 
@@ -209,7 +204,7 @@ impl MultiVenueAdapter for IcpswapFinalizer {
         context: &crate::finalizers::multi_venue::VenuePlanningContext,
         request: &crate::swappers::model::SwapRequest,
     ) -> Result<VenueRoutePreview, String> {
-        require_native_icp(request)?;
+        require_supported_pair(request)?;
         if self.trader.subaccount.is_some() {
             return Err("ICPSwap requires the trader's default ledger account".to_string());
         }

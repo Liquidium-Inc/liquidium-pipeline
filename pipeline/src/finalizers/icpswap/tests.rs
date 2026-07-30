@@ -48,7 +48,7 @@ use crate::{
         },
         model::{SwapQuote, SwapQuoteLeg, SwapRequest},
     },
-    utils::ICP_LEDGER_PRINCIPAL,
+    utils::{CKUSDC_LEDGER_PRINCIPAL, ICP_LEDGER_PRINCIPAL},
     wal::{decode_receipt_wrapper, encode_meta},
     watchdog::{Watchdog, WatchdogEvent},
 };
@@ -461,12 +461,13 @@ fn finalizer_with_preview(preview: IcpswapRoutePreview) -> IcpswapFinalizer {
 
 fn native_plan() -> IcpswapExecutionPlan {
     let native_ledger = Principal::from_text(ICP_LEDGER_PRINCIPAL).expect("native ICP ledger");
+    let ckusdc_ledger = Principal::from_text(CKUSDC_LEDGER_PRINCIPAL).expect("ckUSDC ledger");
     let input = token(native_ledger, "ICP", 10);
-    let output = token(p(2), "OUT", 5);
+    let output = token(ckusdc_ledger, "ckUSDC", 5);
     IcpswapExecutionPlan::new(
         p(9),
         native_ledger,
-        p(2),
+        ckusdc_ledger,
         Nat::from(3_000u64),
         ChainTokenAmount::from_raw(input.clone(), Nat::from(100_000u64)),
         ChainTokenAmount::from_raw(input, Nat::from(10u64)),
@@ -579,14 +580,14 @@ async fn multi_venue_preview_requires_an_explicit_receive_address() {
 }
 
 #[tokio::test]
-async fn multi_venue_preview_rejects_non_native_icp_at_adapter_boundary() {
+async fn multi_venue_preview_rejects_unsupported_pair_at_adapter_boundary() {
     let request = receipt().request.swap_args.expect("request");
     let error = finalizer(MockIcpswapManualClient::new())
         .preview(&planning_context(), &request)
         .await
-        .expect_err("non-native ICP must be rejected");
+        .expect_err("unsupported IC token pair must be rejected");
 
-    assert!(error.contains("only accepts native ICP"));
+    assert!(error.contains("only supports canonical ICP <-> ckUSDC"));
 }
 
 #[tokio::test]
@@ -757,7 +758,7 @@ async fn multi_venue_preview_rejects_non_icp_chain_tokens_at_adapter_boundary() 
         .await
         .expect_err("a non-ICP chain token must be rejected before any client call");
 
-    assert!(error.contains("only accepts native ICP"));
+    assert!(error.contains("only supports canonical ICP <-> ckUSDC"));
 }
 
 #[tokio::test]
@@ -905,14 +906,11 @@ async fn multi_venue_advance_surfaces_operational_error_without_losing_leg_progr
 #[tokio::test]
 async fn committing_dex_preview_creates_manual_icpswap_state() {
     let mut receipt = receipt();
-    receipt
-        .request
-        .swap_args
-        .as_mut()
-        .expect("swap request")
-        .pay_amount
-        .value = Nat::from(100_030u64);
-    let plan = plan();
+    let plan = native_plan();
+    let request = native_request(&plan);
+    receipt.request.collateral_asset = request.pay_amount.token.clone();
+    receipt.request.debt_asset = plan.gross_quoted_out.token.clone();
+    receipt.request.swap_args = Some(request);
     let wal = TestWal::new(&receipt, state());
     wal.clear_execution_state();
     let finalizer = finalizer(MockIcpswapManualClient::new());

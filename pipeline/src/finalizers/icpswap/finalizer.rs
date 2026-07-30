@@ -14,6 +14,7 @@ use crate::{
             VENUE_ID,
             execution::{IcpswapExecutionStateStore, WalIcpswapExecutionStateStore},
             session::{IcpswapExecutionSession, IcpswapExecutionSessionFactory},
+            supports_pair,
             transfer_state::{IcpswapFundingState, IcpswapLedgerTransferState, IcpswapSettlementState},
             types::{IcpswapExecutionPlan, IcpswapExecutionState, IcpswapStep},
             venue::IcpswapFinalizerLogic,
@@ -86,6 +87,17 @@ impl IcpswapFinalizer {
         request: &SwapRequest,
         plan: IcpswapExecutionPlan,
     ) -> Result<IcpswapExecutionState, String> {
+        if !supports_pair(&request.pay_amount.token, &request.receive_asset) {
+            return Err(format!(
+                "ICPSwap only supports canonical ICP <-> ckUSDC swaps; received {} -> {}",
+                request.pay_asset, request.receive_asset
+            ));
+        }
+        if plan.amount_in.token.asset_id() != request.pay_asset
+            || plan.gross_quoted_out.token.asset_id() != request.receive_asset
+        {
+            return Err("ICPSwap execution plan token pair does not match its swap request".to_string());
+        }
         let identity = self.sessions.descriptor(liquidation_id)?;
         let child = Account {
             owner: identity.principal,

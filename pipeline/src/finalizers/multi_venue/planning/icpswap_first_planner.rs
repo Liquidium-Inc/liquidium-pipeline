@@ -1,9 +1,7 @@
 use std::{cmp::max, sync::Arc};
 
-use candid::{Nat, Principal};
-use liquidium_pipeline_core::tokens::{
-    asset_id::AssetId, chain_token::ChainToken, chain_token_amount::ChainTokenAmount,
-};
+use candid::Nat;
+use liquidium_pipeline_core::tokens::{asset_id::AssetId, chain_token_amount::ChainTokenAmount};
 use num_traits::ToPrimitive;
 use thiserror::Error;
 
@@ -14,8 +12,7 @@ use crate::{
         VenueLegState,
     },
     stages::executor::{ExecutionReceipt, ExecutionStatus},
-    swappers::model::SwapRequest,
-    utils::ICP_LEDGER_PRINCIPAL,
+    swappers::{icpswap::supports_pair, model::SwapRequest},
 };
 
 use super::{
@@ -200,11 +197,8 @@ impl IcpswapFirstPlanInput {
         }
     }
 
-    fn is_native_icp(&self) -> bool {
-        let Ok(native_ledger) = Principal::from_text(ICP_LEDGER_PRINCIPAL) else {
-            return false;
-        };
-        matches!(&self.total_pay.token, ChainToken::Icp { ledger, .. } if *ledger == native_ledger)
+    fn is_icpswap_supported_pair(&self) -> bool {
+        supports_pair(&self.total_pay.token, &self.receive_asset)
     }
 
     fn meets_cex_minimum(&self, amount: &ChainTokenAmount, minimum_usd: f64) -> bool {
@@ -286,7 +280,7 @@ impl IcpswapFirstPlanner {
         input.validate()?;
         let context = input.planning_context();
 
-        if !input.is_native_icp() || !self.venues.contains(ICPSWAP_VENUE_ID) {
+        if !input.is_icpswap_supported_pair() || !self.venues.contains(ICPSWAP_VENUE_ID) {
             return self.plan_overflow_only(input, quoted_at).await;
         }
 

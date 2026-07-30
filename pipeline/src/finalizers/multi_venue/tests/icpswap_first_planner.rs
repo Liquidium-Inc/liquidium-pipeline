@@ -24,7 +24,7 @@ use crate::{
     persistance::{MultiVenueAllocationReason, VenueExecutionState, VenueLegState},
     stages::executor::{ExecutionReceipt, ExecutionStatus},
     swappers::model::{SwapQuote, SwapQuoteLeg, SwapRequest},
-    utils::ICP_LEDGER_PRINCIPAL,
+    utils::{CKUSDC_LEDGER_PRINCIPAL, CKUSDT_LEDGER_PRINCIPAL, ICP_LEDGER_PRINCIPAL},
 };
 
 const TOTAL_PAY: u64 = 100_000_000;
@@ -186,7 +186,7 @@ fn non_native_icp_token() -> ChainToken {
 
 fn debt_token() -> ChainToken {
     ChainToken::Icp {
-        ledger: Principal::from_slice(&[2]),
+        ledger: Principal::from_text(CKUSDC_LEDGER_PRINCIPAL).expect("ckUSDC ledger"),
         symbol: "ckUSDC".to_string(),
         decimals: 6,
         fee: Nat::from(10_000u64),
@@ -203,6 +203,38 @@ fn input_with_pay_token(pay_token: ChainToken) -> IcpswapFirstPlanInput {
         receive_address: Some("receiver".to_string()),
         max_execution_slippage_bps: Some(500),
         pay_reference_price_usd: Some(10.0),
+    }
+}
+
+fn native_icp_to_ckusdt_input() -> IcpswapFirstPlanInput {
+    let debt = ChainToken::Icp {
+        ledger: Principal::from_text(CKUSDT_LEDGER_PRINCIPAL).expect("ckUSDT ledger"),
+        symbol: "ckUSDT".to_string(),
+        decimals: 6,
+        fee: Nat::from(10_000u64),
+    };
+    IcpswapFirstPlanInput {
+        liquidation_id: "42".to_string(),
+        total_pay: ChainTokenAmount::from_raw(native_icp(), Nat::from(TOTAL_PAY)),
+        receive_asset: debt.asset_id(),
+        debt_repaid: ChainTokenAmount::from_raw(debt, Nat::from(DEBT_REPAID)),
+        receive_address: Some("receiver".to_string()),
+        max_execution_slippage_bps: Some(500),
+        pay_reference_price_usd: Some(10.0),
+    }
+}
+
+fn ckusdc_to_native_icp_input() -> IcpswapFirstPlanInput {
+    let pay = debt_token();
+    let receive = native_icp();
+    IcpswapFirstPlanInput {
+        liquidation_id: "42".to_string(),
+        total_pay: ChainTokenAmount::from_raw(pay, Nat::from(TOTAL_PAY)),
+        receive_asset: receive.asset_id(),
+        debt_repaid: ChainTokenAmount::from_raw(receive, Nat::from(DEBT_REPAID)),
+        receive_address: Some("receiver".to_string()),
+        max_execution_slippage_bps: Some(500),
+        pay_reference_price_usd: Some(1.0),
     }
 }
 
@@ -224,7 +256,12 @@ fn preview(
     receive_amount: u64,
     conservative_receive_amount: u64,
 ) -> VenueRoutePreview {
-    let receive_token = debt_token();
+    let receive_token = ChainToken::Icp {
+        ledger: Principal::from_text(&request.receive_asset.address).expect("test receive ledger"),
+        symbol: request.receive_asset.symbol.clone(),
+        decimals: 6,
+        fee: Nat::from(10_000u64),
+    };
     VenueRoutePreview {
         venue_id: venue_id.to_string(),
         request: request.clone(),
@@ -398,8 +435,8 @@ async fn liquidation_context_reaches_full_search_exact_and_overflow_previews() {
         contexts: mexc_contexts.clone(),
     };
 
-    let planner = IcpswapFirstPlanner::new(vec![Arc::new(icpswap), Arc::new(mexc)], config(0.0))
-        .expect("valid planner");
+    let planner =
+        IcpswapFirstPlanner::new(vec![Arc::new(icpswap), Arc::new(mexc)], config(0.0)).expect("valid planner");
     let state = planner
         .plan(&input_with_pay_token(native_icp()), 123)
         .await
@@ -1177,6 +1214,55 @@ async fn non_native_icp_is_mexc_only_and_never_previews_icpswap() {
         mexc_calls_for_assert.lock().expect("calls lock").as_slice(),
         &[TOTAL_PAY]
     );
+}
+
+#[tokio::test]
+async fn native_icp_to_ckusdt_is_mexc_only_and_never_previews_icpswap() {
+    let icpswap = PlannerAdapter {
+        venue_id: ICPSWAP_VENUE_ID,
+        calls: Arc::new(Mutex::new(Vec::new())),
+        responder: Box::new(|_| Err("not used".to_string())),
+        validation_error: None,
+        preview_forbidden: true,
+    };
+    let mexc_calls = Arc::new(Mutex::new(Vec::new()));
+    let mexc_calls_for_assert = mexc_calls.clone();
+    let mexc = mock_adapter(MEXC_VENUE_ID, mexc_calls, |request| {
+        Ok(proportional_preview(request, MEXC_VENUE_ID, 0.0, 2))
+    });
+
+    let state = planner(icpswap, mexc, config(0.0))
+        .plan(&native_icp_to_ckusdt_input(), 123)
+        .await
+        .expect("unsupported ICPSwap pair should use MEXC");
+
+    assert_eq!(state.legs.len(), 1);
+    assert_eq!(state.legs[0].venue_id, MEXC_VENUE_ID);
+    assert_eq!(
+        mexc_calls_for_assert.lock().expect("calls lock").as_slice(),
+        &[TOTAL_PAY]
+    );
+}
+
+#[tokio::test]
+async fn ckusdc_to_native_icp_remains_eligible_for_icpswap() {
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let calls_for_assert = calls.clone();
+    let icpswap = mock_adapter(ICPSWAP_VENUE_ID, calls, |request| {
+        let mut preview = proportional_preview(request, ICPSWAP_VENUE_ID, 50.0, 2);
+        preview.conservative_receive.token = native_icp();
+        Ok(preview)
+    });
+    let planner = IcpswapFirstPlanner::new(vec![Arc::new(icpswap)], config(0.0)).expect("planner");
+
+    let state = planner
+        .plan(&ckusdc_to_native_icp_input(), 123)
+        .await
+        .expect("reverse canonical pair should use ICPSwap");
+
+    assert_eq!(state.legs.len(), 1);
+    assert_eq!(state.legs[0].venue_id, ICPSWAP_VENUE_ID);
+    assert_eq!(calls_for_assert.lock().expect("calls lock").as_slice(), &[TOTAL_PAY]);
 }
 
 #[tokio::test]

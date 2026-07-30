@@ -336,10 +336,10 @@ pub enum IcpswapQuoteError {
     MissingToken(String),
     #[error("swap request pay asset does not match pay amount token")]
     PayAssetMismatch,
+    #[error("ICPSwap only supports canonical ICP <-> ckUSDC swaps; received {pay_asset} -> {receive_asset}")]
+    UnsupportedPair { pay_asset: String, receive_asset: String },
     #[error("ICPSwap input budget {budget} cannot cover transfer and deposit fees totaling {fees}")]
     InputFeesExceedBudget { budget: Nat, fees: Nat },
-    #[error("ICPSwap only accepts native ICP from ledger {expected}, got {actual}")]
-    UnsupportedInputLedger { expected: Principal, actual: Principal },
     #[error("ICPSwap pool {pool} returned an invalid zero spot price")]
     InvalidPoolPrice { pool: Principal },
     #[error("invalid principal '{address}' returned as {field}: {message}")]

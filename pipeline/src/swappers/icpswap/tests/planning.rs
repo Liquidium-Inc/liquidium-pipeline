@@ -13,9 +13,12 @@ use super::{
     },
     venue::IcpswapVenue,
 };
-use crate::utils::ICP_LEDGER_PRINCIPAL;
+use crate::utils::{CKUSDC_LEDGER_PRINCIPAL, ICP_LEDGER_PRINCIPAL};
 
 fn principal(id: u8) -> Principal {
+    if id == 2 {
+        return Principal::from_text(CKUSDC_LEDGER_PRINCIPAL).expect("ckUSDC ledger principal");
+    }
     Principal::from_slice(&[id])
 }
 
@@ -193,6 +196,45 @@ async fn keeps_usable_quote_when_another_fee_tier_fails() {
 
     assert_eq!(result.route.pool, principal(6));
     assert_eq!(result.route.net_expected_output().value, Nat::from(980u64));
+}
+
+#[tokio::test]
+async fn quotes_canonical_ckusdc_to_native_icp_direction() {
+    let input = chain_token(principal(2), "ckUSDC", 10);
+    let output = chain_token(native_icp_ledger(), "ICP", 10);
+    let input_ledger = principal(2);
+    let output_ledger = native_icp_ledger();
+
+    let mut client = MockIcpswapReadClient::new();
+    client.expect_ledger_fee().times(2).returning(|_| Ok(Nat::from(10u64)));
+    client
+        .expect_get_pool()
+        .times(1)
+        .return_once(move |_, _, fee| Ok(pool_data(principal(6), output_ledger, input_ledger, fee.clone())));
+    client.expect_quote().times(1).return_once(|_, args| {
+        assert!(!args.zero_for_one);
+        Ok(Nat::from(1_000u64))
+    });
+    client
+        .expect_pool_metadata()
+        .times(1)
+        .return_once(move |_| Ok(pool_metadata(output_ledger, input_ledger)));
+
+    let venue = IcpswapVenue::new(
+        Arc::new(client),
+        vec![metadata(input.clone()), metadata(output.clone())],
+        vec![Nat::from(3_000u64)],
+        100,
+    )
+    .expect("venue");
+    let result = venue
+        .preview_route(&request(&input, &output))
+        .await
+        .expect("reverse quote");
+
+    assert_eq!(result.route.token_in, input_ledger);
+    assert_eq!(result.route.token_out, output_ledger);
+    assert_eq!(result.quote.receive_asset, output.asset_id());
 }
 
 #[tokio::test]
@@ -437,7 +479,7 @@ async fn rejects_non_native_icp_before_calling_the_protocol() {
     .expect("venue");
 
     let error = venue.preview_route(&request(&input, &output)).await.unwrap_err();
-    assert!(matches!(error, IcpswapQuoteError::UnsupportedInputLedger { .. }));
+    assert!(matches!(error, IcpswapQuoteError::UnsupportedPair { .. }));
 }
 
 #[tokio::test]
@@ -464,5 +506,5 @@ async fn rejects_non_icp_chain_token_as_missing_before_calling_the_protocol() {
     .expect("venue");
 
     let error = venue.preview_route(&request(&input, &output)).await.unwrap_err();
-    assert!(matches!(error, IcpswapQuoteError::MissingToken(_)));
+    assert!(matches!(error, IcpswapQuoteError::UnsupportedPair { .. }));
 }

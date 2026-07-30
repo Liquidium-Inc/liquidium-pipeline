@@ -8,11 +8,11 @@ use liquidium_pipeline_core::tokens::{
 };
 use num_traits::ToPrimitive;
 
+use crate::swappers::icpswap::supports_pair;
 use crate::swappers::{
     model::{SwapExecution, SwapQuote, SwapQuoteLeg, SwapRequest},
     venue::SwapVenue,
 };
-use crate::utils::ICP_LEDGER_PRINCIPAL;
 
 use super::{
     client::{IcpswapManualClient, IcpswapReadClient},
@@ -202,7 +202,7 @@ impl<C: IcpswapReadClient> IcpswapVenue<C> {
             return Err(IcpswapQuoteError::PayAssetMismatch);
         }
 
-        validate_native_icp_input(request)?;
+        validate_supported_pair(request)?;
 
         let input = self
             .tokens
@@ -515,15 +515,14 @@ fn quoted_price_impact_bps(spot_output: &Nat, gross_quote: &Nat) -> f64 {
     ((spot - quoted) / spot).max(0.0) * 10_000.0
 }
 
-fn validate_native_icp_input(request: &SwapRequest) -> Result<(), IcpswapQuoteError> {
-    let expected =
-        Principal::from_text(ICP_LEDGER_PRINCIPAL).expect("configured native ICP ledger principal must be valid");
-    let actual = icp_ledger(&request.pay_amount.token)
-        .ok_or_else(|| IcpswapQuoteError::MissingToken(request.pay_asset.to_string()))?;
-    if actual == expected {
+fn validate_supported_pair(request: &SwapRequest) -> Result<(), IcpswapQuoteError> {
+    if supports_pair(&request.pay_amount.token, &request.receive_asset) {
         Ok(())
     } else {
-        Err(IcpswapQuoteError::UnsupportedInputLedger { expected, actual })
+        Err(IcpswapQuoteError::UnsupportedPair {
+            pay_asset: request.pay_asset.to_string(),
+            receive_asset: request.receive_asset.to_string(),
+        })
     }
 }
 
