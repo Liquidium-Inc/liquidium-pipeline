@@ -1,6 +1,4 @@
-use candid::Nat;
-/// Floating-point epsilon used for liquidity comparisons.
-pub(super) const LIQUIDITY_EPS: f64 = 1e-9;
+pub(super) use crate::swappers::model::{LIQUIDITY_EPS, f64_to_nat};
 
 /// One market leg in a routed CEX trade.
 #[derive(Debug, Clone)]
@@ -34,11 +32,6 @@ pub(super) fn is_usd_stable_symbol(symbol: &str) -> bool {
         symbol.to_ascii_uppercase().as_str(),
         "USD" | "USDT" | "USDC" | "CKUSDT" | "CKUSDC"
     )
-}
-
-/// Convert a non-negative float into `Nat` using truncation.
-pub(super) fn f64_to_nat(v: f64) -> Nat {
-    Nat::from(v.max(0.0) as u128)
 }
 
 /// Hardcoded multi-leg routes where direct market lookup is insufficient.

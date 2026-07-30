@@ -26,7 +26,7 @@ use log::{debug, info};
 use num_traits::ToPrimitive;
 
 use crate::liquidation::liquidation_math::oracle_implied_output;
-use crate::swappers::model::SwapRequest;
+use crate::swappers::model::{BASIS_POINTS_DENOMINATOR, SwapRequest, amount_after_bps_haircut};
 use crate::utils::{ICP_LEDGER_PRINCIPAL, max_for_ledger, now_ts};
 use crate::watchdog::{Watchdog, WatchdogEvent, noop_watchdog};
 use async_trait::async_trait;
@@ -116,12 +116,8 @@ where
     }
 
     fn min_collateral_for_bad_debt(gross_collateral: Nat, slippage_bps: u32) -> Nat {
-        if gross_collateral == 0u8 {
-            return Nat::from(0u8);
-        }
-
-        let retained_bps = 10_000u32.saturating_sub(slippage_bps.min(10_000));
-        (gross_collateral * Nat::from(retained_bps)) / Nat::from(10_000u32)
+        amount_after_bps_haircut(&gross_collateral, slippage_bps.min(BASIS_POINTS_DENOMINATOR))
+            .unwrap_or_else(|_| Nat::from(0u8))
     }
 
     fn native_to_units(amount: &Nat, decimals: u8) -> f64 {
@@ -367,8 +363,7 @@ where
 }
 
 #[async_trait]
-impl<'a, C, R, U> PipelineStage<'a, Vec<LiquidatebleUser>, Vec<ExecutorRequest>>
-    for SimpleLiquidationStrategy<C, R, U>
+impl<'a, C, R, U> PipelineStage<'a, Vec<LiquidatebleUser>, Vec<ExecutorRequest>> for SimpleLiquidationStrategy<C, R, U>
 where
     C: ConfigTrait,
     R: TokenRegistryTrait + 'static,
@@ -784,7 +779,6 @@ mod tests {
             })
         });
 
-
         let registry = Arc::new(registry);
         let account = Arc::new(account);
         let balance_service = Arc::new(BalanceService::new(registry.clone(), account.clone()));
@@ -844,7 +838,6 @@ mod tests {
             .expect_get_balance()
             .returning(|_t: &ChainToken| Err("boom".to_string()));
 
-
         let registry = Arc::new(registry);
         let account = Arc::new(account);
         let balance_service = Arc::new(BalanceService::new(registry.clone(), account.clone()));
@@ -898,7 +891,6 @@ mod tests {
         account
             .expect_get_balance()
             .returning(|_t: &ChainToken| panic!("balance should not be fetched for invalid asset type"));
-
 
         let registry = Arc::new(registry);
         let account = Arc::new(account);
@@ -1001,7 +993,6 @@ mod tests {
             })
         });
 
-
         let registry = Arc::new(registry);
         let account = Arc::new(account);
         let balance_service = Arc::new(BalanceService::new(registry.clone(), account.clone()));
@@ -1069,7 +1060,6 @@ mod tests {
                 value: Nat::from(1_000_000u64),
             })
         });
-
 
         let registry = Arc::new(registry);
         let account = Arc::new(account);
@@ -1143,7 +1133,6 @@ mod tests {
                 value: Nat::from(10_000u64),
             })
         });
-
 
         let registry = Arc::new(registry);
         let account = Arc::new(account);
@@ -1231,7 +1220,6 @@ mod tests {
                 value: Nat::from(1_000_000_000_000u64),
             })
         });
-
 
         let registry = Arc::new(registry);
         let account = Arc::new(account);
@@ -1326,7 +1314,6 @@ mod tests {
             })
         });
 
-
         let registry = Arc::new(registry);
         let account = Arc::new(account);
         let balance_service = Arc::new(BalanceService::new(registry.clone(), account.clone()));
@@ -1345,7 +1332,11 @@ mod tests {
         let user = mk_user(vec![debt_pos, collateral_pos], 1_000_000, 900);
 
         let res = strategy.process(&vec![user]).await.unwrap();
-        assert_eq!(res.len(), 1, "venue-neutral strategy should not apply a MEXC bridge floor");
+        assert_eq!(
+            res.len(),
+            1,
+            "venue-neutral strategy should not apply a MEXC bridge floor"
+        );
         assert!(!res[0].liquidation.buy_bad_debt);
     }
 
@@ -1417,7 +1408,6 @@ mod tests {
             })
         });
 
-
         let registry = Arc::new(registry);
         let account = Arc::new(account);
         let balance_service = Arc::new(BalanceService::new(registry.clone(), account.clone()));
@@ -1481,7 +1471,6 @@ mod tests {
                 value: Nat::from(1_000_000u64),
             })
         });
-
 
         let registry = Arc::new(registry);
         let account = Arc::new(account);
@@ -1554,7 +1543,6 @@ mod tests {
                 value: Nat::from(1_399u64),
             })
         });
-
 
         let registry = Arc::new(registry);
         let account = Arc::new(account);
@@ -1632,7 +1620,6 @@ mod tests {
                 value: Nat::from(1_000_000u64),
             })
         });
-
 
         let registry = Arc::new(registry);
         let account = Arc::new(account);
@@ -1716,7 +1703,6 @@ mod tests {
             })
         });
 
-
         let registry = Arc::new(registry);
         let account = Arc::new(account);
         let balance_service = Arc::new(BalanceService::new(registry.clone(), account.clone()));
@@ -1799,7 +1785,6 @@ mod tests {
                 value: Nat::from(1_000_000u64),
             })
         });
-
 
         let registry = Arc::new(registry);
         let account = Arc::new(account);

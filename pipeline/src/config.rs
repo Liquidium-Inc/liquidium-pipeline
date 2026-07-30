@@ -117,22 +117,14 @@ pub trait ConfigTrait: Send + Sync {
     fn get_cex_buy_inverse_enabled(&self) -> bool;
     fn get_cex_retry_base_secs(&self) -> u64;
     fn get_cex_retry_max_secs(&self) -> u64;
-    fn get_multi_venue_min_net_edge_bps(&self) -> u32;
-    fn get_multi_venue_max_oracle_discount_bps(&self) -> u32;
-    fn get_multi_venue_oracle_snapshot_max_age_secs(&self) -> i64;
     fn get_cex_delay_buffer_bps(&self) -> u32;
     fn get_cex_route_fee_bps(&self) -> u32;
     fn get_cex_mexc_available_pairs(&self) -> Vec<String>;
     fn get_cex_mexc_max_hops(&self) -> u8;
-    fn get_icpswap_max_price_impact_bps(&self) -> f64;
-    fn get_icpswap_max_search_iterations(&self) -> u8;
-    fn get_icpswap_dust_fallback_max_price_impact_bps(&self) -> f64;
-    fn get_icpswap_test_allocation_usd(&self) -> Option<f64>;
     #[allow(dead_code)]
     fn get_lending_canister(&self) -> Principal;
     #[allow(dead_code)]
     fn get_recovery_account(&self) -> Account;
-    fn get_enabled_swap_venues(&self) -> Vec<String>;
     fn get_cex_credentials(&self, cex: &str) -> Result<(String, String), String>;
 }
 
@@ -204,18 +196,6 @@ impl ConfigTrait for Config {
         self.cex_retry_max_secs
     }
 
-    fn get_multi_venue_min_net_edge_bps(&self) -> u32 {
-        self.multi_venue_min_net_edge_bps
-    }
-
-    fn get_multi_venue_max_oracle_discount_bps(&self) -> u32 {
-        self.multi_venue_max_oracle_discount_bps
-    }
-
-    fn get_multi_venue_oracle_snapshot_max_age_secs(&self) -> i64 {
-        self.multi_venue_oracle_snapshot_max_age_secs
-    }
-
     fn get_cex_delay_buffer_bps(&self) -> u32 {
         self.cex_delay_buffer_bps
     }
@@ -230,26 +210,6 @@ impl ConfigTrait for Config {
 
     fn get_cex_mexc_max_hops(&self) -> u8 {
         self.cex_mexc_max_hops
-    }
-
-    fn get_icpswap_max_price_impact_bps(&self) -> f64 {
-        self.icpswap_max_price_impact_bps
-    }
-
-    fn get_icpswap_max_search_iterations(&self) -> u8 {
-        self.icpswap_max_search_iterations
-    }
-
-    fn get_icpswap_dust_fallback_max_price_impact_bps(&self) -> f64 {
-        self.icpswap_dust_fallback_max_price_impact_bps
-    }
-
-    fn get_icpswap_test_allocation_usd(&self) -> Option<f64> {
-        self.icpswap_test_allocation_usd
-    }
-
-    fn get_enabled_swap_venues(&self) -> Vec<String> {
-        self.enabled_swap_venues.clone()
     }
 
     fn get_cex_credentials(&self, cex: &str) -> Result<(String, String), String> {
@@ -369,10 +329,7 @@ impl Config {
 
         let enabled_swap_venues = parse_enabled_swap_venues_from_env()?;
         if let Ok(legacy) = env::var("SWAPPER") {
-            warn!(
-                "SWAPPER={} is ignored; configure ENABLED_SWAP_VENUES instead",
-                legacy
-            );
+            warn!("SWAPPER={} is ignored; configure ENABLED_SWAP_VENUES instead", legacy);
         }
 
         debug!("Loading cex credentials...");
@@ -439,8 +396,7 @@ impl Config {
             icpswap_fee_tiers,
             icpswap_max_price_impact_bps: parse_icpswap_max_price_impact_bps_from_env(),
             icpswap_max_search_iterations: parse_icpswap_max_search_iterations_from_env(),
-            icpswap_dust_fallback_max_price_impact_bps:
-                parse_icpswap_dust_fallback_max_price_impact_bps_from_env(),
+            icpswap_dust_fallback_max_price_impact_bps: parse_icpswap_dust_fallback_max_price_impact_bps_from_env(),
             icpswap_test_allocation_usd,
             enabled_swap_venues,
             cex_credentials,
@@ -585,9 +541,9 @@ fn parse_slippage_bps_from_env(primary: &str, default_bps: u32) -> Result<u32, S
     if trimmed.is_empty() {
         return Ok(default_bps);
     }
-    let parsed: u32 = trimmed.parse().map_err(|_| {
-        format!("{name}='{trimmed}' is not a whole number of basis points (e.g. 125 for 1.25%)")
-    })?;
+    let parsed: u32 = trimmed
+        .parse()
+        .map_err(|_| format!("{name}='{trimmed}' is not a whole number of basis points (e.g. 125 for 1.25%)"))?;
     if parsed > MAX_CONFIGURABLE_SLIPPAGE_BPS {
         return Err(format!(
             "{name}={parsed} exceeds the maximum {MAX_CONFIGURABLE_SLIPPAGE_BPS} bps allowed for a slippage cap"

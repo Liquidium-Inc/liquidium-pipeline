@@ -1,7 +1,6 @@
 use liquidium_pipeline_connectors::backend::cex_backend::OrderBookLevel;
 
-const LIQUIDITY_EPS: f64 = 1e-9;
-const BPS_PER_RATIO_UNIT: f64 = 10_000.0;
+use crate::swappers::model::{BPS_PER_RATIO_UNIT, LIQUIDITY_EPS};
 
 /// Simulates selling base into bids from best to worst.
 /// Returns `(quote_out, vwap, price_impact_bps, unfilled_base)`.

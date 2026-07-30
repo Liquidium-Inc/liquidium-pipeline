@@ -82,7 +82,9 @@ pub fn derivation_path(liquidation_id: u128) -> String {
     format!("{ICPSWAP_DERIVATION_PREFIX}/{l4}'/{l3}'/{l2}'/{l1}'/{l0}'")
 }
 
-fn parse_liquidation_id(liquidation_id: &str) -> Result<u128, String> {
+/// The signing identity is derived from this parse, so every layer that accepts
+/// a liquidation ID must accept exactly the forms accepted here.
+pub(crate) fn parse_liquidation_id(liquidation_id: &str) -> Result<u128, String> {
     let value = liquidation_id
         .parse::<u128>()
         .map_err(|error| format!("invalid liquidation ID `{liquidation_id}`: {error}"))?;

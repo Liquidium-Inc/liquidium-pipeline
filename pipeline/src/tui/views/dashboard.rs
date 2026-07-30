@@ -280,7 +280,11 @@ fn draw_recent_outcomes_table(f: &mut Frame<'_>, area: Rect, app: &App) {
                     break;
                 }
 
-                let venue_rows = multi_venue_fork_rows(&r.meta_json);
+                // One decode per row: the fork rows and the compact context are
+                // both projections of the same envelope, and this runs on the
+                // render tick.
+                let meta = parse_execution_meta(&r.meta_json);
+                let venue_rows = multi_venue_fork_rows(meta.as_ref());
                 // Keep a multi-venue execution together. It is easier to scan
                 // one fewer liquidation than to show an orphaned first branch
                 // without the remaining venue rows.
@@ -293,7 +297,7 @@ fn draw_recent_outcomes_table(f: &mut Frame<'_>, area: Rect, app: &App) {
                     .unwrap_or_else(|| "-".to_string());
                 let status = status_short(r.status);
                 let status_style = status_style(r.status);
-                let (pair, pnl, pnl_style) = compact_liq_context(&r.meta_json);
+                let (pair, pnl, pnl_style) = compact_liq_context(meta.as_ref());
 
                 rows.push(Row::new(vec![
                     Cell::new(at),
@@ -401,14 +405,14 @@ struct VenueForkRow {
 
 /// Expands every persisted multi-venue plan regardless of parent WAL status.
 /// Before planning is committed an enqueued row has no legs to display yet.
-fn multi_venue_fork_rows(raw: &str) -> Vec<VenueForkRow> {
-    let Ok(wrapper) = serde_json::from_str::<LiqMetaWrapper>(raw) else {
+fn multi_venue_fork_rows(meta: Option<&ParsedExecutionMeta>) -> Vec<VenueForkRow> {
+    let Some(ParsedExecutionMeta::Wrapper(wrapper)) = meta else {
         return Vec::new();
     };
-    let Some(meta) = wrapper.meta_v2 else {
+    let Some(meta_v2) = &wrapper.meta_v2 else {
         return Vec::new();
     };
-    let FinalizerMetaPayload::MultiVenueSwap(state) = meta.payload;
+    let FinalizerMetaPayload::MultiVenueSwap(state) = &meta_v2.payload;
     venue_fork_rows(&state.legs)
 }
 
@@ -498,7 +502,7 @@ fn venue_leg_amount(leg: &VenueLegState) -> String {
     format!("{} alloc", leg.request.pay_amount.formatted())
 }
 
-fn venue_leg_style(status: VenueLegStatus) -> Style {
+pub(super) fn venue_leg_style(status: VenueLegStatus) -> Style {
     match status {
         VenueLegStatus::Completed => Style::default().fg(Color::Green),
         VenueLegStatus::Recovered => Style::default().fg(Color::Cyan),
@@ -568,10 +572,10 @@ fn status_style(status: ResultStatus) -> Style {
     }
 }
 
-fn compact_liq_context(raw: &str) -> (String, String, Style) {
+fn compact_liq_context(meta: Option<&ParsedExecutionMeta>) -> (String, String, Style) {
     let default_profit = ("-".to_string(), Style::default().fg(Color::DarkGray));
 
-    match parse_execution_meta(raw) {
+    match meta {
         Some(ParsedExecutionMeta::Wrapper(wrapper)) => {
             let pair = format!(
                 "{}→{}",
@@ -579,7 +583,7 @@ fn compact_liq_context(raw: &str) -> (String, String, Style) {
                 wrapper.receipt.request.debt_asset.symbol()
             );
 
-            if let Some(snapshot) = wrapper.profit_snapshot {
+            if let Some(snapshot) = &wrapper.profit_snapshot {
                 let expected = snapshot.expected_profit_raw.parse::<i128>().ok();
                 if let Some(realized) = snapshot
                     .realized_profit_raw

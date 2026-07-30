@@ -31,9 +31,6 @@ struct MexcVenueExecutionState {
     operator_required: bool,
 }
 
-// Step 6 registers this implementation in the live venue registry. Until then
-// the private dispatch helpers are exercised only by focused adapter tests.
-#[allow(dead_code)]
 impl<B> MexcFinalizer<B>
 where
     B: CexBackend,

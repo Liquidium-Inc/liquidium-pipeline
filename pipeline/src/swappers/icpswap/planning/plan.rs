@@ -104,10 +104,32 @@ pub fn net_expected_output(gross_quote: &Nat, output_ledger_fee: &Nat) -> Result
 /// Net credit after the pool withdrawal and the child-to-recipient forwarding
 /// transfer each consume one output-ledger fee.
 pub fn net_forwarded_output(gross_quote: &Nat, output_ledger_fee: &Nat) -> Result<Nat, IcpswapPlanError> {
-    net_expected_output(gross_quote, &(output_ledger_fee.clone() * Nat::from(2u8)))
+    net_expected_output(gross_quote, &output_fee_budget(output_ledger_fee))
 }
 
-fn icp_ledger(token: &ChainToken) -> Result<Principal, IcpswapPlanError> {
+// The hop topology below is stated once. Planning, funding, and the finalizer's
+// allocation check each reserve a different slice of it, so deriving every
+// slice here keeps a change to the hop structure from leaving one site behind.
+
+/// Input-side reservation: trader -> child, child -> pool deposit account, and
+/// the pool's deposit sweep each consume one input-ledger fee.
+pub fn input_fee_budget(input_ledger_fee: &Nat) -> Nat {
+    input_ledger_fee.clone() * Nat::from(3u8)
+}
+
+/// Balance the isolated child must hold on top of the pool input: the deposit
+/// transfer and the pool's sweep.
+pub fn child_fee_budget(input_ledger_fee: &Nat) -> Nat {
+    input_ledger_fee.clone() * Nat::from(2u8)
+}
+
+/// Output-side reservation: the pool withdrawal and the child -> receiver
+/// forwarding transfer each consume one output-ledger fee.
+pub fn output_fee_budget(output_ledger_fee: &Nat) -> Nat {
+    output_ledger_fee.clone() * Nat::from(2u8)
+}
+
+pub(super) fn icp_ledger(token: &ChainToken) -> Result<Principal, IcpswapPlanError> {
     match token {
         ChainToken::Icp { ledger, .. } => Ok(*ledger),
         other => Err(IcpswapPlanError::NonIcpToken(other.to_string())),

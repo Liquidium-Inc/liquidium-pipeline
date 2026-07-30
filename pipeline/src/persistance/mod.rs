@@ -27,6 +27,25 @@ pub enum ResultStatus {
     Unresumable = 8,
 }
 
+impl From<i32> for ResultStatus {
+    /// Unknown discriminants decode as permanently failed so a row written by a
+    /// newer binary is never picked up as pending work.
+    fn from(value: i32) -> Self {
+        match value {
+            0 => ResultStatus::Enqueued,
+            1 => ResultStatus::InFlight,
+            2 => ResultStatus::Succeeded,
+            3 => ResultStatus::FailedRetryable,
+            4 => ResultStatus::FailedPermanent,
+            5 => ResultStatus::WaitingCollateral,
+            6 => ResultStatus::WaitingProfit,
+            7 => ResultStatus::OperatorRequired,
+            8 => ResultStatus::Unresumable,
+            _ => ResultStatus::FailedPermanent,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, serde::Deserialize)]
 pub struct LiqMetaWrapper {
     pub receipt: ExecutionReceipt,

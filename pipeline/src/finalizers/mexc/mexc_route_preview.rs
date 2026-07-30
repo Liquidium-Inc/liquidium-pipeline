@@ -4,9 +4,8 @@ use super::{
     mexc_finalizer::MexcFinalizer,
     mexc_utils::{LIQUIDITY_EPS, TradeLeg},
 };
-use crate::swappers::model::adverse_price_impact_bps;
+use crate::swappers::model::{BPS_PER_RATIO_UNIT, adverse_price_impact_bps};
 
-const BPS_PER_RATIO_UNIT: f64 = 10_000.0;
 /// Conservative quote-time fee per MEXC hop. Live fills resolve the exact
 /// symbol fee; planning must not assume the gross order-book output is usable.
 const MEXC_PREVIEW_TAKER_FEE_BPS: f64 = 10.0;

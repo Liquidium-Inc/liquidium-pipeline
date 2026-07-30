@@ -1,7 +1,6 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use candid::Nat;
 use icrc_ledger_types::icrc1::account::Account;
 
 use crate::{
@@ -11,10 +10,10 @@ use crate::{
     stages::executor::{ExecutionReceipt, ExecutionStatus},
     swappers::{
         icpswap::{
-            VENUE_ID,
+            VENUE_ID, ensure_supported_pair,
             execution::{IcpswapExecutionStateStore, WalIcpswapExecutionStateStore},
+            plan::input_fee_budget,
             session::{IcpswapExecutionSession, IcpswapExecutionSessionFactory},
-            supports_pair,
             transfer_state::{IcpswapFundingState, IcpswapLedgerTransferState, IcpswapSettlementState},
             types::{IcpswapExecutionPlan, IcpswapExecutionState, IcpswapStep},
             venue::IcpswapFinalizerLogic,
@@ -87,12 +86,7 @@ impl IcpswapFinalizer {
         request: &SwapRequest,
         plan: IcpswapExecutionPlan,
     ) -> Result<IcpswapExecutionState, String> {
-        if !supports_pair(&request.pay_amount.token, &request.receive_asset) {
-            return Err(format!(
-                "ICPSwap only supports canonical ICP <-> ckUSDC swaps; received {} -> {}",
-                request.pay_asset, request.receive_asset
-            ));
-        }
+        ensure_supported_pair(request)?;
         if plan.amount_in.token.asset_id() != request.pay_asset
             || plan.gross_quoted_out.token.asset_id() != request.receive_asset
         {
@@ -105,7 +99,7 @@ impl IcpswapFinalizer {
         };
         let allocation = request.pay_amount.value.clone();
         let fee = plan.input_ledger_fee.value.clone();
-        let required = plan.amount_in.value.clone() + fee.clone() * Nat::from(3u8);
+        let required = plan.amount_in.value.clone() + input_fee_budget(&fee);
         if allocation != required {
             return Err(format!(
                 "ICPSwap allocation {allocation} does not equal pool input plus three ledger fees {required}"

@@ -211,7 +211,7 @@ async fn init(
     let executor = Arc::new(executor);
 
     let mut venue_adapters: Vec<Arc<dyn MultiVenueAdapter>> = Vec::new();
-    for venue_id in config.get_enabled_swap_venues() {
+    for venue_id in &config.enabled_swap_venues {
         match venue_id.as_str() {
             ICPSWAP_VENUE_ID => venue_adapters.push(
                 ctx.icpswap_finalizer
@@ -230,15 +230,14 @@ async fn init(
         MultiVenueFinalizer::new(
             venue_adapters,
             IcpswapFirstPlannerConfig {
-                max_price_impact_bps: config.get_icpswap_max_price_impact_bps(),
-                max_search_iterations: config.get_icpswap_max_search_iterations(),
-                dust_fallback_max_price_impact_bps: config
-                    .get_icpswap_dust_fallback_max_price_impact_bps(),
+                max_price_impact_bps: config.icpswap_max_price_impact_bps,
+                max_search_iterations: config.icpswap_max_search_iterations,
+                dust_fallback_max_price_impact_bps: config.icpswap_dust_fallback_max_price_impact_bps,
                 cex_min_exec_usd: config.get_cex_min_exec_usd(),
-                min_net_edge_bps: config.get_multi_venue_min_net_edge_bps(),
-                max_oracle_discount_bps: config.get_multi_venue_max_oracle_discount_bps(),
-                oracle_snapshot_max_age_secs: config.get_multi_venue_oracle_snapshot_max_age_secs(),
-                icpswap_test_allocation_usd: config.get_icpswap_test_allocation_usd(),
+                min_net_edge_bps: config.multi_venue_min_net_edge_bps,
+                max_oracle_discount_bps: config.multi_venue_max_oracle_discount_bps,
+                oracle_snapshot_max_age_secs: config.multi_venue_oracle_snapshot_max_age_secs,
+                icpswap_test_allocation_usd: config.icpswap_test_allocation_usd,
             },
         )?
         .with_watchdog(slack_watchdog_from_env(DEFAULT_LOW_BALANCE_ALERT_COOLDOWN))

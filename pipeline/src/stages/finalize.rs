@@ -150,6 +150,15 @@ where
             .await;
     }
 
+    /// Parks a row whose WAL meta cannot be interpreted. The row is already
+    /// unusable, so a failure to mark it is logged rather than propagated.
+    async fn quarantine_row(&self, row_id: &str, error: String) {
+        if let Err(mark_error) = wal_mark_permanent_failed(&*self.wal, row_id, error.clone()).await {
+            warn!("Failed to quarantine malformed WAL row {}: {}", row_id, mark_error);
+        }
+        error!("[finalize] quarantined malformed WAL row {}: {}", row_id, error);
+    }
+
     async fn persist_profit_snapshot(
         &self,
         liq_id: &str,
@@ -213,32 +222,20 @@ where
         let mut receipts: Vec<ExecutionReceipt> = vec![];
 
         for row in rows {
-            let meta = match decode_receipt_wrapper(&row) {
-                Ok(Some(meta)) => meta,
-                Ok(None) => {
-                    let error = format!("receipt not found in WAL meta_json for {}", row.id);
-                    if let Err(mark_error) = wal_mark_permanent_failed(&*self.wal, &row.id, error.clone()).await {
-                        warn!("Failed to quarantine malformed WAL row {}: {}", row.id, mark_error);
-                    }
-                    error!("[finalize] quarantined malformed WAL row {}: {}", row.id, error);
-                    continue;
-                }
+            let decoded = decode_receipt_wrapper(&row)
+                .and_then(|meta| meta.ok_or_else(|| format!("receipt not found in WAL meta_json for {}", row.id)));
+            let meta = match decoded {
+                Ok(meta) => meta,
                 Err(error) => {
-                    if let Err(mark_error) = wal_mark_permanent_failed(&*self.wal, &row.id, error.clone()).await {
-                        warn!("Failed to quarantine malformed WAL row {}: {}", row.id, mark_error);
-                    }
-                    error!("[finalize] quarantined malformed WAL row {}: {}", row.id, error);
+                    self.quarantine_row(&row.id, error).await;
                     continue;
                 }
             };
             let receipt: ExecutionReceipt = meta.receipt;
 
             let Some(liq) = receipt.liquidation_result.as_ref() else {
-                let error = format!("missing liquidation_result for WAL id {}", row.id);
-                if let Err(mark_error) = wal_mark_permanent_failed(&*self.wal, &row.id, error.clone()).await {
-                    warn!("Failed to quarantine malformed WAL row {}: {}", row.id, mark_error);
-                }
-                error!("[finalize] quarantined malformed WAL row {}: {}", row.id, error);
+                self.quarantine_row(&row.id, format!("missing liquidation_result for WAL id {}", row.id))
+                    .await;
                 continue;
             };
 

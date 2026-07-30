@@ -12,7 +12,7 @@ use serde_json::Value;
 use crate::finalizers::liquidation_outcome::LiquidationOutcome;
 use crate::persistance::{
     FinalizerMetaPayload, FinalizerMetaV2, LiqMetaWrapper, ResultStatus, VenueExecutionState, VenueLegState,
-    VenueLegStatus, WalProfitSnapshot,
+    WalProfitSnapshot,
 };
 use crate::stages::executor::{ExecutionReceipt, ExecutionStatus};
 use crate::swappers::icpswap::{VENUE_ID as ICPSWAP_VENUE_ID, identity::IcpswapExecutionIdentity};
@@ -387,7 +387,7 @@ fn append_multi_venue_summary(lines: &mut Vec<Line<'static>>, meta: Option<&Fina
 fn append_venue_leg_summary(lines: &mut Vec<Line<'static>>, leg: &VenueLegState, is_last: bool) {
     let branch = if is_last { "└─" } else { "├─" };
     let stage = super::dashboard::venue_leg_stage(leg);
-    let style = venue_detail_style(leg.status);
+    let style = super::dashboard::venue_leg_style(leg.status);
     lines.push(Line::from(vec![
         Span::styled(
             format!("{branch} {}", super::dashboard::venue_display_name(&leg.venue_id)),
@@ -421,17 +421,6 @@ fn append_venue_leg_summary(lines: &mut Vec<Line<'static>>, leg: &VenueLegState,
             format!("   Last error: {error}"),
             Style::default().fg(Color::Red),
         )));
-    }
-}
-
-fn venue_detail_style(status: VenueLegStatus) -> Style {
-    match status {
-        VenueLegStatus::Completed => Style::default().fg(Color::Green),
-        VenueLegStatus::Recovered => Style::default().fg(Color::Cyan),
-        VenueLegStatus::OperatorRequired => Style::default().fg(Color::Magenta),
-        VenueLegStatus::FailedPermanent => Style::default().fg(Color::Red),
-        VenueLegStatus::Running => Style::default().fg(Color::Yellow),
-        VenueLegStatus::Planned => Style::default().fg(Color::DarkGray),
     }
 }
 

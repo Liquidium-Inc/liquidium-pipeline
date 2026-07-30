@@ -3,7 +3,12 @@
 use candid::Principal;
 use liquidium_pipeline_core::tokens::{asset_id::AssetId, chain_token::ChainToken};
 
-use crate::utils::{CKUSDC_LEDGER_PRINCIPAL, ICP_LEDGER_PRINCIPAL};
+use crate::{
+    swappers::model::SwapRequest,
+    utils::{CKUSDC_LEDGER_PRINCIPAL, ICP_LEDGER_PRINCIPAL},
+};
+
+use self::types::IcpswapQuoteError;
 
 #[path = "protocol/client.rs"]
 pub mod client;
@@ -13,18 +18,18 @@ pub mod execution;
 pub mod identity;
 #[path = "execution/ledger_transfers.rs"]
 pub mod ledger_transfers;
-#[path = "execution/session.rs"]
-pub mod session;
-#[path = "execution/transfer_state.rs"]
-pub mod transfer_state;
 #[path = "execution/manual.rs"]
 pub mod manual;
 #[path = "planning/plan.rs"]
 pub mod plan;
 #[path = "execution/reconciliation.rs"]
 pub(crate) mod reconciliation;
+#[path = "execution/session.rs"]
+pub mod session;
 #[path = "execution/state.rs"]
 pub mod state;
+#[path = "execution/transfer_state.rs"]
+pub mod transfer_state;
 #[path = "protocol/types.rs"]
 pub mod types;
 #[path = "planning/venue.rs"]
@@ -51,6 +56,19 @@ pub(crate) fn supports_pair(pay_token: &ChainToken, receive_asset: &AssetId) -> 
         Principal::from_text(CKUSDC_LEDGER_PRINCIPAL).expect("configured ckUSDC ledger principal must be valid");
 
     (*pay_ledger == native_icp && receive_ledger == ckusdc) || (*pay_ledger == ckusdc && receive_ledger == native_icp)
+}
+
+/// Rejects an unsupported pair with the one canonical message, so the planner,
+/// the execution adapter and the venue all report the policy identically.
+pub(crate) fn ensure_supported_pair(request: &SwapRequest) -> Result<(), String> {
+    if supports_pair(&request.pay_amount.token, &request.receive_asset) {
+        return Ok(());
+    }
+    Err(IcpswapQuoteError::UnsupportedPair {
+        pay_asset: request.pay_asset.to_string(),
+        receive_asset: request.receive_asset.to_string(),
+    }
+    .to_string())
 }
 
 #[cfg(test)]
@@ -94,17 +112,17 @@ mod pair_policy_tests {
 }
 
 #[cfg(test)]
+#[path = "tests/ledger_transfers.rs"]
+mod ledger_transfer_tests;
+#[cfg(test)]
 #[path = "tests/manual.rs"]
 mod manual_tests;
+#[cfg(test)]
+#[path = "tests/state_versioning.rs"]
+mod state_versioning_tests;
 #[cfg(test)]
 #[path = "tests/protocol.rs"]
 mod tests;
 #[cfg(test)]
 #[path = "tests/planning.rs"]
 mod venue_tests;
-#[cfg(test)]
-#[path = "tests/state_versioning.rs"]
-mod state_versioning_tests;
-#[cfg(test)]
-#[path = "tests/ledger_transfers.rs"]
-mod ledger_transfer_tests;

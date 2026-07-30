@@ -2,8 +2,15 @@ use candid::{CandidType, Nat};
 use liquidium_pipeline_core::tokens::{asset_id::AssetId, chain_token_amount::ChainTokenAmount};
 use serde::{Deserialize, Serialize};
 
-const BPS_PER_RATIO_UNIT: f64 = 10_000.0;
 pub const BASIS_POINTS_DENOMINATOR: u32 = 10_000;
+pub const BPS_PER_RATIO_UNIT: f64 = BASIS_POINTS_DENOMINATOR as f64;
+/// Floating-point epsilon used for liquidity comparisons.
+pub const LIQUIDITY_EPS: f64 = 1e-9;
+
+/// Convert a non-negative float into `Nat` using truncation.
+pub fn f64_to_nat(v: f64) -> Nat {
+    Nat::from(v.max(0.0) as u128)
+}
 
 /// Normalized adverse quote impact for prices expressed in receive units per
 /// pay unit. Better-than-reference quotes are clamped to zero.

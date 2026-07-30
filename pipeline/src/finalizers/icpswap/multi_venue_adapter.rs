@@ -6,10 +6,9 @@ use crate::{
     persistance::{VenueExecutionState, VenueLegState, VenueLegStatus},
     swappers::{
         icpswap::{
-            VENUE_ID,
+            VENUE_ID, ensure_supported_pair,
             execution::IcpswapExecutionStateStore,
             plan::net_forwarded_output,
-            supports_pair,
             types::{IcpswapExecutionState, IcpswapStep},
         },
         model::SwapExecution,
@@ -60,10 +59,19 @@ impl IcpswapExecutionStateStore for CheckpointedLegStateStore<'_> {
                 state.execution_id
             ));
         }
-        *self
-            .state
-            .lock()
-            .map_err(|_| "ICPSwap checkpointed leg state lock poisoned".to_string())? = state.clone();
+        {
+            let mut held = self
+                .state
+                .lock()
+                .map_err(|_| "ICPSwap checkpointed leg state lock poisoned".to_string())?;
+            // Waiting steps re-persist identical bytes on every daemon poll, and
+            // the checkpoint below is an fsync'd WAL write. The held state came
+            // from the WAL, so equality means the row is already current.
+            if *held == *state {
+                return Ok(());
+            }
+            *held = state.clone();
+        }
 
         // Completed/refunded results are constructed by the adapter after the
         // workflow returns. Persisting them here would briefly create a
@@ -103,19 +111,6 @@ fn leg_status(step: IcpswapStep) -> VenueLegStatus {
         IcpswapStep::OperatorRequired => VenueLegStatus::OperatorRequired,
         IcpswapStep::Failed => VenueLegStatus::FailedPermanent,
         _ => VenueLegStatus::Running,
-    }
-}
-
-/// Re-checks the pair at the execution adapter boundary so a future planner or
-/// forced-venue caller cannot bypass the venue policy.
-fn require_supported_pair(request: &crate::swappers::model::SwapRequest) -> Result<(), String> {
-    if supports_pair(&request.pay_amount.token, &request.receive_asset) {
-        Ok(())
-    } else {
-        Err(format!(
-            "ICPSwap only supports canonical ICP <-> ckUSDC swaps; received {} -> {}",
-            request.pay_asset, request.receive_asset
-        ))
     }
 }
 
@@ -204,7 +199,9 @@ impl MultiVenueAdapter for IcpswapFinalizer {
         context: &crate::finalizers::multi_venue::VenuePlanningContext,
         request: &crate::swappers::model::SwapRequest,
     ) -> Result<VenueRoutePreview, String> {
-        require_supported_pair(request)?;
+        // Re-checked at the execution adapter boundary so a future planner or
+        // forced-venue caller cannot bypass the venue policy.
+        ensure_supported_pair(request)?;
         if self.trader.subaccount.is_some() {
             return Err("ICPSwap requires the trader's default ledger account".to_string());
         }

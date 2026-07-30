@@ -4,6 +4,7 @@ use liquidium_pipeline_connectors::backend::icp_backend::{IcpBackend, IcrcTransf
 
 use super::{
     execution::IcpswapExecutionStateStore,
+    plan::child_fee_budget,
     reconciliation,
     transfer_state::{IcpswapLedgerTransferState, IcpswapSettlementKind},
     types::{IcpswapState, IcpswapStep},
@@ -162,7 +163,7 @@ async fn normalize_funding_balance(
 /// transfer into the pool deposit account and one consumed when the pool sweeps
 /// that deposit. The separate trader-to-child fee is paid outside this balance.
 fn required_child_balance(state: &IcpswapState) -> Nat {
-    state.plan.amount_in.value.clone() + state.funding.fee.value.clone() * Nat::from(2u8)
+    state.plan.amount_in.value.clone() + child_fee_budget(&state.funding.fee.value)
 }
 
 /// Purely classifies the observed balance. Keeping this decision separate from
@@ -443,11 +444,11 @@ async fn reconcile_aged_transfer(
         DurableTransferKind::Funding => {
             let destination_now = destination_now
                 .map_err(|error| format!("failed reading isolated funding destination balance: {error}"))?;
-            let destination_credit = saturating_sub(&destination_now, &destination_before);
+            let destination_credit = reconciliation::nat_saturating_sub(&destination_now, &destination_before);
             let destination_unchanged = destination_now == destination_before;
             let source_debit = source_now
                 .ok()
-                .map(|source_now| saturating_sub(&source_before, &source_now));
+                .map(|source_now| reconciliation::nat_saturating_sub(&source_before, &source_now));
             (
                 classify_isolated_delta(destination_credit, args.amount.clone(), destination_unchanged),
                 source_debit,
@@ -457,11 +458,11 @@ async fn reconcile_aged_transfer(
         DurableTransferKind::FundingSurplus | DurableTransferKind::Settlement(_) => {
             let source_now =
                 source_now.map_err(|error| format!("failed reading isolated settlement source balance: {error}"))?;
-            let source_debit = saturating_sub(&source_before, &source_now);
+            let source_debit = reconciliation::nat_saturating_sub(&source_before, &source_now);
             let source_unchanged = source_now == source_before;
             let destination_credit = destination_now
                 .ok()
-                .map(|destination_now| saturating_sub(&destination_now, &destination_before));
+                .map(|destination_now| reconciliation::nat_saturating_sub(&destination_now, &destination_before));
             (
                 classify_isolated_delta(source_debit, expected_debit, source_unchanged),
                 destination_credit,
@@ -659,14 +660,6 @@ fn reset_for_fresh_timestamp(state: &mut IcpswapState, kind: DurableTransferKind
         DurableTransferKind::Funding | DurableTransferKind::FundingSurplus => IcpswapStep::Funding,
         DurableTransferKind::Settlement(_) => IcpswapStep::Forward,
     };
-}
-
-fn saturating_sub(left: &Nat, right: &Nat) -> Nat {
-    if left > right {
-        left.clone() - right.clone()
-    } else {
-        Nat::from(0u8)
-    }
 }
 
 async fn persist(

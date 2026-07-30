@@ -7,15 +7,12 @@ use liquidium_pipeline_core::tokens::asset_id::AssetId;
 use log::{debug, info};
 
 use crate::swappers::mexc::orderbook_quote::{simulate_buy_from_asks, simulate_sell_from_bids};
-use crate::swappers::model::{SwapExecution, SwapQuote, SwapQuoteLeg, SwapRequest, adverse_price_impact_bps};
+use crate::swappers::model::{
+    LIQUIDITY_EPS, SwapExecution, SwapQuote, SwapQuoteLeg, SwapRequest, adverse_price_impact_bps, f64_to_nat,
+};
 use crate::swappers::venue::{ExecutableSwapVenue, SwapVenue};
 
-fn f64_to_nat(v: f64) -> Nat {
-    Nat::from(v as u128)
-}
-
 const DEFAULT_ORDERBOOK_LIMIT: u32 = 50;
-const LIQUIDITY_EPS: f64 = 1e-9;
 
 struct ResolvedTradeQuote {
     market: String,

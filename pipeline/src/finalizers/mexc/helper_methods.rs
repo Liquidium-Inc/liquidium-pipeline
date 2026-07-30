@@ -2,6 +2,7 @@ use super::*;
 use crate::finalizers::bridge_planner::BridgePlanner;
 use crate::finalizers::cex_finalizer::{CexRouteLeg, CexTradeSlice};
 use crate::finalizers::mexc::mexc_utils::parse_market_symbols;
+use crate::swappers::model::BPS_PER_RATIO_UNIT;
 
 struct PendingSliceRequest {
     requested_in: f64,
@@ -15,8 +16,6 @@ const DEPOSIT_CONFIRMATION_DELTA_EPSILON: f64 = 0.00001;
 const DEPOSIT_TOTAL_FREE_FALLBACK_SECS: i64 = 25;
 /// Hard stop to avoid unbounded per-leg slicing loops on pathological books.
 const MAX_SLICE_EXECUTION_ROUNDS: usize = 128;
-/// Basis points per 1.00 ratio value.
-const BPS_PER_RATIO_UNIT: f64 = 10_000.0;
 
 impl<C> MexcFinalizer<C>
 where

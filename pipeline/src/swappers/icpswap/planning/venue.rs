@@ -10,7 +10,7 @@ use num_traits::ToPrimitive;
 
 use crate::swappers::icpswap::supports_pair;
 use crate::swappers::{
-    model::{SwapExecution, SwapQuote, SwapQuoteLeg, SwapRequest},
+    model::{SwapExecution, SwapQuote, SwapQuoteLeg, SwapRequest, adverse_price_impact_bps},
     venue::SwapVenue,
 };
 
@@ -19,7 +19,9 @@ use super::{
     execution::IcpswapExecutionStateStore,
     ledger_transfers::{forward_step, funding_step},
     manual::{deposit_step, operator_step, recover_step, trade_step, transfer_step, withdraw_step},
-    plan::{amount_out_minimum, nat_to_decimal_text},
+    plan::{
+        amount_out_minimum, icp_ledger, input_fee_budget, nat_to_decimal_text, output_fee_budget, resolve_direction,
+    },
     session::IcpswapExecutionSession,
     state::validate_execution_state,
     types::{
@@ -213,9 +215,9 @@ impl<C: IcpswapReadClient> IcpswapVenue<C> {
             .get(&request.receive_asset)
             .ok_or_else(|| IcpswapQuoteError::MissingToken(request.receive_asset.to_string()))?;
         let token_in =
-            icp_ledger(&input.token).ok_or_else(|| IcpswapQuoteError::MissingToken(request.pay_asset.to_string()))?;
+            icp_ledger(&input.token).map_err(|_| IcpswapQuoteError::MissingToken(request.pay_asset.to_string()))?;
         let token_out = icp_ledger(&output.token)
-            .ok_or_else(|| IcpswapQuoteError::MissingToken(request.receive_asset.to_string()))?;
+            .map_err(|_| IcpswapQuoteError::MissingToken(request.receive_asset.to_string()))?;
         let (input_fee, output_fee) =
             futures::join!(self.client.ledger_fee(token_in), self.client.ledger_fee(token_out));
         let input_fee = input_fee.map_err(IcpswapQuoteError::LedgerFee)?;
@@ -411,7 +413,7 @@ fn completed_execution(request: &SwapRequest, state: &IcpswapState, now_nanos: u
             receive_amount: net.clone(),
             price: exec_price,
             lp_fee: Nat::from(0u8),
-            gas_fee: state.plan.output_ledger_fee.value.clone() * Nat::from(2u8),
+            gas_fee: output_fee_budget(&state.plan.output_ledger_fee.value),
         }],
         approval_count: Some(0),
         ts: now_nanos / 1_000_000_000,
@@ -420,7 +422,7 @@ fn completed_execution(request: &SwapRequest, state: &IcpswapState, now_nanos: u
 
 fn execution_slippage_bps(expected: f64, receive: f64) -> f64 {
     if expected > 0.0 {
-        ((expected - receive) / expected).max(0.0) * 10_000.0
+        adverse_price_impact_bps(expected, receive)
     } else {
         0.0
     }
@@ -477,7 +479,7 @@ fn common_quote(
             receive_amount: expected_output.value,
             price: exec_price,
             lp_fee: Nat::from(0u8),
-            gas_fee: plan.output_ledger_fee.value.clone() * Nat::from(2u8),
+            gas_fee: output_fee_budget(&plan.output_ledger_fee.value),
         }],
     }
 }
@@ -507,12 +509,10 @@ fn spot_output_amount(
 /// Measures planning-time price impact against pool spot. This is deliberately
 /// independent from `amount_out_minimum`, which protects execution-time drift.
 fn quoted_price_impact_bps(spot_output: &Nat, gross_quote: &Nat) -> f64 {
-    let spot = spot_output.0.to_f64().unwrap_or(f64::INFINITY);
-    let quoted = gross_quote.0.to_f64().unwrap_or(0.0);
-    if !spot.is_finite() || spot <= 0.0 || !quoted.is_finite() {
-        return f64::INFINITY;
-    }
-    ((spot - quoted) / spot).max(0.0) * 10_000.0
+    adverse_price_impact_bps(
+        spot_output.0.to_f64().unwrap_or(f64::INFINITY),
+        gross_quote.0.to_f64().unwrap_or(0.0),
+    )
 }
 
 fn validate_supported_pair(request: &SwapRequest) -> Result<(), IcpswapQuoteError> {
@@ -529,9 +529,7 @@ fn validate_supported_pair(request: &SwapRequest) -> Result<(), IcpswapQuoteErro
 /// Converts the total allocation into the amount sent through the pool after
 /// reserving the wallet transfer and pool deposit-sweep ledger fees.
 fn executable_input_amount(request: &SwapRequest, input_fee: &Nat) -> Result<ChainTokenAmount, IcpswapQuoteError> {
-    // Funding trader -> child, child -> pool deposit account, and the pool's
-    // deposit sweep each consume one input-ledger fee.
-    let input_operation_fees = input_fee.clone() * Nat::from(3u8);
+    let input_operation_fees = input_fee_budget(input_fee);
     if request.pay_amount.value <= input_operation_fees {
         return Err(IcpswapQuoteError::InputFeesExceedBudget {
             budget: request.pay_amount.value.clone(),
@@ -564,16 +562,14 @@ fn resolve_pool_direction(
 ) -> Result<(Principal, Principal, bool), String> {
     let token0 = parse_pool_principal("token0", &pool.token0.address).map_err(|error| error.to_string())?;
     let token1 = parse_pool_principal("token1", &pool.token1.address).map_err(|error| error.to_string())?;
-    let zero_for_one = if token_in == token0 && token_out == token1 {
-        true
-    } else if token_in == token1 && token_out == token0 {
-        false
-    } else {
-        return Err(format!(
+    // `IcpswapExecutionPlan::new` applies the same rule to the same principals,
+    // so the ordering decision stays in one place.
+    let zero_for_one = resolve_direction(token_in, token_out, token0, token1).map_err(|_| {
+        format!(
             "pool {} token pair does not match {} -> {}",
             pool.canister_id, token_in, token_out
-        ));
-    };
+        )
+    })?;
     Ok((token0, token1, zero_for_one))
 }
 
@@ -603,13 +599,6 @@ fn parse_pool_principal(field: &'static str, address: &str) -> Result<Principal,
         address: address.to_string(),
         message: error.to_string(),
     })
-}
-
-fn icp_ledger(token: &ChainToken) -> Option<Principal> {
-    match token {
-        ChainToken::Icp { ledger, .. } => Some(*ledger),
-        _ => None,
-    }
 }
 
 #[cfg(test)]

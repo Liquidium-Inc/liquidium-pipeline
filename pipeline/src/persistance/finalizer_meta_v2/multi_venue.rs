@@ -17,7 +17,6 @@ pub struct MultiVenueExecutionState {
 }
 
 impl MultiVenueExecutionState {
-    #[allow(dead_code)]
     pub fn validate(&self) -> Result<(), String> {
         let mut leg_ids = HashSet::new();
         let mut venue_ids = HashSet::new();

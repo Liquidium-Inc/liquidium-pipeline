@@ -4,7 +4,6 @@ mod multi_venue;
 
 pub use multi_venue::*;
 
-#[allow(dead_code)]
 pub const FINALIZER_META_V2_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -22,7 +21,6 @@ pub enum FinalizerMetaPayload {
 }
 
 impl FinalizerMetaV2 {
-    #[allow(dead_code)]
     pub fn validate(&self) -> Result<(), String> {
         if self.version != FINALIZER_META_V2_VERSION {
             return Err(format!(

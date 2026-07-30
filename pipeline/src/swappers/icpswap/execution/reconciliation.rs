@@ -422,7 +422,9 @@ pub(crate) fn output_balance(plan: &IcpswapExecutionPlan, unused: &IcpswapUnused
     }
 }
 
-fn nat_saturating_sub(left: &Nat, right: &Nat) -> Nat {
+/// `candid::Nat` has no saturating subtraction and panics on underflow, so the
+/// balance-delta comparisons share this one clamp.
+pub(crate) fn nat_saturating_sub(left: &Nat, right: &Nat) -> Nat {
     if left > right {
         left.clone() - right.clone()
     } else {

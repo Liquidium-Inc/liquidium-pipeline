@@ -17,7 +17,10 @@ use crate::{
     },
     price_oracle::price_oracle::PriceOracle,
     stages::executor::{ExecutionReceipt, ExecutionStatus},
-    swappers::{icpswap::supports_pair, model::SwapRequest},
+    swappers::{
+        icpswap::{identity::parse_liquidation_id, supports_pair},
+        model::{SwapRequest, adverse_price_impact_bps},
+    },
 };
 
 use super::{
@@ -197,17 +200,9 @@ impl IcpswapFirstPlanInput {
 
     // Verifies the amount and asset invariants required by every venue quote.
     pub(in crate::finalizers::multi_venue) fn validate(&self) -> Result<(), IcpswapFirstPlannerError> {
-        let parsed_liquidation_id = self.liquidation_id.parse::<u128>().map_err(|error| {
-            IcpswapFirstPlannerError::InvalidInput(format!(
-                "liquidation ID `{}` is not a u128: {error}",
-                self.liquidation_id
-            ))
-        })?;
-        if parsed_liquidation_id.to_string() != self.liquidation_id {
-            return Err(IcpswapFirstPlannerError::InvalidInput(
-                "liquidation ID must use canonical unsigned decimal notation".to_string(),
-            ));
-        }
+        // Shares the identity module's rule: a plan must never validate an ID
+        // that would derive a different signing principal at execution time.
+        parse_liquidation_id(&self.liquidation_id).map_err(IcpswapFirstPlannerError::InvalidInput)?;
         if self.total_pay.value == Nat::from(0u8) {
             return Err(IcpswapFirstPlannerError::InvalidInput(
                 "total pay amount must be positive".to_string(),
@@ -567,13 +562,15 @@ impl IcpswapFirstPlanner {
             );
         }
 
-        let overflow_quotes = self.preview_overflow(input, input.total_pay.value.clone()).await?;
-        let overflow = self.best_executable_overflow(input, &overflow_quotes).ok_or_else(|| {
-            IcpswapFirstPlannerError::NoViableRoute(format!(
-                "full ICPSwap quote exceeds the dust-fallback price-impact limit and the below-minimum remainder cannot be split; {}",
-                self.overflow_failure_summary(&overflow_quotes)
-            ))
-        })?;
+        let overflow = self
+            .full_amount_overflow(
+                input,
+                Some(
+                    "full ICPSwap quote exceeds the dust-fallback price-impact limit and the below-minimum remainder cannot be split"
+                        .to_string(),
+                ),
+            )
+            .await?;
         let mut skipped_venue_ids = vec![ICPSWAP_VENUE_ID.to_string()];
         skipped_venue_ids.extend(
             self.overflow_venue_ids
@@ -592,6 +589,24 @@ impl IcpswapFirstPlanner {
         )
     }
 
+    // Quotes the complete allocation on every overflow venue and returns the
+    // best executable one. `context` prefixes the rejection summary when the
+    // caller reached this path because another venue fell through.
+    async fn full_amount_overflow(
+        &self,
+        input: &IcpswapFirstPlanInput,
+        context: Option<String>,
+    ) -> Result<VenueRoutePreview, IcpswapFirstPlannerError> {
+        let quotes = self.preview_overflow(input, input.total_pay.value.clone()).await?;
+        self.best_executable_overflow(input, &quotes).cloned().ok_or_else(|| {
+            let summary = self.overflow_failure_summary(&quotes);
+            IcpswapFirstPlannerError::NoViableRoute(match context {
+                Some(context) => format!("{context}; {summary}"),
+                None => summary,
+            })
+        })
+    }
+
     // Non-native ICP collateral cannot use ICPSwap, so choose the executable
     // overflow venue with the highest conservative output.
     async fn plan_overflow_only(
@@ -604,16 +619,12 @@ impl IcpswapFirstPlanner {
                 "no enabled venue can accept this collateral asset".to_string(),
             ));
         }
-        let quotes = self.preview_overflow(input, input.total_pay.value.clone()).await?;
-        let preview = self
-            .best_executable_overflow(input, &quotes)
-            .ok_or_else(|| IcpswapFirstPlannerError::NoViableRoute(self.overflow_failure_summary(&quotes)))?;
+        let preview = self.full_amount_overflow(input, None).await?;
+        let venue_id = preview.venue_id.clone();
         self.build_state(
             input,
-            vec![preview.clone()],
-            MultiVenueAllocationReason::SingleVenue {
-                venue_id: preview.venue_id.clone(),
-            },
+            vec![preview],
+            MultiVenueAllocationReason::SingleVenue { venue_id },
             quoted_at,
         )
     }
@@ -627,18 +638,15 @@ impl IcpswapFirstPlanner {
         quoted_at: i64,
         icpswap_error: &IcpswapFirstPlannerError,
     ) -> Result<MultiVenueExecutionState, IcpswapFirstPlannerError> {
-        let quotes = self.preview_overflow(input, input.total_pay.value.clone()).await?;
-        let overflow = self.best_executable_overflow(input, &quotes).ok_or_else(|| {
-            IcpswapFirstPlannerError::NoViableRoute(format!(
-                "ICPSwap exact quote rejected ({icpswap_error}); {}",
-                self.overflow_failure_summary(&quotes)
-            ))
-        })?;
+        let overflow = self
+            .full_amount_overflow(input, Some(format!("ICPSwap exact quote rejected ({icpswap_error})")))
+            .await?;
+        let selected_venue_id = overflow.venue_id.clone();
         self.build_state(
             input,
-            vec![overflow.clone()],
+            vec![overflow],
             MultiVenueAllocationReason::VenueUnavailable {
-                selected_venue_id: overflow.venue_id.clone(),
+                selected_venue_id,
                 unavailable_venue_ids: vec![ICPSWAP_VENUE_ID.to_string()],
             },
             quoted_at,
@@ -666,16 +674,12 @@ impl IcpswapFirstPlanner {
         }
 
         if safe_value == Nat::from(0u8) {
-            let quotes = self.preview_overflow(input, input.total_pay.value.clone()).await?;
-            let overflow = self
-                .best_executable_overflow(input, &quotes)
-                .ok_or_else(|| IcpswapFirstPlannerError::NoViableRoute(self.overflow_failure_summary(&quotes)))?;
+            let overflow = self.full_amount_overflow(input, None).await?;
+            let venue_id = overflow.venue_id.clone();
             return self.build_state(
                 input,
-                vec![overflow.clone()],
-                MultiVenueAllocationReason::SingleVenue {
-                    venue_id: overflow.venue_id.clone(),
-                },
+                vec![overflow],
+                MultiVenueAllocationReason::SingleVenue { venue_id },
                 quoted_at,
             );
         }
@@ -968,13 +972,10 @@ impl IcpswapFirstPlanner {
         // Floating point only describes the rejection; the decision above was
         // already made exactly. An unrepresentable ratio reports an infinite
         // discount rather than a misleading number.
-        let expected = oracle_output.0.to_f64().unwrap_or(f64::INFINITY);
-        let actual = preview.quote.receive_amount.0.to_f64().unwrap_or(0.0);
-        let discount_bps = if expected.is_finite() && expected > 0.0 && actual.is_finite() {
-            ((expected - actual) / expected).max(0.0) * f64::from(BPS_DENOMINATOR)
-        } else {
-            f64::INFINITY
-        };
+        let discount_bps = adverse_price_impact_bps(
+            oracle_output.0.to_f64().unwrap_or(f64::INFINITY),
+            preview.quote.receive_amount.0.to_f64().unwrap_or(0.0),
+        );
 
         Err(IcpswapFirstPlannerError::NoViableRoute(format!(
             "{venue_id} quote is {:.2} bps below oracle-implied output, exceeding the {} bps limit",

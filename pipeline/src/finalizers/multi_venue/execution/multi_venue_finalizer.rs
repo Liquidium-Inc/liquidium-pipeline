@@ -258,8 +258,15 @@ impl MultiVenueFinalizer {
                     "Multi-venue leg made internal progress"
                 );
             }
+            let previous_outcome = state.outcome.clone();
             state.outcome = derive_outcome(&state.legs);
-            self.persist_state(wal, row, wrapper, state).await?;
+            // The adapter's own checkpoints already journaled everything it
+            // committed, so only rewrite the parent envelope when this
+            // transition actually changed it. A waiting leg would otherwise
+            // cost one fsync'd write per daemon tick.
+            if current != state.legs[index] || previous_outcome != state.outcome {
+                self.persist_state(wal, row, wrapper, state).await?;
+            }
 
             // Alert only when entering the parked state. A direct retry of the
             // same committed row must not emit a duplicate notification.
