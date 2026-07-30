@@ -1,12 +1,76 @@
+#![allow(dead_code)]
+
+use std::{fmt, sync::Arc};
+
 use async_trait::async_trait;
 use log::debug;
+use serde::{Serialize, de::DeserializeOwned};
 
 use crate::{
     finalizers::finalizer::{Finalizer, FinalizerResult},
-    persistance::WalStore,
+    persistance::{FinalizerDecisionSnapshot, WalStore},
     stages::executor::{ExecutionReceipt, ExecutionStatus},
-    swappers::model::{SwapExecution, SwapRequest},
+    swappers::model::{SwapExecution, SwapQuote, SwapRequest},
 };
+
+#[derive(Clone)]
+pub struct DexRoutePreview {
+    pub quote: SwapQuote,
+    venue: Arc<str>,
+    route: Arc<[u8]>,
+}
+
+impl DexRoutePreview {
+    pub fn new<T: Serialize>(quote: SwapQuote, venue: impl Into<Arc<str>>, route: &T) -> Result<Self, String> {
+        Ok(Self {
+            quote,
+            venue: venue.into(),
+            route: serde_json::to_vec(route)
+                .map_err(|error| format!("failed encoding DEX route preview: {error}"))?
+                .into(),
+        })
+    }
+
+    pub(crate) fn route<T: DeserializeOwned>(&self, expected_venue: &str) -> Result<T, String> {
+        if self.venue.as_ref() != expected_venue {
+            return Err(format!(
+                "DEX route belongs to venue {}, not {expected_venue}",
+                self.venue
+            ));
+        }
+        serde_json::from_slice(&self.route)
+            .map_err(|error| format!("failed decoding {} DEX route preview: {error}", self.venue))
+    }
+}
+
+impl fmt::Debug for DexRoutePreview {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("DexRoutePreview")
+            .field("quote", &self.quote)
+            .field("venue", &self.venue)
+            .finish_non_exhaustive()
+    }
+}
+
+/// One coherent DEX dependency for previewing and executing a persisted route.
+/// A future implementation may aggregate several DEX venues behind this trait.
+#[async_trait]
+pub trait DexRouteFinalizer: Finalizer + Send + Sync {
+    fn venue_id(&self) -> &'static str;
+
+    async fn preview_route(&self, request: &SwapRequest) -> Result<DexRoutePreview, String>;
+
+    async fn has_committed_route(&self, wal: &dyn WalStore, receipt: &ExecutionReceipt) -> Result<bool, String>;
+
+    async fn commit_route(
+        &self,
+        wal: &dyn WalStore,
+        receipt: &ExecutionReceipt,
+        decision: FinalizerDecisionSnapshot,
+        preview: DexRoutePreview,
+    ) -> Result<(), String>;
+}
 
 // Tunables
 const BASE_SLIPPAGE_BPS: u32 = 125; // 1.25%
@@ -67,6 +131,7 @@ impl Finalizer for dyn DexFinalizerLogic {
         let finlizer_result = FinalizerResult {
             swap_result: Some(swap_exec),
             finalized: true,
+            operator_required: false,
             swapper: None,
             reason: None,
         };

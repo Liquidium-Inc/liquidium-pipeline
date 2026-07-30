@@ -79,7 +79,7 @@ mod tests {
 
             mid_price: 1.0,
             exec_price: 1.0,
-            slippage: 0.0,
+            realized_slippage_bps: 0.0,
 
             legs: vec![],
             approval_count: None,

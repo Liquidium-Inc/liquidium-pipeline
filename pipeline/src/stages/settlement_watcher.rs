@@ -247,6 +247,7 @@ where
             meta: Vec::new(),
             finalizer_decision: None,
             profit_snapshot: None,
+            venue_execution: None,
         });
         wrapper.receipt = receipt.clone();
         encode_meta(&mut row, &wrapper)?;
@@ -372,6 +373,7 @@ mod tests {
             meta: Vec::new(),
             finalizer_decision: None,
             profit_snapshot: None,
+            venue_execution: None,
         };
         encode_meta(&mut row, &wrapper).expect("encode_meta should succeed");
         row
@@ -422,7 +424,7 @@ mod tests {
             receive_amount: Nat::from(2_000_000u64),
             mid_price: 1.0,
             exec_price: 1.0,
-            slippage: 0.0,
+            estimated_price_impact_bps: 0.0,
             legs: vec![],
         };
         swapper
@@ -609,7 +611,7 @@ mod tests {
             receive_amount: Nat::from(1u64),
             mid_price: 1.0,
             exec_price: 1.0,
-            slippage: 0.0,
+            estimated_price_impact_bps: 0.0,
             legs: vec![],
         };
         swapper
@@ -668,6 +670,7 @@ mod tests {
                 debt_decimals: 8,
                 updated_at: 123,
             }),
+            venue_execution: None,
         };
         encode_meta(&mut row, &wrapper).expect("encode wrapper");
 

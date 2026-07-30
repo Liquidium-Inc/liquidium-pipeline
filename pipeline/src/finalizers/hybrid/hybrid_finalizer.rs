@@ -3,7 +3,7 @@ use candid::Nat;
 use std::sync::Arc;
 
 use super::utils::{
-    DEX_DUST_MAX_USD, RouteCandidate, RouteVenue, choose_best_route, debt_repaid_f64, dex_slippage_bps,
+    DEX_DUST_MAX_USD, RouteCandidate, RouteVenue, choose_best_route, debt_repaid_f64,
     estimate_swap_value_usd, is_dust_swap, make_snapshot, net_edge_bps, preview_gross_edge_bps,
     should_force_cex_over_threshold, swapper_id,
 };
@@ -108,6 +108,7 @@ where
             .map_err(|e| format!("wal update failed: {e}"))?;
         Ok(FinalizerResult {
             finalized: true,
+            operator_required: false,
             swap_result: None,
             swapper: Some("none".to_string()),
             reason,
@@ -151,6 +152,7 @@ where
             );
             return Ok(FinalizerResult {
                 finalized: true,
+                operator_required: false,
                 swap_result: None,
                 swapper: Some("recovery".to_string()),
                 reason: None,
@@ -181,6 +183,7 @@ where
 
         Ok(FinalizerResult {
             finalized: true,
+            operator_required: false,
             swap_result: None,
             swapper: Some("recovery".to_string()),
             reason: None,
@@ -226,12 +229,12 @@ where
                     ChainTokenAmount::from_raw(receipt.request.debt_asset.clone(), quote.receive_amount.clone())
                         .to_f64();
                 let gross_edge_bps = preview_gross_edge_bps(estimated_receive_amount, debt_repaid_amount);
-                let slippage_bps = dex_slippage_bps(quote.slippage);
+                let price_impact_bps = quote.estimated_price_impact_bps;
                 // DEX quote receive amount already includes execution impact; avoid double-counting slippage.
                 let net_edge_bps = gross_edge_bps;
                 info!(
-                    "[hybrid] dex preview preview_gross_bps={:.2} slippage_bps={:.2} preview_net_bps={:.2}",
-                    gross_edge_bps, slippage_bps, net_edge_bps
+                    "[hybrid] dex preview preview_gross_bps={:.2} price_impact_bps={:.2} preview_net_bps={:.2}",
+                    gross_edge_bps, price_impact_bps, net_edge_bps
                 );
                 Ok(Some(RouteCandidate {
                     venue: RouteVenue::Dex,

@@ -254,6 +254,9 @@ impl Finalizer for dyn CexFinalizerLogic {
                     ResultStatus::WaitingCollateral | ResultStatus::WaitingProfit => {
                         return Ok(FinalizerResult::noop());
                     }
+                    ResultStatus::OperatorRequired => {
+                        return Ok(FinalizerResult::noop());
+                    }
                     ResultStatus::FailedPermanent => {
                         return Err(format!("invalid WAL state {:?} for liq_id {}", row.status, row.id));
                     }
@@ -383,6 +386,7 @@ impl Finalizer for dyn CexFinalizerLogic {
             FinalizerResult {
                 swap_result: Some(swap_exec),
                 finalized: true,
+                operator_required: false,
                 swapper: None,
                 reason: None,
             }
@@ -602,7 +606,7 @@ mod tests {
                 receive_amount: Nat::from(0u8),
                 mid_price: 0.0,
                 exec_price: 0.0,
-                slippage: 0.0,
+                realized_slippage_bps: 0.0,
                 legs: vec![],
                 approval_count: None,
                 ts: 0,
@@ -755,7 +759,7 @@ mod tests {
                 receive_amount: Nat::from(0u8),
                 mid_price: 0.0,
                 exec_price: 0.0,
-                slippage: 0.0,
+                realized_slippage_bps: 0.0,
                 legs: vec![],
                 approval_count: None,
                 ts: 0,
@@ -851,6 +855,7 @@ mod tests {
             meta: Vec::new(),
             finalizer_decision: None,
             profit_snapshot: None,
+            venue_execution: None,
         };
 
         let mut row = LiqResultRecord {
@@ -893,6 +898,7 @@ mod tests {
             meta: Vec::new(),
             finalizer_decision: None,
             profit_snapshot: None,
+            venue_execution: None,
         };
 
         let mut row = LiqResultRecord {
@@ -1047,6 +1053,7 @@ mod tests {
             meta: serde_json::to_vec(&legacy_value).expect("legacy meta encoding"),
             finalizer_decision: None,
             profit_snapshot: None,
+            venue_execution: None,
         };
 
         let mut row = LiqResultRecord {

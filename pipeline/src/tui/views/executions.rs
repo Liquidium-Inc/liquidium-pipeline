@@ -186,6 +186,7 @@ fn status_label(status: ResultStatus) -> &'static str {
         ResultStatus::FailedPermanent => "failed",
         ResultStatus::WaitingCollateral => "wait-col",
         ResultStatus::WaitingProfit => "wait-prof",
+        ResultStatus::OperatorRequired => "operator",
     }
 }
 
@@ -196,6 +197,7 @@ fn status_style(status: ResultStatus) -> Style {
         ResultStatus::FailedRetryable => Style::default().fg(Color::Yellow),
         ResultStatus::InFlight => Style::default().fg(Color::Cyan),
         ResultStatus::WaitingCollateral | ResultStatus::WaitingProfit => Style::default().fg(Color::Yellow),
+        ResultStatus::OperatorRequired => Style::default().fg(Color::Magenta),
         ResultStatus::Enqueued => Style::default().fg(Color::DarkGray),
     }
 }

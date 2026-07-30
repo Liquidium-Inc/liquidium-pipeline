@@ -3,11 +3,25 @@ use serde::{Deserialize, Serialize};
 
 use crate::{persistance::WalStore, stages::executor::ExecutionReceipt, swappers::model::SwapExecution};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FinalizerErrorKind {
+    Retryable,
+    /// Retryable, but raised while a venue leg may still hold the liquidation's
+    /// funds. Exhausting the retry budget must park the row for an operator
+    /// rather than fail it permanently, because a permanently failed row leaves
+    /// the runnable queue and nothing would ever return that custody.
+    VenueCustody,
+    Permanent,
+    BadDebtAmountFloor,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FinalizerResult {
     // Optional swap; non-swap finalizers can leave this as None
     pub swap_result: Option<SwapExecution>,
     pub finalized: bool,
+    #[serde(default)]
+    pub operator_required: bool,
     #[serde(default)]
     pub swapper: Option<String>,
     #[serde(default)]
@@ -19,6 +33,7 @@ impl FinalizerResult {
         Self {
             swap_result: None,
             finalized: false,
+            operator_required: false,
             swapper: None,
             reason: None,
         }
@@ -28,4 +43,10 @@ impl FinalizerResult {
 #[async_trait]
 pub trait Finalizer: Send + Sync {
     async fn finalize(&self, wal: &dyn WalStore, receipt: ExecutionReceipt) -> Result<FinalizerResult, String>;
+
+    /// Classify an error without exposing implementation-specific sentinels to
+    /// the pipeline stage that owns retry scheduling.
+    fn classify_error(&self, _error: &str) -> FinalizerErrorKind {
+        FinalizerErrorKind::Retryable
+    }
 }
