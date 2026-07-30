@@ -105,7 +105,12 @@ async fn park_unresumable_committed_rows(
         let Some(meta) = wrapper.meta_v2 else {
             continue;
         };
-        let FinalizerMetaPayload::MultiVenueSwap(state) = meta.payload;
+        let state = match meta.payload {
+            FinalizerMetaPayload::MultiVenueSwap(state) => state,
+            // Recovery sweeps have no venue adapter dependency. Their own
+            // durable submission gate handles restart ambiguity.
+            FinalizerMetaPayload::RecoverySweep(_) => continue,
+        };
         let mut reasons = Vec::new();
         let disabled = disabled_venue_ids(
             &state.outcome,
@@ -241,7 +246,8 @@ async fn init(
             },
         )?
         .with_watchdog(slack_watchdog_from_env(DEFAULT_LOW_BALANCE_ALERT_COOLDOWN))
-        .with_price_oracle(price_oracle.clone()),
+        .with_price_oracle(price_oracle.clone())
+        .with_recovery_sweep(ctx.trader_transfers.actions(), config.get_recovery_account()),
     );
 
     // Profit calculator for expected/realized PnL
@@ -682,7 +688,9 @@ mod tests {
     fn set_startup_leg_status(row: &mut LiqResultRecord, status: VenueLegStatus) {
         let mut wrapper: LiqMetaWrapper = serde_json::from_str(&row.meta_json).expect("decode startup fixture");
         let meta = wrapper.meta_v2.as_mut().expect("multi-venue metadata");
-        let FinalizerMetaPayload::MultiVenueSwap(state) = &mut meta.payload;
+        let FinalizerMetaPayload::MultiVenueSwap(state) = &mut meta.payload else {
+            panic!("expected multi-venue state")
+        };
         state.legs.first_mut().expect("ICPSwap leg").status = status;
         row.meta_json = serde_json::to_string(&wrapper).expect("encode startup fixture");
     }

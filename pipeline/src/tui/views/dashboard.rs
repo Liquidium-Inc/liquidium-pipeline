@@ -412,8 +412,24 @@ fn multi_venue_fork_rows(meta: Option<&ParsedExecutionMeta>) -> Vec<VenueForkRow
     let Some(meta_v2) = &wrapper.meta_v2 else {
         return Vec::new();
     };
-    let FinalizerMetaPayload::MultiVenueSwap(state) = &meta_v2.payload;
-    venue_fork_rows(&state.legs)
+    match &meta_v2.payload {
+        FinalizerMetaPayload::MultiVenueSwap(state) => venue_fork_rows(&state.legs),
+        FinalizerMetaPayload::RecoverySweep(state) => {
+            let (stage, color) = match state.status {
+                crate::persistance::RecoverySweepStatus::ReadyToSubmit => ("ready", Color::Yellow),
+                crate::persistance::RecoverySweepStatus::Completed => ("completed", Color::Green),
+                crate::persistance::RecoverySweepStatus::OperatorRequired => ("operator required", Color::Red),
+            };
+            vec![VenueForkRow {
+                branch_and_venue: "└─ Recovery".to_string(),
+                stage: stage.to_string(),
+                amount: state.amount.formatted(),
+                alert: if state.last_error.is_some() { "!" } else { "" }.to_string(),
+                style: Style::default().fg(color),
+                alert_style: Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            }]
+        }
+    }
 }
 
 fn venue_fork_rows(legs: &[VenueLegState]) -> Vec<VenueForkRow> {

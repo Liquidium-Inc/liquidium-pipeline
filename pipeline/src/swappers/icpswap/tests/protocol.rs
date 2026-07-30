@@ -9,6 +9,7 @@ use liquidium_pipeline_connectors::{
     pipeline_agent::MockPipelineAgent,
 };
 use liquidium_pipeline_core::tokens::{chain_token::ChainToken, chain_token_amount::ChainTokenAmount};
+use liquidium_pipeline_core::transfer::actions::TransferFailure;
 use serde::Deserialize;
 
 use super::{
@@ -36,11 +37,11 @@ mockall::mock! {
             from: &Account,
             to: &Account,
             amount: Nat,
-        ) -> Result<Nat, String>;
+        ) -> Result<Nat, TransferFailure>;
         async fn icrc1_transfer_with_args(&self, ledger: Principal, args: TransferArg)
             -> Result<Nat, IcrcTransferError>;
         async fn icp_transfer(&self, ledger: Principal, to_account_id_hex: &str, amount_e8s: Nat)
-            -> Result<u64, String>;
+            -> Result<u64, TransferFailure>;
         async fn icrc1_decimals(&self, ledger: Principal) -> Result<u8, String>;
         async fn icrc1_fee(&self, ledger: Principal) -> Result<Nat, String>;
         async fn icrc2_allowance(&self, ledger: Principal, account: &Account, spender: &Account)

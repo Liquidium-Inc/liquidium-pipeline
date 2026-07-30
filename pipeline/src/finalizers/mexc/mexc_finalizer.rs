@@ -597,7 +597,8 @@ where
                 let tx_id = self
                     .transfer_service
                     .transfer(&state.deposit.deposit_asset, &destination, transfer_value.clone())
-                    .await?;
+                    .await
+                    .map_err(|error| error.to_string())?;
 
                 state.trade.trade_next_amount_in = Some(transfer_amount.to_f64());
                 state.deposit.deposit_txid = Some(tx_id);
@@ -698,7 +699,8 @@ where
             let tx_id = self
                 .transfer_service
                 .transfer(&state.deposit.deposit_asset, &bridge_destination, transfer_value)
-                .await?;
+                .await
+                .map_err(|error| error.to_string())?;
 
             state.deposit.bridge.deposit_bridge_submit_amount = Some(bridge_submit_amount);
             state.deposit.bridge.deposit_bridge_expected_amount = Some(bridge_expected_amount);

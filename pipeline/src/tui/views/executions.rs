@@ -1,4 +1,5 @@
 use chrono::{Local, TimeZone};
+use liquidium_pipeline_core::account::model::ChainAccount;
 use liquidium_pipeline_core::tokens::chain_token_amount::ChainTokenAmount;
 use liquidium_pipeline_core::types::protocol_types::{LiquidationStatus, TransferStatus, TxStatus};
 use ratatui::Frame;
@@ -351,6 +352,16 @@ fn append_receipt_from_meta(lines: &mut Vec<Line<'static>>, raw: &str) {
     }
 }
 
+/// Renders a sweep destination as the address an operator would paste into a
+/// ledger explorer, rather than its debug shape.
+fn format_recovery_destination(destination: &ChainAccount) -> String {
+    match destination {
+        ChainAccount::Icp(account) => account.to_string(),
+        ChainAccount::IcpLedger(account_id_hex) => account_id_hex.clone(),
+        ChainAccount::Evm(address) => address.clone(),
+    }
+}
+
 /// Displays the identity that actually signs each persisted ICPSwap leg. This
 /// is the account operators need when checking isolated balances or recovering
 /// a specific liquidation.
@@ -358,7 +369,32 @@ fn append_multi_venue_summary(lines: &mut Vec<Line<'static>>, meta: Option<&Fina
     let Some(meta) = meta else {
         return;
     };
-    let FinalizerMetaPayload::MultiVenueSwap(state) = &meta.payload;
+    let state = match &meta.payload {
+        FinalizerMetaPayload::MultiVenueSwap(state) => state,
+        FinalizerMetaPayload::RecoverySweep(state) => {
+            push_section_title(lines, "Recovery Sweep");
+            lines.push(Line::from(format!(
+                "Status: {:?} | amount: {}",
+                state.status,
+                state.amount.formatted()
+            )));
+            lines.push(Line::from(format!(
+                "Destination: {}",
+                format_recovery_destination(&state.destination)
+            )));
+            lines.push(Line::from(format!("Reason: {}", state.reason)));
+            if let Some(txid) = &state.txid {
+                lines.push(Line::from(format!("Transfer tx: {txid}")));
+            }
+            if let Some(error) = &state.last_error {
+                lines.push(Line::from(Span::styled(
+                    format!("Error: {error}"),
+                    Style::default().fg(Color::Red),
+                )));
+            }
+            return;
+        }
+    };
 
     push_section_title(lines, "Multi-Venue Execution");
     lines.push(Line::from(format!(
@@ -870,15 +906,23 @@ mod tests {
         assert!(text.iter().any(|line| line == "   Allocation: ICP: 7.20"));
         assert!(text.iter().any(|line| line.contains("impact 12.50 bps")));
         assert!(text.iter().any(|line| line == "   Route: ICP_USDC"));
-        assert!(text.iter().any(|line| line == "   MEXC deposit txid: ic-ledger-deposit-123"));
-        assert!(text
-            .iter()
-            .any(|line| line == "   MEXC deposit bridge txid: bridge-deposit-456"));
+        assert!(
+            text.iter()
+                .any(|line| line == "   MEXC deposit txid: ic-ledger-deposit-123")
+        );
+        assert!(
+            text.iter()
+                .any(|line| line == "   MEXC deposit bridge txid: bridge-deposit-456")
+        );
         assert!(text.iter().any(|line| line == "   MEXC withdraw id: mexc-withdraw-789"));
-        assert!(text.iter().any(|line| line == "   MEXC withdraw txid: ic-ledger-withdraw-987"));
-        assert!(text
-            .iter()
-            .any(|line| line == "   MEXC withdraw bridge txid: bridge-withdraw-654"));
+        assert!(
+            text.iter()
+                .any(|line| line == "   MEXC withdraw txid: ic-ledger-withdraw-987")
+        );
+        assert!(
+            text.iter()
+                .any(|line| line == "   MEXC withdraw bridge txid: bridge-withdraw-654")
+        );
         assert!(text.iter().any(|line| line == "   Last error: waiting for bridge"));
     }
 

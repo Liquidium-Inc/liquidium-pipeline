@@ -7,7 +7,7 @@ use candid::{Encode, Principal};
 use futures::FutureExt;
 use tracing::{debug, error, info, warn};
 
-use crate::finalizers::finalizer::{Finalizer, FinalizerErrorKind, FinalizerResult};
+use crate::finalizers::finalizer::{Finalizer, FinalizerError, FinalizerResult};
 use crate::finalizers::liquidation_outcome::LiquidationOutcome;
 use crate::finalizers::profit_calculator::ProfitCalculator;
 
@@ -18,6 +18,7 @@ use crate::utils::now_ts;
 use crate::wal::{
     decode_receipt_wrapper, encode_meta, wal_mark_enqueued, wal_mark_inflight, wal_mark_operator_required,
     wal_mark_operator_required_with_error, wal_mark_permanent_failed, wal_mark_retryable_failed, wal_mark_succeeded,
+    wal_mark_unresumable,
 };
 use crate::watchdog::{Watchdog, WatchdogEvent, noop_watchdog};
 use liquidium_pipeline_connectors::pipeline_agent::PipelineAgent;
@@ -159,6 +160,14 @@ where
         error!("[finalize] quarantined malformed WAL row {}: {}", row_id, error);
     }
 
+    /// Records the PnL of one finished liquidation.
+    ///
+    /// The committed receipt is deliberately left alone. Callers pass their own
+    /// copy, and the permanent-failure path hands over one whose status has been
+    /// rewritten to `SwapFailed` for reporting. Persisting that copy would
+    /// overwrite the execution outcome the row is replanned from, so a requeued
+    /// row could never be finalized again. A receipt that genuinely changed is
+    /// already journalled by `update_receipt_meta`.
     async fn persist_profit_snapshot(
         &self,
         liq_id: &str,
@@ -179,7 +188,6 @@ where
             venue_execution: None,
             meta_v2: None,
         });
-        wrapper.receipt = receipt.clone();
         wrapper.profit_snapshot = Some(WalProfitSnapshot {
             expected_profit_raw: expected_profit.to_string(),
             realized_profit_raw: Some(realized_profit.to_string()),
@@ -363,7 +371,8 @@ where
                         .or_else(|| panic.downcast_ref::<String>().cloned())
                         .unwrap_or_else(|| "unknown panic".to_string());
                     error!("[finalize] 💥 finalizer panicked liq_id={} detail={}", liq_id, detail);
-                    Err(format!("finalizer panicked: {detail}"))
+                    // A panic says nothing about whether a retry would succeed.
+                    Err(FinalizerError::Retryable(format!("finalizer panicked: {detail}")))
                 });
 
             match outcome {
@@ -398,18 +407,39 @@ where
                         }
                     }
                 }
-                Err(e) => {
+                Err(error) => {
                     let base_errors = error_count_by_liq.get(&liq_id).copied().unwrap_or(0);
                     let next_errors = base_errors + 1;
-                    let err_msg = e.to_string();
-                    let error_kind = self.finalizer.classify_error(&err_msg);
+                    let err_msg = error.message().to_string();
 
                     let wal_id = wal_id_by_liq
                         .get(&liq_id)
                         .ok_or_else(|| format!("missing WAL id for liquidation {}", liq_id))?;
 
-                    debug!("Failed finalization {}", err_msg);
-                    if error_kind == FinalizerErrorKind::BadDebtAmountFloor && receipt.request.liquidation.buy_bad_debt
+                    warn!(
+                        "[finalize] finalization failed liq_id={} kind={} attempt={} err={}",
+                        liq_id,
+                        error.kind(),
+                        next_errors,
+                        err_msg
+                    );
+                    if matches!(error, FinalizerError::Unresumable(_)) {
+                        // This build cannot read the committed row. The
+                        // liquidation is not wrong, so it must not be failed:
+                        // park it where an operator can see it, exactly as
+                        // startup does for the same condition.
+                        if let Err(mark_error) =
+                            wal_mark_unresumable(&*self.wal, wal_id, err_msg.clone()).await
+                        {
+                            warn!("Failed to park unresumable WAL row {}: {}", wal_id, mark_error);
+                        }
+                        error!(
+                            "[finalize] 🅿️ committed row cannot be resumed by this build; parked for operator liq_id={} err={}",
+                            liq_id, err_msg
+                        );
+                        self.escalate_custody_park(&receipt, liq_id, &err_msg).await;
+                    } else if matches!(error, FinalizerError::BadDebtAmountFloor(_))
+                        && receipt.request.liquidation.buy_bad_debt
                     {
                         let _ = wal_mark_succeeded(&*self.wal, wal_id).await;
 
@@ -423,7 +453,7 @@ where
                             },
                             receipt.clone(),
                         ));
-                    } else if error_kind == FinalizerErrorKind::VenueCustody && next_errors >= MAX_FINALIZER_ERRORS {
+                    } else if matches!(error, FinalizerError::VenueCustody(_)) && next_errors >= MAX_FINALIZER_ERRORS {
                         // The retry budget is spent, but a venue leg may still
                         // hold this liquidation's funds. Failing permanently
                         // would drop the row out of the runnable queue and
@@ -448,8 +478,8 @@ where
                             self.escalate_custody_park(&receipt, liq_id, &err_msg).await;
                         }
                     } else if matches!(
-                        error_kind,
-                        FinalizerErrorKind::Permanent | FinalizerErrorKind::BadDebtAmountFloor
+                        error,
+                        FinalizerError::Permanent(_) | FinalizerError::BadDebtAmountFloor(_)
                     ) || next_errors >= MAX_FINALIZER_ERRORS
                     {
                         let _ = wal_mark_permanent_failed(&*self.wal, wal_id, err_msg.clone()).await;
@@ -584,7 +614,7 @@ mod tests {
 
     #[async_trait::async_trait]
     impl Finalizer for NoopFinalizer {
-        async fn finalize(&self, _: &dyn WalStore, _: ExecutionReceipt) -> Result<FinalizerResult, String> {
+        async fn finalize(&self, _: &dyn WalStore, _: ExecutionReceipt) -> Result<FinalizerResult, FinalizerError> {
             let mut calls = self.calls.lock().unwrap();
             *calls += 1;
             Ok(FinalizerResult {
@@ -599,15 +629,14 @@ mod tests {
 
     #[derive(Clone)]
     struct ErrorFinalizer {
-        error: String,
-        kind: FinalizerErrorKind,
+        error: FinalizerError,
     }
 
     struct OperatorRequiredFinalizer;
 
     #[async_trait::async_trait]
     impl Finalizer for OperatorRequiredFinalizer {
-        async fn finalize(&self, _: &dyn WalStore, _: ExecutionReceipt) -> Result<FinalizerResult, String> {
+        async fn finalize(&self, _: &dyn WalStore, _: ExecutionReceipt) -> Result<FinalizerResult, FinalizerError> {
             Ok(FinalizerResult {
                 swap_result: None,
                 finalized: false,
@@ -620,12 +649,8 @@ mod tests {
 
     #[async_trait::async_trait]
     impl Finalizer for ErrorFinalizer {
-        async fn finalize(&self, _: &dyn WalStore, _: ExecutionReceipt) -> Result<FinalizerResult, String> {
+        async fn finalize(&self, _: &dyn WalStore, _: ExecutionReceipt) -> Result<FinalizerResult, FinalizerError> {
             Err(self.error.clone())
-        }
-
-        fn classify_error(&self, _error: &str) -> FinalizerErrorKind {
-            self.kind
         }
     }
 
@@ -866,8 +891,7 @@ mod tests {
         let stage = FinalizeStage::new(
             Arc::new(wal),
             Arc::new(ErrorFinalizer {
-                error: "venue still holds the input".to_string(),
-                kind: FinalizerErrorKind::VenueCustody,
+                error: FinalizerError::VenueCustody("venue still holds the input".to_string()),
             }),
             Arc::new(SimpleProfitCalculator),
             Arc::new(MockPipelineAgent::new()),
@@ -919,8 +943,7 @@ mod tests {
         let stage = FinalizeStage::new(
             Arc::new(wal),
             Arc::new(ErrorFinalizer {
-                error: "venue still holds the input".to_string(),
-                kind: FinalizerErrorKind::VenueCustody,
+                error: FinalizerError::VenueCustody("venue still holds the input".to_string()),
             }),
             Arc::new(SimpleProfitCalculator),
             Arc::new(MockPipelineAgent::new()),
@@ -974,8 +997,7 @@ mod tests {
         let stage = FinalizeStage::new(
             Arc::new(wal),
             Arc::new(ErrorFinalizer {
-                error: "venue still holds the input".to_string(),
-                kind: FinalizerErrorKind::VenueCustody,
+                error: FinalizerError::VenueCustody("venue still holds the input".to_string()),
             }),
             Arc::new(SimpleProfitCalculator),
             Arc::new(MockPipelineAgent::new()),
@@ -1049,8 +1071,7 @@ mod tests {
         let stage = FinalizeStage::new(
             Arc::new(wal),
             Arc::new(ErrorFinalizer {
-                error: err,
-                kind: FinalizerErrorKind::BadDebtAmountFloor,
+                error: FinalizerError::BadDebtAmountFloor(err),
             }),
             Arc::new(SimpleProfitCalculator),
             Arc::new(MockPipelineAgent::new()),
@@ -1105,8 +1126,7 @@ mod tests {
         let stage = FinalizeStage::new(
             Arc::new(wal),
             Arc::new(ErrorFinalizer {
-                error: err.clone(),
-                kind: FinalizerErrorKind::BadDebtAmountFloor,
+                error: FinalizerError::BadDebtAmountFloor(err.clone()),
             }),
             Arc::new(SimpleProfitCalculator),
             Arc::new(MockPipelineAgent::new()),
@@ -1163,8 +1183,7 @@ mod tests {
         let stage = FinalizeStage::new(
             Arc::new(wal),
             Arc::new(ErrorFinalizer {
-                error: err,
-                kind: FinalizerErrorKind::Retryable,
+                error: FinalizerError::Retryable(err),
             }),
             Arc::new(SimpleProfitCalculator),
             Arc::new(MockPipelineAgent::new()),
@@ -1569,5 +1588,70 @@ mod tests {
 
         let outcomes = stage.process(&()).await.expect("process should succeed");
         assert_eq!(outcomes.len(), 1);
+    }
+
+    /// A permanent failure reports `SwapFailed` to the export and the operator,
+    /// but the committed receipt has to keep describing what actually happened
+    /// on chain. Overwriting it would leave the row unable to replan, because
+    /// planning requires a successful execution, so a requeue could never
+    /// finalize a liquidation whose collateral the trader already holds.
+    #[tokio::test]
+    async fn permanent_failure_reports_swap_failed_without_rewriting_the_committed_receipt() {
+        let liq_id = 914u128;
+        let receipt = ExecutionReceipt {
+            request: make_swapping_receipt(liq_id).request,
+            liquidation_result: Some(make_liq_result(liq_id, TransferStatus::Success, 0)),
+            status: ExecutionStatus::Success,
+            change_received: true,
+        };
+        let row = make_row(liq_id, receipt.clone());
+        let row_for_pending = row.clone();
+        let row_for_get = row.clone();
+
+        let mut wal = MockWalStore::new();
+        wal.expect_get_pending()
+            .with(eq(100usize))
+            .times(1)
+            .returning(move |_| Ok(vec![row_for_pending.clone()]));
+        wal.expect_update_status()
+            .withf(|_, status, _| *status == ResultStatus::InFlight)
+            .times(1)
+            .returning(|_, _, _| Ok(()));
+        wal.expect_update_failure()
+            .withf(|_, status, _, _| *status == ResultStatus::FailedPermanent)
+            .times(1)
+            .returning(|_, _, _, _| Ok(()));
+        wal.expect_get_result()
+            .times(1)
+            .returning(move |_| Ok(Some(row_for_get.clone())));
+        wal.expect_upsert_result().times(1).returning(|row| {
+            let wrapper = decode_receipt_wrapper(&row)
+                .expect("decode wrapper")
+                .expect("wrapper exists");
+            assert!(
+                matches!(wrapper.receipt.status, ExecutionStatus::Success),
+                "the committed receipt must still be replannable, got {:?}",
+                wrapper.receipt.status
+            );
+            assert!(wrapper.profit_snapshot.is_some(), "the PnL still has to be recorded");
+            Ok(())
+        });
+
+        let stage = FinalizeStage::new(
+            Arc::new(wal),
+            Arc::new(ErrorFinalizer {
+                error: FinalizerError::Permanent("permanent multi-venue finalizer: no route".to_string()),
+            }),
+            Arc::new(SimpleProfitCalculator),
+            Arc::new(MockPipelineAgent::new()),
+            Principal::anonymous(),
+            5,
+            120,
+        );
+
+        let outcomes = stage.process(&()).await.expect("process should succeed");
+        assert_eq!(outcomes.len(), 1);
+        // The reported outcome still carries the failure for export and alerting.
+        assert!(matches!(outcomes[0].status, ExecutionStatus::SwapFailed(_)));
     }
 }

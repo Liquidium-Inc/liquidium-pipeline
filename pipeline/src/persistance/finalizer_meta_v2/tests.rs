@@ -1,5 +1,8 @@
 use candid::{Nat, Principal};
-use liquidium_pipeline_core::tokens::{chain_token::ChainToken, chain_token_amount::ChainTokenAmount};
+use liquidium_pipeline_core::{
+    account::model::ChainAccount,
+    tokens::{chain_token::ChainToken, chain_token_amount::ChainTokenAmount},
+};
 use serde_json::json;
 
 use super::*;
@@ -19,6 +22,55 @@ fn token(ledger: u8, symbol: &str, decimals: u8) -> ChainToken {
 
 fn amount(token: &ChainToken, value: u64) -> ChainTokenAmount {
     ChainTokenAmount::from_raw(token.clone(), Nat::from(value))
+}
+
+#[test]
+fn recovery_sweep_round_trips_and_validates() {
+    let state = RecoverySweepState {
+        liquidation_id: "1549".to_string(),
+        reason: "MEXC amount is below its minimum".to_string(),
+        amount: amount(&token(3, "ckUSDT", 6), 7_115_292),
+        destination: ChainAccount::Icp(icrc_ledger_types::icrc1::account::Account {
+            owner: Principal::from_slice(&[42]),
+            subaccount: None,
+        }),
+        status: RecoverySweepStatus::ReadyToSubmit,
+        txid: None,
+        last_error: None,
+    };
+    let original = FinalizerMetaV2 {
+        version: FINALIZER_META_V2_VERSION,
+        payload: FinalizerMetaPayload::RecoverySweep(state),
+    };
+
+    original.validate().expect("valid recovery sweep");
+    let encoded = serde_json::to_vec(&original).expect("serialize recovery sweep");
+    let decoded: FinalizerMetaV2 = serde_json::from_slice(&encoded).expect("deserialize recovery sweep");
+    assert_eq!(decoded, original);
+}
+
+#[test]
+fn validation_rejects_a_ready_sweep_that_already_transferred() {
+    let mut state = RecoverySweepState {
+        liquidation_id: "1549".to_string(),
+        reason: "MEXC amount is below its minimum".to_string(),
+        amount: amount(&token(3, "ckUSDT", 6), 7_115_292),
+        destination: ChainAccount::Icp(icrc_ledger_types::icrc1::account::Account {
+            owner: Principal::from_slice(&[42]),
+            subaccount: None,
+        }),
+        status: RecoverySweepStatus::ReadyToSubmit,
+        txid: Some("block-1".to_string()),
+        last_error: None,
+    };
+    assert!(
+        state.validate().is_err(),
+        "a submitted transfer cannot still be pending submission"
+    );
+
+    // The same evidence is exactly what a completed sweep requires.
+    state.status = RecoverySweepStatus::Completed;
+    state.validate().expect("completed sweep with a transaction ID");
 }
 
 fn leg(leg_id: &str, venue_id: &str, pay: &ChainTokenAmount, receive: &ChainTokenAmount) -> VenueLegState {
@@ -147,7 +199,9 @@ fn arbitrary_venue_id_round_trips_without_schema_changes() {
 #[test]
 fn below_minimum_reason_round_trips_all_skipped_venue_ids() {
     let mut original = envelope(state_with_venues(&[("icpswap", 100)]));
-    let FinalizerMetaPayload::MultiVenueSwap(state) = &mut original.payload;
+    let FinalizerMetaPayload::MultiVenueSwap(state) = &mut original.payload else {
+        panic!("expected multi-venue state")
+    };
     state.plan.allocation_reason = MultiVenueAllocationReason::RemainderBelowMinimum {
         skipped_venue_ids: vec!["mexc".to_string(), "kraken".to_string()],
         selected_venue_id: "icpswap".to_string(),
@@ -174,7 +228,9 @@ fn below_minimum_reason_decodes_legacy_singular_skipped_venue_id() {
     });
 
     let decoded: FinalizerMetaV2 = serde_json::from_value(encoded).expect("decode legacy singular field");
-    let FinalizerMetaPayload::MultiVenueSwap(state) = decoded.payload;
+    let FinalizerMetaPayload::MultiVenueSwap(state) = decoded.payload else {
+        panic!("expected multi-venue state")
+    };
 
     assert_eq!(
         state.plan.allocation_reason,
@@ -206,7 +262,9 @@ fn legacy_decision_snapshot_defaults_multi_venue_allocation_to_none() {
 #[test]
 fn completed_result_round_trips_inside_a_leg() {
     let mut original = envelope(state_with_venues(&[("icpswap", 100)]));
-    let FinalizerMetaPayload::MultiVenueSwap(state) = &mut original.payload;
+    let FinalizerMetaPayload::MultiVenueSwap(state) = &mut original.payload else {
+        panic!("expected multi-venue state")
+    };
     let pay = state.legs[0].request.pay_amount.clone();
     let receive = state.legs[0].quote.estimated_receive.clone();
     state.legs[0].result = Some(execution(&pay, &receive));
@@ -232,7 +290,9 @@ fn validation_rejects_unsupported_version() {
 #[test]
 fn validation_rejects_empty_leg_id() {
     let mut meta = envelope(state_with_venues(&[("icpswap", 100)]));
-    let FinalizerMetaPayload::MultiVenueSwap(state) = &mut meta.payload;
+    let FinalizerMetaPayload::MultiVenueSwap(state) = &mut meta.payload else {
+        panic!("expected multi-venue state")
+    };
     state.legs[0].leg_id = "  ".to_string();
 
     assert!(
@@ -245,7 +305,9 @@ fn validation_rejects_empty_leg_id() {
 #[test]
 fn validation_rejects_duplicate_leg_id() {
     let mut meta = envelope(state_with_venues(&[("icpswap", 75), ("mexc", 25)]));
-    let FinalizerMetaPayload::MultiVenueSwap(state) = &mut meta.payload;
+    let FinalizerMetaPayload::MultiVenueSwap(state) = &mut meta.payload else {
+        panic!("expected multi-venue state")
+    };
     state.legs[1].leg_id = state.legs[0].leg_id.clone();
 
     assert!(
@@ -258,7 +320,9 @@ fn validation_rejects_duplicate_leg_id() {
 #[test]
 fn validation_rejects_empty_venue_id() {
     let mut meta = envelope(state_with_venues(&[("icpswap", 100)]));
-    let FinalizerMetaPayload::MultiVenueSwap(state) = &mut meta.payload;
+    let FinalizerMetaPayload::MultiVenueSwap(state) = &mut meta.payload else {
+        panic!("expected multi-venue state")
+    };
     state.legs[0].venue_id.clear();
 
     assert!(
@@ -271,7 +335,9 @@ fn validation_rejects_empty_venue_id() {
 #[test]
 fn validation_rejects_mismatched_execution_venue() {
     let mut meta = envelope(state_with_venues(&[("icpswap", 100)]));
-    let FinalizerMetaPayload::MultiVenueSwap(state) = &mut meta.payload;
+    let FinalizerMetaPayload::MultiVenueSwap(state) = &mut meta.payload else {
+        panic!("expected multi-venue state")
+    };
     state.legs[0].execution.venue = "mexc".to_string();
 
     assert!(
@@ -284,7 +350,9 @@ fn validation_rejects_mismatched_execution_venue() {
 #[test]
 fn validation_rejects_allocation_total_mismatch() {
     let mut meta = envelope(state_with_venues(&[("icpswap", 100)]));
-    let FinalizerMetaPayload::MultiVenueSwap(state) = &mut meta.payload;
+    let FinalizerMetaPayload::MultiVenueSwap(state) = &mut meta.payload else {
+        panic!("expected multi-venue state")
+    };
     state.legs[0].request.pay_amount.value = Nat::from(99u64);
 
     assert!(
@@ -297,7 +365,9 @@ fn validation_rejects_allocation_total_mismatch() {
 #[test]
 fn validation_rejects_allocation_token_mismatch() {
     let mut meta = envelope(state_with_venues(&[("icpswap", 100)]));
-    let FinalizerMetaPayload::MultiVenueSwap(state) = &mut meta.payload;
+    let FinalizerMetaPayload::MultiVenueSwap(state) = &mut meta.payload else {
+        panic!("expected multi-venue state")
+    };
     state.legs[0].request.pay_amount.token = token(9, "OTHER", 8);
 
     assert!(
@@ -310,7 +380,9 @@ fn validation_rejects_allocation_token_mismatch() {
 #[test]
 fn validation_rejects_duplicate_venue_for_icpswap_first() {
     let mut meta = envelope(state_with_venues(&[("icpswap", 75), ("mexc", 25)]));
-    let FinalizerMetaPayload::MultiVenueSwap(state) = &mut meta.payload;
+    let FinalizerMetaPayload::MultiVenueSwap(state) = &mut meta.payload else {
+        panic!("expected multi-venue state")
+    };
     state.legs[1].venue_id = "icpswap".to_string();
     state.legs[1].execution.venue = "icpswap".to_string();
 

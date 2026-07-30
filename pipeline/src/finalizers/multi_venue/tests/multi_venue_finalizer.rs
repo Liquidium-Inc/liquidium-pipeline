@@ -12,7 +12,9 @@ use async_trait::async_trait;
 use candid::{Nat, Principal};
 use liquidium_pipeline_connectors::pipeline_agent::MockPipelineAgent;
 use liquidium_pipeline_core::{
+    account::model::ChainAccount,
     tokens::{chain_token::ChainToken, chain_token_amount::ChainTokenAmount},
+    transfer::actions::{MockTransferActions, TransferFailure},
     types::protocol_types::{
         AssetType, LiquidationAmounts, LiquidationRequest, LiquidationResult, LiquidationStatus, TransferStatus,
         TxStatus,
@@ -23,13 +25,14 @@ use num_traits::ToPrimitive;
 use crate::{
     executors::executor::ExecutorRequest,
     finalizers::{
-        finalizer::{Finalizer, FinalizerErrorKind},
+        finalizer::{Finalizer, FinalizerError},
         multi_venue::{ICPSWAP_VENUE_ID, MEXC_VENUE_ID, VenueLegProgress, VenueRoutePreview},
         profit_calculator::SimpleProfitCalculator,
     },
     persistance::{
-        FinalizerMetaPayload, LiqMetaWrapper, LiqResultRecord, MultiVenueExecutionOutcome, MultiVenueExecutionState,
-        ResultStatus, VenueExecutionState, VenueLegState, VenueLegStatus, WalStore,
+        FINALIZER_META_V2_VERSION, FinalizerMetaPayload, FinalizerMetaV2, LiqMetaWrapper, LiqResultRecord,
+        MultiVenueExecutionOutcome, MultiVenueExecutionState, RecoverySweepState, RecoverySweepStatus, ResultStatus,
+        VenueExecutionState, VenueLegState, VenueLegStatus, WalStore,
     },
     stage::PipelineStage,
     stages::{
@@ -37,7 +40,7 @@ use crate::{
         finalize::{FinalizeStage, MAX_FINALIZER_ERRORS},
     },
     swappers::model::{SwapExecution, SwapQuote, SwapQuoteLeg, SwapRequest},
-    utils::{CKUSDC_LEDGER_PRINCIPAL, ICP_LEDGER_PRINCIPAL},
+    utils::{CKUSDC_LEDGER_PRINCIPAL, CKUSDT_LEDGER_PRINCIPAL, ICP_LEDGER_PRINCIPAL},
     wal::{decode_receipt_wrapper, encode_meta, liq_id_from_receipt},
     watchdog::{Watchdog, WatchdogEvent},
 };
@@ -47,6 +50,13 @@ const DEBT_REPAID: u64 = 190_000_000;
 
 #[derive(Default)]
 struct RecordingWatchdog(Mutex<Vec<(String, String)>>);
+
+impl RecordingWatchdog {
+    /// Captured operator escalations as `(execution_id, pending_step)`.
+    fn alerts(&self) -> Vec<(String, String)> {
+        self.0.lock().expect("watchdog lock").clone()
+    }
+}
 
 #[async_trait]
 impl Watchdog for RecordingWatchdog {
@@ -96,6 +106,41 @@ impl TestWal {
         }
     }
 
+    /// Seeds a row whose recovery sweep was committed by an earlier process, so
+    /// the finalizer under test can only reach it by loading it back.
+    fn with_recovery_sweep(receipt: &ExecutionReceipt, status: RecoverySweepStatus) -> Self {
+        let collateral = receipt.request.collateral_asset.clone();
+        let state = RecoverySweepState {
+            liquidation_id: liq_id_from_receipt(receipt).expect("liquidation id"),
+            reason: "no viable swap route: MEXC amount is below its minimum".to_string(),
+            amount: ChainTokenAmount::from_raw(collateral, Nat::from(TOTAL_PAY - 10_000)),
+            destination: ChainAccount::IcpLedger(
+                ic_ledger_types::AccountIdentifier::new(
+                    &recovery_account().owner,
+                    &ic_ledger_types::Subaccount(recovery_account().subaccount.expect("recovery subaccount")),
+                )
+                .to_hex(),
+            ),
+            status,
+            txid: match status {
+                RecoverySweepStatus::Completed => Some("earlier-recovery-block".to_string()),
+                _ => None,
+            },
+            last_error: None,
+        };
+        Self::with_wrapper(LiqMetaWrapper {
+            receipt: receipt.clone(),
+            meta: Vec::new(),
+            finalizer_decision: None,
+            profit_snapshot: None,
+            venue_execution: None,
+            meta_v2: Some(FinalizerMetaV2 {
+                version: FINALIZER_META_V2_VERSION,
+                payload: FinalizerMetaPayload::RecoverySweep(state),
+            }),
+        })
+    }
+
     fn wrapper(&self) -> LiqMetaWrapper {
         let row = self.row.lock().expect("WAL lock").clone().expect("WAL row");
         decode_receipt_wrapper(&row)
@@ -103,10 +148,20 @@ impl TestWal {
             .expect("wrapper exists")
     }
 
+    /// Rewrites the committed envelope in place, standing in for a row written
+    /// by a different build of the binary.
+    fn replace_wrapper(&self, wrapper: &LiqMetaWrapper) {
+        let mut guard = self.row.lock().expect("WAL lock");
+        let row = guard.as_mut().expect("WAL row");
+        encode_meta(row, wrapper).expect("re-encode wrapper");
+    }
+
     fn leg_statuses(&self) -> Vec<VenueLegStatus> {
         let wrapper = self.wrapper();
         let meta = wrapper.meta_v2.expect("committed meta_v2");
-        let FinalizerMetaPayload::MultiVenueSwap(state) = meta.payload;
+        let FinalizerMetaPayload::MultiVenueSwap(state) = meta.payload else {
+            panic!("expected multi-venue state")
+        };
         state.legs.into_iter().map(|leg| leg.status).collect()
     }
 }
@@ -216,7 +271,9 @@ impl BatchWal {
         let wrapper = decode_receipt_wrapper(row)
             .expect("decode batch WAL row")
             .expect("batch WAL wrapper");
-        let FinalizerMetaPayload::MultiVenueSwap(state) = wrapper.meta_v2.expect("committed meta_v2").payload;
+        let FinalizerMetaPayload::MultiVenueSwap(state) = wrapper.meta_v2.expect("committed meta_v2").payload else {
+            panic!("expected multi-venue state")
+        };
         state
     }
 }
@@ -320,6 +377,9 @@ struct ScriptedAdapter {
     /// Makes `advance` fail structurally, the way a decode or dispatch error
     /// does: the leg is never touched, so it cannot be holding funds.
     advance_failure: Option<String>,
+    /// Makes `preview` fail the way a venue outage does, so the planner sees
+    /// the venue as unavailable rather than as quoted.
+    preview_failure: Option<String>,
 }
 
 impl ScriptedAdapter {
@@ -336,11 +396,17 @@ impl ScriptedAdapter {
             wal: Mutex::new(Weak::new()),
             observed_statuses: Mutex::new(Vec::new()),
             advance_failure: None,
+            preview_failure: None,
         }
     }
 
     fn with_advance_failure(mut self, error: &str) -> Self {
         self.advance_failure = Some(error.to_string());
+        self
+    }
+
+    fn with_preview_failure(mut self, error: &str) -> Self {
+        self.preview_failure = Some(error.to_string());
         self
     }
 
@@ -383,6 +449,9 @@ impl MultiVenueAdapter for ScriptedAdapter {
         request: &SwapRequest,
     ) -> Result<VenueRoutePreview, String> {
         self.preview_calls.fetch_add(1, Ordering::SeqCst);
+        if let Some(error) = &self.preview_failure {
+            return Err(error.clone());
+        }
         let pay = request
             .pay_amount
             .value
@@ -492,6 +561,15 @@ fn debt_token() -> ChainToken {
         symbol: "ckUSDC".to_string(),
         decimals: 6,
         fee: Nat::from(10u64),
+    }
+}
+
+fn ckusdt() -> ChainToken {
+    ChainToken::Icp {
+        ledger: Principal::from_text(CKUSDT_LEDGER_PRINCIPAL).expect("ckUSDT ledger"),
+        symbol: "ckUSDT".to_string(),
+        decimals: 6,
+        fee: Nat::from(10_000u64),
     }
 }
 
@@ -626,9 +704,406 @@ fn finalizer(adapters: Vec<Arc<dyn MultiVenueAdapter>>) -> MultiVenueFinalizer {
     MultiVenueFinalizer::new(adapters, planner_config()).expect("valid finalizer")
 }
 
+fn below_mexc_minimum_config() -> IcpswapFirstPlannerConfig {
+    IcpswapFirstPlannerConfig {
+        cex_min_exec_usd: 11.0,
+        ..planner_config()
+    }
+}
+
+fn recovery_account() -> icrc_ledger_types::icrc1::account::Account {
+    icrc_ledger_types::icrc1::account::Account {
+        owner: Principal::from_slice(&[42]),
+        subaccount: Some([7; 32]),
+    }
+}
+
+fn committed_recovery_state(wal: &TestWal) -> crate::persistance::RecoverySweepState {
+    let meta = wal.wrapper().meta_v2.expect("committed meta_v2");
+    let FinalizerMetaPayload::RecoverySweep(state) = meta.payload else {
+        panic!("expected recovery sweep state")
+    };
+    state
+}
+
+#[tokio::test]
+async fn below_minimum_route_sweeps_exact_collateral_minus_fee_to_recovery() {
+    let receipt = receipt();
+    let wal = TestWal::with_receipt(&receipt);
+    let mexc = Arc::new(ScriptedAdapter::new(MEXC_VENUE_ID, None, Vec::new()));
+    let destination = recovery_account();
+    let expected_account_id = ic_ledger_types::AccountIdentifier::new(
+        &destination.owner,
+        &ic_ledger_types::Subaccount(destination.subaccount.unwrap()),
+    )
+    .to_hex();
+    let mut transfers = MockTransferActions::new();
+    transfers
+        .expect_transfer()
+        .withf(move |token, account, amount| {
+            token.symbol() == "ICP"
+                && account == &ChainAccount::IcpLedger(expected_account_id.clone())
+                && amount == &Nat::from(TOTAL_PAY - 10_000)
+        })
+        .times(1)
+        .returning(|_, _, _| Ok("recovery-block-123".to_string()));
+    let finalizer = MultiVenueFinalizer::new(vec![mexc.clone()], below_mexc_minimum_config())
+        .expect("valid finalizer")
+        .with_recovery_sweep(Arc::new(transfers), destination);
+
+    let completed = finalizer.finalize(&wal, receipt).await.expect("sweep to recovery");
+
+    assert!(completed.finalized);
+    assert!(!completed.operator_required);
+    assert_eq!(completed.swapper.as_deref(), Some("recovery"));
+    // No venue is touched: the sweep exists because none could execute.
+    assert_eq!(mexc.calls(), 0);
+    let state = committed_recovery_state(&wal);
+    assert_eq!(state.status, RecoverySweepStatus::Completed);
+    assert_eq!(state.amount.value, Nat::from(TOTAL_PAY - 10_000));
+    assert_eq!(state.txid.as_deref(), Some("recovery-block-123"));
+}
+
+/// The transfer must be durable before it is submitted, so that a reader who
+/// finds it can tell a planned sweep apart from an unrecorded one.
+#[tokio::test]
+async fn recovery_transfer_is_persisted_as_ready_before_it_is_submitted() {
+    let receipt = receipt();
+    let wal = Arc::new(TestWal::with_receipt(&receipt));
+    let observed = Arc::new(Mutex::new(None));
+    let mexc = Arc::new(ScriptedAdapter::new(MEXC_VENUE_ID, None, Vec::new()));
+
+    let mut transfers = MockTransferActions::new();
+    let seen = observed.clone();
+    let wal_during_transfer = wal.clone();
+    transfers.expect_transfer().times(1).returning(move |_, _, _| {
+        *seen.lock().expect("observation lock") = Some(committed_recovery_state(&wal_during_transfer));
+        Ok("recovery-block-123".to_string())
+    });
+
+    let finalizer = MultiVenueFinalizer::new(vec![mexc], below_mexc_minimum_config())
+        .expect("valid finalizer")
+        .with_recovery_sweep(Arc::new(transfers), recovery_account());
+    finalizer
+        .finalize(wal.as_ref(), receipt)
+        .await
+        .expect("sweep to recovery");
+
+    let during = observed
+        .lock()
+        .expect("observation lock")
+        .clone()
+        .expect("transfer ran");
+    assert_eq!(during.status, RecoverySweepStatus::ReadyToSubmit);
+    assert_eq!(during.amount.value, Nat::from(TOTAL_PAY - 10_000));
+    assert!(during.txid.is_none());
+}
+
+#[tokio::test]
+async fn seven_dollar_ckusdt_is_swept_from_trader_to_the_icrc_recovery_account() {
+    const RECEIVED: u64 = 7_125_292;
+    const TRANSFERRED: u64 = 7_115_292;
+    let mut receipt = receipt();
+    let collateral = ckusdt();
+    receipt.request.collateral_asset = collateral.clone();
+    receipt.request.ref_price = Nat::from(1_000_000_000_000_000_000_000_000_000u128);
+    let swap = receipt.request.swap_args.as_mut().expect("swap request");
+    swap.pay_asset = collateral.asset_id();
+    swap.pay_amount = ChainTokenAmount::from_raw(collateral, Nat::from(RECEIVED));
+    receipt
+        .liquidation_result
+        .as_mut()
+        .expect("liquidation result")
+        .amounts
+        .collateral_received = Nat::from(RECEIVED);
+
+    let wal = TestWal::with_receipt(&receipt);
+    let destination = recovery_account();
+    let expected_destination = destination;
+    let mut transfers = MockTransferActions::new();
+    transfers
+        .expect_transfer()
+        .withf(move |token, account, amount| {
+            token.symbol() == "ckUSDT"
+                && account == &ChainAccount::Icp(expected_destination)
+                && amount == &Nat::from(TRANSFERRED)
+        })
+        .times(1)
+        .returning(|_, _, _| Ok("ckusdt-recovery-block".to_string()));
+    let mexc = Arc::new(ScriptedAdapter::new(MEXC_VENUE_ID, None, Vec::new()));
+    let mut config = planner_config();
+    config.cex_min_exec_usd = 8.0;
+    let finalizer = MultiVenueFinalizer::new(vec![mexc], config)
+        .expect("valid finalizer")
+        .with_recovery_sweep(Arc::new(transfers), destination);
+
+    let completed = finalizer.finalize(&wal, receipt).await.expect("sweep to recovery");
+
+    assert!(completed.finalized);
+    let state = committed_recovery_state(&wal);
+    assert_eq!(state.amount.value, Nat::from(TRANSFERRED));
+    assert_eq!(state.txid.as_deref(), Some("ckusdt-recovery-block"));
+}
+
+/// A ready transfer read back from the WAL is ambiguous: the process that wrote
+/// it may have submitted it and died, or never reached the ledger at all. It is
+/// never repeated automatically, whichever process finds it.
+#[tokio::test]
+async fn ready_recovery_sweep_loaded_from_the_wal_is_parked_without_transfer() {
+    let receipt = receipt();
+    let wal = TestWal::with_recovery_sweep(&receipt, RecoverySweepStatus::ReadyToSubmit);
+    let mexc = Arc::new(ScriptedAdapter::new(MEXC_VENUE_ID, None, Vec::new()));
+    let watchdog = Arc::new(RecordingWatchdog::default());
+
+    let mut transfers = MockTransferActions::new();
+    transfers.expect_transfer().times(0);
+    let finalizer = MultiVenueFinalizer::new(vec![mexc], below_mexc_minimum_config())
+        .expect("valid finalizer")
+        .with_watchdog(watchdog.clone())
+        .with_recovery_sweep(Arc::new(transfers), recovery_account());
+
+    let result = finalizer.finalize(&wal, receipt).await.expect("park ambiguous sweep");
+
+    assert!(result.operator_required);
+    assert!(!result.finalized);
+    let state = committed_recovery_state(&wal);
+    assert_eq!(state.status, RecoverySweepStatus::OperatorRequired);
+    assert!(state.txid.is_none());
+    assert!(
+        state.last_error.is_some(),
+        "the ambiguity must be recorded for an operator"
+    );
+    // The alert has to name the liquidation an operator needs to reconcile.
+    assert_eq!(
+        watchdog.alerts(),
+        vec![("recovery-7".to_string(), "recovery_transfer_reconciliation".to_string())]
+    );
+}
+
+/// A completed sweep is terminal: reprocessing the row must not transfer twice.
+#[tokio::test]
+async fn completed_recovery_sweep_is_not_transferred_again() {
+    let receipt = receipt();
+    let wal = TestWal::with_recovery_sweep(&receipt, RecoverySweepStatus::Completed);
+    let mexc = Arc::new(ScriptedAdapter::new(MEXC_VENUE_ID, None, Vec::new()));
+
+    let mut transfers = MockTransferActions::new();
+    transfers.expect_transfer().times(0);
+    let finalizer = MultiVenueFinalizer::new(vec![mexc], below_mexc_minimum_config())
+        .expect("valid finalizer")
+        .with_recovery_sweep(Arc::new(transfers), recovery_account());
+
+    let result = finalizer.finalize(&wal, receipt).await.expect("terminal sweep");
+
+    assert!(result.finalized);
+    assert!(!result.operator_required);
+    assert_eq!(committed_recovery_state(&wal).status, RecoverySweepStatus::Completed);
+}
+
+/// An error from the ledger may or may not have applied the transfer, so the
+/// sweep is escalated rather than retried on the next cycle.
+#[tokio::test]
+async fn ambiguous_recovery_transfer_error_parks_the_sweep() {
+    let receipt = receipt();
+    let wal = TestWal::with_receipt(&receipt);
+    let mexc = Arc::new(ScriptedAdapter::new(MEXC_VENUE_ID, None, Vec::new()));
+    let watchdog = Arc::new(RecordingWatchdog::default());
+
+    let mut transfers = MockTransferActions::new();
+    transfers
+        .expect_transfer()
+        .times(1)
+        .returning(|_, _, _| Err(TransferFailure::Ambiguous("ledger call timed out".to_string())));
+    let finalizer = MultiVenueFinalizer::new(vec![mexc], below_mexc_minimum_config())
+        .expect("valid finalizer")
+        .with_watchdog(watchdog.clone())
+        .with_recovery_sweep(Arc::new(transfers), recovery_account());
+
+    let result = finalizer
+        .finalize(&wal, receipt)
+        .await
+        .expect("park ambiguous transfer");
+
+    assert!(result.operator_required);
+    assert!(!result.finalized);
+    let state = committed_recovery_state(&wal);
+    assert_eq!(state.status, RecoverySweepStatus::OperatorRequired);
+    assert!(
+        state
+            .last_error
+            .as_deref()
+            .is_some_and(|error| error.contains("ledger call timed out")),
+        "the ledger failure must survive for an operator: {:?}",
+        state.last_error
+    );
+    assert!(
+        state
+            .last_error
+            .as_deref()
+            .is_some_and(|error| error.contains("may already have been applied")),
+        "a lost answer must send the operator to compare balances: {:?}",
+        state.last_error
+    );
+    assert_eq!(watchdog.alerts().len(), 1);
+}
+
+/// A refusal the ledger decided is not ambiguous: nothing moved, and the
+/// operator must not be sent to reconcile balances over it.
+#[tokio::test]
+async fn rejected_recovery_transfer_is_parked_as_having_moved_nothing() {
+    let receipt = receipt();
+    let wal = TestWal::with_receipt(&receipt);
+    let mexc = Arc::new(ScriptedAdapter::new(MEXC_VENUE_ID, None, Vec::new()));
+    let watchdog = Arc::new(RecordingWatchdog::default());
+
+    let mut transfers = MockTransferActions::new();
+    transfers.expect_transfer().times(1).returning(|_, _, _| {
+        Err(TransferFailure::Rejected(
+            "icp_transfer error: InsufficientFunds { balance: Tokens { e8s: 1 } }".to_string(),
+        ))
+    });
+    let finalizer = MultiVenueFinalizer::new(vec![mexc], below_mexc_minimum_config())
+        .expect("valid finalizer")
+        .with_watchdog(watchdog.clone())
+        .with_recovery_sweep(Arc::new(transfers), recovery_account());
+
+    let result = finalizer.finalize(&wal, receipt).await.expect("park refused transfer");
+
+    assert!(result.operator_required);
+    let state = committed_recovery_state(&wal);
+    assert_eq!(state.status, RecoverySweepStatus::OperatorRequired);
+    assert!(state.txid.is_none());
+    let reported = state.last_error.expect("refusal must be recorded");
+    assert!(
+        reported.contains("InsufficientFunds"),
+        "the ledger's reason must survive: {reported}"
+    );
+    assert!(
+        reported.contains("moved nothing"),
+        "a decided refusal must say the balance is intact: {reported}"
+    );
+    assert!(
+        !reported.contains("may already have been applied"),
+        "a decided refusal must not be reported as ambiguous: {reported}"
+    );
+    assert_eq!(watchdog.alerts().len(), 1);
+}
+
+/// A venue outage alongside a below-minimum venue must never be mistaken for
+/// "this amount can never be traded". The planner's summary still contains the
+/// below-minimum wording, so this is exactly the case that a text match on that
+/// wording would sweep: the collateral would leave the swap path permanently
+/// because ICPSwap happened to be down for a moment.
+#[tokio::test]
+async fn transient_icpswap_outage_below_minimum_is_retried_instead_of_swept() {
+    let receipt = receipt();
+    let wal = TestWal::with_receipt(&receipt);
+    let icpswap = Arc::new(
+        ScriptedAdapter::new(ICPSWAP_VENUE_ID, None, Vec::new()).with_preview_failure("canister is out of cycles"),
+    );
+    let mexc = Arc::new(ScriptedAdapter::new(MEXC_VENUE_ID, None, Vec::new()));
+    let mut transfers = MockTransferActions::new();
+    transfers.expect_transfer().times(0);
+    let finalizer = MultiVenueFinalizer::new(vec![icpswap, mexc], below_mexc_minimum_config())
+        .expect("valid finalizer")
+        .with_recovery_sweep(Arc::new(transfers), recovery_account());
+
+    let error = finalizer.finalize(&wal, receipt).await.expect_err("no route yet");
+
+    // The wording a text match would have keyed on is present...
+    assert!(
+        error.message().contains("amount is below its minimum"),
+        "expected the below-minimum wording to still appear: {error}"
+    );
+    // ...but the outage, not the amount, is what blocked the route.
+    assert!(
+        error.message().contains("canister is out of cycles"),
+        "expected the outage to be reported: {error}"
+    );
+    assert!(matches!(error, FinalizerError::Retryable(_)), "unexpected kind: {error:?}");
+    assert!(
+        wal.wrapper().meta_v2.is_none(),
+        "an outage must not commit a recovery sweep"
+    );
+}
+
+/// Committed state this build cannot read is a code or config problem, not a
+/// dead liquidation. Bumping the meta version — or tightening any invariant —
+/// must not permanently fail rows whose venue legs may still hold funds; they
+/// are parked for an operator, the way startup already handles this.
+#[tokio::test]
+async fn committed_state_this_build_cannot_read_is_parked_not_failed() {
+    let receipt = receipt();
+    let wal = TestWal::with_receipt(&receipt);
+    let mexc = Arc::new(ScriptedAdapter::new(MEXC_VENUE_ID, None, Vec::new()));
+
+    // Commit a plan, then age it out from under the running binary.
+    let finalizer = finalizer(vec![mexc.clone()]);
+    let _ = finalizer.finalize(&wal, receipt.clone()).await;
+    let mut wrapper = wal.wrapper();
+    let meta = wrapper.meta_v2.as_mut().expect("committed meta_v2");
+    meta.version = FINALIZER_META_V2_VERSION + 1;
+    wal.replace_wrapper(&wrapper);
+
+    let error = finalizer
+        .finalize(&wal, receipt)
+        .await
+        .expect_err("unreadable committed state cannot be planned");
+
+    assert!(
+        matches!(error, FinalizerError::Unresumable(_)),
+        "an unreadable row must be parked, not failed: {error:?}"
+    );
+    assert!(
+        error.message().contains("cannot be read by this build"),
+        "the reason must point at the binary, not the liquidation: {error}"
+    );
+}
+
+/// A receipt that cannot be planned from is broken in a way no retry can
+/// repair, so it must not spend the row's retry budget before saying so.
+#[tokio::test]
+async fn a_receipt_that_cannot_be_planned_from_fails_permanently_on_the_first_attempt() {
+    let mut receipt = receipt();
+    receipt.status = ExecutionStatus::SwapFailed("an earlier finalizer failure".to_string());
+    let wal = TestWal::with_receipt(&receipt);
+    let mexc = Arc::new(ScriptedAdapter::new(MEXC_VENUE_ID, None, Vec::new()));
+    let finalizer = finalizer(vec![mexc.clone()]);
+
+    let error = finalizer
+        .finalize(&wal, receipt)
+        .await
+        .expect_err("an unsuccessful execution cannot be planned");
+
+    assert!(
+        error.message().contains("receipt execution is not successful"),
+        "the reason must survive: {error}"
+    );
+    assert!(matches!(error, FinalizerError::Permanent(_)), "unexpected kind: {error:?}");
+    assert_eq!(mexc.previews(), 0, "no venue should be quoted for an unusable receipt");
+    assert!(wal.wrapper().meta_v2.is_none(), "nothing may be committed");
+}
+
+#[tokio::test]
+async fn below_minimum_route_without_recovery_runtime_is_terminal() {
+    let receipt = receipt();
+    let wal = TestWal::with_receipt(&receipt);
+    let mexc = Arc::new(ScriptedAdapter::new(MEXC_VENUE_ID, None, Vec::new()));
+    let finalizer = MultiVenueFinalizer::new(vec![mexc], below_mexc_minimum_config()).expect("valid finalizer");
+
+    let error = finalizer
+        .finalize(&wal, receipt)
+        .await
+        .expect_err("missing recovery runtime");
+    assert!(error.message().contains("amount is below its minimum"));
+    assert!(matches!(error, FinalizerError::Permanent(_)), "unexpected kind: {error:?}");
+}
+
 fn committed_state(wal: &TestWal) -> MultiVenueExecutionState {
     let meta = wal.wrapper().meta_v2.expect("committed meta_v2");
-    let FinalizerMetaPayload::MultiVenueSwap(state) = meta.payload;
+    let FinalizerMetaPayload::MultiVenueSwap(state) = meta.payload else {
+        panic!("expected multi-venue state")
+    };
     state
 }
 
@@ -652,7 +1127,7 @@ async fn bad_debt_below_minimum_edge_never_advances_a_venue_leg() {
         .await
         .expect_err("a bad-debt receipt does not bypass the swap edge floor");
 
-    assert!(error.contains("below required 150 bps"));
+    assert!(error.message().contains("below required 150 bps"));
     assert_eq!(icpswap.previews(), 1);
     assert_eq!(mexc.previews(), 0);
     assert_eq!(icpswap.calls(), 0);
@@ -794,8 +1269,8 @@ async fn permanent_failure_is_not_readvanced_or_rerouted() {
         .finalize(&wal, receipt.clone())
         .await
         .expect_err("permanent failure");
-    assert_eq!(finalizer.classify_error(&first_error), FinalizerErrorKind::Permanent);
-    assert!(first_error.contains("icpswap-0: deposit outcome could not be proven"));
+    assert!(matches!(first_error, FinalizerError::Permanent(_)), "unexpected kind: {first_error:?}");
+    assert!(first_error.message().contains("icpswap-0: deposit outcome could not be proven"));
     finalizer
         .finalize(&wal, receipt)
         .await
@@ -917,7 +1392,7 @@ async fn committed_legacy_state_is_rejected_without_being_upgraded() {
         .finalize(&wal, receipt)
         .await
         .expect_err("legacy state must be rejected");
-    assert_eq!(finalizer.classify_error(&error), FinalizerErrorKind::Permanent);
+    assert!(matches!(error, FinalizerError::Permanent(_)), "unexpected kind: {error:?}");
     assert_eq!(adapter.calls(), 0);
     assert_eq!(mexc.calls(), 0);
     assert!(wal.wrapper().meta_v2.is_none());
@@ -942,7 +1417,7 @@ async fn adapter_error_is_persisted_before_retry_backoff_is_requested() {
     // The leg has begun, so the venue may already hold the funds. The error
     // stays retryable, but is tagged so that exhausting the retry budget parks
     // the row for an operator instead of failing it permanently.
-    assert_eq!(finalizer.classify_error(&error), FinalizerErrorKind::VenueCustody);
+    assert!(matches!(error, FinalizerError::VenueCustody(_)), "unexpected kind: {error:?}");
     let state = committed_state(&wal);
     assert_eq!(state.legs[0].status, VenueLegStatus::Running);
     assert_eq!(state.legs[0].last_error.as_deref(), Some("temporary pool outage"));
@@ -966,7 +1441,7 @@ async fn error_before_any_leg_starts_is_not_tagged_as_holding_custody() {
         .await
         .expect_err("a structural adapter failure reaches FinalizeStage");
 
-    assert_eq!(finalizer.classify_error(&error), FinalizerErrorKind::Retryable);
+    assert!(matches!(error, FinalizerError::Retryable(_)), "unexpected kind: {error:?}");
     assert_eq!(committed_state(&wal).legs[0].status, VenueLegStatus::Planned);
 }
 

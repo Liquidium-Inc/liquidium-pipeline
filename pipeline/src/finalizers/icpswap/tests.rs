@@ -11,6 +11,7 @@ use icrc_ledger_types::icrc2::approve::ApproveArgs;
 use liquidium_pipeline_connectors::backend::icp_backend::{IcpBackend, IcrcTransferError};
 use liquidium_pipeline_core::{
     tokens::{chain_token::ChainToken, chain_token_amount::ChainTokenAmount},
+    transfer::actions::TransferFailure,
     types::protocol_types::{
         AssetType, LiquidationAmounts, LiquidationRequest, LiquidationResult, LiquidationStatus, TransferStatus,
         TxStatus,
@@ -22,7 +23,7 @@ use crate::{
     executors::executor::ExecutorRequest,
     finalizers::{
         dex_finalizer::{DexRouteFinalizer, DexRoutePreview},
-        finalizer::Finalizer,
+        finalizer::{Finalizer, FinalizerError},
         icpswap::finalizer::{ICPSWAP_FINALIZER_PERMANENT_PREFIX, IcpswapFinalizer},
         multi_venue::{
             ICPSWAP_VENUE_ID, MultiVenueAdapter, VenueLegCheckpoint, VenueLegProgress, VenuePlanningContext,
@@ -380,8 +381,10 @@ impl IcpBackend for TestIcpswapClient {
         Err("native ICP backend balance is not used by this finalizer test double".to_string())
     }
 
-    async fn icrc1_transfer(&self, _: Principal, _: &Account, _: &Account, _: Nat) -> Result<Nat, String> {
-        Err("plain ICRC-1 transfer is not used by this finalizer test double".to_string())
+    async fn icrc1_transfer(&self, _: Principal, _: &Account, _: &Account, _: Nat) -> Result<Nat, TransferFailure> {
+        Err(TransferFailure::Rejected(
+            "plain ICRC-1 transfer is not used by this finalizer test double".to_string(),
+        ))
     }
 
     async fn icrc1_transfer_with_args(&self, ledger: Principal, args: TransferArg) -> Result<Nat, IcrcTransferError> {
@@ -396,8 +399,10 @@ impl IcpBackend for TestIcpswapClient {
             })
     }
 
-    async fn icp_transfer(&self, _: Principal, _: &str, _: Nat) -> Result<u64, String> {
-        Err("legacy ICP transfer is not used by this finalizer test double".to_string())
+    async fn icp_transfer(&self, _: Principal, _: &str, _: Nat) -> Result<u64, TransferFailure> {
+        Err(TransferFailure::Rejected(
+            "legacy ICP transfer is not used by this finalizer test double".to_string(),
+        ))
     }
 
     async fn icrc1_decimals(&self, _: Principal) -> Result<u8, String> {
@@ -1075,8 +1080,10 @@ async fn failed_state_returns_explicit_permanent_error() {
         .finalize(&wal, receipt)
         .await
         .expect_err("permanent");
-    assert!(error.starts_with(ICPSWAP_FINALIZER_PERMANENT_PREFIX));
-    assert!(error.contains("ambiguous withdrawal"));
+    // The kind now travels with the error instead of being read off its text.
+    assert!(matches!(error, FinalizerError::Permanent(_)), "unexpected kind: {error:?}");
+    assert!(error.message().starts_with(ICPSWAP_FINALIZER_PERMANENT_PREFIX));
+    assert!(error.message().contains("ambiguous withdrawal"));
 }
 
 #[tokio::test]
