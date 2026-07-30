@@ -10,6 +10,7 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use crate::finalizers::liquidation_outcome::LiquidationOutcome;
+use crate::finalizers::multi_venue::MEXC_VENUE_ID;
 use crate::persistance::{
     FinalizerMetaPayload, FinalizerMetaV2, LiqMetaWrapper, ResultStatus, VenueExecutionState, VenueLegState,
     WalProfitSnapshot,
@@ -408,6 +409,10 @@ fn append_venue_leg_summary(lines: &mut Vec<Line<'static>>, leg: &VenueLegState,
     )));
     lines.push(Line::from(format!("   Route: {}", leg.quote.route_id)));
 
+    if leg.venue_id == MEXC_VENUE_ID {
+        append_mexc_leg_transactions(lines, &leg.execution);
+    }
+
     if let Some(result) = &leg.result {
         let mut received = leg.quote.estimated_receive.clone();
         received.value = result.receive_amount.clone();
@@ -421,6 +426,33 @@ fn append_venue_leg_summary(lines: &mut Vec<Line<'static>>, leg: &VenueLegState,
             format!("   Last error: {error}"),
             Style::default().fg(Color::Red),
         )));
+    }
+}
+
+/// Shows transaction identifiers from the MEXC state stored inside a
+/// multi-venue leg. These are not present in the legacy top-level `meta` bytes.
+fn append_mexc_leg_transactions(lines: &mut Vec<Line<'static>>, execution: &VenueExecutionState) {
+    // Current multi-venue MEXC state wraps the existing CEX state in `cex`.
+    // Falling back to the root keeps this readable if an older direct CEX
+    // state was persisted in the venue envelope.
+    let cex = execution.state.get("cex").unwrap_or(&execution.state);
+    let fields = [
+        ("deposit_txid", "MEXC deposit txid"),
+        ("deposit_bridge_id", "MEXC deposit bridge txid"),
+        ("withdraw_id", "MEXC withdraw id"),
+        ("withdraw_txid", "MEXC withdraw txid"),
+        ("withdraw_bridge_id", "MEXC withdraw bridge txid"),
+    ];
+
+    for (field, label) in fields {
+        if let Some(value) = cex
+            .get(field)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            lines.push(Line::from(format!("   {label}: {value}")));
+        }
     }
 }
 
@@ -814,7 +846,16 @@ mod tests {
             },
             execution: VenueExecutionState {
                 venue: "mexc".to_string(),
-                state: serde_json::json!({ "cex": { "step": "WithdrawPending" } }),
+                state: serde_json::json!({
+                    "cex": {
+                        "step": "WithdrawPending",
+                        "deposit_txid": "ic-ledger-deposit-123",
+                        "deposit_bridge_id": "bridge-deposit-456",
+                        "withdraw_id": "mexc-withdraw-789",
+                        "withdraw_txid": "ic-ledger-withdraw-987",
+                        "withdraw_bridge_id": "bridge-withdraw-654"
+                    }
+                }),
             },
             status: VenueLegStatus::Running,
             result: None,
@@ -829,6 +870,15 @@ mod tests {
         assert!(text.iter().any(|line| line == "   Allocation: ICP: 7.20"));
         assert!(text.iter().any(|line| line.contains("impact 12.50 bps")));
         assert!(text.iter().any(|line| line == "   Route: ICP_USDC"));
+        assert!(text.iter().any(|line| line == "   MEXC deposit txid: ic-ledger-deposit-123"));
+        assert!(text
+            .iter()
+            .any(|line| line == "   MEXC deposit bridge txid: bridge-deposit-456"));
+        assert!(text.iter().any(|line| line == "   MEXC withdraw id: mexc-withdraw-789"));
+        assert!(text.iter().any(|line| line == "   MEXC withdraw txid: ic-ledger-withdraw-987"));
+        assert!(text
+            .iter()
+            .any(|line| line == "   MEXC withdraw bridge txid: bridge-withdraw-654"));
         assert!(text.iter().any(|line| line == "   Last error: waiting for bridge"));
     }
 
