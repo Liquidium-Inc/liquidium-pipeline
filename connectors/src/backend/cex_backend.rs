@@ -1,5 +1,19 @@
 use async_trait::async_trait;
 
+/// Marks a venue error that means "not ready yet", not "this order failed".
+///
+/// A CEX credits a deposit into its account service and into its matching
+/// engine at different moments, so the balance API can report funds the order
+/// book still refuses to trade. Only the venue knows when that gap closes, and
+/// it says so by rejecting the order. Errors carrying this prefix must be
+/// waited out under a deadline rather than counted against a retry budget.
+pub const CEX_PENDING_SETTLEMENT_PREFIX: &str = "cex pending settlement: ";
+
+/// Reports whether a backend error asks the caller to wait for the venue.
+pub fn is_cex_pending_settlement_error(message: &str) -> bool {
+    message.starts_with(CEX_PENDING_SETTLEMENT_PREFIX)
+}
+
 #[derive(Debug, Clone)]
 pub struct DepositAddress {
     pub asset: String,

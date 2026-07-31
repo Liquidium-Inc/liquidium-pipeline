@@ -1,11 +1,13 @@
 use async_trait::async_trait;
 use liquidium_pipeline_connectors::backend::bridge_backend::FINALIZER_PERMANENT_AMOUNT_FLOOR_PREFIX;
-use liquidium_pipeline_connectors::backend::cex_backend::CexBackend;
+use liquidium_pipeline_connectors::backend::cex_backend::{CexBackend, is_cex_pending_settlement_error};
+use log::{info, warn};
 use serde::{Deserialize, Serialize};
 
 use super::mexc_finalizer::MexcFinalizer;
 use crate::{
     finalizers::{
+        bridge_planner::BridgePlanner,
         cex_finalizer::{CexFinalizerLogic, CexState, CexStep},
         multi_venue::{
             MultiVenueAdapter, VenueLegCheckpoint, VenueLegProgress, VenuePlanningContext, VenueRoutePreview,
@@ -13,9 +15,19 @@ use crate::{
     },
     persistance::{VenueExecutionState, VenueLegState, VenueLegStatus},
     swappers::model::SwapRequest,
+    utils::now_ts,
 };
 
 const VENUE_ID: &str = "mexc";
+
+/// How long a leg keeps re-offering an order that MEXC rejects as not yet
+/// tradable before an operator has to look at it.
+///
+/// Deposit credit and matching-engine availability are minutes apart on MEXC,
+/// while the finalizer's retry budget is spent in about two, so the wait has to
+/// live here rather than in the retry counter. The deadline still bounds it:
+/// an account that is genuinely short never resolves and must not loop forever.
+const SETTLEMENT_WAIT_TIMEOUT_SECS: i64 = 15 * 60;
 
 /// MEXC's complete venue-local state plus a persistence gate. The gate makes
 /// every call that may submit a transfer, order, withdrawal, or bridge request
@@ -132,13 +144,69 @@ where
 
         let result = self.advance_current_step(&mut execution.cex).await;
         let error = result.err();
-        if let Some(error) = &error {
-            execution.cex.last_error = Some(error.clone());
-            if error.starts_with(FINALIZER_PERMANENT_AMOUNT_FLOOR_PREFIX) {
-                execution.cex.step = CexStep::Failed;
+        match &error {
+            Some(error) => {
+                execution.cex.last_error = Some(error.clone());
+                if error.starts_with(FINALIZER_PERMANENT_AMOUNT_FLOOR_PREFIX) {
+                    execution.cex.step = CexStep::Failed;
+                } else if is_cex_pending_settlement_error(error) {
+                    return self.settlement_wait_progress(execution, error.clone()).await;
+                }
             }
+            // Any step that completes without an error proves the venue is
+            // caught up, so a later wait starts from its own first refusal.
+            None => execution.cex.trade.trade_settlement_waiting_since_ts = None,
         }
         self.progress_for(execution, error)
+    }
+
+    /// Holds a leg whose funds the venue reports as not tradable yet.
+    ///
+    /// Nothing failed here: MEXC accepted the deposit into the account balance
+    /// but its matching engine still refuses to trade it, and only the venue
+    /// can say when that changes. The leg therefore keeps its `Running` status
+    /// and reports no retryable error, so the orchestrator re-offers the same
+    /// order under the same client id on later cycles without spending the
+    /// finalization retry budget. The error stays in `last_error` for the TUI.
+    async fn settlement_wait_progress(
+        &self,
+        mut execution: MexcVenueExecutionState,
+        error: String,
+    ) -> Result<VenueLegProgress, String> {
+        let now = now_ts();
+        let waiting_since = *execution.cex.trade.trade_settlement_waiting_since_ts.get_or_insert(now);
+        let waited = now.saturating_sub(waiting_since);
+
+        if waited < SETTLEMENT_WAIT_TIMEOUT_SECS {
+            info!(
+                "[mexc] liq_id={} waiting for venue settlement: waited={}s timeout={}s err={}",
+                execution.cex.liq_id, waited, SETTLEMENT_WAIT_TIMEOUT_SECS, error
+            );
+            return Ok(VenueLegProgress {
+                execution: VenueExecutionState::new(VENUE_ID, &execution)?,
+                status: VenueLegStatus::Running,
+                result: None,
+                last_error: Some(error),
+                retryable_error: None,
+            });
+        }
+
+        // The wait is over and the venue never released the funds. One balance
+        // read costs nothing here and tells the operator which case they have:
+        // funds present and stuck, or an account that never held them.
+        let asset = <Self as BridgePlanner>::planned_deposit_asset(&execution.cex);
+        let observed = match self.backend.get_balance(&asset).await {
+            Ok(balance) => format!("{}", balance),
+            Err(balance_error) => format!("unavailable ({})", balance_error),
+        };
+        warn!(
+            "[mexc] liq_id={} venue settlement wait expired after {}s free_{}={} err={}",
+            execution.cex.liq_id, waited, asset, observed, error
+        );
+        self.operator_required_progress(
+            execution,
+            format!("MEXC leg not settled after {waited}s: {error} (free {asset}={observed})"),
+        )
     }
 
     /// Maps the detailed CEX state onto the generic leg status and creates a
