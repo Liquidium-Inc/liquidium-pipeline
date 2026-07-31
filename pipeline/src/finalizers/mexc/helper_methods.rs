@@ -84,12 +84,19 @@ where
                 let observed_balance_delta = current_balance - baseline_balance;
                 if observed_balance_delta >= expected_floor {
                     if state.deposit.bridge.deposit_bridge_required {
-                        let cap = state
-                            .deposit
-                            .bridge
-                            .deposit_bridge_submit_amount
-                            .unwrap_or(expected_deposit_amount);
-                        state.trade.trade_next_amount_in = Some(observed_balance_delta.max(0.0).min(cap));
+                        // Cap at what this deposit can actually credit: the
+                        // post-fee expected amount. The bridge submit amount is
+                        // the pre-fee gross and is unreachable, because the
+                        // minter takes its withdrawal fee out of the transfer in
+                        // transit.
+                        //
+                        // The delta only reaches this ceiling when it is
+                        // contaminated — a concurrent deposit landing on the
+                        // same account inflates it beyond what this leg sent.
+                        // Capping on the gross would then size the trade above
+                        // what arrived and the venue rejects it as oversold.
+                        state.trade.trade_next_amount_in =
+                            Some(observed_balance_delta.max(0.0).min(expected_deposit_amount));
                     }
                     info!(
                         "[mexc] liq_id={} deposit confirmed: before={} after={} expected={}",
