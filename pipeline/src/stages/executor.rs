@@ -145,16 +145,22 @@ impl<'a, A: PipelineAgent, D: WalStore> PipelineStage<'a, Vec<ExecutorRequest>, 
                     return Ok::<ExecutionReceipt, String>(receipt);
                 }
 
+                // The change transfer returns the unspent part of the debt
+                // tokens we sent. That is our money, but it is not on the
+                // critical path: the collateral leg below is what has to be
+                // swapped and finalized. Returning here dropped the receipt
+                // before it reached the WAL, and the WAL is the only handoff to
+                // the finalizer -- so the liquidation settled on-chain and then
+                // was never touched again, leaving the collateral stranded.
                 if matches!(
                     liq.change_tx.status,
                     TransferStatus::Failed(_) | TransferStatus::Pending
                 ) {
-                    info!(
-                        "[executor] 💱 change_tx status={:?} liq_id={}",
+                    warn!(
+                        "[executor] 💱 change not received; continuing with the collateral leg | change_tx status={:?} liq_id={}",
                         liq.change_tx.status, liq.id
                     );
                     receipt.change_received = false;
-                    return Ok::<ExecutionReceipt, String>(receipt);
                 }
 
                 match &liq.collateral_tx.status {
@@ -339,6 +345,12 @@ mod tests {
         }
     }
 
+    fn wal_accepting_upserts(expected: usize) -> MockWalStore {
+        let mut wal = MockWalStore::new();
+        wal.expect_upsert_result().times(expected).returning(|_| Ok(()));
+        wal
+    }
+
     #[tokio::test]
     async fn executor_calls_liquidate_with_slippage_without_allowance_preflight() {
         let lending_canister = p("nja4y-2yaaa-aaaae-qddxa-cai");
@@ -371,7 +383,7 @@ mod tests {
                 subaccount: None,
             },
             lending_canister,
-            Arc::new(MockWalStore::new()),
+            Arc::new(wal_accepting_upserts(2)),
             Arc::new(ApprovalState::new()),
         );
 
@@ -411,5 +423,62 @@ mod tests {
             "second request should continue and execute"
         );
         assert!(receipts[1].liquidation_result.is_some());
+    }
+
+    /// A pending change transfer used to return before `store_to_wal`, and the
+    /// WAL is the only handoff to the finalizer -- the collateral was received
+    /// on-chain and then nothing ever swapped it. The row must be enqueued.
+    #[tokio::test]
+    async fn pending_change_still_enqueues_the_collateral_leg_in_the_wal() {
+        let lending_canister = p("nja4y-2yaaa-aaaae-qddxa-cai");
+
+        let mut agent = MockPipelineAgent::new();
+        agent
+            .expect_call_update::<Result<LiquidationResult, ProtocolError>>()
+            .times(1)
+            .returning(move |_, _, _| Ok(Ok(make_liquidation_result(1_556u128))));
+
+        let mut wal = MockWalStore::new();
+        wal.expect_upsert_result()
+            .withf(|row| row.id == "1556" && row.status == ResultStatus::Enqueued)
+            .times(1)
+            .returning(|_| Ok(()));
+
+        let executor = BasicExecutor::new(
+            Arc::new(agent),
+            Account {
+                owner: p("2vxsx-fae"),
+                subaccount: None,
+            },
+            lending_canister,
+            Arc::new(wal),
+            Arc::new(ApprovalState::new()),
+        );
+
+        let request = make_request(
+            p("2vxsx-fae"),
+            ChainToken::Icp {
+                ledger: p("ryjl3-tyaaa-aaaaa-aaaba-cai"),
+                symbol: "ICP".to_string(),
+                decimals: 8,
+                fee: Nat::from(10_000u64),
+            },
+        );
+
+        let receipts = executor
+            .process(&vec![request])
+            .await
+            .expect("executor process should succeed");
+
+        assert_eq!(receipts.len(), 1);
+        assert!(
+            !receipts[0].change_received,
+            "pending change must stay visible on the receipt"
+        );
+        assert!(
+            matches!(receipts[0].status, ExecutionStatus::Success),
+            "a pending change does not fail the liquidation, status was {:?}",
+            receipts[0].status
+        );
     }
 }
