@@ -241,6 +241,7 @@ pub(crate) fn bootstrap_control_plane(
         .with_context(|| format!("initialize control socket at {}", sock_path.display()))?;
 
     let state_store = control_state_store.clone();
+    let termination_watchdog = lifecycle_watchdog.clone();
     tokio::spawn(async move {
         let on_transition = Arc::new(move |is_paused: bool| {
             if let Err(err) = state_store.set_daemon_paused(is_paused) {
@@ -255,10 +256,7 @@ pub(crate) fn bootstrap_control_plane(
                         "Liquidation initiation suspended; queued finalization and housekeeping continue.".to_string(),
                     )
                 } else {
-                    (
-                        "resumed".to_string(),
-                        "Liquidation initiation enabled.".to_string(),
-                    )
+                    ("resumed".to_string(), "Liquidation initiation enabled.".to_string())
                 };
                 tokio::spawn(async move {
                     watchdog.notify(WatchdogEvent::Lifecycle { state, details }).await;
@@ -269,7 +267,21 @@ pub(crate) fn bootstrap_control_plane(
         if let Err(err) =
             crate::control_plane::serve_bound_listener_with_hook(control_listener, paused, Some(on_transition)).await
         {
+            // The accept loop already retries transient failures, so reaching
+            // here means the socket is unusable and pause/resume is gone for
+            // this process lifetime. Liquidations keep running, which is why
+            // this has to be escalated rather than left in the log.
             tracing::error!("Control plane terminated: {}", err);
+            if let Some(watchdog) = termination_watchdog {
+                watchdog
+                    .notify(WatchdogEvent::Lifecycle {
+                        state: "degraded".to_string(),
+                        details: format!(
+                            "Control plane terminated: {err}. Liquidations continue, but pause/resume is unavailable until restart."
+                        ),
+                    })
+                    .await;
+            }
         }
     });
 
