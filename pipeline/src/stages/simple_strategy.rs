@@ -496,6 +496,17 @@ where
                 continue;
             }
 
+            // The canister settles at most the liquidation-ratio cap and returns
+            // the remainder as change, so the request below is deliberately
+            // oversized. `received_collateral` is paired with the repay figure
+            // the estimator actually chose -- `compute_liquidation_amounts`
+            // derives the seize from the capped repay -- so the profit basis has
+            // to stay on that figure. Charging the oversized request against
+            // collateral from a capped repayment understates profit by the
+            // change we get back, which mislabels profitable liquidations as bad
+            // debt.
+            let expected_repaid_debt = estimation.repaid_debt.clone();
+
             // Add only explicitly configured repay buffers; unspecified assets get no bump.
             let repay_buffer = repay_buffer_native_units(&repayment_token.symbol())
                 .map(Nat::from)
@@ -554,7 +565,7 @@ where
             let inverse_price = if price > 0.0 { 1.0 / price } else { 0.0 };
             info!(
                 "💱 Quote: repay_debt={} {} | seized_collateral={} {} | estimated_swap_out={} {} | price={} inverse_price={} | swap={} -> {}",
-                Self::native_to_units(&estimation.repaid_debt, repayment_token.decimals()),
+                Self::native_to_units(&expected_repaid_debt, repayment_token.decimals()),
                 repayment_token.symbol(),
                 Self::native_to_units(&estimation.received_collateral, collateral_token.decimals()),
                 collateral_token.symbol(),
@@ -567,7 +578,7 @@ where
             );
 
             let profit = Int::from(amount_received)
-                - Int::from(estimation.repaid_debt.clone())
+                - Int::from(expected_repaid_debt.clone())
                 - Int::from(debt_fee_total.clone());
             let is_bad_debt = profit <= 0;
             let buy_bad_debt = is_bad_debt;
@@ -636,8 +647,13 @@ where
             }
 
             if is_bad_debt && self.config.should_buy_bad_debt() {
+                // The request is oversized on purpose; the canister caps the
+                // settlement and returns the difference as change. Reporting the
+                // request alone reads as if we spent twice what we did.
                 info!(
-                    "🧯 Buying bad debt: repaid={} {}",
+                    "🧯 Buying bad debt: expected_repaid={} {} | requested={} {}",
+                    Self::native_to_units(&expected_repaid_debt, repayment_token.decimals()),
+                    repayment_token.symbol(),
                     Self::native_to_units(&estimation.repaid_debt, repayment_token.decimals()),
                     repayment_token.symbol()
                 );
@@ -1244,6 +1260,106 @@ mod tests {
             res[0].liquidation.debt_amount,
             Nat::from(305_000_000_000u64),
             "wipeout full-close offer should add a 300 gwei buffer for 18-decimal debt"
+        );
+    }
+
+    /// The canister settles at most the liquidation-ratio cap and returns the
+    /// rest as change, so the request is deliberately oversized. Profit must
+    /// still be charged against the repay the estimator paired the collateral
+    /// with -- billing the oversized request instead turned profitable
+    /// liquidations into bad debt and dropped them.
+    #[tokio::test]
+    async fn profit_basis_uses_the_expected_settlement_not_the_oversized_request() {
+        let ledger = p("mxzaz-hqaaa-aaaar-qaada-cai");
+        let token = mk_icp_token("ckBTC", 8);
+
+        let mut registry = MockTokenRegistryTrait::new();
+        registry
+            .expect_get()
+            .returning(move |_id: &AssetId| Some(token.clone()));
+
+        let mut cfg = MockConfigTrait::new();
+        let trader = p("aaaaa-aa");
+        cfg.expect_get_trader_principal().return_const(trader);
+        cfg.expect_get_liquidator_principal().return_const(trader);
+        // Bad-debt buying is off, so a mislabelled liquidation is dropped
+        // outright -- which is exactly what used to happen here.
+        cfg.expect_should_buy_bad_debt().return_const(false);
+        cfg.expect_get_max_allowed_dex_slippage().return_const(2000u32);
+        cfg.expect_get_lending_canister()
+            .return_const(p("mxzaz-hqaaa-aaaar-qaada-cai"));
+        // Only reached if this gets misclassified as bad debt; stubbed so the
+        // regression surfaces as a failed assertion rather than a mock panic.
+        cfg.expect_get_bad_debt_collateral_slippage_bps().return_const(100u32);
+
+        // The estimator caps the repay and sizes the seized collateral to that
+        // capped figure -- the pairing the profit basis has to respect.
+        let mut collateral = MockCollateralServiceTrait::new();
+        collateral
+            .expect_calculate_liquidation_amounts()
+            .returning(|_max_balance, _debt_pos, _coll_pos, _user| {
+                Ok(LiquidationEstimation {
+                    received_collateral: Nat::from(1_100_000u64),
+                    repaid_debt: Nat::from(1_000_000u64),
+                    ref_price: Nat::from(0u8),
+                    debt_price: Nat::from(0u8),
+                })
+            });
+
+        let mut account = MockAccountInfo::new();
+        account.expect_sync_balance().returning(move |_t: &ChainToken| {
+            Ok(ChainTokenAmount {
+                token: _t.clone(),
+                value: Nat::from(10_000_000u64),
+            })
+        });
+        account.expect_get_balance().returning(move |_t: &ChainToken| {
+            Ok(ChainTokenAmount {
+                token: _t.clone(),
+                value: Nat::from(10_000_000u64),
+            })
+        });
+
+        let registry = Arc::new(registry);
+        let account = Arc::new(account);
+        let balance_service = Arc::new(BalanceService::new(registry.clone(), account.clone()));
+
+        let strategy = SimpleLiquidationStrategy::new(
+            Arc::new(cfg),
+            registry.clone(),
+            Arc::new(collateral),
+            balance_service,
+            Arc::new(ApprovalState::new()),
+        );
+
+        let pool = p("mxzaz-hqaaa-aaaar-qaada-cai");
+        let borrower = p("user-capped-repay");
+        // Position debt is double what the estimator will settle, so the repay
+        // buffer override doubles the request.
+        let pos = mk_position(pool, borrower, ledger, 2_000_000, 4_000_000, Assets::BTC);
+        let user = mk_user(vec![pos], 2_000_000, 900);
+
+        let res = strategy.process(&vec![user]).await.unwrap();
+
+        assert_eq!(
+            res.len(),
+            1,
+            "a profitable liquidation must survive even though the request is oversized"
+        );
+        assert_eq!(
+            res[0].liquidation.debt_amount,
+            Nat::from(2_000_010u64),
+            "the request stays oversized on purpose; the canister returns the change"
+        );
+        assert!(
+            !res[0].liquidation.buy_bad_debt,
+            "profitable at the settled repay, so it is not bad debt"
+        );
+        // collateral 1_100_000 - 100 fee, less the 1_000_000 settled repay and
+        // two 100-unit debt fees (transfer + approval).
+        assert_eq!(
+            res[0].expected_profit, 99_700i128,
+            "profit is charged against the settled repay, not the oversized request"
         );
     }
 
