@@ -3,9 +3,11 @@ use icrc_ledger_types::icrc1::account::Account;
 use std::{
     collections::{HashMap, HashSet},
     path::PathBuf,
+    process::ExitCode,
     sync::{Arc, atomic::AtomicBool},
     time::Duration,
 };
+use tokio::time::sleep;
 use tracing::instrument;
 use tracing::{info, warn};
 
@@ -52,6 +54,13 @@ use liquidium_pipeline_core::{
 };
 
 const BRIDGE_CKETH_LEDGER_ID: &str = "ss2fx-dyaaa-aaaar-qacoq-cai";
+
+/// Cadence at which the settlement watcher polls the WAL for rows awaiting
+/// on-chain confirmation.
+const SETTLEMENT_POLL_INTERVAL: Duration = Duration::from_secs(3);
+
+/// Cooldown before the settlement watcher supervisor respawns a dead task.
+const SETTLEMENT_RESTART_DELAY: Duration = Duration::from_secs(5);
 
 fn disabled_venue_ids<'a>(
     outcome: &MultiVenueExecutionOutcome,
@@ -322,7 +331,12 @@ fn bridge_low_balance_service(ctx: &PipelineContext) -> Arc<BalanceService> {
     Arc::new(BalanceService::new(Arc::new(registry), ctx.bridge_service.accounts()))
 }
 
-pub async fn run_liquidation_loop(sock_path: PathBuf) {
+/// Boots and runs the daemon.
+///
+/// Returns [`ExitCode::FAILURE`] for every fatal startup fault. Reporting these
+/// as a clean exit would make a permanently broken configuration look like a
+/// successful shutdown to any supervisor that distinguishes the two.
+pub async fn run_liquidation_loop(sock_path: PathBuf) -> ExitCode {
     // Auditor note:
     // This function is the foreground daemon entrypoint. It does not fork/detach;
     // lifecycle is expected to be managed by an external supervisor (systemd).
@@ -335,7 +349,7 @@ pub async fn run_liquidation_loop(sock_path: PathBuf) {
         Ok(ctx) => ctx,
         Err(err) => {
             tracing::error!("Failed to initialize pipeline context: {}", err);
-            return;
+            return ExitCode::FAILURE;
         }
     };
     let ctx = Arc::new(ctx);
@@ -348,7 +362,7 @@ pub async fn run_liquidation_loop(sock_path: PathBuf) {
             "Startup filesystem preflight failed: {}",
             err
         );
-        return;
+        return ExitCode::FAILURE;
     }
 
     if config.buy_bad_debt {
@@ -384,7 +398,7 @@ pub async fn run_liquidation_loop(sock_path: PathBuf) {
         Ok(stages) => stages,
         Err(err) => {
             tracing::error!("Failed to initialize pipeline stages: {}", err);
-            return;
+            return ExitCode::FAILURE;
         }
     };
 
@@ -392,20 +406,40 @@ pub async fn run_liquidation_loop(sock_path: PathBuf) {
         Ok(wal) => Arc::new(wal),
         Err(err) => {
             tracing::error!("Failed to init watcher WAL: {}", err);
-            return;
+            return ExitCode::FAILURE;
         }
     };
 
     // Settlement watcher is intentionally independent from pause/resume.
     // Even while paused, it can continue reconciling previously-started work.
-    let watcher = SettlementWatcher::new(
-        watcher_wal,
-        ctx.agent.clone(),
-        config.lending_canister,
-        Duration::from_secs(3),
-    );
+    //
+    // `SettlementWatcher::run` contains per-sweep panics and stalls itself, so
+    // the supervisor below only covers the residual case where the task ends
+    // anyway. Losing it silently would strand in-flight liquidations in
+    // non-terminal WAL states while the daemon still looks healthy, so the task
+    // is restarted rather than dropped.
+    let watcher_agent = ctx.agent.clone();
+    let watcher_canister = config.lending_canister;
+    tokio::spawn(async move {
+        loop {
+            let watcher = SettlementWatcher::new(
+                watcher_wal.clone(),
+                watcher_agent.clone(),
+                watcher_canister,
+                SETTLEMENT_POLL_INTERVAL,
+            );
 
-    tokio::spawn(async move { watcher.run().await });
+            match tokio::spawn(watcher.run()).await {
+                Ok(()) => tracing::error!("Settlement watcher exited unexpectedly; restarting"),
+                Err(err) if err.is_panic() => {
+                    tracing::error!("Settlement watcher panicked; restarting: {}", err);
+                }
+                Err(err) => tracing::error!("Settlement watcher task ended; restarting: {}", err),
+            }
+
+            sleep(SETTLEMENT_RESTART_DELAY).await;
+        }
+    });
 
     let debt_asset_principals = debt_asset_principals(&ctx.registry);
     let debt_assets = debt_assets_as_text(&debt_asset_principals);
@@ -435,7 +469,7 @@ pub async fn run_liquidation_loop(sock_path: PathBuf) {
     // - state persistence on pause/resume transitions
     if let Err(err) = bootstrap_control_plane(&sock_path, &config.db_path, paused.clone(), slack_watchdog.clone()) {
         tracing::error!("{}", err);
-        return;
+        return ExitCode::FAILURE;
     }
     info!(sock_path = %sock_path.display(), "Control plane ready");
 
@@ -489,6 +523,9 @@ pub async fn run_liquidation_loop(sock_path: PathBuf) {
         ui_enabled,
     )
     .await;
+
+    // `run_daemon_cycle_loop` never returns; this keeps the signature honest.
+    ExitCode::SUCCESS
 }
 
 #[allow(dead_code)]

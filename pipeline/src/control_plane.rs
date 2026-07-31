@@ -20,12 +20,23 @@ use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use anyhow::{Context as _, bail};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
+use tokio::time::sleep;
 
 const MAX_COMMAND_LEN: usize = 32;
+
+/// Backoff between `accept` retries after a transient failure.
+const ACCEPT_RETRY_DELAY: Duration = Duration::from_millis(100);
+
+/// Consecutive transient `accept` failures tolerated before giving up. At
+/// [`ACCEPT_RETRY_DELAY`] this is roughly ten seconds of sustained failure,
+/// which no longer looks transient.
+const MAX_CONSECUTIVE_ACCEPT_ERRORS: u32 = 100;
+
 type TransitionHook = Arc<dyn Fn(bool) + Send + Sync + 'static>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -80,13 +91,43 @@ pub async fn serve_bound_listener(listener: UnixListener, paused: Arc<AtomicBool
     serve_bound_listener_with_hook(listener, paused, None).await
 }
 
+/// Serves the control socket until the listener becomes unusable.
+///
+/// Auditor notes: `accept` can fail for reasons that leave the listener
+/// perfectly valid — a client vanishing mid-handshake, or the process hitting
+/// its descriptor limit. Propagating those would permanently disable
+/// pause/resume for the lifetime of the daemon, so they are retried with a
+/// backoff and only a sustained run of failures is treated as fatal.
 pub async fn serve_bound_listener_with_hook(
     listener: UnixListener,
     paused: Arc<AtomicBool>,
     on_transition: Option<TransitionHook>,
 ) -> anyhow::Result<()> {
+    let mut consecutive_errors: u32 = 0;
+
     loop {
-        let (stream, _) = listener.accept().await.context("accept control client")?;
+        let stream = match listener.accept().await {
+            Ok((stream, _)) => {
+                consecutive_errors = 0;
+                stream
+            }
+            Err(err) if is_transient_accept_error(&err) => {
+                consecutive_errors = consecutive_errors.saturating_add(1);
+                if consecutive_errors >= MAX_CONSECUTIVE_ACCEPT_ERRORS {
+                    return Err(err).with_context(|| {
+                        format!("accept control client failed {consecutive_errors} times consecutively")
+                    });
+                }
+                tracing::warn!(
+                    consecutive_errors,
+                    "accept control client failed transiently; retrying: {err}"
+                );
+                sleep(ACCEPT_RETRY_DELAY).await;
+                continue;
+            }
+            Err(err) => return Err(err).context("accept control client"),
+        };
+
         let paused = paused.clone();
         let on_transition = on_transition.clone();
         tokio::spawn(async move {
@@ -95,6 +136,21 @@ pub async fn serve_bound_listener_with_hook(
             }
         });
     }
+}
+
+/// Classifies `accept` failures that leave the listener usable.
+///
+/// `EMFILE`/`ENFILE` have no `ErrorKind` variant and surface as
+/// `Uncategorized`, so they are matched on errno instead; both values are
+/// identical on Linux and macOS.
+fn is_transient_accept_error(err: &std::io::Error) -> bool {
+    const EMFILE: i32 = 24;
+    const ENFILE: i32 = 23;
+
+    matches!(
+        err.kind(),
+        ErrorKind::ConnectionAborted | ErrorKind::Interrupted | ErrorKind::WouldBlock | ErrorKind::OutOfMemory
+    ) || matches!(err.raw_os_error(), Some(EMFILE) | Some(ENFILE))
 }
 
 #[allow(dead_code)]
@@ -299,10 +355,52 @@ mod tests {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tokio::net::UnixStream;
 
-    use super::{ControlCommand, bind_control_listener, run_control_server, send_control_command};
+    use super::{
+        ControlCommand, bind_control_listener, is_transient_accept_error, run_control_server, send_control_command,
+    };
 
     fn sock_path(tmp: &TempDir) -> std::path::PathBuf {
         tmp.path().join("ctl.sock")
+    }
+
+    /// Failures that leave the listener usable must not end the accept loop:
+    /// doing so would disable pause/resume for the rest of the process lifetime
+    /// while liquidations keep running.
+    #[test]
+    fn recoverable_accept_failures_are_classified_transient() {
+        for kind in [
+            std::io::ErrorKind::ConnectionAborted,
+            std::io::ErrorKind::Interrupted,
+            std::io::ErrorKind::WouldBlock,
+            std::io::ErrorKind::OutOfMemory,
+        ] {
+            assert!(
+                is_transient_accept_error(&std::io::Error::new(kind, "transient")),
+                "{kind:?} should be retried"
+            );
+        }
+
+        // EMFILE / ENFILE: descriptor exhaustion, surfaced only as an errno.
+        for errno in [24, 23] {
+            assert!(
+                is_transient_accept_error(&std::io::Error::from_raw_os_error(errno)),
+                "errno {errno} should be retried"
+            );
+        }
+    }
+
+    #[test]
+    fn unrecoverable_accept_failures_are_classified_fatal() {
+        for kind in [
+            std::io::ErrorKind::InvalidInput,
+            std::io::ErrorKind::PermissionDenied,
+            std::io::ErrorKind::NotConnected,
+        ] {
+            assert!(
+                !is_transient_accept_error(&std::io::Error::new(kind, "fatal")),
+                "{kind:?} should not be retried"
+            );
+        }
     }
 
     fn skip_if_uds_unsupported(tmp: &TempDir) -> bool {
