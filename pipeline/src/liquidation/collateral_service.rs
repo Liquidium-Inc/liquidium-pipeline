@@ -10,7 +10,7 @@ use crate::{
 };
 
 use liquidium_pipeline_core::types::protocol_types::{
-    Asset, LiquidateblePosition, LiquidatebleUser, MAX_LIQUIDATION_RATIO,
+    Asset, Assets, LiquidateblePosition, LiquidatebleUser, MAX_LIQUIDATION_RATIO,
 };
 
 pub(crate) const USD_QUOTE_CURRENCY: &str = "USDT";
@@ -33,6 +33,13 @@ pub trait CollateralServiceTrait: Send + Sync {
         collateral_position: &LiquidateblePosition,
         user: &mut LiquidatebleUser,
     ) -> Result<LiquidationEstimation, String>;
+
+    /// Oracle price of one whole unit of `asset`, in RAY.
+    ///
+    /// Exposed separately from the estimation pass so callers can rank
+    /// positions by what they are worth before committing to the much heavier
+    /// per-combo estimation.
+    async fn price_ray(&self, asset: &Assets) -> Result<Nat, String>;
 }
 
 pub struct CollateralService<P: PriceOracle> {
@@ -46,6 +53,15 @@ impl<P: PriceOracle> CollateralService<P> {
 }
 #[async_trait]
 impl<P: PriceOracle> CollateralServiceTrait for CollateralService<P> {
+    async fn price_ray(&self, asset: &Assets) -> Result<Nat, String> {
+        let symbol = asset.symbol();
+        self.price_oracle
+            .get_price(&symbol, USD_QUOTE_CURRENCY)
+            .await
+            .map(|(price_ray, _)| price_ray)
+            .map_err(|e| format!("Could not get price for {}: {}", symbol, e))
+    }
+
     async fn calculate_liquidation_amounts(
         &self,
         max_repay_amount: Nat,

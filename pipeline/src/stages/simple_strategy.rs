@@ -19,9 +19,9 @@ use liquidium_pipeline_core::{
         asset_id::AssetId, chain_token::ChainToken, chain_token_amount::ChainTokenAmount,
         token_registry::TokenRegistryTrait,
     },
-    types::protocol_types::{Asset, AssetType, LiquidateblePosition, LiquidatebleUser, LiquidationRequest},
+    types::protocol_types::{Asset, AssetType, Assets, LiquidateblePosition, LiquidatebleUser, LiquidationRequest},
 };
-use log::{debug, info};
+use log::{debug, info, warn};
 
 use num_traits::ToPrimitive;
 
@@ -113,6 +113,54 @@ where
         let threshold = max_for_ledger(ledger) / Nat::from(2u8);
         self.approval_state
             .needs_approval(*ledger, self.config.get_lending_canister(), &threshold)
+    }
+
+    /// Ranking weight for one leg of a combo.
+    ///
+    /// Ranking now consults the oracle for combos the main loop may never
+    /// evaluate -- an unsupported asset, a position with no balance to fund it.
+    /// A price we cannot fetch must therefore never sink the cycle, or one
+    /// borrower holding an unknown asset would block every liquidation in it.
+    /// The combo sorts last instead, and the loop's own gates handle it exactly
+    /// as they did before ranking consulted prices at all.
+    async fn ranking_value(&self, asset: &Assets, native_amount: &Nat, prices: &mut HashMap<String, Nat>) -> Nat {
+        match self.quote_value_ray(asset, native_amount, prices).await {
+            Ok(value) => value,
+            Err(err) => {
+                warn!(
+                    "Could not price {} for ranking; sorting this position last: {}",
+                    asset.symbol(),
+                    err
+                );
+                Nat::from(0u8)
+            }
+        }
+    }
+
+    /// Worth of `native_amount` of `asset`, in RAY, so positions denominated in
+    /// different tokens can be compared against each other.
+    ///
+    /// Prices are cached for the caller's cycle because the same handful of
+    /// assets recurs across every combo and each miss is a canister query.
+    async fn quote_value_ray(
+        &self,
+        asset: &Assets,
+        native_amount: &Nat,
+        prices: &mut HashMap<String, Nat>,
+    ) -> Result<Nat, String> {
+        let symbol = asset.symbol();
+        let price_ray = match prices.get(&symbol) {
+            Some(price) => price.clone(),
+            None => {
+                let price = self.collateral_service.price_ray(asset).await?;
+                prices.insert(symbol, price.clone());
+                price
+            }
+        };
+
+        // Dividing a RAY price by the token scale leaves the result in RAY,
+        // matching the convention `calculate_liquidation_amounts` uses.
+        Ok((price_ray * native_amount.clone()) / Nat::from(10u128.pow(asset.decimals())))
     }
 
     fn min_collateral_for_bad_debt(gross_collateral: Nat, slippage_bps: u32) -> Nat {
@@ -383,19 +431,47 @@ where
 
         // Build all candidate (user_idx, debt_position, collateral_position) combinations,
         // and collect pure bad-debt positions.
-        let (mut combos, bad_debts) = self.build_combos(&work_users);
+        let (combos, bad_debts) = self.build_combos(&work_users);
         let mut cleared_debts: HashSet<String> = HashSet::new();
 
-        // Sort by most urgent first: lowest health factor, then largest debt, then largest collateral
-        combos.sort_by(|(i1, d1, c1), (i2, d2, c2)| {
+        // Price every combo before ranking. Comparing `debt_amount` directly
+        // compares raw ledger integers across tokens with different decimals,
+        // so an 18-decimal dust position outranks an 8-decimal position worth
+        // twenty times more purely on scale -- which is how a $2.50 ckETH
+        // position got liquidated ahead of a $50 ICP one on the same borrower.
+        let mut prices: HashMap<String, Nat> = HashMap::new();
+        let mut priced = Vec::with_capacity(combos.len());
+        for (user_idx, debt_position, collateral_position) in combos {
+            let debt_value = self
+                .ranking_value(&debt_position.asset, &debt_position.debt_amount, &mut prices)
+                .await;
+            let collateral_value = self
+                .ranking_value(
+                    &collateral_position.asset,
+                    &collateral_position.collateral_amount,
+                    &mut prices,
+                )
+                .await;
+            priced.push((
+                user_idx,
+                debt_position,
+                collateral_position,
+                debt_value,
+                collateral_value,
+            ));
+        }
+
+        // Most urgent first: lowest health factor, then largest debt by value,
+        // then largest collateral by value.
+        priced.sort_by(|(i1, _, _, d1, c1), (i2, _, _, d2, c2)| {
             work_users[*i1]
                 .health_factor
                 .cmp(&work_users[*i2].health_factor)
-                .then(d2.debt_amount.cmp(&d1.debt_amount))
-                .then(c2.collateral_amount.cmp(&c1.collateral_amount))
+                .then(d2.cmp(d1))
+                .then(c2.cmp(c1))
         });
 
-        for (user_idx, debt_position, collateral_position) in combos {
+        for (user_idx, debt_position, collateral_position, _, _) in priced {
             let debt_key = format!("{}:{}", debt_position.account, debt_position.pool_id);
             if cleared_debts.contains(&debt_key) {
                 continue;
@@ -768,6 +844,11 @@ mod tests {
 
         // Collateral service: repay 1_000, receive 4_000 collateral
         let mut collateral = MockCollateralServiceTrait::new();
+        // Flat RAY price: these tests compare same-asset positions, so the
+        // value ranking reduces to the raw amounts they already assert on.
+        collateral
+            .expect_price_ray()
+            .returning(|_| Ok(Nat::from(1_000_000_000_000_000_000_000_000_000u128)));
         collateral
             .expect_calculate_liquidation_amounts()
             .returning(|_max_balance, _debt_pos, _coll_pos, _user| {
@@ -842,6 +923,11 @@ mod tests {
             .return_const(p("mxzaz-hqaaa-aaaar-qaada-cai"));
 
         let mut collateral = MockCollateralServiceTrait::new();
+        // Flat RAY price: these tests compare same-asset positions, so the
+        // value ranking reduces to the raw amounts they already assert on.
+        collateral
+            .expect_price_ray()
+            .returning(|_| Ok(Nat::from(1_000_000_000_000_000_000_000_000_000u128)));
         collateral
             .expect_calculate_liquidation_amounts()
             .returning(|_, _, _, _| panic!("collateral should not be called when balance fetch fails"));
@@ -896,6 +982,11 @@ mod tests {
             .return_const(p("mxzaz-hqaaa-aaaar-qaada-cai"));
 
         let mut collateral = MockCollateralServiceTrait::new();
+        // Flat RAY price: these tests compare same-asset positions, so the
+        // value ranking reduces to the raw amounts they already assert on.
+        collateral
+            .expect_price_ray()
+            .returning(|_| Ok(Nat::from(1_000_000_000_000_000_000_000_000_000u128)));
         collateral
             .expect_calculate_liquidation_amounts()
             .returning(|_, _, _, _| panic!("collateral should not be called for invalid asset type"));
@@ -983,6 +1074,11 @@ mod tests {
             .return_const(p("mxzaz-hqaaa-aaaar-qaada-cai"));
 
         let mut collateral = MockCollateralServiceTrait::new();
+        // Flat RAY price: these tests compare same-asset positions, so the
+        // value ranking reduces to the raw amounts they already assert on.
+        collateral
+            .expect_price_ray()
+            .returning(|_| Ok(Nat::from(1_000_000_000_000_000_000_000_000_000u128)));
         collateral
             .expect_calculate_liquidation_amounts()
             .returning(|_max_balance, _debt_pos, coll_pos, _user| {
@@ -1059,6 +1155,11 @@ mod tests {
             .return_const(p("mxzaz-hqaaa-aaaar-qaada-cai"));
 
         let mut collateral = MockCollateralServiceTrait::new();
+        // Flat RAY price: these tests compare same-asset positions, so the
+        // value ranking reduces to the raw amounts they already assert on.
+        collateral
+            .expect_price_ray()
+            .returning(|_| Ok(Nat::from(1_000_000_000_000_000_000_000_000_000u128)));
         collateral
             .expect_calculate_liquidation_amounts()
             .returning(|_, _, _, _| panic!("collateral should not be called when HF >= 1000"));
@@ -1125,6 +1226,11 @@ mod tests {
             .return_const(p("mxzaz-hqaaa-aaaar-qaada-cai"));
 
         let mut collateral = MockCollateralServiceTrait::new();
+        // Flat RAY price: these tests compare same-asset positions, so the
+        // value ranking reduces to the raw amounts they already assert on.
+        collateral
+            .expect_price_ray()
+            .returning(|_| Ok(Nat::from(1_000_000_000_000_000_000_000_000_000u128)));
         collateral
             .expect_calculate_liquidation_amounts()
             .returning(|_max_balance, _debt_pos, _coll_pos, _user| {
@@ -1212,6 +1318,11 @@ mod tests {
 
         let scanned_debt = Nat::from(5_000_000_000u64);
         let mut collateral = MockCollateralServiceTrait::new();
+        // Flat RAY price: these tests compare same-asset positions, so the
+        // value ranking reduces to the raw amounts they already assert on.
+        collateral
+            .expect_price_ray()
+            .returning(|_| Ok(Nat::from(1_000_000_000_000_000_000_000_000_000u128)));
         collateral.expect_calculate_liquidation_amounts().returning(
             move |_max_balance, _debt_pos, _coll_pos, _user| {
                 Ok(LiquidationEstimation {
@@ -1295,6 +1406,11 @@ mod tests {
         // The estimator caps the repay and sizes the seized collateral to that
         // capped figure -- the pairing the profit basis has to respect.
         let mut collateral = MockCollateralServiceTrait::new();
+        // Flat RAY price: these tests compare same-asset positions, so the
+        // value ranking reduces to the raw amounts they already assert on.
+        collateral
+            .expect_price_ray()
+            .returning(|_| Ok(Nat::from(1_000_000_000_000_000_000_000_000_000u128)));
         collateral
             .expect_calculate_liquidation_amounts()
             .returning(|_max_balance, _debt_pos, _coll_pos, _user| {
@@ -1405,6 +1521,11 @@ mod tests {
             .return_const(p("mxzaz-hqaaa-aaaar-qaada-cai"));
 
         let mut collateral = MockCollateralServiceTrait::new();
+        // Flat RAY price: these tests compare same-asset positions, so the
+        // value ranking reduces to the raw amounts they already assert on.
+        collateral
+            .expect_price_ray()
+            .returning(|_| Ok(Nat::from(1_000_000_000_000_000_000_000_000_000u128)));
         collateral
             .expect_calculate_liquidation_amounts()
             .returning(|_max_balance, _debt_pos, _coll_pos, _user| {
@@ -1499,6 +1620,11 @@ mod tests {
             .return_const(p("mxzaz-hqaaa-aaaar-qaada-cai"));
 
         let mut collateral = MockCollateralServiceTrait::new();
+        // Flat RAY price: these tests compare same-asset positions, so the
+        // value ranking reduces to the raw amounts they already assert on.
+        collateral
+            .expect_price_ray()
+            .returning(|_| Ok(Nat::from(1_000_000_000_000_000_000_000_000_000u128)));
         collateral
             .expect_calculate_liquidation_amounts()
             .returning(|_max_balance, _debt_pos, _coll_pos, _user| {
@@ -1570,6 +1696,11 @@ mod tests {
             .return_const(p("mxzaz-hqaaa-aaaar-qaada-cai"));
 
         let mut collateral = MockCollateralServiceTrait::new();
+        // Flat RAY price: these tests compare same-asset positions, so the
+        // value ranking reduces to the raw amounts they already assert on.
+        collateral
+            .expect_price_ray()
+            .returning(|_| Ok(Nat::from(1_000_000_000_000_000_000_000_000_000u128)));
         collateral
             .expect_calculate_liquidation_amounts()
             .returning(|_, _, _, _| panic!("collateral estimation should not run for pure bad debt"));
@@ -1633,6 +1764,11 @@ mod tests {
 
         // Collateral service returns fixed repay so we can control budgeting
         let mut collateral = MockCollateralServiceTrait::new();
+        // Flat RAY price: these tests compare same-asset positions, so the
+        // value ranking reduces to the raw amounts they already assert on.
+        collateral
+            .expect_price_ray()
+            .returning(|_| Ok(Nat::from(1_000_000_000_000_000_000_000_000_000u128)));
         collateral
             .expect_calculate_liquidation_amounts()
             .returning(|_max_balance, _debt_pos, _coll_pos, _user| {
@@ -1706,6 +1842,11 @@ mod tests {
 
         let mut calls = 0u32;
         let mut collateral = MockCollateralServiceTrait::new();
+        // Flat RAY price: these tests compare same-asset positions, so the
+        // value ranking reduces to the raw amounts they already assert on.
+        collateral
+            .expect_price_ray()
+            .returning(|_| Ok(Nat::from(1_000_000_000_000_000_000_000_000_000u128)));
         collateral.expect_calculate_liquidation_amounts().returning(
             move |_max_balance, _debt_pos, _coll_pos, user: &mut LiquidatebleUser| {
                 calls += 1;
@@ -1786,6 +1927,11 @@ mod tests {
 
         let mut first_called_for_low_hf = true;
         let mut collateral = MockCollateralServiceTrait::new();
+        // Flat RAY price: these tests compare same-asset positions, so the
+        // value ranking reduces to the raw amounts they already assert on.
+        collateral
+            .expect_price_ray()
+            .returning(|_| Ok(Nat::from(1_000_000_000_000_000_000_000_000_000u128)));
         collateral.expect_calculate_liquidation_amounts().returning(
             move |_max_balance, _debt_pos, _coll_pos, user: &mut LiquidatebleUser| {
                 if first_called_for_low_hf {
@@ -1846,6 +1992,210 @@ mod tests {
         let _ = strategy.process(&vec![high_hf_user, low_hf_user]).await.unwrap();
     }
 
+    /// Reproduces liquidations 1559-1561: one borrower with a dust ckETH debt
+    /// (18 decimals) and a far more valuable ICP debt (8 decimals). Comparing
+    /// `debt_amount` as raw ledger integers made 878_385_217_534_923 outrank
+    /// 1_095_934_098 by ~800_000x, so ~$2.50 of ckETH was liquidated ahead of
+    /// ~$50 of ICP -- and the ckETH collateral was too small to sell.
+    #[tokio::test]
+    async fn ranks_debt_positions_by_value_not_by_raw_ledger_units() {
+        let cketh_ledger = p("ss2fx-dyaaa-aaaar-qacoq-cai");
+        let icp_ledger = p(ICP_LEDGER_PRINCIPAL);
+        let ckbtc_ledger = p("mxzaz-hqaaa-aaaar-qaada-cai");
+
+        let mut registry = MockTokenRegistryTrait::new();
+        registry.expect_get().returning(move |id: &AssetId| {
+            Some(match id.symbol.as_str() {
+                "ETH" | "ckETH" => mk_icp_token("ckETH", 18),
+                "ICP" => mk_icp_token("ICP", 8),
+                _ => mk_icp_token("ckBTC", 8),
+            })
+        });
+
+        let mut cfg = MockConfigTrait::new();
+        let trader = p("aaaaa-aa");
+        cfg.expect_get_trader_principal().return_const(trader);
+        cfg.expect_get_liquidator_principal().return_const(trader);
+        cfg.expect_should_buy_bad_debt().return_const(false);
+        cfg.expect_get_max_allowed_dex_slippage().return_const(2000u32);
+        cfg.expect_get_lending_canister()
+            .return_const(p("mxzaz-hqaaa-aaaar-qaada-cai"));
+        cfg.expect_get_bad_debt_collateral_slippage_bps().return_const(100u32);
+
+        // Records which debt asset the estimator is asked about first.
+        let first_priced = Arc::new(std::sync::Mutex::new(None::<String>));
+        let sink = first_priced.clone();
+
+        let mut collateral = MockCollateralServiceTrait::new();
+        // ETH ~$3000, ICP ~$4.60, BTC ~$100k, all in RAY.
+        collateral.expect_price_ray().returning(|asset| {
+            Ok(match asset {
+                Assets::ETH => Nat::from(3_000_000_000_000_000_000_000_000_000_000u128),
+                Assets::ICP => Nat::from(4_600_000_000_000_000_000_000_000_000u128),
+                _ => Nat::from(100_000_000_000_000_000_000_000_000_000_000u128),
+            })
+        });
+        collateral
+            .expect_calculate_liquidation_amounts()
+            .returning(move |_max_balance, debt_pos, _coll_pos, _user| {
+                sink.lock().unwrap().get_or_insert_with(|| debt_pos.asset.symbol());
+                Ok(LiquidationEstimation {
+                    received_collateral: Nat::from(47_058u64),
+                    repaid_debt: debt_pos.debt_amount.clone(),
+                    ref_price: Nat::from(0u8),
+                    debt_price: Nat::from(0u8),
+                })
+            });
+
+        let mut account = MockAccountInfo::new();
+        account.expect_sync_balance().returning(move |_t: &ChainToken| {
+            Ok(ChainTokenAmount {
+                token: _t.clone(),
+                value: Nat::from(100_000_000_000_000_000_000u128),
+            })
+        });
+        account.expect_get_balance().returning(move |_t: &ChainToken| {
+            Ok(ChainTokenAmount {
+                token: _t.clone(),
+                value: Nat::from(100_000_000_000_000_000_000u128),
+            })
+        });
+
+        let registry = Arc::new(registry);
+        let account = Arc::new(account);
+        let balance_service = Arc::new(BalanceService::new(registry.clone(), account.clone()));
+
+        let strategy = SimpleLiquidationStrategy::new(
+            Arc::new(cfg),
+            registry.clone(),
+            Arc::new(collateral),
+            balance_service,
+            Arc::new(ApprovalState::new()),
+        );
+
+        let borrower = p("4awtt-aaaaa-aaaaa-aaaaa-aaaaa-aaaaa-cvai");
+        // 0.000878 ckETH -- a huge integer, a trivial amount of money.
+        let cketh_debt = mk_position(
+            p("jrgdg-siaaa-aaaae-qkfmq-cai"),
+            borrower,
+            cketh_ledger,
+            878_385_217_534_923,
+            0,
+            Assets::ETH,
+        );
+        // 10.96 ICP -- a far smaller integer, twenty times the value.
+        let icp_debt = mk_position(
+            p("en2mt-fyaaa-aaaae-qkefq-cai"),
+            borrower,
+            icp_ledger,
+            1_095_934_098,
+            0,
+            Assets::ICP,
+        );
+        let ckbtc_collateral = mk_position(
+            p("42svn-2yaaa-aaaae-qfcsq-cai"),
+            borrower,
+            ckbtc_ledger,
+            0,
+            47_058,
+            Assets::BTC,
+        );
+        let user = mk_user(vec![cketh_debt, icp_debt, ckbtc_collateral], 1_095_934_098, 900);
+
+        let _ = strategy.process(&vec![user]).await.unwrap();
+
+        assert_eq!(
+            first_priced.lock().unwrap().as_deref(),
+            Some("ICP"),
+            "the $50 ICP position must be evaluated before the $2.50 ckETH one"
+        );
+    }
+
+    /// Ranking asks the oracle about combos the main loop may never reach, so a
+    /// single unpriceable asset must not cost us every other liquidation in the
+    /// cycle.
+    #[tokio::test]
+    async fn an_unpriceable_asset_does_not_block_the_rest_of_the_cycle() {
+        let ledger = p("xevnm-gaaaa-aaaar-qafnq-cai");
+        let token = mk_icp_token("ckUSDC", 6);
+
+        let mut registry = MockTokenRegistryTrait::new();
+        registry
+            .expect_get()
+            .returning(move |_id: &AssetId| Some(token.clone()));
+
+        let mut cfg = MockConfigTrait::new();
+        let trader = p("aaaaa-aa");
+        cfg.expect_get_trader_principal().return_const(trader);
+        cfg.expect_get_liquidator_principal().return_const(trader);
+        cfg.expect_should_buy_bad_debt().return_const(false);
+        cfg.expect_get_max_allowed_dex_slippage().return_const(2000u32);
+        cfg.expect_get_lending_canister()
+            .return_const(p("mxzaz-hqaaa-aaaar-qaada-cai"));
+
+        let mut collateral = MockCollateralServiceTrait::new();
+        // The oracle has no feed for SOL; USDC prices fine.
+        collateral.expect_price_ray().returning(|asset| match asset {
+            Assets::SOL => Err("no price feed for SOL".to_string()),
+            _ => Ok(Nat::from(1_000_000_000_000_000_000_000_000_000u128)),
+        });
+        collateral
+            .expect_calculate_liquidation_amounts()
+            .returning(|_max_balance, _debt_pos, _coll_pos, _user| {
+                Ok(LiquidationEstimation {
+                    received_collateral: Nat::from(4_000u64),
+                    repaid_debt: Nat::from(1_000u64),
+                    ref_price: Nat::from(0u8),
+                    debt_price: Nat::from(0u8),
+                })
+            });
+
+        let mut account = MockAccountInfo::new();
+        account.expect_sync_balance().returning(move |_t: &ChainToken| {
+            Ok(ChainTokenAmount {
+                token: _t.clone(),
+                value: Nat::from(1_000_000u64),
+            })
+        });
+        account.expect_get_balance().returning(move |_t: &ChainToken| {
+            Ok(ChainTokenAmount {
+                token: _t.clone(),
+                value: Nat::from(1_000_000u64),
+            })
+        });
+
+        let registry = Arc::new(registry);
+        let account = Arc::new(account);
+        let balance_service = Arc::new(BalanceService::new(registry.clone(), account.clone()));
+
+        let strategy = SimpleLiquidationStrategy::new(
+            Arc::new(cfg),
+            registry.clone(),
+            Arc::new(collateral),
+            balance_service,
+            Arc::new(ApprovalState::new()),
+        );
+
+        let pool = p("mxzaz-hqaaa-aaaar-qaada-cai");
+        let unpriceable_borrower = p("user-with-sol");
+        let healthy_borrower = p("user-with-usdc");
+
+        let sol_debt = mk_position(pool, unpriceable_borrower, ledger, 1_000, 0, Assets::SOL);
+        let sol_collateral = mk_position(pool, unpriceable_borrower, ledger, 0, 4_000, Assets::SOL);
+        let usdc_debt = mk_position(pool, healthy_borrower, ledger, 1_000, 0, Assets::USDC);
+        let usdc_collateral = mk_position(pool, healthy_borrower, ledger, 0, 4_000, Assets::USDC);
+
+        let sol_user = mk_user(vec![sol_debt, sol_collateral], 1_000, 900);
+        let usdc_user = mk_user(vec![usdc_debt, usdc_collateral], 1_000, 900);
+
+        let res = strategy
+            .process(&vec![sol_user, usdc_user])
+            .await
+            .expect("an unpriceable asset must not fail the whole cycle");
+
+        assert!(!res.is_empty(), "the priceable liquidation must still be produced");
+    }
+
     // Ordering tie: for equal HF, larger debt is processed first.
     #[tokio::test]
     async fn simple_strategy_orders_by_debt_when_hf_equal() {
@@ -1868,6 +2218,11 @@ mod tests {
 
         let mut first_checked = true;
         let mut collateral = MockCollateralServiceTrait::new();
+        // Flat RAY price: these tests compare same-asset positions, so the
+        // value ranking reduces to the raw amounts they already assert on.
+        collateral
+            .expect_price_ray()
+            .returning(|_| Ok(Nat::from(1_000_000_000_000_000_000_000_000_000u128)));
         collateral
             .expect_calculate_liquidation_amounts()
             .returning(move |_max_balance, debt_pos, _coll_pos, _user| {
