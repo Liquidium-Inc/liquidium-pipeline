@@ -2399,12 +2399,20 @@ async fn mexc_deposit_phase_b_bridged_confirmation_uses_expected_amount_and_obse
     assert!((state.trade.trade_next_amount_in.unwrap_or_default() - 9.9).abs() < 1e-12);
 }
 
+/// A balance delta larger than this deposit could possibly have credited means
+/// the reading is contaminated — typically a second deposit crediting the same
+/// account concurrently. The trade must then be sized on the post-fee expected
+/// amount, never the pre-fee submit amount, which the minter's withdrawal fee
+/// makes unreachable. Sizing on the gross oversells what arrived and the venue
+/// rejects the order as oversold.
 #[tokio::test]
-async fn mexc_deposit_phase_b_bridged_confirmation_caps_observed_delta_at_submit_amount() {
+async fn mexc_deposit_phase_b_bridged_confirmation_caps_contaminated_delta_at_expected_amount() {
     let mut backend = MockCexBackend::new();
     let transfers = MockTransferActions::new();
     let mut bridge = MockBridgeBackend::new();
 
+    // 15.2 - 5.0 = 10.2 delta: more than the 10.0 submitted, so a concurrent
+    // deposit is inflating it.
     backend.expect_get_balance().returning(|asset| {
         assert_eq!(asset, "ETH");
         Ok(15.2)
@@ -2439,7 +2447,75 @@ async fn mexc_deposit_phase_b_bridged_confirmation_caps_observed_delta_at_submit
         .expect("bridged deposit should cap confirmed amount");
 
     assert!(matches!(state.step, CexStep::Trade));
-    assert!((state.trade.trade_next_amount_in.unwrap_or_default() - 10.0).abs() < 1e-12);
+    assert!(
+        (state.trade.trade_next_amount_in.unwrap_or_default() - 9.9).abs() < 1e-12,
+        "contaminated delta must cap at the post-fee expected amount, not the pre-fee submit amount"
+    );
+}
+
+/// Regression for liq 1563: two ckETH withdrawals pre-credited to the MEXC
+/// account in the same block, so this leg's balance delta picked up the other
+/// deposit as well. The pre-fee cap then sized the sell at the full submitted
+/// 0.00804851439432068 ETH while only 0.00801372 had actually credited, and
+/// MEXC rejected it as oversold on every retry until the settlement wait
+/// expired.
+///
+/// The fee budget was not at fault: 0.0000425 was reserved against an actual
+/// 0.0000348 minter fee, so the credit landed slightly above forecast.
+#[tokio::test]
+async fn mexc_deposit_never_sizes_a_trade_above_what_the_bridge_could_credit() {
+    let submitted = 0.008_048_514_394_320_68;
+    let expected_after_fee = 0.008_005_979_746_399_88;
+    let baseline = 0.000_018_374_568_812_442;
+    // Baseline plus this leg's real credit plus a concurrent deposit.
+    let contaminated_balance = baseline + 0.008_013_72 + 0.010_278_35;
+
+    let mut backend = MockCexBackend::new();
+    let transfers = MockTransferActions::new();
+    let mut bridge = MockBridgeBackend::new();
+
+    backend.expect_get_balance().returning(move |asset| {
+        assert_eq!(asset, "ETH");
+        Ok(contaminated_balance)
+    });
+    bridge.expect_get_bridge_status().times(1).returning(|bridge_id| {
+        assert_eq!(bridge_id, "bridge-deposit-cketh");
+        Ok(BridgeStatus::Completed)
+    });
+
+    let finalizer = MexcFinalizer::new(
+        Arc::new(backend),
+        Arc::new(transfers),
+        Principal::anonymous(),
+        TEST_MAX_SELL_SLIPPAGE_BPS,
+        TEST_CEX_MIN_EXEC_USD,
+        TEST_CEX_SLICE_TARGET_RATIO,
+    )
+    .with_bridge_dependencies(bridge_dependencies(Arc::new(bridge)));
+
+    let receipt = make_execution_receipt_with_assets(82, cketh_token(), ckusdc_token());
+    let mut state = finalizer
+        .prepare("1563", &receipt)
+        .await
+        .expect("prepare should succeed");
+    state.deposit.deposit_txid = Some("989_486".to_string());
+    state.deposit.deposit_balance_before = Some(baseline);
+    state.deposit.bridge.deposit_bridge_id = Some("bridge-deposit-cketh".to_string());
+    state.deposit.bridge.deposit_bridge_submit_amount = Some(submitted);
+    state.deposit.bridge.deposit_bridge_expected_amount = Some(expected_after_fee);
+    state.step = CexStep::DepositPending;
+
+    finalizer.deposit(&mut state).await.expect("deposit should confirm");
+
+    let sized = state.trade.trade_next_amount_in.expect("trade amount should be set");
+    assert!(
+        sized <= expected_after_fee,
+        "sized {sized} above the post-fee ceiling {expected_after_fee}; this is the oversold bug"
+    );
+    assert!(
+        sized < submitted,
+        "sized {sized} at the pre-fee submit amount {submitted}, which the minter fee makes unreachable"
+    );
 }
 
 #[tokio::test]
