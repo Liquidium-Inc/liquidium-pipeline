@@ -2,7 +2,9 @@ use std::{collections::HashMap, sync::Arc};
 
 use candid::{Nat, Principal};
 use liquidium_pipeline_connectors::backend::bridge_backend::FINALIZER_PERMANENT_AMOUNT_FLOOR_PREFIX;
-use liquidium_pipeline_connectors::backend::cex_backend::{MockCexBackend, OrderBook, OrderBookLevel};
+use liquidium_pipeline_connectors::backend::cex_backend::{
+    CEX_PENDING_SETTLEMENT_PREFIX, MockCexBackend, OrderBook, OrderBookLevel, SwapFillReport,
+};
 use liquidium_pipeline_core::{
     tokens::{chain_token::ChainToken, chain_token_amount::ChainTokenAmount, token_registry::TokenRegistry},
     transfer::actions::MockTransferActions,
@@ -10,7 +12,10 @@ use liquidium_pipeline_core::{
 
 use super::*;
 use crate::{
-    finalizers::multi_venue::{MultiVenueAdapter, VenueLegCheckpoint, VenueLegProgress, VenuePlanningContext},
+    finalizers::{
+        cex_finalizer::CexRouteLeg,
+        multi_venue::{MultiVenueAdapter, VenueLegCheckpoint, VenueLegProgress, VenuePlanningContext},
+    },
     persistance::{VenueLegQuote, VenueLegState, VenueLegStatus},
     swappers::model::SwapRequest,
 };
@@ -502,4 +507,165 @@ async fn ordinary_cex_error_remains_retryable_without_operator_intervention() {
         execution.cex.last_error,
         Some("deposit address request timed out".to_string())
     );
+}
+
+/// Builds a finalizer whose trade slice always draws the given venue response.
+fn finalizer_with_trade_result(
+    swap_result: Result<SwapFillReport, String>,
+    balance_calls: usize,
+) -> MexcFinalizer<MockCexBackend> {
+    let mut backend = MockCexBackend::new();
+    backend.expect_get_orderbook().returning(|_, _| {
+        Ok(OrderBook {
+            bids: vec![OrderBookLevel {
+                price: 10.0,
+                quantity: 1_000_000.0,
+            }],
+            asks: vec![OrderBookLevel {
+                price: 10.0,
+                quantity: 1_000_000.0,
+            }],
+        })
+    });
+    backend
+        .expect_execute_swap_detailed_with_options()
+        .returning(move |_, _, _, _| swap_result.clone());
+    backend.expect_get_balance().times(balance_calls).returning(|_| Ok(0.0));
+    let tokens = HashMap::from([
+        (pay_token().asset_id(), pay_token()),
+        (receive_token().asset_id(), receive_token()),
+    ]);
+    MexcFinalizer::new(
+        Arc::new(backend),
+        Arc::new(MockTransferActions::new()),
+        Principal::anonymous(),
+        200.0,
+        0.0001,
+        0.7,
+    )
+    .with_token_registry(Arc::new(TokenRegistry::new(tokens)))
+}
+
+/// Places a committed leg on its trade step with one resolved USDT-quoted
+/// market, so the slice runner reaches the venue call without route discovery.
+async fn leg_at_trade_step(finalizer: &MexcFinalizer<MockCexBackend>, waiting_since_ts: Option<i64>) -> VenueLegState {
+    let preview = MultiVenueAdapter::preview(finalizer, &planning_context(), &request(100_000_000))
+        .await
+        .expect("preview should succeed");
+    let mut leg = leg_from_preview(preview);
+    let mut execution = leg
+        .execution
+        .decode::<MexcVenueExecutionState>(VENUE_ID)
+        .expect("state should decode")
+        .expect("state should be MEXC");
+    execution.cex.step = CexStep::Trade;
+    execution.cex.trade.trade_resolved_legs = vec![CexRouteLeg {
+        market: "PAY_USDT".to_string(),
+        side: "sell".to_string(),
+    }];
+    execution.cex.trade.trade_next_amount_in = Some(1.0);
+    execution.cex.trade.trade_settlement_waiting_since_ts = waiting_since_ts;
+    leg.execution = VenueExecutionState::new(VENUE_ID, &execution).expect("state should encode");
+
+    let armed = MultiVenueAdapter::advance(finalizer, &leg, &NoopCheckpoint)
+        .await
+        .expect("first cycle should arm the leg");
+    leg.execution = armed.execution;
+    leg
+}
+
+#[tokio::test]
+async fn venue_settlement_rejection_waits_instead_of_spending_the_retry_budget() {
+    let finalizer = finalizer_with_trade_result(
+        Err(format!(
+            "{CEX_PENDING_SETTLEMENT_PREFIX}Swap err: code=Oversold msg=Oversold"
+        )),
+        0,
+    );
+    let leg = leg_at_trade_step(&finalizer, None).await;
+
+    let waiting = MultiVenueAdapter::advance(&finalizer, &leg, &NoopCheckpoint)
+        .await
+        .expect("a settling venue should produce durable waiting progress");
+
+    // The leg is still working, so the parent keeps re-offering the same order.
+    assert_eq!(waiting.status, VenueLegStatus::Running);
+    // The decisive assertion: a wait must not be charged to the retry budget,
+    // which is what parked liquidation 1551 roughly a minute before its
+    // already-credited deposit became tradable.
+    assert_eq!(waiting.retryable_error, None);
+    assert!(
+        waiting
+            .last_error
+            .as_deref()
+            .is_some_and(|error| error.contains("Oversold"))
+    );
+
+    let execution = waiting
+        .execution
+        .decode::<MexcVenueExecutionState>(VENUE_ID)
+        .expect("decode waiting state")
+        .expect("MEXC state");
+    assert_eq!(execution.cex.step, CexStep::Trade);
+    assert!(!execution.operator_required);
+    assert!(execution.cex.trade.trade_settlement_waiting_since_ts.is_some());
+}
+
+#[tokio::test]
+async fn venue_settlement_wait_parks_for_an_operator_once_the_deadline_passes() {
+    // One balance read is expected: the give-up path reports what the account
+    // actually holds so an operator can tell a stuck credit from an empty one.
+    let finalizer = finalizer_with_trade_result(
+        Err(format!(
+            "{CEX_PENDING_SETTLEMENT_PREFIX}Swap err: code=Oversold msg=Oversold"
+        )),
+        1,
+    );
+    let expired_since = now_ts() - (SETTLEMENT_WAIT_TIMEOUT_SECS + 1);
+    let leg = leg_at_trade_step(&finalizer, Some(expired_since)).await;
+
+    let parked = MultiVenueAdapter::advance(&finalizer, &leg, &NoopCheckpoint)
+        .await
+        .expect("an expired settlement wait should park the leg");
+
+    assert_eq!(parked.status, VenueLegStatus::OperatorRequired);
+    assert_eq!(parked.retryable_error, None);
+    let reported = parked.last_error.expect("parked leg keeps its diagnosis");
+    assert!(reported.contains("not settled after"), "unexpected message: {reported}");
+    assert!(reported.contains("free PAY=0"), "unexpected message: {reported}");
+
+    let execution = parked
+        .execution
+        .decode::<MexcVenueExecutionState>(VENUE_ID)
+        .expect("decode parked state")
+        .expect("MEXC state");
+    assert!(execution.operator_required);
+}
+
+#[tokio::test]
+async fn a_settled_fill_clears_the_recorded_wait() {
+    let finalizer = finalizer_with_trade_result(
+        Ok(SwapFillReport {
+            input_consumed: 1.0,
+            output_received: 10.0,
+        }),
+        0,
+    );
+    // The leg enters this cycle already carrying a wait from earlier refusals.
+    let leg = leg_at_trade_step(&finalizer, Some(now_ts() - 60)).await;
+
+    let progress = MultiVenueAdapter::advance(&finalizer, &leg, &NoopCheckpoint)
+        .await
+        .expect("a filled slice should advance the leg");
+
+    assert_eq!(progress.status, VenueLegStatus::Running);
+    assert_eq!(progress.retryable_error, None);
+    let execution = progress
+        .execution
+        .decode::<MexcVenueExecutionState>(VENUE_ID)
+        .expect("decode filled state")
+        .expect("MEXC state");
+    // Cleared, so a later refusal is timed from its own first occurrence
+    // rather than inheriting a stale deadline.
+    assert_eq!(execution.cex.trade.trade_settlement_waiting_since_ts, None);
 }

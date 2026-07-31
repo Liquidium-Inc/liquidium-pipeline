@@ -89,6 +89,7 @@ where
                 trade_pending_buy_mode: None,
                 trade_inverse_retry_count: 0,
                 trade_unexecutable_residual_in: None,
+                trade_settlement_waiting_since_ts: None,
             },
             withdraw: CexWithdrawState {
                 withdraw_asset: receive_token,

@@ -160,6 +160,13 @@ pub struct CexTradeState {
     /// Residual input that could not be executed due to constraints.
     #[serde(default)]
     pub trade_unexecutable_residual_in: Option<f64>,
+    /// When the venue first reported this leg's funds as not tradable yet.
+    ///
+    /// Set on the first pending-settlement rejection and cleared by the next
+    /// error-free step, so the wait is measured from the venue's first refusal
+    /// rather than restarted by every retry.
+    #[serde(default)]
+    pub trade_settlement_waiting_since_ts: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -564,6 +571,7 @@ mod tests {
                     trade_pending_buy_mode: None,
                     trade_inverse_retry_count: 0,
                     trade_unexecutable_residual_in: None,
+                    trade_settlement_waiting_since_ts: None,
                 },
                 withdraw: CexWithdrawState {
                     withdraw_asset: recv,
@@ -716,6 +724,7 @@ mod tests {
                     trade_pending_buy_mode: None,
                     trade_inverse_retry_count: 0,
                     trade_unexecutable_residual_in: None,
+                    trade_settlement_waiting_since_ts: None,
                 },
                 withdraw: CexWithdrawState {
                     withdraw_asset: recv,

@@ -4,8 +4,8 @@ use std::env;
 use async_trait::async_trait;
 
 use liquidium_pipeline_connectors::backend::cex_backend::{
-    BuyOrderInputMode, CexBackend, DepositAddress, OrderBook, OrderBookLevel, SwapExecutionOptions, SwapFillReport,
-    WithdrawStatus, WithdrawStatusSnapshot, WithdrawalReceipt,
+    BuyOrderInputMode, CEX_PENDING_SETTLEMENT_PREFIX, CexBackend, DepositAddress, OrderBook, OrderBookLevel,
+    SwapExecutionOptions, SwapFillReport, WithdrawStatus, WithdrawStatusSnapshot, WithdrawalReceipt,
 };
 use log::{debug, info, warn};
 use rust_decimal::{Decimal, RoundingStrategy};
@@ -102,6 +102,20 @@ fn is_bad_symbol(err: &v3::ApiError) -> bool {
     matches!(
         err,
         v3::ApiError::ErrorResponse(resp) if resp.code == v3::ErrorCode::BadSymbol
+    )
+}
+
+/// Reports whether MEXC rejected the order because the funds it already shows
+/// in the account are not tradable yet.
+///
+/// `Oversold` is the sell-side form (base asset short) and `InsufficientPosition`
+/// the buy-side one (quote asset short). Both appear while a credited deposit is
+/// still settling into the matching engine, which is a wait, not a failure.
+fn is_pending_settlement(err: &v3::ApiError) -> bool {
+    matches!(
+        err,
+        v3::ApiError::ErrorResponse(resp)
+            if resp.code == v3::ErrorCode::Oversold || resp.code == v3::ErrorCode::InsufficientPosition
     )
 }
 
@@ -710,6 +724,9 @@ impl MexcClient {
                         last_err = Some(format!("Swap err: {}", details));
                         continue;
                     }
+                    if is_pending_settlement(&e) {
+                        return Err(format!("{}Swap err: {}", CEX_PENDING_SETTLEMENT_PREFIX, details));
+                    }
                     return Err(format!("Swap err: {}", details));
                 }
             }
@@ -1087,9 +1104,12 @@ impl CexBackend for MexcClient {
                         }
 
                         if is_order_missing_lookup_error(&fetch_err) {
+                            // The order was accepted but the venue cannot read it
+                            // back yet. Same eventual-consistency wait as a
+                            // settling deposit, so it must not spend a retry.
                             return Err(format!(
-                                "order lookup pending after submit market={} side={} symbol={} order_id={} err={}",
-                                market, side, chosen_symbol, order_id, fetch_err
+                                "{}order lookup pending after submit market={} side={} symbol={} order_id={} err={}",
+                                CEX_PENDING_SETTLEMENT_PREFIX, market, side, chosen_symbol, order_id, fetch_err
                             ));
                         }
 
