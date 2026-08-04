@@ -35,6 +35,7 @@ pub(super) struct ConfigSummary {
     pub(super) control_socket: String,
     pub(super) log_source: String,
     pub(super) db_path: String,
+    pub(super) liquidations_db_path: String,
     pub(super) export_path: String,
 }
 
@@ -520,6 +521,7 @@ mod tests {
             control_socket: "/tmp/liquidator/ctl.sock".to_string(),
             log_source: "Log source file: /tmp/liquidator/liquidator.log".to_string(),
             db_path: "./wal.db".to_string(),
+            liquidations_db_path: "./liquidations.db".to_string(),
             export_path: "executions.csv".to_string(),
         }
     }

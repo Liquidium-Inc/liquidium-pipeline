@@ -46,8 +46,12 @@ pub(super) fn draw_configuration(f: &mut Frame<'_>, area: Rect, app: &App) {
         Line::from(format!("Bridge ICP owner: {}", app.config.bridge_ic_owner_principal)),
         Line::from(format!("Bridge BTC: {}", app.config.bridge_btc_address)),
         Line::from(format!(
-            "DB: {}",
+            "Execution WAL: {}",
             truncate_start(&app.config.db_path, area.width.saturating_sub(6) as usize)
+        )),
+        Line::from(format!(
+            "Liquidation intake: {}",
+            truncate_start(&app.config.liquidations_db_path, area.width.saturating_sub(6) as usize)
         )),
         Line::from(format!(
             "Export: {}",

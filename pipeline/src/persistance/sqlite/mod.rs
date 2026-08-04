@@ -5,7 +5,7 @@ use diesel::{
     dsl::count_star,
     prelude::*,
     r2d2::{ConnectionManager, Pool},
-    sql_types::{BigInt, Integer, Text},
+    sql_types::{BigInt, Text},
 };
 use std::collections::HashMap;
 
@@ -174,49 +174,6 @@ impl SqliteWalStore {
             .order(tbl::created_at.asc())
             .load::<Row>(&mut conn)?;
         Ok(rows.into_iter().map(Self::from_row).collect())
-    }
-
-    pub fn set_daemon_paused(&self, paused: bool) -> Result<()> {
-        self.ensure_writable()?;
-        let mut conn = self.get_conn()?;
-        diesel::sql_query(
-            r#"
-            INSERT INTO daemon_control_state (singleton_id, paused, updated_at)
-            VALUES (1, ?, ?)
-            ON CONFLICT(singleton_id) DO UPDATE SET
-                paused = excluded.paused,
-                updated_at = excluded.updated_at
-        "#,
-        )
-        .bind::<Integer, _>(if paused { 1 } else { 0 })
-        .bind::<BigInt, _>(now_secs())
-        .execute(&mut conn)?;
-        Ok(())
-    }
-
-    pub fn daemon_paused(&self) -> Result<bool> {
-        #[derive(QueryableByName)]
-        struct StateRow {
-            #[diesel(sql_type = Integer)]
-            paused: i32,
-        }
-
-        let mut conn = self.get_conn()?;
-        match diesel::sql_query("SELECT paused FROM daemon_control_state WHERE singleton_id = 1 LIMIT 1")
-            .get_result::<StateRow>(&mut conn)
-            .optional()
-        {
-            Ok(Some(row)) => Ok(row.paused != 0),
-            Ok(None) => Ok(false),
-            Err(err) => {
-                let msg = err.to_string();
-                if msg.contains("no such table: daemon_control_state") {
-                    Ok(false)
-                } else {
-                    Err(err.into())
-                }
-            }
-        }
     }
 
     /// Imports one scanner handoff without ever updating an existing execution
@@ -489,14 +446,6 @@ pub fn initialize_schema(conn: &mut SqliteConnection) -> Result<()> {
         );
         CREATE INDEX IF NOT EXISTS idx_liq_status ON liquidation_results(status);
 
-        CREATE TABLE IF NOT EXISTS daemon_control_state (
-            singleton_id INTEGER PRIMARY KEY CHECK (singleton_id = 1),
-            paused INTEGER NOT NULL DEFAULT 0 CHECK (paused IN (0, 1)),
-            updated_at BIGINT NOT NULL
-        );
-        INSERT OR IGNORE INTO daemon_control_state (singleton_id, paused, updated_at)
-        VALUES (1, 0, CAST(strftime('%s','now') AS INTEGER));
-
         CREATE TABLE IF NOT EXISTS intake_import_state (
             singleton_id INTEGER PRIMARY KEY CHECK (singleton_id = 1),
             last_handoff_sequence BIGINT NOT NULL DEFAULT 0
@@ -614,33 +563,6 @@ mod tests {
         let err = rt
             .block_on(async { reader.delete("liq-1").await })
             .expect_err("write should fail");
-        assert!(err.to_string().contains("read-only"));
-    }
-
-    #[test]
-    fn daemon_pause_state_roundtrip_in_writable_and_read_only_store() {
-        let temp = tempfile::NamedTempFile::new().expect("tmp db");
-        let path = temp.path().display().to_string();
-
-        let writer = SqliteWalStore::new_with_busy_timeout(&path, 5_000).expect("writer");
-        assert!(!writer.daemon_paused().expect("default state"));
-        writer.set_daemon_paused(true).expect("set paused");
-        assert!(writer.daemon_paused().expect("paused state"));
-
-        let reader = SqliteWalStore::new_read_only_with_busy_timeout(&path, 5_000).expect("reader");
-        assert!(reader.daemon_paused().expect("read-only read paused state"));
-    }
-
-    #[test]
-    fn read_only_store_blocks_daemon_state_writes() {
-        let temp = tempfile::NamedTempFile::new().expect("tmp db");
-        let path = temp.path().display().to_string();
-
-        let writer = SqliteWalStore::new_with_busy_timeout(&path, 5_000).expect("writer");
-        writer.set_daemon_paused(false).expect("seed state");
-
-        let reader = SqliteWalStore::new_read_only_with_busy_timeout(&path, 5_000).expect("reader");
-        let err = reader.set_daemon_paused(true).expect_err("write should fail");
         assert!(err.to_string().contains("read-only"));
     }
 
