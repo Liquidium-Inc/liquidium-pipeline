@@ -18,6 +18,7 @@ use crate::{
     },
     config::{Config, ConfigTrait},
     context::{PipelineContext, init_context},
+    control_plane::acquire_daemon_instance,
     executors::basic::basic_executor::BasicExecutor,
     finalizers::{
         mexc::runtime::build_mexc_finalizer,
@@ -359,6 +360,27 @@ pub async fn run_liquidation_loop(sock_path: PathBuf) -> ExitCode {
     let ctx = Arc::new(ctx);
     let config = ctx.config.clone();
 
+    // Claim process ownership before any database is opened or startup
+    // recovery can mutate live intent state. The database lock also prevents
+    // bypassing single-daemon ownership with a different control socket path.
+    let (daemon_instance_lock, control_listener) =
+        match acquire_daemon_instance(PathBuf::from(&config.liquidations_db_path).as_path(), &sock_path) {
+            Ok(instance) => instance,
+            Err(err) => {
+                tracing::error!(
+                    liquidations_db_path = %config.liquidations_db_path,
+                    sock_path = %sock_path.display(),
+                    "Failed to claim daemon instance: {err:#}"
+                );
+                return ExitCode::FAILURE;
+            }
+        };
+    info!(
+        lock_path = %daemon_instance_lock.path().display(),
+        sock_path = %sock_path.display(),
+        "Daemon instance ownership claimed"
+    );
+
     if let Err(err) =
         ensure_runtime_file_permissions(&config.db_path, &config.liquidations_db_path, &config.export_path)
     {
@@ -447,10 +469,10 @@ pub async fn run_liquidation_loop(sock_path: PathBuf) -> ExitCode {
     };
     // The helper encapsulates:
     // - persisted paused/running state bootstrap
-    // - UDS bind + serve
+    // - serving the UDS listener claimed before database initialization
     // - state persistence on pause/resume transitions
     if let Err(err) = bootstrap_control_plane(
-        &sock_path,
+        control_listener,
         &config.liquidations_db_path,
         paused.clone(),
         slack_watchdog.clone(),

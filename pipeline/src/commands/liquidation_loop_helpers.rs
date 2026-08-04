@@ -10,6 +10,7 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 use std::time::{Duration, Instant};
+use tokio::net::UnixListener;
 use tokio::time::{sleep, timeout};
 use tracing::{Instrument, info, info_span, warn};
 
@@ -160,6 +161,8 @@ fn probe_rw_file(path: &Path, label: &str, append: bool) -> anyhow::Result<()> {
 /// Boots and serves the UDS control plane used by attachable TUI clients.
 ///
 /// Auditor notes:
+/// - The listener is pre-bound before database initialization so another
+///   daemon cannot mutate startup state before exclusivity is established.
 /// - The daemon lifecycle state (paused/running) is persisted in sqlite so new
 ///   TUI sessions can recover a correct view without adding a "status" IPC call.
 /// - Pause transitions are persisted only when a real state change occurs,
@@ -167,7 +170,7 @@ fn probe_rw_file(path: &Path, label: &str, append: bool) -> anyhow::Result<()> {
 /// - The server is fire-and-forget; failures after bootstrap are surfaced via
 ///   structured error logs while the daemon process keeps running.
 pub(crate) fn bootstrap_control_plane(
-    sock_path: &Path,
+    control_listener: UnixListener,
     liquidations_db_path: &str,
     paused: Arc<AtomicBool>,
     lifecycle_watchdog: Option<Arc<dyn Watchdog>>,
@@ -182,9 +185,6 @@ pub(crate) fn bootstrap_control_plane(
     control_state_store
         .set_daemon_paused(false)
         .context("persist initial daemon state")?;
-
-    let control_listener = crate::control_plane::bind_control_listener(sock_path)
-        .with_context(|| format!("initialize control socket at {}", sock_path.display()))?;
 
     let state_store = control_state_store.clone();
     let termination_watchdog = lifecycle_watchdog.clone();
