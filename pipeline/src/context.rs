@@ -463,6 +463,7 @@ mod tests {
             export_path: "executions.csv".to_string(),
             buy_bad_debt: false,
             db_path: "wal.db".to_string(),
+            liquidations_db_path: "liquidations.db".to_string(),
             max_allowed_dex_slippage: 125,
             max_allowed_cex_slippage_bps: 200,
             bad_debt_collateral_slippage_bps: 500,

@@ -5,7 +5,7 @@ use diesel::{
     dsl::count_star,
     prelude::*,
     r2d2::{ConnectionManager, Pool},
-    sql_types::{BigInt, Integer},
+    sql_types::{BigInt, Integer, Text},
 };
 use std::collections::HashMap;
 
@@ -16,6 +16,21 @@ use crate::persistance::{LiqResultRecord, ResultStatus, WalStore, now_secs};
 
 use self::models::LiquidationResultRow as Row;
 use self::schema::liquidation_results as tbl;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DatabaseRole {
+    ExecutionWal,
+    LiquidationIntake,
+}
+
+impl DatabaseRole {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::ExecutionWal => "execution_wal",
+            Self::LiquidationIntake => "liquidation_intake",
+        }
+    }
+}
 
 pub struct SqliteWalStore {
     pool: Pool<ConnectionManager<SqliteConnection>>,
@@ -38,7 +53,8 @@ impl SqliteWalStore {
         let mut conn = pool
             .get()
             .with_context(|| format!("open sqlite connection (mode=rw path={path})"))?;
-        initialize_schema(&mut conn).with_context(|| format!("initialize sqlite schema (path={path})"))?;
+        initialize_role_and_schema(&mut conn, DatabaseRole::ExecutionWal, initialize_schema)
+            .with_context(|| format!("initialize sqlite schema (path={path})"))?;
         apply_pragmas(&mut conn, busy_timeout_ms)
             .with_context(|| format!("apply sqlite pragmas (mode=rw path={path})"))?;
         Ok(Self {
@@ -60,6 +76,8 @@ impl SqliteWalStore {
             .with_context(|| format!("open sqlite connection (mode=ro path={path})"))?;
         apply_read_only_pragmas(&mut conn, busy_timeout_ms)
             .with_context(|| format!("apply sqlite pragmas (mode=ro path={path})"))?;
+        validate_database_role(&mut conn, DatabaseRole::ExecutionWal)
+            .with_context(|| format!("validate sqlite database role (mode=ro path={path})"))?;
         Ok(Self {
             pool,
             busy_timeout_ms,
@@ -330,6 +348,87 @@ impl WalStore for SqliteWalStore {
     }
 }
 
+pub(crate) fn initialize_role_and_schema(
+    conn: &mut SqliteConnection,
+    expected_role: DatabaseRole,
+    initialize_schema: fn(&mut SqliteConnection) -> Result<()>,
+) -> Result<()> {
+    if metadata_table_exists(conn)? {
+        return validate_database_role(conn, expected_role);
+    }
+
+    let user_tables = user_table_names(conn)?;
+    if !user_tables.is_empty() {
+        anyhow::bail!(
+            "database is untagged and already contains schema ({}); move or remove it before startup",
+            user_tables.join(", ")
+        );
+    }
+
+    conn.transaction::<_, anyhow::Error, _>(|conn| {
+        conn.batch_execute(
+            "CREATE TABLE database_metadata (metadata_key TEXT PRIMARY KEY NOT NULL, metadata_value TEXT NOT NULL);",
+        )?;
+        diesel::sql_query("INSERT INTO database_metadata (metadata_key, metadata_value) VALUES ('role', ?)")
+            .bind::<Text, _>(expected_role.as_str())
+            .execute(conn)?;
+        initialize_schema(conn)?;
+        Ok(())
+    })
+}
+
+pub(crate) fn validate_database_role(conn: &mut SqliteConnection, expected_role: DatabaseRole) -> Result<()> {
+    #[derive(QueryableByName)]
+    struct RoleRow {
+        #[diesel(sql_type = Text)]
+        metadata_value: String,
+    }
+
+    if !metadata_table_exists(conn)? {
+        anyhow::bail!("database is missing role metadata; move or remove this legacy database before startup");
+    }
+    let role = diesel::sql_query("SELECT metadata_value FROM database_metadata WHERE metadata_key = 'role' LIMIT 1")
+        .get_result::<RoleRow>(conn)
+        .optional()?
+        .ok_or_else(|| anyhow::anyhow!("database role metadata is missing the role value"))?;
+    if role.metadata_value != expected_role.as_str() {
+        anyhow::bail!(
+            "database role mismatch: expected {}, found {}",
+            expected_role.as_str(),
+            role.metadata_value
+        );
+    }
+    Ok(())
+}
+
+fn metadata_table_exists(conn: &mut SqliteConnection) -> Result<bool> {
+    #[derive(QueryableByName)]
+    struct CountRow {
+        #[diesel(sql_type = BigInt)]
+        count: i64,
+    }
+    let row = diesel::sql_query(
+        "SELECT COUNT(*) AS count FROM sqlite_master WHERE type = 'table' AND name = 'database_metadata'",
+    )
+    .get_result::<CountRow>(conn)?;
+    Ok(row.count != 0)
+}
+
+fn user_table_names(conn: &mut SqliteConnection) -> Result<Vec<String>> {
+    #[derive(QueryableByName)]
+    struct TableRow {
+        #[diesel(sql_type = Text)]
+        name: String,
+    }
+    Ok(diesel::sql_query(
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name",
+    )
+    .load::<TableRow>(conn)?
+    .into_iter()
+    .map(|row| row.name)
+    .collect())
+}
+
 pub fn initialize_schema(conn: &mut SqliteConnection) -> Result<()> {
     conn.batch_execute(
         r#"
@@ -399,6 +498,9 @@ fn apply_read_only_pragmas(conn: &mut SqliteConnection, busy_timeout_ms: i64) ->
 mod tests {
     use std::sync::Arc;
 
+    use diesel::{Connection, connection::SimpleConnection};
+
+    use crate::persistance::liquidation_intake::SqliteLiquidationIntentStore;
     use crate::persistance::{LiqResultRecord, ResultStatus, WalStore, now_secs};
 
     use super::SqliteWalStore;
@@ -600,5 +702,31 @@ mod tests {
             assert_eq!(stored.last_error.as_deref(), Some("disabled venue"));
             assert!(store.get_pending(10).await.expect("pending").is_empty());
         });
+    }
+
+    #[test]
+    fn rejects_untagged_legacy_database() {
+        let temp = tempfile::NamedTempFile::new().expect("tmp db");
+        let path = temp.path().display().to_string();
+        let mut conn = diesel::SqliteConnection::establish(&path).expect("legacy connection");
+        conn.batch_execute("CREATE TABLE legacy_rows (id INTEGER PRIMARY KEY);")
+            .expect("legacy schema");
+        drop(conn);
+
+        let error = SqliteWalStore::new(&path).err().expect("legacy database must fail");
+        assert!(format!("{error:#}").contains("untagged"), "unexpected error: {error:#}");
+    }
+
+    #[test]
+    fn rejects_database_tagged_for_the_other_role() {
+        let temp = tempfile::NamedTempFile::new().expect("tmp db");
+        let path = temp.path().display().to_string();
+        let _intake = SqliteLiquidationIntentStore::new(&path).expect("intake database");
+
+        let error = SqliteWalStore::new(&path).err().expect("wrong database role must fail");
+        assert!(
+            format!("{error:#}").contains("role mismatch"),
+            "unexpected error: {error:#}"
+        );
     }
 }

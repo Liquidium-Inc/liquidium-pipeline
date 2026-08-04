@@ -41,6 +41,7 @@ pub struct Config {
     pub export_path: String,
     pub buy_bad_debt: bool,
     pub db_path: String,
+    pub liquidations_db_path: String,
     pub max_allowed_dex_slippage: u32,
     pub max_allowed_cex_slippage_bps: u32,
     pub bad_debt_collateral_slippage_bps: u32,
@@ -274,6 +275,16 @@ impl Config {
         // The db path
         let db_path_raw = env::var("DB_PATH").unwrap_or(format!("{}/wal.db", home));
         let db_path = expand_tilde(&db_path_raw).to_string_lossy().into_owned();
+        let liquidations_db_path = match env::var("LIQUIDATIONS_DB_PATH") {
+            Ok(path) => expand_tilde(&path),
+            Err(_) => std::path::Path::new(&db_path)
+                .parent()
+                .unwrap_or_else(|| std::path::Path::new("."))
+                .join("liquidations.db"),
+        }
+        .to_string_lossy()
+        .into_owned();
+        validate_distinct_database_paths(&db_path, &liquidations_db_path)?;
 
         // Derive EVM private key
         let sk = derive_evm_private_key(&mnemonic, 0, 0)?;
@@ -377,6 +388,7 @@ impl Config {
             export_path,
             buy_bad_debt,
             db_path,
+            liquidations_db_path,
             max_allowed_dex_slippage,
             max_allowed_cex_slippage_bps,
             bad_debt_collateral_slippage_bps,
@@ -407,6 +419,20 @@ impl Config {
             opportunity_account_filter,
         }))
     }
+}
+
+fn validate_distinct_database_paths(wal_path: &str, liquidations_path: &str) -> Result<(), String> {
+    fn comparable_path(path: &str) -> std::path::PathBuf {
+        let path = std::path::Path::new(path);
+        std::fs::canonicalize(path)
+            .or_else(|_| std::path::absolute(path))
+            .unwrap_or_else(|_| path.to_path_buf())
+    }
+
+    if comparable_path(wal_path) == comparable_path(liquidations_path) {
+        return Err("DB_PATH and LIQUIDATIONS_DB_PATH must point to different files".to_string());
+    }
+    Ok(())
 }
 
 fn load_cex_credentials() -> HashMap<String, (String, String)> {
@@ -1267,5 +1293,26 @@ mod tests {
                 None => env::remove_var("HOME"),
             }
         }
+    }
+
+    #[test]
+    fn database_paths_must_be_distinct() {
+        let temp = tempfile::tempdir().expect("temp directory");
+        let wal = temp.path().join("wal.db");
+        let equivalent = temp.path().join(".").join("wal.db");
+        let liquidations = temp.path().join("liquidations.db");
+
+        assert!(
+            validate_distinct_database_paths(
+                wal.to_str().expect("wal path"),
+                equivalent.to_str().expect("equivalent path")
+            )
+            .is_err()
+        );
+        validate_distinct_database_paths(
+            wal.to_str().expect("wal path"),
+            liquidations.to_str().expect("liquidations path"),
+        )
+        .expect("different database paths");
     }
 }
