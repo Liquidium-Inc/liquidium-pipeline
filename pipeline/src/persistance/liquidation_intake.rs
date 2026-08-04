@@ -335,7 +335,7 @@ impl LiquidationIntentStore for SqliteLiquidationIntentStore {
 fn initialize_schema(conn: &mut SqliteConnection) -> Result<()> {
     conn.batch_execute(
         r#"
-        CREATE TABLE liquidation_intents (
+        CREATE TABLE IF NOT EXISTS liquidation_intents (
             intent_id TEXT PRIMARY KEY NOT NULL,
             liquidation_id TEXT UNIQUE,
             status INTEGER NOT NULL,
@@ -345,19 +345,19 @@ fn initialize_schema(conn: &mut SqliteConnection) -> Result<()> {
             created_at BIGINT NOT NULL,
             updated_at BIGINT NOT NULL
         );
-        CREATE INDEX idx_liquidation_intents_status ON liquidation_intents(status);
+        CREATE INDEX IF NOT EXISTS idx_liquidation_intents_status ON liquidation_intents(status);
 
-        CREATE TABLE liquidation_handoffs (
+        CREATE TABLE IF NOT EXISTS liquidation_handoffs (
             sequence INTEGER PRIMARY KEY AUTOINCREMENT,
             intent_id TEXT NOT NULL UNIQUE REFERENCES liquidation_intents(intent_id)
         );
 
-        CREATE TABLE daemon_control_state (
+        CREATE TABLE IF NOT EXISTS daemon_control_state (
             singleton_id INTEGER PRIMARY KEY CHECK (singleton_id = 1),
             paused INTEGER NOT NULL DEFAULT 0 CHECK (paused IN (0, 1)),
             updated_at BIGINT NOT NULL
         );
-        INSERT INTO daemon_control_state (singleton_id, paused, updated_at)
+        INSERT OR IGNORE INTO daemon_control_state (singleton_id, paused, updated_at)
         VALUES (1, 0, CAST(strftime('%s','now') AS INTEGER));
         "#,
     )?;

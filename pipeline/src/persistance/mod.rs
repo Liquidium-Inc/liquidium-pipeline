@@ -10,7 +10,6 @@ pub mod liquidation_intake;
 pub mod sqlite;
 
 pub use finalizer_meta_v2::*;
-pub use liquidation_intake::*;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(i32)]
@@ -170,6 +169,7 @@ impl TryFrom<i32> for LiquidationIntentStatus {
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct LiquidationIntentRecord {
     pub intent_id: String,
     pub liquidation_id: Option<String>,

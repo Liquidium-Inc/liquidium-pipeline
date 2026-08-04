@@ -1,6 +1,5 @@
 use candid::Principal;
 use indicatif::{ProgressBar, ProgressStyle};
-use prettytable::{Cell, Row, Table, format};
 use std::fs::OpenOptions;
 use std::future::Future;
 use std::io::{IsTerminal, stderr, stdout};
@@ -16,21 +15,15 @@ use tracing::{Instrument, info, info_span, warn};
 
 use crate::config::Config;
 use crate::executors::basic::basic_executor::BasicExecutor;
-use crate::finalizers::liquidation_outcome::LiquidationOutcome;
-use crate::finalizers::{multi_venue::MultiVenueFinalizer, profit_calculator::SimpleProfitCalculator};
 use crate::liquidation::collateral_service::CollateralService;
 use crate::output::human_output_enabled;
-use crate::persistance::sqlite::SqliteWalStore;
+use crate::persistance::liquidation_intake::SqliteLiquidationIntentStore;
 use crate::price_oracle::price_oracle::LiquidationPriceOracle;
 use crate::stage::PipelineStage;
-use crate::stages::executor::ExecutionStatus;
-use crate::stages::{
-    export::ExportStage, finalize::FinalizeStage, opportunity::OpportunityFinder,
-    simple_strategy::SimpleLiquidationStrategy,
-};
+use crate::stages::{opportunity::OpportunityFinder, simple_strategy::SimpleLiquidationStrategy};
 use crate::watchdog::{Watchdog, WatchdogEvent, balance_monitor::LowBalanceMonitor};
 use anyhow::Context as _;
-use futures::{FutureExt, StreamExt, stream};
+use futures::FutureExt;
 use ic_agent::Agent;
 use liquidium_pipeline_core::tokens::{
     chain_token::ChainToken,
@@ -39,11 +32,7 @@ use liquidium_pipeline_core::tokens::{
 
 const FINDER_STAGE_TIMEOUT: Duration = Duration::from_secs(300);
 const LIQUIDATION_CYCLE_TIMEOUT: Duration = Duration::from_secs(300);
-const FINALIZER_STAGE_TIMEOUT: Duration = Duration::from_secs(300);
-const EXPORT_STAGE_TIMEOUT: Duration = Duration::from_secs(20);
 const WATCHDOG_STAGE_TIMEOUT: Duration = Duration::from_secs(10);
-const LIQUIDATION_NOTIFY_STAGE_TIMEOUT: Duration = Duration::from_secs(10);
-const LIQUIDATION_NOTIFY_CONCURRENCY: usize = 4;
 const LOW_BALANCE_MONITOR_STAGE_TIMEOUT: Duration = Duration::from_secs(45);
 const REFRESH_ALLOWANCES_TIMEOUT: Duration = Duration::from_secs(45);
 const SCAN_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(300);
@@ -92,61 +81,10 @@ pub(crate) fn start_spinner(enabled: bool) -> Option<ProgressBar> {
 fn set_spinner_message(spinner: &Option<ProgressBar>, paused: bool) {
     if let Some(s) = spinner.as_ref() {
         if paused {
-            s.set_message("Daemon paused; finalizing queued work only...");
+            s.set_message("Daemon paused; execution worker remains active...");
         } else {
             s.set_message("Scanning for liquidation opportunities...");
         }
-    }
-}
-
-/// Structured per-outcome logs consumed by journald/OTEL and auditor tooling.
-pub(crate) fn log_execution_results(results: &[LiquidationOutcome]) {
-    let success_count = results
-        .iter()
-        .filter(|r| matches!(r.status, ExecutionStatus::Success))
-        .count();
-
-    info!(
-        outcome_count = results.len(),
-        success_count,
-        failed_count = results.len() - success_count,
-        "Liquidation outcomes finalized"
-    );
-
-    for r in results {
-        let liquidation_id = r
-            .execution_receipt
-            .liquidation_result
-            .as_ref()
-            .map(|v| v.id.to_string())
-            .unwrap_or_else(|| "n/a".to_string());
-
-        let swap_status = r
-            .finalizer_result
-            .swap_result
-            .as_ref()
-            .map(|v| v.status.clone())
-            .unwrap_or_else(|| "none".to_string());
-        let status = r.status.description();
-
-        info!(
-            event = "liquidation_outcome",
-            liquidation_id = %liquidation_id,
-            borrower = %r.request.liquidation.borrower.to_text(),
-            debt_asset = %r.request.debt_asset.symbol(),
-            collateral_asset = %r.request.collateral_asset.symbol(),
-            debt_repaid = %r.formatted_debt_repaid(),
-            collateral_received = %r.formatted_received_collateral(),
-            swap_output = %r.formatted_swap_output(),
-            swapper = %r.formatted_swapper(),
-            swap_status = %swap_status,
-            status = %status,
-            expected_profit = r.expected_profit,
-            realized_profit = r.realized_profit,
-            profit_delta = r.realized_profit - r.expected_profit,
-            round_trip_secs = r.round_trip_secs.unwrap_or(-1),
-            "Liquidation outcome"
-        );
     }
 }
 
@@ -173,11 +111,17 @@ pub(crate) fn debt_assets_as_text(principals: &[Principal]) -> Vec<String> {
 ///
 /// This preflight fails fast with explicit path+permission diagnostics so the
 /// daemon does not enter a noisy retry loop when DB/export paths are invalid.
-pub(crate) fn ensure_runtime_file_permissions(db_path: &str, export_path: &str) -> anyhow::Result<()> {
+pub(crate) fn ensure_runtime_file_permissions(
+    db_path: &str,
+    liquidations_db_path: &str,
+    export_path: &str,
+) -> anyhow::Result<()> {
     ensure_parent_dir(Path::new(db_path), "DB_PATH")?;
+    ensure_parent_dir(Path::new(liquidations_db_path), "LIQUIDATIONS_DB_PATH")?;
     ensure_parent_dir(Path::new(export_path), "EXPORT_PATH")?;
 
     probe_rw_file(Path::new(db_path), "DB_PATH", false)?;
+    probe_rw_file(Path::new(liquidations_db_path), "LIQUIDATIONS_DB_PATH", false)?;
     probe_rw_file(Path::new(export_path), "EXPORT_PATH", true)?;
     Ok(())
 }
@@ -224,12 +168,14 @@ fn probe_rw_file(path: &Path, label: &str, append: bool) -> anyhow::Result<()> {
 ///   structured error logs while the daemon process keeps running.
 pub(crate) fn bootstrap_control_plane(
     sock_path: &Path,
-    db_path: &str,
+    liquidations_db_path: &str,
     paused: Arc<AtomicBool>,
     lifecycle_watchdog: Option<Arc<dyn Watchdog>>,
 ) -> anyhow::Result<()> {
-    let control_state_store =
-        Arc::new(SqliteWalStore::new_with_busy_timeout(db_path, 30_000).context("initialize control-state store")?);
+    let control_state_store = Arc::new(
+        SqliteLiquidationIntentStore::new_with_busy_timeout(liquidations_db_path, 30_000)
+            .context("initialize control-state store")?,
+    );
 
     // On daemon start we explicitly persist "running" as the baseline state.
     // This prevents stale paused values from previous process lifetimes.
@@ -292,18 +238,16 @@ pub(crate) fn bootstrap_control_plane(
 ///
 /// Auditor notes:
 /// - Paused mode suppresses only opportunity discovery/initiation.
-/// - Finalization/export and housekeeping always run to keep WAL state convergent.
+/// - Venue execution runs independently on the execution worker thread.
+/// - Housekeeping always runs to keep allowances and monitoring fresh.
 /// - The loop is intentionally infinite; process lifecycle is handled by supervisor.
 /// - Stage timeouts and panic recovery keep the daemon responsive during partial
 ///   downstream outages or unexpected runtime faults.
 pub(crate) async fn run_daemon_cycle_loop(
     finder: &OpportunityFinder<Agent>,
     strategy: &SimpleLiquidationStrategy<Config, TokenRegistry, CollateralService<LiquidationPriceOracle<Agent>>>,
-    executor: &Arc<BasicExecutor<Agent, SqliteWalStore>>,
-    exporter: &Arc<ExportStage>,
-    finalizer: &Arc<FinalizeStage<MultiVenueFinalizer, SqliteWalStore, SimpleProfitCalculator, Agent>>,
+    executor: &Arc<BasicExecutor<Agent, SqliteLiquidationIntentStore>>,
     liq_dog: &Arc<dyn Watchdog>,
-    slack_watchdog: Option<Arc<dyn Watchdog>>,
     low_balance_monitor: Option<Arc<LowBalanceMonitor>>,
     paused: Arc<AtomicBool>,
     debt_assets: &Vec<String>,
@@ -319,15 +263,11 @@ pub(crate) async fn run_daemon_cycle_loop(
             finder,
             strategy,
             executor,
-            exporter,
-            finalizer,
             liq_dog,
-            slack_watchdog.as_ref(),
             low_balance_monitor.as_deref(),
             paused.as_ref(),
             debt_assets,
             debt_asset_principals,
-            ui_enabled,
             &mut spinner,
             &mut last_alive_log,
         );
@@ -391,16 +331,12 @@ where
 async fn run_single_daemon_cycle(
     finder: &OpportunityFinder<Agent>,
     strategy: &SimpleLiquidationStrategy<Config, TokenRegistry, CollateralService<LiquidationPriceOracle<Agent>>>,
-    executor: &Arc<BasicExecutor<Agent, SqliteWalStore>>,
-    exporter: &Arc<ExportStage>,
-    finalizer: &Arc<FinalizeStage<MultiVenueFinalizer, SqliteWalStore, SimpleProfitCalculator, Agent>>,
+    executor: &Arc<BasicExecutor<Agent, SqliteLiquidationIntentStore>>,
     liq_dog: &Arc<dyn Watchdog>,
-    slack_watchdog: Option<&Arc<dyn Watchdog>>,
     low_balance_monitor: Option<&LowBalanceMonitor>,
     paused: &AtomicBool,
     debt_assets: &Vec<String>,
     debt_asset_principals: &[Principal],
-    ui_enabled: bool,
     spinner: &mut Option<ProgressBar>,
     last_alive_log: &mut Instant,
 ) -> CycleOutcome {
@@ -466,51 +402,6 @@ async fn run_single_daemon_cycle(
         }
     }
 
-    // Finalization is intentionally always-on, even while paused, so queued
-    // operations can complete and state can converge.
-    let outcomes = match stage_with_timeout("finalizer", FINALIZER_STAGE_TIMEOUT, finalizer.process(&())).await {
-        Some(Ok(results)) => results,
-        Some(Err(err)) => {
-            tracing::error!("Finalizer failed: {err}");
-            vec![]
-        }
-        None => {
-            had_timeout = true;
-            vec![]
-        }
-    };
-
-    if outcomes.is_empty() {
-        set_spinner_message(spinner, is_paused);
-    } else {
-        match stage_with_timeout("exporter", EXPORT_STAGE_TIMEOUT, exporter.process(&outcomes)).await {
-            Some(Ok(())) => {}
-            Some(Err(err)) => {
-                warn!("Failed to export results: {}", err);
-            }
-            None => {
-                had_timeout = true;
-            }
-        }
-        log_execution_results(&outcomes);
-        if stage_with_timeout(
-            "watchdog.liquidation_notifications",
-            LIQUIDATION_NOTIFY_STAGE_TIMEOUT,
-            notify_liquidation_outcomes(slack_watchdog, &outcomes),
-        )
-        .await
-        .is_none()
-        {
-            had_timeout = true;
-        }
-
-        if ui_enabled {
-            print_execution_results(outcomes.clone());
-        }
-        *spinner = start_spinner(ui_enabled);
-        set_spinner_message(spinner, is_paused);
-    }
-
     // Housekeeping stays active in both running and paused states so
     // monitoring and allowances remain fresh while initiation is suspended.
     if stage_with_timeout(
@@ -555,98 +446,6 @@ async fn run_single_daemon_cycle(
     CycleOutcome { is_paused, had_timeout }
 }
 
-async fn notify_liquidation_outcomes(slack_watchdog: Option<&Arc<dyn Watchdog>>, outcomes: &[LiquidationOutcome]) {
-    let Some(watchdog) = slack_watchdog else {
-        return;
-    };
-
-    stream::iter(outcomes)
-        .for_each_concurrent(LIQUIDATION_NOTIFY_CONCURRENCY, |outcome| async move {
-            watchdog.notify(liquidation_finalized_event(outcome)).await;
-        })
-        .await;
-}
-
-fn liquidation_finalized_event(outcome: &LiquidationOutcome) -> WatchdogEvent<'static> {
-    let liquidation_id = outcome
-        .execution_receipt
-        .liquidation_result
-        .as_ref()
-        .map(|v| v.id.to_string())
-        .unwrap_or_else(|| "n/a".to_string());
-
-    WatchdogEvent::LiquidationFinalized {
-        liquidation_id,
-        borrower: outcome.request.liquidation.borrower.to_text(),
-        debt_asset: outcome.request.debt_asset.symbol(),
-        collateral_asset: outcome.request.collateral_asset.symbol(),
-        status: outcome.status.description(),
-        debt_repaid: outcome.formatted_debt_repaid(),
-        collateral_received: outcome.formatted_received_collateral(),
-        swap_output: outcome.formatted_swap_output(),
-        swapper: outcome.formatted_swapper(),
-        expected_profit: outcome.formatted_expected_profit(),
-        realized_profit: outcome.formatted_realized_profit(),
-        profit_delta: outcome.formatted_profit_delta(),
-        round_trip_secs: outcome.formatted_round_trip_secs(),
-    }
-}
-
-pub(crate) fn print_execution_results(results: Vec<LiquidationOutcome>) {
-    let mut table = Table::new();
-    table.set_format(*format::consts::FORMAT_NO_LINESEP_WITH_TITLE);
-    table.set_titles(Row::new(vec![
-        Cell::new("Realized (Δ)"),
-        Cell::new("Expected"),
-        Cell::new("Debt Repaid"),
-        Cell::new("Collateral"),
-        Cell::new("Swap Output"),
-        Cell::new("Swap Status"),
-        Cell::new("Swapper"),
-        Cell::new("Round Trip (s)"),
-        Cell::new("Status"),
-    ]));
-
-    for r in results {
-        let (debt, collat) = (r.formatted_debt_repaid(), r.formatted_received_collateral());
-
-        let (recv_amt, swap_status) = match &r.finalizer_result.swap_result {
-            Some(sr) => (r.formatted_swap_output(), sr.status.clone()),
-            None => ("-".to_string(), "-".to_string()),
-        };
-
-        let delta = r.realized_profit - r.expected_profit;
-        let delta_cell = {
-            let txt = format!("{} ({})", r.formatted_realized_profit(), r.formatted_profit_delta());
-            match delta.cmp(&0) {
-                std::cmp::Ordering::Greater => Cell::new(&txt).style_spec("Fg"),
-                std::cmp::Ordering::Less => Cell::new(&txt).style_spec("Fr"),
-                std::cmp::Ordering::Equal => Cell::new(&txt),
-            }
-        };
-
-        let status_text = r.status.description();
-        let status_cell = match &r.status {
-            ExecutionStatus::Success => Cell::new(&status_text).style_spec("Fg"),
-            _ => Cell::new(&status_text).style_spec("Fr"),
-        };
-
-        table.add_row(Row::new(vec![
-            delta_cell,
-            Cell::new(&r.formatted_expected_profit()),
-            Cell::new(&debt),
-            Cell::new(&collat),
-            Cell::new(&recv_amt),
-            Cell::new(&swap_status),
-            Cell::new(&r.formatted_swapper()),
-            Cell::new(&r.formatted_round_trip_secs()),
-            status_cell,
-        ]));
-    }
-
-    table.printstd();
-}
-
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
@@ -677,12 +476,18 @@ mod tests {
     fn runtime_file_preflight_creates_missing_parents_and_files() {
         let tmp = TempDir::new().expect("tmp");
         let db = tmp.path().join("state/wal.db");
+        let liquidations_db = tmp.path().join("state/liquidations.db");
         let export = tmp.path().join("exports/executions.csv");
 
-        ensure_runtime_file_permissions(db.to_str().expect("db path"), export.to_str().expect("export path"))
-            .expect("preflight should pass");
+        ensure_runtime_file_permissions(
+            db.to_str().expect("db path"),
+            liquidations_db.to_str().expect("liquidations db path"),
+            export.to_str().expect("export path"),
+        )
+        .expect("preflight should pass");
 
         assert!(db.is_file());
+        assert!(liquidations_db.is_file());
         assert!(export.is_file());
     }
 
@@ -691,11 +496,15 @@ mod tests {
         let tmp = TempDir::new().expect("tmp");
         let db_dir = tmp.path().join("dbdir");
         std::fs::create_dir_all(&db_dir).expect("mkdir");
+        let liquidations_db = tmp.path().join("liquidations.db");
         let export = tmp.path().join("exports/executions.csv");
 
-        let err =
-            ensure_runtime_file_permissions(db_dir.to_str().expect("db dir"), export.to_str().expect("export path"))
-                .expect_err("directory path must fail");
+        let err = ensure_runtime_file_permissions(
+            db_dir.to_str().expect("db dir"),
+            liquidations_db.to_str().expect("liquidations db path"),
+            export.to_str().expect("export path"),
+        )
+        .expect_err("directory path must fail");
         assert!(err.to_string().contains("DB_PATH"));
     }
 }

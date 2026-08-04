@@ -218,6 +218,48 @@ impl SqliteWalStore {
             }
         }
     }
+
+    /// Imports one scanner handoff without ever updating an existing execution
+    /// row. The row insert and durable source cursor advance are atomic.
+    pub async fn import_handoff(&self, sequence: i64, row: LiqResultRecord) -> Result<bool> {
+        self.ensure_writable()?;
+        let mut conn = self.get_conn()?;
+        conn.transaction::<_, anyhow::Error, _>(|conn| {
+            let current = current_intake_sequence(conn)?;
+            if sequence <= current {
+                return Ok(false);
+            }
+
+            let inserted = diesel::insert_into(tbl::table)
+                .values(&Self::to_row(&row))
+                .on_conflict(tbl::liq_id)
+                .do_nothing()
+                .execute(conn)?;
+            diesel::sql_query("UPDATE intake_import_state SET last_handoff_sequence = ? WHERE singleton_id = 1")
+                .bind::<BigInt, _>(sequence)
+                .execute(conn)?;
+            Ok(inserted == 1)
+        })
+    }
+
+    pub fn intake_import_sequence(&self) -> Result<i64> {
+        let mut conn = self.get_conn()?;
+        current_intake_sequence(&mut conn)
+    }
+}
+
+fn current_intake_sequence(conn: &mut SqliteConnection) -> Result<i64> {
+    #[derive(QueryableByName)]
+    struct CursorRow {
+        #[diesel(sql_type = BigInt)]
+        last_handoff_sequence: i64,
+    }
+
+    Ok(
+        diesel::sql_query("SELECT last_handoff_sequence FROM intake_import_state WHERE singleton_id = 1 LIMIT 1")
+            .get_result::<CursorRow>(conn)?
+            .last_handoff_sequence,
+    )
 }
 
 #[async_trait]
@@ -354,7 +396,9 @@ pub(crate) fn initialize_role_and_schema(
     initialize_schema: fn(&mut SqliteConnection) -> Result<()>,
 ) -> Result<()> {
     if metadata_table_exists(conn)? {
-        return validate_database_role(conn, expected_role);
+        validate_database_role(conn, expected_role)?;
+        initialize_schema(conn)?;
+        return Ok(());
     }
 
     let user_tables = user_table_names(conn)?;
@@ -452,6 +496,13 @@ pub fn initialize_schema(conn: &mut SqliteConnection) -> Result<()> {
         );
         INSERT OR IGNORE INTO daemon_control_state (singleton_id, paused, updated_at)
         VALUES (1, 0, CAST(strftime('%s','now') AS INTEGER));
+
+        CREATE TABLE IF NOT EXISTS intake_import_state (
+            singleton_id INTEGER PRIMARY KEY CHECK (singleton_id = 1),
+            last_handoff_sequence BIGINT NOT NULL DEFAULT 0
+        );
+        INSERT OR IGNORE INTO intake_import_state (singleton_id, last_handoff_sequence)
+        VALUES (1, 0);
 
     "#,
     )?;
@@ -728,5 +779,40 @@ mod tests {
             format!("{error:#}").contains("role mismatch"),
             "unexpected error: {error:#}"
         );
+    }
+
+    #[tokio::test]
+    async fn handoff_import_advances_cursor_without_overwriting_existing_execution() {
+        let temp = tempfile::NamedTempFile::new().expect("tmp db");
+        let path = temp.path().display().to_string();
+        let store = SqliteWalStore::new(&path).expect("WAL store");
+        let now = now_secs();
+        let source_row = LiqResultRecord {
+            id: "liq-42".to_string(),
+            status: ResultStatus::Enqueued,
+            attempt: 0,
+            error_count: 0,
+            last_error: None,
+            created_at: now,
+            updated_at: now,
+            meta_json: "source".to_string(),
+        };
+
+        assert!(store.import_handoff(1, source_row.clone()).await.expect("first import"));
+        let mut checkpointed = source_row.clone();
+        checkpointed.status = ResultStatus::InFlight;
+        checkpointed.attempt = 3;
+        checkpointed.meta_json = "checkpoint".to_string();
+        store.upsert_result(checkpointed).await.expect("checkpoint row");
+
+        assert!(!store.import_handoff(2, source_row).await.expect("duplicate import"));
+        assert_eq!(store.intake_import_sequence().expect("cursor"), 2);
+        let stored = store.get_result("liq-42").await.unwrap().unwrap();
+        assert_eq!(stored.status, ResultStatus::InFlight);
+        assert_eq!(stored.attempt, 3);
+        assert_eq!(stored.meta_json, "checkpoint");
+
+        assert!(!store.import_handoff(2, stored).await.expect("replayed cursor"));
+        assert_eq!(store.intake_import_sequence().expect("cursor"), 2);
     }
 }
