@@ -196,10 +196,10 @@ async fn init(
     let config = ctx.config.clone();
     let agent = ctx.agent.clone();
     let registry = ctx.registry.clone();
-    let db = Arc::new(SqliteWalStore::new(&config.db_path).map_err(|e| format!("could not connect to db: {e}"))?);
+    let db = Arc::new(SqliteWalStore::new(&config.db_path).map_err(|e| format!("could not connect to db: {e:#}"))?);
     let intents = Arc::new(
         SqliteLiquidationIntentStore::new(&config.liquidations_db_path)
-            .map_err(|e| format!("could not connect to liquidation intake db: {e}"))?,
+            .map_err(|e| format!("could not connect to liquidation intake db: {e:#}"))?,
     );
     let recovered = intents
         .recover_submitting_as_ambiguous("process restarted during liquidation submission")
