@@ -198,9 +198,9 @@ impl<P: PriceOracle> CollateralServiceTrait for CollateralService<P> {
             let coll_quote = (p_ray.clone() * pos.collateral_amount.clone()) / scale.clone();
             total_coll_quote_new += coll_quote.clone();
 
-            // NOTE: expect per-position liquidation threshold bps available on the position.
-            // This mirrors canister's: weighted_liquidation_threshold = sum(coll_value * pool.liq_threshold_bps) / total_collateral
-            let liq_threshold_bps = Nat::from(8500u64);
+            // Mirror the canister's per-pool weighting:
+            // weighted_liquidation_threshold = sum(coll_value * pool.liq_threshold_bps) / total_collateral
+            let liq_threshold_bps = Nat::from(pos.liquidation_threshold);
             weighted_sum_new += coll_quote * liq_threshold_bps;
         }
 
@@ -500,6 +500,7 @@ mod test {
         let denom_bps = tenk.clone() + bonus - fee_on_bonus; // 10_980
         let coll_scale = Nat::from(10u128.pow(8)); // BTC sats
         let debt_scale = Nat::from(10u128.pow(6)); // USDT 6-dec
+
         // coll_cap_quote_ray = price_btc_ray * 100_000 sats / 1e8
         let coll_cap_quote_ray = (price_btc_ray.clone() * Nat::from(100_000u64)) / coll_scale;
         let r_max_quote_ray = (coll_cap_quote_ray * tenk) / denom_bps;
@@ -604,6 +605,68 @@ mod test {
 
         assert!(post_coll < before_coll);
         assert!(post_debt_native < before_debt_native);
+    }
+
+    #[tokio::test]
+    async fn projected_hf_uses_each_positions_liquidation_threshold() {
+        let mut mock_oracle = MockPriceOracle::new();
+        mock_oracle.expect_get_price().returning(|base, _| match base {
+            "BTC" => Ok(((80_000u128 * 10u128.pow(27)).into(), 27)),
+            "USDC" | "USDT" => Ok(((10u128.pow(27)).into(), 27)),
+            _ => Err(format!("unsupported asset: {base}")),
+        });
+
+        let service = CollateralService::new(Arc::new(mock_oracle));
+        let account = Principal::anonymous();
+        let debt_position = LiquidateblePosition {
+            pool_id: Principal::anonymous(),
+            account,
+            asset: Assets::USDT,
+            asset_type: AssetType::CkAsset(Principal::anonymous()),
+            debt_amount: Nat::from(100_000_000u64), // $100
+            collateral_amount: Nat::from(0u8),
+            liquidation_bonus: 0,
+            liquidation_threshold: 0,
+            protocol_fee: 0,
+        };
+        let btc_collateral = LiquidateblePosition {
+            pool_id: Principal::anonymous(),
+            account,
+            asset: Assets::BTC,
+            asset_type: AssetType::CkAsset(Principal::anonymous()),
+            debt_amount: Nat::from(0u8),
+            collateral_amount: Nat::from(125_000u64), // $100
+            liquidation_bonus: 0,
+            liquidation_threshold: 7_000,
+            protocol_fee: 0,
+        };
+        let usdc_collateral = LiquidateblePosition {
+            pool_id: Principal::anonymous(),
+            account,
+            asset: Assets::USDC,
+            asset_type: AssetType::CkAsset(Principal::anonymous()),
+            debt_amount: Nat::from(0u8),
+            collateral_amount: Nat::from(100_000_000u64), // $100
+            liquidation_bonus: 0,
+            liquidation_threshold: 9_000,
+            protocol_fee: 0,
+        };
+        let mut user = LiquidatebleUser {
+            account,
+            health_factor: Nat::from(900u64),
+            weighted_liquidation_threshold: Nat::from(8_000u64),
+            positions: vec![debt_position.clone(), btc_collateral, usdc_collateral.clone()],
+            total_debt: Nat::from(100u128 * 10u128.pow(27)),
+        };
+
+        service
+            .calculate_liquidation_amounts(Nat::from(0u8), &debt_position, &usdc_collateral, &mut user)
+            .await
+            .expect("health-factor projection should succeed");
+
+        // Equal-value collateral at 70% and 90% has an 80% weighted threshold:
+        // ($200 * 0.8 / $100) * 1000 = 1600 permille.
+        assert_eq!(user.health_factor, Nat::from(1_600u64));
     }
 
     #[tokio::test]
