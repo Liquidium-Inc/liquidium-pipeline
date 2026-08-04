@@ -74,37 +74,6 @@ pub(super) fn draw_executions(f: &mut Frame<'_>, area: Rect, app: &App) {
 
     let now = Local::now().timestamp();
 
-    let rows = exec.rows.iter().enumerate().map(|(idx, r)| {
-        let status = status_label(r.status);
-        let status_cell = Cell::new(status).style(status_style(r.status));
-
-        let age_secs = now.saturating_sub(r.updated_at);
-        let updated = format_age(age_secs);
-
-        let profit_cell = profit_cell_for_row(r, app);
-
-        let last_error = r
-            .last_error
-            .as_deref()
-            .map(|e| truncate(e, 34))
-            .unwrap_or_else(|| "-".to_string());
-
-        let mut row = Row::new(vec![
-            status_cell,
-            Cell::new(truncate(&r.liq_id, 14)),
-            Cell::new(r.attempt.to_string()),
-            Cell::new(r.error_count.to_string()),
-            Cell::new(updated),
-            profit_cell,
-            Cell::new(last_error),
-        ]);
-
-        if idx == app.executions_selected {
-            row = row.style(Style::default().bg(Color::DarkGray));
-        }
-        row
-    });
-
     let header = Row::new(vec![
         Cell::new("Status"),
         Cell::new("Liq ID"),
@@ -167,6 +136,46 @@ pub(super) fn draw_executions(f: &mut Frame<'_>, area: Rect, app: &App) {
         return;
     }
 
+    // A stateless `Table` always starts at row zero. Slice the backing rows so
+    // keyboard selection remains visible when the WAL contains more entries
+    // than fit in the panel.
+    let visible_rows = body_layout[0].height.saturating_sub(3) as usize;
+    let viewport_start = wal_viewport_start(app.executions_selected, exec.rows.len(), visible_rows);
+    let rows = exec
+        .rows
+        .iter()
+        .enumerate()
+        .skip(viewport_start)
+        .take(visible_rows)
+        .map(|(idx, r)| {
+            let status = status_label(r.status);
+            let status_cell = Cell::new(status).style(status_style(r.status));
+
+            let age_secs = now.saturating_sub(r.updated_at);
+            let updated = format_age(age_secs);
+            let profit_cell = profit_cell_for_row(r, app);
+            let last_error = r
+                .last_error
+                .as_deref()
+                .map(|e| truncate(e, 34))
+                .unwrap_or_else(|| "-".to_string());
+
+            let mut row = Row::new(vec![
+                status_cell,
+                Cell::new(truncate(&r.liq_id, 14)),
+                Cell::new(r.attempt.to_string()),
+                Cell::new(r.error_count.to_string()),
+                Cell::new(updated),
+                profit_cell,
+                Cell::new(last_error),
+            ]);
+
+            if idx == app.executions_selected {
+                row = row.style(Style::default().bg(Color::DarkGray));
+            }
+            row
+        });
+
     let table = Table::new(
         rows,
         [
@@ -183,6 +192,18 @@ pub(super) fn draw_executions(f: &mut Frame<'_>, area: Rect, app: &App) {
     .block(table_block);
 
     f.render_widget(table, body_layout[0]);
+}
+
+fn wal_viewport_start(selected: usize, row_count: usize, visible_rows: usize) -> usize {
+    if row_count == 0 || visible_rows == 0 {
+        return 0;
+    }
+
+    let selected = selected.min(row_count - 1);
+    selected
+        .saturating_add(1)
+        .saturating_sub(visible_rows)
+        .min(row_count.saturating_sub(visible_rows))
 }
 
 fn status_label(status: ResultStatus) -> &'static str {
@@ -817,7 +838,7 @@ fn format_profit(amount: i128, decimals: u8, symbol: &str) -> String {
 mod tests {
     use super::{
         WalProfitSnapshot, append_meta_summary, append_venue_leg_summary, icpswap_account_principal,
-        profit_display_from_snapshot, status_label, truncate,
+        profit_display_from_snapshot, status_label, truncate, wal_viewport_start,
     };
     use crate::{
         persistance::{ResultStatus, VenueExecutionState, VenueLegQuote, VenueLegState, VenueLegStatus},
@@ -844,6 +865,21 @@ mod tests {
     #[test]
     fn unresumable_status_is_visible_in_executions() {
         assert_eq!(status_label(ResultStatus::Unresumable), "unresumable");
+    }
+
+    #[test]
+    fn wal_viewport_follows_selection_below_visible_rows() {
+        assert_eq!(wal_viewport_start(0, 20, 5), 0);
+        assert_eq!(wal_viewport_start(4, 20, 5), 0);
+        assert_eq!(wal_viewport_start(5, 20, 5), 1);
+        assert_eq!(wal_viewport_start(19, 20, 5), 15);
+    }
+
+    #[test]
+    fn wal_viewport_handles_small_or_collapsed_tables() {
+        assert_eq!(wal_viewport_start(3, 4, 10), 0);
+        assert_eq!(wal_viewport_start(3, 4, 0), 0);
+        assert_eq!(wal_viewport_start(0, 0, 5), 0);
     }
 
     #[test]
