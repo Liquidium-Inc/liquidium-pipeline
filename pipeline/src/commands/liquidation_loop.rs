@@ -21,9 +21,11 @@ use crate::{
     control_plane::acquire_daemon_instance,
     executors::basic::basic_executor::BasicExecutor,
     finalizers::{
+        kraken::runtime::build_kraken_finalizer,
         mexc::runtime::build_mexc_finalizer,
         multi_venue::{
-            ICPSWAP_VENUE_ID, IcpswapFirstPlannerConfig, MEXC_VENUE_ID, MultiVenueAdapter, MultiVenueFinalizer,
+            ICPSWAP_VENUE_ID, IcpswapFirstPlannerConfig, KRAKEN_VENUE_ID, MEXC_VENUE_ID, MultiVenueAdapter,
+            MultiVenueFinalizer,
         },
         profit_calculator::SimpleProfitCalculator,
     },
@@ -238,6 +240,7 @@ async fn init(
                     .ok_or_else(|| "ICPSwap is enabled but its adapter was not initialized".to_string())?,
             ),
             MEXC_VENUE_ID => venue_adapters.push(build_mexc_finalizer(ctx.as_ref()).await?),
+            KRAKEN_VENUE_ID => venue_adapters.push(build_kraken_finalizer(ctx.as_ref()).await?),
             _ => return Err(format!("unsupported enabled swap venue `{venue_id}`")),
         }
     }

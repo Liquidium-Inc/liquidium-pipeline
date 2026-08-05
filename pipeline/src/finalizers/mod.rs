@@ -2,6 +2,7 @@ pub(crate) mod bridge_planner;
 pub mod cex_finalizer;
 pub mod finalizer;
 pub mod icpswap;
+pub mod kraken;
 pub mod liquidation_outcome;
 pub mod mexc;
 pub mod multi_venue;
