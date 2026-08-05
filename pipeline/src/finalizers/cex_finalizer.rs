@@ -16,6 +16,7 @@ use crate::{
 use log::{debug, error, info};
 
 pub mod execution;
+pub(crate) mod runtime;
 pub(crate) mod utils;
 
 pub use execution::{CexBridgeConfig, CexBridgeDependencies, CexFinalizer, CexVenueProfile};
