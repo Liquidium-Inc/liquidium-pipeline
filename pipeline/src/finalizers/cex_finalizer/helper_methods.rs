@@ -422,14 +422,18 @@ where
     async fn resolve_hop_route(&self, deposit_symbol: &str, withdraw_symbol: &str) -> Result<Vec<TradeLeg>, String> {
         if self.cex_available_pairs.is_empty() {
             return Err(format!(
-                "no configured MEXC pairs for hop discovery ({} -> {})",
-                deposit_symbol, withdraw_symbol
+                "no configured {} pairs for hop discovery ({} -> {})",
+                self.profile.venue_id(),
+                deposit_symbol,
+                withdraw_symbol
             ));
         }
         if self.cex_max_hops == 0 {
             return Err(format!(
-                "hop discovery disabled by CEX_MEXC_MAX_HOPS=0 ({} -> {})",
-                deposit_symbol, withdraw_symbol
+                "hop discovery disabled for {} by max_hops=0 ({} -> {})",
+                self.profile.venue_id(),
+                deposit_symbol,
+                withdraw_symbol
             ));
         }
 

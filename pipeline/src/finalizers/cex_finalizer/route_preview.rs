@@ -18,14 +18,17 @@ where
     B: CexBackend,
 {
     /// Compounds the normalized reference and execution prices for every CEX
-    /// hop so all MEXC routing paths make decisions from the same calculation.
+    /// hop so all CEX routing paths make decisions from the same calculation.
     pub(super) async fn preview_resolved_trade_route(
         &self,
         legs: &[TradeLeg],
         initial_amount: f64,
     ) -> Result<CexResolvedRoutePreview, String> {
         if !initial_amount.is_finite() || initial_amount <= LIQUIDITY_EPS {
-            return Err("MEXC cannot quote a non-positive pay amount".to_string());
+            return Err(format!(
+                "{} cannot quote a non-positive pay amount",
+                self.profile.venue_id()
+            ));
         }
 
         let mut amount_in = initial_amount;
@@ -41,10 +44,18 @@ where
             } else if impact_ratio < 1.0 {
                 gross_execution_price / (1.0 - impact_ratio)
             } else {
-                return Err(format!("MEXC returned invalid price impact for {}", leg.market));
+                return Err(format!(
+                    "{} returned invalid price impact for {}",
+                    self.profile.venue_id(),
+                    leg.market
+                ));
             };
             if !reference_price.is_finite() || reference_price <= 0.0 {
-                return Err(format!("MEXC returned an invalid preview for {}", leg.market));
+                return Err(format!(
+                    "{} returned an invalid preview for {}",
+                    self.profile.venue_id(),
+                    leg.market
+                ));
             }
             route_reference_price *= reference_price;
             amount_in = amount_out;
