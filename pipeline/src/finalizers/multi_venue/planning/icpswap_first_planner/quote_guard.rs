@@ -10,31 +10,9 @@ use crate::{
 };
 
 use super::{
-    BPS_DENOMINATOR, IcpswapFirstPlanInput, IcpswapFirstPlanner, IcpswapFirstPlannerError,
-    ORACLE_GUARD_MIN_TEST_ALLOCATION_USD, input::positive_price,
+    BPS_DENOMINATOR, IcpswapFirstPlanInput, IcpswapFirstPlanner, IcpswapFirstPlannerError, input::positive_price,
 };
 use crate::finalizers::multi_venue::planning::icpswap_first_planner_utils::validate_preview;
-
-/// Startup notice that a configured test allocation has switched the oracle
-/// quote guard off for that leg. Loud on purpose: it is a live routing setting,
-/// not a test-harness flag, so it can reach production unnoticed.
-pub(in crate::finalizers::multi_venue) fn oracle_guard_waiver_banner(target_usd: f64) -> String {
-    let rule = "=".repeat(66);
-    format!(
-        "\n{rule}\n\
-         ⚠️  ORACLE QUOTE GUARD DISABLED FOR THE ICPSWAP TEST LEG  ⚠️\n\
-         {rule}\n\
-         ICPSWAP_TEST_ALLOCATION_USD=${target_usd:.2} is below the \
-         ${ORACLE_GUARD_MIN_TEST_ALLOCATION_USD:.2} minimum, so that leg's\n\
-         quote is NOT priced against the oracle on any liquidation. At this size\n\
-         its fixed ledger fees are a larger share of the leg than the whole\n\
-         discount budget, so the check cannot say anything about the price.\n\
-         The overflow remainder is still checked. Raise the allocation to \
-         ${ORACLE_GUARD_MIN_TEST_ALLOCATION_USD:.2} or\n\
-         clear ICPSWAP_TEST_ALLOCATION_USD to price every leg again.\n\
-         {rule}"
-    )
-}
 
 /// Maps a ledger token onto the symbol the price oracle is keyed by.
 ///

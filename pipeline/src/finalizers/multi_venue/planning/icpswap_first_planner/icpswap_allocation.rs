@@ -2,91 +2,19 @@ use std::cmp::max;
 
 use candid::Nat;
 use liquidium_pipeline_core::tokens::chain_token_amount::ChainTokenAmount;
-use tracing::warn;
 
 use crate::{
     finalizers::multi_venue::VenueRoutePreview,
     persistance::{MultiVenueAllocationReason, MultiVenueExecutionState},
 };
 
-use super::{
-    BPS_DENOMINATOR, ICPSWAP_VENUE_ID, IcpswapFirstPlanInput, IcpswapFirstPlanner, IcpswapFirstPlannerError,
-    ORACLE_GUARD_MIN_TEST_ALLOCATION_USD,
-};
+use super::{BPS_DENOMINATOR, ICPSWAP_VENUE_ID, IcpswapFirstPlanInput, IcpswapFirstPlanner, IcpswapFirstPlannerError};
 
 impl IcpswapFirstPlanner {
-    /// Test-only deterministic split used to exercise concurrent venue status
-    /// and execution. Normal price-impact allocation remains unchanged when
-    /// the override is absent.
-    pub(super) async fn plan_test_fixed_icpswap_split(
-        &self,
-        input: &IcpswapFirstPlanInput,
-        quoted_at: i64,
-        target_usd: f64,
-    ) -> Result<MultiVenueExecutionState, IcpswapFirstPlannerError> {
-        if self.overflow_venue_ids.is_empty() {
-            return Err(IcpswapFirstPlannerError::NoViableRoute(
-                "test ICPSwap split requires an enabled overflow venue".to_string(),
-            ));
-        }
-        let reference_price = input.pay_reference_price_usd.ok_or_else(|| {
-            IcpswapFirstPlannerError::NoViableRoute(
-                "test ICPSwap USD split requires a positive collateral reference price".to_string(),
-            )
-        })?;
-        let icpswap_value =
-            ChainTokenAmount::from_formatted(input.total_pay.token.clone(), target_usd / reference_price).value;
-        if icpswap_value == Nat::from(0u8) {
-            return Err(IcpswapFirstPlannerError::NoViableRoute(format!(
-                "test ICPSwap allocation ${target_usd:.2} rounds to zero native units"
-            )));
-        }
-        if icpswap_value >= input.total_pay.value {
-            return Err(IcpswapFirstPlannerError::NoViableRoute(format!(
-                "received collateral is too small to split ${target_usd:.2} to ICPSwap and leave a MEXC remainder"
-            )));
-        }
-
-        let remainder_value = input.total_pay.value.clone() - icpswap_value.clone();
-        let remainder = ChainTokenAmount::from_raw(input.total_pay.token.clone(), remainder_value.clone());
-        if !input.meets_cex_minimum(&remainder, self.config.cex_min_exec_usd) {
-            return self.plan_below_minimum_remainder(input, quoted_at).await;
-        }
-
-        let icpswap_request = input.request_for(ICPSWAP_VENUE_ID, icpswap_value);
-        // Only the forced leg is exempted; the MEXC remainder holds the bulk of
-        // the collateral and is large enough for the guard to mean something.
-        let unguarded_input = self.oracle_guard_waived_for_test_leg(target_usd).then(|| {
-            warn!(
-                "[multi-venue] liq_id={} oracle quote guard waived for the ${target_usd:.2} ICPSwap test leg",
-                input.liquidation_id
-            );
-            let mut unguarded = input.clone();
-            unguarded.pay_reference_price_ray = None;
-            unguarded.receive_reference_price_ray = None;
-            unguarded
-        });
-        let icpswap_input = unguarded_input.as_ref().unwrap_or(input);
-        let icpswap = self
-            .preview_exact(icpswap_input, ICPSWAP_VENUE_ID, &icpswap_request)
-            .await?;
-        if !self.is_safe_icpswap(&icpswap) {
-            return Err(IcpswapFirstPlannerError::NoViableRoute(format!(
-                "test ICPSwap allocation impact {:.2} bps is not below {:.2} bps",
-                icpswap.quote.estimated_price_impact_bps, self.config.max_price_impact_bps
-            )));
-        }
-        let overflow = self.ordered_overflow_previews(input, remainder_value).await?;
-        let mut previews = vec![icpswap];
-        previews.extend(overflow);
-
-        self.build_state(input, previews, MultiVenueAllocationReason::PriceImpactSplit, quoted_at)
-    }
-
     // Avoids a dust overflow leg by re-quoting the full amount on ICPSwap with
     // the narrowly relaxed fallback cap. If that quote is still too expensive,
     // the full amount is sent to the best executable overflow venue.
-    async fn plan_below_minimum_remainder(
+    pub(super) async fn plan_below_minimum_remainder(
         &self,
         input: &IcpswapFirstPlanInput,
         quoted_at: i64,
@@ -317,18 +245,6 @@ impl IcpswapFirstPlanner {
         }
 
         Ok(last_safe)
-    }
-
-    /// Whether the forced test leg is too small for the oracle guard to say
-    /// anything about its price.
-    ///
-    /// ICPSwap reserves three input ledger fees before the pool sees the money,
-    /// and the guard measures against the whole allocation. That gap is a share
-    /// of the leg, so on a small one it can exceed the entire discount budget by
-    /// itself -- three ckUSDC transfers are 3% of a $1 leg -- and the guard would
-    /// reject a quote priced perfectly.
-    fn oracle_guard_waived_for_test_leg(&self, target_usd: f64) -> bool {
-        target_usd < ORACLE_GUARD_MIN_TEST_ALLOCATION_USD
     }
 
     // The threshold is strict: exactly 100 bps is not below a 100 bps limit.

@@ -23,6 +23,9 @@ pub struct IcpswapFirstPlannerConfig {
     /// it as a fallback for a live oracle read.
     pub oracle_snapshot_max_age_secs: i64,
     pub icpswap_test_allocation_usd: Option<f64>,
+    /// Fixed test allocation for MEXC. When present, the forced ICPSwap test
+    /// split becomes ICPSwap, then MEXC, then the exact Kraken remainder.
+    pub mexc_test_allocation_usd: Option<f64>,
 }
 
 impl IcpswapFirstPlannerConfig {
@@ -104,6 +107,24 @@ impl IcpswapFirstPlannerConfig {
             return Err(IcpswapFirstPlannerError::InvalidInput(
                 "test ICPSwap allocation USD must be finite and positive".to_string(),
             ));
+        }
+        if let Some(value) = self.mexc_test_allocation_usd {
+            if !value.is_finite() || value <= 0.0 {
+                return Err(IcpswapFirstPlannerError::InvalidInput(
+                    "test MEXC allocation USD must be finite and positive".to_string(),
+                ));
+            }
+            if self.icpswap_test_allocation_usd.is_none() {
+                return Err(IcpswapFirstPlannerError::InvalidInput(
+                    "test MEXC allocation requires a test ICPSwap allocation".to_string(),
+                ));
+            }
+            if value < self.cex_min_exec_usd {
+                return Err(IcpswapFirstPlannerError::InvalidInput(format!(
+                    "test MEXC allocation ${value:.2} is below the ${:.2} CEX execution minimum",
+                    self.cex_min_exec_usd
+                )));
+            }
         }
         Ok(())
     }

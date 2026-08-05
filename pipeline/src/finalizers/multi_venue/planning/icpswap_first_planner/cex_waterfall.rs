@@ -96,7 +96,7 @@ impl IcpswapFirstPlanner {
 
     /// Returns an exact CEX preview only when it satisfies the common impact
     /// ceiling and the planner's minimum-notional rule.
-    async fn preview_safe_cex(
+    pub(super) async fn preview_safe_cex(
         &self,
         input: &IcpswapFirstPlanInput,
         venue_id: &str,

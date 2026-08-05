@@ -102,6 +102,9 @@ pub struct Config {
     /// Test-only fixed USD allocation sent to ICPSwap before routing the
     /// remainder to an overflow venue. Unset preserves the normal policy.
     pub icpswap_test_allocation_usd: Option<f64>,
+    /// Test-only fixed USD allocation sent to MEXC after the forced ICPSwap
+    /// leg. Requires `icpswap_test_allocation_usd`; Kraken receives the rest.
+    pub mexc_test_allocation_usd: Option<f64>,
     /// Ordered venue IDs eligible for new multi-venue plans.
     pub enabled_swap_venues: Vec<String>,
     pub cex_credentials: HashMap<String, (String, String)>,
@@ -355,10 +358,22 @@ impl Config {
         let icpswap_factory_canister = parse_icpswap_factory_from_env()?;
         let icpswap_fee_tiers = parse_icpswap_fee_tiers_from_env()?;
         let icpswap_test_allocation_usd = parse_icpswap_test_allocation_usd_from_env()?;
-        if let Some(value) = icpswap_test_allocation_usd {
-            warn!(
-                "TEST-ONLY ICPSwap split is enabled: approximately ${value:.2} goes to ICPSwap and the remainder to MEXC"
-            );
+        let mexc_test_allocation_usd = parse_mexc_test_allocation_usd_from_env()?;
+        match (icpswap_test_allocation_usd, mexc_test_allocation_usd) {
+            (None, Some(_)) => {
+                return Err("MEXC_TEST_ALLOCATION_USD requires ICPSWAP_TEST_ALLOCATION_USD".to_string());
+            }
+            (Some(icpswap), Some(mexc)) => {
+                warn!(
+                    "TEST-ONLY three-venue split is enabled: approximately ${icpswap:.2} goes to ICPSwap, ${mexc:.2} to MEXC, and the remainder to Kraken"
+                );
+            }
+            (Some(icpswap), None) => {
+                warn!(
+                    "TEST-ONLY ICPSwap split is enabled: approximately ${icpswap:.2} goes to ICPSwap and the remainder follows the CEX waterfall"
+                );
+            }
+            (None, None) => {}
         }
 
         let enabled_swap_venues = parse_enabled_swap_venues_from_env()?;
@@ -436,6 +451,7 @@ impl Config {
             icpswap_max_search_iterations: parse_icpswap_max_search_iterations_from_env(),
             icpswap_dust_fallback_max_price_impact_bps: parse_icpswap_dust_fallback_max_price_impact_bps_from_env(),
             icpswap_test_allocation_usd,
+            mexc_test_allocation_usd,
             enabled_swap_venues,
             cex_credentials,
             opportunity_account_filter,
@@ -697,8 +713,8 @@ fn parse_icpswap_dust_fallback_max_price_impact_bps_from_env() -> f64 {
         .unwrap_or(DEFAULT_ICPSWAP_DUST_FALLBACK_MAX_PRICE_IMPACT_BPS)
 }
 
-fn parse_icpswap_test_allocation_usd_from_env() -> Result<Option<f64>, String> {
-    let Ok(raw) = env::var("ICPSWAP_TEST_ALLOCATION_USD") else {
+fn parse_test_allocation_usd_from_env(name: &str) -> Result<Option<f64>, String> {
+    let Ok(raw) = env::var(name) else {
         return Ok(None);
     };
     let trimmed = raw.trim();
@@ -707,13 +723,19 @@ fn parse_icpswap_test_allocation_usd_from_env() -> Result<Option<f64>, String> {
     }
     let value = trimmed
         .parse::<f64>()
-        .map_err(|_| format!("ICPSWAP_TEST_ALLOCATION_USD='{trimmed}' must be a positive USD amount"))?;
+        .map_err(|_| format!("{name}='{trimmed}' must be a positive USD amount"))?;
     if !value.is_finite() || value <= 0.0 {
-        return Err(format!(
-            "ICPSWAP_TEST_ALLOCATION_USD='{trimmed}' must be finite and positive"
-        ));
+        return Err(format!("{name}='{trimmed}' must be finite and positive"));
     }
     Ok(Some(value))
+}
+
+fn parse_icpswap_test_allocation_usd_from_env() -> Result<Option<f64>, String> {
+    parse_test_allocation_usd_from_env("ICPSWAP_TEST_ALLOCATION_USD")
+}
+
+fn parse_mexc_test_allocation_usd_from_env() -> Result<Option<f64>, String> {
+    parse_test_allocation_usd_from_env("MEXC_TEST_ALLOCATION_USD")
 }
 
 pub(crate) fn parse_icpswap_fee_tiers_from_env() -> Result<Vec<candid::Nat>, String> {
@@ -1108,6 +1130,21 @@ mod tests {
         assert!(parse_icpswap_test_allocation_usd_from_env().is_err());
 
         unsafe { env::remove_var("ICPSWAP_TEST_ALLOCATION_USD") };
+    }
+
+    #[test]
+    fn parse_mexc_test_allocation_is_optional_and_strictly_positive() {
+        let _guard = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        unsafe { env::remove_var("MEXC_TEST_ALLOCATION_USD") };
+        assert_eq!(parse_mexc_test_allocation_usd_from_env().unwrap(), None);
+
+        unsafe { env::set_var("MEXC_TEST_ALLOCATION_USD", "10") };
+        assert_eq!(parse_mexc_test_allocation_usd_from_env().unwrap(), Some(10.0));
+
+        unsafe { env::set_var("MEXC_TEST_ALLOCATION_USD", "0") };
+        assert!(parse_mexc_test_allocation_usd_from_env().is_err());
+
+        unsafe { env::remove_var("MEXC_TEST_ALLOCATION_USD") };
     }
 
     #[test]

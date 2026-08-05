@@ -280,6 +280,7 @@ fn config(cex_min_exec_usd: f64) -> IcpswapFirstPlannerConfig {
         max_oracle_discount_bps: 200,
         oracle_snapshot_max_age_secs: 300,
         icpswap_test_allocation_usd: None,
+        mexc_test_allocation_usd: None,
     }
 }
 
@@ -566,6 +567,68 @@ async fn test_usd_override_sends_one_dollar_to_icpswap_and_exact_remainder_to_me
         state.plan.allocation_reason,
         MultiVenueAllocationReason::PriceImpactSplit
     );
+}
+
+#[tokio::test]
+async fn test_usd_overrides_send_fixed_icpswap_and_mexc_legs_then_the_remainder_to_kraken() {
+    let icpswap_calls = Arc::new(Mutex::new(Vec::new()));
+    let mexc_calls = Arc::new(Mutex::new(Vec::new()));
+    let kraken_calls = Arc::new(Mutex::new(Vec::new()));
+    let icpswap = mock_adapter(ICPSWAP_VENUE_ID, icpswap_calls.clone(), |request| {
+        Ok(proportional_preview(request, ICPSWAP_VENUE_ID, 10.0, 2))
+    });
+    let mexc = mock_adapter(MEXC_VENUE_ID, mexc_calls.clone(), |request| {
+        Ok(proportional_preview(request, MEXC_VENUE_ID, 10.0, 2))
+    });
+    let kraken = mock_adapter(KRAKEN_VENUE_ID, kraken_calls.clone(), |request| {
+        Ok(proportional_preview(request, KRAKEN_VENUE_ID, 10.0, 2))
+    });
+    let mut planner_config = config(8.0);
+    planner_config.icpswap_test_allocation_usd = Some(1.0);
+    planner_config.mexc_test_allocation_usd = Some(10.0);
+
+    // At $10/ICP, 3 ICP gives the forced $1 and $10 legs enough room to
+    // leave a $19 exact remainder for Kraken.
+    let mut input = input_with_pay_token(native_icp());
+    input.total_pay.value = Nat::from(300_000_000u64);
+    let planner = IcpswapFirstPlanner::new(
+        vec![Arc::new(icpswap), Arc::new(mexc), Arc::new(kraken)],
+        planner_config,
+    )
+    .expect("valid three-venue test planner");
+
+    let state = planner.plan(&input, 123).await.expect("forced three-venue split");
+
+    assert_eq!(*icpswap_calls.lock().expect("ICPSwap calls"), vec![10_000_000]);
+    assert_eq!(*mexc_calls.lock().expect("MEXC calls"), vec![100_000_000]);
+    assert_eq!(*kraken_calls.lock().expect("Kraken calls"), vec![190_000_000]);
+    assert_eq!(state.legs.len(), 3);
+    assert_eq!(state.legs[0].venue_id, ICPSWAP_VENUE_ID);
+    assert_eq!(state.legs[1].venue_id, MEXC_VENUE_ID);
+    assert_eq!(state.legs[2].venue_id, KRAKEN_VENUE_ID);
+    assert_eq!(
+        state.plan.allocation_reason,
+        MultiVenueAllocationReason::PriceImpactSplit
+    );
+}
+
+#[test]
+fn mexc_test_override_requires_all_three_venues() {
+    let icpswap = mock_adapter(ICPSWAP_VENUE_ID, Arc::new(Mutex::new(Vec::new())), |request| {
+        Ok(proportional_preview(request, ICPSWAP_VENUE_ID, 10.0, 2))
+    });
+    let mexc = mock_adapter(MEXC_VENUE_ID, Arc::new(Mutex::new(Vec::new())), |request| {
+        Ok(proportional_preview(request, MEXC_VENUE_ID, 10.0, 2))
+    });
+    let mut planner_config = config(8.0);
+    planner_config.icpswap_test_allocation_usd = Some(1.0);
+    planner_config.mexc_test_allocation_usd = Some(10.0);
+
+    let error = IcpswapFirstPlanner::new(vec![Arc::new(icpswap), Arc::new(mexc)], planner_config)
+        .err()
+        .expect("missing Kraken must reject the test configuration");
+
+    assert!(error.to_string().contains("ICPSwap, MEXC, and Kraken"));
 }
 
 #[tokio::test]

@@ -492,6 +492,7 @@ mod tests {
             icpswap_max_search_iterations: 16,
             icpswap_dust_fallback_max_price_impact_bps: 150.0,
             icpswap_test_allocation_usd: None,
+            mexc_test_allocation_usd: None,
             enabled_swap_venues: vec!["icpswap".to_string(), "mexc".to_string()],
             cex_credentials: HashMap::new(),
             opportunity_account_filter: vec![],

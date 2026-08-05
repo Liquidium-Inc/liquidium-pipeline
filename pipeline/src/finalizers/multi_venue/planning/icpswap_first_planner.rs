@@ -23,23 +23,22 @@ pub const MEXC_VENUE_ID: &str = "mexc";
 pub const KRAKEN_VENUE_ID: &str = "kraken";
 
 pub(super) const BPS_DENOMINATOR: u32 = 10_000;
-/// Smallest forced ICPSwap test allocation the oracle quote guard is applied to,
-/// in USD. See `oracle_guard_waived_for_test_leg`.
-const ORACLE_GUARD_MIN_TEST_ALLOCATION_USD: f64 = 10.0;
 
 mod cex_waterfall;
 mod config;
 mod icpswap_allocation;
 mod input;
 mod quote_guard;
+mod test_allocation;
 
 pub use config::IcpswapFirstPlannerConfig;
 pub use input::IcpswapFirstPlanInput;
 #[cfg(test)]
 pub(in crate::finalizers::multi_venue) use input::reference_price_usd;
-pub(in crate::finalizers::multi_venue) use quote_guard::oracle_guard_waiver_banner;
 #[cfg(test)]
 pub(in crate::finalizers::multi_venue) use quote_guard::oracle_price_symbol;
+use test_allocation::ORACLE_GUARD_MIN_TEST_ALLOCATION_USD;
+pub(in crate::finalizers::multi_venue) use test_allocation::oracle_guard_waiver_banner;
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum IcpswapFirstPlannerError {
@@ -83,6 +82,15 @@ impl IcpswapFirstPlanner {
         config: IcpswapFirstPlannerConfig,
     ) -> Result<Self, IcpswapFirstPlannerError> {
         config.validate()?;
+        if config.mexc_test_allocation_usd.is_some()
+            && [ICPSWAP_VENUE_ID, MEXC_VENUE_ID, KRAKEN_VENUE_ID]
+                .iter()
+                .any(|venue_id| !venues.contains(venue_id))
+        {
+            return Err(IcpswapFirstPlannerError::InvalidInput(
+                "test MEXC allocation requires ICPSwap, MEXC, and Kraken to all be enabled".to_string(),
+            ));
+        }
         if let Some(target_usd) = config.icpswap_test_allocation_usd
             && target_usd < ORACLE_GUARD_MIN_TEST_ALLOCATION_USD
         {

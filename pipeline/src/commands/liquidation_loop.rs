@@ -262,6 +262,7 @@ async fn init(
                 max_oracle_discount_bps: config.multi_venue_max_oracle_discount_bps,
                 oracle_snapshot_max_age_secs: config.multi_venue_oracle_snapshot_max_age_secs,
                 icpswap_test_allocation_usd: config.icpswap_test_allocation_usd,
+                mexc_test_allocation_usd: config.mexc_test_allocation_usd,
             },
         )?
         .with_watchdog(slack_watchdog_from_env(DEFAULT_LOW_BALANCE_ALERT_COOLDOWN))

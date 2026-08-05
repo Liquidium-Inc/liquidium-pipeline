@@ -700,6 +700,7 @@ fn planner_config() -> IcpswapFirstPlannerConfig {
         max_oracle_discount_bps: 250,
         oracle_snapshot_max_age_secs: 300,
         icpswap_test_allocation_usd: None,
+        mexc_test_allocation_usd: None,
     }
 }
 
