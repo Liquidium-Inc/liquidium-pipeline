@@ -1316,6 +1316,90 @@ async fn three_venue_waterfall_is_committed_before_execution_and_aggregated_in_o
 }
 
 #[tokio::test]
+async fn forced_three_venue_test_allocation_is_committed_executed_and_aggregated() {
+    const THREE_ICP: u64 = 300_000_000;
+    const ONE_DOLLAR_ICP: u64 = 10_000_000;
+    const TEN_DOLLAR_MEXC: u64 = 100_000_000;
+    const KRAKEN_REMAINDER: u64 = 190_000_000;
+
+    // The receipt prices ICP at $10, so 3 ICP can carry the forced $1 ICPSwap
+    // leg, the forced $10 MEXC leg, and a $19 Kraken remainder.
+    let mut receipt = receipt();
+    receipt
+        .liquidation_result
+        .as_mut()
+        .expect("liquidation result")
+        .amounts
+        .collateral_received = Nat::from(THREE_ICP);
+    let wal = Arc::new(TestWal::with_receipt(&receipt));
+
+    let icpswap = Arc::new(ScriptedAdapter::new(
+        ICPSWAP_VENUE_ID,
+        None,
+        vec![VenueLegStatus::Completed],
+    ));
+    let mexc = Arc::new(ScriptedAdapter::new(
+        MEXC_VENUE_ID,
+        None,
+        vec![VenueLegStatus::Completed],
+    ));
+    let kraken = Arc::new(ScriptedAdapter::new(
+        KRAKEN_VENUE_ID,
+        None,
+        vec![VenueLegStatus::Completed],
+    ));
+    icpswap.observe(&wal);
+    mexc.observe(&wal);
+    kraken.observe(&wal);
+
+    let config = IcpswapFirstPlannerConfig {
+        icpswap_test_allocation_usd: Some(1.0),
+        mexc_test_allocation_usd: Some(10.0),
+        ..planner_config()
+    };
+    let finalizer = MultiVenueFinalizer::new(vec![icpswap.clone(), mexc.clone(), kraken.clone()], config)
+        .expect("valid forced three-venue finalizer");
+
+    let result = finalizer
+        .finalize(wal.as_ref(), receipt)
+        .await
+        .expect("forced three-venue execution");
+
+    assert!(result.finalized);
+    assert_eq!(icpswap.calls(), 1);
+    assert_eq!(mexc.calls(), 1);
+    assert_eq!(kraken.calls(), 1);
+    assert_eq!(
+        icpswap.observed_statuses.lock().expect("statuses lock").as_slice(),
+        &[vec![
+            VenueLegStatus::Planned,
+            VenueLegStatus::Planned,
+            VenueLegStatus::Planned,
+        ]]
+    );
+
+    let wrapper = wal.wrapper();
+    let FinalizerMetaPayload::MultiVenueSwap(state) = wrapper.meta_v2.expect("committed plan").payload else {
+        panic!("expected multi-venue state")
+    };
+    let allocations = state
+        .legs
+        .iter()
+        .map(|leg| leg.request.pay_amount.value.0.to_u64().expect("allocation fits u64"))
+        .collect::<Vec<_>>();
+    assert_eq!(allocations, vec![ONE_DOLLAR_ICP, TEN_DOLLAR_MEXC, KRAKEN_REMAINDER]);
+    assert!(state.legs.iter().all(|leg| leg.status == VenueLegStatus::Completed));
+
+    let aggregate = result.swap_result.expect("aggregated forced allocation result");
+    assert_eq!(aggregate.pay_amount, Nat::from(THREE_ICP));
+    assert_eq!(aggregate.receive_amount, Nat::from(THREE_ICP * 2));
+    assert_eq!(
+        aggregate.legs.iter().map(|leg| leg.venue.as_str()).collect::<Vec<_>>(),
+        vec![ICPSWAP_VENUE_ID, MEXC_VENUE_ID, KRAKEN_VENUE_ID]
+    );
+}
+
+#[tokio::test]
 async fn operator_required_mexc_leg_is_parked_across_restarts() {
     let receipt = receipt();
     let wal = TestWal::with_receipt(&receipt);
