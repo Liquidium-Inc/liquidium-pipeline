@@ -4,8 +4,9 @@ use crate::{
     config::ConfigTrait,
     context::PipelineContext,
     finalizers::{
+        cex_finalizer::CexFinalizer,
         kraken::KrakenFinalizer,
-        mexc::{mexc_finalizer::MexcFinalizer, runtime::build_cex_bridge_dependencies},
+        mexc::runtime::build_cex_bridge_dependencies,
     },
     swappers::kraken::KrakenClient,
 };
@@ -20,7 +21,7 @@ pub async fn build_kraken_finalizer(ctx: &PipelineContext) -> Result<Arc<KrakenF
     let bridge_dependencies = build_cex_bridge_dependencies(ctx).await?;
 
     Ok(Arc::new(
-        MexcFinalizer::new_with_tunables(
+        CexFinalizer::new_with_tunables(
             client,
             ctx.trader_transfers.actions(),
             config.liquidator_principal,

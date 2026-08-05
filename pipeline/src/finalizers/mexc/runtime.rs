@@ -17,8 +17,7 @@ use liquidium_pipeline_connectors::backend::{
 use crate::{
     config::ConfigTrait,
     context::PipelineContext,
-    finalizers::cex_finalizer::CexVenueProfile,
-    finalizers::mexc::mexc_finalizer::{MexcBridgeConfig, MexcBridgeDependencies, MexcFinalizer},
+    finalizers::cex_finalizer::{CexBridgeConfig, CexBridgeDependencies, CexFinalizer, CexVenueProfile},
     swappers::mexc::mexc_adapter::MexcClient,
 };
 
@@ -173,7 +172,7 @@ fn required_cketh_route_chain_ids(chain_id_config: &RouteChainIdConfig) -> Resul
     Ok(chain_ids)
 }
 
-pub(crate) async fn build_cex_bridge_dependencies(ctx: &PipelineContext) -> Result<MexcBridgeDependencies, String> {
+pub(crate) async fn build_cex_bridge_dependencies(ctx: &PipelineContext) -> Result<CexBridgeDependencies, String> {
     let config = ctx.config.clone();
     let route_chain_id_config = route_chain_id_config_from_env()?;
     let required_chain_ids = required_cketh_route_chain_ids(&route_chain_id_config)?;
@@ -227,9 +226,9 @@ pub(crate) async fn build_cex_bridge_dependencies(ctx: &PipelineContext) -> Resu
         config.bridge_cketh_minter_canister,
         config.bridge_ic_owner_principal,
     ));
-    Ok(MexcBridgeDependencies {
+    Ok(CexBridgeDependencies {
         backend: bridge_backend,
-        config: MexcBridgeConfig {
+        config: CexBridgeConfig {
             bridge_ic_source_account: config.bridge_ic_account(),
             bridge_evm_source_address: config.bridge_evm_address.clone(),
             bridge_btc_source_address: config.bridge_btc_address.clone(),
@@ -237,7 +236,7 @@ pub(crate) async fn build_cex_bridge_dependencies(ctx: &PipelineContext) -> Resu
     })
 }
 
-pub async fn build_mexc_finalizer(ctx: &PipelineContext) -> Result<Arc<MexcFinalizer<MexcClient>>, String> {
+pub async fn build_mexc_finalizer(ctx: &PipelineContext) -> Result<Arc<CexFinalizer<MexcClient>>, String> {
     let config = ctx.config.clone();
     let (api_key, secret) = config
         .get_cex_credentials("mexc")
@@ -246,7 +245,7 @@ pub async fn build_mexc_finalizer(ctx: &PipelineContext) -> Result<Arc<MexcFinal
     let bridge_dependencies = build_cex_bridge_dependencies(ctx).await?;
 
     Ok(Arc::new(
-        MexcFinalizer::new_with_tunables(
+        CexFinalizer::new_with_tunables(
             mexc_client,
             ctx.trader_transfers.actions(),
             config.liquidator_principal,
