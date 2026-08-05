@@ -84,6 +84,10 @@ pub struct Config {
     /// Maximum intermediate hops allowed for MEXC route discovery.
     /// Example: `2` allows up to 3 legs total.
     pub cex_mexc_max_hops: u8,
+    /// Optional Kraken market allowlist, normalized as `BASE_QUOTE`.
+    pub cex_kraken_available_pairs: Vec<String>,
+    /// Maximum intermediate hops allowed for Kraken route discovery.
+    pub cex_kraken_max_hops: u8,
     pub icpswap_factory_canister: Principal,
     pub icpswap_fee_tiers: Vec<candid::Nat>,
     /// Highest ICPSwap price impact an allocation may carry, in bps. The limit is
@@ -125,6 +129,8 @@ pub trait ConfigTrait: Send + Sync {
     fn get_cex_route_fee_bps(&self) -> u32;
     fn get_cex_mexc_available_pairs(&self) -> Vec<String>;
     fn get_cex_mexc_max_hops(&self) -> u8;
+    fn get_cex_kraken_available_pairs(&self) -> Vec<String>;
+    fn get_cex_kraken_max_hops(&self) -> u8;
     #[allow(dead_code)]
     fn get_lending_canister(&self) -> Principal;
     #[allow(dead_code)]
@@ -214,6 +220,14 @@ impl ConfigTrait for Config {
 
     fn get_cex_mexc_max_hops(&self) -> u8 {
         self.cex_mexc_max_hops
+    }
+
+    fn get_cex_kraken_available_pairs(&self) -> Vec<String> {
+        self.cex_kraken_available_pairs.clone()
+    }
+
+    fn get_cex_kraken_max_hops(&self) -> u8 {
+        self.cex_kraken_max_hops
     }
 
     fn get_cex_credentials(&self, cex: &str) -> Result<(String, String), String> {
@@ -332,6 +346,12 @@ impl Config {
         let cex_tunables = parse_cex_tunables_from_env();
         let cex_mexc_available_pairs = parse_cex_mexc_available_pairs_from_env();
         let cex_mexc_max_hops = parse_cex_mexc_max_hops_from_env();
+        let cex_kraken_available_pairs = parse_cex_available_pairs_from_env("CEX_KRAKEN_AVAILABLE_PAIRS");
+        let cex_kraken_max_hops = parse_cex_max_hops_from_env(
+            "CEX_KRAKEN_MAX_HOPS",
+            DEFAULT_CEX_KRAKEN_MAX_HOPS,
+            MAX_CEX_KRAKEN_MAX_HOPS,
+        );
         let icpswap_factory_canister = parse_icpswap_factory_from_env()?;
         let icpswap_fee_tiers = parse_icpswap_fee_tiers_from_env()?;
         let icpswap_test_allocation_usd = parse_icpswap_test_allocation_usd_from_env()?;
@@ -408,6 +428,8 @@ impl Config {
             cex_route_fee_bps: cex_tunables.route_fee_bps,
             cex_mexc_available_pairs,
             cex_mexc_max_hops,
+            cex_kraken_available_pairs,
+            cex_kraken_max_hops,
             icpswap_factory_canister,
             icpswap_fee_tiers,
             icpswap_max_price_impact_bps: parse_icpswap_max_price_impact_bps_from_env(),
@@ -493,6 +515,8 @@ const DEFAULT_CEX_DELAY_BUFFER_BPS: u32 = 75;
 const DEFAULT_CEX_ROUTE_FEE_BPS: u32 = 25;
 const DEFAULT_CEX_MEXC_MAX_HOPS: u8 = 2;
 const MAX_CEX_MEXC_MAX_HOPS: u8 = 4;
+const DEFAULT_CEX_KRAKEN_MAX_HOPS: u8 = 2;
+const MAX_CEX_KRAKEN_MAX_HOPS: u8 = 4;
 const DEFAULT_BAD_DEBT_COLLATERAL_SLIPPAGE_BPS: u32 = 500;
 const MAX_BPS: u32 = 10_000;
 const MIN_RATIO: f64 = 0.0;
@@ -509,7 +533,7 @@ const DEFAULT_ICPSWAP_MAX_PRICE_IMPACT_BPS: f64 = 100.0;
 const DEFAULT_ICPSWAP_DUST_FALLBACK_MAX_PRICE_IMPACT_BPS: f64 = 150.0;
 const DEFAULT_ICPSWAP_MAX_SEARCH_ITERATIONS: u8 = 16;
 const DEFAULT_ENABLED_SWAP_VENUES: &str = "icpswap,mexc";
-const SUPPORTED_SWAP_VENUES: [&str; 2] = ["icpswap", "mexc"];
+const SUPPORTED_SWAP_VENUES: [&str; 3] = ["icpswap", "mexc", "kraken"];
 
 fn parse_multi_venue_min_net_edge_bps_from_env() -> u32 {
     env::var("MULTI_VENUE_MIN_NET_EDGE_BPS")
@@ -737,7 +761,11 @@ fn normalize_cex_market_pair(raw: &str) -> Option<String> {
 }
 
 fn parse_cex_mexc_available_pairs_from_env() -> Vec<String> {
-    let raw = match env::var("CEX_MEXC_AVAILABLE_PAIRS") {
+    parse_cex_available_pairs_from_env("CEX_MEXC_AVAILABLE_PAIRS")
+}
+
+fn parse_cex_available_pairs_from_env(name: &str) -> Vec<String> {
+    let raw = match env::var(name) {
         Ok(v) => v,
         Err(_) => return vec![],
     };
@@ -755,11 +783,15 @@ fn parse_cex_mexc_available_pairs_from_env() -> Vec<String> {
 }
 
 fn parse_cex_mexc_max_hops_from_env() -> u8 {
-    env::var("CEX_MEXC_MAX_HOPS")
+    parse_cex_max_hops_from_env("CEX_MEXC_MAX_HOPS", DEFAULT_CEX_MEXC_MAX_HOPS, MAX_CEX_MEXC_MAX_HOPS)
+}
+
+fn parse_cex_max_hops_from_env(name: &str, default: u8, maximum: u8) -> u8 {
+    env::var(name)
         .ok()
         .and_then(|v| v.parse::<u8>().ok())
-        .map(|v| v.min(MAX_CEX_MEXC_MAX_HOPS))
-        .unwrap_or(DEFAULT_CEX_MEXC_MAX_HOPS)
+        .map(|v| v.min(maximum))
+        .unwrap_or(default)
 }
 
 fn parse_cex_tunables_from_env() -> CexTunables {
@@ -1187,7 +1219,7 @@ mod tests {
             ("", "empty venue ID"),
             ("mexc,", "empty venue ID"),
             ("mexc,MEXC", "duplicate venue"),
-            ("kraken", "unsupported venue"),
+            ("binance", "unsupported venue"),
         ] {
             unsafe {
                 env::set_var("ENABLED_SWAP_VENUES", raw);

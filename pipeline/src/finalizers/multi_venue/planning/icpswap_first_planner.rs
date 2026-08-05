@@ -31,6 +31,7 @@ use super::{
 pub const ICPSWAP_FIRST_STRATEGY_ID: &str = "icpswap_first";
 pub const ICPSWAP_VENUE_ID: &str = "icpswap";
 pub const MEXC_VENUE_ID: &str = "mexc";
+pub const KRAKEN_VENUE_ID: &str = "kraken";
 
 pub(super) const BPS_DENOMINATOR: u32 = 10_000;
 const RAY_PRICE_SCALE: f64 = 1e27;

@@ -483,6 +483,8 @@ mod tests {
             cex_route_fee_bps: 12,
             cex_mexc_available_pairs: vec![],
             cex_mexc_max_hops: 2,
+            cex_kraken_available_pairs: vec![],
+            cex_kraken_max_hops: 2,
             icpswap_factory_canister: Principal::from_text(crate::config::DEFAULT_ICPSWAP_FACTORY_CANISTER)
                 .expect("principal"),
             icpswap_fee_tiers: vec![candid::Nat::from(500u32), candid::Nat::from(3000u32)],
