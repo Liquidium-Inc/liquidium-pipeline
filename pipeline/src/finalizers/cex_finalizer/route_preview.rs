@@ -36,6 +36,11 @@ where
         for leg in legs {
             let (gross_amount_out, _side_vwap, side_impact_bps) =
                 self.preview_leg(&leg.market, &leg.side, amount_in).await?;
+            if self.profile.funding_preflight_required() {
+                self.backend
+                    .validate_trade_amounts(&leg.market, &leg.side, amount_in, gross_amount_out)
+                    .await?;
+            }
             let amount_out = gross_amount_out * (1.0 - self.profile.preview_taker_fee_bps() / BPS_PER_RATIO_UNIT);
             let impact_ratio = side_impact_bps / BPS_PER_RATIO_UNIT;
             let gross_execution_price = gross_amount_out / amount_in;

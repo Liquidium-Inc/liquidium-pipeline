@@ -1,9 +1,13 @@
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use async_trait::async_trait;
 use liquidium_pipeline_connectors::backend::cex_backend::{
-    BuyOrderInputMode, CEX_PENDING_SETTLEMENT_PREFIX, CexBackend, CexSubmissionError, DepositAddress, OrderBook,
-    OrderBookLevel, SwapExecutionOptions, SwapFillReport, WithdrawStatus, WithdrawStatusSnapshot, WithdrawalReceipt,
+    BuyOrderInputMode, CEX_PENDING_SETTLEMENT_PREFIX, CexBackend, CexSubmissionError, DepositAddress,
+    FundingRoutePreflight, OrderBook, OrderBookLevel, SwapExecutionOptions, SwapFillReport, WithdrawStatus,
+    WithdrawStatusSnapshot, WithdrawalReceipt,
 };
 use rust_decimal::{
     Decimal, RoundingStrategy,
@@ -19,11 +23,12 @@ use super::kraken_api::{
 const KRAKEN_AMBIGUOUS_PREFIX: &str = "kraken ambiguous submission: ";
 const ORDER_POLL_ATTEMPTS: usize = 20;
 const ORDER_POLL_INTERVAL: Duration = Duration::from_millis(500);
+const PAIR_METADATA_TTL: Duration = Duration::from_secs(5 * 60);
 
 #[derive(Clone)]
 pub struct KrakenClient {
     api: Arc<dyn KrakenApi>,
-    pairs: Arc<RwLock<Option<Vec<KrakenPair>>>>,
+    pairs: Arc<RwLock<Option<(Instant, Vec<KrakenPair>)>>>,
     allowed_pairs: Arc<Vec<String>>,
 }
 
@@ -41,11 +46,13 @@ impl KrakenClient {
     }
 
     async fn all_pairs(&self) -> Result<Vec<KrakenPair>, String> {
-        if let Some(pairs) = self.pairs.read().await.as_ref() {
+        if let Some((loaded_at, pairs)) = self.pairs.read().await.as_ref()
+            && loaded_at.elapsed() < PAIR_METADATA_TTL
+        {
             return Ok(pairs.clone());
         }
         let pairs = self.api.pairs().await.map_err(api_read_error)?;
-        *self.pairs.write().await = Some(pairs.clone());
+        *self.pairs.write().await = Some((Instant::now(), pairs.clone()));
         Ok(pairs)
     }
 
@@ -70,7 +77,11 @@ impl KrakenClient {
         self.api.orderbook(&pair.api_name, depth).await.map_err(api_read_error)
     }
 
-    async fn resolve_deposit(&self, asset: &str, network: &str) -> Result<(String, String, Option<String>), String> {
+    async fn resolve_deposit(
+        &self,
+        asset: &str,
+        network: &str,
+    ) -> Result<(KrakenFundingMethod, String, Option<String>), String> {
         let api_asset = api_asset(asset);
         let method = unique_method(
             self.api.deposit_methods(&api_asset).await.map_err(api_read_error)?,
@@ -84,7 +95,7 @@ impl KrakenClient {
             .await
             .map_err(api_read_error)?;
         match addresses.as_slice() {
-            [address] => Ok((method.method, address.address.clone(), address.tag.clone())),
+            [address] => Ok((method, address.address.clone(), address.tag.clone())),
             [] => Err(format!(
                 "Kraken has no existing {asset} deposit address for network {network}"
             )),
@@ -159,17 +170,77 @@ impl CexBackend for KrakenClient {
         }
     }
 
-    async fn validate_funding_route(
-        &self,
-        deposit_asset: &str,
-        deposit_network: &str,
-        withdraw_asset: &str,
-        withdraw_network: &str,
-        withdraw_address: &str,
-    ) -> Result<(), String> {
-        self.resolve_deposit(deposit_asset, deposit_network).await?;
-        self.resolve_withdrawal(withdraw_asset, withdraw_network, withdraw_address)
+    async fn validate_funding_route(&self, preflight: &FundingRoutePreflight) -> Result<(), String> {
+        ensure_positive(preflight.deposit_amount)?;
+        ensure_positive(preflight.withdraw_amount)?;
+        let (deposit_method, _, deposit_tag) = self
+            .resolve_deposit(&preflight.deposit_asset, &preflight.deposit_network)
             .await?;
+        if preflight.deposit_network.eq_ignore_ascii_case("ICP")
+            && deposit_tag.as_deref().is_some_and(|tag| !tag.trim().is_empty())
+        {
+            return Err(format!(
+                "Kraken {} deposit on ICP requires a memo/tag that the transfer layer cannot preserve",
+                preflight.deposit_asset
+            ));
+        }
+        let deposit_amount =
+            Decimal::from_f64(preflight.deposit_amount).ok_or_else(|| "invalid Kraken deposit amount".to_string())?;
+        if deposit_amount < deposit_method.minimum {
+            return Err(format!(
+                "Kraken deposit amount {deposit_amount} is below {} minimum {}",
+                deposit_method.method, deposit_method.minimum
+            ));
+        }
+        let (withdraw_method, _) = self
+            .resolve_withdrawal(
+                &preflight.withdraw_asset,
+                &preflight.withdraw_network,
+                &preflight.withdraw_address,
+            )
+            .await?;
+        let withdraw_amount = Decimal::from_f64(preflight.withdraw_amount)
+            .ok_or_else(|| "invalid Kraken withdrawal amount".to_string())?;
+        if withdraw_amount < withdraw_method.minimum {
+            return Err(format!(
+                "Kraken withdrawal amount {withdraw_amount} is below {} minimum {}",
+                withdraw_method.method, withdraw_method.minimum
+            ));
+        }
+        Ok(())
+    }
+
+    async fn validate_trade_amounts(
+        &self,
+        market: &str,
+        side: &str,
+        amount_in: f64,
+        amount_out: f64,
+    ) -> Result<(), String> {
+        ensure_positive(amount_in)?;
+        ensure_positive(amount_out)?;
+        let pair = self.pair(market).await?;
+        let input = Decimal::from_f64(amount_in).ok_or_else(|| "invalid Kraken trade input".to_string())?;
+        let output = Decimal::from_f64(amount_out).ok_or_else(|| "invalid Kraken trade output".to_string())?;
+        let (base_volume, quote_cost) = if side.eq_ignore_ascii_case("sell") {
+            (truncate(input, pair.lot_decimals), output)
+        } else if side.eq_ignore_ascii_case("buy") {
+            (truncate(output, pair.lot_decimals), input)
+        } else {
+            return Err(format!("unsupported Kraken order side {side}"));
+        };
+        if base_volume < pair.order_min {
+            return Err(format!(
+                "Kraken base volume {base_volume} is below order minimum {}",
+                pair.order_min
+            ));
+        }
+        if quote_cost < pair.cost_min {
+            return Err(format!(
+                "Kraken quote cost {quote_cost} is below cost minimum {}",
+                pair.cost_min
+            ));
+        }
         Ok(())
     }
 
@@ -377,7 +448,7 @@ impl CexBackend for KrakenClient {
     }
 }
 
-fn normalize_market(market: &str) -> String {
+pub(crate) fn normalize_market(market: &str) -> String {
     market
         .trim()
         .to_ascii_uppercase()
@@ -666,7 +737,15 @@ mod tests {
         assert_eq!(deposit.address, "bc1qdeposit");
         assert_eq!(deposit.tag.as_deref(), Some("memo-7"));
         client
-            .validate_funding_route("BTC", "bitcoin", "BTC", "bitcoin", "bc1qdestination")
+            .validate_funding_route(&FundingRoutePreflight {
+                deposit_asset: "BTC".into(),
+                deposit_network: "bitcoin".into(),
+                withdraw_asset: "BTC".into(),
+                withdraw_network: "bitcoin".into(),
+                withdraw_address: "bc1qdestination".into(),
+                deposit_amount: 0.1,
+                withdraw_amount: 0.1,
+            })
             .await
             .expect("verified route");
     }
@@ -723,9 +802,9 @@ mod tests {
     #[tokio::test]
     async fn accepted_order_with_failed_status_query_is_ambiguous() {
         let mut api = MockKrakenApi::new();
-        api.expect_order().once().returning(|_| {
-            Err(KrakenApiError::Transport("status request timed out".into()))
-        });
+        api.expect_order()
+            .once()
+            .returning(|_| Err(KrakenApiError::Transport("status request timed out".into())));
         let client = KrakenClient::with_api(Arc::new(api), vec![]);
 
         let error = client.wait_for_order("ORDER-2", "sell").await.expect_err("must park");
@@ -763,6 +842,58 @@ mod tests {
             .expect_err("below minimum");
 
         assert!(error.contains("below Bitcoin minimum"));
+    }
+
+    #[tokio::test]
+    async fn funding_preflight_rejects_below_minimum_deposit_before_planning() {
+        let mut api = MockKrakenApi::new();
+        api.expect_deposit_methods().once().returning(|_| {
+            Ok(vec![KrakenFundingMethod {
+                method: "Bitcoin".into(),
+                network: Some("Bitcoin".into()),
+                minimum: Decimal::new(1, 2),
+            }])
+        });
+        api.expect_deposit_addresses().once().returning(|_, _| {
+            Ok(vec![KrakenDepositAddress {
+                address: "bc1qdeposit".into(),
+                tag: None,
+            }])
+        });
+        api.expect_withdrawal_methods().never();
+        api.expect_withdrawal_addresses().never();
+        let client = KrakenClient::with_api(Arc::new(api), vec![]);
+
+        let error = client
+            .validate_funding_route(&FundingRoutePreflight {
+                deposit_asset: "BTC".into(),
+                deposit_network: "bitcoin".into(),
+                withdraw_asset: "BTC".into(),
+                withdraw_network: "bitcoin".into(),
+                withdraw_address: "bc1qdestination".into(),
+                deposit_amount: 0.001,
+                withdraw_amount: 0.1,
+            })
+            .await
+            .expect_err("deposit minimum must reject preview");
+
+        assert!(error.contains("deposit amount"));
+        assert!(error.contains("below Bitcoin minimum"));
+    }
+
+    #[tokio::test]
+    async fn trade_preflight_rejects_pair_minimum_before_submission() {
+        let mut api = MockKrakenApi::new();
+        api.expect_pairs().once().returning(|| Ok(vec![btc_usd_pair()]));
+        api.expect_place_market_order().never();
+        let client = KrakenClient::with_api(Arc::new(api), vec![]);
+
+        let error = client
+            .validate_trade_amounts("BTC_USD", "sell", 0.000_01, 1.0)
+            .await
+            .expect_err("order minimum must reject preview");
+
+        assert!(error.contains("below order minimum"));
     }
 
     #[tokio::test]
@@ -846,12 +977,26 @@ mod tests {
         let mut api = MockKrakenApi::new();
         api.expect_pairs().once().return_once(move || Ok(vec![offline]));
         let client = KrakenClient::with_api(Arc::new(api), vec![]);
-        assert!(client.get_orderbook("BTC_USD", None).await.unwrap_err().contains("not online"));
+        assert!(
+            client
+                .get_orderbook("BTC_USD", None)
+                .await
+                .unwrap_err()
+                .contains("not online")
+        );
 
         let pair = btc_usd_pair();
         let mut api = MockKrakenApi::new();
-        api.expect_pairs().once().return_once(move || Ok(vec![pair.clone(), pair]));
+        api.expect_pairs()
+            .once()
+            .return_once(move || Ok(vec![pair.clone(), pair]));
         let client = KrakenClient::with_api(Arc::new(api), vec![]);
-        assert!(client.get_orderbook("BTC_USD", None).await.unwrap_err().contains("ambiguous"));
+        assert!(
+            client
+                .get_orderbook("BTC_USD", None)
+                .await
+                .unwrap_err()
+                .contains("ambiguous")
+        );
     }
 }

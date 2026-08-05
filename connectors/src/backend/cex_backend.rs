@@ -98,6 +98,18 @@ impl Default for SwapExecutionOptions {
     }
 }
 
+/// Exact, side-effect-free funding requirements for one planned CEX route.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FundingRoutePreflight {
+    pub deposit_asset: String,
+    pub deposit_network: String,
+    pub withdraw_asset: String,
+    pub withdraw_network: String,
+    pub withdraw_address: String,
+    pub deposit_amount: f64,
+    pub withdraw_amount: f64,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WithdrawStatus {
     Pending,
@@ -127,13 +139,19 @@ pub trait CexBackend: Send + Sync {
     /// Read-only preflight performed before a venue quote can be committed.
     /// Backends with destination allowlists use it to prove later settlement
     /// is possible for the exact route and address.
-    async fn validate_funding_route(
+    async fn validate_funding_route(&self, _preflight: &FundingRoutePreflight) -> Result<(), String> {
+        Ok(())
+    }
+
+    /// Amount-aware, read-only validation for one planned trade leg. This is
+    /// separate from order submission so venue minimums can reject a preview
+    /// before collateral is transferred to the exchange.
+    async fn validate_trade_amounts(
         &self,
-        _deposit_asset: &str,
-        _deposit_network: &str,
-        _withdraw_asset: &str,
-        _withdraw_network: &str,
-        _withdraw_address: &str,
+        _market: &str,
+        _side: &str,
+        _amount_in: f64,
+        _amount_out: f64,
     ) -> Result<(), String> {
         Ok(())
     }

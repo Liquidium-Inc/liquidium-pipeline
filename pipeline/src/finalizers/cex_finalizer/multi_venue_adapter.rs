@@ -162,6 +162,18 @@ where
         execution.intent_id = None;
         execution.cex.last_error = None;
 
+        if matches!(execution.cex.step, CexStep::Trade | CexStep::TradePending)
+            && execution.cex.trade.trade_pending_client_order_id.is_none()
+        {
+            match self.prepare_next_trade_order_intent(&mut execution.cex).await {
+                Ok(_) => return self.progress_for(execution, None),
+                Err(error) => {
+                    execution.cex.last_error = Some(error.clone());
+                    return self.progress_for(execution, Some(error));
+                }
+            }
+        }
+
         let result = self.advance_current_step(&mut execution.cex).await;
         let error = result.err();
         match &error {

@@ -467,9 +467,12 @@ fn load_cex_credentials() -> HashMap<String, (String, String)> {
             let secret_var = format!("CEX_{}_API_SECRET", name);
 
             match std::env::var(&secret_var) {
-                Ok(secret) => {
+                Ok(secret) if !value.trim().is_empty() && !secret.trim().is_empty() => {
                     debug!("Loaded CEX credentials for '{}'", name_lower);
-                    cex_credentials.insert(name_lower, (value, secret));
+                    cex_credentials.insert(name_lower, (value.trim().to_string(), secret.trim().to_string()));
+                }
+                Ok(_) => {
+                    debug!("Ignoring blank CEX credentials for '{}'", name_lower);
                 }
                 Err(_) => {
                     debug!("Found {} but missing {}", key, secret_var);
@@ -875,6 +878,23 @@ mod tests {
     use std::sync::{Mutex, OnceLock};
 
     static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+    #[test]
+    fn blank_cex_credentials_are_treated_as_missing() {
+        let _guard = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        unsafe {
+            env::set_var("CEX_REVIEWBLANK_API_KEY", "   ");
+            env::set_var("CEX_REVIEWBLANK_API_SECRET", "");
+        }
+
+        let credentials = load_cex_credentials();
+        assert!(!credentials.contains_key("reviewblank"));
+
+        unsafe {
+            env::remove_var("CEX_REVIEWBLANK_API_KEY");
+            env::remove_var("CEX_REVIEWBLANK_API_SECRET");
+        }
+    }
 
     #[test]
     fn parse_cex_tunables_uses_defaults() {

@@ -1,4 +1,7 @@
-use std::{fmt::Debug, sync::Arc};
+use std::{
+    fmt::{self, Debug},
+    sync::Arc,
+};
 
 use async_trait::async_trait;
 use kraken_async_rs::{
@@ -129,10 +132,19 @@ pub trait KrakenApi: Send + Sync {
     async fn withdrawals(&self, asset: &str) -> Result<Vec<KrakenWithdrawal>, KrakenApiError>;
 }
 
-#[derive(Debug)]
 struct OwnedSecretsProvider {
     key: String,
     secret: String,
+}
+
+impl Debug for OwnedSecretsProvider {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("OwnedSecretsProvider")
+            .field("key", &"[redacted]")
+            .field("secret", &"[redacted]")
+            .finish()
+    }
 }
 
 impl SecretsProvider for OwnedSecretsProvider {
@@ -146,9 +158,14 @@ impl SecretsProvider for OwnedSecretsProvider {
 
 type Client = RateLimitedKrakenClient<CoreKrakenClient>;
 
-#[derive(Debug)]
 pub struct KrakenRestApi {
     client: Mutex<Client>,
+}
+
+impl Debug for KrakenRestApi {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.debug_struct("KrakenRestApi").finish_non_exhaustive()
+    }
 }
 
 impl KrakenRestApi {
@@ -177,7 +194,15 @@ fn canonical_symbol(symbol: &str) -> String {
     match symbol.trim().to_ascii_uppercase().as_str() {
         "XBT" | "XXBT" => "BTC".to_string(),
         "XDG" | "XXDG" => "DOGE".to_string(),
-        value => value.trim_start_matches(['X', 'Z']).to_string(),
+        "XETH" => "ETH".to_string(),
+        "ZUSD" => "USD".to_string(),
+        "ZEUR" => "EUR".to_string(),
+        "ZGBP" => "GBP".to_string(),
+        "ZJPY" => "JPY".to_string(),
+        "ZCAD" => "CAD".to_string(),
+        "ZCHF" => "CHF".to_string(),
+        "ZAUD" => "AUD".to_string(),
+        value => value.to_string(),
     }
 }
 
@@ -445,5 +470,32 @@ impl KrakenApi for KrakenRestApi {
                 },
             })
             .collect())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn canonical_symbol_only_strips_known_kraken_legacy_codes() {
+        assert_eq!(canonical_symbol("XXBT"), "BTC");
+        assert_eq!(canonical_symbol("ZUSD"), "USD");
+        assert_eq!(canonical_symbol("XETH"), "ETH");
+        assert_eq!(canonical_symbol("XRP"), "XRP");
+        assert_eq!(canonical_symbol("XMR"), "XMR");
+        assert_eq!(canonical_symbol("ZEC"), "ZEC");
+    }
+
+    #[test]
+    fn debug_output_redacts_owned_credentials() {
+        let provider = OwnedSecretsProvider {
+            key: "public-key".to_string(),
+            secret: "private-secret".to_string(),
+        };
+        let output = format!("{provider:?}");
+        assert!(!output.contains("public-key"));
+        assert!(!output.contains("private-secret"));
+        assert!(output.contains("redacted"));
     }
 }

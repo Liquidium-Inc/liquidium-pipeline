@@ -79,18 +79,27 @@ pub struct CexVenueProfile {
     withdraw_below_min_raw_code: Option<i64>,
     funding_preflight_required: bool,
     backend_submission_classifier_required: bool,
+    approval_bumps_required: bool,
+    direct_withdrawal_reconciliation_required: bool,
+    best_route_preview_required: bool,
+    client_order_id_max_len: usize,
 }
 
 impl CexVenueProfile {
-    pub fn standard(venue_id: &'static str, preview_taker_fee_bps: f64) -> Self {
+    pub fn kraken(preview_taker_fee_bps: f64) -> Self {
         Self {
-            venue_id,
+            venue_id: "kraken",
             preview_taker_fee_bps,
             deposit_fee_multiplier: 1,
             special_trade_legs: None,
             withdraw_below_min_raw_code: None,
             funding_preflight_required: true,
             backend_submission_classifier_required: true,
+            approval_bumps_required: false,
+            direct_withdrawal_reconciliation_required: true,
+            best_route_preview_required: true,
+            // Kraken accepts free-text client order IDs up to 18 ASCII characters.
+            client_order_id_max_len: 18,
         }
     }
 
@@ -103,6 +112,10 @@ impl CexVenueProfile {
             withdraw_below_min_raw_code: Some(MEXC_WITHDRAW_BELOW_MIN_RAW_CODE),
             funding_preflight_required: false,
             backend_submission_classifier_required: false,
+            approval_bumps_required: true,
+            direct_withdrawal_reconciliation_required: false,
+            best_route_preview_required: false,
+            client_order_id_max_len: 32,
         }
     }
 
@@ -120,6 +133,22 @@ impl CexVenueProfile {
 
     pub fn backend_submission_classifier_required(&self) -> bool {
         self.backend_submission_classifier_required
+    }
+
+    fn approval_bumps_required(&self) -> bool {
+        self.approval_bumps_required
+    }
+
+    fn direct_withdrawal_reconciliation_required(&self) -> bool {
+        self.direct_withdrawal_reconciliation_required
+    }
+
+    fn best_route_preview_required(&self) -> bool {
+        self.best_route_preview_required
+    }
+
+    fn client_order_id_max_len(&self) -> usize {
+        self.client_order_id_max_len
     }
 
     fn special_trade_legs(&self, deposit: &str, withdraw: &str) -> Option<Vec<TradeLeg>> {
@@ -244,10 +273,11 @@ where
 
     fn native_icp_direct_withdraw_address(&self, requested_destination: &str) -> Result<String, String> {
         let requested_destination = requested_destination.trim();
+        let venue = self.profile.venue_id().to_ascii_uppercase();
         if requested_destination.is_empty() {
             return Ok(Self::principal_default_account_id_hex(self.liquidator_principal));
         }
-        if let Ok(account_id) = Self::validate_icp_account_id_hex(requested_destination, "MEXC withdraw") {
+        if let Ok(account_id) = Self::validate_icp_account_id_hex(requested_destination, &format!("{venue} withdraw")) {
             return Ok(account_id);
         }
 
@@ -257,6 +287,7 @@ where
     }
 
     fn complete_withdraw_as_below_min_dust(
+        &self,
         state: &mut CexState,
         planned_asset: &str,
         planned_network: &str,
@@ -264,8 +295,13 @@ where
         err: &str,
     ) {
         let msg = format!(
-            "mexc withdraw below minimum; treating residual as CEX dust for liq_id {} asset={} network={} amount={} err={}",
-            state.liq_id, planned_asset, planned_network, amount, err
+            "{} withdraw below minimum; treating residual as CEX dust for liq_id {} asset={} network={} amount={} err={}",
+            self.profile.venue_id(),
+            state.liq_id,
+            planned_asset,
+            planned_network,
+            amount,
+            err
         );
         warn!("{}", msg);
         state.last_error = Some(msg);
@@ -277,15 +313,17 @@ where
     }
 
     fn direct_deposit_destination_account(
+        &self,
         token: &ChainToken,
         planned_network: &str,
         address: &str,
     ) -> Result<ChainAccount, String> {
         let destination = address.trim();
+        let venue = self.profile.venue_id().to_ascii_uppercase();
         if destination.is_empty() {
             return Err(format!(
-                "invalid MEXC deposit address for network '{}': address is empty",
-                planned_network
+                "invalid {} deposit address for network '{}': address is empty",
+                venue, planned_network
             ));
         }
 
@@ -293,19 +331,21 @@ where
             ChainToken::Icp { .. } => {
                 if !planned_network.eq_ignore_ascii_case("ICP") {
                     return Err(format!(
-                        "unsupported MEXC deposit network '{}' for ICP asset {}; expected ICP",
+                        "unsupported {} deposit network '{}' for ICP asset {}; expected ICP",
+                        venue,
                         planned_network,
                         token.symbol()
                     ));
                 }
                 if Self::is_native_icp_token(token) {
-                    let account_id_hex = Self::validate_icp_account_id_hex(destination, "MEXC ICP deposit")?;
+                    let account_id_hex =
+                        Self::validate_icp_account_id_hex(destination, &format!("{venue} ICP deposit"))?;
                     return Ok(ChainAccount::IcpLedger(account_id_hex));
                 }
                 let owner = Principal::from_text(destination).map_err(|e| {
                     format!(
-                        "invalid MEXC ICP deposit address '{}' for network '{}': {e}",
-                        destination, planned_network
+                        "invalid {} ICP deposit address '{}' for network '{}': {e}",
+                        venue, destination, planned_network
                     )
                 })?;
                 Ok(ChainAccount::Icp(Account {
@@ -316,15 +356,16 @@ where
             ChainToken::EvmNative { .. } | ChainToken::EvmErc20 { .. } => {
                 if planned_network.eq_ignore_ascii_case("ICP") {
                     return Err(format!(
-                        "unsupported MEXC deposit network '{}' for EVM asset {}; expected EVM-compatible network",
+                        "unsupported {} deposit network '{}' for EVM asset {}; expected EVM-compatible network",
+                        venue,
                         planned_network,
                         token.symbol()
                     ));
                 }
                 let evm_address = destination.parse::<EvmAddress>().map_err(|e| {
                     format!(
-                        "invalid MEXC EVM deposit address '{}' for network '{}': {e}",
-                        destination, planned_network
+                        "invalid {} EVM deposit address '{}' for network '{}': {e}",
+                        venue, destination, planned_network
                     )
                 })?;
                 Ok(ChainAccount::Evm(evm_address.to_string()))
@@ -505,20 +546,6 @@ where
         self
     }
 
-    pub fn with_venue_profile(
-        mut self,
-        venue_id: &'static str,
-        preview_taker_fee_bps: f64,
-        use_mexc_special_routes: bool,
-    ) -> Self {
-        self.profile = if use_mexc_special_routes {
-            CexVenueProfile::mexc()
-        } else {
-            CexVenueProfile::standard(venue_id, preview_taker_fee_bps)
-        };
-        self
-    }
-
     pub fn with_profile(mut self, profile: CexVenueProfile) -> Self {
         self.profile = profile;
         self
@@ -631,7 +658,7 @@ where
         let planned_network = <Self as BridgePlanner>::planned_deposit_network(state);
 
         debug!(
-            "[mexc] liq_id={} step=Deposit source_asset={} source_network={} cex_asset={} cex_network={} bridge_required={}",
+            "[cex] liq_id={} step=Deposit source_asset={} source_network={} cex_asset={} cex_network={} bridge_required={}",
             state.liq_id,
             state.deposit.deposit_asset,
             state.deposit.deposit_asset.chain(),
@@ -647,7 +674,7 @@ where
                     Ok(bal) => bal,
                     Err(e) => {
                         debug!(
-                            "[mexc] liq_id={} could not get baseline balance before deposit: {} (using 0.0)",
+                            "[cex] liq_id={} could not get baseline balance before deposit: {} (using 0.0)",
                             state.liq_id, e
                         );
                         0.0
@@ -655,7 +682,7 @@ where
                 };
 
                 debug!(
-                    "[mexc] liq_id={} baseline balance before deposit: {}",
+                    "[cex] liq_id={} baseline balance before deposit: {}",
                     state.liq_id, baseline
                 );
                 state.deposit.deposit_balance_before = Some(baseline);
@@ -670,8 +697,13 @@ where
                 {
                     let tag = addr.tag.clone().unwrap_or_default();
                     return Err(format!(
-                        "native ICP MEXC deposit returned unsupported memo/tag for liq_id {} asset={} network={} address={} tag={}",
-                        state.liq_id, planned_asset, planned_network, addr.address, tag
+                        "native ICP {} deposit returned unsupported memo/tag for liq_id {} asset={} network={} address={} tag={}",
+                        self.profile.venue_id().to_ascii_uppercase(),
+                        state.liq_id,
+                        planned_asset,
+                        planned_network,
+                        addr.address,
+                        tag
                     ));
                 }
 
@@ -679,7 +711,7 @@ where
 
                 let (transfer_value, transfer_amount) =
                     self.compute_fee_adjusted_deposit_transfer(&state.deposit.deposit_asset, &state.size_in)?;
-                let destination = Self::direct_deposit_destination_account(
+                let destination = self.direct_deposit_destination_account(
                     &state.deposit.deposit_asset,
                     &planned_network,
                     &addr.address,
@@ -695,7 +727,8 @@ where
                 state.deposit.deposit_txid = Some(tx_id);
                 state.deposit.deposit_sent_at_ts = Some(now_ts());
 
-                if matches!(state.deposit.deposit_asset, ChainToken::Icp { .. })
+                if self.profile.approval_bumps_required()
+                    && matches!(state.deposit.deposit_asset, ChainToken::Icp { .. })
                     && !Self::is_native_icp_token(&state.deposit.deposit_asset)
                 {
                     let approved = self
@@ -735,7 +768,7 @@ where
                 Ok(bal) => bal,
                 Err(e) => {
                     debug!(
-                        "[mexc] liq_id={} could not get baseline balance before bridged deposit: {} (using 0.0)",
+                        "[cex] liq_id={} could not get baseline balance before bridged deposit: {} (using 0.0)",
                         state.liq_id, e
                     );
                     0.0
@@ -768,7 +801,7 @@ where
                 let source_transfer_amount =
                     ChainTokenAmount::from_raw(state.deposit.deposit_asset.clone(), transfer_value.clone());
                 info!(
-                    "[mexc] liq_id={} bridged deposit reserving reverse bridge source fee budget: reserve={} source_transfer={} bridge_amount={} route={}@{}->{}",
+                    "[cex] liq_id={} bridged deposit reserving reverse bridge source fee budget: reserve={} source_transfer={} bridge_amount={} route={}@{}->{}",
                     state.liq_id,
                     source_fee_reserve.formatted(),
                     source_transfer_amount.formatted(),
@@ -855,7 +888,7 @@ where
             let required_source_available = bridge_amount + fee_budget.source_fee_budget;
             if source_available + WITHDRAW_BRIDGE_SOURCE_BALANCE_TOLERANCE < required_source_available {
                 info!(
-                    "[mexc] liq_id={} bridged deposit waiting for source funding: available={} expected={} tolerance={} source={} route={}@{}->{}",
+                    "[cex] liq_id={} bridged deposit waiting for source funding: available={} expected={} tolerance={} source={} route={}@{}->{}",
                     state.liq_id,
                     source_available,
                     required_source_available,
@@ -871,7 +904,7 @@ where
 
             let bridge_amount = if source_available < bridge_amount {
                 info!(
-                    "[mexc] liq_id={} adjusting bridged deposit amount within source balance tolerance: amount {} -> {} (tolerance={} source={} route={}@{}->{})",
+                    "[cex] liq_id={} adjusting bridged deposit amount within source balance tolerance: amount {} -> {} (tolerance={} source={} route={}@{}->{})",
                     state.liq_id,
                     bridge_amount,
                     source_available,
@@ -896,7 +929,7 @@ where
                     .await?;
                 if fee_available + WITHDRAW_BRIDGE_SOURCE_BALANCE_TOLERANCE < required_fee_budget {
                     info!(
-                        "[mexc] liq_id={} bridged deposit waiting for fee funding: available={} expected={} tolerance={} source={} fee_asset={}@{} route={}@{}->{}",
+                        "[cex] liq_id={} bridged deposit waiting for fee funding: available={} expected={} tolerance={} source={} fee_asset={}@{} route={}@{}->{}",
                         state.liq_id,
                         fee_available,
                         required_fee_budget,
@@ -1007,7 +1040,7 @@ where
 
         // 1) Trace function entry with the currently persisted trade snapshot.
         debug!(
-            "[mexc] liq_id={} step=Trade market={} side={} size_in={}",
+            "[cex] liq_id={} step=Trade market={} side={} size_in={}",
             state.liq_id,
             state.market,
             state.side,
@@ -1022,7 +1055,7 @@ where
 
         // 4) Log explicit multi-hop route details when applicable.
         if legs.len() > 1 {
-            debug!("[mexc] liq_id={} multi-hop route: {:?}", state.liq_id, legs);
+            debug!("[cex] liq_id={} multi-hop route: {:?}", state.liq_id, legs);
         }
 
         // 5) For one-leg routes, normalize state market/side to the resolved leg.
@@ -1058,7 +1091,7 @@ where
         // 10) Nothing to trade (or dust below epsilon) -> finish trading phase.
         if amount_in <= LIQUIDITY_EPS {
             debug!(
-                "[mexc] liq_id={} trade skipped: non-positive amount_in={}",
+                "[cex] liq_id={} trade skipped: non-positive amount_in={}",
                 state.liq_id, amount_in
             );
             state.step = CexStep::Withdraw;
@@ -1083,7 +1116,7 @@ where
 
         // 13) Log leg-level execution start.
         debug!(
-            "[mexc] liq_id={} trade leg {}/{} market={} side={} amount_in={}",
+            "[cex] liq_id={} trade leg {}/{} market={} side={} amount_in={}",
             state.liq_id,
             idx + 1,
             legs.len(),
@@ -1108,9 +1141,14 @@ where
             .execute_trade_leg_slices(state, leg, idx, legs.len(), amount_in, target_bps)
             .await?;
 
+        if remaining_in > LIQUIDITY_EPS && state.trade.trade_unexecutable_residual_in.is_none() {
+            state.step = CexStep::TradePending;
+            return Ok(());
+        }
+
         // 15) Emit end-of-leg summary including residual and dust info.
         info!(
-            "[mexc] liq_id={} trade leg {}/{} completed market={} side={} amount_in={} amount_out={} residual_in={} dust_skipped={} dust_usd={:?}",
+            "[cex] liq_id={} trade leg {}/{} completed market={} side={} amount_in={} amount_out={} residual_in={} dust_skipped={} dust_usd={:?}",
             state.liq_id,
             idx + 1,
             legs.len(),
@@ -1135,7 +1173,7 @@ where
         let planned_network = <Self as BridgePlanner>::planned_withdraw_network(state);
 
         debug!(
-            "[mexc] liq_id={} step={:?} source_asset={} source_network={} final_asset={} final_network={} withdraw_address={} bridge_required={}",
+            "[cex] liq_id={} step={:?} source_asset={} source_network={} final_asset={} final_network={} withdraw_address={} bridge_required={}",
             state.liq_id,
             state.step,
             planned_asset,
@@ -1206,7 +1244,60 @@ where
                 state.withdraw.withdraw_address = direct_destination;
             }
 
-            if state.withdraw.withdraw_id.is_some() || state.withdraw.withdraw_txid.is_some() {
+            if self.profile.direct_withdrawal_reconciliation_required()
+                && let Some(withdraw_id) = state.withdraw.withdraw_id.clone()
+            {
+                let snapshot = self
+                    .backend
+                    .get_withdraw_status_snapshot_by_id(&planned_asset, &withdraw_id)
+                    .await?;
+                if state.withdraw.withdraw_txid.is_none() {
+                    state.withdraw.withdraw_txid = snapshot.txid.clone();
+                }
+                match snapshot.status {
+                    WithdrawStatus::Pending | WithdrawStatus::Unknown => {
+                        state.step = CexStep::WithdrawPending;
+                        return Ok(());
+                    }
+                    WithdrawStatus::Failed => {
+                        return Err(format!(
+                            "cex withdraw failed for liq_id {} withdraw_id={withdraw_id}",
+                            state.liq_id
+                        ));
+                    }
+                    WithdrawStatus::Canceled => {
+                        return Err(format!(
+                            "cex withdraw canceled for liq_id {} withdraw_id={withdraw_id}",
+                            state.liq_id
+                        ));
+                    }
+                    WithdrawStatus::Completed => {
+                        let received = match snapshot.transaction_fee {
+                            Some(fee) if fee > LIQUIDITY_EPS => {
+                                let net = amount - fee;
+                                if net <= LIQUIDITY_EPS {
+                                    return Err(format!(
+                                        "cex withdraw fee exceeds direct amount for liq_id {}: amount={} fee={} withdraw_id={withdraw_id}",
+                                        state.liq_id, amount, fee
+                                    ));
+                                }
+                                net
+                            }
+                            _ => amount,
+                        };
+                        state.withdraw.size_out = Some(ChainTokenAmount::from_formatted(
+                            state.withdraw.withdraw_asset.clone(),
+                            received,
+                        ));
+                        state.step = CexStep::Completed;
+                        return Ok(());
+                    }
+                }
+            }
+
+            if !self.profile.direct_withdrawal_reconciliation_required()
+                && (state.withdraw.withdraw_id.is_some() || state.withdraw.withdraw_txid.is_some())
+            {
                 state.step = CexStep::Completed;
                 return Ok(());
             }
@@ -1223,14 +1314,24 @@ where
             {
                 Ok(receipt) => receipt,
                 Err(err) if self.profile.is_withdraw_below_min_error(&err) => {
-                    Self::complete_withdraw_as_below_min_dust(state, &planned_asset, &planned_network, amount, &err);
+                    self.complete_withdraw_as_below_min_dust(state, &planned_asset, &planned_network, amount, &err);
                     return Ok(());
                 }
                 Err(err) => return Err(err),
             };
             state.withdraw.withdraw_id = receipt.internal_id.clone();
             state.withdraw.withdraw_txid = receipt.txid.clone();
-            state.step = CexStep::Completed;
+            state.step = if self.profile.direct_withdrawal_reconciliation_required() {
+                if state.withdraw.withdraw_id.is_none() {
+                    return Err(format!(
+                        "{} withdrawal submission returned no reconciliation ID",
+                        self.profile.venue_id()
+                    ));
+                }
+                CexStep::WithdrawPending
+            } else {
+                CexStep::Completed
+            };
             return Ok(());
         }
 
@@ -1269,7 +1370,7 @@ where
             {
                 Ok(receipt) => receipt,
                 Err(err) if self.profile.is_withdraw_below_min_error(&err) => {
-                    Self::complete_withdraw_as_below_min_dust(state, &planned_asset, &planned_network, amount, &err);
+                    self.complete_withdraw_as_below_min_dust(state, &planned_asset, &planned_network, amount, &err);
                     return Ok(());
                 }
                 Err(err) => return Err(err),
@@ -1293,7 +1394,7 @@ where
                 .get_withdraw_status_snapshot_by_id(&planned_asset, &withdraw_id)
                 .await?;
             info!(
-                "[mexc] liq_id={} withdraw snapshot: withdraw_id={} status={:?} txid_present={} fee={:?}",
+                "[cex] liq_id={} withdraw snapshot: withdraw_id={} status={:?} txid_present={} fee={:?}",
                 state.liq_id,
                 withdraw_id,
                 withdraw_snapshot.status,
@@ -1305,7 +1406,7 @@ where
                 WithdrawStatus::Pending | WithdrawStatus::Unknown => {
                     if withdraw_snapshot.txid.is_some() {
                         info!(
-                            "[mexc] liq_id={} withdraw status={:?} but txid is present for withdraw_id={}; proceeding to source-balance bridge preflight",
+                            "[cex] liq_id={} withdraw status={:?} but txid is present for withdraw_id={}; proceeding to source-balance bridge preflight",
                             state.liq_id, withdraw_snapshot.status, withdraw_id
                         );
                     } else {
@@ -1355,7 +1456,7 @@ where
                         ));
                     }
                     info!(
-                        "[mexc] liq_id={} applying CEX withdraw fee to bridged amount: gross={} fee={} net={} asset={} network={} withdraw_id={}",
+                        "[cex] liq_id={} applying CEX withdraw fee to bridged amount: gross={} fee={} net={} asset={} network={} withdraw_id={}",
                         state.liq_id,
                         bridge_amount,
                         withdraw_fee,
@@ -1386,7 +1487,7 @@ where
                     let adjusted_source_available = (source_available - NATIVE_ETH_BRIDGEABLE_SAFETY_MARGIN).max(0.0);
                     if adjusted_source_available <= WITHDRAW_BRIDGE_SOURCE_BALANCE_TOLERANCE {
                         info!(
-                            "[mexc] liq_id={} bridged native ETH withdraw waiting for source funding after safety margin: available={} adjusted={} expected={} tolerance={} source={} route={}@{}->{}",
+                            "[cex] liq_id={} bridged native ETH withdraw waiting for source funding after safety margin: available={} adjusted={} expected={} tolerance={} source={} route={}@{}->{}",
                             state.liq_id,
                             source_available,
                             adjusted_source_available,
@@ -1401,7 +1502,7 @@ where
                         return Ok(());
                     }
                     info!(
-                        "[mexc] liq_id={} bridged native ETH withdraw adjusting to bridgeable source balance: amount {} -> {} (source includes gas reserve; safety_margin={} tolerance={} source={} route={}@{}->{})",
+                        "[cex] liq_id={} bridged native ETH withdraw adjusting to bridgeable source balance: amount {} -> {} (source includes gas reserve; safety_margin={} tolerance={} source={} route={}@{}->{})",
                         state.liq_id,
                         bridge_amount,
                         adjusted_source_available,
@@ -1415,7 +1516,7 @@ where
                     bridge_amount = adjusted_source_available;
                 } else {
                     info!(
-                        "[mexc] liq_id={} bridged withdraw waiting for source funding: available={} expected={} tolerance={} source={} route={}@{}->{}",
+                        "[cex] liq_id={} bridged withdraw waiting for source funding: available={} expected={} tolerance={} source={} route={}@{}->{}",
                         state.liq_id,
                         source_available,
                         bridge_amount,
@@ -1432,7 +1533,7 @@ where
 
             if source_available < bridge_amount {
                 info!(
-                    "[mexc] liq_id={} adjusting bridged withdraw amount within source balance tolerance: amount {} -> {} (tolerance={} source={} route={}@{}->{})",
+                    "[cex] liq_id={} adjusting bridged withdraw amount within source balance tolerance: amount {} -> {} (tolerance={} source={} route={}@{}->{})",
                     state.liq_id,
                     bridge_amount,
                     source_available,
