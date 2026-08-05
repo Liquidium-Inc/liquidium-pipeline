@@ -53,7 +53,7 @@ uuid = { workspace = true }
 
 
 mexc-rs = { git = "https://github.com/liquidium-Inc/mexc-rs.git", rev = "5b8dc1e5e4261cab27772e32e2311ba4e70c1b13" }
-kraken-async-rs = { version = "=0.15.0", default-features = false }
+kraken-async-rs = { git = "https://github.com/pxr64/kraken-async-rs.git", rev = "916e950", default-features = false }
 dotenv = "0.15"
 ctor = "0.4.2"
 clap = { version = "4.5.40", features = ["derive"] }
