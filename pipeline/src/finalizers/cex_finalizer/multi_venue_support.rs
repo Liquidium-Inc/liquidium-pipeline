@@ -1,4 +1,5 @@
 use candid::Nat;
+use liquidium_pipeline_connectors::backend::bridge_backend::resolve_route;
 use liquidium_pipeline_connectors::backend::cex_backend::CexBackend;
 use liquidium_pipeline_core::tokens::{chain_token::ChainToken, chain_token_amount::ChainTokenAmount};
 
@@ -28,6 +29,28 @@ impl<B> CexFinalizer<B>
 where
     B: CexBackend,
 {
+    fn funding_preflight_withdraw_destination(&self, state: &CexState) -> Result<String, String> {
+        let planned_asset = <Self as BridgePlanner>::planned_withdraw_asset(state);
+        let planned_network = <Self as BridgePlanner>::planned_withdraw_network(state);
+
+        if state.withdraw.bridge.withdraw_bridge_required {
+            let final_symbol = state.withdraw.withdraw_asset.symbol();
+            let route = resolve_route(&planned_asset, &planned_network, &final_symbol).ok_or_else(|| {
+                format!(
+                    "bridge route not found for withdraw {}@{} -> {}",
+                    planned_asset, planned_network, final_symbol
+                )
+            })?;
+            return self.resolve_bridge_source_address(route.source_chain);
+        }
+
+        if planned_network.eq_ignore_ascii_case("ICP") && Self::is_native_icp_token(&state.withdraw.withdraw_asset) {
+            return self.native_icp_direct_withdraw_address(&state.withdraw.withdraw_address);
+        }
+
+        Ok(state.withdraw.withdraw_address.clone())
+    }
+
     /// Builds the venue-local CEX state from an exact allocation. Keeping this
     /// separate from `ExecutionReceipt` prevents a split leg from accidentally
     /// depositing the liquidation's full collateral amount.
@@ -220,13 +243,14 @@ where
     ) -> Result<CexPreparedPreview, String> {
         let mut state = self.prepare_swap_request(execution_id, request)?;
         if self.profile.funding_preflight_required() {
+            let withdraw_destination = self.funding_preflight_withdraw_destination(&state)?;
             self.backend
                 .validate_funding_route(
                     &<Self as BridgePlanner>::planned_deposit_asset(&state),
                     &<Self as BridgePlanner>::planned_deposit_network(&state),
                     &<Self as BridgePlanner>::planned_withdraw_asset(&state),
                     &<Self as BridgePlanner>::planned_withdraw_network(&state),
-                    &state.withdraw.withdraw_address,
+                    &withdraw_destination,
                 )
                 .await?;
         }

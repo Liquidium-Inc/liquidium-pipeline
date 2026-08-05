@@ -395,3 +395,7 @@ type MexcVenueExecutionState = CexVenueExecutionState;
 #[cfg(test)]
 #[path = "../mexc/mexc_multi_venue_adapter_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "kraken_route_tests.rs"]
+mod kraken_route_tests;

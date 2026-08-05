@@ -212,7 +212,7 @@ CEX_MEXC_AVAILABLE_PAIRS=CKBTC_BTC,BTC_USDC,BTC_USDT,USDC_USDT,CKUSDT_USDT,ICP_U
 # Max intermediate hops when searching configured pairs (0 disables hop fallback)
 CEX_MEXC_MAX_HOPS=2
 # Optional canonical Kraken market allowlist. XBT is normalized to BTC.
-CEX_KRAKEN_AVAILABLE_PAIRS=BTC_USD,ETH_USD,USDC_USD
+CEX_KRAKEN_AVAILABLE_PAIRS=BTC_USD,ETH_USD,USDC_USD,ICP_USD
 # Defaults to two intermediate hops; 0 disables hop fallback.
 CEX_KRAKEN_MAX_HOPS=2
 ```
