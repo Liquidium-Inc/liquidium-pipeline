@@ -465,6 +465,8 @@ No change should be needed to:
 | Enabled-venue runtime selection | Implemented |
 | Restart-boundary and full compatibility verification | Implemented |
 
+Kraken can use the shared executable `ckETH↔ETH` and `ckUSDC↔USDC` bridge routes. The catalog also models `ckBTC↔BTC`, but the current runtime bridge backend does not implement ckBTC minter submission/status operations; those previews remain unavailable rather than entering a non-executable custody flow.
+
 ## Rollout and Rollback
 
 - No SQLite migration is required because `meta_v2` is stored inside existing JSON metadata.

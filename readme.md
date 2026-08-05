@@ -659,7 +659,7 @@ Kraken has no standalone live-smoke command. Keep live execution out of CI and v
 6. If a leg becomes `OperatorRequired`, stop. Reconcile Kraken order and withdrawal history against the persisted intent before explicitly re-enqueuing it; do not submit a replacement manually without that comparison.
 7. Remove Kraken from `ENABLED_SWAP_VENUES` after the smoke run until the result and logs have been reviewed for amount accuracy and secret leakage.
 
-Bridge smoke coverage should separately exercise `ckBTC↔BTC`, `ckETH↔ETH`, and `ckUSDC↔USDC`. A route is intentionally unavailable when Kraken lacks an exact funding method or verified destination; for example, ckUSDT must fall back to another venue when no direct method or configured bridge exists.
+Bridge smoke coverage should separately exercise the currently executable `ckETH↔ETH` and `ckUSDC↔USDC` routes. Although the shared catalog describes `ckBTC↔BTC`, the configured bridge backend does not yet submit ckBTC minter operations, so Kraken must report that route unavailable instead of attempting it. A route is also unavailable when Kraken lacks an exact funding method or verified destination; for example, ckUSDT must fall back to another venue when no direct method or configured bridge exists.
 
 ### Withdraw Funds
 
