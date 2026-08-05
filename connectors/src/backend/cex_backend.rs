@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use thiserror::Error;
 
 /// Marks a venue error that means "not ready yet", not "this order failed".
 ///
@@ -8,6 +9,17 @@ use async_trait::async_trait;
 /// it says so by rejecting the order. Errors carrying this prefix must be
 /// waited out under a deadline rather than counted against a retry budget.
 pub const CEX_PENDING_SETTLEMENT_PREFIX: &str = "cex pending settlement: ";
+
+/// Classification for calls that may have moved money before returning.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum CexSubmissionError {
+    #[error("submission rejected: {0}")]
+    Rejected(String),
+    #[error("submission pending settlement: {0}")]
+    PendingSettlement(String),
+    #[error("submission outcome is ambiguous: {0}")]
+    Ambiguous(String),
+}
 
 /// Reports whether a backend error asks the caller to wait for the venue.
 pub fn is_cex_pending_settlement_error(message: &str) -> bool {
@@ -97,6 +109,31 @@ pub struct WithdrawStatusSnapshot {
 #[mockall::automock]
 #[async_trait]
 pub trait CexBackend: Send + Sync {
+    /// Converts a backend-owned error into the decision the venue adapter must
+    /// persist. The backend owns this mapping because only it knows whether a
+    /// failed request may have reached the exchange.
+    fn classify_submission_error(&self, error: &str) -> CexSubmissionError {
+        if is_cex_pending_settlement_error(error) {
+            CexSubmissionError::PendingSettlement(error.to_string())
+        } else {
+            CexSubmissionError::Rejected(error.to_string())
+        }
+    }
+
+    /// Read-only preflight performed before a venue quote can be committed.
+    /// Backends with destination allowlists use it to prove later settlement
+    /// is possible for the exact route and address.
+    async fn validate_funding_route(
+        &self,
+        _deposit_asset: &str,
+        _deposit_network: &str,
+        _withdraw_asset: &str,
+        _withdraw_network: &str,
+        _withdraw_address: &str,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+
     // trading
     async fn get_quote(&self, market: &str, amount_in: f64) -> Result<f64, String>;
 
