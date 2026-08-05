@@ -5,7 +5,9 @@ use ic_ledger_types::{AccountIdentifier, Subaccount};
 use icrc_ledger_types::icrc1::account::Account;
 use liquidium_pipeline_connectors::backend::{
     bridge_backend::MockBridgeBackend,
-    cex_backend::{MockCexBackend, OrderBook, OrderBookLevel},
+    cex_backend::{
+        MockCexBackend, OrderBook, OrderBookLevel, WithdrawStatus, WithdrawStatusSnapshot, WithdrawalReceipt,
+    },
 };
 use liquidium_pipeline_core::{
     tokens::{chain_token::ChainToken, chain_token_amount::ChainTokenAmount, token_registry::TokenRegistry},
@@ -14,7 +16,9 @@ use liquidium_pipeline_core::{
 
 use crate::{
     finalizers::{
-        cex_finalizer::{CexBridgeConfig, CexBridgeDependencies, CexFinalizer},
+        cex_finalizer::{
+            CexBridgeConfig, CexBridgeDependencies, CexFinalizer, CexFinalizerLogic, CexStep, CexVenueProfile,
+        },
         multi_venue::{MultiVenueAdapter, VenuePlanningContext},
     },
     swappers::model::SwapRequest,
@@ -81,7 +85,7 @@ fn finalizer(
         0.0001,
         0.7,
     )
-    .with_venue_profile("kraken", 40.0, false)
+    .with_profile(CexVenueProfile::kraken(40.0))
     .with_token_registry(Arc::new(TokenRegistry::new(tokens)))
     .with_bridge_dependencies(bridge_dependencies())
     .with_route_config(pairs, 2)
@@ -93,18 +97,26 @@ async fn assert_icp_to_bridged_asset(receive_symbol: &str, quote_market: &str) {
     let expected_withdraw_asset = receive_symbol.trim_start_matches("ck").to_ascii_uppercase();
     let mut backend = MockCexBackend::new();
     backend
+        .expect_validate_trade_amounts()
+        .times(2)
+        .returning(|_, _, amount_in, amount_out| {
+            assert!(amount_in > 0.0);
+            assert!(amount_out > 0.0);
+            Ok(())
+        });
+    backend
         .expect_validate_funding_route()
-        .withf(
-            move |deposit_asset, deposit_network, withdraw_asset, withdraw_network, destination| {
-                deposit_asset == "ICP"
-                    && deposit_network == "ICP"
-                    && withdraw_asset == expected_withdraw_asset
-                    && withdraw_network == "ETH"
-                    && destination == BRIDGE_EVM_ADDRESS
-            },
-        )
+        .withf(move |preflight| {
+            preflight.deposit_asset == "ICP"
+                && preflight.deposit_network == "ICP"
+                && preflight.withdraw_asset == expected_withdraw_asset
+                && preflight.withdraw_network == "ETH"
+                && preflight.withdraw_address == BRIDGE_EVM_ADDRESS
+                && preflight.deposit_amount > 0.0
+                && preflight.withdraw_amount > 0.0
+        })
         .once()
-        .returning(|_, _, _, _, _| Ok(()));
+        .returning(|_| Ok(()));
     backend.expect_get_orderbook().returning(|market, _| match market {
         "ICP_USD" => Ok(OrderBook {
             bids: vec![OrderBookLevel {
@@ -157,18 +169,26 @@ async fn assert_bridged_asset_to_icp(pay_symbol: &str, base_market: &str) {
     let expected_deposit_asset = pay_symbol.trim_start_matches("ck").to_ascii_uppercase();
     let mut backend = MockCexBackend::new();
     backend
+        .expect_validate_trade_amounts()
+        .times(2)
+        .returning(|_, _, amount_in, amount_out| {
+            assert!(amount_in > 0.0);
+            assert!(amount_out > 0.0);
+            Ok(())
+        });
+    backend
         .expect_validate_funding_route()
-        .withf(
-            move |deposit_asset, deposit_network, withdraw_asset, withdraw_network, destination| {
-                deposit_asset == expected_deposit_asset
-                    && deposit_network == "ETH"
-                    && withdraw_asset == "ICP"
-                    && withdraw_network == "ICP"
-                    && destination == expected_account_id
-            },
-        )
+        .withf(move |preflight| {
+            preflight.deposit_asset == expected_deposit_asset
+                && preflight.deposit_network == "ETH"
+                && preflight.withdraw_asset == "ICP"
+                && preflight.withdraw_network == "ICP"
+                && preflight.withdraw_address == expected_account_id
+                && preflight.deposit_amount > 0.0
+                && preflight.withdraw_amount > 0.0
+        })
         .once()
-        .returning(|_, _, _, _, _| Ok(()));
+        .returning(|_| Ok(()));
     backend.expect_get_orderbook().returning(|market, _| match market {
         "USDC_USD" | "ETH_USD" => Ok(OrderBook {
             bids: vec![OrderBookLevel {
@@ -236,4 +256,127 @@ async fn kraken_routes_usdc_to_icp_through_usd_and_preflights_account_id() {
 #[tokio::test]
 async fn kraken_routes_eth_to_icp_through_usd_and_preflights_account_id() {
     assert_bridged_asset_to_icp("ckETH", "ETH_USD").await;
+}
+
+#[tokio::test]
+async fn kraken_falls_back_to_amount_fillable_hop_when_direct_book_is_too_thin() {
+    let pay = native_icp_token();
+    let receive = bridged_token("ckUSDC");
+    let mut backend = MockCexBackend::new();
+    backend
+        .expect_validate_trade_amounts()
+        .times(2)
+        .returning(|_, _, _, _| Ok(()));
+    backend
+        .expect_validate_funding_route()
+        .withf(|preflight| {
+            preflight.deposit_asset == "ICP"
+                && preflight.deposit_network == "ICP"
+                && preflight.withdraw_asset == "USDC"
+                && preflight.withdraw_network == "ETH"
+                && preflight.withdraw_address == BRIDGE_EVM_ADDRESS
+        })
+        .once()
+        .returning(|_| Ok(()));
+    backend.expect_get_orderbook().returning(|market, _| match market {
+        "ICP_USDC" => Ok(OrderBook {
+            bids: vec![OrderBookLevel {
+                price: 5.0,
+                quantity: 0.01,
+            }],
+            asks: vec![],
+        }),
+        "ICP_USD" => Ok(OrderBook {
+            bids: vec![OrderBookLevel {
+                price: 5.0,
+                quantity: 1_000_000.0,
+            }],
+            asks: vec![],
+        }),
+        "USDC_USD" => Ok(OrderBook {
+            bids: vec![],
+            asks: vec![OrderBookLevel {
+                price: 1.0,
+                quantity: 1_000_000.0,
+            }],
+        }),
+        _ => Err(format!("unexpected market {market}")),
+    });
+
+    let finalizer = finalizer(
+        backend,
+        &pay,
+        &receive,
+        vec!["ICP_USDC".to_string(), "ICP_USD".to_string(), "USDC_USD".to_string()],
+    );
+    let request = SwapRequest {
+        pay_asset: pay.asset_id(),
+        pay_amount: ChainTokenAmount::from_formatted(pay, 1.0),
+        receive_asset: receive.asset_id(),
+        receive_address: Some(Principal::from_slice(&[42]).to_text()),
+        max_slippage_bps: Some(200),
+        venue_hint: Some("kraken".to_string()),
+    };
+
+    let preview = MultiVenueAdapter::preview(&finalizer, &planning_context(), &request)
+        .await
+        .expect("fillable hop should replace thin direct route");
+    assert_eq!(preview.quote.legs[0].route_id, "ICP_USD:sell>USDC_USD:buy");
+}
+
+#[tokio::test]
+async fn kraken_direct_withdraw_waits_for_terminal_status_and_reports_net_receive() {
+    let pay = bridged_token("ckUSDC");
+    let receive = native_icp_token();
+    let mut backend = MockCexBackend::new();
+    backend
+        .expect_withdraw()
+        .once()
+        .returning(|asset, network, address, amount| {
+            assert_eq!(asset, "ICP");
+            assert_eq!(network, "ICP");
+            assert!(!address.is_empty());
+            Ok(WithdrawalReceipt {
+                asset: asset.to_string(),
+                network: network.to_string(),
+                amount,
+                txid: None,
+                internal_id: Some("kraken-withdraw-1".to_string()),
+            })
+        });
+    backend
+        .expect_get_withdraw_status_snapshot_by_id()
+        .withf(|asset, id| asset == "ICP" && id == "kraken-withdraw-1")
+        .once()
+        .returning(|_, _| {
+            Ok(WithdrawStatusSnapshot {
+                status: WithdrawStatus::Completed,
+                txid: Some("icp-tx-1".to_string()),
+                transaction_fee: Some(0.01),
+            })
+        });
+
+    let finalizer = finalizer(backend, &pay, &receive, vec![]);
+    let mut state = finalizer
+        .prepare_amount_scoped_state(
+            "withdraw-test",
+            ChainTokenAmount::from_formatted(pay, 1.0),
+            receive,
+            Some(Principal::from_slice(&[42]).to_text()),
+        )
+        .expect("state");
+    state.step = CexStep::Withdraw;
+    state.withdraw.size_out = Some(ChainTokenAmount::from_formatted(
+        state.withdraw.withdraw_asset.clone(),
+        1.0,
+    ));
+
+    finalizer.withdraw(&mut state).await.expect("submit withdrawal");
+    assert_eq!(state.step, CexStep::WithdrawPending);
+    assert_eq!(state.withdraw.withdraw_id.as_deref(), Some("kraken-withdraw-1"));
+
+    finalizer.withdraw(&mut state).await.expect("reconcile withdrawal");
+    assert_eq!(state.step, CexStep::Completed);
+    assert_eq!(state.withdraw.withdraw_txid.as_deref(), Some("icp-tx-1"));
+    assert!((state.withdraw.size_out.expect("net output").to_f64() - 0.99).abs() < 1e-9);
 }

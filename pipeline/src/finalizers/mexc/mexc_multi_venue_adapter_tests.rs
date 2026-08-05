@@ -509,6 +509,96 @@ async fn ordinary_cex_error_remains_retryable_without_operator_intervention() {
     );
 }
 
+#[tokio::test]
+async fn each_trade_order_intent_is_persisted_before_its_submission() {
+    let calls = Arc::new(std::sync::Mutex::new(0usize));
+    let calls_for_backend = calls.clone();
+    let mut backend = MockCexBackend::new();
+    backend.expect_get_orderbook().returning(|_, _| {
+        Ok(OrderBook {
+            bids: vec![OrderBookLevel {
+                price: 10.0,
+                quantity: 1_000_000.0,
+            }],
+            asks: vec![],
+        })
+    });
+    backend
+        .expect_execute_swap_detailed_with_options()
+        .once()
+        .returning(move |_, _, amount_in, _| {
+            *calls_for_backend.lock().unwrap() += 1;
+            Ok(SwapFillReport {
+                input_consumed: amount_in,
+                output_received: amount_in * 10.0,
+            })
+        });
+    let tokens = HashMap::from([
+        (pay_token().asset_id(), pay_token()),
+        (receive_token().asset_id(), receive_token()),
+    ]);
+    let finalizer = MexcFinalizer::new(
+        Arc::new(backend),
+        Arc::new(MockTransferActions::new()),
+        Principal::anonymous(),
+        200.0,
+        0.0001,
+        0.7,
+    )
+    .with_token_registry(Arc::new(TokenRegistry::new(tokens)));
+
+    let preview = MultiVenueAdapter::preview(&finalizer, &planning_context(), &request(100_000_000))
+        .await
+        .expect("preview");
+    let mut leg = leg_from_preview(preview);
+    let mut execution = leg
+        .execution
+        .decode::<MexcVenueExecutionState>(VENUE_ID)
+        .expect("decode")
+        .expect("state");
+    execution.cex.step = CexStep::Trade;
+    execution.cex.trade.trade_resolved_legs = vec![CexRouteLeg {
+        market: "PAY_RECV".to_string(),
+        side: "sell".to_string(),
+    }];
+    execution.cex.trade.trade_next_amount_in = Some(1.0);
+    leg.execution = VenueExecutionState::new(VENUE_ID, &execution).expect("encode");
+
+    let gate = MultiVenueAdapter::advance(&finalizer, &leg, &NoopCheckpoint)
+        .await
+        .expect("open outer gate");
+    leg.execution = gate.execution;
+    let prepared = MultiVenueAdapter::advance(&finalizer, &leg, &NoopCheckpoint)
+        .await
+        .expect("prepare order intent");
+    assert_eq!(*calls.lock().unwrap(), 0);
+    let prepared_state = prepared
+        .execution
+        .decode::<MexcVenueExecutionState>(VENUE_ID)
+        .expect("decode prepared")
+        .expect("prepared state");
+    assert!(prepared_state.cex.trade.trade_pending_client_order_id.is_some());
+    assert!(prepared_state.cex.trade.trade_pending_requested_in.is_some());
+
+    leg.execution = prepared.execution;
+    let submission_gate = MultiVenueAdapter::advance(&finalizer, &leg, &NoopCheckpoint)
+        .await
+        .expect("open submission gate");
+    assert_eq!(*calls.lock().unwrap(), 0);
+    leg.execution = submission_gate.execution;
+    let filled = MultiVenueAdapter::advance(&finalizer, &leg, &NoopCheckpoint)
+        .await
+        .expect("submit persisted order");
+    assert_eq!(*calls.lock().unwrap(), 1);
+    let filled_state = filled
+        .execution
+        .decode::<MexcVenueExecutionState>(VENUE_ID)
+        .expect("decode fill")
+        .expect("filled state");
+    assert!(filled_state.cex.trade.trade_pending_client_order_id.is_none());
+    assert_eq!(filled_state.cex.trade.trade_slices.len(), 1);
+}
+
 /// Builds a finalizer whose trade slice always draws the given venue response.
 fn finalizer_with_trade_result(
     swap_result: Result<SwapFillReport, String>,
@@ -569,8 +659,16 @@ async fn leg_at_trade_step(finalizer: &MexcFinalizer<MockCexBackend>, waiting_si
 
     let armed = MultiVenueAdapter::advance(finalizer, &leg, &NoopCheckpoint)
         .await
-        .expect("first cycle should arm the leg");
+        .expect("first cycle should arm the outer leg intent");
     leg.execution = armed.execution;
+    let prepared = MultiVenueAdapter::advance(finalizer, &leg, &NoopCheckpoint)
+        .await
+        .expect("second cycle should prepare the order intent");
+    leg.execution = prepared.execution;
+    let submission_gate = MultiVenueAdapter::advance(finalizer, &leg, &NoopCheckpoint)
+        .await
+        .expect("third cycle should arm the order submission");
+    leg.execution = submission_gate.execution;
     leg
 }
 
@@ -606,7 +704,7 @@ async fn venue_settlement_rejection_waits_instead_of_spending_the_retry_budget()
         .decode::<MexcVenueExecutionState>(VENUE_ID)
         .expect("decode waiting state")
         .expect("MEXC state");
-    assert_eq!(execution.cex.step, CexStep::Trade);
+    assert_eq!(execution.cex.step, CexStep::TradePending);
     assert!(!execution.operator_required);
     assert!(execution.cex.trade.trade_settlement_waiting_since_ts.is_some());
 }
