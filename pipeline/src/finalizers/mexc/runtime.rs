@@ -17,6 +17,7 @@ use liquidium_pipeline_connectors::backend::{
 use crate::{
     config::ConfigTrait,
     context::PipelineContext,
+    finalizers::cex_finalizer::CexVenueProfile,
     finalizers::mexc::mexc_finalizer::{MexcBridgeConfig, MexcBridgeDependencies, MexcFinalizer},
     swappers::mexc::mexc_adapter::MexcClient,
 };
@@ -172,13 +173,8 @@ fn required_cketh_route_chain_ids(chain_id_config: &RouteChainIdConfig) -> Resul
     Ok(chain_ids)
 }
 
-pub async fn build_mexc_finalizer(ctx: &PipelineContext) -> Result<Arc<MexcFinalizer<MexcClient>>, String> {
+pub(crate) async fn build_cex_bridge_dependencies(ctx: &PipelineContext) -> Result<MexcBridgeDependencies, String> {
     let config = ctx.config.clone();
-    let (api_key, secret) = config
-        .get_cex_credentials("mexc")
-        .map_err(|err| format!("Cex credentials not found: {err}"))?;
-
-    let mexc_client = Arc::new(MexcClient::new(&api_key, &secret));
     let route_chain_id_config = route_chain_id_config_from_env()?;
     let required_chain_ids = required_cketh_route_chain_ids(&route_chain_id_config)?;
     if required_chain_ids.len() > 1 {
@@ -191,11 +187,11 @@ pub async fn build_mexc_finalizer(ctx: &PipelineContext) -> Result<Arc<MexcFinal
     let bridge_signer: PrivateKeySigner = config
         .bridge_evm_private_key
         .parse()
-        .map_err(|err| format!("Failed to parse bridge EVM private key for MEXC bridge finalizer: {err}"))?;
+        .map_err(|err| format!("failed to parse bridge EVM private key for CEX finalizer: {err}"))?;
     let bridge_rpc_url = config
         .evm_rpc_url
         .parse()
-        .map_err(|err| format!("Invalid EVM RPC URL for MEXC bridge finalizer: {err}"))?;
+        .map_err(|err| format!("invalid EVM RPC URL for CEX finalizer: {err}"))?;
     let bridge_provider = ProviderBuilder::new()
         .network::<AnyNetwork>()
         .wallet(bridge_signer)
@@ -204,7 +200,7 @@ pub async fn build_mexc_finalizer(ctx: &PipelineContext) -> Result<Arc<MexcFinal
     if let Some(expected_chain_id) = required_chain_ids.first().copied() {
         let rpc_chain_id = bridge_provider.get_chain_id().await.map_err(|err| {
             format!(
-                "failed to read chain id from EVM_RPC_URL '{}' for MEXC bridge finalizer: {err}",
+                "failed to read chain id from EVM_RPC_URL '{}' for CEX finalizer: {err}",
                 config.evm_rpc_url
             )
         })?;
@@ -231,14 +227,23 @@ pub async fn build_mexc_finalizer(ctx: &PipelineContext) -> Result<Arc<MexcFinal
         config.bridge_cketh_minter_canister,
         config.bridge_ic_owner_principal,
     ));
-    let bridge_dependencies = MexcBridgeDependencies {
+    Ok(MexcBridgeDependencies {
         backend: bridge_backend,
         config: MexcBridgeConfig {
             bridge_ic_source_account: config.bridge_ic_account(),
             bridge_evm_source_address: config.bridge_evm_address.clone(),
             bridge_btc_source_address: config.bridge_btc_address.clone(),
         },
-    };
+    })
+}
+
+pub async fn build_mexc_finalizer(ctx: &PipelineContext) -> Result<Arc<MexcFinalizer<MexcClient>>, String> {
+    let config = ctx.config.clone();
+    let (api_key, secret) = config
+        .get_cex_credentials("mexc")
+        .map_err(|err| format!("MEXC credentials not found: {err}"))?;
+    let mexc_client = Arc::new(MexcClient::new(&api_key, &secret));
+    let bridge_dependencies = build_cex_bridge_dependencies(ctx).await?;
 
     Ok(Arc::new(
         MexcFinalizer::new_with_tunables(
@@ -253,6 +258,7 @@ pub async fn build_mexc_finalizer(ctx: &PipelineContext) -> Result<Arc<MexcFinal
             config.cex_buy_inverse_max_retries,
             config.cex_buy_inverse_enabled,
         )
+        .with_profile(CexVenueProfile::mexc())
         .with_token_registry(ctx.registry.clone())
         .with_quote_costs(config.cex_route_fee_bps, config.cex_delay_buffer_bps)
         .with_bridge_dependencies(bridge_dependencies)

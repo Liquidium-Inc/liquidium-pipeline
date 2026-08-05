@@ -1,7 +1,7 @@
 use super::*;
 use crate::finalizers::bridge_planner::BridgePlanner;
+use crate::finalizers::cex_finalizer::utils::parse_market_symbols;
 use crate::finalizers::cex_finalizer::{CexRouteLeg, CexTradeSlice};
-use crate::finalizers::mexc::mexc_utils::parse_market_symbols;
 use crate::swappers::model::BPS_PER_RATIO_UNIT;
 
 struct PendingSliceRequest {
@@ -17,7 +17,7 @@ const DEPOSIT_TOTAL_FREE_FALLBACK_SECS: i64 = 25;
 /// Hard stop to avoid unbounded per-leg slicing loops on pathological books.
 const MAX_SLICE_EXECUTION_ROUNDS: usize = 128;
 
-impl<C> MexcFinalizer<C>
+impl<C> CexFinalizer<C>
 where
     C: CexBackend,
 {
@@ -262,7 +262,7 @@ where
 
     fn route_neighbors_from_pairs(&self, from_symbol: &str) -> Vec<(String, TradeLeg)> {
         let mut out = Vec::new();
-        for market in &self.cex_mexc_available_pairs {
+        for market in &self.cex_available_pairs {
             let Some((base, quote)) = parse_market_symbols(market) else {
                 continue;
             };
@@ -412,32 +412,32 @@ where
     /// Resolve a multi-leg hop route from `deposit_symbol` to `withdraw_symbol`.
     ///
     /// Flow:
-    /// 1) Require hop config (`cex_mexc_available_pairs`) and enabled hop depth.
-    /// 2) Discover candidate paths up to `cex_mexc_max_hops`.
+    /// 1) Require hop config (`cex_available_pairs`) and enabled hop depth.
+    /// 2) Discover candidate paths up to `cex_max_hops`.
     /// 3) Sort candidates by shortest route first, then deterministic signature.
     /// 4) Return the first route whose all legs pass `ensure_route_liquidity`.
     ///
     /// If no candidate is executable, returns an aggregated error that includes each
     /// rejected route signature and failure reason.
     async fn resolve_hop_route(&self, deposit_symbol: &str, withdraw_symbol: &str) -> Result<Vec<TradeLeg>, String> {
-        if self.cex_mexc_available_pairs.is_empty() {
+        if self.cex_available_pairs.is_empty() {
             return Err(format!(
                 "no configured MEXC pairs for hop discovery ({} -> {})",
                 deposit_symbol, withdraw_symbol
             ));
         }
-        if self.cex_mexc_max_hops == 0 {
+        if self.cex_max_hops == 0 {
             return Err(format!(
                 "hop discovery disabled by CEX_MEXC_MAX_HOPS=0 ({} -> {})",
                 deposit_symbol, withdraw_symbol
             ));
         }
 
-        let mut candidates = self.discover_hop_candidates(deposit_symbol, withdraw_symbol, self.cex_mexc_max_hops);
+        let mut candidates = self.discover_hop_candidates(deposit_symbol, withdraw_symbol, self.cex_max_hops);
         if candidates.is_empty() {
             return Err(format!(
                 "no configured hop route for {} -> {} within {} hops",
-                deposit_symbol, withdraw_symbol, self.cex_mexc_max_hops
+                deposit_symbol, withdraw_symbol, self.cex_max_hops
             ));
         }
 
@@ -478,7 +478,7 @@ where
         }
 
         // 1) High-priority compatibility override for legacy ck routes.
-        if let Some(legs) = mexc_special_trade_legs(&deposit, &withdraw) {
+        if let Some(legs) = self.profile.special_trade_legs(&deposit, &withdraw) {
             return Ok(legs);
         }
 
@@ -552,14 +552,14 @@ where
             }
         }
 
-        if self.cex_mexc_available_pairs.is_empty() {
+        if self.cex_available_pairs.is_empty() {
             return Err(format!(
                 "cannot convert {} to USD: no configured hop pairs and no direct stable market ({})",
                 symbol,
                 direct_errors.join(" | ")
             ));
         }
-        if self.cex_mexc_max_hops == 0 {
+        if self.cex_max_hops == 0 {
             return Err(format!(
                 "cannot convert {} to USD: hop discovery disabled and no direct stable market ({})",
                 symbol,
@@ -575,13 +575,13 @@ where
             }
         }
         for stable in &stable_targets {
-            candidates.extend(self.discover_hop_candidates(symbol, stable, self.cex_mexc_max_hops));
+            candidates.extend(self.discover_hop_candidates(symbol, stable, self.cex_max_hops));
         }
 
         if candidates.is_empty() {
             return Err(format!(
                 "cannot convert {} to USD: no configured path to stable symbols within {} hops",
-                symbol, self.cex_mexc_max_hops
+                symbol, self.cex_max_hops
             ));
         }
 
@@ -707,7 +707,7 @@ where
     }
 
     /// Simulate one leg with current orderbook for route previews.
-    pub(in crate::finalizers::mexc) async fn preview_leg(
+    pub(super) async fn preview_leg(
         &self,
         market: &str,
         side: &str,

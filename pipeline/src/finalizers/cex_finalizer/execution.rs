@@ -24,7 +24,7 @@ use num_traits::ToPrimitive;
 use tokio::sync::Mutex as TokioMutex;
 use tokio::time::sleep;
 
-use super::mexc_utils::{LIQUIDITY_EPS, SlicePreview, TradeLeg, is_usd_stable_symbol, mexc_special_trade_legs};
+use super::utils::{LIQUIDITY_EPS, SlicePreview, TradeLeg, is_usd_stable_symbol, legacy_special_trade_legs};
 
 const WITHDRAW_BRIDGE_SOURCE_BALANCE_TOLERANCE: f64 = LIQUIDITY_EPS;
 const NATIVE_ETH_BRIDGEABLE_SAFETY_MARGIN: f64 = 1e-15;
@@ -46,30 +46,90 @@ use crate::{
 };
 
 #[derive(Debug, Clone)]
-pub struct MexcBridgeConfig {
+pub struct CexBridgeConfig {
     pub bridge_ic_source_account: Account,
     pub bridge_evm_source_address: String,
     pub bridge_btc_source_address: String,
 }
 
 #[derive(Clone)]
-pub struct MexcBridgeDependencies {
+pub struct CexBridgeDependencies {
     pub backend: Arc<dyn BridgeBackend>,
-    pub config: MexcBridgeConfig,
+    pub config: CexBridgeConfig,
 }
 
-fn is_mexc_withdraw_below_min_error(err: &str) -> bool {
-    // The CEX backend trait currently erases MEXC's typed error into a string.
-    // Recover the stable raw code instead of matching MEXC's human-readable text.
-    parse_mexc_raw_code(err) == Some(MEXC_WITHDRAW_BELOW_MIN_RAW_CODE)
-}
-
-fn parse_mexc_raw_code(err: &str) -> Option<i64> {
+fn parse_raw_code(err: &str) -> Option<i64> {
     let value = err.split("raw_code:").nth(1)?.trim_start();
     let end = value
         .find(|ch: char| !ch.is_ascii_digit() && ch != '-')
         .unwrap_or(value.len());
     value.get(..end)?.parse().ok()
+}
+
+/// Venue-specific policy consumed by the shared CEX state machine.
+///
+/// API types and transport behavior remain in `CexBackend`; this profile only
+/// contains deterministic routing, fee-budget, and error-classification rules.
+#[derive(Clone)]
+pub struct CexVenueProfile {
+    venue_id: &'static str,
+    preview_taker_fee_bps: f64,
+    deposit_fee_multiplier: u8,
+    special_trade_legs: Option<fn(&str, &str) -> Option<Vec<TradeLeg>>>,
+    withdraw_below_min_raw_code: Option<i64>,
+    funding_preflight_required: bool,
+    backend_submission_classifier_required: bool,
+}
+
+impl CexVenueProfile {
+    pub fn standard(venue_id: &'static str, preview_taker_fee_bps: f64) -> Self {
+        Self {
+            venue_id,
+            preview_taker_fee_bps,
+            deposit_fee_multiplier: 1,
+            special_trade_legs: None,
+            withdraw_below_min_raw_code: None,
+            funding_preflight_required: true,
+            backend_submission_classifier_required: true,
+        }
+    }
+
+    pub fn mexc() -> Self {
+        Self {
+            venue_id: "mexc",
+            preview_taker_fee_bps: 10.0,
+            deposit_fee_multiplier: CEX_DEPOSIT_FEE_MULTIPLIER,
+            special_trade_legs: Some(legacy_special_trade_legs),
+            withdraw_below_min_raw_code: Some(MEXC_WITHDRAW_BELOW_MIN_RAW_CODE),
+            funding_preflight_required: false,
+            backend_submission_classifier_required: false,
+        }
+    }
+
+    pub fn venue_id(&self) -> &'static str {
+        self.venue_id
+    }
+
+    pub fn preview_taker_fee_bps(&self) -> f64 {
+        self.preview_taker_fee_bps
+    }
+
+    pub fn funding_preflight_required(&self) -> bool {
+        self.funding_preflight_required
+    }
+
+    pub fn backend_submission_classifier_required(&self) -> bool {
+        self.backend_submission_classifier_required
+    }
+
+    fn special_trade_legs(&self, deposit: &str, withdraw: &str) -> Option<Vec<TradeLeg>> {
+        self.special_trade_legs.and_then(|resolve| resolve(deposit, withdraw))
+    }
+
+    fn is_withdraw_below_min_error(&self, error: &str) -> bool {
+        self.withdraw_below_min_raw_code
+            .is_some_and(|expected| parse_raw_code(error) == Some(expected))
+    }
 }
 
 fn nat_to_units(amount: &Nat, decimals: i32) -> Result<f64, String> {
@@ -80,17 +140,18 @@ fn nat_to_units(amount: &Nat, decimals: i32) -> Result<f64, String> {
     Ok(raw / 10f64.powi(decimals))
 }
 
-// MEXC-specific implementation of the generic CEX finalizer logic.
+// Venue-neutral implementation of the generic CEX finalizer logic.
 //
-// This is a thin state machine wrapper around the generic `CexState`:
+// A venue backend supplies exchange-specific API behavior while this core owns:
 // - `prepare` initializes the state from a liquidation id / receipt plus static config
 // - `deposit` transitions Deposit -> Trade
 // - `trade` transitions Trade -> Withdraw
 // - `withdraw` transitions Withdraw -> Completed
-pub struct MexcFinalizer<C>
+pub struct CexFinalizer<C>
 where
     C: CexBackend,
 {
+    pub profile: CexVenueProfile,
     pub backend: Arc<C>,
     pub transfer_service: Arc<dyn TransferActions>,
     pub liquidator_principal: Principal,
@@ -108,15 +169,15 @@ where
     /// Enables inverse buy fallback after truncation.
     pub cex_buy_inverse_enabled: bool,
     /// Configured market universe used for route graph search.
-    pub cex_mexc_available_pairs: Vec<String>,
+    pub cex_available_pairs: Vec<String>,
     /// Maximum intermediate hops allowed in graph-based route discovery.
-    pub cex_mexc_max_hops: usize,
+    pub cex_max_hops: usize,
     /// Extra end-to-end route costs included in conservative planner output.
     pub quote_route_fee_bps: u32,
     /// Price-move buffer for deposit/trade/withdraw latency.
     pub quote_delay_buffer_bps: u32,
     /// Optional bridge runtime used by liquidation-linked bridge submit/poll flows.
-    pub bridge: Option<MexcBridgeDependencies>,
+    pub bridge: Option<CexBridgeDependencies>,
     /// Resolves the receive-side `AssetId` supplied by the generic venue
     /// contract into the full chain token needed by deposits and withdrawals.
     /// Legacy receipt-based execution does not need this dependency.
@@ -140,7 +201,7 @@ pub const APPROVE_BUMP_MAX_COUNT: u8 = 6;
 const APPROVE_BUMP_BATCH_SIZE: u8 = 3;
 const APPROVE_BUMP_DELAY_MS: u64 = 300;
 const APPROVE_BUMP_BATCH_DELAY_SECS: u64 = 3;
-pub const MEXC_DEPOSIT_FEE_MULTIPLIER: u8 = 7;
+pub const CEX_DEPOSIT_FEE_MULTIPLIER: u8 = 7;
 #[allow(dead_code)]
 const DEFAULT_BUY_TRUNCATION_TRIGGER_RATIO: f64 = 0.25;
 #[allow(dead_code)]
@@ -149,10 +210,10 @@ const DEFAULT_BUY_INVERSE_OVERSPEND_BPS: u32 = 10;
 const DEFAULT_BUY_INVERSE_MAX_RETRIES: u32 = 1;
 #[allow(dead_code)]
 const DEFAULT_BUY_INVERSE_ENABLED: bool = true;
-const DEFAULT_MEXC_MAX_HOPS: usize = 2;
-const MAX_MEXC_MAX_HOPS: usize = 4;
+const DEFAULT_CEX_MAX_HOPS: usize = 2;
+const MAX_CEX_MAX_HOPS: usize = 4;
 
-impl<C> MexcFinalizer<C>
+impl<C> CexFinalizer<C>
 where
     C: CexBackend,
 {
@@ -272,10 +333,11 @@ where
     }
 
     pub(super) fn compute_fee_adjusted_deposit_transfer(
+        &self,
         deposit_asset: &ChainToken,
         size_in: &ChainTokenAmount,
     ) -> Result<(Nat, ChainTokenAmount), String> {
-        let fee = deposit_asset.fee() * MEXC_DEPOSIT_FEE_MULTIPLIER;
+        let fee = deposit_asset.fee() * self.profile.deposit_fee_multiplier;
         let transfer_value = if fee > Nat::from(0u8) {
             if size_in.value.clone() <= fee {
                 let fee_amount = ChainTokenAmount::from_raw(deposit_asset.clone(), fee.clone());
@@ -340,7 +402,7 @@ where
     }
 
     async fn ensure_minimum_bridge_amount(
-        bridge: &MexcBridgeDependencies,
+        bridge: &CexBridgeDependencies,
         route: &BridgeRouteSpec,
         amount: &ChainTokenAmount,
     ) -> Result<(), String> {
@@ -422,12 +484,12 @@ where
     }
 
     pub fn with_route_config(mut self, available_pairs: Vec<String>, max_hops: usize) -> Self {
-        self.cex_mexc_available_pairs = Self::normalize_market_pairs(available_pairs);
-        self.cex_mexc_max_hops = max_hops.min(MAX_MEXC_MAX_HOPS);
+        self.cex_available_pairs = Self::normalize_market_pairs(available_pairs);
+        self.cex_max_hops = max_hops.min(MAX_CEX_MAX_HOPS);
         self
     }
 
-    pub fn with_bridge_dependencies(mut self, bridge: MexcBridgeDependencies) -> Self {
+    pub fn with_bridge_dependencies(mut self, bridge: CexBridgeDependencies) -> Self {
         self.bridge = Some(bridge);
         self
     }
@@ -440,6 +502,25 @@ where
     pub fn with_quote_costs(mut self, route_fee_bps: u32, delay_buffer_bps: u32) -> Self {
         self.quote_route_fee_bps = route_fee_bps;
         self.quote_delay_buffer_bps = delay_buffer_bps;
+        self
+    }
+
+    pub fn with_venue_profile(
+        mut self,
+        venue_id: &'static str,
+        preview_taker_fee_bps: f64,
+        use_mexc_special_routes: bool,
+    ) -> Self {
+        self.profile = if use_mexc_special_routes {
+            CexVenueProfile::mexc()
+        } else {
+            CexVenueProfile::standard(venue_id, preview_taker_fee_bps)
+        };
+        self
+    }
+
+    pub fn with_profile(mut self, profile: CexVenueProfile) -> Self {
+        self.profile = profile;
         self
     }
 
@@ -481,6 +562,7 @@ where
         cex_buy_inverse_enabled: bool,
     ) -> Self {
         Self {
+            profile: CexVenueProfile::mexc(),
             backend,
             transfer_service,
             liquidator_principal,
@@ -491,8 +573,8 @@ where
             cex_buy_inverse_overspend_bps,
             cex_buy_inverse_max_retries,
             cex_buy_inverse_enabled,
-            cex_mexc_available_pairs: vec![],
-            cex_mexc_max_hops: DEFAULT_MEXC_MAX_HOPS,
+            cex_available_pairs: vec![],
+            cex_max_hops: DEFAULT_CEX_MAX_HOPS,
             quote_route_fee_bps: 0,
             quote_delay_buffer_bps: 0,
             bridge: None,
@@ -510,13 +592,22 @@ mod bridge_planner_impl;
 #[path = "helper_methods.rs"]
 mod helper_methods;
 
+#[path = "multi_venue_adapter.rs"]
+mod multi_venue_adapter;
+
+#[path = "multi_venue_support.rs"]
+mod multi_venue_support;
+
+#[path = "route_preview.rs"]
+mod route_preview;
+
 #[async_trait]
-impl<B> CexFinalizerLogic for MexcFinalizer<B>
+impl<B> CexFinalizerLogic for CexFinalizer<B>
 where
     B: CexBackend,
 {
     fn venue_id(&self) -> &'static str {
-        "mexc"
+        self.profile.venue_id()
     }
 
     async fn prepare(&self, liq_id: &str, receipt: &ExecutionReceipt) -> Result<CexState, String> {
@@ -587,7 +678,7 @@ where
                 state.deposit.bridge.deposit_bridge_destination_snapshot = Some(addr.address.clone());
 
                 let (transfer_value, transfer_amount) =
-                    Self::compute_fee_adjusted_deposit_transfer(&state.deposit.deposit_asset, &state.size_in)?;
+                    self.compute_fee_adjusted_deposit_transfer(&state.deposit.deposit_asset, &state.size_in)?;
                 let destination = Self::direct_deposit_destination_account(
                     &state.deposit.deposit_asset,
                     &planned_network,
@@ -659,7 +750,7 @@ where
             )?;
 
             let (transfer_value, mut transfer_amount) =
-                Self::compute_fee_adjusted_deposit_transfer(&state.deposit.deposit_asset, &state.size_in)?;
+                self.compute_fee_adjusted_deposit_transfer(&state.deposit.deposit_asset, &state.size_in)?;
 
             let fee_budget = bridge
                 .backend
@@ -1131,7 +1222,7 @@ where
                 .await
             {
                 Ok(receipt) => receipt,
-                Err(err) if is_mexc_withdraw_below_min_error(&err) => {
+                Err(err) if self.profile.is_withdraw_below_min_error(&err) => {
                     Self::complete_withdraw_as_below_min_dust(state, &planned_asset, &planned_network, amount, &err);
                     return Ok(());
                 }
@@ -1177,7 +1268,7 @@ where
                 .await
             {
                 Ok(receipt) => receipt,
-                Err(err) if is_mexc_withdraw_below_min_error(&err) => {
+                Err(err) if self.profile.is_withdraw_below_min_error(&err) => {
                     Self::complete_withdraw_as_below_min_dust(state, &planned_asset, &planned_network, amount, &err);
                     return Ok(());
                 }
@@ -1436,5 +1527,14 @@ where
 }
 
 #[cfg(test)]
-#[path = "mexc_finalizer_tests.rs"]
+type MexcFinalizer<C> = CexFinalizer<C>;
+
+#[cfg(test)]
+type MexcBridgeConfig = CexBridgeConfig;
+
+#[cfg(test)]
+type MexcBridgeDependencies = CexBridgeDependencies;
+
+#[cfg(test)]
+#[path = "../mexc/mexc_finalizer_tests.rs"]
 mod tests;

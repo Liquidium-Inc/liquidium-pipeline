@@ -1,25 +1,19 @@
 use liquidium_pipeline_connectors::backend::cex_backend::CexBackend;
 
-use super::{
-    mexc_finalizer::MexcFinalizer,
-    mexc_utils::{LIQUIDITY_EPS, TradeLeg},
-};
+use super::CexFinalizer;
+use crate::finalizers::cex_finalizer::utils::{LIQUIDITY_EPS, TradeLeg};
 use crate::swappers::model::{BPS_PER_RATIO_UNIT, adverse_price_impact_bps};
-
-/// Conservative quote-time fee per MEXC hop. Live fills resolve the exact
-/// symbol fee; planning must not assume the gross order-book output is usable.
-const MEXC_PREVIEW_TAKER_FEE_BPS: f64 = 10.0;
 
 /// One normalized route preview shared by legacy CEX routing and the generic
 /// multi-venue adapter. Prices are always receive units per pay unit.
-pub(super) struct MexcRoutePreview {
+pub(super) struct CexResolvedRoutePreview {
     pub receive_amount: f64,
     pub reference_price: f64,
     pub execution_price: f64,
     pub price_impact_bps: f64,
 }
 
-impl<B> MexcFinalizer<B>
+impl<B> CexFinalizer<B>
 where
     B: CexBackend,
 {
@@ -29,7 +23,7 @@ where
         &self,
         legs: &[TradeLeg],
         initial_amount: f64,
-    ) -> Result<MexcRoutePreview, String> {
+    ) -> Result<CexResolvedRoutePreview, String> {
         if !initial_amount.is_finite() || initial_amount <= LIQUIDITY_EPS {
             return Err("MEXC cannot quote a non-positive pay amount".to_string());
         }
@@ -39,7 +33,7 @@ where
         for leg in legs {
             let (gross_amount_out, _side_vwap, side_impact_bps) =
                 self.preview_leg(&leg.market, &leg.side, amount_in).await?;
-            let amount_out = gross_amount_out * (1.0 - MEXC_PREVIEW_TAKER_FEE_BPS / BPS_PER_RATIO_UNIT);
+            let amount_out = gross_amount_out * (1.0 - self.profile.preview_taker_fee_bps() / BPS_PER_RATIO_UNIT);
             let impact_ratio = side_impact_bps / BPS_PER_RATIO_UNIT;
             let gross_execution_price = gross_amount_out / amount_in;
             let reference_price = if leg.side.eq_ignore_ascii_case("buy") {
@@ -62,7 +56,7 @@ where
         } else {
             route_reference_price
         };
-        Ok(MexcRoutePreview {
+        Ok(CexResolvedRoutePreview {
             receive_amount: amount_in,
             reference_price,
             execution_price,

@@ -46,13 +46,28 @@ fn is_valid_mexc_client_order_id(value: &str) -> bool {
 }
 
 #[test]
+fn cex_venue_profile_separates_standard_and_mexc_policy() {
+    let standard = CexVenueProfile::standard("kraken", 40.0);
+    assert_eq!(standard.venue_id(), "kraken");
+    assert_eq!(standard.preview_taker_fee_bps(), 40.0);
+    assert!(standard.special_trade_legs("ETH", "USDC").is_none());
+    assert!(!standard.is_withdraw_below_min_error("raw_code: 10254"));
+    assert_eq!(standard.deposit_fee_multiplier, 1);
+
+    let mexc = CexVenueProfile::mexc();
+    assert_eq!(mexc.venue_id(), "mexc");
+    assert!(mexc.special_trade_legs("ETH", "USDC").is_some());
+    assert!(mexc.is_withdraw_below_min_error("exchange error raw_code: 10254"));
+    assert_eq!(mexc.deposit_fee_multiplier, CEX_DEPOSIT_FEE_MULTIPLIER);
+}
+
+#[test]
 fn mexc_withdraw_below_min_detection_uses_raw_code() {
-    assert!(is_mexc_withdraw_below_min_error(
+    let profile = CexVenueProfile::mexc();
+    assert!(profile.is_withdraw_below_min_error(
         r#"Error response: ErrorResponse { code: InvalidResponse, raw_code: 10254, msg: "localized or changed text", _extend: None }"#
     ));
-    assert!(!is_mexc_withdraw_below_min_error(
-        "Withdrawal shall not be less than the Min amount of:0.00002"
-    ));
+    assert!(!profile.is_withdraw_below_min_error("Withdrawal shall not be less than the Min amount of:0.00002"));
 }
 
 fn make_execution_receipt(liq_id: u128) -> ExecutionReceipt {

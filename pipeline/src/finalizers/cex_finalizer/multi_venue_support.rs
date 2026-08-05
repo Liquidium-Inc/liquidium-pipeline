@@ -2,7 +2,8 @@ use candid::Nat;
 use liquidium_pipeline_connectors::backend::cex_backend::CexBackend;
 use liquidium_pipeline_core::tokens::{chain_token::ChainToken, chain_token_amount::ChainTokenAmount};
 
-use super::{mexc_finalizer::MexcFinalizer, mexc_utils::LIQUIDITY_EPS};
+use super::CexFinalizer;
+use crate::finalizers::cex_finalizer::utils::LIQUIDITY_EPS;
 use crate::{
     finalizers::{
         bridge_planner::BridgePlanner,
@@ -17,13 +18,13 @@ use crate::{
 
 /// Amount-scoped MEXC preview used by the thin multi-venue adapter. The full
 /// `CexState` remains the single execution state owned by `CexFinalizerLogic`.
-pub(super) struct MexcPreparedPreview {
+pub(super) struct CexPreparedPreview {
     pub state: CexState,
     pub quote: SwapQuote,
     pub conservative_receive: ChainTokenAmount,
 }
 
-impl<B> MexcFinalizer<B>
+impl<B> CexFinalizer<B>
 where
     B: CexBackend,
 {
@@ -158,12 +159,13 @@ where
             .trade_slices
             .iter()
             .map(|slice| {
-                let (base, quote) = super::mexc_utils::parse_market_symbols(&slice.market).unwrap_or_else(|| {
-                    (
-                        state.deposit.deposit_asset.symbol().to_ascii_uppercase(),
-                        state.withdraw.withdraw_asset.symbol().to_ascii_uppercase(),
-                    )
-                });
+                let (base, quote) = crate::finalizers::cex_finalizer::utils::parse_market_symbols(&slice.market)
+                    .unwrap_or_else(|| {
+                        (
+                            state.deposit.deposit_asset.symbol().to_ascii_uppercase(),
+                            state.withdraw.withdraw_asset.symbol().to_ascii_uppercase(),
+                        )
+                    });
                 let (pay_symbol, recv_symbol, pay_amount, recv_amount) = if slice.side.eq_ignore_ascii_case("sell") {
                     (base, quote, slice.amount_in, slice.amount_out)
                 } else {
@@ -171,14 +173,14 @@ where
                 };
 
                 SwapQuoteLeg {
-                    venue: "mexc".to_string(),
+                    venue: self.profile.venue_id().to_string(),
                     route_id: slice.market.clone(),
                     pay_chain: state.deposit.deposit_asset.chain(),
                     pay_symbol,
-                    pay_amount: super::mexc_utils::f64_to_nat(pay_amount),
+                    pay_amount: crate::finalizers::cex_finalizer::utils::f64_to_nat(pay_amount),
                     receive_chain: state.withdraw.withdraw_asset.chain(),
                     receive_symbol: recv_symbol,
-                    receive_amount: super::mexc_utils::f64_to_nat(recv_amount),
+                    receive_amount: crate::finalizers::cex_finalizer::utils::f64_to_nat(recv_amount),
                     price: slice.exec_price,
                     lp_fee: Nat::from(0u8),
                     gas_fee: Nat::from(0u8),
@@ -210,8 +212,19 @@ where
         &self,
         execution_id: &str,
         request: &SwapRequest,
-    ) -> Result<MexcPreparedPreview, String> {
+    ) -> Result<CexPreparedPreview, String> {
         let mut state = self.prepare_swap_request(execution_id, request)?;
+        if self.profile.funding_preflight_required() {
+            self.backend
+                .validate_funding_route(
+                    &<Self as BridgePlanner>::planned_deposit_asset(&state),
+                    &<Self as BridgePlanner>::planned_deposit_network(&state),
+                    &<Self as BridgePlanner>::planned_withdraw_asset(&state),
+                    &<Self as BridgePlanner>::planned_withdraw_network(&state),
+                    &state.withdraw.withdraw_address,
+                )
+                .await?;
+        }
         if state.size_in.value == Nat::from(0u8) {
             return Err("MEXC cannot quote a non-positive pay amount".to_string());
         }
@@ -219,7 +232,7 @@ where
             amount_after_bps_haircut(&Nat::from(0u8), requested_bps)?;
         }
         let (_, executable_pay) =
-            Self::compute_fee_adjusted_deposit_transfer(&state.deposit.deposit_asset, &state.size_in)?;
+            self.compute_fee_adjusted_deposit_transfer(&state.deposit.deposit_asset, &state.size_in)?;
         let initial_amount = executable_pay.to_f64();
         if initial_amount <= LIQUIDITY_EPS {
             return Err("MEXC cannot quote a non-positive pay amount".to_string());
@@ -266,7 +279,7 @@ where
             exec_price: route_preview.execution_price,
             estimated_price_impact_bps: route_preview.price_impact_bps,
             legs: vec![SwapQuoteLeg {
-                venue: "mexc".to_string(),
+                venue: self.profile.venue_id().to_string(),
                 route_id,
                 pay_chain: state.size_in.token.chain(),
                 pay_symbol: state.size_in.token.symbol(),
@@ -286,7 +299,7 @@ where
             .ok_or_else(|| "MEXC conservative quote haircut overflowed u32".to_string())?;
         let conservative_value = amount_after_bps_haircut(&receive_amount.value, conservative_haircut_bps)?;
 
-        Ok(MexcPreparedPreview {
+        Ok(CexPreparedPreview {
             state,
             quote,
             conservative_receive: ChainTokenAmount::from_raw(receive_amount.token, conservative_value),

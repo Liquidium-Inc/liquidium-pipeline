@@ -15,6 +15,11 @@ use crate::{
 
 use log::{debug, error, info};
 
+pub mod execution;
+pub(crate) mod utils;
+
+pub use execution::{CexBridgeConfig, CexBridgeDependencies, CexFinalizer, CexVenueProfile};
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum CexStep {
     Deposit,
@@ -252,11 +257,7 @@ pub trait CexFinalizerLogic: Send + Sync {
 
 #[async_trait]
 impl Finalizer for dyn CexFinalizerLogic {
-    async fn finalize(
-        &self,
-        wal: &dyn WalStore,
-        receipt: ExecutionReceipt,
-    ) -> Result<FinalizerResult, FinalizerError> {
+    async fn finalize(&self, wal: &dyn WalStore, receipt: ExecutionReceipt) -> Result<FinalizerResult, FinalizerError> {
         self.finalize_inner(wal, receipt).await.map_err(|error| {
             // Classify once here; the bridge's sentinel never reaches the stage.
             if error.starts_with(

@@ -26,6 +26,14 @@ pub fn is_cex_pending_settlement_error(message: &str) -> bool {
     message.starts_with(CEX_PENDING_SETTLEMENT_PREFIX)
 }
 
+pub fn classify_cex_submission_error(message: &str) -> CexSubmissionError {
+    if is_cex_pending_settlement_error(message) {
+        CexSubmissionError::PendingSettlement(message.to_string())
+    } else {
+        CexSubmissionError::Rejected(message.to_string())
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct DepositAddress {
     pub asset: String,
@@ -113,11 +121,7 @@ pub trait CexBackend: Send + Sync {
     /// persist. The backend owns this mapping because only it knows whether a
     /// failed request may have reached the exchange.
     fn classify_submission_error(&self, error: &str) -> CexSubmissionError {
-        if is_cex_pending_settlement_error(error) {
-            CexSubmissionError::PendingSettlement(error.to_string())
-        } else {
-            CexSubmissionError::Rejected(error.to_string())
-        }
+        classify_cex_submission_error(error)
     }
 
     /// Read-only preflight performed before a venue quote can be committed.
