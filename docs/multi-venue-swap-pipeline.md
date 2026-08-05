@@ -2,7 +2,7 @@
 
 This document explains the production multi-venue swap-finalization pipeline.
 
-Venue eligibility is configured with an ordered list, for example `ENABLED_SWAP_VENUES=icpswap,mexc`. There is no CEX/DEX/Hybrid routing mode.
+Venue eligibility is configured with an ordered list, for example `ENABLED_SWAP_VENUES=icpswap,mexc,kraken`. The default remains `icpswap,mexc`; Kraken is opt-in. There is no CEX/DEX/Hybrid routing mode.
 
 ## Goals
 
@@ -12,7 +12,7 @@ The pipeline is designed to:
 - Keep allocation policy separate from exchange mechanics.
 - Split one seized-collateral amount into independently persisted venue legs.
 - Resume each leg safely after process restarts.
-- Add venues such as Kraken without changing the WAL schema or orchestrator.
+- Add venues without changing the WAL schema or orchestrator.
 - Reject incompatible pre-isolation ICPSwap execution state instead of silently
   changing its signing identity mid-flight.
 
@@ -67,7 +67,7 @@ The generic layer only deals with venue IDs, requests, quotes, leg state, and pr
 | WAL orchestrator | Plan commitment, leg ordering, persistence, restart precedence, parent outcome | ICPSwap pool math or MEXC order-book mechanics |
 | Result aggregator | Combining completed leg amounts and execution records | Routing or rerouting |
 
-This separation is what makes adding another exchange local: a Kraken adapter should not require changes to the persisted leg vector or WAL orchestration algorithm.
+This separation keeps exchange integration local: the Kraken adapter did not require changes to the persisted leg vector or WAL orchestration algorithm.
 
 ## Unified Venue Contract
 
@@ -128,7 +128,7 @@ Strategy-selected venue subsets run concurrently. The common safe-ICPSwap path q
 - `receive_amount`: estimated output in the receive asset's native units.
 - `legs`: venue route description for persistence and observability.
 
-ICPSwap derives the reference output from pool `sqrtPriceX96` metadata and compares it with the canister quote. MEXC derives its reference from the best order-book side and compares it with the simulated VWAP. Execution drift is tracked separately from planning-time price impact.
+ICPSwap derives the reference output from pool `sqrtPriceX96` metadata and compares it with the canister quote. CEX venues derive their reference from the best order-book side and compare it with simulated VWAP, including the venue fee and configured conservative haircuts. Execution drift is tracked separately from planning-time price impact.
 
 ## Current `icpswap_first` Policy
 
@@ -417,17 +417,15 @@ Downstream consumers continue to receive one `SwapExecution`. The aggregator wil
 
 One completed venue leg cannot close the parent row while another leg remains pending.
 
-## Adding Another Venue
+## Adding Another CEX Venue
 
-Adding Kraken should require the following work only:
+Kraken and MEXC use the same `CexFinalizer`; exchange-specific behavior stays behind `CexBackend` and `CexVenueProfile`. A new CEX venue should:
 
-1. Implement `MultiVenueAdapter` with stable `venue_id = "kraken"`.
-2. Convert exact `SwapRequest` amounts into Kraken's internal decimal representation.
-3. Return the normalized `SwapQuote` and initialized tagged `VenueExecutionState`.
-4. Keep Kraken order IDs, deposits, withdrawals, and recovery state inside its leg.
-5. Add the adapter factory and supported venue ID to startup registration.
-6. Add `"kraken"` to `ENABLED_SWAP_VENUES` when it should receive new plans.
-7. Add adapter contract tests and restart-boundary tests.
+1. Implement the normalized CEX backend without exposing third-party API types.
+2. Define a stable venue profile for its ID, fee assumptions, funding preflight, special routes, and error classification.
+3. Return normalized order books, balances, funding methods, fills, withdrawals, and typed submission outcomes.
+4. Register an opt-in runtime factory and supported venue ID.
+5. Add amount-scoped quote, restart-boundary, ambiguous-submission, and persistence round-trip tests.
 
 No change should be needed to:
 
@@ -442,14 +440,15 @@ No change should be needed to:
 | Responsibility | Location |
 |---|---|
 | Versioned persisted envelope and leg vector | `pipeline/src/persistance/finalizer_meta_v2/` |
-| Generic adapter contract | `pipeline/src/finalizers/multi_venue/multi_venue_adapter.rs` |
-| Venue registry and concurrent quote book | `pipeline/src/finalizers/multi_venue/multi_venue_quote_book.rs` |
-| `icpswap_first` allocation policy | `pipeline/src/finalizers/multi_venue/icpswap_first_planner.rs` |
-| ICPSwap adapter | `pipeline/src/finalizers/icpswap/multi_venue_adapter.rs` |
-| MEXC adapter | `pipeline/src/finalizers/mexc/mexc_multi_venue_adapter.rs` |
-| MEXC amount-scoped preparation and quote support | `pipeline/src/finalizers/mexc/mexc_multi_venue_support.rs` |
-| Shared legacy and multi-venue MEXC route quote | `pipeline/src/finalizers/mexc/mexc_route_preview.rs` |
-| Existing MEXC CEX state machine | `pipeline/src/finalizers/mexc/mexc_finalizer.rs` |
+| Generic adapter contract | `pipeline/src/finalizers/multi_venue/contracts/multi_venue_adapter.rs` |
+| Venue registry and concurrent previews | `pipeline/src/finalizers/multi_venue/planning/venue_registry.rs` |
+| `icpswap_first` allocation policy | `pipeline/src/finalizers/multi_venue/planning/icpswap_first_planner.rs` |
+| Shared CEX state machine and venue profile | `pipeline/src/finalizers/cex_finalizer/execution.rs` |
+| Shared CEX multi-venue adapter | `pipeline/src/finalizers/cex_finalizer/multi_venue_adapter.rs` |
+| Shared CEX amount-scoped quote support | `pipeline/src/finalizers/cex_finalizer/multi_venue_support.rs` |
+| Kraken runtime | `pipeline/src/finalizers/kraken/runtime.rs` |
+| Kraken normalized backend and API boundary | `pipeline/src/swappers/kraken/` |
+| MEXC runtime and normalized backend | `pipeline/src/finalizers/mexc/runtime.rs`, `pipeline/src/swappers/mexc/` |
 
 ## Implementation Status
 
@@ -460,6 +459,7 @@ No change should be needed to:
 | Pure `icpswap_first` allocation planner | Implemented |
 | ICPSwap adapter | Implemented |
 | MEXC adapter | Implemented |
+| Kraken adapter (opt-in) | Implemented |
 | Generic multi-venue WAL orchestrator | Implemented |
 | Aggregate result and legacy router removal | Implemented |
 | Enabled-venue runtime selection | Implemented |

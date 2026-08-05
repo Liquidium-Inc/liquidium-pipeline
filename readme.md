@@ -27,7 +27,7 @@ Inspired by Artemis/MEV patterns and designed for permissionless, community-driv
 - **Pipeline Architecture** — Composable stages for discovery, strategy, execution, finalization, and export.
 - **Async Rust** — Highly concurrent and efficient with Tokio runtime.
 - **Multi-Chain** — Primary support for ICP with EVM (Arbitrum) integration.
-- **Swap Execution** — Enabled-venue planning across ICPSwap and MEXC.
+- **Swap Execution** — Enabled-venue planning across ICPSwap, MEXC, and opt-in Kraken.
 - **Extensible** — Add custom risk checks, strategies, swaps, or notification stages.
 - **Permissionless** — Anyone can run it.
 - **Multi-Account** — Separate liquidator, trader, and recovery identities for security.
@@ -36,7 +36,7 @@ Inspired by Artemis/MEV patterns and designed for permissionless, community-driv
 
 ## At a Glance
 
-- **Default venues:** `ENABLED_SWAP_VENUES=icpswap,mexc`; disable MEXC when credentials are not configured.
+- **Default venues:** `ENABLED_SWAP_VENUES=icpswap,mexc`; Kraken remains opt-in.
 - **Current config precedence:** shell env vars > local `.env` > `~/.liquidium-pipeline/config.env`.
 - **Required env vars (minimum):** `MNEMONIC_FILE`, `IC_URL`, `EVM_RPC_URL`, `LENDING_CANISTER`, `DEBT_ASSETS`, `COLLATERAL_ASSETS`.
 - **New client env var:** `BRIDGE_CKETH_MINTER_CANISTER` (recommended to set explicitly; defaults to `sv3dd-oaaaa-aaaar-qacoa-cai` when unset/empty).
@@ -151,8 +151,9 @@ BALANCE_CHECK_EXCLUDE=ckETH,ETH
 ### Swap Configuration
 
 ```bash
-# Ordered venues eligible for new plans. Omit to enable both by default.
+# Ordered venues eligible for new plans. Kraken is opt-in; the default is unchanged.
 ENABLED_SWAP_VENUES=icpswap,mexc
+# ENABLED_SWAP_VENUES=icpswap,mexc,kraken
 
 # Optional test-only split override. Unset in production.
 # Sends approximately $1 of native ICP to ICPSwap and the remainder to MEXC.
@@ -164,9 +165,13 @@ ICPSWAP_TEST_ALLOCATION_USD=1
 # Allow full ICPSwap up to 1.5% impact only when the MEXC remainder is dust.
 ICPSWAP_DUST_FALLBACK_MAX_PRICE_IMPACT_BPS=150
 
-# CEX (MEXC) - Optional
+# MEXC credentials (required only when MEXC is enabled)
 CEX_MEXC_API_KEY=your_api_key
 CEX_MEXC_API_SECRET=your_api_secret
+
+# Kraken credentials (required only when Kraken is enabled)
+CEX_KRAKEN_API_KEY=your_api_key
+CEX_KRAKEN_API_SECRET=your_api_secret
 MAX_ALLOWED_CEX_SLIPPAGE_BPS=200  # 2.00% in basis points
 
 # Liquidation guard (bad debt only)
@@ -206,6 +211,10 @@ CEX_ROUTE_FEE_BPS=25
 CEX_MEXC_AVAILABLE_PAIRS=CKBTC_BTC,BTC_USDC,BTC_USDT,USDC_USDT,CKUSDT_USDT,ICP_USDT,ICP_USDC,ETH_USDT
 # Max intermediate hops when searching configured pairs (0 disables hop fallback)
 CEX_MEXC_MAX_HOPS=2
+# Optional canonical Kraken market allowlist. XBT is normalized to BTC.
+CEX_KRAKEN_AVAILABLE_PAIRS=BTC_USD,ETH_USD,USDC_USD
+# Defaults to two intermediate hops; 0 disables hop fallback.
+CEX_KRAKEN_MAX_HOPS=2
 ```
 
 Quick reference:
@@ -220,13 +229,15 @@ Quick reference:
 | `CEX_BUY_INVERSE_ENABLED` | Master toggle for adaptive buy fallback. |
 | `CEX_RETRY_BASE_SECS` | Initial retry delay after retryable CEX errors. |
 | `CEX_RETRY_MAX_SECS` | Maximum retry delay cap. |
-| `MULTI_VENUE_MIN_NET_EDGE_BPS` | Minimum conservative edge required for any ICPSwap, MEXC, or split plan. |
+| `MULTI_VENUE_MIN_NET_EDGE_BPS` | Minimum conservative edge required for any enabled venue or split plan. |
 | `MULTI_VENUE_MAX_ORACLE_DISCOUNT_BPS` | Maximum amount any venue quote may fall below the oracle-implied output. Values at or above 10000 would accept anything, so they fall back to the default. |
 | `MULTI_VENUE_ORACLE_SNAPSHOT_MAX_AGE_SECS` | How stale a price recorded at detection may be before it stops standing in for a failed live oracle read. Past this age the quote guard stands down rather than block a liquidation that already holds collateral. |
 | `CEX_DELAY_BUFFER_BPS` | Extra haircut for execution-latency/price-move risk. |
 | `CEX_ROUTE_FEE_BPS` | Fee haircut applied during route edge estimation. |
 | `CEX_MEXC_AVAILABLE_PAIRS` | Configured market universe used for direct/hop route discovery. |
 | `CEX_MEXC_MAX_HOPS` | Max intermediate hops allowed in configured-pair route search. |
+| `CEX_KRAKEN_AVAILABLE_PAIRS` | Optional canonical Kraken market allowlist used for direct/hop route discovery. |
+| `CEX_KRAKEN_MAX_HOPS` | Max intermediate hops allowed for Kraken route search; defaults to 2. |
 
 Note: `CEX_BUY_INVERSE_OVESPEND_BPS` is still accepted as a legacy alias, but `CEX_BUY_INVERSE_OVERSPEND_BPS` is the canonical key.
 
@@ -280,7 +291,7 @@ For each `deposit_symbol -> withdraw_symbol`, route selection is deterministic:
 
 1. Legacy special override (`CKBTC <-> CKUSDT`) when applicable.
 2. Direct market probe (`A_B` sell, then `B_A` buy fallback).
-3. Configured hop search over `CEX_MEXC_AVAILABLE_PAIRS` up to `CEX_MEXC_MAX_HOPS`.
+3. Configured hop search over the venue's `CEX_<VENUE>_AVAILABLE_PAIRS` up to its `CEX_<VENUE>_MAX_HOPS`.
 
 Resolved legs are persisted in CEX state and reused across retries.
 
@@ -312,6 +323,7 @@ Route summary metrics are updated from slice notional, and weighted slippage is 
 
 - `icpswap` — native ICP input only.
 - `mexc` — requires `CEX_MEXC_API_KEY` and `CEX_MEXC_API_SECRET` when enabled.
+- `kraken` — opt-in; requires `CEX_KRAKEN_API_KEY` and `CEX_KRAKEN_API_SECRET` when enabled. Preview also requires an exact supported funding method and an already verified withdrawal destination.
 - Venue IDs are ordered, comma-separated, and validated at startup. `SWAPPER` is obsolete and ignored.
 
 ### Storage & Export
@@ -635,6 +647,20 @@ Behavior:
 - Uses configured `CEX_MEXC_AVAILABLE_PAIRS` for market routing.
 - Final bridged asset is `ckUSDC@ICP` to the liquidator principal account.
 
+### Kraken Real-Funds Smoke Procedure
+
+Kraken has no standalone live-smoke command. Keep live execution out of CI and validate it manually with an isolated account and the smallest practical amount:
+
+1. Create a dedicated Kraken API key with only balance/funding reads, order create/query, and withdrawal permissions. Apply an IP allowlist where possible.
+2. Save and verify the exact withdrawal destination in Kraken before starting. The pipeline only uses existing verified entries and never creates or changes one.
+3. Set `CEX_KRAKEN_API_KEY`, `CEX_KRAKEN_API_SECRET`, a narrow `CEX_KRAKEN_AVAILABLE_PAIRS` allowlist, and `ENABLED_SWAP_VENUES=kraken` in an isolated runtime.
+4. Stage one deliberately small liquidation and inspect the preview before custody moves. Confirm the selected market, funding method/network, conservative receive amount, and destination.
+5. During execution, confirm the deposit credit, persisted intent, Kraken client order ID, fill, withdrawal reference, transaction ID, and final received amount.
+6. If a leg becomes `OperatorRequired`, stop. Reconcile Kraken order and withdrawal history against the persisted intent before explicitly re-enqueuing it; do not submit a replacement manually without that comparison.
+7. Remove Kraken from `ENABLED_SWAP_VENUES` after the smoke run until the result and logs have been reviewed for amount accuracy and secret leakage.
+
+Bridge smoke coverage should separately exercise `ckBTC↔BTC`, `ckETH↔ETH`, and `ckUSDC↔USDC`. A route is intentionally unavailable when Kraken lacks an exact funding method or verified destination; for example, ckUSDT must fall back to another venue when no direct method or configured bridge exists.
+
 ### Withdraw Funds
 
 #### Interactive Wizard
@@ -797,8 +823,10 @@ liquidator tui --log-file ./liquidator.log
 
 ## Security
 
-- Treat `MNEMONIC_FILE`, `CEX_MEXC_API_KEY`, and `CEX_MEXC_API_SECRET` as secrets; never commit them.
-- Restrict CEX API keys to required permissions only, and rotate keys periodically.
+- Treat `MNEMONIC_FILE` and all `CEX_*_API_KEY` / `CEX_*_API_SECRET` values as secrets; never commit or log them.
+- Restrict CEX API keys to required permissions only, rotate them periodically, and use exchange IP allowlists where possible.
+- Kraken needs balance/funding reads, order create/query, and withdrawal access. Do not grant unrelated account-management permissions.
+- Kraken withdrawals require an exact, existing verified withdrawal entry. The pipeline does not create or modify withdrawal destinations.
 - Keep mnemonic backups offline and access controlled.
 - Prefer separate runtime users/environments for production bot instances.
 
@@ -807,6 +835,9 @@ liquidator tui --log-file ./liquidator.log
 - `LENDING_CANISTER not configured` / `EVM_RPC_URL not configured`: confirm required env vars are set in `.env` or `config.env`.
 - `Invalid source account` / destination parse errors during withdraw: use `main|trader|recovery` aliases or valid account/principal text.
 - MEXC initialization failing while `mexc` is enabled: verify `CEX_MEXC_API_KEY` and `CEX_MEXC_API_SECRET`, or remove `mexc` from `ENABLED_SWAP_VENUES`.
+- Kraken initialization failing while `kraken` is enabled: verify `CEX_KRAKEN_API_KEY` and `CEX_KRAKEN_API_SECRET`, or remove `kraken` from `ENABLED_SWAP_VENUES`.
+- Kraken preview unavailable: verify the canonical pair allowlist, exact asset/network funding method, and exact verified withdrawal destination. Ambiguous methods and unverified destinations are rejected locally.
+- Kraken leg is `OperatorRequired`: reconcile the persisted client order ID or withdrawal reference against Kraken history before explicitly re-enqueuing; automatic replay is intentionally disabled after an uncertain submission.
 - Noisy terminal output in containerized logging stacks: build and run with `--features plain-logs`.
 - Missing diagnostic detail: rerun with `RUST_LOG=debug`.
 - Runtime socket permission mismatch under systemd: run `systemctl daemon-reload` and restart `liquidator.service`; ensure `RuntimeDirectory=liquidator` and `RuntimeDirectoryMode=0770` are set on the active unit.
