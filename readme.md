@@ -155,13 +155,16 @@ BALANCE_CHECK_EXCLUDE=ckETH,ETH
 ENABLED_SWAP_VENUES=icpswap,mexc
 # ENABLED_SWAP_VENUES=icpswap,mexc,kraken
 
-# Optional test-only split override. Unset in production.
-# Sends approximately $1 of native ICP to ICPSwap and the remainder to MEXC.
+# Optional test-only split overrides. Unset in production.
+# Sends approximately $1 of the collateral to ICPSwap. When the MEXC override
+# is also set, $10 goes to MEXC and Kraken receives the exact remainder.
 # Below $10 the forced leg's quote is NOT checked against the oracle: its three
 # fixed ledger fees are a larger share of the leg than the whole discount budget,
-# so the check cannot judge the price. The remainder leg is still checked, and a
-# loud warning is logged at startup whenever this waiver is active.
+# so the check cannot judge the price. Both CEX legs retain their normal route,
+# minimum, impact, funding, and oracle checks. The three-venue override requires
+# ENABLED_SWAP_VENUES=icpswap,mexc,kraken.
 ICPSWAP_TEST_ALLOCATION_USD=1
+# MEXC_TEST_ALLOCATION_USD=10
 # Allow full ICPSwap up to 1.5% impact only when the MEXC remainder is dust.
 ICPSWAP_DUST_FALLBACK_MAX_PRICE_IMPACT_BPS=150
 
