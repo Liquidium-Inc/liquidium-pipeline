@@ -378,7 +378,17 @@ impl CexBackend for KrakenClient {
 }
 
 fn normalize_market(market: &str) -> String {
-    market.trim().to_ascii_uppercase().replace(['/', '-'], "_")
+    market
+        .trim()
+        .to_ascii_uppercase()
+        .replace(['/', '-'], "_")
+        .split('_')
+        .map(|symbol| match symbol {
+            "XBT" | "XXBT" => "BTC",
+            value => value,
+        })
+        .collect::<Vec<_>>()
+        .join("_")
 }
 fn api_asset(asset: &str) -> String {
     match asset.trim().to_ascii_uppercase().as_str() {
@@ -549,7 +559,8 @@ mod tests {
     #[test]
     fn canonicalizes_kraken_btc_and_market_separators() {
         assert_eq!(api_asset("BTC"), "XBT");
-        assert_eq!(normalize_market("xbt/usd"), "XBT_USD");
+        assert_eq!(normalize_market("xbt/usd"), "BTC_USD");
+        assert_eq!(normalize_market("xxbt-usd"), "BTC_USD");
     }
 
     #[test]
