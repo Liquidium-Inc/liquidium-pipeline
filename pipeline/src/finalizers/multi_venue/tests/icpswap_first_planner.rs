@@ -271,6 +271,7 @@ fn config(cex_min_exec_usd: f64) -> IcpswapFirstPlannerConfig {
         max_price_impact_bps: 100.0,
         max_search_iterations: 16,
         dust_fallback_max_price_impact_bps: 150.0,
+        max_cex_price_impact_bps: 200.0,
         cex_min_exec_usd,
         min_net_edge_bps: 150,
         bad_debt_min_net_edge_bps: 150,
@@ -1029,6 +1030,24 @@ fn oracle_discount_limit_must_leave_room_above_the_impact_caps() {
     );
 }
 
+#[test]
+fn cex_price_impact_limit_must_be_non_negative_and_bounded() {
+    for invalid_limit in [-1.0, 10_001.0, f64::NAN] {
+        let invalid = IcpswapFirstPlannerConfig {
+            max_cex_price_impact_bps: invalid_limit,
+            ..config(0.0)
+        };
+        let adapter = mock_adapter(ICPSWAP_VENUE_ID, Arc::new(Mutex::new(Vec::new())), |request| {
+            Ok(preview(request, ICPSWAP_VENUE_ID, 10.0, 1, 1))
+        });
+        let error = match IcpswapFirstPlanner::new(vec![Arc::new(adapter)], invalid) {
+            Ok(_) => panic!("invalid CEX impact limit {invalid_limit:?} must be rejected"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("maximum CEX price impact"));
+    }
+}
+
 #[tokio::test]
 async fn below_minimum_requote_uses_full_icpswap_only_when_the_fresh_quote_is_safe() {
     let call_count = Arc::new(Mutex::new(0u32));
@@ -1134,9 +1153,7 @@ async fn malformed_final_split_icpswap_quote_falls_back_to_fresh_full_overflow_q
     assert_eq!(state.legs[0].venue_id, MEXC_VENUE_ID);
     assert_eq!(state.legs[0].request.pay_amount.value, Nat::from(TOTAL_PAY));
     let mexc_calls = mexc_calls_for_assert.lock().expect("calls lock");
-    assert_ne!(mexc_calls.first(), Some(&TOTAL_PAY));
-    assert_eq!(mexc_calls.last(), Some(&TOTAL_PAY));
-    assert_eq!(mexc_calls.len(), 2);
+    assert_eq!(mexc_calls.as_slice(), &[TOTAL_PAY]);
 }
 
 #[tokio::test]
@@ -1260,7 +1277,7 @@ async fn icpswap_unavailable_falls_back_to_executable_mexc() {
 }
 
 #[tokio::test]
-async fn icpswap_unavailable_selects_the_best_configured_overflow_venue() {
+async fn icpswap_unavailable_prioritizes_safe_mexc_over_a_better_kraken_quote() {
     let icpswap = mock_adapter(ICPSWAP_VENUE_ID, Arc::new(Mutex::new(Vec::new())), |_request| {
         Err("pool unavailable".to_string())
     });
@@ -1280,21 +1297,21 @@ async fn icpswap_unavailable_selects_the_best_configured_overflow_venue() {
     let state = planner
         .plan(&input_with_pay_token(native_icp()), 123)
         .await
-        .expect("Kraken fallback");
+        .expect("ordered MEXC allocation");
 
     assert_eq!(state.legs.len(), 1);
-    assert_eq!(state.legs[0].venue_id, KRAKEN_VENUE_ID);
+    assert_eq!(state.legs[0].venue_id, MEXC_VENUE_ID);
     assert_eq!(
         state.plan.allocation_reason,
         MultiVenueAllocationReason::VenueUnavailable {
-            selected_venue_id: KRAKEN_VENUE_ID.to_string(),
+            selected_venue_id: MEXC_VENUE_ID.to_string(),
             unavailable_venue_ids: vec![ICPSWAP_VENUE_ID.to_string()],
         }
     );
 }
 
 #[tokio::test]
-async fn equal_overflow_quotes_keep_environment_order() {
+async fn mexc_priority_is_independent_of_environment_order() {
     let kraken = mock_adapter(KRAKEN_VENUE_ID, Arc::new(Mutex::new(Vec::new())), |request| {
         Ok(proportional_preview(request, KRAKEN_VENUE_ID, 0.0, 2))
     });
@@ -1307,9 +1324,171 @@ async fn equal_overflow_quotes_keep_environment_order() {
     let state = planner
         .plan(&input_with_pay_token(native_icp()), 123)
         .await
-        .expect("first equal quote is selected");
+        .expect("MEXC policy priority is selected");
 
+    assert_eq!(state.legs[0].venue_id, MEXC_VENUE_ID);
+}
+
+#[tokio::test]
+async fn unsafe_mexc_allocation_is_sized_and_only_its_remainder_goes_to_kraken() {
+    const MEXC_SAFE_CAPACITY: u64 = 60_000_000;
+    let mexc_calls = Arc::new(Mutex::new(Vec::new()));
+    let mexc = mock_adapter(MEXC_VENUE_ID, mexc_calls.clone(), |request| {
+        let pay = request.pay_amount.value.0.to_u64().expect("test amount");
+        let impact = if pay <= MEXC_SAFE_CAPACITY { 200.0 } else { 201.0 };
+        Ok(proportional_preview(request, MEXC_VENUE_ID, impact, 2))
+    });
+    let kraken_calls = Arc::new(Mutex::new(Vec::new()));
+    let kraken = mock_adapter(KRAKEN_VENUE_ID, kraken_calls.clone(), |request| {
+        Ok(proportional_preview(request, KRAKEN_VENUE_ID, 50.0, 2))
+    });
+    let planner =
+        IcpswapFirstPlanner::new(vec![Arc::new(mexc), Arc::new(kraken)], config(0.0)).expect("valid overflow planner");
+
+    let state = planner
+        .plan(&input_with_pay_token(non_native_icp_token()), QUOTED_AT)
+        .await
+        .expect("MEXC and Kraken waterfall");
+
+    assert_eq!(state.legs.len(), 2);
+    assert_eq!(state.legs[0].venue_id, MEXC_VENUE_ID);
+    assert_eq!(state.legs[1].venue_id, KRAKEN_VENUE_ID);
+    let mexc_pay = state.legs[0].request.pay_amount.value.0.to_u64().expect("MEXC amount");
+    let kraken_pay = state.legs[1]
+        .request
+        .pay_amount
+        .value
+        .0
+        .to_u64()
+        .expect("Kraken amount");
+    assert!(mexc_pay <= MEXC_SAFE_CAPACITY);
+    assert!(mexc_pay > 59_000_000, "binary search should approach the safe capacity");
+    assert_eq!(mexc_pay + kraken_pay, TOTAL_PAY);
+    assert_eq!(kraken_calls.lock().expect("calls lock").as_slice(), &[kraken_pay]);
+    assert!(mexc_calls.lock().expect("calls lock").len() > 2);
+    assert_eq!(
+        state.plan.allocation_reason,
+        MultiVenueAllocationReason::PriceImpactSplit
+    );
+}
+
+#[tokio::test]
+async fn liquidation_waterfall_persists_icpswap_then_mexc_then_kraken() {
+    const ICPSWAP_SAFE_CAPACITY: u64 = 40_000_000;
+    const MEXC_SAFE_CAPACITY: u64 = 30_000_000;
+    let icpswap = mock_adapter(ICPSWAP_VENUE_ID, Arc::new(Mutex::new(Vec::new())), |request| {
+        let pay = request.pay_amount.value.0.to_u64().expect("test amount");
+        let impact = if pay <= ICPSWAP_SAFE_CAPACITY { 50.0 } else { 101.0 };
+        Ok(proportional_preview(request, ICPSWAP_VENUE_ID, impact, 2))
+    });
+    let mexc = mock_adapter(MEXC_VENUE_ID, Arc::new(Mutex::new(Vec::new())), |request| {
+        let pay = request.pay_amount.value.0.to_u64().expect("test amount");
+        let impact = if pay <= MEXC_SAFE_CAPACITY { 200.0 } else { 201.0 };
+        Ok(proportional_preview(request, MEXC_VENUE_ID, impact, 2))
+    });
+    let kraken = mock_adapter(KRAKEN_VENUE_ID, Arc::new(Mutex::new(Vec::new())), |request| {
+        Ok(proportional_preview(request, KRAKEN_VENUE_ID, 50.0, 2))
+    });
+    let planner = IcpswapFirstPlanner::new(vec![Arc::new(icpswap), Arc::new(mexc), Arc::new(kraken)], config(0.0))
+        .expect("valid waterfall planner");
+
+    let state = planner
+        .plan(&input_with_pay_token(native_icp()), QUOTED_AT)
+        .await
+        .expect("three-venue waterfall");
+
+    assert_eq!(state.legs.len(), 3);
+    assert_eq!(state.legs[0].venue_id, ICPSWAP_VENUE_ID);
+    assert_eq!(state.legs[1].venue_id, MEXC_VENUE_ID);
+    assert_eq!(state.legs[2].venue_id, KRAKEN_VENUE_ID);
+    let allocations = state
+        .legs
+        .iter()
+        .map(|leg| leg.request.pay_amount.value.0.to_u64().expect("allocation"))
+        .collect::<Vec<_>>();
+    assert!(allocations[0] <= ICPSWAP_SAFE_CAPACITY);
+    assert!(allocations[0] > 39_000_000);
+    assert!(allocations[1] <= MEXC_SAFE_CAPACITY);
+    assert!(allocations[1] > 29_000_000);
+    assert_eq!(allocations.iter().sum::<u64>(), TOTAL_PAY);
+    assert_eq!(
+        state.plan.allocation_reason,
+        MultiVenueAllocationReason::PriceImpactSplit
+    );
+}
+
+#[tokio::test]
+async fn unavailable_mexc_sends_the_complete_overflow_allocation_to_kraken() {
+    let mexc = mock_adapter(MEXC_VENUE_ID, Arc::new(Mutex::new(Vec::new())), |_request| {
+        Err("exchange unavailable".to_string())
+    });
+    let kraken_calls = Arc::new(Mutex::new(Vec::new()));
+    let kraken = mock_adapter(KRAKEN_VENUE_ID, kraken_calls.clone(), |request| {
+        Ok(proportional_preview(request, KRAKEN_VENUE_ID, 50.0, 2))
+    });
+    let planner =
+        IcpswapFirstPlanner::new(vec![Arc::new(mexc), Arc::new(kraken)], config(0.0)).expect("valid overflow planner");
+
+    let state = planner
+        .plan(&input_with_pay_token(non_native_icp_token()), QUOTED_AT)
+        .await
+        .expect("Kraken fallback");
+
+    assert_eq!(state.legs.len(), 1);
     assert_eq!(state.legs[0].venue_id, KRAKEN_VENUE_ID);
+    assert_eq!(state.legs[0].request.pay_amount.value, Nat::from(TOTAL_PAY));
+    assert_eq!(kraken_calls.lock().expect("calls lock").as_slice(), &[TOTAL_PAY]);
+}
+
+#[tokio::test]
+async fn below_minimum_kraken_remainder_discards_partial_mexc_and_uses_full_kraken() {
+    let mexc = mock_adapter(MEXC_VENUE_ID, Arc::new(Mutex::new(Vec::new())), |request| {
+        let pay = request.pay_amount.value.0.to_u64().expect("test amount");
+        let impact = if pay <= 95_000_000 { 200.0 } else { 201.0 };
+        Ok(proportional_preview(request, MEXC_VENUE_ID, impact, 2))
+    });
+    let kraken_calls = Arc::new(Mutex::new(Vec::new()));
+    let kraken = mock_adapter(KRAKEN_VENUE_ID, kraken_calls.clone(), |request| {
+        Ok(proportional_preview(request, KRAKEN_VENUE_ID, 50.0, 2))
+    });
+    // At $10 per ICP, the roughly 0.05 ICP remainder is below this $1 floor.
+    let planner =
+        IcpswapFirstPlanner::new(vec![Arc::new(mexc), Arc::new(kraken)], config(1.0)).expect("valid overflow planner");
+
+    let state = planner
+        .plan(&input_with_pay_token(non_native_icp_token()), QUOTED_AT)
+        .await
+        .expect("full Kraken dust fallback");
+
+    assert_eq!(state.legs.len(), 1);
+    assert_eq!(state.legs[0].venue_id, KRAKEN_VENUE_ID);
+    assert_eq!(state.legs[0].request.pay_amount.value, Nat::from(TOTAL_PAY));
+    assert_eq!(kraken_calls.lock().expect("calls lock").as_slice(), &[TOTAL_PAY]);
+}
+
+#[tokio::test]
+async fn unsafe_kraken_remainder_rejects_the_waterfall() {
+    let mexc = mock_adapter(MEXC_VENUE_ID, Arc::new(Mutex::new(Vec::new())), |request| {
+        let pay = request.pay_amount.value.0.to_u64().expect("test amount");
+        let impact = if pay <= 60_000_000 { 200.0 } else { 201.0 };
+        Ok(proportional_preview(request, MEXC_VENUE_ID, impact, 2))
+    });
+    let kraken = mock_adapter(KRAKEN_VENUE_ID, Arc::new(Mutex::new(Vec::new())), |request| {
+        Ok(proportional_preview(request, KRAKEN_VENUE_ID, 201.0, 2))
+    });
+    let planner =
+        IcpswapFirstPlanner::new(vec![Arc::new(mexc), Arc::new(kraken)], config(0.0)).expect("valid overflow planner");
+
+    let error = planner
+        .plan(&input_with_pay_token(non_native_icp_token()), QUOTED_AT)
+        .await
+        .expect_err("unsafe Kraken remainder must reject the plan");
+
+    assert!(
+        error
+            .to_string()
+            .contains("kraken quote impact 201.00 bps exceeds 200.00 bps")
+    );
 }
 
 #[tokio::test]
@@ -1337,7 +1516,7 @@ async fn mexc_unavailable_allows_only_a_normally_safe_full_icpswap_quote() {
         .plan(&input_with_pay_token(native_icp()), 123)
         .await
         .expect_err("unsafe ICPSwap must not be forced when MEXC is unavailable");
-    assert!(error.to_string().contains("MEXC unavailable"));
+    assert!(error.to_string().contains("mexc preview failed"));
 }
 
 #[tokio::test]
@@ -1365,7 +1544,7 @@ async fn below_minimum_remainder_rejects_when_full_icpswap_is_unsafe_and_overflo
             .to_string()
             .contains("full ICPSwap quote exceeds the dust-fallback price-impact limit")
     );
-    assert!(error.to_string().contains("MEXC unavailable"));
+    assert!(error.to_string().contains("mexc preview failed"));
 }
 
 // Asset eligibility and adapter validation
@@ -1483,7 +1662,7 @@ async fn oracle_discount_guard_rejects_mexc_at_the_same_top_level_boundary() {
         .await
         .expect_err("both below-oracle venue quotes must be rejected");
 
-    assert!(error.to_string().contains("MEXC quote rejected"));
+    assert!(error.to_string().contains("mexc quote is"));
     assert!(error.to_string().contains("below oracle-implied output"));
 }
 
@@ -1791,7 +1970,7 @@ async fn forced_test_split_rejects_a_bad_mexc_leg_even_when_icpswap_is_valid() {
         .await
         .expect_err("a rejected MEXC leg must prevent the forced split");
 
-    assert!(error.to_string().contains("MEXC quote rejected"));
+    assert!(error.to_string().contains("mexc quote is"));
     assert!(error.to_string().contains("250 bps limit"));
 }
 

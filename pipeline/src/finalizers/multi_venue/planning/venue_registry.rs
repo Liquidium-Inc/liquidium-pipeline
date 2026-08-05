@@ -136,6 +136,7 @@ pub(in crate::finalizers::multi_venue) struct VenueQuoteBook {
 
 impl VenueQuoteBook {
     // Iteration follows deterministic registry/configuration order.
+    #[cfg(test)]
     pub(in crate::finalizers::multi_venue) fn iter(&self) -> impl Iterator<Item = &VenuePreview> {
         self.previews.iter()
     }
