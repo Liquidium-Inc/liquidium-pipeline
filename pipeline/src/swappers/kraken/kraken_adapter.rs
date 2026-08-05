@@ -99,7 +99,7 @@ impl KrakenClient {
         asset: &str,
         network: &str,
         destination: &str,
-    ) -> Result<(String, String), String> {
+    ) -> Result<(KrakenFundingMethod, String), String> {
         let api_asset = api_asset(asset);
         let method = unique_method(
             self.api.withdrawal_methods(&api_asset).await.map_err(api_read_error)?,
@@ -116,7 +116,7 @@ impl KrakenClient {
             .filter(|entry| entry.verified && entry.method == method.method && entry.address == destination)
             .collect::<Vec<_>>();
         match matches.as_slice() {
-            [entry] => Ok((method.method, entry.key.clone())),
+            [entry] => Ok((method, entry.key.clone())),
             [] => Err(format!(
                 "Kraken destination is not a verified {asset} withdrawal address for network {network}"
             )),
@@ -126,7 +126,7 @@ impl KrakenClient {
 
     async fn wait_for_order(&self, order_id: &str, side: &str) -> Result<SwapFillReport, String> {
         for attempt in 0..ORDER_POLL_ATTEMPTS {
-            let order = self.api.order(order_id).await.map_err(api_read_error)?;
+            let order = self.api.order(order_id).await.map_err(api_reconciliation_error)?;
             match order.status {
                 KrakenOrderStatus::Closed => return fill_report(side, order.volume_executed, order.cost, order.fee),
                 KrakenOrderStatus::Canceled | KrakenOrderStatus::Expired => {
@@ -215,13 +215,32 @@ impl CexBackend for KrakenClient {
         let pair = self.pair(market).await?;
         let amount = Decimal::from_f64(amount_in).ok_or_else(|| "invalid Kraken order amount".to_string())?;
         let base_volume = if side.eq_ignore_ascii_case("sell") {
-            truncate(amount, pair.lot_decimals)
+            let base = truncate(amount, pair.lot_decimals);
+            let estimated_output = estimate_sell_output(&self.book(&pair, 100).await?, base)?;
+            if estimated_output < pair.cost_min {
+                return Err(format!(
+                    "Kraken sell estimate {estimated_output} is below cost minimum {}",
+                    pair.cost_min
+                ));
+            }
+            base
         } else if side.eq_ignore_ascii_case("buy") {
             if options.buy_mode == BuyOrderInputMode::QuoteOrderQty {
                 return Err("Kraken market buys require precision-safe base quantity mode".to_string());
             }
+            if !pair.taker_fee_bps.is_finite() || !(0.0..=10_000.0).contains(&pair.taker_fee_bps) {
+                return Err(format!("invalid Kraken taker fee {} bps", pair.taker_fee_bps));
+            }
+            let cap_bps = options.max_quote_overspend_bps.unwrap_or(0.0);
+            if !cap_bps.is_finite() || !(0.0..=10_000.0).contains(&cap_bps) {
+                return Err(format!("invalid Kraken quote overspend cap {cap_bps} bps"));
+            }
+            let fee_ratio = Decimal::from_f64(pair.taker_fee_bps / 10_000.0).unwrap_or_default();
+            let cap_ratio = Decimal::from_f64(cap_bps / 10_000.0).unwrap_or_default();
+            let max_spend = amount * (Decimal::ONE + cap_ratio);
+            let trade_budget = max_spend / (Decimal::ONE + fee_ratio);
             let book = self.book(&pair, 100).await?;
-            let mut budget = amount;
+            let mut budget = trade_budget;
             let mut base = Decimal::ZERO;
             for level in &book.asks {
                 if budget <= Decimal::ZERO {
@@ -236,11 +255,10 @@ impl CexBackend for KrakenClient {
             }
             let base = truncate(base, pair.lot_decimals);
             let estimated_cost = estimate_buy_cost(&book, base)?;
-            let cap_bps = options.max_quote_overspend_bps.unwrap_or(0.0);
-            let cap = amount * (Decimal::ONE + Decimal::from_f64(cap_bps / 10_000.0).unwrap_or_default());
-            if estimated_cost > cap {
+            let estimated_total = estimated_cost * (Decimal::ONE + fee_ratio);
+            if estimated_total > max_spend {
                 return Err(format!(
-                    "Kraken buy estimate {estimated_cost} exceeds quote-input cap {cap}"
+                    "Kraken buy estimate with fee {estimated_total} exceeds quote-input cap {max_spend}"
                 ));
             }
             base
@@ -294,8 +312,14 @@ impl CexBackend for KrakenClient {
         amount: f64,
     ) -> Result<WithdrawalReceipt, String> {
         ensure_positive(amount)?;
-        let (_, key) = self.resolve_withdrawal(asset, network, address).await?;
+        let (method, key) = self.resolve_withdrawal(asset, network, address).await?;
         let amount_decimal = Decimal::from_f64(amount).ok_or_else(|| "invalid Kraken withdrawal amount".to_string())?;
+        if amount_decimal < method.minimum {
+            return Err(format!(
+                "Kraken withdrawal amount {amount_decimal} is below {} minimum {}",
+                method.method, method.minimum
+            ));
+        }
         let ref_id = self
             .api
             .withdraw(&api_asset(asset), &key, address, amount_decimal)
@@ -427,6 +451,24 @@ fn estimate_buy_cost(book: &KrakenBook, base_volume: Decimal) -> Result<Decimal,
     }
 }
 
+fn estimate_sell_output(book: &KrakenBook, base_volume: Decimal) -> Result<Decimal, String> {
+    let mut remaining = base_volume;
+    let mut output = Decimal::ZERO;
+    for level in &book.bids {
+        let take = remaining.min(level.quantity);
+        output += take * level.price;
+        remaining -= take;
+        if remaining <= Decimal::ZERO {
+            break;
+        }
+    }
+    if remaining > Decimal::ZERO {
+        Err("not enough Kraken bid liquidity".to_string())
+    } else {
+        Ok(output)
+    }
+}
+
 fn convert_levels(levels: Vec<super::kraken_api::KrakenBookLevel>) -> Result<Vec<OrderBookLevel>, String> {
     levels
         .into_iter()
@@ -471,6 +513,9 @@ fn ensure_positive(value: f64) -> Result<(), String> {
 fn api_read_error(error: KrakenApiError) -> String {
     error.to_string()
 }
+fn api_reconciliation_error(error: KrakenApiError) -> String {
+    format!("{KRAKEN_AMBIGUOUS_PREFIX}could not reconcile accepted order: {error}")
+}
 fn api_submit_error(error: KrakenApiError) -> String {
     match error {
         KrakenApiError::Ambiguous(message) | KrakenApiError::Transport(message) => {
@@ -492,6 +537,7 @@ mod tests {
             api_name: "XXBTZUSD".into(),
             base: "BTC".into(),
             quote: "USD".into(),
+            price_decimals: 1,
             lot_decimals: 8,
             order_min: Decimal::new(1, 4),
             cost_min: Decimal::new(5, 0),
@@ -627,6 +673,15 @@ mod tests {
             })
             .once()
             .returning(|_, _, _, _| Ok("ORDER-1".into()));
+        api.expect_orderbook().once().returning(|_, _| {
+            Ok(KrakenBook {
+                bids: vec![KrakenBookLevel {
+                    price: Decimal::new(60_000, 0),
+                    quantity: Decimal::new(1, 0),
+                }],
+                asks: vec![],
+            })
+        });
         api.expect_order().withf(|id| id == "ORDER-1").once().returning(|_| {
             Ok(KrakenOrder {
                 status: KrakenOrderStatus::Closed,
@@ -652,5 +707,140 @@ mod tests {
 
         assert_eq!(report.input_consumed, 0.1);
         assert_eq!(report.output_received, 5_976.0);
+    }
+
+    #[tokio::test]
+    async fn accepted_order_with_failed_status_query_is_ambiguous() {
+        let mut api = MockKrakenApi::new();
+        api.expect_order().once().returning(|_| {
+            Err(KrakenApiError::Transport("status request timed out".into()))
+        });
+        let client = KrakenClient::with_api(Arc::new(api), vec![]);
+
+        let error = client.wait_for_order("ORDER-2", "sell").await.expect_err("must park");
+
+        assert!(matches!(
+            client.classify_submission_error(&error),
+            CexSubmissionError::Ambiguous(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn withdrawal_below_method_minimum_is_rejected_before_submission() {
+        let mut api = MockKrakenApi::new();
+        api.expect_withdrawal_methods().once().returning(|_| {
+            Ok(vec![KrakenFundingMethod {
+                method: "Bitcoin".into(),
+                network: Some("Bitcoin".into()),
+                minimum: Decimal::new(1, 2),
+            }])
+        });
+        api.expect_withdrawal_addresses().once().returning(|_| {
+            Ok(vec![KrakenWithdrawalAddress {
+                address: "bc1qdestination".into(),
+                method: "Bitcoin".into(),
+                key: "verified-key".into(),
+                verified: true,
+            }])
+        });
+        api.expect_withdraw().never();
+        let client = KrakenClient::with_api(Arc::new(api), vec![]);
+
+        let error = client
+            .withdraw("BTC", "bitcoin", "bc1qdestination", 0.001)
+            .await
+            .expect_err("below minimum");
+
+        assert!(error.contains("below Bitcoin minimum"));
+    }
+
+    #[tokio::test]
+    async fn market_buy_derives_precision_safe_base_volume_from_quote_budget() {
+        let mut api = MockKrakenApi::new();
+        api.expect_pairs().once().returning(|| Ok(vec![btc_usd_pair()]));
+        api.expect_orderbook().once().returning(|_, _| {
+            Ok(KrakenBook {
+                bids: vec![],
+                asks: vec![KrakenBookLevel {
+                    price: Decimal::new(60_000, 0),
+                    quantity: Decimal::ONE,
+                }],
+            })
+        });
+        api.expect_place_market_order()
+            .withf(|pair, side, volume, client_id| {
+                pair == "XXBTZUSD"
+                    && side == "buy"
+                    && *volume == Decimal::new(9_960_159, 8)
+                    && client_id.as_deref() == Some("liq-buy-1")
+            })
+            .once()
+            .returning(|_, _, _, _| Ok("ORDER-BUY".into()));
+        api.expect_order().once().returning(|_| {
+            Ok(KrakenOrder {
+                status: KrakenOrderStatus::Closed,
+                volume_executed: Decimal::new(9_960_159, 8),
+                cost: Decimal::new(59_760_954, 4),
+                fee: Decimal::new(239_043_816, 7),
+            })
+        });
+        let client = KrakenClient::with_api(Arc::new(api), vec![]);
+
+        let report = client
+            .execute_swap_detailed_with_options(
+                "BTC_USD",
+                "buy",
+                6_000.0,
+                SwapExecutionOptions {
+                    client_order_id: Some("liq-buy-1".into()),
+                    buy_mode: BuyOrderInputMode::BaseQuantity,
+                    max_quote_overspend_bps: Some(0.0),
+                },
+            )
+            .await
+            .expect("filled buy");
+
+        assert!((report.input_consumed - 5_999.999_781_6).abs() < 1e-9);
+        assert_eq!(report.output_received, 0.099_601_59);
+    }
+
+    #[tokio::test]
+    async fn sell_below_cost_minimum_is_rejected_before_submission() {
+        let mut api = MockKrakenApi::new();
+        api.expect_pairs().once().returning(|| Ok(vec![btc_usd_pair()]));
+        api.expect_orderbook().once().returning(|_, _| {
+            Ok(KrakenBook {
+                bids: vec![KrakenBookLevel {
+                    price: Decimal::TEN,
+                    quantity: Decimal::ONE,
+                }],
+                asks: vec![],
+            })
+        });
+        api.expect_place_market_order().never();
+        let client = KrakenClient::with_api(Arc::new(api), vec![]);
+
+        let error = client
+            .execute_swap_detailed("BTC_USD", "sell", 0.1)
+            .await
+            .expect_err("below cost minimum");
+
+        assert!(error.contains("below cost minimum"));
+    }
+
+    #[tokio::test]
+    async fn offline_and_ambiguous_pairs_are_rejected_locally() {
+        let mut offline = btc_usd_pair();
+        offline.online = false;
+        let mut api = MockKrakenApi::new();
+        api.expect_pairs().once().return_once(move || Ok(vec![offline]));
+        let client = KrakenClient::with_api(Arc::new(api), vec![]);
+        assert!(client.get_orderbook("BTC_USD", None).await.unwrap_err().contains("not online"));
+
+        let pair = btc_usd_pair();
+        let mut api = MockKrakenApi::new();
+        api.expect_pairs().once().return_once(move || Ok(vec![pair.clone(), pair]));
+        let client = KrakenClient::with_api(Arc::new(api), vec![]);
+        assert!(client.get_orderbook("BTC_USD", None).await.unwrap_err().contains("ambiguous"));
     }
 }

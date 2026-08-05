@@ -1186,6 +1186,32 @@ mod tests {
     }
 
     #[test]
+    fn parse_cex_kraken_route_config_normalizes_and_defaults_to_two_hops() {
+        let _guard = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        unsafe {
+            env::set_var("CEX_KRAKEN_AVAILABLE_PAIRS", " xbt/usd,ETH-USD,xbt_usd ");
+            env::remove_var("CEX_KRAKEN_MAX_HOPS");
+        }
+
+        assert_eq!(
+            parse_cex_available_pairs_from_env("CEX_KRAKEN_AVAILABLE_PAIRS"),
+            vec!["XBT_USD".to_string(), "ETH_USD".to_string()]
+        );
+        assert_eq!(
+            parse_cex_max_hops_from_env(
+                "CEX_KRAKEN_MAX_HOPS",
+                DEFAULT_CEX_KRAKEN_MAX_HOPS,
+                MAX_CEX_KRAKEN_MAX_HOPS,
+            ),
+            2
+        );
+
+        unsafe {
+            env::remove_var("CEX_KRAKEN_AVAILABLE_PAIRS");
+        }
+    }
+
+    #[test]
     fn enabled_swap_venues_default_to_icpswap_then_mexc() {
         let _guard = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
         unsafe {
