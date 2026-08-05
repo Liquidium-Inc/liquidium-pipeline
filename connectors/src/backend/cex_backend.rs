@@ -163,6 +163,26 @@ pub trait CexBackend: Send + Sync {
 
     async fn execute_swap_detailed(&self, market: &str, side: &str, amount_in: f64) -> Result<SwapFillReport, String>;
 
+    /// Submits a market order with venue-specific execution controls and
+    /// returns the amounts that the exchange actually filled.
+    ///
+    /// `market` identifies the venue market, while `side` must select either a
+    /// buy or a sell. For sells, `amount_in` is the available base-asset
+    /// quantity. For buys, `amount_in` is the quote-asset budget, even when the
+    /// backend must translate that budget into a base quantity for its API.
+    ///
+    /// `options.client_order_id` should be forwarded when the venue supports
+    /// client-assigned order IDs. `options.buy_mode` controls how a buy budget
+    /// is expressed to the exchange, and `options.max_quote_overspend_bps`
+    /// bounds extra quote consumption when a base-quantity buy is required.
+    /// Implementations must reject unsupported modes or invalid limits before
+    /// submitting an order.
+    ///
+    /// The returned [`SwapFillReport`] contains actual consumed input and
+    /// received output rather than estimates. Because an error may occur after
+    /// the exchange accepted the order, callers must pass failures through
+    /// [`CexBackend::classify_submission_error`] before deciding whether a
+    /// submission is safe to retry.
     async fn execute_swap_detailed_with_options(
         &self,
         market: &str,
