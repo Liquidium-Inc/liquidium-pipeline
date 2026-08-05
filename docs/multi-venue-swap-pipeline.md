@@ -165,19 +165,12 @@ venue plan         on ICPSwap
                        yes               no
                        |                  |
                        v                  v
-               ICPSwap + overflow   Re-quote full ICPSwap
-                    split             /          \
+             ICPSwap + CEX waterfall Re-quote full ICPSwap
+                                      /          \
                                   safe          unsafe
                                    |              |
                                    v              v
-                            Full ICPSwap    Quote full overflow
-                                                   |
-                                           executable venue?
-                                             /           \
-                                           yes            no
-                                            |              |
-                                            v              v
-                                    Full best overflow  Reject route
+                            Full ICPSwap    Apply CEX waterfall
                        \                    /
                         +---------+--------+
                                 |
@@ -198,12 +191,16 @@ Important policy rules:
 4. If the full quote is unsafe, search for the largest confirmed-safe ICPSwap allocation.
 5. Binary search is bounded to 16 iterations and retains the last safe lower bound.
 6. Exact final allocations are quoted again before commitment.
-7. When the remainder is below `CEX_MIN_EXEC_USD`, use a refreshed full ICPSwap quote when it is at or below `ICPSWAP_DUST_FALLBACK_MAX_PRICE_IMPACT_BPS` (150 bps by default); otherwise send the full amount to the best executable overflow venue or reject the route.
-8. A better MEXC price does not reduce the policy's ICPSwap allocation.
-9. The combined conservative output must satisfy the configured net-edge floor, currently 150 bps.
-10. Invalid venue previews are discarded; valid venues remain eligible.
-11. With ICPSwap alone, a full quote at or above 100 bps is rejected rather than forced.
-12. Without ICPSwap, the best executable enabled overflow venue receives the full amount.
+7. When the remainder is below `CEX_MIN_EXEC_USD`, use a refreshed full ICPSwap quote when it is at or below `ICPSWAP_DUST_FALLBACK_MAX_PRICE_IMPACT_BPS` (150 bps by default); otherwise apply the CEX waterfall to the full amount or reject the route.
+8. MEXC receives the CEX allocation first while its amount-scoped impact is at or below `MAX_ALLOWED_CEX_SLIPPAGE_BPS` (200 bps by default).
+9. When full MEXC impact exceeds that ceiling, binary-search its largest confirmed-safe allocation and quote Kraken for the exact remainder.
+10. If MEXC is unavailable, Kraken is asked to take the complete CEX allocation. If a partial MEXC allocation would leave a below-minimum Kraken leg, it is discarded and Kraken is tested for the complete allocation.
+11. Kraken must independently satisfy the same CEX impact ceiling, minimum, funding, liquidity, and oracle guards. Failure rejects the plan; funds are never dynamically transferred between exchanges after execution starts.
+12. A better CEX price does not reduce the policy's ICPSwap allocation, and a better Kraken price does not displace a safe MEXC allocation.
+13. The combined conservative output must satisfy the configured net-edge floor, currently 150 bps.
+14. Invalid venue previews are discarded; valid venues remain eligible.
+15. With ICPSwap alone, a full quote at or above 100 bps is rejected rather than forced.
+16. Without ICPSwap, the same ordered MEXC-then-Kraken waterfall applies to the full amount.
 
 The strategy is replaceable. A future best-price strategy can make different allocation decisions while reusing the same adapters, persisted state, and orchestrator.
 

@@ -227,6 +227,7 @@ Quick reference:
 | `CEX_BUY_INVERSE_OVERSPEND_BPS` | Safety cap for how much inverse/base buy mode may overspend. |
 | `CEX_BUY_INVERSE_MAX_RETRIES` | Max fallback attempts per leg. |
 | `CEX_BUY_INVERSE_ENABLED` | Master toggle for adaptive buy fallback. |
+| `MAX_ALLOWED_CEX_SLIPPAGE_BPS` | Shared hard ceiling for CEX planning-time price impact and realized execution slippage. |
 | `CEX_RETRY_BASE_SECS` | Initial retry delay after retryable CEX errors. |
 | `CEX_RETRY_MAX_SECS` | Maximum retry delay cap. |
 | `MULTI_VENUE_MIN_NET_EDGE_BPS` | Minimum conservative edge required for any enabled venue or split plan. |
@@ -460,7 +461,7 @@ The production finalizer quotes enabled venues through one amount-scoped adapter
 
 | Strategy | Description |
 |----------|-------------|
-| **ICPSwap first** | Uses ICPSwap below the impact cap and allocates executable overflow to enabled exchanges. |
+| **ICPSwap first** | Allocates the largest safe ICPSwap amount, then applies an ordered MEXC → Kraken waterfall under the CEX impact cap. |
 
 ### Retry & State Management
 
