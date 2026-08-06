@@ -1,8 +1,10 @@
 use candid::Nat;
-use liquidium_pipeline_connectors::backend::cex_backend::CexBackend;
+use liquidium_pipeline_connectors::backend::bridge_backend::resolve_route;
+use liquidium_pipeline_connectors::backend::cex_backend::{CexBackend, FundingRoutePreflight};
 use liquidium_pipeline_core::tokens::{chain_token::ChainToken, chain_token_amount::ChainTokenAmount};
 
-use super::{mexc_finalizer::MexcFinalizer, mexc_utils::LIQUIDITY_EPS};
+use super::CexFinalizer;
+use crate::finalizers::cex_finalizer::utils::LIQUIDITY_EPS;
 use crate::{
     finalizers::{
         bridge_planner::BridgePlanner,
@@ -15,18 +17,40 @@ use crate::{
     utils::now_ts,
 };
 
-/// Amount-scoped MEXC preview used by the thin multi-venue adapter. The full
+/// Amount-scoped CEX preview used by the thin multi-venue adapter. The full
 /// `CexState` remains the single execution state owned by `CexFinalizerLogic`.
-pub(super) struct MexcPreparedPreview {
+pub(super) struct CexPreparedPreview {
     pub state: CexState,
     pub quote: SwapQuote,
     pub conservative_receive: ChainTokenAmount,
 }
 
-impl<B> MexcFinalizer<B>
+impl<B> CexFinalizer<B>
 where
     B: CexBackend,
 {
+    fn funding_preflight_withdraw_destination(&self, state: &CexState) -> Result<String, String> {
+        let planned_asset = <Self as BridgePlanner>::planned_withdraw_asset(state);
+        let planned_network = <Self as BridgePlanner>::planned_withdraw_network(state);
+
+        if state.withdraw.bridge.withdraw_bridge_required {
+            let final_symbol = state.withdraw.withdraw_asset.symbol();
+            let route = resolve_route(&planned_asset, &planned_network, &final_symbol).ok_or_else(|| {
+                format!(
+                    "bridge route not found for withdraw {}@{} -> {}",
+                    planned_asset, planned_network, final_symbol
+                )
+            })?;
+            return self.resolve_bridge_source_address(route.source_chain);
+        }
+
+        if planned_network.eq_ignore_ascii_case("ICP") && Self::is_native_icp_token(&state.withdraw.withdraw_asset) {
+            return self.native_icp_direct_withdraw_address(&state.withdraw.withdraw_address);
+        }
+
+        Ok(state.withdraw.withdraw_address.clone())
+    }
+
     /// Builds the venue-local CEX state from an exact allocation. Keeping this
     /// separate from `ExecutionReceipt` prevents a split leg from accidentally
     /// depositing the liquidation's full collateral amount.
@@ -110,16 +134,21 @@ where
         })
     }
 
-    /// Resolves the receive token required by MEXC's deposit/withdraw state and
+    /// Resolves the receive token required by the CEX deposit/withdraw state and
     /// validates that the request's exact pay allocation is internally sound.
     fn prepare_swap_request(&self, execution_id: &str, request: &SwapRequest) -> Result<CexState, String> {
         if request.pay_amount.token.asset_id() != request.pay_asset {
-            return Err("MEXC request pay asset does not match pay amount token".to_string());
+            return Err(format!(
+                "{} request pay asset does not match pay amount token",
+                self.profile.venue_id()
+            ));
         }
-        let registry = self
-            .token_registry
-            .as_ref()
-            .ok_or_else(|| "MEXC multi-venue adapter requires a token registry".to_string())?;
+        let registry = self.token_registry.as_ref().ok_or_else(|| {
+            format!(
+                "{} multi-venue adapter requires a token registry",
+                self.profile.venue_id()
+            )
+        })?;
         let receive_token = registry.resolve(&request.receive_asset)?;
         self.prepare_amount_scoped_state(
             execution_id,
@@ -158,12 +187,13 @@ where
             .trade_slices
             .iter()
             .map(|slice| {
-                let (base, quote) = super::mexc_utils::parse_market_symbols(&slice.market).unwrap_or_else(|| {
-                    (
-                        state.deposit.deposit_asset.symbol().to_ascii_uppercase(),
-                        state.withdraw.withdraw_asset.symbol().to_ascii_uppercase(),
-                    )
-                });
+                let (base, quote) = crate::finalizers::cex_finalizer::utils::parse_market_symbols(&slice.market)
+                    .unwrap_or_else(|| {
+                        (
+                            state.deposit.deposit_asset.symbol().to_ascii_uppercase(),
+                            state.withdraw.withdraw_asset.symbol().to_ascii_uppercase(),
+                        )
+                    });
                 let (pay_symbol, recv_symbol, pay_amount, recv_amount) = if slice.side.eq_ignore_ascii_case("sell") {
                     (base, quote, slice.amount_in, slice.amount_out)
                 } else {
@@ -171,14 +201,14 @@ where
                 };
 
                 SwapQuoteLeg {
-                    venue: "mexc".to_string(),
+                    venue: self.profile.venue_id().to_string(),
                     route_id: slice.market.clone(),
                     pay_chain: state.deposit.deposit_asset.chain(),
                     pay_symbol,
-                    pay_amount: super::mexc_utils::f64_to_nat(pay_amount),
+                    pay_amount: crate::finalizers::cex_finalizer::utils::f64_to_nat(pay_amount),
                     receive_chain: state.withdraw.withdraw_asset.chain(),
                     receive_symbol: recv_symbol,
-                    receive_amount: super::mexc_utils::f64_to_nat(recv_amount),
+                    receive_amount: crate::finalizers::cex_finalizer::utils::f64_to_nat(recv_amount),
                     price: slice.exec_price,
                     lp_fee: Nat::from(0u8),
                     gas_fee: Nat::from(0u8),
@@ -210,41 +240,114 @@ where
         &self,
         execution_id: &str,
         request: &SwapRequest,
-    ) -> Result<MexcPreparedPreview, String> {
+    ) -> Result<CexPreparedPreview, String> {
+        // Build the venue-owned execution state for exactly this requested allocation.
         let mut state = self.prepare_swap_request(execution_id, request)?;
+
+        // Reject a zero raw ledger amount before doing order-book or funding API reads.
         if state.size_in.value == Nat::from(0u8) {
-            return Err("MEXC cannot quote a non-positive pay amount".to_string());
+            return Err(format!(
+                "{} cannot quote a non-positive pay amount",
+                self.profile.venue_id()
+            ));
         }
+
+        // Validate the caller's slippage value with the shared bounded-bps helper.
+        // A zero amount is sufficient here because only the bps validation is needed.
         if let Some(requested_bps) = request.max_slippage_bps {
             amount_after_bps_haircut(&Nat::from(0u8), requested_bps)?;
         }
-        let (_, executable_pay) =
-            Self::compute_fee_adjusted_deposit_transfer(&state.deposit.deposit_asset, &state.size_in)?;
-        let initial_amount = executable_pay.to_f64();
-        if initial_amount <= LIQUIDITY_EPS {
-            return Err("MEXC cannot quote a non-positive pay amount".to_string());
-        }
-        let legs = self
-            .resolve_trade_legs_for_symbols(
-                &<Self as BridgePlanner>::planned_deposit_asset(&state),
-                &<Self as BridgePlanner>::planned_withdraw_asset(&state),
-            )
-            .await?;
-        let route_preview = self.preview_resolved_trade_route(&legs, initial_amount).await?;
 
+        // Remove the source-ledger transfer fee from the amount that can reach the CEX.
+        let (_, executable_pay) =
+            self.compute_fee_adjusted_deposit_transfer(&state.deposit.deposit_asset, &state.size_in)?;
+
+        // Convert the executable input into native decimal units for order-book simulation.
+        let initial_amount = executable_pay.to_f64();
+
+        // Guard against fees or conversion precision reducing the executable amount to zero.
+        if initial_amount <= LIQUIDITY_EPS {
+            return Err(format!(
+                "{} cannot quote a non-positive pay amount",
+                self.profile.venue_id()
+            ));
+        }
+
+        // Resolve the asset that will actually be credited to the CEX after any input bridge.
+        let deposit_asset = <Self as BridgePlanner>::planned_deposit_asset(&state);
+
+        // Resolve the asset that the CEX must produce before any output bridge.
+        let withdraw_asset = <Self as BridgePlanner>::planned_withdraw_asset(&state);
+
+        // Kraken evaluates every amount-fillable route and selects the best net output.
+        // MEXC keeps its legacy deterministic route selection for compatibility.
+        let (legs, route_preview) = if self.profile.best_route_preview_required() {
+            self.resolve_best_trade_route_for_amount(&deposit_asset, &withdraw_asset, initial_amount)
+                .await?
+        } else {
+            // Resolve the venue's preferred route without comparing alternate route outputs.
+            let legs = self
+                .resolve_trade_legs_for_symbols(&deposit_asset, &withdraw_asset)
+                .await?;
+
+            // Simulate the selected route against current order-book depth and venue fees.
+            let preview = self.preview_resolved_trade_route(&legs, initial_amount).await?;
+
+            // Return the route and its simulation in the same shape as best-route selection.
+            (legs, preview)
+        };
+
+        // Venues such as Kraken require funding methods and destinations to be
+        // proven usable before their quote is exposed to the planner.
+        if self.profile.funding_preflight_required() {
+            // Use the direct receiver or the bridge source address, as appropriate.
+            let withdraw_destination = self.funding_preflight_withdraw_destination(&state)?;
+
+            // Validate exact assets, networks, destination, and estimated amounts
+            // without creating an address or submitting any external side effect.
+            self.backend
+                .validate_funding_route(&FundingRoutePreflight {
+                    // Asset expected to arrive in the exchange account.
+                    deposit_asset: <Self as BridgePlanner>::planned_deposit_asset(&state),
+                    // Exchange deposit network selected by the bridge plan.
+                    deposit_network: <Self as BridgePlanner>::planned_deposit_network(&state),
+                    // Asset that will be withdrawn after all trade legs complete.
+                    withdraw_asset: <Self as BridgePlanner>::planned_withdraw_asset(&state),
+                    // Exchange withdrawal network selected by the bridge plan.
+                    withdraw_network: <Self as BridgePlanner>::planned_withdraw_network(&state),
+                    // Exact preverified receiver required for later withdrawal.
+                    withdraw_address: withdraw_destination,
+                    // Estimated amount entering the first trade leg.
+                    deposit_amount: initial_amount,
+                    // Estimated amount available for the eventual withdrawal.
+                    withdraw_amount: route_preview.receive_amount,
+                })
+                .await?;
+        }
+
+        // Persist the resolved route so execution and recovery never rediscover
+        // a different route after the quote has been committed.
         state.trade.trade_resolved_legs = legs
             .iter()
             .map(|leg| CexRouteLeg {
+                // Store only internal canonical market names in persisted state.
                 market: leg.market.clone(),
+                // Store the input-oriented side used by execution.
                 side: leg.side.clone(),
             })
             .collect();
+
+        // Persist the expected leg count for progress tracking and recovery checks.
         state.trade.trade_leg_total = Some(legs.len() as u32);
 
+        // Convert the simulated decimal output into the destination token's exact
+        // ledger representation, flooring according to that token's decimals.
         let receive_amount = ChainTokenAmount::from_formatted(
             state.withdraw.withdraw_asset.clone(),
             route_preview.receive_amount.max(0.0),
         );
+
+        // Give no-op conversions a stable asset-pair identifier.
         let route_id = if legs.is_empty() {
             format!(
                 "{}_{}",
@@ -252,43 +355,77 @@ where
                 state.withdraw.withdraw_asset.symbol()
             )
         } else {
+            // Encode each executable market and side in traversal order.
             legs.iter()
                 .map(|leg| format!("{}:{}", leg.market, leg.side))
                 .collect::<Vec<_>>()
                 .join(">")
         };
+
+        // Build the planner-facing quote while keeping the detailed execution
+        // state owned by this CEX adapter.
         let quote = SwapQuote {
+            // Preserve the request's canonical source asset identifier.
             pay_asset: request.pay_asset.clone(),
+            // Report the full allocated ledger amount, including its transfer fee budget.
             pay_amount: request.pay_amount.value.clone(),
+            // Preserve the request's canonical destination asset identifier.
             receive_asset: request.receive_asset.clone(),
+            // Report the simulated, token-rounded output.
             receive_amount: receive_amount.value.clone(),
+            // Reference price is the route price before simulated execution impact.
             mid_price: route_preview.reference_price,
+            // Execution price reflects depth, route fees, and route direction.
             exec_price: route_preview.execution_price,
+            // Surface the amount-scoped aggregate impact for planner policy checks.
             estimated_price_impact_bps: route_preview.price_impact_bps,
+            // A CEX conversion is represented as one planner leg whose route_id
+            // contains the internal sequence of exchange markets.
             legs: vec![SwapQuoteLeg {
-                venue: "mexc".to_string(),
+                // Tag the leg with the active venue profile.
+                venue: self.profile.venue_id().to_string(),
+                // Persist the human-readable internal route description.
                 route_id,
+                // Describe the original source chain and symbol.
                 pay_chain: state.size_in.token.chain(),
                 pay_symbol: state.size_in.token.symbol(),
+                // Keep the exact amount allocated to this venue.
                 pay_amount: request.pay_amount.value.clone(),
+                // Describe the final destination chain and symbol.
                 receive_chain: receive_amount.token.chain(),
                 receive_symbol: receive_amount.token.symbol(),
+                // Keep the exact simulated destination amount.
                 receive_amount: receive_amount.value.clone(),
+                // Use the normalized receive-per-pay execution price.
                 price: route_preview.execution_price,
+                // CEX taker fees are already included in the simulated output.
                 lp_fee: Nat::from(0u8),
+                // Chain/bridge gas is budgeted by execution rather than this quote field.
                 gas_fee: Nat::from(0u8),
             }],
         };
+
+        // Convert the configured execution slippage cap into non-negative bps.
         let execution_slippage_bps = self.max_sell_slippage_bps.max(0.0) as u32;
+
+        // Combine execution slippage, route-fee safety, and quote-age safety
+        // using checked arithmetic so a bad configuration cannot wrap.
         let conservative_haircut_bps = execution_slippage_bps
             .checked_add(self.quote_route_fee_bps)
             .and_then(|bps| bps.checked_add(self.quote_delay_buffer_bps))
-            .ok_or_else(|| "MEXC conservative quote haircut overflowed u32".to_string())?;
+            .ok_or_else(|| format!("{} conservative quote haircut overflowed u32", self.profile.venue_id()))?;
+
+        // Floor the simulated output by the complete safety haircut used for
+        // cross-venue ranking and minimum-receive protection.
         let conservative_value = amount_after_bps_haircut(&receive_amount.value, conservative_haircut_bps)?;
 
-        Ok(MexcPreparedPreview {
+        // Return both the public quote and the venue-owned initial execution state.
+        Ok(CexPreparedPreview {
+            // The caller persists this before any deposit, order, or withdrawal.
             state,
+            // The planner compares this normalized quote with other venues.
             quote,
+            // The planner uses this stricter amount when deciding route safety.
             conservative_receive: ChainTokenAmount::from_raw(receive_amount.token, conservative_value),
         })
     }

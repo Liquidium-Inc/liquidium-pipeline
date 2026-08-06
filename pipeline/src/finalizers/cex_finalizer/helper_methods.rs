@@ -1,23 +1,23 @@
+use super::route_preview::CexResolvedRoutePreview;
 use super::*;
 use crate::finalizers::bridge_planner::BridgePlanner;
+use crate::finalizers::cex_finalizer::utils::parse_market_symbols;
 use crate::finalizers::cex_finalizer::{CexRouteLeg, CexTradeSlice};
-use crate::finalizers::mexc::mexc_utils::parse_market_symbols;
 use crate::swappers::model::BPS_PER_RATIO_UNIT;
 
 struct PendingSliceRequest {
     requested_in: f64,
     client_order_id: String,
     buy_mode_label: &'static str,
+    slice_seq: usize,
 }
 
 /// Deposit is considered confirmed once balance delta reaches expected amount minus this epsilon.
 const DEPOSIT_CONFIRMATION_DELTA_EPSILON: f64 = 0.00001;
 /// After this wait window, allow a fallback confirmation from total free balance.
 const DEPOSIT_TOTAL_FREE_FALLBACK_SECS: i64 = 25;
-/// Hard stop to avoid unbounded per-leg slicing loops on pathological books.
-const MAX_SLICE_EXECUTION_ROUNDS: usize = 128;
 
-impl<C> MexcFinalizer<C>
+impl<C> CexFinalizer<C>
 where
     C: CexBackend,
 {
@@ -42,7 +42,7 @@ where
             None => {
                 state.deposit.deposit_sent_at_ts = Some(now);
                 info!(
-                    "[mexc] liq_id={} deposit fallback timer initialized at={} (legacy state without send timestamp)",
+                    "[cex] liq_id={} deposit fallback timer initialized at={} (legacy state without send timestamp)",
                     state.liq_id, now
                 );
                 return false;
@@ -55,7 +55,7 @@ where
                 state.trade.trade_next_amount_in = Some(expected_amount);
             }
             info!(
-                "[mexc] liq_id={} deposit confirmed via total-free fallback: current={} expected={} elapsed={}s",
+                "[cex] liq_id={} deposit confirmed via total-free fallback: current={} expected={} elapsed={}s",
                 state.liq_id, current_balance, expected_deposit_amount, elapsed
             );
             state.step = CexStep::Trade;
@@ -99,7 +99,7 @@ where
                             Some(observed_balance_delta.max(0.0).min(expected_deposit_amount));
                     }
                     info!(
-                        "[mexc] liq_id={} deposit confirmed: before={} after={} expected={}",
+                        "[cex] liq_id={} deposit confirmed: before={} after={} expected={}",
                         state.liq_id, baseline_balance, current_balance, expected_deposit_amount
                     );
                     state.step = CexStep::Trade;
@@ -118,7 +118,7 @@ where
                 }
 
                 debug!(
-                    "[mexc] liq_id={} deposit pending: before={} current={} delta={} expected={}",
+                    "[cex] liq_id={} deposit pending: before={} current={} delta={} expected={}",
                     state.liq_id, baseline_balance, current_balance, observed_balance_delta, expected_deposit_amount
                 );
             }
@@ -126,7 +126,7 @@ where
                 // No baseline recorded yet (should normally be set when we send the transfer),
                 // so record the current balance as the baseline and stay in Deposit.
                 info!(
-                    "[mexc] liq_id={} deposit baseline set: current={}",
+                    "[cex] liq_id={} deposit baseline set: current={}",
                     state.liq_id, current_balance
                 );
                 state.deposit.deposit_balance_before = Some(current_balance);
@@ -262,7 +262,7 @@ where
 
     fn route_neighbors_from_pairs(&self, from_symbol: &str) -> Vec<(String, TradeLeg)> {
         let mut out = Vec::new();
-        for market in &self.cex_mexc_available_pairs {
+        for market in &self.cex_available_pairs {
             let Some((base, quote)) = parse_market_symbols(market) else {
                 continue;
             };
@@ -412,32 +412,36 @@ where
     /// Resolve a multi-leg hop route from `deposit_symbol` to `withdraw_symbol`.
     ///
     /// Flow:
-    /// 1) Require hop config (`cex_mexc_available_pairs`) and enabled hop depth.
-    /// 2) Discover candidate paths up to `cex_mexc_max_hops`.
+    /// 1) Require hop config (`cex_available_pairs`) and enabled hop depth.
+    /// 2) Discover candidate paths up to `cex_max_hops`.
     /// 3) Sort candidates by shortest route first, then deterministic signature.
     /// 4) Return the first route whose all legs pass `ensure_route_liquidity`.
     ///
     /// If no candidate is executable, returns an aggregated error that includes each
     /// rejected route signature and failure reason.
     async fn resolve_hop_route(&self, deposit_symbol: &str, withdraw_symbol: &str) -> Result<Vec<TradeLeg>, String> {
-        if self.cex_mexc_available_pairs.is_empty() {
+        if self.cex_available_pairs.is_empty() {
             return Err(format!(
-                "no configured MEXC pairs for hop discovery ({} -> {})",
-                deposit_symbol, withdraw_symbol
+                "no configured {} pairs for hop discovery ({} -> {})",
+                self.profile.venue_id(),
+                deposit_symbol,
+                withdraw_symbol
             ));
         }
-        if self.cex_mexc_max_hops == 0 {
+        if self.cex_max_hops == 0 {
             return Err(format!(
-                "hop discovery disabled by CEX_MEXC_MAX_HOPS=0 ({} -> {})",
-                deposit_symbol, withdraw_symbol
+                "hop discovery disabled for {} by max_hops=0 ({} -> {})",
+                self.profile.venue_id(),
+                deposit_symbol,
+                withdraw_symbol
             ));
         }
 
-        let mut candidates = self.discover_hop_candidates(deposit_symbol, withdraw_symbol, self.cex_mexc_max_hops);
+        let mut candidates = self.discover_hop_candidates(deposit_symbol, withdraw_symbol, self.cex_max_hops);
         if candidates.is_empty() {
             return Err(format!(
                 "no configured hop route for {} -> {} within {} hops",
-                deposit_symbol, withdraw_symbol, self.cex_mexc_max_hops
+                deposit_symbol, withdraw_symbol, self.cex_max_hops
             ));
         }
 
@@ -478,7 +482,7 @@ where
         }
 
         // 1) High-priority compatibility override for legacy ck routes.
-        if let Some(legs) = mexc_special_trade_legs(&deposit, &withdraw) {
+        if let Some(legs) = self.profile.special_trade_legs(&deposit, &withdraw) {
             return Ok(legs);
         }
 
@@ -492,6 +496,68 @@ where
         self.resolve_hop_route(&deposit, &withdraw)
             .await
             .map_err(|hop_err| format!("{}; {}", direct_err, hop_err))
+    }
+
+    /// Resolve and fully simulate every direct/configured candidate for the
+    /// requested amount, then keep the route with the highest net output.
+    /// Unlike the legacy availability-first resolver, a thin direct book does
+    /// not prevent a viable hop route from being considered.
+    pub(super) async fn resolve_best_trade_route_for_amount(
+        &self,
+        deposit_symbol: &str,
+        withdraw_symbol: &str,
+        initial_amount: f64,
+    ) -> Result<(Vec<TradeLeg>, CexResolvedRoutePreview), String> {
+        let deposit = Self::normalize_symbol(deposit_symbol);
+        let withdraw = Self::normalize_symbol(withdraw_symbol);
+        if deposit == withdraw {
+            let preview = self.preview_resolved_trade_route(&[], initial_amount).await?;
+            return Ok((vec![], preview));
+        }
+        if let Some(legs) = self.profile.special_trade_legs(&deposit, &withdraw) {
+            let preview = self.preview_resolved_trade_route(&legs, initial_amount).await?;
+            return Ok((legs, preview));
+        }
+
+        let mut candidates = Vec::new();
+        let mut discovery_errors = Vec::new();
+        match self.resolve_direct_leg(&deposit, &withdraw).await {
+            Ok(leg) => candidates.push(vec![leg]),
+            Err(error) => discovery_errors.push(error),
+        }
+        if self.cex_max_hops > 0 {
+            candidates.extend(self.discover_hop_candidates(&deposit, &withdraw, self.cex_max_hops));
+        }
+
+        let mut seen = std::collections::HashSet::new();
+        candidates.retain(|candidate| seen.insert(Self::route_signature(candidate)));
+        let mut best: Option<(Vec<TradeLeg>, CexResolvedRoutePreview)> = None;
+        let mut preview_errors = Vec::new();
+        for candidate in candidates {
+            match self.preview_resolved_trade_route(&candidate, initial_amount).await {
+                Ok(preview)
+                    if best
+                        .as_ref()
+                        .is_none_or(|(_, current)| preview.receive_amount > current.receive_amount) =>
+                {
+                    best = Some((candidate, preview));
+                }
+                Ok(_) => {}
+                Err(error) => preview_errors.push(format!("{} ({error})", Self::route_signature(&candidate))),
+            }
+        }
+        best.ok_or_else(|| {
+            let mut errors = discovery_errors;
+            errors.extend(preview_errors);
+            format!(
+                "no executable {} route for {} -> {} at amount {} ({})",
+                self.profile.venue_id(),
+                deposit,
+                withdraw,
+                initial_amount,
+                errors.join(" | ")
+            )
+        })
     }
 
     /// Resolve route legs once, then always reuse persisted legs on subsequent calls.
@@ -552,14 +618,14 @@ where
             }
         }
 
-        if self.cex_mexc_available_pairs.is_empty() {
+        if self.cex_available_pairs.is_empty() {
             return Err(format!(
                 "cannot convert {} to USD: no configured hop pairs and no direct stable market ({})",
                 symbol,
                 direct_errors.join(" | ")
             ));
         }
-        if self.cex_mexc_max_hops == 0 {
+        if self.cex_max_hops == 0 {
             return Err(format!(
                 "cannot convert {} to USD: hop discovery disabled and no direct stable market ({})",
                 symbol,
@@ -575,13 +641,13 @@ where
             }
         }
         for stable in &stable_targets {
-            candidates.extend(self.discover_hop_candidates(symbol, stable, self.cex_mexc_max_hops));
+            candidates.extend(self.discover_hop_candidates(symbol, stable, self.cex_max_hops));
         }
 
         if candidates.is_empty() {
             return Err(format!(
                 "cannot convert {} to USD: no configured path to stable symbols within {} hops",
-                symbol, self.cex_mexc_max_hops
+                symbol, self.cex_max_hops
             ));
         }
 
@@ -707,7 +773,7 @@ where
     }
 
     /// Simulate one leg with current orderbook for route previews.
-    pub(in crate::finalizers::mexc) async fn preview_leg(
+    pub(super) async fn preview_leg(
         &self,
         market: &str,
         side: &str,
@@ -782,9 +848,9 @@ where
         }
     }
 
-    fn is_valid_client_order_id(value: &str) -> bool {
+    pub(super) fn is_valid_client_order_id(&self, value: &str) -> bool {
         let len = value.len();
-        if !(1..=32).contains(&len) {
+        if !(1..=self.profile.client_order_id_max_len()).contains(&len) {
             return false;
         }
 
@@ -793,16 +859,20 @@ where
             .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
     }
 
-    fn stable_hash_6hex(value: &str) -> String {
+    fn stable_hash_64(value: &str) -> u64 {
         let mut hash: u64 = 0xcbf29ce484222325;
         for byte in value.bytes() {
             hash ^= byte as u64;
             hash = hash.wrapping_mul(0x100000001b3);
         }
-        format!("{:06x}", hash & 0x00ff_ffff)
+        hash
     }
 
-    fn sanitize_client_order_id(value: &str) -> String {
+    fn stable_hash_6hex(value: &str) -> String {
+        format!("{:06x}", Self::stable_hash_64(value) & 0x00ff_ffff)
+    }
+
+    pub(super) fn sanitize_client_order_id(&self, value: &str) -> String {
         let mut sanitized: String = value
             .bytes()
             .filter(|b| b.is_ascii_alphanumeric() || *b == b'_' || *b == b'-')
@@ -813,9 +883,16 @@ where
             sanitized.push_str("liq");
         }
 
-        if sanitized.len() > 32 {
+        let max_len = self.profile.client_order_id_max_len();
+        if sanitized.len() > max_len {
+            if max_len == 18 {
+                // Kraken treats non-UUID values as free text capped at 18
+                // characters. A full 64-bit hash keeps the persisted ID
+                // deterministic without relying on a collision-prone prefix.
+                return format!("lq{:016x}", Self::stable_hash_64(&sanitized));
+            }
             let hash = Self::stable_hash_6hex(&sanitized);
-            sanitized.truncate(25);
+            sanitized.truncate(max_len.saturating_sub(7));
             sanitized.push('-');
             sanitized.push_str(&hash);
         }
@@ -835,15 +912,18 @@ where
     /// Clears persisted pending state when it is:
     /// - tied to a different market/side tuple,
     /// - missing a client order id (legacy partial state),
-    /// - carrying an invalid client order id for MEXC.
-    fn sanitize_pending_trade_state_for_leg(state: &mut CexState, leg: &TradeLeg) {
+    /// - carrying an invalid client order id for the active venue profile.
+    fn sanitize_pending_trade_state_for_leg(&self, state: &mut CexState, leg: &TradeLeg) {
         if state.trade.trade_pending_client_order_id.is_some()
             && (state.trade.trade_pending_market.as_deref() != Some(leg.market.as_str())
                 || state.trade.trade_pending_side.as_deref() != Some(leg.side.as_str()))
         {
             warn!(
-                "[mexc] liq_id={} clearing stale pending order state market={:?} side={:?}",
-                state.liq_id, state.trade.trade_pending_market, state.trade.trade_pending_side
+                "[{}] liq_id={} clearing stale pending order state market={:?} side={:?}",
+                self.profile.venue_id(),
+                state.liq_id,
+                state.trade.trade_pending_market,
+                state.trade.trade_pending_side
             );
             Self::clear_pending_trade_order(state);
             state.trade.trade_pending_buy_mode = None;
@@ -855,7 +935,8 @@ where
                 || state.trade.trade_pending_requested_in.is_some())
         {
             warn!(
-                "[mexc] liq_id={} clearing legacy pending state without client_order_id",
+                "[{}] liq_id={} clearing legacy pending state without client_order_id",
+                self.profile.venue_id(),
                 state.liq_id
             );
             Self::clear_pending_trade_order(state);
@@ -863,11 +944,13 @@ where
         }
 
         if let Some(existing) = state.trade.trade_pending_client_order_id.as_deref()
-            && !Self::is_valid_client_order_id(existing)
+            && !self.is_valid_client_order_id(existing)
         {
             warn!(
-                "[mexc] liq_id={} clearing invalid pending client_order_id={}",
-                state.liq_id, existing
+                "[{}] liq_id={} clearing invalid pending client_order_id={}",
+                self.profile.venue_id(),
+                state.liq_id,
+                existing
             );
             Self::clear_pending_trade_order(state);
             state.trade.trade_pending_buy_mode = None;
@@ -900,6 +983,7 @@ where
 
     /// Persist one pending slice request in state and return the resolved values.
     fn prepare_pending_slice_request(
+        &self,
         state: &mut CexState,
         leg: &TradeLeg,
         leg_idx: usize,
@@ -912,7 +996,7 @@ where
             .trade
             .trade_pending_client_order_id
             .clone()
-            .unwrap_or_else(|| Self::build_client_order_id(state, leg_idx, slice_seq, buy_mode));
+            .unwrap_or_else(|| self.build_client_order_id(state, leg_idx, slice_seq, buy_mode));
         let buy_mode_label = Self::buy_mode_to_str(buy_mode);
 
         state.trade.trade_pending_client_order_id = Some(client_order_id.clone());
@@ -925,6 +1009,7 @@ where
             requested_in,
             client_order_id,
             buy_mode_label,
+            slice_seq,
         }
     }
 
@@ -945,7 +1030,74 @@ where
         Self::persist_trade_progress(state, *remaining_in, *total_out);
     }
 
+    /// Prepare exactly one durable order intent without submitting it.
+    ///
+    /// The multi-venue adapter calls this after consuming its outer persistence
+    /// gate. The returned state is then committed by the orchestrator, and only
+    /// a later advance may submit the order carrying this client ID. This keeps
+    /// every slice independently recoverable instead of journaling only the
+    /// enclosing trade step.
+    pub(super) async fn prepare_next_trade_order_intent(&self, state: &mut CexState) -> Result<bool, String> {
+        self.ensure_plan_on_state(state);
+        let legs = self.resolve_or_load_trade_legs(state).await?;
+        state.trade.trade_leg_total = Some(legs.len() as u32);
+
+        let idx = state.trade.trade_leg_index.unwrap_or(0) as usize;
+        if idx >= legs.len() {
+            state.step = CexStep::Withdraw;
+            if let Some(out) = state.trade.trade_next_amount_in {
+                state.withdraw.size_out = Some(ChainTokenAmount::from_formatted(
+                    state.withdraw.withdraw_asset.clone(),
+                    out,
+                ));
+            }
+            return Ok(false);
+        }
+
+        let amount_in = state.trade.trade_progress_remaining_in.unwrap_or_else(|| {
+            state
+                .trade
+                .trade_next_amount_in
+                .unwrap_or_else(|| state.size_in.to_f64())
+        });
+        if amount_in <= LIQUIDITY_EPS {
+            state.step = CexStep::Withdraw;
+            return Ok(false);
+        }
+
+        let leg = &legs[idx];
+        Self::set_trade_leg_context(state, leg, amount_in);
+        self.sanitize_pending_trade_state_for_leg(state, leg);
+        if state.trade.trade_pending_client_order_id.is_some() {
+            return Ok(true);
+        }
+
+        let preview = self
+            .preview_trade_slice(leg, amount_in, self.target_slice_bps())
+            .await?;
+        if self
+            .maybe_mark_trade_dust(state, leg, preview.chunk_in, amount_in)
+            .await?
+        {
+            state.trade.trade_unexecutable_residual_in = Some(amount_in);
+            let total_out = state.trade.trade_progress_total_out.unwrap_or(0.0);
+            Self::persist_trade_progress(state, amount_in, total_out);
+            Self::advance_after_trade_leg(state, idx, legs.len(), total_out);
+            return Ok(false);
+        }
+
+        let buy_mode = if leg.side.eq_ignore_ascii_case("buy") {
+            Self::parse_buy_mode(state.trade.trade_pending_buy_mode.as_deref())
+        } else {
+            BuyOrderInputMode::Auto
+        };
+        self.prepare_pending_slice_request(state, leg, idx, preview.chunk_in, buy_mode);
+        state.step = CexStep::TradePending;
+        Ok(true)
+    }
+
     fn build_client_order_id(
+        &self,
         state: &CexState,
         leg_idx: usize,
         slice_seq: usize,
@@ -958,7 +1110,7 @@ where
             slice_seq,
             Self::buy_mode_short_code(buy_mode)
         );
-        Self::sanitize_client_order_id(&raw)
+        self.sanitize_client_order_id(&raw)
     }
 
     /// Apply adaptive buy fallback after one executed buy slice.
@@ -1015,6 +1167,7 @@ where
             if residual_usd >= self.cex_min_exec_usd {
                 state.trade.trade_inverse_retry_count += 1;
                 *forced_next_buy_mode = Some(BuyOrderInputMode::BaseQuantity);
+                state.trade.trade_pending_buy_mode = Some("base_quantity".to_string());
             }
         }
 
@@ -1023,7 +1176,7 @@ where
         }
     }
 
-    /// Execute one route leg by slicing `amount_in` into impact-bounded chunks.
+    /// Execute one impact-bounded slice of a route leg.
     ///
     /// Detailed algorithm:
     /// - `preview_trade_slice` proposes the next chunk from live orderbook depth:
@@ -1047,30 +1200,18 @@ where
         total_legs: usize,
         amount_in: f64,
         target_bps: f64,
-    ) -> Result<(f64, f64), CexBackendError> {
+    ) -> Result<(f64, f64), CexSubmissionError> {
         // Resume from persisted per-leg progress if available.
         let mut remaining_in = state.trade.trade_progress_remaining_in.unwrap_or(amount_in);
         let mut total_out = state.trade.trade_progress_total_out.unwrap_or(0.0);
-        // Hard guard against pathological loops when liquidity math cannot converge.
-        let mut slice_round_count = 0usize;
-
         // One-shot override for the NEXT buy slice only.
         // Normal mode is quote-driven (`Auto`), but if quote truncation is large
         // we can force `BaseQuantity` on the next slice to consume more residual.
         let mut forced_next_buy_mode: Option<BuyOrderInputMode> = None;
 
-        Self::sanitize_pending_trade_state_for_leg(state, leg);
+        self.sanitize_pending_trade_state_for_leg(state, leg);
 
-        // Keep slicing until the leg input is consumed (or considered dust).
-        while remaining_in > LIQUIDITY_EPS {
-            slice_round_count += 1;
-            // Prevent unbounded retries if chunk sizing keeps returning tiny progress.
-            if slice_round_count > MAX_SLICE_EXECUTION_ROUNDS {
-                let err = format!("trade slicing exceeded max rounds for market {}", leg.market);
-                state.last_error = Some(err.clone());
-                return Err(err.into());
-            }
-
+        if remaining_in > LIQUIDITY_EPS {
             // Preview the next executable chunk using live orderbook depth.
             // This gives us expected chunk size, midpoint proxy, and expected impact.
             let preview = match self.preview_trade_slice(leg, remaining_in, target_bps).await {
@@ -1088,11 +1229,11 @@ where
             {
                 state.trade.trade_unexecutable_residual_in = Some(remaining_in);
                 Self::persist_trade_progress(state, remaining_in, total_out);
-                break;
+                return Ok((remaining_in, total_out));
             }
 
             let buy_mode = Self::resolve_slice_buy_mode(state, leg, &mut forced_next_buy_mode);
-            let pending = Self::prepare_pending_slice_request(state, leg, leg_idx, preview.chunk_in, buy_mode);
+            let pending = self.prepare_pending_slice_request(state, leg, leg_idx, preview.chunk_in, buy_mode);
 
             // Execute exactly this one slice as a market order.
             let fill_report = self
@@ -1183,11 +1324,11 @@ where
 
             // Emit slice execution log with route and quality context.
             info!(
-                "[mexc] liq_id={} trade leg {}/{} slice={} market={} side={} in={} out={} slippage_bps={:.2} preview_impact_bps={:.2}",
+                "[cex] liq_id={} trade leg {}/{} slice={} market={} side={} in={} out={} slippage_bps={:.2} preview_impact_bps={:.2}",
                 state.liq_id,
                 leg_idx + 1,
                 total_legs,
-                slice_round_count,
+                pending.slice_seq,
                 leg.market,
                 leg.side,
                 actual_input_consumed,
@@ -1356,7 +1497,7 @@ where
         state.trade.trade_dust_skipped = true;
         state.trade.trade_dust_usd = Some(residual_usd);
         info!(
-            "[mexc] liq_id={} dust skipped market={} side={} residual_in={} residual_usd={}",
+            "[cex] liq_id={} dust skipped market={} side={} residual_in={} residual_usd={}",
             state.liq_id, leg.market, leg.side, remaining_in, residual_usd
         );
         Ok(true)

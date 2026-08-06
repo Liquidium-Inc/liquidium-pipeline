@@ -26,7 +26,7 @@ use crate::{
     executors::executor::ExecutorRequest,
     finalizers::{
         finalizer::{Finalizer, FinalizerError, FinalizerResult},
-        multi_venue::{ICPSWAP_VENUE_ID, MEXC_VENUE_ID, VenueLegProgress, VenueRoutePreview},
+        multi_venue::{ICPSWAP_VENUE_ID, KRAKEN_VENUE_ID, MEXC_VENUE_ID, VenueLegProgress, VenueRoutePreview},
         profit_calculator::SimpleProfitCalculator,
     },
     persistance::{
@@ -459,7 +459,8 @@ impl MultiVenueAdapter for ScriptedAdapter {
             .to_u64()
             .ok_or_else(|| "test pay amount does not fit u64".to_string())?;
         let impact = match self.safe_through {
-            Some(limit) if pay > limit => 200.0,
+            Some(limit) if pay > limit && self.venue_id == ICPSWAP_VENUE_ID => 200.0,
+            Some(limit) if pay > limit => 201.0,
             _ => 50.0,
         };
         let receive = Nat::from(pay * 2);
@@ -692,12 +693,14 @@ fn planner_config() -> IcpswapFirstPlannerConfig {
         max_price_impact_bps: 100.0,
         max_search_iterations: 16,
         dust_fallback_max_price_impact_bps: 150.0,
+        max_cex_price_impact_bps: 200.0,
         cex_min_exec_usd: 0.01,
         min_net_edge_bps: 150,
         bad_debt_min_net_edge_bps: 150,
         max_oracle_discount_bps: 250,
         oracle_snapshot_max_age_secs: 300,
         icpswap_test_allocation_usd: None,
+        mexc_test_allocation_usd: None,
     }
 }
 
@@ -1021,7 +1024,10 @@ async fn transient_icpswap_outage_below_minimum_is_retried_instead_of_swept() {
         error.message().contains("canister is out of cycles"),
         "expected the outage to be reported: {error}"
     );
-    assert!(matches!(error, FinalizerError::Retryable(_)), "unexpected kind: {error:?}");
+    assert!(
+        matches!(error, FinalizerError::Retryable(_)),
+        "unexpected kind: {error:?}"
+    );
     assert!(
         wal.wrapper().meta_v2.is_none(),
         "an outage must not commit a recovery sweep"
@@ -1118,7 +1124,10 @@ async fn a_receipt_that_cannot_be_planned_from_fails_permanently_on_the_first_at
         error.message().contains("receipt execution is not successful"),
         "the reason must survive: {error}"
     );
-    assert!(matches!(error, FinalizerError::Permanent(_)), "unexpected kind: {error:?}");
+    assert!(
+        matches!(error, FinalizerError::Permanent(_)),
+        "unexpected kind: {error:?}"
+    );
     assert_eq!(mexc.previews(), 0, "no venue should be quoted for an unusable receipt");
     assert!(wal.wrapper().meta_v2.is_none(), "nothing may be committed");
 }
@@ -1135,7 +1144,10 @@ async fn below_minimum_route_without_recovery_runtime_is_terminal() {
         .await
         .expect_err("missing recovery runtime");
     assert!(error.message().contains("amount is below its minimum"));
-    assert!(matches!(error, FinalizerError::Permanent(_)), "unexpected kind: {error:?}");
+    assert!(
+        matches!(error, FinalizerError::Permanent(_)),
+        "unexpected kind: {error:?}"
+    );
 }
 
 fn committed_state(wal: &TestWal) -> MultiVenueExecutionState {
@@ -1279,6 +1291,153 @@ async fn commits_plan_before_effects_and_journals_legs_in_vector_order() {
 }
 
 #[tokio::test]
+async fn three_venue_waterfall_is_committed_before_execution_and_aggregated_in_order() {
+    let receipt = receipt();
+    let wal = Arc::new(TestWal::with_receipt(&receipt));
+    let icpswap = Arc::new(ScriptedAdapter::new(
+        ICPSWAP_VENUE_ID,
+        Some(40_000_000),
+        vec![VenueLegStatus::Completed],
+    ));
+    let mexc = Arc::new(ScriptedAdapter::new(
+        MEXC_VENUE_ID,
+        Some(30_000_000),
+        vec![VenueLegStatus::Completed],
+    ));
+    let kraken = Arc::new(ScriptedAdapter::new(
+        KRAKEN_VENUE_ID,
+        None,
+        vec![VenueLegStatus::Completed],
+    ));
+    icpswap.observe(&wal);
+    mexc.observe(&wal);
+    kraken.observe(&wal);
+    let finalizer = finalizer(vec![icpswap.clone(), mexc.clone(), kraken.clone()]);
+
+    let result = finalizer
+        .finalize(wal.as_ref(), receipt)
+        .await
+        .expect("three venue execution");
+
+    assert!(result.finalized);
+    assert_eq!(
+        icpswap.observed_statuses.lock().expect("statuses lock").as_slice(),
+        &[vec![
+            VenueLegStatus::Planned,
+            VenueLegStatus::Planned,
+            VenueLegStatus::Planned,
+        ]]
+    );
+    assert_eq!(
+        mexc.observed_statuses.lock().expect("statuses lock").as_slice(),
+        &[vec![
+            VenueLegStatus::Completed,
+            VenueLegStatus::Planned,
+            VenueLegStatus::Planned,
+        ]]
+    );
+    assert_eq!(
+        kraken.observed_statuses.lock().expect("statuses lock").as_slice(),
+        &[vec![
+            VenueLegStatus::Completed,
+            VenueLegStatus::Completed,
+            VenueLegStatus::Planned,
+        ]]
+    );
+    let aggregate = result.swap_result.expect("aggregated waterfall result");
+    assert_eq!(aggregate.pay_amount, Nat::from(TOTAL_PAY));
+    assert_eq!(aggregate.receive_amount, Nat::from(TOTAL_PAY * 2));
+    assert_eq!(
+        aggregate.legs.iter().map(|leg| leg.venue.as_str()).collect::<Vec<_>>(),
+        vec![ICPSWAP_VENUE_ID, MEXC_VENUE_ID, KRAKEN_VENUE_ID]
+    );
+}
+
+#[tokio::test]
+async fn forced_three_venue_test_allocation_is_committed_executed_and_aggregated() {
+    const THREE_ICP: u64 = 300_000_000;
+    const ONE_DOLLAR_ICP: u64 = 10_000_000;
+    const TEN_DOLLAR_MEXC: u64 = 100_000_000;
+    const KRAKEN_REMAINDER: u64 = 190_000_000;
+
+    // The receipt prices ICP at $10, so 3 ICP can carry the forced $1 ICPSwap
+    // leg, the forced $10 MEXC leg, and a $19 Kraken remainder.
+    let mut receipt = receipt();
+    receipt
+        .liquidation_result
+        .as_mut()
+        .expect("liquidation result")
+        .amounts
+        .collateral_received = Nat::from(THREE_ICP);
+    let wal = Arc::new(TestWal::with_receipt(&receipt));
+
+    let icpswap = Arc::new(ScriptedAdapter::new(
+        ICPSWAP_VENUE_ID,
+        None,
+        vec![VenueLegStatus::Completed],
+    ));
+    let mexc = Arc::new(ScriptedAdapter::new(
+        MEXC_VENUE_ID,
+        None,
+        vec![VenueLegStatus::Completed],
+    ));
+    let kraken = Arc::new(ScriptedAdapter::new(
+        KRAKEN_VENUE_ID,
+        None,
+        vec![VenueLegStatus::Completed],
+    ));
+    icpswap.observe(&wal);
+    mexc.observe(&wal);
+    kraken.observe(&wal);
+
+    let config = IcpswapFirstPlannerConfig {
+        icpswap_test_allocation_usd: Some(1.0),
+        mexc_test_allocation_usd: Some(10.0),
+        ..planner_config()
+    };
+    let finalizer = MultiVenueFinalizer::new(vec![icpswap.clone(), mexc.clone(), kraken.clone()], config)
+        .expect("valid forced three-venue finalizer");
+
+    let result = finalizer
+        .finalize(wal.as_ref(), receipt)
+        .await
+        .expect("forced three-venue execution");
+
+    assert!(result.finalized);
+    assert_eq!(icpswap.calls(), 1);
+    assert_eq!(mexc.calls(), 1);
+    assert_eq!(kraken.calls(), 1);
+    assert_eq!(
+        icpswap.observed_statuses.lock().expect("statuses lock").as_slice(),
+        &[vec![
+            VenueLegStatus::Planned,
+            VenueLegStatus::Planned,
+            VenueLegStatus::Planned,
+        ]]
+    );
+
+    let wrapper = wal.wrapper();
+    let FinalizerMetaPayload::MultiVenueSwap(state) = wrapper.meta_v2.expect("committed plan").payload else {
+        panic!("expected multi-venue state")
+    };
+    let allocations = state
+        .legs
+        .iter()
+        .map(|leg| leg.request.pay_amount.value.0.to_u64().expect("allocation fits u64"))
+        .collect::<Vec<_>>();
+    assert_eq!(allocations, vec![ONE_DOLLAR_ICP, TEN_DOLLAR_MEXC, KRAKEN_REMAINDER]);
+    assert!(state.legs.iter().all(|leg| leg.status == VenueLegStatus::Completed));
+
+    let aggregate = result.swap_result.expect("aggregated forced allocation result");
+    assert_eq!(aggregate.pay_amount, Nat::from(THREE_ICP));
+    assert_eq!(aggregate.receive_amount, Nat::from(THREE_ICP * 2));
+    assert_eq!(
+        aggregate.legs.iter().map(|leg| leg.venue.as_str()).collect::<Vec<_>>(),
+        vec![ICPSWAP_VENUE_ID, MEXC_VENUE_ID, KRAKEN_VENUE_ID]
+    );
+}
+
+#[tokio::test]
 async fn operator_required_mexc_leg_is_parked_across_restarts() {
     let receipt = receipt();
     let wal = TestWal::with_receipt(&receipt);
@@ -1386,8 +1545,15 @@ async fn permanent_failure_is_not_readvanced_or_rerouted() {
         .finalize(&wal, receipt.clone())
         .await
         .expect_err("permanent failure");
-    assert!(matches!(first_error, FinalizerError::Permanent(_)), "unexpected kind: {first_error:?}");
-    assert!(first_error.message().contains("icpswap-0: deposit outcome could not be proven"));
+    assert!(
+        matches!(first_error, FinalizerError::Permanent(_)),
+        "unexpected kind: {first_error:?}"
+    );
+    assert!(
+        first_error
+            .message()
+            .contains("icpswap-0: deposit outcome could not be proven")
+    );
     finalizer
         .finalize(&wal, receipt)
         .await
@@ -1509,7 +1675,10 @@ async fn committed_legacy_state_is_rejected_without_being_upgraded() {
         .finalize(&wal, receipt)
         .await
         .expect_err("legacy state must be rejected");
-    assert!(matches!(error, FinalizerError::Permanent(_)), "unexpected kind: {error:?}");
+    assert!(
+        matches!(error, FinalizerError::Permanent(_)),
+        "unexpected kind: {error:?}"
+    );
     assert_eq!(adapter.calls(), 0);
     assert_eq!(mexc.calls(), 0);
     assert!(wal.wrapper().meta_v2.is_none());
@@ -1534,7 +1703,10 @@ async fn adapter_error_is_persisted_before_retry_backoff_is_requested() {
     // The leg has begun, so the venue may already hold the funds. The error
     // stays retryable, but is tagged so that exhausting the retry budget parks
     // the row for an operator instead of failing it permanently.
-    assert!(matches!(error, FinalizerError::VenueCustody(_)), "unexpected kind: {error:?}");
+    assert!(
+        matches!(error, FinalizerError::VenueCustody(_)),
+        "unexpected kind: {error:?}"
+    );
     let state = committed_state(&wal);
     assert_eq!(state.legs[0].status, VenueLegStatus::Running);
     assert_eq!(state.legs[0].last_error.as_deref(), Some("temporary pool outage"));
@@ -1558,7 +1730,10 @@ async fn error_before_any_leg_starts_is_not_tagged_as_holding_custody() {
         .await
         .expect_err("a structural adapter failure reaches FinalizeStage");
 
-    assert!(matches!(error, FinalizerError::Retryable(_)), "unexpected kind: {error:?}");
+    assert!(
+        matches!(error, FinalizerError::Retryable(_)),
+        "unexpected kind: {error:?}"
+    );
     assert_eq!(committed_state(&wal).legs[0].status, VenueLegStatus::Planned);
 }
 

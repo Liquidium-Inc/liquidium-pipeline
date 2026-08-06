@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use candid::Nat;
-use liquidium_pipeline_connectors::backend::cex_backend::CexBackendError;
+use liquidium_pipeline_connectors::backend::cex_backend::CexSubmissionError;
 use liquidium_pipeline_core::tokens::{chain_token::ChainToken, chain_token_amount::ChainTokenAmount};
 
 use serde::{Deserialize, Serialize};
@@ -15,6 +15,12 @@ use crate::{
 };
 
 use log::{debug, error, info};
+
+pub mod execution;
+pub(crate) mod runtime;
+pub(crate) mod utils;
+
+pub use execution::{CexBridgeConfig, CexBridgeDependencies, CexFinalizer, CexVenueProfile};
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum CexStep {
@@ -227,18 +233,18 @@ pub trait CexFinalizerLogic: Send + Sync {
     async fn deposit(&self, state: &mut CexState) -> Result<(), String>;
 
     // On CEX: deposit asset -> withdraw asset
-    async fn trade(&self, state: &mut CexState) -> Result<(), CexBackendError>;
+    async fn trade(&self, state: &mut CexState) -> Result<(), CexSubmissionError>;
 
     // On CEX: withdraw to chain
     async fn withdraw(&self, state: &mut CexState) -> Result<(), String>;
 
     /// Executes one phase of the shared CEX state machine. Venue adapters and
     /// the legacy WAL finalizer use this same dispatch to avoid behavior drift.
-    async fn advance_current_step(&self, state: &mut CexState) -> Result<(), CexBackendError> {
+    async fn advance_current_step(&self, state: &mut CexState) -> Result<(), CexSubmissionError> {
         match state.step {
-            CexStep::Deposit | CexStep::DepositPending => self.deposit(state).await.map_err(CexBackendError::from),
+            CexStep::Deposit | CexStep::DepositPending => self.deposit(state).await.map_err(CexSubmissionError::from),
             CexStep::Trade | CexStep::TradePending => self.trade(state).await,
-            CexStep::Withdraw | CexStep::WithdrawPending => self.withdraw(state).await.map_err(CexBackendError::from),
+            CexStep::Withdraw | CexStep::WithdrawPending => self.withdraw(state).await.map_err(CexSubmissionError::from),
             CexStep::Completed | CexStep::Failed => Ok(()),
         }
     }
@@ -593,7 +599,7 @@ mod tests {
             Ok(())
         }
 
-        async fn trade(&self, state: &mut CexState) -> Result<(), CexBackendError> {
+        async fn trade(&self, state: &mut CexState) -> Result<(), CexSubmissionError> {
             let mut calls = self.trade_calls.lock().unwrap();
             *calls += 1;
 
@@ -746,7 +752,7 @@ mod tests {
             Ok(())
         }
 
-        async fn trade(&self, state: &mut CexState) -> Result<(), CexBackendError> {
+        async fn trade(&self, state: &mut CexState) -> Result<(), CexSubmissionError> {
             let mut calls = self.trade_calls.lock().unwrap();
             *calls += 1;
 

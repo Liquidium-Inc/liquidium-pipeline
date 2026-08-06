@@ -4,7 +4,7 @@ use std::env;
 use async_trait::async_trait;
 
 use liquidium_pipeline_connectors::backend::cex_backend::{
-    BuyOrderInputMode, CexBackend, CexBackendError, DepositAddress, OrderBook, OrderBookLevel, SwapExecutionOptions,
+    BuyOrderInputMode, CexBackend, CexSubmissionError, DepositAddress, OrderBook, OrderBookLevel, SwapExecutionOptions,
     SwapFillReport, WithdrawStatus, WithdrawStatusSnapshot, WithdrawalReceipt,
 };
 use log::{debug, info, warn};
@@ -435,6 +435,29 @@ impl MexcClient {
             debug!("[mexc] resolved symbol filters {} -> {}", symbol, resolved_symbol);
         }
 
+        let mut filters = Self::symbol_filters_from_info(&info);
+        filters.resolved_symbol = Some(resolved_symbol.clone());
+
+        let mut cache = self.symbol_filters.lock().await;
+        cache.insert(symbol.to_string(), filters.clone());
+        if resolved_symbol != symbol {
+            cache.insert(resolved_symbol, filters.clone());
+        }
+        Ok(Some(filters))
+    }
+
+    /// Reads one symbol's order-size limits out of an `exchangeInfo` entry.
+    ///
+    /// MEXC publishes only `PERCENT_PRICE_BY_SIDE` filters: it emits neither
+    /// `LOT_SIZE` nor `MIN_NOTIONAL`, and carries the equivalent limits as the
+    /// top-level `baseSizePrecision` and `quoteAmountPrecision` instead. Read
+    /// from the filter array alone every limit here parses as `None`, which
+    /// leaves the order-size guards permanently inert and defers every
+    /// too-small order to a venue rejection that classifies as retryable.
+    ///
+    /// The filter arm is kept ahead of the fallbacks so a venue that does send
+    /// the standard filters keeps deciding for itself.
+    fn symbol_filters_from_info(info: &Value) -> SymbolFilters {
         let mut filters = SymbolFilters::default();
         if let Some(entries) = info.get("filters").and_then(|v| v.as_array()) {
             for f in entries {
@@ -451,19 +474,28 @@ impl MexcClient {
                 }
             }
         }
-        filters.quote_precision = parse_u32(&info, "quotePrecision")
-            .or_else(|| parse_u32(&info, "quoteAssetPrecision"))
-            .or(filters.quote_precision);
-        filters.base_precision = parse_u32(&info, "baseAssetPrecision").or(filters.base_precision);
-        filters.taker_fee_bps = Self::parse_taker_fee_bps(&info);
-        filters.resolved_symbol = Some(resolved_symbol.clone());
 
-        let mut cache = self.symbol_filters.lock().await;
-        cache.insert(symbol.to_string(), filters.clone());
-        if resolved_symbol != symbol {
-            cache.insert(resolved_symbol, filters.clone());
-        }
-        Ok(Some(filters))
+        // Several live pairs report exactly "0" here. That means unconstrained,
+        // so it has to stay absent: a `Some(0)` bound reads like an enforced
+        // limit while comparing as a no-op.
+        filters.min_notional = filters
+            .min_notional
+            .or_else(|| parse_decimal(info, "quoteAmountPrecision"))
+            .filter(|value| !value.is_zero());
+        // MEXC states this one value as both the base-side granularity and the
+        // smallest quantity it will accept.
+        filters.step_size = filters
+            .step_size
+            .or_else(|| parse_decimal(info, "baseSizePrecision"))
+            .filter(|value| !value.is_zero());
+        filters.min_qty = filters.min_qty.or(filters.step_size);
+
+        filters.quote_precision = parse_u32(info, "quotePrecision")
+            .or_else(|| parse_u32(info, "quoteAssetPrecision"))
+            .or(filters.quote_precision);
+        filters.base_precision = parse_u32(info, "baseAssetPrecision").or(filters.base_precision);
+        filters.taker_fee_bps = Self::parse_taker_fee_bps(info);
+        filters
     }
 }
 
@@ -690,7 +722,7 @@ impl MexcClient {
         market: &str,
         side: &str,
         _amount_in: f64,
-    ) -> Result<(String, String), CexBackendError> {
+    ) -> Result<(String, String), CexSubmissionError> {
         let mut last_err: Option<String> = None;
         for candidate in candidates {
             match ex
@@ -725,7 +757,7 @@ impl MexcClient {
                         continue;
                     }
                     if is_pending_settlement(&e) {
-                        return Err(CexBackendError::PendingSettlement(format!("Swap err: {details}")));
+                        return Err(CexSubmissionError::PendingSettlement(format!("Swap err: {details}")));
                     }
                     return Err(format!("Swap err: {details}").into());
                 }
@@ -1016,7 +1048,7 @@ impl CexBackend for MexcClient {
         side: &str,
         amount_in: f64,
         options: SwapExecutionOptions,
-    ) -> Result<SwapFillReport, CexBackendError> {
+    ) -> Result<SwapFillReport, CexSubmissionError> {
         let market_symbol = market.trim().to_ascii_uppercase();
         let symbol = normalize_market_symbol(&market_symbol);
         // Determine order params (side, quantity vs quote quantity) using filters.
@@ -1108,7 +1140,7 @@ impl CexBackend for MexcClient {
                             // The order was accepted but the venue cannot read it
                             // back yet. Same eventual-consistency wait as a
                             // settling deposit, so it must not spend a retry.
-                            return Err(CexBackendError::PendingSettlement(format!(
+                            return Err(CexSubmissionError::PendingSettlement(format!(
                                 "order lookup pending after submit market={market} side={side} symbol={chosen_symbol} order_id={order_id} err={fetch_err}"
                             )));
                         }
@@ -1463,6 +1495,70 @@ mod tests {
             .expect("convert expected sell output");
         assert!((report.input_consumed - 0.000185).abs() < 1e-12);
         assert!((report.output_received - expected_output).abs() < 1e-12);
+    }
+
+    // Shape copied from a live exchangeInfo response for BTCUSDT: the only
+    // filter MEXC emits is PERCENT_PRICE_BY_SIDE, so the order-size limits have
+    // to come from the top-level fields or they are never read at all.
+    #[test]
+    fn symbol_limits_are_read_from_the_fields_mexc_actually_publishes() {
+        let info = serde_json::json!({
+            "symbol": "BTCUSDT",
+            "baseAssetPrecision": 8,
+            "quotePrecision": 2,
+            "quoteAmountPrecision": "1",
+            "baseSizePrecision": "0.000001",
+            "filters": [{
+                "filterType": "PERCENT_PRICE_BY_SIDE",
+                "bidMultiplierUp": "0.005",
+                "askMultiplierDown": "0.005"
+            }]
+        });
+
+        let filters = MexcClient::symbol_filters_from_info(&info);
+
+        assert_eq!(filters.min_notional, Decimal::from_str_exact("1").ok());
+        assert_eq!(filters.step_size, Decimal::from_str_exact("0.000001").ok());
+        assert_eq!(filters.min_qty, Decimal::from_str_exact("0.000001").ok());
+    }
+
+    // CKBTC_BTC and other configured pairs report baseSizePrecision "0", which
+    // means unconstrained. Recording it as a limit would look enforced while
+    // comparing as a no-op.
+    #[test]
+    fn a_zero_limit_is_absent_rather_than_an_enforced_floor() {
+        let info = serde_json::json!({
+            "symbol": "CKBTCBTC",
+            "quoteAmountPrecision": "0.000005",
+            "baseSizePrecision": "0",
+            "filters": []
+        });
+
+        let filters = MexcClient::symbol_filters_from_info(&info);
+
+        assert_eq!(filters.min_notional, Decimal::from_str_exact("0.000005").ok());
+        assert_eq!(filters.step_size, None);
+        assert_eq!(filters.min_qty, None);
+    }
+
+    // The fallbacks must not override a venue that does send standard filters.
+    #[test]
+    fn an_explicit_filter_outranks_the_top_level_fallback() {
+        let info = serde_json::json!({
+            "symbol": "BTCUSDT",
+            "quoteAmountPrecision": "1",
+            "baseSizePrecision": "0.000001",
+            "filters": [
+                {"filterType": "LOT_SIZE", "stepSize": "0.01", "minQty": "0.05"},
+                {"filterType": "MIN_NOTIONAL", "minNotional": "10"}
+            ]
+        });
+
+        let filters = MexcClient::symbol_filters_from_info(&info);
+
+        assert_eq!(filters.min_notional, Decimal::from_str_exact("10").ok());
+        assert_eq!(filters.step_size, Decimal::from_str_exact("0.01").ok());
+        assert_eq!(filters.min_qty, Decimal::from_str_exact("0.05").ok());
     }
 
     // exchangeInfo returns takerCommission as ratio; we convert ratio -> bps.

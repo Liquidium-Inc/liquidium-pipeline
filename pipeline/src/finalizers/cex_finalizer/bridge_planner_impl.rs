@@ -1,7 +1,7 @@
 use super::*;
 use crate::finalizers::bridge_planner::BridgePlanner;
 
-impl<C> BridgePlanner for MexcFinalizer<C>
+impl<C> BridgePlanner for CexFinalizer<C>
 where
     C: CexBackend,
 {

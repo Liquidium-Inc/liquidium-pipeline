@@ -10,7 +10,7 @@ use liquidium_pipeline_connectors::backend::bridge_backend::{
     MockBridgeBackend,
 };
 use liquidium_pipeline_connectors::backend::cex_backend::{
-    BuyOrderInputMode, CexBackendError, DepositAddress, MockCexBackend, OrderBook, OrderBookLevel, SwapFillReport,
+    BuyOrderInputMode, CexSubmissionError, DepositAddress, MockCexBackend, OrderBook, OrderBookLevel, SwapFillReport,
     WithdrawStatus, WithdrawStatusSnapshot,
 };
 use liquidium_pipeline_core::account::model::ChainAccount;
@@ -46,13 +46,49 @@ fn is_valid_mexc_client_order_id(value: &str) -> bool {
 }
 
 #[test]
+fn cex_venue_profile_separates_kraken_and_mexc_policy() {
+    let kraken = CexVenueProfile::kraken(40.0);
+    assert_eq!(kraken.venue_id(), "kraken");
+    assert_eq!(kraken.preview_taker_fee_bps(), 40.0);
+    assert!(kraken.special_trade_legs("ETH", "USDC").is_none());
+    assert!(!kraken.is_withdraw_below_min_error("raw_code: 10254"));
+    assert_eq!(kraken.deposit_fee_multiplier, 1);
+
+    let mexc = CexVenueProfile::mexc();
+    assert_eq!(mexc.venue_id(), "mexc");
+    assert!(mexc.special_trade_legs("ETH", "USDC").is_some());
+    assert!(mexc.is_withdraw_below_min_error("exchange error raw_code: 10254"));
+    assert_eq!(mexc.deposit_fee_multiplier, CEX_DEPOSIT_FEE_MULTIPLIER);
+}
+
+#[test]
+fn kraken_profile_generates_compatible_client_order_ids() {
+    let finalizer = MexcFinalizer::new(
+        Arc::new(MockCexBackend::new()),
+        Arc::new(MockTransferActions::new()),
+        Principal::anonymous(),
+        TEST_MAX_SELL_SLIPPAGE_BPS,
+        TEST_CEX_MIN_EXEC_USD,
+        TEST_CEX_SLICE_TARGET_RATIO,
+    )
+    .with_profile(CexVenueProfile::kraken(40.0));
+
+    let first = finalizer.sanitize_client_order_id("liq-340282366920938463463374607431768211455-l1-s1-a");
+    let second = finalizer.sanitize_client_order_id("liq-340282366920938463463374607431768211455-l1-s2-a");
+
+    assert_eq!(first.len(), 18);
+    assert!(first.is_ascii());
+    assert_ne!(first, second);
+    assert!(finalizer.is_valid_client_order_id(&first));
+}
+
+#[test]
 fn mexc_withdraw_below_min_detection_uses_raw_code() {
-    assert!(is_mexc_withdraw_below_min_error(
+    let profile = CexVenueProfile::mexc();
+    assert!(profile.is_withdraw_below_min_error(
         r#"Error response: ErrorResponse { code: InvalidResponse, raw_code: 10254, msg: "localized or changed text", _extend: None }"#
     ));
-    assert!(!is_mexc_withdraw_below_min_error(
-        "Withdrawal shall not be less than the Min amount of:0.00002"
-    ));
+    assert!(!profile.is_withdraw_below_min_error("Withdrawal shall not be less than the Min amount of:0.00002"));
 }
 
 fn make_execution_receipt(liq_id: u128) -> ExecutionReceipt {
@@ -2958,7 +2994,7 @@ async fn mexc_trade_propagates_backend_errors() {
     backend
         .expect_execute_swap_detailed_with_options()
         .times(1)
-        .returning(|_market, _side, _amount_in, _opts| Err(CexBackendError::Other("boom".to_string())));
+        .returning(|_market, _side, _amount_in, _opts| Err(CexSubmissionError::Rejected("boom".to_string())));
 
     let backend = Arc::new(backend);
     let transfer_service = Arc::new(transfers);
@@ -2979,7 +3015,7 @@ async fn mexc_trade_propagates_backend_errors() {
 
     let err = finalizer.trade(&mut state).await.expect_err("trade should fail");
 
-    assert_eq!(err, CexBackendError::Other("boom".to_string()));
+    assert_eq!(err, CexSubmissionError::Rejected("boom".to_string()));
     // On error we expect the step to remain Trade.
     assert!(matches!(state.step, CexStep::Trade));
 }
@@ -3388,6 +3424,13 @@ async fn mexc_trade_buy_truncation_mismatch_does_not_false_spike_slippage() {
         .trade(&mut state)
         .await
         .expect("trade should succeed without false slippage spike");
+    assert!(matches!(state.step, CexStep::TradePending));
+    assert_eq!(state.trade.trade_slices.len(), 1);
+
+    finalizer
+        .trade(&mut state)
+        .await
+        .expect("second checkpointed slice should finish the trade");
 
     assert!(matches!(state.step, CexStep::Withdraw));
     let out = state.withdraw.size_out.as_ref().expect("size_out should be set");
@@ -3480,7 +3523,7 @@ async fn mexc_trade_slippage_error_includes_requested_and_actual_fill_details() 
 }
 
 #[tokio::test]
-async fn mexc_trade_clamp_and_finish_under_consumed_buy_input_single_slice() {
+async fn mexc_trade_clamp_and_finish_under_consumed_buy_input_across_calls() {
     let mut backend = MockCexBackend::new();
     let transfers = MockTransferActions::new();
 
@@ -3562,6 +3605,13 @@ async fn mexc_trade_clamp_and_finish_under_consumed_buy_input_single_slice() {
     state.size_in = ChainTokenAmount::from_formatted(state.deposit.deposit_asset.clone(), 0.000185);
 
     finalizer.trade(&mut state).await.expect("trade should succeed");
+    assert_eq!(*calls.lock().unwrap(), 1);
+    assert!(matches!(state.step, CexStep::TradePending));
+
+    finalizer
+        .trade(&mut state)
+        .await
+        .expect("second checkpointed slice should succeed");
 
     assert_eq!(*calls.lock().unwrap(), 2);
     assert!(matches!(state.step, CexStep::Withdraw));
@@ -5843,7 +5893,12 @@ mod fuzz {
                 };
                 state.withdraw.bridge.withdraw_planned_asset = Some("BTC".to_string());
 
-                finalizer.trade(&mut state).await.expect("trade should succeed");
+                for _ in 0..128 {
+                    finalizer.trade(&mut state).await.expect("trade should succeed");
+                    if matches!(state.step, CexStep::Withdraw) {
+                        break;
+                    }
+                }
 
                 let call_count = *calls.lock().unwrap();
                 assert!(call_count > 1);

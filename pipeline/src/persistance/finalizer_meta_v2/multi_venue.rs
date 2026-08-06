@@ -89,18 +89,46 @@ pub struct MultiVenueExecutionPlan {
     pub quoted_at: i64,
 }
 
+/// Durable state for one independently executable allocation in a multi-venue plan.
+///
+/// The planner creates one leg for each selected venue—for example ICPSwap,
+/// MEXC, and Kraken in the ordered liquidation waterfall. The complete leg is
+/// written to the WAL before execution begins. On every subsequent advance or
+/// recovery attempt, the orchestrator reloads this record, dispatches it to the
+/// adapter identified by `venue_id`, and atomically checkpoints the returned
+/// state back into the parent multi-venue plan.
+///
+/// `request` and `quote` are the immutable planning commitment: they describe
+/// exactly how much collateral belongs to this venue and the output on which
+/// route selection was based. `execution`, `status`, `result`, and `last_error`
+/// form the mutable lifecycle journal. Venue-specific API details remain inside
+/// the opaque `execution` payload rather than leaking into shared persistence
+/// types.
+///
+/// Serialization keeps the leg restart-safe, cloning supports checkpointed
+/// state transitions, and equality is used by persistence and recovery tests.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct VenueLegState {
+    /// Stable identifier for this leg within its parent liquidation plan.
     pub leg_id: String,
+    /// Stable adapter identifier used to dispatch execution and recovery.
     pub venue_id: String,
+    /// Exact amount-scoped swap request committed by the planner.
     pub request: SwapRequest,
+    /// Validated planning-time quote and conservative receive commitment.
     pub quote: VenueLegQuote,
+    /// Opaque, venue-owned resumable state persisted after every checkpoint.
     pub execution: VenueExecutionState,
+    /// Parent-owned lifecycle status controlling advance and recovery behavior.
     pub status: VenueLegStatus,
 
+    /// Actual terminal execution result, populated after completion or recovery.
+    /// Older persisted legs deserialize this as `None`.
     #[serde(default)]
     pub result: Option<SwapExecution>,
 
+    /// Most recent venue-specific diagnostic retained for retries and operators.
+    /// Older persisted legs deserialize this as `None`.
     #[serde(default)]
     pub last_error: Option<String>,
 }

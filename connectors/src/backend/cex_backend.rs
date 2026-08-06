@@ -1,39 +1,54 @@
 use async_trait::async_trait;
-use std::{error::Error, fmt};
+use thiserror::Error;
 
-const CEX_PENDING_SETTLEMENT_PREFIX: &str = "cex pending settlement: ";
+pub const CEX_PENDING_SETTLEMENT_PREFIX: &str = "cex pending settlement: ";
 
-/// Classified failure from a CEX trade submission or reconciliation request.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum CexBackendError {
-    /// The venue sees the funds or order but cannot trade or reconcile it yet.
+/// Classification for calls that may have moved money before returning.
+///
+/// `Ambiguous` is the reason this stays a three-variant enum: a submission whose
+/// outcome the venue will not confirm cannot be retried like a rejection without
+/// risking a second order against the same funds.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum CexSubmissionError {
+    /// Rendered verbatim. Callers still match sentinel prefixes against this
+    /// message — the permanent amount floor, and each backend's own ambiguity
+    /// marker — so decorating it here would silently defeat those checks.
+    #[error("{0}")]
+    Rejected(String),
+    /// Rendered with the shared wire prefix so a classification made here still
+    /// reads as pending after a round trip through `last_error` and back through
+    /// [`classify_cex_submission_error`].
+    #[error("{CEX_PENDING_SETTLEMENT_PREFIX}{0}")]
     PendingSettlement(String),
-    /// Any backend failure that follows the normal retry/error policy.
-    Other(String),
+    #[error("submission outcome is ambiguous: {0}")]
+    Ambiguous(String),
 }
 
-impl fmt::Display for CexBackendError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::PendingSettlement(message) => {
-                write!(formatter, "{CEX_PENDING_SETTLEMENT_PREFIX}{message}")
-            }
-            Self::Other(message) => formatter.write_str(message),
-        }
-    }
-}
-
-impl Error for CexBackendError {}
-
-impl From<String> for CexBackendError {
+/// An unclassified backend message is a plain rejection: the two states that
+/// need care are only ever reached by deliberate classification, never by
+/// defaulting into them.
+impl From<String> for CexSubmissionError {
     fn from(message: String) -> Self {
-        Self::Other(message)
+        Self::Rejected(message)
     }
 }
 
-impl From<&str> for CexBackendError {
+impl From<&str> for CexSubmissionError {
     fn from(message: &str) -> Self {
-        Self::Other(message.to_string())
+        Self::Rejected(message.to_string())
+    }
+}
+
+/// Reports whether a backend error asks the caller to wait for the venue.
+pub fn is_cex_pending_settlement_error(message: &str) -> bool {
+    message.starts_with(CEX_PENDING_SETTLEMENT_PREFIX)
+}
+
+pub fn classify_cex_submission_error(message: &str) -> CexSubmissionError {
+    if is_cex_pending_settlement_error(message) {
+        CexSubmissionError::PendingSettlement(message.to_string())
+    } else {
+        CexSubmissionError::Rejected(message.to_string())
     }
 }
 
@@ -101,6 +116,18 @@ impl Default for SwapExecutionOptions {
     }
 }
 
+/// Exact, side-effect-free funding requirements for one planned CEX route.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FundingRoutePreflight {
+    pub deposit_asset: String,
+    pub deposit_network: String,
+    pub withdraw_asset: String,
+    pub withdraw_network: String,
+    pub withdraw_address: String,
+    pub deposit_amount: f64,
+    pub withdraw_amount: f64,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WithdrawStatus {
     Pending,
@@ -120,6 +147,33 @@ pub struct WithdrawStatusSnapshot {
 #[mockall::automock]
 #[async_trait]
 pub trait CexBackend: Send + Sync {
+    /// Converts a backend-owned error into the decision the venue adapter must
+    /// persist. The backend owns this mapping because only it knows whether a
+    /// failed request may have reached the exchange.
+    fn classify_submission_error(&self, error: &str) -> CexSubmissionError {
+        classify_cex_submission_error(error)
+    }
+
+    /// Read-only preflight performed before a venue quote can be committed.
+    /// Backends with destination allowlists use it to prove later settlement
+    /// is possible for the exact route and address.
+    async fn validate_funding_route(&self, _preflight: &FundingRoutePreflight) -> Result<(), String> {
+        Ok(())
+    }
+
+    /// Amount-aware, read-only validation for one planned trade leg. This is
+    /// separate from order submission so venue minimums can reject a preview
+    /// before collateral is transferred to the exchange.
+    async fn validate_trade_amounts(
+        &self,
+        _market: &str,
+        _side: &str,
+        _amount_in: f64,
+        _amount_out: f64,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+
     // trading
     async fn get_quote(&self, market: &str, amount_in: f64) -> Result<f64, String>;
 
@@ -127,13 +181,33 @@ pub trait CexBackend: Send + Sync {
 
     async fn execute_swap_detailed(&self, market: &str, side: &str, amount_in: f64) -> Result<SwapFillReport, String>;
 
+    /// Submits a market order with venue-specific execution controls and
+    /// returns the amounts that the exchange actually filled.
+    ///
+    /// `market` identifies the venue market, while `side` must select either a
+    /// buy or a sell. For sells, `amount_in` is the available base-asset
+    /// quantity. For buys, `amount_in` is the quote-asset budget, even when the
+    /// backend must translate that budget into a base quantity for its API.
+    ///
+    /// `options.client_order_id` should be forwarded when the venue supports
+    /// client-assigned order IDs. `options.buy_mode` controls how a buy budget
+    /// is expressed to the exchange, and `options.max_quote_overspend_bps`
+    /// bounds extra quote consumption when a base-quantity buy is required.
+    /// Implementations must reject unsupported modes or invalid limits before
+    /// submitting an order.
+    ///
+    /// The returned [`SwapFillReport`] contains actual consumed input and
+    /// received output rather than estimates. Because an error may occur after
+    /// the exchange accepted the order, callers must pass failures through
+    /// [`CexBackend::classify_submission_error`] before deciding whether a
+    /// submission is safe to retry.
     async fn execute_swap_detailed_with_options(
         &self,
         market: &str,
         side: &str,
         amount_in: f64,
         options: SwapExecutionOptions,
-    ) -> Result<SwapFillReport, CexBackendError>;
+    ) -> Result<SwapFillReport, CexSubmissionError>;
 
     async fn get_orderbook(&self, market: &str, limit: Option<u32>) -> Result<OrderBook, String>;
 
@@ -170,11 +244,11 @@ mod tests {
     #[test]
     fn backend_error_display_formats_classification_without_changing_the_message() {
         assert_eq!(
-            CexBackendError::PendingSettlement("matching engine is catching up".to_string()).to_string(),
+            CexSubmissionError::PendingSettlement("matching engine is catching up".to_string()).to_string(),
             "cex pending settlement: matching engine is catching up"
         );
         assert_eq!(
-            CexBackendError::Other("order rejected".to_string()).to_string(),
+            CexSubmissionError::Rejected("order rejected".to_string()).to_string(),
             "order rejected"
         );
     }

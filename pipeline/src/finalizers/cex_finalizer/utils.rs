@@ -35,7 +35,7 @@ pub(super) fn is_usd_stable_symbol(symbol: &str) -> bool {
 }
 
 /// Hardcoded multi-leg routes where direct market lookup is insufficient.
-pub(super) fn mexc_special_trade_legs(deposit_symbol: &str, withdraw_symbol: &str) -> Option<Vec<TradeLeg>> {
+pub(super) fn legacy_special_trade_legs(deposit_symbol: &str, withdraw_symbol: &str) -> Option<Vec<TradeLeg>> {
     let deposit = deposit_symbol.to_ascii_uppercase();
     let withdraw = withdraw_symbol.to_ascii_uppercase();
 
