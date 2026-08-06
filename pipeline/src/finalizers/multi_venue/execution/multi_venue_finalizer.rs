@@ -160,7 +160,8 @@ impl MultiVenueFinalizer {
         let mut row = wal_load(wal, &liquidation_id)
             .await?
             .ok_or_else(|| format!("missing WAL row for multi-venue liquidation {liquidation_id}"))?;
-        let mut wrapper = decode_receipt_wrapper(&row)?
+        let mut wrapper = decode_receipt_wrapper(&row)
+            .map_err(unresumable_meta)?
             .ok_or_else(|| format!("missing receipt wrapper for multi-venue liquidation {liquidation_id}"))?;
 
         if wrapper.meta_v2.is_some() {
@@ -170,9 +171,7 @@ impl MultiVenueFinalizer {
                 // mismatch, not a dead liquidation. Failing it here would drop a
                 // row whose venue legs may still hold funds out of the queue,
                 // so it is parked for an operator instead.
-                meta.validate().map_err(|error| {
-                    format!("{MULTI_VENUE_UNRESUMABLE_PREFIX}committed finalizer state cannot be read by this build: {error}")
-                })?;
+                meta.validate().map_err(unresumable_meta)?;
                 meta.payload.clone()
             };
             return Ok(LoadedFinalization {
@@ -722,6 +721,17 @@ fn aggregate_swap_executions(
 /// The sentinels are private to this module and never leave it: `finalize`
 /// classifies once, at the boundary, so no caller re-derives a decision from a
 /// message. New code should prefer building the variant directly.
+/// Marks committed state this binary cannot interpret — an unknown payload
+/// kind, an unreadable envelope, or a version from a newer build.
+///
+/// This is a code or config mismatch, not a dead liquidation. Left unmarked it
+/// classifies as retryable, which spends the row's budget on a decode that can
+/// never succeed and then fails it permanently, dropping a row whose venue legs
+/// may still hold funds out of the queue. Parking keeps it visible instead.
+fn unresumable_meta(error: impl std::fmt::Display) -> String {
+    format!("{MULTI_VENUE_UNRESUMABLE_PREFIX}committed finalizer state cannot be read by this build: {error}")
+}
+
 fn classify(error: String) -> FinalizerError {
     if error.starts_with(MULTI_VENUE_PERMANENT_PREFIX) {
         FinalizerError::Permanent(error)
@@ -755,7 +765,8 @@ impl MultiVenueFinalizer {
         let row = wal_load(wal, &liquidation_id)
             .await?
             .ok_or_else(|| format!("missing WAL row for liquidation {liquidation_id}"))?;
-        let wrapper = decode_receipt_wrapper(&row)?
+        let wrapper = decode_receipt_wrapper(&row)
+            .map_err(unresumable_meta)?
             .ok_or_else(|| format!("missing receipt wrapper for liquidation {liquidation_id}"))?;
 
         // Routing precedence is deliberately based only on durable state. A
@@ -903,7 +914,12 @@ fn decision_snapshot(state: &MultiVenueExecutionState) -> FinalizerDecisionSnaps
         mode: "multi_venue".to_string(),
         chosen: "multi_venue".to_string(),
         reason: format!("{} allocation committed", state.plan.strategy_id),
-        min_required_bps: f64::from(state.plan.min_net_edge_bps),
+        // Prefer the floor that was actually enforced; rows planned before that
+        // field existed only carry the unsigned one.
+        min_required_bps: state
+            .plan
+            .enforced_min_net_edge_bps
+            .map_or_else(|| f64::from(state.plan.min_net_edge_bps), f64::from),
         dex_preview_gross_bps: None,
         dex_preview_net_bps: None,
         cex_preview_gross_bps: None,
