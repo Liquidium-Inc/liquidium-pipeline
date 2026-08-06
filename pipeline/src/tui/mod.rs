@@ -25,7 +25,6 @@ use crate::commands::liquidation_loop::LoopControl;
 use crate::commands::tui::TuiOptions;
 use crate::context::init_context_best_effort;
 use crate::persistance::sqlite::SqliteWalStore;
-use crate::swappers::kong::kong_swapper::DEX_PRINCIPAL;
 
 use self::app::{App, ConfigSummary, ExecutionRowData, ExecutionsSnapshot, WalCounts, WalSnapshot};
 use self::events::UiEvent;
@@ -197,14 +196,14 @@ pub async fn run(opts: TuiOptions) -> anyhow::Result<()> {
     let config = ConfigSummary {
         ic_url: cfg.ic_url.clone(),
         lending_canister: cfg.lending_canister.to_text(),
-        kong_backend: DEX_PRINCIPAL.to_string(),
+        icpswap_factory: cfg.icpswap_factory_canister.to_text(),
         liquidator_principal: cfg.liquidator_principal.to_text(),
         trader_principal: cfg.trader_principal.to_text(),
         evm_address: ctx.evm_address.clone(),
         bridge_evm_address: cfg.bridge_evm_address.clone(),
         bridge_ic_owner_principal: cfg.bridge_ic_owner_principal.to_text(),
         bridge_btc_address: cfg.bridge_btc_address.clone(),
-        swapper_mode: format!("{:?}", cfg.swapper),
+        enabled_swap_venues: cfg.enabled_swap_venues.join(","),
         max_dex_slippage_bps: cfg.max_allowed_dex_slippage,
         max_cex_slippage_bps: cfg.max_allowed_cex_slippage_bps,
         bad_debt_collateral_slippage_bps: cfg.bad_debt_collateral_slippage_bps,

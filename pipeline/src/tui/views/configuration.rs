@@ -19,8 +19,8 @@ pub(super) fn draw_configuration(f: &mut Frame<'_>, area: Rect, app: &App) {
         Line::from(app.config.log_source.clone()),
         Line::from(""),
         Line::from(vec![
-            Span::styled("Swapper: ", Style::default().add_modifier(Modifier::BOLD)),
-            Span::raw(app.config.swapper_mode.clone()),
+            Span::styled("Venues: ", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw(app.config.enabled_swap_venues.clone()),
             Span::raw(" · "),
             Span::styled("DEX/CEX: ", Style::default().add_modifier(Modifier::BOLD)),
             Span::raw(format!(
@@ -38,7 +38,7 @@ pub(super) fn draw_configuration(f: &mut Frame<'_>, area: Rect, app: &App) {
         Line::from(""),
         Line::from(format!("Network: {}", app.config.ic_url)),
         Line::from(format!("LENDING_CANISTER: {}", app.config.lending_canister)),
-        Line::from(format!("KONG_BACKEND: {}", app.config.kong_backend)),
+        Line::from(format!("ICPSWAP_FACTORY_CANISTER: {}", app.config.icpswap_factory)),
         Line::from(format!("Liquidator principal: {}", app.config.liquidator_principal)),
         Line::from(format!("Trader principal: {}", app.config.trader_principal)),
         Line::from(format!("Liquidator EVM: {}", app.config.evm_address)),

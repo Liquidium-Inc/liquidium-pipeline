@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use candid::Nat;
 use liquidium_pipeline_core::account::model::ChainAccount;
 use liquidium_pipeline_core::tokens::chain_token::ChainToken;
-use liquidium_pipeline_core::transfer::actions::TransferActions;
+use liquidium_pipeline_core::transfer::actions::{TransferActions, TransferFailure};
 use tracing::instrument;
 
 pub struct MultiChainTransferRouter<I, E> {
@@ -25,7 +25,12 @@ where
     E: TransferActions + Send + Sync,
 {
     #[instrument(name = "transfer_router.transfer", skip_all, err, fields(token = %token.symbol()))]
-    async fn transfer(&self, token: &ChainToken, to: &ChainAccount, amount_native: Nat) -> Result<String, String> {
+    async fn transfer(
+        &self,
+        token: &ChainToken,
+        to: &ChainAccount,
+        amount_native: Nat,
+    ) -> Result<String, TransferFailure> {
         // Validate that token and destination are on the same chain
         match (token, to) {
             (ChainToken::Icp { .. }, ChainAccount::Icp(_)) => self.icp.transfer(token, to, amount_native).await,
@@ -33,7 +38,8 @@ where
             (ChainToken::EvmNative { .. } | ChainToken::EvmErc20 { .. }, ChainAccount::Evm(_)) => {
                 self.evm.transfer(token, to, amount_native).await
             }
-            _ => Err("invalid transfer configuration".to_string()),
+            // Nothing is dispatched, so nothing moved.
+            _ => Err(TransferFailure::Rejected("invalid transfer configuration".to_string())),
         }
     }
 

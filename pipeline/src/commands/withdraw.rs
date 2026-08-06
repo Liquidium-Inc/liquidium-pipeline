@@ -20,6 +20,7 @@ use liquidium_pipeline_core::account::model::ChainAccount;
 use alloy::primitives::Address as EvmAddress;
 use alloy::providers::{Provider, ProviderBuilder};
 use alloy::signers::local::PrivateKeySigner;
+use anyhow::{Result, anyhow, bail};
 
 use crate::config::ConfigTrait;
 use crate::context::{PipelineContext, init_context};
@@ -30,12 +31,11 @@ enum Destination {
     Evm(String),
 }
 
-pub async fn withdraw() {
+pub async fn withdraw() -> Result<()> {
     if plain_logs_enabled() {
-        eprintln!(
+        bail!(
             "Interactive withdraw wizard is disabled in plain-logs mode. Use non-interactive flags: liquidator withdraw --source <main|trader|recovery|bridge> --destination <main|trader|recovery|bridge|ACCOUNT|0xEVM_ADDRESS> --asset <SYMBOL|all> --amount <DECIMAL|all>."
         );
-        return;
     }
 
     let theme = ColorfulTheme::default();
@@ -63,7 +63,9 @@ pub async fn withdraw() {
     }
 
     // Initialize pipeline context (config + registry + backends)
-    let ctx = init_context().await.expect("Failed to init context");
+    let ctx = init_context()
+        .await
+        .map_err(|error| anyhow!("failed to init context: {error}"))?;
     let config = ctx.config.clone();
 
     // Step 1: Select account (Main | Trader | Recovery)
@@ -188,7 +190,7 @@ pub async fn withdraw() {
                         .unwrap();
                     if !confirm_recovery {
                         println!("Aborted by user.");
-                        return;
+                        return Ok(());
                     }
                 }
                 entered_account
@@ -239,7 +241,7 @@ pub async fn withdraw() {
                                 .unwrap();
                             if !confirm_recovery {
                                 println!("Aborted by user.");
-                                return;
+                                return Ok(());
                             }
                         }
                         entered_account
@@ -345,58 +347,45 @@ pub async fn withdraw() {
                         .unwrap_or(0)
                         .saturating_sub(fee.0.to_u128().unwrap_or(0));
                     if send_amount == 0 {
-                        println!("Not enough balance to cover fee; aborting.");
-                        return;
+                        bail!("not enough balance to cover fee; aborting.");
                     }
                     Nat::from(send_amount)
                 }
                 ChainToken::EvmErc20 { .. } => {
-                    let (gas_reserve_wei, native_balance_wei) = match estimate_evm_gas_reserve_and_native_balance_wei(
+                    let (gas_reserve_wei, native_balance_wei) = estimate_evm_gas_reserve_and_native_balance_wei(
                         &config,
                         source_kind,
                         EVM_ERC20_TRANSFER_GAS_LIMIT,
                     )
                     .await
-                    {
-                        Ok(v) => v,
-                        Err(err) => {
-                            println!("Failed to estimate EVM gas reserve: {err}; aborting.");
-                            return;
-                        }
-                    };
+                    .map_err(|err| anyhow!("failed to estimate EVM gas reserve: {err}; aborting."))?;
                     if native_balance_wei <= gas_reserve_wei {
-                        println!(
-                            "Not enough native balance to cover gas for EVM token transfer; aborting. native_balance_wei={} gas_reserve_wei={}",
-                            native_balance_wei, gas_reserve_wei
+                        bail!(
+                            "not enough native balance to cover gas for EVM token transfer; aborting. native_balance_wei={} gas_reserve_wei={}",
+                            native_balance_wei,
+                            gas_reserve_wei
                         );
-                        return;
                     }
                     bal_opt.map(|b| b.value.clone()).unwrap_or(0u8.into())
                 }
 
                 // EVM native: reserve a gas buffer so the tx can actually be sent.
                 ChainToken::EvmNative { .. } => {
-                    let (gas_reserve_wei, native_balance_wei) = match estimate_evm_gas_reserve_and_native_balance_wei(
+                    let (gas_reserve_wei, native_balance_wei) = estimate_evm_gas_reserve_and_native_balance_wei(
                         &config,
                         source_kind,
                         EVM_NATIVE_TRANSFER_GAS_LIMIT,
                     )
                     .await
-                    {
-                        Ok(v) => v,
-                        Err(err) => {
-                            println!("Failed to estimate EVM gas reserve: {err}; aborting.");
-                            return;
-                        }
-                    };
+                    .map_err(|err| anyhow!("failed to estimate EVM gas reserve: {err}; aborting."))?;
                     let send_native = native_balance_wei.saturating_sub(gas_reserve_wei);
 
                     if send_native == 0 {
-                        println!(
-                            "Not enough native balance to cover gas for EVM transfer; aborting. native_balance_wei={} gas_reserve_wei={}",
-                            native_balance_wei, gas_reserve_wei
+                        bail!(
+                            "not enough native balance to cover gas for EVM transfer; aborting. native_balance_wei={} gas_reserve_wei={}",
+                            native_balance_wei,
+                            gas_reserve_wei
                         );
-                        return;
                     }
 
                     send_native.into()
@@ -458,11 +447,16 @@ pub async fn withdraw() {
 
     if !confirm {
         println!("Aborted by user.");
-        return;
+        return Ok(());
     }
 
     // Step 6: Execute transfers and show summary (plain prints)
     println!("\nExecuting withdrawals...\n");
+
+    // Every transfer is still attempted and reported, but a failure has to
+    // reach the exit code: a caller that reads only the status must not be
+    // told the funds moved when they did not.
+    let mut failures: Vec<String> = Vec::new();
 
     for (asset_id, token, amt, bal_fmt) in plan {
         let transfer_service = transfer_service_for_source(&ctx, source_kind, &asset_id.symbol);
@@ -494,6 +488,7 @@ pub async fn withdraw() {
             }
             _ => {
                 println!("Destination / token chain mismatch; skipping.");
+                failures.push(format!("{}: destination / token chain mismatch", asset_id.symbol));
                 continue;
             }
         };
@@ -533,6 +528,7 @@ pub async fn withdraw() {
                 println!("  Balance:     {}", bal_fmt);
                 println!("  Result:      err: {}", e);
                 println!();
+                failures.push(format!("{}: {e}", asset_id.symbol));
             }
         }
     }
@@ -549,7 +545,12 @@ pub async fn withdraw() {
         }
     }
 
+    if !failures.is_empty() {
+        bail!("{} of the requested transfers failed: {}", failures.len(), failures.join("; "));
+    }
+
     println!("\nAll transfers processed.\n");
+    Ok(())
 }
 
 // Fetch balances for a set of tokens for a given account, using the agent and formatting with token decimals.
@@ -766,17 +767,13 @@ fn resolve_evm_destination(default_main_evm: &str, bridge_evm: &str, destination
 /// - `asset`: token symbol (e.g., "ckUSDT", "USDC") | "all" (`all` executes ICP assets only)
 /// - `amount`: decimal string (respects token decimals) | "all"
 #[allow(dead_code)]
-pub async fn withdraw_noninteractive(source: &str, destination: &str, asset: &str, amount: &str) {
+pub async fn withdraw_noninteractive(source: &str, destination: &str, asset: &str, amount: &str) -> Result<()> {
     println!("\n=== Withdraw (non-interactive) ===\n");
 
     // Load context (config + registry)
-    let ctx = match init_context().await {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("Failed to init context: {e}");
-            return;
-        }
-    };
+    let ctx = init_context()
+        .await
+        .map_err(|error| anyhow!("failed to init context: {error}"))?;
     let config = ctx.config.clone();
 
     // Resolve source
@@ -785,10 +782,7 @@ pub async fn withdraw_noninteractive(source: &str, destination: &str, asset: &st
         "trader" | "t" => "trader",
         "recovery" | "r" => "recovery",
         "bridge" | "b" => "bridge",
-        other => {
-            eprintln!("Invalid source account: {}", other);
-            return;
-        }
+        other => bail!("invalid source account: {other}"),
     };
     let (src_identity, account) = match source_kind {
         "main" => (config.liquidator_identity.clone(), config.liquidator_principal.into()),
@@ -799,18 +793,14 @@ pub async fn withdraw_noninteractive(source: &str, destination: &str, asset: &st
     };
 
     // Initialize Agent and account service
-    let agent = match Agent::builder()
-        .with_url(config.ic_url.clone())
-        .with_identity(src_identity)
-        .with_max_tcp_error_retries(3)
-        .build()
-    {
-        Ok(a) => Arc::new(a),
-        Err(e) => {
-            eprintln!("Failed to initialize IC agent: {e}");
-            return;
-        }
-    };
+    let agent = Arc::new(
+        Agent::builder()
+            .with_url(config.ic_url.clone())
+            .with_identity(src_identity)
+            .with_max_tcp_error_retries(3)
+            .build()
+            .map_err(|error| anyhow!("failed to initialize IC agent: {error}"))?,
+    );
     // Build asset catalog from registry: ICP + EVM tokens.
     let mut assets: Vec<(AssetId, ChainToken)> = ctx
         .registry
@@ -838,13 +828,7 @@ pub async fn withdraw_noninteractive(source: &str, destination: &str, asset: &st
                 continue;
             };
 
-            let dst_account = match resolve_icp_destination(&config, destination) {
-                Ok(account) => account,
-                Err(err) => {
-                    eprintln!("{err}");
-                    return;
-                }
-            };
+            let dst_account = resolve_icp_destination(&config, destination).map_err(|err| anyhow!("{err}"))?;
 
             let balance_service = balance_service_for_source(&ctx, source_kind, &id.symbol);
             let bal = match balance_service.get_balance(id).await {
@@ -889,8 +873,7 @@ pub async fn withdraw_noninteractive(source: &str, destination: &str, asset: &st
             .find(|(id, _)| id.symbol.eq_ignore_ascii_case(asset))
             .cloned();
         let Some((id, token)) = picked else {
-            eprintln!("Unknown asset symbol: {}", asset);
-            return;
+            bail!("unknown asset symbol: {asset}");
         };
 
         let balance_service = balance_service_for_source(&ctx, source_kind, &id.symbol);
@@ -901,23 +884,13 @@ pub async fn withdraw_noninteractive(source: &str, destination: &str, asset: &st
             .unwrap_or_else(|| "n/a".to_string());
 
         let destination_account = match &token {
-            ChainToken::Icp { .. } => match resolve_icp_destination(&config, destination) {
-                Ok(dst_account) => ChainAccount::Icp(dst_account),
-                Err(err) => {
-                    eprintln!("{err}");
-                    return;
-                }
-            },
-            ChainToken::EvmNative { .. } | ChainToken::EvmErc20 { .. } => {
-                let dst = match resolve_evm_destination(&ctx.evm_address, &config.bridge_evm_address, destination) {
-                    Ok(dst) => dst,
-                    Err(err) => {
-                        eprintln!("{err}");
-                        return;
-                    }
-                };
-                ChainAccount::Evm(dst)
+            ChainToken::Icp { .. } => {
+                ChainAccount::Icp(resolve_icp_destination(&config, destination).map_err(|err| anyhow!("{err}"))?)
             }
+            ChainToken::EvmNative { .. } | ChainToken::EvmErc20 { .. } => ChainAccount::Evm(
+                resolve_evm_destination(&ctx.evm_address, &config.bridge_evm_address, destination)
+                    .map_err(|err| anyhow!("{err}"))?,
+            ),
         };
 
         let amount_nat = if amount.eq_ignore_ascii_case("all") {
@@ -931,8 +904,7 @@ pub async fn withdraw_noninteractive(source: &str, destination: &str, asset: &st
                         .unwrap_or(0)
                         .saturating_sub(fee.0.to_u128().unwrap_or(0));
                     if send_amount == 0 {
-                        eprintln!("Not enough balance to cover fee; aborting.");
-                        return;
+                        bail!("not enough balance to cover fee; aborting.");
                     }
                     ChainTokenAmount {
                         token: token.clone(),
@@ -942,51 +914,38 @@ pub async fn withdraw_noninteractive(source: &str, destination: &str, asset: &st
                 ChainToken::EvmErc20 { .. } => ChainTokenAmount {
                     token: token.clone(),
                     value: {
-                        let (gas_reserve_wei, native_balance_wei) =
-                            match estimate_evm_gas_reserve_and_native_balance_wei(
-                                &config,
-                                source_kind,
-                                EVM_ERC20_TRANSFER_GAS_LIMIT,
-                            )
-                            .await
-                            {
-                                Ok(v) => v,
-                                Err(err) => {
-                                    eprintln!("Failed to estimate EVM gas reserve: {err}");
-                                    return;
-                                }
-                            };
+                        let (gas_reserve_wei, native_balance_wei) = estimate_evm_gas_reserve_and_native_balance_wei(
+                            &config,
+                            source_kind,
+                            EVM_ERC20_TRANSFER_GAS_LIMIT,
+                        )
+                        .await
+                        .map_err(|err| anyhow!("failed to estimate EVM gas reserve: {err}"))?;
                         if native_balance_wei <= gas_reserve_wei {
-                            eprintln!(
-                                "Not enough native balance to cover gas for EVM token transfer; aborting. native_balance_wei={} gas_reserve_wei={}",
-                                native_balance_wei, gas_reserve_wei
+                            bail!(
+                                "not enough native balance to cover gas for EVM token transfer; aborting. native_balance_wei={} gas_reserve_wei={}",
+                                native_balance_wei,
+                                gas_reserve_wei
                             );
-                            return;
                         }
                         bal_opt.map(|b| b.value).unwrap_or_else(|| Nat::from(0u8))
                     },
                 },
                 ChainToken::EvmNative { .. } => {
-                    let (gas_reserve_wei, native_balance_wei) = match estimate_evm_gas_reserve_and_native_balance_wei(
+                    let (gas_reserve_wei, native_balance_wei) = estimate_evm_gas_reserve_and_native_balance_wei(
                         &config,
                         source_kind,
                         EVM_NATIVE_TRANSFER_GAS_LIMIT,
                     )
                     .await
-                    {
-                        Ok(v) => v,
-                        Err(err) => {
-                            eprintln!("Failed to estimate EVM gas reserve: {err}");
-                            return;
-                        }
-                    };
+                    .map_err(|err| anyhow!("failed to estimate EVM gas reserve: {err}"))?;
                     let send_native = native_balance_wei.saturating_sub(gas_reserve_wei);
                     if send_native == 0 {
-                        eprintln!(
-                            "Not enough native balance to cover gas for EVM transfer; aborting. native_balance_wei={} gas_reserve_wei={}",
-                            native_balance_wei, gas_reserve_wei
+                        bail!(
+                            "not enough native balance to cover gas for EVM transfer; aborting. native_balance_wei={} gas_reserve_wei={}",
+                            native_balance_wei,
+                            gas_reserve_wei
                         );
-                        return;
                     }
                     ChainTokenAmount {
                         token: token.clone(),
@@ -1003,8 +962,7 @@ pub async fn withdraw_noninteractive(source: &str, destination: &str, asset: &st
     }
 
     if plan.is_empty() {
-        eprintln!("No transfers to execute.");
-        return;
+        bail!("no transfers to execute.");
     }
 
     // Echo plan
@@ -1040,6 +998,11 @@ pub async fn withdraw_noninteractive(source: &str, destination: &str, asset: &st
         println!("  Balance:     {}", bal);
         println!();
     }
+
+    // Every transfer is still attempted and reported, but a failure has to
+    // reach the exit code: a caller that reads only the status must not be
+    // told the funds moved when they did not.
+    let mut failures: Vec<String> = Vec::new();
 
     for (asset_id, token, to, amt, bal_fmt) in &plan {
         let transfer_service = transfer_service_for_source(&ctx, source_kind, &asset_id.symbol);
@@ -1088,6 +1051,7 @@ pub async fn withdraw_noninteractive(source: &str, destination: &str, asset: &st
                 println!("  Balance:     {}", bal_fmt);
                 println!("  Result:      err: {}", e);
                 println!();
+                failures.push(format!("{}: {e}", asset_id.symbol));
             }
         }
     }
@@ -1109,4 +1073,10 @@ pub async fn withdraw_noninteractive(source: &str, destination: &str, asset: &st
             println!("  {} | {}", principal, formatted);
         }
     }
+
+    if !failures.is_empty() {
+        bail!("{} of {} transfers failed: {}", failures.len(), plan.len(), failures.join("; "));
+    }
+
+    Ok(())
 }

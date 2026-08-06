@@ -50,6 +50,12 @@ pub fn now_nanos() -> u64 {
         .unwrap_or(u64::MAX)
 }
 
+/// Creates a restart-safe idempotency key for a venue execution prepared
+/// before the parent multi-venue plan has assigned its persisted leg ID.
+pub fn new_venue_execution_id(venue_id: &str) -> String {
+    format!("{venue_id}-{}", uuid::Uuid::new_v4())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -58,5 +64,15 @@ mod tests {
     fn cketh_has_nonzero_max_allowance() {
         let ledger = Principal::from_text(CKETH_LEDGER_PRINCIPAL).expect("valid ckETH ledger principal");
         assert!(max_for_ledger(&ledger) > Nat::from(0u8));
+    }
+
+    #[test]
+    fn venue_execution_ids_are_unique_and_keep_the_venue_prefix() {
+        let first = new_venue_execution_id("mexc");
+        let second = new_venue_execution_id("mexc");
+
+        assert!(first.starts_with("mexc-"));
+        assert_ne!(first, second);
+        uuid::Uuid::parse_str(first.trim_start_matches("mexc-")).expect("execution ID should contain a UUID");
     }
 }

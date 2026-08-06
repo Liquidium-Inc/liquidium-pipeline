@@ -1,68 +1,132 @@
+use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use candid::{Encode, Principal};
-use num_traits::ToPrimitive;
-use tokio::time::sleep;
+use futures::FutureExt;
+use tokio::time::{sleep, timeout};
 use tracing::instrument;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
-use crate::config::SwapperMode;
 use crate::persistance::{LiqMetaWrapper, LiqResultRecord, ResultStatus, WalStore};
 use crate::stages::executor::ExecutionReceipt;
 use crate::stages::executor::ExecutionStatus;
-use crate::swappers::swap_interface::SwapInterface;
 use crate::utils::now_ts;
 use crate::wal::{decode_receipt_wrapper, encode_meta};
 use liquidium_pipeline_connectors::pipeline_agent::PipelineAgent;
 use liquidium_pipeline_core::types::protocol_types::{LiquidationResult, ProtocolError, TransferStatus};
-const MAX_UNPROFITABLE_SECS: i64 = 180;
 
-pub struct SettlementWatcher<A, S, D>
+/// Upper bound on a single reconciliation sweep.
+///
+/// Auditor notes: the watcher issues IC queries through an agent configured
+/// without a transport deadline, so an accepted-but-unanswered request would
+/// otherwise park reconciliation forever while the daemon keeps logging healthy.
+const TICK_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Minimum cooldown after a panicking sweep before the next attempt.
+const PANIC_RECOVERY_DELAY: Duration = Duration::from_secs(1);
+
+/// Liveness cadence, so a silent watcher is distinguishable from an idle one.
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(300);
+
+/// Result of one guarded sweep, used to drive backoff and liveness logging.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TickOutcome {
+    /// Sweep ran to completion.
+    Completed,
+    /// Sweep returned an error; the loop is healthy, the work is not.
+    Failed,
+    /// Sweep exceeded [`TICK_TIMEOUT`] and was abandoned.
+    TimedOut,
+    /// Sweep panicked and was contained.
+    Panicked,
+}
+
+pub struct SettlementWatcher<A, D>
 where
     A: PipelineAgent,
-    S: SwapInterface,
     D: WalStore,
 {
     pub wal: Arc<D>,
     pub agent: Arc<A>,
-    pub swapper: Arc<S>,
     pub lending_canister: Principal,
     pub poll_interval: Duration,
-    /// Active swapper mode used to decide whether DEX profitability gating applies.
-    pub swapper_mode: SwapperMode,
 }
 
-impl<A, S, D> SettlementWatcher<A, S, D>
+impl<A, D> SettlementWatcher<A, D>
 where
     A: PipelineAgent + Send + Sync,
-    S: SwapInterface + Send + Sync,
     D: WalStore + Send + Sync,
 {
-    pub fn new(
-        wal: Arc<D>,
-        agent: Arc<A>,
-        swapper: Arc<S>,
-        lending_canister: Principal,
-        poll_interval: Duration,
-        swapper_mode: SwapperMode,
-    ) -> Self {
+    pub fn new(wal: Arc<D>, agent: Arc<A>, lending_canister: Principal, poll_interval: Duration) -> Self {
         Self {
             wal,
             agent,
-            swapper,
             lending_canister,
             poll_interval,
-            swapper_mode,
         }
     }
 
+    /// Drives reconciliation forever.
+    ///
+    /// Auditor notes: this loop is the only thing advancing already-started
+    /// liquidations to a terminal state, so it must survive every per-sweep
+    /// fault. Both ways a sweep can break the loop — an unwinding panic and an
+    /// unbounded await — are contained in [`Self::guarded_tick`].
     pub async fn run(self) {
+        let mut last_heartbeat = Instant::now();
+        let mut consecutive_stalls: u32 = 0;
+
         loop {
-            if let Err(err) = self.tick().await {
-                warn!("[settlement] tick error: {}", err);
+            let outcome = self.guarded_tick().await;
+            match outcome {
+                TickOutcome::Completed | TickOutcome::Failed => consecutive_stalls = 0,
+                TickOutcome::TimedOut | TickOutcome::Panicked => {
+                    consecutive_stalls = consecutive_stalls.saturating_add(1);
+                    warn!(
+                        consecutive_stalls,
+                        ?outcome,
+                        "[settlement] sweep did not complete; watcher stays alive and retries"
+                    );
+                }
             }
-            sleep(self.poll_interval).await;
+
+            if last_heartbeat.elapsed() >= HEARTBEAT_INTERVAL {
+                info!(consecutive_stalls, "[settlement] watcher alive");
+                last_heartbeat = Instant::now();
+            }
+
+            let delay = if matches!(outcome, TickOutcome::Panicked) {
+                self.poll_interval.max(PANIC_RECOVERY_DELAY)
+            } else {
+                self.poll_interval
+            };
+            sleep(delay).await;
+        }
+    }
+
+    /// Runs one sweep under a deadline and a panic guard.
+    async fn guarded_tick(&self) -> TickOutcome {
+        // `tick` only touches `Arc` handles and owned rows, so a panic cannot
+        // leave the watcher observing torn state.
+        let tick = AssertUnwindSafe(self.tick()).catch_unwind();
+        match timeout(TICK_TIMEOUT, tick).await {
+            Ok(Ok(Ok(()))) => TickOutcome::Completed,
+            Ok(Ok(Err(err))) => {
+                warn!("[settlement] tick error: {}", err);
+                TickOutcome::Failed
+            }
+            Ok(Err(_)) => {
+                error!("[settlement] tick panicked; recovering and continuing reconciliation");
+                TickOutcome::Panicked
+            }
+            Err(_) => {
+                error!(
+                    timeout_secs = TICK_TIMEOUT.as_secs(),
+                    "[settlement] tick timed out; abandoning sweep and retrying"
+                );
+                TickOutcome::TimedOut
+            }
         }
     }
 
@@ -145,81 +209,11 @@ where
             return Ok(());
         }
 
-        if receipt.request.liquidation.buy_bad_debt {
-            self.wal
-                .update_status(&row.id, ResultStatus::Enqueued, true)
-                .await
-                .map_err(|e| e.to_string())?;
-            return Ok(());
-        }
-
-        // DEX quote-based profitability gating is only valid in pure DEX mode.
-        // In CEX/Hybrid modes, finalizer-side previews decide route viability.
-        if !matches!(self.swapper_mode, SwapperMode::Dex) {
-            self.wal
-                .update_status(&row.id, ResultStatus::Enqueued, true)
-                .await
-                .map_err(|e| e.to_string())?;
-            info!(
-                "[settlement] ✅ liq_id={} mode={:?} -> enqueued without DEX quote gate",
-                liq.id, self.swapper_mode
-            );
-            return Ok(());
-        }
-
-        let swap_req = receipt
-            .request
-            .swap_args
-            .as_ref()
-            .ok_or_else(|| "missing swap args".to_string())?;
-
-        let quote = match self.swapper.quote(swap_req).await {
-            Ok(q) => q,
-            Err(err) => {
-                warn!("[settlement] quote failed liq_id={} err={}", liq.id, err);
-                return self.handle_unprofitable(&row, liq.id).await;
-            }
-        };
-
-        let recv = quote.receive_amount.0.to_i128();
-        let debt = liq.amounts.debt_repaid.0.to_i128();
-        let profitable = matches!((recv, debt), (Some(r), Some(d)) if r >= d);
-
-        if profitable {
-            self.wal
-                .update_status(&row.id, ResultStatus::Enqueued, true)
-                .await
-                .map_err(|e| e.to_string())?;
-            info!("[settlement] ✅ liq_id={} profitable -> enqueued", liq.id);
-            return Ok(());
-        }
-
-        self.handle_unprofitable(&row, liq.id).await
-    }
-
-    async fn handle_unprofitable(&self, row: &LiqResultRecord, liq_id: u128) -> Result<(), String> {
-        if row.status != ResultStatus::WaitingProfit {
-            self.wal
-                .update_status(&row.id, ResultStatus::WaitingProfit, false)
-                .await
-                .map_err(|e| e.to_string())?;
-            info!("[settlement] ⏳ liq_id={} not profitable -> waiting", liq_id);
-            return Ok(());
-        }
-
-        let elapsed = now_ts().saturating_sub(row.updated_at);
-        if elapsed >= MAX_UNPROFITABLE_SECS {
-            self.wal
-                .update_failure(
-                    &row.id,
-                    ResultStatus::FailedPermanent,
-                    "unprofitable after 180s".to_string(),
-                    true,
-                )
-                .await
-                .map_err(|e| e.to_string())?;
-            warn!("[settlement] ❌ liq_id={} unprofitable > 180s -> failed", liq_id);
-        }
+        self.wal
+            .update_status(&row.id, ResultStatus::Enqueued, true)
+            .await
+            .map_err(|e| e.to_string())?;
+        info!("[settlement] ✅ liq_id={} -> enqueued for multi-venue planning", liq.id);
         Ok(())
     }
 
@@ -248,6 +242,7 @@ where
             finalizer_decision: None,
             profit_snapshot: None,
             venue_execution: None,
+            meta_v2: None,
         });
         wrapper.receipt = receipt.clone();
         encode_meta(&mut row, &wrapper)?;
@@ -268,9 +263,10 @@ mod tests {
         FinalizerDecisionSnapshot, LiqMetaWrapper, MockWalStore, ResultStatus, WalProfitSnapshot,
     };
     use crate::stages::executor::ExecutionStatus;
-    use crate::swappers::model::{SwapQuote, SwapRequest};
-    use crate::swappers::swap_interface::MockSwapInterface;
+    use crate::swappers::model::SwapRequest;
     use candid::Nat;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use liquidium_pipeline_connectors::pipeline_agent::MockPipelineAgent;
     use liquidium_pipeline_core::tokens::asset_id::AssetId;
     use liquidium_pipeline_core::tokens::chain_token::ChainToken;
@@ -308,6 +304,8 @@ mod tests {
             collateral_asset,
             expected_profit: 0,
             ref_price: Nat::from(0u8),
+            debt_ref_price: Nat::from(0u8),
+            ref_price_at: 0,
             debt_approval_needed: false,
             min_collateral_amount: Nat::from(0u8),
         }
@@ -374,13 +372,14 @@ mod tests {
             finalizer_decision: None,
             profit_snapshot: None,
             venue_execution: None,
+            meta_v2: None,
         };
         encode_meta(&mut row, &wrapper).expect("encode_meta should succeed");
         row
     }
 
     #[tokio::test]
-    async fn watcher_enqueues_when_profitable() {
+    async fn watcher_enqueues_for_multi_venue_planning() {
         let liq_id = 9u128;
         let swap_args = make_swap_args();
         let receipt = ExecutionReceipt {
@@ -416,37 +415,18 @@ mod tests {
             .times(1)
             .returning(move |_, _, _| Ok(Ok(fresh.clone())));
 
-        let mut swapper = MockSwapInterface::new();
-        let quote = SwapQuote {
-            pay_asset: swap_args.pay_asset.clone(),
-            pay_amount: swap_args.pay_amount.value.clone(),
-            receive_asset: swap_args.receive_asset.clone(),
-            receive_amount: Nat::from(2_000_000u64),
-            mid_price: 1.0,
-            exec_price: 1.0,
-            estimated_price_impact_bps: 0.0,
-            legs: vec![],
-        };
-        swapper
-            .expect_quote()
-            .withf(move |req| req.pay_asset.symbol == "ckBTC" && req.receive_asset.symbol == "ckUSDT")
-            .times(1)
-            .returning(move |_| Ok(quote.clone()));
-
         let watcher = SettlementWatcher::new(
             Arc::new(wal),
             Arc::new(agent),
-            Arc::new(swapper),
             Principal::anonymous(),
             Duration::from_secs(3),
-            SwapperMode::Dex,
         );
 
         watcher.tick().await.expect("tick should succeed");
     }
 
     #[tokio::test]
-    async fn watcher_bypasses_dex_quote_gate_in_hybrid_mode() {
+    async fn watcher_enqueues_settled_swap_rows_without_a_quote_dependency() {
         let liq_id = 10u128;
         let swap_args = make_swap_args();
         let receipt = ExecutionReceipt {
@@ -482,26 +462,19 @@ mod tests {
             .times(1)
             .returning(move |_, _, _| Ok(Ok(fresh.clone())));
 
-        let mut swapper = MockSwapInterface::new();
-        swapper.expect_quote().times(0);
-
         let watcher = SettlementWatcher::new(
             Arc::new(wal),
             Arc::new(agent),
-            Arc::new(swapper),
             Principal::anonymous(),
             Duration::from_secs(3),
-            SwapperMode::Hybrid,
         );
 
         watcher.tick().await.expect("tick should succeed");
     }
 
-    /// Given: Settlement watcher runs in pure CEX mode with a ready liquidation row.
-    /// When: One watcher tick is executed.
-    /// Then: It enqueues without calling DEX quote gating.
+    /// A ready settled row is handed to the finalizer without venue-specific routing.
     #[tokio::test]
-    async fn watcher_bypasses_dex_quote_gate_in_cex_mode() {
+    async fn watcher_enqueue_behavior_is_independent_of_venue_selection() {
         // given
         const LIQUIDATION_ID: u128 = 11;
         const WAL_BATCH_LIMIT: usize = 100;
@@ -540,30 +513,24 @@ mod tests {
             .times(1)
             .returning(move |_, _, _| Ok(Ok(fresh.clone())));
 
-        let mut swapper = MockSwapInterface::new();
-        swapper.expect_quote().times(0);
-
         let watcher = SettlementWatcher::new(
             Arc::new(wal),
             Arc::new(agent),
-            Arc::new(swapper),
             Principal::anonymous(),
             Duration::from_secs(3),
-            SwapperMode::Cex,
         );
 
         // when
         watcher.tick().await.expect("tick should succeed");
 
-        // then
-        // Expectations above assert: no quote calls and Enqueued transition.
+        // Expectations above assert the Enqueued transition.
     }
 
     #[tokio::test]
-    async fn watcher_fails_after_unprofitable_window() {
+    async fn watcher_reenqueues_legacy_waiting_profit_rows() {
         let liq_id = 12u128;
         let swap_args = make_swap_args();
-        let mut row = make_row(
+        let row = make_row(
             ResultStatus::WaitingProfit,
             ExecutionReceipt {
                 request: make_request(false, Some(swap_args.clone())),
@@ -572,7 +539,6 @@ mod tests {
                 change_received: true,
             },
         );
-        row.updated_at = now_ts() - 181;
         let row_id = row.id.clone();
 
         let mut wal = MockWalStore::new();
@@ -584,15 +550,10 @@ mod tests {
             .with(eq(ResultStatus::WaitingProfit), eq(100usize))
             .times(1)
             .returning(move |_, _| Ok(vec![row.clone()]));
-        wal.expect_update_failure()
-            .with(
-                eq(row_id.clone()),
-                eq(ResultStatus::FailedPermanent),
-                eq("unprofitable after 180s".to_string()),
-                eq(true),
-            )
+        wal.expect_update_status()
+            .with(eq(row_id.clone()), eq(ResultStatus::Enqueued), eq(true))
             .times(1)
-            .returning(|_, _, _, _| Ok(()));
+            .returning(|_, _, _| Ok(()));
 
         let mut agent = MockPipelineAgent::new();
         let args = Encode!(&liq_id).unwrap();
@@ -603,30 +564,11 @@ mod tests {
             .times(1)
             .returning(move |_, _, _| Ok(Ok(fresh.clone())));
 
-        let mut swapper = MockSwapInterface::new();
-        let quote = SwapQuote {
-            pay_asset: swap_args.pay_asset.clone(),
-            pay_amount: swap_args.pay_amount.value.clone(),
-            receive_asset: swap_args.receive_asset.clone(),
-            receive_amount: Nat::from(1u64),
-            mid_price: 1.0,
-            exec_price: 1.0,
-            estimated_price_impact_bps: 0.0,
-            legs: vec![],
-        };
-        swapper
-            .expect_quote()
-            .withf(move |req| req.pay_asset.symbol == "ckBTC" && req.receive_asset.symbol == "ckUSDT")
-            .times(1)
-            .returning(move |_| Ok(quote.clone()));
-
         let watcher = SettlementWatcher::new(
             Arc::new(wal),
             Arc::new(agent),
-            Arc::new(swapper),
             Principal::anonymous(),
             Duration::from_secs(3),
-            SwapperMode::Dex,
         );
 
         watcher.tick().await.expect("tick should succeed");
@@ -662,6 +604,7 @@ mod tests {
                 cex_preview_gross_bps: Some(33.0),
                 cex_preview_net_bps: Some(26.0),
                 ts: 123,
+                multi_venue_allocation: None,
             }),
             profit_snapshot: Some(WalProfitSnapshot {
                 expected_profit_raw: "1000".to_string(),
@@ -671,6 +614,7 @@ mod tests {
                 updated_at: 123,
             }),
             venue_execution: None,
+            meta_v2: None,
         };
         encode_meta(&mut row, &wrapper).expect("encode wrapper");
 
@@ -692,15 +636,150 @@ mod tests {
         let watcher = SettlementWatcher::new(
             Arc::new(wal),
             Arc::new(MockPipelineAgent::new()),
-            Arc::new(MockSwapInterface::new()),
             Principal::anonymous(),
             Duration::from_secs(3),
-            SwapperMode::Dex,
         );
 
         watcher
             .update_receipt_meta(&row, &new_receipt, true)
             .await
             .expect("receipt meta update should succeed");
+    }
+
+    /// How a [`FaultyWal`] sweep misbehaves.
+    enum Fault {
+        /// Never resolves — an IC query accepted and then never answered.
+        Hang,
+        /// Unwinds on every sweep.
+        Panic,
+    }
+
+    /// WAL double for the sweep-fault containment paths.
+    ///
+    /// Hand-rolled rather than reusing `MockWalStore` because mockall guards its
+    /// call state with a mutex that the first panic poisons; every later sweep
+    /// would then fail inside the mock instead of exercising the watcher.
+    struct FaultyWal {
+        fault: Fault,
+        sweeps: Arc<AtomicUsize>,
+    }
+
+    impl FaultyWal {
+        fn new(fault: Fault) -> Self {
+            Self {
+                fault,
+                sweeps: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+
+        fn sweep_counter(&self) -> Arc<AtomicUsize> {
+            self.sweeps.clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl WalStore for FaultyWal {
+        async fn list_by_status(&self, _status: ResultStatus, _limit: usize) -> anyhow::Result<Vec<LiqResultRecord>> {
+            self.sweeps.fetch_add(1, Ordering::SeqCst);
+            match self.fault {
+                Fault::Hang => std::future::pending().await,
+                Fault::Panic => panic!("simulated sweep panic"),
+            }
+        }
+
+        async fn upsert_result(&self, _row: LiqResultRecord) -> anyhow::Result<()> {
+            unreachable!("sweep faults before reaching this")
+        }
+
+        async fn get_result(&self, _liq_id: &str) -> anyhow::Result<Option<LiqResultRecord>> {
+            unreachable!("sweep faults before reaching this")
+        }
+
+        async fn get_pending(&self, _limit: usize) -> anyhow::Result<Vec<LiqResultRecord>> {
+            unreachable!("sweep faults before reaching this")
+        }
+
+        async fn update_status(&self, _liq_id: &str, _next: ResultStatus, _bump: bool) -> anyhow::Result<()> {
+            unreachable!("sweep faults before reaching this")
+        }
+
+        async fn update_failure(
+            &self,
+            _liq_id: &str,
+            _next: ResultStatus,
+            _last_error: String,
+            _bump: bool,
+        ) -> anyhow::Result<()> {
+            unreachable!("sweep faults before reaching this")
+        }
+
+        async fn delete(&self, _liq_id: &str) -> anyhow::Result<()> {
+            unreachable!("sweep faults before reaching this")
+        }
+    }
+
+    fn watcher_with_wal<D: WalStore + Send + Sync + 'static>(wal: D) -> SettlementWatcher<MockPipelineAgent, D> {
+        SettlementWatcher::new(
+            Arc::new(wal),
+            Arc::new(MockPipelineAgent::new()),
+            Principal::anonymous(),
+            Duration::from_millis(1),
+        )
+    }
+
+    #[tokio::test]
+    async fn guarded_tick_contains_a_panicking_sweep() {
+        let watcher = watcher_with_wal(FaultyWal::new(Fault::Panic));
+
+        assert_eq!(watcher.guarded_tick().await, TickOutcome::Panicked);
+    }
+
+    #[tokio::test]
+    async fn guarded_tick_reports_a_sweep_error_without_unwinding() {
+        let mut wal = MockWalStore::new();
+        wal.expect_list_by_status()
+            .returning(|_, _| Err(anyhow::anyhow!("wal unavailable")));
+
+        let watcher = watcher_with_wal(wal);
+
+        assert_eq!(watcher.guarded_tick().await, TickOutcome::Failed);
+    }
+
+    /// A stalled sweep must be abandoned rather than parking reconciliation.
+    /// The paused clock makes `TICK_TIMEOUT` elapse in virtual time.
+    #[tokio::test(start_paused = true)]
+    async fn guarded_tick_abandons_a_stalled_sweep() {
+        let watcher = watcher_with_wal(FaultyWal::new(Fault::Hang));
+
+        assert_eq!(watcher.guarded_tick().await, TickOutcome::TimedOut);
+    }
+
+    /// The loop is the only thing advancing started liquidations to a terminal
+    /// state, so a panicking sweep must not end it.
+    ///
+    /// Each panic costs `PANIC_RECOVERY_DELAY` before the next sweep, so the
+    /// paused clock steps over those delays in virtual time. Polling the
+    /// counter behind real 1ms sleeps made the test depend on the timer
+    /// overshooting its request: three sweeps need two real seconds of
+    /// recovery, which a precise 1ms tick would never reach.
+    #[tokio::test(start_paused = true)]
+    async fn run_keeps_sweeping_after_a_panicking_sweep() {
+        let wal = FaultyWal::new(Fault::Panic);
+        let sweeps = wal.sweep_counter();
+
+        let handle = tokio::spawn(watcher_with_wal(wal).run());
+
+        for _ in 0..3 {
+            tokio::task::yield_now().await;
+            tokio::time::advance(PANIC_RECOVERY_DELAY).await;
+        }
+        tokio::task::yield_now().await;
+
+        assert!(
+            sweeps.load(Ordering::SeqCst) >= 3,
+            "watcher stopped sweeping after a panic"
+        );
+        assert!(!handle.is_finished(), "watcher task died on a panicking sweep");
+        handle.abort();
     }
 }

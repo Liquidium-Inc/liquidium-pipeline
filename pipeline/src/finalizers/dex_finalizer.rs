@@ -7,7 +7,7 @@ use log::debug;
 use serde::{Serialize, de::DeserializeOwned};
 
 use crate::{
-    finalizers::finalizer::{Finalizer, FinalizerResult},
+    finalizers::finalizer::{Finalizer, FinalizerError, FinalizerResult},
     persistance::{FinalizerDecisionSnapshot, WalStore},
     stages::executor::{ExecutionReceipt, ExecutionStatus},
     swappers::model::{SwapExecution, SwapQuote, SwapRequest},
@@ -115,7 +115,18 @@ pub trait DexFinalizerLogic: Send + Sync {
 
 #[async_trait]
 impl Finalizer for dyn DexFinalizerLogic {
-    async fn finalize(&self, _: &dyn WalStore, receipt: ExecutionReceipt) -> Result<FinalizerResult, String> {
+    async fn finalize(
+        &self,
+        wal: &dyn WalStore,
+        receipt: ExecutionReceipt,
+    ) -> Result<FinalizerResult, FinalizerError> {
+        // This route raises no permanent sentinels of its own.
+        self.finalize_inner(wal, receipt).await.map_err(FinalizerError::Retryable)
+    }
+}
+
+impl dyn DexFinalizerLogic {
+    async fn finalize_inner(&self, _: &dyn WalStore, receipt: ExecutionReceipt) -> Result<FinalizerResult, String> {
         // Only finalize successful executions
         if !matches!(receipt.status, ExecutionStatus::Success) {
             return Ok(FinalizerResult::noop());

@@ -49,6 +49,7 @@ alloy = { workspace = true }
 futures = { workspace = true }
 bip39 = { workspace = true }
 thiserror = { workspace = true }
+uuid = { workspace = true }
 
 
 mexc-rs = { git = "https://github.com/liquidium-Inc/mexc-rs.git", rev = "5b8dc1e5e4261cab27772e32e2311ba4e70c1b13" }
@@ -89,3 +90,6 @@ arbitrary = "1.4.2"
 rand = "0.9.2"
 proptest = "1.4"
 tempfile = "3"
+# `test-util` provides the paused clock used to exercise long timeouts in
+# virtual time instead of waiting them out.
+tokio = { workspace = true, features = ["test-util"] }

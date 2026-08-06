@@ -1,11 +1,12 @@
 use async_trait::async_trait;
 use candid::Nat;
+use liquidium_pipeline_connectors::backend::cex_backend::CexBackendError;
 use liquidium_pipeline_core::tokens::{chain_token::ChainToken, chain_token_amount::ChainTokenAmount};
 
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    finalizers::finalizer::{Finalizer, FinalizerResult},
+    finalizers::finalizer::{Finalizer, FinalizerError, FinalizerResult},
     persistance::{LiqMetaWrapper, LiqResultRecord, ResultStatus, WalStore},
     stages::executor::{ExecutionReceipt, ExecutionStatus},
     swappers::model::SwapExecution,
@@ -27,7 +28,8 @@ pub enum CexStep {
     Failed,
 }
 
-/// Route-level CEX feasibility and cost preview used by hybrid routing decisions.
+/// Route-level CEX feasibility and cost preview used by multi-venue planning.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CexRoutePreview {
     /// Whether the route is executable against current orderbook depth.
@@ -35,7 +37,7 @@ pub struct CexRoutePreview {
     /// Estimated output amount in final receive-asset native units.
     pub estimated_receive_amount: f64,
     /// Estimated end-to-end route slippage in basis points.
-    pub estimated_slippage_bps: f64,
+    pub estimated_price_impact_bps: f64,
     /// Optional reason when preview cannot be executed.
     pub reason: Option<String>,
 }
@@ -159,6 +161,13 @@ pub struct CexTradeState {
     /// Residual input that could not be executed due to constraints.
     #[serde(default)]
     pub trade_unexecutable_residual_in: Option<f64>,
+    /// When the venue first reported this leg's funds as not tradable yet.
+    ///
+    /// Set on the first pending-settlement rejection and cleared by the next
+    /// error-free step, so the wait is measured from the venue's first refusal
+    /// rather than restarted by every retry.
+    #[serde(default)]
+    pub trade_settlement_waiting_since_ts: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -208,6 +217,9 @@ pub struct CexState {
 
 #[async_trait]
 pub trait CexFinalizerLogic: Send + Sync {
+    #[allow(dead_code)]
+    fn venue_id(&self) -> &'static str;
+
     // Build the initial CEX state for this liquidation from the receipt
     async fn prepare(&self, liq_id: &str, receipt: &ExecutionReceipt) -> Result<CexState, String>;
 
@@ -215,21 +227,48 @@ pub trait CexFinalizerLogic: Send + Sync {
     async fn deposit(&self, state: &mut CexState) -> Result<(), String>;
 
     // On CEX: deposit asset -> withdraw asset
-    async fn trade(&self, state: &mut CexState) -> Result<(), String>;
+    async fn trade(&self, state: &mut CexState) -> Result<(), CexBackendError>;
 
     // On CEX: withdraw to chain
     async fn withdraw(&self, state: &mut CexState) -> Result<(), String>;
+
+    /// Executes one phase of the shared CEX state machine. Venue adapters and
+    /// the legacy WAL finalizer use this same dispatch to avoid behavior drift.
+    async fn advance_current_step(&self, state: &mut CexState) -> Result<(), CexBackendError> {
+        match state.step {
+            CexStep::Deposit | CexStep::DepositPending => self.deposit(state).await.map_err(CexBackendError::from),
+            CexStep::Trade | CexStep::TradePending => self.trade(state).await,
+            CexStep::Withdraw | CexStep::WithdrawPending => self.withdraw(state).await.map_err(CexBackendError::from),
+            CexStep::Completed | CexStep::Failed => Ok(()),
+        }
+    }
 
     // Build final SwapExecution to hand back to pipeline when Completed
     async fn finish(&self, receipt: &ExecutionReceipt, state: &CexState) -> Result<SwapExecution, String>;
 
     // Preview route feasibility and slippage using current orderbook depth.
+    #[allow(dead_code)]
     async fn preview_route(&self, receipt: &ExecutionReceipt) -> Result<CexRoutePreview, String>;
 }
 
 #[async_trait]
 impl Finalizer for dyn CexFinalizerLogic {
-    async fn finalize(&self, wal: &dyn WalStore, receipt: ExecutionReceipt) -> Result<FinalizerResult, String> {
+    async fn finalize(&self, wal: &dyn WalStore, receipt: ExecutionReceipt) -> Result<FinalizerResult, FinalizerError> {
+        self.finalize_inner(wal, receipt).await.map_err(|error| {
+            // Classify once here; the bridge's sentinel never reaches the stage.
+            if error.starts_with(
+                liquidium_pipeline_connectors::backend::bridge_backend::FINALIZER_PERMANENT_AMOUNT_FLOOR_PREFIX,
+            ) {
+                FinalizerError::BadDebtAmountFloor(error)
+            } else {
+                FinalizerError::Retryable(error)
+            }
+        })
+    }
+}
+
+impl dyn CexFinalizerLogic {
+    async fn finalize_inner(&self, wal: &dyn WalStore, receipt: ExecutionReceipt) -> Result<FinalizerResult, String> {
         // Only finalize successful executions
         if !matches!(receipt.status, ExecutionStatus::Success) {
             debug!("[cex] ⏭️ skip: execution status not successful: {:?}", receipt.status);
@@ -254,7 +293,7 @@ impl Finalizer for dyn CexFinalizerLogic {
                     ResultStatus::WaitingCollateral | ResultStatus::WaitingProfit => {
                         return Ok(FinalizerResult::noop());
                     }
-                    ResultStatus::OperatorRequired => {
+                    ResultStatus::OperatorRequired | ResultStatus::Unresumable => {
                         return Ok(FinalizerResult::noop());
                     }
                     ResultStatus::FailedPermanent => {
@@ -306,35 +345,9 @@ impl Finalizer for dyn CexFinalizerLogic {
 
         let mut row_after = row;
         loop {
-            let step_res = match cex_state.step {
-                CexStep::Deposit => {
-                    debug!("[cex] 💰 liq_id={} step=Deposit", cex_state.liq_id);
-                    self.deposit(&mut cex_state).await
-                }
-                CexStep::DepositPending => {
-                    info!("[cex] ⏳ liq_id={} step=DepositPending", cex_state.liq_id);
-                    // Re-check deposit arrival on the CEX.
-                    self.deposit(&mut cex_state).await
-                }
-                CexStep::Trade => {
-                    debug!("[cex] 🔁 liq_id={} step=Trade", cex_state.liq_id);
-                    self.trade(&mut cex_state).await
-                }
-                CexStep::TradePending => {
-                    debug!("[cex] ⏳ liq_id={} step=TradePending", cex_state.liq_id);
-                    self.trade(&mut cex_state).await
-                }
-                CexStep::Withdraw => {
-                    debug!("[cex] 🏦 liq_id={} step=Withdraw", cex_state.liq_id);
-                    self.withdraw(&mut cex_state).await
-                }
-                CexStep::WithdrawPending => {
-                    info!("[cex] ⏳ liq_id={} step=WithdrawPending", cex_state.liq_id);
-                    self.withdraw(&mut cex_state).await
-                }
+            match cex_state.step {
                 CexStep::Completed => {
                     info!("[cex] 🎉 liq_id={} step=Completed", cex_state.liq_id);
-                    debug!("[cex] liq_id={} step=Completed (noop)", cex_state.liq_id);
                     break;
                 }
                 CexStep::Failed => {
@@ -344,7 +357,10 @@ impl Finalizer for dyn CexFinalizerLogic {
                     );
                     break;
                 }
-            };
+                step => debug!("[cex] liq_id={} step={step:?}", cex_state.liq_id),
+            }
+
+            let step_res = self.advance_current_step(&mut cex_state).await;
 
             // If the current leg failed, stop and handle retry / permanent fail below.
             if let Err(err) = step_res {
@@ -484,6 +500,10 @@ mod tests {
 
     #[async_trait]
     impl CexFinalizerLogic for DummyCexFinalizer {
+        fn venue_id(&self) -> &'static str {
+            "dummy"
+        }
+
         async fn prepare(&self, liq_id: &str, _receipt: &ExecutionReceipt) -> Result<CexState, String> {
             let pay = ChainToken::Icp {
                 ledger: Principal::anonymous(),
@@ -548,6 +568,7 @@ mod tests {
                     trade_pending_buy_mode: None,
                     trade_inverse_retry_count: 0,
                     trade_unexecutable_residual_in: None,
+                    trade_settlement_waiting_since_ts: None,
                 },
                 withdraw: CexWithdrawState {
                     withdraw_asset: recv,
@@ -572,7 +593,7 @@ mod tests {
             Ok(())
         }
 
-        async fn trade(&self, state: &mut CexState) -> Result<(), String> {
+        async fn trade(&self, state: &mut CexState) -> Result<(), CexBackendError> {
             let mut calls = self.trade_calls.lock().unwrap();
             *calls += 1;
 
@@ -617,7 +638,7 @@ mod tests {
             Ok(CexRoutePreview {
                 is_executable: true,
                 estimated_receive_amount: 0.0,
-                estimated_slippage_bps: 0.0,
+                estimated_price_impact_bps: 0.0,
                 reason: None,
             })
         }
@@ -630,6 +651,10 @@ mod tests {
 
     #[async_trait]
     impl CexFinalizerLogic for FailThenResumeFinalizer {
+        fn venue_id(&self) -> &'static str {
+            "test-cex"
+        }
+
         async fn prepare(&self, liq_id: &str, _receipt: &ExecutionReceipt) -> Result<CexState, String> {
             *self.prepare_calls.lock().unwrap() += 1;
 
@@ -696,6 +721,7 @@ mod tests {
                     trade_pending_buy_mode: None,
                     trade_inverse_retry_count: 0,
                     trade_unexecutable_residual_in: None,
+                    trade_settlement_waiting_since_ts: None,
                 },
                 withdraw: CexWithdrawState {
                     withdraw_asset: recv,
@@ -720,7 +746,7 @@ mod tests {
             Ok(())
         }
 
-        async fn trade(&self, state: &mut CexState) -> Result<(), String> {
+        async fn trade(&self, state: &mut CexState) -> Result<(), CexBackendError> {
             let mut calls = self.trade_calls.lock().unwrap();
             *calls += 1;
 
@@ -728,14 +754,14 @@ mod tests {
                 state.trade.trade_leg_index = Some(1);
                 state.trade.trade_leg_total = Some(2);
                 state.trade.trade_next_amount_in = Some(0.1234);
-                return Err("trade exploded once".to_string());
+                return Err("trade exploded once".into());
             }
 
             if state.trade.trade_leg_index != Some(1) {
-                return Err("expected persisted trade_leg_index=1 on retry".to_string());
+                return Err("expected persisted trade_leg_index=1 on retry".into());
             }
             if (state.trade.trade_next_amount_in.unwrap_or_default() - 0.1234).abs() > 1e-12 {
-                return Err("expected persisted trade_next_amount_in on retry".to_string());
+                return Err("expected persisted trade_next_amount_in on retry".into());
             }
 
             state.trade.trade_leg_index = Some(2);
@@ -770,7 +796,7 @@ mod tests {
             Ok(CexRoutePreview {
                 is_executable: true,
                 estimated_receive_amount: 0.0,
-                estimated_slippage_bps: 0.0,
+                estimated_price_impact_bps: 0.0,
                 reason: None,
             })
         }
@@ -815,6 +841,8 @@ mod tests {
             collateral_asset: pay_token.clone(),
             expected_profit: 0,
             ref_price: Nat::from(0u8),
+            debt_ref_price: Nat::from(0u8),
+            ref_price_at: 0,
             debt_approval_needed: false,
             min_collateral_amount: Nat::from(0u8),
         };
@@ -856,6 +884,7 @@ mod tests {
             finalizer_decision: None,
             profit_snapshot: None,
             venue_execution: None,
+            meta_v2: None,
         };
 
         let mut row = LiqResultRecord {
@@ -899,6 +928,7 @@ mod tests {
             finalizer_decision: None,
             profit_snapshot: None,
             venue_execution: None,
+            meta_v2: None,
         };
 
         let mut row = LiqResultRecord {
@@ -926,7 +956,7 @@ mod tests {
             .finalize(&wal, receipt.clone())
             .await
             .expect_err("first finalize should fail");
-        assert!(first_err.contains("trade exploded once"));
+        assert!(first_err.message().contains("trade exploded once"));
 
         assert_eq!(*prepare_calls.lock().unwrap(), 1);
         assert_eq!(*trade_calls.lock().unwrap(), 1);
@@ -1054,6 +1084,7 @@ mod tests {
             finalizer_decision: None,
             profit_snapshot: None,
             venue_execution: None,
+            meta_v2: None,
         };
 
         let mut row = LiqResultRecord {

@@ -1,0 +1,539 @@
+# Multi-Venue Swap Pipeline
+
+This document explains the production multi-venue swap-finalization pipeline.
+
+Venue eligibility is configured with an ordered list, for example `ENABLED_SWAP_VENUES=icpswap,mexc`. There is no CEX/DEX/Hybrid routing mode.
+
+## Goals
+
+The pipeline is designed to:
+
+- Quote every venue through one amount-scoped contract.
+- Keep allocation policy separate from exchange mechanics.
+- Split one seized-collateral amount into independently persisted venue legs.
+- Resume each leg safely after process restarts.
+- Add venues such as Kraken without changing the WAL schema or orchestrator.
+- Reject incompatible pre-isolation ICPSwap execution state instead of silently
+  changing its signing identity mid-flight.
+
+## Architecture at a Glance
+
+```text
+                         REPLACEABLE POLICY
+              +------------------------------------+
+              | icpswap_first                      |
+              | future best-price / balanced policy|
+              +------------------+-----------------+
+                                 |
+                                 v
++----------------------+   GENERIC MULTI-VENUE PIPELINE
+| Successful           |   +-------------------------------+
+| liquidation receipt  +-->| Allocation strategy           |
++----------------------+   |              |                |
+                           |              v                |
+                           | ENABLED_SWAP_VENUES             |
+                           |              |                |
+                           |              v                |
+                           |       Venue registry           |
+                           |        /     |      \          |
+                           |       /      |       \         |
+                           |      v       v        v        |
+                           | ICPSwap    MEXC    Kraken ...   |
+                           | adapter   adapter   adapter     |
+                           |              |                |
+                           |              v                |
+                           | MultiVenueExecutionState       |
+                           |              |                |
+                           |              v                |
+                           | WAL orchestrator               |
+                           |              |                |
+                           |              v                |
+                           | Result aggregator              |
+                           +--------------+----------------+
+                                          |
+                                          v
+                           Profit snapshots / export / logs / TUI
+```
+
+The generic layer only deals with venue IDs, requests, quotes, leg state, and progress. It must not contain exchange-specific branches such as `if venue == "mexc"`.
+
+## Layer Responsibilities
+
+| Layer | Knows about | Must not own |
+|---|---|---|
+| Allocation strategy | Business policy, impact limits, minimum edge, overflow ordering | Deposits, orders, withdrawals, bridges, WAL writes |
+| Venue registry | `venue_id -> MultiVenueAdapter` lookup and concurrent previews | Allocation policy |
+| Venue adapter | Exchange APIs, route discovery, price-impact calculation, venue-local recovery | Another venue's state or the parent WAL status |
+| WAL orchestrator | Plan commitment, leg ordering, persistence, restart precedence, parent outcome | ICPSwap pool math or MEXC order-book mechanics |
+| Result aggregator | Combining completed leg amounts and execution records | Routing or rerouting |
+
+This separation is what makes adding another exchange local: a Kraken adapter should not require changes to the persisted leg vector or WAL orchestration algorithm.
+
+## Unified Venue Contract
+
+Every exchange implements the same amount-scoped interface:
+
+```rust
+pub trait MultiVenueAdapter {
+    fn venue_id(&self) -> &'static str;
+
+    async fn preview(
+        &self,
+        context: &VenuePlanningContext,
+        request: &SwapRequest,
+    ) -> Result<VenueRoutePreview, String>;
+
+    async fn advance(
+        &self,
+        leg: &VenueLegState,
+        checkpoint: &dyn VenueLegCheckpoint,
+    ) -> Result<VenueLegProgress, String>;
+
+    async fn recover(
+        &self,
+        leg: &VenueLegState,
+        checkpoint: &dyn VenueLegCheckpoint,
+    ) -> Result<VenueLegProgress, String>;
+}
+```
+
+The boundary uses `ChainTokenAmount`. Exchange decimals, pool units, market symbols, order IDs, and bridge state stay inside the adapter.
+
+```text
+Allocation planner          Venue registry         Venue adapters
+        |                          |                       |
+        |-- preview(request) ----->|                       |
+        |                          |--+ ICPSwap.preview() ->| choose pool
+        |                          |  |                     | calculate X96 spot impact
+        |                          |  +<-- quote + state ---|
+        |                          |                       |
+        |                          |--+ MEXC.preview() ---->| resolve markets
+        |                          |  |                     | simulate order-book VWAP
+        |                          |  +<-- quote + state ---|
+        |                          |                       |
+        |<-- ordered quote book ---|                       |
+        |                          |                       |
+        | validate quotes and allocate exact amounts       |
+
+Strategy-selected venue subsets run concurrently. The common safe-ICPSwap path quotes ICPSwap first and avoids unnecessary exchange calls.
+```
+
+### Unified quote semantics
+
+`SwapQuote` exposes the same planning fields for all venues:
+
+- `mid_price`: the venue reference price before size impact.
+- `exec_price`: expected amount-scoped execution price.
+- `estimated_price_impact_bps`: adverse difference between reference and execution price.
+- `receive_amount`: estimated output in the receive asset's native units.
+- `legs`: venue route description for persistence and observability.
+
+ICPSwap derives the reference output from pool `sqrtPriceX96` metadata and compares it with the canister quote. MEXC derives its reference from the best order-book side and compares it with the simulated VWAP. Execution drift is tracked separately from planning-time price impact.
+
+## Current `icpswap_first` Policy
+
+The first strategy intentionally expresses Liquidium's routing policy rather than pretending every strategy is best-price routing.
+
+```text
+Actual collateral_received
+            |
+            v
+     Is input native ICP?
+        /           \
+      no             yes
+      |               |
+      v               v
+Overflow-only      Quote full amount
+venue plan         on ICPSwap
+                      |
+                      v
+              Impact below 100 bps?
+                  /          \
+                yes           no
+                |              |
+                v              v
+          All ICPSwap     Binary-search largest
+                          confirmed-safe amount
+                                |
+                                v
+                     Re-quote exact allocation
+                     and exact venue remainder
+                                |
+                                v
+                   Remainder meets CEX minimum?
+                         /              \
+                       yes               no
+                       |                  |
+                       v                  v
+               ICPSwap + overflow   Re-quote full ICPSwap
+                    split             /          \
+                                  safe          unsafe
+                                   |              |
+                                   v              v
+                            Full ICPSwap    Quote full overflow
+                                                   |
+                                           executable venue?
+                                             /           \
+                                           yes            no
+                                            |              |
+                                            v              v
+                                    Full best overflow  Reject route
+                       \                    /
+                        +---------+--------+
+                                |
+                                v
+                  Conservative edge >= 150 bps?
+                         /              \
+                       yes               no
+                       |                  |
+                       v                  v
+               Commit immutable plan   Reject route
+```
+
+Important policy rules:
+
+`ICPSWAP_TEST_ALLOCATION_USD` is an opt-in testing override and is unset by
+default. When set, the planner first forces approximately that USD value of the
+collateral to ICPSwap, then applies the normal allocation rules to the remaining
+amount. A forced ICPSwap allocation below $10 bypasses the oracle discount guard
+because fixed ledger fees dominate such a small leg. This waiver applies only
+to that forced leg; the remainder and all other venue safety checks stay active.
+
+1. Use actual `collateral_received`, not the estimated pre-liquidation amount.
+2. Only canonical native ICP is initially eligible for ICPSwap.
+3. ICPSwap receives the full amount while its quoted impact is below 100 bps.
+4. If the full quote is unsafe, search for the largest confirmed-safe ICPSwap allocation.
+5. Binary search is bounded to 16 iterations and retains the last safe lower bound.
+6. Exact final allocations are quoted again before commitment.
+7. When the remainder is below `CEX_MIN_EXEC_USD`, use a refreshed full ICPSwap quote when it is at or below `ICPSWAP_DUST_FALLBACK_MAX_PRICE_IMPACT_BPS` (150 bps by default); otherwise send the full amount to the best executable overflow venue or reject the route.
+8. A better MEXC price does not reduce the policy's ICPSwap allocation.
+9. The combined conservative output must satisfy the configured net-edge floor, currently 150 bps.
+10. Invalid venue previews are discarded; valid venues remain eligible.
+11. With ICPSwap alone, a full quote at or above 100 bps is rejected rather than forced.
+12. Without ICPSwap, the best executable enabled overflow venue receives the full amount.
+
+The strategy is replaceable. A future best-price strategy can make different allocation decisions while reusing the same adapters, persisted state, and orchestrator.
+
+## Persisted Model
+
+Multi-venue state is additive inside the existing `meta_json`; no SQLite schema migration is required.
+
+```text
+LiqMetaWrapper
+├── receipt
+├── meta                         legacy MEXC state
+├── venue_execution              legacy ICPSwap state
+└── meta_v2: FinalizerMetaV2?
+    ├── version: 2
+    ├── kind: multi_venue_swap
+    └── state: MultiVenueExecutionState
+        ├── plan: MultiVenueExecutionPlan
+        ├── outcome: MultiVenueExecutionOutcome
+        └── legs: Vec<VenueLegState>
+            ├── leg_id: String
+            ├── venue_id: String
+            ├── request: SwapRequest
+            ├── quote: VenueLegQuote
+            ├── execution: VenueExecutionState
+            ├── status: VenueLegStatus
+            ├── result: Option<SwapExecution>
+            └── last_error: Option<String>
+```
+
+Abbreviated structural example (not a complete deserializable fixture):
+
+```json
+{
+  "version": 2,
+  "kind": "multi_venue_swap",
+  "state": {
+    "plan": {
+      "strategy_id": "icpswap_first",
+      "allocation_reason": {
+        "reason": "price_impact_split"
+      }
+    },
+    "legs": [
+      {
+        "leg_id": "icpswap-0",
+        "venue_id": "icpswap",
+        "status": "planned"
+      },
+      {
+        "leg_id": "mexc-1",
+        "venue_id": "mexc",
+        "status": "planned"
+      }
+    ],
+    "outcome": {
+      "status": "running"
+    }
+  }
+}
+```
+
+The actual persisted legs also contain their complete request, quote, initialized venue state, optional result, and last error.
+
+### Persistence invariants
+
+- `version` must be supported.
+- `leg_id` must be non-empty and unique.
+- `venue_id` must be non-empty.
+- `VenueLegState.venue_id` must match `VenueExecutionState.venue`.
+- Leg pay allocations must sum exactly to `plan.total_pay`.
+- Committed allocations are immutable.
+- The initial `icpswap_first` strategy allows at most one leg per venue.
+- Failed legs are never automatically rerouted.
+
+## WAL Commitment and Execution
+
+The orchestrator owns the parent lifecycle. Venue adapters return progress but never write the WAL or mark the liquidation successful.
+
+```text
+Multi-venue orchestrator          SQLite WAL             Venue adapter
+          |                            |                       |
+          |-- load row -------------->|                       |
+          |<-- row + route metadata --|                       |
+          |                            |                       |
+          |  If no route is committed:                        |
+          |  build + validate plan                            |
+          |-- atomically persist plan and initialized legs -->|
+          |                            |                       |
+          |  For each leg in persisted vector order:          |
+          |-------------------------------- advance(leg) ----->|
+          |<---------------- state + status + result? ---------|
+          |-- persist transition ---->|                       |
+          |                            |                       |
+          |  All legs complete/recovered?                     |
+          |        yes: aggregate and mark parent successful  |
+          |        no:  keep parent row resumable             |
+          |  ambiguous custody: persist OperatorRequired      |
+```
+
+Restart state is loaded in this order:
+
+1. `meta_v2`
+2. Legacy `venue_execution`
+3. Legacy MEXC `meta`
+4. New planning only when no route has already been committed
+
+Legacy in-progress rows remain on their legacy execution path and are not upgraded in flight.
+
+## Venue Isolation
+
+Each persisted leg is an independent state machine:
+
+```text
+                         +----------------------------+
+                         | one venue-local transition |
+                         v                            |
+[start] --> Planned --> Running ----------------------+
+                         |
+                         +--> Completed         swap and custody complete
+                         +--> Recovered         funds confirmed recovered
+                         +--> OperatorRequired  custody is ambiguous
+                         +--> FailedPermanent   permanent venue-local failure
+```
+
+An adapter may:
+
+- Decode only its supplied leg.
+- Update only its venue-specific execution state.
+- Return a result only after its own leg completes.
+- Reconcile only its own deposit, order, withdrawal, bridge, or refund state.
+
+An adapter may not:
+
+- Modify another leg.
+- Change an allocation after commitment.
+- Select a fallback venue.
+- Mark the parent WAL row successful.
+
+### Per-liquidation ICPSwap identity
+
+Every newly planned ICPSwap leg derives a deterministic secp256k1 child
+principal from the configured mnemonic and the liquidation ID. The mnemonic and
+private key are never persisted; the WAL stores only the derivation scheme,
+liquidation ID, path, and derived principal.
+
+```text
+Configured mnemonic
+        |
+        v
+ICPSwap derivation namespace + liquidation ID
+        |
+        v
+Derived child principal
+        |
+        +-- shortage <-- funding trader ----+
+        |                                    |
+        +-- surplus --> trader recovery      |
+        |                                    v
+        |                         exact committed budget
+        |                                    |
+        |                                    v
+        |                         child ICPSwap deposit account
+        |                                    |
+        |                         deposit -> swap -> withdraw
+        |                                    |
+        +<-- recovery input ------------ child default account
+                                             |
+                                             +-- output balance --> request.receive_address
+```
+
+The child signs its own pool transfer, deposit, swap, withdrawal, and final
+forwarding transfer. Consequently, both the ICPSwap deposit account and pool
+balances are isolated per liquidation. Recovery forwards only the recorded
+input credit to the funding trader; successful settlement forwards only the
+recorded output credit to the request receiver. If that final transfer becomes
+ambiguous after aging out, the one-use child drains its current output balance,
+minus the ledger fee, to the same committed receiver.
+
+Before the pool transfer, funding normalizes the child account to the immutable
+committed budget. A shortage is topped up by exactly the missing amount. A
+surplus is durably transferred to the trader's recovery subaccount; surplus too
+small to pay its own ledger fee is recorded as residual dust and does not block
+the trade. This makes the isolated child balance sufficient evidence for aged
+funding reconciliation without requiring the shared trader account to remain
+unchanged.
+
+An aged final forwarding transfer also uses the isolated child as its source of
+truth. If its net debit is unexpected, the WAL retains the interrupted intent
+and observed amount, reads the child's actual current balance, and durably
+drains that balance to the original `request.receive_address`. It never infers
+a partial ICRC-1 transfer and never redirects swap output to the trader recovery
+account. A remaining balance too small to pay its forwarding fee parks only
+that isolated leg for operator fee funding.
+
+Funding and forwarding persist their exact `TransferArg`, timestamp, source
+balance baseline, and destination balance baseline before submission. A restart
+can therefore reconcile a lost response without inventing a second transfer.
+Before daemon startup, every unfinished ICPSwap leg is decoded and its persisted
+principal is re-derived from the configured mnemonic. If the identity cannot
+be reproduced, that WAL row is marked `Unresumable` with the exact reason and
+startup continues for unrelated liquidations.
+
+## Result Aggregation
+
+Downstream consumers continue to receive one `SwapExecution`. The aggregator will:
+
+- Sum all completed leg pay amounts.
+- Sum all completed leg receive amounts.
+- Concatenate execution legs in persisted venue-leg order.
+- Preserve the aggregate for profit snapshots, CSV exports, logs, and TUI output.
+
+One completed venue leg cannot close the parent row while another leg remains pending.
+
+## Adding Another Venue
+
+Adding Kraken should require the following work only:
+
+1. Implement `MultiVenueAdapter` with stable `venue_id = "kraken"`.
+2. Convert exact `SwapRequest` amounts into Kraken's internal decimal representation.
+3. Return the normalized `SwapQuote` and initialized tagged `VenueExecutionState`.
+4. Keep Kraken order IDs, deposits, withdrawals, and recovery state inside its leg.
+5. Add the adapter factory and supported venue ID to startup registration.
+6. Add `"kraken"` to `ENABLED_SWAP_VENUES` when it should receive new plans.
+7. Add adapter contract tests and restart-boundary tests.
+
+No change should be needed to:
+
+- `FinalizerMetaV2`
+- `MultiVenueExecutionState`
+- `Vec<VenueLegState>`
+- The generic WAL orchestrator
+- Aggregate result construction
+
+## Code Map
+
+| Responsibility | Location |
+|---|---|
+| Versioned persisted envelope and leg vector | `pipeline/src/persistance/finalizer_meta_v2/` |
+| Generic adapter contract | `pipeline/src/finalizers/multi_venue/contracts/multi_venue_adapter.rs` |
+| Venue registry and concurrent quote book | `pipeline/src/finalizers/multi_venue/planning/venue_registry.rs` |
+| `icpswap_first` allocation policy | `pipeline/src/finalizers/multi_venue/planning/icpswap_first_planner.rs` |
+| ICPSwap adapter | `pipeline/src/finalizers/icpswap/multi_venue_adapter.rs` |
+| MEXC adapter | `pipeline/src/finalizers/mexc/mexc_multi_venue_adapter.rs` |
+| MEXC amount-scoped preparation and quote support | `pipeline/src/finalizers/mexc/mexc_multi_venue_support.rs` |
+| Shared legacy and multi-venue MEXC route quote | `pipeline/src/finalizers/mexc/mexc_route_preview.rs` |
+| Existing MEXC CEX state machine | `pipeline/src/finalizers/mexc/mexc_finalizer.rs` |
+
+## Implementation Status
+
+| Stage | Status |
+|---|---|
+| Versioned `meta_v2` data model | Implemented |
+| Generic venue contract and registry | Implemented |
+| Pure `icpswap_first` allocation planner | Implemented |
+| ICPSwap adapter | Implemented |
+| MEXC adapter | Implemented |
+| Generic multi-venue WAL orchestrator | Implemented |
+| Aggregate result and legacy router removal | Implemented |
+| Enabled-venue runtime selection | Implemented |
+| Restart-boundary and full compatibility verification | Implemented |
+
+## Rollout and Rollback
+
+- No SQLite migration is required because `meta_v2` is stored inside existing JSON metadata.
+- Older binaries do not understand the operational meaning of active `meta_v2` rows and cannot safely continue them.
+- Before rolling back to a binary that does not understand `meta_v2`, drain or manually recover all active multi-venue rows.
+- If an unfinished committed leg references a disabled venue, or its persisted
+  execution identity cannot be reproduced, startup marks that WAL row
+  `Unresumable`, logs a warning, and continues processing unrelated rows. The
+  row stays visible in Executions and is excluded from automatic polling.
+- Re-enabling the venue or correcting the identity configuration does not
+  silently replay an `Unresumable` row. Inspect it first, then explicitly
+  re-enqueue it when recovery is safe.
+- A binary without the isolated-principal ICPSwap state cannot safely resume
+  these legs. Drain or manually recover every active ICPSwap leg before rolling
+  back to an older binary.
+
+### Upgrading from a pre-multi-venue binary
+
+The multi-venue finalizer refuses to continue a legacy in-flight execution: a
+row carrying legacy MEXC `meta`, a legacy `venue_execution`, or a `dex`/`cex`
+`finalizer_decision` is failed permanently rather than resumed on a state
+machine that no longer exists. That is the safe outcome, but it strands
+whatever the legacy execution was holding, possibly on the exchange.
+
+**Drain before cutover.** Pause the old binary, let the finalizer run until no
+row is `Enqueued`, `InFlight`, or `FailedRetryable`, then deploy. Do not cut
+over while legacy swaps are in flight.
+
+Note also that `SWAPPER` is ignored by this binary and `ENABLED_SWAP_VENUES`
+defaults to `icpswap,mexc`. A CEX-only deployment that upgrades without editing
+its config will start routing ICP collateral through ICPSwap. Set
+`ENABLED_SWAP_VENUES=mexc` explicitly for a behavior-preserving first deploy.
+
+## Rows Outside the Runnable Queue
+
+`OperatorRequired` and `FailedPermanent` are both excluded from pending
+selection, so nothing in the daemon moves such a row again. Two paths lead there
+while a venue may still hold funds:
+
+- A venue reports ambiguous custody and parks its leg. The orchestrator raises
+  an `OperatorRequired` alert on that transition.
+- The finalize stage's retry budget runs out while a leg is past `Planned`. The
+  error carries a custody tag so this parks the row instead of failing it
+  permanently, which would have removed the custody from every queue with
+  nothing tracking it.
+
+A parked row produces no finalized outcome, so it appears in neither the CSV
+export nor the liquidation-finalized notification. Both park paths therefore
+raise their own `OperatorRequired` alert; a park is never log-only.
+
+> **Open item:** there is currently no supported command to return a parked row
+> to the queue; doing so requires editing the WAL by hand. An operator recovery
+> command is tracked separately.
+
+### ICPSwap concurrency
+
+The active multi-venue ICPSwap adapter no longer needs a venue-wide owner lock.
+The parent has one WAL writer, and every leg has a different derived principal,
+deposit account, and pool balance. An `OperatorRequired` leg therefore parks
+only its own liquidation and cannot take ICPSwap offline for later rows.
+
+The standalone ICPSwap entrypoint follows the same model. The old WAL/SQLite
+owner-lock machinery has been removed; existing databases may retain an unused
+`icpswap_execution_locks` table, but this binary never reads or writes it and
+new databases no longer create it.

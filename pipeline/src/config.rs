@@ -6,8 +6,8 @@ use icrc_ledger_types::icrc1::account::Account;
 use liquidium_pipeline_commons::env::config_dir;
 use liquidium_pipeline_connectors::account::icp_account::{RECOVERY_ACCOUNT, derive_icp_identity};
 use liquidium_pipeline_connectors::crypto::derivation::{derive_btc_p2tr_address, derive_evm_private_key};
-use log::debug;
-use std::collections::HashMap;
+use log::{debug, warn};
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::sync::Arc;
 
@@ -20,20 +20,10 @@ fn expand_tilde(p: &str) -> std::path::PathBuf {
     std::path::PathBuf::from(p)
 }
 
-/// Runtime swapper mode used by strategy/finalization routing.
-///
-/// `Dex` and `Hybrid` are intentionally retained for backward compatibility with
-/// historical WAL/meta values and for potential future re-enablement.
-/// TODO(PIPE-154, target 2026-06): remove legacy variants once migration cleanup is complete.
-#[allow(dead_code)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SwapperMode {
-    Dex,
-    Cex,
-    Hybrid,
-}
-
 pub struct Config {
+    /// Mnemonic retained only for deterministic, per-liquidation ICPSwap
+    /// session derivation. It is never serialized or logged.
+    pub(crate) icpswap_mnemonic: Arc<str>,
     pub liquidator_identity: Arc<dyn Identity>,
     pub trader_identity: Arc<dyn Identity>,
     pub bridge_ic_identity: Arc<dyn Identity>,
@@ -72,22 +62,43 @@ pub struct Config {
     pub cex_retry_base_secs: u64,
     /// Maximum retry delay cap, in seconds.
     pub cex_retry_max_secs: u64,
-    /// Minimum projected net edge required to execute, in bps.
-    pub cex_min_net_edge_bps: u32,
+    /// Minimum projected net edge required for any multi-venue plan, in bps.
+    pub multi_venue_min_net_edge_bps: u32,
+    /// Signed edge floor used only for bad-debt liquidations. See
+    /// `parse_multi_venue_bad_debt_min_net_edge_bps_from_env`.
+    pub multi_venue_bad_debt_min_net_edge_bps: i32,
+    /// Maximum downside from the oracle-implied output allowed for any venue
+    /// quote, in bps. Applied centrally after venue quote normalization.
+    pub multi_venue_max_oracle_discount_bps: u32,
+    /// How old a recorded price may be, in seconds, before the venue quote guard
+    /// stops using it as a fallback for a live oracle read.
+    pub multi_venue_oracle_snapshot_max_age_secs: i64,
     /// Extra safety haircut for price-move risk during execution latency, in bps.
     pub cex_delay_buffer_bps: u32,
     /// Route fee estimate in bps subtracted from projected edge.
     pub cex_route_fee_bps: u32,
-    /// Reserved for hybrid mode force-over-threshold behavior.
-    /// Hybrid mode is currently disabled.
-    pub cex_force_over_usd_threshold: f64,
     /// Configured MEXC market universe for hop-based route discovery.
     /// Markets are normalized as `BASE_QUOTE`.
     pub cex_mexc_available_pairs: Vec<String>,
     /// Maximum intermediate hops allowed for MEXC route discovery.
     /// Example: `2` allows up to 3 legs total.
     pub cex_mexc_max_hops: u8,
-    pub swapper: SwapperMode,
+    pub icpswap_factory_canister: Principal,
+    pub icpswap_fee_tiers: Vec<candid::Nat>,
+    /// Highest ICPSwap price impact an allocation may carry, in bps. The limit is
+    /// strict: an allocation quoted exactly at it is rejected.
+    pub icpswap_max_price_impact_bps: f64,
+    /// Iteration budget for the planner's binary search for the largest safe
+    /// ICPSwap allocation. Each iteration costs one pool quote.
+    pub icpswap_max_search_iterations: u8,
+    /// Higher ICPSwap impact cap used only when an overflow remainder is below
+    /// the venue minimum and the planner considers sending the full amount DEX-side.
+    pub icpswap_dust_fallback_max_price_impact_bps: f64,
+    /// Test-only fixed USD allocation sent to ICPSwap before routing the
+    /// remainder to an overflow venue. Unset preserves the normal policy.
+    pub icpswap_test_allocation_usd: Option<f64>,
+    /// Ordered venue IDs eligible for new multi-venue plans.
+    pub enabled_swap_venues: Vec<String>,
     pub cex_credentials: HashMap<String, (String, String)>,
     pub opportunity_account_filter: Vec<Principal>,
 }
@@ -109,17 +120,14 @@ pub trait ConfigTrait: Send + Sync {
     fn get_cex_buy_inverse_enabled(&self) -> bool;
     fn get_cex_retry_base_secs(&self) -> u64;
     fn get_cex_retry_max_secs(&self) -> u64;
-    fn get_cex_min_net_edge_bps(&self) -> u32;
     fn get_cex_delay_buffer_bps(&self) -> u32;
     fn get_cex_route_fee_bps(&self) -> u32;
-    fn get_cex_force_over_usd_threshold(&self) -> f64;
     fn get_cex_mexc_available_pairs(&self) -> Vec<String>;
     fn get_cex_mexc_max_hops(&self) -> u8;
     #[allow(dead_code)]
     fn get_lending_canister(&self) -> Principal;
     #[allow(dead_code)]
     fn get_recovery_account(&self) -> Account;
-    fn get_swapper_mode(&self) -> SwapperMode;
     fn get_cex_credentials(&self, cex: &str) -> Result<(String, String), String>;
 }
 
@@ -191,10 +199,6 @@ impl ConfigTrait for Config {
         self.cex_retry_max_secs
     }
 
-    fn get_cex_min_net_edge_bps(&self) -> u32 {
-        self.cex_min_net_edge_bps
-    }
-
     fn get_cex_delay_buffer_bps(&self) -> u32 {
         self.cex_delay_buffer_bps
     }
@@ -203,20 +207,12 @@ impl ConfigTrait for Config {
         self.cex_route_fee_bps
     }
 
-    fn get_cex_force_over_usd_threshold(&self) -> f64 {
-        self.cex_force_over_usd_threshold
-    }
-
     fn get_cex_mexc_available_pairs(&self) -> Vec<String> {
         self.cex_mexc_available_pairs.clone()
     }
 
     fn get_cex_mexc_max_hops(&self) -> u8 {
         self.cex_mexc_max_hops
-    }
-
-    fn get_swapper_mode(&self) -> SwapperMode {
-        self.swapper
     }
 
     fn get_cex_credentials(&self, cex: &str) -> Result<(String, String), String> {
@@ -309,31 +305,35 @@ impl Config {
         } else {
             bridge_cketh_minter_canister_text
         };
-        
+
         let bridge_cketh_minter_canister = Principal::from_text(&bridge_cketh_minter_canister_text).map_err(|e| {
             format!(
                 "invalid BRIDGE_CKETH_MINTER_CANISTER principal '{}': {e}",
                 bridge_cketh_minter_canister_text
             )
         })?;
-        let max_allowed_dex_slippage: u32 = std::env::var("MAX_ALLOWED_DEX_SLIPPAGE")
-            .or_else(|_| std::env::var("MAX_ALLOWED_SLIPPAGE_BPS"))
-            .ok()
-            .and_then(|v| v.parse::<u32>().ok())
-            .unwrap_or(125); // default 1.25%
-
-        let max_allowed_cex_slippage_bps: u32 = std::env::var("MAX_ALLOWED_CEX_SLIPPAGE_BPS")
-            .or_else(|_| std::env::var("MAX_ALLOWED_SLIPPAGE_BPS"))
-            .ok()
-            .and_then(|v| v.parse::<u32>().ok())
-            .unwrap_or(200);
+        let max_allowed_dex_slippage =
+            parse_slippage_bps_from_env("MAX_ALLOWED_DEX_SLIPPAGE", DEFAULT_MAX_ALLOWED_DEX_SLIPPAGE_BPS)?;
+        let max_allowed_cex_slippage_bps =
+            parse_slippage_bps_from_env("MAX_ALLOWED_CEX_SLIPPAGE_BPS", DEFAULT_MAX_ALLOWED_CEX_SLIPPAGE_BPS)?;
 
         let bad_debt_collateral_slippage_bps = parse_bad_debt_collateral_slippage_bps_from_env();
         let cex_tunables = parse_cex_tunables_from_env();
         let cex_mexc_available_pairs = parse_cex_mexc_available_pairs_from_env();
         let cex_mexc_max_hops = parse_cex_mexc_max_hops_from_env();
+        let icpswap_factory_canister = parse_icpswap_factory_from_env()?;
+        let icpswap_fee_tiers = parse_icpswap_fee_tiers_from_env()?;
+        let icpswap_test_allocation_usd = parse_icpswap_test_allocation_usd_from_env()?;
+        if let Some(value) = icpswap_test_allocation_usd {
+            warn!(
+                "TEST-ONLY ICPSwap split is enabled: approximately ${value:.2} goes to ICPSwap and the remainder to MEXC"
+            );
+        }
 
-        let swapper = parse_swapper_mode_from_env()?;
+        let enabled_swap_venues = parse_enabled_swap_venues_from_env()?;
+        if let Ok(legacy) = env::var("SWAPPER") {
+            warn!("SWAPPER={} is ignored; configure ENABLED_SWAP_VENUES instead", legacy);
+        }
 
         debug!("Loading cex credentials...");
         let cex_credentials = load_cex_credentials();
@@ -359,6 +359,7 @@ impl Config {
         let evm_rpc_url = env::var("EVM_RPC_URL").map_err(|_| "EVM_RPC_URL not configured".to_string())?;
 
         Ok(Arc::new(Config {
+            icpswap_mnemonic: Arc::from(mnemonic),
             evm_private_key,
             evm_rpc_url,
             bridge_evm_private_key,
@@ -387,13 +388,21 @@ impl Config {
             cex_buy_inverse_enabled: cex_tunables.buy_inverse_enabled,
             cex_retry_base_secs: cex_tunables.retry_base_secs,
             cex_retry_max_secs: cex_tunables.retry_max_secs,
-            cex_min_net_edge_bps: cex_tunables.min_net_edge_bps,
+            multi_venue_min_net_edge_bps: parse_multi_venue_min_net_edge_bps_from_env(),
+            multi_venue_bad_debt_min_net_edge_bps: parse_multi_venue_bad_debt_min_net_edge_bps_from_env(),
+            multi_venue_max_oracle_discount_bps: parse_multi_venue_max_oracle_discount_bps_from_env(),
+            multi_venue_oracle_snapshot_max_age_secs: parse_multi_venue_oracle_snapshot_max_age_secs_from_env(),
             cex_delay_buffer_bps: cex_tunables.delay_buffer_bps,
             cex_route_fee_bps: cex_tunables.route_fee_bps,
-            cex_force_over_usd_threshold: cex_tunables.force_over_usd_threshold,
             cex_mexc_available_pairs,
             cex_mexc_max_hops,
-            swapper,
+            icpswap_factory_canister,
+            icpswap_fee_tiers,
+            icpswap_max_price_impact_bps: parse_icpswap_max_price_impact_bps_from_env(),
+            icpswap_max_search_iterations: parse_icpswap_max_search_iterations_from_env(),
+            icpswap_dust_fallback_max_price_impact_bps: parse_icpswap_dust_fallback_max_price_impact_bps_from_env(),
+            icpswap_test_allocation_usd,
+            enabled_swap_venues,
             cex_credentials,
             opportunity_account_filter,
         }))
@@ -434,13 +443,11 @@ struct CexTunables {
     buy_inverse_enabled: bool,
     retry_base_secs: u64,
     retry_max_secs: u64,
-    min_net_edge_bps: u32,
     delay_buffer_bps: u32,
     route_fee_bps: u32,
-    force_over_usd_threshold: f64,
 }
 
-const DEFAULT_CEX_MIN_EXEC_USD: f64 = 1.1;
+const DEFAULT_CEX_MIN_EXEC_USD: f64 = 8.0;
 const DEFAULT_CEX_SLICE_TARGET_RATIO: f64 = 0.7;
 const DEFAULT_CEX_BUY_TRUNCATION_TRIGGER_RATIO: f64 = 0.25;
 const DEFAULT_CEX_BUY_INVERSE_OVERSPEND_BPS: u32 = 10;
@@ -450,10 +457,14 @@ const MAX_CEX_BUY_INVERSE_MAX_RETRIES: u32 = 3;
 const DEFAULT_CEX_BUY_INVERSE_ENABLED: bool = true;
 const DEFAULT_CEX_RETRY_BASE_SECS: u64 = 5;
 const DEFAULT_CEX_RETRY_MAX_SECS: u64 = 120;
-const DEFAULT_CEX_MIN_NET_EDGE_BPS: u32 = 150;
+const DEFAULT_MULTI_VENUE_MIN_NET_EDGE_BPS: u32 = 150;
+/// Bad debt may return this much less than it repaid and still be recycled
+/// automatically; anything further underwater is escalated to an operator.
+const DEFAULT_MULTI_VENUE_BAD_DEBT_MIN_NET_EDGE_BPS: i32 = -500;
+const DEFAULT_MULTI_VENUE_MAX_ORACLE_DISCOUNT_BPS: u32 = 500;
+const DEFAULT_MULTI_VENUE_ORACLE_SNAPSHOT_MAX_AGE_SECS: i64 = 300;
 const DEFAULT_CEX_DELAY_BUFFER_BPS: u32 = 75;
 const DEFAULT_CEX_ROUTE_FEE_BPS: u32 = 25;
-const DEFAULT_CEX_FORCE_OVER_USD_THRESHOLD: f64 = 12.5;
 const DEFAULT_CEX_MEXC_MAX_HOPS: u8 = 2;
 const MAX_CEX_MEXC_MAX_HOPS: u8 = 4;
 const DEFAULT_BAD_DEBT_COLLATERAL_SLIPPAGE_BPS: u32 = 500;
@@ -466,6 +477,61 @@ const BRIDGE_EVM_INDEX: u32 = 0;
 const BRIDGE_ICP_INDEX: u32 = 1;
 const BRIDGE_BTC_INDEX: u32 = 0;
 const DEFAULT_BRIDGE_CKETH_MINTER_CANISTER: &str = "sv3dd-oaaaa-aaaar-qacoa-cai";
+pub const DEFAULT_ICPSWAP_FACTORY_CANISTER: &str = "4mmnk-kiaaa-aaaag-qbllq-cai";
+const DEFAULT_ICPSWAP_FEE_TIERS: &str = "100,500,3000,10000";
+const DEFAULT_ICPSWAP_MAX_PRICE_IMPACT_BPS: f64 = 100.0;
+const DEFAULT_ICPSWAP_DUST_FALLBACK_MAX_PRICE_IMPACT_BPS: f64 = 150.0;
+const DEFAULT_ICPSWAP_MAX_SEARCH_ITERATIONS: u8 = 16;
+const DEFAULT_ENABLED_SWAP_VENUES: &str = "icpswap,mexc";
+const SUPPORTED_SWAP_VENUES: [&str; 2] = ["icpswap", "mexc"];
+
+fn parse_multi_venue_min_net_edge_bps_from_env() -> u32 {
+    env::var("MULTI_VENUE_MIN_NET_EDGE_BPS")
+        .or_else(|_| env::var("CEX_MIN_NET_EDGE_BPS"))
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok())
+        .unwrap_or(DEFAULT_MULTI_VENUE_MIN_NET_EDGE_BPS)
+        .min(MAX_BPS)
+}
+
+/// Edge floor for collateral bought as bad debt, which repays more than the
+/// collateral is worth by construction.
+///
+/// It mirrors `MULTI_VENUE_MIN_NET_EDGE_BPS` in sign, not in value: a
+/// profitable liquidation must clear the debt by 150 bps, while bad debt may
+/// fall short of it by 150 bps and still be recycled without a human. Anything
+/// further underwater is escalated instead of sold automatically.
+///
+/// Deliberately a constant rather than the negation of the profitable floor:
+/// raising the profit bar is a tightening, and must not silently widen how much
+/// loss the swap-back will accept. The quote is priced against the oracle
+/// regardless, so this governs recycling, never fill quality.
+fn parse_multi_venue_bad_debt_min_net_edge_bps_from_env() -> i32 {
+    let limit = i32::try_from(MAX_BPS).unwrap_or(i32::MAX);
+    env::var("MULTI_VENUE_BAD_DEBT_MIN_NET_EDGE_BPS")
+        .ok()
+        .and_then(|value| value.parse::<i32>().ok())
+        .filter(|bps| *bps >= -limit && *bps <= limit)
+        .unwrap_or(DEFAULT_MULTI_VENUE_BAD_DEBT_MIN_NET_EDGE_BPS)
+}
+
+/// A discount of `MAX_BPS` accepts any output at all, so out-of-range values
+/// fall back to the default instead of being clamped into disabling the guard.
+fn parse_multi_venue_max_oracle_discount_bps_from_env() -> u32 {
+    env::var("MULTI_VENUE_MAX_ORACLE_DISCOUNT_BPS")
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok())
+        .filter(|value| *value < MAX_BPS)
+        .unwrap_or(DEFAULT_MULTI_VENUE_MAX_ORACLE_DISCOUNT_BPS)
+}
+
+fn parse_multi_venue_oracle_snapshot_max_age_secs_from_env() -> i64 {
+    env::var("MULTI_VENUE_ORACLE_SNAPSHOT_MAX_AGE_SECS")
+        .ok()
+        .and_then(|value| value.parse::<i64>().ok())
+        .filter(|value| *value >= 0)
+        .unwrap_or(DEFAULT_MULTI_VENUE_ORACLE_SNAPSHOT_MAX_AGE_SECS)
+}
 
 fn parse_bad_debt_collateral_slippage_bps_from_env() -> u32 {
     env::var("BAD_DEBT_COLLATERAL_SLIPPAGE_BPS")
@@ -475,16 +541,162 @@ fn parse_bad_debt_collateral_slippage_bps_from_env() -> u32 {
         .unwrap_or(DEFAULT_BAD_DEBT_COLLATERAL_SLIPPAGE_BPS)
 }
 
-fn parse_swapper_mode_from_env() -> Result<SwapperMode, String> {
-    let swapper_raw = env::var("SWAPPER").unwrap_or_else(|_| "cex".to_string());
-    match swapper_raw.trim().to_lowercase().as_str() {
-        "" => Ok(SwapperMode::Cex),
-        "cex" => Ok(SwapperMode::Cex),
-        other => Err(format!(
-            "SWAPPER='{}' is unsupported; only SWAPPER=cex is currently supported",
-            other
-        )),
+/// Ceiling for any configured slippage allowance. These values become on-chain
+/// `amount_out_minimum` floors, so a fat-fingered order of magnitude is the
+/// difference between a 1.25% cap and effectively none at all.
+const MAX_CONFIGURABLE_SLIPPAGE_BPS: u32 = 2_000;
+const DEFAULT_MAX_ALLOWED_DEX_SLIPPAGE_BPS: u32 = 125;
+const DEFAULT_MAX_ALLOWED_CEX_SLIPPAGE_BPS: u32 = 200;
+
+/// Reads a basis-point slippage allowance, falling back to the shared
+/// `MAX_ALLOWED_SLIPPAGE_BPS` and then to `default_bps`.
+///
+/// A *set but unparseable* value is an error rather than a silent fallback:
+/// `"1.25"` or `"0.5%"` are natural ways to write this, and quietly substituting
+/// the default would leave an operator believing they had tightened a cap they
+/// had in fact left at its default.
+fn parse_slippage_bps_from_env(primary: &str, default_bps: u32) -> Result<u32, String> {
+    const SHARED: &str = "MAX_ALLOWED_SLIPPAGE_BPS";
+    // An empty or whitespace-only value counts as unset, so `FOO=` in an env
+    // file falls through to the shared cap rather than short-circuiting to the
+    // default the operator was trying to override.
+    let read = |name: &str| {
+        env::var(name)
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+    };
+    let Some((name, trimmed)) = read(primary)
+        .map(|value| (primary, value))
+        .or_else(|| read(SHARED).map(|value| (SHARED, value)))
+    else {
+        return Ok(default_bps);
+    };
+
+    let parsed: u32 = trimmed
+        .parse()
+        .map_err(|_| format!("{name}='{trimmed}' is not a whole number of basis points (e.g. 125 for 1.25%)"))?;
+    if parsed > MAX_CONFIGURABLE_SLIPPAGE_BPS {
+        return Err(format!(
+            "{name}={parsed} exceeds the maximum {MAX_CONFIGURABLE_SLIPPAGE_BPS} bps allowed for a slippage cap"
+        ));
     }
+    Ok(parsed)
+}
+
+fn parse_enabled_swap_venues_from_env() -> Result<Vec<String>, String> {
+    let raw = env::var("ENABLED_SWAP_VENUES").unwrap_or_else(|_| DEFAULT_ENABLED_SWAP_VENUES.to_string());
+    let mut seen = HashSet::new();
+    let mut venues = Vec::new();
+
+    for entry in raw.split(',') {
+        let venue_id = entry.trim().to_ascii_lowercase();
+        if venue_id.is_empty() {
+            return Err("ENABLED_SWAP_VENUES contains an empty venue ID".to_string());
+        }
+        if !SUPPORTED_SWAP_VENUES.contains(&venue_id.as_str()) {
+            return Err(format!(
+                "ENABLED_SWAP_VENUES contains unsupported venue `{venue_id}`; expected one of {}",
+                SUPPORTED_SWAP_VENUES.join(", ")
+            ));
+        }
+        if !seen.insert(venue_id.clone()) {
+            return Err(format!("ENABLED_SWAP_VENUES contains duplicate venue `{venue_id}`"));
+        }
+        venues.push(venue_id);
+    }
+
+    if venues.is_empty() {
+        return Err("ENABLED_SWAP_VENUES must enable at least one venue".to_string());
+    }
+    Ok(venues)
+}
+
+pub(crate) fn parse_icpswap_factory_from_env() -> Result<Principal, String> {
+    let raw = env::var("ICPSWAP_FACTORY_CANISTER").unwrap_or_else(|_| DEFAULT_ICPSWAP_FACTORY_CANISTER.to_string());
+    let trimmed = raw.trim();
+    Principal::from_text(trimmed)
+        .map_err(|error| format!("invalid ICPSWAP_FACTORY_CANISTER principal '{trimmed}': {error}"))
+}
+
+/// Mirrors `IcpswapFirstPlannerConfig::validate`: a non-finite or non-positive
+/// limit would be rejected by the planner constructor, so an unusable override
+/// falls back to the default instead of failing startup.
+fn parse_icpswap_max_price_impact_bps_from_env() -> f64 {
+    env::var("ICPSWAP_MAX_PRICE_IMPACT_BPS")
+        .ok()
+        .and_then(|value| value.trim().parse::<f64>().ok())
+        .filter(|value| value.is_finite() && *value > 0.0)
+        .unwrap_or(DEFAULT_ICPSWAP_MAX_PRICE_IMPACT_BPS)
+}
+
+/// The planner rejects a zero iteration budget, so zero falls back to the
+/// default rather than producing an unconstructable planner.
+fn parse_icpswap_max_search_iterations_from_env() -> u8 {
+    env::var("ICPSWAP_MAX_SEARCH_ITERATIONS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u8>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_ICPSWAP_MAX_SEARCH_ITERATIONS)
+}
+
+fn parse_icpswap_dust_fallback_max_price_impact_bps_from_env() -> f64 {
+    env::var("ICPSWAP_DUST_FALLBACK_MAX_PRICE_IMPACT_BPS")
+        .ok()
+        .and_then(|value| value.trim().parse::<f64>().ok())
+        .filter(|value| value.is_finite() && *value > 0.0)
+        .unwrap_or(DEFAULT_ICPSWAP_DUST_FALLBACK_MAX_PRICE_IMPACT_BPS)
+}
+
+fn parse_icpswap_test_allocation_usd_from_env() -> Result<Option<f64>, String> {
+    let Ok(raw) = env::var("ICPSWAP_TEST_ALLOCATION_USD") else {
+        return Ok(None);
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    let value = trimmed
+        .parse::<f64>()
+        .map_err(|_| format!("ICPSWAP_TEST_ALLOCATION_USD='{trimmed}' must be a positive USD amount"))?;
+    if !value.is_finite() || value <= 0.0 {
+        return Err(format!(
+            "ICPSWAP_TEST_ALLOCATION_USD='{trimmed}' must be finite and positive"
+        ));
+    }
+    Ok(Some(value))
+}
+
+pub(crate) fn parse_icpswap_fee_tiers_from_env() -> Result<Vec<candid::Nat>, String> {
+    let raw = env::var("ICPSWAP_FEE_TIERS").unwrap_or_else(|_| DEFAULT_ICPSWAP_FEE_TIERS.to_string());
+    parse_icpswap_fee_tiers(&raw)
+}
+
+fn parse_icpswap_fee_tiers(raw: &str) -> Result<Vec<candid::Nat>, String> {
+    let mut tiers = raw
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| {
+            value
+                .parse::<u32>()
+                .map_err(|error| format!("invalid ICPSWAP fee tier '{value}': {error}"))
+                .and_then(|fee| {
+                    if fee == 0 {
+                        Err("ICPSWAP fee tiers must be greater than zero".to_string())
+                    } else {
+                        Ok(candid::Nat::from(fee))
+                    }
+                })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    tiers.sort();
+    tiers.dedup();
+    if tiers.is_empty() {
+        return Err("ICPSWAP_FEE_TIERS must contain at least one positive integer".to_string());
+    }
+    Ok(tiers)
 }
 
 fn normalize_cex_market_pair(raw: &str) -> Option<String> {
@@ -579,11 +791,6 @@ fn parse_cex_tunables_from_env() -> CexTunables {
         .unwrap_or(DEFAULT_CEX_RETRY_MAX_SECS)
         .max(retry_base_secs);
 
-    let min_net_edge_bps = env::var("CEX_MIN_NET_EDGE_BPS")
-        .ok()
-        .and_then(|v| v.parse::<u32>().ok())
-        .unwrap_or(DEFAULT_CEX_MIN_NET_EDGE_BPS);
-
     let delay_buffer_bps = env::var("CEX_DELAY_BUFFER_BPS")
         .ok()
         .and_then(|v| v.parse::<u32>().ok())
@@ -594,12 +801,6 @@ fn parse_cex_tunables_from_env() -> CexTunables {
         .and_then(|v| v.parse::<u32>().ok())
         .unwrap_or(DEFAULT_CEX_ROUTE_FEE_BPS);
 
-    let force_over_usd_threshold = env::var("CEX_FORCE_OVER_USD_THRESHOLD")
-        .ok()
-        .and_then(|v| v.parse::<f64>().ok())
-        .filter(|v| *v >= MIN_RATIO)
-        .unwrap_or(DEFAULT_CEX_FORCE_OVER_USD_THRESHOLD);
-
     CexTunables {
         min_exec_usd,
         slice_target_ratio,
@@ -609,10 +810,8 @@ fn parse_cex_tunables_from_env() -> CexTunables {
         buy_inverse_enabled,
         retry_base_secs,
         retry_max_secs,
-        min_net_edge_bps,
         delay_buffer_bps,
         route_fee_bps,
-        force_over_usd_threshold,
     }
 }
 
@@ -636,10 +835,13 @@ mod tests {
             "CEX_BUY_INVERSE_ENABLED",
             "CEX_RETRY_BASE_SECS",
             "CEX_RETRY_MAX_SECS",
+            "MULTI_VENUE_MIN_NET_EDGE_BPS",
+            "MULTI_VENUE_BAD_DEBT_MIN_NET_EDGE_BPS",
             "CEX_MIN_NET_EDGE_BPS",
+            "MULTI_VENUE_MAX_ORACLE_DISCOUNT_BPS",
+            "MULTI_VENUE_ORACLE_SNAPSHOT_MAX_AGE_SECS",
             "CEX_DELAY_BUFFER_BPS",
             "CEX_ROUTE_FEE_BPS",
-            "CEX_FORCE_OVER_USD_THRESHOLD",
             "CEX_MEXC_AVAILABLE_PAIRS",
             "CEX_MEXC_MAX_HOPS",
             "BAD_DEBT_COLLATERAL_SLIPPAGE_BPS",
@@ -652,7 +854,7 @@ mod tests {
         assert_eq!(
             parsed,
             CexTunables {
-                min_exec_usd: 1.1,
+                min_exec_usd: 8.0,
                 slice_target_ratio: 0.7,
                 buy_truncation_trigger_ratio: 0.25,
                 buy_inverse_overspend_bps: 10,
@@ -660,12 +862,33 @@ mod tests {
                 buy_inverse_enabled: true,
                 retry_base_secs: 5,
                 retry_max_secs: 120,
-                min_net_edge_bps: 150,
                 delay_buffer_bps: 75,
                 route_fee_bps: 25,
-                force_over_usd_threshold: 12.5,
             }
         );
+        assert_eq!(parse_multi_venue_min_net_edge_bps_from_env(), 150);
+        // The same 150 bps, mirrored: a profitable liquidation must clear the
+        // debt by that much, bad debt may fall short of it by that much.
+        assert_eq!(parse_multi_venue_bad_debt_min_net_edge_bps_from_env(), -500);
+        assert_eq!(parse_multi_venue_oracle_snapshot_max_age_secs_from_env(), 300);
+    }
+
+    #[test]
+    fn bad_debt_edge_floor_accepts_negatives_and_rejects_out_of_range() {
+        let _guard = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+
+        unsafe { env::set_var("MULTI_VENUE_BAD_DEBT_MIN_NET_EDGE_BPS", "-6000") };
+        assert_eq!(parse_multi_venue_bad_debt_min_net_edge_bps_from_env(), -6000);
+
+        // Beyond ±10000 the floor would stop meaning anything, so a bad value
+        // falls back to the default instead of silently disabling the check.
+        unsafe { env::set_var("MULTI_VENUE_BAD_DEBT_MIN_NET_EDGE_BPS", "-20000") };
+        assert_eq!(parse_multi_venue_bad_debt_min_net_edge_bps_from_env(), -500);
+
+        unsafe { env::set_var("MULTI_VENUE_BAD_DEBT_MIN_NET_EDGE_BPS", "not-a-number") };
+        assert_eq!(parse_multi_venue_bad_debt_min_net_edge_bps_from_env(), -500);
+
+        unsafe { env::remove_var("MULTI_VENUE_BAD_DEBT_MIN_NET_EDGE_BPS") };
     }
 
     #[test]
@@ -680,10 +903,11 @@ mod tests {
             env::set_var("CEX_BUY_INVERSE_ENABLED", "false");
             env::set_var("CEX_RETRY_BASE_SECS", "7");
             env::set_var("CEX_RETRY_MAX_SECS", "240");
-            env::set_var("CEX_MIN_NET_EDGE_BPS", "160");
+            env::set_var("MULTI_VENUE_MIN_NET_EDGE_BPS", "160");
+            env::set_var("MULTI_VENUE_MAX_ORACLE_DISCOUNT_BPS", "175");
+            env::set_var("MULTI_VENUE_ORACLE_SNAPSHOT_MAX_AGE_SECS", "45");
             env::set_var("CEX_DELAY_BUFFER_BPS", "90");
             env::set_var("CEX_ROUTE_FEE_BPS", "0");
-            env::set_var("CEX_FORCE_OVER_USD_THRESHOLD", "5.75");
             env::set_var("BAD_DEBT_COLLATERAL_SLIPPAGE_BPS", "350");
         }
 
@@ -699,13 +923,66 @@ mod tests {
                 buy_inverse_enabled: false,
                 retry_base_secs: 7,
                 retry_max_secs: 240,
-                min_net_edge_bps: 160,
                 delay_buffer_bps: 90,
                 route_fee_bps: 0,
-                force_over_usd_threshold: 5.75,
             }
         );
         assert_eq!(parse_bad_debt_collateral_slippage_bps_from_env(), 350);
+        assert_eq!(parse_multi_venue_min_net_edge_bps_from_env(), 160);
+        assert_eq!(parse_multi_venue_max_oracle_discount_bps_from_env(), 175);
+        assert_eq!(parse_multi_venue_oracle_snapshot_max_age_secs_from_env(), 45);
+
+        unsafe {
+            env::remove_var("MULTI_VENUE_MIN_NET_EDGE_BPS");
+            env::remove_var("MULTI_VENUE_MAX_ORACLE_DISCOUNT_BPS");
+            env::remove_var("MULTI_VENUE_ORACLE_SNAPSHOT_MAX_AGE_SECS");
+        }
+    }
+
+    #[test]
+    fn legacy_cex_min_edge_key_remains_a_fallback() {
+        let _guard = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        unsafe {
+            env::remove_var("MULTI_VENUE_MIN_NET_EDGE_BPS");
+            env::set_var("CEX_MIN_NET_EDGE_BPS", "165");
+        }
+
+        assert_eq!(parse_multi_venue_min_net_edge_bps_from_env(), 165);
+
+        unsafe { env::remove_var("CEX_MIN_NET_EDGE_BPS") };
+    }
+
+    #[test]
+    fn oracle_discount_defaults_to_500_and_rejects_a_guard_disabling_value() {
+        let _guard = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        unsafe { env::remove_var("MULTI_VENUE_MAX_ORACLE_DISCOUNT_BPS") };
+        assert_eq!(parse_multi_venue_max_oracle_discount_bps_from_env(), 500);
+
+        // 10_000 bps and above would accept any output at all, so out-of-range
+        // values fall back to the default instead of turning the guard off.
+        for value in ["10000", "20000", "not-a-number"] {
+            unsafe { env::set_var("MULTI_VENUE_MAX_ORACLE_DISCOUNT_BPS", value) };
+            assert_eq!(
+                parse_multi_venue_max_oracle_discount_bps_from_env(),
+                500,
+                "`{value}` must not disable the oracle guard"
+            );
+        }
+        unsafe { env::remove_var("MULTI_VENUE_MAX_ORACLE_DISCOUNT_BPS") };
+    }
+
+    #[test]
+    fn oracle_snapshot_max_age_defaults_and_rejects_negative_values() {
+        let _guard = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        unsafe { env::remove_var("MULTI_VENUE_ORACLE_SNAPSHOT_MAX_AGE_SECS") };
+        assert_eq!(parse_multi_venue_oracle_snapshot_max_age_secs_from_env(), 300);
+
+        unsafe { env::set_var("MULTI_VENUE_ORACLE_SNAPSHOT_MAX_AGE_SECS", "0") };
+        assert_eq!(parse_multi_venue_oracle_snapshot_max_age_secs_from_env(), 0);
+
+        unsafe { env::set_var("MULTI_VENUE_ORACLE_SNAPSHOT_MAX_AGE_SECS", "-1") };
+        assert_eq!(parse_multi_venue_oracle_snapshot_max_age_secs_from_env(), 300);
+        unsafe { env::remove_var("MULTI_VENUE_ORACLE_SNAPSHOT_MAX_AGE_SECS") };
     }
 
     #[test]
@@ -720,12 +997,11 @@ mod tests {
             env::set_var("CEX_BUY_INVERSE_ENABLED", "not-a-bool");
             env::set_var("CEX_RETRY_BASE_SECS", "10");
             env::set_var("CEX_RETRY_MAX_SECS", "1");
-            env::set_var("CEX_FORCE_OVER_USD_THRESHOLD", "-1");
             env::set_var("BAD_DEBT_COLLATERAL_SLIPPAGE_BPS", "20000");
         }
 
         let parsed = parse_cex_tunables_from_env();
-        assert_eq!(parsed.min_exec_usd, 1.1);
+        assert_eq!(parsed.min_exec_usd, 8.0);
         assert_eq!(parsed.slice_target_ratio, 1.0);
         assert_eq!(parsed.buy_truncation_trigger_ratio, 0.0);
         assert_eq!(parsed.buy_inverse_overspend_bps, 100);
@@ -733,7 +1009,6 @@ mod tests {
         assert!(parsed.buy_inverse_enabled);
         assert_eq!(parsed.retry_base_secs, 10);
         assert_eq!(parsed.retry_max_secs, 120);
-        assert_eq!(parsed.force_over_usd_threshold, 12.5);
         assert_eq!(parse_bad_debt_collateral_slippage_bps_from_env(), 10_000);
     }
 
@@ -747,14 +1022,30 @@ mod tests {
     }
 
     #[test]
-    fn parse_cex_tunables_allows_zero_force_threshold_for_disable() {
+    fn parse_icpswap_test_allocation_is_optional_and_strictly_positive() {
         let _guard = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
-        unsafe {
-            env::set_var("CEX_FORCE_OVER_USD_THRESHOLD", "0");
-        }
+        unsafe { env::remove_var("ICPSWAP_TEST_ALLOCATION_USD") };
+        assert_eq!(parse_icpswap_test_allocation_usd_from_env().unwrap(), None);
 
-        let parsed = parse_cex_tunables_from_env();
-        assert_eq!(parsed.force_over_usd_threshold, 0.0);
+        unsafe { env::set_var("ICPSWAP_TEST_ALLOCATION_USD", "1") };
+        assert_eq!(parse_icpswap_test_allocation_usd_from_env().unwrap(), Some(1.0));
+
+        unsafe { env::set_var("ICPSWAP_TEST_ALLOCATION_USD", "0") };
+        assert!(parse_icpswap_test_allocation_usd_from_env().is_err());
+
+        unsafe { env::remove_var("ICPSWAP_TEST_ALLOCATION_USD") };
+    }
+
+    #[test]
+    fn parse_icpswap_dust_fallback_impact_defaults_to_150_and_accepts_override() {
+        let _guard = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        unsafe { env::remove_var("ICPSWAP_DUST_FALLBACK_MAX_PRICE_IMPACT_BPS") };
+        assert_eq!(parse_icpswap_dust_fallback_max_price_impact_bps_from_env(), 150.0);
+
+        unsafe { env::set_var("ICPSWAP_DUST_FALLBACK_MAX_PRICE_IMPACT_BPS", "175") };
+        assert_eq!(parse_icpswap_dust_fallback_max_price_impact_bps_from_env(), 175.0);
+
+        unsafe { env::remove_var("ICPSWAP_DUST_FALLBACK_MAX_PRICE_IMPACT_BPS") };
     }
 
     #[test]
@@ -841,42 +1132,142 @@ mod tests {
     }
 
     #[test]
-    fn parse_swapper_mode_defaults_to_cex_when_unset() {
+    fn enabled_swap_venues_default_to_icpswap_then_mexc() {
         let _guard = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
         unsafe {
-            env::remove_var("SWAPPER");
+            env::remove_var("ENABLED_SWAP_VENUES");
         }
-        assert_eq!(parse_swapper_mode_from_env().unwrap(), SwapperMode::Cex);
+        assert_eq!(
+            parse_enabled_swap_venues_from_env().unwrap(),
+            vec!["icpswap".to_string(), "mexc".to_string()]
+        );
     }
 
     #[test]
-    fn parse_swapper_mode_rejects_unknown() {
+    fn enabled_swap_venues_normalize_and_preserve_order() {
         let _guard = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
         unsafe {
-            env::set_var("SWAPPER", "unknown-value");
+            env::set_var("ENABLED_SWAP_VENUES", " MEXC, IcPsWaP ");
         }
-        let err = parse_swapper_mode_from_env().expect_err("unknown swapper mode should be rejected");
-        assert!(err.contains("only SWAPPER=cex"));
+        assert_eq!(
+            parse_enabled_swap_venues_from_env().unwrap(),
+            vec!["mexc".to_string(), "icpswap".to_string()]
+        );
+        unsafe {
+            env::remove_var("ENABLED_SWAP_VENUES");
+        }
     }
 
     #[test]
-    fn parse_swapper_mode_rejects_dex() {
+    fn enabled_swap_venues_reject_invalid_lists() {
+        let _guard = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        for (raw, expected) in [
+            ("", "empty venue ID"),
+            ("mexc,", "empty venue ID"),
+            ("mexc,MEXC", "duplicate venue"),
+            ("kraken", "unsupported venue"),
+        ] {
+            unsafe {
+                env::set_var("ENABLED_SWAP_VENUES", raw);
+            }
+            let error = parse_enabled_swap_venues_from_env().expect_err("invalid venue list must fail");
+            assert!(error.contains(expected), "unexpected error: {error}");
+        }
+        unsafe {
+            env::remove_var("ENABLED_SWAP_VENUES");
+        }
+    }
+
+    #[test]
+    fn legacy_swapper_does_not_affect_enabled_venues() {
         let _guard = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
         unsafe {
             env::set_var("SWAPPER", "dex");
+            env::set_var("ENABLED_SWAP_VENUES", "mexc");
         }
-        let err = parse_swapper_mode_from_env().expect_err("dex mode should be rejected");
-        assert!(err.contains("only SWAPPER=cex"));
+        assert_eq!(parse_enabled_swap_venues_from_env().unwrap(), vec!["mexc"]);
+        unsafe {
+            env::remove_var("SWAPPER");
+            env::remove_var("ENABLED_SWAP_VENUES");
+        }
     }
 
     #[test]
-    fn parse_swapper_mode_rejects_hybrid() {
+    fn parse_slippage_bps_rejects_malformed_and_oversized_values() {
         let _guard = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
         unsafe {
-            env::set_var("SWAPPER", "hybrid");
+            env::remove_var("MAX_ALLOWED_SLIPPAGE_BPS");
+            env::remove_var("SLIPPAGE_TEST_BPS");
         }
-        let err = parse_swapper_mode_from_env().expect_err("hybrid mode should be rejected");
-        assert!(err.contains("only SWAPPER=cex"));
+        assert_eq!(parse_slippage_bps_from_env("SLIPPAGE_TEST_BPS", 125).unwrap(), 125);
+
+        // A percentage or decimal is the natural way to get this wrong, and
+        // silently falling back would hide a cap the operator believes they set.
+        for bad in ["1.25", "0.5%", "abc"] {
+            unsafe {
+                env::set_var("SLIPPAGE_TEST_BPS", bad);
+            }
+            assert!(
+                parse_slippage_bps_from_env("SLIPPAGE_TEST_BPS", 125).is_err(),
+                "{bad} must be rejected rather than silently defaulted"
+            );
+        }
+
+        unsafe {
+            env::set_var("SLIPPAGE_TEST_BPS", "9999");
+        }
+        assert!(parse_slippage_bps_from_env("SLIPPAGE_TEST_BPS", 125).is_err());
+
+        unsafe {
+            env::set_var("SLIPPAGE_TEST_BPS", " 300 ");
+        }
+        assert_eq!(parse_slippage_bps_from_env("SLIPPAGE_TEST_BPS", 125).unwrap(), 300);
+
+        // `FOO=` in an env file is unset, not "use the default": the shared cap
+        // still applies, and with neither set we fall back to the default.
+        unsafe {
+            env::set_var("SLIPPAGE_TEST_BPS", "   ");
+            env::set_var("MAX_ALLOWED_SLIPPAGE_BPS", "175");
+        }
+        assert_eq!(parse_slippage_bps_from_env("SLIPPAGE_TEST_BPS", 125).unwrap(), 175);
+        unsafe {
+            env::set_var("MAX_ALLOWED_SLIPPAGE_BPS", "");
+        }
+        assert_eq!(parse_slippage_bps_from_env("SLIPPAGE_TEST_BPS", 125).unwrap(), 125);
+
+        unsafe {
+            env::remove_var("SLIPPAGE_TEST_BPS");
+            env::remove_var("MAX_ALLOWED_SLIPPAGE_BPS");
+        }
+    }
+
+    #[test]
+    fn parse_icpswap_fee_tiers_sorts_and_deduplicates() {
+        assert_eq!(
+            parse_icpswap_fee_tiers("3000, 500,3000,100").unwrap(),
+            vec![
+                candid::Nat::from(100u32),
+                candid::Nat::from(500u32),
+                candid::Nat::from(3000u32),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_icpswap_fee_tiers_rejects_empty_zero_and_invalid_values() {
+        assert!(parse_icpswap_fee_tiers(" , ").is_err());
+        assert!(parse_icpswap_fee_tiers("0").is_err());
+        assert!(parse_icpswap_fee_tiers("500,nope").is_err());
+    }
+
+    #[test]
+    fn default_icpswap_factory_is_a_valid_principal() {
+        assert_eq!(
+            Principal::from_text(DEFAULT_ICPSWAP_FACTORY_CANISTER)
+                .unwrap()
+                .to_text(),
+            DEFAULT_ICPSWAP_FACTORY_CANISTER
+        );
     }
 
     #[test]

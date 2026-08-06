@@ -1,4 +1,5 @@
 use chrono::{Local, TimeZone};
+use liquidium_pipeline_core::account::model::ChainAccount;
 use liquidium_pipeline_core::tokens::chain_token_amount::ChainTokenAmount;
 use liquidium_pipeline_core::types::protocol_types::{LiquidationStatus, TransferStatus, TxStatus};
 use ratatui::Frame;
@@ -6,11 +7,17 @@ use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, Wrap};
+use serde::Deserialize;
 use serde_json::Value;
 
 use crate::finalizers::liquidation_outcome::LiquidationOutcome;
-use crate::persistance::{LiqMetaWrapper, ResultStatus, WalProfitSnapshot};
+use crate::finalizers::multi_venue::MEXC_VENUE_ID;
+use crate::persistance::{
+    FinalizerMetaPayload, FinalizerMetaV2, LiqMetaWrapper, ResultStatus, VenueExecutionState, VenueLegState,
+    WalProfitSnapshot,
+};
 use crate::stages::executor::{ExecutionReceipt, ExecutionStatus};
+use crate::swappers::icpswap::{VENUE_ID as ICPSWAP_VENUE_ID, identity::IcpswapExecutionIdentity};
 use crate::wal::liq_id_from_receipt;
 
 use super::super::app::{App, ExecutionRowData, UiFocus};
@@ -29,9 +36,10 @@ pub(super) fn draw_executions(f: &mut Frame<'_>, area: Rect, app: &App) {
 
     if let Some(wal) = &app.wal {
         lines.push(Line::from(format!(
-            "WAL: inflight={} wait={} ok={} fail={} total={}",
+            "WAL: inflight={} wait={} unresumable={} ok={} fail={} total={}",
             wal.counts.inflight,
             wal.counts.waiting_collateral + wal.counts.waiting_profit,
+            wal.counts.unresumable,
             wal.counts.succeeded,
             wal.counts.failed_retryable + wal.counts.failed_permanent,
             wal.counts.total
@@ -65,37 +73,6 @@ pub(super) fn draw_executions(f: &mut Frame<'_>, area: Rect, app: &App) {
     };
 
     let now = Local::now().timestamp();
-
-    let rows = exec.rows.iter().enumerate().map(|(idx, r)| {
-        let status = status_label(r.status);
-        let status_cell = Cell::new(status).style(status_style(r.status));
-
-        let age_secs = now.saturating_sub(r.updated_at);
-        let updated = format_age(age_secs);
-
-        let profit_cell = profit_cell_for_row(r, app);
-
-        let last_error = r
-            .last_error
-            .as_deref()
-            .map(|e| truncate(e, 34))
-            .unwrap_or_else(|| "-".to_string());
-
-        let mut row = Row::new(vec![
-            status_cell,
-            Cell::new(truncate(&r.liq_id, 14)),
-            Cell::new(r.attempt.to_string()),
-            Cell::new(r.error_count.to_string()),
-            Cell::new(updated),
-            profit_cell,
-            Cell::new(last_error),
-        ]);
-
-        if idx == app.executions_selected {
-            row = row.style(Style::default().bg(Color::DarkGray));
-        }
-        row
-    });
 
     let header = Row::new(vec![
         Cell::new("Status"),
@@ -159,6 +136,46 @@ pub(super) fn draw_executions(f: &mut Frame<'_>, area: Rect, app: &App) {
         return;
     }
 
+    // A stateless `Table` always starts at row zero. Slice the backing rows so
+    // keyboard selection remains visible when the WAL contains more entries
+    // than fit in the panel.
+    let visible_rows = body_layout[0].height.saturating_sub(3) as usize;
+    let viewport_start = wal_viewport_start(app.executions_selected, exec.rows.len(), visible_rows);
+    let rows = exec
+        .rows
+        .iter()
+        .enumerate()
+        .skip(viewport_start)
+        .take(visible_rows)
+        .map(|(idx, r)| {
+            let status = status_label(r.status);
+            let status_cell = Cell::new(status).style(status_style(r.status));
+
+            let age_secs = now.saturating_sub(r.updated_at);
+            let updated = format_age(age_secs);
+            let profit_cell = profit_cell_for_row(r, app);
+            let last_error = r
+                .last_error
+                .as_deref()
+                .map(|e| truncate(e, 34))
+                .unwrap_or_else(|| "-".to_string());
+
+            let mut row = Row::new(vec![
+                status_cell,
+                Cell::new(truncate(&r.liq_id, 14)),
+                Cell::new(r.attempt.to_string()),
+                Cell::new(r.error_count.to_string()),
+                Cell::new(updated),
+                profit_cell,
+                Cell::new(last_error),
+            ]);
+
+            if idx == app.executions_selected {
+                row = row.style(Style::default().bg(Color::DarkGray));
+            }
+            row
+        });
+
     let table = Table::new(
         rows,
         [
@@ -177,6 +194,18 @@ pub(super) fn draw_executions(f: &mut Frame<'_>, area: Rect, app: &App) {
     f.render_widget(table, body_layout[0]);
 }
 
+fn wal_viewport_start(selected: usize, row_count: usize, visible_rows: usize) -> usize {
+    if row_count == 0 || visible_rows == 0 {
+        return 0;
+    }
+
+    let selected = selected.min(row_count - 1);
+    selected
+        .saturating_add(1)
+        .saturating_sub(visible_rows)
+        .min(row_count.saturating_sub(visible_rows))
+}
+
 fn status_label(status: ResultStatus) -> &'static str {
     match status {
         ResultStatus::Enqueued => "enqueued",
@@ -187,6 +216,7 @@ fn status_label(status: ResultStatus) -> &'static str {
         ResultStatus::WaitingCollateral => "wait-col",
         ResultStatus::WaitingProfit => "wait-prof",
         ResultStatus::OperatorRequired => "operator",
+        ResultStatus::Unresumable => "unresumable",
     }
 }
 
@@ -198,6 +228,7 @@ fn status_style(status: ResultStatus) -> Style {
         ResultStatus::InFlight => Style::default().fg(Color::Cyan),
         ResultStatus::WaitingCollateral | ResultStatus::WaitingProfit => Style::default().fg(Color::Yellow),
         ResultStatus::OperatorRequired => Style::default().fg(Color::Magenta),
+        ResultStatus::Unresumable => Style::default().fg(Color::Red),
         ResultStatus::Enqueued => Style::default().fg(Color::DarkGray),
     }
 }
@@ -292,6 +323,7 @@ fn append_receipt_from_meta(lines: &mut Vec<Line<'static>>, raw: &str) {
         Ok(wrapper) => {
             append_receipt_lines(lines, &wrapper.receipt);
             append_finalizer_decision(lines, wrapper.finalizer_decision.as_ref());
+            append_multi_venue_summary(lines, wrapper.meta_v2.as_ref());
             append_meta_summary(lines, &wrapper.meta);
         }
         Err(wrapper_err) => match serde_json::from_str::<ExecutionReceipt>(raw) {
@@ -339,6 +371,160 @@ fn append_receipt_from_meta(lines: &mut Vec<Line<'static>>, raw: &str) {
             }
         },
     }
+}
+
+/// Renders a sweep destination as the address an operator would paste into a
+/// ledger explorer, rather than its debug shape.
+fn format_recovery_destination(destination: &ChainAccount) -> String {
+    match destination {
+        ChainAccount::Icp(account) => account.to_string(),
+        ChainAccount::IcpLedger(account_id_hex) => account_id_hex.clone(),
+        ChainAccount::Evm(address) => address.clone(),
+    }
+}
+
+/// Displays the identity that actually signs each persisted ICPSwap leg. This
+/// is the account operators need when checking isolated balances or recovering
+/// a specific liquidation.
+fn append_multi_venue_summary(lines: &mut Vec<Line<'static>>, meta: Option<&FinalizerMetaV2>) {
+    let Some(meta) = meta else {
+        return;
+    };
+    let state = match &meta.payload {
+        FinalizerMetaPayload::MultiVenueSwap(state) => state,
+        FinalizerMetaPayload::RecoverySweep(state) => {
+            push_section_title(lines, "Recovery Sweep");
+            lines.push(Line::from(format!(
+                "Status: {:?} | amount: {}",
+                state.status,
+                state.amount.formatted()
+            )));
+            lines.push(Line::from(format!(
+                "Destination: {}",
+                format_recovery_destination(&state.destination)
+            )));
+            lines.push(Line::from(format!("Reason: {}", state.reason)));
+            if let Some(txid) = &state.txid {
+                lines.push(Line::from(format!("Transfer tx: {txid}")));
+            }
+            if let Some(error) = &state.last_error {
+                lines.push(Line::from(Span::styled(
+                    format!("Error: {error}"),
+                    Style::default().fg(Color::Red),
+                )));
+            }
+            return;
+        }
+    };
+
+    push_section_title(lines, "Multi-Venue Execution");
+    lines.push(Line::from(format!(
+        "Strategy: {} | outcome: {:?}",
+        state.plan.strategy_id, state.outcome
+    )));
+    lines.push(Line::from(format!(
+        "Allocation: {:?} | conservative edge: {:.2} bps",
+        state.plan.allocation_reason, state.plan.combined_net_edge_bps
+    )));
+
+    let last = state.legs.len().saturating_sub(1);
+    for (index, leg) in state.legs.iter().enumerate() {
+        append_venue_leg_summary(lines, leg, index == last);
+        if leg.venue_id == ICPSWAP_VENUE_ID {
+            match icpswap_account_principal(&leg.execution) {
+                Ok(principal) => lines.push(Line::from(format!("   Execution principal: {principal}"))),
+                Err(error) => lines.push(Line::from(Span::styled(
+                    format!("   Execution principal: <unavailable: {}>", truncate(&error, 140)),
+                    Style::default().fg(Color::Yellow),
+                ))),
+            }
+        }
+    }
+}
+
+fn append_venue_leg_summary(lines: &mut Vec<Line<'static>>, leg: &VenueLegState, is_last: bool) {
+    let branch = if is_last { "└─" } else { "├─" };
+    let stage = super::dashboard::venue_leg_stage(leg);
+    let style = super::dashboard::venue_leg_style(leg.status);
+    lines.push(Line::from(vec![
+        Span::styled(
+            format!("{branch} {}", super::dashboard::venue_display_name(&leg.venue_id)),
+            style.add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(" · "),
+        Span::styled(stage, style),
+    ]));
+    lines.push(Line::from(format!(
+        "   Allocation: {}",
+        leg.request.pay_amount.formatted()
+    )));
+    lines.push(Line::from(format!(
+        "   Quote: expected {} | conservative {} | impact {:.2} bps",
+        leg.quote.estimated_receive.formatted(),
+        leg.quote.conservative_receive.formatted(),
+        leg.quote.estimated_price_impact_bps
+    )));
+    lines.push(Line::from(format!("   Route: {}", leg.quote.route_id)));
+
+    if leg.venue_id == MEXC_VENUE_ID {
+        append_mexc_leg_transactions(lines, &leg.execution);
+    }
+
+    if let Some(result) = &leg.result {
+        let mut received = leg.quote.estimated_receive.clone();
+        received.value = result.receive_amount.clone();
+        lines.push(Line::from(Span::styled(
+            format!("   Realized: {} | status: {}", received.formatted(), result.status),
+            Style::default().fg(Color::Green),
+        )));
+    }
+    if let Some(error) = leg.last_error.as_deref() {
+        lines.push(Line::from(Span::styled(
+            format!("   Last error: {error}"),
+            Style::default().fg(Color::Red),
+        )));
+    }
+}
+
+/// Shows transaction identifiers from the MEXC state stored inside a
+/// multi-venue leg. These are not present in the legacy top-level `meta` bytes.
+fn append_mexc_leg_transactions(lines: &mut Vec<Line<'static>>, execution: &VenueExecutionState) {
+    // Current multi-venue MEXC state wraps the existing CEX state in `cex`.
+    // Falling back to the root keeps this readable if an older direct CEX
+    // state was persisted in the venue envelope.
+    let cex = execution.state.get("cex").unwrap_or(&execution.state);
+    let fields = [
+        ("deposit_txid", "MEXC deposit txid"),
+        ("deposit_bridge_id", "MEXC deposit bridge txid"),
+        ("withdraw_id", "MEXC withdraw id"),
+        ("withdraw_txid", "MEXC withdraw txid"),
+        ("withdraw_bridge_id", "MEXC withdraw bridge txid"),
+    ];
+
+    for (field, label) in fields {
+        if let Some(value) = cex
+            .get(field)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            lines.push(Line::from(format!("   {label}: {value}")));
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct IcpswapIdentityView {
+    identity: IcpswapExecutionIdentity,
+}
+
+/// Decodes only the stable identity portion of the venue state. Ignoring the
+/// remaining fields keeps the TUI useful while execution-state details evolve.
+fn icpswap_account_principal(execution: &VenueExecutionState) -> Result<String, String> {
+    execution
+        .decode::<IcpswapIdentityView>(ICPSWAP_VENUE_ID)?
+        .map(|state| state.identity.principal.to_text())
+        .ok_or_else(|| "execution state is tagged for a different venue".to_string())
 }
 
 fn append_receipt_lines(lines: &mut Vec<Line<'static>>, receipt: &ExecutionReceipt) {
@@ -495,10 +681,7 @@ fn append_meta_summary(lines: &mut Vec<Line<'static>>, meta: &[u8]) {
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
             {
-                lines.push(Line::from(format!(
-                    "Bridge deposit txid: {}",
-                    deposit_bridge_id
-                )));
+                lines.push(Line::from(format!("Bridge deposit txid: {}", deposit_bridge_id)));
                 emitted = true;
             }
             if let Some(withdraw_bridge_id) = value
@@ -507,10 +690,7 @@ fn append_meta_summary(lines: &mut Vec<Line<'static>>, meta: &[u8]) {
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
             {
-                lines.push(Line::from(format!(
-                    "Bridge withdraw txid: {}",
-                    withdraw_bridge_id
-                )));
+                lines.push(Line::from(format!("Bridge withdraw txid: {}", withdraw_bridge_id)));
                 emitted = true;
             }
             if !emitted {
@@ -656,20 +836,201 @@ fn format_profit(amount: i128, decimals: u8, symbol: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{WalProfitSnapshot, append_meta_summary, profit_display_from_snapshot, truncate};
-    use ratatui::text::Line;
+    use super::{
+        WalProfitSnapshot, append_meta_summary, append_venue_leg_summary, icpswap_account_principal,
+        profit_display_from_snapshot, status_label, truncate, wal_viewport_start,
+    };
+    use crate::{
+        persistance::{ResultStatus, VenueExecutionState, VenueLegQuote, VenueLegState, VenueLegStatus},
+        swappers::icpswap::{
+            identity::IcpswapExecutionIdentity,
+            transfer_state::{IcpswapFundingState, IcpswapLedgerTransferState, IcpswapSettlementState},
+            types::{IcpswapExecutionPlan, IcpswapExecutionState},
+        },
+        swappers::model::SwapRequest,
+    };
+    use candid::{Nat, Principal};
+    use icrc_ledger_types::icrc1::account::Account;
+    use liquidium_pipeline_core::tokens::{chain_token::ChainToken, chain_token_amount::ChainTokenAmount};
     use ratatui::style::Color;
+    use ratatui::text::Line;
 
     fn lines_as_text(lines: &[Line<'_>]) -> Vec<String> {
         lines
             .iter()
-            .map(|line| {
-                line.spans
-                    .iter()
-                    .map(|span| span.content.as_ref())
-                    .collect::<String>()
-            })
+            .map(|line| line.spans.iter().map(|span| span.content.as_ref()).collect::<String>())
             .collect()
+    }
+
+    #[test]
+    fn unresumable_status_is_visible_in_executions() {
+        assert_eq!(status_label(ResultStatus::Unresumable), "unresumable");
+    }
+
+    #[test]
+    fn wal_viewport_follows_selection_below_visible_rows() {
+        assert_eq!(wal_viewport_start(0, 20, 5), 0);
+        assert_eq!(wal_viewport_start(4, 20, 5), 0);
+        assert_eq!(wal_viewport_start(5, 20, 5), 1);
+        assert_eq!(wal_viewport_start(19, 20, 5), 15);
+    }
+
+    #[test]
+    fn wal_viewport_handles_small_or_collapsed_tables() {
+        assert_eq!(wal_viewport_start(3, 4, 10), 0);
+        assert_eq!(wal_viewport_start(3, 4, 0), 0);
+        assert_eq!(wal_viewport_start(0, 0, 5), 0);
+    }
+
+    #[test]
+    fn execution_details_show_venue_branch_stage_quote_route_and_error() {
+        let pay_token = ChainToken::EvmNative {
+            chain: "ICP".to_string(),
+            symbol: "ICP".to_string(),
+            decimals: 2,
+            fee: Nat::from(1u8),
+        };
+        let receive_token = ChainToken::EvmNative {
+            chain: "ICP".to_string(),
+            symbol: "ckUSDC".to_string(),
+            decimals: 2,
+            fee: Nat::from(1u8),
+        };
+        let pay_amount = ChainTokenAmount::from_raw(pay_token.clone(), Nat::from(720u64));
+        let receive_amount = ChainTokenAmount::from_raw(receive_token.clone(), Nat::from(810u64));
+        let leg = VenueLegState {
+            leg_id: "mexc-0".to_string(),
+            venue_id: "mexc".to_string(),
+            request: SwapRequest {
+                pay_asset: pay_token.asset_id(),
+                pay_amount: pay_amount.clone(),
+                receive_asset: receive_token.asset_id(),
+                receive_address: None,
+                max_slippage_bps: Some(100),
+                venue_hint: Some("mexc".to_string()),
+            },
+            quote: VenueLegQuote {
+                pay_amount,
+                estimated_receive: receive_amount.clone(),
+                conservative_receive: receive_amount,
+                estimated_price_impact_bps: 12.5,
+                route_id: "ICP_USDC".to_string(),
+            },
+            execution: VenueExecutionState {
+                venue: "mexc".to_string(),
+                state: serde_json::json!({
+                    "cex": {
+                        "step": "WithdrawPending",
+                        "deposit_txid": "ic-ledger-deposit-123",
+                        "deposit_bridge_id": "bridge-deposit-456",
+                        "withdraw_id": "mexc-withdraw-789",
+                        "withdraw_txid": "ic-ledger-withdraw-987",
+                        "withdraw_bridge_id": "bridge-withdraw-654"
+                    }
+                }),
+            },
+            status: VenueLegStatus::Running,
+            result: None,
+            last_error: Some("waiting for bridge".to_string()),
+        };
+
+        let mut lines = Vec::new();
+        append_venue_leg_summary(&mut lines, &leg, true);
+        let text = lines_as_text(&lines);
+
+        assert_eq!(text[0], "└─ MEXC · withdraw pending");
+        assert!(text.iter().any(|line| line == "   Allocation: ICP: 7.20"));
+        assert!(text.iter().any(|line| line.contains("impact 12.50 bps")));
+        assert!(text.iter().any(|line| line == "   Route: ICP_USDC"));
+        assert!(
+            text.iter()
+                .any(|line| line == "   MEXC deposit txid: ic-ledger-deposit-123")
+        );
+        assert!(
+            text.iter()
+                .any(|line| line == "   MEXC deposit bridge txid: bridge-deposit-456")
+        );
+        assert!(text.iter().any(|line| line == "   MEXC withdraw id: mexc-withdraw-789"));
+        assert!(
+            text.iter()
+                .any(|line| line == "   MEXC withdraw txid: ic-ledger-withdraw-987")
+        );
+        assert!(
+            text.iter()
+                .any(|line| line == "   MEXC withdraw bridge txid: bridge-withdraw-654")
+        );
+        assert!(text.iter().any(|line| line == "   Last error: waiting for bridge"));
+    }
+
+    #[test]
+    fn decoded_icpswap_view_shows_the_execution_account_principal() {
+        let input = ChainToken::Icp {
+            ledger: Principal::from_slice(&[1]),
+            symbol: "ICP".to_string(),
+            decimals: 8,
+            fee: Nat::from(10u64),
+        };
+        let output = ChainToken::Icp {
+            ledger: Principal::from_slice(&[2]),
+            symbol: "ckUSDC".to_string(),
+            decimals: 6,
+            fee: Nat::from(5u64),
+        };
+        let plan = IcpswapExecutionPlan::new(
+            Principal::from_slice(&[9]),
+            Principal::from_slice(&[1]),
+            Principal::from_slice(&[2]),
+            Nat::from(3_000u64),
+            ChainTokenAmount::from_raw(input.clone(), Nat::from(100_000u64)),
+            ChainTokenAmount::from_raw(input, Nat::from(10u64)),
+            ChainTokenAmount::from_raw(output.clone(), Nat::from(120_000u64)),
+            ChainTokenAmount::from_raw(output, Nat::from(5u64)),
+            100,
+        )
+        .expect("ICPSwap plan");
+        let (identity, _) = IcpswapExecutionIdentity::derive(
+            "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about",
+            "1536",
+        )
+        .expect("derive execution identity");
+        let principal = identity.principal;
+        let child = Account {
+            owner: principal,
+            subaccount: None,
+        };
+        let state = IcpswapExecutionState::prepare(
+            "icpswap-tui-test",
+            plan.clone(),
+            identity,
+            IcpswapFundingState::new(
+                Account {
+                    owner: Principal::from_slice(&[4]),
+                    subaccount: None,
+                },
+                child,
+                plan.input_ledger_fee.clone(),
+            ),
+            IcpswapSettlementState {
+                kind: None,
+                destination: Account {
+                    owner: Principal::from_slice(&[5]),
+                    subaccount: None,
+                },
+                fee: plan.output_ledger_fee.clone(),
+                transfer: IcpswapLedgerTransferState::default(),
+                interrupted_transfer: None,
+                interrupted_observed_debit: None,
+                recovery_credit: None,
+                residual_dust: None,
+            },
+        )
+        .expect("prepare persisted execution state");
+        let execution = VenueExecutionState::new("icpswap", &state).expect("encode execution state");
+
+        assert_eq!(
+            icpswap_account_principal(&execution).expect("decode principal"),
+            principal.to_text()
+        );
     }
 
     #[test]
@@ -772,9 +1133,10 @@ mod tests {
         append_meta_summary(&mut lines, meta);
 
         let text = lines_as_text(&lines);
-        assert!(text
-            .iter()
-            .any(|line| line == "Bridge withdraw txid: ic-withdraw:12:34"));
+        assert!(
+            text.iter()
+                .any(|line| line == "Bridge withdraw txid: ic-withdraw:12:34")
+        );
         assert!(!text.iter().any(|line| line.starts_with("Bridge deposit txid: ")));
         assert!(!text.iter().any(|line| line.starts_with("State preview: ")));
     }

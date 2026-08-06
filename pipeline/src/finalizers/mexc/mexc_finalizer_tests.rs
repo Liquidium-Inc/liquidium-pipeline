@@ -10,8 +10,8 @@ use liquidium_pipeline_connectors::backend::bridge_backend::{
     MockBridgeBackend,
 };
 use liquidium_pipeline_connectors::backend::cex_backend::{
-    BuyOrderInputMode, DepositAddress, MockCexBackend, OrderBook, OrderBookLevel, SwapFillReport, WithdrawStatus,
-    WithdrawStatusSnapshot,
+    BuyOrderInputMode, CexBackendError, DepositAddress, MockCexBackend, OrderBook, OrderBookLevel, SwapFillReport,
+    WithdrawStatus, WithdrawStatusSnapshot,
 };
 use liquidium_pipeline_core::account::model::ChainAccount;
 use liquidium_pipeline_core::tokens::{chain_token::ChainToken, chain_token_amount::ChainTokenAmount};
@@ -106,6 +106,8 @@ fn make_execution_receipt(liq_id: u128) -> ExecutionReceipt {
         collateral_asset: collateral_token.clone(),
         expected_profit: 0,
         ref_price: Nat::from(0u8),
+        debt_ref_price: Nat::from(0u8),
+        ref_price_at: 0,
         debt_approval_needed: false,
         min_collateral_amount: Nat::from(0u8),
     };
@@ -159,6 +161,8 @@ fn make_execution_receipt_with_assets(
         collateral_asset: collateral_token,
         expected_profit: 0,
         ref_price: Nat::from(0u8),
+        debt_ref_price: Nat::from(0u8),
+        ref_price_at: 0,
         debt_approval_needed: false,
         min_collateral_amount: Nat::from(0u8),
     };
@@ -1979,6 +1983,30 @@ async fn mexc_native_icp_non_bridge_withdraw_uses_liquidator_account_id_hex() {
     assert_ne!(state.withdraw.withdraw_address, liquidator.to_text());
 }
 
+#[test]
+fn mexc_native_icp_withdraw_converts_the_persisted_per_leg_destination() {
+    let finalizer = MexcFinalizer::new(
+        Arc::new(MockCexBackend::new()),
+        Arc::new(MockTransferActions::new()),
+        Principal::anonymous(),
+        TEST_MAX_SELL_SLIPPAGE_BPS,
+        TEST_CEX_MIN_EXEC_USD,
+        TEST_CEX_SLICE_TARGET_RATIO,
+    );
+    let requested = Account {
+        owner: Principal::from_slice(&[42]),
+        subaccount: Some([7; 32]),
+    };
+    let expected = AccountIdentifier::new(&requested.owner, &Subaccount([7; 32])).to_hex();
+
+    assert_eq!(
+        finalizer
+            .native_icp_direct_withdraw_address(&requested.to_string())
+            .expect("valid per-leg destination"),
+        expected
+    );
+}
+
 #[tokio::test]
 async fn mexc_non_bridge_withdraw_below_min_completes_as_zero_output_dust() {
     let mut cex = MockCexBackend::new();
@@ -2371,12 +2399,20 @@ async fn mexc_deposit_phase_b_bridged_confirmation_uses_expected_amount_and_obse
     assert!((state.trade.trade_next_amount_in.unwrap_or_default() - 9.9).abs() < 1e-12);
 }
 
+/// A balance delta larger than this deposit could possibly have credited means
+/// the reading is contaminated — typically a second deposit crediting the same
+/// account concurrently. The trade must then be sized on the post-fee expected
+/// amount, never the pre-fee submit amount, which the minter's withdrawal fee
+/// makes unreachable. Sizing on the gross oversells what arrived and the venue
+/// rejects the order as oversold.
 #[tokio::test]
-async fn mexc_deposit_phase_b_bridged_confirmation_caps_observed_delta_at_submit_amount() {
+async fn mexc_deposit_phase_b_bridged_confirmation_caps_contaminated_delta_at_expected_amount() {
     let mut backend = MockCexBackend::new();
     let transfers = MockTransferActions::new();
     let mut bridge = MockBridgeBackend::new();
 
+    // 15.2 - 5.0 = 10.2 delta: more than the 10.0 submitted, so a concurrent
+    // deposit is inflating it.
     backend.expect_get_balance().returning(|asset| {
         assert_eq!(asset, "ETH");
         Ok(15.2)
@@ -2411,7 +2447,75 @@ async fn mexc_deposit_phase_b_bridged_confirmation_caps_observed_delta_at_submit
         .expect("bridged deposit should cap confirmed amount");
 
     assert!(matches!(state.step, CexStep::Trade));
-    assert!((state.trade.trade_next_amount_in.unwrap_or_default() - 10.0).abs() < 1e-12);
+    assert!(
+        (state.trade.trade_next_amount_in.unwrap_or_default() - 9.9).abs() < 1e-12,
+        "contaminated delta must cap at the post-fee expected amount, not the pre-fee submit amount"
+    );
+}
+
+/// Regression for liq 1563: two ckETH withdrawals pre-credited to the MEXC
+/// account in the same block, so this leg's balance delta picked up the other
+/// deposit as well. The pre-fee cap then sized the sell at the full submitted
+/// 0.00804851439432068 ETH while only 0.00801372 had actually credited, and
+/// MEXC rejected it as oversold on every retry until the settlement wait
+/// expired.
+///
+/// The fee budget was not at fault: 0.0000425 was reserved against an actual
+/// 0.0000348 minter fee, so the credit landed slightly above forecast.
+#[tokio::test]
+async fn mexc_deposit_never_sizes_a_trade_above_what_the_bridge_could_credit() {
+    let submitted = 0.008_048_514_394_320_68;
+    let expected_after_fee = 0.008_005_979_746_399_88;
+    let baseline = 0.000_018_374_568_812_442;
+    // Baseline plus this leg's real credit plus a concurrent deposit.
+    let contaminated_balance = baseline + 0.008_013_72 + 0.010_278_35;
+
+    let mut backend = MockCexBackend::new();
+    let transfers = MockTransferActions::new();
+    let mut bridge = MockBridgeBackend::new();
+
+    backend.expect_get_balance().returning(move |asset| {
+        assert_eq!(asset, "ETH");
+        Ok(contaminated_balance)
+    });
+    bridge.expect_get_bridge_status().times(1).returning(|bridge_id| {
+        assert_eq!(bridge_id, "bridge-deposit-cketh");
+        Ok(BridgeStatus::Completed)
+    });
+
+    let finalizer = MexcFinalizer::new(
+        Arc::new(backend),
+        Arc::new(transfers),
+        Principal::anonymous(),
+        TEST_MAX_SELL_SLIPPAGE_BPS,
+        TEST_CEX_MIN_EXEC_USD,
+        TEST_CEX_SLICE_TARGET_RATIO,
+    )
+    .with_bridge_dependencies(bridge_dependencies(Arc::new(bridge)));
+
+    let receipt = make_execution_receipt_with_assets(82, cketh_token(), ckusdc_token());
+    let mut state = finalizer
+        .prepare("1563", &receipt)
+        .await
+        .expect("prepare should succeed");
+    state.deposit.deposit_txid = Some("989_486".to_string());
+    state.deposit.deposit_balance_before = Some(baseline);
+    state.deposit.bridge.deposit_bridge_id = Some("bridge-deposit-cketh".to_string());
+    state.deposit.bridge.deposit_bridge_submit_amount = Some(submitted);
+    state.deposit.bridge.deposit_bridge_expected_amount = Some(expected_after_fee);
+    state.step = CexStep::DepositPending;
+
+    finalizer.deposit(&mut state).await.expect("deposit should confirm");
+
+    let sized = state.trade.trade_next_amount_in.expect("trade amount should be set");
+    assert!(
+        sized <= expected_after_fee,
+        "sized {sized} above the post-fee ceiling {expected_after_fee}; this is the oversold bug"
+    );
+    assert!(
+        sized < submitted,
+        "sized {sized} at the pre-fee submit amount {submitted}, which the minter fee makes unreachable"
+    );
 }
 
 #[tokio::test]
@@ -2854,7 +2958,7 @@ async fn mexc_trade_propagates_backend_errors() {
     backend
         .expect_execute_swap_detailed_with_options()
         .times(1)
-        .returning(|_market, _side, _amount_in, _opts| Err("boom".to_string()));
+        .returning(|_market, _side, _amount_in, _opts| Err(CexBackendError::Other("boom".to_string())));
 
     let backend = Arc::new(backend);
     let transfer_service = Arc::new(transfers);
@@ -2875,7 +2979,7 @@ async fn mexc_trade_propagates_backend_errors() {
 
     let err = finalizer.trade(&mut state).await.expect_err("trade should fail");
 
-    assert_eq!(err, "boom");
+    assert_eq!(err, CexBackendError::Other("boom".to_string()));
     // On error we expect the step to remain Trade.
     assert!(matches!(state.step, CexStep::Trade));
 }
@@ -3177,7 +3281,7 @@ async fn mexc_trade_fails_when_realized_slice_slippage_exceeds_cap() {
         .await
         .expect_err("trade should fail when realized slippage exceeds cap");
 
-    assert!(err.contains("slice slippage too high"));
+    assert!(err.to_string().contains("slice slippage too high"));
     assert!(
         state
             .last_error
@@ -3366,12 +3470,13 @@ async fn mexc_trade_slippage_error_includes_requested_and_actual_fill_details() 
     };
 
     let err = finalizer.trade(&mut state).await.expect_err("trade should fail");
-    assert!(err.contains("slice slippage too high"));
-    assert!(err.contains("requested_in="));
-    assert!(err.contains("actual_in="));
-    assert!(err.contains("actual_out="));
-    assert!(err.contains("preview_mid="));
-    assert!(err.contains("exec_price="));
+    let error = err.to_string();
+    assert!(error.contains("slice slippage too high"));
+    assert!(error.contains("requested_in="));
+    assert!(error.contains("actual_in="));
+    assert!(error.contains("actual_out="));
+    assert!(error.contains("preview_mid="));
+    assert!(error.contains("exec_price="));
 }
 
 #[tokio::test]
@@ -3543,7 +3648,7 @@ async fn mexc_trade_retries_current_leg_from_original_amount_after_mid_leg_error
         .trade(&mut state)
         .await
         .expect_err("first trade attempt should fail on slippage");
-    assert!(first_err.contains("slice slippage too high"));
+    assert!(first_err.to_string().contains("slice slippage too high"));
     assert!(matches!(state.step, CexStep::Trade));
 
     // Retry same state; the leg should resume from persisted progress without replaying the order.
@@ -3978,7 +4083,8 @@ async fn mexc_trade_errors_when_direct_market_cannot_be_resolved() {
         .expect_err("trade should fail when no direct leg can be resolved");
 
     assert!(
-        err.contains("could not resolve direct market") || err.contains("no configured MEXC pairs for hop discovery")
+        err.to_string().contains("could not resolve direct market")
+            || err.to_string().contains("no configured MEXC pairs for hop discovery")
     );
     assert!(matches!(state.step, CexStep::Trade));
 }
@@ -4645,7 +4751,7 @@ async fn mexc_trade_errors_when_no_hop_route_exists_in_configured_pairs() {
         .trade(&mut state)
         .await
         .expect_err("trade should fail when no configured hop route exists");
-    assert!(err.contains("no configured hop route"));
+    assert!(err.to_string().contains("no configured hop route"));
 }
 
 #[tokio::test]
@@ -5308,6 +5414,7 @@ async fn mexc_finish_builds_synthetic_swap_execution_from_state() {
         state.withdraw.withdraw_asset.clone(),
         2.0,
     ));
+    state.trade.trade_weighted_slippage_bps = Some(42.5);
 
     let swap = finalizer.finish(&receipt, &state).await.expect("finish should succeed");
 
@@ -5331,6 +5438,7 @@ async fn mexc_finish_builds_synthetic_swap_execution_from_state() {
 
     assert!((swap.exec_price - expected_price).abs() < 1e-9);
     assert!((swap.mid_price - expected_price).abs() < 1e-9);
+    assert_eq!(swap.realized_slippage_bps, 42.5);
 
     // Status and legs should reflect a single synthetic CEX hop.
     assert_eq!(swap.status, "completed".to_string());
@@ -5358,7 +5466,7 @@ async fn mexc_preview_route_returns_non_executable_for_zero_amount() {
     let preview = finalizer.preview_route(&receipt).await.expect("preview should succeed");
     assert!(!preview.is_executable);
     assert_eq!(preview.estimated_receive_amount, 0.0);
-    assert_eq!(preview.estimated_slippage_bps, 0.0);
+    assert_eq!(preview.estimated_price_impact_bps, 0.0);
     assert_eq!(preview.reason.as_deref(), Some("non-positive amount_in"));
 }
 
@@ -5425,7 +5533,7 @@ async fn mexc_preview_route_resolves_direct_buy_leg_when_sell_book_empty() {
     let preview = finalizer.preview_route(&receipt).await.expect("preview should succeed");
     assert!(preview.is_executable);
     assert!(preview.estimated_receive_amount > 0.0);
-    assert!(preview.estimated_slippage_bps >= 0.0);
+    assert!(preview.estimated_price_impact_bps >= 0.0);
 }
 
 mod fuzz {
@@ -5652,7 +5760,7 @@ mod fuzz {
                 state.withdraw.bridge.withdraw_planned_asset = Some("BTC".to_string());
 
                 let err = finalizer.trade(&mut state).await.expect_err("trade should fail");
-                assert!(err.contains("slice slippage too high"));
+                assert!(err.to_string().contains("slice slippage too high"));
                 assert!(matches!(state.step, CexStep::Trade));
                 assert!(state
                     .last_error
@@ -5821,7 +5929,7 @@ mod fuzz {
                 };
 
                 let first = finalizer.trade(&mut state).await.expect_err("first attempt should fail");
-                assert!(first.contains("slice slippage too high"));
+                assert!(first.to_string().contains("slice slippage too high"));
                 assert!(matches!(state.step, CexStep::Trade));
 
                 finalizer.trade(&mut state).await.expect("second attempt should recover");

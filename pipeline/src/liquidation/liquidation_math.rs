@@ -163,6 +163,42 @@ pub fn max_repay_from_collateral(
     Ok(repay_native)
 }
 
+/*
+ Convert a pay amount into receive-token native units at two RAY prices:
+
+   receive_native = pay_native * price_pay_ray * receive_scale
+                    / (pay_scale * price_receive_ray)
+
+ Both prices are quoted per whole token, so RAY cancels and only the decimal
+ scales remain. The single truncation rounds down.
+
+ Shared by liquidation sizing and the multi-venue quote guard, which compare
+ against the same expected output.
+*/
+pub fn oracle_implied_output(
+    pay_native: &Nat,
+    price_pay_ray: &Nat,
+    price_receive_ray: &Nat,
+    pay_decimals: u64,
+    receive_decimals: u64,
+) -> Result<Nat, String> {
+    if *price_pay_ray == 0u8 {
+        return Err("Zero pay price".into());
+    }
+    if *price_receive_ray == 0u8 {
+        return Err("Zero receive price".into());
+    }
+    if pay_decimals > 38 || receive_decimals > 38 {
+        return Err("decimals too large".into());
+    }
+
+    let pay_scale = pow10(pay_decimals);
+    let receive_scale = pow10(receive_decimals);
+    let numerator = pay_native.clone() * price_pay_ray.clone() * receive_scale;
+    let denominator = pay_scale * price_receive_ray.clone();
+    Ok(numerator / denominator)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -175,6 +211,31 @@ mod tests {
         assert!(compute_liquidation_amounts(&repay, &(10u128.pow(27)).into(), &Nat::from(0u8), 6, 8, 0, 0,).is_err());
         // Zero debt price
         assert!(compute_liquidation_amounts(&repay, &Nat::from(0u8), &(10u128.pow(27)).into(), 6, 8, 0, 0,).is_err());
+    }
+
+    #[test]
+    fn oracle_implied_output_is_direction_neutral_across_decimals() {
+        let ray = Nat::from(10u128.pow(27));
+        let price_icp = Nat::from(2u8) * ray.clone();
+        let price_usdc = ray.clone();
+
+        // 1 ICP (8 decimals) at $2 buys 2 ckUSDC (6 decimals).
+        let forward = oracle_implied_output(&Nat::from(100_000_000u64), &price_icp, &price_usdc, 8, 6).unwrap();
+        assert_eq!(forward, Nat::from(2_000_000u64));
+
+        // The reverse direction round-trips: 2 ckUSDC buys 1 ICP.
+        let reverse = oracle_implied_output(&forward, &price_usdc, &price_icp, 6, 8).unwrap();
+        assert_eq!(reverse, Nat::from(100_000_000u64));
+    }
+
+    #[test]
+    fn oracle_implied_output_rejects_zero_prices_and_huge_decimals() {
+        let ray = Nat::from(10u128.pow(27));
+        let amount = Nat::from(1_000u64);
+        assert!(oracle_implied_output(&amount, &Nat::from(0u8), &ray, 8, 6).is_err());
+        assert!(oracle_implied_output(&amount, &ray, &Nat::from(0u8), 8, 6).is_err());
+        assert!(oracle_implied_output(&amount, &ray, &ray, 39, 6).is_err());
+        assert!(oracle_implied_output(&amount, &ray, &ray, 8, 39).is_err());
     }
 
     #[test]

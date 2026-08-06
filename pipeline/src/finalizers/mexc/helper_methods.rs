@@ -1,5 +1,8 @@
 use super::*;
 use crate::finalizers::bridge_planner::BridgePlanner;
+use crate::finalizers::cex_finalizer::{CexRouteLeg, CexTradeSlice};
+use crate::finalizers::mexc::mexc_utils::parse_market_symbols;
+use crate::swappers::model::BPS_PER_RATIO_UNIT;
 
 struct PendingSliceRequest {
     requested_in: f64,
@@ -13,8 +16,6 @@ const DEPOSIT_CONFIRMATION_DELTA_EPSILON: f64 = 0.00001;
 const DEPOSIT_TOTAL_FREE_FALLBACK_SECS: i64 = 25;
 /// Hard stop to avoid unbounded per-leg slicing loops on pathological books.
 const MAX_SLICE_EXECUTION_ROUNDS: usize = 128;
-/// Basis points per 1.00 ratio value.
-const BPS_PER_RATIO_UNIT: f64 = 10_000.0;
 
 impl<C> MexcFinalizer<C>
 where
@@ -83,12 +84,19 @@ where
                 let observed_balance_delta = current_balance - baseline_balance;
                 if observed_balance_delta >= expected_floor {
                     if state.deposit.bridge.deposit_bridge_required {
-                        let cap = state
-                            .deposit
-                            .bridge
-                            .deposit_bridge_submit_amount
-                            .unwrap_or(expected_deposit_amount);
-                        state.trade.trade_next_amount_in = Some(observed_balance_delta.max(0.0).min(cap));
+                        // Cap at what this deposit can actually credit: the
+                        // post-fee expected amount. The bridge submit amount is
+                        // the pre-fee gross and is unreachable, because the
+                        // minter takes its withdrawal fee out of the transfer in
+                        // transit.
+                        //
+                        // The delta only reaches this ceiling when it is
+                        // contaminated — a concurrent deposit landing on the
+                        // same account inflates it beyond what this leg sent.
+                        // Capping on the gross would then size the trade above
+                        // what arrived and the venue rejects it as oversold.
+                        state.trade.trade_next_amount_in =
+                            Some(observed_balance_delta.max(0.0).min(expected_deposit_amount));
                     }
                     info!(
                         "[mexc] liq_id={} deposit confirmed: before={} after={} expected={}",
@@ -109,7 +117,7 @@ where
                     return Ok(());
                 }
 
-                info!(
+                debug!(
                     "[mexc] liq_id={} deposit pending: before={} current={} delta={} expected={}",
                     state.liq_id, baseline_balance, current_balance, observed_balance_delta, expected_deposit_amount
                 );
@@ -699,7 +707,7 @@ where
     }
 
     /// Simulate one leg with current orderbook for route previews.
-    pub(super) async fn preview_leg(
+    pub(in crate::finalizers::mexc) async fn preview_leg(
         &self,
         market: &str,
         side: &str,
@@ -1039,7 +1047,7 @@ where
         total_legs: usize,
         amount_in: f64,
         target_bps: f64,
-    ) -> Result<(f64, f64), String> {
+    ) -> Result<(f64, f64), CexBackendError> {
         // Resume from persisted per-leg progress if available.
         let mut remaining_in = state.trade.trade_progress_remaining_in.unwrap_or(amount_in);
         let mut total_out = state.trade.trade_progress_total_out.unwrap_or(0.0);
@@ -1060,7 +1068,7 @@ where
             if slice_round_count > MAX_SLICE_EXECUTION_ROUNDS {
                 let err = format!("trade slicing exceeded max rounds for market {}", leg.market);
                 state.last_error = Some(err.clone());
-                return Err(err);
+                return Err(err.into());
             }
 
             // Preview the next executable chunk using live orderbook depth.
@@ -1069,7 +1077,7 @@ where
                 Ok(preview) => preview,
                 Err(err) => {
                     state.last_error = Some(err.clone());
-                    return Err(err);
+                    return Err(err.into());
                 }
             };
 
@@ -1123,7 +1131,7 @@ where
                     Ok(price) => price,
                     Err(err) => {
                         state.last_error = Some(err.clone());
-                        return Err(err);
+                        return Err(err.into());
                     }
                 };
 
@@ -1148,7 +1156,7 @@ where
                     exec_price
                 );
                 state.last_error = Some(err.clone());
-                return Err(err);
+                return Err(err.into());
             }
 
             // Update weighted route-level aggregates used by finish/export summaries.

@@ -24,6 +24,7 @@ use liquidium_pipeline_commons::telemetry::{init_telemetry_from_env, init_teleme
 use std::path::PathBuf;
 #[cfg(target_os = "linux")]
 use std::process::Command;
+use std::process::ExitCode;
 #[cfg(target_os = "linux")]
 use std::time::{Duration, SystemTime};
 
@@ -106,8 +107,15 @@ enum AccountCommands {
     New,
 }
 
+/// Process entrypoint.
+///
+/// Returns [`ExitCode`] rather than exiting in place so the telemetry guard is
+/// still dropped (and buffered logs flushed) on the way out. Fatal faults must
+/// report a non-zero status: a supervisor that distinguishes clean shutdown from
+/// failure would otherwise read a permanently broken daemon as having stopped
+/// successfully.
 #[tokio::main]
-async fn main() {
+async fn main() -> ExitCode {
     load_env();
     let cli = Cli::parse();
     let running_under_systemd = is_systemd_service_process();
@@ -116,7 +124,7 @@ async fn main() {
         && let Some(reason) = detect_manual_run_block_reason(running_under_systemd)
     {
         eprintln!("{reason}");
-        return;
+        return ExitCode::FAILURE;
     }
 
     // Telemetry writes to stdout by default; in TUI mode it will corrupt the terminal.
@@ -149,12 +157,12 @@ async fn main() {
                             Ok(guard) => Some(guard),
                             Err(stdout_err) => {
                                 eprintln!("Failed to initialize telemetry fallback: {stdout_err}");
-                                return;
+                                return ExitCode::FAILURE;
                             }
                         }
                     } else {
                         eprintln!("Failed to initialize telemetry: {err}");
-                        return;
+                        return ExitCode::FAILURE;
                     }
                 }
             }
@@ -163,7 +171,7 @@ async fn main() {
             Ok(guard) => Some(guard),
             Err(err) => {
                 eprintln!("Failed to initialize telemetry: {err}");
-                return;
+                return ExitCode::FAILURE;
             }
         },
     };
@@ -171,7 +179,7 @@ async fn main() {
     match cli.command {
         Commands::Run { sock_path, .. } => {
             let sock_path = sock_path.unwrap_or_else(control_plane::default_sock_path);
-            run_liquidation_loop(sock_path).await;
+            run_liquidation_loop(sock_path).await
         }
         Commands::Tui {
             sock_path,
@@ -187,12 +195,16 @@ async fn main() {
             };
             if let Err(err) = commands::tui::run(opts).await {
                 eprintln!("TUI exited with error: {}", err);
+                return ExitCode::FAILURE;
             }
+            ExitCode::SUCCESS
         }
         Commands::Balance => {
             if let Err(e) = commands::funds::funds().await {
                 eprintln!("Balance check failed: {}", e);
+                return ExitCode::FAILURE;
             }
+            ExitCode::SUCCESS
         }
         Commands::Withdraw {
             source,
@@ -210,27 +222,39 @@ async fn main() {
                     amount.as_deref(),
                 ) {
                     (Some(s), Some(d), Some(a), Some(am)) => {
-                        commands::withdraw::withdraw_noninteractive(s, d, a, am).await;
+                        if let Err(e) = commands::withdraw::withdraw_noninteractive(s, d, a, am).await {
+                            eprintln!("Withdraw failed: {:#}", e);
+                            return ExitCode::FAILURE;
+                        }
+                        ExitCode::SUCCESS
                     }
                     _ => {
                         eprintln!(
                             "Missing flags. Required for non-interactive: --source <main|trader|recovery|bridge> --destination <main|trader|recovery|bridge|ACCOUNT|0xEVM_ADDRESS> --asset <SYMBOL|all> --amount <DECIMAL|all>.\nRun without flags to use the interactive wizard."
                         );
+                        ExitCode::FAILURE
                     }
                 }
             } else {
                 // Interactive wizard
-                commands::withdraw::withdraw().await;
+                if let Err(e) = commands::withdraw::withdraw().await {
+                    eprintln!("Withdraw failed: {:#}", e);
+                    return ExitCode::FAILURE;
+                }
+                ExitCode::SUCCESS
             }
         }
-        Commands::Account { subcommand } => match subcommand {
-            AccountCommands::Show => {
-                commands::account::show().await;
+        Commands::Account { subcommand } => {
+            let outcome = match subcommand {
+                AccountCommands::Show => commands::account::show().await,
+                AccountCommands::New => commands::account::new().await,
+            };
+            if let Err(e) = outcome {
+                eprintln!("Account command failed: {:#}", e);
+                return ExitCode::FAILURE;
             }
-            AccountCommands::New => {
-                commands::account::new().await;
-            }
-        },
+            ExitCode::SUCCESS
+        }
     }
 }
 

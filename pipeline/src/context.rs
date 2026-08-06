@@ -27,9 +27,12 @@ use liquidium_pipeline_connectors::{
 
 use crate::approval_state::ApprovalState;
 use crate::config::{Config, ConfigTrait};
-use crate::swappers::kong::kong_swapper::KongSwapSwapper;
-use crate::swappers::kong::kong_venue::KongVenue;
-use crate::swappers::router::{SwapRouter, SwapVenue};
+use crate::finalizers::icpswap::finalizer::IcpswapFinalizer;
+use crate::finalizers::multi_venue::ICPSWAP_VENUE_ID;
+use crate::swappers::icpswap::{
+    client::IcpswapClient, session::IcpswapAgentSessionFactory, types::IcpswapTokenMetadata, venue::IcpswapVenue,
+};
+use crate::watchdog::{balance_monitor::DEFAULT_LOW_BALANCE_ALERT_COOLDOWN, slack_watchdog_from_env};
 
 pub struct PipelineContext {
     pub config: Arc<Config>,
@@ -41,7 +44,7 @@ pub struct PipelineContext {
     pub agent: Arc<Agent>,
     pub main_transfers: Arc<TransferService>,
     pub trader_transfers: Arc<TransferService>,
-    pub swap_router: Arc<SwapRouter>,
+    pub icpswap_finalizer: Option<Arc<IcpswapFinalizer>>,
     pub recovery_transfers: Arc<TransferService>,
     pub bridge_transfers: Arc<TransferService>,
     pub evm_address: String,
@@ -191,11 +194,6 @@ impl<P: Provider<AnyNetwork> + WalletProvider<AnyNetwork> + Clone + 'static> Pip
             subaccount: None,
         };
 
-        let main_trader_account = Account {
-            owner: config.trader_principal,
-            subaccount: None,
-        };
-
         let recovery_icp_account = config.get_recovery_account();
         let bridge_icp_account = config.bridge_ic_account();
 
@@ -263,38 +261,60 @@ impl<P: Provider<AnyNetwork> + WalletProvider<AnyNetwork> + Clone + 'static> Pip
 
         let approval_state = Arc::new(ApprovalState::new());
 
-        // Setup swap venue
+        // Construct ICPSwap only when it is enabled. In particular, a MEXC-only
+        // process should not initialize clients or validate configuration for a
+        // venue that cannot be selected.
+        let icpswap_finalizer = if config.enabled_swap_venues.iter().any(|venue| venue == ICPSWAP_VENUE_ID) {
+            let icpswap_tokens: Vec<IcpswapTokenMetadata> = registry
+                .tokens
+                .values()
+                .filter_map(|t| match t {
+                    ChainToken::Icp { .. } => Some(IcpswapTokenMetadata {
+                        token: t.clone(),
+                        standard: "ICRC2".to_string(),
+                    }),
+                    _ => None,
+                })
+                .collect();
 
-        // Kong swapper uses the trader agent/backend, adjust ctor args to your real API
-        let kong_swapper = KongSwapSwapper::new(
-            icp_backend_trader.agent.clone(),
-            main_trader_account,
-            approval_state.clone(),
-        );
-        // Build Kong venue (ICP)
-        let icp_tokens: Vec<ChainToken> = registry
-            .tokens
-            .values()
-            .filter_map(|t| match t {
-                ChainToken::Icp { .. } => Some(t.clone()),
-                _ => None,
-            })
-            .collect();
+            let icpswap_client = Arc::new(IcpswapClient::new(
+                icp_backend_trader.agent.clone(),
+                icp_backend_trader.clone(),
+                config.icpswap_factory_canister,
+            ));
+            let icpswap_sessions = Arc::new(IcpswapAgentSessionFactory::new(
+                config.icpswap_mnemonic.clone(),
+                config.ic_url.clone(),
+                config.icpswap_factory_canister,
+                icp_backend_trader.clone(),
+            ));
+            let icpswap_venue = Arc::new(
+                IcpswapVenue::new(
+                    icpswap_client,
+                    icpswap_tokens,
+                    config.icpswap_fee_tiers.clone(),
+                    config.max_allowed_dex_slippage,
+                )
+                .map_err(|error| PipelineContextError::Other(format!("invalid ICPSwap configuration: {error}")))?,
+            );
 
-        let kong_swapper = Arc::new(kong_swapper);
-        let kong_venue: Arc<dyn SwapVenue> = Arc::new(KongVenue::new(kong_swapper, icp_tokens));
-
-        // let mexc_client = Arc::new(MexcClient::from_env()?);
-        // let mexc_venue: Arc<dyn SwapVenue> = Arc::new(MexcSwapVenue::new(mexc_client));
-
-        // Build router
-        let swap_router = SwapRouter::new().with_venue("kong", kong_venue);
-
-        let swap_router = Arc::new(swap_router);
-
+            Some(Arc::new(
+                IcpswapFinalizer::new(
+                    icpswap_venue,
+                    Account {
+                        owner: config.trader_principal,
+                        subaccount: None,
+                    },
+                    icpswap_sessions,
+                )
+                .with_watchdog(slack_watchdog_from_env(DEFAULT_LOW_BALANCE_ALERT_COOLDOWN)),
+            ))
+        } else {
+            None
+        };
         Ok(PipelineContext {
             config: config.clone(),
-            swap_router,
+            icpswap_finalizer,
             registry,
             main_service: Arc::new(main_service),
             trader_service: Arc::new(trader_service),
@@ -423,6 +443,9 @@ mod tests {
         let evm_test_private_key = std::env::var("EVM_TEST_PRIVATE_KEY").unwrap_or_default();
 
         Arc::new(Config {
+            icpswap_mnemonic: Arc::from(
+                "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about",
+            ),
             liquidator_identity: Arc::new(AnonymousIdentity {}),
             trader_identity: Arc::new(AnonymousIdentity {}),
             bridge_ic_identity: Arc::new(AnonymousIdentity {}),
@@ -451,13 +474,22 @@ mod tests {
             cex_buy_inverse_enabled: true,
             cex_retry_base_secs: 5,
             cex_retry_max_secs: 120,
-            cex_min_net_edge_bps: 25,
+            multi_venue_min_net_edge_bps: 25,
+            multi_venue_bad_debt_min_net_edge_bps: 25,
+            multi_venue_max_oracle_discount_bps: 250,
+            multi_venue_oracle_snapshot_max_age_secs: 300,
             cex_delay_buffer_bps: 15,
             cex_route_fee_bps: 12,
-            cex_force_over_usd_threshold: 0.0,
             cex_mexc_available_pairs: vec![],
             cex_mexc_max_hops: 2,
-            swapper: crate::config::SwapperMode::Hybrid,
+            icpswap_factory_canister: Principal::from_text(crate::config::DEFAULT_ICPSWAP_FACTORY_CANISTER)
+                .expect("principal"),
+            icpswap_fee_tiers: vec![candid::Nat::from(500u32), candid::Nat::from(3000u32)],
+            icpswap_max_price_impact_bps: 100.0,
+            icpswap_max_search_iterations: 16,
+            icpswap_dust_fallback_max_price_impact_bps: 150.0,
+            icpswap_test_allocation_usd: None,
+            enabled_swap_venues: vec!["icpswap".to_string(), "mexc".to_string()],
             cex_credentials: HashMap::new(),
             opportunity_account_filter: vec![],
         })

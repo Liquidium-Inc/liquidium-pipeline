@@ -4,19 +4,19 @@ use std::env;
 use async_trait::async_trait;
 
 use liquidium_pipeline_connectors::backend::cex_backend::{
-    BuyOrderInputMode, CexBackend, DepositAddress, OrderBook, OrderBookLevel, SwapExecutionOptions, SwapFillReport,
-    WithdrawStatus, WithdrawStatusSnapshot, WithdrawalReceipt,
+    BuyOrderInputMode, CexBackend, CexBackendError, DepositAddress, OrderBook, OrderBookLevel, SwapExecutionOptions,
+    SwapFillReport, WithdrawStatus, WithdrawStatusSnapshot, WithdrawalReceipt,
 };
 use log::{debug, info, warn};
 use rust_decimal::{Decimal, RoundingStrategy};
 use serde_json::Value;
 
+use crate::swappers::model::BPS_PER_RATIO_UNIT;
+
 /// Default orderbook depth level used for quote-cost and preview estimations.
 const DEFAULT_ORDERBOOK_DEPTH_LIMIT: u32 = 50;
 /// Default record limit for withdrawal history lookups.
 const DEFAULT_WITHDRAW_HISTORY_LIMIT: u32 = 50;
-/// Basis points per 1.00 ratio value.
-const BPS_PER_RATIO_UNIT: f64 = 10_000.0;
 /// MEXC spot fee assumption used to convert gross fills into net-usable output.
 const MEXC_SPOT_FEE_BPS: f64 = 5.01;
 /// Tiny safety increment to avoid borderline balance/rounding rejections between legs.
@@ -102,6 +102,20 @@ fn is_bad_symbol(err: &v3::ApiError) -> bool {
     matches!(
         err,
         v3::ApiError::ErrorResponse(resp) if resp.code == v3::ErrorCode::BadSymbol
+    )
+}
+
+/// Reports whether MEXC rejected the order because the funds it already shows
+/// in the account are not tradable yet.
+///
+/// `Oversold` is the sell-side form (base asset short) and `InsufficientPosition`
+/// the buy-side one (quote asset short). Both appear while a credited deposit is
+/// still settling into the matching engine, which is a wait, not a failure.
+fn is_pending_settlement(err: &v3::ApiError) -> bool {
+    matches!(
+        err,
+        v3::ApiError::ErrorResponse(resp)
+            if resp.code == v3::ErrorCode::Oversold || resp.code == v3::ErrorCode::InsufficientPosition
     )
 }
 
@@ -676,7 +690,7 @@ impl MexcClient {
         market: &str,
         side: &str,
         _amount_in: f64,
-    ) -> Result<(String, String), String> {
+    ) -> Result<(String, String), CexBackendError> {
         let mut last_err: Option<String> = None;
         for candidate in candidates {
             match ex
@@ -699,7 +713,7 @@ impl MexcClient {
                             candidate, market, side
                         );
                         warn!("[mexc] {}", details);
-                        return Err(details);
+                        return Err(details.into());
                     }
                     return Ok((candidate.clone(), order_id));
                 }
@@ -710,12 +724,15 @@ impl MexcClient {
                         last_err = Some(format!("Swap err: {}", details));
                         continue;
                     }
-                    return Err(format!("Swap err: {}", details));
+                    if is_pending_settlement(&e) {
+                        return Err(CexBackendError::PendingSettlement(format!("Swap err: {details}")));
+                    }
+                    return Err(format!("Swap err: {details}").into());
                 }
             }
         }
 
-        Err(last_err.unwrap_or_else(|| "Swap err: bad symbol".to_string()))
+        Err(last_err.unwrap_or_else(|| "Swap err: bad symbol".to_string()).into())
     }
 
     /// Converts MEXC order fill fields into side-agnostic execution amounts.
@@ -990,6 +1007,7 @@ impl CexBackend for MexcClient {
     async fn execute_swap_detailed(&self, market: &str, side: &str, amount_in: f64) -> Result<SwapFillReport, String> {
         self.execute_swap_detailed_with_options(market, side, amount_in, SwapExecutionOptions::default())
             .await
+            .map_err(|error| error.to_string())
     }
 
     async fn execute_swap_detailed_with_options(
@@ -998,7 +1016,7 @@ impl CexBackend for MexcClient {
         side: &str,
         amount_in: f64,
         options: SwapExecutionOptions,
-    ) -> Result<SwapFillReport, String> {
+    ) -> Result<SwapFillReport, CexBackendError> {
         let market_symbol = market.trim().to_ascii_uppercase();
         let symbol = normalize_market_symbol(&market_symbol);
         // Determine order params (side, quantity vs quote quantity) using filters.
@@ -1035,7 +1053,7 @@ impl CexBackend for MexcClient {
                 )
                 .await?
             }
-            _ => return Err(format!("unsupported side: {}", side)),
+            _ => return Err(format!("unsupported side: {side}").into()),
         };
 
         // Try multiple candidate symbols for MEXC quirks, then fetch the filled amount.
@@ -1087,13 +1105,15 @@ impl CexBackend for MexcClient {
                         }
 
                         if is_order_missing_lookup_error(&fetch_err) {
-                            return Err(format!(
-                                "order lookup pending after submit market={} side={} symbol={} order_id={} err={}",
-                                market, side, chosen_symbol, order_id, fetch_err
-                            ));
+                            // The order was accepted but the venue cannot read it
+                            // back yet. Same eventual-consistency wait as a
+                            // settling deposit, so it must not spend a retry.
+                            return Err(CexBackendError::PendingSettlement(format!(
+                                "order lookup pending after submit market={market} side={side} symbol={chosen_symbol} order_id={order_id} err={fetch_err}"
+                            )));
                         }
 
-                        Err(fetch_err)
+                        Err(fetch_err.into())
                     }
                 }
             }

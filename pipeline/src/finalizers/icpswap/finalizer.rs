@@ -5,7 +5,7 @@ use icrc_ledger_types::icrc1::account::Account;
 
 use crate::{
     finalizers::dex_finalizer::{DexRouteFinalizer, DexRoutePreview},
-    finalizers::finalizer::{Finalizer, FinalizerErrorKind, FinalizerResult},
+    finalizers::finalizer::{Finalizer, FinalizerError, FinalizerResult},
     persistance::{FinalizerDecisionSnapshot, VenueExecutionState, WalStore},
     stages::executor::{ExecutionReceipt, ExecutionStatus},
     swappers::{
@@ -220,7 +220,25 @@ impl IcpswapFinalizer {
 
 #[async_trait]
 impl Finalizer for IcpswapFinalizer {
-    async fn finalize(&self, wal: &dyn WalStore, receipt: ExecutionReceipt) -> Result<FinalizerResult, String> {
+    async fn finalize(
+        &self,
+        wal: &dyn WalStore,
+        receipt: ExecutionReceipt,
+    ) -> Result<FinalizerResult, FinalizerError> {
+        self.finalize_inner(wal, receipt).await.map_err(|error| {
+            // The sentinel stays private to this module; classification happens
+            // once, here, rather than being re-derived by the caller.
+            if error.starts_with(ICPSWAP_FINALIZER_PERMANENT_PREFIX) {
+                FinalizerError::Permanent(error)
+            } else {
+                FinalizerError::Retryable(error)
+            }
+        })
+    }
+}
+
+impl IcpswapFinalizer {
+    async fn finalize_inner(&self, wal: &dyn WalStore, receipt: ExecutionReceipt) -> Result<FinalizerResult, String> {
         if !matches!(receipt.status, ExecutionStatus::Success) || receipt.request.swap_args.is_none() {
             return Ok(FinalizerResult::noop());
         }
@@ -283,14 +301,6 @@ impl Finalizer for IcpswapFinalizer {
         }
 
         self.result_for_state(&receipt, &state, now_nanos).await
-    }
-
-    fn classify_error(&self, error: &str) -> FinalizerErrorKind {
-        if error.starts_with(ICPSWAP_FINALIZER_PERMANENT_PREFIX) {
-            FinalizerErrorKind::Permanent
-        } else {
-            FinalizerErrorKind::Retryable
-        }
     }
 }
 

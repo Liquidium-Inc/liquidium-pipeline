@@ -12,11 +12,11 @@ use liquidium_pipeline_connectors::backend::bridge_backend::{
     FINALIZER_PERMANENT_AMOUNT_FLOOR_PREFIX, resolve_route,
 };
 use liquidium_pipeline_connectors::backend::cex_backend::{
-    BuyOrderInputMode, CexBackend, OrderBookLevel, SwapExecutionOptions, WithdrawStatus,
+    BuyOrderInputMode, CexBackend, CexBackendError, OrderBookLevel, SwapExecutionOptions, WithdrawStatus,
 };
 use liquidium_pipeline_core::{
     account::model::ChainAccount,
-    tokens::{chain_token::ChainToken, chain_token_amount::ChainTokenAmount},
+    tokens::{chain_token::ChainToken, chain_token_amount::ChainTokenAmount, token_registry::TokenRegistryTrait},
     transfer::actions::TransferActions,
 };
 use log::{debug, info, warn};
@@ -24,10 +24,7 @@ use num_traits::ToPrimitive;
 use tokio::sync::Mutex as TokioMutex;
 use tokio::time::sleep;
 
-use super::mexc_utils::{
-    LIQUIDITY_EPS, SlicePreview, TradeLeg, f64_to_nat, is_usd_stable_symbol, mexc_special_trade_legs,
-    parse_market_symbols, simulate_buy_from_asks, simulate_sell_from_bids,
-};
+use super::mexc_utils::{LIQUIDITY_EPS, SlicePreview, TradeLeg, is_usd_stable_symbol, mexc_special_trade_legs};
 
 const WITHDRAW_BRIDGE_SOURCE_BALANCE_TOLERANCE: f64 = LIQUIDITY_EPS;
 const NATIVE_ETH_BRIDGEABLE_SAFETY_MARGIN: f64 = 1e-15;
@@ -38,13 +35,13 @@ const CKETH_DECIMALS: i32 = 18;
 
 use crate::{
     finalizers::bridge_planner::BridgePlanner,
-    finalizers::cex_finalizer::{
-        CexDepositBridgeState, CexDepositState, CexFinalizerLogic, CexRouteLeg, CexRoutePreview, CexState, CexStep,
-        CexTradeSlice, CexTradeState, CexWithdrawBridgeState, CexWithdrawState,
-    },
+    finalizers::cex_finalizer::{CexFinalizerLogic, CexRoutePreview, CexState, CexStep},
     stages::bridge_submit_lock::acquire_bridge_submit_lock,
     stages::executor::ExecutionReceipt,
-    swappers::model::{SwapExecution, SwapQuoteLeg},
+    swappers::{
+        mexc::orderbook_quote::{simulate_buy_from_asks, simulate_sell_from_bids},
+        model::SwapExecution,
+    },
     utils::{ICP_LEDGER_PRINCIPAL, now_ts},
 };
 
@@ -114,12 +111,24 @@ where
     pub cex_mexc_available_pairs: Vec<String>,
     /// Maximum intermediate hops allowed in graph-based route discovery.
     pub cex_mexc_max_hops: usize,
+    /// Extra end-to-end route costs included in conservative planner output.
+    pub quote_route_fee_bps: u32,
+    /// Price-move buffer for deposit/trade/withdraw latency.
+    pub quote_delay_buffer_bps: u32,
     /// Optional bridge runtime used by liquidation-linked bridge submit/poll flows.
     pub bridge: Option<MexcBridgeDependencies>,
+    /// Resolves the receive-side `AssetId` supplied by the generic venue
+    /// contract into the full chain token needed by deposits and withdrawals.
+    /// Legacy receipt-based execution does not need this dependency.
+    pub token_registry: Option<Arc<dyn TokenRegistryTrait>>,
     /// `approve_bumps` is only touched in short synchronous sections.
     approve_bumps: Mutex<HashMap<String, u8>>,
     /// `market_locks` is acquired/held in async trade flow, so it uses Tokio's async mutex.
     market_locks: TokioMutex<HashMap<String, Arc<TokioMutex<()>>>>,
+    /// Process-local proof that a persisted multi-venue intent came from this
+    /// live adapter. Missing proof after restart means the external call may
+    /// already have happened, so the leg is parked instead of repeated.
+    pub(super) multi_venue_armed_intents: Mutex<HashSet<String>>,
 }
 
 /// Number of orderbook levels used for impact simulation.
@@ -172,8 +181,18 @@ where
         Ok(normalized)
     }
 
-    fn native_icp_direct_withdraw_address(&self) -> String {
-        Self::principal_default_account_id_hex(self.liquidator_principal)
+    fn native_icp_direct_withdraw_address(&self, requested_destination: &str) -> Result<String, String> {
+        let requested_destination = requested_destination.trim();
+        if requested_destination.is_empty() {
+            return Ok(Self::principal_default_account_id_hex(self.liquidator_principal));
+        }
+        if let Ok(account_id) = Self::validate_icp_account_id_hex(requested_destination, "MEXC withdraw") {
+            return Ok(account_id);
+        }
+
+        let account = <Self as BridgePlanner>::parse_icp_account_like(requested_destination)?;
+        let subaccount = Subaccount(account.subaccount.unwrap_or([0; 32]));
+        Ok(AccountIdentifier::new(&account.owner, &subaccount).to_hex())
     }
 
     fn complete_withdraw_as_below_min_dust(
@@ -252,7 +271,7 @@ where
         }
     }
 
-    fn compute_fee_adjusted_deposit_transfer(
+    pub(super) fn compute_fee_adjusted_deposit_transfer(
         deposit_asset: &ChainToken,
         size_in: &ChainTokenAmount,
     ) -> Result<(Nat, ChainTokenAmount), String> {
@@ -413,6 +432,17 @@ where
         self
     }
 
+    pub fn with_token_registry(mut self, token_registry: Arc<dyn TokenRegistryTrait>) -> Self {
+        self.token_registry = Some(token_registry);
+        self
+    }
+
+    pub fn with_quote_costs(mut self, route_fee_bps: u32, delay_buffer_bps: u32) -> Self {
+        self.quote_route_fee_bps = route_fee_bps;
+        self.quote_delay_buffer_bps = delay_buffer_bps;
+        self
+    }
+
     // used in tests
     #[allow(unused)]
     pub fn new(
@@ -463,9 +493,13 @@ where
             cex_buy_inverse_enabled,
             cex_mexc_available_pairs: vec![],
             cex_mexc_max_hops: DEFAULT_MEXC_MAX_HOPS,
+            quote_route_fee_bps: 0,
+            quote_delay_buffer_bps: 0,
             bridge: None,
+            token_registry: None,
             approve_bumps: Mutex::new(HashMap::new()),
             market_locks: TokioMutex::new(HashMap::new()),
+            multi_venue_armed_intents: Mutex::new(HashSet::new()),
         }
     }
 }
@@ -481,6 +515,10 @@ impl<B> CexFinalizerLogic for MexcFinalizer<B>
 where
     B: CexBackend,
 {
+    fn venue_id(&self) -> &'static str {
+        "mexc"
+    }
+
     async fn prepare(&self, liq_id: &str, receipt: &ExecutionReceipt) -> Result<CexState, String> {
         let amount = &receipt
             .liquidation_result
@@ -488,83 +526,12 @@ where
             .ok_or_else(|| "missing liquidation result".to_string())?
             .amounts
             .collateral_received;
-
-        let bridge_plan =
-            self.resolve_bridge_plan_for_assets(&receipt.request.collateral_asset, &receipt.request.debt_asset);
-
-        let size_in = ChainTokenAmount {
-            token: receipt.request.collateral_asset.clone(),
-            value: amount.clone(),
-        };
-
-        Ok(CexState {
-            liq_id: liq_id.to_string(),
-            step: CexStep::Deposit,
-            last_error: None,
-            market: format!("{}_{}", bridge_plan.deposit.cex_asset, bridge_plan.withdraw.cex_asset),
-            side: "sell".to_string(),
-            size_in,
-            deposit: CexDepositState {
-                deposit_asset: receipt.request.collateral_asset.clone(),
-                deposit_txid: None,
-                deposit_balance_before: None,
-                deposit_sent_at_ts: None,
-                approval_bump_count: None,
-                bridge: CexDepositBridgeState {
-                    deposit_planned_asset: Some(bridge_plan.deposit.cex_asset),
-                    deposit_planned_network: Some(bridge_plan.deposit.cex_network),
-                    deposit_bridge_required: bridge_plan.deposit.bridge_required,
-                    deposit_bridge_id: None,
-                    deposit_bridge_submitted_at_ts: None,
-                    deposit_bridge_polled_at_ts: None,
-                    deposit_bridge_destination_snapshot: None,
-                    deposit_bridge_submit_amount: None,
-                    deposit_bridge_expected_amount: None,
-                    deposit_bridge_provider_fee_budget_native_units: None,
-                },
-            },
-            trade: CexTradeState {
-                trade_leg_index: None,
-                trade_leg_total: None,
-                trade_resolved_legs: Vec::new(),
-                trade_last_market: None,
-                trade_last_side: None,
-                trade_last_amount_in: None,
-                trade_last_amount_out: None,
-                trade_next_amount_in: None,
-                trade_weighted_slippage_bps: None,
-                trade_mid_notional_sum: None,
-                trade_exec_notional_sum: None,
-                trade_slices: Vec::new(),
-                trade_dust_skipped: false,
-                trade_dust_usd: None,
-                trade_progress_remaining_in: None,
-                trade_progress_total_out: None,
-                trade_pending_client_order_id: None,
-                trade_pending_market: None,
-                trade_pending_side: None,
-                trade_pending_requested_in: None,
-                trade_pending_buy_mode: None,
-                trade_inverse_retry_count: 0,
-                trade_unexecutable_residual_in: None,
-            },
-            withdraw: CexWithdrawState {
-                withdraw_asset: receipt.request.debt_asset.clone(),
-                withdraw_address: self.liquidator_principal.to_text(),
-                withdraw_id: None,
-                withdraw_txid: None,
-                size_out: None,
-                bridge: CexWithdrawBridgeState {
-                    withdraw_planned_asset: Some(bridge_plan.withdraw.cex_asset),
-                    withdraw_planned_network: Some(bridge_plan.withdraw.cex_network),
-                    withdraw_bridge_required: bridge_plan.withdraw.bridge_required,
-                    withdraw_bridge_id: None,
-                    withdraw_bridge_submitted_at_ts: None,
-                    withdraw_bridge_polled_at_ts: None,
-                    withdraw_bridge_destination_snapshot: None,
-                },
-            },
-        })
+        self.prepare_amount_scoped_state(
+            liq_id,
+            ChainTokenAmount::from_raw(receipt.request.collateral_asset.clone(), amount.clone()),
+            receipt.request.debt_asset.clone(),
+            None,
+        )
     }
 
     async fn deposit(&self, state: &mut CexState) -> Result<(), String> {
@@ -630,7 +597,8 @@ where
                 let tx_id = self
                     .transfer_service
                     .transfer(&state.deposit.deposit_asset, &destination, transfer_value.clone())
-                    .await?;
+                    .await
+                    .map_err(|error| error.to_string())?;
 
                 state.trade.trade_next_amount_in = Some(transfer_amount.to_f64());
                 state.deposit.deposit_txid = Some(tx_id);
@@ -731,7 +699,8 @@ where
             let tx_id = self
                 .transfer_service
                 .transfer(&state.deposit.deposit_asset, &bridge_destination, transfer_value)
-                .await?;
+                .await
+                .map_err(|error| error.to_string())?;
 
             state.deposit.bridge.deposit_bridge_submit_amount = Some(bridge_submit_amount);
             state.deposit.bridge.deposit_bridge_expected_amount = Some(bridge_expected_amount);
@@ -937,7 +906,7 @@ where
     ///
     /// Error path:
     /// - returns `Err` and stores a descriptive `state.last_error` where applicable
-    async fn trade(&self, state: &mut CexState) -> Result<(), String> {
+    async fn trade(&self, state: &mut CexState) -> Result<(), CexBackendError> {
         self.ensure_plan_on_state(state);
         state.market = format!(
             "{}_{}",
@@ -1102,9 +1071,16 @@ where
         if !state.withdraw.bridge.withdraw_bridge_required {
             let direct_destination = if planned_network.eq_ignore_ascii_case("ICP") {
                 if Self::is_native_icp_token(&state.withdraw.withdraw_asset) {
-                    self.native_icp_direct_withdraw_address()
+                    self.native_icp_direct_withdraw_address(&state.withdraw.withdraw_address)?
                 } else {
-                    self.liquidator_principal.to_text()
+                    let raw = state.withdraw.withdraw_address.trim();
+                    if raw.is_empty() {
+                        return Err(format!(
+                            "missing ICP withdraw destination for {}@{}",
+                            planned_asset, planned_network
+                        ));
+                    }
+                    raw.to_string()
                 }
             } else if planned_network.eq_ignore_ascii_case("ETH")
                 || planned_network.to_ascii_lowercase().starts_with("evm")
@@ -1428,126 +1404,32 @@ where
     }
 
     async fn finish(&self, _receipt: &ExecutionReceipt, state: &CexState) -> Result<SwapExecution, String> {
-        let receive_amount = state
-            .withdraw
-            .size_out
-            .clone()
-            .ok_or_else(|| "receive amount missing".to_string())?;
-
-        // Pay side: seized collateral we sent in, as recorded on the CEX state.
-        let pay_amount = state.size_in.clone();
-
-        // Compute an effective execution price in native units: receive / pay.
-        let pay_f = pay_amount.to_f64();
-        let recv_f = receive_amount.to_f64();
-
-        let exec_price = if pay_f > 0.0 { recv_f / pay_f } else { 0.0 };
-        let mid_price = if let (Some(mid_sum), Some(exec_sum)) =
-            (state.trade.trade_mid_notional_sum, state.trade.trade_exec_notional_sum)
-        {
-            if exec_sum > LIQUIDITY_EPS {
-                (mid_sum / exec_sum) * exec_price
-            } else {
-                exec_price
-            }
-        } else {
-            exec_price
-        };
-
-        let slippage = state.trade.trade_weighted_slippage_bps.unwrap_or(0.0);
-        let legs: Vec<SwapQuoteLeg> = state
-            .trade
-            .trade_slices
-            .iter()
-            .map(|slice| {
-                let (base, quote) = parse_market_symbols(&slice.market).unwrap_or_else(|| {
-                    (
-                        state.deposit.deposit_asset.symbol().to_ascii_uppercase(),
-                        state.withdraw.withdraw_asset.symbol().to_ascii_uppercase(),
-                    )
-                });
-                let (pay_symbol, recv_symbol, pay_amount, recv_amount) = if slice.side.eq_ignore_ascii_case("sell") {
-                    (base, quote, slice.amount_in, slice.amount_out)
-                } else {
-                    (quote, base, slice.amount_in, slice.amount_out)
-                };
-
-                SwapQuoteLeg {
-                    venue: "mexc".to_string(),
-                    route_id: slice.market.clone(),
-                    pay_chain: state.deposit.deposit_asset.chain(),
-                    pay_symbol,
-                    pay_amount: f64_to_nat(pay_amount),
-                    receive_chain: state.withdraw.withdraw_asset.chain(),
-                    receive_symbol: recv_symbol,
-                    receive_amount: f64_to_nat(recv_amount),
-                    price: slice.exec_price,
-                    lp_fee: Nat::from(0u8),
-                    gas_fee: Nat::from(0u8),
-                }
-            })
-            .collect();
-
-        let exec = SwapExecution {
-            swap_id: 0,
-            request_id: 0,
-            status: "completed".to_string(),
-            pay_asset: state.deposit.deposit_asset.asset_id(),
-            pay_amount: pay_amount.value,
-            receive_asset: state.withdraw.withdraw_asset.asset_id(),
-            receive_amount: receive_amount.value,
-            mid_price,
-            exec_price,
-            realized_slippage_bps: slippage,
-            legs,
-            approval_count: state.deposit.approval_bump_count,
-            ts: now_ts().max(0) as u64,
-        };
-
-        Ok(exec)
+        self.finish_state(state)
     }
 
     async fn preview_route(&self, receipt: &ExecutionReceipt) -> Result<CexRoutePreview, String> {
         let state = self.prepare("preview", receipt).await?;
+        let initial_amount = state.size_in.to_f64();
+        if initial_amount <= LIQUIDITY_EPS {
+            return Ok(CexRoutePreview {
+                is_executable: false,
+                estimated_receive_amount: 0.0,
+                estimated_price_impact_bps: 0.0,
+                reason: Some("non-positive amount_in".to_string()),
+            });
+        }
         let legs = self
             .resolve_trade_legs_for_symbols(
                 &<Self as BridgePlanner>::planned_deposit_asset(&state),
                 &<Self as BridgePlanner>::planned_withdraw_asset(&state),
             )
             .await?;
-        let mut amount_in = state.size_in.to_f64();
-        if amount_in <= LIQUIDITY_EPS {
-            return Ok(CexRoutePreview {
-                is_executable: false,
-                estimated_receive_amount: 0.0,
-                estimated_slippage_bps: 0.0,
-                reason: Some("non-positive amount_in".to_string()),
-            });
-        }
-
-        let mut weighted_slippage_sum = 0.0;
-        let mut weighted_notional_usd = 0.0;
-        for leg in &legs {
-            let (out, _avg_price, impact_bps) = self.preview_leg(&leg.market, &leg.side, amount_in).await?;
-            let leg_notional_usd = self
-                .input_slice_usd(&leg.market, &leg.side, amount_in)
-                .await
-                .unwrap_or(0.0);
-            weighted_slippage_sum += impact_bps * leg_notional_usd;
-            weighted_notional_usd += leg_notional_usd;
-            amount_in = out;
-        }
-
-        let route_slippage_bps = if weighted_notional_usd > LIQUIDITY_EPS {
-            weighted_slippage_sum / weighted_notional_usd
-        } else {
-            0.0
-        };
+        let route_preview = self.preview_resolved_trade_route(&legs, initial_amount).await?;
 
         Ok(CexRoutePreview {
             is_executable: true,
-            estimated_receive_amount: amount_in,
-            estimated_slippage_bps: route_slippage_bps,
+            estimated_receive_amount: route_preview.receive_amount,
+            estimated_price_impact_bps: route_preview.price_impact_bps,
             reason: None,
         })
     }

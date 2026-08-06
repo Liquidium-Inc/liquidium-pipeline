@@ -17,7 +17,7 @@ use tracing::{Instrument, info, info_span, warn};
 use crate::config::Config;
 use crate::executors::basic::basic_executor::BasicExecutor;
 use crate::finalizers::liquidation_outcome::LiquidationOutcome;
-use crate::finalizers::{hybrid::hybrid_finalizer::HybridFinalizer, profit_calculator::SimpleProfitCalculator};
+use crate::finalizers::{multi_venue::MultiVenueFinalizer, profit_calculator::SimpleProfitCalculator};
 use crate::liquidation::collateral_service::CollateralService;
 use crate::output::human_output_enabled;
 use crate::persistance::sqlite::SqliteWalStore;
@@ -28,7 +28,6 @@ use crate::stages::{
     export::ExportStage, finalize::FinalizeStage, opportunity::OpportunityFinder,
     simple_strategy::SimpleLiquidationStrategy,
 };
-use crate::swappers::router::SwapRouter;
 use crate::watchdog::{Watchdog, WatchdogEvent, balance_monitor::LowBalanceMonitor};
 use anyhow::Context as _;
 use futures::{FutureExt, StreamExt, stream};
@@ -242,6 +241,7 @@ pub(crate) fn bootstrap_control_plane(
         .with_context(|| format!("initialize control socket at {}", sock_path.display()))?;
 
     let state_store = control_state_store.clone();
+    let termination_watchdog = lifecycle_watchdog.clone();
     tokio::spawn(async move {
         let on_transition = Arc::new(move |is_paused: bool| {
             if let Err(err) = state_store.set_daemon_paused(is_paused) {
@@ -256,10 +256,7 @@ pub(crate) fn bootstrap_control_plane(
                         "Liquidation initiation suspended; queued finalization and housekeeping continue.".to_string(),
                     )
                 } else {
-                    (
-                        "resumed".to_string(),
-                        "Liquidation initiation enabled.".to_string(),
-                    )
+                    ("resumed".to_string(), "Liquidation initiation enabled.".to_string())
                 };
                 tokio::spawn(async move {
                     watchdog.notify(WatchdogEvent::Lifecycle { state, details }).await;
@@ -270,7 +267,21 @@ pub(crate) fn bootstrap_control_plane(
         if let Err(err) =
             crate::control_plane::serve_bound_listener_with_hook(control_listener, paused, Some(on_transition)).await
         {
+            // The accept loop already retries transient failures, so reaching
+            // here means the socket is unusable and pause/resume is gone for
+            // this process lifetime. Liquidations keep running, which is why
+            // this has to be escalated rather than left in the log.
             tracing::error!("Control plane terminated: {}", err);
+            if let Some(watchdog) = termination_watchdog {
+                watchdog
+                    .notify(WatchdogEvent::Lifecycle {
+                        state: "degraded".to_string(),
+                        details: format!(
+                            "Control plane terminated: {err}. Liquidations continue, but pause/resume is unavailable until restart."
+                        ),
+                    })
+                    .await;
+            }
         }
     });
 
@@ -287,15 +298,10 @@ pub(crate) fn bootstrap_control_plane(
 ///   downstream outages or unexpected runtime faults.
 pub(crate) async fn run_daemon_cycle_loop(
     finder: &OpportunityFinder<Agent>,
-    strategy: &SimpleLiquidationStrategy<
-        SwapRouter,
-        Config,
-        TokenRegistry,
-        CollateralService<LiquidationPriceOracle<Agent>>,
-    >,
+    strategy: &SimpleLiquidationStrategy<Config, TokenRegistry, CollateralService<LiquidationPriceOracle<Agent>>>,
     executor: &Arc<BasicExecutor<Agent, SqliteWalStore>>,
     exporter: &Arc<ExportStage>,
-    finalizer: &Arc<FinalizeStage<HybridFinalizer<Config>, SqliteWalStore, SimpleProfitCalculator, Agent>>,
+    finalizer: &Arc<FinalizeStage<MultiVenueFinalizer, SqliteWalStore, SimpleProfitCalculator, Agent>>,
     liq_dog: &Arc<dyn Watchdog>,
     slack_watchdog: Option<Arc<dyn Watchdog>>,
     low_balance_monitor: Option<Arc<LowBalanceMonitor>>,
@@ -384,15 +390,10 @@ where
 
 async fn run_single_daemon_cycle(
     finder: &OpportunityFinder<Agent>,
-    strategy: &SimpleLiquidationStrategy<
-        SwapRouter,
-        Config,
-        TokenRegistry,
-        CollateralService<LiquidationPriceOracle<Agent>>,
-    >,
+    strategy: &SimpleLiquidationStrategy<Config, TokenRegistry, CollateralService<LiquidationPriceOracle<Agent>>>,
     executor: &Arc<BasicExecutor<Agent, SqliteWalStore>>,
     exporter: &Arc<ExportStage>,
-    finalizer: &Arc<FinalizeStage<HybridFinalizer<Config>, SqliteWalStore, SimpleProfitCalculator, Agent>>,
+    finalizer: &Arc<FinalizeStage<MultiVenueFinalizer, SqliteWalStore, SimpleProfitCalculator, Agent>>,
     liq_dog: &Arc<dyn Watchdog>,
     slack_watchdog: Option<&Arc<dyn Watchdog>>,
     low_balance_monitor: Option<&LowBalanceMonitor>,
