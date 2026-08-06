@@ -981,9 +981,12 @@ async fn the_plan_records_the_floor_it_was_actually_held_to() {
     .expect("bad debt is accepted by its own floor");
 
     assert!(state.plan.combined_net_edge_bps < 0.0);
-    assert_eq!(state.plan.min_net_edge_bps, -6_000);
+    assert_eq!(state.plan.enforced_min_net_edge_bps, Some(-6_000));
+    // The unsigned field keeps carrying the ordinary floor so a binary that
+    // predates `enforced_min_net_edge_bps` can still decode the row.
+    assert_eq!(state.plan.min_net_edge_bps, 150);
 
-    // A profitable row still records the ordinary floor.
+    // A profitable row is held to, and records, the ordinary floor.
     let profitable = planner(
         mock_adapter(ICPSWAP_VENUE_ID, Arc::new(Mutex::new(Vec::new())), |request| {
             Ok(proportional_preview(request, ICPSWAP_VENUE_ID, 0.0, 2))
@@ -997,7 +1000,80 @@ async fn the_plan_records_the_floor_it_was_actually_held_to() {
     .await
     .expect("profitable plan");
 
+    assert_eq!(profitable.plan.enforced_min_net_edge_bps, Some(150));
     assert_eq!(profitable.plan.min_net_edge_bps, 150);
+}
+
+/// A row committed before `enforced_min_net_edge_bps` existed must still decode,
+/// which is the whole reason the floor is a new field rather than a wider one.
+#[tokio::test]
+async fn a_plan_without_the_enforced_floor_still_decodes() {
+    let state = planner(
+        mock_adapter(ICPSWAP_VENUE_ID, Arc::new(Mutex::new(Vec::new())), |request| {
+            Ok(proportional_preview(request, ICPSWAP_VENUE_ID, 0.0, 2))
+        }),
+        mock_adapter(MEXC_VENUE_ID, Arc::new(Mutex::new(Vec::new())), |request| {
+            Ok(proportional_preview(request, MEXC_VENUE_ID, 0.0, 2))
+        }),
+        config(1.1),
+    )
+    .plan(&input_with_pay_token(native_icp()), QUOTED_AT)
+    .await
+    .expect("profitable plan");
+
+    let mut json = serde_json::to_value(&state.plan)
+        .expect("serialize plan")
+        .as_object()
+        .expect("plan object")
+        .clone();
+    json.remove("enforced_min_net_edge_bps");
+
+    let decoded: crate::persistance::MultiVenueExecutionPlan =
+        serde_json::from_value(serde_json::Value::Object(json)).expect("a plan predating the field still decodes");
+
+    assert_eq!(decoded.enforced_min_net_edge_bps, None);
+    assert_eq!(decoded.min_net_edge_bps, 150);
+}
+
+/// The rollback direction, which is why the enforced floor is not stored by
+/// widening `min_net_edge_bps` to `i32`: a binary predating this field must be
+/// able to read a bad-debt row this one committed. A negative value in the old
+/// field would fail to decode, and an undecodable committed row is parked or
+/// permanently failed while its legs may still hold funds.
+#[tokio::test]
+async fn a_binary_predating_the_enforced_floor_can_still_read_a_bad_debt_row() {
+    /// The plan as an older build declares it: unsigned floor, no knowledge of
+    /// `enforced_min_net_edge_bps`.
+    #[derive(serde::Deserialize)]
+    struct LegacyPlan {
+        min_net_edge_bps: u32,
+    }
+
+    let mut bad_debt = input_with_pay_token(native_icp());
+    bad_debt.buy_bad_debt = true;
+    let losing_venue = |venue_id: &'static str| {
+        mock_adapter(venue_id, Arc::new(Mutex::new(Vec::new())), move |request| {
+            Ok(proportional_preview(request, venue_id, 0.0, 1))
+        })
+    };
+
+    let state = planner(
+        losing_venue(ICPSWAP_VENUE_ID),
+        losing_venue(MEXC_VENUE_ID),
+        IcpswapFirstPlannerConfig {
+            bad_debt_min_net_edge_bps: -6_000,
+            ..config(1.1)
+        },
+    )
+    .plan(&bad_debt, QUOTED_AT)
+    .await
+    .expect("bad debt is accepted by its own floor");
+
+    let json = serde_json::to_string(&state.plan).expect("serialize plan");
+    assert!(json.contains("-6000"), "the enforced negative floor must be persisted");
+
+    let legacy: LegacyPlan = serde_json::from_str(&json).expect("an older build must still decode this row");
+    assert_eq!(legacy.min_net_edge_bps, 150);
 }
 
 #[test]

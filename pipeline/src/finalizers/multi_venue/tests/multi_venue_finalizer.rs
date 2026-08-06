@@ -1061,6 +1061,44 @@ async fn committed_state_this_build_cannot_read_is_parked_not_failed() {
     );
 }
 
+/// A committed payload whose `kind` this build does not know decodes no better
+/// than a version it cannot read: both mean the row's legs may hold funds this
+/// binary cannot account for, so both must park rather than burn the retry
+/// budget and fail permanently.
+#[tokio::test]
+async fn committed_payload_of_an_unknown_kind_is_parked_not_failed() {
+    let receipt = receipt();
+    let wal = TestWal::with_receipt(&receipt);
+    let mexc = Arc::new(ScriptedAdapter::new(MEXC_VENUE_ID, None, Vec::new()));
+
+    let finalizer = finalizer(vec![mexc.clone()]);
+    let _ = finalizer.finalize(&wal, receipt.clone()).await;
+
+    // Stands in for a payload variant written by a newer binary and read back
+    // after a rollback.
+    let mut row = wal.row.lock().expect("WAL lock").clone().expect("WAL row");
+    assert!(
+        row.meta_json.contains("multi_venue_swap"),
+        "expected a committed multi-venue payload to rewrite"
+    );
+    row.meta_json = row.meta_json.replace("multi_venue_swap", "some_future_venue_swap");
+    *wal.row.lock().expect("WAL lock") = Some(row);
+
+    let error = finalizer
+        .finalize(&wal, receipt)
+        .await
+        .expect_err("an undecodable payload cannot be planned");
+
+    assert!(
+        matches!(error, FinalizerError::Unresumable(_)),
+        "an undecodable row must be parked, not failed: {error:?}"
+    );
+    assert!(
+        error.message().contains("cannot be read by this build"),
+        "the reason must point at the binary, not the liquidation: {error}"
+    );
+}
+
 /// A receipt that cannot be planned from is broken in a way no retry can
 /// repair, so it must not spend the row's retry budget before saying so.
 #[tokio::test]

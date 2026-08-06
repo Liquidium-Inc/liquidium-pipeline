@@ -147,6 +147,7 @@ fn state_with_venues(venues: &[(&str, u64)]) -> MultiVenueExecutionState {
                 MultiVenueAllocationReason::PriceImpactSplit
             },
             min_net_edge_bps: 150,
+            enforced_min_net_edge_bps: Some(150),
             estimated_receive: estimated_receive.clone(),
             conservative_receive: estimated_receive,
             combined_net_edge_bps: 175.0,

@@ -73,10 +73,16 @@ pub struct MultiVenueExecutionPlan {
     pub receive_asset: AssetId,
     pub debt_repaid: ChainTokenAmount,
     pub allocation_reason: MultiVenueAllocationReason,
-    /// The floor this plan was actually held to. Signed because a bad-debt row
-    /// is bought at a known loss and carries a deliberately negative floor;
-    /// recording the unsigned one would misreport what was enforced.
-    pub min_net_edge_bps: i32,
+    pub min_net_edge_bps: u32,
+    /// The floor this plan was actually held to, which for a bad-debt row is
+    /// the deliberately negative one rather than `min_net_edge_bps`. Kept as a
+    /// separate optional field rather than widening `min_net_edge_bps` to `i32`
+    /// so a binary that predates it still reads these rows: a negative value in
+    /// the old field would fail to decode, and an undecodable committed row is
+    /// far more dangerous than an imprecise one. `None` on rows written before
+    /// this field existed.
+    #[serde(default)]
+    pub enforced_min_net_edge_bps: Option<i32>,
     pub estimated_receive: ChainTokenAmount,
     pub conservative_receive: ChainTokenAmount,
     pub combined_net_edge_bps: f64,
