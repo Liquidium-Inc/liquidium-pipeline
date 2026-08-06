@@ -699,6 +699,7 @@ mod tests {
                         venue_id: "icpswap".to_string(),
                     },
                     min_net_edge_bps: 150,
+                    enforced_min_net_edge_bps: Some(150),
                     estimated_receive: quoted_output,
                     conservative_receive: receive,
                     combined_net_edge_bps: 175.0,

@@ -12,7 +12,7 @@ use liquidium_pipeline_connectors::backend::bridge_backend::{
     FINALIZER_PERMANENT_AMOUNT_FLOOR_PREFIX, resolve_route,
 };
 use liquidium_pipeline_connectors::backend::cex_backend::{
-    BuyOrderInputMode, CexBackend, OrderBookLevel, SwapExecutionOptions, WithdrawStatus,
+    BuyOrderInputMode, CexBackend, CexSubmissionError, OrderBookLevel, SwapExecutionOptions, WithdrawStatus,
 };
 use liquidium_pipeline_core::{
     account::model::ChainAccount,
@@ -1030,7 +1030,7 @@ where
     ///
     /// Error path:
     /// - returns `Err` and stores a descriptive `state.last_error` where applicable
-    async fn trade(&self, state: &mut CexState) -> Result<(), String> {
+    async fn trade(&self, state: &mut CexState) -> Result<(), CexSubmissionError> {
         self.ensure_plan_on_state(state);
         state.market = format!(
             "{}_{}",

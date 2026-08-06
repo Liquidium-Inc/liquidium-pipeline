@@ -1067,6 +1067,44 @@ async fn committed_state_this_build_cannot_read_is_parked_not_failed() {
     );
 }
 
+/// A committed payload whose `kind` this build does not know decodes no better
+/// than a version it cannot read: both mean the row's legs may hold funds this
+/// binary cannot account for, so both must park rather than burn the retry
+/// budget and fail permanently.
+#[tokio::test]
+async fn committed_payload_of_an_unknown_kind_is_parked_not_failed() {
+    let receipt = receipt();
+    let wal = TestWal::with_receipt(&receipt);
+    let mexc = Arc::new(ScriptedAdapter::new(MEXC_VENUE_ID, None, Vec::new()));
+
+    let finalizer = finalizer(vec![mexc.clone()]);
+    let _ = finalizer.finalize(&wal, receipt.clone()).await;
+
+    // Stands in for a payload variant written by a newer binary and read back
+    // after a rollback.
+    let mut row = wal.row.lock().expect("WAL lock").clone().expect("WAL row");
+    assert!(
+        row.meta_json.contains("multi_venue_swap"),
+        "expected a committed multi-venue payload to rewrite"
+    );
+    row.meta_json = row.meta_json.replace("multi_venue_swap", "some_future_venue_swap");
+    *wal.row.lock().expect("WAL lock") = Some(row);
+
+    let error = finalizer
+        .finalize(&wal, receipt)
+        .await
+        .expect_err("an undecodable payload cannot be planned");
+
+    assert!(
+        matches!(error, FinalizerError::Unresumable(_)),
+        "an undecodable row must be parked, not failed: {error:?}"
+    );
+    assert!(
+        error.message().contains("cannot be read by this build"),
+        "the reason must point at the binary, not the liquidation: {error}"
+    );
+}
+
 /// A receipt that cannot be planned from is broken in a way no retry can
 /// repair, so it must not spend the row's retry budget before saying so.
 #[tokio::test]
@@ -1448,6 +1486,44 @@ async fn operator_required_mexc_leg_is_parked_across_restarts() {
         watchdog.0.lock().expect("watchdog lock").as_slice(),
         &[("mexc-0".to_string(), "venue_reconciliation".to_string())]
     );
+    assert!(matches!(
+        committed_state(&wal).outcome,
+        MultiVenueExecutionOutcome::OperatorRequired { .. }
+    ));
+}
+
+#[tokio::test]
+async fn a_parked_leg_does_not_freeze_a_still_running_sibling() {
+    let receipt = receipt();
+    let wal = TestWal::with_receipt(&receipt);
+    // A split plan where ICPSwap parks for reconciliation while the MEXC leg
+    // still has an open order. Parking the row here would stop the daemon from
+    // ever polling that order again.
+    let icpswap = Arc::new(ScriptedAdapter::new(
+        ICPSWAP_VENUE_ID,
+        Some(TOTAL_PAY / 2),
+        vec![VenueLegStatus::OperatorRequired],
+    ));
+    let mexc = Arc::new(ScriptedAdapter::new(
+        MEXC_VENUE_ID,
+        None,
+        vec![VenueLegStatus::Running, VenueLegStatus::Completed],
+    ));
+    let finalizer = finalizer(vec![icpswap.clone(), mexc.clone()]);
+
+    let first = finalizer.finalize(&wal, receipt.clone()).await.expect("first cycle");
+    assert!(
+        !first.operator_required,
+        "a runnable sibling must keep the row in the pending queue"
+    );
+    assert!(!first.finalized);
+    assert_eq!(committed_state(&wal).outcome, MultiVenueExecutionOutcome::Running);
+
+    // Once the sibling reaches a terminal status the parked leg surfaces.
+    let second = finalizer.finalize(&wal, receipt).await.expect("second cycle");
+    assert!(second.operator_required);
+    assert_eq!(mexc.calls(), 2, "the running leg keeps being driven");
+    assert_eq!(icpswap.calls(), 1, "the parked leg is never re-advanced");
     assert!(matches!(
         committed_state(&wal).outcome,
         MultiVenueExecutionOutcome::OperatorRequired { .. }

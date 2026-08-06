@@ -7,6 +7,7 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::{env, io::Write, path::PathBuf};
 
 use alloy::signers::local::PrivateKeySigner;
+use anyhow::{Context, Result, anyhow};
 use bip39::{Language, Mnemonic};
 
 use prettytable::{Cell, Row, Table, format};
@@ -15,7 +16,7 @@ use tracing::{info, warn};
 use crate::config::Config;
 use crate::output::plain_logs_enabled;
 
-pub async fn show() {
+pub async fn show() -> Result<()> {
     // Load Config
     let config = Config::load();
 
@@ -48,7 +49,7 @@ pub async fn show() {
                         warn!(role = "evm", "Invalid EVM private key in config");
                     }
                 }
-                return;
+                return Ok(());
             }
 
             let mut table = Table::new();
@@ -94,10 +95,9 @@ pub async fn show() {
             }
 
             table.printstd();
+            Ok(())
         }
-        Err(_) => {
-            println!("Could not load account.");
-        }
+        Err(error) => Err(anyhow!("could not load account: {error}")),
     }
 }
 
@@ -115,70 +115,49 @@ fn expand_tilde(p: &str) -> PathBuf {
     PathBuf::from(p)
 }
 
-pub async fn new() {
+pub async fn new() -> Result<()> {
     let mnemonic_path: PathBuf = match env::var("MNEMONIC_FILE") {
         Ok(p) => expand_tilde(&p),
-        Err(_) => match default_mnemonic_path() {
-            Some(p) => p,
-            None => {
-                eprintln!("HOME environment variable not set and MNEMONIC_FILE not specified");
-                return;
-            }
-        },
+        Err(_) => default_mnemonic_path()
+            .ok_or_else(|| anyhow!("HOME environment variable not set and MNEMONIC_FILE not specified"))?,
     };
 
+    // Declining to overwrite an existing wallet is the guard working, not a
+    // failure, so it stays a success exit.
     if mnemonic_path.exists() {
         println!(
             "Mnemonic file already exists at {}. Not overwriting.",
             mnemonic_path.display()
         );
         println!("If you want to regenerate, delete the file manually and run this command again.");
-        return;
+        return Ok(());
     }
 
-    let mnemonic = match Mnemonic::generate_in(Language::English, 24) {
-        Ok(m) => m,
-        Err(e) => {
-            eprintln!("Failed to generate mnemonic: {e}");
-            return;
-        }
-    };
+    let mnemonic = Mnemonic::generate_in(Language::English, 24).context("failed to generate mnemonic")?;
     let phrase = mnemonic.to_string();
 
-    if let Some(parent) = mnemonic_path.parent()
-        && let Err(e) = fs::create_dir_all(parent)
-    {
-        eprintln!("Failed to create directory {}: {e}", parent.display());
-        return;
+    if let Some(parent) = mnemonic_path.parent() {
+        fs::create_dir_all(parent).with_context(|| format!("failed to create directory {}", parent.display()))?;
     }
 
     #[cfg(unix)]
-    let mut file = match OpenOptions::new()
+    let mut file = OpenOptions::new()
         .write(true)
         .create_new(true)
         .mode(0o600)
         .open(&mnemonic_path)
-    {
-        Ok(f) => f,
-        Err(e) => {
-            eprintln!("Failed to create {}: {e}", mnemonic_path.display());
-            return;
-        }
-    };
+        .with_context(|| format!("failed to create {}", mnemonic_path.display()))?;
 
     #[cfg(not(unix))]
-    let mut file = match OpenOptions::new().write(true).create_new(true).open(&mnemonic_path) {
-        Ok(f) => f,
-        Err(e) => {
-            eprintln!("Failed to create {}: {e}", mnemonic_path.display());
-            return;
-        }
-    };
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&mnemonic_path)
+        .with_context(|| format!("failed to create {}", mnemonic_path.display()))?;
 
     if let Err(e) = writeln!(file, "{phrase}") {
         let _ = fs::remove_file(&mnemonic_path);
-        eprintln!("Failed to write {}: {e}", mnemonic_path.display());
-        return;
+        return Err(anyhow::Error::new(e).context(format!("failed to write {}", mnemonic_path.display())));
     }
 
     println!(
@@ -190,4 +169,5 @@ pub async fn new() {
         "   Tip: set MNEMONIC_FILE={} in your environment, or configure your pipeline to read it.",
         mnemonic_path.display()
     );
+    Ok(())
 }

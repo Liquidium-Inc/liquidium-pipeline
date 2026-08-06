@@ -3,7 +3,7 @@ use std::{collections::HashMap, sync::Arc};
 use candid::{Nat, Principal};
 use liquidium_pipeline_connectors::backend::bridge_backend::FINALIZER_PERMANENT_AMOUNT_FLOOR_PREFIX;
 use liquidium_pipeline_connectors::backend::cex_backend::{
-    CEX_PENDING_SETTLEMENT_PREFIX, MockCexBackend, OrderBook, OrderBookLevel, SwapFillReport,
+    CexSubmissionError, MockCexBackend, OrderBook, OrderBookLevel, SwapFillReport,
 };
 use liquidium_pipeline_core::{
     tokens::{chain_token::ChainToken, chain_token_amount::ChainTokenAmount, token_registry::TokenRegistry},
@@ -601,7 +601,7 @@ async fn each_trade_order_intent_is_persisted_before_its_submission() {
 
 /// Builds a finalizer whose trade slice always draws the given venue response.
 fn finalizer_with_trade_result(
-    swap_result: Result<SwapFillReport, String>,
+    swap_result: Result<SwapFillReport, CexSubmissionError>,
     balance_calls: usize,
 ) -> MexcFinalizer<MockCexBackend> {
     let mut backend = MockCexBackend::new();
@@ -675,8 +675,8 @@ async fn leg_at_trade_step(finalizer: &MexcFinalizer<MockCexBackend>, waiting_si
 #[tokio::test]
 async fn venue_settlement_rejection_waits_instead_of_spending_the_retry_budget() {
     let finalizer = finalizer_with_trade_result(
-        Err(format!(
-            "{CEX_PENDING_SETTLEMENT_PREFIX}Swap err: code=Oversold msg=Oversold"
+        Err(CexSubmissionError::PendingSettlement(
+            "Swap err: code=Oversold msg=Oversold".to_string(),
         )),
         0,
     );
@@ -710,12 +710,33 @@ async fn venue_settlement_rejection_waits_instead_of_spending_the_retry_budget()
 }
 
 #[tokio::test]
+async fn prefix_shaped_other_error_does_not_enter_settlement_wait() {
+    let message = "cex pending settlement: ordinary backend failure";
+    let finalizer = finalizer_with_trade_result(Err(CexSubmissionError::Rejected(message.to_string())), 0);
+    let leg = leg_at_trade_step(&finalizer, None).await;
+
+    let retryable = MultiVenueAdapter::advance(&finalizer, &leg, &NoopCheckpoint)
+        .await
+        .expect("an ordinary backend failure should produce retryable progress");
+
+    assert_eq!(retryable.status, VenueLegStatus::Running);
+    assert_eq!(retryable.retryable_error.as_deref(), Some(message));
+    let execution = retryable
+        .execution
+        .decode::<MexcVenueExecutionState>(VENUE_ID)
+        .expect("decode retryable state")
+        .expect("MEXC state");
+    assert_eq!(execution.cex.trade.trade_settlement_waiting_since_ts, None);
+    assert!(!execution.operator_required);
+}
+
+#[tokio::test]
 async fn venue_settlement_wait_parks_for_an_operator_once_the_deadline_passes() {
     // One balance read is expected: the give-up path reports what the account
     // actually holds so an operator can tell a stuck credit from an empty one.
     let finalizer = finalizer_with_trade_result(
-        Err(format!(
-            "{CEX_PENDING_SETTLEMENT_PREFIX}Swap err: code=Oversold msg=Oversold"
+        Err(CexSubmissionError::PendingSettlement(
+            "Swap err: code=Oversold msg=Oversold".to_string(),
         )),
         1,
     );

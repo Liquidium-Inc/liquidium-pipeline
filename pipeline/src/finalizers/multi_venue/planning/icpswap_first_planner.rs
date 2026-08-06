@@ -303,6 +303,7 @@ impl IcpswapFirstPlanner {
                 debt_repaid: input.debt_repaid.clone(),
                 allocation_reason,
                 min_net_edge_bps: self.config.min_net_edge_bps,
+                enforced_min_net_edge_bps: Some(required_edge_bps),
                 estimated_receive,
                 conservative_receive,
                 combined_net_edge_bps,

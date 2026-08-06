@@ -10,8 +10,8 @@ use liquidium_pipeline_connectors::backend::bridge_backend::{
     MockBridgeBackend,
 };
 use liquidium_pipeline_connectors::backend::cex_backend::{
-    BuyOrderInputMode, DepositAddress, MockCexBackend, OrderBook, OrderBookLevel, SwapFillReport, WithdrawStatus,
-    WithdrawStatusSnapshot,
+    BuyOrderInputMode, CexSubmissionError, DepositAddress, MockCexBackend, OrderBook, OrderBookLevel, SwapFillReport,
+    WithdrawStatus, WithdrawStatusSnapshot,
 };
 use liquidium_pipeline_core::account::model::ChainAccount;
 use liquidium_pipeline_core::tokens::{chain_token::ChainToken, chain_token_amount::ChainTokenAmount};
@@ -2994,7 +2994,7 @@ async fn mexc_trade_propagates_backend_errors() {
     backend
         .expect_execute_swap_detailed_with_options()
         .times(1)
-        .returning(|_market, _side, _amount_in, _opts| Err("boom".to_string()));
+        .returning(|_market, _side, _amount_in, _opts| Err(CexSubmissionError::Rejected("boom".to_string())));
 
     let backend = Arc::new(backend);
     let transfer_service = Arc::new(transfers);
@@ -3015,7 +3015,7 @@ async fn mexc_trade_propagates_backend_errors() {
 
     let err = finalizer.trade(&mut state).await.expect_err("trade should fail");
 
-    assert_eq!(err, "boom");
+    assert_eq!(err, CexSubmissionError::Rejected("boom".to_string()));
     // On error we expect the step to remain Trade.
     assert!(matches!(state.step, CexStep::Trade));
 }
@@ -3317,7 +3317,7 @@ async fn mexc_trade_fails_when_realized_slice_slippage_exceeds_cap() {
         .await
         .expect_err("trade should fail when realized slippage exceeds cap");
 
-    assert!(err.contains("slice slippage too high"));
+    assert!(err.to_string().contains("slice slippage too high"));
     assert!(
         state
             .last_error
@@ -3513,12 +3513,13 @@ async fn mexc_trade_slippage_error_includes_requested_and_actual_fill_details() 
     };
 
     let err = finalizer.trade(&mut state).await.expect_err("trade should fail");
-    assert!(err.contains("slice slippage too high"));
-    assert!(err.contains("requested_in="));
-    assert!(err.contains("actual_in="));
-    assert!(err.contains("actual_out="));
-    assert!(err.contains("preview_mid="));
-    assert!(err.contains("exec_price="));
+    let error = err.to_string();
+    assert!(error.contains("slice slippage too high"));
+    assert!(error.contains("requested_in="));
+    assert!(error.contains("actual_in="));
+    assert!(error.contains("actual_out="));
+    assert!(error.contains("preview_mid="));
+    assert!(error.contains("exec_price="));
 }
 
 #[tokio::test]
@@ -3697,7 +3698,7 @@ async fn mexc_trade_retries_current_leg_from_original_amount_after_mid_leg_error
         .trade(&mut state)
         .await
         .expect_err("first trade attempt should fail on slippage");
-    assert!(first_err.contains("slice slippage too high"));
+    assert!(first_err.to_string().contains("slice slippage too high"));
     assert!(matches!(state.step, CexStep::Trade));
 
     // Retry same state; the leg should resume from persisted progress without replaying the order.
@@ -4132,7 +4133,8 @@ async fn mexc_trade_errors_when_direct_market_cannot_be_resolved() {
         .expect_err("trade should fail when no direct leg can be resolved");
 
     assert!(
-        err.contains("could not resolve direct market") || err.contains("no configured MEXC pairs for hop discovery")
+        err.to_string().contains("could not resolve direct market")
+            || err.to_string().contains("no configured MEXC pairs for hop discovery")
     );
     assert!(matches!(state.step, CexStep::Trade));
 }
@@ -4799,7 +4801,7 @@ async fn mexc_trade_errors_when_no_hop_route_exists_in_configured_pairs() {
         .trade(&mut state)
         .await
         .expect_err("trade should fail when no configured hop route exists");
-    assert!(err.contains("no configured hop route"));
+    assert!(err.to_string().contains("no configured hop route"));
 }
 
 #[tokio::test]
@@ -5808,7 +5810,7 @@ mod fuzz {
                 state.withdraw.bridge.withdraw_planned_asset = Some("BTC".to_string());
 
                 let err = finalizer.trade(&mut state).await.expect_err("trade should fail");
-                assert!(err.contains("slice slippage too high"));
+                assert!(err.to_string().contains("slice slippage too high"));
                 assert!(matches!(state.step, CexStep::Trade));
                 assert!(state
                     .last_error
@@ -5982,7 +5984,7 @@ mod fuzz {
                 };
 
                 let first = finalizer.trade(&mut state).await.expect_err("first attempt should fail");
-                assert!(first.contains("slice slippage too high"));
+                assert!(first.to_string().contains("slice slippage too high"));
                 assert!(matches!(state.step, CexStep::Trade));
 
                 finalizer.trade(&mut state).await.expect("second attempt should recover");

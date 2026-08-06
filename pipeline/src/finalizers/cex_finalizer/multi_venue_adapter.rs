@@ -1,8 +1,6 @@
 use async_trait::async_trait;
 use liquidium_pipeline_connectors::backend::bridge_backend::FINALIZER_PERMANENT_AMOUNT_FLOOR_PREFIX;
-use liquidium_pipeline_connectors::backend::cex_backend::{
-    CexBackend, CexSubmissionError, classify_cex_submission_error,
-};
+use liquidium_pipeline_connectors::backend::cex_backend::{CexBackend, CexSubmissionError};
 use log::{info, warn};
 use serde::{Deserialize, Serialize};
 
@@ -174,18 +172,30 @@ where
             }
         }
 
-        let result = self.advance_current_step(&mut execution.cex).await;
-        let error = result.err();
-        match &error {
-            Some(error) => {
+        let error = match self.advance_current_step(&mut execution.cex).await {
+            Err(failure) => {
+                let error = failure.to_string();
                 execution.cex.last_error = Some(error.clone());
                 if error.starts_with(FINALIZER_PERMANENT_AMOUNT_FLOOR_PREFIX) {
                     execution.cex.step = CexStep::Failed;
                 } else {
-                    let classified = if self.profile.backend_submission_classifier_required() {
-                        self.backend.classify_submission_error(error)
-                    } else {
-                        classify_cex_submission_error(error)
+                    // A `Rejected` may only mean the step could not classify
+                    // itself: everything outside the trade path converts through
+                    // `From<String>` and lands here by default. Backends that can
+                    // read their own failures get to re-decide that one case; a
+                    // classification the backend already made is never
+                    // second-guessed, so a typed pending or ambiguous result
+                    // survives regardless of profile.
+                    let classified = match &failure {
+                        CexSubmissionError::Rejected(message)
+                            if self.profile.backend_submission_classifier_required() =>
+                        {
+                            // The raw message, not the rendered error: a backend
+                            // recognises its own failures by their sentinel
+                            // prefix, which any decoration would hide.
+                            self.backend.classify_submission_error(message)
+                        }
+                        _ => failure.clone(),
                     };
                     match classified {
                         CexSubmissionError::PendingSettlement(message) => {
@@ -197,11 +207,15 @@ where
                         CexSubmissionError::Rejected(_) => {}
                     }
                 }
+                Some(error)
             }
             // Any step that completes without an error proves the venue is
             // caught up, so a later wait starts from its own first refusal.
-            None => execution.cex.trade.trade_settlement_waiting_since_ts = None,
-        }
+            Ok(()) => {
+                execution.cex.trade.trade_settlement_waiting_since_ts = None;
+                None
+            }
+        };
         self.progress_for(execution, error)
     }
 

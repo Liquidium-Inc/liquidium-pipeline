@@ -185,6 +185,13 @@ venue plan         on ICPSwap
 
 Important policy rules:
 
+`ICPSWAP_TEST_ALLOCATION_USD` is an opt-in testing override and is unset by
+default. When set, the planner first forces approximately that USD value of the
+collateral to ICPSwap, then applies the normal allocation rules to the remaining
+amount. A forced ICPSwap allocation below $10 bypasses the oracle discount guard
+because fixed ledger fees dominate such a small leg. This waiver applies only
+to that forced leg; the remainder and all other venue safety checks stay active.
+
 1. Use actual `collateral_received`, not the estimated pre-liquidation amount.
 2. Only canonical native ICP is initially eligible for ICPSwap.
 3. ICPSwap receives the full amount while its quoted impact is below 100 bps.

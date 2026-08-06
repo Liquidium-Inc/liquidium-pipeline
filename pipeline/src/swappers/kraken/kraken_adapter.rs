@@ -283,8 +283,11 @@ impl CexBackend for KrakenClient {
     }
 
     async fn execute_swap_detailed(&self, market: &str, side: &str, amount_in: f64) -> Result<SwapFillReport, String> {
+        // The classification is flattened back into its message here so the
+        // sentinel prefixes stay readable to `classify_submission_error`.
         self.execute_swap_detailed_with_options(market, side, amount_in, SwapExecutionOptions::default())
             .await
+            .map_err(|error| error.to_string())
     }
 
     /// Submits one Kraken spot market order and reconciles its terminal fill.
@@ -310,7 +313,7 @@ impl CexBackend for KrakenClient {
         side: &str,
         amount_in: f64,
         options: SwapExecutionOptions,
-    ) -> Result<SwapFillReport, String> {
+    ) -> Result<SwapFillReport, CexSubmissionError> {
         // Reject zero, negative, NaN, and infinite inputs before reading Kraken state.
         ensure_positive(amount_in)?;
 
@@ -338,7 +341,8 @@ impl CexBackend for KrakenClient {
                 return Err(format!(
                     "Kraken sell estimate {estimated_output} is below cost minimum {}",
                     pair.cost_min
-                ));
+                )
+                .into());
             }
 
             // Submit the precision-safe base volume produced above.
@@ -347,12 +351,14 @@ impl CexBackend for KrakenClient {
             // The shared quote-quantity mode cannot be sent directly because this
             // Kraken endpoint expects market-buy volume in base units.
             if options.buy_mode == BuyOrderInputMode::QuoteOrderQty {
-                return Err("Kraken market buys require precision-safe base quantity mode".to_string());
+                return Err("Kraken market buys require precision-safe base quantity mode"
+                    .to_string()
+                    .into());
             }
 
             // Reject malformed pair metadata before using its fee in budget math.
             if !pair.taker_fee_bps.is_finite() || !(0.0..=10_000.0).contains(&pair.taker_fee_bps) {
-                return Err(format!("invalid Kraken taker fee {} bps", pair.taker_fee_bps));
+                return Err(format!("invalid Kraken taker fee {} bps", pair.taker_fee_bps).into());
             }
 
             // Default to no extra spending when the caller did not authorize an
@@ -361,7 +367,7 @@ impl CexBackend for KrakenClient {
 
             // Keep the overspend cap within a finite zero-to-100% bps range.
             if !cap_bps.is_finite() || !(0.0..=10_000.0).contains(&cap_bps) {
-                return Err(format!("invalid Kraken quote overspend cap {cap_bps} bps"));
+                return Err(format!("invalid Kraken quote overspend cap {cap_bps} bps").into());
             }
 
             // Convert fee and overspend bps into exact decimal ratios.
@@ -404,7 +410,7 @@ impl CexBackend for KrakenClient {
             // Any material budget left after exhausting asks means visible depth
             // cannot support the requested quote-input order.
             if budget > Decimal::from_f64(1e-10).unwrap_or(Decimal::ZERO) {
-                return Err("not enough Kraken ask liquidity".to_string());
+                return Err("not enough Kraken ask liquidity".to_string().into());
             }
 
             // Truncate derived base volume to Kraken lot precision; rounding up
@@ -421,14 +427,15 @@ impl CexBackend for KrakenClient {
             if estimated_total > max_spend {
                 return Err(format!(
                     "Kraken buy estimate with fee {estimated_total} exceeds quote-input cap {max_spend}"
-                ));
+                )
+                .into());
             }
 
             // Submit the precision-safe base volume derived from the quote budget.
             base
         } else {
             // Only the two spot sides understood by Kraken are accepted locally.
-            return Err(format!("unsupported Kraken order side {side}"));
+            return Err(format!("unsupported Kraken order side {side}").into());
         };
 
         // Apply Kraken's minimum base-order volume after all precision truncation.
@@ -436,29 +443,32 @@ impl CexBackend for KrakenClient {
             return Err(format!(
                 "Kraken base volume {base_volume} is below order minimum {}",
                 pair.order_min
-            ));
+            )
+            .into());
         }
 
         // For buys, the route input is the quote budget and must independently
         // satisfy Kraken's minimum quote cost.
         if side.eq_ignore_ascii_case("buy") && amount < pair.cost_min {
-            return Err(format!(
-                "Kraken quote budget {amount} is below cost minimum {}",
-                pair.cost_min
-            ));
+            return Err(format!("Kraken quote budget {amount} is below cost minimum {}", pair.cost_min).into());
         }
 
         // Submit exactly one market order, carrying the persisted client order ID
         // that the shared CEX recovery logic prepared before this side effect.
+        // Past this point a failure may have reached the exchange, so both the
+        // submission and the reconciliation are classified here rather than
+        // being flattened into a rejection the caller would be free to replay.
         let order_id = self
             .api
             .place_market_order(&pair.api_name, side, base_volume, options.client_order_id)
             .await
-            .map_err(api_submit_error)?;
+            .map_err(|error| self.classify_submission_error(&api_submit_error(error)))?;
 
         // Poll the returned Kraken order ID to a terminal state and translate its
         // consumed input, received output, and fees into the shared fill report.
-        self.wait_for_order(&order_id, side).await
+        self.wait_for_order(&order_id, side)
+            .await
+            .map_err(|error| self.classify_submission_error(&error))
     }
 
     async fn get_orderbook(&self, market: &str, limit: Option<u32>) -> Result<OrderBook, String> {

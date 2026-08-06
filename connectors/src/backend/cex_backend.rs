@@ -1,24 +1,42 @@
 use async_trait::async_trait;
 use thiserror::Error;
 
-/// Marks a venue error that means "not ready yet", not "this order failed".
-///
-/// A CEX credits a deposit into its account service and into its matching
-/// engine at different moments, so the balance API can report funds the order
-/// book still refuses to trade. Only the venue knows when that gap closes, and
-/// it says so by rejecting the order. Errors carrying this prefix must be
-/// waited out under a deadline rather than counted against a retry budget.
 pub const CEX_PENDING_SETTLEMENT_PREFIX: &str = "cex pending settlement: ";
 
 /// Classification for calls that may have moved money before returning.
+///
+/// `Ambiguous` is the reason this stays a three-variant enum: a submission whose
+/// outcome the venue will not confirm cannot be retried like a rejection without
+/// risking a second order against the same funds.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum CexSubmissionError {
-    #[error("submission rejected: {0}")]
+    /// Rendered verbatim. Callers still match sentinel prefixes against this
+    /// message — the permanent amount floor, and each backend's own ambiguity
+    /// marker — so decorating it here would silently defeat those checks.
+    #[error("{0}")]
     Rejected(String),
-    #[error("submission pending settlement: {0}")]
+    /// Rendered with the shared wire prefix so a classification made here still
+    /// reads as pending after a round trip through `last_error` and back through
+    /// [`classify_cex_submission_error`].
+    #[error("{CEX_PENDING_SETTLEMENT_PREFIX}{0}")]
     PendingSettlement(String),
     #[error("submission outcome is ambiguous: {0}")]
     Ambiguous(String),
+}
+
+/// An unclassified backend message is a plain rejection: the two states that
+/// need care are only ever reached by deliberate classification, never by
+/// defaulting into them.
+impl From<String> for CexSubmissionError {
+    fn from(message: String) -> Self {
+        Self::Rejected(message)
+    }
+}
+
+impl From<&str> for CexSubmissionError {
+    fn from(message: &str) -> Self {
+        Self::Rejected(message.to_string())
+    }
 }
 
 /// Reports whether a backend error asks the caller to wait for the venue.
@@ -189,7 +207,7 @@ pub trait CexBackend: Send + Sync {
         side: &str,
         amount_in: f64,
         options: SwapExecutionOptions,
-    ) -> Result<SwapFillReport, String>;
+    ) -> Result<SwapFillReport, CexSubmissionError>;
 
     async fn get_orderbook(&self, market: &str, limit: Option<u32>) -> Result<OrderBook, String>;
 
@@ -217,4 +235,21 @@ pub trait CexBackend: Send + Sync {
         coin: &str,
         withdraw_id: &str,
     ) -> Result<WithdrawStatusSnapshot, String>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn backend_error_display_formats_classification_without_changing_the_message() {
+        assert_eq!(
+            CexSubmissionError::PendingSettlement("matching engine is catching up".to_string()).to_string(),
+            "cex pending settlement: matching engine is catching up"
+        );
+        assert_eq!(
+            CexSubmissionError::Rejected("order rejected".to_string()).to_string(),
+            "order rejected"
+        );
+    }
 }
