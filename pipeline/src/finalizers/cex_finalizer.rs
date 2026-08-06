@@ -1,5 +1,6 @@
 use async_trait::async_trait;
 use candid::Nat;
+use liquidium_pipeline_connectors::backend::cex_backend::CexBackendError;
 use liquidium_pipeline_core::tokens::{chain_token::ChainToken, chain_token_amount::ChainTokenAmount};
 
 use serde::{Deserialize, Serialize};
@@ -226,18 +227,18 @@ pub trait CexFinalizerLogic: Send + Sync {
     async fn deposit(&self, state: &mut CexState) -> Result<(), String>;
 
     // On CEX: deposit asset -> withdraw asset
-    async fn trade(&self, state: &mut CexState) -> Result<(), String>;
+    async fn trade(&self, state: &mut CexState) -> Result<(), CexBackendError>;
 
     // On CEX: withdraw to chain
     async fn withdraw(&self, state: &mut CexState) -> Result<(), String>;
 
     /// Executes one phase of the shared CEX state machine. Venue adapters and
     /// the legacy WAL finalizer use this same dispatch to avoid behavior drift.
-    async fn advance_current_step(&self, state: &mut CexState) -> Result<(), String> {
+    async fn advance_current_step(&self, state: &mut CexState) -> Result<(), CexBackendError> {
         match state.step {
-            CexStep::Deposit | CexStep::DepositPending => self.deposit(state).await,
+            CexStep::Deposit | CexStep::DepositPending => self.deposit(state).await.map_err(CexBackendError::from),
             CexStep::Trade | CexStep::TradePending => self.trade(state).await,
-            CexStep::Withdraw | CexStep::WithdrawPending => self.withdraw(state).await,
+            CexStep::Withdraw | CexStep::WithdrawPending => self.withdraw(state).await.map_err(CexBackendError::from),
             CexStep::Completed | CexStep::Failed => Ok(()),
         }
     }
@@ -252,11 +253,7 @@ pub trait CexFinalizerLogic: Send + Sync {
 
 #[async_trait]
 impl Finalizer for dyn CexFinalizerLogic {
-    async fn finalize(
-        &self,
-        wal: &dyn WalStore,
-        receipt: ExecutionReceipt,
-    ) -> Result<FinalizerResult, FinalizerError> {
+    async fn finalize(&self, wal: &dyn WalStore, receipt: ExecutionReceipt) -> Result<FinalizerResult, FinalizerError> {
         self.finalize_inner(wal, receipt).await.map_err(|error| {
             // Classify once here; the bridge's sentinel never reaches the stage.
             if error.starts_with(
@@ -596,7 +593,7 @@ mod tests {
             Ok(())
         }
 
-        async fn trade(&self, state: &mut CexState) -> Result<(), String> {
+        async fn trade(&self, state: &mut CexState) -> Result<(), CexBackendError> {
             let mut calls = self.trade_calls.lock().unwrap();
             *calls += 1;
 
@@ -749,7 +746,7 @@ mod tests {
             Ok(())
         }
 
-        async fn trade(&self, state: &mut CexState) -> Result<(), String> {
+        async fn trade(&self, state: &mut CexState) -> Result<(), CexBackendError> {
             let mut calls = self.trade_calls.lock().unwrap();
             *calls += 1;
 
@@ -757,14 +754,14 @@ mod tests {
                 state.trade.trade_leg_index = Some(1);
                 state.trade.trade_leg_total = Some(2);
                 state.trade.trade_next_amount_in = Some(0.1234);
-                return Err("trade exploded once".to_string());
+                return Err("trade exploded once".into());
             }
 
             if state.trade.trade_leg_index != Some(1) {
-                return Err("expected persisted trade_leg_index=1 on retry".to_string());
+                return Err("expected persisted trade_leg_index=1 on retry".into());
             }
             if (state.trade.trade_next_amount_in.unwrap_or_default() - 0.1234).abs() > 1e-12 {
-                return Err("expected persisted trade_next_amount_in on retry".to_string());
+                return Err("expected persisted trade_next_amount_in on retry".into());
             }
 
             state.trade.trade_leg_index = Some(2);
