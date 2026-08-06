@@ -1296,6 +1296,44 @@ async fn operator_required_mexc_leg_is_parked_across_restarts() {
 }
 
 #[tokio::test]
+async fn a_parked_leg_does_not_freeze_a_still_running_sibling() {
+    let receipt = receipt();
+    let wal = TestWal::with_receipt(&receipt);
+    // A split plan where ICPSwap parks for reconciliation while the MEXC leg
+    // still has an open order. Parking the row here would stop the daemon from
+    // ever polling that order again.
+    let icpswap = Arc::new(ScriptedAdapter::new(
+        ICPSWAP_VENUE_ID,
+        Some(TOTAL_PAY / 2),
+        vec![VenueLegStatus::OperatorRequired],
+    ));
+    let mexc = Arc::new(ScriptedAdapter::new(
+        MEXC_VENUE_ID,
+        None,
+        vec![VenueLegStatus::Running, VenueLegStatus::Completed],
+    ));
+    let finalizer = finalizer(vec![icpswap.clone(), mexc.clone()]);
+
+    let first = finalizer.finalize(&wal, receipt.clone()).await.expect("first cycle");
+    assert!(
+        !first.operator_required,
+        "a runnable sibling must keep the row in the pending queue"
+    );
+    assert!(!first.finalized);
+    assert_eq!(committed_state(&wal).outcome, MultiVenueExecutionOutcome::Running);
+
+    // Once the sibling reaches a terminal status the parked leg surfaces.
+    let second = finalizer.finalize(&wal, receipt).await.expect("second cycle");
+    assert!(second.operator_required);
+    assert_eq!(mexc.calls(), 2, "the running leg keeps being driven");
+    assert_eq!(icpswap.calls(), 1, "the parked leg is never re-advanced");
+    assert!(matches!(
+        committed_state(&wal).outcome,
+        MultiVenueExecutionOutcome::OperatorRequired { .. }
+    ));
+}
+
+#[tokio::test]
 async fn permanent_failure_is_not_readvanced_or_rerouted() {
     let receipt = receipt();
     let wal = TestWal::with_receipt(&receipt);

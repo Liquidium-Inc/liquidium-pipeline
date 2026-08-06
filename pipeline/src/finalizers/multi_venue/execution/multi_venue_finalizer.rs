@@ -821,6 +821,19 @@ pub(super) fn apply_progress(leg: &mut VenueLegState, progress: VenueLegProgress
 }
 
 pub(super) fn derive_outcome(legs: &[VenueLegState]) -> MultiVenueExecutionOutcome {
+    // A runnable leg outranks a parked one. `OperatorRequired` drops the row out
+    // of the pending queue, so reporting it while a sibling still has an open
+    // order would leave that leg with nothing polling it until a human requeues
+    // the row. The operator alert fires on the leg's own transition, not here,
+    // so deferring the parked outcome until nothing is runnable costs no
+    // alerting latency and strands no in-flight funds.
+    if legs
+        .iter()
+        .any(|leg| matches!(leg.status, VenueLegStatus::Planned | VenueLegStatus::Running))
+    {
+        return MultiVenueExecutionOutcome::Running;
+    }
+
     let operator_leg_ids = legs
         .iter()
         .filter(|leg| leg.status == VenueLegStatus::OperatorRequired)
@@ -830,13 +843,6 @@ pub(super) fn derive_outcome(legs: &[VenueLegState]) -> MultiVenueExecutionOutco
         return MultiVenueExecutionOutcome::OperatorRequired {
             leg_ids: operator_leg_ids,
         };
-    }
-
-    if legs
-        .iter()
-        .any(|leg| matches!(leg.status, VenueLegStatus::Planned | VenueLegStatus::Running))
-    {
-        return MultiVenueExecutionOutcome::Running;
     }
 
     let failed_leg_ids = legs
