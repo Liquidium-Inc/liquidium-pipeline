@@ -11,8 +11,8 @@ use kraken_async_rs::{
     },
     crypto::nonce_provider::{IncreasingNonceProvider, NonceProvider},
     request_types::{
-        AddOrderRequest, DepositAddressesRequest, DepositMethodsRequest, OrderRequest, OrderbookRequest,
-        StatusOfDepositWithdrawRequest, StringCSV, TradableAssetPairsRequest, WithdrawFundsRequest,
+        AddOrderRequest, ClosedOrdersRequest, DepositAddressesRequest, DepositMethodsRequest, OrderRequest,
+        OrderbookRequest, StatusOfDepositWithdrawRequest, StringCSV, TradableAssetPairsRequest, WithdrawFundsRequest,
         WithdrawalAddressesRequest, WithdrawalMethodsRequest,
     },
     response_types::{BuySell, OrderStatus, OrderType, TradableAssetStatus, TransferStatus},
@@ -128,6 +128,13 @@ pub trait KrakenApi: Send + Sync {
         client_order_id: Option<String>,
     ) -> Result<String, KrakenApiError>;
     async fn order(&self, order_id: &str) -> Result<KrakenOrder, KrakenApiError>;
+    /// Finds an already-settled order by the client id we submitted it under.
+    ///
+    /// This is how a resumed leg discovers that its order exists: the Kraken
+    /// order id lives only in the response we may never have read, whereas the
+    /// client id is chosen before submission and persisted with the leg.
+    /// `Ok(None)` means Kraken has no closed order under that id.
+    async fn closed_order_by_client_id(&self, client_order_id: &str) -> Result<Option<KrakenOrder>, KrakenApiError>;
     async fn withdraw(&self, asset: &str, key: &str, address: &str, amount: Decimal) -> Result<String, KrakenApiError>;
     async fn withdrawals(&self, asset: &str) -> Result<Vec<KrakenWithdrawal>, KrakenApiError>;
 }
@@ -178,6 +185,22 @@ impl KrakenRestApi {
         Self {
             client: Mutex::new(Client::new(secrets, nonce)),
         }
+    }
+}
+
+/// Narrows a Kraken order to the fields execution actually reconciles against.
+fn to_kraken_order(order: kraken_async_rs::response_types::Order) -> KrakenOrder {
+    KrakenOrder {
+        status: match order.status {
+            OrderStatus::Pending => KrakenOrderStatus::Pending,
+            OrderStatus::Open => KrakenOrderStatus::Open,
+            OrderStatus::Closed => KrakenOrderStatus::Closed,
+            OrderStatus::Canceled => KrakenOrderStatus::Canceled,
+            OrderStatus::Expired => KrakenOrderStatus::Expired,
+        },
+        volume_executed: order.volume_executed,
+        cost: order.cost,
+        fee: order.fee,
     }
 }
 
@@ -416,19 +439,28 @@ impl KrakenApi for KrakenRestApi {
             .remove(order_id)
             .or_else(|| orders.into_values().next())
             .ok_or_else(|| KrakenApiError::Transport(format!("order {order_id} was not returned")))?;
-        let status = match order.status {
-            OrderStatus::Pending => KrakenOrderStatus::Pending,
-            OrderStatus::Open => KrakenOrderStatus::Open,
-            OrderStatus::Closed => KrakenOrderStatus::Closed,
-            OrderStatus::Canceled => KrakenOrderStatus::Canceled,
-            OrderStatus::Expired => KrakenOrderStatus::Expired,
-        };
-        Ok(KrakenOrder {
-            status,
-            volume_executed: order.volume_executed,
-            cost: order.cost,
-            fee: order.fee,
-        })
+        Ok(to_kraken_order(order))
+    }
+
+    async fn closed_order_by_client_id(&self, client_order_id: &str) -> Result<Option<KrakenOrder>, KrakenApiError> {
+        let request = ClosedOrdersRequest::builder()
+            .client_order_id(client_order_id.to_string())
+            .build();
+        let response = self
+            .client
+            .lock()
+            .await
+            .get_closed_orders(&request)
+            .await
+            .map_err(|error| KrakenApiError::Transport(error.to_string()))?;
+        let closed = take_result(response)?;
+        // Kraken filters server-side, but the client id is re-checked here so a
+        // filter the venue ignored cannot make us adopt an unrelated fill.
+        Ok(closed
+            .closed
+            .into_values()
+            .find(|order| order.client_order_id.as_deref() == Some(client_order_id))
+            .map(to_kraken_order))
     }
 
     async fn withdraw(&self, asset: &str, key: &str, address: &str, amount: Decimal) -> Result<String, KrakenApiError> {
@@ -461,7 +493,9 @@ impl KrakenApi for KrakenRestApi {
             .into_iter()
             .map(|withdrawal| KrakenWithdrawal {
                 ref_id: withdrawal.ref_id,
-                tx_id: (!withdrawal.tx_id.trim().is_empty()).then_some(withdrawal.tx_id),
+                // Absent while pending, and blank on some venues once present;
+                // both mean "no chain transaction yet" to every caller.
+                tx_id: withdrawal.tx_id.filter(|tx_id| !tx_id.trim().is_empty()),
                 fee: withdrawal.fee,
                 status: match withdrawal.status {
                     TransferStatus::Success | TransferStatus::Settled => KrakenTransferStatus::Completed,

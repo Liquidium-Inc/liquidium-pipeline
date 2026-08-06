@@ -9,6 +9,7 @@ use liquidium_pipeline_connectors::backend::cex_backend::{
     FundingRoutePreflight, OrderBook, OrderBookLevel, SwapExecutionOptions, SwapFillReport, WithdrawStatus,
     WithdrawStatusSnapshot, WithdrawalReceipt,
 };
+use log::info;
 use rust_decimal::{
     Decimal, RoundingStrategy,
     prelude::{FromPrimitive, ToPrimitive},
@@ -124,7 +125,9 @@ impl KrakenClient {
             .await
             .map_err(api_read_error)?
             .into_iter()
-            .filter(|entry| entry.verified && entry.method == method.method && entry.address == destination)
+            .filter(|entry| {
+                entry.verified && entry.method == method.method && addresses_match(&entry.address, destination)
+            })
             .collect::<Vec<_>>();
         match matches.as_slice() {
             [entry] => Ok((method, entry.key.clone())),
@@ -136,8 +139,25 @@ impl KrakenClient {
     }
 
     async fn wait_for_order(&self, order_id: &str, side: &str) -> Result<SwapFillReport, String> {
+        let mut last_lookup_failure: Option<String> = None;
         for attempt in 0..ORDER_POLL_ATTEMPTS {
-            let order = self.api.order(order_id).await.map_err(api_reconciliation_error)?;
+            let order = match self.api.order(order_id).await {
+                Ok(order) => order,
+                // Kraken already accepted this order and handed back its id, so
+                // a read that cannot see it yet is the venue's own propagation
+                // delay rather than a lost order. Re-reading submits nothing, so
+                // polling on is safe -- and necessary: failing the first lookup
+                // parked orders that had already filled, because the loop below
+                // only ever retried on *status*, never on a failed read.
+                Err(error) => {
+                    last_lookup_failure = Some(api_reconciliation_error(error));
+                    if attempt + 1 < ORDER_POLL_ATTEMPTS {
+                        tokio::time::sleep(ORDER_POLL_INTERVAL).await;
+                    }
+                    continue;
+                }
+            };
+            last_lookup_failure = None;
             match order.status {
                 KrakenOrderStatus::Closed => return fill_report(side, order.volume_executed, order.cost, order.fee),
                 KrakenOrderStatus::Canceled | KrakenOrderStatus::Expired => {
@@ -152,9 +172,10 @@ impl KrakenClient {
                 KrakenOrderStatus::Pending | KrakenOrderStatus::Open => {}
             }
         }
-        Err(format!(
-            "{KRAKEN_AMBIGUOUS_PREFIX}order {order_id} did not reach a terminal state"
-        ))
+        // Both exhaustion paths stay ambiguous: an order we still cannot read,
+        // or one that never settled, may both have moved funds.
+        Err(last_lookup_failure
+            .unwrap_or_else(|| format!("{KRAKEN_AMBIGUOUS_PREFIX}order {order_id} did not reach a terminal state")))
     }
 }
 
@@ -453,6 +474,31 @@ impl CexBackend for KrakenClient {
             return Err(format!("Kraken quote budget {amount} is below cost minimum {}", pair.cost_min).into());
         }
 
+        // A leg that already submitted under this client id must adopt that
+        // order rather than place a second one. The Kraken order id is returned
+        // only once, so a leg interrupted between submission and reconciliation
+        // knows the order solely by the client id persisted before it -- and
+        // without this lookup the resumed attempt would re-sell collateral the
+        // first order had already sold.
+        if let Some(client_order_id) = options.client_order_id.as_deref() {
+            match self.api.closed_order_by_client_id(client_order_id).await {
+                Ok(Some(order)) if order.volume_executed > Decimal::ZERO => {
+                    info!(
+                        "[kraken] adopting order already settled under client id {client_order_id}: executed {} cost {}",
+                        order.volume_executed, order.cost
+                    );
+                    return fill_report(side, order.volume_executed, order.cost, order.fee).map_err(Into::into);
+                }
+                Ok(_) => {}
+                // Not knowing whether a prior order exists is not the same as
+                // knowing there is none, so this must not fall through to a
+                // submission that could duplicate it.
+                Err(error) => {
+                    return Err(self.classify_submission_error(&api_reconciliation_error(error)));
+                }
+            }
+        }
+
         // Submit exactly one market order, carrying the persisted client order ID
         // that the shared CEX recovery logic prepared before this side effect.
         // Past this point a failure may have reached the exchange, so both the
@@ -576,6 +622,28 @@ pub(crate) fn normalize_market(market: &str) -> String {
         .collect::<Vec<_>>()
         .join("_")
 }
+/// Compares a stored withdrawal address against the destination we intend to
+/// send to.
+///
+/// Hex addresses carry no information in their case: EIP-55 checksumming is a
+/// display convention, so Kraken storing an address lowercased while the
+/// pipeline holds the checksummed form describes one address, not two. Matching
+/// those byte-for-byte rejects a destination the operator did verify, and the
+/// failure surfaces only after the collateral has been seized.
+///
+/// Every other address format is compared exactly. Base58 in particular encodes
+/// distinct values in `A` and `a`, so case-folding it would risk matching an
+/// address that was never verified.
+fn addresses_match(stored: &str, destination: &str) -> bool {
+    let hex_address = |value: &str| {
+        value.len() > 2 && value[..2].eq_ignore_ascii_case("0x") && value[2..].chars().all(|c| c.is_ascii_hexdigit())
+    };
+    if hex_address(stored) && hex_address(destination) {
+        return stored.eq_ignore_ascii_case(destination);
+    }
+    stored == destination
+}
+
 fn api_asset(asset: &str) -> String {
     match asset.trim().to_ascii_uppercase().as_str() {
         "BTC" => "XBT".to_string(),
@@ -728,6 +796,40 @@ mod tests {
         KrakenBookLevel, KrakenDepositAddress, KrakenOrder, KrakenWithdrawalAddress, MockKrakenApi,
     };
 
+    /// The real pairing that failed liquidation 1615: Kraken had stored the
+    /// verified address lowercased, the pipeline held the EIP-55 checksummed
+    /// form, and the exact comparison reported a verified destination as
+    /// unverified after the collateral was already seized.
+    #[test]
+    fn a_checksummed_destination_matches_its_lowercased_stored_address() {
+        assert!(addresses_match(
+            "0xa21522b91e8ed11a9afcc09f718319277b75c381",
+            "0xa21522B91E8Ed11A9AFcC09f718319277b75c381"
+        ));
+    }
+
+    #[test]
+    fn a_different_hex_address_still_does_not_match() {
+        assert!(!addresses_match(
+            "0xd9a5b3a87e971e09c30829206506b4cc0548984c",
+            "0xa21522B91E8Ed11A9AFcC09f718319277b75c381"
+        ));
+    }
+
+    /// Base58 encodes different values in `A` and `a`, so folding case there
+    /// could match an address the operator never verified.
+    #[test]
+    fn non_hex_addresses_are_compared_exactly() {
+        assert!(addresses_match(
+            "1BvBMSEYstWetqTFn5Au4m4GFg7xJaNVN2",
+            "1BvBMSEYstWetqTFn5Au4m4GFg7xJaNVN2"
+        ));
+        assert!(!addresses_match(
+            "1BvBMSEYstWetqTFn5Au4m4GFg7xJaNVN2",
+            "1bvbmseystwetqtfn5au4m4gfg7xjanvn2"
+        ));
+    }
+
     fn btc_usd_pair() -> KrakenPair {
         KrakenPair {
             api_name: "XXBTZUSD".into(),
@@ -869,6 +971,7 @@ mod tests {
     async fn market_sell_attaches_client_id_and_reports_net_fill() {
         let mut api = MockKrakenApi::new();
         api.expect_pairs().once().returning(|| Ok(vec![btc_usd_pair()]));
+        api.expect_closed_order_by_client_id().returning(|_| Ok(None));
         api.expect_place_market_order()
             .withf(|pair, side, volume, client_id| {
                 pair == "XXBTZUSD"
@@ -914,11 +1017,62 @@ mod tests {
         assert_eq!(report.output_received, 5_976.0);
     }
 
+    /// Liquidation 1615's recovery path: the leg resumes still holding the
+    /// client id it submitted under, and Kraken has that order settled. It must
+    /// adopt the existing fill rather than sell the same collateral twice.
     #[tokio::test]
-    async fn accepted_order_with_failed_status_query_is_ambiguous() {
+    async fn a_resumed_leg_adopts_the_order_it_already_submitted() {
+        let mut api = MockKrakenApi::new();
+        api.expect_pairs().once().returning(|| Ok(vec![btc_usd_pair()]));
+        api.expect_closed_order_by_client_id()
+            .withf(|id| id == "lqd39ae79815a051f7")
+            .once()
+            .returning(|_| {
+                Ok(Some(KrakenOrder {
+                    status: KrakenOrderStatus::Closed,
+                    volume_executed: Decimal::new(1, 1),
+                    cost: Decimal::new(6_000, 0),
+                    fee: Decimal::new(24, 0),
+                }))
+            });
+        // The point of the test: no order is placed on the resumed attempt.
+        api.expect_place_market_order().never();
+        api.expect_orderbook().returning(|_, _| {
+            Ok(KrakenBook {
+                bids: vec![KrakenBookLevel {
+                    price: Decimal::new(60_000, 0),
+                    quantity: Decimal::new(1, 0),
+                }],
+                asks: vec![],
+            })
+        });
+        let client = KrakenClient::with_api(Arc::new(api), vec![]);
+
+        let report = client
+            .execute_swap_detailed_with_options(
+                "BTC_USD",
+                "sell",
+                0.1,
+                SwapExecutionOptions {
+                    client_order_id: Some("lqd39ae79815a051f7".into()),
+                    ..SwapExecutionOptions::default()
+                },
+            )
+            .await
+            .expect("the settled order must be adopted");
+
+        assert!((report.input_consumed - 0.1).abs() < 1e-9);
+        assert_eq!(report.output_received, 5_976.0);
+    }
+
+    /// A lookup that never succeeds stays ambiguous: the order may have moved
+    /// funds, and nothing here can prove otherwise. The paused clock steps over
+    /// the poll interval so exhausting the budget costs no real time.
+    #[tokio::test(start_paused = true)]
+    async fn an_order_that_never_becomes_readable_is_ambiguous() {
         let mut api = MockKrakenApi::new();
         api.expect_order()
-            .once()
+            .times(ORDER_POLL_ATTEMPTS)
             .returning(|_| Err(KrakenApiError::Transport("status request timed out".into())));
         let client = KrakenClient::with_api(Arc::new(api), vec![]);
 
@@ -928,6 +1082,39 @@ mod tests {
             client.classify_submission_error(&error),
             CexSubmissionError::Ambiguous(_)
         ));
+    }
+
+    /// Liquidation 1615: Kraken accepted the order, returned its id, then could
+    /// not read it back on the first attempt. The order had in fact filled, so
+    /// bailing there parked a completed sell for an operator. The read must be
+    /// retried to its deadline instead.
+    #[tokio::test(start_paused = true)]
+    async fn a_briefly_unreadable_order_is_polled_rather_than_parked() {
+        let mut api = MockKrakenApi::new();
+        let mut reads = 0;
+        api.expect_order().times(2).returning(move |_| {
+            reads += 1;
+            if reads == 1 {
+                return Err(KrakenApiError::Transport(
+                    "order OJKJQE-YONE3-2QEYQ2 was not returned".into(),
+                ));
+            }
+            Ok(KrakenOrder {
+                status: KrakenOrderStatus::Closed,
+                volume_executed: Decimal::new(748_710_104, 8),
+                cost: Decimal::new(1_563_307, 5),
+                fee: Decimal::new(12_506, 5),
+            })
+        });
+        let client = KrakenClient::with_api(Arc::new(api), vec![]);
+
+        let report = client
+            .wait_for_order("OJKJQE-YONE3-2QEYQ2", "sell")
+            .await
+            .expect("a filled order must be reported, not parked");
+
+        assert!((report.input_consumed - 7.48710104).abs() < 1e-8);
+        assert!(report.output_received > 0.0);
     }
 
     #[tokio::test]
@@ -1015,6 +1202,7 @@ mod tests {
     async fn market_buy_derives_precision_safe_base_volume_from_quote_budget() {
         let mut api = MockKrakenApi::new();
         api.expect_pairs().once().returning(|| Ok(vec![btc_usd_pair()]));
+        api.expect_closed_order_by_client_id().returning(|_| Ok(None));
         api.expect_orderbook().once().returning(|_, _| {
             Ok(KrakenBook {
                 bids: vec![],

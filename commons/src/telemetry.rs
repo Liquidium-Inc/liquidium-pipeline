@@ -85,7 +85,20 @@ impl Drop for TelemetryGuard {
 }
 
 pub fn init_telemetry(config: TelemetryConfig) -> Result<TelemetryGuard, Box<dyn std::error::Error>> {
-    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    // Venue client crates instrument every request and response at INFO, so a
+    // single poll loop prints whole balance maps several times a minute and
+    // buries the pipeline's own lines. They are quieted to WARN by default --
+    // errors still surface -- and the full detail remains one `RUST_LOG` away.
+    //
+    // `RUST_LOG` is layered on top rather than replacing these, because
+    // `add_directive` lets a later directive replace an earlier one for the
+    // same target: an operator asking for `kraken_async_rs=debug` still wins.
+    let mut env_filter = EnvFilter::new("info").add_directive("kraken_async_rs=warn".parse()?);
+    if let Ok(requested) = std::env::var("RUST_LOG") {
+        for directive in requested.split(',').map(str::trim).filter(|value| !value.is_empty()) {
+            env_filter = env_filter.add_directive(directive.parse()?);
+        }
+    }
 
     let (writer, file_log_guard) = if let Some(path) = &config.local_log_file {
         let file = open_log_file(path)?;

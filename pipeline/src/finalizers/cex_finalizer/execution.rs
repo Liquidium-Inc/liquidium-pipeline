@@ -1393,14 +1393,22 @@ where
                 .backend
                 .get_withdraw_status_snapshot_by_id(&planned_asset, &withdraw_id)
                 .await?;
-            info!(
+            // This poll repeats every few seconds for as long as the venue takes
+            // to release the funds, and a withdrawal that has not moved reports
+            // the same snapshot every time. Logging each identical observation
+            // at INFO buries the transitions worth reading, so the steady state
+            // -- still pending, no chain txid yet -- is demoted to DEBUG.
+            let txid_present = withdraw_snapshot.txid.as_ref().is_some_and(|tx| !tx.trim().is_empty());
+            let unchanged = matches!(withdraw_snapshot.status, WithdrawStatus::Pending) && !txid_present;
+            let snapshot_line = format!(
                 "[cex] liq_id={} withdraw snapshot: withdraw_id={} status={:?} txid_present={} fee={:?}",
-                state.liq_id,
-                withdraw_id,
-                withdraw_snapshot.status,
-                withdraw_snapshot.txid.as_ref().is_some_and(|tx| !tx.trim().is_empty()),
-                withdraw_snapshot.transaction_fee,
+                state.liq_id, withdraw_id, withdraw_snapshot.status, txid_present, withdraw_snapshot.transaction_fee,
             );
+            if unchanged {
+                debug!("{snapshot_line}");
+            } else {
+                info!("{snapshot_line}");
+            }
 
             match withdraw_snapshot.status {
                 WithdrawStatus::Pending | WithdrawStatus::Unknown => {

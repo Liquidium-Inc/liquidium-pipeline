@@ -3841,7 +3841,7 @@ dependencies = [
 [[package]]
 name = "kraken-async-rs"
 version = "0.16.0"
-source = "git+https://github.com/pxr64/kraken-async-rs.git?rev=916e950#916e9508676a7b94f71164a212cf53e2d9a348bc"
+source = "git+https://github.com/pxr64/kraken-async-rs.git?rev=f16cda1#f16cda1016799d7b90964bbe59f7cf3e2492d6ad"
 dependencies = [
  "async-rate-limit",
  "base64 0.23.1",
