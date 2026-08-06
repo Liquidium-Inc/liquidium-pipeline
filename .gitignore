@@ -9,3 +9,6 @@ key
 wal.db
 _key
 key_
+pipeline/src/commands/liquidation_loop.rs
+liquidations.db
+*.daemon.lock

@@ -15,7 +15,8 @@
 //! - Server replies with exactly one line: `ok\n` or `err:<reason>\n`.
 //! - Connection is closed after the reply.
 
-use std::fs;
+use std::ffi::OsString;
+use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -45,6 +46,23 @@ pub enum ControlCommand {
     Resume,
 }
 
+/// Process-lifetime ownership of one liquidation-intake database.
+///
+/// The lock file remains on disk after shutdown, but the OS lock itself is
+/// released automatically when the process exits, including after a crash.
+/// Keeping the file handle alive is what keeps this daemon authoritative.
+#[derive(Debug)]
+pub struct DaemonInstanceLock {
+    _file: File,
+    path: PathBuf,
+}
+
+impl DaemonInstanceLock {
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
 impl ControlCommand {
     fn as_wire(self) -> &'static str {
         match self {
@@ -67,6 +85,80 @@ pub fn default_sock_path() -> PathBuf {
 
 pub fn default_log_file_path() -> PathBuf {
     std::env::temp_dir().join("liquidator").join("liquidator.log")
+}
+
+/// Claims exclusive ownership of the intake database and control socket.
+///
+/// This must run before opening either SQLite database or recovering
+/// `Submitting` intents. The database-scoped lock prevents a second daemon
+/// from bypassing exclusivity with a different `--sock-path`; the pre-bound
+/// socket additionally prevents an older daemon using the same control path
+/// from overlapping startup.
+pub fn acquire_daemon_instance(
+    liquidations_db_path: &Path,
+    sock_path: &Path,
+) -> anyhow::Result<(DaemonInstanceLock, UnixListener)> {
+    let instance_lock = acquire_intake_db_lock(liquidations_db_path)?;
+    let listener = bind_control_listener(sock_path)
+        .with_context(|| format!("claim daemon control socket at {}", sock_path.display()))?;
+    Ok((instance_lock, listener))
+}
+
+fn acquire_intake_db_lock(liquidations_db_path: &Path) -> anyhow::Result<DaemonInstanceLock> {
+    let lock_path = daemon_lock_path(liquidations_db_path)?;
+    let mut options = OpenOptions::new();
+    options.create(true).read(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+
+    let file = options
+        .open(&lock_path)
+        .with_context(|| format!("open daemon lock file {}", lock_path.display()))?;
+    match file.try_lock() {
+        Ok(()) => Ok(DaemonInstanceLock {
+            _file: file,
+            path: lock_path,
+        }),
+        Err(TryLockError::WouldBlock) => bail!(
+            "another liquidation daemon is already using intake database {} (lock: {})",
+            liquidations_db_path.display(),
+            lock_path.display()
+        ),
+        Err(TryLockError::Error(error)) => {
+            Err(error).with_context(|| format!("lock daemon instance at {}", lock_path.display()))
+        }
+    }
+}
+
+fn daemon_lock_path(liquidations_db_path: &Path) -> anyhow::Result<PathBuf> {
+    let canonical_target = if liquidations_db_path.exists() {
+        liquidations_db_path
+            .canonicalize()
+            .with_context(|| format!("canonicalize intake database {}", liquidations_db_path.display()))?
+    } else {
+        let parent = liquidations_db_path
+            .parent()
+            .filter(|path| !path.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        fs::create_dir_all(parent).with_context(|| format!("create intake database directory {}", parent.display()))?;
+        let canonical_parent = parent
+            .canonicalize()
+            .with_context(|| format!("canonicalize intake database directory {}", parent.display()))?;
+        let file_name = liquidations_db_path.file_name().ok_or_else(|| {
+            anyhow::anyhow!(
+                "liquidation intake database path has no file name: {}",
+                liquidations_db_path.display()
+            )
+        })?;
+        canonical_parent.join(file_name)
+    };
+
+    let mut lock_name = OsString::from(canonical_target.as_os_str());
+    lock_name.push(".daemon.lock");
+    Ok(PathBuf::from(lock_name))
 }
 
 pub fn bind_control_listener(sock_path: &Path) -> anyhow::Result<UnixListener> {
@@ -356,7 +448,8 @@ mod tests {
     use tokio::net::UnixStream;
 
     use super::{
-        ControlCommand, bind_control_listener, is_transient_accept_error, run_control_server, send_control_command,
+        ControlCommand, acquire_daemon_instance, acquire_intake_db_lock, bind_control_listener,
+        is_transient_accept_error, run_control_server, send_control_command,
     };
 
     fn sock_path(tmp: &TempDir) -> std::path::PathBuf {
@@ -485,6 +578,73 @@ mod tests {
         assert!(
             msg.contains("already in use") || msg.contains("another daemon"),
             "unexpected error message: {msg}"
+        );
+    }
+
+    #[test]
+    fn intake_database_lock_rejects_a_second_holder_and_releases_on_drop() {
+        let tmp = TempDir::new().expect("tmp");
+        let db_path = tmp.path().join("liquidations.db");
+
+        let first = acquire_intake_db_lock(&db_path).expect("first daemon lock");
+        assert_eq!(
+            first.path(),
+            tmp.path()
+                .canonicalize()
+                .expect("canonical temp directory")
+                .join("liquidations.db.daemon.lock")
+        );
+
+        let error = acquire_intake_db_lock(&db_path).expect_err("second daemon must be rejected");
+        assert!(
+            error.to_string().contains("another liquidation daemon"),
+            "unexpected error: {error:#}"
+        );
+
+        drop(first);
+        acquire_intake_db_lock(&db_path).expect("lock should be released when daemon exits");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn intake_database_lock_canonicalizes_symlink_aliases() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = TempDir::new().expect("tmp");
+        let db_path = tmp.path().join("liquidations.db");
+        let db_alias = tmp.path().join("liquidations-alias.db");
+        fs::write(&db_path, b"").expect("create intake database");
+        symlink(&db_path, &db_alias).expect("create intake database alias");
+
+        let _first = acquire_intake_db_lock(&db_path).expect("first daemon lock");
+        let error = acquire_intake_db_lock(&db_alias).expect_err("canonical alias must share the same lock");
+
+        assert!(
+            error.to_string().contains("another liquidation daemon"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn same_database_is_rejected_even_with_a_different_socket() {
+        let tmp = TempDir::new().expect("tmp");
+        if skip_if_uds_unsupported(&tmp) {
+            return;
+        }
+        let db_path = tmp.path().join("liquidations.db");
+        let first_socket = tmp.path().join("first.sock");
+        let second_socket = tmp.path().join("second.sock");
+
+        let _first = acquire_daemon_instance(&db_path, &first_socket).expect("first daemon");
+        let error = acquire_daemon_instance(&db_path, &second_socket).expect_err("second daemon must be rejected");
+
+        assert!(
+            error.to_string().contains("another liquidation daemon"),
+            "unexpected error: {error:#}"
+        );
+        assert!(
+            !second_socket.exists(),
+            "rejected daemon must not bind its alternate socket"
         );
     }
 

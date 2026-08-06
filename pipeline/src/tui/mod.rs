@@ -24,6 +24,7 @@ use tokio::sync::mpsc;
 use crate::commands::liquidation_loop::LoopControl;
 use crate::commands::tui::TuiOptions;
 use crate::context::init_context_best_effort;
+use crate::persistance::liquidation_intake::SqliteLiquidationIntentStore;
 use crate::persistance::sqlite::SqliteWalStore;
 
 use self::app::{App, ConfigSummary, ExecutionRowData, ExecutionsSnapshot, WalCounts, WalSnapshot};
@@ -93,19 +94,16 @@ pub async fn run(opts: TuiOptions) -> anyhow::Result<()> {
                 let res = tokio::task::spawn_blocking(move || {
                     let counts = store.status_counts().map_err(|e| e.to_string())?;
                     let rows = store.list_recent(200).map_err(|e| e.to_string())?;
-                    let paused = store.daemon_paused().map_err(|e| e.to_string())?;
-                    Ok::<_, String>((counts, rows, paused))
+                    Ok::<_, String>((counts, rows))
                 })
                 .await;
                 match res {
-                    Ok(Ok((map, rows, paused))) => {
+                    Ok(Ok((map, rows))) => {
                         let snapshot = WalSnapshot {
                             counts: WalCounts::from_map(&map),
                             at: Local::now(),
                         };
                         let _ = ui_tx.send(UiEvent::Wal(Ok(snapshot)));
-                        let _ = ui_tx.send(UiEvent::DaemonPaused(Ok(paused)));
-
                         let rows = rows
                             .into_iter()
                             .map(|row| ExecutionRowData {
@@ -125,12 +123,48 @@ pub async fn run(opts: TuiOptions) -> anyhow::Result<()> {
                     Ok(Err(e)) => {
                         let _ = ui_tx.send(UiEvent::Wal(Err(format!("db query failed: {e}"))));
                         let _ = ui_tx.send(UiEvent::Executions(Err(format!("db query failed: {e}"))));
-                        let _ = ui_tx.send(UiEvent::DaemonPaused(Err(format!("db query failed: {e}"))));
                     }
                     Err(e) => {
                         let _ = ui_tx.send(UiEvent::Wal(Err(format!("db task failed: {e}"))));
                         let _ = ui_tx.send(UiEvent::Executions(Err(format!("db task failed: {e}"))));
-                        let _ = ui_tx.send(UiEvent::DaemonPaused(Err(format!("db task failed: {e}"))));
+                    }
+                }
+            }
+        });
+    }
+
+    // Scanner/control state polling (read-only, separate from execution WAL).
+    {
+        let ui_tx = ui_tx.clone();
+        let stop = stop.clone();
+        let db_path = ctx.config.liquidations_db_path.clone();
+        tokio::spawn(async move {
+            let store = match SqliteLiquidationIntentStore::new_read_only_with_busy_timeout(&db_path, 30_000) {
+                Ok(store) => Arc::new(store),
+                Err(error) => {
+                    let _ = ui_tx.send(UiEvent::DaemonPaused(Err(format!("intake db open failed: {error}"))));
+                    return;
+                }
+            };
+
+            let mut interval = tokio::time::interval(Duration::from_secs(1));
+            loop {
+                interval.tick().await;
+                if stop.load(Ordering::Relaxed) {
+                    break;
+                }
+                let store = store.clone();
+                let result =
+                    tokio::task::spawn_blocking(move || store.daemon_paused().map_err(|e| e.to_string())).await;
+                match result {
+                    Ok(Ok(paused)) => {
+                        let _ = ui_tx.send(UiEvent::DaemonPaused(Ok(paused)));
+                    }
+                    Ok(Err(error)) => {
+                        let _ = ui_tx.send(UiEvent::DaemonPaused(Err(format!("intake db query failed: {error}"))));
+                    }
+                    Err(error) => {
+                        let _ = ui_tx.send(UiEvent::DaemonPaused(Err(format!("intake db task failed: {error}"))));
                     }
                 }
             }
@@ -212,6 +246,7 @@ pub async fn run(opts: TuiOptions) -> anyhow::Result<()> {
         control_socket: sock_path.display().to_string(),
         log_source: describe_log_source(&unit_name, log_file.as_deref()),
         db_path: cfg.db_path.clone(),
+        liquidations_db_path: cfg.liquidations_db_path.clone(),
         export_path: cfg.export_path.clone(),
     };
 
