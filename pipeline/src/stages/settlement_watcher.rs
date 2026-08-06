@@ -756,21 +756,24 @@ mod tests {
 
     /// The loop is the only thing advancing started liquidations to a terminal
     /// state, so a panicking sweep must not end it.
-    #[tokio::test]
+    ///
+    /// Each panic costs `PANIC_RECOVERY_DELAY` before the next sweep, so the
+    /// paused clock steps over those delays in virtual time. Polling the
+    /// counter behind real 1ms sleeps made the test depend on the timer
+    /// overshooting its request: three sweeps need two real seconds of
+    /// recovery, which a precise 1ms tick would never reach.
+    #[tokio::test(start_paused = true)]
     async fn run_keeps_sweeping_after_a_panicking_sweep() {
         let wal = FaultyWal::new(Fault::Panic);
         let sweeps = wal.sweep_counter();
 
         let handle = tokio::spawn(watcher_with_wal(wal).run());
 
-        // Poll rather than sleeping a fixed span so the test does not depend on
-        // wall-clock scheduling.
-        for _ in 0..1_000 {
-            if sweeps.load(Ordering::SeqCst) >= 3 {
-                break;
-            }
-            sleep(Duration::from_millis(1)).await;
+        for _ in 0..3 {
+            tokio::task::yield_now().await;
+            tokio::time::advance(PANIC_RECOVERY_DELAY).await;
         }
+        tokio::task::yield_now().await;
 
         assert!(
             sweeps.load(Ordering::SeqCst) >= 3,
