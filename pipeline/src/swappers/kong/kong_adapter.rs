@@ -5,6 +5,12 @@ use crate::swappers::kong::kong_types::{
 };
 use crate::swappers::model::{SwapExecution, SwapQuote, SwapQuoteLeg, SwapRequest};
 
+const BPS_PER_PERCENTAGE_POINT: f64 = 100.0;
+
+fn percentage_points_to_bps(value: f64) -> f64 {
+    value.max(0.0) * BPS_PER_PERCENTAGE_POINT
+}
+
 fn asset_to_chain_and_symbol(asset: &AssetId) -> (String, String, String) {
     (asset.chain.clone(), asset.symbol.clone(), asset.address.clone())
 }
@@ -71,7 +77,7 @@ impl From<KongSwapAmountsReply> for SwapQuote {
             receive_amount: k.receive_amount,
             mid_price: k.mid_price,
             exec_price: k.price,
-            slippage: k.slippage,
+            estimated_price_impact_bps: percentage_points_to_bps(k.slippage),
             legs,
         }
     }
@@ -114,10 +120,21 @@ impl From<KongSwapReply> for SwapExecution {
             receive_amount: r.receive_amount.clone(),
             mid_price: r.mid_price,
             exec_price: r.price,
-            slippage: r.slippage,
+            realized_slippage_bps: percentage_points_to_bps(r.slippage),
             legs,
             approval_count: None,
             ts: r.ts,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::percentage_points_to_bps;
+
+    #[test]
+    fn kong_percentage_points_are_normalized_to_basis_points() {
+        assert_eq!(percentage_points_to_bps(1.25), 125.0);
+        assert_eq!(percentage_points_to_bps(-1.0), 0.0);
     }
 }

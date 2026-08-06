@@ -255,6 +255,7 @@ impl<A: PipelineAgent, D: WalStore> BasicExecutor<A, D> {
                 debt_decimals: executor_request.debt_asset.decimals(),
                 updated_at: now_ts(),
             }),
+            venue_execution: None,
         };
         let _ = encode_meta(&mut result_record, &wrapper);
         self.wal.upsert_result(result_record).map_err(|e| e.to_string()).await

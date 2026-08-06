@@ -107,16 +107,7 @@ impl SqliteWalStore {
     fn from_row(r: Row) -> LiqResultRecord {
         LiqResultRecord {
             id: r.liq_id,
-            status: match r.status {
-                0 => ResultStatus::Enqueued,
-                1 => ResultStatus::InFlight,
-                2 => ResultStatus::Succeeded,
-                3 => ResultStatus::FailedRetryable,
-                4 => ResultStatus::FailedPermanent,
-                5 => ResultStatus::WaitingCollateral,
-                6 => ResultStatus::WaitingProfit,
-                _ => ResultStatus::FailedPermanent,
-            },
+            status: r.status.into(),
             attempt: r.attempt,
             error_count: r.error_count,
             last_error: r.last_error,
@@ -135,17 +126,7 @@ impl SqliteWalStore {
 
         let mut out: HashMap<ResultStatus, i64> = HashMap::new();
         for (status, count) in rows {
-            let status = match status {
-                0 => ResultStatus::Enqueued,
-                1 => ResultStatus::InFlight,
-                2 => ResultStatus::Succeeded,
-                3 => ResultStatus::FailedRetryable,
-                4 => ResultStatus::FailedPermanent,
-                5 => ResultStatus::WaitingCollateral,
-                6 => ResultStatus::WaitingProfit,
-                _ => ResultStatus::FailedPermanent,
-            };
-            *out.entry(status).or_insert(0) += count;
+            *out.entry(ResultStatus::from(status)).or_insert(0) += count;
         }
         Ok(out)
     }

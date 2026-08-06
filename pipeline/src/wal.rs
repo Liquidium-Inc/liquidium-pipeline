@@ -19,6 +19,7 @@ pub fn decode_receipt_wrapper(row: &LiqResultRecord) -> Result<Option<LiqMetaWra
                 meta: Vec::new(),
                 finalizer_decision: None,
                 profit_snapshot: None,
+                venue_execution: None,
             })),
             Err(receipt_err) => Err(format!(
                 "invalid meta_json for {}: wrapper_err={}; receipt_err={}",
@@ -80,6 +81,25 @@ pub async fn wal_mark_permanent_failed(wal: &dyn WalStore, liq_id: &str, last_er
 
 pub async fn wal_mark_enqueued(wal: &dyn WalStore, liq_id: &str) -> Result<(), String> {
     wal.update_status(liq_id, ResultStatus::Enqueued, true)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+pub async fn wal_mark_operator_required(wal: &dyn WalStore, liq_id: &str) -> Result<(), String> {
+    wal.update_status(liq_id, ResultStatus::OperatorRequired, false)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Parks a row for an operator while preserving the failure that caused it.
+/// Used when the retry budget runs out on a row whose venue leg may still hold
+/// funds, where the diagnostic matters as much as the status change.
+pub async fn wal_mark_operator_required_with_error(
+    wal: &dyn WalStore,
+    liq_id: &str,
+    last_error: String,
+) -> Result<(), String> {
+    wal.update_failure(liq_id, ResultStatus::OperatorRequired, last_error, false)
         .await
         .map_err(|e| e.to_string())
 }

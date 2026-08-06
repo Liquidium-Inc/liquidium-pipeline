@@ -1498,7 +1498,7 @@ where
             receive_amount: receive_amount.value,
             mid_price,
             exec_price,
-            slippage,
+            realized_slippage_bps: slippage,
             legs,
             approval_count: state.deposit.approval_bump_count,
             ts: now_ts().max(0) as u64,

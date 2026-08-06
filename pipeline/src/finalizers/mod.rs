@@ -2,6 +2,7 @@ pub(crate) mod bridge_planner;
 pub mod cex_finalizer;
 pub mod dex_finalizer;
 pub mod finalizer;
+pub mod icpswap;
 pub mod hybrid;
 pub mod kong_swap;
 pub mod liquidation_outcome;

@@ -13,8 +13,6 @@ use crate::{
 pub(crate) const DEX_DUST_MAX_USD: f64 = 2.5;
 /// Basis points per 1.00 ratio value (100%).
 const BPS_PER_RATIO_UNIT: f64 = 10_000.0;
-/// Basis points per 1.00 percentage-point value.
-const BPS_PER_PERCENTAGE_POINT: f64 = 100.0;
 /// Fixed-point divisor used to convert RAY price (1e27) into decimal price.
 pub(crate) const RAY_PRICE_SCALE: f64 = 1e27_f64;
 
@@ -81,13 +79,6 @@ pub(crate) fn debt_repaid_f64(receipt: &ExecutionReceipt) -> Result<f64, String>
         return Err("invalid debt_repaid amount in receipt".to_string());
     }
     Ok(debt_repaid_amount)
-}
-
-/// Normalize quote slippage into basis points.
-pub(crate) fn dex_slippage_bps(slippage: f64) -> f64 {
-    // Kong reports slippage in percentage points, e.g. 0.72 => 0.72%.
-    // 1% = 100 bps, hence *100.
-    (slippage.max(0.0)) * BPS_PER_PERCENTAGE_POINT
 }
 
 /// Estimate swap notional in USD using strategy-provided reference price (ray format 1e27).

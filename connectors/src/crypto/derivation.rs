@@ -5,7 +5,11 @@ use bip39::{Language, Mnemonic};
 use k256::SecretKey;
 use std::str::FromStr;
 
-fn derive_private_key_with_path(mnemonic: &str, path_str: &str) -> Result<SecretKey, String> {
+/// Derives a secp256k1 private key at an explicit BIP-32 path.
+///
+/// Callers define their own hardened namespace in the path; this helper only
+/// performs mnemonic parsing and deterministic child-key derivation.
+pub(crate) fn derive_private_key_with_path(mnemonic: &str, path_str: &str) -> Result<SecretKey, String> {
     let mnemonic = Mnemonic::parse_in(Language::English, mnemonic).map_err(|e| format!("invalid mnemonic: {e}"))?;
     let seed = mnemonic.to_seed("");
     let master = XPrv::new(seed).map_err(|e| format!("xprv error: {e}"))?;

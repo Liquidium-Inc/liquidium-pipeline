@@ -1,5 +1,6 @@
 use anyhow::Result;
 use async_trait::async_trait;
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 use crate::stages::executor::ExecutionReceipt;
@@ -15,6 +16,27 @@ pub enum ResultStatus {
     FailedPermanent = 4,
     WaitingCollateral = 5,
     WaitingProfit = 6,
+    /// External custody is ambiguous and must be reconciled before retrying.
+    /// Pending selection deliberately excludes this status.
+    OperatorRequired = 7,
+}
+
+impl From<i32> for ResultStatus {
+    /// Unknown discriminants decode as permanently failed so a row written by a
+    /// newer binary is never picked up as pending work.
+    fn from(value: i32) -> Self {
+        match value {
+            0 => ResultStatus::Enqueued,
+            1 => ResultStatus::InFlight,
+            2 => ResultStatus::Succeeded,
+            3 => ResultStatus::FailedRetryable,
+            4 => ResultStatus::FailedPermanent,
+            5 => ResultStatus::WaitingCollateral,
+            6 => ResultStatus::WaitingProfit,
+            7 => ResultStatus::OperatorRequired,
+            _ => ResultStatus::FailedPermanent,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, serde::Deserialize)]
@@ -25,6 +47,36 @@ pub struct LiqMetaWrapper {
     pub finalizer_decision: Option<FinalizerDecisionSnapshot>,
     #[serde(default)]
     pub profit_snapshot: Option<WalProfitSnapshot>,
+    #[serde(default)]
+    pub venue_execution: Option<VenueExecutionState>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct VenueExecutionState {
+    pub venue: String,
+    pub state: serde_json::Value,
+}
+
+impl VenueExecutionState {
+    pub fn new<T: Serialize>(venue: impl Into<String>, state: &T) -> Result<Self, String> {
+        Ok(Self {
+            venue: venue.into(),
+            state: serde_json::to_value(state).map_err(|error| format!("failed to encode venue state: {error}"))?,
+        })
+    }
+
+    pub fn is_venue(&self, venue: &str) -> bool {
+        self.venue == venue
+    }
+
+    pub fn decode<T: DeserializeOwned>(&self, venue: &str) -> Result<Option<T>, String> {
+        if !self.is_venue(venue) {
+            return Ok(None);
+        }
+        serde_json::from_value(self.state.clone())
+            .map(Some)
+            .map_err(|error| format!("failed to decode {venue} execution state: {error}"))
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

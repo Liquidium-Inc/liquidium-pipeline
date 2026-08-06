@@ -40,15 +40,31 @@ impl SlackWatchdog {
         }
     }
 
-    async fn reserve_for_send(&self, key: &str) -> Option<Instant> {
+    /// Claims the cooldown slot for `key`, returning the timestamp it displaced
+    /// so a failed send can put it back. Reserving up front keeps the check and
+    /// the claim atomic under one lock; [`Self::release_reservation`] undoes it
+    /// when the send fails, so a dropped alert is retried on the next attempt
+    /// rather than silently consuming the whole cooldown window.
+    async fn reserve_for_send(&self, key: &str) -> Option<Option<Instant>> {
         let mut m = self.last.lock().await;
         let now = Instant::now();
         m.retain(|_, ts| now.duration_since(*ts) < self.cooldown);
         if matches!(m.get(key), Some(&t) if now.duration_since(t) < self.cooldown) {
             return None;
         }
-        m.insert(key.to_string(), now);
-        Some(now)
+        Some(m.insert(key.to_string(), now))
+    }
+
+    async fn release_reservation(&self, key: &str, displaced: Option<Instant>) {
+        let mut m = self.last.lock().await;
+        match displaced {
+            Some(previous) => {
+                m.insert(key.to_string(), previous);
+            }
+            None => {
+                m.remove(key);
+            }
+        }
     }
 }
 
@@ -56,27 +72,40 @@ impl SlackWatchdog {
 impl Watchdog for SlackWatchdog {
     async fn notify(&self, ev: WatchdogEvent<'_>) {
         let cooldown_key = slack_cooldown_key(&ev);
-        match cooldown_key.as_deref() {
+        let reservation = match cooldown_key.as_deref() {
             Some(key) => match self.reserve_for_send(key).await {
-                Some(_) => {}
+                Some(displaced) => Some((key.to_string(), displaced)),
                 None => return,
             },
-            None => {}
-        }
+            None => None,
+        };
 
         let Some(payload) = slack_payload_for_event_with_bot(&ev, &self.bot_name) else {
+            if let Some((key, displaced)) = reservation {
+                self.release_reservation(&key, displaced).await;
+            }
             return;
         };
 
-        match self.client.post(&self.url).json(&payload).send().await {
-            Ok(resp) if resp.status().is_success() => {}
-            Ok(resp) if !resp.status().is_success() => {
+        let delivered = match self.client.post(&self.url).json(&payload).send().await {
+            Ok(resp) if resp.status().is_success() => true,
+            Ok(resp) => {
                 warn!("Slack notification failed with status {}", resp.status());
+                false
             }
             Err(err) => {
                 warn!("Slack notification failed: {}", err);
+                false
             }
-            _ => {}
+        };
+
+        // An undelivered alert must not burn its cooldown: the caller re-notifies
+        // every cycle while a condition persists, and swallowing the failure here
+        // is what turns a stuck swap into one nobody is ever told about.
+        if !delivered
+            && let Some((key, displaced)) = reservation
+        {
+            self.release_reservation(&key, displaced).await;
         }
     }
 }
@@ -94,6 +123,12 @@ fn slack_cooldown_key(ev: &WatchdogEvent<'_>) -> Option<String> {
         } => Some(format!(
             "liquidation_finalized:{liquidation_id}:{borrower}:{debt_asset}:{collateral_asset}:{status}"
         )),
+        WatchdogEvent::OperatorRequired {
+            execution_id,
+            venue,
+            pending_step,
+            ..
+        } => Some(format!("operator_required:{venue}:{execution_id}:{pending_step}")),
         _ => None,
     }
 }
@@ -192,6 +227,57 @@ fn slack_payload_for_event_with_bot(ev: &WatchdogEvent<'_>, bot_name: &str) -> O
                         }
                     }
                 ]
+            }))
+        }
+        WatchdogEvent::OperatorRequired {
+            execution_id,
+            venue,
+            pending_step,
+            owner,
+            details,
+        } => {
+            let text = format!("[{bot_name}] Operator action required: {venue} {execution_id} ({pending_step})");
+            let mut blocks = vec![
+                serde_json::json!({
+                    "type": "section",
+                    "text": {
+                        "type": "mrkdwn",
+                        "text": format!("*{bot_name}* - Operator action required for `{venue}`")
+                    }
+                }),
+                serde_json::json!({
+                    "type": "section",
+                    "fields": [
+                        {
+                            "type": "mrkdwn",
+                            "text": format!("*Execution ID*\n`{execution_id}`")
+                        },
+                        {
+                            "type": "mrkdwn",
+                            "text": format!("*Pending step*\n`{pending_step}`")
+                        },
+                        {
+                            "type": "mrkdwn",
+                            "text": format!("*Owner*\n`{owner}`")
+                        }
+                    ]
+                }),
+            ];
+            // Slack rejects a section block with empty text and drops the whole
+            // message, so a blank detail string would silently swallow the very
+            // alert that says a swap is stuck. Omit the block instead.
+            if !details.trim().is_empty() {
+                blocks.push(serde_json::json!({
+                    "type": "section",
+                    "text": {
+                        "type": "mrkdwn",
+                        "text": details
+                    }
+                }));
+            }
+            Some(serde_json::json!({
+                "text": text,
+                "blocks": blocks
             }))
         }
         WatchdogEvent::LiquidationFinalized {
@@ -296,7 +382,10 @@ mod tests {
         };
 
         let payload = slack_payload_for_event(&ev).expect("low balance should format");
-        assert_eq!(payload["text"], "[liquidator] Low balance: main ckBTC is 0 ckBTC, below 0.001 ckBTC");
+        assert_eq!(
+            payload["text"],
+            "[liquidator] Low balance: main ckBTC is 0 ckBTC, below 0.001 ckBTC"
+        );
         assert_eq!(payload["blocks"][0]["type"], "section");
     }
 
@@ -308,8 +397,14 @@ mod tests {
         };
 
         let payload = slack_payload_for_event_with_bot(&ev, "prod-liquidator").expect("payload");
-        assert_eq!(payload["text"], "[prod-liquidator] Liquidator started: Liquidator started.");
-        assert_eq!(payload["blocks"][0]["text"]["text"], "*prod-liquidator* - Liquidator started");
+        assert_eq!(
+            payload["text"],
+            "[prod-liquidator] Liquidator started: Liquidator started."
+        );
+        assert_eq!(
+            payload["blocks"][0]["text"]["text"],
+            "*prod-liquidator* - Liquidator started"
+        );
     }
 
     #[test]
@@ -320,8 +415,53 @@ mod tests {
         };
 
         let payload = slack_payload_for_event(&ev).expect("lifecycle should format");
-        assert_eq!(payload["text"], "[liquidator] Liquidator started: Liquidator started on https://ic0.app.");
-        assert_eq!(payload["blocks"][0]["text"]["text"], "*liquidator* - Liquidator started");
+        assert_eq!(
+            payload["text"],
+            "[liquidator] Liquidator started: Liquidator started on https://ic0.app."
+        );
+        assert_eq!(
+            payload["blocks"][0]["text"]["text"],
+            "*liquidator* - Liquidator started"
+        );
+    }
+
+    #[test]
+    fn slack_payload_formats_operator_required_event() {
+        let ev = WatchdogEvent::OperatorRequired {
+            execution_id: "42".to_string(),
+            venue: "icpswap".to_string(),
+            pending_step: "DepositPending".to_string(),
+            owner: "aaaaa-aa".to_string(),
+            details: "deposit outcome is ambiguous".to_string(),
+        };
+
+        let payload = slack_payload_for_event(&ev).expect("operator alert should format");
+        assert_eq!(
+            payload["text"],
+            "[liquidator] Operator action required: icpswap 42 (DepositPending)"
+        );
+        assert_eq!(payload["blocks"][1]["fields"][0]["text"], "*Execution ID*\n`42`");
+        assert_eq!(payload["blocks"][2]["text"]["text"], "deposit outcome is ambiguous");
+        assert_eq!(
+            slack_cooldown_key(&ev),
+            Some("operator_required:icpswap:42:DepositPending".to_string())
+        );
+    }
+
+    #[test]
+    fn slack_payload_omits_empty_operator_details_block() {
+        let ev = WatchdogEvent::OperatorRequired {
+            execution_id: "42".to_string(),
+            venue: "icpswap".to_string(),
+            pending_step: "DepositPending".to_string(),
+            owner: "aaaaa-aa".to_string(),
+            details: String::new(),
+        };
+
+        let payload = slack_payload_for_event(&ev).expect("operator alert should format");
+        let blocks = payload["blocks"].as_array().expect("blocks array");
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[1]["fields"][0]["text"], "*Execution ID*\n`42`");
     }
 
     #[test]
@@ -344,7 +484,10 @@ mod tests {
 
         let payload = slack_payload_for_event(&ev).expect("liquidation should format");
         assert_eq!(payload["text"], "[liquidator] Liquidation finalized: Success 42");
-        assert_eq!(payload["blocks"][0]["text"]["text"], "*liquidator* - Liquidation finalized: `Success`");
+        assert_eq!(
+            payload["blocks"][0]["text"]["text"],
+            "*liquidator* - Liquidation finalized: `Success`"
+        );
     }
 
     #[test]
