@@ -192,6 +192,13 @@ venue plan         on ICPSwap
 
 Important policy rules:
 
+`ICPSWAP_TEST_ALLOCATION_USD` is an opt-in testing override and is unset by
+default. When set, the planner first forces approximately that USD value of the
+collateral to ICPSwap, then applies the normal allocation rules to the remaining
+amount. A forced ICPSwap allocation below $10 bypasses the oracle discount guard
+because fixed ledger fees dominate such a small leg. This waiver applies only
+to that forced leg; the remainder and all other venue safety checks stay active.
+
 1. Use actual `collateral_received`, not the estimated pre-liquidation amount.
 2. Only canonical native ICP is initially eligible for ICPSwap.
 3. ICPSwap receives the full amount while its quoted impact is below 100 bps.
@@ -442,9 +449,9 @@ No change should be needed to:
 | Responsibility | Location |
 |---|---|
 | Versioned persisted envelope and leg vector | `pipeline/src/persistance/finalizer_meta_v2/` |
-| Generic adapter contract | `pipeline/src/finalizers/multi_venue/multi_venue_adapter.rs` |
-| Venue registry and concurrent quote book | `pipeline/src/finalizers/multi_venue/multi_venue_quote_book.rs` |
-| `icpswap_first` allocation policy | `pipeline/src/finalizers/multi_venue/icpswap_first_planner.rs` |
+| Generic adapter contract | `pipeline/src/finalizers/multi_venue/contracts/multi_venue_adapter.rs` |
+| Venue registry and concurrent quote book | `pipeline/src/finalizers/multi_venue/planning/venue_registry.rs` |
+| `icpswap_first` allocation policy | `pipeline/src/finalizers/multi_venue/planning/icpswap_first_planner.rs` |
 | ICPSwap adapter | `pipeline/src/finalizers/icpswap/multi_venue_adapter.rs` |
 | MEXC adapter | `pipeline/src/finalizers/mexc/mexc_multi_venue_adapter.rs` |
 | MEXC amount-scoped preparation and quote support | `pipeline/src/finalizers/mexc/mexc_multi_venue_support.rs` |
