@@ -222,7 +222,10 @@ async fn main() -> ExitCode {
                     amount.as_deref(),
                 ) {
                     (Some(s), Some(d), Some(a), Some(am)) => {
-                        commands::withdraw::withdraw_noninteractive(s, d, a, am).await;
+                        if let Err(e) = commands::withdraw::withdraw_noninteractive(s, d, a, am).await {
+                            eprintln!("Withdraw failed: {:#}", e);
+                            return ExitCode::FAILURE;
+                        }
                         ExitCode::SUCCESS
                     }
                     _ => {
@@ -234,18 +237,21 @@ async fn main() -> ExitCode {
                 }
             } else {
                 // Interactive wizard
-                commands::withdraw::withdraw().await;
+                if let Err(e) = commands::withdraw::withdraw().await {
+                    eprintln!("Withdraw failed: {:#}", e);
+                    return ExitCode::FAILURE;
+                }
                 ExitCode::SUCCESS
             }
         }
         Commands::Account { subcommand } => {
-            match subcommand {
-                AccountCommands::Show => {
-                    commands::account::show().await;
-                }
-                AccountCommands::New => {
-                    commands::account::new().await;
-                }
+            let outcome = match subcommand {
+                AccountCommands::Show => commands::account::show().await,
+                AccountCommands::New => commands::account::new().await,
+            };
+            if let Err(e) = outcome {
+                eprintln!("Account command failed: {:#}", e);
+                return ExitCode::FAILURE;
             }
             ExitCode::SUCCESS
         }
