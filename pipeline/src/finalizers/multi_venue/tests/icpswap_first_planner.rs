@@ -954,6 +954,52 @@ async fn unsafe_exact_icpswap_requotes_full_even_when_the_remainder_is_unquotabl
     );
 }
 
+#[tokio::test]
+async fn the_plan_records_the_floor_it_was_actually_held_to() {
+    // Bought at a known loss: the conservative output lands far below the debt
+    // repaid, so only the bad-debt floor lets this plan exist at all. The
+    // persisted plan has to name that floor, not the one it was never held to.
+    let planner_config = IcpswapFirstPlannerConfig {
+        bad_debt_min_net_edge_bps: -6_000,
+        ..config(1.1)
+    };
+    let losing_venue = |venue_id: &'static str| {
+        mock_adapter(venue_id, Arc::new(Mutex::new(Vec::new())), move |request| {
+            Ok(proportional_preview(request, venue_id, 0.0, 1))
+        })
+    };
+
+    let mut bad_debt = input_with_pay_token(native_icp());
+    bad_debt.buy_bad_debt = true;
+    let state = planner(
+        losing_venue(ICPSWAP_VENUE_ID),
+        losing_venue(MEXC_VENUE_ID),
+        planner_config.clone(),
+    )
+    .plan(&bad_debt, QUOTED_AT)
+    .await
+    .expect("bad debt is accepted by its own floor");
+
+    assert!(state.plan.combined_net_edge_bps < 0.0);
+    assert_eq!(state.plan.min_net_edge_bps, -6_000);
+
+    // A profitable row still records the ordinary floor.
+    let profitable = planner(
+        mock_adapter(ICPSWAP_VENUE_ID, Arc::new(Mutex::new(Vec::new())), |request| {
+            Ok(proportional_preview(request, ICPSWAP_VENUE_ID, 0.0, 2))
+        }),
+        mock_adapter(MEXC_VENUE_ID, Arc::new(Mutex::new(Vec::new())), |request| {
+            Ok(proportional_preview(request, MEXC_VENUE_ID, 0.0, 2))
+        }),
+        planner_config,
+    )
+    .plan(&input_with_pay_token(native_icp()), QUOTED_AT)
+    .await
+    .expect("profitable plan");
+
+    assert_eq!(profitable.plan.min_net_edge_bps, 150);
+}
+
 #[test]
 fn unusable_reference_prices_are_absent_rather_than_zero() {
     // RAY-scaled: 10 * 1e27 is $10.

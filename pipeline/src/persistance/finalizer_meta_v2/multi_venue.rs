@@ -73,7 +73,10 @@ pub struct MultiVenueExecutionPlan {
     pub receive_asset: AssetId,
     pub debt_repaid: ChainTokenAmount,
     pub allocation_reason: MultiVenueAllocationReason,
-    pub min_net_edge_bps: u32,
+    /// The floor this plan was actually held to. Signed because a bad-debt row
+    /// is bought at a known loss and carries a deliberately negative floor;
+    /// recording the unsigned one would misreport what was enforced.
+    pub min_net_edge_bps: i32,
     pub estimated_receive: ChainTokenAmount,
     pub conservative_receive: ChainTokenAmount,
     pub combined_net_edge_bps: f64,
