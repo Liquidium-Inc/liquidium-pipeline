@@ -557,18 +557,22 @@ const DEFAULT_MAX_ALLOWED_CEX_SLIPPAGE_BPS: u32 = 200;
 /// had in fact left at its default.
 fn parse_slippage_bps_from_env(primary: &str, default_bps: u32) -> Result<u32, String> {
     const SHARED: &str = "MAX_ALLOWED_SLIPPAGE_BPS";
-    let Some((name, raw)) = env::var(primary)
-        .ok()
+    // An empty or whitespace-only value counts as unset, so `FOO=` in an env
+    // file falls through to the shared cap rather than short-circuiting to the
+    // default the operator was trying to override.
+    let read = |name: &str| {
+        env::var(name)
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+    };
+    let Some((name, trimmed)) = read(primary)
         .map(|value| (primary, value))
-        .or_else(|| env::var(SHARED).ok().map(|value| (SHARED, value)))
+        .or_else(|| read(SHARED).map(|value| (SHARED, value)))
     else {
         return Ok(default_bps);
     };
 
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        return Ok(default_bps);
-    }
     let parsed: u32 = trimmed
         .parse()
         .map_err(|_| format!("{name}='{trimmed}' is not a whole number of basis points (e.g. 125 for 1.25%)"))?;
@@ -1218,8 +1222,22 @@ mod tests {
             env::set_var("SLIPPAGE_TEST_BPS", " 300 ");
         }
         assert_eq!(parse_slippage_bps_from_env("SLIPPAGE_TEST_BPS", 125).unwrap(), 300);
+
+        // `FOO=` in an env file is unset, not "use the default": the shared cap
+        // still applies, and with neither set we fall back to the default.
+        unsafe {
+            env::set_var("SLIPPAGE_TEST_BPS", "   ");
+            env::set_var("MAX_ALLOWED_SLIPPAGE_BPS", "175");
+        }
+        assert_eq!(parse_slippage_bps_from_env("SLIPPAGE_TEST_BPS", 125).unwrap(), 175);
+        unsafe {
+            env::set_var("MAX_ALLOWED_SLIPPAGE_BPS", "");
+        }
+        assert_eq!(parse_slippage_bps_from_env("SLIPPAGE_TEST_BPS", 125).unwrap(), 125);
+
         unsafe {
             env::remove_var("SLIPPAGE_TEST_BPS");
+            env::remove_var("MAX_ALLOWED_SLIPPAGE_BPS");
         }
     }
 
