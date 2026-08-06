@@ -1,17 +1,40 @@
 use async_trait::async_trait;
+use std::{error::Error, fmt};
 
-/// Marks a venue error that means "not ready yet", not "this order failed".
-///
-/// A CEX credits a deposit into its account service and into its matching
-/// engine at different moments, so the balance API can report funds the order
-/// book still refuses to trade. Only the venue knows when that gap closes, and
-/// it says so by rejecting the order. Errors carrying this prefix must be
-/// waited out under a deadline rather than counted against a retry budget.
-pub const CEX_PENDING_SETTLEMENT_PREFIX: &str = "cex pending settlement: ";
+const CEX_PENDING_SETTLEMENT_PREFIX: &str = "cex pending settlement: ";
 
-/// Reports whether a backend error asks the caller to wait for the venue.
-pub fn is_cex_pending_settlement_error(message: &str) -> bool {
-    message.starts_with(CEX_PENDING_SETTLEMENT_PREFIX)
+/// Classified failure from a CEX trade submission or reconciliation request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CexBackendError {
+    /// The venue sees the funds or order but cannot trade or reconcile it yet.
+    PendingSettlement(String),
+    /// Any backend failure that follows the normal retry/error policy.
+    Other(String),
+}
+
+impl fmt::Display for CexBackendError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::PendingSettlement(message) => {
+                write!(formatter, "{CEX_PENDING_SETTLEMENT_PREFIX}{message}")
+            }
+            Self::Other(message) => formatter.write_str(message),
+        }
+    }
+}
+
+impl Error for CexBackendError {}
+
+impl From<String> for CexBackendError {
+    fn from(message: String) -> Self {
+        Self::Other(message)
+    }
+}
+
+impl From<&str> for CexBackendError {
+    fn from(message: &str) -> Self {
+        Self::Other(message.to_string())
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -110,7 +133,7 @@ pub trait CexBackend: Send + Sync {
         side: &str,
         amount_in: f64,
         options: SwapExecutionOptions,
-    ) -> Result<SwapFillReport, String>;
+    ) -> Result<SwapFillReport, CexBackendError>;
 
     async fn get_orderbook(&self, market: &str, limit: Option<u32>) -> Result<OrderBook, String>;
 
@@ -138,4 +161,21 @@ pub trait CexBackend: Send + Sync {
         coin: &str,
         withdraw_id: &str,
     ) -> Result<WithdrawStatusSnapshot, String>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn backend_error_display_formats_classification_without_changing_the_message() {
+        assert_eq!(
+            CexBackendError::PendingSettlement("matching engine is catching up".to_string()).to_string(),
+            "cex pending settlement: matching engine is catching up"
+        );
+        assert_eq!(
+            CexBackendError::Other("order rejected".to_string()).to_string(),
+            "order rejected"
+        );
+    }
 }

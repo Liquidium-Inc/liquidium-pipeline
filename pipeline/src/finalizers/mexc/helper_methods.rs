@@ -1047,7 +1047,7 @@ where
         total_legs: usize,
         amount_in: f64,
         target_bps: f64,
-    ) -> Result<(f64, f64), String> {
+    ) -> Result<(f64, f64), CexBackendError> {
         // Resume from persisted per-leg progress if available.
         let mut remaining_in = state.trade.trade_progress_remaining_in.unwrap_or(amount_in);
         let mut total_out = state.trade.trade_progress_total_out.unwrap_or(0.0);
@@ -1068,7 +1068,7 @@ where
             if slice_round_count > MAX_SLICE_EXECUTION_ROUNDS {
                 let err = format!("trade slicing exceeded max rounds for market {}", leg.market);
                 state.last_error = Some(err.clone());
-                return Err(err);
+                return Err(err.into());
             }
 
             // Preview the next executable chunk using live orderbook depth.
@@ -1077,7 +1077,7 @@ where
                 Ok(preview) => preview,
                 Err(err) => {
                     state.last_error = Some(err.clone());
-                    return Err(err);
+                    return Err(err.into());
                 }
             };
 
@@ -1131,7 +1131,7 @@ where
                     Ok(price) => price,
                     Err(err) => {
                         state.last_error = Some(err.clone());
-                        return Err(err);
+                        return Err(err.into());
                     }
                 };
 
@@ -1156,7 +1156,7 @@ where
                     exec_price
                 );
                 state.last_error = Some(err.clone());
-                return Err(err);
+                return Err(err.into());
             }
 
             // Update weighted route-level aggregates used by finish/export summaries.

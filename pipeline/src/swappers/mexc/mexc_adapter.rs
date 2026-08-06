@@ -4,8 +4,8 @@ use std::env;
 use async_trait::async_trait;
 
 use liquidium_pipeline_connectors::backend::cex_backend::{
-    BuyOrderInputMode, CEX_PENDING_SETTLEMENT_PREFIX, CexBackend, DepositAddress, OrderBook, OrderBookLevel,
-    SwapExecutionOptions, SwapFillReport, WithdrawStatus, WithdrawStatusSnapshot, WithdrawalReceipt,
+    BuyOrderInputMode, CexBackend, CexBackendError, DepositAddress, OrderBook, OrderBookLevel, SwapExecutionOptions,
+    SwapFillReport, WithdrawStatus, WithdrawStatusSnapshot, WithdrawalReceipt,
 };
 use log::{debug, info, warn};
 use rust_decimal::{Decimal, RoundingStrategy};
@@ -690,7 +690,7 @@ impl MexcClient {
         market: &str,
         side: &str,
         _amount_in: f64,
-    ) -> Result<(String, String), String> {
+    ) -> Result<(String, String), CexBackendError> {
         let mut last_err: Option<String> = None;
         for candidate in candidates {
             match ex
@@ -713,7 +713,7 @@ impl MexcClient {
                             candidate, market, side
                         );
                         warn!("[mexc] {}", details);
-                        return Err(details);
+                        return Err(details.into());
                     }
                     return Ok((candidate.clone(), order_id));
                 }
@@ -725,14 +725,14 @@ impl MexcClient {
                         continue;
                     }
                     if is_pending_settlement(&e) {
-                        return Err(format!("{}Swap err: {}", CEX_PENDING_SETTLEMENT_PREFIX, details));
+                        return Err(CexBackendError::PendingSettlement(format!("Swap err: {details}")));
                     }
-                    return Err(format!("Swap err: {}", details));
+                    return Err(format!("Swap err: {details}").into());
                 }
             }
         }
 
-        Err(last_err.unwrap_or_else(|| "Swap err: bad symbol".to_string()))
+        Err(last_err.unwrap_or_else(|| "Swap err: bad symbol".to_string()).into())
     }
 
     /// Converts MEXC order fill fields into side-agnostic execution amounts.
@@ -1007,6 +1007,7 @@ impl CexBackend for MexcClient {
     async fn execute_swap_detailed(&self, market: &str, side: &str, amount_in: f64) -> Result<SwapFillReport, String> {
         self.execute_swap_detailed_with_options(market, side, amount_in, SwapExecutionOptions::default())
             .await
+            .map_err(|error| error.to_string())
     }
 
     async fn execute_swap_detailed_with_options(
@@ -1015,7 +1016,7 @@ impl CexBackend for MexcClient {
         side: &str,
         amount_in: f64,
         options: SwapExecutionOptions,
-    ) -> Result<SwapFillReport, String> {
+    ) -> Result<SwapFillReport, CexBackendError> {
         let market_symbol = market.trim().to_ascii_uppercase();
         let symbol = normalize_market_symbol(&market_symbol);
         // Determine order params (side, quantity vs quote quantity) using filters.
@@ -1052,7 +1053,7 @@ impl CexBackend for MexcClient {
                 )
                 .await?
             }
-            _ => return Err(format!("unsupported side: {}", side)),
+            _ => return Err(format!("unsupported side: {side}").into()),
         };
 
         // Try multiple candidate symbols for MEXC quirks, then fetch the filled amount.
@@ -1107,13 +1108,12 @@ impl CexBackend for MexcClient {
                             // The order was accepted but the venue cannot read it
                             // back yet. Same eventual-consistency wait as a
                             // settling deposit, so it must not spend a retry.
-                            return Err(format!(
-                                "{}order lookup pending after submit market={} side={} symbol={} order_id={} err={}",
-                                CEX_PENDING_SETTLEMENT_PREFIX, market, side, chosen_symbol, order_id, fetch_err
-                            ));
+                            return Err(CexBackendError::PendingSettlement(format!(
+                                "order lookup pending after submit market={market} side={side} symbol={chosen_symbol} order_id={order_id} err={fetch_err}"
+                            )));
                         }
 
-                        Err(fetch_err)
+                        Err(fetch_err.into())
                     }
                 }
             }

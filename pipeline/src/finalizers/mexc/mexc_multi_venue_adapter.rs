@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use liquidium_pipeline_connectors::backend::bridge_backend::FINALIZER_PERMANENT_AMOUNT_FLOOR_PREFIX;
-use liquidium_pipeline_connectors::backend::cex_backend::{CexBackend, is_cex_pending_settlement_error};
+use liquidium_pipeline_connectors::backend::cex_backend::{CexBackend, CexBackendError};
 use log::{info, warn};
 use serde::{Deserialize, Serialize};
 
@@ -142,21 +142,27 @@ where
         execution.intent_id = None;
         execution.cex.last_error = None;
 
-        let result = self.advance_current_step(&mut execution.cex).await;
-        let error = result.err();
-        match &error {
-            Some(error) => {
+        let error = match self.advance_current_step(&mut execution.cex).await {
+            Err(CexBackendError::PendingSettlement(message)) => {
+                let error = CexBackendError::PendingSettlement(message).to_string();
+                execution.cex.last_error = Some(error.clone());
+                return self.settlement_wait_progress(execution, error).await;
+            }
+            Err(error) => {
+                let error = error.to_string();
                 execution.cex.last_error = Some(error.clone());
                 if error.starts_with(FINALIZER_PERMANENT_AMOUNT_FLOOR_PREFIX) {
                     execution.cex.step = CexStep::Failed;
-                } else if is_cex_pending_settlement_error(error) {
-                    return self.settlement_wait_progress(execution, error.clone()).await;
                 }
+                Some(error)
             }
             // Any step that completes without an error proves the venue is
             // caught up, so a later wait starts from its own first refusal.
-            None => execution.cex.trade.trade_settlement_waiting_since_ts = None,
-        }
+            Ok(()) => {
+                execution.cex.trade.trade_settlement_waiting_since_ts = None;
+                None
+            }
+        };
         self.progress_for(execution, error)
     }
 
