@@ -227,6 +227,12 @@ impl<P: PriceOracle> CollateralServiceTrait for CollateralService<P> {
             weighted_sum_new.clone() / total_coll_quote_new.clone()
         };
 
+        // The caller reuses this user across combos, so every derived field has
+        // to move together. Leaving the threshold at its pre-liquidation value
+        // beside a post-liquidation health factor that was computed from the new
+        // one would hand the next reader two numbers that disagree.
+        user.weighted_liquidation_threshold = weighted_liq_threshold_new.clone();
+
         // HF = (coll * 1000 * WLT_bps) / (debt * 10_000)
         let projected_hf = if new_debt_quote == 0u8 {
             Nat::from(u128::MAX)
@@ -653,8 +659,10 @@ mod test {
         };
         let mut user = LiquidatebleUser {
             account,
+            // Deliberately not the value the positions imply, so the assertion
+            // below cannot pass on the input being echoed back.
             health_factor: Nat::from(900u64),
-            weighted_liquidation_threshold: Nat::from(8_000u64),
+            weighted_liquidation_threshold: Nat::from(5_000u64),
             positions: vec![debt_position.clone(), btc_collateral, usdc_collateral.clone()],
             total_debt: Nat::from(100u128 * 10u128.pow(27)),
         };
@@ -667,6 +675,9 @@ mod test {
         // Equal-value collateral at 70% and 90% has an 80% weighted threshold:
         // ($200 * 0.8 / $100) * 1000 = 1600 permille.
         assert_eq!(user.health_factor, Nat::from(1_600u64));
+        // The threshold the projection was derived from is carried on the user
+        // alongside it, not left at the stale input.
+        assert_eq!(user.weighted_liquidation_threshold, Nat::from(8_000u64));
     }
 
     #[tokio::test]
