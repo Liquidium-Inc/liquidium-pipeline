@@ -47,6 +47,13 @@ pub struct ExecutionReceipt {
     pub request: ExecutorRequest,
     pub liquidation_result: Option<LiquidationResult>,
     pub status: ExecutionStatus,
+    /// Whether the change transfer had already settled *at execution time*.
+    ///
+    /// This is a single observation, not a durable verdict: the protocol
+    /// queues the change alongside the liquidation, so `false` here usually
+    /// means "not yet" rather than "never", and nothing re-reads it later.
+    /// Treat it as a timing hint only -- it is not evidence that funds are
+    /// missing, and no retry or recovery keys off it.
     pub change_received: bool,
 }
 
@@ -172,15 +179,28 @@ impl<'a, A: PipelineAgent, D: LiquidationIntentStore> PipelineStage<'a, Vec<Exec
                 // before it reached the WAL, and the WAL is the only handoff to
                 // the finalizer -- so the liquidation settled on-chain and then
                 // was never touched again, leaving the collateral stranded.
-                if matches!(
-                    liq.change_tx.status,
-                    TransferStatus::Failed(_) | TransferStatus::Pending
-                ) {
-                    warn!(
-                        "[executor] 💱 change not received; continuing with the collateral leg | change_tx status={:?} liq_id={}",
-                        liq.change_tx.status, liq.id
-                    );
-                    receipt.change_received = false;
+                //
+                // `change_tx` is read once, in the same response that reports the
+                // liquidation, so a change the protocol has queued but not yet
+                // settled reads as `Pending` here and is never re-observed. That
+                // is the ordinary case and it settles seconds later, so it must
+                // not be reported as money that failed to arrive.
+                match &liq.change_tx.status {
+                    TransferStatus::Success => {}
+                    TransferStatus::Pending => {
+                        info!(
+                            "[executor] 💱 change still settling at execution time; continuing with the collateral leg | liq_id={}",
+                            liq.id
+                        );
+                        receipt.change_received = false;
+                    }
+                    TransferStatus::Failed(err) => {
+                        warn!(
+                            "[executor] 💱 change transfer failed; the unspent debt is still with the protocol | liq_id={} err={}",
+                            liq.id, err
+                        );
+                        receipt.change_received = false;
+                    }
                 }
 
                 match &liq.collateral_tx.status {

@@ -29,6 +29,13 @@ impl ProfitCalculator for SimpleProfitCalculator {
         if req.debt_approval_needed {
             fee_total += req.debt_asset.fee();
         }
+        // The protocol is sent the whole debt allowance and returns the unspent
+        // part as a second transfer, whose fee is deducted from what comes back.
+        // Counting only the outbound fee reported every liquidation as more
+        // profitable than the ledger shows, by exactly one debt-asset fee.
+        if req.liquidation.debt_amount > liq.amounts.debt_repaid {
+            fee_total += req.debt_asset.fee();
+        }
 
         let receive_amount = match swap {
             Some(swap) => swap.receive_amount.clone(),
@@ -36,9 +43,7 @@ impl ProfitCalculator for SimpleProfitCalculator {
                 if req.collateral_asset.asset_id() == req.debt_asset.asset_id() {
                     liq.amounts.collateral_received.clone()
                 } else {
-                    warn!(
-                        "Swap not found for cross-asset liquidation; realized receive amount is treated as zero"
-                    );
+                    warn!("Swap not found for cross-asset liquidation; realized receive amount is treated as zero");
                     Nat::from(0u8)
                 }
             }
@@ -80,6 +85,7 @@ mod tests {
 
     use candid::Principal;
     use liquidium_pipeline_core::{
+        tokens::asset_id::AssetId,
         tokens::chain_token::ChainToken,
         types::protocol_types::{
             AssetType, LiquidationAmounts, LiquidationRequest, LiquidationResult, LiquidationStatus, TransferStatus,
@@ -118,6 +124,31 @@ mod tests {
         }
     }
 
+    /// A swap that only carries the amounts the profit maths reads; the price
+    /// and leg fields play no part in it.
+    fn swap_execution() -> SwapExecution {
+        let asset = |symbol: &str| AssetId {
+            chain: "icp".to_string(),
+            address: Principal::anonymous().to_text(),
+            symbol: symbol.to_string(),
+        };
+        SwapExecution {
+            swap_id: 0,
+            request_id: 0,
+            status: "completed".to_string(),
+            pay_asset: asset("ICP"),
+            pay_amount: Nat::from(0u8),
+            receive_asset: asset("ckUSDC"),
+            receive_amount: Nat::from(0u8),
+            mid_price: 0.0,
+            exec_price: 0.0,
+            realized_slippage_bps: 0.0,
+            legs: Vec::new(),
+            approval_count: None,
+            ts: 0,
+        }
+    }
+
     fn liquidation(collateral_received: u64, debt_repaid: u64) -> LiquidationResult {
         LiquidationResult {
             id: 1,
@@ -138,6 +169,42 @@ mod tests {
                 status: TransferStatus::Success,
             },
         }
+    }
+
+    /// Numbers taken from liquidation 1614 on mainnet, where the ledger showed
+    /// 2.820225 ckUSDC while the pipeline reported 2.830225: the protocol was
+    /// sent 11.629791, repaid 5.814395, and returned the remainder in a second
+    /// transfer whose fee the old calculation ignored.
+    #[test]
+    fn realized_charges_the_fee_on_the_returned_change() {
+        let ledger = Principal::anonymous();
+        let token = icp_token("ckUSDC", 6, 10_000, ledger);
+        let mut req = request(token.clone(), icp_token("ICP", 8, 10_000, ledger));
+        req.liquidation.debt_amount = Nat::from(11_629_791u64);
+        let liq = liquidation(416_949_805, 5_814_395);
+        let swap = SwapExecution {
+            receive_amount: Nat::from(8_654_620u64),
+            ..swap_execution()
+        };
+
+        assert_eq!(SimpleProfitCalculator.realized(&req, &liq, Some(&swap)), 2_820_225);
+    }
+
+    /// Sending exactly what gets repaid leaves nothing to return, so only the
+    /// outbound fee applies and the extra charge must not appear.
+    #[test]
+    fn realized_charges_one_fee_when_no_change_is_returned() {
+        let ledger = Principal::anonymous();
+        let token = icp_token("ckUSDC", 6, 10_000, ledger);
+        let mut req = request(token.clone(), icp_token("ICP", 8, 10_000, ledger));
+        req.liquidation.debt_amount = Nat::from(5_814_395u64);
+        let liq = liquidation(416_949_805, 5_814_395);
+        let swap = SwapExecution {
+            receive_amount: Nat::from(8_654_620u64),
+            ..swap_execution()
+        };
+
+        assert_eq!(SimpleProfitCalculator.realized(&req, &liq, Some(&swap)), 2_830_225);
     }
 
     #[test]
