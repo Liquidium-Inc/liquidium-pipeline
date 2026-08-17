@@ -56,8 +56,14 @@ pub async fn wal_load(wal: &dyn WalStore, liq_id: &str) -> Result<Option<LiqResu
     wal.get_result(liq_id).await.map_err(|e| e.to_string())
 }
 
+/// Claims a row for this cycle.
+///
+/// Taking and releasing the claim is not an attempt: a row polled while a venue
+/// leg waits on a bridge credit passes through here on every cycle, which counted
+/// hundreds of "attempts" against liquidations that never failed once and made the
+/// counter useless for spotting the ones that did.
 pub async fn wal_mark_inflight(wal: &dyn WalStore, liq_id: &str) -> Result<(), String> {
-    wal.update_status(liq_id, ResultStatus::InFlight, true)
+    wal.update_status(liq_id, ResultStatus::InFlight, false)
         .await
         .map_err(|e| e.to_string())
 }
@@ -91,8 +97,11 @@ pub async fn wal_mark_unresumable(wal: &dyn WalStore, liq_id: &str, last_error: 
         .map_err(|e| e.to_string())
 }
 
+/// Releases the claim on a row that has not finished yet.
+///
+/// The counterpart to [`wal_mark_inflight`], and likewise not an attempt.
 pub async fn wal_mark_enqueued(wal: &dyn WalStore, liq_id: &str) -> Result<(), String> {
-    wal.update_status(liq_id, ResultStatus::Enqueued, true)
+    wal.update_status(liq_id, ResultStatus::Enqueued, false)
         .await
         .map_err(|e| e.to_string())
 }

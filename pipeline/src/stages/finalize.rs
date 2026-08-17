@@ -428,9 +428,7 @@ where
                         // liquidation is not wrong, so it must not be failed:
                         // park it where an operator can see it, exactly as
                         // startup does for the same condition.
-                        if let Err(mark_error) =
-                            wal_mark_unresumable(&*self.wal, wal_id, err_msg.clone()).await
-                        {
+                        if let Err(mark_error) = wal_mark_unresumable(&*self.wal, wal_id, err_msg.clone()).await {
                             warn!("Failed to park unresumable WAL row {}: {}", wal_id, mark_error);
                         }
                         error!(
@@ -790,7 +788,7 @@ mod tests {
             .times(1)
             .returning(|_, _, _, _| Ok(()));
         wal.expect_update_status()
-            .withf(move |id, status, bump| id == valid_id && *status == ResultStatus::InFlight && *bump)
+            .withf(move |id, status, bump| id == valid_id && *status == ResultStatus::InFlight && !*bump)
             .times(1)
             .returning(|_, _, _| Ok(()));
         wal.expect_update_status()
@@ -832,7 +830,7 @@ mod tests {
             .times(1)
             .return_once(move |_| Ok(vec![row]));
         wal.expect_update_status()
-            .withf(move |id, status, bump| id == row_id && *status == ResultStatus::InFlight && *bump)
+            .withf(move |id, status, bump| id == row_id && *status == ResultStatus::InFlight && !*bump)
             .times(1)
             .returning(|_, _, _| Ok(()));
         wal.expect_update_status()
@@ -875,7 +873,7 @@ mod tests {
             .times(1)
             .return_once(move |_| Ok(vec![row]));
         wal.expect_update_status()
-            .withf(move |id, status, bump| id == row_id && *status == ResultStatus::InFlight && *bump)
+            .withf(move |id, status, bump| id == row_id && *status == ResultStatus::InFlight && !*bump)
             .times(1)
             .returning(|_, _, _| Ok(()));
         wal.expect_update_failure()
@@ -927,7 +925,7 @@ mod tests {
             .times(1)
             .return_once(move |_| Ok(vec![row]));
         wal.expect_update_status()
-            .withf(move |id, status, bump| id == row_id && *status == ResultStatus::InFlight && *bump)
+            .withf(move |id, status, bump| id == row_id && *status == ResultStatus::InFlight && !*bump)
             .times(1)
             .returning(|_, _, _| Ok(()));
         wal.expect_update_failure()
@@ -983,7 +981,7 @@ mod tests {
             .times(1)
             .return_once(move |_| Ok(vec![row]));
         wal.expect_update_status()
-            .withf(move |id, status, bump| id == row_id && *status == ResultStatus::InFlight && *bump)
+            .withf(move |id, status, bump| id == row_id && *status == ResultStatus::InFlight && !*bump)
             .times(1)
             .returning(|_, _, _| Ok(()));
         wal.expect_update_failure()
@@ -1050,7 +1048,7 @@ mod tests {
             .times(1)
             .returning(move |_| Ok(vec![row_pending.clone()]));
         wal.expect_update_status()
-            .withf(move |id, status, bump| id == liq_id_str.as_str() && *status == ResultStatus::InFlight && *bump)
+            .withf(move |id, status, bump| id == liq_id_str.as_str() && *status == ResultStatus::InFlight && !*bump)
             .times(1)
             .returning(|_, _, _| Ok(()));
         wal.expect_update_failure()
@@ -1107,7 +1105,7 @@ mod tests {
             .times(1)
             .returning(move |_| Ok(vec![row_pending.clone()]));
         wal.expect_update_status()
-            .withf(move |id, status, bump| id == liq_id_str.as_str() && *status == ResultStatus::InFlight && *bump)
+            .withf(move |id, status, bump| id == liq_id_str.as_str() && *status == ResultStatus::InFlight && !*bump)
             .times(1)
             .returning(|_, _, _| Ok(()));
         wal.expect_update_status()
@@ -1165,7 +1163,7 @@ mod tests {
             .times(1)
             .returning(move |_| Ok(vec![row_pending.clone()]));
         wal.expect_update_status()
-            .withf(move |id, status, bump| id == liq_id_str.as_str() && *status == ResultStatus::InFlight && *bump)
+            .withf(move |id, status, bump| id == liq_id_str.as_str() && *status == ResultStatus::InFlight && !*bump)
             .times(1)
             .returning(|_, _, _| Ok(()));
         wal.expect_update_failure()
