@@ -30,6 +30,40 @@ const VENUE_ID: &str = "mexc";
 /// an account that is genuinely short never resolves and must not loop forever.
 const SETTLEMENT_WAIT_TIMEOUT_SECS: i64 = 15 * 60;
 
+/// Names the step-level idempotency guard that makes a persisted step safe to
+/// re-enter without the in-memory arming token, or `None` while the step still
+/// owes a first submission whose outcome was never recorded.
+fn durable_resume_anchor(state: &CexState) -> Option<&'static str> {
+    match state.step {
+        // Past the seizure transfer the step only reads balances; a bridged
+        // deposit re-checks its source balance before submitting.
+        CexStep::Deposit | CexStep::DepositPending => {
+            if state.deposit.bridge.deposit_bridge_id.is_some() {
+                Some("deposit_bridge_id")
+            } else {
+                state.deposit.deposit_txid.as_ref().map(|_| "deposit_txid")
+            }
+        }
+        // A step without a client order id only prepares one and returns; with
+        // one it re-offers under that same id.
+        CexStep::Trade | CexStep::TradePending => Some(
+            state
+                .trade
+                .trade_pending_client_order_id
+                .as_ref()
+                .map_or("trade_order_intent_unsubmitted", |_| "trade_pending_client_order_id"),
+        ),
+        CexStep::Withdraw | CexStep::WithdrawPending => {
+            if state.withdraw.bridge.withdraw_bridge_id.is_some() {
+                Some("withdraw_bridge_id")
+            } else {
+                state.withdraw.withdraw_id.as_ref().map(|_| "withdraw_id")
+            }
+        }
+        CexStep::Completed | CexStep::Failed => None,
+    }
+}
+
 /// Complete venue-local CEX state plus a persistence gate. The gate makes
 /// every call that may submit a transfer, order, withdrawal, or bridge request
 /// take two orchestrator cycles: first persist `ready_to_advance`, then execute.
@@ -148,13 +182,26 @@ where
             .map_err(|_| format!("{} multi-venue intent lock poisoned", self.profile.venue_id()))?
             .remove(&intent_id);
         if !armed_here {
-            return self.operator_required_progress(
-                execution,
-                format!(
-                    "persisted {} intent `{intent_id}` has ambiguous submission state after restart",
-                    self.profile.venue_id()
+            // A restart loses the process-local token but not the step's own
+            // idempotency guard; park only when there is no guard to defer to.
+            match durable_resume_anchor(&execution.cex) {
+                Some(anchor) => info!(
+                    "[{}] liq_id={} resuming intent `{intent_id}` after restart: step={:?} guarded by {}",
+                    self.profile.venue_id(),
+                    execution.cex.liq_id,
+                    execution.cex.step,
+                    anchor
                 ),
-            );
+                None => {
+                    return self.operator_required_progress(
+                        execution,
+                        format!(
+                            "persisted {} intent `{intent_id}` has ambiguous submission state after restart",
+                            self.profile.venue_id()
+                        ),
+                    );
+                }
+            }
         }
         execution.ready_to_advance = false;
         execution.intent_id = None;

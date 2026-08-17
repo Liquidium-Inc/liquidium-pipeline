@@ -366,6 +366,87 @@ async fn restart_with_an_outstanding_intent_requires_operator_instead_of_replayi
 }
 
 #[tokio::test]
+async fn restart_resumes_a_step_its_own_idempotency_guard_already_covers() {
+    let mut backend = MockCexBackend::new();
+    backend.expect_get_orderbook().returning(|_, _| {
+        Ok(OrderBook {
+            bids: vec![OrderBookLevel {
+                price: 10.0,
+                quantity: 1_000_000.0,
+            }],
+            asks: vec![],
+        })
+    });
+    // Only the balance read of `check_deposit`: no deposit address is fetched
+    // and no transfer is sent, so the seizure is not replayed.
+    backend.expect_get_balance().returning(|_| Ok(0.0));
+    let tokens = HashMap::from([
+        (pay_token().asset_id(), pay_token()),
+        (receive_token().asset_id(), receive_token()),
+    ]);
+    let restarted = MexcFinalizer::new(
+        Arc::new(backend),
+        Arc::new(MockTransferActions::new()),
+        Principal::anonymous(),
+        200.0,
+        0.0001,
+        0.7,
+    )
+    .with_token_registry(Arc::new(TokenRegistry::new(tokens)));
+
+    let preview = MultiVenueAdapter::preview(&finalizer(), &planning_context(), &request(100_000_000))
+        .await
+        .expect("preview should succeed");
+    let mut leg = leg_from_preview(preview);
+    let mut execution = leg
+        .execution
+        .decode::<MexcVenueExecutionState>(VENUE_ID)
+        .expect("state should decode")
+        .expect("state should be MEXC");
+    execution.cex.step = CexStep::DepositPending;
+    execution.cex.deposit.deposit_txid = Some("seizure-tx".to_string());
+    execution.cex.deposit.deposit_balance_before = Some(0.0);
+    execution.ready_to_advance = true;
+    execution.intent_id = Some("intent-lost-with-the-process".to_string());
+    leg.execution = VenueExecutionState::new(VENUE_ID, &execution).expect("re-encode state");
+    leg.status = VenueLegStatus::Running;
+
+    let progress = MultiVenueAdapter::advance(&restarted, &leg, &NoopCheckpoint)
+        .await
+        .expect("guarded step should advance");
+
+    assert_eq!(progress.status, VenueLegStatus::Running);
+    assert!(
+        !progress
+            .last_error
+            .as_deref()
+            .is_some_and(|error| error.contains("ambiguous submission state"))
+    );
+}
+
+#[test]
+fn a_step_owing_its_first_submission_has_no_resume_anchor() {
+    let mut state = finalizer()
+        .prepare_amount_scoped_state(
+            "mexc-test",
+            ChainTokenAmount::from_raw(pay_token(), Nat::from(100_000_000u64)),
+            receive_token(),
+            None,
+        )
+        .expect("state");
+
+    state.step = CexStep::Deposit;
+    assert!(durable_resume_anchor(&state).is_none());
+    state.deposit.deposit_txid = Some("seizure-tx".to_string());
+    assert_eq!(durable_resume_anchor(&state), Some("deposit_txid"));
+
+    state.step = CexStep::Withdraw;
+    assert!(durable_resume_anchor(&state).is_none());
+    state.withdraw.withdraw_id = Some("wd-1".to_string());
+    assert_eq!(durable_resume_anchor(&state), Some("withdraw_id"));
+}
+
+#[tokio::test]
 async fn completed_leg_returns_a_result_without_parent_wal_access() {
     let finalizer = finalizer();
     let preview = MultiVenueAdapter::preview(&finalizer, &planning_context(), &request(100_000_000))

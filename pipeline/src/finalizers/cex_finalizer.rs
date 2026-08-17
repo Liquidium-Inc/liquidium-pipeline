@@ -203,6 +203,13 @@ pub struct CexWithdrawBridgeState {
     pub withdraw_bridge_polled_at_ts: Option<i64>,
     #[serde(default)]
     pub withdraw_bridge_destination_snapshot: Option<String>,
+    /// Target-asset amount the destination is expected to gain from this bridge.
+    #[serde(default)]
+    pub withdraw_bridge_expected_amount: Option<f64>,
+    /// Destination target-asset balance read just before submitting, so the
+    /// credit is proven by delta rather than by a total that may be shared.
+    #[serde(default)]
+    pub withdraw_bridge_destination_balance_before: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -244,7 +251,9 @@ pub trait CexFinalizerLogic: Send + Sync {
         match state.step {
             CexStep::Deposit | CexStep::DepositPending => self.deposit(state).await.map_err(CexSubmissionError::from),
             CexStep::Trade | CexStep::TradePending => self.trade(state).await,
-            CexStep::Withdraw | CexStep::WithdrawPending => self.withdraw(state).await.map_err(CexSubmissionError::from),
+            CexStep::Withdraw | CexStep::WithdrawPending => {
+                self.withdraw(state).await.map_err(CexSubmissionError::from)
+            }
             CexStep::Completed | CexStep::Failed => Ok(()),
         }
     }
@@ -590,6 +599,8 @@ mod tests {
                         withdraw_bridge_submitted_at_ts: None,
                         withdraw_bridge_polled_at_ts: None,
                         withdraw_bridge_destination_snapshot: None,
+                        withdraw_bridge_expected_amount: None,
+                        withdraw_bridge_destination_balance_before: None,
                     },
                 },
             })
@@ -743,6 +754,8 @@ mod tests {
                         withdraw_bridge_submitted_at_ts: None,
                         withdraw_bridge_polled_at_ts: None,
                         withdraw_bridge_destination_snapshot: None,
+                        withdraw_bridge_expected_amount: None,
+                        withdraw_bridge_destination_balance_before: None,
                     },
                 },
             })

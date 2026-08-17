@@ -1554,6 +1554,15 @@ where
                 bridge_amount = source_available;
             }
 
+            // The withdraw leg only ever resolves forward routes, which mint the
+            // full deposited amount. A route that did charge a destination fee
+            // would fall short of this and stall rather than book early.
+            state.withdraw.bridge.withdraw_bridge_expected_amount = Some(bridge_amount);
+            state.withdraw.bridge.withdraw_bridge_destination_balance_before = Some(
+                self.read_bridge_destination_balance(bridge, route, &final_destination_snapshot)
+                    .await?,
+            );
+
             let submission = bridge
                 .backend
                 .submit_bridge(BridgeRequest {
@@ -1581,8 +1590,10 @@ where
         state.withdraw.bridge.withdraw_bridge_polled_at_ts = Some(now_ts());
         match bridge.backend.get_bridge_status(&bridge_id).await? {
             BridgeStatus::Completed => {
-                state.step = CexStep::Completed;
-                Ok(())
+                // `Completed` only means the source-side transaction settled.
+                // The ckERC20 minter credits the destination minutes later, so
+                // the leg is not done until that credit is observed.
+                self.check_bridge_credit(state, bridge, route).await
             }
             BridgeStatus::Pending | BridgeStatus::Unknown => {
                 state.step = CexStep::WithdrawPending;

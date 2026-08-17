@@ -135,10 +135,24 @@ impl IcpswapFirstPlanner {
             )));
         }
 
-        let kraken_value = cex_value - mexc_value.clone();
-        let mexc = self.preview_safe_cex(input, MEXC_VENUE_ID, mexc_value).await?;
-        let kraken = self.preview_safe_cex(input, KRAKEN_VENUE_ID, kraken_value).await?;
-        Ok(vec![mexc, kraken])
+        let kraken_value = cex_value.clone() - mexc_value.clone();
+
+        // An exact split cannot be honoured when one of its venues will not
+        // quote, but refusing to plan strands collateral that is already seized.
+        let abandoned = match self.preview_safe_cex(input, MEXC_VENUE_ID, mexc_value).await {
+            Ok(mexc) => match self.preview_safe_cex(input, KRAKEN_VENUE_ID, kraken_value).await {
+                Ok(kraken) => return Ok(vec![mexc, kraken]),
+                Err(error) => format!("{KRAKEN_VENUE_ID} could not quote its remainder ({error})"),
+            },
+            Err(error) => format!("{MEXC_VENUE_ID} could not quote its forced ${mexc_target_usd:.2} leg ({error})"),
+        };
+
+        // Loudly, because the run no longer tests the split it was configured for.
+        warn!(
+            "[multi-venue] liq_id={} forced three-venue split abandoned: {abandoned}; falling back to the ordered CEX waterfall",
+            input.liquidation_id
+        );
+        self.ordered_overflow_previews(input, cex_value).await
     }
 
     /// Whether fixed ledger fees make the forced ICPSwap leg too small for the

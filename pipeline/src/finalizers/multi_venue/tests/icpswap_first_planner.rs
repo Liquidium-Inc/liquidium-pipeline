@@ -612,6 +612,50 @@ async fn test_usd_overrides_send_fixed_icpswap_and_mexc_legs_then_the_remainder_
     );
 }
 
+/// A venue that cannot quote must not strand already-seized collateral. The
+/// forced split is abandoned for the ordered waterfall, which hands the whole
+/// CEX remainder to the venue that can still take it.
+#[tokio::test]
+async fn a_venue_that_cannot_quote_falls_back_instead_of_failing_the_forced_split() {
+    let icpswap_calls = Arc::new(Mutex::new(Vec::new()));
+    let kraken_calls = Arc::new(Mutex::new(Vec::new()));
+    let icpswap = mock_adapter(ICPSWAP_VENUE_ID, icpswap_calls.clone(), |request| {
+        Ok(proportional_preview(request, ICPSWAP_VENUE_ID, 10.0, 2))
+    });
+    let mexc = mock_adapter(MEXC_VENUE_ID, Arc::new(Mutex::new(Vec::new())), |_| {
+        Err("Api key info invalid".to_string())
+    });
+    let kraken = mock_adapter(KRAKEN_VENUE_ID, kraken_calls.clone(), |request| {
+        Ok(proportional_preview(request, KRAKEN_VENUE_ID, 10.0, 2))
+    });
+    let mut planner_config = config(8.0);
+    planner_config.icpswap_test_allocation_usd = Some(1.0);
+    planner_config.mexc_test_allocation_usd = Some(10.0);
+
+    let mut input = input_with_pay_token(native_icp());
+    input.total_pay.value = Nat::from(300_000_000u64);
+    let planner = IcpswapFirstPlanner::new(
+        vec![Arc::new(icpswap), Arc::new(mexc), Arc::new(kraken)],
+        planner_config,
+    )
+    .expect("valid three-venue test planner");
+
+    let state = planner
+        .plan(&input, 123)
+        .await
+        .expect("an unquotable MEXC must not fail the plan");
+
+    // The forced $1 ICPSwap leg still stands. MEXC fails before Kraken's forced
+    // remainder is requested, so Kraken is quoted once, for the whole $29
+    // remainder rather than the $19 the forced split would have left it.
+    assert_eq!(*icpswap_calls.lock().expect("ICPSwap calls"), vec![10_000_000]);
+    assert_eq!(*kraken_calls.lock().expect("Kraken calls"), vec![290_000_000]);
+    assert_eq!(state.legs.len(), 2);
+    assert_eq!(state.legs[0].venue_id, ICPSWAP_VENUE_ID);
+    assert_eq!(state.legs[1].venue_id, KRAKEN_VENUE_ID);
+    assert_eq!(state.legs[1].request.pay_amount.value, Nat::from(290_000_000u64));
+}
+
 #[test]
 fn mexc_test_override_requires_all_three_venues() {
     let icpswap = mock_adapter(ICPSWAP_VENUE_ID, Arc::new(Mutex::new(Vec::new())), |request| {

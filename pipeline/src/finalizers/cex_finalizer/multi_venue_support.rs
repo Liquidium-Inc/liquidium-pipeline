@@ -129,6 +129,8 @@ where
                     withdraw_bridge_submitted_at_ts: None,
                     withdraw_bridge_polled_at_ts: None,
                     withdraw_bridge_destination_snapshot: None,
+                    withdraw_bridge_expected_amount: None,
+                    withdraw_bridge_destination_balance_before: None,
                 },
             },
         })

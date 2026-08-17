@@ -1540,14 +1540,24 @@ async fn mexc_withdraw_bridge_submit_resume_complete_and_idempotent() {
             }
         });
 
+    // The destination is read three times: once for the pre-submit baseline,
+    // then once per credit check. The mint only lands on the second check.
+    let destination_reads = Arc::new(std::sync::Mutex::new(0u8));
+    let destination_reads_clone = destination_reads.clone();
     bridge
         .expect_get_source_balance()
-        .times(1)
-        .returning(|asset, chain, address| {
-            assert_eq!(asset, "USDC");
-            assert_eq!(chain, "ETH");
-            assert_eq!(address, "0x2222222222222222222222222222222222222222");
-            Ok(1.5)
+        .times(4)
+        .returning(move |asset, chain, address| match (asset, chain) {
+            ("USDC", "ETH") => {
+                assert_eq!(address, "0x2222222222222222222222222222222222222222");
+                Ok(1.5)
+            }
+            ("ckUSDC", "ICP") => {
+                let mut guard = destination_reads_clone.lock().expect("mutex");
+                *guard += 1;
+                Ok(if *guard >= 3 { 1.5 } else { 0.0 })
+            }
+            other => panic!("unexpected balance read for {other:?}"),
         });
 
     bridge.expect_submit_bridge().times(1).returning(|request| {
@@ -1569,7 +1579,7 @@ async fn mexc_withdraw_bridge_submit_resume_complete_and_idempotent() {
 
     let bridge_status_calls = Arc::new(std::sync::Mutex::new(0u8));
     let bridge_status_calls_clone = bridge_status_calls.clone();
-    bridge.expect_get_bridge_status().times(2).returning(move |bridge_id| {
+    bridge.expect_get_bridge_status().times(3).returning(move |bridge_id| {
         assert_eq!(bridge_id, "bridge-withdraw-1");
         let mut guard = bridge_status_calls_clone.lock().expect("mutex");
         *guard += 1;
@@ -1629,10 +1639,18 @@ async fn mexc_withdraw_bridge_submit_resume_complete_and_idempotent() {
         .expect("bridge pending should keep pending");
     assert!(matches!(state.step, CexStep::WithdrawPending));
 
+    // A settled deposit transaction is not the mint: the leg must stay
+    // incomplete until the destination is actually credited.
     finalizer
         .withdraw(&mut state)
         .await
-        .expect("bridge completion should finish");
+        .expect("settled deposit without a credit should keep pending");
+    assert!(matches!(state.step, CexStep::WithdrawPending));
+
+    finalizer
+        .withdraw(&mut state)
+        .await
+        .expect("observed destination credit should finish");
     assert!(matches!(state.step, CexStep::Completed));
 }
 
@@ -1760,13 +1778,16 @@ async fn mexc_withdraw_bridge_applies_cex_withdraw_fee_to_submit_amount() {
 
     bridge
         .expect_get_source_balance()
-        .times(1)
-        .returning(|asset, chain, address| {
-            assert_eq!(asset, "USDC");
-            assert_eq!(chain, "ETH");
-            assert_eq!(address, "0x2222222222222222222222222222222222222222");
-            // Available is higher than net amount after fee so this validates fee deduction (not source cap).
-            Ok(1.45)
+        .times(2)
+        .returning(|asset, chain, address| match (asset, chain) {
+            ("USDC", "ETH") => {
+                assert_eq!(address, "0x2222222222222222222222222222222222222222");
+                // Available is higher than net amount after fee so this validates fee deduction (not source cap).
+                Ok(1.45)
+            }
+            // Destination baseline captured before the bridge is submitted.
+            ("ckUSDC", "ICP") => Ok(0.0),
+            other => panic!("unexpected balance read for {other:?}"),
         });
 
     bridge.expect_submit_bridge().times(1).returning(|request| {
@@ -1858,13 +1879,16 @@ async fn mexc_native_eth_withdraw_bridge_uses_bridgeable_balance_after_gas_reser
 
     bridge
         .expect_get_source_balance()
-        .times(1)
-        .returning(|asset, chain, address| {
-            assert_eq!(asset, "ETH");
-            assert_eq!(chain, "ETH");
-            assert_eq!(address, "0x2222222222222222222222222222222222222222");
-            // ETH source balance is reported after reserving gas for the bridge transaction.
-            Ok(0.016425721728152685)
+        .times(2)
+        .returning(|asset, chain, address| match (asset, chain) {
+            ("ETH", "ETH") => {
+                assert_eq!(address, "0x2222222222222222222222222222222222222222");
+                // ETH source balance is reported after reserving gas for the bridge transaction.
+                Ok(0.016425721728152685)
+            }
+            // Destination baseline captured before the bridge is submitted.
+            ("ckETH", "ICP") => Ok(0.0),
+            other => panic!("unexpected balance read for {other:?}"),
         });
 
     bridge.expect_submit_bridge().times(1).returning(|request| {
