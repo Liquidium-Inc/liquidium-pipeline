@@ -182,11 +182,28 @@ where
             .unwrap_or_else(|| state.withdraw.size_out.as_ref().map_or(0.0, |out| out.to_f64()));
 
         let typed_destination = self.bridge_destination_for_final_liquidator(route.destination_kind, &destination)?;
-        if let Some(credited) = bridge
+        // A failed read says nothing about the credit, so it must not count as a
+        // failed step. The retry budget is shared across the row's whole life and
+        // never resets, so surfacing a canister or subnet outage as a retryable
+        // error would spend that budget on a leg whose funds are fine and
+        // eventually park it for an operator.
+        let credit = match bridge
             .backend
             .find_bridge_credit(route.target_asset, &typed_destination, &bridge_id)
-            .await?
+            .await
         {
+            Ok(credit) => credit,
+            Err(error) => {
+                warn!(
+                    "[cex] liq_id={} could not read {} credit for {}; still waiting: {}",
+                    state.liq_id, route.target_asset, bridge_id, error
+                );
+                state.step = CexStep::WithdrawPending;
+                return Ok(());
+            }
+        };
+
+        if let Some(credited) = credit {
             if credited + BRIDGE_CREDIT_DELTA_EPSILON < expected {
                 // The mint is this leg's, so the leg is settled either way; a
                 // short credit is a sizing bug worth seeing rather than hiding.

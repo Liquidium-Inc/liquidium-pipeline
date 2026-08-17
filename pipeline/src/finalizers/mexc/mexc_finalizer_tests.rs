@@ -1719,6 +1719,57 @@ async fn a_sibling_credit_at_the_same_destination_does_not_confirm_this_leg() {
     assert!(matches!(state.step, CexStep::Completed));
 }
 
+/// A read that fails says nothing about the credit, so it must not spend the
+/// row's retry budget.
+///
+/// That budget is shared across the row's whole life and never resets, so
+/// treating a canister or subnet outage as a failed step would eventually park a
+/// leg whose funds are perfectly fine.
+#[tokio::test]
+async fn a_failed_credit_read_keeps_waiting_instead_of_failing_the_leg() {
+    let cex = MockCexBackend::new();
+    let mut bridge = MockBridgeBackend::new();
+    let transfers = MockTransferActions::new();
+
+    bridge
+        .expect_get_bridge_status()
+        .returning(|_| Ok(BridgeStatus::Completed));
+    bridge
+        .expect_find_bridge_credit()
+        .times(1)
+        .returning(|_, _, _| Err("subnet unavailable: canister xrs4b-hiaaa-aaaar-qafoa-cai".to_string()));
+
+    let finalizer = MexcFinalizer::new(
+        Arc::new(cex),
+        Arc::new(transfers),
+        Principal::management_canister(),
+        TEST_MAX_SELL_SLIPPAGE_BPS,
+        TEST_CEX_MIN_EXEC_USD,
+        TEST_CEX_SLICE_TARGET_RATIO,
+    )
+    .with_bridge_dependencies(bridge_dependencies(Arc::new(bridge)));
+
+    let receipt = make_execution_receipt_with_assets(130, ckbtc_token(), ckusdc_token());
+    let mut state = finalizer
+        .prepare("130", &receipt)
+        .await
+        .expect("prepare should succeed");
+    state.step = CexStep::WithdrawPending;
+    state.withdraw.withdraw_id = Some("withdraw-130".to_string());
+    state.withdraw.bridge.withdraw_bridge_id = Some("0xdeposit".to_string());
+    state.withdraw.bridge.withdraw_bridge_submitted_at_ts = Some(crate::utils::now_ts());
+    state.withdraw.bridge.withdraw_bridge_expected_amount = Some(5.7);
+
+    finalizer
+        .withdraw(&mut state)
+        .await
+        .expect("an unreadable credit must not surface as a retryable failure");
+
+    assert!(matches!(state.step, CexStep::WithdrawPending));
+    // Nothing was proven either way, so the leg must not look settled.
+    assert!(!matches!(state.step, CexStep::Completed));
+}
+
 /// A bridge transaction replaced before mining never executed, so the leg must
 /// drop it and submit again. Left in place it would be polled forever while its
 /// funds sat untouched on the bridge source account.
