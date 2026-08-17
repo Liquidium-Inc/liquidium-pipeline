@@ -103,7 +103,7 @@ impl IcpswapFirstPlanner {
 
         let overflow = match self.config.mexc_test_allocation_usd {
             Some(mexc_target_usd) => {
-                self.preview_test_three_venue_split(input, remainder_value, reference_price, mexc_target_usd)
+                self.preview_forced_cex_split(input, remainder_value, reference_price, mexc_target_usd)
                     .await?
             }
             None => self.ordered_overflow_previews(input, remainder_value).await?,
@@ -115,7 +115,11 @@ impl IcpswapFirstPlanner {
     }
 
     /// Quotes the fixed MEXC test leg and sends its exact remainder to Kraken.
-    async fn preview_test_three_venue_split(
+    ///
+    /// `cex_value` is whatever is left for the CEXes: the post-ICPSwap remainder
+    /// on the three-venue path, or the whole allocation when ICPSwap cannot take
+    /// the pair at all.
+    async fn preview_forced_cex_split(
         &self,
         input: &IcpswapFirstPlanInput,
         cex_value: Nat,
@@ -149,10 +153,56 @@ impl IcpswapFirstPlanner {
 
         // Loudly, because the run no longer tests the split it was configured for.
         warn!(
-            "[multi-venue] liq_id={} forced three-venue split abandoned: {abandoned}; falling back to the ordered CEX waterfall",
+            "[multi-venue] liq_id={} forced CEX split abandoned: {abandoned}; falling back to the ordered CEX waterfall",
             input.liquidation_id
         );
         self.ordered_overflow_previews(input, cex_value).await
+    }
+
+    /// Forces the MEXC/Kraken split on a pair ICPSwap cannot take at all.
+    ///
+    /// Reaching the CEX waterfall by price impact needs a book thin enough to
+    /// exceed the impact ceiling before it stops filling, which the liquid pairs
+    /// never do -- ICP/ckUSDT tops out around 165 bps against a 200 bps ceiling
+    /// and then errors outright. Without this the two-CEX split has no reachable
+    /// test path on those routes.
+    ///
+    /// Returns `None` whenever the split cannot be shaped, so a test setting can
+    /// never fail a liquidation that the normal waterfall would have routed.
+    pub(super) async fn plan_forced_cex_split_previews(
+        &self,
+        input: &IcpswapFirstPlanInput,
+    ) -> Result<Option<Vec<VenueRoutePreview>>, IcpswapFirstPlannerError> {
+        let Some(mexc_target_usd) = self.config.mexc_test_allocation_usd else {
+            return Ok(None);
+        };
+        if !self.venues.contains(MEXC_VENUE_ID) || !self.venues.contains(KRAKEN_VENUE_ID) {
+            return Ok(None);
+        }
+        let Some(reference_price) = input.pay_reference_price_usd else {
+            warn!(
+                "[multi-venue] liq_id={} forced CEX split skipped: no collateral reference price",
+                input.liquidation_id
+            );
+            return Ok(None);
+        };
+        let mexc_value =
+            ChainTokenAmount::from_formatted(input.total_pay.token.clone(), mexc_target_usd / reference_price).value;
+        if mexc_value == Nat::from(0u8) || mexc_value >= input.total_pay.value {
+            warn!(
+                "[multi-venue] liq_id={} forced CEX split skipped: ${mexc_target_usd:.2} to MEXC leaves no Kraken remainder",
+                input.liquidation_id
+            );
+            return Ok(None);
+        }
+
+        warn!(
+            "[multi-venue] liq_id={} TEST-ONLY forced CEX split: ${mexc_target_usd:.2} to MEXC, remainder to Kraken",
+            input.liquidation_id
+        );
+        self.preview_forced_cex_split(input, input.total_pay.value.clone(), reference_price, mexc_target_usd)
+            .await
+            .map(Some)
     }
 
     /// Whether fixed ledger fees make the forced ICPSwap leg too small for the

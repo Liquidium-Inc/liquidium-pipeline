@@ -103,6 +103,12 @@ impl IcpswapFirstPlanner {
                 "no enabled venue can accept this collateral asset".to_string(),
             ));
         }
+        // The test override also applies where ICPSwap cannot take the pair:
+        // otherwise the two-CEX split has no reachable test path on these routes,
+        // because their books stop filling before the impact ceiling is crossed.
+        if let Some(previews) = self.plan_forced_cex_split_previews(input).await? {
+            return self.build_state(input, previews, MultiVenueAllocationReason::PriceImpactSplit, quoted_at);
+        }
         let previews = self.full_amount_overflow(input, None).await?;
         let allocation_reason = if previews.len() == 1 {
             MultiVenueAllocationReason::SingleVenue {

@@ -656,6 +656,87 @@ async fn a_venue_that_cannot_quote_falls_back_instead_of_failing_the_forced_spli
     assert_eq!(state.legs[1].request.pay_amount.value, Nat::from(290_000_000u64));
 }
 
+/// ICP/ckUSDT cannot reach the CEX split by price impact: its books stop filling
+/// around 165 bps against a 200 bps ceiling, so MEXC either fills safely or errors
+/// outright and Kraken takes everything. The override is the only way to exercise
+/// a genuine two-CEX split on such a route.
+#[tokio::test]
+async fn the_mexc_override_forces_a_two_cex_split_where_icpswap_cannot_take_the_pair() {
+    let icpswap_calls = Arc::new(Mutex::new(Vec::new()));
+    let mexc_calls = Arc::new(Mutex::new(Vec::new()));
+    let kraken_calls = Arc::new(Mutex::new(Vec::new()));
+    let icpswap = mock_adapter(ICPSWAP_VENUE_ID, icpswap_calls.clone(), |request| {
+        Ok(proportional_preview(request, ICPSWAP_VENUE_ID, 10.0, 2))
+    });
+    let mexc = mock_adapter(MEXC_VENUE_ID, mexc_calls.clone(), |request| {
+        Ok(proportional_preview(request, MEXC_VENUE_ID, 10.0, 2))
+    });
+    let kraken = mock_adapter(KRAKEN_VENUE_ID, kraken_calls.clone(), |request| {
+        Ok(proportional_preview(request, KRAKEN_VENUE_ID, 10.0, 2))
+    });
+    let mut planner_config = config(8.0);
+    planner_config.icpswap_test_allocation_usd = Some(1.0);
+    planner_config.mexc_test_allocation_usd = Some(10.0);
+
+    // At $10/ICP, 3 ICP is $30: $10 forced to MEXC leaves $20 for Kraken.
+    let mut input = native_icp_to_ckusdt_input();
+    input.total_pay.value = Nat::from(300_000_000u64);
+    let state = IcpswapFirstPlanner::new(
+        vec![Arc::new(icpswap), Arc::new(mexc), Arc::new(kraken)],
+        planner_config,
+    )
+    .expect("valid three-venue test planner")
+    .plan(&input, 123)
+    .await
+    .expect("forced CEX split");
+
+    // ICPSwap does not support ICP/ckUSDT, so it is never quoted at all.
+    assert!(icpswap_calls.lock().expect("ICPSwap calls").is_empty());
+    assert_eq!(*mexc_calls.lock().expect("MEXC calls"), vec![100_000_000]);
+    assert_eq!(*kraken_calls.lock().expect("Kraken calls"), vec![200_000_000]);
+    assert_eq!(state.legs.len(), 2);
+    assert_eq!(state.legs[0].venue_id, MEXC_VENUE_ID);
+    assert_eq!(state.legs[1].venue_id, KRAKEN_VENUE_ID);
+}
+
+/// A test setting must never fail a liquidation the normal waterfall would route.
+#[tokio::test]
+async fn the_forced_cex_split_defers_to_the_waterfall_when_it_cannot_be_shaped() {
+    let mexc_calls = Arc::new(Mutex::new(Vec::new()));
+    let kraken_calls = Arc::new(Mutex::new(Vec::new()));
+    let icpswap = mock_adapter(ICPSWAP_VENUE_ID, Arc::new(Mutex::new(Vec::new())), |request| {
+        Ok(proportional_preview(request, ICPSWAP_VENUE_ID, 10.0, 2))
+    });
+    let mexc = mock_adapter(MEXC_VENUE_ID, mexc_calls.clone(), |request| {
+        Ok(proportional_preview(request, MEXC_VENUE_ID, 10.0, 2))
+    });
+    let kraken = mock_adapter(KRAKEN_VENUE_ID, kraken_calls.clone(), |request| {
+        Ok(proportional_preview(request, KRAKEN_VENUE_ID, 10.0, 2))
+    });
+    let mut planner_config = config(8.0);
+    planner_config.icpswap_test_allocation_usd = Some(1.0);
+    // A forced leg larger than the whole allocation cannot leave Kraken a
+    // remainder, which is the condition the override has to step aside for.
+    planner_config.mexc_test_allocation_usd = Some(1_000.0);
+
+    let mut input = native_icp_to_ckusdt_input();
+    input.total_pay.value = Nat::from(300_000_000u64);
+    let state = IcpswapFirstPlanner::new(
+        vec![Arc::new(icpswap), Arc::new(mexc), Arc::new(kraken)],
+        planner_config,
+    )
+    .expect("valid three-venue test planner")
+    .plan(&input, 123)
+    .await
+    .expect("the waterfall must still route this");
+
+    // MEXC quoted the whole amount and took it, exactly as without the override.
+    assert_eq!(*mexc_calls.lock().expect("MEXC calls"), vec![300_000_000]);
+    assert!(kraken_calls.lock().expect("Kraken calls").is_empty());
+    assert_eq!(state.legs.len(), 1);
+    assert_eq!(state.legs[0].venue_id, MEXC_VENUE_ID);
+}
+
 #[test]
 fn mexc_test_override_requires_all_three_venues() {
     let icpswap = mock_adapter(ICPSWAP_VENUE_ID, Arc::new(Mutex::new(Vec::new())), |request| {
