@@ -92,6 +92,8 @@ pub struct CexVenueProfile {
     direct_withdrawal_reconciliation_required: bool,
     best_route_preview_required: bool,
     client_order_id_max_len: usize,
+    /// ICP-native assets this venue lists itself, so they are never bridged.
+    icp_native_assets: &'static [&'static str],
 }
 
 impl CexVenueProfile {
@@ -109,6 +111,8 @@ impl CexVenueProfile {
             best_route_preview_required: true,
             // Kraken accepts free-text client order IDs up to 18 ASCII characters.
             client_order_id_max_len: 18,
+            // Kraken settles no ICP-network token other than ICP itself.
+            icp_native_assets: &[],
         }
     }
 
@@ -125,11 +129,24 @@ impl CexVenueProfile {
             direct_withdrawal_reconciliation_required: false,
             best_route_preview_required: false,
             client_order_id_max_len: 32,
+            // MEXC lists ckUSDT on the ICP network, so bridging it to USDT@ETH
+            // would pay a ckETH fee, Ethereum gas and a 15-20 minute mint to
+            // reach a market it already has. ckBTC needs no entry: no
+            // implemented route matches it, so it stays native anyway.
+            icp_native_assets: &["ckUSDT"],
         }
     }
 
     pub fn venue_id(&self) -> &'static str {
         self.venue_id
+    }
+
+    /// Whether this venue settles the ICP-native asset itself rather than a
+    /// bridged EVM equivalent.
+    pub fn accepts_icp_native_asset(&self, symbol: &str) -> bool {
+        self.icp_native_assets
+            .iter()
+            .any(|native| native.eq_ignore_ascii_case(symbol))
     }
 
     pub fn preview_taker_fee_bps(&self) -> f64 {

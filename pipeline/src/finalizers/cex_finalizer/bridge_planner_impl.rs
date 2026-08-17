@@ -9,6 +9,10 @@ where
         self.bridge.is_some()
     }
 
+    fn accepts_icp_native_asset(&self, symbol: &str) -> bool {
+        self.profile.accepts_icp_native_asset(symbol)
+    }
+
     fn resolve_bridge_source_address(&self, source_chain: &str) -> Result<String, String> {
         let deps = self
             .bridge

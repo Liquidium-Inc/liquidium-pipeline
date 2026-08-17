@@ -29,6 +29,16 @@ pub(crate) trait BridgePlanner {
     fn bridge_enabled(&self) -> bool;
     /// Resolves the configured bridge source address/account string for a given source chain.
     fn resolve_bridge_source_address(&self, source_chain: &str) -> Result<String, String>;
+    /// Whether this venue trades and settles the ICP-native asset itself.
+    ///
+    /// A bridge route existing does not mean it should be used: a venue listing
+    /// the ck-asset directly settles in one ICRC-1 transfer, while bridging the
+    /// same asset costs a ckETH fee, Ethereum gas, and a 15-20 minute mint.
+    /// Venues that cannot accept ICP-network tokens simply say no.
+    fn accepts_icp_native_asset(&self, symbol: &str) -> bool {
+        let _ = symbol;
+        false
+    }
     /// Builds a direct (non-bridged) transport plan from the provided asset.
     fn plan_from_direct_asset(asset: &ChainToken) -> BridgeTransportPlan {
         BridgeTransportPlan {
@@ -57,7 +67,9 @@ pub(crate) trait BridgePlanner {
         }
 
         // Deposit-side translation: ckERC20 reverse route (e.g. ckUSDC@ICP -> USDC@ETH).
-        if let Some(route) = resolve_cketh_reverse_route_by_source(&deposit.cex_asset, &deposit.cex_network) {
+        if !self.accepts_icp_native_asset(&deposit.cex_asset)
+            && let Some(route) = resolve_cketh_reverse_route_by_source(&deposit.cex_asset, &deposit.cex_network)
+        {
             deposit = BridgeTransportPlan {
                 cex_asset: route.target_asset.to_string(),
                 cex_network: Self::cex_network_from_destination_kind(route.destination_kind),
@@ -66,7 +78,8 @@ pub(crate) trait BridgePlanner {
         }
 
         // Withdraw-side translation: ckERC20 forward route (e.g. USDC@ETH -> ckUSDC@ICP).
-        if let Some(route) = resolve_cketh_forward_route_by_target(&withdraw.cex_asset)
+        if !self.accepts_icp_native_asset(&withdraw.cex_asset)
+            && let Some(route) = resolve_cketh_forward_route_by_target(&withdraw.cex_asset)
             && route.destination_kind == BridgeDestinationKind::IcpAccount
         {
             withdraw = BridgeTransportPlan {
