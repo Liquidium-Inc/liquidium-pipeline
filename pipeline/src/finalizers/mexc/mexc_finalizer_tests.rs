@@ -725,6 +725,74 @@ async fn mexc_native_icp_deposit_rejects_memo_tag_before_transfer() {
     assert!(err.contains("unsupported memo/tag"));
 }
 
+/// A bridge route existing is not a reason to use it.
+///
+/// MEXC lists ckUSDT on the ICP network, so it settles in one ICRC-1 transfer.
+/// Kraken lists no ICP-network token but does list USDT/USD, so the same asset
+/// has to be bridged to reach it. Both venues read the same catalog, so the
+/// choice has to come from the venue.
+#[test]
+fn ckusdt_stays_native_on_mexc_and_bridges_for_kraken() {
+    fn planner(profile: CexVenueProfile) -> MexcFinalizer<MockCexBackend> {
+        MexcFinalizer::new(
+            Arc::new(MockCexBackend::new()),
+            Arc::new(MockTransferActions::new()),
+            Principal::anonymous(),
+            TEST_MAX_SELL_SLIPPAGE_BPS,
+            TEST_CEX_MIN_EXEC_USD,
+            TEST_CEX_SLICE_TARGET_RATIO,
+        )
+        .with_profile(profile)
+        .with_bridge_dependencies(bridge_dependencies(Arc::new(MockBridgeBackend::new())))
+    }
+    let ckusdt = ChainToken::Icp {
+        ledger: Principal::from_text("cngnf-vqaaa-aaaar-qag4q-cai").expect("ckUSDT ledger"),
+        symbol: "ckUSDT".to_string(),
+        decimals: 6,
+        fee: Nat::from(10_000u64),
+    };
+
+    // MEXC: native on both sides, so no bridge fee and no 15-20 minute mint.
+    let plan = planner(CexVenueProfile::mexc()).resolve_bridge_plan_for_assets(&ckusdt, &ckusdt);
+    assert!(!plan.deposit.bridge_required);
+    assert_eq!(plan.deposit.cex_asset, "ckUSDT");
+    assert_eq!(plan.deposit.cex_network, "ICP");
+    assert!(!plan.withdraw.bridge_required);
+    assert_eq!(plan.withdraw.cex_asset, "ckUSDT");
+    assert_eq!(plan.withdraw.cex_network, "ICP");
+
+    // Kraken: bridged to USDT@ETH, which its existing USDT_USD market can trade.
+    let plan = planner(CexVenueProfile::kraken(40.0)).resolve_bridge_plan_for_assets(&ckusdt, &ckusdt);
+    assert!(plan.deposit.bridge_required);
+    assert_eq!(plan.deposit.cex_asset, "USDT");
+    assert_eq!(plan.deposit.cex_network, "ETH");
+    assert!(plan.withdraw.bridge_required);
+    assert_eq!(plan.withdraw.cex_asset, "USDT");
+    assert_eq!(plan.withdraw.cex_network, "ETH");
+}
+
+/// ckUSDC has no native listing on either venue, so adding the ckUSDT exemption
+/// must not stop it bridging.
+#[test]
+fn ckusdc_still_bridges_on_mexc() {
+    let finalizer = MexcFinalizer::new(
+        Arc::new(MockCexBackend::new()),
+        Arc::new(MockTransferActions::new()),
+        Principal::anonymous(),
+        TEST_MAX_SELL_SLIPPAGE_BPS,
+        TEST_CEX_MIN_EXEC_USD,
+        TEST_CEX_SLICE_TARGET_RATIO,
+    )
+    .with_profile(CexVenueProfile::mexc())
+    .with_bridge_dependencies(bridge_dependencies(Arc::new(MockBridgeBackend::new())));
+
+    let plan = finalizer.resolve_bridge_plan_for_assets(&ckusdc_token(), &ckusdc_token());
+    assert!(plan.deposit.bridge_required);
+    assert_eq!(plan.deposit.cex_asset, "USDC");
+    assert!(plan.withdraw.bridge_required);
+    assert_eq!(plan.withdraw.cex_asset, "USDC");
+}
+
 #[test]
 fn mexc_bridge_planner_keeps_direct_path_when_no_bridge_route_matches() {
     let finalizer = MexcFinalizer::new(
@@ -737,10 +805,12 @@ fn mexc_bridge_planner_keeps_direct_path_when_no_bridge_route_matches() {
     )
     .with_bridge_dependencies(bridge_dependencies(Arc::new(MockBridgeBackend::new())));
 
+    // ckLINK is a ckERC20 the minter supports but this catalog deliberately does
+    // not carry, so it exercises an unknown route rather than an impossible one.
     let debt_token = ChainToken::Icp {
         ledger: Principal::anonymous(),
-        symbol: "ckUSDT".to_string(),
-        decimals: 6,
+        symbol: "ckLINK".to_string(),
+        decimals: 18,
         fee: Nat::from(10_000u64),
     };
 
@@ -749,7 +819,7 @@ fn mexc_bridge_planner_keeps_direct_path_when_no_bridge_route_matches() {
     assert_eq!(plan.deposit.cex_asset, "ckBTC");
     assert_eq!(plan.deposit.cex_network, "ICP");
     assert!(!plan.withdraw.bridge_required);
-    assert_eq!(plan.withdraw.cex_asset, "ckUSDT");
+    assert_eq!(plan.withdraw.cex_asset, "ckLINK");
     assert_eq!(plan.withdraw.cex_network, "ICP");
 }
 

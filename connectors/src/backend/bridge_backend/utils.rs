@@ -134,6 +134,7 @@ mod tests {
                     let expected = match ledger {
                         "xevnm-gaaaa-aaaar-qafnq-cai" => "xrs4b-hiaaa-aaaar-qafoa-cai",
                         "ss2fx-dyaaa-aaaar-qacoq-cai" => "s3zol-vqaaa-aaaar-qacpa-cai",
+                        "cngnf-vqaaa-aaaar-qag4q-cai" => "cefgz-dyaaa-aaaar-qag5a-cai",
                         other => panic!("no verified index recorded for ledger {other}"),
                     };
                     assert_eq!(index, expected, "wrong index for ledger {ledger}");
@@ -190,7 +191,10 @@ mod tests {
         assert!(resolve_route("eth", "eth", "cketh").is_some());
         assert!(resolve_route("cketh", "icp", "eth").is_some());
         assert!(resolve_route("CKBTC", "icp", "btc").is_some());
-        assert!(resolve_route("USDT", "ETH", "ckUSDT").is_none());
+        assert!(resolve_route("usdt", "eth", "ckusdt").is_some());
+        assert!(resolve_route("ckusdt", "icp", "usdt").is_some());
+        // A ckERC20 the minter supports but this catalog deliberately omits.
+        assert!(resolve_route("LINK", "ETH", "ckLINK").is_none());
     }
 
     #[test]
@@ -205,7 +209,7 @@ mod tests {
     #[test]
     fn cketh_forward_routes_contains_usdc_entry() {
         let routes = cketh_forward_routes();
-        assert_eq!(routes.len(), 2);
+        assert_eq!(routes.len(), 3);
         assert!(routes.iter().any(|route| {
             route.source_asset == "USDC"
                 && route.source_chain == "ETH"
@@ -223,7 +227,7 @@ mod tests {
     #[test]
     fn cketh_reverse_routes_contains_ckusdc_entry() {
         let routes = cketh_reverse_routes();
-        assert_eq!(routes.len(), 2);
+        assert_eq!(routes.len(), 3);
         assert!(routes.iter().any(|route| {
             route.source_asset == "ckUSDC"
                 && route.source_chain == "ICP"
