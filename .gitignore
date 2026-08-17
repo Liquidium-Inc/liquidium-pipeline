@@ -9,3 +9,5 @@ key
 wal.db
 _key
 key_
+liquidations.db
+liquidations.db.daemon.lock
