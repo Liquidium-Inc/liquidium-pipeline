@@ -651,25 +651,78 @@ fn api_asset(asset: &str) -> String {
     }
 }
 
-fn network_matches(asset: &str, requested: &str, method: &KrakenFundingMethod) -> bool {
-    let requested = requested.to_ascii_lowercase();
-    let descriptor =
-        format!("{} {}", method.method, method.network.as_deref().unwrap_or_default()).to_ascii_lowercase();
-    match asset.trim().to_ascii_uppercase().as_str() {
-        "BTC" => {
-            (requested.contains("btc") || requested.contains("bitcoin"))
-                && descriptor.contains("bitcoin")
-                && !descriptor.contains("lightning")
-        }
-        "ETH" => {
-            (requested.contains("eth") || requested.contains("erc20"))
-                && (descriptor.contains("ethereum") || descriptor.contains("erc20"))
-        }
-        "USDC" | "USDT" => {
-            descriptor.contains(&requested) || (descriptor.contains("ethereum") && requested.contains("erc20"))
-        }
-        _ => descriptor.contains(&requested),
+/// Kraken's own label for a chain this pipeline names, when it has one.
+///
+/// Used to compare against `KrakenFundingMethod::network` exactly. A method
+/// *name* cannot identify a chain: `Tether USD (SPL)` contains "eth" because
+/// "Tether" does, and `Ethereum (Polygon)` contains "ethereum" while settling on
+/// Polygon. Matching either by substring selects the wrong chain or several.
+fn kraken_network_label(requested: &str) -> Option<&'static str> {
+    match requested.trim().to_ascii_uppercase().as_str() {
+        "ETH" | "ETHEREUM" | "ERC20" => Some("ethereum"),
+        "BTC" | "BITCOIN" => Some("bitcoin"),
+        _ => None,
     }
+}
+
+/// Chain names that appear inside a method name for the chain the pipeline asked
+/// for, used only when Kraken reports no network field.
+///
+/// Deposit methods carry no network, so the name is the only signal. Kraken
+/// spells the same chain several ways -- `Ether (Hex)`, `Tether USD (ERC20)`,
+/// `USDC - Ethereum (Unified)` -- so each accepted spelling is listed rather
+/// than inferred, and anything unlisted does not match.
+fn method_name_names_chain(requested: &str, method_name: &str) -> bool {
+    let name = method_name.to_ascii_lowercase();
+    let Some(label) = kraken_network_label(requested) else {
+        // Assets whose chain this pipeline does not translate, such as ICP.
+        return name.contains(&requested.to_ascii_lowercase());
+    };
+    match label {
+        "ethereum" => {
+            // `Ether (Hex)` is Kraken's native ETH deposit; `erc20` covers the
+            // token spellings. A chain qualifier means a different rollup.
+            let ethereum_spelling = name.starts_with("ether") || name.contains("erc20") || name.contains("ethereum");
+            ethereum_spelling && !OTHER_CHAIN_QUALIFIERS.iter().any(|other| name.contains(other))
+        }
+        "bitcoin" => name.contains("bitcoin") && !name.contains("lightning") && !name.contains("kbtc"),
+        _ => false,
+    }
+}
+
+/// Chain qualifiers that disqualify an otherwise Ethereum-looking method name.
+///
+/// Kraken names rollup methods after the token plus the rollup, so a name can
+/// contain an Ethereum spelling while settling elsewhere entirely.
+const OTHER_CHAIN_QUALIFIERS: [&str; 12] = [
+    "polygon",
+    "optimism",
+    "arbitrum",
+    "base",
+    "unichain",
+    "ink",
+    "linea",
+    "zksync",
+    "sei",
+    "avalanche",
+    "solana",
+    "tron",
+];
+
+fn network_matches(asset: &str, requested: &str, method: &KrakenFundingMethod) -> bool {
+    let _ = asset;
+    // Withdrawal methods report the settlement network, which is the only field
+    // that identifies a chain unambiguously. Compare it exactly.
+    if let Some(expected) = kraken_network_label(requested)
+        && let Some(network) = method.network.as_deref()
+    {
+        return network.trim().eq_ignore_ascii_case(expected);
+    }
+    // Deposit methods report no network, leaving only the method name.
+    if let Some(network) = method.network.as_deref() {
+        return network.to_ascii_lowercase().contains(&requested.to_ascii_lowercase());
+    }
+    method_name_names_chain(requested, &method.method)
 }
 
 fn unique_method(
@@ -795,6 +848,107 @@ mod tests {
     use crate::swappers::kraken::kraken_api::{
         KrakenBookLevel, KrakenDepositAddress, KrakenOrder, KrakenWithdrawalAddress, MockKrakenApi,
     };
+
+    fn method(name: &str, network: Option<&str>) -> KrakenFundingMethod {
+        KrakenFundingMethod {
+            method: name.to_string(),
+            network: network.map(str::to_string),
+            minimum: Decimal::ZERO,
+        }
+    }
+
+    /// Every method name and network below is what Kraken returns today.
+    ///
+    /// A method name cannot identify a chain, and both counterexamples are live:
+    /// `Tether USD (SPL)` matches a substring search for "eth" because "Tether"
+    /// does, and `Ethereum (Polygon)` contains "ethereum" while settling on
+    /// Polygon. Selecting on the reported network instead is what makes each of
+    /// these resolve to exactly one method.
+    #[test]
+    fn withdrawal_methods_resolve_to_the_one_ethereum_settlement() {
+        let usdt = vec![
+            method("USDT - Avalanche C-Chain", Some("Avalanche C-Chain")),
+            method("Tether USD (ERC20)", Some("Ethereum")),
+            method("Tether USD (TRC20)", Some("Tron")),
+            method("Tether USD (SPL)", Some("Solana")),
+            method("Tether USD (Aptos)", Some("Aptos")),
+            method("Tether USD (Polygon)", Some("Polygon")),
+            method("USDT0 - Sei (EVM)", Some("Sei - EVM")),
+        ];
+        let chosen = unique_method(usdt, "USDT", "ETH", "withdrawal").expect("exactly one Ethereum method");
+        assert_eq!(chosen.method, "Tether USD (ERC20)");
+
+        let eth = vec![
+            method("Ether", Some("Ethereum")),
+            method("Ethereum (Polygon)", Some("Polygon")),
+            method("Arbitrum One", Some("Arbitrum One")),
+            method("ETH - Base", Some("Base")),
+        ];
+        let chosen = unique_method(eth, "ETH", "ETH", "withdrawal").expect("exactly one Ethereum method");
+        assert_eq!(chosen.method, "Ether");
+
+        let usdc = vec![
+            method("USDC", Some("Ethereum")),
+            method("USDC (Polygon)", Some("Polygon (USDC.e)")),
+            method("Optimism", Some("Optimism (USDC.e)")),
+        ];
+        let chosen = unique_method(usdc, "USDC", "ETH", "withdrawal").expect("exactly one Ethereum method");
+        assert_eq!(chosen.method, "USDC");
+    }
+
+    /// Deposit methods report no network at all, so the name is the only signal
+    /// and each accepted spelling has to be recognised deliberately.
+    #[test]
+    fn deposit_methods_resolve_without_a_reported_network() {
+        let eth = vec![
+            method("Ether (Hex)", None),
+            method("ETH - Polygon (Unified)", None),
+            method("ETH - Arbitrum One (Unified)", None),
+            method("zkSync Era", None),
+            method("Linea", None),
+        ];
+        let chosen = unique_method(eth, "ETH", "ETH", "deposit").expect("native ETH deposit");
+        assert_eq!(chosen.method, "Ether (Hex)");
+
+        let usdc = vec![
+            method("USDC - Ethereum (Unified)", None),
+            method("USDC.e - Optimism (Unified)", None),
+            method("USDC - Stellar XLM", None),
+        ];
+        let chosen = unique_method(usdc, "USDC", "ETH", "deposit").expect("Ethereum USDC deposit");
+        assert_eq!(chosen.method, "USDC - Ethereum (Unified)");
+
+        // An asset whose chain this pipeline does not translate falls back to a
+        // plain name match.
+        let icp = vec![method("Internet Computer Protocol (ICP)", None)];
+        let chosen = unique_method(icp, "ICP", "ICP", "deposit").expect("ICP deposit");
+        assert_eq!(chosen.method, "Internet Computer Protocol (ICP)");
+    }
+
+    /// Wrapped BTC on Ethereum and Lightning both live under the BTC asset, and
+    /// neither is the on-chain Bitcoin settlement the bridge expects.
+    #[test]
+    fn bitcoin_selection_excludes_lightning_and_wrapped_variants() {
+        let btc = vec![
+            method("Bitcoin", Some("Bitcoin")),
+            method("Bitcoin Lightning", Some("Lightning")),
+            method("kBTC - Ethereum", Some("Ethereum (kBTC)")),
+        ];
+        let chosen = unique_method(btc.clone(), "BTC", "BTC", "withdrawal").expect("on-chain Bitcoin");
+        assert_eq!(chosen.method, "Bitcoin");
+
+        // Deposits carry no network, so the name-based path must exclude them too.
+        let deposits = vec![
+            method("Bitcoin", None),
+            method("Bitcoin Lightning", None),
+            method("kBTC - Ethereum (Unified)", None),
+        ];
+        let chosen = unique_method(deposits, "BTC", "BTC", "deposit").expect("on-chain Bitcoin");
+        assert_eq!(chosen.method, "Bitcoin");
+
+        // Asking for ETH must never select the kBTC-on-Ethereum wrapper.
+        assert!(unique_method(btc, "BTC", "ETH", "withdrawal").is_err());
+    }
 
     /// The real pairing that failed liquidation 1615: Kraken had stored the
     /// verified address lowercased, the pipeline held the EIP-55 checksummed
