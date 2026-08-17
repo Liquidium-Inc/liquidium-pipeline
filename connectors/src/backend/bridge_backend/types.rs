@@ -47,6 +47,9 @@ pub struct BridgeRouteSpec {
     pub route_kind: BridgeRouteKind,
     pub evm_token_address: Option<&'static str>,
     pub ckerc20_ledger_id: Option<&'static str>,
+    /// Index canister for `ckerc20_ledger_id`, used to find a mint by the
+    /// deposit that caused it. Verified against the ledger at startup.
+    pub ckerc20_index_id: Option<&'static str>,
     pub min_sweep_amount: f64,
 }
 
@@ -144,6 +147,23 @@ pub trait BridgeBackend: Send + Sync {
 
     /// Polls current status for a previously submitted bridge operation.
     async fn get_bridge_status(&self, bridge_id: &str) -> Result<BridgeStatus, String>;
+
+    /// Returns the amount credited at `destination` by this specific bridge
+    /// submission, or `None` while nothing there names it.
+    ///
+    /// A credit identified by its originating transaction is attributable; a
+    /// balance increase on an account several legs settle into is not. Backends
+    /// whose destinations carry no such link report `None`, leaving the caller to
+    /// fall back on whatever weaker evidence it has.
+    async fn find_bridge_credit(
+        &self,
+        target_asset: &str,
+        destination: &BridgeDestination,
+        bridge_id: &str,
+    ) -> Result<Option<f64>, String> {
+        let _ = (target_asset, destination, bridge_id);
+        Ok(None)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -19,6 +19,7 @@ use super::{
         expect_evm_destination, expect_icp_destination, parse_ckerc20_ledger_id, parse_evm_token_address,
         parse_source_icp_account, resolve_cketh_route_for_request,
     },
+    mint_lookup::find_convert_mint,
     superseded::{is_superseded, superseded_reason},
     types::{
         CkEthMinterInfo, Eip1559TransactionPrice, Eip1559TransactionPriceArg, EvmReceiptStatus, HelperContract,
@@ -32,8 +33,9 @@ use crate::{
             nat_units_to_amount_via_core,
         },
         bridge_backend::{
-            BridgeBackend, BridgeFeeBudget, BridgeRequest, BridgeRouteKind, BridgeRouteSpec, BridgeStatus,
-            BridgeSubmission, resolve_cketh_forward_route_by_source, resolve_cketh_reverse_route_by_source,
+            BridgeBackend, BridgeDestination, BridgeFeeBudget, BridgeRequest, BridgeRouteKind, BridgeRouteSpec,
+            BridgeStatus, BridgeSubmission, resolve_cketh_forward_route_by_source,
+            resolve_cketh_forward_route_by_target, resolve_cketh_reverse_route_by_source,
         },
         evm_backend::EvmBackendImpl,
         icp_backend::IcpBackend,
@@ -1041,6 +1043,44 @@ where
                 route.source_asset, route.source_chain, route.target_asset
             )),
         }
+    }
+
+    async fn find_bridge_credit(
+        &self,
+        target_asset: &str,
+        destination: &BridgeDestination,
+        bridge_id: &str,
+    ) -> Result<Option<f64>, String> {
+        // Only a mint into an ICP account carries a memo naming its deposit. An
+        // EVM destination has no equivalent, so it reports nothing rather than
+        // guessing.
+        let BridgeDestination::IcpAccount(account) = destination else {
+            return Ok(None);
+        };
+        let Some(route) = resolve_cketh_forward_route_by_target(target_asset) else {
+            return Ok(None);
+        };
+        let Some(index_id) = route.ckerc20_index_id else {
+            return Ok(None);
+        };
+        let index = Principal::from_text(index_id)
+            .map_err(|e| format!("invalid index canister id '{index_id}' for {target_asset}: {e}"))?;
+        let ledger_id = parse_ckerc20_ledger_id(route)?;
+
+        let Some(minted) = find_convert_mint(
+            self.agent.as_ref(),
+            self.cketh_minter_canister,
+            index,
+            *account,
+            bridge_id,
+        )
+        .await?
+        else {
+            return Ok(None);
+        };
+
+        let decimals = icrc1_decimals_with_context(self.icp_backend.as_ref(), ledger_id, "ckerc20 bridge").await?;
+        nat_units_to_amount_via_core(&minted, decimals).map(Some)
     }
 
     async fn get_bridge_status(&self, bridge_id: &str) -> Result<BridgeStatus, String> {

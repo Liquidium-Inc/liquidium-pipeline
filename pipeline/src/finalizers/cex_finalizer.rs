@@ -206,10 +206,6 @@ pub struct CexWithdrawBridgeState {
     /// Target-asset amount the destination is expected to gain from this bridge.
     #[serde(default)]
     pub withdraw_bridge_expected_amount: Option<f64>,
-    /// Destination target-asset balance read just before submitting, so the
-    /// credit is proven by delta rather than by a total that may be shared.
-    #[serde(default)]
-    pub withdraw_bridge_destination_balance_before: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -600,7 +596,6 @@ mod tests {
                         withdraw_bridge_polled_at_ts: None,
                         withdraw_bridge_destination_snapshot: None,
                         withdraw_bridge_expected_amount: None,
-                        withdraw_bridge_destination_balance_before: None,
                     },
                 },
             })
@@ -755,7 +750,6 @@ mod tests {
                         withdraw_bridge_polled_at_ts: None,
                         withdraw_bridge_destination_snapshot: None,
                         withdraw_bridge_expected_amount: None,
-                        withdraw_bridge_destination_balance_before: None,
                     },
                 },
             })

@@ -1579,10 +1579,6 @@ where
             // full deposited amount. A route that did charge a destination fee
             // would fall short of this and stall rather than book early.
             state.withdraw.bridge.withdraw_bridge_expected_amount = Some(bridge_amount);
-            state.withdraw.bridge.withdraw_bridge_destination_balance_before = Some(
-                self.read_bridge_destination_balance(bridge, route, &final_destination_snapshot)
-                    .await?,
-            );
 
             let submission = bridge
                 .backend
@@ -1627,12 +1623,11 @@ where
                     bridge_id,
                     reason.unwrap_or_default()
                 );
-                // The credit baseline and expectation belong to the abandoned
-                // submission; a resubmit re-reads both against current balances.
+                // The expectation belongs to the abandoned submission; a
+                // resubmit recomputes it from the amount it actually sends.
                 state.withdraw.bridge.withdraw_bridge_id = None;
                 state.withdraw.bridge.withdraw_bridge_submitted_at_ts = None;
                 state.withdraw.bridge.withdraw_bridge_expected_amount = None;
-                state.withdraw.bridge.withdraw_bridge_destination_balance_before = None;
                 state.step = CexStep::WithdrawPending;
                 Ok(())
             }

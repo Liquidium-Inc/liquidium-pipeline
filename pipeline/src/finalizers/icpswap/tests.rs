@@ -1017,7 +1017,10 @@ async fn failed_state_returns_explicit_permanent_error() {
         .await
         .expect_err("permanent");
     // The kind now travels with the error instead of being read off its text.
-    assert!(matches!(error, FinalizerError::Permanent(_)), "unexpected kind: {error:?}");
+    assert!(
+        matches!(error, FinalizerError::Permanent(_)),
+        "unexpected kind: {error:?}"
+    );
     assert!(error.message().starts_with(ICPSWAP_FINALIZER_PERMANENT_PREFIX));
     assert!(error.message().contains("ambiguous withdrawal"));
 }

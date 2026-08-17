@@ -2,7 +2,9 @@ use super::{BridgeDestinationKind, BridgeRouteKind, BridgeRouteSpec};
 
 const USDC_ETH_TOKEN_ADDRESS: &str = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48";
 const CKUSDC_ICP_LEDGER_ID: &str = "xevnm-gaaaa-aaaar-qafnq-cai";
+const CKUSDC_ICP_INDEX_ID: &str = "xrs4b-hiaaa-aaaar-qafoa-cai";
 const CKETH_ICP_LEDGER_ID: &str = "ss2fx-dyaaa-aaaar-qacoq-cai";
+const CKETH_ICP_INDEX_ID: &str = "s3zol-vqaaa-aaaar-qacpa-cai";
 
 pub(super) const BRIDGE_ROUTE_CATALOG: [BridgeRouteSpec; 6] = [
     BridgeRouteSpec {
@@ -13,6 +15,7 @@ pub(super) const BRIDGE_ROUTE_CATALOG: [BridgeRouteSpec; 6] = [
         route_kind: BridgeRouteKind::EthToCkEth,
         evm_token_address: None,
         ckerc20_ledger_id: Some(CKETH_ICP_LEDGER_ID),
+        ckerc20_index_id: Some(CKETH_ICP_INDEX_ID),
         min_sweep_amount: 0.0,
     },
     BridgeRouteSpec {
@@ -23,6 +26,7 @@ pub(super) const BRIDGE_ROUTE_CATALOG: [BridgeRouteSpec; 6] = [
         route_kind: BridgeRouteKind::CkEthToEth,
         evm_token_address: None,
         ckerc20_ledger_id: Some(CKETH_ICP_LEDGER_ID),
+        ckerc20_index_id: Some(CKETH_ICP_INDEX_ID),
         min_sweep_amount: 0.0,
     },
     BridgeRouteSpec {
@@ -33,6 +37,7 @@ pub(super) const BRIDGE_ROUTE_CATALOG: [BridgeRouteSpec; 6] = [
         route_kind: BridgeRouteKind::CkEthErc20Forward,
         evm_token_address: Some(USDC_ETH_TOKEN_ADDRESS),
         ckerc20_ledger_id: Some(CKUSDC_ICP_LEDGER_ID),
+        ckerc20_index_id: Some(CKUSDC_ICP_INDEX_ID),
         min_sweep_amount: 0.0,
     },
     BridgeRouteSpec {
@@ -43,6 +48,7 @@ pub(super) const BRIDGE_ROUTE_CATALOG: [BridgeRouteSpec; 6] = [
         route_kind: BridgeRouteKind::CkEthErc20Reverse,
         evm_token_address: Some(USDC_ETH_TOKEN_ADDRESS),
         ckerc20_ledger_id: Some(CKUSDC_ICP_LEDGER_ID),
+        ckerc20_index_id: Some(CKUSDC_ICP_INDEX_ID),
         min_sweep_amount: 0.0,
     },
     BridgeRouteSpec {
@@ -53,6 +59,7 @@ pub(super) const BRIDGE_ROUTE_CATALOG: [BridgeRouteSpec; 6] = [
         route_kind: BridgeRouteKind::BtcToCkBtc,
         evm_token_address: None,
         ckerc20_ledger_id: None,
+        ckerc20_index_id: None,
         min_sweep_amount: 0.0,
     },
     BridgeRouteSpec {
@@ -63,6 +70,7 @@ pub(super) const BRIDGE_ROUTE_CATALOG: [BridgeRouteSpec; 6] = [
         route_kind: BridgeRouteKind::CkBtcToBtc,
         evm_token_address: None,
         ckerc20_ledger_id: None,
+        ckerc20_index_id: None,
         min_sweep_amount: 0.0,
     },
 ];

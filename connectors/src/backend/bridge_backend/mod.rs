@@ -1,6 +1,7 @@
 mod catalog;
 pub mod ckerc20_bridge;
 mod ckerc20_bridge_utils;
+mod mint_lookup;
 mod superseded;
 mod types;
 mod utils;

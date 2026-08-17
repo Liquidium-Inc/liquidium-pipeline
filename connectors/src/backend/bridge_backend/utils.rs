@@ -118,6 +118,32 @@ mod tests {
     };
     use icrc_ledger_types::icrc1::account::Account;
 
+    /// A wrong index id would not fail loudly at runtime: no mint would ever be
+    /// found, so the leg would simply wait forever. Pinning the pairing here
+    /// turns that into a build failure instead.
+    ///
+    /// Both ids were verified against the live canisters, each of which reports
+    /// its own ledger: `xrs4b-hiaaa-aaaar-qafoa-cai` -> ckUSDC and
+    /// `s3zol-vqaaa-aaaar-qacpa-cai` -> ckETH.
+    #[test]
+    fn every_ckerc20_route_pairs_its_ledger_with_a_verified_index() {
+        for route in super::super::catalog::BRIDGE_ROUTE_CATALOG {
+            match (route.ckerc20_ledger_id, route.ckerc20_index_id) {
+                (Some(ledger), Some(index)) => {
+                    candid::Principal::from_text(index).expect("index id must be a principal");
+                    let expected = match ledger {
+                        "xevnm-gaaaa-aaaar-qafnq-cai" => "xrs4b-hiaaa-aaaar-qafoa-cai",
+                        "ss2fx-dyaaa-aaaar-qacoq-cai" => "s3zol-vqaaa-aaaar-qacpa-cai",
+                        other => panic!("no verified index recorded for ledger {other}"),
+                    };
+                    assert_eq!(index, expected, "wrong index for ledger {ledger}");
+                }
+                (None, None) => {}
+                (ledger, index) => panic!("route {} has ledger {ledger:?} but index {index:?}", route.target_asset),
+            }
+        }
+    }
+
     #[test]
     fn route_catalog_covers_expected_pairs() {
         let usdc = resolve_route("USDC", "ETH", "ckUSDC").expect("USDC route");

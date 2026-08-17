@@ -145,28 +145,18 @@ where
         Ok(())
     }
 
-    /// Reads the destination's balance in the bridge route's target asset.
-    pub(super) async fn read_bridge_destination_balance(
-        &self,
-        bridge: &CexBridgeDependencies,
-        route: &BridgeRouteSpec,
-        destination: &str,
-    ) -> Result<f64, String> {
-        let target_network = <Self as BridgePlanner>::cex_network_from_destination_kind(route.destination_kind);
-        bridge
-            .backend
-            .get_source_balance(route.target_asset, &target_network, destination)
-            .await
-    }
-
-    /// Confirms the bridge credit actually landed at the destination.
+    /// Confirms this leg's own bridge credit landed at the destination.
     ///
-    /// The source-side transaction settling is not the credit: the ckERC20
-    /// minter mints 15-20 minutes later, and a mint that never lands would
-    /// otherwise book realized profit on funds nobody holds. Completion is
-    /// therefore proven by a destination balance delta, and a credit that
-    /// overruns [`BRIDGE_CREDIT_STALL_SECS`] is surfaced for an operator while
-    /// the leg keeps polling.
+    /// The source-side transaction settling is not the credit: the ckERC20 minter
+    /// mints 15-20 minutes later, and a mint that never lands would otherwise
+    /// book realized profit on funds nobody holds.
+    ///
+    /// Completion is proven by finding the mint the leg's own deposit produced.
+    /// Legs share a destination account, so a balance increase there names no
+    /// leg in particular -- a larger sibling credit satisfies a smaller leg's
+    /// expectation just as well. A credit overrunning
+    /// [`BRIDGE_CREDIT_STALL_SECS`] is surfaced for an operator while the leg
+    /// keeps polling.
     pub(super) async fn check_bridge_credit(
         &self,
         state: &mut CexState,
@@ -179,38 +169,35 @@ where
             .withdraw_bridge_destination_snapshot
             .clone()
             .ok_or_else(|| "missing bridge destination snapshot while confirming bridge credit".to_string())?;
+        let bridge_id = state
+            .withdraw
+            .bridge
+            .withdraw_bridge_id
+            .clone()
+            .ok_or_else(|| "missing bridge id while confirming bridge credit".to_string())?;
         let expected = state
             .withdraw
             .bridge
             .withdraw_bridge_expected_amount
             .unwrap_or_else(|| state.withdraw.size_out.as_ref().map_or(0.0, |out| out.to_f64()));
 
-        let current = self
-            .read_bridge_destination_balance(bridge, route, &destination)
-            .await?;
-
-        // A row bridged by a build without this check has no baseline, so its
-        // credit can only be judged on the total held. That is weaker evidence
-        // than a delta, but still strictly more than the settled deposit
-        // transaction those rows used to complete on.
-        let Some(baseline) = state.withdraw.bridge.withdraw_bridge_destination_balance_before else {
-            if current + BRIDGE_CREDIT_DELTA_EPSILON >= expected {
-                info!(
-                    "[cex] liq_id={} bridge credit confirmed on total held (no baseline): current={} expected={} target={}",
-                    state.liq_id, current, expected, route.target_asset
+        let typed_destination = self.bridge_destination_for_final_liquidator(route.destination_kind, &destination)?;
+        if let Some(credited) = bridge
+            .backend
+            .find_bridge_credit(route.target_asset, &typed_destination, &bridge_id)
+            .await?
+        {
+            if credited + BRIDGE_CREDIT_DELTA_EPSILON < expected {
+                // The mint is this leg's, so the leg is settled either way; a
+                // short credit is a sizing bug worth seeing rather than hiding.
+                warn!(
+                    "[cex] liq_id={} bridge credit is short of the expectation: credited={} expected={} bridge_id={}",
+                    state.liq_id, credited, expected, bridge_id
                 );
-                state.step = CexStep::Completed;
-            } else {
-                state.step = CexStep::WithdrawPending;
             }
-            return Ok(());
-        };
-
-        let observed = current - baseline;
-        if observed + BRIDGE_CREDIT_DELTA_EPSILON >= expected {
             info!(
-                "[cex] liq_id={} bridge credit confirmed: before={} after={} expected={} target={}",
-                state.liq_id, baseline, current, expected, route.target_asset
+                "[cex] liq_id={} bridge credit confirmed by deposit: credited={} expected={} target={} bridge_id={}",
+                state.liq_id, credited, expected, route.target_asset, bridge_id
             );
             state.step = CexStep::Completed;
             return Ok(());
@@ -222,8 +209,8 @@ where
             .withdraw_bridge_submitted_at_ts
             .map_or(0, |sent| now_ts().saturating_sub(sent));
         let pending_line = format!(
-            "awaiting {} bridge credit for liq_id {}: observed={} expected={} waited={}s destination={}",
-            route.target_asset, state.liq_id, observed, expected, waited, destination
+            "awaiting {} bridge credit for liq_id {}: no mint names {} yet, expected={} waited={}s destination={}",
+            route.target_asset, state.liq_id, bridge_id, expected, waited, destination
         );
         if waited >= BRIDGE_CREDIT_STALL_SECS {
             warn!("[cex] {pending_line} (past {BRIDGE_CREDIT_STALL_SECS}s)");
