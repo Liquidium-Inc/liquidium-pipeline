@@ -8,7 +8,7 @@ use candid::{Nat, Principal};
 use ic_ledger_types::{AccountIdentifier, Subaccount};
 use icrc_ledger_types::icrc1::account::Account;
 use liquidium_pipeline_connectors::backend::bridge_backend::{
-    BridgeBackend, BridgeRequest, BridgeRouteKind, BridgeRouteSpec, BridgeStatus,
+    BRIDGE_TX_SUPERSEDED_PREFIX, BridgeBackend, BridgeRequest, BridgeRouteKind, BridgeRouteSpec, BridgeStatus,
     FINALIZER_PERMANENT_AMOUNT_FLOOR_PREFIX, resolve_route,
 };
 use liquidium_pipeline_connectors::backend::cex_backend::{
@@ -56,6 +56,15 @@ pub struct CexBridgeConfig {
 pub struct CexBridgeDependencies {
     pub backend: Arc<dyn BridgeBackend>,
     pub config: CexBridgeConfig,
+}
+
+/// Whether a bridge failure is a transaction that was replaced before mining.
+///
+/// Such a submission never executed, so the source funds are untouched and the
+/// step may submit again. Every other failure describes a transaction that did
+/// run, which must not be repeated blindly.
+fn is_superseded_bridge_failure(reason: Option<&str>) -> bool {
+    reason.is_some_and(|reason| reason.starts_with(BRIDGE_TX_SUPERSEDED_PREFIX))
 }
 
 fn parse_raw_code(err: &str) -> Option<i64> {
@@ -985,6 +994,18 @@ where
                 state.step = CexStep::DepositPending;
                 Ok(())
             }
+            BridgeStatus::Failed { reason } if is_superseded_bridge_failure(reason.as_deref()) => {
+                warn!(
+                    "[cex] liq_id={} bridged deposit {} was replaced before mining; clearing it to resubmit: {}",
+                    state.liq_id,
+                    bridge_id,
+                    reason.unwrap_or_default()
+                );
+                state.deposit.bridge.deposit_bridge_id = None;
+                state.deposit.bridge.deposit_bridge_submitted_at_ts = None;
+                state.step = CexStep::DepositPending;
+                Ok(())
+            }
             BridgeStatus::Failed { reason } => Err(format!(
                 "bridged deposit failed for liq_id {} bridge_id {}: {}",
                 state.liq_id,
@@ -1596,6 +1617,22 @@ where
                 self.check_bridge_credit(state, bridge, route).await
             }
             BridgeStatus::Pending | BridgeStatus::Unknown => {
+                state.step = CexStep::WithdrawPending;
+                Ok(())
+            }
+            BridgeStatus::Failed { reason } if is_superseded_bridge_failure(reason.as_deref()) => {
+                warn!(
+                    "[cex] liq_id={} bridged withdraw {} was replaced before mining; clearing it to resubmit: {}",
+                    state.liq_id,
+                    bridge_id,
+                    reason.unwrap_or_default()
+                );
+                // The credit baseline and expectation belong to the abandoned
+                // submission; a resubmit re-reads both against current balances.
+                state.withdraw.bridge.withdraw_bridge_id = None;
+                state.withdraw.bridge.withdraw_bridge_submitted_at_ts = None;
+                state.withdraw.bridge.withdraw_bridge_expected_amount = None;
+                state.withdraw.bridge.withdraw_bridge_destination_balance_before = None;
                 state.step = CexStep::WithdrawPending;
                 Ok(())
             }

@@ -10,6 +10,7 @@ use icrc_ledger_types::icrc1::account::Account;
 use liquidium_pipeline_connectors::account::evm_account::EvmAccountInfoAdapter;
 use liquidium_pipeline_connectors::account::icp_account::IcpAccountInfoAdapter;
 use liquidium_pipeline_connectors::backend::evm_backend::EvmBackendImpl;
+use liquidium_pipeline_connectors::backend::evm_nonce::build_evm_provider;
 use liquidium_pipeline_connectors::error_format::format_with_code;
 use liquidium_pipeline_core::balance_service::BalanceService;
 use liquidium_pipeline_core::tokens::chain_token::ChainToken;
@@ -161,14 +162,8 @@ impl<P: Provider<AnyNetwork> + WalletProvider<AnyNetwork> + Clone + 'static> Pip
             .bridge_evm_private_key
             .parse()
             .map_err(|e| PipelineContextError::Other(format!("failed parsing bridge evm private key: {e}")))?;
-        let bridge_rpc_url = config
-            .evm_rpc_url
-            .parse()
-            .map_err(|e| PipelineContextError::Other(format!("invalid evm rpc url: {e}")))?;
-        let bridge_provider = ProviderBuilder::new()
-            .network::<AnyNetwork>()
-            .wallet(bridge_signer)
-            .connect_http(bridge_rpc_url);
+        let bridge_provider = build_evm_provider(&config.evm_rpc_url, bridge_signer)
+            .map_err(|e| PipelineContextError::Other(format!("bridge provider: {e}")))?;
         let evm_backend_bridge = Arc::new(EvmBackendImpl::new(bridge_provider));
 
         let registry = Arc::new(match registry_override {

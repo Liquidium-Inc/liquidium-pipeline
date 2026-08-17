@@ -4,15 +4,12 @@ use std::{
     sync::Arc,
 };
 
-use alloy::{
-    network::AnyNetwork,
-    providers::{Provider, ProviderBuilder},
-    signers::local::PrivateKeySigner,
-};
+use alloy::{providers::Provider, signers::local::PrivateKeySigner};
 use ic_agent::Agent;
 use liquidium_pipeline_connectors::backend::{
     bridge_backend::{CkErc20BridgeBackend, cketh_forward_routes},
     evm_backend::EvmBackendImpl,
+    evm_nonce::build_evm_provider,
     icp_backend::IcpBackendImpl,
 };
 
@@ -145,14 +142,8 @@ pub(crate) async fn build_cex_bridge_dependencies(ctx: &PipelineContext) -> Resu
         .bridge_evm_private_key
         .parse()
         .map_err(|error| format!("failed to parse bridge EVM private key for CEX finalizer: {error}"))?;
-    let bridge_rpc_url = config
-        .evm_rpc_url
-        .parse()
-        .map_err(|error| format!("invalid EVM RPC URL for CEX finalizer: {error}"))?;
-    let bridge_provider = ProviderBuilder::new()
-        .network::<AnyNetwork>()
-        .wallet(bridge_signer)
-        .connect_http(bridge_rpc_url);
+    let bridge_provider = build_evm_provider(&config.evm_rpc_url, bridge_signer)
+        .map_err(|error| format!("bridge provider for CEX finalizer: {error}"))?;
 
     if let Some(expected_chain_id) = required_chain_ids.first().copied() {
         let rpc_chain_id = bridge_provider.get_chain_id().await.map_err(|error| {

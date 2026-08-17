@@ -1,5 +1,6 @@
 use alloy::{
-    network::{AnyNetwork, ReceiptResponse},
+    consensus::Transaction as ConsensusTransaction,
+    network::{AnyNetwork, ReceiptResponse, TransactionResponse},
     primitives::{Address, FixedBytes, TxHash, U256},
     providers::{Provider, WalletProvider},
     sol,
@@ -18,6 +19,7 @@ use super::{
         expect_evm_destination, expect_icp_destination, parse_ckerc20_ledger_id, parse_evm_token_address,
         parse_source_icp_account, resolve_cketh_route_for_request,
     },
+    superseded::{is_superseded, superseded_reason},
     types::{
         CkEthMinterInfo, Eip1559TransactionPrice, Eip1559TransactionPriceArg, EvmReceiptStatus, HelperContract,
         LedgerError, WithdrawErc20Arg, WithdrawErc20Error, WithdrawErc20Ret, WithdrawalArg, WithdrawalRet,
@@ -125,6 +127,14 @@ pub trait BridgeEvmBackend: Send + Sync {
     ) -> Result<TxHash, String>;
 
     async fn receipt_status(&self, tx_hash: TxHash) -> Result<Option<EvmReceiptStatus>, String>;
+
+    /// Returns a transaction's own nonce alongside its sender's latest count, or
+    /// `None` when the node no longer knows the transaction.
+    ///
+    /// Together these say whether an unmined transaction was replaced. The node
+    /// may have evicted the hash entirely, in which case the question cannot be
+    /// answered and the caller has to keep waiting.
+    async fn tx_nonce_and_sender_count(&self, tx_hash: TxHash) -> Result<Option<(u64, u64)>, String>;
 }
 
 #[async_trait]
@@ -245,6 +255,29 @@ where
             success: receipt.status(),
             block_number: receipt.block_number,
         }))
+    }
+
+    async fn tx_nonce_and_sender_count(&self, tx_hash: TxHash) -> Result<Option<(u64, u64)>, String> {
+        let Some(tx) = self
+            .provider
+            .get_transaction_by_hash(tx_hash)
+            .await
+            .map_err(|e| format!("transaction fetch failed for {tx_hash:#x}: {e}"))?
+        else {
+            return Ok(None);
+        };
+
+        let sender = tx.from();
+        let tx_nonce = ConsensusTransaction::nonce(&tx);
+        // Latest, not pending: a pending count includes this very transaction and
+        // so could never show its nonce as consumed by another.
+        let sender_count = self
+            .provider
+            .get_transaction_count(sender)
+            .await
+            .map_err(|e| format!("transaction count fetch failed for {sender}: {e}"))?;
+
+        Ok(Some((tx_nonce, sender_count)))
     }
 }
 
@@ -1026,6 +1059,16 @@ where
             .map_err(|e| format!("failed to fetch transaction receipt for bridge id '{}': {e}", bridge_id))?;
 
         let Some(receipt) = receipt else {
+            // No receipt is usually just "not mined yet", but a transaction whose
+            // nonce another hash already took will never mine, and polling it
+            // forever leaves the caller waiting on funds it still holds.
+            if let Some((tx_nonce, sender_count)) = self.evm_backend.tx_nonce_and_sender_count(tx_hash).await?
+                && is_superseded(tx_nonce, sender_count)
+            {
+                return Ok(BridgeStatus::Failed {
+                    reason: Some(superseded_reason(bridge_id, tx_nonce, sender_count)),
+                });
+            }
             return Ok(BridgeStatus::Pending);
         };
 

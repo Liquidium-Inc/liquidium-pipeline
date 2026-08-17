@@ -1654,6 +1654,73 @@ async fn mexc_withdraw_bridge_submit_resume_complete_and_idempotent() {
     assert!(matches!(state.step, CexStep::Completed));
 }
 
+/// A bridge transaction replaced before mining never executed, so the leg must
+/// drop it and submit again. Left in place it would be polled forever while its
+/// funds sat untouched on the bridge source account.
+#[tokio::test]
+async fn mexc_withdraw_bridge_resubmits_a_transaction_that_was_replaced_before_mining() {
+    let cex = MockCexBackend::new();
+    let mut bridge = MockBridgeBackend::new();
+    let transfers = MockTransferActions::new();
+
+    bridge.expect_get_bridge_status().times(1).returning(|bridge_id| {
+        assert_eq!(bridge_id, "0xreplaced");
+        Ok(BridgeStatus::Failed {
+            reason: Some(format!(
+                "{}: bridge transaction 0xreplaced at nonce 70 was replaced",
+                liquidium_pipeline_connectors::backend::bridge_backend::BRIDGE_TX_SUPERSEDED_PREFIX
+            )),
+        })
+    });
+
+    let finalizer = MexcFinalizer::new(
+        Arc::new(cex),
+        Arc::new(transfers),
+        Principal::management_canister(),
+        TEST_MAX_SELL_SLIPPAGE_BPS,
+        TEST_CEX_MIN_EXEC_USD,
+        TEST_CEX_SLICE_TARGET_RATIO,
+    )
+    .with_bridge_dependencies(bridge_dependencies(Arc::new(bridge)));
+
+    let receipt = make_execution_receipt_with_assets(120, ckbtc_token(), ckusdc_token());
+    let mut state = finalizer
+        .prepare("120", &receipt)
+        .await
+        .expect("prepare should succeed");
+    state.step = CexStep::WithdrawPending;
+    state.withdraw.withdraw_id = Some("withdraw-replaced".to_string());
+    state.withdraw.withdraw_txid = Some("0xcex".to_string());
+    state.withdraw.bridge.withdraw_bridge_id = Some("0xreplaced".to_string());
+    state.withdraw.bridge.withdraw_bridge_submitted_at_ts = Some(crate::utils::now_ts());
+    state.withdraw.bridge.withdraw_bridge_expected_amount = Some(5.7);
+    state.withdraw.bridge.withdraw_bridge_destination_balance_before = Some(40.9);
+    state.withdraw.size_out = Some(ChainTokenAmount::from_formatted(
+        state.withdraw.withdraw_asset.clone(),
+        1.5,
+    ));
+
+    finalizer
+        .withdraw(&mut state)
+        .await
+        .expect("a replaced bridge must not fail the leg");
+
+    assert!(matches!(state.step, CexStep::WithdrawPending));
+    // Cleared so the next cycle re-enters the submit branch, and the credit
+    // baseline is re-read against balances as they are at that point.
+    assert!(state.withdraw.bridge.withdraw_bridge_id.is_none());
+    assert!(state.withdraw.bridge.withdraw_bridge_expected_amount.is_none());
+    assert!(
+        state
+            .withdraw
+            .bridge
+            .withdraw_bridge_destination_balance_before
+            .is_none()
+    );
+    // The CEX withdrawal itself is untouched: it already succeeded.
+    assert_eq!(state.withdraw.withdraw_id.as_deref(), Some("withdraw-replaced"));
+}
+
 #[tokio::test]
 async fn mexc_withdraw_bridge_waits_when_source_balance_below_expected_net() {
     let mut cex = MockCexBackend::new();
