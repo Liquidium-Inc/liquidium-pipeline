@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use liquidium_pipeline_core::tokens::chain_token_amount::ChainTokenAmount;
+use liquidium_pipeline_core::tokens::{chain_token::ChainToken, chain_token_amount::ChainTokenAmount};
 
 use crate::{
     persistance::{VenueExecutionState, VenueLegState, VenueLegStatus},
@@ -57,6 +57,24 @@ pub trait MultiVenueAdapter: Send + Sync {
     /// registry is built, before any liquidation reaches quote planning.
     fn validate_configuration(&self) -> Result<(), String> {
         Ok(())
+    }
+
+    /// Smallest pay amount this venue can carry all the way through execution,
+    /// or `None` when nothing bounds it.
+    ///
+    /// A venue that reaches its exchange over a bridge inherits that bridge's
+    /// own minimum withdrawal. That floor is a native per-asset amount, not a
+    /// USD notional, so no dollar minimum can stand in for it: the same $8 is
+    /// 0.005 ETH at one price and half that at another. Reporting it here lets
+    /// the planner refuse an allocation it would otherwise commit and only
+    /// discover at deposit time, once sibling legs have already moved money.
+    ///
+    /// The amount returned is gross: it includes the fees execution deducts
+    /// before the bridge sees the transfer, so a leg sized at or above it
+    /// clears the same check the bridge applies later.
+    async fn minimum_executable_amount(&self, token: &ChainToken) -> Result<Option<ChainTokenAmount>, String> {
+        let _ = token;
+        Ok(None)
     }
 
     /// Produces an amount-scoped quote and initial execution state without

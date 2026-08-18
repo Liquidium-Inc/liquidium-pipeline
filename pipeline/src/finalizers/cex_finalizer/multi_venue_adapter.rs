@@ -3,6 +3,7 @@ use liquidium_pipeline_connectors::backend::bridge_backend::FINALIZER_PERMANENT_
 use liquidium_pipeline_connectors::backend::cex_backend::{
     CexBackend, CexSubmissionError, is_cex_venue_unreachable_error,
 };
+use liquidium_pipeline_core::tokens::{chain_token::ChainToken, chain_token_amount::ChainTokenAmount};
 use log::{info, warn};
 use serde::{Deserialize, Serialize};
 
@@ -438,6 +439,10 @@ where
             ));
         }
         Ok(())
+    }
+
+    async fn minimum_executable_amount(&self, token: &ChainToken) -> Result<Option<ChainTokenAmount>, String> {
+        self.minimum_bridged_deposit_size_in(token).await
     }
 
     async fn preview(

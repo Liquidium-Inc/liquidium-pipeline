@@ -1,6 +1,6 @@
 use std::time::Duration;
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     sync::{Arc, Mutex},
 };
 
@@ -59,6 +59,12 @@ struct PlannerAdapter {
     responder: Box<PreviewResponder>,
     validation_error: Option<String>,
     preview_forbidden: bool,
+    /// Native floor this venue reports, in pay-token units. `None` is a venue
+    /// that bridges nothing, which is every venue in the pre-existing tests.
+    minimum_executable: Option<u64>,
+    /// Error the venue returns instead of a floor, to prove a failed lookup
+    /// leaves the venue usable rather than removing it from the waterfall.
+    minimum_error: Option<String>,
 }
 
 #[async_trait]
@@ -69,6 +75,15 @@ impl MultiVenueAdapter for PlannerAdapter {
 
     fn validate_configuration(&self) -> Result<(), String> {
         self.validation_error.clone().map_or(Ok(()), Err)
+    }
+
+    async fn minimum_executable_amount(&self, token: &ChainToken) -> Result<Option<ChainTokenAmount>, String> {
+        if let Some(error) = &self.minimum_error {
+            return Err(error.clone());
+        }
+        Ok(self
+            .minimum_executable
+            .map(|minimum| ChainTokenAmount::from_raw(token.clone(), Nat::from(minimum))))
     }
 
     async fn preview(
@@ -215,6 +230,7 @@ fn input_with_pay_token(pay_token: ChainToken) -> IcpswapFirstPlanInput {
         receive_reference_price_ray: None,
         reference_price_captured_at: Some(QUOTED_AT),
         buy_bad_debt: false,
+        venue_minimums: BTreeMap::new(),
     }
 }
 
@@ -237,6 +253,7 @@ fn native_icp_to_ckusdt_input() -> IcpswapFirstPlanInput {
         receive_reference_price_ray: None,
         reference_price_captured_at: Some(QUOTED_AT),
         buy_bad_debt: false,
+        venue_minimums: BTreeMap::new(),
     }
 }
 
@@ -255,6 +272,7 @@ fn ckusdc_to_native_icp_input() -> IcpswapFirstPlanInput {
         receive_reference_price_ray: None,
         reference_price_captured_at: Some(QUOTED_AT),
         buy_bad_debt: false,
+        venue_minimums: BTreeMap::new(),
     }
 }
 
@@ -358,6 +376,24 @@ where
         responder: Box::new(responder),
         validation_error: None,
         preview_forbidden: false,
+        minimum_executable: None,
+        minimum_error: None,
+    }
+}
+
+/// A venue that reports a native floor, as a bridged CEX does.
+fn mock_adapter_with_minimum<F>(
+    venue_id: &'static str,
+    calls: Arc<Mutex<Vec<u64>>>,
+    minimum_executable: u64,
+    responder: F,
+) -> PlannerAdapter
+where
+    F: Fn(&SwapRequest) -> Result<VenueRoutePreview, String> + Send + Sync + 'static,
+{
+    PlannerAdapter {
+        minimum_executable: Some(minimum_executable),
+        ..mock_adapter(venue_id, calls, responder)
     }
 }
 
@@ -508,6 +544,8 @@ fn registry_rejects_an_adapter_with_missing_runtime_configuration() {
         responder: Box::new(|_| Err("not used".to_string())),
         validation_error: Some("token registry is required".to_string()),
         preview_forbidden: true,
+        minimum_executable: None,
+        minimum_error: None,
     };
 
     let error = VenueRegistry::new(vec![Arc::new(adapter)])
@@ -654,6 +692,177 @@ async fn a_venue_that_cannot_quote_falls_back_instead_of_failing_the_forced_spli
     assert_eq!(state.legs[0].venue_id, ICPSWAP_VENUE_ID);
     assert_eq!(state.legs[1].venue_id, KRAKEN_VENUE_ID);
     assert_eq!(state.legs[1].request.pay_amount.value, Nat::from(290_000_000u64));
+}
+
+// Native venue minimums
+//
+// A bridged CEX inherits its bridge's own minimum withdrawal, which is a native
+// per-asset floor rather than a USD notional. Liquidation 1627 committed a MEXC
+// leg below the 0.005 ETH ckETH floor, bridged its Kraken sibling, and only then
+// had MEXC rejected at deposit time, leaving that slice stranded.
+
+/// Liquidation 1627: the forced test split sized MEXC below the bridge floor.
+/// The split is abandoned for the ordered waterfall rather than committed, so no
+/// leg is persisted that the bridge will refuse.
+#[tokio::test]
+async fn a_forced_mexc_leg_below_its_native_minimum_falls_back_to_the_waterfall() {
+    let icpswap_calls = Arc::new(Mutex::new(Vec::new()));
+    let mexc_calls = Arc::new(Mutex::new(Vec::new()));
+    let kraken_calls = Arc::new(Mutex::new(Vec::new()));
+    let icpswap = mock_adapter(ICPSWAP_VENUE_ID, icpswap_calls.clone(), |request| {
+        Ok(proportional_preview(request, ICPSWAP_VENUE_ID, 10.0, 2))
+    });
+    // The forced $10 leg is 100_000_000 units, just under the floor.
+    let mexc = mock_adapter_with_minimum(MEXC_VENUE_ID, mexc_calls.clone(), 100_000_001, |request| {
+        Ok(proportional_preview(request, MEXC_VENUE_ID, 10.0, 2))
+    });
+    let kraken = mock_adapter(KRAKEN_VENUE_ID, kraken_calls.clone(), |request| {
+        Ok(proportional_preview(request, KRAKEN_VENUE_ID, 10.0, 2))
+    });
+    let mut planner_config = config(8.0);
+    planner_config.icpswap_test_allocation_usd = Some(1.0);
+    planner_config.mexc_test_allocation_usd = Some(10.0);
+
+    let mut input = input_with_pay_token(native_icp());
+    input.total_pay.value = Nat::from(300_000_000u64);
+    let planner = IcpswapFirstPlanner::new(
+        vec![Arc::new(icpswap), Arc::new(mexc), Arc::new(kraken)],
+        planner_config,
+    )
+    .expect("valid three-venue test planner");
+
+    let state = planner
+        .plan(&input, 123)
+        .await
+        .expect("a sub-floor MEXC leg must not fail the plan");
+
+    // The forced $10 leg is never quoted at 100_000_000, because that amount is
+    // below the floor. The waterfall re-sizes instead, and MEXC takes the whole
+    // remainder, which does clear it.
+    assert_eq!(*mexc_calls.lock().expect("MEXC calls"), vec![290_000_000]);
+    assert!(kraken_calls.lock().expect("Kraken calls").is_empty());
+    assert_eq!(state.legs.len(), 2);
+    assert_eq!(state.legs[0].venue_id, ICPSWAP_VENUE_ID);
+    assert_eq!(state.legs[1].venue_id, MEXC_VENUE_ID);
+    // The committed leg clears the floor; the abandoned forced one did not.
+    assert_eq!(state.legs[1].request.pay_amount.value, Nat::from(290_000_000u64));
+}
+
+/// The main path's equivalent: MEXC's largest safely quotable slice is itself
+/// below the floor, so MEXC has no viable size at any amount and Kraken takes
+/// everything rather than a partial leg being persisted alongside it.
+#[tokio::test]
+async fn a_mexc_capacity_below_its_native_minimum_sends_the_whole_amount_to_kraken() {
+    let mexc_calls = Arc::new(Mutex::new(Vec::new()));
+    let kraken_calls = Arc::new(Mutex::new(Vec::new()));
+    // MEXC can only quote a quarter of the amount safely, which is under its floor.
+    let mexc = mock_adapter_with_minimum(MEXC_VENUE_ID, mexc_calls.clone(), TOTAL_PAY / 2, |request| {
+        let pay = request.pay_amount.value.0.to_u64().expect("test amount");
+        let impact = if pay > TOTAL_PAY / 4 { 500.0 } else { 10.0 };
+        Ok(proportional_preview(request, MEXC_VENUE_ID, impact, 2))
+    });
+    let kraken = mock_adapter(KRAKEN_VENUE_ID, kraken_calls.clone(), |request| {
+        Ok(proportional_preview(request, KRAKEN_VENUE_ID, 10.0, 2))
+    });
+    let planner =
+        IcpswapFirstPlanner::new(vec![Arc::new(mexc), Arc::new(kraken)], config(0.0)).expect("valid two-CEX planner");
+
+    // A non-ICPSwap pair goes straight to the overflow waterfall.
+    let state = planner
+        .plan(&input_with_pay_token(non_native_icp_token()), 123)
+        .await
+        .expect("Kraken must absorb the whole amount");
+
+    assert_eq!(state.legs.len(), 1);
+    assert_eq!(state.legs[0].venue_id, KRAKEN_VENUE_ID);
+    assert_eq!(state.legs[0].request.pay_amount.value, Nat::from(TOTAL_PAY));
+    assert_eq!(
+        *kraken_calls
+            .lock()
+            .expect("Kraken calls")
+            .last()
+            .expect("a Kraken quote"),
+        TOTAL_PAY
+    );
+}
+
+/// A floor above the whole allocation rules out every slice of it, so MEXC is
+/// skipped before it is quoted rather than after a wasted round trip.
+#[tokio::test]
+async fn a_venue_whose_floor_exceeds_the_whole_amount_is_never_quoted() {
+    let mexc_calls = Arc::new(Mutex::new(Vec::new()));
+    let kraken_calls = Arc::new(Mutex::new(Vec::new()));
+    let mexc = mock_adapter_with_minimum(MEXC_VENUE_ID, mexc_calls.clone(), TOTAL_PAY + 1, |request| {
+        Ok(proportional_preview(request, MEXC_VENUE_ID, 10.0, 2))
+    });
+    let kraken = mock_adapter(KRAKEN_VENUE_ID, kraken_calls.clone(), |request| {
+        Ok(proportional_preview(request, KRAKEN_VENUE_ID, 10.0, 2))
+    });
+    let planner =
+        IcpswapFirstPlanner::new(vec![Arc::new(mexc), Arc::new(kraken)], config(0.0)).expect("valid two-CEX planner");
+
+    let state = planner
+        .plan(&input_with_pay_token(non_native_icp_token()), 123)
+        .await
+        .expect("Kraken must take the amount MEXC cannot");
+
+    assert!(mexc_calls.lock().expect("MEXC calls").is_empty());
+    assert_eq!(state.legs.len(), 1);
+    assert_eq!(state.legs[0].venue_id, KRAKEN_VENUE_ID);
+    assert_eq!(*kraken_calls.lock().expect("Kraken calls"), vec![TOTAL_PAY]);
+}
+
+/// An amount under every venue's floor is unexecutable rather than merely hard to
+/// route, so it is reported as such and the caller may sweep it. Reported before
+/// any venue is quoted, so an outage can never be mistaken for this.
+#[tokio::test]
+async fn an_amount_below_every_venue_floor_is_terminal_rather_than_retryable() {
+    let mexc_calls = Arc::new(Mutex::new(Vec::new()));
+    let kraken_calls = Arc::new(Mutex::new(Vec::new()));
+    let mexc = mock_adapter_with_minimum(MEXC_VENUE_ID, mexc_calls.clone(), TOTAL_PAY + 1, |request| {
+        Ok(proportional_preview(request, MEXC_VENUE_ID, 10.0, 2))
+    });
+    let kraken = mock_adapter_with_minimum(KRAKEN_VENUE_ID, kraken_calls.clone(), TOTAL_PAY + 1, |request| {
+        Ok(proportional_preview(request, KRAKEN_VENUE_ID, 10.0, 2))
+    });
+    let planner =
+        IcpswapFirstPlanner::new(vec![Arc::new(mexc), Arc::new(kraken)], config(0.0)).expect("valid two-CEX planner");
+
+    let error = planner
+        .plan(&input_with_pay_token(non_native_icp_token()), 123)
+        .await
+        .expect_err("no venue can execute this amount");
+
+    assert!(
+        matches!(error, IcpswapFirstPlannerError::BelowVenueMinimum(_)),
+        "a below-minimum amount must not be reported as a retryable route failure: {error:?}"
+    );
+    assert!(mexc_calls.lock().expect("MEXC calls").is_empty());
+    assert!(kraken_calls.lock().expect("Kraken calls").is_empty());
+}
+
+/// A venue that cannot report its floor is sized without one. Treating a failed
+/// lookup as "below minimum" would drop a venue that executes perfectly well, and
+/// its own deposit path still enforces the real minimum.
+#[tokio::test]
+async fn a_venue_that_cannot_report_its_minimum_is_still_usable() {
+    let mexc_calls = Arc::new(Mutex::new(Vec::new()));
+    let mexc = PlannerAdapter {
+        minimum_error: Some("bridge fee quote unavailable".to_string()),
+        ..mock_adapter(MEXC_VENUE_ID, mexc_calls.clone(), |request| {
+            Ok(proportional_preview(request, MEXC_VENUE_ID, 10.0, 2))
+        })
+    };
+    let planner = IcpswapFirstPlanner::new(vec![Arc::new(mexc)], config(0.0)).expect("valid single-CEX planner");
+
+    let state = planner
+        .plan(&input_with_pay_token(non_native_icp_token()), 123)
+        .await
+        .expect("an unreported floor must not remove the venue");
+
+    assert_eq!(state.legs.len(), 1);
+    assert_eq!(state.legs[0].venue_id, MEXC_VENUE_ID);
+    assert_eq!(*mexc_calls.lock().expect("MEXC calls"), vec![TOTAL_PAY]);
 }
 
 /// ICP/ckUSDT cannot reach the CEX split by price impact: its books stop filling
@@ -1907,6 +2116,8 @@ async fn non_native_icp_is_mexc_only_and_never_previews_icpswap() {
         responder: Box::new(|_| Err("not used".to_string())),
         validation_error: None,
         preview_forbidden: true,
+        minimum_executable: None,
+        minimum_error: None,
     };
     let mexc_calls = Arc::new(Mutex::new(Vec::new()));
     let mexc_calls_for_assert = mexc_calls.clone();
@@ -1935,6 +2146,8 @@ async fn native_icp_to_ckusdt_is_mexc_only_and_never_previews_icpswap() {
         responder: Box::new(|_| Err("not used".to_string())),
         validation_error: None,
         preview_forbidden: true,
+        minimum_executable: None,
+        minimum_error: None,
     };
     let mexc_calls = Arc::new(Mutex::new(Vec::new()));
     let mexc_calls_for_assert = mexc_calls.clone();
@@ -2528,6 +2741,7 @@ proptest! {
             receive_reference_price_ray: Some(Nat::from(u128::from(receive_price) * RAY)),
             reference_price_captured_at: Some(QUOTED_AT),
             buy_bad_debt: false,
+            venue_minimums: BTreeMap::new(),
         };
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()

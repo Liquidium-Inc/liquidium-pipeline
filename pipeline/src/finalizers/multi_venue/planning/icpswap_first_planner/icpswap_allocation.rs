@@ -9,8 +9,110 @@ use crate::{
 };
 
 use super::{BPS_DENOMINATOR, ICPSWAP_VENUE_ID, IcpswapFirstPlanInput, IcpswapFirstPlanner, IcpswapFirstPlannerError};
+use crate::finalizers::multi_venue::planning::venue_registry::VenuePreviewOutcome;
 
 impl IcpswapFirstPlanner {
+    /// The normal route: quote ICPSwap for the whole amount, then allocate
+    /// according to what that quote says.
+    ///
+    /// Reached whenever ICPSwap can take the pair and no test allocation is
+    /// configured, which is every ordinary liquidation.
+    pub(super) async fn plan_by_full_icpswap_quote(
+        &self,
+        input: &IcpswapFirstPlanInput,
+        quoted_at: i64,
+    ) -> Result<MultiVenueExecutionState, IcpswapFirstPlannerError> {
+        let context = input.planning_context();
+
+        // The common safe-ICPSwap path needs no CEX data. Quote ICPSwap alone
+        // first so adding overflow venues does not add unconditional latency or
+        // API load to every liquidation.
+        let quotes = self
+            .venues
+            .preview_venues(&context, &[ICPSWAP_VENUE_ID.to_string()], |venue_id| {
+                input.request_for(venue_id, input.total_pay.value.clone())
+            })
+            .await
+            .map_err(IcpswapFirstPlannerError::InvalidInput)?;
+
+        let quotes = self.drop_invalid_quotes(input, quotes);
+        let icpswap = quotes
+            .get(ICPSWAP_VENUE_ID)
+            .ok_or_else(|| IcpswapFirstPlannerError::InvalidInput("ICPSwap full preview is missing".to_string()))?;
+
+        // Route according to the validated result of the full-amount ICPSwap preview.
+        match &icpswap.outcome {
+            // A quoted full allocation wins immediately when its impact is below
+            // the ICPSwap ceiling; overflow venues do not need to be queried.
+            VenuePreviewOutcome::Quoted(preview) if self.is_safe_icpswap(preview) => {
+                // Persist a plan containing only the safe full ICPSwap preview.
+                self.build_state(
+                    // Retain the liquidation amounts, assets, and edge requirements.
+                    input,
+                    // Clone the borrowed preview into the immutable persisted plan.
+                    vec![preview.clone()],
+                    // Record why this plan contains exactly one venue leg.
+                    MultiVenueAllocationReason::SingleVenue {
+                        // Store the stable adapter ID used later for execution dispatch.
+                        venue_id: ICPSWAP_VENUE_ID.to_string(),
+                    },
+                    // Preserve the timestamp shared by every quote in this plan.
+                    quoted_at,
+                )
+            }
+            // A valid quote at or above the ICPSwap impact limit cannot execute
+            // when no CEX adapter is enabled to receive the unsafe remainder.
+            VenuePreviewOutcome::Quoted(_) if self.overflow_venue_ids.is_empty() => {
+                // Return a retryable planning failure instead of forcing an unsafe swap.
+                Err(IcpswapFirstPlannerError::NoViableRoute(
+                    // Explain both the rejected ICPSwap quote and missing fallback.
+                    "ICPSwap full quote exceeds the price-impact limit and no overflow venue is enabled".to_string(),
+                ))
+            }
+            // A valid but unsafe full quote starts the normal capacity search:
+            // retain the largest safe ICPSwap amount, then apply the CEX waterfall.
+            VenuePreviewOutcome::Quoted(_) => {
+                // Re-quote exact allocations before constructing the persisted split.
+                self.plan_split_or_fallback(input, quoted_at).await
+            }
+            // An unavailable response is an operational venue failure; an invalid
+            // response is a malformed or safety-rejected quote. Neither may be used.
+            VenuePreviewOutcome::Unavailable(icpswap_error) | VenuePreviewOutcome::Invalid(icpswap_error) => {
+                // Since no ICPSwap amount is proven safe, offer the full collateral
+                // allocation to the ordered MEXC-then-Kraken overflow policy.
+                let overflow = self
+                    // Preview and size every CEX leg before any external side effect.
+                    .ordered_overflow_previews(input, input.total_pay.value.clone())
+                    .await
+                    // Retain the ICPSwap failure alongside any CEX waterfall failure.
+                    .map_err(|error| {
+                        // Classify the combined failure as a route that may become viable later.
+                        IcpswapFirstPlannerError::NoViableRoute(format!(
+                            // Include both venue contexts in the operator-facing error.
+                            "ICPSwap quote rejected ({icpswap_error}); {error}"
+                        ))
+                    })?;
+                // A one-leg fallback is an availability decision; a multi-leg
+                // MEXC/Kraken result is an amount-scoped price-impact split.
+                let allocation_reason = if overflow.len() == 1 {
+                    // Record which single CEX replaced the unavailable ICPSwap leg.
+                    MultiVenueAllocationReason::VenueUnavailable {
+                        // Dispatch execution to the sole CEX selected by the waterfall.
+                        selected_venue_id: overflow[0].venue_id.clone(),
+                        // Preserve ICPSwap as the venue that could not serve this plan.
+                        unavailable_venue_ids: vec![ICPSWAP_VENUE_ID.to_string()],
+                    }
+                } else {
+                    // Multiple CEX legs mean MEXC reached its safe capacity and
+                    // Kraken received the exact remaining allocation.
+                    MultiVenueAllocationReason::PriceImpactSplit
+                };
+                // Validate totals and edge, then construct the immutable execution plan.
+                self.build_state(input, overflow, allocation_reason, quoted_at)
+            }
+        }
+    }
+
     // Avoids a dust overflow leg by re-quoting the full amount on ICPSwap with
     // the narrowly relaxed fallback cap. If that quote is still too expensive,
     // the full amount is sent to the best executable overflow venue.
@@ -103,12 +205,14 @@ impl IcpswapFirstPlanner {
                 "no enabled venue can accept this collateral asset".to_string(),
             ));
         }
+
         // The test override also applies where ICPSwap cannot take the pair:
         // otherwise the two-CEX split has no reachable test path on these routes,
         // because their books stop filling before the impact ceiling is crossed.
         if let Some(previews) = self.plan_forced_cex_split_previews(input).await? {
             return self.build_state(input, previews, MultiVenueAllocationReason::PriceImpactSplit, quoted_at);
         }
+
         let previews = self.full_amount_overflow(input, None).await?;
         let allocation_reason = if previews.len() == 1 {
             MultiVenueAllocationReason::SingleVenue {
@@ -117,6 +221,7 @@ impl IcpswapFirstPlanner {
         } else {
             MultiVenueAllocationReason::PriceImpactSplit
         };
+        
         self.build_state(input, previews, allocation_reason, quoted_at)
     }
 

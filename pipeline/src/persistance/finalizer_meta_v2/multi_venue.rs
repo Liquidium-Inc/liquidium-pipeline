@@ -45,7 +45,7 @@ impl MultiVenueExecutionState {
                 ));
             }
 
-            allocated = allocated + leg.request.pay_amount.value.clone();
+            allocated += leg.request.pay_amount.value.clone();
 
             if self.plan.strategy_id == "icpswap_first" && !venue_ids.insert(leg.venue_id.as_str()) {
                 return Err(format!(

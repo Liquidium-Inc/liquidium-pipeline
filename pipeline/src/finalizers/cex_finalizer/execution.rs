@@ -438,20 +438,10 @@ where
         transfer_amount: &ChainTokenAmount,
         source_fee_budget: f64,
     ) -> Result<Option<(ChainTokenAmount, ChainTokenAmount)>, String> {
-        if !matches!(
-            route.route_kind,
-            BridgeRouteKind::CkEthErc20Reverse | BridgeRouteKind::CkEthToEth
-        ) || !route.source_chain.eq_ignore_ascii_case("ICP")
-            || !deposit_asset.symbol().eq_ignore_ascii_case(route.source_asset)
-            || !deposit_asset.chain().eq_ignore_ascii_case(route.source_chain)
-        {
+        let Some(source_fee_reserve) = Self::reverse_bridge_source_fee_reserve(route, deposit_asset, source_fee_budget)
+        else {
             return Ok(None);
-        }
-
-        let source_fee_reserve = ChainTokenAmount::from_formatted(deposit_asset.clone(), source_fee_budget);
-        if source_fee_reserve.value == Nat::from(0u8) {
-            return Ok(None);
-        }
+        };
 
         if transfer_value.clone() <= source_fee_reserve.value.clone() {
             return Err(format!(
@@ -466,6 +456,87 @@ where
         let bridge_amount_value = transfer_value.clone() - source_fee_reserve.value.clone();
         let bridge_amount = ChainTokenAmount::from_raw(deposit_asset.clone(), bridge_amount_value);
         Ok(Some((source_fee_reserve, bridge_amount)))
+    }
+
+    /// The source-token reserve a reverse ckETH route must keep back for its own
+    /// bridge submit, or `None` when the route reserves nothing.
+    ///
+    /// Shared by the deposit path, which subtracts it, and by the planner's
+    /// minimum, which adds it back. One definition so the two cannot disagree
+    /// about what the bridge will actually receive.
+    fn reverse_bridge_source_fee_reserve(
+        route: &BridgeRouteSpec,
+        deposit_asset: &ChainToken,
+        source_fee_budget: f64,
+    ) -> Option<ChainTokenAmount> {
+        if !matches!(
+            route.route_kind,
+            BridgeRouteKind::CkEthErc20Reverse | BridgeRouteKind::CkEthToEth
+        ) || !route.source_chain.eq_ignore_ascii_case("ICP")
+            || !deposit_asset.symbol().eq_ignore_ascii_case(route.source_asset)
+            || !deposit_asset.chain().eq_ignore_ascii_case(route.source_chain)
+        {
+            return None;
+        }
+
+        let source_fee_reserve = ChainTokenAmount::from_formatted(deposit_asset.clone(), source_fee_budget);
+        (source_fee_reserve.value != Nat::from(0u8)).then_some(source_fee_reserve)
+    }
+
+    /// Smallest `size_in` whose bridged deposit still clears the bridge's own
+    /// minimum withdrawal, or `None` when this deposit is not bridged or the
+    /// route has no floor.
+    ///
+    /// The deposit path shaves a ledger fee, and on reverse ckETH routes a
+    /// source fee reserve, off `size_in` before the bridge ever sees the
+    /// transfer. So the amount the planner must respect is the bridge minimum
+    /// plus both deductions. Built from the same helpers that perform those
+    /// deductions, so a leg sized at or above this clears
+    /// [`Self::ensure_minimum_bridge_amount`] later.
+    pub(super) async fn minimum_bridged_deposit_size_in(
+        &self,
+        deposit_asset: &ChainToken,
+    ) -> Result<Option<ChainTokenAmount>, String> {
+        let Some(bridge) = self.bridge.as_ref() else {
+            return Ok(None);
+        };
+
+        let plan = self.resolve_deposit_bridge_plan(deposit_asset);
+        if !plan.bridge_required {
+            return Ok(None);
+        }
+
+        let source_symbol = deposit_asset.symbol();
+        let source_chain = deposit_asset.chain();
+        let Some(route) = resolve_route(&source_symbol, &source_chain, &plan.cex_asset) else {
+            return Ok(None);
+        };
+
+        let minimum = bridge
+            .backend
+            .get_minimum_bridge_amount(route.source_asset, route.source_chain, route.target_asset)
+            .await?;
+
+        if minimum <= 0.0 {
+            return Ok(None);
+        }
+
+        let fee_budget = bridge
+            .backend
+            .get_fee_budget(route.source_asset, route.source_chain, route.target_asset)
+            .await?;
+
+        let source_fee_reserve =
+            Self::reverse_bridge_source_fee_reserve(route, deposit_asset, fee_budget.source_fee_budget)
+                .map_or_else(|| Nat::from(0u8), |reserve| reserve.value);
+
+        let ledger_fee = deposit_asset.fee() * self.profile.deposit_fee_multiplier;
+
+        let minimum_value = ChainTokenAmount::from_formatted(deposit_asset.clone(), minimum).value;
+        Ok(Some(ChainTokenAmount::from_raw(
+            deposit_asset.clone(),
+            minimum_value + source_fee_reserve + ledger_fee,
+        )))
     }
 
     async fn ensure_minimum_bridge_amount(

@@ -27,8 +27,10 @@ pub(crate) struct BridgePlan {
 pub(crate) trait BridgePlanner {
     /// Returns whether bridge-aware planning should be enabled for this finalizer instance.
     fn bridge_enabled(&self) -> bool;
+   
     /// Resolves the configured bridge source address/account string for a given source chain.
     fn resolve_bridge_source_address(&self, source_chain: &str) -> Result<String, String>;
+  
     /// Whether this venue trades and settles the ICP-native asset itself.
     ///
     /// A bridge route existing does not mean it should be used: a venue listing
@@ -39,6 +41,7 @@ pub(crate) trait BridgePlanner {
         let _ = symbol;
         false
     }
+
     /// Builds a direct (non-bridged) transport plan from the provided asset.
     fn plan_from_direct_asset(asset: &ChainToken) -> BridgeTransportPlan {
         BridgeTransportPlan {
@@ -57,24 +60,39 @@ pub(crate) trait BridgePlanner {
         }
     }
 
-    /// Resolves per-leg transport plans (deposit and withdraw), including bridge symbol/network translation.
-    fn resolve_bridge_plan_for_assets(&self, deposit_asset: &ChainToken, withdraw_asset: &ChainToken) -> BridgePlan {
-        let mut deposit = Self::plan_from_direct_asset(deposit_asset);
-        let mut withdraw = Self::plan_from_direct_asset(withdraw_asset);
+    /// Resolves the deposit-side transport plan on its own.
+    ///
+    /// Split out of `resolve_bridge_plan_for_assets` because sizing a deposit
+    /// only needs the pay asset: the planner asks how small a deposit may be
+    /// long before it knows what the leg will withdraw.
+    fn resolve_deposit_bridge_plan(&self, deposit_asset: &ChainToken) -> BridgeTransportPlan {
+        let deposit = Self::plan_from_direct_asset(deposit_asset);
 
         if !self.bridge_enabled() {
-            return BridgePlan { deposit, withdraw };
+            return deposit;
         }
 
         // Deposit-side translation: ckERC20 reverse route (e.g. ckUSDC@ICP -> USDC@ETH).
         if !self.accepts_icp_native_asset(&deposit.cex_asset)
             && let Some(route) = resolve_cketh_reverse_route_by_source(&deposit.cex_asset, &deposit.cex_network)
         {
-            deposit = BridgeTransportPlan {
+            return BridgeTransportPlan {
                 cex_asset: route.target_asset.to_string(),
                 cex_network: Self::cex_network_from_destination_kind(route.destination_kind),
                 bridge_required: true,
             };
+        }
+
+        deposit
+    }
+
+    /// Resolves per-leg transport plans (deposit and withdraw), including bridge symbol/network translation.
+    fn resolve_bridge_plan_for_assets(&self, deposit_asset: &ChainToken, withdraw_asset: &ChainToken) -> BridgePlan {
+        let deposit = self.resolve_deposit_bridge_plan(deposit_asset);
+        let mut withdraw = Self::plan_from_direct_asset(withdraw_asset);
+
+        if !self.bridge_enabled() {
+            return BridgePlan { deposit, withdraw };
         }
 
         // Withdraw-side translation: ckERC20 forward route (e.g. USDC@ETH -> ckUSDC@ICP).

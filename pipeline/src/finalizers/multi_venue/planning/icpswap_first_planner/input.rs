@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use candid::Nat;
 use liquidium_pipeline_core::tokens::{asset_id::AssetId, chain_token_amount::ChainTokenAmount};
 use num_traits::ToPrimitive;
@@ -40,6 +42,15 @@ pub struct IcpswapFirstPlanInput {
     /// than the collateral is worth by design, so it is held to its own edge
     /// floor rather than the profitable-liquidation one.
     pub buy_bad_debt: bool,
+    /// Smallest allocation each overflow venue can actually execute, in pay-token
+    /// units, for the venues that report a floor.
+    ///
+    /// Separate from `cex_min_exec_usd` because a bridge minimum is a native
+    /// per-asset amount, not a notional: the same $8 is 0.005 ETH at one price
+    /// and half that at another, so a dollar floor cannot stand in for it.
+    /// Resolved once per plan, since part of the number is a live gas quote and
+    /// every leg has to be measured against the same floor.
+    pub venue_minimums: BTreeMap<String, ChainTokenAmount>,
 }
 
 impl IcpswapFirstPlanInput {
@@ -94,6 +105,9 @@ impl IcpswapFirstPlanInput {
             receive_reference_price_ray,
             reference_price_captured_at: (receipt.request.ref_price_at > 0).then_some(receipt.request.ref_price_at),
             buy_bad_debt: receipt.request.liquidation.buy_bad_debt,
+            // Filled in by the planner once the venues have been asked; a
+            // receipt carries no venue state of its own.
+            venue_minimums: BTreeMap::new(),
         };
         input.validate()?;
         Ok(input)
@@ -171,6 +185,44 @@ impl IcpswapFirstPlanInput {
         };
         let notional = amount.to_f64() * price;
         notional.is_finite() && notional >= minimum_usd
+    }
+
+    /// Whether this allocation clears the floor the venue itself reported.
+    ///
+    /// A venue that reported nothing is unbounded here: its own deposit path
+    /// still enforces the real minimum, so a failed lookup must not remove a
+    /// venue that can execute perfectly well.
+    pub(super) fn meets_venue_minimum(&self, venue_id: &str, amount: &ChainTokenAmount) -> bool {
+        self.venue_minimums
+            .get(venue_id)
+            .is_none_or(|minimum| amount.value >= minimum.value)
+    }
+
+    /// Whether every one of these venues has a floor above the whole allocation.
+    ///
+    /// True means no slice can clear any venue, because every slice is smaller
+    /// than the total that already failed. That makes the amount unexecutable
+    /// rather than merely hard to route, which is a different answer for the
+    /// caller: retrying cannot grow it.
+    pub(super) fn below_every_venue_minimum(&self, venue_ids: &[String], amount: &ChainTokenAmount) -> bool {
+        !venue_ids.is_empty()
+            && venue_ids
+                .iter()
+                .all(|venue_id| !self.meets_venue_minimum(venue_id, amount))
+    }
+
+    /// Describes the reported floors that this allocation fails, for an
+    /// operator-facing error.
+    pub(super) fn venue_minimum_summary(&self, venue_ids: &[String]) -> String {
+        venue_ids
+            .iter()
+            .filter_map(|venue_id| {
+                self.venue_minimums
+                    .get(venue_id)
+                    .map(|minimum| format!("{venue_id} needs at least {}", minimum.formatted()))
+            })
+            .collect::<Vec<_>>()
+            .join("; ")
     }
 }
 

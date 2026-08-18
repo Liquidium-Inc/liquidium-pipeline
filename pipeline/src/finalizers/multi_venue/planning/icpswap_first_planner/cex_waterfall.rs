@@ -35,7 +35,24 @@ impl IcpswapFirstPlanner {
             ));
         }
 
-        let (partial_mexc, mexc_failure) = if mexc_enabled {
+        // A floor above the whole allocation cannot be met by any slice of it,
+        // because every slice is smaller than the total that already failed.
+        // Checked before any venue is quoted, so this can never be reported
+        // while an outage is the real cause and a retry would still find a route.
+        if input.below_every_venue_minimum(&self.overflow_venue_ids, &pay_amount) {
+            return Err(IcpswapFirstPlannerError::BelowVenueMinimum(format!(
+                "CEX amount {} is below every venue's minimum executable amount ({})",
+                pay_amount.formatted(),
+                input.venue_minimum_summary(&self.overflow_venue_ids)
+            )));
+        }
+
+        // MEXC is quoted only when the whole allocation clears its own floor: a
+        // partial can only ever be smaller, so a total below the floor rules out
+        // every MEXC leg and the quote would be wasted.
+        let mexc_quotable = mexc_enabled && input.meets_venue_minimum(MEXC_VENUE_ID, &pay_amount);
+
+        let (partial_mexc, mexc_failure) = if mexc_quotable {
             let request = input.request_for(MEXC_VENUE_ID, pay_value.clone());
             match self.preview_exact(input, MEXC_VENUE_ID, &request).await {
                 Ok(preview) if self.is_safe_cex(&preview) => return Ok(vec![preview]),
@@ -54,6 +71,15 @@ impl IcpswapFirstPlanner {
                 }
                 Err(error) => (None, error.to_string()),
             }
+        } else if mexc_enabled {
+            (
+                None,
+                format!(
+                    "MEXC cannot execute {} ({})",
+                    pay_amount.formatted(),
+                    input.venue_minimum_summary(&[MEXC_VENUE_ID.to_string()])
+                ),
+            )
         } else {
             (None, "MEXC is disabled".to_string())
         };
@@ -67,11 +93,15 @@ impl IcpswapFirstPlanner {
                 let remainder_value = pay_value.clone() - mexc.request.pay_amount.value.clone();
                 let remainder = ChainTokenAmount::from_raw(input.total_pay.token.clone(), remainder_value.clone());
 
-                if input.meets_cex_minimum(&remainder, self.config.cex_min_exec_usd) {
+                if input.meets_cex_minimum(&remainder, self.config.cex_min_exec_usd)
+                    && input.meets_venue_minimum(KRAKEN_VENUE_ID, &remainder)
+                {
                     (Some(mexc), remainder_value)
                 } else {
-                    // Never persist a dust Kraken leg. Ask Kraken to take the
-                    // complete amount instead of retaining the partial MEXC leg.
+                    // Never persist a dust Kraken leg, whether it is dust by
+                    // notional or below the floor Kraken's own bridge enforces.
+                    // Ask Kraken to take the complete amount instead of
+                    // retaining the partial MEXC leg.
                     (None, pay_value)
                 }
             }
@@ -107,6 +137,16 @@ impl IcpswapFirstPlanner {
             return Err(IcpswapFirstPlannerError::BelowVenueMinimum(format!(
                 "{venue_id} amount is below its minimum (${:.2} execution minimum)",
                 self.config.cex_min_exec_usd
+            )));
+        }
+        // The floor the venue reported for itself, which a notional minimum
+        // cannot express. Checked here so every caller is covered, including
+        // the forced test split that never reaches the waterfall.
+        if !input.meets_venue_minimum(venue_id, &request.pay_amount) {
+            return Err(IcpswapFirstPlannerError::BelowVenueMinimum(format!(
+                "{venue_id} amount {} is below its minimum executable amount ({})",
+                request.pay_amount.formatted(),
+                input.venue_minimum_summary(&[venue_id.to_string()])
             )));
         }
         let preview = self.preview_exact(input, venue_id, &request).await?;
@@ -151,8 +191,13 @@ impl IcpswapFirstPlanner {
             }
         }
 
-        Ok(last_safe
-            .filter(|preview| input.meets_cex_minimum(&preview.request.pay_amount, self.config.cex_min_exec_usd)))
+        // The largest safe amount is still only usable when it clears both
+        // floors. Below either one this venue has no viable size at all, since
+        // anything bigger is exactly what the impact ceiling already rejected.
+        Ok(last_safe.filter(|preview| {
+            input.meets_cex_minimum(&preview.request.pay_amount, self.config.cex_min_exec_usd)
+                && input.meets_venue_minimum(venue_id, &preview.request.pay_amount)
+        }))
     }
 
     fn is_safe_cex(&self, preview: &VenueRoutePreview) -> bool {
