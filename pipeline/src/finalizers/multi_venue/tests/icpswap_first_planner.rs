@@ -865,6 +865,112 @@ async fn a_venue_that_cannot_report_its_minimum_is_still_usable() {
     assert_eq!(*mexc_calls.lock().expect("MEXC calls"), vec![TOTAL_PAY]);
 }
 
+// Impact ceiling on a fold
+//
+// The ceiling decides how to divide an allocation. Once a minimum has forced the
+// whole amount onto one venue there is nothing left to divide, and the estimate
+// it is measured against -- one sweep of the book -- is not what execution does:
+// the leg is walked in impact-bounded slices. So the ceiling is waived there, and
+// only there.
+
+/// A venue absorbing a fold is quoted without the impact ceiling, because the
+/// alternative is no plan at all for collateral that is already seized.
+#[tokio::test]
+async fn a_venue_absorbing_a_fold_is_quoted_without_the_impact_ceiling() {
+    let mexc_calls = Arc::new(Mutex::new(Vec::new()));
+    let kraken_calls = Arc::new(Mutex::new(Vec::new()));
+    // MEXC's safe capacity is a quarter of the amount, below its own floor.
+    let mexc = mock_adapter_with_minimum(MEXC_VENUE_ID, mexc_calls.clone(), TOTAL_PAY / 2, |request| {
+        let pay = request.pay_amount.value.0.to_u64().expect("test amount");
+        let impact = if pay > TOTAL_PAY / 4 { 500.0 } else { 10.0 };
+        Ok(proportional_preview(request, MEXC_VENUE_ID, impact, 2))
+    });
+    // Kraken's full-amount quote is above the 200 bps ceiling.
+    let kraken = mock_adapter(KRAKEN_VENUE_ID, kraken_calls.clone(), |request| {
+        Ok(proportional_preview(request, KRAKEN_VENUE_ID, 500.0, 2))
+    });
+    let planner =
+        IcpswapFirstPlanner::new(vec![Arc::new(mexc), Arc::new(kraken)], config(0.0)).expect("valid two-CEX planner");
+
+    let state = planner
+        .plan(&input_with_pay_token(non_native_icp_token()), 123)
+        .await
+        .expect("a folded allocation must not be rejected on the sizing ceiling");
+
+    assert_eq!(state.legs.len(), 1);
+    assert_eq!(state.legs[0].venue_id, KRAKEN_VENUE_ID);
+    assert_eq!(state.legs[0].request.pay_amount.value, Nat::from(TOTAL_PAY));
+    assert!(
+        state.legs[0].quote.estimated_price_impact_bps > config(0.0).max_cex_price_impact_bps,
+        "the test is meaningless unless the accepted quote is above the ceiling"
+    );
+}
+
+/// The waiver is scoped to folds. A venue covering for an unavailable sibling is
+/// not absorbing a fold, so the ceiling still decides whether its quote is usable
+/// and a retry can still find a better one.
+#[tokio::test]
+async fn the_impact_ceiling_still_binds_when_the_collapse_is_an_outage() {
+    let kraken_calls = Arc::new(Mutex::new(Vec::new()));
+    let mexc = mock_adapter(MEXC_VENUE_ID, Arc::new(Mutex::new(Vec::new())), |_| {
+        Err("Api key info invalid".to_string())
+    });
+    let kraken = mock_adapter(KRAKEN_VENUE_ID, kraken_calls.clone(), |request| {
+        Ok(proportional_preview(request, KRAKEN_VENUE_ID, 500.0, 2))
+    });
+    let planner =
+        IcpswapFirstPlanner::new(vec![Arc::new(mexc), Arc::new(kraken)], config(0.0)).expect("valid two-CEX planner");
+
+    let error = planner
+        .plan(&input_with_pay_token(non_native_icp_token()), 123)
+        .await
+        .expect_err("an outage must not waive the sizing ceiling");
+
+    assert!(
+        error.to_string().contains("exceeds"),
+        "the ceiling must still reject this quote: {error}"
+    );
+    assert!(
+        matches!(error, IcpswapFirstPlannerError::NoViableRoute(_)),
+        "an outage stays retryable: {error:?}"
+    );
+}
+
+/// Waiving the ceiling does not leave a folded leg unpriced. The oracle guard
+/// measures the output rather than a proxy for it, so it still rejects a quote
+/// that is genuinely bad rather than merely large.
+#[tokio::test]
+async fn a_folded_leg_is_still_priced_against_the_oracle() {
+    let mexc = mock_adapter_with_minimum(
+        MEXC_VENUE_ID,
+        Arc::new(Mutex::new(Vec::new())),
+        TOTAL_PAY / 2,
+        |request| {
+            let pay = request.pay_amount.value.0.to_u64().expect("test amount");
+            let impact = if pay > TOTAL_PAY / 4 { 500.0 } else { 10.0 };
+            Ok(proportional_preview(request, MEXC_VENUE_ID, impact, 2))
+        },
+    );
+    // Far below what the oracle implies for this allocation.
+    let kraken = mock_adapter(KRAKEN_VENUE_ID, Arc::new(Mutex::new(Vec::new())), |request| {
+        Ok(preview(request, KRAKEN_VENUE_ID, 500.0, 1_000, 1_000))
+    });
+    let mut input = input_with_pay_token(non_native_icp_token());
+    input.pay_reference_price_ray = Some(Nat::from(2 * RAY));
+    input.receive_reference_price_ray = Some(Nat::from(RAY));
+
+    let error = IcpswapFirstPlanner::new(vec![Arc::new(mexc), Arc::new(kraken)], production_oracle_config(0.0))
+        .expect("valid two-CEX planner")
+        .plan(&input, QUOTED_AT)
+        .await
+        .expect_err("the oracle guard still applies to a folded leg");
+
+    assert!(
+        error.to_string().contains("below oracle-implied output"),
+        "a folded leg must still be priced: {error}"
+    );
+}
+
 /// ICP/ckUSDT cannot reach the CEX split by price impact: its books stop filling
 /// around 165 bps against a 200 bps ceiling, so MEXC either fills safely or errors
 /// outright and Kraken takes everything. The override is the only way to exercise
@@ -1999,9 +2105,17 @@ async fn unavailable_mexc_sends_the_complete_overflow_allocation_to_kraken() {
     assert_eq!(kraken_calls.lock().expect("calls lock").as_slice(), &[TOTAL_PAY]);
 }
 
+/// A dust remainder folds back into MEXC, not across to Kraken.
+///
+/// MEXC has first refusal and could safely take 95% of this allocation, so it is
+/// a better home for the last 5% than the venue that was never asked for any of
+/// it. Handing the lot to Kraken would invert the venue order over a rounding
+/// detail. The impact overage MEXC accepts is small precisely because the
+/// remainder was dust.
 #[tokio::test]
-async fn below_minimum_kraken_remainder_discards_partial_mexc_and_uses_full_kraken() {
-    let mexc = mock_adapter(MEXC_VENUE_ID, Arc::new(Mutex::new(Vec::new())), |request| {
+async fn a_dust_kraken_remainder_folds_back_into_mexc() {
+    let mexc_calls = Arc::new(Mutex::new(Vec::new()));
+    let mexc = mock_adapter(MEXC_VENUE_ID, mexc_calls.clone(), |request| {
         let pay = request.pay_amount.value.0.to_u64().expect("test amount");
         let impact = if pay <= 95_000_000 { 200.0 } else { 201.0 };
         Ok(proportional_preview(request, MEXC_VENUE_ID, impact, 2))
@@ -2017,12 +2131,21 @@ async fn below_minimum_kraken_remainder_discards_partial_mexc_and_uses_full_krak
     let state = planner
         .plan(&input_with_pay_token(non_native_icp_token()), QUOTED_AT)
         .await
-        .expect("full Kraken dust fallback");
+        .expect("MEXC absorbs its own dust remainder");
 
     assert_eq!(state.legs.len(), 1);
-    assert_eq!(state.legs[0].venue_id, KRAKEN_VENUE_ID);
+    assert_eq!(state.legs[0].venue_id, MEXC_VENUE_ID);
     assert_eq!(state.legs[0].request.pay_amount.value, Nat::from(TOTAL_PAY));
-    assert_eq!(kraken_calls.lock().expect("calls lock").as_slice(), &[TOTAL_PAY]);
+    // Above the 200 bps ceiling, which is waived because nothing is left to size.
+    assert_eq!(state.legs[0].quote.estimated_price_impact_bps, 201.0);
+    // Kraken is never asked: the fold reuses the full-amount quote MEXC already
+    // gave, so no venue is quoted again to serve it.
+    assert!(kraken_calls.lock().expect("calls lock").is_empty());
+    assert_eq!(
+        mexc_calls.lock().expect("calls lock").first().copied(),
+        Some(TOTAL_PAY),
+        "MEXC's retained full-amount quote is the one that gets committed"
+    );
 }
 
 #[tokio::test]
