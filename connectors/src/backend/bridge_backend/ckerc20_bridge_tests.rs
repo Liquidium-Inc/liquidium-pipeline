@@ -1167,6 +1167,10 @@ async fn native_reverse_bridge_approves_cketh_and_calls_withdraw_eth() {
                 && args.amount == Nat::from(1_000_000_000_000_120_000u128)
                 && args.spender.owner == minter
                 && args.spender.subaccount.is_none()
+                // Compare-and-swap against the allowance just read, so a
+                // concurrent approval is rejected by the ledger instead of being
+                // silently overwritten while its withdraw still needs it.
+                && args.expected_allowance == Some(Nat::from(999_999_999_999_999_999u128))
         })
         .times(1)
         .returning(|_, _| Ok(Nat::from(1u8)));

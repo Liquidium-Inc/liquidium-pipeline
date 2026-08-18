@@ -11,7 +11,8 @@ use icrc_ledger_types::{
     icrc1::account::Account,
     icrc2::{allowance::AllowanceArgs, approve::ApproveArgs},
 };
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
+use tokio::sync::Mutex as TokioMutex;
 
 use super::{
     ckerc20_bridge_utils::{
@@ -316,6 +317,32 @@ where
     pub evm_backend: Arc<E>,
     pub cketh_minter_canister: Principal,
     pub bridge_ic_owner_principal: Principal,
+    /// Serialises forward-bridge submissions that share one signer and token.
+    ///
+    /// An ERC20 allowance is wallet-wide state, not per-caller. Two legs
+    /// bridging the same token each read it, decide whether to approve, and then
+    /// submit a deposit against it. Interleaved, the first deposit to mine
+    /// consumes the allowance the second was relying on, and that second deposit
+    /// reverts on-chain: gas spent, and the withdrawn funds left sitting at the
+    /// signer address with nothing to move them. The balance preflight races the
+    /// same way, and `approve` sets rather than adds, so a second approval can
+    /// also shrink an allowance the first leg still needs.
+    ///
+    /// Holding this across read-allowance -> approve -> deposit makes the whole
+    /// sequence atomic, which is enough because one daemon owns the wallet.
+    /// Keyed by token: different tokens share no allowance or balance.
+    forward_bridge_locks: TokioMutex<HashMap<Address, Arc<TokioMutex<()>>>>,
+    /// Serialises reverse-bridge submissions, for the same reason as
+    /// `forward_bridge_locks`: an ICRC-2 allowance is account-wide, so two legs
+    /// reading it, deciding whether to approve, and then having the minter spend
+    /// it will interleave into one leg burning the other's approval.
+    ///
+    /// One lock rather than one per ledger, because a single reverse withdraw
+    /// spends two allowances at once -- the ckERC20 being burned and the ckETH
+    /// paying the EVM fee. Taking two locks would invite a deadlock for no gain:
+    /// these submissions are a handful of canister calls each, and they all
+    /// contend on the same minter and the same source account anyway.
+    reverse_bridge_lock: TokioMutex<()>,
 }
 
 impl<A, B, E> CkErc20BridgeBackend<A, B, E>
@@ -337,7 +364,21 @@ where
             evm_backend,
             cketh_minter_canister,
             bridge_ic_owner_principal,
+            forward_bridge_locks: TokioMutex::new(HashMap::new()),
+            reverse_bridge_lock: TokioMutex::new(()),
         }
+    }
+
+    /// Claims the forward-bridge lock for one ERC20 token.
+    async fn forward_bridge_lock(&self, token: Address) -> tokio::sync::OwnedMutexGuard<()> {
+        let lock = {
+            let mut guard = self.forward_bridge_locks.lock().await;
+            guard
+                .entry(token)
+                .or_insert_with(|| Arc::new(TokioMutex::new(())))
+                .clone()
+        };
+        lock.lock_owned().await
     }
 
     async fn minter_info(&self) -> Result<CkEthMinterInfo, String> {
@@ -439,7 +480,14 @@ where
         self.evm_backend.erc20_decimals_of(token).await
     }
 
-    async fn approve_minter_spend(&self, ledger: Principal, amount: Nat) -> Result<(), String> {
+    /// Sets the minter's allowance, refusing if it is not what we just observed.
+    ///
+    /// `expected_allowance` is ICRC-2's compare-and-swap: if anything changed the
+    /// allowance between the read and this call, the ledger rejects the approve
+    /// rather than silently overwriting an approval another submission is still
+    /// relying on. `reverse_bridge_lock` should already make that impossible
+    /// in-process; this catches anything holding the same account from outside.
+    async fn approve_minter_spend(&self, ledger: Principal, amount: Nat, expected: Nat) -> Result<(), String> {
         let approve_args = ApproveArgs {
             from_subaccount: None,
             spender: Account {
@@ -447,7 +495,7 @@ where
                 subaccount: None,
             },
             amount,
-            expected_allowance: None,
+            expected_allowance: Some(expected),
             expires_at: None,
             fee: None,
             memo: None,
@@ -481,7 +529,8 @@ where
             return Ok(());
         }
 
-        self.approve_minter_spend(ledger, required_allowance).await
+        self.approve_minter_spend(ledger, required_allowance, current_allowance)
+            .await
     }
 
     fn with_fee_headroom(amount: &Nat) -> Nat {
@@ -580,6 +629,13 @@ where
 
         let decimals = self.token_decimals(token_address).await?;
         let amount_base_units = amount_to_base_units_strict(request.amount, decimals)?;
+
+        // Everything from here to the deposit reads or spends wallet-wide state,
+        // so it runs alone. Claimed after the preparation above, which touches
+        // nothing shared, to keep the held section as short as the RPC round
+        // trips allow.
+        let _bridge_guard = self.forward_bridge_lock(token_address).await;
+
         let signer_balance = self
             .evm_backend
             .erc20_balance_of(token_address, signer)
@@ -714,6 +770,11 @@ where
         // Reverse flow is restricted to the configured bridge owner principal.
         ensure_source_matches_bridge_owner(&source_account, self.bridge_ic_owner_principal)?;
 
+        // Held for the whole submission: everything below reads or spends the
+        // minter's allowance on this account, which no other leg may disturb
+        // between the read and the withdraw that consumes it.
+        let _reverse_guard = self.reverse_bridge_lock.lock().await;
+
         let destination = expect_evm_destination(route, &request.destination)?;
 
         let ckerc20_ledger_id = parse_ckerc20_ledger_id(route)?;
@@ -832,6 +893,11 @@ where
     ) -> Result<BridgeSubmission, String> {
         let source_account = parse_source_icp_account(&request.source_address)?;
         ensure_source_matches_bridge_owner(&source_account, self.bridge_ic_owner_principal)?;
+
+        // Held for the whole submission: everything below reads or spends the
+        // minter's allowance on this account, which no other leg may disturb
+        // between the read and the withdraw that consumes it.
+        let _reverse_guard = self.reverse_bridge_lock.lock().await;
 
         let destination = expect_evm_destination(route, &request.destination)?;
         let cketh_ledger_id = parse_ckerc20_ledger_id(route)?;
