@@ -74,6 +74,10 @@ pub trait MultiVenueAdapter: Send + Sync {
     ) -> Result<VenueLegProgress, String>;
 
     /// Reconciles or recovers only the supplied leg after restart or failure.
+    /// Has no caller in the finalize loop on purpose: a parked leg's external
+    /// state is unknown, so only an explicit per-leg operator command may rearm
+    /// it. Covered by
+    /// `reenqueuing_the_parent_row_does_not_rearm_an_operator_required_mexc_leg`.
     #[allow(dead_code)]
     async fn recover(
         &self,
