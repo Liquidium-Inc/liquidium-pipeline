@@ -90,7 +90,7 @@ impl IcpswapFirstPlanner {
             unguarded.receive_reference_price_ray = None;
             unguarded
         });
-        
+
         let icpswap_input = unguarded_input.as_ref().unwrap_or(input);
         let icpswap = self
             .preview_exact(icpswap_input, ICPSWAP_VENUE_ID, &icpswap_request)

@@ -208,7 +208,15 @@ impl MultiVenueFinalizer {
         // No swap, transfer, or order side effect is submitted by `plan`.
         let state = match self.planner.plan(&input, now_ts()).await {
             Ok(state) => state,
-            Err(IcpswapFirstPlannerError::BelowVenueMinimum(reason)) => {
+            // Two different findings, one end state. Either the amount is too
+            // small for any venue, or the only allocation left was quoted and
+            // refused on price. Neither improves by being asked again, so the
+            // collateral is swept out of the swap path instead of spending the
+            // row's retry budget and then being abandoned where it sits.
+            Err(
+                IcpswapFirstPlannerError::BelowVenueMinimum(reason)
+                | IcpswapFirstPlannerError::NoAcceptableQuote(reason),
+            ) => {
                 let recovery = self.recovery.as_ref().ok_or_else(|| {
                     format!(
                         "{MULTI_VENUE_PERMANENT_PREFIX}no venue can execute this amount and recovery sweep is unavailable: {reason}"
@@ -746,11 +754,7 @@ fn classify(error: String) -> FinalizerError {
 
 #[async_trait]
 impl Finalizer for MultiVenueFinalizer {
-    async fn finalize(
-        &self,
-        wal: &dyn WalStore,
-        receipt: ExecutionReceipt,
-    ) -> Result<FinalizerResult, FinalizerError> {
+    async fn finalize(&self, wal: &dyn WalStore, receipt: ExecutionReceipt) -> Result<FinalizerResult, FinalizerError> {
         self.finalize_inner(wal, receipt).await.map_err(classify)
     }
 }

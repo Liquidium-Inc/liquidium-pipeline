@@ -197,9 +197,18 @@ impl IcpswapFirstPlanner {
             .preview_cex(input, KRAKEN_VENUE_ID, kraken_value, ceiling)
             .await
             .map_err(|kraken_error| {
-                IcpswapFirstPlannerError::NoViableRoute(format!(
+                let combined = format!(
                     "MEXC could not accept the full allocation ({rejection}); Kraken could not accept its allocation ({kraken_error})"
-                ))
+                );
+                // A terminal verdict has to survive being combined with MEXC's
+                // reason, or the wrapper would quietly turn "this cannot be
+                // priced" back into "try again later".
+                match kraken_error {
+                    IcpswapFirstPlannerError::NoAcceptableQuote(_) => {
+                        IcpswapFirstPlannerError::NoAcceptableQuote(combined)
+                    }
+                    _ => IcpswapFirstPlannerError::NoViableRoute(combined),
+                }
             })?;
 
         Ok(match mexc {
@@ -240,7 +249,7 @@ impl IcpswapFirstPlanner {
             Ok(full) => full,
             Err(error) => return Ok(MexcShare::Unusable(error.to_string())),
         };
-        
+
         if self.is_safe_cex(&full) {
             return Ok(MexcShare::WholeAllocation(Box::new(full)));
         }
@@ -310,7 +319,19 @@ impl IcpswapFirstPlanner {
                 input.venue_minimum_summary(&[venue_id.to_string()])
             )));
         }
-        let preview = self.preview_exact(input, venue_id, &request).await?;
+        // Quoting and judging are separated so a venue that never answered is
+        // not confused with one whose answer we refused. Silence is an outage
+        // and stays retryable; a refusal on a fold is final, because a fold has
+        // no other allocation to fall back to and the same book answers the same
+        // way next cycle. Retrying there only spends the row's budget before
+        // abandoning collateral that a sweep could have parked deliberately.
+        let preview = self.quote_venue(input, venue_id, &request).await?;
+        if let Err(refused) = self.validate_venue_preview(input, venue_id, &request, &preview) {
+            return Err(match ceiling {
+                ImpactCeiling::WaivedForFold => IcpswapFirstPlannerError::NoAcceptableQuote(refused.to_string()),
+                ImpactCeiling::Enforced => refused,
+            });
+        }
         if !self.is_safe_cex(&preview) {
             if ceiling == ImpactCeiling::Enforced {
                 return Err(IcpswapFirstPlannerError::NoViableRoute(format!(

@@ -58,6 +58,19 @@ pub enum IcpswapFirstPlannerError {
     /// and a retry would then produce a real route.
     #[error("no venue can execute this amount: {0}")]
     BelowVenueMinimum(String),
+    /// The one allocation left to try was quoted, and we refused the quote on
+    /// price. Terminal for the same reason as `BelowVenueMinimum`: retrying
+    /// re-asks a question the venue already answered.
+    ///
+    /// Only produced where no alternative allocation exists — a venue absorbing
+    /// a fold, whose split was itself already rejected. Anywhere a different
+    /// division could still be tried, a refused quote stays `NoViableRoute` so
+    /// the next cycle may find one.
+    ///
+    /// Never construct this from a venue that failed to answer: silence is an
+    /// outage, and an outage ends.
+    #[error("no venue will price this amount acceptably: {0}")]
+    NoAcceptableQuote(String),
 }
 
 pub struct IcpswapFirstPlanner {
@@ -184,15 +197,29 @@ impl IcpswapFirstPlanner {
         venue_id: &str,
         request: &SwapRequest,
     ) -> Result<VenueRoutePreview, IcpswapFirstPlannerError> {
+        let preview = self.quote_venue(input, venue_id, request).await?;
+        self.validate_venue_preview(input, venue_id, request, &preview)?;
+        Ok(preview)
+    }
+
+    /// Asks one venue for an exact quote, without judging the answer.
+    ///
+    /// Split from `preview_exact` so a caller can tell a venue that did not
+    /// answer from one whose answer we refused. Those are different facts: an
+    /// outage ends, while a quote we priced out will come back the same.
+    pub(super) async fn quote_venue(
+        &self,
+        input: &IcpswapFirstPlanInput,
+        venue_id: &str,
+        request: &SwapRequest,
+    ) -> Result<VenueRoutePreview, IcpswapFirstPlannerError> {
         let adapter = self.venues.adapter(venue_id).ok_or_else(|| {
             IcpswapFirstPlannerError::InvalidInput(format!("venue adapter `{venue_id}` is not registered"))
         })?;
         let context = input.planning_context();
-        let preview = adapter.preview(&context, request).await.map_err(|error| {
+        adapter.preview(&context, request).await.map_err(|error| {
             IcpswapFirstPlannerError::NoViableRoute(format!("{} preview failed: {error}", adapter.venue_id()))
-        })?;
-        self.validate_venue_preview(input, adapter.venue_id(), request, &preview)?;
-        Ok(preview)
+        })
     }
 
     // Converts malformed responses into per-venue Invalid outcomes so one bad

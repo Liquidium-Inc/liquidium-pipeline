@@ -380,6 +380,8 @@ struct ScriptedAdapter {
     /// Makes `preview` fail the way a venue outage does, so the planner sees
     /// the venue as unavailable rather than as quoted.
     preview_failure: Option<String>,
+    /// Native floor this venue reports, as a bridged CEX does.
+    minimum_executable: Option<u64>,
 }
 
 impl ScriptedAdapter {
@@ -397,7 +399,13 @@ impl ScriptedAdapter {
             observed_statuses: Mutex::new(Vec::new()),
             advance_failure: None,
             preview_failure: None,
+            minimum_executable: None,
         }
+    }
+
+    fn with_minimum_executable(mut self, minimum: u64) -> Self {
+        self.minimum_executable = Some(minimum);
+        self
     }
 
     fn with_advance_failure(mut self, error: &str) -> Self {
@@ -441,6 +449,15 @@ impl ScriptedAdapter {
 impl MultiVenueAdapter for ScriptedAdapter {
     fn venue_id(&self) -> &'static str {
         self.venue_id
+    }
+
+    async fn minimum_executable_amount(
+        &self,
+        token: &liquidium_pipeline_core::tokens::chain_token::ChainToken,
+    ) -> Result<Option<ChainTokenAmount>, String> {
+        Ok(self
+            .minimum_executable
+            .map(|minimum| ChainTokenAmount::from_raw(token.clone(), Nat::from(minimum))))
     }
 
     async fn preview(
@@ -728,6 +745,51 @@ fn committed_recovery_state(wal: &TestWal) -> crate::persistance::RecoverySweepS
         panic!("expected recovery sweep state")
     };
     state
+}
+
+/// A receipt whose recorded prices are fresh and say the collateral is worth far
+/// more than any venue will quote for it, so the oracle guard refuses the quote.
+fn receipt_priced_far_above_any_quote() -> ExecutionReceipt {
+    let mut receipt = receipt();
+    // The oracle prices the collateral 10_000x the debt token, so it implies far
+    // more output than the scripted quote's flat 2x ever produces.
+    receipt.request.ref_price = Nat::from(10_000_000_000_000_000_000_000_000_000_000u128);
+    receipt.request.debt_ref_price = Nat::from(1_000_000_000_000_000_000_000_000_000u128);
+    // Recorded now, so the guard uses them instead of discarding them as stale.
+    receipt.request.ref_price_at = crate::utils::now_ts();
+    receipt
+}
+
+/// A fold refused on price is swept, not retried.
+///
+/// MEXC's floor rules it out entirely, so Kraken absorbs the whole allocation as
+/// a fold. Kraken answers, and the oracle guard refuses that answer. Since a fold
+/// has no other allocation to fall back on, the collateral is parked in recovery
+/// rather than spending the row's retry budget on a settled question.
+#[tokio::test]
+async fn a_fold_refused_on_price_sweeps_to_recovery_instead_of_retrying() {
+    let receipt = receipt_priced_far_above_any_quote();
+    let wal = TestWal::with_receipt(&receipt);
+    let mexc = Arc::new(ScriptedAdapter::new(MEXC_VENUE_ID, None, Vec::new()).with_minimum_executable(TOTAL_PAY + 1));
+    let kraken = Arc::new(ScriptedAdapter::new(KRAKEN_VENUE_ID, None, Vec::new()));
+    let destination = recovery_account();
+    let mut transfers = MockTransferActions::new();
+    transfers
+        .expect_transfer()
+        .times(1)
+        .returning(|_, _, _| Ok("recovery-block-fold".to_string()));
+    let finalizer = MultiVenueFinalizer::new(vec![mexc.clone(), kraken.clone()], planner_config())
+        .expect("valid finalizer")
+        .with_recovery_sweep(Arc::new(transfers), destination);
+
+    let completed = finalizer.finalize(&wal, receipt).await.expect("sweep to recovery");
+
+    assert!(completed.finalized);
+    assert_eq!(completed.swapper.as_deref(), Some("recovery"));
+    // MEXC is ruled out on size before it is asked; Kraken answered and was refused.
+    assert_eq!(mexc.previews(), 0, "a venue below its own floor is never quoted");
+    assert!(kraken.previews() > 0, "Kraken must have been quoted for the fold");
+    assert_eq!(committed_recovery_state(&wal).status, RecoverySweepStatus::Completed);
 }
 
 #[tokio::test]

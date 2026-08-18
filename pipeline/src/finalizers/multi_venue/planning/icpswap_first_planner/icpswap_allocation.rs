@@ -221,7 +221,7 @@ impl IcpswapFirstPlanner {
         } else {
             MultiVenueAllocationReason::PriceImpactSplit
         };
-        
+
         self.build_state(input, previews, allocation_reason, quoted_at)
     }
 

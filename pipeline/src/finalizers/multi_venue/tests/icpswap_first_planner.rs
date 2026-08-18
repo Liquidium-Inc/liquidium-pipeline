@@ -971,6 +971,78 @@ async fn a_folded_leg_is_still_priced_against_the_oracle() {
     );
 }
 
+// Terminal versus retryable on a fold
+//
+// A fold has no alternative allocation: the split it replaced was already
+// rejected. So a venue that answers and is refused on price has given a final
+// answer, and retrying only spends the row's budget before abandoning its
+// collateral. A venue that never answered is a different fact -- outages end.
+
+/// A folded leg refused on price is terminal, so the caller may sweep the
+/// collateral rather than retry a question already answered.
+#[tokio::test]
+async fn a_folded_leg_refused_on_price_is_terminal() {
+    let mexc = mock_adapter_with_minimum(
+        MEXC_VENUE_ID,
+        Arc::new(Mutex::new(Vec::new())),
+        TOTAL_PAY / 2,
+        |request| {
+            let pay = request.pay_amount.value.0.to_u64().expect("test amount");
+            let impact = if pay > TOTAL_PAY / 4 { 500.0 } else { 10.0 };
+            Ok(proportional_preview(request, MEXC_VENUE_ID, impact, 2))
+        },
+    );
+    // Answers, but far below what the oracle implies.
+    let kraken = mock_adapter(KRAKEN_VENUE_ID, Arc::new(Mutex::new(Vec::new())), |request| {
+        Ok(preview(request, KRAKEN_VENUE_ID, 500.0, 1_000, 1_000))
+    });
+    let mut input = input_with_pay_token(non_native_icp_token());
+    input.pay_reference_price_ray = Some(Nat::from(2 * RAY));
+    input.receive_reference_price_ray = Some(Nat::from(RAY));
+
+    let error = IcpswapFirstPlanner::new(vec![Arc::new(mexc), Arc::new(kraken)], production_oracle_config(0.0))
+        .expect("valid two-CEX planner")
+        .plan(&input, QUOTED_AT)
+        .await
+        .expect_err("a folded leg refused on price cannot be planned");
+
+    assert!(
+        matches!(error, IcpswapFirstPlannerError::NoAcceptableQuote(_)),
+        "a refused fold must not be reported as retryable: {error:?}"
+    );
+}
+
+/// Silence is not a refusal. A venue that never answered may answer next cycle,
+/// so the row keeps its retry rather than being swept.
+#[tokio::test]
+async fn a_folded_leg_whose_venue_never_answered_stays_retryable() {
+    let mexc = mock_adapter_with_minimum(
+        MEXC_VENUE_ID,
+        Arc::new(Mutex::new(Vec::new())),
+        TOTAL_PAY / 2,
+        |request| {
+            let pay = request.pay_amount.value.0.to_u64().expect("test amount");
+            let impact = if pay > TOTAL_PAY / 4 { 500.0 } else { 10.0 };
+            Ok(proportional_preview(request, MEXC_VENUE_ID, impact, 2))
+        },
+    );
+    let kraken = mock_adapter(KRAKEN_VENUE_ID, Arc::new(Mutex::new(Vec::new())), |_| {
+        Err("connection reset".to_string())
+    });
+    let planner =
+        IcpswapFirstPlanner::new(vec![Arc::new(mexc), Arc::new(kraken)], config(0.0)).expect("valid two-CEX planner");
+
+    let error = planner
+        .plan(&input_with_pay_token(non_native_icp_token()), QUOTED_AT)
+        .await
+        .expect_err("an unreachable Kraken cannot be planned");
+
+    assert!(
+        matches!(error, IcpswapFirstPlannerError::NoViableRoute(_)),
+        "an outage must stay retryable: {error:?}"
+    );
+}
+
 /// ICP/ckUSDT cannot reach the CEX split by price impact: its books stop filling
 /// around 165 bps against a 200 bps ceiling, so MEXC either fills safely or errors
 /// outright and Kraken takes everything. The override is the only way to exercise
