@@ -297,13 +297,31 @@ impl WalStore for SqliteWalStore {
             .optional()?;
         let new_attempt = current.unwrap_or(0) + attempt_delta;
 
-        diesel::update(tbl::table.find(liq_id.to_string()))
-            .set((
-                tbl::status.eq(next as i32),
-                tbl::attempt.eq(new_attempt),
-                tbl::updated_at.eq(now),
-            ))
-            .execute(&mut conn)?;
+        // Reaching one of these without an error proves the venues answered, so
+        // the strike count restarts. Otherwise it is a lifetime total and five
+        // unrelated blips park a long-running row. `InFlight` is excluded:
+        // claiming a row proves nothing.
+        let clears_errors = matches!(next, ResultStatus::Enqueued | ResultStatus::Succeeded);
+
+        if clears_errors {
+            diesel::update(tbl::table.find(liq_id.to_string()))
+                .set((
+                    tbl::status.eq(next as i32),
+                    tbl::attempt.eq(new_attempt),
+                    tbl::error_count.eq(0),
+                    tbl::last_error.eq(None::<String>),
+                    tbl::updated_at.eq(now),
+                ))
+                .execute(&mut conn)?;
+        } else {
+            diesel::update(tbl::table.find(liq_id.to_string()))
+                .set((
+                    tbl::status.eq(next as i32),
+                    tbl::attempt.eq(new_attempt),
+                    tbl::updated_at.eq(now),
+                ))
+                .execute(&mut conn)?;
+        }
         Ok(())
     }
 
@@ -630,6 +648,66 @@ mod tests {
             .block_on(async { reader.delete("liq-1").await })
             .expect_err("write should fail");
         assert!(err.to_string().contains("read-only"));
+    }
+
+    /// A row that errors, recovers, then errors again must not carry the earlier
+    /// strikes; the budget is five for the row's whole life.
+    #[test]
+    fn a_cycle_without_errors_clears_the_strike_count() {
+        let temp = tempfile::NamedTempFile::new().expect("tmp db");
+        let path = temp.path().display().to_string();
+        let store = SqliteWalStore::new_with_busy_timeout(&path, 5_000).expect("store");
+        let now = now_secs();
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+
+        rt.block_on(async {
+            store
+                .upsert_result(LiqResultRecord {
+                    id: "liq".to_string(),
+                    status: ResultStatus::Enqueued,
+                    attempt: 0,
+                    error_count: 0,
+                    last_error: None,
+                    created_at: now,
+                    updated_at: now,
+                    meta_json: "{}".to_string(),
+                })
+                .await
+                .expect("seed row");
+
+            for _ in 0..3 {
+                store
+                    .update_failure("liq", ResultStatus::FailedRetryable, "venue said no".to_string(), true)
+                    .await
+                    .expect("record failure");
+            }
+            let row = store.get_result("liq").await.expect("read").expect("row");
+            assert_eq!(row.error_count, 3);
+
+            // Claiming the row proves nothing, so the strikes survive it.
+            store
+                .update_status("liq", ResultStatus::InFlight, false)
+                .await
+                .expect("claim row");
+            let row = store.get_result("liq").await.expect("read").expect("row");
+            assert_eq!(row.error_count, 3);
+
+            // Releasing it without an error does.
+            store
+                .update_status("liq", ResultStatus::Enqueued, false)
+                .await
+                .expect("release row");
+            let row = store.get_result("liq").await.expect("read").expect("row");
+            assert_eq!(row.error_count, 0);
+            assert_eq!(row.last_error, None);
+
+            store
+                .update_failure("liq", ResultStatus::FailedRetryable, "venue said no".to_string(), true)
+                .await
+                .expect("record failure");
+            let row = store.get_result("liq").await.expect("read").expect("row");
+            assert_eq!(row.error_count, 1, "the strike count restarts rather than resuming");
+        });
     }
 
     #[test]
