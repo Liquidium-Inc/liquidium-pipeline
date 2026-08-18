@@ -1,4 +1,5 @@
 use super::*;
+use liquidium_pipeline_connectors::backend::bridge_backend::BridgeFailure;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -1852,10 +1853,8 @@ async fn mexc_withdraw_bridge_resubmits_a_transaction_that_was_replaced_before_m
     bridge.expect_get_bridge_status().times(1).returning(|bridge_id| {
         assert_eq!(bridge_id, "0xreplaced");
         Ok(BridgeStatus::Failed {
-            reason: Some(format!(
-                "{}: bridge transaction 0xreplaced at nonce 70 was replaced",
-                liquidium_pipeline_connectors::backend::bridge_backend::BRIDGE_TX_SUPERSEDED_PREFIX
-            )),
+            cause: BridgeFailure::Superseded,
+            reason: Some("bridge transaction 0xreplaced at nonce 70 was replaced".to_string()),
         })
     });
 
@@ -1897,6 +1896,113 @@ async fn mexc_withdraw_bridge_resubmits_a_transaction_that_was_replaced_before_m
     assert!(state.withdraw.bridge.withdraw_bridge_expected_amount.is_none());
     // The CEX withdrawal itself is untouched: it already succeeded.
     assert_eq!(state.withdraw.withdraw_id.as_deref(), Some("withdraw-replaced"));
+}
+
+/// Liquidation 1630: two legs bridged USDC from the same wallet three seconds
+/// apart, the first consumed the allowance the second was relying on, and the
+/// second reverted. A revert rolls back every state change, so those funds never
+/// moved and the submission can simply be made again.
+#[tokio::test]
+async fn mexc_withdraw_bridge_resubmits_a_reverted_transaction() {
+    let mut bridge = MockBridgeBackend::new();
+    bridge.expect_get_bridge_status().times(1).returning(|_| {
+        Ok(BridgeStatus::Failed {
+            cause: BridgeFailure::Reverted,
+            reason: Some("bridge transaction 0xreverted reverted in block 25781438".to_string()),
+        })
+    });
+
+    let state = reverted_withdraw_state(bridge).await;
+    // Cleared so the next cycle re-enters the submit branch and quotes afresh.
+    assert!(state.withdraw.bridge.withdraw_bridge_id.is_none());
+    assert!(state.withdraw.bridge.withdraw_bridge_expected_amount.is_none());
+    assert!(matches!(state.step, CexStep::WithdrawPending));
+    // The attempt is counted, so a cause that is not transient cannot loop.
+    assert_eq!(state.withdraw.bridge.withdraw_bridge_revert_resubmits, 1);
+    // The CEX withdrawal itself already succeeded and is left alone.
+    assert_eq!(state.withdraw.withdraw_id.as_deref(), Some("withdraw-reverted"));
+}
+
+/// A revert that keeps happening is not a collision, and every attempt burns
+/// gas, so the leg stops rather than paying to rediscover the same answer.
+#[tokio::test]
+async fn mexc_withdraw_bridge_stops_resubmitting_a_persistently_reverting_transaction() {
+    let mut bridge = MockBridgeBackend::new();
+    bridge.expect_get_bridge_status().times(1).returning(|_| {
+        Ok(BridgeStatus::Failed {
+            cause: BridgeFailure::Reverted,
+            reason: Some("bridge transaction 0xreverted reverted in block 25781438".to_string()),
+        })
+    });
+
+    let cex = MockCexBackend::new();
+    let transfers = MockTransferActions::new();
+    let finalizer = MexcFinalizer::new(
+        Arc::new(cex),
+        Arc::new(transfers),
+        Principal::management_canister(),
+        TEST_MAX_SELL_SLIPPAGE_BPS,
+        TEST_CEX_MIN_EXEC_USD,
+        TEST_CEX_SLICE_TARGET_RATIO,
+    )
+    .with_bridge_dependencies(bridge_dependencies(Arc::new(bridge)));
+
+    let receipt = make_execution_receipt_with_assets(120, ckbtc_token(), ckusdc_token());
+    let mut state = finalizer.prepare("120", &receipt).await.expect("prepare");
+    state.step = CexStep::WithdrawPending;
+    state.withdraw.withdraw_id = Some("withdraw-reverted".to_string());
+    state.withdraw.withdraw_txid = Some("0xcex".to_string());
+    state.withdraw.bridge.withdraw_bridge_id = Some("0xreverted".to_string());
+    state.withdraw.bridge.withdraw_bridge_submitted_at_ts = Some(crate::utils::now_ts());
+    state.withdraw.bridge.withdraw_bridge_expected_amount = Some(5.7);
+    // Already resubmitted as many times as the bound allows.
+    state.withdraw.bridge.withdraw_bridge_revert_resubmits = 2;
+    state.withdraw.size_out = Some(ChainTokenAmount::from_formatted(
+        state.withdraw.withdraw_asset.clone(),
+        1.5,
+    ));
+
+    let error = finalizer
+        .withdraw(&mut state)
+        .await
+        .expect_err("a persistently reverting bridge must stop");
+    assert!(error.to_string().contains("reverted"), "unexpected error: {error}");
+    // The id is kept so an operator can see exactly which transaction failed.
+    assert_eq!(state.withdraw.bridge.withdraw_bridge_id.as_deref(), Some("0xreverted"));
+}
+
+/// Drives one withdraw cycle against a bridge that reports a revert.
+async fn reverted_withdraw_state(bridge: MockBridgeBackend) -> CexState {
+    let cex = MockCexBackend::new();
+    let transfers = MockTransferActions::new();
+    let finalizer = MexcFinalizer::new(
+        Arc::new(cex),
+        Arc::new(transfers),
+        Principal::management_canister(),
+        TEST_MAX_SELL_SLIPPAGE_BPS,
+        TEST_CEX_MIN_EXEC_USD,
+        TEST_CEX_SLICE_TARGET_RATIO,
+    )
+    .with_bridge_dependencies(bridge_dependencies(Arc::new(bridge)));
+
+    let receipt = make_execution_receipt_with_assets(120, ckbtc_token(), ckusdc_token());
+    let mut state = finalizer.prepare("120", &receipt).await.expect("prepare");
+    state.step = CexStep::WithdrawPending;
+    state.withdraw.withdraw_id = Some("withdraw-reverted".to_string());
+    state.withdraw.withdraw_txid = Some("0xcex".to_string());
+    state.withdraw.bridge.withdraw_bridge_id = Some("0xreverted".to_string());
+    state.withdraw.bridge.withdraw_bridge_submitted_at_ts = Some(crate::utils::now_ts());
+    state.withdraw.bridge.withdraw_bridge_expected_amount = Some(5.7);
+    state.withdraw.size_out = Some(ChainTokenAmount::from_formatted(
+        state.withdraw.withdraw_asset.clone(),
+        1.5,
+    ));
+
+    finalizer
+        .withdraw(&mut state)
+        .await
+        .expect("a reverted bridge leaves its funds untouched, so it resubmits");
+    state
 }
 
 #[tokio::test]
@@ -2918,6 +3024,7 @@ fn cex_deposit_state_deserialize_defaults_missing_sent_timestamp() {
             deposit_bridge_submit_amount: None,
             deposit_bridge_expected_amount: None,
             deposit_bridge_provider_fee_budget_native_units: None,
+            deposit_bridge_revert_resubmits: 0,
         },
     };
 

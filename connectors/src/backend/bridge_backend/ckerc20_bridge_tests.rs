@@ -7,7 +7,8 @@ use std::sync::Arc;
 use crate::backend::{
     bridge_backend::types::{RetrieveErc20Request, RetrieveEthRequest},
     bridge_backend::{
-        BRIDGE_TX_SUPERSEDED_PREFIX, BridgeBackend, BridgeDestination, BridgeRequest, BridgeStatus, TxLiveness,
+        BRIDGE_TX_SUPERSEDED_PREFIX, BridgeBackend, BridgeDestination, BridgeFailure, BridgeRequest, BridgeStatus,
+        TxLiveness,
     },
     icp_backend::MockIcpBackend,
 };
@@ -1587,9 +1588,10 @@ async fn an_unmined_bridge_transaction_that_lost_its_nonce_is_reported_supersede
         .get_bridge_status(LIQ_1625_BRIDGE_TX)
         .await
         .expect("status must read");
-    let BridgeStatus::Failed { reason } = status else {
+    let BridgeStatus::Failed { cause, reason } = status else {
         panic!("a replaced transaction must fail so the caller resubmits: {status:?}");
     };
+    assert_eq!(cause, BridgeFailure::Superseded);
     assert!(reason.expect("reason").starts_with(BRIDGE_TX_SUPERSEDED_PREFIX));
 }
 

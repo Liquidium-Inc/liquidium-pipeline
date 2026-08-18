@@ -8,7 +8,7 @@ use candid::{Nat, Principal};
 use ic_ledger_types::{AccountIdentifier, Subaccount};
 use icrc_ledger_types::icrc1::account::Account;
 use liquidium_pipeline_connectors::backend::bridge_backend::{
-    BRIDGE_TX_SUPERSEDED_PREFIX, BridgeBackend, BridgeRequest, BridgeRouteKind, BridgeRouteSpec, BridgeStatus,
+    BridgeBackend, BridgeFailure, BridgeRequest, BridgeRouteKind, BridgeRouteSpec, BridgeStatus,
     FINALIZER_PERMANENT_AMOUNT_FLOOR_PREFIX, resolve_route,
 };
 use liquidium_pipeline_connectors::backend::cex_backend::{
@@ -58,13 +58,35 @@ pub struct CexBridgeDependencies {
     pub config: CexBridgeConfig,
 }
 
-/// Whether a bridge failure is a transaction that was replaced before mining.
+/// How many times a reverted bridge submission is resubmitted before an
+/// operator has to look at it.
 ///
-/// Such a submission never executed, so the source funds are untouched and the
-/// step may submit again. Every other failure describes a transaction that did
-/// run, which must not be repeated blindly.
-fn is_superseded_bridge_failure(reason: Option<&str>) -> bool {
-    reason.is_some_and(|reason| reason.starts_with(BRIDGE_TX_SUPERSEDED_PREFIX))
+/// A revert costs gas every attempt, and one with a permanent cause -- an
+/// unsupported token, a misconfigured helper -- reverts identically forever.
+/// Two attempts clear a transient collision without funding an endless loop.
+const MAX_REVERTED_BRIDGE_RESUBMITS: u32 = 2;
+
+/// What to do with a bridge submission that ended without delivering.
+enum BridgeFailureAction {
+    /// The funds are provably still at the source, so send them again.
+    Resubmit,
+    /// Either the funds may have moved, or resubmitting has already been tried
+    /// enough times to suggest the cause is not transient.
+    Fail,
+}
+
+/// Decides whether a failed bridge submission may be sent again.
+///
+/// Both a replaced and a reverted transaction leave the source funds exactly
+/// where they were -- one never ran, the other undid itself -- so neither can
+/// double-send. They differ in cost: a replaced transaction was free, while
+/// every revert burns gas, so only the revert is bounded.
+fn bridge_failure_action(cause: BridgeFailure, revert_resubmits: u32) -> BridgeFailureAction {
+    match cause {
+        BridgeFailure::Superseded => BridgeFailureAction::Resubmit,
+        BridgeFailure::Reverted if revert_resubmits < MAX_REVERTED_BRIDGE_RESUBMITS => BridgeFailureAction::Resubmit,
+        BridgeFailure::Reverted | BridgeFailure::Indeterminate => BridgeFailureAction::Fail,
+    }
 }
 
 fn parse_raw_code(err: &str) -> Option<i64> {
@@ -1082,11 +1104,21 @@ where
                 state.step = CexStep::DepositPending;
                 Ok(())
             }
-            BridgeStatus::Failed { reason } if is_superseded_bridge_failure(reason.as_deref()) => {
+            BridgeStatus::Failed { cause, reason }
+                if matches!(
+                    bridge_failure_action(cause, state.deposit.bridge.deposit_bridge_revert_resubmits),
+                    BridgeFailureAction::Resubmit
+                ) =>
+            {
+                if cause == BridgeFailure::Reverted {
+                    state.deposit.bridge.deposit_bridge_revert_resubmits += 1;
+                }
                 warn!(
-                    "[cex] liq_id={} bridged deposit {} was replaced before mining; clearing it to resubmit: {}",
+                    "[cex] liq_id={} bridged deposit {} did not deliver and its funds are untouched; clearing it to resubmit (cause={:?} revert_resubmits={}): {}",
                     state.liq_id,
                     bridge_id,
+                    cause,
+                    state.deposit.bridge.deposit_bridge_revert_resubmits,
                     reason.unwrap_or_default()
                 );
                 state.deposit.bridge.deposit_bridge_id = None;
@@ -1094,7 +1126,7 @@ where
                 state.step = CexStep::DepositPending;
                 Ok(())
             }
-            BridgeStatus::Failed { reason } => Err(format!(
+            BridgeStatus::Failed { cause: _, reason } => Err(format!(
                 "bridged deposit failed for liq_id {} bridge_id {}: {}",
                 state.liq_id,
                 bridge_id,
@@ -1704,11 +1736,21 @@ where
                 state.step = CexStep::WithdrawPending;
                 Ok(())
             }
-            BridgeStatus::Failed { reason } if is_superseded_bridge_failure(reason.as_deref()) => {
+            BridgeStatus::Failed { cause, reason }
+                if matches!(
+                    bridge_failure_action(cause, state.withdraw.bridge.withdraw_bridge_revert_resubmits),
+                    BridgeFailureAction::Resubmit
+                ) =>
+            {
+                if cause == BridgeFailure::Reverted {
+                    state.withdraw.bridge.withdraw_bridge_revert_resubmits += 1;
+                }
                 warn!(
-                    "[cex] liq_id={} bridged withdraw {} was replaced before mining; clearing it to resubmit: {}",
+                    "[cex] liq_id={} bridged withdraw {} did not deliver and its funds are untouched; clearing it to resubmit (cause={:?} revert_resubmits={}): {}",
                     state.liq_id,
                     bridge_id,
+                    cause,
+                    state.withdraw.bridge.withdraw_bridge_revert_resubmits,
                     reason.unwrap_or_default()
                 );
                 // The expectation belongs to the abandoned submission; a
@@ -1719,7 +1761,7 @@ where
                 state.step = CexStep::WithdrawPending;
                 Ok(())
             }
-            BridgeStatus::Failed { reason } => Err(format!(
+            BridgeStatus::Failed { cause: _, reason } => Err(format!(
                 "bridged withdraw failed for liq_id {} bridge_id {}: {}",
                 state.liq_id,
                 bridge_id,

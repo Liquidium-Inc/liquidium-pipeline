@@ -34,8 +34,8 @@ use crate::{
             nat_units_to_amount_via_core,
         },
         bridge_backend::{
-            BridgeBackend, BridgeDestination, BridgeFeeBudget, BridgeRequest, BridgeRouteKind, BridgeRouteSpec,
-            BridgeStatus, BridgeSubmission, resolve_cketh_forward_route_by_source,
+            BridgeBackend, BridgeDestination, BridgeFailure, BridgeFeeBudget, BridgeRequest, BridgeRouteKind,
+            BridgeRouteSpec, BridgeStatus, BridgeSubmission, resolve_cketh_forward_route_by_source,
             resolve_cketh_forward_route_by_target, resolve_cketh_reverse_route_by_source,
         },
         evm_backend::EvmBackendImpl,
@@ -1192,6 +1192,7 @@ where
                     tx_nonce,
                     sender_next_nonce,
                 } => BridgeStatus::Failed {
+                    cause: BridgeFailure::Superseded,
                     reason: Some(superseded_reason(bridge_id, tx_nonce, sender_next_nonce)),
                 },
                 TxLiveness::Mined | TxLiveness::Pending | TxLiveness::Unknown => BridgeStatus::Pending,
@@ -1202,7 +1203,10 @@ where
             return Ok(BridgeStatus::Completed);
         }
 
+        // A revert undoes every state change it made, so the funds it was
+        // meant to move are still at the source.
         Ok(BridgeStatus::Failed {
+            cause: BridgeFailure::Reverted,
             reason: Some(format!(
                 "bridge transaction {} reverted in block {}",
                 bridge_id,

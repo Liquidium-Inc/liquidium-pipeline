@@ -101,6 +101,14 @@ pub struct CexDepositBridgeState {
     pub deposit_bridge_submit_amount: Option<f64>,
     #[serde(default)]
     pub deposit_bridge_expected_amount: Option<f64>,
+    /// How many times a reverted submission on this side has been resubmitted.
+    ///
+    /// A revert leaves the funds untouched, so resubmitting is safe -- but it
+    /// costs gas every attempt, and a revert with a permanent cause reverts
+    /// identically forever. Bounding it clears a transient collision without
+    /// funding an endless loop.
+    #[serde(default)]
+    pub deposit_bridge_revert_resubmits: u32,
     #[serde(default)]
     pub deposit_bridge_provider_fee_budget_native_units: Option<Nat>,
 }
@@ -201,6 +209,14 @@ pub struct CexWithdrawBridgeState {
     pub withdraw_bridge_submitted_at_ts: Option<i64>,
     #[serde(default)]
     pub withdraw_bridge_polled_at_ts: Option<i64>,
+    /// How many times a reverted submission on this side has been resubmitted.
+    ///
+    /// A revert leaves the funds untouched, so resubmitting is safe -- but it
+    /// costs gas every attempt, and a revert with a permanent cause reverts
+    /// identically forever. Bounding it clears a transient collision without
+    /// funding an endless loop.
+    #[serde(default)]
+    pub withdraw_bridge_revert_resubmits: u32,
     #[serde(default)]
     pub withdraw_bridge_destination_snapshot: Option<String>,
     /// Target-asset amount the destination is expected to gain from this bridge.
@@ -553,6 +569,7 @@ mod tests {
                         deposit_bridge_submit_amount: None,
                         deposit_bridge_expected_amount: None,
                         deposit_bridge_provider_fee_budget_native_units: None,
+                        deposit_bridge_revert_resubmits: 0,
                     },
                 },
                 trade: CexTradeState {
@@ -596,6 +613,7 @@ mod tests {
                         withdraw_bridge_polled_at_ts: None,
                         withdraw_bridge_destination_snapshot: None,
                         withdraw_bridge_expected_amount: None,
+                        withdraw_bridge_revert_resubmits: 0,
                     },
                 },
             })
@@ -707,6 +725,7 @@ mod tests {
                         deposit_bridge_submit_amount: None,
                         deposit_bridge_expected_amount: None,
                         deposit_bridge_provider_fee_budget_native_units: None,
+                        deposit_bridge_revert_resubmits: 0,
                     },
                 },
                 trade: CexTradeState {
@@ -750,6 +769,7 @@ mod tests {
                         withdraw_bridge_polled_at_ts: None,
                         withdraw_bridge_destination_snapshot: None,
                         withdraw_bridge_expected_amount: None,
+                        withdraw_bridge_revert_resubmits: 0,
                     },
                 },
             })

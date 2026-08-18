@@ -87,6 +87,7 @@ where
                     deposit_bridge_submit_amount: None,
                     deposit_bridge_expected_amount: None,
                     deposit_bridge_provider_fee_budget_native_units: None,
+                    deposit_bridge_revert_resubmits: 0,
                 },
             },
             trade: CexTradeState {
@@ -130,6 +131,7 @@ where
                     withdraw_bridge_polled_at_ts: None,
                     withdraw_bridge_destination_snapshot: None,
                     withdraw_bridge_expected_amount: None,
+                    withdraw_bridge_revert_resubmits: 0,
                 },
             },
         })

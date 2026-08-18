@@ -88,13 +88,46 @@ pub struct BridgeSubmission {
     pub bridge_id: String,
 }
 
+/// Why a bridge submission ended without delivering, and — the part the caller
+/// actually needs — whether the source funds are still where they were.
+///
+/// A resubmit is only safe when nothing moved. Deciding that from the failure
+/// message would mean rewording a string could start or stop a second transfer
+/// of the same money, so it is a variant the caller matches on instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BridgeFailure {
+    /// Another transaction took this one's nonce, so it never executed at all.
+    Superseded,
+    /// It executed and reverted. Reverting rolls back every state change, so
+    /// the source funds are untouched and only gas was spent.
+    Reverted,
+    /// Anything else. It may have moved funds, so it must never be repeated
+    /// without a human deciding first.
+    Indeterminate,
+}
+
+impl BridgeFailure {
+    /// Whether the source funds are provably still available to resubmit.
+    ///
+    /// True for a transaction that never ran and for one that ran and undid
+    /// itself. Both leave the balance exactly as it was.
+    pub fn funds_untouched(self) -> bool {
+        matches!(self, Self::Superseded | Self::Reverted)
+    }
+}
+
 /// High-level bridge lifecycle state from the provider/backend.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BridgeStatus {
     Pending,
     Completed,
-    Failed { reason: Option<String> },
-    Canceled { reason: Option<String> },
+    Failed {
+        cause: BridgeFailure,
+        reason: Option<String>,
+    },
+    Canceled {
+        reason: Option<String>,
+    },
     Unknown,
 }
 
