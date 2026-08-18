@@ -25,6 +25,9 @@ const KRAKEN_AMBIGUOUS_PREFIX: &str = "kraken ambiguous submission: ";
 const ORDER_POLL_ATTEMPTS: usize = 20;
 const ORDER_POLL_INTERVAL: Duration = Duration::from_millis(500);
 const PAIR_METADATA_TTL: Duration = Duration::from_secs(5 * 60);
+/// One hundredth of a basis point, matching MEXC's `ROUND_HANDLER`: the margin
+/// by which a reported fill is kept under the amount the venue credited.
+const FILL_ROUNDING_MARGIN_RATIO: Decimal = Decimal::from_parts(1, 0, 0, false, 6);
 
 #[derive(Clone)]
 pub struct KrakenClient {
@@ -800,21 +803,57 @@ fn convert_levels(levels: Vec<super::kraken_api::KrakenBookLevel>) -> Result<Vec
         .collect()
 }
 
+/// Splits a settled order into what it consumed and what it paid out.
+///
+/// Kraken charges the fee in the currency the order pays out, and no order
+/// flags are set to change that, so both sides here take the fee off the
+/// received amount. What differs is the units: Kraken reports `fee` in the
+/// quote currency whichever side it actually took it from. A sell pays out
+/// quote, so the number is already usable. A buy pays out base, so the reported
+/// fee has to be converted at this fill's own price before it can be taken off
+/// the volume the order says it executed.
+///
+/// Reading a buy as "quote spent plus a quote fee" instead left `executed`
+/// standing as the amount received, which is a fee more than Kraken credits.
+/// Every withdrawal of that amount was then rejected for insufficient funds,
+/// and no retry could close a gap where neither side moves (liquidation 1634).
 fn fill_report(side: &str, executed: Decimal, cost: Decimal, fee: Decimal) -> Result<SwapFillReport, String> {
-    let executed = decimal_f64(executed, "executed volume")?;
-    let cost = decimal_f64(cost, "order cost")?;
-    let fee = decimal_f64(fee, "order fee")?;
-    if side.eq_ignore_ascii_case("sell") {
-        Ok(SwapFillReport {
-            input_consumed: executed,
-            output_received: (cost - fee).max(0.0),
-        })
+    // A sell pays out quote and a buy pays out base; the fee comes out of
+    // whichever that is. Kraken reports it in the quote currency either way, so
+    // only a buy has to convert, and `fee / cost` -- the fee as a fraction of
+    // the order -- is the one form that survives the change of units. A
+    // zero-cost fill has no price to convert through and nothing to charge a
+    // fee against.
+    let (consumed, received, fee_in_received) = if side.eq_ignore_ascii_case("sell") {
+        (executed, cost, fee)
+    } else if cost > Decimal::ZERO {
+        let base_fee = executed
+            .checked_mul(fee)
+            .and_then(|weighted| weighted.checked_div(cost))
+            .ok_or_else(|| "Kraken order fee cannot be expressed in base units".to_string())?;
+        (cost, executed, base_fee)
     } else {
-        Ok(SwapFillReport {
-            input_consumed: cost + fee,
-            output_received: executed,
-        })
-    }
+        (cost, executed, Decimal::ZERO)
+    };
+
+    // Kraken rounds every figure it reports, so a fee derived from them can land
+    // a rounding step under what was really withheld -- and a received amount
+    // even slightly above what the venue credited is the whole failure this
+    // fixes: the leg then asks to withdraw or spend money that is not there, and
+    // retrying cannot close a gap where neither side moves. The same hundredth
+    // of a basis point MEXC's `ROUND_HANDLER` shaves off a fill covers it here,
+    // three orders of magnitude below the dust the venue leaves behind anyway.
+    let rounding_margin = received
+        .checked_mul(FILL_ROUNDING_MARGIN_RATIO)
+        .unwrap_or(Decimal::ZERO);
+
+    Ok(SwapFillReport {
+        input_consumed: decimal_f64(consumed, "order input")?,
+        output_received: decimal_f64(
+            (received - fee_in_received - rounding_margin).max(Decimal::ZERO),
+            "order output net of fee",
+        )?,
+    })
 }
 
 fn decimal_f64(value: Decimal, field: &str) -> Result<f64, String> {
@@ -1180,7 +1219,13 @@ mod tests {
             .expect("filled sell");
 
         assert_eq!(report.input_consumed, 0.1);
-        assert_eq!(report.output_received, 5_976.0);
+        // 6000 quote less the 24 fee, less the rounding margin that keeps a
+        // reported fill from ever exceeding what the venue credited.
+        assert!(
+            report.output_received <= 5_976.0 && report.output_received > 5_976.0 * (1.0 - 1e-5),
+            "a sell must report at most the quote the venue credited: {}",
+            report.output_received
+        );
     }
 
     /// Liquidation 1615's recovery path: the leg resumes still holding the
@@ -1228,7 +1273,13 @@ mod tests {
             .expect("the settled order must be adopted");
 
         assert!((report.input_consumed - 0.1).abs() < 1e-9);
-        assert_eq!(report.output_received, 5_976.0);
+        // 6000 quote less the 24 fee, less the rounding margin that keeps a
+        // reported fill from ever exceeding what the venue credited.
+        assert!(
+            report.output_received <= 5_976.0 && report.output_received > 5_976.0 * (1.0 - 1e-5),
+            "a sell must report at most the quote the venue credited: {}",
+            report.output_received
+        );
     }
 
     /// A lookup that never succeeds stays ambiguous: the order may have moved
@@ -1439,8 +1490,42 @@ mod tests {
             .await
             .expect("filled buy");
 
-        assert!((report.input_consumed - 5_999.999_781_6).abs() < 1e-9);
-        assert_eq!(report.output_received, 0.099_601_59);
+        // The fee is 40 bps of the order, and a buy pays out base, so it is 40
+        // bps of the executed volume that never reaches the balance -- not a
+        // quote-side surcharge on top of what was spent.
+        assert!((report.input_consumed - 5_976.095_4).abs() < 1e-9);
+        let credited = 0.099_601_59 * 0.996;
+        assert!(
+            report.output_received <= credited && report.output_received > credited * (1.0 - 1e-5),
+            "a buy must report at most the base the venue credited: {} against {credited}",
+            report.output_received
+        );
+    }
+
+    /// The shape that stranded liquidation 1634: Kraken reports the fee in USD,
+    /// takes it out of the ETH, and the leg then tries to withdraw what it
+    /// believes it received. The received amount must already be net, or the
+    /// withdrawal asks for more ETH than the account holds -- forever, since a
+    /// retry changes neither the balance nor the request.
+    #[test]
+    fn a_market_buy_reports_the_base_it_can_actually_withdraw() {
+        let report = fill_report(
+            "buy",
+            Decimal::new(3_532_234, 8),   // 0.03532234 ETH executed
+            Decimal::new(6_707_536, 5),   // 67.07536 USD cost
+            Decimal::new(5_366, 4),       // 0.53660 USD fee, charged in ETH
+        )
+        .expect("buy fill");
+
+        // What Kraken credited: 0.03532234 less the 0.80% it withheld in ETH.
+        // The balance on the account that day was 0.0350477408, dust included.
+        let credited = 0.035_039_762_8;
+        assert!(
+            report.output_received <= credited && report.output_received > credited * (1.0 - 1e-5),
+            "the withdrawal must never ask for more than this: {} against {credited}",
+            report.output_received
+        );
+        assert!((report.input_consumed - 67.075_36).abs() < 1e-9);
     }
 
     #[tokio::test]

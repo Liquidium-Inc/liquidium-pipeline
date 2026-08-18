@@ -36,7 +36,15 @@ pub async fn build_kraken_finalizer(ctx: &PipelineContext) -> Result<Arc<KrakenF
             config.cex_buy_inverse_max_retries,
             config.cex_buy_inverse_enabled,
         )
-        .with_profile(CexVenueProfile::kraken(40.0))
+        // Measured on the live account rather than read off Kraken's published
+        // schedule: every crypto pair it has traded -- ETH/USD, ICP/USD, both
+        // directions -- charged exactly 80 bps, twice the 40 assumed here
+        // before. Stablecoin pairs charge 20, so a route that crosses one of
+        // each is quoted 60 bps pessimistic and every other route is quoted
+        // right; erring high is the safe direction for a gate that decides
+        // whether a liquidation is worth taking. Per-pair rates belong in the
+        // profile eventually, from Kraken's own TradeVolume endpoint.
+        .with_profile(CexVenueProfile::kraken(80.0))
         .with_token_registry(ctx.registry.clone())
         .with_quote_costs(config.cex_route_fee_bps, config.cex_delay_buffer_bps)
         .with_bridge_dependencies(bridge_dependencies)
