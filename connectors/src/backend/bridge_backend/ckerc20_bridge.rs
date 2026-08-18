@@ -20,10 +20,10 @@ use super::{
         parse_source_icp_account, resolve_cketh_route_for_request,
     },
     mint_lookup::find_convert_mint,
-    superseded::{is_superseded, superseded_reason},
+    superseded::{classify_liveness, superseded_reason},
     types::{
         CkEthMinterInfo, Eip1559TransactionPrice, Eip1559TransactionPriceArg, EvmReceiptStatus, HelperContract,
-        LedgerError, WithdrawErc20Arg, WithdrawErc20Error, WithdrawErc20Ret, WithdrawalArg, WithdrawalRet,
+        LedgerError, TxLiveness, WithdrawErc20Arg, WithdrawErc20Error, WithdrawErc20Ret, WithdrawalArg, WithdrawalRet,
     },
 };
 use crate::{
@@ -130,13 +130,11 @@ pub trait BridgeEvmBackend: Send + Sync {
 
     async fn receipt_status(&self, tx_hash: TxHash) -> Result<Option<EvmReceiptStatus>, String>;
 
-    /// Returns a transaction's own nonce alongside its sender's latest count, or
-    /// `None` when the node no longer knows the transaction.
+    /// Reports what the node still knows about a transaction with no receipt.
     ///
-    /// Together these say whether an unmined transaction was replaced. The node
-    /// may have evicted the hash entirely, in which case the question cannot be
-    /// answered and the caller has to keep waiting.
-    async fn tx_nonce_and_sender_count(&self, tx_hash: TxHash) -> Result<Option<(u64, u64)>, String>;
+    /// Says whether it mined, was replaced, or is still waiting its turn, so no
+    /// caller has to read minedness out of a missing receipt.
+    async fn tx_liveness(&self, tx_hash: TxHash) -> Result<TxLiveness, String>;
 }
 
 #[async_trait]
@@ -259,15 +257,21 @@ where
         }))
     }
 
-    async fn tx_nonce_and_sender_count(&self, tx_hash: TxHash) -> Result<Option<(u64, u64)>, String> {
+    async fn tx_liveness(&self, tx_hash: TxHash) -> Result<TxLiveness, String> {
         let Some(tx) = self
             .provider
             .get_transaction_by_hash(tx_hash)
             .await
             .map_err(|e| format!("transaction fetch failed for {tx_hash:#x}: {e}"))?
         else {
-            return Ok(None);
+            return Ok(TxLiveness::Unknown);
         };
+
+        let block_number = tx.block_number();
+        // A mined transaction needs no nonce comparison, so skip the extra call.
+        if block_number.is_some() {
+            return Ok(TxLiveness::Mined);
+        }
 
         let sender = tx.from();
         let tx_nonce = ConsensusTransaction::nonce(&tx);
@@ -279,7 +283,22 @@ where
             .await
             .map_err(|e| format!("transaction count fetch failed for {sender}: {e}"))?;
 
-        Ok(Some((tx_nonce, sender_count)))
+        let liveness = classify_liveness(block_number, tx_nonce, sender_count);
+        if !matches!(liveness, TxLiveness::Replaced { .. }) {
+            return Ok(liveness);
+        }
+
+        // The two reads above can land on different nodes, so a stale one can
+        // report the transaction unmined while a current one has already counted
+        // its nonce. Read it once more before calling its funds unspent.
+        let mined_since = self
+            .provider
+            .get_transaction_by_hash(tx_hash)
+            .await
+            .map_err(|e| format!("transaction fetch failed for {tx_hash:#x}: {e}"))?
+            .is_some_and(|tx| tx.block_number().is_some());
+
+        Ok(if mined_since { TxLiveness::Mined } else { liveness })
     }
 }
 
@@ -1099,17 +1118,18 @@ where
             .map_err(|e| format!("failed to fetch transaction receipt for bridge id '{}': {e}", bridge_id))?;
 
         let Some(receipt) = receipt else {
-            // No receipt is usually just "not mined yet", but a transaction whose
-            // nonce another hash already took will never mine, and polling it
-            // forever leaves the caller waiting on funds it still holds.
-            if let Some((tx_nonce, sender_count)) = self.evm_backend.tx_nonce_and_sender_count(tx_hash).await?
-                && is_superseded(tx_nonce, sender_count)
-            {
-                return Ok(BridgeStatus::Failed {
-                    reason: Some(superseded_reason(bridge_id, tx_nonce, sender_count)),
-                });
-            }
-            return Ok(BridgeStatus::Pending);
+            // No receipt is usually just "not mined yet". Only a transaction that
+            // is unmined and has lost its nonce to another hash can never mine;
+            // everything else keeps waiting rather than inviting a resubmit.
+            return Ok(match self.evm_backend.tx_liveness(tx_hash).await? {
+                TxLiveness::Replaced {
+                    tx_nonce,
+                    sender_next_nonce,
+                } => BridgeStatus::Failed {
+                    reason: Some(superseded_reason(bridge_id, tx_nonce, sender_next_nonce)),
+                },
+                TxLiveness::Mined | TxLiveness::Pending | TxLiveness::Unknown => BridgeStatus::Pending,
+            });
         };
 
         if receipt.success {

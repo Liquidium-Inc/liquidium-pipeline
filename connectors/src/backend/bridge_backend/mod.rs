@@ -11,7 +11,7 @@ pub use ckerc20_bridge::{
 pub use superseded::BRIDGE_TX_SUPERSEDED_PREFIX;
 pub use types::{
     BridgeBackend, BridgeDestination, BridgeDestinationKind, BridgeFeeBudget, BridgeRequest, BridgeRouteKind,
-    BridgeRouteSpec, BridgeStatus, BridgeSubmission, BridgeSweepRoute, EvmReceiptStatus, MockBridgeBackend,
+    BridgeRouteSpec, BridgeStatus, BridgeSubmission, BridgeSweepRoute, EvmReceiptStatus, MockBridgeBackend, TxLiveness,
 };
 pub use utils::{
     cketh_forward_routes, cketh_reverse_routes, resolve_cketh_forward_route_by_source,

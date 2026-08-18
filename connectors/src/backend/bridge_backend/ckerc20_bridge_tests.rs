@@ -6,7 +6,9 @@ use std::sync::Arc;
 
 use crate::backend::{
     bridge_backend::types::{RetrieveErc20Request, RetrieveEthRequest},
-    bridge_backend::{BridgeBackend, BridgeDestination, BridgeRequest},
+    bridge_backend::{
+        BRIDGE_TX_SUPERSEDED_PREFIX, BridgeBackend, BridgeDestination, BridgeRequest, BridgeStatus, TxLiveness,
+    },
     icp_backend::MockIcpBackend,
 };
 use crate::pipeline_agent::MockPipelineAgent;
@@ -1529,4 +1531,78 @@ async fn native_reverse_bridge_rejects_wrong_bridge_owner() {
 
     let err = backend.submit_bridge(request).await.expect_err("must fail");
     assert!(err.contains("does not match configured bridge owner"));
+}
+
+/// The bridge id liquidation 1625 broadcast, whose receipt was not yet served
+/// when the leg next polled it.
+const LIQ_1625_BRIDGE_TX: &str = "0xd1b8e78d0fb25ce7f97943689edcf150e108b2a1bc78d8e70bb43a65daa07595";
+
+fn status_backend(
+    mock_evm: MockBridgeEvmBackend,
+) -> CkErc20BridgeBackend<MockPipelineAgent, MockIcpBackend, MockBridgeEvmBackend> {
+    CkErc20BridgeBackend::new(
+        Arc::new(MockPipelineAgent::new()),
+        Arc::new(MockIcpBackend::new()),
+        Arc::new(mock_evm),
+        Principal::anonymous(),
+        Principal::management_canister(),
+    )
+}
+
+/// Liquidation 1625: the deposit had mined and the funds were gone, but the
+/// receipt lagged a few seconds. Reporting that as superseded made the leg drop
+/// its bridge id and stand ready to send the same money a second time.
+#[tokio::test]
+async fn a_mined_bridge_transaction_awaiting_its_receipt_is_still_pending() {
+    let mut mock_evm = MockBridgeEvmBackend::new();
+    mock_evm.expect_receipt_status().times(1).returning(|_| Ok(None));
+    mock_evm
+        .expect_tx_liveness()
+        .times(1)
+        .returning(|_| Ok(TxLiveness::Mined));
+
+    let status = status_backend(mock_evm)
+        .get_bridge_status(LIQ_1625_BRIDGE_TX)
+        .await
+        .expect("status must read");
+    assert_eq!(status, BridgeStatus::Pending);
+}
+
+#[tokio::test]
+async fn an_unmined_bridge_transaction_that_lost_its_nonce_is_reported_superseded() {
+    let mut mock_evm = MockBridgeEvmBackend::new();
+    mock_evm.expect_receipt_status().times(1).returning(|_| Ok(None));
+    mock_evm.expect_tx_liveness().times(1).returning(|_| {
+        Ok(TxLiveness::Replaced {
+            tx_nonce: 87,
+            sender_next_nonce: 88,
+        })
+    });
+
+    let status = status_backend(mock_evm)
+        .get_bridge_status(LIQ_1625_BRIDGE_TX)
+        .await
+        .expect("status must read");
+    let BridgeStatus::Failed { reason } = status else {
+        panic!("a replaced transaction must fail so the caller resubmits: {status:?}");
+    };
+    assert!(reason.expect("reason").starts_with(BRIDGE_TX_SUPERSEDED_PREFIX));
+}
+
+/// A node that has forgotten the hash knows nothing about the funds, so the leg
+/// keeps waiting rather than treating silence as permission to resend.
+#[tokio::test]
+async fn a_bridge_transaction_the_node_no_longer_knows_is_still_pending() {
+    let mut mock_evm = MockBridgeEvmBackend::new();
+    mock_evm.expect_receipt_status().times(1).returning(|_| Ok(None));
+    mock_evm
+        .expect_tx_liveness()
+        .times(1)
+        .returning(|_| Ok(TxLiveness::Unknown));
+
+    let status = status_backend(mock_evm)
+        .get_bridge_status(LIQ_1625_BRIDGE_TX)
+        .await
+        .expect("status must read");
+    assert_eq!(status, BridgeStatus::Pending);
 }

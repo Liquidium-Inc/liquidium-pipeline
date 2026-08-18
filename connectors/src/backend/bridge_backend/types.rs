@@ -172,6 +172,22 @@ pub struct EvmReceiptStatus {
     pub block_number: Option<u64>,
 }
 
+/// What a node can still say about a transaction that has no receipt yet.
+///
+/// A missing receipt is not proof that a transaction is unmined, so minedness is
+/// reported in its own right rather than inferred from the receipt's absence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TxLiveness {
+    /// Mined; the receipt has simply not caught up yet.
+    Mined,
+    /// Unmined, and another hash has taken its nonce, so it can never mine.
+    Replaced { tx_nonce: u64, sender_next_nonce: u64 },
+    /// Unmined and still holding its nonce.
+    Pending,
+    /// The node no longer knows the hash, so nothing can be concluded.
+    Unknown,
+}
+
 #[derive(CandidType, Deserialize, Clone, Debug)]
 pub(super) struct CkEthMinterInfo {
     #[serde(default)]
