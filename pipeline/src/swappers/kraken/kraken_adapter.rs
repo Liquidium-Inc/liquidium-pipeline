@@ -5,9 +5,9 @@ use std::{
 
 use async_trait::async_trait;
 use liquidium_pipeline_connectors::backend::cex_backend::{
-    BuyOrderInputMode, CEX_PENDING_SETTLEMENT_PREFIX, CexBackend, CexSubmissionError, DepositAddress,
-    FundingRoutePreflight, OrderBook, OrderBookLevel, SwapExecutionOptions, SwapFillReport, WithdrawStatus,
-    WithdrawStatusSnapshot, WithdrawalReceipt,
+    BuyOrderInputMode, CEX_PENDING_SETTLEMENT_PREFIX, CEX_VENUE_UNREACHABLE_PREFIX, CexBackend, CexSubmissionError,
+    DepositAddress, FundingRoutePreflight, OrderBook, OrderBookLevel, SwapExecutionOptions, SwapFillReport,
+    WithdrawStatus, WithdrawStatusSnapshot, WithdrawalReceipt, is_cex_venue_unreachable_error,
 };
 use log::info;
 use rust_decimal::{
@@ -182,7 +182,9 @@ impl KrakenClient {
 #[async_trait]
 impl CexBackend for KrakenClient {
     fn classify_submission_error(&self, error: &str) -> CexSubmissionError {
-        if error.starts_with(KRAKEN_AMBIGUOUS_PREFIX) {
+        if is_cex_venue_unreachable_error(error) {
+            CexSubmissionError::Unreachable(error.to_string())
+        } else if error.starts_with(KRAKEN_AMBIGUOUS_PREFIX) {
             CexSubmissionError::Ambiguous(error.to_string())
         } else if error.starts_with(CEX_PENDING_SETTLEMENT_PREFIX) {
             CexSubmissionError::PendingSettlement(error.to_string())
@@ -828,13 +830,23 @@ fn ensure_positive(value: f64) -> Result<(), String> {
     }
 }
 fn api_read_error(error: KrakenApiError) -> String {
-    error.to_string()
+    match error {
+        KrakenApiError::Unreachable(message) => format!("{CEX_VENUE_UNREACHABLE_PREFIX}{message}"),
+        other => other.to_string(),
+    }
 }
+/// An unreachable venue leaves the accepted order exactly as it was, so the
+/// read is simply retried rather than handed to an operator.
 fn api_reconciliation_error(error: KrakenApiError) -> String {
-    format!("{KRAKEN_AMBIGUOUS_PREFIX}could not reconcile accepted order: {error}")
+    match error {
+        KrakenApiError::Unreachable(message) => format!("{CEX_VENUE_UNREACHABLE_PREFIX}{message}"),
+        other => format!("{KRAKEN_AMBIGUOUS_PREFIX}could not reconcile accepted order: {other}"),
+    }
 }
 fn api_submit_error(error: KrakenApiError) -> String {
     match error {
+        // Nothing was submitted, so this is not the ambiguity `Transport` is.
+        KrakenApiError::Unreachable(message) => format!("{CEX_VENUE_UNREACHABLE_PREFIX}{message}"),
         KrakenApiError::Ambiguous(message) | KrakenApiError::Transport(message) => {
             format!("{KRAKEN_AMBIGUOUS_PREFIX}{message}")
         }
@@ -1234,6 +1246,34 @@ mod tests {
 
         assert!(matches!(
             client.classify_submission_error(&error),
+            CexSubmissionError::Ambiguous(_)
+        ));
+    }
+
+    /// A request that never reached Kraken submitted nothing, so it must not be
+    /// parked alongside the submissions whose outcome is genuinely unknown.
+    #[test]
+    fn an_unreachable_kraken_is_not_an_ambiguous_submission() {
+        let client = KrakenClient::with_api(Arc::new(MockKrakenApi::new()), vec![]);
+
+        for rendered in [
+            api_submit_error(KrakenApiError::Unreachable("dns error".into())),
+            api_read_error(KrakenApiError::Unreachable("dns error".into())),
+            api_reconciliation_error(KrakenApiError::Unreachable("dns error".into())),
+        ] {
+            assert!(
+                matches!(
+                    client.classify_submission_error(&rendered),
+                    CexSubmissionError::Unreachable(_)
+                ),
+                "{rendered}"
+            );
+        }
+
+        // A transport failure that may have arrived keeps its ambiguity.
+        let timed_out = api_submit_error(KrakenApiError::Transport("operation timed out".into()));
+        assert!(matches!(
+            client.classify_submission_error(&timed_out),
             CexSubmissionError::Ambiguous(_)
         ));
     }

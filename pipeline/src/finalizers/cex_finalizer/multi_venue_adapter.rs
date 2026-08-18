@@ -1,6 +1,8 @@
 use async_trait::async_trait;
 use liquidium_pipeline_connectors::backend::bridge_backend::FINALIZER_PERMANENT_AMOUNT_FLOOR_PREFIX;
-use liquidium_pipeline_connectors::backend::cex_backend::{CexBackend, CexSubmissionError};
+use liquidium_pipeline_connectors::backend::cex_backend::{
+    CexBackend, CexSubmissionError, is_cex_venue_unreachable_error,
+};
 use log::{info, warn};
 use serde::{Deserialize, Serialize};
 
@@ -242,11 +244,21 @@ where
                             // prefix, which any decoration would hide.
                             self.backend.classify_submission_error(message)
                         }
+                        // Unreachability is not venue-specific, so it is read
+                        // back for every profile: the marker is only ever
+                        // written by our own adapters, at the one place the
+                        // transport error is still typed.
+                        CexSubmissionError::Rejected(message) if is_cex_venue_unreachable_error(message) => {
+                            CexSubmissionError::Unreachable(message.clone())
+                        }
                         _ => failure.clone(),
                     };
                     match classified {
                         CexSubmissionError::PendingSettlement(message) => {
                             return self.settlement_wait_progress(execution, message).await;
+                        }
+                        CexSubmissionError::Unreachable(message) => {
+                            return self.unreachable_venue_progress(execution, message);
                         }
                         CexSubmissionError::Ambiguous(message) => {
                             return self.operator_required_progress(execution, message);
@@ -264,6 +276,34 @@ where
             }
         };
         self.progress_for(execution, error)
+    }
+
+    /// Holds a leg whose venue could not be reached at all.
+    ///
+    /// The request never arrived, so the leg stays `Running` with no retryable
+    /// error and the next cycle tries again without spending the retry budget.
+    /// No deadline: waiting out an outage is cheaper than parking a row that
+    /// only a human could then unpark.
+    fn unreachable_venue_progress(
+        &self,
+        mut execution: CexVenueExecutionState,
+        error: String,
+    ) -> Result<VenueLegProgress, String> {
+        warn!(
+            "[{}] liq_id={} venue unreachable at step={:?}; retrying without spending the retry budget: {}",
+            self.profile.venue_id(),
+            execution.cex.liq_id,
+            execution.cex.step,
+            error
+        );
+        execution.cex.last_error = Some(error.clone());
+        Ok(VenueLegProgress {
+            execution: VenueExecutionState::new(self.profile.venue_id(), &execution)?,
+            status: VenueLegStatus::Running,
+            result: None,
+            last_error: Some(error),
+            retryable_error: None,
+        })
     }
 
     /// Holds a leg whose funds the venue reports as not tradable yet.

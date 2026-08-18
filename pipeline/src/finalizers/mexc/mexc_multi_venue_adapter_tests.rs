@@ -3,7 +3,7 @@ use std::{collections::HashMap, sync::Arc};
 use candid::{Nat, Principal};
 use liquidium_pipeline_connectors::backend::bridge_backend::FINALIZER_PERMANENT_AMOUNT_FLOOR_PREFIX;
 use liquidium_pipeline_connectors::backend::cex_backend::{
-    CexSubmissionError, MockCexBackend, OrderBook, OrderBookLevel, SwapFillReport,
+    CEX_VENUE_UNREACHABLE_PREFIX, CexSubmissionError, MockCexBackend, OrderBook, OrderBookLevel, SwapFillReport,
 };
 use liquidium_pipeline_core::{
     tokens::{chain_token::ChainToken, chain_token_amount::ChainTokenAmount, token_registry::TokenRegistry},
@@ -788,6 +788,36 @@ async fn venue_settlement_rejection_waits_instead_of_spending_the_retry_budget()
     assert_eq!(execution.cex.step, CexStep::TradePending);
     assert!(!execution.operator_required);
     assert!(execution.cex.trade.trade_settlement_waiting_since_ts.is_some());
+}
+
+#[tokio::test]
+async fn an_unreachable_venue_retries_without_spending_the_retry_budget() {
+    // What the MEXC backend renders when the request never left the host. The
+    // marker is read back for every venue, so MEXC needs no classifier of its own.
+    let message = format!(
+        "{CEX_VENUE_UNREACHABLE_PREFIX}Reqwest error: error sending request: error trying to connect: dns error"
+    );
+    let finalizer = finalizer_with_trade_result(Err(CexSubmissionError::Rejected(message.clone())), 0);
+    let leg = leg_at_trade_step(&finalizer, None).await;
+
+    let waiting = MultiVenueAdapter::advance(&finalizer, &leg, &NoopCheckpoint)
+        .await
+        .expect("an unreachable venue should produce durable waiting progress");
+
+    assert_eq!(waiting.status, VenueLegStatus::Running);
+    // The decisive assertion: a request that never arrived must not be charged
+    // to the retry budget, which is what parked liquidation 1625.
+    assert_eq!(waiting.retryable_error, None);
+    assert_eq!(waiting.last_error.as_deref(), Some(message.as_str()));
+
+    let execution = waiting
+        .execution
+        .decode::<MexcVenueExecutionState>(VENUE_ID)
+        .expect("decode waiting state")
+        .expect("MEXC state");
+    assert!(!execution.operator_required);
+    // Unreachability says nothing about settlement, so no wait is started.
+    assert_eq!(execution.cex.trade.trade_settlement_waiting_since_ts, None);
 }
 
 #[tokio::test]

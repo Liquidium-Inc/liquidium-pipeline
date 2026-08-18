@@ -4,8 +4,8 @@ use std::env;
 use async_trait::async_trait;
 
 use liquidium_pipeline_connectors::backend::cex_backend::{
-    BuyOrderInputMode, CexBackend, CexSubmissionError, DepositAddress, OrderBook, OrderBookLevel, SwapExecutionOptions,
-    SwapFillReport, WithdrawStatus, WithdrawStatusSnapshot, WithdrawalReceipt,
+    BuyOrderInputMode, CEX_VENUE_UNREACHABLE_PREFIX, CexBackend, CexSubmissionError, DepositAddress, OrderBook,
+    OrderBookLevel, SwapExecutionOptions, SwapFillReport, WithdrawStatus, WithdrawStatusSnapshot, WithdrawalReceipt,
 };
 use log::{debug, info, warn};
 use rust_decimal::{Decimal, RoundingStrategy};
@@ -84,8 +84,35 @@ fn normalize_market_symbol(market: &str) -> String {
     market.replace(['/', '_', '-'], "").to_ascii_uppercase()
 }
 
+/// Whether the request behind this error never reached MEXC.
+///
+/// Only a failure to connect qualifies. A timeout is excluded: the request may
+/// have arrived and been acted on, so it is ambiguous rather than absent.
+fn is_unreachable_mexc_error(err: &v3::ApiError) -> bool {
+    matches!(err, v3::ApiError::ReqwestError(inner) if inner.is_connect())
+}
+
+/// Renders a MEXC client error, marking one that never reached the exchange so
+/// the decision survives the `Result<_, String>` boundary in `CexBackend`.
+fn mexc_error_message(err: &v3::ApiError) -> String {
+    if is_unreachable_mexc_error(err) {
+        format!("{CEX_VENUE_UNREACHABLE_PREFIX}{err}")
+    } else {
+        err.to_string()
+    }
+}
+
+/// The same marking for the calls this adapter makes outside the MEXC client.
+fn http_error_message(err: &reqwest::Error) -> String {
+    if err.is_connect() {
+        format!("{CEX_VENUE_UNREACHABLE_PREFIX}{err}")
+    } else {
+        err.to_string()
+    }
+}
+
 fn format_mexc_api_error(err: &v3::ApiError) -> String {
-    match err {
+    let rendered = match err {
         v3::ApiError::ErrorResponse(resp) => match &resp._extend {
             Some(extra) => format!("code={:?} msg={} extend={}", resp.code, resp.msg, extra),
             None => format!("code={:?} msg={}", resp.code, resp.msg),
@@ -95,6 +122,11 @@ fn format_mexc_api_error(err: &v3::ApiError) -> String {
             None => format!("err={}", err),
         },
         other => other.to_string(),
+    };
+    if is_unreachable_mexc_error(err) {
+        format!("{CEX_VENUE_UNREACHABLE_PREFIX}{rendered}")
+    } else {
+        rendered
     }
 }
 
@@ -358,9 +390,9 @@ impl MexcClient {
     async fn fetch_symbol_info(&self, symbol: &str) -> Result<Option<(Value, String)>, String> {
         let mut direct_error = None;
         let url = format!("https://api.mexc.com/api/v3/exchangeInfo?symbol={}", symbol);
-        let resp = self.http.get(url).send().await.map_err(|e| e.to_string())?;
+        let resp = self.http.get(url).send().await.map_err(|e| http_error_message(&e))?;
         if resp.status().is_success() {
-            let payload: Value = resp.json().await.map_err(|e| e.to_string())?;
+            let payload: Value = resp.json().await.map_err(|e| http_error_message(&e))?;
             if let Some(info) = payload
                 .get("symbols")
                 .and_then(|v| v.as_array())
@@ -389,14 +421,14 @@ impl MexcClient {
             .get("https://api.mexc.com/api/v3/exchangeInfo")
             .send()
             .await
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| http_error_message(&e))?;
         if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
             return Err(format!("mexc exchangeInfo status={} body={}", status, body));
         }
 
-        let payload: Value = resp.json().await.map_err(|e| e.to_string())?;
+        let payload: Value = resp.json().await.map_err(|e| http_error_message(&e))?;
         let target = normalize_market_symbol(symbol);
         let info = payload
             .get("symbols")
@@ -513,7 +545,7 @@ impl MexcClient {
                 symbol: api_symbol,
             })
             .await
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| mexc_error_message(&e))?;
 
         if orderbook_depth.asks.is_empty() {
             return Err("no asks".into());
@@ -1000,7 +1032,7 @@ impl CexBackend for MexcClient {
                 symbol: &symbol,
             })
             .await
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| mexc_error_message(&e))?;
 
         // asks: Vec<Vec<f64>> = [ [price, qty], ... ]
         let asks = &ob.asks;
@@ -1183,7 +1215,7 @@ impl CexBackend for MexcClient {
         let ob = ex
             .depth(DepthParams { limit, symbol: &symbol })
             .await
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| mexc_error_message(&e))?;
 
         let bids = ob
             .bids
@@ -1273,7 +1305,7 @@ impl CexBackend for MexcClient {
     async fn get_balance(&self, asset: &str) -> Result<f64, String> {
         let ex = self.inner.lock().await;
 
-        let res = ex.account_information().await.map_err(|e| e.to_string())?;
+        let res = ex.account_information().await.map_err(|e| mexc_error_message(&e))?;
 
         let asset_norm = asset.to_ascii_uppercase();
         let balance = match res
@@ -1415,7 +1447,7 @@ impl CexBackend for MexcClient {
                 end_time: None,
             })
             .await
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| mexc_error_message(&e))?;
 
         let rec = records
             .into_iter()
@@ -1473,6 +1505,7 @@ impl CexBackend for MexcClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use liquidium_pipeline_connectors::backend::cex_backend::is_cex_venue_unreachable_error;
 
     // Buy fill mapping should keep quote as input-consumed and apply fee haircut to base output.
     #[test]
@@ -1529,6 +1562,17 @@ mod tests {
     /// The live ICP_USDT shape: `baseSizePrecision` 0.0001 against
     /// `baseAssetPrecision` 2. Treating that minimum as a step rounded to four
     /// decimals, which MEXC rejected as "quantity scale is invalid".
+    /// Only a failure to connect is marked. A venue-side failure has an answer
+    /// in it, so it must keep spending the retry budget.
+    #[test]
+    fn a_venue_side_failure_is_not_marked_unreachable() {
+        for err in [v3::ApiError::InternalServerError, v3::ApiError::RateLimitExceeded] {
+            assert!(!is_unreachable_mexc_error(&err));
+            assert!(!is_cex_venue_unreachable_error(&mexc_error_message(&err)));
+            assert!(!is_cex_venue_unreachable_error(&format_mexc_api_error(&err)));
+        }
+    }
+
     #[test]
     fn a_minimum_order_size_finer_than_the_venue_precision_does_not_set_the_scale() {
         let info = serde_json::json!({

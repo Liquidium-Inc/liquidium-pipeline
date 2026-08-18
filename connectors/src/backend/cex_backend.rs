@@ -3,11 +3,17 @@ use thiserror::Error;
 
 pub const CEX_PENDING_SETTLEMENT_PREFIX: &str = "cex pending settlement: ";
 
+/// Marker a backend renders into a message whose request never left the host.
+/// Only the backend can tell that apart from a venue's answer, so it decides
+/// once and the marker carries the decision across the `Result<_, String>`
+/// boundaries in this trait.
+pub const CEX_VENUE_UNREACHABLE_PREFIX: &str = "cex venue unreachable: ";
+
 /// Classification for calls that may have moved money before returning.
 ///
-/// `Ambiguous` is the reason this stays a three-variant enum: a submission whose
-/// outcome the venue will not confirm cannot be retried like a rejection without
-/// risking a second order against the same funds.
+/// `Ambiguous` is the reason this is an enum at all: a submission whose outcome
+/// the venue will not confirm cannot be retried like a rejection without risking
+/// a second order against the same funds.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum CexSubmissionError {
     /// Rendered verbatim. Callers still match sentinel prefixes against this
@@ -22,6 +28,11 @@ pub enum CexSubmissionError {
     PendingSettlement(String),
     #[error("submission outcome is ambiguous: {0}")]
     Ambiguous(String),
+    /// The request never reached the venue, so there is no outcome to judge.
+    /// Rendered with the shared marker for the same round trip as
+    /// `PendingSettlement`.
+    #[error("{CEX_VENUE_UNREACHABLE_PREFIX}{0}")]
+    Unreachable(String),
 }
 
 /// An unclassified backend message is a plain rejection: the two states that
@@ -44,8 +55,20 @@ pub fn is_cex_pending_settlement_error(message: &str) -> bool {
     message.starts_with(CEX_PENDING_SETTLEMENT_PREFIX)
 }
 
+/// Reports whether a backend marked this message as never having been sent.
+///
+/// Matched anywhere in the message rather than at the front: backends wrap a
+/// rendered error in their own context (`Get_order err: ...`), and the marker
+/// has to survive that. It is our own constant either way, so rewording the
+/// human part of a message still cannot change the decision.
+pub fn is_cex_venue_unreachable_error(message: &str) -> bool {
+    message.contains(CEX_VENUE_UNREACHABLE_PREFIX)
+}
+
 pub fn classify_cex_submission_error(message: &str) -> CexSubmissionError {
-    if is_cex_pending_settlement_error(message) {
+    if is_cex_venue_unreachable_error(message) {
+        CexSubmissionError::Unreachable(message.to_string())
+    } else if is_cex_pending_settlement_error(message) {
         CexSubmissionError::PendingSettlement(message.to_string())
     } else {
         CexSubmissionError::Rejected(message.to_string())
@@ -251,5 +274,38 @@ mod tests {
             CexSubmissionError::Rejected("order rejected".to_string()).to_string(),
             "order rejected"
         );
+    }
+
+    #[test]
+    fn an_unreachable_marker_survives_the_round_trip_through_a_message() {
+        let rendered = CexSubmissionError::Unreachable("dns lookup failed".to_string()).to_string();
+        assert_eq!(
+            classify_cex_submission_error(&rendered),
+            CexSubmissionError::Unreachable(rendered)
+        );
+    }
+
+    #[test]
+    fn the_marker_is_found_inside_a_backends_own_wrapping() {
+        let wrapped = format!("Get_order err: {CEX_VENUE_UNREACHABLE_PREFIX}connection refused");
+        assert!(matches!(
+            classify_cex_submission_error(&wrapped),
+            CexSubmissionError::Unreachable(_)
+        ));
+    }
+
+    /// A venue's own answer must never be read as absence of a request.
+    #[test]
+    fn a_venue_answer_stays_a_rejection() {
+        for message in [
+            "EAccount:Invalid permissions:USDT trading restricted for RO.",
+            "Reqwest error: operation timed out",
+            "quantity 0.0001 below min_qty 0.2 for CKUSDT_USDT",
+        ] {
+            assert!(matches!(
+                classify_cex_submission_error(message),
+                CexSubmissionError::Rejected(_)
+            ));
+        }
     }
 }

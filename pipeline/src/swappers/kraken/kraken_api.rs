@@ -6,8 +6,8 @@ use std::{
 use async_trait::async_trait;
 use kraken_async_rs::{
     clients::{
-        core_kraken_client::CoreKrakenClient, http_response_types::ResultErrorResponse, kraken_client::KrakenClient,
-        rate_limited_kraken_client::RateLimitedKrakenClient,
+        core_kraken_client::CoreKrakenClient, errors::ClientError, http_response_types::ResultErrorResponse,
+        kraken_client::KrakenClient, rate_limited_kraken_client::RateLimitedKrakenClient,
     },
     crypto::nonce_provider::{IncreasingNonceProvider, NonceProvider},
     request_types::{
@@ -108,6 +108,21 @@ pub enum KrakenApiError {
     Transport(String),
     #[error("Kraken submission outcome is ambiguous: {0}")]
     Ambiguous(String),
+    /// The request never reached Kraken, so nothing was submitted or read.
+    #[error("Kraken was not reachable: {0}")]
+    Unreachable(String),
+}
+
+/// Maps a client error, separating a request that never left the host from one
+/// that may have reached Kraken.
+///
+/// Only a failure to connect qualifies. Anything else -- a timeout, a broken
+/// response -- may have been acted on, so it stays [`KrakenApiError::Transport`].
+fn transport_error(error: ClientError) -> KrakenApiError {
+    match &error {
+        ClientError::HyperClient(inner) if inner.is_connect() => KrakenApiError::Unreachable(error.to_string()),
+        _ => KrakenApiError::Transport(error.to_string()),
+    }
 }
 
 #[mockall::automock]
@@ -239,7 +254,7 @@ impl KrakenApi for KrakenRestApi {
             .await
             .get_tradable_asset_pairs(&request)
             .await
-            .map_err(|error| KrakenApiError::Transport(error.to_string()))?;
+            .map_err(transport_error)?;
         let pairs = take_result(response)?;
         Ok(pairs
             .into_iter()
@@ -270,7 +285,7 @@ impl KrakenApi for KrakenRestApi {
             .await
             .get_orderbook(&request)
             .await
-            .map_err(|error| KrakenApiError::Transport(error.to_string()))?;
+            .map_err(transport_error)?;
         let mut books = take_result(response)?;
         let book = books
             .remove(pair)
@@ -303,7 +318,7 @@ impl KrakenApi for KrakenRestApi {
             .await
             .get_account_balance()
             .await
-            .map_err(|error| KrakenApiError::Transport(error.to_string()))?;
+            .map_err(transport_error)?;
         let balances = take_result(response)?;
         Ok(balances
             .iter()
@@ -320,7 +335,7 @@ impl KrakenApi for KrakenRestApi {
             .await
             .get_deposit_methods(&request)
             .await
-            .map_err(|error| KrakenApiError::Transport(error.to_string()))?;
+            .map_err(transport_error)?;
         Ok(take_result(response)?
             .into_iter()
             .map(|method| KrakenFundingMethod {
@@ -341,7 +356,7 @@ impl KrakenApi for KrakenRestApi {
             .await
             .get_deposit_addresses(&request)
             .await
-            .map_err(|error| KrakenApiError::Transport(error.to_string()))?;
+            .map_err(transport_error)?;
         Ok(take_result(response)?
             .into_iter()
             .map(|address| KrakenDepositAddress {
@@ -359,7 +374,7 @@ impl KrakenApi for KrakenRestApi {
             .await
             .get_withdrawal_methods(&request)
             .await
-            .map_err(|error| KrakenApiError::Transport(error.to_string()))?;
+            .map_err(transport_error)?;
         Ok(take_result(response)?
             .into_iter()
             .map(|method| KrakenFundingMethod {
@@ -381,7 +396,7 @@ impl KrakenApi for KrakenRestApi {
             .await
             .get_withdrawal_addresses(&request)
             .await
-            .map_err(|error| KrakenApiError::Transport(error.to_string()))?;
+            .map_err(transport_error)?;
         Ok(take_result(response)?
             .into_iter()
             .map(|address| KrakenWithdrawalAddress {
@@ -433,7 +448,7 @@ impl KrakenApi for KrakenRestApi {
             .await
             .query_orders_info(&request)
             .await
-            .map_err(|error| KrakenApiError::Transport(error.to_string()))?;
+            .map_err(transport_error)?;
         let mut orders = take_result(response)?;
         let order = orders
             .remove(order_id)
@@ -452,7 +467,7 @@ impl KrakenApi for KrakenRestApi {
             .await
             .get_closed_orders(&request)
             .await
-            .map_err(|error| KrakenApiError::Transport(error.to_string()))?;
+            .map_err(transport_error)?;
         let closed = take_result(response)?;
         // Kraken filters server-side, but the client id is re-checked here so a
         // filter the venue ignored cannot make us adopt an unrelated fill.
@@ -488,7 +503,7 @@ impl KrakenApi for KrakenRestApi {
             .await
             .get_status_of_recent_withdrawals(&request)
             .await
-            .map_err(|error| KrakenApiError::Transport(error.to_string()))?;
+            .map_err(transport_error)?;
         Ok(take_result(response)?
             .into_iter()
             .map(|withdrawal| KrakenWithdrawal {
