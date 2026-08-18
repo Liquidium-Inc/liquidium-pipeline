@@ -25,6 +25,18 @@ use liquidium_pipeline_connectors::pipeline_agent::PipelineAgent;
 use liquidium_pipeline_core::types::protocol_types::{LiquidationResult, ProtocolError, TransferStatus};
 
 pub(crate) const MAX_FINALIZER_ERRORS: i32 = 5;
+
+/// How many times one liquidation may be worked before an operator has to look
+/// at it, however far apart the failures fall.
+///
+/// `MAX_FINALIZER_ERRORS` counts strikes that reset once a row gets moving
+/// again, so it catches a row failing in a burst but never one that fails slowly
+/// forever: liquidation 1630 alternated a failing poll with a clean cycle for
+/// eight minutes and cleared its strikes each time round. `attempt` never
+/// resets, so it bounds the row's whole life. Set well above the strike budget
+/// because reaching it is not about one bad patch: with backoff capped at two
+/// minutes, twenty failures is the better part of an hour of getting nowhere.
+pub(crate) const MAX_FINALIZER_ATTEMPTS: i32 = 20;
 /// Maximum safe left-shift for `u64` multipliers in retry backoff.
 const MAX_U64_SHIFT: u32 = 63;
 
@@ -227,6 +239,8 @@ where
         let mut updated_at_by_liq: HashMap<u128, i64> = HashMap::new();
         let mut status_by_liq: HashMap<u128, ResultStatus> = HashMap::new();
         let mut error_count_by_liq: HashMap<u128, i32> = HashMap::new();
+        let mut attempt_by_liq: HashMap<u128, i32> = HashMap::new();
+        let mut last_error_by_liq: HashMap<u128, Option<String>> = HashMap::new();
         let mut receipts: Vec<ExecutionReceipt> = vec![];
 
         for row in rows {
@@ -253,6 +267,8 @@ where
             updated_at_by_liq.insert(liq_id, row.updated_at);
             status_by_liq.insert(liq_id, row.status);
             error_count_by_liq.insert(liq_id, row.error_count);
+            attempt_by_liq.insert(liq_id, row.attempt);
+            last_error_by_liq.insert(liq_id, row.last_error.clone());
 
             receipts.push(receipt);
         }
@@ -331,6 +347,31 @@ where
                     },
                     receipt,
                 ));
+                continue;
+            }
+
+            // A row worked this many times is not going to finish on its own, and
+            // its strike count cannot say so: strikes reset whenever the row is
+            // released back to the queue, which a bridged leg does on every other
+            // cycle. Parking keeps a stuck row visible instead of leaving it to
+            // log the same failure indefinitely, and its funds may still be held
+            // at a venue, so it goes to an operator rather than failing outright.
+            if attempt_by_liq.get(&liq_id).copied().unwrap_or(0) >= MAX_FINALIZER_ATTEMPTS {
+                let wal_id = wal_id_by_liq
+                    .get(&liq_id)
+                    .ok_or_else(|| format!("missing WAL id for liquidation {}", liq_id))?;
+                let err_msg = format!(
+                    "liquidation was worked {MAX_FINALIZER_ATTEMPTS} times without finishing; last error: {}",
+                    last_error_by_liq
+                        .get(&liq_id)
+                        .and_then(|error| error.as_deref())
+                        .unwrap_or("none recorded")
+                );
+                if let Err(error) = wal_mark_operator_required_with_error(&*self.wal, wal_id, err_msg.clone()).await {
+                    warn!("Failed to park attempt-exhausted WAL row {}: {}", wal_id, error);
+                }
+                error!("[finalize] 🅿️ attempt budget exhausted; parked for operator liq_id={liq_id} err={err_msg}");
+                self.escalate_custody_park(&receipt, liq_id, &err_msg).await;
                 continue;
             }
 
@@ -1369,6 +1410,131 @@ mod tests {
         // then
         assert!(outcomes.is_empty(), "backoff-gated rows should not finalize");
         assert_eq!(*finalize_calls.lock().expect("calls lock"), 0);
+    }
+
+    /// Given: A row has been worked up to the lifetime attempt budget without
+    ///        finishing, its strikes cleared by the releases in between.
+    /// When:  Finalize stage processes pending rows.
+    /// Then:  It is parked for an operator rather than worked again. Liquidation
+    ///        1630 looped for eight minutes because nothing bounded a row whose
+    ///        strike count kept resetting.
+    #[tokio::test]
+    async fn finalize_parks_a_row_that_exhausts_its_lifetime_attempt_budget() {
+        const LIQUIDATION_ID: u128 = 91;
+        const WAL_BATCH_LIMIT: usize = 100;
+
+        let liq_id = LIQUIDATION_ID;
+        let mut request = make_request();
+        request.swap_args = Some(make_swap_request(&request));
+        let receipt = ExecutionReceipt {
+            request,
+            liquidation_result: Some(make_liq_result(liq_id, TransferStatus::Success, 0)),
+            status: ExecutionStatus::Success,
+            change_received: true,
+        };
+        let mut row = make_row(liq_id, receipt);
+        // The shape 1630 was in: released back to the queue, no strikes recorded,
+        // and a long history of getting nowhere.
+        row.status = ResultStatus::Enqueued;
+        row.error_count = 0;
+        row.attempt = MAX_FINALIZER_ATTEMPTS;
+        row.last_error = None;
+
+        let mut wal = MockWalStore::new();
+        wal.expect_get_pending()
+            .with(eq(WAL_BATCH_LIMIT))
+            .times(1)
+            .returning(move |_| Ok(vec![row.clone()]));
+        wal.expect_update_failure()
+            .withf(move |_, next, _, _| *next == ResultStatus::OperatorRequired)
+            .times(1)
+            .returning(|_, _, _, _| Ok(()));
+        wal.expect_update_status().times(0);
+        wal.expect_upsert_result().times(0);
+
+        let finalize_calls = Arc::new(Mutex::new(0usize));
+        let finalizer = NoopFinalizer {
+            calls: finalize_calls.clone(),
+        };
+
+        let stage = FinalizeStage::new(
+            Arc::new(wal),
+            Arc::new(finalizer),
+            Arc::new(SimpleProfitCalculator),
+            Arc::new(MockPipelineAgent::new()),
+            Principal::anonymous(),
+            5,
+            120,
+        );
+
+        let outcomes = stage.process(&()).await.expect("process should succeed");
+
+        assert!(outcomes.is_empty(), "a parked row produces no outcome");
+        assert_eq!(
+            *finalize_calls.lock().expect("calls lock"),
+            0,
+            "an exhausted row must not be worked again"
+        );
+    }
+
+    /// Given: A row that has been polled for a long time without ever failing,
+    ///        which is what a leg waiting on a bridge looks like.
+    /// When:  Finalize stage processes pending rows.
+    /// Then:  It runs normally. The cap counts work done, not time waited, so
+    ///        patience alone must never park a healthy liquidation.
+    #[tokio::test]
+    async fn finalize_does_not_park_a_long_running_row_that_has_not_failed() {
+        const LIQUIDATION_ID: u128 = 92;
+        const WAL_BATCH_LIMIT: usize = 100;
+
+        let liq_id = LIQUIDATION_ID;
+        let mut request = make_request();
+        request.swap_args = Some(make_swap_request(&request));
+        let receipt = ExecutionReceipt {
+            request,
+            liquidation_result: Some(make_liq_result(liq_id, TransferStatus::Success, 0)),
+            status: ExecutionStatus::Success,
+            change_received: true,
+        };
+        let mut row = make_row(liq_id, receipt);
+        row.status = ResultStatus::Enqueued;
+        row.error_count = 0;
+        // One attempt from the settlement hand-off, and nothing since: waiting is
+        // not working, so the budget has barely been touched.
+        row.attempt = 1;
+
+        let mut wal = MockWalStore::new();
+        wal.expect_get_pending()
+            .with(eq(WAL_BATCH_LIMIT))
+            .times(1)
+            .returning(move |_| Ok(vec![row.clone()]));
+        wal.expect_update_status().returning(|_, _, _| Ok(()));
+        wal.expect_update_failure().returning(|_, _, _, _| Ok(()));
+        wal.expect_upsert_result().returning(|_| Ok(()));
+        wal.expect_get_result().returning(|_| Ok(None));
+
+        let finalize_calls = Arc::new(Mutex::new(0usize));
+        let finalizer = NoopFinalizer {
+            calls: finalize_calls.clone(),
+        };
+
+        let stage = FinalizeStage::new(
+            Arc::new(wal),
+            Arc::new(finalizer),
+            Arc::new(SimpleProfitCalculator),
+            Arc::new(MockPipelineAgent::new()),
+            Principal::anonymous(),
+            5,
+            120,
+        );
+
+        stage.process(&()).await.expect("process should succeed");
+
+        assert_eq!(
+            *finalize_calls.lock().expect("calls lock"),
+            1,
+            "a row that has not failed must still be worked"
+        );
     }
 
     /// Given: A retryable row is already due under exponential backoff.
