@@ -482,13 +482,15 @@ impl MexcClient {
             .min_notional
             .or_else(|| parse_decimal(info, "quoteAmountPrecision"))
             .filter(|value| !value.is_zero());
-        // MEXC states this one value as both the base-side granularity and the
-        // smallest quantity it will accept.
-        filters.step_size = filters
-            .step_size
+        // `baseSizePrecision` is the smallest order MEXC accepts, not a step
+        // size. Rounding to it can exceed the venue's own quantity precision
+        // (ICP_USDT: 0.0001 minimum, `baseAssetPrecision` 2), which MEXC rejects
+        // as "quantity scale is invalid". Decimal places come from
+        // `baseAssetPrecision`; a real `LOT_SIZE` filter still wins.
+        filters.min_qty = filters
+            .min_qty
             .or_else(|| parse_decimal(info, "baseSizePrecision"))
             .filter(|value| !value.is_zero());
-        filters.min_qty = filters.min_qty.or(filters.step_size);
 
         filters.quote_precision = parse_u32(info, "quotePrecision")
             .or_else(|| parse_u32(info, "quoteAssetPrecision"))
@@ -1518,8 +1520,53 @@ mod tests {
         let filters = MexcClient::symbol_filters_from_info(&info);
 
         assert_eq!(filters.min_notional, Decimal::from_str_exact("1").ok());
-        assert_eq!(filters.step_size, Decimal::from_str_exact("0.000001").ok());
+        // A minimum order size, not a step: MEXC sent no LOT_SIZE filter.
         assert_eq!(filters.min_qty, Decimal::from_str_exact("0.000001").ok());
+        assert_eq!(filters.step_size, None);
+        assert_eq!(filters.base_precision, Some(8));
+    }
+
+    /// The live ICP_USDT shape: `baseSizePrecision` 0.0001 against
+    /// `baseAssetPrecision` 2. Treating that minimum as a step rounded to four
+    /// decimals, which MEXC rejected as "quantity scale is invalid".
+    #[test]
+    fn a_minimum_order_size_finer_than_the_venue_precision_does_not_set_the_scale() {
+        let info = serde_json::json!({
+            "symbol": "ICPUSDT",
+            "baseAssetPrecision": 2,
+            "quotePrecision": 3,
+            "quoteAmountPrecision": "1",
+            "baseSizePrecision": "0.0001",
+            "filters": [{
+                "filterType": "PERCENT_PRICE_BY_SIDE",
+                "bidMultiplierUp": "0.2",
+                "askMultiplierDown": "0.2"
+            }]
+        });
+        let filters = MexcClient::symbol_filters_from_info(&info);
+        assert_eq!(filters.step_size, None);
+        assert_eq!(filters.min_qty, Decimal::from_str_exact("0.0001").ok());
+        assert_eq!(filters.base_precision, Some(2));
+
+        // The exact quantity liquidation 1620 could not submit.
+        let (_, qty, _) = MexcClient::prepare_sell_order(
+            Decimal::from_str_exact("7.8073757").expect("test amount"),
+            Some(&filters),
+            "ICP_USDT",
+        )
+        .expect("a sell within the venue's precision");
+        assert_eq!(qty, Decimal::from_str_exact("7.8").ok());
+
+        // A real LOT_SIZE filter still decides where one is sent.
+        let mut with_lot_size = filters.clone();
+        with_lot_size.step_size = Decimal::from_str_exact("0.001").ok();
+        let (_, qty, _) = MexcClient::prepare_sell_order(
+            Decimal::from_str_exact("7.8073757").expect("test amount"),
+            Some(&with_lot_size),
+            "ICP_USDT",
+        )
+        .expect("a sell on the venue's own step");
+        assert_eq!(qty, Decimal::from_str_exact("7.807").ok());
     }
 
     // CKBTC_BTC and other configured pairs report baseSizePrecision "0", which
