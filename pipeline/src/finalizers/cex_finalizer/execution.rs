@@ -12,7 +12,8 @@ use liquidium_pipeline_connectors::backend::bridge_backend::{
     FINALIZER_PERMANENT_AMOUNT_FLOOR_PREFIX, resolve_route,
 };
 use liquidium_pipeline_connectors::backend::cex_backend::{
-    BuyOrderInputMode, CexBackend, CexSubmissionError, OrderBookLevel, SwapExecutionOptions, WithdrawStatus,
+    BuyOrderInputMode, CexBackend, CexSubmissionError, CexWithdrawError, OrderBookLevel, SwapExecutionOptions,
+    WithdrawStatus, WithdrawalReceipt,
 };
 use liquidium_pipeline_core::{
     account::model::ChainAccount,
@@ -28,7 +29,6 @@ use super::utils::{LIQUIDITY_EPS, SlicePreview, TradeLeg, is_usd_stable_symbol, 
 
 const WITHDRAW_BRIDGE_SOURCE_BALANCE_TOLERANCE: f64 = LIQUIDITY_EPS;
 const NATIVE_ETH_BRIDGEABLE_SAFETY_MARGIN: f64 = 1e-15;
-const MEXC_WITHDRAW_BELOW_MIN_RAW_CODE: i64 = 10254;
 const BRIDGE_FEE_TOKEN_SYMBOL: &str = "ckETH";
 const BRIDGE_FEE_TOKEN_CHAIN: &str = "ICP";
 const CKETH_DECIMALS: i32 = 18;
@@ -39,7 +39,6 @@ use crate::{
     stages::bridge_submit_lock::acquire_bridge_submit_lock,
     stages::executor::ExecutionReceipt,
     swappers::{
-        kraken::KRAKEN_WITHDRAW_BELOW_MIN,
         mexc::orderbook_quote::{simulate_buy_from_asks, simulate_sell_from_bids},
         model::SwapExecution,
     },
@@ -90,29 +89,6 @@ fn bridge_failure_action(cause: BridgeFailure, revert_resubmits: u32) -> BridgeF
     }
 }
 
-fn parse_raw_code(err: &str) -> Option<i64> {
-    let value = err.split("raw_code:").nth(1)?.trim_start();
-    let end = value
-        .find(|ch: char| !ch.is_ascii_digit() && ch != '-')
-        .unwrap_or(value.len());
-    value.get(..end)?.parse().ok()
-}
-
-/// How a venue reports a withdrawal refused for being under its minimum.
-///
-/// The two venues signal it differently, and neither signal works for the
-/// other: MEXC returns a numeric code that survives the message being
-/// localized or reworded, while Kraken returns no code at all because its
-/// adapter refuses the amount before submission, leaving its own message as
-/// the only thing to match.
-#[derive(Clone, Copy)]
-enum WithdrawBelowMinSignal {
-    /// A numeric code carried in the error as `raw_code:`.
-    RawCode(i64),
-    /// A substring of a message the venue's own adapter raises.
-    Message(&'static str),
-}
-
 /// Venue-specific policy consumed by the shared CEX state machine.
 ///
 /// API types and transport behavior remain in `CexBackend`; this profile only
@@ -123,7 +99,6 @@ pub struct CexVenueProfile {
     preview_taker_fee_bps: f64,
     deposit_fee_multiplier: u8,
     special_trade_legs: Option<fn(&str, &str) -> Option<Vec<TradeLeg>>>,
-    withdraw_below_min: Option<WithdrawBelowMinSignal>,
     funding_preflight_required: bool,
     backend_submission_classifier_required: bool,
     approval_bumps_required: bool,
@@ -141,11 +116,6 @@ impl CexVenueProfile {
             preview_taker_fee_bps,
             deposit_fee_multiplier: 1,
             special_trade_legs: None,
-            // Kraken names no code for this, so its own refusal message is
-            // matched instead. Without it a residual post-trade withdrawal too
-            // small to send would retry in `Withdraw` until it ran out of
-            // strikes, rather than being written off as dust.
-            withdraw_below_min: Some(WithdrawBelowMinSignal::Message(KRAKEN_WITHDRAW_BELOW_MIN)),
             funding_preflight_required: true,
             backend_submission_classifier_required: true,
             approval_bumps_required: false,
@@ -164,7 +134,6 @@ impl CexVenueProfile {
             preview_taker_fee_bps: 10.0,
             deposit_fee_multiplier: CEX_DEPOSIT_FEE_MULTIPLIER,
             special_trade_legs: Some(legacy_special_trade_legs),
-            withdraw_below_min: Some(WithdrawBelowMinSignal::RawCode(MEXC_WITHDRAW_BELOW_MIN_RAW_CODE)),
             funding_preflight_required: false,
             backend_submission_classifier_required: false,
             approval_bumps_required: true,
@@ -221,14 +190,6 @@ impl CexVenueProfile {
 
     fn special_trade_legs(&self, deposit: &str, withdraw: &str) -> Option<Vec<TradeLeg>> {
         self.special_trade_legs.and_then(|resolve| resolve(deposit, withdraw))
-    }
-
-    fn is_withdraw_below_min_error(&self, error: &str) -> bool {
-        match self.withdraw_below_min {
-            Some(WithdrawBelowMinSignal::RawCode(expected)) => parse_raw_code(error) == Some(expected),
-            Some(WithdrawBelowMinSignal::Message(marker)) => error.contains(marker),
-            None => false,
-        }
     }
 }
 
@@ -357,22 +318,62 @@ where
         Ok(AccountIdentifier::new(&account.owner, &subaccount).to_hex())
     }
 
-    fn complete_withdraw_as_below_min_dust(
+    /// Submits the venue withdrawal for the leg's whole output.
+    ///
+    /// `Ok(None)` means the venue refused the amount as under its minimum and
+    /// the leg was closed as dust, so there is nothing left to track.
+    async fn submit_withdraw(
         &self,
         state: &mut CexState,
         planned_asset: &str,
         planned_network: &str,
         amount: f64,
-        err: &str,
-    ) {
+    ) -> Result<Option<WithdrawalReceipt>, String> {
+        match self
+            .backend
+            .withdraw(planned_asset, planned_network, &state.withdraw.withdraw_address, amount)
+            .await
+        {
+            Ok(receipt) => Ok(Some(receipt)),
+            Err(CexWithdrawError::BelowMinimum(refusal)) => {
+                self.settle_withdraw_below_min(state, planned_asset, planned_network, amount, &refusal)
+                    .await?;
+                Ok(None)
+            }
+            Err(error) => Err(error.to_string()),
+        }
+    }
+
+    /// Decides what a withdrawal the venue refused as under its minimum becomes.
+    ///
+    /// A leg withdraws its whole output, so the refused amount is everything the
+    /// leg produced, and venue minimums are dollar-sized. Only an amount under
+    /// the operator's own dust floor is written off; anything larger, or
+    /// anything this venue cannot price, comes back as the error so the leg
+    /// parks for an operator instead of leaving the funds on the venue unnoticed.
+    async fn settle_withdraw_below_min(
+        &self,
+        state: &mut CexState,
+        planned_asset: &str,
+        planned_network: &str,
+        amount: f64,
+        refusal: &str,
+    ) -> Result<(), String> {
+        let venue = self.profile.venue_id();
+        let usd = self.amount_symbol_to_usd(planned_asset, amount).await.map_err(|error| {
+            format!(
+                "{refusal}; {amount} {planned_asset} stays on {venue} because it could not be priced to decide whether it is dust: {error}"
+            )
+        })?;
+        if usd > self.cex_min_exec_usd {
+            return Err(format!(
+                "{refusal}; {amount} {planned_asset} (~{usd:.2} USD) is above the {} USD dust floor, so it stays on {venue} for an operator rather than being written off",
+                self.cex_min_exec_usd
+            ));
+        }
         let msg = format!(
-            "{} withdraw below minimum; treating residual as CEX dust for liq_id {} asset={} network={} amount={} err={}",
-            self.profile.venue_id(),
-            state.liq_id,
-            planned_asset,
-            planned_network,
-            amount,
-            err
+            "{venue} withdraw below minimum; treating residual as CEX dust for liq_id {} asset={} network={} amount={} (~{usd:.4} USD) err={refusal}",
+            state.liq_id, planned_asset, planned_network, amount
         );
         warn!("{}", msg);
         state.last_error = Some(msg);
@@ -381,6 +382,7 @@ where
             Nat::from(0u8),
         ));
         state.step = CexStep::Completed;
+        Ok(())
     }
 
     fn direct_deposit_destination_account(
@@ -1466,22 +1468,11 @@ where
                 return Ok(());
             }
 
-            let receipt = match self
-                .backend
-                .withdraw(
-                    &planned_asset,
-                    &planned_network,
-                    &state.withdraw.withdraw_address,
-                    amount,
-                )
-                .await
-            {
-                Ok(receipt) => receipt,
-                Err(err) if self.profile.is_withdraw_below_min_error(&err) => {
-                    self.complete_withdraw_as_below_min_dust(state, &planned_asset, &planned_network, amount, &err);
-                    return Ok(());
-                }
-                Err(err) => return Err(err),
+            let Some(receipt) = self
+                .submit_withdraw(state, &planned_asset, &planned_network, amount)
+                .await?
+            else {
+                return Ok(());
             };
             state.withdraw.withdraw_id = receipt.internal_id.clone();
             state.withdraw.withdraw_txid = receipt.txid.clone();
@@ -1522,22 +1513,11 @@ where
 
         // Submit CEX withdraw once (to bridge source), then keep polling in WithdrawPending.
         if state.withdraw.withdraw_id.is_none() && state.withdraw.withdraw_txid.is_none() {
-            let receipt = match self
-                .backend
-                .withdraw(
-                    &planned_asset,
-                    &planned_network,
-                    &state.withdraw.withdraw_address,
-                    amount,
-                )
-                .await
-            {
-                Ok(receipt) => receipt,
-                Err(err) if self.profile.is_withdraw_below_min_error(&err) => {
-                    self.complete_withdraw_as_below_min_dust(state, &planned_asset, &planned_network, amount, &err);
-                    return Ok(());
-                }
-                Err(err) => return Err(err),
+            let Some(receipt) = self
+                .submit_withdraw(state, &planned_asset, &planned_network, amount)
+                .await?
+            else {
+                return Ok(());
             };
             state.withdraw.withdraw_id = receipt.internal_id.clone();
             state.withdraw.withdraw_txid = receipt.txid.clone();

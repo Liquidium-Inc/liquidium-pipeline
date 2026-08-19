@@ -780,7 +780,7 @@ where
     }
 
     /// Convert an amount in `symbol` units to USD for min-notional checks.
-    async fn amount_symbol_to_usd(&self, symbol: &str, amount: f64) -> Result<f64, String> {
+    pub(super) async fn amount_symbol_to_usd(&self, symbol: &str, amount: f64) -> Result<f64, String> {
         if amount <= 0.0 {
             return Ok(0.0);
         }

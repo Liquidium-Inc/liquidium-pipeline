@@ -5,7 +5,7 @@ use std::{
 
 use async_trait::async_trait;
 use liquidium_pipeline_connectors::backend::cex_backend::{
-    BuyOrderInputMode, CEX_VENUE_UNREACHABLE_PREFIX, CexBackend, CexSubmissionError, DepositAddress,
+    BuyOrderInputMode, CEX_VENUE_UNREACHABLE_PREFIX, CexBackend, CexSubmissionError, CexWithdrawError, DepositAddress,
     FundingRoutePreflight, OrderBook, OrderBookLevel, SwapExecutionOptions, SwapFillReport, WithdrawStatus,
     WithdrawStatusSnapshot, WithdrawalReceipt, classify_cex_submission_error, is_cex_venue_unreachable_error,
 };
@@ -22,15 +22,6 @@ use super::kraken_api::{
 };
 
 const KRAKEN_AMBIGUOUS_PREFIX: &str = "kraken ambiguous submission: ";
-/// Prefix on the refusal this adapter raises when a withdrawal is under the
-/// method minimum.
-///
-/// Kraken returns no numeric code for this, unlike MEXC: the amount is refused
-/// here, before submission, so the message is the only signal the finalizer can
-/// classify on. `CexVenueProfile::kraken` matches this exact constant and the
-/// message is built from it, so the two cannot drift apart and leave a residual
-/// withdrawal retrying forever in `Withdraw`.
-pub const KRAKEN_WITHDRAW_BELOW_MIN: &str = "Kraken withdrawal is below the method minimum";
 const ORDER_POLL_ATTEMPTS: usize = 20;
 const ORDER_POLL_INTERVAL: Duration = Duration::from_millis(500);
 const PAIR_METADATA_TTL: Duration = Duration::from_secs(5 * 60);
@@ -562,15 +553,17 @@ impl CexBackend for KrakenClient {
         network: &str,
         address: &str,
         amount: f64,
-    ) -> Result<WithdrawalReceipt, String> {
+    ) -> Result<WithdrawalReceipt, CexWithdrawError> {
         ensure_positive(amount)?;
         let (method, key) = self.resolve_withdrawal(asset, network, address).await?;
         let amount_decimal = Decimal::from_f64(amount).ok_or_else(|| "invalid Kraken withdrawal amount".to_string())?;
+        // Kraken returns no code for this: the amount is refused here, before
+        // submission, so this is where the refusal gets its name.
         if amount_decimal < method.minimum {
-            return Err(format!(
-                "{KRAKEN_WITHDRAW_BELOW_MIN}: {amount_decimal} is below {} minimum {}",
+            return Err(CexWithdrawError::BelowMinimum(format!(
+                "Kraken withdrawal amount {amount_decimal} is below {} minimum {}",
                 method.method, method.minimum
-            ));
+            )));
         }
         let ref_id = self
             .api
@@ -1435,11 +1428,9 @@ mod tests {
             .await
             .expect_err("below minimum");
 
-        assert!(error.contains("below Bitcoin minimum"));
-        // The finalizer writes this residual off as dust rather than retrying a
-        // withdrawal Kraken will never accept, and it recognises it by this
-        // marker, so the refusal actually raised here has to carry it.
-        assert!(error.contains(KRAKEN_WITHDRAW_BELOW_MIN));
+        // The finalizer decides what becomes of the amount on the variant, not
+        // on the wording, so the refusal raised here has to be the typed one.
+        assert!(matches!(&error, CexWithdrawError::BelowMinimum(message) if message.contains("below Bitcoin minimum")));
     }
 
     #[tokio::test]

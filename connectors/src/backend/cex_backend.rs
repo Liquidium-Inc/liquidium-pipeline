@@ -75,6 +75,32 @@ pub fn classify_cex_submission_error(message: &str) -> CexSubmissionError {
     }
 }
 
+/// Why a venue refused a withdrawal.
+///
+/// The state machine keeps or writes off a leg's output on this, so the venue
+/// that read the refusal names it here once; the message is only for humans.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum CexWithdrawError {
+    /// The amount is under the venue's minimum for this asset and network.
+    /// Nothing was sent.
+    #[error("{0}")]
+    BelowMinimum(String),
+    #[error("{0}")]
+    Other(String),
+}
+
+impl From<String> for CexWithdrawError {
+    fn from(message: String) -> Self {
+        Self::Other(message)
+    }
+}
+
+impl From<&str> for CexWithdrawError {
+    fn from(message: &str) -> Self {
+        Self::Other(message.to_string())
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct DepositAddress {
     pub asset: String,
@@ -244,7 +270,7 @@ pub trait CexBackend: Send + Sync {
         network: &str,
         address: &str,
         amount: f64,
-    ) -> Result<WithdrawalReceipt, String>;
+    ) -> Result<WithdrawalReceipt, CexWithdrawError>;
 
     // balance
     async fn get_balance(&self, asset: &str) -> Result<f64, String>;

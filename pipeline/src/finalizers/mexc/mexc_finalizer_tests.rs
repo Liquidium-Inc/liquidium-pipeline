@@ -11,8 +11,8 @@ use liquidium_pipeline_connectors::backend::bridge_backend::{
     MockBridgeBackend,
 };
 use liquidium_pipeline_connectors::backend::cex_backend::{
-    BuyOrderInputMode, CexSubmissionError, DepositAddress, MockCexBackend, OrderBook, OrderBookLevel, SwapFillReport,
-    WithdrawStatus, WithdrawStatusSnapshot,
+    BuyOrderInputMode, CexSubmissionError, CexWithdrawError, DepositAddress, MockCexBackend, OrderBook, OrderBookLevel,
+    SwapFillReport, WithdrawStatus, WithdrawStatusSnapshot,
 };
 use liquidium_pipeline_core::account::model::ChainAccount;
 use liquidium_pipeline_core::tokens::{chain_token::ChainToken, chain_token_amount::ChainTokenAmount};
@@ -52,16 +52,11 @@ fn cex_venue_profile_separates_kraken_and_mexc_policy() {
     assert_eq!(kraken.venue_id(), "kraken");
     assert_eq!(kraken.preview_taker_fee_bps(), 40.0);
     assert!(kraken.special_trade_legs("ETH", "USDC").is_none());
-    assert!(!kraken.is_withdraw_below_min_error("raw_code: 10254"));
-    assert!(kraken.is_withdraw_below_min_error(&format!(
-        "{KRAKEN_WITHDRAW_BELOW_MIN}: 0.001 is below Bitcoin minimum 0.01"
-    )));
     assert_eq!(kraken.deposit_fee_multiplier, 1);
 
     let mexc = CexVenueProfile::mexc();
     assert_eq!(mexc.venue_id(), "mexc");
     assert!(mexc.special_trade_legs("ETH", "USDC").is_some());
-    assert!(mexc.is_withdraw_below_min_error("exchange error raw_code: 10254"));
     assert_eq!(mexc.deposit_fee_multiplier, CEX_DEPOSIT_FEE_MULTIPLIER);
 }
 
@@ -84,15 +79,6 @@ fn kraken_profile_generates_compatible_client_order_ids() {
     assert!(first.is_ascii());
     assert_ne!(first, second);
     assert!(finalizer.is_valid_client_order_id(&first));
-}
-
-#[test]
-fn mexc_withdraw_below_min_detection_uses_raw_code() {
-    let profile = CexVenueProfile::mexc();
-    assert!(profile.is_withdraw_below_min_error(
-        r#"Error response: ErrorResponse { code: InvalidResponse, raw_code: 10254, msg: "localized or changed text", _extend: None }"#
-    ));
-    assert!(!profile.is_withdraw_below_min_error("Withdrawal shall not be less than the Min amount of:0.00002"));
 }
 
 fn make_execution_receipt(liq_id: u128) -> ExecutionReceipt {
@@ -2493,10 +2479,9 @@ async fn mexc_non_bridge_withdraw_below_min_completes_as_zero_output_dust() {
     cex.expect_withdraw()
         .times(1)
         .returning(|_asset, _network, _address, _amount| {
-            Err(
-                r#"Error response: ErrorResponse { code: InvalidResponse, raw_code: 10254, msg: "Withdrawal shall not be less than the Min amount of:0.00002", _extend: None }"#
-                    .to_string(),
-            )
+            Err(CexWithdrawError::BelowMinimum(
+                "Withdrawal shall not be less than the Min amount of:0.00002".to_string(),
+            ))
         });
 
     let finalizer = MexcFinalizer::new(
@@ -2547,10 +2532,7 @@ async fn mexc_bridged_withdraw_below_min_completes_as_zero_output_dust() {
             assert_eq!(network, "ETH");
             assert_eq!(address, "0x2222222222222222222222222222222222222222");
             assert_eq!(amount, 0.00001);
-            Err(
-                r#"Error response: ErrorResponse { code: InvalidResponse, raw_code: 10254, msg: "localized or changed text", _extend: None }"#
-                    .to_string(),
-            )
+            Err(CexWithdrawError::BelowMinimum("localized or changed text".to_string()))
         });
 
     let finalizer = MexcFinalizer::new(
@@ -2588,6 +2570,104 @@ async fn mexc_bridged_withdraw_below_min_completes_as_zero_output_dust() {
             .unwrap_or_default()
             .contains("mexc withdraw below minimum")
     );
+}
+
+/// A leg withdraws its whole output, so "below the venue minimum" is not a
+/// statement about dust: venue minimums are dollar-sized, and a preview that
+/// passed on an estimate can be refused after the price moves. Only an amount
+/// under the operator's own dust floor may be written off; anything larger
+/// has to stay visible, or it sits on the venue with nothing tracking it.
+#[tokio::test]
+async fn a_below_minimum_withdrawal_above_the_dust_floor_is_not_written_off() {
+    let mut cex = MockCexBackend::new();
+    cex.expect_withdraw()
+        .times(1)
+        .returning(|_asset, _network, _address, _amount| {
+            Err(CexWithdrawError::BelowMinimum(
+                "Kraken withdrawal amount 5 is below Tether USD minimum 10".to_string(),
+            ))
+        });
+
+    let finalizer = MexcFinalizer::new(
+        Arc::new(cex),
+        Arc::new(MockTransferActions::new()),
+        Principal::anonymous(),
+        TEST_MAX_SELL_SLIPPAGE_BPS,
+        TEST_CEX_MIN_EXEC_USD,
+        TEST_CEX_SLICE_TARGET_RATIO,
+    );
+
+    let receipt = make_execution_receipt(15);
+    let mut state = finalizer.prepare("15", &receipt).await.expect("prepare should succeed");
+    state.step = CexStep::Withdraw;
+    // Five ckUSDT: real money against a $0.0001 dust floor.
+    state.withdraw.size_out = Some(ChainTokenAmount::from_formatted(
+        state.withdraw.withdraw_asset.clone(),
+        5.0,
+    ));
+
+    let error = finalizer
+        .withdraw(&mut state)
+        .await
+        .expect_err("an amount worth keeping must surface, not vanish as dust");
+
+    assert!(
+        error.contains("above the 0.0001 USD dust floor"),
+        "unexpected error: {error}"
+    );
+    assert!(
+        error.contains("below Tether USD minimum"),
+        "the venue's refusal is kept: {error}"
+    );
+    assert!(
+        matches!(state.step, CexStep::Withdraw),
+        "the leg stays where an operator can act on it"
+    );
+    assert_eq!(state.withdraw.size_out.as_ref().unwrap().to_f64(), 5.0);
+}
+
+/// Deciding "dust" needs a price. When the venue cannot give one, the amount
+/// is not written off on a guess.
+#[tokio::test]
+async fn a_below_minimum_withdrawal_that_cannot_be_priced_is_not_written_off() {
+    let mut cex = MockCexBackend::new();
+    cex.expect_withdraw()
+        .times(1)
+        .returning(|_asset, _network, _address, _amount| {
+            Err(CexWithdrawError::BelowMinimum(
+                "Kraken withdrawal amount 0.004 is below Ether minimum 0.005".to_string(),
+            ))
+        });
+    // No market prices ETH here, so its USD value is unknown.
+    cex.expect_get_orderbook()
+        .returning(|market, _| Err(format!("no {market} market")));
+
+    let finalizer = MexcFinalizer::new(
+        Arc::new(cex),
+        Arc::new(MockTransferActions::new()),
+        Principal::anonymous(),
+        TEST_MAX_SELL_SLIPPAGE_BPS,
+        TEST_CEX_MIN_EXEC_USD,
+        TEST_CEX_SLICE_TARGET_RATIO,
+    )
+    .with_bridge_dependencies(bridge_dependencies(Arc::new(MockBridgeBackend::new())));
+
+    let receipt = make_execution_receipt_with_assets(16, ckbtc_token(), cketh_token());
+    let mut state = finalizer.prepare("16", &receipt).await.expect("prepare should succeed");
+    assert!(state.withdraw.bridge.withdraw_bridge_required);
+    state.step = CexStep::Withdraw;
+    state.withdraw.size_out = Some(ChainTokenAmount::from_formatted(
+        state.withdraw.withdraw_asset.clone(),
+        0.004,
+    ));
+
+    let error = finalizer
+        .withdraw(&mut state)
+        .await
+        .expect_err("an unpriced amount must not be written off");
+
+    assert!(error.contains("could not be priced"), "unexpected error: {error}");
+    assert!(!matches!(state.step, CexStep::Completed));
 }
 
 #[tokio::test]

@@ -4,8 +4,9 @@ use std::env;
 use async_trait::async_trait;
 
 use liquidium_pipeline_connectors::backend::cex_backend::{
-    BuyOrderInputMode, CEX_VENUE_UNREACHABLE_PREFIX, CexBackend, CexSubmissionError, DepositAddress, OrderBook,
-    OrderBookLevel, SwapExecutionOptions, SwapFillReport, WithdrawStatus, WithdrawStatusSnapshot, WithdrawalReceipt,
+    BuyOrderInputMode, CEX_VENUE_UNREACHABLE_PREFIX, CexBackend, CexSubmissionError, CexWithdrawError, DepositAddress,
+    OrderBook, OrderBookLevel, SwapExecutionOptions, SwapFillReport, WithdrawStatus, WithdrawStatusSnapshot,
+    WithdrawalReceipt,
 };
 use log::{debug, info, warn};
 use rust_decimal::{Decimal, RoundingStrategy};
@@ -23,6 +24,27 @@ const MEXC_SPOT_FEE_BPS: f64 = 5.01;
 const ROUND_HANDLER: f64 = 0.01;
 /// Hard cap for fee inputs; values above this are treated as invalid.
 const MAX_TAKER_FEE_BPS: f64 = 10_000.0;
+/// MEXC's code for a withdrawal under the asset's minimum. The code is what
+/// is matched, because the message alongside it is localized and reworded.
+const MEXC_WITHDRAW_BELOW_MIN_RAW_CODE: i64 = 10254;
+
+/// Reads the `raw_code:` MEXC's SDK renders into its error text.
+fn parse_raw_code(err: &str) -> Option<i64> {
+    let value = err.split("raw_code:").nth(1)?.trim_start();
+    let end = value
+        .find(|ch: char| !ch.is_ascii_digit() && ch != '-')
+        .unwrap_or(value.len());
+    value.get(..end)?.parse().ok()
+}
+
+/// Names a failed MEXC withdrawal by what it means for the funds, once, here.
+fn classify_withdraw_error(message: String) -> CexWithdrawError {
+    if parse_raw_code(&message) == Some(MEXC_WITHDRAW_BELOW_MIN_RAW_CODE) {
+        CexWithdrawError::BelowMinimum(message)
+    } else {
+        CexWithdrawError::Other(message)
+    }
+}
 
 fn from_mexc_raw(s: &str) -> WithdrawStatus {
     let normalized = s.trim().to_ascii_uppercase();
@@ -1341,7 +1363,7 @@ impl CexBackend for MexcClient {
         network: &str,
         address: &str,
         amount: f64,
-    ) -> Result<WithdrawalReceipt, String> {
+    ) -> Result<WithdrawalReceipt, CexWithdrawError> {
         let ex = self.inner.lock().await;
         let push_unique = |list: &mut Vec<String>, value: String| {
             if !list.iter().any(|item| item.eq_ignore_ascii_case(&value)) {
@@ -1415,7 +1437,11 @@ impl CexBackend for MexcClient {
 
         let res = match res {
             Some(res) => res,
-            None => return Err(hard_err.or(last_err).unwrap_or_else(|| "withdraw failed".to_string())),
+            None => {
+                return Err(classify_withdraw_error(
+                    hard_err.or(last_err).unwrap_or_else(|| "withdraw failed".to_string()),
+                ));
+            }
         };
 
         Ok(WithdrawalReceipt {
@@ -1763,6 +1789,27 @@ mod tests {
         assert_eq!(from_mexc_raw(" finished "), WithdrawStatus::Completed);
         assert_eq!(from_mexc_raw("cAnCeLeD"), WithdrawStatus::Canceled);
         assert_eq!(from_mexc_raw(" processing "), WithdrawStatus::Pending);
+    }
+
+    /// The finalizer writes a leg off as dust on this variant, so it has to come
+    /// from the code MEXC sends and not from the words around it, which MEXC
+    /// localizes and rewords.
+    #[test]
+    fn a_withdrawal_under_the_minimum_is_named_by_its_code_not_its_wording() {
+        assert!(matches!(
+            classify_withdraw_error(
+                r#"Error response: ErrorResponse { code: InvalidResponse, raw_code: 10254, msg: "localized or changed text", _extend: None }"#.to_string()
+            ),
+            CexWithdrawError::BelowMinimum(_)
+        ));
+        assert!(matches!(
+            classify_withdraw_error("Withdrawal shall not be less than the Min amount of:0.00002".to_string()),
+            CexWithdrawError::Other(_)
+        ));
+        assert!(matches!(
+            classify_withdraw_error("exchange error raw_code: 10007".to_string()),
+            CexWithdrawError::Other(_)
+        ));
     }
 
     #[test]
