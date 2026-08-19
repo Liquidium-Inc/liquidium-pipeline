@@ -1956,6 +1956,62 @@ async fn a_failed_credit_read_keeps_waiting_instead_of_failing_the_leg() {
     assert!(!matches!(state.step, CexStep::Completed));
 }
 
+/// Not failing the leg is not the same as saying nothing. A read that keeps
+/// failing past the stall bound leaves the leg exactly as stuck as a credit
+/// that keeps not arriving, so it is stamped on the leg the same way; without
+/// that a minter outage spanning the whole mint window would show nothing.
+#[tokio::test]
+async fn an_unreadable_credit_past_the_stall_bound_is_stamped_on_the_leg() {
+    let cex = MockCexBackend::new();
+    let mut bridge = MockBridgeBackend::new();
+    let transfers = MockTransferActions::new();
+
+    bridge
+        .expect_get_bridge_status()
+        .returning(|_| Ok(BridgeStatus::Completed));
+    bridge.expect_find_bridge_credit().times(2).returning(|_, _, _| {
+        Err("decode_ledger_memo failed on minter sv3dd-oaaaa-aaaar-qacoa-cai: stopped".to_string())
+    });
+
+    let finalizer = MexcFinalizer::new(
+        Arc::new(cex),
+        Arc::new(transfers),
+        Principal::management_canister(),
+        TEST_MAX_SELL_SLIPPAGE_BPS,
+        TEST_CEX_MIN_EXEC_USD,
+        TEST_CEX_SLICE_TARGET_RATIO,
+    )
+    .with_bridge_dependencies(bridge_dependencies(Arc::new(bridge)));
+
+    let receipt = make_execution_receipt_with_assets(131, ckbtc_token(), ckusdc_token());
+    let mut state = finalizer
+        .prepare("131", &receipt)
+        .await
+        .expect("prepare should succeed");
+    state.step = CexStep::WithdrawPending;
+    state.withdraw.withdraw_id = Some("withdraw-131".to_string());
+    state.withdraw.bridge.withdraw_bridge_id = Some("0xdeposit".to_string());
+    state.withdraw.bridge.withdraw_bridge_expected_amount = Some(5.7);
+
+    // Inside the bound: still an ordinary wait, nothing on the leg.
+    state.withdraw.bridge.withdraw_bridge_submitted_at_ts = Some(crate::utils::now_ts());
+    finalizer.withdraw(&mut state).await.expect("waiting is not a failure");
+    assert!(matches!(state.step, CexStep::WithdrawPending));
+    assert!(state.last_error.is_none());
+
+    // Past it: the leg says what it is waiting on and for how long.
+    state.withdraw.bridge.withdraw_bridge_submitted_at_ts = Some(crate::utils::now_ts() - 41 * 60);
+    finalizer.withdraw(&mut state).await.expect("waiting is not a failure");
+    assert!(matches!(state.step, CexStep::WithdrawPending));
+    let stall = state
+        .last_error
+        .as_deref()
+        .expect("a stalled read is stamped on the leg");
+    assert!(stall.contains("awaiting ckUSDC bridge credit"), "{stall}");
+    assert!(stall.contains("could not read the credit"), "{stall}");
+    assert!(stall.contains("decode_ledger_memo failed"), "{stall}");
+}
+
 /// A bridge transaction replaced before mining never executed, so the leg must
 /// drop it and submit again. Left in place it would be polled forever while its
 /// funds sat untouched on the bridge source account.

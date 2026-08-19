@@ -182,11 +182,18 @@ where
             .unwrap_or_else(|| state.withdraw.size_out.as_ref().map_or(0.0, |out| out.to_f64()));
 
         let typed_destination = self.bridge_destination_for_final_liquidator(route.destination_kind, &destination)?;
+        let waited = state
+            .withdraw
+            .bridge
+            .withdraw_bridge_submitted_at_ts
+            .map_or(0, |sent| now_ts().saturating_sub(sent));
         // A failed read says nothing about the credit, so it must not count as a
         // failed step. The retry budget is shared across the row's whole life and
         // never resets, so surfacing a canister or subnet outage as a retryable
         // error would spend that budget on a leg whose funds are fine and
-        // eventually park it for an operator.
+        // eventually park it for an operator. It still counts as waiting: a
+        // read that keeps failing past the stall bound is stamped on the leg
+        // like a credit that keeps not arriving, or the stall would be invisible.
         let credit = match bridge
             .backend
             .find_bridge_credit(route.target_asset, &typed_destination, &bridge_id)
@@ -194,10 +201,16 @@ where
         {
             Ok(credit) => credit,
             Err(error) => {
-                warn!(
-                    "[cex] liq_id={} could not read {} credit for {}; still waiting: {}",
-                    state.liq_id, route.target_asset, bridge_id, error
+                let pending_line = format!(
+                    "awaiting {} bridge credit for liq_id {}: could not read the credit for {} yet ({}), waited={}s destination={}",
+                    route.target_asset, state.liq_id, bridge_id, error, waited, destination
                 );
+                if waited >= BRIDGE_CREDIT_STALL_SECS {
+                    warn!("[cex] {pending_line} (past {BRIDGE_CREDIT_STALL_SECS}s)");
+                    state.last_error = Some(pending_line);
+                } else {
+                    warn!("[cex] {pending_line}");
+                }
                 state.step = CexStep::WithdrawPending;
                 return Ok(());
             }
@@ -220,11 +233,6 @@ where
             return Ok(());
         }
 
-        let waited = state
-            .withdraw
-            .bridge
-            .withdraw_bridge_submitted_at_ts
-            .map_or(0, |sent| now_ts().saturating_sub(sent));
         let pending_line = format!(
             "awaiting {} bridge credit for liq_id {}: no mint names {} yet, expected={} waited={}s destination={}",
             route.target_asset, state.liq_id, bridge_id, expected, waited, destination
