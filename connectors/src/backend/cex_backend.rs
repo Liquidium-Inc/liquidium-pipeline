@@ -50,11 +50,6 @@ impl From<&str> for CexSubmissionError {
     }
 }
 
-/// Reports whether a backend error asks the caller to wait for the venue.
-pub fn is_cex_pending_settlement_error(message: &str) -> bool {
-    message.starts_with(CEX_PENDING_SETTLEMENT_PREFIX)
-}
-
 /// Reports whether a backend marked this message as never having been sent.
 ///
 /// Matched anywhere in the message rather than at the front: backends wrap a
@@ -66,12 +61,14 @@ pub fn is_cex_venue_unreachable_error(message: &str) -> bool {
 }
 
 pub fn classify_cex_submission_error(message: &str) -> CexSubmissionError {
+    // Payloads are stored without their marker, because `Display` puts it
+    // back. A backend that flattens a classification into its message and
+    // hands it here again would otherwise stack one marker per round trip.
     if is_cex_venue_unreachable_error(message) {
-        CexSubmissionError::Unreachable(message.to_string())
+        // The marker may sit inside a backend's own wrapping rather than at
+        // the front, so the first copy is removed wherever it is.
+        CexSubmissionError::Unreachable(message.replacen(CEX_VENUE_UNREACHABLE_PREFIX, "", 1))
     } else if let Some(payload) = message.strip_prefix(CEX_PENDING_SETTLEMENT_PREFIX) {
-        // The payload only, because `Display` puts the prefix back. A backend
-        // that flattens a classification into its message and hands it here
-        // again would otherwise stack one prefix per round trip.
         CexSubmissionError::PendingSettlement(payload.to_string())
     } else {
         CexSubmissionError::Rejected(message.to_string())
@@ -281,20 +278,27 @@ mod tests {
 
     #[test]
     fn an_unreachable_marker_survives_the_round_trip_through_a_message() {
-        let rendered = CexSubmissionError::Unreachable("dns lookup failed".to_string()).to_string();
-        assert_eq!(
-            classify_cex_submission_error(&rendered),
-            CexSubmissionError::Unreachable(rendered)
-        );
+        let original = CexSubmissionError::Unreachable("dns lookup failed".to_string());
+        let rendered = original.to_string();
+        let reclassified = classify_cex_submission_error(&rendered);
+        assert_eq!(reclassified, original);
+        // Rendered again it carries one marker, not one per pass.
+        assert_eq!(reclassified.to_string(), rendered);
     }
 
     #[test]
     fn the_marker_is_found_inside_a_backends_own_wrapping() {
         let wrapped = format!("Get_order err: {CEX_VENUE_UNREACHABLE_PREFIX}connection refused");
-        assert!(matches!(
-            classify_cex_submission_error(&wrapped),
-            CexSubmissionError::Unreachable(_)
-        ));
+        let classified = classify_cex_submission_error(&wrapped);
+        assert_eq!(
+            classified,
+            CexSubmissionError::Unreachable("Get_order err: connection refused".to_string())
+        );
+        // And the wrapping is kept while the marker moves to the front once.
+        assert_eq!(
+            classified.to_string(),
+            format!("{CEX_VENUE_UNREACHABLE_PREFIX}Get_order err: connection refused")
+        );
     }
 
     /// Rendering a classification and reading it back has to land on the same

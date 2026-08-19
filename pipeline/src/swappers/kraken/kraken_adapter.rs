@@ -5,9 +5,9 @@ use std::{
 
 use async_trait::async_trait;
 use liquidium_pipeline_connectors::backend::cex_backend::{
-    BuyOrderInputMode, CEX_PENDING_SETTLEMENT_PREFIX, CEX_VENUE_UNREACHABLE_PREFIX, CexBackend, CexSubmissionError,
-    DepositAddress, FundingRoutePreflight, OrderBook, OrderBookLevel, SwapExecutionOptions, SwapFillReport,
-    WithdrawStatus, WithdrawStatusSnapshot, WithdrawalReceipt, is_cex_venue_unreachable_error,
+    BuyOrderInputMode, CEX_VENUE_UNREACHABLE_PREFIX, CexBackend, CexSubmissionError, DepositAddress,
+    FundingRoutePreflight, OrderBook, OrderBookLevel, SwapExecutionOptions, SwapFillReport, WithdrawStatus,
+    WithdrawStatusSnapshot, WithdrawalReceipt, classify_cex_submission_error, is_cex_venue_unreachable_error,
 };
 use log::info;
 use rust_decimal::{
@@ -194,18 +194,13 @@ impl KrakenClient {
 #[async_trait]
 impl CexBackend for KrakenClient {
     fn classify_submission_error(&self, error: &str) -> CexSubmissionError {
-        if is_cex_venue_unreachable_error(error) {
-            CexSubmissionError::Unreachable(error.to_string())
-        } else if error.starts_with(KRAKEN_AMBIGUOUS_PREFIX) {
-            CexSubmissionError::Ambiguous(error.to_string())
-        } else if let Some(payload) = error.strip_prefix(CEX_PENDING_SETTLEMENT_PREFIX) {
-            // `Display` re-adds the prefix, and `execute_swap_detailed` flattens
-            // a classification back into its message, so keeping it here would
-            // stack a prefix on every pass.
-            CexSubmissionError::PendingSettlement(payload.to_string())
-        } else {
-            CexSubmissionError::Rejected(error.to_string())
+        // Only the ambiguity marker is Kraken's own; every other case follows
+        // the shared rule. Unreachability still wins over it, because that is
+        // decided by the transport before any submission could become unclear.
+        if error.starts_with(KRAKEN_AMBIGUOUS_PREFIX) && !is_cex_venue_unreachable_error(error) {
+            return CexSubmissionError::Ambiguous(error.to_string());
         }
+        classify_cex_submission_error(error)
     }
 
     async fn validate_funding_route(&self, preflight: &FundingRoutePreflight) -> Result<(), String> {
