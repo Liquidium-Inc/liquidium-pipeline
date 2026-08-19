@@ -6764,3 +6764,51 @@ mod fuzz {
         }
     }
 }
+
+/// The ranking lookup and the venue profiles are two entry points onto one
+/// set of constants. Nothing in the type system ties them together, so a venue
+/// added to one and not the other would silently rank every asset it settles
+/// natively as delayed. These pin both directions.
+mod venue_icp_native_asset_lookup {
+    use super::*;
+    use crate::config::SUPPORTED_SWAP_VENUES;
+    use crate::finalizers::cex_finalizer::execution::venue_icp_native_assets;
+
+    const ICPSWAP_VENUE_ID: &str = "icpswap";
+
+    #[test]
+    fn the_lookup_reports_exactly_what_each_profile_carries() {
+        assert_eq!(
+            venue_icp_native_assets("mexc"),
+            CexVenueProfile::mexc().icp_native_assets
+        );
+        assert_eq!(
+            venue_icp_native_assets("kraken"),
+            CexVenueProfile::kraken(0.0).icp_native_assets
+        );
+    }
+
+    /// Every CEX the config accepts must be reachable here. A venue that falls
+    /// through to the catch-all reports no ICP-native assets, which reads as
+    /// "everything this venue settles has to bridge" and quietly demotes its
+    /// collateral in liquidation ranking.
+    #[test]
+    fn every_supported_cex_venue_is_reachable_through_the_lookup() {
+        for venue_id in SUPPORTED_SWAP_VENUES
+            .iter()
+            .filter(|venue_id| **venue_id != ICPSWAP_VENUE_ID)
+        {
+            assert!(
+                !venue_icp_native_assets(venue_id).is_empty(),
+                "`{venue_id}` is a supported CEX but the ranking lookup has no arm for it"
+            );
+        }
+    }
+
+    /// ICPSwap settles on the IC but is not a CEX, and the ranking classifier
+    /// documents that it deliberately contributes nothing.
+    #[test]
+    fn icpswap_contributes_no_native_assets() {
+        assert!(venue_icp_native_assets(ICPSWAP_VENUE_ID).is_empty());
+    }
+}

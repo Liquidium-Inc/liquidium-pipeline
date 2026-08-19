@@ -552,7 +552,11 @@ const DEFAULT_ICPSWAP_MAX_PRICE_IMPACT_BPS: f64 = 100.0;
 const DEFAULT_ICPSWAP_DUST_FALLBACK_MAX_PRICE_IMPACT_BPS: f64 = 150.0;
 const DEFAULT_ICPSWAP_MAX_SEARCH_ITERATIONS: u8 = 16;
 const DEFAULT_ENABLED_SWAP_VENUES: &str = "icpswap,mexc";
-const SUPPORTED_SWAP_VENUES: [&str; 3] = ["icpswap", "mexc", "kraken"];
+/// Every venue `ENABLED_SWAP_VENUES` accepts.
+///
+/// `pub(crate)` so tests elsewhere can assert that per-venue tables stay in
+/// step with it rather than silently omitting a venue added here.
+pub(crate) const SUPPORTED_SWAP_VENUES: [&str; 3] = ["icpswap", "mexc", "kraken"];
 
 fn parse_multi_venue_min_net_edge_bps_from_env() -> u32 {
     env::var("MULTI_VENUE_MIN_NET_EDGE_BPS")

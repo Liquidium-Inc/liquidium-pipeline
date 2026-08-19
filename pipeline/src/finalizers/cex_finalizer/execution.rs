@@ -109,6 +109,36 @@ pub struct CexVenueProfile {
     icp_native_assets: &'static [&'static str],
 }
 
+/// Kraken settles ICP itself on the ICP network and no other ICP-network
+/// token.
+const KRAKEN_ICP_NATIVE_ASSETS: &[&str] = &["ICP"];
+
+/// MEXC lists ckUSDT, ckBTC and ICP on the ICP network, so bridging any of
+/// them would pay a ckETH fee, Ethereum gas and a 15-20 minute mint to reach a
+/// market it already has.
+///
+/// ckBTC and ICP are named even though no ckETH-minter route matches either
+/// today, so the bridge planner reaches the same answer with or without them.
+/// Stating them makes that answer intentional rather than incidental, and it
+/// is what tells the liquidation strategy which collateral recycles in
+/// seconds -- a question no absence of a bridge route can answer.
+const MEXC_ICP_NATIVE_ASSETS: &[&str] = &["ckUSDT", "ckBTC", "ICP"];
+
+/// ICP-native assets `venue_id` lists itself, or nothing for a venue that is
+/// not a bridge-capable CEX.
+///
+/// Exposed separately from the profile because the liquidation strategy has to
+/// know which collateral recycles without a bridge long before any venue
+/// profile is built -- and it must not answer that from a second, drifting
+/// copy of the same list.
+pub fn venue_icp_native_assets(venue_id: &str) -> &'static [&'static str] {
+    match venue_id {
+        "kraken" => KRAKEN_ICP_NATIVE_ASSETS,
+        "mexc" => MEXC_ICP_NATIVE_ASSETS,
+        _ => &[],
+    }
+}
+
 impl CexVenueProfile {
     pub fn kraken(preview_taker_fee_bps: f64) -> Self {
         Self {
@@ -123,8 +153,7 @@ impl CexVenueProfile {
             best_route_preview_required: true,
             // Kraken accepts free-text client order IDs up to 18 ASCII characters.
             client_order_id_max_len: 18,
-            // Kraken settles no ICP-network token other than ICP itself.
-            icp_native_assets: &[],
+            icp_native_assets: KRAKEN_ICP_NATIVE_ASSETS,
         }
     }
 
@@ -140,11 +169,7 @@ impl CexVenueProfile {
             direct_withdrawal_reconciliation_required: false,
             best_route_preview_required: false,
             client_order_id_max_len: 32,
-            // MEXC lists ckUSDT on the ICP network, so bridging it to USDT@ETH
-            // would pay a ckETH fee, Ethereum gas and a 15-20 minute mint to
-            // reach a market it already has. ckBTC needs no entry: no
-            // implemented route matches it, so it stays native anyway.
-            icp_native_assets: &["ckUSDT"],
+            icp_native_assets: MEXC_ICP_NATIVE_ASSETS,
         }
     }
 

@@ -20,7 +20,7 @@ pub mod execution;
 pub(crate) mod runtime;
 pub(crate) mod utils;
 
-pub use execution::{CexBridgeConfig, CexBridgeDependencies, CexFinalizer, CexVenueProfile};
+pub use execution::{CexBridgeConfig, CexBridgeDependencies, CexFinalizer, CexVenueProfile, venue_icp_native_assets};
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum CexStep {

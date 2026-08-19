@@ -9,6 +9,7 @@ use crate::executors::executor::ExecutorRequest;
 
 use crate::approval_state::ApprovalState;
 use crate::liquidation::collateral_service::CollateralServiceTrait;
+use crate::liquidation::settlement_speed::{SettlementSpeed, deposit_speed, repayment_speed};
 use crate::stage::PipelineStage;
 
 use candid::{Int, Nat};
@@ -63,6 +64,72 @@ fn is_supported_position_asset_type(pos: &LiquidateblePosition) -> bool {
     pos.asset.symbol().eq_ignore_ascii_case("ICP") || matches!(pos.asset_type, AssetType::CkAsset(_))
 }
 
+/// One (debt, collateral) candidate together with everything ranking orders it
+/// by, so the comparator reads as the policy instead of as tuple indices.
+struct RankedCombo {
+    user_idx: usize,
+    debt_position: LiquidateblePosition,
+    collateral_position: LiquidateblePosition,
+    debt_value: Nat,
+    collateral_value: Nat,
+    /// The outbound leg: how the seized collateral reaches the venue.
+    settlement: SettlementSpeed,
+    /// The return leg: how the proceeds come back as the repayment asset.
+    repayment_settlement: SettlementSpeed,
+    /// `debt_value` after the return-leg haircut, which is what ranking orders
+    /// debts by. See [`RETURN_LEG_HAIRCUT_BPS`].
+    ranked_debt_value: Nat,
+    /// Whether this collateral can back a full repayment of this debt.
+    covers_debt: bool,
+}
+
+/// How much of a debt's ranking weight a bridged return leg gives up.
+///
+/// Unlike the outbound leg, which collateral to seize is nearly a free choice
+/// -- two positions that both cover the debt seize the same value, so only time
+/// differs. Which debt to repay is not: a bigger debt earns a bigger bonus, so
+/// preferring a faster one trades real profit for capital velocity.
+///
+/// A haircut rather than a tier expresses that trade-off directly and, unlike a
+/// "within 25% of each other" rule, stays a total order -- proximity is not
+/// transitive, and `sort_by` panics on a comparator that is not. At 2500 bps a
+/// debt whose proceeds bridge must be a third larger to outrank one whose
+/// proceeds come straight home, which keeps a trivially small fast debt from
+/// displacing a materially bigger slow one. That matters because liquidations
+/// are contested: taking the small one first can raise the borrower's health
+/// factor enough to lose the large one to somebody else entirely.
+const RETURN_LEG_HAIRCUT_BPS: u32 = 2_500;
+
+/// Whether collateral worth `collateral_value` can back a repayment worth
+/// `debt_value`, both in RAY.
+///
+/// Mirrors the cap `max_repay_from_collateral` applies: repaying value V
+/// seizes `V * denom_bps / 10_000` of collateral, where the denominator
+/// carries the liquidation bonus net of the protocol's cut of it. Inverted and
+/// cross-multiplied so the comparison stays in integers.
+///
+/// The bps are clamped rather than rejected. Out-of-range values make the
+/// estimator fail this combo a moment later anyway, and ranking must not panic
+/// on a `Nat` subtraction to find that out.
+fn collateral_covers_debt(
+    debt_value: &Nat,
+    collateral_value: &Nat,
+    collateral_position: &LiquidateblePosition,
+) -> bool {
+    let one_bps = Nat::from(BASIS_POINTS_DENOMINATOR);
+    let bonus = Nat::from(collateral_position.liquidation_bonus);
+    let fee = Nat::from(
+        collateral_position
+            .protocol_fee
+            .min(u64::from(BASIS_POINTS_DENOMINATOR)),
+    );
+
+    let bonus_fee = (bonus.clone() * fee) / one_bps.clone();
+    let denom_bps = one_bps.clone() + bonus - bonus_fee;
+
+    collateral_value.clone() * one_bps >= debt_value.clone() * denom_bps
+}
+
 pub struct SimpleLiquidationStrategy<C, R, U>
 where
     C: ConfigTrait,
@@ -75,6 +142,11 @@ where
     pub account_service: Arc<BalanceService>,
     pub approval_state: Arc<ApprovalState>,
     pub watchdog: Arc<dyn Watchdog>,
+    /// ICP-native symbols the enabled CEX venues list themselves, used to rank
+    /// collateral that recycles in seconds ahead of collateral that has to
+    /// bridge. Empty makes every collateral count as delayed, which leaves
+    /// ranking on collateral value exactly as it was before.
+    venue_native_symbols: Vec<String>,
 }
 
 impl<C, R, U> SimpleLiquidationStrategy<C, R, U>
@@ -97,11 +169,19 @@ where
             account_service: balance_service,
             approval_state,
             watchdog: noop_watchdog(),
+            venue_native_symbols: Vec::new(),
         }
     }
 
     pub fn with_watchdog(mut self, wd: Arc<dyn Watchdog>) -> Self {
         self.watchdog = wd;
+        self
+    }
+
+    /// Declares which collateral symbols reach a CEX without bridging, so
+    /// ranking can prefer the ones that free capital again in seconds.
+    pub fn with_venue_native_symbols(mut self, symbols: Vec<String>) -> Self {
+        self.venue_native_symbols = symbols;
         self
     }
 
@@ -137,6 +217,31 @@ where
         }
     }
 
+    /// Both legs of this combo's round trip: how the seized collateral reaches
+    /// a venue, and how the proceeds come back as the repayment asset.
+    ///
+    /// Either side resolving to no known token counts as delayed. The loop
+    /// skips such a combo a moment later anyway, and calling it fast would let
+    /// an asset we cannot even name displace one that really does recycle in
+    /// seconds.
+    fn combo_settlement_speed(
+        &self,
+        debt_position: &LiquidateblePosition,
+        collateral_position: &LiquidateblePosition,
+    ) -> (SettlementSpeed, SettlementSpeed) {
+        let (Some(collateral), Some(repayment)) = (
+            resolve_token_for_position(self.registry.as_ref(), collateral_position),
+            resolve_token_for_position(self.registry.as_ref(), debt_position),
+        ) else {
+            return (SettlementSpeed::Delayed, SettlementSpeed::Delayed);
+        };
+
+        (
+            deposit_speed(&collateral, &repayment, &self.venue_native_symbols),
+            repayment_speed(&collateral, &repayment, &self.venue_native_symbols),
+        )
+    }
+
     /// Worth of `native_amount` of `asset`, in RAY, so positions denominated in
     /// different tokens can be compared against each other.
     ///
@@ -166,6 +271,11 @@ where
     fn min_collateral_for_bad_debt(gross_collateral: Nat, slippage_bps: u32) -> Nat {
         amount_after_bps_haircut(&gross_collateral, slippage_bps.min(BASIS_POINTS_DENOMINATOR))
             .unwrap_or_else(|_| Nat::from(0u8))
+    }
+
+    /// Renders a RAY-denominated value as whole units for logging.
+    fn ray_to_units(value: &Nat) -> f64 {
+        value.0.to_f64().unwrap_or(f64::MAX) / 1e27
     }
 
     fn native_to_units(amount: &Nat, decimals: u8) -> f64 {
@@ -452,26 +562,98 @@ where
                     &mut prices,
                 )
                 .await;
-            priced.push((
+            let (settlement, repayment_settlement) = self.combo_settlement_speed(&debt_position, &collateral_position);
+            let covers_debt = collateral_covers_debt(&debt_value, &collateral_value, &collateral_position);
+            // A debt whose proceeds bridge home is worth less to rank on than
+            // the same debt repaid in an asset the venue settles on the IC.
+            let ranked_debt_value = match repayment_settlement {
+                SettlementSpeed::Direct => debt_value.clone(),
+                SettlementSpeed::Delayed => {
+                    amount_after_bps_haircut(&debt_value, RETURN_LEG_HAIRCUT_BPS).unwrap_or_else(|_| Nat::from(0u8))
+                }
+            };
+            priced.push(RankedCombo {
                 user_idx,
                 debt_position,
                 collateral_position,
                 debt_value,
                 collateral_value,
-            ));
+                settlement,
+                repayment_settlement,
+                ranked_debt_value,
+                covers_debt,
+            });
         }
 
-        // Most urgent first: lowest health factor, then largest debt by value,
-        // then largest collateral by value.
-        priced.sort_by(|(i1, _, _, d1, c1), (i2, _, _, d2, c2)| {
-            work_users[*i1]
+        // Most urgent first: lowest health factor, then largest debt by value
+        // after the return-leg haircut. That haircut is how the debt side of
+        // the round trip enters ranking at all: repaying ckUSDT comes home in
+        // seconds because MEXC settles it on the IC, while repaying ckUSDC is
+        // withdrawn on Ethereum and bridged back, and ranking on raw size could
+        // not tell those apart.
+        //
+        // Which collateral backs that repayment is decided in two further
+        // steps, kept separate from the debt haircut on purpose: folding the
+        // outbound leg into the same figure would let a dust position that
+        // settles fast outweigh a large one that covers the debt. First,
+        // collateral that can cover the repayment outranks collateral that
+        // cannot: a position too small to back the debt caps the repay, and the
+        // buffer override downstream still charges the full request against the
+        // cycle's balance, so letting a dust position win the pairing spends the
+        // budget of a liquidation it cannot perform.
+        //
+        // Only among collateral that can do the job does speed decide, and it
+        // decides before size. Either position seizes the same value for the
+        // same repayment, so the choice sets nothing except when the capital is
+        // spendable again: ckBTC reaches MEXC in one ICRC-1 transfer, while
+        // ckETH has to burn through the ckETH minter and wait 15-20 minutes on
+        // Ethereum before the venue sees a deposit. Ranking purely by size
+        // paired the largest debt with the largest collateral, which is how a
+        // USDT debt took the slow ckETH collateral and left the ckBTC that
+        // would have recycled the capital in seconds for a second liquidation
+        // the balance could no longer fund.
+        priced.sort_by(|a, b| {
+            work_users[a.user_idx]
                 .health_factor
-                .cmp(&work_users[*i2].health_factor)
-                .then(d2.cmp(d1))
-                .then(c2.cmp(c1))
+                .cmp(&work_users[b.user_idx].health_factor)
+                .then(b.ranked_debt_value.cmp(&a.ranked_debt_value))
+                .then(b.covers_debt.cmp(&a.covers_debt))
+                .then(a.settlement.cmp(&b.settlement))
+                .then(b.collateral_value.cmp(&a.collateral_value))
         });
 
-        for (user_idx, debt_position, collateral_position, _, _) in priced {
+        // The order the loop is about to walk. Without this a live run leaves
+        // the ranking to be inferred from the order quotes appear in, which
+        // cannot tell a coverage decision from a speed one. Debug because a
+        // full cycle ranks every combo of every borrower; enable it with
+        // `RUST_LOG=liquidium_pipeline::stages::simple_strategy=debug`.
+        for (rank, combo) in priced.iter().enumerate() {
+            debug!(
+                "Ranked #{}: borrower={} hf={} | debt={} (${:.2} -> ranked ${:.2}) | collateral={} (${:.2}) | covers={} out={:?} back={:?}",
+                rank,
+                combo.debt_position.account,
+                work_users[combo.user_idx].health_factor,
+                combo.debt_position.asset.symbol(),
+                Self::ray_to_units(&combo.debt_value),
+                Self::ray_to_units(&combo.ranked_debt_value),
+                combo.collateral_position.asset.symbol(),
+                Self::ray_to_units(&combo.collateral_value),
+                combo.covers_debt,
+                combo.settlement,
+                combo.repayment_settlement,
+            );
+        }
+
+        for RankedCombo {
+            user_idx,
+            debt_position,
+            collateral_position,
+            settlement,
+            repayment_settlement,
+            covers_debt,
+            ..
+        } in priced
+        {
             let debt_key = format!("{}:{}", debt_position.account, debt_position.pool_id);
             if cleared_debts.contains(&debt_key) {
                 continue;
@@ -640,7 +822,7 @@ where
 
             let inverse_price = if price > 0.0 { 1.0 / price } else { 0.0 };
             info!(
-                "💱 Quote: repay_debt={} {} | seized_collateral={} {} | estimated_swap_out={} {} | price={} inverse_price={} | swap={} -> {}",
+                "💱 Quote: repay_debt={} {} | seized_collateral={} {} | estimated_swap_out={} {} | price={} inverse_price={} | swap={} -> {} | ranked: covers={} out={:?} back={:?}",
                 Self::native_to_units(&expected_repaid_debt, repayment_token.decimals()),
                 repayment_token.symbol(),
                 Self::native_to_units(&estimation.received_collateral, collateral_token.decimals()),
@@ -650,7 +832,10 @@ where
                 price,
                 inverse_price,
                 collateral_token.symbol(),
-                repayment_token.symbol()
+                repayment_token.symbol(),
+                covers_debt,
+                settlement,
+                repayment_settlement,
             );
 
             let profit = Int::from(amount_received)
@@ -718,7 +903,14 @@ where
                 min_collateral_amount,
             });
 
-            if estimation.repaid_debt >= debt_position.debt_amount {
+            // The request above is padded on purpose and the canister returns
+            // the difference as change, so it is not evidence the debt closed.
+            // `expected_repaid_debt` is what the estimator says will actually
+            // settle -- the same figure the profit basis uses. Reading the
+            // padded request here let a collateral-capped partial repayment
+            // mark the debt cleared and skip the combo that could have closed
+            // it with the borrower's other collateral.
+            if expected_repaid_debt >= debt_position.debt_amount {
                 cleared_debts.insert(debt_key);
             }
 
@@ -762,8 +954,13 @@ mod tests {
 
     fn mk_icp_token(symbol: &str, decimals: u8) -> ChainToken {
         // Fee comes from ChainToken impl, not from tests.
+        //
+        // The ledger is derived from the symbol because real ck-assets each
+        // have their own. A shared principal made every token compare equal by
+        // `asset_id`, which silently reads as "collateral is already the
+        // repayment asset" and collapses settlement ranking to one class.
         ChainToken::Icp {
-            ledger: p("mxzaz-hqaaa-aaaar-qaada-cai"),
+            ledger: Principal::from_slice(symbol.as_bytes()),
             symbol: symbol.to_string(),
             decimals,
             fee: 100u8.into(),
@@ -2108,6 +2305,503 @@ mod tests {
             first_priced.lock().unwrap().as_deref(),
             Some("ICP"),
             "the $50 ICP position must be evaluated before the $2.50 ckETH one"
+        );
+    }
+
+    /// Reproduces the pairing on a borrower holding USDT and USDC debt against
+    /// ckETH and ckBTC collateral. Ranking collateral purely by value handed
+    /// the larger USDT debt the more valuable ckETH, which cannot reach MEXC
+    /// without burning through the ckETH minter and waiting 15-20 minutes on
+    /// Ethereum -- while the ckBTC that MEXC accepts in a single ICRC-1
+    /// transfer went to the smaller debt. Same profit, capital back a quarter
+    /// of an hour later, and one fewer liquidation funded in between.
+    #[tokio::test]
+    async fn pairs_the_largest_debt_with_the_collateral_that_recycles_fastest() {
+        let ckusdt_ledger = p("cngnf-vqaaa-aaaar-qag4q-cai");
+        let ckusdc_ledger = p("xevnm-gaaaa-aaaar-qafnq-cai");
+        let cketh_ledger = p("ss2fx-dyaaa-aaaar-qacoq-cai");
+        let ckbtc_ledger = p("mxzaz-hqaaa-aaaar-qaada-cai");
+
+        let mut registry = MockTokenRegistryTrait::new();
+        registry.expect_get().returning(move |id: &AssetId| {
+            Some(match id.symbol.as_str() {
+                "USDT" => mk_icp_token("ckUSDT", 6),
+                "USDC" => mk_icp_token("ckUSDC", 6),
+                "ETH" => mk_icp_token("ckETH", 18),
+                _ => mk_icp_token("ckBTC", 8),
+            })
+        });
+
+        let mut cfg = MockConfigTrait::new();
+        let trader = p("aaaaa-aa");
+        cfg.expect_get_trader_principal().return_const(trader);
+        cfg.expect_get_liquidator_principal().return_const(trader);
+        cfg.expect_should_buy_bad_debt().return_const(false);
+        cfg.expect_get_max_allowed_dex_slippage().return_const(2000u32);
+        cfg.expect_get_lending_canister()
+            .return_const(p("mxzaz-hqaaa-aaaar-qaada-cai"));
+        cfg.expect_get_bad_debt_collateral_slippage_bps().return_const(100u32);
+
+        // The (debt, collateral) pair the loop evaluates first.
+        let first_pair = Arc::new(std::sync::Mutex::new(None::<(String, String)>));
+        let sink = first_pair.clone();
+
+        let mut collateral = MockCollateralServiceTrait::new();
+        // BTC ~$100k, ETH ~$3k, both stables $1, all in RAY.
+        collateral.expect_price_ray().returning(|asset| {
+            Ok(match asset {
+                Assets::BTC => Nat::from(100_000_000_000_000_000_000_000_000_000_000u128),
+                Assets::ETH => Nat::from(3_000_000_000_000_000_000_000_000_000_000u128),
+                _ => Nat::from(1_000_000_000_000_000_000_000_000_000u128),
+            })
+        });
+        collateral
+            .expect_calculate_liquidation_amounts()
+            .returning(move |_max_balance, debt_pos, coll_pos, _user| {
+                sink.lock()
+                    .unwrap()
+                    .get_or_insert_with(|| (debt_pos.asset.symbol(), coll_pos.asset.symbol()));
+                Ok(LiquidationEstimation {
+                    received_collateral: Nat::from(1_000u64),
+                    repaid_debt: debt_pos.debt_amount.clone(),
+                    ref_price: Nat::from(0u8),
+                    debt_price: Nat::from(0u8),
+                })
+            });
+
+        let mut account = MockAccountInfo::new();
+        account.expect_sync_balance().returning(move |t: &ChainToken| {
+            Ok(ChainTokenAmount {
+                token: t.clone(),
+                value: Nat::from(100_000_000_000u128),
+            })
+        });
+        account.expect_get_balance().returning(move |t: &ChainToken| {
+            Ok(ChainTokenAmount {
+                token: t.clone(),
+                value: Nat::from(100_000_000_000u128),
+            })
+        });
+
+        let registry = Arc::new(registry);
+        let account = Arc::new(account);
+        let balance_service = Arc::new(BalanceService::new(registry.clone(), account.clone()));
+
+        let strategy = SimpleLiquidationStrategy::new(
+            Arc::new(cfg),
+            registry.clone(),
+            Arc::new(collateral),
+            balance_service,
+            Arc::new(ApprovalState::new()),
+        )
+        // What MEXC lists on the ICP network. ckETH is absent on purpose.
+        .with_venue_native_symbols(vec!["ckUSDT".to_string(), "ckBTC".to_string(), "ICP".to_string()]);
+
+        let borrower = p("4awtt-aaaaa-aaaaa-aaaaa-aaaaa-aaaaa-cvai");
+        // 600 USDT, the larger debt, so it is paired first either way.
+        let usdt_debt = mk_position(
+            p("jrgdg-siaaa-aaaae-qkfmq-cai"),
+            borrower,
+            ckusdt_ledger,
+            600_000_000,
+            0,
+            Assets::USDT,
+        );
+        // 500 USDC.
+        let usdc_debt = mk_position(
+            p("en2mt-fyaaa-aaaae-qkefq-cai"),
+            borrower,
+            ckusdc_ledger,
+            500_000_000,
+            0,
+            Assets::USDC,
+        );
+        // 1 ckETH -- $3000, the more valuable collateral, but it has to bridge.
+        let cketh_collateral = mk_position(
+            p("42svn-2yaaa-aaaae-qfcsq-cai"),
+            borrower,
+            cketh_ledger,
+            0,
+            1_000_000_000_000_000_000,
+            Assets::ETH,
+        );
+        // 0.02 ckBTC -- $2000, worth less, but tradeable seconds after the seize.
+        let ckbtc_collateral = mk_position(
+            p("mxzaz-hqaaa-aaaar-qaada-cai"),
+            borrower,
+            ckbtc_ledger,
+            0,
+            2_000_000,
+            Assets::BTC,
+        );
+
+        let user = mk_user(
+            vec![usdt_debt, usdc_debt, cketh_collateral, ckbtc_collateral],
+            1_100_000_000,
+            900,
+        );
+
+        let _ = strategy.process(&vec![user]).await.unwrap();
+
+        assert_eq!(
+            first_pair.lock().unwrap().clone(),
+            Some(("USDT".to_string(), "BTC".to_string())),
+            "the most urgent debt must take the collateral that recycles in seconds, not the largest one"
+        );
+    }
+
+    /// Builds a strategy whose estimator records every (debt, collateral) pair
+    /// the loop commits to, repaying `repaid_fraction_bps` of each debt.
+    ///
+    /// Shared by the ranking tests because they differ only in the positions
+    /// they hand it and the order they expect back.
+    fn ranking_probe(
+        repaid_fraction_bps: u64,
+        received_collateral: u64,
+    ) -> (
+        SimpleLiquidationStrategy<MockConfigTrait, MockTokenRegistryTrait, MockCollateralServiceTrait>,
+        Arc<std::sync::Mutex<Vec<(String, String)>>>,
+    ) {
+        let mut registry = MockTokenRegistryTrait::new();
+        registry.expect_get().returning(move |id: &AssetId| {
+            Some(match id.symbol.as_str() {
+                "USDT" => mk_icp_token("ckUSDT", 6),
+                "USDC" => mk_icp_token("ckUSDC", 6),
+                "ETH" => mk_icp_token("ckETH", 18),
+                "ICP" => mk_icp_token("ICP", 8),
+                _ => mk_icp_token("ckBTC", 8),
+            })
+        });
+
+        let mut cfg = MockConfigTrait::new();
+        let trader = p("aaaaa-aa");
+        cfg.expect_get_trader_principal().return_const(trader);
+        cfg.expect_get_liquidator_principal().return_const(trader);
+        cfg.expect_should_buy_bad_debt().return_const(false);
+        cfg.expect_get_max_allowed_dex_slippage().return_const(2000u32);
+        cfg.expect_get_lending_canister()
+            .return_const(p("mxzaz-hqaaa-aaaar-qaada-cai"));
+        cfg.expect_get_bad_debt_collateral_slippage_bps().return_const(100u32);
+
+        let pairs = Arc::new(std::sync::Mutex::new(Vec::<(String, String)>::new()));
+        let sink = pairs.clone();
+
+        let mut collateral = MockCollateralServiceTrait::new();
+        // BTC ~$100k, ETH ~$3k, both stables $1, all in RAY.
+        collateral.expect_price_ray().returning(|asset| {
+            Ok(match asset {
+                Assets::BTC => Nat::from(100_000_000_000_000_000_000_000_000_000_000u128),
+                Assets::ETH => Nat::from(3_000_000_000_000_000_000_000_000_000_000u128),
+                Assets::ICP => Nat::from(5_000_000_000_000_000_000_000_000_000u128),
+                _ => Nat::from(1_000_000_000_000_000_000_000_000_000u128),
+            })
+        });
+        collateral
+            .expect_calculate_liquidation_amounts()
+            .returning(move |_max_balance, debt_pos, coll_pos, _user| {
+                sink.lock()
+                    .unwrap()
+                    .push((debt_pos.asset.symbol(), coll_pos.asset.symbol()));
+                Ok(LiquidationEstimation {
+                    received_collateral: Nat::from(received_collateral),
+                    repaid_debt: (debt_pos.debt_amount.clone() * Nat::from(repaid_fraction_bps))
+                        / Nat::from(BASIS_POINTS_DENOMINATOR),
+                    ref_price: Nat::from(0u8),
+                    debt_price: Nat::from(0u8),
+                })
+            });
+
+        let mut account = MockAccountInfo::new();
+        account.expect_sync_balance().returning(move |t: &ChainToken| {
+            Ok(ChainTokenAmount {
+                token: t.clone(),
+                value: Nat::from(1_000_000_000_000u128),
+            })
+        });
+        account.expect_get_balance().returning(move |t: &ChainToken| {
+            Ok(ChainTokenAmount {
+                token: t.clone(),
+                value: Nat::from(1_000_000_000_000u128),
+            })
+        });
+
+        let registry = Arc::new(registry);
+        let account = Arc::new(account);
+        let balance_service = Arc::new(BalanceService::new(registry.clone(), account.clone()));
+
+        let strategy = SimpleLiquidationStrategy::new(
+            Arc::new(cfg),
+            registry,
+            Arc::new(collateral),
+            balance_service,
+            Arc::new(ApprovalState::new()),
+        )
+        // What MEXC lists on the ICP network. ckETH is absent on purpose.
+        .with_venue_native_symbols(vec!["ckUSDT".to_string(), "ckBTC".to_string(), "ICP".to_string()]);
+
+        (strategy, pairs)
+    }
+
+    /// A dust position that settles fast must not outrank collateral that can
+    /// actually close the debt.
+    ///
+    /// Preferring speed alone sent the $5,000 ckUSDT debt to $20 of ckBTC. The
+    /// estimator caps that repayment at what $20 of collateral supports, but
+    /// the repay-buffer override then raises the request back to the full debt
+    /// -- which charges $5,000 against the cycle's balance for a $20
+    /// liquidation and, before the `expected_repaid_debt` fix below, marked the
+    /// debt cleared so the $9,000 ckETH position was never tried.
+    #[tokio::test]
+    async fn a_dust_position_that_settles_fast_does_not_outrank_collateral_that_covers_the_debt() {
+        let (strategy, pairs) = ranking_probe(BASIS_POINTS_DENOMINATOR as u64, 1_000);
+
+        let borrower = p("4awtt-aaaaa-aaaaa-aaaaa-aaaaa-aaaaa-cvai");
+        // 5,000 ckUSDT.
+        let debt = mk_position(
+            p("jrgdg-siaaa-aaaae-qkfmq-cai"),
+            borrower,
+            p("cngnf-vqaaa-aaaar-qag4q-cai"),
+            5_000_000_000,
+            0,
+            Assets::USDT,
+        );
+        // 3 ckETH -- $9,000, slow, and the only position that can close the debt.
+        let cketh_collateral = mk_position(
+            p("42svn-2yaaa-aaaae-qfcsq-cai"),
+            borrower,
+            p("ss2fx-dyaaa-aaaar-qacoq-cai"),
+            0,
+            3_000_000_000_000_000_000,
+            Assets::ETH,
+        );
+        // 0.0002 ckBTC -- $20, fast, and nowhere near enough.
+        let ckbtc_collateral = mk_position(
+            p("mxzaz-hqaaa-aaaar-qaada-cai"),
+            borrower,
+            p("mxzaz-hqaaa-aaaar-qaada-cai"),
+            0,
+            20_000,
+            Assets::BTC,
+        );
+
+        let user = mk_user(vec![debt, cketh_collateral, ckbtc_collateral], 5_000_000_000, 900);
+        let _ = strategy.process(&vec![user]).await.unwrap();
+
+        assert_eq!(
+            pairs.lock().unwrap().first().cloned(),
+            Some(("USDT".to_string(), "ETH".to_string())),
+            "the collateral that can close the debt must be paired first, however slowly it settles"
+        );
+    }
+
+    /// Collateral that is already the repayment asset never reaches a venue at
+    /// all, so it must not be ranked behind one that does.
+    ///
+    /// Classifying on the venue list alone made ckUSDC collateral against
+    /// ckUSDC debt `Delayed`, losing the pairing to a smaller ckBTC position
+    /// and buying a MEXC deposit, trade and withdrawal that nothing needed.
+    #[tokio::test]
+    async fn collateral_that_is_already_the_repayment_asset_wins_the_pairing() {
+        let (strategy, pairs) = ranking_probe(BASIS_POINTS_DENOMINATOR as u64, 1_000);
+
+        let borrower = p("4awtt-aaaaa-aaaaa-aaaaa-aaaaa-aaaaa-cvai");
+        // 1,000 ckUSDC.
+        let debt = mk_position(
+            p("jrgdg-siaaa-aaaae-qkfmq-cai"),
+            borrower,
+            p("xevnm-gaaaa-aaaar-qafnq-cai"),
+            1_000_000_000,
+            0,
+            Assets::USDC,
+        );
+        // 5,000 ckUSDC -- needs no swap whatsoever.
+        let ckusdc_collateral = mk_position(
+            p("en2mt-fyaaa-aaaae-qkefq-cai"),
+            borrower,
+            p("xevnm-gaaaa-aaaar-qafnq-cai"),
+            0,
+            5_000_000_000,
+            Assets::USDC,
+        );
+        // 0.02 ckBTC -- $2,000, fast, but still a full venue round trip.
+        let ckbtc_collateral = mk_position(
+            p("mxzaz-hqaaa-aaaar-qaada-cai"),
+            borrower,
+            p("mxzaz-hqaaa-aaaar-qaada-cai"),
+            0,
+            2_000_000,
+            Assets::BTC,
+        );
+
+        let user = mk_user(vec![debt, ckusdc_collateral, ckbtc_collateral], 1_000_000_000, 900);
+        let _ = strategy.process(&vec![user]).await.unwrap();
+
+        assert_eq!(
+            pairs.lock().unwrap().first().cloned(),
+            Some(("USDC".to_string(), "USDC".to_string())),
+            "same-asset collateral skips the swap entirely and must rank ahead of a venue round trip"
+        );
+    }
+
+    /// A repayment the collateral capped below the full debt must leave that
+    /// debt open for the borrower's other collateral.
+    ///
+    /// The request sent to the canister is padded on purpose and the change
+    /// comes back, so reading it as proof the debt closed retired the debt key
+    /// after a partial settlement and skipped every remaining combo for it.
+    /// The first pairing here is same-asset so it needs no swap and clears the
+    /// profit gate, which is what carries it as far as the decision.
+    #[tokio::test]
+    async fn a_partially_repaid_debt_stays_open_for_the_next_collateral() {
+        // The estimator settles half of whatever it is asked to repay, and
+        // seizes enough for the combo to be profitable.
+        let (strategy, pairs) = ranking_probe(5_000, 2_000_000_000);
+
+        let borrower = p("4awtt-aaaaa-aaaaa-aaaaa-aaaaa-aaaaa-cvai");
+        // 1,000 ckUSDT.
+        let debt = mk_position(
+            p("jrgdg-siaaa-aaaae-qkfmq-cai"),
+            borrower,
+            p("cngnf-vqaaa-aaaar-qag4q-cai"),
+            1_000_000_000,
+            0,
+            Assets::USDT,
+        );
+        // 5,000 ckUSDT -- same asset, so no swap and a clean profit.
+        let ckusdt_collateral = mk_position(
+            p("en2mt-fyaaa-aaaae-qkefq-cai"),
+            borrower,
+            p("cngnf-vqaaa-aaaar-qag4q-cai"),
+            0,
+            5_000_000_000,
+            Assets::USDT,
+        );
+        // 3 ckETH -- $9,000, the collateral that should still get its turn.
+        let cketh_collateral = mk_position(
+            p("42svn-2yaaa-aaaae-qfcsq-cai"),
+            borrower,
+            p("ss2fx-dyaaa-aaaar-qacoq-cai"),
+            0,
+            3_000_000_000_000_000_000,
+            Assets::ETH,
+        );
+
+        let user = mk_user(vec![debt, ckusdt_collateral, cketh_collateral], 1_000_000_000, 900);
+        let _ = strategy.process(&vec![user]).await.unwrap();
+
+        assert_eq!(
+            pairs.lock().unwrap().clone(),
+            vec![
+                ("USDT".to_string(), "USDT".to_string()),
+                ("USDT".to_string(), "ETH".to_string()),
+            ],
+            "a half-settled debt must still be offered the borrower's other collateral"
+        );
+    }
+
+    /// Builds the borrower from the first live run: ckUSDC and ckUSDT debt
+    /// against ckBTC and ckETH collateral, with the ckUSDC debt worth
+    /// `ckusdc_debt` and the ckUSDT debt $40.
+    fn mixed_debt_borrower(ckusdc_debt: u64) -> LiquidatebleUser {
+        let borrower = p("4awtt-aaaaa-aaaaa-aaaaa-aaaaa-aaaaa-cvai");
+        let usdc_debt = mk_position(
+            p("jrgdg-siaaa-aaaae-qkfmq-cai"),
+            borrower,
+            p("xevnm-gaaaa-aaaar-qafnq-cai"),
+            ckusdc_debt,
+            0,
+            Assets::USDC,
+        );
+        // 40 ckUSDT.
+        let usdt_debt = mk_position(
+            p("en2mt-fyaaa-aaaae-qkefq-cai"),
+            borrower,
+            p("cngnf-vqaaa-aaaar-qag4q-cai"),
+            40_000_000,
+            0,
+            Assets::USDT,
+        );
+        // 0.02 ckBTC -- $2,000, covers either debt.
+        let ckbtc_collateral = mk_position(
+            p("mxzaz-hqaaa-aaaar-qaada-cai"),
+            borrower,
+            p("mxzaz-hqaaa-aaaar-qaada-cai"),
+            0,
+            2_000_000,
+            Assets::BTC,
+        );
+        // 1 ckETH -- $3,000, also covers either debt.
+        let cketh_collateral = mk_position(
+            p("42svn-2yaaa-aaaae-qfcsq-cai"),
+            borrower,
+            p("ss2fx-dyaaa-aaaar-qacoq-cai"),
+            0,
+            1_000_000_000_000_000_000,
+            Assets::ETH,
+        );
+
+        mk_user(
+            vec![usdc_debt, usdt_debt, ckbtc_collateral, cketh_collateral],
+            ckusdc_debt + 40_000_000,
+            900,
+        )
+    }
+
+    /// MEXC settles ckUSDT on the ICP network but not ckUSDC, so repaying
+    /// ckUSDC withdraws USDC on Ethereum and bridges home -- 15-20 minutes the
+    /// ckUSDT debt does not cost. Ranking debts on raw size alone could not see
+    /// that, and sent a $51 ckUSDC debt ahead of a $40 ckUSDT one.
+    #[tokio::test]
+    async fn a_debt_whose_proceeds_come_straight_home_beats_a_slightly_larger_bridged_one() {
+        let (strategy, pairs) = ranking_probe(BASIS_POINTS_DENOMINATOR as u64, 1_000);
+
+        // $51.35 ckUSDC against $40 ckUSDT: bigger, but its proceeds bridge.
+        let _ = strategy.process(&vec![mixed_debt_borrower(51_350_000)]).await.unwrap();
+
+        assert_eq!(
+            pairs.lock().unwrap().first().cloned(),
+            Some(("USDT".to_string(), "BTC".to_string())),
+            "the debt that comes home in seconds must be repaid first when the two are comparable"
+        );
+    }
+
+    /// The haircut must not hand a materially bigger liquidation to a
+    /// competitor for a latency win. Liquidations are contested, and taking the
+    /// small one first can lift the borrower's health factor out of range.
+    #[tokio::test]
+    async fn a_materially_larger_bridged_debt_still_outranks_a_fast_small_one() {
+        let (strategy, pairs) = ranking_probe(BASIS_POINTS_DENOMINATOR as u64, 1_000);
+
+        // $500 ckUSDC against $40 ckUSDT: far past the 25% haircut.
+        let _ = strategy.process(&vec![mixed_debt_borrower(500_000_000)]).await.unwrap();
+
+        assert_eq!(
+            pairs.lock().unwrap().first().cloned(),
+            Some(("USDC".to_string(), "BTC".to_string())),
+            "a debt worth an order more must win despite its slower return leg"
+        );
+    }
+
+    /// The haircut is exactly 25%, so the boundary is where a bridged debt is
+    /// one third larger than a direct one.
+    #[tokio::test]
+    async fn the_return_leg_haircut_turns_over_at_a_third_larger() {
+        // $53 ckUSDC vs $40 ckUSDT: 53 * 0.75 = 39.75, still short of 40.
+        let (strategy, pairs) = ranking_probe(BASIS_POINTS_DENOMINATOR as u64, 1_000);
+        let _ = strategy.process(&vec![mixed_debt_borrower(53_000_000)]).await.unwrap();
+        assert_eq!(
+            pairs.lock().unwrap().first().cloned().map(|pair| pair.0),
+            Some("USDT".to_string()),
+            "just under a third larger, the fast debt still wins"
+        );
+
+        // $54 ckUSDC vs $40 ckUSDT: 54 * 0.75 = 40.5, now ahead.
+        let (strategy, pairs) = ranking_probe(BASIS_POINTS_DENOMINATOR as u64, 1_000);
+        let _ = strategy.process(&vec![mixed_debt_borrower(54_000_000)]).await.unwrap();
+        assert_eq!(
+            pairs.lock().unwrap().first().cloned().map(|pair| pair.0),
+            Some("USDC".to_string()),
+            "just over a third larger, the bigger debt wins despite bridging"
         );
     }
 
