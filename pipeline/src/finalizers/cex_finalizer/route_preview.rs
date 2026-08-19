@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, hash_map::Entry};
 
 use liquidium_pipeline_connectors::backend::cex_backend::{CexBackend, OrderBook};
 
@@ -28,13 +28,10 @@ impl RouteOrderbooks {
     where
         B: CexBackend,
     {
-        if !self.books.contains_key(market) {
-            let book = backend.get_orderbook(market, Some(DEFAULT_ORDERBOOK_LIMIT)).await?;
-            self.books.insert(market.to_string(), book);
+        match self.books.entry(market.to_string()) {
+            Entry::Occupied(book) => Ok(book.into_mut()),
+            Entry::Vacant(slot) => Ok(slot.insert(backend.get_orderbook(market, Some(DEFAULT_ORDERBOOK_LIMIT)).await?)),
         }
-        self.books
-            .get(market)
-            .ok_or_else(|| format!("orderbook for {market} vanished from this pass"))
     }
 }
 

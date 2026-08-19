@@ -785,6 +785,62 @@ async fn candidate_routes_share_one_read_per_market_and_the_best_still_wins() {
     assert_eq!(reads.get("D_C"), Some(&1));
 }
 
+/// The direct market is probed for availability before any route is priced.
+/// That probe has to be the read the direct route is then previewed on: a
+/// second read costs a venue call and prices the direct candidate on a later
+/// book than the one it was admitted on.
+#[tokio::test]
+async fn the_direct_market_probe_is_the_read_its_preview_uses() {
+    let reads: Arc<std::sync::Mutex<HashMap<String, usize>>> = Arc::new(std::sync::Mutex::new(HashMap::new()));
+    let counted = Arc::clone(&reads);
+
+    let mut backend = MockCexBackend::new();
+    backend.expect_get_orderbook().returning(move |market, _| {
+        *counted
+            .lock()
+            .expect("read counter")
+            .entry(market.to_string())
+            .or_insert(0) += 1;
+        let price = match market {
+            "A_C" => 1.5,
+            "A_B" | "B_C" => 1.0,
+            _ => return Err(format!("no {market} market")),
+        };
+        Ok(OrderBook {
+            bids: vec![OrderBookLevel {
+                price,
+                quantity: 1_000_000.0,
+            }],
+            asks: vec![],
+        })
+    });
+
+    let finalizer = MexcFinalizer::new(
+        Arc::new(backend),
+        Arc::new(MockTransferActions::new()),
+        Principal::anonymous(),
+        TEST_MAX_SELL_SLIPPAGE_BPS,
+        TEST_CEX_MIN_EXEC_USD,
+        TEST_CEX_SLICE_TARGET_RATIO,
+    )
+    .with_profile(CexVenueProfile::mexc())
+    .with_route_config(vec!["A_B".to_string(), "B_C".to_string()], 1);
+
+    let (legs, _) = finalizer
+        .resolve_best_trade_route_for_amount("A", "C", 100.0)
+        .await
+        .expect("the direct route is executable");
+    assert_eq!(
+        legs.iter().map(|leg| leg.market.as_str()).collect::<Vec<_>>(),
+        vec!["A_C"]
+    );
+
+    let reads = reads.lock().expect("read counter");
+    assert_eq!(reads.get("A_C"), Some(&1), "probed and previewed on one read");
+    assert_eq!(reads.get("A_B"), Some(&1));
+    assert_eq!(reads.get("B_C"), Some(&1));
+}
+
 /// A bridge route existing is not a reason to use it.
 ///
 /// MEXC lists ckUSDT on the ICP network, so it settles in one ICRC-1 transfer.

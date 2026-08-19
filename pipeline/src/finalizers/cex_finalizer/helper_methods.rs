@@ -247,6 +247,19 @@ where
     ///
     /// When neither side is tradable, returns a combined error with both probe outcomes.
     async fn resolve_direct_leg(&self, deposit_symbol: &str, withdraw_symbol: &str) -> Result<TradeLeg, String> {
+        self.resolve_direct_leg_with_books(&mut RouteOrderbooks::default(), deposit_symbol, withdraw_symbol)
+            .await
+    }
+
+    /// `resolve_direct_leg` reading through the books of the current pass, so
+    /// the market it probes is not read a second time when the direct route is
+    /// then previewed against the other candidates.
+    async fn resolve_direct_leg_with_books(
+        &self,
+        books: &mut RouteOrderbooks,
+        deposit_symbol: &str,
+        withdraw_symbol: &str,
+    ) -> Result<TradeLeg, String> {
         let deposit = deposit_symbol.to_ascii_uppercase();
         let withdraw = withdraw_symbol.to_ascii_uppercase();
 
@@ -255,11 +268,7 @@ where
         let mut errors: Vec<String> = Vec::new();
 
         // Preferred direct path: sell deposit asset into withdraw asset.
-        match self
-            .backend
-            .get_orderbook(&sell_market, Some(DEFAULT_ORDERBOOK_LIMIT))
-            .await
-        {
+        match books.book(self.backend.as_ref(), &sell_market).await {
             Ok(orderbook) => {
                 if !orderbook.bids.is_empty() {
                     return Ok(TradeLeg {
@@ -273,11 +282,7 @@ where
         }
 
         // Fallback direct path: buy withdraw asset with deposit asset on the inverse market.
-        match self
-            .backend
-            .get_orderbook(&buy_market, Some(DEFAULT_ORDERBOOK_LIMIT))
-            .await
-        {
+        match books.book(self.backend.as_ref(), &buy_market).await {
             Ok(orderbook) => {
                 if !orderbook.asks.is_empty() {
                     return Ok(TradeLeg {
@@ -619,9 +624,18 @@ where
             return Ok((legs, preview));
         }
 
+        // One set of books for the whole pass, opened before the direct probe
+        // so the market it reads is the one the direct route is then previewed
+        // on. Candidates overlap heavily -- every route out of the pay asset
+        // opens on the same leg -- so this also spares a read per route that
+        // crosses a market already seen.
+        let mut books = RouteOrderbooks::default();
         let mut candidates = Vec::new();
         let mut discovery_errors = Vec::new();
-        match self.resolve_direct_leg(&deposit, &withdraw).await {
+        match self
+            .resolve_direct_leg_with_books(&mut books, &deposit, &withdraw)
+            .await
+        {
             Ok(leg) => candidates.push(vec![leg]),
             Err(error) => discovery_errors.push(error),
         }
@@ -633,10 +647,6 @@ where
         candidates.retain(|candidate| seen.insert(Self::route_signature(candidate)));
         let mut best: Option<(Vec<TradeLeg>, CexResolvedRoutePreview)> = None;
         let mut preview_errors = Vec::new();
-        // Candidates overlap heavily -- every route out of the pay asset opens
-        // on the same leg -- so one set of books serves the whole comparison
-        // instead of re-reading a market once per route that crosses it.
-        let mut books = RouteOrderbooks::default();
         for candidate in candidates {
             match self
                 .preview_resolved_trade_route_with_books(&mut books, &candidate, initial_amount)
