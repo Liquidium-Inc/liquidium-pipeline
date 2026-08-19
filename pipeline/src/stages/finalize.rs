@@ -297,21 +297,20 @@ where
                 .ok_or_else(|| "missing liquidation_result in receipt".to_string())?;
             let liq_id = liq.id;
 
-            if !matches!(liq.collateral_tx.status, TransferStatus::Success) {
+            // Re-read while the collateral has not settled, and also while the
+            // change is still pending: rows whose collateral settled at once
+            // come straight here and nowhere else, so this is the only read
+            // that can ever see their change land. It stops asking as soon as
+            // the change is settled or failed.
+            let change_pending = matches!(liq.change_tx.status, TransferStatus::Pending);
+            if !matches!(liq.collateral_tx.status, TransferStatus::Success) || change_pending {
                 match self.refresh_liquidation(liq_id).await {
                     Ok(fresh) => {
-                        if fresh != *liq {
-                            receipt.liquidation_result = Some(fresh.clone());
-                            if matches!(receipt.status, ExecutionStatus::CollateralTransferFailed(_))
-                                && matches!(fresh.collateral_tx.status, TransferStatus::Success)
-                            {
-                                receipt.status = ExecutionStatus::Success;
-                            }
-                            if let Some(wal_id) = wal_id_by_liq.get(&liq_id)
-                                && let Err(err) = self.update_receipt_meta(wal_id, &receipt).await
-                            {
-                                warn!("Failed to update WAL meta for liq_id {}: {}", liq_id, err);
-                            }
+                        if receipt.absorb_liquidation(fresh)
+                            && let Some(wal_id) = wal_id_by_liq.get(&liq_id)
+                            && let Err(err) = self.update_receipt_meta(wal_id, &receipt).await
+                        {
+                            warn!("Failed to update WAL meta for liq_id {}: {}", liq_id, err);
                         }
                     }
                     Err(err) => {
@@ -779,9 +778,11 @@ mod tests {
             debt_asset: AssetType::Unknown,
             status: LiquidationStatus::Success,
             timestamp: ts,
+            // Settled, so a row here is not re-read for its change; the test
+            // for that pending re-read builds its own.
             change_tx: TxStatus {
                 tx_id: None,
-                status: TransferStatus::Pending,
+                status: TransferStatus::Success,
             },
             collateral_tx: TxStatus {
                 tx_id: None,
@@ -1393,6 +1394,82 @@ mod tests {
         let outcomes = stage.process(&()).await.expect("process should succeed");
         assert_eq!(outcomes.len(), 1, "should finalize after collateral success");
         assert!(matches!(outcomes[0].status, ExecutionStatus::Success));
+    }
+
+    /// A row whose collateral settled at once is enqueued straight here and
+    /// never passes the settlement watcher, so this is the only place that can
+    /// ever see its change land. Left to the executor's one early observation
+    /// the receipt would say the change never came back, for ever.
+    #[tokio::test]
+    async fn finalize_re_reads_a_row_whose_change_was_still_pending_and_corrects_the_flag() {
+        let liq_id = 78u128;
+        let mut initial_liq = make_liq_result(liq_id, TransferStatus::Success, 0);
+        initial_liq.change_tx.status = TransferStatus::Pending;
+        let receipt = ExecutionReceipt {
+            request: make_request(),
+            liquidation_result: Some(initial_liq),
+            status: ExecutionStatus::Success,
+            // What the executor recorded from its one early observation.
+            change_received: false,
+        };
+        let row = make_row(liq_id, receipt.clone());
+        let row_pending = row.clone();
+        let row_for_get = row.clone();
+        let liq_id_str = liq_id.to_string();
+
+        let mut wal = MockWalStore::new();
+        wal.expect_get_pending()
+            .with(eq(100usize))
+            .times(1)
+            .returning(move |_| Ok(vec![row_pending.clone()]));
+        wal.expect_get_result()
+            .withf(move |id| id == liq_id_str.as_str())
+            .returning(move |_| Ok(Some(row_for_get.clone())));
+        // The corrected receipt is written back before the row is finalized.
+        wal.expect_upsert_result()
+            .withf(|row| {
+                let wrapper = decode_receipt_wrapper(row)
+                    .expect("stored meta decodes")
+                    .expect("stored meta is present");
+                wrapper.receipt.change_received
+            })
+            .times(1)
+            .returning(|_| Ok(()));
+        // And once more when the profit snapshot lands.
+        wal.expect_upsert_result().returning(|_| Ok(()));
+        wal.expect_update_status().returning(|_, _, _| Ok(()));
+
+        // Settled by the time finalize looks: the same liquidation, change included.
+        let fresh_liq = make_liq_result(liq_id, TransferStatus::Success, 0);
+        let mut agent = MockPipelineAgent::new();
+        agent
+            .expect_call_query::<Result<LiquidationResult, ProtocolError>>()
+            .with(
+                eq(Principal::anonymous()),
+                eq("get_liquidation"),
+                eq(Encode!(&liq_id).expect("encode should succeed")),
+            )
+            .times(1)
+            .returning(move |_, _, _| Ok(Ok(fresh_liq.clone())));
+
+        let stage = FinalizeStage::new(
+            Arc::new(wal),
+            Arc::new(NoopFinalizer {
+                calls: Arc::new(Mutex::new(0)),
+            }),
+            Arc::new(SimpleProfitCalculator),
+            Arc::new(agent),
+            Principal::anonymous(),
+            5,
+            120,
+        );
+
+        let outcomes = stage.process(&()).await.expect("process should succeed");
+        assert_eq!(outcomes.len(), 1);
+        assert!(
+            outcomes[0].execution_receipt.change_received,
+            "the outcome carries the corrected flag"
+        );
     }
 
     /// Given: A retryable row is not yet due under exponential backoff.

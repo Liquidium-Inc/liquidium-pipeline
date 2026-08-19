@@ -47,14 +47,46 @@ pub struct ExecutionReceipt {
     pub request: ExecutorRequest,
     pub liquidation_result: Option<LiquidationResult>,
     pub status: ExecutionStatus,
-    /// Whether the change transfer had already settled *at execution time*.
+    /// Whether the change transfer had settled the last time the liquidation
+    /// was read.
     ///
-    /// This is a single observation, not a durable verdict: the protocol
-    /// queues the change alongside the liquidation, so `false` here usually
-    /// means "not yet" rather than "never", and nothing re-reads it later.
-    /// Treat it as a timing hint only -- it is not evidence that funds are
-    /// missing, and no retry or recovery keys off it.
+    /// First recorded at execution time, where a change the protocol has
+    /// queued but not yet settled reads as `false`; that usually means "not
+    /// yet" rather than "never", and it is refreshed by every later read of
+    /// the liquidation through [`ExecutionReceipt::absorb_liquidation`] --
+    /// the settlement watcher for rows waiting on collateral, the finalize
+    /// stage while the change is still pending. Informational only: no retry
+    /// or recovery keys off it.
     pub change_received: bool,
+}
+
+impl ExecutionReceipt {
+    /// Folds a fresh read of the liquidation into the receipt and reports
+    /// whether anything changed.
+    ///
+    /// Every stage that re-reads the liquidation goes through here, so what
+    /// the executor could only observe once -- the result itself, a collateral
+    /// transfer that has since settled, the change -- is brought up to date
+    /// the same way everywhere.
+    pub fn absorb_liquidation(&mut self, fresh: LiquidationResult) -> bool {
+        let mut updated = false;
+        if matches!(fresh.collateral_tx.status, TransferStatus::Success)
+            && matches!(self.status, ExecutionStatus::CollateralTransferFailed(_))
+        {
+            self.status = ExecutionStatus::Success;
+            updated = true;
+        }
+        let change_received = matches!(fresh.change_tx.status, TransferStatus::Success);
+        if self.change_received != change_received {
+            self.change_received = change_received;
+            updated = true;
+        }
+        if self.liquidation_result.as_ref() != Some(&fresh) {
+            self.liquidation_result = Some(fresh);
+            updated = true;
+        }
+        updated
+    }
 }
 
 #[async_trait]

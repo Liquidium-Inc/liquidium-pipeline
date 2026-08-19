@@ -6,7 +6,6 @@ use tracing::{info, warn};
 
 use crate::persistance::{LiqMetaWrapper, LiqResultRecord, ResultStatus, WalStore};
 use crate::stages::executor::ExecutionReceipt;
-use crate::stages::executor::ExecutionStatus;
 use crate::utils::now_ts;
 use crate::wal::{decode_receipt_wrapper, encode_meta};
 use liquidium_pipeline_connectors::pipeline_agent::PipelineAgent;
@@ -76,31 +75,7 @@ where
             }
         };
 
-        let mut updated = false;
-        if fresh != *liq {
-            receipt.liquidation_result = Some(fresh.clone());
-            updated = true;
-        }
-        if matches!(fresh.collateral_tx.status, TransferStatus::Success)
-            && matches!(receipt.status, ExecutionStatus::CollateralTransferFailed(_))
-        {
-            receipt.status = ExecutionStatus::Success;
-            updated = true;
-        }
-        // The executor judges the change from a single early observation, where
-        // a change the protocol has queued but not yet settled necessarily reads
-        // as pending. This is the only place that observation is ever revisited,
-        // so the flag is re-derived here rather than left as first recorded:
-        // otherwise the ordinary case -- change lands seconds later -- reads for
-        // ever as money that never came back, and nothing downstream can tell it
-        // apart from a change that genuinely failed and is still with the
-        // protocol. Mirrors the venue's current answer in both directions.
-        let change_received = matches!(fresh.change_tx.status, TransferStatus::Success);
-        if receipt.change_received != change_received {
-            receipt.change_received = change_received;
-            updated = true;
-        }
-        if updated {
+        if receipt.absorb_liquidation(fresh) {
             let touch_meta = row.status != ResultStatus::WaitingProfit;
             self.update_receipt_meta(&row, &receipt, touch_meta).await?;
         }
