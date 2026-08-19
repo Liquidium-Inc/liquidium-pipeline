@@ -626,7 +626,7 @@ where
         // the ranking to be inferred from the order quotes appear in, which
         // cannot tell a coverage decision from a speed one. Debug because a
         // full cycle ranks every combo of every borrower; enable it with
-        // `RUST_LOG=liquidium_pipeline::stages::simple_strategy=debug`.
+        // `RUST_LOG=liquidator::stages::simple_strategy=debug`.
         for (rank, combo) in priced.iter().enumerate() {
             debug!(
                 "Ranked #{}: borrower={} hf={} | debt={} (${:.2} -> ranked ${:.2}) | collateral={} (${:.2}) | covers={} out={:?} back={:?}",

@@ -408,18 +408,30 @@ where
             }],
         };
 
-        // Convert the configured execution slippage cap into non-negative bps.
-        let execution_slippage_bps = self.max_sell_slippage_bps.max(0.0) as u32;
-
-        // Combine execution slippage, route-fee safety, and quote-age safety
-        // using checked arithmetic so a bad configuration cannot wrap.
-        let conservative_haircut_bps = execution_slippage_bps
-            .checked_add(self.quote_route_fee_bps)
-            .and_then(|bps| bps.checked_add(self.quote_delay_buffer_bps))
+        // Only costs the order-book simulation cannot already see: route fees it
+        // does not model, and the book moving between this quote and the fill.
+        //
+        // Measured price impact is deliberately absent. `receive_amount` is the
+        // result of walking the live book and applying the venue's taker fee,
+        // so impact has already been taken out of it. Subtracting
+        // `max_sell_slippage_bps` here charged for the same thing twice -- once
+        // as measured, once as the worst value permitted -- which understated
+        // every CEX plan by the full slippage cap and refused liquidations on a
+        // profit floor they had in fact cleared.
+        //
+        // Nothing is given up by dropping it: this figure is a planning
+        // estimate that is never compared against a fill. Slippage is enforced
+        // live and per slice against the book at execution time, in
+        // `execute_trade_leg_slices`, and that guard still uses the full cap.
+        //
+        // Checked arithmetic so a bad configuration cannot wrap.
+        let conservative_haircut_bps = self
+            .quote_route_fee_bps
+            .checked_add(self.quote_delay_buffer_bps)
             .ok_or_else(|| format!("{} conservative quote haircut overflowed u32", self.profile.venue_id()))?;
 
-        // Floor the simulated output by the complete safety haircut used for
-        // cross-venue ranking and minimum-receive protection.
+        // Floor the simulated output by the costs above, giving the planner the
+        // figure it ranks venues and gates the minimum edge on.
         let conservative_value = amount_after_bps_haircut(&receive_amount.value, conservative_haircut_bps)?;
 
         // Return both the public quote and the venue-owned initial execution state.

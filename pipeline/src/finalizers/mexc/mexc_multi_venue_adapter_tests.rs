@@ -196,7 +196,7 @@ async fn preview_uses_the_exact_leg_allocation_and_persists_the_route() {
 
     assert_eq!(preview.quote.pay_amount, Nat::from(200_000_000u64));
     assert!(preview.quote.receive_amount < Nat::from(20_000_000u64));
-    assert!(preview.conservative_receive.value < preview.quote.receive_amount);
+    assert!(preview.conservative_receive.value <= preview.quote.receive_amount);
     let execution = preview
         .initial_execution_state
         .decode::<MexcVenueExecutionState>("mexc")
@@ -207,6 +207,48 @@ async fn preview_uses_the_exact_leg_allocation_and_persists_the_route() {
     assert_eq!(execution.cex.trade.trade_resolved_legs[0].market, "PAY_RECV");
     uuid::Uuid::parse_str(execution.cex.liq_id.trim_start_matches("mexc-"))
         .expect("execution ID should contain a restart-safe UUID");
+}
+
+/// The conservative figure may carry only costs the order-book simulation
+/// cannot already see.
+///
+/// `receive_amount` is the result of walking the live book with the venue's
+/// taker fee applied, so measured price impact is already out of it. Charging
+/// `max_sell_slippage_bps` on top counted slippage twice -- once as measured,
+/// once as the worst value permitted -- understating every CEX plan by the full
+/// cap and refusing liquidations on a profit floor they had in fact cleared.
+/// The cap still guards execution, live and per slice, in
+/// `execute_trade_leg_slices`.
+#[tokio::test]
+async fn the_conservative_quote_carries_only_costs_the_simulation_cannot_see() {
+    // 200 bps sell-slippage cap, plus a 25 bps route fee and 75 bps delay buffer.
+    let finalizer = finalizer().with_quote_costs(25, 75);
+    let request = request(200_000_000);
+
+    let preview = MultiVenueAdapter::preview(&finalizer, &planning_context(), &request)
+        .await
+        .expect("MEXC preview should succeed");
+
+    // 100 bps, not 300: the slippage cap is not deducted a second time.
+    let expected = (preview.quote.receive_amount.clone() * Nat::from(9_900u32)) / Nat::from(10_000u32);
+    assert_eq!(
+        preview.conservative_receive.value, expected,
+        "only the route fee and delay buffer may be charged against a simulated output"
+    );
+}
+
+/// With neither cost configured the conservative figure is the simulation
+/// itself, because the simulation is already net of impact and fees.
+#[tokio::test]
+async fn a_venue_with_no_configured_quote_costs_is_not_discounted() {
+    let finalizer = finalizer();
+    let request = request(200_000_000);
+
+    let preview = MultiVenueAdapter::preview(&finalizer, &planning_context(), &request)
+        .await
+        .expect("MEXC preview should succeed");
+
+    assert_eq!(preview.conservative_receive.value, preview.quote.receive_amount);
 }
 
 #[tokio::test]
