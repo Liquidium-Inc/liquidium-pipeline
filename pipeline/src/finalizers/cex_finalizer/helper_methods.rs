@@ -1177,22 +1177,15 @@ where
                 .unwrap_or_else(|| state.size_in.to_f64())
         });
         if amount_in <= LIQUIDITY_EPS {
-            state.step = CexStep::Withdraw;
-            // Carried forward exactly as `CexFinalizerLogic::trade` does at the
-            // same guard, because both entry points reach the same `withdraw`.
-            // Leaving `size_out` unset there does not mean "withdraw nothing":
-            // `withdraw` falls back to `size_in`, the pay amount, and sends that
-            // quantity of the receive asset instead.
-            if let Some(out_amt) = state
-                .trade
-                .trade_progress_total_out
-                .or(state.trade.trade_next_amount_in)
-            {
-                state.withdraw.size_out = Some(ChainTokenAmount::from_formatted(
-                    state.withdraw.withdraw_asset.clone(),
-                    out_amt.max(0.0),
-                ));
-            }
+            // Nothing left on this leg: it is done with whatever it produced,
+            // exactly as `CexFinalizerLogic::trade` treats the same guard. The
+            // output feeds the next leg, or the withdrawal only if this was the
+            // last one -- an exhausted first leg must not skip the rest of the
+            // route, and `withdraw` reads `size_out` for the amount, so it has
+            // to be the traded output rather than left unset (which falls back
+            // to `size_in`, the pay amount).
+            let total_out = state.trade.trade_progress_total_out.unwrap_or(0.0);
+            Self::advance_after_trade_leg(state, idx, legs.len(), total_out);
             return Ok(false);
         }
 

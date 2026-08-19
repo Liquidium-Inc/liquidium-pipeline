@@ -1254,23 +1254,20 @@ where
                 .unwrap_or_else(|| state.size_in.to_f64())
         });
 
-        // 10) Nothing to trade (or dust below epsilon) -> finish trading phase.
+        // 10) Nothing left to trade on this leg (or dust below epsilon): the
+        //     leg is done with whatever it has produced so far. That output feeds
+        //     the next leg, or the withdrawal only if this was the last one --
+        //     an exhausted first leg must not skip the rest of the route.
         if amount_in <= LIQUIDITY_EPS {
             debug!(
-                "[cex] liq_id={} trade skipped: non-positive amount_in={}",
-                state.liq_id, amount_in
+                "[cex] liq_id={} trade leg {}/{} has nothing left to trade: amount_in={}",
+                state.liq_id,
+                idx + 1,
+                legs.len(),
+                amount_in
             );
-            state.step = CexStep::Withdraw;
-            if let Some(out_amt) = state
-                .trade
-                .trade_progress_total_out
-                .or(state.trade.trade_next_amount_in)
-            {
-                state.withdraw.size_out = Some(ChainTokenAmount::from_formatted(
-                    state.withdraw.withdraw_asset.clone(),
-                    out_amt.max(0.0),
-                ));
-            }
+            let total_out = state.trade.trade_progress_total_out.unwrap_or(0.0);
+            Self::advance_after_trade_leg(state, idx, legs.len(), total_out);
             return Ok(());
         }
 

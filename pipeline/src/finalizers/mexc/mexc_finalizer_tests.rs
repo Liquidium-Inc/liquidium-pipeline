@@ -3349,6 +3349,9 @@ fn mexc_target_slice_bps_is_clamped_for_extreme_inputs() {
     assert!((capped.target_slice_bps() - 200.0).abs() < 1e-12);
 }
 
+/// With nothing to trade, every leg of the route is passed through with a zero
+/// output and no order is ever placed. The route is still walked leg by leg:
+/// "nothing on this leg" is not "the route is done".
 #[tokio::test]
 async fn mexc_trade_skips_when_amount_in_zero_and_moves_to_withdraw() {
     let mut backend = MockCexBackend::new();
@@ -3356,6 +3359,7 @@ async fn mexc_trade_skips_when_amount_in_zero_and_moves_to_withdraw() {
 
     // When amount_in <= 0, execute_swap must never be called.
     backend.expect_execute_swap_detailed_with_options().times(0);
+    backend.expect_get_orderbook().times(0);
 
     let backend = Arc::new(backend);
     let transfer_service = Arc::new(transfers);
@@ -3376,14 +3380,19 @@ async fn mexc_trade_skips_when_amount_in_zero_and_moves_to_withdraw() {
     state.size_in.value = Nat::from(0u32);
     state.step = CexStep::Trade;
 
-    finalizer
-        .trade(&mut state)
-        .await
-        .expect("trade should succeed even when skipped");
+    // One cycle per leg of the four-leg legacy route.
+    for leg in 1..=4 {
+        assert!(matches!(state.step, CexStep::Trade | CexStep::TradePending));
+        finalizer
+            .trade(&mut state)
+            .await
+            .expect("trade should succeed even when skipped");
+        assert_eq!(state.trade.trade_leg_index, Some(leg));
+    }
 
-    // No size_out set and step advanced to Withdraw.
-    assert!(state.withdraw.size_out.is_none());
+    // Nothing was traded, so nothing is there to withdraw.
     assert!(matches!(state.step, CexStep::Withdraw));
+    assert_eq!(state.withdraw.size_out.as_ref().map(|out| out.to_f64()), Some(0.0));
 }
 
 #[tokio::test]
@@ -4622,11 +4631,12 @@ async fn both_trade_entry_points_carry_the_traded_output_into_withdraw() {
     );
 
     let receipt = make_execution_receipt(42);
-    // A leg that consumed all of its input: the index still points at a real
-    // leg, so neither entry point takes the out-of-range shortcut.
+    // The last leg of the four-leg legacy route consumed all of its input: the
+    // index still points at a real leg, so neither entry point takes the
+    // out-of-range shortcut.
     let exhausted = |mut state: CexState| {
         state.step = CexStep::Trade;
-        state.trade.trade_leg_index = Some(0);
+        state.trade.trade_leg_index = Some(3);
         state.trade.trade_progress_remaining_in = Some(0.0);
         state.trade.trade_progress_total_out = Some(7.5);
         state
@@ -4658,6 +4668,65 @@ async fn both_trade_entry_points_carry_the_traded_output_into_withdraw() {
         .expect("the traded output has to reach withdraw");
     assert_eq!(out.token, through_intent.withdraw.withdraw_asset);
     assert!((out.to_f64() - 7.5).abs() < 1e-12);
+}
+
+/// The same guard on a leg that is not the last one. A leg whose final slice
+/// filled but whose cycle then failed -- a bad execution price, a slippage cap
+/// -- is saved with nothing left to trade and its index unchanged. Reading
+/// that as "the route is done" would withdraw the intermediate asset's amount
+/// under the final asset's name; the leg is done, the route is not.
+#[tokio::test]
+async fn an_exhausted_leg_that_is_not_the_last_hands_its_output_to_the_next_leg() {
+    let mut backend = MockCexBackend::new();
+    backend.expect_get_orderbook().times(0);
+    backend.expect_execute_swap_detailed_with_options().times(0);
+
+    let finalizer = MexcFinalizer::new(
+        Arc::new(backend),
+        Arc::new(MockTransferActions::new()),
+        Principal::anonymous(),
+        TEST_MAX_SELL_SLIPPAGE_BPS,
+        TEST_CEX_MIN_EXEC_USD,
+        TEST_CEX_SLICE_TARGET_RATIO,
+    );
+
+    let receipt = make_execution_receipt(43);
+    // Leg 1 of 4 (ckBTC -> BTC) fully consumed, 0.05 BTC out.
+    let exhausted = |mut state: CexState| {
+        state.step = CexStep::Trade;
+        state.trade.trade_leg_index = Some(0);
+        state.trade.trade_progress_remaining_in = Some(0.0);
+        state.trade.trade_progress_total_out = Some(0.05);
+        state
+    };
+
+    let mut through_trade = exhausted(finalizer.prepare("43", &receipt).await.expect("prepare"));
+    finalizer
+        .trade(&mut through_trade)
+        .await
+        .expect("an exhausted leg is not a failure");
+
+    let mut through_intent = exhausted(finalizer.prepare("43", &receipt).await.expect("prepare"));
+    let prepared = finalizer
+        .prepare_next_trade_order_intent(&mut through_intent)
+        .await
+        .expect("an exhausted leg is not a failure");
+    assert!(!prepared);
+
+    for state in [&through_trade, &through_intent] {
+        assert!(
+            matches!(state.step, CexStep::TradePending),
+            "three legs remain, so the route must not jump to withdraw: {:?}",
+            state.step
+        );
+        assert_eq!(state.trade.trade_leg_index, Some(1));
+        assert_eq!(state.trade.trade_next_amount_in, Some(0.05));
+        assert!(state.trade.trade_progress_remaining_in.is_none());
+        assert!(
+            state.withdraw.size_out.is_none(),
+            "0.05 BTC must not be recorded as the ckUSDT to withdraw"
+        );
+    }
 }
 
 #[tokio::test]
@@ -6557,13 +6626,16 @@ mod fuzz {
 
                 let mut state = finalizer.prepare("42", &receipt).await.expect("prepare should succeed");
                 state.step = CexStep::Trade;
-                // Force single-leg route for deterministic retry assertions.
+                // Force single-leg route for deterministic retry assertions. The
+                // plan made at prepare time still names ckUSDT, so it is
+                // overridden too; otherwise the route stays the four-leg one.
                 state.withdraw.withdraw_asset = ChainToken::Icp {
                     ledger: Principal::anonymous(),
                     symbol: "BTC".to_string(),
                     decimals: 8,
                     fee: Nat::from(1_000u64),
                 };
+                state.withdraw.bridge.withdraw_planned_asset = Some("BTC".to_string());
 
                 let first = finalizer.trade(&mut state).await.expect_err("first attempt should fail");
                 assert!(first.to_string().contains("slice slippage too high"));
