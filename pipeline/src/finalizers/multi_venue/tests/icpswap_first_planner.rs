@@ -295,18 +295,12 @@ fn config(cex_min_exec_usd: f64) -> IcpswapFirstPlannerConfig {
         bad_debt_min_net_edge_bps: 150,
         // Must stay above both impact caps -- the 200 bps CEX cap is the wider
         // of the two -- because a venue's reported impact already includes its
-        // pool fee. This is the shipped pairing.
+        // pool fee. This is the shipped pairing, so tests that pin the 250 bps
+        // boundary read it from here rather than from a separate fixture.
         max_oracle_discount_bps: 250,
         oracle_snapshot_max_age_secs: 300,
         icpswap_test_allocation_usd: None,
         mexc_test_allocation_usd: None,
-    }
-}
-
-fn production_oracle_config(cex_min_exec_usd: f64) -> IcpswapFirstPlannerConfig {
-    IcpswapFirstPlannerConfig {
-        max_oracle_discount_bps: 250,
-        ..config(cex_min_exec_usd)
     }
 }
 
@@ -960,7 +954,7 @@ async fn a_folded_leg_is_still_priced_against_the_oracle() {
     input.pay_reference_price_ray = Some(Nat::from(2 * RAY));
     input.receive_reference_price_ray = Some(Nat::from(RAY));
 
-    let error = IcpswapFirstPlanner::new(vec![Arc::new(mexc), Arc::new(kraken)], production_oracle_config(0.0))
+    let error = IcpswapFirstPlanner::new(vec![Arc::new(mexc), Arc::new(kraken)], config(0.0))
         .expect("valid two-CEX planner")
         .plan(&input, QUOTED_AT)
         .await
@@ -1001,7 +995,7 @@ async fn a_folded_leg_refused_on_price_is_terminal() {
     input.pay_reference_price_ray = Some(Nat::from(2 * RAY));
     input.receive_reference_price_ray = Some(Nat::from(RAY));
 
-    let error = IcpswapFirstPlanner::new(vec![Arc::new(mexc), Arc::new(kraken)], production_oracle_config(0.0))
+    let error = IcpswapFirstPlanner::new(vec![Arc::new(mexc), Arc::new(kraken)], config(0.0))
         .expect("valid two-CEX planner")
         .plan(&input, QUOTED_AT)
         .await
@@ -1759,7 +1753,7 @@ async fn input_ledger_fee_drag_is_a_share_of_the_leg_and_depends_on_the_pay_toke
     let icpswap = mock_adapter(ICPSWAP_VENUE_ID, Arc::new(Mutex::new(Vec::new())), |request| {
         Ok(ledger_fee_only_preview(request, debt_token()))
     });
-    let state = IcpswapFirstPlanner::new(vec![Arc::new(icpswap)], production_oracle_config(0.0))
+    let state = IcpswapFirstPlanner::new(vec![Arc::new(icpswap)], config(0.0))
         .expect("planner")
         .plan(&icp_leg, QUOTED_AT)
         .await
@@ -1776,7 +1770,7 @@ async fn input_ledger_fee_drag_is_a_share_of_the_leg_and_depends_on_the_pay_toke
     let icpswap = mock_adapter(ICPSWAP_VENUE_ID, Arc::new(Mutex::new(Vec::new())), |request| {
         Ok(ledger_fee_only_preview(request, native_icp()))
     });
-    let error = IcpswapFirstPlanner::new(vec![Arc::new(icpswap)], production_oracle_config(0.0))
+    let error = IcpswapFirstPlanner::new(vec![Arc::new(icpswap)], config(0.0))
         .expect("planner")
         .plan(&ckusdc_leg, QUOTED_AT)
         .await
@@ -1827,10 +1821,6 @@ fn oracle_discount_limit_must_leave_room_above_the_impact_caps() {
     // The shipped pairing leaves room above both caps.
     assert!(config(0.0).max_oracle_discount_bps as f64 > config(0.0).dust_fallback_max_price_impact_bps);
     assert!(config(0.0).max_oracle_discount_bps as f64 > config(0.0).max_cex_price_impact_bps);
-    assert!(
-        production_oracle_config(0.0).max_oracle_discount_bps as f64
-            > production_oracle_config(0.0).dust_fallback_max_price_impact_bps
-    );
 }
 
 #[test]
@@ -2543,7 +2533,7 @@ async fn live_oracle_price_replaces_a_stale_recorded_price() {
         Ok(preview(request, ICPSWAP_VENUE_ID, 10.0, 1_025_000, 1_025_000))
     });
 
-    let state = IcpswapFirstPlanner::new(vec![Arc::new(icpswap)], production_oracle_config(0.0))
+    let state = IcpswapFirstPlanner::new(vec![Arc::new(icpswap)], config(0.0))
         .expect("planner")
         .with_price_oracle(mock_oracle(1, 1))
         .plan(&native_icp_to_ckusdc_with_oracle(), QUOTED_AT)
@@ -2561,7 +2551,7 @@ async fn live_oracle_price_rejects_a_quote_the_recorded_price_would_have_accepte
         Ok(preview(request, ICPSWAP_VENUE_ID, 10.0, 2_000_000, 2_000_000))
     });
 
-    let error = IcpswapFirstPlanner::new(vec![Arc::new(icpswap)], production_oracle_config(0.0))
+    let error = IcpswapFirstPlanner::new(vec![Arc::new(icpswap)], config(0.0))
         .expect("planner")
         .with_price_oracle(mock_oracle(4, 1))
         .plan(&native_icp_to_ckusdc_with_oracle(), QUOTED_AT)
@@ -2577,7 +2567,7 @@ async fn recorded_price_is_used_while_fresh_when_the_oracle_is_unavailable() {
         Ok(preview(request, ICPSWAP_VENUE_ID, 10.0, 1_500_000, 1_500_000))
     });
 
-    let error = IcpswapFirstPlanner::new(vec![Arc::new(icpswap)], production_oracle_config(0.0))
+    let error = IcpswapFirstPlanner::new(vec![Arc::new(icpswap)], config(0.0))
         .expect("planner")
         .with_price_oracle(failing_oracle())
         .plan(&native_icp_to_ckusdc_with_oracle(), QUOTED_AT)
@@ -2598,7 +2588,7 @@ async fn stale_recorded_price_stands_the_guard_down_instead_of_blocking_the_swap
     let mut input = native_icp_to_ckusdc_with_oracle();
     input.reference_price_captured_at = Some(QUOTED_AT - 301);
 
-    let state = IcpswapFirstPlanner::new(vec![Arc::new(icpswap)], production_oracle_config(0.0))
+    let state = IcpswapFirstPlanner::new(vec![Arc::new(icpswap)], config(0.0))
         .expect("planner")
         .with_price_oracle(failing_oracle())
         .plan(&input, QUOTED_AT)
@@ -2616,7 +2606,7 @@ async fn an_unknown_recorded_price_age_is_treated_as_stale() {
     let mut input = native_icp_to_ckusdc_with_oracle();
     input.reference_price_captured_at = None;
 
-    let state = IcpswapFirstPlanner::new(vec![Arc::new(icpswap)], production_oracle_config(0.0))
+    let state = IcpswapFirstPlanner::new(vec![Arc::new(icpswap)], config(0.0))
         .expect("planner")
         .with_price_oracle(failing_oracle())
         .plan(&input, QUOTED_AT)
@@ -2645,7 +2635,7 @@ async fn one_missing_oracle_side_falls_back_instead_of_mixing_two_instants() {
         Ok(preview(request, ICPSWAP_VENUE_ID, 10.0, 1_025_000, 1_025_000))
     });
 
-    let error = IcpswapFirstPlanner::new(vec![Arc::new(icpswap)], production_oracle_config(0.0))
+    let error = IcpswapFirstPlanner::new(vec![Arc::new(icpswap)], config(0.0))
         .expect("planner")
         .with_price_oracle(Arc::new(oracle))
         .plan(&native_icp_to_ckusdc_with_oracle(), QUOTED_AT)
@@ -2661,7 +2651,7 @@ async fn a_non_positive_live_price_falls_back_to_the_recorded_price() {
         Ok(preview(request, ICPSWAP_VENUE_ID, 10.0, 1_500_000, 1_500_000))
     });
 
-    let error = IcpswapFirstPlanner::new(vec![Arc::new(icpswap)], production_oracle_config(0.0))
+    let error = IcpswapFirstPlanner::new(vec![Arc::new(icpswap)], config(0.0))
         .expect("planner")
         .with_price_oracle(mock_oracle(0, 1))
         .plan(&native_icp_to_ckusdc_with_oracle(), QUOTED_AT)
@@ -2689,12 +2679,12 @@ async fn oracle_discount_guard_accepts_quote_within_inclusive_limit() {
 }
 
 #[tokio::test]
-async fn production_oracle_discount_accepts_exactly_250_bps_but_rejects_one_native_unit_less() {
+async fn the_shipped_oracle_discount_accepts_exactly_250_bps_but_rejects_one_native_unit_less() {
     let exact = mock_adapter(ICPSWAP_VENUE_ID, Arc::new(Mutex::new(Vec::new())), |request| {
         // Oracle output is 2,000,000 units; 1,950,000 is exactly 2.5% below it.
         Ok(preview(request, ICPSWAP_VENUE_ID, 10.0, 1_950_000, 1_950_000))
     });
-    let accepted = IcpswapFirstPlanner::new(vec![Arc::new(exact)], production_oracle_config(0.0))
+    let accepted = IcpswapFirstPlanner::new(vec![Arc::new(exact)], config(0.0))
         .expect("planner")
         .plan(&native_icp_to_ckusdc_with_oracle(), 123)
         .await
@@ -2704,7 +2694,7 @@ async fn production_oracle_discount_accepts_exactly_250_bps_but_rejects_one_nati
     let one_less = mock_adapter(ICPSWAP_VENUE_ID, Arc::new(Mutex::new(Vec::new())), |request| {
         Ok(preview(request, ICPSWAP_VENUE_ID, 10.0, 1_949_999, 1_949_999))
     });
-    let error = IcpswapFirstPlanner::new(vec![Arc::new(one_less)], production_oracle_config(0.0))
+    let error = IcpswapFirstPlanner::new(vec![Arc::new(one_less)], config(0.0))
         .expect("planner")
         .plan(&native_icp_to_ckusdc_with_oracle(), 123)
         .await
@@ -2718,7 +2708,7 @@ async fn oracle_discount_guard_accepts_a_quote_better_than_oracle() {
         Ok(preview(request, ICPSWAP_VENUE_ID, 10.0, 2_100_000, 2_100_000))
     });
 
-    let state = IcpswapFirstPlanner::new(vec![Arc::new(icpswap)], production_oracle_config(0.0))
+    let state = IcpswapFirstPlanner::new(vec![Arc::new(icpswap)], config(0.0))
         .expect("planner")
         .plan(&native_icp_to_ckusdc_with_oracle(), 123)
         .await
@@ -2740,7 +2730,7 @@ async fn forced_test_split_waives_the_oracle_guard_for_a_sub_ten_dollar_icpswap_
     let mexc = mock_adapter(MEXC_VENUE_ID, Arc::new(Mutex::new(Vec::new())), |request| {
         Ok(preview(request, MEXC_VENUE_ID, 0.0, 1_800_000, 1_800_000))
     });
-    let mut planner_config = production_oracle_config(8.0);
+    let mut planner_config = config(8.0);
     planner_config.icpswap_test_allocation_usd = Some(1.0);
 
     let state = planner(icpswap, mexc, planner_config)
@@ -2762,7 +2752,7 @@ async fn forced_test_split_still_guards_a_ten_dollar_icpswap_leg() {
     let mexc = mock_adapter(MEXC_VENUE_ID, Arc::new(Mutex::new(Vec::new())), |request| {
         Ok(preview(request, MEXC_VENUE_ID, 0.0, 8_000_000, 8_000_000))
     });
-    let mut planner_config = production_oracle_config(8.0);
+    let mut planner_config = config(8.0);
     planner_config.icpswap_test_allocation_usd = Some(10.0);
     // 5 ICP at $10 leaves a $40 MEXC remainder after the $10 forced leg.
     let mut input = native_icp_to_ckusdc_with_oracle();
@@ -2786,7 +2776,7 @@ async fn forced_test_split_rejects_a_bad_mexc_leg_even_when_icpswap_is_valid() {
         // The remainder is 0.9 ICP, whose oracle output is 1,800,000 units.
         Ok(preview(request, MEXC_VENUE_ID, 0.0, 1_754_999, 1_754_999))
     });
-    let mut planner_config = production_oracle_config(8.0);
+    let mut planner_config = config(8.0);
     planner_config.icpswap_test_allocation_usd = Some(1.0);
 
     let error = planner(icpswap, mexc, planner_config)
@@ -2860,7 +2850,7 @@ async fn legacy_receipt_without_debt_oracle_price_skips_only_the_oracle_guard() 
         // missing receive-side oracle price had been available.
         Ok(preview(request, ICPSWAP_VENUE_ID, 10.0, 1_500_000, 1_500_000))
     });
-    let state = IcpswapFirstPlanner::new(vec![Arc::new(icpswap)], production_oracle_config(0.0))
+    let state = IcpswapFirstPlanner::new(vec![Arc::new(icpswap)], config(0.0))
         .expect("planner")
         .plan(&input, 123)
         .await
@@ -3022,7 +3012,7 @@ proptest! {
             Ok(route)
         });
         let accepted = runtime.block_on(async {
-            IcpswapFirstPlanner::new(vec![Arc::new(accepted_adapter)], production_oracle_config(0.0))
+            IcpswapFirstPlanner::new(vec![Arc::new(accepted_adapter)], config(0.0))
                 .expect("planner")
                 .plan(&make_input(), 123)
                 .await
@@ -3043,7 +3033,7 @@ proptest! {
             Ok(route)
         });
         let rejected = runtime.block_on(async {
-            IcpswapFirstPlanner::new(vec![Arc::new(rejected_adapter)], production_oracle_config(0.0))
+            IcpswapFirstPlanner::new(vec![Arc::new(rejected_adapter)], config(0.0))
                 .expect("planner")
                 .plan(&make_input(), 123)
                 .await

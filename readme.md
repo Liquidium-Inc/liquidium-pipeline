@@ -202,7 +202,10 @@ CEX_RETRY_BASE_SECS=5
 CEX_RETRY_MAX_SECS=120
 # Minimum projected net edge required before executing any venue plan (bps)
 MULTI_VENUE_MIN_NET_EDGE_BPS=150
-# Reject a venue quote this far below the oracle-implied output (bps)
+# Reject a venue quote this far below the oracle-implied output (bps).
+# Must be strictly above both MAX_ALLOWED_CEX_SLIPPAGE_BPS and
+# ICPSWAP_DUST_FALLBACK_MAX_PRICE_IMPACT_BPS, and below 10000: the daemon
+# refuses to start otherwise (see the quick reference below).
 MULTI_VENUE_MAX_ORACLE_DISCOUNT_BPS=250
 # How long a price recorded on a receipt may stand in for a live oracle read (seconds)
 MULTI_VENUE_ORACLE_SNAPSHOT_MAX_AGE_SECS=300
@@ -214,7 +217,10 @@ CEX_ROUTE_FEE_BPS=25
 CEX_MEXC_AVAILABLE_PAIRS=CKBTC_BTC,BTC_USDC,BTC_USDT,USDC_USDT,CKUSDT_USDT,ICP_USDT,ICP_USDC,ETH_USDT
 # Max intermediate hops when searching configured pairs (0 disables hop fallback)
 CEX_MEXC_MAX_HOPS=2
-# Optional canonical Kraken market allowlist. XBT is normalized to BTC.
+# Canonical Kraken market allowlist (BASE_QUOTE; XBT is normalized to BTC).
+# Required whenever `kraken` is in ENABLED_SWAP_VENUES: startup fails if it is
+# unset or holds no parsable market. Malformed entries (e.g. `BTCUSD`) are
+# dropped with a warning, so check the log if a market seems to be missing.
 CEX_KRAKEN_AVAILABLE_PAIRS=BTC_USD,ETH_USD,USDC_USD,ICP_USD
 # Defaults to two intermediate hops; 0 disables hop fallback.
 CEX_KRAKEN_MAX_HOPS=2
@@ -230,17 +236,17 @@ Quick reference:
 | `CEX_BUY_INVERSE_OVERSPEND_BPS` | Safety cap for how much inverse/base buy mode may overspend. |
 | `CEX_BUY_INVERSE_MAX_RETRIES` | Max fallback attempts per leg. |
 | `CEX_BUY_INVERSE_ENABLED` | Master toggle for adaptive buy fallback. |
-| `MAX_ALLOWED_CEX_SLIPPAGE_BPS` | Shared hard ceiling for CEX planning-time price impact and realized execution slippage. |
+| `MAX_ALLOWED_CEX_SLIPPAGE_BPS` | Shared hard ceiling for CEX planning-time price impact and realized execution slippage. Must stay below `MULTI_VENUE_MAX_ORACLE_DISCOUNT_BPS`. |
 | `CEX_RETRY_BASE_SECS` | Initial retry delay after retryable CEX errors. |
 | `CEX_RETRY_MAX_SECS` | Maximum retry delay cap. |
 | `MULTI_VENUE_MIN_NET_EDGE_BPS` | Minimum conservative edge required for any enabled venue or split plan. |
-| `MULTI_VENUE_MAX_ORACLE_DISCOUNT_BPS` | Maximum amount any venue quote may fall below the oracle-implied output. Values at or above 10000 would accept anything, so they fall back to the default. |
+| `MULTI_VENUE_MAX_ORACLE_DISCOUNT_BPS` | Maximum amount any venue quote may fall below the oracle-implied output. Must be strictly above both `MAX_ALLOWED_CEX_SLIPPAGE_BPS` and `ICPSWAP_DUST_FALLBACK_MAX_PRICE_IMPACT_BPS` -- a venue's reported impact already includes its pool fee, so a limit at or under either cap would reject quotes those caps allow -- and the daemon refuses to start if it is not. Values at or above 10000 would accept anything, so they fall back to the default. |
 | `MULTI_VENUE_ORACLE_SNAPSHOT_MAX_AGE_SECS` | How stale a price recorded at detection may be before it stops standing in for a failed live oracle read. Past this age the quote guard stands down rather than block a liquidation that already holds collateral. |
 | `CEX_DELAY_BUFFER_BPS` | Extra haircut for execution-latency/price-move risk. |
 | `CEX_ROUTE_FEE_BPS` | Fee haircut applied during route edge estimation. |
 | `CEX_MEXC_AVAILABLE_PAIRS` | Configured market universe used for direct/hop route discovery. |
 | `CEX_MEXC_MAX_HOPS` | Max intermediate hops allowed in configured-pair route search. |
-| `CEX_KRAKEN_AVAILABLE_PAIRS` | Optional canonical Kraken market allowlist used for direct/hop route discovery. |
+| `CEX_KRAKEN_AVAILABLE_PAIRS` | Canonical Kraken market allowlist used for direct/hop route discovery. Required when `kraken` is enabled: Kraken never routes outside it, and startup fails if it is unset or has no parsable market. |
 | `CEX_KRAKEN_MAX_HOPS` | Max intermediate hops allowed for Kraken route search; defaults to 2. |
 
 Note: `CEX_BUY_INVERSE_OVESPEND_BPS` is still accepted as a legacy alias, but `CEX_BUY_INVERSE_OVERSPEND_BPS` is the canonical key.
@@ -839,7 +845,8 @@ liquidator tui --log-file ./liquidator.log
 - `LENDING_CANISTER not configured` / `EVM_RPC_URL not configured`: confirm required env vars are set in `.env` or `config.env`.
 - `Invalid source account` / destination parse errors during withdraw: use `main|trader|recovery` aliases or valid account/principal text.
 - MEXC initialization failing while `mexc` is enabled: verify `CEX_MEXC_API_KEY` and `CEX_MEXC_API_SECRET`, or remove `mexc` from `ENABLED_SWAP_VENUES`.
-- Kraken initialization failing while `kraken` is enabled: verify `CEX_KRAKEN_API_KEY` and `CEX_KRAKEN_API_SECRET`, or remove `kraken` from `ENABLED_SWAP_VENUES`.
+- Kraken initialization failing while `kraken` is enabled: verify `CEX_KRAKEN_API_KEY` and `CEX_KRAKEN_API_SECRET`, and that `CEX_KRAKEN_AVAILABLE_PAIRS` holds at least one `BASE_QUOTE` market (the log names any entry it dropped); or remove `kraken` from `ENABLED_SWAP_VENUES`.
+- Startup refuses `maximum oracle discount ... must exceed the ... impact cap`: raise `MULTI_VENUE_MAX_ORACLE_DISCOUNT_BPS` above both `MAX_ALLOWED_CEX_SLIPPAGE_BPS` and `ICPSWAP_DUST_FALLBACK_MAX_PRICE_IMPACT_BPS`, or lower the cap you raised.
 - Kraken preview unavailable: verify the canonical pair allowlist, exact asset/network funding method, and exact verified withdrawal destination. Ambiguous methods and unverified destinations are rejected locally.
 - Kraken leg is `OperatorRequired`: reconcile the persisted client order ID or withdrawal reference against Kraken history before explicitly re-enqueuing; automatic replay is intentionally disabled after an uncertain submission.
 - Noisy terminal output in containerized logging stacks: build and run with `--features plain-logs`.

@@ -802,6 +802,12 @@ fn parse_cex_available_pairs_from_env(name: &str) -> Vec<String> {
     let mut out = Vec::new();
     for token in raw.split(',') {
         let Some(market) = normalize_cex_market_pair(token) else {
+            // Named rather than dropped in silence: a Kraken list that loses
+            // every entry this way refuses to start, and the operator needs to
+            // see which entry it was.
+            if !token.trim().is_empty() {
+                warn!("{name}: ignoring '{}', expected BASE_QUOTE", token.trim());
+            }
             continue;
         };
         if !out.iter().any(|existing| existing == &market) {
