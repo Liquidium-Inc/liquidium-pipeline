@@ -40,6 +40,44 @@ pub(crate) const MAX_FINALIZER_ATTEMPTS: i32 = 20;
 /// Maximum safe left-shift for `u64` multipliers in retry backoff.
 const MAX_U64_SHIFT: u32 = 63;
 
+/// Why a liquidation was parked for an operator while a venue leg may still
+/// hold its funds.
+///
+/// The parks are not one condition: `MAX_FINALIZER_ERRORS` counts strikes that
+/// reset whenever a row gets moving again, `MAX_FINALIZER_ATTEMPTS` bounds the
+/// row's whole life, and an unresumable row is no budget at all. Each names
+/// its own reason so an operator is quoted the right bound and the watchdog
+/// keys the alert on it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CustodyParkReason {
+    AttemptBudgetExhausted,
+    RetryBudgetExhausted,
+    UnresumableCommittedRow,
+}
+
+impl CustodyParkReason {
+    /// The stable key the watchdog dedupes alerts on.
+    fn pending_step(self) -> &'static str {
+        match self {
+            Self::AttemptBudgetExhausted => "attempt_budget_exhausted",
+            Self::RetryBudgetExhausted => "retry_budget_exhausted",
+            Self::UnresumableCommittedRow => "unresumable_committed_row",
+        }
+    }
+}
+
+impl std::fmt::Display for CustodyParkReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::AttemptBudgetExhausted => {
+                write!(f, "worked {MAX_FINALIZER_ATTEMPTS} times in total without finishing")
+            }
+            Self::RetryBudgetExhausted => write!(f, "{MAX_FINALIZER_ERRORS} failed finalize attempts"),
+            Self::UnresumableCommittedRow => write!(f, "this build cannot resume the committed row"),
+        }
+    }
+}
+
 /// Exponential retry delay with cap: min(max, base * 2^(errors-1)).
 fn retry_delay_secs(base: u64, max: u64, error_count: i32) -> u64 {
     if base == 0 {
@@ -148,29 +186,21 @@ where
     /// The venue itself is not known here -- this stage is generic over the
     /// finalizer -- but the tagged error carries the venue and leg, so it goes
     /// in `details` while `venue` names the component that made the decision.
-    ///
-    /// `pending_step` and `parked_because` come from the caller because the
-    /// parks are not one condition: `MAX_FINALIZER_ERRORS` counts strikes that
-    /// reset whenever a row gets moving again, `MAX_FINALIZER_ATTEMPTS` bounds
-    /// the row's whole life, and an unresumable row is no budget at all. Naming
-    /// one of them for every park quoted an operator the wrong number and the
-    /// wrong reason for the other two.
     async fn escalate_custody_park(
         &self,
         receipt: &ExecutionReceipt,
         liq_id: u128,
-        pending_step: &str,
-        parked_because: &str,
+        reason: CustodyParkReason,
         error: &str,
     ) {
         self.watchdog
             .notify(WatchdogEvent::OperatorRequired {
                 execution_id: liq_id.to_string(),
                 venue: "finalizer".to_string(),
-                pending_step: pending_step.to_string(),
+                pending_step: reason.pending_step().to_string(),
                 owner: receipt.request.liquidation.borrower.to_text(),
                 details: format!(
-                    "Liquidation {liq_id} was parked ({parked_because}) while a venue leg may still hold its funds. It will not be retried automatically. Last error: {error}"
+                    "Liquidation {liq_id} was parked ({reason}) while a venue leg may still hold its funds. It will not be retried automatically. Last error: {error}"
                 ),
             })
             .await;
@@ -383,14 +413,8 @@ where
                     warn!("Failed to park attempt-exhausted WAL row {}: {}", wal_id, error);
                 }
                 error!("[finalize] 🅿️ attempt budget exhausted; parked for operator liq_id={liq_id} err={err_msg}");
-                self.escalate_custody_park(
-                    &receipt,
-                    liq_id,
-                    "attempt_budget_exhausted",
-                    &format!("worked {MAX_FINALIZER_ATTEMPTS} times in total without finishing"),
-                    &err_msg,
-                )
-                .await;
+                self.escalate_custody_park(&receipt, liq_id, CustodyParkReason::AttemptBudgetExhausted, &err_msg)
+                    .await;
                 continue;
             }
 
@@ -498,8 +522,7 @@ where
                         self.escalate_custody_park(
                             &receipt,
                             liq_id,
-                            "unresumable_committed_row",
-                            "this build cannot resume the committed row",
+                            CustodyParkReason::UnresumableCommittedRow,
                             &err_msg,
                         )
                         .await;
@@ -530,32 +553,19 @@ where
                             wal_mark_operator_required_with_error(&*self.wal, wal_id, err_msg.clone()).await
                         {
                             warn!("Failed to park custody-holding WAL row {}: {}", wal_id, error);
-                            self.escalate_custody_park(
-                                &receipt,
-                                liq_id,
-                                "retry_budget_exhausted",
-                                &format!("{MAX_FINALIZER_ERRORS} failed finalize attempts"),
-                                &err_msg,
-                            )
-                            .await;
                         } else {
                             error!(
                                 "[finalize] 🅿️ retry budget exhausted while a venue leg holds funds; parked for operator liq_id={} err={}",
                                 liq_id, err_msg
                             );
-                            // A parked row produces no finalized outcome, so it
-                            // reaches neither the CSV export nor the
-                            // liquidation-finalized notification. Without this
-                            // the only trace of stranded custody is a log line.
-                            self.escalate_custody_park(
-                                &receipt,
-                                liq_id,
-                                "retry_budget_exhausted",
-                                &format!("{MAX_FINALIZER_ERRORS} failed finalize attempts"),
-                                &err_msg,
-                            )
-                            .await;
                         }
+                        // Escalated whether or not the park was written: a
+                        // parked row produces no finalized outcome, so it
+                        // reaches neither the CSV export nor the
+                        // liquidation-finalized notification, and without this
+                        // the only trace of stranded custody is a log line.
+                        self.escalate_custody_park(&receipt, liq_id, CustodyParkReason::RetryBudgetExhausted, &err_msg)
+                            .await;
                     } else if matches!(
                         error,
                         FinalizerError::Permanent(_) | FinalizerError::BadDebtAmountFloor(_)
