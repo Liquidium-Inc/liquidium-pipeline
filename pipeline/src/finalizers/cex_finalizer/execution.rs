@@ -39,6 +39,7 @@ use crate::{
     stages::bridge_submit_lock::acquire_bridge_submit_lock,
     stages::executor::ExecutionReceipt,
     swappers::{
+        kraken::KRAKEN_WITHDRAW_BELOW_MIN,
         mexc::orderbook_quote::{simulate_buy_from_asks, simulate_sell_from_bids},
         model::SwapExecution,
     },
@@ -97,6 +98,21 @@ fn parse_raw_code(err: &str) -> Option<i64> {
     value.get(..end)?.parse().ok()
 }
 
+/// How a venue reports a withdrawal refused for being under its minimum.
+///
+/// The two venues signal it differently, and neither signal works for the
+/// other: MEXC returns a numeric code that survives the message being
+/// localized or reworded, while Kraken returns no code at all because its
+/// adapter refuses the amount before submission, leaving its own message as
+/// the only thing to match.
+#[derive(Clone, Copy)]
+enum WithdrawBelowMinSignal {
+    /// A numeric code carried in the error as `raw_code:`.
+    RawCode(i64),
+    /// A substring of a message the venue's own adapter raises.
+    Message(&'static str),
+}
+
 /// Venue-specific policy consumed by the shared CEX state machine.
 ///
 /// API types and transport behavior remain in `CexBackend`; this profile only
@@ -107,7 +123,7 @@ pub struct CexVenueProfile {
     preview_taker_fee_bps: f64,
     deposit_fee_multiplier: u8,
     special_trade_legs: Option<fn(&str, &str) -> Option<Vec<TradeLeg>>>,
-    withdraw_below_min_raw_code: Option<i64>,
+    withdraw_below_min: Option<WithdrawBelowMinSignal>,
     funding_preflight_required: bool,
     backend_submission_classifier_required: bool,
     approval_bumps_required: bool,
@@ -125,7 +141,11 @@ impl CexVenueProfile {
             preview_taker_fee_bps,
             deposit_fee_multiplier: 1,
             special_trade_legs: None,
-            withdraw_below_min_raw_code: None,
+            // Kraken names no code for this, so its own refusal message is
+            // matched instead. Without it a residual post-trade withdrawal too
+            // small to send would retry in `Withdraw` until it ran out of
+            // strikes, rather than being written off as dust.
+            withdraw_below_min: Some(WithdrawBelowMinSignal::Message(KRAKEN_WITHDRAW_BELOW_MIN)),
             funding_preflight_required: true,
             backend_submission_classifier_required: true,
             approval_bumps_required: false,
@@ -144,7 +164,7 @@ impl CexVenueProfile {
             preview_taker_fee_bps: 10.0,
             deposit_fee_multiplier: CEX_DEPOSIT_FEE_MULTIPLIER,
             special_trade_legs: Some(legacy_special_trade_legs),
-            withdraw_below_min_raw_code: Some(MEXC_WITHDRAW_BELOW_MIN_RAW_CODE),
+            withdraw_below_min: Some(WithdrawBelowMinSignal::RawCode(MEXC_WITHDRAW_BELOW_MIN_RAW_CODE)),
             funding_preflight_required: false,
             backend_submission_classifier_required: false,
             approval_bumps_required: true,
@@ -204,8 +224,11 @@ impl CexVenueProfile {
     }
 
     fn is_withdraw_below_min_error(&self, error: &str) -> bool {
-        self.withdraw_below_min_raw_code
-            .is_some_and(|expected| parse_raw_code(error) == Some(expected))
+        match self.withdraw_below_min {
+            Some(WithdrawBelowMinSignal::RawCode(expected)) => parse_raw_code(error) == Some(expected),
+            Some(WithdrawBelowMinSignal::Message(marker)) => error.contains(marker),
+            None => false,
+        }
     }
 }
 

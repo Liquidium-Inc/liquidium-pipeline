@@ -90,10 +90,18 @@ impl IcpswapFirstPlannerConfig {
         // that same shortfall plus the input ledger fees and the pool-versus-
         // oracle basis, so its limit has to sit above the impact caps or it would
         // reject the quotes those caps deliberately allow.
-        if f64::from(self.max_oracle_discount_bps) <= self.dust_fallback_max_price_impact_bps {
+        // Both caps, because they are set independently: a CEX cap above the
+        // oracle limit lets the waterfall size a leg to an impact the guard
+        // then refuses, so the plan dies after the quotes are spent.
+        let (cap_name, cap_bps) = if self.dust_fallback_max_price_impact_bps >= self.max_cex_price_impact_bps {
+            ("dust fallback", self.dust_fallback_max_price_impact_bps)
+        } else {
+            ("CEX", self.max_cex_price_impact_bps)
+        };
+        if f64::from(self.max_oracle_discount_bps) <= cap_bps {
             return Err(IcpswapFirstPlannerError::InvalidInput(format!(
-                "maximum oracle discount {} bps must exceed the {:.2} bps dust fallback impact cap",
-                self.max_oracle_discount_bps, self.dust_fallback_max_price_impact_bps
+                "maximum oracle discount {} bps must exceed the {:.2} bps {} impact cap",
+                self.max_oracle_discount_bps, cap_bps, cap_name
             )));
         }
         if self.oracle_snapshot_max_age_secs < 0 {

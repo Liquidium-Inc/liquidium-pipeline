@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     fmt::{self, Debug},
     sync::Arc,
 };
@@ -178,6 +179,9 @@ impl SecretsProvider for OwnedSecretsProvider {
     }
 }
 
+/// Most withdrawals Kraken returns for one `WithdrawStatus` request.
+const KRAKEN_WITHDRAWAL_HISTORY_MAX: i64 = 500;
+
 type Client = RateLimitedKrakenClient<CoreKrakenClient>;
 
 pub struct KrakenRestApi {
@@ -200,6 +204,22 @@ impl KrakenRestApi {
         Self {
             client: Mutex::new(Client::new(secrets, nonce)),
         }
+    }
+}
+
+/// Picks the entry a one-item request asked for out of Kraken's keyed response.
+///
+/// Kraken keys results by its own name for the thing, which is not always the
+/// name that was sent, so a lone entry is still the answer to our question. More
+/// than one entry without our key is somebody else's answer -- another market's
+/// book, another order's fill -- and adopting it is worse than failing the call,
+/// because it reconciles real money against the wrong row. `HashMap` iteration
+/// order is arbitrary, so the entry a blind fallback picks is arbitrary too.
+fn take_requested<T>(mut entries: HashMap<String, T>, key: &str) -> Option<T> {
+    match entries.remove(key) {
+        Some(entry) => Some(entry),
+        None if entries.len() == 1 => entries.into_values().next(),
+        None => None,
     }
 }
 
@@ -286,10 +306,7 @@ impl KrakenApi for KrakenRestApi {
             .get_orderbook(&request)
             .await
             .map_err(transport_error)?;
-        let mut books = take_result(response)?;
-        let book = books
-            .remove(pair)
-            .or_else(|| books.into_values().next())
+        let book = take_requested(take_result(response)?, pair)
             .ok_or_else(|| KrakenApiError::Transport(format!("no order book returned for {pair}")))?;
         Ok(KrakenBook {
             bids: book
@@ -449,10 +466,7 @@ impl KrakenApi for KrakenRestApi {
             .query_orders_info(&request)
             .await
             .map_err(transport_error)?;
-        let mut orders = take_result(response)?;
-        let order = orders
-            .remove(order_id)
-            .or_else(|| orders.into_values().next())
+        let order = take_requested(take_result(response)?, order_id)
             .ok_or_else(|| KrakenApiError::Transport(format!("order {order_id} was not returned")))?;
         Ok(to_kraken_order(order))
     }
@@ -493,9 +507,14 @@ impl KrakenApi for KrakenRestApi {
     }
 
     async fn withdrawals(&self, asset: &str) -> Result<Vec<KrakenWithdrawal>, KrakenApiError> {
+        // 500 is what Kraken documents as both the default and the ceiling for
+        // this endpoint, over a 90-day window. Asking for the maximum is the
+        // whole reach available here: the client's typed response is a bare
+        // `Vec<DepositWithdrawal>` with no cursor in it, so a withdrawal that
+        // falls off this page cannot be paged back to.
         let request = StatusOfDepositWithdrawRequest::builder()
             .asset(asset.to_string())
-            .limit(100)
+            .limit(KRAKEN_WITHDRAWAL_HISTORY_MAX)
             .build();
         let response = self
             .client
@@ -525,6 +544,31 @@ impl KrakenApi for KrakenRestApi {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Kraken answers a one-item request with a map keyed by its own name for
+    /// the thing, so a lone entry is still our answer. Two entries without our
+    /// key are not: `HashMap` iteration order is arbitrary, so taking one anyway
+    /// reconciles an order's fill, or prices a market, against whichever row the
+    /// hasher happened to yield.
+    #[test]
+    fn a_keyed_response_only_answers_for_the_thing_that_was_asked_about() {
+        let map = |pairs: &[(&str, u8)]| {
+            pairs
+                .iter()
+                .map(|(key, value)| ((*key).to_string(), *value))
+                .collect::<HashMap<String, u8>>()
+        };
+
+        // The exact key wins, whatever else came back alongside it.
+        assert_eq!(take_requested(map(&[("XXBTZUSD", 1), ("XETHZUSD", 2)]), "XXBTZUSD"), Some(1));
+
+        // Kraken's alias for the same request: one entry, so it is ours.
+        assert_eq!(take_requested(map(&[("XBTUSD", 1)]), "XXBTZUSD"), Some(1));
+
+        // Somebody else's rows. The caller's transport error is the right answer.
+        assert_eq!(take_requested(map(&[("XETHZUSD", 2), ("XXRPZUSD", 3)]), "XXBTZUSD"), None);
+        assert_eq!(take_requested(map(&[]), "XXBTZUSD"), None);
+    }
 
     #[test]
     fn canonical_symbol_only_strips_known_kraken_legacy_codes() {

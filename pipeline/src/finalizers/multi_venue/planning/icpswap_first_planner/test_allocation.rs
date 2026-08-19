@@ -130,27 +130,41 @@ impl IcpswapFirstPlanner {
     ) -> Result<Vec<VenueRoutePreview>, IcpswapFirstPlannerError> {
         let mexc_value =
             ChainTokenAmount::from_formatted(input.total_pay.token.clone(), mexc_target_usd / reference_price).value;
-        if mexc_value == Nat::from(0u8) {
-            return Err(IcpswapFirstPlannerError::NoViableRoute(format!(
+
+        // A configured amount that does not fit what is left is a misconfigured
+        // test, not a reason to strand collateral that is already seized, so it
+        // leaves by the same exit as the quoting failures below.
+        // `plan_forced_cex_split_previews` screens both cases before it calls
+        // here; the fixed-ICPSwap path cannot, because the remainder it has to
+        // fit only exists once its own leg is carved.
+        let unshapeable = if mexc_value == Nat::from(0u8) {
+            Some(format!(
                 "test MEXC allocation ${mexc_target_usd:.2} rounds to zero native units"
-            )));
-        }
-        if mexc_value >= cex_value {
-            return Err(IcpswapFirstPlannerError::NoViableRoute(format!(
-                "received collateral is too small to allocate ${mexc_target_usd:.2} to MEXC and leave a Kraken remainder"
-            )));
-        }
+            ))
+        } else if mexc_value >= cex_value {
+            Some(format!(
+                "${mexc_target_usd:.2} to MEXC leaves no remainder for {KRAKEN_VENUE_ID}"
+            ))
+        } else {
+            None
+        };
 
-        let kraken_value = cex_value.clone() - mexc_value.clone();
-
-        // An exact split cannot be honoured when one of its venues will not
-        // quote, but refusing to plan strands collateral that is already seized.
-        let abandoned = match self.preview_safe_cex(input, MEXC_VENUE_ID, mexc_value).await {
-            Ok(mexc) => match self.preview_safe_cex(input, KRAKEN_VENUE_ID, kraken_value).await {
-                Ok(kraken) => return Ok(vec![mexc, kraken]),
-                Err(error) => format!("{KRAKEN_VENUE_ID} could not quote its remainder ({error})"),
-            },
-            Err(error) => format!("{MEXC_VENUE_ID} could not quote its forced ${mexc_target_usd:.2} leg ({error})"),
+        let abandoned = match unshapeable {
+            Some(reason) => reason,
+            // An exact split cannot be honoured when one of its venues will not
+            // quote, but refusing to plan strands collateral that is already seized.
+            None => {
+                let kraken_value = cex_value.clone() - mexc_value.clone();
+                match self.preview_safe_cex(input, MEXC_VENUE_ID, mexc_value).await {
+                    Ok(mexc) => match self.preview_safe_cex(input, KRAKEN_VENUE_ID, kraken_value).await {
+                        Ok(kraken) => return Ok(vec![mexc, kraken]),
+                        Err(error) => format!("{KRAKEN_VENUE_ID} could not quote its remainder ({error})"),
+                    },
+                    Err(error) => {
+                        format!("{MEXC_VENUE_ID} could not quote its forced ${mexc_target_usd:.2} leg ({error})")
+                    }
+                }
+            }
         };
 
         // Loudly, because the run no longer tests the split it was configured for.

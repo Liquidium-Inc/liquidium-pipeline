@@ -293,9 +293,10 @@ fn config(cex_min_exec_usd: f64) -> IcpswapFirstPlannerConfig {
         cex_min_exec_usd,
         min_net_edge_bps: 150,
         bad_debt_min_net_edge_bps: 150,
-        // Must stay above the 150 bps dust fallback impact cap, which already
-        // includes the pool fee.
-        max_oracle_discount_bps: 200,
+        // Must stay above both impact caps -- the 200 bps CEX cap is the wider
+        // of the two -- because a venue's reported impact already includes its
+        // pool fee. This is the shipped pairing.
+        max_oracle_discount_bps: 250,
         oracle_snapshot_max_age_secs: 300,
         icpswap_test_allocation_usd: None,
         mexc_test_allocation_usd: None,
@@ -1086,6 +1087,51 @@ async fn the_mexc_override_forces_a_two_cex_split_where_icpswap_cannot_take_the_
     assert_eq!(state.legs[1].venue_id, KRAKEN_VENUE_ID);
 }
 
+/// The same invariant on the fixed-ICPSwap path, which screens nothing before
+/// shaping the split: the remainder the forced MEXC leg has to fit only exists
+/// once the ICPSwap leg is carved, so an oversized setting is discovered here
+/// rather than up front. It still must not fail a routable liquidation.
+#[tokio::test]
+async fn an_oversized_forced_mexc_leg_defers_to_the_waterfall_after_a_valid_icpswap_leg() {
+    let icpswap_calls = Arc::new(Mutex::new(Vec::new()));
+    let mexc_calls = Arc::new(Mutex::new(Vec::new()));
+    let kraken_calls = Arc::new(Mutex::new(Vec::new()));
+    let icpswap = mock_adapter(ICPSWAP_VENUE_ID, icpswap_calls.clone(), |request| {
+        Ok(proportional_preview(request, ICPSWAP_VENUE_ID, 10.0, 2))
+    });
+    let mexc = mock_adapter(MEXC_VENUE_ID, mexc_calls.clone(), |request| {
+        Ok(proportional_preview(request, MEXC_VENUE_ID, 10.0, 2))
+    });
+    let kraken = mock_adapter(KRAKEN_VENUE_ID, kraken_calls.clone(), |request| {
+        Ok(proportional_preview(request, KRAKEN_VENUE_ID, 10.0, 2))
+    });
+    let mut planner_config = config(8.0);
+    planner_config.icpswap_test_allocation_usd = Some(1.0);
+    // At $10/ICP this asks for 100 ICP of a 3 ICP liquidation, so nothing is
+    // left for Kraken once the forced $1 ICPSwap leg is carved.
+    planner_config.mexc_test_allocation_usd = Some(1_000.0);
+
+    let mut input = input_with_pay_token(native_icp());
+    input.total_pay.value = Nat::from(300_000_000u64);
+    let state = IcpswapFirstPlanner::new(
+        vec![Arc::new(icpswap), Arc::new(mexc), Arc::new(kraken)],
+        planner_config,
+    )
+    .expect("valid three-venue test planner")
+    .plan(&input, 123)
+    .await
+    .expect("an unshapeable test setting must not fail a routable liquidation");
+
+    // The forced ICPSwap leg still stands; its remainder went to the ordered
+    // waterfall, which gave all of it to MEXC.
+    assert_eq!(*icpswap_calls.lock().expect("ICPSwap calls"), vec![10_000_000]);
+    assert_eq!(*mexc_calls.lock().expect("MEXC calls"), vec![290_000_000]);
+    assert!(kraken_calls.lock().expect("Kraken calls").is_empty());
+    assert_eq!(state.legs.len(), 2);
+    assert_eq!(state.legs[0].venue_id, ICPSWAP_VENUE_ID);
+    assert_eq!(state.legs[1].venue_id, MEXC_VENUE_ID);
+}
+
 /// A test setting must never fail a liquidation the normal waterfall would route.
 #[tokio::test]
 async fn the_forced_cex_split_defers_to_the_waterfall_when_it_cannot_be_shaped() {
@@ -1744,23 +1790,43 @@ async fn input_ledger_fee_drag_is_a_share_of_the_leg_and_depends_on_the_pay_toke
 #[test]
 fn oracle_discount_limit_must_leave_room_above_the_impact_caps() {
     // A venue's reported impact already contains its pool fee, so a limit at or
-    // below the dust fallback cap would reject max-impact quotes that the impact
-    // policy allows -- with no room left for ledger fees or oracle basis.
-    let too_tight = IcpswapFirstPlannerConfig {
-        max_oracle_discount_bps: 150,
-        ..config(0.0)
+    // below an impact cap would reject max-impact quotes that the impact policy
+    // allows -- with no room left for ledger fees or oracle basis. Both caps are
+    // set independently, so each has to be checked.
+    let reject = |config: IcpswapFirstPlannerConfig, expected: &str| {
+        let adapter = mock_adapter(ICPSWAP_VENUE_ID, Arc::new(Mutex::new(Vec::new())), |request| {
+            Ok(preview(request, ICPSWAP_VENUE_ID, 10.0, 1, 1))
+        });
+        let error = match IcpswapFirstPlanner::new(vec![Arc::new(adapter)], config) {
+            Ok(_) => panic!("a limit at an impact cap must be rejected"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains(expected), "unexpected error: {error}");
     };
-    let adapter = mock_adapter(ICPSWAP_VENUE_ID, Arc::new(Mutex::new(Vec::new())), |request| {
-        Ok(preview(request, ICPSWAP_VENUE_ID, 10.0, 1, 1))
-    });
-    let error = match IcpswapFirstPlanner::new(vec![Arc::new(adapter)], too_tight) {
-        Ok(_) => panic!("a limit at the dust fallback cap must be rejected"),
-        Err(error) => error,
-    };
-    assert!(error.to_string().contains("must exceed the 150.00 bps dust fallback"));
 
-    // The shipped pairing leaves 100 bps above the cap.
+    // The CEX cap binds: it is the wider of the two in the shipped pairing, and
+    // it used to go unchecked entirely.
+    reject(
+        IcpswapFirstPlannerConfig {
+            max_oracle_discount_bps: 200,
+            ..config(0.0)
+        },
+        "must exceed the 200.00 bps CEX impact cap",
+    );
+
+    // The dust fallback cap binds once it is raised above the CEX cap.
+    reject(
+        IcpswapFirstPlannerConfig {
+            dust_fallback_max_price_impact_bps: 300.0,
+            max_oracle_discount_bps: 300,
+            ..config(0.0)
+        },
+        "must exceed the 300.00 bps dust fallback impact cap",
+    );
+
+    // The shipped pairing leaves room above both caps.
     assert!(config(0.0).max_oracle_discount_bps as f64 > config(0.0).dust_fallback_max_price_impact_bps);
+    assert!(config(0.0).max_oracle_discount_bps as f64 > config(0.0).max_cex_price_impact_bps);
     assert!(
         production_oracle_config(0.0).max_oracle_discount_bps as f64
             > production_oracle_config(0.0).dust_fallback_max_price_impact_bps

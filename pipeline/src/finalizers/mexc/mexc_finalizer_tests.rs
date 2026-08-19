@@ -53,6 +53,9 @@ fn cex_venue_profile_separates_kraken_and_mexc_policy() {
     assert_eq!(kraken.preview_taker_fee_bps(), 40.0);
     assert!(kraken.special_trade_legs("ETH", "USDC").is_none());
     assert!(!kraken.is_withdraw_below_min_error("raw_code: 10254"));
+    assert!(kraken.is_withdraw_below_min_error(&format!(
+        "{KRAKEN_WITHDRAW_BELOW_MIN}: 0.001 is below Bitcoin minimum 0.01"
+    )));
     assert_eq!(kraken.deposit_fee_multiplier, 1);
 
     let mexc = CexVenueProfile::mexc();
@@ -724,6 +727,76 @@ async fn mexc_native_icp_deposit_rejects_memo_tag_before_transfer() {
         .await
         .expect_err("native ICP memo/tag should fail before transfer");
     assert!(err.contains("unsupported memo/tag"));
+}
+
+/// Candidate routes overlap: every route out of the pay asset opens on the same
+/// leg. Reading that book once per candidate multiplies venue calls by the
+/// number of routes considered, and quotes the later candidates against a book
+/// the earlier ones never saw.
+///
+/// The comparison itself must not change: the longer route here pays more, and
+/// it still has to win.
+#[tokio::test]
+async fn candidate_routes_share_one_read_per_market_and_the_best_still_wins() {
+    let reads: Arc<std::sync::Mutex<HashMap<String, usize>>> = Arc::new(std::sync::Mutex::new(HashMap::new()));
+    let counted = Arc::clone(&reads);
+
+    let mut backend = MockCexBackend::new();
+    backend.expect_get_orderbook().returning(move |market, _| {
+        *counted.lock().expect("read counter").entry(market.to_string()).or_insert(0) += 1;
+        // A_C has no market, so the direct leg is discovered as unavailable.
+        // A -> B -> C pays 1:1, while A -> B -> D -> C doubles on its last leg.
+        let price = match market {
+            "A_B" | "B_C" | "B_D" => 1.0,
+            "D_C" => 2.0,
+            _ => return Err(format!("no {market} market")),
+        };
+        Ok(OrderBook {
+            bids: vec![OrderBookLevel {
+                price,
+                quantity: 1_000_000.0,
+            }],
+            asks: vec![],
+        })
+    });
+
+    let finalizer = MexcFinalizer::new(
+        Arc::new(backend),
+        Arc::new(MockTransferActions::new()),
+        Principal::anonymous(),
+        TEST_MAX_SELL_SLIPPAGE_BPS,
+        TEST_CEX_MIN_EXEC_USD,
+        TEST_CEX_SLICE_TARGET_RATIO,
+    )
+    .with_profile(CexVenueProfile::mexc())
+    .with_route_config(
+        vec![
+            "A_B".to_string(),
+            "B_C".to_string(),
+            "B_D".to_string(),
+            "D_C".to_string(),
+        ],
+        2,
+    );
+
+    let (legs, preview) = finalizer
+        .resolve_best_trade_route_for_amount("A", "C", 100.0)
+        .await
+        .expect("both candidates are executable");
+
+    assert_eq!(
+        legs.iter().map(|leg| leg.market.as_str()).collect::<Vec<_>>(),
+        vec!["A_B", "B_D", "D_C"],
+        "the higher-output route must still win, however many legs it takes"
+    );
+    assert!(preview.receive_amount > 190.0);
+
+    let reads = reads.lock().expect("read counter");
+    // A_B is crossed by both candidates and B_C by one, each read once.
+    assert_eq!(reads.get("A_B"), Some(&1));
+    assert_eq!(reads.get("B_C"), Some(&1));
+    assert_eq!(reads.get("B_D"), Some(&1));
+    assert_eq!(reads.get("D_C"), Some(&1));
 }
 
 /// A bridge route existing is not a reason to use it.
@@ -4446,6 +4519,65 @@ async fn mexc_trade_when_leg_index_is_past_route_moves_to_withdraw_and_sets_size
         .expect("size_out should be carried forward");
     assert_eq!(out.token, state.withdraw.withdraw_asset);
     assert!((out.to_f64() - 12.345678).abs() < 1e-12);
+}
+
+/// `trade` and `prepare_next_trade_order_intent` are two doors into the same
+/// state machine, and both leave it at `Withdraw` when there is nothing left to
+/// trade. They have to leave it in the same state: `withdraw` reads `size_out`,
+/// and an unset one is not "withdraw nothing" but "withdraw `size_in`" -- the
+/// pay amount, sent as a quantity of the receive asset.
+#[tokio::test]
+async fn both_trade_entry_points_carry_the_traded_output_into_withdraw() {
+    let mut backend = MockCexBackend::new();
+    backend.expect_get_orderbook().times(0);
+    backend.expect_execute_swap_detailed_with_options().times(0);
+
+    let finalizer = MexcFinalizer::new(
+        Arc::new(backend),
+        Arc::new(MockTransferActions::new()),
+        Principal::anonymous(),
+        TEST_MAX_SELL_SLIPPAGE_BPS,
+        TEST_CEX_MIN_EXEC_USD,
+        TEST_CEX_SLICE_TARGET_RATIO,
+    );
+
+    let receipt = make_execution_receipt(42);
+    // A leg that consumed all of its input: the index still points at a real
+    // leg, so neither entry point takes the out-of-range shortcut.
+    let exhausted = |mut state: CexState| {
+        state.step = CexStep::Trade;
+        state.trade.trade_leg_index = Some(0);
+        state.trade.trade_progress_remaining_in = Some(0.0);
+        state.trade.trade_progress_total_out = Some(7.5);
+        state
+    };
+
+    let mut through_trade = exhausted(finalizer.prepare("42", &receipt).await.expect("prepare"));
+    finalizer
+        .trade(&mut through_trade)
+        .await
+        .expect("nothing left to trade is not a failure");
+
+    let mut through_intent = exhausted(finalizer.prepare("42", &receipt).await.expect("prepare"));
+    let prepared = finalizer
+        .prepare_next_trade_order_intent(&mut through_intent)
+        .await
+        .expect("nothing left to trade is not a failure");
+
+    assert!(!prepared, "no order intent is prepared once the route is exhausted");
+    assert!(matches!(through_trade.step, CexStep::Withdraw));
+    assert!(matches!(through_intent.step, CexStep::Withdraw));
+    assert_eq!(
+        through_intent.withdraw.size_out.as_ref().map(|out| out.to_f64()),
+        through_trade.withdraw.size_out.as_ref().map(|out| out.to_f64()),
+    );
+    let out = through_intent
+        .withdraw
+        .size_out
+        .as_ref()
+        .expect("the traded output has to reach withdraw");
+    assert_eq!(out.token, through_intent.withdraw.withdraw_asset);
+    assert!((out.to_f64() - 7.5).abs() < 1e-12);
 }
 
 #[tokio::test]

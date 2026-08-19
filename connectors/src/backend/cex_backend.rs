@@ -68,8 +68,11 @@ pub fn is_cex_venue_unreachable_error(message: &str) -> bool {
 pub fn classify_cex_submission_error(message: &str) -> CexSubmissionError {
     if is_cex_venue_unreachable_error(message) {
         CexSubmissionError::Unreachable(message.to_string())
-    } else if is_cex_pending_settlement_error(message) {
-        CexSubmissionError::PendingSettlement(message.to_string())
+    } else if let Some(payload) = message.strip_prefix(CEX_PENDING_SETTLEMENT_PREFIX) {
+        // The payload only, because `Display` puts the prefix back. A backend
+        // that flattens a classification into its message and hands it here
+        // again would otherwise stack one prefix per round trip.
+        CexSubmissionError::PendingSettlement(payload.to_string())
     } else {
         CexSubmissionError::Rejected(message.to_string())
     }
@@ -292,6 +295,22 @@ mod tests {
             classify_cex_submission_error(&wrapped),
             CexSubmissionError::Unreachable(_)
         ));
+    }
+
+    /// Rendering a classification and reading it back has to land on the same
+    /// error, not on one carrying a second copy of the marker. Kraken flattens
+    /// typed errors into their message (`execute_swap_detailed`) and classifies
+    /// the result again, so this round trip runs on a live path.
+    #[test]
+    fn a_pending_classification_survives_rendering_without_stacking_its_marker() {
+        let original = CexSubmissionError::PendingSettlement("matching engine is catching up".to_string());
+        let reclassified = classify_cex_submission_error(&original.to_string());
+
+        assert_eq!(reclassified, original);
+        assert_eq!(
+            reclassified.to_string(),
+            "cex pending settlement: matching engine is catching up"
+        );
     }
 
     /// A venue's own answer must never be read as absence of a request.

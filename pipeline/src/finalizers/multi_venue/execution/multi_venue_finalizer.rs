@@ -214,13 +214,18 @@ impl MultiVenueFinalizer {
             // collateral is swept out of the swap path instead of spending the
             // row's retry budget and then being abandoned where it sits.
             Err(
-                IcpswapFirstPlannerError::BelowVenueMinimum(reason)
-                | IcpswapFirstPlannerError::NoAcceptableQuote(reason),
+                planner_error @ (IcpswapFirstPlannerError::BelowVenueMinimum(_)
+                | IcpswapFirstPlannerError::NoAcceptableQuote(_)),
             ) => {
+                // One end state, but not one finding: an amount below every
+                // venue's minimum is a property of the amount, while a refused
+                // quote means a venue would have taken it at a price we would
+                // not. Each variant renders its own summary, so the durable
+                // record an operator reads says which of the two happened
+                // instead of reporting both as the first.
+                let finding = planner_error.to_string();
                 let recovery = self.recovery.as_ref().ok_or_else(|| {
-                    format!(
-                        "{MULTI_VENUE_PERMANENT_PREFIX}no venue can execute this amount and recovery sweep is unavailable: {reason}"
-                    )
+                    format!("{MULTI_VENUE_PERMANENT_PREFIX}{finding}; recovery sweep is unavailable")
                 })?;
                 let destination = recovery_destination(&input.total_pay.token, &recovery.recovery_account)?;
                 let fee = input.total_pay.token.fee();
@@ -231,7 +236,7 @@ impl MultiVenueFinalizer {
                 };
                 let recovery_state = RecoverySweepState {
                     liquidation_id: liquidation_id.clone(),
-                    reason: format!("no venue can execute this amount: {reason}"),
+                    reason: finding,
                     amount: ChainTokenAmount::from_raw(input.total_pay.token.clone(), amount.clone()),
                     destination,
                     // Collateral that cannot pay its own transfer fee never

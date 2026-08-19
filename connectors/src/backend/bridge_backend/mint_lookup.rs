@@ -83,9 +83,12 @@ struct ConvertMintMemo {
     tx_hash: String,
 }
 
-/// Only the variant this pipeline produces is declared. A memo of any other
-/// shape fails to decode, which reads as "not this leg's credit" -- the one
-/// direction that cannot book funds nobody holds.
+/// Only the variant this pipeline produces is declared. The minter wraps this in
+/// `opt` precisely so it can add variants, and candid decodes an `opt` it cannot
+/// match as `null` rather than failing, so a reimbursement memo -- or any memo
+/// added later -- arrives as `Mint(None)` and reads as "not this leg's credit".
+/// That is the one direction that cannot book funds nobody holds, and it comes
+/// from the match below rather than from swallowing a failed call.
 #[derive(CandidType, Deserialize)]
 enum MintMemo {
     Convert(ConvertMintMemo),
@@ -170,11 +173,8 @@ async fn memo_names_deposit<A: PipelineAgent>(
 
     let decoded = agent
         .call_query::<DecodeLedgerMemoResult>(&minter, "decode_ledger_memo", args)
-        .await;
-    let Ok(decoded) = decoded else {
-        // A memo this build cannot get decoded is not evidence of a credit.
-        return Ok(false);
-    };
+        .await
+        .map_err(|e| format!("decode_ledger_memo failed on minter {minter}: {e}"))?;
 
     Ok(match decoded {
         DecodeLedgerMemoResult::Ok(Some(DecodedMemo::Mint(Some(MintMemo::Convert(convert))))) => {
@@ -182,4 +182,53 @@ async fn memo_names_deposit<A: PipelineAgent>(
         }
         _ => false,
     })
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use candid::{Decode, Deserialize};
+
+    /// `memo_names_deposit` propagates a failed `decode_ledger_memo` call, which
+    /// is only safe because a memo shape this build does not know is not a
+    /// failure. The minter wraps `MintMemo` in `opt` so it can add variants, and
+    /// candid decodes an unmatched `opt` as `null`: `ReimburseWithdrawal` exists
+    /// on the live minter today and lands on the same account this scan walks.
+    /// If that ever became a hard decode error, propagating would turn one
+    /// reimbursement into a permanently failing credit scan.
+    #[test]
+    fn a_mint_memo_this_build_does_not_know_decodes_as_absent_rather_than_failing() {
+        // The minter's own declaration, as its candid interface gives it.
+        #[derive(CandidType, Deserialize)]
+        enum WireMintMemo {
+            #[allow(dead_code)]
+            Convert(ConvertMintMemo),
+            ReimburseWithdrawal {
+                withdrawal_id: u64,
+            },
+        }
+        #[derive(CandidType, Deserialize)]
+        enum WireDecodedMemo {
+            Mint(Option<WireMintMemo>),
+        }
+        #[derive(CandidType, Deserialize)]
+        enum WireResult {
+            Ok(Option<WireDecodedMemo>),
+            #[allow(dead_code)]
+            Err(Option<DecodeLedgerMemoError>),
+        }
+
+        let wire = WireResult::Ok(Some(WireDecodedMemo::Mint(Some(WireMintMemo::ReimburseWithdrawal {
+            withdrawal_id: 7,
+        }))));
+        let bytes = candid::Encode!(&wire).expect("the minter's shape encodes");
+
+        let decoded = Decode!(&bytes, DecodeLedgerMemoResult).expect("an unknown variant must not fail to decode");
+
+        assert!(
+            matches!(decoded, DecodeLedgerMemoResult::Ok(Some(DecodedMemo::Mint(None)))),
+            "an unknown mint memo must arrive as absent, so the match below reads it as not our credit"
+        );
+    }
 }

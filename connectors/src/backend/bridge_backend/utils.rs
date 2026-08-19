@@ -122,9 +122,11 @@ mod tests {
     /// found, so the leg would simply wait forever. Pinning the pairing here
     /// turns that into a build failure instead.
     ///
-    /// Both ids were verified against the live canisters, each of which reports
-    /// its own ledger: `xrs4b-hiaaa-aaaar-qafoa-cai` -> ckUSDC and
-    /// `s3zol-vqaaa-aaaar-qacpa-cai` -> ckETH.
+    /// Every id below was verified against the live canister, each of which
+    /// reports its own ledger from `ledger_id`:
+    /// `xrs4b-hiaaa-aaaar-qafoa-cai` -> ckUSDC `xevnm-gaaaa-aaaar-qafnq-cai`,
+    /// `s3zol-vqaaa-aaaar-qacpa-cai` -> ckETH `ss2fx-dyaaa-aaaar-qacoq-cai`, and
+    /// `cefgz-dyaaa-aaaar-qag5a-cai` -> ckUSDT `cngnf-vqaaa-aaaar-qag4q-cai`.
     #[test]
     fn every_ckerc20_route_pairs_its_ledger_with_a_verified_index() {
         for route in super::super::catalog::BRIDGE_ROUTE_CATALOG {

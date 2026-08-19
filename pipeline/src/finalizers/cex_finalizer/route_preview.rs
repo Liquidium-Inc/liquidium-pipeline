@@ -1,8 +1,42 @@
-use liquidium_pipeline_connectors::backend::cex_backend::CexBackend;
+use std::collections::HashMap;
 
-use super::CexFinalizer;
+use liquidium_pipeline_connectors::backend::cex_backend::{CexBackend, OrderBook};
+
+use super::{CexFinalizer, DEFAULT_ORDERBOOK_LIMIT};
 use crate::finalizers::cex_finalizer::utils::{LIQUIDITY_EPS, TradeLeg};
 use crate::swappers::model::{BPS_PER_RATIO_UNIT, adverse_price_impact_bps};
+
+/// Order books read during one route-resolution pass, keyed by market.
+///
+/// A book belongs to the market, not to the amount being routed, so candidate
+/// routes that cross the same market share one read instead of one each. That
+/// also makes the comparison between them fair: without it the route previewed
+/// last is judged against a later book than the route previewed first, and the
+/// winner partly reflects which one was quoted more recently.
+///
+/// Deliberately per-pass rather than a long-lived cache: a stale book would
+/// then decide real routing.
+#[derive(Default)]
+pub(super) struct RouteOrderbooks {
+    books: HashMap<String, OrderBook>,
+}
+
+impl RouteOrderbooks {
+    /// Returns this market's book, reading it from the venue only the first
+    /// time this pass asks for it.
+    pub(super) async fn book<B>(&mut self, backend: &B, market: &str) -> Result<&OrderBook, String>
+    where
+        B: CexBackend,
+    {
+        if !self.books.contains_key(market) {
+            let book = backend.get_orderbook(market, Some(DEFAULT_ORDERBOOK_LIMIT)).await?;
+            self.books.insert(market.to_string(), book);
+        }
+        self.books
+            .get(market)
+            .ok_or_else(|| format!("orderbook for {market} vanished from this pass"))
+    }
+}
 
 /// One normalized route preview shared by legacy CEX routing and the generic
 /// multi-venue adapter. Prices are always receive units per pay unit.
@@ -24,6 +58,18 @@ where
         legs: &[TradeLeg],
         initial_amount: f64,
     ) -> Result<CexResolvedRoutePreview, String> {
+        self.preview_resolved_trade_route_with_books(&mut RouteOrderbooks::default(), legs, initial_amount)
+            .await
+    }
+
+    /// `preview_resolved_trade_route` reusing the books an earlier candidate in
+    /// the same pass already read.
+    pub(super) async fn preview_resolved_trade_route_with_books(
+        &self,
+        books: &mut RouteOrderbooks,
+        legs: &[TradeLeg],
+        initial_amount: f64,
+    ) -> Result<CexResolvedRoutePreview, String> {
         if !initial_amount.is_finite() || initial_amount <= LIQUIDITY_EPS {
             return Err(format!(
                 "{} cannot quote a non-positive pay amount",
@@ -34,8 +80,9 @@ where
         let mut amount_in = initial_amount;
         let mut route_reference_price = 1.0;
         for leg in legs {
-            let (gross_amount_out, _side_vwap, side_impact_bps) =
-                self.preview_leg(&leg.market, &leg.side, amount_in).await?;
+            let (gross_amount_out, _side_vwap, side_impact_bps) = self
+                .preview_leg_with_books(books, &leg.market, &leg.side, amount_in)
+                .await?;
             if self.profile.funding_preflight_required() {
                 self.backend
                     .validate_trade_amounts(&leg.market, &leg.side, amount_in, gross_amount_out)

@@ -1,4 +1,4 @@
-use super::route_preview::CexResolvedRoutePreview;
+use super::route_preview::{CexResolvedRoutePreview, RouteOrderbooks};
 use super::*;
 use crate::finalizers::bridge_planner::BridgePlanner;
 use crate::finalizers::cex_finalizer::utils::parse_market_symbols;
@@ -633,8 +633,15 @@ where
         candidates.retain(|candidate| seen.insert(Self::route_signature(candidate)));
         let mut best: Option<(Vec<TradeLeg>, CexResolvedRoutePreview)> = None;
         let mut preview_errors = Vec::new();
+        // Candidates overlap heavily -- every route out of the pay asset opens
+        // on the same leg -- so one set of books serves the whole comparison
+        // instead of re-reading a market once per route that crosses it.
+        let mut books = RouteOrderbooks::default();
         for candidate in candidates {
-            match self.preview_resolved_trade_route(&candidate, initial_amount).await {
+            match self
+                .preview_resolved_trade_route_with_books(&mut books, &candidate, initial_amount)
+                .await
+            {
                 Ok(preview)
                     if best
                         .as_ref()
@@ -879,10 +886,19 @@ where
         side: &str,
         amount_in: f64,
     ) -> Result<(f64, f64, f64), String> {
-        let orderbook = self
-            .backend
-            .get_orderbook(market, Some(DEFAULT_ORDERBOOK_LIMIT))
-            .await?;
+        self.preview_leg_with_books(&mut RouteOrderbooks::default(), market, side, amount_in)
+            .await
+    }
+
+    /// `preview_leg` against the books this pass has already read.
+    pub(super) async fn preview_leg_with_books(
+        &self,
+        books: &mut RouteOrderbooks,
+        market: &str,
+        side: &str,
+        amount_in: f64,
+    ) -> Result<(f64, f64, f64), String> {
+        let orderbook = books.book(self.backend.as_ref(), market).await?;
 
         if side.eq_ignore_ascii_case("sell") {
             let (out, avg, impact, unfilled) = simulate_sell_from_bids(&orderbook.bids, amount_in)?;
@@ -1162,6 +1178,21 @@ where
         });
         if amount_in <= LIQUIDITY_EPS {
             state.step = CexStep::Withdraw;
+            // Carried forward exactly as `CexFinalizerLogic::trade` does at the
+            // same guard, because both entry points reach the same `withdraw`.
+            // Leaving `size_out` unset there does not mean "withdraw nothing":
+            // `withdraw` falls back to `size_in`, the pay amount, and sends that
+            // quantity of the receive asset instead.
+            if let Some(out_amt) = state
+                .trade
+                .trade_progress_total_out
+                .or(state.trade.trade_next_amount_in)
+            {
+                state.withdraw.size_out = Some(ChainTokenAmount::from_formatted(
+                    state.withdraw.withdraw_asset.clone(),
+                    out_amt.max(0.0),
+                ));
+            }
             return Ok(false);
         }
 

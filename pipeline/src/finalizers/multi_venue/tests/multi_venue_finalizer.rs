@@ -789,7 +789,15 @@ async fn a_fold_refused_on_price_sweeps_to_recovery_instead_of_retrying() {
     // MEXC is ruled out on size before it is asked; Kraken answered and was refused.
     assert_eq!(mexc.previews(), 0, "a venue below its own floor is never quoted");
     assert!(kraken.previews() > 0, "Kraken must have been quoted for the fold");
-    assert_eq!(committed_recovery_state(&wal).status, RecoverySweepStatus::Completed);
+    let state = committed_recovery_state(&wal);
+    assert_eq!(state.status, RecoverySweepStatus::Completed);
+    // A venue would have taken this amount; we refused its price. The durable
+    // record has to say that, not that the amount was too small for anyone.
+    assert!(
+        state.reason.starts_with("no venue will price this amount acceptably"),
+        "unexpected sweep reason: {}",
+        state.reason
+    );
 }
 
 #[tokio::test]
@@ -828,6 +836,12 @@ async fn below_minimum_route_sweeps_exact_collateral_minus_fee_to_recovery() {
     assert_eq!(state.status, RecoverySweepStatus::Completed);
     assert_eq!(state.amount.value, Nat::from(TOTAL_PAY - 10_000));
     assert_eq!(state.txid.as_deref(), Some("recovery-block-123"));
+    // The other finding, which must stay distinguishable from a refused price.
+    assert!(
+        state.reason.starts_with("no venue can execute this amount"),
+        "unexpected sweep reason: {}",
+        state.reason
+    );
 }
 
 /// The transfer must be durable before it is submitted, so that a reader who

@@ -20,6 +20,17 @@ pub async fn build_kraken_finalizer(ctx: &PipelineContext) -> Result<Arc<KrakenF
         .iter()
         .map(|pair| normalize_market(pair))
         .collect::<Vec<_>>();
+    // An empty allowlist is not a narrower Kraken, it is an unrestricted one:
+    // `KrakenClient` skips the market filter entirely when it has no pairs, so
+    // a missing or unparsable setting would quietly let routing reach every
+    // market Kraken lists. Refused here for the same reason missing credentials
+    // are -- Kraken is opt-in, so only an operator who asked for it is affected.
+    if available_pairs.is_empty() {
+        return Err(
+            "Kraken is enabled but CEX_KRAKEN_AVAILABLE_PAIRS is unset or has no parsable market: an empty allowlist would let Kraken route through every market it lists"
+                .to_string(),
+        );
+    }
     let client = Arc::new(KrakenClient::new(api_key, api_secret, available_pairs.clone()));
     let bridge_dependencies = build_cex_bridge_dependencies(ctx).await?;
 

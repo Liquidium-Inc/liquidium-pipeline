@@ -143,21 +143,34 @@ where
         Ok(())
     }
 
-    /// Escalates a liquidation parked because its retry budget ran out while a
-    /// venue leg may still hold the funds.
+    /// Escalates a liquidation parked while a venue leg may still hold the funds.
     ///
     /// The venue itself is not known here -- this stage is generic over the
     /// finalizer -- but the tagged error carries the venue and leg, so it goes
     /// in `details` while `venue` names the component that made the decision.
-    async fn escalate_custody_park(&self, receipt: &ExecutionReceipt, liq_id: u128, error: &str) {
+    ///
+    /// `pending_step` and `parked_because` come from the caller because the
+    /// parks are not one condition: `MAX_FINALIZER_ERRORS` counts strikes that
+    /// reset whenever a row gets moving again, `MAX_FINALIZER_ATTEMPTS` bounds
+    /// the row's whole life, and an unresumable row is no budget at all. Naming
+    /// one of them for every park quoted an operator the wrong number and the
+    /// wrong reason for the other two.
+    async fn escalate_custody_park(
+        &self,
+        receipt: &ExecutionReceipt,
+        liq_id: u128,
+        pending_step: &str,
+        parked_because: &str,
+        error: &str,
+    ) {
         self.watchdog
             .notify(WatchdogEvent::OperatorRequired {
                 execution_id: liq_id.to_string(),
                 venue: "finalizer".to_string(),
-                pending_step: "retry_budget_exhausted".to_string(),
+                pending_step: pending_step.to_string(),
                 owner: receipt.request.liquidation.borrower.to_text(),
                 details: format!(
-                    "Liquidation {liq_id} was parked after {MAX_FINALIZER_ERRORS} failed finalize attempts while a venue leg may still hold its funds. It will not be retried automatically. Last error: {error}"
+                    "Liquidation {liq_id} was parked ({parked_because}) while a venue leg may still hold its funds. It will not be retried automatically. Last error: {error}"
                 ),
             })
             .await;
@@ -371,7 +384,14 @@ where
                     warn!("Failed to park attempt-exhausted WAL row {}: {}", wal_id, error);
                 }
                 error!("[finalize] 🅿️ attempt budget exhausted; parked for operator liq_id={liq_id} err={err_msg}");
-                self.escalate_custody_park(&receipt, liq_id, &err_msg).await;
+                self.escalate_custody_park(
+                    &receipt,
+                    liq_id,
+                    "attempt_budget_exhausted",
+                    &format!("worked {MAX_FINALIZER_ATTEMPTS} times in total without finishing"),
+                    &err_msg,
+                )
+                .await;
                 continue;
             }
 
@@ -476,7 +496,14 @@ where
                             "[finalize] 🅿️ committed row cannot be resumed by this build; parked for operator liq_id={} err={}",
                             liq_id, err_msg
                         );
-                        self.escalate_custody_park(&receipt, liq_id, &err_msg).await;
+                        self.escalate_custody_park(
+                            &receipt,
+                            liq_id,
+                            "unresumable_committed_row",
+                            "this build cannot resume the committed row",
+                            &err_msg,
+                        )
+                        .await;
                     } else if matches!(error, FinalizerError::BadDebtAmountFloor(_))
                         && receipt.request.liquidation.buy_bad_debt
                     {
@@ -504,7 +531,14 @@ where
                             wal_mark_operator_required_with_error(&*self.wal, wal_id, err_msg.clone()).await
                         {
                             warn!("Failed to park custody-holding WAL row {}: {}", wal_id, error);
-                            self.escalate_custody_park(&receipt, liq_id, &err_msg).await;
+                            self.escalate_custody_park(
+                                &receipt,
+                                liq_id,
+                                "retry_budget_exhausted",
+                                &format!("{MAX_FINALIZER_ERRORS} failed finalize attempts"),
+                                &err_msg,
+                            )
+                            .await;
                         } else {
                             error!(
                                 "[finalize] 🅿️ retry budget exhausted while a venue leg holds funds; parked for operator liq_id={} err={}",
@@ -514,7 +548,14 @@ where
                             // reaches neither the CSV export nor the
                             // liquidation-finalized notification. Without this
                             // the only trace of stranded custody is a log line.
-                            self.escalate_custody_park(&receipt, liq_id, &err_msg).await;
+                            self.escalate_custody_park(
+                                &receipt,
+                                liq_id,
+                                "retry_budget_exhausted",
+                                &format!("{MAX_FINALIZER_ERRORS} failed finalize attempts"),
+                                &err_msg,
+                            )
+                            .await;
                         }
                     } else if matches!(
                         error,
@@ -1457,6 +1498,7 @@ mod tests {
             calls: finalize_calls.clone(),
         };
 
+        let watchdog = Arc::new(RecordingWatchdog(Mutex::new(Vec::new())));
         let stage = FinalizeStage::new(
             Arc::new(wal),
             Arc::new(finalizer),
@@ -1465,9 +1507,26 @@ mod tests {
             Principal::anonymous(),
             5,
             120,
-        );
+        )
+        .with_watchdog(watchdog.clone());
 
         let outcomes = stage.process(&()).await.expect("process should succeed");
+
+        // The operator is told which budget ran out. Quoting the strike budget
+        // here named a number this row never reached: its strikes were cleared
+        // by every release, which is why the lifetime bound exists at all.
+        let alerts = watchdog.operator_alerts();
+        assert_eq!(alerts.len(), 1, "an attempt-exhausted row must raise exactly one alert");
+        let (_, pending_step, details) = &alerts[0];
+        assert_eq!(pending_step, "attempt_budget_exhausted");
+        assert!(
+            details.contains(&format!("worked {MAX_FINALIZER_ATTEMPTS} times in total")),
+            "the alert must report the lifetime attempt budget: {details}"
+        );
+        assert!(
+            !details.contains(&format!("{MAX_FINALIZER_ERRORS} failed finalize attempts")),
+            "the strike budget is a different bound and must not be quoted here: {details}"
+        );
 
         assert!(outcomes.is_empty(), "a parked row produces no outcome");
         assert_eq!(

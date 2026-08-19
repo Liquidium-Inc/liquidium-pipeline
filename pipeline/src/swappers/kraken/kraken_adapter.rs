@@ -17,11 +17,20 @@ use rust_decimal::{
 use tokio::sync::RwLock;
 
 use super::kraken_api::{
-    KrakenApi, KrakenApiError, KrakenBook, KrakenFundingMethod, KrakenOrderStatus, KrakenPair, KrakenRestApi,
-    KrakenTransferStatus,
+    KrakenApi, KrakenApiError, KrakenBook, KrakenBookLevel, KrakenFundingMethod, KrakenOrderStatus, KrakenPair,
+    KrakenRestApi, KrakenTransferStatus,
 };
 
 const KRAKEN_AMBIGUOUS_PREFIX: &str = "kraken ambiguous submission: ";
+/// Prefix on the refusal this adapter raises when a withdrawal is under the
+/// method minimum.
+///
+/// Kraken returns no numeric code for this, unlike MEXC: the amount is refused
+/// here, before submission, so the message is the only signal the finalizer can
+/// classify on. `CexVenueProfile::kraken` matches this exact constant and the
+/// message is built from it, so the two cannot drift apart and leave a residual
+/// withdrawal retrying forever in `Withdraw`.
+pub const KRAKEN_WITHDRAW_BELOW_MIN: &str = "Kraken withdrawal is below the method minimum";
 const ORDER_POLL_ATTEMPTS: usize = 20;
 const ORDER_POLL_INTERVAL: Duration = Duration::from_millis(500);
 const PAIR_METADATA_TTL: Duration = Duration::from_secs(5 * 60);
@@ -189,8 +198,11 @@ impl CexBackend for KrakenClient {
             CexSubmissionError::Unreachable(error.to_string())
         } else if error.starts_with(KRAKEN_AMBIGUOUS_PREFIX) {
             CexSubmissionError::Ambiguous(error.to_string())
-        } else if error.starts_with(CEX_PENDING_SETTLEMENT_PREFIX) {
-            CexSubmissionError::PendingSettlement(error.to_string())
+        } else if let Some(payload) = error.strip_prefix(CEX_PENDING_SETTLEMENT_PREFIX) {
+            // `Display` re-adds the prefix, and `execute_swap_detailed` flattens
+            // a classification back into its message, so keeping it here would
+            // stack a prefix on every pass.
+            CexSubmissionError::PendingSettlement(payload.to_string())
         } else {
             CexSubmissionError::Rejected(error.to_string())
         }
@@ -423,6 +435,14 @@ impl CexBackend for KrakenClient {
                     break;
                 }
 
+                // Skipped rather than rejected outright, so one malformed level
+                // deep in the book does not refuse an order the rest of the
+                // depth can fill; the liquidity check below still refuses it if
+                // it cannot. See `is_tradable_level` for why it cannot be used.
+                if !is_tradable_level(level) {
+                    continue;
+                }
+
                 // Buy no more than the level offers or the remaining budget affords.
                 let take = level.quantity.min(budget / level.price);
 
@@ -553,7 +573,7 @@ impl CexBackend for KrakenClient {
         let amount_decimal = Decimal::from_f64(amount).ok_or_else(|| "invalid Kraken withdrawal amount".to_string())?;
         if amount_decimal < method.minimum {
             return Err(format!(
-                "Kraken withdrawal amount {amount_decimal} is below {} minimum {}",
+                "{KRAKEN_WITHDRAW_BELOW_MIN}: {amount_decimal} is below {} minimum {}",
                 method.method, method.minimum
             ));
         }
@@ -755,10 +775,24 @@ fn truncate(value: Decimal, decimals: u32) -> Decimal {
     value.round_dp_with_strategy(decimals, RoundingStrategy::ToZero)
 }
 
+/// Whether a book level is one this pipeline can trade against at all.
+///
+/// Levels arrive exactly as Kraken sent them, and a price at or below zero is
+/// not a price: dividing a budget by it panics `Decimal`, and a negative one
+/// would hand back budget that was never spent. Every walk over a book answers
+/// this the same way, because sizing an order against depth that the repricing
+/// then treats differently is how an order slips past its own spend cap.
+fn is_tradable_level(level: &KrakenBookLevel) -> bool {
+    level.price > Decimal::ZERO
+}
+
 fn estimate_buy_cost(book: &KrakenBook, base_volume: Decimal) -> Result<Decimal, String> {
     let mut remaining = base_volume;
     let mut cost = Decimal::ZERO;
     for level in &book.asks {
+        if !is_tradable_level(level) {
+            continue;
+        }
         let take = remaining.min(level.quantity);
         cost += take * level.price;
         remaining -= take;
@@ -777,6 +811,9 @@ fn estimate_sell_output(book: &KrakenBook, base_volume: Decimal) -> Result<Decim
     let mut remaining = base_volume;
     let mut output = Decimal::ZERO;
     for level in &book.bids {
+        if !is_tradable_level(level) {
+            continue;
+        }
         let take = remaining.min(level.quantity);
         output += take * level.price;
         remaining -= take;
@@ -1329,6 +1366,21 @@ mod tests {
         ));
     }
 
+    /// `execute_swap_detailed` flattens a classification into its message and
+    /// this classifier reads it back, so that pass has to be idempotent: a
+    /// pending settlement must not gain a second marker each time round.
+    #[test]
+    fn flattening_a_pending_settlement_and_classifying_it_again_is_idempotent() {
+        let client = KrakenClient::with_api(Arc::new(MockKrakenApi::new()), vec![]);
+        let original = CexSubmissionError::PendingSettlement("order OJKJQE-YONE3-2QEYQ2 has not settled".to_string());
+
+        let flattened = original.to_string();
+        let reclassified = client.classify_submission_error(&flattened);
+
+        assert_eq!(reclassified, original);
+        assert_eq!(reclassified.to_string(), flattened);
+    }
+
     /// Liquidation 1615: Kraken accepted the order, returned its id, then could
     /// not read it back on the first attempt. The order had in fact filled, so
     /// bailing there parked a completed sell for an operator. The read must be
@@ -1389,6 +1441,10 @@ mod tests {
             .expect_err("below minimum");
 
         assert!(error.contains("below Bitcoin minimum"));
+        // The finalizer writes this residual off as dust rather than retrying a
+        // withdrawal Kraken will never accept, and it recognises it by this
+        // marker, so the refusal actually raised here has to carry it.
+        assert!(error.contains(KRAKEN_WITHDRAW_BELOW_MIN));
     }
 
     #[tokio::test]
@@ -1441,6 +1497,106 @@ mod tests {
             .expect_err("order minimum must reject preview");
 
         assert!(error.contains("below order minimum"));
+    }
+
+    /// The sizing walk skips levels it cannot buy from, so the repricing that
+    /// checks the spend cap has to skip them too. Counting a zero-priced level
+    /// as volume filled for nothing reports a cost of zero, and a cap check
+    /// against zero passes whatever the order actually costs.
+    #[test]
+    fn an_untradable_level_never_fills_volume_for_free() {
+        let book = KrakenBook {
+            bids: vec![
+                KrakenBookLevel {
+                    price: Decimal::ZERO,
+                    quantity: Decimal::ONE,
+                },
+                KrakenBookLevel {
+                    price: Decimal::new(60_000, 0),
+                    quantity: Decimal::ONE,
+                },
+            ],
+            asks: vec![
+                KrakenBookLevel {
+                    price: Decimal::ZERO,
+                    quantity: Decimal::ONE,
+                },
+                KrakenBookLevel {
+                    price: Decimal::new(60_000, 0),
+                    quantity: Decimal::ONE,
+                },
+            ],
+        };
+
+        // Priced against the real level, not absorbed by the junk one.
+        assert_eq!(
+            estimate_buy_cost(&book, Decimal::new(5, 1)).expect("half a coin is covered"),
+            Decimal::new(30_000, 0)
+        );
+        assert_eq!(
+            estimate_sell_output(&book, Decimal::new(5, 1)).expect("half a coin is covered"),
+            Decimal::new(30_000, 0)
+        );
+
+        // And once the priced depth runs out, that is a liquidity failure rather
+        // than a free fill.
+        assert!(estimate_buy_cost(&book, Decimal::new(15, 1)).is_err());
+        assert!(estimate_sell_output(&book, Decimal::new(15, 1)).is_err());
+    }
+
+    /// Order-book levels are copied from Kraken's response without validation,
+    /// and `Decimal` panics rather than erring when asked to divide by zero. A
+    /// zero-priced ask would therefore take the whole process down mid-buy, so
+    /// the sizing walk has to step over it and size on the depth it can buy.
+    #[tokio::test]
+    async fn a_zero_priced_ask_is_stepped_over_rather_than_dividing_by_it() {
+        let mut api = MockKrakenApi::new();
+        api.expect_pairs().once().returning(|| Ok(vec![btc_usd_pair()]));
+        api.expect_closed_order_by_client_id().returning(|_| Ok(None));
+        api.expect_orderbook().once().returning(|_, _| {
+            Ok(KrakenBook {
+                bids: vec![],
+                asks: vec![
+                    KrakenBookLevel {
+                        price: Decimal::ZERO,
+                        quantity: Decimal::ONE,
+                    },
+                    KrakenBookLevel {
+                        price: Decimal::new(60_000, 0),
+                        quantity: Decimal::ONE,
+                    },
+                ],
+            })
+        });
+        // Sized purely from the priced level, exactly as if the junk one were
+        // not in the book at all.
+        api.expect_place_market_order()
+            .withf(|pair, side, volume, _| pair == "XXBTZUSD" && side == "buy" && *volume == Decimal::new(9_960_159, 8))
+            .once()
+            .returning(|_, _, _, _| Ok("ORDER-BUY".into()));
+        api.expect_order().once().returning(|_| {
+            Ok(KrakenOrder {
+                status: KrakenOrderStatus::Closed,
+                volume_executed: Decimal::new(9_960_159, 8),
+                cost: Decimal::new(59_760_954, 4),
+                fee: Decimal::new(239_043_816, 7),
+            })
+        });
+        let client = KrakenClient::with_api(Arc::new(api), vec![]);
+
+        client
+            .execute_swap_detailed_with_options(
+                "BTC_USD",
+                "buy",
+                6_000.0,
+                SwapExecutionOptions {
+                    client_order_id: Some("liq-buy-zero".into()),
+                    buy_mode: BuyOrderInputMode::BaseQuantity,
+                    max_quote_overspend_bps: Some(0.0),
+                },
+            )
+            .await
+            .expect("a malformed level must not stop an otherwise fillable buy");
     }
 
     #[tokio::test]

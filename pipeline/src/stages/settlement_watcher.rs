@@ -87,6 +87,19 @@ where
             receipt.status = ExecutionStatus::Success;
             updated = true;
         }
+        // The executor judges the change from a single early observation, where
+        // a change the protocol has queued but not yet settled necessarily reads
+        // as pending. This is the only place that observation is ever revisited,
+        // so the flag is re-derived here rather than left as first recorded:
+        // otherwise the ordinary case -- change lands seconds later -- reads for
+        // ever as money that never came back, and nothing downstream can tell it
+        // apart from a change that genuinely failed and is still with the
+        // protocol. Mirrors the venue's current answer in both directions.
+        let change_received = matches!(fresh.change_tx.status, TransferStatus::Success);
+        if receipt.change_received != change_received {
+            receipt.change_received = change_received;
+            updated = true;
+        }
         if updated {
             let touch_meta = row.status != ResultStatus::WaitingProfit;
             self.update_receipt_meta(&row, &receipt, touch_meta).await?;
@@ -250,7 +263,7 @@ mod tests {
             timestamp: 0,
             change_tx: TxStatus {
                 tx_id: None,
-                status: TransferStatus::Pending,
+                status: TransferStatus::Success,
             },
             collateral_tx: TxStatus {
                 tx_id: None,
@@ -316,6 +329,70 @@ mod tests {
         agent
             .expect_call_query::<Result<LiquidationResult, ProtocolError>>()
             .with(eq(Principal::anonymous()), eq("get_liquidation"), eq(args))
+            .times(1)
+            .returning(move |_, _, _| Ok(Ok(fresh.clone())));
+
+        let watcher = SettlementWatcher::new(Arc::new(wal), Arc::new(agent), Principal::anonymous());
+
+        watcher.tick().await.expect("tick should succeed");
+    }
+
+    /// The executor can only see the change at the instant it liquidates, and a
+    /// change the protocol has queued reads as pending there. This watcher is
+    /// the only re-read, so an unspent-debt flag it leaves stale is a permanent
+    /// false alarm that hides the liquidations where the money really is stuck.
+    #[tokio::test]
+    async fn a_change_that_settles_after_execution_stops_reading_as_money_never_returned() {
+        let liq_id = 11u128;
+        let receipt = ExecutionReceipt {
+            request: make_request(false, Some(make_swap_args())),
+            liquidation_result: Some(LiquidationResult {
+                change_tx: TxStatus {
+                    tx_id: None,
+                    status: TransferStatus::Pending,
+                },
+                ..make_liq_result(liq_id, TransferStatus::Success)
+            }),
+            status: ExecutionStatus::Success,
+            // What the executor recorded from its one early observation.
+            change_received: false,
+        };
+        let row = make_row(ResultStatus::WaitingCollateral, receipt.clone());
+        let row_id = row.id.clone();
+
+        let mut wal = MockWalStore::new();
+        wal.expect_list_by_status()
+            .with(eq(ResultStatus::WaitingCollateral), eq(100usize))
+            .times(1)
+            .returning(move |_, _| Ok(vec![row.clone()]));
+        wal.expect_list_by_status()
+            .with(eq(ResultStatus::WaitingProfit), eq(100usize))
+            .times(1)
+            .returning(|_, _| Ok(vec![]));
+        wal.expect_upsert_result()
+            .withf(|row| {
+                let wrapper = decode_receipt_wrapper(row)
+                    .expect("stored meta decodes")
+                    .expect("stored meta is present");
+                wrapper.receipt.change_received
+            })
+            .times(1)
+            .returning(|_| Ok(()));
+        wal.expect_update_status()
+            .with(eq(row_id.clone()), eq(ResultStatus::Enqueued), eq(true))
+            .times(1)
+            .returning(|_, _, _| Ok(()));
+
+        let mut agent = MockPipelineAgent::new();
+        // The protocol now reports the change as settled.
+        let fresh = make_liq_result(liq_id, TransferStatus::Success);
+        agent
+            .expect_call_query::<Result<LiquidationResult, ProtocolError>>()
+            .with(
+                eq(Principal::anonymous()),
+                eq("get_liquidation"),
+                eq(Encode!(&liq_id).unwrap()),
+            )
             .times(1)
             .returning(move |_, _, _| Ok(Ok(fresh.clone())));
 
