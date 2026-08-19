@@ -152,7 +152,10 @@ pub trait KrakenApi: Send + Sync {
     /// `Ok(None)` means Kraken has no closed order under that id.
     async fn closed_order_by_client_id(&self, client_order_id: &str) -> Result<Option<KrakenOrder>, KrakenApiError>;
     async fn withdraw(&self, asset: &str, key: &str, address: &str, amount: Decimal) -> Result<String, KrakenApiError>;
-    async fn withdrawals(&self, asset: &str) -> Result<Vec<KrakenWithdrawal>, KrakenApiError>;
+    /// The newest `limit` withdrawals of `asset`. Kraken caps this at 500 over
+    /// a 90-day window and the typed response carries no cursor, so a
+    /// withdrawal that falls off that page cannot be paged back to.
+    async fn withdrawals(&self, asset: &str, limit: i64) -> Result<Vec<KrakenWithdrawal>, KrakenApiError>;
 }
 
 struct OwnedSecretsProvider {
@@ -178,9 +181,6 @@ impl SecretsProvider for OwnedSecretsProvider {
         }
     }
 }
-
-/// Most withdrawals Kraken returns for one `WithdrawStatus` request.
-const KRAKEN_WITHDRAWAL_HISTORY_MAX: i64 = 500;
 
 type Client = RateLimitedKrakenClient<CoreKrakenClient>;
 
@@ -506,15 +506,10 @@ impl KrakenApi for KrakenRestApi {
         Ok(take_result(response)?.ref_id)
     }
 
-    async fn withdrawals(&self, asset: &str) -> Result<Vec<KrakenWithdrawal>, KrakenApiError> {
-        // 500 is what Kraken documents as both the default and the ceiling for
-        // this endpoint, over a 90-day window. Asking for the maximum is the
-        // whole reach available here: the client's typed response is a bare
-        // `Vec<DepositWithdrawal>` with no cursor in it, so a withdrawal that
-        // falls off this page cannot be paged back to.
+    async fn withdrawals(&self, asset: &str, limit: i64) -> Result<Vec<KrakenWithdrawal>, KrakenApiError> {
         let request = StatusOfDepositWithdrawRequest::builder()
             .asset(asset.to_string())
-            .limit(KRAKEN_WITHDRAWAL_HISTORY_MAX)
+            .limit(limit)
             .build();
         let response = self
             .client

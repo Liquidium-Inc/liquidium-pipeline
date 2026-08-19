@@ -22,6 +22,11 @@ use super::kraken_api::{
 };
 
 const KRAKEN_AMBIGUOUS_PREFIX: &str = "kraken ambiguous submission: ";
+/// Withdrawals read per status poll before falling back to the whole history.
+const KRAKEN_WITHDRAWAL_RECENT_PAGE: i64 = 20;
+/// The most Kraken returns for one `WithdrawStatus` request, over a 90-day
+/// window. The typed response carries no cursor, so this is the whole reach.
+const KRAKEN_WITHDRAWAL_HISTORY_MAX: i64 = 500;
 const ORDER_POLL_ATTEMPTS: usize = 20;
 const ORDER_POLL_INTERVAL: Duration = Duration::from_millis(500);
 const PAIR_METADATA_TTL: Duration = Duration::from_secs(5 * 60);
@@ -37,16 +42,29 @@ pub struct KrakenClient {
 }
 
 impl KrakenClient {
-    pub fn new(api_key: String, api_secret: String, allowed_pairs: Vec<String>) -> Self {
+    /// Builds a client that trades only the markets in `allowed_pairs`.
+    ///
+    /// An empty allowlist is refused rather than read as "no restriction":
+    /// there is no reason to route through every market Kraken lists, and a
+    /// setting that went missing must not quietly become one.
+    pub fn new(api_key: String, api_secret: String, allowed_pairs: Vec<String>) -> Result<Self, String> {
         Self::with_api(Arc::new(KrakenRestApi::new(api_key, api_secret)), allowed_pairs)
     }
 
-    pub fn with_api(api: Arc<dyn KrakenApi>, allowed_pairs: Vec<String>) -> Self {
-        Self {
+    pub fn with_api(api: Arc<dyn KrakenApi>, allowed_pairs: Vec<String>) -> Result<Self, String> {
+        let allowed_pairs = allowed_pairs
+            .into_iter()
+            .map(|pair| normalize_market(&pair))
+            .filter(|pair| !pair.is_empty())
+            .collect::<Vec<_>>();
+        if allowed_pairs.is_empty() {
+            return Err("Kraken needs an explicit market allowlist; an empty one is not \"no markets\" and must not mean \"every market\"".to_string());
+        }
+        Ok(Self {
             api,
             pairs: Arc::new(RwLock::new(None)),
-            allowed_pairs: Arc::new(allowed_pairs.into_iter().map(|pair| normalize_market(&pair)).collect()),
-        }
+            allowed_pairs: Arc::new(allowed_pairs),
+        })
     }
 
     async fn all_pairs(&self) -> Result<Vec<KrakenPair>, String> {
@@ -67,7 +85,7 @@ impl KrakenClient {
             .await?
             .into_iter()
             .filter(|pair| format!("{}_{}", pair.base, pair.quote) == market)
-            .filter(|_| self.allowed_pairs.is_empty() || self.allowed_pairs.iter().any(|allowed| allowed == &market))
+            .filter(|_| self.allowed_pairs.iter().any(|allowed| allowed == &market))
             .collect::<Vec<_>>();
         match matches.as_slice() {
             [] => Err(format!("Kraken pair {market} is unavailable or not allowed")),
@@ -595,13 +613,26 @@ impl CexBackend for KrakenClient {
         coin: &str,
         withdraw_id: &str,
     ) -> Result<WithdrawStatusSnapshot, String> {
-        let withdrawal = self
+        // Polled every worker cycle for a withdrawal that is nearly always among
+        // the newest, so the recent page is read first and the whole history
+        // only when it is not there.
+        let asset = api_asset(coin);
+        let mut withdrawal = self
             .api
-            .withdrawals(&api_asset(coin))
+            .withdrawals(&asset, KRAKEN_WITHDRAWAL_RECENT_PAGE)
             .await
             .map_err(api_read_error)?
             .into_iter()
             .find(|item| item.ref_id == withdraw_id);
+        if withdrawal.is_none() {
+            withdrawal = self
+                .api
+                .withdrawals(&asset, KRAKEN_WITHDRAWAL_HISTORY_MAX)
+                .await
+                .map_err(api_read_error)?
+                .into_iter()
+                .find(|item| item.ref_id == withdraw_id);
+        }
         let Some(withdrawal) = withdrawal else {
             return Ok(WithdrawStatusSnapshot {
                 status: WithdrawStatus::Unknown,
@@ -922,7 +953,7 @@ fn api_submit_error(error: KrakenApiError) -> String {
 mod tests {
     use super::*;
     use crate::swappers::kraken::kraken_api::{
-        KrakenBookLevel, KrakenDepositAddress, KrakenOrder, KrakenWithdrawalAddress, MockKrakenApi,
+        KrakenBookLevel, KrakenDepositAddress, KrakenOrder, KrakenWithdrawal, KrakenWithdrawalAddress, MockKrakenApi,
     };
 
     fn method(name: &str, network: Option<&str>) -> KrakenFundingMethod {
@@ -1074,6 +1105,70 @@ mod tests {
         }
     }
 
+    /// A client allowed to trade the one market these tests use.
+    fn btc_usd_client(api: MockKrakenApi) -> KrakenClient {
+        KrakenClient::with_api(Arc::new(api), vec!["BTC_USD".into()]).expect("a non-empty allowlist")
+    }
+
+    /// The allowlist is the only thing keeping routing off every market Kraken
+    /// lists, so a client cannot exist without one; a constructor that read an
+    /// empty list as "unrestricted" would hand that behaviour to any caller
+    /// that lost the setting.
+    #[test]
+    fn a_client_cannot_be_built_without_a_market_allowlist() {
+        let error = match KrakenClient::with_api(Arc::new(MockKrakenApi::new()), vec![]) {
+            Ok(_) => panic!("an empty allowlist must be refused"),
+            Err(error) => error,
+        };
+        assert!(error.contains("allowlist"), "unexpected error: {error}");
+        assert!(KrakenClient::with_api(Arc::new(MockKrakenApi::new()), vec![" ".into(), "".into()]).is_err());
+    }
+
+    /// One withdrawal is looked up every worker cycle for as long as it is
+    /// pending, and it is nearly always among the newest, so the recent page
+    /// answers first and the whole history is only read when it does not.
+    #[tokio::test]
+    async fn a_withdrawal_status_poll_reads_the_recent_page_before_the_whole_history() {
+        let recent = || KrakenWithdrawal {
+            ref_id: "RECENT-1".into(),
+            tx_id: Some("0xrecent".into()),
+            fee: Decimal::new(1, 4),
+            status: KrakenTransferStatus::Completed,
+        };
+        let old = || KrakenWithdrawal {
+            ref_id: "OLD-1".into(),
+            tx_id: None,
+            fee: Decimal::new(2, 4),
+            status: KrakenTransferStatus::Pending,
+        };
+
+        let mut api = MockKrakenApi::new();
+        api.expect_withdrawals()
+            .withf(|asset, limit| asset == "XBT" && *limit == KRAKEN_WITHDRAWAL_RECENT_PAGE)
+            .times(2)
+            .returning(move |_, _| Ok(vec![recent()]));
+        api.expect_withdrawals()
+            .withf(|asset, limit| asset == "XBT" && *limit == KRAKEN_WITHDRAWAL_HISTORY_MAX)
+            .once()
+            .returning(move |_, _| Ok(vec![recent(), old()]));
+        let client = btc_usd_client(api);
+
+        // Found on the first page: the history is never asked for.
+        let snapshot = client
+            .get_withdraw_status_snapshot_by_id("BTC", "RECENT-1")
+            .await
+            .expect("recent withdrawal");
+        assert_eq!(snapshot.status, WithdrawStatus::Completed);
+        assert_eq!(snapshot.txid.as_deref(), Some("0xrecent"));
+
+        // Off the first page: the whole history is read once, and it is there.
+        let snapshot = client
+            .get_withdraw_status_snapshot_by_id("BTC", "OLD-1")
+            .await
+            .expect("older withdrawal");
+        assert_eq!(snapshot.status, WithdrawStatus::Pending);
+    }
+
     #[test]
     fn canonicalizes_kraken_btc_and_market_separators() {
         assert_eq!(api_asset("BTC"), "XBT");
@@ -1120,7 +1215,7 @@ mod tests {
                     }],
                 })
             });
-        let client = KrakenClient::with_api(Arc::new(api), vec!["BTC_USD".into()]);
+        let client = btc_usd_client(api);
 
         let book = client
             .get_orderbook("btc/usd", Some(25))
@@ -1175,7 +1270,7 @@ mod tests {
                     verified: true,
                 }])
             });
-        let client = KrakenClient::with_api(Arc::new(api), vec![]);
+        let client = btc_usd_client(api);
 
         let deposit = client
             .get_deposit_address("BTC", "bitcoin")
@@ -1228,7 +1323,7 @@ mod tests {
                 fee: Decimal::new(24, 0),
             })
         });
-        let client = KrakenClient::with_api(Arc::new(api), vec![]);
+        let client = btc_usd_client(api);
 
         let report = client
             .execute_swap_detailed_with_options(
@@ -1282,7 +1377,7 @@ mod tests {
                 asks: vec![],
             })
         });
-        let client = KrakenClient::with_api(Arc::new(api), vec![]);
+        let client = btc_usd_client(api);
 
         let report = client
             .execute_swap_detailed_with_options(
@@ -1316,7 +1411,7 @@ mod tests {
         api.expect_order()
             .times(ORDER_POLL_ATTEMPTS)
             .returning(|_| Err(KrakenApiError::Transport("status request timed out".into())));
-        let client = KrakenClient::with_api(Arc::new(api), vec![]);
+        let client = btc_usd_client(api);
 
         let error = client.wait_for_order("ORDER-2", "sell").await.expect_err("must park");
 
@@ -1330,7 +1425,7 @@ mod tests {
     /// parked alongside the submissions whose outcome is genuinely unknown.
     #[test]
     fn an_unreachable_kraken_is_not_an_ambiguous_submission() {
-        let client = KrakenClient::with_api(Arc::new(MockKrakenApi::new()), vec![]);
+        let client = btc_usd_client(MockKrakenApi::new());
 
         for rendered in [
             api_submit_error(KrakenApiError::Unreachable("dns error".into())),
@@ -1359,7 +1454,7 @@ mod tests {
     /// pending settlement must not gain a second marker each time round.
     #[test]
     fn flattening_a_pending_settlement_and_classifying_it_again_is_idempotent() {
-        let client = KrakenClient::with_api(Arc::new(MockKrakenApi::new()), vec![]);
+        let client = btc_usd_client(MockKrakenApi::new());
         let original = CexSubmissionError::PendingSettlement("order OJKJQE-YONE3-2QEYQ2 has not settled".to_string());
 
         let flattened = original.to_string();
@@ -1391,7 +1486,7 @@ mod tests {
                 fee: Decimal::new(12_506, 5),
             })
         });
-        let client = KrakenClient::with_api(Arc::new(api), vec![]);
+        let client = btc_usd_client(api);
 
         let report = client
             .wait_for_order("OJKJQE-YONE3-2QEYQ2", "sell")
@@ -1421,7 +1516,7 @@ mod tests {
             }])
         });
         api.expect_withdraw().never();
-        let client = KrakenClient::with_api(Arc::new(api), vec![]);
+        let client = btc_usd_client(api);
 
         let error = client
             .withdraw("BTC", "bitcoin", "bc1qdestination", 0.001)
@@ -1451,7 +1546,7 @@ mod tests {
         });
         api.expect_withdrawal_methods().never();
         api.expect_withdrawal_addresses().never();
-        let client = KrakenClient::with_api(Arc::new(api), vec![]);
+        let client = btc_usd_client(api);
 
         let error = client
             .validate_funding_route(&FundingRoutePreflight {
@@ -1475,7 +1570,7 @@ mod tests {
         let mut api = MockKrakenApi::new();
         api.expect_pairs().once().returning(|| Ok(vec![btc_usd_pair()]));
         api.expect_place_market_order().never();
-        let client = KrakenClient::with_api(Arc::new(api), vec![]);
+        let client = btc_usd_client(api);
 
         let error = client
             .validate_trade_amounts("BTC_USD", "sell", 0.000_01, 1.0)
@@ -1568,7 +1663,7 @@ mod tests {
                 fee: Decimal::new(239_043_816, 7),
             })
         });
-        let client = KrakenClient::with_api(Arc::new(api), vec![]);
+        let client = btc_usd_client(api);
 
         client
             .execute_swap_detailed_with_options(
@@ -1616,7 +1711,7 @@ mod tests {
                 fee: Decimal::new(239_043_816, 7),
             })
         });
-        let client = KrakenClient::with_api(Arc::new(api), vec![]);
+        let client = btc_usd_client(api);
 
         let report = client
             .execute_swap_detailed_with_options(
@@ -1684,7 +1779,7 @@ mod tests {
             })
         });
         api.expect_place_market_order().never();
-        let client = KrakenClient::with_api(Arc::new(api), vec![]);
+        let client = btc_usd_client(api);
 
         let error = client
             .execute_swap_detailed("BTC_USD", "sell", 0.1)
@@ -1700,7 +1795,7 @@ mod tests {
         offline.online = false;
         let mut api = MockKrakenApi::new();
         api.expect_pairs().once().return_once(move || Ok(vec![offline]));
-        let client = KrakenClient::with_api(Arc::new(api), vec![]);
+        let client = btc_usd_client(api);
         assert!(
             client
                 .get_orderbook("BTC_USD", None)
@@ -1714,7 +1809,7 @@ mod tests {
         api.expect_pairs()
             .once()
             .return_once(move || Ok(vec![pair.clone(), pair]));
-        let client = KrakenClient::with_api(Arc::new(api), vec![]);
+        let client = btc_usd_client(api);
         assert!(
             client
                 .get_orderbook("BTC_USD", None)
