@@ -11,10 +11,6 @@ pub struct IcpswapFirstPlannerConfig {
     /// to reject an unsafe final Kraken remainder.
     pub max_cex_price_impact_bps: f64,
     pub cex_min_exec_usd: f64,
-    /// Minimum USD a CEX leg's conservative output must be worth, on top of the
-    /// dust allowance, before the leg may be planned. Guards the exit the venue
-    /// enforces at withdrawal time and this planner cannot ask it about.
-    pub min_leg_receive_usd: f64,
     pub min_net_edge_bps: u32,
     /// Edge floor applied instead of `min_net_edge_bps` when the liquidation was
     /// bought as bad debt. Signed, because such a row repays more than the
@@ -66,11 +62,6 @@ impl IcpswapFirstPlannerConfig {
         if !self.cex_min_exec_usd.is_finite() || self.cex_min_exec_usd < 0.0 {
             return Err(IcpswapFirstPlannerError::InvalidInput(
                 "CEX minimum execution USD must be finite and non-negative".to_string(),
-            ));
-        }
-        if !self.min_leg_receive_usd.is_finite() || self.min_leg_receive_usd < 0.0 {
-            return Err(IcpswapFirstPlannerError::InvalidInput(
-                "minimum CEX leg receive USD must be finite and non-negative".to_string(),
             ));
         }
         if self.min_net_edge_bps > BPS_DENOMINATOR {

@@ -712,8 +712,6 @@ fn planner_config() -> IcpswapFirstPlannerConfig {
         dust_fallback_max_price_impact_bps: 150.0,
         max_cex_price_impact_bps: 200.0,
         cex_min_exec_usd: 0.01,
-        // Off: these fixtures predate the exit floor and assert other rules.
-        min_leg_receive_usd: 0.0,
         min_net_edge_bps: 150,
         bad_debt_min_net_edge_bps: 150,
         max_oracle_discount_bps: 250,
@@ -730,7 +728,6 @@ fn finalizer(adapters: Vec<Arc<dyn MultiVenueAdapter>>) -> MultiVenueFinalizer {
 fn below_mexc_minimum_config() -> IcpswapFirstPlannerConfig {
     IcpswapFirstPlannerConfig {
         cex_min_exec_usd: 11.0,
-        min_leg_receive_usd: 0.0,
         ..planner_config()
     }
 }

@@ -281,28 +281,6 @@ impl IcpswapFirstPlanner {
         )
     }
 
-    /// The USD a CEX leg's conservative output has to clear to be plannable.
-    ///
-    /// Enforced once, in `build_state`, because every allocation path converges
-    /// there and a leg whose proceeds cannot leave the venue is a bad plan
-    /// whichever path produced it.
-    ///
-    /// The operator's leg floor covers the venue's own withdrawal minimum, which
-    /// no venue here can be asked for; the dust allowance on top covers what the
-    /// slicer abandons. A residual under `cex_min_exec_usd` is dropped rather
-    /// than sold, and that loss is taken out of exactly this output, so a leg
-    /// quoted at the bare floor can still finish below it. Liquidation 1657 lost
-    /// 13% of a $5.78 leg that way and could not withdraw the $4.96 it made.
-    pub(super) fn cex_receive_floor_usd(&self) -> f64 {
-        // The allowance is a margin on the operator's floor, never a floor of
-        // its own: clearing the leg floor turns the whole check off, rather than
-        // leaving one dust allowance behind as a silent minimum.
-        if self.config.min_leg_receive_usd <= 0.0 {
-            return 0.0;
-        }
-        self.config.min_leg_receive_usd + self.config.cex_min_exec_usd
-    }
-
     /// Returns an exact CEX preview only when it satisfies the common impact
     /// ceiling and the planner's minimum-notional rule.
     pub(super) async fn preview_safe_cex(

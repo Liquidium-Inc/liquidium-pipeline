@@ -187,7 +187,6 @@ BAD_DEBT_COLLATERAL_SLIPPAGE_BPS=500  # 5.00% haircut used for min collateral
 # CEX trade slicing and execution controls
 # Skip execution chunks below this USD notional (treat as dust)
 CEX_MIN_EXEC_USD=8
-CEX_MIN_LEG_RECEIVE_USD=5
 # Per-slice impact target ratio of MAX_ALLOWED_CEX_SLIPPAGE_BPS
 CEX_SLICE_TARGET_RATIO=0.7
 # Arm adaptive buy fallback when truncation ratio is >= this value
@@ -232,7 +231,6 @@ Quick reference:
 | Parameter | What it controls |
 |----------|-------------------|
 | `CEX_MIN_EXEC_USD` | Dust floor per slice (below this, execution is skipped). |
-| `CEX_MIN_LEG_RECEIVE_USD` | Minimum USD a CEX leg's conservative output must be worth, plus a dust allowance, or the leg is not planned. Guards the venue's own withdrawal minimum, which is only enforced after the trade. `0` disables. |
 | `CEX_SLICE_TARGET_RATIO` | How aggressive slice sizing is vs hard slippage cap. |
 | `CEX_BUY_TRUNCATION_TRIGGER_RATIO` | When buy truncation is considered large enough to trigger fallback logic. |
 | `CEX_BUY_INVERSE_OVERSPEND_BPS` | Safety cap for how much inverse/base buy mode may overspend. |
@@ -295,7 +293,6 @@ How config controls this risk:
 - `MAX_ALLOWED_CEX_SLIPPAGE_BPS`: hard per-slice reject limit (safety brake).
 - `CEX_SLICE_TARGET_RATIO`: softer sizing target below hard limit (execution smoothness).
 - `CEX_MIN_EXEC_USD`: prevents low-notional micro-fills that usually have poor quality.
-- `CEX_MIN_LEG_RECEIVE_USD`: keeps a leg off a CEX when its proceeds would be too small to withdraw. Venues refuse withdrawals under a per-asset minimum and only say so once the trade is done, leaving the funds on the exchange for an operator.
 - `CEX_BUY_*`: controls adaptive buy fallback when quote-mode truncation leaves meaningful residual.
 
 #### Route Resolution Order

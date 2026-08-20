@@ -187,36 +187,6 @@ impl IcpswapFirstPlanInput {
         notional.is_finite() && notional >= minimum_usd
     }
 
-    /// The receive asset's oracle price in USD, when the receipt carried one.
-    ///
-    /// Present exactly when the pay-side ray price is, because the two are
-    /// recorded together and validated as a pair.
-    pub(super) fn receive_reference_price_usd(&self) -> Option<f64> {
-        self.receive_reference_price_ray.as_ref().and_then(reference_price_usd)
-    }
-
-    /// Whether a quoted output is large enough to leave the venue afterwards.
-    ///
-    /// Every CEX withdraws its whole leg in one transfer, and venues refuse
-    /// anything under a per-asset minimum of their own -- a refusal that arrives
-    /// after the trade, with the proceeds already sitting on the exchange. The
-    /// planner cannot ask them for that number, so it applies the operator's
-    /// floor to the conservative output instead.
-    ///
-    /// An unusable price makes the notional unknown rather than too small, and
-    /// is deferred to the venue for the same reason as [`Self::meets_cex_minimum`]:
-    /// filtering on missing data would reject legs that execute perfectly well.
-    pub(super) fn meets_receive_minimum(&self, receive: &ChainTokenAmount, minimum_usd: f64) -> bool {
-        if minimum_usd <= 0.0 {
-            return true;
-        }
-        let Some(price) = self.receive_reference_price_usd() else {
-            return true;
-        };
-        let notional = receive.to_f64() * price;
-        notional.is_finite() && notional >= minimum_usd
-    }
-
     /// Whether this allocation clears the floor the venue itself reported.
     ///
     /// A venue that reported nothing is unbounded here: its own deposit path
