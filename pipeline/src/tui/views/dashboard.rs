@@ -467,6 +467,7 @@ pub(super) fn venue_display_name(venue_id: &str) -> String {
     match venue_id {
         "icpswap" => "ICPSwap".to_string(),
         "mexc" => "MEXC".to_string(),
+        "kraken" => "Kraken".to_string(),
         other => other.to_string(),
     }
 }

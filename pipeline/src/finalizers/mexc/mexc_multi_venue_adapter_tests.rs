@@ -1010,11 +1010,19 @@ async fn a_settled_fill_clears_the_recorded_wait() {
 /// Slice slippage is measured against a mid price re-read immediately after the
 /// previous slice, so slices running back to back can each pass the per-slice
 /// cap while together walking the book down by a multiple of it. The poll
-/// interval between them is what bounds the aggregate, and chaining would
-/// remove it. `TradePending` with the client order ID already cleared is
-/// exactly that boundary.
+/// interval between them is what bounds the aggregate: a filled slice ends the
+/// call, and the next one belongs to the next call.
+///
+/// That fill is the whole boundary, though. The call after it opens by arming
+/// the gate, which submits nothing, and by then the interval has already been
+/// spent -- so arming chains on into the slice it armed for instead of handing
+/// back a second time and spending another interval on nothing. Before that,
+/// every hop of a route cost four cycles where it needed two, which is what
+/// made a four-hop MEXC leg take a minute of mostly idle polling.
 #[tokio::test]
-async fn a_leg_with_size_left_to_sell_does_not_open_the_next_slice_in_the_same_call() {
+async fn the_cycle_after_a_filled_slice_reaches_the_next_one_and_stops_on_its_fill() {
+    let submissions = Arc::new(std::sync::Mutex::new(0usize));
+    let submissions_for_backend = submissions.clone();
     let mut backend = MockCexBackend::new();
     backend.expect_get_orderbook().returning(|_, _| {
         Ok(OrderBook {
@@ -1025,9 +1033,18 @@ async fn a_leg_with_size_left_to_sell_does_not_open_the_next_slice_in_the_same_c
             asks: vec![],
         })
     });
-    // Any submission in this call fails the test: the next slice belongs to a
-    // later cycle.
-    backend.expect_execute_swap_detailed_with_options().never();
+    // Exactly one: the chain must reach this slice, and must not open the one
+    // after it against a book this fill just moved.
+    backend
+        .expect_execute_swap_detailed_with_options()
+        .times(1)
+        .returning(move |_, _, amount_in, _| {
+            *submissions_for_backend.lock().unwrap() += 1;
+            Ok(SwapFillReport {
+                input_consumed: amount_in,
+                output_received: amount_in * 10.0,
+            })
+        });
     let tokens = HashMap::from([
         (pay_token().asset_id(), pay_token()),
         (receive_token().asset_id(), receive_token()),
@@ -1048,25 +1065,220 @@ async fn a_leg_with_size_left_to_sell_does_not_open_the_next_slice_in_the_same_c
         .decode::<MexcVenueExecutionState>(VENUE_ID)
         .expect("decode")
         .expect("MEXC state");
-    // The previous slice finished and cleared its order ID, leaving size behind.
+    // A second hop, so the state after this fill is the next slice boundary
+    // rather than the withdrawal.
+    execution.cex.trade.trade_resolved_legs = vec![
+        CexRouteLeg {
+            market: "PAY_USDT".to_string(),
+            side: "sell".to_string(),
+        },
+        CexRouteLeg {
+            market: "USDT_RECV".to_string(),
+            side: "buy".to_string(),
+        },
+    ];
+    // The previous slice finished and cleared its order ID, leaving size behind,
+    // and the gate closed behind it.
     execution.cex.step = CexStep::TradePending;
     execution.cex.trade.trade_pending_client_order_id = None;
+    execution.ready_to_advance = false;
     leg.execution = VenueExecutionState::new(VENUE_ID, &execution).expect("encode");
 
     let progress = MultiVenueAdapter::advance(&finalizer, &leg, &NoopCheckpoint)
         .await
-        .expect("the slice boundary is a clean hand-back, not a failure");
+        .expect("the armed cycle should carry the next slice through to its fill");
 
+    assert_eq!(
+        *submissions.lock().unwrap(),
+        1,
+        "arming and submitting belong to the same cycle"
+    );
     assert_eq!(progress.status, VenueLegStatus::Running);
     assert!(progress.result.is_none(), "a leg mid-route yields no result yet");
-    let armed = progress
+
+    let settled = progress
         .execution
         .decode::<MexcVenueExecutionState>(VENUE_ID)
         .expect("decode")
         .expect("MEXC state");
+    assert_eq!(settled.cex.trade.trade_slices.len(), 1, "one slice per cycle");
+    assert_eq!(settled.cex.step, CexStep::TradePending);
     assert!(
-        armed.ready_to_advance,
-        "the call still arms the next slice; it just does not submit it"
+        settled.cex.trade.trade_pending_client_order_id.is_none(),
+        "the fill consumed its intent"
     );
-    assert_eq!(armed.cex.step, CexStep::TradePending);
+    assert!(
+        !settled.ready_to_advance,
+        "the cycle ends on the fill, leaving the next slice to the next one"
+    );
+}
+
+/// A hop that has nothing left to trade is pure bookkeeping: it re-reads the
+/// route, moves the index on and persists the next hop's intent, sending the
+/// venue nothing. Chaining through it is what took a four-hop MEXC leg from
+/// four cycles per hop down to one -- the fill that ends each cycle is the only
+/// spacing the book needs.
+#[tokio::test]
+async fn an_exhausted_hop_reaches_the_next_hop_fill_in_the_same_cycle() {
+    let submissions = Arc::new(std::sync::Mutex::new(0usize));
+    let submissions_for_backend = submissions.clone();
+    let mut backend = MockCexBackend::new();
+    backend.expect_get_orderbook().returning(|_, _| {
+        Ok(OrderBook {
+            bids: vec![OrderBookLevel {
+                price: 10.0,
+                quantity: 1_000_000.0,
+            }],
+            asks: vec![],
+        })
+    });
+    // The second hop's slice, and nothing after it.
+    backend
+        .expect_execute_swap_detailed_with_options()
+        .times(1)
+        .returning(move |_, _, amount_in, _| {
+            *submissions_for_backend.lock().unwrap() += 1;
+            Ok(SwapFillReport {
+                input_consumed: amount_in,
+                output_received: amount_in * 10.0,
+            })
+        });
+    let tokens = HashMap::from([
+        (pay_token().asset_id(), pay_token()),
+        (receive_token().asset_id(), receive_token()),
+    ]);
+    let finalizer = MexcFinalizer::new(
+        Arc::new(backend),
+        Arc::new(MockTransferActions::new()),
+        Principal::anonymous(),
+        200.0,
+        0.0001,
+        0.7,
+    )
+    .with_token_registry(Arc::new(TokenRegistry::new(tokens)));
+
+    let mut leg = leg_at_trade_step(&finalizer, None).await;
+    let mut execution = leg
+        .execution
+        .decode::<MexcVenueExecutionState>(VENUE_ID)
+        .expect("decode")
+        .expect("MEXC state");
+    execution.cex.trade.trade_resolved_legs = vec![
+        CexRouteLeg {
+            market: "PAY_USDT".to_string(),
+            side: "sell".to_string(),
+        },
+        CexRouteLeg {
+            market: "AAA_USDT".to_string(),
+            side: "sell".to_string(),
+        },
+    ];
+    // The first hop sold everything it had and left its output behind; the gate
+    // closed with the leg still on that hop.
+    execution.cex.step = CexStep::TradePending;
+    execution.cex.trade.trade_leg_index = Some(0);
+    execution.cex.trade.trade_progress_remaining_in = Some(0.0);
+    execution.cex.trade.trade_progress_total_out = Some(1.0);
+    execution.cex.trade.trade_pending_client_order_id = None;
+    execution.ready_to_advance = false;
+    leg.execution = VenueExecutionState::new(VENUE_ID, &execution).expect("encode");
+
+    let progress = MultiVenueAdapter::advance(&finalizer, &leg, &NoopCheckpoint)
+        .await
+        .expect("walking past an exhausted hop should reach the next hop's slice");
+
+    assert_eq!(
+        *submissions.lock().unwrap(),
+        1,
+        "the exhausted hop costs no cycle of its own"
+    );
+    assert_eq!(progress.status, VenueLegStatus::Running);
+
+    let settled = progress
+        .execution
+        .decode::<MexcVenueExecutionState>(VENUE_ID)
+        .expect("decode")
+        .expect("MEXC state");
+    let slice = settled
+        .cex
+        .trade
+        .trade_slices
+        .last()
+        .expect("the second hop recorded its slice");
+    assert_eq!(
+        slice.leg_index, 1,
+        "the slice belongs to the hop after the exhausted one"
+    );
+    assert_eq!(slice.market, "AAA_USDT");
+    assert!(
+        !settled.ready_to_advance,
+        "the cycle still ends on the fill, leaving the next one to the next cycle"
+    );
+}
+
+/// The chain stops on submissions, so it has to be able to tell a phase that
+/// sends something from one that only writes state. Getting this wrong in
+/// either direction is expensive: too eager and two orders hit one book in the
+/// same instant, too shy and every hop pays an idle poll interval again.
+///
+/// The rule is deliberately one-sided. Only arming and slice planning are
+/// provably local; every step handed to `advance_current_step` counts as a
+/// submission, the two pending ones included, because they re-enter the same
+/// `deposit` and `withdraw` that submit bridges and transfers rather than
+/// polling anything.
+#[tokio::test]
+async fn only_arming_and_slice_planning_are_read_as_local_phases() {
+    let finalizer = finalizer();
+    let leg = leg_from_preview(
+        MultiVenueAdapter::preview(&finalizer, &planning_context(), &request(100_000_000))
+            .await
+            .expect("preview"),
+    );
+    let mut execution = leg
+        .execution
+        .decode::<MexcVenueExecutionState>(VENUE_ID)
+        .expect("decode")
+        .expect("MEXC state");
+    let submits = |execution: &MexcVenueExecutionState| MexcFinalizer::<MockCexBackend>::phase_submits(execution);
+    let every_live_step = [
+        CexStep::Deposit,
+        CexStep::DepositPending,
+        CexStep::Trade,
+        CexStep::TradePending,
+        CexStep::Withdraw,
+        CexStep::WithdrawPending,
+    ];
+
+    // A closed gate only ever arms itself, whatever step it is holding.
+    execution.ready_to_advance = false;
+    execution.cex.trade.trade_pending_client_order_id = Some("liq-42-l1-s1-a".to_string());
+    for step in every_live_step {
+        execution.cex.step = step;
+        assert!(!submits(&execution), "arming for {step:?} sends nothing");
+    }
+
+    execution.ready_to_advance = true;
+
+    // Planning a slice writes its client order ID and stops short of the venue;
+    // with that ID persisted, the same step is the submission itself.
+    for step in [CexStep::Trade, CexStep::TradePending] {
+        execution.cex.step = step;
+        execution.cex.trade.trade_pending_client_order_id = None;
+        assert!(!submits(&execution), "planning a slice at {step:?} sends nothing");
+        execution.cex.trade.trade_pending_client_order_id = Some("liq-42-l1-s1-a".to_string());
+        assert!(submits(&execution), "the persisted intent at {step:?} is submitted");
+    }
+
+    // Everything else reaches the venue, including the pending steps: they
+    // resume `deposit` and `withdraw`, which submit whenever their own guard is
+    // still unset.
+    for step in [
+        CexStep::Deposit,
+        CexStep::DepositPending,
+        CexStep::Withdraw,
+        CexStep::WithdrawPending,
+    ] {
+        execution.cex.step = step;
+        assert!(submits(&execution), "{step:?} can move funds");
+    }
 }

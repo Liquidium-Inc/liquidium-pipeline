@@ -11,7 +11,7 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use crate::finalizers::liquidation_outcome::LiquidationOutcome;
-use crate::finalizers::multi_venue::MEXC_VENUE_ID;
+use crate::finalizers::multi_venue::{KRAKEN_VENUE_ID, MEXC_VENUE_ID};
 use crate::persistance::{
     FinalizerMetaPayload, FinalizerMetaV2, LiqMetaWrapper, ResultStatus, VenueExecutionState, VenueLegState,
     WalProfitSnapshot,
@@ -466,8 +466,8 @@ fn append_venue_leg_summary(lines: &mut Vec<Line<'static>>, leg: &VenueLegState,
     )));
     lines.push(Line::from(format!("   Route: {}", leg.quote.route_id)));
 
-    if leg.venue_id == MEXC_VENUE_ID {
-        append_mexc_leg_transactions(lines, &leg.execution);
+    if matches!(leg.venue_id.as_str(), MEXC_VENUE_ID | KRAKEN_VENUE_ID) {
+        append_cex_leg_transactions(lines, &leg.venue_id, &leg.execution);
     }
 
     if let Some(result) = &leg.result {
@@ -486,19 +486,26 @@ fn append_venue_leg_summary(lines: &mut Vec<Line<'static>>, leg: &VenueLegState,
     }
 }
 
-/// Shows transaction identifiers from the MEXC state stored inside a
+/// Shows transaction identifiers from the CEX state stored inside a
 /// multi-venue leg. These are not present in the legacy top-level `meta` bytes.
-fn append_mexc_leg_transactions(lines: &mut Vec<Line<'static>>, execution: &VenueExecutionState) {
-    // Current multi-venue MEXC state wraps the existing CEX state in `cex`.
+///
+/// Every CEX venue persists this same envelope -- they are all the one
+/// `CexFinalizer` behind a venue profile -- so the fields are read by name for
+/// whichever venue owns the leg rather than for MEXC alone. Kraken legs carried
+/// their deposit, withdrawal and both bridge identifiers from the start and
+/// simply had no line to appear on.
+fn append_cex_leg_transactions(lines: &mut Vec<Line<'static>>, venue_id: &str, execution: &VenueExecutionState) {
+    // Current multi-venue CEX state wraps the existing CEX state in `cex`.
     // Falling back to the root keeps this readable if an older direct CEX
     // state was persisted in the venue envelope.
     let cex = execution.state.get("cex").unwrap_or(&execution.state);
+    let venue = super::dashboard::venue_display_name(venue_id);
     let fields = [
-        ("deposit_txid", "MEXC deposit txid"),
-        ("deposit_bridge_id", "MEXC deposit bridge txid"),
-        ("withdraw_id", "MEXC withdraw id"),
-        ("withdraw_txid", "MEXC withdraw txid"),
-        ("withdraw_bridge_id", "MEXC withdraw bridge txid"),
+        ("deposit_txid", "deposit txid"),
+        ("deposit_bridge_id", "deposit bridge txid"),
+        ("withdraw_id", "withdraw id"),
+        ("withdraw_txid", "withdraw txid"),
+        ("withdraw_bridge_id", "withdraw bridge txid"),
     ];
 
     for (field, label) in fields {
@@ -508,7 +515,7 @@ fn append_mexc_leg_transactions(lines: &mut Vec<Line<'static>>, execution: &Venu
             .map(str::trim)
             .filter(|value| !value.is_empty())
         {
-            lines.push(Line::from(format!("   {label}: {value}")));
+            lines.push(Line::from(format!("   {venue} {label}: {value}")));
         }
     }
 }
@@ -960,6 +967,81 @@ mod tests {
                 .any(|line| line == "   MEXC withdraw bridge txid: bridge-withdraw-654")
         );
         assert!(text.iter().any(|line| line == "   Last error: waiting for bridge"));
+    }
+
+    /// Liquidation 1652 split across MEXC and Kraken, and only the MEXC leg
+    /// showed its transactions: the Kraken leg had persisted the same
+    /// identifiers all along, under the same keys, with nothing rendering them.
+    #[test]
+    fn execution_details_show_the_kraken_leg_transactions_too() {
+        let pay_token = ChainToken::EvmNative {
+            chain: "ICP".to_string(),
+            symbol: "ckETH".to_string(),
+            decimals: 2,
+            fee: Nat::from(1u8),
+        };
+        let receive_token = ChainToken::EvmNative {
+            chain: "ICP".to_string(),
+            symbol: "ckUSDC".to_string(),
+            decimals: 2,
+            fee: Nat::from(1u8),
+        };
+        let pay_amount = ChainTokenAmount::from_raw(pay_token.clone(), Nat::from(720u64));
+        let receive_amount = ChainTokenAmount::from_raw(receive_token.clone(), Nat::from(810u64));
+        let leg = VenueLegState {
+            leg_id: "kraken-0".to_string(),
+            venue_id: "kraken".to_string(),
+            request: SwapRequest {
+                pay_asset: pay_token.asset_id(),
+                pay_amount: pay_amount.clone(),
+                receive_asset: receive_token.asset_id(),
+                receive_address: None,
+                max_slippage_bps: Some(100),
+                venue_hint: Some("kraken".to_string()),
+            },
+            quote: VenueLegQuote {
+                pay_amount,
+                estimated_receive: receive_amount.clone(),
+                conservative_receive: receive_amount,
+                estimated_price_impact_bps: 4.0,
+                route_id: "ETH_USDC".to_string(),
+            },
+            execution: VenueExecutionState {
+                venue: "kraken".to_string(),
+                state: serde_json::json!({
+                    "cex": {
+                        "step": "WithdrawPending",
+                        "deposit_txid": "991_924",
+                        "deposit_bridge_id": "ic-withdraw-eth:991_926",
+                        "withdraw_id": "FTR5nyg-hY0kJ1XzPvychxDADDUJjx",
+                        "withdraw_txid": "0xd81a4eaf0b1d7adb2106acecf1b2349b5bfba0e0f4cc08a1076cb8fad423d15f",
+                        "withdraw_bridge_id": "0x6c939a2ae4776457a63d5da2e960bc87583c266473550a656b680859bf7e4b09"
+                    }
+                }),
+            },
+            status: VenueLegStatus::Running,
+            result: None,
+            last_error: None,
+        };
+
+        let mut lines = Vec::new();
+        append_venue_leg_summary(&mut lines, &leg, true);
+        let text = lines_as_text(&lines);
+
+        assert_eq!(text[0], "└─ Kraken · withdraw pending");
+        assert!(text.iter().any(|line| line == "   Kraken deposit txid: 991_924"));
+        assert!(
+            text.iter()
+                .any(|line| line == "   Kraken deposit bridge txid: ic-withdraw-eth:991_926")
+        );
+        assert!(
+            text.iter()
+                .any(|line| line == "   Kraken withdraw id: FTR5nyg-hY0kJ1XzPvychxDADDUJjx")
+        );
+        assert!(text.iter().any(|line| line
+            == "   Kraken withdraw txid: 0xd81a4eaf0b1d7adb2106acecf1b2349b5bfba0e0f4cc08a1076cb8fad423d15f"));
+        assert!(text.iter().any(|line| line
+            == "   Kraken withdraw bridge txid: 0x6c939a2ae4776457a63d5da2e960bc87583c266473550a656b680859bf7e4b09"));
     }
 
     #[test]

@@ -35,14 +35,16 @@ const SETTLEMENT_WAIT_TIMEOUT_SECS: i64 = 15 * 60;
 
 /// Upper bound on phases chained inside one `advance`.
 ///
-/// The chain covers the orchestration around a single submission and stops at
-/// every pending phase, so it costs at most four: arm the gate, persist the
-/// client order ID, arm again, submit. Eight leaves room for that sequence to
-/// grow without tripping, while still bounding the case a phase reports
-/// success without moving:
-/// the finalize stage walks rows serially, so an unbounded loop here would
-/// stall every other liquidation behind it rather than just this one.
-const MAX_CHAINED_PHASES: usize = 8;
+/// The chain stops on the first phase that submits anything, so everything it
+/// runs before that is bookkeeping: arming the gate, planning a slice and
+/// persisting its client order ID, walking past a route hop with nothing left
+/// to trade. Each hop walked past costs an arm and a plan, so the worst case
+/// on a four-hop route -- every earlier hop exhausted, the last one
+/// submitting -- is around ten phases. Sixteen leaves room for that without
+/// tripping, while still bounding the case a phase reports success without
+/// moving: the finalize stage walks rows serially, so an unbounded loop here
+/// would stall every other liquidation behind it rather than just this one.
+const MAX_CHAINED_PHASES: usize = 16;
 
 /// Names the step-level idempotency guard that makes a persisted step safe to
 /// re-enter without the in-memory arming token, or `None` while the step still
@@ -158,9 +160,10 @@ where
     /// The orchestrator otherwise re-enters once per phase on its own poll
     /// interval, so a route that deposits, trades two hops and withdraws spent
     /// tens of seconds waiting to be asked again rather than waiting on the
-    /// exchange. Only two phases wait on somebody else -- a deposit being
-    /// credited and a withdrawal being processed -- and those still hand
-    /// control back, because only the venue can say when they are done.
+    /// exchange. What still hands control back is a phase that submits -- one
+    /// per cycle, always -- and the two phases that wait on somebody else, a
+    /// deposit being credited and a withdrawal being processed, because only
+    /// the venue can say when those are done.
     ///
     /// This loops *around* [`Self::advance_decoded_leg`] rather than inside it
     /// on purpose. Every iteration runs the same arming, intent preparation and
@@ -182,10 +185,17 @@ where
         let mut phases = 0usize;
 
         loop {
+            // Read before the phase runs: the phase consumes the very state
+            // that says what it is about to do.
+            let submits = Self::phase_submits(&execution);
             let progress = self.advance_decoded_leg(execution).await?;
             phases += 1;
 
-            if !self.may_chain(&progress)? {
+            // One submission per cycle, whichever it was. A fill has moved the
+            // book the next slice would be priced against, a deposit transfer
+            // and a withdrawal are now the venue's to finish, and a refusal has
+            // already been classified into the status this returns.
+            if submits || !self.may_chain(&progress)? {
                 return Ok(progress);
             }
 
@@ -206,12 +216,49 @@ where
         }
     }
 
+    /// Whether the phase about to run can reach the venue with something it
+    /// will act on.
+    ///
+    /// Mirrors the dispatch order in [`Self::advance_decoded_leg`], and is read
+    /// from the same persisted state that phase decides on. Exactly two phases
+    /// are provably local: a closed gate arms and returns, and an armed trade
+    /// with no client order ID plans the next slice and persists its intent.
+    /// Everything else hands the step to [`Self::advance_current_step`] and is
+    /// treated as a submission.
+    ///
+    /// Including the two pending steps, which is not the obvious reading of
+    /// their names. `advance_current_step` routes `Deposit` and `DepositPending`
+    /// into the same `deposit`, and `Withdraw` and `WithdrawPending` into the
+    /// same `withdraw`, so a "pending" phase is a resume rather than a poll: it
+    /// re-enters where it left off and submits a bridge, or the seizure
+    /// transfer, whenever the guard for that submission is still unset. Reading
+    /// those as status checks would put a funds-moving phase and a second
+    /// submission in one cycle. The price is that a deposit found credited no
+    /// longer chains into the trade it unblocks, costing one cycle per leg,
+    /// which is not worth buying with a whitelist that has to stay in step with
+    /// every branch inside `deposit` and `withdraw`.
+    ///
+    /// Terminal and parked states are not considered: they never chain, because
+    /// the progress they produce is not `Running`.
+    fn phase_submits(execution: &CexVenueExecutionState) -> bool {
+        if !execution.ready_to_advance {
+            return false;
+        }
+        let plans_a_slice = matches!(execution.cex.step, CexStep::Trade | CexStep::TradePending)
+            && execution.cex.trade.trade_pending_client_order_id.is_none();
+        !plans_a_slice
+    }
+
     /// Whether the venue can take another phase immediately.
     ///
-    /// Chaining is for the orchestration around a submission -- arming the
-    /// gate, persisting a client order ID, arming again -- never for two
-    /// submissions in a row. Each pending phase marks a boundary where
-    /// something outside this process has to happen first:
+    /// Chaining is for the bookkeeping around a submission -- arming the gate,
+    /// planning a slice and persisting its client order ID, walking past a hop
+    /// with nothing left to trade. Submissions end the cycle in
+    /// [`Self::advance_leg`], on [`Self::phase_submits`] alone, so nothing here
+    /// carries that invariant and relaxing these arms cannot break it. What is
+    /// left for them is latency: recognising the phases that leave the leg
+    /// waiting on somebody else, so the chain does not arm for a step that has
+    /// nothing to do yet.
     ///
     /// - `DepositPending` and `WithdrawPending` wait on the exchange, and only
     ///   it can say when a deposit is credited or a withdrawal has left.
@@ -219,13 +266,23 @@ where
     ///   finished. The withdrawal itself is never instant, so starting it a
     ///   poll interval later costs nothing measurable and keeps it away from
     ///   the moment the proceeds landed.
-    /// - `TradePending` with no client order ID left means the leg still has
-    ///   size to sell. Slices must not run back to back: each is measured
-    ///   against a mid price re-read right after its predecessor, so chained
-    ///   slices can each pass the per-slice cap while together walking the book
-    ///   down by a multiple of it. Handing control back puts a poll interval
-    ///   between slices and lets the book refill, which is what bounded the
-    ///   aggregate before phases were chained at all.
+    ///
+    /// Slice spacing needs no rule of its own here either. Every fill is a
+    /// submission, so the cycle ends on it and the next slice is planned by the
+    /// next cycle. That gap is the only aggregate-impact control this path has:
+    /// the per-slice cap cannot be one, because each slice is measured against a
+    /// mid price re-read right after its predecessor, so back-to-back slices can
+    /// each pass the cap while together walking the book down by a multiple of
+    /// it.
+    ///
+    /// Be clear about what that gap is now worth. It used to be two orchestrator
+    /// cycles -- one spent arming, one planning and submitting -- and chaining
+    /// the arm into the plan has halved it, so consecutive slices on one book
+    /// are about one `EXECUTION_WORKER_POLL_INTERVAL` apart. Nothing enforces a
+    /// floor: the book gets exactly as long to refill as the daemon happens to
+    /// take coming back, which is incidental rather than chosen, and is the
+    /// first thing to replace with a real minimum if slice impact ever
+    /// compounds.
     ///
     /// Beyond that the test is an error of any kind, not merely a retryable
     /// one. A venue outage and a settlement wait both report a non-retryable
@@ -247,13 +304,6 @@ where
         let execution = self.decode_progress_state(progress)?;
         let waits_on_someone_else = match execution.cex.step {
             CexStep::DepositPending | CexStep::WithdrawPending => true,
-            // `TradePending` covers two different situations. While a client
-            // order ID is still pending the intent is persisted and its
-            // submission is the very next phase -- orchestration, which is
-            // exactly what chaining is for. Once it is cleared the previous
-            // slice has completed, and the next phase would open a *new* order
-            // against a book that slice just moved.
-            CexStep::TradePending => execution.cex.trade.trade_pending_client_order_id.is_none(),
             // Arriving at the withdrawal is a boundary; being armed for it is
             // not. The venue takes minutes to approve a withdrawal, so
             // submitting it in the same instant as the fill that funded it buys
