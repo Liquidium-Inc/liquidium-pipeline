@@ -33,6 +33,17 @@ const VENUE_ID: &str = "mexc";
 /// an account that is genuinely short never resolves and must not loop forever.
 const SETTLEMENT_WAIT_TIMEOUT_SECS: i64 = 15 * 60;
 
+/// Upper bound on phases chained inside one `advance`.
+///
+/// The chain covers the orchestration around a single submission and stops at
+/// every pending phase, so it costs at most four: arm the gate, persist the
+/// client order ID, arm again, submit. Eight leaves room for that sequence to
+/// grow without tripping, while still bounding the case a phase reports
+/// success without moving:
+/// the finalize stage walks rows serially, so an unbounded loop here would
+/// stall every other liquidation behind it rather than just this one.
+const MAX_CHAINED_PHASES: usize = 8;
+
 /// Names the step-level idempotency guard that makes a persisted step safe to
 /// re-enter without the in-memory arming token, or `None` while the step still
 /// owes a first submission whose outcome was never recorded.
@@ -139,10 +150,133 @@ where
         Ok(state)
     }
 
-    /// Advances exactly one venue-local state-machine phase. This method never
-    /// receives a WAL handle and therefore cannot change the parent row status.
-    async fn advance_leg(&self, leg: &VenueLegState) -> Result<VenueLegProgress, String> {
-        self.advance_decoded_leg(self.decode_leg_state(leg)?).await
+    /// Drives this leg through every immediately runnable CEX phase, persisting
+    /// each one through the narrow checkpoint before the next may submit
+    /// anything, and stopping on a wait, an error, or a terminal state so the
+    /// next daemon tick can resume safely.
+    ///
+    /// The orchestrator otherwise re-enters once per phase on its own poll
+    /// interval, so a route that deposits, trades two hops and withdraws spent
+    /// tens of seconds waiting to be asked again rather than waiting on the
+    /// exchange. Only two phases wait on somebody else -- a deposit being
+    /// credited and a withdrawal being processed -- and those still hand
+    /// control back, because only the venue can say when they are done.
+    ///
+    /// This loops *around* [`Self::advance_decoded_leg`] rather than inside it
+    /// on purpose. Every iteration runs the same arming, intent preparation and
+    /// error classification the orchestrator drove one call at a time, so the
+    /// crash-safety contract stays the existing one instead of becoming a
+    /// second copy of it. `checkpoint` writes each result into the parent
+    /// envelope before the next iteration begins, and that iteration re-decodes
+    /// its state from what was written, so the loop only ever continues from
+    /// state that is already durable.
+    ///
+    /// This method never receives a WAL handle and therefore cannot change the
+    /// parent row status.
+    async fn advance_leg(
+        &self,
+        leg: &VenueLegState,
+        checkpoint: &dyn VenueLegCheckpoint,
+    ) -> Result<VenueLegProgress, String> {
+        let mut execution = self.decode_leg_state(leg)?;
+        let mut phases = 0usize;
+
+        loop {
+            let progress = self.advance_decoded_leg(execution).await?;
+            phases += 1;
+
+            if !self.may_chain(&progress)? {
+                return Ok(progress);
+            }
+
+            if phases >= MAX_CHAINED_PHASES {
+                // Returning un-checkpointed is safe: the orchestrator persists
+                // whatever `advance` hands back, exactly as it does for a leg
+                // that stopped on its own.
+                warn!(
+                    "[{}] leg_id={} chained {phases} phases without reaching a waiting state; handing back to the orchestrator",
+                    self.profile.venue_id(),
+                    leg.leg_id
+                );
+                return Ok(progress);
+            }
+
+            checkpoint.checkpoint(progress.clone()).await?;
+            execution = self.decode_progress_state(&progress)?;
+        }
+    }
+
+    /// Whether the venue can take another phase immediately.
+    ///
+    /// Chaining is for the orchestration around a submission -- arming the
+    /// gate, persisting a client order ID, arming again -- never for two
+    /// submissions in a row. Each pending phase marks a boundary where
+    /// something outside this process has to happen first:
+    ///
+    /// - `DepositPending` and `WithdrawPending` wait on the exchange, and only
+    ///   it can say when a deposit is credited or a withdrawal has left.
+    /// - `Withdraw` reached with the gate still closed means the trade just
+    ///   finished. The withdrawal itself is never instant, so starting it a
+    ///   poll interval later costs nothing measurable and keeps it away from
+    ///   the moment the proceeds landed.
+    /// - `TradePending` with no client order ID left means the leg still has
+    ///   size to sell. Slices must not run back to back: each is measured
+    ///   against a mid price re-read right after its predecessor, so chained
+    ///   slices can each pass the per-slice cap while together walking the book
+    ///   down by a multiple of it. Handing control back puts a poll interval
+    ///   between slices and lets the book refill, which is what bounded the
+    ///   aggregate before phases were chained at all.
+    ///
+    /// Beyond that the test is an error of any kind, not merely a retryable
+    /// one. A venue outage and a settlement wait both report a non-retryable
+    /// error while leaving the phase where it was, and both describe a leg
+    /// waiting on somebody else; chaining either would spin against the venue
+    /// for nothing.
+    ///
+    /// An armed gate is the one exception. Arming submits nothing and cannot
+    /// repeat -- the next phase consumes the intent -- so a leg still carrying
+    /// a previous cycle's error for diagnostics may chain through it. Without
+    /// that exception any leg that had ever failed would be stuck at the old
+    /// one-phase-per-cycle cadence forever, because nothing clears `last_error`
+    /// until a phase actually runs.
+    fn may_chain(&self, progress: &VenueLegProgress) -> Result<bool, String> {
+        if !matches!(progress.status, VenueLegStatus::Running) {
+            return Ok(false);
+        }
+
+        let execution = self.decode_progress_state(progress)?;
+        let waits_on_someone_else = match execution.cex.step {
+            CexStep::DepositPending | CexStep::WithdrawPending => true,
+            // `TradePending` covers two different situations. While a client
+            // order ID is still pending the intent is persisted and its
+            // submission is the very next phase -- orchestration, which is
+            // exactly what chaining is for. Once it is cleared the previous
+            // slice has completed, and the next phase would open a *new* order
+            // against a book that slice just moved.
+            CexStep::TradePending => execution.cex.trade.trade_pending_client_order_id.is_none(),
+            // Arriving at the withdrawal is a boundary; being armed for it is
+            // not. The venue takes minutes to approve a withdrawal, so
+            // submitting it in the same instant as the fill that funded it buys
+            // nothing and risks refusal while the proceeds are still settling
+            // -- which classifies as an ordinary rejection and spends the
+            // retry budget rather than waiting.
+            CexStep::Withdraw => !execution.ready_to_advance,
+            _ => false,
+        };
+        if waits_on_someone_else {
+            return Ok(false);
+        }
+
+        Ok(execution.ready_to_advance || progress.last_error.is_none())
+    }
+
+    /// Reads back the state a phase just produced, so the next phase starts
+    /// from the same bytes the checkpoint persisted.
+    fn decode_progress_state(&self, progress: &VenueLegProgress) -> Result<CexVenueExecutionState, String> {
+        progress
+            .execution
+            .decode::<CexVenueExecutionState>(self.profile.venue_id())?
+            .ok_or_else(|| format!("{} progress state decoded to the wrong venue", self.profile.venue_id()))
     }
 
     /// Advances an already validated state so recovery does not decode the
@@ -456,9 +590,9 @@ where
     async fn advance(
         &self,
         leg: &VenueLegState,
-        _checkpoint: &dyn VenueLegCheckpoint,
+        checkpoint: &dyn VenueLegCheckpoint,
     ) -> Result<VenueLegProgress, String> {
-        self.advance_leg(leg).await
+        self.advance_leg(leg, checkpoint).await
     }
 
     async fn recover(

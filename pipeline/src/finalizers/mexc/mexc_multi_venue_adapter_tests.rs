@@ -35,6 +35,69 @@ impl VenueLegCheckpoint for NoopCheckpoint {
     }
 }
 
+/// Stamps each checkpoint with the venue submissions made before it.
+///
+/// `advance` chains phases, so "state is durable before the side effect it
+/// guards" is no longer guaranteed by the shape of the code -- one phase per
+/// call, persisted by the orchestrator in between -- but by an explicit
+/// checkpoint inside the loop. Counting `advance` calls can no longer see that,
+/// so these tests read the ordering back instead.
+struct SpyCheckpoint {
+    submissions: Arc<std::sync::Mutex<usize>>,
+    saved: std::sync::Mutex<Vec<(usize, VenueExecutionState)>>,
+    /// Records the state and then refuses it once the chain reaches this step,
+    /// so a test can stop at a boundary without mocking the phases past it.
+    /// The refusal is what a failed persist looks like, so the chain stops
+    /// there without submitting anything further.
+    stop_at: Option<CexStep>,
+}
+
+impl SpyCheckpoint {
+    fn new(submissions: Arc<std::sync::Mutex<usize>>, stop_at: Option<CexStep>) -> Self {
+        Self {
+            submissions,
+            saved: std::sync::Mutex::new(Vec::new()),
+            stop_at,
+        }
+    }
+
+    fn stopping_at(step: CexStep) -> Self {
+        Self::new(Arc::new(std::sync::Mutex::new(0)), Some(step))
+    }
+
+    /// Every checkpoint taken, as `(submissions_before_it, state)`.
+    fn saved(&self) -> Vec<(usize, VenueExecutionState)> {
+        self.saved.lock().unwrap().clone()
+    }
+
+    fn saved_state(&self, index: usize) -> MexcVenueExecutionState {
+        self.saved()[index]
+            .1
+            .decode::<MexcVenueExecutionState>(VENUE_ID)
+            .expect("decode checkpoint")
+            .expect("MEXC state")
+    }
+}
+
+#[async_trait::async_trait]
+impl VenueLegCheckpoint for SpyCheckpoint {
+    async fn checkpoint(&self, progress: VenueLegProgress) -> Result<(), String> {
+        let submissions = *self.submissions.lock().unwrap();
+        let step = progress
+            .execution
+            .decode::<MexcVenueExecutionState>(VENUE_ID)
+            .expect("decode checkpoint")
+            .expect("MEXC state")
+            .cex
+            .step;
+        self.saved.lock().unwrap().push((submissions, progress.execution));
+        if self.stop_at == Some(step) {
+            return Err("checkpoint unavailable".to_string());
+        }
+        Ok(())
+    }
+}
+
 fn pay_token() -> ChainToken {
     ChainToken::Icp {
         ledger: Principal::anonymous(),
@@ -336,28 +399,33 @@ fn persisted_adapter_state_defaults_a_missing_persistence_gate_to_closed() {
 }
 
 #[tokio::test]
-async fn first_advance_only_opens_the_parent_persistence_gate() {
+async fn nothing_is_submitted_until_the_persistence_gate_is_durable() {
     let finalizer = finalizer();
     let preview = MultiVenueAdapter::preview(&finalizer, &planning_context(), &request(100_000_000))
         .await
         .expect("preview should succeed");
     let leg = leg_from_preview(preview);
 
-    // No transfer/backend side-effect expectations are configured. Any such
-    // call would fail this test; the first cycle must only return durable state.
-    let progress = MultiVenueAdapter::advance(&finalizer, &leg, &NoopCheckpoint)
+    // No transfer/backend side-effect expectations are configured, so any such
+    // call fails this test. The checkpoint refuses, which stops the chain the
+    // moment the gate has been offered for persistence -- the point before
+    // which nothing may be submitted.
+    let checkpoint = SpyCheckpoint::stopping_at(CexStep::Deposit);
+    let error = MultiVenueAdapter::advance(&finalizer, &leg, &checkpoint)
         .await
-        .expect("gate transition should succeed");
-    let execution = progress
-        .execution
-        .decode::<MexcVenueExecutionState>("mexc")
-        .expect("state should decode")
-        .expect("state should be MEXC");
+        .expect_err("a gate that cannot be persisted must not be advanced past");
+    assert!(
+        error.contains("checkpoint unavailable"),
+        "the checkpoint failure must surface rather than be swallowed: {error}"
+    );
 
+    let saved = checkpoint.saved();
+    assert_eq!(saved.len(), 1, "only the gate is offered before it is persisted");
+    assert_eq!(saved[0].0, 0, "nothing may be submitted before the gate is durable");
+
+    let execution = checkpoint.saved_state(0);
     assert!(execution.ready_to_advance);
     assert_eq!(execution.cex.step, CexStep::Deposit);
-    assert_eq!(progress.status, VenueLegStatus::Running);
-    assert!(progress.result.is_none());
 }
 
 #[tokio::test]
@@ -367,11 +435,17 @@ async fn restart_with_an_outstanding_intent_requires_operator_instead_of_replayi
         .await
         .expect("preview should succeed");
     let mut leg = leg_from_preview(preview);
-    let armed = MultiVenueAdapter::advance(&original, &leg, &NoopCheckpoint)
+
+    // The armed intent is read from what the chain persisted, not from what it
+    // returned: chaining submits immediately after checkpointing, so the state
+    // a crash could interrupt is the checkpointed one. Refusing the checkpoint
+    // stops the chain exactly there.
+    let checkpoint = SpyCheckpoint::stopping_at(CexStep::Deposit);
+    MultiVenueAdapter::advance(&original, &leg, &checkpoint)
         .await
-        .expect("first cycle should persist an intent");
-    leg.execution = armed.execution;
-    leg.status = armed.status;
+        .expect_err("the refused checkpoint stops the chain at the armed intent");
+    leg.execution = checkpoint.saved()[0].1.clone();
+    leg.status = VenueLegStatus::Running;
 
     // A reconstructed adapter has no process-local proof that the external
     // call did not already happen before the crash. It must not call MEXC or
@@ -604,12 +678,9 @@ async fn ordinary_cex_error_remains_retryable_without_operator_intervention() {
     let preview = MultiVenueAdapter::preview(&finalizer, &planning_context(), &request(100_000_000))
         .await
         .expect("preview should succeed");
-    let mut leg = leg_from_preview(preview);
+    let leg = leg_from_preview(preview);
 
-    let armed = MultiVenueAdapter::advance(&finalizer, &leg, &NoopCheckpoint)
-        .await
-        .expect("first cycle should arm the leg");
-    leg.execution = armed.execution;
+    // Arming and the failing deposit now happen in one chained call.
     let retryable = MultiVenueAdapter::advance(&finalizer, &leg, &NoopCheckpoint)
         .await
         .expect("ordinary CEX failure should become durable retryable progress");
@@ -687,32 +758,29 @@ async fn each_trade_order_intent_is_persisted_before_its_submission() {
     execution.cex.trade.trade_next_amount_in = Some(1.0);
     leg.execution = VenueExecutionState::new(VENUE_ID, &execution).expect("encode");
 
-    let gate = MultiVenueAdapter::advance(&finalizer, &leg, &NoopCheckpoint)
+    // One `advance` now walks the gate, the order intent and the submission,
+    // so the guarantee is no longer "the caller returned in between" but
+    // "the intent was checkpointed while nothing had been submitted yet".
+    let checkpoint = SpyCheckpoint::new(calls.clone(), None);
+    let filled = MultiVenueAdapter::advance(&finalizer, &leg, &checkpoint)
         .await
-        .expect("open outer gate");
-    leg.execution = gate.execution;
-    let prepared = MultiVenueAdapter::advance(&finalizer, &leg, &NoopCheckpoint)
-        .await
-        .expect("prepare order intent");
-    assert_eq!(*calls.lock().unwrap(), 0);
-    let prepared_state = prepared
-        .execution
-        .decode::<MexcVenueExecutionState>(VENUE_ID)
-        .expect("decode prepared")
-        .expect("prepared state");
-    assert!(prepared_state.cex.trade.trade_pending_client_order_id.is_some());
-    assert!(prepared_state.cex.trade.trade_pending_requested_in.is_some());
+        .expect("the chain runs the order intent through to its submission");
 
-    leg.execution = prepared.execution;
-    let submission_gate = MultiVenueAdapter::advance(&finalizer, &leg, &NoopCheckpoint)
-        .await
-        .expect("open submission gate");
-    assert_eq!(*calls.lock().unwrap(), 0);
-    leg.execution = submission_gate.execution;
-    let filled = MultiVenueAdapter::advance(&finalizer, &leg, &NoopCheckpoint)
-        .await
-        .expect("submit persisted order");
-    assert_eq!(*calls.lock().unwrap(), 1);
+    assert_eq!(*calls.lock().unwrap(), 1, "the order is submitted exactly once");
+    assert_eq!(filled.status, VenueLegStatus::Running);
+
+    let intent_saved_before_submission = checkpoint.saved().into_iter().any(|(submissions, state)| {
+        let state = state
+            .decode::<MexcVenueExecutionState>(VENUE_ID)
+            .expect("decode checkpoint")
+            .expect("MEXC state");
+        submissions == 0 && state.cex.trade.trade_pending_client_order_id.is_some()
+    });
+    assert!(
+        intent_saved_before_submission,
+        "the client order ID must be durable before the order reaches the venue"
+    );
+
     let filled_state = filled
         .execution
         .decode::<MexcVenueExecutionState>(VENUE_ID)
@@ -761,6 +829,9 @@ fn finalizer_with_trade_result(
 
 /// Places a committed leg on its trade step with one resolved USDT-quoted
 /// market, so the slice runner reaches the venue call without route discovery.
+/// A leg parked at the trade step, with the gates left closed: one chained
+/// `advance` now walks the outer gate, the order intent and the submission, so
+/// driving them here would consume the caller's mock expectations first.
 async fn leg_at_trade_step(finalizer: &MexcFinalizer<MockCexBackend>, waiting_since_ts: Option<i64>) -> VenueLegState {
     let preview = MultiVenueAdapter::preview(finalizer, &planning_context(), &request(100_000_000))
         .await
@@ -779,19 +850,6 @@ async fn leg_at_trade_step(finalizer: &MexcFinalizer<MockCexBackend>, waiting_si
     execution.cex.trade.trade_next_amount_in = Some(1.0);
     execution.cex.trade.trade_settlement_waiting_since_ts = waiting_since_ts;
     leg.execution = VenueExecutionState::new(VENUE_ID, &execution).expect("state should encode");
-
-    let armed = MultiVenueAdapter::advance(finalizer, &leg, &NoopCheckpoint)
-        .await
-        .expect("first cycle should arm the outer leg intent");
-    leg.execution = armed.execution;
-    let prepared = MultiVenueAdapter::advance(finalizer, &leg, &NoopCheckpoint)
-        .await
-        .expect("second cycle should prepare the order intent");
-    leg.execution = prepared.execution;
-    let submission_gate = MultiVenueAdapter::advance(finalizer, &leg, &NoopCheckpoint)
-        .await
-        .expect("third cycle should arm the order submission");
-    leg.execution = submission_gate.execution;
     leg
 }
 
@@ -928,7 +986,7 @@ async fn a_settled_fill_clears_the_recorded_wait() {
 
     let progress = MultiVenueAdapter::advance(&finalizer, &leg, &NoopCheckpoint)
         .await
-        .expect("a filled slice should advance the leg");
+        .expect("a filled slice should advance the leg to the withdraw boundary");
 
     assert_eq!(progress.status, VenueLegStatus::Running);
     assert_eq!(progress.retryable_error, None);
@@ -940,4 +998,75 @@ async fn a_settled_fill_clears_the_recorded_wait() {
     // Cleared, so a later refusal is timed from its own first occurrence
     // rather than inheriting a stale deadline.
     assert_eq!(execution.cex.trade.trade_settlement_waiting_since_ts, None);
+    // The fill hands back here rather than withdrawing in the same call: the
+    // venue takes minutes to approve a withdrawal, and the proceeds may not be
+    // withdrawable the instant they land.
+    assert_eq!(execution.cex.step, CexStep::Withdraw);
+    assert!(!execution.ready_to_advance, "the withdrawal gate is left closed");
+}
+
+/// A leg with more size to sell must not open the next slice in the same call.
+///
+/// Slice slippage is measured against a mid price re-read immediately after the
+/// previous slice, so slices running back to back can each pass the per-slice
+/// cap while together walking the book down by a multiple of it. The poll
+/// interval between them is what bounds the aggregate, and chaining would
+/// remove it. `TradePending` with the client order ID already cleared is
+/// exactly that boundary.
+#[tokio::test]
+async fn a_leg_with_size_left_to_sell_does_not_open_the_next_slice_in_the_same_call() {
+    let mut backend = MockCexBackend::new();
+    backend.expect_get_orderbook().returning(|_, _| {
+        Ok(OrderBook {
+            bids: vec![OrderBookLevel {
+                price: 10.0,
+                quantity: 1_000_000.0,
+            }],
+            asks: vec![],
+        })
+    });
+    // Any submission in this call fails the test: the next slice belongs to a
+    // later cycle.
+    backend.expect_execute_swap_detailed_with_options().never();
+    let tokens = HashMap::from([
+        (pay_token().asset_id(), pay_token()),
+        (receive_token().asset_id(), receive_token()),
+    ]);
+    let finalizer = MexcFinalizer::new(
+        Arc::new(backend),
+        Arc::new(MockTransferActions::new()),
+        Principal::anonymous(),
+        200.0,
+        0.0001,
+        0.7,
+    )
+    .with_token_registry(Arc::new(TokenRegistry::new(tokens)));
+
+    let mut leg = leg_at_trade_step(&finalizer, None).await;
+    let mut execution = leg
+        .execution
+        .decode::<MexcVenueExecutionState>(VENUE_ID)
+        .expect("decode")
+        .expect("MEXC state");
+    // The previous slice finished and cleared its order ID, leaving size behind.
+    execution.cex.step = CexStep::TradePending;
+    execution.cex.trade.trade_pending_client_order_id = None;
+    leg.execution = VenueExecutionState::new(VENUE_ID, &execution).expect("encode");
+
+    let progress = MultiVenueAdapter::advance(&finalizer, &leg, &NoopCheckpoint)
+        .await
+        .expect("the slice boundary is a clean hand-back, not a failure");
+
+    assert_eq!(progress.status, VenueLegStatus::Running);
+    assert!(progress.result.is_none(), "a leg mid-route yields no result yet");
+    let armed = progress
+        .execution
+        .decode::<MexcVenueExecutionState>(VENUE_ID)
+        .expect("decode")
+        .expect("MEXC state");
+    assert!(
+        armed.ready_to_advance,
+        "the call still arms the next slice; it just does not submit it"
+    );
+    assert_eq!(armed.cex.step, CexStep::TradePending);
 }
