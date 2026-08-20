@@ -187,7 +187,7 @@ BAD_DEBT_COLLATERAL_SLIPPAGE_BPS=500  # 5.00% haircut used for min collateral
 # CEX trade slicing and execution controls
 # Skip execution chunks below this USD notional (treat as dust)
 CEX_MIN_EXEC_USD=8
-CEX_MIN_LEG_RECEIVE_USD=10
+CEX_MIN_LEG_RECEIVE_USD=5
 # Per-slice impact target ratio of MAX_ALLOWED_CEX_SLIPPAGE_BPS
 CEX_SLICE_TARGET_RATIO=0.7
 # Arm adaptive buy fallback when truncation ratio is >= this value

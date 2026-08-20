@@ -528,10 +528,14 @@ struct CexTunables {
 }
 
 const DEFAULT_CEX_MIN_EXEC_USD: f64 = 8.0;
-/// Venue withdrawal minimums are dollar-sized -- MEXC refuses an ERC20 USDC
-/// withdrawal under 5 -- so a leg worth less than this on the way out risks
-/// stranding its proceeds on the exchange for an operator to retrieve.
-const DEFAULT_CEX_MIN_LEG_RECEIVE_USD: f64 = 10.0;
+/// Venue withdrawal minimums are dollar-sized: MEXC refuses an ERC20 USDC
+/// withdrawal under 5, which is the one number observed here and so the one
+/// this default matches. A leg worth less than this on the way out risks
+/// stranding its proceeds on the exchange for an operator to retrieve. It is
+/// the floor itself, with no headroom of its own -- the dust allowance added on
+/// top is the whole cushion -- so a venue or bridge with a higher minimum than
+/// MEXC's needs this raised.
+const DEFAULT_CEX_MIN_LEG_RECEIVE_USD: f64 = 5.0;
 const DEFAULT_CEX_SLICE_TARGET_RATIO: f64 = 0.7;
 const DEFAULT_CEX_BUY_TRUNCATION_TRIGGER_RATIO: f64 = 0.25;
 const DEFAULT_CEX_BUY_INVERSE_OVERSPEND_BPS: u32 = 10;
@@ -989,7 +993,7 @@ mod tests {
             parsed,
             CexTunables {
                 min_exec_usd: 8.0,
-                min_leg_receive_usd: 10.0,
+                min_leg_receive_usd: 5.0,
                 slice_target_ratio: 0.7,
                 buy_truncation_trigger_ratio: 0.25,
                 buy_inverse_overspend_bps: 10,
@@ -1051,7 +1055,7 @@ mod tests {
             parsed,
             CexTunables {
                 min_exec_usd: 1.05,
-                min_leg_receive_usd: 10.0,
+                min_leg_receive_usd: 5.0,
                 slice_target_ratio: 0.85,
                 buy_truncation_trigger_ratio: 0.4,
                 buy_inverse_overspend_bps: 20,
