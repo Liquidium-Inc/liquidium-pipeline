@@ -48,6 +48,12 @@ pub struct Config {
     /// Minimum USD notional allowed for a single CEX execution chunk.
     /// Chunks below this threshold are treated as dust.
     pub cex_min_exec_usd: f64,
+    /// Minimum USD a CEX leg must still be worth on the way out, before the
+    /// dust the slicer may abandon is allowed for. A venue refuses to withdraw
+    /// less than its own per-asset minimum, and that refusal lands after the
+    /// trade, with the proceeds already on the exchange, so the floor is applied
+    /// while the leg is only a plan. Zero disables the check.
+    pub cex_min_leg_receive_usd: f64,
     /// Target fraction of max allowed slippage used for slice sizing.
     /// Example: 0.85 with 200 bps cap targets ~170 bps per slice.
     pub cex_slice_target_ratio: f64,
@@ -121,6 +127,7 @@ pub trait ConfigTrait: Send + Sync {
     fn get_max_allowed_cex_slippage_bps(&self) -> u32;
     fn get_bad_debt_collateral_slippage_bps(&self) -> u32;
     fn get_cex_min_exec_usd(&self) -> f64;
+    fn get_cex_min_leg_receive_usd(&self) -> f64;
     fn get_cex_slice_target_ratio(&self) -> f64;
     fn get_cex_buy_truncation_trigger_ratio(&self) -> f64;
     fn get_cex_buy_inverse_overspend_bps(&self) -> u32;
@@ -179,6 +186,10 @@ impl ConfigTrait for Config {
 
     fn get_cex_min_exec_usd(&self) -> f64 {
         self.cex_min_exec_usd
+    }
+
+    fn get_cex_min_leg_receive_usd(&self) -> f64 {
+        self.cex_min_leg_receive_usd
     }
 
     fn get_cex_slice_target_ratio(&self) -> f64 {
@@ -428,6 +439,7 @@ impl Config {
             max_allowed_cex_slippage_bps,
             bad_debt_collateral_slippage_bps,
             cex_min_exec_usd: cex_tunables.min_exec_usd,
+            cex_min_leg_receive_usd: cex_tunables.min_leg_receive_usd,
             cex_slice_target_ratio: cex_tunables.slice_target_ratio,
             cex_buy_truncation_trigger_ratio: cex_tunables.buy_truncation_trigger_ratio,
             cex_buy_inverse_overspend_bps: cex_tunables.buy_inverse_overspend_bps,
@@ -503,6 +515,7 @@ fn load_cex_credentials() -> HashMap<String, (String, String)> {
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct CexTunables {
     min_exec_usd: f64,
+    min_leg_receive_usd: f64,
     slice_target_ratio: f64,
     buy_truncation_trigger_ratio: f64,
     buy_inverse_overspend_bps: u32,
@@ -515,6 +528,10 @@ struct CexTunables {
 }
 
 const DEFAULT_CEX_MIN_EXEC_USD: f64 = 8.0;
+/// Venue withdrawal minimums are dollar-sized -- MEXC refuses an ERC20 USDC
+/// withdrawal under 5 -- so a leg worth less than this on the way out risks
+/// stranding its proceeds on the exchange for an operator to retrieve.
+const DEFAULT_CEX_MIN_LEG_RECEIVE_USD: f64 = 10.0;
 const DEFAULT_CEX_SLICE_TARGET_RATIO: f64 = 0.7;
 const DEFAULT_CEX_BUY_TRUNCATION_TRIGGER_RATIO: f64 = 0.25;
 const DEFAULT_CEX_BUY_INVERSE_OVERSPEND_BPS: u32 = 10;
@@ -841,6 +858,12 @@ fn parse_cex_tunables_from_env() -> CexTunables {
         .filter(|v| *v > 0.0)
         .unwrap_or(DEFAULT_CEX_MIN_EXEC_USD);
 
+    let min_leg_receive_usd = env::var("CEX_MIN_LEG_RECEIVE_USD")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .filter(|v| v.is_finite() && *v >= 0.0)
+        .unwrap_or(DEFAULT_CEX_MIN_LEG_RECEIVE_USD);
+
     let slice_target_ratio = env::var("CEX_SLICE_TARGET_RATIO")
         .ok()
         .and_then(|v| v.parse::<f64>().ok())
@@ -896,6 +919,7 @@ fn parse_cex_tunables_from_env() -> CexTunables {
 
     CexTunables {
         min_exec_usd,
+        min_leg_receive_usd,
         slice_target_ratio,
         buy_truncation_trigger_ratio,
         buy_inverse_overspend_bps,
@@ -965,6 +989,7 @@ mod tests {
             parsed,
             CexTunables {
                 min_exec_usd: 8.0,
+                min_leg_receive_usd: 10.0,
                 slice_target_ratio: 0.7,
                 buy_truncation_trigger_ratio: 0.25,
                 buy_inverse_overspend_bps: 10,
@@ -1026,6 +1051,7 @@ mod tests {
             parsed,
             CexTunables {
                 min_exec_usd: 1.05,
+                min_leg_receive_usd: 10.0,
                 slice_target_ratio: 0.85,
                 buy_truncation_trigger_ratio: 0.4,
                 buy_inverse_overspend_bps: 20,

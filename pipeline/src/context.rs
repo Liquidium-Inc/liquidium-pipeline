@@ -463,6 +463,7 @@ mod tests {
             max_allowed_cex_slippage_bps: 200,
             bad_debt_collateral_slippage_bps: 500,
             cex_min_exec_usd: 5.0,
+            cex_min_leg_receive_usd: 10.0,
             cex_slice_target_ratio: 0.85,
             cex_buy_truncation_trigger_ratio: 0.25,
             cex_buy_inverse_overspend_bps: 10,

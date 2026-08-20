@@ -258,6 +258,7 @@ async fn init(
                 dust_fallback_max_price_impact_bps: config.icpswap_dust_fallback_max_price_impact_bps,
                 max_cex_price_impact_bps: config.get_max_allowed_cex_slippage_bps() as f64,
                 cex_min_exec_usd: config.get_cex_min_exec_usd(),
+                min_leg_receive_usd: config.get_cex_min_leg_receive_usd(),
                 min_net_edge_bps: config.multi_venue_min_net_edge_bps,
                 bad_debt_min_net_edge_bps: config.multi_venue_bad_debt_min_net_edge_bps,
                 max_oracle_discount_bps: config.multi_venue_max_oracle_discount_bps,

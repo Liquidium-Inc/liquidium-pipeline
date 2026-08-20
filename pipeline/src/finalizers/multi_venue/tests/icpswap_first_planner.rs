@@ -291,6 +291,8 @@ fn config(cex_min_exec_usd: f64) -> IcpswapFirstPlannerConfig {
         dust_fallback_max_price_impact_bps: 150.0,
         max_cex_price_impact_bps: 200.0,
         cex_min_exec_usd,
+        // Off unless a test sets it: the fixtures here predate the exit floor.
+        min_leg_receive_usd: 0.0,
         min_net_edge_bps: 150,
         bad_debt_min_net_edge_bps: 150,
         // Must stay above both impact caps -- the 200 bps CEX cap is the wider
@@ -3041,4 +3043,73 @@ proptest! {
         prop_assert!(rejected.is_err(), "one unit below the integer boundary must fail");
         prop_assert!(rejected.unwrap_err().to_string().contains("250 bps limit"));
     }
+}
+
+/// A CEX leg is withdrawn in one transfer, and venues refuse anything under a
+/// per-asset minimum of their own -- MEXC will not send less than 5 USDC over
+/// ERC20. That refusal arrives after the trade, with the proceeds already on the
+/// exchange and only an operator able to retrieve them, which is how liquidation
+/// 1657 came to leave $4.96 on MEXC. The floor is therefore applied to the
+/// conservative output while the leg is still only a plan.
+#[tokio::test]
+async fn a_leg_whose_output_cannot_be_withdrawn_is_not_planned() {
+    let icpswap = mock_adapter(ICPSWAP_VENUE_ID, Arc::new(Mutex::new(Vec::new())), |request| {
+        Ok(proportional_preview(request, ICPSWAP_VENUE_ID, 0.0, 2))
+    });
+    // 5.7 ckUSDC conservative, as 1657 was quoted, against a $10 leg floor.
+    let mexc = mock_adapter(MEXC_VENUE_ID, Arc::new(Mutex::new(Vec::new())), |request| {
+        Ok(preview(request, MEXC_VENUE_ID, 0.0, 5_718_480, 5_661_295))
+    });
+    let mut planner_config = config(1.1);
+    planner_config.min_leg_receive_usd = 10.0;
+
+    let error = planner(icpswap, mexc, planner_config)
+        .plan(&small_output_cex_only_input(), QUOTED_AT)
+        .await
+        .expect_err("a leg that cannot be withdrawn must not be planned");
+
+    let error = error.to_string();
+    assert!(
+        error.contains("withdrawable minimum"),
+        "the refusal should name the exit floor, got: {error}"
+    );
+    // The dust allowance is part of the floor: the slicer abandons residuals
+    // under it, and that loss comes out of this same output.
+    assert!(
+        error.contains("11.10"),
+        "floor should include the dust allowance, got: {error}"
+    );
+}
+
+/// The mirror of the case above: the floor must only reject what it is for, or
+/// it would strand collateral that a venue would have withdrawn perfectly well.
+#[tokio::test]
+async fn an_output_clearing_the_floor_still_plans() {
+    let icpswap = mock_adapter(ICPSWAP_VENUE_ID, Arc::new(Mutex::new(Vec::new())), |request| {
+        Ok(proportional_preview(request, ICPSWAP_VENUE_ID, 0.0, 2))
+    });
+    let mexc = mock_adapter(MEXC_VENUE_ID, Arc::new(Mutex::new(Vec::new())), |request| {
+        Ok(preview(request, MEXC_VENUE_ID, 0.0, 5_718_480, 5_661_295))
+    });
+    let mut planner_config = config(1.1);
+    planner_config.min_leg_receive_usd = 1.0;
+
+    let state = planner(icpswap, mexc, planner_config)
+        .plan(&small_output_cex_only_input(), QUOTED_AT)
+        .await
+        .expect("5.66 USDC clears a $2.10 floor");
+
+    assert_eq!(state.legs.len(), 1);
+    assert_eq!(state.legs[0].venue_id, MEXC_VENUE_ID);
+}
+
+/// A ckBTC seizure repaying a small debt: ICPSwap cannot take the pair, so the
+/// CEX waterfall owns the whole allocation, and the oracle prices needed to
+/// value the output in USD are present.
+fn small_output_cex_only_input() -> IcpswapFirstPlanInput {
+    let mut input = input_with_pay_token(non_native_icp_token());
+    input.debt_repaid.value = Nat::from(1_000_000u64);
+    input.pay_reference_price_ray = Some(Nat::from(2 * RAY));
+    input.receive_reference_price_ray = Some(Nat::from(RAY));
+    input
 }

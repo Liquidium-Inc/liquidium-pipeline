@@ -253,6 +253,24 @@ impl IcpswapFirstPlanner {
         let conservative_receive = sum_leg_outputs(&legs, true)?;
         let combined_net_edge_bps = edge_bps(&conservative_receive, &input.debt_repaid)?;
 
+        // Every CEX leg is withdrawn on its own, so each has to clear the exit
+        // floor by itself rather than as part of the combined output below.
+        // ICPSwap legs settle on-chain and have no such floor, so only the
+        // overflow venues are held to it.
+        if let Some(stranded) = legs.iter().find(|leg| {
+            self.overflow_venue_ids.contains(&leg.venue_id)
+                && !input.meets_receive_minimum(&leg.quote.conservative_receive, self.cex_receive_floor_usd())
+        }) {
+            return Err(IcpswapFirstPlannerError::BelowVenueMinimum(format!(
+                "{} leg would produce {}, under the ${:.2} withdrawable minimum (${:.2} leg floor plus a ${:.2} dust allowance)",
+                stranded.venue_id,
+                stranded.quote.conservative_receive.formatted(),
+                self.cex_receive_floor_usd(),
+                self.config.min_leg_receive_usd,
+                self.config.cex_min_exec_usd
+            )));
+        }
+
         // Bad debt is bought at a known loss, so measuring the swap against the
         // debt it repaid can only ever reject it. Its own floor decides how much
         // of that shortfall may be recycled without a human; the quote is still
