@@ -178,7 +178,7 @@ pub async fn build_mexc_finalizer(ctx: &PipelineContext) -> Result<Arc<MexcFinal
         .get_cex_credentials("mexc")
         .map_err(|err| format!("Cex credentials not found: {err}"))?;
 
-    let mexc_client = Arc::new(MexcClient::new(&api_key, &secret));
+    let mexc_client = Arc::new(MexcClient::new(&api_key, &secret)?);
     let route_chain_id_config = route_chain_id_config_from_env()?;
     let required_chain_ids = required_cketh_route_chain_ids(&route_chain_id_config)?;
     if required_chain_ids.len() > 1 {

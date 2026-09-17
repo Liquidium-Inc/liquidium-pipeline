@@ -294,6 +294,7 @@ pub struct MexcClient {
     inner: tokio::sync::Mutex<MexcSpotApiClientWithAuthentication>,
     symbol_filters: tokio::sync::Mutex<HashMap<String, SymbolFilters>>,
     http: reqwest::Client,
+    api_base: String,
 }
 
 impl MexcClient {
@@ -335,29 +336,50 @@ impl MexcClient {
         }
     }
 
-    pub fn new(api_key: &str, secret: &str) -> Self {
+    pub fn new(api_key: &str, secret: &str) -> Result<Self, String> {
+        #[cfg(not(feature = "simulator"))]
+        let api_base = "https://api.mexc.com".to_string();
+        #[cfg(feature = "simulator")]
+        let api_base = {
+            let raw = env::var("SIM_MEXC_URL").map_err(|_| "simulator MEXC requires SIM_MEXC_URL".to_string())?;
+            let url = reqwest::Url::parse(&raw).map_err(|e| e.to_string())?;
+            // Both the signed client and unsigned metadata requests must remain
+            // local; otherwise route discovery can mix real and simulated books.
+            if url.scheme() != "http"
+                || url.host_str() != Some("127.0.0.1")
+                || !url.username().is_empty()
+                || url.password().is_some()
+                || url.path() != "/"
+                || url.query().is_some()
+                || url.fragment().is_some()
+            {
+                return Err("SIM_MEXC_URL must be a loopback HTTP origin".to_string());
+            }
+            raw.trim_end_matches('/').to_string()
+        };
         let api = MexcSpotApiClientWithAuthentication::new(
-            mexc_rs::spot::MexcSpotApiEndpoint::Base,
+            mexc_rs::spot::MexcSpotApiEndpoint::Custom(api_base.clone()),
             api_key.to_string(),
             secret.to_string(),
         );
-        Self {
+        Ok(Self {
             inner: tokio::sync::Mutex::new(api),
             symbol_filters: tokio::sync::Mutex::new(HashMap::new()),
             http: reqwest::Client::new(),
-        }
+            api_base,
+        })
     }
 
     pub fn from_env() -> Result<Self, String> {
         let api_key = env::var("CEX_MEXC_API_KEY").map_err(|_| "CEX_MEXC_API_KEY not set".to_string())?;
         let api_secret = env::var("CEX_MEXC_API_SECRET").map_err(|_| "CEX_MEXC_API_SECRET not set".to_string())?;
 
-        Ok(Self::new(&api_key, &api_secret))
+        Self::new(&api_key, &api_secret)
     }
 
     async fn fetch_symbol_info(&self, symbol: &str) -> Result<Option<(Value, String)>, String> {
         let mut direct_error = None;
-        let url = format!("https://api.mexc.com/api/v3/exchangeInfo?symbol={}", symbol);
+        let url = format!("{}/api/v3/exchangeInfo?symbol={}", self.api_base, symbol);
         let resp = self.http.get(url).send().await.map_err(|e| e.to_string())?;
         if resp.status().is_success() {
             let payload: Value = resp.json().await.map_err(|e| e.to_string())?;
@@ -386,7 +408,7 @@ impl MexcClient {
 
         let resp = self
             .http
-            .get("https://api.mexc.com/api/v3/exchangeInfo")
+            .get(format!("{}/api/v3/exchangeInfo", self.api_base))
             .send()
             .await
             .map_err(|e| e.to_string())?;
@@ -956,6 +978,11 @@ impl MexcClient {
 
 #[async_trait]
 impl CexBackend for MexcClient {
+    async fn get_taker_fee_bps(&self, market: &str) -> Result<f64, String> {
+        let filters = self.get_symbol_filters(market).await?;
+        Ok(Self::resolve_taker_fee_bps(filters.as_ref()).0)
+    }
+
     async fn get_quote(&self, market: &str, amount_in: f64) -> Result<f64, String> {
         let ex = self.inner.lock().await;
 
@@ -1438,6 +1465,75 @@ impl CexBackend for MexcClient {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "simulator")]
+    #[tokio::test]
+    #[ignore = "requires completed local MEXC custody proof; read-only history check"]
+    async fn simulator_mexc_history_contract() {
+        use super::*;
+        let client = MexcClient::from_env().expect("local exchange credentials");
+        let records = client
+            .inner
+            .lock()
+            .await
+            .withdraw_history(WithdrawHistoryRequest {
+                coin: Some("CKUSDT".to_string()),
+                ..Default::default()
+            })
+            .await
+            .expect("typed MEXC withdrawal history");
+        assert!(!records.is_empty());
+        for record in records {
+            let snapshot = client
+                .get_withdraw_status_snapshot_by_id("CKUSDT", &record.id)
+                .await
+                .unwrap();
+            assert_eq!(snapshot.status, WithdrawStatus::Completed);
+        }
+    }
+    #[cfg(feature = "simulator")]
+    #[tokio::test]
+    #[ignore = "requires a funded local MEXC workbench; performs actual local trades and withdrawal"]
+    async fn simulator_mexc_custody_contract() {
+        use super::*;
+        let client = MexcClient::from_env().expect("local exchange credentials");
+        let deposit = client
+            .get_deposit_address("CKBTC", "CKBTC")
+            .await
+            .expect("deposit address");
+        assert!(!deposit.address.is_empty());
+        let book = client.get_orderbook("BTC_USDT", Some(50)).await.expect("order book");
+        assert!(!book.bids.is_empty() && !book.asks.is_empty());
+        assert!(client.get_balance("CKBTC").await.unwrap() >= 0.001);
+        let first = client
+            .execute_swap_detailed("CKBTC_BTC", "sell", 0.001)
+            .await
+            .expect("CKBTC/BTC fill");
+        assert!(first.output_received > 0.0);
+        let btc = client.get_balance("BTC").await.unwrap();
+        let second = client
+            .execute_swap_detailed("BTC_USDT", "sell", btc)
+            .await
+            .expect("BTC/USDT fill");
+        assert!(second.output_received > 0.0);
+        let usdt = client.get_balance("USDT").await.unwrap();
+        let third = client
+            .execute_swap_detailed("CKUSDT_USDT", "buy", usdt)
+            .await
+            .expect("USDT/CKUSDT fill");
+        assert!(third.output_received > 0.0);
+        let ck = client.get_balance("CKUSDT").await.unwrap();
+        let destination = std::env::var("MEXC_TEST_WITHDRAW_ADDRESS").expect("local destination");
+        let receipt = client
+            .withdraw(
+                "CKUSDT",
+                "CKUSDT",
+                &destination,
+                (ck * 1_000_000.0).floor() / 1_000_000.0,
+            )
+            .await
+            .expect("withdrawal accepted");
+        println!("local MEXC withdrawal: {receipt:?}");
+    }
     use super::*;
 
     // Buy fill mapping should keep quote as input-consumed and apply fee haircut to base output.

@@ -494,6 +494,73 @@ where
             .map_err(|hop_err| format!("{}; {}", direct_err, hop_err))
     }
 
+    /// Compare configured simple paths using depth-aware net output for this
+    /// amount. Stable ordering breaks ties without introducing route churn.
+    pub(crate) async fn best_trade_legs_for_amount(
+        &self,
+        deposit_symbol: &str,
+        withdraw_symbol: &str,
+        amount: f64,
+    ) -> Result<Vec<TradeLeg>, String> {
+        let deposit = Self::normalize_symbol(deposit_symbol);
+        let withdraw = Self::normalize_symbol(withdraw_symbol);
+        if !amount.is_finite() || amount <= 0.0 {
+            return Err("route amount must be positive and finite".to_string());
+        }
+        if deposit == withdraw {
+            return Ok(vec![]);
+        }
+        let mut candidates = self.discover_hop_candidates(&deposit, &withdraw, self.cex_mexc_max_hops);
+        if let Ok(legacy) = self.resolve_trade_legs_for_symbols(&deposit, &withdraw).await {
+            candidates.push(legacy);
+        }
+        candidates.sort_by(|a, b| {
+            a.len()
+                .cmp(&b.len())
+                .then_with(|| Self::route_signature(a).cmp(&Self::route_signature(b)))
+        });
+        candidates.dedup_by(|a, b| Self::route_signature(a) == Self::route_signature(b));
+        let mut best = None;
+        let mut output = 0.0;
+        for candidate in candidates {
+            let quote: Result<f64, String> = async {
+                let mut net = amount;
+                for leg in &candidate {
+                    let (gross, _, _) = self.preview_leg(&leg.market, &leg.side, net).await?;
+                    let fee = self.backend.get_taker_fee_bps(&leg.market).await?;
+                    if !fee.is_finite() || !(0.0..10000.0).contains(&fee) {
+                        return Err("invalid venue fee".to_string());
+                    }
+                    net = gross * (1.0 - fee / BPS_PER_RATIO_UNIT);
+                }
+                Ok(net)
+            }
+            .await;
+            if let Ok(net) = quote {
+                if net.is_finite() && net > output {
+                    output = net;
+                    best = Some(candidate);
+                }
+            }
+        }
+        best.ok_or_else(|| format!("no fully executable route for {amount} {deposit} -> {withdraw}"))
+    }
+
+    pub(crate) async fn resolve_trade_legs_for_amount(
+        &self,
+        deposit: &str,
+        withdraw: &str,
+        amount: f64,
+    ) -> Result<Vec<TradeLeg>, String> {
+        // Opt in for simulator qualification first; existing deployments retain
+        // their compatibility routing until the new policy is explicitly chosen.
+        if std::env::var("CEX_MEXC_ROUTE_SELECTION").as_deref() == Ok("best-output") {
+            self.best_trade_legs_for_amount(deposit, withdraw, amount).await
+        } else {
+            self.resolve_trade_legs_for_symbols(deposit, withdraw).await
+        }
+    }
+
     /// Resolve route legs once, then always reuse persisted legs on subsequent calls.
     ///
     /// Persistence location:
@@ -507,9 +574,13 @@ where
         }
 
         let legs = self
-            .resolve_trade_legs_for_symbols(
+            .resolve_trade_legs_for_amount(
                 &<Self as BridgePlanner>::planned_deposit_asset(state),
                 &<Self as BridgePlanner>::planned_withdraw_asset(state),
+                state
+                    .trade
+                    .trade_next_amount_in
+                    .unwrap_or_else(|| state.size_in.to_f64()),
             )
             .await?;
         Self::persist_trade_legs(state, &legs);

@@ -136,6 +136,10 @@ pub trait CexBackend: Send + Sync {
     ) -> Result<SwapFillReport, CexBackendError>;
 
     async fn get_orderbook(&self, market: &str, limit: Option<u32>) -> Result<OrderBook, String>;
+    /// Conservative fallback for backends without symbol-specific fee metadata.
+    async fn get_taker_fee_bps(&self, _market: &str) -> Result<f64, String> {
+        Ok(10.0)
+    }
 
     // deposits
     async fn get_deposit_address(&self, asset: &str, network: &str) -> Result<DepositAddress, String>;

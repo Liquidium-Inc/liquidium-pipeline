@@ -4830,6 +4830,58 @@ async fn mexc_resolves_eth_to_usdc_via_usdt_special_route_without_direct_probe()
 }
 
 #[tokio::test]
+async fn mexc_best_output_route_accounts_for_amount_depth_and_hop_fees() {
+    let mut backend = MockCexBackend::new();
+    let high_fee = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let fee_switch = high_fee.clone();
+    backend.expect_get_taker_fee_bps().returning(move |market| {
+        Ok(
+            if market == "BTC_USDC" && fee_switch.load(std::sync::atomic::Ordering::SeqCst) {
+                2000.0
+            } else {
+                5.0
+            },
+        )
+    });
+    backend.expect_get_orderbook().returning(|market, _| {
+        let (price, quantity) = match market {
+            "BTC_USDT" => (100.0, 10.0),
+            "BTC_USDC" => (110.0, 1.0),
+            "USDC_USDT" => (1.0, 1000.0),
+            _ => return Err("unknown market".to_string()),
+        };
+        Ok(OrderBook {
+            bids: vec![OrderBookLevel { price, quantity }],
+            asks: vec![OrderBookLevel {
+                price: price * 1.001,
+                quantity,
+            }],
+        })
+    });
+    let finalizer = MexcFinalizer::new(
+        Arc::new(backend),
+        Arc::new(MockTransferActions::new()),
+        Principal::anonymous(),
+        TEST_MAX_SELL_SLIPPAGE_BPS,
+        TEST_CEX_MIN_EXEC_USD,
+        TEST_CEX_SLICE_TARGET_RATIO,
+    )
+    .with_route_config(vec!["BTC_USDT".into(), "BTC_USDC".into(), "USDC_USDT".into()], 2);
+    let small = finalizer.best_trade_legs_for_amount("BTC", "USDT", 0.5).await.unwrap();
+    assert_eq!(
+        small.iter().map(|leg| leg.market.as_str()).collect::<Vec<_>>(),
+        vec!["BTC_USDC", "USDC_USDT"]
+    );
+    let large = finalizer.best_trade_legs_for_amount("BTC", "USDT", 2.0).await.unwrap();
+    assert_eq!(large.len(), 1);
+    assert_eq!(large[0].market, "BTC_USDT");
+    high_fee.store(true, std::sync::atomic::Ordering::SeqCst);
+    let expensive = finalizer.best_trade_legs_for_amount("BTC", "USDT", 0.5).await.unwrap();
+    assert_eq!(expensive.len(), 1);
+    assert_eq!(expensive[0].market, "BTC_USDT");
+}
+
+#[tokio::test]
 async fn mexc_resolves_usdc_to_eth_via_usdt_special_route_without_direct_probe() {
     let mut backend = MockCexBackend::new();
     let transfers = MockTransferActions::new();
