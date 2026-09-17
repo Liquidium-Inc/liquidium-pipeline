@@ -1931,6 +1931,67 @@ async fn mexc_non_bridge_withdraw_behavior_unchanged() {
 }
 
 #[tokio::test]
+async fn mexc_direct_withdraw_waits_for_delivery_and_deducts_fee_once() {
+    use liquidium_pipeline_connectors::backend::cex_backend::{
+        WithdrawStatus, WithdrawStatusSnapshot, WithdrawalReceipt,
+    };
+    let mut cex = MockCexBackend::new();
+    cex.expect_withdraw().times(1).returning(|asset, network, _, amount| {
+        Ok(WithdrawalReceipt {
+            asset: asset.to_string(),
+            network: network.to_string(),
+            amount,
+            txid: None,
+            internal_id: Some("pending-direct".to_string()),
+        })
+    });
+    let mut poll = 0;
+    cex.expect_get_withdraw_status_snapshot_by_id()
+        .times(2)
+        .returning(move |_, id| {
+            assert_eq!(id, "pending-direct");
+            poll += 1;
+            Ok(WithdrawStatusSnapshot {
+                status: if poll == 1 {
+                    WithdrawStatus::Pending
+                } else {
+                    WithdrawStatus::Completed
+                },
+                txid: if poll == 1 { None } else { Some("ledger:42".to_string()) },
+                transaction_fee: Some(0.02),
+            })
+        });
+    let finalizer = MexcFinalizer::new(
+        Arc::new(cex),
+        Arc::new(MockTransferActions::new()),
+        Principal::anonymous(),
+        TEST_MAX_SELL_SLIPPAGE_BPS,
+        TEST_CEX_MIN_EXEC_USD,
+        TEST_CEX_SLICE_TARGET_RATIO,
+    );
+    let mut state = finalizer
+        .prepare("pending", &make_execution_receipt(130))
+        .await
+        .unwrap();
+    state.step = CexStep::Withdraw;
+    state.withdraw.size_out = Some(ChainTokenAmount::from_formatted(
+        state.withdraw.withdraw_asset.clone(),
+        1.0,
+    ));
+    for _ in 0..2 {
+        finalizer.withdraw(&mut state).await.unwrap();
+        assert!(matches!(state.step, CexStep::WithdrawPending));
+        assert_eq!(state.withdraw.size_out.as_ref().unwrap().to_f64(), 1.0);
+    }
+    finalizer.withdraw(&mut state).await.unwrap();
+    assert!(matches!(state.step, CexStep::Completed));
+    assert_eq!(state.withdraw.withdraw_txid.as_deref(), Some("ledger:42"));
+    assert_eq!(state.withdraw.size_out.as_ref().unwrap().to_f64(), 0.98);
+    finalizer.withdraw(&mut state).await.unwrap();
+    assert_eq!(state.withdraw.size_out.as_ref().unwrap().to_f64(), 0.98);
+}
+
+#[tokio::test]
 async fn mexc_native_icp_non_bridge_withdraw_uses_liquidator_account_id_hex() {
     let mut cex = MockCexBackend::new();
     let transfers = MockTransferActions::new();

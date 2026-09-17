@@ -591,10 +591,14 @@ fn parse_slippage_bps_from_env(primary: &str, default_bps: u32) -> Result<u32, S
 }
 
 fn parse_enabled_swap_venues_from_env() -> Result<Vec<String>, String> {
-    // The simulator exercises discovery, execution and settlement with funded
-    // local ledgers. Collateral remains in custody; no exchange is simulated.
+    // Retained-collateral workbenches have no venue. A managed local MEXC
+    // endpoint opts into real finalisation; its client validates loopback-only.
     if cfg!(feature = "simulator") {
-        return Ok(Vec::new());
+        return Ok(if env::var_os("SIM_MEXC_URL").is_some() {
+            vec!["mexc".to_string()]
+        } else {
+            Vec::new()
+        });
     }
     let raw = env::var("ENABLED_SWAP_VENUES").unwrap_or_else(|_| DEFAULT_ENABLED_SWAP_VENUES.to_string());
     let mut seen = HashSet::new();
@@ -1152,6 +1156,28 @@ mod tests {
             parse_enabled_swap_venues_from_env().unwrap(),
             vec!["icpswap".to_string(), "mexc".to_string()]
         );
+    }
+
+    #[cfg(feature = "simulator")]
+    #[test]
+    fn simulator_venues_require_a_local_exchange_configuration() {
+        let _guard = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        let previous = env::var_os("SIM_MEXC_URL");
+        unsafe {
+            env::remove_var("SIM_MEXC_URL");
+        }
+        assert!(parse_enabled_swap_venues_from_env().unwrap().is_empty());
+        unsafe {
+            env::set_var("SIM_MEXC_URL", "http://127.0.0.1:23009");
+        }
+        assert_eq!(parse_enabled_swap_venues_from_env().unwrap(), vec!["mexc"]);
+        unsafe {
+            if let Some(value) = previous {
+                env::set_var("SIM_MEXC_URL", value);
+            } else {
+                env::remove_var("SIM_MEXC_URL");
+            }
+        }
     }
 
     #[test]

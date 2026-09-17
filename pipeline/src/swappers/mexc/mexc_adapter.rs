@@ -1401,7 +1401,9 @@ impl CexBackend for MexcClient {
         let ex = self.inner.lock().await;
         let records = ex
             .withdraw_history(WithdrawHistoryRequest {
-                coin: Some(coin.to_string()),
+                // Match submission's exchange symbol: a case-sensitive history
+                // filter otherwise hides receipts for mixed-case CK symbols.
+                coin: Some(coin.trim().to_ascii_uppercase()),
                 status: None,
                 limit: Some(DEFAULT_WITHDRAW_HISTORY_LIMIT),
                 start_time: None,
@@ -1484,7 +1486,7 @@ mod tests {
         assert!(!records.is_empty());
         for record in records {
             let snapshot = client
-                .get_withdraw_status_snapshot_by_id("CKUSDT", &record.id)
+                .get_withdraw_status_snapshot_by_id("ckUSDT", &record.id)
                 .await
                 .unwrap();
             assert_eq!(snapshot.status, WithdrawStatus::Completed);

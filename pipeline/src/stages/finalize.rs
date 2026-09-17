@@ -304,19 +304,22 @@ where
                 continue;
             }
 
-            if cfg!(feature = "simulator") {
+            if cfg!(feature = "simulator") && std::env::var_os("SIM_MEXC_URL").is_none() {
                 // A settled liquidation is real, but selling its collateral is
                 // outside this workbench phase. Keep custody explicit in the
                 // existing WAL instead of reporting a fictitious swap/profit.
                 if !matches!(liq.change_tx.status, TransferStatus::Success) {
                     continue;
                 }
-                let wal_id = wal_id_by_liq.get(&liq_id)
+                let wal_id = wal_id_by_liq
+                    .get(&liq_id)
                     .ok_or_else(|| format!("missing WAL id for liquidation {liq_id}"))?;
                 wal_mark_operator_required_with_error(
-                    &*self.wal, wal_id,
+                    &*self.wal,
+                    wal_id,
                     "simulator: liquidation settled; collateral retained, exchange finalisation disabled".to_string(),
-                ).await?;
+                )
+                .await?;
                 info!(liquidation_id = %liq_id, "Simulator liquidation settled; collateral retained");
                 continue;
             }
@@ -445,9 +448,7 @@ where
                         // liquidation is not wrong, so it must not be failed:
                         // park it where an operator can see it, exactly as
                         // startup does for the same condition.
-                        if let Err(mark_error) =
-                            wal_mark_unresumable(&*self.wal, wal_id, err_msg.clone()).await
-                        {
+                        if let Err(mark_error) = wal_mark_unresumable(&*self.wal, wal_id, err_msg.clone()).await {
                             warn!("Failed to park unresumable WAL row {}: {}", wal_id, mark_error);
                         }
                         error!(

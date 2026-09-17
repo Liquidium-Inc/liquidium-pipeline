@@ -1115,8 +1115,46 @@ where
                 state.withdraw.withdraw_address = direct_destination;
             }
 
-            if state.withdraw.withdraw_id.is_some() || state.withdraw.withdraw_txid.is_some() {
+            if state
+                .withdraw
+                .withdraw_txid
+                .as_ref()
+                .is_some_and(|tx| !tx.trim().is_empty())
+            {
                 state.step = CexStep::Completed;
+                return Ok(());
+            }
+
+            if let Some(withdraw_id) = &state.withdraw.withdraw_id {
+                // A successful POST only reserves exchange funds. Direct CK
+                // withdrawals also need settlement evidence before reporting
+                // realised profit or making this leg terminal in the WAL.
+                let snapshot = self
+                    .backend
+                    .get_withdraw_status_snapshot_by_id(&planned_asset, withdraw_id)
+                    .await?;
+                match snapshot.status {
+                    WithdrawStatus::Failed | WithdrawStatus::Canceled => {
+                        return Err(format!(
+                            "cex withdraw failed for liq_id {} withdraw_id={withdraw_id}",
+                            state.liq_id
+                        ));
+                    }
+                    WithdrawStatus::Completed if snapshot.txid.as_ref().is_some_and(|tx| !tx.trim().is_empty()) => {
+                        if let Some(fee) = snapshot.transaction_fee {
+                            if !fee.is_finite() || fee < 0.0 || fee >= amount {
+                                return Err("invalid completed withdrawal fee".to_string());
+                            }
+                            state.withdraw.size_out = Some(ChainTokenAmount::from_formatted(
+                                state.withdraw.withdraw_asset.clone(),
+                                amount - fee,
+                            ));
+                        }
+                        state.withdraw.withdraw_txid = snapshot.txid;
+                        state.step = CexStep::Completed;
+                    }
+                    _ => state.step = CexStep::WithdrawPending,
+                }
                 return Ok(());
             }
 
@@ -1139,7 +1177,11 @@ where
             };
             state.withdraw.withdraw_id = receipt.internal_id.clone();
             state.withdraw.withdraw_txid = receipt.txid.clone();
-            state.step = CexStep::Completed;
+            state.step = if receipt.txid.as_ref().is_some_and(|tx| !tx.trim().is_empty()) {
+                CexStep::Completed
+            } else {
+                CexStep::WithdrawPending
+            };
             return Ok(());
         }
 

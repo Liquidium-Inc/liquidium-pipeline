@@ -366,6 +366,46 @@ async fn restart_with_an_outstanding_intent_requires_operator_instead_of_replayi
 }
 
 #[tokio::test]
+async fn restart_can_reconcile_a_direct_withdrawal_receipt_without_resubmission() {
+    use liquidium_pipeline_connectors::backend::cex_backend::{WithdrawStatus, WithdrawStatusSnapshot};
+    let mut restarted = finalizer();
+    Arc::get_mut(&mut restarted.backend)
+        .unwrap()
+        .expect_get_withdraw_status_snapshot_by_id()
+        .times(1)
+        .returning(|_, id| {
+            assert_eq!(id, "persisted-withdrawal");
+            Ok(WithdrawStatusSnapshot {
+                status: WithdrawStatus::Completed,
+                txid: Some("ledger:123".to_string()),
+                transaction_fee: Some(0.02),
+            })
+        });
+    let mut cex = restarted
+        .prepare_amount_scoped_state(
+            "receipt-poll",
+            ChainTokenAmount::from_raw(pay_token(), Nat::from(100_000_000u64)),
+            receive_token(),
+            None,
+        )
+        .unwrap();
+    cex.step = CexStep::WithdrawPending;
+    cex.withdraw.withdraw_id = Some("persisted-withdrawal".to_string());
+    cex.withdraw.size_out = Some(ChainTokenAmount::from_formatted(receive_token(), 10.0));
+    let progress = restarted
+        .advance_decoded_leg(MexcVenueExecutionState {
+            cex,
+            ready_to_advance: true,
+            intent_id: Some("lost-process-local-gate".to_string()),
+            operator_required: false,
+        })
+        .await
+        .unwrap();
+    assert_eq!(progress.status, VenueLegStatus::Completed);
+    assert_eq!(progress.result.unwrap().receive_amount, Nat::from(9_980_000u64));
+}
+
+#[tokio::test]
 async fn completed_leg_returns_a_result_without_parent_wal_access() {
     let finalizer = finalizer();
     let preview = MultiVenueAdapter::preview(&finalizer, &planning_context(), &request(100_000_000))
