@@ -21,6 +21,7 @@ type_complexity = "allow"
 [features]
 default = []
 plain-logs = []
+simulator = []
 
 [dependencies]
 liquidium-pipeline-core = { path = "../core" }

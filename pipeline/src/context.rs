@@ -142,11 +142,13 @@ impl<P: Provider<AnyNetwork> + WalletProvider<AnyNetwork> + Clone + 'static> Pip
         let bridge_agent = Arc::new(
             Agent::builder()
                 .with_url(config.ic_url.clone())
+                .with_verify_query_signatures(!cfg!(feature = "simulator"))
                 .with_identity(config.bridge_ic_identity.clone())
                 .with_max_tcp_error_retries(3)
                 .build()
                 .map_err(|e| PipelineContextError::Other(format!("ic agent(bridge) build: {e}")))?,
         );
+        configure_simulator_agent(&bridge_agent).map_err(PipelineContextError::Other)?;
         let icp_backend_bridge = Arc::new(IcpBackendImpl::new(bridge_agent));
 
         // Use provided EVM providers or fail
@@ -331,6 +333,17 @@ impl<P: Provider<AnyNetwork> + WalletProvider<AnyNetwork> + Clone + 'static> Pip
     }
 }
 
+fn configure_simulator_agent(_agent: &Agent) -> Result<(), String> {
+    #[cfg(feature = "simulator")]
+    {
+        // PocketIC uses its own root key. The workbench manager supplies the
+        // driver's exported key rather than trusting a production default.
+        let path = std::env::var("SIM_IC_ROOT_KEY").map_err(|e| format!("SIM_IC_ROOT_KEY: {e}"))?;
+        _agent.set_root_key(std::fs::read(path).map_err(|e| format!("PocketIC root key: {e}"))?);
+    }
+    Ok(())
+}
+
 fn setup_agents_and_provider(
     config: &Config,
 ) -> Result<
@@ -344,6 +357,7 @@ fn setup_agents_and_provider(
     let agent_main = Arc::new(
         Agent::builder()
             .with_url(config.ic_url.clone())
+            .with_verify_query_signatures(!cfg!(feature = "simulator"))
             .with_identity(config.liquidator_identity.clone())
             .with_max_tcp_error_retries(3)
             .build()
@@ -353,11 +367,15 @@ fn setup_agents_and_provider(
     let agent_trader = Arc::new(
         Agent::builder()
             .with_url(config.ic_url.clone())
+            .with_verify_query_signatures(!cfg!(feature = "simulator"))
             .with_identity(config.trader_identity.clone())
             .with_max_tcp_error_retries(3)
             .build()
             .map_err(|e| format!("ic agent(trader) build: {e}"))?,
     );
+
+    configure_simulator_agent(&agent_main)?;
+    configure_simulator_agent(&agent_trader)?;
 
     // Build a wallet-backed EVM RootProvider from config.evm_url and config.evm_private_key.
     let signer: PrivateKeySigner = config

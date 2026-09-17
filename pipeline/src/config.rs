@@ -235,6 +235,12 @@ impl Config {
         let home = config_dir();
 
         let ic_url = env::var("IC_URL").map_err(|_| "IC_URL not configured".to_string())?;
+        if cfg!(feature = "simulator") {
+            let url = reqwest::Url::parse(&ic_url).map_err(|e| format!("invalid simulator IC URL: {e}"))?;
+            if url.scheme() != "http" || url.host_str() != Some("127.0.0.1") {
+                return Err("simulator builds require a loopback PocketIC URL".to_string());
+            }
+        }
         let export_path_raw = env::var("EXPORT_PATH").unwrap_or(format!("{}/executions.csv", home));
         let export_path = expand_tilde(&export_path_raw).to_string_lossy().into_owned();
 
@@ -585,6 +591,11 @@ fn parse_slippage_bps_from_env(primary: &str, default_bps: u32) -> Result<u32, S
 }
 
 fn parse_enabled_swap_venues_from_env() -> Result<Vec<String>, String> {
+    // The simulator exercises discovery, execution and settlement with funded
+    // local ledgers. Collateral remains in custody; no exchange is simulated.
+    if cfg!(feature = "simulator") {
+        return Ok(Vec::new());
+    }
     let raw = env::var("ENABLED_SWAP_VENUES").unwrap_or_else(|_| DEFAULT_ENABLED_SWAP_VENUES.to_string());
     let mut seen = HashSet::new();
     let mut venues = Vec::new();

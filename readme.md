@@ -826,3 +826,21 @@ liquidator tui --log-file ./liquidator.log
 ## License
 
 MIT
+
+## Native simulator integration
+
+The parent `liquidium-pool-sim` workbench manager can build this executable with
+`--features simulator,plain-logs` and supervise `liquidator run` in the foreground.
+The simulator feature requires a loopback IC URL and the driver's exported
+`SIM_IC_ROOT_KEY`; main, trader and bridge agents use that local key.
+
+This build runs normal discovery, strategy, approvals, execution, settlement and
+SQLite persistence, but enables no swap venues. After successful settlement it
+retains collateral in the trader account and parks the row as `OperatorRequired`
+with an explicit custody reason. It does not claim a completed swap or realised
+trading profit. Default builds retain normal venue requirements and IC trust.
+
+Python owns the mnemonic, local configuration, logs and process lifecycle.
+`account show` writes public main/trader/bridge principals to `SIM_IDENTITY_FILE`
+in simulator builds. Use the workbench manager's enable, pause, resume and stop
+commands rather than installing an independent liquidator service.

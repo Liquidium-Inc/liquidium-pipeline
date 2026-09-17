@@ -116,7 +116,11 @@ enum AccountCommands {
 /// successfully.
 #[tokio::main]
 async fn main() -> ExitCode {
-    load_env();
+    // Python supplies the complete simulator environment. dotenv searches parent
+    // directories too, so an isolated HOME alone cannot exclude host settings.
+    if !cfg!(feature = "simulator") {
+        load_env();
+    }
     let cli = Cli::parse();
     let running_under_systemd = is_systemd_service_process();
 

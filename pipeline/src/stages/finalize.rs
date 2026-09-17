@@ -304,6 +304,23 @@ where
                 continue;
             }
 
+            if cfg!(feature = "simulator") {
+                // A settled liquidation is real, but selling its collateral is
+                // outside this workbench phase. Keep custody explicit in the
+                // existing WAL instead of reporting a fictitious swap/profit.
+                if !matches!(liq.change_tx.status, TransferStatus::Success) {
+                    continue;
+                }
+                let wal_id = wal_id_by_liq.get(&liq_id)
+                    .ok_or_else(|| format!("missing WAL id for liquidation {liq_id}"))?;
+                wal_mark_operator_required_with_error(
+                    &*self.wal, wal_id,
+                    "simulator: liquidation settled; collateral retained, exchange finalisation disabled".to_string(),
+                ).await?;
+                info!(liquidation_id = %liq_id, "Simulator liquidation settled; collateral retained");
+                continue;
+            }
+
             debug!(
                 "[finalize] 🧾 executing receipt: liq_id={} debt_asset={} collateral_asset={} debt_repaid={} collateral_received={} swap={} swap_pay={} swap_recv={}",
                 liq_id,

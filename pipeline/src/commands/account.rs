@@ -22,6 +22,15 @@ pub async fn show() -> Result<()> {
 
     match config.await {
         Ok(config) => {
+            if cfg!(feature = "simulator") {
+                let identity_path = env::var("SIM_IDENTITY_FILE")?;
+                fs::write(identity_path, serde_json::to_vec_pretty(&serde_json::json!({
+                    "liquidator": config.liquidator_principal.to_text(),
+                    "trader": config.trader_principal.to_text(),
+                    "bridge": config.bridge_ic_owner_principal.to_text(),
+                }))?)?;
+                return Ok(());
+            }
             let recovery = Account {
                 owner: config.liquidator_principal,
                 subaccount: Some(*RECOVERY_ACCOUNT),
