@@ -38,6 +38,11 @@ impl SqliteWalStore {
         let mut conn = pool
             .get()
             .with_context(|| format!("open sqlite connection (mode=rw path={path})"))?;
+        // The control plane opens a second store after execution tasks start.
+        // Schema setup can contend with their writes; install the busy timeout
+        // before any schema or journal-mode operation, not just afterwards.
+        conn.batch_execute(&format!("PRAGMA busy_timeout = {busy_timeout_ms};"))
+            .context("set sqlite startup busy timeout")?;
         initialize_schema(&mut conn).with_context(|| format!("initialize sqlite schema (path={path})"))?;
         apply_pragmas(&mut conn, busy_timeout_ms)
             .with_context(|| format!("apply sqlite pragmas (mode=rw path={path})"))?;
@@ -397,6 +402,22 @@ fn apply_read_only_pragmas(conn: &mut SqliteConnection, busy_timeout_ms: i64) ->
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn startup_schema_waits_for_existing_writer() {
+        use diesel::Connection;
+        use diesel::connection::SimpleConnection;
+
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let path = file.path().to_str().unwrap().to_owned();
+        let _store = super::SqliteWalStore::new(&path).unwrap();
+        let mut writer = diesel::SqliteConnection::establish(&path).unwrap();
+        writer.batch_execute("BEGIN IMMEDIATE;").unwrap();
+        let opening = std::thread::spawn(move || super::SqliteWalStore::new_with_busy_timeout(&path, 2_000));
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        writer.batch_execute("COMMIT;").unwrap();
+        assert!(opening.join().unwrap().is_ok());
+    }
+
     use std::sync::Arc;
 
     use crate::persistance::{LiqResultRecord, ResultStatus, WalStore, now_secs};

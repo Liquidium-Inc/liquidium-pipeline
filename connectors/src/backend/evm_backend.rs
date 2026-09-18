@@ -150,16 +150,25 @@ where
                         sleep(Duration::from_millis(backoff_ms)).await;
                         continue;
                     }
-                    return Err(format!("ERC20 approve(spender={spender}) failed for token {token}: {err}"));
+                    return Err(format!(
+                        "ERC20 approve(spender={spender}) failed for token {token}: {err}"
+                    ));
                 }
             }
         };
         let tx_hash = *pending.tx_hash();
 
-        pending
-            .watch()
+        let receipt = pending
+            .get_receipt()
             .await
             .map_err(|e| format!("ERC20 approve confirmation failed for token {token}: {e}"))?;
+
+        // Inclusion alone is not approval: a reverted/out-of-gas transaction
+        // consumes a nonce but changes no allowance. Never submit a helper call
+        // against an approval whose receipt failed.
+        if !receipt.status() {
+            return Err(format!("ERC20 approval {tx_hash:#x} reverted for token {token}"));
+        }
 
         Ok(tx_hash)
     }
@@ -272,3 +281,4 @@ mod tests {
         assert!(!is_nonce_too_low_error("insufficient funds for gas * price + value"));
     }
 }
+use alloy::network::ReceiptResponse;

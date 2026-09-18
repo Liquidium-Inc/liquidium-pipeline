@@ -333,7 +333,7 @@ impl<P: Provider<AnyNetwork> + WalletProvider<AnyNetwork> + Clone + 'static> Pip
     }
 }
 
-fn configure_simulator_agent(_agent: &Agent) -> Result<(), String> {
+pub(crate) fn configure_simulator_agent(_agent: &Agent) -> Result<(), String> {
     #[cfg(feature = "simulator")]
     {
         // PocketIC uses its own root key. The workbench manager supplies the

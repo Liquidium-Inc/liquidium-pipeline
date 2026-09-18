@@ -406,6 +406,67 @@ async fn restart_can_reconcile_a_direct_withdrawal_receipt_without_resubmission(
 }
 
 #[tokio::test]
+async fn restart_polls_a_persisted_helper_instead_of_parking_or_resubmitting() {
+    use crate::finalizers::mexc::mexc_finalizer::{MexcBridgeConfig, MexcBridgeDependencies};
+    use icrc_ledger_types::icrc1::account::Account;
+    use liquidium_pipeline_connectors::backend::bridge_backend::{BridgeStatus, MockBridgeBackend};
+
+    let mut bridge = MockBridgeBackend::new();
+    bridge.expect_get_bridge_status().times(1).returning(|id| {
+        assert_eq!(id, "persisted-helper");
+        Ok(BridgeStatus::Pending)
+    });
+    bridge.expect_submit_bridge().times(0);
+    let restarted = finalizer().with_bridge_dependencies(MexcBridgeDependencies {
+        backend: Arc::new(bridge),
+        config: MexcBridgeConfig {
+            bridge_ic_source_account: Account {
+                owner: Principal::anonymous(),
+                subaccount: None,
+            },
+            bridge_evm_source_address: "0x2222222222222222222222222222222222222222".into(),
+            bridge_btc_source_address: String::new(),
+        },
+    });
+    let mut cex = restarted
+        .prepare_amount_scoped_state(
+            "bridge-receipt-poll",
+            ChainTokenAmount::from_raw(pay_token(), Nat::from(100_000_000u64)),
+            receive_token(),
+            None,
+        )
+        .unwrap();
+    cex.withdraw.withdraw_asset = ChainToken::Icp {
+        ledger: Principal::from_text("xevnm-gaaaa-aaaar-qafnq-cai").unwrap(),
+        symbol: "ckUSDC".into(),
+        decimals: 6,
+        fee: Nat::from(10_000u64),
+    };
+    cex.step = CexStep::WithdrawPending;
+    cex.withdraw.withdraw_id = Some("persisted-withdrawal".into());
+    cex.withdraw.size_out = Some(ChainTokenAmount::from_formatted(
+        cex.withdraw.withdraw_asset.clone(),
+        10.0,
+    ));
+    cex.withdraw.bridge.withdraw_bridge_required = true;
+    cex.withdraw.bridge.withdraw_bridge_id = Some("persisted-helper".into());
+    cex.withdraw.bridge.withdraw_planned_asset = Some("USDC".into());
+    cex.withdraw.bridge.withdraw_planned_network = Some("ETH".into());
+    let progress = restarted
+        .advance_decoded_leg(MexcVenueExecutionState {
+            cex,
+            ready_to_advance: true,
+            intent_id: Some("lost-process-local-gate".into()),
+            operator_required: false,
+        })
+        .await
+        .unwrap();
+    assert_eq!(progress.status, VenueLegStatus::Running);
+    assert!(progress.last_error.is_none());
+    assert!(progress.result.is_none());
+}
+
+#[tokio::test]
 async fn completed_leg_returns_a_result_without_parent_wal_access() {
     let finalizer = finalizer();
     let preview = MultiVenueAdapter::preview(&finalizer, &planning_context(), &request(100_000_000))

@@ -269,7 +269,8 @@ fn mexc_deposit_asset_candidates(asset: &str) -> Vec<String> {
         candidates.push(format!("CK{}", asset_upper));
     }
 
-    candidates.sort();
+    // Try the requested asset before its CK alias. Sorting puts CKETH before
+    // ETH and can select IC custody for a native Ethereum bridge deposit.
     candidates.dedup();
     candidates
 }
@@ -455,6 +456,15 @@ impl MexcClient {
         };
         if resolved_symbol != symbol {
             debug!("[mexc] resolved symbol filters {} -> {}", symbol, resolved_symbol);
+        }
+
+        // Route execution uses MARKET orders. A listed LIMIT-only market is
+        // not executable by this adapter and must fail during quoting, before
+        // collateral is deposited or an earlier route leg is committed.
+        if info.get("orderTypes").and_then(Value::as_array).is_some_and(|types| {
+            !types.iter().any(|kind| kind.as_str() == Some("MARKET"))
+        }) {
+            return Err(format!("MEXC market {resolved_symbol} does not support MARKET orders"));
         }
 
         let mut filters = SymbolFilters::default();
@@ -1232,7 +1242,9 @@ impl CexBackend for MexcClient {
 
                 let addr = res.iter().find(|item| {
                     let item_network = item.network.to_ascii_uppercase();
-                    candidates.iter().any(|cand| item_network.contains(cand))
+                    // Network names identify distinct custody protocols: ETH
+                    // must never match CKETH merely because it is a substring.
+                    candidates.iter().any(|cand| item_network == *cand)
                 });
 
                 if let Some(v) = addr {
@@ -1467,6 +1479,14 @@ impl CexBackend for MexcClient {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn native_deposit_candidates_preserve_asset_and_network() {
+        assert_eq!(super::mexc_deposit_asset_candidates("ETH"), vec!["ETH", "CKETH"]);
+        let networks = super::mexc_network_candidates("ETH", "ETH");
+        assert!(networks.contains(&"ETH".to_string()));
+        assert!(!networks.contains(&"CKETH".to_string()));
+        assert!(!networks.contains(&"ICP".to_string()));
+    }
     #[cfg(feature = "simulator")]
     #[tokio::test]
     #[ignore = "requires completed local MEXC custody proof; read-only history check"]

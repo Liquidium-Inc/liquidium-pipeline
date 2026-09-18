@@ -1152,8 +1152,11 @@ where
                 }
             };
 
-            // Skip very small residuals below min execution notional to avoid bad fills / fees.
-            if self
+            // The configured dust floor trims leftovers after a fill; it must
+            // not discard an entire committed leg when prices fall below that
+            // floor during deposit settlement. Exchange lot/minimum checks still
+            // apply to the first fill, and zero output must never reach withdrawal.
+            if total_out > 0.0 && self
                 .maybe_mark_trade_dust(state, leg, preview.chunk_in, remaining_in)
                 .await?
             {

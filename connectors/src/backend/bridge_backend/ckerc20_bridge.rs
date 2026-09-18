@@ -85,6 +85,8 @@ fn eth_forward_gas_reserve_from_price(gas_price_wei: u128, gas_limit: u128) -> U
 pub trait BridgeEvmBackend: Send + Sync {
     fn signer_address(&self) -> Address;
 
+    async fn has_pending_transactions(&self) -> Result<bool, String>;
+
     async fn native_balance_of(&self, owner: Address) -> Result<U256, String>;
     async fn native_tx_gas_reserve(&self, gas_limit: u128) -> Result<U256, String>;
     async fn erc20_balance_of(&self, token: Address, owner: Address) -> Result<U256, String>;
@@ -166,6 +168,22 @@ where
 
     async fn erc20_approve_and_wait(&self, token: Address, spender: Address, amount: U256) -> Result<TxHash, String> {
         self.erc20_approve_and_wait_raw(token, spender, amount).await
+    }
+
+    async fn has_pending_transactions(&self) -> Result<bool, String> {
+        let signer = self.signer_address();
+        let latest = self
+            .provider
+            .get_transaction_count(signer)
+            .await
+            .map_err(|e| e.to_string())?;
+        let pending = self
+            .provider
+            .get_transaction_count(signer)
+            .pending()
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(pending > latest)
     }
 
     async fn helper_deposit_native(
@@ -262,6 +280,7 @@ where
     pub evm_backend: Arc<E>,
     pub cketh_minter_canister: Principal,
     pub bridge_ic_owner_principal: Principal,
+    forward_submission: tokio::sync::Mutex<()>,
 }
 
 impl<A, B, E> CkErc20BridgeBackend<A, B, E>
@@ -283,6 +302,7 @@ where
             evm_backend,
             cketh_minter_canister,
             bridge_ic_owner_principal,
+            forward_submission: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -502,6 +522,14 @@ where
         route: &BridgeRouteSpec,
         request: &BridgeRequest,
     ) -> Result<BridgeSubmission, String> {
+        // Exact approvals replace a wallet's allowance; overlapping deposits can
+        // consume it or overwrite it between preflight and helper execution.
+        // Serialise this backend's submissions and defer while the RPC still has
+        // an unmined wallet transaction, including after a normal restart.
+        let _submission = self.forward_submission.lock().await;
+        if self.evm_backend.has_pending_transactions().await? {
+            return Err("bridge wallet has pending transactions; retry after inclusion".into());
+        }
         let token_address = parse_evm_token_address(route)?;
 
         let signer = self.evm_backend.signer_address();
@@ -551,6 +579,13 @@ where
                 .map_err(|e| format!("ERC20 approve(helper={helper_address}) failed: {e}"))?;
         }
 
+        let expectation = serde_json::to_string(&super::mint_events::DepositExpectation {
+            amount: amount_base_units.to_string(),
+            recipient: *destination_account,
+            token_symbol: route.target_asset.to_string(),
+        })
+        .map_err(|e| e.to_string())?;
+        let event_start = super::mint_events::count(self.agent.as_ref(), &self.cketh_minter_canister).await?;
         let tx_hash = match helper {
             HelperContract::WithSubaccount(address) => self
                 .evm_backend
@@ -572,7 +607,7 @@ where
 
         // Return the submitted tx hash; completion is tracked asynchronously via get_bridge_status.
         Ok(BridgeSubmission {
-            bridge_id: format!("{:#x}", tx_hash),
+            bridge_id: format!("ckmint:{event_start}:{tx_hash:#x}:{expectation}"),
         })
     }
 
@@ -628,6 +663,13 @@ where
             ));
         }
 
+        let expectation = serde_json::to_string(&super::mint_events::DepositExpectation {
+            amount: amount_wei.to_string(),
+            recipient: *destination_account,
+            token_symbol: route.target_asset.to_string(),
+        })
+        .map_err(|e| e.to_string())?;
+        let event_start = super::mint_events::count(self.agent.as_ref(), &self.cketh_minter_canister).await?;
         let tx_hash = match helper {
             HelperContract::WithSubaccount(address) => self
                 .evm_backend
@@ -647,7 +689,7 @@ where
         };
 
         Ok(BridgeSubmission {
-            bridge_id: format!("{:#x}", tx_hash),
+            bridge_id: format!("ckmint:{event_start}:{tx_hash:#x}:{expectation}"),
         })
     }
 
@@ -1012,10 +1054,38 @@ where
 
     async fn get_bridge_status(&self, bridge_id: &str) -> Result<BridgeStatus, String> {
         if bridge_id.starts_with("ic-withdraw:") || bridge_id.starts_with("ic-withdraw-eth:") {
+            // The reverse-route caller separately requires the exchange deposit
+            // credit before trading. This legacy status releases that polling
+            // phase; it is not evidence of an Ethereum payout or destination mint.
             return Ok(BridgeStatus::Completed);
         }
 
-        let tx_hash = bridge_id
+        // New handles persist the audit-log boundary taken before submission.
+        // Older WALs contain only a hash and must scan from genesis; never treat
+        // those receipts as completed just because their helper call succeeded.
+        let (event_start, transaction_hash, expectation) = if let Some(handle) = bridge_id.strip_prefix("ckmint:") {
+            let (start, hash) = handle.split_once(':').ok_or("invalid ckmint handle")?;
+            let (hash, expectation) = match hash.split_once(':') {
+                Some((hash, json)) => (
+                    hash,
+                    Some(
+                        serde_json::from_str::<super::mint_events::DepositExpectation>(json)
+                            .map_err(|e| e.to_string())?,
+                    ),
+                ),
+                None => (hash, None),
+            };
+            (
+                start
+                    .parse::<u64>()
+                    .map_err(|e| format!("invalid mint event cursor: {e}"))?,
+                hash,
+                expectation,
+            )
+        } else {
+            (0, bridge_id, None)
+        };
+        let tx_hash = transaction_hash
             .parse::<TxHash>()
             .map_err(|e| format!("invalid bridge id '{}': expected EVM tx hash: {e}", bridge_id))?;
 
@@ -1030,7 +1100,26 @@ where
         };
 
         if receipt.success {
-            return Ok(BridgeStatus::Completed);
+            return Ok(
+                match super::mint_events::receipt(
+                    self.agent.as_ref(),
+                    &self.cketh_minter_canister,
+                    event_start,
+                    transaction_hash,
+                )
+                .await?
+                {
+                    Some(receipt) => {
+                        if expectation.as_ref().is_some_and(|expected| !expected.matches(&receipt)) {
+                            return Err(
+                                "mint evidence does not match the submitted amount, token and destination".into(),
+                            );
+                        }
+                        BridgeStatus::Minted(receipt)
+                    }
+                    None => BridgeStatus::Pending,
+                },
+            );
         }
 
         Ok(BridgeStatus::Failed {

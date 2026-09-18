@@ -179,7 +179,7 @@ pub async fn build_mexc_finalizer(ctx: &PipelineContext) -> Result<Arc<MexcFinal
         .map_err(|err| format!("Cex credentials not found: {err}"))?;
 
     let mexc_client = Arc::new(MexcClient::new(&api_key, &secret)?);
-    if cfg!(feature = "simulator") {
+    if cfg!(feature = "simulator") && std::env::var_os("SIM_MEXC_BRIDGE").is_none() {
         // The local exchange advertises CK custody directly. Attaching the
         // production bridge would turn a CK withdrawal into an unsupported
         // native-chain route and query mainnet bridge dependencies at startup.
@@ -245,10 +245,12 @@ pub async fn build_mexc_finalizer(ctx: &PipelineContext) -> Result<Arc<MexcFinal
         Agent::builder()
             .with_url(config.ic_url.clone())
             .with_identity(config.bridge_ic_identity.clone())
+            .with_verify_query_signatures(!cfg!(feature = "simulator"))
             .with_max_tcp_error_retries(3)
             .build()
             .map_err(|e| format!("ic agent(bridge finalizer) build: {e}"))?,
     );
+    crate::context::configure_simulator_agent(&bridge_agent)?;
     let bridge_backend = Arc::new(CkErc20BridgeBackend::new(
         bridge_agent.clone(),
         Arc::new(IcpBackendImpl::new(bridge_agent)),

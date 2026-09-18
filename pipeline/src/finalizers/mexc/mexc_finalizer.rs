@@ -689,7 +689,9 @@ where
             }
 
             Self::ensure_minimum_bridge_amount(bridge, route, &transfer_amount).await?;
-            let bridge_submit_amount = transfer_amount.to_f64();
+            let bridge_submit_amount = liquidium_pipeline_connectors::backend::amount_utils::nat_units_to_spend_amount(
+                &transfer_amount.value, transfer_amount.token.decimals(),
+            )?;
             let bridge_expected_amount = Self::compute_expected_bridge_deposit_amount(
                 route,
                 bridge_submit_amount,
@@ -850,7 +852,7 @@ where
             .clone()
             .ok_or_else(|| "missing bridge id while polling bridged deposit".to_string())?;
         match bridge.backend.get_bridge_status(&bridge_id).await? {
-            BridgeStatus::Completed => {
+            BridgeStatus::Completed | BridgeStatus::Minted(_) => {
                 self.check_deposit(state).await?;
                 if !matches!(state.step, CexStep::Trade) {
                     state.step = CexStep::DepositPending;
@@ -1422,6 +1424,31 @@ where
             .ok_or_else(|| "missing bridge id while polling bridged withdraw".to_string())?;
         state.withdraw.bridge.withdraw_bridge_polled_at_ts = Some(now_ts());
         match bridge.backend.get_bridge_status(&bridge_id).await? {
+            BridgeStatus::Minted(receipt) => {
+                let destination = state
+                    .withdraw
+                    .bridge
+                    .withdraw_bridge_destination_snapshot
+                    .as_deref()
+                    .ok_or("missing expected mint destination")?;
+                let expected = <Self as BridgePlanner>::parse_icp_account_like(destination)?;
+                if receipt.recipient != expected
+                    || !receipt
+                        .token_symbol
+                        .eq_ignore_ascii_case(&state.withdraw.withdraw_asset.symbol())
+                {
+                    return Err("minter receipt does not match the committed return destination/token".to_string());
+                }
+                // Report destination credit, not the pre-withdrawal trade output:
+                // exchange fees and bridge source adjustments have already reduced it.
+                state.withdraw.size_out = Some(ChainTokenAmount::from_raw(
+                    state.withdraw.withdraw_asset.clone(),
+                    receipt.amount.clone(),
+                ));
+                state.withdraw.bridge.withdraw_bridge_mint_receipt = Some(receipt);
+                state.step = CexStep::Completed;
+                Ok(())
+            }
             BridgeStatus::Completed => {
                 state.step = CexStep::Completed;
                 Ok(())

@@ -28,6 +28,7 @@ pub async fn show() -> Result<()> {
                     "liquidator": config.liquidator_principal.to_text(),
                     "trader": config.trader_principal.to_text(),
                     "bridge": config.bridge_ic_owner_principal.to_text(),
+                    "bridgeEvm": config.bridge_evm_address,
                 }))?)?;
                 return Ok(());
             }

@@ -1533,14 +1533,30 @@ async fn mexc_withdraw_bridge_submit_resume_complete_and_idempotent() {
 
     let bridge_status_calls = Arc::new(std::sync::Mutex::new(0u8));
     let bridge_status_calls_clone = bridge_status_calls.clone();
-    bridge.expect_get_bridge_status().times(2).returning(move |bridge_id| {
+    bridge.expect_get_bridge_status().times(3).returning(move |bridge_id| {
         assert_eq!(bridge_id, "bridge-withdraw-1");
         let mut guard = bridge_status_calls_clone.lock().expect("mutex");
         *guard += 1;
         if *guard == 1 {
             Ok(BridgeStatus::Pending)
         } else {
-            Ok(BridgeStatus::Completed)
+            Ok(BridgeStatus::Minted(
+                liquidium_pipeline_connectors::backend::bridge_backend::BridgeMintReceipt {
+                    transaction_hash: "0xhelper".into(),
+                    log_index: Nat::from(1u64),
+                    mint_block_index: Nat::from(42u64),
+                    amount: Nat::from(1_500_000u64),
+                    recipient: Account {
+                        owner: if *guard == 2 {
+                            Principal::anonymous()
+                        } else {
+                            Principal::management_canister()
+                        },
+                        subaccount: None,
+                    },
+                    token_symbol: "ckUSDC".into(),
+                },
+            ))
         }
     });
 
@@ -1593,11 +1609,29 @@ async fn mexc_withdraw_bridge_submit_resume_complete_and_idempotent() {
         .expect("bridge pending should keep pending");
     assert!(matches!(state.step, CexStep::WithdrawPending));
 
+    // Reconstruct the durable state before polling; neither the exchange
+    // withdrawal nor the helper deposit may be submitted a second time.
+    state = serde_json::from_str(&serde_json::to_string(&state).unwrap()).unwrap();
+    let error = finalizer.withdraw(&mut state).await.unwrap_err();
+    assert!(error.contains("destination/token"));
+    assert!(matches!(state.step, CexStep::WithdrawPending));
+    assert!(state.withdraw.bridge.withdraw_bridge_mint_receipt.is_none());
+
     finalizer
         .withdraw(&mut state)
         .await
         .expect("bridge completion should finish");
     assert!(matches!(state.step, CexStep::Completed));
+    let saved: CexState = serde_json::from_str(&serde_json::to_string(&state).unwrap()).unwrap();
+    assert_eq!(
+        saved
+            .withdraw
+            .bridge
+            .withdraw_bridge_mint_receipt
+            .unwrap()
+            .mint_block_index,
+        Nat::from(42u64)
+    );
 }
 
 #[tokio::test]
@@ -3046,7 +3080,7 @@ async fn mexc_trade_propagates_backend_errors() {
 }
 
 #[tokio::test]
-async fn mexc_trade_marks_dust_and_skips_execution_for_small_residual() {
+async fn mexc_trade_marks_dust_only_after_a_fill() {
     let mut backend = MockCexBackend::new();
     let transfers = MockTransferActions::new();
 
@@ -3106,6 +3140,9 @@ async fn mexc_trade_marks_dust_and_skips_execution_for_small_residual() {
     state.withdraw.bridge.withdraw_planned_network = Some("ICP".to_string());
     state.withdraw.bridge.withdraw_bridge_required = false;
 
+    // Resume a partially filled leg: only its remaining input may be dust.
+    state.trade.trade_progress_total_out = Some(0.02);
+
     finalizer
         .trade(&mut state)
         .await
@@ -3116,7 +3153,29 @@ async fn mexc_trade_marks_dust_and_skips_execution_for_small_residual() {
     assert!(state.trade.trade_slices.is_empty());
     assert!(matches!(state.step, CexStep::Withdraw));
     let out = state.withdraw.size_out.as_ref().expect("size_out should be set");
-    assert_eq!(out.to_f64(), 0.0);
+    assert_eq!(out.to_f64(), 0.02);
+}
+
+#[tokio::test]
+async fn mexc_committed_leg_below_dust_floor_still_executes() {
+    let mut backend = MockCexBackend::new();
+    backend.expect_get_orderbook().returning(|_, _| Ok(OrderBook {
+        bids: vec![OrderBookLevel { price: 1.0, quantity: 100.0 }],
+        asks: vec![OrderBookLevel { price: 1.001, quantity: 100.0 }],
+    }));
+    backend.expect_execute_swap_detailed_with_options().times(1).returning(|_, _, amount, _| {
+        Ok(SwapFillReport { input_consumed: amount, output_received: amount })
+    });
+    let finalizer = MexcFinalizer::new(
+        Arc::new(backend), Arc::new(MockTransferActions::new()), Principal::anonymous(),
+        TEST_MAX_SELL_SLIPPAGE_BPS, 1_000.0, TEST_CEX_SLICE_TARGET_RATIO,
+    );
+    let mut state = finalizer.prepare("dust-crossing", &make_execution_receipt(42)).await.unwrap();
+    let leg = TradeLeg { market: "CKBTC_BTC".to_string(), side: "sell".to_string() };
+    let (remaining, output) = finalizer.execute_trade_leg_slices(&mut state, &leg, 0, 1, 0.01, 50.0).await.unwrap();
+    assert_eq!(remaining, 0.0);
+    assert_eq!(output, 0.01);
+    assert!(!state.trade.trade_dust_skipped);
 }
 
 #[tokio::test]

@@ -132,12 +132,14 @@ where
             .lock()
             .map_err(|_| "MEXC multi-venue intent lock poisoned".to_string())?
             .remove(&intent_id);
-        // A direct withdrawal with a persisted exchange ID only reads history.
-        // Losing the in-memory gate across an ordinary restart cannot duplicate
-        // that transfer; bridged withdrawals may still submit a bridge action.
+        // Once the exchange ID (direct route) or helper ID (bridged route) is
+        // durable, this phase only reads settlement evidence. A normal restart
+        // cannot duplicate that submission. A bridged withdrawal without its
+        // helper ID still needs the submission gate: it may initiate a deposit.
         let receipt_poll = execution.cex.step == CexStep::WithdrawPending
-            && !execution.cex.withdraw.bridge.withdraw_bridge_required
-            && execution.cex.withdraw.withdraw_id.is_some();
+            && execution.cex.withdraw.withdraw_id.is_some()
+            && (!execution.cex.withdraw.bridge.withdraw_bridge_required
+                || execution.cex.withdraw.bridge.withdraw_bridge_id.is_some());
         if !armed_here && !receipt_poll {
             return self.operator_required_progress(
                 execution,

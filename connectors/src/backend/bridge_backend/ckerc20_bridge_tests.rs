@@ -18,6 +18,22 @@ use super::{
     parse_source_icp_account, resolve_cketh_route_for_request,
 };
 
+fn expect_event_boundary(agent: &mut MockPipelineAgent) {
+    #[derive(candid::CandidType)]
+    struct Events {
+        events: Vec<u64>,
+        total_event_count: u64,
+    }
+    agent.expect_call_query_raw().times(1).returning(|_, method, _| {
+        assert_eq!(method, "get_events");
+        Ok(candid::encode_one(Events {
+            events: vec![],
+            total_event_count: 42,
+        })
+        .unwrap())
+    });
+}
+
 #[test]
 fn destination_account_encodes_principal_and_default_subaccount() {
     let account = Account {
@@ -175,6 +191,81 @@ fn reverse_source_must_match_bridge_owner_and_be_owner_only() {
 }
 
 #[tokio::test]
+async fn successful_helper_receipt_without_a_minter_credit_stays_pending() {
+    let hash = TxHash::from([8; 32]);
+    let mut evm = MockBridgeEvmBackend::new();
+    evm.expect_receipt_status().with(eq(hash)).times(1).returning(|_| {
+        Ok(Some(super::EvmReceiptStatus {
+            success: true,
+            block_number: Some(100),
+        }))
+    });
+    let mut agent = MockPipelineAgent::new();
+    expect_event_boundary(&mut agent);
+    let backend = CkErc20BridgeBackend::new(
+        Arc::new(agent),
+        Arc::new(MockIcpBackend::new()),
+        Arc::new(evm),
+        Principal::management_canister(),
+        Principal::management_canister(),
+    );
+    assert!(matches!(
+        backend
+            .get_bridge_status(&format!("ckmint:42:{hash:#x}"))
+            .await
+            .unwrap(),
+        super::BridgeStatus::Pending
+    ));
+}
+
+#[tokio::test]
+async fn forward_bridge_serialises_preflight_and_defers_pending_wallet_after_restart() {
+    for _ in 0..2 {
+        let mut evm = MockBridgeEvmBackend::new();
+        evm.expect_has_pending_transactions().times(1).returning(|| Ok(true));
+        evm.expect_erc20_approve_and_wait().times(0);
+        evm.expect_helper_deposit_native().times(0);
+        evm.expect_helper_deposit_with_subaccount().times(0);
+        let backend = CkErc20BridgeBackend::new(
+            Arc::new(MockPipelineAgent::new()),
+            Arc::new(MockIcpBackend::new()),
+            Arc::new(evm),
+            Principal::management_canister(),
+            Principal::management_canister(),
+        );
+        let request = BridgeRequest {
+            asset: "USDC".into(),
+            source_chain: "ETH".into(),
+            source_address: "0x1111111111111111111111111111111111111111".into(),
+            target_asset: "ckUSDC".into(),
+            destination: BridgeDestination::IcpAccount(Account {
+                owner: Principal::management_canister(),
+                subaccount: None,
+            }),
+            amount: 1.0,
+            provider_fee_budget_native_units: None,
+        };
+        let guard = backend.forward_submission.lock().await;
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(10),
+                backend.submit_bridge(request.clone())
+            )
+            .await
+            .is_err()
+        );
+        drop(guard);
+        assert!(
+            backend
+                .submit_bridge(request)
+                .await
+                .unwrap_err()
+                .contains("pending transactions")
+        );
+    }
+}
+
+#[tokio::test]
 async fn forward_bridge_rejects_subaccount_destination_when_native_helper_is_resolved() {
     let signer = "0x1111111111111111111111111111111111111111"
         .parse::<Address>()
@@ -196,6 +287,7 @@ async fn forward_bridge_rejects_subaccount_destination_when_native_helper_is_res
         });
 
     let mut mock_evm = MockBridgeEvmBackend::new();
+    mock_evm.expect_has_pending_transactions().returning(|| Ok(false));
     mock_evm.expect_signer_address().times(1).returning(move || signer);
     mock_evm.expect_erc20_decimals_of().times(0);
     mock_evm.expect_erc20_approve_and_wait().times(0);
@@ -245,6 +337,7 @@ async fn forward_bridge_skips_approve_when_allowance_is_sufficient() {
     let tx_hash = TxHash::from([0x11u8; 32]);
 
     let mut mock_agent = MockPipelineAgent::new();
+    expect_event_boundary(&mut mock_agent);
     mock_agent
         .expect_call_query::<CkEthMinterInfo>()
         .times(1)
@@ -259,6 +352,7 @@ async fn forward_bridge_skips_approve_when_allowance_is_sufficient() {
         });
 
     let mut mock_evm = MockBridgeEvmBackend::new();
+    mock_evm.expect_has_pending_transactions().returning(|| Ok(false));
     mock_evm.expect_signer_address().times(1).returning(move || signer);
     mock_evm
         .expect_erc20_decimals_of()
@@ -310,7 +404,7 @@ async fn forward_bridge_skips_approve_when_allowance_is_sufficient() {
     };
 
     let submission = backend.submit_bridge(request).await.expect("bridge must submit");
-    assert_eq!(submission.bridge_id, format!("{:#x}", tx_hash));
+    assert!(submission.bridge_id.starts_with(&format!("ckmint:42:{tx_hash:#x}:")));
 }
 
 #[tokio::test]
@@ -328,6 +422,7 @@ async fn forward_bridge_approves_when_allowance_is_insufficient() {
     let tx_hash = TxHash::from([0x22u8; 32]);
 
     let mut mock_agent = MockPipelineAgent::new();
+    expect_event_boundary(&mut mock_agent);
     mock_agent
         .expect_call_query::<CkEthMinterInfo>()
         .times(1)
@@ -342,6 +437,7 @@ async fn forward_bridge_approves_when_allowance_is_insufficient() {
         });
 
     let mut mock_evm = MockBridgeEvmBackend::new();
+    mock_evm.expect_has_pending_transactions().returning(|| Ok(false));
     mock_evm.expect_signer_address().times(1).returning(move || signer);
     mock_evm
         .expect_erc20_decimals_of()
@@ -397,7 +493,7 @@ async fn forward_bridge_approves_when_allowance_is_insufficient() {
     };
 
     let submission = backend.submit_bridge(request).await.expect("bridge must submit");
-    assert_eq!(submission.bridge_id, format!("{:#x}", tx_hash));
+    assert!(submission.bridge_id.starts_with(&format!("ckmint:42:{tx_hash:#x}:")));
 }
 
 #[tokio::test]
@@ -427,6 +523,7 @@ async fn forward_bridge_fails_preflight_when_balance_is_insufficient() {
         });
 
     let mut mock_evm = MockBridgeEvmBackend::new();
+    mock_evm.expect_has_pending_transactions().returning(|| Ok(false));
     mock_evm.expect_signer_address().times(1).returning(move || signer);
     mock_evm
         .expect_erc20_decimals_of()
@@ -489,6 +586,7 @@ async fn native_forward_bridge_uses_deposit_eth_with_subaccount_helper() {
     let tx_hash = TxHash::from([0x44u8; 32]);
 
     let mut mock_agent = MockPipelineAgent::new();
+    expect_event_boundary(&mut mock_agent);
     mock_agent
         .expect_call_query::<CkEthMinterInfo>()
         .times(1)
@@ -552,7 +650,7 @@ async fn native_forward_bridge_uses_deposit_eth_with_subaccount_helper() {
     };
 
     let submission = backend.submit_bridge(request).await.expect("bridge must submit");
-    assert_eq!(submission.bridge_id, format!("{:#x}", tx_hash));
+    assert!(submission.bridge_id.starts_with(&format!("ckmint:42:{tx_hash:#x}:")));
 }
 
 #[tokio::test]
@@ -568,6 +666,7 @@ async fn native_forward_bridge_falls_back_to_legacy_eth_helper_for_default_subac
     let tx_hash = TxHash::from([0x45u8; 32]);
 
     let mut mock_agent = MockPipelineAgent::new();
+    expect_event_boundary(&mut mock_agent);
     mock_agent
         .expect_call_query::<CkEthMinterInfo>()
         .times(1)
@@ -623,7 +722,7 @@ async fn native_forward_bridge_falls_back_to_legacy_eth_helper_for_default_subac
     };
 
     let submission = backend.submit_bridge(request).await.expect("bridge must submit");
-    assert_eq!(submission.bridge_id, format!("{:#x}", tx_hash));
+    assert!(submission.bridge_id.starts_with(&format!("ckmint:42:{tx_hash:#x}:")));
 }
 
 #[tokio::test]
