@@ -181,12 +181,6 @@ pub struct LiquidationIntentRecord {
     pub updated_at: i64,
 }
 
-#[derive(Debug, Clone)]
-pub struct LiquidationHandoff {
-    pub sequence: i64,
-    pub intent: LiquidationIntentRecord,
-}
-
 #[allow(dead_code)]
 #[cfg_attr(test, mockall::automock)]
 #[async_trait]
@@ -203,7 +197,6 @@ pub trait LiquidationIntentStore: Send + Sync {
     async fn mark_ambiguous(&self, intent_id: &str, error: &str) -> Result<()>;
     async fn recover_submitting_as_ambiguous(&self, reason: &str) -> Result<usize>;
     async fn get_intent(&self, intent_id: &str) -> Result<Option<LiquidationIntentRecord>>;
-    async fn list_handoffs_after(&self, sequence: i64, limit: usize) -> Result<Vec<LiquidationHandoff>>;
 }
 
 pub fn now_secs() -> i64 {

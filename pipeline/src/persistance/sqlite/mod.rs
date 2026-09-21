@@ -20,14 +20,12 @@ use self::schema::liquidation_results as tbl;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DatabaseRole {
     ExecutionWal,
-    LiquidationIntake,
 }
 
 impl DatabaseRole {
     fn as_str(self) -> &'static str {
         match self {
             Self::ExecutionWal => "execution_wal",
-            Self::LiquidationIntake => "liquidation_intake",
         }
     }
 }
@@ -53,6 +51,8 @@ impl SqliteWalStore {
         let mut conn = pool
             .get()
             .with_context(|| format!("open sqlite connection (mode=rw path={path})"))?;
+        // Control-plane setup can overlap execution writes to this same file.
+        conn.batch_execute(&format!("PRAGMA busy_timeout = {busy_timeout_ms};"))?;
         initialize_role_and_schema(&mut conn, DatabaseRole::ExecutionWal, initialize_schema)
             .with_context(|| format!("initialize sqlite schema (path={path})"))?;
         apply_pragmas(&mut conn, busy_timeout_ms)
@@ -86,7 +86,7 @@ impl SqliteWalStore {
         })
     }
 
-    fn get_conn(&self) -> Result<r2d2::PooledConnection<ConnectionManager<SqliteConnection>>> {
+    pub(super) fn get_conn(&self) -> Result<r2d2::PooledConnection<ConnectionManager<SqliteConnection>>> {
         let mode = if self.read_only { "ro" } else { "rw" };
         let mut conn = self
             .pool
@@ -102,7 +102,7 @@ impl SqliteWalStore {
         Ok(conn)
     }
 
-    fn ensure_writable(&self) -> Result<()> {
+    pub(super) fn ensure_writable(&self) -> Result<()> {
         if self.read_only {
             anyhow::bail!("wal store opened read-only");
         }
@@ -176,47 +176,6 @@ impl SqliteWalStore {
         Ok(rows.into_iter().map(Self::from_row).collect())
     }
 
-    /// Imports one scanner handoff without ever updating an existing execution
-    /// row. The row insert and durable source cursor advance are atomic.
-    pub async fn import_handoff(&self, sequence: i64, row: LiqResultRecord) -> Result<bool> {
-        self.ensure_writable()?;
-        let mut conn = self.get_conn()?;
-        conn.transaction::<_, anyhow::Error, _>(|conn| {
-            let current = current_intake_sequence(conn)?;
-            if sequence <= current {
-                return Ok(false);
-            }
-
-            let inserted = diesel::insert_into(tbl::table)
-                .values(&Self::to_row(&row))
-                .on_conflict(tbl::liq_id)
-                .do_nothing()
-                .execute(conn)?;
-            diesel::sql_query("UPDATE intake_import_state SET last_handoff_sequence = ? WHERE singleton_id = 1")
-                .bind::<BigInt, _>(sequence)
-                .execute(conn)?;
-            Ok(inserted == 1)
-        })
-    }
-
-    pub fn intake_import_sequence(&self) -> Result<i64> {
-        let mut conn = self.get_conn()?;
-        current_intake_sequence(&mut conn)
-    }
-}
-
-fn current_intake_sequence(conn: &mut SqliteConnection) -> Result<i64> {
-    #[derive(QueryableByName)]
-    struct CursorRow {
-        #[diesel(sql_type = BigInt)]
-        last_handoff_sequence: i64,
-    }
-
-    Ok(
-        diesel::sql_query("SELECT last_handoff_sequence FROM intake_import_state WHERE singleton_id = 1 LIMIT 1")
-            .get_result::<CursorRow>(conn)?
-            .last_handoff_sequence,
-    )
 }
 
 #[async_trait]
@@ -497,6 +456,11 @@ fn user_table_names(conn: &mut SqliteConnection) -> Result<Vec<String>> {
 }
 
 pub fn initialize_schema(conn: &mut SqliteConnection) -> Result<()> {
+    // That layout may still have accepted work in a separate intake file.
+    // Opening only its WAL would silently omit those obligations.
+    if user_table_names(conn)?.iter().any(|name| name == "intake_import_state") {
+        anyhow::bail!("two-database execution layout requires reconciliation of the old intake before migration");
+    }
     conn.batch_execute(
         r#"
         CREATE TABLE IF NOT EXISTS liquidation_results (
@@ -512,15 +476,9 @@ pub fn initialize_schema(conn: &mut SqliteConnection) -> Result<()> {
         );
         CREATE INDEX IF NOT EXISTS idx_liq_status ON liquidation_results(status);
 
-        CREATE TABLE IF NOT EXISTS intake_import_state (
-            singleton_id INTEGER PRIMARY KEY CHECK (singleton_id = 1),
-            last_handoff_sequence BIGINT NOT NULL DEFAULT 0
-        );
-        INSERT OR IGNORE INTO intake_import_state (singleton_id, last_handoff_sequence)
-        VALUES (1, 0);
-
     "#,
     )?;
+    super::liquidation_intake::initialize_schema(conn)?;
     Ok(())
 }
 
@@ -566,7 +524,6 @@ mod tests {
 
     use diesel::{Connection, connection::SimpleConnection};
 
-    use crate::persistance::liquidation_intake::SqliteLiquidationIntentStore;
     use crate::persistance::{LiqResultRecord, ResultStatus, WalStore, now_secs};
 
     use super::SqliteWalStore;
@@ -780,7 +737,6 @@ mod tests {
         drop(conn);
 
         let store = SqliteWalStore::new(&path).expect("adopt legacy WAL");
-        assert_eq!(store.intake_import_sequence().expect("import cursor"), 0);
         let rows = store.list_recent(10).expect("legacy rows");
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].id, "legacy-liq");
@@ -805,39 +761,11 @@ mod tests {
     }
 
     #[test]
-    fn intake_store_does_not_adopt_a_legacy_execution_wal() {
-        let temp = tempfile::NamedTempFile::new().expect("tmp db");
-        let path = temp.path().display().to_string();
-        let mut conn = diesel::SqliteConnection::establish(&path).expect("legacy connection");
-        conn.batch_execute(
-            r#"
-            CREATE TABLE liquidation_results (
-                liq_id TEXT NOT NULL,
-                status INTEGER NOT NULL,
-                attempt INTEGER NOT NULL DEFAULT 0,
-                error_count INTEGER NOT NULL DEFAULT 0,
-                last_error TEXT,
-                created_at BIGINT NOT NULL,
-                updated_at BIGINT NOT NULL,
-                meta_json TEXT NOT NULL,
-                PRIMARY KEY (liq_id)
-            );
-            "#,
-        )
-        .expect("legacy WAL schema");
-        drop(conn);
-
-        let error = SqliteLiquidationIntentStore::new(&path)
-            .err()
-            .expect("intake must reject legacy WAL");
-        assert!(format!("{error:#}").contains("untagged"), "unexpected error: {error:#}");
-    }
-
-    #[test]
     fn rejects_database_tagged_for_the_other_role() {
         let temp = tempfile::NamedTempFile::new().expect("tmp db");
         let path = temp.path().display().to_string();
-        let _intake = SqliteLiquidationIntentStore::new(&path).expect("intake database");
+        let mut conn = diesel::SqliteConnection::establish(&path).unwrap();
+        conn.batch_execute("CREATE TABLE database_metadata (metadata_key TEXT PRIMARY KEY, metadata_value TEXT); INSERT INTO database_metadata VALUES ('role', 'liquidation_intake');").unwrap();
 
         let error = SqliteWalStore::new(&path).err().expect("wrong database role must fail");
         assert!(
@@ -846,38 +774,13 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn handoff_import_advances_cursor_without_overwriting_existing_execution() {
-        let temp = tempfile::NamedTempFile::new().expect("tmp db");
-        let path = temp.path().display().to_string();
-        let store = SqliteWalStore::new(&path).expect("WAL store");
-        let now = now_secs();
-        let source_row = LiqResultRecord {
-            id: "liq-42".to_string(),
-            status: ResultStatus::Enqueued,
-            attempt: 0,
-            error_count: 0,
-            last_error: None,
-            created_at: now,
-            updated_at: now,
-            meta_json: "source".to_string(),
-        };
-
-        assert!(store.import_handoff(1, source_row.clone()).await.expect("first import"));
-        let mut checkpointed = source_row.clone();
-        checkpointed.status = ResultStatus::InFlight;
-        checkpointed.attempt = 3;
-        checkpointed.meta_json = "checkpoint".to_string();
-        store.upsert_result(checkpointed).await.expect("checkpoint row");
-
-        assert!(!store.import_handoff(2, source_row).await.expect("duplicate import"));
-        assert_eq!(store.intake_import_sequence().expect("cursor"), 2);
-        let stored = store.get_result("liq-42").await.unwrap().unwrap();
-        assert_eq!(stored.status, ResultStatus::InFlight);
-        assert_eq!(stored.attempt, 3);
-        assert_eq!(stored.meta_json, "checkpoint");
-
-        assert!(!store.import_handoff(2, stored).await.expect("replayed cursor"));
-        assert_eq!(store.intake_import_sequence().expect("cursor"), 2);
+    #[test]
+    fn rejects_old_two_database_layout_instead_of_losing_unimported_work() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let path = file.path().to_str().unwrap();
+        let _store = SqliteWalStore::new(path).unwrap();
+        let mut conn = diesel::SqliteConnection::establish(path).unwrap();
+        conn.batch_execute("CREATE TABLE intake_import_state (last_handoff_sequence BIGINT);").unwrap();
+        assert!(SqliteWalStore::new(path).is_err());
     }
 }

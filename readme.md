@@ -43,6 +43,17 @@ Inspired by Artemis/MEV patterns and designed for permissionless, community-driv
 - **Primary operations:** `liquidator run`, `liquidator balance`, `liquidator withdraw`, `liquidator account show`.
 - **Persistence:** SQLite WAL (`DB_PATH`) enables idempotent retries and resume-safe execution.
 
+Discovery and venue execution run independently but share `DB_PATH`. Accepting a
+liquidation records its receipt and creates execution work in one SQLite
+transaction. Interrupted submissions remain ambiguous rather than being replayed;
+there is no second intake database, handoff importer or import cursor. The daemon
+lock is scoped to `DB_PATH`, and the TUI reads pause state from that same database.
+
+The earlier unmerged two-database layout is not automatically migrated. Startup
+rejects `LIQUIDATIONS_DB_PATH` and WALs containing `intake_import_state` so accepted
+work in the old intake file cannot be silently left behind. Reconcile those files
+before migrating; ordinary legacy execution WALs are still adopted in place.
+
 ---
 
 ## Quick Install

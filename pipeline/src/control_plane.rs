@@ -46,7 +46,7 @@ pub enum ControlCommand {
     Resume,
 }
 
-/// Process-lifetime ownership of one liquidation-intake database.
+/// Process-lifetime ownership of the pipeline database.
 ///
 /// The lock file remains on disk after shutdown, but the OS lock itself is
 /// released automatically when the process exits, including after a crash.
@@ -87,25 +87,25 @@ pub fn default_log_file_path() -> PathBuf {
     std::env::temp_dir().join("liquidator").join("liquidator.log")
 }
 
-/// Claims exclusive ownership of the intake database and control socket.
+/// Claims exclusive ownership of the pipeline database and control socket.
 ///
-/// This must run before opening either SQLite database or recovering
+/// This must run before opening SQLite or recovering
 /// `Submitting` intents. The database-scoped lock prevents a second daemon
 /// from bypassing exclusivity with a different `--sock-path`; the pre-bound
 /// socket additionally prevents an older daemon using the same control path
 /// from overlapping startup.
 pub fn acquire_daemon_instance(
-    liquidations_db_path: &Path,
+    db_path: &Path,
     sock_path: &Path,
 ) -> anyhow::Result<(DaemonInstanceLock, UnixListener)> {
-    let instance_lock = acquire_intake_db_lock(liquidations_db_path)?;
+    let instance_lock = acquire_db_lock(db_path)?;
     let listener = bind_control_listener(sock_path)
         .with_context(|| format!("claim daemon control socket at {}", sock_path.display()))?;
     Ok((instance_lock, listener))
 }
 
-fn acquire_intake_db_lock(liquidations_db_path: &Path) -> anyhow::Result<DaemonInstanceLock> {
-    let lock_path = daemon_lock_path(liquidations_db_path)?;
+fn acquire_db_lock(db_path: &Path) -> anyhow::Result<DaemonInstanceLock> {
+    let lock_path = daemon_lock_path(db_path)?;
     let mut options = OpenOptions::new();
     options.create(true).read(true).write(true);
     #[cfg(unix)]
@@ -123,8 +123,8 @@ fn acquire_intake_db_lock(liquidations_db_path: &Path) -> anyhow::Result<DaemonI
             path: lock_path,
         }),
         Err(TryLockError::WouldBlock) => bail!(
-            "another liquidation daemon is already using intake database {} (lock: {})",
-            liquidations_db_path.display(),
+            "another liquidation daemon is already using database {} (lock: {})",
+            db_path.display(),
             lock_path.display()
         ),
         Err(TryLockError::Error(error)) => {
@@ -133,24 +133,24 @@ fn acquire_intake_db_lock(liquidations_db_path: &Path) -> anyhow::Result<DaemonI
     }
 }
 
-fn daemon_lock_path(liquidations_db_path: &Path) -> anyhow::Result<PathBuf> {
-    let canonical_target = if liquidations_db_path.exists() {
-        liquidations_db_path
+fn daemon_lock_path(db_path: &Path) -> anyhow::Result<PathBuf> {
+    let canonical_target = if db_path.exists() {
+        db_path
             .canonicalize()
-            .with_context(|| format!("canonicalize intake database {}", liquidations_db_path.display()))?
+            .with_context(|| format!("canonicalize database {}", db_path.display()))?
     } else {
-        let parent = liquidations_db_path
+        let parent = db_path
             .parent()
             .filter(|path| !path.as_os_str().is_empty())
             .unwrap_or_else(|| Path::new("."));
-        fs::create_dir_all(parent).with_context(|| format!("create intake database directory {}", parent.display()))?;
+        fs::create_dir_all(parent).with_context(|| format!("create database directory {}", parent.display()))?;
         let canonical_parent = parent
             .canonicalize()
-            .with_context(|| format!("canonicalize intake database directory {}", parent.display()))?;
-        let file_name = liquidations_db_path.file_name().ok_or_else(|| {
+            .with_context(|| format!("canonicalize database directory {}", parent.display()))?;
+        let file_name = db_path.file_name().ok_or_else(|| {
             anyhow::anyhow!(
-                "liquidation intake database path has no file name: {}",
-                liquidations_db_path.display()
+                "pipeline database path has no file name: {}",
+                db_path.display()
             )
         })?;
         canonical_parent.join(file_name)
@@ -448,7 +448,7 @@ mod tests {
     use tokio::net::UnixStream;
 
     use super::{
-        ControlCommand, acquire_daemon_instance, acquire_intake_db_lock, bind_control_listener,
+        ControlCommand, acquire_daemon_instance, acquire_db_lock, bind_control_listener,
         is_transient_accept_error, run_control_server, send_control_command,
     };
 
@@ -586,7 +586,7 @@ mod tests {
         let tmp = TempDir::new().expect("tmp");
         let db_path = tmp.path().join("liquidations.db");
 
-        let first = acquire_intake_db_lock(&db_path).expect("first daemon lock");
+        let first = acquire_db_lock(&db_path).expect("first daemon lock");
         assert_eq!(
             first.path(),
             tmp.path()
@@ -595,14 +595,14 @@ mod tests {
                 .join("liquidations.db.daemon.lock")
         );
 
-        let error = acquire_intake_db_lock(&db_path).expect_err("second daemon must be rejected");
+        let error = acquire_db_lock(&db_path).expect_err("second daemon must be rejected");
         assert!(
             error.to_string().contains("another liquidation daemon"),
             "unexpected error: {error:#}"
         );
 
         drop(first);
-        acquire_intake_db_lock(&db_path).expect("lock should be released when daemon exits");
+        acquire_db_lock(&db_path).expect("lock should be released when daemon exits");
     }
 
     #[cfg(unix)]
@@ -616,8 +616,8 @@ mod tests {
         fs::write(&db_path, b"").expect("create intake database");
         symlink(&db_path, &db_alias).expect("create intake database alias");
 
-        let _first = acquire_intake_db_lock(&db_path).expect("first daemon lock");
-        let error = acquire_intake_db_lock(&db_alias).expect_err("canonical alias must share the same lock");
+        let _first = acquire_db_lock(&db_path).expect("first daemon lock");
+        let error = acquire_db_lock(&db_alias).expect_err("canonical alias must share the same lock");
 
         assert!(
             error.to_string().contains("another liquidation daemon"),

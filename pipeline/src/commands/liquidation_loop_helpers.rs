@@ -18,7 +18,7 @@ use crate::config::Config;
 use crate::executors::basic::basic_executor::BasicExecutor;
 use crate::liquidation::collateral_service::CollateralService;
 use crate::output::human_output_enabled;
-use crate::persistance::liquidation_intake::SqliteLiquidationIntentStore;
+use crate::persistance::sqlite::SqliteWalStore;
 use crate::price_oracle::price_oracle::LiquidationPriceOracle;
 use crate::stage::PipelineStage;
 use crate::stages::{opportunity::OpportunityFinder, simple_strategy::SimpleLiquidationStrategy};
@@ -114,15 +114,12 @@ pub(crate) fn debt_assets_as_text(principals: &[Principal]) -> Vec<String> {
 /// daemon does not enter a noisy retry loop when DB/export paths are invalid.
 pub(crate) fn ensure_runtime_file_permissions(
     db_path: &str,
-    liquidations_db_path: &str,
     export_path: &str,
 ) -> anyhow::Result<()> {
     ensure_parent_dir(Path::new(db_path), "DB_PATH")?;
-    ensure_parent_dir(Path::new(liquidations_db_path), "LIQUIDATIONS_DB_PATH")?;
     ensure_parent_dir(Path::new(export_path), "EXPORT_PATH")?;
 
     probe_rw_file(Path::new(db_path), "DB_PATH", false)?;
-    probe_rw_file(Path::new(liquidations_db_path), "LIQUIDATIONS_DB_PATH", false)?;
     probe_rw_file(Path::new(export_path), "EXPORT_PATH", true)?;
     Ok(())
 }
@@ -171,12 +168,12 @@ fn probe_rw_file(path: &Path, label: &str, append: bool) -> anyhow::Result<()> {
 ///   structured error logs while the daemon process keeps running.
 pub(crate) fn bootstrap_control_plane(
     control_listener: UnixListener,
-    liquidations_db_path: &str,
+    db_path: &str,
     paused: Arc<AtomicBool>,
     lifecycle_watchdog: Option<Arc<dyn Watchdog>>,
 ) -> anyhow::Result<()> {
     let control_state_store = Arc::new(
-        SqliteLiquidationIntentStore::new_with_busy_timeout(liquidations_db_path, 30_000)
+        SqliteWalStore::new_with_busy_timeout(db_path, 30_000)
             .context("initialize control-state store")?,
     );
 
@@ -246,7 +243,7 @@ pub(crate) fn bootstrap_control_plane(
 pub(crate) async fn run_daemon_cycle_loop(
     finder: &OpportunityFinder<Agent>,
     strategy: &SimpleLiquidationStrategy<Config, TokenRegistry, CollateralService<LiquidationPriceOracle<Agent>>>,
-    executor: &Arc<BasicExecutor<Agent, SqliteLiquidationIntentStore>>,
+    executor: &Arc<BasicExecutor<Agent, SqliteWalStore>>,
     liq_dog: &Arc<dyn Watchdog>,
     low_balance_monitor: Option<Arc<LowBalanceMonitor>>,
     paused: Arc<AtomicBool>,
@@ -331,7 +328,7 @@ where
 async fn run_single_daemon_cycle(
     finder: &OpportunityFinder<Agent>,
     strategy: &SimpleLiquidationStrategy<Config, TokenRegistry, CollateralService<LiquidationPriceOracle<Agent>>>,
-    executor: &Arc<BasicExecutor<Agent, SqliteLiquidationIntentStore>>,
+    executor: &Arc<BasicExecutor<Agent, SqliteWalStore>>,
     liq_dog: &Arc<dyn Watchdog>,
     low_balance_monitor: Option<&LowBalanceMonitor>,
     paused: &AtomicBool,
@@ -476,18 +473,15 @@ mod tests {
     fn runtime_file_preflight_creates_missing_parents_and_files() {
         let tmp = TempDir::new().expect("tmp");
         let db = tmp.path().join("state/wal.db");
-        let liquidations_db = tmp.path().join("state/liquidations.db");
         let export = tmp.path().join("exports/executions.csv");
 
         ensure_runtime_file_permissions(
             db.to_str().expect("db path"),
-            liquidations_db.to_str().expect("liquidations db path"),
             export.to_str().expect("export path"),
         )
         .expect("preflight should pass");
 
         assert!(db.is_file());
-        assert!(liquidations_db.is_file());
         assert!(export.is_file());
     }
 
@@ -496,12 +490,10 @@ mod tests {
         let tmp = TempDir::new().expect("tmp");
         let db_dir = tmp.path().join("dbdir");
         std::fs::create_dir_all(&db_dir).expect("mkdir");
-        let liquidations_db = tmp.path().join("liquidations.db");
         let export = tmp.path().join("exports/executions.csv");
 
         let err = ensure_runtime_file_permissions(
             db_dir.to_str().expect("db dir"),
-            liquidations_db.to_str().expect("liquidations db path"),
             export.to_str().expect("export path"),
         )
         .expect_err("directory path must fail");

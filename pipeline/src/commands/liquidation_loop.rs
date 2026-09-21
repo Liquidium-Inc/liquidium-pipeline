@@ -30,7 +30,7 @@ use crate::{
     liquidation::collateral_service::CollateralService,
     persistance::{
         FinalizerMetaPayload, LiquidationIntentStore, MultiVenueExecutionOutcome, ResultStatus, VenueLegStatus,
-        WalStore, liquidation_intake::SqliteLiquidationIntentStore, sqlite::SqliteWalStore,
+        WalStore, sqlite::SqliteWalStore,
     },
     price_oracle::price_oracle::LiquidationPriceOracle,
     stages::{
@@ -187,7 +187,7 @@ async fn init(
     (
         OpportunityFinder<Agent>,
         SimpleLiquidationStrategy<Config, TokenRegistry, CollateralService<LiquidationPriceOracle<Agent>>>,
-        Arc<BasicExecutor<Agent, SqliteLiquidationIntentStore>>,
+        Arc<BasicExecutor<Agent, SqliteWalStore>>,
         Arc<ExportStage>,
         Arc<FinalizeStage<MultiVenueFinalizer, SqliteWalStore, SimpleProfitCalculator, Agent>>,
         Arc<SqliteWalStore>,
@@ -198,11 +198,7 @@ async fn init(
     let agent = ctx.agent.clone();
     let registry = ctx.registry.clone();
     let db = Arc::new(SqliteWalStore::new(&config.db_path).map_err(|e| format!("could not connect to db: {e:#}"))?);
-    let intents = Arc::new(
-        SqliteLiquidationIntentStore::new(&config.liquidations_db_path)
-            .map_err(|e| format!("could not connect to liquidation intake db: {e:#}"))?,
-    );
-    let recovered = intents
+    let recovered = db
         .recover_submitting_as_ambiguous("process restarted during liquidation submission")
         .await
         .map_err(|e| format!("failed to recover interrupted liquidation intents: {e}"))?;
@@ -219,7 +215,7 @@ async fn init(
             subaccount: None,
         },
         config.lending_canister,
-        intents,
+        db.clone(),
         ctx.approval_state.clone(),
     );
 
@@ -364,11 +360,11 @@ pub async fn run_liquidation_loop(sock_path: PathBuf) -> ExitCode {
     // recovery can mutate live intent state. The database lock also prevents
     // bypassing single-daemon ownership with a different control socket path.
     let (daemon_instance_lock, control_listener) =
-        match acquire_daemon_instance(PathBuf::from(&config.liquidations_db_path).as_path(), &sock_path) {
+        match acquire_daemon_instance(PathBuf::from(&config.db_path).as_path(), &sock_path) {
             Ok(instance) => instance,
             Err(err) => {
                 tracing::error!(
-                    liquidations_db_path = %config.liquidations_db_path,
+                    db_path = %config.db_path,
                     sock_path = %sock_path.display(),
                     "Failed to claim daemon instance: {err:#}"
                 );
@@ -382,11 +378,10 @@ pub async fn run_liquidation_loop(sock_path: PathBuf) -> ExitCode {
     );
 
     if let Err(err) =
-        ensure_runtime_file_permissions(&config.db_path, &config.liquidations_db_path, &config.export_path)
+        ensure_runtime_file_permissions(&config.db_path, &config.export_path)
     {
         tracing::error!(
             db_path = %config.db_path,
-            liquidations_db_path = %config.liquidations_db_path,
             export_path = %config.export_path,
             "Startup filesystem preflight failed: {}",
             err
@@ -431,14 +426,6 @@ pub async fn run_liquidation_loop(sock_path: PathBuf) -> ExitCode {
         }
     };
 
-    let intake_reader =
-        match SqliteLiquidationIntentStore::new_read_only_with_busy_timeout(&config.liquidations_db_path, 30_000) {
-            Ok(store) => Arc::new(store),
-            Err(err) => {
-                tracing::error!("Failed to init execution worker intake reader: {}", err);
-                return ExitCode::FAILURE;
-            }
-        };
     let settlement = Arc::new(SettlementWatcher::new(
         wal.clone(),
         ctx.agent.clone(),
@@ -473,7 +460,7 @@ pub async fn run_liquidation_loop(sock_path: PathBuf) -> ExitCode {
     // - state persistence on pause/resume transitions
     if let Err(err) = bootstrap_control_plane(
         control_listener,
-        &config.liquidations_db_path,
+        &config.db_path,
         paused.clone(),
         slack_watchdog.clone(),
     ) {
@@ -518,7 +505,6 @@ pub async fn run_liquidation_loop(sock_path: PathBuf) -> ExitCode {
     let _execution_worker = match spawn_execution_worker(
         finalizer,
         wal,
-        intake_reader,
         settlement,
         exporter,
         config.enabled_swap_venues.clone(),

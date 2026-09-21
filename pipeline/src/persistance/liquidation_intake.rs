@@ -3,92 +3,22 @@ use async_trait::async_trait;
 use diesel::{
     connection::SimpleConnection,
     prelude::*,
-    r2d2::{ConnectionManager, Pool},
     sql_types::{BigInt, Integer, Nullable, Text},
 };
 
 use crate::{
     executors::executor::ExecutorRequest,
     persistance::{
-        LiquidationHandoff, LiquidationIntentRecord, LiquidationIntentStatus, LiquidationIntentStore, now_secs,
+        LiqMetaWrapper, LiquidationIntentRecord, LiquidationIntentStatus, LiquidationIntentStore, ResultStatus,
+        WalProfitSnapshot, now_secs,
     },
     stages::executor::ExecutionReceipt,
 };
 
-use super::sqlite::{DatabaseRole, initialize_role_and_schema, validate_database_role};
+use super::sqlite::SqliteWalStore;
+use liquidium_pipeline_core::types::protocol_types::TransferStatus;
 
-pub struct SqliteLiquidationIntentStore {
-    pool: Pool<ConnectionManager<SqliteConnection>>,
-    busy_timeout_ms: i64,
-    read_only: bool,
-    db_path: String,
-}
-
-impl SqliteLiquidationIntentStore {
-    pub fn new(path: &str) -> Result<Self> {
-        Self::new_with_busy_timeout(path, 5_000)
-    }
-
-    pub fn new_with_busy_timeout(path: &str, busy_timeout_ms: i64) -> Result<Self> {
-        let manager = ConnectionManager::<SqliteConnection>::new(path);
-        let pool = Pool::builder()
-            .max_size(2)
-            .build(manager)
-            .with_context(|| format!("open liquidation intake pool (mode=rw path={path})"))?;
-        let mut conn = pool
-            .get()
-            .with_context(|| format!("open liquidation intake connection (mode=rw path={path})"))?;
-        initialize_role_and_schema(&mut conn, DatabaseRole::LiquidationIntake, initialize_schema)
-            .with_context(|| format!("initialize liquidation intake schema (path={path})"))?;
-        apply_pragmas(&mut conn, busy_timeout_ms)?;
-        Ok(Self {
-            pool,
-            busy_timeout_ms,
-            read_only: false,
-            db_path: path.to_string(),
-        })
-    }
-
-    pub fn new_read_only_with_busy_timeout(path: &str, busy_timeout_ms: i64) -> Result<Self> {
-        let manager = ConnectionManager::<SqliteConnection>::new(format!("file:{path}?mode=ro"));
-        let pool = Pool::builder()
-            .max_size(2)
-            .build(manager)
-            .with_context(|| format!("open liquidation intake pool (mode=ro path={path})"))?;
-        let mut conn = pool
-            .get()
-            .with_context(|| format!("open liquidation intake connection (mode=ro path={path})"))?;
-        apply_read_only_pragmas(&mut conn, busy_timeout_ms)?;
-        validate_database_role(&mut conn, DatabaseRole::LiquidationIntake)
-            .with_context(|| format!("validate liquidation intake database role (path={path})"))?;
-        Ok(Self {
-            pool,
-            busy_timeout_ms,
-            read_only: true,
-            db_path: path.to_string(),
-        })
-    }
-
-    fn get_conn(&self) -> Result<r2d2::PooledConnection<ConnectionManager<SqliteConnection>>> {
-        let mut conn = self
-            .pool
-            .get()
-            .with_context(|| format!("open liquidation intake connection (path={})", self.db_path))?;
-        if self.read_only {
-            apply_read_only_pragmas(&mut conn, self.busy_timeout_ms)?;
-        } else {
-            apply_pragmas(&mut conn, self.busy_timeout_ms)?;
-        }
-        Ok(conn)
-    }
-
-    fn ensure_writable(&self) -> Result<()> {
-        if self.read_only {
-            anyhow::bail!("liquidation intent store opened read-only");
-        }
-        Ok(())
-    }
-
+impl SqliteWalStore {
     pub fn set_daemon_paused(&self, paused: bool) -> Result<()> {
         self.ensure_writable()?;
         let mut conn = self.get_conn()?;
@@ -154,30 +84,8 @@ impl TryFrom<IntentSqlRow> for LiquidationIntentRecord {
     }
 }
 
-#[derive(QueryableByName)]
-struct HandoffSqlRow {
-    #[diesel(sql_type = BigInt)]
-    sequence: i64,
-    #[diesel(sql_type = Text)]
-    intent_id: String,
-    #[diesel(sql_type = Nullable<Text>)]
-    liquidation_id: Option<String>,
-    #[diesel(sql_type = Integer)]
-    status: i32,
-    #[diesel(sql_type = Text)]
-    request_json: String,
-    #[diesel(sql_type = Nullable<Text>)]
-    receipt_json: Option<String>,
-    #[diesel(sql_type = Nullable<Text>)]
-    last_error: Option<String>,
-    #[diesel(sql_type = BigInt)]
-    created_at: i64,
-    #[diesel(sql_type = BigInt)]
-    updated_at: i64,
-}
-
 #[async_trait]
-impl LiquidationIntentStore for SqliteLiquidationIntentStore {
+impl LiquidationIntentStore for SqliteWalStore {
     async fn create_submitting(&self, intent_id: &str, request: &ExecutorRequest) -> Result<()> {
         self.ensure_writable()?;
         let request_json = serde_json::to_string(request).context("encode liquidation intent request")?;
@@ -198,9 +106,32 @@ impl LiquidationIntentStore for SqliteLiquidationIntentStore {
 
     async fn mark_accepted(&self, intent_id: &str, liquidation_id: &str, receipt: &ExecutionReceipt) -> Result<()> {
         self.ensure_writable()?;
+        let liquidation = receipt.liquidation_result.as_ref().context("accepted receipt has no liquidation result")?;
+        anyhow::ensure!(liquidation.id.to_string() == liquidation_id, "accepted receipt liquidation id mismatch");
+        let status = match liquidation.collateral_tx.status {
+            TransferStatus::Success if receipt.request.swap_args.is_none() => ResultStatus::Succeeded,
+            TransferStatus::Success => ResultStatus::Enqueued,
+            TransferStatus::Pending | TransferStatus::Failed(_) => ResultStatus::WaitingCollateral,
+        };
         let receipt_json = serde_json::to_string(receipt).context("encode accepted liquidation receipt")?;
         let now = now_secs();
+        let meta_json = serde_json::to_string(&LiqMetaWrapper {
+            receipt: receipt.clone(),
+            meta: Vec::new(),
+            finalizer_decision: None,
+            profit_snapshot: Some(WalProfitSnapshot {
+                expected_profit_raw: receipt.request.expected_profit.to_string(),
+                realized_profit_raw: None,
+                debt_symbol: receipt.request.debt_asset.symbol().to_string(),
+                debt_decimals: receipt.request.debt_asset.decimals(),
+                updated_at: now,
+            }),
+            venue_execution: None,
+            meta_v2: None,
+        })?;
         let mut conn = self.get_conn()?;
+        // Acceptance and runnable work commit together. No importer/cursor can
+        // lose the handoff, and a duplicate receipt must never overwrite execution.
         conn.transaction::<_, anyhow::Error, _>(|conn| {
             let updated = diesel::sql_query(
                 "UPDATE liquidation_intents SET liquidation_id = ?, status = ?, receipt_json = ?, \
@@ -216,7 +147,14 @@ impl LiquidationIntentStore for SqliteLiquidationIntentStore {
             if updated != 1 {
                 anyhow::bail!("intent {intent_id} is missing or no longer submitting");
             }
-            diesel::sql_query("INSERT INTO liquidation_handoffs (intent_id) VALUES (?)")
+            diesel::sql_query(
+                "INSERT INTO liquidation_results (liq_id, status, created_at, updated_at, meta_json) \
+                 SELECT ?, ?, created_at, ?, ? FROM liquidation_intents WHERE intent_id = ?",
+            )
+                .bind::<Text, _>(liquidation_id)
+                .bind::<Integer, _>(status as i32)
+                .bind::<BigInt, _>(now)
+                .bind::<Text, _>(&meta_json)
                 .bind::<Text, _>(intent_id)
                 .execute(conn)?;
             Ok(())
@@ -301,38 +239,9 @@ impl LiquidationIntentStore for SqliteLiquidationIntentStore {
         .transpose()
     }
 
-    async fn list_handoffs_after(&self, sequence: i64, limit: usize) -> Result<Vec<LiquidationHandoff>> {
-        let mut conn = self.get_conn()?;
-        let rows = diesel::sql_query(
-            "SELECT h.sequence, i.intent_id, i.liquidation_id, i.status, i.request_json, \
-             i.receipt_json, i.last_error, i.created_at, i.updated_at \
-             FROM liquidation_handoffs h JOIN liquidation_intents i ON i.intent_id = h.intent_id \
-             WHERE h.sequence > ? ORDER BY h.sequence ASC LIMIT ?",
-        )
-        .bind::<BigInt, _>(sequence)
-        .bind::<BigInt, _>(limit as i64)
-        .load::<HandoffSqlRow>(&mut conn)?;
-        rows.into_iter()
-            .map(|row| {
-                let sequence = row.sequence;
-                let intent = IntentSqlRow {
-                    intent_id: row.intent_id,
-                    liquidation_id: row.liquidation_id,
-                    status: row.status,
-                    request_json: row.request_json,
-                    receipt_json: row.receipt_json,
-                    last_error: row.last_error,
-                    created_at: row.created_at,
-                    updated_at: row.updated_at,
-                }
-                .try_into()?;
-                Ok(LiquidationHandoff { sequence, intent })
-            })
-            .collect()
-    }
 }
 
-fn initialize_schema(conn: &mut SqliteConnection) -> Result<()> {
+pub(super) fn initialize_schema(conn: &mut SqliteConnection) -> Result<()> {
     conn.batch_execute(
         r#"
         CREATE TABLE IF NOT EXISTS liquidation_intents (
@@ -347,11 +256,6 @@ fn initialize_schema(conn: &mut SqliteConnection) -> Result<()> {
         );
         CREATE INDEX IF NOT EXISTS idx_liquidation_intents_status ON liquidation_intents(status);
 
-        CREATE TABLE IF NOT EXISTS liquidation_handoffs (
-            sequence INTEGER PRIMARY KEY AUTOINCREMENT,
-            intent_id TEXT NOT NULL UNIQUE REFERENCES liquidation_intents(intent_id)
-        );
-
         CREATE TABLE IF NOT EXISTS daemon_control_state (
             singleton_id INTEGER PRIMARY KEY CHECK (singleton_id = 1),
             paused INTEGER NOT NULL DEFAULT 0 CHECK (paused IN (0, 1)),
@@ -361,21 +265,6 @@ fn initialize_schema(conn: &mut SqliteConnection) -> Result<()> {
         VALUES (1, 0, CAST(strftime('%s','now') AS INTEGER));
         "#,
     )?;
-    Ok(())
-}
-
-fn apply_pragmas(conn: &mut SqliteConnection, busy_timeout_ms: i64) -> Result<()> {
-    conn.batch_execute(&format!(
-        "PRAGMA journal_mode=DELETE; PRAGMA synchronous=FULL; PRAGMA fullfsync=ON; \
-         PRAGMA temp_store=FILE; PRAGMA busy_timeout={busy_timeout_ms};"
-    ))?;
-    Ok(())
-}
-
-fn apply_read_only_pragmas(conn: &mut SqliteConnection, busy_timeout_ms: i64) -> Result<()> {
-    conn.batch_execute(&format!(
-        "PRAGMA query_only=ON; PRAGMA temp_store=FILE; PRAGMA busy_timeout={busy_timeout_ms};"
-    ))?;
     Ok(())
 }
 
@@ -392,11 +281,11 @@ mod tests {
 
     use crate::{
         executors::executor::ExecutorRequest,
-        persistance::{LiquidationIntentStatus, LiquidationIntentStore},
+        persistance::{LiquidationIntentStatus, LiquidationIntentStore, ResultStatus, WalStore},
         stages::executor::{ExecutionReceipt, ExecutionStatus},
     };
 
-    use super::SqliteLiquidationIntentStore;
+    use super::SqliteWalStore;
 
     fn principal(text: &str) -> Principal {
         Principal::from_text(text).expect("valid principal")
@@ -458,10 +347,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn accepted_intent_creates_one_ordered_handoff() {
+    async fn accepted_intent_creates_one_execution_without_overwriting_it() {
         let temp = tempfile::NamedTempFile::new().expect("temporary database");
         let path = temp.path().to_str().expect("database path");
-        let store = SqliteLiquidationIntentStore::new(path).expect("intake store");
+        let store = SqliteWalStore::new(path).expect("store");
 
         store
             .create_submitting("intent-1", &request())
@@ -480,18 +369,27 @@ mod tests {
         assert_eq!(intent.status, LiquidationIntentStatus::Accepted);
         assert_eq!(intent.liquidation_id.as_deref(), Some("42"));
 
-        let handoffs = store.list_handoffs_after(0, 10).await.expect("handoffs");
-        assert_eq!(handoffs.len(), 1);
-        assert_eq!(handoffs[0].sequence, 1);
-        assert_eq!(handoffs[0].intent.intent_id, "intent-1");
-        assert!(store.list_handoffs_after(1, 10).await.expect("next page").is_empty());
+        let mut row = store.get_result("42").await.unwrap().unwrap();
+        row.status = ResultStatus::InFlight;
+        row.attempt = 3;
+        row.meta_json = "checkpoint".into();
+        store.upsert_result(row).await.unwrap();
+        assert!(store.mark_accepted("intent-1", "42", &receipt(42)).await.is_err());
+        let row = store.get_result("42").await.unwrap().unwrap();
+        assert_eq!(row.meta_json, "checkpoint");
+        assert_eq!(row.attempt, 3);
+
+        // A conflicting execution insert rolls the acceptance update back too.
+        store.create_submitting("intent-2", &request()).await.unwrap();
+        assert!(store.mark_accepted("intent-2", "42", &receipt(42)).await.is_err());
+        assert_eq!(store.get_intent("intent-2").await.unwrap().unwrap().status, LiquidationIntentStatus::Submitting);
     }
 
     #[tokio::test]
-    async fn failed_and_recovered_intents_never_create_handoffs() {
+    async fn failed_and_recovered_intents_never_create_execution_rows() {
         let temp = tempfile::NamedTempFile::new().expect("temporary database");
         let path = temp.path().to_str().expect("database path");
-        let store = SqliteLiquidationIntentStore::new(path).expect("intake store");
+        let store = SqliteWalStore::new(path).expect("store");
 
         store
             .create_submitting("failed", &request())
@@ -521,19 +419,37 @@ mod tests {
             store.get_intent("stale").await.unwrap().unwrap().status,
             LiquidationIntentStatus::Ambiguous
         );
-        assert!(store.list_handoffs_after(0, 10).await.expect("handoffs").is_empty());
+        assert!(store.list_recent(10).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn failed_execution_insert_rolls_back_acceptance() {
+        use diesel::connection::SimpleConnection;
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let path = file.path().to_str().unwrap();
+        let store = SqliteWalStore::new(path).unwrap();
+        store.create_submitting("intent", &request()).await.unwrap();
+        store.get_conn().unwrap().batch_execute(
+            "CREATE TRIGGER refuse_execution BEFORE INSERT ON liquidation_results BEGIN SELECT RAISE(ABORT, 'test failure'); END;",
+        ).unwrap();
+
+        assert!(store.mark_accepted("intent", "42", &receipt(42)).await.is_err());
+        drop(store);
+        let reopened = SqliteWalStore::new(path).unwrap();
+        assert_eq!(reopened.get_intent("intent").await.unwrap().unwrap().status, LiquidationIntentStatus::Submitting);
+        assert!(reopened.get_result("42").await.unwrap().is_none());
     }
 
     #[tokio::test]
     async fn read_only_store_reads_but_cannot_change_intents_or_control_state() {
         let temp = tempfile::NamedTempFile::new().expect("temporary database");
         let path = temp.path().to_str().expect("database path");
-        let writer = SqliteLiquidationIntentStore::new(path).expect("writer");
+        let writer = SqliteWalStore::new(path).expect("writer");
         writer.create_submitting("intent", &request()).await.expect("intent");
         writer.set_daemon_paused(true).expect("pause state");
 
         let reader =
-            SqliteLiquidationIntentStore::new_read_only_with_busy_timeout(path, 5_000).expect("read-only store");
+            SqliteWalStore::new_read_only_with_busy_timeout(path, 5_000).expect("read-only store");
         assert!(reader.get_intent("intent").await.unwrap().is_some());
         assert!(reader.daemon_paused().expect("read pause state"));
         assert!(reader.mark_ambiguous("intent", "must fail").await.is_err());

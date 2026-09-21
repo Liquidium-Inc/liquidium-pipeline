@@ -50,10 +50,6 @@ pub(super) fn draw_configuration(f: &mut Frame<'_>, area: Rect, app: &App) {
             truncate_start(&app.config.db_path, area.width.saturating_sub(6) as usize)
         )),
         Line::from(format!(
-            "Liquidation intake: {}",
-            truncate_start(&app.config.liquidations_db_path, area.width.saturating_sub(6) as usize)
-        )),
-        Line::from(format!(
             "Export: {}",
             truncate_start(&app.config.export_path, area.width.saturating_sub(10) as usize)
         )),

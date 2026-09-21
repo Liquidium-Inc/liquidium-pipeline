@@ -8,7 +8,6 @@ use std::{
 
 use futures::{FutureExt, StreamExt, stream};
 use ic_agent::Agent;
-use liquidium_pipeline_core::types::protocol_types::TransferStatus;
 use prettytable::{Cell, Row, Table, format};
 use tokio::time::{sleep, timeout};
 use tracing::{error, info, warn};
@@ -18,25 +17,19 @@ use crate::{
         liquidation_outcome::LiquidationOutcome, multi_venue::MultiVenueFinalizer,
         profit_calculator::SimpleProfitCalculator,
     },
-    persistance::{
-        LiqMetaWrapper, LiqResultRecord, LiquidationHandoff, LiquidationIntentStatus, LiquidationIntentStore,
-        ResultStatus, WalProfitSnapshot, liquidation_intake::SqliteLiquidationIntentStore, sqlite::SqliteWalStore,
-    },
+    persistance::sqlite::SqliteWalStore,
     stage::PipelineStage,
     stages::{
-        executor::{ExecutionReceipt, ExecutionStatus},
+        executor::ExecutionStatus,
         export::ExportStage,
         finalize::FinalizeStage,
         settlement_watcher::SettlementWatcher,
     },
-    utils::now_ts,
-    wal::encode_meta,
     watchdog::{Watchdog, WatchdogEvent},
 };
 
 const EXECUTION_WORKER_POLL_INTERVAL: Duration = Duration::from_secs(2);
 const EXECUTION_WORKER_PANIC_DELAY: Duration = Duration::from_secs(1);
-const INTAKE_BATCH_LIMIT: usize = 100;
 const SETTLEMENT_STAGE_TIMEOUT: Duration = Duration::from_secs(120);
 const FINALIZER_STAGE_TIMEOUT: Duration = Duration::from_secs(300);
 const EXPORT_STAGE_TIMEOUT: Duration = Duration::from_secs(20);
@@ -54,7 +47,6 @@ pub(crate) type RuntimeSettlementWatcher = SettlementWatcher<Agent, SqliteWalSto
 pub(crate) fn spawn_execution_worker(
     finalizer: Arc<RuntimeFinalizer>,
     wal: Arc<SqliteWalStore>,
-    intake: Arc<SqliteLiquidationIntentStore>,
     settlement: Arc<RuntimeSettlementWatcher>,
     exporter: Arc<ExportStage>,
     enabled_venues: Vec<String>,
@@ -68,7 +60,6 @@ pub(crate) fn spawn_execution_worker(
         run_execution_worker(
             finalizer,
             wal,
-            intake,
             settlement,
             exporter,
             enabled_venues,
@@ -99,7 +90,6 @@ where
 async fn run_execution_worker(
     finalizer: Arc<RuntimeFinalizer>,
     wal: Arc<SqliteWalStore>,
-    intake: Arc<SqliteLiquidationIntentStore>,
     settlement: Arc<RuntimeSettlementWatcher>,
     exporter: Arc<ExportStage>,
     enabled_venues: Vec<String>,
@@ -126,8 +116,6 @@ async fn run_execution_worker(
     loop {
         let cycle = run_execution_cycle(
             finalizer.as_ref(),
-            wal.as_ref(),
-            intake.as_ref(),
             settlement.as_ref(),
             exporter.as_ref(),
             slack_watchdog.as_ref(),
@@ -146,17 +134,11 @@ async fn run_execution_worker(
 
 async fn run_execution_cycle(
     finalizer: &RuntimeFinalizer,
-    wal: &SqliteWalStore,
-    intake: &SqliteLiquidationIntentStore,
     settlement: &RuntimeSettlementWatcher,
     exporter: &ExportStage,
     slack_watchdog: Option<&Arc<dyn Watchdog>>,
     ui_enabled: bool,
 ) {
-    if let Err(error) = import_accepted_handoffs(intake, wal).await {
-        error!("Execution worker intake import failed: {error}");
-    }
-
     match timeout(SETTLEMENT_STAGE_TIMEOUT, settlement.tick()).await {
         Ok(Ok(())) => {}
         Ok(Err(error)) => warn!("Execution worker settlement sweep failed: {error}"),
@@ -211,156 +193,6 @@ async fn run_execution_cycle(
 
     if ui_enabled {
         print_execution_results(outcomes);
-    }
-}
-
-async fn import_accepted_handoffs(
-    intake: &SqliteLiquidationIntentStore,
-    wal: &SqliteWalStore,
-) -> Result<usize, String> {
-    let mut cursor = wal
-        .intake_import_sequence()
-        .map_err(|error| format!("read WAL intake cursor: {error}"))?;
-    let mut imported = 0usize;
-
-    loop {
-        let handoffs = intake
-            .list_handoffs_after(cursor, INTAKE_BATCH_LIMIT)
-            .await
-            .map_err(|error| format!("read accepted liquidation handoffs after {cursor}: {error}"))?;
-        if handoffs.is_empty() {
-            break;
-        }
-        let page_len = handoffs.len();
-        for handoff in handoffs {
-            let sequence = handoff.sequence;
-            let row = wal_row_from_handoff(&handoff);
-            if wal
-                .import_handoff(sequence, row)
-                .await
-                .map_err(|error| format!("import liquidation handoff {sequence}: {error}"))?
-            {
-                imported += 1;
-            }
-            cursor = sequence;
-        }
-        if page_len < INTAKE_BATCH_LIMIT {
-            break;
-        }
-    }
-
-    if imported != 0 {
-        info!(imported, cursor, "Imported accepted liquidations into execution WAL");
-    }
-    Ok(imported)
-}
-
-fn wal_row_from_handoff(handoff: &LiquidationHandoff) -> LiqResultRecord {
-    match decode_handoff(handoff) {
-        Ok((receipt, status)) => {
-            let expected_profit_raw = receipt.request.expected_profit.to_string();
-            let debt_symbol = receipt.request.debt_asset.symbol().to_string();
-            let debt_decimals = receipt.request.debt_asset.decimals();
-            let mut row = LiqResultRecord {
-                id: handoff
-                    .intent
-                    .liquidation_id
-                    .clone()
-                    .expect("validated accepted handoff has liquidation id"),
-                status,
-                attempt: 0,
-                error_count: 0,
-                last_error: None,
-                created_at: handoff.intent.created_at,
-                updated_at: now_ts(),
-                meta_json: "{}".to_string(),
-            };
-            let wrapper = LiqMetaWrapper {
-                receipt,
-                meta: Vec::new(),
-                finalizer_decision: None,
-                profit_snapshot: Some(WalProfitSnapshot {
-                    expected_profit_raw,
-                    realized_profit_raw: None,
-                    debt_symbol,
-                    debt_decimals,
-                    updated_at: now_ts(),
-                }),
-                venue_execution: None,
-                meta_v2: None,
-            };
-            if let Err(error) = encode_meta(&mut row, &wrapper) {
-                return unresumable_handoff_row(handoff, format!("encode WAL metadata: {error}"));
-            }
-            row
-        }
-        Err(error) => unresumable_handoff_row(handoff, error),
-    }
-}
-
-fn decode_handoff(handoff: &LiquidationHandoff) -> Result<(ExecutionReceipt, ResultStatus), String> {
-    if handoff.intent.status != LiquidationIntentStatus::Accepted {
-        return Err(format!(
-            "handoff references intent in {:?} state",
-            handoff.intent.status
-        ));
-    }
-    let expected_id = handoff
-        .intent
-        .liquidation_id
-        .as_deref()
-        .ok_or_else(|| "accepted handoff has no liquidation id".to_string())?;
-    let request = serde_json::from_str(&handoff.intent.request_json)
-        .map_err(|error| format!("decode liquidation request: {error}"))?;
-    let mut receipt: ExecutionReceipt = serde_json::from_str(
-        handoff
-            .intent
-            .receipt_json
-            .as_deref()
-            .ok_or_else(|| "accepted handoff has no receipt".to_string())?,
-    )
-    .map_err(|error| format!("decode liquidation receipt: {error}"))?;
-    let liquidation = receipt
-        .liquidation_result
-        .as_ref()
-        .ok_or_else(|| "accepted receipt has no liquidation result".to_string())?;
-    if liquidation.id.to_string() != expected_id {
-        return Err(format!(
-            "accepted receipt liquidation id {} does not match intent id {expected_id}",
-            liquidation.id
-        ));
-    }
-    receipt.request = request;
-    let status = match liquidation.collateral_tx.status {
-        TransferStatus::Success if receipt.request.swap_args.is_none() => ResultStatus::Succeeded,
-        TransferStatus::Success => ResultStatus::Enqueued,
-        TransferStatus::Pending | TransferStatus::Failed(_) => ResultStatus::WaitingCollateral,
-    };
-    Ok((receipt, status))
-}
-
-fn unresumable_handoff_row(handoff: &LiquidationHandoff, error: String) -> LiqResultRecord {
-    let id = handoff
-        .intent
-        .liquidation_id
-        .clone()
-        .unwrap_or_else(|| format!("intake-{}", handoff.intent.intent_id));
-    error!(
-        handoff_sequence = handoff.sequence,
-        intent_id = %handoff.intent.intent_id,
-        liquidation_id = %id,
-        reason = %error,
-        "Accepted liquidation handoff is unresumable"
-    );
-    LiqResultRecord {
-        id,
-        status: ResultStatus::Unresumable,
-        attempt: 0,
-        error_count: 1,
-        last_error: Some(format!("intake handoff {} is invalid: {error}", handoff.sequence)),
-        created_at: handoff.intent.created_at,
-        updated_at: now_ts(),
-        meta_json: "{}".to_string(),
     }
 }
 
@@ -525,15 +357,12 @@ mod tests {
 
     use crate::{
         executors::executor::ExecutorRequest,
-        persistance::{LiquidationHandoff, LiquidationIntentStore, ResultStatus, WalStore},
+        persistance::{LiquidationIntentStatus, LiquidationIntentStore, ResultStatus, WalStore},
         stages::executor::{ExecutionReceipt, ExecutionStatus},
         swappers::model::SwapRequest,
     };
 
-    use super::{
-        SqliteLiquidationIntentStore, SqliteWalStore, build_execution_runtime, import_accepted_handoffs,
-        spawn_runtime_thread, wal_row_from_handoff,
-    };
+    use super::{SqliteWalStore, build_execution_runtime, spawn_runtime_thread};
 
     #[test]
     fn execution_runtime_runs_on_the_named_os_thread() {
@@ -622,11 +451,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn importer_maps_accepted_receipts_and_advances_the_cursor() {
+    async fn acceptance_makes_work_visible_to_the_execution_reader() {
         let temp = tempfile::tempdir().expect("temporary directory");
-        let intake_path = temp.path().join("liquidations.db");
         let wal_path = temp.path().join("wal.db");
-        let intake_writer = SqliteLiquidationIntentStore::new(intake_path.to_str().unwrap()).expect("intake writer");
+        let intake_writer = SqliteWalStore::new(wal_path.to_str().unwrap()).expect("writer");
 
         for (intent_id, liquidation_id, receipt) in [
             ("swap-ready", "1", receipt(1, TransferStatus::Success, true)),
@@ -643,12 +471,8 @@ mod tests {
                 .expect("accept intent");
         }
 
-        let intake_reader =
-            SqliteLiquidationIntentStore::new_read_only_with_busy_timeout(intake_path.to_str().unwrap(), 5_000)
-                .expect("intake reader");
-        let wal = SqliteWalStore::new(wal_path.to_str().unwrap()).expect("WAL");
-        assert_eq!(import_accepted_handoffs(&intake_reader, &wal).await.unwrap(), 3);
-        assert_eq!(wal.intake_import_sequence().unwrap(), 3);
+        drop(intake_writer);
+        let wal = SqliteWalStore::new_read_only_with_busy_timeout(wal_path.to_str().unwrap(), 5_000).expect("reader");
         assert_eq!(
             wal.get_result("1").await.unwrap().unwrap().status,
             ResultStatus::Enqueued
@@ -661,22 +485,16 @@ mod tests {
             wal.get_result("3").await.unwrap().unwrap().status,
             ResultStatus::Succeeded
         );
-        assert_eq!(import_accepted_handoffs(&intake_reader, &wal).await.unwrap(), 0);
     }
 
     #[tokio::test]
-    async fn malformed_accepted_handoff_is_parked_as_unresumable() {
+    async fn mismatched_receipt_leaves_the_intent_unaccepted() {
         let temp = tempfile::NamedTempFile::new().expect("temporary database");
-        let store = SqliteLiquidationIntentStore::new(temp.path().to_str().unwrap()).expect("intake store");
+        let store = SqliteWalStore::new(temp.path().to_str().unwrap()).expect("store");
         let receipt = receipt(9, TransferStatus::Success, true);
         store.create_submitting("bad", &receipt.request).await.unwrap();
-        store.mark_accepted("bad", "9", &receipt).await.unwrap();
-        let mut intent = store.get_intent("bad").await.unwrap().unwrap();
-        intent.receipt_json = Some("not-json".to_string());
-
-        let row = wal_row_from_handoff(&LiquidationHandoff { sequence: 1, intent });
-        assert_eq!(row.id, "9");
-        assert_eq!(row.status, ResultStatus::Unresumable);
-        assert!(row.last_error.unwrap().contains("decode liquidation receipt"));
+        assert!(store.mark_accepted("bad", "10", &receipt).await.is_err());
+        assert_eq!(store.get_intent("bad").await.unwrap().unwrap().status, LiquidationIntentStatus::Submitting);
+        assert!(store.get_result("10").await.unwrap().is_none());
     }
 }
