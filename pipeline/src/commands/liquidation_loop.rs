@@ -21,6 +21,7 @@ use crate::{
     control_plane::acquire_daemon_instance,
     executors::basic::basic_executor::BasicExecutor,
     finalizers::{
+        cex_finalizer::venue_icp_native_assets,
         kraken::runtime::build_kraken_finalizer,
         mexc::runtime::build_mexc_finalizer,
         multi_venue::{
@@ -300,6 +301,17 @@ async fn init(
     let wd = webhook_watchdog_from_env(Duration::from_secs(300));
     wd.notify(WatchdogEvent::Heartbeat { stage: "Init" }).await;
 
+    // Ranking prefers collateral an enabled venue takes on the ICP network,
+    // because that leg is one ICRC-1 transfer rather than a bridge crossing.
+    // The list is taken from the same venue profiles the finalizer routes on,
+    // so the two cannot drift into disagreeing about what needs a bridge.
+    let venue_native_symbols: Vec<String> = config
+        .enabled_swap_venues
+        .iter()
+        .flat_map(|venue_id| venue_icp_native_assets(venue_id))
+        .map(|symbol| symbol.to_string())
+        .collect();
+
     let strategy = SimpleLiquidationStrategy::new(
         config.clone(),
         registry.clone(),
@@ -307,7 +319,8 @@ async fn init(
         ctx.main_service.clone(),
         ctx.approval_state.clone(),
     )
-    .with_watchdog(wd);
+    .with_watchdog(wd)
+    .with_venue_native_symbols(venue_native_symbols);
 
     let exporter = Arc::new(ExportStage {
         path: config.export_path.clone(),
