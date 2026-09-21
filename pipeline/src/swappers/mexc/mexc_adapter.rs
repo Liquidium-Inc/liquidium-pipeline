@@ -1374,7 +1374,9 @@ impl CexBackend for MexcClient {
         let ex = self.inner.lock().await;
         let records = ex
             .withdraw_history(WithdrawHistoryRequest {
-                coin: Some(coin.to_string()),
+                // Use the same exchange symbol as submission so a case-sensitive
+                // history filter cannot hide mixed-case CK withdrawal receipts.
+                coin: Some(coin.trim().to_ascii_uppercase()),
                 status: None,
                 limit: Some(DEFAULT_WITHDRAW_HISTORY_LIMIT),
                 start_time: None,
