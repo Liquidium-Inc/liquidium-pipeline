@@ -269,7 +269,8 @@ fn mexc_deposit_asset_candidates(asset: &str) -> Vec<String> {
         candidates.push(format!("CK{}", asset_upper));
     }
 
-    candidates.sort();
+    // Try the requested asset before its CK alias. Sorting puts CKETH before
+    // ETH and can select IC custody for a native Ethereum bridge deposit.
     candidates.dedup();
     candidates
 }
@@ -1205,7 +1206,9 @@ impl CexBackend for MexcClient {
 
                 let addr = res.iter().find(|item| {
                     let item_network = item.network.to_ascii_uppercase();
-                    candidates.iter().any(|cand| item_network.contains(cand))
+                    // Network names identify distinct custody protocols: ETH
+                    // must never match CKETH merely because it is a substring.
+                    candidates.iter().any(|cand| item_network == *cand)
                 });
 
                 if let Some(v) = addr {
@@ -1438,6 +1441,52 @@ impl CexBackend for MexcClient {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn native_deposit_prefers_eth_and_ignores_cketh_address() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0; 1024];
+            while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                let count = stream.read(&mut buffer).await.unwrap();
+                assert!(count > 0);
+                request.extend_from_slice(&buffer[..count]);
+            }
+            let request = String::from_utf8(request).unwrap();
+            assert!(request.contains("coin=ETH"), "{request}");
+            assert!(!request.contains("coin=CKETH"), "{request}");
+            let body = r#"[{"coin":"ETH","network":"CKETH","address":"wrong-ic-account","memo":""},{"coin":"ETH","network":"ETH","address":"0x1111111111111111111111111111111111111111","memo":""}]"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+        });
+        let client = MexcClient {
+            inner: tokio::sync::Mutex::new(MexcSpotApiClientWithAuthentication::new(
+                mexc_rs::spot::MexcSpotApiEndpoint::Custom(endpoint),
+                "test-key".into(),
+                "test-secret".into(),
+            )),
+            symbol_filters: tokio::sync::Mutex::new(HashMap::new()),
+            http: reqwest::Client::new(),
+        };
+        let address = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            client.get_deposit_address("ETH", "ETH"),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        server.await.unwrap();
+        assert_eq!(address.network, "ETH");
+        assert_eq!(address.address, "0x1111111111111111111111111111111111111111");
+    }
+
     use super::*;
 
     // Buy fill mapping should keep quote as input-consumed and apply fee haircut to base output.
