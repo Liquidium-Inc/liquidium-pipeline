@@ -435,6 +435,8 @@ impl MexcClient {
             debug!("[mexc] resolved symbol filters {} -> {}", symbol, resolved_symbol);
         }
 
+        Self::validate_market_order_support(&info, &resolved_symbol)?;
+
         let mut filters = SymbolFilters::default();
         if let Some(entries) = info.get("filters").and_then(|v| v.as_array()) {
             for f in entries {
@@ -468,6 +470,20 @@ impl MexcClient {
 }
 
 impl MexcClient {
+    fn validate_market_order_support(info: &Value, symbol: &str) -> Result<(), String> {
+        // Execution uses MARKET orders. Reject listed LIMIT-only markets when
+        // loading execution filters, before attempting a market-order submission.
+        // Preserve compatibility with metadata responses that omit orderTypes.
+        if info
+            .get("orderTypes")
+            .and_then(Value::as_array)
+            .is_some_and(|types| !types.iter().any(|kind| kind.as_str() == Some("MARKET")))
+        {
+            return Err(format!("MEXC market {symbol} does not support MARKET orders"));
+        }
+        Ok(())
+    }
+
     async fn fetch_ask_levels(
         &self,
         ex: &MexcSpotApiClientWithAuthentication,
@@ -1438,6 +1454,22 @@ impl CexBackend for MexcClient {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn market_order_admission_rejects_limit_only_books() {
+        for order_types in [serde_json::json!(["LIMIT"]), serde_json::json!([])] {
+            let info = serde_json::json!({"orderTypes": order_types});
+            let error = MexcClient::validate_market_order_support(&info, "ETHUSDC").unwrap_err();
+            assert!(error.contains("ETHUSDC"));
+            assert!(error.contains("does not support MARKET"));
+        }
+        for info in [
+            serde_json::json!({"orderTypes": ["LIMIT", "MARKET"]}),
+            serde_json::json!({}),
+        ] {
+            assert!(MexcClient::validate_market_order_support(&info, "ETHUSDC").is_ok());
+        }
+    }
+
     use super::*;
 
     // Buy fill mapping should keep quote as input-consumed and apply fee haircut to base output.
