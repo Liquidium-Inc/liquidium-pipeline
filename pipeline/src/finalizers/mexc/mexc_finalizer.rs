@@ -689,7 +689,10 @@ where
             }
 
             Self::ensure_minimum_bridge_amount(bridge, route, &transfer_amount).await?;
-            let bridge_submit_amount = transfer_amount.to_f64();
+            let bridge_submit_amount = liquidium_pipeline_connectors::backend::amount_utils::nat_units_to_spend_amount(
+                &transfer_amount.value,
+                transfer_amount.token.decimals(),
+            )?;
             let bridge_expected_amount = Self::compute_expected_bridge_deposit_amount(
                 route,
                 bridge_submit_amount,
