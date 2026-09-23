@@ -38,6 +38,11 @@ impl SqliteWalStore {
         let mut conn = pool
             .get()
             .with_context(|| format!("open sqlite connection (mode=rw path={path})"))?;
+        // The control plane opens a second store after execution tasks start.
+        // Schema setup can contend with their writes; install the busy timeout
+        // before any schema or journal-mode operation, not just afterwards.
+        conn.batch_execute(&format!("PRAGMA busy_timeout = {busy_timeout_ms};"))
+            .context("set sqlite startup busy timeout")?;
         initialize_schema(&mut conn).with_context(|| format!("initialize sqlite schema (path={path})"))?;
         apply_pragmas(&mut conn, busy_timeout_ms)
             .with_context(|| format!("apply sqlite pragmas (mode=rw path={path})"))?;
@@ -397,6 +402,31 @@ fn apply_read_only_pragmas(conn: &mut SqliteConnection, busy_timeout_ms: i64) ->
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn startup_schema_waits_for_existing_writer() {
+        use diesel::Connection;
+        use diesel::connection::SimpleConnection;
+
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let path = file.path().to_str().unwrap().to_owned();
+        let _store = super::SqliteWalStore::new(&path).unwrap();
+        let mut writer = diesel::SqliteConnection::establish(&path).unwrap();
+        writer.batch_execute("BEGIN IMMEDIATE;").unwrap();
+        // Keep the writer locked for the entire constructor call. Releasing it
+        // after a sleep could let a delayed opener miss the contention entirely.
+        let started = std::time::Instant::now();
+        let error = super::SqliteWalStore::new_with_busy_timeout(&path, 200)
+            .err()
+            .expect("startup must not complete while another connection holds the write lock");
+        assert!(format!("{error:#}").contains("database is locked"), "{error:#}");
+        assert!(
+            started.elapsed() >= std::time::Duration::from_millis(200),
+            "schema initialisation must honour the configured busy timeout"
+        );
+        writer.batch_execute("COMMIT;").unwrap();
+        assert!(super::SqliteWalStore::new_with_busy_timeout(&path, 200).is_ok());
+    }
+
     use std::sync::Arc;
 
     use crate::persistance::{LiqResultRecord, ResultStatus, WalStore, now_secs};
