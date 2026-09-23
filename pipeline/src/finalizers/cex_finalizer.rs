@@ -184,6 +184,8 @@ pub struct CexWithdrawState {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct CexWithdrawBridgeState {
     #[serde(default)]
+    pub withdraw_bridge_mint_receipt: Option<liquidium_pipeline_connectors::backend::bridge_backend::BridgeMintReceipt>,
+    #[serde(default)]
     pub withdraw_planned_asset: Option<String>,
     #[serde(default)]
     pub withdraw_planned_network: Option<String>,
@@ -583,6 +585,7 @@ mod tests {
                         withdraw_bridge_id: None,
                         withdraw_bridge_submitted_at_ts: None,
                         withdraw_bridge_polled_at_ts: None,
+                        withdraw_bridge_mint_receipt: None,
                         withdraw_bridge_destination_snapshot: None,
                     },
                 },
@@ -736,6 +739,7 @@ mod tests {
                         withdraw_bridge_id: None,
                         withdraw_bridge_submitted_at_ts: None,
                         withdraw_bridge_polled_at_ts: None,
+                        withdraw_bridge_mint_receipt: None,
                         withdraw_bridge_destination_snapshot: None,
                     },
                 },

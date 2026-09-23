@@ -551,6 +551,13 @@ where
                 .map_err(|e| format!("ERC20 approve(helper={helper_address}) failed: {e}"))?;
         }
 
+        let expectation = serde_json::to_string(&super::mint_events::DepositExpectation {
+            amount: amount_base_units.to_string(),
+            recipient: *destination_account,
+            token_symbol: route.target_asset.to_string(),
+        })
+        .map_err(|e| e.to_string())?;
+        let event_start = super::mint_events::count(self.agent.as_ref(), &self.cketh_minter_canister).await?;
         let tx_hash = match helper {
             HelperContract::WithSubaccount(address) => self
                 .evm_backend
@@ -572,7 +579,7 @@ where
 
         // Return the submitted tx hash; completion is tracked asynchronously via get_bridge_status.
         Ok(BridgeSubmission {
-            bridge_id: format!("{:#x}", tx_hash),
+            bridge_id: format!("ckmint:{event_start}:{tx_hash:#x}:{expectation}"),
         })
     }
 
@@ -628,6 +635,13 @@ where
             ));
         }
 
+        let expectation = serde_json::to_string(&super::mint_events::DepositExpectation {
+            amount: amount_wei.to_string(),
+            recipient: *destination_account,
+            token_symbol: route.target_asset.to_string(),
+        })
+        .map_err(|e| e.to_string())?;
+        let event_start = super::mint_events::count(self.agent.as_ref(), &self.cketh_minter_canister).await?;
         let tx_hash = match helper {
             HelperContract::WithSubaccount(address) => self
                 .evm_backend
@@ -647,7 +661,7 @@ where
         };
 
         Ok(BridgeSubmission {
-            bridge_id: format!("{:#x}", tx_hash),
+            bridge_id: format!("ckmint:{event_start}:{tx_hash:#x}:{expectation}"),
         })
     }
 
@@ -1012,10 +1026,38 @@ where
 
     async fn get_bridge_status(&self, bridge_id: &str) -> Result<BridgeStatus, String> {
         if bridge_id.starts_with("ic-withdraw:") || bridge_id.starts_with("ic-withdraw-eth:") {
+            // The reverse-route caller separately requires the exchange deposit
+            // credit before trading. This legacy status releases that polling
+            // phase; it is not evidence of an Ethereum payout or destination mint.
             return Ok(BridgeStatus::Completed);
         }
 
-        let tx_hash = bridge_id
+        // New handles persist the audit-log boundary taken before submission.
+        // Older WALs contain only a hash and must scan from genesis; never treat
+        // those receipts as completed just because their helper call succeeded.
+        let (event_start, transaction_hash, expectation) = if let Some(handle) = bridge_id.strip_prefix("ckmint:") {
+            let (start, hash) = handle.split_once(':').ok_or("invalid ckmint handle")?;
+            let (hash, expectation) = match hash.split_once(':') {
+                Some((hash, json)) => (
+                    hash,
+                    Some(
+                        serde_json::from_str::<super::mint_events::DepositExpectation>(json)
+                            .map_err(|e| e.to_string())?,
+                    ),
+                ),
+                None => (hash, None),
+            };
+            (
+                start
+                    .parse::<u64>()
+                    .map_err(|e| format!("invalid mint event cursor: {e}"))?,
+                hash,
+                expectation,
+            )
+        } else {
+            (0, bridge_id, None)
+        };
+        let tx_hash = transaction_hash
             .parse::<TxHash>()
             .map_err(|e| format!("invalid bridge id '{}': expected EVM tx hash: {e}", bridge_id))?;
 
@@ -1030,7 +1072,18 @@ where
         };
 
         if receipt.success {
-            return Ok(BridgeStatus::Completed);
+            let status = super::mint_events::status(
+                self.agent.as_ref(),
+                &self.cketh_minter_canister,
+                event_start,
+                transaction_hash,
+            ).await?;
+            if let BridgeStatus::Minted(receipt) = &status {
+                if expectation.as_ref().is_some_and(|expected| !expected.matches(receipt)) {
+                    return Err("mint evidence does not match the submitted amount, token and destination".into());
+                }
+            }
+            return Ok(status);
         }
 
         Ok(BridgeStatus::Failed {

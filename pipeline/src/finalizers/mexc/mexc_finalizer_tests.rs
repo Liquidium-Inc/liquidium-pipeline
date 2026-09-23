@@ -1533,14 +1533,30 @@ async fn mexc_withdraw_bridge_submit_resume_complete_and_idempotent() {
 
     let bridge_status_calls = Arc::new(std::sync::Mutex::new(0u8));
     let bridge_status_calls_clone = bridge_status_calls.clone();
-    bridge.expect_get_bridge_status().times(2).returning(move |bridge_id| {
+    bridge.expect_get_bridge_status().times(3).returning(move |bridge_id| {
         assert_eq!(bridge_id, "bridge-withdraw-1");
         let mut guard = bridge_status_calls_clone.lock().expect("mutex");
         *guard += 1;
         if *guard == 1 {
             Ok(BridgeStatus::Pending)
         } else {
-            Ok(BridgeStatus::Completed)
+            Ok(BridgeStatus::Minted(
+                liquidium_pipeline_connectors::backend::bridge_backend::BridgeMintReceipt {
+                    transaction_hash: "0xhelper".into(),
+                    log_index: Nat::from(1u64),
+                    mint_block_index: Nat::from(42u64),
+                    amount: Nat::from(1_500_000u64),
+                    recipient: Account {
+                        owner: if *guard == 2 {
+                            Principal::anonymous()
+                        } else {
+                            Principal::management_canister()
+                        },
+                        subaccount: None,
+                    },
+                    token_symbol: "ckUSDC".into(),
+                },
+            ))
         }
     });
 
@@ -1593,11 +1609,29 @@ async fn mexc_withdraw_bridge_submit_resume_complete_and_idempotent() {
         .expect("bridge pending should keep pending");
     assert!(matches!(state.step, CexStep::WithdrawPending));
 
+    // Reconstruct durable state: polling must not resubmit either withdrawal.
+    state = serde_json::from_str(&serde_json::to_string(&state).unwrap()).unwrap();
+    let error = finalizer.withdraw(&mut state).await.unwrap_err();
+    assert!(error.contains("destination/token"));
+    assert!(matches!(state.step, CexStep::WithdrawPending));
+    assert!(state.withdraw.bridge.withdraw_bridge_mint_receipt.is_none());
+
     finalizer
         .withdraw(&mut state)
         .await
         .expect("bridge completion should finish");
     assert!(matches!(state.step, CexStep::Completed));
+    assert_eq!(state.withdraw.size_out.as_ref().unwrap().value, Nat::from(1_500_000u64));
+    let saved: CexState = serde_json::from_str(&serde_json::to_string(&state).unwrap()).unwrap();
+    assert_eq!(
+        saved
+            .withdraw
+            .bridge
+            .withdraw_bridge_mint_receipt
+            .unwrap()
+            .mint_block_index,
+        Nat::from(42u64)
+    );
 }
 
 #[tokio::test]

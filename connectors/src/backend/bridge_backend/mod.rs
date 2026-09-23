@@ -1,14 +1,16 @@
 mod catalog;
 pub mod ckerc20_bridge;
 mod ckerc20_bridge_utils;
+mod mint_events;
 mod types;
 mod utils;
 pub use ckerc20_bridge::{
     BRIDGE_AMOUNT_BELOW_MINIMUM_PREFIX, BridgeEvmBackend, CkErc20BridgeBackend, FINALIZER_PERMANENT_AMOUNT_FLOOR_PREFIX,
 };
 pub use types::{
-    BridgeBackend, BridgeDestination, BridgeDestinationKind, BridgeFeeBudget, BridgeRequest, BridgeRouteKind,
-    BridgeRouteSpec, BridgeStatus, BridgeSubmission, BridgeSweepRoute, EvmReceiptStatus, MockBridgeBackend,
+    BridgeBackend, BridgeDestination, BridgeDestinationKind, BridgeFeeBudget, BridgeMintReceipt, BridgeRequest,
+    BridgeRouteKind, BridgeRouteSpec, BridgeStatus, BridgeSubmission, BridgeSweepRoute, EvmReceiptStatus,
+    MockBridgeBackend,
 };
 pub use utils::{
     cketh_forward_routes, cketh_reverse_routes, resolve_cketh_forward_route_by_source,
