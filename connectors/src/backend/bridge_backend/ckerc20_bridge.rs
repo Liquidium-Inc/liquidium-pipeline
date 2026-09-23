@@ -1072,26 +1072,18 @@ where
         };
 
         if receipt.success {
-            return Ok(
-                match super::mint_events::receipt(
-                    self.agent.as_ref(),
-                    &self.cketh_minter_canister,
-                    event_start,
-                    transaction_hash,
-                )
-                .await?
-                {
-                    Some(receipt) => {
-                        if expectation.as_ref().is_some_and(|expected| !expected.matches(&receipt)) {
-                            return Err(
-                                "mint evidence does not match the submitted amount, token and destination".into(),
-                            );
-                        }
-                        BridgeStatus::Minted(receipt)
-                    }
-                    None => BridgeStatus::Pending,
-                },
-            );
+            let status = super::mint_events::status(
+                self.agent.as_ref(),
+                &self.cketh_minter_canister,
+                event_start,
+                transaction_hash,
+            ).await?;
+            if let BridgeStatus::Minted(receipt) = &status {
+                if expectation.as_ref().is_some_and(|expected| !expected.matches(receipt)) {
+                    return Err("mint evidence does not match the submitted amount, token and destination".into());
+                }
+            }
+            return Ok(status);
         }
 
         Ok(BridgeStatus::Failed {

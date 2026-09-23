@@ -1,7 +1,7 @@
 //! Match the minter's successful ledger mint to its exact Ethereum event source.
 //! The append-only audit API is authoritative; wallet deltas and helper receipts
 //! cannot distinguish concurrent deposits or prove destination delivery.
-use super::BridgeMintReceipt;
+use super::{BridgeMintReceipt, BridgeStatus};
 use crate::pipeline_agent::PipelineAgent;
 use candid::{CandidType, Encode, IDLArgs, Nat, Principal, types::value::IDLValue};
 use icrc_ledger_types::icrc1::account::Account;
@@ -132,16 +132,38 @@ fn accepted_deposit(event: &IDLValue, hash: &str) -> Result<Option<(Nat, Nat, Ac
     )))
 }
 
-pub(super) async fn receipt<A: PipelineAgent>(
+pub(super) async fn status<A: PipelineAgent>(
     agent: &A,
     minter: &Principal,
     mut start: u64,
     hash: &str,
-) -> Result<Option<BridgeMintReceipt>, String> {
+) -> Result<BridgeStatus, String> {
     let mut accepted = Vec::new();
     loop {
         let (total, events) = page(agent, minter, start, 1000).await?;
         for event in &events {
+            let IDLValue::Variant(payload) = field(event, "payload")? else {
+                return Err("invalid minter event payload".into());
+            };
+            let tag = payload.0.id.get_id();
+            if tag == candid::idl_hash("InvalidDeposit") || tag == candid::idl_hash("QuarantinedDeposit") {
+                let source = field(&payload.0.val, "event_source")?;
+                let IDLValue::Text(transaction) = field(source, "transaction_hash")? else {
+                    return Err("invalid rejected deposit hash".into());
+                };
+                if transaction.eq_ignore_ascii_case(hash) {
+                    // A successful helper receipt does not imply a mint. Surface
+                    // minter rejection while preserving the submitted bridge ID.
+                    let kind = if tag == candid::idl_hash("InvalidDeposit") {
+                        "invalid"
+                    } else {
+                        "quarantined"
+                    };
+                    return Ok(BridgeStatus::Failed {
+                        reason: Some(format!("minter marked deposit {hash} {kind}; operator reconciliation required")),
+                    });
+                }
+            }
             if let Some(deposit) = accepted_deposit(event, hash)? {
                 accepted.push(deposit);
             }
@@ -163,7 +185,7 @@ pub(super) async fn receipt<A: PipelineAgent>(
                 } else {
                     return Err("invalid minted token symbol".into());
                 };
-                return Ok(Some(BridgeMintReceipt {
+                return Ok(BridgeStatus::Minted(BridgeMintReceipt {
                     transaction_hash: hash.to_string(),
                     log_index,
                     mint_block_index: nat(body, "mint_block_index")?,
@@ -177,11 +199,11 @@ pub(super) async fn receipt<A: PipelineAgent>(
             if start < total {
                 return Err("minter returned an empty nonterminal event page".into());
             }
-            return Ok(None);
+            return Ok(BridgeStatus::Pending);
         }
         start += events.len() as u64;
         if start >= total {
-            return Ok(None);
+            return Ok(BridgeStatus::Pending);
         }
     }
 }
@@ -229,6 +251,13 @@ mod tests {
 
     #[derive(CandidType)]
     enum Payload {
+        InvalidDeposit {
+            event_source: Source,
+            reason: String,
+        },
+        QuarantinedDeposit {
+            event_source: Source,
+        },
         AcceptedErc20Deposit {
             transaction_hash: String,
             log_index: Nat,
@@ -283,6 +312,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rejected_deposits_fail_only_the_matching_bridge() {
+        for quarantined in [false, true] {
+            for hash in ["0x123", "0x456"] {
+                let mut agent = crate::pipeline_agent::MockPipelineAgent::new();
+                agent.expect_call_query_raw().times(1).returning(move |_, _, _| {
+                    let event_source = Source { transaction_hash: hash.into(), log_index: 7u64.into() };
+                    let payload = if quarantined {
+                        Payload::QuarantinedDeposit { event_source }
+                    } else {
+                        Payload::InvalidDeposit { event_source, reason: "unsupported token".into() }
+                    };
+                    candid::encode_one(Page {
+                        events: vec![Event { timestamp: 0, payload }],
+                        total_event_count: 1,
+                    }).map_err(|e| e.to_string())
+                });
+                let result = status(&agent, &Principal::management_canister(), 0, "0x123").await.unwrap();
+                if hash == "0x123" {
+                    assert!(matches!(result, BridgeStatus::Failed { reason: Some(_) }));
+                } else {
+                    assert!(matches!(result, BridgeStatus::Pending));
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn accepted_and_unrelated_mints_stay_pending() {
         let mut agent = crate::pipeline_agent::MockPipelineAgent::new();
         agent.expect_call_query_raw().returning(|_, _, _| {
@@ -292,12 +348,12 @@ mod tests {
             })
             .map_err(|e| e.to_string())
         });
-        assert!(
-            receipt(&agent, &Principal::management_canister(), 0, "0x123")
+        assert!(matches!(
+            status(&agent, &Principal::management_canister(), 0, "0x123")
                 .await
-                .unwrap()
-                .is_none()
-        );
+                .unwrap(),
+            BridgeStatus::Pending
+        ));
     }
 
     #[tokio::test]
@@ -317,10 +373,9 @@ mod tests {
                 })
                 .map_err(|e| e.to_string())
             });
-            let result = receipt(&agent, &Principal::management_canister(), 42, "0x123")
+            let BridgeStatus::Minted(result) = status(&agent, &Principal::management_canister(), 42, "0x123")
                 .await
-                .unwrap()
-                .unwrap();
+                .unwrap() else { panic!("expected matching mint") };
             assert_eq!(result.log_index, Nat::from(7u64));
             assert_eq!(result.amount, Nat::from(123456u64));
             let mut expected = DepositExpectation {
