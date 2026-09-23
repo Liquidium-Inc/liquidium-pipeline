@@ -84,6 +84,18 @@ fn normalize_market_symbol(market: &str) -> String {
     market.replace(['/', '_', '-'], "").to_ascii_uppercase()
 }
 
+fn mexc_withdraw_coin_candidates(asset: &str) -> Vec<String> {
+    let asset = asset.trim().to_ascii_uppercase();
+    let native = asset.strip_prefix("CK").unwrap_or(&asset);
+    let mut candidates = vec![asset.clone()];
+    for candidate in [format!("CK{native}"), native.to_string()] {
+        if !candidates.contains(&candidate) {
+            candidates.push(candidate);
+        }
+    }
+    candidates
+}
+
 fn format_mexc_api_error(err: &v3::ApiError) -> String {
     match err {
         v3::ApiError::ErrorResponse(resp) => match &resp._extend {
@@ -1283,14 +1295,7 @@ impl CexBackend for MexcClient {
             }
         };
 
-        let asset_upper = asset.to_ascii_uppercase();
-        let asset_no_ck = asset_upper.strip_prefix("CK").unwrap_or(&asset_upper);
-        let mut candidates = Vec::new();
-        // Prefer native symbol and its CK-prefixed form first.
-        push_unique(&mut candidates, asset_upper.clone());
-        push_unique(&mut candidates, format!("CK{}", asset_no_ck));
-        push_unique(&mut candidates, asset_no_ck.to_string());
-        push_unique(&mut candidates, asset.to_string());
+        let candidates = mexc_withdraw_coin_candidates(asset);
 
         let mut network_candidates = mexc_network_candidates(asset, network);
         let network_mapped = mexc_withdraw_network(asset, network);
@@ -1327,7 +1332,7 @@ impl CexBackend for MexcClient {
                     .await
                 {
                     Ok(ok) => {
-                        res = Some(ok);
+                        res = Some((ok, coin.clone()));
                         break;
                     }
                     Err(e) => {
@@ -1347,13 +1352,13 @@ impl CexBackend for MexcClient {
             }
         }
 
-        let res = match res {
+        let (res, accepted_coin) = match res {
             Some(res) => res,
             None => return Err(hard_err.or(last_err).unwrap_or_else(|| "withdraw failed".to_string())),
         };
 
         Ok(WithdrawalReceipt {
-            asset: asset.to_string(),
+            asset: accepted_coin,
             network: network_mapped,
             amount,
             txid: None,
@@ -1372,22 +1377,28 @@ impl CexBackend for MexcClient {
         withdraw_id: &str,
     ) -> Result<WithdrawStatusSnapshot, String> {
         let ex = self.inner.lock().await;
-        let records = ex
-            .withdraw_history(WithdrawHistoryRequest {
-                // Use the same exchange symbol as submission so a case-sensitive
-                // history filter cannot hide mixed-case CK withdrawal receipts.
-                coin: Some(coin.trim().to_ascii_uppercase()),
+        let mut rec = None;
+        // Older durable rows retain the planned symbol, not the alias MEXC
+        // accepted. Search the same candidates as submission, matching only the
+        // durable withdrawal ID; absence under one alias is not non-delivery.
+        for candidate in mexc_withdraw_coin_candidates(coin) {
+            let records = match ex.withdraw_history(WithdrawHistoryRequest {
+                coin: Some(candidate),
                 status: None,
                 limit: Some(DEFAULT_WITHDRAW_HISTORY_LIMIT),
                 start_time: None,
                 end_time: None,
-            })
-            .await
-            .map_err(|e| e.to_string())?;
-
-        let rec = records
-            .into_iter()
-            .find(|r| r.id == withdraw_id || r.withdraw_order_id.as_deref() == Some(withdraw_id));
+            }).await {
+                Ok(records) => records,
+                Err(error) if is_coin_missing(&error) => continue,
+                Err(error) => return Err(error.to_string()),
+            };
+            rec = records.into_iter()
+                .find(|record| record.id == withdraw_id || record.withdraw_order_id.as_deref() == Some(withdraw_id));
+            if rec.is_some() {
+                break;
+            }
+        }
 
         let rec = match rec {
             Some(r) => r,
@@ -1441,6 +1452,13 @@ impl CexBackend for MexcClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn withdrawal_submission_and_history_cover_native_and_ck_aliases() {
+        assert_eq!(mexc_withdraw_coin_candidates(" usdc "), ["USDC", "CKUSDC"]);
+        assert_eq!(mexc_withdraw_coin_candidates("ckUSDC"), ["CKUSDC", "USDC"]);
+        assert_eq!(mexc_withdraw_coin_candidates("ICP"), ["ICP", "CKICP"]);
+    }
 
     // Buy fill mapping should keep quote as input-consumed and apply fee haircut to base output.
     #[test]
