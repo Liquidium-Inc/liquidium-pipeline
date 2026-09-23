@@ -383,10 +383,16 @@ async fn run_single_daemon_cycle(
                     );
                 }
 
-                let _ = executor.process(&executions).await.unwrap_or_else(|e| {
-                    tracing::error!("Executor failed: {e}");
-                    vec![]
-                });
+                if let Err(error) = executor.process(&executions).await {
+                    tracing::error!("Executor failed: {error}");
+                    liq_dog.notify(WatchdogEvent::OperatorRequired {
+                        execution_id: "liquidation-intake".to_string(),
+                        venue: "protocol".to_string(),
+                        pending_step: "persist-liquidation-result".to_string(),
+                        owner: executor.account_id.owner.to_text(),
+                        details: error,
+                    }).await;
+                }
             }
             .instrument(info_span!("liquidation.cycle", opportunities = opp_count));
 

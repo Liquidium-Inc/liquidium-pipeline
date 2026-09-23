@@ -194,7 +194,7 @@ pub trait LiquidationIntentStore: Send + Sync {
         receipt: Option<ExecutionReceipt>,
         error: &str,
     ) -> Result<()>;
-    async fn mark_ambiguous(&self, intent_id: &str, error: &str) -> Result<()>;
+    async fn mark_ambiguous(&self, intent_id: &str, error: &str, receipt: Option<ExecutionReceipt>) -> Result<()>;
     async fn recover_submitting_as_ambiguous(&self, reason: &str) -> Result<usize>;
     async fn get_intent(&self, intent_id: &str) -> Result<Option<LiquidationIntentRecord>>;
 }

@@ -103,7 +103,7 @@ impl<'a, A: PipelineAgent, D: LiquidationIntentStore> PipelineStage<'a, Vec<Exec
                         warn!("Liquidation call failed {err}");
                         receipt.status = ExecutionStatus::LiquidationCallFailed(err.clone());
                         self.intents
-                            .mark_ambiguous(&intent_id, &err)
+                            .mark_ambiguous(&intent_id, &err, None)
                             .await
                             .map_err(|store_error| {
                                 format!("failed to mark liquidation intent {intent_id} ambiguous: {store_error}")
@@ -202,12 +202,7 @@ impl<'a, A: PipelineAgent, D: LiquidationIntentStore> PipelineStage<'a, Vec<Exec
                 }
 
                 debug!("Executed liquidation {:?}", liq);
-                self.intents
-                    .mark_accepted(&intent_id, &liq.id.to_string(), &receipt)
-                    .await
-                    .map_err(|store_error| {
-                        format!("failed to mark liquidation intent {intent_id} accepted: {store_error}")
-                    })?;
+                persist_accepted_receipt(self.intents.as_ref(), &intent_id, &liq.id.to_string(), &receipt).await?;
 
                 Ok::<ExecutionReceipt, String>(receipt)
             }
@@ -224,6 +219,37 @@ impl<'a, A: PipelineAgent, D: LiquidationIntentStore> PipelineStage<'a, Vec<Exec
 
         Ok(liquidations)
     }
+}
+
+async fn persist_accepted_receipt<D: LiquidationIntentStore>(
+    intents: &D,
+    intent_id: &str,
+    liquidation_id: &str,
+    receipt: &ExecutionReceipt,
+) -> Result<(), String> {
+    // The chain has already moved funds. Retry only the atomic local write,
+    // never the liquidation call. Keep retries bounded within the cycle timeout.
+    let mut last_error = String::new();
+    for attempt in 0..3 {
+        match intents.mark_accepted(intent_id, liquidation_id, receipt).await {
+            Ok(()) => return Ok(()),
+            Err(error) => last_error = error.to_string(),
+        }
+        if attempt < 2 {
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        }
+    }
+
+    let mut details = format!(
+        "liquidation {liquidation_id} succeeded on-chain but intent {intent_id} could not be accepted: {last_error}; operator reconciliation required; do not resubmit"
+    );
+    // Preserve the successful receipt separately from the failed execution-row
+    // insert. Ambiguous intents are never picked up for automatic resubmission.
+    if let Err(error) = intents.mark_ambiguous(intent_id, &details, Some(receipt.clone())).await {
+        details.push_str(&format!("; could not persist ambiguous state: {error}"));
+    }
+    tracing::error!(intent_id, liquidation_id, receipt = ?receipt, "{details}");
+    Err(details)
 }
 
 #[cfg(test)]
@@ -537,14 +563,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn acceptance_failures_retry_only_persistence_and_preserve_the_receipt() {
+        for recover in [true, false] {
+            let mut intents = MockLiquidationIntentStore::new();
+            intents.expect_create_submitting().times(1).returning(|_, _| Ok(()));
+            let mut sequence = mockall::Sequence::new();
+            intents.expect_mark_accepted()
+                .times(if recover { 1 } else { 3 })
+                .in_sequence(&mut sequence)
+                .returning(|_, _, _| Err(anyhow::anyhow!("database locked")));
+            if recover {
+                intents.expect_mark_accepted().times(1).in_sequence(&mut sequence).returning(|_, _, _| Ok(()));
+            } else {
+                intents.expect_mark_ambiguous().times(1).in_sequence(&mut sequence)
+                    .returning(|_, _, receipt| {
+                        let receipt = receipt.expect("retain the successful chain receipt");
+                        assert_eq!(receipt.liquidation_result.unwrap().id, Nat::from(77u64));
+                        Ok(())
+                    });
+            }
+            let mut agent = MockPipelineAgent::new();
+            agent.expect_call_update::<Result<LiquidationResult, ProtocolError>>()
+                .times(1)
+                .returning(|_, _, _| Ok(Ok(make_liquidation_result(77))));
+            let executor = BasicExecutor::new(
+                Arc::new(agent),
+                Account { owner: p("2vxsx-fae"), subaccount: None },
+                p("nja4y-2yaaa-aaaae-qddxa-cai"),
+                Arc::new(intents),
+                Arc::new(ApprovalState::new()),
+            );
+            let result = executor.process(&vec![make_request(
+                p("2vxsx-fae"),
+                ChainToken::Icp {
+                    ledger: p("ryjl3-tyaaa-aaaaa-aaaba-cai"),
+                    symbol: "ICP".to_string(),
+                    decimals: 8,
+                    fee: Nat::from(10_000u64),
+                },
+            )]).await;
+            if recover {
+                assert!(result.is_ok());
+            } else {
+                assert!(result.unwrap_err().contains("operator reconciliation required"));
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn transport_failure_parks_the_intent_as_ambiguous() {
         let mut intents = MockLiquidationIntentStore::new();
         intents.expect_create_submitting().times(1).returning(|_, _| Ok(()));
         intents
             .expect_mark_ambiguous()
-            .withf(|_, error| error == "response lost")
+            .withf(|_, error, receipt| error == "response lost" && receipt.is_none())
             .times(1)
-            .returning(|_, _| Ok(()));
+            .returning(|_, _, _| Ok(()));
         let mut agent = MockPipelineAgent::new();
         agent
             .expect_call_update::<Result<LiquidationResult, ProtocolError>>()

@@ -141,7 +141,7 @@ pub async fn run(opts: TuiOptions) -> anyhow::Result<()> {
             let store = match SqliteWalStore::new_read_only_with_busy_timeout(&db_path, 30_000) {
                 Ok(store) => Arc::new(store),
                 Err(error) => {
-                    let _ = ui_tx.send(UiEvent::DaemonPaused(Err(format!("intake db open failed: {error}"))));
+                    let _ = ui_tx.send(UiEvent::DaemonPaused(Err(format!("control state db open failed: {error}"))));
                     return;
                 }
             };
@@ -160,10 +160,10 @@ pub async fn run(opts: TuiOptions) -> anyhow::Result<()> {
                         let _ = ui_tx.send(UiEvent::DaemonPaused(Ok(paused)));
                     }
                     Ok(Err(error)) => {
-                        let _ = ui_tx.send(UiEvent::DaemonPaused(Err(format!("intake db query failed: {error}"))));
+                        let _ = ui_tx.send(UiEvent::DaemonPaused(Err(format!("control state db query failed: {error}"))));
                     }
                     Err(error) => {
-                        let _ = ui_tx.send(UiEvent::DaemonPaused(Err(format!("intake db task failed: {error}"))));
+                        let _ = ui_tx.send(UiEvent::DaemonPaused(Err(format!("control state db task failed: {error}"))));
                     }
                 }
             }

@@ -193,13 +193,19 @@ impl LiquidationIntentStore for SqliteWalStore {
         Ok(())
     }
 
-    async fn mark_ambiguous(&self, intent_id: &str, error: &str) -> Result<()> {
+    async fn mark_ambiguous(&self, intent_id: &str, error: &str, receipt: Option<ExecutionReceipt>) -> Result<()> {
         self.ensure_writable()?;
+        let liquidation_id = receipt.as_ref().and_then(|receipt| {
+            receipt.liquidation_result.as_ref().map(|liquidation| liquidation.id.to_string())
+        });
+        let receipt_json = receipt.as_ref().map(serde_json::to_string).transpose()?;
         let mut conn = self.get_conn()?;
         let updated = diesel::sql_query(
-            "UPDATE liquidation_intents SET status = ?, last_error = ?, updated_at = ? \
+            "UPDATE liquidation_intents SET liquidation_id = ?, receipt_json = ?, status = ?, last_error = ?, updated_at = ? \
              WHERE intent_id = ? AND status = ?",
         )
+        .bind::<Nullable<Text>, _>(liquidation_id)
+        .bind::<Nullable<Text>, _>(receipt_json)
         .bind::<Integer, _>(LiquidationIntentStatus::Ambiguous as i32)
         .bind::<Text, _>(error)
         .bind::<BigInt, _>(now_secs())
@@ -434,9 +440,15 @@ mod tests {
         ).unwrap();
 
         assert!(store.mark_accepted("intent", "42", &receipt(42)).await.is_err());
+        assert_eq!(store.get_intent("intent").await.unwrap().unwrap().status, LiquidationIntentStatus::Submitting);
+        store.mark_ambiguous("intent", "execution insert failed", Some(receipt(42))).await.unwrap();
         drop(store);
         let reopened = SqliteWalStore::new(path).unwrap();
-        assert_eq!(reopened.get_intent("intent").await.unwrap().unwrap().status, LiquidationIntentStatus::Submitting);
+        let intent = reopened.get_intent("intent").await.unwrap().unwrap();
+        assert_eq!(intent.status, LiquidationIntentStatus::Ambiguous);
+        assert_eq!(intent.liquidation_id.as_deref(), Some("42"));
+        let saved: ExecutionReceipt = serde_json::from_str(intent.receipt_json.as_deref().unwrap()).unwrap();
+        assert_eq!(saved.liquidation_result.unwrap().id, Nat::from(42u64));
         assert!(reopened.get_result("42").await.unwrap().is_none());
     }
 
@@ -452,7 +464,7 @@ mod tests {
             SqliteWalStore::new_read_only_with_busy_timeout(path, 5_000).expect("read-only store");
         assert!(reader.get_intent("intent").await.unwrap().is_some());
         assert!(reader.daemon_paused().expect("read pause state"));
-        assert!(reader.mark_ambiguous("intent", "must fail").await.is_err());
+        assert!(reader.mark_ambiguous("intent", "must fail", None).await.is_err());
         assert!(reader.set_daemon_paused(false).is_err());
     }
 }

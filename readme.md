@@ -49,6 +49,14 @@ transaction. Interrupted submissions remain ambiguous rather than being replayed
 there is no second intake database, handoff importer or import cursor. The daemon
 lock is scoped to `DB_PATH`, and the TUI reads pause state from that same database.
 
+After a successful chain call, acceptance persistence is attempted up to three
+times without repeating the liquidation. If it still fails, the intent is parked
+as ambiguous with its chain receipt for operator reconciliation, and the daemon
+sends an operator-required watchdog alert. If the database also rejects that
+fallback write, the receipt is logged and the alert reports the persistence
+failure; startup still parks the remaining submitting intent. This does not
+automatically replay the liquidation or claim that its collateral was settled.
+
 The earlier unmerged two-database layout is not automatically migrated. Startup
 rejects `LIQUIDATIONS_DB_PATH` and WALs containing `intake_import_state` so accepted
 work in the old intake file cannot be silently left behind. Reconcile those files
