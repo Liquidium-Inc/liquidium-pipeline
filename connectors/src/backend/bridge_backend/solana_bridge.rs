@@ -129,8 +129,9 @@ enum DepositSolStatus {
 #[derive(serde::Serialize, Deserialize)]
 struct QueuedSolDeposit {
     account: Account,
-    deposit_id: u64,
+    deposit_id: Option<u64>,
     transfer_signature: String,
+    notification_error: Option<String>,
 }
 
 const QUEUED_DEPOSIT_PREFIX: &str = "cksol-deposit-v2:";
@@ -637,14 +638,21 @@ where
             "deposit_sol",
             args,
             minter_info.deposit_sol_required_cycles,
-        ).await?;
-        let deposit_id = result.map_err(|error| format!("deposit_sol rejected: {error:?}"))?;
+        ).await;
+        // SOL has already moved. Preserve a handle even if notification failed,
+        // otherwise a finaliser retry can transfer the same funds twice.
+        let (deposit_id, notification_error) = match result {
+            Ok(Ok(id)) => (Some(id), None),
+            Ok(Err(error)) => (None, Some(format!("{error:?}"))),
+            Err(error) => (None, Some(error)),
+        };
         // Sweep costs determine the credited amount. Persist the minter's ID so
         // completion cannot be inferred from another deposit's wallet credit.
         let bridge_id = format!("{QUEUED_DEPOSIT_PREFIX}{}", serde_json::to_string(&QueuedSolDeposit {
             account: *destination,
             deposit_id,
             transfer_signature,
+            notification_error,
         }).map_err(|error| error.to_string())?);
 
         Ok(BridgeSubmission { bridge_id })
@@ -761,15 +769,18 @@ where
     async fn get_bridge_status(&self, bridge_id: &str) -> Result<BridgeStatus, String> {
         if let Some(encoded) = bridge_id.strip_prefix(QUEUED_DEPOSIT_PREFIX) {
             let state: QueuedSolDeposit = serde_json::from_str(encoded).map_err(|error| error.to_string())?;
+            let Some(deposit_id) = state.deposit_id else {
+                return Ok(BridgeStatus::Unknown);
+            };
             let status = self.agent.call_query::<DepositSolStatus>(
                 &self.cksol_minter_canister,
                 "deposit_sol_status",
-                Encode!(&state.deposit_id).map_err(|error| error.to_string())?,
+                Encode!(&deposit_id).map_err(|error| error.to_string())?,
             ).await?;
             return Ok(match status {
                 DepositSolStatus::Minted { block_index, minted_amount } => BridgeStatus::Minted(BridgeMintReceipt {
                     transaction_hash: state.transfer_signature,
-                    log_index: Nat::from(state.deposit_id),
+                    log_index: Nat::from(deposit_id),
                     mint_block_index: Nat::from(block_index),
                     amount: Nat::from(minted_amount),
                     recipient: state.account,
@@ -939,8 +950,9 @@ mod tests {
     async fn queued_deposit_uses_actual_mint_receipt_without_wallet_balance() {
         let state = super::QueuedSolDeposit {
             account: Account { owner: bridge_owner(), subaccount: Some([7; 32]) },
-            deposit_id: 42,
+            deposit_id: Some(42),
             transfer_signature: "sol-transfer".into(),
+            notification_error: None,
         };
         let id = format!("{}{}", super::QUEUED_DEPOSIT_PREFIX, serde_json::to_string(&state).unwrap());
         let mut agent = MockPipelineAgent::new();
@@ -1020,6 +1032,19 @@ mod tests {
 
     #[tokio::test]
     async fn solana_to_icp_persists_queued_deposit_id_after_transfer() {
+        assert_deposit_notification_handle(Ok(Ok(77)), Some(77)).await;
+    }
+
+    #[tokio::test]
+    async fn ambiguous_notification_stays_unknown_without_resubmitting() {
+        assert_deposit_notification_handle(Err("timeout".into()), None).await;
+        assert_deposit_notification_handle(Ok(Err(DepositSolError::AlreadyProcessing)), None).await;
+    }
+
+    async fn assert_deposit_notification_handle(
+        result: Result<Result<u64, DepositSolError>, String>,
+        expected_id: Option<u64>,
+    ) {
         let source = bridge_source_address();
         let derived_deposit = deposit_address();
         let query_deposit = derived_deposit.clone();
@@ -1050,7 +1075,7 @@ mod tests {
                 assert_eq!(*canister, minter_canister());
                 assert_eq!(method, "deposit_sol");
                 assert_eq!(cycles, Nat::from(1_000_000_000_000u64));
-                Ok(Ok(77))
+                result.clone()
             });
 
         let mut mock_icp = MockIcpBackend::new();
@@ -1086,8 +1111,15 @@ mod tests {
 
         assert_eq!(decoded.account.owner, bridge_owner());
         assert_eq!(decoded.account.subaccount, subaccount);
-        assert_eq!(decoded.deposit_id, 77);
+        assert_eq!(decoded.deposit_id, expected_id);
         assert_eq!(decoded.transfer_signature, "sig-123");
+        if expected_id.is_none() {
+            assert!(decoded.notification_error.is_some());
+            assert_eq!(
+                backend.get_bridge_status(&submission.bridge_id).await.unwrap(),
+                super::BridgeStatus::Unknown
+            );
+        }
     }
 
     #[tokio::test]
