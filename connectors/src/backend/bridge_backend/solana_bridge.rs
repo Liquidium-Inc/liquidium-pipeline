@@ -102,6 +102,7 @@ enum CkSolWithdrawalError {
         withdrawal_amount: u64,
     },
     MalformedAddress(String),
+    InvalidDestination(String),
     InsufficientFunds {
         balance: u64,
     },
@@ -542,6 +543,9 @@ where
             CkSolWithdrawalError::MalformedAddress(address) => {
                 format!("ckSOL withdraw rejected: MalformedAddress ({address})")
             }
+            CkSolWithdrawalError::InvalidDestination(reason) => {
+                format!("ckSOL withdraw rejected: InvalidDestination ({reason})")
+            }
             CkSolWithdrawalError::InsufficientFunds { balance } => {
                 format!("ckSOL withdraw rejected: InsufficientFunds (balance={balance})")
             }
@@ -560,7 +564,7 @@ where
             .agent
             .call_update::<Result<CkSolWithdrawalOk, CkSolWithdrawalError>>(
                 &self.cksol_minter_canister,
-                "withdraw",
+                "withdraw_sol",
                 arg_blob,
             )
             .await
@@ -573,7 +577,7 @@ where
         let args = CkSolWithdrawalStatusArgs { block_index };
         let arg_blob = Encode!(&args).map_err(|e| format!("encode withdrawal_status args failed: {e}"))?;
         self.agent
-            .call_update::<CkSolWithdrawalStatus>(&self.cksol_minter_canister, "withdrawal_status", arg_blob)
+            .call_update::<CkSolWithdrawalStatus>(&self.cksol_minter_canister, "withdraw_sol_status", arg_blob)
             .await
             .map_err(|e| {
                 format!(
@@ -1293,7 +1297,10 @@ mod tests {
         mock_agent
             .expect_call_update::<Result<CkSolWithdrawalOk, CkSolWithdrawalError>>()
             .times(1)
-            .returning(|_, _, _| Ok(Ok(CkSolWithdrawalOk { block_index: 42 })));
+            .returning(|_, method, _| {
+                assert_eq!(method, "withdraw_sol");
+                Ok(Ok(CkSolWithdrawalOk { block_index: 42 }))
+            });
 
         let mut mock_icp = MockIcpBackend::new();
         mock_icp.expect_icrc1_decimals().times(1).returning(|_| Ok(9));
@@ -1363,7 +1370,8 @@ mod tests {
         mock_agent
             .expect_call_update::<CkSolWithdrawalStatus>()
             .times(5)
-            .returning(move |_, _, _| {
+            .returning(move |_, method, _| {
+                assert_eq!(method, "withdraw_sol_status");
                 let mut guard = status_call_count_clone.lock().expect("mutex");
                 let out = match *guard {
                     0 => CkSolWithdrawalStatus::Pending,
