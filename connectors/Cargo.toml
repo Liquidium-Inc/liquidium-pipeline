@@ -12,6 +12,7 @@ type_complexity = "allow"
 collapsible_if = "allow"
 
 [dependencies]
+serde_json.workspace = true
 serde = { workspace = true }
 alloy = { workspace = true }
 candid = { workspace = true }

@@ -9,7 +9,8 @@ use serde::Deserialize;
 use std::{str::FromStr, sync::Arc};
 
 use super::{
-    BridgeBackend, BridgeDestination, BridgeRequest, BridgeRouteKind, BridgeRouteSpec, BridgeStatus, BridgeSubmission,
+    BridgeBackend, BridgeDestination, BridgeMintReceipt, BridgeRequest, BridgeRouteKind, BridgeRouteSpec, BridgeStatus,
+    BridgeSubmission,
     catalog::BRIDGE_ROUTE_CATALOG, resolve_route, validate_destination_for_route,
 };
 use crate::{
@@ -36,50 +37,9 @@ struct CkSolGetDepositAddressArgs {
 }
 
 #[derive(CandidType, Deserialize, Clone, Debug)]
-struct CkSolProcessDepositArgs {
-    owner: Option<Principal>,
-    subaccount: Option<[u8; 32]>,
-    signature: String,
-}
-
-#[derive(CandidType, Deserialize, Clone, Debug)]
 struct CkSolInsufficientCyclesError {
     expected: Nat,
     received: Nat,
-}
-
-#[derive(CandidType, Deserialize, Clone, Debug)]
-struct CkSolDepositId {
-    signature: String,
-    account: Account,
-}
-
-#[derive(CandidType, Deserialize, Clone, Debug)]
-enum CkSolDepositStatus {
-    Processing {
-        deposit_amount: u64,
-        amount_to_mint: u64,
-        deposit_id: CkSolDepositId,
-    },
-    Quarantined(CkSolDepositId),
-    Minted {
-        block_index: u64,
-        minted_amount: u64,
-        deposit_id: CkSolDepositId,
-    },
-}
-
-#[derive(CandidType, Deserialize, Clone, Debug)]
-enum CkSolProcessDepositError {
-    InsufficientCycles(CkSolInsufficientCyclesError),
-    TemporarilyUnavailable(String),
-    AlreadyProcessing,
-    TransactionNotFound,
-    InvalidDepositTransaction(String),
-    ValueTooSmall {
-        minimum_deposit_amount: u64,
-        deposit_amount: u64,
-    },
 }
 
 #[derive(CandidType, Deserialize, Clone, Debug)]
@@ -138,15 +98,42 @@ enum CkSolWithdrawalStatus {
 
 #[derive(CandidType, Deserialize, Clone, Debug)]
 struct CkSolMinterInfo {
-    manual_deposit_fee: u64,
-    automated_deposit_fee: u64,
-    deposit_consolidation_fee: Nat,
+    deposit_sol_fee: Nat,
     minimum_withdrawal_amount: u64,
     minimum_deposit_amount: u64,
     withdrawal_fee: u64,
-    process_deposit_required_cycles: Nat,
+    deposit_sol_required_cycles: Nat,
     balance: u64,
 }
+
+#[derive(CandidType, Deserialize, Clone, Debug)]
+enum DepositSolError {
+    InsufficientCycles(CkSolInsufficientCyclesError),
+    TemporarilyUnavailable(String),
+    AlreadyProcessing,
+    ValueTooSmall { balance: u64, minimum_deposit_amount: u64 },
+    Quarantined { deposit_id: u64 },
+}
+
+#[derive(CandidType, Deserialize, Clone, Debug)]
+enum DepositSolStatus {
+    NotFound,
+    Queued { sweepable_amount: u64 },
+    Swept { signature: String },
+    Finalized { signature: String },
+    Minted { block_index: u64, minted_amount: u64 },
+    Dropped { signature: String },
+    Quarantined { signature: String },
+}
+
+#[derive(serde::Serialize, Deserialize)]
+struct QueuedSolDeposit {
+    account: Account,
+    deposit_id: u64,
+    transfer_signature: String,
+}
+
+const QUEUED_DEPOSIT_PREFIX: &str = "cksol-deposit-v2:";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct DepositBridgePollState {
@@ -469,65 +456,9 @@ where
 
     fn resolve_proxy_canister(&self) -> Result<Principal, String> {
         self.bridge_proxy_canister.ok_or_else(|| {
-            "bridge proxy canister is not configured. Set BRIDGE_IC_PROXY_CANISTER or pass --proxy-canister to spend cycles for process_deposit"
+            "bridge proxy canister is not configured. Set BRIDGE_IC_PROXY_CANISTER or pass --proxy-canister to spend cycles for deposit_sol"
                 .to_string()
         })
-    }
-
-    fn map_process_deposit_error(err: CkSolProcessDepositError) -> String {
-        match err {
-            CkSolProcessDepositError::InsufficientCycles(detail) => format!(
-                "process_deposit rejected: InsufficientCycles (expected={}, received={})",
-                detail.expected, detail.received
-            ),
-            CkSolProcessDepositError::TemporarilyUnavailable(message) => {
-                format!("process_deposit rejected: TemporarilyUnavailable ({message})")
-            }
-            CkSolProcessDepositError::AlreadyProcessing => "process_deposit rejected: AlreadyProcessing".to_string(),
-            CkSolProcessDepositError::TransactionNotFound => {
-                "process_deposit rejected: TransactionNotFound".to_string()
-            }
-            CkSolProcessDepositError::InvalidDepositTransaction(message) => {
-                format!("process_deposit rejected: InvalidDepositTransaction ({message})")
-            }
-            CkSolProcessDepositError::ValueTooSmall {
-                minimum_deposit_amount,
-                deposit_amount,
-            } => format!(
-                "process_deposit rejected: ValueTooSmall (minimum_deposit_amount={}, deposit_amount={})",
-                minimum_deposit_amount, deposit_amount
-            ),
-        }
-    }
-
-    async fn process_deposit_via_proxy(
-        &self,
-        proxy_canister: &Principal,
-        args: CkSolProcessDepositArgs,
-        cycles: Nat,
-    ) -> Result<CkSolDepositStatus, String> {
-        let arg_blob = Encode!(&args).map_err(|e| format!("encode process_deposit args failed: {e}"))?;
-        let result: Result<CkSolDepositStatus, CkSolProcessDepositError> = self
-            .agent
-            .call_update_via_proxy::<Result<CkSolDepositStatus, CkSolProcessDepositError>>(
-                proxy_canister,
-                &self.cksol_minter_canister,
-                "process_deposit",
-                arg_blob,
-                cycles,
-            )
-            .await
-            .map_err(|e| {
-                format!(
-                    "process_deposit proxy-forwarded call failed (proxy={} minter={}): {e}",
-                    proxy_canister, self.cksol_minter_canister
-                )
-            })?;
-
-        match result {
-            Ok(status) => Ok(status),
-            Err(err) => Err(Self::map_process_deposit_error(err)),
-        }
     }
 
     fn map_withdraw_error(err: CkSolWithdrawalError) -> String {
@@ -669,12 +600,6 @@ where
                 amount_lamports, minter_info.minimum_deposit_amount
             ));
         }
-        if amount_lamports <= minter_info.manual_deposit_fee {
-            return Err(format!(
-                "bridge amount preflight failed: requested SOL amount must exceed manual deposit fee (requested={} lamports, manual_deposit_fee={} lamports)",
-                amount_lamports, minter_info.manual_deposit_fee
-            ));
-        }
 
         let required_budget = amount_native.clone() + Nat::from(self.fee_buffer_lamports);
         let available_balance = self.solana_backend.native_balance().await.map_err(|e| {
@@ -690,14 +615,6 @@ where
             ));
         }
 
-        let baseline = icrc1_balance_with_context(
-            self.icp_backend.as_ref(),
-            self.cksol_ledger_canister,
-            destination,
-            "cksol bridge",
-        )
-        .await?;
-
         let transfer_signature = self
             .solana_backend
             .native_transfer(&expected_source, amount_native.clone())
@@ -709,26 +626,26 @@ where
                 )
             })?;
 
-        let _deposit_status = self
-            .process_deposit_via_proxy(
-                &proxy_canister,
-                CkSolProcessDepositArgs {
-                    owner: Some(destination.owner),
-                    subaccount: destination.subaccount,
-                    signature: transfer_signature.clone(),
-                },
-                minter_info.process_deposit_required_cycles.clone(),
-            )
-            .await?;
-
-        let expected_mint_lamports = amount_lamports - minter_info.manual_deposit_fee;
-        let threshold = baseline.clone() + Nat::from(expected_mint_lamports);
-        let bridge_id = Self::encode_deposit_bridge_id(&DepositBridgePollState {
+        let args = Encode!(&CkSolGetDepositAddressArgs {
+            owner: Some(destination.owner),
+            subaccount: destination.subaccount,
+        })
+        .map_err(|error| error.to_string())?;
+        let result = self.agent.call_update_via_proxy::<Result<u64, DepositSolError>>(
+            &proxy_canister,
+            &self.cksol_minter_canister,
+            "deposit_sol",
+            args,
+            minter_info.deposit_sol_required_cycles,
+        ).await?;
+        let deposit_id = result.map_err(|error| format!("deposit_sol rejected: {error:?}"))?;
+        // Sweep costs determine the credited amount. Persist the minter's ID so
+        // completion cannot be inferred from another deposit's wallet credit.
+        let bridge_id = format!("{QUEUED_DEPOSIT_PREFIX}{}", serde_json::to_string(&QueuedSolDeposit {
             account: *destination,
-            baseline,
-            threshold,
-            transfer_signature: Some(transfer_signature),
-        });
+            deposit_id,
+            transfer_signature,
+        }).map_err(|error| error.to_string())?);
 
         Ok(BridgeSubmission { bridge_id })
     }
@@ -842,6 +759,33 @@ where
     }
 
     async fn get_bridge_status(&self, bridge_id: &str) -> Result<BridgeStatus, String> {
+        if let Some(encoded) = bridge_id.strip_prefix(QUEUED_DEPOSIT_PREFIX) {
+            let state: QueuedSolDeposit = serde_json::from_str(encoded).map_err(|error| error.to_string())?;
+            let status = self.agent.call_query::<DepositSolStatus>(
+                &self.cksol_minter_canister,
+                "deposit_sol_status",
+                Encode!(&state.deposit_id).map_err(|error| error.to_string())?,
+            ).await?;
+            return Ok(match status {
+                DepositSolStatus::Minted { block_index, minted_amount } => BridgeStatus::Minted(BridgeMintReceipt {
+                    transaction_hash: state.transfer_signature,
+                    log_index: Nat::from(state.deposit_id),
+                    mint_block_index: Nat::from(block_index),
+                    amount: Nat::from(minted_amount),
+                    recipient: state.account,
+                    token_symbol: "ckSOL".into(),
+                }),
+                DepositSolStatus::Queued { .. } | DepositSolStatus::Swept { .. }
+                | DepositSolStatus::Finalized { .. } => BridgeStatus::Pending,
+                DepositSolStatus::NotFound => BridgeStatus::Unknown,
+                DepositSolStatus::Dropped { signature } => BridgeStatus::Failed {
+                    reason: Some(format!("SOL sweep dropped: {signature}")),
+                },
+                // A quarantined mint may have landed. Keep it unresolved rather
+                // than classifying it as a clean failure permitting a new transfer.
+                DepositSolStatus::Quarantined { .. } => BridgeStatus::Unknown,
+            });
+        }
         if let Some(block_index) = Self::parse_withdraw_bridge_id(bridge_id)? {
             let status = self.withdrawal_status(block_index).await?;
             return Ok(match status {
@@ -881,7 +825,7 @@ where
 mod tests {
     use super::super::{BridgeBackend, BridgeDestination, BridgeRequest};
     use super::{
-        CkSolDepositId, CkSolDepositStatus, CkSolMinterInfo, CkSolProcessDepositError, CkSolTxFinalizedStatus,
+        CkSolMinterInfo, CkSolTxFinalizedStatus, DepositSolError,
         CkSolWithdrawalError, CkSolWithdrawalOk, CkSolWithdrawalStatus, DEFAULT_SOLANA_BRIDGE_FEE_BUFFER_LAMPORTS,
         DEPOSIT_BRIDGE_ID_PREFIX, DepositBridgePollState, SolanaBridgeBackend, WITHDRAW_BRIDGE_ID_PREFIX,
     };
@@ -982,15 +926,35 @@ mod tests {
 
     fn default_minter_info() -> CkSolMinterInfo {
         CkSolMinterInfo {
-            manual_deposit_fee: 10_000,
-            automated_deposit_fee: 10_000_000,
-            deposit_consolidation_fee: Nat::from(10_000_000_000u64),
+            deposit_sol_fee: Nat::from(45_000_000_000u64),
             minimum_withdrawal_amount: 2_000_000,
             minimum_deposit_amount: 20_000_000,
             withdrawal_fee: 1_000_000,
-            process_deposit_required_cycles: Nat::from(1_000_000_000_000u64),
+            deposit_sol_required_cycles: Nat::from(1_000_000_000_000u64),
             balance: 0,
         }
+    }
+
+    #[tokio::test]
+    async fn queued_deposit_uses_actual_mint_receipt_without_wallet_balance() {
+        let state = super::QueuedSolDeposit {
+            account: Account { owner: bridge_owner(), subaccount: Some([7; 32]) },
+            deposit_id: 42,
+            transfer_signature: "sol-transfer".into(),
+        };
+        let id = format!("{}{}", super::QUEUED_DEPOSIT_PREFIX, serde_json::to_string(&state).unwrap());
+        let mut agent = MockPipelineAgent::new();
+        agent.expect_call_query::<super::DepositSolStatus>().times(1).returning(|_, method, args| {
+            assert_eq!(method, "deposit_sol_status");
+            assert_eq!(candid::decode_one::<u64>(&args).unwrap(), 42);
+            Ok(super::DepositSolStatus::Minted { block_index: 88, minted_amount: 999104120 })
+        });
+        let backend = backend(agent, MockIcpBackend::new(), MockSolanaBackend::new());
+        let status = backend.get_bridge_status(&id).await.unwrap();
+        let super::BridgeStatus::Minted(receipt) = status else { panic!("expected mint receipt") };
+        assert_eq!(receipt.amount, Nat::from(999104120u64));
+        assert_eq!(receipt.recipient, state.account);
+        assert_eq!(receipt.mint_block_index, Nat::from(88u64));
     }
 
     #[tokio::test]
@@ -1055,7 +1019,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn solana_to_icp_happy_path_sends_transfer_then_calls_process_deposit_and_returns_synthetic_bridge_id() {
+    async fn solana_to_icp_persists_queued_deposit_id_after_transfer() {
         let source = bridge_source_address();
         let derived_deposit = deposit_address();
         let query_deposit = derived_deposit.clone();
@@ -1078,33 +1042,20 @@ mod tests {
             .times(1)
             .returning(|_, _, _| Ok(default_minter_info()));
         mock_agent
-            .expect_call_update_via_proxy::<Result<CkSolDepositStatus, CkSolProcessDepositError>>()
+            .expect_call_update_via_proxy::<Result<u64, DepositSolError>>()
             .times(1)
             .returning(move |proxy, canister, method, _, cycles| {
                 process_events.lock().expect("mutex").push("process".to_string());
                 assert_eq!(*proxy, proxy_canister());
                 assert_eq!(*canister, minter_canister());
-                assert_eq!(method, "process_deposit");
+                assert_eq!(method, "deposit_sol");
                 assert_eq!(cycles, Nat::from(1_000_000_000_000u64));
-                Ok(Ok(CkSolDepositStatus::Minted {
-                    block_index: 77,
-                    minted_amount: 1_999_990_000,
-                    deposit_id: CkSolDepositId {
-                        signature: "sig-123".to_string(),
-                        account: Account {
-                            owner: bridge_owner(),
-                            subaccount,
-                        },
-                    },
-                }))
+                Ok(Ok(77))
             });
 
         let mut mock_icp = MockIcpBackend::new();
         mock_icp.expect_icrc1_decimals().times(1).returning(|_| Ok(9));
-        mock_icp
-            .expect_icrc1_balance()
-            .times(1)
-            .returning(|_, _| Ok(Nat::from(1_000_000_000u64)));
+        mock_icp.expect_icrc1_balance().times(0);
 
         let mut mock_solana = MockSolanaBackend::new();
         mock_solana
@@ -1126,23 +1077,17 @@ mod tests {
         assert_eq!(
             events.lock().expect("mutex").as_slice(),
             ["transfer", "process"],
-            "manual flow must transfer before process_deposit"
+            "flow must transfer before deposit_sol"
         );
 
-        assert!(submission.bridge_id.starts_with(DEPOSIT_BRIDGE_ID_PREFIX));
-        let decoded =
-            SolanaBridgeBackend::<MockPipelineAgent, MockIcpBackend, MockSolanaBackend>::parse_deposit_bridge_id(
-                &submission.bridge_id,
-            )
-            .expect("bridge id must decode")
-            .expect("bridge id must be deposit metadata");
+        let decoded: super::QueuedSolDeposit = serde_json::from_str(
+            submission.bridge_id.strip_prefix(super::QUEUED_DEPOSIT_PREFIX).unwrap(),
+        ).unwrap();
 
         assert_eq!(decoded.account.owner, bridge_owner());
         assert_eq!(decoded.account.subaccount, subaccount);
-        assert_eq!(decoded.baseline, Nat::from(1_000_000_000u64));
-        // expected threshold = baseline + (2_000_000_000 - 10_000)
-        assert_eq!(decoded.threshold, Nat::from(2_999_990_000u64));
-        assert_eq!(decoded.transfer_signature.as_deref(), Some("sig-123"));
+        assert_eq!(decoded.deposit_id, 77);
+        assert_eq!(decoded.transfer_signature, "sig-123");
     }
 
     #[tokio::test]
@@ -1160,7 +1105,7 @@ mod tests {
             .times(1)
             .returning(|_, _, _| Ok(default_minter_info()));
         mock_agent
-            .expect_call_update_via_proxy::<Result<CkSolDepositStatus, CkSolProcessDepositError>>()
+            .expect_call_update_via_proxy::<Result<u64, DepositSolError>>()
             .times(0);
 
         let mut mock_icp = MockIcpBackend::new();
@@ -1197,15 +1142,12 @@ mod tests {
             .times(1)
             .returning(|_, _, _| Ok(default_minter_info()));
         mock_agent
-            .expect_call_update_via_proxy::<Result<CkSolDepositStatus, CkSolProcessDepositError>>()
+            .expect_call_update_via_proxy::<Result<u64, DepositSolError>>()
             .times(0);
 
         let mut mock_icp = MockIcpBackend::new();
         mock_icp.expect_icrc1_decimals().times(1).returning(|_| Ok(9));
-        mock_icp
-            .expect_icrc1_balance()
-            .times(1)
-            .returning(|_, _| Ok(Nat::from(1_000_000_000u64)));
+        mock_icp.expect_icrc1_balance().times(0);
 
         let mut mock_solana = MockSolanaBackend::new();
         mock_solana
@@ -1235,7 +1177,7 @@ mod tests {
         mock_agent.expect_call_query::<String>().times(0);
         mock_agent.expect_call_query::<CkSolMinterInfo>().times(0);
         mock_agent
-            .expect_call_update_via_proxy::<Result<CkSolDepositStatus, CkSolProcessDepositError>>()
+            .expect_call_update_via_proxy::<Result<u64, DepositSolError>>()
             .times(0);
 
         let mut mock_icp = MockIcpBackend::new();

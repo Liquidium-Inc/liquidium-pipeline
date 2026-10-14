@@ -113,6 +113,10 @@ fn format_bridge_status(status: &BridgeStatus) -> String {
     match status {
         BridgeStatus::Pending => "Pending".to_string(),
         BridgeStatus::Completed => "Completed".to_string(),
+        BridgeStatus::Minted(receipt) => format!(
+            "Minted {} {} at ledger block {}",
+            receipt.amount, receipt.token_symbol, receipt.mint_block_index
+        ),
         BridgeStatus::Unknown => "Unknown".to_string(),
         BridgeStatus::Failed { reason } => {
             format!("Failed ({})", reason.as_deref().unwrap_or("no reason"))

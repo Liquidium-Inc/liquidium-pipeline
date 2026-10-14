@@ -95,9 +95,21 @@ pub struct BridgeSubmission {
 pub enum BridgeStatus {
     Pending,
     Completed,
+    Minted(BridgeMintReceipt),
     Failed { reason: Option<String> },
     Canceled { reason: Option<String> },
     Unknown,
+}
+
+/// Deposit-specific ledger evidence; unrelated wallet credits cannot satisfy it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BridgeMintReceipt {
+    pub transaction_hash: String,
+    pub log_index: Nat,
+    pub mint_block_index: Nat,
+    pub amount: Nat,
+    pub recipient: Account,
+    pub token_symbol: String,
 }
 
 /// Backend contract for reading balances and executing bridge routes.
