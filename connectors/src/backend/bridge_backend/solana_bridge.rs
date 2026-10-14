@@ -456,7 +456,7 @@ where
     async fn get_deposit_address(&self, args: CkSolGetDepositAddressArgs) -> Result<String, String> {
         let arg_blob = Encode!(&args).map_err(|e| format!("encode get_deposit_address args failed: {e}"))?;
         self.agent
-            .call_query::<String>(&self.cksol_minter_canister, "get_deposit_address", arg_blob)
+            .call_update::<String>(&self.cksol_minter_canister, "get_deposit_address", arg_blob)
             .await
             .map_err(|e| {
                 format!(
@@ -1066,7 +1066,7 @@ mod tests {
 
         let mut mock_agent = MockPipelineAgent::new();
         mock_agent
-            .expect_call_query::<String>()
+            .expect_call_update::<String>()
             .times(1)
             .returning(move |_, _, _| Ok(query_deposit.clone()));
         mock_agent
@@ -1148,7 +1148,7 @@ mod tests {
 
         let mut mock_agent = MockPipelineAgent::new();
         mock_agent
-            .expect_call_query::<String>()
+            .expect_call_update::<String>()
             .times(1)
             .returning(|_, _, _| Ok(deposit_address()));
         mock_agent
@@ -1185,7 +1185,7 @@ mod tests {
 
         let mut mock_agent = MockPipelineAgent::new();
         mock_agent
-            .expect_call_query::<String>()
+            .expect_call_update::<String>()
             .times(1)
             .returning(|_, _, _| Ok(deposit_address()));
         mock_agent
