@@ -2,6 +2,8 @@ mod catalog;
 pub mod ckerc20_bridge;
 mod ckerc20_bridge_utils;
 pub mod solana_bridge;
+mod routed_bridge;
+pub use routed_bridge::RoutedBridgeBackend;
 mod types;
 mod utils;
 pub use ckerc20_bridge::{

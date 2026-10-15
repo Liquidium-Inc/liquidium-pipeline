@@ -8,10 +8,13 @@ use alloy::{
     signers::local::PrivateKeySigner,
 };
 use ic_agent::Agent;
+use solana_sdk::{signature::Keypair, signer::Signer};
 use liquidium_pipeline_connectors::backend::{
-    bridge_backend::{CkErc20BridgeBackend, cketh_forward_routes},
+    bridge_backend::{CkErc20BridgeBackend, SolanaBridgeBackend, RoutedBridgeBackend,
+        DEFAULT_SOLANA_BRIDGE_FEE_BUFFER_LAMPORTS, cketh_forward_routes},
     evm_backend::EvmBackendImpl,
     icp_backend::IcpBackendImpl,
+    solana_backend::SolanaBackendImpl,
 };
 
 use crate::{
@@ -226,13 +229,26 @@ pub async fn build_mexc_finalizer(ctx: &PipelineContext) -> Result<Arc<MexcFinal
     );
     let bridge_backend = Arc::new(CkErc20BridgeBackend::new(
         bridge_agent.clone(),
-        Arc::new(IcpBackendImpl::new(bridge_agent)),
+        Arc::new(IcpBackendImpl::new(bridge_agent.clone())),
         Arc::new(EvmBackendImpl::new(bridge_provider)),
         config.bridge_cketh_minter_canister,
         config.bridge_ic_owner_principal,
     ));
+    let solana_backend = Arc::new(SolanaBridgeBackend::new(
+        bridge_agent.clone(),
+        Arc::new(IcpBackendImpl::new(bridge_agent)),
+        Arc::new(SolanaBackendImpl::from_url_and_secret_key(
+            config.solana_rpc_url.clone(), config.bridge_solana_private_key_bytes,
+        )),
+        config.bridge_cksol_minter_canister,
+        config.bridge_cksol_ledger_canister,
+        config.bridge_ic_owner_principal,
+        config.bridge_ic_proxy_canister,
+        Keypair::new_from_array(config.bridge_solana_private_key_bytes).pubkey().to_string(),
+        DEFAULT_SOLANA_BRIDGE_FEE_BUFFER_LAMPORTS,
+    ));
     let bridge_dependencies = MexcBridgeDependencies {
-        backend: bridge_backend,
+        backend: Arc::new(RoutedBridgeBackend { evm: bridge_backend, solana: solana_backend }),
         config: MexcBridgeConfig {
             bridge_ic_source_account: config.bridge_ic_account(),
             bridge_evm_source_address: config.bridge_evm_address.clone(),
