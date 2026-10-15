@@ -9,7 +9,7 @@ use serde::Deserialize;
 use std::{str::FromStr, sync::Arc};
 
 use super::{
-    BridgeBackend, BridgeDestination, BridgeMintReceipt, BridgeRequest, BridgeRouteKind, BridgeRouteSpec, BridgeStatus,
+    BridgeBackend, BridgeDestination, BridgeFeeBudget, BridgeMintReceipt, BridgeRequest, BridgeRouteKind, BridgeRouteSpec, BridgeStatus,
     BridgeSubmission,
     catalog::BRIDGE_ROUTE_CATALOG, resolve_route, validate_destination_for_route,
 };
@@ -752,6 +752,41 @@ where
         }
     }
 
+    async fn get_fee_budget(&self, asset: &str, chain: &str, target: &str) -> Result<BridgeFeeBudget, String> {
+        let route = resolve_route(asset, chain, target).ok_or_else(|| "unknown SOL bridge route".to_string())?;
+        if route.route_kind != BridgeRouteKind::IcpToSolana {
+            return Ok(BridgeFeeBudget::default());
+        }
+        let info = self.minter_info().await?;
+        let approval_fee = icrc1_fee_with_context(self.icp_backend.as_ref(), self.cksol_ledger_canister, "cksol bridge").await?;
+        // Approval is paid from the bridge wallet in addition to the burn.
+        // The minter's withdrawal fee is deducted from the SOL delivered to CEX.
+        Ok(BridgeFeeBudget {
+            source_fee_budget: nat_units_to_amount_via_core(&approval_fee, 9)?,
+            destination_fee_budget: nat_units_to_amount_via_core(&Nat::from(info.withdrawal_fee), 9)?,
+            provider_fee_budget_native_units: None,
+        })
+    }
+
+    async fn get_source_fee_budget(&self, asset: &str, chain: &str, target: &str) -> Result<f64, String> {
+        Ok(self.get_fee_budget(asset, chain, target).await?.source_fee_budget)
+    }
+
+    async fn get_destination_fee_budget(&self, asset: &str, chain: &str, target: &str) -> Result<f64, String> {
+        Ok(self.get_fee_budget(asset, chain, target).await?.destination_fee_budget)
+    }
+
+    async fn get_minimum_bridge_amount(&self, asset: &str, chain: &str, target: &str) -> Result<f64, String> {
+        let route = resolve_route(asset, chain, target).ok_or_else(|| "unknown SOL bridge route".to_string())?;
+        let info = self.minter_info().await?;
+        let minimum = match route.route_kind {
+            BridgeRouteKind::IcpToSolana => info.minimum_withdrawal_amount,
+            BridgeRouteKind::SolanaToIcp => info.minimum_deposit_amount,
+            _ => return Err("unsupported SOL bridge route".into()),
+        };
+        nat_units_to_amount_via_core(&Nat::from(minimum), 9)
+    }
+
     async fn submit_bridge(&self, request: BridgeRequest) -> Result<BridgeSubmission, String> {
         let route = Self::resolve_solana_route_for_request(&request)?;
         validate_destination_for_route(route, &request.destination)?;
@@ -944,6 +979,20 @@ mod tests {
             deposit_sol_required_cycles: Nat::from(1_000_000_000_000u64),
             balance: 0,
         }
+    }
+
+    #[tokio::test]
+    async fn reverse_quote_reserves_approval_and_deducts_minter_fee() {
+        let mut agent = MockPipelineAgent::new();
+        agent.expect_call_query::<CkSolMinterInfo>().times(2)
+            .returning(|_, _, _| Ok(default_minter_info()));
+        let mut icp = MockIcpBackend::new();
+        icp.expect_icrc1_fee().times(1).returning(|_| Ok(Nat::from(500u64)));
+        let backend = backend(agent, icp, MockSolanaBackend::new());
+        let fees = backend.get_fee_budget("ckSOL", "ICP", "SOL").await.unwrap();
+        assert_eq!(fees.source_fee_budget, 0.0000005);
+        assert_eq!(fees.destination_fee_budget, 0.001);
+        assert_eq!(backend.get_minimum_bridge_amount("ckSOL", "ICP", "SOL").await.unwrap(), 0.002);
     }
 
     #[tokio::test]

@@ -303,9 +303,9 @@ where
     /// Computes the source-token reserve needed before submitting an ICP reverse bridge.
     ///
     /// Bridged deposits first transfer seized collateral into the configured bridge source account.
-    /// For ckETH-minter reverse routes, that same source account must keep enough source token
-    /// available for the bridge submit itself: ckERC20 routes need the source ledger approval fee,
-    /// while native `ckETH -> ETH` also needs the quoted minter withdrawal fee budget. This helper
+    /// That account must retain the source ledger approval fee for ckERC20 and ckSOL routes;
+    /// native `ckETH -> ETH` also needs its quoted minter withdrawal fee budget. ckSOL's
+    /// minter fee instead reduces the SOL received at the destination. This helper
     /// returns the reserved amount and the net amount that can be submitted to the bridge.
     fn compute_reverse_bridge_source_fee_reserve(
         route: &BridgeRouteSpec,
@@ -316,7 +316,7 @@ where
     ) -> Result<Option<(ChainTokenAmount, ChainTokenAmount)>, String> {
         if !matches!(
             route.route_kind,
-            BridgeRouteKind::CkEthErc20Reverse | BridgeRouteKind::CkEthToEth
+            BridgeRouteKind::CkEthErc20Reverse | BridgeRouteKind::CkEthToEth | BridgeRouteKind::IcpToSolana
         ) || !route.source_chain.eq_ignore_ascii_case("ICP")
             || !deposit_asset.symbol().eq_ignore_ascii_case(route.source_asset)
             || !deposit_asset.chain().eq_ignore_ascii_case(route.source_chain)

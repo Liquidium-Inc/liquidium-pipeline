@@ -37,6 +37,17 @@ are not migrated by these backend fixes.
 
 ## Features
 
+### Native SOL liquidation settlement
+
+With bridge dependencies enabled, MEXC settlement routes seized ckSOL through
+the ckSOL minter to a validated native SOL exchange deposit address. The bridge
+wallet reserves the ckSOL approval fee; the minter withdrawal fee is deducted
+from the expected exchange credit before sizing trades. Persisted ckSOL and
+EVM bridge handles are polled by their respective backends after restart.
+Configure `BRIDGE_CKSOL_MINTER_CANISTER`, `BRIDGE_CKSOL_LEDGER_CANISTER` and
+`SOLANA_RPC_URL` for the deployment. Stablecoin proceeds use the existing
+withdrawal/bridge route back to the repayment wallet.
+
 - **Pipeline Architecture** — Composable stages for discovery, strategy, execution, finalization, and export.
 - **Async Rust** — Highly concurrent and efficient with Tokio runtime.
 - **Multi-Chain** — Primary support for ICP with EVM (Arbitrum) integration.
