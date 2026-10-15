@@ -13,7 +13,8 @@ pub const CKUSDT_MAX_ALLOWANCE: u128 = 340_282_366_920_938_463_463_374_607_431_7
 pub fn max_for_ledger(token: &Principal) -> Nat {
     let cksol_ledger = std::env::var("BRIDGE_CKSOL_LEDGER_CANISTER")
         .unwrap_or_else(|_| "la34w-haaaa-aaaar-qb5na-cai".to_string());
-    // ckSOL uses a u64 ledger. Returning zero here leaves SOL repayment
+    // A u64-sized allowance works with both standard and wider ledgers.
+    // Returning zero here leaves SOL repayment
     // approvals unusable, including deployments with a configured ledger ID.
     if Principal::from_text(cksol_ledger).ok().as_ref() == Some(token) {
         return Nat::from(u64::MAX);
