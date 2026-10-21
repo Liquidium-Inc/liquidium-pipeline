@@ -99,6 +99,7 @@ where
                 withdraw_address: receive_address.unwrap_or_else(|| self.liquidator_principal.to_text()),
                 withdraw_id: None,
                 withdraw_txid: None,
+                withdraw_accepted_at_ts: None,
                 size_out: None,
                 bridge: CexWithdrawBridgeState {
                     withdraw_planned_asset: Some(bridge_plan.withdraw.cex_asset),

@@ -2138,6 +2138,53 @@ async fn mexc_non_bridge_withdraw_behavior_unchanged() {
 }
 
 #[tokio::test]
+async fn mexc_direct_withdraw_parks_when_delivery_never_arrives() {
+    use liquidium_pipeline_connectors::backend::cex_backend::{WithdrawStatus, WithdrawStatusSnapshot, WithdrawalReceipt};
+    let mut cex = MockCexBackend::new();
+    cex.expect_withdraw().times(1).returning(|asset, network, _, amount| {
+        Ok(WithdrawalReceipt {
+            asset: asset.to_string(),
+            network: network.to_string(),
+            amount,
+            txid: None,
+            internal_id: Some("never-delivered".to_string()),
+        })
+    });
+    cex.expect_get_withdraw_status_snapshot_by_id().times(2).returning(|_, _| {
+        Ok(WithdrawStatusSnapshot {
+            status: WithdrawStatus::Pending,
+            txid: None,
+            transaction_fee: None,
+        })
+    });
+    let finalizer = MexcFinalizer::new(
+        Arc::new(cex),
+        Arc::new(MockTransferActions::new()),
+        Principal::anonymous(),
+        TEST_MAX_SELL_SLIPPAGE_BPS,
+        TEST_CEX_MIN_EXEC_USD,
+        TEST_CEX_SLICE_TARGET_RATIO,
+    );
+    let mut state = finalizer.prepare("stuck", &make_execution_receipt(131)).await.unwrap();
+    state.step = CexStep::Withdraw;
+    state.withdraw.size_out = Some(ChainTokenAmount::from_formatted(state.withdraw.withdraw_asset.clone(), 1.0));
+
+    finalizer.withdraw(&mut state).await.unwrap();
+    assert!(matches!(state.step, CexStep::WithdrawPending));
+    let accepted_at = state.withdraw.withdraw_accepted_at_ts.expect("accept time recorded");
+
+    // Within the window the row keeps waiting.
+    finalizer.withdraw(&mut state).await.unwrap();
+    assert!(matches!(state.step, CexStep::WithdrawPending));
+
+    // Past the window the row errors so the retry budget parks it with an alert.
+    state.withdraw.withdraw_accepted_at_ts = Some(accepted_at - 2 * 60 * 60);
+    let error = finalizer.withdraw(&mut state).await.unwrap_err();
+    assert!(error.contains("not delivered"), "{error}");
+    assert!(matches!(state.step, CexStep::WithdrawPending));
+}
+
+#[tokio::test]
 async fn mexc_direct_withdraw_waits_for_delivery_and_deducts_fee_once() {
     use liquidium_pipeline_connectors::backend::cex_backend::{
         WithdrawStatus, WithdrawStatusSnapshot, WithdrawalReceipt,

@@ -176,6 +176,9 @@ pub struct CexWithdrawState {
     pub withdraw_address: String,
     pub withdraw_id: Option<String>,
     pub withdraw_txid: Option<String>,
+    /// When MEXC accepted a direct withdrawal that had no transaction id yet.
+    #[serde(default)]
+    pub withdraw_accepted_at_ts: Option<i64>,
     pub size_out: Option<ChainTokenAmount>,
     #[serde(flatten)]
     pub bridge: CexWithdrawBridgeState,
@@ -577,6 +580,7 @@ mod tests {
                     withdraw_address: "dest".to_string(),
                     withdraw_id: None,
                     withdraw_txid: None,
+                    withdraw_accepted_at_ts: None,
                     size_out: None,
                     bridge: CexWithdrawBridgeState {
                         withdraw_planned_asset: None,
@@ -731,6 +735,7 @@ mod tests {
                     withdraw_address: "dest".to_string(),
                     withdraw_id: None,
                     withdraw_txid: None,
+                    withdraw_accepted_at_ts: None,
                     size_out: None,
                     bridge: CexWithdrawBridgeState {
                         withdraw_planned_asset: None,

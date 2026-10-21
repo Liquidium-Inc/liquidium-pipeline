@@ -32,6 +32,9 @@ const MEXC_WITHDRAW_BELOW_MIN_RAW_CODE: i64 = 10254;
 const BRIDGE_FEE_TOKEN_SYMBOL: &str = "ckETH";
 const BRIDGE_FEE_TOKEN_CHAIN: &str = "ICP";
 const CKETH_DECIMALS: i32 = 18;
+/// A direct withdrawal that MEXC accepted but never reports as delivered
+/// must not wait forever. After this long the row parks for an operator.
+const DIRECT_WITHDRAW_DELIVERY_TIMEOUT_SECS: i64 = 60 * 60;
 
 use crate::{
     finalizers::bridge_planner::BridgePlanner,
@@ -1212,7 +1215,18 @@ where
                         state.withdraw.withdraw_txid = snapshot.txid;
                         state.step = CexStep::Completed;
                     }
-                    _ => state.step = CexStep::WithdrawPending,
+                    _ => {
+                        // Rows accepted before this clock existed start it now.
+                        let accepted_at = *state.withdraw.withdraw_accepted_at_ts.get_or_insert_with(now_ts);
+                        let waited = now_ts().saturating_sub(accepted_at);
+                        if waited > DIRECT_WITHDRAW_DELIVERY_TIMEOUT_SECS {
+                            return Err(format!(
+                                "cex withdraw not delivered after {waited}s for liq_id {} withdraw_id={withdraw_id} status={:?}",
+                                state.liq_id, snapshot.status
+                            ));
+                        }
+                        state.step = CexStep::WithdrawPending;
+                    }
                 }
                 return Ok(());
             }
@@ -1239,6 +1253,7 @@ where
             state.step = if receipt.txid.as_ref().is_some_and(|tx| !tx.trim().is_empty()) {
                 CexStep::Completed
             } else {
+                state.withdraw.withdraw_accepted_at_ts = Some(now_ts());
                 CexStep::WithdrawPending
             };
             return Ok(());
