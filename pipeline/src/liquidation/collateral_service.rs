@@ -286,6 +286,43 @@ mod test {
     }
 
     #[tokio::test]
+    async fn sol_debt_uses_lamports_when_seizing_usdt_collateral() {
+        // given: the live fixture owes 4 SOL at $230 against 1,000 USDT.
+        let mut oracle = MockPriceOracle::new();
+        oracle.expect_get_price().returning(|asset, _| {
+            let price = match asset {
+                "SOL" => 230u128,
+                "USDT" => 1u128,
+                _ => panic!("unexpected asset"),
+            };
+            Ok((Nat::from(price * 10u128.pow(27)), 27))
+        });
+        let debt = LiquidateblePosition {
+            pool_id: Principal::anonymous(), account: Principal::anonymous(),
+            asset: Assets::SOL, asset_type: AssetType::CkAsset(Principal::anonymous()),
+            debt_amount: Nat::from(4_000_000_000u64), collateral_amount: Nat::from(0u8),
+            liquidation_bonus: 500, liquidation_threshold: 8500, protocol_fee: 200,
+        };
+        let collateral = LiquidateblePosition {
+            asset: Assets::USDT, debt_amount: Nat::from(0u8),
+            collateral_amount: Nat::from(1_000_000_000u64), ..debt.clone()
+        };
+        let mut user = LiquidatebleUser {
+            account: Principal::anonymous(), health_factor: Nat::from(900u16),
+            weighted_liquidation_threshold: Nat::from(8500u16),
+            total_debt: Nat::from(920u128 * 10u128.pow(27)),
+            positions: vec![debt.clone(), collateral.clone()],
+        };
+        // when
+        let result = CollateralService::new(Arc::new(oracle))
+            .calculate_liquidation_amounts(debt.debt_amount.clone(), &debt, &collateral, &mut user)
+            .await.unwrap();
+        // then: $920 plus 5% bonus, less 2% of that bonus.
+        assert_eq!(result.repaid_debt, Nat::from(4_000_000_000u64));
+        assert_eq!(result.received_collateral, Nat::from(965_080_000u64));
+    }
+
+    #[tokio::test]
     async fn test_full_liquidation_btc_debt_usdt_collateral() {
         let mut mock_oracle = MockPriceOracle::new();
 

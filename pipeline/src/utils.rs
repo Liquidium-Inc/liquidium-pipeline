@@ -11,6 +11,13 @@ pub const CKETH_LEDGER_PRINCIPAL: &str = "ss2fx-dyaaa-aaaar-qacoq-cai";
 pub const CKUSDT_MAX_ALLOWANCE: u128 = 340_282_366_920_938_463_463_374_607_431_768_211_455;
 
 pub fn max_for_ledger(token: &Principal) -> Nat {
+    let cksol_ledger = std::env::var("BRIDGE_CKSOL_LEDGER_CANISTER")
+        .unwrap_or_else(|_| "la34w-haaaa-aaaar-qb5na-cai".to_string());
+    // ckSOL uses a u64 ledger. The configured ID also covers local deployments;
+    // returning zero here silently makes SOL repayment approvals unusable.
+    if Principal::from_text(cksol_ledger).ok().as_ref() == Some(token) {
+        return Nat::from(u64::MAX);
+    }
     if *token == Principal::from_text(ICP_LEDGER_PRINCIPAL).expect("invalid ICP ledger principal") {
         return Nat::from(u64::MAX);
     }
@@ -64,6 +71,13 @@ mod tests {
     fn cketh_has_nonzero_max_allowance() {
         let ledger = Principal::from_text(CKETH_LEDGER_PRINCIPAL).expect("valid ckETH ledger principal");
         assert!(max_for_ledger(&ledger) > Nat::from(0u8));
+    }
+
+    #[test]
+    fn configured_cksol_has_u64_allowance() {
+        let ledger = std::env::var("BRIDGE_CKSOL_LEDGER_CANISTER")
+            .unwrap_or_else(|_| "la34w-haaaa-aaaar-qb5na-cai".into());
+        assert_eq!(max_for_ledger(&Principal::from_text(ledger).unwrap()), Nat::from(u64::MAX));
     }
 
     #[test]

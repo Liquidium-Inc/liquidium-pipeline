@@ -42,7 +42,7 @@ impl Asset for Assets {
         match self {
             Assets::BTC => 8,
             Assets::ICP => 8,
-            Assets::SOL => 18,
+            Assets::SOL => 9,
             Assets::USDC => 6,
             Assets::USDT => 6,
             Assets::ETH => 18,

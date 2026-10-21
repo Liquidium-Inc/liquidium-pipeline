@@ -5,7 +5,9 @@ use ic_agent::Identity;
 use icrc_ledger_types::icrc1::account::Account;
 use liquidium_pipeline_commons::env::config_dir;
 use liquidium_pipeline_connectors::account::icp_account::{RECOVERY_ACCOUNT, derive_icp_identity};
-use liquidium_pipeline_connectors::crypto::derivation::{derive_btc_p2tr_address, derive_evm_private_key};
+use liquidium_pipeline_connectors::crypto::derivation::{
+    derive_btc_p2tr_address, derive_evm_private_key, derive_solana_private_key_bytes,
+};
 use log::{debug, warn};
 use std::collections::{HashMap, HashSet};
 use std::env;
@@ -31,12 +33,18 @@ pub struct Config {
     pub trader_principal: Principal,
     pub ic_url: String,
     pub evm_rpc_url: String,
+    pub solana_rpc_url: String,
     pub evm_private_key: String,
+    pub solana_private_key_bytes: [u8; 32],
     pub bridge_evm_private_key: String,
+    pub bridge_solana_private_key_bytes: [u8; 32],
     pub bridge_evm_address: String,
     pub bridge_ic_owner_principal: Principal,
     pub bridge_btc_address: String,
     pub bridge_cketh_minter_canister: Principal,
+    pub bridge_cksol_minter_canister: Principal,
+    pub bridge_cksol_ledger_canister: Principal,
+    pub bridge_ic_proxy_canister: Option<Principal>,
     pub lending_canister: Principal,
     pub export_path: String,
     pub buy_bad_debt: bool,
@@ -286,6 +294,7 @@ impl Config {
         let evm_signer: PrivateKeySigner = PrivateKeySigner::from_slice(&sk.to_bytes()).map_err(|e| e.to_string())?;
         let hex = evm_signer.to_bytes().encode_hex();
         let evm_private_key = format!("{:#}", hex);
+        let solana_private_key_bytes = derive_solana_private_key_bytes(&mnemonic, 0, 0)?;
 
         // Derive dedicated bridge namespace identities.
         let bridge_sk = derive_evm_private_key(&mnemonic, BRIDGE_NAMESPACE_ACCOUNT, BRIDGE_EVM_INDEX)?;
@@ -293,6 +302,8 @@ impl Config {
             .map_err(|e| format!("failed to create bridge EVM signer: {e}"))?;
         let bridge_evm_private_key = format!("{:#}", bridge_signer.to_bytes().encode_hex());
         let bridge_evm_address = bridge_signer.address().to_string();
+        let bridge_solana_private_key_bytes =
+            derive_solana_private_key_bytes(&mnemonic, BRIDGE_NAMESPACE_ACCOUNT, BRIDGE_SOLANA_INDEX)?;
 
         let bridge_ic_identity = derive_icp_identity(&mnemonic, BRIDGE_NAMESPACE_ACCOUNT, BRIDGE_ICP_INDEX)
             .map_err(|e| format!("could not create bridge identity: {e}"))?;
@@ -318,6 +329,52 @@ impl Config {
                 bridge_cketh_minter_canister_text
             )
         })?;
+        let bridge_cksol_minter_canister_text = env::var("BRIDGE_CKSOL_MINTER_CANISTER")
+            .unwrap_or_else(|_| DEFAULT_BRIDGE_CKSOL_MINTER_CANISTER.to_string())
+            .trim()
+            .to_string();
+        let bridge_cksol_minter_canister_text = if bridge_cksol_minter_canister_text.is_empty() {
+            DEFAULT_BRIDGE_CKSOL_MINTER_CANISTER.to_string()
+        } else {
+            bridge_cksol_minter_canister_text
+        };
+        let bridge_cksol_minter_canister = Principal::from_text(&bridge_cksol_minter_canister_text).map_err(|e| {
+            format!(
+                "invalid BRIDGE_CKSOL_MINTER_CANISTER principal '{}': {e}",
+                bridge_cksol_minter_canister_text
+            )
+        })?;
+        let bridge_cksol_ledger_canister_text = env::var("BRIDGE_CKSOL_LEDGER_CANISTER")
+            .unwrap_or_else(|_| DEFAULT_BRIDGE_CKSOL_LEDGER_CANISTER.to_string())
+            .trim()
+            .to_string();
+        let bridge_cksol_ledger_canister_text = if bridge_cksol_ledger_canister_text.is_empty() {
+            DEFAULT_BRIDGE_CKSOL_LEDGER_CANISTER.to_string()
+        } else {
+            bridge_cksol_ledger_canister_text
+        };
+        let bridge_cksol_ledger_canister = Principal::from_text(&bridge_cksol_ledger_canister_text).map_err(|e| {
+            format!(
+                "invalid BRIDGE_CKSOL_LEDGER_CANISTER principal '{}': {e}",
+                bridge_cksol_ledger_canister_text
+            )
+        })?;
+        let bridge_ic_proxy_canister = match env::var("BRIDGE_IC_PROXY_CANISTER")
+            .or_else(|_| env::var("BRIDGE_IC_WALLET_CANISTER"))
+        {
+            Ok(value) => {
+                let trimmed = value.trim();
+                if trimmed.is_empty() {
+                    None
+                } else {
+                    Some(
+                        Principal::from_text(trimmed)
+                            .map_err(|e| format!("invalid BRIDGE_IC_PROXY_CANISTER principal '{}': {e}", trimmed))?,
+                    )
+                }
+            }
+            Err(_) => None,
+        };
         let max_allowed_dex_slippage =
             parse_slippage_bps_from_env("MAX_ALLOWED_DEX_SLIPPAGE", DEFAULT_MAX_ALLOWED_DEX_SLIPPAGE_BPS)?;
         let max_allowed_cex_slippage_bps =
@@ -363,16 +420,23 @@ impl Config {
         };
 
         let evm_rpc_url = env::var("EVM_RPC_URL").map_err(|_| "EVM_RPC_URL not configured".to_string())?;
+        let solana_rpc_url = env::var("SOLANA_RPC_URL").unwrap_or_else(|_| "https://api.devnet.solana.com".to_string());
 
         Ok(Arc::new(Config {
             icpswap_mnemonic: Arc::from(mnemonic),
             evm_private_key,
             evm_rpc_url,
+            solana_rpc_url,
+            solana_private_key_bytes,
             bridge_evm_private_key,
+            bridge_solana_private_key_bytes,
             bridge_evm_address,
             bridge_ic_owner_principal,
             bridge_btc_address,
             bridge_cketh_minter_canister,
+            bridge_cksol_minter_canister,
+            bridge_cksol_ledger_canister,
+            bridge_ic_proxy_canister,
             liquidator_identity: Arc::new(liquidator_identity),
             bridge_ic_identity: Arc::new(bridge_ic_identity),
             ic_url,
@@ -482,7 +546,10 @@ const BRIDGE_NAMESPACE_ACCOUNT: u32 = 1;
 const BRIDGE_EVM_INDEX: u32 = 0;
 const BRIDGE_ICP_INDEX: u32 = 1;
 const BRIDGE_BTC_INDEX: u32 = 0;
+const BRIDGE_SOLANA_INDEX: u32 = 0;
 const DEFAULT_BRIDGE_CKETH_MINTER_CANISTER: &str = "sv3dd-oaaaa-aaaar-qacoa-cai";
+const DEFAULT_BRIDGE_CKSOL_MINTER_CANISTER: &str = "ljyxk-riaaa-aaaar-qb5mq-cai";
+const DEFAULT_BRIDGE_CKSOL_LEDGER_CANISTER: &str = "la34w-haaaa-aaaar-qb5na-cai";
 pub const DEFAULT_ICPSWAP_FACTORY_CANISTER: &str = "4mmnk-kiaaa-aaaag-qbllq-cai";
 const DEFAULT_ICPSWAP_FEE_TIERS: &str = "100,500,3000,10000";
 const DEFAULT_ICPSWAP_MAX_PRICE_IMPACT_BPS: f64 = 100.0;

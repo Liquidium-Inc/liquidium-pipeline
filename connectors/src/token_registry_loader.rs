@@ -9,6 +9,7 @@ use liquidium_pipeline_core::tokens::{chain_token::ChainToken, token_registry::T
 
 use crate::backend::evm_backend::EvmBackend;
 use crate::backend::icp_backend::IcpBackend;
+use crate::backend::solana_backend::SolanaBackend;
 
 #[derive(Debug)]
 pub enum RegistryLoadError {
@@ -57,15 +58,17 @@ fn split_spec(spec: &str) -> Result<(String, String, String), RegistryLoadError>
     Ok((parts[0].to_string(), parts[1].to_string(), parts[2].to_string()))
 }
 
-// Uses ICP/EVM backends to resolve decimals and build a ChainToken.
-async fn resolve_chain_token<IB, EB>(
+// Uses ICP/EVM/Solana backends to resolve decimals and build a ChainToken.
+async fn resolve_chain_token<IB, EB, SB>(
     spec: &str,
     icp_backend: &Arc<IB>,
     evm_backend: &Arc<EB>,
+    solana_backend: &Arc<SB>,
 ) -> Result<ChainToken, RegistryLoadError>
 where
     IB: IcpBackend + Send + Sync,
     EB: EvmBackend + Send + Sync,
+    SB: SolanaBackend + Send + Sync,
 {
     let (chain, address, symbol) = split_spec(spec)?;
 
@@ -121,6 +124,36 @@ where
                 fee: 0u8.into(),
             })
         }
+    } else if chain == "sol" {
+        if address == "native" {
+            // Native SOL (lamports, 9 decimals).
+            Ok(ChainToken::SolanaNative {
+                symbol,
+                decimals: 9,
+                fee: 0u8.into(),
+            })
+        } else {
+            // Validate mint shape early so malformed specs fail fast.
+            let mint_bytes = bs58::decode(&address)
+                .into_vec()
+                .map_err(|e| RegistryLoadError::Other(format!("invalid Solana mint `{address}` in `{spec}`: {e}")))?;
+            if mint_bytes.len() != 32 {
+                return Err(RegistryLoadError::Other(format!(
+                    "invalid Solana mint `{address}` in `{spec}`: expected 32-byte pubkey"
+                )));
+            }
+            let decimals = solana_backend
+                .spl_decimals(&address)
+                .await
+                .map_err(|e| RegistryLoadError::Other(format!("sol decimals for `{spec}` failed: {e}")))?;
+
+            Ok(ChainToken::SolanaSpl {
+                mint: address,
+                symbol,
+                decimals,
+                fee: 0u8.into(),
+            })
+        }
     } else {
         Err(RegistryLoadError::Other(format!(
             "unsupported chain `{chain}` in spec `{spec}`"
@@ -133,13 +166,15 @@ where
 // Env format:
 //   DEBT_ASSETS=icp:mxzaz-hqaaa-aaaar-qaada-cai:ckBTC,evm-arb:0x...:USDC
 //   COLLATERAL_ASSETS=icp:mxzaz-hqaaa-aaaar-qaada-cai:ckBTC,...
-pub async fn load_token_registry<IB, EB>(
+pub async fn load_token_registry<IB, EB, SB>(
     icp_backend: Arc<IB>,
     evm_backend: Arc<EB>,
+    solana_backend: Arc<SB>,
 ) -> Result<TokenRegistry, RegistryLoadError>
 where
     IB: IcpBackend + Send + Sync,
     EB: EvmBackend + Send + Sync,
+    SB: SolanaBackend + Send + Sync,
 {
     let debt_specs = load_env_specs("DEBT_ASSETS")?;
     let coll_specs = load_env_specs("COLLATERAL_ASSETS")?;
@@ -154,7 +189,7 @@ where
 
     let mut tokens = HashMap::new();
     for spec in &all_specs {
-        let token = resolve_chain_token(spec, &icp_backend, &evm_backend).await?;
+        let token = resolve_chain_token(spec, &icp_backend, &evm_backend, &solana_backend).await?;
         let id = token.asset_id();
         tokens.insert(id, token);
     }
@@ -188,6 +223,8 @@ mod tests {
     use super::{RegistryLoadError, load_token_registry};
     use crate::backend::evm_backend::MockEvmBackend;
     use crate::backend::icp_backend::MockIcpBackend;
+    use crate::backend::solana_backend::MockSolanaBackend;
+    use liquidium_pipeline_core::tokens::chain_token::ChainToken;
     use liquidium_pipeline_core::tokens::token_registry::TokenRegistryTrait;
 
     static ENV_LOCK: Mutex<()> = Mutex::const_new(());
@@ -236,8 +273,9 @@ mod tests {
             .returning(|_| Err("decimals-failed".to_string()));
 
         let evm = MockEvmBackend::new();
+        let sol = MockSolanaBackend::new();
 
-        let err = load_token_registry(Arc::new(icp), Arc::new(evm))
+        let err = load_token_registry(Arc::new(icp), Arc::new(evm), Arc::new(sol))
             .await
             .expect_err("expected error");
 
@@ -260,8 +298,9 @@ mod tests {
         icp.expect_icrc1_fee().returning(|_| Err("fee-failed".to_string()));
 
         let evm = MockEvmBackend::new();
+        let sol = MockSolanaBackend::new();
 
-        let err = load_token_registry(Arc::new(icp), Arc::new(evm))
+        let err = load_token_registry(Arc::new(icp), Arc::new(evm), Arc::new(sol))
             .await
             .expect_err("expected error");
 
@@ -281,8 +320,9 @@ mod tests {
 
         let icp = MockIcpBackend::new();
         let evm = MockEvmBackend::new();
+        let sol = MockSolanaBackend::new();
 
-        let err = load_token_registry(Arc::new(icp), Arc::new(evm))
+        let err = load_token_registry(Arc::new(icp), Arc::new(evm), Arc::new(sol))
             .await
             .expect_err("expected error");
 
@@ -304,13 +344,65 @@ mod tests {
         icp.expect_icrc1_fee().returning(|_| Ok(Nat::from(10u8)));
 
         let evm = MockEvmBackend::new();
+        let sol = MockSolanaBackend::new();
 
-        let registry = load_token_registry(Arc::new(icp), Arc::new(evm))
+        let registry = load_token_registry(Arc::new(icp), Arc::new(evm), Arc::new(sol))
             .await
             .expect("registry");
 
         assert_eq!(registry.tokens.len(), 1);
         assert_eq!(registry.collateral_assets().len(), 1);
         assert_eq!(registry.debt_assets().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn sol_native_spec_builds_registry_entry() {
+        let _lock = ENV_LOCK.lock().await;
+        let _env = EnvGuard::set("sol:native:SOL", "sol:native:SOL");
+
+        let icp = MockIcpBackend::new();
+        let evm = MockEvmBackend::new();
+        let sol = MockSolanaBackend::new();
+
+        let registry = load_token_registry(Arc::new(icp), Arc::new(evm), Arc::new(sol))
+            .await
+            .expect("registry");
+
+        assert_eq!(registry.tokens.len(), 1);
+        let (asset_id, token) = registry.tokens.iter().next().expect("token");
+        assert_eq!(asset_id.chain, "sol");
+        assert_eq!(asset_id.address, "native");
+        assert_eq!(asset_id.symbol, "SOL");
+        assert_eq!(token.decimals(), 9);
+    }
+
+    #[tokio::test]
+    async fn sol_spl_spec_resolves_decimals_from_solana_backend() {
+        let _lock = ENV_LOCK.lock().await;
+        let _env = EnvGuard::set(
+            "sol:So11111111111111111111111111111111111111112:WSOL",
+            "sol:So11111111111111111111111111111111111111112:WSOL",
+        );
+
+        let icp = MockIcpBackend::new();
+        let evm = MockEvmBackend::new();
+        let mut sol = MockSolanaBackend::new();
+        sol.expect_spl_decimals()
+            .withf(|mint| mint == "So11111111111111111111111111111111111111112")
+            .return_once(|_| Ok(9));
+
+        let registry = load_token_registry(Arc::new(icp), Arc::new(evm), Arc::new(sol))
+            .await
+            .expect("registry");
+
+        assert_eq!(registry.tokens.len(), 1);
+        let (asset_id, token) = registry.tokens.iter().next().expect("token");
+        assert_eq!(asset_id.chain, "sol");
+        assert_eq!(asset_id.address, "So11111111111111111111111111111111111111112");
+        assert_eq!(asset_id.symbol, "WSOL");
+        match token {
+            ChainToken::SolanaSpl { decimals, .. } => assert_eq!(*decimals, 9),
+            other => panic!("unexpected token variant: {other:?}"),
+        }
     }
 }

@@ -2,11 +2,15 @@ mod catalog;
 pub mod ckerc20_bridge;
 mod ckerc20_bridge_utils;
 mod mint_events;
+pub mod solana_bridge;
+mod routed_bridge;
+pub use routed_bridge::RoutedBridgeBackend;
 mod types;
 mod utils;
 pub use ckerc20_bridge::{
     BRIDGE_AMOUNT_BELOW_MINIMUM_PREFIX, BridgeEvmBackend, CkErc20BridgeBackend, FINALIZER_PERMANENT_AMOUNT_FLOOR_PREFIX,
 };
+pub use solana_bridge::{DEFAULT_SOLANA_BRIDGE_FEE_BUFFER_LAMPORTS, SolanaBridgeBackend};
 pub use types::{
     BridgeBackend, BridgeDestination, BridgeDestinationKind, BridgeFeeBudget, BridgeMintReceipt, BridgeRequest,
     BridgeRouteKind, BridgeRouteSpec, BridgeStatus, BridgeSubmission, BridgeSweepRoute, EvmReceiptStatus,

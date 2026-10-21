@@ -42,7 +42,9 @@ pub(super) fn draw_configuration(f: &mut Frame<'_>, area: Rect, app: &App) {
         Line::from(format!("Liquidator principal: {}", app.config.liquidator_principal)),
         Line::from(format!("Trader principal: {}", app.config.trader_principal)),
         Line::from(format!("Liquidator EVM: {}", app.config.evm_address)),
+        Line::from(format!("Liquidator SOL: {}", app.config.solana_address)),
         Line::from(format!("Bridge EVM: {}", app.config.bridge_evm_address)),
+        Line::from(format!("Bridge SOL: {}", app.config.bridge_solana_address)),
         Line::from(format!("Bridge ICP owner: {}", app.config.bridge_ic_owner_principal)),
         Line::from(format!("Bridge BTC: {}", app.config.bridge_btc_address)),
         Line::from(format!(

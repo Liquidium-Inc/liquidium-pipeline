@@ -690,6 +690,35 @@ async fn mexc_native_icp_deposit_rejects_memo_tag_before_transfer() {
 }
 
 #[test]
+fn mexc_sol_reverse_plan_reserves_approval_fee() {
+    let finalizer = MexcFinalizer::new(
+        Arc::new(MockCexBackend::new()), Arc::new(MockTransferActions::new()), Principal::anonymous(),
+        TEST_MAX_SELL_SLIPPAGE_BPS, TEST_CEX_MIN_EXEC_USD, TEST_CEX_SLICE_TARGET_RATIO,
+    ).with_bridge_dependencies(bridge_dependencies(Arc::new(MockBridgeBackend::new())));
+    let sol = ChainToken::Icp {
+        ledger: Principal::anonymous(), symbol: "ckSOL".into(), decimals: 9, fee: Nat::from(500u64),
+    };
+    let stable = ChainToken::Icp {
+        ledger: Principal::anonymous(), symbol: "ckUSDT".into(), decimals: 6, fee: Nat::from(10_000u64),
+    };
+    let plan = finalizer.resolve_bridge_plan_for_assets(&sol, &stable);
+    assert!(plan.deposit.bridge_required);
+    assert_eq!(plan.deposit.cex_asset, "SOL");
+    assert_eq!(plan.deposit.cex_network, "SOL");
+    assert!(!plan.withdraw.bridge_required);
+    let route = liquidium_pipeline_connectors::backend::bridge_backend::resolve_route("ckSOL", "ICP", "SOL").unwrap();
+    let amount = ChainTokenAmount::from_raw(sol.clone(), Nat::from(1_000_000_000u64));
+    let (reserve, burn) = MexcFinalizer::<MockCexBackend>::compute_reverse_bridge_source_fee_reserve(
+        route, &sol, &amount.value, &amount, 0.0000005,
+    ).unwrap().unwrap();
+    assert_eq!(reserve.value, Nat::from(500u64));
+    assert_eq!(burn.value, Nat::from(999_999_500u64));
+    assert!(MexcFinalizer::<MockCexBackend>::route_destination_for_deposit(
+        route.destination_kind, "not-a-solana-address",
+    ).is_err());
+}
+
+#[test]
 fn mexc_bridge_planner_keeps_direct_path_when_no_bridge_route_matches() {
     let finalizer = MexcFinalizer::new(
         Arc::new(MockCexBackend::new()),
