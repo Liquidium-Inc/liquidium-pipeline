@@ -76,6 +76,17 @@ pub fn nat_units_to_amount_via_core(amount_native: &Nat, decimals: u8) -> Result
     Ok(human)
 }
 
+/// A spend budget must survive the legacy f64 bridge API without rounding up
+/// beyond the transferred balance. One wei can otherwise strand a reverse
+/// bridge after its collateral has already moved into the bridge wallet.
+pub fn nat_units_to_spend_amount(amount_native: &Nat, decimals: u8) -> Result<f64, String> {
+    let mut amount = nat_units_to_amount_via_core(amount_native, decimals)?;
+    while amount_to_nat_units_strict(amount, decimals)? > *amount_native {
+        amount = amount.next_down();
+    }
+    Ok(amount)
+}
+
 /// Converts EVM base units into human amount using `core::ChainTokenAmount`.
 pub fn base_units_to_amount_via_core(base_units: U256, decimals: u8) -> Result<f64, String> {
     let raw_nat: Nat = base_units
@@ -87,6 +98,15 @@ pub fn base_units_to_amount_via_core(base_units: U256, decimals: u8) -> Result<f
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn spend_amount_never_rounds_above_native_budget() {
+        for units in [82_100_000_000_000_001u128, 13_890_165_484_393_960_017u128] {
+            let budget = candid::Nat::from(units);
+            let amount = super::nat_units_to_spend_amount(&budget, 18).unwrap();
+            assert!(super::amount_to_nat_units_strict(amount, 18).unwrap() <= budget);
+            assert!(super::amount_to_nat_units_strict(amount.next_up(), 18).unwrap() > budget);
+        }
+    }
     use super::{
         amount_to_base_units_strict, amount_to_nat_units_strict, amount_to_scaled_u128_strict,
         base_units_to_amount_via_core, nat_units_to_amount_via_core,
