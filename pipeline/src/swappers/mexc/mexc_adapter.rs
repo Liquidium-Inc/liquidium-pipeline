@@ -221,6 +221,17 @@ fn mexc_network_candidates(asset: &str, network: &str) -> Vec<String> {
     candidates
 }
 
+/// MEXC labels deposit networks either as a bare code (`CKBTC`) or as a
+/// display name with the code in parentheses (`Solana(SOL)`). A plain
+/// substring test would let `ETH` match `MEGAETH` or `CKETH`.
+fn deposit_network_matches(item_network: &str, candidates: &[String]) -> bool {
+    let item_network = item_network.trim().to_ascii_uppercase();
+    candidates.iter().any(|cand| {
+        let cand = cand.to_ascii_uppercase();
+        item_network == cand || item_network.ends_with(&format!("({cand})"))
+    })
+}
+
 fn is_evm_network_alias(network_norm: &str) -> bool {
     network_norm == "ETH" || network_norm == "ETHEREUM" || network_norm.starts_with("EVM")
 }
@@ -1220,12 +1231,9 @@ impl CexBackend for MexcClient {
                     continue;
                 }
 
-                let addr = res.iter().find(|item| {
-                    let item_network = item.network.to_ascii_uppercase();
-                    // Network names identify distinct custody protocols: ETH
-                    // must never match CKETH merely because it is a substring.
-                    candidates.iter().any(|cand| item_network == *cand)
-                });
+                let addr = res
+                    .iter()
+                    .find(|item| deposit_network_matches(&item.network, &candidates));
 
                 if let Some(v) = addr {
                     return Ok(DepositAddress {
@@ -1457,6 +1465,31 @@ impl CexBackend for MexcClient {
 
 #[cfg(test)]
 mod tests {
+    // Labels recorded from the live deposit address endpoint on 2026-10-21.
+    #[test]
+    fn deposit_network_matches_live_mexc_labels() {
+        let cands = |list: &[&str]| list.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        for (label, candidates) in [
+            ("Solana(SOL)", cands(&["SOL"])),
+            ("Bitcoin(BTC)", cands(&["BTC"])),
+            ("Ethereum(ERC20)", cands(&["ETH", "ERC20"])),
+            ("Internet Computer(ICP)", cands(&["ICP"])),
+            ("CKBTC", cands(&["CKBTC", "ICP"])),
+            ("CKUSDT", cands(&["CKUSDT", "ICP"])),
+        ] {
+            assert!(super::deposit_network_matches(label, &candidates), "{label}");
+        }
+        for (label, candidates) in [
+            ("CKETH", cands(&["ETH", "ERC20"])),
+            ("MEGAETH", cands(&["ETH", "ERC20"])),
+            ("Wormhole-SOL", cands(&["SOL"])),
+            ("Solana(SOL)", cands(&["ETH", "ERC20"])),
+            ("BNB Smart Chain(BEP20)", cands(&["BTC"])),
+        ] {
+            assert!(!super::deposit_network_matches(label, &candidates), "{label}");
+        }
+    }
+
     #[test]
     fn market_order_admission_rejects_limit_only_books() {
         for order_types in [serde_json::json!(["LIMIT"]), serde_json::json!([])] {
