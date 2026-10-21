@@ -1,9 +1,5 @@
 use std::sync::Arc;
-use std::{
-    collections::HashSet,
-    sync::Mutex,
-    time::Duration,
-};
+use std::{collections::HashSet, sync::Mutex, time::Duration};
 
 use candid::{Encode, Nat, Principal};
 use futures::future::join_all;
@@ -20,7 +16,7 @@ use tokio::time::timeout;
 
 use liquidium_pipeline_connectors::pipeline_agent::PipelineAgent;
 
-use crate::{approval_state::ApprovalState, persistance::WalStore, utils::max_for_ledger};
+use crate::{approval_state::ApprovalState, persistance::LiquidationIntentStore, utils::max_for_ledger};
 
 const ALLOWANCE_LEDGER_TIMEOUT: Duration = Duration::from_secs(20);
 
@@ -39,28 +35,28 @@ struct InitAllowanceStats {
     failed: usize,
 }
 
-pub struct BasicExecutor<A: PipelineAgent, D: WalStore + Sync + Send> {
+pub struct BasicExecutor<A: PipelineAgent, D: LiquidationIntentStore + Sync + Send> {
     pub agent: Arc<A>,
     pub account_id: Account,
     pub lending_canister: Principal,
-    pub wal: Arc<D>,
+    pub intents: Arc<D>,
     pub approval_state: Arc<ApprovalState>,
     low_balance_allowance_warned_ledgers: Mutex<HashSet<Principal>>,
 }
 
-impl<A: PipelineAgent, D: WalStore> BasicExecutor<A, D> {
+impl<A: PipelineAgent, D: LiquidationIntentStore> BasicExecutor<A, D> {
     pub fn new(
         agent: Arc<A>,
         account_id: Account,
         lending_canister: Principal,
-        wal: Arc<D>,
+        intents: Arc<D>,
         approval_state: Arc<ApprovalState>,
     ) -> Self {
         Self {
             agent,
             account_id,
             lending_canister,
-            wal,
+            intents,
             approval_state,
             low_balance_allowance_warned_ledgers: Mutex::new(HashSet::new()),
         }
@@ -160,7 +156,7 @@ impl<A: PipelineAgent, D: WalStore> BasicExecutor<A, D> {
     }
 }
 
-impl<A: PipelineAgent, D: WalStore> BasicExecutor<A, D> {
+impl<A: PipelineAgent, D: LiquidationIntentStore> BasicExecutor<A, D> {
     async fn collect_allowance_results(
         &self,
         tokens: &[Principal],
@@ -351,14 +347,14 @@ mod tests {
 
     use liquidium_pipeline_connectors::pipeline_agent::MockPipelineAgent;
 
-    use crate::persistance::MockWalStore;
+    use crate::persistance::MockLiquidationIntentStore;
 
     fn p(text: &str) -> Principal {
         Principal::from_text(text).expect("invalid principal")
     }
 
-    fn make_executor(agent: MockPipelineAgent) -> BasicExecutor<MockPipelineAgent, MockWalStore> {
-        let wal = MockWalStore::new();
+    fn make_executor(agent: MockPipelineAgent) -> BasicExecutor<MockPipelineAgent, MockLiquidationIntentStore> {
+        let intents = MockLiquidationIntentStore::new();
         BasicExecutor::new(
             Arc::new(agent),
             Account {
@@ -366,7 +362,7 @@ mod tests {
                 subaccount: None,
             },
             p("nja4y-2yaaa-aaaae-qddxa-cai"),
-            Arc::new(wal),
+            Arc::new(intents),
             Arc::new(ApprovalState::new()),
         )
     }

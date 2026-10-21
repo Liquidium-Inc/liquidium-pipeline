@@ -282,6 +282,10 @@ impl Config {
         // The db path
         let db_path_raw = env::var("DB_PATH").unwrap_or(format!("{}/wal.db", home));
         let db_path = expand_tilde(&db_path_raw).to_string_lossy().into_owned();
+        // Do not silently abandon durable intents from the earlier two-file layout.
+        if env::var_os("LIQUIDATIONS_DB_PATH").is_some() {
+            return Err("LIQUIDATIONS_DB_PATH is retired; reconcile the old intake database before removing this setting and using DB_PATH alone".into());
+        }
 
         // Derive EVM private key
         let sk = derive_evm_private_key(&mnemonic, 0, 0)?;
@@ -1353,4 +1357,5 @@ mod tests {
             }
         }
     }
+
 }

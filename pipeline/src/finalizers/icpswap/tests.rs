@@ -22,7 +22,6 @@ use mockall::Sequence;
 use crate::{
     executors::executor::ExecutorRequest,
     finalizers::{
-        dex_finalizer::{DexRouteFinalizer, DexRoutePreview},
         finalizer::{Finalizer, FinalizerError},
         icpswap::finalizer::{ICPSWAP_FINALIZER_PERMANENT_PREFIX, IcpswapFinalizer},
         multi_venue::{
@@ -30,8 +29,8 @@ use crate::{
         },
     },
     persistance::{
-        FinalizerDecisionSnapshot, LiqMetaWrapper, LiqResultRecord, ResultStatus, VenueExecutionState, VenueLegQuote,
-        VenueLegState, VenueLegStatus, WalStore,
+        LiqMetaWrapper, LiqResultRecord, ResultStatus, VenueExecutionState, VenueLegQuote, VenueLegState,
+        VenueLegStatus, WalStore,
     },
     stages::executor::{ExecutionReceipt, ExecutionStatus},
     swappers::{
@@ -245,17 +244,6 @@ impl TestWal {
             .decode(crate::swappers::icpswap::VENUE_ID)
             .expect("decode state")
             .expect("wrong venue")
-    }
-
-    fn clear_execution_state(&self) {
-        let mut row = self.0.lock().unwrap();
-        let mut wrapper = decode_receipt_wrapper(&row).unwrap().unwrap();
-        wrapper.venue_execution = None;
-        encode_meta(&mut row, &wrapper).expect("encode WAL");
-    }
-
-    fn wrapper(&self) -> LiqMetaWrapper {
-        decode_receipt_wrapper(&self.0.lock().unwrap()).unwrap().unwrap()
     }
 }
 
@@ -908,58 +896,6 @@ async fn multi_venue_advance_surfaces_operational_error_without_losing_leg_progr
             .expect("the operational error must reach the orchestrator")
             .contains("network unreachable")
     );
-}
-
-#[tokio::test]
-async fn committing_dex_preview_creates_manual_icpswap_state() {
-    let mut receipt = receipt();
-    let plan = native_plan();
-    let request = native_request(&plan);
-    receipt.request.collateral_asset = request.pay_amount.token.clone();
-    receipt.request.debt_asset = plan.gross_quoted_out.token.clone();
-    receipt.request.swap_args = Some(request);
-    let wal = TestWal::new(&receipt, state());
-    wal.clear_execution_state();
-    let finalizer = finalizer(MockIcpswapManualClient::new());
-    let decision = FinalizerDecisionSnapshot {
-        mode: "hybrid".to_string(),
-        chosen: "dex".to_string(),
-        reason: "best route".to_string(),
-        min_required_bps: 100.0,
-        dex_preview_gross_bps: Some(200.0),
-        dex_preview_net_bps: Some(200.0),
-        cex_preview_gross_bps: Some(150.0),
-        cex_preview_net_bps: Some(140.0),
-        ts: 123,
-        multi_venue_allocation: None,
-    };
-    let preview = DexRoutePreview::new(
-        SwapQuote {
-            pay_asset: receipt.request.swap_args.as_ref().unwrap().pay_asset.clone(),
-            pay_amount: plan.amount_in.value.clone(),
-            receive_asset: receipt.request.swap_args.as_ref().unwrap().receive_asset.clone(),
-            receive_amount: plan.net_expected_output().value,
-            mid_price: 0.0,
-            exec_price: 0.0,
-            estimated_price_impact_bps: 0.0,
-            legs: Vec::new(),
-        },
-        crate::swappers::icpswap::VENUE_ID,
-        &plan,
-    )
-    .expect("encode route preview");
-
-    finalizer
-        .commit_route(&wal, &receipt, decision.clone(), preview)
-        .await
-        .expect("commit route");
-
-    assert_eq!(wal.wrapper().finalizer_decision, Some(decision));
-    let state = wal.state();
-    assert_eq!(state.plan, plan);
-    assert_eq!(state.step, IcpswapStep::Funding);
-    assert_ne!(state.owner, trader());
-    assert_eq!(state.funding.source, trader());
 }
 
 #[tokio::test]

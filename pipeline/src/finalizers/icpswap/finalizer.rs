@@ -4,9 +4,8 @@ use async_trait::async_trait;
 use icrc_ledger_types::icrc1::account::Account;
 
 use crate::{
-    finalizers::dex_finalizer::{DexRouteFinalizer, DexRoutePreview},
     finalizers::finalizer::{Finalizer, FinalizerError, FinalizerResult},
-    persistance::{FinalizerDecisionSnapshot, VenueExecutionState, WalStore},
+    persistance::WalStore,
     stages::executor::{ExecutionReceipt, ExecutionStatus},
     swappers::{
         icpswap::{
@@ -21,7 +20,7 @@ use crate::{
         model::SwapRequest,
     },
     utils::now_nanos,
-    wal::{decode_receipt_wrapper, encode_meta, liq_id_from_receipt, wal_load},
+    wal::liq_id_from_receipt,
     watchdog::{Watchdog, WatchdogEvent, noop_watchdog},
 };
 
@@ -301,108 +300,6 @@ impl IcpswapFinalizer {
         }
 
         self.result_for_state(&receipt, &state, now_nanos).await
-    }
-}
-
-#[async_trait]
-impl DexRouteFinalizer for IcpswapFinalizer {
-    fn venue_id(&self) -> &'static str {
-        VENUE_ID
-    }
-
-    async fn preview_route(&self, request: &SwapRequest) -> Result<DexRoutePreview, String> {
-        let preview = self
-            .workflow
-            .preview_route(request)
-            .await
-            .map_err(|error| error.to_string())?;
-        DexRoutePreview::new(preview.quote, VENUE_ID, &preview.route)
-    }
-
-    async fn has_committed_route(&self, wal: &dyn WalStore, receipt: &ExecutionReceipt) -> Result<bool, String> {
-        let liquidation_id = liq_id_from_receipt(receipt)?;
-        let Some(row) = wal_load(wal, &liquidation_id).await? else {
-            return Ok(false);
-        };
-        let Some(wrapper) = decode_receipt_wrapper(&row)? else {
-            return Ok(false);
-        };
-        Ok(wrapper
-            .venue_execution
-            .as_ref()
-            .is_some_and(|record| record.is_venue(VENUE_ID)))
-    }
-
-    async fn commit_route(
-        &self,
-        wal: &dyn WalStore,
-        receipt: &ExecutionReceipt,
-        decision: FinalizerDecisionSnapshot,
-        preview: DexRoutePreview,
-    ) -> Result<(), String> {
-        if self.trader.subaccount.is_some() {
-            return Err("ICPSwap route commit requires the trader's default ledger account".to_string());
-        }
-        let route: IcpswapExecutionPlan = preview.route(VENUE_ID)?;
-        if decision.chosen != "dex" {
-            return Err(format!(
-                "ICPSwap route commit requires chosen=dex, got {}",
-                decision.chosen
-            ));
-        }
-        let liquidation_id = liq_id_from_receipt(receipt)?;
-        let mut row = wal_load(wal, &liquidation_id)
-            .await?
-            .ok_or_else(|| format!("missing WAL row for liquidation {liquidation_id}"))?;
-        let mut wrapper = decode_receipt_wrapper(&row)?
-            .ok_or_else(|| format!("missing receipt wrapper in WAL meta_json for {}", row.id))?;
-
-        if let Some(existing) = &wrapper.finalizer_decision
-            && matches!(existing.chosen.as_str(), "dex" | "cex")
-            && existing.chosen != "dex"
-        {
-            return Err(format!(
-                "refusing to replace persisted {} route with dex for liquidation {liquidation_id}",
-                existing.chosen
-            ));
-        }
-
-        match &wrapper.venue_execution {
-            Some(record) if record.is_venue(VENUE_ID) => {
-                let existing = record.decode::<IcpswapExecutionState>(VENUE_ID)?.ok_or_else(|| {
-                    format!("ICPSwap execution state for liquidation {liquidation_id} decoded to the wrong venue")
-                })?;
-                if existing.plan != route {
-                    return Err(format!(
-                        "refusing to replace persisted ICPSwap pool plan for liquidation {liquidation_id}"
-                    ));
-                }
-            }
-            Some(record) => {
-                return Err(format!(
-                    "refusing to replace persisted {} execution state for liquidation {liquidation_id}",
-                    record.venue
-                ));
-            }
-            None => {
-                // Committing only records this liquidation's plan in its WAL
-                // row. No pool account is touched until `finalize` advances the
-                // persisted state.
-                let request = receipt
-                    .request
-                    .swap_args
-                    .as_ref()
-                    .ok_or_else(|| "ICPSwap route commit receipt has no swap request".to_string())?;
-                let state = self.prepare_execution_state(&liquidation_id, &liquidation_id, request, route)?;
-                wrapper.venue_execution = Some(VenueExecutionState::new(VENUE_ID, &state)?);
-            }
-        }
-
-        wrapper.finalizer_decision = Some(decision);
-        encode_meta(&mut row, &wrapper)?;
-        wal.upsert_result(row)
-            .await
-            .map_err(|error| format!("WAL ICPSwap route commit failed for {liquidation_id}: {error}"))
     }
 }
 
