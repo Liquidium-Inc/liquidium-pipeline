@@ -132,7 +132,15 @@ where
             .lock()
             .map_err(|_| "MEXC multi-venue intent lock poisoned".to_string())?
             .remove(&intent_id);
-        if !armed_here {
+        // Once the exchange ID (direct route) or helper ID (bridged route) is
+        // durable, this phase only reads settlement evidence. A normal restart
+        // cannot duplicate that submission. A bridged withdrawal without its
+        // helper ID still needs the submission gate: it may initiate a deposit.
+        let receipt_poll = execution.cex.step == CexStep::WithdrawPending
+            && execution.cex.withdraw.withdraw_id.is_some()
+            && (!execution.cex.withdraw.bridge.withdraw_bridge_required
+                || execution.cex.withdraw.bridge.withdraw_bridge_id.is_some());
+        if !armed_here && !receipt_poll {
             return self.operator_required_progress(
                 execution,
                 format!("persisted MEXC intent `{intent_id}` has ambiguous submission state after restart"),
