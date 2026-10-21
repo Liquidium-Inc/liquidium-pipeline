@@ -342,14 +342,16 @@ pub enum IcpswapFirstPlannerError {
     InvalidInput(String),
     #[error("no viable ICPSwap-first route: {0}")]
     NoViableRoute(String),
-    /// Every venue that could take this collateral answered, and the only
-    /// reason none can execute is that the amount is below their execution
-    /// minimum. Unlike `NoViableRoute` this is a property of the amount rather
-    /// than of venue availability, so retrying cannot resolve it and the
-    /// caller may move the collateral out of the swap path.
+    /// The amount is below the configured execution minimum of every overflow
+    /// venue. `preview_overflow` decides this from the amount alone, before any
+    /// venue is asked; after quoting it also covers the case where every venue
+    /// answered and none can execute. Unlike `NoViableRoute` this is a property
+    /// of the amount, so retrying cannot resolve it and the caller may move the
+    /// collateral out of the swap path.
     ///
     /// Never construct this while any venue failed to quote: an outage may end,
-    /// and a retry would then produce a real route.
+    /// and a retry would then produce a real route. Callers that reached the
+    /// overflow preview through a venue failure downgrade it to `NoViableRoute`.
     #[error("no venue can execute this amount: {0}")]
     BelowVenueMinimum(String),
 }
@@ -653,7 +655,8 @@ impl IcpswapFirstPlanner {
     // Whether every configured overflow venue actually answered. Combined with
     // `best_executable_overflow` returning nothing, this is what distinguishes
     // "all venues are healthy and this amount is simply too small" from "a
-    // venue is down", which is not a permanent property of the amount.
+    // venue is down", which is not a permanent property of the amount. The
+    // pre-quote check in `preview_overflow` never reaches here.
     fn every_overflow_venue_quoted(&self, quotes: &VenueQuoteBook) -> bool {
         !self.overflow_venue_ids.is_empty()
             && self.overflow_venue_ids.iter().all(|venue_id| {

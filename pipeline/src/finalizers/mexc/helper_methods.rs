@@ -1056,8 +1056,8 @@ where
     /// Detailed algorithm:
     /// - `preview_trade_slice` proposes the next chunk from live orderbook depth:
     ///   soft target (`target_bps`) first, hard-cap fallback second.
-    /// - `maybe_mark_trade_dust` stops execution when chunk/remainder notional is
-    ///   below `cex_min_exec_usd` to avoid low-quality micro-fills.
+    /// - `maybe_mark_trade_dust` stops execution when, after the leg's first fill,
+    ///   the chunk and remainder notional are both below `cex_min_exec_usd`.
     /// - each accepted chunk is sent as a market order (`execute_swap`).
     /// - realized `exec_price` is derived from actual fills and compared to preview
     ///   midpoint to compute realized slippage in bps.
@@ -1109,13 +1109,9 @@ where
                 }
             };
 
-            // The dust floor trims leftovers after a fill; it must not discard
-            // an entire committed leg when prices fall during deposit settlement.
-            // Exchange lot/minimum checks still apply to the first fill.
-            if total_out > 0.0
-                && self
-                    .maybe_mark_trade_dust(state, leg, preview.chunk_in, remaining_in)
-                    .await?
+            if self
+                .maybe_mark_trade_dust(state, leg, total_out, preview.chunk_in, remaining_in)
+                .await?
             {
                 state.trade.trade_unexecutable_residual_in = Some(remaining_in);
                 Self::persist_trade_progress(state, remaining_in, total_out);
@@ -1367,13 +1363,21 @@ where
     }
 
     /// Skip tiny residual chunks that are below configured minimum execution notional.
+    ///
+    /// The floor trims leftovers after a fill. It never discards a whole
+    /// committed leg whose price fell during deposit settlement; the exchange's
+    /// own lot and minimum checks still apply to that first fill.
     pub(super) async fn maybe_mark_trade_dust(
         &self,
         state: &mut CexState,
         leg: &TradeLeg,
+        leg_total_out: f64,
         chunk_in: f64,
         remaining_in: f64,
     ) -> Result<bool, String> {
+        if leg_total_out <= 0.0 {
+            return Ok(false);
+        }
         let chunk_usd = self.input_slice_usd(&leg.market, &leg.side, chunk_in).await?;
         if chunk_usd >= self.cex_min_exec_usd {
             return Ok(false);

@@ -136,11 +136,7 @@ where
         // durable, this phase only reads settlement evidence. A normal restart
         // cannot duplicate that submission. A bridged withdrawal without its
         // helper ID still needs the submission gate: it may initiate a deposit.
-        let receipt_poll = execution.cex.step == CexStep::WithdrawPending
-            && execution.cex.withdraw.withdraw_id.is_some()
-            && (!execution.cex.withdraw.bridge.withdraw_bridge_required
-                || execution.cex.withdraw.bridge.withdraw_bridge_id.is_some());
-        if !armed_here && !receipt_poll {
+        if !armed_here && !execution.cex.is_receipt_poll_only() {
             return self.operator_required_progress(
                 execution,
                 format!("persisted MEXC intent `{intent_id}` has ambiguous submission state after restart"),

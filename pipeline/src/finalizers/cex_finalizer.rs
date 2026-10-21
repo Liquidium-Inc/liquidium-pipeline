@@ -220,6 +220,17 @@ pub struct CexState {
     pub withdraw: CexWithdrawState,
 }
 
+impl CexState {
+    /// True when advancing this state can only read exchange or bridge
+    /// evidence. Nothing in that phase submits a withdrawal or a bridge, so a
+    /// restart may resume it without the submission gate.
+    pub fn is_receipt_poll_only(&self) -> bool {
+        self.step == CexStep::WithdrawPending
+            && self.withdraw.withdraw_id.is_some()
+            && (!self.withdraw.bridge.withdraw_bridge_required || self.withdraw.bridge.withdraw_bridge_id.is_some())
+    }
+}
+
 #[async_trait]
 pub trait CexFinalizerLogic: Send + Sync {
     #[allow(dead_code)]

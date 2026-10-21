@@ -7,6 +7,7 @@ use async_trait::async_trait;
 use candid::{Nat, Principal};
 use ic_ledger_types::{AccountIdentifier, Subaccount};
 use icrc_ledger_types::icrc1::account::Account;
+use liquidium_pipeline_connectors::backend::amount_utils::nat_units_to_spend_amount;
 use liquidium_pipeline_connectors::backend::bridge_backend::{
     BRIDGE_SUBMISSION_DEFERRED_PREFIX, BridgeBackend, BridgeRequest, BridgeRouteKind, BridgeRouteSpec,
     BridgeStatus, FINALIZER_PERMANENT_AMOUNT_FLOOR_PREFIX, resolve_route,
@@ -418,6 +419,28 @@ where
         Ok(())
     }
 
+    /// Converts a native amount for the float bridge API without rounding
+    /// above the budget the wallet actually holds.
+    fn spend_f64(amount: &ChainTokenAmount) -> Result<f64, String> {
+        nat_units_to_spend_amount(&amount.value, amount.token.decimals())
+    }
+
+    /// Nets an exchange withdrawal fee out of an amount. A zero fee leaves the
+    /// amount unchanged; a fee that consumes the amount is an error.
+    fn net_of_withdraw_fee(amount: f64, fee: f64) -> Result<f64, String> {
+        if !fee.is_finite() || fee < 0.0 {
+            return Err(format!("invalid withdrawal fee {fee}"));
+        }
+        if fee <= LIQUIDITY_EPS {
+            return Ok(amount);
+        }
+        let net = amount - fee;
+        if net <= LIQUIDITY_EPS {
+            return Err(format!("fee {fee} consumes amount {amount}"));
+        }
+        Ok(net)
+    }
+
     fn compute_expected_bridge_deposit_amount(
         route: &BridgeRouteSpec,
         bridge_amount: f64,
@@ -738,10 +761,7 @@ where
             }
 
             Self::ensure_minimum_bridge_amount(bridge, route, &transfer_amount).await?;
-            let bridge_submit_amount = liquidium_pipeline_connectors::backend::amount_utils::nat_units_to_spend_amount(
-                &transfer_amount.value,
-                transfer_amount.token.decimals(),
-            )?;
+            let bridge_submit_amount = Self::spend_f64(&transfer_amount)?;
             let bridge_expected_amount = Self::compute_expected_bridge_deposit_amount(
                 route,
                 bridge_submit_amount,
@@ -1204,12 +1224,11 @@ where
                     }
                     WithdrawStatus::Completed if snapshot.txid.as_ref().is_some_and(|tx| !tx.trim().is_empty()) => {
                         if let Some(fee) = snapshot.transaction_fee {
-                            if !fee.is_finite() || fee < 0.0 || fee >= amount {
-                                return Err("invalid completed withdrawal fee".to_string());
-                            }
+                            let net = Self::net_of_withdraw_fee(amount, fee)
+                                .map_err(|error| format!("invalid completed withdrawal fee: {error}"))?;
                             state.withdraw.size_out = Some(ChainTokenAmount::from_formatted(
                                 state.withdraw.withdraw_asset.clone(),
-                                amount - fee,
+                                net,
                             ));
                         }
                         state.withdraw.withdraw_txid = snapshot.txid;
@@ -1371,14 +1390,13 @@ where
 
             let mut bridge_amount = amount;
             if let Some(withdraw_fee) = withdraw_snapshot.transaction_fee {
-                if withdraw_fee > LIQUIDITY_EPS {
-                    let adjusted_amount = bridge_amount - withdraw_fee;
-                    if adjusted_amount <= LIQUIDITY_EPS {
-                        return Err(format!(
-                            "cex withdraw fee exceeds bridged amount for liq_id {}: amount={} fee={} withdraw_id={}",
-                            state.liq_id, bridge_amount, withdraw_fee, withdraw_id
-                        ));
-                    }
+                let adjusted_amount = Self::net_of_withdraw_fee(bridge_amount, withdraw_fee).map_err(|error| {
+                    format!(
+                        "cex withdraw fee exceeds bridged amount for liq_id {}: {error} withdraw_id={}",
+                        state.liq_id, withdraw_id
+                    )
+                })?;
+                if adjusted_amount < bridge_amount {
                     info!(
                         "[mexc] liq_id={} applying CEX withdraw fee to bridged amount: gross={} fee={} net={} asset={} network={} withdraw_id={}",
                         state.liq_id,
@@ -1472,7 +1490,7 @@ where
 
             if route.route_kind == BridgeRouteKind::SolanaToIcp {
                 let gross = ChainTokenAmount::from_formatted(state.withdraw.withdraw_asset.clone(), bridge_amount);
-                bridge_amount = Self::solana_repayment_bridge_amount(bridge, route, &gross).await?.to_f64();
+                bridge_amount = Self::spend_f64(&Self::solana_repayment_bridge_amount(bridge, route, &gross).await?)?;
             }
 
             let submission = match bridge

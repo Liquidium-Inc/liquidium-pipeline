@@ -3472,7 +3472,7 @@ async fn mexc_maybe_mark_trade_dust_honors_threshold_boundary() {
         .await
         .expect("prepare should succeed");
     let skipped_eq = finalizer_eq
-        .maybe_mark_trade_dust(&mut state_eq, &leg, 0.01, 0.01)
+        .maybe_mark_trade_dust(&mut state_eq, &leg, 1.0, 0.01, 0.01)
         .await
         .expect("dust check should succeed");
     assert!(!skipped_eq);
@@ -3516,7 +3516,7 @@ async fn mexc_maybe_mark_trade_dust_honors_threshold_boundary() {
         .await
         .expect("prepare should succeed");
     let skipped_below = finalizer_below
-        .maybe_mark_trade_dust(&mut state_below, &leg, 0.01, 0.01)
+        .maybe_mark_trade_dust(&mut state_below, &leg, 1.0, 0.01, 0.01)
         .await
         .expect("dust check should succeed");
     assert!(skipped_below);
@@ -3569,7 +3569,7 @@ async fn mexc_maybe_mark_trade_dust_requires_small_chunk_and_small_residual() {
 
     // chunk_usd=0.5 (<1.0), residual_usd=2.0 (>=1.0) => should not be dust-skipped.
     let skipped = finalizer
-        .maybe_mark_trade_dust(&mut state, &leg, 0.005, 0.02)
+        .maybe_mark_trade_dust(&mut state, &leg, 1.0, 0.005, 0.02)
         .await
         .expect("dust check should succeed");
     assert!(!skipped);
