@@ -22,6 +22,19 @@ Inspired by Artemis/MEV patterns and designed for permissionless, community-driv
 
 ---
 
+## ckSOL bridge compatibility
+
+The SOL bridge backend uses account-based `deposit_sol` and deposit-specific
+`deposit_sol_status` receipts, plus `withdraw_sol` / `withdraw_sol_status`.
+Configure `BRIDGE_CKSOL_LEDGER_CANISTER` for the deployment's repayment ledger
+and `BRIDGE_IC_PROXY_CANISTER` for the cycle-funded deposit call.
+
+If notification fails after SOL is transferred, the returned bridge handle stays
+`Unknown`. Reconcile the minter deposit before taking recovery action; submitting
+a fresh bridge request would send SOL again. Automated notification recovery,
+legacy balance-threshold handles and the legacy CLI `process-deposit` command
+are not migrated by these backend fixes.
+
 ## Features
 
 ### Native SOL liquidation settlement

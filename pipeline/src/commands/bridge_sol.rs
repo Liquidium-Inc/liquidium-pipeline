@@ -332,7 +332,7 @@ async fn resolve_deposit_address_for_account(
     let arg_blob = Encode!(&args).map_err(|e| format!("encode get_deposit_address args failed: {e}"))?;
     backend
         .agent
-        .call_query::<String>(&backend.cksol_minter_canister, "get_deposit_address", arg_blob)
+        .call_update::<String>(&backend.cksol_minter_canister, "get_deposit_address", arg_blob)
         .await
         .map_err(|e| {
             format!(

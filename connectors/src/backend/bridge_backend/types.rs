@@ -101,6 +101,7 @@ pub enum BridgeStatus {
     Unknown,
 }
 
+/// Deposit-specific ledger evidence; unrelated wallet credits cannot satisfy it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BridgeMintReceipt {
     pub transaction_hash: String,
