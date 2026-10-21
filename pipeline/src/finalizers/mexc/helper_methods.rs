@@ -267,6 +267,10 @@ where
                 continue;
             };
 
+            if (base == "SOL" || quote == "SOL") && !(base == "SOL" && quote == "USDT") {
+                continue;
+            }
+
             if base == from_symbol {
                 out.push((
                     quote.clone(),
@@ -477,19 +481,43 @@ where
             return Ok(vec![]);
         }
 
+        if deposit == "SOL" {
+            let mut legs = vec![TradeLeg {
+                market: "SOL_USDT".into(),
+                side: "sell".into(),
+            }];
+            legs.extend(self.resolve_standard_trade_legs("USDT", &withdraw).await?);
+            return Ok(legs);
+        }
+        if withdraw == "SOL" {
+            let mut legs = self.resolve_standard_trade_legs(&deposit, "USDT").await?;
+            legs.push(TradeLeg {
+                market: "SOL_USDT".into(),
+                side: "buy".into(),
+            });
+            return Ok(legs);
+        }
+        self.resolve_standard_trade_legs(&deposit, &withdraw).await
+    }
+
+    async fn resolve_standard_trade_legs(&self, deposit: &str, withdraw: &str) -> Result<Vec<TradeLeg>, String> {
+        if deposit == withdraw {
+            return Ok(vec![]);
+        }
+
         // 1) High-priority compatibility override for legacy ck routes.
-        if let Some(legs) = mexc_special_trade_legs(&deposit, &withdraw) {
+        if let Some(legs) = mexc_special_trade_legs(deposit, withdraw) {
             return Ok(legs);
         }
 
         // 2) Probe direct tradable market first.
-        let direct_err = match self.resolve_direct_leg(&deposit, &withdraw).await {
+        let direct_err = match self.resolve_direct_leg(deposit, withdraw).await {
             Ok(direct_leg) => return Ok(vec![direct_leg]),
             Err(err) => err,
         };
 
         // 3) Fallback to configured graph hops.
-        self.resolve_hop_route(&deposit, &withdraw)
+        self.resolve_hop_route(deposit, withdraw)
             .await
             .map_err(|hop_err| format!("{}; {}", direct_err, hop_err))
     }

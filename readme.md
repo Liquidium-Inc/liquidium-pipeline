@@ -48,11 +48,12 @@ Configure `BRIDGE_CKSOL_MINTER_CANISTER`, `BRIDGE_CKSOL_LEDGER_CANISTER` and
 `SOLANA_RPC_URL` for the deployment. Stablecoin proceeds use the existing
 withdrawal/bridge route back to the repayment wallet.
 
-For ckSOL repayment, MEXC trades into native SOL (for example, ICP → USDC →
+For ckSOL repayment, MEXC trades into native SOL (for example, ICP → USDT →
 SOL), withdraws to the dedicated bridge Solana wallet, then deposits through
-the minter into the repayment ICP account. Include `ICP_USDC` and `SOL_USDC`
-in `CEX_MEXC_AVAILABLE_PAIRS` for that two-hop route. The bridge reserves SOL
-for its transfer fee and records the actual minted ckSOL amount. Mint
+the minter into the repayment ICP account. Include `ICP_USDT` and `SOL_USDT`
+in `CEX_MEXC_AVAILABLE_PAIRS` for that two-hop route. SOL trades always use
+`SOL_USDT`; USDC proceeds convert through `USDC_USDT` when needed. The bridge
+reserves SOL for its transfer fee and records the actual minted ckSOL amount. Mint
 destinations are restricted to the bridge owner or the configured liquidator;
 the requested subaccount is preserved.
 
