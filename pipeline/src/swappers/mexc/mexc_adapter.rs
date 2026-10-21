@@ -84,15 +84,25 @@ fn normalize_market_symbol(market: &str) -> String {
     market.replace(['/', '_', '-'], "").to_ascii_uppercase()
 }
 
-fn mexc_withdraw_coin_candidates(asset: &str) -> Vec<String> {
-    let asset = asset.trim().to_ascii_uppercase();
-    let native = asset.strip_prefix("CK").unwrap_or(&asset);
-    let mut candidates = vec![asset.clone()];
-    for candidate in [format!("CK{native}"), native.to_string()] {
-        if !candidates.contains(&candidate) {
-            candidates.push(candidate);
-        }
+/// Splits an asset symbol into its upper-case form and its native symbol
+/// without the `CK` prefix. Every MEXC alias builder starts from this pair.
+fn ck_split(asset: &str) -> (String, String) {
+    let upper = asset.trim().to_ascii_uppercase();
+    let native = upper.strip_prefix("CK").unwrap_or(&upper).to_string();
+    (upper, native)
+}
+
+fn push_unique(candidates: &mut Vec<String>, value: String) {
+    if !candidates.iter().any(|item| item.eq_ignore_ascii_case(&value)) {
+        candidates.push(value);
     }
+}
+
+fn mexc_withdraw_coin_candidates(asset: &str) -> Vec<String> {
+    let (upper, native) = ck_split(asset);
+    let mut candidates = vec![upper];
+    push_unique(&mut candidates, format!("CK{native}"));
+    push_unique(&mut candidates, native);
     candidates
 }
 
@@ -207,8 +217,8 @@ fn mexc_network_candidates(asset: &str, network: &str) -> Vec<String> {
         return candidates;
     }
 
-    let asset_no_ck = asset_norm.strip_prefix("CK").unwrap_or(&asset_norm);
-    let ck_asset = format!("CK{}", asset_no_ck);
+    let (_, asset_no_ck) = ck_split(&asset_norm);
+    let ck_asset = format!("CK{asset_no_ck}");
 
     // For ck-assets, prefer CK network names only (avoid leaking base symbol like BTC/USDT as a network).
     if asset_norm.starts_with("CK") {
@@ -269,32 +279,37 @@ fn mexc_withdraw_network(asset: &str, network: &str) -> String {
     network.to_string()
 }
 
+/// Reads the advertised order types of one exchangeInfo symbol entry.
+///
+/// The live API always returns the list, so a missing list is treated as
+/// supported only to stay compatible with older or partial metadata.
+fn supports_market_orders(info: &Value) -> bool {
+    match info.get("orderTypes").and_then(Value::as_array) {
+        Some(types) => types.iter().any(|kind| kind.as_str() == Some("MARKET")),
+        None => true,
+    }
+}
+
 fn mexc_deposit_asset_candidates(asset: &str) -> Vec<String> {
     let asset_trimmed = asset.trim();
     if asset_trimmed.is_empty() {
         return vec![];
     }
-
-    let asset_upper = asset_trimmed.to_ascii_uppercase();
-    let has_ck_prefix = asset_upper.starts_with("CK");
-    let asset_no_ck = asset_upper.strip_prefix("CK").unwrap_or(&asset_upper);
-
-    let mut candidates = Vec::new();
-
-    if has_ck_prefix {
-        // only ck variants
-        candidates.push(format!("CK{}", asset_no_ck));
-        candidates.push(format!("ck{}", asset_no_ck));
+    let (upper, native) = ck_split(asset_trimmed);
+    // Order matters: the requested asset comes before its CK alias, otherwise
+    // a native ETH deposit could resolve to IC custody. A ck asset keeps only
+    // its ck forms so the base symbol never leaks as a coin.
+    let ordered = if upper.starts_with("CK") {
+        vec![format!("CK{native}"), format!("ck{native}")]
     } else {
-        // normal asset + ck variants
-        candidates.push(asset_trimmed.to_string());
-        candidates.push(asset_upper.clone());
-        candidates.push(format!("CK{}", asset_upper));
+        vec![asset_trimmed.to_string(), upper.clone(), format!("CK{upper}")]
+    };
+    let mut candidates = Vec::new();
+    for candidate in ordered {
+        if !candidates.contains(&candidate) {
+            candidates.push(candidate);
+        }
     }
-
-    // Try the requested asset before its CK alias. Sorting puts CKETH before
-    // ETH and can select IC custody for a native Ethereum bridge deposit.
-    candidates.dedup();
     candidates
 }
 
@@ -494,15 +509,10 @@ impl MexcClient {
 }
 
 impl MexcClient {
+    /// Execution uses MARKET orders, so a listed market is only usable when
+    /// its metadata advertises them.
     fn validate_market_order_support(info: &Value, symbol: &str) -> Result<(), String> {
-        // Execution uses MARKET orders. Reject listed LIMIT-only markets when
-        // loading execution filters, before attempting a market-order submission.
-        // Preserve compatibility with metadata responses that omit orderTypes.
-        if info
-            .get("orderTypes")
-            .and_then(Value::as_array)
-            .is_some_and(|types| !types.iter().any(|kind| kind.as_str() == Some("MARKET")))
-        {
+        if !supports_market_orders(info) {
             return Err(format!("MEXC market {symbol} does not support MARKET orders"));
         }
         Ok(())
@@ -1478,6 +1488,8 @@ impl CexBackend for MexcClient {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     // Labels recorded from the live deposit address endpoint on 2026-10-21.
     #[test]
     fn deposit_network_matches_live_mexc_labels() {
@@ -1564,8 +1576,6 @@ mod tests {
         assert_eq!(address.network, "ETH");
         assert_eq!(address.address, "0x1111111111111111111111111111111111111111");
     }
-
-    use super::*;
 
     #[test]
     fn withdrawal_submission_and_history_cover_native_and_ck_aliases() {
