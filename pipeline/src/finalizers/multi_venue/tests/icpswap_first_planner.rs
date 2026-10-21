@@ -1561,6 +1561,64 @@ async fn non_native_icp_is_mexc_only_and_never_previews_icpswap() {
 }
 
 #[tokio::test]
+async fn tiny_non_native_collateral_is_rejected_before_mexc_preview() {
+    let mexc_calls = Arc::new(Mutex::new(Vec::new()));
+    let mexc = PlannerAdapter {
+        venue_id: MEXC_VENUE_ID,
+        calls: mexc_calls.clone(),
+        responder: Box::new(|_| Err("a below-minimum amount must not be quoted".to_string())),
+        validation_error: None,
+        preview_forbidden: true,
+    };
+    let planner = IcpswapFirstPlanner::new(vec![Arc::new(mexc)], config(8.0)).expect("MEXC-only planner");
+    let mut input = input_with_pay_token(non_native_icp_token());
+    input.total_pay.value = Nat::from(294u64);
+    input.pay_reference_price_usd = Some(77_663.34);
+
+    let error = planner
+        .plan(&input, QUOTED_AT)
+        .await
+        .expect_err("294 satoshis must be classified as below the MEXC minimum");
+
+    assert!(matches!(error, IcpswapFirstPlannerError::BelowVenueMinimum(_)));
+    assert!(error.to_string().contains("MEXC amount is below its minimum"));
+    assert!(mexc_calls.lock().expect("calls lock").is_empty());
+}
+
+#[tokio::test]
+async fn tiny_collateral_does_not_preview_mexc_when_icpswap_is_unavailable() {
+    let icpswap = mock_adapter(ICPSWAP_VENUE_ID, Arc::new(Mutex::new(Vec::new())), |_| {
+        Err("temporary pool outage".to_string())
+    });
+    let mexc_calls = Arc::new(Mutex::new(Vec::new()));
+    let mexc = PlannerAdapter {
+        venue_id: MEXC_VENUE_ID,
+        calls: mexc_calls.clone(),
+        responder: Box::new(|_| Err("a below-minimum amount must not be quoted".to_string())),
+        validation_error: None,
+        preview_forbidden: true,
+    };
+    let planner = planner(icpswap, mexc, config(8.0));
+    let mut input = input_with_pay_token(native_icp());
+    input.total_pay.value = Nat::from(1_000_000u64);
+    input.pay_reference_price_usd = Some(2.434);
+
+    let error = planner
+        .plan(&input, QUOTED_AT)
+        .await
+        .expect_err("a retryable ICPSwap failure must not trigger a dust MEXC preview");
+
+    assert!(matches!(error, IcpswapFirstPlannerError::NoViableRoute(_)));
+    assert!(
+        error
+            .to_string()
+            .contains("ICPSwap quote rejected (temporary pool outage)")
+    );
+    assert!(error.to_string().contains("MEXC amount is below its minimum"));
+    assert!(mexc_calls.lock().expect("calls lock").is_empty());
+}
+
+#[tokio::test]
 async fn native_icp_to_ckusdt_is_mexc_only_and_never_previews_icpswap() {
     let icpswap = PlannerAdapter {
         venue_id: ICPSWAP_VENUE_ID,

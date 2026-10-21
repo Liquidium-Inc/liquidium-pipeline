@@ -458,7 +458,11 @@ impl IcpswapFirstPlanner {
             }
             VenuePreviewOutcome::Quoted(_) => self.plan_split_or_fallback(input, quoted_at).await,
             VenuePreviewOutcome::Unavailable(icpswap_error) | VenuePreviewOutcome::Invalid(icpswap_error) => {
-                let overflow_quotes = self.preview_overflow(input, input.total_pay.value.clone()).await?;
+                let fallthrough_reason = format!("ICPSwap quote rejected ({icpswap_error})");
+                let overflow_quotes = self
+                    .preview_overflow(input, input.total_pay.value.clone())
+                    .await
+                    .map_err(|error| self.classify_overflow_preview_error(error, Some(&fallthrough_reason)))?;
                 let overflow = self.best_executable_overflow(input, &overflow_quotes).ok_or_else(|| {
                     IcpswapFirstPlannerError::NoViableRoute(format!(
                         "ICPSwap quote rejected ({icpswap_error}); {}",
@@ -630,7 +634,10 @@ impl IcpswapFirstPlanner {
         input: &IcpswapFirstPlanInput,
         fallthrough_reason: Option<String>,
     ) -> Result<VenueRoutePreview, IcpswapFirstPlannerError> {
-        let quotes = self.preview_overflow(input, input.total_pay.value.clone()).await?;
+        let quotes = self
+            .preview_overflow(input, input.total_pay.value.clone())
+            .await
+            .map_err(|error| self.classify_overflow_preview_error(error, fallthrough_reason.as_deref()))?;
         self.best_executable_overflow(input, &quotes).cloned().ok_or_else(|| {
             let summary = self.overflow_failure_summary(&quotes);
             match fallthrough_reason {
@@ -655,6 +662,27 @@ impl IcpswapFirstPlanner {
                     Some(VenuePreviewOutcome::Quoted(_))
                 )
             })
+    }
+
+    fn below_minimum_overflow_summary(&self) -> String {
+        self.overflow_venue_ids
+            .iter()
+            .map(|venue_id| format!("{} amount is below its minimum", venue_id.to_uppercase()))
+            .collect::<Vec<_>>()
+            .join("; ")
+    }
+
+    fn classify_overflow_preview_error(
+        &self,
+        error: IcpswapFirstPlannerError,
+        fallthrough_reason: Option<&str>,
+    ) -> IcpswapFirstPlannerError {
+        match (error, fallthrough_reason) {
+            (IcpswapFirstPlannerError::BelowVenueMinimum(summary), Some(reason)) => {
+                IcpswapFirstPlannerError::NoViableRoute(format!("{reason}; {summary}"))
+            }
+            (error, _) => error,
+        }
     }
 
     // Non-native ICP collateral cannot use ICPSwap, so choose the executable
@@ -875,6 +903,17 @@ impl IcpswapFirstPlanner {
         input: &IcpswapFirstPlanInput,
         pay_value: Nat,
     ) -> Result<VenueQuoteBook, IcpswapFirstPlannerError> {
+        // Overflow dust must never reach a venue adapter. Fixed transfer fees
+        // can dominate a tiny allocation and make a fair market quote look like
+        // an oracle-price failure, while the venue cannot execute the amount
+        // economically in any case.
+        let pay_amount = ChainTokenAmount::from_raw(input.total_pay.token.clone(), pay_value.clone());
+        if !input.meets_cex_minimum(&pay_amount, self.config.cex_min_exec_usd) {
+            return Err(IcpswapFirstPlannerError::BelowVenueMinimum(
+                self.below_minimum_overflow_summary(),
+            ));
+        }
+
         let context = input.planning_context();
         let quotes = self
             .venues
