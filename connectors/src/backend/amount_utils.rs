@@ -98,6 +98,13 @@ pub fn base_units_to_amount_via_core(base_units: U256, decimals: u8) -> Result<f
 
 #[cfg(test)]
 mod tests {
+    use super::{
+        amount_to_base_units_strict, amount_to_nat_units_strict, amount_to_scaled_u128_strict,
+        base_units_to_amount_via_core, nat_units_to_amount_via_core,
+    };
+    use alloy::primitives::U256;
+    use candid::Nat;
+
     #[test]
     fn spend_amount_never_rounds_above_native_budget() {
         for units in [82_100_000_000_000_001u128, 13_890_165_484_393_960_017u128] {
@@ -107,12 +114,6 @@ mod tests {
             assert!(super::amount_to_nat_units_strict(amount.next_up(), 18).unwrap() > budget);
         }
     }
-    use super::{
-        amount_to_base_units_strict, amount_to_nat_units_strict, amount_to_scaled_u128_strict,
-        base_units_to_amount_via_core, nat_units_to_amount_via_core,
-    };
-    use alloy::primitives::U256;
-    use candid::Nat;
 
     #[test]
     fn strict_converter_rejects_non_finite_amount() {

@@ -18,6 +18,13 @@ use super::{
     parse_source_icp_account, resolve_cketh_route_for_request,
 };
 
+/// A wallet with nothing in the mempool, the normal state for a submission.
+fn idle_wallet() -> MockBridgeEvmBackend {
+    let mut evm = MockBridgeEvmBackend::new();
+    evm.expect_has_pending_transactions().returning(|| Ok(false));
+    evm
+}
+
 fn expect_event_boundary(agent: &mut MockPipelineAgent) {
     #[derive(candid::CandidType)]
     struct Events {
@@ -286,8 +293,7 @@ async fn forward_bridge_rejects_subaccount_destination_when_native_helper_is_res
             })
         });
 
-    let mut mock_evm = MockBridgeEvmBackend::new();
-    mock_evm.expect_has_pending_transactions().returning(|| Ok(false));
+    let mut mock_evm = idle_wallet();
     mock_evm.expect_signer_address().times(1).returning(move || signer);
     mock_evm.expect_erc20_decimals_of().times(0);
     mock_evm.expect_erc20_approve_and_wait().times(0);
@@ -351,8 +357,7 @@ async fn forward_bridge_skips_approve_when_allowance_is_sufficient() {
             })
         });
 
-    let mut mock_evm = MockBridgeEvmBackend::new();
-    mock_evm.expect_has_pending_transactions().returning(|| Ok(false));
+    let mut mock_evm = idle_wallet();
     mock_evm.expect_signer_address().times(1).returning(move || signer);
     mock_evm
         .expect_erc20_decimals_of()
@@ -436,8 +441,7 @@ async fn forward_bridge_approves_when_allowance_is_insufficient() {
             })
         });
 
-    let mut mock_evm = MockBridgeEvmBackend::new();
-    mock_evm.expect_has_pending_transactions().returning(|| Ok(false));
+    let mut mock_evm = idle_wallet();
     mock_evm.expect_signer_address().times(1).returning(move || signer);
     mock_evm
         .expect_erc20_decimals_of()
@@ -522,8 +526,7 @@ async fn forward_bridge_fails_preflight_when_balance_is_insufficient() {
             })
         });
 
-    let mut mock_evm = MockBridgeEvmBackend::new();
-    mock_evm.expect_has_pending_transactions().returning(|| Ok(false));
+    let mut mock_evm = idle_wallet();
     mock_evm.expect_signer_address().times(1).returning(move || signer);
     mock_evm
         .expect_erc20_decimals_of()

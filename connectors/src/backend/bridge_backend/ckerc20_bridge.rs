@@ -174,19 +174,7 @@ where
     }
 
     async fn has_pending_transactions(&self) -> Result<bool, String> {
-        let signer = self.signer_address();
-        let latest = self
-            .provider
-            .get_transaction_count(signer)
-            .await
-            .map_err(|e| e.to_string())?;
-        let pending = self
-            .provider
-            .get_transaction_count(signer)
-            .pending()
-            .await
-            .map_err(|e| e.to_string())?;
-        Ok(pending > latest)
+        self.has_pending_nonce_gap(self.signer_address()).await
     }
 
     async fn helper_deposit_native(
