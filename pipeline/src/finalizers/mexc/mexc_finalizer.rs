@@ -1456,6 +1456,9 @@ where
         state.withdraw.bridge.withdraw_bridge_polled_at_ts = Some(now_ts());
         match bridge.backend.get_bridge_status(&bridge_id).await? {
             BridgeStatus::Minted(receipt) => {
+                // The EVM backend already checks its receipt against the
+                // submitted expectation. The Solana backend has no such check,
+                // so this comparison is the only one for ckSOL. Keep it.
                 let destination = state
                     .withdraw
                     .bridge

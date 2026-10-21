@@ -583,13 +583,14 @@ where
                 .map_err(|e| format!("ERC20 approve(helper={helper_address}) failed: {e}"))?;
         }
 
-        let expectation = serde_json::to_string(&super::mint_events::DepositExpectation {
-            amount: amount_base_units.to_string(),
-            recipient: *destination_account,
-            token_symbol: route.target_asset.to_string(),
-        })
-        .map_err(|e| e.to_string())?;
-        let event_start = super::mint_events::count(self.agent.as_ref(), &self.cketh_minter_canister).await?;
+        let handle = super::mint_events::PendingMintHandle::prepare(
+            self.agent.as_ref(),
+            &self.cketh_minter_canister,
+            amount_base_units,
+            *destination_account,
+            route.target_asset,
+        )
+        .await?;
         let tx_hash = match helper {
             HelperContract::WithSubaccount(address) => self
                 .evm_backend
@@ -611,7 +612,7 @@ where
 
         // Return the submitted tx hash; completion is tracked asynchronously via get_bridge_status.
         Ok(BridgeSubmission {
-            bridge_id: format!("ckmint:{event_start}:{tx_hash:#x}:{expectation}"),
+            bridge_id: handle.bridge_id(tx_hash)?,
         })
     }
 
@@ -667,13 +668,14 @@ where
             ));
         }
 
-        let expectation = serde_json::to_string(&super::mint_events::DepositExpectation {
-            amount: amount_wei.to_string(),
-            recipient: *destination_account,
-            token_symbol: route.target_asset.to_string(),
-        })
-        .map_err(|e| e.to_string())?;
-        let event_start = super::mint_events::count(self.agent.as_ref(), &self.cketh_minter_canister).await?;
+        let handle = super::mint_events::PendingMintHandle::prepare(
+            self.agent.as_ref(),
+            &self.cketh_minter_canister,
+            amount_wei,
+            *destination_account,
+            route.target_asset,
+        )
+        .await?;
         let tx_hash = match helper {
             HelperContract::WithSubaccount(address) => self
                 .evm_backend
@@ -693,7 +695,7 @@ where
         };
 
         Ok(BridgeSubmission {
-            bridge_id: format!("ckmint:{event_start}:{tx_hash:#x}:{expectation}"),
+            bridge_id: handle.bridge_id(tx_hash)?,
         })
     }
 
@@ -1067,28 +1069,7 @@ where
         // New handles persist the audit-log boundary taken before submission.
         // Older WALs contain only a hash and must scan from genesis; never treat
         // those receipts as completed just because their helper call succeeded.
-        let (event_start, transaction_hash, expectation) = if let Some(handle) = bridge_id.strip_prefix("ckmint:") {
-            let (start, hash) = handle.split_once(':').ok_or("invalid ckmint handle")?;
-            let (hash, expectation) = match hash.split_once(':') {
-                Some((hash, json)) => (
-                    hash,
-                    Some(
-                        serde_json::from_str::<super::mint_events::DepositExpectation>(json)
-                            .map_err(|e| e.to_string())?,
-                    ),
-                ),
-                None => (hash, None),
-            };
-            (
-                start
-                    .parse::<u64>()
-                    .map_err(|e| format!("invalid mint event cursor: {e}"))?,
-                hash,
-                expectation,
-            )
-        } else {
-            (0, bridge_id, None)
-        };
+        let (event_start, transaction_hash, expectation) = super::mint_events::parse_bridge_id(bridge_id)?;
         let tx_hash = transaction_hash
             .parse::<TxHash>()
             .map_err(|e| format!("invalid bridge id '{}': expected EVM tx hash: {e}", bridge_id))?;

@@ -3,8 +3,11 @@
 //! cannot distinguish concurrent deposits or prove destination delivery.
 use super::{BridgeMintReceipt, BridgeStatus};
 use crate::pipeline_agent::PipelineAgent;
+use alloy::primitives::{TxHash, U256};
 use candid::{CandidType, Encode, IDLArgs, Nat, Principal, types::value::IDLValue};
 use icrc_ledger_types::icrc1::account::Account;
+
+const HANDLE_PREFIX: &str = "ckmint:";
 
 #[derive(serde::Serialize, serde::Deserialize)]
 pub(super) struct DepositExpectation {
@@ -19,6 +22,57 @@ impl DepositExpectation {
             && self.recipient == receipt.recipient
             && self.token_symbol.eq_ignore_ascii_case(&receipt.token_symbol)
     }
+}
+
+/// Taken before the helper call, so the audit scan for this deposit starts
+/// where its events can first appear.
+pub(super) struct PendingMintHandle {
+    event_start: u64,
+    expectation: DepositExpectation,
+}
+
+impl PendingMintHandle {
+    pub(super) async fn prepare<A: PipelineAgent>(
+        agent: &A,
+        minter: &Principal,
+        amount: U256,
+        recipient: Account,
+        token_symbol: &str,
+    ) -> Result<Self, String> {
+        Ok(Self {
+            event_start: count(agent, minter).await?,
+            expectation: DepositExpectation {
+                amount: amount.to_string(),
+                recipient,
+                token_symbol: token_symbol.to_string(),
+            },
+        })
+    }
+
+    pub(super) fn bridge_id(self, tx_hash: TxHash) -> Result<String, String> {
+        let expectation = serde_json::to_string(&self.expectation).map_err(|e| e.to_string())?;
+        Ok(format!("{HANDLE_PREFIX}{}:{tx_hash:#x}:{expectation}", self.event_start))
+    }
+}
+
+/// A bare hash is a handle from before the cursor existed. It scans from
+/// genesis and has no expectation to verify.
+pub(super) fn parse_bridge_id(bridge_id: &str) -> Result<(u64, &str, Option<DepositExpectation>), String> {
+    let Some(handle) = bridge_id.strip_prefix(HANDLE_PREFIX) else {
+        return Ok((0, bridge_id, None));
+    };
+    let (start, rest) = handle.split_once(':').ok_or("invalid ckmint handle")?;
+    let event_start = start
+        .parse::<u64>()
+        .map_err(|e| format!("invalid mint event cursor: {e}"))?;
+    let (hash, expectation) = match rest.split_once(':') {
+        Some((hash, json)) => (
+            hash,
+            Some(serde_json::from_str::<DepositExpectation>(json).map_err(|e| e.to_string())?),
+        ),
+        None => (rest, None),
+    };
+    Ok((event_start, hash, expectation))
 }
 
 #[derive(CandidType, serde::Deserialize)]
@@ -190,7 +244,7 @@ pub(super) async fn status<A: PipelineAgent>(
                     log_index,
                     mint_block_index: nat(body, "mint_block_index")?,
                     amount: amount.clone(),
-                    recipient: recipient.clone(),
+                    recipient: *recipient,
                     token_symbol,
                 }));
             }
@@ -233,6 +287,35 @@ mod tests {
                 0,
             )),
         )
+    }
+
+    #[test]
+    fn bridge_id_round_trips_and_legacy_hash_scans_from_genesis() {
+        let hash = TxHash::from([7u8; 32]);
+        let handle = PendingMintHandle {
+            event_start: 42,
+            expectation: DepositExpectation {
+                amount: "123".into(),
+                recipient: Account {
+                    owner: Principal::anonymous(),
+                    subaccount: Some([3; 32]),
+                },
+                token_symbol: "ckUSDC".into(),
+            },
+        };
+        let bridge_id = handle.bridge_id(hash).unwrap();
+        let (start, parsed_hash, expectation) = parse_bridge_id(&bridge_id).unwrap();
+        assert_eq!(start, 42);
+        assert_eq!(parsed_hash, format!("{hash:#x}"));
+        let expectation = expectation.unwrap();
+        assert_eq!(expectation.amount, "123");
+        assert_eq!(expectation.recipient.subaccount, Some([3; 32]));
+
+        let legacy = format!("{hash:#x}");
+        let (start, parsed_hash, expectation) = parse_bridge_id(&legacy).unwrap();
+        assert_eq!((start, parsed_hash), (0, legacy.as_str()));
+        assert!(expectation.is_none());
+        assert!(parse_bridge_id("ckmint:nope").is_err());
     }
 
     #[test]
