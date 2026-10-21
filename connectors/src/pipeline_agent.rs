@@ -6,6 +6,7 @@ use serde::de::DeserializeOwned;
 #[mockall::automock]
 #[async_trait::async_trait]
 pub trait PipelineAgent: Send + Sync {
+    async fn call_query_raw(&self, canister: &Principal, method: &str, arg: Vec<u8>) -> Result<Vec<u8>, String>;
     async fn call_query<R: Sized + CandidType + DeserializeOwned + 'static>(
         &self,
         canister: &Principal,
@@ -68,6 +69,13 @@ pub trait PipelineAgent: Send + Sync {
 
 #[async_trait::async_trait]
 impl PipelineAgent for ic_agent::Agent {
+    async fn call_query_raw(&self, canister: &Principal, method: &str, arg: Vec<u8>) -> Result<Vec<u8>, String> {
+        self.query(canister, method)
+            .with_arg(arg)
+            .call()
+            .await
+            .map_err(|e| e.to_string())
+    }
     async fn call_query<R: CandidType + Sized + DeserializeOwned>(
         &self,
         canister: &Principal,
@@ -247,6 +255,10 @@ mod tests {
 
     #[async_trait::async_trait]
     impl PipelineAgent for ProxyRawOnlyAgent {
+        async fn call_query_raw(&self, _canister: &Principal, _method: &str, _arg: Vec<u8>) -> Result<Vec<u8>, String> {
+            panic!("unused in test")
+        }
+
         async fn call_query<R: Sized + CandidType + DeserializeOwned + 'static>(
             &self,
             _canister: &Principal,

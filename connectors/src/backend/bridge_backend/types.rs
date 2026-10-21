@@ -2,7 +2,7 @@ use alloy::primitives::Address;
 use async_trait::async_trait;
 use candid::{CandidType, Nat, Principal};
 use icrc_ledger_types::icrc1::account::Account;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BridgeDestination {
@@ -102,7 +102,7 @@ pub enum BridgeStatus {
 }
 
 /// Deposit-specific ledger evidence; unrelated wallet credits cannot satisfy it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BridgeMintReceipt {
     pub transaction_hash: String,
     pub log_index: Nat,
