@@ -234,6 +234,7 @@ pub async fn build_mexc_finalizer(ctx: &PipelineContext) -> Result<Arc<MexcFinal
         config.bridge_cketh_minter_canister,
         config.bridge_ic_owner_principal,
     ));
+    let bridge_solana_address = Keypair::new_from_array(config.bridge_solana_private_key_bytes).pubkey().to_string();
     let solana_backend = Arc::new(SolanaBridgeBackend::new(
         bridge_agent.clone(),
         Arc::new(IcpBackendImpl::new(bridge_agent)),
@@ -244,15 +245,16 @@ pub async fn build_mexc_finalizer(ctx: &PipelineContext) -> Result<Arc<MexcFinal
         config.bridge_cksol_ledger_canister,
         config.bridge_ic_owner_principal,
         config.bridge_ic_proxy_canister,
-        Keypair::new_from_array(config.bridge_solana_private_key_bytes).pubkey().to_string(),
+        bridge_solana_address.clone(),
         DEFAULT_SOLANA_BRIDGE_FEE_BUFFER_LAMPORTS,
-    ));
+    ).with_repayment_owner(config.liquidator_principal));
     let bridge_dependencies = MexcBridgeDependencies {
         backend: Arc::new(RoutedBridgeBackend { evm: bridge_backend, solana: solana_backend }),
         config: MexcBridgeConfig {
             bridge_ic_source_account: config.bridge_ic_account(),
             bridge_evm_source_address: config.bridge_evm_address.clone(),
             bridge_btc_source_address: config.bridge_btc_address.clone(),
+            bridge_solana_source_address: bridge_solana_address,
         },
     };
 

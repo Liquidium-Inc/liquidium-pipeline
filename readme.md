@@ -48,6 +48,14 @@ Configure `BRIDGE_CKSOL_MINTER_CANISTER`, `BRIDGE_CKSOL_LEDGER_CANISTER` and
 `SOLANA_RPC_URL` for the deployment. Stablecoin proceeds use the existing
 withdrawal/bridge route back to the repayment wallet.
 
+For ckSOL repayment, MEXC trades into native SOL (for example, ICP → USDC →
+SOL), withdraws to the dedicated bridge Solana wallet, then deposits through
+the minter into the repayment ICP account. Include `ICP_USDC` and `SOL_USDC`
+in `CEX_MEXC_AVAILABLE_PAIRS` for that two-hop route. The bridge reserves SOL
+for its transfer fee and records the actual minted ckSOL amount. Mint
+destinations are restricted to the bridge owner or the configured liquidator;
+the requested subaccount is preserved.
+
 - **Pipeline Architecture** — Composable stages for discovery, strategy, execution, finalization, and export.
 - **Async Rust** — Highly concurrent and efficient with Tokio runtime.
 - **Multi-Chain** — Primary support for ICP with EVM (Arbitrum) integration.

@@ -234,6 +234,7 @@ fn bridge_dependencies(backend: Arc<MockBridgeBackend>) -> MexcBridgeDependencie
             },
             bridge_evm_source_address: "0x2222222222222222222222222222222222222222".to_string(),
             bridge_btc_source_address: "bc1qbridge000000000000000000000000000000000".to_string(),
+            bridge_solana_source_address: "So11111111111111111111111111111111111111112".to_string(),
         },
     }
 }
@@ -709,7 +710,7 @@ fn mexc_sol_reverse_plan_reserves_approval_fee() {
     let route = liquidium_pipeline_connectors::backend::bridge_backend::resolve_route("ckSOL", "ICP", "SOL").unwrap();
     let amount = ChainTokenAmount::from_raw(sol.clone(), Nat::from(1_000_000_000u64));
     let (reserve, burn) = MexcFinalizer::<MockCexBackend>::compute_reverse_bridge_source_fee_reserve(
-        route, &sol, &amount.value, &amount, 0.0000005,
+        route, &sol, &amount.value, 0.0000005,
     ).unwrap().unwrap();
     assert_eq!(reserve.value, Nat::from(500u64));
     assert_eq!(burn.value, Nat::from(999_999_500u64));
@@ -5563,6 +5564,242 @@ async fn mexc_preview_route_resolves_direct_buy_leg_when_sell_book_empty() {
     assert!(preview.is_executable);
     assert!(preview.estimated_receive_amount > 0.0);
     assert!(preview.estimated_price_impact_bps >= 0.0);
+}
+
+fn repayment_account() -> icrc_ledger_types::icrc1::account::Account {
+    icrc_ledger_types::icrc1::account::Account {
+        owner: Principal::from_slice(&[42]),
+        subaccount: Some([7; 32]),
+    }
+}
+
+fn cksol_finalizer(cex: MockCexBackend, bridge: MockBridgeBackend) -> MexcFinalizer<MockCexBackend> {
+    MexcFinalizer::new(
+        Arc::new(cex),
+        Arc::new(MockTransferActions::new()),
+        repayment_account().owner,
+        TEST_MAX_SELL_SLIPPAGE_BPS,
+        TEST_CEX_MIN_EXEC_USD,
+        TEST_CEX_SLICE_TARGET_RATIO,
+    )
+    .with_bridge_dependencies(bridge_dependencies(Arc::new(bridge)))
+}
+
+fn cksol_repayment_state(finalizer: &MexcFinalizer<MockCexBackend>, amount: f64) -> CexState {
+    let mut state = finalizer
+        .prepare_amount_scoped_state(
+            "1705",
+            ChainTokenAmount::from_formatted(native_icp_token(), 10.0),
+            cksol_token(),
+            Some(repayment_account().to_string()),
+        )
+        .unwrap();
+    state.step = CexStep::Withdraw;
+    state.withdraw.size_out = Some(ChainTokenAmount::from_formatted(cksol_token(), amount));
+    state
+}
+
+fn cksol_token() -> ChainToken {
+    ChainToken::Icp {
+        ledger: Principal::from_text("ls5lp-lqaaa-aaaar-qb5oa-cai").unwrap(),
+        symbol: "ckSOL".to_string(),
+        decimals: 9,
+        fee: Nat::from(500u64),
+    }
+}
+
+#[tokio::test]
+async fn mexc_cksol_repayment_preview_uses_icp_usdc_sol_route() {
+    let mut cex = MockCexBackend::new();
+    cex.expect_get_orderbook().returning(|market, _| {
+        assert!(!market.contains("CKSOL"), "ckSOL must translate to native SOL");
+        let price = match market {
+            "ICP_USDC" => 5.0,
+            "SOL_USDC" => 100.0,
+            _ => return Err("unlisted market".to_string()),
+        };
+        Ok(OrderBook {
+            bids: vec![OrderBookLevel {
+                price,
+                quantity: 1_000.0,
+            }],
+            asks: vec![OrderBookLevel {
+                price,
+                quantity: 1_000.0,
+            }],
+        })
+    });
+    let mut bridge = MockBridgeBackend::new();
+    bridge.expect_get_source_fee_budget().returning(|asset, chain, target| {
+        assert_eq!((asset, chain, target), ("SOL", "SOL", "ckSOL"));
+        Ok(0.002)
+    });
+    bridge.expect_get_minimum_bridge_amount().returning(|_, _, _| Ok(0.02));
+    let pay = native_icp_token();
+    let receive = cksol_token();
+    let registry = liquidium_pipeline_core::tokens::token_registry::TokenRegistry::new(HashMap::from([
+        (pay.asset_id(), pay.clone()),
+        (receive.asset_id(), receive.clone()),
+    ]));
+    let finalizer = cksol_finalizer(cex, bridge)
+        .with_token_registry(Arc::new(registry))
+        .with_route_config(vec!["ICP_USDC".into(), "SOL_USDC".into()], 2);
+    let request = crate::swappers::model::SwapRequest {
+        pay_asset: pay.asset_id(),
+        pay_amount: ChainTokenAmount::from_formatted(pay, 10.0),
+        receive_asset: receive.asset_id(),
+        receive_address: None,
+        max_slippage_bps: Some(200),
+        venue_hint: Some("mexc".into()),
+    };
+    let preview = finalizer.preview_swap_request("1705", &request).await.unwrap();
+    assert_eq!(preview.state.market, "ICP_SOL");
+    assert_eq!(
+        preview.state.withdraw.bridge.withdraw_planned_network.as_deref(),
+        Some("SOL")
+    );
+    assert!(preview.state.withdraw.bridge.withdraw_bridge_required);
+    assert_eq!(preview.quote.legs[0].route_id, "ICP_USDC:sell>SOL_USDC:buy");
+    assert!(preview.quote.receive_amount > Nat::from(490_000_000u64));
+    assert!(preview.quote.receive_amount < Nat::from(498_000_000u64));
+    assert!(preview.conservative_receive.value < preview.quote.receive_amount);
+}
+
+#[tokio::test]
+async fn mexc_cksol_repayment_waits_for_funding_reserves_fees_and_records_mint() {
+    let recipient = repayment_account();
+    let mut cex = MockCexBackend::new();
+    cex.expect_withdraw()
+        .times(1)
+        .returning(|asset, network, address, amount| {
+            assert_eq!((asset, network), ("SOL", "SOL"));
+            assert_eq!(address, "So11111111111111111111111111111111111111112");
+            assert_eq!(amount, 1.5);
+            Ok(liquidium_pipeline_connectors::backend::cex_backend::WithdrawalReceipt {
+                asset: asset.into(),
+                network: network.into(),
+                amount,
+                internal_id: Some("sol-withdraw".into()),
+                txid: Some("sol-signature".into()),
+            })
+        });
+    cex.expect_get_withdraw_status_snapshot_by_id()
+        .times(2)
+        .returning(|_, _| {
+            Ok(WithdrawStatusSnapshot {
+                status: WithdrawStatus::Completed,
+                txid: Some("sol-signature".into()),
+                transaction_fee: Some(0.01),
+            })
+        });
+    let mut bridge = MockBridgeBackend::new();
+    let balances = Arc::new(std::sync::Mutex::new(vec![1.49, 0.5]));
+    bridge
+        .expect_get_source_balance()
+        .times(2)
+        .returning(move |asset, chain, _| {
+            assert_eq!((asset, chain), ("SOL", "SOL"));
+            Ok(balances.lock().unwrap().pop().unwrap())
+        });
+    bridge
+        .expect_get_source_fee_budget()
+        .times(1)
+        .returning(|_, _, _| Ok(0.002));
+    bridge
+        .expect_get_minimum_bridge_amount()
+        .times(1)
+        .returning(|_, _, _| Ok(0.02));
+    bridge.expect_submit_bridge().times(1).returning(move |request| {
+        assert_eq!(
+            (
+                request.asset.as_str(),
+                request.source_chain.as_str(),
+                request.target_asset.as_str()
+            ),
+            ("SOL", "SOL", "ckSOL")
+        );
+        assert!((request.amount - 1.488).abs() < 1e-9);
+        assert_eq!(request.destination, BridgeDestination::IcpAccount(recipient));
+        Ok(BridgeSubmission {
+            bridge_id: "cksol-deposit-v2:test".into(),
+        })
+    });
+    bridge.expect_get_bridge_status().times(1).returning(move |_| {
+        Ok(BridgeStatus::Minted(
+            liquidium_pipeline_connectors::backend::bridge_backend::BridgeMintReceipt {
+                transaction_hash: "sol-signature".into(),
+                log_index: Nat::from(77u8),
+                mint_block_index: Nat::from(99u8),
+                amount: Nat::from(1_487_995_000u64),
+                recipient,
+                token_symbol: "ckSOL".into(),
+            },
+        ))
+    });
+    let finalizer = cksol_finalizer(cex, bridge);
+    let mut state = cksol_repayment_state(&finalizer, 1.5);
+    finalizer.withdraw(&mut state).await.unwrap();
+    finalizer.withdraw(&mut state).await.unwrap();
+    assert!(state.withdraw.bridge.withdraw_bridge_id.is_none());
+    finalizer.withdraw(&mut state).await.unwrap();
+    assert!(matches!(state.step, CexStep::WithdrawPending));
+    // The persisted bridge handle resumes without issuing another exchange withdrawal or SOL transfer.
+    let mut resumed: CexState = serde_json::from_str(&serde_json::to_string(&state).unwrap()).unwrap();
+    finalizer.withdraw(&mut resumed).await.unwrap();
+    assert!(matches!(resumed.step, CexStep::Completed));
+    assert_eq!(resumed.withdraw.size_out.unwrap().value, Nat::from(1_487_995_000u64));
+}
+
+#[tokio::test]
+async fn mexc_cksol_repayment_rejects_underfunded_bridge_before_submission() {
+    let mut bridge = MockBridgeBackend::new();
+    bridge.expect_get_source_fee_budget().returning(|_, _, _| Ok(0.002));
+    bridge.expect_get_minimum_bridge_amount().returning(|_, _, _| Ok(0.02));
+    bridge.expect_submit_bridge().times(0);
+    let deps = bridge_dependencies(Arc::new(bridge));
+    let route = liquidium_pipeline_connectors::backend::bridge_backend::resolve_route("SOL", "SOL", "ckSOL").unwrap();
+    for gross in [0.001, 0.021, f64::NAN, f64::INFINITY] {
+        let amount = ChainTokenAmount::from_formatted(cksol_token(), gross);
+        assert!(
+            MexcFinalizer::<MockCexBackend>::solana_repayment_bridge_amount(&deps, route, &amount)
+                .await
+                .is_err()
+        );
+    }
+}
+
+#[tokio::test]
+async fn mexc_cksol_repayment_rejects_mint_receipt_for_wrong_account_or_token() {
+    let recipient = repayment_account();
+    for wrong_account in [true, false] {
+        let mut bridge = MockBridgeBackend::new();
+        bridge.expect_get_bridge_status().times(1).returning(move |_| {
+            Ok(BridgeStatus::Minted(
+                liquidium_pipeline_connectors::backend::bridge_backend::BridgeMintReceipt {
+                    transaction_hash: "sig".into(),
+                    log_index: Nat::from(77u8),
+                    mint_block_index: Nat::from(99u8),
+                    amount: Nat::from(100_000_000u64),
+                    recipient: if wrong_account {
+                        icrc_ledger_types::icrc1::account::Account {
+                            owner: recipient.owner,
+                            subaccount: None,
+                        }
+                    } else {
+                        recipient
+                    },
+                    token_symbol: if wrong_account { "ckSOL".into() } else { "ckETH".into() },
+                },
+            ))
+        });
+        let finalizer = cksol_finalizer(MockCexBackend::new(), bridge);
+        let mut state = cksol_repayment_state(&finalizer, 0.1);
+        state.step = CexStep::WithdrawPending;
+        state.withdraw.withdraw_id = Some("withdraw".into());
+        state.withdraw.bridge.withdraw_bridge_id = Some("cksol-deposit-v2:test".into());
+        assert!(finalizer.withdraw(&mut state).await.is_err());
+        assert!(matches!(state.step, CexStep::WithdrawPending));
+    }
 }
 
 mod fuzz {

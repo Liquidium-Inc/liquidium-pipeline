@@ -156,6 +156,7 @@ where
     pub cksol_minter_canister: Principal,
     pub cksol_ledger_canister: Principal,
     pub bridge_ic_owner_principal: Principal,
+    pub repayment_owner: Option<Principal>,
     pub bridge_proxy_canister: Option<Principal>,
     pub bridge_solana_source_address: String,
     pub fee_buffer_lamports: u64,
@@ -185,10 +186,17 @@ where
             cksol_minter_canister,
             cksol_ledger_canister,
             bridge_ic_owner_principal,
+            repayment_owner: None,
             bridge_proxy_canister,
             bridge_solana_source_address: bridge_solana_source_address.trim().to_string(),
             fee_buffer_lamports,
         }
+    }
+
+    /// Adds the liquidator as a permitted mint destination alongside the bridge owner.
+    pub fn with_repayment_owner(mut self, owner: Principal) -> Self {
+        self.repayment_owner = Some(owner);
+        self
     }
 
     fn parse_source_icp_account(source_address: &str) -> Result<Account, String> {
@@ -442,8 +450,8 @@ where
         }
     }
 
-    async fn get_deposit_address(&self, args: CkSolGetDepositAddressArgs) -> Result<String, String> {
-        let arg_blob = Encode!(&args).map_err(|e| format!("encode get_deposit_address args failed: {e}"))?;
+    async fn get_deposit_address(&self, args: &CkSolGetDepositAddressArgs) -> Result<String, String> {
+        let arg_blob = Encode!(args).map_err(|e| format!("encode get_deposit_address args failed: {e}"))?;
         self.agent
             .call_update::<String>(&self.cksol_minter_canister, "get_deposit_address", arg_blob)
             .await
@@ -569,20 +577,21 @@ where
         self.ensure_configured_bridge_source(&request.source_address)?;
 
         let destination = Self::expect_icp_destination(route, &request.destination)?;
-        if destination.owner != self.bridge_ic_owner_principal {
+        if destination.owner != self.bridge_ic_owner_principal
+            && self.repayment_owner != Some(destination.owner)
+        {
             return Err(format!(
-                "destination ICP account owner {} does not match configured bridge owner {}",
-                destination.owner, self.bridge_ic_owner_principal
+                "destination ICP account owner {} is neither configured bridge owner {} nor repayment owner {:?}",
+                destination.owner, self.bridge_ic_owner_principal, self.repayment_owner,
             ));
         }
         let proxy_canister = self.resolve_proxy_canister()?;
 
-        let expected_source = self
-            .get_deposit_address(CkSolGetDepositAddressArgs {
-                owner: Some(self.bridge_ic_owner_principal),
-                subaccount: destination.subaccount,
-            })
-            .await?;
+        let deposit_account = CkSolGetDepositAddressArgs {
+            owner: Some(destination.owner),
+            subaccount: destination.subaccount,
+        };
+        let expected_source = self.get_deposit_address(&deposit_account).await?;
 
         let decimals =
             icrc1_decimals_with_context(self.icp_backend.as_ref(), self.cksol_ledger_canister, "cksol bridge").await?;
@@ -627,10 +636,7 @@ where
                 )
             })?;
 
-        let args = Encode!(&CkSolGetDepositAddressArgs {
-            owner: Some(destination.owner),
-            subaccount: destination.subaccount,
-        })
+        let args = Encode!(&deposit_account)
         .map_err(|error| error.to_string())?;
         let result = self.agent.call_update_via_proxy::<Result<u64, DepositSolError>>(
             &proxy_canister,
@@ -725,11 +731,9 @@ where
 
         match route.route_kind {
             BridgeRouteKind::SolanaToIcp => {
-                Self::validate_solana_pubkey(address, "source Solana address")?;
-                Err(format!(
-                    "source balance is not supported for route {}@{} -> {}; sol-to-cksol uses manual process_deposit flow",
-                    route.source_asset, route.source_chain, route.target_asset
-                ))
+                self.ensure_configured_bridge_source(address)?;
+                let balance = self.solana_backend.native_balance().await?;
+                nat_units_to_amount_via_core(&balance, 9)
             }
             BridgeRouteKind::IcpToSolana => {
                 let source = self.ensure_principal_only_bridge_source(address)?;
@@ -754,6 +758,12 @@ where
 
     async fn get_fee_budget(&self, asset: &str, chain: &str, target: &str) -> Result<BridgeFeeBudget, String> {
         let route = resolve_route(asset, chain, target).ok_or_else(|| "unknown SOL bridge route".to_string())?;
+        if route.route_kind == BridgeRouteKind::SolanaToIcp {
+            return Ok(BridgeFeeBudget {
+                source_fee_budget: nat_units_to_amount_via_core(&Nat::from(self.fee_buffer_lamports), 9)?,
+                ..BridgeFeeBudget::default()
+            });
+        }
         if route.route_kind != BridgeRouteKind::IcpToSolana {
             return Ok(BridgeFeeBudget::default());
         }
@@ -879,7 +889,7 @@ mod tests {
         backend::{icp_backend::MockIcpBackend, solana_backend::MockSolanaBackend},
         pipeline_agent::MockPipelineAgent,
     };
-    use candid::{Nat, Principal};
+    use candid::{Decode, Nat, Principal};
     use icrc_ledger_types::icrc1::account::Account;
     use std::sync::{Arc, Mutex};
 
@@ -940,7 +950,7 @@ mod tests {
             Some(proxy_canister()),
             bridge_source_address(),
             fee_buffer_lamports,
-        )
+        ).with_repayment_owner(Principal::from_slice(&[42]))
     }
 
     fn sol_to_icp_request(destination_owner: Principal, subaccount: Option<[u8; 32]>) -> BridgeRequest {
@@ -1046,20 +1056,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn solana_to_icp_destination_owner_mismatch_fails() {
-        let backend = backend(
-            MockPipelineAgent::new(),
-            MockIcpBackend::new(),
-            MockSolanaBackend::new(),
-        );
+    async fn solana_to_icp_rejects_unconfigured_recipient_before_any_calls() {
+        let backend = backend(MockPipelineAgent::new(), MockIcpBackend::new(), MockSolanaBackend::new());
         let request = sol_to_icp_request(Principal::anonymous(), None);
+        assert!(backend.submit_bridge(request).await.is_err());
+    }
 
-        let err = backend
-            .submit_bridge(request)
-            .await
-            .expect_err("destination owner mismatch must fail");
-        assert!(err.contains("destination ICP account owner"));
-        assert!(err.contains("does not match configured bridge owner"));
+    #[tokio::test]
+    async fn solana_to_icp_default_restricts_recipient_to_bridge_owner() {
+        let mut backend = backend(MockPipelineAgent::new(), MockIcpBackend::new(), MockSolanaBackend::new());
+        backend.repayment_owner = None;
+        let request = sol_to_icp_request(Principal::from_slice(&[42]), None);
+        assert!(backend.submit_bridge(request).await.is_err());
     }
 
     #[tokio::test]
@@ -1080,7 +1088,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn solana_to_icp_persists_queued_deposit_id_after_transfer() {
+    async fn solana_to_icp_mints_to_requested_repayment_account() {
         assert_deposit_notification_handle(Ok(Ok(77)), Some(77)).await;
     }
 
@@ -1099,7 +1107,8 @@ mod tests {
         let query_deposit = derived_deposit.clone();
         let transfer_deposit = derived_deposit.clone();
         let subaccount = Some([9u8; 32]);
-        let mut request = sol_to_icp_request(bridge_owner(), subaccount);
+        let recipient = Principal::from_slice(&[42]);
+        let mut request = sol_to_icp_request(recipient, subaccount);
         request.source_address = source.clone();
         request.amount = 2.0;
         let events = Arc::new(Mutex::new(Vec::<String>::new()));
@@ -1110,7 +1119,13 @@ mod tests {
         mock_agent
             .expect_call_update::<String>()
             .times(1)
-            .returning(move |_, _, _| Ok(query_deposit.clone()));
+            .returning(move |_, method, args| {
+                assert_eq!(method, "get_deposit_address");
+                let account = candid::Decode!(&args, super::CkSolGetDepositAddressArgs).unwrap();
+                assert_eq!(account.owner, Some(recipient));
+                assert_eq!(account.subaccount, subaccount);
+                Ok(query_deposit.clone())
+            });
         mock_agent
             .expect_call_query::<CkSolMinterInfo>()
             .times(1)
@@ -1118,11 +1133,14 @@ mod tests {
         mock_agent
             .expect_call_update_via_proxy::<Result<u64, DepositSolError>>()
             .times(1)
-            .returning(move |proxy, canister, method, _, cycles| {
+            .returning(move |proxy, canister, method, args, cycles| {
                 process_events.lock().expect("mutex").push("process".to_string());
                 assert_eq!(*proxy, proxy_canister());
                 assert_eq!(*canister, minter_canister());
                 assert_eq!(method, "deposit_sol");
+                let account = candid::Decode!(&args, super::CkSolGetDepositAddressArgs).unwrap();
+                assert_eq!(account.owner, Some(recipient));
+                assert_eq!(account.subaccount, subaccount);
                 assert_eq!(cycles, Nat::from(1_000_000_000_000u64));
                 result.clone()
             });
@@ -1158,7 +1176,7 @@ mod tests {
             submission.bridge_id.strip_prefix(super::QUEUED_DEPOSIT_PREFIX).unwrap(),
         ).unwrap();
 
-        assert_eq!(decoded.account.owner, bridge_owner());
+        assert_eq!(decoded.account.owner, recipient);
         assert_eq!(decoded.account.subaccount, subaccount);
         assert_eq!(decoded.deposit_id, expected_id);
         assert_eq!(decoded.transfer_signature, "sig-123");
@@ -1513,18 +1531,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn get_source_balance_for_solana_to_icp_is_explicitly_unsupported() {
-        let backend = backend(
-            MockPipelineAgent::new(),
-            MockIcpBackend::new(),
-            MockSolanaBackend::new(),
-        );
-
-        let err = backend
-            .get_source_balance("SOL", "SOL", &bridge_source_address())
-            .await
-            .expect_err("source balance on Solana side should be unsupported in this phase");
-        assert!(err.contains("source balance is not supported"));
+    async fn get_source_balance_for_solana_to_icp_reads_configured_wallet_only() {
+        let mut solana = MockSolanaBackend::new();
+        solana.expect_native_balance().times(1).returning(|| Ok(Nat::from(123_000_000u64)));
+        let backend = backend(MockPipelineAgent::new(), MockIcpBackend::new(), solana);
+        assert!(backend.get_source_balance("SOL", "SOL", &valid_solana_address()).await.is_err());
+        let balance = backend.get_source_balance("SOL", "SOL", &bridge_source_address()).await.unwrap();
+        assert!((balance - 0.123).abs() < 1e-12);
+        let fees = backend.get_fee_budget("SOL", "SOL", "ckSOL").await.unwrap();
+        assert!((fees.source_fee_budget - 0.002).abs() < 1e-12);
     }
 
     #[test]

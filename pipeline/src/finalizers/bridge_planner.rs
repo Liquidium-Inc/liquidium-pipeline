@@ -68,8 +68,13 @@ pub(crate) trait BridgePlanner {
             };
         }
 
-        // Withdraw-side translation: ckERC20 forward route (e.g. USDC@ETH -> ckUSDC@ICP).
-        if let Some(route) = resolve_cketh_forward_route_by_target(&withdraw.cex_asset)
+        // Withdraw-side translation into the asset the exchange can deliver.
+        let forward_route = if withdraw.cex_asset.eq_ignore_ascii_case("ckSOL") {
+            resolve_route("SOL", "SOL", &withdraw.cex_asset)
+        } else {
+            resolve_cketh_forward_route_by_target(&withdraw.cex_asset)
+        };
+        if let Some(route) = forward_route
             && route.destination_kind == BridgeDestinationKind::IcpAccount
         {
             withdraw = BridgeTransportPlan {

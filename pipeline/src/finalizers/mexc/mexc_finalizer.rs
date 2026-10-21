@@ -50,6 +50,7 @@ pub struct MexcBridgeConfig {
     pub bridge_ic_source_account: Account,
     pub bridge_evm_source_address: String,
     pub bridge_btc_source_address: String,
+    pub bridge_solana_source_address: String,
 }
 
 #[derive(Clone)]
@@ -311,7 +312,6 @@ where
         route: &BridgeRouteSpec,
         deposit_asset: &ChainToken,
         transfer_value: &Nat,
-        transfer_amount: &ChainTokenAmount,
         source_fee_budget: f64,
     ) -> Result<Option<(ChainTokenAmount, ChainTokenAmount)>, String> {
         if !matches!(
@@ -324,24 +324,66 @@ where
             return Ok(None);
         }
 
-        let source_fee_reserve = ChainTokenAmount::from_formatted(deposit_asset.clone(), source_fee_budget);
-        if source_fee_reserve.value == Nat::from(0u8) {
+        let bridge_amount = Self::amount_after_fee_reserve(
+            deposit_asset,
+            transfer_value,
+            source_fee_budget,
+            "reverse bridge source fee budget",
+        )?;
+        if bridge_amount.value == *transfer_value {
             return Ok(None);
         }
+        let reserve = ChainTokenAmount::from_raw(
+            deposit_asset.clone(),
+            transfer_value.clone() - bridge_amount.value.clone(),
+        );
+        Ok(Some((reserve, bridge_amount)))
+    }
 
-        if transfer_value.clone() <= source_fee_reserve.value.clone() {
+    fn amount_after_fee_reserve(
+        token: &ChainToken,
+        amount: &Nat,
+        reserve_budget: f64,
+        label: &str,
+    ) -> Result<ChainTokenAmount, String> {
+        if !reserve_budget.is_finite() || reserve_budget < 0.0 {
+            return Err(format!("invalid {label}: {reserve_budget}"));
+        }
+        let reserve = ChainTokenAmount::from_formatted(token.clone(), reserve_budget);
+        if reserve.value != Nat::from(0u8) && *amount <= reserve.value {
             return Err(format!(
-                "{}: deposit amount {} too small to reserve reverse bridge source fee budget {} for {}",
+                "{}: deposit amount {} too small to reserve {} {} for {}",
                 FINALIZER_PERMANENT_AMOUNT_FLOOR_PREFIX,
-                transfer_amount.formatted(),
-                source_fee_reserve.formatted(),
-                deposit_asset.symbol()
+                ChainTokenAmount::from_raw(token.clone(), amount.clone()).formatted(),
+                label,
+                reserve.formatted(),
+                token.symbol(),
             ));
         }
+        Ok(ChainTokenAmount::from_raw(
+            token.clone(),
+            amount.clone() - reserve.value,
+        ))
+    }
 
-        let bridge_amount_value = transfer_value.clone() - source_fee_reserve.value.clone();
-        let bridge_amount = ChainTokenAmount::from_raw(deposit_asset.clone(), bridge_amount_value);
-        Ok(Some((source_fee_reserve, bridge_amount)))
+    pub(super) async fn solana_repayment_bridge_amount(
+        bridge: &MexcBridgeDependencies,
+        route: &BridgeRouteSpec,
+        gross: &ChainTokenAmount,
+    ) -> Result<ChainTokenAmount, String> {
+        let fee_budget = bridge
+            .backend
+            .get_source_fee_budget(route.source_asset, route.source_chain, route.target_asset)
+            .await?;
+        // SOL and ckSOL have the same base units; keep the repayment token metadata.
+        let net = Self::amount_after_fee_reserve(
+            &gross.token,
+            &gross.value,
+            fee_budget,
+            "repayment bridge source fee budget",
+        )?;
+        Self::ensure_minimum_bridge_amount(bridge, route, &net).await?;
+        Ok(net)
     }
 
     async fn ensure_minimum_bridge_amount(
@@ -675,7 +717,6 @@ where
                 route,
                 &state.deposit.deposit_asset,
                 &transfer_value,
-                &transfer_amount,
                 fee_budget.source_fee_budget,
             )? {
                 transfer_amount = bridge_amount;
@@ -1359,6 +1400,11 @@ where
                 bridge_amount = source_available;
             }
 
+            if route.route_kind == BridgeRouteKind::SolanaToIcp {
+                let gross = ChainTokenAmount::from_formatted(state.withdraw.withdraw_asset.clone(), bridge_amount);
+                bridge_amount = Self::solana_repayment_bridge_amount(bridge, route, &gross).await?.to_f64();
+            }
+
             let submission = bridge
                 .backend
                 .submit_bridge(BridgeRequest {
@@ -1385,7 +1431,22 @@ where
             .ok_or_else(|| "missing bridge id while polling bridged withdraw".to_string())?;
         state.withdraw.bridge.withdraw_bridge_polled_at_ts = Some(now_ts());
         match bridge.backend.get_bridge_status(&bridge_id).await? {
-            BridgeStatus::Completed | BridgeStatus::Minted(_) => {
+            BridgeStatus::Minted(receipt) => {
+                let destination = state.withdraw.bridge.withdraw_bridge_destination_snapshot.as_deref()
+                    .ok_or_else(|| "missing final destination snapshot for bridged withdraw".to_string())?;
+                let expected = Self::parse_icp_account_like(destination)?;
+                if receipt.recipient != expected
+                    || !receipt.token_symbol.eq_ignore_ascii_case(&state.withdraw.withdraw_asset.symbol())
+                {
+                    return Err("bridge mint receipt does not match repayment account or token".to_string());
+                }
+                state.withdraw.size_out = Some(ChainTokenAmount::from_raw(
+                    state.withdraw.withdraw_asset.clone(), receipt.amount,
+                ));
+                state.step = CexStep::Completed;
+                Ok(())
+            }
+            BridgeStatus::Completed => {
                 state.step = CexStep::Completed;
                 Ok(())
             }

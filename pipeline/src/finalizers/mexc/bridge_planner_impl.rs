@@ -27,6 +27,10 @@ where
             return Ok(deps.config.bridge_btc_source_address.clone());
         }
 
+        if source_chain.eq_ignore_ascii_case("SOL") {
+            return Ok(deps.config.bridge_solana_source_address.clone());
+        }
+
         Err(format!("unsupported bridge source chain '{}'", source_chain))
     }
 }
