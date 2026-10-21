@@ -85,6 +85,8 @@ fn eth_forward_gas_reserve_from_price(gas_price_wei: u128, gas_limit: u128) -> U
 pub trait BridgeEvmBackend: Send + Sync {
     fn signer_address(&self) -> Address;
 
+    async fn has_pending_transactions(&self) -> Result<bool, String>;
+
     async fn native_balance_of(&self, owner: Address) -> Result<U256, String>;
     async fn native_tx_gas_reserve(&self, gas_limit: u128) -> Result<U256, String>;
     async fn erc20_balance_of(&self, token: Address, owner: Address) -> Result<U256, String>;
@@ -166,6 +168,22 @@ where
 
     async fn erc20_approve_and_wait(&self, token: Address, spender: Address, amount: U256) -> Result<TxHash, String> {
         self.erc20_approve_and_wait_raw(token, spender, amount).await
+    }
+
+    async fn has_pending_transactions(&self) -> Result<bool, String> {
+        let signer = self.signer_address();
+        let latest = self
+            .provider
+            .get_transaction_count(signer)
+            .await
+            .map_err(|e| e.to_string())?;
+        let pending = self
+            .provider
+            .get_transaction_count(signer)
+            .pending()
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(pending > latest)
     }
 
     async fn helper_deposit_native(
@@ -262,6 +280,7 @@ where
     pub evm_backend: Arc<E>,
     pub cketh_minter_canister: Principal,
     pub bridge_ic_owner_principal: Principal,
+    forward_submission: tokio::sync::Mutex<()>,
 }
 
 impl<A, B, E> CkErc20BridgeBackend<A, B, E>
@@ -283,6 +302,7 @@ where
             evm_backend,
             cketh_minter_canister,
             bridge_ic_owner_principal,
+            forward_submission: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -502,6 +522,13 @@ where
         route: &BridgeRouteSpec,
         request: &BridgeRequest,
     ) -> Result<BridgeSubmission, String> {
+        // Exact approvals replace the wallet's allowance. Serialise preflight
+        // and submission, then defer while a helper may still consume it in the
+        // mempool. The RPC nonce check also applies after backend reconstruction.
+        let _submission = self.forward_submission.lock().await;
+        if self.evm_backend.has_pending_transactions().await? {
+            return Err("bridge wallet has pending transactions; retry after inclusion".into());
+        }
         let token_address = parse_evm_token_address(route)?;
 
         let signer = self.evm_backend.signer_address();

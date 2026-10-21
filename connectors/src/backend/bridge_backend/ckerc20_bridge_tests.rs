@@ -175,6 +175,53 @@ fn reverse_source_must_match_bridge_owner_and_be_owner_only() {
 }
 
 #[tokio::test]
+async fn forward_bridge_serialises_preflight_and_defers_pending_wallet_after_restart() {
+    for _ in 0..2 {
+        let mut evm = MockBridgeEvmBackend::new();
+        evm.expect_has_pending_transactions().times(1).returning(|| Ok(true));
+        evm.expect_erc20_approve_and_wait().times(0);
+        evm.expect_helper_deposit_native().times(0);
+        evm.expect_helper_deposit_with_subaccount().times(0);
+        let backend = CkErc20BridgeBackend::new(
+            Arc::new(MockPipelineAgent::new()),
+            Arc::new(MockIcpBackend::new()),
+            Arc::new(evm),
+            Principal::management_canister(),
+            Principal::management_canister(),
+        );
+        let request = BridgeRequest {
+            asset: "USDC".into(),
+            source_chain: "ETH".into(),
+            source_address: "0x1111111111111111111111111111111111111111".into(),
+            target_asset: "ckUSDC".into(),
+            destination: BridgeDestination::IcpAccount(Account {
+                owner: Principal::management_canister(),
+                subaccount: None,
+            }),
+            amount: 1.0,
+            provider_fee_budget_native_units: None,
+        };
+        let guard = backend.forward_submission.lock().await;
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(10),
+                backend.submit_bridge(request.clone())
+            )
+            .await
+            .is_err()
+        );
+        drop(guard);
+        assert!(
+            backend
+                .submit_bridge(request)
+                .await
+                .unwrap_err()
+                .contains("pending transactions")
+        );
+    }
+}
+
+#[tokio::test]
 async fn forward_bridge_rejects_subaccount_destination_when_native_helper_is_resolved() {
     let signer = "0x1111111111111111111111111111111111111111"
         .parse::<Address>()
@@ -196,6 +243,7 @@ async fn forward_bridge_rejects_subaccount_destination_when_native_helper_is_res
         });
 
     let mut mock_evm = MockBridgeEvmBackend::new();
+    mock_evm.expect_has_pending_transactions().returning(|| Ok(false));
     mock_evm.expect_signer_address().times(1).returning(move || signer);
     mock_evm.expect_erc20_decimals_of().times(0);
     mock_evm.expect_erc20_approve_and_wait().times(0);
@@ -259,6 +307,7 @@ async fn forward_bridge_skips_approve_when_allowance_is_sufficient() {
         });
 
     let mut mock_evm = MockBridgeEvmBackend::new();
+    mock_evm.expect_has_pending_transactions().returning(|| Ok(false));
     mock_evm.expect_signer_address().times(1).returning(move || signer);
     mock_evm
         .expect_erc20_decimals_of()
@@ -342,6 +391,7 @@ async fn forward_bridge_approves_when_allowance_is_insufficient() {
         });
 
     let mut mock_evm = MockBridgeEvmBackend::new();
+    mock_evm.expect_has_pending_transactions().returning(|| Ok(false));
     mock_evm.expect_signer_address().times(1).returning(move || signer);
     mock_evm
         .expect_erc20_decimals_of()
@@ -427,6 +477,7 @@ async fn forward_bridge_fails_preflight_when_balance_is_insufficient() {
         });
 
     let mut mock_evm = MockBridgeEvmBackend::new();
+    mock_evm.expect_has_pending_transactions().returning(|| Ok(false));
     mock_evm.expect_signer_address().times(1).returning(move || signer);
     mock_evm
         .expect_erc20_decimals_of()
