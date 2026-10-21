@@ -8,8 +8,8 @@ use candid::{Nat, Principal};
 use ic_ledger_types::{AccountIdentifier, Subaccount};
 use icrc_ledger_types::icrc1::account::Account;
 use liquidium_pipeline_connectors::backend::bridge_backend::{
-    BridgeBackend, BridgeRequest, BridgeRouteKind, BridgeRouteSpec, BridgeStatus,
-    FINALIZER_PERMANENT_AMOUNT_FLOOR_PREFIX, resolve_route,
+    BRIDGE_SUBMISSION_DEFERRED_PREFIX, BridgeBackend, BridgeRequest, BridgeRouteKind, BridgeRouteSpec,
+    BridgeStatus, FINALIZER_PERMANENT_AMOUNT_FLOOR_PREFIX, resolve_route,
 };
 use liquidium_pipeline_connectors::backend::cex_backend::{
     BuyOrderInputMode, CexBackend, CexBackendError, OrderBookLevel, SwapExecutionOptions, WithdrawStatus,
@@ -871,7 +871,7 @@ where
                 }
             }
 
-            let submission = bridge
+            let submission = match bridge
                 .backend
                 .submit_bridge(BridgeRequest {
                     asset: route.source_asset.to_string(),
@@ -882,7 +882,18 @@ where
                     amount: bridge_amount,
                     provider_fee_budget_native_units,
                 })
-                .await?;
+                .await
+            {
+                Ok(submission) => submission,
+                // A busy bridge wallet is a wait, not a failure. Keep the step
+                // pending so the retry budget is not spent on it.
+                Err(error) if error.starts_with(BRIDGE_SUBMISSION_DEFERRED_PREFIX) => {
+                    info!("[mexc] liq_id={} bridged deposit deferred: {}", state.liq_id, error);
+                    state.step = CexStep::DepositPending;
+                    return Ok(());
+                }
+                Err(error) => return Err(error),
+            };
 
             state.deposit.bridge.deposit_bridge_id = Some(submission.bridge_id);
             state.deposit.bridge.deposit_bridge_submitted_at_ts = Some(now_ts());
@@ -1408,7 +1419,7 @@ where
                 bridge_amount = Self::solana_repayment_bridge_amount(bridge, route, &gross).await?.to_f64();
             }
 
-            let submission = bridge
+            let submission = match bridge
                 .backend
                 .submit_bridge(BridgeRequest {
                     asset: route.source_asset.to_string(),
@@ -1419,7 +1430,17 @@ where
                     amount: bridge_amount,
                     provider_fee_budget_native_units: None,
                 })
-                .await?;
+                .await
+            {
+                Ok(submission) => submission,
+                // Same wait semantics as the deposit side: no budget spent.
+                Err(error) if error.starts_with(BRIDGE_SUBMISSION_DEFERRED_PREFIX) => {
+                    info!("[mexc] liq_id={} bridged withdraw deferred: {}", state.liq_id, error);
+                    state.step = CexStep::WithdrawPending;
+                    return Ok(());
+                }
+                Err(error) => return Err(error),
+            };
             state.withdraw.bridge.withdraw_bridge_id = Some(submission.bridge_id);
             state.withdraw.bridge.withdraw_bridge_submitted_at_ts = Some(now_ts());
             state.step = CexStep::WithdrawPending;

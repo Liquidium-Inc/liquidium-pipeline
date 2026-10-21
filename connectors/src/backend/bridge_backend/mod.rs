@@ -7,7 +7,8 @@ pub use routed_bridge::RoutedBridgeBackend;
 mod types;
 mod utils;
 pub use ckerc20_bridge::{
-    BRIDGE_AMOUNT_BELOW_MINIMUM_PREFIX, BridgeEvmBackend, CkErc20BridgeBackend, FINALIZER_PERMANENT_AMOUNT_FLOOR_PREFIX,
+    BRIDGE_AMOUNT_BELOW_MINIMUM_PREFIX, BRIDGE_SUBMISSION_DEFERRED_PREFIX, BridgeEvmBackend, CkErc20BridgeBackend,
+    FINALIZER_PERMANENT_AMOUNT_FLOOR_PREFIX,
 };
 pub use solana_bridge::{DEFAULT_SOLANA_BRIDGE_FEE_BUFFER_LAMPORTS, SolanaBridgeBackend};
 pub use types::{

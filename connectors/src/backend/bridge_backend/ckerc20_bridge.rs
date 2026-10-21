@@ -72,6 +72,9 @@ const ETH_FORWARD_GAS_RESERVE_MULTIPLIER: u128 = 2;
 const DEFAULT_CKETH_MIN_WITHDRAWAL_WEI: u128 = 5_000_000_000_000_000;
 pub const FINALIZER_PERMANENT_AMOUNT_FLOOR_PREFIX: &str = "finalizer_permanent_amount_floor";
 pub const BRIDGE_AMOUNT_BELOW_MINIMUM_PREFIX: &str = FINALIZER_PERMANENT_AMOUNT_FLOOR_PREFIX;
+/// Marks a submission the bridge refused only because the wallet is busy. The
+/// finalizer keeps the step pending and retries without spending its budget.
+pub const BRIDGE_SUBMISSION_DEFERRED_PREFIX: &str = "bridge_submission_deferred";
 
 fn eth_forward_gas_reserve_from_price(gas_price_wei: u128, gas_limit: u128) -> U256 {
     let dynamic_reserve = U256::from(gas_price_wei)
@@ -527,7 +530,9 @@ where
         // mempool. The RPC nonce check also applies after backend reconstruction.
         let _submission = self.forward_submission.lock().await;
         if self.evm_backend.has_pending_transactions().await? {
-            return Err("bridge wallet has pending transactions; retry after inclusion".into());
+            return Err(format!(
+                "{BRIDGE_SUBMISSION_DEFERRED_PREFIX}: bridge wallet has pending transactions; retry after inclusion"
+            ));
         }
         let token_address = parse_evm_token_address(route)?;
 
