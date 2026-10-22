@@ -24,7 +24,7 @@ use super::super::*;
 use crate::{
     executors::executor::ExecutorRequest,
     liquidation::collateral_service::USD_QUOTE_CURRENCY,
-    persistance::{MultiVenueAllocationReason, VenueExecutionState, VenueLegState},
+    persistance::{MultiVenueAllocationReason, MultiVenueExecutionState, VenueExecutionState, VenueLegState},
     price_oracle::price_oracle::MockPriceOracle,
     stages::executor::{ExecutionReceipt, ExecutionStatus},
     swappers::model::{SwapQuote, SwapQuoteLeg, SwapRequest},
@@ -273,6 +273,8 @@ fn config(cex_min_exec_usd: f64) -> IcpswapFirstPlannerConfig {
         dust_fallback_max_price_impact_bps: 150.0,
         cex_min_exec_usd,
         min_net_edge_bps: 150,
+        settlement_min_net_edge_bps: None,
+        buy_bad_debt: false,
         bad_debt_min_net_edge_bps: 150,
         // Must stay above the 150 bps dust fallback impact cap, which already
         // includes the pool fee.
@@ -952,6 +954,41 @@ async fn unsafe_exact_icpswap_requotes_full_even_when_the_remainder_is_unquotabl
             unavailable_venue_ids: vec![ICPSWAP_VENUE_ID.to_string()],
         }
     );
+}
+
+#[tokio::test]
+async fn settlement_override_enforces_exact_boundaries_and_preserves_the_legacy_default() {
+    for (floor, output, accepted) in [
+        (None, TOTAL_PAY, false),
+        (Some(0), TOTAL_PAY, true),
+        (Some(0), TOTAL_PAY - 1, false),
+        (Some(-150), TOTAL_PAY * 985 / 1000, true),
+        (Some(-150), TOTAL_PAY * 985 / 1000 - 1, false),
+    ] {
+        let icpswap = mock_adapter(ICPSWAP_VENUE_ID, Arc::new(Mutex::new(Vec::new())), move |request| {
+            let mut preview = proportional_preview(request, ICPSWAP_VENUE_ID, 0.0, 1);
+            preview.conservative_receive.value = Nat::from(output);
+            Ok(preview)
+        });
+        let planner_config = IcpswapFirstPlannerConfig {
+            settlement_min_net_edge_bps: floor,
+            ..config(1.1)
+        };
+        let planner = IcpswapFirstPlanner::new(vec![Arc::new(icpswap)], planner_config).expect("valid planner");
+        let mut input = input_with_pay_token(native_icp());
+        input.debt_repaid.value = Nat::from(TOTAL_PAY);
+        let result = planner.plan(&input, QUOTED_AT).await;
+        if accepted {
+            let state = result.expect("output meets the settlement floor");
+            assert_eq!(state.plan.enforced_min_net_edge_bps, floor);
+            assert_eq!(state.plan.min_net_edge_bps, 150);
+            let restored: MultiVenueExecutionState =
+                serde_json::from_str(&serde_json::to_string(&state).expect("serialize")).expect("restore");
+            assert_eq!(restored.plan.enforced_min_net_edge_bps, floor);
+        } else {
+            assert!(matches!(result, Err(IcpswapFirstPlannerError::NoViableRoute(_))));
+        }
+    }
 }
 
 #[tokio::test]

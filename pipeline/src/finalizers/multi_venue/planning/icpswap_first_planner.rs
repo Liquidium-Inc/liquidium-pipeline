@@ -45,8 +45,12 @@ pub struct IcpswapFirstPlannerConfig {
     pub dust_fallback_max_price_impact_bps: f64,
     pub cex_min_exec_usd: f64,
     pub min_net_edge_bps: u32,
-    /// Edge floor applied instead of `min_net_edge_bps` when the liquidation was
-    /// bought as bad debt. Signed, because such a row repays more than the
+    /// Optional signed override for normal settlement after liquidation.
+    pub settlement_min_net_edge_bps: Option<i32>,
+    /// Reuse the bad-debt settlement floor for all new plans when enabled globally.
+    pub buy_bad_debt: bool,
+    /// Edge floor used when bad-debt mode is enabled or the row was bought as
+    /// bad debt. Signed, because such a row repays more than the
     /// collateral is worth by construction: a non-negative floor can never be
     /// met and would leave the collateral stranded. `-10000` recycles it
     /// whatever the shortfall; the quote is still bounded by the oracle guard.
@@ -58,7 +62,28 @@ pub struct IcpswapFirstPlannerConfig {
     pub icpswap_test_allocation_usd: Option<f64>,
 }
 
+/// A settlement floor of `-BPS_DENOMINATOR` would accept any output at all, so
+/// the valid range is open at the bottom and closed at the top.
+pub(crate) fn is_valid_settlement_floor(bps: i32) -> bool {
+    let limit = i32::try_from(BPS_DENOMINATOR).unwrap_or(i32::MAX);
+    bps > -limit && bps <= limit
+}
+
 impl IcpswapFirstPlannerConfig {
+    /// The edge floor a new plan is held to.
+    ///
+    /// Bad-debt mode, global or per row, permits bounded settlement losses even
+    /// for a row that looked profitable at entry. Otherwise the signed
+    /// settlement override applies, and without one the legacy unsigned floor.
+    pub(crate) fn required_edge_bps(&self, row_bad_debt: bool) -> i32 {
+        if self.buy_bad_debt || row_bad_debt {
+            self.bad_debt_min_net_edge_bps
+        } else {
+            self.settlement_min_net_edge_bps
+                .unwrap_or_else(|| i32::try_from(self.min_net_edge_bps).unwrap_or(i32::MAX))
+        }
+    }
+
     // Rejects configuration that could make allocation ambiguous or unsafe.
     fn validate(&self) -> Result<(), IcpswapFirstPlannerError> {
         if !self.max_price_impact_bps.is_finite() || self.max_price_impact_bps <= 0.0 {
@@ -92,6 +117,11 @@ impl IcpswapFirstPlannerConfig {
             )));
         }
         let bps_limit = i32::try_from(BPS_DENOMINATOR).unwrap_or(i32::MAX);
+        if self.settlement_min_net_edge_bps.is_some_and(|bps| !is_valid_settlement_floor(bps)) {
+            return Err(IcpswapFirstPlannerError::InvalidInput(format!(
+                "settlement minimum net edge must be greater than -{bps_limit} and at most {bps_limit} bps"
+            )));
+        }
         if self.bad_debt_min_net_edge_bps > bps_limit || self.bad_debt_min_net_edge_bps < -bps_limit {
             return Err(IcpswapFirstPlannerError::InvalidInput(format!(
                 "bad-debt minimum net edge {} bps must stay within ±{} bps",
@@ -1141,15 +1171,8 @@ impl IcpswapFirstPlanner {
         let conservative_receive = sum_leg_outputs(&legs, true)?;
         let combined_net_edge_bps = edge_bps(&conservative_receive, &input.debt_repaid)?;
 
-        // Bad debt is bought at a known loss, so measuring the swap against the
-        // debt it repaid can only ever reject it. Its own floor decides how much
-        // of that shortfall may be recycled without a human; the quote is still
-        // held to the oracle by `validate_venue_preview`.
-        let required_edge_bps = if input.buy_bad_debt {
-            self.config.bad_debt_min_net_edge_bps
-        } else {
-            i32::try_from(self.config.min_net_edge_bps).unwrap_or(i32::MAX)
-        };
+        // Every quote is still held to the oracle by `validate_venue_preview`.
+        let required_edge_bps = self.config.required_edge_bps(input.buy_bad_debt);
 
         if !meets_minimum_edge(&conservative_receive, &input.debt_repaid, required_edge_bps)? {
             return Err(IcpswapFirstPlannerError::NoViableRoute(format!(

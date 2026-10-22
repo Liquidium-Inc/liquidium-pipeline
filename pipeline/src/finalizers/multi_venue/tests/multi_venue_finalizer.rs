@@ -694,6 +694,8 @@ fn planner_config() -> IcpswapFirstPlannerConfig {
         dust_fallback_max_price_impact_bps: 150.0,
         cex_min_exec_usd: 0.01,
         min_net_edge_bps: 150,
+        settlement_min_net_edge_bps: None,
+        buy_bad_debt: false,
         bad_debt_min_net_edge_bps: 150,
         max_oracle_discount_bps: 250,
         oracle_snapshot_max_age_secs: 300,
@@ -1212,6 +1214,46 @@ async fn a_negative_bad_debt_floor_recycles_collateral_a_positive_one_strands() 
         .await
         .expect_err("a profitable-liquidation row keeps its own floor");
     assert!(error.message().contains("below required 150 bps"));
+}
+
+#[tokio::test]
+async fn global_bad_debt_mode_reuses_the_existing_floor_for_normal_settlement() {
+    for (enabled, row_bad_debt, debt, accepted) in [
+        (false, false, 200_000_000u64, false),
+        (true, false, 200_000_000, true),
+        (true, false, 200_000_001, false),
+        (false, true, 200_000_000, true),
+        (true, true, 200_000_000, true),
+        (false, false, 180_000_000, true),
+    ] {
+        let mut receipt = receipt();
+        receipt.request.liquidation.buy_bad_debt = row_bad_debt;
+        let amounts = &mut receipt.liquidation_result.as_mut().expect("liquidation result").amounts;
+        // The adapter returns twice the collateral, so this quotes 190M units.
+        amounts.collateral_received = Nat::from(95_000_000u64);
+        amounts.debt_repaid = Nat::from(debt);
+        let wal = TestWal::with_receipt(&receipt);
+        let adapter = Arc::new(ScriptedAdapter::new(ICPSWAP_VENUE_ID, None, Vec::new()));
+        let config = IcpswapFirstPlannerConfig {
+            buy_bad_debt: enabled,
+            settlement_min_net_edge_bps: Some(-150),
+            bad_debt_min_net_edge_bps: -500,
+            ..planner_config()
+        };
+        let finalizer = MultiVenueFinalizer::new(vec![adapter.clone()], config).expect("valid finalizer");
+        let result = finalizer.finalize(&wal, receipt).await;
+        if accepted {
+            result.expect("settlement clears its floor");
+            let state = committed_state(&wal);
+            let floor = if enabled || row_bad_debt { -500 } else { -150 };
+            assert_eq!(state.plan.enforced_min_net_edge_bps, Some(floor));
+        } else {
+            let error = result.expect_err("settlement below its floor");
+            assert!(error.message().contains("below required"));
+            assert_eq!(adapter.calls(), 0);
+            assert!(wal.wrapper().meta_v2.is_none());
+        }
+    }
 }
 
 #[tokio::test]

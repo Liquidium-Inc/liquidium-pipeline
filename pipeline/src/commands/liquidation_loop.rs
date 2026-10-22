@@ -250,6 +250,8 @@ async fn init(
                 dust_fallback_max_price_impact_bps: config.icpswap_dust_fallback_max_price_impact_bps,
                 cex_min_exec_usd: config.get_cex_min_exec_usd(),
                 min_net_edge_bps: config.multi_venue_min_net_edge_bps,
+                settlement_min_net_edge_bps: config.multi_venue_settlement_min_net_edge_bps,
+                buy_bad_debt: config.buy_bad_debt,
                 bad_debt_min_net_edge_bps: config.multi_venue_bad_debt_min_net_edge_bps,
                 max_oracle_discount_bps: config.multi_venue_max_oracle_discount_bps,
                 oracle_snapshot_max_age_secs: config.multi_venue_oracle_snapshot_max_age_secs,

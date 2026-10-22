@@ -250,6 +250,8 @@ CEX_RETRY_BASE_SECS=5
 CEX_RETRY_MAX_SECS=120
 # Minimum projected net edge required before executing any venue plan (bps)
 MULTI_VENUE_MIN_NET_EDGE_BPS=150
+# Optional normal-settlement override after liquidation (up to 1.5% shortfall)
+MULTI_VENUE_SETTLEMENT_MIN_NET_EDGE_BPS=-150
 # Reject a venue quote this far below the oracle-implied output (bps)
 MULTI_VENUE_MAX_ORACLE_DISCOUNT_BPS=250
 # How long a price recorded on a receipt may stand in for a live oracle read (seconds)
@@ -276,7 +278,9 @@ Quick reference:
 | `CEX_BUY_INVERSE_ENABLED` | Master toggle for adaptive buy fallback. |
 | `CEX_RETRY_BASE_SECS` | Initial retry delay after retryable CEX errors. |
 | `CEX_RETRY_MAX_SECS` | Maximum retry delay cap. |
-| `MULTI_VENUE_MIN_NET_EDGE_BPS` | Minimum conservative edge required for any ICPSwap, MEXC, or split plan. |
+| `MULTI_VENUE_MIN_NET_EDGE_BPS` | Default normal-settlement floor when the signed override is unset. |
+| `MULTI_VENUE_SETTLEMENT_MIN_NET_EDGE_BPS` | Optional signed floor for normal settlement after liquidation; `-150` allows up to 1.5% conservative shortfall. Valid range is greater than `-10000` through `10000`; absent or invalid values use `MULTI_VENUE_MIN_NET_EDGE_BPS`. Does not change liquidation-entry checks or already committed plans. |
+| `MULTI_VENUE_BAD_DEBT_MIN_NET_EDGE_BPS` | Existing signed floor used for all new settlement plans when `BUY_BAD_DEBT=true`, and for saved bad-debt rows even when global mode is off. Defaults to `-500` (up to 5% shortfall) and takes precedence over the normal-settlement override. |
 | `MULTI_VENUE_MAX_ORACLE_DISCOUNT_BPS` | Maximum amount any venue quote may fall below the oracle-implied output. Values at or above 10000 would accept anything, so they fall back to the default. |
 | `MULTI_VENUE_ORACLE_SNAPSHOT_MAX_AGE_SECS` | How stale a price recorded at detection may be before it stops standing in for a failed live oracle read. Past this age the quote guard stands down rather than block a liquidation that already holds collateral. |
 | `CEX_DELAY_BUFFER_BPS` | Extra haircut for execution-latency/price-move risk. |

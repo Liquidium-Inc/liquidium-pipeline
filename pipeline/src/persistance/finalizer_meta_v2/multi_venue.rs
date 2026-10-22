@@ -74,7 +74,7 @@ pub struct MultiVenueExecutionPlan {
     pub debt_repaid: ChainTokenAmount,
     pub allocation_reason: MultiVenueAllocationReason,
     pub min_net_edge_bps: u32,
-    /// The floor this plan was actually held to, which for a bad-debt row is
+    /// The floor this plan was actually held to, which in bad-debt mode is
     /// the deliberately negative one rather than `min_net_edge_bps`. Kept as a
     /// separate optional field rather than widening `min_net_edge_bps` to `i32`
     /// so a binary that predates it still reads these rows: a negative value in
