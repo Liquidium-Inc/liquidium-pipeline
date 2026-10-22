@@ -366,6 +366,264 @@ async fn restart_with_an_outstanding_intent_requires_operator_instead_of_replayi
 }
 
 #[tokio::test]
+async fn restart_polls_a_direct_deposit_then_gates_the_trade_separately() {
+    let mut cex = finalizer()
+        .prepare_amount_scoped_state(
+            "deposit-receipt-poll",
+            ChainTokenAmount::from_raw(pay_token(), Nat::from(100_000_000u64)),
+            receive_token(),
+            None,
+        )
+        .unwrap();
+    cex.step = CexStep::DepositPending;
+    cex.deposit.deposit_txid = Some("persisted-transfer".into());
+    cex.deposit.deposit_balance_before = Some(0.0);
+    cex.trade.trade_next_amount_in = Some(0.9999);
+    let mut execution = after_restart(cex);
+
+    for (balance, expected_step) in [(0.0, CexStep::DepositPending), (1.0, CexStep::Trade)] {
+        let mut restarted = finalizer();
+        Arc::get_mut(&mut restarted.backend)
+            .unwrap()
+            .expect_get_balance()
+            .times(1)
+            .returning(move |asset| {
+                assert_eq!(asset, "PAY");
+                Ok(balance)
+            });
+        execution.ready_to_advance = true;
+        execution.intent_id = Some("lost-process-local-gate".into());
+        let restored = serde_json::from_str(&serde_json::to_string(&execution).unwrap()).unwrap();
+        let progress = restarted.advance_decoded_leg(restored).await.unwrap();
+        assert_eq!(progress.status, VenueLegStatus::Running);
+        assert!(progress.last_error.is_none());
+        execution = progress.execution.decode(VENUE_ID).unwrap().unwrap();
+        assert_eq!(execution.cex.step, expected_step);
+        assert_eq!(execution.cex.deposit.deposit_txid.as_deref(), Some("persisted-transfer"));
+        assert!(!execution.operator_required);
+        assert!(!execution.ready_to_advance);
+        assert!(execution.intent_id.is_none());
+    }
+
+    // Confirmation must not submit an order; the trade needs a new durable gate.
+    let progress = finalizer().advance_decoded_leg(execution).await.unwrap();
+    let execution = progress.execution.decode::<MexcVenueExecutionState>(VENUE_ID).unwrap().unwrap();
+    assert_eq!(execution.cex.step, CexStep::Trade);
+    assert!(execution.ready_to_advance);
+    assert!(execution.intent_id.is_some());
+}
+
+/// A leg as the orchestrator hands it back after a process restart: armed in a
+/// process that no longer exists.
+fn after_restart(cex: CexState) -> MexcVenueExecutionState {
+    MexcVenueExecutionState {
+        cex,
+        ready_to_advance: true,
+        intent_id: Some("lost-process-local-gate".into()),
+        operator_required: false,
+    }
+}
+
+fn deposit_poll_finalizer(
+    bridge: liquidium_pipeline_connectors::backend::bridge_backend::MockBridgeBackend,
+) -> MexcFinalizer<MockCexBackend> {
+    use crate::finalizers::mexc::mexc_finalizer::{MexcBridgeConfig, MexcBridgeDependencies};
+    use icrc_ledger_types::icrc1::account::Account;
+
+    finalizer().with_bridge_dependencies(MexcBridgeDependencies {
+        backend: Arc::new(bridge),
+        config: MexcBridgeConfig {
+            bridge_ic_source_account: Account {
+                owner: Principal::anonymous(),
+                subaccount: None,
+            },
+            bridge_evm_source_address: "0x2222222222222222222222222222222222222222".into(),
+            bridge_btc_source_address: String::new(),
+            bridge_solana_source_address: String::new(),
+        },
+    })
+}
+
+#[tokio::test]
+async fn restart_only_polls_bridged_deposits_with_both_durable_submission_ids() {
+    use liquidium_pipeline_connectors::backend::bridge_backend::{BridgeStatus, MockBridgeBackend};
+
+    for (has_transfer, has_bridge, legacy_plan, bridge_completed) in [
+        (true, true, false, false),
+        (true, true, false, true),
+        (true, false, false, false),
+        (false, true, false, false),
+        (true, false, true, false),
+        (true, true, true, false),
+    ] {
+        let can_poll = has_transfer && has_bridge;
+        let mut bridge = MockBridgeBackend::new();
+        bridge.expect_submit_bridge().times(0);
+        bridge
+            .expect_get_bridge_status()
+            .times(usize::from(can_poll))
+            .returning(move |id| {
+                assert_eq!(id, "persisted-deposit-bridge");
+                Ok(if bridge_completed { BridgeStatus::Completed } else { BridgeStatus::Pending })
+            });
+        let mut restarted = deposit_poll_finalizer(bridge);
+        Arc::get_mut(&mut restarted.backend)
+            .unwrap()
+            .expect_get_balance()
+            .times(usize::from(can_poll && bridge_completed))
+            .returning(|asset| {
+                assert_eq!(asset, "ETH");
+                Ok(0.01)
+            });
+        let cketh = ChainToken::Icp {
+            ledger: Principal::from_text("ss2fx-dyaaa-aaaar-qacoq-cai").unwrap(),
+            symbol: "ckETH".into(),
+            decimals: 18,
+            fee: Nat::from(2_000_000_000_000u64),
+        };
+        let mut cex = restarted
+            .prepare_amount_scoped_state(
+                "bridged-deposit-poll",
+                ChainTokenAmount::from_formatted(cketh, 0.01),
+                receive_token(),
+                None,
+            )
+            .unwrap();
+        cex.step = CexStep::DepositPending;
+        cex.deposit.deposit_txid = has_transfer.then(|| "persisted-transfer".into());
+        cex.deposit.bridge.deposit_bridge_id = has_bridge.then(|| "persisted-deposit-bridge".into());
+        cex.deposit.deposit_balance_before = Some(0.0);
+        cex.deposit.bridge.deposit_bridge_expected_amount = Some(0.009);
+        if legacy_plan {
+            cex.deposit.bridge.deposit_planned_asset = None;
+            cex.deposit.bridge.deposit_planned_network = None;
+            cex.deposit.bridge.deposit_bridge_required = false;
+        }
+        let execution = after_restart(cex);
+        let restored = serde_json::from_str(&serde_json::to_string(&execution).unwrap()).unwrap();
+        let progress = restarted.advance_decoded_leg(restored).await.unwrap();
+        assert_eq!(
+            progress.status,
+            if can_poll { VenueLegStatus::Running } else { VenueLegStatus::OperatorRequired }
+        );
+        let execution = progress.execution.decode::<MexcVenueExecutionState>(VENUE_ID).unwrap().unwrap();
+        assert!(execution.cex.deposit.bridge.deposit_bridge_required);
+        assert_eq!(execution.operator_required, !can_poll);
+        assert_eq!(
+            execution.cex.step,
+            if can_poll && bridge_completed { CexStep::Trade } else { CexStep::DepositPending }
+        );
+    }
+}
+
+#[tokio::test]
+async fn restart_surfaces_a_failed_deposit_bridge_without_resubmitting() {
+    use liquidium_pipeline_connectors::backend::bridge_backend::{BridgeStatus, MockBridgeBackend};
+
+    let mut bridge = MockBridgeBackend::new();
+    bridge.expect_submit_bridge().times(0);
+    bridge.expect_get_bridge_status().times(1).returning(|_| {
+        Ok(BridgeStatus::Failed {
+            reason: Some("minter rejected the deposit".into()),
+        })
+    });
+    let restarted_finalizer = deposit_poll_finalizer(bridge);
+    let cketh = ChainToken::Icp {
+        ledger: Principal::from_text("ss2fx-dyaaa-aaaar-qacoq-cai").unwrap(),
+        symbol: "ckETH".into(),
+        decimals: 18,
+        fee: Nat::from(2_000_000_000_000u64),
+    };
+    let mut cex = restarted_finalizer
+        .prepare_amount_scoped_state(
+            "bridged-deposit-failed",
+            ChainTokenAmount::from_formatted(cketh, 0.01),
+            receive_token(),
+            None,
+        )
+        .unwrap();
+    cex.step = CexStep::DepositPending;
+    cex.deposit.deposit_txid = Some("persisted-transfer".into());
+    cex.deposit.bridge.deposit_bridge_id = Some("persisted-deposit-bridge".into());
+    cex.deposit.deposit_balance_before = Some(0.0);
+
+    let progress = restarted_finalizer.advance_decoded_leg(after_restart(cex)).await.unwrap();
+
+    // A failed bridge is an ordinary retryable error: the leg keeps its ids,
+    // spends retry budget, and is never resubmitted from here.
+    assert_eq!(progress.status, VenueLegStatus::Running);
+    let error = progress.retryable_error.expect("bridge failure is reported");
+    assert!(error.contains("minter rejected the deposit"), "{error}");
+    let execution = progress.execution.decode::<MexcVenueExecutionState>(VENUE_ID).unwrap().unwrap();
+    assert_eq!(execution.cex.step, CexStep::DepositPending);
+    assert_eq!(execution.cex.deposit.bridge.deposit_bridge_id.as_deref(), Some("persisted-deposit-bridge"));
+    assert!(!execution.operator_required);
+}
+
+#[tokio::test]
+async fn restart_direct_deposit_without_baseline_records_one_and_keeps_waiting() {
+    let mut restarted_finalizer = finalizer();
+    Arc::get_mut(&mut restarted_finalizer.backend)
+        .unwrap()
+        .expect_get_balance()
+        .times(1)
+        .returning(|_| Ok(1.0));
+    let mut cex = restarted_finalizer
+        .prepare_amount_scoped_state(
+            "deposit-no-baseline",
+            ChainTokenAmount::from_raw(pay_token(), Nat::from(100_000_000u64)),
+            receive_token(),
+            None,
+        )
+        .unwrap();
+    cex.step = CexStep::DepositPending;
+    cex.deposit.deposit_txid = Some("persisted-transfer".into());
+    cex.deposit.deposit_balance_before = None;
+
+    let progress = restarted_finalizer.advance_decoded_leg(after_restart(cex)).await.unwrap();
+
+    // Without a baseline the balance cannot prove this deposit, so the step
+    // records one and waits; the total-balance fallback needs elapsed time.
+    assert_eq!(progress.status, VenueLegStatus::Running);
+    assert!(progress.retryable_error.is_none());
+    let execution = progress.execution.decode::<MexcVenueExecutionState>(VENUE_ID).unwrap().unwrap();
+    assert_eq!(execution.cex.step, CexStep::DepositPending);
+    assert_eq!(execution.cex.deposit.deposit_balance_before, Some(1.0));
+    assert!(execution.cex.deposit.deposit_sent_at_ts.is_some());
+    assert!(!execution.ready_to_advance);
+}
+
+#[tokio::test]
+async fn restart_keeps_the_gate_when_legacy_withdraw_planning_introduces_a_bridge() {
+    use liquidium_pipeline_connectors::backend::bridge_backend::MockBridgeBackend;
+
+    let restarted = deposit_poll_finalizer(MockBridgeBackend::new());
+    let mut cex = restarted
+        .prepare_amount_scoped_state(
+            "legacy-withdraw-plan",
+            ChainTokenAmount::from_raw(pay_token(), Nat::from(100_000_000u64)),
+            ChainToken::Icp {
+                ledger: Principal::from_text("xevnm-gaaaa-aaaar-qafnq-cai").unwrap(),
+                symbol: "ckUSDC".into(),
+                decimals: 6,
+                fee: Nat::from(10_000u64),
+            },
+            None,
+        )
+        .unwrap();
+    cex.step = CexStep::WithdrawPending;
+    cex.withdraw.withdraw_id = Some("persisted-withdrawal".into());
+    cex.withdraw.bridge.withdraw_planned_asset = None;
+    cex.withdraw.bridge.withdraw_planned_network = None;
+    cex.withdraw.bridge.withdraw_bridge_required = false;
+    let progress = restarted
+        .advance_decoded_leg(after_restart(cex))
+        .await
+        .unwrap();
+    assert_eq!(progress.status, VenueLegStatus::OperatorRequired);
+}
+
+#[tokio::test]
 async fn restart_can_reconcile_a_direct_withdrawal_receipt_without_resubmission() {
     use liquidium_pipeline_connectors::backend::cex_backend::{WithdrawStatus, WithdrawStatusSnapshot};
     let mut restarted = finalizer();
@@ -393,12 +651,7 @@ async fn restart_can_reconcile_a_direct_withdrawal_receipt_without_resubmission(
     cex.withdraw.withdraw_id = Some("persisted-withdrawal".to_string());
     cex.withdraw.size_out = Some(ChainTokenAmount::from_formatted(receive_token(), 10.0));
     let progress = restarted
-        .advance_decoded_leg(MexcVenueExecutionState {
-            cex,
-            ready_to_advance: true,
-            intent_id: Some("lost-process-local-gate".to_string()),
-            operator_required: false,
-        })
+        .advance_decoded_leg(after_restart(cex))
         .await
         .unwrap();
     assert_eq!(progress.status, VenueLegStatus::Completed);
@@ -407,8 +660,6 @@ async fn restart_can_reconcile_a_direct_withdrawal_receipt_without_resubmission(
 
 #[tokio::test]
 async fn restart_polls_a_persisted_helper_instead_of_parking_or_resubmitting() {
-    use crate::finalizers::mexc::mexc_finalizer::{MexcBridgeConfig, MexcBridgeDependencies};
-    use icrc_ledger_types::icrc1::account::Account;
     use liquidium_pipeline_connectors::backend::bridge_backend::{BridgeStatus, MockBridgeBackend};
 
     let mut bridge = MockBridgeBackend::new();
@@ -417,18 +668,7 @@ async fn restart_polls_a_persisted_helper_instead_of_parking_or_resubmitting() {
         Ok(BridgeStatus::Pending)
     });
     bridge.expect_submit_bridge().times(0);
-    let restarted = finalizer().with_bridge_dependencies(MexcBridgeDependencies {
-        backend: Arc::new(bridge),
-        config: MexcBridgeConfig {
-            bridge_ic_source_account: Account {
-                owner: Principal::anonymous(),
-                subaccount: None,
-            },
-            bridge_evm_source_address: "0x2222222222222222222222222222222222222222".into(),
-            bridge_btc_source_address: String::new(),
-            bridge_solana_source_address: String::new(),
-        },
-    });
+    let restarted = deposit_poll_finalizer(bridge);
     let mut cex = restarted
         .prepare_amount_scoped_state(
             "bridge-receipt-poll",
@@ -454,12 +694,7 @@ async fn restart_polls_a_persisted_helper_instead_of_parking_or_resubmitting() {
     cex.withdraw.bridge.withdraw_planned_asset = Some("USDC".into());
     cex.withdraw.bridge.withdraw_planned_network = Some("ETH".into());
     let progress = restarted
-        .advance_decoded_leg(MexcVenueExecutionState {
-            cex,
-            ready_to_advance: true,
-            intent_id: Some("lost-process-local-gate".into()),
-            operator_required: false,
-        })
+        .advance_decoded_leg(after_restart(cex))
         .await
         .unwrap();
     assert_eq!(progress.status, VenueLegStatus::Running);

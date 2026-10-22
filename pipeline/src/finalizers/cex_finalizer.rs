@@ -220,14 +220,31 @@ pub struct CexState {
     pub withdraw: CexWithdrawState,
 }
 
+/// A pending step is safe to resume by reading alone once its own submission
+/// id is durable and, when a bridge follows, the bridge handle is durable too.
+fn durable_for_polling(submission_id: Option<&str>, bridge_required: bool, bridge_id: Option<&str>) -> bool {
+    submission_id.is_some() && (!bridge_required || bridge_id.is_some())
+}
+
 impl CexState {
     /// True when advancing this state can only read exchange or bridge
-    /// evidence. Nothing in that phase submits a withdrawal or a bridge, so a
-    /// restart may resume it without the submission gate.
+    /// evidence. Nothing in that phase submits a transfer, withdrawal or bridge, so a
+    /// restart may resume it without the submission gate. The MEXC adapter
+    /// resolves legacy transport plans first; see `can_resume_by_polling`.
     pub fn is_receipt_poll_only(&self) -> bool {
-        self.step == CexStep::WithdrawPending
-            && self.withdraw.withdraw_id.is_some()
-            && (!self.withdraw.bridge.withdraw_bridge_required || self.withdraw.bridge.withdraw_bridge_id.is_some())
+        match self.step {
+            CexStep::DepositPending => durable_for_polling(
+                self.deposit.deposit_txid.as_deref(),
+                self.deposit.bridge.deposit_bridge_required,
+                self.deposit.bridge.deposit_bridge_id.as_deref(),
+            ),
+            CexStep::WithdrawPending => durable_for_polling(
+                self.withdraw.withdraw_id.as_deref(),
+                self.withdraw.bridge.withdraw_bridge_required,
+                self.withdraw.bridge.withdraw_bridge_id.as_deref(),
+            ),
+            _ => false,
+        }
     }
 }
 

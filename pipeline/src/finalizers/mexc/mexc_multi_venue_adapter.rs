@@ -93,6 +93,15 @@ where
         self.advance_decoded_leg(self.decode_leg_state(leg)?).await
     }
 
+    /// Whether a restarted leg may advance without its submission gate.
+    ///
+    /// Legacy plan backfilling can turn a direct step into a bridged one, so
+    /// the plan is resolved here before the durable-id check runs.
+    fn can_resume_by_polling(&self, state: &mut CexState) -> bool {
+        self.ensure_plan_on_state(state);
+        state.is_receipt_poll_only()
+    }
+
     /// Advances an already validated state so recovery does not decode the
     /// same persisted JSON twice in one orchestrator cycle.
     async fn advance_decoded_leg(&self, mut execution: MexcVenueExecutionState) -> Result<VenueLegProgress, String> {
@@ -132,11 +141,7 @@ where
             .lock()
             .map_err(|_| "MEXC multi-venue intent lock poisoned".to_string())?
             .remove(&intent_id);
-        // Once the exchange ID (direct route) or helper ID (bridged route) is
-        // durable, this phase only reads settlement evidence. A normal restart
-        // cannot duplicate that submission. A bridged withdrawal without its
-        // helper ID still needs the submission gate: it may initiate a deposit.
-        if !armed_here && !execution.cex.is_receipt_poll_only() {
+        if !armed_here && !self.can_resume_by_polling(&mut execution.cex) {
             return self.operator_required_progress(
                 execution,
                 format!("persisted MEXC intent `{intent_id}` has ambiguous submission state after restart"),
