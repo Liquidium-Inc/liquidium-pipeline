@@ -244,6 +244,16 @@ impl WalStore for SqliteWalStore {
         Ok(rows.into_iter().map(Self::from_row).collect())
     }
 
+    async fn list_updated_since(&self, since_ts: i64, limit: usize) -> Result<Vec<LiqResultRecord>> {
+        let mut conn = self.get_conn()?;
+        let rows = tbl::table
+            .filter(tbl::updated_at.ge(since_ts))
+            .order(tbl::updated_at.desc())
+            .limit(limit as i64)
+            .load::<Row>(&mut conn)?;
+        Ok(rows.into_iter().map(Self::from_row).collect())
+    }
+
     async fn update_status(&self, liq_id: &str, next: ResultStatus, bump_attempt: bool) -> Result<()> {
         self.ensure_writable()?;
         let mut conn = self.get_conn()?;

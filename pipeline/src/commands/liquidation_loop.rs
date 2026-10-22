@@ -21,6 +21,8 @@ use crate::{
     control_plane::acquire_daemon_instance,
     executors::basic::basic_executor::BasicExecutor,
     finalizers::{
+        bridge_claims::WalBridgeClaims,
+        bridge_runtime::BridgeRuntime,
         mexc::runtime::build_mexc_finalizer,
         multi_venue::{
             ICPSWAP_VENUE_ID, IcpswapFirstPlannerConfig, MEXC_VENUE_ID, MultiVenueAdapter, MultiVenueFinalizer,
@@ -225,6 +227,14 @@ async fn init(
         .map_err(|e| format!("executor token init failed: {e}"))?;
     let executor = Arc::new(executor);
 
+    // One bridge for every exchange venue: they share its accounts, so they
+    // must share the registry of handles held on them.
+    let bridge = if config.enabled_swap_venues.iter().any(|venue| venue == MEXC_VENUE_ID) {
+        Some(BridgeRuntime::build(&config, Arc::new(WalBridgeClaims::new(db.clone()))).await?)
+    } else {
+        None
+    };
+
     let mut venue_adapters: Vec<Arc<dyn MultiVenueAdapter>> = Vec::new();
     for venue_id in &config.enabled_swap_venues {
         match venue_id.as_str() {
@@ -233,7 +243,13 @@ async fn init(
                     .clone()
                     .ok_or_else(|| "ICPSwap is enabled but its adapter was not initialized".to_string())?,
             ),
-            MEXC_VENUE_ID => venue_adapters.push(build_mexc_finalizer(ctx.as_ref()).await?),
+            MEXC_VENUE_ID => venue_adapters.push(
+                build_mexc_finalizer(
+                    ctx.as_ref(),
+                    bridge.clone().ok_or_else(|| "MEXC is enabled but the bridge was not built".to_string())?,
+                )
+                .await?,
+            ),
             _ => return Err(format!("unsupported enabled swap venue `{venue_id}`")),
         }
     }

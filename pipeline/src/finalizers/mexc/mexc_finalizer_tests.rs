@@ -22,7 +22,7 @@ use liquidium_pipeline_core::types::protocol_types::{
 };
 
 use crate::executors::executor::ExecutorRequest;
-use crate::finalizers::cex_finalizer::{CexDepositState, CexState, CexStep};
+use crate::finalizers::cex_finalizer::{BridgeSubmitPhase, CexDepositState, CexState, CexStep};
 use crate::stages::executor::{ExecutionReceipt, ExecutionStatus};
 use crate::utils::ICP_LEDGER_PRINCIPAL;
 use proptest::prelude::*;
@@ -225,19 +225,8 @@ fn liquid_orderbook() -> OrderBook {
     }
 }
 
-fn bridge_dependencies(backend: Arc<MockBridgeBackend>) -> MexcBridgeDependencies {
-    MexcBridgeDependencies {
-        backend,
-        config: MexcBridgeConfig {
-            bridge_ic_source_account: icrc_ledger_types::icrc1::account::Account {
-                owner: Principal::anonymous(),
-                subaccount: None,
-            },
-            bridge_evm_source_address: "0x2222222222222222222222222222222222222222".to_string(),
-            bridge_btc_source_address: "bc1qbridge000000000000000000000000000000000".to_string(),
-            bridge_solana_source_address: "So11111111111111111111111111111111111111112".to_string(),
-        },
-    }
+fn bridge_dependencies(backend: Arc<MockBridgeBackend>) -> BridgeRuntime {
+    BridgeRuntime::for_tests(backend)
 }
 
 #[tokio::test]
@@ -301,7 +290,7 @@ async fn mexc_prepare_maps_cketh_collateral_to_eth_deposit_bridge_plan() {
         TEST_CEX_MIN_EXEC_USD,
         TEST_CEX_SLICE_TARGET_RATIO,
     )
-    .with_bridge_dependencies(bridge_dependencies(Arc::new(MockBridgeBackend::new())));
+    .with_bridge_runtime(bridge_dependencies(Arc::new(MockBridgeBackend::new())));
 
     let receipt = make_execution_receipt_with_assets(43, cketh_token(), ckbtc_token());
     let state = finalizer.prepare("43", &receipt).await.expect("prepare should succeed");
@@ -326,7 +315,7 @@ async fn mexc_prepare_maps_cketh_debt_to_eth_withdraw_bridge_plan() {
         TEST_CEX_MIN_EXEC_USD,
         TEST_CEX_SLICE_TARGET_RATIO,
     )
-    .with_bridge_dependencies(bridge_dependencies(Arc::new(MockBridgeBackend::new())));
+    .with_bridge_runtime(bridge_dependencies(Arc::new(MockBridgeBackend::new())));
 
     let receipt = make_execution_receipt_with_assets(44, ckbtc_token(), cketh_token());
     let state = finalizer.prepare("44", &receipt).await.expect("prepare should succeed");
@@ -696,7 +685,7 @@ fn mexc_sol_reverse_plan_reserves_approval_fee() {
     let finalizer = MexcFinalizer::new(
         Arc::new(MockCexBackend::new()), Arc::new(MockTransferActions::new()), Principal::anonymous(),
         TEST_MAX_SELL_SLIPPAGE_BPS, TEST_CEX_MIN_EXEC_USD, TEST_CEX_SLICE_TARGET_RATIO,
-    ).with_bridge_dependencies(bridge_dependencies(Arc::new(MockBridgeBackend::new())));
+    ).with_bridge_runtime(bridge_dependencies(Arc::new(MockBridgeBackend::new())));
     let sol = ChainToken::Icp {
         ledger: Principal::anonymous(), symbol: "ckSOL".into(), decimals: 9, fee: Nat::from(500u64),
     };
@@ -730,7 +719,7 @@ fn mexc_bridge_planner_keeps_direct_path_when_no_bridge_route_matches() {
         TEST_CEX_MIN_EXEC_USD,
         TEST_CEX_SLICE_TARGET_RATIO,
     )
-    .with_bridge_dependencies(bridge_dependencies(Arc::new(MockBridgeBackend::new())));
+    .with_bridge_runtime(bridge_dependencies(Arc::new(MockBridgeBackend::new())));
 
     let debt_token = ChainToken::Icp {
         ledger: Principal::anonymous(),
@@ -758,7 +747,7 @@ fn mexc_bridge_planner_uses_bridge_fallback_for_ckusdc_deposit() {
         TEST_CEX_MIN_EXEC_USD,
         TEST_CEX_SLICE_TARGET_RATIO,
     )
-    .with_bridge_dependencies(bridge_dependencies(Arc::new(MockBridgeBackend::new())));
+    .with_bridge_runtime(bridge_dependencies(Arc::new(MockBridgeBackend::new())));
 
     let plan = finalizer.resolve_bridge_plan_for_assets(&ckusdc_token(), &ckbtc_token());
     assert!(plan.deposit.bridge_required);
@@ -778,7 +767,7 @@ fn mexc_bridge_planner_translates_ckusdc_symbol_both_directions() {
         TEST_CEX_MIN_EXEC_USD,
         TEST_CEX_SLICE_TARGET_RATIO,
     )
-    .with_bridge_dependencies(bridge_dependencies(Arc::new(MockBridgeBackend::new())));
+    .with_bridge_runtime(bridge_dependencies(Arc::new(MockBridgeBackend::new())));
 
     let plan = finalizer.resolve_bridge_plan_for_assets(&ckusdc_token(), &ckusdc_token());
     assert!(plan.deposit.bridge_required);
@@ -822,15 +811,19 @@ async fn mexc_deposit_bridge_submit_resume_and_complete() {
 
     bridge
         .expect_get_source_balance()
-        .times(1)
+        .times(2)
         .returning(|asset, chain, _address| {
             assert_eq!(asset, "ckUSDC");
             assert_eq!(chain, "ICP");
             Ok(0.93)
         });
+    bridge.expect_prepare_submission().times(1).returning(|request| {
+        assert!((request.amount - 0.92).abs() < 1e-9);
+        Ok(Some(100))
+    });
     bridge
         .expect_get_fee_budget()
-        .times(1)
+        .times(2)
         .returning(|asset, chain, target| {
             assert_eq!(asset, "ckUSDC");
             assert_eq!(chain, "ICP");
@@ -885,7 +878,7 @@ async fn mexc_deposit_bridge_submit_resume_and_complete() {
         TEST_CEX_MIN_EXEC_USD,
         TEST_CEX_SLICE_TARGET_RATIO,
     )
-    .with_bridge_dependencies(bridge_dependencies(Arc::new(bridge)));
+    .with_bridge_runtime(bridge_dependencies(Arc::new(bridge)));
 
     let receipt = make_execution_receipt_with_assets(7, ckusdc_token(), ckbtc_token());
     let mut state = finalizer.prepare("7", &receipt).await.expect("prepare should succeed");
@@ -894,23 +887,40 @@ async fn mexc_deposit_bridge_submit_resume_and_complete() {
     finalizer
         .deposit(&mut state)
         .await
-        .expect("first bridged deposit call should submit");
+        .expect("first bridged deposit call should transfer and record the attempt");
+    assert!(matches!(state.step, CexStep::DepositPending));
+    assert!(state.deposit.bridge.deposit_bridge_id.is_none());
+    let Some(BridgeSubmitPhase::Submitting(attempt)) = state.deposit.bridge.deposit_bridge_submit_phase.clone()
+    else {
+        panic!("attempt must be persisted before the bridge call");
+    };
+    assert_eq!(attempt.cursor, Some(100));
+    assert!(attempt.called_at_ts.is_none());
+    assert!(attempt.id.starts_with("bridge-attempt-"), "{}", attempt.id);
+    assert_eq!(attempt.destination, "0x1111111111111111111111111111111111111111");
+    assert!((attempt.amount - 0.92).abs() < 1e-9);
+
+    finalizer
+        .deposit(&mut state)
+        .await
+        .expect("second bridged deposit call should submit");
     assert!(matches!(state.step, CexStep::DepositPending));
     assert_eq!(
         state.deposit.bridge.deposit_bridge_id.as_deref(),
         Some("bridge-deposit-1")
     );
+    assert!(state.deposit.bridge.deposit_bridge_submit_phase.is_none());
 
     finalizer
         .deposit(&mut state)
         .await
-        .expect("second bridged deposit call should poll pending");
+        .expect("third bridged deposit call should poll pending");
     assert!(matches!(state.step, CexStep::DepositPending));
 
     finalizer
         .deposit(&mut state)
         .await
-        .expect("third bridged deposit call should complete");
+        .expect("fourth bridged deposit call should complete");
     assert!(matches!(state.step, CexStep::Trade));
     assert!(state.deposit.bridge.deposit_bridge_submitted_at_ts.is_some());
     assert!(state.deposit.bridge.deposit_bridge_polled_at_ts.is_some());
@@ -945,15 +955,16 @@ async fn mexc_deposit_bridge_reserves_reverse_bridge_approval_fee_in_trade_amoun
 
     bridge
         .expect_get_source_balance()
-        .times(1)
+        .times(2)
         .returning(|asset, chain, _address| {
             assert_eq!(asset, "ckUSDC");
             assert_eq!(chain, "ICP");
             Ok(0.93)
         });
+    bridge.expect_prepare_submission().times(1).returning(|_| Ok(None));
     bridge
         .expect_get_fee_budget()
-        .times(1)
+        .times(2)
         .returning(|asset, chain, target| {
             assert_eq!(asset, "ckUSDC");
             assert_eq!(chain, "ICP");
@@ -992,7 +1003,7 @@ async fn mexc_deposit_bridge_reserves_reverse_bridge_approval_fee_in_trade_amoun
         TEST_CEX_MIN_EXEC_USD,
         TEST_CEX_SLICE_TARGET_RATIO,
     )
-    .with_bridge_dependencies(bridge_dependencies(Arc::new(bridge)));
+    .with_bridge_runtime(bridge_dependencies(Arc::new(bridge)));
 
     let receipt = make_execution_receipt_with_assets(8, ckusdc_token(), ckbtc_token());
     let mut state = finalizer.prepare("8", &receipt).await.expect("prepare should succeed");
@@ -1002,6 +1013,7 @@ async fn mexc_deposit_bridge_reserves_reverse_bridge_approval_fee_in_trade_amoun
         .deposit(&mut state)
         .await
         .expect("bridged deposit call should reserve reverse bridge approval fee before sizing trade");
+    finalizer.deposit(&mut state).await.expect("the recorded attempt submits");
 
     assert!(matches!(state.step, CexStep::DepositPending));
     assert_eq!(
@@ -1050,7 +1062,7 @@ async fn mexc_deposit_bridge_rejects_source_fee_reserve_too_small_with_permanent
         TEST_CEX_MIN_EXEC_USD,
         TEST_CEX_SLICE_TARGET_RATIO,
     )
-    .with_bridge_dependencies(bridge_dependencies(Arc::new(bridge)));
+    .with_bridge_runtime(bridge_dependencies(Arc::new(bridge)));
 
     let receipt = make_execution_receipt_with_assets(84, ckusdc_token(), ckbtc_token());
     let mut state = finalizer.prepare("84", &receipt).await.expect("prepare should succeed");
@@ -1095,15 +1107,16 @@ async fn mexc_deposit_bridge_reserves_native_cketh_withdrawal_fee_budget() {
 
     bridge
         .expect_get_source_balance()
-        .times(1)
+        .times(2)
         .returning(|asset, chain, _address| {
             assert_eq!(asset, "ckETH");
             assert_eq!(chain, "ICP");
             Ok(0.005_086)
         });
+    bridge.expect_prepare_submission().times(1).returning(|_| Ok(Some(7)));
     bridge
         .expect_get_fee_budget()
-        .times(1)
+        .times(2)
         .returning(|asset, chain, target| {
             assert_eq!(asset, "ckETH");
             assert_eq!(chain, "ICP");
@@ -1149,7 +1162,7 @@ async fn mexc_deposit_bridge_reserves_native_cketh_withdrawal_fee_budget() {
         TEST_CEX_MIN_EXEC_USD,
         TEST_CEX_SLICE_TARGET_RATIO,
     )
-    .with_bridge_dependencies(bridge_dependencies(Arc::new(bridge)));
+    .with_bridge_runtime(bridge_dependencies(Arc::new(bridge)));
 
     let mut receipt = make_execution_receipt_with_assets(82, cketh_token(), ckusdc_token());
     receipt
@@ -1165,6 +1178,7 @@ async fn mexc_deposit_bridge_reserves_native_cketh_withdrawal_fee_budget() {
         .deposit(&mut state)
         .await
         .expect("bridged native ckETH deposit should reserve approval and withdrawal fees");
+    finalizer.deposit(&mut state).await.expect("the recorded attempt submits");
 
     assert!(matches!(state.step, CexStep::DepositPending));
     assert_eq!(state.deposit.deposit_txid.as_deref(), Some("tx-bridge-fund-cketh"));
@@ -1228,7 +1242,7 @@ async fn mexc_deposit_bridge_rejects_native_cketh_below_minimum_before_transfer(
         TEST_CEX_MIN_EXEC_USD,
         TEST_CEX_SLICE_TARGET_RATIO,
     )
-    .with_bridge_dependencies(bridge_dependencies(Arc::new(bridge)));
+    .with_bridge_runtime(bridge_dependencies(Arc::new(bridge)));
 
     let mut receipt = make_execution_receipt_with_assets(83, cketh_token(), ckusdc_token());
     receipt
@@ -1296,7 +1310,7 @@ async fn mexc_deposit_bridge_rejects_native_cketh_when_destination_fee_consumes_
         TEST_CEX_MIN_EXEC_USD,
         TEST_CEX_SLICE_TARGET_RATIO,
     )
-    .with_bridge_dependencies(bridge_dependencies(Arc::new(bridge)));
+    .with_bridge_runtime(bridge_dependencies(Arc::new(bridge)));
 
     let mut receipt = make_execution_receipt_with_assets(83, cketh_token(), ckusdc_token());
     receipt
@@ -1385,7 +1399,7 @@ async fn mexc_deposit_bridge_waits_for_source_funding_snapshot() {
         TEST_CEX_MIN_EXEC_USD,
         TEST_CEX_SLICE_TARGET_RATIO,
     )
-    .with_bridge_dependencies(bridge_dependencies(Arc::new(bridge)));
+    .with_bridge_runtime(bridge_dependencies(Arc::new(bridge)));
 
     let receipt = make_execution_receipt_with_assets(81, ckusdc_token(), ckbtc_token());
     let mut state = finalizer.prepare("81", &receipt).await.expect("prepare should succeed");
@@ -1472,7 +1486,7 @@ async fn mexc_deposit_bridge_waits_for_cketh_fee_funding_snapshot() {
         TEST_CEX_MIN_EXEC_USD,
         TEST_CEX_SLICE_TARGET_RATIO,
     )
-    .with_bridge_dependencies(bridge_dependencies(Arc::new(bridge)));
+    .with_bridge_runtime(bridge_dependencies(Arc::new(bridge)));
 
     let receipt = make_execution_receipt_with_assets(84, ckusdc_token(), ckbtc_token());
     let mut state = finalizer.prepare("84", &receipt).await.expect("prepare should succeed");
@@ -1599,7 +1613,7 @@ async fn mexc_withdraw_bridge_submit_resume_complete_and_idempotent() {
         TEST_CEX_MIN_EXEC_USD,
         TEST_CEX_SLICE_TARGET_RATIO,
     )
-    .with_bridge_dependencies(bridge_dependencies(Arc::new(bridge)));
+    .with_bridge_runtime(bridge_dependencies(Arc::new(bridge)));
 
     let receipt = make_execution_receipt_with_assets(11, ckbtc_token(), ckusdc_token());
     let mut state = finalizer.prepare("11", &receipt).await.expect("prepare should succeed");
@@ -1722,7 +1736,7 @@ async fn mexc_withdraw_bridge_waits_when_source_balance_below_expected_net() {
         TEST_CEX_MIN_EXEC_USD,
         TEST_CEX_SLICE_TARGET_RATIO,
     )
-    .with_bridge_dependencies(bridge_dependencies(Arc::new(bridge)));
+    .with_bridge_runtime(bridge_dependencies(Arc::new(bridge)));
 
     let receipt = make_execution_receipt_with_assets(111, ckbtc_token(), ckusdc_token());
     let mut state = finalizer
@@ -1797,7 +1811,7 @@ async fn mexc_withdraw_bridge_deferral_keeps_step_pending_then_submits() {
         TEST_CEX_MIN_EXEC_USD,
         TEST_CEX_SLICE_TARGET_RATIO,
     )
-    .with_bridge_dependencies(bridge_dependencies(Arc::new(bridge)));
+    .with_bridge_runtime(bridge_dependencies(Arc::new(bridge)));
 
     let receipt = make_execution_receipt_with_assets(112, ckbtc_token(), ckusdc_token());
     let mut state = finalizer.prepare("112", &receipt).await.expect("prepare should succeed");
@@ -1851,6 +1865,7 @@ async fn mexc_deposit_bridge_deferral_keeps_step_pending_then_submits() {
         })
     });
     bridge.expect_get_minimum_bridge_amount().returning(|_, _, _| Ok(0.0));
+    bridge.expect_prepare_submission().times(2).returning(|_| Ok(Some(1)));
     let calls = Arc::new(std::sync::Mutex::new(0u32));
     let submit_calls = calls.clone();
     bridge.expect_submit_bridge().times(2).returning(move |_| {
@@ -1873,12 +1888,13 @@ async fn mexc_deposit_bridge_deferral_keeps_step_pending_then_submits() {
         TEST_CEX_MIN_EXEC_USD,
         TEST_CEX_SLICE_TARGET_RATIO,
     )
-    .with_bridge_dependencies(bridge_dependencies(Arc::new(bridge)));
+    .with_bridge_runtime(bridge_dependencies(Arc::new(bridge)));
 
     let receipt = make_execution_receipt_with_assets(82, ckusdc_token(), ckbtc_token());
     let mut state = finalizer.prepare("82", &receipt).await.expect("prepare should succeed");
     assert!(state.deposit.bridge.deposit_bridge_required);
 
+    finalizer.deposit(&mut state).await.expect("transfer and record the attempt");
     finalizer
         .deposit(&mut state)
         .await
@@ -1886,7 +1902,13 @@ async fn mexc_deposit_bridge_deferral_keeps_step_pending_then_submits() {
     assert!(matches!(state.step, CexStep::DepositPending));
     assert_eq!(state.deposit.deposit_txid.as_deref(), Some("tx-bridge-deferred"));
     assert!(state.deposit.bridge.deposit_bridge_id.is_none());
+    // The backend proved nothing was sent, so the attempt is dropped.
+    assert_eq!(
+        state.deposit.bridge.deposit_bridge_submit_phase,
+        Some(BridgeSubmitPhase::WaitingFunds)
+    );
 
+    finalizer.deposit(&mut state).await.expect("a new attempt is recorded");
     finalizer.deposit(&mut state).await.expect("bridge submits once the wallet is idle");
     assert_eq!(
         state.deposit.bridge.deposit_bridge_id.as_deref(),
@@ -1959,7 +1981,7 @@ async fn mexc_withdraw_bridge_applies_cex_withdraw_fee_to_submit_amount() {
         TEST_CEX_MIN_EXEC_USD,
         TEST_CEX_SLICE_TARGET_RATIO,
     )
-    .with_bridge_dependencies(bridge_dependencies(Arc::new(bridge)));
+    .with_bridge_runtime(bridge_dependencies(Arc::new(bridge)));
 
     let receipt = make_execution_receipt_with_assets(112, ckbtc_token(), ckusdc_token());
     let mut state = finalizer
@@ -2058,7 +2080,7 @@ async fn mexc_native_eth_withdraw_bridge_uses_bridgeable_balance_after_gas_reser
         TEST_CEX_MIN_EXEC_USD,
         TEST_CEX_SLICE_TARGET_RATIO,
     )
-    .with_bridge_dependencies(bridge_dependencies(Arc::new(bridge)));
+    .with_bridge_runtime(bridge_dependencies(Arc::new(bridge)));
 
     let receipt = make_execution_receipt_with_assets(113, native_icp_token(), cketh_token());
     let mut state = finalizer
@@ -2399,7 +2421,7 @@ async fn mexc_bridged_withdraw_below_min_completes_as_zero_output_dust() {
         TEST_CEX_MIN_EXEC_USD,
         TEST_CEX_SLICE_TARGET_RATIO,
     )
-    .with_bridge_dependencies(bridge_dependencies(Arc::new(bridge)));
+    .with_bridge_runtime(bridge_dependencies(Arc::new(bridge)));
 
     let receipt = make_execution_receipt_with_assets(14, ckbtc_token(), ckusdc_token());
     let mut state = finalizer.prepare("14", &receipt).await.expect("prepare should succeed");
@@ -2694,7 +2716,7 @@ async fn mexc_deposit_phase_b_bridged_confirmation_uses_expected_amount_and_obse
         TEST_CEX_MIN_EXEC_USD,
         TEST_CEX_SLICE_TARGET_RATIO,
     )
-    .with_bridge_dependencies(bridge_dependencies(Arc::new(bridge)));
+    .with_bridge_runtime(bridge_dependencies(Arc::new(bridge)));
 
     let receipt = make_execution_receipt_with_assets(82, cketh_token(), ckusdc_token());
     let mut state = finalizer.prepare("82", &receipt).await.expect("prepare should succeed");
@@ -2746,7 +2768,7 @@ async fn mexc_deposit_phase_b_bridged_confirmation_caps_contaminated_delta_at_ex
         TEST_CEX_MIN_EXEC_USD,
         TEST_CEX_SLICE_TARGET_RATIO,
     )
-    .with_bridge_dependencies(bridge_dependencies(Arc::new(bridge)));
+    .with_bridge_runtime(bridge_dependencies(Arc::new(bridge)));
 
     let receipt = make_execution_receipt_with_assets(82, cketh_token(), ckusdc_token());
     let mut state = finalizer.prepare("82", &receipt).await.expect("prepare should succeed");
@@ -2807,7 +2829,7 @@ async fn mexc_deposit_never_sizes_a_trade_above_what_the_bridge_could_credit() {
         TEST_CEX_MIN_EXEC_USD,
         TEST_CEX_SLICE_TARGET_RATIO,
     )
-    .with_bridge_dependencies(bridge_dependencies(Arc::new(bridge)));
+    .with_bridge_runtime(bridge_dependencies(Arc::new(bridge)));
 
     let receipt = make_execution_receipt_with_assets(82, cketh_token(), ckusdc_token());
     let mut state = finalizer
@@ -2857,7 +2879,7 @@ async fn mexc_deposit_phase_b_bridged_total_free_fallback_keeps_expected_amount(
         TEST_CEX_MIN_EXEC_USD,
         TEST_CEX_SLICE_TARGET_RATIO,
     )
-    .with_bridge_dependencies(bridge_dependencies(Arc::new(bridge)));
+    .with_bridge_runtime(bridge_dependencies(Arc::new(bridge)));
 
     let receipt = make_execution_receipt_with_assets(82, cketh_token(), ckusdc_token());
     let mut state = finalizer.prepare("82", &receipt).await.expect("prepare should succeed");
@@ -2935,6 +2957,7 @@ fn cex_deposit_state_deserialize_defaults_missing_sent_timestamp() {
             deposit_bridge_submit_amount: None,
             deposit_bridge_expected_amount: None,
             deposit_bridge_provider_fee_budget_native_units: None,
+            deposit_bridge_submit_phase: None,
         },
     };
 
@@ -5920,7 +5943,7 @@ fn cksol_finalizer(cex: MockCexBackend, bridge: MockBridgeBackend) -> MexcFinali
         TEST_CEX_MIN_EXEC_USD,
         TEST_CEX_SLICE_TARGET_RATIO,
     )
-    .with_bridge_dependencies(bridge_dependencies(Arc::new(bridge)))
+    .with_bridge_runtime(bridge_dependencies(Arc::new(bridge)))
 }
 
 fn cksol_repayment_state(finalizer: &MexcFinalizer<MockCexBackend>, amount: f64) -> CexState {
@@ -6588,5 +6611,294 @@ mod fuzz {
                 assert!(state.withdraw.size_out.as_ref().unwrap().to_f64() > 0.0);
             });
         }
+    }
+}
+
+mod lost_bridge_call {
+    //! A bridge call whose handle was lost is looked up before any new call.
+    use super::*;
+    use crate::finalizers::bridge_claims::{BridgeClaims, MockBridgeClaimLookup};
+    use crate::finalizers::cex_finalizer::{BRIDGE_SUBMISSION_AMBIGUOUS_PREFIX, BridgeSubmitAttempt};
+    use crate::utils::now_ts;
+    use liquidium_pipeline_connectors::backend::bridge_backend::BridgeSubmissionCandidate;
+
+    const DESTINATION: &str = "0x1111111111111111111111111111111111111111";
+
+    fn attempt(cursor: Option<u64>, called_at_ts: Option<i64>) -> BridgeSubmitAttempt {
+        BridgeSubmitAttempt {
+            id: "mine".into(),
+            started_at_ts: now_ts() - 30,
+            called_at_ts,
+            ..BridgeSubmitAttempt::test("ckUSDC", DESTINATION, 0.92, cursor)
+        }
+    }
+
+    fn other_attempt(cursor: Option<u64>, called_at_ts: Option<i64>) -> BridgeSubmitAttempt {
+        BridgeSubmitAttempt {
+            id: "theirs".into(),
+            ..attempt(cursor, called_at_ts)
+        }
+    }
+
+    fn candidate(sequence: u64) -> BridgeSubmissionCandidate {
+        BridgeSubmissionCandidate {
+            bridge_id: format!("ic-withdraw:recovered:{sequence}"),
+            sequence,
+        }
+    }
+
+    fn zero_fee_bridge() -> MockBridgeBackend {
+        let mut bridge = MockBridgeBackend::new();
+        bridge.expect_get_fee_budget().returning(|_, _, _| {
+            Ok(BridgeFeeBudget {
+                source_fee_budget: 0.0,
+                destination_fee_budget: 0.0,
+                provider_fee_budget_native_units: None,
+            })
+        });
+        bridge
+    }
+
+    fn claims(open_attempts: Vec<BridgeSubmitAttempt>) -> MockBridgeClaimLookup {
+        let mut claims = MockBridgeClaimLookup::new();
+        claims.expect_claims_since().returning(move |_| {
+            Ok(BridgeClaims {
+                bridge_ids: vec!["ic-withdraw:1:2".into()],
+                open_attempts: open_attempts.clone(),
+            })
+        });
+        claims
+    }
+
+    fn finalizer(bridge: MockBridgeBackend, claims: Option<MockBridgeClaimLookup>) -> MexcFinalizer<MockCexBackend> {
+        MexcFinalizer::new(
+            Arc::new(MockCexBackend::new()),
+            Arc::new(MockTransferActions::new()),
+            Principal::anonymous(),
+            TEST_MAX_SELL_SLIPPAGE_BPS,
+            TEST_CEX_MIN_EXEC_USD,
+            TEST_CEX_SLICE_TARGET_RATIO,
+        )
+        .with_bridge_runtime(match claims {
+            Some(claims) => bridge_dependencies(Arc::new(bridge)).with_claims(Arc::new(claims)),
+            None => bridge_dependencies(Arc::new(bridge)),
+        })
+    }
+
+    /// A bridged ckUSDC deposit whose transfer landed and whose attempt is persisted.
+    async fn submitting_state(finalizer: &MexcFinalizer<MockCexBackend>, attempt: BridgeSubmitAttempt) -> CexState {
+        let receipt = make_execution_receipt_with_assets(90, ckusdc_token(), ckbtc_token());
+        let mut state = finalizer.prepare("90", &receipt).await.expect("prepare");
+        state.step = CexStep::DepositPending;
+        state.deposit.deposit_txid = Some("tx-bridge-fund".into());
+        state.deposit.bridge.deposit_bridge_submit_amount = Some(0.92);
+        state.deposit.bridge.deposit_bridge_expected_amount = Some(0.91);
+        state.deposit.bridge.deposit_bridge_submit_phase = Some(BridgeSubmitPhase::Submitting(attempt));
+        state
+    }
+
+    #[tokio::test]
+    async fn single_unclaimed_record_is_attached_without_a_new_call() {
+        let mut bridge = zero_fee_bridge();
+        bridge.expect_submit_bridge().times(0);
+        bridge
+            .expect_find_submissions()
+            .times(1)
+            .returning(|request, cursor, claimed| {
+                assert_eq!(request.asset, "ckUSDC");
+                assert!((request.amount - 0.92).abs() < 1e-12);
+                assert_eq!(cursor, 100);
+                assert_eq!(claimed, ["ic-withdraw:1:2"]);
+                Ok(vec![candidate(105)])
+            });
+        let finalizer = finalizer(bridge, Some(claims(vec![])));
+        let mut state = submitting_state(&finalizer, attempt(Some(100), Some(now_ts()))).await;
+
+        finalizer.deposit(&mut state).await.expect("lookup attaches the handle");
+
+        assert_eq!(
+            state.deposit.bridge.deposit_bridge_id.as_deref(),
+            Some("ic-withdraw:recovered:105")
+        );
+        assert!(state.deposit.bridge.deposit_bridge_submit_phase.is_none());
+        assert_eq!(state.trade.trade_next_amount_in, Some(0.91));
+        assert!(state.deposit.bridge.deposit_bridge_submitted_at_ts.is_some());
+        assert_eq!(state.step, CexStep::DepositPending);
+    }
+
+    #[tokio::test]
+    async fn two_records_or_a_competing_attempt_park_with_the_ambiguous_prefix() {
+        let cases: [(Vec<u64>, Vec<BridgeSubmitAttempt>, &str); 3] = [
+            (vec![105, 106], vec![], "2 unclaimed provider records"),
+            (vec![105], vec![other_attempt(Some(90), None)], "another open attempt could own one"),
+            (vec![105], vec![other_attempt(None, Some(1))], "another open attempt could own one"),
+        ];
+        for (records, open_attempts, reason) in cases {
+            let mut bridge = zero_fee_bridge();
+            bridge.expect_submit_bridge().times(0);
+            bridge
+                .expect_find_submissions()
+                .times(1)
+                .returning(move |_, _, _| Ok(records.iter().map(|id| candidate(*id)).collect()));
+            let finalizer = finalizer(bridge, Some(claims(open_attempts)));
+            let mut state = submitting_state(&finalizer, attempt(Some(100), Some(now_ts()))).await;
+
+            let error = finalizer.deposit(&mut state).await.expect_err("operator decides");
+
+            assert!(error.starts_with(BRIDGE_SUBMISSION_AMBIGUOUS_PREFIX), "{error}");
+            assert!(error.contains(reason), "{error}");
+            assert!(state.deposit.bridge.deposit_bridge_id.is_none());
+            assert!(matches!(
+                state.deposit.bridge.deposit_bridge_submit_phase,
+                Some(BridgeSubmitPhase::Submitting(_))
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn the_own_attempt_and_one_recorded_after_the_record_cannot_contest_it() {
+        let mut bridge = zero_fee_bridge();
+        bridge.expect_submit_bridge().times(0);
+        bridge
+            .expect_find_submissions()
+            .times(1)
+            .returning(|_, _, _| Ok(vec![candidate(105)]));
+        // The registry scans every row, so the row's own attempt is in it.
+        let own = attempt(Some(100), Some(now_ts()));
+        let later = other_attempt(Some(110), None);
+        let finalizer = finalizer(bridge, Some(claims(vec![own, later])));
+        let mut state = submitting_state(&finalizer, attempt(Some(100), Some(now_ts()))).await;
+
+        finalizer.deposit(&mut state).await.expect("the later attempt cannot own record 105");
+
+        assert_eq!(
+            state.deposit.bridge.deposit_bridge_id.as_deref(),
+            Some("ic-withdraw:recovered:105")
+        );
+    }
+
+    #[tokio::test]
+    async fn no_record_waits_a_grace_period_then_parks_until_an_operator_releases_it() {
+        let recent = now_ts();
+        let stale = now_ts() - 11 * 60;
+        for (called_at_ts, released) in [(recent, false), (stale, false), (stale, true)] {
+            let mut bridge = zero_fee_bridge();
+            bridge.expect_submit_bridge().times(0);
+            bridge.expect_find_submissions().times(1).returning(|_, _, _| Ok(vec![]));
+            let finalizer = finalizer(bridge, Some(claims(vec![])));
+            let mut attempt = attempt(Some(100), Some(called_at_ts));
+            attempt.parked_for_operator = released;
+            let mut state = submitting_state(&finalizer, attempt).await;
+
+            let result = finalizer.deposit(&mut state).await;
+
+            assert!(state.deposit.bridge.deposit_bridge_id.is_none());
+            assert_eq!(state.step, CexStep::DepositPending);
+            match (called_at_ts == recent, released) {
+                (true, _) => {
+                    result.expect("inside the grace period a miss is a wait");
+                    let Some(BridgeSubmitPhase::Submitting(kept)) = &state.deposit.bridge.deposit_bridge_submit_phase
+                    else {
+                        panic!("the attempt stays");
+                    };
+                    assert_eq!(kept.called_at_ts, Some(called_at_ts));
+                }
+                (false, false) => {
+                    let error = result.expect_err("a stale miss is not proof");
+                    assert!(error.starts_with(BRIDGE_SUBMISSION_AMBIGUOUS_PREFIX), "{error}");
+                    assert!(error.contains("re-enqueue"), "{error}");
+                    let Some(BridgeSubmitPhase::Submitting(kept)) = &state.deposit.bridge.deposit_bridge_submit_phase
+                    else {
+                        panic!("the attempt stays for the operator");
+                    };
+                    assert!(kept.parked_for_operator, "the next run counts as the operator's release");
+                }
+                (false, true) => {
+                    result.expect("the operator released the attempt");
+                    assert_eq!(
+                        state.deposit.bridge.deposit_bridge_submit_phase,
+                        Some(BridgeSubmitPhase::WaitingFunds)
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unavailable_claim_registry_parks_instead_of_retrying() {
+        let mut bridge = zero_fee_bridge();
+        bridge.expect_submit_bridge().times(0);
+        bridge.expect_find_submissions().times(0);
+        let mut claims = MockBridgeClaimLookup::new();
+        claims
+            .expect_claims_since()
+            .returning(|_| Err("bridge claim scan truncated at 20000 rows".into()));
+        let finalizer = finalizer(bridge, Some(claims));
+        let mut state = submitting_state(&finalizer, attempt(Some(100), Some(now_ts()))).await;
+
+        let error = finalizer.deposit(&mut state).await.expect_err("no partial answers");
+
+        assert!(error.starts_with(BRIDGE_SUBMISSION_AMBIGUOUS_PREFIX), "{error}");
+        assert!(error.contains("truncated"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn no_cursor_parks_instead_of_guessing() {
+        let mut bridge = zero_fee_bridge();
+        bridge.expect_submit_bridge().times(0);
+        bridge.expect_find_submissions().times(0);
+        let finalizer = finalizer(bridge, Some(claims(vec![])));
+        let mut state = submitting_state(&finalizer, attempt(None, Some(now_ts()))).await;
+
+        let error = finalizer.deposit(&mut state).await.expect_err("nothing to look up with");
+
+        assert!(error.starts_with(BRIDGE_SUBMISSION_AMBIGUOUS_PREFIX), "{error}");
+    }
+
+    #[tokio::test]
+    async fn a_failed_call_is_looked_up_before_the_retry() {
+        let mut bridge = zero_fee_bridge();
+        bridge.expect_get_source_balance().times(1).returning(|_, _, _| Ok(5.0));
+        bridge.expect_submit_bridge().times(1).returning(|request| {
+            assert!((request.amount - 0.92).abs() < 1e-12);
+            Err("minter call timed out".into())
+        });
+        bridge
+            .expect_find_submissions()
+            .times(1)
+            .returning(|_, _, _| Ok(vec![candidate(105)]));
+        let finalizer = finalizer(bridge, Some(claims(vec![])));
+        let mut state = submitting_state(&finalizer, attempt(Some(100), None)).await;
+
+        let error = finalizer.deposit(&mut state).await.expect_err("the call failed");
+        assert_eq!(error, "minter call timed out");
+        let Some(BridgeSubmitPhase::Submitting(kept)) = &state.deposit.bridge.deposit_bridge_submit_phase else {
+            panic!("the attempt must stay persisted with its call time");
+        };
+        assert!(kept.called_at_ts.is_some());
+
+        finalizer.deposit(&mut state).await.expect("the retry finds the record");
+        assert_eq!(
+            state.deposit.bridge.deposit_bridge_id.as_deref(),
+            Some("ic-withdraw:recovered:105")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_funding_regression_drops_the_attempt_without_a_call() {
+        let mut bridge = zero_fee_bridge();
+        bridge.expect_get_source_balance().times(1).returning(|_, _, _| Ok(0.5));
+        bridge.expect_submit_bridge().times(0);
+        bridge.expect_find_submissions().times(0);
+        let finalizer = finalizer(bridge, None);
+        let mut state = submitting_state(&finalizer, attempt(Some(100), None)).await;
+
+        finalizer.deposit(&mut state).await.expect("short funds are a wait");
+
+        assert_eq!(
+            state.deposit.bridge.deposit_bridge_submit_phase,
+            Some(BridgeSubmitPhase::WaitingFunds)
+        );
+        assert!(state.deposit.bridge.deposit_bridge_id.is_none());
     }
 }

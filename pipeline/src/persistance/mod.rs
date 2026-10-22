@@ -133,6 +133,11 @@ pub trait WalStore: Send + Sync {
     async fn upsert_result(&self, row: LiqResultRecord) -> Result<()>;
     async fn get_result(&self, liq_id: &str) -> Result<Option<LiqResultRecord>>;
     async fn list_by_status(&self, status: ResultStatus, limit: usize) -> Result<Vec<LiqResultRecord>>;
+    /// Rows written at or after `since_ts`, newest first, whatever their status.
+    async fn list_updated_since(&self, since_ts: i64, limit: usize) -> Result<Vec<LiqResultRecord>> {
+        let _ = (since_ts, limit);
+        anyhow::bail!("list_updated_since is not supported by this store")
+    }
     async fn get_pending(&self, limit: usize) -> Result<Vec<LiqResultRecord>>;
     async fn update_status(&self, liq_id: &str, next: ResultStatus, bump_attempt: bool) -> Result<()>;
     async fn update_failure(

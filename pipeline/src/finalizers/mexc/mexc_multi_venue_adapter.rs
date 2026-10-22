@@ -8,7 +8,7 @@ use super::mexc_finalizer::MexcFinalizer;
 use crate::{
     finalizers::{
         bridge_planner::BridgePlanner,
-        cex_finalizer::{CexFinalizerLogic, CexState, CexStep},
+        cex_finalizer::{BRIDGE_SUBMISSION_AMBIGUOUS_PREFIX, CexFinalizerLogic, CexState, CexStep},
         multi_venue::{
             MultiVenueAdapter, VenueLegCheckpoint, VenueLegProgress, VenuePlanningContext, VenueRoutePreview,
         },
@@ -99,6 +99,7 @@ where
     /// the plan is resolved here before the durable-id check runs.
     fn can_resume_by_polling(&self, state: &mut CexState) -> bool {
         self.ensure_plan_on_state(state);
+        state.deposit.bridge.mark_bridge_call_uncertain(now_ts());
         state.is_receipt_poll_only()
     }
 
@@ -162,6 +163,10 @@ where
                 execution.cex.last_error = Some(error.clone());
                 if error.starts_with(FINALIZER_PERMANENT_AMOUNT_FLOOR_PREFIX) {
                     execution.cex.step = CexStep::Failed;
+                }
+                // Only an operator can say which row owns the provider record.
+                if error.starts_with(BRIDGE_SUBMISSION_AMBIGUOUS_PREFIX) {
+                    return self.operator_required_progress(execution, error);
                 }
                 Some(error)
             }

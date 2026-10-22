@@ -75,8 +75,76 @@ pub struct CexDepositState {
     pub bridge: CexDepositBridgeState,
 }
 
+/// A deposit step that parks for an operator because the bridge provider
+/// cannot say whether a lost attempt was submitted.
+pub const BRIDGE_SUBMISSION_AMBIGUOUS_PREFIX: &str = "bridge_submission_ambiguous";
+
+/// Where a bridged deposit stands before its handle exists. Persisted before
+/// the bridge call, so a restart can tell "never submitted" from "handle lost".
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum BridgeSubmitPhase {
+    /// Balance checks only. Nothing was sent to the bridge.
+    WaitingFunds,
+    /// The attempt is persisted and the next cycle may call the bridge.
+    Submitting(BridgeSubmitAttempt),
+}
+
+/// What the bridge call will look like on the provider, so it can be found
+/// again if the handle is lost between the call and its persistence.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct BridgeSubmitAttempt {
+    /// Tells this attempt apart from the others in the claim registry. The
+    /// leg state carries a venue execution id, not the WAL row id.
+    #[serde(default)]
+    pub id: String,
+    pub asset: String,
+    pub destination: String,
+    pub amount: f64,
+    /// Provider history position taken before the call. `None` when the
+    /// provider cannot look lost handles up.
+    pub cursor: Option<u64>,
+    pub started_at_ts: i64,
+    /// Set right before the bridge call and on restart. A persisted value
+    /// means the call may have happened, so the next cycle looks it up first.
+    pub called_at_ts: Option<i64>,
+    /// The row parked on this attempt. When the leg runs again, an operator
+    /// released it, and that decision lets an empty lookup end in a new call;
+    /// the pipeline alone cannot prove a lost call never ran.
+    #[serde(default)]
+    pub parked_for_operator: bool,
+}
+
+impl BridgeSubmitAttempt {
+    /// A fixture with the fields tests rarely vary; override the rest by
+    /// struct update.
+    #[cfg(test)]
+    pub fn test(asset: &str, destination: &str, amount: f64, cursor: Option<u64>) -> Self {
+        Self {
+            id: "attempt-test".into(),
+            asset: asset.into(),
+            destination: destination.into(),
+            amount,
+            cursor,
+            started_at_ts: 1,
+            called_at_ts: None,
+            parked_for_operator: false,
+        }
+    }
+
+    /// True when this attempt could have produced the provider record at
+    /// `sequence` that `other` matched: same shape, taken before the record.
+    pub fn may_own(&self, other: &BridgeSubmitAttempt, sequence: u64) -> bool {
+        self.asset.eq_ignore_ascii_case(&other.asset)
+            && self.destination.eq_ignore_ascii_case(&other.destination)
+            && (self.amount - other.amount).abs() <= 1e-9
+            && self.cursor.is_none_or(|cursor| cursor < sequence)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct CexDepositBridgeState {
+    #[serde(default)]
+    pub deposit_bridge_submit_phase: Option<BridgeSubmitPhase>,
     #[serde(default)]
     pub deposit_planned_asset: Option<String>,
     #[serde(default)]
@@ -222,8 +290,42 @@ pub struct CexState {
 
 /// A pending step is safe to resume by reading alone once its own submission
 /// id is durable and, when a bridge follows, the bridge handle is durable too.
-fn durable_for_polling(submission_id: Option<&str>, bridge_required: bool, bridge_id: Option<&str>) -> bool {
-    submission_id.is_some() && (!bridge_required || bridge_id.is_some())
+impl CexDepositBridgeState {
+    /// True when the persisted phase accounts for the bridge call: nothing was
+    /// sent, or the attempt is marked so the next cycle looks it up first.
+    pub fn bridge_call_is_accounted_for(&self) -> bool {
+        match &self.deposit_bridge_submit_phase {
+            Some(BridgeSubmitPhase::WaitingFunds) => true,
+            Some(BridgeSubmitPhase::Submitting(attempt)) => attempt.called_at_ts.is_some(),
+            None => false,
+        }
+    }
+
+    /// A restart cannot know whether the lost cycle reached the bridge call.
+    /// Marks the attempt so the deposit step looks it up before it submits.
+    pub fn mark_bridge_call_uncertain(&mut self, now: i64) {
+        if let Some(BridgeSubmitPhase::Submitting(attempt)) = &mut self.deposit_bridge_submit_phase {
+            attempt.called_at_ts.get_or_insert(now);
+        }
+    }
+
+    /// Balance checks only from here; nothing is in flight.
+    pub fn wait_for_funds(&mut self) {
+        self.deposit_bridge_submit_phase = Some(BridgeSubmitPhase::WaitingFunds);
+    }
+
+    /// Persists what the next cycle will submit, before any call is made.
+    pub fn record_attempt(&mut self, attempt: BridgeSubmitAttempt) {
+        self.deposit_bridge_submit_phase = Some(BridgeSubmitPhase::Submitting(attempt));
+    }
+
+    /// Records that the row parks on this attempt, so the next run of the leg
+    /// counts as an operator's release. The lookup still runs first.
+    pub fn mark_bridge_attempt_parked(&mut self) {
+        if let Some(BridgeSubmitPhase::Submitting(attempt)) = &mut self.deposit_bridge_submit_phase {
+            attempt.parked_for_operator = true;
+        }
+    }
 }
 
 impl CexState {
@@ -233,16 +335,18 @@ impl CexState {
     /// resolves legacy transport plans first; see `can_resume_by_polling`.
     pub fn is_receipt_poll_only(&self) -> bool {
         match self.step {
-            CexStep::DepositPending => durable_for_polling(
-                self.deposit.deposit_txid.as_deref(),
-                self.deposit.bridge.deposit_bridge_required,
-                self.deposit.bridge.deposit_bridge_id.as_deref(),
-            ),
-            CexStep::WithdrawPending => durable_for_polling(
-                self.withdraw.withdraw_id.as_deref(),
-                self.withdraw.bridge.withdraw_bridge_required,
-                self.withdraw.bridge.withdraw_bridge_id.as_deref(),
-            ),
+            CexStep::DepositPending => {
+                let bridge = &self.deposit.bridge;
+                self.deposit.deposit_txid.is_some()
+                    && (!bridge.deposit_bridge_required
+                        || bridge.deposit_bridge_id.is_some()
+                        || bridge.bridge_call_is_accounted_for())
+            }
+            CexStep::WithdrawPending => {
+                let bridge = &self.withdraw.bridge;
+                self.withdraw.withdraw_id.is_some()
+                    && (!bridge.withdraw_bridge_required || bridge.withdraw_bridge_id.is_some())
+            }
             _ => false,
         }
     }
@@ -575,6 +679,7 @@ mod tests {
                         deposit_bridge_submit_amount: None,
                         deposit_bridge_expected_amount: None,
                         deposit_bridge_provider_fee_budget_native_units: None,
+                        deposit_bridge_submit_phase: None,
                     },
                 },
                 trade: CexTradeState {
@@ -730,6 +835,7 @@ mod tests {
                         deposit_bridge_submit_amount: None,
                         deposit_bridge_expected_amount: None,
                         deposit_bridge_provider_fee_budget_native_units: None,
+                        deposit_bridge_submit_phase: None,
                     },
                 },
                 trade: CexTradeState {
@@ -1143,5 +1249,57 @@ mod tests {
             .expect("finalize should succeed");
         assert!(res.finalized);
         assert_eq!(*trade_calls.lock().unwrap(), 1);
+    }
+
+    fn attempt(cursor: Option<u64>) -> BridgeSubmitAttempt {
+        BridgeSubmitAttempt::test("ckUSDC", "0xAbC", 1.0, cursor)
+    }
+
+    #[test]
+    fn only_a_persisted_phase_accounts_for_the_bridge_call() {
+        let legacy: CexDepositBridgeState = serde_json::from_str(r#"{"deposit_bridge_required":true}"#).unwrap();
+        assert!(legacy.deposit_bridge_submit_phase.is_none());
+        assert!(!legacy.bridge_call_is_accounted_for());
+
+        let mut waiting = CexDepositBridgeState {
+            deposit_bridge_submit_phase: Some(BridgeSubmitPhase::WaitingFunds),
+            ..Default::default()
+        };
+        assert!(waiting.bridge_call_is_accounted_for());
+        waiting.mark_bridge_call_uncertain(5);
+        assert_eq!(waiting.deposit_bridge_submit_phase, Some(BridgeSubmitPhase::WaitingFunds));
+
+        let mut submitting = CexDepositBridgeState {
+            deposit_bridge_submit_phase: Some(BridgeSubmitPhase::Submitting(attempt(Some(100)))),
+            ..Default::default()
+        };
+        assert!(!submitting.bridge_call_is_accounted_for());
+        submitting.mark_bridge_call_uncertain(5);
+        submitting.mark_bridge_call_uncertain(9);
+        submitting.mark_bridge_attempt_parked();
+        waiting.mark_bridge_attempt_parked();
+        assert!(submitting.bridge_call_is_accounted_for());
+        let restored: CexDepositBridgeState =
+            serde_json::from_str(&serde_json::to_string(&submitting).unwrap()).unwrap();
+        let Some(BridgeSubmitPhase::Submitting(kept)) = restored.deposit_bridge_submit_phase else {
+            panic!("attempt survives the round trip");
+        };
+        assert_eq!(kept.called_at_ts, Some(5));
+        assert_eq!(kept.cursor, Some(100));
+        assert!(kept.parked_for_operator);
+    }
+
+    #[test]
+    fn an_attempt_owns_a_record_only_with_the_same_shape_taken_before_it() {
+        let mine = attempt(Some(100));
+        assert!(attempt(Some(90)).may_own(&mine, 105));
+        assert!(attempt(None).may_own(&mine, 105));
+        assert!(!attempt(Some(105)).may_own(&mine, 105));
+        let mut other = attempt(Some(90));
+        other.destination = "0xabc".into();
+        other.asset = "CKUSDC".into();
+        assert!(other.may_own(&mine, 105));
+        other.amount = 1.0 + 1e-6;
+        assert!(!other.may_own(&mine, 105));
     }
 }
