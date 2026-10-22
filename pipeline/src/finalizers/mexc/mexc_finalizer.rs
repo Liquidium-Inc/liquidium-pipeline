@@ -835,7 +835,7 @@ where
                 .await?;
             let required_source_available = bridge_amount + fee_budget.source_fee_budget;
             if source_available + WITHDRAW_BRIDGE_SOURCE_BALANCE_TOLERANCE < required_source_available {
-                info!(
+                debug!(
                     "[mexc] liq_id={} bridged deposit waiting for source funding: available={} expected={} tolerance={} source={} route={}@{}->{}",
                     state.liq_id,
                     source_available,
@@ -876,7 +876,7 @@ where
                     .get_source_balance(BRIDGE_FEE_TOKEN_SYMBOL, BRIDGE_FEE_TOKEN_CHAIN, &bridge_source_address)
                     .await?;
                 if fee_available + WITHDRAW_BRIDGE_SOURCE_BALANCE_TOLERANCE < required_fee_budget {
-                    info!(
+                    debug!(
                         "[mexc] liq_id={} bridged deposit waiting for fee funding: available={} expected={} tolerance={} source={} fee_asset={}@{} route={}@{}->{}",
                         state.liq_id,
                         fee_available,
@@ -1428,7 +1428,7 @@ where
                 {
                     let adjusted_source_available = (source_available - NATIVE_ETH_BRIDGEABLE_SAFETY_MARGIN).max(0.0);
                     if adjusted_source_available <= WITHDRAW_BRIDGE_SOURCE_BALANCE_TOLERANCE {
-                        info!(
+                        debug!(
                             "[mexc] liq_id={} bridged native ETH withdraw waiting for source funding after safety margin: available={} adjusted={} expected={} tolerance={} source={} route={}@{}->{}",
                             state.liq_id,
                             source_available,
@@ -1457,7 +1457,7 @@ where
                     );
                     bridge_amount = adjusted_source_available;
                 } else {
-                    info!(
+                    debug!(
                         "[mexc] liq_id={} bridged withdraw waiting for source funding: available={} expected={} tolerance={} source={} route={}@{}->{}",
                         state.liq_id,
                         source_available,
