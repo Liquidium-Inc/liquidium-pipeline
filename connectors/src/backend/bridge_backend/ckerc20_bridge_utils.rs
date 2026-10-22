@@ -167,3 +167,21 @@ pub(super) fn resolve_cketh_route_for_request(request: &BridgeRequest) -> Result
     }
     Ok(route)
 }
+
+/// The ckETH burn index inside a reverse-route handle. The minter indexes every
+/// withdrawal by it, so it is the one id that both handle formats share.
+pub(super) fn minter_withdrawal_id(bridge_id: &str) -> Option<u64> {
+    if let Some(id) = bridge_id.strip_prefix("ic-withdraw-eth:") {
+        return id.parse().ok();
+    }
+    bridge_id.strip_prefix("ic-withdraw:")?.rsplit(':').next()?.parse().ok()
+}
+
+/// A handle rebuilt from the minter's withdrawal record. The record has no
+/// ckERC20 burn index, and the status poller only reads the prefix.
+pub(super) fn recovered_bridge_id(route_kind: BridgeRouteKind, withdrawal_id: u64) -> String {
+    match route_kind {
+        BridgeRouteKind::CkEthToEth => format!("ic-withdraw-eth:{withdrawal_id}"),
+        _ => format!("ic-withdraw:recovered:{withdrawal_id}"),
+    }
+}

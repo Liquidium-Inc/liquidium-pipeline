@@ -1,12 +1,8 @@
-use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
 
 use candid::{Encode, Principal};
-use futures::FutureExt;
-use tokio::time::{sleep, timeout};
 use tracing::instrument;
-use tracing::{error, info, warn};
+use tracing::{info, warn};
 
 use crate::persistance::{LiqMetaWrapper, LiqResultRecord, ResultStatus, WalStore};
 use crate::stages::executor::ExecutionReceipt;
@@ -16,32 +12,6 @@ use crate::wal::{decode_receipt_wrapper, encode_meta};
 use liquidium_pipeline_connectors::pipeline_agent::PipelineAgent;
 use liquidium_pipeline_core::types::protocol_types::{LiquidationResult, ProtocolError, TransferStatus};
 
-/// Upper bound on a single reconciliation sweep.
-///
-/// Auditor notes: the watcher issues IC queries through an agent configured
-/// without a transport deadline, so an accepted-but-unanswered request would
-/// otherwise park reconciliation forever while the daemon keeps logging healthy.
-const TICK_TIMEOUT: Duration = Duration::from_secs(120);
-
-/// Minimum cooldown after a panicking sweep before the next attempt.
-const PANIC_RECOVERY_DELAY: Duration = Duration::from_secs(1);
-
-/// Liveness cadence, so a silent watcher is distinguishable from an idle one.
-const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(300);
-
-/// Result of one guarded sweep, used to drive backoff and liveness logging.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TickOutcome {
-    /// Sweep ran to completion.
-    Completed,
-    /// Sweep returned an error; the loop is healthy, the work is not.
-    Failed,
-    /// Sweep exceeded [`TICK_TIMEOUT`] and was abandoned.
-    TimedOut,
-    /// Sweep panicked and was contained.
-    Panicked,
-}
-
 pub struct SettlementWatcher<A, D>
 where
     A: PipelineAgent,
@@ -50,87 +20,23 @@ where
     pub wal: Arc<D>,
     pub agent: Arc<A>,
     pub lending_canister: Principal,
-    pub poll_interval: Duration,
 }
 
+#[allow(dead_code)]
 impl<A, D> SettlementWatcher<A, D>
 where
     A: PipelineAgent + Send + Sync,
     D: WalStore + Send + Sync,
 {
-    pub fn new(wal: Arc<D>, agent: Arc<A>, lending_canister: Principal, poll_interval: Duration) -> Self {
+    pub fn new(wal: Arc<D>, agent: Arc<A>, lending_canister: Principal) -> Self {
         Self {
             wal,
             agent,
             lending_canister,
-            poll_interval,
         }
     }
 
-    /// Drives reconciliation forever.
-    ///
-    /// Auditor notes: this loop is the only thing advancing already-started
-    /// liquidations to a terminal state, so it must survive every per-sweep
-    /// fault. Both ways a sweep can break the loop — an unwinding panic and an
-    /// unbounded await — are contained in [`Self::guarded_tick`].
-    pub async fn run(self) {
-        let mut last_heartbeat = Instant::now();
-        let mut consecutive_stalls: u32 = 0;
-
-        loop {
-            let outcome = self.guarded_tick().await;
-            match outcome {
-                TickOutcome::Completed | TickOutcome::Failed => consecutive_stalls = 0,
-                TickOutcome::TimedOut | TickOutcome::Panicked => {
-                    consecutive_stalls = consecutive_stalls.saturating_add(1);
-                    warn!(
-                        consecutive_stalls,
-                        ?outcome,
-                        "[settlement] sweep did not complete; watcher stays alive and retries"
-                    );
-                }
-            }
-
-            if last_heartbeat.elapsed() >= HEARTBEAT_INTERVAL {
-                info!(consecutive_stalls, "[settlement] watcher alive");
-                last_heartbeat = Instant::now();
-            }
-
-            let delay = if matches!(outcome, TickOutcome::Panicked) {
-                self.poll_interval.max(PANIC_RECOVERY_DELAY)
-            } else {
-                self.poll_interval
-            };
-            sleep(delay).await;
-        }
-    }
-
-    /// Runs one sweep under a deadline and a panic guard.
-    async fn guarded_tick(&self) -> TickOutcome {
-        // `tick` only touches `Arc` handles and owned rows, so a panic cannot
-        // leave the watcher observing torn state.
-        let tick = AssertUnwindSafe(self.tick()).catch_unwind();
-        match timeout(TICK_TIMEOUT, tick).await {
-            Ok(Ok(Ok(()))) => TickOutcome::Completed,
-            Ok(Ok(Err(err))) => {
-                warn!("[settlement] tick error: {}", err);
-                TickOutcome::Failed
-            }
-            Ok(Err(_)) => {
-                error!("[settlement] tick panicked; recovering and continuing reconciliation");
-                TickOutcome::Panicked
-            }
-            Err(_) => {
-                error!(
-                    timeout_secs = TICK_TIMEOUT.as_secs(),
-                    "[settlement] tick timed out; abandoning sweep and retrying"
-                );
-                TickOutcome::TimedOut
-            }
-        }
-    }
-
-    async fn tick(&self) -> Result<(), String> {
+    pub(crate) async fn tick(&self) -> Result<(), String> {
         let mut rows = self
             .wal
             .list_by_status(ResultStatus::WaitingCollateral, 100)
@@ -265,8 +171,6 @@ mod tests {
     use crate::stages::executor::ExecutionStatus;
     use crate::swappers::model::SwapRequest;
     use candid::Nat;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
     use liquidium_pipeline_connectors::pipeline_agent::MockPipelineAgent;
     use liquidium_pipeline_core::tokens::asset_id::AssetId;
     use liquidium_pipeline_core::tokens::chain_token::ChainToken;
@@ -415,12 +319,7 @@ mod tests {
             .times(1)
             .returning(move |_, _, _| Ok(Ok(fresh.clone())));
 
-        let watcher = SettlementWatcher::new(
-            Arc::new(wal),
-            Arc::new(agent),
-            Principal::anonymous(),
-            Duration::from_secs(3),
-        );
+        let watcher = SettlementWatcher::new(Arc::new(wal), Arc::new(agent), Principal::anonymous());
 
         watcher.tick().await.expect("tick should succeed");
     }
@@ -462,12 +361,7 @@ mod tests {
             .times(1)
             .returning(move |_, _, _| Ok(Ok(fresh.clone())));
 
-        let watcher = SettlementWatcher::new(
-            Arc::new(wal),
-            Arc::new(agent),
-            Principal::anonymous(),
-            Duration::from_secs(3),
-        );
+        let watcher = SettlementWatcher::new(Arc::new(wal), Arc::new(agent), Principal::anonymous());
 
         watcher.tick().await.expect("tick should succeed");
     }
@@ -513,12 +407,7 @@ mod tests {
             .times(1)
             .returning(move |_, _, _| Ok(Ok(fresh.clone())));
 
-        let watcher = SettlementWatcher::new(
-            Arc::new(wal),
-            Arc::new(agent),
-            Principal::anonymous(),
-            Duration::from_secs(3),
-        );
+        let watcher = SettlementWatcher::new(Arc::new(wal), Arc::new(agent), Principal::anonymous());
 
         // when
         watcher.tick().await.expect("tick should succeed");
@@ -564,12 +453,7 @@ mod tests {
             .times(1)
             .returning(move |_, _, _| Ok(Ok(fresh.clone())));
 
-        let watcher = SettlementWatcher::new(
-            Arc::new(wal),
-            Arc::new(agent),
-            Principal::anonymous(),
-            Duration::from_secs(3),
-        );
+        let watcher = SettlementWatcher::new(Arc::new(wal), Arc::new(agent), Principal::anonymous());
 
         watcher.tick().await.expect("tick should succeed");
     }
@@ -637,149 +521,11 @@ mod tests {
             Arc::new(wal),
             Arc::new(MockPipelineAgent::new()),
             Principal::anonymous(),
-            Duration::from_secs(3),
         );
 
         watcher
             .update_receipt_meta(&row, &new_receipt, true)
             .await
             .expect("receipt meta update should succeed");
-    }
-
-    /// How a [`FaultyWal`] sweep misbehaves.
-    enum Fault {
-        /// Never resolves — an IC query accepted and then never answered.
-        Hang,
-        /// Unwinds on every sweep.
-        Panic,
-    }
-
-    /// WAL double for the sweep-fault containment paths.
-    ///
-    /// Hand-rolled rather than reusing `MockWalStore` because mockall guards its
-    /// call state with a mutex that the first panic poisons; every later sweep
-    /// would then fail inside the mock instead of exercising the watcher.
-    struct FaultyWal {
-        fault: Fault,
-        sweeps: Arc<AtomicUsize>,
-    }
-
-    impl FaultyWal {
-        fn new(fault: Fault) -> Self {
-            Self {
-                fault,
-                sweeps: Arc::new(AtomicUsize::new(0)),
-            }
-        }
-
-        fn sweep_counter(&self) -> Arc<AtomicUsize> {
-            self.sweeps.clone()
-        }
-    }
-
-    #[async_trait::async_trait]
-    impl WalStore for FaultyWal {
-        async fn list_by_status(&self, _status: ResultStatus, _limit: usize) -> anyhow::Result<Vec<LiqResultRecord>> {
-            self.sweeps.fetch_add(1, Ordering::SeqCst);
-            match self.fault {
-                Fault::Hang => std::future::pending().await,
-                Fault::Panic => panic!("simulated sweep panic"),
-            }
-        }
-
-        async fn upsert_result(&self, _row: LiqResultRecord) -> anyhow::Result<()> {
-            unreachable!("sweep faults before reaching this")
-        }
-
-        async fn get_result(&self, _liq_id: &str) -> anyhow::Result<Option<LiqResultRecord>> {
-            unreachable!("sweep faults before reaching this")
-        }
-
-        async fn get_pending(&self, _limit: usize) -> anyhow::Result<Vec<LiqResultRecord>> {
-            unreachable!("sweep faults before reaching this")
-        }
-
-        async fn update_status(&self, _liq_id: &str, _next: ResultStatus, _bump: bool) -> anyhow::Result<()> {
-            unreachable!("sweep faults before reaching this")
-        }
-
-        async fn update_failure(
-            &self,
-            _liq_id: &str,
-            _next: ResultStatus,
-            _last_error: String,
-            _bump: bool,
-        ) -> anyhow::Result<()> {
-            unreachable!("sweep faults before reaching this")
-        }
-
-        async fn delete(&self, _liq_id: &str) -> anyhow::Result<()> {
-            unreachable!("sweep faults before reaching this")
-        }
-    }
-
-    fn watcher_with_wal<D: WalStore + Send + Sync + 'static>(wal: D) -> SettlementWatcher<MockPipelineAgent, D> {
-        SettlementWatcher::new(
-            Arc::new(wal),
-            Arc::new(MockPipelineAgent::new()),
-            Principal::anonymous(),
-            Duration::from_millis(1),
-        )
-    }
-
-    #[tokio::test]
-    async fn guarded_tick_contains_a_panicking_sweep() {
-        let watcher = watcher_with_wal(FaultyWal::new(Fault::Panic));
-
-        assert_eq!(watcher.guarded_tick().await, TickOutcome::Panicked);
-    }
-
-    #[tokio::test]
-    async fn guarded_tick_reports_a_sweep_error_without_unwinding() {
-        let mut wal = MockWalStore::new();
-        wal.expect_list_by_status()
-            .returning(|_, _| Err(anyhow::anyhow!("wal unavailable")));
-
-        let watcher = watcher_with_wal(wal);
-
-        assert_eq!(watcher.guarded_tick().await, TickOutcome::Failed);
-    }
-
-    /// A stalled sweep must be abandoned rather than parking reconciliation.
-    /// The paused clock makes `TICK_TIMEOUT` elapse in virtual time.
-    #[tokio::test(start_paused = true)]
-    async fn guarded_tick_abandons_a_stalled_sweep() {
-        let watcher = watcher_with_wal(FaultyWal::new(Fault::Hang));
-
-        assert_eq!(watcher.guarded_tick().await, TickOutcome::TimedOut);
-    }
-
-    /// The loop is the only thing advancing started liquidations to a terminal
-    /// state, so a panicking sweep must not end it.
-    ///
-    /// Each panic costs `PANIC_RECOVERY_DELAY` before the next sweep, so the
-    /// paused clock steps over those delays in virtual time. Polling the
-    /// counter behind real 1ms sleeps made the test depend on the timer
-    /// overshooting its request: three sweeps need two real seconds of
-    /// recovery, which a precise 1ms tick would never reach.
-    #[tokio::test(start_paused = true)]
-    async fn run_keeps_sweeping_after_a_panicking_sweep() {
-        let wal = FaultyWal::new(Fault::Panic);
-        let sweeps = wal.sweep_counter();
-
-        let handle = tokio::spawn(watcher_with_wal(wal).run());
-
-        for _ in 0..3 {
-            tokio::task::yield_now().await;
-            tokio::time::advance(PANIC_RECOVERY_DELAY).await;
-        }
-        tokio::task::yield_now().await;
-
-        assert!(
-            sweeps.load(Ordering::SeqCst) >= 3,
-            "watcher stopped sweeping after a panic"
-        );
-        assert!(!handle.is_finished(), "watcher task died on a panicking sweep");
-        handle.abort();
     }
 }

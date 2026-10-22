@@ -1,7 +1,29 @@
 use bitcoin::{Address as BitcoinAddress, Network};
 use std::str::FromStr;
 
-use super::{BridgeDestination, BridgeRouteKind, BridgeRouteSpec, BridgeSweepRoute, catalog::BRIDGE_ROUTE_CATALOG};
+use super::{
+    BridgeDestination, BridgeDestinationKind, BridgeRouteKind, BridgeRouteSpec, BridgeSweepRoute,
+    catalog::BRIDGE_ROUTE_CATALOG,
+};
+
+fn validate_solana_address(address: &str, field_name: &str) -> Result<(), String> {
+    let trimmed = address.trim();
+    if trimmed.is_empty() {
+        return Err(format!("{field_name} must not be empty"));
+    }
+
+    let decoded = bs58::decode(trimmed)
+        .into_vec()
+        .map_err(|e| format!("invalid {field_name} '{trimmed}': {e}"))?;
+    if decoded.len() != 32 {
+        return Err(format!(
+            "invalid {field_name} '{trimmed}': expected 32-byte pubkey, got {} bytes",
+            decoded.len()
+        ));
+    }
+
+    Ok(())
+}
 
 pub fn resolve_route(source_asset: &str, source_chain: &str, target_asset: &str) -> Option<&'static BridgeRouteSpec> {
     BRIDGE_ROUTE_CATALOG.iter().find(|route| {
@@ -34,6 +56,27 @@ pub fn resolve_cketh_reverse_route_by_source(
             BridgeRouteKind::CkEthErc20Reverse | BridgeRouteKind::CkEthToEth
         ) && source_asset.eq_ignore_ascii_case(route.source_asset)
             && source_chain.eq_ignore_ascii_case(route.source_chain)
+    })
+}
+
+/// The exchange-transport route that moves an ICP asset out to another chain,
+/// whatever the bridge behind it. Direction and eligibility come from the
+/// catalog, not from the symbol.
+pub fn resolve_reverse_route_by_source(source_asset: &str, source_chain: &str) -> Option<&'static BridgeRouteSpec> {
+    BRIDGE_ROUTE_CATALOG.iter().find(|route| {
+        route.exchange_transport
+            && route.source_chain.eq_ignore_ascii_case("ICP")
+            && source_asset.eq_ignore_ascii_case(route.source_asset)
+            && source_chain.eq_ignore_ascii_case(route.source_chain)
+    })
+}
+
+/// The exchange-transport route that delivers the target asset into an ICP account.
+pub fn resolve_forward_route_by_target(target_asset: &str) -> Option<&'static BridgeRouteSpec> {
+    BRIDGE_ROUTE_CATALOG.iter().find(|route| {
+        route.exchange_transport
+            && route.destination_kind == BridgeDestinationKind::IcpAccount
+            && target_asset.eq_ignore_ascii_case(route.target_asset)
     })
 }
 
@@ -94,16 +137,22 @@ pub fn validate_destination_for_route(route: &BridgeRouteSpec, destination: &Bri
         ));
     }
 
-    if let BridgeDestination::BtcAddress(address) = destination {
-        let trimmed = address.trim();
-        if trimmed.is_empty() {
-            return Err("destination BTC address must not be empty".to_string());
+    match destination {
+        BridgeDestination::BtcAddress(address) => {
+            let trimmed = address.trim();
+            if trimmed.is_empty() {
+                return Err("destination BTC address must not be empty".to_string());
+            }
+            let parsed = BitcoinAddress::from_str(trimmed)
+                .map_err(|e| format!("invalid BTC destination address '{trimmed}': {e}"))?;
+            parsed
+                .require_network(Network::Bitcoin)
+                .map_err(|_| format!("BTC destination address '{trimmed}' is not mainnet"))?;
         }
-        let parsed = BitcoinAddress::from_str(trimmed)
-            .map_err(|e| format!("invalid BTC destination address '{trimmed}': {e}"))?;
-        parsed
-            .require_network(Network::Bitcoin)
-            .map_err(|_| format!("BTC destination address '{trimmed}' is not mainnet"))?;
+        BridgeDestination::SolanaAddress(address) => {
+            validate_solana_address(address, "destination Solana address")?;
+        }
+        _ => {}
     }
 
     Ok(())
@@ -111,9 +160,25 @@ pub fn validate_destination_for_route(route: &BridgeRouteSpec, destination: &Bri
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn generic_lookups_cover_every_bridged_asset_without_symbol_tests() {
+        for (asset, target) in [("ckUSDC", "USDC"), ("ckETH", "ETH"), ("ckSOL", "SOL")] {
+            let route = super::resolve_reverse_route_by_source(asset, "ICP").expect(asset);
+            assert_eq!(route.target_asset, target);
+            let back = super::resolve_forward_route_by_target(asset).expect(asset);
+            assert_eq!(back.source_asset, target);
+            assert_eq!(back.destination_kind, super::BridgeDestinationKind::IcpAccount);
+        }
+        assert!(super::resolve_reverse_route_by_source("USDC", "ETH").is_none());
+        assert!(super::resolve_forward_route_by_target("USDC").is_none());
+        // ckBTC trades on the exchange's ICP network, so its bridge is not exchange transport.
+        assert!(super::resolve_reverse_route_by_source("ckBTC", "ICP").is_none());
+        assert!(super::resolve_forward_route_by_target("ckBTC").is_none());
+    }
+
     use super::super::BridgeDestinationKind;
     use super::{
-        BridgeDestination, BridgeRouteKind, cketh_forward_routes, cketh_reverse_routes,
+        BridgeDestination, BridgeRouteKind, BridgeRouteSpec, cketh_forward_routes, cketh_reverse_routes,
         resolve_cketh_forward_route_by_target, resolve_route, validate_destination_for_route,
     };
     use icrc_ledger_types::icrc1::account::Account;
@@ -155,6 +220,18 @@ mod tests {
         assert_eq!(ckbtc.route_kind, BridgeRouteKind::CkBtcToBtc);
         assert_eq!(ckbtc.destination_kind, BridgeDestinationKind::BtcAddress);
         assert_eq!(ckbtc.ckerc20_ledger_id, None);
+
+        let sol = resolve_route("SOL", "SOL", "ckSOL").expect("SOL route");
+        assert_eq!(sol.route_kind, BridgeRouteKind::SolanaToIcp);
+        assert_eq!(sol.destination_kind, BridgeDestinationKind::IcpAccount);
+        assert_eq!(sol.evm_token_address, None);
+        assert_eq!(sol.ckerc20_ledger_id, None);
+
+        let cksol = resolve_route("ckSOL", "ICP", "SOL").expect("ckSOL route");
+        assert_eq!(cksol.route_kind, BridgeRouteKind::IcpToSolana);
+        assert_eq!(cksol.destination_kind, BridgeDestinationKind::SolanaAddress);
+        assert_eq!(cksol.evm_token_address, None);
+        assert_eq!(cksol.ckerc20_ledger_id, None);
     }
 
     #[test]
@@ -164,6 +241,8 @@ mod tests {
         assert!(resolve_route("eth", "eth", "cketh").is_some());
         assert!(resolve_route("cketh", "icp", "eth").is_some());
         assert!(resolve_route("CKBTC", "icp", "btc").is_some());
+        assert!(resolve_route("sol", "sol", "cksol").is_some());
+        assert!(resolve_route("cksol", "icp", "sol").is_some());
         assert!(resolve_route("USDT", "ETH", "ckUSDT").is_none());
     }
 
@@ -248,5 +327,34 @@ mod tests {
             }),
         )
         .expect("matching kind must pass");
+    }
+
+    #[test]
+    fn solana_destination_validation_checks_base58_shape() {
+        let route = BridgeRouteSpec {
+            source_asset: "ckSOL",
+            source_chain: "ICP",
+            target_asset: "SOL",
+            destination_kind: BridgeDestinationKind::SolanaAddress,
+            route_kind: BridgeRouteKind::IcpToSolana,
+            exchange_transport: true,
+            evm_token_address: None,
+            ckerc20_ledger_id: None,
+            min_sweep_amount: 0.0,
+        };
+
+        validate_destination_for_route(
+            &route,
+            &BridgeDestination::SolanaAddress("So11111111111111111111111111111111111111112".to_string()),
+        )
+        .expect("valid Solana pubkey must pass");
+
+        let malformed = BridgeDestination::SolanaAddress("not-a-base58-@@".to_string());
+        let err = validate_destination_for_route(&route, &malformed).expect_err("malformed address must fail");
+        assert!(err.contains("invalid destination Solana address"));
+
+        let short = BridgeDestination::SolanaAddress(bs58::encode([1u8, 2u8, 3u8]).into_string());
+        let err = validate_destination_for_route(&route, &short).expect_err("short pubkey must fail");
+        assert!(err.contains("expected 32-byte pubkey"));
     }
 }

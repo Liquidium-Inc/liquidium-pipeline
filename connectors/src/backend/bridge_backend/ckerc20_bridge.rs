@@ -10,17 +10,19 @@ use icrc_ledger_types::{
     icrc1::account::Account,
     icrc2::{allowance::AllowanceArgs, approve::ApproveArgs},
 };
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use super::{
     ckerc20_bridge_utils::{
         destination_to_bytes32, ensure_source_matches_bridge_owner, ensure_source_matches_signer,
-        expect_evm_destination, expect_icp_destination, parse_ckerc20_ledger_id, parse_evm_token_address,
-        parse_source_icp_account, resolve_cketh_route_for_request,
+        expect_evm_destination, expect_icp_destination, minter_withdrawal_id, parse_ckerc20_ledger_id,
+        parse_evm_token_address, parse_source_icp_account, recovered_bridge_id, resolve_cketh_route_for_request,
     },
     types::{
         CkEthMinterInfo, Eip1559TransactionPrice, Eip1559TransactionPriceArg, EvmReceiptStatus, HelperContract,
-        LedgerError, WithdrawErc20Arg, WithdrawErc20Error, WithdrawErc20Ret, WithdrawalArg, WithdrawalRet,
+        LedgerError, WithdrawErc20Arg, WithdrawErc20Error, WithdrawErc20Ret, WithdrawalArg, WithdrawalDetail,
+        WithdrawalRet, WithdrawalSearchParameter,
     },
 };
 use crate::{
@@ -31,7 +33,8 @@ use crate::{
         },
         bridge_backend::{
             BridgeBackend, BridgeFeeBudget, BridgeRequest, BridgeRouteKind, BridgeRouteSpec, BridgeStatus,
-            BridgeSubmission, resolve_cketh_forward_route_by_source, resolve_cketh_reverse_route_by_source,
+            BridgeSubmission, BridgeSubmissionCandidate, resolve_cketh_forward_route_by_source,
+            resolve_cketh_reverse_route_by_source,
         },
         evm_backend::EvmBackendImpl,
         icp_backend::IcpBackend,
@@ -72,6 +75,9 @@ const ETH_FORWARD_GAS_RESERVE_MULTIPLIER: u128 = 2;
 const DEFAULT_CKETH_MIN_WITHDRAWAL_WEI: u128 = 5_000_000_000_000_000;
 pub const FINALIZER_PERMANENT_AMOUNT_FLOOR_PREFIX: &str = "finalizer_permanent_amount_floor";
 pub const BRIDGE_AMOUNT_BELOW_MINIMUM_PREFIX: &str = FINALIZER_PERMANENT_AMOUNT_FLOOR_PREFIX;
+/// Marks a submission the bridge refused only because the wallet is busy. The
+/// finalizer keeps the step pending and retries without spending its budget.
+pub const BRIDGE_SUBMISSION_DEFERRED_PREFIX: &str = "bridge_submission_deferred";
 
 fn eth_forward_gas_reserve_from_price(gas_price_wei: u128, gas_limit: u128) -> U256 {
     let dynamic_reserve = U256::from(gas_price_wei)
@@ -84,6 +90,8 @@ fn eth_forward_gas_reserve_from_price(gas_price_wei: u128, gas_limit: u128) -> U
 #[async_trait]
 pub trait BridgeEvmBackend: Send + Sync {
     fn signer_address(&self) -> Address;
+
+    async fn has_pending_transactions(&self) -> Result<bool, String>;
 
     async fn native_balance_of(&self, owner: Address) -> Result<U256, String>;
     async fn native_tx_gas_reserve(&self, gas_limit: u128) -> Result<U256, String>;
@@ -166,6 +174,10 @@ where
 
     async fn erc20_approve_and_wait(&self, token: Address, spender: Address, amount: U256) -> Result<TxHash, String> {
         self.erc20_approve_and_wait_raw(token, spender, amount).await
+    }
+
+    async fn has_pending_transactions(&self) -> Result<bool, String> {
+        self.has_pending_nonce_gap(self.signer_address()).await
     }
 
     async fn helper_deposit_native(
@@ -262,6 +274,7 @@ where
     pub evm_backend: Arc<E>,
     pub cketh_minter_canister: Principal,
     pub bridge_ic_owner_principal: Principal,
+    forward_submission: tokio::sync::Mutex<()>,
 }
 
 impl<A, B, E> CkErc20BridgeBackend<A, B, E>
@@ -283,6 +296,7 @@ where
             evm_backend,
             cketh_minter_canister,
             bridge_ic_owner_principal,
+            forward_submission: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -502,6 +516,15 @@ where
         route: &BridgeRouteSpec,
         request: &BridgeRequest,
     ) -> Result<BridgeSubmission, String> {
+        // Exact approvals replace the wallet's allowance. Serialise preflight
+        // and submission, then defer while a helper may still consume it in the
+        // mempool. The RPC nonce check also applies after backend reconstruction.
+        let _submission = self.forward_submission.lock().await;
+        if self.evm_backend.has_pending_transactions().await? {
+            return Err(format!(
+                "{BRIDGE_SUBMISSION_DEFERRED_PREFIX}: bridge wallet has pending transactions; retry after inclusion"
+            ));
+        }
         let token_address = parse_evm_token_address(route)?;
 
         let signer = self.evm_backend.signer_address();
@@ -551,6 +574,14 @@ where
                 .map_err(|e| format!("ERC20 approve(helper={helper_address}) failed: {e}"))?;
         }
 
+        let handle = super::mint_events::PendingMintHandle::prepare(
+            self.agent.as_ref(),
+            &self.cketh_minter_canister,
+            amount_base_units,
+            *destination_account,
+            route.target_asset,
+        )
+        .await?;
         let tx_hash = match helper {
             HelperContract::WithSubaccount(address) => self
                 .evm_backend
@@ -572,7 +603,7 @@ where
 
         // Return the submitted tx hash; completion is tracked asynchronously via get_bridge_status.
         Ok(BridgeSubmission {
-            bridge_id: format!("{:#x}", tx_hash),
+            bridge_id: handle.bridge_id(tx_hash)?,
         })
     }
 
@@ -628,6 +659,14 @@ where
             ));
         }
 
+        let handle = super::mint_events::PendingMintHandle::prepare(
+            self.agent.as_ref(),
+            &self.cketh_minter_canister,
+            amount_wei,
+            *destination_account,
+            route.target_asset,
+        )
+        .await?;
         let tx_hash = match helper {
             HelperContract::WithSubaccount(address) => self
                 .evm_backend
@@ -647,7 +686,7 @@ where
         };
 
         Ok(BridgeSubmission {
-            bridge_id: format!("{:#x}", tx_hash),
+            bridge_id: handle.bridge_id(tx_hash)?,
         })
     }
 
@@ -823,6 +862,44 @@ where
             }),
             WithdrawalRet::Err(err) => Err(format!("withdraw_eth error: {:?}", err)),
         }
+    }
+}
+
+impl<A, B, E> CkErc20BridgeBackend<A, B, E>
+where
+    A: PipelineAgent,
+    B: IcpBackend,
+    E: BridgeEvmBackend,
+{
+    /// The reverse route and the account whose withdrawals the minter records.
+    /// Forward routes leave no minter withdrawal, so they return `None`.
+    fn reverse_route_source(request: &BridgeRequest) -> Result<Option<(&'static BridgeRouteSpec, Account)>, String> {
+        let route = resolve_cketh_route_for_request(request)?;
+        if !matches!(
+            route.route_kind,
+            BridgeRouteKind::CkEthErc20Reverse | BridgeRouteKind::CkEthToEth
+        ) {
+            return Ok(None);
+        }
+        Ok(Some((route, parse_source_icp_account(&request.source_address)?)))
+    }
+
+    /// Every withdrawal the minter holds for `sender`. A certified read goes
+    /// through consensus, so a negative answer is safe to act on.
+    async fn minter_withdrawals(&self, sender: &Account, certified: bool) -> Result<Vec<WithdrawalDetail>, String> {
+        let arg = Encode!(&WithdrawalSearchParameter::BySenderAccount(*sender))
+            .map_err(|e| format!("encode withdrawal_status args failed: {e}"))?;
+        let minter = &self.cketh_minter_canister;
+        let result = if certified {
+            self.agent
+                .call_update::<Vec<WithdrawalDetail>>(minter, "withdrawal_status", arg)
+                .await
+        } else {
+            self.agent
+                .call_query::<Vec<WithdrawalDetail>>(minter, "withdrawal_status", arg)
+                .await
+        };
+        result.map_err(|e| format!("withdrawal_status call failed for minter {minter}: {e}"))
     }
 }
 
@@ -1010,12 +1087,77 @@ where
         }
     }
 
+    async fn prepare_submission(&self, request: &BridgeRequest) -> Result<Option<u64>, String> {
+        let Some((_, source_account)) = Self::reverse_route_source(request)? else {
+            return Ok(None);
+        };
+        // A stale cursor only widens the later search, so a plain query is enough.
+        let withdrawals = self.minter_withdrawals(&source_account, false).await?;
+        Ok(Some(withdrawals.iter().map(|w| w.withdrawal_id).max().unwrap_or(0)))
+    }
+
+    async fn find_submissions(
+        &self,
+        request: &BridgeRequest,
+        cursor: u64,
+        claimed_bridge_ids: &[String],
+    ) -> Result<Vec<BridgeSubmissionCandidate>, String> {
+        let Some((route, source_account)) = Self::reverse_route_source(request)? else {
+            return Err(format!(
+                "route {}@{} -> {} leaves no minter withdrawal record to look up",
+                request.asset, request.source_chain, request.target_asset
+            ));
+        };
+        let decimals = match route.route_kind {
+            BridgeRouteKind::CkEthToEth => ETH_DECIMALS,
+            _ => {
+                let ledger = parse_ckerc20_ledger_id(route)?;
+                icrc1_decimals_with_context(self.icp_backend.as_ref(), ledger, "ckerc20 bridge").await?
+            }
+        };
+        let amount_native = amount_to_nat_units_strict(request.amount, decimals)?;
+        let destination = expect_evm_destination(route, &request.destination)?.to_string();
+        let claimed: HashSet<u64> = claimed_bridge_ids
+            .iter()
+            .filter_map(|id| minter_withdrawal_id(id))
+            .collect();
+        let subaccount = source_account.subaccount.as_ref().map(|bytes| bytes.as_slice());
+
+        let mut candidates: Vec<BridgeSubmissionCandidate> = self
+            .minter_withdrawals(&source_account, true)
+            .await?
+            .into_iter()
+            .filter(|w| {
+                w.withdrawal_id > cursor
+                    && !claimed.contains(&w.withdrawal_id)
+                    && w.from == source_account.owner
+                    && w.from_subaccount.as_deref() == subaccount
+                    && w.token_symbol.eq_ignore_ascii_case(route.source_asset)
+                    && w.withdrawal_amount == amount_native
+                    && w.recipient_address.eq_ignore_ascii_case(&destination)
+            })
+            .map(|w| BridgeSubmissionCandidate {
+                bridge_id: recovered_bridge_id(route.route_kind, w.withdrawal_id),
+                sequence: w.withdrawal_id,
+            })
+            .collect();
+        candidates.sort_by_key(|candidate| candidate.sequence);
+        Ok(candidates)
+    }
+
     async fn get_bridge_status(&self, bridge_id: &str) -> Result<BridgeStatus, String> {
         if bridge_id.starts_with("ic-withdraw:") || bridge_id.starts_with("ic-withdraw-eth:") {
+            // The reverse-route caller separately requires the exchange deposit
+            // credit before trading. This legacy status releases that polling
+            // phase; it is not evidence of an Ethereum payout or destination mint.
             return Ok(BridgeStatus::Completed);
         }
 
-        let tx_hash = bridge_id
+        // New handles persist the audit-log boundary taken before submission.
+        // Older WALs contain only a hash and must scan from genesis; never treat
+        // those receipts as completed just because their helper call succeeded.
+        let (event_start, transaction_hash, expectation) = super::mint_events::parse_bridge_id(bridge_id)?;
+        let tx_hash = transaction_hash
             .parse::<TxHash>()
             .map_err(|e| format!("invalid bridge id '{}': expected EVM tx hash: {e}", bridge_id))?;
 
@@ -1030,7 +1172,18 @@ where
         };
 
         if receipt.success {
-            return Ok(BridgeStatus::Completed);
+            let status = super::mint_events::status(
+                self.agent.as_ref(),
+                &self.cketh_minter_canister,
+                event_start,
+                transaction_hash,
+            ).await?;
+            if let BridgeStatus::Minted(receipt) = &status {
+                if expectation.as_ref().is_some_and(|expected| !expected.matches(receipt)) {
+                    return Err("mint evidence does not match the submitted amount, token and destination".into());
+                }
+            }
+            return Ok(status);
         }
 
         Ok(BridgeStatus::Failed {

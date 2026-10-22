@@ -3,7 +3,7 @@ use std::{collections::HashSet, sync::Arc};
 use futures::future::join_all;
 
 use crate::{
-    finalizers::multi_venue::{MultiVenueAdapter, VenuePlanningContext, VenueRoutePreview},
+    finalizers::multi_venue::{MultiVenueAdapter, VenueAmountError, VenuePlanningContext, VenueRoutePreview},
     swappers::model::SwapRequest,
 };
 
@@ -70,10 +70,7 @@ impl VenueRegistry {
             let venue_id = adapter.venue_id().to_string();
             let request = request_for(&venue_id);
             async move {
-                let outcome = match adapter.preview(context, &request).await {
-                    Ok(preview) => VenuePreviewOutcome::Quoted(preview),
-                    Err(error) => VenuePreviewOutcome::Unavailable(error),
-                };
+                let outcome = preview_with_amount_check(adapter.as_ref(), context, &request).await;
                 VenuePreview {
                     venue_id,
                     request,
@@ -112,10 +109,7 @@ impl VenueRegistry {
             let venue_id = adapter.venue_id().to_string();
             let request = request_for(&venue_id);
             async move {
-                let outcome = match adapter.preview(context, &request).await {
-                    Ok(preview) => VenuePreviewOutcome::Quoted(preview),
-                    Err(error) => VenuePreviewOutcome::Unavailable(error),
-                };
+                let outcome = preview_with_amount_check(adapter.as_ref(), context, &request).await;
                 VenuePreview {
                     venue_id,
                     request,
@@ -127,6 +121,22 @@ impl VenueRegistry {
         Ok(VenueQuoteBook {
             previews: join_all(previews).await,
         })
+    }
+}
+
+async fn preview_with_amount_check(
+    adapter: &dyn MultiVenueAdapter,
+    context: &VenuePlanningContext,
+    request: &SwapRequest,
+) -> VenuePreviewOutcome {
+    match adapter.check_amount(request).await {
+        Err(VenueAmountError::BelowMinimum(reason)) => return VenuePreviewOutcome::BelowMinimum(reason),
+        Err(VenueAmountError::Unavailable(error)) => return VenuePreviewOutcome::Unavailable(error),
+        Ok(()) => {}
+    }
+    match adapter.preview(context, request).await {
+        Ok(preview) => VenuePreviewOutcome::Quoted(preview),
+        Err(error) => VenuePreviewOutcome::Unavailable(error),
     }
 }
 
@@ -160,6 +170,8 @@ pub(in crate::finalizers::multi_venue) enum VenuePreviewOutcome {
     Quoted(VenueRoutePreview),
     // The adapter could not produce a response, for example during an outage.
     Unavailable(String),
+    // A provider amount limit prevents this allocation from being executed.
+    BelowMinimum(String),
     // A response was returned but failed validation and cannot be allocated.
     Invalid(String),
 }

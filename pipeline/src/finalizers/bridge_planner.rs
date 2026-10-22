@@ -4,8 +4,7 @@ use alloy::primitives::Address as EvmAddress;
 use candid::Principal;
 use icrc_ledger_types::icrc1::account::Account;
 use liquidium_pipeline_connectors::backend::bridge_backend::{
-    BridgeDestination, BridgeDestinationKind, resolve_cketh_forward_route_by_target,
-    resolve_cketh_reverse_route_by_source,
+    BridgeDestination, BridgeDestinationKind, resolve_forward_route_by_target, resolve_reverse_route_by_source,
 };
 use liquidium_pipeline_core::{account::model::ChainAccount, tokens::chain_token::ChainToken};
 
@@ -24,6 +23,16 @@ pub(crate) struct BridgePlan {
     pub withdraw: BridgeTransportPlan,
 }
 
+/// Maps a bridge route destination kind to the CEX network label used by backends.
+pub(crate) fn cex_network_from_destination_kind(kind: BridgeDestinationKind) -> String {
+    match kind {
+        BridgeDestinationKind::IcpAccount => "ICP".to_string(),
+        BridgeDestinationKind::EvmAddress => "ETH".to_string(),
+        BridgeDestinationKind::BtcAddress => "BTC".to_string(),
+        BridgeDestinationKind::SolanaAddress => "SOL".to_string(),
+    }
+}
+
 pub(crate) trait BridgePlanner {
     /// Returns whether bridge-aware planning should be enabled for this finalizer instance.
     fn bridge_enabled(&self) -> bool;
@@ -38,15 +47,6 @@ pub(crate) trait BridgePlanner {
         }
     }
 
-    /// Maps a bridge route destination kind to the CEX network label used by backends.
-    fn cex_network_from_destination_kind(kind: BridgeDestinationKind) -> String {
-        match kind {
-            BridgeDestinationKind::IcpAccount => "ICP".to_string(),
-            BridgeDestinationKind::EvmAddress => "ETH".to_string(),
-            BridgeDestinationKind::BtcAddress => "BTC".to_string(),
-        }
-    }
-
     /// Resolves per-leg transport plans (deposit and withdraw), including bridge symbol/network translation.
     fn resolve_bridge_plan_for_assets(&self, deposit_asset: &ChainToken, withdraw_asset: &ChainToken) -> BridgePlan {
         let mut deposit = Self::plan_from_direct_asset(deposit_asset);
@@ -56,19 +56,18 @@ pub(crate) trait BridgePlanner {
             return BridgePlan { deposit, withdraw };
         }
 
-        // Deposit-side translation: ckERC20 reverse route (e.g. ckUSDC@ICP -> USDC@ETH).
-        if let Some(route) = resolve_cketh_reverse_route_by_source(&deposit.cex_asset, &deposit.cex_network) {
+        // Deposit side: the ICP asset leaves through its reverse route
+        // (ckUSDC@ICP -> USDC@ETH, ckSOL@ICP -> SOL@SOL).
+        if let Some(route) = resolve_reverse_route_by_source(&deposit.cex_asset, &deposit.cex_network) {
             deposit = BridgeTransportPlan {
                 cex_asset: route.target_asset.to_string(),
-                cex_network: Self::cex_network_from_destination_kind(route.destination_kind),
+                cex_network: cex_network_from_destination_kind(route.destination_kind),
                 bridge_required: true,
             };
         }
 
-        // Withdraw-side translation: ckERC20 forward route (e.g. USDC@ETH -> ckUSDC@ICP).
-        if let Some(route) = resolve_cketh_forward_route_by_target(&withdraw.cex_asset)
-            && route.destination_kind == BridgeDestinationKind::IcpAccount
-        {
+        // Withdraw side: the exchange delivers the forward route's source asset.
+        if let Some(route) = resolve_forward_route_by_target(&withdraw.cex_asset) {
             withdraw = BridgeTransportPlan {
                 cex_asset: route.source_asset.to_string(),
                 cex_network: route.source_chain.to_string(),
@@ -95,6 +94,11 @@ pub(crate) trait BridgePlanner {
                 .map(BridgeDestination::IcpAccount)
                 .map_err(|e| format!("invalid CEX deposit ICP destination '{}': {e}", cex_address)),
             BridgeDestinationKind::BtcAddress => Ok(BridgeDestination::BtcAddress(cex_address.to_string())),
+            BridgeDestinationKind::SolanaAddress => {
+                let address = solana_sdk::pubkey::Pubkey::from_str(cex_address)
+                    .map_err(|error| format!("invalid CEX deposit Solana address: {error}"))?;
+                Ok(BridgeDestination::SolanaAddress(address.to_string()))
+            }
         }
     }
 
@@ -124,6 +128,11 @@ pub(crate) trait BridgePlanner {
                 Ok(BridgeDestination::EvmAddress(evm))
             }
             BridgeDestinationKind::BtcAddress => Ok(BridgeDestination::BtcAddress(direct_withdraw_address.to_string())),
+            BridgeDestinationKind::SolanaAddress => {
+                let address = solana_sdk::pubkey::Pubkey::from_str(direct_withdraw_address)
+                    .map_err(|error| format!("invalid final Solana address: {error}"))?;
+                Ok(BridgeDestination::SolanaAddress(address.to_string()))
+            }
         }
     }
 

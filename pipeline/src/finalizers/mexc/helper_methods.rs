@@ -267,6 +267,10 @@ where
                 continue;
             };
 
+            if (base == "SOL" || quote == "SOL") && !(base == "SOL" && quote == "USDT") {
+                continue;
+            }
+
             if base == from_symbol {
                 out.push((
                     quote.clone(),
@@ -477,19 +481,43 @@ where
             return Ok(vec![]);
         }
 
+        if deposit == "SOL" {
+            let mut legs = vec![TradeLeg {
+                market: "SOL_USDT".into(),
+                side: "sell".into(),
+            }];
+            legs.extend(self.resolve_standard_trade_legs("USDT", &withdraw).await?);
+            return Ok(legs);
+        }
+        if withdraw == "SOL" {
+            let mut legs = self.resolve_standard_trade_legs(&deposit, "USDT").await?;
+            legs.push(TradeLeg {
+                market: "SOL_USDT".into(),
+                side: "buy".into(),
+            });
+            return Ok(legs);
+        }
+        self.resolve_standard_trade_legs(&deposit, &withdraw).await
+    }
+
+    async fn resolve_standard_trade_legs(&self, deposit: &str, withdraw: &str) -> Result<Vec<TradeLeg>, String> {
+        if deposit == withdraw {
+            return Ok(vec![]);
+        }
+
         // 1) High-priority compatibility override for legacy ck routes.
-        if let Some(legs) = mexc_special_trade_legs(&deposit, &withdraw) {
+        if let Some(legs) = mexc_special_trade_legs(deposit, withdraw) {
             return Ok(legs);
         }
 
         // 2) Probe direct tradable market first.
-        let direct_err = match self.resolve_direct_leg(&deposit, &withdraw).await {
+        let direct_err = match self.resolve_direct_leg(deposit, withdraw).await {
             Ok(direct_leg) => return Ok(vec![direct_leg]),
             Err(err) => err,
         };
 
         // 3) Fallback to configured graph hops.
-        self.resolve_hop_route(&deposit, &withdraw)
+        self.resolve_hop_route(deposit, withdraw)
             .await
             .map_err(|hop_err| format!("{}; {}", direct_err, hop_err))
     }
@@ -1028,8 +1056,8 @@ where
     /// Detailed algorithm:
     /// - `preview_trade_slice` proposes the next chunk from live orderbook depth:
     ///   soft target (`target_bps`) first, hard-cap fallback second.
-    /// - `maybe_mark_trade_dust` stops execution when chunk/remainder notional is
-    ///   below `cex_min_exec_usd` to avoid low-quality micro-fills.
+    /// - `maybe_mark_trade_dust` stops execution when, after the leg's first fill,
+    ///   the chunk and remainder notional are both below `cex_min_exec_usd`.
     /// - each accepted chunk is sent as a market order (`execute_swap`).
     /// - realized `exec_price` is derived from actual fills and compared to preview
     ///   midpoint to compute realized slippage in bps.
@@ -1081,9 +1109,8 @@ where
                 }
             };
 
-            // Skip very small residuals below min execution notional to avoid bad fills / fees.
             if self
-                .maybe_mark_trade_dust(state, leg, preview.chunk_in, remaining_in)
+                .maybe_mark_trade_dust(state, leg, total_out, preview.chunk_in, remaining_in)
                 .await?
             {
                 state.trade.trade_unexecutable_residual_in = Some(remaining_in);
@@ -1336,13 +1363,21 @@ where
     }
 
     /// Skip tiny residual chunks that are below configured minimum execution notional.
+    ///
+    /// The floor trims leftovers after a fill. It never discards a whole
+    /// committed leg whose price fell during deposit settlement; the exchange's
+    /// own lot and minimum checks still apply to that first fill.
     pub(super) async fn maybe_mark_trade_dust(
         &self,
         state: &mut CexState,
         leg: &TradeLeg,
+        leg_total_out: f64,
         chunk_in: f64,
         remaining_in: f64,
     ) -> Result<bool, String> {
+        if leg_total_out <= 0.0 {
+            return Ok(false);
+        }
         let chunk_usd = self.input_slice_usd(&leg.market, &leg.side, chunk_in).await?;
         if chunk_usd >= self.cex_min_exec_usd {
             return Ok(false);

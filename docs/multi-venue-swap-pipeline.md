@@ -319,6 +319,14 @@ Restart state is loaded in this order:
 
 Legacy in-progress rows remain on their legacy execution path and are not upgraded in flight.
 
+Multi-venue MEXC deposit polling may resume after a restart when the transfer ID
+is saved and, for bridged deposits, the bridge submission ID is also saved.
+Confirmation only advances to the trade phase; an order still needs a fresh
+persisted submission gate. A missing bridge ID, including a fee-funding wait,
+remains subject to operator reconciliation if its submission intent is ambiguous.
+Legacy transport plans are resolved before deciding whether a step only polls.
+Already parked rows still require explicit operator recovery.
+
 ## Venue Isolation
 
 Each persisted leg is an independent state machine:
