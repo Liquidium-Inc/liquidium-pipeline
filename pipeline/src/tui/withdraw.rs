@@ -674,6 +674,17 @@ mod tests {
     }
 
     #[test]
+    fn mexc_deposit_lookup_maps_cksol_to_sol_network() {
+        let asset = AssetId {
+            chain: "icp".to_string(),
+            address: "cksol-ledger".to_string(),
+            symbol: "ckSOL".to_string(),
+        };
+
+        assert_eq!(mexc_deposit_lookup_for_asset(&asset), ("SOL".to_string(), "SOL".to_string()));
+    }
+
+    #[test]
     fn mexc_deposit_lookup_keeps_direct_assets_unchanged() {
         let asset = AssetId {
             chain: "icp".to_string(),
