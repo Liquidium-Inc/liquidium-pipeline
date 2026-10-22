@@ -66,6 +66,14 @@ pub struct BridgeSweepRoute {
     pub min_sweep_amount: f64,
 }
 
+/// A provider record that may belong to an attempt whose handle was lost.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BridgeSubmissionCandidate {
+    pub bridge_id: String,
+    /// Provider-side monotonic position. Attempt cursors compare against it.
+    pub sequence: u64,
+}
+
 /// A normalized request for moving assets between chains/assets.
 #[derive(Debug, Clone, PartialEq)]
 pub struct BridgeRequest {
@@ -164,6 +172,27 @@ pub trait BridgeBackend: Send + Sync {
 
     /// Polls current status for a previously submitted bridge operation.
     async fn get_bridge_status(&self, bridge_id: &str) -> Result<BridgeStatus, String>;
+
+    /// Reads the provider's history position before a submission, so a handle
+    /// lost between the call and its persistence can be found again. `None`
+    /// means this provider cannot look up lost submissions.
+    async fn prepare_submission(&self, request: &BridgeRequest) -> Result<Option<u64>, String> {
+        let _ = request;
+        Ok(None)
+    }
+
+    /// Returns provider records after `cursor` that match the request exactly
+    /// and are not in `claimed_bridge_ids`. The read must be certified, because
+    /// the caller may submit again when nothing is found.
+    async fn find_submissions(
+        &self,
+        request: &BridgeRequest,
+        cursor: u64,
+        claimed_bridge_ids: &[String],
+    ) -> Result<Vec<BridgeSubmissionCandidate>, String> {
+        let _ = (request, cursor, claimed_bridge_ids);
+        Err("submission lookup is not supported by this bridge backend".to_string())
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -220,6 +249,29 @@ pub(super) struct WithdrawalArg {
     pub amount: Nat,
     pub recipient: String,
     pub from_subaccount: Option<Vec<u8>>,
+}
+
+// Variant names are the minter's candid tags.
+#[allow(clippy::enum_variant_names)]
+#[derive(CandidType, Deserialize, Clone, Debug)]
+pub(super) enum WithdrawalSearchParameter {
+    ByRecipient(String),
+    BySenderAccount(Account),
+    ByWithdrawalId(u64),
+}
+
+/// One minter withdrawal as `withdrawal_status` reports it. The status variant
+/// is kept opaque: the record proves the burn happened whatever its state.
+#[derive(CandidType, Deserialize, Clone, Debug)]
+pub(super) struct WithdrawalDetail {
+    pub token_symbol: String,
+    pub withdrawal_amount: Nat,
+    pub max_transaction_fee: Option<Nat>,
+    pub withdrawal_id: u64,
+    pub from: Principal,
+    pub from_subaccount: Option<Vec<u8>>,
+    pub recipient_address: String,
+    pub status: candid::Reserved,
 }
 
 #[derive(CandidType, Deserialize, Clone, Debug)]

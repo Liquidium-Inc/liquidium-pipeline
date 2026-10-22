@@ -10,17 +10,19 @@ use icrc_ledger_types::{
     icrc1::account::Account,
     icrc2::{allowance::AllowanceArgs, approve::ApproveArgs},
 };
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use super::{
     ckerc20_bridge_utils::{
         destination_to_bytes32, ensure_source_matches_bridge_owner, ensure_source_matches_signer,
-        expect_evm_destination, expect_icp_destination, parse_ckerc20_ledger_id, parse_evm_token_address,
-        parse_source_icp_account, resolve_cketh_route_for_request,
+        expect_evm_destination, expect_icp_destination, minter_withdrawal_id, parse_ckerc20_ledger_id,
+        parse_evm_token_address, parse_source_icp_account, recovered_bridge_id, resolve_cketh_route_for_request,
     },
     types::{
         CkEthMinterInfo, Eip1559TransactionPrice, Eip1559TransactionPriceArg, EvmReceiptStatus, HelperContract,
-        LedgerError, WithdrawErc20Arg, WithdrawErc20Error, WithdrawErc20Ret, WithdrawalArg, WithdrawalRet,
+        LedgerError, WithdrawErc20Arg, WithdrawErc20Error, WithdrawErc20Ret, WithdrawalArg, WithdrawalDetail,
+        WithdrawalRet, WithdrawalSearchParameter,
     },
 };
 use crate::{
@@ -31,7 +33,8 @@ use crate::{
         },
         bridge_backend::{
             BridgeBackend, BridgeFeeBudget, BridgeRequest, BridgeRouteKind, BridgeRouteSpec, BridgeStatus,
-            BridgeSubmission, resolve_cketh_forward_route_by_source, resolve_cketh_reverse_route_by_source,
+            BridgeSubmission, BridgeSubmissionCandidate, resolve_cketh_forward_route_by_source,
+            resolve_cketh_reverse_route_by_source,
         },
         evm_backend::EvmBackendImpl,
         icp_backend::IcpBackend,
@@ -862,6 +865,44 @@ where
     }
 }
 
+impl<A, B, E> CkErc20BridgeBackend<A, B, E>
+where
+    A: PipelineAgent,
+    B: IcpBackend,
+    E: BridgeEvmBackend,
+{
+    /// The reverse route and the account whose withdrawals the minter records.
+    /// Forward routes leave no minter withdrawal, so they return `None`.
+    fn reverse_route_source(request: &BridgeRequest) -> Result<Option<(&'static BridgeRouteSpec, Account)>, String> {
+        let route = resolve_cketh_route_for_request(request)?;
+        if !matches!(
+            route.route_kind,
+            BridgeRouteKind::CkEthErc20Reverse | BridgeRouteKind::CkEthToEth
+        ) {
+            return Ok(None);
+        }
+        Ok(Some((route, parse_source_icp_account(&request.source_address)?)))
+    }
+
+    /// Every withdrawal the minter holds for `sender`. A certified read goes
+    /// through consensus, so a negative answer is safe to act on.
+    async fn minter_withdrawals(&self, sender: &Account, certified: bool) -> Result<Vec<WithdrawalDetail>, String> {
+        let arg = Encode!(&WithdrawalSearchParameter::BySenderAccount(*sender))
+            .map_err(|e| format!("encode withdrawal_status args failed: {e}"))?;
+        let minter = &self.cketh_minter_canister;
+        let result = if certified {
+            self.agent
+                .call_update::<Vec<WithdrawalDetail>>(minter, "withdrawal_status", arg)
+                .await
+        } else {
+            self.agent
+                .call_query::<Vec<WithdrawalDetail>>(minter, "withdrawal_status", arg)
+                .await
+        };
+        result.map_err(|e| format!("withdrawal_status call failed for minter {minter}: {e}"))
+    }
+}
+
 #[async_trait]
 impl<A, B, E> BridgeBackend for CkErc20BridgeBackend<A, B, E>
 where
@@ -1044,6 +1085,64 @@ where
                 route.source_asset, route.source_chain, route.target_asset
             )),
         }
+    }
+
+    async fn prepare_submission(&self, request: &BridgeRequest) -> Result<Option<u64>, String> {
+        let Some((_, source_account)) = Self::reverse_route_source(request)? else {
+            return Ok(None);
+        };
+        // A stale cursor only widens the later search, so a plain query is enough.
+        let withdrawals = self.minter_withdrawals(&source_account, false).await?;
+        Ok(Some(withdrawals.iter().map(|w| w.withdrawal_id).max().unwrap_or(0)))
+    }
+
+    async fn find_submissions(
+        &self,
+        request: &BridgeRequest,
+        cursor: u64,
+        claimed_bridge_ids: &[String],
+    ) -> Result<Vec<BridgeSubmissionCandidate>, String> {
+        let Some((route, source_account)) = Self::reverse_route_source(request)? else {
+            return Err(format!(
+                "route {}@{} -> {} leaves no minter withdrawal record to look up",
+                request.asset, request.source_chain, request.target_asset
+            ));
+        };
+        let decimals = match route.route_kind {
+            BridgeRouteKind::CkEthToEth => ETH_DECIMALS,
+            _ => {
+                let ledger = parse_ckerc20_ledger_id(route)?;
+                icrc1_decimals_with_context(self.icp_backend.as_ref(), ledger, "ckerc20 bridge").await?
+            }
+        };
+        let amount_native = amount_to_nat_units_strict(request.amount, decimals)?;
+        let destination = expect_evm_destination(route, &request.destination)?.to_string();
+        let claimed: HashSet<u64> = claimed_bridge_ids
+            .iter()
+            .filter_map(|id| minter_withdrawal_id(id))
+            .collect();
+        let subaccount = source_account.subaccount.as_ref().map(|bytes| bytes.as_slice());
+
+        let mut candidates: Vec<BridgeSubmissionCandidate> = self
+            .minter_withdrawals(&source_account, true)
+            .await?
+            .into_iter()
+            .filter(|w| {
+                w.withdrawal_id > cursor
+                    && !claimed.contains(&w.withdrawal_id)
+                    && w.from == source_account.owner
+                    && w.from_subaccount.as_deref() == subaccount
+                    && w.token_symbol.eq_ignore_ascii_case(route.source_asset)
+                    && w.withdrawal_amount == amount_native
+                    && w.recipient_address.eq_ignore_ascii_case(&destination)
+            })
+            .map(|w| BridgeSubmissionCandidate {
+                bridge_id: recovered_bridge_id(route.route_kind, w.withdrawal_id),
+                sequence: w.withdrawal_id,
+            })
+            .collect();
+        candidates.sort_by_key(|candidate| candidate.sequence);
+        Ok(candidates)
     }
 
     async fn get_bridge_status(&self, bridge_id: &str) -> Result<BridgeStatus, String> {

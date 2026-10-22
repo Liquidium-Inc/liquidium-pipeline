@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
-use super::{BridgeBackend, BridgeFeeBudget, BridgeRequest, BridgeStatus, BridgeSubmission};
+use super::{BridgeBackend, BridgeFeeBudget, BridgeRequest, BridgeStatus, BridgeSubmission, BridgeSubmissionCandidate};
 
 /// Keeps provider-specific submission handles with the backend that issued them.
 pub struct RoutedBridgeBackend {
@@ -69,6 +69,23 @@ impl BridgeBackend for RoutedBridgeBackend {
 
     async fn submit_bridge(&self, request: BridgeRequest) -> Result<BridgeSubmission, String> {
         self.source(&request.asset, &request.source_chain).submit_bridge(request).await
+    }
+
+    async fn prepare_submission(&self, request: &BridgeRequest) -> Result<Option<u64>, String> {
+        self.source(&request.asset, &request.source_chain)
+            .prepare_submission(request)
+            .await
+    }
+
+    async fn find_submissions(
+        &self,
+        request: &BridgeRequest,
+        cursor: u64,
+        claimed_bridge_ids: &[String],
+    ) -> Result<Vec<BridgeSubmissionCandidate>, String> {
+        self.source(&request.asset, &request.source_chain)
+            .find_submissions(request, cursor, claimed_bridge_ids)
+            .await
     }
 
     async fn get_bridge_status(&self, bridge_id: &str) -> Result<BridgeStatus, String> {
