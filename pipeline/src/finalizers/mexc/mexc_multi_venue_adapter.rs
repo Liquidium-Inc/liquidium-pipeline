@@ -1,5 +1,7 @@
 use async_trait::async_trait;
-use liquidium_pipeline_connectors::backend::bridge_backend::FINALIZER_PERMANENT_AMOUNT_FLOOR_PREFIX;
+use liquidium_pipeline_connectors::backend::bridge_backend::{
+    FINALIZER_PERMANENT_AMOUNT_FLOOR_PREFIX, BridgeRouteKind, resolve_route,
+};
 use liquidium_pipeline_connectors::backend::cex_backend::{CexBackend, CexBackendError};
 use log::{info, warn};
 use serde::{Deserialize, Serialize};
@@ -10,7 +12,8 @@ use crate::{
         bridge_planner::BridgePlanner,
         cex_finalizer::{BRIDGE_SUBMISSION_AMBIGUOUS_PREFIX, CexFinalizerLogic, CexState, CexStep},
         multi_venue::{
-            MultiVenueAdapter, VenueLegCheckpoint, VenueLegProgress, VenuePlanningContext, VenueRoutePreview,
+            MultiVenueAdapter, VenueAmountError, VenueLegCheckpoint, VenueLegProgress, VenuePlanningContext,
+            VenueRoutePreview,
         },
     },
     persistance::{VenueExecutionState, VenueLegState, VenueLegStatus},
@@ -297,6 +300,43 @@ where
             return Err("token registry is required for amount-scoped MEXC previews".to_string());
         }
         Ok(())
+    }
+
+    async fn check_amount(&self, request: &SwapRequest) -> Result<(), VenueAmountError> {
+        let state = self
+            .prepare_swap_request("amount-check", request)
+            .map_err(VenueAmountError::Unavailable)?;
+        let Some(route) = resolve_route(
+            &state.deposit.deposit_asset.symbol(),
+            &state.deposit.deposit_asset.chain(),
+            &<Self as BridgePlanner>::planned_deposit_asset(&state),
+        ) else {
+            return Ok(());
+        };
+        // Only these minters enforce a withdrawal minimum; ckERC20 does not.
+        if !matches!(
+            route.route_kind,
+            BridgeRouteKind::CkEthToEth | BridgeRouteKind::IcpToSolana
+        ) {
+            return Ok(());
+        }
+        let bridge = self
+            .bridge
+            .as_ref()
+            .ok_or_else(|| VenueAmountError::Unavailable("bridge runtime is missing".to_string()))?;
+        let sizing = Self::size_bridged_deposit(bridge, route, &state.deposit.deposit_asset, &state.size_in)
+            .await
+            .map_err(VenueAmountError::Unavailable)?;
+        match Self::bridge_minimum_shortfall(bridge, route, &sizing.bridge_amount)
+            .await
+            .map_err(VenueAmountError::Unavailable)?
+        {
+            Some((amount, minimum)) => Err(VenueAmountError::BelowMinimum(format!(
+                "{} -> {} bridge amount ({amount}) after fee reserves is below minimum ({minimum})",
+                route.source_asset, route.target_asset
+            ))),
+            None => Ok(()),
+        }
     }
 
     async fn preview(

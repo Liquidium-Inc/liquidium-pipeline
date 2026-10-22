@@ -489,7 +489,9 @@ impl IcpswapFirstPlanner {
                 ))
             }
             VenuePreviewOutcome::Quoted(_) => self.plan_split_or_fallback(input, quoted_at).await,
-            VenuePreviewOutcome::Unavailable(icpswap_error) | VenuePreviewOutcome::Invalid(icpswap_error) => {
+            VenuePreviewOutcome::Unavailable(icpswap_error)
+            | VenuePreviewOutcome::Invalid(icpswap_error)
+            | VenuePreviewOutcome::BelowMinimum(icpswap_error) => {
                 let fallthrough_reason = format!("ICPSwap quote rejected ({icpswap_error})");
                 let overflow_quotes = self
                     .preview_overflow(input, input.total_pay.value.clone())
@@ -674,7 +676,7 @@ impl IcpswapFirstPlanner {
             let summary = self.overflow_failure_summary(&quotes);
             match fallthrough_reason {
                 Some(reason) => IcpswapFirstPlannerError::NoViableRoute(format!("{reason}; {summary}")),
-                None if self.every_overflow_venue_quoted(&quotes) => {
+                None if self.every_overflow_venue_responded(&quotes) => {
                     IcpswapFirstPlannerError::BelowVenueMinimum(summary)
                 }
                 None => IcpswapFirstPlannerError::NoViableRoute(summary),
@@ -687,12 +689,12 @@ impl IcpswapFirstPlanner {
     // "all venues are healthy and this amount is simply too small" from "a
     // venue is down", which is not a permanent property of the amount. The
     // pre-quote check in `preview_overflow` never reaches here.
-    fn every_overflow_venue_quoted(&self, quotes: &VenueQuoteBook) -> bool {
+    fn every_overflow_venue_responded(&self, quotes: &VenueQuoteBook) -> bool {
         !self.overflow_venue_ids.is_empty()
             && self.overflow_venue_ids.iter().all(|venue_id| {
                 matches!(
                     quotes.get(venue_id).map(|venue| &venue.outcome),
-                    Some(VenuePreviewOutcome::Quoted(_))
+                    Some(VenuePreviewOutcome::Quoted(_) | VenuePreviewOutcome::BelowMinimum(_))
                 )
             })
     }
@@ -966,7 +968,9 @@ impl IcpswapFirstPlanner {
                 VenuePreviewOutcome::Quoted(preview) => self
                     .validate_venue_preview(input, &venue.venue_id, &venue.request, preview)
                     .err(),
-                VenuePreviewOutcome::Unavailable(_) | VenuePreviewOutcome::Invalid(_) => None,
+                VenuePreviewOutcome::Unavailable(_)
+                | VenuePreviewOutcome::Invalid(_)
+                | VenuePreviewOutcome::BelowMinimum(_) => None,
             };
             if let Some(error) = validation_error {
                 venue.outcome = VenuePreviewOutcome::Invalid(error.to_string());
@@ -1147,6 +1151,9 @@ impl IcpswapFirstPlanner {
                 }
                 Some(VenuePreviewOutcome::Invalid(error)) => {
                     format!("{} quote rejected ({error})", venue_id.to_uppercase())
+                }
+                Some(VenuePreviewOutcome::BelowMinimum(reason)) => {
+                    format!("{} amount below minimum ({reason})", venue_id.to_uppercase())
                 }
                 Some(VenuePreviewOutcome::Quoted(_)) => {
                     format!("{} amount is below its minimum", venue_id.to_uppercase())

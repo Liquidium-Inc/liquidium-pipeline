@@ -430,6 +430,135 @@ fn deposit_poll_finalizer(
     finalizer().with_bridge_runtime(crate::finalizers::bridge_runtime::BridgeRuntime::for_tests(Arc::new(bridge)))
 }
 
+fn amount_check_request(token: ChainToken, raw: u64) -> SwapRequest {
+    SwapRequest {
+        pay_asset: token.asset_id(),
+        pay_amount: ChainTokenAmount::from_raw(token, Nat::from(raw)),
+        ..request(1)
+    }
+}
+
+fn cketh_amount_check_request(raw: u64) -> SwapRequest {
+    let token = ChainToken::Icp {
+        ledger: Principal::from_text("ss2fx-dyaaa-aaaar-qacoq-cai").unwrap(),
+        symbol: "ckETH".into(),
+        decimals: 18,
+        fee: Nat::from(2_000_000_000_000u64),
+    };
+    amount_check_request(token, raw)
+}
+
+#[tokio::test]
+async fn cksol_planning_amount_check_uses_the_minter_minimum_after_the_approval_reserve() {
+    use liquidium_pipeline_connectors::backend::bridge_backend::{BridgeFeeBudget, MockBridgeBackend};
+
+    let cksol = ChainToken::Icp {
+        ledger: Principal::from_text("ls5lp-lqaaa-aaaar-qb5oa-cai").unwrap(),
+        symbol: "ckSOL".into(),
+        decimals: 9,
+        fee: Nat::from(500u64),
+    };
+    // 7 ledger fees of 500 come off the transfer, then a 1_000 lamport reserve.
+    for (raw, below_minimum) in [
+        (9_000_000, true),
+        (10_004_000, true),
+        (10_004_500, false),
+        (10_005_000, false),
+    ] {
+        let mut bridge = MockBridgeBackend::new();
+        bridge
+            .expect_get_fee_budget()
+            .times(1)
+            .returning(|asset, chain, target| {
+                assert_eq!((asset, chain, target), ("ckSOL", "ICP", "SOL"));
+                Ok(BridgeFeeBudget {
+                    source_fee_budget: 0.000_001,
+                    ..BridgeFeeBudget::default()
+                })
+            });
+        bridge
+            .expect_get_minimum_bridge_amount()
+            .times(1)
+            .returning(|_, _, _| Ok(0.01));
+        bridge.expect_submit_bridge().times(0);
+        let finalizer = deposit_poll_finalizer(bridge);
+
+        let result = finalizer.check_amount(&amount_check_request(cksol.clone(), raw)).await;
+
+        if below_minimum {
+            let Err(VenueAmountError::BelowMinimum(reason)) = result else {
+                panic!("expected a below-minimum decision for {raw}, got {result:?}");
+            };
+            assert!(reason.contains("ckSOL -> SOL"), "{reason}");
+            assert!(reason.contains("0.01"), "{reason}");
+        } else {
+            result.unwrap_or_else(|error| panic!("{raw} lamports must pass: {error}"));
+        }
+    }
+}
+
+#[tokio::test]
+async fn cketh_planning_amount_check_reserves_fees_before_comparing_the_bridge_minimum() {
+    use liquidium_pipeline_connectors::backend::bridge_backend::{BridgeFeeBudget, MockBridgeBackend};
+
+    for (raw, below_minimum) in [
+        (4_000_000_000_000_000, true),
+        (5_050_000_000_000_000, true),
+        (5_064_000_000_000_000, false),
+        (5_065_000_000_000_000, false),
+    ] {
+        let mut bridge = MockBridgeBackend::new();
+        bridge
+            .expect_get_fee_budget()
+            .times(1)
+            .returning(|asset, chain, target| {
+                assert_eq!((asset, chain, target), ("ckETH", "ICP", "ETH"));
+                Ok(BridgeFeeBudget {
+                    source_fee_budget: 0.00005,
+                    ..BridgeFeeBudget::default()
+                })
+            });
+        bridge
+            .expect_get_minimum_bridge_amount()
+            .times(1)
+            .returning(|_, _, _| Ok(0.005));
+        bridge.expect_submit_bridge().times(0);
+        bridge.expect_get_source_balance().times(0);
+        let finalizer = deposit_poll_finalizer(bridge);
+
+        let result = finalizer.check_amount(&cketh_amount_check_request(raw)).await;
+
+        if below_minimum {
+            let Err(VenueAmountError::BelowMinimum(reason)) = result else {
+                panic!("expected a below-minimum decision, got {result:?}");
+            };
+            assert!(reason.contains("ckETH -> ETH"));
+            assert!(reason.contains("0.005"));
+        } else {
+            result.expect("the exact minimum and larger amounts remain executable");
+        }
+    }
+}
+
+#[tokio::test]
+async fn cketh_planning_amount_check_keeps_bridge_outages_retryable() {
+    use liquidium_pipeline_connectors::backend::bridge_backend::MockBridgeBackend;
+    let mut bridge = MockBridgeBackend::new();
+    bridge
+        .expect_get_fee_budget()
+        .times(1)
+        .returning(|_, _, _| Err("minter unavailable".into()));
+    bridge.expect_submit_bridge().times(0);
+    let finalizer = deposit_poll_finalizer(bridge);
+
+    assert!(matches!(
+        finalizer
+            .check_amount(&cketh_amount_check_request(4_000_000_000_000_000))
+            .await,
+        Err(VenueAmountError::Unavailable(_))
+    ));
+}
+
 #[tokio::test]
 async fn restart_only_polls_bridged_deposits_with_both_durable_submission_ids() {
     use liquidium_pipeline_connectors::backend::bridge_backend::{BridgeStatus, MockBridgeBackend};

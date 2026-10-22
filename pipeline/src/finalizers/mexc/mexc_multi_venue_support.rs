@@ -118,7 +118,7 @@ where
 
     /// Resolves the receive token required by MEXC's deposit/withdraw state and
     /// validates that the request's exact pay allocation is internally sound.
-    fn prepare_swap_request(&self, execution_id: &str, request: &SwapRequest) -> Result<CexState, String> {
+    pub(super) fn prepare_swap_request(&self, execution_id: &str, request: &SwapRequest) -> Result<CexState, String> {
         if request.pay_amount.token.asset_id() != request.pay_asset {
             return Err("MEXC request pay asset does not match pay amount token".to_string());
         }

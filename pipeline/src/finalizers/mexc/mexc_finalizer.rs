@@ -9,7 +9,7 @@ use ic_ledger_types::{AccountIdentifier, Subaccount};
 use icrc_ledger_types::icrc1::account::Account;
 use liquidium_pipeline_connectors::backend::amount_utils::nat_units_to_spend_amount;
 use liquidium_pipeline_connectors::backend::bridge_backend::{
-    BRIDGE_SUBMISSION_DEFERRED_PREFIX, BridgeRequest, BridgeRouteKind, BridgeRouteSpec,
+    BRIDGE_SUBMISSION_DEFERRED_PREFIX, BridgeFeeBudget, BridgeRequest, BridgeRouteKind, BridgeRouteSpec,
     BridgeStatus, FINALIZER_PERMANENT_AMOUNT_FLOOR_PREFIX, resolve_route,
 };
 use liquidium_pipeline_connectors::backend::cex_backend::{
@@ -49,6 +49,14 @@ use crate::{
     },
     utils::{ICP_LEDGER_PRINCIPAL, now_ts},
 };
+
+/// What a bridged deposit sends and what the bridge receives from it.
+pub(super) struct BridgeDepositSizing {
+    pub transfer_value: Nat,
+    pub bridge_amount: ChainTokenAmount,
+    pub source_fee_reserve: Option<ChainTokenAmount>,
+    pub fee_budget: BridgeFeeBudget,
+}
 
 fn is_mexc_withdraw_below_min_error(err: &str) -> bool {
     // The CEX backend trait currently erases MEXC's typed error into a string.
@@ -300,7 +308,7 @@ where
     /// native `ckETH -> ETH` also needs its quoted minter withdrawal fee budget. ckSOL's
     /// minter fee instead reduces the SOL received at the destination. This helper
     /// returns the reserved amount and the net amount that can be submitted to the bridge.
-    fn compute_reverse_bridge_source_fee_reserve(
+    pub(super) fn compute_reverse_bridge_source_fee_reserve(
         route: &BridgeRouteSpec,
         deposit_asset: &ChainToken,
         transfer_value: &Nat,
@@ -378,21 +386,64 @@ where
         Ok(net)
     }
 
+    /// Sizes a bridged deposit from its allocation: the ledger fee comes off
+    /// the transfer, then the route's source-side reserve. Planning and the
+    /// deposit use this one sizing, so they agree on the minimum.
+    pub(super) async fn size_bridged_deposit(
+        bridge: &BridgeRuntime,
+        route: &BridgeRouteSpec,
+        deposit_asset: &ChainToken,
+        size_in: &ChainTokenAmount,
+    ) -> Result<BridgeDepositSizing, String> {
+        let (transfer_value, mut bridge_amount) = Self::compute_fee_adjusted_deposit_transfer(deposit_asset, size_in)?;
+        let fee_budget = bridge
+            .backend
+            .get_fee_budget(route.source_asset, route.source_chain, route.target_asset)
+            .await?;
+        let mut source_fee_reserve = None;
+        if let Some((reserve, net)) = Self::compute_reverse_bridge_source_fee_reserve(
+            route,
+            deposit_asset,
+            &transfer_value,
+            fee_budget.source_fee_budget,
+        )? {
+            bridge_amount = net;
+            source_fee_reserve = Some(reserve);
+        }
+        Ok(BridgeDepositSizing {
+            transfer_value,
+            bridge_amount,
+            source_fee_reserve,
+            fee_budget,
+        })
+    }
+
+    /// The route minimum this amount falls short of, as `(amount, minimum)`.
+    pub(super) async fn bridge_minimum_shortfall(
+        bridge: &BridgeRuntime,
+        route: &BridgeRouteSpec,
+        amount: &ChainTokenAmount,
+    ) -> Result<Option<(f64, f64)>, String> {
+        let minimum = bridge
+            .backend
+            .get_minimum_bridge_amount(route.source_asset, route.source_chain, route.target_asset)
+            .await?;
+        if !minimum.is_finite() {
+            return Err(format!("invalid bridge minimum {minimum} for {}@{}", route.source_asset, route.source_chain));
+        }
+        if minimum <= 0.0 {
+            return Ok(None);
+        }
+        let current = amount.to_f64();
+        Ok((current < minimum).then_some((current, minimum)))
+    }
+
     async fn ensure_minimum_bridge_amount(
         bridge: &BridgeRuntime,
         route: &BridgeRouteSpec,
         amount: &ChainTokenAmount,
     ) -> Result<(), String> {
-        let minimum = bridge
-            .backend
-            .get_minimum_bridge_amount(route.source_asset, route.source_chain, route.target_asset)
-            .await?;
-        if minimum <= 0.0 {
-            return Ok(());
-        }
-
-        let current = amount.to_f64();
-        if current < minimum {
+        if let Some((current, minimum)) = Self::bridge_minimum_shortfall(bridge, route, amount).await? {
             return Err(format!(
                 "{}: {}@{} -> {} amount below minimum withdrawal (amount={} minimum={})",
                 FINALIZER_PERMANENT_AMOUNT_FLOOR_PREFIX,
@@ -719,21 +770,14 @@ where
                 &bridge_source_address,
             )?;
 
-            let (transfer_value, mut transfer_amount) =
-                Self::compute_fee_adjusted_deposit_transfer(&state.deposit.deposit_asset, &state.size_in)?;
+            let BridgeDepositSizing {
+                transfer_value,
+                bridge_amount: transfer_amount,
+                source_fee_reserve,
+                fee_budget,
+            } = Self::size_bridged_deposit(bridge, route, &state.deposit.deposit_asset, &state.size_in).await?;
 
-            let fee_budget = bridge
-                .backend
-                .get_fee_budget(route.source_asset, route.source_chain, route.target_asset)
-                .await?;
-
-            if let Some((source_fee_reserve, bridge_amount)) = Self::compute_reverse_bridge_source_fee_reserve(
-                route,
-                &state.deposit.deposit_asset,
-                &transfer_value,
-                fee_budget.source_fee_budget,
-            )? {
-                transfer_amount = bridge_amount;
+            if let Some(source_fee_reserve) = source_fee_reserve {
                 let source_transfer_amount =
                     ChainTokenAmount::from_raw(state.deposit.deposit_asset.clone(), transfer_value.clone());
                 info!(

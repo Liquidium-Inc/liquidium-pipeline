@@ -802,6 +802,158 @@ async fn recovery_transfer_is_persisted_as_ready_before_it_is_submitted() {
     assert!(during.txid.is_none());
 }
 
+mod cketh_bridge_minimum {
+    use super::*;
+    use crate::finalizers::{bridge_runtime::BridgeRuntime, mexc::mexc_finalizer::MexcFinalizer};
+    use liquidium_pipeline_connectors::backend::{
+        bridge_backend::{BridgeFeeBudget, MockBridgeBackend},
+        cex_backend::MockCexBackend,
+    };
+    use liquidium_pipeline_core::tokens::token_registry::TokenRegistry;
+
+    const COLLATERAL: u64 = 4_000_000_000_000_000;
+    const LEDGER_FEE: u64 = 2_000_000_000_000;
+
+    fn setup(debt: ChainToken, bridge_unavailable: bool) -> (ExecutionReceipt, Arc<MexcFinalizer<MockCexBackend>>) {
+        let collateral = ChainToken::Icp {
+            ledger: Principal::from_text("ss2fx-dyaaa-aaaar-qacoq-cai").unwrap(),
+            symbol: "ckETH".into(),
+            decimals: 18,
+            fee: Nat::from(LEDGER_FEE),
+        };
+        let mut receipt = receipt();
+        receipt.request.collateral_asset = collateral.clone();
+        receipt.request.debt_asset = debt.clone();
+        receipt.request.ref_price = Nat::from(2_500_000_000_000_000_000_000_000_000_000u128);
+        let swap = receipt.request.swap_args.as_mut().unwrap();
+        swap.pay_asset = collateral.asset_id();
+        swap.pay_amount = ChainTokenAmount::from_raw(collateral.clone(), Nat::from(COLLATERAL));
+        swap.receive_asset = debt.asset_id();
+        receipt.liquidation_result.as_mut().unwrap().amounts.collateral_received = Nat::from(COLLATERAL);
+
+        let mut bridge = MockBridgeBackend::new();
+        bridge.expect_get_fee_budget().times(1).returning(move |_, _, _| {
+            if bridge_unavailable {
+                Err("minter unavailable".into())
+            } else {
+                Ok(BridgeFeeBudget {
+                    source_fee_budget: 0.00005,
+                    ..BridgeFeeBudget::default()
+                })
+            }
+        });
+        bridge
+            .expect_get_minimum_bridge_amount()
+            .times(usize::from(!bridge_unavailable))
+            .returning(|_, _, _| Ok(0.005));
+        bridge.expect_submit_bridge().times(0);
+        let mut venue_transfers = MockTransferActions::new();
+        venue_transfers.expect_transfer().times(0);
+        // No exchange calls are allowed: the bridge minimum rejects the route before its quote.
+        let mexc = MexcFinalizer::new(
+            Arc::new(MockCexBackend::new()),
+            Arc::new(venue_transfers),
+            Principal::anonymous(),
+            200.0,
+            0.01,
+            0.7,
+        )
+        .with_token_registry(Arc::new(TokenRegistry::new(std::collections::HashMap::from([
+            (collateral.asset_id(), collateral),
+            (debt.asset_id(), debt),
+        ]))))
+        .with_bridge_runtime(BridgeRuntime::for_tests(Arc::new(bridge)));
+        (receipt, Arc::new(mexc))
+    }
+
+    #[tokio::test]
+    async fn bridge_minimum_sweeps_cketh_to_recovery_and_persists_the_reason() {
+        for debt in [debt_token(), ckusdt()] {
+            let (receipt, mexc) = setup(debt, false);
+            let wal = TestWal::with_receipt(&receipt);
+            let destination = recovery_account();
+            let mut transfers = MockTransferActions::new();
+            transfers
+                .expect_transfer()
+                .times(1)
+                .withf(move |token, account, amount| {
+                    token.symbol() == "ckETH"
+                        && account == &ChainAccount::Icp(destination)
+                        && amount == &Nat::from(COLLATERAL - LEDGER_FEE)
+                })
+                .returning(|_, _, _| Ok("cketh-recovery-block".into()));
+            let finalizer = MultiVenueFinalizer::new(vec![mexc], planner_config())
+                .unwrap()
+                .with_recovery_sweep(Arc::new(transfers), destination);
+
+            let result = finalizer
+                .finalize(&wal, receipt.clone())
+                .await
+                .expect("recover unbridgeable ckETH");
+
+            assert!(result.finalized);
+            assert_eq!(result.swapper.as_deref(), Some("recovery"));
+            let state = committed_recovery_state(&wal);
+            assert_eq!(state.amount.value, Nat::from(COLLATERAL - LEDGER_FEE));
+            assert_eq!(state.txid.as_deref(), Some("cketh-recovery-block"));
+            assert!(state.reason.contains("ckETH -> ETH"));
+            assert!(state.reason.contains("0.005"));
+            assert!(state.reason.contains("after fee reserves"));
+            // Repeated finalization reads the completed sweep and never transfers again.
+            assert!(finalizer.finalize(&wal, receipt).await.unwrap().finalized);
+        }
+    }
+
+    #[tokio::test]
+    async fn executable_sibling_venue_is_used_instead_of_recovery() {
+        let (receipt, mexc) = setup(debt_token(), false);
+        let wal = TestWal::with_receipt(&receipt);
+        let other = Arc::new(ScriptedAdapter::new("other", None, vec![VenueLegStatus::Completed]));
+        let mut transfers = MockTransferActions::new();
+        transfers.expect_transfer().times(0);
+        let finalizer = MultiVenueFinalizer::new(vec![mexc, other.clone()], planner_config())
+            .unwrap()
+            .with_recovery_sweep(Arc::new(transfers), recovery_account());
+
+        assert!(finalizer.finalize(&wal, receipt).await.unwrap().finalized);
+
+        assert_eq!(other.calls(), 1);
+        let FinalizerMetaPayload::MultiVenueSwap(state) = wal.wrapper().meta_v2.unwrap().payload else {
+            panic!("the executable route should be committed instead of recovery");
+        };
+        assert_eq!(state.legs.len(), 1);
+        assert_eq!(state.legs[0].venue_id, "other");
+    }
+
+    #[tokio::test]
+    async fn unavailable_bridge_or_sibling_venue_never_triggers_recovery() {
+        for bridge_unavailable in [true, false] {
+            let (receipt, mexc) = setup(debt_token(), bridge_unavailable);
+            let wal = TestWal::with_receipt(&receipt);
+            let mut transfers = MockTransferActions::new();
+            transfers.expect_transfer().times(0);
+            let mut venues: Vec<Arc<dyn MultiVenueAdapter>> = vec![mexc];
+            if !bridge_unavailable {
+                venues.push(Arc::new(
+                    ScriptedAdapter::new("other", None, vec![]).with_preview_failure("venue unavailable"),
+                ));
+            }
+            let finalizer = MultiVenueFinalizer::new(venues, planner_config())
+                .unwrap()
+                .with_recovery_sweep(Arc::new(transfers), recovery_account());
+
+            let error = finalizer
+                .finalize(&wal, receipt)
+                .await
+                .expect_err("outages remain retryable");
+
+            assert!(error.to_string().contains("unavailable"));
+            assert!(matches!(error, FinalizerError::Retryable(_)));
+            assert!(wal.wrapper().meta_v2.is_none());
+        }
+    }
+}
+
 #[tokio::test]
 async fn seven_dollar_ckusdt_is_swept_from_trader_to_the_icrc_recovery_account() {
     const RECEIVED: u64 = 7_125_292;
