@@ -9,117 +9,118 @@ use std::{env, io::Write, path::PathBuf};
 use alloy::signers::local::PrivateKeySigner;
 use anyhow::{Context, Result, anyhow};
 use bip39::{Language, Mnemonic};
+use candid::Principal;
+use ic_ledger_types::{AccountIdentifier, Subaccount};
 use solana_sdk::{signature::Keypair, signer::Signer};
 
 use prettytable::{Cell, Row, Table, format};
-use tracing::{info, warn};
+use tracing::info;
 
 use crate::config::Config;
 use crate::output::plain_logs_enabled;
 
-pub async fn show() -> Result<()> {
-    // Load Config
-    let config = Config::load();
+/// One address the pipeline signs for or receives on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AddressEntry {
+    pub role: &'static str,
+    pub chain: &'static str,
+    pub address: String,
+}
 
-    match config.await {
-        Ok(config) => {
-            let recovery = Account {
-                owner: config.liquidator_principal,
-                subaccount: Some(*RECOVERY_ACCOUNT),
-            };
-            let solana_address = Keypair::new_from_array(config.solana_private_key_bytes)
+/// Every account of the three identities: liquidator, trader and bridge.
+/// Built from the config once, so the table and the log lines agree.
+pub struct AddressBook {
+    pub liquidator_principal: Principal,
+    pub trader_principal: Principal,
+    pub trader_evm: Result<String, String>,
+    pub trader_solana: String,
+    pub bridge_principal: Principal,
+    pub bridge_evm: String,
+    pub bridge_btc: String,
+    pub bridge_solana: String,
+}
+
+/// The ICP ledger account id of a principal's default subaccount, which is
+/// the form exchanges and the native ICP ledger use.
+fn icp_account_id(owner: Principal) -> String {
+    AccountIdentifier::new(&owner, &Subaccount([0; 32])).to_hex()
+}
+
+impl AddressBook {
+    pub fn from_config(config: &Config) -> Self {
+        let trader_evm = config
+            .evm_private_key
+            .parse::<PrivateKeySigner>()
+            .map(|signer| signer.address().to_string())
+            .map_err(|_| "invalid EVM private key in config".to_string());
+        Self {
+            liquidator_principal: config.liquidator_principal,
+            trader_principal: config.trader_principal,
+            trader_evm,
+            trader_solana: Keypair::new_from_array(config.solana_private_key_bytes)
                 .pubkey()
-                .to_string();
-            let bridge_solana_address = Keypair::new_from_array(config.bridge_solana_private_key_bytes)
+                .to_string(),
+            bridge_principal: config.bridge_ic_owner_principal,
+            bridge_evm: config.bridge_evm_address.clone(),
+            bridge_btc: config.bridge_btc_address.clone(),
+            bridge_solana: Keypair::new_from_array(config.bridge_solana_private_key_bytes)
                 .pubkey()
-                .to_string();
-            if plain_logs_enabled() {
-                info!(role = "liquidator", principal = %config.liquidator_principal, "Account identity");
-                info!(role = "recovery", principal = %recovery, "Account identity");
-                info!(role = "solana", principal = %solana_address, "Account identity");
-                info!(role = "bridge-solana", principal = %bridge_solana_address, "Account identity");
-                info!(
-                    role = "bridge-ic-owner",
-                    principal = %config.bridge_ic_owner_principal,
-                    "Account identity"
-                );
-                info!(role = "bridge-btc", principal = %config.bridge_btc_address, "Account identity");
-                match config.evm_private_key.parse::<PrivateKeySigner>() {
-                    Ok(evm_signer) => {
-                        let evm_address = evm_signer.address();
-                        info!(role = "evm", principal = %evm_address, "Account identity");
-                        info!(
-                            role = "bridge-evm",
-                            principal = %config.bridge_evm_address,
-                            "Account identity"
-                        );
-                    }
-                    Err(_) => {
-                        warn!(role = "evm", "Invalid EVM private key in config");
-                    }
-                }
-                return Ok(());
-            }
-
-            let mut table = Table::new();
-            table.set_format(*format::consts::FORMAT_NO_LINESEP_WITH_TITLE);
-            table.set_titles(Row::new(vec![Cell::new("Role"), Cell::new("Principal")]));
-
-            table.add_row(Row::new(vec![
-                Cell::new("Liquidator Account"),
-                Cell::new(&config.liquidator_principal.to_string()),
-            ]));
-
-            table.add_row(Row::new(vec![
-                Cell::new("Recovery Account"),
-                Cell::new(&recovery.to_string()),
-            ]));
-            table.add_row(Row::new(vec![
-                Cell::new("Solana Account"),
-                Cell::new(&solana_address),
-            ]));
-            table.add_row(Row::new(vec![
-                Cell::new("Bridge Solana Account"),
-                Cell::new(&bridge_solana_address),
-            ]));
-            table.add_row(Row::new(vec![
-                Cell::new("Bridge ICP Owner"),
-                Cell::new(&config.bridge_ic_owner_principal.to_string()),
-            ]));
-            table.add_row(Row::new(vec![
-                Cell::new("Bridge BTC Address"),
-                Cell::new(&config.bridge_btc_address),
-            ]));
-
-            match config.evm_private_key.parse::<PrivateKeySigner>() {
-                Ok(evm_signer) => {
-                    let evm_address = evm_signer.address();
-                    table.add_row(Row::new(vec![
-                        Cell::new("EVM Account"),
-                        Cell::new(&format!("{evm_address}")),
-                    ]));
-                    table.add_row(Row::new(vec![
-                        Cell::new("Bridge EVM Account"),
-                        Cell::new(&config.bridge_evm_address),
-                    ]));
-                }
-                Err(_) => {
-                    table.add_row(Row::new(vec![
-                        Cell::new("EVM Account"),
-                        Cell::new("(invalid EVM private key in config)"),
-                    ]));
-                    table.add_row(Row::new(vec![
-                        Cell::new("Bridge EVM Account"),
-                        Cell::new("(invalid EVM private key in config)"),
-                    ]));
-                }
-            }
-
-            table.printstd();
-            Ok(())
+                .to_string(),
         }
-        Err(error) => Err(anyhow!("could not load account: {error}")),
     }
+
+    pub fn entries(&self) -> Vec<AddressEntry> {
+        let entry = |role, chain, address: String| AddressEntry { role, chain, address };
+        let recovery = Account {
+            owner: self.liquidator_principal,
+            subaccount: Some(*RECOVERY_ACCOUNT),
+        };
+        let trader_evm = match &self.trader_evm {
+            Ok(address) => address.clone(),
+            Err(reason) => format!("({reason})"),
+        };
+        vec![
+            entry("Liquidator", "ICP principal", self.liquidator_principal.to_string()),
+            entry("Liquidator", "ICP account id", icp_account_id(self.liquidator_principal)),
+            entry("Liquidator recovery", "ICP account", recovery.to_string()),
+            entry("Trader", "ICP principal", self.trader_principal.to_string()),
+            entry("Trader", "ICP account id", icp_account_id(self.trader_principal)),
+            entry("Trader", "EVM", trader_evm),
+            entry("Trader", "Solana", self.trader_solana.clone()),
+            entry("Bridge", "ICP principal", self.bridge_principal.to_string()),
+            entry("Bridge", "ICP account id", icp_account_id(self.bridge_principal)),
+            entry("Bridge", "EVM", self.bridge_evm.clone()),
+            entry("Bridge", "Bitcoin", self.bridge_btc.clone()),
+            entry("Bridge", "Solana", self.bridge_solana.clone()),
+        ]
+    }
+}
+
+pub async fn show() -> Result<()> {
+    let config = Config::load()
+        .await
+        .map_err(|error| anyhow!("could not load account: {error}"))?;
+    let entries = AddressBook::from_config(&config).entries();
+
+    if plain_logs_enabled() {
+        for entry in &entries {
+            info!(role = entry.role, chain = entry.chain, address = %entry.address, "Account identity");
+        }
+        return Ok(());
+    }
+
+    let mut table = Table::new();
+    table.set_format(*format::consts::FORMAT_NO_LINESEP_WITH_TITLE);
+    table.set_titles(Row::new(vec![Cell::new("Role"), Cell::new("Chain"), Cell::new("Address")]));
+    for entry in &entries {
+        table.add_row(Row::new(vec![
+            Cell::new(entry.role),
+            Cell::new(entry.chain),
+            Cell::new(&entry.address),
+        ]));
+    }
+    table.printstd();
+    Ok(())
 }
 
 fn default_mnemonic_path() -> Option<PathBuf> {
@@ -191,4 +192,39 @@ pub async fn new() -> Result<()> {
         mnemonic_path.display()
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_address_book_lists_every_identity_on_every_chain() {
+        let book = AddressBook {
+            liquidator_principal: Principal::management_canister(),
+            trader_principal: Principal::anonymous(),
+            trader_evm: Err("invalid EVM private key in config".into()),
+            trader_solana: "So11111111111111111111111111111111111111112".into(),
+            bridge_principal: Principal::from_text("xeefw-xlb5n-2hfz2-35dam-x6lxm-v2fsu-faxj6-4tbgi-mpwir-pqa4s-mae")
+                .unwrap(),
+            bridge_evm: "0x2222222222222222222222222222222222222222".into(),
+            bridge_btc: "bc1qbridge".into(),
+            bridge_solana: "BridgeSol".into(),
+        };
+
+        let entries = book.entries();
+
+        let roles: Vec<&str> = entries.iter().map(|e| e.role).collect();
+        assert_eq!(roles.iter().filter(|r| **r == "Trader").count(), 4);
+        assert_eq!(roles.iter().filter(|r| **r == "Bridge").count(), 5);
+        assert!(entries.iter().any(|e| e.role == "Liquidator recovery" && e.address.contains('.')));
+        let trader_evm = entries.iter().find(|e| e.role == "Trader" && e.chain == "EVM").unwrap();
+        assert_eq!(trader_evm.address, "(invalid EVM private key in config)");
+        let bridge_icp_id = entries
+            .iter()
+            .find(|e| e.role == "Bridge" && e.chain == "ICP account id")
+            .unwrap();
+        assert_eq!(bridge_icp_id.address.len(), 64);
+        assert_eq!(bridge_icp_id.address, icp_account_id(book.bridge_principal));
+    }
 }
