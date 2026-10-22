@@ -19,6 +19,6 @@ pub use types::{
 };
 pub use utils::{
     cketh_forward_routes, cketh_reverse_routes, resolve_cketh_forward_route_by_source,
-    resolve_cketh_forward_route_by_target, resolve_cketh_reverse_route_by_source, resolve_route,
-    validate_destination_for_route,
+    resolve_cketh_forward_route_by_target, resolve_cketh_reverse_route_by_source, resolve_forward_route_by_target,
+    resolve_reverse_route_by_source, resolve_route, validate_destination_for_route,
 };

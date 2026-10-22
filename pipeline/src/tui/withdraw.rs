@@ -15,9 +15,8 @@ use tokio::sync::mpsc;
 
 use crate::config::ConfigTrait;
 use crate::swappers::mexc::mexc_adapter::MexcClient;
-use liquidium_pipeline_connectors::backend::bridge_backend::{
-    BridgeDestinationKind, resolve_cketh_reverse_route_by_source,
-};
+use crate::finalizers::bridge_planner::cex_network_from_destination_kind;
+use liquidium_pipeline_connectors::backend::bridge_backend::resolve_reverse_route_by_source;
 use liquidium_pipeline_connectors::backend::cex_backend::CexBackend;
 use liquidium_pipeline_core::account::model::ChainAccount;
 use liquidium_pipeline_core::tokens::asset_id::AssetId;
@@ -108,14 +107,11 @@ pub(super) fn deposit_network_for_asset(asset: &AssetId) -> String {
 
 pub(super) fn mexc_deposit_lookup_for_asset(asset: &AssetId) -> (String, String) {
     let source_network = deposit_network_for_asset(asset);
-    if let Some(route) = resolve_cketh_reverse_route_by_source(&asset.symbol, &source_network) {
-        let network = match route.destination_kind {
-            BridgeDestinationKind::IcpAccount => "ICP",
-            BridgeDestinationKind::EvmAddress => "ETH",
-            BridgeDestinationKind::BtcAddress => "BTC",
-            BridgeDestinationKind::SolanaAddress => "SOL",
-        };
-        return (route.target_asset.to_string(), network.to_string());
+    if let Some(route) = resolve_reverse_route_by_source(&asset.symbol, &source_network) {
+        return (
+            route.target_asset.to_string(),
+            cex_network_from_destination_kind(route.destination_kind),
+        );
     }
 
     (asset.symbol.clone(), source_network)

@@ -50,6 +50,9 @@ pub struct BridgeRouteSpec {
     pub target_asset: &'static str,
     pub destination_kind: BridgeDestinationKind,
     pub route_kind: BridgeRouteKind,
+    /// The exchange cannot hold the ICP asset, so exchange legs move through
+    /// this bridge. False for assets the exchange lists on the ICP network.
+    pub exchange_transport: bool,
     pub evm_token_address: Option<&'static str>,
     pub ckerc20_ledger_id: Option<&'static str>,
     pub min_sweep_amount: f64,
