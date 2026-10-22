@@ -1367,12 +1367,41 @@ async fn operator_required_mexc_leg_is_parked_across_restarts() {
     assert_eq!(mexc.recovery_calls(), 0);
     assert_eq!(
         watchdog.0.lock().expect("watchdog lock").as_slice(),
-        &[("mexc-0".to_string(), "venue_reconciliation".to_string())]
+        &[("7:mexc-0".to_string(), "venue_reconciliation".to_string())]
     );
     assert!(matches!(
         committed_state(&wal).outcome,
         MultiVenueExecutionOutcome::OperatorRequired { .. }
     ));
+}
+
+#[tokio::test]
+async fn operator_alerts_distinguish_liquidations_with_the_same_leg_id() {
+    let mexc = Arc::new(ScriptedAdapter::new(
+        MEXC_VENUE_ID,
+        None,
+        vec![VenueLegStatus::OperatorRequired, VenueLegStatus::OperatorRequired],
+    ));
+    let watchdog = Arc::new(RecordingWatchdog::default());
+    let finalizer = MultiVenueFinalizer::new(vec![mexc.clone()], planner_config())
+        .expect("valid finalizer")
+        .with_watchdog(watchdog.clone());
+
+    for liquidation_id in [1721, 1722] {
+        let receipt = receipt_with_id(liquidation_id);
+        let wal = TestWal::with_receipt(&receipt);
+        finalizer.finalize(&wal, receipt.clone()).await.expect("park leg");
+        finalizer.finalize(&wal, receipt).await.expect("poll parked leg");
+    }
+
+    assert_eq!(mexc.calls(), 2);
+    assert_eq!(
+        watchdog.alerts(),
+        vec![
+            ("1721:mexc-0".to_string(), "venue_reconciliation".to_string()),
+            ("1722:mexc-0".to_string(), "venue_reconciliation".to_string()),
+        ]
+    );
 }
 
 #[tokio::test]
