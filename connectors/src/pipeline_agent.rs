@@ -155,6 +155,8 @@ impl PipelineAgent for ic_agent::Agent {
             InsufficientCycles(ProxyInsufficientCyclesError),
             CallFailed(ProxyCallFailedError),
             UnauthorizedUser,
+            // The hardened proxy forwards only to allowlisted targets.
+            UnauthorizedTarget,
         }
 
         #[derive(CandidType, Deserialize)]
@@ -191,6 +193,9 @@ impl PipelineAgent for ic_agent::Agent {
                 Err(format!("proxy returned error: CallFailed ({})", err.reason))
             }
             ProxyResult::Err(ProxyError::UnauthorizedUser) => Err("proxy returned error: UnauthorizedUser".to_string()),
+            ProxyResult::Err(ProxyError::UnauthorizedTarget) => {
+                Err("proxy returned error: UnauthorizedTarget".to_string())
+            }
         }
     }
 
