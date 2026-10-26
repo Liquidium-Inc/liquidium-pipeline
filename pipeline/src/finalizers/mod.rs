@@ -1,3 +1,4 @@
+pub mod bridge_calls;
 pub mod bridge_claims;
 pub mod bridge_runtime;
 pub(crate) mod bridge_planner;

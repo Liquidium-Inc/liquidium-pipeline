@@ -118,7 +118,7 @@ where
     /// the plan is resolved here before the durable-id check runs.
     fn can_resume_by_polling(&self, state: &mut CexState) -> bool {
         self.ensure_plan_on_state(state);
-        state.deposit.bridge.mark_bridge_call_uncertain(now_ts());
+        state.mark_sends_uncertain(now_ts());
         state.is_receipt_poll_only()
     }
 

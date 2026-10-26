@@ -4,7 +4,7 @@ use liquidium_pipeline_connectors::backend::cex_backend::CexBackend;
 
 use super::mexc_finalizer::MexcFinalizer;
 use crate::finalizers::{
-    cex_finalizer::{BridgeSubmitPhase, CexState},
+    cex_finalizer::CexState,
     multi_venue::OperatorQuestion,
     outbound::{OperatorDecision, OutboundRecord},
 };
@@ -18,8 +18,8 @@ enum Undecided {
     BridgeFunding,
     /// The MEXC withdrawal request.
     Withdrawal,
-    /// A bridge call whose provider record was not found.
-    BridgeAttempt,
+    /// The provider call that bridges the deposit.
+    BridgeCall,
 }
 
 /// A saved send only an operator can decide: it parked, or it may have run
@@ -57,17 +57,10 @@ fn open_questions(state: &CexState) -> Vec<(Undecided, OperatorQuestion)> {
             send_question("MEXC withdrawal", record, "MEXC withdrawal id"),
         ));
     }
-    if let Some(BridgeSubmitPhase::Submitting(attempt)) = &state.deposit.bridge.deposit_bridge_submit_phase
-        && attempt.parked_for_operator
-    {
+    if let Some(record) = undecided(&state.deposit.bridge.deposit_bridge_call) {
         questions.push((
-            Undecided::BridgeAttempt,
-            OperatorQuestion {
-                detail: format!(
-                    "did bridge attempt {} ({} {} to {}) reach the provider? --landed <bridge id> | --absent (the provider is searched again, then a new call follows)",
-                    attempt.id, attempt.amount, attempt.asset, attempt.destination
-                ),
-            },
+            Undecided::BridgeCall,
+            send_question("deposit bridge call", record, "bridge id"),
         ));
     }
     questions
@@ -107,14 +100,7 @@ impl<C: CexBackend> MexcFinalizer<C> {
             Undecided::DepositFunding => &mut state.deposit.deposit_funding,
             Undecided::BridgeFunding => &mut state.withdraw.bridge.withdraw_bridge_funding,
             Undecided::Withdrawal => &mut state.withdraw.withdraw_send,
-            Undecided::BridgeAttempt => {
-                match answer {
-                    OperatorDecision::Landed { receipt } => Self::attach_bridge_handle(state, receipt.clone()),
-                    // A released park searches the provider again before a new call.
-                    OperatorDecision::Absent => {}
-                }
-                return Ok(());
-            }
+            Undecided::BridgeCall => &mut state.deposit.bridge.deposit_bridge_call,
         };
         // The next run asks the chain or MEXC first, so the decision is used
         // only while that answer stays open.

@@ -23,7 +23,7 @@ use liquidium_pipeline_core::types::protocol_types::{
 };
 
 use crate::executors::executor::ExecutorRequest;
-use crate::finalizers::cex_finalizer::{BridgeSubmitPhase, CexDepositState, CexState, CexStep};
+use crate::finalizers::cex_finalizer::{CexDepositState, CexState, CexStep};
 use crate::stages::executor::{ExecutionReceipt, ExecutionStatus};
 use crate::utils::ICP_LEDGER_PRINCIPAL;
 use proptest::prelude::*;
@@ -742,7 +742,7 @@ fn mexc_sol_reverse_plan_reserves_approval_fee() {
     ).unwrap().unwrap();
     assert_eq!(reserve.value, Nat::from(500u64));
     assert_eq!(burn.value, Nat::from(999_999_500u64));
-    assert!(MexcFinalizer::<MockCexBackend>::route_destination_for_deposit(
+    assert!(crate::finalizers::bridge_planner::deposit_destination(
         route.destination_kind, "not-a-solana-address",
     ).is_err());
 }
@@ -849,7 +849,7 @@ async fn mexc_deposit_bridge_submit_resume_and_complete() {
 
     bridge
         .expect_get_source_balance()
-        .times(2)
+        .times(1)
         .returning(|asset, chain, _address| {
             assert_eq!(asset, "ckUSDC");
             assert_eq!(chain, "ICP");
@@ -926,18 +926,21 @@ async fn mexc_deposit_bridge_submit_resume_and_complete() {
     finalizer
         .deposit(&mut state)
         .await
-        .expect("first bridged deposit call should transfer and record the attempt");
+        .expect("first bridged deposit call should save the bridge call");
     assert!(matches!(state.step, CexStep::DepositPending));
     assert!(state.deposit.bridge.deposit_bridge_id.is_none());
-    let Some(BridgeSubmitPhase::Submitting(attempt)) = state.deposit.bridge.deposit_bridge_submit_phase.clone()
-    else {
-        panic!("attempt must be persisted before the bridge call");
-    };
-    assert_eq!(attempt.cursor, Some(100));
-    assert!(attempt.called_at_ts.is_none());
-    assert!(attempt.id.starts_with("bridge-attempt-"), "{}", attempt.id);
-    assert_eq!(attempt.destination, "0x1111111111111111111111111111111111111111");
-    assert!((attempt.amount - 0.92).abs() < 1e-9);
+    let saved = state
+        .deposit
+        .bridge
+        .deposit_bridge_call
+        .clone()
+        .expect("the call must be saved before it runs");
+    assert_eq!(saved.phase, crate::finalizers::outbound::OutboundPhase::Prepared);
+    assert!(saved.prepared.identity.starts_with("bridge-call-"), "{}", saved.prepared.identity);
+    let call = crate::finalizers::bridge_calls::saved_call(&saved.prepared).unwrap();
+    assert_eq!(call.cursor, Some(100));
+    assert_eq!(call.destination, "0x1111111111111111111111111111111111111111");
+    assert!((call.amount - 0.92).abs() < 1e-9);
 
     finalizer
         .deposit(&mut state)
@@ -948,7 +951,7 @@ async fn mexc_deposit_bridge_submit_resume_and_complete() {
         state.deposit.bridge.deposit_bridge_id.as_deref(),
         Some("bridge-deposit-1")
     );
-    assert!(state.deposit.bridge.deposit_bridge_submit_phase.is_none());
+    assert!(state.deposit.bridge.deposit_bridge_call.is_none());
 
     finalizer
         .deposit(&mut state)
@@ -994,7 +997,7 @@ async fn mexc_deposit_bridge_reserves_reverse_bridge_approval_fee_in_trade_amoun
 
     bridge
         .expect_get_source_balance()
-        .times(2)
+        .times(1)
         .returning(|asset, chain, _address| {
             assert_eq!(asset, "ckUSDC");
             assert_eq!(chain, "ICP");
@@ -1147,7 +1150,7 @@ async fn mexc_deposit_bridge_reserves_native_cketh_withdrawal_fee_budget() {
 
     bridge
         .expect_get_source_balance()
-        .times(2)
+        .times(1)
         .returning(|asset, chain, _address| {
             assert_eq!(asset, "ckETH");
             assert_eq!(chain, "ICP");
@@ -1959,13 +1962,10 @@ async fn mexc_deposit_bridge_deferral_keeps_step_pending_then_submits() {
     assert!(matches!(state.step, CexStep::DepositPending));
     assert_eq!(state.deposit.deposit_txid.as_deref(), Some("tx-bridge-deferred"));
     assert!(state.deposit.bridge.deposit_bridge_id.is_none());
-    // The backend proved nothing was sent, so the attempt is dropped.
-    assert_eq!(
-        state.deposit.bridge.deposit_bridge_submit_phase,
-        Some(BridgeSubmitPhase::WaitingFunds)
-    );
+    // The backend proved nothing was sent, so the call is dropped.
+    assert!(state.deposit.bridge.deposit_bridge_call.is_none());
 
-    finalizer.deposit(&mut state).await.expect("a new attempt is recorded");
+    finalizer.deposit(&mut state).await.expect("a new call is saved");
     finalizer.deposit(&mut state).await.expect("bridge submits once the wallet is idle");
     assert_eq!(
         state.deposit.bridge.deposit_bridge_id.as_deref(),
@@ -3034,7 +3034,8 @@ fn cex_deposit_state_deserialize_defaults_missing_sent_timestamp() {
             deposit_bridge_submit_amount: None,
             deposit_bridge_expected_amount: None,
             deposit_bridge_provider_fee_budget_native_units: None,
-            deposit_bridge_submit_phase: None,
+            deposit_bridge_call: None,
+            legacy_bridge_submit_phase: None,
         },
     };
 
@@ -6939,32 +6940,19 @@ mod fuzz {
     }
 }
 
-mod lost_bridge_call {
-    //! A bridge call whose handle was lost is looked up before any new call.
+mod saved_bridge_call {
+    //! A deposit bridge call is saved before it runs, and a lost answer is
+    //! settled from the provider history before any new call.
     use super::*;
+    use crate::finalizers::bridge_calls::{BridgeCall, OpenBridgeCall, prepare_bridge_call};
     use crate::finalizers::bridge_claims::{BridgeClaims, MockBridgeClaimLookup};
-    use crate::finalizers::cex_finalizer::BridgeSubmitAttempt;
-    use liquidium_pipeline_core::outbound::SIDE_EFFECT_AMBIGUOUS_PREFIX;
+    use crate::finalizers::cex_finalizer::{LegacyBridgeSubmitAttempt, LegacyBridgeSubmitPhase};
+    use crate::finalizers::outbound::{OperatorDecision, OutboundPhase, OutboundRecord};
     use crate::utils::now_ts;
     use liquidium_pipeline_connectors::backend::bridge_backend::BridgeSubmissionCandidate;
+    use liquidium_pipeline_core::outbound::SIDE_EFFECT_AMBIGUOUS_PREFIX;
 
     const DESTINATION: &str = "0x1111111111111111111111111111111111111111";
-
-    fn attempt(cursor: Option<u64>, called_at_ts: Option<i64>) -> BridgeSubmitAttempt {
-        BridgeSubmitAttempt {
-            id: "mine".into(),
-            started_at_ts: now_ts() - 30,
-            called_at_ts,
-            ..BridgeSubmitAttempt::test("ckUSDC", DESTINATION, 0.92, cursor)
-        }
-    }
-
-    fn other_attempt(cursor: Option<u64>, called_at_ts: Option<i64>) -> BridgeSubmitAttempt {
-        BridgeSubmitAttempt {
-            id: "theirs".into(),
-            ..attempt(cursor, called_at_ts)
-        }
-    }
 
     fn candidate(sequence: u64) -> BridgeSubmissionCandidate {
         BridgeSubmissionCandidate {
@@ -6985,12 +6973,12 @@ mod lost_bridge_call {
         bridge
     }
 
-    fn claims(open_attempts: Vec<BridgeSubmitAttempt>) -> MockBridgeClaimLookup {
+    fn claims(open_calls: Vec<OpenBridgeCall>) -> MockBridgeClaimLookup {
         let mut claims = MockBridgeClaimLookup::new();
         claims.expect_claims_since().returning(move |_| {
             Ok(BridgeClaims {
                 bridge_ids: vec!["ic-withdraw:1:2".into()],
-                open_attempts: open_attempts.clone(),
+                open_calls: open_calls.clone(),
                 ..BridgeClaims::default()
             })
         });
@@ -7012,20 +7000,50 @@ mod lost_bridge_call {
         })
     }
 
-    /// A bridged ckUSDC deposit whose transfer landed and whose attempt is persisted.
-    async fn submitting_state(finalizer: &MexcFinalizer<MockCexBackend>, attempt: BridgeSubmitAttempt) -> CexState {
+    /// A bridged ckUSDC deposit whose funding transfer landed.
+    async fn funded_state(finalizer: &MexcFinalizer<MockCexBackend>) -> CexState {
         let receipt = make_execution_receipt_with_assets(90, ckusdc_token(), ckbtc_token());
         let mut state = finalizer.prepare("90", &receipt).await.expect("prepare");
         state.step = CexStep::DepositPending;
         state.deposit.deposit_txid = Some("tx-bridge-fund".into());
         state.deposit.bridge.deposit_bridge_submit_amount = Some(0.92);
         state.deposit.bridge.deposit_bridge_expected_amount = Some(0.91);
-        state.deposit.bridge.deposit_bridge_submit_phase = Some(BridgeSubmitPhase::Submitting(attempt));
         state
     }
 
+    /// A row that the bridge journal saved before the outbound driver.
+    fn journal_attempt(called_at_ts: Option<i64>, parked: bool) -> LegacyBridgeSubmitPhase {
+        LegacyBridgeSubmitPhase::Submitting(LegacyBridgeSubmitAttempt {
+            id: "mine".into(),
+            asset: "ckUSDC".into(),
+            destination: DESTINATION.into(),
+            amount: 0.92,
+            cursor: Some(100),
+            started_at_ts: now_ts() - 30,
+            called_at_ts,
+            parked_for_operator: parked,
+        })
+    }
+
+    fn sent_call(at: i64) -> OutboundRecord {
+        let call = BridgeCall {
+            asset: "ckUSDC".into(),
+            source_chain: "ICP".into(),
+            source_address: Principal::anonymous().to_text(),
+            target_asset: "USDC".into(),
+            destination: DESTINATION.into(),
+            amount: 0.92,
+            provider_fee_budget_native_units: None,
+            cursor: Some(100),
+            started_at_ts: at,
+        };
+        let mut record = OutboundRecord::prepared(prepare_bridge_call("mine".into(), &call).unwrap());
+        record.phase = OutboundPhase::Submitted { at };
+        record
+    }
+
     #[tokio::test]
-    async fn single_unclaimed_record_is_attached_without_a_new_call() {
+    async fn a_journal_attempt_is_migrated_and_settled_without_a_new_call() {
         let mut bridge = zero_fee_bridge();
         bridge.expect_submit_bridge().times(0);
         bridge
@@ -7038,154 +7056,52 @@ mod lost_bridge_call {
                 assert_eq!(claimed, ["ic-withdraw:1:2"]);
                 Ok(vec![candidate(105)])
             });
-        let finalizer = finalizer(bridge, Some(claims(vec![])));
-        let mut state = submitting_state(&finalizer, attempt(Some(100), Some(now_ts()))).await;
+        // The row's own attempt is still in the saved row the registry reads.
+        let LegacyBridgeSubmitPhase::Submitting(own) = journal_attempt(None, false) else {
+            unreachable!()
+        };
+        let finalizer = finalizer(bridge, Some(claims(vec![own.open_call()])));
+        let mut state = funded_state(&finalizer).await;
+        state.deposit.bridge.legacy_bridge_submit_phase = Some(journal_attempt(None, false));
 
-        finalizer.deposit(&mut state).await.expect("lookup attaches the handle");
+        finalizer.deposit(&mut state).await.expect("the lookup attaches the handle");
 
         assert_eq!(
             state.deposit.bridge.deposit_bridge_id.as_deref(),
             Some("ic-withdraw:recovered:105")
         );
-        assert!(state.deposit.bridge.deposit_bridge_submit_phase.is_none());
+        assert!(state.deposit.bridge.deposit_bridge_call.is_none());
+        assert!(state.deposit.bridge.legacy_bridge_submit_phase.is_none());
         assert_eq!(state.trade.trade_next_amount_in, Some(0.91));
-        assert!(state.deposit.bridge.deposit_bridge_submitted_at_ts.is_some());
-        assert_eq!(state.step, CexStep::DepositPending);
     }
 
     #[tokio::test]
-    async fn two_records_or_a_competing_attempt_park_with_the_ambiguous_prefix() {
-        let cases: [(Vec<u64>, Vec<BridgeSubmitAttempt>, &str); 3] = [
-            (vec![105, 106], vec![], "2 unclaimed provider records"),
-            (vec![105], vec![other_attempt(Some(90), None)], "another open attempt could own one"),
-            (vec![105], vec![other_attempt(None, Some(1))], "another open attempt could own one"),
-        ];
-        for (records, open_attempts, reason) in cases {
-            let mut bridge = zero_fee_bridge();
-            bridge.expect_submit_bridge().times(0);
-            bridge
-                .expect_find_submissions()
-                .times(1)
-                .returning(move |_, _, _| Ok(records.iter().map(|id| candidate(*id)).collect()));
-            let finalizer = finalizer(bridge, Some(claims(open_attempts)));
-            let mut state = submitting_state(&finalizer, attempt(Some(100), Some(now_ts()))).await;
-
-            let error = finalizer.deposit(&mut state).await.expect_err("operator decides");
-
-            assert!(error.starts_with(SIDE_EFFECT_AMBIGUOUS_PREFIX), "{error}");
-            assert!(error.contains(reason), "{error}");
-            assert!(state.deposit.bridge.deposit_bridge_id.is_none());
-            assert!(matches!(
-                state.deposit.bridge.deposit_bridge_submit_phase,
-                Some(BridgeSubmitPhase::Submitting(_))
-            ));
-        }
-    }
-
-    #[tokio::test]
-    async fn the_own_attempt_and_one_recorded_after_the_record_cannot_contest_it() {
+    async fn a_parked_journal_attempt_waits_for_an_operator_answer() {
         let mut bridge = zero_fee_bridge();
         bridge.expect_submit_bridge().times(0);
-        bridge
-            .expect_find_submissions()
-            .times(1)
-            .returning(|_, _, _| Ok(vec![candidate(105)]));
-        // The registry scans every row, so the row's own attempt is in it.
-        let own = attempt(Some(100), Some(now_ts()));
-        let later = other_attempt(Some(110), None);
-        let finalizer = finalizer(bridge, Some(claims(vec![own, later])));
-        let mut state = submitting_state(&finalizer, attempt(Some(100), Some(now_ts()))).await;
-
-        finalizer.deposit(&mut state).await.expect("the later attempt cannot own record 105");
-
-        assert_eq!(
-            state.deposit.bridge.deposit_bridge_id.as_deref(),
-            Some("ic-withdraw:recovered:105")
-        );
-    }
-
-    #[tokio::test]
-    async fn no_record_waits_a_grace_period_then_parks_until_an_operator_releases_it() {
-        let recent = now_ts();
-        let stale = now_ts() - 11 * 60;
-        for (called_at_ts, released) in [(recent, false), (stale, false), (stale, true)] {
-            let mut bridge = zero_fee_bridge();
-            bridge.expect_submit_bridge().times(0);
-            bridge.expect_find_submissions().times(1).returning(|_, _, _| Ok(vec![]));
-            let finalizer = finalizer(bridge, Some(claims(vec![])));
-            let mut attempt = attempt(Some(100), Some(called_at_ts));
-            attempt.parked_for_operator = released;
-            let mut state = submitting_state(&finalizer, attempt).await;
-
-            let result = finalizer.deposit(&mut state).await;
-
-            assert!(state.deposit.bridge.deposit_bridge_id.is_none());
-            assert_eq!(state.step, CexStep::DepositPending);
-            match (called_at_ts == recent, released) {
-                (true, _) => {
-                    result.expect("inside the grace period a miss is a wait");
-                    let Some(BridgeSubmitPhase::Submitting(kept)) = &state.deposit.bridge.deposit_bridge_submit_phase
-                    else {
-                        panic!("the attempt stays");
-                    };
-                    assert_eq!(kept.called_at_ts, Some(called_at_ts));
-                }
-                (false, false) => {
-                    let error = result.expect_err("a stale miss is not proof");
-                    assert!(error.starts_with(SIDE_EFFECT_AMBIGUOUS_PREFIX), "{error}");
-                    assert!(error.contains("re-enqueue"), "{error}");
-                    let Some(BridgeSubmitPhase::Submitting(kept)) = &state.deposit.bridge.deposit_bridge_submit_phase
-                    else {
-                        panic!("the attempt stays for the operator");
-                    };
-                    assert!(kept.parked_for_operator, "the next run counts as the operator's release");
-                }
-                (false, true) => {
-                    result.expect("the operator released the attempt");
-                    assert_eq!(
-                        state.deposit.bridge.deposit_bridge_submit_phase,
-                        Some(BridgeSubmitPhase::WaitingFunds)
-                    );
-                }
-            }
-        }
-    }
-
-    #[tokio::test]
-    async fn an_unavailable_claim_registry_parks_instead_of_retrying() {
-        let mut bridge = zero_fee_bridge();
-        bridge.expect_submit_bridge().times(0);
-        bridge.expect_find_submissions().times(0);
-        let mut claims = MockBridgeClaimLookup::new();
-        claims
-            .expect_claims_since()
-            .returning(|_| Err("bridge claim scan truncated at 20000 rows".into()));
-        let finalizer = finalizer(bridge, Some(claims));
-        let mut state = submitting_state(&finalizer, attempt(Some(100), Some(now_ts()))).await;
-
-        let error = finalizer.deposit(&mut state).await.expect_err("no partial answers");
-
-        assert!(error.starts_with(SIDE_EFFECT_AMBIGUOUS_PREFIX), "{error}");
-        assert!(error.contains("truncated"), "{error}");
-    }
-
-    #[tokio::test]
-    async fn no_cursor_parks_instead_of_guessing() {
-        let mut bridge = zero_fee_bridge();
-        bridge.expect_submit_bridge().times(0);
-        bridge.expect_find_submissions().times(0);
+        bridge.expect_find_submissions().times(2).returning(|_, _, _| Ok(vec![]));
         let finalizer = finalizer(bridge, Some(claims(vec![])));
-        let mut state = submitting_state(&finalizer, attempt(None, Some(now_ts()))).await;
+        let mut state = funded_state(&finalizer).await;
+        state.deposit.bridge.legacy_bridge_submit_phase = Some(journal_attempt(Some(now_ts() - 3_600), true));
 
-        let error = finalizer.deposit(&mut state).await.expect_err("nothing to look up with");
-
+        let error = finalizer.deposit(&mut state).await.expect_err("only an operator decides");
         assert!(error.starts_with(SIDE_EFFECT_AMBIGUOUS_PREFIX), "{error}");
+        assert!(matches!(
+            state.deposit.bridge.deposit_bridge_call.as_ref().unwrap().phase,
+            OutboundPhase::Parked { .. }
+        ));
+
+        // The operator found no record. The provider is searched once more.
+        state.deposit.bridge.deposit_bridge_call.as_mut().unwrap().decide(OperatorDecision::Absent);
+        finalizer.deposit(&mut state).await.expect_err("the absent call is dropped");
+        assert!(state.deposit.bridge.deposit_bridge_call.is_none());
     }
 
     #[tokio::test]
-    async fn a_failed_call_is_looked_up_before_the_retry() {
+    async fn a_failed_call_is_looked_up_before_any_new_call() {
         let mut bridge = zero_fee_bridge();
         bridge.expect_get_source_balance().times(1).returning(|_, _, _| Ok(5.0));
+        bridge.expect_prepare_submission().times(1).returning(|_| Ok(Some(100)));
         bridge.expect_submit_bridge().times(1).returning(|request| {
             assert!((request.amount - 0.92).abs() < 1e-12);
             Err("minter call timed out".into())
@@ -7194,17 +7110,33 @@ mod lost_bridge_call {
             .expect_find_submissions()
             .times(1)
             .returning(|_, _, _| Ok(vec![candidate(105)]));
-        let finalizer = finalizer(bridge, Some(claims(vec![])));
-        let mut state = submitting_state(&finalizer, attempt(Some(100), None)).await;
+        let mut cex = MockCexBackend::new();
+        cex.expect_get_deposit_address().returning(|_, _| {
+            Ok(DepositAddress {
+                asset: "USDC".into(),
+                network: "ETH".into(),
+                address: DESTINATION.into(),
+                tag: None,
+            })
+        });
+        let finalizer = MexcFinalizer::new(
+            Arc::new(cex),
+            Arc::new(MockTransferActions::new()),
+            Principal::anonymous(),
+            TEST_MAX_SELL_SLIPPAGE_BPS,
+            TEST_CEX_MIN_EXEC_USD,
+            TEST_CEX_SLICE_TARGET_RATIO,
+        )
+        .with_bridge_runtime(bridge_dependencies(Arc::new(bridge)).with_claims(Arc::new(claims(vec![]))));
+        let mut state = funded_state(&finalizer).await;
 
-        let error = finalizer.deposit(&mut state).await.expect_err("the call failed");
-        assert_eq!(error, "minter call timed out");
-        let Some(BridgeSubmitPhase::Submitting(kept)) = &state.deposit.bridge.deposit_bridge_submit_phase else {
-            panic!("the attempt must stay persisted with its call time");
-        };
-        assert!(kept.called_at_ts.is_some());
-
-        finalizer.deposit(&mut state).await.expect("the retry finds the record");
+        finalizer.deposit(&mut state).await.expect("the call is saved");
+        finalizer.deposit(&mut state).await.expect("a failed call stays open");
+        assert!(matches!(
+            state.deposit.bridge.deposit_bridge_call.as_ref().unwrap().phase,
+            OutboundPhase::Submitted { .. }
+        ));
+        finalizer.deposit(&mut state).await.expect("the lookup finds the record");
         assert_eq!(
             state.deposit.bridge.deposit_bridge_id.as_deref(),
             Some("ic-withdraw:recovered:105")
@@ -7212,21 +7144,27 @@ mod lost_bridge_call {
     }
 
     #[tokio::test]
-    async fn a_funding_regression_drops_the_attempt_without_a_call() {
-        let mut bridge = zero_fee_bridge();
-        bridge.expect_get_source_balance().times(1).returning(|_, _, _| Ok(0.5));
-        bridge.expect_submit_bridge().times(0);
-        bridge.expect_find_submissions().times(0);
-        let finalizer = finalizer(bridge, None);
-        let mut state = submitting_state(&finalizer, attempt(Some(100), None)).await;
+    async fn a_call_missing_past_the_grace_period_parks() {
+        let recent = now_ts();
+        let stale = now_ts() - 11 * 60;
+        for at in [recent, stale] {
+            let mut bridge = zero_fee_bridge();
+            bridge.expect_submit_bridge().times(0);
+            bridge.expect_find_submissions().times(1).returning(|_, _, _| Ok(vec![]));
+            let finalizer = finalizer(bridge, Some(claims(vec![])));
+            let mut state = funded_state(&finalizer).await;
+            state.deposit.bridge.deposit_bridge_call = Some(sent_call(at));
 
-        finalizer.deposit(&mut state).await.expect("short funds are a wait");
+            let result = finalizer.deposit(&mut state).await;
 
-        assert_eq!(
-            state.deposit.bridge.deposit_bridge_submit_phase,
-            Some(BridgeSubmitPhase::WaitingFunds)
-        );
-        assert!(state.deposit.bridge.deposit_bridge_id.is_none());
+            assert!(state.deposit.bridge.deposit_bridge_id.is_none());
+            if at == recent {
+                result.expect("inside the grace period a miss is a wait");
+            } else {
+                let error = result.expect_err("a stale miss is not proof");
+                assert!(error.starts_with(SIDE_EFFECT_AMBIGUOUS_PREFIX), "{error}");
+            }
+        }
     }
 }
 
@@ -7822,7 +7760,6 @@ mod uncertain_side_effects {
 
 mod operator_answers {
     use super::*;
-    use crate::finalizers::cex_finalizer::BridgeSubmitAttempt;
     use crate::finalizers::outbound::{OperatorDecision, OutboundPhase, OutboundRecord};
     use liquidium_pipeline_core::outbound::PreparedSend;
 
@@ -7896,25 +7833,22 @@ mod operator_answers {
     }
 
     #[test]
-    fn a_parked_bridge_attempt_attaches_the_found_handle() {
+    fn a_parked_bridge_call_takes_the_found_handle_as_its_decision() {
         let mut state = state();
-        state.deposit.bridge.deposit_bridge_submit_phase = Some(BridgeSubmitPhase::Submitting(BridgeSubmitAttempt {
-            id: "a1".into(),
-            asset: "ckUSDC".into(),
-            destination: "0xabc".into(),
-            amount: 1.5,
-            cursor: Some(100),
-            started_at_ts: 5,
-            called_at_ts: Some(6),
-            parked_for_operator: true,
-        }));
-        assert_eq!(Mexc::operator_questions_for(&state).len(), 1);
+        let mut call = parked_send();
+        call.prepared.sender = crate::finalizers::bridge_calls::NAME.into();
+        call.prepared.identity = "bridge-call-1".into();
+        call.prepared.replay_safe = false;
+        state.deposit.bridge.deposit_bridge_call = Some(call);
+        let questions = Mexc::operator_questions_for(&state);
+        assert_eq!(questions.len(), 1);
+        assert!(questions[0].detail.contains("bridge id"), "{}", questions[0].detail);
 
         Mexc::answer_operator(&mut state, Some(&landed("ic-withdraw:1:2"))).unwrap();
 
-        assert_eq!(state.deposit.bridge.deposit_bridge_id.as_deref(), Some("ic-withdraw:1:2"));
-        assert!(state.deposit.bridge.deposit_bridge_submit_phase.is_none());
-        assert!(Mexc::operator_questions_for(&state).is_empty());
+        // The next run searches the provider first, then uses this handle.
+        let decided = state.deposit.bridge.deposit_bridge_call.unwrap();
+        assert_eq!(decided.decision, Some(landed("ic-withdraw:1:2")));
     }
 
     #[test]

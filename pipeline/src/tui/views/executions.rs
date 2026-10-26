@@ -10,7 +10,7 @@ use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, Wrap};
 use serde::Deserialize;
 use serde_json::Value;
 
-use crate::finalizers::cex_finalizer::BridgeSubmitPhase;
+use crate::finalizers::cex_finalizer::LegacyBridgeSubmitPhase;
 use crate::finalizers::liquidation_outcome::LiquidationOutcome;
 use crate::finalizers::multi_venue::MEXC_VENUE_ID;
 use crate::persistance::{
@@ -537,7 +537,9 @@ fn append_mexc_leg_transactions(lines: &mut Vec<Line<'static>>, execution: &Venu
             lines.push(Line::from(format!("   {label}: {value}")));
         }
     }
-    if let Some(phase) = cex.get("deposit_bridge_submit_phase").filter(|phase| !phase.is_null()) {
+    if let Some(call) = cex.get("deposit_bridge_call").filter(|call| !call.is_null()) {
+        lines.push(Line::from(format!("   MEXC deposit bridge call: {}", describe_bridge_call(call))));
+    } else if let Some(phase) = cex.get("deposit_bridge_submit_phase").filter(|phase| !phase.is_null()) {
         lines.push(Line::from(format!(
             "   MEXC deposit bridge phase: {}",
             describe_bridge_submit_phase(phase)
@@ -545,12 +547,38 @@ fn append_mexc_leg_transactions(lines: &mut Vec<Line<'static>>, execution: &Venu
     }
 }
 
-/// One line an operator can act on. A wait needs nothing; an attempt names
-/// what to look for on the minter.
+/// One line an operator can act on: what to look for on the provider, and
+/// whether the call may have run.
+fn describe_bridge_call(record: &Value) -> String {
+    use crate::finalizers::{
+        bridge_calls::saved_call,
+        outbound::{OutboundPhase, OutboundRecord},
+    };
+    let Ok(record) = serde_json::from_value::<OutboundRecord>(record.clone()) else {
+        return truncate(&record.to_string(), 80);
+    };
+    let phase = match &record.phase {
+        OutboundPhase::Prepared => "saved, not sent".to_string(),
+        OutboundPhase::Submitted { .. } => "sent, waiting for the provider".to_string(),
+        OutboundPhase::Parked { reason } => format!("parked: {}", truncate(reason, 60)),
+    };
+    match saved_call(&record.prepared) {
+        Ok(call) => format!(
+            "{} {} -> {} cursor={} {phase}",
+            call.amount,
+            call.asset,
+            call.destination,
+            call.cursor.map_or("none".to_string(), |cursor| cursor.to_string()),
+        ),
+        Err(_) => phase,
+    }
+}
+
+/// Rows saved before the outbound driver, until their next cycle migrates them.
 fn describe_bridge_submit_phase(phase: &Value) -> String {
-    match serde_json::from_value::<BridgeSubmitPhase>(phase.clone()) {
-        Ok(BridgeSubmitPhase::WaitingFunds) => "waiting for bridge funds".to_string(),
-        Ok(BridgeSubmitPhase::Submitting(attempt)) => format!(
+    match serde_json::from_value::<LegacyBridgeSubmitPhase>(phase.clone()) {
+        Ok(LegacyBridgeSubmitPhase::WaitingFunds) => "waiting for bridge funds".to_string(),
+        Ok(LegacyBridgeSubmitPhase::Submitting(attempt)) => format!(
             "attempt {} {} -> {} cursor={} called={}",
             attempt.amount,
             attempt.asset,

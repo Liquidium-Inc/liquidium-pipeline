@@ -10,6 +10,47 @@ use liquidium_pipeline_core::{account::model::ChainAccount, tokens::chain_token:
 
 use crate::finalizers::cex_finalizer::CexState;
 
+/// Reads an ICRC account text or a bare principal.
+pub(crate) fn parse_icp_account_like(address: &str) -> Result<Account, String> {
+    if let Ok(account) = Account::from_str(address) {
+        return Ok(account);
+    }
+    if let Ok(owner) = Principal::from_text(address) {
+        return Ok(Account {
+            owner,
+            subaccount: None,
+        });
+    }
+    Err(format!(
+        "invalid ICP account-like address '{}'; expected Account or principal",
+        address
+    ))
+}
+
+/// The bridge destination for a CEX deposit address of the given kind.
+pub(crate) fn deposit_destination(
+    route_destination_kind: BridgeDestinationKind,
+    cex_address: &str,
+) -> Result<BridgeDestination, String> {
+    match route_destination_kind {
+        BridgeDestinationKind::EvmAddress => {
+            let evm = cex_address
+                .parse::<EvmAddress>()
+                .map_err(|e| format!("invalid CEX deposit EVM address '{}': {e}", cex_address))?;
+            Ok(BridgeDestination::EvmAddress(evm))
+        }
+        BridgeDestinationKind::IcpAccount => parse_icp_account_like(cex_address)
+            .map(BridgeDestination::IcpAccount)
+            .map_err(|e| format!("invalid CEX deposit ICP destination '{}': {e}", cex_address)),
+        BridgeDestinationKind::BtcAddress => Ok(BridgeDestination::BtcAddress(cex_address.to_string())),
+        BridgeDestinationKind::SolanaAddress => {
+            let address = solana_sdk::pubkey::Pubkey::from_str(cex_address)
+                .map_err(|error| format!("invalid CEX deposit Solana address: {error}"))?;
+            Ok(BridgeDestination::SolanaAddress(address.to_string()))
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct BridgeTransportPlan {
     pub cex_asset: String,
@@ -79,29 +120,6 @@ pub(crate) trait BridgePlanner {
     }
 
     /// Converts a CEX deposit address into a typed bridge destination based on route destination kind.
-    fn route_destination_for_deposit(
-        route_destination_kind: BridgeDestinationKind,
-        cex_address: &str,
-    ) -> Result<BridgeDestination, String> {
-        match route_destination_kind {
-            BridgeDestinationKind::EvmAddress => {
-                let evm = cex_address
-                    .parse::<EvmAddress>()
-                    .map_err(|e| format!("invalid CEX deposit EVM address '{}': {e}", cex_address))?;
-                Ok(BridgeDestination::EvmAddress(evm))
-            }
-            BridgeDestinationKind::IcpAccount => Self::parse_icp_account_like(cex_address)
-                .map(BridgeDestination::IcpAccount)
-                .map_err(|e| format!("invalid CEX deposit ICP destination '{}': {e}", cex_address)),
-            BridgeDestinationKind::BtcAddress => Ok(BridgeDestination::BtcAddress(cex_address.to_string())),
-            BridgeDestinationKind::SolanaAddress => {
-                let address = solana_sdk::pubkey::Pubkey::from_str(cex_address)
-                    .map_err(|error| format!("invalid CEX deposit Solana address: {error}"))?;
-                Ok(BridgeDestination::SolanaAddress(address.to_string()))
-            }
-        }
-    }
-
     /// Converts the final liquidator target into a bridge destination for the post-withdraw bridge leg.
     fn bridge_destination_for_final_liquidator(
         &self,
@@ -203,19 +221,7 @@ pub(crate) trait BridgePlanner {
 
     /// Parses an ICP destination string as either full `Account` text or a principal (with empty subaccount).
     fn parse_icp_account_like(address: &str) -> Result<Account, String> {
-        if let Ok(account) = Account::from_str(address) {
-            return Ok(account);
-        }
-        if let Ok(owner) = Principal::from_text(address) {
-            return Ok(Account {
-                owner,
-                subaccount: None,
-            });
-        }
-        Err(format!(
-            "invalid ICP account-like address '{}'; expected Account or principal",
-            address
-        ))
+        parse_icp_account_like(address)
     }
 
     /// Builds a transfer destination account for pre-bridge funding on the given source chain.

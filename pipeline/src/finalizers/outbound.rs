@@ -50,6 +50,14 @@ impl OutboundRecord {
         self.prepared.replay_safe || self.phase != OutboundPhase::Prepared
     }
 
+    /// After a restart, a prepared send that is not safe to repeat may have
+    /// gone out. From then on the driver only settles it and never sends it.
+    pub fn mark_uncertain(&mut self, now: i64) {
+        if self.phase == OutboundPhase::Prepared && !self.prepared.replay_safe {
+            self.phase = OutboundPhase::Submitted { at: now };
+        }
+    }
+
     /// True when only an operator can decide the send: it parked, or it may
     /// have run before a restart and a second run is not safe.
     pub fn needs_operator(&self) -> bool {

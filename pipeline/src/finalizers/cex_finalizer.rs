@@ -79,72 +79,57 @@ pub struct CexDepositState {
     pub bridge: CexDepositBridgeState,
 }
 
-/// Where a bridged deposit stands before its handle exists. Persisted before
-/// the bridge call, so a restart can tell "never submitted" from "handle lost".
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub enum BridgeSubmitPhase {
-    /// Balance checks only. Nothing was sent to the bridge.
+/// The bridge journal's phase from before the outbound driver. It is read
+/// so saved rows keep their call, and it is never written again.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+pub enum LegacyBridgeSubmitPhase {
     WaitingFunds,
-    /// The attempt is persisted and the next cycle may call the bridge.
-    Submitting(BridgeSubmitAttempt),
+    Submitting(LegacyBridgeSubmitAttempt),
 }
 
-/// What the bridge call will look like on the provider, so it can be found
-/// again if the handle is lost between the call and its persistence.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct BridgeSubmitAttempt {
-    /// Tells this attempt apart from the others in the claim registry. The
-    /// leg state carries a venue execution id, not the WAL row id.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+pub struct LegacyBridgeSubmitAttempt {
     #[serde(default)]
     pub id: String,
     pub asset: String,
     pub destination: String,
     pub amount: f64,
-    /// Provider history position taken before the call. `None` when the
-    /// provider cannot look lost handles up.
     pub cursor: Option<u64>,
     pub started_at_ts: i64,
-    /// Set right before the bridge call and on restart. A persisted value
-    /// means the call may have happened, so the next cycle looks it up first.
     pub called_at_ts: Option<i64>,
-    /// The row parked on this attempt. When the leg runs again, an operator
-    /// released it, and that decision lets an empty lookup end in a new call;
-    /// the pipeline alone cannot prove a lost call never ran.
     #[serde(default)]
     pub parked_for_operator: bool,
 }
 
-impl BridgeSubmitAttempt {
-    /// A fixture with the fields tests rarely vary; override the rest by
-    /// struct update.
-    #[cfg(test)]
-    pub fn test(asset: &str, destination: &str, amount: f64, cursor: Option<u64>) -> Self {
-        Self {
-            id: "attempt-test".into(),
-            asset: asset.into(),
-            destination: destination.into(),
-            amount,
-            cursor,
-            started_at_ts: 1,
-            called_at_ts: None,
-            parked_for_operator: false,
+impl LegacyBridgeSubmitAttempt {
+    /// The call as the claim registry compares it. The fields a lookup does
+    /// not compare stay empty.
+    pub fn open_call(&self) -> crate::finalizers::bridge_calls::OpenBridgeCall {
+        crate::finalizers::bridge_calls::OpenBridgeCall {
+            id: self.id.clone(),
+            call: crate::finalizers::bridge_calls::BridgeCall {
+                asset: self.asset.clone(),
+                source_chain: String::new(),
+                source_address: String::new(),
+                target_asset: String::new(),
+                destination: self.destination.clone(),
+                amount: self.amount,
+                provider_fee_budget_native_units: None,
+                cursor: self.cursor,
+                started_at_ts: self.started_at_ts,
+            },
         }
-    }
-
-    /// True when this attempt could have produced the provider record at
-    /// `sequence` that `other` matched: same shape, taken before the record.
-    pub fn may_own(&self, other: &BridgeSubmitAttempt, sequence: u64) -> bool {
-        self.asset.eq_ignore_ascii_case(&other.asset)
-            && self.destination.eq_ignore_ascii_case(&other.destination)
-            && (self.amount - other.amount).abs() <= 1e-9
-            && self.cursor.is_none_or(|cursor| cursor < sequence)
     }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct CexDepositBridgeState {
+    /// The provider call that bridges the deposit, saved before it runs.
     #[serde(default)]
-    pub deposit_bridge_submit_phase: Option<BridgeSubmitPhase>,
+    pub deposit_bridge_call: Option<crate::finalizers::outbound::OutboundRecord>,
+    /// Read from rows saved before the outbound driver; never written.
+    #[serde(default, rename = "deposit_bridge_submit_phase", skip_serializing)]
+    pub legacy_bridge_submit_phase: Option<LegacyBridgeSubmitPhase>,
     #[serde(default)]
     pub deposit_planned_asset: Option<String>,
     #[serde(default)]
@@ -348,45 +333,23 @@ impl CexDepositState {
     }
 }
 
-impl CexDepositBridgeState {
-    /// True when the persisted phase accounts for the bridge call: nothing was
-    /// sent, or the attempt is marked so the next cycle looks it up first.
-    pub fn bridge_call_is_accounted_for(&self) -> bool {
-        match &self.deposit_bridge_submit_phase {
-            Some(BridgeSubmitPhase::WaitingFunds) => true,
-            Some(BridgeSubmitPhase::Submitting(attempt)) => attempt.called_at_ts.is_some(),
-            None => false,
-        }
-    }
-
-    /// A restart cannot know whether the lost cycle reached the bridge call.
-    /// Marks the attempt so the deposit step looks it up before it submits.
-    pub fn mark_bridge_call_uncertain(&mut self, now: i64) {
-        if let Some(BridgeSubmitPhase::Submitting(attempt)) = &mut self.deposit_bridge_submit_phase {
-            attempt.called_at_ts.get_or_insert(now);
-        }
-    }
-
-    /// Balance checks only from here; nothing is in flight.
-    pub fn wait_for_funds(&mut self) {
-        self.deposit_bridge_submit_phase = Some(BridgeSubmitPhase::WaitingFunds);
-    }
-
-    /// Persists what the next cycle will submit, before any call is made.
-    pub fn record_attempt(&mut self, attempt: BridgeSubmitAttempt) {
-        self.deposit_bridge_submit_phase = Some(BridgeSubmitPhase::Submitting(attempt));
-    }
-
-    /// Records that the row parks on this attempt, so the next run of the leg
-    /// counts as an operator's release. The lookup still runs first.
-    pub fn mark_bridge_attempt_parked(&mut self) {
-        if let Some(BridgeSubmitPhase::Submitting(attempt)) = &mut self.deposit_bridge_submit_phase {
-            attempt.parked_for_operator = true;
-        }
-    }
-}
-
 impl CexState {
+    /// Marks every saved send that may have run before a restart, so the
+    /// next run only settles it.
+    pub fn mark_sends_uncertain(&mut self, now: i64) {
+        for record in [
+            &mut self.deposit.deposit_funding,
+            &mut self.deposit.bridge.deposit_bridge_call,
+            &mut self.withdraw.withdraw_send,
+            &mut self.withdraw.bridge.withdraw_bridge_funding,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            record.mark_uncertain(now);
+        }
+    }
+
     /// True when advancing this state can only read exchange or bridge
     /// evidence. Nothing in that phase submits a transfer, withdrawal or bridge, so a
     /// restart may resume it without the submission gate. The MEXC adapter
@@ -399,12 +362,16 @@ impl CexState {
                 .withdraw_send
                 .as_ref()
                 .is_some_and(crate::finalizers::outbound::OutboundRecord::resumable),
+            // A bridge call is saved before it runs, so a missing record means
+            // no call is in flight.
             CexStep::DepositPending => {
-                let bridge = &self.deposit.bridge;
                 self.deposit.deposit_txid.is_some()
-                    && (!bridge.deposit_bridge_required
-                        || bridge.deposit_bridge_id.is_some()
-                        || bridge.bridge_call_is_accounted_for())
+                    && self
+                        .deposit
+                        .bridge
+                        .deposit_bridge_call
+                        .as_ref()
+                        .is_none_or(crate::finalizers::outbound::OutboundRecord::resumable)
             }
             CexStep::WithdrawPending => {
                 let bridge = &self.withdraw.bridge;
@@ -747,7 +714,8 @@ mod tests {
                         deposit_bridge_submit_amount: None,
                         deposit_bridge_expected_amount: None,
                         deposit_bridge_provider_fee_budget_native_units: None,
-                        deposit_bridge_submit_phase: None,
+                        deposit_bridge_call: None,
+                        legacy_bridge_submit_phase: None,
                     },
                 },
                 trade: CexTradeState {
@@ -912,7 +880,8 @@ mod tests {
                         deposit_bridge_submit_amount: None,
                         deposit_bridge_expected_amount: None,
                         deposit_bridge_provider_fee_budget_native_units: None,
-                        deposit_bridge_submit_phase: None,
+                        deposit_bridge_call: None,
+                        legacy_bridge_submit_phase: None,
                     },
                 },
                 trade: CexTradeState {
@@ -1335,55 +1304,43 @@ mod tests {
         assert_eq!(*trade_calls.lock().unwrap(), 1);
     }
 
-    fn attempt(cursor: Option<u64>) -> BridgeSubmitAttempt {
-        BridgeSubmitAttempt::test("ckUSDC", "0xAbC", 1.0, cursor)
+    #[test]
+    fn a_legacy_journal_phase_is_read_but_never_written() {
+        let saved = r#"{"deposit_bridge_required":true,"deposit_bridge_submit_phase":{"Submitting":{"id":"a1","asset":"ckUSDC","destination":"0xabc","amount":1.5,"cursor":100,"started_at_ts":5,"called_at_ts":null,"parked_for_operator":true}}}"#;
+        let state: CexDepositBridgeState = serde_json::from_str(saved).unwrap();
+        let Some(LegacyBridgeSubmitPhase::Submitting(attempt)) = &state.legacy_bridge_submit_phase else {
+            panic!("the saved attempt is read");
+        };
+        assert_eq!((attempt.id.as_str(), attempt.cursor), ("a1", Some(100)));
+        assert!(attempt.parked_for_operator);
+        assert!(!serde_json::to_string(&state).unwrap().contains("deposit_bridge_submit_phase"));
+
+        let waiting: CexDepositBridgeState =
+            serde_json::from_str(r#"{"deposit_bridge_submit_phase":"WaitingFunds"}"#).unwrap();
+        assert_eq!(waiting.legacy_bridge_submit_phase, Some(LegacyBridgeSubmitPhase::WaitingFunds));
     }
 
     #[test]
-    fn only_a_persisted_phase_accounts_for_the_bridge_call() {
-        let legacy: CexDepositBridgeState = serde_json::from_str(r#"{"deposit_bridge_required":true}"#).unwrap();
-        assert!(legacy.deposit_bridge_submit_phase.is_none());
-        assert!(!legacy.bridge_call_is_accounted_for());
-
-        let mut waiting = CexDepositBridgeState {
-            deposit_bridge_submit_phase: Some(BridgeSubmitPhase::WaitingFunds),
+    fn a_restart_marks_only_sends_that_are_not_safe_to_repeat() {
+        use crate::finalizers::outbound::{OutboundPhase, OutboundRecord};
+        use liquidium_pipeline_core::outbound::PreparedSend;
+        let record = |replay_safe| {
+            Some(OutboundRecord::prepared(PreparedSend {
+                sender: "test".into(),
+                identity: "send-1".into(),
+                payload: String::new(),
+                replay_safe,
+            }))
+        };
+        let mut bridge = CexDepositBridgeState {
+            deposit_bridge_call: record(false),
             ..Default::default()
         };
-        assert!(waiting.bridge_call_is_accounted_for());
-        waiting.mark_bridge_call_uncertain(5);
-        assert_eq!(waiting.deposit_bridge_submit_phase, Some(BridgeSubmitPhase::WaitingFunds));
+        bridge.deposit_bridge_call.as_mut().unwrap().mark_uncertain(7);
+        assert_eq!(bridge.deposit_bridge_call.unwrap().phase, OutboundPhase::Submitted { at: 7 });
 
-        let mut submitting = CexDepositBridgeState {
-            deposit_bridge_submit_phase: Some(BridgeSubmitPhase::Submitting(attempt(Some(100)))),
-            ..Default::default()
-        };
-        assert!(!submitting.bridge_call_is_accounted_for());
-        submitting.mark_bridge_call_uncertain(5);
-        submitting.mark_bridge_call_uncertain(9);
-        submitting.mark_bridge_attempt_parked();
-        waiting.mark_bridge_attempt_parked();
-        assert!(submitting.bridge_call_is_accounted_for());
-        let restored: CexDepositBridgeState =
-            serde_json::from_str(&serde_json::to_string(&submitting).unwrap()).unwrap();
-        let Some(BridgeSubmitPhase::Submitting(kept)) = restored.deposit_bridge_submit_phase else {
-            panic!("attempt survives the round trip");
-        };
-        assert_eq!(kept.called_at_ts, Some(5));
-        assert_eq!(kept.cursor, Some(100));
-        assert!(kept.parked_for_operator);
-    }
-
-    #[test]
-    fn an_attempt_owns_a_record_only_with_the_same_shape_taken_before_it() {
-        let mine = attempt(Some(100));
-        assert!(attempt(Some(90)).may_own(&mine, 105));
-        assert!(attempt(None).may_own(&mine, 105));
-        assert!(!attempt(Some(105)).may_own(&mine, 105));
-        let mut other = attempt(Some(90));
-        other.destination = "0xabc".into();
-        other.asset = "CKUSDC".into();
-        assert!(other.may_own(&mine, 105));
-        other.amount = 1.0 + 1e-6;
-        assert!(!other.may_own(&mine, 105));
+        let mut safe = record(true).unwrap();
+        safe.mark_uncertain(7);
+        assert_eq!(safe.phase, OutboundPhase::Prepared, "a safe send may simply run again");
     }
 }

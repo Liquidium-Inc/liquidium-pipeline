@@ -1,13 +1,13 @@
 //! A bridged deposit's path from funds in the bridge account to a bridge
-//! handle. The phase is persisted before the bridge call, so a restart can
-//! tell a long funding wait from a call whose handle was lost.
+//! handle. The provider call is a saved send: the outbound driver saves it
+//! before it runs, and settles a lost answer from the provider history.
 use candid::Nat;
 use liquidium_pipeline_connectors::backend::bridge_backend::{
-    BRIDGE_SUBMISSION_DEFERRED_PREFIX, BridgeFeeBudget, BridgeRequest, BridgeRouteKind, BridgeRouteSpec,
+    BRIDGE_SUBMISSION_DEFERRED_PREFIX, BridgeFeeBudget, BridgeRouteKind, BridgeRouteSpec,
 };
-use liquidium_pipeline_core::outbound::SIDE_EFFECT_AMBIGUOUS_PREFIX;
 use liquidium_pipeline_connectors::backend::cex_backend::CexBackend;
-use log::{debug, info, warn};
+use liquidium_pipeline_core::outbound::side_effect_ambiguous;
+use log::{debug, info};
 
 use super::mexc_finalizer::{
     BRIDGE_FEE_TOKEN_CHAIN, BRIDGE_FEE_TOKEN_SYMBOL, CKETH_DECIMALS, MexcFinalizer,
@@ -15,28 +15,15 @@ use super::mexc_finalizer::{
 };
 use crate::{
     finalizers::{
+        bridge_calls::{BridgeCall, BridgeCallSender, prepare_bridge_call},
         bridge_planner::BridgePlanner,
         bridge_runtime::BridgeRuntime,
-        cex_finalizer::{
-            BridgeSubmitAttempt, BridgeSubmitPhase, CexState, CexStep,
-        },
+        cex_finalizer::{CexState, CexStep, LegacyBridgeSubmitPhase},
+        outbound::{OutboundPhase, OutboundRecord, step_outbound},
     },
     stages::bridge_submit_lock::acquire_bridge_submit_lock,
     utils::now_ts,
 };
-
-/// How long an empty lookup waits before the row parks. The IC drops an
-/// unexecuted ingress after about five minutes, but a call that started can
-/// still finish later, so the wait is a grace period and not a proof.
-const LOST_BRIDGE_CALL_GRACE_SECS: i64 = 10 * 60;
-/// Rows written this long before the attempt may hold a handle after its cursor.
-const CLAIM_SCAN_MARGIN_SECS: i64 = 60 * 60;
-
-enum LostCall {
-    Found(String),
-    StillPossible,
-    NeverLanded,
-}
 
 /// What one cycle of a bridged deposit works with besides the state. Resolved
 /// once, so the phase methods read like the state machine they are.
@@ -125,8 +112,8 @@ impl<C> MexcFinalizer<C>
 where
     C: CexBackend,
 {
-    /// Moves a bridged deposit through the funding wait, the persisted attempt
-    /// and the bridge call. Every exit leaves the step pending.
+    /// Moves a bridged deposit from funds in the bridge account to a bridge
+    /// handle: one cycle saves the provider call, the next sends it.
     pub(super) async fn advance_bridged_deposit_submission(
         &self,
         state: &mut CexState,
@@ -136,69 +123,24 @@ where
     ) -> Result<(), String> {
         state.step = CexStep::DepositPending;
         let deposit = self.bridged_deposit(state, bridge, route, deposit_fee_budget).await?;
+        Self::upgrade_legacy_bridge_call(state, &deposit)?;
         let _submit_guard =
             acquire_bridge_submit_lock(route.source_asset, route.source_chain, &deposit.source_address).await;
-
-        let mut attempt = match state.deposit.bridge.deposit_bridge_submit_phase.clone() {
-            Some(BridgeSubmitPhase::Submitting(attempt)) => attempt,
-            _ => return self.record_bridge_attempt(state, &deposit).await,
-        };
-
-        if attempt.called_at_ts.is_some() {
-            let lookup = self.find_lost_bridge_call(state, &deposit, &attempt).await;
-            if lookup
-                .as_ref()
-                .is_err_and(|error| error.starts_with(SIDE_EFFECT_AMBIGUOUS_PREFIX))
-            {
-                state.deposit.bridge.mark_bridge_attempt_parked();
-            }
-            match lookup? {
-                LostCall::Found(bridge_id) => {
-                    warn!(
-                        "[mexc] liq_id={} attached bridge handle {} found on the provider for a lost call",
-                        state.liq_id, bridge_id
-                    );
-                    Self::attach_bridge_handle(state, bridge_id);
-                }
-                LostCall::StillPossible => {
-                    info!(
-                        "[mexc] liq_id={} lost bridge call not visible yet; waiting before a new attempt",
-                        state.liq_id
-                    );
-                }
-                LostCall::NeverLanded => {
-                    info!(
-                        "[mexc] liq_id={} operator cleared the lost bridge call; funds are rechecked next cycle",
-                        state.liq_id
-                    );
-                    state.deposit.bridge.wait_for_funds();
-                }
-            }
-            return Ok(());
+        if state.deposit.bridge.deposit_bridge_call.is_none() {
+            return self.save_bridge_call(state, &deposit).await;
         }
 
-        if deposit.funding(&state.liq_id, attempt.amount).await? != Some(attempt.amount) {
-            // Another row spent the shared balance since the attempt was recorded.
-            state.deposit.bridge.wait_for_funds();
-            return Ok(());
-        }
-
-        // Persisted with the error if the call fails, so the retry looks it up first.
-        attempt.called_at_ts = Some(now_ts());
-        state.deposit.bridge.record_attempt(attempt.clone());
-        match bridge
-            .backend
-            .submit_bridge(Self::bridge_request(&deposit, &attempt)?)
-            .await
-        {
-            Ok(submission) => {
-                Self::attach_bridge_handle(state, submission.bridge_id);
+        let sender = BridgeCallSender::new(bridge.backend.clone(), bridge.claims.clone());
+        match step_outbound(&mut state.deposit.bridge.deposit_bridge_call, &sender, None, now_ts()).await {
+            Ok(Some(bridge_id)) => {
+                Self::attach_bridge_handle(state, bridge_id);
                 Ok(())
             }
-            // A busy bridge wallet is a wait, not a failure. Nothing was sent.
+            Ok(None) => Ok(()),
+            // A busy bridge wallet is a wait. The next cycle measures the
+            // funds again and saves a new call.
             Err(error) if error.starts_with(BRIDGE_SUBMISSION_DEFERRED_PREFIX) => {
                 info!("[mexc] liq_id={} bridged deposit deferred: {}", state.liq_id, error);
-                state.deposit.bridge.wait_for_funds();
                 Ok(())
             }
             Err(error) => Err(error),
@@ -238,9 +180,9 @@ where
         })
     }
 
-    /// Checks funding and, when it is present, persists what the next cycle
-    /// will submit. The bridge is not called here.
-    async fn record_bridge_attempt(&self, state: &mut CexState, deposit: &BridgedDeposit<'_>) -> Result<(), String> {
+    /// Checks funding and, when it is present, saves the provider call with
+    /// the history cursor taken before it. The call runs on the next step.
+    async fn save_bridge_call(&self, state: &mut CexState, deposit: &BridgedDeposit<'_>) -> Result<(), String> {
         let planned_asset = <Self as BridgePlanner>::planned_deposit_asset(state);
         let planned_network = <Self as BridgePlanner>::planned_deposit_network(state);
         let cex_destination = self
@@ -255,127 +197,72 @@ where
             .deposit_bridge_submit_amount
             .unwrap_or_else(|| state.size_in.to_f64());
         let Some(amount) = deposit.funding(&state.liq_id, requested).await? else {
-            state.deposit.bridge.wait_for_funds();
             return Ok(());
         };
 
-        let attempt = BridgeSubmitAttempt {
-            id: crate::utils::new_venue_execution_id("bridge-attempt"),
-            asset: deposit.route.source_asset.to_string(),
-            destination: cex_destination.address,
-            amount,
-            cursor: None,
-            started_at_ts: now_ts(),
-            called_at_ts: None,
-            parked_for_operator: false,
-        };
-        let cursor = deposit
-            .bridge
-            .backend
-            .prepare_submission(&Self::bridge_request(deposit, &attempt)?)
-            .await?;
-        info!(
-            "[mexc] liq_id={} bridged deposit funded; attempt recorded amount={} destination={} cursor={:?}",
-            state.liq_id, attempt.amount, attempt.destination, cursor
-        );
-        state
-            .deposit
-            .bridge
-            .record_attempt(BridgeSubmitAttempt { cursor, ..attempt });
-        Ok(())
-    }
-
-    /// Looks the attempt up on the provider. Exactly one unclaimed record that
-    /// no other open attempt can own is this row's handle. An empty lookup
-    /// waits a grace period and then parks: only an operator can rule out a
-    /// call that is still running. Anything else parks at once. A leg that
-    /// runs again after a park was released by an operator.
-    async fn find_lost_bridge_call(
-        &self,
-        state: &CexState,
-        deposit: &BridgedDeposit<'_>,
-        attempt: &BridgeSubmitAttempt,
-    ) -> Result<LostCall, String> {
-        let ambiguous = |reason: String| {
-            format!(
-                "{SIDE_EFFECT_AMBIGUOUS_PREFIX}: liq_id {} bridge attempt {} {} -> {} (cursor {:?}): {reason}; operator must attach a handle or clear the attempt",
-                state.liq_id, attempt.amount, attempt.asset, attempt.destination, attempt.cursor
-            )
-        };
-        let Some(cursor) = attempt.cursor else {
-            return Err(ambiguous("the provider cannot look up lost submissions".into()));
-        };
-        let claims = deposit
-            .bridge
-            .claims
-            .claims_since(attempt.started_at_ts - CLAIM_SCAN_MARGIN_SECS)
-            .await
-            .map_err(|error| ambiguous(format!("claim registry unavailable: {error}")))?;
-        let candidates = deposit
-            .bridge
-            .backend
-            .find_submissions(&Self::bridge_request(deposit, attempt)?, cursor, &claims.bridge_ids)
-            .await?;
-
-        if candidates.is_empty() {
-            if attempt.parked_for_operator {
-                return Ok(LostCall::NeverLanded);
-            }
-            let called_at = attempt.called_at_ts.unwrap_or(attempt.started_at_ts);
-            let waited = now_ts() - called_at;
-            if waited < LOST_BRIDGE_CALL_GRACE_SECS {
-                return Ok(LostCall::StillPossible);
-            }
-            return Err(ambiguous(format!(
-                "no provider record after {waited}s; confirm on the minter that no withdrawal of this amount exists, then re-enqueue to submit again"
-            )));
-        }
-        let contested = candidates.iter().any(|candidate| {
-            claims
-                .open_attempts
-                .iter()
-                .filter(|other| other.id != attempt.id)
-                .any(|other| other.may_own(attempt, candidate.sequence))
-        });
-        if candidates.len() == 1 && !contested {
-            return Ok(LostCall::Found(candidates[0].bridge_id.clone()));
-        }
-        let ids: Vec<&str> = candidates
-            .iter()
-            .map(|candidate| candidate.bridge_id.as_str())
-            .collect();
-        Err(ambiguous(format!(
-            "{} unclaimed provider records match {:?}{}",
-            candidates.len(),
-            ids,
-            if contested {
-                " and another open attempt could own one"
-            } else {
-                ""
-            }
-        )))
-    }
-
-    fn bridge_request(deposit: &BridgedDeposit<'_>, attempt: &BridgeSubmitAttempt) -> Result<BridgeRequest, String> {
         let route = deposit.route;
-        Ok(BridgeRequest {
+        let mut call = BridgeCall {
             asset: route.source_asset.to_string(),
             source_chain: route.source_chain.to_string(),
             source_address: deposit.source_address.clone(),
             target_asset: route.target_asset.to_string(),
-            destination: <Self as BridgePlanner>::route_destination_for_deposit(
-                route.destination_kind,
-                &attempt.destination,
-            )?,
+            destination: cex_destination.address,
+            amount,
+            provider_fee_budget_native_units: deposit.provider_fee.clone(),
+            cursor: None,
+            started_at_ts: now_ts(),
+        };
+        call.cursor = deposit.bridge.backend.prepare_submission(&call.request()?).await?;
+        info!(
+            "[mexc] liq_id={} bridged deposit funded; call saved amount={} destination={} cursor={:?}",
+            state.liq_id, call.amount, call.destination, call.cursor
+        );
+        let id = crate::utils::new_venue_execution_id("bridge-call");
+        state.deposit.bridge.deposit_bridge_call = Some(OutboundRecord::prepared(prepare_bridge_call(id, &call)?));
+        state.send_saved = true;
+        Ok(())
+    }
+
+    /// Moves a journal attempt from a row saved before the outbound driver
+    /// into a saved call. A recorded attempt may have run, so from now on it
+    /// only settles from the provider history.
+    fn upgrade_legacy_bridge_call(state: &mut CexState, deposit: &BridgedDeposit<'_>) -> Result<(), String> {
+        let Some(LegacyBridgeSubmitPhase::Submitting(attempt)) = state.deposit.bridge.legacy_bridge_submit_phase.take()
+        else {
+            return Ok(());
+        };
+        let call = BridgeCall {
+            asset: attempt.asset,
+            source_chain: deposit.route.source_chain.to_string(),
+            source_address: deposit.source_address.clone(),
+            target_asset: deposit.route.target_asset.to_string(),
+            destination: attempt.destination,
             amount: attempt.amount,
             provider_fee_budget_native_units: deposit.provider_fee.clone(),
-        })
+            cursor: attempt.cursor,
+            started_at_ts: attempt.started_at_ts,
+        };
+        let mut record = OutboundRecord::prepared(prepare_bridge_call(attempt.id, &call)?);
+        record.phase = if attempt.parked_for_operator {
+            OutboundPhase::Parked {
+                reason: side_effect_ambiguous(format!(
+                    "bridge call {} {} to {} was parked by the bridge journal; answer it with reconcile",
+                    call.amount, call.asset, call.destination
+                )),
+            }
+        } else {
+            OutboundPhase::Submitted {
+                at: attempt.called_at_ts.unwrap_or(attempt.started_at_ts),
+            }
+        };
+        state.deposit.bridge.deposit_bridge_call = Some(record);
+        Ok(())
     }
 
     pub(super) fn attach_bridge_handle(state: &mut CexState, bridge_id: String) {
         state.deposit.bridge.deposit_bridge_id = Some(bridge_id);
         state.deposit.bridge.deposit_bridge_submitted_at_ts = Some(now_ts());
-        state.deposit.bridge.deposit_bridge_submit_phase = None;
+        state.deposit.bridge.deposit_bridge_call = None;
         state.trade.trade_next_amount_in = state.deposit.bridge.deposit_bridge_expected_amount;
         state.step = CexStep::DepositPending;
     }

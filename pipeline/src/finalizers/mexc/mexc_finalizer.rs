@@ -1040,7 +1040,6 @@ where
             };
             state.deposit.deposit_txid = Some(tx_id);
             state.deposit.deposit_sent_at_ts = Some(now_ts());
-            state.deposit.bridge.wait_for_funds();
             state.step = CexStep::DepositPending;
             return Ok(());
         }
