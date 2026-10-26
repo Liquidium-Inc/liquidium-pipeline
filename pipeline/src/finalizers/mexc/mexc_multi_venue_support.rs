@@ -94,6 +94,7 @@ where
                 trade_inverse_retry_count: 0,
                 trade_unexecutable_residual_in: None,
                 trade_settlement_waiting_since_ts: None,
+                trade_applied_client_order_ids: Vec::new(),
             },
             withdraw: CexWithdrawState {
                 withdraw_asset: receive_token,

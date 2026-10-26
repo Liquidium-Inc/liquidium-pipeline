@@ -236,6 +236,12 @@ pub struct CexTradeState {
     /// rather than restarted by every retry.
     #[serde(default)]
     pub trade_settlement_waiting_since_ts: Option<i64>,
+    /// Client order ids whose fills are already in the leg totals.
+    ///
+    /// MEXC answers a reused id with the original fill, so a reused id would
+    /// count that fill again. An id in this list is never submitted again.
+    #[serde(default)]
+    pub trade_applied_client_order_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -707,6 +713,7 @@ mod tests {
                     trade_inverse_retry_count: 0,
                     trade_unexecutable_residual_in: None,
                     trade_settlement_waiting_since_ts: None,
+                    trade_applied_client_order_ids: Vec::new(),
                 },
                 withdraw: CexWithdrawState {
                     withdraw_asset: recv,
@@ -863,6 +870,7 @@ mod tests {
                     trade_inverse_retry_count: 0,
                     trade_unexecutable_residual_in: None,
                     trade_settlement_waiting_since_ts: None,
+                    trade_applied_client_order_ids: Vec::new(),
                 },
                 withdraw: CexWithdrawState {
                     withdraw_asset: recv,
