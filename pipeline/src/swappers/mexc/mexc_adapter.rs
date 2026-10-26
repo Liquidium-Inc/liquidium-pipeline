@@ -148,6 +148,17 @@ fn is_coin_missing(err: &v3::ApiError) -> bool {
     )
 }
 
+/// MEXC answers a history read for a coin it does not list with 700004,
+/// "mandatory parameter 'coin' ... malformed". Seen live on 2026-10-26.
+const MEXC_MALFORMED_PARAM_RAW_CODE: i32 = 700004;
+
+/// True when a history read of a coin alias failed because MEXC does not
+/// list that alias, so no withdrawal can exist under it.
+fn is_unlisted_alias(err: &v3::ApiError) -> bool {
+    is_coin_missing(err)
+        || matches!(err, v3::ApiError::ErrorResponse(resp) if resp.raw_code == MEXC_MALFORMED_PARAM_RAW_CODE)
+}
+
 fn is_order_missing_lookup_error(message: &str) -> bool {
     let msg = message.to_ascii_lowercase();
     msg.contains("order does not exist")
@@ -1418,7 +1429,7 @@ impl CexBackend for MexcClient {
         // Older durable rows retain the planned symbol, not the alias MEXC
         // accepted. Search the same candidates as submission, matching only the
         // durable withdrawal ID; absence under one alias is not non-delivery.
-        for candidate in mexc_withdraw_coin_candidates(coin) {
+        for (index, candidate) in mexc_withdraw_coin_candidates(coin).into_iter().enumerate() {
             let records = match ex.withdraw_history(WithdrawHistoryRequest {
                 coin: Some(candidate),
                 status: None,
@@ -1428,6 +1439,8 @@ impl CexBackend for MexcClient {
             }).await {
                 Ok(records) => records,
                 Err(error) if is_coin_missing(&error) => continue,
+                // The planned coin must answer, so only an alias may be skipped.
+                Err(error) if index > 0 && is_unlisted_alias(&error) => continue,
                 Err(error) => return Err(error.to_string()),
             };
             rec = records.into_iter()
@@ -1489,6 +1502,26 @@ impl CexBackend for MexcClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_history_read_skips_only_aliases_that_mexc_does_not_list() {
+        let response = |code: v3::ErrorCode, raw_code: i32| {
+            v3::ApiError::ErrorResponse(v3::ErrorResponse {
+                code,
+                raw_code,
+                msg: "test".into(),
+                _extend: None,
+            })
+        };
+        assert!(is_unlisted_alias(&response(
+            v3::ErrorCode::ParamOrigClientOrderIdOrOrderIdMustBeSentButBothWereEmptyNull,
+            700004
+        )));
+        assert!(is_unlisted_alias(&response(v3::ErrorCode::CurrencyDoesNotExist, 10232)));
+        assert!(!is_unlisted_alias(&response(v3::ErrorCode::InternalError, 500)));
+        assert!(!is_unlisted_alias(&v3::ApiError::RateLimitExceeded));
+        assert_eq!(mexc_withdraw_coin_candidates("SOL"), vec!["SOL", "CKSOL"]);
+    }
 
     // Labels recorded from the live deposit address endpoint on 2026-10-21.
     #[test]
