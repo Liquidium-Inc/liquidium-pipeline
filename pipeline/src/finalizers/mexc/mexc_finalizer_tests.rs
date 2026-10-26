@@ -617,7 +617,7 @@ async fn mexc_native_icp_deposit_uses_ledger_account_id_destination() {
                 }
                 other => panic!("expected native ICP ledger account destination, got {:?}", other),
             }
-            assert_eq!(amount, Nat::from(930_000u64));
+            assert_eq!(amount, Nat::from(990_000u64));
             Ok("tx-native-icp".to_string())
         });
     transfers.expect_approve().times(0);
@@ -853,10 +853,10 @@ async fn mexc_deposit_bridge_submit_resume_and_complete() {
         .returning(|asset, chain, _address| {
             assert_eq!(asset, "ckUSDC");
             assert_eq!(chain, "ICP");
-            Ok(0.93)
+            Ok(0.99)
         });
     bridge.expect_prepare_submission().times(1).returning(|request| {
-        assert!((request.amount - 0.92).abs() < 1e-9);
+        assert!((request.amount - 0.98).abs() < 1e-9);
         Ok(Some(100))
     });
     bridge
@@ -885,7 +885,7 @@ async fn mexc_deposit_bridge_submit_resume_and_complete() {
         assert_eq!(request.asset, "ckUSDC");
         assert_eq!(request.source_chain, "ICP");
         assert_eq!(request.target_asset, "USDC");
-        assert!((request.amount - 0.92).abs() < 1e-9);
+        assert!((request.amount - 0.98).abs() < 1e-9);
         match request.destination {
             BridgeDestination::EvmAddress(_) => {}
             other => panic!("unexpected bridge destination: {:?}", other),
@@ -940,7 +940,7 @@ async fn mexc_deposit_bridge_submit_resume_and_complete() {
     let call = crate::bridge::call_sender::saved_call(&saved.prepared).unwrap();
     assert_eq!(call.cursor, Some(100));
     assert_eq!(call.destination, "0x1111111111111111111111111111111111111111");
-    assert!((call.amount - 0.92).abs() < 1e-9);
+    assert!((call.amount - 0.98).abs() < 1e-9);
 
     finalizer
         .deposit(&mut state)
@@ -1001,7 +1001,7 @@ async fn mexc_deposit_bridge_reserves_reverse_bridge_approval_fee_in_trade_amoun
         .returning(|asset, chain, _address| {
             assert_eq!(asset, "ckUSDC");
             assert_eq!(chain, "ICP");
-            Ok(0.93)
+            Ok(0.99)
         });
     bridge.expect_prepare_submission().times(1).returning(|_| Ok(None));
     bridge
@@ -1028,7 +1028,7 @@ async fn mexc_deposit_bridge_reserves_reverse_bridge_approval_fee_in_trade_amoun
         });
     bridge.expect_submit_bridge().times(1).returning(move |request| {
         assert!(
-            (request.amount - 0.92).abs() < 1e-9,
+            (request.amount - 0.98).abs() < 1e-9,
             "unexpected amount {}",
             request.amount
         );
@@ -1063,7 +1063,7 @@ async fn mexc_deposit_bridge_reserves_reverse_bridge_approval_fee_in_trade_amoun
         state.deposit.bridge.deposit_bridge_id.as_deref(),
         Some("bridge-deposit-2")
     );
-    assert!((state.trade.trade_next_amount_in.unwrap_or_default() - 0.92).abs() < 1e-9);
+    assert!((state.trade.trade_next_amount_in.unwrap_or_default() - 0.98).abs() < 1e-9);
 }
 
 #[tokio::test]
@@ -1144,7 +1144,7 @@ async fn mexc_deposit_bridge_reserves_native_cketh_withdrawal_fee_budget() {
     });
 
     transfers.expect_transfer().times(1).returning(|_token, _to, amount| {
-        assert_eq!(amount, Nat::from(5_086_000_000_000_000u64));
+        assert_eq!(amount, Nat::from(5_098_000_000_000_000u64));
         Ok("tx-bridge-fund-cketh".to_string())
     });
 
@@ -1154,7 +1154,7 @@ async fn mexc_deposit_bridge_reserves_native_cketh_withdrawal_fee_budget() {
         .returning(|asset, chain, _address| {
             assert_eq!(asset, "ckETH");
             assert_eq!(chain, "ICP");
-            Ok(0.005_086)
+            Ok(0.005_098)
         });
     bridge.expect_prepare_submission().times(1).returning(|_| Ok(Some(7)));
     bridge
@@ -1184,7 +1184,7 @@ async fn mexc_deposit_bridge_reserves_native_cketh_withdrawal_fee_budget() {
         assert_eq!(request.source_chain, "ICP");
         assert_eq!(request.target_asset, "ETH");
         assert!(
-            (request.amount - 0.005_034_099_114_98).abs() < 1e-15,
+            (request.amount - 0.005_046_099_114_98).abs() < 1e-15,
             "unexpected amount {}",
             request.amount
         );
@@ -1231,12 +1231,12 @@ async fn mexc_deposit_bridge_reserves_native_cketh_withdrawal_fee_budget() {
         Some("bridge-deposit-cketh")
     );
     assert!(
-        (state.deposit.bridge.deposit_bridge_submit_amount.unwrap_or_default() - 0.005_034_099_114_98).abs() < 1e-15
+        (state.deposit.bridge.deposit_bridge_submit_amount.unwrap_or_default() - 0.005_046_099_114_98).abs() < 1e-15
     );
     assert!(
-        (state.deposit.bridge.deposit_bridge_expected_amount.unwrap_or_default() - 0.004_984_198_229_96).abs() < 1e-15
+        (state.deposit.bridge.deposit_bridge_expected_amount.unwrap_or_default() - 0.004_996_198_229_96).abs() < 1e-15
     );
-    assert!((state.trade.trade_next_amount_in.unwrap_or_default() - 0.004_984_198_229_96).abs() < 1e-15);
+    assert!((state.trade.trade_next_amount_in.unwrap_or_default() - 0.004_996_198_229_96).abs() < 1e-15);
 }
 
 #[tokio::test]
@@ -1493,7 +1493,7 @@ async fn mexc_deposit_bridge_waits_for_cketh_fee_funding_snapshot() {
         .returning(|asset, chain, _address| {
             assert_eq!(chain, "ICP");
             match asset {
-                "ckUSDC" => Ok(0.93),
+                "ckUSDC" => Ok(0.99),
                 "ckETH" => Ok(0.000_080_356_126_532_001),
                 other => panic!("unexpected source balance asset {other}"),
             }
@@ -3522,7 +3522,8 @@ async fn mexc_committed_leg_below_dust_floor_still_executes() {
     let (remaining, output) = finalizer
         .execute_trade_leg_slices(&mut state, &leg, 0, 1, 0.01, 50.0)
         .await
-        .unwrap();
+        .unwrap()
+        .expect("the leg finishes");
     assert_eq!(remaining, 0.0);
     assert_eq!(output, 0.01);
     assert!(!state.trade.trade_dust_skipped);
@@ -5907,7 +5908,8 @@ async fn mexc_finish_builds_synthetic_swap_execution_from_state() {
     };
 
     assert!((swap.exec_price - expected_price).abs() < 1e-9);
-    assert!((swap.mid_price - expected_price).abs() < 1e-9);
+    // At the mids the route returns 1 / (1 - 42.5 bps) times more.
+    assert!((swap.mid_price - expected_price / (1.0 - 0.00425)).abs() < 1e-9);
     assert_eq!(swap.realized_slippage_bps, 42.5);
 
     // Status and legs should reflect a single synthetic CEX hop.
@@ -7439,7 +7441,8 @@ mod fill_accounting {
         let (remaining, output) = finalizer
             .execute_trade_leg_slices(&mut state, &leg(), 0, 1, 10.0, 140.0)
             .await
-            .expect("the residual sells inside the cap");
+            .expect("the residual sells inside the cap")
+            .expect("the leg finishes");
 
         let exchange = exchange.lock().unwrap();
         assert_eq!(exchange.requests.len(), 2);
@@ -7469,7 +7472,8 @@ mod fill_accounting {
         let (remaining, output) = finalizer
             .execute_trade_leg_slices(&mut state, &leg(), 0, 1, 10.0, 140.0)
             .await
-            .expect("the residual sells");
+            .expect("the residual sells")
+            .expect("the leg finishes");
 
         let exchange = exchange.lock().unwrap();
         assert_ne!(exchange.requests[0].0, exchange.requests[1].0);
@@ -7496,7 +7500,8 @@ mod fill_accounting {
         let (remaining, output) = finalizer
             .execute_trade_leg_slices(&mut state, &leg(), 0, 1, 10.0, 140.0)
             .await
-            .expect("the recovered fill and the residual both count");
+            .expect("the recovered fill and the residual both count")
+            .expect("the leg finishes");
 
         let exchange = exchange.lock().unwrap();
         let sent: Vec<&str> = exchange.requests[1..].iter().map(|(id, _)| id.as_str()).collect();
@@ -7523,7 +7528,8 @@ mod fill_accounting {
         let (remaining, output) = finalizer
             .execute_trade_leg_slices(&mut state, &leg(), 0, 1, 10.0, 140.0)
             .await
-            .expect("the residual sells under a fresh id");
+            .expect("the residual sells under a fresh id")
+            .expect("the leg finishes");
 
         let exchange = exchange.lock().unwrap();
         assert_ne!(exchange.requests[1].0, spent);
@@ -8016,5 +8022,288 @@ mod operator_answers {
         Mexc::answer_operator(&mut state, None).unwrap();
         let error = Mexc::answer_operator(&mut state, Some(&OperatorDecision::Absent)).unwrap_err();
         assert!(error.contains("--release"), "{error}");
+    }
+}
+
+mod execution_records {
+    //! Audit L19, L23 and L25: the fee reserve, the route slippage and the per-slice amounts.
+    use super::*;
+    use crate::finalizers::cex_finalizer::CexTradeSlice;
+
+    fn slice(
+        leg_index: u32,
+        market: &str,
+        side: &str,
+        amount_in: f64,
+        amount_out: f64,
+        mid_price: f64,
+    ) -> CexTradeSlice {
+        CexTradeSlice {
+            leg_index,
+            market: market.into(),
+            side: side.into(),
+            amount_in,
+            amount_out,
+            mid_price,
+            exec_price: 0.0,
+            slippage_bps: 0.0,
+        }
+    }
+
+    fn route_bps(slices: &[CexTradeSlice]) -> f64 {
+        MexcFinalizer::<MockCexBackend>::route_slippage_bps(slices)
+    }
+
+    #[test]
+    fn a_buy_above_mid_and_a_sell_below_mid_are_both_adverse() {
+        // Paid 101 for one unit with a mid of 100: 1.01 units at mid, 1 received.
+        assert!((route_bps(&[slice(0, "ICP_USDT", "buy", 101.0, 1.0, 100.0)]) - 99.009_900_99).abs() < 1e-6);
+        // Sold one unit for 99 with a mid of 100.
+        assert!((route_bps(&[slice(0, "ICP_USDT", "sell", 1.0, 99.0, 100.0)]) - 100.0).abs() < 1e-9);
+        // Better than mid is no slippage.
+        assert_eq!(route_bps(&[slice(0, "ICP_USDT", "buy", 99.0, 1.0, 100.0)]), 0.0);
+    }
+
+    #[test]
+    fn legs_in_different_quote_currencies_combine_their_own_ratios() {
+        let slices = [
+            // 50 bps on a BTC-quoted leg of 0.01 BTC.
+            slice(0, "CKBTC_BTC", "sell", 0.01, 0.00995, 1.0),
+            // 30 bps on a USDC-quoted leg: 995 USDC at mid, 992.015 received.
+            slice(1, "BTC_USDC", "sell", 0.00995, 992.015, 100_000.0),
+        ];
+        // 0.995 * 0.997 of the output at mid arrives: 79.85 bps, not 80.
+        assert!((route_bps(&slices) - 79.85).abs() < 1e-6, "{}", route_bps(&slices));
+    }
+
+    #[test]
+    fn losses_on_sequential_legs_compound() {
+        let slices = [
+            slice(0, "ICP_USDT", "sell", 1.0, 90.0, 100.0),
+            slice(1, "BTC_USDT", "buy", 90.0, 0.0009, 90_000.0),
+        ];
+        // Each leg keeps 90% of its output at mid, so the route keeps 81%.
+        assert!((route_bps(&slices) - 1_900.0).abs() < 1e-6, "{}", route_bps(&slices));
+    }
+
+    #[tokio::test]
+    async fn a_finished_row_reports_slippage_from_its_slices_not_a_saved_figure() {
+        let finalizer = MexcFinalizer::new(
+            Arc::new(MockCexBackend::new()),
+            Arc::new(MockTransferActions::new()),
+            Principal::anonymous(),
+            TEST_MAX_SELL_SLIPPAGE_BPS,
+            TEST_CEX_MIN_EXEC_USD,
+            TEST_CEX_SLICE_TARGET_RATIO,
+        );
+        let receipt = make_execution_receipt(44);
+        let mut state = finalizer.prepare("44", &receipt).await.expect("prepare should succeed");
+        state.withdraw.size_out = Some(ChainTokenAmount::from_formatted(
+            state.withdraw.withdraw_asset.clone(),
+            2.0,
+        ));
+        // An older build saved this figure under the old formula.
+        state.trade.trade_weighted_slippage_bps = Some(999.0);
+        state.trade.trade_slices = vec![slice(0, "ICP_USDT", "sell", 1.0, 99.0, 100.0)];
+
+        let swap = finalizer.finish(&receipt, &state).await.expect("finish should succeed");
+
+        assert!(
+            (swap.realized_slippage_bps - 100.0).abs() < 1e-9,
+            "{}",
+            swap.realized_slippage_bps
+        );
+    }
+
+    #[tokio::test]
+    async fn slice_records_keep_token_decimals() {
+        let finalizer = MexcFinalizer::new(
+            Arc::new(MockCexBackend::new()),
+            Arc::new(MockTransferActions::new()),
+            Principal::anonymous(),
+            TEST_MAX_SELL_SLIPPAGE_BPS,
+            TEST_CEX_MIN_EXEC_USD,
+            TEST_CEX_SLICE_TARGET_RATIO,
+        );
+        let receipt = make_execution_receipt(43);
+        let mut state = finalizer.prepare("43", &receipt).await.expect("prepare should succeed");
+        state.withdraw.size_out = Some(ChainTokenAmount::from_formatted(
+            state.withdraw.withdraw_asset.clone(),
+            2.0,
+        ));
+        state.trade.trade_slices = vec![slice(0, "BTC_USDC", "sell", 0.01, 500.0, 50_000.0)];
+
+        let swap = finalizer.finish(&receipt, &state).await.expect("finish should succeed");
+
+        assert_eq!(swap.legs.len(), 1);
+        assert_eq!(swap.legs[0].pay_amount, Nat::from(1_000_000u64), "0.01 BTC in sats");
+        assert_eq!(
+            swap.legs[0].receive_amount,
+            Nat::from(500_000_000u64),
+            "500 USDC in 6 decimals"
+        );
+    }
+
+    /// Only a direct non-native ICP deposit sends approval bumps, so only it
+    /// holds back their fees; every other route keeps the transfer fee alone.
+    #[test]
+    fn the_deposit_reserve_covers_only_the_fees_its_route_pays() {
+        type F = MexcFinalizer<MockCexBackend>;
+        let sol = ChainToken::SolanaNative {
+            symbol: "SOL".into(),
+            decimals: 9,
+            fee: Nat::from(5_000u64),
+        };
+        assert_eq!(F::deposit_fee_count(&ckusdc_token(), false), 7);
+        assert_eq!(F::deposit_fee_count(&ckusdc_token(), true), 1);
+        assert_eq!(F::deposit_fee_count(&native_icp_token(), false), 1);
+        assert_eq!(F::deposit_fee_count(&sol, false), 1);
+
+        let size_in = ChainTokenAmount::from_raw(ckusdc_token(), Nat::from(1_000_000u64));
+        let fee = ckusdc_token().fee();
+        let (direct, _) = F::compute_fee_adjusted_deposit_transfer(&ckusdc_token(), &size_in, false).unwrap();
+        let (bridged, _) = F::compute_fee_adjusted_deposit_transfer(&ckusdc_token(), &size_in, true).unwrap();
+        assert_eq!(direct, Nat::from(1_000_000u64) - fee.clone() * 7u8);
+        assert_eq!(bridged, Nat::from(1_000_000u64) - fee);
+    }
+}
+
+mod price_limited_orders {
+    //! Audit S3: the exchange enforces the slippage cap on every slice order.
+    use super::*;
+    use liquidium_pipeline_connectors::backend::cex_backend::{PriceLimit, SwapExecutionOptions};
+
+    type Orders = Arc<std::sync::Mutex<Vec<SwapExecutionOptions>>>;
+
+    /// A ckBTC -> ckUSDT finalizer whose first leg, CKBTC_BTC, answers each
+    /// order with the next fill; `None` is a fill of the whole request.
+    fn finalizer_with_fills(fills: Vec<Option<f64>>) -> (MexcFinalizer<MockCexBackend>, Orders) {
+        let mut backend = MockCexBackend::new();
+        let book = OrderBook {
+            bids: vec![OrderBookLevel {
+                price: 1.0,
+                quantity: 1_000.0,
+            }],
+            asks: vec![OrderBookLevel {
+                price: 1.001,
+                quantity: 1_000.0,
+            }],
+        };
+        backend.expect_get_orderbook().returning(move |_, _| Ok(book.clone()));
+        let orders: Orders = Arc::default();
+        let seen = orders.clone();
+        let fills = std::sync::Mutex::new(fills.into_iter());
+        backend
+            .expect_execute_swap_detailed_with_options()
+            .returning(move |market, _, amount_in, options| {
+                assert_eq!(market, "CKBTC_BTC");
+                seen.lock().unwrap().push(options);
+                let consumed = fills
+                    .lock()
+                    .unwrap()
+                    .next()
+                    .expect("an unexpected order")
+                    .unwrap_or(amount_in);
+                Ok(SwapFillReport {
+                    input_consumed: consumed,
+                    output_received: consumed * 0.9999,
+                })
+            });
+        let finalizer = MexcFinalizer::new(
+            Arc::new(backend),
+            Arc::new(MockTransferActions::new()),
+            Principal::anonymous(),
+            TEST_MAX_SELL_SLIPPAGE_BPS,
+            TEST_CEX_MIN_EXEC_USD,
+            TEST_CEX_SLICE_TARGET_RATIO,
+        );
+        (finalizer, orders)
+    }
+
+    async fn trade_state(finalizer: &MexcFinalizer<MockCexBackend>) -> CexState {
+        let mut state = finalizer.prepare("42", &make_execution_receipt(42)).await.unwrap();
+        state.step = CexStep::Trade;
+        state
+    }
+
+    fn client_ids(orders: &Orders) -> Vec<String> {
+        orders
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|o| o.client_order_id.clone().unwrap())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn every_slice_order_carries_the_cap_as_its_limit() {
+        let (finalizer, orders) = finalizer_with_fills(vec![None]);
+        let mut state = trade_state(&finalizer).await;
+
+        finalizer.trade(&mut state).await.expect("the leg fills");
+
+        let orders = orders.lock().unwrap();
+        assert_eq!(orders.len(), 1);
+        assert_eq!(
+            orders[0].price_limit,
+            Some(PriceLimit {
+                reference_price: state.trade.trade_slices[0].mid_price,
+                max_slippage_bps: TEST_MAX_SELL_SLIPPAGE_BPS,
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn an_order_that_fills_nothing_spends_its_id_and_previews_again() {
+        let (finalizer, orders) = finalizer_with_fills(vec![Some(0.0), None]);
+        let mut state = trade_state(&finalizer).await;
+
+        finalizer.trade(&mut state).await.expect("the second order fills");
+
+        let ids = client_ids(&orders);
+        assert_eq!(ids.len(), 2);
+        assert_ne!(ids[0], ids[1], "a spent id is never sent again");
+        assert!(state.trade.trade_applied_client_order_ids.contains(&ids[0]));
+        assert_eq!(state.trade.trade_slices.len(), 1, "an empty order records no slice");
+    }
+
+    #[tokio::test]
+    async fn a_partial_fill_leaves_the_rest_for_the_next_order() {
+        let (finalizer, orders) = finalizer_with_fills(vec![Some(0.0001), None]);
+        let mut state = trade_state(&finalizer).await;
+        let amount_in = state.size_in.to_f64();
+
+        finalizer.trade(&mut state).await.expect("the rest fills");
+
+        assert_eq!(client_ids(&orders).len(), 2);
+        let consumed: f64 = state.trade.trade_slices.iter().map(|slice| slice.amount_in).sum();
+        assert!(consumed > 0.0001 && consumed <= amount_in, "{consumed} of {amount_in}");
+    }
+
+    #[tokio::test]
+    async fn empty_fills_in_a_row_pause_the_leg_without_an_error() {
+        let (finalizer, orders) = finalizer_with_fills(vec![Some(0.0), Some(0.0), Some(0.0), None]);
+        let mut state = trade_state(&finalizer).await;
+
+        finalizer
+            .trade(&mut state)
+            .await
+            .expect("a pause is a wait, not an error");
+
+        let ids = client_ids(&orders);
+        assert_eq!(ids.len(), 3);
+        assert!(
+            ids.iter()
+                .all(|id| state.trade.trade_applied_client_order_ids.contains(id))
+        );
+        assert!(state.trade.trade_slices.is_empty());
+        assert!(state.last_error.is_none());
+        assert_eq!(state.trade.trade_leg_index.unwrap_or(0), 0, "the leg did not advance");
+
+        // The next cycle resumes the same leg and fills it.
+        finalizer.trade(&mut state).await.expect("the next cycle fills");
+        assert_eq!(client_ids(&orders).len(), 4);
+        assert_eq!(state.trade.trade_slices.len(), 1);
+        assert_eq!(state.trade.trade_leg_index, Some(1));
     }
 }

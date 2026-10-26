@@ -3,11 +3,11 @@ use std::env;
 
 use async_trait::async_trait;
 
-use liquidium_pipeline_core::outbound::SIDE_EFFECT_AMBIGUOUS_PREFIX;
 use liquidium_pipeline_connectors::backend::cex_backend::{
-    BuyOrderInputMode, CexBackend, CexBackendError, DepositAddress, OrderBook, OrderBookLevel, SwapExecutionOptions,
-    SwapFillReport, WithdrawStatus, WithdrawStatusSnapshot, WithdrawalReceipt,
+    BuyOrderInputMode, CexBackend, CexBackendError, DepositAddress, OrderBook, OrderBookLevel, PriceLimit,
+    SwapExecutionOptions, SwapFillReport, WithdrawStatus, WithdrawStatusSnapshot, WithdrawalReceipt,
 };
+use liquidium_pipeline_core::outbound::SIDE_EFFECT_AMBIGUOUS_PREFIX;
 use log::{debug, info, warn};
 use rust_decimal::{Decimal, RoundingStrategy};
 use serde_json::Value;
@@ -188,6 +188,15 @@ fn is_definite_rejection(err: &v3::ApiError) -> bool {
     }
 }
 
+/// MEXC answered the IOC order with a refusal about the order itself, for
+/// example 30041 "current order type can not place order". Nothing was placed.
+fn is_ioc_refusal(err: &v3::ApiError) -> bool {
+    matches!(err, v3::ApiError::ErrorResponse(_))
+        && is_definite_rejection(err)
+        && !is_bad_symbol(err)
+        && !is_pending_settlement(err)
+}
+
 fn is_order_missing_lookup_error(message: &str) -> bool {
     let msg = message.to_ascii_lowercase();
     msg.contains("order does not exist")
@@ -205,6 +214,10 @@ struct SymbolFilters {
     base_precision: Option<u32>,
     taker_fee_bps: Option<f64>,
     resolved_symbol: Option<String>,
+    /// `PERCENT_PRICE_BY_SIDE`: how far above the market a buy may be priced.
+    buy_price_band: Option<Decimal>,
+    /// `PERCENT_PRICE_BY_SIDE`: how far below the market a sell may be priced.
+    sell_price_band: Option<Decimal>,
 }
 
 fn truncate_to_step(value: Decimal, step: Decimal) -> Decimal {
@@ -358,6 +371,7 @@ use mexc_rs::spot::{
     v3::{
         self,
         account_information::{AccountBalance, AccountInformationEndpoint},
+        cancel_order::{CancelOrderEndpoint, CancelOrderParams},
         deposit_address::DepositAddressEndpoint,
         depth::{DepthEndpoint, DepthParams},
         enums::{OrderSide, OrderStatus},
@@ -368,6 +382,33 @@ use mexc_rs::spot::{
 };
 
 use num_traits::{FromPrimitive, ToPrimitive};
+
+/// The market order of one slice: a base quantity, or for a buy a quote amount.
+#[derive(Debug, Clone, Copy)]
+struct MarketOrder {
+    quantity: Option<Decimal>,
+    quote_order_quantity: Option<Decimal>,
+}
+
+/// The IOC limit order of one slice: nothing fills worse than `price`.
+#[derive(Debug, Clone, Copy)]
+struct IocOrder {
+    quantity: Decimal,
+    price: Decimal,
+}
+
+/// One limit order as MEXC reports it after placement.
+#[derive(Debug, Clone)]
+pub struct LimitOrderReport {
+    pub order_id: String,
+    pub status: OrderStatus,
+    pub executed_quantity: Decimal,
+    pub cumulative_quote_quantity: Decimal,
+}
+
+/// Reads after placement that may miss a just-created order.
+const ORDER_LOOKUP_ATTEMPTS: u32 = 5;
+const ORDER_LOOKUP_PAUSE: std::time::Duration = std::time::Duration::from_millis(400);
 
 pub struct MexcClient {
     inner: tokio::sync::Mutex<MexcSpotApiClientWithAuthentication>,
@@ -462,6 +503,88 @@ impl MexcClient {
             }
         }
         Ok(None)
+    }
+
+    /// Places a limit order whose unfilled rest MEXC cancels at once (IOC), so
+    /// no part fills beyond `price`. It then reads the order back.
+    pub async fn place_ioc_limit_order(
+        &self,
+        symbol: &str,
+        side: OrderSide,
+        quantity: Decimal,
+        price: Decimal,
+        client_order_id: &str,
+    ) -> Result<LimitOrderReport, String> {
+        let ex = self.inner.lock().await;
+        let placed = ex
+            .order(OrderParams {
+                symbol,
+                side,
+                order_type: v3::enums::OrderType::ImmediateOrCancel,
+                quantity: Some(quantity),
+                quote_order_quantity: None,
+                price: Some(price),
+                new_client_order_id: Some(client_order_id),
+            })
+            .await
+            .map_err(|error| format!("IOC order refused: {}", format_mexc_api_error(&error)))?;
+        let mut attempt = 0;
+        loop {
+            attempt += 1;
+            match ex
+                .get_order(GetOrderParams {
+                    symbol,
+                    order_id: Some(&placed.order_id),
+                    new_client_order_id: None,
+                    original_client_order_id: None,
+                })
+                .await
+            {
+                Ok(order) => {
+                    return Ok(LimitOrderReport {
+                        order_id: placed.order_id,
+                        status: order.status,
+                        executed_quantity: order.executed_quantity,
+                        cumulative_quote_quantity: order.cummulative_quote_quantity,
+                    });
+                }
+                Err(error) if attempt < ORDER_LOOKUP_ATTEMPTS => {
+                    debug!(
+                        "[mexc] order {} not readable yet: {}",
+                        placed.order_id,
+                        format_mexc_api_error(&error)
+                    );
+                    tokio::time::sleep(ORDER_LOOKUP_PAUSE).await;
+                }
+                Err(error) => {
+                    return Err(format!(
+                        "IOC order {} placed but not readable: {}",
+                        placed.order_id,
+                        format_mexc_api_error(&error)
+                    ));
+                }
+            }
+        }
+    }
+
+    /// Cancels an open order and returns its final state.
+    pub async fn cancel_order(&self, symbol: &str, order_id: &str) -> Result<LimitOrderReport, String> {
+        let ex = self.inner.lock().await;
+        let cancelled = ex
+            .cancel_order(CancelOrderParams {
+                symbol,
+                order_id: Some(order_id),
+                original_client_order_id: None,
+                new_client_order_id: None,
+            })
+            .await
+            .map_err(|error| format!("cancel of {order_id} failed: {}", format_mexc_api_error(&error)))?;
+        Ok(LimitOrderReport {
+            order_id: cancelled.order_id,
+            status: cancelled.status,
+            executed_quantity: cancelled.executed_quantity,
+            cumulative_quote_quantity: cancelled.cummulative_quote_quantity,
+        })
     }
 
     pub fn from_env() -> Result<Self, String> {
@@ -565,6 +688,10 @@ impl MexcClient {
                     "MIN_NOTIONAL" | "NOTIONAL" => {
                         filters.min_notional = parse_decimal(f, "minNotional").or(filters.min_notional);
                     }
+                    "PERCENT_PRICE_BY_SIDE" => {
+                        filters.buy_price_band = parse_decimal(f, "bidMultiplierUp").or(filters.buy_price_band);
+                        filters.sell_price_band = parse_decimal(f, "askMultiplierDown").or(filters.sell_price_band);
+                    }
                     _ => {}
                 }
             }
@@ -586,8 +713,8 @@ impl MexcClient {
 }
 
 impl MexcClient {
-    /// Execution uses MARKET orders, so a listed market is only usable when
-    /// its metadata advertises them.
+    /// An order without a price limit is a MARKET order, so a listed market is
+    /// only usable when its metadata advertises them. IOC is accepted unlisted.
     fn validate_market_order_support(info: &Value, symbol: &str) -> Result<(), String> {
         if !supports_market_orders(info) {
             return Err(format!("MEXC market {symbol} does not support MARKET orders"));
@@ -806,60 +933,100 @@ impl MexcClient {
         Ok((OrderSide::Sell, Some(qty), None))
     }
 
-    async fn submit_market_order(
+    /// Submits the IOC order when there is one, else the market order. A
+    /// definite refusal of the IOC order placed nothing, so the market order
+    /// follows under the same client id.
+    async fn submit_order(
         &self,
         ex: &MexcSpotApiClientWithAuthentication,
         candidates: &[String],
         order_side: OrderSide,
-        quantity: Option<Decimal>,
-        quote_order_quantity: Option<Decimal>,
+        market_order: Option<MarketOrder>,
+        ioc_order: Option<IocOrder>,
         client_order_id: Option<&str>,
         market: &str,
         side: &str,
-        _amount_in: f64,
     ) -> Result<(String, String), CexBackendError> {
         let mut last_err: Option<String> = None;
         for candidate in candidates {
+            if let Some(ioc) = ioc_order {
+                let placed = ex
+                    .order(OrderParams {
+                        symbol: candidate,
+                        side: order_side,
+                        order_type: v3::enums::OrderType::ImmediateOrCancel,
+                        quantity: Some(ioc.quantity),
+                        new_client_order_id: client_order_id,
+                        price: Some(ioc.price),
+                        quote_order_quantity: None,
+                    })
+                    .await;
+                match placed {
+                    Ok(ok) => return Self::placed_order(candidate, ok.order_id, market, side),
+                    Err(e) if is_bad_symbol(&e) => {
+                        last_err = Some(format!("Swap err: {}", format_mexc_api_error(&e)));
+                        continue;
+                    }
+                    Err(e) if is_ioc_refusal(&e) && market_order.is_some() => {
+                        warn!(
+                            "[mexc] IOC order refused for {} {} ({}); sending a market order",
+                            candidate,
+                            side,
+                            format_mexc_api_error(&e)
+                        );
+                    }
+                    Err(e) => return Err(Self::order_error(&e)),
+                }
+            }
+            let Some(market_order) = market_order else {
+                return Err("Swap err: no order could be built".to_string().into());
+            };
             match ex
                 .order(OrderParams {
                     symbol: candidate,
                     side: order_side,
                     order_type: v3::enums::OrderType::Market,
-                    quantity,
+                    quantity: market_order.quantity,
                     new_client_order_id: client_order_id,
                     price: None,
-                    quote_order_quantity,
+                    quote_order_quantity: market_order.quote_order_quantity,
                 })
                 .await
             {
-                Ok(ok) => {
-                    let order_id = ok.order_id.trim().to_string();
-                    if order_id.is_empty() {
-                        let details = format!(
-                            "empty order_id returned for symbol={} market={} side={}",
-                            candidate, market, side
-                        );
-                        warn!("[mexc] {}", details);
-                        return Err(details.into());
-                    }
-                    return Ok((candidate.clone(), order_id));
+                Ok(ok) => return Self::placed_order(candidate, ok.order_id, market, side),
+                Err(e) if is_bad_symbol(&e) => {
+                    last_err = Some(format!("Swap err: {}", format_mexc_api_error(&e)));
+                    continue;
                 }
-                Err(e) => {
-                    let details = format_mexc_api_error(&e);
-                    warn!("[mexc] order error response: {}", details);
-                    if is_bad_symbol(&e) {
-                        last_err = Some(format!("Swap err: {}", details));
-                        continue;
-                    }
-                    if is_pending_settlement(&e) {
-                        return Err(CexBackendError::PendingSettlement(format!("Swap err: {details}")));
-                    }
-                    return Err(format!("Swap err: {details}").into());
-                }
+                Err(e) => return Err(Self::order_error(&e)),
             }
         }
 
         Err(last_err.unwrap_or_else(|| "Swap err: bad symbol".to_string()).into())
+    }
+
+    fn placed_order(
+        candidate: &str,
+        order_id: String,
+        market: &str,
+        side: &str,
+    ) -> Result<(String, String), CexBackendError> {
+        let order_id = order_id.trim().to_string();
+        if order_id.is_empty() {
+            let details = format!("empty order_id returned for symbol={candidate} market={market} side={side}");
+            warn!("[mexc] {}", details);
+            return Err(details.into());
+        }
+        Ok((candidate.to_string(), order_id))
+    }
+
+    fn order_error(e: &v3::ApiError) -> CexBackendError {
+        let details = format_mexc_api_error(e);
+        warn!("[mexc] order error response: {}", details);
+        if is_pending_settlement(e) {
+            return CexBackendError::PendingSettlement(format!("Swap err: {details}"));
+        }
+        format!("Swap err: {details}").into()
     }
 
     /// Converts MEXC order fill fields into side-agnostic execution amounts.
@@ -924,19 +1091,82 @@ impl MexcClient {
             .await
             .map_err(|e| format!("Get_order err: {}", format_mexc_api_error(&e)))?;
 
-        match order_res.status {
-            OrderStatus::Filled => {}
-            other => {
-                return Err(format!("order not executed, status: {:?}", other));
-            }
+        if !Self::is_final_order_status(order_res.status) {
+            return Err(format!("order not executed, status: {:?}", order_res.status));
         }
-
-        Self::map_fill_report(
+        Self::final_fill_report(
             side_norm,
             order_res.executed_quantity,
             order_res.cummulative_quote_quantity,
             fee_bps,
         )
+    }
+
+    /// Filled, or cancelled after any fill: the order trades no further. An IOC
+    /// order ends cancelled when the book had no more within its price.
+    fn is_final_order_status(status: OrderStatus) -> bool {
+        matches!(
+            status,
+            OrderStatus::Filled | OrderStatus::Canceled | OrderStatus::PartiallyCanceled
+        )
+    }
+
+    /// The fill of a final order. A cancelled order that filled nothing is a zero fill.
+    fn final_fill_report(
+        side_norm: &str,
+        executed_quantity: Decimal,
+        cummulative_quote_quantity: Decimal,
+        fee_bps: f64,
+    ) -> Result<SwapFillReport, String> {
+        if executed_quantity <= Decimal::ZERO {
+            return Ok(SwapFillReport {
+                input_consumed: 0.0,
+                output_received: 0.0,
+            });
+        }
+        Self::map_fill_report(side_norm, executed_quantity, cummulative_quote_quantity, fee_bps)
+    }
+
+    /// The IOC order price: the slippage cap, kept inside MEXC's price band for
+    /// the side and rounded toward the stricter price.
+    fn ioc_limit_price(
+        side_norm: &str,
+        limit: &PriceLimit,
+        filters: Option<&SymbolFilters>,
+    ) -> Result<Decimal, String> {
+        let reference = Decimal::from_f64(limit.reference_price)
+            .filter(|price| *price > Decimal::ZERO)
+            .ok_or_else(|| format!("invalid reference price {}", limit.reference_price))?;
+        let cap = Decimal::from_f64(limit.max_slippage_bps / BPS_PER_RATIO_UNIT)
+            .filter(|cap| *cap >= Decimal::ZERO && *cap < Decimal::ONE)
+            .ok_or_else(|| format!("invalid slippage cap {} bps", limit.max_slippage_bps))?;
+        let sell = side_norm == "sell";
+        let band = filters.and_then(|f| if sell { f.sell_price_band } else { f.buy_price_band });
+        // MEXC measures its band from its own price, so stay inside 90% of it.
+        let allowed = band.map_or(cap, |band| cap.min(band * Decimal::new(9, 1)));
+        let decimals = filters.and_then(|f| f.quote_precision).unwrap_or(8);
+        let price = if sell {
+            (reference * (Decimal::ONE - allowed)).round_dp_with_strategy(decimals, RoundingStrategy::AwayFromZero)
+        } else {
+            (reference * (Decimal::ONE + allowed)).round_dp_with_strategy(decimals, RoundingStrategy::ToZero)
+        };
+        if price <= Decimal::ZERO {
+            return Err(format!("IOC price {price} not valid"));
+        }
+        Ok(price.normalize())
+    }
+
+    /// The base quantity an IOC buy may take: every unit fills at or under the
+    /// price, so the order spends at most `quote_amount`.
+    fn ioc_buy_quantity(
+        quote_amount: Decimal,
+        price: Decimal,
+        filters: Option<&SymbolFilters>,
+        symbol: &str,
+    ) -> Result<Decimal, String> {
+        let quantity = Self::adjust_buy_quantity(quote_amount / price, filters, symbol)?;
+        Self::ensure_min_notional(filters, quantity * price, symbol)?;
+        Ok(quantity)
     }
 
     async fn try_fetch_fill_report_by_client_order_id(
@@ -976,17 +1206,14 @@ impl MexcClient {
             }
         };
 
-        match order_res.status {
-            OrderStatus::Filled => {}
-            other => {
-                return Err(format!(
-                    "order {} not executed yet for {} (status={:?})",
-                    client_order_id, symbol, other
-                ));
-            }
+        if !Self::is_final_order_status(order_res.status) {
+            return Err(format!(
+                "order {} not executed yet for {} (status={:?})",
+                client_order_id, symbol, order_res.status
+            ));
         }
 
-        let report = Self::map_fill_report(
+        let report = Self::final_fill_report(
             side_norm,
             order_res.executed_quantity,
             order_res.cummulative_quote_quantity,
@@ -1164,38 +1391,69 @@ impl CexBackend for MexcClient {
 
         let candidates = Self::candidate_symbols(api_symbol, &market_symbol, &symbol);
 
-        // Lock the authenticated client per exchange interaction, not for the full swap flow.
-        let (order_side, quantity, quote_order_quantity) = match side_norm.as_str() {
-            "sell" => Self::prepare_sell_order(amount_dec, filters.as_ref(), symbol.as_str())?,
-            "buy" => {
-                let ex = self.inner.lock().await;
-                self.prepare_buy_order(
-                    &ex,
-                    amount_dec,
-                    filters.as_ref(),
-                    api_symbol,
-                    symbol.as_str(),
-                    options.buy_mode,
-                    options.max_quote_overspend_bps,
-                )
-                .await?
-            }
+        let order_side = match side_norm.as_str() {
+            "sell" => OrderSide::Sell,
+            "buy" => OrderSide::Buy,
             _ => return Err(format!("unsupported side: {side}").into()),
+        };
+        // Lock the authenticated client per exchange interaction, not for the full swap flow.
+        let market_order = if order_side == OrderSide::Sell {
+            Self::prepare_sell_order(amount_dec, filters.as_ref(), symbol.as_str())
+        } else {
+            let ex = self.inner.lock().await;
+            self.prepare_buy_order(
+                &ex,
+                amount_dec,
+                filters.as_ref(),
+                api_symbol,
+                symbol.as_str(),
+                options.buy_mode,
+                options.max_quote_overspend_bps,
+            )
+            .await
+        }
+        .map(|(_, quantity, quote_order_quantity)| MarketOrder {
+            quantity,
+            quote_order_quantity,
+        });
+        // An IOC order that cannot be built here goes out as the market order.
+        let ioc_order = options.price_limit.as_ref().and_then(|limit| {
+            let built = Self::ioc_limit_price(&side_norm, limit, filters.as_ref()).and_then(|price| {
+                let quantity = match order_side {
+                    OrderSide::Sell => market_order
+                        .as_ref()
+                        .map_err(Clone::clone)?
+                        .quantity
+                        .ok_or("sell order has no quantity")?,
+                    OrderSide::Buy => Self::ioc_buy_quantity(amount_dec, price, filters.as_ref(), &symbol)?,
+                };
+                Ok(IocOrder { quantity, price })
+            });
+            built
+                .inspect_err(|error| warn!("[mexc] no IOC order for {market} {side} ({error}); sending a market order"))
+                .ok()
+        });
+        let market_order = match (market_order, ioc_order) {
+            (Ok(order), _) => Some(order),
+            (Err(error), Some(_)) => {
+                warn!("[mexc] no market fallback for {market} {side} ({error}); sending the IOC order alone");
+                None
+            }
+            (Err(error), None) => return Err(error.into()),
         };
 
         // Try multiple candidate symbols for MEXC quirks, then fetch the filled amount.
         let submit_res = {
             let ex = self.inner.lock().await;
-            self.submit_market_order(
+            self.submit_order(
                 &ex,
                 &candidates,
                 order_side,
-                quantity,
-                quote_order_quantity,
+                market_order,
+                ioc_order,
                 options.client_order_id.as_deref(),
                 market,
                 side,
-                amount_in,
             )
             .await
         };
@@ -1899,5 +2157,182 @@ mod tests {
         assert_eq!(parse_mexc_transaction_fee(""), None);
         assert_eq!(parse_mexc_transaction_fee("-0.1"), None);
         assert_eq!(parse_mexc_transaction_fee("abc"), None);
+    }
+
+    /// Audit S3: the limit sits at the cap, inside MEXC's band, rounded strict.
+    #[test]
+    fn the_ioc_price_is_the_cap_inside_the_price_band() {
+        let limit = PriceLimit {
+            reference_price: 2.611,
+            max_slippage_bps: 200.0,
+        };
+        let filters = |band: Option<Decimal>| SymbolFilters {
+            quote_precision: Some(3),
+            buy_price_band: band,
+            sell_price_band: band,
+            ..SymbolFilters::default()
+        };
+        let price = |side: &str, band| MexcClient::ioc_limit_price(side, &limit, Some(&filters(band))).unwrap();
+
+        // ICP bands are 20%, so the 2% cap applies: 2.55878 rounds up, 2.66322 down.
+        assert_eq!(price("sell", Some(Decimal::new(2, 1))), Decimal::new(2559, 3));
+        assert_eq!(price("buy", Some(Decimal::new(2, 1))), Decimal::new(2663, 3));
+        // A 0.5% band (BTC, ETH) clamps the cap to 0.45%.
+        assert_eq!(price("sell", Some(Decimal::new(5, 3))), Decimal::new(2600, 3));
+        assert_eq!(price("buy", Some(Decimal::new(5, 3))), Decimal::new(2622, 3));
+        assert!(
+            MexcClient::ioc_limit_price(
+                "sell",
+                &PriceLimit {
+                    reference_price: 0.0,
+                    ..limit
+                },
+                None
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn an_ioc_buy_never_spends_more_than_its_quote_input() {
+        let filters = SymbolFilters {
+            base_precision: Some(2),
+            ..SymbolFilters::default()
+        };
+        let price = Decimal::new(2663, 3);
+        let quantity = MexcClient::ioc_buy_quantity(Decimal::new(10, 0), price, Some(&filters), "ICPUSDT").unwrap();
+        assert_eq!(quantity, Decimal::new(375, 2));
+        assert!(quantity * price <= Decimal::new(10, 0));
+    }
+
+    #[test]
+    fn a_cancelled_order_reports_what_filled_before_the_cancel() {
+        assert!(MexcClient::is_final_order_status(OrderStatus::Canceled));
+        assert!(MexcClient::is_final_order_status(OrderStatus::PartiallyCanceled));
+        assert!(!MexcClient::is_final_order_status(OrderStatus::New));
+        assert!(!MexcClient::is_final_order_status(OrderStatus::PartiallyFilled));
+
+        let nothing = MexcClient::final_fill_report("sell", Decimal::ZERO, Decimal::ZERO, 5.0).unwrap();
+        assert_eq!((nothing.input_consumed, nothing.output_received), (0.0, 0.0));
+        let partial = MexcClient::final_fill_report("sell", Decimal::new(45, 2), Decimal::new(117495, 5), 0.0).unwrap();
+        assert_eq!((partial.input_consumed, partial.output_received), (0.45, 1.17495));
+    }
+
+    /// Serves one canned response per connection and returns each request's head.
+    async fn serve(responses: Vec<(u16, &'static str)>) -> (String, tokio::task::JoinHandle<Vec<String>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let mut requests = Vec::new();
+            for (status, body) in responses {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                let mut buffer = [0; 4096];
+                while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                    let count = stream.read(&mut buffer).await.unwrap();
+                    assert!(count > 0);
+                    request.extend_from_slice(&buffer[..count]);
+                }
+                requests.push(
+                    String::from_utf8_lossy(&request)
+                        .lines()
+                        .next()
+                        .unwrap_or_default()
+                        .to_string(),
+                );
+                let response = format!(
+                    "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+            }
+            requests
+        });
+        (endpoint, server)
+    }
+
+    fn client_at(endpoint: String) -> MexcClient {
+        MexcClient {
+            inner: tokio::sync::Mutex::new(MexcSpotApiClientWithAuthentication::new(
+                mexc_rs::spot::MexcSpotApiEndpoint::Custom(endpoint),
+                "test-key".into(),
+                "test-secret".into(),
+            )),
+            symbol_filters: tokio::sync::Mutex::new(HashMap::new()),
+            http: reqwest::Client::new(),
+        }
+    }
+
+    const ACCEPTED: &str = r#"{"symbol":"ICPUSDT","orderId":"market-1","orderListId":-1,"price":"0","origQty":"0.45","type":"MARKET","side":"SELL","transactTime":1793030000000}"#;
+
+    async fn submit(endpoint: String) -> Result<(String, String), CexBackendError> {
+        let client = client_at(endpoint);
+        let ex = client.inner.lock().await;
+        client
+            .submit_order(
+                &ex,
+                &["ICPUSDT".to_string()],
+                OrderSide::Sell,
+                Some(MarketOrder {
+                    quantity: Some(Decimal::new(45, 2)),
+                    quote_order_quantity: None,
+                }),
+                Some(IocOrder {
+                    quantity: Decimal::new(45, 2),
+                    price: Decimal::new(2559, 3),
+                }),
+                Some("lqclient1"),
+                "ICP_USDT",
+                "sell",
+            )
+            .await
+    }
+
+    /// Audit S3: IOC first; a refused IOC order placed nothing, so a market
+    /// order follows under the same client id.
+    #[tokio::test]
+    async fn a_refused_ioc_order_falls_back_to_a_market_order() {
+        let refused = r#"{"code":30041,"msg":"current order type can not place order"}"#;
+        let (endpoint, server) = serve(vec![(400, refused), (200, ACCEPTED)]).await;
+
+        let placed = tokio::time::timeout(std::time::Duration::from_secs(5), submit(endpoint))
+            .await
+            .unwrap()
+            .expect("the market order is placed");
+
+        assert_eq!(placed, ("ICPUSDT".to_string(), "market-1".to_string()));
+        let requests = server.await.unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(
+            requests[0].contains("type=IMMEDIATE_OR_CANCEL") && requests[0].contains("price=2.559"),
+            "{}",
+            requests[0]
+        );
+        assert!(
+            requests[1].contains("type=MARKET") && !requests[1].contains("price="),
+            "{}",
+            requests[1]
+        );
+        assert!(
+            requests
+                .iter()
+                .all(|request| request.contains("newClientOrderId=lqclient1"))
+        );
+    }
+
+    /// An answer that may hide a placed order never gets a second order.
+    #[tokio::test]
+    async fn an_ambiguous_ioc_error_sends_no_market_order() {
+        let failed = r#"{"code":-1,"msg":"internal error"}"#;
+        let (endpoint, server) = serve(vec![(500, failed)]).await;
+
+        let error = tokio::time::timeout(std::time::Duration::from_secs(5), submit(endpoint))
+            .await
+            .unwrap()
+            .expect_err("no fallback on an ambiguous answer");
+
+        assert!(error.to_string().contains("Swap err"), "{error}");
+        assert_eq!(server.await.unwrap().len(), 1);
     }
 }

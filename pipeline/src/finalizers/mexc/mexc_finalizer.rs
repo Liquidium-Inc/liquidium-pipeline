@@ -17,7 +17,7 @@ use liquidium_pipeline_core::outbound::{
     OutboundIntent, OutboundSender, is_side_effect_ambiguous, side_effect_ambiguous,
 };
 use liquidium_pipeline_connectors::backend::cex_backend::{
-    BuyOrderInputMode, CexBackend, CexBackendError, OrderBookLevel, SwapExecutionOptions, WithdrawStatus,
+    BuyOrderInputMode, CexBackend, CexBackendError, OrderBookLevel, PriceLimit, SwapExecutionOptions, WithdrawStatus,
 };
 use liquidium_pipeline_core::{
     account::model::ChainAccount,
@@ -160,7 +160,6 @@ pub const APPROVE_BUMP_MAX_COUNT: u8 = 6;
 const APPROVE_BUMP_BATCH_SIZE: u8 = 3;
 const APPROVE_BUMP_DELAY_MS: u64 = 300;
 const APPROVE_BUMP_BATCH_DELAY_SECS: u64 = 3;
-pub const MEXC_DEPOSIT_FEE_MULTIPLIER: u8 = 7;
 #[allow(dead_code)]
 const DEFAULT_BUY_TRUNCATION_TRIGGER_RATIO: f64 = 0.25;
 #[allow(dead_code)]
@@ -416,7 +415,7 @@ where
         state.deposit.bridge.deposit_bridge_destination_snapshot = Some(addr.address.clone());
 
         let (transfer_value, transfer_amount) =
-            Self::compute_fee_adjusted_deposit_transfer(&state.deposit.deposit_asset, &state.size_in)?;
+            Self::compute_fee_adjusted_deposit_transfer(&state.deposit.deposit_asset, &state.size_in, false)?;
         let destination = Self::direct_deposit_destination_account(
             &state.deposit.deposit_asset,
             planned_network,
@@ -611,11 +610,20 @@ where
         }
     }
 
+    /// Ledger fees held back from a deposit transfer: the transfer itself,
+    /// plus the approval bumps that only direct non-native ICP deposits send.
+    pub(super) fn deposit_fee_count(deposit_asset: &ChainToken, bridged: bool) -> u8 {
+        let bumps_approvals =
+            !bridged && matches!(deposit_asset, ChainToken::Icp { .. }) && !Self::is_native_icp_token(deposit_asset);
+        if bumps_approvals { 1 + APPROVE_BUMP_MAX_COUNT } else { 1 }
+    }
+
     pub(super) fn compute_fee_adjusted_deposit_transfer(
         deposit_asset: &ChainToken,
         size_in: &ChainTokenAmount,
+        bridged: bool,
     ) -> Result<(Nat, ChainTokenAmount), String> {
-        let fee = deposit_asset.fee() * MEXC_DEPOSIT_FEE_MULTIPLIER;
+        let fee = deposit_asset.fee() * Self::deposit_fee_count(deposit_asset, bridged);
         let transfer_value = if fee > Nat::from(0u8) {
             if size_in.value.clone() <= fee {
                 let fee_amount = ChainTokenAmount::from_raw(deposit_asset.clone(), fee.clone());
@@ -729,7 +737,8 @@ where
         deposit_asset: &ChainToken,
         size_in: &ChainTokenAmount,
     ) -> Result<BridgeDepositSizing, String> {
-        let (transfer_value, mut bridge_amount) = Self::compute_fee_adjusted_deposit_transfer(deposit_asset, size_in)?;
+        let (transfer_value, mut bridge_amount) =
+            Self::compute_fee_adjusted_deposit_transfer(deposit_asset, size_in, true)?;
         let fee_budget = bridge
             .backend
             .get_fee_budget(route.source_asset, route.source_chain, route.target_asset)
@@ -1233,11 +1242,15 @@ where
         //     The helper repeatedly:
         //     - previews a safe chunk from live orderbook depth,
         //     - skips tiny residual chunks below `cex_min_exec_usd` as dust,
-        //     - executes market orders and validates realized slippage,
+        //     - executes IOC limit orders at the slippage cap,
         //     - records per-slice telemetry, then returns `(remaining_in, total_out)`.
-        let (remaining_in, total_out) = self
+        let Some((remaining_in, total_out)) = self
             .execute_trade_leg_slices(state, leg, idx, legs.len(), amount_in, target_bps)
-            .await?;
+            .await?
+        else {
+            // Paused with its progress saved; the next cycle resumes this leg.
+            return Ok(());
+        };
 
         // 15) Emit end-of-leg summary including residual and dust info.
         info!(

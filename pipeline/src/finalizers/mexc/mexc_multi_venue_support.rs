@@ -83,8 +83,6 @@ where
                 trade_last_amount_out: None,
                 trade_next_amount_in: None,
                 trade_weighted_slippage_bps: None,
-                trade_mid_notional_sum: None,
-                trade_exec_notional_sum: None,
                 trade_slices: Vec::new(),
                 trade_dust_skipped: false,
                 trade_dust_usd: None,
@@ -158,14 +156,16 @@ where
         let pay_f = pay_amount.to_f64();
         let recv_f = receive_amount.to_f64();
         let exec_price = if pay_f > 0.0 { recv_f / pay_f } else { 0.0 };
-        let mid_price = if let (Some(mid_sum), Some(exec_sum)) =
-            (state.trade.trade_mid_notional_sum, state.trade.trade_exec_notional_sum)
-        {
-            if exec_sum > LIQUIDITY_EPS {
-                (mid_sum / exec_sum) * exec_price
-            } else {
-                exec_price
-            }
+        // From the saved slices, so a row that an older build saved reports the
+        // same way. At the mids the route would have returned 1 / (1 - slippage) more.
+        let slippage_bps = if state.trade.trade_slices.is_empty() {
+            state.trade.trade_weighted_slippage_bps.unwrap_or(0.0)
+        } else {
+            Self::route_slippage_bps(&state.trade.trade_slices)
+        };
+        let slippage = slippage_bps / crate::swappers::model::BPS_PER_RATIO_UNIT;
+        let mid_price = if slippage < 1.0 {
+            exec_price / (1.0 - slippage)
         } else {
             exec_price
         };
@@ -181,21 +181,23 @@ where
                         state.withdraw.withdraw_asset.symbol().to_ascii_uppercase(),
                     )
                 });
-                let (pay_symbol, recv_symbol, pay_amount, recv_amount) = if slice.side.eq_ignore_ascii_case("sell") {
-                    (base, quote, slice.amount_in, slice.amount_out)
+                let (pay_symbol, recv_symbol) = if slice.side.eq_ignore_ascii_case("sell") {
+                    (base, quote)
                 } else {
-                    (quote, base, slice.amount_in, slice.amount_out)
+                    (quote, base)
                 };
+                let pay_amount = super::mexc_utils::slice_amount_to_nat(slice.amount_in, &pay_symbol);
+                let recv_amount = super::mexc_utils::slice_amount_to_nat(slice.amount_out, &recv_symbol);
 
                 SwapQuoteLeg {
                     venue: "mexc".to_string(),
                     route_id: slice.market.clone(),
                     pay_chain: state.deposit.deposit_asset.chain(),
                     pay_symbol,
-                    pay_amount: super::mexc_utils::f64_to_nat(pay_amount),
+                    pay_amount,
                     receive_chain: state.withdraw.withdraw_asset.chain(),
                     receive_symbol: recv_symbol,
-                    receive_amount: super::mexc_utils::f64_to_nat(recv_amount),
+                    receive_amount: recv_amount,
                     price: slice.exec_price,
                     lp_fee: Nat::from(0u8),
                     gas_fee: Nat::from(0u8),
@@ -213,7 +215,7 @@ where
             receive_amount: receive_amount.value,
             mid_price,
             exec_price,
-            realized_slippage_bps: state.trade.trade_weighted_slippage_bps.unwrap_or(0.0),
+            realized_slippage_bps: slippage_bps,
             legs,
             approval_count: state.deposit.approval_bump_count,
             ts: now_ts().max(0) as u64,
@@ -235,8 +237,11 @@ where
         if let Some(requested_bps) = request.max_slippage_bps {
             amount_after_bps_haircut(&Nat::from(0u8), requested_bps)?;
         }
-        let (_, executable_pay) =
-            Self::compute_fee_adjusted_deposit_transfer(&state.deposit.deposit_asset, &state.size_in)?;
+        let (_, executable_pay) = Self::compute_fee_adjusted_deposit_transfer(
+            &state.deposit.deposit_asset,
+            &state.size_in,
+            state.deposit.bridge.deposit_bridge_required,
+        )?;
         let initial_amount = executable_pay.to_f64();
         if initial_amount <= LIQUIDITY_EPS {
             return Err("MEXC cannot quote a non-positive pay amount".to_string());

@@ -16,6 +16,9 @@ const DEPOSIT_CONFIRMATION_DELTA_EPSILON: f64 = 0.00001;
 const DEPOSIT_TOTAL_FREE_FALLBACK_SECS: i64 = 25;
 /// Hard stop to avoid unbounded per-leg slicing loops on pathological books.
 const MAX_SLICE_EXECUTION_ROUNDS: usize = 128;
+/// Orders in a row that fill nothing within the price limit before the leg
+/// pauses until the next cycle. A pause is a wait, not an error.
+const MAX_EMPTY_FILLS_IN_A_ROW: usize = 3;
 
 impl<C> MexcFinalizer<C>
 where
@@ -1068,15 +1071,15 @@ where
     ///   soft target (`target_bps`) first, hard-cap fallback second.
     /// - `maybe_mark_trade_dust` stops execution when, after the leg's first fill,
     ///   the chunk and remainder notional are both below `cex_min_exec_usd`.
-    /// - each accepted chunk is sent as a market order (`execute_swap`).
+    /// - each accepted chunk is sent as an IOC limit order at the slippage cap.
     /// - realized `exec_price` is derived from actual fills and compared to preview
     ///   midpoint to compute realized slippage in bps.
     /// - if realized slippage exceeds `max_sell_slippage_bps`, the leg fails fast.
-    /// - successful slices update weighted route stats and append per-slice telemetry.
+    /// - each executed slice is recorded, and the route slippage is computed from the records.
     ///
-    /// Returns `(remaining_in, total_out)` where:
-    /// - `remaining_in` is unexecuted residual (typically `0` or dust),
-    /// - `total_out` is total output produced by all executed slices in this leg.
+    /// Returns `Some((remaining_in, total_out))` once the leg is done, where
+    /// `remaining_in` is the unexecuted residual (typically `0` or dust). `None`
+    /// means the leg paused with its progress saved; the next cycle resumes it.
     pub(super) async fn execute_trade_leg_slices(
         &self,
         state: &mut CexState,
@@ -1085,12 +1088,13 @@ where
         total_legs: usize,
         amount_in: f64,
         target_bps: f64,
-    ) -> Result<(f64, f64), CexBackendError> {
+    ) -> Result<Option<(f64, f64)>, CexBackendError> {
         // Resume from persisted per-leg progress if available.
         let mut remaining_in = state.trade.trade_progress_remaining_in.unwrap_or(amount_in);
         let mut total_out = state.trade.trade_progress_total_out.unwrap_or(0.0);
         // Hard guard against pathological loops when liquidity math cannot converge.
         let mut slice_round_count = 0usize;
+        let mut empty_fills_in_a_row = 0usize;
 
         // One-shot override for the NEXT buy slice only.
         // Normal mode is quote-driven (`Auto`), but if quote truncation is large
@@ -1131,7 +1135,8 @@ where
             let buy_mode = Self::resolve_slice_buy_mode(state, leg, &mut forced_next_buy_mode);
             let pending = Self::prepare_pending_slice_request(state, leg, leg_idx, preview.chunk_in, buy_mode);
 
-            // Execute exactly this one slice as a market order.
+            // The exchange enforces the slippage cap with an IOC order. Only if
+            // MEXC refuses IOC outright does the slice go out as a market order.
             let fill_report = self
                 .backend
                 .execute_swap_detailed_with_options(
@@ -1142,11 +1147,36 @@ where
                         client_order_id: Some(pending.client_order_id.clone()),
                         buy_mode,
                         max_quote_overspend_bps: Some(self.cex_buy_inverse_overspend_bps as f64),
+                        price_limit: Some(PriceLimit {
+                            reference_price: preview.preview_mid_price,
+                            max_slippage_bps: self.max_sell_slippage_bps,
+                        }),
                     },
                 )
                 .await?;
 
             Self::clear_pending_trade_order(state);
+            if fill_report.input_consumed <= LIQUIDITY_EPS {
+                // The book moved past the limit and nothing filled. The id is
+                // spent, and the next round previews the book again.
+                state
+                    .trade
+                    .trade_applied_client_order_ids
+                    .push(pending.client_order_id.clone());
+                empty_fills_in_a_row += 1;
+                if empty_fills_in_a_row >= MAX_EMPTY_FILLS_IN_A_ROW {
+                    // The book keeps moving away. Waiting costs no retry budget,
+                    // so the capital is never parked for this alone.
+                    Self::persist_trade_progress(state, remaining_in, total_out);
+                    warn!(
+                        "[mexc] liq_id={} {} {}: {} orders in a row filled nothing within the limit; retrying next cycle",
+                        state.liq_id, leg.market, leg.side, empty_fills_in_a_row
+                    );
+                    return Ok(None);
+                }
+                continue;
+            }
+            empty_fills_in_a_row = 0;
             let actual_input_consumed = fill_report.input_consumed;
             let actual_output_received = fill_report.output_received;
 
@@ -1184,13 +1214,6 @@ where
 
             // Record the executed slice before the cap check. A breaching slice
             // still happened, and its record is the durable trace of the breach.
-            Self::update_trade_notional_stats(
-                state,
-                &leg.side,
-                actual_input_consumed,
-                actual_output_received,
-                preview.preview_mid_price,
-            );
             Self::record_trade_slice(
                 state,
                 leg_idx,
@@ -1251,7 +1274,7 @@ where
 
         Self::persist_trade_progress(state, remaining_in, total_out);
         // Return any unexecuted residual (often 0 or dust) plus total output of this leg.
-        Ok((remaining_in, total_out))
+        Ok(Some((remaining_in, total_out)))
     }
 
     /// Build a one-slice preview under the configured impact target.
@@ -1442,34 +1465,29 @@ where
         }
     }
 
-    /// Update route-level weighted slippage totals after one executed slice.
-    pub(super) fn update_trade_notional_stats(
-        state: &mut CexState,
-        side: &str,
-        chunk_in: f64,
-        filled_out: f64,
-        preview_mid_price: f64,
-    ) {
-        let mid_notional = if side.eq_ignore_ascii_case("sell") {
-            chunk_in * preview_mid_price
-        } else {
-            filled_out * preview_mid_price
-        };
-        let exec_notional = if side.eq_ignore_ascii_case("sell") {
-            filled_out
-        } else {
-            chunk_in
-        };
-
-        let mid_sum = state.trade.trade_mid_notional_sum.unwrap_or(0.0) + mid_notional;
-        let exec_sum = state.trade.trade_exec_notional_sum.unwrap_or(0.0) + exec_notional;
-        state.trade.trade_mid_notional_sum = Some(mid_sum);
-        state.trade.trade_exec_notional_sum = Some(exec_sum);
-        state.trade.trade_weighted_slippage_bps = if mid_sum > LIQUIDITY_EPS {
-            Some(((mid_sum - exec_sum) / mid_sum * BPS_PER_RATIO_UNIT).max(0.0))
-        } else {
-            None
-        };
+    /// Adverse slippage of the whole route against the preview mids, in bps.
+    /// Each leg compares its output with its output at the mids, in its own
+    /// currency; the legs' output ratios multiply along the route.
+    pub(in crate::finalizers::mexc) fn route_slippage_bps(slices: &[CexTradeSlice]) -> f64 {
+        let mut legs: std::collections::BTreeMap<u32, (f64, f64)> = std::collections::BTreeMap::new();
+        for slice in slices {
+            let output_at_mid = if slice.side.eq_ignore_ascii_case("sell") {
+                slice.amount_in * slice.mid_price
+            } else if slice.mid_price > 0.0 {
+                slice.amount_in / slice.mid_price
+            } else {
+                0.0
+            };
+            let leg = legs.entry(slice.leg_index).or_default();
+            leg.0 += slice.amount_out;
+            leg.1 += output_at_mid;
+        }
+        let output_ratio: f64 = legs
+            .values()
+            .filter(|(_, output_at_mid)| *output_at_mid > LIQUIDITY_EPS)
+            .map(|(output, output_at_mid)| output / output_at_mid)
+            .product();
+        ((1.0 - output_ratio) * BPS_PER_RATIO_UNIT).max(0.0)
     }
 
     /// Append one executed slice for telemetry/export.
@@ -1494,6 +1512,7 @@ where
             exec_price,
             slippage_bps: slice_slippage_bps.max(preview_impact_bps),
         });
+        state.trade.trade_weighted_slippage_bps = Some(Self::route_slippage_bps(&state.trade.trade_slices));
     }
 
     /// Advance state to the next trade leg or to withdraw when route is fully processed.

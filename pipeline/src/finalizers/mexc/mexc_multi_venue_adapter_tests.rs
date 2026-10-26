@@ -458,12 +458,12 @@ async fn cksol_planning_amount_check_uses_the_minter_minimum_after_the_approval_
         decimals: 9,
         fee: Nat::from(500u64),
     };
-    // 7 ledger fees of 500 come off the transfer, then a 1_000 lamport reserve.
+    // One ledger fee of 500 comes off the bridged transfer, then a 1_000 lamport reserve.
     for (raw, below_minimum) in [
         (9_000_000, true),
-        (10_004_000, true),
-        (10_004_500, false),
-        (10_005_000, false),
+        (10_001_000, true),
+        (10_001_500, false),
+        (10_002_000, false),
     ] {
         let mut bridge = MockBridgeBackend::new();
         bridge
