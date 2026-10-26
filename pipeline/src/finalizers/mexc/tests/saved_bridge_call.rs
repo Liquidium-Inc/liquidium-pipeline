@@ -25,6 +25,7 @@ fn zero_fee_bridge() -> MockBridgeBackend {
             source_fee_budget: 0.0,
             destination_fee_budget: 0.0,
             provider_fee_budget_native_units: None,
+            side_costs: Vec::new(),
         })
     });
     bridge

@@ -3,12 +3,13 @@ use std::{collections::HashMap, sync::Arc};
 use candid::{Nat, Principal};
 use liquidium_pipeline_connectors::backend::bridge_backend::FINALIZER_PERMANENT_AMOUNT_FLOOR_PREFIX;
 use liquidium_pipeline_connectors::backend::cex_backend::{
-    CexBackendError, MockCexBackend, OrderBook, OrderBookLevel, SwapFillReport,
+    CexBackendError, MockCexBackend, OrderBook, OrderBookLevel, SwapFillReport, WithdrawTerms,
 };
 use liquidium_pipeline_core::{
     tokens::{chain_token::ChainToken, chain_token_amount::ChainTokenAmount, token_registry::TokenRegistry},
     transfer::actions::MockTransferActions,
 };
+use num_traits::ToPrimitive;
 
 use super::*;
 use crate::{
@@ -67,7 +68,12 @@ fn request(raw_pay: u64) -> SwapRequest {
 }
 
 fn finalizer() -> MexcFinalizer<MockCexBackend> {
+    finalizer_with_withdraw_terms(WithdrawTerms { fee: 0.0, minimum: 0.0 })
+}
+
+fn finalizer_with_withdraw_terms(terms: WithdrawTerms) -> MexcFinalizer<MockCexBackend> {
     let mut backend = MockCexBackend::new();
+    backend.expect_get_withdraw_terms().returning(move |_, _| Ok(terms));
     backend.expect_get_orderbook().returning(|market, _| match market {
         "PAY_RECV" => Ok(OrderBook {
             bids: vec![OrderBookLevel {
@@ -75,6 +81,7 @@ fn finalizer() -> MexcFinalizer<MockCexBackend> {
                 quantity: 1_000_000.0,
             }],
             asks: vec![],
+            taker_fee_bps: 10.0,
         }),
         _ => Err(format!("unexpected market {market}")),
     });
@@ -106,6 +113,9 @@ fn finalizer_without_registry() -> MexcFinalizer<MockCexBackend> {
 
 fn finalizer_with_permanent_deposit_error() -> MexcFinalizer<MockCexBackend> {
     let mut backend = MockCexBackend::new();
+    backend
+        .expect_get_withdraw_terms()
+        .returning(|_, _| Ok(WithdrawTerms { fee: 0.0, minimum: 0.0 }));
     backend.expect_get_orderbook().returning(|market, _| match market {
         "PAY_RECV" => Ok(OrderBook {
             bids: vec![OrderBookLevel {
@@ -113,6 +123,7 @@ fn finalizer_with_permanent_deposit_error() -> MexcFinalizer<MockCexBackend> {
                 quantity: 1_000_000.0,
             }],
             asks: vec![],
+            taker_fee_bps: 10.0,
         }),
         _ => Err(format!("unexpected market {market}")),
     });
@@ -137,6 +148,9 @@ fn finalizer_with_permanent_deposit_error() -> MexcFinalizer<MockCexBackend> {
 
 fn finalizer_with_retryable_deposit_error() -> MexcFinalizer<MockCexBackend> {
     let mut backend = MockCexBackend::new();
+    backend
+        .expect_get_withdraw_terms()
+        .returning(|_, _| Ok(WithdrawTerms { fee: 0.0, minimum: 0.0 }));
     backend.expect_get_orderbook().returning(|_, _| {
         Ok(OrderBook {
             bids: vec![OrderBookLevel {
@@ -144,6 +158,7 @@ fn finalizer_with_retryable_deposit_error() -> MexcFinalizer<MockCexBackend> {
                 quantity: 1_000_000.0,
             }],
             asks: vec![],
+            taker_fee_bps: 10.0,
         })
     });
     backend.expect_get_balance().times(1).returning(|_| Ok(0.0));
@@ -177,6 +192,7 @@ fn leg_from_preview(preview: VenueRoutePreview) -> VenueLegState {
             conservative_receive: preview.conservative_receive,
             estimated_price_impact_bps: preview.quote.estimated_price_impact_bps,
             route_id: preview.quote.legs[0].route_id.clone(),
+            side_costs: Vec::new(),
         },
         execution: preview.initial_execution_state,
         status: VenueLegStatus::Planned,
@@ -207,6 +223,46 @@ async fn preview_uses_the_exact_leg_allocation_and_persists_the_route() {
     assert_eq!(execution.cex.trade.trade_resolved_legs[0].market, "PAY_RECV");
     uuid::Uuid::parse_str(execution.cex.liq_id.trim_start_matches("mexc-"))
         .expect("execution ID should contain a restart-safe UUID");
+}
+
+/// Audit L10: the preview takes MEXC's withdrawal fee off the output, as the
+/// withdrawal does. The market output stays the book's price for the guard.
+#[tokio::test]
+async fn preview_takes_the_mexc_withdrawal_fee_off_the_output() {
+    let free = MultiVenueAdapter::preview(&finalizer(), &planning_context(), &request(200_000_000))
+        .await
+        .expect("fee-free preview");
+    let charged = MultiVenueAdapter::preview(
+        &finalizer_with_withdraw_terms(WithdrawTerms { fee: 0.5, minimum: 0.0 }),
+        &planning_context(),
+        &request(200_000_000),
+    )
+    .await
+    .expect("preview with a withdrawal fee");
+
+    let fee = (free.quote.receive_amount.clone() - charged.quote.receive_amount.clone())
+        .0
+        .to_u64()
+        .expect("fee fits u64");
+    assert!((499_999..=500_001).contains(&fee), "0.5 RECV comes off, got {fee}");
+    // 2 PAY at 10 less the 10 bps taker fee, before any fixed fee.
+    assert_eq!(charged.market_receive, Some(Nat::from(19_980_000u64)));
+    assert!(charged.quote.receive_amount < 19_980_000u64);
+}
+
+#[tokio::test]
+async fn preview_refuses_an_output_below_the_mexc_withdrawal_minimum() {
+    let error = MultiVenueAdapter::preview(
+        &finalizer_with_withdraw_terms(WithdrawTerms {
+            fee: 0.0,
+            minimum: 100.0,
+        }),
+        &planning_context(),
+        &request(200_000_000),
+    )
+    .await
+    .expect_err("MEXC would refuse the withdrawal and leave the output as dust");
+    assert!(error.contains("below its minimum"), "{error}");
 }
 
 #[tokio::test]
@@ -581,11 +637,14 @@ async fn restart_resumes_a_bridged_deposit_once_its_funding_transfer_is_durable(
             .expect_get_fee_budget()
             .times(usize::from(measures_funds))
             .returning(|_, _, _| {
-                Ok(liquidium_pipeline_connectors::backend::bridge_backend::BridgeFeeBudget {
-                    source_fee_budget: 0.0,
-                    destination_fee_budget: 0.0,
-                    provider_fee_budget_native_units: None,
-                })
+                Ok(
+                    liquidium_pipeline_connectors::backend::bridge_backend::BridgeFeeBudget {
+                        source_fee_budget: 0.0,
+                        destination_fee_budget: 0.0,
+                        provider_fee_budget_native_units: None,
+                        side_costs: Vec::new(),
+                    },
+                )
             });
         bridge
             .expect_get_source_balance()
@@ -996,6 +1055,9 @@ fn finalizer_with_trade_result(
     balance_calls: usize,
 ) -> MexcFinalizer<MockCexBackend> {
     let mut backend = MockCexBackend::new();
+    backend
+        .expect_get_withdraw_terms()
+        .returning(|_, _| Ok(WithdrawTerms { fee: 0.0, minimum: 0.0 }));
     backend.expect_get_orderbook().returning(|_, _| {
         Ok(OrderBook {
             bids: vec![OrderBookLevel {
@@ -1006,6 +1068,7 @@ fn finalizer_with_trade_result(
                 price: 10.0,
                 quantity: 1_000_000.0,
             }],
+            taker_fee_bps: 10.0,
         })
     });
     backend
@@ -1247,6 +1310,7 @@ mod bridged_deposit_restart {
                 source_fee_budget: 0.0,
                 destination_fee_budget: 0.0,
                 provider_fee_budget_native_units: None,
+                side_costs: Vec::new(),
             })
         });
     }

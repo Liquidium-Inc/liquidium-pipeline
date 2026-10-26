@@ -48,6 +48,7 @@ async fn mexc_deposit_bridge_reserves_reverse_bridge_approval_fee_in_trade_amoun
                 source_fee_budget: 0.01,
                 destination_fee_budget: 0.0,
                 provider_fee_budget_native_units: None,
+                side_costs: Vec::new(),
             })
         });
     bridge
@@ -117,6 +118,7 @@ async fn mexc_deposit_bridge_rejects_source_fee_reserve_too_small_with_permanent
                 source_fee_budget: 2.0,
                 destination_fee_budget: 0.0,
                 provider_fee_budget_native_units: None,
+                side_costs: Vec::new(),
             })
         });
     bridge.expect_get_minimum_bridge_amount().times(0);
@@ -183,10 +185,12 @@ async fn mexc_deposit_bridge_reserves_native_cketh_withdrawal_fee_budget() {
             assert_eq!(asset, "ckETH");
             assert_eq!(chain, "ICP");
             assert_eq!(target, "ETH");
+            // The minter takes gas out of the amount: only the approve fee stays behind.
             Ok(BridgeFeeBudget {
-                source_fee_budget: 0.000_051_900_885_02,
+                source_fee_budget: 0.000_002,
                 destination_fee_budget: 0.000_049_900_885_02,
                 provider_fee_budget_native_units: Some(Nat::from(49_900_885_020_000u64)),
+                side_costs: Vec::new(),
             })
         });
     bridge
@@ -203,7 +207,7 @@ async fn mexc_deposit_bridge_reserves_native_cketh_withdrawal_fee_budget() {
         assert_eq!(request.source_chain, "ICP");
         assert_eq!(request.target_asset, "ETH");
         assert!(
-            (request.amount - 0.005_046_099_114_98).abs() < 1e-15,
+            (request.amount - 0.005_096).abs() < 1e-15,
             "unexpected amount {}",
             request.amount
         );
@@ -233,7 +237,7 @@ async fn mexc_deposit_bridge_reserves_native_cketh_withdrawal_fee_budget() {
     finalizer
         .deposit(&mut state)
         .await
-        .expect("bridged native ckETH deposit should reserve approval and withdrawal fees");
+        .expect("bridged native ckETH deposit should reserve the approval fee");
     finalizer.deposit(&mut state).await.expect("the recorded attempt submits");
 
     assert!(matches!(state.step, CexStep::DepositPending));
@@ -242,13 +246,11 @@ async fn mexc_deposit_bridge_reserves_native_cketh_withdrawal_fee_budget() {
         state.deposit.bridge.deposit_bridge_id.as_deref(),
         Some("bridge-deposit-cketh")
     );
+    assert!((state.deposit.bridge.deposit_bridge_submit_amount.unwrap_or_default() - 0.005_096).abs() < 1e-15);
     assert!(
-        (state.deposit.bridge.deposit_bridge_submit_amount.unwrap_or_default() - 0.005_046_099_114_98).abs() < 1e-15
+        (state.deposit.bridge.deposit_bridge_expected_amount.unwrap_or_default() - 0.005_046_099_114_98).abs() < 1e-15
     );
-    assert!(
-        (state.deposit.bridge.deposit_bridge_expected_amount.unwrap_or_default() - 0.004_996_198_229_96).abs() < 1e-15
-    );
-    assert!((state.trade.trade_next_amount_in.unwrap_or_default() - 0.004_996_198_229_96).abs() < 1e-15);
+    assert!((state.trade.trade_next_amount_in.unwrap_or_default() - 0.005_046_099_114_98).abs() < 1e-15);
 }
 
 #[tokio::test]
@@ -276,6 +278,7 @@ async fn mexc_deposit_bridge_rejects_native_cketh_below_minimum_before_transfer(
                 source_fee_budget: 0.000_051_900_885_02,
                 destination_fee_budget: 0.0,
                 provider_fee_budget_native_units: Some(Nat::from(49_900_885_020_000u64)),
+                side_costs: Vec::new(),
             })
         });
     bridge
@@ -337,6 +340,7 @@ async fn mexc_deposit_bridge_rejects_native_cketh_when_destination_fee_consumes_
                 source_fee_budget: 0.000_051_900_885_02,
                 destination_fee_budget: 0.006,
                 provider_fee_budget_native_units: Some(Nat::from(49_900_885_020_000u64)),
+                side_costs: Vec::new(),
             })
         });
     bridge
@@ -419,6 +423,7 @@ async fn mexc_deposit_bridge_waits_for_source_funding_snapshot() {
                 source_fee_budget: 0.01,
                 destination_fee_budget: 0.0,
                 provider_fee_budget_native_units: None,
+                side_costs: Vec::new(),
             })
         });
     bridge
@@ -500,6 +505,7 @@ async fn mexc_deposit_bridge_waits_for_cketh_fee_funding_snapshot() {
                 source_fee_budget: 0.01,
                 destination_fee_budget: 0.0,
                 provider_fee_budget_native_units: Some(Nat::from(138_541_176_852_000u64)),
+                side_costs: Vec::new(),
             })
         });
     bridge

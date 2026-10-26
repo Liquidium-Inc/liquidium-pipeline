@@ -44,6 +44,12 @@ impl ProfitCalculator for SimpleProfitCalculator {
             }
         };
 
+        // Costs paid from other balances, such as bridge gas, count against
+        // the receive amount at the prices the plan used.
+        if let Some(side_cost) = swap.and_then(|swap| swap.side_cost_receive.clone()) {
+            fee_total += side_cost;
+        }
+
         let recv = receive_amount.0.to_i128();
         let debt = liq.amounts.debt_repaid.clone().0.to_i128();
         // Collateral-side fees, MEXC approval bumps included, came out of the
@@ -168,8 +174,17 @@ mod tests {
             legs: vec![],
             approval_count: Some(6),
             ts: 0,
+            side_costs: Vec::new(),
+            side_cost_receive: None,
         };
 
         assert_eq!(SimpleProfitCalculator.realized(&req, &liq, Some(&swap)), 99_000);
+
+        // Audit L10: gas paid from the bridge wallet still comes off the profit.
+        let swap = SwapExecution {
+            side_cost_receive: Some(Nat::from(4_000u64)),
+            ..swap
+        };
+        assert_eq!(SimpleProfitCalculator.realized(&req, &liq, Some(&swap)), 95_000);
     }
 }

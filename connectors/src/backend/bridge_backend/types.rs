@@ -3,6 +3,7 @@ use async_trait::async_trait;
 use candid::{CandidType, Nat, Principal};
 use icrc_ledger_types::icrc1::account::Account;
 use liquidium_pipeline_core::outbound::PreparedSend;
+use liquidium_pipeline_core::types::side_cost::SideCost;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -102,6 +103,8 @@ pub struct BridgeFeeBudget {
     pub source_fee_budget: f64,
     pub destination_fee_budget: f64,
     pub provider_fee_budget_native_units: Option<Nat>,
+    /// Costs the route pays from other balances, for the planner to price.
+    pub side_costs: Vec<SideCost>,
 }
 
 /// Provider submission handle returned after a bridge transaction is sent.
@@ -179,6 +182,7 @@ pub trait BridgeBackend: Send + Sync {
             source_fee_budget: self.get_source_fee_budget(asset, chain, target_asset).await?,
             destination_fee_budget: self.get_destination_fee_budget(asset, chain, target_asset).await?,
             provider_fee_budget_native_units: None,
+            side_costs: Vec::new(),
         })
     }
 

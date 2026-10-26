@@ -4,6 +4,7 @@ use candid::Nat;
 use liquidium_pipeline_core::tokens::{
     asset_id::AssetId, chain_token::ChainToken, chain_token_amount::ChainTokenAmount,
 };
+use liquidium_pipeline_core::types::side_cost::CYCLES_SYMBOL;
 use num_traits::ToPrimitive;
 use thiserror::Error;
 use tracing::{debug, warn};
@@ -13,7 +14,7 @@ use crate::{
     liquidation::{collateral_service::USD_QUOTE_CURRENCY, liquidation_math::oracle_implied_output},
     persistance::{
         MultiVenueAllocationReason, MultiVenueExecutionOutcome, MultiVenueExecutionPlan, MultiVenueExecutionState,
-        VenueLegState,
+        PricedSideCost, VenueLegState,
     },
     price_oracle::price_oracle::PriceOracle,
     stages::executor::{ExecutionReceipt, ExecutionStatus},
@@ -60,6 +61,8 @@ pub struct IcpswapFirstPlannerConfig {
     /// it as a fallback for a live oracle read.
     pub oracle_snapshot_max_age_secs: i64,
     pub icpswap_test_allocation_usd: Option<f64>,
+    /// USD per trillion cycles, for side costs paid in cycles.
+    pub cycles_usd_per_trillion: f64,
 }
 
 /// A settlement floor of `-BPS_DENOMINATOR` would accept any output at all, so
@@ -146,6 +149,11 @@ impl IcpswapFirstPlannerConfig {
                 "maximum oracle discount {} bps must exceed the {:.2} bps dust fallback impact cap",
                 self.max_oracle_discount_bps, self.dust_fallback_max_price_impact_bps
             )));
+        }
+        if !self.cycles_usd_per_trillion.is_finite() || self.cycles_usd_per_trillion <= 0.0 {
+            return Err(IcpswapFirstPlannerError::InvalidInput(
+                "cycles price must be finite and positive".to_string(),
+            ));
         }
         if self.oracle_snapshot_max_age_secs < 0 {
             return Err(IcpswapFirstPlannerError::InvalidInput(
@@ -333,6 +341,36 @@ fn positive_price(price_ray: &Nat) -> Option<Nat> {
     (price_ray > &Nat::from(0u8)).then(|| price_ray.clone())
 }
 
+/// One trillion cycles at the configured USD rate, as a RAY price.
+fn cycles_price_ray(usd_per_trillion: f64) -> Result<Nat, String> {
+    let nano_usd = (usd_per_trillion * 1e9).round();
+    if !nano_usd.is_finite() || nano_usd <= 0.0 {
+        return Err(format!("invalid cycles price {usd_per_trillion}"));
+    }
+    Ok(Nat::from(nano_usd as u128) * Nat::from(10u128.pow(18)))
+}
+
+/// A quote's priced side costs in receive-token units.
+fn side_cost_total(preview: &VenueRoutePreview) -> Nat {
+    preview
+        .priced_side_costs
+        .iter()
+        .flatten()
+        .fold(Nat::from(0u8), |total, priced| {
+            total + priced.receive_equivalent.clone()
+        })
+}
+
+/// A quote's conservative output after its side costs. Venues compare on this.
+fn net_conservative(preview: &VenueRoutePreview) -> Nat {
+    let side_costs = side_cost_total(preview);
+    if preview.conservative_receive.value > side_costs {
+        preview.conservative_receive.value.clone() - side_costs
+    } else {
+        Nat::from(0u8)
+    }
+}
+
 /// Startup notice that a configured test allocation has switched the oracle
 /// quote guard off for that leg. Loud on purpose: it is a live routing setting,
 /// not a test-harness flag, so it can reach production unnoticed.
@@ -470,19 +508,23 @@ impl IcpswapFirstPlanner {
             .await
             .map_err(IcpswapFirstPlannerError::InvalidInput)?;
         let quotes = self.drop_invalid_quotes(input, quotes);
+        let quotes = self.price_quote_book(input, quotes).await;
         let icpswap = quotes
             .get(ICPSWAP_VENUE_ID)
             .ok_or_else(|| IcpswapFirstPlannerError::InvalidInput("ICPSwap full preview is missing".to_string()))?;
 
         match &icpswap.outcome {
-            VenuePreviewOutcome::Quoted(preview) if self.is_safe_icpswap(preview) => self.build_state(
-                input,
-                vec![preview.clone()],
-                MultiVenueAllocationReason::SingleVenue {
-                    venue_id: ICPSWAP_VENUE_ID.to_string(),
-                },
-                quoted_at,
-            ),
+            VenuePreviewOutcome::Quoted(preview) if self.is_safe_icpswap(preview) => {
+                self.build_or_overflow(
+                    input,
+                    vec![preview.clone()],
+                    MultiVenueAllocationReason::SingleVenue {
+                        venue_id: ICPSWAP_VENUE_ID.to_string(),
+                    },
+                    quoted_at,
+                )
+                .await
+            }
             VenuePreviewOutcome::Quoted(_) if self.overflow_venue_ids.is_empty() => {
                 Err(IcpswapFirstPlannerError::NoViableRoute(
                     "ICPSwap full quote exceeds the price-impact limit and no overflow venue is enabled".to_string(),
@@ -617,15 +659,17 @@ impl IcpswapFirstPlanner {
             }
         };
         if self.is_safe_dust_fallback_icpswap(&icpswap) {
-            return self.build_state(
-                input,
-                vec![icpswap],
-                MultiVenueAllocationReason::RemainderBelowMinimum {
-                    skipped_venue_ids: self.overflow_venue_ids.clone(),
-                    selected_venue_id: ICPSWAP_VENUE_ID.to_string(),
-                },
-                quoted_at,
-            );
+            return self
+                .build_or_overflow(
+                    input,
+                    vec![icpswap],
+                    MultiVenueAllocationReason::RemainderBelowMinimum {
+                        skipped_venue_ids: self.overflow_venue_ids.clone(),
+                        selected_venue_id: ICPSWAP_VENUE_ID.to_string(),
+                    },
+                    quoted_at,
+                )
+                .await;
         }
 
         let overflow = self
@@ -742,6 +786,31 @@ impl IcpswapFirstPlanner {
         )
     }
 
+    /// Builds the plan from a candidate that includes ICPSwap. If its profit or
+    /// price check rejects it, the full amount goes to the overflow venues under
+    /// the same checks before the planner gives up (audit L11).
+    async fn build_or_overflow(
+        &self,
+        input: &IcpswapFirstPlanInput,
+        previews: Vec<VenueRoutePreview>,
+        allocation_reason: MultiVenueAllocationReason,
+        quoted_at: i64,
+    ) -> Result<MultiVenueExecutionState, IcpswapFirstPlannerError> {
+        let rejected = match self.build_state(input, previews, allocation_reason, quoted_at) {
+            Err(IcpswapFirstPlannerError::NoViableRoute(reason)) if !self.overflow_venue_ids.is_empty() => reason,
+            built => return built,
+        };
+        let error = IcpswapFirstPlannerError::NoViableRoute(rejected.clone());
+        self.plan_full_overflow_after_icpswap_failure(input, quoted_at, &error)
+            .await
+            .map_err(|fallback| match fallback {
+                IcpswapFirstPlannerError::NoViableRoute(reason) => {
+                    IcpswapFirstPlannerError::NoViableRoute(format!("{rejected}; {reason}"))
+                }
+                other => other,
+            })
+    }
+
     // Re-plans the complete amount on overflow venues when ICPSwap's final
     // exact quote cannot be used. The earlier remainder quotes are discarded
     // because they do not cover the amount that must now be allocated.
@@ -832,12 +901,13 @@ impl IcpswapFirstPlanner {
             .best_executable_overflow(input, &overflow_quotes)
             .ok_or_else(|| IcpswapFirstPlannerError::NoViableRoute(self.overflow_failure_summary(&overflow_quotes)))?;
 
-        self.build_state(
+        self.build_or_overflow(
             input,
             vec![icpswap, overflow.clone()],
             MultiVenueAllocationReason::PriceImpactSplit,
             quoted_at,
         )
+        .await
     }
 
     // Binary-searches for the largest amount whose confirmed ICPSwap impact
@@ -924,10 +994,16 @@ impl IcpswapFirstPlanner {
             IcpswapFirstPlannerError::InvalidInput(format!("venue adapter `{venue_id}` is not registered"))
         })?;
         let context = input.planning_context();
-        let preview = adapter.preview(&context, request).await.map_err(|error| {
+        let mut preview = adapter.preview(&context, request).await.map_err(|error| {
             IcpswapFirstPlannerError::NoViableRoute(format!("{} preview failed: {error}", adapter.venue_id()))
         })?;
         self.validate_venue_preview(input, adapter.venue_id(), request, &preview)?;
+        self.price_side_costs(input, &mut preview).await.map_err(|error| {
+            IcpswapFirstPlannerError::NoViableRoute(format!(
+                "{} side costs cannot be priced: {error}",
+                adapter.venue_id()
+            ))
+        })?;
         Ok(preview)
     }
 
@@ -957,7 +1033,87 @@ impl IcpswapFirstPlanner {
             })
             .await
             .map_err(IcpswapFirstPlannerError::InvalidInput)?;
-        Ok(self.drop_invalid_quotes(input, quotes))
+        let quotes = self.drop_invalid_quotes(input, quotes);
+        Ok(self.price_quote_book(input, quotes).await)
+    }
+
+    /// Prices every quoted venue's side costs. A venue whose costs cannot be
+    /// priced becomes Invalid, so it cannot win on a cost nobody knows.
+    async fn price_quote_book(&self, input: &IcpswapFirstPlanInput, mut quotes: VenueQuoteBook) -> VenueQuoteBook {
+        for venue in quotes.iter_mut() {
+            if let VenuePreviewOutcome::Quoted(preview) = &mut venue.outcome
+                && let Err(error) = self.price_side_costs(input, preview).await
+            {
+                venue.outcome = VenuePreviewOutcome::Invalid(format!("side costs cannot be priced: {error}"));
+            }
+        }
+        quotes
+    }
+
+    /// Converts a quote's side costs into receive-token units at the plan's
+    /// prices (audit L10). The prices are kept, so the realized cost converts the same way.
+    async fn price_side_costs(
+        &self,
+        input: &IcpswapFirstPlanInput,
+        preview: &mut VenueRoutePreview,
+    ) -> Result<(), String> {
+        let mut priced = Vec::with_capacity(preview.side_costs.len());
+        if !preview.side_costs.is_empty() {
+            let receive_price = input
+                .receive_reference_price_ray
+                .clone()
+                .ok_or_else(|| "no receive-token price to value them".to_string())?;
+            let receive_decimals = u64::from(preview.conservative_receive.token.decimals());
+            for cost in &preview.side_costs {
+                let cost_price = self.side_cost_price(input, &cost.symbol).await?;
+                let receive_equivalent = oracle_implied_output(
+                    &cost.amount,
+                    &cost_price,
+                    &receive_price,
+                    u64::from(cost.decimals),
+                    receive_decimals,
+                )?;
+                priced.push(PricedSideCost {
+                    cost: cost.clone(),
+                    cost_price_ray: cost_price,
+                    receive_price_ray: receive_price.clone(),
+                    receive_equivalent,
+                });
+            }
+        }
+        preview.priced_side_costs = Some(priced);
+        Ok(())
+    }
+
+    /// The RAY USD price of a side cost's asset. Cycles use the configured XDR
+    /// rate; the pair's own assets reuse the prices the plan already holds.
+    async fn side_cost_price(&self, input: &IcpswapFirstPlanInput, symbol: &str) -> Result<Nat, String> {
+        if symbol == CYCLES_SYMBOL {
+            return cycles_price_ray(self.config.cycles_usd_per_trillion);
+        }
+        let known = [
+            (
+                oracle_price_symbol(&input.total_pay.token),
+                &input.pay_reference_price_ray,
+            ),
+            (
+                oracle_price_symbol(&input.debt_repaid.token),
+                &input.receive_reference_price_ray,
+            ),
+        ];
+        if let Some(price) = known
+            .iter()
+            .find(|(known_symbol, _)| known_symbol.eq_ignore_ascii_case(symbol))
+            .and_then(|(_, price)| price.as_ref())
+        {
+            return Ok(price.clone());
+        }
+        let oracle = self
+            .price_oracle
+            .as_ref()
+            .ok_or_else(|| format!("no oracle to price {symbol}"))?;
+        let (price, _) = oracle.get_price(symbol, USD_QUOTE_CURRENCY).await?;
+        positive_price(&price).ok_or_else(|| format!("the oracle returned a non-positive {symbol} price"))
     }
 
     // Converts malformed responses into per-venue Invalid outcomes so one bad
@@ -1092,8 +1248,11 @@ impl IcpswapFirstPlanner {
         // With a 250 bps limit the quote must return at least 9,750 / 10,000 of
         // the oracle-implied output. Both sides are multiplied out so the
         // decision stays in exact integer token units.
+        // The venue's own price is judged, so fixed transfer fees that the quote
+        // counts exactly do not read as a discount (audit L10).
+        let quoted_receive = preview.market_receive.as_ref().unwrap_or(&preview.quote.receive_amount);
         let allowed_bps = BPS_DENOMINATOR - self.config.max_oracle_discount_bps;
-        let actual_scaled = preview.quote.receive_amount.clone() * Nat::from(BPS_DENOMINATOR);
+        let actual_scaled = quoted_receive.clone() * Nat::from(BPS_DENOMINATOR);
         let minimum_scaled = oracle_output.clone() * Nat::from(allowed_bps);
         if actual_scaled >= minimum_scaled {
             return Ok(());
@@ -1104,7 +1263,7 @@ impl IcpswapFirstPlanner {
         // discount rather than a misleading number.
         let discount_bps = adverse_price_impact_bps(
             oracle_output.0.to_f64().unwrap_or(f64::INFINITY),
-            preview.quote.receive_amount.0.to_f64().unwrap_or(0.0),
+            quoted_receive.0.to_f64().unwrap_or(0.0),
         );
 
         Err(IcpswapFirstPlannerError::NoViableRoute(format!(
@@ -1114,7 +1273,7 @@ impl IcpswapFirstPlanner {
     }
 
     // Excludes unavailable, invalid, and below-minimum overflow quotes, then
-    // selects the venue with the highest conservative receive amount.
+    // selects the venue with the highest conservative output after side costs.
     fn best_executable_overflow<'a>(
         &self,
         input: &IcpswapFirstPlanInput,
@@ -1134,9 +1293,7 @@ impl IcpswapFirstPlanner {
             // Replace the current selection only for a strictly better quote,
             // so an exact tie keeps the first venue from environment order.
             .fold(None, |best, candidate| match best {
-                Some(current) if current.conservative_receive.value >= candidate.conservative_receive.value => {
-                    Some(current)
-                }
+                Some(current) if net_conservative(current) >= net_conservative(candidate) => Some(current),
                 _ => Some(candidate),
             })
     }
@@ -1173,15 +1330,36 @@ impl IcpswapFirstPlanner {
         allocation_reason: MultiVenueAllocationReason,
         quoted_at: i64,
     ) -> Result<MultiVenueExecutionState, IcpswapFirstPlannerError> {
+        if let Some(unpriced) = previews
+            .iter()
+            .find(|preview| preview.priced_side_costs.is_none() && !preview.side_costs.is_empty())
+        {
+            return Err(IcpswapFirstPlannerError::InvalidInput(format!(
+                "{} side costs were not priced",
+                unpriced.venue_id
+            )));
+        }
+        let side_cost = previews
+            .iter()
+            .fold(Nat::from(0u8), |total, preview| total + side_cost_total(preview));
         let legs: Vec<VenueLegState> = previews.into_iter().map(preview_to_leg).collect();
         let estimated_receive = sum_leg_outputs(&legs, false)?;
         let conservative_receive = sum_leg_outputs(&legs, true)?;
-        let combined_net_edge_bps = edge_bps(&conservative_receive, &input.debt_repaid)?;
+        // Costs paid from other balances still come out of the liquidation's result.
+        let net_receive = ChainTokenAmount::from_raw(
+            conservative_receive.token.clone(),
+            if conservative_receive.value > side_cost {
+                conservative_receive.value.clone() - side_cost.clone()
+            } else {
+                Nat::from(0u8)
+            },
+        );
+        let combined_net_edge_bps = edge_bps(&net_receive, &input.debt_repaid)?;
 
         // Every quote is still held to the oracle by `validate_venue_preview`.
         let required_edge_bps = self.config.required_edge_bps(input.buy_bad_debt);
 
-        if !meets_minimum_edge(&conservative_receive, &input.debt_repaid, required_edge_bps)? {
+        if !meets_minimum_edge(&net_receive, &input.debt_repaid, required_edge_bps)? {
             return Err(IcpswapFirstPlannerError::NoViableRoute(format!(
                 "combined conservative output has {:.2} bps edge, below required {} bps",
                 combined_net_edge_bps, required_edge_bps
@@ -1198,6 +1376,10 @@ impl IcpswapFirstPlanner {
                 min_net_edge_bps: self.config.min_net_edge_bps,
                 enforced_min_net_edge_bps: Some(required_edge_bps),
                 estimated_receive,
+                side_cost_receive: Some(ChainTokenAmount::from_raw(
+                    conservative_receive.token.clone(),
+                    side_cost,
+                )),
                 conservative_receive,
                 combined_net_edge_bps,
                 quoted_at,

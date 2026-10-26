@@ -137,6 +137,7 @@ async fn native_deposit_prefers_eth_and_ignores_cketh_address() {
             "test-secret".into(),
         )),
         symbol_filters: tokio::sync::Mutex::new(HashMap::new()),
+        coin_config: CoinConfigCache::default(),
         http: reqwest::Client::new(),
     };
     let address = tokio::time::timeout(
@@ -454,6 +455,7 @@ fn client_at(endpoint: String) -> MexcClient {
             "test-secret".into(),
         )),
         symbol_filters: tokio::sync::Mutex::new(HashMap::new()),
+        coin_config: CoinConfigCache::default(),
         http: reqwest::Client::new(),
     }
 }
@@ -528,4 +530,57 @@ async fn an_ambiguous_ioc_error_sends_no_market_order() {
 
     assert!(error.to_string().contains("Swap err"), "{error}");
     assert_eq!(server.await.unwrap().len(), 1);
+}
+
+fn coin(coin: &str, networks: &[(&str, &str, bool, &str)]) -> mexc_rs::spot::v3::coin_config::CoinConfig {
+    serde_json::from_value(serde_json::json!({
+        "coin": coin,
+        "networkList": networks
+            .iter()
+            .map(|(network, net_work, enabled, fee)| serde_json::json!({
+                "coin": coin,
+                "network": network,
+                "netWork": net_work,
+                "withdrawEnable": enabled,
+                "withdrawFee": fee,
+                "withdrawMin": "0.01",
+            }))
+            .collect::<Vec<_>>(),
+    }))
+    .unwrap()
+}
+
+#[test]
+fn withdraw_terms_follow_the_network_a_withdrawal_would_use() {
+    let config = vec![
+        coin("SOL", &[("Solana(SOL)", "SOL", true, "0.008")]),
+        coin(
+            "ETH",
+            &[
+                ("Ethereum(ERC20)", "ETH", true, "0.0015"),
+                ("Arbitrum One", "ARB", true, "0.0001"),
+            ],
+        ),
+    ];
+
+    let sol = find_withdraw_terms(&config, "SOL", "SOL").expect("SOL terms");
+    assert_eq!(
+        sol,
+        WithdrawTerms {
+            fee: 0.008,
+            minimum: 0.01
+        }
+    );
+    let eth = find_withdraw_terms(&config, "ETH", "ETH").expect("ETH terms");
+    assert_eq!(eth.fee, 0.0015, "the Ethereum network, not Arbitrum");
+}
+
+#[test]
+fn withdraw_terms_refuse_a_disabled_or_unknown_network() {
+    let config = vec![coin("USDC", &[("Ethereum(ERC20)", "ETH", false, "1")])];
+
+    let disabled = find_withdraw_terms(&config, "USDC", "ETH").unwrap_err();
+    assert!(disabled.contains("disabled"), "{disabled}");
+    let unknown = find_withdraw_terms(&config, "BTC", "BTC").unwrap_err();
+    assert!(unknown.contains("no withdrawal terms"), "{unknown}");
 }

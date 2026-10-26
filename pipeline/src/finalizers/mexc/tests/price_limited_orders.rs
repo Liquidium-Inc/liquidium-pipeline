@@ -17,6 +17,7 @@ fn finalizer_with_fills(fills: Vec<Option<f64>>) -> (MexcFinalizer<MockCexBacken
             price: 1.001,
             quantity: 1_000.0,
         }],
+        taker_fee_bps: 10.0,
     };
     backend.expect_get_orderbook().returning(move |_, _| Ok(book.clone()));
     let orders: Orders = Arc::default();

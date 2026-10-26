@@ -229,6 +229,9 @@ impl MultiVenueAdapter for IcpswapFinalizer {
             quote: preview.quote,
             conservative_receive,
             initial_execution_state: VenueExecutionState::new(VENUE_ID, &state)?,
+            market_receive: None,
+            side_costs: Vec::new(),
+            priced_side_costs: None,
         })
     }
 

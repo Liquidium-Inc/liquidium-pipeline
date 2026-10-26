@@ -248,8 +248,16 @@ impl CexBackend for MexcClient {
                 Ok(OrderBookLevel { price, quantity })
             })
             .collect::<Result<Vec<_>, String>>()?;
+        drop(ex);
 
-        Ok(OrderBook { bids, asks })
+        // The same fee source the fills are accounted with.
+        let filters = self.get_symbol_filters(&market.trim().to_ascii_uppercase()).await?;
+        let (taker_fee_bps, _) = Self::resolve_taker_fee_bps(filters.as_ref());
+        Ok(OrderBook {
+            bids,
+            asks,
+            taker_fee_bps,
+        })
     }
 
     async fn get_deposit_address(&self, asset: &str, network: &str) -> Result<DepositAddress, String> {
@@ -313,6 +321,10 @@ impl CexBackend for MexcClient {
         ))
     }
 
+    async fn get_withdraw_terms(&self, asset: &str, network: &str) -> Result<WithdrawTerms, String> {
+        find_withdraw_terms(&self.coin_config().await?, asset, network)
+    }
+
     async fn get_balance(&self, asset: &str) -> Result<f64, String> {
         let ex = self.inner.lock().await;
 
@@ -355,25 +367,8 @@ impl CexBackend for MexcClient {
         withdraw_order_id: &str,
     ) -> Result<WithdrawalReceipt, String> {
         let ex = self.inner.lock().await;
-        let push_unique = |list: &mut Vec<String>, value: String| {
-            if !list.iter().any(|item| item.eq_ignore_ascii_case(&value)) {
-                list.push(value);
-            }
-        };
-
         let candidates = mexc_withdraw_coin_candidates(asset);
-
-        let mut network_candidates = mexc_network_candidates(asset, network);
-        let network_mapped = mexc_withdraw_network(asset, network);
-        let mut ordered_networks = Vec::new();
-        push_unique(&mut ordered_networks, network_mapped.clone());
-        for cand in network_candidates.drain(..) {
-            push_unique(&mut ordered_networks, cand);
-        }
-        if ordered_networks.is_empty() {
-            push_unique(&mut ordered_networks, network_mapped.clone());
-        }
-        let network_candidates = ordered_networks;
+        let network_candidates = mexc_withdraw_network_order(asset, network);
 
         info!(
             "Withdraw request coin={} network_candidates={:?} amount={} address={} withdraw_order_id={}",
@@ -432,7 +427,7 @@ impl CexBackend for MexcClient {
 
         Ok(WithdrawalReceipt {
             asset: accepted_coin,
-            network: network_mapped,
+            network: mexc_withdraw_network(asset, network),
             amount,
             txid: None,
             internal_id: Some(res.id),

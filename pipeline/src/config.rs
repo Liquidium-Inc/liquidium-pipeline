@@ -83,6 +83,8 @@ pub struct Config {
     /// How old a recorded price may be, in seconds, before the venue quote guard
     /// stops using it as a fallback for a live oracle read.
     pub multi_venue_oracle_snapshot_max_age_secs: i64,
+    /// USD per trillion cycles, the XDR rate the planner prices cycle costs at.
+    pub cycles_usd_per_trillion: f64,
     /// Extra safety haircut for price-move risk during execution latency, in bps.
     pub cex_delay_buffer_bps: u32,
     /// Route fee estimate in bps subtracted from projected edge.
@@ -449,6 +451,7 @@ impl Config {
             multi_venue_bad_debt_min_net_edge_bps: parse_multi_venue_bad_debt_min_net_edge_bps_from_env(),
             multi_venue_max_oracle_discount_bps: parse_multi_venue_max_oracle_discount_bps_from_env(),
             multi_venue_oracle_snapshot_max_age_secs: parse_multi_venue_oracle_snapshot_max_age_secs_from_env(),
+            cycles_usd_per_trillion: parse_cycles_usd_per_trillion_from_env(),
             cex_delay_buffer_bps: cex_tunables.delay_buffer_bps,
             cex_route_fee_bps: cex_tunables.route_fee_bps,
             cex_mexc_available_pairs,
@@ -549,7 +552,11 @@ const DEFAULT_MULTI_VENUE_SETTLEMENT_MIN_NET_EDGE_BPS: i32 = -150;
 const DEFAULT_MULTI_VENUE_MAX_ORACLE_DISCOUNT_BPS: u32 = 500;
 const DEFAULT_MULTI_VENUE_ORACLE_SNAPSHOT_MAX_AGE_SECS: i64 = 300;
 const DEFAULT_CEX_DELAY_BUFFER_BPS: u32 = 75;
-const DEFAULT_CEX_ROUTE_FEE_BPS: u32 = 25;
+/// Every route fee the planner can know is now counted exactly, so the flat
+/// route-fee haircut defaults to none (audit L10). The env var still adds one.
+const DEFAULT_CEX_ROUTE_FEE_BPS: u32 = 0;
+/// One trillion cycles is one XDR. The XDR moves little against the USD.
+const DEFAULT_CYCLES_USD_PER_TRILLION: f64 = 1.35;
 const DEFAULT_CEX_MEXC_MAX_HOPS: u8 = 2;
 const MAX_CEX_MEXC_MAX_HOPS: u8 = 4;
 const DEFAULT_BAD_DEBT_COLLATERAL_SLIPPAGE_BPS: u32 = 500;
@@ -614,6 +621,14 @@ fn parse_multi_venue_max_oracle_discount_bps_from_env() -> u32 {
         .and_then(|value| value.parse::<u32>().ok())
         .filter(|value| *value < MAX_BPS)
         .unwrap_or(DEFAULT_MULTI_VENUE_MAX_ORACLE_DISCOUNT_BPS)
+}
+
+fn parse_cycles_usd_per_trillion_from_env() -> f64 {
+    env::var("CYCLES_USD_PER_TRILLION")
+        .ok()
+        .and_then(|value| value.parse::<f64>().ok())
+        .filter(|value| value.is_finite() && *value > 0.0)
+        .unwrap_or(DEFAULT_CYCLES_USD_PER_TRILLION)
 }
 
 fn parse_multi_venue_oracle_snapshot_max_age_secs_from_env() -> i64 {
@@ -957,7 +972,7 @@ mod tests {
                 retry_base_secs: 5,
                 retry_max_secs: 120,
                 delay_buffer_bps: 75,
-                route_fee_bps: 25,
+                route_fee_bps: 0,
             }
         );
         assert_eq!(parse_multi_venue_min_net_edge_bps_from_env(), 150);

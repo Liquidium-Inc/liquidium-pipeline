@@ -17,6 +17,7 @@ proptest! {
                     price: 1.001,
                     quantity: 100.0,
                 }],
+                taker_fee_bps: 10.0,
             };
             let btc_usdc = OrderBook {
                 bids: vec![OrderBookLevel {
@@ -27,6 +28,7 @@ proptest! {
                     price: 69_010.0,
                     quantity: 100.0,
                 }],
+                taker_fee_bps: 10.0,
             };
 
             backend
@@ -92,10 +94,12 @@ proptest! {
             let ckbtc_btc_book = OrderBook {
                 bids: vec![OrderBookLevel { price: 1.0, quantity: 100.0 }],
                 asks: vec![OrderBookLevel { price: 1.001, quantity: 100.0 }],
+                taker_fee_bps: 10.0,
             };
             let btc_usdc_book = OrderBook {
                 bids: vec![OrderBookLevel { price: btc_usd as f64, quantity: 1000.0 }],
                 asks: vec![OrderBookLevel { price: btc_usd as f64 + 1.0, quantity: 1000.0 }],
+                taker_fee_bps: 10.0,
             };
 
             backend.expect_get_orderbook().returning(move |market, _limit| match market {
@@ -166,10 +170,12 @@ proptest! {
             let ckbtc_btc_book = OrderBook {
                 bids: vec![OrderBookLevel { price: 1.0, quantity: 100.0 }],
                 asks: vec![OrderBookLevel { price: 1.001, quantity: 100.0 }],
+                taker_fee_bps: 10.0,
             };
             let btc_usdc_book = OrderBook {
                 bids: vec![OrderBookLevel { price: 69_000.0, quantity: 1000.0 }],
                 asks: vec![OrderBookLevel { price: 69_010.0, quantity: 1000.0 }],
+                taker_fee_bps: 10.0,
             };
 
             backend.expect_get_orderbook().returning(move |market, _limit| match market {
@@ -247,10 +253,12 @@ proptest! {
                     OrderBookLevel { price: 0.99, quantity: 10.0 },
                 ],
                 asks: vec![OrderBookLevel { price: 1.001, quantity: 10.0 }],
+                taker_fee_bps: 10.0,
             };
             let btc_usdc_book = OrderBook {
                 bids: vec![OrderBookLevel { price: 69_000.0, quantity: 1000.0 }],
                 asks: vec![OrderBookLevel { price: 69_010.0, quantity: 1000.0 }],
+                taker_fee_bps: 10.0,
             };
 
             backend.expect_get_orderbook().returning(move |market, _limit| match market {
@@ -322,10 +330,12 @@ proptest! {
             let ckbtc_btc_book = OrderBook {
                 bids: vec![OrderBookLevel { price: 1.0, quantity: 100.0 }],
                 asks: vec![OrderBookLevel { price: 1.001, quantity: 100.0 }],
+                taker_fee_bps: 10.0,
             };
             let btc_usdc_book = OrderBook {
                 bids: vec![OrderBookLevel { price: 69_000.0, quantity: 1000.0 }],
                 asks: vec![OrderBookLevel { price: 69_010.0, quantity: 1000.0 }],
+                taker_fee_bps: 10.0,
             };
 
             backend.expect_get_orderbook().returning(move |market, _limit| match market {

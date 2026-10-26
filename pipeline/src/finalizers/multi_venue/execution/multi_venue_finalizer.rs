@@ -6,6 +6,7 @@ use crate::{
         IcpswapFirstPlanInput, IcpswapFirstPlanner, IcpswapFirstPlannerConfig, IcpswapFirstPlannerError,
         MultiVenueAdapter, VenueLegProgress,
     },
+    liquidation::liquidation_math::oracle_implied_output,
     persistance::{
         FINALIZER_META_V2_VERSION, FinalizerDecisionSnapshot, FinalizerMetaPayload, FinalizerMetaV2, LiqMetaWrapper,
         MultiVenueAllocationSnapshot, MultiVenueExecutionOutcome, MultiVenueExecutionState, RecoverySweepState,
@@ -25,8 +26,9 @@ use liquidium_pipeline_core::{
     account::model::ChainAccount,
     tokens::{chain_token::ChainToken, chain_token_amount::ChainTokenAmount},
     transfer::actions::{TransferActions, TransferFailure},
+    types::side_cost::SideCost,
 };
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use super::parent_leg_checkpoint::ParentLegCheckpoint;
 use crate::finalizers::multi_venue::planning::venue_registry::VenueRegistry;
@@ -631,6 +633,42 @@ fn recovery_result(state: &RecoverySweepState) -> FinalizerResult {
     }
 }
 
+/// One leg's actual side costs in receive-token units, at the prices its plan
+/// used. A cost the plan did not price cannot be converted; it is logged and
+/// stays visible in the execution's `side_costs`.
+fn leg_side_cost_receive(leg: &VenueLegState, costs: &[SideCost]) -> Nat {
+    let receive_decimals = u64::from(leg.quote.conservative_receive.token.decimals());
+    let mut total = Nat::from(0u8);
+    for cost in costs {
+        let Some(priced) = leg
+            .quote
+            .side_costs
+            .iter()
+            .find(|priced| priced.cost.symbol == cost.symbol)
+        else {
+            warn!(
+                "[multi-venue] leg `{}` paid side cost `{}` in {} that its plan did not price",
+                leg.leg_id, cost.label, cost.symbol
+            );
+            continue;
+        };
+        match oracle_implied_output(
+            &cost.amount,
+            &priced.cost_price_ray,
+            &priced.receive_price_ray,
+            u64::from(cost.decimals),
+            receive_decimals,
+        ) {
+            Ok(value) => total += value,
+            Err(error) => warn!(
+                "[multi-venue] leg `{}` side cost `{}` could not be converted: {error}",
+                leg.leg_id, cost.label
+            ),
+        }
+    }
+    total
+}
+
 /// Collects every completed leg's execution result and folds them into the one
 /// swap shape the pipeline records. A completed leg with no result is a broken
 /// invariant, not an empty aggregate.
@@ -683,6 +721,8 @@ fn aggregate_swap_executions(
     let mut quote_legs = Vec::new();
     let mut approval_count = None;
     let mut ts = 0;
+    let mut side_costs = Vec::new();
+    let mut side_cost_receive = Nat::from(0u8);
 
     for (leg, execution) in legs
         .iter()
@@ -701,6 +741,8 @@ fn aggregate_swap_executions(
             approval_count = Some(approval_count.unwrap_or(0u32).saturating_add(count));
         }
         ts = ts.max(execution.ts);
+        side_cost_receive += leg_side_cost_receive(leg, &execution.side_costs);
+        side_costs.extend(execution.side_costs);
     }
 
     let weighted = |notional: f64| if pay_weight > 0.0 { notional / pay_weight } else { 0.0 };
@@ -718,6 +760,8 @@ fn aggregate_swap_executions(
         legs: quote_legs,
         approval_count,
         ts,
+        side_cost_receive: (!side_costs.is_empty()).then_some(side_cost_receive),
+        side_costs,
     }))
 }
 
@@ -954,5 +998,83 @@ fn decision_snapshot(state: &MultiVenueExecutionState) -> FinalizerDecisionSnaps
             combined_net_edge_bps: state.plan.combined_net_edge_bps,
             reason: state.plan.allocation_reason.clone(),
         }),
+    }
+}
+
+#[cfg(test)]
+mod side_cost_tests {
+    use super::*;
+    use crate::persistance::{PricedSideCost, VenueExecutionState, VenueLegQuote};
+    use crate::swappers::model::SwapRequest;
+    use candid::Principal;
+
+    const RAY: u128 = 1_000_000_000_000_000_000_000_000_000;
+
+    fn ckusdc() -> ChainToken {
+        ChainToken::Icp {
+            ledger: Principal::anonymous(),
+            symbol: "ckUSDC".to_string(),
+            decimals: 6,
+            fee: Nat::from(10_000u64),
+        }
+    }
+
+    fn gas(wei: u64) -> SideCost {
+        SideCost::new("ETH gas for the USDC helper deposit", "ETH", 18, Nat::from(wei))
+    }
+
+    fn leg_with_planned_gas() -> VenueLegState {
+        let amount = ChainTokenAmount::from_raw(ckusdc(), Nat::from(1_000_000u64));
+        VenueLegState {
+            leg_id: "mexc-0".to_string(),
+            venue_id: "mexc".to_string(),
+            request: SwapRequest {
+                pay_asset: ckusdc().asset_id(),
+                pay_amount: amount.clone(),
+                receive_asset: ckusdc().asset_id(),
+                receive_address: None,
+                max_slippage_bps: None,
+                venue_hint: None,
+            },
+            quote: VenueLegQuote {
+                pay_amount: amount.clone(),
+                estimated_receive: amount.clone(),
+                conservative_receive: amount,
+                estimated_price_impact_bps: 0.0,
+                route_id: "mexc".to_string(),
+                // Planned at $3,000 per ETH and $1 per ckUSDC.
+                side_costs: vec![PricedSideCost {
+                    cost: gas(1_000_000_000_000_000),
+                    cost_price_ray: Nat::from(3_000 * RAY),
+                    receive_price_ray: Nat::from(RAY),
+                    receive_equivalent: Nat::from(3_000_000u64),
+                }],
+            },
+            execution: VenueExecutionState {
+                venue: "mexc".to_string(),
+                state: serde_json::json!({}),
+            },
+            status: VenueLegStatus::Completed,
+            result: None,
+            last_error: None,
+        }
+    }
+
+    /// Audit L10: the cost a leg actually paid converts at the prices its
+    /// plan used, so the outcome compares with the plan.
+    #[test]
+    fn actual_side_costs_convert_at_the_planned_prices() {
+        // Half the planned gas was used: 0.0005 ETH at $3,000 is 1.5 ckUSDC.
+        let converted = leg_side_cost_receive(&leg_with_planned_gas(), &[gas(500_000_000_000_000)]);
+        assert_eq!(converted, Nat::from(1_500_000u64));
+    }
+
+    #[test]
+    fn a_side_cost_the_plan_never_priced_is_not_guessed() {
+        let cycles = SideCost::new("cycles", "CYCLES", 12, Nat::from(1u8));
+        assert_eq!(
+            leg_side_cost_receive(&leg_with_planned_gas(), &[cycles]),
+            Nat::from(0u8)
+        );
     }
 }

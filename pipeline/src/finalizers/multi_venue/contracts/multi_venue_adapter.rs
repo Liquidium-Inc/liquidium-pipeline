@@ -1,9 +1,11 @@
 use async_trait::async_trait;
+use candid::Nat;
 use liquidium_pipeline_core::tokens::chain_token_amount::ChainTokenAmount;
+use liquidium_pipeline_core::types::side_cost::SideCost;
 
 use crate::{
     outbound::driver::OperatorDecision,
-    persistance::{VenueExecutionState, VenueLegState, VenueLegStatus},
+    persistance::{PricedSideCost, VenueExecutionState, VenueLegState, VenueLegStatus},
     swappers::model::{SwapExecution, SwapQuote, SwapRequest},
 };
 
@@ -29,6 +31,14 @@ pub struct VenueRoutePreview {
     pub quote: SwapQuote,
     pub conservative_receive: ChainTokenAmount,
     pub initial_execution_state: VenueExecutionState,
+    /// The output at the venue's own price before fixed transfer fees. The
+    /// oracle guard reads this, so a correctly counted fee does not look like
+    /// a bad price. `None` means the quote has no fixed fees to separate.
+    pub market_receive: Option<Nat>,
+    /// What the route pays from other balances, in their own assets.
+    pub side_costs: Vec<SideCost>,
+    /// The planner's pricing of `side_costs`. `None` until the planner prices it.
+    pub priced_side_costs: Option<Vec<PricedSideCost>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]

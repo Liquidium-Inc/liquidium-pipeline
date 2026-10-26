@@ -185,6 +185,7 @@ async fn mexc_deposit_bridge_submit_resume_and_complete() {
                 source_fee_budget: 0.01,
                 destination_fee_budget: 0.0,
                 provider_fee_budget_native_units: None,
+                side_costs: Vec::new(),
             })
         });
     bridge

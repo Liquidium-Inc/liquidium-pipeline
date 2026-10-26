@@ -1,5 +1,6 @@
 use candid::{CandidType, Nat};
 use liquidium_pipeline_core::tokens::{asset_id::AssetId, chain_token_amount::ChainTokenAmount};
+use liquidium_pipeline_core::types::side_cost::SideCost;
 use serde::{Deserialize, Serialize};
 
 pub const BASIS_POINTS_DENOMINATOR: u32 = 10_000;
@@ -113,6 +114,13 @@ pub struct SwapExecution {
     #[serde(default)]
     pub approval_count: Option<u32>,
     pub ts: u64,
+    /// What this execution paid from other balances, in their own assets.
+    #[serde(default)]
+    pub side_costs: Vec<SideCost>,
+    /// The same costs in receive-token units at the planned prices. Realized
+    /// profit subtracts it. `None` when no plan priced them.
+    #[serde(default)]
+    pub side_cost_receive: Option<Nat>,
 }
 
 #[cfg(test)]
@@ -175,6 +183,8 @@ mod tests {
             legs: Vec::new(),
             approval_count: None,
             ts: 3,
+            side_costs: Vec::new(),
+            side_cost_receive: None,
         }
     }
 

@@ -255,7 +255,7 @@ mod withdraw_bridge;
 #[path = "withdraw/direct.rs"]
 mod withdraw_direct;
 
-pub(super) use sizing::BridgeDepositSizing;
+pub(super) use sizing::{BridgeDepositSizing, BridgedDepositArrival};
 #[cfg(test)]
 use withdraw_direct::is_mexc_withdraw_below_min_error;
 pub use withdraw_direct::mexc_withdraw_order_id;

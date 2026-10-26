@@ -80,6 +80,9 @@ where
             quote: preview.quote,
             conservative_receive: preview.conservative_receive,
             initial_execution_state: VenueExecutionState::new(VENUE_ID, &execution)?,
+            market_receive: Some(preview.market_receive),
+            side_costs: preview.side_costs,
+            priced_side_costs: None,
         })
     }
 

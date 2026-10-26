@@ -4,6 +4,7 @@ use liquidium_pipeline_connectors::backend::{
     cex_backend::CexBackend,
 };
 use liquidium_pipeline_core::tokens::{chain_token::ChainToken, chain_token_amount::ChainTokenAmount};
+use liquidium_pipeline_core::types::side_cost::SideCost;
 
 use super::{mexc_finalizer::MexcFinalizer, mexc_utils::LIQUIDITY_EPS};
 use crate::{
@@ -24,6 +25,10 @@ pub(super) struct MexcPreparedPreview {
     pub state: CexState,
     pub quote: SwapQuote,
     pub conservative_receive: ChainTokenAmount,
+    /// The output at the order book's price for the whole allocation, before
+    /// the route's fixed fees.
+    pub market_receive: Nat,
+    pub side_costs: Vec<SideCost>,
 }
 
 impl<B> MexcFinalizer<B>
@@ -45,6 +50,7 @@ where
         Ok(CexState {
             liq_id: execution_id.to_string(),
             send_saved: false,
+            side_costs: Vec::new(),
             step: CexStep::Deposit,
             last_error: None,
             market: format!("{}_{}", bridge_plan.deposit.cex_asset, bridge_plan.withdraw.cex_asset),
@@ -219,6 +225,8 @@ where
             legs,
             approval_count: state.deposit.approval_bump_count,
             ts: now_ts().max(0) as u64,
+            side_costs: state.side_costs.clone(),
+            side_cost_receive: None,
         })
     }
 
@@ -237,12 +245,8 @@ where
         if let Some(requested_bps) = request.max_slippage_bps {
             amount_after_bps_haircut(&Nat::from(0u8), requested_bps)?;
         }
-        let (_, executable_pay) = Self::compute_fee_adjusted_deposit_transfer(
-            &state.deposit.deposit_asset,
-            &state.size_in,
-            state.deposit.bridge.deposit_bridge_required,
-        )?;
-        let initial_amount = executable_pay.to_f64();
+        let mut side_costs = Vec::new();
+        let initial_amount = self.preview_trade_input(&state, &mut side_costs).await?;
         if initial_amount <= LIQUIDITY_EPS {
             return Err("MEXC cannot quote a non-positive pay amount".to_string());
         }
@@ -263,22 +267,18 @@ where
             .collect();
         state.trade.trade_leg_total = Some(legs.len() as u32);
 
-        let mut net_receive = route_preview.receive_amount.max(0.0);
-        let mut execution_price = route_preview.execution_price;
-        let withdraw_route = resolve_route(
-            &<Self as BridgePlanner>::planned_withdraw_asset(&state),
-            &<Self as BridgePlanner>::planned_withdraw_network(&state),
-            &state.withdraw.withdraw_asset.symbol(),
-        );
-        if state.withdraw.bridge.withdraw_bridge_required
-            && let Some(route) = withdraw_route
-            && route.route_kind == BridgeRouteKind::SolanaToIcp
-        {
-            let bridge = self.bridge.as_ref().ok_or_else(|| "SOL bridge runtime is missing".to_string())?;
-            let gross = ChainTokenAmount::from_formatted(state.withdraw.withdraw_asset.clone(), net_receive);
-            net_receive = Self::solana_repayment_bridge_amount(bridge, route, &gross).await?.to_f64();
-            execution_price = net_receive / initial_amount;
-        }
+        // The order book's price for the whole allocation, before fixed fees.
+        let market_receive = ChainTokenAmount::from_formatted(
+            state.withdraw.withdraw_asset.clone(),
+            (state.size_in.to_f64() * route_preview.execution_price).max(0.0),
+        )
+        .value;
+        let net_receive = self
+            .preview_receive(&state, route_preview.receive_amount.max(0.0), &mut side_costs)
+            .await?;
+        let execution_price = net_receive / initial_amount;
+        // The leg starts with the side costs it plans to pay.
+        state.record_side_costs(&side_costs);
         let receive_amount = ChainTokenAmount::from_formatted(state.withdraw.withdraw_asset.clone(), net_receive);
         let route_id = if legs.is_empty() {
             format!(
@@ -325,6 +325,80 @@ where
             state,
             quote,
             conservative_receive: ChainTokenAmount::from_raw(receive_amount.token, conservative_value),
+            market_receive,
+            side_costs,
         })
+    }
+
+    /// The amount that reaches MEXC to trade, sized as the deposit sizes it.
+    async fn preview_trade_input(&self, state: &CexState, side_costs: &mut Vec<SideCost>) -> Result<f64, String> {
+        if !state.deposit.bridge.deposit_bridge_required {
+            let (_, executable_pay) =
+                Self::compute_fee_adjusted_deposit_transfer(&state.deposit.deposit_asset, &state.size_in, false)?;
+            return Ok(executable_pay.to_f64());
+        }
+        let bridge = self
+            .bridge
+            .as_ref()
+            .ok_or_else(|| "bridge runtime not configured for bridged deposit".to_string())?;
+        let source_symbol = state.deposit.deposit_asset.symbol();
+        let source_chain = state.deposit.deposit_asset.chain();
+        let planned_asset = <Self as BridgePlanner>::planned_deposit_asset(state);
+        let route = resolve_route(&source_symbol, &source_chain, &planned_asset).ok_or_else(|| {
+            format!("bridge route not found for deposit {source_symbol}@{source_chain} -> {planned_asset}")
+        })?;
+        let arrival =
+            Self::bridged_deposit_arrival(bridge, route, &state.deposit.deposit_asset, &state.size_in).await?;
+        side_costs.extend(arrival.sizing.fee_budget.side_costs);
+        Ok(arrival.expected_amount)
+    }
+
+    /// What arrives as the final asset after MEXC's withdrawal fee and the
+    /// return bridge, as the withdrawal meets them.
+    async fn preview_receive(
+        &self,
+        state: &CexState,
+        trade_out: f64,
+        side_costs: &mut Vec<SideCost>,
+    ) -> Result<f64, String> {
+        let planned_asset = <Self as BridgePlanner>::planned_withdraw_asset(state);
+        let planned_network = <Self as BridgePlanner>::planned_withdraw_network(state);
+        let terms = self
+            .backend
+            .get_withdraw_terms(&planned_asset, &planned_network)
+            .await?;
+        // MEXC refuses a smaller withdrawal, and the leg would end as dust.
+        if trade_out < terms.minimum {
+            return Err(format!(
+                "MEXC {planned_asset} withdrawal of {trade_out} is below its minimum {}",
+                terms.minimum
+            ));
+        }
+        let mut net = Self::net_of_withdraw_fee(trade_out, terms.fee)?;
+
+        let withdraw_route = resolve_route(
+            &planned_asset,
+            &planned_network,
+            &state.withdraw.withdraw_asset.symbol(),
+        );
+        let (true, Some(route)) = (state.withdraw.bridge.withdraw_bridge_required, withdraw_route) else {
+            return Ok(net);
+        };
+        let bridge = self
+            .bridge
+            .as_ref()
+            .ok_or_else(|| "return bridge runtime is missing".to_string())?;
+        let budget = bridge
+            .backend
+            .get_fee_budget(route.source_asset, route.source_chain, route.target_asset)
+            .await?;
+        side_costs.extend(budget.side_costs);
+        if route.route_kind == BridgeRouteKind::SolanaToIcp {
+            let gross = ChainTokenAmount::from_formatted(state.withdraw.withdraw_asset.clone(), net);
+            net = Self::solana_repayment_bridge_amount(bridge, route, &gross)
+                .await?
+                .to_f64();
+        }
+        Ok(net)
     }
 }

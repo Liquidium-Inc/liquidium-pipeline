@@ -6,6 +6,7 @@ use std::{
 
 use async_trait::async_trait;
 use candid::{Nat, Principal};
+use liquidium_pipeline_core::types::side_cost::{CYCLES_DECIMALS, CYCLES_SYMBOL, SideCost};
 use liquidium_pipeline_core::{
     tokens::{chain_token::ChainToken, chain_token_amount::ChainTokenAmount},
     types::protocol_types::{
@@ -281,6 +282,7 @@ fn config(cex_min_exec_usd: f64) -> IcpswapFirstPlannerConfig {
         max_oracle_discount_bps: 200,
         oracle_snapshot_max_age_secs: 300,
         icpswap_test_allocation_usd: None,
+        cycles_usd_per_trillion: 1.35,
     }
 }
 
@@ -334,6 +336,9 @@ fn preview(
             venue: venue_id.to_string(),
             state: serde_json::json!({ "step": "planned" }),
         },
+        market_receive: None,
+        side_costs: Vec::new(),
+        priced_side_costs: None,
     }
 }
 
@@ -1404,13 +1409,12 @@ async fn safe_value_zero_quotes_mexc_once_after_binary_search() {
     assert_eq!(*call_count.lock().expect("count lock"), 1);
 }
 
-#[tokio::test]
-async fn safe_full_icpswap_below_minimum_still_requires_the_profit_floor() {
+/// An ICPSwap quote within its impact cap that fails the profit floor.
+fn unprofitable_icpswap() -> PlannerAdapter {
     let call_count = Arc::new(Mutex::new(0u32));
-    let icpswap_call_count = call_count.clone();
-    let icpswap = mock_adapter(ICPSWAP_VENUE_ID, Arc::new(Mutex::new(Vec::new())), move |request| {
+    mock_adapter(ICPSWAP_VENUE_ID, Arc::new(Mutex::new(Vec::new())), move |request| {
         let pay = request.pay_amount.value.0.to_u64().expect("u64 pay");
-        let mut count = icpswap_call_count.lock().expect("count lock");
+        let mut count = call_count.lock().expect("count lock");
         *count += 1;
         let impact = if pay == TOTAL_PAY && *count > 1 {
             50.0
@@ -1418,17 +1422,52 @@ async fn safe_full_icpswap_below_minimum_still_requires_the_profit_floor() {
             pay as f64 / 900_000.0
         };
         Ok(preview(request, ICPSWAP_VENUE_ID, impact, 180_000_000, 180_000_000))
-    });
+    })
+}
+
+/// Audit L11: a profit rejection rejects that route, not the liquidation. A
+/// profitable MEXC route under the same checks still settles the collateral.
+#[tokio::test]
+async fn unprofitable_icpswap_falls_back_to_a_profitable_mexc_route() {
     let mexc = mock_adapter(MEXC_VENUE_ID, Arc::new(Mutex::new(Vec::new())), |request| {
         Ok(proportional_preview(request, MEXC_VENUE_ID, 0.0, 2))
     });
 
-    let error = planner(icpswap, mexc, config(1.1))
+    let state = planner(unprofitable_icpswap(), mexc, config(1.1))
         .plan(&input_with_pay_token(native_icp()), 123)
         .await
-        .expect_err("unprofitable full ICPSwap route must fail");
+        .expect("the profitable MEXC route is used");
 
-    assert!(error.to_string().contains("below required 150 bps"));
+    assert_eq!(state.legs.len(), 1);
+    assert_eq!(state.legs[0].venue_id, MEXC_VENUE_ID);
+    assert_eq!(state.legs[0].request.pay_amount.value, Nat::from(TOTAL_PAY));
+    assert_eq!(
+        state.plan.allocation_reason,
+        MultiVenueAllocationReason::VenueUnavailable {
+            selected_venue_id: MEXC_VENUE_ID.to_string(),
+            unavailable_venue_ids: vec![ICPSWAP_VENUE_ID.to_string()],
+        }
+    );
+}
+
+/// The fallback keeps every limit: when MEXC also misses the floor, the
+/// planner gives up and reports both rejections.
+#[tokio::test]
+async fn unprofitable_icpswap_and_mexc_report_both_rejections() {
+    let mexc = mock_adapter(MEXC_VENUE_ID, Arc::new(Mutex::new(Vec::new())), |request| {
+        Ok(preview(request, MEXC_VENUE_ID, 0.0, 180_000_000, 180_000_000))
+    });
+
+    let error = planner(unprofitable_icpswap(), mexc, config(1.1))
+        .plan(&input_with_pay_token(native_icp()), 123)
+        .await
+        .expect_err("no route clears the profit floor");
+
+    assert_eq!(
+        error.to_string().matches("below required 150 bps").count(),
+        2,
+        "{error}"
+    );
 }
 
 // Venue availability
@@ -2304,4 +2343,118 @@ proptest! {
         prop_assert!(rejected.is_err(), "one unit below the integer boundary must fail");
         prop_assert!(rejected.unwrap_err().to_string().contains("250 bps limit"));
     }
+}
+
+// Side costs (audit L10)
+
+/// One ICP at $200 into ckUSDC at $1, with recorded prices the guard accepts.
+fn priced_icp_to_ckusdc_input() -> IcpswapFirstPlanInput {
+    let mut input = input_with_pay_token(native_icp());
+    input.pay_reference_price_ray = Some(Nat::from(200 * RAY));
+    input.receive_reference_price_ray = Some(Nat::from(RAY));
+    input
+}
+
+fn eth_priced_oracle() -> Arc<MockPriceOracle> {
+    let mut oracle = MockPriceOracle::new();
+    for (symbol, usd) in [("ICP", 200u128), ("USDC", 1), ("ETH", 3_000)] {
+        oracle
+            .expect_get_price()
+            .with(eq(symbol), eq(USD_QUOTE_CURRENCY))
+            .returning(move |_, _| Ok((Nat::from(usd * RAY), 27)));
+    }
+    Arc::new(oracle)
+}
+
+fn eth_gas(wei: u64) -> SideCost {
+    SideCost::new("ETH gas for the helper deposit", "ETH", 18, Nat::from(wei))
+}
+
+/// A planner where ICPSwap is down, so MEXC alone decides the plan.
+fn mexc_only_planner(side_costs: Vec<SideCost>, market_receive: Option<u64>, receive: u64) -> IcpswapFirstPlanner {
+    let icpswap = mock_adapter(ICPSWAP_VENUE_ID, Arc::new(Mutex::new(Vec::new())), |_request| {
+        Err("pool unavailable".to_string())
+    });
+    let mexc = mock_adapter(MEXC_VENUE_ID, Arc::new(Mutex::new(Vec::new())), move |request| {
+        let mut quote = preview(request, MEXC_VENUE_ID, 0.0, receive, receive);
+        quote.side_costs = side_costs.clone();
+        quote.market_receive = market_receive.map(Nat::from);
+        Ok(quote)
+    });
+    planner(icpswap, mexc, config(0.0))
+}
+
+#[tokio::test]
+async fn side_costs_count_against_the_profit_floor() {
+    // 200 ckUSDC out against a 190 debt clears the 150 bps floor (192.85) by itself.
+    // $6 of gas still clears it; $15 of gas does not.
+    let state = mexc_only_planner(vec![eth_gas(2_000_000_000_000_000)], None, 200_000_000)
+        .with_price_oracle(eth_priced_oracle())
+        .plan(&priced_icp_to_ckusdc_input(), QUOTED_AT)
+        .await
+        .expect("$6 of gas leaves the route above the floor");
+    assert_eq!(
+        state.plan.side_cost_receive.as_ref().map(|cost| cost.value.clone()),
+        Some(Nat::from(6_000_000u64))
+    );
+    assert_eq!(
+        state.legs[0].quote.side_costs[0].receive_equivalent,
+        Nat::from(6_000_000u64)
+    );
+    assert!(
+        state.plan.combined_net_edge_bps < 250.0,
+        "the edge is measured after side costs"
+    );
+
+    let error = mexc_only_planner(vec![eth_gas(5_000_000_000_000_000)], None, 200_000_000)
+        .with_price_oracle(eth_priced_oracle())
+        .plan(&priced_icp_to_ckusdc_input(), QUOTED_AT)
+        .await
+        .expect_err("$15 of gas drops the route below the floor");
+    assert!(error.to_string().contains("below required 150 bps"), "{error}");
+}
+
+#[tokio::test]
+async fn a_side_cost_nobody_can_price_makes_the_quote_unusable() {
+    let error = mexc_only_planner(vec![eth_gas(1)], None, 200_000_000)
+        .plan(&priced_icp_to_ckusdc_input(), QUOTED_AT)
+        .await
+        .expect_err("an ETH cost without an oracle cannot be valued");
+    assert!(error.to_string().contains("side costs cannot be priced"), "{error}");
+}
+
+#[tokio::test]
+async fn cycles_are_priced_at_the_configured_xdr_rate() {
+    let cycles = SideCost::new(
+        "cycles for the ckSOL deposit call",
+        CYCLES_SYMBOL,
+        CYCLES_DECIMALS,
+        Nat::from(55_000_000_000u64),
+    );
+    let state = mexc_only_planner(vec![cycles], None, 200_000_000)
+        .plan(&priced_icp_to_ckusdc_input(), QUOTED_AT)
+        .await
+        .expect("cycles need no oracle");
+    // 0.055 trillion cycles at $1.35 is $0.07425.
+    assert_eq!(
+        state.legs[0].quote.side_costs[0].receive_equivalent,
+        Nat::from(74_250u64)
+    );
+}
+
+#[tokio::test]
+async fn the_oracle_guard_reads_the_market_output_not_the_net() {
+    // The guard allows 200 bps under the oracle's 200 ckUSDC, so at least 196.
+    // Fixed fees bring the net to 195, but the book's price is the oracle's.
+    let state = mexc_only_planner(Vec::new(), Some(200_000_000), 195_000_000)
+        .plan(&priced_icp_to_ckusdc_input(), QUOTED_AT)
+        .await
+        .expect("correctly counted fees are not a bad price");
+    assert_eq!(state.legs[0].quote.estimated_receive.value, Nat::from(195_000_000u64));
+
+    let error = mexc_only_planner(Vec::new(), None, 195_000_000)
+        .plan(&priced_icp_to_ckusdc_input(), QUOTED_AT)
+        .await
+        .expect_err("without a market output the net is judged");
+    assert!(error.to_string().contains("below oracle-implied output"), "{error}");
 }

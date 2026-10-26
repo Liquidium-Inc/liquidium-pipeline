@@ -91,6 +91,7 @@ fn leg(leg_id: &str, venue_id: &str, pay: &ChainTokenAmount, receive: &ChainToke
             conservative_receive: receive.clone(),
             estimated_price_impact_bps: 50.0,
             route_id: format!("{venue_id}-route"),
+            side_costs: Vec::new(),
         },
         execution: VenueExecutionState::new(venue_id, &json!({ "step": "planned" })).expect("execution state"),
         status: VenueLegStatus::Planned,
@@ -114,6 +115,8 @@ fn execution(pay: &ChainTokenAmount, receive: &ChainTokenAmount) -> SwapExecutio
         legs: Vec::new(),
         approval_count: None,
         ts: 123,
+        side_costs: Vec::new(),
+        side_cost_receive: None,
     }
 }
 
@@ -152,6 +155,7 @@ fn state_with_venues(venues: &[(&str, u64)]) -> MultiVenueExecutionState {
             conservative_receive: estimated_receive,
             combined_net_edge_bps: 175.0,
             quoted_at: 123,
+            side_cost_receive: None,
         },
         legs,
         outcome: MultiVenueExecutionOutcome::Running,

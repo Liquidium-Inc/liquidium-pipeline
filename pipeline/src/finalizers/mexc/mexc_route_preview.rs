@@ -6,10 +6,6 @@ use super::{
 };
 use crate::swappers::model::{BPS_PER_RATIO_UNIT, adverse_price_impact_bps};
 
-/// Conservative quote-time fee per MEXC hop. Live fills resolve the exact
-/// symbol fee; planning must not assume the gross order-book output is usable.
-const MEXC_PREVIEW_TAKER_FEE_BPS: f64 = 10.0;
-
 /// One normalized route preview shared by legacy CEX routing and the generic
 /// multi-venue adapter. Prices are always receive units per pay unit.
 pub(super) struct MexcRoutePreview {
@@ -37,9 +33,10 @@ where
         let mut amount_in = initial_amount;
         let mut route_reference_price = 1.0;
         for leg in legs {
-            let (gross_amount_out, _side_vwap, side_impact_bps) =
+            // The fee comes from the same source the fills are accounted with.
+            let (gross_amount_out, _side_vwap, side_impact_bps, taker_fee_bps) =
                 self.preview_leg(&leg.market, &leg.side, amount_in).await?;
-            let amount_out = gross_amount_out * (1.0 - MEXC_PREVIEW_TAKER_FEE_BPS / BPS_PER_RATIO_UNIT);
+            let amount_out = gross_amount_out * (1.0 - taker_fee_bps / BPS_PER_RATIO_UNIT);
             let impact_ratio = side_impact_bps / BPS_PER_RATIO_UNIT;
             let gross_execution_price = gross_amount_out / amount_in;
             let reference_price = if leg.side.eq_ignore_ascii_case("buy") {

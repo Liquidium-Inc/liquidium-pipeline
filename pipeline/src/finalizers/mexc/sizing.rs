@@ -10,6 +10,15 @@ pub(in crate::finalizers::mexc) struct BridgeDepositSizing {
     pub fee_budget: BridgeFeeBudget,
 }
 
+/// A bridged deposit from funding to the amount MEXC should see arrive.
+pub(in crate::finalizers::mexc) struct BridgedDepositArrival {
+    pub sizing: BridgeDepositSizing,
+    /// What the bridge call sends.
+    pub submit_amount: f64,
+    /// What reaches MEXC after the route's destination fee.
+    pub expected_amount: f64,
+}
+
 impl<C> MexcFinalizer<C>
 where
     C: CexBackend,
@@ -140,6 +149,29 @@ where
         })
     }
 
+    /// Sizes a bridged deposit through to its MEXC arrival. The preview and
+    /// the deposit both use this, so a quote counts the fees execution pays.
+    pub(in crate::finalizers::mexc) async fn bridged_deposit_arrival(
+        bridge: &BridgeRuntime,
+        route: &BridgeRouteSpec,
+        deposit_asset: &ChainToken,
+        size_in: &ChainTokenAmount,
+    ) -> Result<BridgedDepositArrival, String> {
+        let sizing = Self::size_bridged_deposit(bridge, route, deposit_asset, size_in).await?;
+        Self::ensure_minimum_bridge_amount(bridge, route, &sizing.bridge_amount).await?;
+        let submit_amount = Self::spend_f64(&sizing.bridge_amount)?;
+        let expected_amount = Self::compute_expected_bridge_deposit_amount(
+            route,
+            submit_amount,
+            sizing.fee_budget.destination_fee_budget,
+        )?;
+        Ok(BridgedDepositArrival {
+            sizing,
+            submit_amount,
+            expected_amount,
+        })
+    }
+
     /// The route minimum this amount falls short of, as `(amount, minimum)`.
     pub(in crate::finalizers::mexc) async fn bridge_minimum_shortfall(
         bridge: &BridgeRuntime,
@@ -188,7 +220,7 @@ where
 
     /// Nets an exchange withdrawal fee out of an amount. A zero fee leaves the
     /// amount unchanged; a fee that consumes the amount is an error.
-    pub(super) fn net_of_withdraw_fee(amount: f64, fee: f64) -> Result<f64, String> {
+    pub(in crate::finalizers::mexc) fn net_of_withdraw_fee(amount: f64, fee: f64) -> Result<f64, String> {
         if !fee.is_finite() || fee < 0.0 {
             return Err(format!("invalid withdrawal fee {fee}"));
         }

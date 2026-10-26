@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use liquidium_pipeline_core::outbound::SIDE_EFFECT_AMBIGUOUS_PREFIX;
 use liquidium_pipeline_connectors::backend::cex_backend::{
     BuyOrderInputMode, CexBackend, CexBackendError, DepositAddress, OrderBook, OrderBookLevel, PriceLimit,
-    SwapExecutionOptions, SwapFillReport, WithdrawStatus, WithdrawStatusSnapshot, WithdrawalReceipt,
+    SwapExecutionOptions, SwapFillReport, WithdrawStatus, WithdrawStatusSnapshot, WithdrawTerms, WithdrawalReceipt,
 };
 use log::{debug, info, warn};
 use rust_decimal::{Decimal, RoundingStrategy};
@@ -59,6 +59,8 @@ mod orders;
 mod tests;
 #[path = "adapter/withdraw_status.rs"]
 mod withdraw_status;
+#[path = "adapter/withdraw_terms.rs"]
+mod withdraw_terms;
 
 use assets::*;
 use errors::*;
@@ -66,10 +68,12 @@ use filters::*;
 use order_sizing::*;
 pub use orders::LimitOrderReport;
 use withdraw_status::*;
+use withdraw_terms::*;
 
 pub struct MexcClient {
     inner: tokio::sync::Mutex<MexcSpotApiClientWithAuthentication>,
     symbol_filters: tokio::sync::Mutex<HashMap<String, SymbolFilters>>,
+    coin_config: CoinConfigCache,
     http: reqwest::Client,
 }
 
@@ -83,6 +87,7 @@ impl MexcClient {
         Self {
             inner: tokio::sync::Mutex::new(api),
             symbol_filters: tokio::sync::Mutex::new(HashMap::new()),
+            coin_config: CoinConfigCache::default(),
             http: reqwest::Client::new(),
         }
     }

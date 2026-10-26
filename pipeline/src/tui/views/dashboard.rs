@@ -773,6 +773,7 @@ mod tests {
                 conservative_receive: estimated_receive,
                 estimated_price_impact_bps: 10.0,
                 route_id: venue.to_string(),
+                side_costs: Vec::new(),
             },
             execution: VenueExecutionState {
                 venue: venue.to_string(),

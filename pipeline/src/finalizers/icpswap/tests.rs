@@ -526,6 +526,7 @@ fn venue_leg(state: IcpswapExecutionState, request: SwapRequest) -> VenueLegStat
             ),
             estimated_price_impact_bps: 25.0,
             route_id: state.plan.pool.to_text(),
+            side_costs: Vec::new(),
         },
         execution: VenueExecutionState::new(crate::swappers::icpswap::VENUE_ID, &state).expect("state"),
         request,

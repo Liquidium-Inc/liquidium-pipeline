@@ -70,13 +70,14 @@ where
         })
     }
 
-    /// Simulate one leg with current orderbook for route previews.
+    /// Simulate one leg with current orderbook for route previews. Returns the
+    /// gross output, average price, impact and the market's taker fee in bps.
     pub(in crate::finalizers::mexc) async fn preview_leg(
         &self,
         market: &str,
         side: &str,
         amount_in: f64,
-    ) -> Result<(f64, f64, f64), String> {
+    ) -> Result<(f64, f64, f64, f64), String> {
         let orderbook = self
             .backend
             .get_orderbook(market, Some(DEFAULT_ORDERBOOK_LIMIT))
@@ -90,7 +91,7 @@ where
                     market, amount_in, unfilled
                 ));
             }
-            return Ok((out, avg, impact));
+            return Ok((out, avg, impact, orderbook.taker_fee_bps));
         }
 
         let (out, avg, impact, unspent) = simulate_buy_from_asks(&orderbook.asks, amount_in)?;
@@ -101,7 +102,7 @@ where
             ));
         }
 
-        Ok((out, avg, impact))
+        Ok((out, avg, impact, orderbook.taker_fee_bps))
     }
 
     /// Target impact threshold used for one execution slice.

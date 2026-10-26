@@ -29,6 +29,14 @@ fn signed(hash: TxHash) -> crate::backend::evm_backend::SignedEvmTx {
 }
 
 /// A wallet with nothing in the mempool, the normal state for a submission.
+/// A wallet with ETH for the gas a USDC return pays.
+fn fund_gas(mock_evm: &mut MockBridgeEvmBackend) {
+    mock_evm.expect_gas_price_wei().returning(|| Ok(1_000_000_000));
+    mock_evm
+        .expect_native_balance_of()
+        .returning(|_| Ok(U256::from(1_000_000_000_000_000_000u128)));
+}
+
 fn idle_wallet() -> MockBridgeEvmBackend {
     let mut evm = MockBridgeEvmBackend::new();
     evm.expect_has_pending_transactions().returning(|| Ok(false));
@@ -368,6 +376,7 @@ async fn forward_bridge_skips_approve_when_allowance_is_sufficient() {
         });
 
     let mut mock_evm = idle_wallet();
+    fund_gas(&mut mock_evm);
     mock_evm.expect_signer_address().times(1).returning(move || signer);
     mock_evm
         .expect_erc20_decimals_of()
@@ -456,6 +465,7 @@ async fn forward_bridge_approves_when_allowance_is_insufficient() {
         });
 
     let mut mock_evm = idle_wallet();
+    fund_gas(&mut mock_evm);
     mock_evm.expect_signer_address().times(1).returning(move || signer);
     mock_evm
         .expect_erc20_decimals_of()
@@ -1002,9 +1012,13 @@ async fn reverse_bridge_skips_approvals_when_icrc2_allowances_are_sufficient() {
         }
     });
     let ckusdc_ledger_for_fee = ckusdc_ledger;
-    mock_icp.expect_icrc1_fee().times(1).returning(move |ledger| {
+    let cketh_ledger_for_fee = cketh_ledger;
+    // The ckETH approve fee is part of the ckETH budget the withdrawal needs.
+    mock_icp.expect_icrc1_fee().times(2).returning(move |ledger| {
         if ledger == ckusdc_ledger_for_fee {
             Ok(Nat::from(10_000u64))
+        } else if ledger == cketh_ledger_for_fee {
+            Ok(Nat::from(1_000u64))
         } else {
             Err(format!("unexpected fee ledger {ledger}"))
         }
@@ -1044,7 +1058,7 @@ async fn reverse_bridge_skips_approvals_when_icrc2_allowances_are_sufficient() {
                 return Ok(Nat::from(1_000_000u64));
             }
             if ledger == cketh_ledger_for_allowance {
-                return Ok(Nat::from(120_000u64));
+                return Ok(Nat::from(121_000u64));
             }
             Err(format!("unexpected allowance ledger {ledger}"))
         });
@@ -1133,9 +1147,13 @@ async fn reverse_bridge_approves_only_missing_icrc2_allowance() {
         }
     });
     let ckusdc_ledger_for_fee = ckusdc_ledger;
-    mock_icp.expect_icrc1_fee().times(1).returning(move |ledger| {
+    let cketh_ledger_for_fee = cketh_ledger;
+    // The ckETH approve fee is part of the ckETH budget the withdrawal needs.
+    mock_icp.expect_icrc1_fee().times(2).returning(move |ledger| {
         if ledger == ckusdc_ledger_for_fee {
             Ok(Nat::from(10_000u64))
+        } else if ledger == cketh_ledger_for_fee {
+            Ok(Nat::from(1_000u64))
         } else {
             Err(format!("unexpected fee ledger {ledger}"))
         }
@@ -1175,7 +1193,7 @@ async fn reverse_bridge_approves_only_missing_icrc2_allowance() {
                 return Ok(Nat::from(1_000_000u64));
             }
             if ledger == cketh_ledger_for_allowance {
-                return Ok(Nat::from(119_999u64));
+                return Ok(Nat::from(120_999u64));
             }
             Err(format!("unexpected allowance ledger {ledger}"))
         });
@@ -1183,7 +1201,7 @@ async fn reverse_bridge_approves_only_missing_icrc2_allowance() {
         .expect_icrc2_approve()
         .withf(move |ledger, args| {
             *ledger == cketh_ledger
-                && args.amount == 120_000u64
+                && args.amount == 121_000u64
                 && args.spender.owner == minter
                 && args.spender.subaccount.is_none()
         })
@@ -1228,18 +1246,6 @@ async fn native_reverse_bridge_approves_cketh_and_calls_withdraw_eth() {
     };
 
     let mut mock_agent = MockPipelineAgent::new();
-    mock_agent
-        .expect_call_query::<Eip1559TransactionPrice>()
-        .times(1)
-        .returning(|_, _, _| {
-            Ok(Eip1559TransactionPrice {
-                max_priority_fee_per_gas: Nat::from(1u8),
-                max_fee_per_gas: Nat::from(2u8),
-                max_transaction_fee: Nat::from(100_000u64),
-                timestamp: Some(1),
-                gas_limit: Nat::from(21_000u64),
-            })
-        });
     mock_agent
         .expect_call_update::<WithdrawalRet>()
         .times(1)
@@ -1290,7 +1296,7 @@ async fn native_reverse_bridge_approves_cketh_and_calls_withdraw_eth() {
         .expect_icrc2_approve()
         .withf(move |ledger, args| {
             *ledger == cketh_ledger
-                && args.amount == Nat::from(1_000_000_000_000_120_000u128)
+                && args.amount == Nat::from(1_000_000_000_000_000_000u128)
                 && args.spender.owner == minter
                 && args.spender.subaccount.is_none()
         })
@@ -1546,7 +1552,8 @@ async fn native_reverse_bridge_fee_budget_reuses_one_provider_quote() {
         .get_fee_budget("ckETH", "ICP", "ETH")
         .await
         .expect("fee budget should resolve");
-    assert!((fee_budget.source_fee_budget - 0.000122).abs() < 1e-18);
+    // Only the approve fee stays behind: the minter takes gas out of the amount.
+    assert!((fee_budget.source_fee_budget - 0.000002).abs() < 1e-18);
     assert!((fee_budget.destination_fee_budget - 0.00012).abs() < 1e-18);
     assert_eq!(
         fee_budget.provider_fee_budget_native_units,
@@ -1559,7 +1566,20 @@ async fn erc20_reverse_bridge_fee_budget_includes_cketh_provider_quote() {
     let bridge_owner = Principal::management_canister();
     let minter = Principal::anonymous();
     let ckusdc_ledger = Principal::from_text("xevnm-gaaaa-aaaar-qafnq-cai").expect("ledger");
+    let cketh_ledger = Principal::from_text("ss2fx-dyaaa-aaaar-qacoq-cai").expect("ledger");
     let mut mock_agent = MockPipelineAgent::new();
+    mock_agent
+        .expect_call_query::<CkEthMinterInfo>()
+        .times(1)
+        .returning(move |_, _, _| {
+            Ok(CkEthMinterInfo {
+                deposit_with_subaccount_helper_contract_address: None,
+                eth_helper_contract_address: None,
+                erc20_helper_contract_address: None,
+                cketh_ledger_id: Some(cketh_ledger),
+                minimum_withdrawal_amount: None,
+            })
+        });
     mock_agent
         .expect_call_query::<Eip1559TransactionPrice>()
         .times(1)
@@ -1581,9 +1601,11 @@ async fn erc20_reverse_bridge_fee_budget_includes_cketh_provider_quote() {
             Err(format!("unexpected decimals ledger {ledger}"))
         }
     });
-    mock_icp.expect_icrc1_fee().times(1).returning(move |ledger| {
+    mock_icp.expect_icrc1_fee().times(2).returning(move |ledger| {
         if ledger == ckusdc_ledger {
             Ok(Nat::from(10_000u64))
+        } else if ledger == cketh_ledger {
+            Ok(Nat::from(2_000_000_000_000u64))
         } else {
             Err(format!("unexpected fee ledger {ledger}"))
         }
@@ -1605,7 +1627,7 @@ async fn erc20_reverse_bridge_fee_budget_includes_cketh_provider_quote() {
     assert_eq!(fee_budget.destination_fee_budget, 0.0);
     assert_eq!(
         fee_budget.provider_fee_budget_native_units,
-        Some(Nat::from(120_000_000_000_000u64))
+        Some(Nat::from(122_000_000_000_000u64))
     );
 }
 
@@ -1861,6 +1883,7 @@ async fn forward_bridge_helper_send_error_is_ambiguous() {
         });
 
     let mut mock_evm = idle_wallet();
+    fund_gas(&mut mock_evm);
     mock_evm.expect_signer_address().times(1).returning(move || signer);
     mock_evm
         .expect_erc20_decimals_of()
@@ -1948,6 +1971,7 @@ async fn a_forward_bridge_send_is_signed_first_and_tracked_by_its_hash() {
             })
         });
     let mut mock_evm = idle_wallet();
+    fund_gas(&mut mock_evm);
     mock_evm.expect_signer_address().returning(move || signer);
     mock_evm.expect_erc20_decimals_of().returning(|_| Ok(6));
     mock_evm
@@ -1996,4 +2020,91 @@ async fn a_forward_bridge_send_is_signed_first_and_tracked_by_its_hash() {
         panic!("a landed helper deposit is tracked at once");
     };
     assert!(submission.bridge_id.starts_with(&format!("ckmint:42:{tx_hash:#x}:")), "{}", submission.bridge_id);
+}
+
+/// Audit L10: a return to ICP reports the gas it pays from the bridge wallet,
+/// at the limits execution budgets, so the planner can count it.
+#[tokio::test]
+async fn return_routes_report_their_gas_as_a_side_cost() {
+    let mut mock_evm = MockBridgeEvmBackend::new();
+    mock_evm.expect_gas_price_wei().returning(|| Ok(2_000_000_000));
+    let backend = CkErc20BridgeBackend::new(
+        Arc::new(MockPipelineAgent::new()),
+        Arc::new(MockIcpBackend::new()),
+        Arc::new(mock_evm),
+        Principal::management_canister(),
+        Principal::management_canister(),
+    );
+
+    let eth = backend.get_fee_budget("ETH", "ETH", "ckETH").await.expect("ETH budget");
+    assert_eq!(eth.side_costs.len(), 1);
+    assert_eq!(eth.side_costs[0].symbol, "ETH");
+    // One helper call at 150,000 gas and 2 gwei.
+    assert_eq!(eth.side_costs[0].amount, Nat::from(300_000_000_000_000u64));
+    assert_eq!(eth.source_fee_budget, 0.0);
+
+    let usdc = backend
+        .get_fee_budget("USDC", "ETH", "ckUSDC")
+        .await
+        .expect("USDC budget");
+    // The approve adds 120,000 gas.
+    assert_eq!(usdc.side_costs[0].amount, Nat::from(540_000_000_000_000u64));
+}
+
+#[tokio::test]
+async fn a_usdc_return_waits_while_the_wallet_cannot_pay_its_gas() {
+    let signer = "0x1111111111111111111111111111111111111111"
+        .parse::<Address>()
+        .expect("address");
+    let helper = "0x2222222222222222222222222222222222222222"
+        .parse::<Address>()
+        .expect("address");
+    let mut mock_agent = MockPipelineAgent::new();
+    mock_agent
+        .expect_call_query::<CkEthMinterInfo>()
+        .returning(move |_, _, _| {
+            Ok(CkEthMinterInfo {
+                deposit_with_subaccount_helper_contract_address: None,
+                eth_helper_contract_address: None,
+                erc20_helper_contract_address: Some(helper.to_string()),
+                cketh_ledger_id: None,
+                minimum_withdrawal_amount: None,
+            })
+        });
+    let mut mock_evm = idle_wallet();
+    mock_evm.expect_signer_address().returning(move || signer);
+    mock_evm.expect_erc20_decimals_of().returning(|_| Ok(6));
+    mock_evm
+        .expect_erc20_balance_of()
+        .returning(|_, _| Ok(U256::from(1_000_000u64)));
+    mock_evm.expect_gas_price_wei().returning(|| Ok(1_000_000_000));
+    mock_evm
+        .expect_native_balance_of()
+        .returning(|_| Ok(U256::from(1_000u64)));
+    mock_evm.expect_erc20_approve_and_wait().times(0);
+    mock_evm.expect_sign_helper_deposit_native().times(0);
+    let backend = CkErc20BridgeBackend::new(
+        Arc::new(mock_agent),
+        Arc::new(MockIcpBackend::new()),
+        Arc::new(mock_evm),
+        Principal::management_canister(),
+        Principal::management_canister(),
+    );
+
+    let error = backend
+        .submit_bridge(BridgeRequest {
+            asset: "USDC".to_string(),
+            source_chain: "ETH".to_string(),
+            source_address: signer.to_string(),
+            target_asset: "ckUSDC".to_string(),
+            destination: BridgeDestination::IcpAccount(Account {
+                owner: Principal::management_canister(),
+                subaccount: None,
+            }),
+            amount: 1.0,
+            provider_fee_budget_native_units: None,
+        })
+        .await
+        .expect_err("a wallet short on gas must not approve or sign");
+    assert!(error.starts_with(super::BRIDGE_SUBMISSION_DEFERRED_PREFIX), "{error}");
 }
