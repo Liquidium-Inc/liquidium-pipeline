@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use candid::Principal;
 use tracing::instrument;
@@ -13,6 +13,10 @@ use crate::wal::{decode_receipt_wrapper, encode_meta};
 use liquidium_pipeline_connectors::pipeline_agent::PipelineAgent;
 use liquidium_pipeline_core::types::protocol_types::TransferStatus;
 
+/// Rows checked per status in one tick. The watcher walks all rows in pages,
+/// so rows that never settle cannot hide newer ones (audit L09).
+const SETTLEMENT_PAGE_SIZE: usize = 100;
+
 pub struct SettlementWatcher<A, D>
 where
     A: PipelineAgent,
@@ -21,6 +25,9 @@ where
     pub wal: Arc<D>,
     pub agent: Arc<A>,
     pub lending_canister: Principal,
+    /// The last row id each walk reached. `None` starts from the first row.
+    collateral_cursor: Mutex<Option<String>>,
+    profit_cursor: Mutex<Option<String>>,
 }
 
 #[allow(dead_code)]
@@ -34,20 +41,16 @@ where
             wal,
             agent,
             lending_canister,
+            collateral_cursor: Mutex::new(None),
+            profit_cursor: Mutex::new(None),
         }
     }
 
     pub(crate) async fn tick(&self) -> Result<(), String> {
         let mut rows = self
-            .wal
-            .list_by_status(ResultStatus::WaitingCollateral, 100)
-            .await
-            .map_err(|e| e.to_string())?;
-        let mut profit_rows = self
-            .wal
-            .list_by_status(ResultStatus::WaitingProfit, 100)
-            .await
-            .map_err(|e| e.to_string())?;
+            .next_page(ResultStatus::WaitingCollateral, &self.collateral_cursor)
+            .await?;
+        let mut profit_rows = self.next_page(ResultStatus::WaitingProfit, &self.profit_cursor).await?;
         rows.append(&mut profit_rows);
 
         for row in rows {
@@ -56,6 +59,27 @@ where
             }
         }
         Ok(())
+    }
+
+    /// The next page of one status, continuing where the last tick stopped.
+    async fn next_page(
+        &self,
+        status: ResultStatus,
+        cursor: &Mutex<Option<String>>,
+    ) -> Result<Vec<LiqResultRecord>, String> {
+        let after_id = cursor.lock().expect("settlement cursor").clone();
+        let rows = self
+            .wal
+            .list_by_status_after(status, after_id, SETTLEMENT_PAGE_SIZE)
+            .await
+            .map_err(|e| e.to_string())?;
+        // A short page ends the walk, so the next tick starts from the first row again.
+        *cursor.lock().expect("settlement cursor") = if rows.len() < SETTLEMENT_PAGE_SIZE {
+            None
+        } else {
+            rows.last().map(|row| row.id.clone())
+        };
+        Ok(rows)
     }
 
     #[instrument(name = "settlement.process_row", skip_all, err, fields(row_id = %row.id))]
@@ -108,19 +132,13 @@ where
             return Ok(());
         }
 
-        if receipt.request.swap_args.is_none() {
-            self.wal
-                .update_status(&row.id, ResultStatus::Succeeded, true)
-                .await
-                .map_err(|e| e.to_string())?;
-            return Ok(());
-        }
-
+        // A row without a swap is enqueued too: the finalize stage records its
+        // profit, export and notification (audit L03).
         self.wal
             .update_status(&row.id, ResultStatus::Enqueued, true)
             .await
             .map_err(|e| e.to_string())?;
-        info!("[settlement] ✅ liq_id={} -> enqueued for multi-venue planning", liq.id);
+        info!("[settlement] ✅ liq_id={} -> enqueued for finalization", liq.id);
         Ok(())
     }
 
@@ -285,14 +303,14 @@ mod tests {
         let row_id = row.id.clone();
 
         let mut wal = MockWalStore::new();
-        wal.expect_list_by_status()
-            .with(eq(ResultStatus::WaitingCollateral), eq(100usize))
+        wal.expect_list_by_status_after()
+            .with(eq(ResultStatus::WaitingCollateral), eq(None), eq(SETTLEMENT_PAGE_SIZE))
             .times(1)
-            .returning(move |_, _| Ok(vec![row.clone()]));
-        wal.expect_list_by_status()
-            .with(eq(ResultStatus::WaitingProfit), eq(100usize))
+            .returning(move |_, _, _| Ok(vec![row.clone()]));
+        wal.expect_list_by_status_after()
+            .with(eq(ResultStatus::WaitingProfit), eq(None), eq(SETTLEMENT_PAGE_SIZE))
             .times(1)
-            .returning(|_, _| Ok(vec![]));
+            .returning(|_, _, _| Ok(vec![]));
         wal.expect_upsert_result().times(0);
         wal.expect_update_status()
             .with(eq(row_id.clone()), eq(ResultStatus::Enqueued), eq(true))
@@ -327,14 +345,14 @@ mod tests {
         let row_id = row.id.clone();
 
         let mut wal = MockWalStore::new();
-        wal.expect_list_by_status()
-            .with(eq(ResultStatus::WaitingCollateral), eq(100usize))
+        wal.expect_list_by_status_after()
+            .with(eq(ResultStatus::WaitingCollateral), eq(None), eq(SETTLEMENT_PAGE_SIZE))
             .times(1)
-            .returning(move |_, _| Ok(vec![row.clone()]));
-        wal.expect_list_by_status()
-            .with(eq(ResultStatus::WaitingProfit), eq(100usize))
+            .returning(move |_, _, _| Ok(vec![row.clone()]));
+        wal.expect_list_by_status_after()
+            .with(eq(ResultStatus::WaitingProfit), eq(None), eq(SETTLEMENT_PAGE_SIZE))
             .times(1)
-            .returning(|_, _| Ok(vec![]));
+            .returning(|_, _, _| Ok(vec![]));
         wal.expect_upsert_result().times(0);
         wal.expect_update_status()
             .with(eq(row_id.clone()), eq(ResultStatus::Enqueued), eq(true))
@@ -355,12 +373,105 @@ mod tests {
         watcher.tick().await.expect("tick should succeed");
     }
 
+    /// Audit L03: a row without a swap also goes to the finalize stage, which
+    /// records its profit, export and notification.
+    #[tokio::test]
+    async fn watcher_enqueues_settled_rows_without_a_swap() {
+        let liq_id = 12u128;
+        let receipt = ExecutionReceipt {
+            request: make_request(false, None),
+            liquidation_result: Some(make_liq_result(liq_id, TransferStatus::Success)),
+            status: ExecutionStatus::Success,
+            change_received: true,
+        };
+        let row = make_row(ResultStatus::WaitingCollateral, receipt);
+        let row_id = row.id.clone();
+
+        let mut wal = MockWalStore::new();
+        wal.expect_list_by_status_after()
+            .with(eq(ResultStatus::WaitingCollateral), eq(None), eq(SETTLEMENT_PAGE_SIZE))
+            .times(1)
+            .returning(move |_, _, _| Ok(vec![row.clone()]));
+        wal.expect_list_by_status_after()
+            .with(eq(ResultStatus::WaitingProfit), eq(None), eq(SETTLEMENT_PAGE_SIZE))
+            .times(1)
+            .returning(|_, _, _| Ok(vec![]));
+        wal.expect_update_status()
+            .with(eq(row_id), eq(ResultStatus::Enqueued), eq(true))
+            .times(1)
+            .returning(|_, _, _| Ok(()));
+
+        let mut agent = MockPipelineAgent::new();
+        let fresh = make_liq_result(liq_id, TransferStatus::Success);
+        agent
+            .expect_call_query::<Result<LiquidationResult, ProtocolError>>()
+            .times(1)
+            .returning(move |_, _, _| Ok(Ok(fresh.clone())));
+
+        let watcher = SettlementWatcher::new(Arc::new(wal), Arc::new(agent), Principal::anonymous());
+        watcher.tick().await.expect("tick should succeed");
+    }
+
+    /// Audit L09: rows that never settle must not hide newer ones. Each tick
+    /// continues after the last row it saw, and a short page starts over.
+    #[tokio::test]
+    async fn watcher_walks_every_waiting_row_in_pages() {
+        let page = |ids: std::ops::Range<usize>| {
+            ids.map(|i| LiqResultRecord {
+                id: format!("row-{i:03}"),
+                status: ResultStatus::WaitingCollateral,
+                attempt: 0,
+                error_count: 0,
+                last_error: None,
+                created_at: 0,
+                updated_at: 0,
+                meta_json: "{}".to_string(),
+            })
+            .collect::<Vec<_>>()
+        };
+        let full_page = page(0..SETTLEMENT_PAGE_SIZE);
+        let last_id = full_page.last().unwrap().id.clone();
+        let mut sequence = mockall::Sequence::new();
+        let mut wal = MockWalStore::new();
+        wal.expect_list_by_status_after()
+            .with(eq(ResultStatus::WaitingCollateral), eq(None), eq(SETTLEMENT_PAGE_SIZE))
+            .times(1)
+            .in_sequence(&mut sequence)
+            .return_once(move |_, _, _| Ok(full_page));
+        wal.expect_list_by_status_after()
+            .with(
+                eq(ResultStatus::WaitingCollateral),
+                eq(Some(last_id)),
+                eq(SETTLEMENT_PAGE_SIZE),
+            )
+            .times(1)
+            .in_sequence(&mut sequence)
+            .return_once(move |_, _, _| Ok(page(SETTLEMENT_PAGE_SIZE..SETTLEMENT_PAGE_SIZE + 1)));
+        wal.expect_list_by_status_after()
+            .with(eq(ResultStatus::WaitingCollateral), eq(None), eq(SETTLEMENT_PAGE_SIZE))
+            .times(1)
+            .in_sequence(&mut sequence)
+            .return_once(|_, _, _| Ok(vec![]));
+        let watcher = SettlementWatcher::new(
+            Arc::new(wal),
+            Arc::new(MockPipelineAgent::new()),
+            Principal::anonymous(),
+        );
+
+        for expected in [SETTLEMENT_PAGE_SIZE, 1, 0] {
+            let rows = watcher
+                .next_page(ResultStatus::WaitingCollateral, &watcher.collateral_cursor)
+                .await
+                .expect("page");
+            assert_eq!(rows.len(), expected);
+        }
+    }
+
     /// A ready settled row is handed to the finalizer without venue-specific routing.
     #[tokio::test]
     async fn watcher_enqueue_behavior_is_independent_of_venue_selection() {
         // given
         const LIQUIDATION_ID: u128 = 11;
-        const WAL_BATCH_LIMIT: usize = 100;
         let liq_id = LIQUIDATION_ID;
         let swap_args = make_swap_args();
         let receipt = ExecutionReceipt {
@@ -373,14 +484,14 @@ mod tests {
         let row_id = row.id.clone();
 
         let mut wal = MockWalStore::new();
-        wal.expect_list_by_status()
-            .with(eq(ResultStatus::WaitingCollateral), eq(WAL_BATCH_LIMIT))
+        wal.expect_list_by_status_after()
+            .with(eq(ResultStatus::WaitingCollateral), eq(None), eq(SETTLEMENT_PAGE_SIZE))
             .times(1)
-            .returning(move |_, _| Ok(vec![row.clone()]));
-        wal.expect_list_by_status()
-            .with(eq(ResultStatus::WaitingProfit), eq(WAL_BATCH_LIMIT))
+            .returning(move |_, _, _| Ok(vec![row.clone()]));
+        wal.expect_list_by_status_after()
+            .with(eq(ResultStatus::WaitingProfit), eq(None), eq(SETTLEMENT_PAGE_SIZE))
             .times(1)
-            .returning(|_, _| Ok(vec![]));
+            .returning(|_, _, _| Ok(vec![]));
         wal.expect_upsert_result().times(0);
         wal.expect_update_status()
             .with(eq(row_id.clone()), eq(ResultStatus::Enqueued), eq(true))
@@ -420,14 +531,14 @@ mod tests {
         let row_id = row.id.clone();
 
         let mut wal = MockWalStore::new();
-        wal.expect_list_by_status()
-            .with(eq(ResultStatus::WaitingCollateral), eq(100usize))
+        wal.expect_list_by_status_after()
+            .with(eq(ResultStatus::WaitingCollateral), eq(None), eq(SETTLEMENT_PAGE_SIZE))
             .times(1)
-            .returning(|_, _| Ok(vec![]));
-        wal.expect_list_by_status()
-            .with(eq(ResultStatus::WaitingProfit), eq(100usize))
+            .returning(|_, _, _| Ok(vec![]));
+        wal.expect_list_by_status_after()
+            .with(eq(ResultStatus::WaitingProfit), eq(None), eq(SETTLEMENT_PAGE_SIZE))
             .times(1)
-            .returning(move |_, _| Ok(vec![row.clone()]));
+            .returning(move |_, _, _| Ok(vec![row.clone()]));
         wal.expect_update_status()
             .with(eq(row_id.clone()), eq(ResultStatus::Enqueued), eq(true))
             .times(1)

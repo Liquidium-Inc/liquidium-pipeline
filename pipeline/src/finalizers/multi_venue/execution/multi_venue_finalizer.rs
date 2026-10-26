@@ -33,6 +33,7 @@ use crate::finalizers::multi_venue::planning::venue_registry::VenueRegistry;
 
 pub(super) const MULTI_VENUE_PERMANENT_PREFIX: &str = "permanent multi-venue finalizer: ";
 const MULTI_VENUE_CUSTODY_PREFIX: &str = "multi-venue venue custody: ";
+const MULTI_VENUE_NO_ROUTE_PREFIX: &str = "no viable ICPSwap-first route: ";
 const MULTI_VENUE_UNRESUMABLE_PREFIX: &str = "unresumable multi-venue finalizer: ";
 
 struct RecoverySweepRuntime {
@@ -251,7 +252,7 @@ impl MultiVenueFinalizer {
                 return Err(format!("{MULTI_VENUE_PERMANENT_PREFIX}{error}"));
             }
             Err(IcpswapFirstPlannerError::NoViableRoute(reason)) => {
-                return Err(format!("no viable ICPSwap-first route: {reason}"));
+                return Err(format!("{MULTI_VENUE_NO_ROUTE_PREFIX}{reason}"));
             }
         };
 
@@ -744,6 +745,8 @@ fn classify(error: String) -> FinalizerError {
         FinalizerError::Unresumable(error)
     } else if error.starts_with(MULTI_VENUE_CUSTODY_PREFIX) {
         FinalizerError::VenueCustody(error)
+    } else if error.starts_with(MULTI_VENUE_NO_ROUTE_PREFIX) {
+        FinalizerError::NoRoute(error)
     } else {
         FinalizerError::Retryable(error)
     }

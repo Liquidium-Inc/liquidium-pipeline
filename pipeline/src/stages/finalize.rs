@@ -26,6 +26,8 @@ use liquidium_pipeline_connectors::pipeline_agent::PipelineAgent;
 use liquidium_pipeline_core::types::protocol_types::TransferStatus;
 
 pub(crate) const MAX_FINALIZER_ERRORS: i32 = 5;
+/// The retry pace of a row with no acceptable swap once its normal budget is spent.
+const NO_ROUTE_SLOW_RETRY_SECS: u64 = 30 * 60;
 /// Maximum safe left-shift for `u64` multipliers in retry backoff.
 const MAX_U64_SHIFT: u32 = 63;
 
@@ -42,6 +44,15 @@ fn retry_delay_secs(base: u64, max: u64, error_count: i32) -> u64 {
         1u64 << exponent
     };
     base.saturating_mul(multiplier).min(capped_max)
+}
+
+/// An outcome is published only after its terminal status is durable. A failed
+/// write leaves the row to run again, so it is reported once (audit L18).
+fn warn_outcome_deferred(liq_id: u128, error: &str) {
+    warn!(
+        "[finalize] terminal WAL write failed; outcome not published yet liq_id={} err={}",
+        liq_id, error
+    );
 }
 
 //
@@ -135,6 +146,23 @@ where
                 owner: receipt.request.liquidation.borrower.to_text(),
                 details: format!(
                     "Liquidation {liq_id} was parked after {MAX_FINALIZER_ERRORS} failed finalize attempts while a venue leg may still hold its funds. It will not be retried automatically. Last error: {error}"
+                ),
+            })
+            .await;
+    }
+
+    /// Alerts once when a row with no acceptable swap drops to the slow retry
+    /// pace. The row keeps retrying; the alert makes a lasting cause visible.
+    async fn escalate_slow_retry(&self, receipt: &ExecutionReceipt, liq_id: u128, error: &str) {
+        self.watchdog
+            .notify(WatchdogEvent::OperatorRequired {
+                execution_id: liq_id.to_string(),
+                venue: "finalizer".to_string(),
+                pending_step: "no_route_slow_retry".to_string(),
+                owner: receipt.request.liquidation.borrower.to_text(),
+                details: format!(
+                    "Liquidation {liq_id} found no acceptable swap in {MAX_FINALIZER_ERRORS} tries. It keeps retrying every {} minutes on its own. Last error: {error}",
+                    NO_ROUTE_SLOW_RETRY_SECS / 60
                 ),
             })
             .await;
@@ -309,7 +337,10 @@ where
                 let wal_id = wal_id_by_liq
                     .get(&liq_id)
                     .ok_or_else(|| format!("missing WAL id for liquidation {}", liq_id))?;
-                let _ = wal_mark_succeeded(&*self.wal, wal_id).await;
+                if let Err(error) = wal_mark_succeeded(&*self.wal, wal_id).await {
+                    warn_outcome_deferred(liq_id, &error);
+                    continue;
+                }
                 fin_results.push((
                     FinalizerResult {
                         swap_result: None,
@@ -326,7 +357,12 @@ where
             // Apply bounded retry backoff for retryable failures to avoid thrashing thin books.
             if matches!(status_by_liq.get(&liq_id), Some(ResultStatus::FailedRetryable)) {
                 let recorded_errors = error_count_by_liq.get(&liq_id).copied().unwrap_or(1).max(1);
-                let delay_secs = retry_delay_secs(self.cex_retry_base_secs, self.cex_retry_max_secs, recorded_errors);
+                // Only a `NoRoute` row stays retryable past the budget, and it waits longer.
+                let delay_secs = if recorded_errors >= MAX_FINALIZER_ERRORS {
+                    NO_ROUTE_SLOW_RETRY_SECS
+                } else {
+                    retry_delay_secs(self.cex_retry_base_secs, self.cex_retry_max_secs, recorded_errors)
+                };
                 let last_update = updated_at_by_liq.get(&liq_id).copied().unwrap_or(0);
                 let due_at = last_update.saturating_add(delay_secs.min(i64::MAX as u64) as i64);
                 let now = now_ts();
@@ -384,7 +420,10 @@ where
                             .get(&liq_id)
                             .ok_or_else(|| format!("missing WAL id for liquidation {}", liq_id))?;
 
-                        let _ = wal_mark_succeeded(&*self.wal, wal_id).await;
+                        if let Err(error) = wal_mark_succeeded(&*self.wal, wal_id).await {
+                            warn_outcome_deferred(liq_id, &error);
+                            continue;
+                        }
                         fin_results.push((res.clone(), receipt));
                     } else {
                         let wal_id = wal_id_by_liq
@@ -430,7 +469,10 @@ where
                     } else if matches!(error, FinalizerError::BadDebtAmountFloor(_))
                         && receipt.request.liquidation.buy_bad_debt
                     {
-                        let _ = wal_mark_succeeded(&*self.wal, wal_id).await;
+                        if let Err(error) = wal_mark_succeeded(&*self.wal, wal_id).await {
+                            warn_outcome_deferred(liq_id, &error);
+                            continue;
+                        }
 
                         fin_results.push((
                             FinalizerResult {
@@ -466,12 +508,24 @@ where
                             // the only trace of stranded custody is a log line.
                             self.escalate_custody_park(&receipt, liq_id, &err_msg).await;
                         }
+                    } else if matches!(error, FinalizerError::NoRoute(_)) && next_errors >= MAX_FINALIZER_ERRORS {
+                        // The collateral is still ours, and most causes pass: a venue outage, a thin book, a
+                        // price spike. So the row stays queued at a slow pace, with one alert (audit L17).
+                        if let Err(error) = wal_mark_retryable_failed(&*self.wal, wal_id, err_msg.clone()).await {
+                            warn!("Failed to mark WAL row {} for a slow retry: {}", wal_id, error);
+                        }
+                        if next_errors == MAX_FINALIZER_ERRORS {
+                            self.escalate_slow_retry(&receipt, liq_id, &err_msg).await;
+                        }
                     } else if matches!(
                         error,
                         FinalizerError::Permanent(_) | FinalizerError::BadDebtAmountFloor(_)
                     ) || next_errors >= MAX_FINALIZER_ERRORS
                     {
-                        let _ = wal_mark_permanent_failed(&*self.wal, wal_id, err_msg.clone()).await;
+                        if let Err(error) = wal_mark_permanent_failed(&*self.wal, wal_id, err_msg.clone()).await {
+                            warn_outcome_deferred(liq_id, &error);
+                            continue;
+                        }
 
                         let mut failed_receipt = receipt.clone();
                         failed_receipt.status =
@@ -487,8 +541,8 @@ where
                             },
                             failed_receipt,
                         ));
-                    } else {
-                        let _ = wal_mark_retryable_failed(&*self.wal, wal_id, err_msg.clone()).await;
+                    } else if let Err(error) = wal_mark_retryable_failed(&*self.wal, wal_id, err_msg.clone()).await {
+                        warn!("Failed to mark WAL row {} retryable: {}", wal_id, error);
                     }
 
                     debug!("Finalization failed for receipt; continuing: {}", err_msg);
@@ -999,6 +1053,132 @@ mod tests {
         let outcomes = stage.process(&()).await.expect("custody row should retry");
         assert!(outcomes.is_empty());
         assert!(watchdog.operator_alerts().is_empty());
+    }
+
+    /// Audit L17: a route search that keeps failing must not fail the row while
+    /// the collateral is still ours. It drops to the slow pace with one alert.
+    #[tokio::test]
+    async fn exhausted_route_search_retries_slowly_and_alerts_once() {
+        let liq_id = 926u128;
+        let mut row = make_row(liq_id, make_swapping_receipt(liq_id));
+        row.error_count = MAX_FINALIZER_ERRORS - 1;
+        let row_id = row.id.clone();
+        let row_id_for_retry = row_id.clone();
+
+        let mut wal = MockWalStore::new();
+        wal.expect_get_pending()
+            .with(eq(100usize))
+            .times(1)
+            .return_once(move |_| Ok(vec![row]));
+        wal.expect_update_status()
+            .withf(move |id, status, bump| id == row_id && *status == ResultStatus::InFlight && *bump)
+            .times(1)
+            .returning(|_, _, _| Ok(()));
+        wal.expect_update_failure()
+            .withf(move |id, status, _, _| id == row_id_for_retry && *status == ResultStatus::FailedRetryable)
+            .times(1)
+            .returning(|_, _, _, _| Ok(()));
+
+        let watchdog = Arc::new(RecordingWatchdog::default());
+        let stage = FinalizeStage::new(
+            Arc::new(wal),
+            Arc::new(ErrorFinalizer {
+                error: FinalizerError::NoRoute("no viable ICPSwap-first route: MEXC unavailable".to_string()),
+            }),
+            Arc::new(SimpleProfitCalculator),
+            Arc::new(MockPipelineAgent::new()),
+            Principal::anonymous(),
+            5,
+            120,
+        )
+        .with_watchdog(watchdog.clone());
+
+        let outcomes = stage.process(&()).await.expect("route failure should retry");
+        assert!(outcomes.is_empty(), "a row still retrying reports no outcome");
+
+        let alerts = watchdog.operator_alerts();
+        assert_eq!(alerts.len(), 1);
+        let (execution_id, pending_step, details) = &alerts[0];
+        assert_eq!(execution_id, &liq_id.to_string());
+        assert_eq!(pending_step, "no_route_slow_retry");
+        assert!(details.contains("MEXC unavailable"));
+    }
+
+    /// Past the budget a route failure waits the slow interval, not the normal cap.
+    #[tokio::test]
+    async fn slow_retry_row_waits_longer_than_the_normal_backoff() {
+        let liq_id = 927u128;
+        let mut row = make_row(liq_id, make_swapping_receipt(liq_id));
+        row.status = ResultStatus::FailedRetryable;
+        row.error_count = MAX_FINALIZER_ERRORS;
+        row.updated_at = now_ts() - 600;
+
+        let mut wal = MockWalStore::new();
+        wal.expect_get_pending()
+            .with(eq(100usize))
+            .times(1)
+            .return_once(move |_| Ok(vec![row]));
+
+        let calls = Arc::new(Mutex::new(0usize));
+        let stage = FinalizeStage::new(
+            Arc::new(wal),
+            Arc::new(NoopFinalizer { calls: calls.clone() }),
+            Arc::new(SimpleProfitCalculator),
+            Arc::new(MockPipelineAgent::new()),
+            Principal::anonymous(),
+            5,
+            120,
+        );
+
+        let outcomes = stage.process(&()).await.expect("waiting row is skipped");
+        assert!(outcomes.is_empty());
+        assert_eq!(
+            *calls.lock().unwrap(),
+            0,
+            "ten minutes is inside the slow retry interval"
+        );
+    }
+
+    /// Audit L18: an outcome is published only after its terminal status is
+    /// durable. A failed write leaves the row to run again.
+    #[tokio::test]
+    async fn failed_terminal_write_publishes_no_outcome() {
+        let liq_id = 928u128;
+        let row = make_row(liq_id, make_swapping_receipt(liq_id));
+        let row_id = row.id.clone();
+        let row_id_for_success = row_id.clone();
+
+        let mut wal = MockWalStore::new();
+        wal.expect_get_pending()
+            .with(eq(100usize))
+            .times(1)
+            .return_once(move |_| Ok(vec![row]));
+        wal.expect_update_status()
+            .withf(move |id, status, _| id == row_id && *status == ResultStatus::InFlight)
+            .times(1)
+            .returning(|_, _, _| Ok(()));
+        wal.expect_update_status()
+            .withf(move |id, status, _| id == row_id_for_success && *status == ResultStatus::Succeeded)
+            .times(1)
+            .returning(|_, _, _| Err(anyhow::anyhow!("database locked")));
+
+        let stage = FinalizeStage::new(
+            Arc::new(wal),
+            Arc::new(NoopFinalizer {
+                calls: Arc::new(Mutex::new(0usize)),
+            }),
+            Arc::new(SimpleProfitCalculator),
+            Arc::new(MockPipelineAgent::new()),
+            Principal::anonymous(),
+            5,
+            120,
+        );
+
+        let outcomes = stage.process(&()).await.expect("a failed write is not a stage error");
+        assert!(
+            outcomes.is_empty(),
+            "no export or notification before the status is durable"
+        );
     }
 
     #[test]

@@ -992,7 +992,10 @@ mod cketh_bridge_minimum {
                 .expect_err("outages remain retryable");
 
             assert!(error.to_string().contains("unavailable"));
-            assert!(matches!(error, FinalizerError::Retryable(_)));
+            assert!(
+                matches!(error, FinalizerError::NoRoute(_)),
+                "an outage is a route that may return"
+            );
             assert!(wal.wrapper().meta_v2.is_none());
         }
     }
@@ -1219,7 +1222,10 @@ async fn transient_icpswap_outage_below_minimum_is_retried_instead_of_swept() {
         error.message().contains("canister is out of cycles"),
         "expected the outage to be reported: {error}"
     );
-    assert!(matches!(error, FinalizerError::Retryable(_)), "unexpected kind: {error:?}");
+    assert!(
+        matches!(error, FinalizerError::NoRoute(_)),
+        "unexpected kind: {error:?}"
+    );
     assert!(
         wal.wrapper().meta_v2.is_none(),
         "an outage must not commit a recovery sweep"

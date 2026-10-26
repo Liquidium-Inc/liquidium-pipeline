@@ -108,8 +108,9 @@ impl LiquidationIntentStore for SqliteWalStore {
         self.ensure_writable()?;
         let liquidation = receipt.liquidation_result.as_ref().context("accepted receipt has no liquidation result")?;
         anyhow::ensure!(liquidation.id.to_string() == liquidation_id, "accepted receipt liquidation id mismatch");
+        // A row without a swap is enqueued too: the finalize stage records its
+        // profit, export and notification (audit L03).
         let status = match liquidation.collateral_tx.status {
-            TransferStatus::Success if receipt.request.swap_args.is_none() => ResultStatus::Succeeded,
             TransferStatus::Success => ResultStatus::Enqueued,
             TransferStatus::Pending | TransferStatus::Failed(_) => ResultStatus::WaitingCollateral,
         };
@@ -376,6 +377,8 @@ mod tests {
         assert_eq!(intent.liquidation_id.as_deref(), Some("42"));
 
         let mut row = store.get_result("42").await.unwrap().unwrap();
+        // No swap, but the finalize stage still records the outcome (audit L03).
+        assert_eq!(row.status, ResultStatus::Enqueued);
         row.status = ResultStatus::InFlight;
         row.attempt = 3;
         row.meta_json = "checkpoint".into();
