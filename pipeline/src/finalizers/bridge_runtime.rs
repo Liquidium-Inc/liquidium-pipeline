@@ -21,6 +21,8 @@ use liquidium_pipeline_connectors::backend::{
     icp_backend::IcpBackendImpl,
     solana_backend::SolanaBackendImpl,
 };
+use liquidium_pipeline_connectors::outbound::SolanaSender;
+use liquidium_pipeline_core::outbound::OutboundSender;
 use solana_sdk::{signature::Keypair, signer::Signer};
 
 use crate::{config::Config, finalizers::bridge_claims::BridgeClaimLookup};
@@ -50,6 +52,8 @@ pub struct BridgeRuntime {
     pub backend: Arc<dyn BridgeBackend>,
     pub sources: BridgeSourceAccounts,
     pub claims: Arc<dyn BridgeClaimLookup>,
+    /// Sends from the bridge source accounts to provider deposit addresses.
+    pub outbound: Arc<dyn OutboundSender>,
 }
 
 impl BridgeRuntime {
@@ -111,14 +115,15 @@ impl BridgeRuntime {
         let bridge_solana_address = Keypair::new_from_array(config.bridge_solana_private_key_bytes)
             .pubkey()
             .to_string();
+        let bridge_solana_wallet = Arc::new(SolanaBackendImpl::from_url_and_secret_key(
+            config.solana_rpc_url.clone(),
+            config.bridge_solana_private_key_bytes,
+        ));
         let solana_backend = Arc::new(
             SolanaBridgeBackend::new(
                 bridge_agent.clone(),
                 Arc::new(IcpBackendImpl::new(bridge_agent)),
-                Arc::new(SolanaBackendImpl::from_url_and_secret_key(
-                    config.solana_rpc_url.clone(),
-                    config.bridge_solana_private_key_bytes,
-                )),
+                bridge_solana_wallet.clone(),
                 config.bridge_cksol_minter_canister,
                 config.bridge_cksol_ledger_canister,
                 config.bridge_ic_owner_principal,
@@ -140,6 +145,7 @@ impl BridgeRuntime {
                 solana: bridge_solana_address,
             },
             claims,
+            outbound: Arc::new(SolanaSender::new(bridge_solana_wallet)),
         }))
     }
 
@@ -160,7 +166,14 @@ impl BridgeRuntime {
                 solana: "So11111111111111111111111111111111111111112".to_string(),
             },
             claims: Arc::new(crate::finalizers::bridge_claims::MockBridgeClaimLookup::new()),
+            outbound: Arc::new(liquidium_pipeline_core::outbound::MockOutboundSender::new()),
         }
+    }
+
+    #[cfg(test)]
+    pub fn with_outbound(mut self, outbound: Arc<dyn OutboundSender>) -> Self {
+        self.outbound = outbound;
+        self
     }
 
     #[cfg(test)]

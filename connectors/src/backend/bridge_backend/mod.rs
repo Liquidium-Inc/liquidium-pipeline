@@ -14,6 +14,7 @@ pub use ckerc20_bridge::{
 pub use solana_bridge::{DEFAULT_SOLANA_BRIDGE_FEE_BUFFER_LAMPORTS, SolanaBridgeBackend};
 pub use types::{
     BridgeBackend, BridgeDestination, BridgeDestinationKind, BridgeFeeBudget, BridgeMintReceipt, BridgeRequest,
+    DepositNotice,
     BridgeRouteKind, BridgeRouteSpec, BridgeStatus, BridgeSubmission, BridgeSubmissionCandidate, BridgeSweepRoute,
     EvmReceiptStatus, MockBridgeBackend,
 };

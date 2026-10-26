@@ -5,7 +5,7 @@ use candid::Nat;
 use liquidium_pipeline_connectors::backend::bridge_backend::{
     BRIDGE_SUBMISSION_DEFERRED_PREFIX, BridgeFeeBudget, BridgeRequest, BridgeRouteKind, BridgeRouteSpec,
 };
-use liquidium_pipeline_connectors::backend::SIDE_EFFECT_AMBIGUOUS_PREFIX;
+use liquidium_pipeline_core::outbound::SIDE_EFFECT_AMBIGUOUS_PREFIX;
 use liquidium_pipeline_connectors::backend::cex_backend::CexBackend;
 use log::{debug, info, warn};
 

@@ -3,7 +3,7 @@ use std::env;
 
 use async_trait::async_trait;
 
-use liquidium_pipeline_connectors::backend::SIDE_EFFECT_AMBIGUOUS_PREFIX;
+use liquidium_pipeline_core::outbound::SIDE_EFFECT_AMBIGUOUS_PREFIX;
 use liquidium_pipeline_connectors::backend::cex_backend::{
     BuyOrderInputMode, CexBackend, CexBackendError, DepositAddress, OrderBook, OrderBookLevel, SwapExecutionOptions,
     SwapFillReport, WithdrawStatus, WithdrawStatusSnapshot, WithdrawalReceipt,

@@ -10,12 +10,16 @@ use std::{str::FromStr, sync::Arc};
 
 use super::{
     BridgeBackend, BridgeDestination, BridgeFeeBudget, BridgeMintReceipt, BridgeRequest, BridgeRouteKind, BridgeRouteSpec, BridgeStatus,
-    BridgeSubmission,
+    BridgeSubmission, DepositNotice,
     catalog::BRIDGE_ROUTE_CATALOG, resolve_route, validate_destination_for_route,
+};
+use liquidium_pipeline_core::{
+    account::model::ChainAccount,
+    outbound::{OutboundIntent, SIDE_EFFECT_AMBIGUOUS_PREFIX, side_effect_ambiguous},
+    tokens::chain_token::ChainToken,
 };
 use crate::{
     backend::{
-        SIDE_EFFECT_AMBIGUOUS_PREFIX,
         amount_utils::{amount_to_nat_units_strict, nat_units_to_amount_via_core},
         icp_backend::IcpBackend,
         icp_backend_helpers::{
@@ -30,6 +34,8 @@ use crate::{
 const WITHDRAW_BRIDGE_ID_PREFIX: &str = "cksol-withdraw:";
 const DEPOSIT_BRIDGE_ID_PREFIX: &str = "cksol-deposit:";
 pub const DEFAULT_SOLANA_BRIDGE_FEE_BUFFER_LAMPORTS: u64 = 2_000_000;
+/// The base fee of a transaction with one signature.
+const SOLANA_SIGNATURE_FEE_LAMPORTS: u64 = 5_000;
 
 #[derive(CandidType, Deserialize, Clone, Debug)]
 struct CkSolGetDepositAddressArgs {
@@ -570,29 +576,36 @@ where
         .map(|_| ())
     }
 
-    async fn submit_solana_to_icp(
+    /// The minter deposit account for a mint to `destination`. Only the bridge
+    /// owner and the repayment owner may receive the mint.
+    fn deposit_account(
         &self,
         route: &BridgeRouteSpec,
-        request: &BridgeRequest,
-    ) -> Result<BridgeSubmission, String> {
-        self.ensure_configured_bridge_source(&request.source_address)?;
-
-        let destination = Self::expect_icp_destination(route, &request.destination)?;
-        if destination.owner != self.bridge_ic_owner_principal
-            && self.repayment_owner != Some(destination.owner)
-        {
+        destination: &BridgeDestination,
+    ) -> Result<CkSolGetDepositAddressArgs, String> {
+        let destination = Self::expect_icp_destination(route, destination)?;
+        if destination.owner != self.bridge_ic_owner_principal && self.repayment_owner != Some(destination.owner) {
             return Err(format!(
                 "destination ICP account owner {} is neither configured bridge owner {} nor repayment owner {:?}",
                 destination.owner, self.bridge_ic_owner_principal, self.repayment_owner,
             ));
         }
-        let proxy_canister = self.resolve_proxy_canister()?;
-
-        let deposit_account = CkSolGetDepositAddressArgs {
+        Ok(CkSolGetDepositAddressArgs {
             owner: Some(destination.owner),
             subaccount: destination.subaccount,
-        };
-        let expected_source = self.get_deposit_address(&deposit_account).await?;
+        })
+    }
+
+    /// Checks a SOL -> ckSOL request and returns the SOL send to the minter
+    /// deposit address. It sends nothing.
+    async fn solana_to_icp_send(
+        &self,
+        route: &BridgeRouteSpec,
+        request: &BridgeRequest,
+    ) -> Result<OutboundIntent, String> {
+        self.ensure_configured_bridge_source(&request.source_address)?;
+        let deposit_account = self.deposit_account(route, &request.destination)?;
+        self.resolve_proxy_canister()?;
 
         let decimals =
             icrc1_decimals_with_context(self.icp_backend.as_ref(), self.cksol_ledger_canister, "cksol bridge").await?;
@@ -626,9 +639,97 @@ where
             ));
         }
 
+        let deposit_address = self.get_deposit_address(&deposit_account).await?;
+        Ok(OutboundIntent {
+            token: ChainToken::SolanaNative {
+                symbol: "SOL".to_string(),
+                decimals: 9,
+                fee: Nat::from(SOLANA_SIGNATURE_FEE_LAMPORTS),
+            },
+            to: ChainAccount::Solana(deposit_address),
+            amount_native,
+        })
+    }
+
+    /// Asks the minter to track the SOL at the deposit address. The minter
+    /// answers a repeated call with the id of the deposit in flight.
+    async fn notify_sol_deposit(
+        &self,
+        route: &BridgeRouteSpec,
+        destination: &BridgeDestination,
+        funding_receipt: &str,
+    ) -> Result<DepositNotice, String> {
+        let deposit_account = self.deposit_account(route, destination)?;
+        let proxy_canister = self.resolve_proxy_canister()?;
+        let minter_info = self.minter_info().await?;
+        let args = Encode!(&deposit_account).map_err(|error| error.to_string())?;
+        let result = self
+            .agent
+            .call_update_via_proxy::<Result<u64, DepositSolError>>(
+                &proxy_canister,
+                &self.cksol_minter_canister,
+                "deposit_sol",
+                args,
+                minter_info.deposit_sol_required_cycles,
+            )
+            .await;
+        let deposit_id = match result {
+            Ok(Ok(id)) => id,
+            // The minter keeps a quarantined deposit in flight. The status read
+            // of this id parks the row for an operator.
+            Ok(Err(DepositSolError::Quarantined { deposit_id })) => deposit_id,
+            // Each refusal is temporary: the minter reads the balance at
+            // finalized commitment, so a new transfer is first `ValueTooSmall`.
+            Ok(Err(error)) => {
+                return Ok(DepositNotice::NotYet {
+                    reason: format!("deposit_sol refused: {error:?}"),
+                });
+            }
+            Err(error) => {
+                return Ok(DepositNotice::NotYet {
+                    reason: format!("deposit_sol call failed: {error}"),
+                });
+            }
+        };
+        let account = Account {
+            owner: deposit_account.owner.unwrap_or(self.bridge_ic_owner_principal),
+            subaccount: deposit_account.subaccount,
+        };
+        Ok(DepositNotice::Accepted(BridgeSubmission {
+            bridge_id: Self::queued_deposit_id(account, Some(deposit_id), funding_receipt, None)?,
+        }))
+    }
+
+    fn queued_deposit_id(
+        account: Account,
+        deposit_id: Option<u64>,
+        transfer_signature: &str,
+        notification_error: Option<String>,
+    ) -> Result<String, String> {
+        let state = QueuedSolDeposit {
+            account,
+            deposit_id,
+            transfer_signature: transfer_signature.to_string(),
+            notification_error,
+        };
+        let encoded = serde_json::to_string(&state).map_err(|error| error.to_string())?;
+        Ok(format!("{QUEUED_DEPOSIT_PREFIX}{encoded}"))
+    }
+
+    /// The one-shot flow of the manual `bridge-sol` command: send, wait, then
+    /// notify. The finalizer runs the same steps one cycle at a time.
+    async fn submit_solana_to_icp(
+        &self,
+        route: &BridgeRouteSpec,
+        request: &BridgeRequest,
+    ) -> Result<BridgeSubmission, String> {
+        let send = self.solana_to_icp_send(route, request).await?;
+        let ChainAccount::Solana(deposit_address) = &send.to else {
+            return Err("ckSOL deposit address is not a Solana address".to_string());
+        };
         let transfer_signature = self
             .solana_backend
-            .native_transfer(&expected_source, amount_native.clone())
+            .native_transfer(deposit_address, send.amount_native.clone())
             .await
             .map_err(|e| {
                 // The backend settles the send against the cluster; only an
@@ -640,36 +741,24 @@ where
                 };
                 format!(
                     "{prefix}SOL transfer from configured bridge source {} to ckSOL deposit address {} failed: {}",
-                    self.bridge_solana_source_address, expected_source, e
+                    self.bridge_solana_source_address, deposit_address, e
                 )
             })?;
 
-        let args = Encode!(&deposit_account)
-        .map_err(|error| error.to_string())?;
-        let result = self.agent.call_update_via_proxy::<Result<u64, DepositSolError>>(
-            &proxy_canister,
-            &self.cksol_minter_canister,
-            "deposit_sol",
-            args,
-            minter_info.deposit_sol_required_cycles,
-        ).await;
-        // SOL has already moved. Preserve a handle even if notification failed,
-        // otherwise a finaliser retry can transfer the same funds twice.
-        let (deposit_id, notification_error) = match result {
-            Ok(Ok(id)) => (Some(id), None),
-            Ok(Err(error)) => (None, Some(format!("{error:?}"))),
-            Err(error) => (None, Some(error)),
-        };
-        // Sweep costs determine the credited amount. Persist the minter's ID so
-        // completion cannot be inferred from another deposit's wallet credit.
-        let bridge_id = format!("{QUEUED_DEPOSIT_PREFIX}{}", serde_json::to_string(&QueuedSolDeposit {
-            account: *destination,
-            deposit_id,
-            transfer_signature,
-            notification_error,
-        }).map_err(|error| error.to_string())?);
-
-        Ok(BridgeSubmission { bridge_id })
+        match self
+            .notify_sol_deposit(route, &request.destination, &transfer_signature)
+            .await?
+        {
+            DepositNotice::Accepted(submission) => Ok(submission),
+            // SOL has moved, so return a handle with the signature. A new
+            // submission would send the same funds again.
+            DepositNotice::NotYet { reason } => {
+                let account = *Self::expect_icp_destination(route, &request.destination)?;
+                Ok(BridgeSubmission {
+                    bridge_id: Self::queued_deposit_id(account, None, &transfer_signature, Some(reason))?,
+                })
+            }
+        }
     }
 
     async fn submit_icp_to_solana(
@@ -819,11 +908,43 @@ where
         }
     }
 
+    async fn deposit_send(&self, request: &BridgeRequest) -> Result<OutboundIntent, String> {
+        let route = Self::resolve_solana_route_for_request(request)?;
+        validate_destination_for_route(route, &request.destination)?;
+        if route.route_kind != BridgeRouteKind::SolanaToIcp {
+            return Err(format!(
+                "route {}@{} -> {} has no deposit send",
+                route.source_asset, route.source_chain, route.target_asset
+            ));
+        }
+        self.solana_to_icp_send(route, request).await
+    }
+
+    async fn notify_deposit(
+        &self,
+        asset: &str,
+        chain: &str,
+        destination: &BridgeDestination,
+        funding_receipt: &str,
+    ) -> Result<DepositNotice, String> {
+        let route = Self::solana_route_from_source(asset, chain)?;
+        if route.route_kind != BridgeRouteKind::SolanaToIcp {
+            return Err(format!("route {asset}@{chain} has no deposit notice"));
+        }
+        validate_destination_for_route(route, destination)?;
+        self.notify_sol_deposit(route, destination, funding_receipt).await
+    }
+
     async fn get_bridge_status(&self, bridge_id: &str) -> Result<BridgeStatus, String> {
         if let Some(encoded) = bridge_id.strip_prefix(QUEUED_DEPOSIT_PREFIX) {
             let state: QueuedSolDeposit = serde_json::from_str(encoded).map_err(|error| error.to_string())?;
+            // An older flow saved the transfer without a minter id. Only an
+            // operator can tie that SOL to a minter deposit.
             let Some(deposit_id) = state.deposit_id else {
-                return Ok(BridgeStatus::Unknown);
+                return Err(side_effect_ambiguous(format!(
+                    "SOL transfer {} has no ckSOL deposit id; call deposit_sol for {} and record the id",
+                    state.transfer_signature, state.account
+                )));
             };
             let status = self.agent.call_query::<DepositSolStatus>(
                 &self.cksol_minter_canister,
@@ -845,9 +966,13 @@ where
                 DepositSolStatus::Dropped { signature } => BridgeStatus::Failed {
                     reason: Some(format!("SOL sweep dropped: {signature}")),
                 },
-                // A quarantined mint may have landed. Keep it unresolved rather
-                // than classifying it as a clean failure permitting a new transfer.
-                DepositSolStatus::Quarantined { .. } => BridgeStatus::Unknown,
+                // A quarantined mint may have landed, and only a minter upgrade
+                // releases it. Park the row; a new transfer is never safe here.
+                DepositSolStatus::Quarantined { signature } => {
+                    return Err(side_effect_ambiguous(format!(
+                        "ckSOL deposit {deposit_id} is quarantined (sweep {signature}); only a minter upgrade releases it"
+                    )));
+                }
             });
         }
         if let Some(block_index) = Self::parse_withdraw_bridge_id(bridge_id)? {
@@ -889,7 +1014,7 @@ where
 mod tests {
     use super::super::{BridgeBackend, BridgeDestination, BridgeRequest};
     use super::{
-        CkSolMinterInfo, CkSolTxFinalizedStatus, DepositSolError,
+        ChainAccount, ChainToken, CkSolMinterInfo, CkSolTxFinalizedStatus, DepositNotice, DepositSolError,
         CkSolWithdrawalError, CkSolWithdrawalOk, CkSolWithdrawalStatus, DEFAULT_SOLANA_BRIDGE_FEE_BUFFER_LAMPORTS,
         DEPOSIT_BRIDGE_ID_PREFIX, DepositBridgePollState, SolanaBridgeBackend, WITHDRAW_BRIDGE_ID_PREFIX,
     };
@@ -1101,7 +1226,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ambiguous_notification_stays_unknown_without_resubmitting() {
+    async fn a_failed_notification_keeps_the_signature_and_parks_the_status_read() {
         assert_deposit_notification_handle(Err("timeout".into()), None).await;
         assert_deposit_notification_handle(Ok(Err(DepositSolError::AlreadyProcessing)), None).await;
     }
@@ -1134,9 +1259,10 @@ mod tests {
                 assert_eq!(account.subaccount, subaccount);
                 Ok(query_deposit.clone())
             });
+        // The send preflight and the notice each read the minter settings.
         mock_agent
             .expect_call_query::<CkSolMinterInfo>()
-            .times(1)
+            .times(2)
             .returning(|_, _, _| Ok(default_minter_info()));
         mock_agent
             .expect_call_update_via_proxy::<Result<u64, DepositSolError>>()
@@ -1190,11 +1316,127 @@ mod tests {
         assert_eq!(decoded.transfer_signature, "sig-123");
         if expected_id.is_none() {
             assert!(decoded.notification_error.is_some());
-            assert_eq!(
-                backend.get_bridge_status(&submission.bridge_id).await.unwrap(),
-                super::BridgeStatus::Unknown
-            );
+            let error = backend
+                .get_bridge_status(&submission.bridge_id)
+                .await
+                .expect_err("a transfer without a minter id needs an operator");
+            assert!(liquidium_pipeline_core::outbound::is_side_effect_ambiguous(&error), "{error}");
+            assert!(error.contains("sig-123"), "{error}");
         }
+    }
+
+    #[tokio::test]
+    async fn the_deposit_send_names_the_minter_address_and_sends_nothing() {
+        let recipient = Principal::from_slice(&[42]);
+        let subaccount = Some([9u8; 32]);
+        let mut request = sol_to_icp_request(recipient, subaccount);
+        request.amount = 2.0;
+
+        let mut agent = MockPipelineAgent::new();
+        agent.expect_call_update::<String>().times(1).returning(move |_, method, args| {
+            assert_eq!(method, "get_deposit_address");
+            let account = candid::Decode!(&args, super::CkSolGetDepositAddressArgs).unwrap();
+            assert_eq!((account.owner, account.subaccount), (Some(recipient), subaccount));
+            Ok(deposit_address())
+        });
+        agent
+            .expect_call_query::<CkSolMinterInfo>()
+            .times(1)
+            .returning(|_, _, _| Ok(default_minter_info()));
+        agent.expect_call_update_via_proxy::<Result<u64, DepositSolError>>().times(0);
+        let mut icp = MockIcpBackend::new();
+        icp.expect_icrc1_decimals().times(1).returning(|_| Ok(9));
+        let mut solana = MockSolanaBackend::new();
+        solana
+            .expect_native_balance()
+            .times(1)
+            .returning(|| Ok(Nat::from(3_000_000_000u64)));
+        solana.expect_native_transfer().times(0);
+
+        let send = backend(agent, icp, solana).deposit_send(&request).await.unwrap();
+
+        assert_eq!(send.to, ChainAccount::Solana(deposit_address()));
+        assert_eq!(send.amount_native, Nat::from(2_000_000_000u64));
+        assert!(matches!(send.token, ChainToken::SolanaNative { decimals: 9, .. }));
+    }
+
+    #[tokio::test]
+    async fn the_deposit_notice_keeps_ids_and_turns_refusals_into_waits() {
+        let recipient = Principal::from_slice(&[42]);
+        let destination = BridgeDestination::IcpAccount(Account {
+            owner: recipient,
+            subaccount: Some([9u8; 32]),
+        });
+        let cases: Vec<(Result<Result<u64, DepositSolError>, String>, Option<u64>)> = vec![
+            (Ok(Ok(77)), Some(77)),
+            // A quarantined deposit stays in flight; its id is the handle.
+            (Ok(Err(DepositSolError::Quarantined { deposit_id: 78 })), Some(78)),
+            (
+                Ok(Err(DepositSolError::ValueTooSmall {
+                    balance: 0,
+                    minimum_deposit_amount: 20_000_000,
+                })),
+                None,
+            ),
+            (Ok(Err(DepositSolError::AlreadyProcessing)), None),
+            (Err("replica timed out".into()), None),
+        ];
+        for (answer, expected_id) in cases {
+            let mut agent = MockPipelineAgent::new();
+            agent
+                .expect_call_query::<CkSolMinterInfo>()
+                .times(1)
+                .returning(|_, _, _| Ok(default_minter_info()));
+            agent
+                .expect_call_update_via_proxy::<Result<u64, DepositSolError>>()
+                .times(1)
+                .return_once(move |_, _, method, _, _| {
+                    assert_eq!(method, "deposit_sol");
+                    answer
+                });
+            let backend = backend(agent, MockIcpBackend::new(), MockSolanaBackend::new());
+
+            let notice = backend
+                .notify_deposit("SOL", "SOL", &destination, "sig-9")
+                .await
+                .unwrap();
+
+            match (notice, expected_id) {
+                (DepositNotice::Accepted(submission), Some(id)) => {
+                    let saved: super::QueuedSolDeposit = serde_json::from_str(
+                        submission.bridge_id.strip_prefix(super::QUEUED_DEPOSIT_PREFIX).unwrap(),
+                    )
+                    .unwrap();
+                    assert_eq!(saved.deposit_id, Some(id));
+                    assert_eq!(saved.transfer_signature, "sig-9");
+                    assert_eq!(saved.account.owner, recipient);
+                }
+                (DepositNotice::NotYet { .. }, None) => {}
+                (notice, expected) => panic!("unexpected {notice:?} for {expected:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_quarantined_deposit_parks_the_status_read() {
+        let id = super::SolanaBridgeBackend::<MockPipelineAgent, MockIcpBackend, MockSolanaBackend>::queued_deposit_id(
+            Account { owner: bridge_owner(), subaccount: None },
+            Some(78),
+            "sig-9",
+            None,
+        )
+        .unwrap();
+        let mut agent = MockPipelineAgent::new();
+        agent
+            .expect_call_query::<super::DepositSolStatus>()
+            .times(1)
+            .returning(|_, _, _| Ok(super::DepositSolStatus::Quarantined { signature: "sweep".into() }));
+        let error = backend(agent, MockIcpBackend::new(), MockSolanaBackend::new())
+            .get_bridge_status(&id)
+            .await
+            .expect_err("only an operator can release a quarantined deposit");
+        assert!(liquidium_pipeline_core::outbound::is_side_effect_ambiguous(&error), "{error}");
+        assert!(error.contains("78"), "{error}");
     }
 
     #[tokio::test]
@@ -1203,10 +1445,7 @@ mod tests {
         request.amount = 2.0;
 
         let mut mock_agent = MockPipelineAgent::new();
-        mock_agent
-            .expect_call_update::<String>()
-            .times(1)
-            .returning(|_, _, _| Ok(deposit_address()));
+        mock_agent.expect_call_update::<String>().times(0);
         mock_agent
             .expect_call_query::<CkSolMinterInfo>()
             .times(1)
@@ -1242,7 +1481,7 @@ mod tests {
             (
                 format!(
                     "{}: solana transaction 1 has no decided answer: rpc failure",
-                    crate::backend::SIDE_EFFECT_AMBIGUOUS_PREFIX
+                    liquidium_pipeline_core::outbound::SIDE_EFFECT_AMBIGUOUS_PREFIX
                 ),
                 true,
             ),
@@ -1282,7 +1521,7 @@ mod tests {
             .submit_bridge(request)
             .await
             .expect_err("transfer failure must fail submission");
-        assert_eq!(err.starts_with(crate::backend::SIDE_EFFECT_AMBIGUOUS_PREFIX), ambiguous, "{err}");
+        assert_eq!(err.starts_with(liquidium_pipeline_core::outbound::SIDE_EFFECT_AMBIGUOUS_PREFIX), ambiguous, "{err}");
         assert!(err.contains("SOL transfer from configured bridge source"));
         assert!(err.contains("rpc failure"));
         }

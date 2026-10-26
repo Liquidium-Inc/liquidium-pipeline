@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::str::FromStr;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
@@ -14,40 +15,57 @@ use solana_sdk::{
     transaction::Transaction,
 };
 
-use crate::backend::SIDE_EFFECT_AMBIGUOUS_PREFIX;
+use liquidium_pipeline_core::outbound::{SendOutcome, side_effect_ambiguous};
+use serde::{Deserialize, Serialize};
+use solana_client::{client_error::ClientErrorKind, rpc_request::RpcError};
 
-/// How long a send without confirmation is checked before it stays open.
-/// A blockhash expires after about 60 seconds and finalizes about 15 later;
-/// the finalizer stage shares its 300-second budget with other rows.
-const UNCONFIRMED_SEND_DEADLINE: Duration = Duration::from_secs(75);
-const UNCONFIRMED_SEND_POLL: Duration = Duration::from_secs(2);
+/// How long a plain transfer waits for a decided answer before it reports
+/// an open one. A blockhash expires after about 60 seconds and finalizes
+/// about 15 later; the finalizer stage shares 300 seconds with other rows.
+const PLAIN_TRANSFER_DEADLINE: Duration = Duration::from_secs(75);
+const PLAIN_TRANSFER_POLL: Duration = Duration::from_secs(2);
 
-/// What a send without confirmation turned out to be.
+/// A signed transfer, kept so the same transaction can be sent and read again.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SignedSolanaTx {
+    pub transaction: Transaction,
+    pub signature: String,
+    /// The transaction cannot land after the finalized block height passes this.
+    pub last_valid_block_height: u64,
+}
+
+/// What one read of the cluster says about a signed transfer.
 #[derive(Debug, PartialEq, Eq)]
-enum SendOutcome {
+enum Reading {
     Landed,
     FailedOnChain(String),
     Expired,
     Open,
 }
 
-/// Decides one status read. `status` is `None` when the read failed, and
-/// `Some(None)` when the cluster does not know the signature. A signature that
-/// is absent after its blockhash expired can no longer land.
-fn decide_send_outcome(
+/// Decides one read. `status` is `None` when the read failed and `Some(None)`
+/// when the node does not know the signature. Absence proves expiry only when
+/// the node answering the status had seen the finalized slot compared with.
+fn read_outcome(
     status: Option<Option<(bool, Option<String>)>>,
-    finalized_block_height: Option<u64>,
+    status_slot: Option<u64>,
+    finalized: Option<(u64, u64)>,
     last_valid_block_height: u64,
-) -> SendOutcome {
+) -> Reading {
     match status {
-        Some(Some((true, None))) => SendOutcome::Landed,
-        Some(Some((true, Some(error)))) => SendOutcome::FailedOnChain(error),
-        Some(None) if finalized_block_height.is_some_and(|height| height > last_valid_block_height) => {
-            SendOutcome::Expired
+        Some(Some((true, None))) => Reading::Landed,
+        Some(Some((true, Some(error)))) => Reading::FailedOnChain(error),
+        Some(None)
+            if finalized.is_some_and(|(height, slot)| {
+                height > last_valid_block_height && status_slot.is_some_and(|seen| seen >= slot)
+            }) =>
+        {
+            Reading::Expired
         }
-        _ => SendOutcome::Open,
+        _ => Reading::Open,
     }
 }
+
 use solana_system_interface::instruction as system_instruction;
 use spl_associated_token_account::{get_associated_token_address, instruction::create_associated_token_account};
 
@@ -69,6 +87,15 @@ pub trait SolanaBackend: Send + Sync {
     // SPL token transfer from the pipeline wallet.
     // Creates destination ATA if missing.
     async fn spl_transfer(&self, mint: &str, to: &str, amount: Nat) -> Result<String, String>; // signature
+
+    /// Builds and signs a transfer without sending it. `mint` is `None` for SOL.
+    async fn prepare_transfer(&self, mint: Option<String>, to: &str, amount: Nat) -> Result<SignedSolanaTx, String>;
+
+    /// Sends a signed transfer once, without waiting for confirmation.
+    async fn send_signed(&self, tx: &SignedSolanaTx) -> SendOutcome;
+
+    /// Reads the cluster once for a signed transfer.
+    async fn signed_outcome(&self, tx: &SignedSolanaTx) -> SendOutcome;
 }
 
 pub struct SolanaBackendImpl {
@@ -128,82 +155,85 @@ impl SolanaBackendImpl {
             .map_err(|e| format!("failed to reconstruct Solana signer from key bytes: {e}"))
     }
 
-    async fn send_instructions(&self, instructions: Vec<Instruction>) -> Result<String, String> {
+    /// Signs at the client's commitment: the send runs its preflight there,
+    /// so a blockhash from another bank would be refused.
+    async fn sign(&self, instructions: Vec<Instruction>) -> Result<SignedSolanaTx, String> {
         if instructions.is_empty() {
             return Err("cannot send empty Solana transaction".to_string());
         }
-
-        // The send runs its preflight at the client's commitment, so the
-        // blockhash must come from the same bank or the preflight rejects it.
         let (recent_blockhash, last_valid_block_height) = self
             .rpc
             .get_latest_blockhash_with_commitment(self.rpc.commitment())
             .await
             .map_err(|e| format!("solana get_latest_blockhash failed: {e}"))?;
-
         let signer = self.signer()?;
-        let tx = Transaction::new_signed_with_payer(
-            &instructions,
-            Some(&self.owner),
-            &[&signer],
-            recent_blockhash,
-        );
-        let signature = tx.signatures[0];
-
-        match self.rpc.send_and_confirm_transaction(&tx).await {
-            Ok(signature) => Ok(signature.to_string()),
-            Err(error) => {
-                self.settle_unconfirmed_send(signature, last_valid_block_height, error.to_string())
-                    .await
-            }
-        }
+        let transaction = Transaction::new_signed_with_payer(&instructions, Some(&self.owner), &[&signer], recent_blockhash);
+        Ok(SignedSolanaTx {
+            signature: transaction.signatures[0].to_string(),
+            transaction,
+            last_valid_block_height,
+        })
     }
 
-    /// A failed confirmation does not prove the transaction stayed local. The
-    /// signature is known, so the cluster can say whether it landed; after the
-    /// blockhash expires, an absent signature proves that it never will.
-    async fn settle_unconfirmed_send(
-        &self,
-        signature: Signature,
-        last_valid_block_height: u64,
-        send_error: String,
-    ) -> Result<String, String> {
-        let deadline = Instant::now() + UNCONFIRMED_SEND_DEADLINE;
+    async fn native_instructions(&self, to: &str, amount_lamports: &Nat) -> Result<Vec<Instruction>, String> {
+        let to_pubkey = Self::parse_pubkey(to, "recipient")?;
+        let lamports = Self::nat_to_u64(amount_lamports, "native transfer amount")?;
+        Ok(vec![system_instruction::transfer(&self.owner, &to_pubkey, lamports)])
+    }
+
+    async fn spl_instructions(&self, mint: &str, to: &str, amount: &Nat) -> Result<Vec<Instruction>, String> {
+        let mint_pubkey = Self::parse_pubkey(mint, "mint")?;
+        let recipient = Self::parse_pubkey(to, "recipient")?;
+        let amount_raw = Self::nat_to_u64(amount, "SPL transfer amount")?;
+
+        let source_ata = get_associated_token_address(&self.owner, &mint_pubkey);
+        let destination_ata = get_associated_token_address(&recipient, &mint_pubkey);
+        let decimals = self.spl_decimals(mint).await?;
+
+        let mut instructions = Vec::new();
+        if !self.account_exists(&destination_ata).await? {
+            instructions.push(create_associated_token_account(
+                &self.owner,
+                &recipient,
+                &mint_pubkey,
+                &spl_token::id(),
+            ));
+        }
+        instructions.push(
+            spl_token::instruction::transfer_checked(
+                &spl_token::id(),
+                &source_ata,
+                &mint_pubkey,
+                &destination_ata,
+                &self.owner,
+                &[],
+                amount_raw,
+                decimals,
+            )
+            .map_err(|e| format!("failed to build SPL transfer_checked instruction: {e}"))?,
+        );
+        Ok(instructions)
+    }
+
+    /// A plain transfer for callers without a saved record: send, then read
+    /// the cluster until it decides or the deadline passes.
+    async fn transfer_and_wait(&self, tx: SignedSolanaTx) -> Result<String, String> {
+        let deadline = Instant::now() + PLAIN_TRANSFER_DEADLINE;
+        let mut outcome = self.send_signed(&tx).await;
         loop {
-            let status = self
-                .rpc
-                .get_signature_statuses_with_history(&[signature])
-                .await
-                .ok()
-                .map(|response| {
-                    response.value.into_iter().next().flatten().map(|status| {
-                        (
-                            status.satisfies_commitment(CommitmentConfig::confirmed()),
-                            status.err.map(|error| error.to_string()),
-                        )
-                    })
-                });
-            let finalized_block_height = self
-                .rpc
-                .get_block_height_with_commitment(CommitmentConfig::finalized())
-                .await
-                .ok();
-            match decide_send_outcome(status, finalized_block_height, last_valid_block_height) {
-                SendOutcome::Landed => return Ok(signature.to_string()),
-                SendOutcome::FailedOnChain(error) => {
-                    return Err(format!("solana transaction {signature} failed on chain and moved no funds: {error}"));
+            match outcome {
+                SendOutcome::Landed { receipt } => return Ok(receipt),
+                SendOutcome::NeverLanded { reason } => return Err(reason),
+                SendOutcome::Open { reason } if Instant::now() >= deadline => {
+                    return Err(side_effect_ambiguous(format!(
+                        "solana transaction {} has no decided answer: {reason}",
+                        tx.signature
+                    )));
                 }
-                SendOutcome::Expired => {
-                    return Err(format!(
-                        "solana transaction {signature} expired unconfirmed and moved no funds: {send_error}"
-                    ));
+                SendOutcome::Open { .. } => {
+                    tokio::time::sleep(PLAIN_TRANSFER_POLL).await;
+                    outcome = self.signed_outcome(&tx).await;
                 }
-                SendOutcome::Open if Instant::now() >= deadline => {
-                    return Err(format!(
-                        "{SIDE_EFFECT_AMBIGUOUS_PREFIX}: solana transaction {signature} has no decided answer: {send_error}"
-                    ));
-                }
-                SendOutcome::Open => tokio::time::sleep(UNCONFIRMED_SEND_POLL).await,
             }
         }
     }
@@ -272,46 +302,78 @@ impl SolanaBackend for SolanaBackendImpl {
     }
 
     async fn native_transfer(&self, to: &str, amount_lamports: Nat) -> Result<String, String> {
-        let to_pubkey = Self::parse_pubkey(to, "recipient")?;
-        let lamports = Self::nat_to_u64(&amount_lamports, "native transfer amount")?;
-
-        let ix = system_instruction::transfer(&self.owner, &to_pubkey, lamports);
-        self.send_instructions(vec![ix]).await
+        let tx = self.prepare_transfer(None, to, amount_lamports).await?;
+        self.transfer_and_wait(tx).await
     }
 
     async fn spl_transfer(&self, mint: &str, to: &str, amount: Nat) -> Result<String, String> {
-        let mint_pubkey = Self::parse_pubkey(mint, "mint")?;
-        let recipient = Self::parse_pubkey(to, "recipient")?;
-        let amount_raw = Self::nat_to_u64(&amount, "SPL transfer amount")?;
+        let tx = self.prepare_transfer(Some(mint.to_string()), to, amount).await?;
+        self.transfer_and_wait(tx).await
+    }
 
-        let source_ata = get_associated_token_address(&self.owner, &mint_pubkey);
-        let destination_ata = get_associated_token_address(&recipient, &mint_pubkey);
-        let decimals = self.spl_decimals(mint).await?;
+    async fn prepare_transfer(&self, mint: Option<String>, to: &str, amount: Nat) -> Result<SignedSolanaTx, String> {
+        let instructions = match mint {
+            None => self.native_instructions(to, &amount).await?,
+            Some(mint) => self.spl_instructions(&mint, to, &amount).await?,
+        };
+        self.sign(instructions).await
+    }
 
-        let mut instructions = Vec::new();
-        if !self.account_exists(&destination_ata).await? {
-            instructions.push(create_associated_token_account(
-                &self.owner,
-                &recipient,
-                &mint_pubkey,
-                &spl_token::id(),
-            ));
+    async fn send_signed(&self, tx: &SignedSolanaTx) -> SendOutcome {
+        match self.rpc.send_transaction(&tx.transaction).await {
+            Ok(_) => SendOutcome::Open {
+                reason: "sent; waiting for confirmation".to_string(),
+            },
+            // The node answered with an error, preflight failures included,
+            // and forwards nothing in that case.
+            Err(error) if matches!(error.kind(), ClientErrorKind::RpcError(RpcError::RpcResponseError { .. })) => {
+                SendOutcome::NeverLanded {
+                    reason: format!("solana node refused transaction {}: {error}", tx.signature),
+                }
+            }
+            Err(error) => SendOutcome::Open {
+                reason: format!("solana send of {} has no answer: {error}", tx.signature),
+            },
         }
+    }
 
-        let transfer_ix = spl_token::instruction::transfer_checked(
-            &spl_token::id(),
-            &source_ata,
-            &mint_pubkey,
-            &destination_ata,
-            &self.owner,
-            &[],
-            amount_raw,
-            decimals,
-        )
-        .map_err(|e| format!("failed to build SPL transfer_checked instruction: {e}"))?;
-        instructions.push(transfer_ix);
-
-        self.send_instructions(instructions).await
+    async fn signed_outcome(&self, tx: &SignedSolanaTx) -> SendOutcome {
+        let Ok(signature) = Signature::from_str(&tx.signature) else {
+            return SendOutcome::NeverLanded {
+                reason: format!("invalid saved Solana signature {}", tx.signature),
+            };
+        };
+        // Finalized first: the status must come from a node at least that fresh.
+        let finalized = self
+            .rpc
+            .get_epoch_info_with_commitment(CommitmentConfig::finalized())
+            .await
+            .ok()
+            .map(|epoch| (epoch.block_height, epoch.absolute_slot));
+        let response = self.rpc.get_signature_statuses_with_history(&[signature]).await.ok();
+        let status_slot = response.as_ref().map(|response| response.context.slot);
+        let status = response.map(|response| {
+            response.value.into_iter().next().flatten().map(|status| {
+                (
+                    status.satisfies_commitment(CommitmentConfig::confirmed()),
+                    status.err.map(|error| error.to_string()),
+                )
+            })
+        });
+        match read_outcome(status, status_slot, finalized, tx.last_valid_block_height) {
+            Reading::Landed => SendOutcome::Landed {
+                receipt: tx.signature.clone(),
+            },
+            Reading::FailedOnChain(error) => SendOutcome::NeverLanded {
+                reason: format!("solana transaction {} failed on chain and moved no funds: {error}", tx.signature),
+            },
+            Reading::Expired => SendOutcome::NeverLanded {
+                reason: format!("solana transaction {} expired unconfirmed and moved no funds", tx.signature),
+            },
+            Reading::Open => SendOutcome::Open {
+                reason: format!("solana transaction {} is not confirmed yet", tx.signature),
+            },
+        }
     }
 }
 
@@ -345,27 +407,28 @@ mod tests {
 }
 
 #[cfg(test)]
-mod send_outcome_tests {
+mod reading_tests {
     use super::*;
 
     #[test]
-    fn a_send_is_settled_only_by_a_confirmed_status_or_a_proven_expiry() {
+    fn a_transfer_is_decided_only_by_a_confirmed_status_or_a_fresh_proof_of_expiry() {
         let last_valid = 100;
-        // The cluster confirmed it: it landed, or it failed and moved nothing.
-        assert_eq!(decide_send_outcome(Some(Some((true, None))), Some(50), last_valid), SendOutcome::Landed);
+        let finalized = Some((101, 5_000));
+        assert_eq!(read_outcome(Some(Some((true, None))), Some(1), Some((50, 1)), last_valid), Reading::Landed);
         assert_eq!(
-            decide_send_outcome(Some(Some((true, Some("InsufficientFunds".into())))), Some(50), last_valid),
-            SendOutcome::FailedOnChain("InsufficientFunds".into())
+            read_outcome(Some(Some((true, Some("InsufficientFunds".into())))), Some(1), None, last_valid),
+            Reading::FailedOnChain("InsufficientFunds".into())
         );
-        // Seen but not confirmed yet: wait.
-        assert_eq!(decide_send_outcome(Some(Some((false, None))), Some(150), last_valid), SendOutcome::Open);
-        // Absent after the finalized height passed the blockhash: it never landed.
-        assert_eq!(decide_send_outcome(Some(None), Some(101), last_valid), SendOutcome::Expired);
-        // Absent before expiry, or at the last valid height: it still can land.
-        assert_eq!(decide_send_outcome(Some(None), Some(100), last_valid), SendOutcome::Open);
-        assert_eq!(decide_send_outcome(Some(None), Some(80), last_valid), SendOutcome::Open);
-        // A failed read proves nothing, even after expiry.
-        assert_eq!(decide_send_outcome(None, Some(500), last_valid), SendOutcome::Open);
-        assert_eq!(decide_send_outcome(Some(None), None, last_valid), SendOutcome::Open);
+        // Seen but not confirmed: wait.
+        assert_eq!(read_outcome(Some(Some((false, None))), Some(9_000), finalized, last_valid), Reading::Open);
+        // Absent on a node that saw the finalized slot, after expiry: it never landed.
+        assert_eq!(read_outcome(Some(None), Some(5_000), finalized, last_valid), Reading::Expired);
+        // Absent on a node behind that slot proves nothing.
+        assert_eq!(read_outcome(Some(None), Some(4_999), finalized, last_valid), Reading::Open);
+        // Absent before expiry, or at the last valid height: it can still land.
+        assert_eq!(read_outcome(Some(None), Some(9_000), Some((100, 5_000)), last_valid), Reading::Open);
+        // A failed read proves nothing.
+        assert_eq!(read_outcome(None, None, finalized, last_valid), Reading::Open);
+        assert_eq!(read_outcome(Some(None), Some(9_000), None, last_valid), Reading::Open);
     }
 }

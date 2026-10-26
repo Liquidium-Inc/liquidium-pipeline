@@ -71,10 +71,10 @@ pub struct CexDepositState {
     pub deposit_sent_at_ts: Option<i64>,
     #[serde(default)]
     pub approval_bump_count: Option<u32>,
-    /// `created_at_time` of the funding transfer, kept for its retries. An ICP
-    /// ledger answers a repeat with the first block instead of moving funds.
+    /// The funding transfer, saved before it is sent. Retries and restarts send
+    /// this exact transfer again instead of measuring and sizing a new one.
     #[serde(default)]
-    pub deposit_transfer_created_at_ns: Option<u64>,
+    pub deposit_funding: Option<crate::finalizers::outbound::OutboundRecord>,
     #[serde(flatten)]
     pub bridge: CexDepositBridgeState,
 }
@@ -292,6 +292,33 @@ pub struct CexWithdrawBridgeState {
     pub withdraw_bridge_polled_at_ts: Option<i64>,
     #[serde(default)]
     pub withdraw_bridge_destination_snapshot: Option<String>,
+    /// The send to a provider deposit address, saved before it is sent.
+    #[serde(default)]
+    pub withdraw_bridge_funding: Option<crate::finalizers::outbound::OutboundRecord>,
+    /// The chain receipt of that send, once it landed.
+    #[serde(default)]
+    pub withdraw_bridge_funding_txid: Option<String>,
+    /// When the send landed. The provider must accept it within a window.
+    #[serde(default)]
+    pub withdraw_bridge_funded_at_ts: Option<i64>,
+}
+
+impl CexWithdrawBridgeState {
+    /// True once a deposit send exists. The source balance then no longer
+    /// holds the bridge amount, so the step must not size a new send.
+    pub fn deposit_send_started(&self) -> bool {
+        self.withdraw_bridge_funding.is_some() || self.withdraw_bridge_funding_txid.is_some()
+    }
+
+    /// True when a restart may resume the deposit send: the next action
+    /// reads the chain, resends a replay-safe send, or tells the provider.
+    fn deposit_send_resumable(&self) -> bool {
+        self.withdraw_bridge_funding_txid.is_some()
+            || self
+                .withdraw_bridge_funding
+                .as_ref()
+                .is_some_and(crate::finalizers::outbound::OutboundRecord::resumable)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -312,6 +339,16 @@ pub struct CexState {
 
 /// A pending step is safe to resume by reading alone once its own submission
 /// id is durable and, when a bridge follows, the bridge handle is durable too.
+impl CexDepositState {
+    /// True when a saved funding transfer can resume without the arming
+    /// token: it was sent already, or sending it again cannot pay twice.
+    pub fn funding_resumable(&self) -> bool {
+        self.deposit_funding
+            .as_ref()
+            .is_some_and(crate::finalizers::outbound::OutboundRecord::resumable)
+    }
+}
+
 impl CexDepositBridgeState {
     /// True when the persisted phase accounts for the bridge call: nothing was
     /// sent, or the attempt is marked so the next cycle looks it up first.
@@ -357,6 +394,7 @@ impl CexState {
     /// resolves legacy transport plans first; see `can_resume_by_polling`.
     pub fn is_receipt_poll_only(&self) -> bool {
         match self.step {
+            CexStep::Deposit => self.deposit.funding_resumable(),
             CexStep::DepositPending => {
                 let bridge = &self.deposit.bridge;
                 self.deposit.deposit_txid.is_some()
@@ -367,7 +405,9 @@ impl CexState {
             CexStep::WithdrawPending => {
                 let bridge = &self.withdraw.bridge;
                 self.withdraw.withdraw_id.is_some()
-                    && (!bridge.withdraw_bridge_required || bridge.withdraw_bridge_id.is_some())
+                    && (!bridge.withdraw_bridge_required
+                        || bridge.withdraw_bridge_id.is_some()
+                        || bridge.deposit_send_resumable())
             }
             _ => false,
         }
@@ -690,7 +730,7 @@ mod tests {
                     deposit_balance_before: None,
                     deposit_sent_at_ts: None,
                     approval_bump_count: None,
-                    deposit_transfer_created_at_ns: None,
+                    deposit_funding: None,
                     bridge: CexDepositBridgeState {
                         deposit_planned_asset: None,
                         deposit_planned_network: None,
@@ -750,6 +790,9 @@ mod tests {
                         withdraw_bridge_polled_at_ts: None,
                         withdraw_bridge_mint_receipt: None,
                         withdraw_bridge_destination_snapshot: None,
+                        withdraw_bridge_funding: None,
+                        withdraw_bridge_funding_txid: None,
+                        withdraw_bridge_funded_at_ts: None,
                     },
                 },
             })
@@ -850,7 +893,7 @@ mod tests {
                     deposit_balance_before: None,
                     deposit_sent_at_ts: None,
                     approval_bump_count: None,
-                    deposit_transfer_created_at_ns: None,
+                    deposit_funding: None,
                     bridge: CexDepositBridgeState {
                         deposit_planned_asset: None,
                         deposit_planned_network: None,
@@ -910,6 +953,9 @@ mod tests {
                         withdraw_bridge_polled_at_ts: None,
                         withdraw_bridge_mint_receipt: None,
                         withdraw_bridge_destination_snapshot: None,
+                        withdraw_bridge_funding: None,
+                        withdraw_bridge_funding_txid: None,
+                        withdraw_bridge_funded_at_ts: None,
                     },
                 },
             })

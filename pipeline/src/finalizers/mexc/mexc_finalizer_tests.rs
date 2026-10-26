@@ -229,6 +229,14 @@ fn bridge_dependencies(backend: Arc<MockBridgeBackend>) -> BridgeRuntime {
     BridgeRuntime::for_tests(backend)
 }
 
+/// Runs the two funding cycles: the first saves the transfer, the second sends it.
+async fn fund(finalizer: &MexcFinalizer<MockCexBackend>, state: &mut CexState) {
+    finalizer.deposit(state).await.expect("the first cycle saves the funding transfer");
+    assert!(state.deposit.deposit_funding.is_some(), "the transfer is saved before it is sent");
+    finalizer.deposit(state).await.expect("the second cycle sends it");
+    assert!(state.deposit.deposit_txid.is_some(), "the funding transfer landed");
+}
+
 #[tokio::test]
 async fn mexc_prepare_builds_initial_cex_state() {
     let backend = Arc::new(MockCexBackend::new());
@@ -345,8 +353,8 @@ async fn mexc_deposit_phase_a_snapshots_baseline_and_sends_transfer() {
     });
 
     transfers
-        .expect_transfer_deduplicated()
-        .returning(|_token, _to, _amount, _created_at_time_nanos| Ok("tx-123".to_string()));
+        .expect_transfer()
+        .returning(|_token, _to, _amount| Ok("tx-123".to_string()));
     transfers
         .expect_approve()
         .times(6)
@@ -373,7 +381,7 @@ async fn mexc_deposit_phase_a_snapshots_baseline_and_sends_transfer() {
     assert!(matches!(state.step, CexStep::Deposit));
 
     // Phase A: snapshot baseline and send transfer
-    finalizer.deposit(&mut state).await.expect("deposit should succeed");
+    fund(&finalizer, &mut state).await;
 
     assert_eq!(state.deposit.deposit_balance_before, Some(10.0));
     assert_eq!(state.deposit.deposit_txid.as_deref(), Some("tx-123"));
@@ -403,7 +411,7 @@ async fn mexc_deposit_phase_a_rejects_fee_consumed_deposit_with_permanent_prefix
                 tag: None,
             })
         });
-    transfers.expect_transfer_deduplicated().times(0);
+    transfers.expect_transfer().times(0);
 
     let finalizer = MexcFinalizer::new(
         Arc::new(backend),
@@ -458,9 +466,9 @@ async fn mexc_deposit_phase_a_uses_evm_destination_for_evm_assets() {
         });
 
     transfers
-        .expect_transfer_deduplicated()
+        .expect_transfer()
         .times(1)
-        .returning(|token, destination, amount, _created_at_time_nanos| {
+        .returning(|token, destination, amount| {
             assert!(matches!(token, ChainToken::EvmErc20 { symbol, .. } if symbol == "USDC"));
             match destination {
                 ChainAccount::Evm(address) => {
@@ -491,7 +499,7 @@ async fn mexc_deposit_phase_a_uses_evm_destination_for_evm_assets() {
     let receipt = make_execution_receipt_with_assets(43, collateral, ckbtc_token());
     let mut state = finalizer.prepare("43", &receipt).await.expect("prepare should succeed");
 
-    finalizer.deposit(&mut state).await.expect("deposit should succeed");
+    fund(&finalizer, &mut state).await;
 
     assert_eq!(state.deposit.deposit_txid.as_deref(), Some("tx-evm-123"));
     assert!(matches!(state.step, CexStep::DepositPending));
@@ -514,7 +522,7 @@ async fn mexc_deposit_phase_a_rejects_invalid_evm_deposit_address() {
                 tag: None,
             })
         });
-    transfers.expect_transfer_deduplicated().times(0);
+    transfers.expect_transfer().times(0);
 
     let finalizer = MexcFinalizer::new(
         Arc::new(backend),
@@ -566,9 +574,9 @@ async fn mexc_native_icp_deposit_uses_ledger_account_id_destination() {
         });
 
     transfers
-        .expect_transfer_deduplicated()
+        .expect_transfer()
         .times(1)
-        .returning(|token, destination, amount, _created_at_time_nanos| {
+        .returning(|token, destination, amount| {
             assert!(MexcFinalizer::<MockCexBackend>::is_native_icp_token(token));
             match destination {
                 ChainAccount::IcpLedger(account_id_hex) => {
@@ -593,10 +601,7 @@ async fn mexc_native_icp_deposit_uses_ledger_account_id_destination() {
     let receipt = make_execution_receipt_with_assets(45, native_icp_token(), ckbtc_token());
     let mut state = finalizer.prepare("45", &receipt).await.expect("prepare should succeed");
 
-    finalizer
-        .deposit(&mut state)
-        .await
-        .expect("native ICP deposit should succeed");
+    fund(&finalizer, &mut state).await;
 
     assert_eq!(state.deposit.deposit_txid.as_deref(), Some("tx-native-icp"));
     assert!(matches!(state.step, CexStep::DepositPending));
@@ -619,7 +624,7 @@ async fn mexc_native_icp_deposit_rejects_invalid_ledger_account_id() {
                 tag: None,
             })
         });
-    transfers.expect_transfer_deduplicated().times(0);
+    transfers.expect_transfer().times(0);
     transfers.expect_approve().times(0);
 
     let finalizer = MexcFinalizer::new(
@@ -658,7 +663,7 @@ async fn mexc_native_icp_deposit_rejects_memo_tag_before_transfer() {
                 tag: Some("memo-not-supported".to_string()),
             })
         });
-    transfers.expect_transfer_deduplicated().times(0);
+    transfers.expect_transfer().times(0);
     transfers.expect_approve().times(0);
 
     let finalizer = MexcFinalizer::new(
@@ -805,9 +810,9 @@ async fn mexc_deposit_bridge_submit_resume_and_complete() {
     });
 
     transfers
-        .expect_transfer_deduplicated()
+        .expect_transfer()
         .times(1)
-        .returning(|_token, _to, _amount, _created_at_time_nanos| Ok("tx-bridge-fund".to_string()));
+        .returning(|_token, _to, _amount| Ok("tx-bridge-fund".to_string()));
 
     bridge
         .expect_get_source_balance()
@@ -823,7 +828,7 @@ async fn mexc_deposit_bridge_submit_resume_and_complete() {
     });
     bridge
         .expect_get_fee_budget()
-        .times(2)
+        .times(3)
         .returning(|asset, chain, target| {
             assert_eq!(asset, "ckUSDC");
             assert_eq!(chain, "ICP");
@@ -884,6 +889,7 @@ async fn mexc_deposit_bridge_submit_resume_and_complete() {
     let mut state = finalizer.prepare("7", &receipt).await.expect("prepare should succeed");
     assert!(state.deposit.bridge.deposit_bridge_required);
 
+    fund(&finalizer, &mut state).await;
     finalizer
         .deposit(&mut state)
         .await
@@ -949,9 +955,9 @@ async fn mexc_deposit_bridge_reserves_reverse_bridge_approval_fee_in_trade_amoun
     });
 
     transfers
-        .expect_transfer_deduplicated()
+        .expect_transfer()
         .times(1)
-        .returning(|_token, _to, _amount, _created_at_time_nanos| Ok("tx-bridge-fund".to_string()));
+        .returning(|_token, _to, _amount| Ok("tx-bridge-fund".to_string()));
 
     bridge
         .expect_get_source_balance()
@@ -964,7 +970,7 @@ async fn mexc_deposit_bridge_reserves_reverse_bridge_approval_fee_in_trade_amoun
     bridge.expect_prepare_submission().times(1).returning(|_| Ok(None));
     bridge
         .expect_get_fee_budget()
-        .times(2)
+        .times(3)
         .returning(|asset, chain, target| {
             assert_eq!(asset, "ckUSDC");
             assert_eq!(chain, "ICP");
@@ -1009,6 +1015,7 @@ async fn mexc_deposit_bridge_reserves_reverse_bridge_approval_fee_in_trade_amoun
     let mut state = finalizer.prepare("8", &receipt).await.expect("prepare should succeed");
     assert!(state.deposit.bridge.deposit_bridge_required);
 
+    fund(&finalizer, &mut state).await;
     finalizer
         .deposit(&mut state)
         .await
@@ -1034,7 +1041,7 @@ async fn mexc_deposit_bridge_rejects_source_fee_reserve_too_small_with_permanent
         Ok(10.0)
     });
 
-    transfers.expect_transfer_deduplicated().times(0);
+    transfers.expect_transfer().times(0);
 
     bridge.expect_get_source_balance().times(0);
     bridge
@@ -1100,7 +1107,7 @@ async fn mexc_deposit_bridge_reserves_native_cketh_withdrawal_fee_budget() {
         })
     });
 
-    transfers.expect_transfer_deduplicated().times(1).returning(|_token, _to, amount, _created_at_time_nanos| {
+    transfers.expect_transfer().times(1).returning(|_token, _to, amount| {
         assert_eq!(amount, Nat::from(5_086_000_000_000_000u64));
         Ok("tx-bridge-fund-cketh".to_string())
     });
@@ -1116,7 +1123,7 @@ async fn mexc_deposit_bridge_reserves_native_cketh_withdrawal_fee_budget() {
     bridge.expect_prepare_submission().times(1).returning(|_| Ok(Some(7)));
     bridge
         .expect_get_fee_budget()
-        .times(2)
+        .times(3)
         .returning(|asset, chain, target| {
             assert_eq!(asset, "ckETH");
             assert_eq!(chain, "ICP");
@@ -1174,6 +1181,7 @@ async fn mexc_deposit_bridge_reserves_native_cketh_withdrawal_fee_budget() {
     let mut state = finalizer.prepare("82", &receipt).await.expect("prepare should succeed");
     assert!(state.deposit.bridge.deposit_bridge_required);
 
+    fund(&finalizer, &mut state).await;
     finalizer
         .deposit(&mut state)
         .await
@@ -1206,7 +1214,7 @@ async fn mexc_deposit_bridge_rejects_native_cketh_below_minimum_before_transfer(
         Ok(10.0)
     });
 
-    transfers.expect_transfer_deduplicated().times(0);
+    transfers.expect_transfer().times(0);
 
     bridge.expect_get_source_balance().times(0);
     bridge
@@ -1274,7 +1282,7 @@ async fn mexc_deposit_bridge_rejects_native_cketh_when_destination_fee_consumes_
         Ok(10.0)
     });
 
-    transfers.expect_transfer_deduplicated().times(0);
+    transfers.expect_transfer().times(0);
 
     bridge.expect_get_source_balance().times(0);
     bridge
@@ -1354,9 +1362,9 @@ async fn mexc_deposit_bridge_waits_for_source_funding_snapshot() {
     });
 
     transfers
-        .expect_transfer_deduplicated()
+        .expect_transfer()
         .times(1)
-        .returning(|_token, _to, _amount, _created_at_time_nanos| Ok("tx-bridge-fund-wait".to_string()));
+        .returning(|_token, _to, _amount| Ok("tx-bridge-fund-wait".to_string()));
 
     bridge
         .expect_get_source_balance()
@@ -1368,7 +1376,7 @@ async fn mexc_deposit_bridge_waits_for_source_funding_snapshot() {
         });
     bridge
         .expect_get_fee_budget()
-        .times(1)
+        .times(2)
         .returning(|asset, chain, target| {
             assert_eq!(asset, "ckUSDC");
             assert_eq!(chain, "ICP");
@@ -1405,6 +1413,7 @@ async fn mexc_deposit_bridge_waits_for_source_funding_snapshot() {
     let mut state = finalizer.prepare("81", &receipt).await.expect("prepare should succeed");
     assert!(state.deposit.bridge.deposit_bridge_required);
 
+    fund(&finalizer, &mut state).await;
     finalizer
         .deposit(&mut state)
         .await
@@ -1438,9 +1447,9 @@ async fn mexc_deposit_bridge_waits_for_cketh_fee_funding_snapshot() {
     });
 
     transfers
-        .expect_transfer_deduplicated()
+        .expect_transfer()
         .times(1)
-        .returning(|_token, _to, _amount, _created_at_time_nanos| Ok("tx-bridge-fund-fee-wait".to_string()));
+        .returning(|_token, _to, _amount| Ok("tx-bridge-fund-fee-wait".to_string()));
 
     bridge
         .expect_get_source_balance()
@@ -1455,7 +1464,7 @@ async fn mexc_deposit_bridge_waits_for_cketh_fee_funding_snapshot() {
         });
     bridge
         .expect_get_fee_budget()
-        .times(1)
+        .times(2)
         .returning(|asset, chain, target| {
             assert_eq!(asset, "ckUSDC");
             assert_eq!(chain, "ICP");
@@ -1492,6 +1501,7 @@ async fn mexc_deposit_bridge_waits_for_cketh_fee_funding_snapshot() {
     let mut state = finalizer.prepare("84", &receipt).await.expect("prepare should succeed");
     assert!(state.deposit.bridge.deposit_bridge_required);
 
+    fund(&finalizer, &mut state).await;
     finalizer
         .deposit(&mut state)
         .await
@@ -1853,9 +1863,9 @@ async fn mexc_deposit_bridge_deferral_keeps_step_pending_then_submits() {
         })
     });
     transfers
-        .expect_transfer_deduplicated()
+        .expect_transfer()
         .times(1)
-        .returning(|_token, _to, _amount, _created_at_time_nanos| Ok("tx-bridge-deferred".to_string()));
+        .returning(|_token, _to, _amount| Ok("tx-bridge-deferred".to_string()));
     bridge.expect_get_source_balance().returning(|_, _, _| Ok(10.0));
     bridge.expect_get_fee_budget().returning(|_, _, _| {
         Ok(BridgeFeeBudget {
@@ -1894,6 +1904,7 @@ async fn mexc_deposit_bridge_deferral_keeps_step_pending_then_submits() {
     let mut state = finalizer.prepare("82", &receipt).await.expect("prepare should succeed");
     assert!(state.deposit.bridge.deposit_bridge_required);
 
+    fund(&finalizer, &mut state).await;
     finalizer.deposit(&mut state).await.expect("transfer and record the attempt");
     finalizer
         .deposit(&mut state)
@@ -2946,7 +2957,7 @@ fn cex_deposit_state_deserialize_defaults_missing_sent_timestamp() {
         deposit_balance_before: Some(5.0),
         deposit_sent_at_ts: Some(123),
         approval_bump_count: Some(2),
-        deposit_transfer_created_at_ns: None,
+        deposit_funding: None,
         bridge: crate::finalizers::cex_finalizer::CexDepositBridgeState {
             deposit_planned_asset: Some("ckBTC".to_string()),
             deposit_planned_network: Some("ICP".to_string()),
@@ -6028,6 +6039,51 @@ async fn mexc_cksol_repayment_preview_uses_icp_usdt_sol_route() {
     assert!(preview.conservative_receive.value < preview.quote.receive_amount);
 }
 
+/// A SOL sender that saves one send, reports it open once, then landed.
+fn sol_deposit_sender() -> liquidium_pipeline_core::outbound::MockOutboundSender {
+    use liquidium_pipeline_core::outbound::{PreparedSend, SendOutcome};
+    let mut sender = liquidium_pipeline_core::outbound::MockOutboundSender::new();
+    sender.expect_prepare().times(1).returning(|intent| {
+        assert_eq!(intent.to, ChainAccount::Solana("minter-deposit".into()));
+        Ok(PreparedSend {
+            sender: "solana".into(),
+            identity: "sol-sig".into(),
+            payload: format!("{}", intent.amount_native),
+            replay_safe: true,
+        })
+    });
+    sender.expect_submit().times(1).returning(|_| SendOutcome::Open {
+        reason: "sent".into(),
+    });
+    sender.expect_settle().times(1).returning(|_| SendOutcome::Landed {
+        receipt: "sol-sig".into(),
+    });
+    sender.expect_open_window_secs().returning(|_| 900);
+    sender
+}
+
+fn cksol_mint(recipient: icrc_ledger_types::icrc1::account::Account) -> BridgeStatus {
+    BridgeStatus::Minted(liquidium_pipeline_connectors::backend::bridge_backend::BridgeMintReceipt {
+        transaction_hash: "sol-sig".into(),
+        log_index: Nat::from(77u8),
+        mint_block_index: Nat::from(99u8),
+        amount: Nat::from(1_487_995_000u64),
+        recipient,
+        token_symbol: "ckSOL".into(),
+    })
+}
+
+/// A ckSOL repayment row whose SOL send landed and waits for the minter.
+fn cksol_funded_state(finalizer: &MexcFinalizer<MockCexBackend>, funded_at: i64) -> CexState {
+    let mut state = cksol_repayment_state(finalizer, 1.5);
+    state.step = CexStep::WithdrawPending;
+    state.withdraw.withdraw_id = Some("sol-withdraw".into());
+    state.withdraw.bridge.withdraw_bridge_destination_snapshot = Some(repayment_account().to_string());
+    state.withdraw.bridge.withdraw_bridge_funding_txid = Some("sol-sig".into());
+    state.withdraw.bridge.withdraw_bridge_funded_at_ts = Some(funded_at);
+    state
+}
+
 #[tokio::test]
 async fn mexc_cksol_repayment_waits_for_funding_reserves_fees_and_records_mint() {
     let recipient = repayment_account();
@@ -6046,6 +6102,7 @@ async fn mexc_cksol_repayment_waits_for_funding_reserves_fees_and_records_mint()
                 txid: Some("sol-signature".into()),
             })
         });
+    // Only the cycles before the send read the exchange and the source balance.
     cex.expect_get_withdraw_status_snapshot_by_id()
         .times(2)
         .returning(|_, _| {
@@ -6072,7 +6129,8 @@ async fn mexc_cksol_repayment_waits_for_funding_reserves_fees_and_records_mint()
         .expect_get_minimum_bridge_amount()
         .times(1)
         .returning(|_, _, _| Ok(0.02));
-    bridge.expect_submit_bridge().times(1).returning(move |request| {
+    bridge.expect_submit_bridge().times(0);
+    bridge.expect_deposit_send().times(1).returning(move |request| {
         assert_eq!(
             (
                 request.asset.as_str(),
@@ -6083,34 +6141,163 @@ async fn mexc_cksol_repayment_waits_for_funding_reserves_fees_and_records_mint()
         );
         assert!((request.amount - 1.488).abs() < 1e-9);
         assert_eq!(request.destination, BridgeDestination::IcpAccount(recipient));
-        Ok(BridgeSubmission {
-            bridge_id: "cksol-deposit-v2:test".into(),
+        Ok(liquidium_pipeline_core::outbound::OutboundIntent {
+            token: ChainToken::SolanaNative {
+                symbol: "SOL".into(),
+                decimals: 9,
+                fee: Nat::from(5_000u64),
+            },
+            to: ChainAccount::Solana("minter-deposit".into()),
+            amount_native: Nat::from(1_488_000_000u64),
         })
     });
-    bridge.expect_get_bridge_status().times(1).returning(move |_| {
-        Ok(BridgeStatus::Minted(
-            liquidium_pipeline_connectors::backend::bridge_backend::BridgeMintReceipt {
-                transaction_hash: "sol-signature".into(),
-                log_index: Nat::from(77u8),
-                mint_block_index: Nat::from(99u8),
-                amount: Nat::from(1_487_995_000u64),
-                recipient,
-                token_symbol: "ckSOL".into(),
-            },
-        ))
-    });
-    let finalizer = cksol_finalizer(cex, bridge);
+    let notices = Arc::new(std::sync::Mutex::new(vec![
+        DepositNotice::Accepted(BridgeSubmission {
+            bridge_id: "cksol-deposit-v2:test".into(),
+        }),
+        DepositNotice::NotYet {
+            reason: "ValueTooSmall".into(),
+        },
+    ]));
+    bridge
+        .expect_notify_deposit()
+        .times(2)
+        .returning(move |asset, chain, destination, receipt| {
+            assert_eq!((asset, chain, receipt), ("SOL", "SOL", "sol-sig"));
+            assert_eq!(*destination, BridgeDestination::IcpAccount(recipient));
+            Ok(notices.lock().unwrap().pop().unwrap())
+        });
+    bridge
+        .expect_get_bridge_status()
+        .times(1)
+        .returning(move |_| Ok(cksol_mint(recipient)));
+    let finalizer = MexcFinalizer::new(
+        Arc::new(cex),
+        Arc::new(MockTransferActions::new()),
+        recipient.owner,
+        TEST_MAX_SELL_SLIPPAGE_BPS,
+        TEST_CEX_MIN_EXEC_USD,
+        TEST_CEX_SLICE_TARGET_RATIO,
+    )
+    .with_bridge_runtime(bridge_dependencies(Arc::new(bridge)).with_outbound(Arc::new(sol_deposit_sender())));
     let mut state = cksol_repayment_state(&finalizer, 1.5);
-    finalizer.withdraw(&mut state).await.unwrap();
-    finalizer.withdraw(&mut state).await.unwrap();
+
+    finalizer.withdraw(&mut state).await.unwrap(); // exchange withdrawal
+    finalizer.withdraw(&mut state).await.unwrap(); // source balance too low
+    assert!(!state.withdraw.bridge.deposit_send_started());
+    finalizer.withdraw(&mut state).await.unwrap(); // the SOL send is saved
+    assert!(state.withdraw.bridge.withdraw_bridge_funding.is_some());
     assert!(state.withdraw.bridge.withdraw_bridge_id.is_none());
-    finalizer.withdraw(&mut state).await.unwrap();
+
+    // A restart resumes the saved send without the gate, and sends that send.
+    let mut state: CexState = serde_json::from_str(&serde_json::to_string(&state).unwrap()).unwrap();
+    assert!(state.is_receipt_poll_only());
+    finalizer.withdraw(&mut state).await.unwrap(); // sent, open
+    finalizer.withdraw(&mut state).await.unwrap(); // landed
+    assert_eq!(state.withdraw.bridge.withdraw_bridge_funding_txid.as_deref(), Some("sol-sig"));
+    assert!(state.withdraw.bridge.withdraw_bridge_funding.is_none());
+    finalizer.withdraw(&mut state).await.unwrap(); // the minter does not see it yet
+    assert!(state.withdraw.bridge.withdraw_bridge_id.is_none());
+    finalizer.withdraw(&mut state).await.unwrap(); // the minter accepts it
+    assert_eq!(state.withdraw.bridge.withdraw_bridge_id.as_deref(), Some("cksol-deposit-v2:test"));
     assert!(matches!(state.step, CexStep::WithdrawPending));
-    // The persisted bridge handle resumes without issuing another exchange withdrawal or SOL transfer.
+
     let mut resumed: CexState = serde_json::from_str(&serde_json::to_string(&state).unwrap()).unwrap();
     finalizer.withdraw(&mut resumed).await.unwrap();
     assert!(matches!(resumed.step, CexStep::Completed));
     assert_eq!(resumed.withdraw.size_out.unwrap().value, Nat::from(1_487_995_000u64));
+}
+
+#[tokio::test]
+async fn mexc_cksol_deposit_notice_parks_after_its_window_and_resumes_on_acceptance() {
+    let mut bridge = MockBridgeBackend::new();
+    let notices = Arc::new(std::sync::Mutex::new(vec![
+        DepositNotice::Accepted(BridgeSubmission {
+            bridge_id: "cksol-deposit-v2:late".into(),
+        }),
+        DepositNotice::NotYet {
+            reason: "TemporarilyUnavailable".into(),
+        },
+    ]));
+    bridge
+        .expect_notify_deposit()
+        .times(2)
+        .returning(move |_, _, _, _| Ok(notices.lock().unwrap().pop().unwrap()));
+    let finalizer = cksol_finalizer(MockCexBackend::new(), bridge);
+    let mut state = cksol_funded_state(&finalizer, now_ts() - DEPOSIT_NOTICE_WINDOW_SECS - 1);
+
+    let error = finalizer.withdraw(&mut state).await.expect_err("the window ran out");
+    assert!(error.starts_with(SIDE_EFFECT_AMBIGUOUS_PREFIX), "{error}");
+    assert!(error.contains("sol-sig"), "{error}");
+    assert!(state.withdraw.bridge.withdraw_bridge_id.is_none());
+
+    // The run after an operator's release asks the minter first.
+    finalizer.withdraw(&mut state).await.unwrap();
+    assert_eq!(state.withdraw.bridge.withdraw_bridge_id.as_deref(), Some("cksol-deposit-v2:late"));
+}
+
+#[tokio::test]
+async fn mexc_cksol_dropped_sweep_is_notified_again_without_a_new_send() {
+    let recipient = repayment_account();
+    let mut bridge = MockBridgeBackend::new();
+    let statuses = Arc::new(std::sync::Mutex::new(vec![
+        cksol_mint(recipient),
+        BridgeStatus::Failed {
+            reason: Some("SOL sweep dropped: sweep-1".into()),
+        },
+    ]));
+    bridge
+        .expect_get_bridge_status()
+        .times(2)
+        .returning(move |_| Ok(statuses.lock().unwrap().pop().unwrap()));
+    bridge.expect_notify_deposit().times(1).returning(|_, _, _, receipt| {
+        assert_eq!(receipt, "sol-sig");
+        Ok(DepositNotice::Accepted(BridgeSubmission {
+            bridge_id: "cksol-deposit-v2:second".into(),
+        }))
+    });
+    bridge.expect_deposit_send().times(0);
+    let finalizer = cksol_finalizer(MockCexBackend::new(), bridge);
+    let mut state = cksol_funded_state(&finalizer, now_ts() - 3_600);
+    state.withdraw.bridge.withdraw_bridge_id = Some("cksol-deposit-v2:first".into());
+
+    finalizer.withdraw(&mut state).await.unwrap();
+    assert!(state.withdraw.bridge.withdraw_bridge_id.is_none());
+    finalizer.withdraw(&mut state).await.unwrap();
+    assert_eq!(state.withdraw.bridge.withdraw_bridge_id.as_deref(), Some("cksol-deposit-v2:second"));
+    finalizer.withdraw(&mut state).await.unwrap();
+    assert!(matches!(state.step, CexStep::Completed));
+}
+
+#[test]
+fn a_saved_deposit_send_resumes_after_a_restart_only_when_a_replay_is_safe() {
+    use crate::finalizers::outbound::{OutboundPhase, OutboundRecord};
+    use liquidium_pipeline_core::outbound::PreparedSend;
+    let finalizer = cksol_finalizer(MockCexBackend::new(), MockBridgeBackend::new());
+    let mut state = cksol_repayment_state(&finalizer, 1.5);
+    state.step = CexStep::WithdrawPending;
+    state.withdraw.withdraw_id = Some("sol-withdraw".into());
+    assert!(!state.is_receipt_poll_only(), "the bridge has not started");
+
+    let record = |replay_safe, phase| OutboundRecord {
+        prepared: PreparedSend {
+            sender: "solana".into(),
+            identity: "sol-sig".into(),
+            payload: "tx".into(),
+            replay_safe,
+        },
+        phase,
+        decision: None,
+    };
+    state.withdraw.bridge.withdraw_bridge_funding = Some(record(false, OutboundPhase::Prepared));
+    assert!(!state.is_receipt_poll_only(), "a crash may have sent an unsafe send");
+    state.withdraw.bridge.withdraw_bridge_funding = Some(record(false, OutboundPhase::Submitted { at: 1 }));
+    assert!(state.is_receipt_poll_only());
+    state.withdraw.bridge.withdraw_bridge_funding = Some(record(true, OutboundPhase::Prepared));
+    assert!(state.is_receipt_poll_only());
+    state.withdraw.bridge.withdraw_bridge_funding = None;
+    state.withdraw.bridge.withdraw_bridge_funding_txid = Some("sol-sig".into());
+    assert!(state.is_receipt_poll_only(), "only the notice is left, and it cannot move funds");
 }
 
 #[tokio::test]
@@ -6620,7 +6807,7 @@ mod lost_bridge_call {
     use super::*;
     use crate::finalizers::bridge_claims::{BridgeClaims, MockBridgeClaimLookup};
     use crate::finalizers::cex_finalizer::BridgeSubmitAttempt;
-    use liquidium_pipeline_connectors::backend::SIDE_EFFECT_AMBIGUOUS_PREFIX;
+    use liquidium_pipeline_core::outbound::SIDE_EFFECT_AMBIGUOUS_PREFIX;
     use crate::utils::now_ts;
     use liquidium_pipeline_connectors::backend::bridge_backend::BridgeSubmissionCandidate;
 
@@ -7128,10 +7315,11 @@ mod uncertain_side_effects {
     //! A call that may have moved funds without an answer is never repeated
     //! automatically. Funding parks the leg; a withdrawal polls its own order id.
     use super::*;
-    use liquidium_pipeline_connectors::backend::SIDE_EFFECT_AMBIGUOUS_PREFIX;
+    use liquidium_pipeline_core::outbound::SIDE_EFFECT_AMBIGUOUS_PREFIX;
     use liquidium_pipeline_connectors::backend::cex_backend::{WithdrawStatusSnapshot, WithdrawalReceipt};
-    use liquidium_pipeline_core::transfer::actions::TransferFailure;
     use crate::finalizers::cex_finalizer::UncertainWithdraw;
+    use crate::finalizers::outbound::{OperatorDecision, OutboundPhase, OutboundRecord};
+    use liquidium_pipeline_core::outbound::{MockOutboundSender, PreparedSend, SendOutcome};
 
     fn finalizer(cex: MockCexBackend, transfers: MockTransferActions) -> MexcFinalizer<MockCexBackend> {
         MexcFinalizer::new(
@@ -7171,8 +7359,9 @@ mod uncertain_side_effects {
 
     fn deposit_address(address: &'static str) -> MockCexBackend {
         let mut cex = MockCexBackend::new();
-        cex.expect_get_balance().returning(|_| Ok(10.0));
-        cex.expect_get_deposit_address().returning(move |asset, network| {
+        // Measured once per prepared transfer, never on a resend.
+        cex.expect_get_balance().times(1).returning(|_| Ok(10.0));
+        cex.expect_get_deposit_address().times(1).returning(move |asset, network| {
             Ok(DepositAddress {
                 asset: asset.into(),
                 network: network.into(),
@@ -7183,103 +7372,152 @@ mod uncertain_side_effects {
         cex
     }
 
-    /// An ICP ledger that drops the reply of its first call. The retry
-    /// carries the same `created_at_time`, so the ledger answers with the
-    /// first block, as `Duplicate` does on a real ledger.
-    fn lossy_ledger(calls: Arc<std::sync::Mutex<Vec<u64>>>, first: TransferFailure) -> MockTransferActions {
+    fn funding_sender(submit: Vec<SendOutcome>, settle: Vec<SendOutcome>, window: i64) -> MockOutboundSender {
+        let mut sender = MockOutboundSender::new();
+        sender.expect_prepare().times(1).returning(|intent| {
+            assert!(matches!(intent.to, ChainAccount::Icp(_)), "{:?}", intent.to);
+            Ok(PreparedSend {
+                sender: "test".into(),
+                identity: "funding-1".into(),
+                payload: format!("{}", intent.amount_native),
+                replay_safe: true,
+            })
+        });
+        let mut submit = submit.into_iter();
+        sender.expect_submit().returning(move |_| submit.next().expect("unexpected submit"));
+        let mut settle = settle.into_iter();
+        sender.expect_settle().returning(move |_| settle.next().expect("unexpected settle"));
+        sender.expect_open_window_secs().returning(move |_| window);
+        sender
+    }
+
+    fn funding_finalizer(cex: MockCexBackend, sender: MockOutboundSender) -> MexcFinalizer<MockCexBackend> {
         let mut transfers = MockTransferActions::new();
-        transfers
-            .expect_transfer_deduplicated()
-            .times(2)
-            .returning(move |_, _, _, created_at| {
-                let mut calls = calls.lock().unwrap();
-                calls.push(created_at);
-                if calls.len() == 1 { Err(first.clone()) } else { Ok("block-7".into()) }
-            });
+        transfers.expect_transfer().times(0);
         transfers.expect_approve().returning(|_, _, _| Ok("approve".into()));
-        transfers
+        finalizer(cex, transfers).with_outbound(Arc::new(sender))
+    }
+
+    fn open() -> SendOutcome {
+        SendOutcome::Open {
+            reason: "replica timed out".into(),
+        }
     }
 
     #[tokio::test]
-    async fn an_unanswered_icp_funding_transfer_retries_under_the_same_created_at_time() {
-        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let finalizer = finalizer(
-            deposit_address("aaaaa-aa"),
-            lossy_ledger(calls.clone(), TransferFailure::Ambiguous("replica timed out".into())),
-        );
+    async fn funding_is_saved_first_and_sent_on_the_next_cycle() {
+        let sender = funding_sender(vec![SendOutcome::Landed { receipt: "block-7".into() }], vec![], 60);
+        let finalizer = funding_finalizer(deposit_address("aaaaa-aa"), sender);
         let mut state = finalizer.prepare("funding", &make_execution_receipt(151)).await.unwrap();
 
-        let error = finalizer.deposit(&mut state).await.expect_err("the first reply is lost");
-        assert!(!error.starts_with(SIDE_EFFECT_AMBIGUOUS_PREFIX), "a safe retry is no park: {error}");
-        assert!(error.contains("created_at_time"), "{error}");
+        finalizer.deposit(&mut state).await.expect("the first cycle only saves");
+        assert_eq!(state.step, CexStep::Deposit);
         assert!(state.deposit.deposit_txid.is_none());
+        let record = state.deposit.deposit_funding.clone().expect("saved before the send");
+        assert_eq!(record.phase, OutboundPhase::Prepared);
+        assert!(state.deposit.funding_resumable(), "a replay-safe record survives a restart");
 
-        finalizer.deposit(&mut state).await.expect("the retry is deduplicated");
-
-        let calls = calls.lock().unwrap();
-        assert_eq!(calls[0], calls[1], "both calls carry one created_at_time");
-        assert_eq!(state.deposit.deposit_transfer_created_at_ns, Some(calls[0]));
+        let mut state = serde_json::from_str::<CexState>(&serde_json::to_string(&state).unwrap()).unwrap();
+        finalizer.deposit(&mut state).await.expect("the second cycle sends");
         assert_eq!(state.deposit.deposit_txid.as_deref(), Some("block-7"));
+        assert!(state.deposit.deposit_funding.is_none());
         assert_eq!(state.step, CexStep::DepositPending);
     }
 
     #[tokio::test]
-    async fn a_refused_funding_transfer_retries_without_a_park() {
-        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let finalizer = finalizer(
-            deposit_address("aaaaa-aa"),
-            lossy_ledger(calls, TransferFailure::Rejected("insufficient funds".into())),
-        );
-        let mut state = finalizer.prepare("refused", &make_execution_receipt(152)).await.unwrap();
+    async fn an_open_funding_send_is_settled_and_never_measured_or_sent_again() {
+        let sender = funding_sender(vec![open()], vec![open(), SendOutcome::Landed { receipt: "block-8".into() }], 600);
+        let finalizer = funding_finalizer(deposit_address("aaaaa-aa"), sender);
+        let mut state = finalizer.prepare("open", &make_execution_receipt(152)).await.unwrap();
 
-        let error = finalizer.deposit(&mut state).await.expect_err("refused");
-        assert_eq!(error, "insufficient funds");
-        finalizer.deposit(&mut state).await.expect("the retry goes through");
+        for _ in 0..3 {
+            finalizer.deposit(&mut state).await.expect("an open send is a wait, not an error");
+            assert!(state.deposit.deposit_txid.is_none());
+        }
+        finalizer.deposit(&mut state).await.unwrap();
+        assert_eq!(state.deposit.deposit_txid.as_deref(), Some("block-8"));
     }
 
     #[tokio::test]
-    async fn funding_parks_when_deduplication_cannot_cover_a_retry() {
-        // A token without ledger deduplication.
-        let mut transfers = MockTransferActions::new();
-        transfers
-            .expect_transfer_deduplicated()
-            .times(1)
-            .returning(|_, _, _, _| Err(TransferFailure::Ambiguous("rpc timed out".into())));
-        let leg_finalizer = finalizer(deposit_address("0x1111111111111111111111111111111111111111"), transfers);
-        let usdc = ChainToken::EvmErc20 {
-            chain: "eth".into(),
-            token_address: "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48".into(),
-            symbol: "USDC".into(),
-            decimals: 6,
-            fee: Nat::from(0u8),
-        };
-        let receipt = make_execution_receipt_with_assets(153, usdc, ckbtc_token());
-        let mut state = leg_finalizer.prepare("evm", &receipt).await.unwrap();
-        let error = leg_finalizer.deposit(&mut state).await.expect_err("no deduplication");
+    async fn a_parked_funding_send_moves_only_on_an_operator_decision() {
+        let sender = funding_sender(vec![open()], vec![open(), open(), open()], 0);
+        let finalizer = funding_finalizer(deposit_address("aaaaa-aa"), sender);
+        let mut state = finalizer.prepare("parked", &make_execution_receipt(153)).await.unwrap();
+        finalizer.deposit(&mut state).await.unwrap();
+        finalizer.deposit(&mut state).await.unwrap();
+        state.deposit.deposit_funding.as_mut().unwrap().phase = OutboundPhase::Submitted { at: 1 };
+
+        let error = finalizer.deposit(&mut state).await.expect_err("the window ran out");
+        assert!(error.starts_with(SIDE_EFFECT_AMBIGUOUS_PREFIX), "{error}");
+        let error = finalizer.deposit(&mut state).await.expect_err("a release without a decision parks again");
         assert!(error.starts_with(SIDE_EFFECT_AMBIGUOUS_PREFIX), "{error}");
 
-        // An ICP retry that would reach the ledger near the end of its window.
-        let mut transfers = MockTransferActions::new();
-        transfers
-            .expect_transfer_deduplicated()
-            .times(1)
-            .returning(|_, _, _, _| Err(TransferFailure::Ambiguous("replica timed out".into())));
-        let leg_finalizer = finalizer(deposit_address("aaaaa-aa"), transfers);
-        let mut state = leg_finalizer.prepare("old", &make_execution_receipt(154)).await.unwrap();
-        state.deposit.deposit_transfer_created_at_ns = Some(crate::utils::now_nanos() - 23 * 60 * 60 * 1_000_000_000);
-        let error = leg_finalizer.deposit(&mut state).await.expect_err("outside the safe window");
-        assert!(error.starts_with(SIDE_EFFECT_AMBIGUOUS_PREFIX), "{error}");
+        state.deposit.deposit_funding.as_mut().unwrap().decision =
+            Some(OperatorDecision::Landed { receipt: "block-9".into() });
+        finalizer.deposit(&mut state).await.expect("the decision completes the step");
+        assert_eq!(state.deposit.deposit_txid.as_deref(), Some("block-9"));
+    }
 
-        // An ICP retry to a deposit address that changed since the first call.
-        let mut transfers = MockTransferActions::new();
-        transfers.expect_transfer_deduplicated().times(0);
-        let leg_finalizer = finalizer(deposit_address("aaaaa-aa"), transfers);
-        let mut state = leg_finalizer.prepare("moved", &make_execution_receipt(155)).await.unwrap();
-        state.deposit.deposit_transfer_created_at_ns = Some(crate::utils::now_nanos());
-        state.deposit.bridge.deposit_bridge_destination_snapshot = Some("2vxsx-fae".into());
-        let error = leg_finalizer.deposit(&mut state).await.expect_err("arguments would differ");
-        assert!(error.starts_with(SIDE_EFFECT_AMBIGUOUS_PREFIX), "{error}");
-        assert!(error.contains("deposit address changed"), "{error}");
+    #[tokio::test]
+    async fn a_send_that_never_landed_is_measured_and_prepared_again() {
+        let mut cex = MockCexBackend::new();
+        cex.expect_get_balance().times(2).returning(|_| Ok(10.0));
+        cex.expect_get_deposit_address().times(2).returning(|asset, network| {
+            Ok(DepositAddress {
+                asset: asset.into(),
+                network: network.into(),
+                address: "aaaaa-aa".into(),
+                tag: None,
+            })
+        });
+        let mut sender = MockOutboundSender::new();
+        sender.expect_prepare().times(2).returning(|_| {
+            Ok(PreparedSend {
+                sender: "test".into(),
+                identity: "funding".into(),
+                payload: String::new(),
+                replay_safe: true,
+            })
+        });
+        let mut submit = vec![
+            SendOutcome::NeverLanded {
+                reason: "insufficient funds".into(),
+            },
+            SendOutcome::Landed { receipt: "block-2".into() },
+        ]
+        .into_iter();
+        sender.expect_submit().times(2).returning(move |_| submit.next().unwrap());
+        let finalizer = funding_finalizer(cex, sender);
+        let mut state = finalizer.prepare("refused", &make_execution_receipt(154)).await.unwrap();
+
+        finalizer.deposit(&mut state).await.unwrap();
+        let error = finalizer.deposit(&mut state).await.expect_err("refused");
+        assert_eq!(error, "insufficient funds");
+        assert!(state.deposit.deposit_funding.is_none());
+        finalizer.deposit(&mut state).await.unwrap();
+        finalizer.deposit(&mut state).await.unwrap();
+        assert_eq!(state.deposit.deposit_txid.as_deref(), Some("block-2"));
+    }
+
+    #[tokio::test]
+    async fn plain_sends_do_not_resume_unsent_after_a_restart() {
+        let mut state = finalizer(MockCexBackend::new(), MockTransferActions::new())
+            .prepare("plain", &make_execution_receipt(155))
+            .await
+            .unwrap();
+        state.deposit.deposit_funding = Some(OutboundRecord {
+            prepared: PreparedSend {
+                sender: "unsettled".into(),
+                identity: "plain-1".into(),
+                payload: String::new(),
+                replay_safe: false,
+            },
+            phase: OutboundPhase::Prepared,
+            decision: None,
+        });
+        assert!(!state.deposit.funding_resumable(), "it may have been sent before the crash");
+        state.deposit.deposit_funding.as_mut().unwrap().phase = OutboundPhase::Submitted { at: 1 };
+        assert!(state.deposit.funding_resumable(), "a submitted send is only read back");
     }
 
     #[tokio::test]

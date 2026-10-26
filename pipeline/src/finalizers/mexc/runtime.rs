@@ -33,6 +33,7 @@ pub async fn build_mexc_finalizer(
         .with_token_registry(ctx.registry.clone())
         .with_quote_costs(config.cex_route_fee_bps, config.cex_delay_buffer_bps)
         .with_bridge_runtime(bridge)
+        .with_outbound(ctx.trader_outbound.clone())
         .with_route_config(
             config.cex_mexc_available_pairs.clone(),
             config.cex_mexc_max_hops as usize,

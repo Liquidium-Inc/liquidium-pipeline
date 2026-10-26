@@ -1888,6 +1888,6 @@ async fn forward_bridge_helper_send_error_is_ambiguous() {
     let _ = tx_hash;
     // The transaction can land after the error, so a repeat would deposit twice.
     let error = backend.submit_bridge(request).await.expect_err("the send failed");
-    assert!(error.starts_with(crate::backend::SIDE_EFFECT_AMBIGUOUS_PREFIX), "{error}");
+    assert!(error.starts_with(liquidium_pipeline_core::outbound::SIDE_EFFECT_AMBIGUOUS_PREFIX), "{error}");
     assert!(error.contains("rpc timed out"), "{error}");
 }

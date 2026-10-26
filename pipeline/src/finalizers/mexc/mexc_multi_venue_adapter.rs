@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use liquidium_pipeline_connectors::backend::bridge_backend::{
     FINALIZER_PERMANENT_AMOUNT_FLOOR_PREFIX, BridgeRouteKind, resolve_route,
 };
-use liquidium_pipeline_connectors::backend::SIDE_EFFECT_AMBIGUOUS_PREFIX;
+use liquidium_pipeline_core::outbound::SIDE_EFFECT_AMBIGUOUS_PREFIX;
 use liquidium_pipeline_connectors::backend::cex_backend::{CexBackend, CexBackendError};
 use log::{info, warn};
 use serde::{Deserialize, Serialize};

@@ -2,7 +2,12 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
-use super::{BridgeBackend, BridgeFeeBudget, BridgeRequest, BridgeStatus, BridgeSubmission, BridgeSubmissionCandidate};
+use liquidium_pipeline_core::outbound::OutboundIntent;
+
+use super::{
+    BridgeBackend, BridgeDestination, BridgeFeeBudget, BridgeRequest, BridgeStatus, BridgeSubmission,
+    BridgeSubmissionCandidate, DepositNotice,
+};
 
 /// Keeps provider-specific submission handles with the backend that issued them.
 pub struct RoutedBridgeBackend {
@@ -69,6 +74,22 @@ impl BridgeBackend for RoutedBridgeBackend {
 
     async fn submit_bridge(&self, request: BridgeRequest) -> Result<BridgeSubmission, String> {
         self.source(&request.asset, &request.source_chain).submit_bridge(request).await
+    }
+
+    async fn deposit_send(&self, request: &BridgeRequest) -> Result<OutboundIntent, String> {
+        self.source(&request.asset, &request.source_chain).deposit_send(request).await
+    }
+
+    async fn notify_deposit(
+        &self,
+        asset: &str,
+        chain: &str,
+        destination: &BridgeDestination,
+        funding_receipt: &str,
+    ) -> Result<DepositNotice, String> {
+        self.source(asset, chain)
+            .notify_deposit(asset, chain, destination, funding_receipt)
+            .await
     }
 
     async fn prepare_submission(&self, request: &BridgeRequest) -> Result<Option<u64>, String> {

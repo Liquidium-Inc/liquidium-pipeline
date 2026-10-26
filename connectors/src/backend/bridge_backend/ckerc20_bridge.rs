@@ -25,9 +25,9 @@ use super::{
         WithdrawalRet, WithdrawalSearchParameter,
     },
 };
+use liquidium_pipeline_core::outbound::SIDE_EFFECT_AMBIGUOUS_PREFIX;
 use crate::{
     backend::{
-        SIDE_EFFECT_AMBIGUOUS_PREFIX,
         amount_utils::{
             amount_to_base_units_strict, amount_to_nat_units_strict, base_units_to_amount_via_core,
             nat_units_to_amount_via_core,

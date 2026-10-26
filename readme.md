@@ -29,11 +29,15 @@ The SOL bridge backend uses account-based `deposit_sol` and deposit-specific
 Configure `BRIDGE_CKSOL_LEDGER_CANISTER` for the deployment's repayment ledger
 and `BRIDGE_IC_PROXY_CANISTER` for the cycle-funded deposit call.
 
-If notification fails after SOL is transferred, the returned bridge handle stays
-`Unknown`. Reconcile the minter deposit before taking recovery action; submitting
-a fresh bridge request would send SOL again. Automated notification recovery,
-legacy balance-threshold handles and the legacy CLI `process-deposit` command
-are not migrated by these backend fixes.
+The finalizer runs a SOL -> ckSOL return in steps. It saves the signed SOL
+transfer before it sends it, and decides the transfer from the cluster. It then
+calls `deposit_sol` until the minter returns a deposit id. A repeated call is
+safe: the minter returns the id of the deposit in flight. A dropped sweep gets a
+new `deposit_sol` call. The row parks for an operator when the minter does not
+accept the deposit within 30 minutes, or quarantines it. A handle without a
+deposit id, from the older flow or the manual `bridge-sol` command, also parks.
+Legacy balance-threshold handles and the legacy CLI `process-deposit` command
+are not migrated.
 
 ## Features
 

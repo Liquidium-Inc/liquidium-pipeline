@@ -7,4 +7,5 @@ pub mod icpswap;
 pub mod liquidation_outcome;
 pub mod mexc;
 pub mod multi_venue;
+pub mod outbound;
 pub mod profit_calculator;

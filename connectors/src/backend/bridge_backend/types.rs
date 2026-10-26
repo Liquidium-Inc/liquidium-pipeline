@@ -2,6 +2,7 @@ use alloy::primitives::Address;
 use async_trait::async_trait;
 use candid::{CandidType, Nat, Principal};
 use icrc_ledger_types::icrc1::account::Account;
+use liquidium_pipeline_core::outbound::OutboundIntent;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -101,6 +102,15 @@ pub struct BridgeSubmission {
     pub bridge_id: String,
 }
 
+/// What the provider says about a deposit that already landed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DepositNotice {
+    /// The provider tracks the deposit under this handle.
+    Accepted(BridgeSubmission),
+    /// The provider does not track it yet. Asking again is safe.
+    NotYet { reason: String },
+}
+
 /// High-level bridge lifecycle state from the provider/backend.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BridgeStatus {
@@ -172,6 +182,27 @@ pub trait BridgeBackend: Send + Sync {
 
     /// Polls current status for a previously submitted bridge operation.
     async fn get_bridge_status(&self, bridge_id: &str) -> Result<BridgeStatus, String>;
+
+    /// The plain send that funds a route whose provider watches a deposit
+    /// address. The caller sends it through an outbound sender, then calls
+    /// `notify_deposit`. It checks the route and the source balance first.
+    async fn deposit_send(&self, request: &BridgeRequest) -> Result<OutboundIntent, String> {
+        let _ = request;
+        Err("deposit sends are not supported by this bridge backend".to_string())
+    }
+
+    /// Tells the provider about a deposit to `destination` that landed with
+    /// `funding_receipt`. A repeated call cannot move funds.
+    async fn notify_deposit(
+        &self,
+        asset: &str,
+        chain: &str,
+        destination: &BridgeDestination,
+        funding_receipt: &str,
+    ) -> Result<DepositNotice, String> {
+        let _ = (asset, chain, destination, funding_receipt);
+        Err("deposit notices are not supported by this bridge backend".to_string())
+    }
 
     /// Reads the provider's history position before a submission, so a handle
     /// lost between the call and its persistence can be found again. `None`
