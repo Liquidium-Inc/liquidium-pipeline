@@ -74,62 +74,19 @@ pub struct CexDepositState {
     /// The funding transfer, saved before it is sent. Retries and restarts send
     /// this exact transfer again instead of measuring and sizing a new one.
     #[serde(default)]
-    pub deposit_funding: Option<crate::finalizers::outbound::OutboundRecord>,
+    pub deposit_funding: Option<crate::outbound::driver::OutboundRecord>,
     #[serde(flatten)]
     pub bridge: CexDepositBridgeState,
-}
-
-/// The bridge journal's phase from before the outbound driver. It is read
-/// so saved rows keep their call, and it is never written again.
-#[derive(Debug, Clone, Deserialize, PartialEq)]
-pub enum LegacyBridgeSubmitPhase {
-    WaitingFunds,
-    Submitting(LegacyBridgeSubmitAttempt),
-}
-
-#[derive(Debug, Clone, Deserialize, PartialEq)]
-pub struct LegacyBridgeSubmitAttempt {
-    #[serde(default)]
-    pub id: String,
-    pub asset: String,
-    pub destination: String,
-    pub amount: f64,
-    pub cursor: Option<u64>,
-    pub started_at_ts: i64,
-    pub called_at_ts: Option<i64>,
-    #[serde(default)]
-    pub parked_for_operator: bool,
-}
-
-impl LegacyBridgeSubmitAttempt {
-    /// The call as the claim registry compares it. The fields a lookup does
-    /// not compare stay empty.
-    pub fn open_call(&self) -> crate::finalizers::bridge_calls::OpenBridgeCall {
-        crate::finalizers::bridge_calls::OpenBridgeCall {
-            id: self.id.clone(),
-            call: crate::finalizers::bridge_calls::BridgeCall {
-                asset: self.asset.clone(),
-                source_chain: String::new(),
-                source_address: String::new(),
-                target_asset: String::new(),
-                destination: self.destination.clone(),
-                amount: self.amount,
-                provider_fee_budget_native_units: None,
-                cursor: self.cursor,
-                started_at_ts: self.started_at_ts,
-            },
-        }
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct CexDepositBridgeState {
     /// The provider call that bridges the deposit, saved before it runs.
     #[serde(default)]
-    pub deposit_bridge_call: Option<crate::finalizers::outbound::OutboundRecord>,
+    pub deposit_bridge_call: Option<crate::outbound::driver::OutboundRecord>,
     /// Read from rows saved before the outbound driver; never written.
     #[serde(default, rename = "deposit_bridge_submit_phase", skip_serializing)]
-    pub legacy_bridge_submit_phase: Option<LegacyBridgeSubmitPhase>,
+    pub legacy_bridge_submit_phase: Option<crate::bridge::legacy::LegacyBridgeSubmitPhase>,
     #[serde(default)]
     pub deposit_planned_asset: Option<String>,
     #[serde(default)]
@@ -243,7 +200,7 @@ pub struct CexWithdrawState {
     pub withdraw_attempt: u32,
     /// The withdrawal request, saved before it is sent.
     #[serde(default)]
-    pub withdraw_send: Option<crate::finalizers::outbound::OutboundRecord>,
+    pub withdraw_send: Option<crate::outbound::driver::OutboundRecord>,
     pub size_out: Option<ChainTokenAmount>,
     #[serde(flatten)]
     pub bridge: CexWithdrawBridgeState,
@@ -269,7 +226,7 @@ pub struct CexWithdrawBridgeState {
     pub withdraw_bridge_destination_snapshot: Option<String>,
     /// The send that funds the return bridge, saved before it is sent.
     #[serde(default)]
-    pub withdraw_bridge_funding: Option<crate::finalizers::outbound::OutboundRecord>,
+    pub withdraw_bridge_funding: Option<crate::outbound::driver::OutboundRecord>,
     /// The provider handle saved with that send. It turns the receipt into
     /// a bridge id.
     #[serde(default)]
@@ -296,7 +253,7 @@ impl CexWithdrawBridgeState {
             || self
                 .withdraw_bridge_funding
                 .as_ref()
-                .is_some_and(crate::finalizers::outbound::OutboundRecord::resumable)
+                .is_some_and(crate::outbound::driver::OutboundRecord::resumable)
     }
 }
 
@@ -329,7 +286,7 @@ impl CexDepositState {
     pub fn funding_resumable(&self) -> bool {
         self.deposit_funding
             .as_ref()
-            .is_some_and(crate::finalizers::outbound::OutboundRecord::resumable)
+            .is_some_and(crate::outbound::driver::OutboundRecord::resumable)
     }
 }
 
@@ -361,7 +318,7 @@ impl CexState {
                 .withdraw
                 .withdraw_send
                 .as_ref()
-                .is_some_and(crate::finalizers::outbound::OutboundRecord::resumable),
+                .is_some_and(crate::outbound::driver::OutboundRecord::resumable),
             // A bridge call is saved before it runs, so a missing record means
             // no call is in flight.
             CexStep::DepositPending => {
@@ -371,7 +328,7 @@ impl CexState {
                         .bridge
                         .deposit_bridge_call
                         .as_ref()
-                        .is_none_or(crate::finalizers::outbound::OutboundRecord::resumable)
+                        .is_none_or(crate::outbound::driver::OutboundRecord::resumable)
             }
             CexStep::WithdrawPending => {
                 let bridge = &self.withdraw.bridge;
@@ -1308,6 +1265,7 @@ mod tests {
     fn a_legacy_journal_phase_is_read_but_never_written() {
         let saved = r#"{"deposit_bridge_required":true,"deposit_bridge_submit_phase":{"Submitting":{"id":"a1","asset":"ckUSDC","destination":"0xabc","amount":1.5,"cursor":100,"started_at_ts":5,"called_at_ts":null,"parked_for_operator":true}}}"#;
         let state: CexDepositBridgeState = serde_json::from_str(saved).unwrap();
+        use crate::bridge::legacy::LegacyBridgeSubmitPhase;
         let Some(LegacyBridgeSubmitPhase::Submitting(attempt)) = &state.legacy_bridge_submit_phase else {
             panic!("the saved attempt is read");
         };
@@ -1322,7 +1280,7 @@ mod tests {
 
     #[test]
     fn a_restart_marks_only_sends_that_are_not_safe_to_repeat() {
-        use crate::finalizers::outbound::{OutboundPhase, OutboundRecord};
+        use crate::outbound::driver::{OutboundPhase, OutboundRecord};
         use liquidium_pipeline_core::outbound::PreparedSend;
         let record = |replay_safe| {
             Some(OutboundRecord::prepared(PreparedSend {

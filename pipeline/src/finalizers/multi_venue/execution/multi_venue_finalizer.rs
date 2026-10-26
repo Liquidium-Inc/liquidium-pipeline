@@ -89,7 +89,7 @@ impl<'a> MultiVenueFinalizationContext<'a> {
 /// amount-scoped adapter for exactly one persisted leg.
 pub struct MultiVenueFinalizer {
     planner: IcpswapFirstPlanner,
-    pub(super) venues: Arc<VenueRegistry>,
+    venues: Arc<VenueRegistry>,
     watchdog: Arc<dyn Watchdog>,
     recovery: Option<RecoverySweepRuntime>,
 }
@@ -295,7 +295,12 @@ impl MultiVenueFinalizer {
 
     /// The single point where a finalization envelope reaches the WAL. Callers
     /// stage their payload transition into `wrapper` first.
-    pub(super) async fn persist_wrapper(
+    /// The adapter registered for a venue id.
+    pub(crate) fn venue_adapter(&self, venue_id: &str) -> Option<&dyn MultiVenueAdapter> {
+        self.venues.adapter(venue_id)
+    }
+
+    pub(crate) async fn persist_wrapper(
         &self,
         wal: &dyn WalStore,
         row: &mut crate::persistance::LiqResultRecord,
@@ -831,7 +836,7 @@ pub(super) fn apply_progress(leg: &mut VenueLegState, progress: VenueLegProgress
     Ok(())
 }
 
-pub(super) fn derive_outcome(legs: &[VenueLegState]) -> MultiVenueExecutionOutcome {
+pub(crate) fn derive_outcome(legs: &[VenueLegState]) -> MultiVenueExecutionOutcome {
     // A runnable leg outranks a parked one. `OperatorRequired` drops the row out
     // of the pending queue, so reporting it while a sibling still has an open
     // order would leave that leg with nothing polling it until a human requeues
@@ -872,7 +877,7 @@ pub(super) fn derive_outcome(legs: &[VenueLegState]) -> MultiVenueExecutionOutco
     }
 }
 
-pub(super) fn set_meta_v2(wrapper: &mut LiqMetaWrapper, state: &MultiVenueExecutionState) -> Result<(), String> {
+pub(crate) fn set_meta_v2(wrapper: &mut LiqMetaWrapper, state: &MultiVenueExecutionState) -> Result<(), String> {
     let meta = FinalizerMetaV2 {
         version: FINALIZER_META_V2_VERSION,
         payload: FinalizerMetaPayload::MultiVenueSwap(state.clone()),

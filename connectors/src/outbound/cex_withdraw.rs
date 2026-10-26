@@ -1,15 +1,15 @@
-//! MEXC withdrawals as outbound sends. The order id exists before the
+//! Exchange withdrawals as outbound sends. The order id exists before the
 //! request, so the withdraw history decides a request whose reply was lost.
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use liquidium_pipeline_connectors::backend::cex_backend::{CexBackend, WithdrawStatus};
+use crate::backend::cex_backend::{CexBackend, WithdrawStatus};
 use liquidium_pipeline_core::outbound::{
     OutboundIntent, OutboundSender, PreparedSend, SendOutcome, is_side_effect_ambiguous,
 };
 use serde::{Deserialize, Serialize};
 
-pub(super) const NAME: &str = "mexc-withdraw";
+pub const NAME: &str = "mexc-withdraw";
 
 /// MEXC lists an accepted request within seconds. A request that stays
 /// absent for this long needs an operator.
@@ -17,7 +17,7 @@ const OPEN_WINDOW_SECS: i64 = 15 * 60;
 
 /// One withdrawal request, saved before it is sent.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub(super) struct WithdrawRequest {
+pub struct WithdrawRequest {
     pub asset: String,
     pub network: String,
     pub address: String,
@@ -27,7 +27,7 @@ pub(super) struct WithdrawRequest {
 
 /// What the leg keeps from an accepted request.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(super) struct AcceptedWithdrawal {
+pub struct AcceptedWithdrawal {
     /// The MEXC id, or our order id when only the history found the request.
     /// The history lookup matches either.
     pub id: String,
@@ -37,7 +37,7 @@ pub(super) struct AcceptedWithdrawal {
 
 impl AcceptedWithdrawal {
     /// Reads a receipt. An operator gives a bare MEXC id.
-    pub(super) fn parse(receipt: &str) -> Self {
+    pub fn parse(receipt: &str) -> Self {
         serde_json::from_str(receipt).unwrap_or_else(|_| Self {
             id: receipt.trim().to_string(),
             txid: None,
@@ -49,19 +49,19 @@ impl AcceptedWithdrawal {
     }
 }
 
-pub(super) struct MexcWithdrawals<B> {
+pub struct CexWithdrawals<B> {
     backend: Arc<B>,
 }
 
-impl<B: CexBackend> MexcWithdrawals<B> {
-    pub(super) fn new(backend: Arc<B>) -> Self {
+impl<B: CexBackend> CexWithdrawals<B> {
+    pub fn new(backend: Arc<B>) -> Self {
         Self { backend }
     }
 }
 
 /// The saved form of a request. The leg builds it from its own state,
 /// because MEXC names the asset and network its own way.
-pub(super) fn prepare_withdraw(request: &WithdrawRequest) -> Result<PreparedSend, String> {
+pub fn prepare_cex_withdraw(request: &WithdrawRequest) -> Result<PreparedSend, String> {
     Ok(PreparedSend {
         sender: NAME.to_string(),
         identity: request.order_id.clone(),
@@ -79,7 +79,7 @@ fn saved_request(prepared: &PreparedSend) -> Result<WithdrawRequest, SendOutcome
 }
 
 #[async_trait]
-impl<B: CexBackend> OutboundSender for MexcWithdrawals<B> {
+impl<B: CexBackend> OutboundSender for CexWithdrawals<B> {
     async fn prepare(&self, _intent: &OutboundIntent) -> Result<PreparedSend, String> {
         Err("a MEXC withdrawal is prepared from the leg state".to_string())
     }

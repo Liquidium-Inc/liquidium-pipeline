@@ -12,7 +12,7 @@ use liquidium_pipeline_connectors::backend::bridge_backend::{
 use liquidium_pipeline_core::outbound::{OutboundIntent, OutboundSender, PreparedSend, SendOutcome};
 use serde::{Deserialize, Serialize};
 
-use crate::finalizers::{bridge_claims::BridgeClaimLookup, bridge_planner::deposit_destination};
+use crate::{bridge::claims::BridgeClaimLookup, finalizers::bridge_planner::deposit_destination};
 
 pub const NAME: &str = "bridge-call";
 
@@ -207,7 +207,7 @@ impl OutboundSender for BridgeCallSender {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::finalizers::bridge_claims::{BridgeClaims, MockBridgeClaimLookup};
+    use crate::bridge::claims::{BridgeClaims, MockBridgeClaimLookup};
     use liquidium_pipeline_connectors::backend::bridge_backend::{
         BridgeSubmission, BridgeSubmissionCandidate, MockBridgeBackend,
     };

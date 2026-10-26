@@ -3,7 +3,8 @@ use std::sync::Arc;
 use crate::{
     config::ConfigTrait,
     context::PipelineContext,
-    finalizers::{bridge_runtime::BridgeRuntime, mexc::mexc_finalizer::MexcFinalizer},
+    bridge::runtime::BridgeRuntime,
+    finalizers::mexc::mexc_finalizer::MexcFinalizer,
     swappers::mexc::mexc_adapter::MexcClient,
 };
 

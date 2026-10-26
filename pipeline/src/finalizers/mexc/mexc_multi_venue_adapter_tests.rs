@@ -427,7 +427,7 @@ fn after_restart(cex: CexState) -> MexcVenueExecutionState {
 fn deposit_poll_finalizer(
     bridge: liquidium_pipeline_connectors::backend::bridge_backend::MockBridgeBackend,
 ) -> MexcFinalizer<MockCexBackend> {
-    finalizer().with_bridge_runtime(crate::finalizers::bridge_runtime::BridgeRuntime::for_tests(Arc::new(bridge)))
+    finalizer().with_bridge_runtime(crate::bridge::runtime::BridgeRuntime::for_tests(Arc::new(bridge)))
 }
 
 fn amount_check_request(token: ChainToken, raw: u64) -> SwapRequest {
@@ -1176,10 +1176,10 @@ mod bridged_deposit_restart {
     //! A restart resumes a bridged deposit without its gate: the bridge call
     //! is saved before it runs, and a saved call only settles from then on.
     use super::*;
-    use crate::finalizers::bridge_calls::{BridgeCall, prepare_bridge_call};
-    use crate::finalizers::bridge_claims::{BridgeClaims, MockBridgeClaimLookup};
-    use crate::finalizers::cex_finalizer::{LegacyBridgeSubmitAttempt, LegacyBridgeSubmitPhase};
-    use crate::finalizers::outbound::{OperatorDecision, OutboundPhase, OutboundRecord};
+    use crate::bridge::call_sender::{BridgeCall, prepare_bridge_call};
+    use crate::bridge::claims::{BridgeClaims, MockBridgeClaimLookup};
+    use crate::bridge::legacy::{LegacyBridgeSubmitAttempt, LegacyBridgeSubmitPhase};
+    use crate::outbound::driver::{OperatorDecision, OutboundPhase, OutboundRecord};
     use liquidium_pipeline_connectors::backend::bridge_backend::{
         BridgeFeeBudget, BridgeSubmissionCandidate, MockBridgeBackend,
     };
@@ -1256,7 +1256,7 @@ mod bridged_deposit_restart {
         let mut claims = MockBridgeClaimLookup::new();
         claims.expect_claims_since().returning(|_| Ok(BridgeClaims::default()));
         finalizer().with_bridge_runtime(
-            crate::finalizers::bridge_runtime::BridgeRuntime::for_tests(Arc::new(bridge)).with_claims(Arc::new(claims)),
+            crate::bridge::runtime::BridgeRuntime::for_tests(Arc::new(bridge)).with_claims(Arc::new(claims)),
         )
     }
 
@@ -1397,7 +1397,7 @@ mod bridged_deposit_restart {
 
 #[tokio::test]
 async fn a_saved_funding_transfer_resumes_after_a_restart_only_when_a_replay_is_safe() {
-    use crate::finalizers::outbound::{OutboundPhase, OutboundRecord};
+    use crate::outbound::driver::{OutboundPhase, OutboundRecord};
     use liquidium_pipeline_core::outbound::{MockOutboundSender, PreparedSend, SendOutcome};
 
     for replay_safe in [true, false] {
@@ -1470,7 +1470,7 @@ impl VenueLegCheckpoint for RecordingCheckpoint {
 
 #[tokio::test]
 async fn a_saved_withdrawal_is_written_then_sent_in_one_cycle_and_a_crash_settles_it_by_lookup() {
-    use crate::finalizers::outbound::OutboundPhase;
+    use crate::outbound::driver::OutboundPhase;
     use liquidium_pipeline_connectors::backend::cex_backend::WithdrawalReceipt;
     let decode = |progress: &VenueLegProgress| -> MexcVenueExecutionState {
         progress.execution.decode(VENUE_ID).unwrap().unwrap()

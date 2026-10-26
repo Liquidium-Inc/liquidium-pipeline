@@ -851,7 +851,7 @@ mod tests {
 
     #[tokio::test]
     async fn reconcile_requests_reach_the_console_and_keep_the_report() {
-        use crate::finalizers::outbound::OperatorDecision;
+        use crate::outbound::driver::OperatorDecision;
         use crate::operator::{ReconcileAction, ReconcileRequest};
         let tmp = TempDir::new().expect("tmp");
         if skip_if_uds_unsupported(&tmp) {

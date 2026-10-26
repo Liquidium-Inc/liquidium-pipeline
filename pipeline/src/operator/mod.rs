@@ -1,9 +1,13 @@
 //! The daemon's operator API: requests about parked rows that the control
 //! socket carries, and the console inside the daemon that serves them.
+mod desk;
+
 use async_trait::async_trait;
+
+pub use desk::OperatorDesk;
 use serde::{Deserialize, Serialize};
 
-use crate::finalizers::outbound::OperatorDecision;
+use crate::outbound::driver::OperatorDecision;
 
 /// One operator request about one row.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

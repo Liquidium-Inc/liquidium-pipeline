@@ -546,7 +546,7 @@ impl MultiVenueAdapter for ScriptedAdapter {
     fn operator_release(
         &self,
         _leg: &VenueLegState,
-        answer: Option<&crate::finalizers::outbound::OperatorDecision>,
+        answer: Option<&crate::outbound::driver::OperatorDecision>,
     ) -> Result<VenueExecutionState, String> {
         match (&self.operator_question, answer) {
             (Some(question), None) => Err(format!("leg waits for an answer: {question}")),
@@ -838,7 +838,7 @@ async fn recovery_transfer_is_persisted_as_ready_before_it_is_submitted() {
 
 mod cketh_bridge_minimum {
     use super::*;
-    use crate::finalizers::{bridge_runtime::BridgeRuntime, mexc::mexc_finalizer::MexcFinalizer};
+    use crate::{bridge::runtime::BridgeRuntime, finalizers::mexc::mexc_finalizer::MexcFinalizer};
     use liquidium_pipeline_connectors::backend::{
         bridge_backend::{BridgeFeeBudget, MockBridgeBackend},
         cex_backend::MockCexBackend,
@@ -2011,7 +2011,7 @@ async fn reenqueuing_the_parent_row_does_not_rearm_an_operator_required_mexc_leg
 
 #[tokio::test]
 async fn reconcile_answers_a_parked_leg_and_queues_the_row_again() {
-    use crate::finalizers::{multi_venue::OperatorDesk, outbound::OperatorDecision};
+    use crate::{operator::OperatorDesk, outbound::driver::OperatorDecision};
     use crate::operator::{OperatorConsole, ReconcileAction, ReconcileRequest};
     const LIQUIDATION_ID: u128 = 809;
     let wal = Arc::new(BatchWal::new([receipt_with_id(LIQUIDATION_ID)]));

@@ -20,16 +20,15 @@ use crate::{
     context::{PipelineContext, init_context},
     control_plane::acquire_daemon_instance,
     executors::basic::basic_executor::BasicExecutor,
+    bridge::{claims::WalBridgeClaims, runtime::BridgeRuntime},
     finalizers::{
-        bridge_claims::WalBridgeClaims,
-        bridge_runtime::BridgeRuntime,
         mexc::runtime::build_mexc_finalizer,
         multi_venue::{
             ICPSWAP_VENUE_ID, IcpswapFirstPlannerConfig, MEXC_VENUE_ID, MultiVenueAdapter, MultiVenueFinalizer,
-            OperatorDesk,
         },
         profit_calculator::SimpleProfitCalculator,
     },
+    operator::OperatorDesk,
     liquidation::collateral_service::CollateralService,
     persistance::{
         FinalizerMetaPayload, LiquidationIntentStore, MultiVenueExecutionOutcome, ResultStatus, VenueLegStatus,

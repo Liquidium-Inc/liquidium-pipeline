@@ -30,7 +30,7 @@ use tokio::sync::Mutex as TokioMutex;
 use tokio::time::sleep;
 
 use super::mexc_utils::{LIQUIDITY_EPS, SlicePreview, TradeLeg, is_usd_stable_symbol, mexc_special_trade_legs};
-use super::mexc_withdraw_sender::{AcceptedWithdrawal, MexcWithdrawals, WithdrawRequest, prepare_withdraw};
+use liquidium_pipeline_connectors::outbound::{AcceptedWithdrawal, CexWithdrawals, WithdrawRequest, prepare_cex_withdraw};
 
 pub(super) const WITHDRAW_BRIDGE_SOURCE_BALANCE_TOLERANCE: f64 = LIQUIDITY_EPS;
 const NATIVE_ETH_BRIDGEABLE_SAFETY_MARGIN: f64 = 1e-15;
@@ -46,10 +46,10 @@ const DIRECT_WITHDRAW_DELIVERY_TIMEOUT_SECS: i64 = 60 * 60;
 const DEPOSIT_NOTICE_WINDOW_SECS: i64 = 30 * 60;
 
 use crate::{
+    bridge::runtime::BridgeRuntime,
     finalizers::bridge_planner::BridgePlanner,
-    finalizers::outbound::{OutboundRecord, step_outbound},
-    finalizers::bridge_runtime::BridgeRuntime,
     finalizers::cex_finalizer::{CexFinalizerLogic, CexRoutePreview, CexState, CexStep},
+    outbound::driver::{OutboundRecord, step_outbound},
     stages::bridge_submit_lock::acquire_bridge_submit_lock,
     stages::executor::ExecutionReceipt,
     swappers::{
@@ -492,11 +492,11 @@ where
                 amount,
                 order_id: Self::withdraw_order_id(state),
             };
-            state.withdraw.withdraw_send = Some(OutboundRecord::prepared(prepare_withdraw(&request)?));
+            state.withdraw.withdraw_send = Some(OutboundRecord::prepared(prepare_cex_withdraw(&request)?));
             state.send_saved = true;
             return Ok(None);
         }
-        let sender = MexcWithdrawals::new(self.backend.clone());
+        let sender = CexWithdrawals::new(self.backend.clone());
         match step_outbound(&mut state.withdraw.withdraw_send, &sender, None, now_ts()).await {
             Ok(landed) => Ok(landed.as_deref().map(AcceptedWithdrawal::parse)),
             Err(error) if is_mexc_withdraw_below_min_error(&error) => {

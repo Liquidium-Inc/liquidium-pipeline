@@ -935,9 +935,9 @@ async fn mexc_deposit_bridge_submit_resume_and_complete() {
         .deposit_bridge_call
         .clone()
         .expect("the call must be saved before it runs");
-    assert_eq!(saved.phase, crate::finalizers::outbound::OutboundPhase::Prepared);
+    assert_eq!(saved.phase, crate::outbound::driver::OutboundPhase::Prepared);
     assert!(saved.prepared.identity.starts_with("bridge-call-"), "{}", saved.prepared.identity);
-    let call = crate::finalizers::bridge_calls::saved_call(&saved.prepared).unwrap();
+    let call = crate::bridge::call_sender::saved_call(&saved.prepared).unwrap();
     assert_eq!(call.cursor, Some(100));
     assert_eq!(call.destination, "0x1111111111111111111111111111111111111111");
     assert!((call.amount - 0.92).abs() < 1e-9);
@@ -6277,12 +6277,12 @@ async fn mexc_cksol_repayment_waits_for_funding_reserves_fees_and_records_mint()
 
 /// A claim registry that answers each scan with the next list of open sends.
 fn open_deposit_sends(
-    scans: Vec<Vec<crate::finalizers::bridge_claims::OpenDepositSend>>,
-) -> crate::finalizers::bridge_claims::MockBridgeClaimLookup {
+    scans: Vec<Vec<crate::bridge::claims::OpenDepositSend>>,
+) -> crate::bridge::claims::MockBridgeClaimLookup {
     let scans = std::sync::Mutex::new(scans.into_iter());
-    let mut claims = crate::finalizers::bridge_claims::MockBridgeClaimLookup::new();
+    let mut claims = crate::bridge::claims::MockBridgeClaimLookup::new();
     claims.expect_claims_since().returning(move |_| {
-        Ok(crate::finalizers::bridge_claims::BridgeClaims {
+        Ok(crate::bridge::claims::BridgeClaims {
             open_deposit_sends: scans.lock().unwrap().next().expect("unexpected claim scan"),
             ..Default::default()
         })
@@ -6292,7 +6292,7 @@ fn open_deposit_sends(
 
 #[tokio::test]
 async fn mexc_cksol_return_waits_while_another_row_has_an_open_sol_deposit() {
-    use crate::finalizers::bridge_claims::OpenDepositSend;
+    use crate::bridge::claims::OpenDepositSend;
     let send = |liq_id: &str, asset: &str| OpenDepositSend {
         liq_id: liq_id.into(),
         asset: asset.into(),
@@ -6409,7 +6409,7 @@ async fn mexc_cksol_dropped_sweep_is_notified_again_without_a_new_send() {
 
 #[test]
 fn a_saved_deposit_send_resumes_after_a_restart_only_when_a_replay_is_safe() {
-    use crate::finalizers::outbound::{OutboundPhase, OutboundRecord};
+    use crate::outbound::driver::{OutboundPhase, OutboundRecord};
     use liquidium_pipeline_core::outbound::PreparedSend;
     let finalizer = cksol_finalizer(MockCexBackend::new(), MockBridgeBackend::new());
     let mut state = cksol_repayment_state(&finalizer, 1.5);
@@ -6944,10 +6944,10 @@ mod saved_bridge_call {
     //! A deposit bridge call is saved before it runs, and a lost answer is
     //! settled from the provider history before any new call.
     use super::*;
-    use crate::finalizers::bridge_calls::{BridgeCall, OpenBridgeCall, prepare_bridge_call};
-    use crate::finalizers::bridge_claims::{BridgeClaims, MockBridgeClaimLookup};
-    use crate::finalizers::cex_finalizer::{LegacyBridgeSubmitAttempt, LegacyBridgeSubmitPhase};
-    use crate::finalizers::outbound::{OperatorDecision, OutboundPhase, OutboundRecord};
+    use crate::bridge::call_sender::{BridgeCall, OpenBridgeCall, prepare_bridge_call};
+    use crate::bridge::claims::{BridgeClaims, MockBridgeClaimLookup};
+    use crate::bridge::legacy::{LegacyBridgeSubmitAttempt, LegacyBridgeSubmitPhase};
+    use crate::outbound::driver::{OperatorDecision, OutboundPhase, OutboundRecord};
     use crate::utils::now_ts;
     use liquidium_pipeline_connectors::backend::bridge_backend::BridgeSubmissionCandidate;
     use liquidium_pipeline_core::outbound::SIDE_EFFECT_AMBIGUOUS_PREFIX;
@@ -7394,7 +7394,7 @@ mod uncertain_side_effects {
     use super::*;
     use liquidium_pipeline_core::outbound::SIDE_EFFECT_AMBIGUOUS_PREFIX;
     use liquidium_pipeline_connectors::backend::cex_backend::{WithdrawStatusSnapshot, WithdrawalReceipt};
-    use crate::finalizers::outbound::{OperatorDecision, OutboundPhase, OutboundRecord};
+    use crate::outbound::driver::{OperatorDecision, OutboundPhase, OutboundRecord};
     use liquidium_pipeline_core::outbound::{MockOutboundSender, PreparedSend, SendOutcome};
 
     fn finalizer(cex: MockCexBackend, transfers: MockTransferActions) -> MexcFinalizer<MockCexBackend> {
@@ -7760,7 +7760,7 @@ mod uncertain_side_effects {
 
 mod operator_answers {
     use super::*;
-    use crate::finalizers::outbound::{OperatorDecision, OutboundPhase, OutboundRecord};
+    use crate::outbound::driver::{OperatorDecision, OutboundPhase, OutboundRecord};
     use liquidium_pipeline_core::outbound::PreparedSend;
 
     type Mexc = MexcFinalizer<MockCexBackend>;
@@ -7836,7 +7836,7 @@ mod operator_answers {
     fn a_parked_bridge_call_takes_the_found_handle_as_its_decision() {
         let mut state = state();
         let mut call = parked_send();
-        call.prepared.sender = crate::finalizers::bridge_calls::NAME.into();
+        call.prepared.sender = crate::bridge::call_sender::NAME.into();
         call.prepared.identity = "bridge-call-1".into();
         call.prepared.replay_safe = false;
         state.deposit.bridge.deposit_bridge_call = Some(call);

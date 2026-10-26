@@ -6,7 +6,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use tracing::info;
 
-use super::multi_venue_finalizer::{MultiVenueFinalizer, derive_outcome, set_meta_v2};
+use crate::finalizers::multi_venue::{MultiVenueFinalizer, derive_outcome, set_meta_v2};
 use crate::{
     finalizers::multi_venue::MultiVenueAdapter,
     operator::{OperatorConsole, ReconcileAction, ReconcileRequest},
@@ -90,8 +90,7 @@ impl MultiVenueFinalizer {
     }
 
     fn operator_adapter(&self, venue_id: &str) -> Result<&dyn MultiVenueAdapter, String> {
-        self.venues
-            .adapter(venue_id)
+        self.venue_adapter(venue_id)
             .ok_or_else(|| format!("no adapter for venue `{venue_id}`"))
     }
 

@@ -25,7 +25,7 @@ use liquidium_pipeline_connectors::outbound::{EvmSender, SignedSendRouter, Solan
 use liquidium_pipeline_core::outbound::OutboundSender;
 use solana_sdk::{signature::Keypair, signer::Signer};
 
-use crate::{config::Config, finalizers::bridge_claims::BridgeClaimLookup};
+use crate::{config::Config, bridge::claims::BridgeClaimLookup};
 
 /// The account the bridge spends from on each chain.
 #[derive(Debug, Clone)]
@@ -169,7 +169,7 @@ impl BridgeRuntime {
                 btc: "bc1qbridge000000000000000000000000000000000".to_string(),
                 solana: "So11111111111111111111111111111111111111112".to_string(),
             },
-            claims: Arc::new(crate::finalizers::bridge_claims::MockBridgeClaimLookup::new()),
+            claims: Arc::new(crate::bridge::claims::MockBridgeClaimLookup::new()),
             outbound: Arc::new(liquidium_pipeline_core::outbound::MockOutboundSender::new()),
         }
     }

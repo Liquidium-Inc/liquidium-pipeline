@@ -1,10 +1,12 @@
 //! One `OutboundSender` per chain, and a router that picks the sender.
+mod cex_withdraw;
 mod evm;
 mod icp;
 mod router;
 mod solana;
 mod unsettled;
 
+pub use cex_withdraw::{AcceptedWithdrawal, CexWithdrawals, WithdrawRequest, prepare_cex_withdraw};
 pub use evm::EvmSender;
 pub(crate) use evm::prepared_send as evm_prepared_send;
 pub use icp::IcpSender;

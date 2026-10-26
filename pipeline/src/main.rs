@@ -4,8 +4,10 @@ mod constants;
 mod context;
 mod executors;
 mod finalizers;
+mod bridge;
 mod liquidation;
 mod operator;
+mod outbound;
 mod output;
 mod persistance;
 mod price_oracle;
@@ -30,7 +32,7 @@ use std::process::ExitCode;
 use std::time::{Duration, SystemTime};
 
 use crate::commands::liquidation_loop::run_liquidation_loop;
-use crate::finalizers::outbound::OperatorDecision;
+use crate::outbound::driver::OperatorDecision;
 use crate::operator::{ReconcileAction, ReconcileRequest};
 
 #[derive(Parser)]

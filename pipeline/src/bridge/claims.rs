@@ -8,11 +8,11 @@ use async_trait::async_trait;
 use serde_json::{Map, Value};
 
 use crate::{
-    finalizers::{
-        bridge_calls::{self, OpenBridgeCall},
-        cex_finalizer::LegacyBridgeSubmitPhase,
-        outbound::OutboundRecord,
+    bridge::{
+        call_sender::{self, OpenBridgeCall},
+        legacy::LegacyBridgeSubmitPhase,
     },
+    outbound::driver::OutboundRecord,
     persistance::{LiqResultRecord, ResultStatus, WalStore},
 };
 
@@ -97,10 +97,10 @@ impl WalBridgeClaims {
 
 fn open_bridge_call(value: &Value) -> Option<OpenBridgeCall> {
     let record = serde_json::from_value::<OutboundRecord>(value.clone()).ok()?;
-    if record.prepared.sender != bridge_calls::NAME {
+    if record.prepared.sender != call_sender::NAME {
         return None;
     }
-    let call = bridge_calls::saved_call(&record.prepared).ok()?;
+    let call = call_sender::saved_call(&record.prepared).ok()?;
     Some(OpenBridgeCall {
         id: record.prepared.identity,
         call,
@@ -253,7 +253,7 @@ mod tests {
 
     #[tokio::test]
     async fn claims_list_saved_bridge_calls_as_open_calls() {
-        use crate::finalizers::bridge_calls::{BridgeCall, prepare_bridge_call};
+        use crate::bridge::call_sender::{BridgeCall, prepare_bridge_call};
         let call = BridgeCall {
             asset: "ckUSDC".into(),
             source_chain: "ICP".into(),

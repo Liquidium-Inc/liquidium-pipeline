@@ -14,13 +14,16 @@ use super::mexc_finalizer::{
     WITHDRAW_BRIDGE_SOURCE_BALANCE_TOLERANCE, nat_to_units,
 };
 use crate::{
-    finalizers::{
-        bridge_calls::{BridgeCall, BridgeCallSender, prepare_bridge_call},
-        bridge_planner::BridgePlanner,
-        bridge_runtime::BridgeRuntime,
-        cex_finalizer::{CexState, CexStep, LegacyBridgeSubmitPhase},
-        outbound::{OutboundPhase, OutboundRecord, step_outbound},
+    bridge::{
+        call_sender::{BridgeCall, BridgeCallSender, prepare_bridge_call},
+        legacy::LegacyBridgeSubmitPhase,
+        runtime::BridgeRuntime,
     },
+    finalizers::{
+        bridge_planner::BridgePlanner,
+        cex_finalizer::{CexState, CexStep},
+    },
+    outbound::driver::{OutboundPhase, OutboundRecord, step_outbound},
     stages::bridge_submit_lock::acquire_bridge_submit_lock,
     utils::now_ts,
 };

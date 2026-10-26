@@ -10,7 +10,7 @@ use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, Wrap};
 use serde::Deserialize;
 use serde_json::Value;
 
-use crate::finalizers::cex_finalizer::LegacyBridgeSubmitPhase;
+use crate::bridge::legacy::LegacyBridgeSubmitPhase;
 use crate::finalizers::liquidation_outcome::LiquidationOutcome;
 use crate::finalizers::multi_venue::MEXC_VENUE_ID;
 use crate::persistance::{
@@ -550,9 +550,9 @@ fn append_mexc_leg_transactions(lines: &mut Vec<Line<'static>>, execution: &Venu
 /// One line an operator can act on: what to look for on the provider, and
 /// whether the call may have run.
 fn describe_bridge_call(record: &Value) -> String {
-    use crate::finalizers::{
-        bridge_calls::saved_call,
-        outbound::{OutboundPhase, OutboundRecord},
+    use crate::{
+        bridge::call_sender::saved_call,
+        outbound::driver::{OutboundPhase, OutboundRecord},
     };
     let Ok(record) = serde_json::from_value::<OutboundRecord>(record.clone()) else {
         return truncate(&record.to_string(), 80);

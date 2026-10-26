@@ -8,7 +8,7 @@ use tokio::time::timeout;
 
 use super::app::App;
 use crate::control_plane::send_reconcile;
-use crate::finalizers::outbound::OperatorDecision;
+use crate::outbound::driver::OperatorDecision;
 use crate::operator::{ReconcileAction, ReconcileRequest};
 
 const RECONCILE_TIMEOUT: Duration = Duration::from_secs(5);
