@@ -27,7 +27,7 @@ use num_traits::ToPrimitive;
 
 use crate::liquidation::liquidation_math::oracle_implied_output;
 use crate::swappers::model::{BASIS_POINTS_DENOMINATOR, SwapRequest, amount_after_bps_haircut};
-use crate::utils::{ICP_LEDGER_PRINCIPAL, max_for_ledger, now_ts};
+use crate::utils::{ICP_LEDGER_PRINCIPAL, approval_threshold, now_ts};
 use crate::watchdog::{Watchdog, WatchdogEvent, noop_watchdog};
 use async_trait::async_trait;
 
@@ -115,7 +115,7 @@ where
             return false;
         };
 
-        let threshold = max_for_ledger(ledger) / Nat::from(2u8);
+        let threshold = approval_threshold(ledger);
         self.approval_state
             .needs_approval(*ledger, self.config.get_lending_canister(), &threshold)
     }

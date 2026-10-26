@@ -3,13 +3,14 @@ use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use candid::{Encode, Principal};
+use candid::Principal;
 use futures::FutureExt;
 use tracing::{debug, error, info, warn};
 
 use crate::finalizers::finalizer::{Finalizer, FinalizerError, FinalizerResult};
 use crate::finalizers::liquidation_outcome::LiquidationOutcome;
 use crate::finalizers::profit_calculator::ProfitCalculator;
+use crate::liquidation::lending_queries::get_liquidation;
 
 use crate::persistance::{LiqMetaWrapper, ResultStatus, WalProfitSnapshot, WalStore};
 use crate::stage::PipelineStage;
@@ -22,7 +23,7 @@ use crate::wal::{
 };
 use crate::watchdog::{Watchdog, WatchdogEvent, noop_watchdog};
 use liquidium_pipeline_connectors::pipeline_agent::PipelineAgent;
-use liquidium_pipeline_core::types::protocol_types::{LiquidationResult, ProtocolError, TransferStatus};
+use liquidium_pipeline_core::types::protocol_types::TransferStatus;
 
 pub(crate) const MAX_FINALIZER_ERRORS: i32 = 5;
 /// Maximum safe left-shift for `u64` multipliers in retry backoff.
@@ -98,18 +99,6 @@ where
     pub fn with_watchdog(mut self, watchdog: Arc<dyn Watchdog>) -> Self {
         self.watchdog = watchdog;
         self
-    }
-
-    async fn refresh_liquidation(&self, liq_id: u128) -> Result<LiquidationResult, String> {
-        let args = Encode!(&liq_id).map_err(|e| format!("get_liquidation encode error: {e}"))?;
-        let res = self
-            .agent
-            .call_query::<Result<LiquidationResult, ProtocolError>>(&self.lending_canister, "get_liquidation", args)
-            .await?;
-        match res {
-            Ok(liq) => Ok(liq),
-            Err(err) => Err(format!("get_liquidation error: {err:?}")),
-        }
     }
 
     async fn update_receipt_meta(&self, liq_id: &str, receipt: &ExecutionReceipt) -> Result<(), String> {
@@ -269,7 +258,7 @@ where
             let liq_id = liq.id;
 
             if !matches!(liq.collateral_tx.status, TransferStatus::Success) {
-                match self.refresh_liquidation(liq_id).await {
+                match get_liquidation(self.agent.as_ref(), &self.lending_canister, liq_id).await {
                     Ok(fresh) => {
                         if fresh != *liq {
                             receipt.liquidation_result = Some(fresh.clone());
@@ -573,8 +562,8 @@ mod tests {
     use liquidium_pipeline_connectors::pipeline_agent::MockPipelineAgent;
     use liquidium_pipeline_core::tokens::{chain_token::ChainToken, chain_token_amount::ChainTokenAmount};
     use liquidium_pipeline_core::types::protocol_types::{
-        AssetType, LiquidationAmounts, LiquidationRequest, LiquidationResult, LiquidationStatus, TransferStatus,
-        TxStatus,
+        AssetType, LiquidationAmounts, LiquidationRequest, LiquidationResult, LiquidationStatus, ProtocolError,
+        TransferStatus, TxStatus,
     };
     use mockall::predicate::eq;
     use std::sync::{Arc, Mutex};

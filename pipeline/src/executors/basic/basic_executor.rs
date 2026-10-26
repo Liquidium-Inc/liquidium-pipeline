@@ -16,7 +16,11 @@ use tokio::time::timeout;
 
 use liquidium_pipeline_connectors::pipeline_agent::PipelineAgent;
 
-use crate::{approval_state::ApprovalState, persistance::LiquidationIntentStore, utils::max_for_ledger};
+use crate::{
+    approval_state::ApprovalState,
+    persistance::LiquidationIntentStore,
+    utils::{approval_threshold, max_for_ledger},
+};
 
 const ALLOWANCE_LEDGER_TIMEOUT: Duration = Duration::from_secs(20);
 
@@ -83,7 +87,7 @@ impl<A: PipelineAgent, D: LiquidationIntentStore> BasicExecutor<A, D> {
     async fn ensure_lending_allowance_for_ledger(&self, ledger: Principal) -> Result<EnsureAllowanceResult, String> {
         let spender = self.lending_spender();
         let spender_account = self.lending_spender_account();
-        let threshold = self.allowance_threshold(&ledger);
+        let threshold = approval_threshold(&ledger);
         let allowance_before = self.allowance(&ledger, spender_account).await?;
 
         let mut allowance_after = allowance_before.clone();
@@ -205,10 +209,6 @@ impl<A: PipelineAgent, D: LiquidationIntentStore> BasicExecutor<A, D> {
             account.owner.to_text(),
             account.subaccount.is_some()
         )
-    }
-
-    fn allowance_threshold(&self, ledger: &Principal) -> Nat {
-        max_for_ledger(ledger) / Nat::from(2u8)
     }
 
     fn handle_startup_allowance_result(
