@@ -23,6 +23,10 @@ pub trait TokenRegistryTrait: Send + Sync {
     fn collateral_assets(&self) -> Vec<(AssetId, ChainToken)>;
     // Returns all assets that are marked as eligible debt assets.
     fn debt_assets(&self) -> Vec<(AssetId, ChainToken)>;
+    // True when the bot may repay debt in this asset.
+    fn is_debt_asset(&self, id: &AssetId) -> bool;
+    // True when the bot may seize this asset as collateral.
+    fn is_collateral_asset(&self, id: &AssetId) -> bool;
 }
 
 impl TokenRegistry {
@@ -101,5 +105,13 @@ impl TokenRegistryTrait for TokenRegistry {
             .filter(|(id, _)| self.debt_ids.contains(*id))
             .map(|(id, tok)| (id.clone(), tok.clone()))
             .collect()
+    }
+
+    fn is_debt_asset(&self, id: &AssetId) -> bool {
+        self.tokens.contains_key(id) && self.debt_ids.contains(id)
+    }
+
+    fn is_collateral_asset(&self, id: &AssetId) -> bool {
+        self.tokens.contains_key(id) && self.collateral_ids.contains(id)
     }
 }

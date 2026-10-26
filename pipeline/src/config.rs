@@ -402,22 +402,7 @@ impl Config {
         let cex_credentials = load_cex_credentials();
         debug!("Cex credentials loaded...");
 
-        let opportunity_account_filter = match env::var("OPPORTUNITY_ACCOUNT_FILTER") {
-            Ok(value) => {
-                let trimmed = value.trim();
-                if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("none") {
-                    vec![]
-                } else {
-                    trimmed
-                        .split(',')
-                        .map(str::trim)
-                        .filter(|item| !item.is_empty())
-                        .filter_map(|item| Principal::from_text(item).ok())
-                        .collect()
-                }
-            }
-            Err(_) => vec![],
-        };
+        let opportunity_account_filter = parse_account_filter(env::var("OPPORTUNITY_ACCOUNT_FILTER").ok().as_deref())?;
 
         let evm_rpc_url = env::var("EVM_RPC_URL").map_err(|_| "EVM_RPC_URL not configured".to_string())?;
         let solana_rpc_url = env::var("SOLANA_RPC_URL").unwrap_or_else(|_| "https://api.devnet.solana.com".to_string());
@@ -478,6 +463,31 @@ impl Config {
             opportunity_account_filter,
         }))
     }
+}
+
+/// Reads `OPPORTUNITY_ACCOUNT_FILTER`. Unset, empty or `none` scans every
+/// borrower; any other value must be a list of valid principals, because an
+/// empty list means no filter and a typo must not widen the scan.
+fn parse_account_filter(value: Option<&str>) -> Result<Vec<Principal>, String> {
+    let value = value.map(str::trim).unwrap_or_default();
+    if value.is_empty() || value.eq_ignore_ascii_case("none") {
+        return Ok(vec![]);
+    }
+    let accounts = value
+        .split(',')
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .map(|item| {
+            Principal::from_text(item)
+                .map_err(|error| format!("OPPORTUNITY_ACCOUNT_FILTER entry `{item}` is not a principal: {error}"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if accounts.is_empty() {
+        return Err(
+            "OPPORTUNITY_ACCOUNT_FILTER has no principals; set it to `none` to scan every borrower".to_string(),
+        );
+    }
+    Ok(accounts)
 }
 
 fn load_cex_credentials() -> HashMap<String, (String, String)> {
@@ -1386,4 +1396,18 @@ mod tests {
         }
     }
 
+    #[test]
+    fn an_account_filter_with_any_bad_entry_fails_at_startup() {
+        let valid = "h64ya-zt56r-44pvj-pjay2-j47ik-gv222-iw4mq-3wrll-yho5m-kmth4-kae";
+        for unrestricted in [None, Some(""), Some("  "), Some("none"), Some("NONE")] {
+            assert_eq!(parse_account_filter(unrestricted), Ok(vec![]), "{unrestricted:?}");
+        }
+        assert_eq!(
+            parse_account_filter(Some(&format!(" {valid} ,"))),
+            Ok(vec![Principal::from_text(valid).unwrap()])
+        );
+        for invalid in ["not-a-principal", &format!("{valid},typo"), ",", " , ,"] {
+            assert!(parse_account_filter(Some(invalid)).is_err(), "{invalid:?}");
+        }
+    }
 }

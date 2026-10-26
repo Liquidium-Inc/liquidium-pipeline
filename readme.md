@@ -195,7 +195,8 @@ MNEMONIC_FILE=~/.liquidium-pipeline/wallets/key
 DEBT_ASSETS=icp:mxzaz-hqaaa-aaaar-qaada-cai:ckBTC,icp:cngnf-vqaaa-aaaar-qag4q-cai:ckUSDT,icp:xevnm-gaaaa-aaaar-qafnq-cai:ckUSDC,icp:ss2fx-dyaaa-aaaar-qacoq-cai:ckETH,icp:ryjl3-tyaaa-aaaaa-aaaba-cai:ICP,sol:native:SOL,icp:la34w-haaaa-aaaar-qb5na-cai:ckSOL
 COLLATERAL_ASSETS=icp:mxzaz-hqaaa-aaaar-qaada-cai:ckBTC,icp:cngnf-vqaaa-aaaar-qag4q-cai:ckUSDT,icp:xevnm-gaaaa-aaaar-qafnq-cai:ckUSDC,icp:ss2fx-dyaaa-aaaar-qacoq-cai:ckETH,icp:ryjl3-tyaaa-aaaaa-aaaba-cai:ICP,sol:native:SOL,icp:la34w-haaaa-aaaar-qb5na-cai:ckSOL
 
-# Optional: only scan specific borrower principals (comma-separated). Set to "none" to disable.
+# Optional: only scan specific borrower principals (comma-separated). Unset, empty or "none" scans every
+# borrower. Startup fails if any entry is not a valid principal.
 OPPORTUNITY_ACCOUNT_FILTER=principal1,principal2
 ```
 
