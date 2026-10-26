@@ -1,16 +1,53 @@
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use candid::Nat;
 use num_traits::ToPrimitive;
 use solana_client::nonblocking::rpc_client::RpcClient;
 use solana_sdk::{
+    commitment_config::CommitmentConfig,
     instruction::Instruction,
     pubkey::Pubkey,
-    signature::Keypair,
+    signature::{Keypair, Signature},
     signer::Signer,
     transaction::Transaction,
 };
+
+use crate::backend::SIDE_EFFECT_AMBIGUOUS_PREFIX;
+
+/// How long a send without confirmation is checked before it stays open.
+/// A blockhash expires after about 60 seconds and finalizes about 15 later;
+/// the finalizer stage shares its 300-second budget with other rows.
+const UNCONFIRMED_SEND_DEADLINE: Duration = Duration::from_secs(75);
+const UNCONFIRMED_SEND_POLL: Duration = Duration::from_secs(2);
+
+/// What a send without confirmation turned out to be.
+#[derive(Debug, PartialEq, Eq)]
+enum SendOutcome {
+    Landed,
+    FailedOnChain(String),
+    Expired,
+    Open,
+}
+
+/// Decides one status read. `status` is `None` when the read failed, and
+/// `Some(None)` when the cluster does not know the signature. A signature that
+/// is absent after its blockhash expired can no longer land.
+fn decide_send_outcome(
+    status: Option<Option<(bool, Option<String>)>>,
+    finalized_block_height: Option<u64>,
+    last_valid_block_height: u64,
+) -> SendOutcome {
+    match status {
+        Some(Some((true, None))) => SendOutcome::Landed,
+        Some(Some((true, Some(error)))) => SendOutcome::FailedOnChain(error),
+        Some(None) if finalized_block_height.is_some_and(|height| height > last_valid_block_height) => {
+            SendOutcome::Expired
+        }
+        _ => SendOutcome::Open,
+    }
+}
 use solana_system_interface::instruction as system_instruction;
 use spl_associated_token_account::{get_associated_token_address, instruction::create_associated_token_account};
 
@@ -96,9 +133,11 @@ impl SolanaBackendImpl {
             return Err("cannot send empty Solana transaction".to_string());
         }
 
-        let recent_blockhash = self
+        // The send runs its preflight at the client's commitment, so the
+        // blockhash must come from the same bank or the preflight rejects it.
+        let (recent_blockhash, last_valid_block_height) = self
             .rpc
-            .get_latest_blockhash()
+            .get_latest_blockhash_with_commitment(self.rpc.commitment())
             .await
             .map_err(|e| format!("solana get_latest_blockhash failed: {e}"))?;
 
@@ -109,14 +148,64 @@ impl SolanaBackendImpl {
             &[&signer],
             recent_blockhash,
         );
+        let signature = tx.signatures[0];
 
-        let signature = self
-            .rpc
-            .send_and_confirm_transaction(&tx)
-            .await
-            .map_err(|e| format!("solana send_and_confirm_transaction failed: {e}"))?;
+        match self.rpc.send_and_confirm_transaction(&tx).await {
+            Ok(signature) => Ok(signature.to_string()),
+            Err(error) => {
+                self.settle_unconfirmed_send(signature, last_valid_block_height, error.to_string())
+                    .await
+            }
+        }
+    }
 
-        Ok(signature.to_string())
+    /// A failed confirmation does not prove the transaction stayed local. The
+    /// signature is known, so the cluster can say whether it landed; after the
+    /// blockhash expires, an absent signature proves that it never will.
+    async fn settle_unconfirmed_send(
+        &self,
+        signature: Signature,
+        last_valid_block_height: u64,
+        send_error: String,
+    ) -> Result<String, String> {
+        let deadline = Instant::now() + UNCONFIRMED_SEND_DEADLINE;
+        loop {
+            let status = self
+                .rpc
+                .get_signature_statuses_with_history(&[signature])
+                .await
+                .ok()
+                .map(|response| {
+                    response.value.into_iter().next().flatten().map(|status| {
+                        (
+                            status.satisfies_commitment(CommitmentConfig::confirmed()),
+                            status.err.map(|error| error.to_string()),
+                        )
+                    })
+                });
+            let finalized_block_height = self
+                .rpc
+                .get_block_height_with_commitment(CommitmentConfig::finalized())
+                .await
+                .ok();
+            match decide_send_outcome(status, finalized_block_height, last_valid_block_height) {
+                SendOutcome::Landed => return Ok(signature.to_string()),
+                SendOutcome::FailedOnChain(error) => {
+                    return Err(format!("solana transaction {signature} failed on chain and moved no funds: {error}"));
+                }
+                SendOutcome::Expired => {
+                    return Err(format!(
+                        "solana transaction {signature} expired unconfirmed and moved no funds: {send_error}"
+                    ));
+                }
+                SendOutcome::Open if Instant::now() >= deadline => {
+                    return Err(format!(
+                        "{SIDE_EFFECT_AMBIGUOUS_PREFIX}: solana transaction {signature} has no decided answer: {send_error}"
+                    ));
+                }
+                SendOutcome::Open => tokio::time::sleep(UNCONFIRMED_SEND_POLL).await,
+            }
+        }
     }
 
     async fn account_exists(&self, account: &Pubkey) -> Result<bool, String> {
@@ -252,5 +341,31 @@ mod tests {
             "Invalid param: could not find account"
         ));
         assert!(!SolanaBackendImpl::is_missing_account_error("blockhash not found"));
+    }
+}
+
+#[cfg(test)]
+mod send_outcome_tests {
+    use super::*;
+
+    #[test]
+    fn a_send_is_settled_only_by_a_confirmed_status_or_a_proven_expiry() {
+        let last_valid = 100;
+        // The cluster confirmed it: it landed, or it failed and moved nothing.
+        assert_eq!(decide_send_outcome(Some(Some((true, None))), Some(50), last_valid), SendOutcome::Landed);
+        assert_eq!(
+            decide_send_outcome(Some(Some((true, Some("InsufficientFunds".into())))), Some(50), last_valid),
+            SendOutcome::FailedOnChain("InsufficientFunds".into())
+        );
+        // Seen but not confirmed yet: wait.
+        assert_eq!(decide_send_outcome(Some(Some((false, None))), Some(150), last_valid), SendOutcome::Open);
+        // Absent after the finalized height passed the blockhash: it never landed.
+        assert_eq!(decide_send_outcome(Some(None), Some(101), last_valid), SendOutcome::Expired);
+        // Absent before expiry, or at the last valid height: it still can land.
+        assert_eq!(decide_send_outcome(Some(None), Some(100), last_valid), SendOutcome::Open);
+        assert_eq!(decide_send_outcome(Some(None), Some(80), last_valid), SendOutcome::Open);
+        // A failed read proves nothing, even after expiry.
+        assert_eq!(decide_send_outcome(None, Some(500), last_valid), SendOutcome::Open);
+        assert_eq!(decide_send_outcome(Some(None), None, last_valid), SendOutcome::Open);
     }
 }

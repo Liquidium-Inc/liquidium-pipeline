@@ -71,13 +71,13 @@ pub struct CexDepositState {
     pub deposit_sent_at_ts: Option<i64>,
     #[serde(default)]
     pub approval_bump_count: Option<u32>,
+    /// `created_at_time` of the funding transfer, kept for its retries. An ICP
+    /// ledger answers a repeat with the first block instead of moving funds.
+    #[serde(default)]
+    pub deposit_transfer_created_at_ns: Option<u64>,
     #[serde(flatten)]
     pub bridge: CexDepositBridgeState,
 }
-
-/// A deposit step that parks for an operator because the bridge provider
-/// cannot say whether a lost attempt was submitted.
-pub const BRIDGE_SUBMISSION_AMBIGUOUS_PREFIX: &str = "bridge_submission_ambiguous";
 
 /// Where a bridged deposit stands before its handle exists. Persisted before
 /// the bridge call, so a restart can tell "never submitted" from "handle lost".
@@ -253,9 +253,25 @@ pub struct CexWithdrawState {
     /// When MEXC accepted a direct withdrawal that had no transaction id yet.
     #[serde(default)]
     pub withdraw_accepted_at_ts: Option<i64>,
+    /// Bumped after each refused request, so a new request gets a new order id.
+    #[serde(default)]
+    pub withdraw_attempt: u32,
+    /// Set when the last request had no decided answer. `withdraw_id` then
+    /// holds our order id, and only an exchange record or an operator confirms it.
+    #[serde(default)]
+    pub withdraw_uncertain: Option<UncertainWithdraw>,
     pub size_out: Option<ChainTokenAmount>,
     #[serde(flatten)]
     pub bridge: CexWithdrawBridgeState,
+}
+
+/// A withdrawal request that got no decided answer.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum UncertainWithdraw {
+    /// The leg polls its order id in the exchange history.
+    Polling,
+    /// The leg parked on it. The next run counts as an operator's release.
+    Parked,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -674,6 +690,7 @@ mod tests {
                     deposit_balance_before: None,
                     deposit_sent_at_ts: None,
                     approval_bump_count: None,
+                    deposit_transfer_created_at_ns: None,
                     bridge: CexDepositBridgeState {
                         deposit_planned_asset: None,
                         deposit_planned_network: None,
@@ -721,6 +738,8 @@ mod tests {
                     withdraw_id: None,
                     withdraw_txid: None,
                     withdraw_accepted_at_ts: None,
+                    withdraw_attempt: 0,
+                    withdraw_uncertain: None,
                     size_out: None,
                     bridge: CexWithdrawBridgeState {
                         withdraw_planned_asset: None,
@@ -831,6 +850,7 @@ mod tests {
                     deposit_balance_before: None,
                     deposit_sent_at_ts: None,
                     approval_bump_count: None,
+                    deposit_transfer_created_at_ns: None,
                     bridge: CexDepositBridgeState {
                         deposit_planned_asset: None,
                         deposit_planned_network: None,
@@ -878,6 +898,8 @@ mod tests {
                     withdraw_id: None,
                     withdraw_txid: None,
                     withdraw_accepted_at_ts: None,
+                    withdraw_attempt: 0,
+                    withdraw_uncertain: None,
                     size_out: None,
                     bridge: CexWithdrawBridgeState {
                         withdraw_planned_asset: None,

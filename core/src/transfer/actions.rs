@@ -58,6 +58,21 @@ pub trait TransferActions: Send + Sync {
         amount_native: Nat,
     ) -> Result<String, TransferFailure>; // return tx hash/id
 
+    /// `transfer` with a caller-chosen `created_at_time`, in nanoseconds. ICP
+    /// ledgers answer a repeat of the same arguments with the first block, so a
+    /// retry after a lost reply cannot move the funds twice. Other chains do
+    /// not deduplicate and fall back to `transfer`.
+    async fn transfer_deduplicated(
+        &self,
+        token: &ChainToken,
+        to: &ChainAccount,
+        amount_native: Nat,
+        created_at_time_nanos: u64,
+    ) -> Result<String, TransferFailure> {
+        let _ = created_at_time_nanos;
+        self.transfer(token, to, amount_native).await
+    }
+
     // Optional ICRC-2-style approval for the current account (used to bump ledger activity).
     async fn approve(&self, token: &ChainToken, spender: &ChainAccount, amount_native: Nat) -> Result<String, String>;
 }

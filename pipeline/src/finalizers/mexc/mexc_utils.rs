@@ -1,5 +1,13 @@
 pub(super) use crate::swappers::model::{LIQUIDITY_EPS, f64_to_nat};
 
+/// Stable 64-bit FNV-1a. Exchange ids derived from it must not change
+/// between releases, so the std hasher is not an option.
+pub(super) fn fnv1a_64(value: &str) -> u64 {
+    value.bytes().fold(0xcbf29ce484222325, |hash, byte| {
+        (hash ^ byte as u64).wrapping_mul(0x100000001b3)
+    })
+}
+
 /// One market leg in a routed CEX trade.
 #[derive(Debug, Clone)]
 pub(crate) struct TradeLeg {

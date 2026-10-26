@@ -55,6 +55,7 @@ where
                 deposit_balance_before: None,
                 deposit_sent_at_ts: None,
                 approval_bump_count: None,
+                deposit_transfer_created_at_ns: None,
                 bridge: CexDepositBridgeState {
                     deposit_planned_asset: Some(bridge_plan.deposit.cex_asset),
                     deposit_planned_network: Some(bridge_plan.deposit.cex_network),
@@ -102,6 +103,8 @@ where
                 withdraw_id: None,
                 withdraw_txid: None,
                 withdraw_accepted_at_ts: None,
+                withdraw_attempt: 0,
+                withdraw_uncertain: None,
                 size_out: None,
                 bridge: CexWithdrawBridgeState {
                     withdraw_planned_asset: Some(bridge_plan.withdraw.cex_asset),

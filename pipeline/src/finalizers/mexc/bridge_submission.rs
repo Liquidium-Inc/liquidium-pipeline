@@ -5,6 +5,7 @@ use candid::Nat;
 use liquidium_pipeline_connectors::backend::bridge_backend::{
     BRIDGE_SUBMISSION_DEFERRED_PREFIX, BridgeFeeBudget, BridgeRequest, BridgeRouteKind, BridgeRouteSpec,
 };
+use liquidium_pipeline_connectors::backend::SIDE_EFFECT_AMBIGUOUS_PREFIX;
 use liquidium_pipeline_connectors::backend::cex_backend::CexBackend;
 use log::{debug, info, warn};
 
@@ -17,7 +18,7 @@ use crate::{
         bridge_planner::BridgePlanner,
         bridge_runtime::BridgeRuntime,
         cex_finalizer::{
-            BRIDGE_SUBMISSION_AMBIGUOUS_PREFIX, BridgeSubmitAttempt, BridgeSubmitPhase, CexState, CexStep,
+            BridgeSubmitAttempt, BridgeSubmitPhase, CexState, CexStep,
         },
     },
     stages::bridge_submit_lock::acquire_bridge_submit_lock,
@@ -147,7 +148,7 @@ where
             let lookup = self.find_lost_bridge_call(state, &deposit, &attempt).await;
             if lookup
                 .as_ref()
-                .is_err_and(|error| error.starts_with(BRIDGE_SUBMISSION_AMBIGUOUS_PREFIX))
+                .is_err_and(|error| error.starts_with(SIDE_EFFECT_AMBIGUOUS_PREFIX))
             {
                 state.deposit.bridge.mark_bridge_attempt_parked();
             }
@@ -297,7 +298,7 @@ where
     ) -> Result<LostCall, String> {
         let ambiguous = |reason: String| {
             format!(
-                "{BRIDGE_SUBMISSION_AMBIGUOUS_PREFIX}: liq_id {} bridge attempt {} {} -> {} (cursor {:?}): {reason}; operator must attach a handle or clear the attempt",
+                "{SIDE_EFFECT_AMBIGUOUS_PREFIX}: liq_id {} bridge attempt {} {} -> {} (cursor {:?}): {reason}; operator must attach a handle or clear the attempt",
                 state.liq_id, attempt.amount, attempt.asset, attempt.destination, attempt.cursor
             )
         };

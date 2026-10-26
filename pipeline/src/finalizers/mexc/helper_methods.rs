@@ -822,12 +822,7 @@ where
     }
 
     fn stable_hash_6hex(value: &str) -> String {
-        let mut hash: u64 = 0xcbf29ce484222325;
-        for byte in value.bytes() {
-            hash ^= byte as u64;
-            hash = hash.wrapping_mul(0x100000001b3);
-        }
-        format!("{:06x}", hash & 0x00ff_ffff)
+        format!("{:06x}", super::super::mexc_utils::fnv1a_64(value) & 0x00ff_ffff)
     }
 
     fn sanitize_client_order_id(value: &str) -> String {

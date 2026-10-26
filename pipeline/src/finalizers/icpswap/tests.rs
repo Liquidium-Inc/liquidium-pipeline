@@ -387,7 +387,7 @@ impl IcpBackend for TestIcpswapClient {
             })
     }
 
-    async fn icp_transfer(&self, _: Principal, _: &str, _: Nat) -> Result<u64, TransferFailure> {
+    async fn icp_transfer(&self, _: Principal, _: &str, _: Nat, _created_at_time_nanos: Option<u64>) -> Result<u64, TransferFailure> {
         Err(TransferFailure::Rejected(
             "legacy ICP transfer is not used by this finalizer test double".to_string(),
         ))
