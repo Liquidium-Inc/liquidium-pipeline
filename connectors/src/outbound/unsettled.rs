@@ -12,7 +12,7 @@ use liquidium_pipeline_core::{
 };
 use serde::{Deserialize, Serialize};
 
-use super::{decode, encode, now_nanos};
+use super::{decode_payload, encode_payload, now_nanos};
 
 pub const NAME: &str = "unsettled";
 
@@ -39,7 +39,7 @@ impl OutboundSender for UnsettledSender {
         Ok(PreparedSend {
             sender: NAME.to_string(),
             identity: format!("plain-{}", now_nanos()),
-            payload: encode(&PlainSend {
+            payload: encode_payload(&PlainSend {
                 token: intent.token.clone(),
                 to: intent.to.clone(),
                 amount: intent.amount_native.clone(),
@@ -50,9 +50,10 @@ impl OutboundSender for UnsettledSender {
     }
 
     async fn submit(&self, prepared: &PreparedSend) -> SendOutcome {
-        let send: PlainSend = match decode(&prepared.payload) {
+        let send: PlainSend = match decode_payload(&prepared.payload) {
             Ok(send) => send,
-            Err(reason) => return SendOutcome::NeverLanded { reason },
+            // An unreadable record proves nothing about the chain.
+            Err(reason) => return SendOutcome::Open { reason },
         };
         match self.transfers.transfer(&send.token, &send.to, send.amount).await {
             Ok(receipt) => SendOutcome::Landed { receipt },

@@ -76,6 +76,8 @@ impl MultiVenueFinalizer {
         state.outcome = derive_outcome(&state.legs);
         set_meta_v2(&mut wrapper, &state)?;
         row.status = ResultStatus::Enqueued;
+        // Old failures must not count against the released leg.
+        row.error_count = 0;
         self.persist_wrapper(wal, &mut row, &wrapper).await?;
         info!(
             liquidation_id = %row.id,

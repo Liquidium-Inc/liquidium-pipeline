@@ -65,7 +65,7 @@ pub fn prepare_cex_withdraw(request: &WithdrawRequest) -> Result<PreparedSend, S
     Ok(PreparedSend {
         sender: NAME.to_string(),
         identity: request.order_id.clone(),
-        payload: serde_json::to_string(request).map_err(|error| format!("encode withdraw request: {error}"))?,
+        payload: super::encode_payload(request)?,
         // MEXC is not known to refuse a reused order id, so a second
         // request could withdraw the same funds twice.
         replay_safe: false,
@@ -73,9 +73,7 @@ pub fn prepare_cex_withdraw(request: &WithdrawRequest) -> Result<PreparedSend, S
 }
 
 fn saved_request(prepared: &PreparedSend) -> Result<WithdrawRequest, SendOutcome> {
-    serde_json::from_str(&prepared.payload).map_err(|error| SendOutcome::NeverLanded {
-        reason: format!("decode withdraw request: {error}"),
-    })
+    super::decode_payload(&prepared.payload).map_err(|reason| SendOutcome::Open { reason })
 }
 
 #[async_trait]

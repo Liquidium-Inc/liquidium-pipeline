@@ -84,9 +84,14 @@ pub struct CexDepositBridgeState {
     /// The provider call that bridges the deposit, saved before it runs.
     #[serde(default)]
     pub deposit_bridge_call: Option<crate::outbound::driver::OutboundRecord>,
-    /// Read from rows saved before the outbound driver; never written.
-    #[serde(default, rename = "deposit_bridge_submit_phase", skip_serializing)]
+    /// From rows saved before the outbound driver. It stays until the bridge
+    /// step upgrades it, so no save between can drop the call.
+    #[serde(default, rename = "deposit_bridge_submit_phase", skip_serializing_if = "Option::is_none")]
     pub legacy_bridge_submit_phase: Option<crate::bridge::legacy::LegacyBridgeSubmitPhase>,
+    /// True on rows saved before the outbound driver, whose build called the
+    /// provider without a record. The bridge step clears it.
+    #[serde(default = "crate::bridge::legacy::saved_before_driver")]
+    pub deposit_bridge_call_unrecorded: bool,
     #[serde(default)]
     pub deposit_planned_asset: Option<String>,
     #[serde(default)]
@@ -245,16 +250,6 @@ impl CexWithdrawBridgeState {
     pub fn deposit_send_started(&self) -> bool {
         self.withdraw_bridge_funding.is_some() || self.withdraw_bridge_funding_txid.is_some()
     }
-
-    /// True when a restart may resume the deposit send: the next action
-    /// reads the chain, resends a replay-safe send, or tells the provider.
-    fn deposit_send_resumable(&self) -> bool {
-        self.withdraw_bridge_funding_txid.is_some()
-            || self
-                .withdraw_bridge_funding
-                .as_ref()
-                .is_some_and(crate::outbound::driver::OutboundRecord::resumable)
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -272,28 +267,15 @@ pub struct CexState {
     #[serde(flatten)]
     pub withdraw: CexWithdrawState,
     /// Set by a step that saved a new send in this call. The venue writes the
-    /// saved send to the WAL, then runs the step again to send it in the same
-    /// cycle. It is never saved.
+    /// send to the WAL, then runs the step again to send it in the same cycle.
     #[serde(skip)]
     pub send_saved: bool,
 }
 
-/// A pending step is safe to resume by reading alone once its own submission
-/// id is durable and, when a bridge follows, the bridge handle is durable too.
-impl CexDepositState {
-    /// True when a saved funding transfer can resume without the arming
-    /// token: it was sent already, or sending it again cannot pay twice.
-    pub fn funding_resumable(&self) -> bool {
-        self.deposit_funding
-            .as_ref()
-            .is_some_and(crate::outbound::driver::OutboundRecord::resumable)
-    }
-}
-
 impl CexState {
-    /// Marks every saved send that may have run before a restart, so the
-    /// next run only settles it.
-    pub fn mark_sends_uncertain(&mut self, now: i64) {
+    /// Runs once after a restart. A saved send that is not safe to repeat may
+    /// have gone out, so it becomes a settle; true when the step then only reads.
+    pub fn resume_after_restart(&mut self, now: i64) -> bool {
         for record in [
             &mut self.deposit.deposit_funding,
             &mut self.deposit.bridge.deposit_bridge_call,
@@ -305,37 +287,20 @@ impl CexState {
         {
             record.mark_uncertain(now);
         }
-    }
-
-    /// True when advancing this state can only read exchange or bridge
-    /// evidence. Nothing in that phase submits a transfer, withdrawal or bridge, so a
-    /// restart may resume it without the submission gate. The MEXC adapter
-    /// resolves legacy transport plans first; see `can_resume_by_polling`.
-    pub fn is_receipt_poll_only(&self) -> bool {
+        // Each saved send now only settles or repeats safely. Without one,
+        // the step may send, unless a later id proves the send happened.
         match self.step {
-            CexStep::Deposit => self.deposit.funding_resumable(),
-            CexStep::Withdraw => self
-                .withdraw
-                .withdraw_send
-                .as_ref()
-                .is_some_and(crate::outbound::driver::OutboundRecord::resumable),
+            CexStep::Deposit => self.deposit.deposit_funding.is_some(),
+            CexStep::Withdraw => self.withdraw.withdraw_send.is_some(),
             // A bridge call is saved before it runs, so a missing record means
             // no call is in flight.
-            CexStep::DepositPending => {
-                self.deposit.deposit_txid.is_some()
-                    && self
-                        .deposit
-                        .bridge
-                        .deposit_bridge_call
-                        .as_ref()
-                        .is_none_or(crate::outbound::driver::OutboundRecord::resumable)
-            }
+            CexStep::DepositPending => self.deposit.deposit_txid.is_some(),
             CexStep::WithdrawPending => {
                 let bridge = &self.withdraw.bridge;
                 self.withdraw.withdraw_id.is_some()
                     && (!bridge.withdraw_bridge_required
                         || bridge.withdraw_bridge_id.is_some()
-                        || bridge.deposit_send_resumable())
+                        || bridge.deposit_send_started())
             }
             _ => false,
         }
@@ -673,6 +638,7 @@ mod tests {
                         deposit_bridge_provider_fee_budget_native_units: None,
                         deposit_bridge_call: None,
                         legacy_bridge_submit_phase: None,
+                        deposit_bridge_call_unrecorded: false,
                     },
                 },
                 trade: CexTradeState {
@@ -839,6 +805,7 @@ mod tests {
                         deposit_bridge_provider_fee_budget_native_units: None,
                         deposit_bridge_call: None,
                         legacy_bridge_submit_phase: None,
+                        deposit_bridge_call_unrecorded: false,
                     },
                 },
                 trade: CexTradeState {
@@ -1262,7 +1229,7 @@ mod tests {
     }
 
     #[test]
-    fn a_legacy_journal_phase_is_read_but_never_written() {
+    fn a_legacy_journal_phase_survives_a_save_until_it_is_upgraded() {
         let saved = r#"{"deposit_bridge_required":true,"deposit_bridge_submit_phase":{"Submitting":{"id":"a1","asset":"ckUSDC","destination":"0xabc","amount":1.5,"cursor":100,"started_at_ts":5,"called_at_ts":null,"parked_for_operator":true}}}"#;
         let state: CexDepositBridgeState = serde_json::from_str(saved).unwrap();
         use crate::bridge::legacy::LegacyBridgeSubmitPhase;
@@ -1271,7 +1238,14 @@ mod tests {
         };
         assert_eq!((attempt.id.as_str(), attempt.cursor), ("a1", Some(100)));
         assert!(attempt.parked_for_operator);
-        assert!(!serde_json::to_string(&state).unwrap().contains("deposit_bridge_submit_phase"));
+        let saved_again: CexDepositBridgeState = serde_json::from_str(&serde_json::to_string(&state).unwrap()).unwrap();
+        assert_eq!(saved_again.legacy_bridge_submit_phase, state.legacy_bridge_submit_phase);
+        assert!(state.deposit_bridge_call_unrecorded, "an old row may hold a call without a record");
+        let upgraded = CexDepositBridgeState::default();
+        let upgraded_json = serde_json::to_string(&upgraded).unwrap();
+        assert!(!upgraded_json.contains("deposit_bridge_submit_phase"));
+        let read_back: CexDepositBridgeState = serde_json::from_str(&upgraded_json).unwrap();
+        assert!(!read_back.deposit_bridge_call_unrecorded);
 
         let waiting: CexDepositBridgeState =
             serde_json::from_str(r#"{"deposit_bridge_submit_phase":"WaitingFunds"}"#).unwrap();

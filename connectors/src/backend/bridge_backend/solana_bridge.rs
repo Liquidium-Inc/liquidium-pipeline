@@ -123,7 +123,7 @@ enum DepositSolError {
     Quarantined { deposit_id: u64 },
 }
 
-#[derive(CandidType, Deserialize, Clone, Debug)]
+#[derive(CandidType, Deserialize, Clone, Debug, PartialEq, Eq)]
 enum DepositSolStatus {
     NotFound,
     Queued { sweepable_amount: u64 },
@@ -143,6 +143,13 @@ struct QueuedSolDeposit {
 }
 
 const QUEUED_DEPOSIT_PREFIX: &str = "cksol-deposit-v2:";
+
+/// The SOL transfer of a ckSOL handle that the older flow saved without a
+/// minter deposit id. `None` for any other handle.
+pub fn cksol_transfer_without_deposit_id(bridge_id: &str) -> Option<String> {
+    let state: QueuedSolDeposit = serde_json::from_str(bridge_id.strip_prefix(QUEUED_DEPOSIT_PREFIX)?).ok()?;
+    state.deposit_id.is_none().then_some(state.transfer_signature)
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct DepositBridgePollState {
@@ -327,6 +334,7 @@ where
         }
     }
 
+    #[cfg(test)]
     fn encode_subaccount(subaccount: Option<[u8; 32]>) -> String {
         match subaccount {
             Some(value) => hex::encode(value),
@@ -354,6 +362,7 @@ where
         Ok(Some(subaccount))
     }
 
+    #[cfg(test)]
     fn encode_deposit_bridge_id(state: &DepositBridgePollState) -> String {
         match &state.transfer_signature {
             Some(signature) => format!(
@@ -692,13 +701,40 @@ where
                 });
             }
         };
-        let account = Account {
-            owner: deposit_account.owner.unwrap_or(self.bridge_ic_owner_principal),
-            subaccount: deposit_account.subaccount,
-        };
+        let account = *Self::expect_icp_destination(route, destination)?;
         Ok(DepositNotice::Accepted(BridgeSubmission {
             bridge_id: Self::queued_deposit_id(account, Some(deposit_id), funding_receipt, None)?,
         }))
+    }
+
+    /// Ties the transfer to a deposit id that an operator recorded. The
+    /// minter must know the id, so a typo waits and parks again.
+    async fn recorded_sol_deposit(
+        &self,
+        route: &BridgeRouteSpec,
+        destination: &BridgeDestination,
+        funding_receipt: &str,
+        deposit_id: u64,
+    ) -> Result<DepositNotice, String> {
+        let account = *Self::expect_icp_destination(route, destination)?;
+        if self.deposit_status(deposit_id).await? == DepositSolStatus::NotFound {
+            return Ok(DepositNotice::NotYet {
+                reason: format!("the minter has no deposit {deposit_id}"),
+            });
+        }
+        Ok(DepositNotice::Accepted(BridgeSubmission {
+            bridge_id: Self::queued_deposit_id(account, Some(deposit_id), funding_receipt, None)?,
+        }))
+    }
+
+    async fn deposit_status(&self, deposit_id: u64) -> Result<DepositSolStatus, String> {
+        self.agent
+            .call_query::<DepositSolStatus>(
+                &self.cksol_minter_canister,
+                "deposit_sol_status",
+                Encode!(&deposit_id).map_err(|error| error.to_string())?,
+            )
+            .await
     }
 
     fn queued_deposit_id(
@@ -746,20 +782,20 @@ where
                 )
             })?;
 
-        match self
+        // SOL has moved, so every answer but an accepted notice returns a
+        // handle with the signature. A new submission would send the same funds again.
+        let reason = match self
             .notify_sol_deposit(route, &request.destination, &transfer_signature)
-            .await?
+            .await
         {
-            DepositNotice::Accepted(submission) => Ok(submission),
-            // SOL has moved, so return a handle with the signature. A new
-            // submission would send the same funds again.
-            DepositNotice::NotYet { reason } => {
-                let account = *Self::expect_icp_destination(route, &request.destination)?;
-                Ok(BridgeSubmission {
-                    bridge_id: Self::queued_deposit_id(account, None, &transfer_signature, Some(reason))?,
-                })
-            }
-        }
+            Ok(DepositNotice::Accepted(submission)) => return Ok(submission),
+            Ok(DepositNotice::NotYet { reason }) => reason,
+            Err(error) => error,
+        };
+        let account = *Self::expect_icp_destination(route, &request.destination)?;
+        Ok(BridgeSubmission {
+            bridge_id: Self::queued_deposit_id(account, None, &transfer_signature, Some(reason))?,
+        })
     }
 
     async fn submit_icp_to_solana(
@@ -938,7 +974,7 @@ where
         asset: &str,
         chain: &str,
         destination: &BridgeDestination,
-        _handle: &str,
+        handle: &str,
         receipt: &str,
     ) -> Result<DepositNotice, String> {
         let route = Self::solana_route_from_source(asset, chain)?;
@@ -946,6 +982,11 @@ where
             return Err(format!("route {asset}@{chain} has no deposit to track"));
         }
         validate_destination_for_route(route, destination)?;
+        // The send itself leaves the handle empty. A number is a deposit id
+        // that an operator recorded after the minter's answer was lost.
+        if let Ok(deposit_id) = handle.parse::<u64>() {
+            return self.recorded_sol_deposit(route, destination, receipt, deposit_id).await;
+        }
         self.notify_sol_deposit(route, destination, receipt).await
     }
 
@@ -960,12 +1001,7 @@ where
                     state.transfer_signature, state.account
                 )));
             };
-            let status = self.agent.call_query::<DepositSolStatus>(
-                &self.cksol_minter_canister,
-                "deposit_sol_status",
-                Encode!(&deposit_id).map_err(|error| error.to_string())?,
-            ).await?;
-            return Ok(match status {
+            return Ok(match self.deposit_status(deposit_id).await? {
                 DepositSolStatus::Minted { block_index, minted_amount } => BridgeStatus::Minted(BridgeMintReceipt {
                     transaction_hash: state.transfer_signature,
                     log_index: Nat::from(deposit_id),
@@ -1447,6 +1483,57 @@ mod tests {
                 (notice, expected) => panic!("unexpected {notice:?} for {expected:?}"),
             }
         }
+    }
+
+    #[tokio::test]
+    async fn a_recorded_deposit_id_needs_no_notice_but_must_exist() {
+        let destination = BridgeDestination::IcpAccount(Account {
+            owner: Principal::from_slice(&[42]),
+            subaccount: Some([9u8; 32]),
+        });
+        for (status, accepted) in [
+            (super::DepositSolStatus::Minted { block_index: 1, minted_amount: 2 }, true),
+            (super::DepositSolStatus::NotFound, false),
+        ] {
+            let mut agent = MockPipelineAgent::new();
+            agent.expect_call_update_via_proxy::<Result<u64, DepositSolError>>().times(0);
+            agent.expect_call_query::<super::DepositSolStatus>().times(1).return_once(move |_, method, args| {
+                assert_eq!(method, "deposit_sol_status");
+                assert_eq!(candid::decode_one::<u64>(&args).unwrap(), 42);
+                Ok(status)
+            });
+            let notice = backend(agent, MockIcpBackend::new(), MockSolanaBackend::new())
+                .track_deposit("SOL", "SOL", &destination, "42", "sig-9")
+                .await
+                .unwrap();
+            match notice {
+                DepositNotice::Accepted(submission) => {
+                    assert!(accepted);
+                    let saved: super::QueuedSolDeposit = serde_json::from_str(
+                        submission.bridge_id.strip_prefix(super::QUEUED_DEPOSIT_PREFIX).unwrap(),
+                    )
+                    .unwrap();
+                    assert_eq!((saved.deposit_id, saved.transfer_signature.as_str()), (Some(42), "sig-9"));
+                }
+                DepositNotice::NotYet { reason } => assert!(!accepted && reason.contains("42"), "{reason}"),
+            }
+        }
+    }
+
+    #[test]
+    fn only_a_handle_without_a_deposit_id_gives_its_transfer() {
+        let handle = |deposit_id| {
+            super::SolanaBridgeBackend::<MockPipelineAgent, MockIcpBackend, MockSolanaBackend>::queued_deposit_id(
+                Account { owner: bridge_owner(), subaccount: None },
+                deposit_id,
+                "sig-9",
+                None,
+            )
+            .unwrap()
+        };
+        assert_eq!(super::cksol_transfer_without_deposit_id(&handle(None)).as_deref(), Some("sig-9"));
+        assert_eq!(super::cksol_transfer_without_deposit_id(&handle(Some(7))), None);
+        assert_eq!(super::cksol_transfer_without_deposit_id("ic-withdraw:1:2"), None);
     }
 
     #[tokio::test]

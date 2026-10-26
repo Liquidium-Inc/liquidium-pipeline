@@ -201,16 +201,15 @@ pub trait BridgeBackend: Send + Sync {
     /// Polls current status for a previously submitted bridge operation.
     async fn get_bridge_status(&self, bridge_id: &str) -> Result<BridgeStatus, String>;
 
-    /// Checks a request and signs the send that funds it. It sends nothing.
-    /// The caller saves the send, sends it through the outbound driver, then
-    /// calls `track_deposit` with its receipt.
+    /// Checks a request and signs the send that funds it, without sending it.
+    /// The outbound driver sends it, then the caller gives `track_deposit` its receipt.
     async fn prepare_bridge_send(&self, request: &BridgeRequest) -> Result<BridgeSend, String> {
         let _ = request;
         Err("signed bridge sends are not supported by this bridge backend".to_string())
     }
 
-    /// The bridge handle for a send that landed with `receipt`. Some
-    /// providers must be told about the deposit first; asking again is safe.
+    /// The bridge handle for a send that landed with `receipt`. `handle` comes
+    /// from the send, or is a provider deposit id that an operator recorded.
     async fn track_deposit(
         &self,
         asset: &str,

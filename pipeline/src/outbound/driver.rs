@@ -78,7 +78,7 @@ impl OutboundRecord {
 
 /// What the step does after one drive.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Drive {
+enum Drive {
     /// The send happened. The record is cleared.
     Done { receipt: String },
     /// Come back on the next cycle.
@@ -92,11 +92,7 @@ pub enum Drive {
 
 /// Prepares a send and saves it. The send itself runs on the next cycle,
 /// after the record is durable.
-pub async fn start_outbound(
-    record: &mut Option<OutboundRecord>,
-    sender: &dyn OutboundSender,
-    intent: &OutboundIntent,
-) -> Drive {
+async fn start_outbound(record: &mut Option<OutboundRecord>, sender: &dyn OutboundSender, intent: &OutboundIntent) -> Drive {
     match sender.prepare(intent).await {
         Ok(prepared) => {
             *record = Some(OutboundRecord::prepared(prepared));
@@ -106,57 +102,55 @@ pub async fn start_outbound(
     }
 }
 
-/// Advances a saved send by one step. A parked send asks the chain first, so
-/// an operator decision is used only while the chain stays undecided.
-pub async fn advance_outbound(record: &mut Option<OutboundRecord>, sender: &dyn OutboundSender, now: i64) -> Drive {
-    let Some(current) = record.clone() else {
+/// Advances a saved send by one step, and clears it once it is decided.
+async fn advance_outbound(record: &mut Option<OutboundRecord>, sender: &dyn OutboundSender, now: i64) -> Drive {
+    let Some(saved) = record.as_mut() else {
         return Drive::Retry {
             reason: "no outbound send is saved".to_string(),
         };
     };
-    let (outcome, submitted_at) = match &current.phase {
-        OutboundPhase::Prepared => (sender.submit(&current.prepared).await, now),
-        OutboundPhase::Submitted { at } => (sender.settle(&current.prepared).await, *at),
+    let drive = advance_saved(saved, sender, now).await;
+    if matches!(drive, Drive::Done { .. } | Drive::Retry { .. }) {
+        *record = None;
+    }
+    drive
+}
+
+/// A parked send asks the chain first, so an operator decision is used only
+/// while the chain stays undecided.
+async fn advance_saved(saved: &mut OutboundRecord, sender: &dyn OutboundSender, now: i64) -> Drive {
+    let (outcome, submitted_at) = match &saved.phase {
+        OutboundPhase::Prepared => (sender.submit(&saved.prepared).await, now),
+        OutboundPhase::Submitted { at } => (sender.settle(&saved.prepared).await, *at),
         OutboundPhase::Parked { reason } => {
-            let outcome = sender.settle(&current.prepared).await;
+            let outcome = sender.settle(&saved.prepared).await;
             if matches!(outcome, SendOutcome::Open { .. }) {
-                return decide_parked(record, &current, reason);
+                return decide_parked(saved, reason);
             }
             (outcome, now)
         }
     };
     match outcome {
-        SendOutcome::Landed { receipt } => {
-            *record = None;
-            Drive::Done { receipt }
-        }
-        SendOutcome::NeverLanded { reason } => {
-            *record = None;
-            Drive::Retry { reason }
-        }
+        SendOutcome::Landed { receipt } => Drive::Done { receipt },
+        SendOutcome::NeverLanded { reason } => Drive::Retry { reason },
         SendOutcome::Open { reason } => {
-            let window = sender.open_window_secs(&current.prepared);
+            let window = sender.open_window_secs(&saved.prepared);
             if now.saturating_sub(submitted_at) > window {
                 let reason = side_effect_ambiguous(format!(
                     "{} send {} has no decided answer after {window}s: {reason}; record an operator decision",
-                    current.prepared.sender, current.prepared.identity
+                    saved.prepared.sender, saved.prepared.identity
                 ));
-                if let Some(saved) = record.as_mut() {
-                    saved.phase = OutboundPhase::Parked { reason: reason.clone() };
-                }
+                saved.phase = OutboundPhase::Parked { reason: reason.clone() };
                 return Drive::Park { reason };
             }
-            if let Some(saved) = record.as_mut() {
-                saved.phase = OutboundPhase::Submitted { at: submitted_at };
-            }
+            saved.phase = OutboundPhase::Submitted { at: submitted_at };
             Drive::Wait
         }
     }
 }
 
-/// One drive for a step that reports through `Result`. `intent` starts a new
-/// send. It returns the receipt once the send landed and `None` while it waits.
-/// An error means a retry with a new send, or a park when it has the prefix.
+/// One drive of a saved send; `intent` starts a new one. An error means a
+/// new send on the next cycle, or a park when it has the ambiguity prefix.
 pub async fn step_outbound(
     record: &mut Option<OutboundRecord>,
     sender: &dyn OutboundSender,
@@ -174,22 +168,17 @@ pub async fn step_outbound(
     }
 }
 
-fn decide_parked(record: &mut Option<OutboundRecord>, current: &OutboundRecord, reason: &str) -> Drive {
-    match &current.decision {
-        Some(OperatorDecision::Landed { receipt }) => {
-            let receipt = receipt.clone();
-            *record = None;
-            Drive::Done { receipt }
-        }
-        Some(OperatorDecision::Absent) => {
-            *record = None;
-            Drive::Retry {
-                reason: format!(
-                    "operator confirmed {} send {} did not happen",
-                    current.prepared.sender, current.prepared.identity
-                ),
-            }
-        }
+fn decide_parked(saved: &OutboundRecord, reason: &str) -> Drive {
+    match &saved.decision {
+        Some(OperatorDecision::Landed { receipt }) => Drive::Done {
+            receipt: receipt.clone(),
+        },
+        Some(OperatorDecision::Absent) => Drive::Retry {
+            reason: format!(
+                "operator confirmed {} send {} did not happen",
+                saved.prepared.sender, saved.prepared.identity
+            ),
+        },
         None => Drive::Park {
             reason: reason.to_string(),
         },

@@ -14,8 +14,7 @@ use serde::{Deserialize, Serialize};
 use tokio::time::{Duration, sleep};
 
 const ERC20_APPROVE_GAS_LIMIT: u64 = 120_000;
-const ERC20_APPROVE_GAS_BUFFER_BPS: u64 = 2_000; // +20%
-const SIGNED_CALL_GAS_BUFFER_BPS: u64 = 2_000; // +20%
+const GAS_BUFFER_BPS: u64 = 2_000; // +20%
 const NONCE_RETRY_MAX_ATTEMPTS: u8 = 3;
 const NONCE_RETRY_BASE_DELAY_MS: u64 = 200;
 
@@ -67,6 +66,11 @@ fn u256_to_nat(v: U256) -> Nat {
     Nat::from(v.to::<u128>())
 }
 
+/// Some RPC stacks under-estimate gas, so every estimate gets headroom.
+fn with_gas_buffer(estimate: u64) -> u64 {
+    estimate.saturating_add(estimate.saturating_mul(GAS_BUFFER_BPS) / 10_000)
+}
+
 fn is_nonce_too_low_error(message: &str) -> bool {
     let normalized = message.to_ascii_lowercase();
     normalized.contains("nonce too low")
@@ -95,14 +99,21 @@ pub enum Broadcast {
     Unknown(String),
 }
 
-/// Refusals that can mean the network already holds or mined this exact
-/// transaction. Only the chain decides those.
-fn may_already_be_known(message: &str) -> bool {
+/// Node refusals that prove this exact transaction failed validation, so no
+/// node took it. Any other error object, gateway errors included, leaves the
+/// answer to the chain.
+fn is_validation_refusal(message: &str) -> bool {
     let message = message.to_ascii_lowercase();
-    ["already known", "known transaction", "already imported", "nonce too low", "replacement transaction underpriced"]
-        .iter()
-        .any(|marker| message.contains(marker))
-        || is_nonce_too_low_error(&message)
+    [
+        "insufficient funds",
+        "intrinsic gas too low",
+        "exceeds block gas limit",
+        "invalid sender",
+        "max fee per gas less than block base fee",
+        "fee cap less than block base fee",
+    ]
+    .iter()
+    .any(|marker| message.contains(marker))
 }
 
 /// What the chain says about a signed transaction.
@@ -166,29 +177,27 @@ where
         request: <AnyNetwork as Network>::TransactionRequest,
     ) -> Result<SignedEvmTx, String> {
         let from = self.provider.default_signer_address();
-        let nonce = self
-            .provider
-            .get_transaction_count(from)
-            .pending()
-            .await
-            .map_err(|e| format!("nonce read failed for {from}: {e}"))?;
-        let chain_id = self
-            .provider
-            .get_chain_id()
-            .await
-            .map_err(|e| format!("chain id read failed: {e}"))?;
+        let (nonce, chain_id, fees) = tokio::try_join!(
+            async {
+                let nonce = self.provider.get_transaction_count(from).pending().await;
+                nonce.map_err(|e| format!("nonce read failed for {from}: {e}"))
+            },
+            async {
+                let chain_id = self.provider.get_chain_id().await;
+                chain_id.map_err(|e| format!("chain id read failed: {e}"))
+            },
+            async {
+                let fees = self.provider.estimate_eip1559_fees().await;
+                fees.map_err(|e| format!("fee estimate failed: {e}"))
+            },
+        )?;
         let mut request = request.with_from(from).with_nonce(nonce).with_chain_id(chain_id);
         let estimate = self
             .provider
             .estimate_gas(request.clone())
             .await
             .map_err(|e| format!("gas estimate failed: {e}"))?;
-        let fees = self
-            .provider
-            .estimate_eip1559_fees()
-            .await
-            .map_err(|e| format!("fee estimate failed: {e}"))?;
-        request.set_gas_limit(estimate.saturating_add(estimate.saturating_mul(SIGNED_CALL_GAS_BUFFER_BPS) / 10_000));
+        request.set_gas_limit(with_gas_buffer(estimate));
         request.set_max_fee_per_gas(fees.max_fee_per_gas);
         request.set_max_priority_fee_per_gas(fees.max_priority_fee_per_gas);
         let envelope = request
@@ -207,7 +216,7 @@ where
     pub(crate) async fn broadcast_signed(&self, tx: &SignedEvmTx) -> Broadcast {
         match self.provider.send_raw_transaction(&tx.raw).await {
             Ok(_) => Broadcast::Sent,
-            Err(RpcError::ErrorResp(error)) if !may_already_be_known(&error.message) => {
+            Err(RpcError::ErrorResp(error)) if is_validation_refusal(&error.message) => {
                 Broadcast::Rejected(error.message.to_string())
             }
             Err(error) => Broadcast::Unknown(error.to_string()),
@@ -244,18 +253,25 @@ where
             EvmReading::Landed => SendOutcome::Landed {
                 receipt: format!("{:#x}", tx.hash),
             },
-            EvmReading::Reverted => SendOutcome::NeverLanded {
+            // A revert moved no funds, but a new send would most likely revert
+            // too, so an operator decides after the window.
+            EvmReading::Reverted => SendOutcome::Open {
                 reason: format!("transaction {:#x} reverted", tx.hash),
             },
-            EvmReading::NonceUsed => SendOutcome::NeverLanded {
+            // The two reads may come from different nodes behind one URL, so
+            // a missing receipt is no proof. An operator decides after the window.
+            EvmReading::NonceUsed => SendOutcome::Open {
                 reason: format!(
-                    "nonce {} of {} was used by another transaction; {:#x} cannot land",
+                    "nonce {} of {} is final but no receipt for {:#x} was found",
                     tx.nonce, tx.from, tx.hash
                 ),
             },
             EvmReading::Pending => {
-                // A node may have dropped it. The same bytes cannot land twice.
-                let _ = self.provider.send_raw_transaction(&tx.raw).await;
+                // A node may have dropped it, and the same bytes cannot land
+                // twice. A node that still holds it needs no new copy.
+                if matches!(self.provider.get_transaction_by_hash(tx.hash).await, Ok(None)) {
+                    let _ = self.provider.send_raw_transaction(&tx.raw).await;
+                }
                 SendOutcome::Open {
                     reason: format!("transaction {:#x} is not mined yet", tx.hash),
                 }
@@ -304,10 +320,7 @@ where
         let contract = IERC20::new(token, self.provider.clone());
         let estimated_gas = contract.approve(spender, amount).estimate_gas().await.ok();
         let gas_limit = estimated_gas
-            .map(|estimate| {
-                let extra = estimate.saturating_mul(ERC20_APPROVE_GAS_BUFFER_BPS) / 10_000;
-                estimate.saturating_add(extra).max(ERC20_APPROVE_GAS_LIMIT)
-            })
+            .map(|estimate| with_gas_buffer(estimate).max(ERC20_APPROVE_GAS_LIMIT))
             .unwrap_or(ERC20_APPROVE_GAS_LIMIT);
 
         let mut attempt: u8 = 0;
@@ -474,18 +487,20 @@ mod tests {
     }
 
     #[test]
-    fn refusals_that_the_network_may_already_hold_stay_open() {
-        use super::may_already_be_known;
+    fn only_validation_refusals_count_as_never_sent() {
+        use super::is_validation_refusal;
+        for message in ["insufficient funds for gas * price + value", "intrinsic gas too low"] {
+            assert!(is_validation_refusal(message), "{message}");
+        }
         for message in [
             "already known",
             "nonce too low: next nonce 8, tx nonce 7",
             "replacement transaction underpriced",
-            "Known transaction: 0xabc",
+            "transaction underpriced",
+            "Internal error",
+            "limit exceeded",
         ] {
-            assert!(may_already_be_known(message), "{message}");
-        }
-        for message in ["insufficient funds for gas * price + value", "intrinsic gas too low"] {
-            assert!(!may_already_be_known(message), "{message}");
+            assert!(!is_validation_refusal(message), "{message}");
         }
     }
 }

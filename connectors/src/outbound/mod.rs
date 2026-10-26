@@ -1,6 +1,8 @@
 //! One `OutboundSender` per chain, and a router that picks the sender.
 mod cex_withdraw;
 mod evm;
+#[cfg(test)]
+mod evm_anvil_tests;
 mod icp;
 mod router;
 mod solana;
@@ -23,10 +25,11 @@ fn now_nanos() -> u64 {
         .unwrap_or(0)
 }
 
-fn encode<T: serde::Serialize>(payload: &T) -> Result<String, String> {
+/// The saved form of a send payload, shared by every sender.
+pub fn encode_payload<T: serde::Serialize>(payload: &T) -> Result<String, String> {
     serde_json::to_string(payload).map_err(|error| format!("encode outbound payload: {error}"))
 }
 
-fn decode<T: serde::de::DeserializeOwned>(payload: &str) -> Result<T, String> {
+pub fn decode_payload<T: serde::de::DeserializeOwned>(payload: &str) -> Result<T, String> {
     serde_json::from_str(payload).map_err(|error| format!("decode outbound payload: {error}"))
 }

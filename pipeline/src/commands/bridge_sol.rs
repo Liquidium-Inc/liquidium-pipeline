@@ -48,22 +48,6 @@ impl BridgeSolDirection {
     }
 }
 
-fn parse_icp_account_like(address: &str) -> Result<Account, String> {
-    if let Ok(account) = Account::from_str(address) {
-        return Ok(account);
-    }
-    if let Ok(owner) = Principal::from_text(address) {
-        return Ok(Account {
-            owner,
-            subaccount: None,
-        });
-    }
-    Err(format!(
-        "invalid ICP account-like address '{}'; expected Account or principal",
-        address
-    ))
-}
-
 fn bridge_solana_address(config: &Config) -> String {
     Keypair::new_from_array(config.bridge_solana_private_key_bytes)
         .pubkey()
@@ -449,7 +433,7 @@ pub async fn submit(
 
     let request = match direction {
         BridgeSolDirection::SolToCkSol => {
-            let destination_account = parse_icp_account_like(destination_value)?;
+            let destination_account = crate::finalizers::bridge_planner::parse_icp_account_like(destination_value)?;
             let source_value = resolve_sol_to_cksol_source(source, &bridge_source_address)?;
             let bridge_available_lamports = backend.solana_backend.native_balance().await.map_err(|e| {
                 format!(

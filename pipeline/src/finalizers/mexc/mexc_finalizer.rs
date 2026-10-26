@@ -9,7 +9,7 @@ use ic_ledger_types::{AccountIdentifier, Subaccount};
 use icrc_ledger_types::icrc1::account::Account;
 use liquidium_pipeline_connectors::backend::amount_utils::nat_units_to_spend_amount;
 use liquidium_pipeline_connectors::backend::bridge_backend::{
-    BRIDGE_SUBMISSION_DEFERRED_PREFIX, BridgeDestination, BridgeFeeBudget, BridgeRequest, BridgeRouteKind,
+    cksol_transfer_without_deposit_id, BRIDGE_SUBMISSION_DEFERRED_PREFIX, BridgeDestination, BridgeFeeBudget, BridgeRequest, BridgeRouteKind,
     BridgeRouteSpec, BridgeStatus, DepositNotice, FINALIZER_PERMANENT_AMOUNT_FLOOR_PREFIX, resolve_route,
 };
 use liquidium_pipeline_connectors::outbound::UnsettledSender;
@@ -44,6 +44,7 @@ const DIRECT_WITHDRAW_DELIVERY_TIMEOUT_SECS: i64 = 60 * 60;
 /// How long a landed bridge deposit may wait for the provider to accept it.
 /// The ckSOL minter reads it at finalized commitment, which takes seconds.
 const DEPOSIT_NOTICE_WINDOW_SECS: i64 = 30 * 60;
+const SOL_FINALITY_SECS: i64 = 20;
 
 use crate::{
     bridge::runtime::BridgeRuntime,
@@ -209,15 +210,14 @@ where
             return Ok(account_id);
         }
 
-        let account = <Self as BridgePlanner>::parse_icp_account_like(requested_destination)?;
+        let account = crate::finalizers::bridge_planner::parse_icp_account_like(requested_destination)?;
         let subaccount = Subaccount(account.subaccount.unwrap_or([0; 32]));
         Ok(AccountIdentifier::new(&account.owner, &subaccount).to_hex())
     }
 
-    /// Drives the funding transfer. `intent` starts a new one; without it the
-    /// saved one advances. `Ok(None)` means wait for the next cycle.
-    async fn drive_funding(&self, state: &mut CexState, intent: Option<OutboundIntent>) -> Result<Option<String>, String> {
-        let starting = intent.is_some();
+    /// Drives the funding transfer; `intent` starts a new one. On landing it
+    /// records the transfer and returns true.
+    async fn drive_funding(&self, state: &mut CexState, intent: Option<OutboundIntent>) -> Result<bool, String> {
         let landed = step_outbound(
             &mut state.deposit.deposit_funding,
             self.outbound.as_ref(),
@@ -225,8 +225,29 @@ where
             now_ts(),
         )
         .await?;
-        state.send_saved = starting && state.deposit.deposit_funding.is_some();
-        Ok(landed)
+        state.send_saved = intent.is_some();
+        let Some(tx_id) = landed else {
+            return Ok(false);
+        };
+        state.deposit.deposit_txid = Some(tx_id);
+        state.deposit.deposit_sent_at_ts = Some(now_ts());
+        Ok(true)
+    }
+
+    /// The exchange balance before the deposit. A failed read counts as zero.
+    async fn record_balance_before_deposit(&self, state: &mut CexState, planned_asset: &str) {
+        let baseline = self.backend.get_balance(planned_asset).await.unwrap_or_else(|error| {
+            debug!(
+                "[mexc] liq_id={} could not get baseline balance before deposit: {} (using 0.0)",
+                state.liq_id, error
+            );
+            0.0
+        });
+        debug!(
+            "[mexc] liq_id={} baseline balance before deposit: {}",
+            state.liq_id, baseline
+        );
+        state.deposit.deposit_balance_before = Some(baseline);
     }
 
     /// The bridge destination for the final liquidator, from the snapshot
@@ -239,6 +260,22 @@ where
             .as_deref()
             .ok_or_else(|| "missing final destination snapshot for bridged withdraw".to_string())?;
         self.bridge_destination_for_final_liquidator(route.destination_kind, snapshot)
+    }
+
+    /// The ckSOL deposit address is shared, and the minter takes one deposit
+    /// at a time. A second send would merge with the open one.
+    async fn waits_for_other_deposit(bridge: &BridgeRuntime, route: &BridgeRouteSpec, liq_id: &str) -> Result<bool, String> {
+        if route.route_kind != BridgeRouteKind::SolanaToIcp {
+            return Ok(false);
+        }
+        let Some(other) = Self::other_open_deposit_send(bridge, route, liq_id).await? else {
+            return Ok(false);
+        };
+        info!(
+            "[mexc] liq_id={} bridge deposit waits for liq_id={} on the same deposit address",
+            liq_id, other
+        );
+        Ok(true)
     }
 
     /// Another row's deposit send on this route that has not minted yet.
@@ -259,6 +296,15 @@ where
             .map(|send| send.liq_id))
     }
 
+    /// The return bridge route from the planned MEXC withdrawal to the final asset.
+    pub(super) fn withdraw_route(state: &CexState) -> Option<&'static BridgeRouteSpec> {
+        resolve_route(
+            &<Self as BridgePlanner>::planned_withdraw_asset(state),
+            &<Self as BridgePlanner>::planned_withdraw_network(state),
+            &state.withdraw.withdraw_asset.symbol(),
+        )
+    }
+
     /// Runs one step of a return bridge whose provider watches a deposit
     /// address: the send, then the notice. `request` starts a new send.
     async fn advance_withdraw_deposit_send(
@@ -275,15 +321,8 @@ where
         let funds = &mut state.withdraw.bridge;
         let Some(receipt) = funds.withdraw_bridge_funding_txid.clone() else {
             if let Some(request) = request {
-                // The ckSOL deposit address is shared, and the minter takes
-                // one deposit at a time. A second send would merge with it.
-                if route.route_kind == BridgeRouteKind::SolanaToIcp
-                    && let Some(other) = Self::other_open_deposit_send(bridge, route, &liq_id).await?
-                {
-                    info!(
-                        "[mexc] liq_id={} bridge deposit waits for liq_id={} on the same deposit address",
-                        liq_id, other
-                    );
+                // The caller holds the submit lock, so this check is final.
+                if Self::waits_for_other_deposit(bridge, route, &liq_id).await? {
                     return Ok(());
                 }
                 let bridge_send = match bridge.backend.prepare_bridge_send(request).await {
@@ -313,6 +352,12 @@ where
             // tracking runs on the next cycle.
             return Ok(());
         };
+        // The minter reads only finalized transfers, and each notice costs
+        // cycles. A confirmed Solana transfer is final after about 13 seconds.
+        let landed_for = now.saturating_sub(funds.withdraw_bridge_funded_at_ts.unwrap_or(0));
+        if route.route_kind == BridgeRouteKind::SolanaToIcp && landed_for < SOL_FINALITY_SECS {
+            return Ok(());
+        }
         let handle = funds.withdraw_bridge_send_handle.clone().unwrap_or_default();
         match bridge
             .backend
@@ -352,23 +397,7 @@ where
         planned_asset: &str,
         planned_network: &str,
     ) -> Result<OutboundIntent, String> {
-        let baseline = match self.backend.get_balance(planned_asset).await {
-            Ok(bal) => bal,
-            Err(e) => {
-                debug!(
-                    "[mexc] liq_id={} could not get baseline balance before deposit: {} (using 0.0)",
-                    state.liq_id, e
-                );
-                0.0
-            }
-        };
-
-        debug!(
-            "[mexc] liq_id={} baseline balance before deposit: {}",
-            state.liq_id, baseline
-        );
-        state.deposit.deposit_balance_before = Some(baseline);
-
+        self.record_balance_before_deposit(state, planned_asset).await;
         let addr = self
             .backend
             .get_deposit_address(planned_asset, planned_network)
@@ -410,18 +439,7 @@ where
         route: &BridgeRouteSpec,
         planned_asset: &str,
     ) -> Result<OutboundIntent, String> {
-        let baseline = match self.backend.get_balance(planned_asset).await {
-            Ok(bal) => bal,
-            Err(e) => {
-                debug!(
-                    "[mexc] liq_id={} could not get baseline balance before bridged deposit: {} (using 0.0)",
-                    state.liq_id, e
-                );
-                0.0
-            }
-        };
-        state.deposit.deposit_balance_before = Some(baseline);
-
+        self.record_balance_before_deposit(state, planned_asset).await;
         let bridge_source_address = self.resolve_bridge_source_address(route.source_chain)?;
         let bridge_destination = <Self as BridgePlanner>::bridge_source_transfer_destination(
             route.source_chain,
@@ -990,11 +1008,9 @@ where
                 } else {
                     Some(self.prepare_direct_funding(state, &planned_asset, &planned_network).await?)
                 };
-                let Some(tx_id) = self.drive_funding(state, intent).await? else {
+                if !self.drive_funding(state, intent).await? {
                     return Ok(());
-                };
-                state.deposit.deposit_txid = Some(tx_id);
-                state.deposit.deposit_sent_at_ts = Some(now_ts());
+                }
 
                 if matches!(state.deposit.deposit_asset, ChainToken::Icp { .. })
                     && !Self::is_native_icp_token(&state.deposit.deposit_asset)
@@ -1035,17 +1051,17 @@ where
             } else {
                 Some(self.prepare_bridged_funding(state, bridge, route, &planned_asset).await?)
             };
-            let Some(tx_id) = self.drive_funding(state, intent).await? else {
+            if !self.drive_funding(state, intent).await? {
                 return Ok(());
-            };
-            state.deposit.deposit_txid = Some(tx_id);
-            state.deposit.deposit_sent_at_ts = Some(now_ts());
+            }
+            // This build funded the bridge, so no call ran without a record.
+            state.deposit.bridge.deposit_bridge_call_unrecorded = false;
             state.step = CexStep::DepositPending;
             return Ok(());
         }
 
         if state.deposit.bridge.deposit_bridge_id.is_none() {
-            return self.advance_bridged_deposit_submission(state, bridge, route, None).await;
+            return self.advance_bridged_deposit_submission(state, bridge, route).await;
         }
 
         state.deposit.bridge.deposit_bridge_polled_at_ts = Some(now_ts());
@@ -1394,11 +1410,12 @@ where
             .bridge
             .as_ref()
             .ok_or_else(|| "bridge runtime not configured for bridged withdraw".to_string())?;
-        let final_symbol = state.withdraw.withdraw_asset.symbol();
-        let route = resolve_route(&planned_asset, &planned_network, &final_symbol).ok_or_else(|| {
+        let route = Self::withdraw_route(state).ok_or_else(|| {
             format!(
                 "bridge route not found for withdraw {}@{} -> {}",
-                planned_asset, planned_network, final_symbol
+                planned_asset,
+                planned_network,
+                state.withdraw.withdraw_asset.symbol()
             )
         })?;
 
@@ -1434,6 +1451,12 @@ where
                 return self
                     .advance_withdraw_deposit_send(state, bridge, route, &destination, None)
                     .await;
+            }
+            // Skips the reads below while another row's deposit is open. The
+            // check under the submit lock decides.
+            if Self::waits_for_other_deposit(bridge, route, &state.liq_id).await? {
+                state.step = CexStep::WithdrawPending;
+                return Ok(());
             }
             let withdraw_id = state
                 .withdraw
@@ -1632,6 +1655,19 @@ where
             .withdraw_bridge_id
             .clone()
             .ok_or_else(|| "missing bridge id while polling bridged withdraw".to_string())?;
+        // The older flow saved the SOL transfer without a minter id. The notice
+        // step asks the minter for it, as after a new transfer.
+        if let Some(transfer) = cksol_transfer_without_deposit_id(&bridge_id) {
+            let funds = &mut state.withdraw.bridge;
+            funds.withdraw_bridge_funding_txid = Some(transfer);
+            funds.withdraw_bridge_funded_at_ts = funds
+                .withdraw_bridge_funded_at_ts
+                .or(funds.withdraw_bridge_submitted_at_ts)
+                .or(Some(now_ts()));
+            funds.withdraw_bridge_id = None;
+            state.step = CexStep::WithdrawPending;
+            return Ok(());
+        }
         state.withdraw.bridge.withdraw_bridge_polled_at_ts = Some(now_ts());
         match bridge.backend.get_bridge_status(&bridge_id).await? {
             BridgeStatus::Minted(receipt) => {
@@ -1644,7 +1680,7 @@ where
                     .withdraw_bridge_destination_snapshot
                     .as_deref()
                     .ok_or("missing expected mint destination")?;
-                let expected = <Self as BridgePlanner>::parse_icp_account_like(destination)?;
+                let expected = crate::finalizers::bridge_planner::parse_icp_account_like(destination)?;
                 if receipt.recipient != expected
                     || !receipt
                         .token_symbol
@@ -1670,18 +1706,28 @@ where
                 state.step = CexStep::WithdrawPending;
                 Ok(())
             }
-            // The provider dropped its sweep and released the deposit address.
-            // The funds stay there, and a new notice queues them again.
-            BridgeStatus::Failed { reason } if state.withdraw.bridge.withdraw_bridge_funding_txid.is_some() => {
+            // The ckSOL minter dropped its sweep and released the deposit
+            // address. The funds stay there, and a new notice queues them again.
+            BridgeStatus::Failed { reason }
+                if route.route_kind == BridgeRouteKind::SolanaToIcp
+                    && state.withdraw.bridge.withdraw_bridge_funding_txid.is_some() =>
+            {
+                let reason = reason.unwrap_or_default();
+                state.withdraw.bridge.withdraw_bridge_id = None;
+                state.step = CexStep::WithdrawPending;
+                // The landing time stays, so a sweep that keeps failing parks
+                // instead of a notice loop. A release then gives one new notice.
+                let now = now_ts();
+                let waited = now.saturating_sub(state.withdraw.bridge.withdraw_bridge_funded_at_ts.unwrap_or(now));
+                if waited > DEPOSIT_NOTICE_WINDOW_SECS {
+                    return Err(side_effect_ambiguous(format!(
+                        "bridge deposit {bridge_id} dropped by the provider {waited}s after the funds landed: {reason}"
+                    )));
+                }
                 warn!(
                     "[mexc] liq_id={} bridge deposit {} dropped by the provider, notifying again: {}",
-                    state.liq_id,
-                    bridge_id,
-                    reason.unwrap_or_default()
+                    state.liq_id, bridge_id, reason
                 );
-                state.withdraw.bridge.withdraw_bridge_id = None;
-                state.withdraw.bridge.withdraw_bridge_funded_at_ts = Some(now_ts());
-                state.step = CexStep::WithdrawPending;
                 Ok(())
             }
             BridgeStatus::Failed { reason } => Err(format!(

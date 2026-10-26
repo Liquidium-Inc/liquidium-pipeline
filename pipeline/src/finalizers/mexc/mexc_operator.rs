@@ -1,6 +1,6 @@
 //! What a parked MEXC leg asks an operator, and where an answer is written.
 //! Each park keeps its undecided action in one place of the leg state.
-use liquidium_pipeline_connectors::backend::cex_backend::CexBackend;
+use liquidium_pipeline_connectors::backend::{bridge_backend::BridgeRouteKind, cex_backend::CexBackend};
 
 use super::mexc_finalizer::MexcFinalizer;
 use crate::{
@@ -19,6 +19,8 @@ enum Undecided {
     Withdrawal,
     /// The provider call that bridges the deposit.
     BridgeCall,
+    /// The ckSOL notice after a landed send: the minter's deposit id.
+    DepositId,
 }
 
 /// A saved send only an operator can decide: it parked, or it may have run
@@ -36,7 +38,7 @@ fn send_question(purpose: &str, record: &OutboundRecord, receipt: &str) -> Opera
     }
 }
 
-fn open_questions(state: &CexState) -> Vec<(Undecided, OperatorQuestion)> {
+fn open_questions<C: CexBackend>(state: &CexState) -> Vec<(Undecided, OperatorQuestion)> {
     let mut questions = Vec::new();
     if let Some(record) = undecided(&state.deposit.deposit_funding) {
         questions.push((
@@ -62,12 +64,31 @@ fn open_questions(state: &CexState) -> Vec<(Undecided, OperatorQuestion)> {
             send_question("deposit bridge call", record, "bridge id"),
         ));
     }
+    // The minter answers a lost notice only with `ValueTooSmall` once it has
+    // minted, so the deposit id must come from an operator.
+    let funds = &state.withdraw.bridge;
+    if let (None, None, Some(transfer)) = (
+        &funds.withdraw_bridge_id,
+        &funds.withdraw_bridge_funding,
+        &funds.withdraw_bridge_funding_txid,
+    ) && MexcFinalizer::<C>::withdraw_route(state)
+        .is_some_and(|route| route.route_kind == BridgeRouteKind::SolanaToIcp)
+    {
+        questions.push((
+            Undecided::DepositId,
+            OperatorQuestion {
+                detail: format!(
+                    "which ckSOL deposit holds SOL transfer {transfer}? --landed <deposit id> | --absent (notify the minter again)"
+                ),
+            },
+        ));
+    }
     questions
 }
 
 impl<C: CexBackend> MexcFinalizer<C> {
     pub(super) fn operator_questions_for(state: &CexState) -> Vec<OperatorQuestion> {
-        open_questions(state)
+        open_questions::<C>(state)
             .into_iter()
             .map(|(_, question)| question)
             .collect()
@@ -76,7 +97,7 @@ impl<C: CexBackend> MexcFinalizer<C> {
     /// Writes the answer where the leg reads it on its next run. A leg with
     /// an open question needs an answer; a leg without one takes a release only.
     pub(super) fn answer_operator(state: &mut CexState, answer: Option<&OperatorDecision>) -> Result<(), String> {
-        let mut questions = open_questions(state);
+        let mut questions = open_questions::<C>(state);
         if questions.len() > 1 {
             let details: Vec<String> = questions.into_iter().map(|(_, question)| question.detail).collect();
             return Err(format!(
@@ -85,25 +106,43 @@ impl<C: CexBackend> MexcFinalizer<C> {
                 details.join("; ")
             ));
         }
-        let (undecided, question) = match (questions.pop(), answer) {
+        let (undecided, question, answer) = match (questions.pop(), answer) {
             (None, None) => return Ok(()),
             (None, Some(_)) => return Err("leg has no open question; release it with --release".to_string()),
             (Some((_, question)), None) => {
                 return Err(format!("leg waits for an answer: {}", question.detail));
             }
-            (Some(open), Some(_)) => open,
+            (Some((undecided, question)), Some(answer)) => (undecided, question, answer),
         };
-        let answer = answer.expect("matched above");
-        let missing = || format!("open question has no saved state: {}", question.detail);
         let send = match undecided {
             Undecided::DepositFunding => &mut state.deposit.deposit_funding,
             Undecided::BridgeFunding => &mut state.withdraw.bridge.withdraw_bridge_funding,
             Undecided::Withdrawal => &mut state.withdraw.withdraw_send,
             Undecided::BridgeCall => &mut state.deposit.bridge.deposit_bridge_call,
+            Undecided::DepositId => return record_deposit_id(state, answer),
         };
         // The next run asks the chain or MEXC first, so the decision is used
         // only while that answer stays open.
-        send.as_mut().ok_or_else(missing)?.decide(answer.clone());
+        send.as_mut()
+            .ok_or_else(|| format!("open question has no saved state: {}", question.detail))?
+            .decide(answer.clone());
         Ok(())
     }
+}
+
+/// The notice step reads a numeric send handle as the minter's deposit id.
+/// `--absent` clears it, so the next notice asks the minter again.
+fn record_deposit_id(state: &mut CexState, answer: &OperatorDecision) -> Result<(), String> {
+    let handle = &mut state.withdraw.bridge.withdraw_bridge_send_handle;
+    *handle = match answer {
+        OperatorDecision::Landed { receipt } => {
+            let deposit_id = receipt
+                .trim()
+                .parse::<u64>()
+                .map_err(|_| format!("a ckSOL deposit id is a number, not `{receipt}`"))?;
+            Some(deposit_id.to_string())
+        }
+        OperatorDecision::Absent => None,
+    };
+    Ok(())
 }

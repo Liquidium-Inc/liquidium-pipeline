@@ -17,7 +17,6 @@ use solana_sdk::{
 
 use liquidium_pipeline_core::outbound::{SendOutcome, side_effect_ambiguous};
 use serde::{Deserialize, Serialize};
-use solana_client::{client_error::ClientErrorKind, rpc_request::RpcError};
 
 /// How long a plain transfer waits for a decided answer before it reports
 /// an open one. A blockhash expires after about 60 seconds and finalizes
@@ -43,9 +42,8 @@ enum Reading {
     Open,
 }
 
-/// Decides one read. `status` is `None` when the read failed and `Some(None)`
-/// when the node does not know the signature. Absence proves expiry only when
-/// the node answering the status had seen the finalized slot compared with.
+/// Decides one read; `status` is `None` for a failed read, `Some(None)` for an unknown signature.
+/// Absence proves expiry only when the answering node had seen the finalized slot.
 fn read_outcome(
     status: Option<Option<(bool, Option<String>)>>,
     status_slot: Option<u64>,
@@ -324,13 +322,9 @@ impl SolanaBackend for SolanaBackendImpl {
             Ok(_) => SendOutcome::Open {
                 reason: "sent; waiting for confirmation".to_string(),
             },
-            // The node answered with an error, preflight failures included,
-            // and forwards nothing in that case.
-            Err(error) if matches!(error.kind(), ClientErrorKind::RpcError(RpcError::RpcResponseError { .. })) => {
-                SendOutcome::NeverLanded {
-                    reason: format!("solana node refused transaction {}: {error}", tx.signature),
-                }
-            }
+            // A refusal, such as "already processed" for a replayed copy, does
+            // not prove that an earlier copy never landed. The cluster decides:
+            // the status cache, or the blockhash expiry.
             Err(error) => SendOutcome::Open {
                 reason: format!("solana send of {} has no answer: {error}", tx.signature),
             },
@@ -339,7 +333,7 @@ impl SolanaBackend for SolanaBackendImpl {
 
     async fn signed_outcome(&self, tx: &SignedSolanaTx) -> SendOutcome {
         let Ok(signature) = Signature::from_str(&tx.signature) else {
-            return SendOutcome::NeverLanded {
+            return SendOutcome::Open {
                 reason: format!("invalid saved Solana signature {}", tx.signature),
             };
         };

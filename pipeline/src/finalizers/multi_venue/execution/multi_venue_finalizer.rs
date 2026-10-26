@@ -293,13 +293,13 @@ impl MultiVenueFinalizer {
         self.persist_wrapper(wal, row, wrapper).await
     }
 
-    /// The single point where a finalization envelope reaches the WAL. Callers
-    /// stage their payload transition into `wrapper` first.
     /// The adapter registered for a venue id.
     pub(crate) fn venue_adapter(&self, venue_id: &str) -> Option<&dyn MultiVenueAdapter> {
         self.venues.adapter(venue_id)
     }
 
+    /// The single point where a finalization envelope reaches the WAL. Callers
+    /// stage their payload transition into `wrapper` first.
     pub(crate) async fn persist_wrapper(
         &self,
         wal: &dyn WalStore,

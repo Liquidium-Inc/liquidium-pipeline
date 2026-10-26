@@ -31,11 +31,16 @@ and `BRIDGE_IC_PROXY_CANISTER` for the cycle-funded deposit call.
 
 The finalizer runs a SOL -> ckSOL return in steps. It saves the signed SOL
 transfer before it sends it, and decides the transfer from the cluster. It then
-calls `deposit_sol` until the minter returns a deposit id. A repeated call is
-safe: the minter returns the id of the deposit in flight. A dropped sweep gets a
-new `deposit_sol` call. The row parks for an operator when the minter does not
-accept the deposit within 30 minutes, or quarantines it. A handle without a
-deposit id, from the older flow or the manual `bridge-sol` command, also parks.
+calls `deposit_sol` until the minter returns a deposit id. The first call waits
+20 seconds after the transfer lands, because the minter reads only finalized
+transfers and each call costs cycles. While the deposit is in flight, a repeated
+call returns the same id. After the mint, a repeated call gets `ValueTooSmall`,
+so a lost reply parks the row after 30 minutes. Reconcile then asks for the
+deposit id (`--landed <id>`); the next cycle checks the id with the minter. A
+dropped sweep gets a new `deposit_sol` call, and a sweep that still fails 30
+minutes after the transfer parks. The row also parks when the minter quarantines
+the deposit. A handle without a deposit id, from the older flow or the manual
+`bridge-sol` command, goes back to the `deposit_sol` step.
 Legacy balance-threshold handles and the legacy CLI `process-deposit` command
 are not migrated.
 

@@ -101,8 +101,8 @@ pub trait MultiVenueAdapter: Send + Sync {
         Err(format!("venue `{}` has no operator release", self.venue_id()))
     }
 
-    /// Writes an operator's answer into a parked leg and clears the park. It
-    /// makes no venue call; the leg acts on the next cycle. `None` releases only.
+    /// Writes an operator's answer (`None` releases only) into a parked leg and
+    /// clears the park. It makes no venue call; the leg acts on the next cycle.
     fn operator_release(
         &self,
         leg: &VenueLegState,

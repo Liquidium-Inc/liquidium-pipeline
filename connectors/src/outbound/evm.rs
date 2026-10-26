@@ -5,7 +5,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use liquidium_pipeline_core::outbound::{OutboundIntent, OutboundSender, PreparedSend, SendOutcome};
 
-use super::{decode, encode};
+use super::{decode_payload, encode_payload};
 use crate::backend::{
     bridge_backend::ckerc20_bridge::BridgeEvmBackend,
     evm_backend::{Broadcast, SignedEvmTx},
@@ -22,7 +22,7 @@ pub(crate) fn prepared_send(tx: &SignedEvmTx) -> Result<PreparedSend, String> {
     Ok(PreparedSend {
         sender: NAME.to_string(),
         identity: format!("{:#x}", tx.hash),
-        payload: encode(tx)?,
+        payload: encode_payload(tx)?,
         // The same bytes cannot land twice: their nonce is used once.
         replay_safe: true,
     })
@@ -40,7 +40,7 @@ impl<E: BridgeEvmBackend> EvmSender<E> {
 }
 
 fn saved_tx(prepared: &PreparedSend) -> Result<SignedEvmTx, SendOutcome> {
-    decode(&prepared.payload).map_err(|reason| SendOutcome::NeverLanded { reason })
+    decode_payload(&prepared.payload).map_err(|reason| SendOutcome::Open { reason })
 }
 
 #[async_trait]

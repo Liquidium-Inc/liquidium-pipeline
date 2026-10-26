@@ -1,8 +1,5 @@
 //! Outbound sends: calls that move our funds out of an account we control.
-//!
-//! Every chain implements [`OutboundSender`], so the pipeline can save the
-//! identity of a send before the call and decide it from the chain afterwards.
-//! A send is never repeated on a guess: only the chain or an operator decides.
+//! The pipeline saves a send before the call, and only the chain or an operator decides it.
 use async_trait::async_trait;
 use candid::Nat;
 use serde::{Deserialize, Serialize};

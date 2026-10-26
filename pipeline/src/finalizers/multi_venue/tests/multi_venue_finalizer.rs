@@ -242,6 +242,16 @@ impl BatchWal {
             .status = status;
     }
 
+    fn error_count(&self, liquidation_id: u128) -> i32 {
+        self.rows
+            .lock()
+            .expect("batch WAL lock")
+            .iter()
+            .find(|row| row.id == liquidation_id.to_string())
+            .expect("batch WAL row")
+            .error_count
+    }
+
     fn set_error_count(&self, liquidation_id: u128, error_count: i32) {
         self.rows
             .lock()
@@ -2051,12 +2061,14 @@ async fn reconcile_answers_a_parked_leg_and_queues_the_row_again() {
     assert!(error.contains("waits for an answer"), "{error}");
     assert_eq!(wal.status(LIQUIDATION_ID), ResultStatus::OperatorRequired);
 
+    wal.set_error_count(LIQUIDATION_ID, MAX_FINALIZER_ERRORS - 1);
     let report = desk
         .reconcile(request(ReconcileAction::Answer(OperatorDecision::Absent)))
         .await
         .expect("answer");
     assert!(report.contains("queued again"), "{report}");
     assert_eq!(wal.status(LIQUIDATION_ID), ResultStatus::Enqueued);
+    assert_eq!(wal.error_count(LIQUIDATION_ID), 0, "a release starts a new error budget");
 
     // The next finalize cycle advances the released leg.
     stage.process(&()).await.expect("released cycle");

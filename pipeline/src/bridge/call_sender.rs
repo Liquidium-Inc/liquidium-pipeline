@@ -9,6 +9,7 @@ use liquidium_pipeline_connectors::backend::bridge_backend::{
     BRIDGE_SUBMISSION_DEFERRED_PREFIX, BridgeBackend, BridgeRequest, FINALIZER_PERMANENT_AMOUNT_FLOOR_PREFIX,
     resolve_route,
 };
+use liquidium_pipeline_connectors::outbound::{decode_payload, encode_payload};
 use liquidium_pipeline_core::outbound::{OutboundIntent, OutboundSender, PreparedSend, SendOutcome};
 use serde::{Deserialize, Serialize};
 
@@ -82,7 +83,7 @@ pub fn prepare_bridge_call(id: String, call: &BridgeCall) -> Result<PreparedSend
     Ok(PreparedSend {
         sender: NAME.to_string(),
         identity: id,
-        payload: serde_json::to_string(call).map_err(|error| format!("encode bridge call: {error}"))?,
+        payload: encode_payload(call)?,
         // The provider has no id of ours, so a second call is a second
         // withdrawal of the same funds.
         replay_safe: false,
@@ -90,7 +91,7 @@ pub fn prepare_bridge_call(id: String, call: &BridgeCall) -> Result<PreparedSend
 }
 
 pub fn saved_call(prepared: &PreparedSend) -> Result<BridgeCall, String> {
-    serde_json::from_str(&prepared.payload).map_err(|error| format!("decode bridge call: {error}"))
+    decode_payload(&prepared.payload)
 }
 
 /// Sends bridge calls and settles them from the provider history.

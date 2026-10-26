@@ -574,7 +574,7 @@ fn describe_bridge_call(record: &Value) -> String {
     }
 }
 
-/// Rows saved before the outbound driver, until their next cycle migrates them.
+/// Rows saved before the outbound driver, until the bridge step upgrades them.
 fn describe_bridge_submit_phase(phase: &Value) -> String {
     match serde_json::from_value::<LegacyBridgeSubmitPhase>(phase.clone()) {
         Ok(LegacyBridgeSubmitPhase::WaitingFunds) => "waiting for bridge funds".to_string(),

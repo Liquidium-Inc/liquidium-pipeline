@@ -9,7 +9,7 @@ use liquidium_pipeline_core::{
     tokens::chain_token::ChainToken,
 };
 
-use super::{decode, encode};
+use super::{decode_payload, encode_payload};
 use crate::backend::solana_backend::{SignedSolanaTx, SolanaBackend};
 
 pub const NAME: &str = "solana";
@@ -30,14 +30,14 @@ pub(crate) fn prepared_send(tx: &SignedSolanaTx) -> Result<PreparedSend, String>
     Ok(PreparedSend {
         sender: NAME.to_string(),
         identity: tx.signature.clone(),
-        payload: encode(tx)?,
+        payload: encode_payload(tx)?,
         // The cluster accepts one transaction per signature.
         replay_safe: true,
     })
 }
 
 fn saved_tx(prepared: &PreparedSend) -> Result<SignedSolanaTx, SendOutcome> {
-    decode(&prepared.payload).map_err(|reason| SendOutcome::NeverLanded { reason })
+    decode_payload(&prepared.payload).map_err(|reason| SendOutcome::Open { reason })
 }
 
 #[async_trait]

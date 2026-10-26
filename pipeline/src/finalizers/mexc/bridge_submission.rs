@@ -34,21 +34,27 @@ struct BridgedDeposit<'a> {
     bridge: &'a BridgeRuntime,
     route: &'static BridgeRouteSpec,
     source_address: String,
-    fee_budget: BridgeFeeBudget,
+    /// The provider fee quote saved on first sight, so every call uses it.
     provider_fee: Option<Nat>,
 }
 
 impl BridgedDeposit<'_> {
     /// The amount the bridge can take now, or `None` while the shared bridge
     /// account or its ckETH fee balance is short.
-    async fn funding(&self, liq_id: &str, requested: f64) -> Result<Option<f64>, String> {
+    async fn funding(
+        &self,
+        liq_id: &str,
+        requested: f64,
+        fee_budget: &BridgeFeeBudget,
+        provider_fee: Option<&Nat>,
+    ) -> Result<Option<f64>, String> {
         let route = self.route;
         let source_available = self
             .bridge
             .backend
             .get_source_balance(route.source_asset, route.source_chain, &self.source_address)
             .await?;
-        let required_source_available = requested + self.fee_budget.source_fee_budget;
+        let required_source_available = requested + fee_budget.source_fee_budget;
         if source_available + WITHDRAW_BRIDGE_SOURCE_BALANCE_TOLERANCE < required_source_available {
             debug!(
                 "[mexc] liq_id={} bridged deposit waiting for source funding: available={} expected={} tolerance={} source={} route={}@{}->{}",
@@ -82,7 +88,7 @@ impl BridgedDeposit<'_> {
         };
 
         if route.route_kind == BridgeRouteKind::CkEthErc20Reverse
-            && let Some(required_fee_budget) = self.provider_fee.as_ref()
+            && let Some(required_fee_budget) = provider_fee
         {
             let required_fee_budget = nat_to_units(required_fee_budget, CKETH_DECIMALS)?;
             let fee_available = self
@@ -122,10 +128,18 @@ where
         state: &mut CexState,
         bridge: &BridgeRuntime,
         route: &'static BridgeRouteSpec,
-        deposit_fee_budget: Option<BridgeFeeBudget>,
     ) -> Result<(), String> {
         state.step = CexStep::DepositPending;
-        let deposit = self.bridged_deposit(state, bridge, route, deposit_fee_budget).await?;
+        let deposit = BridgedDeposit {
+            bridge,
+            route,
+            source_address: self.resolve_bridge_source_address(route.source_chain)?,
+            provider_fee: state
+                .deposit
+                .bridge
+                .deposit_bridge_provider_fee_budget_native_units
+                .clone(),
+        };
         Self::upgrade_legacy_bridge_call(state, &deposit)?;
         let _submit_guard =
             acquire_bridge_submit_lock(route.source_asset, route.source_chain, &deposit.source_address).await;
@@ -150,39 +164,6 @@ where
         }
     }
 
-    /// Resolves the route's source account and fee budgets. The provider fee
-    /// quote is persisted on first sight so every later cycle submits with it.
-    async fn bridged_deposit<'a>(
-        &self,
-        state: &mut CexState,
-        bridge: &'a BridgeRuntime,
-        route: &'static BridgeRouteSpec,
-        deposit_fee_budget: Option<BridgeFeeBudget>,
-    ) -> Result<BridgedDeposit<'a>, String> {
-        let source_address = self.resolve_bridge_source_address(route.source_chain)?;
-        let fee_budget = match deposit_fee_budget {
-            Some(fee_budget) => fee_budget,
-            None => {
-                bridge
-                    .backend
-                    .get_fee_budget(route.source_asset, route.source_chain, route.target_asset)
-                    .await?
-            }
-        };
-        let provider_fee = &mut state.deposit.bridge.deposit_bridge_provider_fee_budget_native_units;
-        if provider_fee.is_none() {
-            *provider_fee = fee_budget.provider_fee_budget_native_units.clone();
-        }
-        let provider_fee = provider_fee.clone();
-        Ok(BridgedDeposit {
-            bridge,
-            route,
-            source_address,
-            fee_budget,
-            provider_fee,
-        })
-    }
-
     /// Checks funding and, when it is present, saves the provider call with
     /// the history cursor taken before it. The call runs on the next step.
     async fn save_bridge_call(&self, state: &mut CexState, deposit: &BridgedDeposit<'_>) -> Result<(), String> {
@@ -199,11 +180,24 @@ where
             .bridge
             .deposit_bridge_submit_amount
             .unwrap_or_else(|| state.size_in.to_f64());
-        let Some(amount) = deposit.funding(&state.liq_id, requested).await? else {
+        let route = deposit.route;
+        let fee_budget = deposit
+            .bridge
+            .backend
+            .get_fee_budget(route.source_asset, route.source_chain, route.target_asset)
+            .await?;
+        let saved_fee = &mut state.deposit.bridge.deposit_bridge_provider_fee_budget_native_units;
+        if saved_fee.is_none() {
+            *saved_fee = fee_budget.provider_fee_budget_native_units.clone();
+        }
+        let provider_fee = saved_fee.clone();
+        let Some(amount) = deposit
+            .funding(&state.liq_id, requested, &fee_budget, provider_fee.as_ref())
+            .await?
+        else {
             return Ok(());
         };
 
-        let route = deposit.route;
         let mut call = BridgeCall {
             asset: route.source_asset.to_string(),
             source_chain: route.source_chain.to_string(),
@@ -211,7 +205,7 @@ where
             target_asset: route.target_asset.to_string(),
             destination: cex_destination.address,
             amount,
-            provider_fee_budget_native_units: deposit.provider_fee.clone(),
+            provider_fee_budget_native_units: provider_fee,
             cursor: None,
             started_at_ts: now_ts(),
         };
@@ -230,22 +224,23 @@ where
     /// into a saved call. A recorded attempt may have run, so from now on it
     /// only settles from the provider history.
     fn upgrade_legacy_bridge_call(state: &mut CexState, deposit: &BridgedDeposit<'_>) -> Result<(), String> {
-        let Some(LegacyBridgeSubmitPhase::Submitting(attempt)) = state.deposit.bridge.legacy_bridge_submit_phase.take()
-        else {
-            return Ok(());
+        let unrecorded = std::mem::take(&mut state.deposit.bridge.deposit_bridge_call_unrecorded);
+        let attempt = match state.deposit.bridge.legacy_bridge_submit_phase.take() {
+            Some(LegacyBridgeSubmitPhase::Submitting(attempt)) => attempt,
+            Some(LegacyBridgeSubmitPhase::WaitingFunds) => return Ok(()),
+            None if unrecorded && state.deposit.bridge.deposit_bridge_call.is_none() => {
+                return Self::park_unrecorded_bridge_call(state, deposit);
+            }
+            None => return Ok(()),
         };
         let call = BridgeCall {
-            asset: attempt.asset,
             source_chain: deposit.route.source_chain.to_string(),
             source_address: deposit.source_address.clone(),
             target_asset: deposit.route.target_asset.to_string(),
-            destination: attempt.destination,
-            amount: attempt.amount,
             provider_fee_budget_native_units: deposit.provider_fee.clone(),
-            cursor: attempt.cursor,
-            started_at_ts: attempt.started_at_ts,
+            ..attempt.bridge_call()
         };
-        let mut record = OutboundRecord::prepared(prepare_bridge_call(attempt.id, &call)?);
+        let mut record = OutboundRecord::prepared(prepare_bridge_call(attempt.id.clone(), &call)?);
         record.phase = if attempt.parked_for_operator {
             OutboundPhase::Parked {
                 reason: side_effect_ambiguous(format!(
@@ -257,6 +252,35 @@ where
             OutboundPhase::Submitted {
                 at: attempt.called_at_ts.unwrap_or(attempt.started_at_ts),
             }
+        };
+        state.deposit.bridge.deposit_bridge_call = Some(record);
+        Ok(())
+    }
+
+    /// An older build called the provider without a record, so its call may
+    /// have run. An operator answers the parked call before any new call.
+    fn park_unrecorded_bridge_call(state: &mut CexState, deposit: &BridgedDeposit<'_>) -> Result<(), String> {
+        let bridge = &state.deposit.bridge;
+        let call = BridgeCall {
+            asset: deposit.route.source_asset.to_string(),
+            source_chain: deposit.route.source_chain.to_string(),
+            source_address: deposit.source_address.clone(),
+            target_asset: deposit.route.target_asset.to_string(),
+            destination: bridge.deposit_bridge_destination_snapshot.clone().unwrap_or_default(),
+            amount: bridge
+                .deposit_bridge_submit_amount
+                .unwrap_or_else(|| state.size_in.to_f64()),
+            provider_fee_budget_native_units: deposit.provider_fee.clone(),
+            cursor: None,
+            started_at_ts: now_ts(),
+        };
+        let id = crate::utils::new_venue_execution_id("bridge-call");
+        let mut record = OutboundRecord::prepared(prepare_bridge_call(id, &call)?);
+        record.phase = OutboundPhase::Parked {
+            reason: side_effect_ambiguous(format!(
+                "an older build may have called the bridge for {} {} without a record; answer it with reconcile",
+                call.amount, call.asset
+            )),
         };
         state.deposit.bridge.deposit_bridge_call = Some(record);
         Ok(())

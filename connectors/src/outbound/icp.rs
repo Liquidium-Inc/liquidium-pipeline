@@ -13,7 +13,7 @@ use liquidium_pipeline_core::{
 };
 use serde::{Deserialize, Serialize};
 
-use super::{decode, encode, now_nanos};
+use super::{decode_payload, encode_payload, now_nanos};
 use crate::backend::icp_backend::IcpBackend;
 
 pub const NAME: &str = "icp";
@@ -40,9 +40,10 @@ impl<B: IcpBackend> IcpSender<B> {
     /// One call serves as submit and as settle: the ledger applies the first
     /// copy and answers every later copy with that block.
     async fn send(&self, prepared: &PreparedSend) -> SendOutcome {
-        let send: IcpSend = match decode(&prepared.payload) {
+        let send: IcpSend = match decode_payload(&prepared.payload) {
             Ok(send) => send,
-            Err(reason) => return SendOutcome::NeverLanded { reason },
+            // An unreadable record proves nothing about the chain.
+            Err(reason) => return SendOutcome::Open { reason },
         };
         let result = match &send.to {
             ChainAccount::IcpLedger(account_id_hex) => self
@@ -90,7 +91,7 @@ impl<B: IcpBackend + Send + Sync> OutboundSender for IcpSender<B> {
         Ok(PreparedSend {
             sender: NAME.to_string(),
             identity: created_at_time_nanos.to_string(),
-            payload: encode(&IcpSend {
+            payload: encode_payload(&IcpSend {
                 ledger: *ledger,
                 to: intent.to.clone(),
                 amount: intent.amount_native.clone(),
