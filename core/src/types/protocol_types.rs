@@ -67,6 +67,17 @@ pub struct LiquidationAmounts {
     pub debt_repaid: Nat,         // Amount of debt repaid
 }
 
+/// The pool's record of what one liquidation still owes, from
+/// `get_liquidation_inflow`. The pool deletes it once every payment has landed.
+#[derive(Debug, CandidType, Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub struct LiquidationInflowRecord {
+    pub debt_amount: Nat,
+    pub collateral_pool_id: Principal,
+    pub timestamp: u64,
+    pub liquidator: Principal,
+    pub debt_pool_id: Principal,
+}
+
 #[derive(Debug, CandidType, Serialize, Deserialize, Clone, PartialEq, Eq)]
 pub struct LiquidationResult {
     pub amounts: LiquidationAmounts,

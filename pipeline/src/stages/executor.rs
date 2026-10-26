@@ -14,7 +14,7 @@ use crate::{
 use liquidium_pipeline_connectors::pipeline_agent::PipelineAgent;
 
 use liquidium_pipeline_core::types::protocol_types::{
-    LiquidationResult, LiquidationStatus, ProtocolError, TransferStatus,
+    LiquidationInflowRecord, LiquidationResult, LiquidationStatus, ProtocolError, TransferStatus,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -83,6 +83,8 @@ impl<'a, A: PipelineAgent, D: LiquidationIntentStore> PipelineStage<'a, Vec<Exec
 
                 let args =
                     Encode!(&liq_req, &executor_request.min_collateral_amount).map_err(|e| e.to_string())?;
+                // Every call gets a new intent, also for a borrower whose last call lost its answer
+                // (audit L02). A repeat is a valid liquidation, or the pool rejects it and refunds the debt.
                 let intent_id = uuid::Uuid::new_v4().to_string();
                 self.intents
                     .create_submitting(&intent_id, &executor_request)
@@ -217,7 +219,48 @@ impl<'a, A: PipelineAgent, D: LiquidationIntentStore> PipelineStage<'a, Vec<Exec
             liquidations.push(receipt);
         }
 
+        for liquidation in liquidations
+            .iter()
+            .filter_map(|receipt| receipt.liquidation_result.as_ref())
+        {
+            self.report_unpaid_change_or_refund(liquidation).await;
+        }
+
         Ok(liquidations)
+    }
+}
+
+impl<A: PipelineAgent, D: LiquidationIntentStore> BasicExecutor<A, D> {
+    /// Logs a liquidation whose change or refund has not landed yet (audit L04).
+    /// The pool retries a temporary failure for about nine hours, and only a
+    /// pool admin can recover a payment that never lands, so the bot only reports it.
+    async fn report_unpaid_change_or_refund(&self, liquidation: &LiquidationResult) {
+        if matches!(liquidation.change_tx.status, TransferStatus::Success) {
+            return;
+        }
+        // The pool keeps this record until it owes nothing. A failed deposit
+        // that moved no money has none, so it needs no report.
+        match self.liquidation_inflow(liquidation.id).await {
+            Ok(None) => {}
+            Ok(Some(inflow)) => tracing::error!(
+                liquidation_id = %liquidation.id,
+                debt_amount = %inflow.debt_amount,
+                change_tx = ?liquidation.change_tx.status,
+                "[executor] the pool has not returned the change or refund yet; it retries a temporary failure for about nine hours, and if the money never lands a pool admin must recover this liquidation"
+            ),
+            Err(error) => tracing::error!(
+                liquidation_id = %liquidation.id,
+                change_tx = ?liquidation.change_tx.status,
+                "[executor] could not read what the pool still owes for this liquidation: {error}"
+            ),
+        }
+    }
+
+    async fn liquidation_inflow(&self, liquidation_id: u128) -> Result<Option<LiquidationInflowRecord>, String> {
+        let args = Encode!(&liquidation_id).map_err(|error| format!("get_liquidation_inflow encode error: {error}"))?;
+        self.agent
+            .call_query::<Option<LiquidationInflowRecord>>(&self.lending_canister, "get_liquidation_inflow", args)
+            .await
     }
 }
 
@@ -322,13 +365,23 @@ mod tests {
             timestamp: 0,
             change_tx: TxStatus {
                 tx_id: None,
-                status: TransferStatus::Pending,
+                status: TransferStatus::Success,
             },
             collateral_tx: TxStatus {
                 tx_id: None,
                 status: TransferStatus::Success,
             },
             id,
+        }
+    }
+
+    fn inflow_record() -> LiquidationInflowRecord {
+        LiquidationInflowRecord {
+            debt_amount: Nat::from(11_244u64),
+            collateral_pool_id: p("hnnn4-iyaaa-aaaar-qb4bq-cai"),
+            timestamp: 0,
+            liquidator: p("2vxsx-fae"),
+            debt_pool_id: p("hkmli-faaaa-aaaar-qb4ba-cai"),
         }
     }
 
@@ -429,7 +482,20 @@ mod tests {
         agent
             .expect_call_update::<Result<LiquidationResult, ProtocolError>>()
             .times(1)
-            .returning(move |_, _, _| Ok(Ok(make_liquidation_result(1_556u128))));
+            .returning(move |_, _, _| {
+                let mut result = make_liquidation_result(1_556u128);
+                result.change_tx.status = TransferStatus::Pending;
+                Ok(Ok(result))
+            });
+        agent
+            .expect_call_query::<Option<LiquidationInflowRecord>>()
+            .withf(move |canister, method, arg| {
+                *canister == lending_canister
+                    && method == "get_liquidation_inflow"
+                    && Decode!(arg, u128).is_ok_and(|id| id == 1_556)
+            })
+            .times(1)
+            .returning(|_, _, _| Ok(Some(inflow_record())));
 
         let mut intents = MockLiquidationIntentStore::new();
         intents.expect_create_submitting().times(1).returning(|_, _| Ok(()));
@@ -475,6 +541,54 @@ mod tests {
             "a pending change does not fail the liquidation, status was {:?}",
             receipts[0].status
         );
+    }
+
+    /// A failed deposit that moved no money leaves no pool record, so the
+    /// executor asks once and reports nothing.
+    #[tokio::test]
+    async fn a_failed_liquidation_asks_the_pool_what_it_still_owes() {
+        let mut intents = MockLiquidationIntentStore::new();
+        intents.expect_create_submitting().times(1).returning(|_, _| Ok(()));
+        intents.expect_mark_failed().times(1).returning(|_, _, _, _| Ok(()));
+        let mut agent = MockPipelineAgent::new();
+        agent
+            .expect_call_update::<Result<LiquidationResult, ProtocolError>>()
+            .times(1)
+            .returning(|_, _, _| {
+                let mut result = make_liquidation_result(9);
+                result.status = LiquidationStatus::FailedLiquidation("deposit underlying failed".to_string());
+                result.change_tx.status = TransferStatus::Pending;
+                Ok(Ok(result))
+            });
+        agent
+            .expect_call_query::<Option<LiquidationInflowRecord>>()
+            .withf(|_, method, arg| method == "get_liquidation_inflow" && Decode!(arg, u128).is_ok_and(|id| id == 9))
+            .times(1)
+            .returning(|_, _, _| Ok(None));
+        let executor = BasicExecutor::new(
+            Arc::new(agent),
+            Account {
+                owner: p("2vxsx-fae"),
+                subaccount: None,
+            },
+            p("nja4y-2yaaa-aaaae-qddxa-cai"),
+            Arc::new(intents),
+            Arc::new(ApprovalState::new()),
+        );
+
+        let receipts = executor
+            .process(&vec![make_request(
+                p("2vxsx-fae"),
+                ChainToken::Icp {
+                    ledger: p("ryjl3-tyaaa-aaaaa-aaaba-cai"),
+                    symbol: "ICP".to_string(),
+                    decimals: 8,
+                    fee: Nat::from(10_000u64),
+                },
+            )])
+            .await
+            .expect("a failed liquidation is a receipt, not an error");
+        assert!(matches!(receipts[0].status, ExecutionStatus::FailedLiquidation(_)));
     }
 
     #[tokio::test]
