@@ -2,7 +2,7 @@ use alloy::primitives::Address;
 use async_trait::async_trait;
 use candid::{CandidType, Nat, Principal};
 use icrc_ledger_types::icrc1::account::Account;
-use liquidium_pipeline_core::outbound::OutboundIntent;
+use liquidium_pipeline_core::outbound::PreparedSend;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -42,6 +42,14 @@ pub enum BridgeRouteKind {
     CkBtcToBtc,
     SolanaToIcp,
     IcpToSolana,
+}
+
+impl BridgeRouteKind {
+    /// True when one send funds the route: the bridge signs it, and the
+    /// outbound driver saves, sends and settles it.
+    pub fn funded_by_signed_send(self) -> bool {
+        matches!(self, Self::SolanaToIcp | Self::CkEthErc20Forward | Self::EthToCkEth)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -100,6 +108,16 @@ pub struct BridgeFeeBudget {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BridgeSubmission {
     pub bridge_id: String,
+}
+
+/// A signed send that funds a bridge route, and the provider handle that
+/// turns its receipt into a bridge id.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BridgeSend {
+    pub send: PreparedSend,
+    /// Opaque to the caller. It is saved with the send and given back to
+    /// `track_deposit`.
+    pub handle: String,
 }
 
 /// What the provider says about a deposit that already landed.
@@ -183,25 +201,26 @@ pub trait BridgeBackend: Send + Sync {
     /// Polls current status for a previously submitted bridge operation.
     async fn get_bridge_status(&self, bridge_id: &str) -> Result<BridgeStatus, String>;
 
-    /// The plain send that funds a route whose provider watches a deposit
-    /// address. The caller sends it through an outbound sender, then calls
-    /// `notify_deposit`. It checks the route and the source balance first.
-    async fn deposit_send(&self, request: &BridgeRequest) -> Result<OutboundIntent, String> {
+    /// Checks a request and signs the send that funds it. It sends nothing.
+    /// The caller saves the send, sends it through the outbound driver, then
+    /// calls `track_deposit` with its receipt.
+    async fn prepare_bridge_send(&self, request: &BridgeRequest) -> Result<BridgeSend, String> {
         let _ = request;
-        Err("deposit sends are not supported by this bridge backend".to_string())
+        Err("signed bridge sends are not supported by this bridge backend".to_string())
     }
 
-    /// Tells the provider about a deposit to `destination` that landed with
-    /// `funding_receipt`. A repeated call cannot move funds.
-    async fn notify_deposit(
+    /// The bridge handle for a send that landed with `receipt`. Some
+    /// providers must be told about the deposit first; asking again is safe.
+    async fn track_deposit(
         &self,
         asset: &str,
         chain: &str,
         destination: &BridgeDestination,
-        funding_receipt: &str,
+        handle: &str,
+        receipt: &str,
     ) -> Result<DepositNotice, String> {
-        let _ = (asset, chain, destination, funding_receipt);
-        Err("deposit notices are not supported by this bridge backend".to_string())
+        let _ = (asset, chain, destination, handle, receipt);
+        Err("deposit tracking is not supported by this bridge backend".to_string())
     }
 
     /// Reads the provider's history position before a submission, so a handle

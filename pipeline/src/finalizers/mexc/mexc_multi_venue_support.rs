@@ -117,6 +117,7 @@ where
                     withdraw_bridge_mint_receipt: None,
                     withdraw_bridge_destination_snapshot: None,
                     withdraw_bridge_funding: None,
+                    withdraw_bridge_send_handle: None,
                     withdraw_bridge_funding_txid: None,
                     withdraw_bridge_funded_at_ts: None,
                 },

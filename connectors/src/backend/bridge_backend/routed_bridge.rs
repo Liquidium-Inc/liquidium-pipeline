@@ -2,10 +2,8 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
-use liquidium_pipeline_core::outbound::OutboundIntent;
-
 use super::{
-    BridgeBackend, BridgeDestination, BridgeFeeBudget, BridgeRequest, BridgeStatus, BridgeSubmission,
+    BridgeBackend, BridgeDestination, BridgeFeeBudget, BridgeRequest, BridgeSend, BridgeStatus, BridgeSubmission,
     BridgeSubmissionCandidate, DepositNotice,
 };
 
@@ -76,19 +74,22 @@ impl BridgeBackend for RoutedBridgeBackend {
         self.source(&request.asset, &request.source_chain).submit_bridge(request).await
     }
 
-    async fn deposit_send(&self, request: &BridgeRequest) -> Result<OutboundIntent, String> {
-        self.source(&request.asset, &request.source_chain).deposit_send(request).await
+    async fn prepare_bridge_send(&self, request: &BridgeRequest) -> Result<BridgeSend, String> {
+        self.source(&request.asset, &request.source_chain)
+            .prepare_bridge_send(request)
+            .await
     }
 
-    async fn notify_deposit(
+    async fn track_deposit(
         &self,
         asset: &str,
         chain: &str,
         destination: &BridgeDestination,
-        funding_receipt: &str,
+        handle: &str,
+        receipt: &str,
     ) -> Result<DepositNotice, String> {
         self.source(asset, chain)
-            .notify_deposit(asset, chain, destination, funding_receipt)
+            .track_deposit(asset, chain, destination, handle, receipt)
             .await
     }
 

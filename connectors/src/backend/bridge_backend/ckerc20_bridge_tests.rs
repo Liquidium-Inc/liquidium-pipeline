@@ -18,6 +18,16 @@ use super::{
     parse_source_icp_account, resolve_cketh_route_for_request,
 };
 
+/// A helper call as the wallet signs it. Only its hash matters to the bridge.
+fn signed(hash: TxHash) -> crate::backend::evm_backend::SignedEvmTx {
+    crate::backend::evm_backend::SignedEvmTx {
+        raw: alloy::primitives::Bytes::from_static(&[0x02]),
+        hash,
+        from: Address::ZERO,
+        nonce: 7,
+    }
+}
+
 /// A wallet with nothing in the mempool, the normal state for a submission.
 fn idle_wallet() -> MockBridgeEvmBackend {
     let mut evm = MockBridgeEvmBackend::new();
@@ -203,8 +213,8 @@ async fn forward_bridge_serialises_preflight_and_defers_pending_wallet_after_res
         let mut evm = MockBridgeEvmBackend::new();
         evm.expect_has_pending_transactions().times(1).returning(|| Ok(true));
         evm.expect_erc20_approve_and_wait().times(0);
-        evm.expect_helper_deposit_native().times(0);
-        evm.expect_helper_deposit_with_subaccount().times(0);
+        evm.expect_sign_helper_deposit_native().times(0);
+        evm.expect_sign_helper_deposit_with_subaccount().times(0);
         let backend = CkErc20BridgeBackend::new(
             Arc::new(MockPipelineAgent::new()),
             Arc::new(MockIcpBackend::new()),
@@ -297,8 +307,8 @@ async fn forward_bridge_rejects_subaccount_destination_when_native_helper_is_res
     mock_evm.expect_signer_address().times(1).returning(move || signer);
     mock_evm.expect_erc20_decimals_of().times(0);
     mock_evm.expect_erc20_approve_and_wait().times(0);
-    mock_evm.expect_helper_deposit_native().times(0);
-    mock_evm.expect_helper_deposit_with_subaccount().times(0);
+    mock_evm.expect_sign_helper_deposit_native().times(0);
+    mock_evm.expect_sign_helper_deposit_with_subaccount().times(0);
     mock_evm.expect_receipt_status().times(0);
 
     let mock_icp = MockIcpBackend::new();
@@ -376,13 +386,17 @@ async fn forward_bridge_skips_approve_when_allowance_is_sufficient() {
         .returning(|_, _, _| Ok(U256::from(1_000_000u64)));
     mock_evm.expect_erc20_approve_and_wait().times(0);
     mock_evm
-        .expect_helper_deposit_native()
+        .expect_sign_helper_deposit_native()
         .withf(move |seen_helper, seen_token, seen_amount, _| {
             *seen_helper == helper && *seen_token == token && *seen_amount == amount_base_units
         })
         .times(1)
-        .returning(move |_, _, _, _| Ok(tx_hash));
-    mock_evm.expect_helper_deposit_with_subaccount().times(0);
+        .returning(move |_, _, _, _| Ok(signed(tx_hash)));
+    mock_evm
+        .expect_broadcast()
+        .times(1)
+        .returning(|_| crate::backend::evm_backend::Broadcast::Sent);
+    mock_evm.expect_sign_helper_deposit_with_subaccount().times(0);
     mock_evm.expect_receipt_status().times(0);
 
     let mock_icp = MockIcpBackend::new();
@@ -464,13 +478,17 @@ async fn forward_bridge_approves_when_allowance_is_insufficient() {
         .times(1)
         .returning(|_, _, _| Ok(TxHash::from([0x33u8; 32])));
     mock_evm
-        .expect_helper_deposit_native()
+        .expect_sign_helper_deposit_native()
         .withf(move |seen_helper, seen_token, seen_amount, _| {
             *seen_helper == helper && *seen_token == token && *seen_amount == amount_base_units
         })
         .times(1)
-        .returning(move |_, _, _, _| Ok(tx_hash));
-    mock_evm.expect_helper_deposit_with_subaccount().times(0);
+        .returning(move |_, _, _, _| Ok(signed(tx_hash)));
+    mock_evm
+        .expect_broadcast()
+        .times(1)
+        .returning(|_| crate::backend::evm_backend::Broadcast::Sent);
+    mock_evm.expect_sign_helper_deposit_with_subaccount().times(0);
     mock_evm.expect_receipt_status().times(0);
 
     let mock_icp = MockIcpBackend::new();
@@ -540,8 +558,8 @@ async fn forward_bridge_fails_preflight_when_balance_is_insufficient() {
         .returning(|_, _| Ok(U256::from(999_999u64)));
     mock_evm.expect_erc20_allowance_of().times(0);
     mock_evm.expect_erc20_approve_and_wait().times(0);
-    mock_evm.expect_helper_deposit_native().times(0);
-    mock_evm.expect_helper_deposit_with_subaccount().times(0);
+    mock_evm.expect_sign_helper_deposit_native().times(0);
+    mock_evm.expect_sign_helper_deposit_with_subaccount().times(0);
     mock_evm.expect_receipt_status().times(0);
 
     let mock_icp = MockIcpBackend::new();
@@ -616,19 +634,23 @@ async fn native_forward_bridge_uses_deposit_eth_with_subaccount_helper() {
         .times(1)
         .returning(move |_| Ok(amount_wei + gas_reserve));
     mock_evm
-        .expect_helper_deposit_eth_with_subaccount()
+        .expect_sign_helper_deposit_eth_with_subaccount()
         .withf(move |seen_helper, seen_amount, _principal, subaccount| {
             *seen_helper == helper && *seen_amount == amount_wei && subaccount.as_slice() == [7u8; 32]
         })
         .times(1)
-        .returning(move |_, _, _, _| Ok(tx_hash));
-    mock_evm.expect_helper_deposit_eth_native().times(0);
+        .returning(move |_, _, _, _| Ok(signed(tx_hash)));
+    mock_evm
+        .expect_broadcast()
+        .times(1)
+        .returning(|_| crate::backend::evm_backend::Broadcast::Sent);
+    mock_evm.expect_sign_helper_deposit_eth_native().times(0);
     mock_evm.expect_erc20_decimals_of().times(0);
     mock_evm.expect_erc20_balance_of().times(0);
     mock_evm.expect_erc20_allowance_of().times(0);
     mock_evm.expect_erc20_approve_and_wait().times(0);
-    mock_evm.expect_helper_deposit_native().times(0);
-    mock_evm.expect_helper_deposit_with_subaccount().times(0);
+    mock_evm.expect_sign_helper_deposit_native().times(0);
+    mock_evm.expect_sign_helper_deposit_with_subaccount().times(0);
     mock_evm.expect_receipt_status().times(0);
 
     let backend = CkErc20BridgeBackend::new(
@@ -696,11 +718,15 @@ async fn native_forward_bridge_falls_back_to_legacy_eth_helper_for_default_subac
         .times(1)
         .returning(move |_| Ok(amount_wei + gas_reserve));
     mock_evm
-        .expect_helper_deposit_eth_native()
+        .expect_sign_helper_deposit_eth_native()
         .withf(move |seen_helper, seen_amount, _principal| *seen_helper == helper && *seen_amount == amount_wei)
         .times(1)
-        .returning(move |_, _, _| Ok(tx_hash));
-    mock_evm.expect_helper_deposit_eth_with_subaccount().times(0);
+        .returning(move |_, _, _| Ok(signed(tx_hash)));
+    mock_evm
+        .expect_broadcast()
+        .times(1)
+        .returning(|_| crate::backend::evm_backend::Broadcast::Sent);
+    mock_evm.expect_sign_helper_deposit_eth_with_subaccount().times(0);
     mock_evm.expect_receipt_status().times(0);
 
     let backend = CkErc20BridgeBackend::new(
@@ -762,8 +788,8 @@ async fn native_forward_bridge_rejects_insufficient_eth_after_gas_reserve() {
         .with(eq(signer))
         .times(1)
         .returning(move |_| Ok(U256::from(1_000_000_000_000_000_000u128) + gas_reserve - U256::from(1u8)));
-    mock_evm.expect_helper_deposit_eth_native().times(0);
-    mock_evm.expect_helper_deposit_eth_with_subaccount().times(0);
+    mock_evm.expect_sign_helper_deposit_eth_native().times(0);
+    mock_evm.expect_sign_helper_deposit_eth_with_subaccount().times(0);
 
     let backend = CkErc20BridgeBackend::new(
         Arc::new(mock_agent),
@@ -822,8 +848,8 @@ async fn native_forward_bridge_propagates_dynamic_gas_reserve_errors() {
         .times(1)
         .returning(|_| Err("native gas price fetch failed: rpc unavailable".to_string()));
     mock_evm.expect_native_balance_of().times(0);
-    mock_evm.expect_helper_deposit_eth_native().times(0);
-    mock_evm.expect_helper_deposit_eth_with_subaccount().times(0);
+    mock_evm.expect_sign_helper_deposit_eth_native().times(0);
+    mock_evm.expect_sign_helper_deposit_eth_with_subaccount().times(0);
 
     let backend = CkErc20BridgeBackend::new(
         Arc::new(mock_agent),
@@ -1853,13 +1879,16 @@ async fn forward_bridge_helper_send_error_is_ambiguous() {
         .returning(|_, _, _| Ok(U256::from(1_000_000u64)));
     mock_evm.expect_erc20_approve_and_wait().times(0);
     mock_evm
-        .expect_helper_deposit_native()
+        .expect_sign_helper_deposit_native()
         .withf(move |seen_helper, seen_token, seen_amount, _| {
             *seen_helper == helper && *seen_token == token && *seen_amount == amount_base_units
         })
         .times(1)
-        .returning(|_, _, _, _| Err("rpc timed out after eth_sendRawTransaction".to_string()));
-    mock_evm.expect_helper_deposit_with_subaccount().times(0);
+        .returning(move |_, _, _, _| Ok(signed(tx_hash)));
+    mock_evm.expect_broadcast().times(1).returning(|_| {
+        crate::backend::evm_backend::Broadcast::Unknown("rpc timed out after eth_sendRawTransaction".to_string())
+    });
+    mock_evm.expect_sign_helper_deposit_with_subaccount().times(0);
     mock_evm.expect_receipt_status().times(0);
 
     let mock_icp = MockIcpBackend::new();
@@ -1885,9 +1914,86 @@ async fn forward_bridge_helper_send_error_is_ambiguous() {
         provider_fee_budget_native_units: None,
     };
 
-    let _ = tx_hash;
     // The transaction can land after the error, so a repeat would deposit twice.
     let error = backend.submit_bridge(request).await.expect_err("the send failed");
     assert!(error.starts_with(liquidium_pipeline_core::outbound::SIDE_EFFECT_AMBIGUOUS_PREFIX), "{error}");
     assert!(error.contains("rpc timed out"), "{error}");
+}
+
+#[tokio::test]
+async fn a_forward_bridge_send_is_signed_first_and_tracked_by_its_hash() {
+    let signer = "0x1111111111111111111111111111111111111111"
+        .parse::<Address>()
+        .expect("address");
+    let helper = "0x2222222222222222222222222222222222222222"
+        .parse::<Address>()
+        .expect("address");
+    let token = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"
+        .parse::<Address>()
+        .expect("address");
+    let tx_hash = TxHash::from([0x44u8; 32]);
+
+    let mut mock_agent = MockPipelineAgent::new();
+    expect_event_boundary(&mut mock_agent);
+    mock_agent
+        .expect_call_query::<CkEthMinterInfo>()
+        .times(1)
+        .returning(move |_, _, _| {
+            Ok(CkEthMinterInfo {
+                deposit_with_subaccount_helper_contract_address: None,
+                eth_helper_contract_address: None,
+                erc20_helper_contract_address: Some(helper.to_string()),
+                cketh_ledger_id: None,
+                minimum_withdrawal_amount: None,
+            })
+        });
+    let mut mock_evm = idle_wallet();
+    mock_evm.expect_signer_address().returning(move || signer);
+    mock_evm.expect_erc20_decimals_of().returning(|_| Ok(6));
+    mock_evm
+        .expect_erc20_balance_of()
+        .returning(|_, _| Ok(U256::from(1_000_000u64)));
+    mock_evm
+        .expect_erc20_allowance_of()
+        .returning(|_, _, _| Ok(U256::from(1_000_000u64)));
+    mock_evm
+        .expect_sign_helper_deposit_native()
+        .withf(move |seen_helper, seen_token, _, _| *seen_helper == helper && *seen_token == token)
+        .times(1)
+        .returning(move |_, _, _, _| Ok(signed(tx_hash)));
+    // Signing broadcasts nothing; the outbound driver sends the saved bytes.
+    mock_evm.expect_broadcast().times(0);
+    let backend = CkErc20BridgeBackend::new(
+        Arc::new(mock_agent),
+        Arc::new(MockIcpBackend::new()),
+        Arc::new(mock_evm),
+        Principal::management_canister(),
+        Principal::management_canister(),
+    );
+    let destination = BridgeDestination::IcpAccount(Account {
+        owner: Principal::management_canister(),
+        subaccount: None,
+    });
+    let request = BridgeRequest {
+        asset: "USDC".to_string(),
+        source_chain: "ETH".to_string(),
+        source_address: signer.to_string(),
+        target_asset: "ckUSDC".to_string(),
+        destination: destination.clone(),
+        amount: 1.0,
+        provider_fee_budget_native_units: None,
+    };
+
+    let bridge_send = backend.prepare_bridge_send(&request).await.expect("signed");
+    assert_eq!(bridge_send.send.sender, "evm");
+    assert_eq!(bridge_send.send.identity, format!("{tx_hash:#x}"));
+
+    let notice = backend
+        .track_deposit("USDC", "ETH", &destination, &bridge_send.handle, &format!("{tx_hash:#x}"))
+        .await
+        .unwrap();
+    let crate::backend::bridge_backend::DepositNotice::Accepted(submission) = notice else {
+        panic!("a landed helper deposit is tracked at once");
+    };
+    assert!(submission.bridge_id.starts_with(&format!("ckmint:42:{tx_hash:#x}:")), "{}", submission.bridge_id);
 }

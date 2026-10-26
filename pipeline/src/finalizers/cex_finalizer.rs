@@ -282,9 +282,13 @@ pub struct CexWithdrawBridgeState {
     pub withdraw_bridge_polled_at_ts: Option<i64>,
     #[serde(default)]
     pub withdraw_bridge_destination_snapshot: Option<String>,
-    /// The send to a provider deposit address, saved before it is sent.
+    /// The send that funds the return bridge, saved before it is sent.
     #[serde(default)]
     pub withdraw_bridge_funding: Option<crate::finalizers::outbound::OutboundRecord>,
+    /// The provider handle saved with that send. It turns the receipt into
+    /// a bridge id.
+    #[serde(default)]
+    pub withdraw_bridge_send_handle: Option<String>,
     /// The chain receipt of that send, once it landed.
     #[serde(default)]
     pub withdraw_bridge_funding_txid: Option<String>,
@@ -792,6 +796,7 @@ mod tests {
                         withdraw_bridge_mint_receipt: None,
                         withdraw_bridge_destination_snapshot: None,
                         withdraw_bridge_funding: None,
+                        withdraw_bridge_send_handle: None,
                         withdraw_bridge_funding_txid: None,
                         withdraw_bridge_funded_at_ts: None,
                     },
@@ -956,6 +961,7 @@ mod tests {
                         withdraw_bridge_mint_receipt: None,
                         withdraw_bridge_destination_snapshot: None,
                         withdraw_bridge_funding: None,
+                        withdraw_bridge_send_handle: None,
                         withdraw_bridge_funding_txid: None,
                         withdraw_bridge_funded_at_ts: None,
                     },

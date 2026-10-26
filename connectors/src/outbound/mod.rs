@@ -1,12 +1,16 @@
 //! One `OutboundSender` per chain, and a router that picks the sender.
+mod evm;
 mod icp;
 mod router;
 mod solana;
 mod unsettled;
 
+pub use evm::EvmSender;
+pub(crate) use evm::prepared_send as evm_prepared_send;
 pub use icp::IcpSender;
-pub use router::OutboundRouter;
+pub use router::{OutboundRouter, SignedSendRouter};
 pub use solana::SolanaSender;
+pub(crate) use solana::prepared_send as solana_prepared_send;
 pub use unsettled::UnsettledSender;
 
 /// Unix time in nanoseconds, the unit ICP ledgers use for `created_at_time`.

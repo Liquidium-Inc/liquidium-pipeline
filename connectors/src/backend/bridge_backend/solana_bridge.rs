@@ -9,8 +9,8 @@ use serde::Deserialize;
 use std::{str::FromStr, sync::Arc};
 
 use super::{
-    BridgeBackend, BridgeDestination, BridgeFeeBudget, BridgeMintReceipt, BridgeRequest, BridgeRouteKind, BridgeRouteSpec, BridgeStatus,
-    BridgeSubmission, DepositNotice,
+    BridgeBackend, BridgeDestination, BridgeFeeBudget, BridgeMintReceipt, BridgeRequest, BridgeRouteKind, BridgeRouteSpec,
+    BridgeSend, BridgeStatus, BridgeSubmission, DepositNotice,
     catalog::BRIDGE_ROUTE_CATALOG, resolve_route, validate_destination_for_route,
 };
 use liquidium_pipeline_core::{
@@ -28,6 +28,7 @@ use crate::{
         },
         solana_backend::SolanaBackend,
     },
+    outbound::solana_prepared_send,
     pipeline_agent::PipelineAgent,
 };
 
@@ -908,31 +909,44 @@ where
         }
     }
 
-    async fn deposit_send(&self, request: &BridgeRequest) -> Result<OutboundIntent, String> {
+    async fn prepare_bridge_send(&self, request: &BridgeRequest) -> Result<BridgeSend, String> {
         let route = Self::resolve_solana_route_for_request(request)?;
         validate_destination_for_route(route, &request.destination)?;
         if route.route_kind != BridgeRouteKind::SolanaToIcp {
             return Err(format!(
-                "route {}@{} -> {} has no deposit send",
+                "route {}@{} -> {} has no signed bridge send",
                 route.source_asset, route.source_chain, route.target_asset
             ));
         }
-        self.solana_to_icp_send(route, request).await
+        let send = self.solana_to_icp_send(route, request).await?;
+        let ChainAccount::Solana(deposit_address) = &send.to else {
+            return Err("ckSOL deposit address is not a Solana address".to_string());
+        };
+        let tx = self
+            .solana_backend
+            .prepare_transfer(None, deposit_address, send.amount_native)
+            .await?;
+        Ok(BridgeSend {
+            send: solana_prepared_send(&tx)?,
+            // The minter keys deposits by account, so the send needs no handle.
+            handle: String::new(),
+        })
     }
 
-    async fn notify_deposit(
+    async fn track_deposit(
         &self,
         asset: &str,
         chain: &str,
         destination: &BridgeDestination,
-        funding_receipt: &str,
+        _handle: &str,
+        receipt: &str,
     ) -> Result<DepositNotice, String> {
         let route = Self::solana_route_from_source(asset, chain)?;
         if route.route_kind != BridgeRouteKind::SolanaToIcp {
-            return Err(format!("route {asset}@{chain} has no deposit notice"));
+            return Err(format!("route {asset}@{chain} has no deposit to track"));
         }
         validate_destination_for_route(route, destination)?;
-        self.notify_sol_deposit(route, destination, funding_receipt).await
+        self.notify_sol_deposit(route, destination, receipt).await
     }
 
     async fn get_bridge_status(&self, bridge_id: &str) -> Result<BridgeStatus, String> {
@@ -1014,7 +1028,7 @@ where
 mod tests {
     use super::super::{BridgeBackend, BridgeDestination, BridgeRequest};
     use super::{
-        ChainAccount, ChainToken, CkSolMinterInfo, CkSolTxFinalizedStatus, DepositNotice, DepositSolError,
+        CkSolMinterInfo, CkSolTxFinalizedStatus, DepositNotice, DepositSolError,
         CkSolWithdrawalError, CkSolWithdrawalOk, CkSolWithdrawalStatus, DEFAULT_SOLANA_BRIDGE_FEE_BUFFER_LAMPORTS,
         DEPOSIT_BRIDGE_ID_PREFIX, DepositBridgePollState, SolanaBridgeBackend, WITHDRAW_BRIDGE_ID_PREFIX,
     };
@@ -1326,7 +1340,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_deposit_send_names_the_minter_address_and_sends_nothing() {
+    async fn the_bridge_send_is_a_signed_transfer_to_the_minter_address() {
         let recipient = Principal::from_slice(&[42]);
         let subaccount = Some([9u8; 32]);
         let mut request = sol_to_icp_request(recipient, subaccount);
@@ -1352,12 +1366,30 @@ mod tests {
             .times(1)
             .returning(|| Ok(Nat::from(3_000_000_000u64)));
         solana.expect_native_transfer().times(0);
+        solana
+            .expect_prepare_transfer()
+            .times(1)
+            .withf(|mint, to, amount| mint.is_none() && *to == deposit_address() && *amount == Nat::from(2_000_000_000u64))
+            .returning(|_, _, _| {
+                let payer = solana_sdk::signature::Keypair::new();
+                let transaction = solana_sdk::transaction::Transaction::new_signed_with_payer(
+                    &[],
+                    Some(&solana_sdk::signer::Signer::pubkey(&payer)),
+                    &[&payer],
+                    solana_sdk::hash::Hash::default(),
+                );
+                Ok(crate::backend::solana_backend::SignedSolanaTx {
+                    signature: transaction.signatures[0].to_string(),
+                    transaction,
+                    last_valid_block_height: 9,
+                })
+            });
 
-        let send = backend(agent, icp, solana).deposit_send(&request).await.unwrap();
+        let bridge_send = backend(agent, icp, solana).prepare_bridge_send(&request).await.unwrap();
 
-        assert_eq!(send.to, ChainAccount::Solana(deposit_address()));
-        assert_eq!(send.amount_native, Nat::from(2_000_000_000u64));
-        assert!(matches!(send.token, ChainToken::SolanaNative { decimals: 9, .. }));
+        assert_eq!(bridge_send.send.sender, "solana");
+        assert!(bridge_send.send.replay_safe);
+        assert!(bridge_send.handle.is_empty(), "the minter keys deposits by account");
     }
 
     #[tokio::test]
@@ -1397,7 +1429,7 @@ mod tests {
             let backend = backend(agent, MockIcpBackend::new(), MockSolanaBackend::new());
 
             let notice = backend
-                .notify_deposit("SOL", "SOL", &destination, "sig-9")
+                .track_deposit("SOL", "SOL", &destination, "", "sig-9")
                 .await
                 .unwrap();
 

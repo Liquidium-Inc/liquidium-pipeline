@@ -272,31 +272,35 @@ where
         state.step = CexStep::WithdrawPending;
         let now = now_ts();
         let liq_id = state.liq_id.clone();
-        let starting = request.is_some();
         let funds = &mut state.withdraw.bridge;
         let Some(receipt) = funds.withdraw_bridge_funding_txid.clone() else {
-            let intent = match request {
-                Some(request) => {
-                    // The deposit address is shared, and the provider takes one
-                    // deposit at a time. A second send would merge with it.
-                    if let Some(other) = Self::other_open_deposit_send(bridge, route, &liq_id).await? {
-                        info!(
-                            "[mexc] liq_id={} bridge deposit waits for liq_id={} on the same deposit address",
-                            liq_id, other
-                        );
+            if let Some(request) = request {
+                // The ckSOL deposit address is shared, and the minter takes
+                // one deposit at a time. A second send would merge with it.
+                if route.route_kind == BridgeRouteKind::SolanaToIcp
+                    && let Some(other) = Self::other_open_deposit_send(bridge, route, &liq_id).await?
+                {
+                    info!(
+                        "[mexc] liq_id={} bridge deposit waits for liq_id={} on the same deposit address",
+                        liq_id, other
+                    );
+                    return Ok(());
+                }
+                let bridge_send = match bridge.backend.prepare_bridge_send(request).await {
+                    Ok(bridge_send) => bridge_send,
+                    // A busy bridge wallet is a wait. Nothing was signed.
+                    Err(error) if error.starts_with(BRIDGE_SUBMISSION_DEFERRED_PREFIX) => {
+                        info!("[mexc] liq_id={} bridged withdraw deferred: {}", liq_id, error);
                         return Ok(());
                     }
-                    Some(bridge.backend.deposit_send(request).await?)
-                }
-                None => None,
-            };
-            let landed = step_outbound(
-                &mut funds.withdraw_bridge_funding,
-                bridge.outbound.as_ref(),
-                intent.as_ref(),
-                now,
-            )
-            .await?;
+                    Err(error) => return Err(error),
+                };
+                funds.withdraw_bridge_funding = Some(OutboundRecord::prepared(bridge_send.send));
+                funds.withdraw_bridge_send_handle = Some(bridge_send.handle);
+                state.send_saved = true;
+                return Ok(());
+            }
+            let landed = step_outbound(&mut funds.withdraw_bridge_funding, bridge.outbound.as_ref(), None, now).await?;
             if let Some(receipt) = landed {
                 info!(
                     "[mexc] liq_id={} bridge deposit send landed: receipt={} route={}@{}->{}",
@@ -305,14 +309,14 @@ where
                 funds.withdraw_bridge_funding_txid = Some(receipt);
                 funds.withdraw_bridge_funded_at_ts = Some(now);
             }
-            state.send_saved = starting && state.withdraw.bridge.withdraw_bridge_funding.is_some();
             // The provider reads the deposit at its own commitment, so the
-            // notice runs on the next cycle.
+            // tracking runs on the next cycle.
             return Ok(());
         };
+        let handle = funds.withdraw_bridge_send_handle.clone().unwrap_or_default();
         match bridge
             .backend
-            .notify_deposit(route.source_asset, route.source_chain, destination, &receipt)
+            .track_deposit(route.source_asset, route.source_chain, destination, &handle, &receipt)
             .await?
         {
             DepositNotice::Accepted(submission) => {
@@ -1600,9 +1604,9 @@ where
                 amount: bridge_amount,
                 provider_fee_budget_native_units: None,
             };
-            // The minter watches a deposit address, so the SOL goes there as
-            // a plain send that the outbound driver saves and settles.
-            if route.route_kind == BridgeRouteKind::SolanaToIcp {
+            // The bridge signs the send that funds the route, and the
+            // outbound driver saves, sends and settles it.
+            if route.route_kind.funded_by_signed_send() {
                 return self
                     .advance_withdraw_deposit_send(state, bridge, route, &request.destination, Some(&request))
                     .await;

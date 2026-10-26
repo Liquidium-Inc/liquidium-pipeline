@@ -230,6 +230,31 @@ fn bridge_dependencies(backend: Arc<MockBridgeBackend>) -> BridgeRuntime {
     BridgeRuntime::for_tests(backend)
 }
 
+/// A helper deposit as the EVM bridge signs it.
+fn evm_bridge_send() -> liquidium_pipeline_connectors::backend::bridge_backend::BridgeSend {
+    liquidium_pipeline_connectors::backend::bridge_backend::BridgeSend {
+        send: liquidium_pipeline_core::outbound::PreparedSend {
+            sender: "evm".into(),
+            identity: "0xhelper".into(),
+            payload: "signed-call".into(),
+            replay_safe: true,
+        },
+        handle: "mint-handle".into(),
+    }
+}
+
+/// A bridge wallet sender whose send lands on the first try.
+fn landing_sender() -> liquidium_pipeline_core::outbound::MockOutboundSender {
+    let mut sender = liquidium_pipeline_core::outbound::MockOutboundSender::new();
+    sender
+        .expect_submit()
+        .times(1)
+        .returning(|_| liquidium_pipeline_core::outbound::SendOutcome::Landed {
+            receipt: "0xhelper".into(),
+        });
+    sender
+}
+
 /// Runs the two funding cycles: the first saves the transfer, the second sends it.
 async fn fund(finalizer: &MexcFinalizer<MockCexBackend>, state: &mut CexState) {
     finalizer.deposit(state).await.expect("the first cycle saves the funding transfer");
@@ -1577,21 +1602,24 @@ async fn mexc_withdraw_bridge_submit_resume_complete_and_idempotent() {
             Ok(1.5)
         });
 
-    bridge.expect_submit_bridge().times(1).returning(|request| {
+    bridge.expect_prepare_bridge_send().times(1).returning(|request| {
         assert_eq!(request.asset, "USDC");
         assert_eq!(request.source_chain, "ETH");
         assert_eq!(request.target_asset, "ckUSDC");
         assert_eq!(request.source_address, "0x2222222222222222222222222222222222222222");
-        match request.destination {
+        match &request.destination {
             BridgeDestination::IcpAccount(account) => {
                 assert_eq!(account.owner, Principal::management_canister());
                 assert!(account.subaccount.is_none());
             }
             other => panic!("unexpected bridge destination: {:?}", other),
         }
-        Ok(BridgeSubmission {
+        Ok(evm_bridge_send())
+    });
+    bridge.expect_track_deposit().times(1).returning(|_, _, _, _, _| {
+        Ok(DepositNotice::Accepted(BridgeSubmission {
             bridge_id: "bridge-withdraw-1".to_string(),
-        })
+        }))
     });
 
     let bridge_status_calls = Arc::new(std::sync::Mutex::new(0u8));
@@ -1631,7 +1659,7 @@ async fn mexc_withdraw_bridge_submit_resume_complete_and_idempotent() {
         TEST_CEX_MIN_EXEC_USD,
         TEST_CEX_SLICE_TARGET_RATIO,
     )
-    .with_bridge_runtime(bridge_dependencies(Arc::new(bridge)));
+    .with_bridge_runtime(bridge_dependencies(Arc::new(bridge)).with_outbound(Arc::new(landing_sender())));
 
     let receipt = make_execution_receipt_with_assets(11, ckbtc_token(), ckusdc_token());
     let mut state = finalizer.prepare("11", &receipt).await.expect("prepare should succeed");
@@ -1661,6 +1689,8 @@ async fn mexc_withdraw_bridge_submit_resume_complete_and_idempotent() {
         .withdraw(&mut state)
         .await
         .expect("withdraw completion should submit bridge once");
+    finalizer.withdraw(&mut state).await.expect("the saved bridge send goes out");
+    finalizer.withdraw(&mut state).await.expect("the landed send is tracked");
     assert!(matches!(state.step, CexStep::WithdrawPending));
     assert_eq!(
         state.withdraw.bridge.withdraw_bridge_id.as_deref(),
@@ -1811,16 +1841,19 @@ async fn mexc_withdraw_bridge_deferral_keeps_step_pending_then_submits() {
     bridge.expect_get_source_balance().times(2).returning(|_, _, _| Ok(1.5));
     let calls = Arc::new(std::sync::Mutex::new(0u32));
     let submit_calls = calls.clone();
-    bridge.expect_submit_bridge().times(2).returning(move |_| {
+    bridge.expect_prepare_bridge_send().times(2).returning(move |_| {
         let mut calls = submit_calls.lock().unwrap();
         *calls += 1;
         if *calls == 1 {
             Err(format!("{BRIDGE_SUBMISSION_DEFERRED_PREFIX}: bridge wallet has pending transactions"))
         } else {
-            Ok(BridgeSubmission {
-                bridge_id: "bridge-after-wait".to_string(),
-            })
+            Ok(evm_bridge_send())
         }
+    });
+    bridge.expect_track_deposit().times(1).returning(|_, _, _, _, _| {
+        Ok(DepositNotice::Accepted(BridgeSubmission {
+            bridge_id: "bridge-after-wait".to_string(),
+        }))
     });
 
     let finalizer = MexcFinalizer::new(
@@ -1831,7 +1864,7 @@ async fn mexc_withdraw_bridge_deferral_keeps_step_pending_then_submits() {
         TEST_CEX_MIN_EXEC_USD,
         TEST_CEX_SLICE_TARGET_RATIO,
     )
-    .with_bridge_runtime(bridge_dependencies(Arc::new(bridge)));
+    .with_bridge_runtime(bridge_dependencies(Arc::new(bridge)).with_outbound(Arc::new(landing_sender())));
 
     let receipt = make_execution_receipt_with_assets(112, ckbtc_token(), ckusdc_token());
     let mut state = finalizer.prepare("112", &receipt).await.expect("prepare should succeed");
@@ -1851,6 +1884,8 @@ async fn mexc_withdraw_bridge_deferral_keeps_step_pending_then_submits() {
     assert!(state.withdraw.bridge.withdraw_bridge_id.is_none());
 
     finalizer.withdraw(&mut state).await.expect("bridge submits once the wallet is idle");
+    finalizer.withdraw(&mut state).await.expect("the saved bridge send goes out");
+    finalizer.withdraw(&mut state).await.expect("the landed send is tracked");
     assert!(matches!(state.step, CexStep::WithdrawPending));
     assert_eq!(
         state.withdraw.bridge.withdraw_bridge_id.as_deref(),
@@ -1984,14 +2019,17 @@ async fn mexc_withdraw_bridge_applies_cex_withdraw_fee_to_submit_amount() {
             Ok(1.45)
         });
 
-    bridge.expect_submit_bridge().times(1).returning(|request| {
+    bridge.expect_prepare_bridge_send().times(1).returning(|request| {
         assert_eq!(request.asset, "USDC");
         assert_eq!(request.source_chain, "ETH");
         assert_eq!(request.target_asset, "ckUSDC");
         assert!((request.amount - 1.4).abs() < 1e-12);
-        Ok(BridgeSubmission {
+        Ok(evm_bridge_send())
+    });
+    bridge.expect_track_deposit().times(1).returning(|_, _, _, _, _| {
+        Ok(DepositNotice::Accepted(BridgeSubmission {
             bridge_id: "bridge-withdraw-fee-apply".to_string(),
-        })
+        }))
     });
     bridge.expect_get_bridge_status().times(0);
 
@@ -2003,7 +2041,7 @@ async fn mexc_withdraw_bridge_applies_cex_withdraw_fee_to_submit_amount() {
         TEST_CEX_MIN_EXEC_USD,
         TEST_CEX_SLICE_TARGET_RATIO,
     )
-    .with_bridge_runtime(bridge_dependencies(Arc::new(bridge)));
+    .with_bridge_runtime(bridge_dependencies(Arc::new(bridge)).with_outbound(Arc::new(landing_sender())));
 
     let receipt = make_execution_receipt_with_assets(112, ckbtc_token(), ckusdc_token());
     let mut state = finalizer
@@ -2030,6 +2068,8 @@ async fn mexc_withdraw_bridge_applies_cex_withdraw_fee_to_submit_amount() {
         .withdraw(&mut state)
         .await
         .expect("bridge submit should apply CEX withdraw fee to amount");
+    finalizer.withdraw(&mut state).await.expect("the saved bridge send goes out");
+    finalizer.withdraw(&mut state).await.expect("the landed send is tracked");
     assert!(matches!(state.step, CexStep::WithdrawPending));
     assert_eq!(
         state.withdraw.bridge.withdraw_bridge_id.as_deref(),
@@ -2083,15 +2123,18 @@ async fn mexc_native_eth_withdraw_bridge_uses_bridgeable_balance_after_gas_reser
             Ok(0.016425721728152685)
         });
 
-    bridge.expect_submit_bridge().times(1).returning(|request| {
+    bridge.expect_prepare_bridge_send().times(1).returning(|request| {
         assert_eq!(request.asset, "ETH");
         assert_eq!(request.source_chain, "ETH");
         assert_eq!(request.target_asset, "ckETH");
         assert_eq!(request.source_address, "0x2222222222222222222222222222222222222222");
         assert!((request.amount - 0.016425721728151685).abs() < 1e-18);
-        Ok(BridgeSubmission {
+        Ok(evm_bridge_send())
+    });
+    bridge.expect_track_deposit().times(1).returning(|_, _, _, _, _| {
+        Ok(DepositNotice::Accepted(BridgeSubmission {
             bridge_id: "bridge-native-eth".to_string(),
-        })
+        }))
     });
     bridge.expect_get_bridge_status().times(0);
 
@@ -2103,7 +2146,7 @@ async fn mexc_native_eth_withdraw_bridge_uses_bridgeable_balance_after_gas_reser
         TEST_CEX_MIN_EXEC_USD,
         TEST_CEX_SLICE_TARGET_RATIO,
     )
-    .with_bridge_runtime(bridge_dependencies(Arc::new(bridge)));
+    .with_bridge_runtime(bridge_dependencies(Arc::new(bridge)).with_outbound(Arc::new(landing_sender())));
 
     let receipt = make_execution_receipt_with_assets(113, native_icp_token(), cketh_token());
     let mut state = finalizer
@@ -2130,6 +2173,8 @@ async fn mexc_native_eth_withdraw_bridge_uses_bridgeable_balance_after_gas_reser
         .withdraw(&mut state)
         .await
         .expect("bridge submit should use bridgeable source balance");
+    finalizer.withdraw(&mut state).await.expect("the saved bridge send goes out");
+    finalizer.withdraw(&mut state).await.expect("the landed send is tracked");
     assert!(matches!(state.step, CexStep::WithdrawPending));
     assert_eq!(
         state.withdraw.bridge.withdraw_bridge_id.as_deref(),
@@ -6059,19 +6104,23 @@ async fn mexc_cksol_repayment_preview_uses_icp_usdt_sol_route() {
     assert!(preview.conservative_receive.value < preview.quote.receive_amount);
 }
 
-/// A SOL sender that saves one send, reports it open once, then landed.
-fn sol_deposit_sender() -> liquidium_pipeline_core::outbound::MockOutboundSender {
-    use liquidium_pipeline_core::outbound::{PreparedSend, SendOutcome};
-    let mut sender = liquidium_pipeline_core::outbound::MockOutboundSender::new();
-    sender.expect_prepare().times(1).returning(|intent| {
-        assert_eq!(intent.to, ChainAccount::Solana("minter-deposit".into()));
-        Ok(PreparedSend {
+/// The signed SOL transfer that the bridge backend returns.
+fn sol_bridge_send() -> liquidium_pipeline_connectors::backend::bridge_backend::BridgeSend {
+    liquidium_pipeline_connectors::backend::bridge_backend::BridgeSend {
+        send: liquidium_pipeline_core::outbound::PreparedSend {
             sender: "solana".into(),
             identity: "sol-sig".into(),
-            payload: format!("{}", intent.amount_native),
+            payload: "signed-transfer".into(),
             replay_safe: true,
-        })
-    });
+        },
+        handle: String::new(),
+    }
+}
+
+/// The bridge wallet's sender: the saved send is open once, then landed.
+fn sol_deposit_sender() -> liquidium_pipeline_core::outbound::MockOutboundSender {
+    use liquidium_pipeline_core::outbound::SendOutcome;
+    let mut sender = liquidium_pipeline_core::outbound::MockOutboundSender::new();
     sender.expect_submit().times(1).returning(|_| SendOutcome::Open {
         reason: "sent".into(),
     });
@@ -6150,7 +6199,7 @@ async fn mexc_cksol_repayment_waits_for_funding_reserves_fees_and_records_mint()
         .times(1)
         .returning(|_, _, _| Ok(0.02));
     bridge.expect_submit_bridge().times(0);
-    bridge.expect_deposit_send().times(1).returning(move |request| {
+    bridge.expect_prepare_bridge_send().times(1).returning(move |request| {
         assert_eq!(
             (
                 request.asset.as_str(),
@@ -6161,15 +6210,7 @@ async fn mexc_cksol_repayment_waits_for_funding_reserves_fees_and_records_mint()
         );
         assert!((request.amount - 1.488).abs() < 1e-9);
         assert_eq!(request.destination, BridgeDestination::IcpAccount(recipient));
-        Ok(liquidium_pipeline_core::outbound::OutboundIntent {
-            token: ChainToken::SolanaNative {
-                symbol: "SOL".into(),
-                decimals: 9,
-                fee: Nat::from(5_000u64),
-            },
-            to: ChainAccount::Solana("minter-deposit".into()),
-            amount_native: Nat::from(1_488_000_000u64),
-        })
+        Ok(sol_bridge_send())
     });
     let notices = Arc::new(std::sync::Mutex::new(vec![
         DepositNotice::Accepted(BridgeSubmission {
@@ -6180,9 +6221,9 @@ async fn mexc_cksol_repayment_waits_for_funding_reserves_fees_and_records_mint()
         },
     ]));
     bridge
-        .expect_notify_deposit()
+        .expect_track_deposit()
         .times(2)
-        .returning(move |asset, chain, destination, receipt| {
+        .returning(move |asset, chain, destination, _handle, receipt| {
             assert_eq!((asset, chain, receipt), ("SOL", "SOL", "sol-sig"));
             assert_eq!(*destination, BridgeDestination::IcpAccount(recipient));
             Ok(notices.lock().unwrap().pop().unwrap())
@@ -6268,17 +6309,10 @@ async fn mexc_cksol_return_waits_while_another_row_has_an_open_sol_deposit() {
     bridge.expect_get_source_balance().returning(|_, _, _| Ok(1.49));
     bridge.expect_get_source_fee_budget().returning(|_, _, _| Ok(0.002));
     bridge.expect_get_minimum_bridge_amount().returning(|_, _, _| Ok(0.02));
-    bridge.expect_deposit_send().times(1).returning(|_| {
-        Ok(liquidium_pipeline_core::outbound::OutboundIntent {
-            token: ChainToken::SolanaNative {
-                symbol: "SOL".into(),
-                decimals: 9,
-                fee: Nat::from(5_000u64),
-            },
-            to: ChainAccount::Solana("minter-deposit".into()),
-            amount_native: Nat::from(1_488_000_000u64),
-        })
-    });
+    bridge
+        .expect_prepare_bridge_send()
+        .times(1)
+        .returning(|_| Ok(sol_bridge_send()));
     // The first scan finds another row's open SOL deposit. The second finds
     // only this row and a deposit on another route, so the send starts.
     let claims = open_deposit_sends(vec![
@@ -6295,7 +6329,7 @@ async fn mexc_cksol_return_waits_while_another_row_has_an_open_sol_deposit() {
     )
     .with_bridge_runtime(
         bridge_dependencies(Arc::new(bridge))
-            .with_outbound(Arc::new(sol_deposit_sender_prepare_only()))
+            .with_outbound(Arc::new(liquidium_pipeline_core::outbound::MockOutboundSender::new()))
             .with_claims(Arc::new(claims)),
     );
     let mut state = cksol_repayment_state(&finalizer, 1.5);
@@ -6311,20 +6345,6 @@ async fn mexc_cksol_return_waits_while_another_row_has_an_open_sol_deposit() {
     assert!(state.withdraw.bridge.withdraw_bridge_funding.is_some());
 }
 
-/// A SOL sender for a test that only saves the send.
-fn sol_deposit_sender_prepare_only() -> liquidium_pipeline_core::outbound::MockOutboundSender {
-    let mut sender = liquidium_pipeline_core::outbound::MockOutboundSender::new();
-    sender.expect_prepare().times(1).returning(|_| {
-        Ok(liquidium_pipeline_core::outbound::PreparedSend {
-            sender: "solana".into(),
-            identity: "sol-sig".into(),
-            payload: "tx".into(),
-            replay_safe: true,
-        })
-    });
-    sender
-}
-
 #[tokio::test]
 async fn mexc_cksol_deposit_notice_parks_after_its_window_and_resumes_on_acceptance() {
     let mut bridge = MockBridgeBackend::new();
@@ -6337,9 +6357,9 @@ async fn mexc_cksol_deposit_notice_parks_after_its_window_and_resumes_on_accepta
         },
     ]));
     bridge
-        .expect_notify_deposit()
+        .expect_track_deposit()
         .times(2)
-        .returning(move |_, _, _, _| Ok(notices.lock().unwrap().pop().unwrap()));
+        .returning(move |_, _, _, _, _| Ok(notices.lock().unwrap().pop().unwrap()));
     let finalizer = cksol_finalizer(MockCexBackend::new(), bridge);
     let mut state = cksol_funded_state(&finalizer, now_ts() - DEPOSIT_NOTICE_WINDOW_SECS - 1);
 
@@ -6367,13 +6387,13 @@ async fn mexc_cksol_dropped_sweep_is_notified_again_without_a_new_send() {
         .expect_get_bridge_status()
         .times(2)
         .returning(move |_| Ok(statuses.lock().unwrap().pop().unwrap()));
-    bridge.expect_notify_deposit().times(1).returning(|_, _, _, receipt| {
+    bridge.expect_track_deposit().times(1).returning(|_, _, _, _, receipt| {
         assert_eq!(receipt, "sol-sig");
         Ok(DepositNotice::Accepted(BridgeSubmission {
             bridge_id: "cksol-deposit-v2:second".into(),
         }))
     });
-    bridge.expect_deposit_send().times(0);
+    bridge.expect_prepare_bridge_send().times(0);
     let finalizer = cksol_finalizer(MockCexBackend::new(), bridge);
     let mut state = cksol_funded_state(&finalizer, now_ts() - 3_600);
     state.withdraw.bridge.withdraw_bridge_id = Some("cksol-deposit-v2:first".into());

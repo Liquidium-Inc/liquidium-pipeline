@@ -25,6 +25,17 @@ impl<S: SolanaBackend> SolanaSender<S> {
     }
 }
 
+/// The saved form of a signed transfer.
+pub(crate) fn prepared_send(tx: &SignedSolanaTx) -> Result<PreparedSend, String> {
+    Ok(PreparedSend {
+        sender: NAME.to_string(),
+        identity: tx.signature.clone(),
+        payload: encode(tx)?,
+        // The cluster accepts one transaction per signature.
+        replay_safe: true,
+    })
+}
+
 fn saved_tx(prepared: &PreparedSend) -> Result<SignedSolanaTx, SendOutcome> {
     decode(&prepared.payload).map_err(|reason| SendOutcome::NeverLanded { reason })
 }
@@ -44,13 +55,7 @@ impl<S: SolanaBackend + Send + Sync> OutboundSender for SolanaSender<S> {
             .backend
             .prepare_transfer(mint, to, intent.amount_native.clone())
             .await?;
-        Ok(PreparedSend {
-            sender: NAME.to_string(),
-            identity: tx.signature.clone(),
-            payload: encode(&tx)?,
-            // The cluster accepts one transaction per signature.
-            replay_safe: true,
-        })
+        prepared_send(&tx)
     }
 
     async fn submit(&self, prepared: &PreparedSend) -> SendOutcome {

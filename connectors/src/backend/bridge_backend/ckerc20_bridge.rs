@@ -25,7 +25,7 @@ use super::{
         WithdrawalRet, WithdrawalSearchParameter,
     },
 };
-use liquidium_pipeline_core::outbound::SIDE_EFFECT_AMBIGUOUS_PREFIX;
+use liquidium_pipeline_core::outbound::{SIDE_EFFECT_AMBIGUOUS_PREFIX, SendOutcome};
 use crate::{
     backend::{
         amount_utils::{
@@ -33,17 +33,18 @@ use crate::{
             nat_units_to_amount_via_core,
         },
         bridge_backend::{
-            BridgeBackend, BridgeFeeBudget, BridgeRequest, BridgeRouteKind, BridgeRouteSpec, BridgeStatus,
-            BridgeSubmission, BridgeSubmissionCandidate, resolve_cketh_forward_route_by_source,
-            resolve_cketh_reverse_route_by_source,
+            BridgeBackend, BridgeDestination, BridgeFeeBudget, BridgeRequest, BridgeRouteKind, BridgeRouteSpec,
+            BridgeSend, BridgeStatus, BridgeSubmission, BridgeSubmissionCandidate, DepositNotice,
+            resolve_cketh_forward_route_by_source, resolve_cketh_reverse_route_by_source,
         },
-        evm_backend::EvmBackendImpl,
+        evm_backend::{Broadcast, EvmBackendImpl, SignedEvmTx},
         icp_backend::IcpBackend,
         icp_backend_helpers::{
             icrc1_balance_with_context, icrc1_decimals_with_context, icrc1_fee_with_context,
             icrc2_allowance_with_context, icrc2_approve_with_context,
         },
     },
+    outbound::evm_prepared_send,
     pipeline_agent::PipelineAgent,
 };
 
@@ -101,37 +102,44 @@ pub trait BridgeEvmBackend: Send + Sync {
     async fn erc20_decimals_of(&self, token: Address) -> Result<u8, String>;
     async fn erc20_approve_and_wait(&self, token: Address, spender: Address, amount: U256) -> Result<TxHash, String>;
 
-    async fn helper_deposit_native(
+    // The helper calls are signed for the wallet's next nonce and not sent,
+    // so the caller can save each one before it reaches the network.
+    async fn sign_helper_deposit_native(
         &self,
         helper: Address,
         token: Address,
         amount: U256,
         recipient_principal: FixedBytes<32>,
-    ) -> Result<TxHash, String>;
+    ) -> Result<SignedEvmTx, String>;
 
-    async fn helper_deposit_with_subaccount(
+    async fn sign_helper_deposit_with_subaccount(
         &self,
         helper: Address,
         token: Address,
         amount: U256,
         recipient_principal: FixedBytes<32>,
         recipient_subaccount: FixedBytes<32>,
-    ) -> Result<TxHash, String>;
+    ) -> Result<SignedEvmTx, String>;
 
-    async fn helper_deposit_eth_native(
+    async fn sign_helper_deposit_eth_native(
         &self,
         helper: Address,
         amount: U256,
         recipient_principal: FixedBytes<32>,
-    ) -> Result<TxHash, String>;
+    ) -> Result<SignedEvmTx, String>;
 
-    async fn helper_deposit_eth_with_subaccount(
+    async fn sign_helper_deposit_eth_with_subaccount(
         &self,
         helper: Address,
         amount: U256,
         recipient_principal: FixedBytes<32>,
         recipient_subaccount: FixedBytes<32>,
-    ) -> Result<TxHash, String>;
+    ) -> Result<SignedEvmTx, String>;
+
+    async fn broadcast(&self, tx: &SignedEvmTx) -> Broadcast;
+
+    /// Decides a saved transaction from the chain.
+    async fn signed_outcome(&self, tx: &SignedEvmTx) -> SendOutcome;
 
     async fn receipt_status(&self, tx_hash: TxHash) -> Result<Option<EvmReceiptStatus>, String>;
 }
@@ -181,70 +189,78 @@ where
         self.has_pending_nonce_gap(self.signer_address()).await
     }
 
-    async fn helper_deposit_native(
+    async fn sign_helper_deposit_native(
         &self,
         helper: Address,
         token: Address,
         amount: U256,
         recipient_principal: FixedBytes<32>,
-    ) -> Result<TxHash, String> {
+    ) -> Result<SignedEvmTx, String> {
         let helper_contract = ICkErc20HelperNative::new(helper, self.provider.clone());
-        let pending = helper_contract
+        let request = helper_contract
             .deposit_1(token, amount, recipient_principal)
-            .send()
+            .into_transaction_request();
+        self.sign_request(request)
             .await
-            .map_err(|e| format!("native helper deposit failed (helper={helper}, token={token}): {e}"))?;
-        Ok(*pending.tx_hash())
+            .map_err(|e| format!("native helper deposit signing failed (helper={helper}, token={token}): {e}"))
     }
 
-    async fn helper_deposit_with_subaccount(
+    async fn sign_helper_deposit_with_subaccount(
         &self,
         helper: Address,
         token: Address,
         amount: U256,
         recipient_principal: FixedBytes<32>,
         recipient_subaccount: FixedBytes<32>,
-    ) -> Result<TxHash, String> {
+    ) -> Result<SignedEvmTx, String> {
         let helper_contract = ICkErc20HelperWithSubaccount::new(helper, self.provider.clone());
-        let pending = helper_contract
+        let request = helper_contract
             .depositErc20(token, amount, recipient_principal, recipient_subaccount)
-            .send()
+            .into_transaction_request();
+        self.sign_request(request)
             .await
-            .map_err(|e| format!("helper depositErc20 failed (helper={helper}, token={token}): {e}"))?;
-        Ok(*pending.tx_hash())
+            .map_err(|e| format!("helper depositErc20 signing failed (helper={helper}, token={token}): {e}"))
     }
 
-    async fn helper_deposit_eth_native(
+    async fn sign_helper_deposit_eth_native(
         &self,
         helper: Address,
         amount: U256,
         recipient_principal: FixedBytes<32>,
-    ) -> Result<TxHash, String> {
+    ) -> Result<SignedEvmTx, String> {
         let helper_contract = ICkErc20HelperNative::new(helper, self.provider.clone());
-        let pending = helper_contract
+        let request = helper_contract
             .deposit_0(recipient_principal)
             .value(amount)
-            .send()
+            .into_transaction_request();
+        self.sign_request(request)
             .await
-            .map_err(|e| format!("native ETH helper deposit failed (helper={helper}): {e}"))?;
-        Ok(*pending.tx_hash())
+            .map_err(|e| format!("native ETH helper deposit signing failed (helper={helper}): {e}"))
     }
 
-    async fn helper_deposit_eth_with_subaccount(
+    async fn sign_helper_deposit_eth_with_subaccount(
         &self,
         helper: Address,
         amount: U256,
         recipient_principal: FixedBytes<32>,
         recipient_subaccount: FixedBytes<32>,
-    ) -> Result<TxHash, String> {
+    ) -> Result<SignedEvmTx, String> {
         let helper_contract = ICkEthHelperWithSubaccount::new(helper, self.provider.clone());
-        let pending = helper_contract
+        let request = helper_contract
             .depositEth(recipient_principal, recipient_subaccount)
             .value(amount)
-            .send()
+            .into_transaction_request();
+        self.sign_request(request)
             .await
-            .map_err(|e| format!("ETH helper depositEth failed (helper={helper}): {e}"))?;
-        Ok(*pending.tx_hash())
+            .map_err(|e| format!("ETH helper depositEth signing failed (helper={helper}): {e}"))
+    }
+
+    async fn broadcast(&self, tx: &SignedEvmTx) -> Broadcast {
+        self.broadcast_signed(tx).await
+    }
+
+    async fn signed_outcome(&self, tx: &SignedEvmTx) -> SendOutcome {
+        EvmBackendImpl::signed_outcome(self, tx).await
     }
 
     async fn receipt_status(&self, tx_hash: TxHash) -> Result<Option<EvmReceiptStatus>, String> {
@@ -518,15 +534,16 @@ where
             })
     }
 
-    async fn submit_forward_bridge(
+    /// Checks a forward ERC20 request, sets the helper allowance and signs the
+    /// helper call. The caller holds `forward_submission` until it sends.
+    async fn sign_forward_bridge(
         &self,
         route: &BridgeRouteSpec,
         request: &BridgeRequest,
-    ) -> Result<BridgeSubmission, String> {
-        // Exact approvals replace the wallet's allowance. Serialise preflight
-        // and submission, then defer while a helper may still consume it in the
-        // mempool. The RPC nonce check also applies after backend reconstruction.
-        let _submission = self.forward_submission.lock().await;
+    ) -> Result<(SignedEvmTx, super::mint_events::PendingMintHandle), String> {
+        // Exact approvals replace the wallet's allowance. Defer while a helper
+        // may still consume one in the mempool. The RPC nonce check also
+        // applies after backend reconstruction.
         if self.evm_backend.has_pending_transactions().await? {
             return Err(format!(
                 "{BRIDGE_SUBMISSION_DEFERRED_PREFIX}: bridge wallet has pending transactions; retry after inclusion"
@@ -589,29 +606,25 @@ where
             route.target_asset,
         )
         .await?;
-        let tx_hash = match helper {
-            HelperContract::WithSubaccount(address) => self
-                .evm_backend
-                .helper_deposit_with_subaccount(
-                    address,
-                    token_address,
-                    amount_base_units,
-                    recipient_principal_bytes32,
-                    recipient_subaccount_bytes32,
-                )
-                .await
-                .map_err(|e| Self::helper_send_error("helper depositErc20", e))?,
-            HelperContract::Native(address) => self
-                .evm_backend
-                .helper_deposit_native(address, token_address, amount_base_units, recipient_principal_bytes32)
-                .await
-                .map_err(|e| Self::helper_send_error("native helper deposit", e))?,
+        let tx = match helper {
+            HelperContract::WithSubaccount(address) => {
+                self.evm_backend
+                    .sign_helper_deposit_with_subaccount(
+                        address,
+                        token_address,
+                        amount_base_units,
+                        recipient_principal_bytes32,
+                        recipient_subaccount_bytes32,
+                    )
+                    .await?
+            }
+            HelperContract::Native(address) => {
+                self.evm_backend
+                    .sign_helper_deposit_native(address, token_address, amount_base_units, recipient_principal_bytes32)
+                    .await?
+            }
         };
-
-        // Return the submitted tx hash; completion is tracked asynchronously via get_bridge_status.
-        Ok(BridgeSubmission {
-            bridge_id: handle.bridge_id(tx_hash)?,
-        })
+        Ok((tx, handle))
     }
 
     /// Submits native ETH forward bridge flow (`ETH@ETH -> ckETH@ICP`).
@@ -627,11 +640,11 @@ where
     /// Safety invariant:
     /// - Preflight requires `signer_balance >= amount + dynamic gas reserve`
     ///   so we never attempt to bridge the entire ETH balance and strand gas.
-    async fn submit_native_forward_bridge(
+    async fn sign_native_forward_bridge(
         &self,
         route: &BridgeRouteSpec,
         request: &BridgeRequest,
-    ) -> Result<BridgeSubmission, String> {
+    ) -> Result<(SignedEvmTx, super::mint_events::PendingMintHandle), String> {
         let signer = self.evm_backend.signer_address();
         ensure_source_matches_signer(&request.source_address, signer)?;
 
@@ -674,27 +687,58 @@ where
             route.target_asset,
         )
         .await?;
-        let tx_hash = match helper {
-            HelperContract::WithSubaccount(address) => self
-                .evm_backend
-                .helper_deposit_eth_with_subaccount(
-                    address,
-                    amount_wei,
-                    recipient_principal_bytes32,
-                    recipient_subaccount_bytes32,
-                )
-                .await
-                .map_err(|e| Self::helper_send_error("ETH helper depositEth", e))?,
-            HelperContract::Native(address) => self
-                .evm_backend
-                .helper_deposit_eth_native(address, amount_wei, recipient_principal_bytes32)
-                .await
-                .map_err(|e| Self::helper_send_error("native ETH helper deposit", e))?,
+        let tx = match helper {
+            HelperContract::WithSubaccount(address) => {
+                self.evm_backend
+                    .sign_helper_deposit_eth_with_subaccount(
+                        address,
+                        amount_wei,
+                        recipient_principal_bytes32,
+                        recipient_subaccount_bytes32,
+                    )
+                    .await?
+            }
+            HelperContract::Native(address) => {
+                self.evm_backend
+                    .sign_helper_deposit_eth_native(address, amount_wei, recipient_principal_bytes32)
+                    .await?
+            }
         };
+        Ok((tx, handle))
+    }
 
-        Ok(BridgeSubmission {
-            bridge_id: handle.bridge_id(tx_hash)?,
-        })
+    /// Signs the helper call of a forward route. It sends nothing.
+    async fn sign_forward(
+        &self,
+        route: &BridgeRouteSpec,
+        request: &BridgeRequest,
+    ) -> Result<(SignedEvmTx, super::mint_events::PendingMintHandle), String> {
+        match route.route_kind {
+            BridgeRouteKind::CkEthErc20Forward => self.sign_forward_bridge(route, request).await,
+            BridgeRouteKind::EthToCkEth => self.sign_native_forward_bridge(route, request).await,
+            _ => Err(format!(
+                "route {}@{} -> {} has no signed helper call",
+                route.source_asset, route.source_chain, route.target_asset
+            )),
+        }
+    }
+
+    /// The one-shot forward flow: sign, then broadcast at once.
+    async fn submit_signed_forward(
+        &self,
+        route: &BridgeRouteSpec,
+        request: &BridgeRequest,
+    ) -> Result<BridgeSubmission, String> {
+        let _submission = self.forward_submission.lock().await;
+        let (tx, handle) = self.sign_forward(route, request).await?;
+        match self.evm_backend.broadcast(&tx).await {
+            // Completion is tracked through get_bridge_status.
+            Broadcast::Sent => Ok(BridgeSubmission {
+                bridge_id: handle.bridge_id(tx.hash)?,
+            }),
+            Broadcast::Rejected(error) => Err(format!("helper deposit {:#x} refused: {error}", tx.hash)),
+            Broadcast::Unknown(error) => Err(Self::helper_send_error("helper deposit", error)),
+        }
     }
 
     async fn submit_reverse_bridge(
@@ -1083,15 +1127,44 @@ where
         // Resolve route metadata once; it validates asset/chain pair and destination kind.
         let route = resolve_cketh_route_for_request(&request)?;
         match route.route_kind {
-            BridgeRouteKind::CkEthErc20Forward => self.submit_forward_bridge(route, &request).await,
+            BridgeRouteKind::CkEthErc20Forward | BridgeRouteKind::EthToCkEth => {
+                self.submit_signed_forward(route, &request).await
+            }
             BridgeRouteKind::CkEthErc20Reverse => self.submit_reverse_bridge(route, &request).await,
-            BridgeRouteKind::EthToCkEth => self.submit_native_forward_bridge(route, &request).await,
             BridgeRouteKind::CkEthToEth => self.submit_native_reverse_bridge(route, &request).await,
             _ => Err(format!(
                 "route {}@{} -> {} is not supported by CkErc20BridgeBackend",
                 route.source_asset, route.source_chain, route.target_asset
             )),
         }
+    }
+
+    async fn prepare_bridge_send(&self, request: &BridgeRequest) -> Result<BridgeSend, String> {
+        let route = resolve_cketh_route_for_request(request)?;
+        // Held until the send is signed, so two rows cannot sign one nonce.
+        let _submission = self.forward_submission.lock().await;
+        let (tx, handle) = self.sign_forward(route, request).await?;
+        Ok(BridgeSend {
+            send: evm_prepared_send(&tx)?,
+            handle: handle.encode()?,
+        })
+    }
+
+    async fn track_deposit(
+        &self,
+        _asset: &str,
+        _chain: &str,
+        _destination: &BridgeDestination,
+        handle: &str,
+        receipt: &str,
+    ) -> Result<DepositNotice, String> {
+        // The minter finds a helper deposit in its own logs; the saved
+        // handle and the hash name it.
+        let hash = receipt
+            .parse::<TxHash>()
+            .map_err(|e| format!("invalid helper deposit hash `{receipt}`: {e}"))?;
+        let bridge_id = super::mint_events::PendingMintHandle::decode(handle)?.bridge_id(hash)?;
+        Ok(DepositNotice::Accepted(BridgeSubmission { bridge_id }))
     }
 
     async fn prepare_submission(&self, request: &BridgeRequest) -> Result<Option<u64>, String> {
