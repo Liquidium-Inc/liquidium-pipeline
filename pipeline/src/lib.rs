@@ -5,6 +5,7 @@ pub mod context;
 pub mod executors;
 pub mod finalizers;
 pub mod liquidation;
+pub mod operator;
 pub mod persistance;
 pub mod price_oracle;
 pub mod stage;

@@ -380,6 +380,8 @@ struct ScriptedAdapter {
     /// Makes `preview` fail the way a venue outage does, so the planner sees
     /// the venue as unavailable rather than as quoted.
     preview_failure: Option<String>,
+    /// The open question a parked leg asks an operator.
+    operator_question: Option<String>,
 }
 
 impl ScriptedAdapter {
@@ -397,7 +399,13 @@ impl ScriptedAdapter {
             observed_statuses: Mutex::new(Vec::new()),
             advance_failure: None,
             preview_failure: None,
+            operator_question: None,
         }
+    }
+
+    fn with_operator_question(mut self, question: &str) -> Self {
+        self.operator_question = Some(question.to_string());
+        self
     }
 
     fn with_advance_failure(mut self, error: &str) -> Self {
@@ -522,6 +530,32 @@ impl MultiVenueAdapter for ScriptedAdapter {
             last_error: retryable_error.clone(),
             retryable_error,
         })
+    }
+
+    fn operator_questions(
+        &self,
+        _leg: &VenueLegState,
+    ) -> Result<Vec<crate::finalizers::multi_venue::OperatorQuestion>, String> {
+        Ok(self
+            .operator_question
+            .iter()
+            .map(|detail| crate::finalizers::multi_venue::OperatorQuestion { detail: detail.clone() })
+            .collect())
+    }
+
+    fn operator_release(
+        &self,
+        _leg: &VenueLegState,
+        answer: Option<&crate::finalizers::outbound::OperatorDecision>,
+    ) -> Result<VenueExecutionState, String> {
+        match (&self.operator_question, answer) {
+            (Some(question), None) => Err(format!("leg waits for an answer: {question}")),
+            (None, Some(_)) => Err("leg has no open question".to_string()),
+            _ => Ok(VenueExecutionState {
+                venue: self.venue_id.to_string(),
+                state: serde_json::json!({ "released_with": format!("{answer:?}") }),
+            }),
+        }
     }
 
     async fn recover(
@@ -1973,6 +2007,63 @@ async fn reenqueuing_the_parent_row_does_not_rearm_an_operator_required_mexc_leg
     assert_eq!(mexc.recovery_calls(), 0);
     assert_eq!(mexc.calls(), 1);
     assert_eq!(mexc.previews(), 1);
+}
+
+#[tokio::test]
+async fn reconcile_answers_a_parked_leg_and_queues_the_row_again() {
+    use crate::finalizers::{multi_venue::OperatorDesk, outbound::OperatorDecision};
+    use crate::operator::{OperatorConsole, ReconcileAction, ReconcileRequest};
+    const LIQUIDATION_ID: u128 = 809;
+    let wal = Arc::new(BatchWal::new([receipt_with_id(LIQUIDATION_ID)]));
+    let mexc = Arc::new(
+        ScriptedAdapter::new(
+            MEXC_VENUE_ID,
+            None,
+            vec![VenueLegStatus::OperatorRequired, VenueLegStatus::Running],
+        )
+        .with_operator_question("did send x land?"),
+    );
+    let finalizer = Arc::new(MultiVenueFinalizer::new(vec![mexc.clone()], planner_config()).expect("valid finalizer"));
+    let stage = FinalizeStage::new(
+        wal.clone(),
+        finalizer.clone(),
+        Arc::new(SimpleProfitCalculator),
+        Arc::new(MockPipelineAgent::new()),
+        Principal::anonymous(),
+        1,
+        60,
+    );
+    let desk = OperatorDesk::new(wal.clone(), finalizer);
+    let request = |action| ReconcileRequest {
+        liq_id: LIQUIDATION_ID.to_string(),
+        leg_id: None,
+        action,
+    };
+
+    assert!(stage.process(&()).await.expect("parking cycle").is_empty());
+    assert_eq!(wal.status(LIQUIDATION_ID), ResultStatus::OperatorRequired);
+
+    let report = desk.reconcile(request(ReconcileAction::Show)).await.expect("show");
+    assert!(report.contains("question: did send x land?"), "{report}");
+    assert_eq!(wal.status(LIQUIDATION_ID), ResultStatus::OperatorRequired, "show changes nothing");
+
+    let error = desk.reconcile(request(ReconcileAction::Release)).await.unwrap_err();
+    assert!(error.contains("waits for an answer"), "{error}");
+    assert_eq!(wal.status(LIQUIDATION_ID), ResultStatus::OperatorRequired);
+
+    let report = desk
+        .reconcile(request(ReconcileAction::Answer(OperatorDecision::Absent)))
+        .await
+        .expect("answer");
+    assert!(report.contains("queued again"), "{report}");
+    assert_eq!(wal.status(LIQUIDATION_ID), ResultStatus::Enqueued);
+
+    // The next finalize cycle advances the released leg.
+    stage.process(&()).await.expect("released cycle");
+    assert_eq!(mexc.calls(), 2);
+    assert_ne!(wal.status(LIQUIDATION_ID), ResultStatus::OperatorRequired);
+    let error = desk.reconcile(request(ReconcileAction::Release)).await.unwrap_err();
+    assert!(error.contains("not parked"), "{error}");
 }
 
 #[tokio::test]

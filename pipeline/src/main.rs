@@ -5,6 +5,7 @@ mod context;
 mod executors;
 mod finalizers;
 mod liquidation;
+mod operator;
 mod output;
 mod persistance;
 mod price_oracle;
@@ -29,6 +30,8 @@ use std::process::ExitCode;
 use std::time::{Duration, SystemTime};
 
 use crate::commands::liquidation_loop::run_liquidation_loop;
+use crate::finalizers::outbound::OperatorDecision;
+use crate::operator::{ReconcileAction, ReconcileRequest};
 
 #[derive(Parser)]
 #[command(name = "liquidator")]
@@ -174,6 +177,28 @@ enum Commands {
         /// Send the withdrawal. Without it the command only reads the history.
         #[arg(long)]
         confirm: bool,
+    },
+
+    // Shows a parked liquidation row, or answers its open question and
+    // releases the parked leg. It talks to the running daemon.
+    Reconcile {
+        /// Liquidation row id
+        liq_id: String,
+        /// Leg id, needed when more than one leg of the row is parked
+        #[arg(long)]
+        leg: Option<String>,
+        /// The undecided action happened: give its receipt or provider id
+        #[arg(long, conflicts_with_all = ["absent", "release"])]
+        landed: Option<String>,
+        /// The undecided action did not happen: the leg checks once more, then acts again
+        #[arg(long, conflicts_with = "release")]
+        absent: bool,
+        /// Release a parked leg that has no open question
+        #[arg(long)]
+        release: bool,
+        /// Control socket path of the running daemon
+        #[arg(long)]
+        sock_path: Option<PathBuf>,
     },
 
     // Account management commands
@@ -403,6 +428,37 @@ async fn main() -> ExitCode {
                 return ExitCode::FAILURE;
             }
             ExitCode::SUCCESS
+        }
+        Commands::Reconcile {
+            liq_id,
+            leg,
+            landed,
+            absent,
+            release,
+            sock_path,
+        } => {
+            let action = match (landed, absent, release) {
+                (Some(receipt), _, _) => ReconcileAction::Answer(OperatorDecision::Landed { receipt }),
+                (None, true, _) => ReconcileAction::Answer(OperatorDecision::Absent),
+                (None, false, true) => ReconcileAction::Release,
+                (None, false, false) => ReconcileAction::Show,
+            };
+            let request = ReconcileRequest {
+                liq_id,
+                leg_id: leg,
+                action,
+            };
+            let sock_path = sock_path.unwrap_or_else(control_plane::default_sock_path);
+            match control_plane::send_reconcile(&sock_path, &request).await {
+                Ok(report) => {
+                    println!("{report}");
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("Reconcile failed: {}", e);
+                    ExitCode::FAILURE
+                }
+            }
         }
         Commands::Account { subcommand } => {
             let outcome = match subcommand {

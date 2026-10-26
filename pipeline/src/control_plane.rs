@@ -11,8 +11,10 @@
 //!   `/run` or `/tmp`.
 //!
 //! Protocol:
-//! - Client sends exactly one line: `pause\n` or `resume\n`.
-//! - Server replies with exactly one line: `ok\n` or `err:<reason>\n`.
+//! - Client sends exactly one line: `pause\n`, `resume\n` or
+//!   `reconcile <json ReconcileRequest>\n`.
+//! - Server replies with `ok\n` or `err:<reason>\n`. A reconcile reply puts
+//!   its report lines before that final line.
 //! - Connection is closed after the reply.
 
 use std::ffi::OsString;
@@ -28,7 +30,11 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::time::sleep;
 
-const MAX_COMMAND_LEN: usize = 32;
+use crate::operator::{OperatorConsole, ReconcileRequest};
+
+/// A reconcile request carries ids and receipts, so the line may be long.
+const MAX_COMMAND_LEN: usize = 2048;
+const RECONCILE_PREFIX: &str = "reconcile ";
 
 /// Backoff between `accept` retries after a transient failure.
 const ACCEPT_RETRY_DELAY: Duration = Duration::from_millis(100);
@@ -180,7 +186,7 @@ pub fn bind_control_listener(sock_path: &Path) -> anyhow::Result<UnixListener> {
 }
 
 pub async fn serve_bound_listener(listener: UnixListener, paused: Arc<AtomicBool>) -> anyhow::Result<()> {
-    serve_bound_listener_with_hook(listener, paused, None).await
+    serve_bound_listener_with_hook(listener, paused, None, None).await
 }
 
 /// Serves the control socket until the listener becomes unusable.
@@ -194,6 +200,7 @@ pub async fn serve_bound_listener_with_hook(
     listener: UnixListener,
     paused: Arc<AtomicBool>,
     on_transition: Option<TransitionHook>,
+    operator: Option<Arc<dyn OperatorConsole>>,
 ) -> anyhow::Result<()> {
     let mut consecutive_errors: u32 = 0;
 
@@ -222,8 +229,9 @@ pub async fn serve_bound_listener_with_hook(
 
         let paused = paused.clone();
         let on_transition = on_transition.clone();
+        let operator = operator.clone();
         tokio::spawn(async move {
-            if let Err(err) = handle_client(stream, paused, on_transition).await {
+            if let Err(err) = handle_client(stream, paused, on_transition, operator).await {
                 tracing::warn!("control client handling failed: {err}");
             }
         });
@@ -252,32 +260,69 @@ pub async fn run_control_server(sock_path: PathBuf, paused: Arc<AtomicBool>) -> 
     serve_bound_listener(listener, paused).await
 }
 
+async fn reconcile_reply(operator: Option<&dyn OperatorConsole>, request: &str) -> String {
+    let Some(operator) = operator else {
+        return "err:this daemon serves no reconcile requests\n".to_string();
+    };
+    let outcome = match serde_json::from_str::<ReconcileRequest>(request) {
+        Ok(request) => operator.reconcile(request).await,
+        Err(error) => Err(format!("invalid reconcile request: {error}")),
+    };
+    match outcome {
+        Ok(report) => format!("{report}ok\n"),
+        Err(error) => format!("err:{}\n", error.replace('\n', "; ")),
+    }
+}
+
+/// Sends one reconcile request to the daemon and returns its report.
+pub async fn send_reconcile(sock_path: &Path, request: &ReconcileRequest) -> Result<String, String> {
+    let line = format!(
+        "{RECONCILE_PREFIX}{}\n",
+        serde_json::to_string(request).map_err(|e| format!("encode reconcile request: {e}"))?
+    );
+    if line.len() > MAX_COMMAND_LEN {
+        return Err(format!("reconcile request is longer than {MAX_COMMAND_LEN} bytes"));
+    }
+    let reply = exchange(sock_path, &line).await?;
+    let reply = reply.trim_end_matches('\n');
+    let (report, last) = reply.rsplit_once('\n').unwrap_or(("", reply));
+    match last.strip_prefix("err:") {
+        Some(error) => Err(error.to_string()),
+        None if last == "ok" => Ok(report.to_string()),
+        None => Err(format!("unexpected reply from control server: {last}")),
+    }
+}
+
 pub async fn send_control_command(sock_path: &Path, cmd: ControlCommand) -> Result<(), String> {
+    let reply = exchange(sock_path, cmd.as_wire()).await?;
+    if reply.trim() == "ok" {
+        Ok(())
+    } else {
+        Err(reply.trim().to_string())
+    }
+}
+
+/// Sends one request line and returns the whole reply. The server closes the
+/// stream after it replies.
+async fn exchange(sock_path: &Path, line: &str) -> Result<String, String> {
     let mut stream = UnixStream::connect(sock_path)
         .await
         .map_err(|e| format!("connect {} failed: {e}", sock_path.display()))?;
-
     stream
-        .write_all(cmd.as_wire().as_bytes())
+        .write_all(line.as_bytes())
         .await
         .map_err(|e| format!("send command failed: {e}"))?;
     stream.flush().await.map_err(|e| format!("flush command failed: {e}"))?;
 
-    let mut reader = BufReader::new(stream);
-    let mut line = String::new();
-    let n = reader
-        .read_line(&mut line)
+    let mut reply = String::new();
+    BufReader::new(stream)
+        .read_to_string(&mut reply)
         .await
         .map_err(|e| format!("read response failed: {e}"))?;
-    if n == 0 {
+    if reply.is_empty() {
         return Err("empty response from control server".to_string());
     }
-
-    if line.trim() == "ok" {
-        Ok(())
-    } else {
-        Err(line.trim().to_string())
-    }
+    Ok(reply)
 }
 
 fn prepare_socket_path(sock_path: &Path) -> anyhow::Result<()> {
@@ -384,6 +429,7 @@ async fn handle_client(
     stream: UnixStream,
     paused: Arc<AtomicBool>,
     on_transition: Option<TransitionHook>,
+    operator: Option<Arc<dyn OperatorConsole>>,
 ) -> anyhow::Result<()> {
     let (read_half, mut write_half) = stream.into_split();
     let mut line = String::new();
@@ -395,6 +441,9 @@ async fn handle_client(
         "err:empty\n".to_string()
     } else if bytes > MAX_COMMAND_LEN || !line.ends_with('\n') {
         "err:invalid command\n".to_string()
+    } else if let Some(request) = line.trim().strip_prefix(RECONCILE_PREFIX) {
+        // Receipts are case sensitive, so the request is not lowercased.
+        reconcile_reply(operator.as_deref(), request).await
     } else {
         let normalized = line.trim().to_ascii_lowercase();
         if normalized.is_empty() {
@@ -719,7 +768,7 @@ mod tests {
         let server = tokio::spawn(run_control_server(path.clone(), paused));
         wait_for_socket(&path).await;
 
-        let too_long = format!("{}\n", "a".repeat(64));
+        let too_long = format!("{}\n", "a".repeat(super::MAX_COMMAND_LEN + 1));
         let reply = send_raw_command(&path, &too_long).await;
         assert_eq!(reply.trim(), "err:invalid command");
 
@@ -784,5 +833,77 @@ mod tests {
             .expect_err("expected error");
         assert_eq!(err, "err:mock failure");
         server.await.expect("join");
+    }
+
+    struct EchoConsole;
+
+    #[async_trait::async_trait]
+    impl crate::operator::OperatorConsole for EchoConsole {
+        async fn reconcile(&self, request: super::ReconcileRequest) -> Result<String, String> {
+            match request.action {
+                crate::operator::ReconcileAction::Show => {
+                    Ok(format!("row {}: OperatorRequired\n  leg l1 at mexc: OperatorRequired\n", request.liq_id))
+                }
+                _ => Err("leg waits for an answer:\ncheck the chain".to_string()),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn reconcile_requests_reach_the_console_and_keep_the_report() {
+        use crate::finalizers::outbound::OperatorDecision;
+        use crate::operator::{ReconcileAction, ReconcileRequest};
+        let tmp = TempDir::new().expect("tmp");
+        if skip_if_uds_unsupported(&tmp) {
+            return;
+        }
+        let path = sock_path(&tmp);
+        let listener = bind_control_listener(&path).expect("bind");
+        let console: Arc<dyn crate::operator::OperatorConsole> = Arc::new(EchoConsole);
+        let paused = Arc::new(AtomicBool::new(false));
+        let server = tokio::spawn(super::serve_bound_listener_with_hook(listener, paused, None, Some(console)));
+        let request = |action| ReconcileRequest {
+            // Receipts and ids are case sensitive.
+            liq_id: "Row-1720".to_string(),
+            leg_id: None,
+            action,
+        };
+
+        let report = super::send_reconcile(&path, &request(ReconcileAction::Show)).await.expect("show");
+        assert_eq!(report, "row Row-1720: OperatorRequired\n  leg l1 at mexc: OperatorRequired");
+
+        let error = super::send_reconcile(
+            &path,
+            &request(ReconcileAction::Answer(OperatorDecision::Landed {
+                receipt: "4xFk9".to_string(),
+            })),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error, "leg waits for an answer:; check the chain");
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn a_daemon_without_a_console_refuses_reconcile() {
+        use crate::operator::{ReconcileAction, ReconcileRequest};
+        let tmp = TempDir::new().expect("tmp");
+        if skip_if_uds_unsupported(&tmp) {
+            return;
+        }
+        let path = sock_path(&tmp);
+        let server = tokio::spawn(run_control_server(path.clone(), Arc::new(AtomicBool::new(false))));
+        wait_for_socket(&path).await;
+
+        let request = ReconcileRequest {
+            liq_id: "1".to_string(),
+            leg_id: None,
+            action: ReconcileAction::Show,
+        };
+        let error = super::send_reconcile(&path, &request).await.unwrap_err();
+        assert!(error.contains("no reconcile"), "{error}");
+
+        server.abort();
     }
 }

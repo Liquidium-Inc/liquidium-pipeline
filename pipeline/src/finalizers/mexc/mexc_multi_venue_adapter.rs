@@ -13,9 +13,10 @@ use crate::{
         bridge_planner::BridgePlanner,
         cex_finalizer::{CexFinalizerLogic, CexState, CexStep},
         multi_venue::{
-            MultiVenueAdapter, VenueAmountError, VenueLegCheckpoint, VenueLegProgress, VenuePlanningContext,
-            VenueRoutePreview,
+            MultiVenueAdapter, OperatorQuestion, VenueAmountError, VenueLegCheckpoint, VenueLegProgress,
+            VenuePlanningContext, VenueRoutePreview,
         },
+        outbound::OperatorDecision,
     },
     persistance::{VenueExecutionState, VenueLegState, VenueLegStatus},
     swappers::model::SwapRequest,
@@ -45,6 +46,16 @@ struct MexcVenueExecutionState {
     intent_id: Option<String>,
     #[serde(default)]
     operator_required: bool,
+}
+
+impl MexcVenueExecutionState {
+    /// Clears a park. The next cycle persists a new intent before the leg
+    /// makes any venue call.
+    fn release_park(&mut self) {
+        self.operator_required = false;
+        self.ready_to_advance = false;
+        self.intent_id = None;
+    }
 }
 
 impl<B> MexcFinalizer<B>
@@ -357,6 +368,22 @@ where
         self.advance_leg(leg).await
     }
 
+    fn operator_questions(&self, leg: &VenueLegState) -> Result<Vec<OperatorQuestion>, String> {
+        let execution = self.decode_leg_state(leg)?;
+        Ok(Self::operator_questions_for(&execution.cex))
+    }
+
+    fn operator_release(
+        &self,
+        leg: &VenueLegState,
+        answer: Option<&OperatorDecision>,
+    ) -> Result<VenueExecutionState, String> {
+        let mut execution = self.decode_leg_state(leg)?;
+        Self::answer_operator(&mut execution.cex, answer)?;
+        execution.release_park();
+        VenueExecutionState::new(VENUE_ID, &execution)
+    }
+
     async fn recover(
         &self,
         leg: &VenueLegState,
@@ -372,9 +399,7 @@ where
         // CEX step through a newly persisted intent. This call only arms that
         // intent; the external action still happens in a later WAL cycle.
         if execution.operator_required {
-            execution.operator_required = false;
-            execution.ready_to_advance = false;
-            execution.intent_id = None;
+            execution.release_park();
         }
         // The legacy CEX machine uses its Pending phases as durable restart
         // reconciliation points; unlike ICPSwap it has no separate Recover

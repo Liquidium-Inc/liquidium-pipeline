@@ -7766,3 +7766,101 @@ mod uncertain_side_effects {
         assert_eq!(state.withdraw.withdraw_id.as_deref(), Some("mexc-internal"));
     }
 }
+
+mod operator_answers {
+    use super::*;
+    use crate::finalizers::cex_finalizer::{BridgeSubmitAttempt, UncertainWithdraw};
+    use crate::finalizers::outbound::{OperatorDecision, OutboundPhase, OutboundRecord};
+    use liquidium_pipeline_core::outbound::PreparedSend;
+
+    type Mexc = MexcFinalizer<MockCexBackend>;
+
+    fn state() -> CexState {
+        cksol_repayment_state(&cksol_finalizer(MockCexBackend::new(), MockBridgeBackend::new()), 1.5)
+    }
+
+    fn parked_send() -> OutboundRecord {
+        OutboundRecord {
+            prepared: PreparedSend {
+                sender: "icp".into(),
+                identity: "send-1".into(),
+                payload: "{}".into(),
+                replay_safe: true,
+            },
+            phase: OutboundPhase::Parked {
+                reason: "no decided answer".into(),
+            },
+            decision: None,
+        }
+    }
+
+    fn landed(receipt: &str) -> OperatorDecision {
+        OperatorDecision::Landed {
+            receipt: receipt.into(),
+        }
+    }
+
+    #[test]
+    fn a_parked_send_takes_a_decision_and_refuses_a_bare_release() {
+        for answer in [landed("block-9"), OperatorDecision::Absent] {
+            let mut state = state();
+            state.deposit.deposit_funding = Some(parked_send());
+            let questions = Mexc::operator_questions_for(&state);
+            assert_eq!(questions.len(), 1);
+            assert!(questions[0].detail.contains("send-1"), "{}", questions[0].detail);
+
+            let error = Mexc::answer_operator(&mut state, None).unwrap_err();
+            assert!(error.contains("waits for an answer"), "{error}");
+            Mexc::answer_operator(&mut state, Some(&answer)).unwrap();
+            assert_eq!(state.deposit.deposit_funding.unwrap().decision, Some(answer));
+        }
+    }
+
+    #[test]
+    fn a_parked_withdrawal_records_the_found_id_or_stays_released_for_a_new_request() {
+        let mut state = state();
+        state.withdraw.withdraw_id = Some("lq0000000000000001w0".into());
+        state.withdraw.withdraw_uncertain = Some(UncertainWithdraw::Parked);
+        assert_eq!(Mexc::operator_questions_for(&state).len(), 1);
+
+        let mut found = state.clone();
+        Mexc::answer_operator(&mut found, Some(&landed("7872730c87d04382b5c76da98359cd4c"))).unwrap();
+        assert_eq!(found.withdraw.withdraw_id.as_deref(), Some("7872730c87d04382b5c76da98359cd4c"));
+        assert_eq!(found.withdraw.withdraw_uncertain, None);
+
+        // The leg checks the history once more before a new request.
+        Mexc::answer_operator(&mut state, Some(&OperatorDecision::Absent)).unwrap();
+        assert_eq!(state.withdraw.withdraw_uncertain, Some(UncertainWithdraw::Parked));
+    }
+
+    #[test]
+    fn a_parked_bridge_attempt_attaches_the_found_handle() {
+        let mut state = state();
+        state.deposit.bridge.deposit_bridge_submit_phase = Some(BridgeSubmitPhase::Submitting(BridgeSubmitAttempt {
+            id: "a1".into(),
+            asset: "ckUSDC".into(),
+            destination: "0xabc".into(),
+            amount: 1.5,
+            cursor: Some(100),
+            started_at_ts: 5,
+            called_at_ts: Some(6),
+            parked_for_operator: true,
+        }));
+        assert_eq!(Mexc::operator_questions_for(&state).len(), 1);
+
+        Mexc::answer_operator(&mut state, Some(&landed("ic-withdraw:1:2"))).unwrap();
+
+        assert_eq!(state.deposit.bridge.deposit_bridge_id.as_deref(), Some("ic-withdraw:1:2"));
+        assert!(state.deposit.bridge.deposit_bridge_submit_phase.is_none());
+        assert!(Mexc::operator_questions_for(&state).is_empty());
+    }
+
+    #[test]
+    fn a_park_without_a_question_takes_only_a_release() {
+        let mut state = state();
+        assert!(Mexc::operator_questions_for(&state).is_empty());
+        Mexc::answer_operator(&mut state, None).unwrap();
+        let error = Mexc::answer_operator(&mut state, Some(&OperatorDecision::Absent)).unwrap_err();
+        assert!(error.contains("--release"), "{error}");
+    }
+}

@@ -2,6 +2,7 @@ use async_trait::async_trait;
 use liquidium_pipeline_core::tokens::chain_token_amount::ChainTokenAmount;
 
 use crate::{
+    finalizers::outbound::OperatorDecision,
     persistance::{VenueExecutionState, VenueLegState, VenueLegStatus},
     swappers::model::{SwapExecution, SwapQuote, SwapRequest},
 };
@@ -40,6 +41,13 @@ pub struct VenueLegProgress {
     /// updated leg first, then returns this error so normal finalizer backoff
     /// and retry accounting apply without losing the venue's latest state.
     pub retryable_error: Option<String>,
+}
+
+/// A fact that only an operator can supply before a parked leg moves on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OperatorQuestion {
+    /// What is undecided, with the ids the operator needs to check it.
+    pub detail: String,
 }
 
 /// Parent-owned persistence boundary exposed to a venue while it drives its
@@ -85,6 +93,28 @@ pub trait MultiVenueAdapter: Send + Sync {
         leg: &VenueLegState,
         checkpoint: &dyn VenueLegCheckpoint,
     ) -> Result<VenueLegProgress, String>;
+
+    /// Questions that only an operator can answer before this parked leg
+    /// moves on. A park without a question needs a release only.
+    fn operator_questions(&self, leg: &VenueLegState) -> Result<Vec<OperatorQuestion>, String> {
+        let _ = leg;
+        Err(format!("venue `{}` has no operator release", self.venue_id()))
+    }
+
+    /// Writes an operator's answer into a parked leg and clears the park. It
+    /// makes no venue call; the leg acts on the next cycle. `None` releases only.
+    fn operator_release(
+        &self,
+        leg: &VenueLegState,
+        answer: Option<&OperatorDecision>,
+    ) -> Result<VenueExecutionState, String> {
+        let _ = answer;
+        Err(format!(
+            "venue `{}` has no operator release for leg `{}`",
+            self.venue_id(),
+            leg.leg_id
+        ))
+    }
 
     /// Reconciles or recovers only the supplied leg after restart or failure.
     #[allow(dead_code)]

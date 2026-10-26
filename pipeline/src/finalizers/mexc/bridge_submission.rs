@@ -372,7 +372,7 @@ where
         })
     }
 
-    fn attach_bridge_handle(state: &mut CexState, bridge_id: String) {
+    pub(super) fn attach_bridge_handle(state: &mut CexState, bridge_id: String) {
         state.deposit.bridge.deposit_bridge_id = Some(bridge_id);
         state.deposit.bridge.deposit_bridge_submitted_at_ts = Some(now_ts());
         state.deposit.bridge.deposit_bridge_submit_phase = None;

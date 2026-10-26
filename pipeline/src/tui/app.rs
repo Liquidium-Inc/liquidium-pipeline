@@ -295,6 +295,8 @@ pub(super) struct App {
     pub(super) executions_error: Option<String>,
     pub(super) executions_selected: usize,
     pub(super) executions_details_scroll: u16,
+    /// Open while the operator reconciles the selected execution row.
+    pub(super) reconcile: Option<super::reconcile::ReconcilePanel>,
 
     pub(super) recent_outcomes: VecDeque<RecentOutcome>,
 
@@ -347,6 +349,7 @@ impl App {
             executions_error: None,
             executions_selected: 0,
             executions_details_scroll: 0,
+            reconcile: None,
 
             recent_outcomes: VecDeque::with_capacity(200),
 
@@ -356,6 +359,12 @@ impl App {
             withdraw_assets,
             withdraw: WithdrawState::new(),
         }
+    }
+
+    /// The execution row the table selects, or the first row.
+    pub(super) fn selected_execution(&self) -> Option<&ExecutionRowData> {
+        let rows = &self.executions.as_ref()?.rows;
+        rows.get(self.executions_selected).or_else(|| rows.first())
     }
 
     pub(super) fn push_log(&mut self, line: impl Into<String>) {

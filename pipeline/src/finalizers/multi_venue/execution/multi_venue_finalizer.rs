@@ -89,7 +89,7 @@ impl<'a> MultiVenueFinalizationContext<'a> {
 /// amount-scoped adapter for exactly one persisted leg.
 pub struct MultiVenueFinalizer {
     planner: IcpswapFirstPlanner,
-    venues: Arc<VenueRegistry>,
+    pub(super) venues: Arc<VenueRegistry>,
     watchdog: Arc<dyn Watchdog>,
     recovery: Option<RecoverySweepRuntime>,
 }
@@ -295,7 +295,7 @@ impl MultiVenueFinalizer {
 
     /// The single point where a finalization envelope reaches the WAL. Callers
     /// stage their payload transition into `wrapper` first.
-    async fn persist_wrapper(
+    pub(super) async fn persist_wrapper(
         &self,
         wal: &dyn WalStore,
         row: &mut crate::persistance::LiqResultRecord,

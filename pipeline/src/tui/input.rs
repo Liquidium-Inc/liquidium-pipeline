@@ -13,6 +13,7 @@ use crate::control_plane::{ControlCommand, send_control_command};
 use super::app::{App, BalancesPanel, Tab, UiFocus, WithdrawDestinationKind, WithdrawField};
 use super::events::UiEvent;
 use super::log_source::LogControlHandle;
+use super::reconcile::{handle_reconcile_key, open_reconcile};
 use super::snapshots::{compute_profits_snapshot, fetch_balances_snapshot};
 use super::views::logs::{scroll_down_by_entries, scroll_up_by_entries};
 use super::withdraw::{open_deposit_panel, open_withdraw_panel, refresh_withdraw_deposit_address, submit_withdraw};
@@ -201,6 +202,11 @@ pub(super) async fn handle_key(
             }
             _ => return Ok(false),
         }
+    }
+
+    if app.reconcile.is_some() {
+        handle_reconcile_key(app, key, sock_path).await;
+        return Ok(false);
     }
 
     if matches!(app.tab, Tab::Logs | Tab::Dashboard) {
@@ -643,6 +649,14 @@ pub(super) async fn handle_key(
             });
             app.push_log("profits: refreshing…");
         }
+        (KeyCode::Char('o'), KeyModifiers::NONE)
+            if matches!(app.tab, Tab::Executions)
+                && matches!(app.ui_focus, UiFocus::ExecutionsTable | UiFocus::ExecutionsDetails) =>
+        {
+            if let Some(liq_id) = app.selected_execution().map(|row| row.liq_id.clone()) {
+                open_reconcile(app, sock_path, liq_id).await;
+            }
+        }
         (KeyCode::Char('e'), KeyModifiers::NONE) => {
             reset_log_focus(app);
             reset_executions_focus(app);
@@ -819,6 +833,11 @@ pub(super) async fn handle_key(
 
 pub(super) fn handle_paste(app: &mut App, text: String) {
     let mut chars = text.chars().filter(|c| !c.is_control());
+
+    if let Some(panel) = app.reconcile.as_mut() {
+        panel.type_text(chars);
+        return;
+    }
 
     if let Some(input) = app.bad_debt_confirm_input.as_mut() {
         while input.len() < 16 {
