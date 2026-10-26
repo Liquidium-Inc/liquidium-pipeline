@@ -256,22 +256,12 @@ pub struct CexWithdrawState {
     /// Bumped after each refused request, so a new request gets a new order id.
     #[serde(default)]
     pub withdraw_attempt: u32,
-    /// Set when the last request had no decided answer. `withdraw_id` then
-    /// holds our order id, and only an exchange record or an operator confirms it.
+    /// The withdrawal request, saved before it is sent.
     #[serde(default)]
-    pub withdraw_uncertain: Option<UncertainWithdraw>,
+    pub withdraw_send: Option<crate::finalizers::outbound::OutboundRecord>,
     pub size_out: Option<ChainTokenAmount>,
     #[serde(flatten)]
     pub bridge: CexWithdrawBridgeState,
-}
-
-/// A withdrawal request that got no decided answer.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-pub enum UncertainWithdraw {
-    /// The leg polls its order id in the exchange history.
-    Polling,
-    /// The leg parked on it. The next run counts as an operator's release.
-    Parked,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -335,6 +325,11 @@ pub struct CexState {
     pub trade: CexTradeState,
     #[serde(flatten)]
     pub withdraw: CexWithdrawState,
+    /// Set by a step that saved a new send in this call. The venue writes the
+    /// saved send to the WAL, then runs the step again to send it in the same
+    /// cycle. It is never saved.
+    #[serde(skip)]
+    pub send_saved: bool,
 }
 
 /// A pending step is safe to resume by reading alone once its own submission
@@ -395,6 +390,11 @@ impl CexState {
     pub fn is_receipt_poll_only(&self) -> bool {
         match self.step {
             CexStep::Deposit => self.deposit.funding_resumable(),
+            CexStep::Withdraw => self
+                .withdraw
+                .withdraw_send
+                .as_ref()
+                .is_some_and(crate::finalizers::outbound::OutboundRecord::resumable),
             CexStep::DepositPending => {
                 let bridge = &self.deposit.bridge;
                 self.deposit.deposit_txid.is_some()
@@ -719,6 +719,7 @@ mod tests {
 
             Ok(CexState {
                 liq_id: liq_id.to_string(),
+                send_saved: false,
                 step: CexStep::Trade,
                 last_error: None,
                 market: "CKBTC_BTC".to_string(),
@@ -779,7 +780,7 @@ mod tests {
                     withdraw_txid: None,
                     withdraw_accepted_at_ts: None,
                     withdraw_attempt: 0,
-                    withdraw_uncertain: None,
+                    withdraw_send: None,
                     size_out: None,
                     bridge: CexWithdrawBridgeState {
                         withdraw_planned_asset: None,
@@ -882,6 +883,7 @@ mod tests {
 
             Ok(CexState {
                 liq_id: liq_id.to_string(),
+                send_saved: false,
                 step: CexStep::Trade,
                 last_error: None,
                 market: "CKBTC_BTC".to_string(),
@@ -942,7 +944,7 @@ mod tests {
                     withdraw_txid: None,
                     withdraw_accepted_at_ts: None,
                     withdraw_attempt: 0,
-                    withdraw_uncertain: None,
+                    withdraw_send: None,
                     size_out: None,
                     bridge: CexWithdrawBridgeState {
                         withdraw_planned_asset: None,

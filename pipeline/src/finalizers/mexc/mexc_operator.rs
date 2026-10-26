@@ -4,9 +4,9 @@ use liquidium_pipeline_connectors::backend::cex_backend::CexBackend;
 
 use super::mexc_finalizer::MexcFinalizer;
 use crate::finalizers::{
-    cex_finalizer::{BridgeSubmitPhase, CexState, UncertainWithdraw},
+    cex_finalizer::{BridgeSubmitPhase, CexState},
     multi_venue::OperatorQuestion,
-    outbound::{OperatorDecision, OutboundPhase, OutboundRecord},
+    outbound::{OperatorDecision, OutboundRecord},
 };
 
 /// Where the undecided action of a parked leg lives.
@@ -16,22 +16,22 @@ enum Undecided {
     DepositFunding,
     /// The send to a bridge provider's deposit address.
     BridgeFunding,
-    /// A MEXC withdrawal request without a decided answer.
+    /// The MEXC withdrawal request.
     Withdrawal,
     /// A bridge call whose provider record was not found.
     BridgeAttempt,
 }
 
-fn parked(record: &Option<OutboundRecord>) -> Option<&OutboundRecord> {
-    record
-        .as_ref()
-        .filter(|record| matches!(record.phase, OutboundPhase::Parked { .. }))
+/// A saved send only an operator can decide: it parked, or it may have run
+/// before a restart and running it again is not safe.
+fn undecided(record: &Option<OutboundRecord>) -> Option<&OutboundRecord> {
+    record.as_ref().filter(|record| record.needs_operator())
 }
 
-fn send_question(purpose: &str, record: &OutboundRecord) -> OperatorQuestion {
+fn send_question(purpose: &str, record: &OutboundRecord, receipt: &str) -> OperatorQuestion {
     OperatorQuestion {
         detail: format!(
-            "did the {purpose} ({} send {}) land? --landed <receipt> | --absent (a new send follows)",
+            "did the {purpose} ({} send {}) happen? --landed <{receipt}> | --absent (a new send follows)",
             record.prepared.sender, record.prepared.identity
         ),
     }
@@ -39,23 +39,22 @@ fn send_question(purpose: &str, record: &OutboundRecord) -> OperatorQuestion {
 
 fn open_questions(state: &CexState) -> Vec<(Undecided, OperatorQuestion)> {
     let mut questions = Vec::new();
-    if let Some(record) = parked(&state.deposit.deposit_funding) {
-        questions.push((Undecided::DepositFunding, send_question("MEXC deposit funding", record)));
+    if let Some(record) = undecided(&state.deposit.deposit_funding) {
+        questions.push((
+            Undecided::DepositFunding,
+            send_question("MEXC deposit funding", record, "receipt"),
+        ));
     }
-    if let Some(record) = parked(&state.withdraw.bridge.withdraw_bridge_funding) {
-        questions.push((Undecided::BridgeFunding, send_question("bridge deposit", record)));
+    if let Some(record) = undecided(&state.withdraw.bridge.withdraw_bridge_funding) {
+        questions.push((
+            Undecided::BridgeFunding,
+            send_question("bridge deposit", record, "receipt"),
+        ));
     }
-    if state.withdraw.withdraw_uncertain == Some(UncertainWithdraw::Parked) {
+    if let Some(record) = undecided(&state.withdraw.withdraw_send) {
         questions.push((
             Undecided::Withdrawal,
-            OperatorQuestion {
-                detail: format!(
-                    "did MEXC withdrawal order {} of {} to {} happen? --landed <MEXC withdrawal id> | --absent (a new request follows)",
-                    state.withdraw.withdraw_id.as_deref().unwrap_or("?"),
-                    state.withdraw.withdraw_asset.symbol(),
-                    state.withdraw.withdraw_address
-                ),
-            },
+            send_question("MEXC withdrawal", record, "MEXC withdrawal id"),
         ));
     }
     if let Some(BridgeSubmitPhase::Submitting(attempt)) = &state.deposit.bridge.deposit_bridge_submit_phase
@@ -104,34 +103,22 @@ impl<C: CexBackend> MexcFinalizer<C> {
         };
         let answer = answer.expect("matched above");
         let missing = || format!("open question has no saved state: {}", question.detail);
-        match (undecided, answer) {
-            // A parked send asks the chain first, so this decision is used
-            // only while the chain stays undecided.
-            (Undecided::DepositFunding, _) => {
-                state.deposit.deposit_funding.as_mut().ok_or_else(missing)?.decision = Some(answer.clone());
+        let send = match undecided {
+            Undecided::DepositFunding => &mut state.deposit.deposit_funding,
+            Undecided::BridgeFunding => &mut state.withdraw.bridge.withdraw_bridge_funding,
+            Undecided::Withdrawal => &mut state.withdraw.withdraw_send,
+            Undecided::BridgeAttempt => {
+                match answer {
+                    OperatorDecision::Landed { receipt } => Self::attach_bridge_handle(state, receipt.clone()),
+                    // A released park searches the provider again before a new call.
+                    OperatorDecision::Absent => {}
+                }
+                return Ok(());
             }
-            (Undecided::BridgeFunding, _) => {
-                state
-                    .withdraw
-                    .bridge
-                    .withdraw_bridge_funding
-                    .as_mut()
-                    .ok_or_else(missing)?
-                    .decision = Some(answer.clone());
-            }
-            // The leg then polls this MEXC id in the withdrawal history.
-            (Undecided::Withdrawal, OperatorDecision::Landed { receipt }) => {
-                state.withdraw.withdraw_id = Some(receipt.clone());
-                state.withdraw.withdraw_uncertain = None;
-            }
-            // A released park submits again only while MEXC still shows nothing.
-            (Undecided::Withdrawal, OperatorDecision::Absent) => {}
-            (Undecided::BridgeAttempt, OperatorDecision::Landed { receipt }) => {
-                Self::attach_bridge_handle(state, receipt.clone());
-            }
-            // A released park searches the provider again before a new call.
-            (Undecided::BridgeAttempt, OperatorDecision::Absent) => {}
-        }
+        };
+        // The next run asks the chain or MEXC first, so the decision is used
+        // only while that answer stays open.
+        send.as_mut().ok_or_else(missing)?.decide(answer.clone());
         Ok(())
     }
 }

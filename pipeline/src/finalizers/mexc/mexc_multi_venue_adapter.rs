@@ -104,8 +104,12 @@ where
 
     /// Advances exactly one venue-local state-machine phase. This method never
     /// receives a WAL handle and therefore cannot change the parent row status.
-    async fn advance_leg(&self, leg: &VenueLegState) -> Result<VenueLegProgress, String> {
-        self.advance_decoded_leg(self.decode_leg_state(leg)?).await
+    async fn advance_leg(
+        &self,
+        leg: &VenueLegState,
+        checkpoint: &dyn VenueLegCheckpoint,
+    ) -> Result<VenueLegProgress, String> {
+        self.advance_decoded_leg(self.decode_leg_state(leg)?, checkpoint).await
     }
 
     /// Whether a restarted leg may advance without its submission gate.
@@ -120,7 +124,11 @@ where
 
     /// Advances an already validated state so recovery does not decode the
     /// same persisted JSON twice in one orchestrator cycle.
-    async fn advance_decoded_leg(&self, mut execution: MexcVenueExecutionState) -> Result<VenueLegProgress, String> {
+    async fn advance_decoded_leg(
+        &self,
+        mut execution: MexcVenueExecutionState,
+        checkpoint: &dyn VenueLegCheckpoint,
+    ) -> Result<VenueLegProgress, String> {
         if execution.cex.step == CexStep::Completed {
             return self.progress_for(execution, None);
         }
@@ -167,7 +175,20 @@ where
         execution.intent_id = None;
         execution.cex.last_error = None;
 
-        let error = match self.advance_current_step(&mut execution.cex).await {
+        let mut outcome = self.advance_current_step(&mut execution.cex).await;
+        // A step that saved a send writes it to the WAL with the gate still
+        // set, then sends it in the same cycle. A crash during the send then
+        // restarts into the saved send, which parks unless a replay is safe.
+        if outcome.is_ok() && std::mem::take(&mut execution.cex.send_saved) {
+            let mut saved = execution.clone();
+            saved.ready_to_advance = true;
+            saved.intent_id = Some(intent_id);
+            checkpoint.checkpoint(self.progress_for(saved, None)?).await?;
+            outcome = self.advance_current_step(&mut execution.cex).await;
+            execution.cex.send_saved = false;
+        }
+
+        let error = match outcome {
             Err(CexBackendError::PendingSettlement(message)) => {
                 let error = CexBackendError::PendingSettlement(message).to_string();
                 execution.cex.last_error = Some(error.clone());
@@ -363,9 +384,9 @@ where
     async fn advance(
         &self,
         leg: &VenueLegState,
-        _checkpoint: &dyn VenueLegCheckpoint,
+        checkpoint: &dyn VenueLegCheckpoint,
     ) -> Result<VenueLegProgress, String> {
-        self.advance_leg(leg).await
+        self.advance_leg(leg, checkpoint).await
     }
 
     fn operator_questions(&self, leg: &VenueLegState) -> Result<Vec<OperatorQuestion>, String> {
@@ -387,7 +408,7 @@ where
     async fn recover(
         &self,
         leg: &VenueLegState,
-        _checkpoint: &dyn VenueLegCheckpoint,
+        checkpoint: &dyn VenueLegCheckpoint,
     ) -> Result<VenueLegProgress, String> {
         let mut execution = self.decode_leg_state(leg)?;
         if execution.cex.step == CexStep::Completed {
@@ -414,7 +435,7 @@ where
         {
             return Err(format!("MEXC leg at {:?} is not in recovery", execution.cex.step));
         }
-        self.advance_decoded_leg(execution).await
+        self.advance_decoded_leg(execution, checkpoint).await
     }
 }
 

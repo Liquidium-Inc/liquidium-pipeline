@@ -14,11 +14,10 @@ use liquidium_pipeline_connectors::backend::bridge_backend::{
 };
 use liquidium_pipeline_connectors::outbound::UnsettledSender;
 use liquidium_pipeline_core::outbound::{
-    OutboundIntent, OutboundSender, SIDE_EFFECT_AMBIGUOUS_PREFIX, side_effect_ambiguous,
+    OutboundIntent, OutboundSender, is_side_effect_ambiguous, side_effect_ambiguous,
 };
 use liquidium_pipeline_connectors::backend::cex_backend::{
     BuyOrderInputMode, CexBackend, CexBackendError, OrderBookLevel, SwapExecutionOptions, WithdrawStatus,
-    WithdrawalReceipt,
 };
 use liquidium_pipeline_core::{
     account::model::ChainAccount,
@@ -31,6 +30,7 @@ use tokio::sync::Mutex as TokioMutex;
 use tokio::time::sleep;
 
 use super::mexc_utils::{LIQUIDITY_EPS, SlicePreview, TradeLeg, is_usd_stable_symbol, mexc_special_trade_legs};
+use super::mexc_withdraw_sender::{AcceptedWithdrawal, MexcWithdrawals, WithdrawRequest, prepare_withdraw};
 
 pub(super) const WITHDRAW_BRIDGE_SOURCE_BALANCE_TOLERANCE: f64 = LIQUIDITY_EPS;
 const NATIVE_ETH_BRIDGEABLE_SAFETY_MARGIN: f64 = 1e-15;
@@ -41,18 +41,15 @@ pub(super) const CKETH_DECIMALS: i32 = 18;
 /// A direct withdrawal that MEXC accepted but never reports as delivered
 /// must not wait forever. After this long the row parks for an operator.
 const DIRECT_WITHDRAW_DELIVERY_TIMEOUT_SECS: i64 = 60 * 60;
-/// How long a withdrawal without a decided answer may stay absent from the
-/// exchange history before the leg parks for an operator.
-const UNCERTAIN_WITHDRAW_GRACE_SECS: i64 = 15 * 60;
 /// How long a landed bridge deposit may wait for the provider to accept it.
 /// The ckSOL minter reads it at finalized commitment, which takes seconds.
 const DEPOSIT_NOTICE_WINDOW_SECS: i64 = 30 * 60;
 
 use crate::{
     finalizers::bridge_planner::BridgePlanner,
-    finalizers::outbound::step_outbound,
+    finalizers::outbound::{OutboundRecord, step_outbound},
     finalizers::bridge_runtime::BridgeRuntime,
-    finalizers::cex_finalizer::{CexFinalizerLogic, CexRoutePreview, CexState, CexStep, UncertainWithdraw},
+    finalizers::cex_finalizer::{CexFinalizerLogic, CexRoutePreview, CexState, CexStep},
     stages::bridge_submit_lock::acquire_bridge_submit_lock,
     stages::executor::ExecutionReceipt,
     swappers::{
@@ -220,13 +217,16 @@ where
     /// Drives the funding transfer. `intent` starts a new one; without it the
     /// saved one advances. `Ok(None)` means wait for the next cycle.
     async fn drive_funding(&self, state: &mut CexState, intent: Option<OutboundIntent>) -> Result<Option<String>, String> {
-        step_outbound(
+        let starting = intent.is_some();
+        let landed = step_outbound(
             &mut state.deposit.deposit_funding,
             self.outbound.as_ref(),
             intent.as_ref(),
             now_ts(),
         )
-        .await
+        .await?;
+        state.send_saved = starting && state.deposit.deposit_funding.is_some();
+        Ok(landed)
     }
 
     /// The bridge destination for the final liquidator, from the snapshot
@@ -272,6 +272,7 @@ where
         state.step = CexStep::WithdrawPending;
         let now = now_ts();
         let liq_id = state.liq_id.clone();
+        let starting = request.is_some();
         let funds = &mut state.withdraw.bridge;
         let Some(receipt) = funds.withdraw_bridge_funding_txid.clone() else {
             let intent = match request {
@@ -304,6 +305,7 @@ where
                 funds.withdraw_bridge_funding_txid = Some(receipt);
                 funds.withdraw_bridge_funded_at_ts = Some(now);
             }
+            state.send_saved = starting && state.withdraw.bridge.withdraw_bridge_funding.is_some();
             // The provider reads the deposit at its own commitment, so the
             // notice runs on the next cycle.
             return Ok(());
@@ -468,87 +470,42 @@ where
         mexc_withdraw_order_id(&state.liq_id, state.withdraw.withdraw_attempt)
     }
 
-    /// Sends one withdrawal under the leg's order id. `None` means the state
-    /// already holds the outcome: dust, or a request without a decided answer.
+    /// Moves the leg's withdrawal request through the outbound driver: one
+    /// cycle saves it, the next sends it. `None` means wait, or the residual
+    /// completed as dust.
     async fn submit_withdraw(
         &self,
         state: &mut CexState,
         asset: &str,
         network: &str,
         amount: f64,
-    ) -> Result<Option<WithdrawalReceipt>, String> {
-        let order_id = Self::withdraw_order_id(state);
-        match self
-            .backend
-            .withdraw(asset, network, &state.withdraw.withdraw_address, amount, &order_id)
-            .await
-        {
-            Ok(receipt) => Ok(Some(receipt)),
-            Err(err) if is_mexc_withdraw_below_min_error(&err) => {
-                Self::complete_withdraw_as_below_min_dust(state, asset, network, amount, &err);
+    ) -> Result<Option<AcceptedWithdrawal>, String> {
+        if state.withdraw.withdraw_send.is_none() {
+            let request = WithdrawRequest {
+                asset: asset.to_string(),
+                network: network.to_string(),
+                address: state.withdraw.withdraw_address.clone(),
+                amount,
+                order_id: Self::withdraw_order_id(state),
+            };
+            state.withdraw.withdraw_send = Some(OutboundRecord::prepared(prepare_withdraw(&request)?));
+            state.send_saved = true;
+            return Ok(None);
+        }
+        let sender = MexcWithdrawals::new(self.backend.clone());
+        match step_outbound(&mut state.withdraw.withdraw_send, &sender, None, now_ts()).await {
+            Ok(landed) => Ok(landed.as_deref().map(AcceptedWithdrawal::parse)),
+            Err(error) if is_mexc_withdraw_below_min_error(&error) => {
+                Self::complete_withdraw_as_below_min_dust(state, asset, network, amount, &error);
                 Ok(None)
             }
-            Err(err) if err.starts_with(SIDE_EFFECT_AMBIGUOUS_PREFIX) => {
-                // Poll our own order id: the history lookup matches it, and a
-                // repeat request could withdraw the same funds twice.
-                warn!(
-                    "[mexc] liq_id={} withdraw without a decided answer; polling order id {}: {}",
-                    state.liq_id, order_id, err
-                );
-                state.withdraw.withdraw_id = Some(order_id);
-                state.withdraw.withdraw_uncertain = Some(UncertainWithdraw::Polling);
-                state.withdraw.withdraw_accepted_at_ts = Some(now_ts());
-                state.step = CexStep::WithdrawPending;
-                Ok(None)
-            }
-            Err(err) => {
+            Err(error) if is_side_effect_ambiguous(&error) => Err(error),
+            // MEXC refused it, so the next request takes a new order id.
+            Err(error) => {
                 state.withdraw.withdraw_attempt += 1;
-                Err(err)
+                Err(error)
             }
         }
-    }
-
-    /// Settles an uncertain withdrawal against the latest exchange status.
-    /// An absent record parks the leg after the grace period; a run after an
-    /// operator release means the operator found none, so the leg submits again.
-    /// `Ok(true)` means the step is decided and the caller returns.
-    fn settle_uncertain_withdraw(
-        state: &mut CexState,
-        status: &WithdrawStatus,
-        withdraw_id: &str,
-        amount: f64,
-    ) -> Result<bool, String> {
-        let Some(uncertain) = state.withdraw.withdraw_uncertain else {
-            return Ok(false);
-        };
-        if !matches!(status, WithdrawStatus::Unknown) {
-            state.withdraw.withdraw_uncertain = None;
-            return Ok(false);
-        }
-        let accepted_at = state.withdraw.withdraw_accepted_at_ts.unwrap_or_else(now_ts);
-        let waited = now_ts().saturating_sub(accepted_at);
-        if waited <= UNCERTAIN_WITHDRAW_GRACE_SECS {
-            return Ok(false);
-        }
-        if uncertain == UncertainWithdraw::Parked {
-            warn!(
-                "[mexc] liq_id={} operator released absent withdraw order {}; submitting a new request",
-                state.liq_id, withdraw_id
-            );
-            state.withdraw.withdraw_id = None;
-            state.withdraw.withdraw_accepted_at_ts = None;
-            state.withdraw.withdraw_uncertain = None;
-            state.withdraw.withdraw_attempt += 1;
-            state.step = CexStep::Withdraw;
-            return Ok(true);
-        }
-        state.withdraw.withdraw_uncertain = Some(UncertainWithdraw::Parked);
-        Err(format!(
-            "{SIDE_EFFECT_AMBIGUOUS_PREFIX}: MEXC shows no withdrawal with order id {withdraw_id} for liq_id {} after {waited}s; check MEXC withdraw history for {amount} {} to {}, then release: a found withdrawal needs its id recorded, an absent one is submitted again",
-            state.liq_id,
-            state.withdraw.withdraw_asset.symbol(),
-            state.withdraw.withdraw_address
-        ))
     }
 
     fn complete_withdraw_as_below_min_dust(
@@ -1378,9 +1335,6 @@ where
                     .backend
                     .get_withdraw_status_snapshot_by_id(&planned_asset, &withdraw_id)
                     .await?;
-                if Self::settle_uncertain_withdraw(state, &snapshot.status, &withdraw_id, amount)? {
-                    return Ok(());
-                }
                 match snapshot.status {
                     WithdrawStatus::Failed | WithdrawStatus::Canceled => {
                         return Err(format!(
@@ -1416,15 +1370,15 @@ where
                 return Ok(());
             }
 
-            let Some(receipt) = self
+            let Some(accepted) = self
                 .submit_withdraw(state, &planned_asset, &planned_network, amount)
                 .await?
             else {
                 return Ok(());
             };
-            state.withdraw.withdraw_id = receipt.internal_id.clone();
-            state.withdraw.withdraw_txid = receipt.txid.clone();
-            state.step = if receipt.txid.as_ref().is_some_and(|tx| !tx.trim().is_empty()) {
+            state.withdraw.withdraw_id = Some(accepted.id);
+            state.withdraw.withdraw_txid = accepted.txid.clone();
+            state.step = if accepted.txid.as_ref().is_some_and(|tx| !tx.trim().is_empty()) {
                 CexStep::Completed
             } else {
                 state.withdraw.withdraw_accepted_at_ts = Some(now_ts());
@@ -1456,14 +1410,14 @@ where
 
         // Submit CEX withdraw once (to bridge source), then keep polling in WithdrawPending.
         if state.withdraw.withdraw_id.is_none() && state.withdraw.withdraw_txid.is_none() {
-            let Some(receipt) = self
+            let Some(accepted) = self
                 .submit_withdraw(state, &planned_asset, &planned_network, amount)
                 .await?
             else {
                 return Ok(());
             };
-            state.withdraw.withdraw_id = receipt.internal_id.clone();
-            state.withdraw.withdraw_txid = receipt.txid.clone();
+            state.withdraw.withdraw_id = Some(accepted.id);
+            state.withdraw.withdraw_txid = accepted.txid;
             state.step = CexStep::WithdrawPending;
             return Ok(());
         }
@@ -1497,9 +1451,6 @@ where
                 withdraw_snapshot.transaction_fee,
             );
 
-            if Self::settle_uncertain_withdraw(state, &withdraw_snapshot.status, &withdraw_id, amount)? {
-                return Ok(());
-            }
             match withdraw_snapshot.status {
                 WithdrawStatus::Pending | WithdrawStatus::Unknown => {
                     if withdraw_snapshot.txid.is_some() {

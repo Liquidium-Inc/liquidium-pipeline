@@ -15,6 +15,7 @@ use liquidium_pipeline_connectors::backend::cex_backend::{
     WithdrawStatus, WithdrawStatusSnapshot,
 };
 use liquidium_pipeline_core::account::model::ChainAccount;
+use liquidium_pipeline_core::outbound::SIDE_EFFECT_AMBIGUOUS_PREFIX;
 use liquidium_pipeline_core::tokens::{chain_token::ChainToken, chain_token_amount::ChainTokenAmount};
 use liquidium_pipeline_core::transfer::actions::MockTransferActions;
 use liquidium_pipeline_core::types::protocol_types::{
@@ -1641,6 +1642,7 @@ async fn mexc_withdraw_bridge_submit_resume_complete_and_idempotent() {
         1.5,
     ));
 
+    finalizer.withdraw(&mut state).await.expect("the first cycle saves the withdrawal request");
     finalizer
         .withdraw(&mut state)
         .await
@@ -1767,6 +1769,7 @@ async fn mexc_withdraw_bridge_waits_when_source_balance_below_expected_net() {
         1.5,
     ));
 
+    finalizer.withdraw(&mut state).await.expect("the first cycle saves the withdrawal request");
     finalizer
         .withdraw(&mut state)
         .await
@@ -1838,6 +1841,7 @@ async fn mexc_withdraw_bridge_deferral_keeps_step_pending_then_submits() {
         1.5,
     ));
 
+    finalizer.withdraw(&mut state).await.expect("the first cycle saves the withdrawal request");
     finalizer.withdraw(&mut state).await.expect("cex withdraw submit");
     finalizer
         .withdraw(&mut state)
@@ -2013,6 +2017,7 @@ async fn mexc_withdraw_bridge_applies_cex_withdraw_fee_to_submit_amount() {
         1.5,
     ));
 
+    finalizer.withdraw(&mut state).await.expect("the first cycle saves the withdrawal request");
     finalizer
         .withdraw(&mut state)
         .await
@@ -2112,6 +2117,7 @@ async fn mexc_native_eth_withdraw_bridge_uses_bridgeable_balance_after_gas_reser
         0.0200899299,
     ));
 
+    finalizer.withdraw(&mut state).await.expect("the first cycle saves the withdrawal request");
     finalizer
         .withdraw(&mut state)
         .await
@@ -2169,6 +2175,7 @@ async fn mexc_non_bridge_withdraw_behavior_unchanged() {
         1.0,
     ));
 
+    finalizer.withdraw(&mut state).await.expect("the first cycle saves the withdrawal request");
     finalizer
         .withdraw(&mut state)
         .await
@@ -2209,6 +2216,7 @@ async fn mexc_direct_withdraw_parks_when_delivery_never_arrives() {
     state.step = CexStep::Withdraw;
     state.withdraw.size_out = Some(ChainTokenAmount::from_formatted(state.withdraw.withdraw_asset.clone(), 1.0));
 
+    finalizer.withdraw(&mut state).await.expect("the first cycle saves the withdrawal request");
     finalizer.withdraw(&mut state).await.unwrap();
     assert!(matches!(state.step, CexStep::WithdrawPending));
     let accepted_at = state.withdraw.withdraw_accepted_at_ts.expect("accept time recorded");
@@ -2272,6 +2280,7 @@ async fn mexc_direct_withdraw_waits_for_delivery_and_deducts_fee_once() {
         state.withdraw.withdraw_asset.clone(),
         1.0,
     ));
+    finalizer.withdraw(&mut state).await.expect("the first cycle saves the withdrawal request");
     for _ in 0..2 {
         finalizer.withdraw(&mut state).await.unwrap();
         assert!(matches!(state.step, CexStep::WithdrawPending));
@@ -2329,6 +2338,7 @@ async fn mexc_native_icp_non_bridge_withdraw_uses_liquidator_account_id_hex() {
         1.0,
     ));
 
+    finalizer.withdraw(&mut state).await.expect("the first cycle saves the withdrawal request");
     finalizer
         .withdraw(&mut state)
         .await
@@ -2394,6 +2404,7 @@ async fn mexc_non_bridge_withdraw_below_min_completes_as_zero_output_dust() {
         0.00001,
     ));
 
+    finalizer.withdraw(&mut state).await.expect("the first cycle saves the withdrawal request");
     finalizer
         .withdraw(&mut state)
         .await
@@ -2450,6 +2461,7 @@ async fn mexc_bridged_withdraw_below_min_completes_as_zero_output_dust() {
         0.00001,
     ));
 
+    finalizer.withdraw(&mut state).await.expect("the first cycle saves the withdrawal request");
     finalizer
         .withdraw(&mut state)
         .await
@@ -2515,6 +2527,7 @@ async fn mexc_non_bridge_withdraw_keeps_evm_destination_address() {
         1.0,
     ));
 
+    finalizer.withdraw(&mut state).await.expect("the first cycle saves the withdrawal request");
     finalizer
         .withdraw(&mut state)
         .await
@@ -6193,6 +6206,7 @@ async fn mexc_cksol_repayment_waits_for_funding_reserves_fees_and_records_mint()
     );
     let mut state = cksol_repayment_state(&finalizer, 1.5);
 
+    finalizer.withdraw(&mut state).await.expect("the first cycle saves the withdrawal request");
     finalizer.withdraw(&mut state).await.unwrap(); // exchange withdrawal
     finalizer.withdraw(&mut state).await.unwrap(); // source balance too low
     assert!(!state.withdraw.bridge.deposit_send_started());
@@ -7417,11 +7431,11 @@ mod fill_accounting {
 
 mod uncertain_side_effects {
     //! A call that may have moved funds without an answer is never repeated
-    //! automatically. Funding parks the leg; a withdrawal polls its own order id.
+    //! automatically. Funding and withdrawals settle from the chain or the
+    //! MEXC history, and park for an operator when that stays undecided.
     use super::*;
     use liquidium_pipeline_core::outbound::SIDE_EFFECT_AMBIGUOUS_PREFIX;
     use liquidium_pipeline_connectors::backend::cex_backend::{WithdrawStatusSnapshot, WithdrawalReceipt};
-    use crate::finalizers::cex_finalizer::UncertainWithdraw;
     use crate::finalizers::outbound::{OperatorDecision, OutboundPhase, OutboundRecord};
     use liquidium_pipeline_core::outbound::{MockOutboundSender, PreparedSend, SendOutcome};
 
@@ -7624,40 +7638,60 @@ mod uncertain_side_effects {
         assert!(state.deposit.funding_resumable(), "a submitted send is only read back");
     }
 
+    /// The order id of the saved request, which the next cycle sends.
+    fn saved_order_id(state: &CexState) -> String {
+        state
+            .withdraw
+            .withdraw_send
+            .as_ref()
+            .expect("the request is saved before it is sent")
+            .prepared
+            .identity
+            .clone()
+    }
+
+    /// Moves the saved request's open clock past the MEXC window.
+    fn age_open_request(state: &mut CexState) {
+        state.withdraw.withdraw_send.as_mut().unwrap().phase = OutboundPhase::Submitted { at: now_ts() - 16 * 60 };
+    }
+
     #[tokio::test]
-    async fn an_unanswered_withdraw_polls_its_order_id_and_is_not_repeated() {
-        let order_ids = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    async fn an_unanswered_withdraw_is_settled_from_its_order_id_and_never_repeated() {
         let mut cex = MockCexBackend::new();
-        let seen = order_ids.clone();
-        cex.expect_withdraw().times(1).returning(move |_, _, _, _, order_id| {
-            seen.lock().unwrap().push(order_id.to_string());
-            Err(format!("{SIDE_EFFECT_AMBIGUOUS_PREFIX}: MEXC withdraw timed out"))
-        });
-        let expected = order_ids.clone();
-        cex.expect_get_withdraw_status_snapshot_by_id()
+        cex.expect_withdraw()
             .times(1)
+            .returning(|_, _, _, _, _| Err(format!("{SIDE_EFFECT_AMBIGUOUS_PREFIX}: MEXC withdraw timed out")));
+        let polls = Arc::new(std::sync::Mutex::new(vec![
+            snapshot(WithdrawStatus::Completed, Some("ledger:7")),
+            snapshot(WithdrawStatus::Pending, None),
+        ]));
+        let polled_ids = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let seen = polled_ids.clone();
+        cex.expect_get_withdraw_status_snapshot_by_id()
+            .times(2)
             .returning(move |_, id| {
-                assert_eq!(id, expected.lock().unwrap()[0], "the poll uses our order id");
-                Ok(snapshot(WithdrawStatus::Completed, Some("ledger:7")))
+                seen.lock().unwrap().push(id.to_string());
+                Ok(polls.lock().unwrap().pop().unwrap())
             });
         let finalizer = finalizer(cex, MockTransferActions::new());
         let mut state = withdraw_state(&finalizer).await;
 
-        finalizer.withdraw(&mut state).await.expect("no error: the leg polls instead");
-
-        let order_id = order_ids.lock().unwrap()[0].clone();
+        finalizer.withdraw(&mut state).await.expect("the first cycle saves the request");
+        let order_id = saved_order_id(&state);
         assert!(order_id.len() <= 32 && order_id.starts_with("lq") && order_id.ends_with("w0"), "{order_id}");
+        assert!(!state.is_receipt_poll_only(), "a saved request may run before a restart");
+        finalizer.withdraw(&mut state).await.expect("no error: the answer stays open");
+        assert!(state.is_receipt_poll_only(), "a sent request is only read back");
+        finalizer.withdraw(&mut state).await.expect("the history shows the request");
         assert_eq!(state.withdraw.withdraw_id.as_deref(), Some(order_id.as_str()));
-        assert_eq!(state.withdraw.withdraw_uncertain, Some(UncertainWithdraw::Polling));
         assert_eq!(state.step, CexStep::WithdrawPending);
-
-        finalizer.withdraw(&mut state).await.expect("the exchange shows the withdrawal");
+        finalizer.withdraw(&mut state).await.expect("the delivery arrives");
         assert_eq!(state.step, CexStep::Completed);
-        assert_eq!(state.withdraw.withdraw_uncertain, None);
+        assert_eq!(*polled_ids.lock().unwrap(), vec![order_id.clone(), order_id]);
     }
 
     #[tokio::test]
-    async fn an_absent_unanswered_withdraw_parks_then_resubmits_after_release() {
+    async fn an_absent_withdraw_parks_then_a_new_order_follows_an_absent_answer() {
         let order_ids = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
         let mut cex = MockCexBackend::new();
         let seen = order_ids.clone();
@@ -7677,28 +7711,27 @@ mod uncertain_side_effects {
         let mut state = withdraw_state(&finalizer).await;
 
         finalizer.withdraw(&mut state).await.unwrap();
-        // Inside the grace period an absent record is a wait.
         finalizer.withdraw(&mut state).await.unwrap();
-        assert_eq!(state.step, CexStep::WithdrawPending);
-
-        let accepted_at = state.withdraw.withdraw_accepted_at_ts.unwrap();
-        state.withdraw.withdraw_accepted_at_ts = Some(accepted_at - 16 * 60);
-        let error = finalizer.withdraw(&mut state).await.expect_err("no record after the grace period");
-        assert!(error.starts_with(SIDE_EFFECT_AMBIGUOUS_PREFIX), "{error}");
-        assert_eq!(state.withdraw.withdraw_uncertain, Some(UncertainWithdraw::Parked));
-
-        // The next run follows an operator's release: the absence is confirmed.
+        // Inside the window an absent record is a wait.
         finalizer.withdraw(&mut state).await.unwrap();
-        assert!(state.withdraw.withdraw_id.is_none());
-        assert_eq!(state.withdraw.withdraw_attempt, 1);
         assert_eq!(state.step, CexStep::Withdraw);
 
+        age_open_request(&mut state);
+        let error = finalizer.withdraw(&mut state).await.expect_err("no record after the window");
+        assert!(error.starts_with(SIDE_EFFECT_AMBIGUOUS_PREFIX), "{error}");
+
+        // The operator found no request. The leg reads the history once more.
+        MexcFinalizer::<MockCexBackend>::answer_operator(&mut state, Some(&OperatorDecision::Absent)).unwrap();
+        finalizer.withdraw(&mut state).await.expect_err("the absent request is dropped");
+        assert!(state.withdraw.withdraw_send.is_none());
+        assert_eq!(state.withdraw.withdraw_attempt, 1);
+
+        finalizer.withdraw(&mut state).await.unwrap();
         finalizer.withdraw(&mut state).await.unwrap();
         let order_ids = order_ids.lock().unwrap();
         assert_ne!(order_ids[0], order_ids[1], "a new request gets a new order id");
         assert!(order_ids[1].ends_with("w1"), "{}", order_ids[1]);
         assert_eq!(state.withdraw.withdraw_id.as_deref(), Some("mexc-internal-2"));
-        assert_eq!(state.withdraw.withdraw_uncertain, None);
     }
 
     #[tokio::test]
@@ -7727,15 +7760,13 @@ mod uncertain_side_effects {
         state.step = CexStep::Withdraw;
         state.withdraw.size_out = Some(ChainTokenAmount::from_formatted(state.withdraw.withdraw_asset.clone(), 1.0));
 
-        finalizer.withdraw(&mut state).await.expect("the leg polls its order id");
-        assert_eq!(state.withdraw.withdraw_uncertain, Some(UncertainWithdraw::Polling));
-        finalizer.withdraw(&mut state).await.expect("inside the grace period");
-        assert_eq!(state.step, CexStep::WithdrawPending);
-
-        let accepted_at = state.withdraw.withdraw_accepted_at_ts.unwrap();
-        state.withdraw.withdraw_accepted_at_ts = Some(accepted_at - 16 * 60);
-        let error = finalizer.withdraw(&mut state).await.expect_err("parks after the grace period");
+        finalizer.withdraw(&mut state).await.expect("saved");
+        finalizer.withdraw(&mut state).await.expect("sent, open");
+        finalizer.withdraw(&mut state).await.expect("inside the window");
+        age_open_request(&mut state);
+        let error = finalizer.withdraw(&mut state).await.expect_err("parks after the window");
         assert!(error.starts_with(SIDE_EFFECT_AMBIGUOUS_PREFIX), "{error}");
+        assert!(state.withdraw.withdraw_id.is_none());
         assert!(state.withdraw.bridge.withdraw_bridge_id.is_none());
     }
 
@@ -7756,9 +7787,11 @@ mod uncertain_side_effects {
         let finalizer = finalizer(cex, MockTransferActions::new());
         let mut state = withdraw_state(&finalizer).await;
 
+        finalizer.withdraw(&mut state).await.unwrap();
         let error = finalizer.withdraw(&mut state).await.expect_err("refused");
         assert!(!error.starts_with(SIDE_EFFECT_AMBIGUOUS_PREFIX));
         assert_eq!(state.withdraw.withdraw_attempt, 1);
+        finalizer.withdraw(&mut state).await.unwrap();
         finalizer.withdraw(&mut state).await.unwrap();
 
         let order_ids = order_ids.lock().unwrap();
@@ -7769,7 +7802,7 @@ mod uncertain_side_effects {
 
 mod operator_answers {
     use super::*;
-    use crate::finalizers::cex_finalizer::{BridgeSubmitAttempt, UncertainWithdraw};
+    use crate::finalizers::cex_finalizer::BridgeSubmitAttempt;
     use crate::finalizers::outbound::{OperatorDecision, OutboundPhase, OutboundRecord};
     use liquidium_pipeline_core::outbound::PreparedSend;
 
@@ -7817,20 +7850,29 @@ mod operator_answers {
     }
 
     #[test]
-    fn a_parked_withdrawal_records_the_found_id_or_stays_released_for_a_new_request() {
+    fn a_withdrawal_that_may_have_run_before_a_restart_takes_a_decision() {
         let mut state = state();
-        state.withdraw.withdraw_id = Some("lq0000000000000001w0".into());
-        state.withdraw.withdraw_uncertain = Some(UncertainWithdraw::Parked);
-        assert_eq!(Mexc::operator_questions_for(&state).len(), 1);
+        let mut request = parked_send();
+        request.prepared.sender = "mexc-withdraw".into();
+        request.prepared.identity = "lq0000000000000001w0".into();
+        request.prepared.replay_safe = false;
+        request.phase = OutboundPhase::Prepared;
+        state.withdraw.withdraw_send = Some(request.clone());
+        let questions = Mexc::operator_questions_for(&state);
+        assert_eq!(questions.len(), 1);
+        assert!(questions[0].detail.contains("lq0000000000000001w0"), "{}", questions[0].detail);
+        assert!(Mexc::answer_operator(&mut state, None).is_err(), "a bare release could withdraw twice");
 
-        let mut found = state.clone();
-        Mexc::answer_operator(&mut found, Some(&landed("7872730c87d04382b5c76da98359cd4c"))).unwrap();
-        assert_eq!(found.withdraw.withdraw_id.as_deref(), Some("7872730c87d04382b5c76da98359cd4c"));
-        assert_eq!(found.withdraw.withdraw_uncertain, None);
+        Mexc::answer_operator(&mut state, Some(&landed("7872730c87d04382b5c76da98359cd4c"))).unwrap();
+        let decided = state.withdraw.withdraw_send.unwrap();
+        assert!(matches!(decided.phase, OutboundPhase::Parked { .. }), "the next run reads MEXC first");
+        assert_eq!(decided.decision, Some(landed("7872730c87d04382b5c76da98359cd4c")));
 
-        // The leg checks the history once more before a new request.
-        Mexc::answer_operator(&mut state, Some(&OperatorDecision::Absent)).unwrap();
-        assert_eq!(state.withdraw.withdraw_uncertain, Some(UncertainWithdraw::Parked));
+        // A prepared send that is safe to repeat resumes by itself.
+        let mut state = super::operator_answers::state();
+        request.prepared.replay_safe = true;
+        state.withdraw.withdraw_send = Some(request);
+        assert!(Mexc::operator_questions_for(&state).is_empty());
     }
 
     #[test]

@@ -44,6 +44,7 @@ where
 
         Ok(CexState {
             liq_id: execution_id.to_string(),
+            send_saved: false,
             step: CexStep::Deposit,
             last_error: None,
             market: format!("{}_{}", bridge_plan.deposit.cex_asset, bridge_plan.withdraw.cex_asset),
@@ -104,7 +105,7 @@ where
                 withdraw_txid: None,
                 withdraw_accepted_at_ts: None,
                 withdraw_attempt: 0,
-                withdraw_uncertain: None,
+                withdraw_send: None,
                 size_out: None,
                 bridge: CexWithdrawBridgeState {
                     withdraw_planned_asset: Some(bridge_plan.withdraw.cex_asset),

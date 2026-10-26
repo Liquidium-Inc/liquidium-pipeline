@@ -35,10 +35,36 @@ pub struct OutboundRecord {
 }
 
 impl OutboundRecord {
+    /// A send saved for the next cycle.
+    pub fn prepared(prepared: PreparedSend) -> Self {
+        Self {
+            prepared,
+            phase: OutboundPhase::Prepared,
+            decision: None,
+        }
+    }
+
     /// True when a restart may resume this send without an operator: it was
     /// sent already, or sending it again cannot move funds twice.
     pub fn resumable(&self) -> bool {
         self.prepared.replay_safe || self.phase != OutboundPhase::Prepared
+    }
+
+    /// True when only an operator can decide the send: it parked, or it may
+    /// have run before a restart and a second run is not safe.
+    pub fn needs_operator(&self) -> bool {
+        matches!(self.phase, OutboundPhase::Parked { .. }) || !self.resumable()
+    }
+
+    /// Records an operator's decision. The next run asks the chain first and
+    /// uses the decision only while the chain stays undecided.
+    pub fn decide(&mut self, decision: OperatorDecision) {
+        if !matches!(self.phase, OutboundPhase::Parked { .. }) {
+            self.phase = OutboundPhase::Parked {
+                reason: "an operator decided a send that may have run before a restart".to_string(),
+            };
+        }
+        self.decision = Some(decision);
     }
 }
 
@@ -65,11 +91,7 @@ pub async fn start_outbound(
 ) -> Drive {
     match sender.prepare(intent).await {
         Ok(prepared) => {
-            *record = Some(OutboundRecord {
-                prepared,
-                phase: OutboundPhase::Prepared,
-                decision: None,
-            });
+            *record = Some(OutboundRecord::prepared(prepared));
             Drive::Wait
         }
         Err(reason) => Drive::Retry { reason },
