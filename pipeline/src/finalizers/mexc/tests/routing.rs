@@ -19,15 +19,7 @@ async fn mexc_resolves_icp_to_ckbtc_route_from_configured_pairs() {
             other => Err(format!("unexpected market {}", other)),
         });
 
-    let finalizer = MexcFinalizer::new(
-        Arc::new(backend),
-        Arc::new(transfers),
-        Principal::anonymous(),
-        TEST_MAX_SELL_SLIPPAGE_BPS,
-        TEST_CEX_MIN_EXEC_USD,
-        TEST_CEX_SLICE_TARGET_RATIO,
-    )
-    .with_route_config(
+    let finalizer = test_finalizer(Arc::new(backend), Arc::new(transfers)).with_route_config(
         vec!["ICP_USDC".to_string(), "BTC_USDC".to_string(), "CKBTC_BTC".to_string()],
         2,
     );
@@ -64,15 +56,7 @@ async fn mexc_resolves_ckbtc_to_icp_route_from_configured_pairs() {
             other => Err(format!("unexpected market {}", other)),
         });
 
-    let finalizer = MexcFinalizer::new(
-        Arc::new(backend),
-        Arc::new(transfers),
-        Principal::anonymous(),
-        TEST_MAX_SELL_SLIPPAGE_BPS,
-        TEST_CEX_MIN_EXEC_USD,
-        TEST_CEX_SLICE_TARGET_RATIO,
-    )
-    .with_route_config(
+    let finalizer = test_finalizer(Arc::new(backend), Arc::new(transfers)).with_route_config(
         vec!["CKBTC_BTC".to_string(), "BTC_USDC".to_string(), "ICP_USDC".to_string()],
         2,
     );
@@ -109,14 +93,7 @@ async fn mexc_resolves_icp_to_ckusdt_route_from_configured_pairs() {
             other => Err(format!("unexpected market {}", other)),
         });
 
-    let finalizer = MexcFinalizer::new(
-        Arc::new(backend),
-        Arc::new(transfers),
-        Principal::anonymous(),
-        TEST_MAX_SELL_SLIPPAGE_BPS,
-        TEST_CEX_MIN_EXEC_USD,
-        TEST_CEX_SLICE_TARGET_RATIO,
-    )
+    let finalizer = test_finalizer(Arc::new(backend), Arc::new(transfers))
     .with_route_config(vec!["ICP_USDT".to_string(), "CKUSDT_USDT".to_string()], 1);
 
     let legs = finalizer
@@ -149,14 +126,7 @@ async fn mexc_resolves_icp_to_eth_route_from_configured_pairs() {
             other => Err(format!("unexpected market {}", other)),
         });
 
-    let finalizer = MexcFinalizer::new(
-        Arc::new(backend),
-        Arc::new(transfers),
-        Principal::anonymous(),
-        TEST_MAX_SELL_SLIPPAGE_BPS,
-        TEST_CEX_MIN_EXEC_USD,
-        TEST_CEX_SLICE_TARGET_RATIO,
-    )
+    let finalizer = test_finalizer(Arc::new(backend), Arc::new(transfers))
     .with_route_config(vec!["ICP_USDT".to_string(), "ETH_USDT".to_string()], 1);
 
     let legs = finalizer
@@ -189,15 +159,7 @@ async fn mexc_resolves_ckbtc_to_eth_route_from_configured_pairs() {
             other => Err(format!("unexpected market {}", other)),
         });
 
-    let finalizer = MexcFinalizer::new(
-        Arc::new(backend),
-        Arc::new(transfers),
-        Principal::anonymous(),
-        TEST_MAX_SELL_SLIPPAGE_BPS,
-        TEST_CEX_MIN_EXEC_USD,
-        TEST_CEX_SLICE_TARGET_RATIO,
-    )
-    .with_route_config(
+    let finalizer = test_finalizer(Arc::new(backend), Arc::new(transfers)).with_route_config(
         vec!["CKBTC_BTC".to_string(), "BTC_USDT".to_string(), "ETH_USDT".to_string()],
         2,
     );
@@ -234,15 +196,7 @@ async fn mexc_resolves_eth_to_ckbtc_route_from_configured_pairs() {
             other => Err(format!("unexpected market {}", other)),
         });
 
-    let finalizer = MexcFinalizer::new(
-        Arc::new(backend),
-        Arc::new(transfers),
-        Principal::anonymous(),
-        TEST_MAX_SELL_SLIPPAGE_BPS,
-        TEST_CEX_MIN_EXEC_USD,
-        TEST_CEX_SLICE_TARGET_RATIO,
-    )
-    .with_route_config(
+    let finalizer = test_finalizer(Arc::new(backend), Arc::new(transfers)).with_route_config(
         vec!["CKBTC_BTC".to_string(), "BTC_USDT".to_string(), "ETH_USDT".to_string()],
         2,
     );
@@ -279,14 +233,7 @@ async fn mexc_resolves_ckusdt_to_icp_route_from_configured_pairs() {
             other => Err(format!("unexpected market {}", other)),
         });
 
-    let finalizer = MexcFinalizer::new(
-        Arc::new(backend),
-        Arc::new(transfers),
-        Principal::anonymous(),
-        TEST_MAX_SELL_SLIPPAGE_BPS,
-        TEST_CEX_MIN_EXEC_USD,
-        TEST_CEX_SLICE_TARGET_RATIO,
-    )
+    let finalizer = test_finalizer(Arc::new(backend), Arc::new(transfers))
     .with_route_config(vec!["CKUSDT_USDT".to_string(), "ICP_USDT".to_string()], 1);
 
     let legs = finalizer
@@ -349,15 +296,7 @@ async fn mexc_trade_prefers_direct_route_over_hops_when_both_available() {
             })
         });
 
-    let finalizer = MexcFinalizer::new(
-        Arc::new(backend),
-        Arc::new(transfers),
-        Principal::anonymous(),
-        TEST_MAX_SELL_SLIPPAGE_BPS,
-        TEST_CEX_MIN_EXEC_USD,
-        TEST_CEX_SLICE_TARGET_RATIO,
-    )
-    .with_route_config(
+    let finalizer = test_finalizer(Arc::new(backend), Arc::new(transfers)).with_route_config(
         vec!["BTC_USDT".to_string(), "BTC_USDC".to_string(), "USDC_USDT".to_string()],
         2,
     );
@@ -434,15 +373,7 @@ async fn mexc_trade_uses_configured_hop_route_when_direct_unavailable() {
             })
         });
 
-    let finalizer = MexcFinalizer::new(
-        Arc::new(backend),
-        Arc::new(transfers),
-        Principal::anonymous(),
-        TEST_MAX_SELL_SLIPPAGE_BPS,
-        TEST_CEX_MIN_EXEC_USD,
-        TEST_CEX_SLICE_TARGET_RATIO,
-    )
-    .with_route_config(
+    let finalizer = test_finalizer(Arc::new(backend), Arc::new(transfers)).with_route_config(
         vec![
             "BTC_USDC".to_string(),
             "USDC_USDT".to_string(),
@@ -541,15 +472,7 @@ async fn mexc_trade_reuses_persisted_route_without_reprobing_direct_markets() {
             })
         });
 
-    let finalizer = MexcFinalizer::new(
-        Arc::new(backend),
-        Arc::new(transfers),
-        Principal::anonymous(),
-        TEST_MAX_SELL_SLIPPAGE_BPS,
-        TEST_CEX_MIN_EXEC_USD,
-        TEST_CEX_SLICE_TARGET_RATIO,
-    )
-    .with_route_config(
+    let finalizer = test_finalizer(Arc::new(backend), Arc::new(transfers)).with_route_config(
         vec![
             "BTC_USDC".to_string(),
             "USDC_USDT".to_string(),
@@ -607,14 +530,7 @@ async fn mexc_trade_errors_when_no_hop_route_exists_in_configured_pairs() {
         .returning(move |_market, _limit| Ok(empty.clone()));
     backend.expect_execute_swap_detailed_with_options().times(0);
 
-    let finalizer = MexcFinalizer::new(
-        Arc::new(backend),
-        Arc::new(transfers),
-        Principal::anonymous(),
-        TEST_MAX_SELL_SLIPPAGE_BPS,
-        TEST_CEX_MIN_EXEC_USD,
-        TEST_CEX_SLICE_TARGET_RATIO,
-    )
+    let finalizer = test_finalizer(Arc::new(backend), Arc::new(transfers))
     .with_route_config(vec!["BTC_USDC".to_string(), "USDC_USDT".to_string()], 2);
 
     let mut receipt = make_execution_receipt(1004);
@@ -673,15 +589,8 @@ async fn mexc_preview_route_keeps_legacy_special_override_even_with_direct_pair_
         }
     });
 
-    let finalizer = MexcFinalizer::new(
-        Arc::new(backend),
-        Arc::new(transfers),
-        Principal::anonymous(),
-        TEST_MAX_SELL_SLIPPAGE_BPS,
-        TEST_CEX_MIN_EXEC_USD,
-        TEST_CEX_SLICE_TARGET_RATIO,
-    )
-    .with_route_config(vec!["CKBTC_CKUSDT".to_string()], 2);
+    let finalizer =
+        test_finalizer(Arc::new(backend), Arc::new(transfers)).with_route_config(vec!["CKBTC_CKUSDT".to_string()], 2);
 
     let receipt = make_execution_receipt(1005);
     let preview = finalizer.preview_route(&receipt).await.expect("preview should succeed");
@@ -697,15 +606,8 @@ async fn mexc_resolves_eth_to_usdc_via_usdt_special_route_without_direct_probe()
     let transfers = MockTransferActions::new();
     backend.expect_get_orderbook().times(0);
 
-    let finalizer = MexcFinalizer::new(
-        Arc::new(backend),
-        Arc::new(transfers),
-        Principal::anonymous(),
-        TEST_MAX_SELL_SLIPPAGE_BPS,
-        TEST_CEX_MIN_EXEC_USD,
-        TEST_CEX_SLICE_TARGET_RATIO,
-    )
-    .with_route_config(vec!["ETH_USDC".to_string()], 2);
+    let finalizer =
+        test_finalizer(Arc::new(backend), Arc::new(transfers)).with_route_config(vec!["ETH_USDC".to_string()], 2);
 
     let legs = finalizer
         .resolve_trade_legs_for_symbols("ETH", "USDC")
@@ -725,15 +627,8 @@ async fn mexc_resolves_usdc_to_eth_via_usdt_special_route_without_direct_probe()
     let transfers = MockTransferActions::new();
     backend.expect_get_orderbook().times(0);
 
-    let finalizer = MexcFinalizer::new(
-        Arc::new(backend),
-        Arc::new(transfers),
-        Principal::anonymous(),
-        TEST_MAX_SELL_SLIPPAGE_BPS,
-        TEST_CEX_MIN_EXEC_USD,
-        TEST_CEX_SLICE_TARGET_RATIO,
-    )
-    .with_route_config(vec!["USDC_ETH".to_string()], 2);
+    let finalizer =
+        test_finalizer(Arc::new(backend), Arc::new(transfers)).with_route_config(vec!["USDC_ETH".to_string()], 2);
 
     let legs = finalizer
         .resolve_trade_legs_for_symbols("USDC", "ETH")
@@ -799,14 +694,7 @@ async fn mexc_input_slice_usd_converts_non_hardcoded_quote_via_configured_hops()
             _ => Err(format!("unexpected market {}", market)),
         });
 
-    let finalizer = MexcFinalizer::new(
-        Arc::new(backend),
-        Arc::new(transfers),
-        Principal::anonymous(),
-        TEST_MAX_SELL_SLIPPAGE_BPS,
-        TEST_CEX_MIN_EXEC_USD,
-        TEST_CEX_SLICE_TARGET_RATIO,
-    )
+    let finalizer = test_finalizer(Arc::new(backend), Arc::new(transfers))
     .with_route_config(vec!["ETH_BTC".to_string(), "BTC_USDC".to_string()], 1);
 
     let usd = finalizer
@@ -905,14 +793,7 @@ async fn mexc_preview_route_resolves_direct_buy_leg_when_sell_book_empty() {
             _ => Err(format!("unexpected market {}", market)),
         });
 
-    let finalizer = MexcFinalizer::new(
-        Arc::new(backend),
-        Arc::new(transfers),
-        Principal::anonymous(),
-        TEST_MAX_SELL_SLIPPAGE_BPS,
-        TEST_CEX_MIN_EXEC_USD,
-        TEST_CEX_SLICE_TARGET_RATIO,
-    );
+    let finalizer = test_finalizer(Arc::new(backend), Arc::new(transfers));
 
     let mut receipt = make_execution_receipt(42);
     receipt.request.collateral_asset = ChainToken::Icp {

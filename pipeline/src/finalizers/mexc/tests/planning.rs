@@ -5,14 +5,7 @@ use super::*;
 async fn mexc_prepare_maps_cketh_collateral_to_eth_deposit_bridge_plan() {
     let backend = Arc::new(MockCexBackend::new());
     let transfer_service = Arc::new(MockTransferActions::new());
-    let finalizer = MexcFinalizer::new(
-        backend,
-        transfer_service,
-        Principal::anonymous(),
-        TEST_MAX_SELL_SLIPPAGE_BPS,
-        TEST_CEX_MIN_EXEC_USD,
-        TEST_CEX_SLICE_TARGET_RATIO,
-    )
+    let finalizer = test_finalizer(backend, transfer_service)
     .with_bridge_runtime(bridge_dependencies(Arc::new(MockBridgeBackend::new())));
 
     let receipt = make_execution_receipt_with_assets(43, cketh_token(), ckbtc_token());
@@ -30,14 +23,7 @@ async fn mexc_prepare_maps_cketh_collateral_to_eth_deposit_bridge_plan() {
 async fn mexc_prepare_maps_cketh_debt_to_eth_withdraw_bridge_plan() {
     let backend = Arc::new(MockCexBackend::new());
     let transfer_service = Arc::new(MockTransferActions::new());
-    let finalizer = MexcFinalizer::new(
-        backend,
-        transfer_service,
-        Principal::anonymous(),
-        TEST_MAX_SELL_SLIPPAGE_BPS,
-        TEST_CEX_MIN_EXEC_USD,
-        TEST_CEX_SLICE_TARGET_RATIO,
-    )
+    let finalizer = test_finalizer(backend, transfer_service)
     .with_bridge_runtime(bridge_dependencies(Arc::new(MockBridgeBackend::new())));
 
     let receipt = make_execution_receipt_with_assets(44, ckbtc_token(), cketh_token());
@@ -78,14 +64,7 @@ async fn mexc_deposit_phase_a_snapshots_baseline_and_sends_transfer() {
     let backend = Arc::new(backend);
     let transfer_service = Arc::new(transfers);
 
-    let finalizer = MexcFinalizer::new(
-        backend,
-        transfer_service,
-        Principal::anonymous(),
-        TEST_MAX_SELL_SLIPPAGE_BPS,
-        TEST_CEX_MIN_EXEC_USD,
-        TEST_CEX_SLICE_TARGET_RATIO,
-    );
+    let finalizer = test_finalizer(backend, transfer_service);
 
     let receipt = make_execution_receipt(42);
     let mut state = finalizer.prepare("42", &receipt).await.expect("prepare should succeed");
@@ -106,14 +85,7 @@ async fn mexc_deposit_phase_a_snapshots_baseline_and_sends_transfer() {
 
 #[test]
 fn mexc_bridge_planner_keeps_direct_path_when_no_bridge_route_matches() {
-    let finalizer = MexcFinalizer::new(
-        Arc::new(MockCexBackend::new()),
-        Arc::new(MockTransferActions::new()),
-        Principal::anonymous(),
-        TEST_MAX_SELL_SLIPPAGE_BPS,
-        TEST_CEX_MIN_EXEC_USD,
-        TEST_CEX_SLICE_TARGET_RATIO,
-    )
+    let finalizer = test_finalizer(Arc::new(MockCexBackend::new()), Arc::new(MockTransferActions::new()))
     .with_bridge_runtime(bridge_dependencies(Arc::new(MockBridgeBackend::new())));
 
     let debt_token = ChainToken::Icp {
@@ -134,14 +106,7 @@ fn mexc_bridge_planner_keeps_direct_path_when_no_bridge_route_matches() {
 
 #[test]
 fn mexc_bridge_planner_uses_bridge_fallback_for_ckusdc_deposit() {
-    let finalizer = MexcFinalizer::new(
-        Arc::new(MockCexBackend::new()),
-        Arc::new(MockTransferActions::new()),
-        Principal::anonymous(),
-        TEST_MAX_SELL_SLIPPAGE_BPS,
-        TEST_CEX_MIN_EXEC_USD,
-        TEST_CEX_SLICE_TARGET_RATIO,
-    )
+    let finalizer = test_finalizer(Arc::new(MockCexBackend::new()), Arc::new(MockTransferActions::new()))
     .with_bridge_runtime(bridge_dependencies(Arc::new(MockBridgeBackend::new())));
 
     let plan = finalizer.resolve_bridge_plan_for_assets(&ckusdc_token(), &ckbtc_token());
@@ -154,14 +119,7 @@ fn mexc_bridge_planner_uses_bridge_fallback_for_ckusdc_deposit() {
 
 #[test]
 fn mexc_bridge_planner_translates_ckusdc_symbol_both_directions() {
-    let finalizer = MexcFinalizer::new(
-        Arc::new(MockCexBackend::new()),
-        Arc::new(MockTransferActions::new()),
-        Principal::anonymous(),
-        TEST_MAX_SELL_SLIPPAGE_BPS,
-        TEST_CEX_MIN_EXEC_USD,
-        TEST_CEX_SLICE_TARGET_RATIO,
-    )
+    let finalizer = test_finalizer(Arc::new(MockCexBackend::new()), Arc::new(MockTransferActions::new()))
     .with_bridge_runtime(bridge_dependencies(Arc::new(MockBridgeBackend::new())));
 
     let plan = finalizer.resolve_bridge_plan_for_assets(&ckusdc_token(), &ckusdc_token());
@@ -265,15 +223,8 @@ async fn mexc_deposit_bridge_submit_resume_and_complete() {
         }
     });
 
-    let finalizer = MexcFinalizer::new(
-        Arc::new(cex),
-        Arc::new(transfers),
-        Principal::anonymous(),
-        TEST_MAX_SELL_SLIPPAGE_BPS,
-        TEST_CEX_MIN_EXEC_USD,
-        TEST_CEX_SLICE_TARGET_RATIO,
-    )
-    .with_bridge_runtime(bridge_dependencies(Arc::new(bridge)));
+    let finalizer =
+        test_finalizer(Arc::new(cex), Arc::new(transfers)).with_bridge_runtime(bridge_dependencies(Arc::new(bridge)));
 
     let receipt = make_execution_receipt_with_assets(7, ckusdc_token(), ckbtc_token());
     let mut state = finalizer.prepare("7", &receipt).await.expect("prepare should succeed");

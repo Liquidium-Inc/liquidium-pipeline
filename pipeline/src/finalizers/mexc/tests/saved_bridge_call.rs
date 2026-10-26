@@ -43,18 +43,12 @@ fn claims(open_calls: Vec<OpenBridgeCall>) -> MockBridgeClaimLookup {
 }
 
 fn finalizer(bridge: MockBridgeBackend, claims: Option<MockBridgeClaimLookup>) -> MexcFinalizer<MockCexBackend> {
-    MexcFinalizer::new(
-        Arc::new(MockCexBackend::new()),
-        Arc::new(MockTransferActions::new()),
-        Principal::anonymous(),
-        TEST_MAX_SELL_SLIPPAGE_BPS,
-        TEST_CEX_MIN_EXEC_USD,
-        TEST_CEX_SLICE_TARGET_RATIO,
+    test_finalizer(Arc::new(MockCexBackend::new()), Arc::new(MockTransferActions::new())).with_bridge_runtime(
+        match claims {
+            Some(claims) => bridge_dependencies(Arc::new(bridge)).with_claims(Arc::new(claims)),
+            None => bridge_dependencies(Arc::new(bridge)),
+        },
     )
-    .with_bridge_runtime(match claims {
-        Some(claims) => bridge_dependencies(Arc::new(bridge)).with_claims(Arc::new(claims)),
-        None => bridge_dependencies(Arc::new(bridge)),
-    })
 }
 
 /// A bridged ckUSDC deposit whose funding transfer landed.
@@ -205,14 +199,7 @@ async fn a_failed_call_is_looked_up_before_any_new_call() {
             tag: None,
         })
     });
-    let finalizer = MexcFinalizer::new(
-        Arc::new(cex),
-        Arc::new(MockTransferActions::new()),
-        Principal::anonymous(),
-        TEST_MAX_SELL_SLIPPAGE_BPS,
-        TEST_CEX_MIN_EXEC_USD,
-        TEST_CEX_SLICE_TARGET_RATIO,
-    )
+    let finalizer = test_finalizer(Arc::new(cex), Arc::new(MockTransferActions::new()))
     .with_bridge_runtime(bridge_dependencies(Arc::new(bridge)).with_claims(Arc::new(claims(vec![]))));
     let mut state = funded_state(&finalizer).await;
 

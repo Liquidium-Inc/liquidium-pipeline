@@ -70,15 +70,8 @@ async fn mexc_deposit_bridge_reserves_reverse_bridge_approval_fee_in_trade_amoun
         })
     });
 
-    let finalizer = MexcFinalizer::new(
-        Arc::new(cex),
-        Arc::new(transfers),
-        Principal::anonymous(),
-        TEST_MAX_SELL_SLIPPAGE_BPS,
-        TEST_CEX_MIN_EXEC_USD,
-        TEST_CEX_SLICE_TARGET_RATIO,
-    )
-    .with_bridge_runtime(bridge_dependencies(Arc::new(bridge)));
+    let finalizer =
+        test_finalizer(Arc::new(cex), Arc::new(transfers)).with_bridge_runtime(bridge_dependencies(Arc::new(bridge)));
 
     let receipt = make_execution_receipt_with_assets(8, ckusdc_token(), ckbtc_token());
     let mut state = finalizer.prepare("8", &receipt).await.expect("prepare should succeed");
@@ -130,15 +123,8 @@ async fn mexc_deposit_bridge_rejects_source_fee_reserve_too_small_with_permanent
     bridge.expect_submit_bridge().times(0);
     bridge.expect_get_bridge_status().times(0);
 
-    let finalizer = MexcFinalizer::new(
-        Arc::new(cex),
-        Arc::new(transfers),
-        Principal::anonymous(),
-        TEST_MAX_SELL_SLIPPAGE_BPS,
-        TEST_CEX_MIN_EXEC_USD,
-        TEST_CEX_SLICE_TARGET_RATIO,
-    )
-    .with_bridge_runtime(bridge_dependencies(Arc::new(bridge)));
+    let finalizer =
+        test_finalizer(Arc::new(cex), Arc::new(transfers)).with_bridge_runtime(bridge_dependencies(Arc::new(bridge)));
 
     let receipt = make_execution_receipt_with_assets(84, ckusdc_token(), ckbtc_token());
     let mut state = finalizer.prepare("84", &receipt).await.expect("prepare should succeed");
@@ -230,15 +216,8 @@ async fn mexc_deposit_bridge_reserves_native_cketh_withdrawal_fee_budget() {
         })
     });
 
-    let finalizer = MexcFinalizer::new(
-        Arc::new(cex),
-        Arc::new(transfers),
-        Principal::anonymous(),
-        TEST_MAX_SELL_SLIPPAGE_BPS,
-        TEST_CEX_MIN_EXEC_USD,
-        TEST_CEX_SLICE_TARGET_RATIO,
-    )
-    .with_bridge_runtime(bridge_dependencies(Arc::new(bridge)));
+    let finalizer =
+        test_finalizer(Arc::new(cex), Arc::new(transfers)).with_bridge_runtime(bridge_dependencies(Arc::new(bridge)));
 
     let mut receipt = make_execution_receipt_with_assets(82, cketh_token(), ckusdc_token());
     receipt
@@ -311,15 +290,8 @@ async fn mexc_deposit_bridge_rejects_native_cketh_below_minimum_before_transfer(
     bridge.expect_submit_bridge().times(0);
     bridge.expect_get_bridge_status().times(0);
 
-    let finalizer = MexcFinalizer::new(
-        Arc::new(cex),
-        Arc::new(transfers),
-        Principal::anonymous(),
-        TEST_MAX_SELL_SLIPPAGE_BPS,
-        TEST_CEX_MIN_EXEC_USD,
-        TEST_CEX_SLICE_TARGET_RATIO,
-    )
-    .with_bridge_runtime(bridge_dependencies(Arc::new(bridge)));
+    let finalizer =
+        test_finalizer(Arc::new(cex), Arc::new(transfers)).with_bridge_runtime(bridge_dependencies(Arc::new(bridge)));
 
     let mut receipt = make_execution_receipt_with_assets(83, cketh_token(), ckusdc_token());
     receipt
@@ -379,15 +351,8 @@ async fn mexc_deposit_bridge_rejects_native_cketh_when_destination_fee_consumes_
     bridge.expect_submit_bridge().times(0);
     bridge.expect_get_bridge_status().times(0);
 
-    let finalizer = MexcFinalizer::new(
-        Arc::new(cex),
-        Arc::new(transfers),
-        Principal::anonymous(),
-        TEST_MAX_SELL_SLIPPAGE_BPS,
-        TEST_CEX_MIN_EXEC_USD,
-        TEST_CEX_SLICE_TARGET_RATIO,
-    )
-    .with_bridge_runtime(bridge_dependencies(Arc::new(bridge)));
+    let finalizer =
+        test_finalizer(Arc::new(cex), Arc::new(transfers)).with_bridge_runtime(bridge_dependencies(Arc::new(bridge)));
 
     let mut receipt = make_execution_receipt_with_assets(83, cketh_token(), ckusdc_token());
     receipt
@@ -468,15 +433,8 @@ async fn mexc_deposit_bridge_waits_for_source_funding_snapshot() {
     bridge.expect_submit_bridge().times(0);
     bridge.expect_get_bridge_status().times(0);
 
-    let finalizer = MexcFinalizer::new(
-        Arc::new(cex),
-        Arc::new(transfers),
-        Principal::anonymous(),
-        TEST_MAX_SELL_SLIPPAGE_BPS,
-        TEST_CEX_MIN_EXEC_USD,
-        TEST_CEX_SLICE_TARGET_RATIO,
-    )
-    .with_bridge_runtime(bridge_dependencies(Arc::new(bridge)));
+    let finalizer =
+        test_finalizer(Arc::new(cex), Arc::new(transfers)).with_bridge_runtime(bridge_dependencies(Arc::new(bridge)));
 
     let receipt = make_execution_receipt_with_assets(81, ckusdc_token(), ckbtc_token());
     let mut state = finalizer.prepare("81", &receipt).await.expect("prepare should succeed");
@@ -556,15 +514,8 @@ async fn mexc_deposit_bridge_waits_for_cketh_fee_funding_snapshot() {
     bridge.expect_submit_bridge().times(0);
     bridge.expect_get_bridge_status().times(0);
 
-    let finalizer = MexcFinalizer::new(
-        Arc::new(cex),
-        Arc::new(transfers),
-        Principal::anonymous(),
-        TEST_MAX_SELL_SLIPPAGE_BPS,
-        TEST_CEX_MIN_EXEC_USD,
-        TEST_CEX_SLICE_TARGET_RATIO,
-    )
-    .with_bridge_runtime(bridge_dependencies(Arc::new(bridge)));
+    let finalizer =
+        test_finalizer(Arc::new(cex), Arc::new(transfers)).with_bridge_runtime(bridge_dependencies(Arc::new(bridge)));
 
     let receipt = make_execution_receipt_with_assets(84, ckusdc_token(), ckbtc_token());
     let mut state = finalizer.prepare("84", &receipt).await.expect("prepare should succeed");

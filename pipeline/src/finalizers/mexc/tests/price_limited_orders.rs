@@ -38,14 +38,7 @@ fn finalizer_with_fills(fills: Vec<Option<f64>>) -> (MexcFinalizer<MockCexBacken
                 output_received: consumed * 0.9999,
             })
         });
-    let finalizer = MexcFinalizer::new(
-        Arc::new(backend),
-        Arc::new(MockTransferActions::new()),
-        Principal::anonymous(),
-        TEST_MAX_SELL_SLIPPAGE_BPS,
-        TEST_CEX_MIN_EXEC_USD,
-        TEST_CEX_SLICE_TARGET_RATIO,
-    );
+    let finalizer = test_finalizer(Arc::new(backend), Arc::new(MockTransferActions::new()));
     (finalizer, orders)
 }
 

@@ -32,7 +32,11 @@ fn has_non_empty_text(value: Option<&str>) -> bool {
     }
 }
 
-pub(super) fn withdraw_status_from_mexc_record(status: &str, tx_id: Option<&str>, trans_hash: Option<&str>) -> WithdrawStatus {
+pub(super) fn withdraw_status_from_mexc_record(
+    status: &str,
+    tx_id: Option<&str>,
+    trans_hash: Option<&str>,
+) -> WithdrawStatus {
     let mapped = from_mexc_raw(status);
     let has_chain_tx = has_non_empty_text(tx_id) || has_non_empty_text(trans_hash);
     match mapped {

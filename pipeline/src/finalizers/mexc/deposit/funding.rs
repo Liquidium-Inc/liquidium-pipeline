@@ -9,7 +9,11 @@ where
 {
     /// Drives the funding transfer; `intent` starts a new one. On landing it
     /// records the transfer and returns true.
-    pub(super) async fn drive_funding(&self, state: &mut CexState, intent: Option<OutboundIntent>) -> Result<bool, String> {
+    pub(super) async fn drive_funding(
+        &self,
+        state: &mut CexState,
+        intent: Option<OutboundIntent>,
+    ) -> Result<bool, String> {
         let landed = step_outbound(
             &mut state.deposit.deposit_funding,
             self.outbound.as_ref(),
@@ -24,6 +28,46 @@ where
         state.deposit.deposit_txid = Some(tx_id);
         state.deposit.deposit_sent_at_ts = Some(now_ts());
         Ok(true)
+    }
+
+    /// A deposit straight to the MEXC address: one funding transfer, then the
+    /// balance check confirms that the funds arrived.
+    pub(super) async fn deposit_direct(
+        &self,
+        state: &mut CexState,
+        planned_asset: &str,
+        planned_network: &str,
+    ) -> Result<(), String> {
+        if state.deposit.deposit_txid.is_none() {
+            let intent = if state.deposit.deposit_funding.is_some() {
+                None
+            } else {
+                Some(
+                    self.prepare_direct_funding(state, planned_asset, planned_network)
+                        .await?,
+                )
+            };
+            if !self.drive_funding(state, intent).await? {
+                return Ok(());
+            }
+
+            if matches!(state.deposit.deposit_asset, ChainToken::Icp { .. })
+                && !Self::is_native_icp_token(&state.deposit.deposit_asset)
+            {
+                let approved = self
+                    .maybe_bump_mexc_approval(&state.liq_id, &state.deposit.deposit_asset)
+                    .await;
+
+                if approved > 0 {
+                    state.deposit.approval_bump_count = Some(approved);
+                }
+            }
+
+            state.step = CexStep::DepositPending;
+            return Ok(());
+        }
+
+        self.check_deposit(state).await
     }
 
     /// The exchange balance before the deposit. A failed read counts as zero.
@@ -153,23 +197,8 @@ where
         bridged: bool,
     ) -> Result<(Nat, ChainTokenAmount), String> {
         let fee = deposit_asset.fee() * Self::deposit_fee_count(deposit_asset, bridged);
-        let transfer_value = if fee > Nat::from(0u8) {
-            if size_in.value.clone() <= fee {
-                let fee_amount = ChainTokenAmount::from_raw(deposit_asset.clone(), fee.clone());
-                return Err(format!(
-                    "{}: deposit amount {} too small to cover fee {} for {}",
-                    FINALIZER_PERMANENT_AMOUNT_FLOOR_PREFIX,
-                    size_in.formatted(),
-                    fee_amount.formatted(),
-                    deposit_asset.symbol()
-                ));
-            }
-            size_in.value.clone() - fee
-        } else {
-            size_in.value.clone()
-        };
-        let transfer_amount = ChainTokenAmount::from_raw(deposit_asset.clone(), transfer_value.clone());
-        Ok((transfer_value, transfer_amount))
+        let transfer_amount = Self::amount_less_reserve(deposit_asset, &size_in.value, fee, "ledger fee")?;
+        Ok((transfer_amount.value.clone(), transfer_amount))
     }
 
     // MEXC approvals are flaky; we send a burst of tiny approvals to increase the chance

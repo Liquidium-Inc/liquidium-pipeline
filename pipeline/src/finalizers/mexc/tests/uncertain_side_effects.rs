@@ -8,14 +8,7 @@ use crate::outbound::driver::{OperatorDecision, OutboundPhase, OutboundRecord};
 use liquidium_pipeline_core::outbound::{MockOutboundSender, PreparedSend, SendOutcome};
 
 fn finalizer(cex: MockCexBackend, transfers: MockTransferActions) -> MexcFinalizer<MockCexBackend> {
-    MexcFinalizer::new(
-        Arc::new(cex),
-        Arc::new(transfers),
-        Principal::anonymous(),
-        TEST_MAX_SELL_SLIPPAGE_BPS,
-        TEST_CEX_MIN_EXEC_USD,
-        TEST_CEX_SLICE_TARGET_RATIO,
-    )
+    test_finalizer(Arc::new(cex), Arc::new(transfers))
 }
 
 fn receipt(id: &str) -> WithdrawalReceipt {
@@ -325,14 +318,7 @@ async fn a_bridged_unanswered_withdraw_parks_instead_of_waiting_forever() {
         .returning(|_, _| Ok(snapshot(WithdrawStatus::Unknown, None)));
     let mut bridge = MockBridgeBackend::new();
     bridge.expect_submit_bridge().times(0);
-    let finalizer = MexcFinalizer::new(
-        Arc::new(cex),
-        Arc::new(MockTransferActions::new()),
-        Principal::anonymous(),
-        TEST_MAX_SELL_SLIPPAGE_BPS,
-        TEST_CEX_MIN_EXEC_USD,
-        TEST_CEX_SLICE_TARGET_RATIO,
-    )
+    let finalizer = test_finalizer(Arc::new(cex), Arc::new(MockTransferActions::new()))
     .with_bridge_runtime(bridge_dependencies(Arc::new(bridge)));
     let receipt = make_execution_receipt_with_assets(152, ckbtc_token(), ckusdc_token());
     let mut state = finalizer.prepare("bridged-uncertain", &receipt).await.unwrap();

@@ -2,14 +2,6 @@
 //! bridged deposit or withdrawal sends and receives.
 use super::*;
 
-pub(in crate::finalizers::mexc) fn nat_to_units(amount: &Nat, decimals: i32) -> Result<f64, String> {
-    let raw = amount
-        .0
-        .to_f64()
-        .ok_or_else(|| "bridge fee budget is too large to convert to decimal units".to_string())?;
-    Ok(raw / 10f64.powi(decimals))
-}
-
 /// What a bridged deposit sends and what the bridge receives from it.
 pub(in crate::finalizers::mexc) struct BridgeDepositSizing {
     pub transfer_value: Nat,
@@ -71,20 +63,28 @@ where
             return Err(format!("invalid {label}: {reserve_budget}"));
         }
         let reserve = ChainTokenAmount::from_formatted(token.clone(), reserve_budget);
-        if reserve.value != Nat::from(0u8) && *amount <= reserve.value {
+        Self::amount_less_reserve(token, amount, reserve.value, label)
+    }
+
+    /// The amount left after a reserve. A reserve that takes the whole amount
+    /// is a permanent floor error, because a retry cannot make it larger.
+    pub(super) fn amount_less_reserve(
+        token: &ChainToken,
+        amount: &Nat,
+        reserve: Nat,
+        label: &str,
+    ) -> Result<ChainTokenAmount, String> {
+        if reserve != Nat::from(0u8) && *amount <= reserve {
             return Err(format!(
                 "{}: deposit amount {} too small to reserve {} {} for {}",
                 FINALIZER_PERMANENT_AMOUNT_FLOOR_PREFIX,
                 ChainTokenAmount::from_raw(token.clone(), amount.clone()).formatted(),
                 label,
-                reserve.formatted(),
+                ChainTokenAmount::from_raw(token.clone(), reserve).formatted(),
                 token.symbol(),
             ));
         }
-        Ok(ChainTokenAmount::from_raw(
-            token.clone(),
-            amount.clone() - reserve.value,
-        ))
+        Ok(ChainTokenAmount::from_raw(token.clone(), amount.clone() - reserve))
     }
 
     pub(in crate::finalizers::mexc) async fn solana_repayment_bridge_amount(

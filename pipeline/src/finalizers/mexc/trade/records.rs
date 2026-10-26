@@ -75,10 +75,17 @@ where
             return;
         }
 
+        Self::finish_trade_route(state, Some(total_out.max(0.0)));
+    }
+
+    /// Ends the trade phase. A known route output becomes the withdrawal size.
+    pub(super) fn finish_trade_route(state: &mut CexState, out_amt: Option<f64>) {
         state.step = CexStep::Withdraw;
-        state.withdraw.size_out = Some(ChainTokenAmount::from_formatted(
-            state.withdraw.withdraw_asset.clone(),
-            total_out.max(0.0),
-        ));
+        if let Some(out_amt) = out_amt {
+            state.withdraw.size_out = Some(ChainTokenAmount::from_formatted(
+                state.withdraw.withdraw_asset.clone(),
+                out_amt,
+            ));
+        }
     }
 }

@@ -53,14 +53,7 @@ proptest! {
                     })
                 });
 
-            let finalizer = MexcFinalizer::new(
-                Arc::new(backend),
-                Arc::new(transfers),
-                Principal::anonymous(),
-                TEST_MAX_SELL_SLIPPAGE_BPS,
-                TEST_CEX_MIN_EXEC_USD,
-                TEST_CEX_SLICE_TARGET_RATIO,
-            );
+            let finalizer = test_finalizer(Arc::new(backend), Arc::new(transfers));
 
             let receipt = make_execution_receipt(42);
             let mut state = finalizer

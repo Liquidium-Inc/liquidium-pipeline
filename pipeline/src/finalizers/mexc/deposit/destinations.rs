@@ -105,4 +105,54 @@ where
             )),
         }
     }
+
+    /// The address a direct withdrawal goes to, checked for its network.
+    pub(super) fn direct_withdraw_destination(
+        &self,
+        state: &CexState,
+        planned_asset: &str,
+        planned_network: &str,
+    ) -> Result<String, String> {
+        let direct_destination = if planned_network.eq_ignore_ascii_case("ICP") {
+            if Self::is_native_icp_token(&state.withdraw.withdraw_asset) {
+                self.native_icp_direct_withdraw_address(&state.withdraw.withdraw_address)?
+            } else {
+                let raw = state.withdraw.withdraw_address.trim();
+                if raw.is_empty() {
+                    return Err(format!(
+                        "missing ICP withdraw destination for {}@{}",
+                        planned_asset, planned_network
+                    ));
+                }
+                raw.to_string()
+            }
+        } else if planned_network.eq_ignore_ascii_case("ETH") || planned_network.to_ascii_lowercase().starts_with("evm")
+        {
+            let raw = state.withdraw.withdraw_address.trim();
+            if raw.is_empty() {
+                return Err(format!(
+                    "missing EVM withdraw destination for {}@{}",
+                    planned_asset, planned_network
+                ));
+            }
+            raw.parse::<EvmAddress>()
+                .map_err(|e| {
+                    format!(
+                        "invalid EVM withdraw destination '{}' for {}@{}: {e}",
+                        raw, planned_asset, planned_network
+                    )
+                })?
+                .to_string()
+        } else {
+            let raw = state.withdraw.withdraw_address.trim();
+            if raw.is_empty() {
+                return Err(format!(
+                    "missing withdraw destination for {}@{}",
+                    planned_asset, planned_network
+                ));
+            }
+            raw.to_string()
+        };
+        Ok(direct_destination)
+    }
 }

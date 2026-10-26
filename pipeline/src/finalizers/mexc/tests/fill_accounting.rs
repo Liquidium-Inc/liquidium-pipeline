@@ -58,14 +58,7 @@ fn finalizer(
                 output_received: fill.1,
             })
         });
-    MexcFinalizer::new(
-        Arc::new(backend),
-        Arc::new(MockTransferActions::new()),
-        Principal::anonymous(),
-        TEST_MAX_SELL_SLIPPAGE_BPS,
-        TEST_CEX_MIN_EXEC_USD,
-        TEST_CEX_SLICE_TARGET_RATIO,
-    )
+    test_finalizer(Arc::new(backend), Arc::new(MockTransferActions::new()))
 }
 
 fn leg() -> TradeLeg {

@@ -25,7 +25,6 @@ use liquidium_pipeline_core::{
     transfer::actions::TransferActions,
 };
 use log::{debug, info, warn};
-use num_traits::ToPrimitive;
 use tokio::sync::Mutex as TokioMutex;
 use tokio::time::sleep;
 
@@ -37,7 +36,7 @@ const NATIVE_ETH_BRIDGEABLE_SAFETY_MARGIN: f64 = 1e-15;
 const MEXC_WITHDRAW_BELOW_MIN_RAW_CODE: i64 = 10254;
 pub(super) const BRIDGE_FEE_TOKEN_SYMBOL: &str = "ckETH";
 pub(super) const BRIDGE_FEE_TOKEN_CHAIN: &str = "ICP";
-pub(super) const CKETH_DECIMALS: i32 = 18;
+pub(super) const CKETH_DECIMALS: u8 = 18;
 /// A direct withdrawal that MEXC accepted but never reports as delivered
 /// must not wait forever. After this long the row parks for an operator.
 const DIRECT_WITHDRAW_DELIVERY_TIMEOUT_SECS: i64 = 60 * 60;
@@ -231,6 +230,8 @@ where
 #[path = "bridge_planner_impl.rs"]
 mod bridge_planner_impl;
 
+#[path = "deposit/bridge.rs"]
+mod deposit_bridge;
 #[path = "deposit/confirmation.rs"]
 mod deposit_check;
 #[path = "deposit/destinations.rs"]
@@ -254,10 +255,10 @@ mod withdraw_bridge;
 #[path = "withdraw/direct.rs"]
 mod withdraw_direct;
 
-pub use withdraw_direct::mexc_withdraw_order_id;
+pub(super) use sizing::BridgeDepositSizing;
 #[cfg(test)]
 use withdraw_direct::is_mexc_withdraw_below_min_error;
-pub(super) use sizing::{BridgeDepositSizing, nat_to_units};
+pub use withdraw_direct::mexc_withdraw_order_id;
 
 #[async_trait]
 impl<B> CexFinalizerLogic for MexcFinalizer<B>
@@ -299,132 +300,17 @@ where
         );
 
         if !state.deposit.bridge.deposit_bridge_required {
-            if state.deposit.deposit_txid.is_none() {
-                let intent = if state.deposit.deposit_funding.is_some() {
-                    None
-                } else {
-                    Some(self.prepare_direct_funding(state, &planned_asset, &planned_network).await?)
-                };
-                if !self.drive_funding(state, intent).await? {
-                    return Ok(());
-                }
-
-                if matches!(state.deposit.deposit_asset, ChainToken::Icp { .. })
-                    && !Self::is_native_icp_token(&state.deposit.deposit_asset)
-                {
-                    let approved = self
-                        .maybe_bump_mexc_approval(&state.liq_id, &state.deposit.deposit_asset)
-                        .await;
-
-                    if approved > 0 {
-                        state.deposit.approval_bump_count = Some(approved);
-                    }
-                }
-
-                state.step = CexStep::DepositPending;
-                return Ok(());
-            }
-
-            return self.check_deposit(state).await;
+            return self.deposit_direct(state, &planned_asset, &planned_network).await;
         }
-
-        let bridge = self
-            .bridge
-            .as_ref()
-            .ok_or_else(|| "bridge runtime not configured for bridged deposit".to_string())?;
-        let source_symbol = state.deposit.deposit_asset.symbol();
-        let source_chain = state.deposit.deposit_asset.chain();
-        let route = resolve_route(&source_symbol, &source_chain, &planned_asset).ok_or_else(|| {
-            format!(
-                "bridge route not found for deposit {}@{} -> {}",
-                source_symbol, source_chain, planned_asset
-            )
-        })?;
-
-        // Phase A: move the seized collateral into the configured bridge source.
-        if state.deposit.deposit_txid.is_none() {
-            let intent = if state.deposit.deposit_funding.is_some() {
-                None
-            } else {
-                Some(self.prepare_bridged_funding(state, bridge, route, &planned_asset).await?)
-            };
-            if !self.drive_funding(state, intent).await? {
-                return Ok(());
-            }
-            // This build funded the bridge, so no call ran without a record.
-            state.deposit.bridge.deposit_bridge_call_unrecorded = false;
-            state.step = CexStep::DepositPending;
-            return Ok(());
-        }
-
-        if state.deposit.bridge.deposit_bridge_id.is_none() {
-            return self.advance_bridged_deposit_submission(state, bridge, route).await;
-        }
-
-        state.deposit.bridge.deposit_bridge_polled_at_ts = Some(now_ts());
-        let bridge_id = state
-            .deposit
-            .bridge
-            .deposit_bridge_id
-            .clone()
-            .ok_or_else(|| "missing bridge id while polling bridged deposit".to_string())?;
-        match bridge.backend.get_bridge_status(&bridge_id).await? {
-            BridgeStatus::Completed | BridgeStatus::Minted(_) => {
-                self.check_deposit(state).await?;
-                if !matches!(state.step, CexStep::Trade) {
-                    state.step = CexStep::DepositPending;
-                }
-                Ok(())
-            }
-            BridgeStatus::Pending | BridgeStatus::Unknown => {
-                state.step = CexStep::DepositPending;
-                Ok(())
-            }
-            BridgeStatus::Failed { reason } => Err(format!(
-                "bridged deposit failed for liq_id {} bridge_id {}: {}",
-                state.liq_id,
-                bridge_id,
-                reason.unwrap_or_else(|| "unknown failure".to_string())
-            )),
-            BridgeStatus::Canceled { reason } => Err(format!(
-                "bridged deposit canceled for liq_id {} bridge_id {}: {}",
-                state.liq_id,
-                bridge_id,
-                reason.unwrap_or_else(|| "no reason provided".to_string())
-            )),
-        }
+        self.deposit_bridged(state, &planned_asset).await
     }
 
     /// Execute one resumable trade invocation for the current CEX route leg.
     ///
-    /// This method orchestrates leg selection and state transitions, while delegating
-    /// slice-by-slice execution to `execute_trade_leg_slices`.
-    ///
-    /// Behavior summary:
-    /// - resolves direct vs multi-hop route for `deposit_asset -> withdraw_asset`
-    /// - resumes from `trade_leg_index` and `trade_next_amount_in` when present
-    /// - serializes execution per market via a market lock
-    /// - enforces slippage and dust controls during sliced execution
-    /// - updates `state` so next invocation continues at the correct leg/step
-    ///
-    /// Slice execution algorithm (implemented in `execute_trade_leg_slices`):
-    /// 1. Compute a preferred chunk under the soft target (`target_bps`), using
-    ///    orderbook simulation + binary search.
-    /// 2. If no soft-target chunk exists, run a one-shot fallback check on the full
-    ///    remainder against the hard cap (`max_sell_slippage_bps`).
-    /// 3. Skip execution when chunk/remainder notional is below `cex_min_exec_usd`
-    ///    (dust), and carry forward the partial result.
-    /// 4. Execute one market slice, derive realized execution price from fills, and
-    ///    compute realized slippage versus preview midpoint.
-    /// 5. Abort the leg when realized slice slippage exceeds the hard cap.
-    /// 6. Record per-slice telemetry and update weighted route-level notional/slippage.
-    /// 7. Repeat until remainder is consumed or marked dust, then return `(remaining_in, total_out)`.
-    ///
-    /// Success path:
-    /// - moves to `TradePending` for next leg, or `Withdraw` when route is complete
-    ///
-    /// Error path:
-    /// - returns `Err` and stores a descriptive `state.last_error` where applicable
+    /// Resolves the route, resumes at `trade_leg_index`, and runs the leg under
+    /// the market lock. `execute_trade_leg_slices` has the slice algorithm.
+    /// On success the state moves to `TradePending` for the next leg, or to
+    /// `Withdraw` when the route is done. A paused leg resumes next cycle.
     async fn trade(&self, state: &mut CexState) -> Result<(), CexBackendError> {
         self.ensure_plan_on_state(state);
         state.market = format!(
@@ -464,14 +350,9 @@ where
 
         // 7) If index is already past route end, go straight to withdraw step.
         if idx >= legs.len() {
-            state.step = CexStep::Withdraw;
             // 8) Carry forward already computed output amount if present.
-            if let Some(out_amt) = state.trade.trade_next_amount_in {
-                state.withdraw.size_out = Some(ChainTokenAmount::from_formatted(
-                    state.withdraw.withdraw_asset.clone(),
-                    out_amt,
-                ));
-            }
+            let out_amt = state.trade.trade_next_amount_in;
+            Self::finish_trade_route(state, out_amt);
             return Ok(());
         }
 
@@ -489,17 +370,12 @@ where
                 "[mexc] liq_id={} trade skipped: non-positive amount_in={}",
                 state.liq_id, amount_in
             );
-            state.step = CexStep::Withdraw;
-            if let Some(out_amt) = state
+            let out_amt = state
                 .trade
                 .trade_progress_total_out
                 .or(state.trade.trade_next_amount_in)
-            {
-                state.withdraw.size_out = Some(ChainTokenAmount::from_formatted(
-                    state.withdraw.withdraw_asset.clone(),
-                    out_amt.max(0.0),
-                ));
-            }
+                .map(|out_amt| out_amt.max(0.0));
+            Self::finish_trade_route(state, out_amt);
             return Ok(());
         }
 
@@ -592,458 +468,12 @@ where
         }
 
         if !state.withdraw.bridge.withdraw_bridge_required {
-            let direct_destination = if planned_network.eq_ignore_ascii_case("ICP") {
-                if Self::is_native_icp_token(&state.withdraw.withdraw_asset) {
-                    self.native_icp_direct_withdraw_address(&state.withdraw.withdraw_address)?
-                } else {
-                    let raw = state.withdraw.withdraw_address.trim();
-                    if raw.is_empty() {
-                        return Err(format!(
-                            "missing ICP withdraw destination for {}@{}",
-                            planned_asset, planned_network
-                        ));
-                    }
-                    raw.to_string()
-                }
-            } else if planned_network.eq_ignore_ascii_case("ETH")
-                || planned_network.to_ascii_lowercase().starts_with("evm")
-            {
-                let raw = state.withdraw.withdraw_address.trim();
-                if raw.is_empty() {
-                    return Err(format!(
-                        "missing EVM withdraw destination for {}@{}",
-                        planned_asset, planned_network
-                    ));
-                }
-                raw.parse::<EvmAddress>()
-                    .map_err(|e| {
-                        format!(
-                            "invalid EVM withdraw destination '{}' for {}@{}: {e}",
-                            raw, planned_asset, planned_network
-                        )
-                    })?
-                    .to_string()
-            } else {
-                let raw = state.withdraw.withdraw_address.trim();
-                if raw.is_empty() {
-                    return Err(format!(
-                        "missing withdraw destination for {}@{}",
-                        planned_asset, planned_network
-                    ));
-                }
-                raw.to_string()
-            };
-
-            if state.withdraw.withdraw_address != direct_destination {
-                state.withdraw.withdraw_address = direct_destination;
-            }
-
-            if state
-                .withdraw
-                .withdraw_txid
-                .as_ref()
-                .is_some_and(|tx| !tx.trim().is_empty())
-            {
-                state.step = CexStep::Completed;
-                return Ok(());
-            }
-
-            if let Some(withdraw_id) = state.withdraw.withdraw_id.clone() {
-                // An accepted POST only reserves exchange funds. Require delivery
-                // evidence before making this leg terminal and reporting profit.
-                let snapshot = self
-                    .backend
-                    .get_withdraw_status_snapshot_by_id(&planned_asset, &withdraw_id)
-                    .await?;
-                match snapshot.status {
-                    WithdrawStatus::Failed | WithdrawStatus::Canceled => {
-                        return Err(format!(
-                            "cex withdraw failed for liq_id {} withdraw_id={withdraw_id}",
-                            state.liq_id
-                        ));
-                    }
-                    WithdrawStatus::Completed if snapshot.txid.as_ref().is_some_and(|tx| !tx.trim().is_empty()) => {
-                        if let Some(fee) = snapshot.transaction_fee {
-                            let net = Self::net_of_withdraw_fee(amount, fee)
-                                .map_err(|error| format!("invalid completed withdrawal fee: {error}"))?;
-                            state.withdraw.size_out = Some(ChainTokenAmount::from_formatted(
-                                state.withdraw.withdraw_asset.clone(),
-                                net,
-                            ));
-                        }
-                        state.withdraw.withdraw_txid = snapshot.txid;
-                        state.step = CexStep::Completed;
-                    }
-                    _ => {
-                        // Rows accepted before this clock existed start it now.
-                        let accepted_at = *state.withdraw.withdraw_accepted_at_ts.get_or_insert_with(now_ts);
-                        let waited = now_ts().saturating_sub(accepted_at);
-                        if waited > DIRECT_WITHDRAW_DELIVERY_TIMEOUT_SECS {
-                            return Err(format!(
-                                "cex withdraw not delivered after {waited}s for liq_id {} withdraw_id={withdraw_id} status={:?}",
-                                state.liq_id, snapshot.status
-                            ));
-                        }
-                        state.step = CexStep::WithdrawPending;
-                    }
-                }
-                return Ok(());
-            }
-
-            let Some(accepted) = self
-                .submit_withdraw(state, &planned_asset, &planned_network, amount)
-                .await?
-            else {
-                return Ok(());
-            };
-            state.withdraw.withdraw_id = Some(accepted.id);
-            state.withdraw.withdraw_txid = accepted.txid.clone();
-            state.step = if accepted.txid.as_ref().is_some_and(|tx| !tx.trim().is_empty()) {
-                CexStep::Completed
-            } else {
-                state.withdraw.withdraw_accepted_at_ts = Some(now_ts());
-                CexStep::WithdrawPending
-            };
-            return Ok(());
+            return self
+                .withdraw_direct(state, &planned_asset, &planned_network, amount)
+                .await;
         }
-
-        let bridge = self
-            .bridge
-            .as_ref()
-            .ok_or_else(|| "bridge runtime not configured for bridged withdraw".to_string())?;
-        let route = Self::withdraw_route(state).ok_or_else(|| {
-            format!(
-                "bridge route not found for withdraw {}@{} -> {}",
-                planned_asset,
-                planned_network,
-                state.withdraw.withdraw_asset.symbol()
-            )
-        })?;
-
-        if state.withdraw.bridge.withdraw_bridge_destination_snapshot.is_none() {
-            state.withdraw.bridge.withdraw_bridge_destination_snapshot = Some(state.withdraw.withdraw_address.clone());
-        }
-
-        let bridge_source_address = self.resolve_bridge_source_address(route.source_chain)?;
-        if state.withdraw.withdraw_address != bridge_source_address {
-            state.withdraw.withdraw_address = bridge_source_address.clone();
-        }
-
-        // Submit CEX withdraw once (to bridge source), then keep polling in WithdrawPending.
-        if state.withdraw.withdraw_id.is_none() && state.withdraw.withdraw_txid.is_none() {
-            let Some(accepted) = self
-                .submit_withdraw(state, &planned_asset, &planned_network, amount)
-                .await?
-            else {
-                return Ok(());
-            };
-            state.withdraw.withdraw_id = Some(accepted.id);
-            state.withdraw.withdraw_txid = accepted.txid;
-            state.step = CexStep::WithdrawPending;
-            return Ok(());
-        }
-
-        // Once CEX withdrawal is completed, submit bridge once.
-        if state.withdraw.bridge.withdraw_bridge_id.is_none() {
-            // A started deposit send has left the source account, so the
-            // balance checks below would wait for it forever.
-            if state.withdraw.bridge.deposit_send_started() {
-                let destination = self.withdraw_bridge_destination(state, route)?;
-                return self
-                    .advance_withdraw_deposit_send(state, bridge, route, &destination, None)
-                    .await;
-            }
-            // Skips the reads below while another row's deposit is open. The
-            // check under the submit lock decides.
-            if Self::waits_for_other_deposit(bridge, route, &state.liq_id).await? {
-                state.step = CexStep::WithdrawPending;
-                return Ok(());
-            }
-            let withdraw_id = state
-                .withdraw
-                .withdraw_id
-                .clone()
-                .ok_or_else(|| "missing withdraw_id while waiting bridged withdraw completion".to_string())?;
-
-            let withdraw_snapshot = self
-                .backend
-                .get_withdraw_status_snapshot_by_id(&planned_asset, &withdraw_id)
-                .await?;
-            info!(
-                "[mexc] liq_id={} withdraw snapshot: withdraw_id={} status={:?} txid_present={} fee={:?}",
-                state.liq_id,
-                withdraw_id,
-                withdraw_snapshot.status,
-                withdraw_snapshot.txid.as_ref().is_some_and(|tx| !tx.trim().is_empty()),
-                withdraw_snapshot.transaction_fee,
-            );
-
-            match withdraw_snapshot.status {
-                WithdrawStatus::Pending | WithdrawStatus::Unknown => {
-                    if withdraw_snapshot.txid.is_some() {
-                        info!(
-                            "[mexc] liq_id={} withdraw status={:?} but txid is present for withdraw_id={}; proceeding to source-balance bridge preflight",
-                            state.liq_id, withdraw_snapshot.status, withdraw_id
-                        );
-                    } else {
-                        state.step = CexStep::WithdrawPending;
-                        return Ok(());
-                    }
-                }
-                WithdrawStatus::Failed => {
-                    return Err(format!(
-                        "cex withdraw failed for liq_id {} withdraw_id={}",
-                        state.liq_id, withdraw_id
-                    ));
-                }
-                WithdrawStatus::Canceled => {
-                    return Err(format!(
-                        "cex withdraw canceled for liq_id {} withdraw_id={}",
-                        state.liq_id, withdraw_id
-                    ));
-                }
-                WithdrawStatus::Completed => {}
-            }
-
-            // Keep the txid in state when available so operators can correlate
-            // pending bridge flow with the underlying CEX withdrawal broadcast.
-            if state.withdraw.withdraw_txid.is_none() {
-                state.withdraw.withdraw_txid = withdraw_snapshot.txid.clone();
-            }
-
-            let bridge_destination = self.withdraw_bridge_destination(state, route)?;
-
-            let mut bridge_amount = amount;
-            if let Some(withdraw_fee) = withdraw_snapshot.transaction_fee {
-                let adjusted_amount = Self::net_of_withdraw_fee(bridge_amount, withdraw_fee).map_err(|error| {
-                    format!(
-                        "cex withdraw fee exceeds bridged amount for liq_id {}: {error} withdraw_id={}",
-                        state.liq_id, withdraw_id
-                    )
-                })?;
-                if adjusted_amount < bridge_amount {
-                    info!(
-                        "[mexc] liq_id={} applying CEX withdraw fee to bridged amount: gross={} fee={} net={} asset={} network={} withdraw_id={}",
-                        state.liq_id,
-                        bridge_amount,
-                        withdraw_fee,
-                        adjusted_amount,
-                        planned_asset,
-                        planned_network,
-                        withdraw_id
-                    );
-                    bridge_amount = adjusted_amount;
-                }
-            }
-            let _submit_guard =
-                acquire_bridge_submit_lock(route.source_asset, route.source_chain, &bridge_source_address).await;
-
-            let source_available = bridge
-                .backend
-                .get_source_balance(route.source_asset, route.source_chain, &bridge_source_address)
-                .await?;
-
-            // CEX withdrawals can arrive net of withdrawal/network fees; use the reported fee
-            // above to compute the expected net amount. Native ETH source balances are reported
-            // as bridgeable balance after reserving gas, so submit that bridgeable amount instead
-            // of waiting forever for the gross source balance to become bridgeable.
-            if source_available + WITHDRAW_BRIDGE_SOURCE_BALANCE_TOLERANCE < bridge_amount {
-                if matches!(route.route_kind, BridgeRouteKind::EthToCkEth)
-                    && source_available > WITHDRAW_BRIDGE_SOURCE_BALANCE_TOLERANCE
-                {
-                    let adjusted_source_available = (source_available - NATIVE_ETH_BRIDGEABLE_SAFETY_MARGIN).max(0.0);
-                    if adjusted_source_available <= WITHDRAW_BRIDGE_SOURCE_BALANCE_TOLERANCE {
-                        debug!(
-                            "[mexc] liq_id={} bridged native ETH withdraw waiting for source funding after safety margin: available={} adjusted={} expected={} tolerance={} source={} route={}@{}->{}",
-                            state.liq_id,
-                            source_available,
-                            adjusted_source_available,
-                            bridge_amount,
-                            WITHDRAW_BRIDGE_SOURCE_BALANCE_TOLERANCE,
-                            bridge_source_address,
-                            route.source_asset,
-                            route.source_chain,
-                            route.target_asset,
-                        );
-                        state.step = CexStep::WithdrawPending;
-                        return Ok(());
-                    }
-                    info!(
-                        "[mexc] liq_id={} bridged native ETH withdraw adjusting to bridgeable source balance: amount {} -> {} (source includes gas reserve; safety_margin={} tolerance={} source={} route={}@{}->{})",
-                        state.liq_id,
-                        bridge_amount,
-                        adjusted_source_available,
-                        NATIVE_ETH_BRIDGEABLE_SAFETY_MARGIN,
-                        WITHDRAW_BRIDGE_SOURCE_BALANCE_TOLERANCE,
-                        bridge_source_address,
-                        route.source_asset,
-                        route.source_chain,
-                        route.target_asset,
-                    );
-                    bridge_amount = adjusted_source_available;
-                } else {
-                    debug!(
-                        "[mexc] liq_id={} bridged withdraw waiting for source funding: available={} expected={} tolerance={} source={} route={}@{}->{}",
-                        state.liq_id,
-                        source_available,
-                        bridge_amount,
-                        WITHDRAW_BRIDGE_SOURCE_BALANCE_TOLERANCE,
-                        bridge_source_address,
-                        route.source_asset,
-                        route.source_chain,
-                        route.target_asset,
-                    );
-                    state.step = CexStep::WithdrawPending;
-                    return Ok(());
-                }
-            }
-
-            if source_available < bridge_amount {
-                info!(
-                    "[mexc] liq_id={} adjusting bridged withdraw amount within source balance tolerance: amount {} -> {} (tolerance={} source={} route={}@{}->{})",
-                    state.liq_id,
-                    bridge_amount,
-                    source_available,
-                    WITHDRAW_BRIDGE_SOURCE_BALANCE_TOLERANCE,
-                    bridge_source_address,
-                    route.source_asset,
-                    route.source_chain,
-                    route.target_asset,
-                );
-                bridge_amount = source_available;
-            }
-
-            if route.route_kind == BridgeRouteKind::SolanaToIcp {
-                let gross = ChainTokenAmount::from_formatted(state.withdraw.withdraw_asset.clone(), bridge_amount);
-                bridge_amount = Self::spend_f64(&Self::solana_repayment_bridge_amount(bridge, route, &gross).await?)?;
-            }
-
-            let request = BridgeRequest {
-                asset: route.source_asset.to_string(),
-                source_chain: route.source_chain.to_string(),
-                source_address: bridge_source_address,
-                target_asset: route.target_asset.to_string(),
-                destination: bridge_destination,
-                amount: bridge_amount,
-                provider_fee_budget_native_units: None,
-            };
-            // The bridge signs the send that funds the route, and the
-            // outbound driver saves, sends and settles it.
-            if route.route_kind.funded_by_signed_send() {
-                return self
-                    .advance_withdraw_deposit_send(state, bridge, route, &request.destination, Some(&request))
-                    .await;
-            }
-            let submission = match bridge.backend.submit_bridge(request).await {
-                Ok(submission) => submission,
-                // Same wait semantics as the deposit side: no budget spent.
-                Err(error) if error.starts_with(BRIDGE_SUBMISSION_DEFERRED_PREFIX) => {
-                    info!("[mexc] liq_id={} bridged withdraw deferred: {}", state.liq_id, error);
-                    state.step = CexStep::WithdrawPending;
-                    return Ok(());
-                }
-                Err(error) => return Err(error),
-            };
-            state.withdraw.bridge.withdraw_bridge_id = Some(submission.bridge_id);
-            state.withdraw.bridge.withdraw_bridge_submitted_at_ts = Some(now_ts());
-            state.step = CexStep::WithdrawPending;
-            return Ok(());
-        }
-
-        let bridge_id = state
-            .withdraw
-            .bridge
-            .withdraw_bridge_id
-            .clone()
-            .ok_or_else(|| "missing bridge id while polling bridged withdraw".to_string())?;
-        // The older flow saved the SOL transfer without a minter id. The notice
-        // step asks the minter for it, as after a new transfer.
-        if let Some(transfer) = cksol_transfer_without_deposit_id(&bridge_id) {
-            let funds = &mut state.withdraw.bridge;
-            funds.withdraw_bridge_funding_txid = Some(transfer);
-            funds.withdraw_bridge_funded_at_ts = funds
-                .withdraw_bridge_funded_at_ts
-                .or(funds.withdraw_bridge_submitted_at_ts)
-                .or(Some(now_ts()));
-            funds.withdraw_bridge_id = None;
-            state.step = CexStep::WithdrawPending;
-            return Ok(());
-        }
-        state.withdraw.bridge.withdraw_bridge_polled_at_ts = Some(now_ts());
-        match bridge.backend.get_bridge_status(&bridge_id).await? {
-            BridgeStatus::Minted(receipt) => {
-                // The EVM backend already checks its receipt against the
-                // submitted expectation. The Solana backend has no such check,
-                // so this comparison is the only one for ckSOL. Keep it.
-                let destination = state
-                    .withdraw
-                    .bridge
-                    .withdraw_bridge_destination_snapshot
-                    .as_deref()
-                    .ok_or("missing expected mint destination")?;
-                let expected = crate::finalizers::bridge_planner::parse_icp_account_like(destination)?;
-                if receipt.recipient != expected
-                    || !receipt
-                        .token_symbol
-                        .eq_ignore_ascii_case(&state.withdraw.withdraw_asset.symbol())
-                {
-                    return Err("minter receipt does not match the committed return destination/token".to_string());
-                }
-                // Report destination credit, not the trade output before
-                // exchange fees and bridge source adjustments.
-                state.withdraw.size_out = Some(ChainTokenAmount::from_raw(
-                    state.withdraw.withdraw_asset.clone(),
-                    receipt.amount.clone(),
-                ));
-                state.withdraw.bridge.withdraw_bridge_mint_receipt = Some(receipt);
-                state.step = CexStep::Completed;
-                Ok(())
-            }
-            BridgeStatus::Completed => {
-                state.step = CexStep::Completed;
-                Ok(())
-            }
-            BridgeStatus::Pending | BridgeStatus::Unknown => {
-                state.step = CexStep::WithdrawPending;
-                Ok(())
-            }
-            // The ckSOL minter dropped its sweep and released the deposit
-            // address. The funds stay there, and a new notice queues them again.
-            BridgeStatus::Failed { reason }
-                if route.route_kind == BridgeRouteKind::SolanaToIcp
-                    && state.withdraw.bridge.withdraw_bridge_funding_txid.is_some() =>
-            {
-                let reason = reason.unwrap_or_default();
-                state.withdraw.bridge.withdraw_bridge_id = None;
-                state.step = CexStep::WithdrawPending;
-                // The landing time stays, so a sweep that keeps failing parks
-                // instead of a notice loop. A release then gives one new notice.
-                let now = now_ts();
-                let waited = now.saturating_sub(state.withdraw.bridge.withdraw_bridge_funded_at_ts.unwrap_or(now));
-                if waited > DEPOSIT_NOTICE_WINDOW_SECS {
-                    return Err(side_effect_ambiguous(format!(
-                        "bridge deposit {bridge_id} dropped by the provider {waited}s after the funds landed: {reason}"
-                    )));
-                }
-                warn!(
-                    "[mexc] liq_id={} bridge deposit {} dropped by the provider, notifying again: {}",
-                    state.liq_id, bridge_id, reason
-                );
-                Ok(())
-            }
-            BridgeStatus::Failed { reason } => Err(format!(
-                "bridged withdraw failed for liq_id {} bridge_id {}: {}",
-                state.liq_id,
-                bridge_id,
-                reason.unwrap_or_else(|| "unknown failure".to_string())
-            )),
-            BridgeStatus::Canceled { reason } => Err(format!(
-                "bridged withdraw canceled for liq_id {} bridge_id {}: {}",
-                state.liq_id,
-                bridge_id,
-                reason.unwrap_or_else(|| "no reason provided".to_string())
-            )),
-        }
+        self.withdraw_bridged(state, &planned_asset, &planned_network, amount)
+            .await
     }
 
     async fn finish(&self, _receipt: &ExecutionReceipt, state: &CexState) -> Result<SwapExecution, String> {

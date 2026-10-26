@@ -25,14 +25,7 @@ async fn mexc_deposit_phase_a_rejects_fee_consumed_deposit_with_permanent_prefix
         });
     transfers.expect_transfer().times(0);
 
-    let finalizer = MexcFinalizer::new(
-        Arc::new(backend),
-        Arc::new(transfers),
-        Principal::anonymous(),
-        TEST_MAX_SELL_SLIPPAGE_BPS,
-        TEST_CEX_MIN_EXEC_USD,
-        TEST_CEX_SLICE_TARGET_RATIO,
-    );
+    let finalizer = test_finalizer(Arc::new(backend), Arc::new(transfers));
 
     let mut receipt = make_execution_receipt_with_assets(85, ckusdc_token(), ckbtc_token());
     receipt
@@ -49,7 +42,7 @@ async fn mexc_deposit_phase_a_rejects_fee_consumed_deposit_with_permanent_prefix
         .expect_err("deposit consumed by fee must fail before transfer");
 
     assert!(err.starts_with(FINALIZER_PERMANENT_AMOUNT_FLOOR_PREFIX));
-    assert!(err.contains("too small to cover fee"));
+    assert!(err.contains("too small to reserve ledger fee"));
     assert!(state.deposit.deposit_txid.is_none());
 }
 
@@ -92,14 +85,7 @@ async fn mexc_deposit_phase_a_uses_evm_destination_for_evm_assets() {
             Ok("tx-evm-123".to_string())
         });
 
-    let finalizer = MexcFinalizer::new(
-        Arc::new(backend),
-        Arc::new(transfers),
-        Principal::anonymous(),
-        TEST_MAX_SELL_SLIPPAGE_BPS,
-        TEST_CEX_MIN_EXEC_USD,
-        TEST_CEX_SLICE_TARGET_RATIO,
-    );
+    let finalizer = test_finalizer(Arc::new(backend), Arc::new(transfers));
 
     let collateral = ChainToken::EvmErc20 {
         chain: "eth".to_string(),
@@ -136,14 +122,7 @@ async fn mexc_deposit_phase_a_rejects_invalid_evm_deposit_address() {
         });
     transfers.expect_transfer().times(0);
 
-    let finalizer = MexcFinalizer::new(
-        Arc::new(backend),
-        Arc::new(transfers),
-        Principal::anonymous(),
-        TEST_MAX_SELL_SLIPPAGE_BPS,
-        TEST_CEX_MIN_EXEC_USD,
-        TEST_CEX_SLICE_TARGET_RATIO,
-    );
+    let finalizer = test_finalizer(Arc::new(backend), Arc::new(transfers));
 
     let collateral = ChainToken::EvmErc20 {
         chain: "eth".to_string(),
@@ -201,14 +180,7 @@ async fn mexc_native_icp_deposit_uses_ledger_account_id_destination() {
         });
     transfers.expect_approve().times(0);
 
-    let finalizer = MexcFinalizer::new(
-        Arc::new(backend),
-        Arc::new(transfers),
-        Principal::anonymous(),
-        TEST_MAX_SELL_SLIPPAGE_BPS,
-        TEST_CEX_MIN_EXEC_USD,
-        TEST_CEX_SLICE_TARGET_RATIO,
-    );
+    let finalizer = test_finalizer(Arc::new(backend), Arc::new(transfers));
 
     let receipt = make_execution_receipt_with_assets(45, native_icp_token(), ckbtc_token());
     let mut state = finalizer.prepare("45", &receipt).await.expect("prepare should succeed");
@@ -239,14 +211,7 @@ async fn mexc_native_icp_deposit_rejects_invalid_ledger_account_id() {
     transfers.expect_transfer().times(0);
     transfers.expect_approve().times(0);
 
-    let finalizer = MexcFinalizer::new(
-        Arc::new(backend),
-        Arc::new(transfers),
-        Principal::anonymous(),
-        TEST_MAX_SELL_SLIPPAGE_BPS,
-        TEST_CEX_MIN_EXEC_USD,
-        TEST_CEX_SLICE_TARGET_RATIO,
-    );
+    let finalizer = test_finalizer(Arc::new(backend), Arc::new(transfers));
 
     let receipt = make_execution_receipt_with_assets(46, native_icp_token(), ckbtc_token());
     let mut state = finalizer.prepare("46", &receipt).await.expect("prepare should succeed");
@@ -278,14 +243,7 @@ async fn mexc_native_icp_deposit_rejects_memo_tag_before_transfer() {
     transfers.expect_transfer().times(0);
     transfers.expect_approve().times(0);
 
-    let finalizer = MexcFinalizer::new(
-        Arc::new(backend),
-        Arc::new(transfers),
-        Principal::anonymous(),
-        TEST_MAX_SELL_SLIPPAGE_BPS,
-        TEST_CEX_MIN_EXEC_USD,
-        TEST_CEX_SLICE_TARGET_RATIO,
-    );
+    let finalizer = test_finalizer(Arc::new(backend), Arc::new(transfers));
 
     let receipt = make_execution_receipt_with_assets(47, native_icp_token(), ckbtc_token());
     let mut state = finalizer.prepare("47", &receipt).await.expect("prepare should succeed");
@@ -299,10 +257,8 @@ async fn mexc_native_icp_deposit_rejects_memo_tag_before_transfer() {
 
 #[test]
 fn mexc_sol_reverse_plan_reserves_approval_fee() {
-    let finalizer = MexcFinalizer::new(
-        Arc::new(MockCexBackend::new()), Arc::new(MockTransferActions::new()), Principal::anonymous(),
-        TEST_MAX_SELL_SLIPPAGE_BPS, TEST_CEX_MIN_EXEC_USD, TEST_CEX_SLICE_TARGET_RATIO,
-    ).with_bridge_runtime(bridge_dependencies(Arc::new(MockBridgeBackend::new())));
+    let finalizer = test_finalizer(Arc::new(MockCexBackend::new()), Arc::new(MockTransferActions::new()))
+        .with_bridge_runtime(bridge_dependencies(Arc::new(MockBridgeBackend::new())));
     let sol = ChainToken::Icp {
         ledger: Principal::anonymous(), symbol: "ckSOL".into(), decimals: 9, fee: Nat::from(500u64),
     };
@@ -336,14 +292,7 @@ async fn mexc_deposit_phase_b_moves_to_trade_when_balance_increased() {
     let backend = Arc::new(backend);
     let transfer_service = Arc::new(transfers);
 
-    let finalizer = MexcFinalizer::new(
-        backend,
-        transfer_service,
-        Principal::anonymous(),
-        TEST_MAX_SELL_SLIPPAGE_BPS,
-        TEST_CEX_MIN_EXEC_USD,
-        TEST_CEX_SLICE_TARGET_RATIO,
-    );
+    let finalizer = test_finalizer(backend, transfer_service);
 
     let receipt = make_execution_receipt(42);
     let mut state = finalizer.prepare("42", &receipt).await.expect("prepare should succeed");
@@ -375,14 +324,7 @@ async fn mexc_deposit_phase_b_stays_in_deposit_when_balance_unchanged() {
     let backend = Arc::new(backend);
     let transfer_service = Arc::new(transfers);
 
-    let finalizer = MexcFinalizer::new(
-        backend,
-        transfer_service,
-        Principal::anonymous(),
-        TEST_MAX_SELL_SLIPPAGE_BPS,
-        TEST_CEX_MIN_EXEC_USD,
-        TEST_CEX_SLICE_TARGET_RATIO,
-    );
+    let finalizer = test_finalizer(backend, transfer_service);
 
     let receipt = make_execution_receipt(42);
     let mut state = finalizer.prepare("42", &receipt).await.expect("prepare should succeed");
@@ -412,14 +354,7 @@ async fn mexc_deposit_phase_b_confirms_via_total_free_fallback_after_wait_window
     // Total free covers expected, but delta from baseline does not.
     backend.expect_get_balance().returning(|_symbol| Ok(10.0));
 
-    let finalizer = MexcFinalizer::new(
-        Arc::new(backend),
-        Arc::new(transfers),
-        Principal::anonymous(),
-        TEST_MAX_SELL_SLIPPAGE_BPS,
-        TEST_CEX_MIN_EXEC_USD,
-        TEST_CEX_SLICE_TARGET_RATIO,
-    );
+    let finalizer = test_finalizer(Arc::new(backend), Arc::new(transfers));
 
     let receipt = make_execution_receipt(42);
     let mut state = finalizer.prepare("42", &receipt).await.expect("prepare should succeed");
@@ -451,14 +386,7 @@ async fn mexc_deposit_phase_b_bridged_confirmation_uses_expected_amount_and_obse
         Ok(BridgeStatus::Completed)
     });
 
-    let finalizer = MexcFinalizer::new(
-        Arc::new(backend),
-        Arc::new(transfers),
-        Principal::anonymous(),
-        TEST_MAX_SELL_SLIPPAGE_BPS,
-        TEST_CEX_MIN_EXEC_USD,
-        TEST_CEX_SLICE_TARGET_RATIO,
-    )
+    let finalizer = test_finalizer(Arc::new(backend), Arc::new(transfers))
     .with_bridge_runtime(bridge_dependencies(Arc::new(bridge)));
 
     let receipt = make_execution_receipt_with_assets(82, cketh_token(), ckusdc_token());
@@ -503,14 +431,7 @@ async fn mexc_deposit_phase_b_bridged_confirmation_caps_contaminated_delta_at_ex
         Ok(BridgeStatus::Completed)
     });
 
-    let finalizer = MexcFinalizer::new(
-        Arc::new(backend),
-        Arc::new(transfers),
-        Principal::anonymous(),
-        TEST_MAX_SELL_SLIPPAGE_BPS,
-        TEST_CEX_MIN_EXEC_USD,
-        TEST_CEX_SLICE_TARGET_RATIO,
-    )
+    let finalizer = test_finalizer(Arc::new(backend), Arc::new(transfers))
     .with_bridge_runtime(bridge_dependencies(Arc::new(bridge)));
 
     let receipt = make_execution_receipt_with_assets(82, cketh_token(), ckusdc_token());
@@ -564,14 +485,7 @@ async fn mexc_deposit_never_sizes_a_trade_above_what_the_bridge_could_credit() {
         Ok(BridgeStatus::Completed)
     });
 
-    let finalizer = MexcFinalizer::new(
-        Arc::new(backend),
-        Arc::new(transfers),
-        Principal::anonymous(),
-        TEST_MAX_SELL_SLIPPAGE_BPS,
-        TEST_CEX_MIN_EXEC_USD,
-        TEST_CEX_SLICE_TARGET_RATIO,
-    )
+    let finalizer = test_finalizer(Arc::new(backend), Arc::new(transfers))
     .with_bridge_runtime(bridge_dependencies(Arc::new(bridge)));
 
     let receipt = make_execution_receipt_with_assets(82, cketh_token(), ckusdc_token());
@@ -614,14 +528,7 @@ async fn mexc_deposit_phase_b_bridged_total_free_fallback_keeps_expected_amount(
         Ok(BridgeStatus::Completed)
     });
 
-    let finalizer = MexcFinalizer::new(
-        Arc::new(backend),
-        Arc::new(transfers),
-        Principal::anonymous(),
-        TEST_MAX_SELL_SLIPPAGE_BPS,
-        TEST_CEX_MIN_EXEC_USD,
-        TEST_CEX_SLICE_TARGET_RATIO,
-    )
+    let finalizer = test_finalizer(Arc::new(backend), Arc::new(transfers))
     .with_bridge_runtime(bridge_dependencies(Arc::new(bridge)));
 
     let receipt = make_execution_receipt_with_assets(82, cketh_token(), ckusdc_token());
@@ -652,14 +559,7 @@ async fn mexc_deposit_phase_b_does_not_use_total_free_fallback_before_wait_windo
     // Total free covers expected, but fallback window has not elapsed yet.
     backend.expect_get_balance().returning(|_symbol| Ok(10.0));
 
-    let finalizer = MexcFinalizer::new(
-        Arc::new(backend),
-        Arc::new(transfers),
-        Principal::anonymous(),
-        TEST_MAX_SELL_SLIPPAGE_BPS,
-        TEST_CEX_MIN_EXEC_USD,
-        TEST_CEX_SLICE_TARGET_RATIO,
-    );
+    let finalizer = test_finalizer(Arc::new(backend), Arc::new(transfers));
 
     let receipt = make_execution_receipt(42);
     let mut state = finalizer.prepare("42", &receipt).await.expect("prepare should succeed");
@@ -774,14 +674,7 @@ async fn mexc_deposit_phase_b_confirmation_uses_inclusive_epsilon_boundary() {
     let transfers_ok = MockTransferActions::new();
     backend_ok.expect_get_balance().returning(|_symbol| Ok(5.00999));
 
-    let finalizer_ok = MexcFinalizer::new(
-        Arc::new(backend_ok),
-        Arc::new(transfers_ok),
-        Principal::anonymous(),
-        TEST_MAX_SELL_SLIPPAGE_BPS,
-        TEST_CEX_MIN_EXEC_USD,
-        TEST_CEX_SLICE_TARGET_RATIO,
-    );
+    let finalizer_ok = test_finalizer(Arc::new(backend_ok), Arc::new(transfers_ok));
 
     let receipt = make_execution_receipt(42);
     let mut state_ok = finalizer_ok
@@ -804,14 +697,7 @@ async fn mexc_deposit_phase_b_confirmation_uses_inclusive_epsilon_boundary() {
     let transfers_pending = MockTransferActions::new();
     backend_pending.expect_get_balance().returning(|_symbol| Ok(5.009989));
 
-    let finalizer_pending = MexcFinalizer::new(
-        Arc::new(backend_pending),
-        Arc::new(transfers_pending),
-        Principal::anonymous(),
-        TEST_MAX_SELL_SLIPPAGE_BPS,
-        TEST_CEX_MIN_EXEC_USD,
-        TEST_CEX_SLICE_TARGET_RATIO,
-    );
+    let finalizer_pending = test_finalizer(Arc::new(backend_pending), Arc::new(transfers_pending));
 
     let mut state_pending = finalizer_pending
         .prepare("42", &receipt)
@@ -898,14 +784,7 @@ async fn mexc_approval_bump_second_batch_failure_does_not_mark_as_completed() {
             }
         });
 
-    let finalizer = MexcFinalizer::new(
-        backend,
-        Arc::new(transfers),
-        Principal::anonymous(),
-        TEST_MAX_SELL_SLIPPAGE_BPS,
-        TEST_CEX_MIN_EXEC_USD,
-        TEST_CEX_SLICE_TARGET_RATIO,
-    );
+    let finalizer = test_finalizer(backend, Arc::new(transfers));
 
     let asset = ChainToken::Icp {
         ledger: Principal::anonymous(),
@@ -935,14 +814,7 @@ async fn mexc_withdraw_is_idempotent_when_already_recorded() {
     let backend = Arc::new(backend);
     let transfer_service = Arc::new(transfers);
 
-    let finalizer = MexcFinalizer::new(
-        backend,
-        transfer_service,
-        Principal::anonymous(),
-        TEST_MAX_SELL_SLIPPAGE_BPS,
-        TEST_CEX_MIN_EXEC_USD,
-        TEST_CEX_SLICE_TARGET_RATIO,
-    );
+    let finalizer = test_finalizer(backend, transfer_service);
 
     let receipt = make_execution_receipt(42);
     let mut state = finalizer.prepare("42", &receipt).await.expect("prepare should succeed");

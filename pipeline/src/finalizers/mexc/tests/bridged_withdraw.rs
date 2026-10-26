@@ -209,15 +209,8 @@ async fn mexc_deposit_bridge_deferral_keeps_step_pending_then_submits() {
         }
     });
 
-    let finalizer = MexcFinalizer::new(
-        Arc::new(cex),
-        Arc::new(transfers),
-        Principal::anonymous(),
-        TEST_MAX_SELL_SLIPPAGE_BPS,
-        TEST_CEX_MIN_EXEC_USD,
-        TEST_CEX_SLICE_TARGET_RATIO,
-    )
-    .with_bridge_runtime(bridge_dependencies(Arc::new(bridge)));
+    let finalizer =
+        test_finalizer(Arc::new(cex), Arc::new(transfers)).with_bridge_runtime(bridge_dependencies(Arc::new(bridge)));
 
     let receipt = make_execution_receipt_with_assets(82, ckusdc_token(), ckbtc_token());
     let mut state = finalizer.prepare("82", &receipt).await.expect("prepare should succeed");
@@ -369,14 +362,7 @@ async fn mexc_non_bridge_withdraw_behavior_unchanged() {
             })
         });
 
-    let finalizer = MexcFinalizer::new(
-        Arc::new(cex),
-        Arc::new(transfers),
-        Principal::anonymous(),
-        TEST_MAX_SELL_SLIPPAGE_BPS,
-        TEST_CEX_MIN_EXEC_USD,
-        TEST_CEX_SLICE_TARGET_RATIO,
-    );
+    let finalizer = test_finalizer(Arc::new(cex), Arc::new(transfers));
 
     let receipt = make_execution_receipt(13);
     let mut state = finalizer.prepare("13", &receipt).await.expect("prepare should succeed");
@@ -417,14 +403,7 @@ async fn mexc_non_bridge_withdraw_keeps_evm_destination_address() {
             })
         });
 
-    let finalizer = MexcFinalizer::new(
-        Arc::new(cex),
-        Arc::new(transfers),
-        Principal::anonymous(),
-        TEST_MAX_SELL_SLIPPAGE_BPS,
-        TEST_CEX_MIN_EXEC_USD,
-        TEST_CEX_SLICE_TARGET_RATIO,
-    );
+    let finalizer = test_finalizer(Arc::new(cex), Arc::new(transfers));
 
     let debt_token = ChainToken::EvmErc20 {
         chain: "eth".to_string(),

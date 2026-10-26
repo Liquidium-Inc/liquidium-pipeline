@@ -786,7 +786,9 @@ fn parse_icpswap_fee_tiers(raw: &str) -> Result<Vec<candid::Nat>, String> {
     Ok(tiers)
 }
 
-fn normalize_cex_market_pair(raw: &str) -> Option<String> {
+/// Normalizes `icp/usdt`, `ICP-USDT` or `ICP_USDT` to `ICP_USDT`. Anything
+/// that is not exactly two symbols gives `None`.
+pub(crate) fn normalize_cex_market_pair(raw: &str) -> Option<String> {
     let normalized = raw.trim().replace(['/', '-'], "_").to_ascii_uppercase();
     if normalized.is_empty() {
         return None;

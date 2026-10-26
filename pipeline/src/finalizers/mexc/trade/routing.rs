@@ -1,6 +1,7 @@
 //! Trade route discovery: direct markets, hop search over the configured
 //! pairs, saved routes, and the USD legs used to value a slice.
 use super::*;
+use crate::config::normalize_cex_market_pair;
 use crate::finalizers::bridge_planner::BridgePlanner;
 use crate::finalizers::cex_finalizer::CexRouteLeg;
 use crate::finalizers::mexc::mexc_utils::parse_market_symbols;
@@ -9,26 +10,11 @@ impl<C> MexcFinalizer<C>
 where
     C: CexBackend,
 {
-    fn normalize_market_pair(raw: &str) -> Option<String> {
-        let normalized = raw.trim().replace(['/', '-'], "_").to_ascii_uppercase();
-        if normalized.is_empty() {
-            return None;
-        }
-
-        let mut parts = normalized.split('_').filter(|part| !part.is_empty());
-        let base = parts.next()?;
-        let quote = parts.next()?;
-        if parts.next().is_some() {
-            return None;
-        }
-        Some(format!("{}_{}", base, quote))
-    }
-
     pub(super) fn normalize_market_pairs(markets: Vec<String>) -> Vec<String> {
         let mut seen = HashSet::new();
         let mut out = Vec::new();
         for market in markets {
-            let Some(normalized) = Self::normalize_market_pair(&market) else {
+            let Some(normalized) = normalize_cex_market_pair(&market) else {
                 continue;
             };
             if seen.insert(normalized.clone()) {

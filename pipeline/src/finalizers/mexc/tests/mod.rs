@@ -260,6 +260,18 @@ fn repayment_account() -> icrc_ledger_types::icrc1::account::Account {
     }
 }
 
+/// The finalizer most tests use: an anonymous liquidator and the test tunables.
+fn test_finalizer<C: CexBackend>(backend: Arc<C>, transfers: Arc<dyn TransferActions>) -> MexcFinalizer<C> {
+    MexcFinalizer::new(
+        backend,
+        transfers,
+        Principal::anonymous(),
+        TEST_MAX_SELL_SLIPPAGE_BPS,
+        TEST_CEX_MIN_EXEC_USD,
+        TEST_CEX_SLICE_TARGET_RATIO,
+    )
+}
+
 fn cksol_finalizer(cex: MockCexBackend, bridge: MockBridgeBackend) -> MexcFinalizer<MockCexBackend> {
     MexcFinalizer::new(
         Arc::new(cex),

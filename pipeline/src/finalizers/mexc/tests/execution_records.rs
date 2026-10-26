@@ -60,14 +60,7 @@ fn losses_on_sequential_legs_compound() {
 
 #[tokio::test]
 async fn a_finished_row_reports_slippage_from_its_slices_not_a_saved_figure() {
-    let finalizer = MexcFinalizer::new(
-        Arc::new(MockCexBackend::new()),
-        Arc::new(MockTransferActions::new()),
-        Principal::anonymous(),
-        TEST_MAX_SELL_SLIPPAGE_BPS,
-        TEST_CEX_MIN_EXEC_USD,
-        TEST_CEX_SLICE_TARGET_RATIO,
-    );
+    let finalizer = test_finalizer(Arc::new(MockCexBackend::new()), Arc::new(MockTransferActions::new()));
     let receipt = make_execution_receipt(44);
     let mut state = finalizer.prepare("44", &receipt).await.expect("prepare should succeed");
     state.withdraw.size_out = Some(ChainTokenAmount::from_formatted(
@@ -89,14 +82,7 @@ async fn a_finished_row_reports_slippage_from_its_slices_not_a_saved_figure() {
 
 #[tokio::test]
 async fn slice_records_keep_token_decimals() {
-    let finalizer = MexcFinalizer::new(
-        Arc::new(MockCexBackend::new()),
-        Arc::new(MockTransferActions::new()),
-        Principal::anonymous(),
-        TEST_MAX_SELL_SLIPPAGE_BPS,
-        TEST_CEX_MIN_EXEC_USD,
-        TEST_CEX_SLICE_TARGET_RATIO,
-    );
+    let finalizer = test_finalizer(Arc::new(MockCexBackend::new()), Arc::new(MockTransferActions::new()));
     let receipt = make_execution_receipt(43);
     let mut state = finalizer.prepare("43", &receipt).await.expect("prepare should succeed");
     state.withdraw.size_out = Some(ChainTokenAmount::from_formatted(

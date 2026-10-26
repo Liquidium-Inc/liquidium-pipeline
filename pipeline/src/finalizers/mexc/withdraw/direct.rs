@@ -89,4 +89,102 @@ where
         ));
         state.step = CexStep::Completed;
     }
+
+    /// A withdrawal straight to the final address: fix the destination, then
+    /// read the delivery of an accepted request, or send a new one.
+    pub(super) async fn withdraw_direct(
+        &self,
+        state: &mut CexState,
+        planned_asset: &str,
+        planned_network: &str,
+        amount: f64,
+    ) -> Result<(), String> {
+        let direct_destination = self.direct_withdraw_destination(state, planned_asset, planned_network)?;
+
+        if state.withdraw.withdraw_address != direct_destination {
+            state.withdraw.withdraw_address = direct_destination;
+        }
+
+        if state
+            .withdraw
+            .withdraw_txid
+            .as_ref()
+            .is_some_and(|tx| !tx.trim().is_empty())
+        {
+            state.step = CexStep::Completed;
+            return Ok(());
+        }
+
+        if let Some(withdraw_id) = state.withdraw.withdraw_id.clone() {
+            return self
+                .poll_direct_withdraw(state, planned_asset, &withdraw_id, amount)
+                .await;
+        }
+
+        let Some(accepted) = self
+            .submit_withdraw(state, planned_asset, planned_network, amount)
+            .await?
+        else {
+            return Ok(());
+        };
+        state.withdraw.withdraw_id = Some(accepted.id);
+        state.withdraw.withdraw_txid = accepted.txid.clone();
+        state.step = if accepted.txid.as_ref().is_some_and(|tx| !tx.trim().is_empty()) {
+            CexStep::Completed
+        } else {
+            state.withdraw.withdraw_accepted_at_ts = Some(now_ts());
+            CexStep::WithdrawPending
+        };
+        Ok(())
+    }
+
+    /// Reads the delivery of an accepted withdrawal. The leg completes only
+    /// with a transaction id, and parks if delivery never arrives.
+    async fn poll_direct_withdraw(
+        &self,
+        state: &mut CexState,
+        planned_asset: &str,
+        withdraw_id: &str,
+        amount: f64,
+    ) -> Result<(), String> {
+        // An accepted POST only reserves exchange funds. Require delivery
+        // evidence before making this leg terminal and reporting profit.
+        let snapshot = self
+            .backend
+            .get_withdraw_status_snapshot_by_id(planned_asset, withdraw_id)
+            .await?;
+        match snapshot.status {
+            WithdrawStatus::Failed | WithdrawStatus::Canceled => {
+                return Err(format!(
+                    "cex withdraw failed for liq_id {} withdraw_id={withdraw_id}",
+                    state.liq_id
+                ));
+            }
+            WithdrawStatus::Completed if snapshot.txid.as_ref().is_some_and(|tx| !tx.trim().is_empty()) => {
+                if let Some(fee) = snapshot.transaction_fee {
+                    let net = Self::net_of_withdraw_fee(amount, fee)
+                        .map_err(|error| format!("invalid completed withdrawal fee: {error}"))?;
+                    state.withdraw.size_out = Some(ChainTokenAmount::from_formatted(
+                        state.withdraw.withdraw_asset.clone(),
+                        net,
+                    ));
+                }
+                state.withdraw.withdraw_txid = snapshot.txid;
+                state.step = CexStep::Completed;
+            }
+            _ => {
+                // Rows accepted before this clock existed start it now.
+                let accepted_at = *state.withdraw.withdraw_accepted_at_ts.get_or_insert_with(now_ts);
+                let waited = now_ts().saturating_sub(accepted_at);
+                if waited > DIRECT_WITHDRAW_DELIVERY_TIMEOUT_SECS {
+                    return Err(format!(
+                        "cex withdraw not delivered after {waited}s for liq_id {} withdraw_id={withdraw_id} status={:?}",
+                        state.liq_id, snapshot.status
+                    ));
+                }
+                state.step = CexStep::WithdrawPending;
+            }
+        }
+        Ok(())
+    }
 }
