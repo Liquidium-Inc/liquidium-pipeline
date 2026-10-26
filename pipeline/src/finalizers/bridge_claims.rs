@@ -5,7 +5,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 use crate::{
     finalizers::cex_finalizer::{BridgeSubmitAttempt, BridgeSubmitPhase},
@@ -18,6 +18,32 @@ pub struct BridgeClaims {
     pub bridge_ids: Vec<String>,
     /// Attempts other rows persisted and have not resolved.
     pub open_attempts: Vec<BridgeSubmitAttempt>,
+    /// Deposit sends that rows started and the provider has not minted.
+    pub open_deposit_sends: Vec<OpenDepositSend>,
+}
+
+/// A send to a provider deposit address whose mint has not arrived. The
+/// address is shared, so a second send would merge with this deposit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenDepositSend {
+    pub liq_id: String,
+    pub asset: String,
+    pub network: String,
+}
+
+/// Reads an open deposit send from a saved leg state.
+fn open_deposit_send(fields: &Map<String, Value>) -> Option<OpenDepositSend> {
+    let present = |key: &str| fields.get(key).is_some_and(|value| !value.is_null());
+    let started = present("withdraw_bridge_funding") || present("withdraw_bridge_funding_txid");
+    if !started || present("withdraw_bridge_mint_receipt") {
+        return None;
+    }
+    let text = |key: &str| fields.get(key).and_then(Value::as_str).unwrap_or_default().to_string();
+    Some(OpenDepositSend {
+        liq_id: text("liq_id"),
+        asset: text("withdraw_planned_asset"),
+        network: text("withdraw_planned_network"),
+    })
 }
 
 #[cfg_attr(test, mockall::automock)]
@@ -68,6 +94,9 @@ impl WalBridgeClaims {
 fn visit(value: &Value, claims: &mut BridgeClaims) {
     match value {
         Value::Object(fields) => {
+            if let Some(send) = open_deposit_send(fields) {
+                claims.open_deposit_sends.push(send);
+            }
             for (key, child) in fields {
                 if key.ends_with("_bridge_id") {
                     if let Some(id) = child.as_str() {
@@ -199,6 +228,33 @@ mod tests {
         assert_eq!(claims.open_attempts[0].id, "a1");
         assert_eq!(claims.open_attempts[0].amount, 1.5);
         assert_eq!(claims.open_attempts[0].cursor, Some(100));
+    }
+
+    #[tokio::test]
+    async fn claims_list_deposit_sends_until_their_mint_arrives() {
+        let leg = |liq_id: &str, fields: &str| {
+            format!(
+                r#"{{"meta_v2":{{"legs":[{{"execution":{{"state":{{"liq_id":"{liq_id}","withdraw_planned_asset":"SOL","withdraw_planned_network":"SOL",{fields}}}}}}}]}}}}"#
+            )
+        };
+        let rows = vec![
+            row("1", &leg("saved", r#""withdraw_bridge_funding":{"phase":"Prepared"}"#)),
+            row("2", &leg("landed", r#""withdraw_bridge_funding_txid":"sig","withdraw_bridge_mint_receipt":null"#)),
+            row("3", &leg("minted", r#""withdraw_bridge_funding_txid":"sig","withdraw_bridge_mint_receipt":{"amount":1}"#)),
+            row("4", &leg("none", r#""withdraw_bridge_funding":null,"withdraw_bridge_funding_txid":null"#)),
+        ];
+        let mut wal = MockWalStore::new();
+        wal.expect_list_by_status().returning(move |status, _| {
+            Ok(if status == ResultStatus::InFlight { rows.clone() } else { vec![] })
+        });
+        wal.expect_list_updated_since().returning(|_, _| Ok(vec![]));
+
+        let claims = WalBridgeClaims::new(Arc::new(wal)).claims_since(0).await.unwrap();
+
+        let open: Vec<&str> = claims.open_deposit_sends.iter().map(|send| send.liq_id.as_str()).collect();
+        assert_eq!(open, vec!["saved", "landed"]);
+        assert_eq!(claims.open_deposit_sends[0].asset, "SOL");
+        assert_eq!(claims.open_deposit_sends[0].network, "SOL");
     }
 
     #[tokio::test]

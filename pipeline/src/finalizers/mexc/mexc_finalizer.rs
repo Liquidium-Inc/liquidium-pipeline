@@ -241,6 +241,24 @@ where
         self.bridge_destination_for_final_liquidator(route.destination_kind, snapshot)
     }
 
+    /// Another row's deposit send on this route that has not minted yet.
+    async fn other_open_deposit_send(
+        bridge: &BridgeRuntime,
+        route: &BridgeRouteSpec,
+        liq_id: &str,
+    ) -> Result<Option<String>, String> {
+        let claims = bridge.claims.claims_since(now_ts()).await?;
+        Ok(claims
+            .open_deposit_sends
+            .into_iter()
+            .find(|send| {
+                send.liq_id != liq_id
+                    && send.asset.eq_ignore_ascii_case(route.source_asset)
+                    && send.network.eq_ignore_ascii_case(route.source_chain)
+            })
+            .map(|send| send.liq_id))
+    }
+
     /// Runs one step of a return bridge whose provider watches a deposit
     /// address: the send, then the notice. `request` starts a new send.
     async fn advance_withdraw_deposit_send(
@@ -257,7 +275,18 @@ where
         let funds = &mut state.withdraw.bridge;
         let Some(receipt) = funds.withdraw_bridge_funding_txid.clone() else {
             let intent = match request {
-                Some(request) => Some(bridge.backend.deposit_send(request).await?),
+                Some(request) => {
+                    // The deposit address is shared, and the provider takes one
+                    // deposit at a time. A second send would merge with it.
+                    if let Some(other) = Self::other_open_deposit_send(bridge, route, &liq_id).await? {
+                        info!(
+                            "[mexc] liq_id={} bridge deposit waits for liq_id={} on the same deposit address",
+                            liq_id, other
+                        );
+                        return Ok(());
+                    }
+                    Some(bridge.backend.deposit_send(request).await?)
+                }
                 None => None,
             };
             let landed = step_outbound(

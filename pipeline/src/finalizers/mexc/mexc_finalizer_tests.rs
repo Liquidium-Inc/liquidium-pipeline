@@ -6186,7 +6186,11 @@ async fn mexc_cksol_repayment_waits_for_funding_reserves_fees_and_records_mint()
         TEST_CEX_MIN_EXEC_USD,
         TEST_CEX_SLICE_TARGET_RATIO,
     )
-    .with_bridge_runtime(bridge_dependencies(Arc::new(bridge)).with_outbound(Arc::new(sol_deposit_sender())));
+    .with_bridge_runtime(
+        bridge_dependencies(Arc::new(bridge))
+            .with_outbound(Arc::new(sol_deposit_sender()))
+            .with_claims(Arc::new(open_deposit_sends(vec![vec![]]))),
+    );
     let mut state = cksol_repayment_state(&finalizer, 1.5);
 
     finalizer.withdraw(&mut state).await.unwrap(); // exchange withdrawal
@@ -6213,6 +6217,98 @@ async fn mexc_cksol_repayment_waits_for_funding_reserves_fees_and_records_mint()
     finalizer.withdraw(&mut resumed).await.unwrap();
     assert!(matches!(resumed.step, CexStep::Completed));
     assert_eq!(resumed.withdraw.size_out.unwrap().value, Nat::from(1_487_995_000u64));
+}
+
+/// A claim registry that answers each scan with the next list of open sends.
+fn open_deposit_sends(
+    scans: Vec<Vec<crate::finalizers::bridge_claims::OpenDepositSend>>,
+) -> crate::finalizers::bridge_claims::MockBridgeClaimLookup {
+    let scans = std::sync::Mutex::new(scans.into_iter());
+    let mut claims = crate::finalizers::bridge_claims::MockBridgeClaimLookup::new();
+    claims.expect_claims_since().returning(move |_| {
+        Ok(crate::finalizers::bridge_claims::BridgeClaims {
+            open_deposit_sends: scans.lock().unwrap().next().expect("unexpected claim scan"),
+            ..Default::default()
+        })
+    });
+    claims
+}
+
+#[tokio::test]
+async fn mexc_cksol_return_waits_while_another_row_has_an_open_sol_deposit() {
+    use crate::finalizers::bridge_claims::OpenDepositSend;
+    let send = |liq_id: &str, asset: &str| OpenDepositSend {
+        liq_id: liq_id.into(),
+        asset: asset.into(),
+        network: "SOL".into(),
+    };
+    let mut cex = MockCexBackend::new();
+    cex.expect_get_withdraw_status_snapshot_by_id().returning(|_, _| {
+        Ok(WithdrawStatusSnapshot {
+            status: WithdrawStatus::Completed,
+            txid: Some("sol-signature".into()),
+            transaction_fee: Some(0.01),
+        })
+    });
+    let mut bridge = MockBridgeBackend::new();
+    bridge.expect_get_source_balance().returning(|_, _, _| Ok(1.49));
+    bridge.expect_get_source_fee_budget().returning(|_, _, _| Ok(0.002));
+    bridge.expect_get_minimum_bridge_amount().returning(|_, _, _| Ok(0.02));
+    bridge.expect_deposit_send().times(1).returning(|_| {
+        Ok(liquidium_pipeline_core::outbound::OutboundIntent {
+            token: ChainToken::SolanaNative {
+                symbol: "SOL".into(),
+                decimals: 9,
+                fee: Nat::from(5_000u64),
+            },
+            to: ChainAccount::Solana("minter-deposit".into()),
+            amount_native: Nat::from(1_488_000_000u64),
+        })
+    });
+    // The first scan finds another row's open SOL deposit. The second finds
+    // only this row and a deposit on another route, so the send starts.
+    let claims = open_deposit_sends(vec![
+        vec![send("other-row", "SOL")],
+        vec![send("1705", "SOL"), send("other-row", "ETH")],
+    ]);
+    let finalizer = MexcFinalizer::new(
+        Arc::new(cex),
+        Arc::new(MockTransferActions::new()),
+        repayment_account().owner,
+        TEST_MAX_SELL_SLIPPAGE_BPS,
+        TEST_CEX_MIN_EXEC_USD,
+        TEST_CEX_SLICE_TARGET_RATIO,
+    )
+    .with_bridge_runtime(
+        bridge_dependencies(Arc::new(bridge))
+            .with_outbound(Arc::new(sol_deposit_sender_prepare_only()))
+            .with_claims(Arc::new(claims)),
+    );
+    let mut state = cksol_repayment_state(&finalizer, 1.5);
+    state.step = CexStep::WithdrawPending;
+    state.withdraw.withdraw_id = Some("sol-withdraw".into());
+    assert_eq!(state.liq_id, "1705");
+
+    finalizer.withdraw(&mut state).await.unwrap();
+    assert!(!state.withdraw.bridge.deposit_send_started(), "another row's deposit is open");
+    assert!(matches!(state.step, CexStep::WithdrawPending));
+
+    finalizer.withdraw(&mut state).await.unwrap();
+    assert!(state.withdraw.bridge.withdraw_bridge_funding.is_some());
+}
+
+/// A SOL sender for a test that only saves the send.
+fn sol_deposit_sender_prepare_only() -> liquidium_pipeline_core::outbound::MockOutboundSender {
+    let mut sender = liquidium_pipeline_core::outbound::MockOutboundSender::new();
+    sender.expect_prepare().times(1).returning(|_| {
+        Ok(liquidium_pipeline_core::outbound::PreparedSend {
+            sender: "solana".into(),
+            identity: "sol-sig".into(),
+            payload: "tx".into(),
+            replay_safe: true,
+        })
+    });
+    sender
 }
 
 #[tokio::test]
@@ -6861,6 +6957,7 @@ mod lost_bridge_call {
             Ok(BridgeClaims {
                 bridge_ids: vec!["ic-withdraw:1:2".into()],
                 open_attempts: open_attempts.clone(),
+                ..BridgeClaims::default()
             })
         });
         claims
