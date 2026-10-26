@@ -62,6 +62,12 @@ use crate::{
     utils::{ICP_LEDGER_PRINCIPAL, now_ts},
 };
 
+/// The MEXC `withdrawOrderId` for one withdrawal attempt of a row.
+pub fn mexc_withdraw_order_id(liq_id: &str, attempt: u32) -> String {
+    let hash = super::mexc_utils::fnv1a_64(liq_id);
+    format!("lq{hash:016x}w{attempt}")
+}
+
 /// What a bridged deposit sends and what the bridge receives from it.
 pub(super) struct BridgeDepositSizing {
     pub transfer_value: Nat,
@@ -430,8 +436,7 @@ where
     /// The exchange keeps this id with the request, so history can find a
     /// request whose reply was lost. A refused request bumps the attempt.
     fn withdraw_order_id(state: &CexState) -> String {
-        let hash = super::mexc_utils::fnv1a_64(&state.liq_id);
-        format!("lq{hash:016x}w{}", state.withdraw.withdraw_attempt)
+        mexc_withdraw_order_id(&state.liq_id, state.withdraw.withdraw_attempt)
     }
 
     /// Sends one withdrawal under the leg's order id. `None` means the state

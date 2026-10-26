@@ -237,6 +237,13 @@ async fn fund(finalizer: &MexcFinalizer<MockCexBackend>, state: &mut CexState) {
     assert!(state.deposit.deposit_txid.is_some(), "the funding transfer landed");
 }
 
+#[test]
+fn the_withdraw_order_id_format_never_changes() {
+    // A saved row polls MEXC history by this id, so a new release must build
+    // the same id from the same row.
+    assert_eq!(mexc_withdraw_order_id("1720", 3), "lq04733af0f350196bw3");
+}
+
 #[tokio::test]
 async fn mexc_prepare_builds_initial_cex_state() {
     let backend = Arc::new(MockCexBackend::new());

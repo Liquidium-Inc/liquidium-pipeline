@@ -80,6 +80,7 @@ enum Commands {
         source: Option<String>,
         /// Destination:
         /// - ICP assets: "main", "trader", "recovery", "bridge", or full Account string
+        /// - native ICP: also a 64-hex ledger account id (exchange deposit addresses)
         /// - EVM assets: "main", "bridge", or 0x... address
         #[arg(long)]
         destination: Option<String>,
@@ -153,6 +154,26 @@ enum Commands {
         /// Optional proxy canister principal override.
         #[arg(long)]
         proxy_canister: Option<String>,
+    },
+
+    // Sends one small MEXC withdrawal with an order id, then checks that the
+    // withdraw history returns that id. Without --confirm it sends nothing.
+    MexcWithdrawCheck {
+        /// Asset as the pipeline plans it (e.g. "SOL")
+        #[arg(long)]
+        asset: String,
+        /// Network as the pipeline plans it (e.g. "SOL")
+        #[arg(long)]
+        network: String,
+        /// Destination address. Use an address we control.
+        #[arg(long)]
+        address: String,
+        /// Amount in asset units, above the MEXC minimum for the network
+        #[arg(long)]
+        amount: f64,
+        /// Send the withdrawal. Without it the command only reads the history.
+        #[arg(long)]
+        confirm: bool,
     },
 
     // Account management commands
@@ -366,6 +387,19 @@ async fn main() -> ExitCode {
             .await
             {
                 eprintln!("Bridge SOL process_deposit failed: {}", e);
+                return ExitCode::FAILURE;
+            }
+            ExitCode::SUCCESS
+        }
+        Commands::MexcWithdrawCheck {
+            asset,
+            network,
+            address,
+            amount,
+            confirm,
+        } => {
+            if let Err(e) = commands::mexc_withdraw_check::check(&asset, &network, &address, amount, confirm).await {
+                eprintln!("MEXC withdraw check failed: {}", e);
                 return ExitCode::FAILURE;
             }
             ExitCode::SUCCESS
