@@ -78,14 +78,7 @@ struct TestWal {
 
 impl TestWal {
     fn with_receipt(receipt: &ExecutionReceipt) -> Self {
-        let wrapper = LiqMetaWrapper {
-            receipt: receipt.clone(),
-            meta: Vec::new(),
-            finalizer_decision: None,
-            profit_snapshot: None,
-            venue_execution: None,
-            meta_v2: None,
-        };
+        let wrapper = LiqMetaWrapper::new(receipt.clone());
         Self::with_wrapper(wrapper)
     }
 
@@ -686,18 +679,7 @@ fn row_for_receipt(receipt: ExecutionReceipt) -> LiqResultRecord {
         updated_at: 0,
         meta_json: String::new(),
     };
-    encode_meta(
-        &mut row,
-        &LiqMetaWrapper {
-            receipt,
-            meta: Vec::new(),
-            finalizer_decision: None,
-            profit_snapshot: None,
-            venue_execution: None,
-            meta_v2: None,
-        },
-    )
-    .expect("encode batch WAL row");
+    encode_meta(&mut row, &LiqMetaWrapper::new(receipt)).expect("encode batch WAL row");
     row
 }
 

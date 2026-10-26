@@ -117,9 +117,6 @@ impl LiquidationIntentStore for SqliteWalStore {
         let receipt_json = serde_json::to_string(receipt).context("encode accepted liquidation receipt")?;
         let now = now_secs();
         let meta_json = serde_json::to_string(&LiqMetaWrapper {
-            receipt: receipt.clone(),
-            meta: Vec::new(),
-            finalizer_decision: None,
             profit_snapshot: Some(WalProfitSnapshot {
                 expected_profit_raw: receipt.request.expected_profit.to_string(),
                 realized_profit_raw: None,
@@ -127,8 +124,7 @@ impl LiquidationIntentStore for SqliteWalStore {
                 debt_decimals: receipt.request.debt_asset.decimals(),
                 updated_at: now,
             }),
-            venue_execution: None,
-            meta_v2: None,
+            ..LiqMetaWrapper::new(receipt.clone())
         })?;
         let mut conn = self.get_conn()?;
         // Acceptance and runnable work commit together. No importer/cursor can

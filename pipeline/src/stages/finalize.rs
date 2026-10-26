@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 
@@ -12,14 +11,14 @@ use crate::finalizers::liquidation_outcome::LiquidationOutcome;
 use crate::finalizers::profit_calculator::ProfitCalculator;
 use crate::liquidation::lending_queries::get_liquidation;
 
-use crate::persistance::{LiqMetaWrapper, ResultStatus, WalProfitSnapshot, WalStore};
+use crate::persistance::{LiqMetaWrapper, LiqResultRecord, ResultStatus, WalProfitSnapshot, WalStore};
 use crate::stage::PipelineStage;
 use crate::stages::executor::{ExecutionReceipt, ExecutionStatus};
 use crate::utils::now_ts;
 use crate::wal::{
     decode_receipt_wrapper, encode_meta, wal_mark_enqueued, wal_mark_inflight, wal_mark_operator_required,
     wal_mark_operator_required_with_error, wal_mark_permanent_failed, wal_mark_retryable_failed, wal_mark_succeeded,
-    wal_mark_unresumable,
+    wal_mark_unresumable, wal_save_receipt,
 };
 use crate::watchdog::{Watchdog, WatchdogEvent, noop_watchdog};
 use liquidium_pipeline_connectors::pipeline_agent::PipelineAgent;
@@ -46,13 +45,27 @@ fn retry_delay_secs(base: u64, max: u64, error_count: i32) -> u64 {
     base.saturating_mul(multiplier).min(capped_max)
 }
 
+/// A liquidation the stage finished, with the receipt its outcome reports.
+type Finished = (FinalizerResult, ExecutionReceipt);
+
 /// An outcome is published only after its terminal status is durable. A failed
 /// write leaves the row to run again, so it is reported once (audit L18).
-fn warn_outcome_deferred(liq_id: u128, error: &str) {
-    warn!(
-        "[finalize] terminal WAL write failed; outcome not published yet liq_id={} err={}",
-        liq_id, error
-    );
+fn published(
+    write: Result<(), String>,
+    liq_id: u128,
+    result: FinalizerResult,
+    receipt: ExecutionReceipt,
+) -> Option<Finished> {
+    match write {
+        Ok(()) => Some((result, receipt)),
+        Err(error) => {
+            warn!(
+                "[finalize] terminal WAL write failed; outcome not published yet liq_id={} err={}",
+                liq_id, error
+            );
+            None
+        }
+    }
 }
 
 //
@@ -113,22 +126,22 @@ where
     }
 
     async fn update_receipt_meta(&self, liq_id: &str, receipt: &ExecutionReceipt) -> Result<(), String> {
-        let row = self.wal.get_result(liq_id).await.map_err(|e| e.to_string())?;
-        if let Some(mut row) = row {
-            let mut wrapper = decode_receipt_wrapper(&row)?.unwrap_or(LiqMetaWrapper {
-                receipt: receipt.clone(),
-                meta: Vec::new(),
-                finalizer_decision: None,
-                profit_snapshot: None,
-                venue_execution: None,
-                meta_v2: None,
-            });
-            wrapper.receipt = receipt.clone();
-            encode_meta(&mut row, &wrapper)?;
-            row.updated_at = now_ts();
-            self.wal.upsert_result(row).await.map_err(|e| e.to_string())?;
+        match self.wal.get_result(liq_id).await.map_err(|e| e.to_string())? {
+            Some(row) => wal_save_receipt(&*self.wal, row, receipt, true).await,
+            None => Ok(()),
         }
-        Ok(())
+    }
+
+    async fn alert_operator(&self, receipt: &ExecutionReceipt, liq_id: u128, pending_step: &str, details: String) {
+        self.watchdog
+            .notify(WatchdogEvent::OperatorRequired {
+                execution_id: liq_id.to_string(),
+                venue: "finalizer".to_string(),
+                pending_step: pending_step.to_string(),
+                owner: receipt.request.liquidation.borrower.to_text(),
+                details,
+            })
+            .await;
     }
 
     /// Escalates a liquidation parked because its retry budget ran out while a
@@ -138,33 +151,21 @@ where
     /// finalizer -- but the tagged error carries the venue and leg, so it goes
     /// in `details` while `venue` names the component that made the decision.
     async fn escalate_custody_park(&self, receipt: &ExecutionReceipt, liq_id: u128, error: &str) {
-        self.watchdog
-            .notify(WatchdogEvent::OperatorRequired {
-                execution_id: liq_id.to_string(),
-                venue: "finalizer".to_string(),
-                pending_step: "retry_budget_exhausted".to_string(),
-                owner: receipt.request.liquidation.borrower.to_text(),
-                details: format!(
-                    "Liquidation {liq_id} was parked after {MAX_FINALIZER_ERRORS} failed finalize attempts while a venue leg may still hold its funds. It will not be retried automatically. Last error: {error}"
-                ),
-            })
+        let details = format!(
+            "Liquidation {liq_id} was parked after {MAX_FINALIZER_ERRORS} failed finalize attempts while a venue leg may still hold its funds. It will not be retried automatically. Last error: {error}"
+        );
+        self.alert_operator(receipt, liq_id, "retry_budget_exhausted", details)
             .await;
     }
 
     /// Alerts once when a row with no acceptable swap drops to the slow retry
     /// pace. The row keeps retrying; the alert makes a lasting cause visible.
     async fn escalate_slow_retry(&self, receipt: &ExecutionReceipt, liq_id: u128, error: &str) {
-        self.watchdog
-            .notify(WatchdogEvent::OperatorRequired {
-                execution_id: liq_id.to_string(),
-                venue: "finalizer".to_string(),
-                pending_step: "no_route_slow_retry".to_string(),
-                owner: receipt.request.liquidation.borrower.to_text(),
-                details: format!(
-                    "Liquidation {liq_id} found no acceptable swap in {MAX_FINALIZER_ERRORS} tries. It keeps retrying every {} minutes on its own. Last error: {error}",
-                    NO_ROUTE_SLOW_RETRY_SECS / 60
-                ),
-            })
+        let details = format!(
+            "Liquidation {liq_id} found no acceptable swap in {MAX_FINALIZER_ERRORS} tries. It keeps retrying every {} minutes on its own. Last error: {error}",
+            NO_ROUTE_SLOW_RETRY_SECS / 60
+        );
+        self.alert_operator(receipt, liq_id, "no_route_slow_retry", details)
             .await;
     }
 
@@ -197,14 +198,7 @@ where
             return Err(format!("missing WAL row for liq_id {liq_id}"));
         };
 
-        let mut wrapper = decode_receipt_wrapper(&row)?.unwrap_or(LiqMetaWrapper {
-            receipt: receipt.clone(),
-            meta: Vec::new(),
-            finalizer_decision: None,
-            profit_snapshot: None,
-            venue_execution: None,
-            meta_v2: None,
-        });
+        let mut wrapper = decode_receipt_wrapper(&row)?.unwrap_or(LiqMetaWrapper::new(receipt.clone()));
         wrapper.profit_snapshot = Some(WalProfitSnapshot {
             expected_profit_raw: expected_profit.to_string(),
             realized_profit_raw: Some(realized_profit.to_string()),
@@ -217,6 +211,324 @@ where
         row.updated_at = now_ts();
         self.wal.upsert_result(row).await.map_err(|e| e.to_string())
     }
+
+    /// Rows with a readable receipt and liquidation result. Any other row is
+    /// quarantined, so it cannot block the rest.
+    async fn decode_rows(&self, rows: Vec<LiqResultRecord>) -> Vec<(LiqResultRecord, ExecutionReceipt)> {
+        let mut decoded = Vec::with_capacity(rows.len());
+        for row in rows {
+            let meta = decode_receipt_wrapper(&row)
+                .and_then(|meta| meta.ok_or_else(|| format!("receipt not found in WAL meta_json for {}", row.id)));
+            match meta {
+                Ok(meta) if meta.receipt.liquidation_result.is_some() => decoded.push((row, meta.receipt)),
+                Ok(_) => {
+                    let error = format!("missing liquidation_result for WAL id {}", row.id);
+                    self.quarantine_row(&row.id, error).await;
+                }
+                Err(error) => self.quarantine_row(&row.id, error).await,
+            }
+        }
+        decoded
+    }
+
+    /// One row through the stage. `Some` is a finished liquidation whose
+    /// terminal status is durable, ready to publish.
+    async fn finalize_row(
+        &self,
+        row: &LiqResultRecord,
+        mut receipt: ExecutionReceipt,
+    ) -> Result<Option<Finished>, String> {
+        let liq = receipt
+            .liquidation_result
+            .as_ref()
+            .ok_or_else(|| "missing liquidation_result in receipt".to_string())?;
+        let liq_id = liq.id;
+        if !matches!(liq.collateral_tx.status, TransferStatus::Success) {
+            self.refresh_collateral(&row.id, liq_id, &mut receipt).await;
+        }
+
+        let liq = receipt
+            .liquidation_result
+            .as_ref()
+            .ok_or_else(|| "missing liquidation_result in receipt".to_string())?;
+        if !matches!(liq.collateral_tx.status, TransferStatus::Success) {
+            info!(
+                "[finalize] ⏳ collateral_tx status={:?} liq_id={}",
+                liq.collateral_tx.status, liq_id
+            );
+            return Ok(None);
+        }
+
+        debug!(
+            "[finalize] 🧾 executing receipt: liq_id={} debt_asset={} collateral_asset={} debt_repaid={} collateral_received={} swap={} swap_pay={} swap_recv={}",
+            liq_id,
+            receipt.request.debt_asset.symbol(),
+            receipt.request.collateral_asset.symbol(),
+            liq.amounts.debt_repaid,
+            liq.amounts.collateral_received,
+            receipt.request.swap_args.is_some(),
+            receipt.request.collateral_asset.symbol(),
+            receipt.request.debt_asset.symbol()
+        );
+
+        if receipt.request.swap_args.is_none() {
+            let result = FinalizerResult::finished_without_swap(Some("none".to_string()), None);
+            let write = wal_mark_succeeded(&*self.wal, &row.id).await;
+            return Ok(published(write, liq_id, result, receipt));
+        }
+        if self.retry_not_due(row, liq_id) {
+            return Ok(None);
+        }
+
+        wal_mark_inflight(&*self.wal, &row.id).await?;
+        Ok(match self.run_finalizer(liq_id, &receipt).await {
+            Ok(result) => self.handle_result(row, liq_id, result, receipt).await,
+            Err(error) => self.handle_error(row, liq_id, error, receipt).await,
+        })
+    }
+
+    /// Asks the pool again while the collateral transfer is open, and saves a
+    /// receipt that changed.
+    async fn refresh_collateral(&self, row_id: &str, liq_id: u128, receipt: &mut ExecutionReceipt) {
+        match get_liquidation(self.agent.as_ref(), &self.lending_canister, liq_id).await {
+            Ok(fresh) => {
+                if receipt.apply_pool_view(fresh)
+                    && let Err(err) = self.update_receipt_meta(row_id, receipt).await
+                {
+                    warn!("Failed to update WAL meta for liq_id {}: {}", liq_id, err);
+                }
+            }
+            Err(err) => warn!("[finalize] get_liquidation failed liq_id={} err={}", liq_id, err),
+        }
+    }
+
+    /// True while a failed row waits out its backoff, so thin books are not thrashed.
+    fn retry_not_due(&self, row: &LiqResultRecord, liq_id: u128) -> bool {
+        if row.status != ResultStatus::FailedRetryable {
+            return false;
+        }
+        let recorded_errors = row.error_count.max(1);
+        // Only a `NoRoute` row stays retryable past the budget, and it waits longer.
+        let delay_secs = if recorded_errors >= MAX_FINALIZER_ERRORS {
+            NO_ROUTE_SLOW_RETRY_SECS
+        } else {
+            retry_delay_secs(self.cex_retry_base_secs, self.cex_retry_max_secs, recorded_errors)
+        };
+        let due_at = row.updated_at.saturating_add(delay_secs.min(i64::MAX as u64) as i64);
+        let now = now_ts();
+        if now >= due_at {
+            return false;
+        }
+        debug!(
+            "[finalize] ⏳ retry backoff liq_id={} errors={} delay={}s remaining={}s",
+            liq_id,
+            recorded_errors,
+            delay_secs,
+            due_at.saturating_sub(now)
+        );
+        true
+    }
+
+    async fn run_finalizer(&self, liq_id: u128, receipt: &ExecutionReceipt) -> Result<FinalizerResult, FinalizerError> {
+        // A panic in one row must not abort the batch. Without this the
+        // unwind escapes `process()` entirely, taking export, heartbeat and
+        // every remaining row with it -- and `tokio::time::timeout` does not
+        // catch panics, so a deterministic one would repeat every cycle.
+        AssertUnwindSafe(self.finalizer.finalize(&*self.wal, receipt.clone()))
+            .catch_unwind()
+            .await
+            .unwrap_or_else(|panic| {
+                let detail = panic
+                    .downcast_ref::<&str>()
+                    .map(|s| (*s).to_string())
+                    .or_else(|| panic.downcast_ref::<String>().cloned())
+                    .unwrap_or_else(|| "unknown panic".to_string());
+                error!("[finalize] 💥 finalizer panicked liq_id={} detail={}", liq_id, detail);
+                // A panic says nothing about whether a retry would succeed.
+                Err(FinalizerError::Retryable(format!("finalizer panicked: {detail}")))
+            })
+    }
+
+    async fn handle_result(
+        &self,
+        row: &LiqResultRecord,
+        liq_id: u128,
+        result: FinalizerResult,
+        receipt: ExecutionReceipt,
+    ) -> Option<Finished> {
+        if result.operator_required {
+            match wal_mark_operator_required(&*self.wal, &row.id).await {
+                Err(error) => warn!("Failed to park operator-required WAL row {}: {}", row.id, error),
+                Ok(()) => warn!(
+                    "[finalize] operator reconciliation required liq_id={} reason={}",
+                    liq_id,
+                    result.reason.as_deref().unwrap_or("unspecified")
+                ),
+            }
+            return None;
+        }
+        if result.finalized {
+            let write = wal_mark_succeeded(&*self.wal, &row.id).await;
+            return published(write, liq_id, result, receipt);
+        }
+        if let Err(error) = wal_mark_enqueued(&*self.wal, &row.id).await {
+            warn!("Failed to re-enqueue unfinished WAL row {}: {}", row.id, error);
+        }
+        None
+    }
+
+    /// The error variant decides the row's fate; the attempt count decides
+    /// when a retryable error has spent its budget.
+    async fn handle_error(
+        &self,
+        row: &LiqResultRecord,
+        liq_id: u128,
+        error: FinalizerError,
+        receipt: ExecutionReceipt,
+    ) -> Option<Finished> {
+        let attempt = row.error_count + 1;
+        let exhausted = attempt >= MAX_FINALIZER_ERRORS;
+        let err_msg = error.message().to_string();
+        warn!(
+            "[finalize] finalization failed liq_id={} kind={} attempt={} err={}",
+            liq_id,
+            error.kind(),
+            attempt,
+            err_msg
+        );
+
+        match error {
+            FinalizerError::Unresumable(_) => {
+                // This build cannot read the committed row. The
+                // liquidation is not wrong, so it must not be failed:
+                // park it where an operator can see it, exactly as
+                // startup does for the same condition.
+                if let Err(mark_error) = wal_mark_unresumable(&*self.wal, &row.id, err_msg.clone()).await {
+                    warn!("Failed to park unresumable WAL row {}: {}", row.id, mark_error);
+                }
+                error!(
+                    "[finalize] 🅿️ committed row cannot be resumed by this build; parked for operator liq_id={} err={}",
+                    liq_id, err_msg
+                );
+                self.escalate_custody_park(&receipt, liq_id, &err_msg).await;
+                None
+            }
+            FinalizerError::BadDebtAmountFloor(_) if receipt.request.liquidation.buy_bad_debt => {
+                let reason = format!("bad debt finalizer amount floor accepted: {}", err_msg);
+                let result = FinalizerResult::finished_without_swap(None, Some(reason));
+                let write = wal_mark_succeeded(&*self.wal, &row.id).await;
+                published(write, liq_id, result, receipt)
+            }
+            FinalizerError::VenueCustody(_) if exhausted => {
+                self.park_custody(row, liq_id, &receipt, &err_msg).await;
+                None
+            }
+            FinalizerError::NoRoute(_) if exhausted => {
+                self.retry_slowly(row, liq_id, attempt, &receipt, &err_msg).await;
+                None
+            }
+            FinalizerError::Permanent(_) | FinalizerError::BadDebtAmountFloor(_) => {
+                self.fail_permanently(row, liq_id, receipt, err_msg).await
+            }
+            _ if exhausted => self.fail_permanently(row, liq_id, receipt, err_msg).await,
+            _ => {
+                if let Err(error) = wal_mark_retryable_failed(&*self.wal, &row.id, err_msg).await {
+                    warn!("Failed to mark WAL row {} retryable: {}", row.id, error);
+                }
+                None
+            }
+        }
+    }
+
+    /// The retry budget is spent, but a venue leg may still
+    /// hold this liquidation's funds. Failing permanently
+    /// would drop the row out of the runnable queue and
+    /// leave that custody with nothing tracking it, so park
+    /// it for an operator instead. Parking is terminal until
+    /// someone requeues the row, which is deliberate: the
+    /// venue side has to be understood before a retry.
+    async fn park_custody(&self, row: &LiqResultRecord, liq_id: u128, receipt: &ExecutionReceipt, err_msg: &str) {
+        match wal_mark_operator_required_with_error(&*self.wal, &row.id, err_msg.to_string()).await {
+            Err(error) => warn!("Failed to park custody-holding WAL row {}: {}", row.id, error),
+            Ok(()) => error!(
+                "[finalize] 🅿️ retry budget exhausted while a venue leg holds funds; parked for operator liq_id={} err={}",
+                liq_id, err_msg
+            ),
+        }
+        // A parked row produces no finalized outcome, so it
+        // reaches neither the CSV export nor the
+        // liquidation-finalized notification. Without this
+        // the only trace of stranded custody is a log line.
+        self.escalate_custody_park(receipt, liq_id, err_msg).await;
+    }
+
+    /// The collateral is still ours, and most causes pass: a venue outage, a thin book, a
+    /// price spike. So the row stays queued at a slow pace, with one alert (audit L17).
+    async fn retry_slowly(
+        &self,
+        row: &LiqResultRecord,
+        liq_id: u128,
+        attempt: i32,
+        receipt: &ExecutionReceipt,
+        err_msg: &str,
+    ) {
+        if let Err(error) = wal_mark_retryable_failed(&*self.wal, &row.id, err_msg.to_string()).await {
+            warn!("Failed to mark WAL row {} for a slow retry: {}", row.id, error);
+        }
+        if attempt == MAX_FINALIZER_ERRORS {
+            self.escalate_slow_retry(receipt, liq_id, err_msg).await;
+        }
+    }
+
+    /// Fails the row for good and reports it as `SwapFailed`.
+    async fn fail_permanently(
+        &self,
+        row: &LiqResultRecord,
+        liq_id: u128,
+        receipt: ExecutionReceipt,
+        err_msg: String,
+    ) -> Option<Finished> {
+        let write = wal_mark_permanent_failed(&*self.wal, &row.id, err_msg.clone()).await;
+        let mut failed_receipt = receipt;
+        failed_receipt.status = ExecutionStatus::SwapFailed(format!("finalizer permanent failure: {}", err_msg));
+        let result = FinalizerResult::finished_without_swap(None, Some(err_msg));
+        published(write, liq_id, result, failed_receipt)
+    }
+
+    /// The outcome of one finished liquidation, with its PnL saved on the row.
+    async fn record_outcome(
+        &self,
+        row: &LiqResultRecord,
+        result: FinalizerResult,
+        receipt: ExecutionReceipt,
+    ) -> Result<LiquidationOutcome, String> {
+        let req = &receipt.request;
+        let liq = receipt
+            .liquidation_result
+            .as_ref()
+            .ok_or_else(|| format!("missing liquidation_result for request: {:?}", req))?;
+
+        let round_trip_secs = result.finalized.then(|| now_ts().saturating_sub(row.created_at));
+        let expected_profit = self.profit_calc.expected(req, Some(liq));
+        let realized_profit = self.profit_calc.realized(req, liq, result.swap_result.as_ref());
+
+        if let Err(err) = self
+            .persist_profit_snapshot(&row.id, &receipt, expected_profit, realized_profit)
+            .await
+        {
+            warn!("Failed to persist WAL profit snapshot for liq_id {}: {}", liq.id, err);
+        }
+
+        Ok(LiquidationOutcome {
+            request: req.clone(),
+            execution_receipt: receipt.clone(),
+            finalizer_result: result,
+            status: receipt.status.clone(),
+            expected_profit,
+            realized_profit,
+            round_trip_secs,
+        })
+    }
 }
 
 #[async_trait]
@@ -228,373 +540,21 @@ where
     A: PipelineAgent + Sync + Send,
 {
     async fn process(&self, _: &'a ()) -> Result<Vec<LiquidationOutcome>, String> {
-        // Load pending entries from WAL
         let rows = self.wal.get_pending(100).await.map_err(|e| e.to_string())?;
         debug!("Finalizing rows {:?}", rows);
-        if rows.is_empty() {
-            return Ok(vec![]);
-        }
 
-        // Decode all receipts and build mappings:
-        // - liq_id -> wal_row_id
-        // - liq_id -> created_at
-        // Then collect receipts for per-receipt processing.
-        let mut wal_id_by_liq: HashMap<u128, String> = HashMap::new();
-        let mut created_at_by_liq: HashMap<u128, i64> = HashMap::new();
-        let mut updated_at_by_liq: HashMap<u128, i64> = HashMap::new();
-        let mut status_by_liq: HashMap<u128, ResultStatus> = HashMap::new();
-        let mut error_count_by_liq: HashMap<u128, i32> = HashMap::new();
-        let mut receipts: Vec<ExecutionReceipt> = vec![];
-
-        for row in rows {
-            let decoded = decode_receipt_wrapper(&row)
-                .and_then(|meta| meta.ok_or_else(|| format!("receipt not found in WAL meta_json for {}", row.id)));
-            let meta = match decoded {
-                Ok(meta) => meta,
-                Err(error) => {
-                    self.quarantine_row(&row.id, error).await;
-                    continue;
-                }
-            };
-            let receipt: ExecutionReceipt = meta.receipt;
-
-            let Some(liq) = receipt.liquidation_result.as_ref() else {
-                self.quarantine_row(&row.id, format!("missing liquidation_result for WAL id {}", row.id))
-                    .await;
-                continue;
-            };
-
-            let liq_id = liq.id;
-            wal_id_by_liq.insert(liq_id, row.id.clone());
-            created_at_by_liq.insert(liq_id, row.created_at);
-            updated_at_by_liq.insert(liq_id, row.updated_at);
-            status_by_liq.insert(liq_id, row.status);
-            error_count_by_liq.insert(liq_id, row.error_count);
-
-            receipts.push(receipt);
-        }
-
-        let mut fin_results: Vec<(FinalizerResult, ExecutionReceipt)> = vec![];
-
-        // Run each receipt independently (no batching).
-        for receipt in receipts {
-            let mut receipt = receipt;
-            let liq = receipt
-                .liquidation_result
-                .as_ref()
-                .ok_or_else(|| "missing liquidation_result in receipt".to_string())?;
-            let liq_id = liq.id;
-
-            if !matches!(liq.collateral_tx.status, TransferStatus::Success) {
-                match get_liquidation(self.agent.as_ref(), &self.lending_canister, liq_id).await {
-                    Ok(fresh) => {
-                        if fresh != *liq {
-                            receipt.liquidation_result = Some(fresh.clone());
-                            if matches!(receipt.status, ExecutionStatus::CollateralTransferFailed(_))
-                                && matches!(fresh.collateral_tx.status, TransferStatus::Success)
-                            {
-                                receipt.status = ExecutionStatus::Success;
-                            }
-                            if let Some(wal_id) = wal_id_by_liq.get(&liq_id)
-                                && let Err(err) = self.update_receipt_meta(wal_id, &receipt).await
-                            {
-                                warn!("Failed to update WAL meta for liq_id {}: {}", liq_id, err);
-                            }
-                        }
-                    }
-                    Err(err) => {
-                        warn!("[finalize] get_liquidation failed liq_id={} err={}", liq_id, err);
-                    }
-                }
-            }
-
-            let liq = receipt
-                .liquidation_result
-                .as_ref()
-                .ok_or_else(|| "missing liquidation_result in receipt".to_string())?;
-
-            if !matches!(liq.collateral_tx.status, TransferStatus::Success) {
-                info!(
-                    "[finalize] ⏳ collateral_tx status={:?} liq_id={}",
-                    liq.collateral_tx.status, liq_id
-                );
-                continue;
-            }
-
-            debug!(
-                "[finalize] 🧾 executing receipt: liq_id={} debt_asset={} collateral_asset={} debt_repaid={} collateral_received={} swap={} swap_pay={} swap_recv={}",
-                liq_id,
-                receipt.request.debt_asset.symbol(),
-                receipt.request.collateral_asset.symbol(),
-                liq.amounts.debt_repaid,
-                liq.amounts.collateral_received,
-                receipt.request.swap_args.is_some(),
-                receipt.request.collateral_asset.symbol(),
-                receipt.request.debt_asset.symbol()
-            );
-
-            if receipt.request.swap_args.is_none() {
-                let wal_id = wal_id_by_liq
-                    .get(&liq_id)
-                    .ok_or_else(|| format!("missing WAL id for liquidation {}", liq_id))?;
-                if let Err(error) = wal_mark_succeeded(&*self.wal, wal_id).await {
-                    warn_outcome_deferred(liq_id, &error);
-                    continue;
-                }
-                fin_results.push((
-                    FinalizerResult {
-                        swap_result: None,
-                        finalized: true,
-                        operator_required: false,
-                        swapper: Some("none".to_string()),
-                        reason: None,
-                    },
-                    receipt,
-                ));
-                continue;
-            }
-
-            // Apply bounded retry backoff for retryable failures to avoid thrashing thin books.
-            if matches!(status_by_liq.get(&liq_id), Some(ResultStatus::FailedRetryable)) {
-                let recorded_errors = error_count_by_liq.get(&liq_id).copied().unwrap_or(1).max(1);
-                // Only a `NoRoute` row stays retryable past the budget, and it waits longer.
-                let delay_secs = if recorded_errors >= MAX_FINALIZER_ERRORS {
-                    NO_ROUTE_SLOW_RETRY_SECS
-                } else {
-                    retry_delay_secs(self.cex_retry_base_secs, self.cex_retry_max_secs, recorded_errors)
-                };
-                let last_update = updated_at_by_liq.get(&liq_id).copied().unwrap_or(0);
-                let due_at = last_update.saturating_add(delay_secs.min(i64::MAX as u64) as i64);
-                let now = now_ts();
-                if now < due_at {
-                    debug!(
-                        "[finalize] ⏳ retry backoff liq_id={} errors={} delay={}s remaining={}s",
-                        liq_id,
-                        recorded_errors,
-                        delay_secs,
-                        due_at.saturating_sub(now)
-                    );
-                    continue;
-                }
-            }
-
-            if let Some(wal_id) = wal_id_by_liq.get(&liq_id) {
-                wal_mark_inflight(&*self.wal, wal_id).await?;
-            }
-
-            // A panic in one row must not abort the batch. Without this the
-            // unwind escapes `process()` entirely, taking export, heartbeat and
-            // every remaining row with it -- and `tokio::time::timeout` does not
-            // catch panics, so a deterministic one would repeat every cycle.
-            let outcome = AssertUnwindSafe(self.finalizer.finalize(&*self.wal, receipt.clone()))
-                .catch_unwind()
-                .await
-                .unwrap_or_else(|panic| {
-                    let detail = panic
-                        .downcast_ref::<&str>()
-                        .map(|s| (*s).to_string())
-                        .or_else(|| panic.downcast_ref::<String>().cloned())
-                        .unwrap_or_else(|| "unknown panic".to_string());
-                    error!("[finalize] 💥 finalizer panicked liq_id={} detail={}", liq_id, detail);
-                    // A panic says nothing about whether a retry would succeed.
-                    Err(FinalizerError::Retryable(format!("finalizer panicked: {detail}")))
-                });
-
-            match outcome {
-                Ok(res) => {
-                    if res.operator_required {
-                        let wal_id = wal_id_by_liq
-                            .get(&liq_id)
-                            .ok_or_else(|| format!("missing WAL id for liquidation {}", liq_id))?;
-                        if let Err(error) = wal_mark_operator_required(&*self.wal, wal_id).await {
-                            warn!("Failed to park operator-required WAL row {}: {}", wal_id, error);
-                        } else {
-                            warn!(
-                                "[finalize] operator reconciliation required liq_id={} reason={}",
-                                liq_id,
-                                res.reason.as_deref().unwrap_or("unspecified")
-                            );
-                        }
-                    } else if res.finalized {
-                        let wal_id = wal_id_by_liq
-                            .get(&liq_id)
-                            .ok_or_else(|| format!("missing WAL id for liquidation {}", liq_id))?;
-
-                        if let Err(error) = wal_mark_succeeded(&*self.wal, wal_id).await {
-                            warn_outcome_deferred(liq_id, &error);
-                            continue;
-                        }
-                        fin_results.push((res.clone(), receipt));
-                    } else {
-                        let wal_id = wal_id_by_liq
-                            .get(&liq_id)
-                            .ok_or_else(|| format!("missing WAL id for liquidation {}", liq_id))?;
-
-                        if let Err(error) = wal_mark_enqueued(&*self.wal, wal_id).await {
-                            warn!("Failed to re-enqueue unfinished WAL row {}: {}", wal_id, error);
-                        }
-                    }
-                }
-                Err(error) => {
-                    let base_errors = error_count_by_liq.get(&liq_id).copied().unwrap_or(0);
-                    let next_errors = base_errors + 1;
-                    let err_msg = error.message().to_string();
-
-                    let wal_id = wal_id_by_liq
-                        .get(&liq_id)
-                        .ok_or_else(|| format!("missing WAL id for liquidation {}", liq_id))?;
-
-                    warn!(
-                        "[finalize] finalization failed liq_id={} kind={} attempt={} err={}",
-                        liq_id,
-                        error.kind(),
-                        next_errors,
-                        err_msg
-                    );
-                    if matches!(error, FinalizerError::Unresumable(_)) {
-                        // This build cannot read the committed row. The
-                        // liquidation is not wrong, so it must not be failed:
-                        // park it where an operator can see it, exactly as
-                        // startup does for the same condition.
-                        if let Err(mark_error) =
-                            wal_mark_unresumable(&*self.wal, wal_id, err_msg.clone()).await
-                        {
-                            warn!("Failed to park unresumable WAL row {}: {}", wal_id, mark_error);
-                        }
-                        error!(
-                            "[finalize] 🅿️ committed row cannot be resumed by this build; parked for operator liq_id={} err={}",
-                            liq_id, err_msg
-                        );
-                        self.escalate_custody_park(&receipt, liq_id, &err_msg).await;
-                    } else if matches!(error, FinalizerError::BadDebtAmountFloor(_))
-                        && receipt.request.liquidation.buy_bad_debt
-                    {
-                        if let Err(error) = wal_mark_succeeded(&*self.wal, wal_id).await {
-                            warn_outcome_deferred(liq_id, &error);
-                            continue;
-                        }
-
-                        fin_results.push((
-                            FinalizerResult {
-                                swap_result: None,
-                                finalized: true,
-                                operator_required: false,
-                                swapper: None,
-                                reason: Some(format!("bad debt finalizer amount floor accepted: {}", err_msg)),
-                            },
-                            receipt.clone(),
-                        ));
-                    } else if matches!(error, FinalizerError::VenueCustody(_)) && next_errors >= MAX_FINALIZER_ERRORS {
-                        // The retry budget is spent, but a venue leg may still
-                        // hold this liquidation's funds. Failing permanently
-                        // would drop the row out of the runnable queue and
-                        // leave that custody with nothing tracking it, so park
-                        // it for an operator instead. Parking is terminal until
-                        // someone requeues the row, which is deliberate: the
-                        // venue side has to be understood before a retry.
-                        if let Err(error) =
-                            wal_mark_operator_required_with_error(&*self.wal, wal_id, err_msg.clone()).await
-                        {
-                            warn!("Failed to park custody-holding WAL row {}: {}", wal_id, error);
-                            self.escalate_custody_park(&receipt, liq_id, &err_msg).await;
-                        } else {
-                            error!(
-                                "[finalize] 🅿️ retry budget exhausted while a venue leg holds funds; parked for operator liq_id={} err={}",
-                                liq_id, err_msg
-                            );
-                            // A parked row produces no finalized outcome, so it
-                            // reaches neither the CSV export nor the
-                            // liquidation-finalized notification. Without this
-                            // the only trace of stranded custody is a log line.
-                            self.escalate_custody_park(&receipt, liq_id, &err_msg).await;
-                        }
-                    } else if matches!(error, FinalizerError::NoRoute(_)) && next_errors >= MAX_FINALIZER_ERRORS {
-                        // The collateral is still ours, and most causes pass: a venue outage, a thin book, a
-                        // price spike. So the row stays queued at a slow pace, with one alert (audit L17).
-                        if let Err(error) = wal_mark_retryable_failed(&*self.wal, wal_id, err_msg.clone()).await {
-                            warn!("Failed to mark WAL row {} for a slow retry: {}", wal_id, error);
-                        }
-                        if next_errors == MAX_FINALIZER_ERRORS {
-                            self.escalate_slow_retry(&receipt, liq_id, &err_msg).await;
-                        }
-                    } else if matches!(
-                        error,
-                        FinalizerError::Permanent(_) | FinalizerError::BadDebtAmountFloor(_)
-                    ) || next_errors >= MAX_FINALIZER_ERRORS
-                    {
-                        if let Err(error) = wal_mark_permanent_failed(&*self.wal, wal_id, err_msg.clone()).await {
-                            warn_outcome_deferred(liq_id, &error);
-                            continue;
-                        }
-
-                        let mut failed_receipt = receipt.clone();
-                        failed_receipt.status =
-                            ExecutionStatus::SwapFailed(format!("finalizer permanent failure: {}", err_msg));
-
-                        fin_results.push((
-                            FinalizerResult {
-                                swap_result: None,
-                                finalized: true,
-                                operator_required: false,
-                                swapper: None,
-                                reason: Some(err_msg.clone()),
-                            },
-                            failed_receipt,
-                        ));
-                    } else if let Err(error) = wal_mark_retryable_failed(&*self.wal, wal_id, err_msg.clone()).await {
-                        warn!("Failed to mark WAL row {} retryable: {}", wal_id, error);
-                    }
-
-                    debug!("Finalization failed for receipt; continuing: {}", err_msg);
-                }
+        // Each row runs on its own. Outcomes are built after the whole batch.
+        let mut finished = vec![];
+        for (row, receipt) in self.decode_rows(rows).await {
+            if let Some(done) = self.finalize_row(&row, receipt).await? {
+                finished.push((row, done));
             }
         }
 
-        let mut outcomes = vec![];
-
-        for (fin_res, receipt) in fin_results {
-            let req = &receipt.request;
-            let liq = receipt
-                .liquidation_result
-                .as_ref()
-                .ok_or_else(|| format!("missing liquidation_result for request: {:?}", req))?;
-
-            let round_trip_secs = if fin_res.finalized {
-                created_at_by_liq
-                    .get(&liq.id)
-                    .map(|created| now_ts().saturating_sub(*created))
-            } else {
-                None
-            };
-
-            let expected_profit = self.profit_calc.expected(req, Some(liq));
-            let realized_profit = self.profit_calc.realized(req, liq, fin_res.swap_result.as_ref());
-
-            if let Some(wal_id) = wal_id_by_liq.get(&liq.id) {
-                if let Err(err) = self
-                    .persist_profit_snapshot(wal_id, &receipt, expected_profit, realized_profit)
-                    .await
-                {
-                    warn!("Failed to persist WAL profit snapshot for liq_id {}: {}", liq.id, err);
-                }
-            } else {
-                warn!(
-                    "Skipping WAL profit snapshot persistence: missing WAL id for liq_id {}",
-                    liq.id
-                );
-            }
-
-            outcomes.push(LiquidationOutcome {
-                request: req.clone(),
-                execution_receipt: receipt.clone(),
-                finalizer_result: fin_res.clone(),
-                status: receipt.status.clone(),
-                expected_profit,
-                realized_profit,
-                round_trip_secs,
-            });
+        let mut outcomes = Vec::with_capacity(finished.len());
+        for (row, (result, receipt)) in finished {
+            outcomes.push(self.record_outcome(&row, result, receipt).await?);
         }
-
         Ok(outcomes)
     }
 }
@@ -697,6 +657,22 @@ mod tests {
         }
     }
 
+    /// A stage with the default test tunables and an agent that is never called.
+    fn test_stage<F: Finalizer>(
+        wal: MockWalStore,
+        finalizer: F,
+    ) -> FinalizeStage<F, MockWalStore, SimpleProfitCalculator, MockPipelineAgent> {
+        FinalizeStage::new(
+            Arc::new(wal),
+            Arc::new(finalizer),
+            Arc::new(SimpleProfitCalculator),
+            Arc::new(MockPipelineAgent::new()),
+            Principal::anonymous(),
+            5,
+            120,
+        )
+    }
+
     fn make_request() -> ExecutorRequest {
         let debt_asset = ChainToken::Icp {
             ledger: Principal::anonymous(),
@@ -786,14 +762,7 @@ mod tests {
             updated_at: 0,
             meta_json: "{}".to_string(),
         };
-        let wrapper = LiqMetaWrapper {
-            receipt,
-            meta: Vec::new(),
-            finalizer_decision: None,
-            profit_snapshot: None,
-            venue_execution: None,
-            meta_v2: None,
-        };
+        let wrapper = LiqMetaWrapper::new(receipt);
         encode_meta(&mut row, &wrapper).expect("encode_meta should succeed");
         row
     }
@@ -846,15 +815,7 @@ mod tests {
         wal.expect_upsert_result().times(1).returning(|_| Ok(()));
 
         let calls = Arc::new(Mutex::new(0usize));
-        let stage = FinalizeStage::new(
-            Arc::new(wal),
-            Arc::new(NoopFinalizer { calls: calls.clone() }),
-            Arc::new(SimpleProfitCalculator),
-            Arc::new(MockPipelineAgent::new()),
-            Principal::anonymous(),
-            5,
-            120,
-        );
+        let stage = test_stage(wal, NoopFinalizer { calls: calls.clone() });
 
         let outcomes = stage.process(&()).await.expect("valid row should still finalize");
 
@@ -885,15 +846,7 @@ mod tests {
             .times(1)
             .returning(|_, _, _| Ok(()));
 
-        let stage = FinalizeStage::new(
-            Arc::new(wal),
-            Arc::new(OperatorRequiredFinalizer),
-            Arc::new(SimpleProfitCalculator),
-            Arc::new(MockPipelineAgent::new()),
-            Principal::anonymous(),
-            5,
-            120,
-        );
+        let stage = test_stage(wal, OperatorRequiredFinalizer);
 
         let outcomes = stage.process(&()).await.expect("operator row should park cleanly");
         assert!(outcomes.is_empty());
@@ -931,16 +884,11 @@ mod tests {
             .returning(|_, _, _, _| Ok(()));
 
         let watchdog = Arc::new(RecordingWatchdog::default());
-        let stage = FinalizeStage::new(
-            Arc::new(wal),
-            Arc::new(ErrorFinalizer {
+        let stage = test_stage(
+            wal,
+            ErrorFinalizer {
                 error: FinalizerError::VenueCustody("venue still holds the input".to_string()),
-            }),
-            Arc::new(SimpleProfitCalculator),
-            Arc::new(MockPipelineAgent::new()),
-            Principal::anonymous(),
-            5,
-            120,
+            },
         )
         .with_watchdog(watchdog.clone());
 
@@ -983,16 +931,11 @@ mod tests {
             .returning(|_, _, _, _| Err(anyhow::anyhow!("WAL unavailable")));
 
         let watchdog = Arc::new(RecordingWatchdog::default());
-        let stage = FinalizeStage::new(
-            Arc::new(wal),
-            Arc::new(ErrorFinalizer {
+        let stage = test_stage(
+            wal,
+            ErrorFinalizer {
                 error: FinalizerError::VenueCustody("venue still holds the input".to_string()),
-            }),
-            Arc::new(SimpleProfitCalculator),
-            Arc::new(MockPipelineAgent::new()),
-            Principal::anonymous(),
-            5,
-            120,
+            },
         )
         .with_watchdog(watchdog.clone());
 
@@ -1037,16 +980,11 @@ mod tests {
             .returning(|_, _, _, _| Ok(()));
 
         let watchdog = Arc::new(RecordingWatchdog::default());
-        let stage = FinalizeStage::new(
-            Arc::new(wal),
-            Arc::new(ErrorFinalizer {
+        let stage = test_stage(
+            wal,
+            ErrorFinalizer {
                 error: FinalizerError::VenueCustody("venue still holds the input".to_string()),
-            }),
-            Arc::new(SimpleProfitCalculator),
-            Arc::new(MockPipelineAgent::new()),
-            Principal::anonymous(),
-            5,
-            120,
+            },
         )
         .with_watchdog(watchdog.clone());
 
@@ -1080,16 +1018,11 @@ mod tests {
             .returning(|_, _, _, _| Ok(()));
 
         let watchdog = Arc::new(RecordingWatchdog::default());
-        let stage = FinalizeStage::new(
-            Arc::new(wal),
-            Arc::new(ErrorFinalizer {
+        let stage = test_stage(
+            wal,
+            ErrorFinalizer {
                 error: FinalizerError::NoRoute("no viable ICPSwap-first route: MEXC unavailable".to_string()),
-            }),
-            Arc::new(SimpleProfitCalculator),
-            Arc::new(MockPipelineAgent::new()),
-            Principal::anonymous(),
-            5,
-            120,
+            },
         )
         .with_watchdog(watchdog.clone());
 
@@ -1120,15 +1053,7 @@ mod tests {
             .return_once(move |_| Ok(vec![row]));
 
         let calls = Arc::new(Mutex::new(0usize));
-        let stage = FinalizeStage::new(
-            Arc::new(wal),
-            Arc::new(NoopFinalizer { calls: calls.clone() }),
-            Arc::new(SimpleProfitCalculator),
-            Arc::new(MockPipelineAgent::new()),
-            Principal::anonymous(),
-            5,
-            120,
-        );
+        let stage = test_stage(wal, NoopFinalizer { calls: calls.clone() });
 
         let outcomes = stage.process(&()).await.expect("waiting row is skipped");
         assert!(outcomes.is_empty());
@@ -1162,16 +1087,11 @@ mod tests {
             .times(1)
             .returning(|_, _, _| Err(anyhow::anyhow!("database locked")));
 
-        let stage = FinalizeStage::new(
-            Arc::new(wal),
-            Arc::new(NoopFinalizer {
+        let stage = test_stage(
+            wal,
+            NoopFinalizer {
                 calls: Arc::new(Mutex::new(0usize)),
-            }),
-            Arc::new(SimpleProfitCalculator),
-            Arc::new(MockPipelineAgent::new()),
-            Principal::anonymous(),
-            5,
-            120,
+            },
         );
 
         let outcomes = stage.process(&()).await.expect("a failed write is not a stage error");
@@ -1237,16 +1157,11 @@ mod tests {
             .returning(move |_| Ok(Some(row_for_profit.clone())));
         wal.expect_upsert_result().times(1).returning(|_| Ok(()));
 
-        let stage = FinalizeStage::new(
-            Arc::new(wal),
-            Arc::new(ErrorFinalizer {
+        let stage = test_stage(
+            wal,
+            ErrorFinalizer {
                 error: FinalizerError::BadDebtAmountFloor(err),
-            }),
-            Arc::new(SimpleProfitCalculator),
-            Arc::new(MockPipelineAgent::new()),
-            Principal::anonymous(),
-            5,
-            120,
+            },
         );
 
         let outcomes = stage.process(&()).await.expect("process should succeed");
@@ -1292,16 +1207,11 @@ mod tests {
             .returning(move |_| Ok(Some(row_for_profit.clone())));
         wal.expect_upsert_result().times(1).returning(|_| Ok(()));
 
-        let stage = FinalizeStage::new(
-            Arc::new(wal),
-            Arc::new(ErrorFinalizer {
+        let stage = test_stage(
+            wal,
+            ErrorFinalizer {
                 error: FinalizerError::BadDebtAmountFloor(err.clone()),
-            }),
-            Arc::new(SimpleProfitCalculator),
-            Arc::new(MockPipelineAgent::new()),
-            Principal::anonymous(),
-            5,
-            120,
+            },
         );
 
         let outcomes = stage.process(&()).await.expect("process should succeed");
@@ -1349,16 +1259,11 @@ mod tests {
         wal.expect_get_result().times(0);
         wal.expect_upsert_result().times(0);
 
-        let stage = FinalizeStage::new(
-            Arc::new(wal),
-            Arc::new(ErrorFinalizer {
+        let stage = test_stage(
+            wal,
+            ErrorFinalizer {
                 error: FinalizerError::Retryable(err),
-            }),
-            Arc::new(SimpleProfitCalculator),
-            Arc::new(MockPipelineAgent::new()),
-            Principal::anonymous(),
-            5,
-            120,
+            },
         );
 
         let outcomes = stage.process(&()).await.expect("process should succeed");
@@ -1688,16 +1593,11 @@ mod tests {
             Ok(())
         });
 
-        let stage = FinalizeStage::new(
-            Arc::new(wal),
-            Arc::new(NoopFinalizer {
+        let stage = test_stage(
+            wal,
+            NoopFinalizer {
                 calls: Arc::new(Mutex::new(0)),
-            }),
-            Arc::new(SimpleProfitCalculator),
-            Arc::new(MockPipelineAgent::new()),
-            Principal::anonymous(),
-            5,
-            120,
+            },
         );
 
         stage
@@ -1743,16 +1643,11 @@ mod tests {
             Ok(())
         });
 
-        let stage = FinalizeStage::new(
-            Arc::new(wal),
-            Arc::new(NoopFinalizer {
+        let stage = test_stage(
+            wal,
+            NoopFinalizer {
                 calls: Arc::new(Mutex::new(0)),
-            }),
-            Arc::new(SimpleProfitCalculator),
-            Arc::new(MockPipelineAgent::new()),
-            Principal::anonymous(),
-            5,
-            120,
+            },
         );
 
         let outcomes = stage.process(&()).await.expect("process should succeed");
@@ -1806,16 +1701,11 @@ mod tests {
             Ok(())
         });
 
-        let stage = FinalizeStage::new(
-            Arc::new(wal),
-            Arc::new(ErrorFinalizer {
+        let stage = test_stage(
+            wal,
+            ErrorFinalizer {
                 error: FinalizerError::Permanent("permanent multi-venue finalizer: no route".to_string()),
-            }),
-            Arc::new(SimpleProfitCalculator),
-            Arc::new(MockPipelineAgent::new()),
-            Principal::anonymous(),
-            5,
-            120,
+            },
         );
 
         let outcomes = stage.process(&()).await.expect("process should succeed");

@@ -5,11 +5,9 @@ use tracing::instrument;
 use tracing::{info, warn};
 
 use crate::liquidation::lending_queries::get_liquidation;
-use crate::persistance::{LiqMetaWrapper, LiqResultRecord, ResultStatus, WalStore};
+use crate::persistance::{LiqResultRecord, ResultStatus, WalStore};
 use crate::stages::executor::ExecutionReceipt;
-use crate::stages::executor::ExecutionStatus;
-use crate::utils::now_ts;
-use crate::wal::{decode_receipt_wrapper, encode_meta};
+use crate::wal::{decode_receipt_wrapper, wal_save_receipt};
 use liquidium_pipeline_connectors::pipeline_agent::PipelineAgent;
 use liquidium_pipeline_core::types::protocol_types::TransferStatus;
 
@@ -88,31 +86,21 @@ where
             .ok_or_else(|| format!("receipt not found in WAL meta_json for {}", row.id))?;
         let mut receipt: ExecutionReceipt = meta.receipt;
 
-        let liq = receipt
+        let liq_id = receipt
             .liquidation_result
             .as_ref()
-            .ok_or_else(|| format!("missing liquidation_result for WAL id {}", row.id))?;
+            .ok_or_else(|| format!("missing liquidation_result for WAL id {}", row.id))?
+            .id;
 
-        let fresh = match get_liquidation(self.agent.as_ref(), &self.lending_canister, liq.id).await {
+        let fresh = match get_liquidation(self.agent.as_ref(), &self.lending_canister, liq_id).await {
             Ok(liq) => liq,
             Err(err) => {
-                warn!("[settlement] get_liquidation failed liq_id={} err={}", liq.id, err);
+                warn!("[settlement] get_liquidation failed liq_id={} err={}", liq_id, err);
                 return Ok(());
             }
         };
 
-        let mut updated = false;
-        if fresh != *liq {
-            receipt.liquidation_result = Some(fresh.clone());
-            updated = true;
-        }
-        if matches!(fresh.collateral_tx.status, TransferStatus::Success)
-            && matches!(receipt.status, ExecutionStatus::CollateralTransferFailed(_))
-        {
-            receipt.status = ExecutionStatus::Success;
-            updated = true;
-        }
-        if updated {
+        if receipt.apply_pool_view(fresh) {
             let touch_meta = row.status != ResultStatus::WaitingProfit;
             self.update_receipt_meta(&row, &receipt, touch_meta).await?;
         }
@@ -148,22 +136,7 @@ where
         receipt: &ExecutionReceipt,
         touch: bool,
     ) -> Result<(), String> {
-        let mut row = row.clone();
-        let mut wrapper = decode_receipt_wrapper(&row)?.unwrap_or(LiqMetaWrapper {
-            receipt: receipt.clone(),
-            meta: Vec::new(),
-            finalizer_decision: None,
-            profit_snapshot: None,
-            venue_execution: None,
-            meta_v2: None,
-        });
-        wrapper.receipt = receipt.clone();
-        encode_meta(&mut row, &wrapper)?;
-        if touch {
-            row.updated_at = now_ts();
-        }
-        self.wal.upsert_result(row).await.map_err(|e| e.to_string())?;
-        Ok(())
+        wal_save_receipt(&*self.wal, row.clone(), receipt, touch).await
     }
 }
 
@@ -177,6 +150,8 @@ mod tests {
     };
     use crate::stages::executor::ExecutionStatus;
     use crate::swappers::model::SwapRequest;
+    use crate::utils::now_ts;
+    use crate::wal::encode_meta;
     use candid::{Encode, Nat};
     use liquidium_pipeline_connectors::pipeline_agent::MockPipelineAgent;
     use liquidium_pipeline_core::tokens::asset_id::AssetId;
@@ -266,6 +241,18 @@ mod tests {
         }
     }
 
+    /// One tick's first pages: these collateral rows and these profit rows.
+    fn expect_pages(wal: &mut MockWalStore, collateral: Vec<LiqResultRecord>, profit: Vec<LiqResultRecord>) {
+        wal.expect_list_by_status_after()
+            .with(eq(ResultStatus::WaitingCollateral), eq(None), eq(SETTLEMENT_PAGE_SIZE))
+            .times(1)
+            .return_once(move |_, _, _| Ok(collateral));
+        wal.expect_list_by_status_after()
+            .with(eq(ResultStatus::WaitingProfit), eq(None), eq(SETTLEMENT_PAGE_SIZE))
+            .times(1)
+            .return_once(move |_, _, _| Ok(profit));
+    }
+
     fn make_row(status: ResultStatus, receipt: ExecutionReceipt) -> LiqResultRecord {
         let mut row = LiqResultRecord {
             id: receipt.liquidation_result.as_ref().unwrap().id.to_string(),
@@ -277,14 +264,7 @@ mod tests {
             updated_at: now_ts(),
             meta_json: "{}".to_string(),
         };
-        let wrapper = LiqMetaWrapper {
-            receipt,
-            meta: Vec::new(),
-            finalizer_decision: None,
-            profit_snapshot: None,
-            venue_execution: None,
-            meta_v2: None,
-        };
+        let wrapper = LiqMetaWrapper::new(receipt);
         encode_meta(&mut row, &wrapper).expect("encode_meta should succeed");
         row
     }
@@ -303,14 +283,7 @@ mod tests {
         let row_id = row.id.clone();
 
         let mut wal = MockWalStore::new();
-        wal.expect_list_by_status_after()
-            .with(eq(ResultStatus::WaitingCollateral), eq(None), eq(SETTLEMENT_PAGE_SIZE))
-            .times(1)
-            .returning(move |_, _, _| Ok(vec![row.clone()]));
-        wal.expect_list_by_status_after()
-            .with(eq(ResultStatus::WaitingProfit), eq(None), eq(SETTLEMENT_PAGE_SIZE))
-            .times(1)
-            .returning(|_, _, _| Ok(vec![]));
+        expect_pages(&mut wal, vec![row], vec![]);
         wal.expect_upsert_result().times(0);
         wal.expect_update_status()
             .with(eq(row_id.clone()), eq(ResultStatus::Enqueued), eq(true))
@@ -345,14 +318,7 @@ mod tests {
         let row_id = row.id.clone();
 
         let mut wal = MockWalStore::new();
-        wal.expect_list_by_status_after()
-            .with(eq(ResultStatus::WaitingCollateral), eq(None), eq(SETTLEMENT_PAGE_SIZE))
-            .times(1)
-            .returning(move |_, _, _| Ok(vec![row.clone()]));
-        wal.expect_list_by_status_after()
-            .with(eq(ResultStatus::WaitingProfit), eq(None), eq(SETTLEMENT_PAGE_SIZE))
-            .times(1)
-            .returning(|_, _, _| Ok(vec![]));
+        expect_pages(&mut wal, vec![row], vec![]);
         wal.expect_upsert_result().times(0);
         wal.expect_update_status()
             .with(eq(row_id.clone()), eq(ResultStatus::Enqueued), eq(true))
@@ -388,14 +354,7 @@ mod tests {
         let row_id = row.id.clone();
 
         let mut wal = MockWalStore::new();
-        wal.expect_list_by_status_after()
-            .with(eq(ResultStatus::WaitingCollateral), eq(None), eq(SETTLEMENT_PAGE_SIZE))
-            .times(1)
-            .returning(move |_, _, _| Ok(vec![row.clone()]));
-        wal.expect_list_by_status_after()
-            .with(eq(ResultStatus::WaitingProfit), eq(None), eq(SETTLEMENT_PAGE_SIZE))
-            .times(1)
-            .returning(|_, _, _| Ok(vec![]));
+        expect_pages(&mut wal, vec![row], vec![]);
         wal.expect_update_status()
             .with(eq(row_id), eq(ResultStatus::Enqueued), eq(true))
             .times(1)
@@ -484,14 +443,7 @@ mod tests {
         let row_id = row.id.clone();
 
         let mut wal = MockWalStore::new();
-        wal.expect_list_by_status_after()
-            .with(eq(ResultStatus::WaitingCollateral), eq(None), eq(SETTLEMENT_PAGE_SIZE))
-            .times(1)
-            .returning(move |_, _, _| Ok(vec![row.clone()]));
-        wal.expect_list_by_status_after()
-            .with(eq(ResultStatus::WaitingProfit), eq(None), eq(SETTLEMENT_PAGE_SIZE))
-            .times(1)
-            .returning(|_, _, _| Ok(vec![]));
+        expect_pages(&mut wal, vec![row], vec![]);
         wal.expect_upsert_result().times(0);
         wal.expect_update_status()
             .with(eq(row_id.clone()), eq(ResultStatus::Enqueued), eq(true))
@@ -531,14 +483,7 @@ mod tests {
         let row_id = row.id.clone();
 
         let mut wal = MockWalStore::new();
-        wal.expect_list_by_status_after()
-            .with(eq(ResultStatus::WaitingCollateral), eq(None), eq(SETTLEMENT_PAGE_SIZE))
-            .times(1)
-            .returning(|_, _, _| Ok(vec![]));
-        wal.expect_list_by_status_after()
-            .with(eq(ResultStatus::WaitingProfit), eq(None), eq(SETTLEMENT_PAGE_SIZE))
-            .times(1)
-            .returning(move |_, _, _| Ok(vec![row.clone()]));
+        expect_pages(&mut wal, vec![], vec![row]);
         wal.expect_update_status()
             .with(eq(row_id.clone()), eq(ResultStatus::Enqueued), eq(true))
             .times(1)

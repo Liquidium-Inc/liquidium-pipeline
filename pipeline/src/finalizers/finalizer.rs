@@ -58,6 +58,18 @@ pub struct FinalizerResult {
 }
 
 impl FinalizerResult {
+    /// A finished liquidation with no swap result: no swap was needed, or the
+    /// stage accepted a failure as final.
+    pub fn finished_without_swap(swapper: Option<String>, reason: Option<String>) -> Self {
+        Self {
+            swap_result: None,
+            finalized: true,
+            operator_required: false,
+            swapper,
+            reason,
+        }
+    }
+
     pub fn noop() -> Self {
         Self {
             swap_result: None,

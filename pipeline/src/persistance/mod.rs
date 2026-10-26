@@ -62,6 +62,20 @@ pub struct LiqMetaWrapper {
     pub meta_v2: Option<FinalizerMetaV2>,
 }
 
+impl LiqMetaWrapper {
+    /// A wrapper that holds only the receipt, as an accepted liquidation starts.
+    pub fn new(receipt: ExecutionReceipt) -> Self {
+        Self {
+            receipt,
+            meta: Vec::new(),
+            finalizer_decision: None,
+            profit_snapshot: None,
+            venue_execution: None,
+            meta_v2: None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct VenueExecutionState {
     pub venue: String,

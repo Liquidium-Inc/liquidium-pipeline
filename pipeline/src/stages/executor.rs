@@ -51,6 +51,24 @@ pub struct ExecutionReceipt {
     pub change_received: bool,
 }
 
+impl ExecutionReceipt {
+    /// Takes the pool's current view of the liquidation. A collateral transfer
+    /// that has landed clears its earlier failure. Returns whether anything changed.
+    pub fn apply_pool_view(&mut self, fresh: LiquidationResult) -> bool {
+        let collateral_landed = matches!(fresh.collateral_tx.status, TransferStatus::Success);
+        let mut changed = false;
+        if self.liquidation_result.as_ref() != Some(&fresh) {
+            self.liquidation_result = Some(fresh);
+            changed = true;
+        }
+        if collateral_landed && matches!(self.status, ExecutionStatus::CollateralTransferFailed(_)) {
+            self.status = ExecutionStatus::Success;
+            changed = true;
+        }
+        changed
+    }
+}
+
 #[async_trait]
 impl<'a, A: PipelineAgent, D: LiquidationIntentStore> PipelineStage<'a, Vec<ExecutorRequest>, Vec<ExecutionReceipt>>
     for BasicExecutor<A, D>
