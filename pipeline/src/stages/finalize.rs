@@ -481,14 +481,8 @@ where
                     .await;
                 None
             }
-            FinalizerError::NoRoute(_) if exhausted => {
-                self.retry_slowly(row, liq_id, attempt, &receipt, &err_msg).await;
-                None
-            }
             FinalizerError::NoRoute(_) => {
-                if let Err(error) = wal_mark_no_route(&*self.wal, &row.id, err_msg).await {
-                    warn!("Failed to mark WAL row {} retryable: {}", row.id, error);
-                }
+                self.retry_no_route(row, liq_id, attempt, &receipt, &err_msg).await;
                 None
             }
             FinalizerError::Permanent(_) | FinalizerError::BadDebtAmountFloor(_) => {
@@ -533,9 +527,10 @@ where
         self.escalate_custody_park(receipt, liq_id, reason, err_msg).await;
     }
 
-    /// The collateral is still ours, and most causes pass: a venue outage, a thin book, a
-    /// price spike. So the row stays queued at a slow pace, with one alert (audit L17).
-    async fn retry_slowly(
+    /// The collateral is still ours, and most causes pass: a venue outage, a thin
+    /// book, a price spike. So the row keeps retrying, at a slow pace once its
+    /// budget is spent, with one alert then (audit L17).
+    async fn retry_no_route(
         &self,
         row: &LiqResultRecord,
         liq_id: u128,
@@ -544,7 +539,7 @@ where
         err_msg: &str,
     ) {
         if let Err(error) = wal_mark_no_route(&*self.wal, &row.id, err_msg.to_string()).await {
-            warn!("Failed to mark WAL row {} for a slow retry: {}", row.id, error);
+            warn!("Failed to mark WAL row {} for a retry: {}", row.id, error);
         }
         if attempt == MAX_FINALIZER_ERRORS {
             self.escalate_slow_retry(receipt, liq_id, err_msg).await;
@@ -1523,21 +1518,6 @@ mod tests {
         assert!(outcomes[0].execution_receipt.change_received);
     }
 
-    /// A swap row whose collateral has settled.
-    fn settled_swap_row(liq_id: u128) -> LiqResultRecord {
-        let mut request = make_request();
-        request.swap_args = Some(make_swap_request(&request));
-        make_row(
-            liq_id,
-            ExecutionReceipt {
-                request,
-                liquidation_result: Some(make_liq_result(liq_id, TransferStatus::Success, 0)),
-                status: ExecutionStatus::Success,
-                change_received: true,
-            },
-        )
-    }
-
     /// One finalize cycle over `row`; returns how often the finalizer ran.
     async fn finalize_calls_for(row: LiqResultRecord, mut wal: MockWalStore) -> usize {
         wal.expect_get_pending().returning(move |_| Ok(vec![row.clone()]));
@@ -1551,7 +1531,7 @@ mod tests {
     /// strikes, so only the lifetime attempt budget can stop such a row.
     #[tokio::test]
     async fn finalize_parks_a_row_that_exhausts_its_lifetime_attempt_budget() {
-        let mut row = settled_swap_row(91);
+        let mut row = make_row(91, make_swapping_receipt(91));
         row.status = ResultStatus::Enqueued;
         row.attempt = MAX_FINALIZER_ATTEMPTS;
 
@@ -1573,7 +1553,7 @@ mod tests {
     /// The cap counts work, not waiting, so a patient healthy row keeps running.
     #[tokio::test]
     async fn finalize_does_not_park_a_long_running_row_that_has_not_failed() {
-        let mut row = settled_swap_row(92);
+        let mut row = make_row(92, make_swapping_receipt(92));
         row.status = ResultStatus::Enqueued;
         row.attempt = 1;
 
@@ -1593,7 +1573,7 @@ mod tests {
     /// by the attempt cap as soon as a route appears.
     #[tokio::test]
     async fn a_no_route_failure_is_a_strike_but_not_an_attempt() {
-        let mut row = settled_swap_row(93);
+        let mut row = make_row(93, make_swapping_receipt(93));
         row.status = ResultStatus::Enqueued;
 
         let mut wal = MockWalStore::new();
@@ -1626,15 +1606,7 @@ mod tests {
         const WAL_BATCH_LIMIT: usize = 100;
 
         let liq_id = LIQUIDATION_ID;
-        let mut request = make_request();
-        request.swap_args = Some(make_swap_request(&request));
-        let receipt = ExecutionReceipt {
-            request,
-            liquidation_result: Some(make_liq_result(liq_id, TransferStatus::Success, 0)),
-            status: ExecutionStatus::Success,
-            change_received: true,
-        };
-        let mut row = make_row(liq_id, receipt);
+        let mut row = make_row(liq_id, make_swapping_receipt(liq_id));
         row.status = ResultStatus::FailedRetryable;
         row.error_count = RECORDED_ERROR_COUNT;
         row.updated_at = now_ts();
@@ -1687,15 +1659,7 @@ mod tests {
         const EXPECTED_OUTCOME_COUNT: usize = 1;
 
         let liq_id = LIQUIDATION_ID;
-        let mut request = make_request();
-        request.swap_args = Some(make_swap_request(&request));
-        let receipt = ExecutionReceipt {
-            request,
-            liquidation_result: Some(make_liq_result(liq_id, TransferStatus::Success, 0)),
-            status: ExecutionStatus::Success,
-            change_received: true,
-        };
-        let mut row = make_row(liq_id, receipt);
+        let mut row = make_row(liq_id, make_swapping_receipt(liq_id));
         row.status = ResultStatus::FailedRetryable;
         row.error_count = RECORDED_ERROR_COUNT;
         row.updated_at = now_ts().saturating_sub(ALREADY_ELAPSED_WINDOW_SECS);

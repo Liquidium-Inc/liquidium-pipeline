@@ -71,11 +71,7 @@ impl MultiVenueFinalizer {
 
         // A budget parks the row while its legs still run. A release then
         // queues the whole row again.
-        let leg_parked = state
-            .legs
-            .iter()
-            .any(|leg| leg.status == VenueLegStatus::OperatorRequired);
-        if !leg_parked && answer.is_none() && request.leg_id.is_none() {
+        if !has_parked_leg(&state) && answer.is_none() && request.leg_id.is_none() {
             requeue(&mut row);
             self.persist_wrapper(wal, &mut row, &wrapper).await?;
             info!(liquidation_id = %row.id, "Operator released a parked row");
@@ -120,12 +116,7 @@ impl MultiVenueFinalizer {
         if let Some(error) = last_error {
             lines.push(format!("  last error: {error}"));
         }
-        if status == ResultStatus::OperatorRequired
-            && !state
-                .legs
-                .iter()
-                .any(|leg| leg.status == VenueLegStatus::OperatorRequired)
-        {
+        if status == ResultStatus::OperatorRequired && !has_parked_leg(state) {
             lines.push("  no leg is parked: --release queues the row again".to_string());
         }
         for leg in &state.legs {
@@ -156,6 +147,13 @@ impl MultiVenueFinalizer {
         lines.push(String::new());
         lines.join("\n")
     }
+}
+
+fn has_parked_leg(state: &MultiVenueExecutionState) -> bool {
+    state
+        .legs
+        .iter()
+        .any(|leg| leg.status == VenueLegStatus::OperatorRequired)
 }
 
 /// Queues a released row again. Old failures and attempts must not count

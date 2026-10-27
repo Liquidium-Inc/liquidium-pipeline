@@ -277,13 +277,7 @@ impl WalStore for SqliteWalStore {
         self.ensure_writable()?;
         let mut conn = self.get_conn()?;
         let now = now_secs();
-        let attempt_delta = if bump_attempt { 1 } else { 0 };
-        let current: Option<i32> = tbl::table
-            .find(liq_id.to_string())
-            .select(tbl::attempt)
-            .first::<i32>(&mut conn)
-            .optional()?;
-        let new_attempt = current.unwrap_or(0) + attempt_delta;
+        let new_attempt = tbl::attempt + i32::from(bump_attempt);
 
         // A row that reaches these without an error is moving again, so its
         // strikes restart. A claim (`InFlight`) proves nothing.
@@ -319,21 +313,13 @@ impl WalStore for SqliteWalStore {
         self.ensure_writable()?;
         let mut conn = self.get_conn()?;
         let now = now_secs();
-        let attempt_delta = if bump_attempt { 1 } else { 0 };
-        let current: Option<(i32, i32)> = tbl::table
-            .find(liq_id.to_string())
-            .select((tbl::attempt, tbl::error_count))
-            .first::<(i32, i32)>(&mut conn)
-            .optional()?;
-        let (cur_attempt, cur_error) = current.unwrap_or((0, 0));
-        let new_attempt = cur_attempt + attempt_delta;
-        let new_error_count = cur_error + 1;
 
+        // The counters change in the statement itself, so two writers cannot lose one.
         diesel::update(tbl::table.find(liq_id.to_string()))
             .set((
                 tbl::status.eq(next as i32),
-                tbl::attempt.eq(new_attempt),
-                tbl::error_count.eq(new_error_count),
+                tbl::attempt.eq(tbl::attempt + i32::from(bump_attempt)),
+                tbl::error_count.eq(tbl::error_count + 1),
                 tbl::last_error.eq(Some(last_error)),
                 tbl::updated_at.eq(now),
             ))

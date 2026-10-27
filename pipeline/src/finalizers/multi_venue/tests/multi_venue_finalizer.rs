@@ -225,36 +225,6 @@ impl BatchWal {
             .status
     }
 
-    fn set_status(&self, liquidation_id: u128, status: ResultStatus) {
-        self.rows
-            .lock()
-            .expect("batch WAL lock")
-            .iter_mut()
-            .find(|row| row.id == liquidation_id.to_string())
-            .expect("batch WAL row")
-            .status = status;
-    }
-
-    fn error_count(&self, liquidation_id: u128) -> i32 {
-        self.rows
-            .lock()
-            .expect("batch WAL lock")
-            .iter()
-            .find(|row| row.id == liquidation_id.to_string())
-            .expect("batch WAL row")
-            .error_count
-    }
-
-    fn set_error_count(&self, liquidation_id: u128, error_count: i32) {
-        self.rows
-            .lock()
-            .expect("batch WAL lock")
-            .iter_mut()
-            .find(|row| row.id == liquidation_id.to_string())
-            .expect("batch WAL row")
-            .error_count = error_count;
-    }
-
     fn row(&self, liquidation_id: u128) -> LiqResultRecord {
         self.rows
             .lock()
@@ -2113,7 +2083,7 @@ async fn reenqueuing_the_parent_row_does_not_rearm_an_operator_required_mexc_leg
     assert_eq!(wal.status(LIQUIDATION_ID), ResultStatus::OperatorRequired);
     assert_eq!(mexc.calls(), 1);
 
-    wal.set_status(LIQUIDATION_ID, ResultStatus::Enqueued);
+    wal.update_row(LIQUIDATION_ID, |row| row.status = ResultStatus::Enqueued);
     assert!(stage.process(&()).await.expect("polling cycle").is_empty());
     assert_eq!(wal.status(LIQUIDATION_ID), ResultStatus::OperatorRequired);
     assert_eq!(mexc.recovery_calls(), 0);
@@ -2163,14 +2133,18 @@ async fn reconcile_answers_a_parked_leg_and_queues_the_row_again() {
     assert!(error.contains("waits for an answer"), "{error}");
     assert_eq!(wal.status(LIQUIDATION_ID), ResultStatus::OperatorRequired);
 
-    wal.set_error_count(LIQUIDATION_ID, MAX_FINALIZER_ERRORS - 1);
+    wal.update_row(LIQUIDATION_ID, |row| row.error_count = MAX_FINALIZER_ERRORS - 1);
     let report = desk
         .reconcile(request(ReconcileAction::Answer(OperatorDecision::Absent)))
         .await
         .expect("answer");
     assert!(report.contains("queued again"), "{report}");
     assert_eq!(wal.status(LIQUIDATION_ID), ResultStatus::Enqueued);
-    assert_eq!(wal.error_count(LIQUIDATION_ID), 0, "a release starts a new error budget");
+    assert_eq!(
+        wal.row(LIQUIDATION_ID).error_count,
+        0,
+        "a release starts a new error budget"
+    );
 
     // The next finalize cycle advances the released leg.
     stage.process(&()).await.expect("released cycle");
@@ -2285,7 +2259,7 @@ async fn mexc_custody_row_exhausting_retries_parks_without_blocking_the_next_bat
         receipt_with_id(EXHAUSTED_ID),
         receipt_with_id(SUCCEEDING_ID),
     ]));
-    wal.set_error_count(EXHAUSTED_ID, MAX_FINALIZER_ERRORS - 1);
+    wal.update_row(EXHAUSTED_ID, |row| row.error_count = MAX_FINALIZER_ERRORS - 1);
     let mexc = Arc::new(
         ScriptedAdapter::new(
             MEXC_VENUE_ID,
