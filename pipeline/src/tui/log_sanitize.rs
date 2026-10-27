@@ -30,23 +30,11 @@ fn skip_escape_sequence(chars: &mut Peekable<Chars<'_>>) {
                 }
             }
         }
-        Some(']') => {
-            // OSC ... BEL or ST (ESC \)
-            chars.next();
+        Some(']' | 'P' | 'X' | '^' | '_') => {
+            // OSC ends at BEL or ST (ESC \); DCS, SOS, PM and APC end at ST only.
+            let bel_ends = chars.next() == Some(']');
             while let Some(c) = chars.next() {
-                if c == '\x07' {
-                    break;
-                }
-                if c == '\x1b' && chars.next_if_eq(&'\\').is_some() {
-                    break;
-                }
-            }
-        }
-        Some('P' | 'X' | '^' | '_') => {
-            // DCS/SOS/PM/APC ... ST (ESC \)
-            chars.next();
-            while let Some(c) = chars.next() {
-                if c == '\x1b' && chars.next_if_eq(&'\\').is_some() {
+                if (bel_ends && c == '\x07') || (c == '\x1b' && chars.next_if_eq(&'\\').is_some()) {
                     break;
                 }
             }

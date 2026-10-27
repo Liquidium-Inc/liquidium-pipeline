@@ -1,38 +1,29 @@
-use dialoguer::{Confirm, Input, Select, theme::ColorfulTheme};
-
-use std::collections::HashMap;
-use std::str::FromStr;
-use std::sync::Arc;
-
-use alloy::network::AnyNetwork;
+//! The `withdraw` command: an interactive wizard, or flags for scripts. Both
+//! build the same plan, and one path shows, confirms and sends it.
+use anyhow::{Result, anyhow, bail};
 use candid::{Decode, Encode, Nat, Principal};
-use ic_agent::Agent;
+use dialoguer::{Confirm, Input, Select, theme::ColorfulTheme};
 use icrc_ledger_types::icrc1::account::Account;
-
-use num_traits::ToPrimitive;
-
+use liquidium_pipeline_core::account::model::ChainAccount;
 use liquidium_pipeline_core::tokens::{
     asset_id::AssetId, chain_token::ChainToken, chain_token_amount::ChainTokenAmount,
 };
+use std::str::FromStr;
 
-use liquidium_pipeline_core::account::model::ChainAccount;
-
-use alloy::primitives::Address as EvmAddress;
-use alloy::providers::{Provider, ProviderBuilder};
-use alloy::signers::local::PrivateKeySigner;
-use anyhow::{Result, anyhow, bail};
-use solana_client::nonblocking::rpc_client::RpcClient;
-use solana_sdk::{message::Message, pubkey::Pubkey, signature::Keypair, signer::Signer};
-use solana_system_interface::instruction as system_instruction;
-
+use crate::commands::withdrawal::{
+    WithdrawDestination, WithdrawSource, destination_account, parse_typed_destination, withdraw_amount,
+};
 use crate::config::ConfigTrait;
 use crate::context::{PipelineContext, init_context};
 use crate::output::plain_logs_enabled;
 
-enum Destination {
-    Icp(Account),
-    Evm(String),
-    Solana(String),
+/// One transfer the command will send.
+struct Planned {
+    asset: AssetId,
+    amount: ChainTokenAmount,
+    to: ChainAccount,
+    /// The source balance before the send, for the operator to compare.
+    balance: String,
 }
 
 pub async fn withdraw() -> Result<()> {
@@ -44,745 +35,310 @@ pub async fn withdraw() -> Result<()> {
 
     let theme = ColorfulTheme::default();
     println!("\n=== Withdraw Wizard ===\n");
-
-    fn format_chain_balance(bal: &ChainTokenAmount) -> String {
-        let raw = bal.value.clone();
-        let decimals = bal.token.decimals() as u32;
-
-        if decimals == 0 {
-            return format!("{} {}", raw, bal.token.symbol());
-        }
-
-        let display_decimals = decimals.min(6);
-        let scale = 10u128.pow(decimals - display_decimals);
-        let scaled = raw / scale;
-
-        let int_part = scaled.clone() / 10u128.pow(display_decimals);
-        let frac_part = scaled % 10u128.pow(display_decimals);
-
-        let frac_clean = frac_part.to_string().replace('_', "");
-        let frac_str = format!("{:0>width$}", frac_clean, width = display_decimals as usize);
-
-        format!("{}.{} {}", int_part, frac_str, bal.token.symbol())
-    }
-
-    // Initialize pipeline context (config + registry + backends)
     let ctx = init_context()
         .await
         .map_err(|error| anyhow!("failed to init context: {error}"))?;
-    let config = ctx.config.clone();
 
-    // Step 1: Select account (Main | Trader | Recovery)
-    let account_choices = vec!["Main (Liquidator)", "Trader (Principal)", "Recovery (Trader)", "Bridge"];
-    let account_idx = Select::with_theme(&theme)
-        .with_prompt("Select source account")
-        .default(0)
-        .items(&account_choices)
-        .interact()
-        .unwrap();
-    let source_kind = match account_idx {
-        0 => "main",
-        1 => "trader",
-        2 => "recovery",
-        3 => "bridge",
-        _ => "main",
-    };
+    let sources = [
+        ("Main (Liquidator)", WithdrawSource::Main),
+        ("Trader (Principal)", WithdrawSource::Trader),
+        ("Recovery (Trader)", WithdrawSource::Recovery),
+        ("Bridge", WithdrawSource::Bridge),
+    ];
+    let source = sources[select(&theme, "Select source account", &sources.map(|(label, _)| label))?].1;
 
-    // Source selection
-    let (src_identity, account) = match source_kind {
-        "main" => (config.liquidator_identity.clone(), config.liquidator_principal.into()),
-        "trader" => (config.trader_identity.clone(), config.trader_principal.into()),
-        "recovery" => (config.trader_identity.clone(), config.get_recovery_account()),
-        "bridge" => (config.bridge_ic_identity.clone(), config.bridge_ic_account()),
-        _ => (config.liquidator_identity.clone(), config.liquidator_principal.into()),
-    };
-    let main_solana_address = derive_solana_address(config.solana_private_key_bytes);
-    let bridge_solana_address = derive_solana_address(config.bridge_solana_private_key_bytes);
-    let source_solana_address = solana_source_address(source_kind, &main_solana_address, &bridge_solana_address);
-
-    // Initialize Agent
-    let agent = Agent::builder()
-        .with_url(config.ic_url.clone())
-        .with_identity(src_identity)
-        .with_max_tcp_error_retries(3)
-        .build()
-        .expect("Failed to initialize IC agent");
-    let agent = Arc::new(agent);
-
-    // Step 2: Select asset(s) from the cross-chain registry (ICP + EVM + SOL).
-    let mut assets: Vec<(AssetId, ChainToken)> = Vec::new();
-    for (id, token) in ctx.registry.tokens.iter() {
-        assets.push((id.clone(), token.clone()));
+    let assets = sorted_assets(&ctx);
+    let mut items = Vec::with_capacity(assets.len() + 1);
+    for (id, _) in &assets {
+        items.push(format!(
+            "{}:{}  —  {}",
+            id.chain,
+            id.symbol,
+            source_balance(&ctx, source, id).await
+        ));
     }
-    // Sort by chain, then symbol for nicer UX
-    assets.sort_by(|(id_a, _), (id_b, _)| id_a.chain.cmp(&id_b.chain).then(id_a.symbol.cmp(&id_b.symbol)));
+    items.push("All".to_string());
+    let picked = select(&theme, "Select asset to withdraw", &items)?;
 
-    // Fetch balances for this source account across all assets using BalanceService
-    let mut balances: HashMap<AssetId, ChainTokenAmount> = HashMap::new();
-    for (id, _token) in &assets {
-        let service = balance_service_for_source(&ctx, source_kind, &id.symbol);
-        if let Ok(bal) = service.get_balance(id).await {
-            balances.insert(id.clone(), bal);
-        }
-    }
-
-    let mut symbols: Vec<String> = assets
-        .iter()
-        .map(|(id, _token)| {
-            if let Some(bal) = balances.get(id) {
-                format!("{}:{}  —  {}", id.chain, id.symbol, format_chain_balance(bal))
-            } else {
-                format!("{}:{}  —  n/a", id.chain, id.symbol)
-            }
-        })
-        .collect();
-    symbols.push("All".to_string());
-
-    let asset_idx = Select::with_theme(&theme)
-        .with_prompt("Select asset to withdraw")
-        .default(0)
-        .items(&symbols)
-        .interact()
-        .unwrap();
-
-    let withdraw_all_assets = asset_idx == symbols.len() - 1;
-
-    // Step 3: Enter amount (skip if all assets)
-    let amount_input: String = if withdraw_all_assets {
+    let plan = if picked == assets.len() {
         println!("Withdrawing all assets — skipping amount input.");
-        "all".to_string()
+        // "All" sends ICP tokens only, so any ICP token sets the destination menu.
+        let Some((_, icp_token)) = assets.iter().find(|(_, token)| matches!(token, ChainToken::Icp { .. })) else {
+            bail!("no ICP assets to withdraw");
+        };
+        let Some((destination, typed)) = prompt_destination(&theme, &ctx, icp_token)? else {
+            return Ok(());
+        };
+        plan_all_icp(&ctx, source, &assets, "all", destination, &typed).await
     } else {
-        Input::with_theme(&theme)
+        let (id, token) = &assets[picked];
+        let amount: String = Input::with_theme(&theme)
             .with_prompt("Enter amount (or 'all')")
-            .interact_text()
-            .unwrap()
-    };
-
-    // Step 4: Select destination, depending on token chain.
-    let dst: Destination = if withdraw_all_assets {
-        // "All" currently only applies to ICP tokens (EVM tokens are skipped in the plan).
-        let dest_choices = vec!["Main (Liquidator)", "Trader", "Recovery", "Bridge", "Manual input"];
-        let dest_idx = Select::with_theme(&theme)
-            .with_prompt("Select destination ICP account")
-            .default(0)
-            .items(&dest_choices)
-            .interact()
-            .unwrap();
-
-        let dst_account = match dest_idx {
-            0 => config.liquidator_principal.into(),
-            1 => config.trader_principal.into(),
-            2 => config.get_recovery_account(),
-            3 => config.bridge_ic_account(),
-            _ => {
-                let manual_input: String = Input::with_theme(&theme)
-                    .with_prompt("Enter destination ICP account (principal or account)")
-                    .validate_with(|input: &String| -> Result<(), &str> {
-                        if Account::from_str(input).is_ok() {
-                            Ok(())
-                        } else {
-                            Err("Invalid account format")
-                        }
-                    })
-                    .interact_text()
-                    .unwrap();
-
-                let entered_account = Account::from_str(&manual_input).unwrap();
-                if entered_account == config.get_recovery_account() || entered_account == config.trader_principal.into()
-                {
-                    let confirm_recovery = Confirm::with_theme(&theme)
-                        .with_prompt("Warning: destination is Recovery (Trader). Continue?")
-                        .default(false)
-                        .interact()
-                        .unwrap();
-                    if !confirm_recovery {
-                        println!("Aborted by user.");
-                        return Ok(());
-                    }
-                }
-                entered_account
-            }
+            .interact_text()?;
+        let Some((destination, typed)) = prompt_destination(&theme, &ctx, token)? else {
+            return Ok(());
         };
-
-        Destination::Icp(dst_account)
-    } else {
-        // Single-asset flow: destination depends on selected token chain.
-        let (_id_selected, token_selected) = assets[asset_idx].clone();
-
-        match token_selected {
-            ChainToken::Icp { .. } => {
-                let dest_choices = vec!["Main (Liquidator)", "Trader", "Recovery", "Bridge", "Manual input"];
-                let dest_idx = Select::with_theme(&theme)
-                    .with_prompt("Select destination ICP account")
-                    .default(0)
-                    .items(&dest_choices)
-                    .interact()
-                    .unwrap();
-
-                let dst_account = match dest_idx {
-                    0 => config.liquidator_principal.into(),
-                    1 => config.trader_principal.into(),
-                    2 => config.get_recovery_account(),
-                    3 => config.bridge_ic_account(),
-                    _ => {
-                        let manual_input: String = Input::with_theme(&theme)
-                            .with_prompt("Enter destination ICP account (principal or account)")
-                            .validate_with(|input: &String| -> Result<(), &str> {
-                                if Account::from_str(input).is_ok() {
-                                    Ok(())
-                                } else {
-                                    Err("Invalid account format")
-                                }
-                            })
-                            .interact_text()
-                            .unwrap();
-
-                        let entered_account = Account::from_str(&manual_input).unwrap();
-                        if entered_account == config.get_recovery_account()
-                            || entered_account == config.trader_principal.into()
-                        {
-                            let confirm_recovery = Confirm::with_theme(&theme)
-                                .with_prompt("Warning: destination is Recovery (Trader). Continue?")
-                                .default(false)
-                                .interact()
-                                .unwrap();
-                            if !confirm_recovery {
-                                println!("Aborted by user.");
-                                return Ok(());
-                            }
-                        }
-                        entered_account
-                    }
-                };
-
-                Destination::Icp(dst_account)
-            }
-            ChainToken::EvmNative { .. } | ChainToken::EvmErc20 { .. } => {
-                let dest_choices = vec!["Main (Liquidator EVM)", "Bridge EVM", "Manual input"];
-                let dest_idx = Select::with_theme(&theme)
-                    .with_prompt("Select destination EVM address")
-                    .default(0)
-                    .items(&dest_choices)
-                    .interact()
-                    .unwrap();
-
-                match dest_idx {
-                    0 => Destination::Evm(ctx.evm_address.clone()),
-                    1 => Destination::Evm(config.bridge_evm_address.clone()),
-                    _ => {
-                        let manual_input: String = Input::with_theme(&theme)
-                            .with_prompt("Enter destination EVM address (0x...)")
-                            .validate_with(|input: &String| -> Result<(), &str> {
-                                if input.parse::<EvmAddress>().is_ok() {
-                                    Ok(())
-                                } else {
-                                    Err("Invalid EVM address format")
-                                }
-                            })
-                            .interact_text()
-                            .unwrap();
-
-                        Destination::Evm(manual_input)
-                    }
-                }
-            }
-            ChainToken::SolanaNative { .. } | ChainToken::SolanaSpl { .. } => {
-                let dest_choices = vec!["Main (Liquidator SOL)", "Bridge SOL", "Manual input"];
-                let dest_idx = Select::with_theme(&theme)
-                    .with_prompt("Select destination Solana address")
-                    .default(0)
-                    .items(&dest_choices)
-                    .interact()
-                    .unwrap();
-
-                match dest_idx {
-                    0 => Destination::Solana(main_solana_address.clone()),
-                    1 => Destination::Solana(bridge_solana_address.clone()),
-                    _ => {
-                        let manual_input: String = Input::with_theme(&theme)
-                            .with_prompt("Enter destination Solana address (base58)")
-                            .validate_with(|input: &String| -> Result<(), &str> {
-                                if parse_solana_destination_address(input).is_ok() {
-                                    Ok(())
-                                } else {
-                                    Err("Invalid Solana base58 pubkey")
-                                }
-                            })
-                            .interact_text()
-                            .unwrap();
-
-                        Destination::Solana(manual_input)
-                    }
-                }
-            }
-        }
+        vec![plan_one(&ctx, source, id, token, &amount, destination, &typed).await?]
     };
+    send_plan(&ctx, source, plan, Some(&theme)).await
+}
 
-    // plan entries: (asset_id, token, amount_nat, balance_fmt)
-    let mut plan: Vec<(AssetId, ChainToken, ChainTokenAmount, String)> = Vec::new();
+/// Non-interactive withdraw flow.
+///
+/// Arguments (case-insensitive where noted):
+/// - `source`: "main" | "trader" | "recovery" | "bridge"
+/// - `destination`: for ICP assets: "main" | "trader" | "recovery" | "bridge" | full Account text.
+///   for EVM assets: "main" | "bridge" | `0x...`.
+///   for Solana assets: "main" | "bridge" | base58 pubkey.
+/// - `asset`: token symbol (e.g., "ckUSDT", "USDC") | "all" (`all` executes ICP assets only)
+/// - `amount`: decimal string (respects token decimals) | "all"
+pub async fn withdraw_noninteractive(source: &str, destination: &str, asset: &str, amount: &str) -> Result<()> {
+    println!("\n=== Withdraw (non-interactive) ===\n");
+    let ctx = init_context()
+        .await
+        .map_err(|error| anyhow!("failed to init context: {error}"))?;
+    let source = WithdrawSource::parse(source).ok_or_else(|| anyhow!("invalid source account: {source}"))?;
+    let kind = WithdrawDestination::parse(destination);
+    let assets = sorted_assets(&ctx);
 
-    if withdraw_all_assets {
-        // "All" currently only applies to ICP tokens for execution, but balances are cross-chain.
-        for (id, token) in &assets {
-            // Keep behavior as ICP-only for 'all' transfers for now.
-            if !matches!(token, ChainToken::Icp { .. }) {
-                continue;
-            }
-
-            let bal = match balances.get(id) {
-                Some(b) => b,
-                None => continue,
-            };
-
-            let bal_fmt = format_chain_balance(bal);
-            let amount_native = match token {
-                ChainToken::Icp { ledger, .. } => {
-                    let fee = fetch_icrc1_fee(agent.clone(), *ledger).await;
-                    let send_amount = bal
-                        .value
-                        .clone()
-                        .0
-                        .to_u128()
-                        .unwrap_or(0)
-                        .saturating_sub(fee.0.to_u128().unwrap_or(0));
-                    if send_amount == 0 {
-                        println!("Skipping {}: balance too low to cover fee.", id.symbol);
-                        continue;
-                    }
-                    Nat::from(send_amount)
-                }
-                _ => bal.value.clone(),
-            };
-
-            let amount_nat = ChainTokenAmount {
-                token: token.clone(),
-                value: amount_native,
-            };
-
-            plan.push((id.clone(), token.clone(), amount_nat, bal_fmt));
-        }
+    let plan = if asset.eq_ignore_ascii_case("all") {
+        plan_all_icp(&ctx, source, &assets, amount, kind, destination).await
     } else {
-        let (id, token) = assets[asset_idx].clone();
-
-        let bal_opt = balances.get(&id);
-        let bal_fmt = bal_opt
-            .as_ref()
-            .map(|b| format_chain_balance(b))
-            .unwrap_or_else(|| "n/a".to_string());
-
-        let amount_nat = if amount_input.trim().eq_ignore_ascii_case("all") {
-            // For "all", behavior depends on token type.
-            let amount_native: Nat = match &token {
-                // ICP and non-native tokens: send full balance in native units.
-                ChainToken::Icp { ledger, .. } => {
-                    let bal_native = bal_opt.map(|b| b.value.clone()).unwrap_or(0u8.into());
-                    let fee = fetch_icrc1_fee(agent.clone(), *ledger).await;
-                    let send_amount = bal_native
-                        .0
-                        .to_u128()
-                        .unwrap_or(0)
-                        .saturating_sub(fee.0.to_u128().unwrap_or(0));
-                    if send_amount == 0 {
-                        bail!("not enough balance to cover fee; aborting.");
-                    }
-                    Nat::from(send_amount)
-                }
-                ChainToken::EvmErc20 { .. } => {
-                    let (gas_reserve_wei, native_balance_wei) = estimate_evm_gas_reserve_and_native_balance_wei(
-                        &config,
-                        source_kind,
-                        EVM_ERC20_TRANSFER_GAS_LIMIT,
-                    )
-                    .await
-                    .map_err(|err| anyhow!("failed to estimate EVM gas reserve: {err}; aborting."))?;
-                    if native_balance_wei <= gas_reserve_wei {
-                        bail!(
-                            "not enough native balance to cover gas for EVM token transfer; aborting. native_balance_wei={} gas_reserve_wei={}",
-                            native_balance_wei,
-                            gas_reserve_wei
-                        );
-                    }
-                    bal_opt.map(|b| b.value.clone()).unwrap_or(0u8.into())
-                }
-
-                // EVM native: reserve a gas buffer so the tx can actually be sent.
-                ChainToken::EvmNative { .. } => {
-                    let (gas_reserve_wei, native_balance_wei) = estimate_evm_gas_reserve_and_native_balance_wei(
-                        &config,
-                        source_kind,
-                        EVM_NATIVE_TRANSFER_GAS_LIMIT,
-                    )
-                    .await
-                    .map_err(|err| anyhow!("failed to estimate EVM gas reserve: {err}; aborting."))?;
-                    let send_native = native_balance_wei.saturating_sub(gas_reserve_wei);
-
-                    if send_native == 0 {
-                        bail!(
-                            "not enough native balance to cover gas for EVM transfer; aborting. native_balance_wei={} gas_reserve_wei={}",
-                            native_balance_wei,
-                            gas_reserve_wei
-                        );
-                    }
-
-                    send_native.into()
-                }
-                ChainToken::SolanaNative { .. } => {
-                    let native_balance_lamports = bal_opt
-                        .and_then(|b| b.value.0.to_u128())
-                        .unwrap_or(0);
-                    let destination = match &dst {
-                        Destination::Solana(addr) => addr.as_str(),
-                        _ => {
-                            println!("invalid Solana destination selected; aborting.");
-                            return Err(anyhow!("invalid Solana destination selected"));
-                        }
-                    };
-                    let fee_lamports = match estimate_solana_native_transfer_fee_lamports(
-                        &config.solana_rpc_url,
-                        &source_solana_address,
-                        destination,
-                    )
-                    .await
-                    {
-                        Ok(v) => v as u128,
-                        Err(err) => {
-                            println!("Failed to estimate Solana tx fee: {err}; aborting.");
-                            return Err(anyhow!("failed to estimate Solana tx fee: {err}"));
-                        }
-                    };
-                    let send_native = native_balance_lamports.saturating_sub(fee_lamports);
-                    if send_native == 0 {
-                        println!(
-                            "Not enough SOL balance to sweep; aborting. native_balance_lamports={} estimated_fee_lamports={}",
-                            native_balance_lamports, fee_lamports
-                        );
-                        return Err(anyhow!("not enough SOL balance to sweep"));
-                    }
-                    Nat::from(send_native)
-                }
-                ChainToken::SolanaSpl { .. } => {
-                    let native_balance_lamports =
-                        match solana_native_balance_lamports_for_source(&ctx, source_kind, &assets).await {
-                            Ok(v) => v,
-                            Err(err) => {
-                                println!("Failed to read SOL balance for fees: {err}; aborting.");
-                                return Err(anyhow!("failed to read SOL balance for fees: {err}"));
-                            }
-                        };
-                    if native_balance_lamports <= SOLANA_SPL_FEE_RESERVE_LAMPORTS {
-                        println!(
-                            "Not enough SOL balance to cover SPL transfer fees; aborting. native_balance_lamports={} required_reserve_lamports={}",
-                            native_balance_lamports, SOLANA_SPL_FEE_RESERVE_LAMPORTS
-                        );
-                        return Err(anyhow!("not enough SOL balance to cover SPL transfer fees"));
-                    }
-                    bal_opt.map(|b| b.value.clone()).unwrap_or(0u8.into())
-                }
-            };
-
-            ChainTokenAmount {
-                token: token.clone(),
-                value: amount_native,
-            }
-        } else {
-            ChainTokenAmount::from_decimal_str(token.clone(), &amount_input)
-                .map_err(|err| anyhow!("{err}; aborting."))?
+        let Some((id, token)) = assets.iter().find(|(id, _)| id.symbol.eq_ignore_ascii_case(asset)) else {
+            bail!("unknown asset symbol: {asset}");
         };
+        vec![plan_one(&ctx, source, id, token, amount, kind, destination).await?]
+    };
+    send_plan(&ctx, source, plan, None).await
+}
 
-        plan.push((id, token, amount_nat, bal_fmt));
+fn select(theme: &ColorfulTheme, prompt: &str, items: &[impl std::fmt::Display]) -> Result<usize> {
+    Ok(Select::with_theme(theme)
+        .with_prompt(prompt)
+        .default(0)
+        .items(items)
+        .interact()?)
+}
+
+/// Asks where the funds go, with the choices of the token's chain. `None`
+/// means the operator stopped.
+fn prompt_destination(
+    theme: &ColorfulTheme,
+    ctx: &PipelineContext,
+    token: &ChainToken,
+) -> Result<Option<(WithdrawDestination, String)>> {
+    use WithdrawDestination::{Bridge, Main, Manual, Recovery, Trader};
+    let choices: &[(&str, WithdrawDestination)] = match token {
+        ChainToken::Icp { .. } => &[
+            ("Main (Liquidator)", Main),
+            ("Trader", Trader),
+            ("Recovery", Recovery),
+            ("Bridge", Bridge),
+            ("Manual input", Manual),
+        ],
+        ChainToken::EvmNative { .. } | ChainToken::EvmErc20 { .. } => &[
+            ("Main (Liquidator EVM)", Main),
+            ("Bridge EVM", Bridge),
+            ("Manual input", Manual),
+        ],
+        ChainToken::SolanaNative { .. } | ChainToken::SolanaSpl { .. } => &[
+            ("Main (Liquidator SOL)", Main),
+            ("Bridge SOL", Bridge),
+            ("Manual input", Manual),
+        ],
+    };
+    let labels: Vec<&str> = choices.iter().map(|(label, _)| *label).collect();
+    let destination = choices[select(theme, "Select destination", &labels)?].1;
+    if destination != Manual {
+        return Ok(Some((destination, String::new())));
     }
 
-    // Preview (labeled, plain prints)
-    println!("\nPlanned transfers:\n");
-    for (i, (asset_id, tok, amt, bal)) in plan.iter().enumerate() {
-        let src_str = match tok {
-            ChainToken::Icp { .. } => {
-                if source_kind == "bridge" {
-                    config.bridge_ic_account().to_string()
-                } else {
-                    account.to_string()
-                }
-            }
-            ChainToken::EvmNative { .. } | ChainToken::EvmErc20 { .. } => {
-                if source_kind == "bridge" {
-                    config.bridge_evm_address.clone()
-                } else {
-                    ctx.evm_address.clone()
-                }
-            }
-            ChainToken::SolanaNative { .. } | ChainToken::SolanaSpl { .. } => source_solana_address.clone(),
-        };
+    let typed: String = Input::with_theme(theme)
+        .with_prompt("Enter destination address")
+        .validate_with(|text: &String| parse_typed_destination(token, text).map(|_| ()))
+        .interact_text()?;
+    // A typed trader account is easy to mistake for an outside one.
+    let config = &ctx.config;
+    let trader_owned = Account::from_str(typed.trim())
+        .is_ok_and(|account| account == config.get_recovery_account() || account == config.trader_principal.into());
+    if trader_owned
+        && !Confirm::with_theme(theme)
+            .with_prompt("Warning: destination is Recovery (Trader). Continue?")
+            .default(false)
+            .interact()?
+    {
+        println!("Aborted by user.");
+        return Ok(None);
+    }
+    Ok(Some((Manual, typed)))
+}
 
+fn sorted_assets(ctx: &PipelineContext) -> Vec<(AssetId, ChainToken)> {
+    let mut assets: Vec<(AssetId, ChainToken)> = ctx
+        .registry
+        .tokens
+        .iter()
+        .map(|(id, token)| (id.clone(), token.clone()))
+        .collect();
+    assets.sort_by(|(a, _), (b, _)| a.chain.cmp(&b.chain).then(a.symbol.cmp(&b.symbol)));
+    assets
+}
+
+/// One transfer per ICP asset. An asset that cannot be planned is skipped with
+/// its reason, so one empty balance does not stop the rest.
+async fn plan_all_icp(
+    ctx: &PipelineContext,
+    source: WithdrawSource,
+    assets: &[(AssetId, ChainToken)],
+    amount: &str,
+    destination: WithdrawDestination,
+    typed: &str,
+) -> Vec<Planned> {
+    let mut plan = Vec::new();
+    for (id, token) in assets
+        .iter()
+        .filter(|(_, token)| matches!(token, ChainToken::Icp { .. }))
+    {
+        match plan_one(ctx, source, id, token, amount, destination, typed).await {
+            Ok(planned) => plan.push(planned),
+            Err(err) => eprintln!("Skipping {}: {err:#}", id.symbol),
+        }
+    }
+    plan
+}
+
+async fn plan_one(
+    ctx: &PipelineContext,
+    source: WithdrawSource,
+    asset: &AssetId,
+    token: &ChainToken,
+    amount: &str,
+    destination: WithdrawDestination,
+    typed: &str,
+) -> Result<Planned> {
+    let to = destination_account(ctx, token, destination, typed).map_err(|err| anyhow!(err))?;
+    let amount = withdraw_amount(ctx, source, asset, token, amount, &to)
+        .await
+        .map_err(|err| anyhow!(err))?;
+    Ok(Planned {
+        asset: asset.clone(),
+        amount,
+        to,
+        balance: source_balance(ctx, source, asset).await,
+    })
+}
+
+/// Shows the plan, asks for a yes when a theme is given, then sends each
+/// transfer. Every transfer is tried, but any failure fails the command.
+async fn send_plan(
+    ctx: &PipelineContext,
+    source: WithdrawSource,
+    plan: Vec<Planned>,
+    confirm: Option<&ColorfulTheme>,
+) -> Result<()> {
+    if plan.is_empty() {
+        bail!("no transfers to execute.");
+    }
+    println!("\nPlanned transfers:\n");
+    for (i, planned) in plan.iter().enumerate() {
         println!("Transfer #{}:", i + 1);
-        println!("  Source:      {}", src_str);
-        println!(
-            "  Destination: {}",
-            match &dst {
-                Destination::Icp(acc) => acc.to_string(),
-                Destination::Evm(addr) => addr.clone(),
-                Destination::Solana(addr) => addr.clone(),
-            }
-        );
-        println!("  Asset:       {} ({})", asset_id.symbol, asset_id.address);
-        println!("  Amount:      {}", amt.formatted());
-        println!("  Balance:     {}", bal);
+        print_transfer(ctx, source, planned);
         println!();
     }
-
-    let confirm = Confirm::with_theme(&theme)
-        .with_prompt(format!("Proceed with {} transfer(s)?", plan.len()))
-        .default(false)
-        .interact()
-        .unwrap();
-
-    if !confirm {
+    if let Some(theme) = confirm
+        && !Confirm::with_theme(theme)
+            .with_prompt(format!("Proceed with {} transfer(s)?", plan.len()))
+            .default(false)
+            .interact()?
+    {
         println!("Aborted by user.");
         return Ok(());
     }
 
-    // Step 6: Execute transfers and show summary (plain prints)
     println!("\nExecuting withdrawals...\n");
-
-    // Every transfer is still attempted and reported, but a failure has to
-    // reach the exit code: a caller that reads only the status must not be
-    // told the funds moved when they did not.
+    // A caller that reads only the exit code must not be told the funds moved
+    // when they did not.
     let mut failures: Vec<String> = Vec::new();
-
-    for (asset_id, token, amt, bal_fmt) in plan {
-        let transfer_service = transfer_service_for_source(&ctx, source_kind, &asset_id.symbol);
-        let src_str = match &token {
-            ChainToken::Icp { .. } => {
-                if source_kind == "bridge" {
-                    config.bridge_ic_account().to_string()
-                } else {
-                    account.to_string()
-                }
-            }
-            ChainToken::EvmNative { .. } | ChainToken::EvmErc20 { .. } => {
-                if source_kind == "bridge" {
-                    config.bridge_evm_address.clone()
-                } else {
-                    ctx.evm_address.clone()
-                }
-            }
-            ChainToken::SolanaNative { .. } | ChainToken::SolanaSpl { .. } => source_solana_address.clone(),
-        };
-
-        let to = match (&token, &dst) {
-            (ChainToken::Icp { .. }, Destination::Icp(acc)) => ChainAccount::Icp(*acc),
-            (ChainToken::EvmNative { .. } | ChainToken::EvmErc20 { .. }, Destination::Evm(addr_str)) => {
-                let addr = addr_str
-                    .parse::<EvmAddress>()
-                    .map_err(|e| format!("invalid EVM address: {e}"))
-                    .unwrap();
-                ChainAccount::Evm(addr.to_string())
-            }
-            (ChainToken::SolanaNative { .. } | ChainToken::SolanaSpl { .. }, Destination::Solana(addr_str)) => {
-                let address = match parse_solana_destination_address(addr_str) {
-                    Ok(address) => address,
-                    Err(err) => {
-                        println!("invalid Solana destination: {err}; skipping.");
-                        continue;
-                    }
-                };
-                ChainAccount::Solana(address)
-            }
-            _ => {
-                println!("Destination / token chain mismatch; skipping.");
-                failures.push(format!("{}: destination / token chain mismatch", asset_id.symbol));
-                continue;
-            }
-        };
-
-        let amount_shown = amt.formatted();
-        match transfer_service
-            .transfer_by_asset_id(&asset_id, to.clone(), amt.value)
-            .await
-        {
-            Ok(txid) => {
-                println!("Transfer result:");
-                println!("  Source:      {}", src_str);
-                println!(
-                    "  Destination: {}",
-                    match &dst {
-                        Destination::Icp(acc) => acc.to_string(),
-                        Destination::Evm(addr) => addr.clone(),
-                        Destination::Solana(addr) => addr.clone(),
-                    }
-                );
-                println!("  Asset:       {}", asset_id.symbol);
-                println!("  Amount:      {}", amount_shown);
-                println!("  Balance:     {}", bal_fmt);
-                println!("  Result:      ok: {}", txid);
-                println!();
-            }
-            Err(e) => {
-                println!("Transfer result:");
-                println!("  Source:      {}", src_str);
-                println!(
-                    "  Destination: {}",
-                    match &dst {
-                        Destination::Icp(acc) => acc.to_string(),
-                        Destination::Evm(addr) => addr.clone(),
-                        Destination::Solana(addr) => addr.clone(),
-                    }
-                );
-                println!("  Asset:       {}", asset_id.symbol);
-                println!("  Amount:      {}", amount_shown);
-                println!("  Balance:     {}", bal_fmt);
-                println!("  Result:      err: {}", e);
-                println!();
-                failures.push(format!("{}: {e}", asset_id.symbol));
+    for planned in &plan {
+        let result = source
+            .transfers(ctx)
+            .transfer_by_asset_id(&planned.asset, planned.to.clone(), planned.amount.value.clone())
+            .await;
+        println!("Transfer result:");
+        print_transfer(ctx, source, planned);
+        match result {
+            Ok(txid) => println!("  Result:      ok: {txid}"),
+            Err(err) => {
+                println!("  Result:      err: {err}");
+                failures.push(format!("{}: {err}", planned.asset.symbol));
             }
         }
+        println!();
     }
-
-    // Step 7: Show updated balances after transfers (ICP only)
-    if let Destination::Icp(dst_account) = &dst {
-        println!("\nRefreshing balances after transfer...\n");
-
-        let balances_after = sync_balances(agent.clone(), &assets, *dst_account).await;
-
-        println!("Updated destination balances ({}):", dst_account);
-        for (principal, formatted) in balances_after {
-            println!("  {} | {}", principal, formatted);
-        }
-    }
+    show_icp_destination_balances(ctx, &plan).await;
 
     if !failures.is_empty() {
-        bail!("{} of the requested transfers failed: {}", failures.len(), failures.join("; "));
+        bail!(
+            "{} of {} transfers failed: {}",
+            failures.len(),
+            plan.len(),
+            failures.join("; ")
+        );
     }
-
     println!("\nAll transfers processed.\n");
     Ok(())
 }
 
-// Fetch balances for a set of tokens for a given account, using the agent and formatting with token decimals.
-async fn sync_balances(
-    agent: Arc<Agent>,
-    assets: &[(AssetId, ChainToken)],
-    account: Account,
-) -> std::collections::HashMap<Principal, String> {
-    use std::collections::{HashMap, HashSet};
+fn print_transfer(ctx: &PipelineContext, source: WithdrawSource, planned: &Planned) {
+    println!("  Source:      {}", source.address(ctx, &planned.amount.token));
+    println!("  Destination: {}", planned.to);
+    println!("  Asset:       {} ({})", planned.asset.symbol, planned.asset.address);
+    println!("  Amount:      {}", planned.amount.formatted());
+    println!("  Balance:     {}", planned.balance);
+}
 
-    // Map ledger -> decimals, only for ICP tokens
-    let mut decimals_map: HashMap<Principal, u8> = HashMap::new();
-    for (_id, token) in assets {
-        if let ChainToken::Icp { ledger, decimals, .. } = token {
-            decimals_map.entry(*ledger).or_insert(*decimals);
-        }
+/// Shows the new balances when every transfer paid the same ICP account.
+async fn show_icp_destination_balances(ctx: &PipelineContext, plan: &[Planned]) {
+    let Some(ChainAccount::Icp(account)) = plan.first().map(|planned| &planned.to) else {
+        return;
+    };
+    if plan.iter().any(|planned| planned.to != ChainAccount::Icp(*account)) {
+        return;
     }
-
-    let mut seen = HashSet::new();
-    let mut balances: HashMap<Principal, String> = HashMap::new();
-
-    for (_id, token) in assets {
-        let (ledger, decimals) = match token {
-            ChainToken::Icp { ledger, decimals, .. } => (*ledger, *decimals),
-            _ => continue,
-        };
-        if !seen.insert(ledger) {
+    println!("Updated destination balances ({account}):");
+    for planned in plan {
+        let ChainToken::Icp { ledger, .. } = &planned.amount.token else {
             continue;
-        }
-
-        let decimals = *decimals_map.get(&ledger).unwrap_or(&decimals);
-
-        let res = agent
-            .query(&ledger, "icrc1_balance_of")
-            .with_arg(Encode!(&account).unwrap())
-            .call()
-            .await;
-
-        if let Ok(bytes) = res
-            && let Ok(balance) = Decode!(&bytes, Nat)
-        {
-            // Convert Nat (smallest units) to u128 for formatting
-            let units: u128 = balance.0.to_string().parse().unwrap_or(0);
-
-            if decimals == 0 {
-                balances.insert(ledger, format!("{}", units));
-            } else {
-                let d = decimals as u32;
-                let pow = 10u128.pow(d);
-                let int_part = units / pow;
-                let frac_part = units % pow;
-                let frac_str = format!("{:0>width$}", frac_part, width = d as usize);
-                balances.insert(ledger, format!("{}.{}", int_part, frac_str));
-            }
+        };
+        if let Some(balance) = icrc1_balance(ctx, *ledger, account).await {
+            let balance = ChainTokenAmount::from_raw(planned.amount.token.clone(), balance);
+            println!("  {} | {}", planned.asset.symbol, format_balance(&balance));
         }
     }
-
-    balances
 }
 
-async fn fetch_icrc1_fee(agent: Arc<Agent>, ledger: Principal) -> Nat {
-    let res = agent
-        .query(&ledger, "icrc1_fee")
-        .with_arg(Encode!(&()).unwrap())
+async fn icrc1_balance(ctx: &PipelineContext, ledger: Principal, account: &Account) -> Option<Nat> {
+    let bytes = ctx
+        .agent
+        .query(&ledger, "icrc1_balance_of")
+        .with_arg(Encode!(account).ok()?)
         .call()
-        .await;
-
-    if let Ok(bytes) = res
-        && let Ok(fee) = Decode!(&bytes, Nat)
-    {
-        fee
-    } else {
-        Nat::from(0u8)
-    }
-}
-
-const EVM_NATIVE_GAS_BUFFER_WEI: u128 = 200_000_000_000_000;
-const EVM_NATIVE_TRANSFER_GAS_LIMIT: u128 = 21_000;
-const EVM_ERC20_TRANSFER_GAS_LIMIT: u128 = 100_000;
-const EVM_GAS_RESERVE_MULTIPLIER: u128 = 2;
-const SOLANA_SPL_FEE_RESERVE_LAMPORTS: u128 = 3_000_000;
-
-fn evm_private_key_for_source<'a>(config: &'a crate::config::Config, source_kind: &str) -> &'a str {
-    if source_kind == "bridge" {
-        &config.bridge_evm_private_key
-    } else {
-        &config.evm_private_key
-    }
-}
-
-async fn estimate_evm_gas_reserve_and_native_balance_wei(
-    config: &crate::config::Config,
-    source_kind: &str,
-    gas_limit: u128,
-) -> Result<(u128, u128), String> {
-    let signer: PrivateKeySigner = evm_private_key_for_source(config, source_kind)
-        .parse()
-        .map_err(|e| format!("failed to parse EVM private key for source '{source_kind}': {e}"))?;
-    let signer_address = signer.address();
-    let rpc_url = config
-        .evm_rpc_url
-        .parse()
-        .map_err(|e| format!("invalid EVM RPC URL '{}': {e}", config.evm_rpc_url))?;
-
-    let provider = ProviderBuilder::new()
-        .network::<AnyNetwork>()
-        .wallet(signer)
-        .connect_http(rpc_url);
-
-    let gas_price_wei = provider
-        .get_gas_price()
         .await
-        .map_err(|e| format!("failed to fetch EVM gas price: {e}"))?;
-    let dynamic_reserve = gas_price_wei
-        .saturating_mul(gas_limit)
-        .saturating_mul(EVM_GAS_RESERVE_MULTIPLIER);
-    let gas_reserve_wei = dynamic_reserve.max(EVM_NATIVE_GAS_BUFFER_WEI);
-
-    let native_balance_wei = provider
-        .get_balance(signer_address)
-        .await
-        .map_err(|e| format!("failed to fetch EVM native balance for {}: {e}", signer_address))?
-        .to::<u128>();
-
-    Ok((gas_reserve_wei, native_balance_wei))
+        .ok()?;
+    Decode!(&bytes, Nat).ok()
 }
 
-fn format_chain_balance_plain(bal: &ChainTokenAmount) -> String {
+async fn source_balance(ctx: &PipelineContext, source: WithdrawSource, asset: &AssetId) -> String {
+    source
+        .balances(ctx)
+        .get_balance(asset)
+        .await
+        .map(|balance| format_balance(&balance))
+        .unwrap_or_else(|_| "n/a".to_string())
+}
+
+/// A balance cut to six decimals for menus and plans.
+fn format_balance(bal: &ChainTokenAmount) -> String {
     let raw = bal.value.clone();
     let decimals = bal.token.decimals() as u32;
 
@@ -801,578 +357,4 @@ fn format_chain_balance_plain(bal: &ChainTokenAmount) -> String {
     let frac_str = format!("{:0>width$}", frac_clean, width = display_decimals as usize);
 
     format!("{}.{} {}", int_part, frac_str, bal.token.symbol())
-}
-
-fn balance_service_for_source(
-    ctx: &PipelineContext,
-    source_kind: &str,
-    asset_symbol: &str,
-) -> Arc<liquidium_pipeline_core::balance_service::BalanceService> {
-    match source_kind {
-        "main" => ctx.main_service.clone(),
-        "trader" => ctx.trader_service.clone(),
-        "recovery" => ctx.recovery_service.clone(),
-        "bridge" => ctx.bridge_balance_service_for_symbol(asset_symbol),
-        _ => ctx.main_service.clone(),
-    }
-}
-
-fn transfer_service_for_source(
-    ctx: &PipelineContext,
-    source_kind: &str,
-    asset_symbol: &str,
-) -> Arc<liquidium_pipeline_core::transfer::transfer_service::TransferService> {
-    match source_kind {
-        "main" => ctx.main_transfers.clone(),
-        "trader" => ctx.trader_transfers.clone(),
-        "recovery" => ctx.recovery_transfers.clone(),
-        "bridge" => ctx.bridge_transfer_service_for_symbol(asset_symbol),
-        _ => ctx.main_transfers.clone(),
-    }
-}
-
-fn resolve_icp_destination(config: &crate::config::Config, destination: &str) -> Result<Account, String> {
-    if destination.eq_ignore_ascii_case("main") {
-        Ok(config.liquidator_principal.into())
-    } else if destination.eq_ignore_ascii_case("trader") {
-        Ok(config.trader_principal.into())
-    } else if destination.eq_ignore_ascii_case("recovery") {
-        Ok(config.get_recovery_account())
-    } else if destination.eq_ignore_ascii_case("bridge") {
-        Ok(config.bridge_ic_account())
-    } else {
-        Account::from_str(destination).map_err(|_| format!("Invalid destination ICP account: {destination}"))
-    }
-}
-
-/// A native ICP destination given as a ledger account id, the form that
-/// exchanges use for ICP deposits. The checksum must match.
-fn native_icp_account_id(ledger: Principal, destination: &str) -> Option<String> {
-    let native_ledger = Principal::from_text(crate::utils::ICP_LEDGER_PRINCIPAL).ok()?;
-    let normalized = destination.trim().to_ascii_lowercase();
-    (ledger == native_ledger && ic_ledger_types::AccountIdentifier::from_hex(&normalized).is_ok()).then_some(normalized)
-}
-
-fn resolve_evm_destination(default_main_evm: &str, bridge_evm: &str, destination: &str) -> Result<String, String> {
-    if destination.eq_ignore_ascii_case("main") {
-        return Ok(default_main_evm.to_string());
-    }
-    if destination.eq_ignore_ascii_case("bridge") {
-        return Ok(bridge_evm.to_string());
-    }
-    if destination.eq_ignore_ascii_case("trader") || destination.eq_ignore_ascii_case("recovery") {
-        return Err(
-            "destination 'trader/recovery' is ICP-only for EVM assets; use --destination main|bridge|0x...".to_string(),
-        );
-    }
-    let parsed = destination
-        .parse::<EvmAddress>()
-        .map_err(|_| format!("Invalid destination EVM address: {destination}"))?;
-    Ok(parsed.to_string())
-}
-
-fn parse_solana_destination_address(value: &str) -> Result<String, String> {
-    let addr = value
-        .parse::<Pubkey>()
-        .map_err(|_| format!("Invalid destination Solana base58 pubkey: {value}"))?;
-    Ok(addr.to_string())
-}
-
-fn derive_solana_address(secret_key: [u8; 32]) -> String {
-    Keypair::new_from_array(secret_key).pubkey().to_string()
-}
-
-fn solana_source_address(source_kind: &str, main_solana: &str, bridge_solana: &str) -> String {
-    if source_kind == "bridge" {
-        bridge_solana.to_string()
-    } else {
-        main_solana.to_string()
-    }
-}
-
-fn resolve_solana_destination(default_main_solana: &str, bridge_solana: &str, destination: &str) -> Result<String, String> {
-    if destination.eq_ignore_ascii_case("main") {
-        return Ok(default_main_solana.to_string());
-    }
-    if destination.eq_ignore_ascii_case("bridge") {
-        return Ok(bridge_solana.to_string());
-    }
-    if destination.eq_ignore_ascii_case("trader") || destination.eq_ignore_ascii_case("recovery") {
-        return Err(
-            "destination 'trader/recovery' is ICP-only for Solana assets; use --destination main|bridge|<base58-pubkey>"
-                .to_string(),
-        );
-    }
-    parse_solana_destination_address(destination)
-}
-
-async fn estimate_solana_native_transfer_fee_lamports(
-    rpc_url: &str,
-    from: &str,
-    to: &str,
-) -> Result<u64, String> {
-    let from_pubkey = from
-        .parse::<Pubkey>()
-        .map_err(|e| format!("invalid Solana source pubkey `{from}`: {e}"))?;
-    let to_pubkey = to
-        .parse::<Pubkey>()
-        .map_err(|e| format!("invalid Solana destination pubkey `{to}`: {e}"))?;
-
-    let rpc = RpcClient::new(rpc_url.to_string());
-    let blockhash = rpc
-        .get_latest_blockhash()
-        .await
-        .map_err(|e| format!("solana get_latest_blockhash failed: {e}"))?;
-
-    let ix = system_instruction::transfer(&from_pubkey, &to_pubkey, 1);
-    let msg = Message::new_with_blockhash(&[ix], Some(&from_pubkey), &blockhash);
-    let fee = rpc
-        .get_fee_for_message(&msg)
-        .await
-        .map_err(|e| format!("solana get_fee_for_message failed: {e}"))?;
-
-    if fee == 0 {
-        return Err("solana estimated transfer fee is zero; refusing sweep".to_string());
-    }
-
-    Ok(fee)
-}
-
-fn find_solana_native_asset_id(assets: &[(AssetId, ChainToken)]) -> Option<AssetId> {
-    assets.iter().find_map(|(id, token)| match token {
-        ChainToken::SolanaNative { .. } => Some(id.clone()),
-        _ => None,
-    })
-}
-
-async fn solana_native_balance_lamports_for_source(
-    ctx: &PipelineContext,
-    source_kind: &str,
-    assets: &[(AssetId, ChainToken)],
-) -> Result<u128, String> {
-    let native_asset_id = find_solana_native_asset_id(assets).ok_or_else(|| {
-        "missing Solana native asset in registry; expected an entry like `sol:native:SOL`".to_string()
-    })?;
-    let service = balance_service_for_source(ctx, source_kind, &native_asset_id.symbol);
-    let balance = service.get_balance(&native_asset_id).await?;
-    balance
-        .value
-        .0
-        .to_u128()
-        .ok_or_else(|| "solana native balance too large for u128".to_string())
-}
-
-/// Non-interactive withdraw flow.
-///
-/// Arguments (case-insensitive where noted):
-/// - `source`: "main" | "trader" | "recovery" | "bridge"
-/// - `destination`: for ICP assets: "main" | "trader" | "recovery" | "bridge" | full Account text.
-///                  for EVM assets: "main" | "bridge" | `0x...`.
-///                  for Solana assets: "main" | "bridge" | base58 pubkey.
-/// - `asset`: token symbol (e.g., "ckUSDT", "USDC") | "all" (`all` executes ICP assets only)
-/// - `amount`: decimal string (respects token decimals) | "all"
-#[allow(dead_code)]
-pub async fn withdraw_noninteractive(source: &str, destination: &str, asset: &str, amount: &str) -> Result<()> {
-    println!("\n=== Withdraw (non-interactive) ===\n");
-
-    // Load context (config + registry)
-    let ctx = init_context()
-        .await
-        .map_err(|error| anyhow!("failed to init context: {error}"))?;
-    let config = ctx.config.clone();
-    let main_solana_address = derive_solana_address(config.solana_private_key_bytes);
-    let bridge_solana_address = derive_solana_address(config.bridge_solana_private_key_bytes);
-
-    // Resolve source
-    let source_kind = match source.to_lowercase().as_str() {
-        "main" | "m" | "liquidator" => "main",
-        "trader" | "t" => "trader",
-        "recovery" | "r" => "recovery",
-        "bridge" | "b" => "bridge",
-        other => bail!("invalid source account: {other}"),
-    };
-    let (src_identity, account) = match source_kind {
-        "main" => (config.liquidator_identity.clone(), config.liquidator_principal.into()),
-        "trader" => (config.trader_identity.clone(), config.trader_principal.into()),
-        "recovery" => (config.trader_identity.clone(), config.get_recovery_account()),
-        "bridge" => (config.bridge_ic_identity.clone(), config.bridge_ic_account()),
-        _ => (config.liquidator_identity.clone(), config.liquidator_principal.into()),
-    };
-    let source_solana_address = solana_source_address(source_kind, &main_solana_address, &bridge_solana_address);
-
-    // Initialize Agent and account service
-    let agent = Arc::new(
-        Agent::builder()
-            .with_url(config.ic_url.clone())
-            .with_identity(src_identity)
-            .with_max_tcp_error_retries(3)
-            .build()
-            .map_err(|error| anyhow!("failed to initialize IC agent: {error}"))?,
-    );
-    // Build asset catalog from registry: ICP + EVM + Solana tokens.
-    let mut assets: Vec<(AssetId, ChainToken)> = ctx
-        .registry
-        .tokens
-        .iter()
-        .map(|(id, token)| (id.clone(), token.clone()))
-        .collect();
-    assets.sort_by(|(id_a, _), (id_b, _)| id_a.chain.cmp(&id_b.chain).then(id_a.symbol.cmp(&id_b.symbol)));
-
-    let icp_assets: Vec<(AssetId, ChainToken)> = assets
-        .iter()
-        .filter_map(|(id, token)| match token {
-            ChainToken::Icp { .. } => Some((id.clone(), token.clone())),
-            _ => None,
-        })
-        .collect();
-
-    // Build plan: (asset_id, token, destination, amount, balance_fmt)
-    let mut plan: Vec<(AssetId, ChainToken, ChainAccount, ChainTokenAmount, String)> = Vec::new();
-    let all_assets = asset.eq_ignore_ascii_case("all");
-
-    if all_assets {
-        for (id, token) in &icp_assets {
-            let ChainToken::Icp { ledger, .. } = token else {
-                continue;
-            };
-
-            let dst_account = resolve_icp_destination(&config, destination).map_err(|err| anyhow!("{err}"))?;
-
-            let balance_service = balance_service_for_source(&ctx, source_kind, &id.symbol);
-            let bal = match balance_service.get_balance(id).await {
-                Ok(balance) => balance,
-                Err(err) => {
-                    eprintln!("Skipping {}: failed to read balance ({err})", id.symbol);
-                    continue;
-                }
-            };
-            let bal_fmt = format_chain_balance_plain(&bal);
-
-            let amount_nat = if amount.eq_ignore_ascii_case("all") {
-                let balance_units = bal.value.0.to_u128().unwrap_or(0);
-                let fee = fetch_icrc1_fee(agent.clone(), *ledger).await;
-                let fee_units = fee.0.to_u128().unwrap_or(0);
-                let send_units = balance_units.saturating_sub(fee_units);
-                if send_units == 0 {
-                    eprintln!("Skipping {}: balance too low to cover fee.", id.symbol);
-                    continue;
-                }
-                ChainTokenAmount {
-                    token: token.clone(),
-                    value: candid::Nat::from(send_units),
-                }
-            } else {
-                ChainTokenAmount::from_decimal_str(token.clone(), amount).map_err(|err| anyhow!("{err}; aborting."))?
-            };
-
-            plan.push((
-                id.clone(),
-                token.clone(),
-                ChainAccount::Icp(dst_account),
-                amount_nat,
-                bal_fmt,
-            ));
-        }
-    } else {
-        // Single-asset flow supports ICP, EVM, and Solana assets.
-        let picked = assets
-            .iter()
-            .find(|(id, _)| id.symbol.eq_ignore_ascii_case(asset))
-            .cloned();
-        let Some((id, token)) = picked else {
-            bail!("unknown asset symbol: {asset}");
-        };
-
-        let balance_service = balance_service_for_source(&ctx, source_kind, &id.symbol);
-        let bal_opt = balance_service.get_balance(&id).await.ok();
-        let bal_fmt = bal_opt
-            .as_ref()
-            .map(format_chain_balance_plain)
-            .unwrap_or_else(|| "n/a".to_string());
-
-        let destination_account = match &token {
-            ChainToken::Icp { ledger, .. } => match native_icp_account_id(*ledger, destination) {
-                Some(account_id) => ChainAccount::IcpLedger(account_id),
-                None => {
-                    ChainAccount::Icp(resolve_icp_destination(&config, destination).map_err(|err| anyhow!("{err}"))?)
-                }
-            },
-            ChainToken::EvmNative { .. } | ChainToken::EvmErc20 { .. } => ChainAccount::Evm(
-                resolve_evm_destination(&ctx.evm_address, &config.bridge_evm_address, destination)
-                    .map_err(|err| anyhow!("{err}"))?,
-            ),
-            ChainToken::SolanaNative { .. } | ChainToken::SolanaSpl { .. } => ChainAccount::Solana(
-                resolve_solana_destination(&main_solana_address, &bridge_solana_address, destination)
-                    .map_err(|err| anyhow!("{err}"))?,
-            ),
-        };
-
-        let amount_nat = if amount.eq_ignore_ascii_case("all") {
-            match &token {
-                ChainToken::Icp { ledger, .. } => {
-                    let bal_native = bal_opt.map(|b| b.value).unwrap_or_else(|| Nat::from(0u8));
-                    let fee = fetch_icrc1_fee(agent.clone(), *ledger).await;
-                    let send_amount = bal_native
-                        .0
-                        .to_u128()
-                        .unwrap_or(0)
-                        .saturating_sub(fee.0.to_u128().unwrap_or(0));
-                    if send_amount == 0 {
-                        bail!("not enough balance to cover fee; aborting.");
-                    }
-                    ChainTokenAmount {
-                        token: token.clone(),
-                        value: Nat::from(send_amount),
-                    }
-                }
-                ChainToken::EvmErc20 { .. } => ChainTokenAmount {
-                    token: token.clone(),
-                    value: {
-                        let (gas_reserve_wei, native_balance_wei) = estimate_evm_gas_reserve_and_native_balance_wei(
-                            &config,
-                            source_kind,
-                            EVM_ERC20_TRANSFER_GAS_LIMIT,
-                        )
-                        .await
-                        .map_err(|err| anyhow!("failed to estimate EVM gas reserve: {err}"))?;
-                        if native_balance_wei <= gas_reserve_wei {
-                            bail!(
-                                "not enough native balance to cover gas for EVM token transfer; aborting. native_balance_wei={} gas_reserve_wei={}",
-                                native_balance_wei,
-                                gas_reserve_wei
-                            );
-                        }
-                        bal_opt.map(|b| b.value).unwrap_or_else(|| Nat::from(0u8))
-                    },
-                },
-                ChainToken::EvmNative { .. } => {
-                    let (gas_reserve_wei, native_balance_wei) = estimate_evm_gas_reserve_and_native_balance_wei(
-                        &config,
-                        source_kind,
-                        EVM_NATIVE_TRANSFER_GAS_LIMIT,
-                    )
-                    .await
-                    .map_err(|err| anyhow!("failed to estimate EVM gas reserve: {err}"))?;
-                    let send_native = native_balance_wei.saturating_sub(gas_reserve_wei);
-                    if send_native == 0 {
-                        bail!(
-                            "not enough native balance to cover gas for EVM transfer; aborting. native_balance_wei={} gas_reserve_wei={}",
-                            native_balance_wei,
-                            gas_reserve_wei
-                        );
-                    }
-                    ChainTokenAmount {
-                        token: token.clone(),
-                        value: Nat::from(send_native),
-                    }
-                }
-                ChainToken::SolanaNative { .. } => {
-                    let native_balance_lamports = bal_opt
-                        .as_ref()
-                        .and_then(|b| b.value.0.to_u128())
-                        .unwrap_or(0);
-                    let destination = match &destination_account {
-                        ChainAccount::Solana(addr) => addr.as_str(),
-                        _ => {
-                            eprintln!("invalid Solana destination selected; aborting.");
-                            return Err(anyhow!("invalid Solana destination selected"));
-                        }
-                    };
-                    let fee_lamports = match estimate_solana_native_transfer_fee_lamports(
-                        &config.solana_rpc_url,
-                        &source_solana_address,
-                        destination,
-                    )
-                    .await
-                    {
-                        Ok(v) => v as u128,
-                        Err(err) => {
-                            eprintln!("Failed to estimate Solana tx fee: {err}");
-                            return Err(anyhow!("failed to estimate Solana tx fee: {err}"));
-                        }
-                    };
-                    let send_native = native_balance_lamports.saturating_sub(fee_lamports);
-                    if send_native == 0 {
-                        eprintln!(
-                            "Not enough SOL balance to sweep; aborting. native_balance_lamports={} estimated_fee_lamports={}",
-                            native_balance_lamports, fee_lamports
-                        );
-                        return Err(anyhow!("not enough SOL balance to sweep"));
-                    }
-                    ChainTokenAmount {
-                        token: token.clone(),
-                        value: Nat::from(send_native),
-                    }
-                }
-                ChainToken::SolanaSpl { .. } => {
-                    let native_balance_lamports =
-                        match solana_native_balance_lamports_for_source(&ctx, source_kind, &assets).await {
-                            Ok(v) => v,
-                            Err(err) => {
-                                eprintln!("Failed to read SOL balance for fees: {err}");
-                                return Err(anyhow!("failed to read SOL balance for fees: {err}"));
-                            }
-                        };
-                    if native_balance_lamports <= SOLANA_SPL_FEE_RESERVE_LAMPORTS {
-                        eprintln!(
-                            "Not enough SOL balance to cover SPL transfer fees; aborting. native_balance_lamports={} required_reserve_lamports={}",
-                            native_balance_lamports, SOLANA_SPL_FEE_RESERVE_LAMPORTS
-                        );
-                        return Err(anyhow!("not enough SOL balance to cover SPL transfer fees"));
-                    }
-                    ChainTokenAmount {
-                        token: token.clone(),
-                        value: bal_opt
-                            .as_ref()
-                            .map(|b| b.value.clone())
-                            .unwrap_or_else(|| Nat::from(0u8)),
-                    }
-                }
-            }
-        } else {
-            ChainTokenAmount::from_decimal_str(token.clone(), amount).map_err(|err| anyhow!("{err}; aborting."))?
-        };
-
-        plan.push((id, token, destination_account, amount_nat, bal_fmt));
-    }
-
-    if plan.is_empty() {
-        bail!("no transfers to execute.");
-    }
-
-    // Echo plan
-    println!("Planned transfers (non-interactive):\n");
-    for (i, (asset_id, token, to, amt, bal)) in plan.iter().enumerate() {
-        let src = match token {
-            ChainToken::Icp { .. } => {
-                if source_kind == "bridge" {
-                    config.bridge_ic_account().to_string()
-                } else {
-                    account.to_string()
-                }
-            }
-            ChainToken::EvmNative { .. } | ChainToken::EvmErc20 { .. } => {
-                if source_kind == "bridge" {
-                    config.bridge_evm_address.clone()
-                } else {
-                    ctx.evm_address.clone()
-                }
-            }
-            ChainToken::SolanaNative { .. } | ChainToken::SolanaSpl { .. } => source_solana_address.clone(),
-        };
-        let dst = match to {
-            ChainAccount::Icp(acc) => acc.to_string(),
-            ChainAccount::Evm(addr) => addr.clone(),
-            ChainAccount::IcpLedger(v) => v.clone(),
-            ChainAccount::Solana(addr) => addr.clone(),
-        };
-
-        println!("Transfer #{}:", i + 1);
-        println!("  Source:      {}", src);
-        println!("  Destination: {}", dst);
-        println!("  Asset:       {}", asset_id.symbol);
-        println!("  Amount:      {}", amt.formatted());
-        println!("  Balance:     {}", bal);
-        println!();
-    }
-
-    // Every transfer is still attempted and reported, but a failure has to
-    // reach the exit code: a caller that reads only the status must not be
-    // told the funds moved when they did not.
-    let mut failures: Vec<String> = Vec::new();
-
-    for (asset_id, token, to, amt, bal_fmt) in &plan {
-        let transfer_service = transfer_service_for_source(&ctx, source_kind, &asset_id.symbol);
-        let src = match token {
-            ChainToken::Icp { .. } => {
-                if source_kind == "bridge" {
-                    config.bridge_ic_account().to_string()
-                } else {
-                    account.to_string()
-                }
-            }
-            ChainToken::EvmNative { .. } | ChainToken::EvmErc20 { .. } => {
-                if source_kind == "bridge" {
-                    config.bridge_evm_address.clone()
-                } else {
-                    ctx.evm_address.clone()
-                }
-            }
-            ChainToken::SolanaNative { .. } | ChainToken::SolanaSpl { .. } => source_solana_address.clone(),
-        };
-        let dst = match to {
-            ChainAccount::Icp(acc) => acc.to_string(),
-            ChainAccount::Evm(addr) => addr.clone(),
-            ChainAccount::IcpLedger(v) => v.clone(),
-            ChainAccount::Solana(addr) => addr.clone(),
-        };
-
-        match transfer_service
-            .transfer_by_asset_id(asset_id, to.clone(), amt.value.clone())
-            .await
-        {
-            Ok(txid) => {
-                println!("Transfer result:");
-                println!("  Source:      {}", src);
-                println!("  Destination: {}", dst);
-                println!("  Asset:       {}", asset_id.symbol);
-                println!("  Amount:      {}", amt.formatted());
-                println!("  Balance:     {}", bal_fmt);
-                println!("  Result:      ok: {}", txid);
-                println!();
-            }
-            Err(e) => {
-                println!("Transfer result:");
-                println!("  Source:      {}", src);
-                println!("  Destination: {}", dst);
-                println!("  Asset:       {}", asset_id.symbol);
-                println!("  Amount:      {}", amt.formatted());
-                println!("  Balance:     {}", bal_fmt);
-                println!("  Result:      err: {}", e);
-                println!();
-                failures.push(format!("{}: {e}", asset_id.symbol));
-            }
-        }
-    }
-
-    // Show updated destination balances only for pure ICP-destination plans.
-    let icp_destination = plan.iter().try_fold(None::<Account>, |acc, (_, _, to, _, _)| match to {
-        ChainAccount::Icp(a) => match acc {
-            None => Ok(Some(a.clone())),
-            Some(existing) if existing == *a => Ok(Some(existing)),
-            Some(_) => Err(()),
-        },
-        _ => Err(()),
-    });
-
-    if let Ok(Some(dst_account)) = icp_destination {
-        let balances_after = sync_balances(agent, &icp_assets, dst_account.clone()).await;
-        println!("Updated destination balances ({dst_account}):");
-        for (principal, formatted) in balances_after {
-            println!("  {} | {}", principal, formatted);
-        }
-    }
-
-    if !failures.is_empty() {
-        bail!("{} of {} transfers failed: {}", failures.len(), plan.len(), failures.join("; "));
-    }
-
-    Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn only_a_checksummed_account_id_on_the_icp_ledger_is_a_ledger_destination() {
-        let icp = Principal::from_text(crate::utils::ICP_LEDGER_PRINCIPAL).unwrap();
-        let other = Principal::from_text("xevnm-gaaaa-aaaar-qafnq-cai").unwrap();
-        let id = "D26A53ADB4DE6404F3D4A7B7978D233A99AFF6DFD35B45C41AE1AAB4CA249B9F";
-        assert_eq!(native_icp_account_id(icp, id).as_deref(), Some(id.to_ascii_lowercase().as_str()));
-        assert_eq!(native_icp_account_id(other, id), None, "ICRC tokens need an Account");
-        let typo = "e26a53adb4de6404f3d4a7b7978d233a99aff6dfd35b45c41ae1aab4ca249b9f";
-        assert_eq!(native_icp_account_id(icp, typo), None, "a bad checksum must not pass");
-        assert_eq!(native_icp_account_id(icp, "main"), None);
-    }
 }

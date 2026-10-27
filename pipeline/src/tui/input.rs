@@ -10,7 +10,7 @@ use tokio::time::timeout;
 use crate::commands::liquidation_loop::LoopControl;
 use crate::control_plane::{ControlCommand, send_control_command};
 
-use super::app::{App, BalancesPanel, Tab, UiFocus, WithdrawDestinationKind, WithdrawField};
+use super::app::{App, BalancesPanel, Tab, UiFocus, WithdrawDestination, WithdrawField, WithdrawSource};
 use super::events::UiEvent;
 use super::log_source::LogControlHandle;
 use super::reconcile::{handle_reconcile_key, open_reconcile};
@@ -83,59 +83,66 @@ fn scroll_dashboard_logs_down(app: &mut App, entries: usize) {
     }
 }
 
-fn selected_withdraw_asset_is_icp(app: &App) -> bool {
-    app.withdraw_assets
+const WITHDRAW_FIELDS: [WithdrawField; 6] = [
+    WithdrawField::Source,
+    WithdrawField::Destination,
+    WithdrawField::ManualDestination,
+    WithdrawField::Asset,
+    WithdrawField::Amount,
+    WithdrawField::Submit,
+];
+const WITHDRAW_SOURCES: [WithdrawSource; 4] = [
+    WithdrawSource::Main,
+    WithdrawSource::Trader,
+    WithdrawSource::Recovery,
+    WithdrawSource::Bridge,
+];
+const ICP_DESTINATIONS: [WithdrawDestination; 5] = [
+    WithdrawDestination::Main,
+    WithdrawDestination::Trader,
+    WithdrawDestination::Recovery,
+    WithdrawDestination::Bridge,
+    WithdrawDestination::Manual,
+];
+// Trader and recovery hold ICP tokens only.
+const OTHER_DESTINATIONS: [WithdrawDestination; 3] = [
+    WithdrawDestination::Main,
+    WithdrawDestination::Bridge,
+    WithdrawDestination::Manual,
+];
+
+/// The option `step` places away from `current`, wrapping at both ends. A
+/// value the list does not hold restarts at the first option.
+fn cycle<T: Copy + PartialEq>(options: &[T], current: T, step: isize) -> T {
+    let Some(index) = options.iter().position(|option| *option == current) else {
+        return options[0];
+    };
+    options[(index as isize + step).rem_euclid(options.len() as isize) as usize]
+}
+
+fn destination_options(app: &App) -> &'static [WithdrawDestination] {
+    let icp = app
+        .withdraw_assets
         .get(app.withdraw.asset_idx)
-        .map(|asset| asset.chain.eq_ignore_ascii_case("icp"))
-        .unwrap_or(true)
+        .is_none_or(|asset| asset.chain.eq_ignore_ascii_case("icp"));
+    if icp { &ICP_DESTINATIONS } else { &OTHER_DESTINATIONS }
 }
 
-fn normalize_destination_for_selected_asset(app: &mut App) {
-    if !selected_withdraw_asset_is_icp(app)
-        && matches!(
-            app.withdraw.destination,
-            WithdrawDestinationKind::Trader | WithdrawDestinationKind::Recovery
-        )
-    {
-        app.withdraw.destination = WithdrawDestinationKind::Main;
-    }
-}
-
-fn rotate_destination_left(current: WithdrawDestinationKind, allow_icp_destinations: bool) -> WithdrawDestinationKind {
-    if allow_icp_destinations {
-        match current {
-            WithdrawDestinationKind::Main => WithdrawDestinationKind::Manual,
-            WithdrawDestinationKind::Trader => WithdrawDestinationKind::Main,
-            WithdrawDestinationKind::Recovery => WithdrawDestinationKind::Trader,
-            WithdrawDestinationKind::Bridge => WithdrawDestinationKind::Recovery,
-            WithdrawDestinationKind::Manual => WithdrawDestinationKind::Bridge,
+/// Moves the value of the selected withdraw field one option left or right.
+fn step_withdraw_choice(app: &mut App, step: isize) {
+    match app.withdraw.field {
+        WithdrawField::Source => app.withdraw.source = cycle(&WITHDRAW_SOURCES, app.withdraw.source, step),
+        WithdrawField::Destination => {
+            app.withdraw.destination = cycle(destination_options(app), app.withdraw.destination, step);
         }
-    } else {
-        match current {
-            WithdrawDestinationKind::Main => WithdrawDestinationKind::Manual,
-            WithdrawDestinationKind::Bridge => WithdrawDestinationKind::Main,
-            WithdrawDestinationKind::Manual => WithdrawDestinationKind::Bridge,
-            WithdrawDestinationKind::Trader | WithdrawDestinationKind::Recovery => WithdrawDestinationKind::Main,
+        WithdrawField::Asset if !app.withdraw_assets.is_empty() => {
+            let count = app.withdraw_assets.len() as isize;
+            app.withdraw.asset_idx = (app.withdraw.asset_idx as isize + step).rem_euclid(count) as usize;
+            if !destination_options(app).contains(&app.withdraw.destination) {
+                app.withdraw.destination = WithdrawDestination::Main;
+            }
         }
-    }
-}
-
-fn rotate_destination_right(current: WithdrawDestinationKind, allow_icp_destinations: bool) -> WithdrawDestinationKind {
-    if allow_icp_destinations {
-        match current {
-            WithdrawDestinationKind::Main => WithdrawDestinationKind::Trader,
-            WithdrawDestinationKind::Trader => WithdrawDestinationKind::Recovery,
-            WithdrawDestinationKind::Recovery => WithdrawDestinationKind::Bridge,
-            WithdrawDestinationKind::Bridge => WithdrawDestinationKind::Manual,
-            WithdrawDestinationKind::Manual => WithdrawDestinationKind::Main,
-        }
-    } else {
-        match current {
-            WithdrawDestinationKind::Main => WithdrawDestinationKind::Bridge,
-            WithdrawDestinationKind::Bridge => WithdrawDestinationKind::Manual,
-            WithdrawDestinationKind::Manual => WithdrawDestinationKind::Main,
-            WithdrawDestinationKind::Trader | WithdrawDestinationKind::Recovery => WithdrawDestinationKind::Main,
-        }
+        _ => {}
     }
 }
 
@@ -708,76 +715,17 @@ pub(super) async fn handle_key(
         {
             // Withdraw form key handling.
             match code {
-                KeyCode::Down => {
-                    app.withdraw.field = match app.withdraw.field {
-                        WithdrawField::Source => WithdrawField::Destination,
-                        WithdrawField::Destination => WithdrawField::ManualDestination,
-                        WithdrawField::ManualDestination => WithdrawField::Asset,
-                        WithdrawField::Asset => WithdrawField::Amount,
-                        WithdrawField::Amount => WithdrawField::Submit,
-                        WithdrawField::Submit => WithdrawField::Source,
-                    };
-                }
-                KeyCode::Up => {
-                    app.withdraw.field = match app.withdraw.field {
-                        WithdrawField::Source => WithdrawField::Submit,
-                        WithdrawField::Destination => WithdrawField::Source,
-                        WithdrawField::ManualDestination => WithdrawField::Destination,
-                        WithdrawField::Asset => WithdrawField::ManualDestination,
-                        WithdrawField::Amount => WithdrawField::Asset,
-                        WithdrawField::Submit => WithdrawField::Amount,
-                    };
-                }
-                KeyCode::Left => match app.withdraw.field {
-                    WithdrawField::Source => {
-                        app.withdraw.source = match app.withdraw.source {
-                            super::app::WithdrawAccountKind::Main => super::app::WithdrawAccountKind::Bridge,
-                            super::app::WithdrawAccountKind::Trader => super::app::WithdrawAccountKind::Main,
-                            super::app::WithdrawAccountKind::Recovery => super::app::WithdrawAccountKind::Trader,
-                            super::app::WithdrawAccountKind::Bridge => super::app::WithdrawAccountKind::Recovery,
-                        };
-                    }
-                    WithdrawField::Destination => {
-                        app.withdraw.destination =
-                            rotate_destination_left(app.withdraw.destination, selected_withdraw_asset_is_icp(app));
-                    }
-                    WithdrawField::Asset => {
-                        if !app.withdraw_assets.is_empty() {
-                            app.withdraw.asset_idx =
-                                (app.withdraw.asset_idx + app.withdraw_assets.len() - 1) % app.withdraw_assets.len();
-                            normalize_destination_for_selected_asset(app);
-                        }
-                    }
-                    _ => {}
-                },
-                KeyCode::Right => match app.withdraw.field {
-                    WithdrawField::Source => {
-                        app.withdraw.source = match app.withdraw.source {
-                            super::app::WithdrawAccountKind::Main => super::app::WithdrawAccountKind::Trader,
-                            super::app::WithdrawAccountKind::Trader => super::app::WithdrawAccountKind::Recovery,
-                            super::app::WithdrawAccountKind::Recovery => super::app::WithdrawAccountKind::Bridge,
-                            super::app::WithdrawAccountKind::Bridge => super::app::WithdrawAccountKind::Main,
-                        };
-                    }
-                    WithdrawField::Destination => {
-                        app.withdraw.destination =
-                            rotate_destination_right(app.withdraw.destination, selected_withdraw_asset_is_icp(app));
-                    }
-                    WithdrawField::Asset => {
-                        if !app.withdraw_assets.is_empty() {
-                            app.withdraw.asset_idx = (app.withdraw.asset_idx + 1) % app.withdraw_assets.len();
-                            normalize_destination_for_selected_asset(app);
-                        }
-                    }
-                    _ => {}
-                },
+                KeyCode::Down => app.withdraw.field = cycle(&WITHDRAW_FIELDS, app.withdraw.field, 1),
+                KeyCode::Up => app.withdraw.field = cycle(&WITHDRAW_FIELDS, app.withdraw.field, -1),
+                KeyCode::Left => step_withdraw_choice(app, -1),
+                KeyCode::Right => step_withdraw_choice(app, 1),
                 KeyCode::Enter => match app.withdraw.field {
                     WithdrawField::Amount => {
                         app.withdraw.editing = Some(WithdrawField::Amount);
                         app.withdraw.edit_backup = Some(app.withdraw.amount.clone());
                     }
                     WithdrawField::ManualDestination => {
-                        if matches!(app.withdraw.destination, super::app::WithdrawDestinationKind::Manual) {
+                        if matches!(app.withdraw.destination, WithdrawDestination::Manual) {
                             app.withdraw.manual_destination.clear();
                             app.withdraw.editing = Some(WithdrawField::ManualDestination);
                             app.withdraw.edit_backup = Some(String::new());
@@ -871,37 +819,11 @@ mod tests {
 
     use super::{edit_withdraw_text, scroll_dashboard_logs_up, scroll_logs_up};
     use crate::commands::liquidation_loop::LoopControl;
-    use crate::tui::app::{App, BalancesPanel, ConfigSummary, Tab, WithdrawField};
-
-    fn sample_config() -> ConfigSummary {
-        ConfigSummary {
-            ic_url: "https://ic0.app".to_string(),
-            lending_canister: "nja4y-2yaaa-aaaae-qddxa-cai".to_string(),
-            icpswap_factory: "4mmnk-kiaaa-aaaag-qbllq-cai".to_string(),
-            liquidator_principal: "aaaaa-aa".to_string(),
-            trader_principal: "bbbbb-bb".to_string(),
-            evm_address: "0x0".to_string(),
-            solana_address: "So11111111111111111111111111111111111111112".to_string(),
-            bridge_evm_address: "0xbridge".to_string(),
-            bridge_solana_address: "So11111111111111111111111111111111111111112".to_string(),
-            bridge_ic_owner_principal: "ccccc-cc".to_string(),
-            bridge_btc_address: "bc1qbridge".to_string(),
-            enabled_swap_venues: "icpswap,mexc".to_string(),
-            max_dex_slippage_bps: 500,
-            max_cex_slippage_bps: 200,
-            bad_debt_collateral_slippage_bps: 500,
-            buy_bad_debt: false,
-            opportunity_filter: vec![],
-            control_socket: "/tmp/liquidator/ctl.sock".to_string(),
-            log_source: "Log source file: /tmp/liquidator/liquidator.log".to_string(),
-            db_path: "./wal.db".to_string(),
-            export_path: "executions.csv".to_string(),
-        }
-    }
+    use crate::tui::app::{App, BalancesPanel, Tab, WithdrawField, test_app};
 
     #[test]
     fn logs_scroll_up_reports_top_edge() {
-        let mut app = App::new(vec![], sample_config());
+        let mut app = test_app();
         app.engine = LoopControl::Running;
         app.logs_scroll_active = true;
         app.logs_follow = false;
@@ -915,7 +837,7 @@ mod tests {
 
     #[test]
     fn dashboard_scroll_up_reports_top_edge() {
-        let mut app = App::new(vec![], sample_config());
+        let mut app = test_app();
         app.engine = LoopControl::Running;
         app.dashboard_logs_scroll_active = true;
         app.dashboard_logs_follow = false;
@@ -928,7 +850,7 @@ mod tests {
     }
 
     fn editing_app(field: WithdrawField) -> App {
-        let mut app = App::new(vec![], sample_config());
+        let mut app = test_app();
         app.tab = Tab::Balances;
         app.balances_panel = BalancesPanel::Withdraw;
         app.withdraw.editing = Some(field);

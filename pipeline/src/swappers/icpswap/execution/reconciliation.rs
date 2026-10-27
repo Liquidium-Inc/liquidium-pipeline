@@ -6,16 +6,13 @@ use tracing::info;
 
 use crate::swappers::icpswap::{
     client::IcpswapManualClient,
-    manual::pool_user_account,
+    manual::{pool_user_account, saved_deposit_account},
     state::{
         MAX_MANUAL_SLIPPAGE_STEPS, MAX_MANUAL_TRADE_RETRIES, MIN_UNCHANGED_TRADE_OBSERVATIONS,
         PENDING_TRADE_RECONCILIATION_TIMEOUT_NANOS, retry_backoff_nanos,
     },
     transfer_state::{IcpswapLedgerTransferState, IcpswapSettlementKind},
-    types::{
-        IcpswapError, IcpswapExecutionPlan, IcpswapOperatorAnswer, IcpswapState, IcpswapStep, IcpswapTransferState,
-        IcpswapUnusedBalance,
-    },
+    types::{IcpswapClientError, IcpswapError, IcpswapOperatorAnswer, IcpswapState, IcpswapStep, IcpswapTransferState},
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -65,11 +62,10 @@ pub(crate) async fn observe_deposit(client: &dyn IcpswapManualClient, state: &Ic
         .input_pool_balance_before
         .clone()
         .ok_or_else(|| "manual deposit is missing its input-pool baseline".to_string())?;
-    let unused = client
-        .unused_balance(state.plan.pool, state.owner.owner)
+    let current = pool_balances(client, state)
         .await
-        .map_err(|error| error.to_string())?;
-    let current = input_balance(&state.plan, &unused);
+        .map_err(|error| error.to_string())?
+        .input;
     let required = before.clone() + state.plan.amount_in.value.clone();
     let confirmed = current >= required;
     info!(
@@ -120,12 +116,10 @@ pub(crate) async fn observe_trade(
         .output_pool_balance_before
         .clone()
         .ok_or_else(|| "manual swap is missing its output-pool baseline".to_string())?;
-    let unused = client
-        .unused_balance(state.plan.pool, state.owner.owner)
-        .await
-        .map_err(|error| error.to_string())?;
-    let input_now = input_balance(&state.plan, &unused);
-    let output_now = output_balance(&state.plan, &unused);
+    let PoolBalances {
+        input: input_now,
+        output: output_now,
+    } = pool_balances(client, state).await.map_err(|error| error.to_string())?;
     if input_now == input_before && output_now == output_before {
         return Ok(TradeObservation::Unchanged);
     }
@@ -266,12 +260,12 @@ pub(crate) async fn observe_output_withdrawal(
         .wallet_balance_before
         .as_ref()
         .ok_or_else(|| "manual output withdrawal is missing its wallet baseline".to_string())?;
-    let (unused, wallet_now) = tokio::try_join!(
-        client.unused_balance(state.plan.pool, state.owner.owner),
+    let (pool, wallet_now) = tokio::try_join!(
+        pool_balances(client, state),
         client.ledger_balance(state.plan.token_out, &state.owner),
     )
     .map_err(|error| error.to_string())?;
-    let pool_now = output_balance(&state.plan, &unused);
+    let pool_now = pool.output;
     let expected_credit = nat_saturating_sub(&args.amount, &args.fee);
     let wallet_delta = nat_saturating_sub(&wallet_now, wallet_before);
     if pool_now <= nat_saturating_sub(pool_before, &args.amount) && wallet_delta >= expected_credit {
@@ -314,12 +308,12 @@ pub(crate) async fn observe_recovery(
         .wallet_balance_before
         .as_ref()
         .ok_or_else(|| "manual recovery is missing its wallet baseline".to_string())?;
-    let (unused, wallet_now) = tokio::try_join!(
-        client.unused_balance(state.plan.pool, state.owner.owner),
+    let (pool, wallet_now) = tokio::try_join!(
+        pool_balances(client, state),
         client.ledger_balance(state.plan.token_in, &state.owner),
     )
     .map_err(|error| error.to_string())?;
-    let pool_now = input_balance(&state.plan, &unused);
+    let pool_now = pool.input;
     let expected_credit = nat_saturating_sub(&args.amount, &args.fee);
     let wallet_delta = nat_saturating_sub(&wallet_now, wallet_before);
     if pool_now <= nat_saturating_sub(pool_before, &args.amount) && wallet_delta >= expected_credit {
@@ -436,7 +430,7 @@ async fn answer_parked_transfer(
         Some(args) => (args.to, args.amount.clone()),
         None => (
             pool_user_account(state.plan.pool, state.owner.owner),
-            state.plan.amount_in.value.clone() + fee.clone(),
+            state.plan.input_with_fee(),
         ),
     };
     let (deposited, wallet) = tokio::try_join!(
@@ -488,13 +482,8 @@ async fn answer_parked_transfer(
 }
 
 async fn redo_parked_deposit(client: &dyn IcpswapManualClient, state: &mut IcpswapState) -> Result<(), String> {
-    let deposit_account = state
-        .transfer
-        .args
-        .as_ref()
-        .map(|args| args.to)
-        .ok_or_else(|| "ICPSwap deposit is missing its persisted ledger destination".to_string())?;
-    let amount = state.plan.amount_in.value.clone() + state.plan.input_ledger_fee.value.clone();
+    let deposit_account = saved_deposit_account(state)?;
+    let amount = state.plan.input_with_fee();
     let held = client
         .ledger_balance(state.plan.token_in, &deposit_account)
         .await
@@ -534,11 +523,8 @@ async fn answer_parked_trade(
                 .output_pool_balance_before
                 .clone()
                 .ok_or_else(|| "manual swap is missing its output-pool baseline".to_string())?;
-            let unused = client
-                .unused_balance(state.plan.pool, state.owner.owner)
-                .await
-                .map_err(|error| error.to_string())?;
-            let produced = nat_saturating_sub(&output_balance(&state.plan, &unused), &before);
+            let pool = pool_balances(client, state).await.map_err(|error| error.to_string())?;
+            let produced = nat_saturating_sub(&pool.output, &before);
             if produced < output {
                 refuse_answer(
                     state,
@@ -571,15 +557,8 @@ async fn redo_parked_withdrawal(
     let amount = args
         .map(|args| args.amount.clone())
         .ok_or_else(|| "parked ICPSwap withdrawal is missing its arguments".to_string())?;
-    let unused = client
-        .unused_balance(state.plan.pool, state.owner.owner)
-        .await
-        .map_err(|error| error.to_string())?;
-    let held = if recovery {
-        input_balance(&state.plan, &unused)
-    } else {
-        output_balance(&state.plan, &unused)
-    };
+    let pool = pool_balances(client, state).await.map_err(|error| error.to_string())?;
+    let held = if recovery { pool.input } else { pool.output };
     if held < amount {
         refuse_answer(
             state,
@@ -625,20 +604,23 @@ pub(crate) fn require_operator(state: &mut IcpswapState, pending: IcpswapStep, m
     state.last_error = Some(message);
 }
 
-pub(crate) fn input_balance(plan: &IcpswapExecutionPlan, unused: &IcpswapUnusedBalance) -> Nat {
-    if plan.zero_for_one {
-        unused.balance0.clone()
-    } else {
-        unused.balance1.clone()
-    }
+/// This leg's unused balances in the pool, named by the swap direction.
+pub(crate) struct PoolBalances {
+    pub(crate) input: Nat,
+    pub(crate) output: Nat,
 }
 
-pub(crate) fn output_balance(plan: &IcpswapExecutionPlan, unused: &IcpswapUnusedBalance) -> Nat {
-    if plan.zero_for_one {
-        unused.balance1.clone()
+pub(crate) async fn pool_balances(
+    client: &dyn IcpswapManualClient,
+    state: &IcpswapState,
+) -> Result<PoolBalances, IcpswapClientError> {
+    let unused = client.unused_balance(state.plan.pool, state.owner.owner).await?;
+    let (input, output) = if state.plan.zero_for_one {
+        (unused.balance0, unused.balance1)
     } else {
-        unused.balance0.clone()
-    }
+        (unused.balance1, unused.balance0)
+    };
+    Ok(PoolBalances { input, output })
 }
 
 /// `candid::Nat` has no saturating subtraction and panics on underflow, so the

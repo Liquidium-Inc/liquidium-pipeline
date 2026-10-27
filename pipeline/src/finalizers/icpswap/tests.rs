@@ -599,13 +599,10 @@ async fn multi_venue_checkpoints_pending_state_before_transfer_side_effect() {
     let mut manual = MockIcpswapManualClient::new();
     manual.expect_ledger_transfer().times(1).return_once(move |_, _| {
         let checkpoints = observed.lock().expect("checkpoint lock");
-        let persisted = checkpoints
+        let last = checkpoints
             .last()
-            .expect("transfer intent must be checkpointed before submission")
-            .execution
-            .decode::<IcpswapExecutionState>(ICPSWAP_VENUE_ID)
-            .expect("decode checkpoint")
-            .expect("ICPSwap checkpoint");
+            .expect("transfer intent must be checkpointed before submission");
+        let persisted = decoded(&last.execution);
         assert_eq!(persisted.step, IcpswapStep::TransferPending);
         assert!(persisted.transfer.args.is_some());
         Err(IcpswapClientError::LedgerTransfer {
@@ -663,13 +660,10 @@ async fn multi_venue_submits_deposit_after_checkpoint_in_the_same_cycle() {
         .return_once(|_, _| Ok(Nat::from(100_010u64)));
     manual.expect_deposit().times(1).return_once(move |pool, _| {
         let checkpoints = observed.lock().expect("checkpoint lock");
-        let persisted = checkpoints
+        let last = checkpoints
             .last()
-            .expect("deposit intent must be checkpointed before submission")
-            .execution
-            .decode::<IcpswapExecutionState>(ICPSWAP_VENUE_ID)
-            .expect("decode checkpoint")
-            .expect("ICPSwap checkpoint");
+            .expect("deposit intent must be checkpointed before submission");
+        let persisted = decoded(&last.execution);
         assert_eq!(persisted.step, IcpswapStep::DepositPending);
         assert!(persisted.deposit.ready_to_submit);
         Err(IcpswapClientError::SubmissionUnknown {
@@ -683,11 +677,7 @@ async fn multi_venue_submits_deposit_after_checkpoint_in_the_same_cycle() {
         .advance(&leg, &checkpoint)
         .await
         .expect("submit checkpointed deposit");
-    let submitted_state = submitted
-        .execution
-        .decode::<IcpswapExecutionState>(ICPSWAP_VENUE_ID)
-        .expect("decode")
-        .expect("ICPSwap state");
+    let submitted_state = decoded(&submitted.execution);
     assert_eq!(submitted_state.step, IcpswapStep::DepositPending);
     assert!(!submitted_state.deposit.ready_to_submit);
     assert!(submitted_state.next_attempt_at_nanos.is_some());
@@ -832,11 +822,7 @@ async fn multi_venue_operator_required_state_parks_only_its_isolated_leg() {
     assert_eq!(progress.status, VenueLegStatus::OperatorRequired);
     assert!(progress.result.is_none());
     assert_eq!(progress.last_error.as_deref(), Some("withdrawal outcome is ambiguous"));
-    let persisted = progress
-        .execution
-        .decode::<IcpswapExecutionState>(ICPSWAP_VENUE_ID)
-        .expect("decode persisted ICPSwap state")
-        .expect("ICPSwap state");
+    let persisted = decoded(&progress.execution);
     assert_eq!(persisted.step, IcpswapStep::OperatorRequired);
 }
 

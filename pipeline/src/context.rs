@@ -60,16 +60,6 @@ pub struct PipelineContext {
     pub approval_state: Arc<ApprovalState>,
 }
 
-impl PipelineContext {
-    pub fn bridge_balance_service_for_symbol(&self, _symbol: &str) -> Arc<BalanceService> {
-        self.bridge_service.clone()
-    }
-
-    pub fn bridge_transfer_service_for_symbol(&self, _symbol: &str) -> Arc<TransferService> {
-        self.bridge_transfers.clone()
-    }
-}
-
 pub struct PipelineContextBuilder<P: Provider<AnyNetwork>> {
     config: Arc<Config>,
     evm_provider_main: Option<P>,
