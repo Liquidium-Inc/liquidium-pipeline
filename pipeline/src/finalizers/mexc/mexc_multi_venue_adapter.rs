@@ -188,15 +188,15 @@ where
             execution.cex.send_saved = false;
         }
 
+        if let Err(error) = &outcome {
+            execution.cex.last_error = Some(error.to_string());
+        }
         let error = match outcome {
             Err(error @ CexBackendError::PendingSettlement(_)) => {
-                let error = error.to_string();
-                execution.cex.last_error = Some(error.clone());
-                return self.settlement_wait_progress(execution, error).await;
+                return self.settlement_wait_progress(execution, error.to_string()).await;
             }
             // No later cycle can raise the amount, so the leg ends here.
             Err(CexBackendError::BelowMinimum(message)) => {
-                execution.cex.last_error = Some(message.clone());
                 execution.cex.step = CexStep::Failed;
                 let mut progress = self.progress_for(execution, Some(message))?;
                 progress.failure = Some(VenueLegFailure::BelowMinimum);
@@ -205,14 +205,9 @@ where
             // Only an operator can say which row owns the provider record, or
             // whether a call without an answer moved funds.
             Err(CexBackendError::Ambiguous(message)) => {
-                execution.cex.last_error = Some(message.clone());
                 return self.operator_required_progress(execution, message);
             }
-            Err(error) => {
-                let error = error.to_string();
-                execution.cex.last_error = Some(error.clone());
-                Some(error)
-            }
+            Err(error) => Some(error.to_string()),
             // Any step that completes without an error proves the venue is
             // caught up, so a later wait starts from its own first refusal.
             Ok(()) => {
