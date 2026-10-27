@@ -21,6 +21,9 @@ pub enum SendOutcome {
     /// The sender was not ready, for example a busy wallet. The send did not
     /// happen, and a new send later is safe.
     Deferred { reason: String },
+    /// The send was mined and reverted, so no funds moved. A new send is safe
+    /// but costs gas again, so the caller bounds the repeats.
+    Reverted { reason: String },
     /// No decided answer yet.
     Open { reason: String },
 }

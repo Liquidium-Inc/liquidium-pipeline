@@ -384,13 +384,15 @@ proptest! {
 
             let mut state = finalizer.prepare("42", &receipt).await.expect("prepare should succeed");
             state.step = CexStep::Trade;
-            // Force single-leg route for deterministic retry assertions.
+            // Force single-leg route for deterministic retry assertions. The plan
+            // made at prepare time still names the old asset, so override it too.
             state.withdraw.withdraw_asset = ChainToken::Icp {
                 ledger: Principal::anonymous(),
                 symbol: "BTC".to_string(),
                 decimals: 8,
                 fee: Nat::from(1_000u64),
             };
+            state.withdraw.bridge.withdraw_planned_asset = Some("BTC".to_string());
 
             let first = finalizer.trade(&mut state).await.expect_err("first attempt should fail");
             assert!(first.to_string().contains("slice slippage too high"));

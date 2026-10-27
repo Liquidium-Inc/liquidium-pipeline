@@ -224,7 +224,8 @@ impl SolanaBackendImpl {
                 SendOutcome::Landed { receipt } => return Ok(receipt),
                 SendOutcome::NeverLanded { reason }
                 | SendOutcome::BelowMinimum { reason }
-                | SendOutcome::Deferred { reason } => return Err(TransferFailure::Rejected(reason)),
+                | SendOutcome::Deferred { reason }
+                | SendOutcome::Reverted { reason } => return Err(TransferFailure::Rejected(reason)),
                 SendOutcome::Open { reason } if Instant::now() >= deadline => {
                     return Err(TransferFailure::Ambiguous(format!(
                         "solana transaction {} has no decided answer: {reason}",

@@ -1018,7 +1018,8 @@ where
                     state.transfer_signature, state.account
                 )));
             };
-            return Ok(match self.deposit_status(deposit_id).await? {
+            let deposit = self.deposit_status(deposit_id).await.map_err(BridgeError::Unreadable)?;
+            return Ok(match deposit {
                 DepositSolStatus::Minted { block_index, minted_amount } => BridgeStatus::Minted(BridgeMintReceipt {
                     transaction_hash: state.transfer_signature,
                     log_index: Nat::from(deposit_id),
@@ -1043,7 +1044,10 @@ where
             });
         }
         if let Some(block_index) = Self::parse_withdraw_bridge_id(bridge_id)? {
-            let status = self.withdrawal_status(block_index).await?;
+            let status = self
+                .withdrawal_status(block_index)
+                .await
+                .map_err(BridgeError::Unreadable)?;
             return Ok(match status {
                 CkSolWithdrawalStatus::Pending | CkSolWithdrawalStatus::TxSent { .. } => BridgeStatus::Pending,
                 CkSolWithdrawalStatus::TxFinalized(CkSolTxFinalizedStatus::Success { .. }) => BridgeStatus::Completed,
@@ -1063,7 +1067,8 @@ where
                 &state.account,
                 "cksol bridge",
             )
-            .await?;
+            .await
+            .map_err(BridgeError::Unreadable)?;
             if current_balance >= state.threshold {
                 return Ok(BridgeStatus::Completed);
             }

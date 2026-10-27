@@ -195,6 +195,8 @@ impl CexBackend for MexcClient {
                     }
                 }
             }
+            // A request that never reached MEXC placed no order, so there is nothing to look up.
+            Err(submit_err @ CexBackendError::Unreachable(_)) => Err(submit_err),
             Err(submit_err) => {
                 if let Some(client_order_id) = options.client_order_id.as_deref() {
                     let recovered = {
@@ -398,6 +400,11 @@ impl CexBackend for MexcClient {
                         break;
                     }
                     Err(e) => {
+                        if is_unreachable(&e) {
+                            return Err(WithdrawError::Unreachable(format!(
+                                "MEXC withdraw coin={coin} network={net} could not reach MEXC: {e}"
+                            )));
+                        }
                         // A request MEXC may have executed ends the search: the
                         // next alias would be a second withdrawal of the same funds.
                         if !is_definite_rejection(&e) {

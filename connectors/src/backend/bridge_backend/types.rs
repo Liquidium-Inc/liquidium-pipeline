@@ -168,6 +168,10 @@ pub enum BridgeError {
     /// can say what happened, so no automatic retry is safe.
     #[error("{0}")]
     Ambiguous(String),
+    /// The provider could not be read, so the status is unknown. The caller
+    /// keeps waiting; the read says nothing about the funds.
+    #[error("{0}")]
+    Unreadable(String),
     /// Any other failure.
     #[error("{0}")]
     Other(String),

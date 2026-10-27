@@ -44,28 +44,47 @@ where
         match step_outbound(&mut state.withdraw.withdraw_send, &sender, None, now_ts()).await {
             Ok(landed) => Ok(landed.as_deref().map(AcceptedWithdrawal::parse)),
             Err(OutboundError::BelowMinimum(error)) => {
-                Self::complete_withdraw_as_below_min_dust(state, asset, network, amount, &error);
+                self.settle_withdraw_below_min(state, asset, network, amount, &error)
+                    .await?;
                 Ok(None)
             }
-            Err(OutboundError::Park(error)) => Err(CexBackendError::Ambiguous(error)),
-            // The request did not happen, so the next one takes a new order id.
-            Err(OutboundError::Retry(error) | OutboundError::Deferred(error)) => {
+            Err(OutboundError::Park(error) | OutboundError::Reverted(error)) => Err(CexBackendError::Ambiguous(error)),
+            // MEXC could not be reached, so the same order id is still unused.
+            Err(OutboundError::Deferred(error)) => Err(CexBackendError::Unreachable(error)),
+            // MEXC refused the request, so the next one takes a new order id.
+            Err(OutboundError::Retry(error)) => {
                 state.withdraw.withdraw_attempt += 1;
                 Err(error.into())
             }
         }
     }
 
-    fn complete_withdraw_as_below_min_dust(
+    /// Writes off a refused withdrawal as dust only when it prices under the
+    /// dust floor. A larger or unpriceable amount stays on MEXC for an operator.
+    async fn settle_withdraw_below_min(
+        &self,
         state: &mut CexState,
         planned_asset: &str,
         planned_network: &str,
         amount: f64,
-        err: &str,
-    ) {
+        refusal: &str,
+    ) -> Result<(), CexBackendError> {
+        let usd = self
+            .amount_symbol_to_usd(planned_asset, amount)
+            .await
+            .map_err(|error| {
+                format!("{refusal}; {amount} {planned_asset} stays on MEXC because it could not be priced: {error}")
+            })?;
+        if usd > self.cex_min_exec_usd {
+            return Err(format!(
+                "{refusal}; {amount} {planned_asset} (~{usd:.2} USD) is above the {} USD dust floor, so it stays on MEXC for an operator",
+                self.cex_min_exec_usd
+            )
+            .into());
+        }
         let msg = format!(
-            "mexc withdraw below minimum; treating residual as CEX dust for liq_id {} asset={} network={} amount={} err={}",
-            state.liq_id, planned_asset, planned_network, amount, err
+            "mexc withdraw below minimum; treating residual as CEX dust for liq_id {} asset={} network={} amount={} (~{usd:.4} USD) err={}",
+            state.liq_id, planned_asset, planned_network, amount, refusal
         );
         warn!("{}", msg);
         state.last_error = Some(msg);
@@ -74,6 +93,7 @@ where
             Nat::from(0u8),
         ));
         state.step = CexStep::Completed;
+        Ok(())
     }
 
     /// A withdrawal straight to the final address: fix the destination, then

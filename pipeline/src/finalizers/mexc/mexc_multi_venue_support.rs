@@ -111,6 +111,7 @@ where
                 withdraw_send: None,
                 size_out: None,
                 bridge: CexWithdrawBridgeState {
+                    withdraw_bridge_reverts: 0,
                     withdraw_planned_asset: Some(bridge_plan.withdraw.cex_asset),
                     withdraw_planned_network: Some(bridge_plan.withdraw.cex_network),
                     withdraw_bridge_required: bridge_plan.withdraw.bridge_required,
@@ -311,10 +312,11 @@ where
                 gas_fee: Nat::from(0u8),
             }],
         };
-        let execution_slippage_bps = self.max_sell_slippage_bps.max(0.0) as u32;
-        let conservative_haircut_bps = execution_slippage_bps
-            .checked_add(self.quote_route_fee_bps)
-            .and_then(|bps| bps.checked_add(self.quote_delay_buffer_bps))
+        // The book walk is already net of price impact and the taker fee, so only costs it
+        // cannot see apply here. Execution still enforces the slippage cap on each slice.
+        let conservative_haircut_bps = self
+            .quote_route_fee_bps
+            .checked_add(self.quote_delay_buffer_bps)
             .ok_or_else(|| "MEXC conservative quote haircut overflowed u32".to_string())?;
         let conservative_value = amount_after_bps_haircut(&receive_amount.value, conservative_haircut_bps)?;
 

@@ -106,6 +106,7 @@ impl<B: CexBackend> OutboundSender for CexWithdrawals<B> {
             Err(WithdrawError::Ambiguous(reason)) => SendOutcome::Open { reason },
             Err(WithdrawError::BelowMinimum(reason)) => SendOutcome::BelowMinimum { reason },
             Err(WithdrawError::Refused(reason)) => SendOutcome::NeverLanded { reason },
+            Err(WithdrawError::Unreachable(reason)) => SendOutcome::Deferred { reason },
         }
     }
 
@@ -174,6 +175,12 @@ mod tests {
                 WithdrawError::Refused("no balance".into()),
                 SendOutcome::NeverLanded {
                     reason: "no balance".into(),
+                },
+            ),
+            (
+                WithdrawError::Unreachable("dns error".into()),
+                SendOutcome::Deferred {
+                    reason: "dns error".into(),
                 },
             ),
         ];

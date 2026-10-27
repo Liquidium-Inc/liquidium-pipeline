@@ -285,13 +285,27 @@ impl WalStore for SqliteWalStore {
             .optional()?;
         let new_attempt = current.unwrap_or(0) + attempt_delta;
 
-        diesel::update(tbl::table.find(liq_id.to_string()))
-            .set((
-                tbl::status.eq(next as i32),
-                tbl::attempt.eq(new_attempt),
-                tbl::updated_at.eq(now),
-            ))
-            .execute(&mut conn)?;
+        // A row that reaches these without an error is moving again, so its
+        // strikes restart. A claim (`InFlight`) proves nothing.
+        if matches!(next, ResultStatus::Enqueued | ResultStatus::Succeeded) {
+            diesel::update(tbl::table.find(liq_id.to_string()))
+                .set((
+                    tbl::status.eq(next as i32),
+                    tbl::attempt.eq(new_attempt),
+                    tbl::error_count.eq(0),
+                    tbl::last_error.eq(None::<String>),
+                    tbl::updated_at.eq(now),
+                ))
+                .execute(&mut conn)?;
+        } else {
+            diesel::update(tbl::table.find(liq_id.to_string()))
+                .set((
+                    tbl::status.eq(next as i32),
+                    tbl::attempt.eq(new_attempt),
+                    tbl::updated_at.eq(now),
+                ))
+                .execute(&mut conn)?;
+        }
         Ok(())
     }
 
@@ -507,8 +521,30 @@ pub fn initialize_schema(conn: &mut SqliteConnection) -> Result<()> {
 
     "#,
     )?;
+    restart_open_attempt_counts_once(conn)?;
     super::super::liquidation_intake::initialize_schema(conn)?;
     Ok(())
+}
+
+/// Older builds added to `attempt` on every claim and release, so an open row
+/// would meet the attempt cap at once. Open rows restart from zero, once.
+fn restart_open_attempt_counts_once(conn: &mut SqliteConnection) -> Result<()> {
+    conn.transaction::<_, anyhow::Error, _>(|conn| {
+        // The marker claims the step, so a second process opening the file skips it.
+        let claimed = diesel::sql_query(
+            "INSERT OR IGNORE INTO database_metadata (metadata_key, metadata_value) VALUES ('attempt_counts_work', '1')",
+        )
+        .execute(conn)?;
+        if claimed == 1 {
+            diesel::sql_query(format!(
+                "UPDATE liquidation_results SET attempt = 0 WHERE status NOT IN ({}, {})",
+                ResultStatus::Succeeded as i32,
+                ResultStatus::FailedPermanent as i32
+            ))
+            .execute(conn)?;
+        }
+        Ok(())
+    })
 }
 
 pub fn apply_pragmas(conn: &mut SqliteConnection, busy_timeout_ms: i64) -> Result<()> {
@@ -723,6 +759,94 @@ mod tests {
         });
     }
 
+    /// Strikes restart once a row moves again without an error; a claim alone
+    /// proves nothing.
+    #[test]
+    fn a_cycle_without_errors_clears_the_strike_count() {
+        let (_temp, store, rt) = temp_store();
+        let now = now_secs();
+
+        rt.block_on(async {
+            store
+                .upsert_result(record("liq", ResultStatus::Enqueued, now, now))
+                .await
+                .expect("seed row");
+            for _ in 0..3 {
+                store
+                    .update_failure("liq", ResultStatus::FailedRetryable, "venue said no".to_string(), true)
+                    .await
+                    .expect("record failure");
+            }
+            async fn strikes(store: &SqliteWalStore) -> i32 {
+                store.get_result("liq").await.expect("read").expect("row").error_count
+            }
+            assert_eq!(strikes(&store).await, 3);
+
+            store
+                .update_status("liq", ResultStatus::InFlight, false)
+                .await
+                .expect("claim row");
+            assert_eq!(strikes(&store).await, 3, "a claim keeps the strikes");
+
+            store
+                .update_status("liq", ResultStatus::Enqueued, false)
+                .await
+                .expect("release row");
+            let row = store.get_result("liq").await.expect("read").expect("row");
+            assert_eq!((row.error_count, row.last_error), (0, None));
+
+            store
+                .update_failure("liq", ResultStatus::FailedRetryable, "venue said no".to_string(), true)
+                .await
+                .expect("record failure");
+            assert_eq!(strikes(&store).await, 1, "the count restarts rather than resuming");
+        });
+    }
+
+    /// Older builds counted every claim and release as an attempt. Open rows
+    /// restart from their strikes once, so the new cap does not park them at once.
+    #[test]
+    fn open_rows_restart_their_attempt_count_once() {
+        use diesel::{Connection as _, connection::SimpleConnection as _, sqlite::SqliteConnection};
+        let temp = tempfile::NamedTempFile::new().expect("tmp db");
+        let path = temp.path().display().to_string();
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        let now = now_secs();
+        let with_counts = |id: &str, status, attempt, error_count| LiqResultRecord {
+            attempt,
+            error_count,
+            ..record(id, status, now, now)
+        };
+
+        let store = SqliteWalStore::new_with_busy_timeout(&path, 5_000).expect("store");
+        rt.block_on(async {
+            store
+                .upsert_result(with_counts("open", ResultStatus::Enqueued, 400, 2))
+                .await
+                .expect("seed open row");
+            store
+                .upsert_result(with_counts("done", ResultStatus::Succeeded, 400, 0))
+                .await
+                .expect("seed finished row");
+        });
+        // A database written by an older build has no marker yet.
+        SqliteConnection::establish(&path)
+            .expect("raw connection")
+            .batch_execute("DELETE FROM database_metadata WHERE metadata_key = 'attempt_counts_work';")
+            .expect("drop marker");
+
+        let attempts =
+            |store: &SqliteWalStore, id: &str| rt.block_on(store.get_result(id)).expect("read").expect("row").attempt;
+        let store = SqliteWalStore::new_with_busy_timeout(&path, 5_000).expect("reopen");
+        assert_eq!(attempts(&store, "open"), 0);
+        assert_eq!(attempts(&store, "done"), 400, "a finished row keeps its history");
+
+        rt.block_on(store.update_status("open", ResultStatus::FailedRetryable, true))
+            .expect("one more attempt");
+        let store = SqliteWalStore::new_with_busy_timeout(&path, 5_000).expect("reopen again");
+        assert_eq!(attempts(&store, "open"), 1, "the restart runs only once");
+    }
+
     #[test]
     fn operator_required_rows_are_persisted_but_not_returned_as_pending() {
         let (_temp, store, rt) = temp_store();
@@ -861,7 +985,8 @@ mod tests {
         let rows = store.list_recent(10).expect("legacy rows");
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].id, "legacy-liq");
-        assert_eq!(rows[0].attempt, 4);
+        // Only the attempt count of the open row restarts.
+        assert_eq!(rows[0].attempt, 0);
         assert_eq!(rows[0].error_count, 2);
         assert_eq!(rows[0].last_error.as_deref(), Some("checkpoint"));
         assert_eq!(rows[0].meta_json, r#"{"version":1}"#);

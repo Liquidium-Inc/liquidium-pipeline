@@ -230,9 +230,10 @@ mod tests {
             debt_asset: AssetType::Unknown,
             status: LiquidationStatus::Success,
             timestamp: 0,
+            // Settled, to match the receipts' `change_received: true`.
             change_tx: TxStatus {
                 tx_id: None,
-                status: TransferStatus::Pending,
+                status: TransferStatus::Success,
             },
             collateral_tx: TxStatus {
                 tx_id: None,

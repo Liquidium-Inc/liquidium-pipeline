@@ -130,6 +130,7 @@ async fn advance_saved(saved: &mut OutboundRecord, sender: &dyn OutboundSender, 
         SendOutcome::NeverLanded { reason } => Drive::Failed(OutboundError::Retry(reason)),
         SendOutcome::BelowMinimum { reason } => Drive::Failed(OutboundError::BelowMinimum(reason)),
         SendOutcome::Deferred { reason } => Drive::Failed(OutboundError::Deferred(reason)),
+        SendOutcome::Reverted { reason } => Drive::Failed(OutboundError::Reverted(reason)),
         SendOutcome::Open { reason } => {
             let window = sender.open_window_secs(&saved.prepared);
             if now.saturating_sub(submitted_at) > window {
@@ -162,6 +163,10 @@ pub enum OutboundError {
     /// and the next cycle prepares a new send.
     #[error("{0}")]
     Deferred(String),
+    /// The send was mined and reverted, so no funds moved. A new send is safe;
+    /// the caller bounds how many, because each one costs gas.
+    #[error("{0}")]
+    Reverted(String),
 }
 
 /// A send failure inside a CEX leg step keeps the kinds the leg decides on.
@@ -169,7 +174,8 @@ impl From<OutboundError> for CexBackendError {
     fn from(error: OutboundError) -> Self {
         match error {
             OutboundError::BelowMinimum(message) => CexBackendError::BelowMinimum(message),
-            OutboundError::Park(message) => CexBackendError::Ambiguous(message),
+            // A step that does not bound its resubmits leaves a revert to an operator.
+            OutboundError::Park(message) | OutboundError::Reverted(message) => CexBackendError::Ambiguous(message),
             OutboundError::Retry(message) | OutboundError::Deferred(message) => CexBackendError::Other(message),
         }
     }
@@ -309,6 +315,10 @@ mod tests {
             (
                 SendOutcome::Deferred { reason: reason.clone() },
                 OutboundError::Deferred(reason.clone()),
+            ),
+            (
+                SendOutcome::Reverted { reason: reason.clone() },
+                OutboundError::Reverted(reason.clone()),
             ),
         ];
         for (refusal, expected) in cases {

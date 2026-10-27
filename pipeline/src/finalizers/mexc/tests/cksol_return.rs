@@ -62,7 +62,7 @@ async fn mexc_cksol_repayment_preview_uses_icp_usdt_sol_route() {
     assert_eq!(preview.quote.legs[0].route_id, "ICP_USDT:sell>SOL_USDT:buy");
     assert!(preview.quote.receive_amount > Nat::from(490_000_000u64));
     assert!(preview.quote.receive_amount < Nat::from(498_000_000u64));
-    assert!(preview.conservative_receive.value < preview.quote.receive_amount);
+    assert!(preview.conservative_receive.value <= preview.quote.receive_amount);
     // The return's cycles reach the planner as a side cost (audit L10).
     assert_eq!(preview.side_costs, vec![deposit_call_cycles()]);
     assert_eq!(preview.state.side_costs, vec![deposit_call_cycles()]);
@@ -419,6 +419,86 @@ async fn mexc_cksol_sweep_dropped_after_the_window_parks() {
     // A release gives one new notice.
     finalizer.withdraw(&mut state).await.unwrap();
     assert_eq!(state.withdraw.bridge.withdraw_bridge_id.as_deref(), Some("cksol-deposit-v2:third"));
+}
+
+/// A failed credit read says nothing about the funds, so the leg waits without a
+/// strike. A read that still fails past the stall bound counts, so it escalates.
+#[tokio::test]
+async fn an_unreadable_bridge_credit_waits_then_counts_as_a_strike() {
+    let mut bridge = MockBridgeBackend::new();
+    bridge
+        .expect_get_bridge_status()
+        .times(2)
+        .returning(|_| Err(BridgeError::Unreadable("subnet unavailable".into())));
+    let finalizer = cksol_finalizer(MockCexBackend::new(), bridge);
+    let mut state = cksol_funded_state(&finalizer, now_ts());
+    state.withdraw.bridge.withdraw_bridge_id = Some("cksol-deposit-v2:second".into());
+    state.withdraw.bridge.withdraw_bridge_submitted_at_ts = Some(now_ts());
+
+    finalizer
+        .withdraw(&mut state)
+        .await
+        .expect("an unreadable credit is a wait");
+    assert_eq!(state.step, CexStep::WithdrawPending);
+    assert!(state.last_error.is_none(), "{:?}", state.last_error);
+
+    state.withdraw.bridge.withdraw_bridge_submitted_at_ts = Some(now_ts() - BRIDGE_CREDIT_STALL_SECS - 1);
+    let error = finalizer
+        .withdraw(&mut state)
+        .await
+        .expect_err("a lasting failure is a strike");
+    assert!(matches!(error, CexBackendError::Other(_)), "{error}");
+    assert!(error.to_string().contains("could not read it"), "{error}");
+}
+
+/// A reverted return-bridge send moved no funds, so it is made again, a
+/// bounded number of times because each one costs gas. Then an operator decides.
+#[tokio::test]
+async fn a_reverted_bridge_send_is_made_again_a_bounded_number_of_times() {
+    use crate::outbound::driver::{OutboundPhase, OutboundRecord};
+    use liquidium_pipeline_core::outbound::{MockOutboundSender, PreparedSend, SendOutcome};
+    let mut sender = MockOutboundSender::new();
+    sender.expect_settle().returning(|_| SendOutcome::Reverted {
+        reason: "transaction 0xabc reverted".into(),
+    });
+    let finalizer = MexcFinalizer::new(
+        Arc::new(MockCexBackend::new()),
+        Arc::new(MockTransferActions::new()),
+        repayment_account().owner,
+        TEST_MAX_SELL_SLIPPAGE_BPS,
+        TEST_CEX_MIN_EXEC_USD,
+        TEST_CEX_SLICE_TARGET_RATIO,
+    )
+    .with_bridge_runtime(bridge_dependencies(Arc::new(MockBridgeBackend::new())).with_outbound(Arc::new(sender)));
+    let mut state = cksol_repayment_state(&finalizer, 1.5);
+    state.step = CexStep::WithdrawPending;
+    state.withdraw.withdraw_id = Some("sol-withdraw".into());
+    state.withdraw.bridge.withdraw_bridge_destination_snapshot = Some(repayment_account().to_string());
+    let sent = |state: &mut CexState| {
+        state.withdraw.bridge.withdraw_bridge_funding = Some(OutboundRecord {
+            prepared: PreparedSend {
+                sender: "solana".into(),
+                identity: "sol-sig".into(),
+                payload: "tx".into(),
+                replay_safe: false,
+            },
+            phase: OutboundPhase::Submitted { at: now_ts() },
+            decision: None,
+        });
+    };
+
+    for round in 1..=MAX_REVERTED_BRIDGE_RESUBMITS {
+        sent(&mut state);
+        finalizer.withdraw(&mut state).await.expect("a revert is sent again");
+        assert!(
+            state.withdraw.bridge.withdraw_bridge_funding.is_none(),
+            "the next cycle prepares it"
+        );
+        assert_eq!(state.withdraw.bridge.withdraw_bridge_reverts, round);
+    }
+    sent(&mut state);
+    let error = finalizer.withdraw(&mut state).await.expect_err("past the bound");
+    assert!(matches!(error, CexBackendError::Ambiguous(_)), "{error}");
 }
 
 #[test]

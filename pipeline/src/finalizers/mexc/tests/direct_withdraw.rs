@@ -267,6 +267,39 @@ async fn mexc_non_bridge_withdraw_below_min_completes_as_zero_output_dust() {
     );
 }
 
+/// A leg withdraws its whole output, so a refusal above the dust floor is
+/// real money: it stays on MEXC for an operator instead of a write-off.
+#[tokio::test]
+async fn a_below_minimum_withdrawal_above_the_dust_floor_is_not_written_off() {
+    let mut cex = MockCexBackend::new();
+    cex.expect_withdraw()
+        .times(1)
+        .returning(|_, _, _, _, _| Err(WithdrawError::BelowMinimum("below the MEXC minimum".to_string())));
+    let finalizer = test_finalizer(Arc::new(cex), Arc::new(MockTransferActions::new()));
+    let mut state = finalizer
+        .prepare("15", &make_execution_receipt(15))
+        .await
+        .expect("prepare should succeed");
+    state.step = CexStep::Withdraw;
+    state.withdraw.size_out = Some(ChainTokenAmount::from_formatted(
+        state.withdraw.withdraw_asset.clone(),
+        TEST_CEX_MIN_EXEC_USD * 10.0,
+    ));
+
+    finalizer
+        .withdraw(&mut state)
+        .await
+        .expect("the first cycle saves the withdrawal request");
+    let error = finalizer
+        .withdraw(&mut state)
+        .await
+        .expect_err("a sizeable refusal is not dust");
+
+    assert!(error.to_string().contains("dust floor"), "{error}");
+    assert!(!matches!(state.step, CexStep::Completed));
+    assert!(state.withdraw.size_out.as_ref().is_some_and(|out| out.value > 0u8));
+}
+
 #[tokio::test]
 async fn mexc_bridged_withdraw_below_min_completes_as_zero_output_dust() {
     let mut cex = MockCexBackend::new();

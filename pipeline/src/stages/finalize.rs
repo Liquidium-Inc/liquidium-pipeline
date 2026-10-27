@@ -16,19 +16,52 @@ use crate::stage::PipelineStage;
 use crate::stages::executor::{ExecutionReceipt, ExecutionStatus};
 use crate::utils::now_ts;
 use crate::wal::{
-    decode_receipt_wrapper, encode_meta, wal_mark_enqueued, wal_mark_inflight, wal_mark_operator_required,
-    wal_mark_operator_required_with_error, wal_mark_permanent_failed, wal_mark_retryable_failed, wal_mark_succeeded,
-    wal_mark_unresumable, wal_save_receipt,
+    decode_receipt_wrapper, encode_meta, wal_mark_enqueued, wal_mark_inflight, wal_mark_no_route,
+    wal_mark_operator_required, wal_mark_operator_required_with_error, wal_mark_permanent_failed,
+    wal_mark_retryable_failed, wal_mark_succeeded, wal_mark_unresumable, wal_save_receipt,
 };
 use crate::watchdog::{Watchdog, WatchdogEvent, noop_watchdog};
 use liquidium_pipeline_connectors::pipeline_agent::PipelineAgent;
 use liquidium_pipeline_core::types::protocol_types::TransferStatus;
 
 pub(crate) const MAX_FINALIZER_ERRORS: i32 = 5;
+/// How many times one liquidation may be worked before an operator looks at it.
+/// Strikes restart when a row moves again, so only this bounds a row that fails
+/// slowly forever (liquidation 1630). A search that finds no route is no work.
+pub(crate) const MAX_FINALIZER_ATTEMPTS: i32 = 20;
 /// The retry pace of a row with no acceptable swap once its normal budget is spent.
 const NO_ROUTE_SLOW_RETRY_SECS: u64 = 30 * 60;
 /// Maximum safe left-shift for `u64` multipliers in retry backoff.
 const MAX_U64_SHIFT: u32 = 63;
+
+/// Why a row was parked for an operator while a venue leg may still hold its funds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CustodyParkReason {
+    AttemptBudgetExhausted,
+    RetryBudgetExhausted,
+    UnresumableCommittedRow,
+}
+
+impl CustodyParkReason {
+    /// The key the watchdog dedupes alerts on.
+    fn pending_step(self) -> &'static str {
+        match self {
+            Self::AttemptBudgetExhausted => "attempt_budget_exhausted",
+            Self::RetryBudgetExhausted => "retry_budget_exhausted",
+            Self::UnresumableCommittedRow => "unresumable_committed_row",
+        }
+    }
+}
+
+impl std::fmt::Display for CustodyParkReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::AttemptBudgetExhausted => write!(f, "worked {MAX_FINALIZER_ATTEMPTS} times without finishing"),
+            Self::RetryBudgetExhausted => write!(f, "after {MAX_FINALIZER_ERRORS} failed finalize attempts"),
+            Self::UnresumableCommittedRow => f.write_str("this build cannot resume the committed row"),
+        }
+    }
+}
 
 /// Exponential retry delay with cap: min(max, base * 2^(errors-1)).
 fn retry_delay_secs(base: u64, max: u64, error_count: i32) -> u64 {
@@ -144,17 +177,22 @@ where
             .await;
     }
 
-    /// Escalates a liquidation parked because its retry budget ran out while a
-    /// venue leg may still hold the funds.
+    /// Escalates a liquidation parked while a venue leg may still hold the funds.
     ///
     /// The venue itself is not known here -- this stage is generic over the
     /// finalizer -- but the tagged error carries the venue and leg, so it goes
     /// in `details` while `venue` names the component that made the decision.
-    async fn escalate_custody_park(&self, receipt: &ExecutionReceipt, liq_id: u128, error: &str) {
+    async fn escalate_custody_park(
+        &self,
+        receipt: &ExecutionReceipt,
+        liq_id: u128,
+        reason: CustodyParkReason,
+        error: &str,
+    ) {
         let details = format!(
-            "Liquidation {liq_id} was parked after {MAX_FINALIZER_ERRORS} failed finalize attempts while a venue leg may still hold its funds. It will not be retried automatically. Last error: {error}"
+            "Liquidation {liq_id} was parked ({reason}) while a venue leg may still hold its funds. It will not be retried automatically. Last error: {error}"
         );
-        self.alert_operator(receipt, liq_id, "retry_budget_exhausted", details)
+        self.alert_operator(receipt, liq_id, reason.pending_step(), details)
             .await;
     }
 
@@ -243,8 +281,11 @@ where
             .as_ref()
             .ok_or_else(|| "missing liquidation_result in receipt".to_string())?;
         let liq_id = liq.id;
-        if !matches!(liq.collateral_tx.status, TransferStatus::Success) {
-            self.refresh_collateral(&row.id, liq_id, &mut receipt).await;
+        // A row whose collateral settled at once comes straight here, so this
+        // read is the only one that can see its pending change land.
+        let change_pending = matches!(liq.change_tx.status, TransferStatus::Pending);
+        if !matches!(liq.collateral_tx.status, TransferStatus::Success) || change_pending {
+            self.refresh_liquidation(&row.id, liq_id, &mut receipt).await;
         }
 
         let liq = receipt
@@ -276,6 +317,21 @@ where
             let write = wal_mark_succeeded(&*self.wal, &row.id).await;
             return Ok(published(write, liq_id, result, receipt));
         }
+        if row.attempt >= MAX_FINALIZER_ATTEMPTS {
+            let err_msg = format!(
+                "liquidation was worked {MAX_FINALIZER_ATTEMPTS} times without finishing; last error: {}",
+                row.last_error.as_deref().unwrap_or("none recorded")
+            );
+            self.park_custody(
+                row,
+                liq_id,
+                &receipt,
+                CustodyParkReason::AttemptBudgetExhausted,
+                &err_msg,
+            )
+            .await;
+            return Ok(None);
+        }
         if self.retry_not_due(row, liq_id) {
             return Ok(None);
         }
@@ -289,7 +345,7 @@ where
 
     /// Asks the pool again while the collateral transfer is open, and saves a
     /// receipt that changed.
-    async fn refresh_collateral(&self, row_id: &str, liq_id: u128, receipt: &mut ExecutionReceipt) {
+    async fn refresh_liquidation(&self, row_id: &str, liq_id: u128, receipt: &mut ExecutionReceipt) {
         match get_liquidation(self.agent.as_ref(), &self.lending_canister, liq_id).await {
             Ok(fresh) => {
                 if receipt.apply_pool_view(fresh)
@@ -410,7 +466,8 @@ where
                     "[finalize] 🅿️ committed row cannot be resumed by this build; parked for operator liq_id={} err={}",
                     liq_id, err_msg
                 );
-                self.escalate_custody_park(&receipt, liq_id, &err_msg).await;
+                self.escalate_custody_park(&receipt, liq_id, CustodyParkReason::UnresumableCommittedRow, &err_msg)
+                    .await;
                 None
             }
             FinalizerError::BadDebtAmountFloor(_) if receipt.request.liquidation.buy_bad_debt => {
@@ -420,11 +477,18 @@ where
                 published(write, liq_id, result, receipt)
             }
             FinalizerError::VenueCustody(_) if exhausted => {
-                self.park_custody(row, liq_id, &receipt, &err_msg).await;
+                self.park_custody(row, liq_id, &receipt, CustodyParkReason::RetryBudgetExhausted, &err_msg)
+                    .await;
                 None
             }
             FinalizerError::NoRoute(_) if exhausted => {
                 self.retry_slowly(row, liq_id, attempt, &receipt, &err_msg).await;
+                None
+            }
+            FinalizerError::NoRoute(_) => {
+                if let Err(error) = wal_mark_no_route(&*self.wal, &row.id, err_msg).await {
+                    warn!("Failed to mark WAL row {} retryable: {}", row.id, error);
+                }
                 None
             }
             FinalizerError::Permanent(_) | FinalizerError::BadDebtAmountFloor(_) => {
@@ -440,26 +504,33 @@ where
         }
     }
 
-    /// The retry budget is spent, but a venue leg may still
+    /// A budget is spent, but a venue leg may still
     /// hold this liquidation's funds. Failing permanently
     /// would drop the row out of the runnable queue and
     /// leave that custody with nothing tracking it, so park
     /// it for an operator instead. Parking is terminal until
     /// someone requeues the row, which is deliberate: the
     /// venue side has to be understood before a retry.
-    async fn park_custody(&self, row: &LiqResultRecord, liq_id: u128, receipt: &ExecutionReceipt, err_msg: &str) {
+    async fn park_custody(
+        &self,
+        row: &LiqResultRecord,
+        liq_id: u128,
+        receipt: &ExecutionReceipt,
+        reason: CustodyParkReason,
+        err_msg: &str,
+    ) {
         match wal_mark_operator_required_with_error(&*self.wal, &row.id, err_msg.to_string()).await {
             Err(error) => warn!("Failed to park custody-holding WAL row {}: {}", row.id, error),
             Ok(()) => error!(
-                "[finalize] 🅿️ retry budget exhausted while a venue leg holds funds; parked for operator liq_id={} err={}",
-                liq_id, err_msg
+                "[finalize] 🅿️ parked for operator ({}) liq_id={} err={}",
+                reason, liq_id, err_msg
             ),
         }
         // A parked row produces no finalized outcome, so it
         // reaches neither the CSV export nor the
         // liquidation-finalized notification. Without this
         // the only trace of stranded custody is a log line.
-        self.escalate_custody_park(receipt, liq_id, err_msg).await;
+        self.escalate_custody_park(receipt, liq_id, reason, err_msg).await;
     }
 
     /// The collateral is still ours, and most causes pass: a venue outage, a thin book, a
@@ -472,7 +543,7 @@ where
         receipt: &ExecutionReceipt,
         err_msg: &str,
     ) {
-        if let Err(error) = wal_mark_retryable_failed(&*self.wal, &row.id, err_msg.to_string()).await {
+        if let Err(error) = wal_mark_no_route(&*self.wal, &row.id, err_msg.to_string()).await {
             warn!("Failed to mark WAL row {} for a slow retry: {}", row.id, error);
         }
         if attempt == MAX_FINALIZER_ERRORS {
@@ -717,9 +788,11 @@ mod tests {
             debt_asset: AssetType::Unknown,
             status: LiquidationStatus::Success,
             timestamp: ts,
+            // Settled, so a row is not re-read for its change; the test for
+            // that re-read builds its own.
             change_tx: TxStatus {
                 tx_id: None,
-                status: TransferStatus::Pending,
+                status: TransferStatus::Success,
             },
             collateral_tx: TxStatus {
                 tx_id: None,
@@ -801,7 +874,7 @@ mod tests {
             .times(1)
             .returning(|_, _, _, _| Ok(()));
         wal.expect_update_status()
-            .withf(move |id, status, bump| id == valid_id && *status == ResultStatus::InFlight && *bump)
+            .withf(move |id, status, bump| id == valid_id && *status == ResultStatus::InFlight && !*bump)
             .times(1)
             .returning(|_, _, _| Ok(()));
         wal.expect_update_status()
@@ -835,7 +908,7 @@ mod tests {
             .times(1)
             .return_once(move |_| Ok(vec![row]));
         wal.expect_update_status()
-            .withf(move |id, status, bump| id == row_id && *status == ResultStatus::InFlight && *bump)
+            .withf(move |id, status, bump| id == row_id && *status == ResultStatus::InFlight && !*bump)
             .times(1)
             .returning(|_, _, _| Ok(()));
         wal.expect_update_status()
@@ -870,7 +943,7 @@ mod tests {
             .times(1)
             .return_once(move |_| Ok(vec![row]));
         wal.expect_update_status()
-            .withf(move |id, status, bump| id == row_id && *status == ResultStatus::InFlight && *bump)
+            .withf(move |id, status, bump| id == row_id && *status == ResultStatus::InFlight && !*bump)
             .times(1)
             .returning(|_, _, _| Ok(()));
         wal.expect_update_failure()
@@ -917,7 +990,7 @@ mod tests {
             .times(1)
             .return_once(move |_| Ok(vec![row]));
         wal.expect_update_status()
-            .withf(move |id, status, bump| id == row_id && *status == ResultStatus::InFlight && *bump)
+            .withf(move |id, status, bump| id == row_id && *status == ResultStatus::InFlight && !*bump)
             .times(1)
             .returning(|_, _, _| Ok(()));
         wal.expect_update_failure()
@@ -968,7 +1041,7 @@ mod tests {
             .times(1)
             .return_once(move |_| Ok(vec![row]));
         wal.expect_update_status()
-            .withf(move |id, status, bump| id == row_id && *status == ResultStatus::InFlight && *bump)
+            .withf(move |id, status, bump| id == row_id && *status == ResultStatus::InFlight && !*bump)
             .times(1)
             .returning(|_, _, _| Ok(()));
         wal.expect_update_failure()
@@ -1008,7 +1081,7 @@ mod tests {
             .times(1)
             .return_once(move |_| Ok(vec![row]));
         wal.expect_update_status()
-            .withf(move |id, status, bump| id == row_id && *status == ResultStatus::InFlight && *bump)
+            .withf(move |id, status, bump| id == row_id && *status == ResultStatus::InFlight && !*bump)
             .times(1)
             .returning(|_, _, _| Ok(()));
         wal.expect_update_failure()
@@ -1135,7 +1208,7 @@ mod tests {
             .times(1)
             .returning(move |_| Ok(vec![row_pending.clone()]));
         wal.expect_update_status()
-            .withf(move |id, status, bump| id == liq_id_str.as_str() && *status == ResultStatus::InFlight && *bump)
+            .withf(move |id, status, bump| id == liq_id_str.as_str() && *status == ResultStatus::InFlight && !*bump)
             .times(1)
             .returning(|_, _, _| Ok(()));
         wal.expect_update_failure()
@@ -1184,7 +1257,7 @@ mod tests {
             .times(1)
             .returning(move |_| Ok(vec![row_pending.clone()]));
         wal.expect_update_status()
-            .withf(move |id, status, bump| id == liq_id_str.as_str() && *status == ResultStatus::InFlight && *bump)
+            .withf(move |id, status, bump| id == liq_id_str.as_str() && *status == ResultStatus::InFlight && !*bump)
             .times(1)
             .returning(|_, _, _| Ok(()));
         wal.expect_update_status()
@@ -1237,7 +1310,7 @@ mod tests {
             .times(1)
             .returning(move |_| Ok(vec![row_pending.clone()]));
         wal.expect_update_status()
-            .withf(move |id, status, bump| id == liq_id_str.as_str() && *status == ResultStatus::InFlight && *bump)
+            .withf(move |id, status, bump| id == liq_id_str.as_str() && *status == ResultStatus::InFlight && !*bump)
             .times(1)
             .returning(|_, _, _| Ok(()));
         wal.expect_update_failure()
@@ -1380,6 +1453,164 @@ mod tests {
         let outcomes = stage.process(&()).await.expect("process should succeed");
         assert_eq!(outcomes.len(), 1, "should finalize after collateral success");
         assert!(matches!(outcomes[0].status, ExecutionStatus::Success));
+    }
+
+    /// A row whose collateral settled at once never passes the settlement
+    /// watcher, so only finalize can see its change land.
+    #[tokio::test]
+    async fn finalize_re_reads_a_row_whose_change_was_still_pending_and_corrects_the_flag() {
+        let liq_id = 78u128;
+        let mut initial_liq = make_liq_result(liq_id, TransferStatus::Success, 0);
+        initial_liq.change_tx.status = TransferStatus::Pending;
+        let receipt = ExecutionReceipt {
+            request: make_request(),
+            liquidation_result: Some(initial_liq),
+            status: ExecutionStatus::Success,
+            change_received: false,
+        };
+        let row = make_row(liq_id, receipt.clone());
+        let row_pending = row.clone();
+        let row_for_get = row.clone();
+        let liq_id_str = liq_id.to_string();
+
+        let mut wal = MockWalStore::new();
+        wal.expect_get_pending()
+            .with(eq(100usize))
+            .times(1)
+            .returning(move |_| Ok(vec![row_pending.clone()]));
+        wal.expect_get_result()
+            .withf(move |id| id == liq_id_str.as_str())
+            .returning(move |_| Ok(Some(row_for_get.clone())));
+        // The corrected receipt is written back before the row is finalized.
+        wal.expect_upsert_result()
+            .withf(|row| {
+                let wrapper = decode_receipt_wrapper(row)
+                    .expect("stored meta decodes")
+                    .expect("stored meta is present");
+                wrapper.receipt.change_received
+            })
+            .times(1)
+            .returning(|_| Ok(()));
+        wal.expect_upsert_result().returning(|_| Ok(()));
+        wal.expect_update_status().returning(|_, _, _| Ok(()));
+
+        let fresh_liq = make_liq_result(liq_id, TransferStatus::Success, 0);
+        let mut agent = MockPipelineAgent::new();
+        agent
+            .expect_call_query::<Result<LiquidationResult, ProtocolError>>()
+            .with(
+                eq(Principal::anonymous()),
+                eq("get_liquidation"),
+                eq(Encode!(&liq_id).expect("encode should succeed")),
+            )
+            .times(1)
+            .returning(move |_, _, _| Ok(Ok(fresh_liq.clone())));
+
+        let stage = FinalizeStage::new(
+            Arc::new(wal),
+            Arc::new(NoopFinalizer {
+                calls: Arc::new(Mutex::new(0)),
+            }),
+            Arc::new(SimpleProfitCalculator),
+            Arc::new(agent),
+            Principal::anonymous(),
+            5,
+            120,
+        );
+
+        let outcomes = stage.process(&()).await.expect("process should succeed");
+        assert_eq!(outcomes.len(), 1);
+        assert!(outcomes[0].execution_receipt.change_received);
+    }
+
+    /// A swap row whose collateral has settled.
+    fn settled_swap_row(liq_id: u128) -> LiqResultRecord {
+        let mut request = make_request();
+        request.swap_args = Some(make_swap_request(&request));
+        make_row(
+            liq_id,
+            ExecutionReceipt {
+                request,
+                liquidation_result: Some(make_liq_result(liq_id, TransferStatus::Success, 0)),
+                status: ExecutionStatus::Success,
+                change_received: true,
+            },
+        )
+    }
+
+    /// One finalize cycle over `row`; returns how often the finalizer ran.
+    async fn finalize_calls_for(row: LiqResultRecord, mut wal: MockWalStore) -> usize {
+        wal.expect_get_pending().returning(move |_| Ok(vec![row.clone()]));
+        let calls = Arc::new(Mutex::new(0usize));
+        let stage = test_stage(wal, NoopFinalizer { calls: calls.clone() });
+        stage.process(&()).await.expect("process should succeed");
+        *calls.lock().expect("calls lock")
+    }
+
+    /// Liquidation 1630 failed slowly for minutes: each release cleared its
+    /// strikes, so only the lifetime attempt budget can stop such a row.
+    #[tokio::test]
+    async fn finalize_parks_a_row_that_exhausts_its_lifetime_attempt_budget() {
+        let mut row = settled_swap_row(91);
+        row.status = ResultStatus::Enqueued;
+        row.attempt = MAX_FINALIZER_ATTEMPTS;
+
+        let mut wal = MockWalStore::new();
+        wal.expect_update_failure()
+            .withf(|_, next, _, _| *next == ResultStatus::OperatorRequired)
+            .times(1)
+            .returning(|_, _, _, _| Ok(()));
+        wal.expect_update_status().times(0);
+        wal.expect_upsert_result().times(0);
+
+        assert_eq!(
+            finalize_calls_for(row, wal).await,
+            0,
+            "an exhausted row is not worked again"
+        );
+    }
+
+    /// The cap counts work, not waiting, so a patient healthy row keeps running.
+    #[tokio::test]
+    async fn finalize_does_not_park_a_long_running_row_that_has_not_failed() {
+        let mut row = settled_swap_row(92);
+        row.status = ResultStatus::Enqueued;
+        row.attempt = 1;
+
+        let mut wal = MockWalStore::new();
+        wal.expect_update_failure()
+            .withf(|_, next, _, _| *next == ResultStatus::OperatorRequired)
+            .times(0);
+        wal.expect_update_status().returning(|_, _, _| Ok(()));
+        wal.expect_upsert_result().returning(|_| Ok(()));
+        wal.expect_get_result().returning(|_| Ok(None));
+
+        assert_eq!(finalize_calls_for(row, wal).await, 1);
+    }
+
+    /// A route search that finds nothing did no work, so it is a strike but not
+    /// an attempt. Otherwise a row on the slow retry (audit L17) would be parked
+    /// by the attempt cap as soon as a route appears.
+    #[tokio::test]
+    async fn a_no_route_failure_is_a_strike_but_not_an_attempt() {
+        let mut row = settled_swap_row(93);
+        row.status = ResultStatus::Enqueued;
+
+        let mut wal = MockWalStore::new();
+        wal.expect_get_pending().returning(move |_| Ok(vec![row.clone()]));
+        wal.expect_update_status().returning(|_, _, _| Ok(()));
+        wal.expect_update_failure()
+            .withf(|_, next, _, bump| *next == ResultStatus::FailedRetryable && !*bump)
+            .times(1)
+            .returning(|_, _, _, _| Ok(()));
+        let stage = test_stage(
+            wal,
+            ErrorFinalizer {
+                error: FinalizerError::NoRoute("no acceptable swap".to_string()),
+            },
+        );
+
+        assert!(stage.process(&()).await.expect("process should succeed").is_empty());
     }
 
     /// Given: A retryable row is not yet due under exponential backoff.

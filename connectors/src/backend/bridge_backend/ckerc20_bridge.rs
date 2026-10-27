@@ -295,6 +295,9 @@ where
     pub cketh_minter_canister: Principal,
     pub bridge_ic_owner_principal: Principal,
     forward_submission: tokio::sync::Mutex<()>,
+    /// One reverse submission at a time: the minter's ICRC-2 allowances are
+    /// account-wide, and one withdraw spends both the ckERC20 and the ckETH one.
+    reverse_submission: tokio::sync::Mutex<()>,
 }
 
 impl<A, B, E> CkErc20BridgeBackend<A, B, E>
@@ -317,6 +320,7 @@ where
             cketh_minter_canister,
             bridge_ic_owner_principal,
             forward_submission: tokio::sync::Mutex::new(()),
+            reverse_submission: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -419,7 +423,9 @@ where
         self.evm_backend.erc20_decimals_of(token).await
     }
 
-    async fn approve_minter_spend(&self, ledger: Principal, amount: Nat) -> Result<(), String> {
+    /// Sets the minter's allowance. `expected` makes the ledger refuse the approve
+    /// when the allowance changed since it was read, instead of overwriting it.
+    async fn approve_minter_spend(&self, ledger: Principal, amount: Nat, expected: Nat) -> Result<(), String> {
         let approve_args = ApproveArgs {
             from_subaccount: None,
             spender: Account {
@@ -427,7 +433,7 @@ where
                 subaccount: None,
             },
             amount,
-            expected_allowance: None,
+            expected_allowance: Some(expected),
             expires_at: None,
             fee: None,
             memo: None,
@@ -461,7 +467,8 @@ where
             return Ok(());
         }
 
-        self.approve_minter_spend(ledger, required_allowance).await
+        self.approve_minter_spend(ledger, required_allowance, current_allowance)
+            .await
     }
 
     fn with_fee_headroom(amount: &Nat) -> Nat {
@@ -780,6 +787,8 @@ where
         let source_account = parse_source_icp_account(&request.source_address)?;
         // Reverse flow is restricted to the configured bridge owner principal.
         ensure_source_matches_bridge_owner(&source_account, self.bridge_ic_owner_principal)?;
+        // Held until the withdraw spends the allowances it reads and sets.
+        let _submission = self.reverse_submission.lock().await;
 
         let destination = expect_evm_destination(route, &request.destination)?;
 
@@ -899,6 +908,8 @@ where
     ) -> Result<BridgeSubmission, BridgeError> {
         let source_account = parse_source_icp_account(&request.source_address)?;
         ensure_source_matches_bridge_owner(&source_account, self.bridge_ic_owner_principal)?;
+        // Held until the withdraw spends the allowances it reads and sets.
+        let _submission = self.reverse_submission.lock().await;
 
         let destination = expect_evm_destination(route, &request.destination)?;
         let cketh_ledger_id = parse_ckerc20_ledger_id(route)?;
@@ -1282,11 +1293,11 @@ where
             .parse::<TxHash>()
             .map_err(|e| format!("invalid bridge id '{}': expected EVM tx hash: {e}", bridge_id))?;
 
-        let receipt = self
-            .evm_backend
-            .receipt_status(tx_hash)
-            .await
-            .map_err(|e| format!("failed to fetch transaction receipt for bridge id '{}': {e}", bridge_id))?;
+        let receipt = self.evm_backend.receipt_status(tx_hash).await.map_err(|e| {
+            BridgeError::Unreadable(format!(
+                "failed to fetch transaction receipt for bridge id '{bridge_id}': {e}"
+            ))
+        })?;
 
         let Some(receipt) = receipt else {
             return Ok(BridgeStatus::Pending);
@@ -1298,7 +1309,8 @@ where
                 &self.cketh_minter_canister,
                 event_start,
                 transaction_hash,
-            ).await?;
+            )
+            .await?;
             if let BridgeStatus::Minted(receipt) = &status {
                 if expectation.as_ref().is_some_and(|expected| !expected.matches(receipt)) {
                     return Err("mint evidence does not match the submitted amount, token and destination".into());

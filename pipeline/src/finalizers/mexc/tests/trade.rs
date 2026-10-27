@@ -21,14 +21,57 @@ async fn mexc_trade_skips_when_amount_in_zero_and_moves_to_withdraw() {
     state.size_in.value = Nat::from(0u32);
     state.step = CexStep::Trade;
 
+    // Nothing on a leg is not "the route is done": one cycle per leg of the
+    // four-leg route, and no order is placed.
+    for leg in 1..=4 {
+        assert!(matches!(state.step, CexStep::Trade | CexStep::TradePending));
+        finalizer
+            .trade(&mut state)
+            .await
+            .expect("trade should succeed even when skipped");
+        assert_eq!(state.trade.trade_leg_index, Some(leg));
+    }
+
+    // Nothing was traded, so nothing is there to withdraw.
+    assert!(matches!(state.step, CexStep::Withdraw));
+    assert_eq!(state.withdraw.size_out.as_ref().map(|out| out.to_f64()), Some(0.0));
+}
+
+/// A leg whose last slice filled but whose cycle then failed, for example on
+/// the slippage cap, is saved with nothing left to trade. The leg is done; the
+/// route is not, so its output must not be withdrawn under the final asset.
+#[tokio::test]
+async fn an_exhausted_leg_that_is_not_the_last_hands_its_output_to_the_next_leg() {
+    let mut backend = MockCexBackend::new();
+    backend.expect_execute_swap_detailed_with_options().times(0);
+    let finalizer = test_finalizer(Arc::new(backend), Arc::new(MockTransferActions::new()));
+
+    let mut state = finalizer
+        .prepare("43", &make_execution_receipt(43))
+        .await
+        .expect("prepare");
+    state.step = CexStep::Trade;
+    state.trade.trade_leg_index = Some(0);
+    state.trade.trade_progress_remaining_in = Some(0.0);
+    state.trade.trade_progress_total_out = Some(0.05);
+
     finalizer
         .trade(&mut state)
         .await
-        .expect("trade should succeed even when skipped");
+        .expect("an exhausted leg is not a failure");
 
-    // No size_out set and step advanced to Withdraw.
-    assert!(state.withdraw.size_out.is_none());
-    assert!(matches!(state.step, CexStep::Withdraw));
+    assert!(
+        matches!(state.step, CexStep::TradePending),
+        "three legs remain, so the route must not jump to withdraw: {:?}",
+        state.step
+    );
+    assert_eq!(state.trade.trade_leg_index, Some(1));
+    assert_eq!(state.trade.trade_next_amount_in, Some(0.05));
+    assert!(state.trade.trade_progress_remaining_in.is_none());
+    assert!(
+        state.withdraw.size_out.is_none(),
+        "0.05 BTC is not the asset to withdraw"
+    );
 }
 
 #[tokio::test]
