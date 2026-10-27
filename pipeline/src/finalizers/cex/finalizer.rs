@@ -14,7 +14,8 @@ use liquidium_pipeline_connectors::backend::bridge_backend::{
 use liquidium_pipeline_connectors::outbound::UnsettledSender;
 use liquidium_pipeline_core::outbound::{OutboundIntent, OutboundSender};
 use liquidium_pipeline_connectors::backend::cex_backend::{
-    BuyOrderInputMode, CexBackend, CexBackendError, OrderBookLevel, PriceLimit, SwapExecutionOptions, WithdrawStatus,
+    BuyOrderInputMode, CexBackend, CexBackendError, OrderBook, OrderBookLevel, PriceLimit, SwapExecutionOptions,
+    WithdrawStatus,
 };
 use liquidium_pipeline_core::{
     account::model::ChainAccount,

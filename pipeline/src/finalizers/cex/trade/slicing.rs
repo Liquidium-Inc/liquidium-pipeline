@@ -141,20 +141,21 @@ where
             .await?;
 
         if leg.side.eq_ignore_ascii_case("sell") {
-            return self.preview_sell_trade_slice(leg, &orderbook.bids, remaining_in, target_bps);
+            return self.preview_sell_trade_slice(leg, &orderbook, remaining_in, target_bps);
         }
 
-        self.preview_buy_trade_slice(leg, &orderbook.asks, remaining_in, target_bps)
+        self.preview_buy_trade_slice(leg, &orderbook, remaining_in, target_bps)
     }
 
     /// Build one sell-side preview slice (base -> quote), including fallback to hard cap.
     fn preview_sell_trade_slice(
         &self,
         leg: &TradeLeg,
-        bids: &[OrderBookLevel],
+        orderbook: &OrderBook,
         remaining_in: f64,
         target_bps: f64,
     ) -> Result<SlicePreview, String> {
+        let bids = &orderbook.bids;
         let candidate = self.max_sell_chunk_for_target(bids, remaining_in, target_bps);
         let chunk =
             self.resolve_chunk_with_hard_cap_fallback(&leg.market, "sell", remaining_in, candidate, |amount| {
@@ -162,7 +163,7 @@ where
                 Ok((impact, residual))
             })?;
 
-        self.build_slice_preview(&leg.market, "bid", chunk, |amount| {
+        self.build_slice_preview(&leg.market, "bid", chunk, orderbook.taker_fee_bps, |amount| {
             simulate_sell_from_bids(bids, amount)
         })
     }
@@ -171,10 +172,11 @@ where
     fn preview_buy_trade_slice(
         &self,
         leg: &TradeLeg,
-        asks: &[OrderBookLevel],
+        orderbook: &OrderBook,
         remaining_in: f64,
         target_bps: f64,
     ) -> Result<SlicePreview, String> {
+        let asks = &orderbook.asks;
         let candidate = self.max_buy_chunk_for_target(asks, remaining_in, target_bps);
         let chunk =
             self.resolve_chunk_with_hard_cap_fallback(&leg.market, "buy", remaining_in, candidate, |amount| {
@@ -182,7 +184,9 @@ where
                 Ok((impact, residual))
             })?;
 
-        self.build_slice_preview(&leg.market, "ask", chunk, |amount| simulate_buy_from_asks(asks, amount))
+        self.build_slice_preview(&leg.market, "ask", chunk, orderbook.taker_fee_bps, |amount| {
+            simulate_buy_from_asks(asks, amount)
+        })
     }
 
     /// Resolve final chunk size when soft-target sizing returns no usable chunk.
@@ -231,6 +235,7 @@ where
         market: &str,
         liquidity_side: &str,
         chunk: f64,
+        taker_fee_bps: f64,
         mut simulate_fill: F,
     ) -> Result<SlicePreview, String>
     where
@@ -248,6 +253,7 @@ where
             chunk_in: chunk,
             preview_mid_price: avg_price,
             preview_impact_bps: impact,
+            taker_fee_bps,
         })
     }
 

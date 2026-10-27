@@ -89,7 +89,7 @@ impl KrakenClient {
         let limit_price = options
             .price_limit
             .as_ref()
-            .map(|limit| ioc_limit_price(side, &net_of_taker_fee(limit)?, pair.price_decimals))
+            .map(|limit| ioc_limit_price(side, limit, pair.price_decimals))
             .transpose()?;
         let volume = match side {
             KrakenSide::Sell => sell_volume(&pair, &book, amount)?,
@@ -165,22 +165,6 @@ fn parse_side(side: &str) -> Result<KrakenSide, String> {
 
 fn truncate(value: Decimal, decimals: u32) -> Decimal {
     value.round_dp_with_strategy(decimals, RoundingStrategy::ToZero)
-}
-
-/// The caller measures a fill net of the fee, so the order's price room is the
-/// limit less the taker fee. A limit that the fee uses up places no order.
-pub(super) fn net_of_taker_fee(limit: &PriceLimit) -> Result<PriceLimit, String> {
-    let price_room_bps = limit.max_slippage_bps - TAKER_FEE_BPS;
-    if price_room_bps <= 0.0 {
-        return Err(format!(
-            "a {} bps limit leaves no room for the {TAKER_FEE_BPS} bps Kraken taker fee",
-            limit.max_slippage_bps
-        ));
-    }
-    Ok(PriceLimit {
-        max_slippage_bps: price_room_bps,
-        ..*limit
-    })
 }
 
 /// The worst price the order accepts, rounded to the pair's precision in the

@@ -340,7 +340,7 @@ Even with slicing, execution still has market-impact and timing risk:
 
 How config controls this risk:
 
-- `MAX_ALLOWED_CEX_SLIPPAGE_BPS`: the IOC limit of each slice order, and the per-slice reject limit (safety brake).
+- `MAX_ALLOWED_CEX_SLIPPAGE_BPS`: the per-slice reject limit (safety brake), measured net of the taker fee. Each slice order is IOC at this limit less the market's taker fee, so a fill at its price still passes.
 - `MAX_WIDENED_CEX_SLIPPAGE_BPS`: after 3 orders in a row fill nothing at the cap, each next order widens the limit by 100 bps up to this value. When the widest order also fills nothing, the leg waits for the next cycle. A value at or below the cap turns widening off. No order goes out without a limit, unless the exchange refuses the IOC order type itself.
 - `CEX_SLICE_TARGET_RATIO`: softer sizing target below hard limit (execution smoothness).
 - `CEX_MIN_EXEC_USD`: prevents low-notional micro-fills that usually have poor quality.

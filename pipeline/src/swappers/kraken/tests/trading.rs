@@ -9,7 +9,6 @@ use crate::swappers::kraken::{
     api::{KrakenApiError, KrakenBook, KrakenOrder, KrakenOrderStatus, KrakenSide, MockKrakenApi},
     trading::{
         ORDER_POLL_ATTEMPTS, TAKER_FEE_BPS, estimate_buy_cost, estimate_sell_output, fill_report, ioc_limit_price,
-        net_of_taker_fee,
     },
 };
 
@@ -22,7 +21,7 @@ fn closed(volume_executed: Decimal, cost: Decimal, fee: Decimal) -> KrakenOrder 
     }
 }
 
-/// A 2% limit from a 60,000 mid. After the 80 bps fee the IOC price may move 1.2%.
+/// A 2% limit from a 60,000 mid.
 fn ioc(client_order_id: &str) -> SwapExecutionOptions {
     SwapExecutionOptions {
         client_order_id: Some(client_order_id.into()),
@@ -77,43 +76,6 @@ fn the_ioc_price_rounds_toward_the_inside_of_the_limit() {
     );
 }
 
-/// The caller checks each fill net of the fee against the same limit, so a
-/// fill at the IOC price must still pass that check.
-#[test]
-fn the_ioc_price_room_is_the_limit_less_the_taker_fee() {
-    let limit = PriceLimit {
-        reference_price: 60_000.0,
-        max_slippage_bps: 200.0,
-    };
-    assert_eq!(
-        net_of_taker_fee(&limit).unwrap().max_slippage_bps,
-        200.0 - TAKER_FEE_BPS
-    );
-    let used_up = PriceLimit {
-        max_slippage_bps: TAKER_FEE_BPS,
-        ..limit
-    };
-    assert!(net_of_taker_fee(&used_up).is_err());
-}
-
-#[tokio::test]
-async fn a_limit_the_fee_uses_up_places_no_order() {
-    let mut api = trading_api();
-    api.expect_place_order().never();
-    let mut options = ioc("liq-tight");
-    options.price_limit = Some(PriceLimit {
-        reference_price: 60_000.0,
-        max_slippage_bps: 50.0,
-    });
-
-    let error = btc_usd_client(api)
-        .execute_swap_detailed_with_options("BTC_USD", "sell", 0.1, options)
-        .await
-        .expect_err("no price room");
-
-    assert!(matches!(error, CexBackendError::Other(_)), "{error}");
-}
-
 #[tokio::test]
 async fn an_ioc_sell_carries_the_limit_and_the_client_id_and_reports_the_net_fill() {
     let mut api = trading_api();
@@ -122,7 +84,7 @@ async fn an_ioc_sell_carries_the_limit_and_the_client_id_and_reports_the_net_fil
             request.pair == "XXBTZUSD"
                 && request.side == KrakenSide::Sell
                 && request.volume == Decimal::new(1, 1)
-                && request.limit_price == Some(Decimal::new(59_280, 0))
+                && request.limit_price == Some(Decimal::new(58_800, 0))
                 && request.client_order_id.as_deref() == Some("liq-42")
         })
         .once()
@@ -151,20 +113,20 @@ async fn an_ioc_sell_carries_the_limit_and_the_client_id_and_reports_the_net_fil
 #[tokio::test]
 async fn an_ioc_buy_never_spends_more_than_its_budget() {
     let mut api = trading_api();
-    // 6,000 / 60,720 = 0.098814229..., cut to 8 decimals.
+    // 6,000 / 61,200 = 0.098039215..., cut to 8 decimals.
     api.expect_place_order()
         .withf(|request| {
             request.side == KrakenSide::Buy
-                && request.volume == Decimal::new(9_881_422, 8)
-                && request.limit_price == Some(Decimal::new(60_720, 0))
+                && request.volume == Decimal::new(9_803_921, 8)
+                && request.limit_price == Some(Decimal::new(61_200, 0))
         })
         .once()
         .returning(|_| Ok("ORDER-BUY".into()));
     api.expect_order().once().returning(|_| {
         Ok(closed(
-            Decimal::new(9_881_422, 8),
-            Decimal::new(59_288_532, 4),
-            Decimal::new(474_308, 4),
+            Decimal::new(9_803_921, 8),
+            Decimal::new(58_823_526, 4),
+            Decimal::new(470_588, 4),
         ))
     });
 
@@ -174,8 +136,8 @@ async fn an_ioc_buy_never_spends_more_than_its_budget() {
         .expect("filled buy");
 
     assert!(report.input_consumed <= 6_000.0, "{}", report.input_consumed);
-    // The fee comes out of the bought base: 80 bps of 0.09881422.
-    let credited = 0.098_814_22 * 0.992;
+    // The fee comes out of the bought base: 80 bps of 0.09803921.
+    let credited = 0.098_039_21 * 0.992;
     assert!(
         report.output_received <= credited && report.output_received > credited * (1.0 - 1e-5),
         "{} against {credited}",

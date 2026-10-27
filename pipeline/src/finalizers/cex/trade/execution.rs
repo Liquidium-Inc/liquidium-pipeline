@@ -37,8 +37,9 @@ where
     ///   soft target (`target_bps`) first, hard-cap fallback second.
     /// - `maybe_mark_trade_dust` stops execution when, after the leg's first fill,
     ///   the chunk and remainder notional are both below `cex_min_exec_usd`.
-    /// - each accepted chunk is sent as an IOC limit order at the slippage cap;
-    ///   after empty fills the limit widens in steps to `max_widened_slippage_bps`.
+    /// - each accepted chunk is sent as an IOC limit order at the slippage cap
+    ///   less the taker fee; after empty fills the limit widens in steps to
+    ///   `max_widened_slippage_bps`.
     /// - realized `exec_price` is derived from actual fills and compared to preview
     ///   midpoint to compute realized slippage in bps.
     /// - if realized slippage exceeds the slice's limit, the leg fails fast.
@@ -99,12 +100,24 @@ where
                 break;
             }
 
+            // A fill is checked net of the fee, so the order's price may move
+            // only the limit less the fee.
+            let limit_bps = self.slice_limit_bps(empty_fills_in_a_row);
+            let price_room_bps = limit_bps - preview.taker_fee_bps;
+            if price_room_bps <= 0.0 {
+                let err = format!(
+                    "the {limit_bps:.0} bps limit on {} leaves no room for its {:.0} bps taker fee",
+                    leg.market, preview.taker_fee_bps
+                );
+                state.last_error = Some(err.clone());
+                return Err(err.into());
+            }
+
             let buy_mode = Self::resolve_slice_buy_mode(state, leg, &mut forced_next_buy_mode);
             let pending = Self::prepare_pending_slice_request(state, leg, leg_idx, preview.chunk_in, buy_mode);
 
             // The exchange enforces the limit with an IOC order. Only if the
             // exchange refuses IOC outright does the slice go out as a market order.
-            let limit_bps = self.slice_limit_bps(empty_fills_in_a_row);
             let fill_report = self
                 .backend
                 .execute_swap_detailed_with_options(
@@ -117,7 +130,7 @@ where
                         max_quote_overspend_bps: Some(self.cex_buy_inverse_overspend_bps as f64),
                         price_limit: Some(PriceLimit {
                             reference_price: preview.preview_mid_price,
-                            max_slippage_bps: limit_bps,
+                            max_slippage_bps: price_room_bps,
                         }),
                     },
                 )

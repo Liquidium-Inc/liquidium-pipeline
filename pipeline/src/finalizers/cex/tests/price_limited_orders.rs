@@ -4,9 +4,20 @@ use liquidium_pipeline_connectors::backend::cex_backend::{PriceLimit, SwapExecut
 
 type Orders = Arc<std::sync::Mutex<Vec<SwapExecutionOptions>>>;
 
+/// The test book's taker fee. A fill is checked net of it, so each order's
+/// price room is the limit less this.
+const FEE_BPS: f64 = 10.0;
+
 /// A ckBTC -> ckUSDT finalizer whose first leg, CKBTC_BTC, answers each
 /// order with the next fill; `None` is a fill of the whole request.
 fn finalizer_with_fills(fills: Vec<Option<f64>>) -> (CexVenueFinalizer<MockCexBackend>, Orders) {
+    finalizer_with_fee_and_fills(FEE_BPS, fills)
+}
+
+fn finalizer_with_fee_and_fills(
+    taker_fee_bps: f64,
+    fills: Vec<Option<f64>>,
+) -> (CexVenueFinalizer<MockCexBackend>, Orders) {
     let mut backend = MockCexBackend::new();
     let book = OrderBook {
         bids: vec![OrderBookLevel {
@@ -17,7 +28,7 @@ fn finalizer_with_fills(fills: Vec<Option<f64>>) -> (CexVenueFinalizer<MockCexBa
             price: 1.001,
             quantity: 1_000.0,
         }],
-        taker_fee_bps: 10.0,
+        taker_fee_bps,
     };
     backend.expect_get_orderbook().returning(move |_, _| Ok(book.clone()));
     let orders: Orders = Arc::default();
@@ -59,7 +70,7 @@ fn client_ids(orders: &Orders) -> Vec<String> {
 }
 
 #[tokio::test]
-async fn every_slice_order_carries_the_cap_as_its_limit() {
+async fn every_slice_order_carries_the_cap_less_the_fee_as_its_limit() {
     let (finalizer, orders) = finalizer_with_fills(vec![None]);
     let mut state = trade_state(&finalizer).await;
 
@@ -71,7 +82,7 @@ async fn every_slice_order_carries_the_cap_as_its_limit() {
         orders[0].price_limit,
         Some(PriceLimit {
             reference_price: state.trade.trade_slices[0].mid_price,
-            max_slippage_bps: TEST_MAX_SELL_SLIPPAGE_BPS,
+            max_slippage_bps: TEST_MAX_SELL_SLIPPAGE_BPS - FEE_BPS,
         })
     );
 }
@@ -152,7 +163,7 @@ async fn empty_fills_widen_the_limit_in_steps_up_to_the_maximum() {
         .await
         .expect("a pause is a wait, not an error");
 
-    let cap = TEST_MAX_SELL_SLIPPAGE_BPS;
+    let cap = TEST_MAX_SELL_SLIPPAGE_BPS - FEE_BPS;
     assert_eq!(limits(&orders), vec![cap, cap, cap, cap + 100.0, cap + 200.0]);
     assert!(state.trade.trade_slices.is_empty());
 
@@ -171,7 +182,7 @@ async fn a_fill_at_a_widened_limit_resets_the_limit_to_the_cap() {
 
     finalizer.trade(&mut state).await.expect("the leg fills");
 
-    let cap = TEST_MAX_SELL_SLIPPAGE_BPS;
+    let cap = TEST_MAX_SELL_SLIPPAGE_BPS - FEE_BPS;
     assert_eq!(limits(&orders), vec![cap, cap, cap, cap + 100.0, cap]);
     assert_eq!(state.trade.trade_slices.len(), 2);
 }
@@ -181,4 +192,16 @@ fn a_maximum_below_the_cap_leaves_the_cap_in_force() {
     let (finalizer, _) = finalizer_with_fills(vec![]);
     let finalizer = finalizer.with_widened_slippage_cap(TEST_MAX_SELL_SLIPPAGE_BPS - 50.0);
     assert_eq!(finalizer.max_widened_slippage_bps, TEST_MAX_SELL_SLIPPAGE_BPS);
+}
+
+/// A fee as large as the limit leaves the order no price room, so no order goes out.
+#[tokio::test]
+async fn a_limit_the_fee_uses_up_sends_no_order() {
+    let (finalizer, orders) = finalizer_with_fee_and_fills(TEST_MAX_SELL_SLIPPAGE_BPS, vec![]);
+    let mut state = trade_state(&finalizer).await;
+
+    let error = finalizer.trade(&mut state).await.expect_err("no price room");
+
+    assert!(error.to_string().contains("taker fee"), "{error}");
+    assert!(orders.lock().unwrap().is_empty());
 }
