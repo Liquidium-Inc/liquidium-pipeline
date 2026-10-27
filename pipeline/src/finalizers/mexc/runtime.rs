@@ -4,14 +4,14 @@ use crate::{
     config::ConfigTrait,
     context::PipelineContext,
     bridge::runtime::BridgeRuntime,
-    finalizers::mexc::mexc_finalizer::MexcFinalizer,
+    finalizers::cex::finalizer::CexVenueFinalizer,
     swappers::mexc::mexc_adapter::MexcClient,
 };
 
 pub async fn build_mexc_finalizer(
     ctx: &PipelineContext,
     bridge: Arc<BridgeRuntime>,
-) -> Result<Arc<MexcFinalizer<MexcClient>>, String> {
+) -> Result<Arc<CexVenueFinalizer<MexcClient>>, String> {
     let config = ctx.config.clone();
     let (api_key, secret) = config
         .get_cex_credentials("mexc")
@@ -19,7 +19,7 @@ pub async fn build_mexc_finalizer(
     let mexc_client = Arc::new(MexcClient::new(&api_key, &secret));
 
     Ok(Arc::new(
-        MexcFinalizer::new_with_tunables(
+        CexVenueFinalizer::new_with_tunables(
             mexc_client,
             ctx.trader_transfers.actions(),
             config.liquidator_principal,

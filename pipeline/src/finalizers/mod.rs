@@ -1,5 +1,5 @@
 pub(crate) mod bridge_planner;
-pub mod cex_finalizer;
+pub mod cex;
 pub mod finalizer;
 pub mod icpswap;
 pub mod liquidation_outcome;

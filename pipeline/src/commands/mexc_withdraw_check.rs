@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use liquidium_pipeline_connectors::backend::cex_backend::CexBackend;
 
-use crate::finalizers::mexc::mexc_finalizer::mexc_withdraw_order_id;
+use crate::finalizers::cex::finalizer::mexc_withdraw_order_id;
 use crate::swappers::mexc::mexc_adapter::MexcClient;
 use crate::utils::now_ts;
 
