@@ -4,9 +4,9 @@ use std::env;
 use async_trait::async_trait;
 
 use liquidium_pipeline_connectors::backend::cex_backend::{
-    BuyOrderInputMode, CexBackend, CexBackendError, DepositAddress, OrderBook, OrderBookLevel, PriceLimit,
-    SwapExecutionOptions, SwapFillReport, WithdrawError, WithdrawStatus, WithdrawStatusSnapshot, WithdrawTerms,
-    WithdrawalReceipt,
+    BuyOrderInputMode, CexBackend, CexBackendError, DepositAddress, FundingRoute, FundingRouteError, OrderBook,
+    OrderBookLevel, PriceLimit, SwapExecutionOptions, SwapFillReport, WithdrawError, WithdrawStatus,
+    WithdrawStatusSnapshot, WithdrawTerms, WithdrawalReceipt,
 };
 use log::{debug, info, warn};
 use rust_decimal::{Decimal, RoundingStrategy};

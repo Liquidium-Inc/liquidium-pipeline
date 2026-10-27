@@ -327,6 +327,12 @@ impl CexBackend for MexcClient {
         find_withdraw_terms(&self.coin_config().await?, asset, network)
     }
 
+    /// MEXC publishes no deposit minimum and keeps no withdrawal address list
+    /// for this account, so it has nothing to refuse here.
+    async fn check_funding_route(&self, _route: &FundingRoute) -> Result<(), FundingRouteError> {
+        Ok(())
+    }
+
     async fn get_balance(&self, asset: &str) -> Result<f64, String> {
         let ex = self.inner.lock().await;
 
