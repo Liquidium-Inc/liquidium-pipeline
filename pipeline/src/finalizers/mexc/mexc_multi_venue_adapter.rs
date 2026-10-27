@@ -9,7 +9,7 @@ use super::mexc_finalizer::MexcFinalizer;
 use crate::{
     finalizers::{
         bridge_planner::BridgePlanner,
-        cex_finalizer::{CexFinalizerLogic, CexState, CexStep},
+        cex_finalizer::{CexState, CexStep},
         multi_venue::{
             MultiVenueAdapter, OperatorQuestion, VenueAmountError, VenueLegCheckpoint, VenueLegProgress,
             VenuePlanningContext, VenueRoutePreview,

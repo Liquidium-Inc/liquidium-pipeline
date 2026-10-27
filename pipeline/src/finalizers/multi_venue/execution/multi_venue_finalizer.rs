@@ -236,7 +236,7 @@ impl MultiVenueFinalizer {
                 };
                 wrapper.finalizer_decision = Some(recovery_decision_snapshot(&recovery_state));
                 // The exact transfer is durable before the caller submits it.
-                self.persist_recovery_state(wal, &mut row, &mut wrapper, &recovery_state)
+                self.persist_state(wal, &mut row, &mut wrapper, recovery_state.clone())
                     .await?;
                 return Ok(LoadedFinalization {
                     row,
@@ -259,7 +259,7 @@ impl MultiVenueFinalizer {
         // Venue execution may begin only after this WAL write succeeds, so a
         // restart always resumes the same allocations instead of replanning.
         wrapper.finalizer_decision = Some(decision_snapshot(&state));
-        self.persist_state(wal, &mut row, &mut wrapper, &state).await?;
+        self.persist_state(wal, &mut row, &mut wrapper, state.clone()).await?;
 
         Ok(LoadedFinalization {
             row,
@@ -269,27 +269,16 @@ impl MultiVenueFinalizer {
         })
     }
 
-    /// Persists the complete envelope after one leg transition. Only the
-    /// supplied leg's execution fields are changed; allocations remain frozen.
+    /// Persists the complete envelope after one transition. Only the supplied
+    /// state changes; allocations remain frozen.
     async fn persist_state(
         &self,
         wal: &dyn WalStore,
         row: &mut crate::persistance::LiqResultRecord,
         wrapper: &mut LiqMetaWrapper,
-        state: &MultiVenueExecutionState,
+        state: impl Into<FinalizerMetaPayload>,
     ) -> Result<(), FinalizerError> {
         set_meta_v2(wrapper, state)?;
-        Ok(self.persist_wrapper(wal, row, wrapper).await?)
-    }
-
-    async fn persist_recovery_state(
-        &self,
-        wal: &dyn WalStore,
-        row: &mut crate::persistance::LiqResultRecord,
-        wrapper: &mut LiqMetaWrapper,
-        state: &RecoverySweepState,
-    ) -> Result<(), FinalizerError> {
-        set_recovery_meta_v2(wrapper, state)?;
         Ok(self.persist_wrapper(wal, row, wrapper).await?)
     }
 
@@ -352,7 +341,7 @@ impl MultiVenueFinalizer {
             Ok(txid) => {
                 state.txid = Some(txid);
                 state.status = RecoverySweepStatus::Completed;
-                self.persist_recovery_state(wal, &mut row, &mut wrapper, &state).await?;
+                self.persist_state(wal, &mut row, &mut wrapper, state.clone()).await?;
                 Ok(recovery_result(&state))
             }
             // A refusal and a lost answer both stop the sweep, but they cost an
@@ -386,7 +375,7 @@ impl MultiVenueFinalizer {
     ) -> Result<FinalizerResult, FinalizerError> {
         state.status = RecoverySweepStatus::OperatorRequired;
         state.last_error = Some(reason);
-        self.persist_recovery_state(wal, row, wrapper, state).await?;
+        self.persist_state(wal, row, wrapper, state.clone()).await?;
         self.notify_recovery_operator_required(state).await;
         Ok(recovery_result(state))
     }
@@ -432,11 +421,11 @@ impl MultiVenueFinalizer {
             // Venue-local checkpoints may have committed several transitions
             // before the adapter returns, including when its final call fails.
             // Synchronize those durable snapshots before handling the result.
-            let (checkpointed_row, checkpointed_wrapper, checkpointed_state) = checkpoint.snapshot().await;
-            *row = checkpointed_row;
-            *wrapper = checkpointed_wrapper;
-            *state = checkpointed_state;
-            if let Some(failure) = checkpoint.permanent_failure().await {
+            let checkpointed = checkpoint.into_state();
+            *row = checkpointed.row;
+            *wrapper = checkpointed.wrapper;
+            *state = checkpointed.execution;
+            if let Some(failure) = checkpointed.permanent_failure {
                 return Err(failure);
             }
 
@@ -478,7 +467,7 @@ impl MultiVenueFinalizer {
             // transition actually changed it. A waiting leg would otherwise
             // cost one fsync'd write per daemon tick.
             if current != state.legs[index] || previous_outcome != state.outcome {
-                self.persist_state(wal, row, wrapper, state).await?;
+                self.persist_state(wal, row, wrapper, state.clone()).await?;
             }
 
             // Alert only when entering the parked state. A direct retry of the
@@ -914,22 +903,11 @@ pub(crate) fn derive_outcome(legs: &[VenueLegState]) -> MultiVenueExecutionOutco
 
 pub(crate) fn set_meta_v2(
     wrapper: &mut LiqMetaWrapper,
-    state: &MultiVenueExecutionState,
+    state: impl Into<FinalizerMetaPayload>,
 ) -> Result<(), FinalizerError> {
     let meta = FinalizerMetaV2 {
         version: FINALIZER_META_V2_VERSION,
-        payload: FinalizerMetaPayload::MultiVenueSwap(state.clone()),
-    };
-    meta.validate()
-        .map_err(|error| FinalizerError::Permanent(error.to_string()))?;
-    wrapper.meta_v2 = Some(meta);
-    Ok(())
-}
-
-fn set_recovery_meta_v2(wrapper: &mut LiqMetaWrapper, state: &RecoverySweepState) -> Result<(), FinalizerError> {
-    let meta = FinalizerMetaV2 {
-        version: FINALIZER_META_V2_VERSION,
-        payload: FinalizerMetaPayload::RecoverySweep(state.clone()),
+        payload: state.into(),
     };
     meta.validate()
         .map_err(|error| FinalizerError::Permanent(error.to_string()))?;

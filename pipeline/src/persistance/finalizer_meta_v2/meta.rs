@@ -20,6 +20,18 @@ pub enum FinalizerMetaPayload {
     RecoverySweep(RecoverySweepState),
 }
 
+impl From<MultiVenueExecutionState> for FinalizerMetaPayload {
+    fn from(state: MultiVenueExecutionState) -> Self {
+        Self::MultiVenueSwap(state)
+    }
+}
+
+impl From<RecoverySweepState> for FinalizerMetaPayload {
+    fn from(state: RecoverySweepState) -> Self {
+        Self::RecoverySweep(state)
+    }
+}
+
 impl FinalizerMetaV2 {
     pub fn validate(&self) -> Result<(), String> {
         if self.version != FINALIZER_META_V2_VERSION {

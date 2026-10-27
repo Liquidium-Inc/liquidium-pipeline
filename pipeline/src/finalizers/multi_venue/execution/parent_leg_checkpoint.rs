@@ -19,13 +19,13 @@ use crate::{
 /// the selected leg together with all sibling legs and the parent execution
 /// outcome. This prevents a venue-local transition from erasing concurrent or
 /// previously committed state belonging to another venue.
-struct ParentLegCheckpointState {
-    row: LiqResultRecord,
-    wrapper: LiqMetaWrapper,
-    execution: MultiVenueExecutionState,
+pub(super) struct ParentLegCheckpointState {
+    pub(super) row: LiqResultRecord,
+    pub(super) wrapper: LiqMetaWrapper,
+    pub(super) execution: MultiVenueExecutionState,
     /// A checkpoint that can never succeed. The adapter only passes text back,
     /// so the parent reads the decision here.
-    permanent_failure: Option<FinalizerError>,
+    pub(super) permanent_failure: Option<FinalizerError>,
 }
 
 /// Invocation-scoped persistence capability for exactly one committed leg.
@@ -64,17 +64,11 @@ impl<'a> ParentLegCheckpoint<'a> {
         }
     }
 
-    /// Returns the most recently committed in-memory snapshot so the parent
-    /// can continue from venue checkpoints even when the adapter returns an
-    /// operational error after one or more successful transitions.
-    pub(super) async fn snapshot(&self) -> (LiqResultRecord, LiqMetaWrapper, MultiVenueExecutionState) {
-        let inner = self.inner.lock().await;
-        (inner.row.clone(), inner.wrapper.clone(), inner.execution.clone())
-    }
-
-    /// The permanent failure a checkpoint met while the adapter ran, if any.
-    pub(super) async fn permanent_failure(&self) -> Option<FinalizerError> {
-        self.inner.lock().await.permanent_failure.clone()
+    /// Returns the most recently committed state so the parent can continue
+    /// from venue checkpoints even when the adapter returns an operational
+    /// error after one or more successful transitions.
+    pub(super) fn into_state(self) -> ParentLegCheckpointState {
+        self.inner.into_inner()
     }
 }
 
@@ -88,7 +82,7 @@ impl VenueLegCheckpoint for ParentLegCheckpoint<'_> {
             .and_then(|()| {
                 inner.execution.outcome = derive_outcome(&inner.execution.legs);
                 let execution = inner.execution.clone();
-                set_meta_v2(&mut inner.wrapper, &execution)
+                set_meta_v2(&mut inner.wrapper, execution)
             });
         if let Err(failure) = applied {
             let message = failure.to_string();

@@ -34,6 +34,13 @@ impl From<String> for CexBackendError {
     }
 }
 
+/// Callers that report text keep the message, prefix included.
+impl From<CexBackendError> for String {
+    fn from(error: CexBackendError) -> Self {
+        error.to_string()
+    }
+}
+
 impl From<&str> for CexBackendError {
     fn from(message: &str) -> Self {
         Self::Other(message.to_string())

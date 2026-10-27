@@ -3,7 +3,6 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use alloy::primitives::Address as EvmAddress;
-use async_trait::async_trait;
 use candid::{Nat, Principal};
 use ic_ledger_types::{AccountIdentifier, Subaccount};
 use icrc_ledger_types::icrc1::account::Account;
@@ -45,7 +44,7 @@ const SOL_FINALITY_SECS: i64 = 20;
 use crate::{
     bridge::runtime::BridgeRuntime,
     finalizers::bridge_planner::BridgePlanner,
-    finalizers::cex_finalizer::{CexFinalizerLogic, CexState, CexStep},
+    finalizers::cex_finalizer::{CexState, CexStep},
     outbound::driver::{OutboundError, OutboundRecord, step_outbound},
     stages::bridge_submit_lock::acquire_bridge_submit_lock,
     swappers::mexc::orderbook_quote::{simulate_buy_from_asks, simulate_sell_from_bids},
@@ -281,12 +280,23 @@ impl<B: CexBackend> MexcFinalizer<B> {
     }
 }
 
-#[async_trait]
-impl<B> CexFinalizerLogic for MexcFinalizer<B>
+/// The CEX state machine one leg walks: deposit, trade, withdraw.
+impl<B> MexcFinalizer<B>
 where
     B: CexBackend,
 {
-    async fn deposit(&self, state: &mut CexState) -> Result<(), CexBackendError> {
+    /// Runs the current step once.
+    pub(super) async fn advance_current_step(&self, state: &mut CexState) -> Result<(), CexBackendError> {
+        match state.step {
+            CexStep::Deposit | CexStep::DepositPending => self.deposit(state).await,
+            CexStep::Trade | CexStep::TradePending => self.trade(state).await,
+            CexStep::Withdraw | CexStep::WithdrawPending => self.withdraw(state).await,
+            CexStep::Completed | CexStep::Failed => Ok(()),
+        }
+    }
+
+    /// On chain: collateral to the CEX deposit asset, sent to the deposit address.
+    pub(super) async fn deposit(&self, state: &mut CexState) -> Result<(), CexBackendError> {
         self.ensure_plan_on_state(state);
         let planned_asset = <Self as BridgePlanner>::planned_deposit_asset(state);
         let planned_network = <Self as BridgePlanner>::planned_deposit_network(state);
@@ -313,7 +323,8 @@ where
     /// the market lock. `execute_trade_leg_slices` has the slice algorithm.
     /// On success the state moves to `TradePending` for the next leg, or to
     /// `Withdraw` when the route is done. A paused leg resumes next cycle.
-    async fn trade(&self, state: &mut CexState) -> Result<(), CexBackendError> {
+    /// On the CEX: the deposit asset to the withdraw asset.
+    pub(super) async fn trade(&self, state: &mut CexState) -> Result<(), CexBackendError> {
         self.ensure_plan_on_state(state);
         state.market = format!(
             "{}_{}",
@@ -439,7 +450,8 @@ where
         Ok(())
     }
 
-    async fn withdraw(&self, state: &mut CexState) -> Result<(), CexBackendError> {
+    /// From the CEX back to the chain.
+    pub(super) async fn withdraw(&self, state: &mut CexState) -> Result<(), CexBackendError> {
         self.ensure_plan_on_state(state);
         let planned_asset = <Self as BridgePlanner>::planned_withdraw_asset(state);
         let planned_network = <Self as BridgePlanner>::planned_withdraw_network(state);
@@ -478,7 +490,6 @@ where
         self.withdraw_bridged(state, &planned_asset, &planned_network, amount)
             .await
     }
-
 }
 
 #[cfg(test)]

@@ -1,11 +1,8 @@
-use async_trait::async_trait;
 use candid::Nat;
-use liquidium_pipeline_connectors::backend::cex_backend::CexBackendError;
 use liquidium_pipeline_core::tokens::{chain_token::ChainToken, chain_token_amount::ChainTokenAmount};
 use liquidium_pipeline_core::types::side_cost::SideCost;
 
 use serde::{Deserialize, Serialize};
-
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum CexStep {
@@ -288,29 +285,6 @@ impl CexState {
                         || bridge.deposit_send_started())
             }
             _ => false,
-        }
-    }
-}
-
-/// The CEX state machine one leg walks: deposit, trade, withdraw.
-#[async_trait]
-pub trait CexFinalizerLogic: Send + Sync {
-    // On chain: collateral -> CEX deposit asset, send to deposit address
-    async fn deposit(&self, state: &mut CexState) -> Result<(), CexBackendError>;
-
-    // On CEX: deposit asset -> withdraw asset
-    async fn trade(&self, state: &mut CexState) -> Result<(), CexBackendError>;
-
-    // On CEX: withdraw to chain
-    async fn withdraw(&self, state: &mut CexState) -> Result<(), CexBackendError>;
-
-    /// Executes one phase of the shared CEX state machine.
-    async fn advance_current_step(&self, state: &mut CexState) -> Result<(), CexBackendError> {
-        match state.step {
-            CexStep::Deposit | CexStep::DepositPending => self.deposit(state).await,
-            CexStep::Trade | CexStep::TradePending => self.trade(state).await,
-            CexStep::Withdraw | CexStep::WithdrawPending => self.withdraw(state).await,
-            CexStep::Completed | CexStep::Failed => Ok(()),
         }
     }
 }
