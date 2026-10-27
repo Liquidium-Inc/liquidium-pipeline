@@ -31,10 +31,9 @@ impl KrakenClient {
         network: &str,
     ) -> Result<(KrakenFundingMethod, String, Option<String>), FundingRouteError> {
         let api_asset = api_asset(asset);
-        let methods = self.api.deposit_methods(&api_asset).await.map_err(unavailable)?;
+        let methods = self.deposit_methods(&api_asset).await.map_err(unavailable)?;
         let method = unique_method(methods, asset, network, "deposit").map_err(FundingRouteError::Unsupported)?;
         let addresses = self
-            .api
             .deposit_addresses(&api_asset, &method.method)
             .await
             .map_err(unavailable)?;
@@ -80,10 +79,9 @@ impl KrakenClient {
         network: &str,
     ) -> Result<(KrakenFundingMethod, Vec<(String, String)>), FundingRouteError> {
         let api_asset = api_asset(asset);
-        let methods = self.api.withdrawal_methods(&api_asset).await.map_err(unavailable)?;
+        let methods = self.withdrawal_methods(&api_asset).await.map_err(unavailable)?;
         let method = unique_method(methods, asset, network, "withdrawal").map_err(FundingRouteError::Unsupported)?;
         let verified = self
-            .api
             .withdrawal_addresses(&api_asset)
             .await
             .map_err(unavailable)?

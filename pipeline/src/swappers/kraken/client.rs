@@ -1,11 +1,8 @@
 //! [`KrakenClient`]: Kraken behind the venue-neutral [`CexBackend`]. Orders
 //! live in `trading.rs` and deposits and withdrawals in `funding.rs`; this file
-//! holds the market allowlist and pair lookup they share.
+//! holds the market allowlist and the cached metadata reads they share.
 
-use std::{
-    sync::Arc,
-    time::{Duration, Instant},
-};
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use liquidium_pipeline_connectors::backend::cex_backend::{
@@ -16,17 +13,18 @@ use rust_decimal::{
     Decimal,
     prelude::{FromPrimitive, ToPrimitive},
 };
-use tokio::sync::RwLock;
 
-use super::api::{KrakenApi, KrakenBook, KrakenPair};
+use super::api::{
+    KrakenApi, KrakenApiError, KrakenBook, KrakenDepositAddress, KrakenFundingMethod, KrakenPair,
+    KrakenWithdrawalAddress,
+};
+use super::cache::MetadataCache;
 use super::rest::KrakenRestApi;
-
-const PAIR_METADATA_TTL: Duration = Duration::from_secs(5 * 60);
 
 #[derive(Clone)]
 pub struct KrakenClient {
     pub(super) api: Arc<dyn KrakenApi>,
-    pairs: Arc<RwLock<Option<(Instant, Vec<KrakenPair>)>>>,
+    cache: Arc<MetadataCache>,
     allowed_pairs: Arc<Vec<String>>,
 }
 
@@ -50,20 +48,54 @@ impl KrakenClient {
         }
         Ok(Self {
             api,
-            pairs: Arc::new(RwLock::new(None)),
+            cache: Arc::default(),
             allowed_pairs: Arc::new(allowed_pairs),
         })
     }
 
     async fn all_pairs(&self) -> Result<Vec<KrakenPair>, String> {
-        if let Some((loaded_at, pairs)) = self.pairs.read().await.as_ref()
-            && loaded_at.elapsed() < PAIR_METADATA_TTL
-        {
-            return Ok(pairs.clone());
-        }
-        let pairs = self.api.pairs().await.map_err(|error| error.to_string())?;
-        *self.pairs.write().await = Some((Instant::now(), pairs.clone()));
-        Ok(pairs)
+        self.cache
+            .pairs
+            .get_or_load((), async || self.api.pairs().await)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    pub(super) async fn deposit_methods(&self, asset: &str) -> Result<Vec<KrakenFundingMethod>, KrakenApiError> {
+        self.cache
+            .deposit_methods
+            .get_or_load(asset.to_string(), async || self.api.deposit_methods(asset).await)
+            .await
+    }
+
+    pub(super) async fn deposit_addresses(
+        &self,
+        asset: &str,
+        method: &str,
+    ) -> Result<Vec<KrakenDepositAddress>, KrakenApiError> {
+        self.cache
+            .deposit_addresses
+            .get_or_load((asset.to_string(), method.to_string()), async || {
+                self.api.deposit_addresses(asset, method).await
+            })
+            .await
+    }
+
+    pub(super) async fn withdrawal_methods(&self, asset: &str) -> Result<Vec<KrakenFundingMethod>, KrakenApiError> {
+        self.cache
+            .withdrawal_methods
+            .get_or_load(asset.to_string(), async || self.api.withdrawal_methods(asset).await)
+            .await
+    }
+
+    pub(super) async fn withdrawal_addresses(
+        &self,
+        asset: &str,
+    ) -> Result<Vec<KrakenWithdrawalAddress>, KrakenApiError> {
+        self.cache
+            .withdrawal_addresses
+            .get_or_load(asset.to_string(), async || self.api.withdrawal_addresses(asset).await)
+            .await
     }
 
     /// The one online Kraken pair for an allowed market.

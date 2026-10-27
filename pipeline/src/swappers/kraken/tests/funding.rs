@@ -371,3 +371,57 @@ async fn a_status_read_tries_the_recent_page_before_the_whole_history() {
     let snapshot = client.get_withdraw_status_snapshot_by_id("BTC", "lq1w0").await.unwrap();
     assert_eq!(snapshot.status, WithdrawStatus::Unknown);
 }
+
+/// Methods and addresses rarely change, so a second route check within the
+/// cache window reads nothing from Kraken again.
+#[tokio::test]
+async fn a_second_route_check_reads_the_cached_methods_and_addresses() {
+    let mut api = MockKrakenApi::new();
+    api.expect_deposit_methods()
+        .once()
+        .returning(|_| Ok(vec![bitcoin_method(Decimal::ZERO)]));
+    api.expect_deposit_addresses().once().returning(|_, _| {
+        Ok(vec![KrakenDepositAddress {
+            address: "bc1qdeposit".into(),
+            tag: None,
+        }])
+    });
+    api.expect_withdrawal_methods()
+        .once()
+        .returning(|_| Ok(vec![bitcoin_method(Decimal::ZERO)]));
+    api.expect_withdrawal_addresses()
+        .once()
+        .returning(|_| Ok(vec![verified("bc1qdestination")]));
+    let client = btc_usd_client(api);
+
+    for _ in 0..2 {
+        client
+            .check_funding_route(&route(0.1, "bc1qdestination"))
+            .await
+            .expect("a verified route");
+    }
+}
+
+/// A failed read is not kept, so the next check reads Kraken again.
+#[tokio::test]
+async fn a_failed_read_is_not_cached() {
+    let mut api = MockKrakenApi::new();
+    let mut reads = 0;
+    api.expect_deposit_methods().times(2).returning(move |_| {
+        reads += 1;
+        if reads == 1 {
+            return Err(KrakenApiError::Transport("timed out".into()));
+        }
+        Ok(vec![bitcoin_method(Decimal::ZERO)])
+    });
+    api.expect_deposit_addresses().returning(|_, _| {
+        Ok(vec![KrakenDepositAddress {
+            address: "bc1qdeposit".into(),
+            tag: None,
+        }])
+    });
+    let client = btc_usd_client(api);
+
+    assert!(client.get_deposit_address("BTC", "bitcoin").await.is_err());
+    assert!(client.get_deposit_address("BTC", "bitcoin").await.is_ok());
+}
