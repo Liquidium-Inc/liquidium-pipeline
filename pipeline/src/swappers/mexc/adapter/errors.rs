@@ -5,6 +5,9 @@ use super::*;
 /// MEXC answers a history read for a coin it does not list with 700004,
 /// "mandatory parameter 'coin' ... malformed". Seen live on 2026-10-26.
 const MEXC_MALFORMED_PARAM_RAW_CODE: i32 = 700004;
+/// MEXC refuses a withdrawal under the coin's minimum with 10254. Its text
+/// changes with the language, so only the code is read.
+const MEXC_WITHDRAW_BELOW_MIN_RAW_CODE: i32 = 10254;
 
 pub(super) fn format_mexc_api_error(err: &v3::ApiError) -> String {
     match err {
@@ -39,6 +42,10 @@ pub(super) fn is_pending_settlement(err: &v3::ApiError) -> bool {
         v3::ApiError::ErrorResponse(resp)
             if resp.code == v3::ErrorCode::Oversold || resp.code == v3::ErrorCode::InsufficientPosition
     )
+}
+
+pub(super) fn is_below_withdraw_minimum(err: &v3::ApiError) -> bool {
+    matches!(err, v3::ApiError::ErrorResponse(resp) if resp.raw_code == MEXC_WITHDRAW_BELOW_MIN_RAW_CODE)
 }
 
 pub(super) fn is_coin_missing(err: &v3::ApiError) -> bool {

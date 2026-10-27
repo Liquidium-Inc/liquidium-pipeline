@@ -6,7 +6,8 @@ use async_trait::async_trait;
 use liquidium_pipeline_core::outbound::SIDE_EFFECT_AMBIGUOUS_PREFIX;
 use liquidium_pipeline_connectors::backend::cex_backend::{
     BuyOrderInputMode, CexBackend, CexBackendError, DepositAddress, OrderBook, OrderBookLevel, PriceLimit,
-    SwapExecutionOptions, SwapFillReport, WithdrawStatus, WithdrawStatusSnapshot, WithdrawTerms, WithdrawalReceipt,
+    SwapExecutionOptions, SwapFillReport, WithdrawError, WithdrawStatus, WithdrawStatusSnapshot, WithdrawTerms,
+    WithdrawalReceipt,
 };
 use log::{debug, info, warn};
 use rust_decimal::{Decimal, RoundingStrategy};

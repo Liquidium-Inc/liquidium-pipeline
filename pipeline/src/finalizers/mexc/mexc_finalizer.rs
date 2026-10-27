@@ -13,9 +13,7 @@ use liquidium_pipeline_connectors::backend::bridge_backend::{
     BridgeRouteSpec, BridgeStatus, DepositNotice, FINALIZER_PERMANENT_AMOUNT_FLOOR_PREFIX, resolve_route,
 };
 use liquidium_pipeline_connectors::outbound::UnsettledSender;
-use liquidium_pipeline_core::outbound::{
-    OutboundIntent, OutboundSender, is_side_effect_ambiguous, side_effect_ambiguous,
-};
+use liquidium_pipeline_core::outbound::{OutboundIntent, OutboundSender, side_effect_ambiguous};
 use liquidium_pipeline_connectors::backend::cex_backend::{
     BuyOrderInputMode, CexBackend, CexBackendError, OrderBookLevel, PriceLimit, SwapExecutionOptions, WithdrawStatus,
 };
@@ -33,7 +31,6 @@ use liquidium_pipeline_connectors::outbound::{AcceptedWithdrawal, CexWithdrawals
 
 pub(super) const WITHDRAW_BRIDGE_SOURCE_BALANCE_TOLERANCE: f64 = LIQUIDITY_EPS;
 const NATIVE_ETH_BRIDGEABLE_SAFETY_MARGIN: f64 = 1e-15;
-const MEXC_WITHDRAW_BELOW_MIN_RAW_CODE: i64 = 10254;
 pub(super) const BRIDGE_FEE_TOKEN_SYMBOL: &str = "ckETH";
 pub(super) const BRIDGE_FEE_TOKEN_CHAIN: &str = "ICP";
 pub(super) const CKETH_DECIMALS: u8 = 18;
@@ -49,7 +46,7 @@ use crate::{
     bridge::runtime::BridgeRuntime,
     finalizers::bridge_planner::BridgePlanner,
     finalizers::cex_finalizer::{CexFinalizerLogic, CexRoutePreview, CexState, CexStep},
-    outbound::driver::{OutboundRecord, step_outbound},
+    outbound::driver::{OutboundError, OutboundRecord, step_outbound},
     stages::bridge_submit_lock::acquire_bridge_submit_lock,
     stages::executor::ExecutionReceipt,
     swappers::{
@@ -263,8 +260,6 @@ mod withdraw_bridge;
 mod withdraw_direct;
 
 pub(super) use sizing::{BridgeDepositSizing, BridgedDepositArrival};
-#[cfg(test)]
-use withdraw_direct::is_mexc_withdraw_below_min_error;
 pub use withdraw_direct::mexc_withdraw_order_id;
 
 #[async_trait]

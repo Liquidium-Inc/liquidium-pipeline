@@ -24,7 +24,7 @@ use crate::{
         bridge_planner::BridgePlanner,
         cex_finalizer::{CexState, CexStep},
     },
-    outbound::driver::{OutboundPhase, OutboundRecord, step_outbound},
+    outbound::driver::{OutboundError, OutboundPhase, OutboundRecord, step_outbound},
     stages::bridge_submit_lock::acquire_bridge_submit_lock,
     utils::now_ts,
 };
@@ -157,11 +157,11 @@ where
             Ok(None) => Ok(()),
             // A busy bridge wallet is a wait. The next cycle measures the
             // funds again and saves a new call.
-            Err(error) if error.starts_with(BRIDGE_SUBMISSION_DEFERRED_PREFIX) => {
+            Err(OutboundError::Retry(error)) if error.starts_with(BRIDGE_SUBMISSION_DEFERRED_PREFIX) => {
                 info!("[mexc] liq_id={} bridged deposit deferred: {}", state.liq_id, error);
                 Ok(())
             }
-            Err(error) => Err(error),
+            Err(error) => Err(error.into()),
         }
     }
 

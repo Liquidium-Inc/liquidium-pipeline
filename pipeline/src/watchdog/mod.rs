@@ -175,7 +175,7 @@ impl Watchdog for WebhookWatchdog {
                 let body = resp
                     .text()
                     .await
-                    .unwrap_or_else(|err| format!("<failed to read response body: {err}>"));
+                    .unwrap_or_else(|err| format!("<failed to read response body: {}>", error_without_url(err)));
                 tracing::error!(
                     key = %key,
                     status = %status,
@@ -185,7 +185,11 @@ impl Watchdog for WebhookWatchdog {
                 false
             }
             Err(err) => {
-                tracing::error!(key = %key, error = %err, "Webhook notification transport failed");
+                tracing::error!(
+                    key = %key,
+                    error = %error_without_url(err),
+                    "Webhook notification transport failed"
+                );
                 false
             }
         };
@@ -197,6 +201,12 @@ impl Watchdog for WebhookWatchdog {
             self.release_reservation(&key, displaced).await;
         }
     }
+}
+
+/// A webhook error as text, without the request URL. Webhook URLs carry their
+/// secret, and reqwest prints the URL with transport errors.
+pub(crate) fn error_without_url(err: reqwest::Error) -> String {
+    err.without_url().to_string()
 }
 
 // helpers for wiring
@@ -282,6 +292,33 @@ mod tests {
         assert!(
             wd.reserve_for_send("hb:Running").await.is_some(),
             "releasing a fresh reservation must clear the key entirely"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_webhook_send_logs_no_part_of_the_url() {
+        // A server that accepts and never answers makes the send time out, and
+        // reqwest attaches the URL to timeout errors.
+        let server = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let port = server.local_addr().expect("addr").port();
+        let _held = tokio::spawn(async move { server.accept().await });
+        let err = reqwest::Client::builder()
+            .timeout(Duration::from_millis(200))
+            .build()
+            .expect("client")
+            .post(format!("http://127.0.0.1:{port}/hooks/secret-path?token=hunter2"))
+            .send()
+            .await
+            .expect_err("silent webhook");
+        assert!(
+            err.to_string().contains("hunter2"),
+            "reqwest no longer prints the URL: {err}"
+        );
+
+        let logged = error_without_url(err);
+        assert!(
+            !logged.contains("hunter2") && !logged.contains("secret-path"),
+            "{logged}"
         );
     }
 

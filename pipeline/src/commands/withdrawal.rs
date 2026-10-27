@@ -304,7 +304,8 @@ async fn evm_gas(config: &Config, source: WithdrawSource, gas_limit: u128) -> Re
     let rpc_url = config
         .evm_rpc_url
         .parse()
-        .map_err(|e| format!("invalid EVM RPC URL '{}': {e}", config.evm_rpc_url))?;
+        // RPC URLs often carry an API key, so the error leaves the URL out.
+        .map_err(|e| format!("invalid EVM RPC URL: {e}"))?;
     let provider = ProviderBuilder::new()
         .network::<AnyNetwork>()
         .wallet(signer)

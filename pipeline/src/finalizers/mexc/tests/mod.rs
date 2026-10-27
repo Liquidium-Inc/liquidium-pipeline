@@ -12,7 +12,7 @@ use liquidium_pipeline_connectors::backend::bridge_backend::{
 };
 use liquidium_pipeline_connectors::backend::cex_backend::{
     BuyOrderInputMode, CexBackendError, DepositAddress, MockCexBackend, OrderBook, OrderBookLevel, SwapFillReport,
-    WithdrawStatus, WithdrawStatusSnapshot, WithdrawTerms,
+    WithdrawError, WithdrawStatus, WithdrawStatusSnapshot, WithdrawTerms,
 };
 use liquidium_pipeline_core::account::model::ChainAccount;
 use liquidium_pipeline_core::outbound::SIDE_EFFECT_AMBIGUOUS_PREFIX;

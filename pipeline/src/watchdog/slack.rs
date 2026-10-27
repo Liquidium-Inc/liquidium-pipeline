@@ -8,7 +8,7 @@ use std::{
 };
 use tokio::sync::Mutex;
 
-use super::{WATCHDOG_HTTP_TIMEOUT_SECS, Watchdog, WatchdogEvent, noop_watchdog};
+use super::{WATCHDOG_HTTP_TIMEOUT_SECS, Watchdog, WatchdogEvent, error_without_url, noop_watchdog};
 
 const DEFAULT_BOT_NAME: &str = "liquidator";
 
@@ -94,7 +94,7 @@ impl Watchdog for SlackWatchdog {
                 false
             }
             Err(err) => {
-                warn!("Slack notification failed: {}", err);
+                warn!("Slack notification failed: {}", error_without_url(err));
                 false
             }
         };

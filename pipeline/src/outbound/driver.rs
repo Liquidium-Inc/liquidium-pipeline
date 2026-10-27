@@ -86,6 +86,9 @@ enum Drive {
     /// The send did not happen. The record is cleared, and the next cycle
     /// prepares a new send.
     Retry { reason: String },
+    /// The receiver refuses the amount as too small. The record is cleared,
+    /// and the caller must not send the same amount again.
+    BelowMinimum { reason: String },
     /// An operator must decide. The reason carries the ambiguity prefix.
     Park { reason: String },
 }
@@ -110,7 +113,10 @@ async fn advance_outbound(record: &mut Option<OutboundRecord>, sender: &dyn Outb
         };
     };
     let drive = advance_saved(saved, sender, now).await;
-    if matches!(drive, Drive::Done { .. } | Drive::Retry { .. }) {
+    if matches!(
+        drive,
+        Drive::Done { .. } | Drive::Retry { .. } | Drive::BelowMinimum { .. }
+    ) {
         *record = None;
     }
     drive
@@ -133,6 +139,7 @@ async fn advance_saved(saved: &mut OutboundRecord, sender: &dyn OutboundSender, 
     match outcome {
         SendOutcome::Landed { receipt } => Drive::Done { receipt },
         SendOutcome::NeverLanded { reason } => Drive::Retry { reason },
+        SendOutcome::BelowMinimum { reason } => Drive::BelowMinimum { reason },
         SendOutcome::Open { reason } => {
             let window = sender.open_window_secs(&saved.prepared);
             if now.saturating_sub(submitted_at) > window {
@@ -149,14 +156,34 @@ async fn advance_saved(saved: &mut OutboundRecord, sender: &dyn OutboundSender, 
     }
 }
 
-/// One drive of a saved send; `intent` starts a new one. An error means a
-/// new send on the next cycle, or a park when it has the ambiguity prefix.
+/// Why one step did not finish its send.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum OutboundError {
+    /// The send did not happen; the next cycle prepares a new one.
+    #[error("{0}")]
+    Retry(String),
+    /// The send may have run; an operator must decide. The reason carries
+    /// the ambiguity prefix for the layers that still read text.
+    #[error("{0}")]
+    Park(String),
+    /// The receiver refuses the amount as too small, so a new send of it fails too.
+    #[error("{0}")]
+    BelowMinimum(String),
+}
+
+impl From<OutboundError> for String {
+    fn from(error: OutboundError) -> Self {
+        error.to_string()
+    }
+}
+
+/// One drive of a saved send; `intent` starts a new one.
 pub async fn step_outbound(
     record: &mut Option<OutboundRecord>,
     sender: &dyn OutboundSender,
     intent: Option<&OutboundIntent>,
     now: i64,
-) -> Result<Option<String>, String> {
+) -> Result<Option<String>, OutboundError> {
     let drive = match intent {
         Some(intent) => start_outbound(record, sender, intent).await,
         None => advance_outbound(record, sender, now).await,
@@ -164,7 +191,9 @@ pub async fn step_outbound(
     match drive {
         Drive::Done { receipt } => Ok(Some(receipt)),
         Drive::Wait => Ok(None),
-        Drive::Retry { reason } | Drive::Park { reason } => Err(reason),
+        Drive::Retry { reason } => Err(OutboundError::Retry(reason)),
+        Drive::Park { reason } => Err(OutboundError::Park(reason)),
+        Drive::BelowMinimum { reason } => Err(OutboundError::BelowMinimum(reason)),
     }
 }
 
@@ -273,6 +302,24 @@ mod tests {
         assert_eq!(
             advance_outbound(&mut record, &sender, 120).await,
             Drive::Retry { reason: "expired".into() }
+        );
+        assert!(record.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_too_small_send_clears_its_record_and_says_so() {
+        let reason = "under the receiver minimum".to_string();
+        let too_small = SendOutcome::BelowMinimum { reason: reason.clone() };
+        let sender = sender(too_small, vec![]);
+        let mut record = None;
+
+        assert_eq!(
+            step_outbound(&mut record, &sender, Some(&intent()), 100).await,
+            Ok(None)
+        );
+        assert_eq!(
+            step_outbound(&mut record, &sender, None, 100).await,
+            Err(OutboundError::BelowMinimum(reason))
         );
         assert!(record.is_none());
     }

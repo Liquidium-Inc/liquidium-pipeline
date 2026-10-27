@@ -308,7 +308,7 @@ mod tests {
                 .await;
             let kind = match outcome {
                 SendOutcome::Landed { .. } => "landed",
-                SendOutcome::NeverLanded { .. } => "never",
+                SendOutcome::NeverLanded { .. } | SendOutcome::BelowMinimum { .. } => "never",
                 SendOutcome::Open { .. } => "open",
             };
             assert_eq!(kind, expected);
