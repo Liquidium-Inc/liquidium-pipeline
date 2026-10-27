@@ -2,6 +2,7 @@
 //!
 //! The record travels with the step's saved state, so the identity of a send
 //! is durable before the send runs, and a restart resumes the same send.
+use liquidium_pipeline_connectors::backend::cex_backend::CexBackendError;
 use liquidium_pipeline_core::outbound::{
     OutboundIntent, OutboundSender, PreparedSend, SendOutcome, side_effect_ambiguous,
 };
@@ -164,6 +165,16 @@ pub enum OutboundError {
 impl From<OutboundError> for String {
     fn from(error: OutboundError) -> Self {
         error.to_string()
+    }
+}
+
+/// A send failure inside a CEX leg step keeps its below-minimum kind.
+impl From<OutboundError> for CexBackendError {
+    fn from(error: OutboundError) -> Self {
+        match error {
+            OutboundError::BelowMinimum(message) => CexBackendError::BelowMinimum(message),
+            other => CexBackendError::Other(other.to_string()),
+        }
     }
 }
 

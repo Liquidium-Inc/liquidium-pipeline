@@ -331,13 +331,15 @@ where
     async fn preview_trade_input(&self, state: &CexState, side_costs: &mut Vec<SideCost>) -> Result<f64, String> {
         if !state.deposit.bridge.deposit_bridge_required {
             let (_, executable_pay) =
-                Self::compute_fee_adjusted_deposit_transfer(&state.deposit.deposit_asset, &state.size_in, false)?;
+                Self::compute_fee_adjusted_deposit_transfer(&state.deposit.deposit_asset, &state.size_in, false)
+                    .map_err(|error| error.to_string())?;
             return Ok(executable_pay.to_f64());
         }
         let bridge = self.bridge_runtime()?;
         let route = Self::deposit_route(state, &<Self as BridgePlanner>::planned_deposit_asset(state))?;
-        let arrival =
-            Self::bridged_deposit_arrival(bridge, route, &state.deposit.deposit_asset, &state.size_in).await?;
+        let arrival = Self::bridged_deposit_arrival(bridge, route, &state.deposit.deposit_asset, &state.size_in)
+            .await
+            .map_err(|error| error.to_string())?;
         side_costs.extend(arrival.sizing.fee_budget.side_costs);
         Ok(arrival.expected_amount)
     }
@@ -379,7 +381,8 @@ where
         if route.route_kind == BridgeRouteKind::SolanaToIcp {
             let gross = ChainTokenAmount::from_formatted(state.withdraw.withdraw_asset.clone(), net);
             net = Self::solana_repayment_bridge_amount(bridge, route, &gross, budget.source_fee_budget)
-                .await?
+                .await
+                .map_err(|error| error.to_string())?
                 .to_f64();
         }
         side_costs.extend(budget.side_costs);

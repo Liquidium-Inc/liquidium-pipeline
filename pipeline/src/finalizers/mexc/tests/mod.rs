@@ -7,7 +7,6 @@ use candid::{Nat, Principal};
 use ic_ledger_types::{AccountIdentifier, Subaccount};
 use liquidium_pipeline_connectors::backend::bridge_backend::{
     BRIDGE_SUBMISSION_DEFERRED_PREFIX, BridgeDestination, BridgeFeeBudget, BridgeStatus, BridgeSubmission,
-    FINALIZER_PERMANENT_AMOUNT_FLOOR_PREFIX,
     MockBridgeBackend,
 };
 use liquidium_pipeline_connectors::backend::cex_backend::{

@@ -20,7 +20,11 @@ where
 
     /// A deposit through a bridge: fund the bridge account, send the provider
     /// call for a bridge handle, then poll the bridge until it completes.
-    pub(super) async fn deposit_bridged(&self, state: &mut CexState, planned_asset: &str) -> Result<(), String> {
+    pub(super) async fn deposit_bridged(
+        &self,
+        state: &mut CexState,
+        planned_asset: &str,
+    ) -> Result<(), CexBackendError> {
         let bridge = self.bridge_runtime()?;
         let route = Self::deposit_route(state, planned_asset)?;
 
@@ -47,7 +51,7 @@ where
             return self.advance_bridged_deposit_submission(state, bridge, route).await;
         }
 
-        self.poll_deposit_bridge(state, bridge).await
+        Ok(self.poll_deposit_bridge(state, bridge).await?)
     }
 
     /// Reads the bridge status. A completed bridge hands over to the MEXC

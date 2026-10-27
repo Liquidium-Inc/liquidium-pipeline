@@ -109,6 +109,18 @@ pub struct VenueLegState {
 
     #[serde(default)]
     pub last_error: Option<String>,
+
+    /// Why the leg failed, where the row's outcome depends on it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure: Option<VenueLegFailure>,
+}
+
+/// Why a leg failed, where the row's outcome depends on the reason.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum VenueLegFailure {
+    /// The amount fell under a route minimum during execution.
+    BelowMinimum,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

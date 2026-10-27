@@ -6,7 +6,7 @@ use liquidium_pipeline_connectors::backend::amount_utils::nat_units_to_amount_vi
 use liquidium_pipeline_connectors::backend::bridge_backend::{
     BRIDGE_SUBMISSION_DEFERRED_PREFIX, BridgeFeeBudget, BridgeRouteKind, BridgeRouteSpec,
 };
-use liquidium_pipeline_connectors::backend::cex_backend::CexBackend;
+use liquidium_pipeline_connectors::backend::cex_backend::{CexBackend, CexBackendError};
 use liquidium_pipeline_core::outbound::side_effect_ambiguous;
 use log::{debug, info};
 
@@ -129,7 +129,7 @@ where
         state: &mut CexState,
         bridge: &BridgeRuntime,
         route: &'static BridgeRouteSpec,
-    ) -> Result<(), String> {
+    ) -> Result<(), CexBackendError> {
         state.step = CexStep::DepositPending;
         let deposit = BridgedDeposit {
             bridge,
@@ -145,7 +145,7 @@ where
         let _submit_guard =
             acquire_bridge_submit_lock(route.source_asset, route.source_chain, &deposit.source_address).await;
         if state.deposit.bridge.deposit_bridge_call.is_none() {
-            return self.save_bridge_call(state, &deposit).await;
+            return Ok(self.save_bridge_call(state, &deposit).await?);
         }
 
         let sender = BridgeCallSender::new(bridge.backend.clone(), bridge.claims.clone());

@@ -173,13 +173,12 @@ impl OutboundSender for BridgeCallSender {
             Ok(submission) => SendOutcome::Landed {
                 receipt: submission.bridge_id,
             },
-            // Refused before any provider call: a busy wallet or a floor.
-            Err(reason)
-                if reason.starts_with(BRIDGE_SUBMISSION_DEFERRED_PREFIX)
-                    || reason.starts_with(FINALIZER_PERMANENT_AMOUNT_FLOOR_PREFIX) =>
-            {
-                SendOutcome::NeverLanded { reason }
+            // Refused before any provider call: a busy wallet or a floor. The
+            // bridge reports both as text until `BridgeBackend` returns types.
+            Err(reason) if reason.starts_with(FINALIZER_PERMANENT_AMOUNT_FLOOR_PREFIX) => {
+                SendOutcome::BelowMinimum { reason }
             }
+            Err(reason) if reason.starts_with(BRIDGE_SUBMISSION_DEFERRED_PREFIX) => SendOutcome::NeverLanded { reason },
             // Any other failure may follow a call that ran, so the provider
             // history decides it.
             Err(reason) => SendOutcome::Open { reason },

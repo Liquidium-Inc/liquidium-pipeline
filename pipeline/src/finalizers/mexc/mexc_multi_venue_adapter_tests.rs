@@ -1,9 +1,8 @@
 use std::{collections::HashMap, sync::Arc};
 
 use candid::{Nat, Principal};
-use liquidium_pipeline_connectors::backend::bridge_backend::FINALIZER_PERMANENT_AMOUNT_FLOOR_PREFIX;
 use liquidium_pipeline_connectors::backend::cex_backend::{
-    CexBackendError, MockCexBackend, OrderBook, OrderBookLevel, SwapFillReport, WithdrawTerms,
+    CexBackendError, DepositAddress, MockCexBackend, OrderBook, OrderBookLevel, SwapFillReport, WithdrawTerms,
 };
 use liquidium_pipeline_core::{
     tokens::{chain_token::ChainToken, chain_token_amount::ChainTokenAmount, token_registry::TokenRegistry},
@@ -17,7 +16,7 @@ use crate::{
         cex_finalizer::CexRouteLeg,
         multi_venue::{MultiVenueAdapter, VenueLegCheckpoint, VenueLegProgress, VenuePlanningContext},
     },
-    persistance::{VenueLegQuote, VenueLegState, VenueLegStatus},
+    persistance::{VenueExecutionState, VenueLegFailure, VenueLegQuote, VenueLegState, VenueLegStatus},
     swappers::model::SwapRequest,
 };
 
@@ -132,9 +131,14 @@ fn finalizer_with_permanent_deposit_error() -> MexcFinalizer<MockCexBackend> {
         _ => Err(format!("unexpected market {market}")),
     });
     backend.expect_get_balance().returning(|_| Ok(0.0));
-    backend
-        .expect_get_deposit_address()
-        .returning(|_, _| Err(format!("{FINALIZER_PERMANENT_AMOUNT_FLOOR_PREFIX}: test amount floor")));
+    backend.expect_get_deposit_address().returning(|asset, network| {
+        Ok(DepositAddress {
+            asset: asset.to_string(),
+            network: network.to_string(),
+            address: "aaaaa-aa".to_string(),
+            tag: None,
+        })
+    });
     let tokens = HashMap::from([
         (pay_token().asset_id(), pay_token()),
         (receive_token().asset_id(), receive_token()),
@@ -200,6 +204,7 @@ fn leg_from_preview(preview: VenueRoutePreview) -> VenueLegState {
         status: VenueLegStatus::Planned,
         result: None,
         last_error: None,
+        failure: None,
     }
 }
 
@@ -987,6 +992,15 @@ async fn permanent_cex_error_marks_only_the_mexc_leg_failed() {
         .await
         .expect("preview should succeed");
     let mut leg = leg_from_preview(preview);
+    // One unit cannot pay its own ledger fee, so the deposit meets its floor.
+    let mut execution = leg
+        .execution
+        .decode::<MexcVenueExecutionState>("mexc")
+        .expect("state should decode")
+        .expect("state should be MEXC");
+    execution.cex.size_in = ChainTokenAmount::from_raw(pay_token(), Nat::from(1u8));
+    leg.execution = VenueExecutionState::new("mexc", &execution).expect("encode state");
+    leg.request.pay_amount = execution.cex.size_in.clone();
 
     let armed = MultiVenueAdapter::advance(&finalizer, &leg, &NoopCheckpoint)
         .await
@@ -997,11 +1011,14 @@ async fn permanent_cex_error_marks_only_the_mexc_leg_failed() {
         .expect("permanent failure should be returned as leg progress");
 
     assert_eq!(failed.status, VenueLegStatus::FailedPermanent);
+    assert_eq!(failed.failure, Some(VenueLegFailure::BelowMinimum));
     assert!(
         failed
             .last_error
             .as_deref()
-            .is_some_and(|error| error.starts_with(FINALIZER_PERMANENT_AMOUNT_FLOOR_PREFIX))
+            .is_some_and(|error| error.contains("too small to reserve ledger fee")),
+        "{:?}",
+        failed.last_error
     );
     // Diagnostics only: a permanent failure must not also ask to be retried.
     assert_eq!(failed.retryable_error, None);

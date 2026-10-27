@@ -85,6 +85,7 @@ pub(super) fn preview_to_leg(preview: VenueRoutePreview) -> VenueLegState {
         status: VenueLegStatus::Planned,
         result: None,
         last_error: None,
+        failure: None,
     }
 }
 

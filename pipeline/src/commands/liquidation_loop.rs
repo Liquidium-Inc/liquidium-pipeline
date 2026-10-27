@@ -695,6 +695,7 @@ mod tests {
             status: VenueLegStatus::Running,
             result: None,
             last_error: None,
+            failure: None,
         };
         let meta_v2 = FinalizerMetaV2 {
             version: FINALIZER_META_V2_VERSION,

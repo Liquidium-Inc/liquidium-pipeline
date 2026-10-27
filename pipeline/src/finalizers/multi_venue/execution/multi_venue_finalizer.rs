@@ -9,7 +9,7 @@ use crate::{
     persistance::{
         FINALIZER_META_V2_VERSION, FinalizerDecisionSnapshot, FinalizerMetaPayload, FinalizerMetaV2, LiqMetaWrapper,
         MultiVenueAllocationSnapshot, MultiVenueExecutionOutcome, MultiVenueExecutionState, RecoverySweepState,
-        RecoverySweepStatus, VenueAllocationSnapshot, VenueLegState, VenueLegStatus, WalStore,
+        RecoverySweepStatus, VenueAllocationSnapshot, VenueLegFailure, VenueLegState, VenueLegStatus, WalStore,
     },
     price_oracle::price_oracle::PriceOracle,
     stages::executor::ExecutionReceipt,
@@ -31,11 +31,6 @@ use tracing::{debug, info, warn};
 
 use super::parent_leg_checkpoint::ParentLegCheckpoint;
 use crate::finalizers::multi_venue::planning::venue_registry::VenueRegistry;
-
-pub(super) const MULTI_VENUE_PERMANENT_PREFIX: &str = "permanent multi-venue finalizer: ";
-const MULTI_VENUE_CUSTODY_PREFIX: &str = "multi-venue venue custody: ";
-const MULTI_VENUE_NO_ROUTE_PREFIX: &str = "no viable ICPSwap-first route: ";
-const MULTI_VENUE_UNRESUMABLE_PREFIX: &str = "unresumable multi-venue finalizer: ";
 
 struct RecoverySweepRuntime {
     trader_transfers: Arc<dyn TransferActions + Send + Sync>,
@@ -157,7 +152,7 @@ impl MultiVenueFinalizer {
         &self,
         wal: &dyn WalStore,
         receipt: &ExecutionReceipt,
-    ) -> Result<LoadedFinalization, String> {
+    ) -> Result<LoadedFinalization, FinalizerError> {
         let liquidation_id = liq_id_from_receipt(receipt)?;
         let mut row = wal_load(wal, &liquidation_id)
             .await?
@@ -193,7 +188,8 @@ impl MultiVenueFinalizer {
         {
             return Err(format!(
                 "refusing to upgrade committed legacy execution for liquidation {liquidation_id} to meta_v2"
-            ));
+            )
+            .into());
         }
 
         // Planning starts here. Build the planner input from the confirmed
@@ -203,7 +199,7 @@ impl MultiVenueFinalizer {
         // mismatched pay asset, an unsuccessful execution — and no retry can
         // change it, so the row fails once instead of spending its whole budget.
         let input = IcpswapFirstPlanInput::from_receipt(receipt)
-            .map_err(|error| format!("{MULTI_VENUE_PERMANENT_PREFIX}{error}"))?;
+            .map_err(|error| FinalizerError::Permanent(error.to_string()))?;
 
         // This is the pure routing decision: quote the registered venues and
         // produce the immutable allocation plan plus initialized venue legs.
@@ -212,9 +208,9 @@ impl MultiVenueFinalizer {
             Ok(state) => state,
             Err(IcpswapFirstPlannerError::BelowVenueMinimum(reason)) => {
                 let recovery = self.recovery.as_ref().ok_or_else(|| {
-                    format!(
-                        "{MULTI_VENUE_PERMANENT_PREFIX}no venue can execute this amount and recovery sweep is unavailable: {reason}"
-                    )
+                    FinalizerError::Permanent(format!(
+                        "no venue can execute this amount and recovery sweep is unavailable: {reason}"
+                    ))
                 })?;
                 let destination = recovery_destination(&input.total_pay.token, &recovery.recovery_account)?;
                 let fee = input.total_pay.token.fee();
@@ -250,10 +246,12 @@ impl MultiVenueFinalizer {
                 });
             }
             Err(IcpswapFirstPlannerError::InvalidInput(error)) => {
-                return Err(format!("{MULTI_VENUE_PERMANENT_PREFIX}{error}"));
+                return Err(FinalizerError::Permanent(error.to_string()));
             }
             Err(IcpswapFirstPlannerError::NoViableRoute(reason)) => {
-                return Err(format!("{MULTI_VENUE_NO_ROUTE_PREFIX}{reason}"));
+                return Err(FinalizerError::NoRoute(format!(
+                    "no viable ICPSwap-first route: {reason}"
+                )));
             }
         };
 
@@ -279,9 +277,9 @@ impl MultiVenueFinalizer {
         row: &mut crate::persistance::LiqResultRecord,
         wrapper: &mut LiqMetaWrapper,
         state: &MultiVenueExecutionState,
-    ) -> Result<(), String> {
+    ) -> Result<(), FinalizerError> {
         set_meta_v2(wrapper, state)?;
-        self.persist_wrapper(wal, row, wrapper).await
+        Ok(self.persist_wrapper(wal, row, wrapper).await?)
     }
 
     async fn persist_recovery_state(
@@ -290,9 +288,9 @@ impl MultiVenueFinalizer {
         row: &mut crate::persistance::LiqResultRecord,
         wrapper: &mut LiqMetaWrapper,
         state: &RecoverySweepState,
-    ) -> Result<(), String> {
+    ) -> Result<(), FinalizerError> {
         set_recovery_meta_v2(wrapper, state)?;
-        self.persist_wrapper(wal, row, wrapper).await
+        Ok(self.persist_wrapper(wal, row, wrapper).await?)
     }
 
     /// The adapter registered for a venue id.
@@ -322,7 +320,7 @@ impl MultiVenueFinalizer {
         mut wrapper: LiqMetaWrapper,
         mut state: RecoverySweepState,
         freshly_planned: bool,
-    ) -> Result<FinalizerResult, String> {
+    ) -> Result<FinalizerResult, FinalizerError> {
         if state.status != RecoverySweepStatus::ReadyToSubmit {
             return Ok(recovery_result(&state));
         }
@@ -344,7 +342,7 @@ impl MultiVenueFinalizer {
         }
 
         let runtime = self.recovery.as_ref().ok_or_else(|| {
-            format!("{MULTI_VENUE_PERMANENT_PREFIX}committed recovery sweep has no configured runtime")
+            FinalizerError::Permanent("committed recovery sweep has no configured runtime".to_string())
         })?;
         match runtime
             .trader_transfers
@@ -385,7 +383,7 @@ impl MultiVenueFinalizer {
         wrapper: &mut LiqMetaWrapper,
         state: &mut RecoverySweepState,
         reason: String,
-    ) -> Result<FinalizerResult, String> {
+    ) -> Result<FinalizerResult, FinalizerError> {
         state.status = RecoverySweepStatus::OperatorRequired;
         state.last_error = Some(reason);
         self.persist_recovery_state(wal, row, wrapper, state).await?;
@@ -410,7 +408,7 @@ impl MultiVenueFinalizer {
 
     /// Advances each runnable leg once in committed vector order and journals
     /// every transition before another venue is touched.
-    async fn advance_legs(&self, context: &mut MultiVenueFinalizationContext<'_>) -> Result<(), String> {
+    async fn advance_legs(&self, context: &mut MultiVenueFinalizationContext<'_>) -> Result<(), FinalizerError> {
         let wal = context.wal;
         let row = &mut context.row;
         let wrapper = &mut context.wrapper;
@@ -424,10 +422,10 @@ impl MultiVenueFinalizer {
             }
 
             let adapter = self.venues.adapter(&current.venue_id).ok_or_else(|| {
-                format!(
-                    "{MULTI_VENUE_PERMANENT_PREFIX}no adapter registered for committed venue `{}`",
+                FinalizerError::Permanent(format!(
+                    "no adapter registered for committed venue `{}`",
                     current.venue_id
-                )
+                ))
             })?;
             let checkpoint = ParentLegCheckpoint::new(wal, index, row, wrapper, state);
             let execution_result = adapter.advance(&current, &checkpoint).await;
@@ -438,13 +436,16 @@ impl MultiVenueFinalizer {
             *row = checkpointed_row;
             *wrapper = checkpointed_wrapper;
             *state = checkpointed_state;
+            if let Some(failure) = checkpoint.permanent_failure().await {
+                return Err(failure);
+            }
 
             let progress = execution_result?;
             let retryable_error = progress.retryable_error.clone();
             let current = state.legs[index].clone();
 
             apply_progress(&mut state.legs[index], progress)
-                .map_err(|error| format!("{MULTI_VENUE_PERMANENT_PREFIX}{error}"))?;
+                .map_err(|error| FinalizerError::Permanent(error.to_string()))?;
             let advanced = &state.legs[index];
             if current.status != advanced.status || current.last_error != advanced.last_error {
                 info!(
@@ -502,11 +503,11 @@ impl MultiVenueFinalizer {
         if retryable_errors.is_empty() {
             Ok(())
         } else {
-            Err(retryable_errors.join("; "))
+            Err(FinalizerError::Retryable(retryable_errors.join("; ")))
         }
     }
 
-    fn result_for_state(&self, state: &MultiVenueExecutionState) -> Result<FinalizerResult, String> {
+    fn result_for_state(&self, state: &MultiVenueExecutionState) -> Result<FinalizerResult, FinalizerError> {
         match &state.outcome {
             MultiVenueExecutionOutcome::Running => Ok(FinalizerResult {
                 swap_result: None,
@@ -542,6 +543,13 @@ impl MultiVenueFinalizer {
                 // pipeline `swap_result: None`, dropping those proceeds out of
                 // profit accounting and the analytics export for good. Fail hard
                 // only when there is nothing to account for.
+                // A route minimum alone is a bad-debt purchase the stage may
+                // accept; any other failure is final.
+                let only_floors = state
+                    .legs
+                    .iter()
+                    .filter(|leg| leg.status == VenueLegStatus::FailedPermanent)
+                    .all(|leg| leg.failure == Some(VenueLegFailure::BelowMinimum));
                 match aggregate_completed_legs(state)? {
                     Some(swap_result) => Ok(FinalizerResult {
                         swap_result: Some(swap_result),
@@ -550,7 +558,8 @@ impl MultiVenueFinalizer {
                         swapper: Some("multi_venue".to_string()),
                         reason: Some(context),
                     }),
-                    None => Err(format!("{MULTI_VENUE_PERMANENT_PREFIX}{context}")),
+                    None if only_floors => Err(FinalizerError::BadDebtAmountFloor(context)),
+                    None => Err(FinalizerError::Permanent(context)),
                 }
             }
             MultiVenueExecutionOutcome::Completed | MultiVenueExecutionOutcome::Recovered => Ok(FinalizerResult {
@@ -569,7 +578,7 @@ impl MultiVenueFinalizer {
         &self,
         wal: &dyn WalStore,
         receipt: ExecutionReceipt,
-    ) -> Result<FinalizerResult, String> {
+    ) -> Result<FinalizerResult, FinalizerError> {
         let LoadedFinalization {
             row,
             wrapper,
@@ -592,10 +601,10 @@ impl MultiVenueFinalizer {
     }
 }
 
-fn recovery_destination(token: &ChainToken, recovery: &Account) -> Result<ChainAccount, String> {
+fn recovery_destination(token: &ChainToken, recovery: &Account) -> Result<ChainAccount, FinalizerError> {
     let ChainToken::Icp { ledger, .. } = token else {
-        return Err(format!(
-            "{MULTI_VENUE_PERMANENT_PREFIX}automatic recovery sweep has no distinct destination for EVM collateral"
+        return Err(FinalizerError::Permanent(
+            "automatic recovery sweep has no distinct destination for EVM collateral".to_string(),
         ));
     };
     if ledger.to_text() == ICP_LEDGER_PRINCIPAL {
@@ -667,17 +676,14 @@ fn leg_side_cost_receive(leg: &VenueLegState, costs: &[SideCost]) -> Nat {
 /// invariant, not an empty aggregate.
 fn aggregate_completed_legs(
     state: &MultiVenueExecutionState,
-) -> Result<Option<crate::swappers::model::SwapExecution>, String> {
+) -> Result<Option<crate::swappers::model::SwapExecution>, FinalizerError> {
     let completed_results = state
         .legs
         .iter()
         .filter(|leg| leg.status == VenueLegStatus::Completed)
         .map(|leg| {
             leg.result.clone().ok_or_else(|| {
-                format!(
-                    "{MULTI_VENUE_PERMANENT_PREFIX}completed venue leg `{}` has no execution result",
-                    leg.leg_id
-                )
+                FinalizerError::Permanent(format!("completed venue leg `{}` has no execution result", leg.leg_id))
             })
         })
         .collect::<Result<Vec<_>, _>>()?;
@@ -690,7 +696,7 @@ fn aggregate_completed_legs(
 fn aggregate_swap_executions(
     legs: &[VenueLegState],
     executions: Vec<crate::swappers::model::SwapExecution>,
-) -> Result<Option<crate::swappers::model::SwapExecution>, String> {
+) -> Result<Option<crate::swappers::model::SwapExecution>, FinalizerError> {
     if executions.is_empty() {
         return Ok(None);
     }
@@ -700,8 +706,8 @@ fn aggregate_swap_executions(
         .iter()
         .any(|execution| execution.pay_asset != first.pay_asset || execution.receive_asset != first.receive_asset)
     {
-        return Err(format!(
-            "{MULTI_VENUE_PERMANENT_PREFIX}completed venue legs use different asset pairs"
+        return Err(FinalizerError::Permanent(
+            "completed venue legs use different asset pairs".to_string(),
         ));
     }
 
@@ -758,35 +764,17 @@ fn aggregate_swap_executions(
     }))
 }
 
-/// Converts this finalizer's internal error text into the decision the pipeline
-/// acts on.
-///
-/// The sentinels are private to this module and never leave it: `finalize`
-/// classifies once, at the boundary, so no caller re-derives a decision from a
-/// message. New code should prefer building the variant directly.
 /// Marks committed state this binary cannot interpret — an unknown payload
 /// kind, an unreadable envelope, or a version from a newer build.
 ///
 /// This is a code or config mismatch, not a dead liquidation. Left unmarked it
-/// classifies as retryable, which spends the row's budget on a decode that can
+/// would be retryable, which spends the row's budget on a decode that can
 /// never succeed and then fails it permanently, dropping a row whose venue legs
 /// may still hold funds out of the queue. Parking keeps it visible instead.
-fn unresumable_meta(error: impl std::fmt::Display) -> String {
-    format!("{MULTI_VENUE_UNRESUMABLE_PREFIX}committed finalizer state cannot be read by this build: {error}")
-}
-
-fn classify(error: String) -> FinalizerError {
-    if error.starts_with(MULTI_VENUE_PERMANENT_PREFIX) {
-        FinalizerError::Permanent(error)
-    } else if error.starts_with(MULTI_VENUE_UNRESUMABLE_PREFIX) {
-        FinalizerError::Unresumable(error)
-    } else if error.starts_with(MULTI_VENUE_CUSTODY_PREFIX) {
-        FinalizerError::VenueCustody(error)
-    } else if error.starts_with(MULTI_VENUE_NO_ROUTE_PREFIX) {
-        FinalizerError::NoRoute(error)
-    } else {
-        FinalizerError::Retryable(error)
-    }
+fn unresumable_meta(error: impl std::fmt::Display) -> FinalizerError {
+    FinalizerError::Unresumable(format!(
+        "committed finalizer state cannot be read by this build: {error}"
+    ))
 }
 
 #[async_trait]
@@ -796,14 +784,18 @@ impl Finalizer for MultiVenueFinalizer {
         wal: &dyn WalStore,
         receipt: ExecutionReceipt,
     ) -> Result<FinalizerResult, FinalizerError> {
-        self.finalize_inner(wal, receipt).await.map_err(classify)
+        self.finalize_inner(wal, receipt).await
     }
 }
 
 impl MultiVenueFinalizer {
-    async fn finalize_inner(&self, wal: &dyn WalStore, receipt: ExecutionReceipt) -> Result<FinalizerResult, String> {
+    async fn finalize_inner(
+        &self,
+        wal: &dyn WalStore,
+        receipt: ExecutionReceipt,
+    ) -> Result<FinalizerResult, FinalizerError> {
         if receipt.request.swap_args.is_none() {
-            return Err(format!("{MULTI_VENUE_PERMANENT_PREFIX}receipt has no swap request"));
+            return Err(FinalizerError::Permanent("receipt has no swap request".to_string()));
         }
 
         let liquidation_id = liq_id_from_receipt(&receipt)?;
@@ -827,9 +819,9 @@ impl MultiVenueFinalizer {
                 .as_ref()
                 .is_some_and(|decision| matches!(decision.chosen.as_str(), "dex" | "cex"))
         {
-            return Err(format!(
-                "{MULTI_VENUE_PERMANENT_PREFIX}legacy execution state is not supported for liquidation {liquidation_id}"
-            ));
+            return Err(FinalizerError::Permanent(format!(
+                "legacy execution state is not supported for liquidation {liquidation_id}"
+            )));
         }
 
         self.finalize_multi_venue(wal, receipt).await
@@ -844,21 +836,23 @@ impl MultiVenueFinalizer {
 /// reconciled by anything. Tagging it routes budget exhaustion to an operator
 /// park instead, which stays visible and can be requeued.
 ///
-/// Errors that already carry a classification keep it because a permanent
-/// decision is more specific than "a leg is running".
-fn tag_custody_error(state: &MultiVenueExecutionState, error: String) -> String {
-    if error.starts_with(MULTI_VENUE_PERMANENT_PREFIX) || error.starts_with(MULTI_VENUE_CUSTODY_PREFIX) {
-        return error;
-    }
-
+/// A permanent decision is more specific than "a leg is running", so it keeps
+/// its kind, as does an error already tagged for custody.
+fn tag_custody_error(state: &MultiVenueExecutionState, error: FinalizerError) -> FinalizerError {
     let holds_custody = state
         .legs
         .iter()
         .any(|leg| matches!(leg.status, VenueLegStatus::Running | VenueLegStatus::OperatorRequired));
-    if holds_custody {
-        format!("{MULTI_VENUE_CUSTODY_PREFIX}{error}")
-    } else {
-        error
+    match error {
+        FinalizerError::Retryable(message)
+        | FinalizerError::NoRoute(message)
+        | FinalizerError::Unresumable(message)
+        | FinalizerError::BadDebtAmountFloor(message)
+            if holds_custody =>
+        {
+            FinalizerError::VenueCustody(message)
+        }
+        other => other,
     }
 }
 
@@ -873,6 +867,7 @@ pub(super) fn apply_progress(leg: &mut VenueLegState, progress: VenueLegProgress
     leg.status = progress.status;
     leg.result = progress.result;
     leg.last_error = progress.last_error;
+    leg.failure = progress.failure;
     Ok(())
 }
 
@@ -917,24 +912,27 @@ pub(crate) fn derive_outcome(legs: &[VenueLegState]) -> MultiVenueExecutionOutco
     }
 }
 
-pub(crate) fn set_meta_v2(wrapper: &mut LiqMetaWrapper, state: &MultiVenueExecutionState) -> Result<(), String> {
+pub(crate) fn set_meta_v2(
+    wrapper: &mut LiqMetaWrapper,
+    state: &MultiVenueExecutionState,
+) -> Result<(), FinalizerError> {
     let meta = FinalizerMetaV2 {
         version: FINALIZER_META_V2_VERSION,
         payload: FinalizerMetaPayload::MultiVenueSwap(state.clone()),
     };
     meta.validate()
-        .map_err(|error| format!("{MULTI_VENUE_PERMANENT_PREFIX}{error}"))?;
+        .map_err(|error| FinalizerError::Permanent(error.to_string()))?;
     wrapper.meta_v2 = Some(meta);
     Ok(())
 }
 
-fn set_recovery_meta_v2(wrapper: &mut LiqMetaWrapper, state: &RecoverySweepState) -> Result<(), String> {
+fn set_recovery_meta_v2(wrapper: &mut LiqMetaWrapper, state: &RecoverySweepState) -> Result<(), FinalizerError> {
     let meta = FinalizerMetaV2 {
         version: FINALIZER_META_V2_VERSION,
         payload: FinalizerMetaPayload::RecoverySweep(state.clone()),
     };
     meta.validate()
-        .map_err(|error| format!("{MULTI_VENUE_PERMANENT_PREFIX}{error}"))?;
+        .map_err(|error| FinalizerError::Permanent(error.to_string()))?;
     wrapper.meta_v2 = Some(meta);
     Ok(())
 }
@@ -1050,6 +1048,7 @@ mod side_cost_tests {
             status: VenueLegStatus::Completed,
             result: None,
             last_error: None,
+            failure: None,
         }
     }
 

@@ -2,9 +2,12 @@ use async_trait::async_trait;
 use tokio::sync::Mutex;
 use tracing::{debug, info};
 
-use super::multi_venue_finalizer::{MULTI_VENUE_PERMANENT_PREFIX, apply_progress, derive_outcome, set_meta_v2};
+use super::multi_venue_finalizer::{apply_progress, derive_outcome, set_meta_v2};
 use crate::{
-    finalizers::multi_venue::{VenueLegCheckpoint, VenueLegProgress},
+    finalizers::{
+        finalizer::FinalizerError,
+        multi_venue::{VenueLegCheckpoint, VenueLegProgress},
+    },
     persistance::{LiqMetaWrapper, LiqResultRecord, MultiVenueExecutionState, WalStore},
     utils::now_ts,
     wal::encode_meta,
@@ -20,6 +23,9 @@ struct ParentLegCheckpointState {
     row: LiqResultRecord,
     wrapper: LiqMetaWrapper,
     execution: MultiVenueExecutionState,
+    /// A checkpoint that can never succeed. The adapter only passes text back,
+    /// so the parent reads the decision here.
+    permanent_failure: Option<FinalizerError>,
 }
 
 /// Invocation-scoped persistence capability for exactly one committed leg.
@@ -53,6 +59,7 @@ impl<'a> ParentLegCheckpoint<'a> {
                 row: row.clone(),
                 wrapper: wrapper.clone(),
                 execution: execution.clone(),
+                permanent_failure: None,
             }),
         }
     }
@@ -64,6 +71,11 @@ impl<'a> ParentLegCheckpoint<'a> {
         let inner = self.inner.lock().await;
         (inner.row.clone(), inner.wrapper.clone(), inner.execution.clone())
     }
+
+    /// The permanent failure a checkpoint met while the adapter ran, if any.
+    pub(super) async fn permanent_failure(&self) -> Option<FinalizerError> {
+        self.inner.lock().await.permanent_failure.clone()
+    }
 }
 
 #[async_trait]
@@ -71,11 +83,18 @@ impl VenueLegCheckpoint for ParentLegCheckpoint<'_> {
     async fn checkpoint(&self, progress: VenueLegProgress) -> Result<(), String> {
         let mut inner = self.inner.lock().await;
         let previous = inner.execution.legs[self.leg_index].clone();
-        apply_progress(&mut inner.execution.legs[self.leg_index], progress)
-            .map_err(|error| format!("{MULTI_VENUE_PERMANENT_PREFIX}{error}"))?;
-        inner.execution.outcome = derive_outcome(&inner.execution.legs);
-        let execution = inner.execution.clone();
-        set_meta_v2(&mut inner.wrapper, &execution)?;
+        let applied = apply_progress(&mut inner.execution.legs[self.leg_index], progress)
+            .map_err(FinalizerError::Permanent)
+            .and_then(|()| {
+                inner.execution.outcome = derive_outcome(&inner.execution.legs);
+                let execution = inner.execution.clone();
+                set_meta_v2(&mut inner.wrapper, &execution)
+            });
+        if let Err(failure) = applied {
+            let message = failure.to_string();
+            inner.permanent_failure = Some(failure);
+            return Err(message);
+        }
         inner.row.updated_at = now_ts();
         let wrapper = inner.wrapper.clone();
         encode_meta(&mut inner.row, &wrapper)?;

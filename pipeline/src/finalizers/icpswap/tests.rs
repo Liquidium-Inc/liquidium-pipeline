@@ -460,6 +460,7 @@ fn venue_leg(state: IcpswapExecutionState, request: SwapRequest) -> VenueLegStat
         status: VenueLegStatus::Planned,
         result: None,
         last_error: None,
+        failure: None,
     }
 }
 

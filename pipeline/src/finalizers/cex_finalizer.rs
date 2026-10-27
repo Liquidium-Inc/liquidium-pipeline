@@ -296,24 +296,23 @@ impl CexState {
 #[async_trait]
 pub trait CexFinalizerLogic: Send + Sync {
     // On chain: collateral -> CEX deposit asset, send to deposit address
-    async fn deposit(&self, state: &mut CexState) -> Result<(), String>;
+    async fn deposit(&self, state: &mut CexState) -> Result<(), CexBackendError>;
 
     // On CEX: deposit asset -> withdraw asset
     async fn trade(&self, state: &mut CexState) -> Result<(), CexBackendError>;
 
     // On CEX: withdraw to chain
-    async fn withdraw(&self, state: &mut CexState) -> Result<(), String>;
+    async fn withdraw(&self, state: &mut CexState) -> Result<(), CexBackendError>;
 
     /// Executes one phase of the shared CEX state machine.
     async fn advance_current_step(&self, state: &mut CexState) -> Result<(), CexBackendError> {
         match state.step {
-            CexStep::Deposit | CexStep::DepositPending => self.deposit(state).await.map_err(CexBackendError::from),
+            CexStep::Deposit | CexStep::DepositPending => self.deposit(state).await,
             CexStep::Trade | CexStep::TradePending => self.trade(state).await,
-            CexStep::Withdraw | CexStep::WithdrawPending => self.withdraw(state).await.map_err(CexBackendError::from),
+            CexStep::Withdraw | CexStep::WithdrawPending => self.withdraw(state).await,
             CexStep::Completed | CexStep::Failed => Ok(()),
         }
     }
-
 }
 
 #[cfg(test)]

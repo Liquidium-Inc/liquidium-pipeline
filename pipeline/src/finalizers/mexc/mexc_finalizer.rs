@@ -286,7 +286,7 @@ impl<B> CexFinalizerLogic for MexcFinalizer<B>
 where
     B: CexBackend,
 {
-    async fn deposit(&self, state: &mut CexState) -> Result<(), String> {
+    async fn deposit(&self, state: &mut CexState) -> Result<(), CexBackendError> {
         self.ensure_plan_on_state(state);
         let planned_asset = <Self as BridgePlanner>::planned_deposit_asset(state);
         let planned_network = <Self as BridgePlanner>::planned_deposit_network(state);
@@ -439,7 +439,7 @@ where
         Ok(())
     }
 
-    async fn withdraw(&self, state: &mut CexState) -> Result<(), String> {
+    async fn withdraw(&self, state: &mut CexState) -> Result<(), CexBackendError> {
         self.ensure_plan_on_state(state);
         let planned_asset = <Self as BridgePlanner>::planned_withdraw_asset(state);
         let planned_network = <Self as BridgePlanner>::planned_withdraw_network(state);
@@ -466,13 +466,14 @@ where
             return Err(format!(
                 "withdrawal amount is zero or negative for liq_id {} (amount={})",
                 state.liq_id, amount
-            ));
+            )
+            .into());
         }
 
         if !state.withdraw.bridge.withdraw_bridge_required {
-            return self
+            return Ok(self
                 .withdraw_direct(state, &planned_asset, &planned_network, amount)
-                .await;
+                .await?);
         }
         self.withdraw_bridged(state, &planned_asset, &planned_network, amount)
             .await

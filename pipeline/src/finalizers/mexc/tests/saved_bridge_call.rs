@@ -137,7 +137,7 @@ async fn a_parked_journal_attempt_waits_for_an_operator_answer() {
     state.deposit.bridge.legacy_bridge_submit_phase = Some(journal_attempt(Some(now_ts() - 3_600), true));
 
     let error = finalizer.deposit(&mut state).await.expect_err("only an operator decides");
-    assert!(error.starts_with(SIDE_EFFECT_AMBIGUOUS_PREFIX), "{error}");
+    assert!(error.to_string().starts_with(SIDE_EFFECT_AMBIGUOUS_PREFIX), "{error}");
     assert!(matches!(
         state.deposit.bridge.deposit_bridge_call.as_ref().unwrap().phase,
         OutboundPhase::Parked { .. }
@@ -159,7 +159,7 @@ async fn a_row_funded_by_an_older_build_parks_before_any_call() {
     state.deposit.bridge.deposit_bridge_call_unrecorded = true;
 
     let error = finalizer.deposit(&mut state).await.expect_err("only an operator decides");
-    assert!(error.starts_with(SIDE_EFFECT_AMBIGUOUS_PREFIX), "{error}");
+    assert!(error.to_string().starts_with(SIDE_EFFECT_AMBIGUOUS_PREFIX), "{error}");
     assert!(!state.deposit.bridge.deposit_bridge_call_unrecorded);
     let questions = MexcFinalizer::<MockCexBackend>::operator_questions_for(&state);
     assert_eq!(questions.len(), 1, "{questions:?}");
@@ -236,7 +236,7 @@ async fn a_call_missing_past_the_grace_period_parks() {
             result.expect("inside the grace period a miss is a wait");
         } else {
             let error = result.expect_err("a stale miss is not proof");
-            assert!(error.starts_with(SIDE_EFFECT_AMBIGUOUS_PREFIX), "{error}");
+            assert!(error.to_string().starts_with(SIDE_EFFECT_AMBIGUOUS_PREFIX), "{error}");
         }
     }
 }

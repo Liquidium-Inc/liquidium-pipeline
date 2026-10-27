@@ -32,7 +32,7 @@ use crate::{
     persistance::{
         FINALIZER_META_V2_VERSION, FinalizerMetaPayload, FinalizerMetaV2, LiqMetaWrapper, LiqResultRecord,
         MultiVenueExecutionOutcome, MultiVenueExecutionState, RecoverySweepState, RecoverySweepStatus, ResultStatus,
-        VenueExecutionState, VenueLegState, VenueLegStatus, WalStore,
+        VenueExecutionState, VenueLegFailure, VenueLegState, VenueLegStatus, WalStore,
     },
     stage::PipelineStage,
     stages::{
@@ -385,6 +385,11 @@ struct ScriptedAdapter {
     preview_failure: Option<String>,
     /// The open question a parked leg asks an operator.
     operator_question: Option<String>,
+    /// Makes `advance` checkpoint progress tagged for another venue, which
+    /// the parent refuses permanently, and return only the refusal text.
+    checkpoint_foreign_venue: bool,
+    /// Why a scripted `FailedPermanent` leg failed.
+    failure: Option<VenueLegFailure>,
 }
 
 impl ScriptedAdapter {
@@ -403,7 +408,19 @@ impl ScriptedAdapter {
             advance_failure: None,
             preview_failure: None,
             operator_question: None,
+            checkpoint_foreign_venue: false,
+            failure: None,
         }
+    }
+
+    fn with_failure(mut self, failure: VenueLegFailure) -> Self {
+        self.failure = Some(failure);
+        self
+    }
+
+    fn with_foreign_checkpoint(mut self) -> Self {
+        self.checkpoint_foreign_venue = true;
+        self
     }
 
     fn with_operator_question(mut self, question: &str) -> Self {
@@ -498,11 +515,26 @@ impl MultiVenueAdapter for ScriptedAdapter {
     async fn advance(
         &self,
         leg: &VenueLegState,
-        _checkpoint: &dyn VenueLegCheckpoint,
+        checkpoint: &dyn VenueLegCheckpoint,
     ) -> Result<VenueLegProgress, String> {
         self.advance_calls.fetch_add(1, Ordering::SeqCst);
         if let Some(error) = &self.advance_failure {
             return Err(error.clone());
+        }
+        if self.checkpoint_foreign_venue {
+            checkpoint
+                .checkpoint(VenueLegProgress {
+                    execution: VenueExecutionState {
+                        venue: "elsewhere".to_string(),
+                        state: serde_json::json!({}),
+                    },
+                    status: VenueLegStatus::Running,
+                    result: None,
+                    last_error: None,
+                    retryable_error: None,
+                    failure: None,
+                })
+                .await?;
         }
         if let Some(wal) = self.wal.lock().expect("observer lock").upgrade() {
             self.observed_statuses
@@ -532,6 +564,7 @@ impl MultiVenueAdapter for ScriptedAdapter {
             result,
             last_error: retryable_error.clone(),
             retryable_error,
+            failure: self.failure.filter(|_| status == VenueLegStatus::FailedPermanent),
         })
     }
 
@@ -579,6 +612,7 @@ impl MultiVenueAdapter for ScriptedAdapter {
             result: (status == VenueLegStatus::Completed).then(|| execution_for(leg)),
             last_error: leg.last_error.clone(),
             retryable_error: None,
+            failure: None,
         })
     }
 }
@@ -1660,6 +1694,33 @@ async fn permanent_failure_is_not_readvanced_or_rerouted() {
 }
 
 #[tokio::test]
+async fn a_leg_that_met_only_a_route_minimum_is_a_bad_debt_floor() {
+    let receipt = receipt();
+    let wal = TestWal::with_receipt(&receipt);
+    let icpswap = Arc::new(
+        ScriptedAdapter::new(ICPSWAP_VENUE_ID, None, vec![VenueLegStatus::FailedPermanent])
+            .with_failure(VenueLegFailure::BelowMinimum),
+    );
+    let mexc = Arc::new(ScriptedAdapter::new(MEXC_VENUE_ID, None, Vec::new()));
+    let finalizer = finalizer(vec![icpswap, mexc]);
+
+    let error = finalizer
+        .finalize(&wal, receipt)
+        .await
+        .expect_err("nothing was swapped");
+
+    // The stage accepts this for a bad-debt row and fails it otherwise.
+    assert!(
+        matches!(error, FinalizerError::BadDebtAmountFloor(_)),
+        "unexpected kind: {error:?}"
+    );
+    assert_eq!(
+        committed_state(&wal).legs[0].failure,
+        Some(VenueLegFailure::BelowMinimum)
+    );
+}
+
+#[tokio::test]
 async fn partial_recovery_still_reports_the_completed_leg_proceeds() {
     let receipt = receipt();
     let wal = TestWal::with_receipt(&receipt);
@@ -1772,6 +1833,31 @@ async fn committed_legacy_state_is_rejected_without_being_upgraded() {
     assert_eq!(adapter.calls(), 0);
     assert_eq!(mexc.calls(), 0);
     assert!(wal.wrapper().meta_v2.is_none());
+}
+
+#[tokio::test]
+async fn a_checkpoint_the_parent_refuses_fails_the_row_permanently() {
+    let receipt = receipt();
+    let wal = TestWal::with_receipt(&receipt);
+    let icpswap =
+        Arc::new(ScriptedAdapter::new(ICPSWAP_VENUE_ID, None, vec![VenueLegStatus::Running]).with_foreign_checkpoint());
+    let mexc = Arc::new(ScriptedAdapter::new(MEXC_VENUE_ID, None, Vec::new()));
+    let finalizer = finalizer(vec![icpswap, mexc]);
+
+    let error = finalizer
+        .finalize(&wal, receipt)
+        .await
+        .expect_err("a foreign checkpoint can never be applied");
+
+    // The adapter hands back only text; the decision comes from the checkpoint.
+    assert!(
+        matches!(error, FinalizerError::Permanent(_)),
+        "unexpected kind: {error:?}"
+    );
+    assert!(
+        error.message().contains("adapter returned venue `elsewhere`"),
+        "{error}"
+    );
 }
 
 #[tokio::test]
