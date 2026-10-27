@@ -149,6 +149,13 @@ where
         self
     }
 
+    /// The bridge runtime, for routes whose MEXC leg moves through a bridge.
+    pub(super) fn bridge_runtime(&self) -> Result<&BridgeRuntime, String> {
+        self.bridge
+            .as_deref()
+            .ok_or_else(|| "bridge runtime is not configured".to_string())
+    }
+
     pub fn with_bridge_runtime(mut self, bridge: impl Into<Arc<BridgeRuntime>>) -> Self {
         self.bridge = Some(bridge.into());
         self

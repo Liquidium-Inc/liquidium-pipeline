@@ -44,7 +44,7 @@ async fn bridged_preview_counts_both_bridges_and_the_mexc_withdrawal() {
                 source_fee_budget: 0.000_002,
                 destination_fee_budget: 0.000_05,
                 provider_fee_budget_native_units: Some(Nat::from(50_000_000_000_000u64)),
-                side_costs: Vec::new(),
+                ..BridgeFeeBudget::default()
             }),
             ("USDC", "ETH", "ckUSDC") => Ok(BridgeFeeBudget {
                 side_costs: vec![return_gas()],

@@ -6,21 +6,23 @@ impl<C> MexcFinalizer<C>
 where
     C: CexBackend,
 {
+    /// The bridge route from the collateral to the asset MEXC receives.
+    pub(in crate::finalizers::mexc) fn deposit_route(
+        state: &CexState,
+        planned_asset: &str,
+    ) -> Result<&'static BridgeRouteSpec, String> {
+        let source_symbol = state.deposit.deposit_asset.symbol();
+        let source_chain = state.deposit.deposit_asset.chain();
+        resolve_route(&source_symbol, &source_chain, planned_asset).ok_or_else(|| {
+            format!("bridge route not found for deposit {source_symbol}@{source_chain} -> {planned_asset}")
+        })
+    }
+
     /// A deposit through a bridge: fund the bridge account, send the provider
     /// call for a bridge handle, then poll the bridge until it completes.
     pub(super) async fn deposit_bridged(&self, state: &mut CexState, planned_asset: &str) -> Result<(), String> {
-        let bridge = self
-            .bridge
-            .as_ref()
-            .ok_or_else(|| "bridge runtime not configured for bridged deposit".to_string())?;
-        let source_symbol = state.deposit.deposit_asset.symbol();
-        let source_chain = state.deposit.deposit_asset.chain();
-        let route = resolve_route(&source_symbol, &source_chain, planned_asset).ok_or_else(|| {
-            format!(
-                "bridge route not found for deposit {}@{} -> {}",
-                source_symbol, source_chain, planned_asset
-            )
-        })?;
+        let bridge = self.bridge_runtime()?;
+        let route = Self::deposit_route(state, planned_asset)?;
 
         // Phase A: move the seized collateral into the configured bridge source.
         if state.deposit.deposit_txid.is_none() {

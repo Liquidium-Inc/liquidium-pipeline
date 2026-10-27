@@ -34,9 +34,9 @@ where
         let mut route_reference_price = 1.0;
         for leg in legs {
             // The fee comes from the same source the fills are accounted with.
-            let (gross_amount_out, _side_vwap, side_impact_bps, taker_fee_bps) =
-                self.preview_leg(&leg.market, &leg.side, amount_in).await?;
-            let amount_out = gross_amount_out * (1.0 - taker_fee_bps / BPS_PER_RATIO_UNIT);
+            let preview = self.preview_leg(&leg.market, &leg.side, amount_in).await?;
+            let (gross_amount_out, side_impact_bps) = (preview.gross_out, preview.impact_bps);
+            let amount_out = gross_amount_out * (1.0 - preview.taker_fee_bps / BPS_PER_RATIO_UNIT);
             let impact_ratio = side_impact_bps / BPS_PER_RATIO_UNIT;
             let gross_execution_price = gross_amount_out / amount_in;
             let reference_price = if leg.side.eq_ignore_ascii_case("buy") {

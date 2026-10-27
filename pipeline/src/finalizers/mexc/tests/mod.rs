@@ -204,6 +204,12 @@ fn native_icp_token() -> ChainToken {
     }
 }
 
+/// MEXC withdrawals with no fee and no minimum.
+fn free_withdrawals(cex: &mut MockCexBackend) {
+    cex.expect_get_withdraw_terms()
+        .returning(|_, _| Ok(WithdrawTerms { fee: 0.0, minimum: 0.0 }));
+}
+
 fn liquid_orderbook() -> OrderBook {
     OrderBook {
         bids: vec![OrderBookLevel {

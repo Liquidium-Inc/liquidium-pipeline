@@ -48,7 +48,7 @@ async fn mexc_deposit_bridge_reserves_reverse_bridge_approval_fee_in_trade_amoun
                 source_fee_budget: 0.01,
                 destination_fee_budget: 0.0,
                 provider_fee_budget_native_units: None,
-                side_costs: Vec::new(),
+                ..BridgeFeeBudget::default()
             })
         });
     bridge
@@ -118,7 +118,7 @@ async fn mexc_deposit_bridge_rejects_source_fee_reserve_too_small_with_permanent
                 source_fee_budget: 2.0,
                 destination_fee_budget: 0.0,
                 provider_fee_budget_native_units: None,
-                side_costs: Vec::new(),
+                ..BridgeFeeBudget::default()
             })
         });
     bridge.expect_get_minimum_bridge_amount().times(0);
@@ -190,7 +190,7 @@ async fn mexc_deposit_bridge_reserves_native_cketh_withdrawal_fee_budget() {
                 source_fee_budget: 0.000_002,
                 destination_fee_budget: 0.000_049_900_885_02,
                 provider_fee_budget_native_units: Some(Nat::from(49_900_885_020_000u64)),
-                side_costs: Vec::new(),
+                ..BridgeFeeBudget::default()
             })
         });
     bridge
@@ -278,7 +278,7 @@ async fn mexc_deposit_bridge_rejects_native_cketh_below_minimum_before_transfer(
                 source_fee_budget: 0.000_051_900_885_02,
                 destination_fee_budget: 0.0,
                 provider_fee_budget_native_units: Some(Nat::from(49_900_885_020_000u64)),
-                side_costs: Vec::new(),
+                ..BridgeFeeBudget::default()
             })
         });
     bridge
@@ -340,7 +340,7 @@ async fn mexc_deposit_bridge_rejects_native_cketh_when_destination_fee_consumes_
                 source_fee_budget: 0.000_051_900_885_02,
                 destination_fee_budget: 0.006,
                 provider_fee_budget_native_units: Some(Nat::from(49_900_885_020_000u64)),
-                side_costs: Vec::new(),
+                ..BridgeFeeBudget::default()
             })
         });
     bridge
@@ -423,7 +423,7 @@ async fn mexc_deposit_bridge_waits_for_source_funding_snapshot() {
                 source_fee_budget: 0.01,
                 destination_fee_budget: 0.0,
                 provider_fee_budget_native_units: None,
-                side_costs: Vec::new(),
+                ..BridgeFeeBudget::default()
             })
         });
     bridge
@@ -505,7 +505,7 @@ async fn mexc_deposit_bridge_waits_for_cketh_fee_funding_snapshot() {
                 source_fee_budget: 0.01,
                 destination_fee_budget: 0.0,
                 provider_fee_budget_native_units: Some(Nat::from(138_541_176_852_000u64)),
-                side_costs: Vec::new(),
+                ..BridgeFeeBudget::default()
             })
         });
     bridge

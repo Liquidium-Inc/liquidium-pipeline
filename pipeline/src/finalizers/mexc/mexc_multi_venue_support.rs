@@ -1,8 +1,5 @@
 use candid::Nat;
-use liquidium_pipeline_connectors::backend::{
-    bridge_backend::{BridgeRouteKind, resolve_route},
-    cex_backend::CexBackend,
-};
+use liquidium_pipeline_connectors::backend::{bridge_backend::BridgeRouteKind, cex_backend::CexBackend};
 use liquidium_pipeline_core::tokens::{chain_token::ChainToken, chain_token_amount::ChainTokenAmount};
 use liquidium_pipeline_core::types::side_cost::SideCost;
 
@@ -337,16 +334,8 @@ where
                 Self::compute_fee_adjusted_deposit_transfer(&state.deposit.deposit_asset, &state.size_in, false)?;
             return Ok(executable_pay.to_f64());
         }
-        let bridge = self
-            .bridge
-            .as_ref()
-            .ok_or_else(|| "bridge runtime not configured for bridged deposit".to_string())?;
-        let source_symbol = state.deposit.deposit_asset.symbol();
-        let source_chain = state.deposit.deposit_asset.chain();
-        let planned_asset = <Self as BridgePlanner>::planned_deposit_asset(state);
-        let route = resolve_route(&source_symbol, &source_chain, &planned_asset).ok_or_else(|| {
-            format!("bridge route not found for deposit {source_symbol}@{source_chain} -> {planned_asset}")
-        })?;
+        let bridge = self.bridge_runtime()?;
+        let route = Self::deposit_route(state, &<Self as BridgePlanner>::planned_deposit_asset(state))?;
         let arrival =
             Self::bridged_deposit_arrival(bridge, route, &state.deposit.deposit_asset, &state.size_in).await?;
         side_costs.extend(arrival.sizing.fee_budget.side_costs);
@@ -376,29 +365,24 @@ where
         }
         let mut net = Self::net_of_withdraw_fee(trade_out, terms.fee)?;
 
-        let withdraw_route = resolve_route(
-            &planned_asset,
-            &planned_network,
-            &state.withdraw.withdraw_asset.symbol(),
-        );
-        let (true, Some(route)) = (state.withdraw.bridge.withdraw_bridge_required, withdraw_route) else {
+        let (true, Some(route)) = (
+            state.withdraw.bridge.withdraw_bridge_required,
+            Self::withdraw_route(state),
+        ) else {
             return Ok(net);
         };
-        let bridge = self
-            .bridge
-            .as_ref()
-            .ok_or_else(|| "return bridge runtime is missing".to_string())?;
+        let bridge = self.bridge_runtime()?;
         let budget = bridge
             .backend
             .get_fee_budget(route.source_asset, route.source_chain, route.target_asset)
             .await?;
-        side_costs.extend(budget.side_costs);
         if route.route_kind == BridgeRouteKind::SolanaToIcp {
             let gross = ChainTokenAmount::from_formatted(state.withdraw.withdraw_asset.clone(), net);
-            net = Self::solana_repayment_bridge_amount(bridge, route, &gross)
+            net = Self::solana_repayment_bridge_amount(bridge, route, &gross, budget.source_fee_budget)
                 .await?
                 .to_f64();
         }
+        side_costs.extend(budget.side_costs);
         Ok(net)
     }
 }

@@ -41,6 +41,29 @@ pub struct VenueRoutePreview {
     pub priced_side_costs: Option<Vec<PricedSideCost>>,
 }
 
+impl VenueRoutePreview {
+    /// A preview with no fixed fees to separate and no side costs. A venue
+    /// that has either sets those fields after.
+    pub fn new(
+        venue_id: impl Into<String>,
+        request: SwapRequest,
+        quote: SwapQuote,
+        conservative_receive: ChainTokenAmount,
+        initial_execution_state: VenueExecutionState,
+    ) -> Self {
+        Self {
+            venue_id: venue_id.into(),
+            request,
+            quote,
+            conservative_receive,
+            initial_execution_state,
+            market_receive: None,
+            side_costs: Vec::new(),
+            priced_side_costs: None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct VenueLegProgress {
     pub execution: VenueExecutionState,

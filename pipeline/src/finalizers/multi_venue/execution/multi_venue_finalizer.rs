@@ -6,7 +6,6 @@ use crate::{
         IcpswapFirstPlanInput, IcpswapFirstPlanner, IcpswapFirstPlannerConfig, IcpswapFirstPlannerError,
         MultiVenueAdapter, VenueLegProgress,
     },
-    liquidation::liquidation_math::oracle_implied_output,
     persistance::{
         FINALIZER_META_V2_VERSION, FinalizerDecisionSnapshot, FinalizerMetaPayload, FinalizerMetaV2, LiqMetaWrapper,
         MultiVenueAllocationSnapshot, MultiVenueExecutionOutcome, MultiVenueExecutionState, RecoverySweepState,
@@ -637,7 +636,7 @@ fn recovery_result(state: &RecoverySweepState) -> FinalizerResult {
 /// used. A cost the plan did not price cannot be converted; it is logged and
 /// stays visible in the execution's `side_costs`.
 fn leg_side_cost_receive(leg: &VenueLegState, costs: &[SideCost]) -> Nat {
-    let receive_decimals = u64::from(leg.quote.conservative_receive.token.decimals());
+    let receive_decimals = leg.quote.conservative_receive.token.decimals();
     let mut total = Nat::from(0u8);
     for cost in costs {
         let Some(priced) = leg
@@ -652,13 +651,7 @@ fn leg_side_cost_receive(leg: &VenueLegState, costs: &[SideCost]) -> Nat {
             );
             continue;
         };
-        match oracle_implied_output(
-            &cost.amount,
-            &priced.cost_price_ray,
-            &priced.receive_price_ray,
-            u64::from(cost.decimals),
-            receive_decimals,
-        ) {
+        match priced.value_of(cost, receive_decimals) {
             Ok(value) => total += value,
             Err(error) => warn!(
                 "[multi-venue] leg `{}` side cost `{}` could not be converted: {error}",

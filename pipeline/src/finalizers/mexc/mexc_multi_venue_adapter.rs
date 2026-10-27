@@ -75,14 +75,15 @@ where
         };
 
         Ok(VenueRoutePreview {
-            venue_id: VENUE_ID.to_string(),
-            request: request.clone(),
-            quote: preview.quote,
-            conservative_receive: preview.conservative_receive,
-            initial_execution_state: VenueExecutionState::new(VENUE_ID, &execution)?,
             market_receive: Some(preview.market_receive),
             side_costs: preview.side_costs,
-            priced_side_costs: None,
+            ..VenueRoutePreview::new(
+                VENUE_ID,
+                request.clone(),
+                preview.quote,
+                preview.conservative_receive,
+                VenueExecutionState::new(VENUE_ID, &execution)?,
+            )
         })
     }
 
@@ -356,10 +357,7 @@ where
         ) {
             return Ok(());
         }
-        let bridge = self
-            .bridge
-            .as_ref()
-            .ok_or_else(|| VenueAmountError::Unavailable("bridge runtime is missing".to_string()))?;
+        let bridge = self.bridge_runtime().map_err(VenueAmountError::Unavailable)?;
         let sizing = Self::size_bridged_deposit(bridge, route, &state.deposit.deposit_asset, &state.size_in)
             .await
             .map_err(VenueAmountError::Unavailable)?;

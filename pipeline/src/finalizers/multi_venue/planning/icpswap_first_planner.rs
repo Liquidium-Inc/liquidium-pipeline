@@ -361,14 +361,18 @@ fn side_cost_total(preview: &VenueRoutePreview) -> Nat {
         })
 }
 
-/// A quote's conservative output after its side costs. Venues compare on this.
-fn net_conservative(preview: &VenueRoutePreview) -> Nat {
-    let side_costs = side_cost_total(preview);
-    if preview.conservative_receive.value > side_costs {
-        preview.conservative_receive.value.clone() - side_costs
+/// An output after side costs, never below zero.
+fn after_side_costs(output: &Nat, side_costs: &Nat) -> Nat {
+    if output > side_costs {
+        output.clone() - side_costs.clone()
     } else {
         Nat::from(0u8)
     }
+}
+
+/// A quote's conservative output after its side costs. Venues compare on this.
+fn net_conservative(preview: &VenueRoutePreview) -> Nat {
+    after_side_costs(&preview.conservative_receive.value, &side_cost_total(preview))
 }
 
 /// Startup notice that a configured test allocation has switched the oracle
@@ -1063,22 +1067,15 @@ impl IcpswapFirstPlanner {
                 .receive_reference_price_ray
                 .clone()
                 .ok_or_else(|| "no receive-token price to value them".to_string())?;
-            let receive_decimals = u64::from(preview.conservative_receive.token.decimals());
+            let receive_decimals = preview.conservative_receive.token.decimals();
             for cost in &preview.side_costs {
                 let cost_price = self.side_cost_price(input, &cost.symbol).await?;
-                let receive_equivalent = oracle_implied_output(
-                    &cost.amount,
-                    &cost_price,
-                    &receive_price,
-                    u64::from(cost.decimals),
+                priced.push(PricedSideCost::new(
+                    cost.clone(),
+                    cost_price,
+                    receive_price.clone(),
                     receive_decimals,
-                )?;
-                priced.push(PricedSideCost {
-                    cost: cost.clone(),
-                    cost_price_ray: cost_price,
-                    receive_price_ray: receive_price.clone(),
-                    receive_equivalent,
-                });
+                )?);
             }
         }
         preview.priced_side_costs = Some(priced);
@@ -1348,11 +1345,7 @@ impl IcpswapFirstPlanner {
         // Costs paid from other balances still come out of the liquidation's result.
         let net_receive = ChainTokenAmount::from_raw(
             conservative_receive.token.clone(),
-            if conservative_receive.value > side_cost {
-                conservative_receive.value.clone() - side_cost.clone()
-            } else {
-                Nat::from(0u8)
-            },
+            after_side_costs(&conservative_receive.value, &side_cost),
         );
         let combined_net_edge_bps = edge_bps(&net_receive, &input.debt_repaid)?;
 

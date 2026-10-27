@@ -96,20 +96,19 @@ where
         Ok(ChainTokenAmount::from_raw(token.clone(), amount.clone() - reserve))
     }
 
+    /// The SOL a return sends after the wallet keeps `source_fee_budget` for
+    /// the send fee. The caller passes the budget it already read.
     pub(in crate::finalizers::mexc) async fn solana_repayment_bridge_amount(
         bridge: &BridgeRuntime,
         route: &BridgeRouteSpec,
         gross: &ChainTokenAmount,
+        source_fee_budget: f64,
     ) -> Result<ChainTokenAmount, String> {
-        let fee_budget = bridge
-            .backend
-            .get_source_fee_budget(route.source_asset, route.source_chain, route.target_asset)
-            .await?;
         // SOL and ckSOL have the same base units; keep the repayment token metadata.
         let net = Self::amount_after_fee_reserve(
             &gross.token,
             &gross.value,
-            fee_budget,
+            source_fee_budget,
             "repayment bridge source fee budget",
         )?;
         Self::ensure_minimum_bridge_amount(bridge, route, &net).await?;

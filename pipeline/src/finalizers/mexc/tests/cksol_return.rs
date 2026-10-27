@@ -4,8 +4,7 @@ use super::*;
 #[tokio::test]
 async fn mexc_cksol_repayment_preview_uses_icp_usdt_sol_route() {
     let mut cex = MockCexBackend::new();
-    cex.expect_get_withdraw_terms()
-        .returning(|_, _| Ok(WithdrawTerms { fee: 0.0, minimum: 0.0 }));
+    free_withdrawals(&mut cex);
     cex.expect_get_orderbook().returning(|market, _| {
         assert!(!market.contains("CKSOL"), "ckSOL must translate to native SOL");
         assert!(!market.contains("SOL_USDC"), "SOL must trade through USDT");
@@ -27,10 +26,6 @@ async fn mexc_cksol_repayment_preview_uses_icp_usdt_sol_route() {
         })
     });
     let mut bridge = MockBridgeBackend::new();
-    bridge.expect_get_source_fee_budget().returning(|asset, chain, target| {
-        assert_eq!((asset, chain, target), ("SOL", "SOL", "ckSOL"));
-        Ok(0.002)
-    });
     bridge.expect_get_minimum_bridge_amount().returning(|_, _, _| Ok(0.02));
     bridge.expect_get_fee_budget().returning(|asset, chain, target| {
         assert_eq!((asset, chain, target), ("SOL", "SOL", "ckSOL"));
@@ -86,8 +81,7 @@ fn deposit_call_cycles() -> SideCost {
 async fn mexc_cksol_repayment_waits_for_funding_reserves_fees_and_records_mint() {
     let recipient = repayment_account();
     let mut cex = MockCexBackend::new();
-    cex.expect_get_withdraw_terms()
-        .returning(|_, _| Ok(WithdrawTerms { fee: 0.0, minimum: 0.0 }));
+    free_withdrawals(&mut cex);
     cex.expect_withdraw()
         .times(1)
         .returning(|asset, network, address, amount, _withdraw_order_id| {
@@ -216,8 +210,7 @@ async fn mexc_cksol_return_waits_while_another_row_has_an_open_sol_deposit() {
         network: "SOL".into(),
     };
     let mut cex = MockCexBackend::new();
-    cex.expect_get_withdraw_terms()
-        .returning(|_, _| Ok(WithdrawTerms { fee: 0.0, minimum: 0.0 }));
+    free_withdrawals(&mut cex);
     // The wait reads nothing from MEXC.
     cex.expect_get_withdraw_status_snapshot_by_id().times(1).returning(|_, _| {
         Ok(WithdrawStatusSnapshot {
@@ -474,7 +467,6 @@ fn a_restart_resumes_a_deposit_send_and_only_settles_an_unsafe_one() {
 #[tokio::test]
 async fn mexc_cksol_repayment_rejects_underfunded_bridge_before_submission() {
     let mut bridge = MockBridgeBackend::new();
-    bridge.expect_get_source_fee_budget().returning(|_, _, _| Ok(0.002));
     bridge.expect_get_minimum_bridge_amount().returning(|_, _, _| Ok(0.02));
     bridge.expect_submit_bridge().times(0);
     let deps = bridge_dependencies(Arc::new(bridge));
@@ -482,7 +474,7 @@ async fn mexc_cksol_repayment_rejects_underfunded_bridge_before_submission() {
     for gross in [0.001, 0.021, f64::NAN, f64::INFINITY] {
         let amount = ChainTokenAmount::from_formatted(cksol_token(), gross);
         assert!(
-            MexcFinalizer::<MockCexBackend>::solana_repayment_bridge_amount(&deps, route, &amount)
+            MexcFinalizer::<MockCexBackend>::solana_repayment_bridge_amount(&deps, route, &amount, 0.002)
                 .await
                 .is_err()
         );
@@ -526,8 +518,7 @@ async fn mexc_cksol_repayment_rejects_mint_receipt_for_wrong_account_or_token() 
 #[tokio::test]
 async fn mexc_sol_routes_always_use_usdt_even_with_a_direct_usdc_book() {
     let mut cex = MockCexBackend::new();
-    cex.expect_get_withdraw_terms()
-        .returning(|_, _| Ok(WithdrawTerms { fee: 0.0, minimum: 0.0 }));
+    free_withdrawals(&mut cex);
     cex.expect_get_orderbook().returning(|market, _| {
         assert_ne!(market, "SOL_USDC");
         assert_ne!(market, "USDC_SOL");
@@ -558,8 +549,7 @@ async fn mexc_sol_routes_always_use_usdt_even_with_a_direct_usdc_book() {
 #[tokio::test]
 async fn mexc_sol_usdc_is_not_used_as_an_intermediate_hop() {
     let mut cex = MockCexBackend::new();
-    cex.expect_get_withdraw_terms()
-        .returning(|_, _| Ok(WithdrawTerms { fee: 0.0, minimum: 0.0 }));
+    free_withdrawals(&mut cex);
     cex.expect_get_orderbook().returning(|market, _| {
         assert!(matches!(market, "ICP_USDC" | "USDC_ICP"));
         Err("unlisted market".into())

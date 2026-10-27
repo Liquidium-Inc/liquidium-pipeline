@@ -306,10 +306,10 @@ fn preview(
         decimals: 6,
         fee: Nat::from(10_000u64),
     };
-    VenueRoutePreview {
-        venue_id: venue_id.to_string(),
-        request: request.clone(),
-        quote: SwapQuote {
+    VenueRoutePreview::new(
+        venue_id.to_string(),
+        request.clone(),
+        SwapQuote {
             pay_asset: request.pay_asset.clone(),
             pay_amount: request.pay_amount.value.clone(),
             receive_asset: request.receive_asset.clone(),
@@ -331,15 +331,12 @@ fn preview(
                 gas_fee: Nat::from(0u8),
             }],
         },
-        conservative_receive: ChainTokenAmount::from_raw(receive_token, Nat::from(conservative_receive_amount)),
-        initial_execution_state: VenueExecutionState {
+        ChainTokenAmount::from_raw(receive_token, Nat::from(conservative_receive_amount)),
+        VenueExecutionState {
             venue: venue_id.to_string(),
             state: serde_json::json!({ "step": "planned" }),
         },
-        market_receive: None,
-        side_costs: Vec::new(),
-        priced_side_costs: None,
-    }
+    )
 }
 
 fn proportional_preview(

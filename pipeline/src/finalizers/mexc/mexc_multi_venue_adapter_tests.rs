@@ -67,6 +67,12 @@ fn request(raw_pay: u64) -> SwapRequest {
     }
 }
 
+/// MEXC withdrawals with no fee and no minimum.
+fn free_withdrawals(cex: &mut MockCexBackend) {
+    cex.expect_get_withdraw_terms()
+        .returning(|_, _| Ok(WithdrawTerms { fee: 0.0, minimum: 0.0 }));
+}
+
 fn finalizer() -> MexcFinalizer<MockCexBackend> {
     finalizer_with_withdraw_terms(WithdrawTerms { fee: 0.0, minimum: 0.0 })
 }
@@ -113,9 +119,7 @@ fn finalizer_without_registry() -> MexcFinalizer<MockCexBackend> {
 
 fn finalizer_with_permanent_deposit_error() -> MexcFinalizer<MockCexBackend> {
     let mut backend = MockCexBackend::new();
-    backend
-        .expect_get_withdraw_terms()
-        .returning(|_, _| Ok(WithdrawTerms { fee: 0.0, minimum: 0.0 }));
+    free_withdrawals(&mut backend);
     backend.expect_get_orderbook().returning(|market, _| match market {
         "PAY_RECV" => Ok(OrderBook {
             bids: vec![OrderBookLevel {
@@ -148,9 +152,7 @@ fn finalizer_with_permanent_deposit_error() -> MexcFinalizer<MockCexBackend> {
 
 fn finalizer_with_retryable_deposit_error() -> MexcFinalizer<MockCexBackend> {
     let mut backend = MockCexBackend::new();
-    backend
-        .expect_get_withdraw_terms()
-        .returning(|_, _| Ok(WithdrawTerms { fee: 0.0, minimum: 0.0 }));
+    free_withdrawals(&mut backend);
     backend.expect_get_orderbook().returning(|_, _| {
         Ok(OrderBook {
             bids: vec![OrderBookLevel {
@@ -642,7 +644,7 @@ async fn restart_resumes_a_bridged_deposit_once_its_funding_transfer_is_durable(
                         source_fee_budget: 0.0,
                         destination_fee_budget: 0.0,
                         provider_fee_budget_native_units: None,
-                        side_costs: Vec::new(),
+                        ..liquidium_pipeline_connectors::backend::bridge_backend::BridgeFeeBudget::default()
                     },
                 )
             });
@@ -1055,9 +1057,7 @@ fn finalizer_with_trade_result(
     balance_calls: usize,
 ) -> MexcFinalizer<MockCexBackend> {
     let mut backend = MockCexBackend::new();
-    backend
-        .expect_get_withdraw_terms()
-        .returning(|_, _| Ok(WithdrawTerms { fee: 0.0, minimum: 0.0 }));
+    free_withdrawals(&mut backend);
     backend.expect_get_orderbook().returning(|_, _| {
         Ok(OrderBook {
             bids: vec![OrderBookLevel {
@@ -1310,7 +1310,7 @@ mod bridged_deposit_restart {
                 source_fee_budget: 0.0,
                 destination_fee_budget: 0.0,
                 provider_fee_budget_native_units: None,
-                side_costs: Vec::new(),
+                ..BridgeFeeBudget::default()
             })
         });
     }

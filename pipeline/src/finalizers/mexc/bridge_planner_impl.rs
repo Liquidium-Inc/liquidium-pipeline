@@ -10,10 +10,6 @@ where
     }
 
     fn resolve_bridge_source_address(&self, source_chain: &str) -> Result<String, String> {
-        self.bridge
-            .as_ref()
-            .ok_or_else(|| "bridge dependencies are not configured".to_string())?
-            .sources
-            .for_chain(source_chain)
+        self.bridge_runtime()?.sources.for_chain(source_chain)
     }
 }

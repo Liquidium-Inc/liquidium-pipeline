@@ -474,10 +474,10 @@ impl MultiVenueAdapter for ScriptedAdapter {
             _ => 50.0,
         };
         let receive = Nat::from(pay * 2);
-        Ok(VenueRoutePreview {
-            venue_id: self.venue_id.to_string(),
-            request: request.clone(),
-            quote: SwapQuote {
+        Ok(VenueRoutePreview::new(
+            self.venue_id.to_string(),
+            request.clone(),
+            SwapQuote {
                 pay_asset: request.pay_asset.clone(),
                 pay_amount: request.pay_amount.value.clone(),
                 receive_asset: request.receive_asset.clone(),
@@ -487,15 +487,12 @@ impl MultiVenueAdapter for ScriptedAdapter {
                 estimated_price_impact_bps: impact,
                 legs: Vec::new(),
             },
-            conservative_receive: ChainTokenAmount::from_raw(debt_token(), receive),
-            initial_execution_state: VenueExecutionState {
+            ChainTokenAmount::from_raw(debt_token(), receive),
+            VenueExecutionState {
                 venue: self.venue_id.to_string(),
                 state: serde_json::json!({ "step": "planned" }),
             },
-            market_receive: None,
-            side_costs: Vec::new(),
-            priced_side_costs: None,
-        })
+        ))
     }
 
     async fn advance(

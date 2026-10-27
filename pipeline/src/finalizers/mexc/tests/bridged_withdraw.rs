@@ -191,7 +191,7 @@ async fn mexc_deposit_bridge_deferral_keeps_step_pending_then_submits() {
             source_fee_budget: 0.0,
             destination_fee_budget: 0.0,
             provider_fee_budget_native_units: None,
-            side_costs: Vec::new(),
+            ..BridgeFeeBudget::default()
         })
     });
     bridge.expect_get_minimum_bridge_amount().returning(|_, _, _| Ok(0.0));
