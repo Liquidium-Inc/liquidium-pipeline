@@ -221,7 +221,9 @@ impl SolanaBackendImpl {
         loop {
             match outcome {
                 SendOutcome::Landed { receipt } => return Ok(receipt),
-                SendOutcome::NeverLanded { reason } | SendOutcome::BelowMinimum { reason } => return Err(reason),
+                SendOutcome::NeverLanded { reason }
+                | SendOutcome::BelowMinimum { reason }
+                | SendOutcome::Deferred { reason } => return Err(reason),
                 SendOutcome::Open { reason } if Instant::now() >= deadline => {
                     return Err(side_effect_ambiguous(format!(
                         "solana transaction {} has no decided answer: {reason}",

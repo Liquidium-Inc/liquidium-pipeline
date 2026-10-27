@@ -3,8 +3,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 
 use super::{
-    BridgeBackend, BridgeDestination, BridgeFeeBudget, BridgeRequest, BridgeSend, BridgeStatus, BridgeSubmission,
-    BridgeSubmissionCandidate, DepositNotice,
+    BridgeBackend, BridgeDestination, BridgeError, BridgeFeeBudget, BridgeRequest, BridgeSend, BridgeStatus,
+    BridgeSubmission, BridgeSubmissionCandidate, DepositNotice,
 };
 
 /// Keeps provider-specific submission handles with the backend that issued them.
@@ -70,11 +70,11 @@ impl BridgeBackend for RoutedBridgeBackend {
         self.source(asset, chain).get_minimum_bridge_amount(asset, chain, target).await
     }
 
-    async fn submit_bridge(&self, request: BridgeRequest) -> Result<BridgeSubmission, String> {
+    async fn submit_bridge(&self, request: BridgeRequest) -> Result<BridgeSubmission, BridgeError> {
         self.source(&request.asset, &request.source_chain).submit_bridge(request).await
     }
 
-    async fn prepare_bridge_send(&self, request: &BridgeRequest) -> Result<BridgeSend, String> {
+    async fn prepare_bridge_send(&self, request: &BridgeRequest) -> Result<BridgeSend, BridgeError> {
         self.source(&request.asset, &request.source_chain)
             .prepare_bridge_send(request)
             .await

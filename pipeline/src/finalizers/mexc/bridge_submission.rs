@@ -3,9 +3,7 @@
 //! before it runs, and settles a lost answer from the provider history.
 use candid::Nat;
 use liquidium_pipeline_connectors::backend::amount_utils::nat_units_to_amount_via_core;
-use liquidium_pipeline_connectors::backend::bridge_backend::{
-    BRIDGE_SUBMISSION_DEFERRED_PREFIX, BridgeFeeBudget, BridgeRouteKind, BridgeRouteSpec,
-};
+use liquidium_pipeline_connectors::backend::bridge_backend::{BridgeFeeBudget, BridgeRouteKind, BridgeRouteSpec};
 use liquidium_pipeline_connectors::backend::cex_backend::{CexBackend, CexBackendError};
 use liquidium_pipeline_core::outbound::side_effect_ambiguous;
 use log::{debug, info};
@@ -157,7 +155,7 @@ where
             Ok(None) => Ok(()),
             // A busy bridge wallet is a wait. The next cycle measures the
             // funds again and saves a new call.
-            Err(OutboundError::Retry(error)) if error.starts_with(BRIDGE_SUBMISSION_DEFERRED_PREFIX) => {
+            Err(OutboundError::Deferred(error)) => {
                 info!("[mexc] liq_id={} bridged deposit deferred: {}", state.liq_id, error);
                 Ok(())
             }

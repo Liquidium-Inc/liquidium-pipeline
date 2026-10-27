@@ -1,4 +1,6 @@
 use async_trait::async_trait;
+
+use super::bridge_backend::BridgeError;
 use std::{error::Error, fmt};
 
 const CEX_PENDING_SETTLEMENT_PREFIX: &str = "cex pending settlement: ";
@@ -44,6 +46,16 @@ impl From<CexBackendError> for String {
 impl From<&str> for CexBackendError {
     fn from(message: &str) -> Self {
         Self::Other(message.to_string())
+    }
+}
+
+/// A bridge refusal inside a CEX leg step keeps its below-minimum kind.
+impl From<BridgeError> for CexBackendError {
+    fn from(error: BridgeError) -> Self {
+        match error {
+            BridgeError::BelowMinimum(message) => Self::BelowMinimum(message),
+            other => Self::Other(other.to_string()),
+        }
     }
 }
 

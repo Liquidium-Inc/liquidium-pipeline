@@ -6,8 +6,7 @@ use std::sync::Arc;
 use candid::{Nat, Principal};
 use ic_ledger_types::{AccountIdentifier, Subaccount};
 use liquidium_pipeline_connectors::backend::bridge_backend::{
-    BRIDGE_SUBMISSION_DEFERRED_PREFIX, BridgeDestination, BridgeFeeBudget, BridgeStatus, BridgeSubmission,
-    MockBridgeBackend,
+    BridgeDestination, BridgeError, BridgeFeeBudget, BridgeStatus, BridgeSubmission, MockBridgeBackend,
 };
 use liquidium_pipeline_connectors::backend::cex_backend::{
     BuyOrderInputMode, CexBackendError, DepositAddress, MockCexBackend, OrderBook, OrderBookLevel, SwapFillReport,

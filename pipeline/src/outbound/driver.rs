@@ -131,6 +131,7 @@ async fn advance_saved(saved: &mut OutboundRecord, sender: &dyn OutboundSender, 
         SendOutcome::Landed { receipt } => Drive::Done { receipt },
         SendOutcome::NeverLanded { reason } => Drive::Failed(OutboundError::Retry(reason)),
         SendOutcome::BelowMinimum { reason } => Drive::Failed(OutboundError::BelowMinimum(reason)),
+        SendOutcome::Deferred { reason } => Drive::Failed(OutboundError::Deferred(reason)),
         SendOutcome::Open { reason } => {
             let window = sender.open_window_secs(&saved.prepared);
             if now.saturating_sub(submitted_at) > window {
@@ -160,6 +161,10 @@ pub enum OutboundError {
     /// The receiver refuses the amount as too small, so a new send of it fails too.
     #[error("{0}")]
     BelowMinimum(String),
+    /// The sender was not ready and the send did not happen. The caller waits,
+    /// and the next cycle prepares a new send.
+    #[error("{0}")]
+    Deferred(String),
 }
 
 impl From<OutboundError> for String {
@@ -302,21 +307,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_too_small_send_clears_its_record_and_says_so() {
-        let reason = "under the receiver minimum".to_string();
-        let too_small = SendOutcome::BelowMinimum { reason: reason.clone() };
-        let sender = sender(too_small, vec![]);
-        let mut record = None;
+    async fn a_refused_send_clears_its_record_and_keeps_its_kind() {
+        let reason = "refused".to_string();
+        let cases = [
+            (
+                SendOutcome::BelowMinimum { reason: reason.clone() },
+                OutboundError::BelowMinimum(reason.clone()),
+            ),
+            (
+                SendOutcome::Deferred { reason: reason.clone() },
+                OutboundError::Deferred(reason.clone()),
+            ),
+        ];
+        for (refusal, expected) in cases {
+            let sender = sender(refusal, vec![]);
+            let mut record = None;
 
-        assert_eq!(
-            step_outbound(&mut record, &sender, Some(&intent()), 100).await,
-            Ok(None)
-        );
-        assert_eq!(
-            step_outbound(&mut record, &sender, None, 100).await,
-            Err(OutboundError::BelowMinimum(reason))
-        );
-        assert!(record.is_none());
+            assert_eq!(
+                step_outbound(&mut record, &sender, Some(&intent()), 100).await,
+                Ok(None)
+            );
+            assert_eq!(step_outbound(&mut record, &sender, None, 100).await, Err(expected));
+            assert!(record.is_none());
+        }
     }
 
     #[tokio::test]
