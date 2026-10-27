@@ -608,8 +608,9 @@ async fn mexc_preview_route_keeps_legacy_special_override_even_with_direct_pair_
         test_finalizer(Arc::new(backend), Arc::new(transfers)).with_route_config(vec!["CKBTC_CKUSDT".to_string()], 2);
 
     let receipt = make_execution_receipt(1005);
-    let preview = finalizer.preview_route(&receipt).await.expect("preview should succeed");
-    assert!(preview.is_executable);
+    preview_receipt_route(&finalizer, &receipt)
+        .await
+        .expect("preview should succeed");
 
     let markets = observed_markets.lock().unwrap();
     assert_eq!(markets.get("CKBTC_CKUSDT").copied().unwrap_or(0), 0);
@@ -832,8 +833,9 @@ async fn mexc_preview_route_resolves_direct_buy_leg_when_sell_book_empty() {
         fee: Nat::from(1_000u64),
     };
 
-    let preview = finalizer.preview_route(&receipt).await.expect("preview should succeed");
-    assert!(preview.is_executable);
-    assert!(preview.estimated_receive_amount > 0.0);
-    assert!(preview.estimated_price_impact_bps >= 0.0);
+    let preview = preview_receipt_route(&finalizer, &receipt)
+        .await
+        .expect("preview should succeed");
+    assert!(preview.receive_amount > 0.0);
+    assert!(preview.price_impact_bps >= 0.0);
 }

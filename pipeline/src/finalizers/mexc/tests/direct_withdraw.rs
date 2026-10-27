@@ -425,7 +425,7 @@ async fn mexc_finish_builds_synthetic_swap_execution_from_state() {
     ));
     state.trade.trade_weighted_slippage_bps = Some(42.5);
 
-    let swap = finalizer.finish(&receipt, &state).await.expect("finish should succeed");
+    let swap = finalizer.finish_state(&state).expect("finish should succeed");
 
     // Pay leg comes from seized collateral (size_in).
     assert_eq!(swap.pay_asset, state.deposit.deposit_asset.asset_id());

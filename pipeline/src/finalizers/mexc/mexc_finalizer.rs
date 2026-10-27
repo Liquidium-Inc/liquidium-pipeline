@@ -45,14 +45,10 @@ const SOL_FINALITY_SECS: i64 = 20;
 use crate::{
     bridge::runtime::BridgeRuntime,
     finalizers::bridge_planner::BridgePlanner,
-    finalizers::cex_finalizer::{CexFinalizerLogic, CexRoutePreview, CexState, CexStep},
+    finalizers::cex_finalizer::{CexFinalizerLogic, CexState, CexStep},
     outbound::driver::{OutboundError, OutboundRecord, step_outbound},
     stages::bridge_submit_lock::acquire_bridge_submit_lock,
-    stages::executor::ExecutionReceipt,
-    swappers::{
-        mexc::orderbook_quote::{simulate_buy_from_asks, simulate_sell_from_bids},
-        model::SwapExecution,
-    },
+    swappers::mexc::orderbook_quote::{simulate_buy_from_asks, simulate_sell_from_bids},
     utils::{ICP_LEDGER_PRINCIPAL, now_ts},
 };
 
@@ -262,16 +258,14 @@ mod withdraw_direct;
 pub(super) use sizing::{BridgeDepositSizing, BridgedDepositArrival};
 pub use withdraw_direct::mexc_withdraw_order_id;
 
-#[async_trait]
-impl<B> CexFinalizerLogic for MexcFinalizer<B>
-where
-    B: CexBackend,
-{
-    fn venue_id(&self) -> &'static str {
-        "mexc"
-    }
-
-    async fn prepare(&self, liq_id: &str, receipt: &ExecutionReceipt) -> Result<CexState, String> {
+/// Builds a leg's state from a liquidation receipt, as tests set legs up.
+#[cfg(test)]
+impl<B: CexBackend> MexcFinalizer<B> {
+    pub(crate) async fn prepare(
+        &self,
+        liq_id: &str,
+        receipt: &crate::stages::executor::ExecutionReceipt,
+    ) -> Result<CexState, String> {
         let amount = &receipt
             .liquidation_result
             .as_ref()
@@ -285,7 +279,13 @@ where
             None,
         )
     }
+}
 
+#[async_trait]
+impl<B> CexFinalizerLogic for MexcFinalizer<B>
+where
+    B: CexBackend,
+{
     async fn deposit(&self, state: &mut CexState) -> Result<(), String> {
         self.ensure_plan_on_state(state);
         let planned_asset = <Self as BridgePlanner>::planned_deposit_asset(state);
@@ -478,36 +478,6 @@ where
             .await
     }
 
-    async fn finish(&self, _receipt: &ExecutionReceipt, state: &CexState) -> Result<SwapExecution, String> {
-        self.finish_state(state)
-    }
-
-    async fn preview_route(&self, receipt: &ExecutionReceipt) -> Result<CexRoutePreview, String> {
-        let state = self.prepare("preview", receipt).await?;
-        let initial_amount = state.size_in.to_f64();
-        if initial_amount <= LIQUIDITY_EPS {
-            return Ok(CexRoutePreview {
-                is_executable: false,
-                estimated_receive_amount: 0.0,
-                estimated_price_impact_bps: 0.0,
-                reason: Some("non-positive amount_in".to_string()),
-            });
-        }
-        let legs = self
-            .resolve_trade_legs_for_symbols(
-                &<Self as BridgePlanner>::planned_deposit_asset(&state),
-                &<Self as BridgePlanner>::planned_withdraw_asset(&state),
-            )
-            .await?;
-        let route_preview = self.preview_resolved_trade_route(&legs, initial_amount).await?;
-
-        Ok(CexRoutePreview {
-            is_executable: true,
-            estimated_receive_amount: route_preview.receive_amount,
-            estimated_price_impact_bps: route_preview.price_impact_bps,
-            reason: None,
-        })
-    }
 }
 
 #[cfg(test)]

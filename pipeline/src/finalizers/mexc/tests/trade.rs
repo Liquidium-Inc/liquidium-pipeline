@@ -1631,7 +1631,7 @@ async fn mexc_approval_bump_retries_after_first_batch_failure_and_then_short_cir
 }
 
 #[tokio::test]
-async fn mexc_preview_route_returns_non_executable_for_zero_amount() {
+async fn mexc_route_preview_refuses_a_zero_amount() {
     let backend = Arc::new(MockCexBackend::new());
     let transfers = Arc::new(MockTransferActions::new());
     let finalizer = test_finalizer(backend, transfers);
@@ -1641,9 +1641,9 @@ async fn mexc_preview_route_returns_non_executable_for_zero_amount() {
         liq.amounts.collateral_received = Nat::from(0u8);
     }
 
-    let preview = finalizer.preview_route(&receipt).await.expect("preview should succeed");
-    assert!(!preview.is_executable);
-    assert_eq!(preview.estimated_receive_amount, 0.0);
-    assert_eq!(preview.estimated_price_impact_bps, 0.0);
-    assert_eq!(preview.reason.as_deref(), Some("non-positive amount_in"));
+    let error = preview_receipt_route(&finalizer, &receipt)
+        .await
+        .err()
+        .expect("a zero amount has no route preview");
+    assert!(error.contains("non-positive pay amount"), "{error}");
 }

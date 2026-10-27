@@ -71,7 +71,7 @@ async fn a_finished_row_reports_slippage_from_its_slices_not_a_saved_figure() {
     state.trade.trade_weighted_slippage_bps = Some(999.0);
     state.trade.trade_slices = vec![slice(0, "ICP_USDT", "sell", 1.0, 99.0, 100.0)];
 
-    let swap = finalizer.finish(&receipt, &state).await.expect("finish should succeed");
+    let swap = finalizer.finish_state(&state).expect("finish should succeed");
 
     assert!(
         (swap.realized_slippage_bps - 100.0).abs() < 1e-9,
@@ -91,7 +91,7 @@ async fn slice_records_keep_token_decimals() {
     ));
     state.trade.trade_slices = vec![slice(0, "BTC_USDC", "sell", 0.01, 500.0, 50_000.0)];
 
-    let swap = finalizer.finish(&receipt, &state).await.expect("finish should succeed");
+    let swap = finalizer.finish_state(&state).expect("finish should succeed");
 
     assert_eq!(swap.legs.len(), 1);
     assert_eq!(swap.legs[0].pay_amount, Nat::from(1_000_000u64), "0.01 BTC in sats");
