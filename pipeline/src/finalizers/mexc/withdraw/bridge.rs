@@ -140,10 +140,9 @@ where
             DepositNotice::NotYet { reason } => {
                 let waited = now.saturating_sub(funds.withdraw_bridge_funded_at_ts.unwrap_or(now));
                 if waited > DEPOSIT_NOTICE_WINDOW_SECS {
-                    return Err(side_effect_ambiguous(format!(
+                    return Err(CexBackendError::Ambiguous(format!(
                         "bridge deposit {receipt} landed {waited}s ago and the provider has not accepted it: {reason}"
-                    ))
-                    .into());
+                    )));
                 }
                 info!(
                     "[mexc] liq_id={} bridge deposit {} not accepted yet: {}",
@@ -210,7 +209,7 @@ where
                 )
                 .await;
         }
-        Ok(self.poll_withdraw_bridge(state, bridge, route).await?)
+        self.poll_withdraw_bridge(state, bridge, route).await
     }
 
     /// The MEXC withdrawal reached the bridge source: sizes the bridge amount
@@ -446,7 +445,7 @@ where
         state: &mut CexState,
         bridge: &BridgeRuntime,
         route: &BridgeRouteSpec,
-    ) -> Result<(), String> {
+    ) -> Result<(), CexBackendError> {
         let bridge_id = state
             .withdraw
             .bridge
@@ -484,7 +483,7 @@ where
                         .token_symbol
                         .eq_ignore_ascii_case(&state.withdraw.withdraw_asset.symbol())
                 {
-                    return Err("minter receipt does not match the committed return destination/token".to_string());
+                    return Err("minter receipt does not match the committed return destination/token".into());
                 }
                 // Report destination credit, not the trade output before
                 // exchange fees and bridge source adjustments.
@@ -518,7 +517,7 @@ where
                 let now = now_ts();
                 let waited = now.saturating_sub(state.withdraw.bridge.withdraw_bridge_funded_at_ts.unwrap_or(now));
                 if waited > DEPOSIT_NOTICE_WINDOW_SECS {
-                    return Err(side_effect_ambiguous(format!(
+                    return Err(CexBackendError::Ambiguous(format!(
                         "bridge deposit {bridge_id} dropped by the provider {waited}s after the funds landed: {reason}"
                     )));
                 }
@@ -533,13 +532,15 @@ where
                 state.liq_id,
                 bridge_id,
                 reason.unwrap_or_else(|| "unknown failure".to_string())
-            )),
+            )
+            .into()),
             BridgeStatus::Canceled { reason } => Err(format!(
                 "bridged withdraw canceled for liq_id {} bridge_id {}: {}",
                 state.liq_id,
                 bridge_id,
                 reason.unwrap_or_else(|| "no reason provided".to_string())
-            )),
+            )
+            .into()),
         }
     }
 }

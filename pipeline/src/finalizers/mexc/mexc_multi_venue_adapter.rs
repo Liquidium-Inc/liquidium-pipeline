@@ -1,7 +1,6 @@
 use async_trait::async_trait;
 use liquidium_pipeline_connectors::backend::bridge_backend::{BridgeRouteKind, resolve_route};
 use liquidium_pipeline_connectors::backend::cex_backend::{CexBackend, CexBackendError};
-use liquidium_pipeline_core::outbound::SIDE_EFFECT_AMBIGUOUS_PREFIX;
 use log::{info, warn};
 use serde::{Deserialize, Serialize};
 
@@ -203,14 +202,15 @@ where
                 progress.failure = Some(VenueLegFailure::BelowMinimum);
                 return Ok(progress);
             }
+            // Only an operator can say which row owns the provider record, or
+            // whether a call without an answer moved funds.
+            Err(CexBackendError::Ambiguous(message)) => {
+                execution.cex.last_error = Some(message.clone());
+                return self.operator_required_progress(execution, message);
+            }
             Err(error) => {
                 let error = error.to_string();
                 execution.cex.last_error = Some(error.clone());
-                // Only an operator can say which row owns the provider record,
-                // or whether a call without an answer moved funds.
-                if error.starts_with(SIDE_EFFECT_AMBIGUOUS_PREFIX) {
-                    return self.operator_required_progress(execution, error);
-                }
                 Some(error)
             }
             // Any step that completes without an error proves the venue is

@@ -5,7 +5,6 @@ use candid::Nat;
 use liquidium_pipeline_connectors::backend::amount_utils::nat_units_to_amount_via_core;
 use liquidium_pipeline_connectors::backend::bridge_backend::{BridgeFeeBudget, BridgeRouteKind, BridgeRouteSpec};
 use liquidium_pipeline_connectors::backend::cex_backend::{CexBackend, CexBackendError};
-use liquidium_pipeline_core::outbound::side_effect_ambiguous;
 use log::{debug, info};
 
 use super::mexc_finalizer::{
@@ -242,10 +241,10 @@ where
         let mut record = OutboundRecord::prepared(prepare_bridge_call(attempt.id.clone(), &call)?);
         record.phase = if attempt.parked_for_operator {
             OutboundPhase::Parked {
-                reason: side_effect_ambiguous(format!(
+                reason: format!(
                     "bridge call {} {} to {} was parked by the bridge journal; answer it with reconcile",
                     call.amount, call.asset, call.destination
-                )),
+                ),
             }
         } else {
             OutboundPhase::Submitted {
@@ -276,10 +275,10 @@ where
         let id = crate::utils::new_venue_execution_id("bridge-call");
         let mut record = OutboundRecord::prepared(prepare_bridge_call(id, &call)?);
         record.phase = OutboundPhase::Parked {
-            reason: side_effect_ambiguous(format!(
+            reason: format!(
                 "an older build may have called the bridge for {} {} without a record; answer it with reconcile",
                 call.amount, call.asset
-            )),
+            ),
         };
         state.deposit.bridge.deposit_bridge_call = Some(record);
         Ok(())

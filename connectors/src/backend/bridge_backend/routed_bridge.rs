@@ -110,7 +110,7 @@ impl BridgeBackend for RoutedBridgeBackend {
             .await
     }
 
-    async fn get_bridge_status(&self, bridge_id: &str) -> Result<BridgeStatus, String> {
+    async fn get_bridge_status(&self, bridge_id: &str) -> Result<BridgeStatus, BridgeError> {
         // Existing WAL handles must survive the addition of another provider.
         // ckSOL owns these prefixes; all pre-existing ckETH handles stay with EVM.
         if bridge_id.starts_with("cksol-") {

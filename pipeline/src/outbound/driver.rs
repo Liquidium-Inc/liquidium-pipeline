@@ -3,9 +3,7 @@
 //! The record travels with the step's saved state, so the identity of a send
 //! is durable before the send runs, and a restart resumes the same send.
 use liquidium_pipeline_connectors::backend::cex_backend::CexBackendError;
-use liquidium_pipeline_core::outbound::{
-    OutboundIntent, OutboundSender, PreparedSend, SendOutcome, side_effect_ambiguous,
-};
+use liquidium_pipeline_core::outbound::{OutboundIntent, OutboundSender, PreparedSend, SendOutcome};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -135,10 +133,10 @@ async fn advance_saved(saved: &mut OutboundRecord, sender: &dyn OutboundSender, 
         SendOutcome::Open { reason } => {
             let window = sender.open_window_secs(&saved.prepared);
             if now.saturating_sub(submitted_at) > window {
-                let reason = side_effect_ambiguous(format!(
+                let reason = format!(
                     "{} send {} has no decided answer after {window}s: {reason}; record an operator decision",
                     saved.prepared.sender, saved.prepared.identity
-                ));
+                );
                 saved.phase = OutboundPhase::Parked { reason: reason.clone() };
                 return Drive::Failed(OutboundError::Park(reason));
             }
@@ -154,8 +152,7 @@ pub enum OutboundError {
     /// The send did not happen; the next cycle prepares a new one.
     #[error("{0}")]
     Retry(String),
-    /// The send may have run; an operator must decide. The reason carries
-    /// the ambiguity prefix for the layers that still read text.
+    /// The send may have run; an operator must decide.
     #[error("{0}")]
     Park(String),
     /// The receiver refuses the amount as too small, so a new send of it fails too.
@@ -167,18 +164,13 @@ pub enum OutboundError {
     Deferred(String),
 }
 
-impl From<OutboundError> for String {
-    fn from(error: OutboundError) -> Self {
-        error.to_string()
-    }
-}
-
-/// A send failure inside a CEX leg step keeps its below-minimum kind.
+/// A send failure inside a CEX leg step keeps the kinds the leg decides on.
 impl From<OutboundError> for CexBackendError {
     fn from(error: OutboundError) -> Self {
         match error {
             OutboundError::BelowMinimum(message) => CexBackendError::BelowMinimum(message),
-            other => CexBackendError::Other(other.to_string()),
+            OutboundError::Park(message) => CexBackendError::Ambiguous(message),
+            OutboundError::Retry(message) | OutboundError::Deferred(message) => CexBackendError::Other(message),
         }
     }
 }
@@ -219,7 +211,7 @@ mod tests {
     use super::*;
     use candid::{Nat, Principal};
     use liquidium_pipeline_core::account::model::ChainAccount;
-    use liquidium_pipeline_core::outbound::{MockOutboundSender, is_side_effect_ambiguous};
+    use liquidium_pipeline_core::outbound::MockOutboundSender;
     use liquidium_pipeline_core::tokens::chain_token::ChainToken;
 
     fn intent() -> OutboundIntent {
@@ -288,7 +280,7 @@ mod tests {
         let Drive::Failed(OutboundError::Park(reason)) = advance_outbound(&mut record, &sender, 161).await else {
             panic!("the window ran out");
         };
-        assert!(is_side_effect_ambiguous(&reason), "{reason}");
+        assert!(reason.contains("no decided answer"), "{reason}");
         assert!(matches!(record.as_ref().unwrap().phase, OutboundPhase::Parked { .. }));
     }
 
@@ -338,7 +330,7 @@ mod tests {
             Some(OutboundRecord {
                 prepared: prepared(),
                 phase: OutboundPhase::Parked {
-                    reason: "side_effect_ambiguous: undecided".into(),
+                    reason: "undecided".into(),
                 },
                 decision,
             })

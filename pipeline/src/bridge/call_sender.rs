@@ -177,7 +177,7 @@ impl OutboundSender for BridgeCallSender {
             Err(BridgeError::Deferred(reason)) => SendOutcome::Deferred { reason },
             // Any other failure may follow a call that ran, so the provider
             // history decides it.
-            Err(BridgeError::Other(reason)) => SendOutcome::Open { reason },
+            Err(BridgeError::Ambiguous(reason) | BridgeError::Other(reason)) => SendOutcome::Open { reason },
         }
     }
 

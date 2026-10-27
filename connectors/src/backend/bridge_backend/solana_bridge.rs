@@ -15,8 +15,9 @@ use super::{
 };
 use liquidium_pipeline_core::{
     account::model::ChainAccount,
-    outbound::{OutboundIntent, SIDE_EFFECT_AMBIGUOUS_PREFIX, side_effect_ambiguous},
+    outbound::OutboundIntent,
     tokens::chain_token::ChainToken,
+    transfer::actions::TransferFailure,
     types::side_cost::{CYCLES_DECIMALS, CYCLES_SYMBOL, SideCost},
 };
 use crate::{
@@ -763,27 +764,26 @@ where
         &self,
         route: &BridgeRouteSpec,
         request: &BridgeRequest,
-    ) -> Result<BridgeSubmission, String> {
+    ) -> Result<BridgeSubmission, BridgeError> {
         let send = self.solana_to_icp_send(route, request).await?;
         let ChainAccount::Solana(deposit_address) = &send.to else {
-            return Err("ckSOL deposit address is not a Solana address".to_string());
+            return Err("ckSOL deposit address is not a Solana address".into());
         };
         let transfer_signature = self
             .solana_backend
             .native_transfer(deposit_address, send.amount_native.clone())
             .await
-            .map_err(|e| {
-                // The backend settles the send against the cluster; only an
-                // answer it could not decide keeps the ambiguity prefix.
-                let prefix = if e.starts_with(SIDE_EFFECT_AMBIGUOUS_PREFIX) {
-                    format!("{SIDE_EFFECT_AMBIGUOUS_PREFIX}: ")
-                } else {
-                    String::new()
-                };
-                format!(
-                    "{prefix}SOL transfer from configured bridge source {} to ckSOL deposit address {} failed: {}",
-                    self.bridge_solana_source_address, deposit_address, e
-                )
+            .map_err(|failure| {
+                let message = format!(
+                    "SOL transfer from configured bridge source {} to ckSOL deposit address {} failed: {}",
+                    self.bridge_solana_source_address, deposit_address, failure
+                );
+                // The backend settles the send against the cluster, so only an
+                // answer it could not decide stays ambiguous.
+                match failure {
+                    TransferFailure::Ambiguous(_) => BridgeError::Ambiguous(message),
+                    TransferFailure::Rejected(_) => BridgeError::Other(message),
+                }
             })?;
 
         // SOL has moved, so every answer but an accepted notice returns a
@@ -951,7 +951,7 @@ where
         validate_destination_for_route(route, &request.destination)?;
 
         match route.route_kind {
-            BridgeRouteKind::SolanaToIcp => Ok(self.submit_solana_to_icp(route, &request).await?),
+            BridgeRouteKind::SolanaToIcp => self.submit_solana_to_icp(route, &request).await,
             BridgeRouteKind::IcpToSolana => Ok(self.submit_icp_to_solana(route, &request).await?),
             _ => Err(format!(
                 "route {}@{} -> {} is not supported by SolanaBridgeBackend",
@@ -1007,13 +1007,13 @@ where
         self.notify_sol_deposit(route, destination, receipt).await
     }
 
-    async fn get_bridge_status(&self, bridge_id: &str) -> Result<BridgeStatus, String> {
+    async fn get_bridge_status(&self, bridge_id: &str) -> Result<BridgeStatus, BridgeError> {
         if let Some(encoded) = bridge_id.strip_prefix(QUEUED_DEPOSIT_PREFIX) {
             let state: QueuedSolDeposit = serde_json::from_str(encoded).map_err(|error| error.to_string())?;
             // An older flow saved the transfer without a minter id. Only an
             // operator can tie that SOL to a minter deposit.
             let Some(deposit_id) = state.deposit_id else {
-                return Err(side_effect_ambiguous(format!(
+                return Err(BridgeError::Ambiguous(format!(
                     "SOL transfer {} has no ckSOL deposit id; call deposit_sol for {} and record the id",
                     state.transfer_signature, state.account
                 )));
@@ -1036,7 +1036,7 @@ where
                 // A quarantined mint may have landed, and only a minter upgrade
                 // releases it. Park the row; a new transfer is never safe here.
                 DepositSolStatus::Quarantined { signature } => {
-                    return Err(side_effect_ambiguous(format!(
+                    return Err(BridgeError::Ambiguous(format!(
                         "ckSOL deposit {deposit_id} is quarantined (sweep {signature}); only a minter upgrade releases it"
                     )));
                 }
@@ -1073,13 +1073,14 @@ where
         Err(format!(
             "unsupported ckSOL bridge id '{}'; expected '{}' or '{}' prefixes",
             bridge_id, WITHDRAW_BRIDGE_ID_PREFIX, DEPOSIT_BRIDGE_ID_PREFIX
-        ))
+        )
+        .into())
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::super::{BridgeBackend, BridgeDestination, BridgeRequest};
+    use super::super::{BridgeBackend, BridgeDestination, BridgeError, BridgeRequest};
     use super::{
         CkSolMinterInfo, CkSolTxFinalizedStatus, DepositNotice, DepositSolError,
         CkSolWithdrawalError, CkSolWithdrawalOk, CkSolWithdrawalStatus, DEFAULT_SOLANA_BRIDGE_FEE_BUFFER_LAMPORTS,
@@ -1091,6 +1092,7 @@ mod tests {
     };
     use candid::{Decode, Nat, Principal};
     use icrc_ledger_types::icrc1::account::Account;
+    use liquidium_pipeline_core::transfer::actions::TransferFailure;
     use liquidium_pipeline_core::types::side_cost::{CYCLES_DECIMALS, CYCLES_SYMBOL, SideCost};
     use std::sync::{Arc, Mutex};
 
@@ -1390,8 +1392,10 @@ mod tests {
                 .get_bridge_status(&submission.bridge_id)
                 .await
                 .expect_err("a transfer without a minter id needs an operator");
-            assert!(liquidium_pipeline_core::outbound::is_side_effect_ambiguous(&error), "{error}");
-            assert!(error.contains("sig-123"), "{error}");
+            assert!(
+                matches!(&error, BridgeError::Ambiguous(message) if message.contains("sig-123")),
+                "{error}"
+            );
         }
     }
 
@@ -1574,8 +1578,10 @@ mod tests {
             .get_bridge_status(&id)
             .await
             .expect_err("only an operator can release a quarantined deposit");
-        assert!(liquidium_pipeline_core::outbound::is_side_effect_ambiguous(&error), "{error}");
-        assert!(error.contains("78"), "{error}");
+        assert!(
+            matches!(&error, BridgeError::Ambiguous(message) if message.contains("78")),
+            "{error}"
+        );
     }
 
     #[tokio::test]
@@ -1617,12 +1623,14 @@ mod tests {
     async fn solana_to_icp_transfer_failure_maps_to_clear_error_and_skips_process_deposit() {
         // The backend settles the send. Only an undecided answer stays ambiguous.
         for (backend_error, ambiguous) in [
-            ("solana transaction 1 expired unconfirmed and moved no funds: rpc failure".to_string(), false),
             (
-                format!(
-                    "{}: solana transaction 1 has no decided answer: rpc failure",
-                    liquidium_pipeline_core::outbound::SIDE_EFFECT_AMBIGUOUS_PREFIX
+                TransferFailure::Rejected(
+                    "solana transaction 1 expired unconfirmed and moved no funds: rpc failure".into(),
                 ),
+                false,
+            ),
+            (
+                TransferFailure::Ambiguous("solana transaction 1 has no decided answer: rpc failure".into()),
                 true,
             ),
         ] {
@@ -1660,13 +1668,9 @@ mod tests {
         let err = backend
             .submit_bridge(request)
             .await
-            .expect_err("transfer failure must fail submission")
-            .to_string();
-        assert_eq!(
-            err.starts_with(liquidium_pipeline_core::outbound::SIDE_EFFECT_AMBIGUOUS_PREFIX),
-            ambiguous,
-            "{err}"
-        );
+            .expect_err("transfer failure must fail submission");
+        assert_eq!(matches!(err, BridgeError::Ambiguous(_)), ambiguous, "{err}");
+        let err = err.to_string();
         assert!(err.contains("SOL transfer from configured bridge source"));
         assert!(err.contains("rpc failure"));
         }

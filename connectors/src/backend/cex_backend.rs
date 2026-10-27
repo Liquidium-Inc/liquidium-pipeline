@@ -12,6 +12,10 @@ pub enum CexBackendError {
     /// succeed with it.
     #[error("{0}")]
     BelowMinimum(String),
+    /// A call may have moved funds, and no answer decides it. Only an operator
+    /// can say what happened, so no automatic retry is safe.
+    #[error("{0}")]
+    Ambiguous(String),
     /// Any backend failure that follows the normal retry/error policy.
     #[error("{0}")]
     Other(String),
@@ -23,25 +27,19 @@ impl From<String> for CexBackendError {
     }
 }
 
-/// Callers that report text keep the message, prefix included.
-impl From<CexBackendError> for String {
-    fn from(error: CexBackendError) -> Self {
-        error.to_string()
-    }
-}
-
 impl From<&str> for CexBackendError {
     fn from(message: &str) -> Self {
         Self::Other(message.to_string())
     }
 }
 
-/// A bridge refusal inside a CEX leg step keeps its below-minimum kind.
+/// A bridge failure inside a CEX leg step keeps the kinds the leg decides on.
 impl From<BridgeError> for CexBackendError {
     fn from(error: BridgeError) -> Self {
         match error {
             BridgeError::BelowMinimum(message) => Self::BelowMinimum(message),
-            other => Self::Other(other.to_string()),
+            BridgeError::Ambiguous(message) => Self::Ambiguous(message),
+            BridgeError::Deferred(message) | BridgeError::Other(message) => Self::Other(message),
         }
     }
 }

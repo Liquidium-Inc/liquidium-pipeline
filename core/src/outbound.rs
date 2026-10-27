@@ -7,20 +7,6 @@ use serde::{Deserialize, Serialize};
 use crate::account::model::ChainAccount;
 use crate::tokens::chain_token::ChainToken;
 
-/// Error prefix for a call that may have moved funds without a decided answer.
-/// It carries that decision across `Result<_, String>` boundaries.
-pub const SIDE_EFFECT_AMBIGUOUS_PREFIX: &str = "side_effect_ambiguous";
-
-/// Builds an error message for a call that may have moved funds.
-pub fn side_effect_ambiguous(detail: impl std::fmt::Display) -> String {
-    format!("{SIDE_EFFECT_AMBIGUOUS_PREFIX}: {detail}")
-}
-
-/// True when the error marks a call that may have moved funds.
-pub fn is_side_effect_ambiguous(error: &str) -> bool {
-    error.starts_with(SIDE_EFFECT_AMBIGUOUS_PREFIX)
-}
-
 /// What one submit, or one read of the chain, says about a send.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SendOutcome {
@@ -83,18 +69,5 @@ pub trait OutboundSender: Send + Sync {
     fn open_window_secs(&self, prepared: &PreparedSend) -> i64 {
         let _ = prepared;
         15 * 60
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn the_ambiguity_marker_round_trips() {
-        let message = side_effect_ambiguous("replica timed out");
-        assert!(is_side_effect_ambiguous(&message));
-        assert!(message.ends_with("replica timed out"));
-        assert!(!is_side_effect_ambiguous("insufficient funds"));
     }
 }

@@ -27,7 +27,7 @@ where
         asset: &str,
         network: &str,
         amount: f64,
-    ) -> Result<Option<AcceptedWithdrawal>, String> {
+    ) -> Result<Option<AcceptedWithdrawal>, CexBackendError> {
         if state.withdraw.withdraw_send.is_none() {
             let request = WithdrawRequest {
                 asset: asset.to_string(),
@@ -47,11 +47,11 @@ where
                 Self::complete_withdraw_as_below_min_dust(state, asset, network, amount, &error);
                 Ok(None)
             }
-            Err(OutboundError::Park(error)) => Err(error),
+            Err(OutboundError::Park(error)) => Err(CexBackendError::Ambiguous(error)),
             // The request did not happen, so the next one takes a new order id.
             Err(OutboundError::Retry(error) | OutboundError::Deferred(error)) => {
                 state.withdraw.withdraw_attempt += 1;
-                Err(error)
+                Err(error.into())
             }
         }
     }
@@ -84,7 +84,7 @@ where
         planned_asset: &str,
         planned_network: &str,
         amount: f64,
-    ) -> Result<(), String> {
+    ) -> Result<(), CexBackendError> {
         let direct_destination = self.direct_withdraw_destination(state, planned_asset, planned_network)?;
 
         if state.withdraw.withdraw_address != direct_destination {
@@ -102,9 +102,9 @@ where
         }
 
         if let Some(withdraw_id) = state.withdraw.withdraw_id.clone() {
-            return self
+            return Ok(self
                 .poll_direct_withdraw(state, planned_asset, &withdraw_id, amount)
-                .await;
+                .await?);
         }
 
         let Some(accepted) = self
