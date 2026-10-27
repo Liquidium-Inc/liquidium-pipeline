@@ -6,10 +6,10 @@ use liquidium_pipeline_connectors::backend::cex_backend::CexBackend;
 use liquidium_pipeline_core::tokens::asset_id::AssetId;
 use log::{debug, info};
 
-use crate::swappers::mexc::orderbook_quote::{simulate_buy_from_asks, simulate_sell_from_bids};
 use crate::swappers::model::{
     LIQUIDITY_EPS, SwapExecution, SwapQuote, SwapQuoteLeg, SwapRequest, adverse_price_impact_bps, f64_to_nat,
 };
+use crate::swappers::orderbook_quote::{simulate_buy_from_asks, simulate_sell_from_bids};
 use crate::swappers::venue::{ExecutableSwapVenue, SwapVenue};
 
 const DEFAULT_ORDERBOOK_LIMIT: u32 = 50;

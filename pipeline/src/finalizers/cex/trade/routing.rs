@@ -147,7 +147,7 @@ where
 
     fn route_neighbors_from_pairs(&self, from_symbol: &str) -> Vec<(String, TradeLeg)> {
         let mut out = Vec::new();
-        for market in &self.cex_mexc_available_pairs {
+        for market in &self.available_pairs {
             let Some((base, quote)) = parse_market_symbols(market) else {
                 continue;
             };
@@ -301,32 +301,33 @@ where
     /// Resolve a multi-leg hop route from `deposit_symbol` to `withdraw_symbol`.
     ///
     /// Flow:
-    /// 1) Require hop config (`cex_mexc_available_pairs`) and enabled hop depth.
-    /// 2) Discover candidate paths up to `cex_mexc_max_hops`.
+    /// 1) Require hop config (`available_pairs`) and enabled hop depth.
+    /// 2) Discover candidate paths up to `max_hops`.
     /// 3) Sort candidates by shortest route first, then deterministic signature.
     /// 4) Return the first route whose all legs pass `ensure_route_liquidity`.
     ///
     /// If no candidate is executable, returns an aggregated error that includes each
     /// rejected route signature and failure reason.
     async fn resolve_hop_route(&self, deposit_symbol: &str, withdraw_symbol: &str) -> Result<Vec<TradeLeg>, String> {
-        if self.cex_mexc_available_pairs.is_empty() {
+        if self.available_pairs.is_empty() {
             return Err(format!(
-                "no configured MEXC pairs for hop discovery ({} -> {})",
+                "no configured {} pairs for hop discovery ({} -> {})",
+                self.profile.name(),
                 deposit_symbol, withdraw_symbol
             ));
         }
-        if self.cex_mexc_max_hops == 0 {
+        if self.max_hops == 0 {
             return Err(format!(
-                "hop discovery disabled by CEX_MEXC_MAX_HOPS=0 ({} -> {})",
+                "hop discovery disabled by a max hop count of 0 ({} -> {})",
                 deposit_symbol, withdraw_symbol
             ));
         }
 
-        let mut candidates = self.discover_hop_candidates(deposit_symbol, withdraw_symbol, self.cex_mexc_max_hops);
+        let mut candidates = self.discover_hop_candidates(deposit_symbol, withdraw_symbol, self.max_hops);
         if candidates.is_empty() {
             return Err(format!(
                 "no configured hop route for {} -> {} within {} hops",
-                deposit_symbol, withdraw_symbol, self.cex_mexc_max_hops
+                deposit_symbol, withdraw_symbol, self.max_hops
             ));
         }
 
@@ -391,7 +392,7 @@ where
         }
 
         // 1) High-priority compatibility override for legacy ck routes.
-        if let Some(legs) = mexc_special_trade_legs(deposit, withdraw) {
+        if let Some(legs) = self.profile.special_trade_legs(deposit, withdraw) {
             return Ok(legs);
         }
 
@@ -452,14 +453,14 @@ where
             }
         }
 
-        if self.cex_mexc_available_pairs.is_empty() {
+        if self.available_pairs.is_empty() {
             return Err(format!(
                 "cannot convert {} to USD: no configured hop pairs and no direct stable market ({})",
                 symbol,
                 direct_errors.join(" | ")
             ));
         }
-        if self.cex_mexc_max_hops == 0 {
+        if self.max_hops == 0 {
             return Err(format!(
                 "cannot convert {} to USD: hop discovery disabled and no direct stable market ({})",
                 symbol,
@@ -475,13 +476,13 @@ where
             }
         }
         for stable in &stable_targets {
-            candidates.extend(self.discover_hop_candidates(symbol, stable, self.cex_mexc_max_hops));
+            candidates.extend(self.discover_hop_candidates(symbol, stable, self.max_hops));
         }
 
         if candidates.is_empty() {
             return Err(format!(
                 "cannot convert {} to USD: no configured path to stable symbols within {} hops",
-                symbol, self.cex_mexc_max_hops
+                symbol, self.max_hops
             ));
         }
 

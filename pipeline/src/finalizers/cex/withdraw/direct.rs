@@ -1,9 +1,9 @@
-//! The MEXC withdrawal request: its order id, the saved send, and the
+//! The exchange withdrawal request: its order id, the saved send, and the
 //! below-minimum dust completion.
 use super::*;
 
-/// The MEXC `withdrawOrderId` for one withdrawal attempt of a row.
-pub fn mexc_withdraw_order_id(liq_id: &str, attempt: u32) -> String {
+/// The withdrawal order id for one withdrawal attempt of a row (MEXC `withdrawOrderId`).
+pub fn withdraw_order_id(liq_id: &str, attempt: u32) -> String {
     let hash = super::super::utils::fnv1a_64(liq_id);
     format!("lq{hash:016x}w{attempt}")
 }
@@ -15,7 +15,7 @@ where
     /// The exchange keeps this id with the request, so history can find a
     /// request whose reply was lost. A refused request bumps the attempt.
     fn withdraw_order_id(state: &CexState) -> String {
-        mexc_withdraw_order_id(&state.liq_id, state.withdraw.withdraw_attempt)
+        withdraw_order_id(&state.liq_id, state.withdraw.withdraw_attempt)
     }
 
     /// Moves the leg's withdrawal request through the outbound driver: one
@@ -49,9 +49,9 @@ where
                 Ok(None)
             }
             Err(OutboundError::Park(error) | OutboundError::Reverted(error)) => Err(CexBackendError::Ambiguous(error)),
-            // MEXC could not be reached, so the same order id is still unused.
+            // The exchange could not be reached, so the same order id is still unused.
             Err(OutboundError::Deferred(error)) => Err(CexBackendError::Unreachable(error)),
-            // MEXC refused the request, so the next one takes a new order id.
+            // The exchange refused the request, so the next one takes a new order id.
             Err(OutboundError::Retry(error)) => {
                 state.withdraw.withdraw_attempt += 1;
                 Err(error.into())
@@ -60,7 +60,7 @@ where
     }
 
     /// Writes off a refused withdrawal as dust only when it prices under the
-    /// dust floor. A larger or unpriceable amount stays on MEXC for an operator.
+    /// dust floor. A larger or unpriceable amount stays on the exchange for an operator.
     async fn settle_withdraw_below_min(
         &self,
         state: &mut CexState,
@@ -73,18 +73,27 @@ where
             .amount_symbol_to_usd(planned_asset, amount)
             .await
             .map_err(|error| {
-                format!("{refusal}; {amount} {planned_asset} stays on MEXC because it could not be priced: {error}")
+                format!(
+                    "{refusal}; {amount} {planned_asset} stays on {} because it could not be priced: {error}",
+                    self.profile.name()
+                )
             })?;
         if usd > self.cex_min_exec_usd {
             return Err(format!(
-                "{refusal}; {amount} {planned_asset} (~{usd:.2} USD) is above the {} USD dust floor, so it stays on MEXC for an operator",
-                self.cex_min_exec_usd
+                "{refusal}; {amount} {planned_asset} (~{usd:.2} USD) is above the {} USD dust floor, so it stays on {} for an operator",
+                self.cex_min_exec_usd,
+                self.profile.name()
             )
             .into());
         }
         let msg = format!(
-            "mexc withdraw below minimum; treating residual as CEX dust for liq_id {} asset={} network={} amount={} (~{usd:.4} USD) err={}",
-            state.liq_id, planned_asset, planned_network, amount, refusal
+            "{} withdraw below minimum; treating residual as CEX dust for liq_id {} asset={} network={} amount={} (~{usd:.4} USD) err={}",
+            self.profile.venue_id(),
+            state.liq_id,
+            planned_asset,
+            planned_network,
+            amount,
+            refusal
         );
         warn!("{}", msg);
         state.last_error = Some(msg);

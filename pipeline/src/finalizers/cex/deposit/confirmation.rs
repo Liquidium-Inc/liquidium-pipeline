@@ -1,4 +1,4 @@
-//! Confirms that a deposit reached the MEXC account, by balance delta or,
+//! Confirms that a deposit reached the exchange account, by balance delta or,
 //! after a wait, by the total free balance.
 use super::*;
 use crate::finalizers::bridge_planner::BridgePlanner;
@@ -34,7 +34,7 @@ where
             None => {
                 state.deposit.deposit_sent_at_ts = Some(now);
                 info!(
-                    "[mexc] liq_id={} deposit fallback timer initialized at={} (legacy state without send timestamp)",
+                    "[cex] liq_id={} deposit fallback timer initialized at={} (legacy state without send timestamp)",
                     state.liq_id, now
                 );
                 return false;
@@ -47,7 +47,7 @@ where
                 state.trade.trade_next_amount_in = Some(expected_amount);
             }
             info!(
-                "[mexc] liq_id={} deposit confirmed via total-free fallback: current={} expected={} elapsed={}s",
+                "[cex] liq_id={} deposit confirmed via total-free fallback: current={} expected={} elapsed={}s",
                 state.liq_id, current_balance, expected_deposit_amount, elapsed
             );
             state.step = CexStep::Trade;
@@ -91,7 +91,7 @@ where
                             Some(observed_balance_delta.max(0.0).min(expected_deposit_amount));
                     }
                     info!(
-                        "[mexc] liq_id={} deposit confirmed: before={} after={} expected={}",
+                        "[cex] liq_id={} deposit confirmed: before={} after={} expected={}",
                         state.liq_id, baseline_balance, current_balance, expected_deposit_amount
                     );
                     state.step = CexStep::Trade;
@@ -110,7 +110,7 @@ where
                 }
 
                 debug!(
-                    "[mexc] liq_id={} deposit pending: before={} current={} delta={} expected={}",
+                    "[cex] liq_id={} deposit pending: before={} current={} delta={} expected={}",
                     state.liq_id, baseline_balance, current_balance, observed_balance_delta, expected_deposit_amount
                 );
             }
@@ -118,7 +118,7 @@ where
                 // No baseline recorded yet (should normally be set when we send the transfer),
                 // so record the current balance as the baseline and stay in Deposit.
                 info!(
-                    "[mexc] liq_id={} deposit baseline set: current={}",
+                    "[cex] liq_id={} deposit baseline set: current={}",
                     state.liq_id, current_balance
                 );
                 state.deposit.deposit_balance_before = Some(current_balance);

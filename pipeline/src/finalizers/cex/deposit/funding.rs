@@ -1,5 +1,5 @@
-//! The deposit funding transfer: measuring the MEXC balance, sizing the
-//! transfer with its fee reserve, the saved send, and the MEXC approval bumps.
+//! The deposit funding transfer: measuring the exchange balance, sizing the
+//! transfer with its fee reserve, the saved send, and the approval bumps.
 use super::*;
 use crate::finalizers::bridge_planner::BridgePlanner;
 
@@ -30,7 +30,7 @@ where
         Ok(true)
     }
 
-    /// A deposit straight to the MEXC address: one funding transfer, then the
+    /// A deposit straight to the exchange address: one funding transfer, then the
     /// balance check confirms that the funds arrived.
     pub(super) async fn deposit_direct(
         &self,
@@ -51,11 +51,9 @@ where
                 return Ok(());
             }
 
-            if matches!(state.deposit.deposit_asset, ChainToken::Icp { .. })
-                && !Self::is_native_icp_token(&state.deposit.deposit_asset)
-            {
+            if self.bumps_approvals(&state.deposit.deposit_asset, false) {
                 let approved = self
-                    .maybe_bump_mexc_approval(&state.liq_id, &state.deposit.deposit_asset)
+                    .maybe_bump_approval(&state.liq_id, &state.deposit.deposit_asset)
                     .await;
 
                 if approved > 0 {
@@ -74,13 +72,13 @@ where
     async fn record_balance_before_deposit(&self, state: &mut CexState, planned_asset: &str) {
         let baseline = self.backend.get_balance(planned_asset).await.unwrap_or_else(|error| {
             debug!(
-                "[mexc] liq_id={} could not get baseline balance before deposit: {} (using 0.0)",
+                "[cex] liq_id={} could not get baseline balance before deposit: {} (using 0.0)",
                 state.liq_id, error
             );
             0.0
         });
         debug!(
-            "[mexc] liq_id={} baseline balance before deposit: {}",
+            "[cex] liq_id={} baseline balance before deposit: {}",
             state.liq_id, baseline
         );
         state.deposit.deposit_balance_before = Some(baseline);
@@ -105,7 +103,7 @@ where
         {
             let tag = addr.tag.clone().unwrap_or_default();
             return Err(format!(
-                "native ICP MEXC deposit returned unsupported memo/tag for liq_id {} asset={} network={} address={} tag={}",
+                "native ICP exchange deposit returned unsupported memo/tag for liq_id {} asset={} network={} address={} tag={}",
                 state.liq_id, planned_asset, planned_network, addr.address, tag
             )
             .into());
@@ -113,8 +111,11 @@ where
 
         state.deposit.bridge.deposit_bridge_destination_snapshot = Some(addr.address.clone());
 
-        let (transfer_value, transfer_amount) =
-            Self::compute_fee_adjusted_deposit_transfer(&state.deposit.deposit_asset, &state.size_in, false)?;
+        let (transfer_value, transfer_amount) = Self::compute_fee_adjusted_deposit_transfer(
+            &state.deposit.deposit_asset,
+            &state.size_in,
+            self.deposit_fee_count(&state.deposit.deposit_asset, false),
+        )?;
         let destination = Self::direct_deposit_destination_account(
             &state.deposit.deposit_asset,
             planned_network,
@@ -160,7 +161,7 @@ where
             let source_transfer_amount =
                 ChainTokenAmount::from_raw(state.deposit.deposit_asset.clone(), transfer_value.clone());
             info!(
-                "[mexc] liq_id={} bridged deposit reserving reverse bridge source fee budget: reserve={} source_transfer={} bridge_amount={} route={}@{}->{}",
+                "[cex] liq_id={} bridged deposit reserving reverse bridge source fee budget: reserve={} source_transfer={} bridge_amount={} route={}@{}->{}",
                 state.liq_id,
                 source_fee_reserve.formatted(),
                 source_transfer_amount.formatted(),
@@ -183,30 +184,41 @@ where
         })
     }
 
-    /// Ledger fees held back from a deposit transfer: the transfer itself,
-    /// plus the approval bumps that only direct non-native ICP deposits send.
-    pub(super) fn deposit_fee_count(deposit_asset: &ChainToken, bridged: bool) -> u8 {
-        let bumps_approvals =
-            !bridged && matches!(deposit_asset, ChainToken::Icp { .. }) && !Self::is_native_icp_token(deposit_asset);
-        if bumps_approvals { 1 + APPROVE_BUMP_MAX_COUNT } else { 1 }
+    /// Whether a deposit of this asset sends approval bumps: only a direct
+    /// non-native ICP deposit to a venue that needs them.
+    fn bumps_approvals(&self, deposit_asset: &ChainToken, bridged: bool) -> bool {
+        self.profile.approval_bumps()
+            && !bridged
+            && matches!(deposit_asset, ChainToken::Icp { .. })
+            && !Self::is_native_icp_token(deposit_asset)
+    }
+
+    /// Ledger fees held back from a deposit transfer: the transfer itself, plus
+    /// the approval bumps when the deposit sends them.
+    pub(in crate::finalizers::cex) fn deposit_fee_count(&self, deposit_asset: &ChainToken, bridged: bool) -> u8 {
+        if self.bumps_approvals(deposit_asset, bridged) {
+            1 + APPROVE_BUMP_MAX_COUNT
+        } else {
+            1
+        }
     }
 
     pub(in crate::finalizers::cex) fn compute_fee_adjusted_deposit_transfer(
         deposit_asset: &ChainToken,
         size_in: &ChainTokenAmount,
-        bridged: bool,
+        fee_count: u8,
     ) -> Result<(Nat, ChainTokenAmount), CexBackendError> {
-        let fee = deposit_asset.fee() * Self::deposit_fee_count(deposit_asset, bridged);
+        let fee = deposit_asset.fee() * fee_count;
         let transfer_amount = Self::amount_less_reserve(deposit_asset, &size_in.value, fee, "ledger fee")?;
         Ok((transfer_amount.value.clone(), transfer_amount))
     }
 
-    // MEXC approvals are flaky; we send a burst of tiny approvals to increase the chance
-    // the exchange notices the approval without blocking the main liquidation flow.
-    pub(super) async fn maybe_bump_mexc_approval(&self, liq_id: &str, asset: &ChainToken) -> u32 {
+    // Some venues notice approvals unreliably; a burst of tiny approvals raises the
+    // chance the exchange notices one without blocking the liquidation flow.
+    pub(super) async fn maybe_bump_approval(&self, liq_id: &str, asset: &ChainToken) -> u32 {
         let already_bumped = {
             let Ok(approve_bumps) = self.approve_bumps.lock() else {
-                warn!("[mexc] liq_id={} approve_bumps mutex poisoned, skipping bump", liq_id);
+                warn!("[cex] liq_id={} approve_bumps mutex poisoned, skipping bump", liq_id);
                 return 0;
             };
             *approve_bumps.get(liq_id).unwrap_or(&0)
@@ -214,7 +226,7 @@ where
 
         if already_bumped >= APPROVE_BUMP_MAX_COUNT {
             debug!(
-                "[mexc] liq_id={} deposit transfer: approve bump already done (count={})",
+                "[cex] liq_id={} deposit transfer: approve bump already done (count={})",
                 liq_id, already_bumped
             );
             return 0;
@@ -226,7 +238,7 @@ where
             subaccount: None,
         });
         info!(
-            "[mexc] liq_id={} deposit transfer: approve bump {}+{} amount={} asset={}",
+            "[cex] liq_id={} deposit transfer: approve bump {}+{} amount={} asset={}",
             liq_id, APPROVE_BUMP_BATCH_SIZE, APPROVE_BUMP_BATCH_SIZE, approve_amount, asset
         );
 
@@ -240,7 +252,7 @@ where
                 .await
             {
                 ok = false;
-                info!("[mexc] liq_id={} approve bump failed: {}", liq_id, err);
+                info!("[cex] liq_id={} approve bump failed: {}", liq_id, err);
                 break;
             }
             approved_count += 1;
@@ -257,7 +269,7 @@ where
                     .await
                 {
                     ok = false;
-                    info!("[mexc] liq_id={} approve bump failed: {}", liq_id, err);
+                    info!("[cex] liq_id={} approve bump failed: {}", liq_id, err);
                     break;
                 }
                 approved_count += 1;

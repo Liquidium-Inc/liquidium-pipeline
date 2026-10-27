@@ -5,7 +5,7 @@ use super::*;
 fn the_withdraw_order_id_format_never_changes() {
     // A saved row polls MEXC history by this id, so a new release must build
     // the same id from the same row.
-    assert_eq!(mexc_withdraw_order_id("1720", 3), "lq04733af0f350196bw3");
+    assert_eq!(withdraw_order_id("1720", 3), "lq04733af0f350196bw3");
 }
 
 #[tokio::test]

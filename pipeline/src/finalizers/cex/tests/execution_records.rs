@@ -107,20 +107,26 @@ async fn slice_records_keep_token_decimals() {
 #[test]
 fn the_deposit_reserve_covers_only_the_fees_its_route_pays() {
     type F = CexVenueFinalizer<MockCexBackend>;
+    let mexc = test_finalizer(Arc::new(MockCexBackend::new()), Arc::new(MockTransferActions::new()));
     let sol = ChainToken::SolanaNative {
         symbol: "SOL".into(),
         decimals: 9,
         fee: Nat::from(5_000u64),
     };
-    assert_eq!(F::deposit_fee_count(&ckusdc_token(), false), 7);
-    assert_eq!(F::deposit_fee_count(&ckusdc_token(), true), 1);
-    assert_eq!(F::deposit_fee_count(&native_icp_token(), false), 1);
-    assert_eq!(F::deposit_fee_count(&sol, false), 1);
+    assert_eq!(mexc.deposit_fee_count(&ckusdc_token(), false), 7);
+    assert_eq!(mexc.deposit_fee_count(&ckusdc_token(), true), 1);
+    assert_eq!(mexc.deposit_fee_count(&native_icp_token(), false), 1);
+    assert_eq!(mexc.deposit_fee_count(&sol, false), 1);
 
     let size_in = ChainTokenAmount::from_raw(ckusdc_token(), Nat::from(1_000_000u64));
     let fee = ckusdc_token().fee();
-    let (direct, _) = F::compute_fee_adjusted_deposit_transfer(&ckusdc_token(), &size_in, false).unwrap();
-    let (bridged, _) = F::compute_fee_adjusted_deposit_transfer(&ckusdc_token(), &size_in, true).unwrap();
+    let (direct, _) = F::compute_fee_adjusted_deposit_transfer(&ckusdc_token(), &size_in, 7).unwrap();
+    let (bridged, _) = F::compute_fee_adjusted_deposit_transfer(&ckusdc_token(), &size_in, 1).unwrap();
     assert_eq!(direct, Nat::from(1_000_000u64) - fee.clone() * 7u8);
     assert_eq!(bridged, Nat::from(1_000_000u64) - fee);
+
+    // A venue without approval bumps holds back the transfer fee alone.
+    let mut plain = test_finalizer(Arc::new(MockCexBackend::new()), Arc::new(MockTransferActions::new()));
+    plain.profile = plain.profile.without_approval_bumps();
+    assert_eq!(plain.deposit_fee_count(&ckusdc_token(), false), 1);
 }

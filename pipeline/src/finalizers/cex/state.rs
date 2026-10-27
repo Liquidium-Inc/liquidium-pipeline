@@ -167,7 +167,7 @@ pub struct CexWithdrawState {
     pub withdraw_address: String,
     pub withdraw_id: Option<String>,
     pub withdraw_txid: Option<String>,
-    /// When MEXC accepted a direct withdrawal that had no transaction id yet.
+    /// When the exchange accepted a direct withdrawal that had no transaction id yet.
     #[serde(default)]
     pub withdraw_accepted_at_ts: Option<i64>,
     /// Bumped after each refused request, so a new request gets a new order id.

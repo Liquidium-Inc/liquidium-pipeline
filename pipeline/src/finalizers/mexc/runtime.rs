@@ -4,7 +4,7 @@ use crate::{
     config::ConfigTrait,
     context::PipelineContext,
     bridge::runtime::BridgeRuntime,
-    finalizers::cex::finalizer::CexVenueFinalizer,
+    finalizers::cex::{finalizer::CexVenueFinalizer, profile::CexVenueProfile},
     swappers::mexc::mexc_adapter::MexcClient,
 };
 
@@ -20,6 +20,7 @@ pub async fn build_mexc_finalizer(
 
     Ok(Arc::new(
         CexVenueFinalizer::new_with_tunables(
+            CexVenueProfile::mexc(),
             mexc_client,
             ctx.trader_transfers.actions(),
             config.liquidator_principal,

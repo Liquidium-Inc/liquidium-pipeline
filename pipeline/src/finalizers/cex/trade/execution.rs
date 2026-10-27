@@ -99,7 +99,7 @@ where
             let pending = Self::prepare_pending_slice_request(state, leg, leg_idx, preview.chunk_in, buy_mode);
 
             // The exchange enforces the slippage cap with an IOC order. Only if
-            // MEXC refuses IOC outright does the slice go out as a market order.
+            // the exchange refuses IOC outright does the slice go out as a market order.
             let fill_report = self
                 .backend
                 .execute_swap_detailed_with_options(
@@ -132,7 +132,7 @@ where
                     // so the capital is never parked for this alone.
                     Self::persist_trade_progress(state, remaining_in, total_out);
                     warn!(
-                        "[mexc] liq_id={} {} {}: {} orders in a row filled nothing within the limit; retrying next cycle",
+                        "[cex] liq_id={} {} {}: {} orders in a row filled nothing within the limit; retrying next cycle",
                         state.liq_id, leg.market, leg.side, empty_fills_in_a_row
                     );
                     return Ok(None);
@@ -211,7 +211,7 @@ where
 
             // Emit slice execution log with route and quality context.
             info!(
-                "[mexc] liq_id={} trade leg {}/{} slice={} market={} side={} in={} out={} slippage_bps={:.2} preview_impact_bps={:.2}",
+                "[cex] liq_id={} trade leg {}/{} slice={} market={} side={} in={} out={} slippage_bps={:.2} preview_impact_bps={:.2}",
                 state.liq_id,
                 leg_idx + 1,
                 total_legs,

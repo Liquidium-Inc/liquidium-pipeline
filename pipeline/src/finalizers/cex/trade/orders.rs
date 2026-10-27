@@ -95,14 +95,14 @@ where
     /// Clears persisted pending state when it is:
     /// - tied to a different market/side tuple,
     /// - missing a client order id (legacy partial state),
-    /// - carrying an invalid client order id for MEXC.
+    /// - carrying an invalid client order id for the exchange.
     pub(super) fn sanitize_pending_trade_state_for_leg(state: &mut CexState, leg: &TradeLeg) {
         if state.trade.trade_pending_client_order_id.is_some()
             && (state.trade.trade_pending_market.as_deref() != Some(leg.market.as_str())
                 || state.trade.trade_pending_side.as_deref() != Some(leg.side.as_str()))
         {
             warn!(
-                "[mexc] liq_id={} clearing stale pending order state market={:?} side={:?}",
+                "[cex] liq_id={} clearing stale pending order state market={:?} side={:?}",
                 state.liq_id, state.trade.trade_pending_market, state.trade.trade_pending_side
             );
             Self::clear_pending_trade_order(state);
@@ -115,7 +115,7 @@ where
                 || state.trade.trade_pending_requested_in.is_some())
         {
             warn!(
-                "[mexc] liq_id={} clearing legacy pending state without client_order_id",
+                "[cex] liq_id={} clearing legacy pending state without client_order_id",
                 state.liq_id
             );
             Self::clear_pending_trade_order(state);
@@ -126,7 +126,7 @@ where
             && !Self::is_valid_client_order_id(existing)
         {
             warn!(
-                "[mexc] liq_id={} clearing invalid pending client_order_id={}",
+                "[cex] liq_id={} clearing invalid pending client_order_id={}",
                 state.liq_id, existing
             );
             Self::clear_pending_trade_order(state);

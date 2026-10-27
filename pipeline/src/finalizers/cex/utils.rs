@@ -34,8 +34,8 @@ pub(super) fn parse_market_symbols(market: &str) -> Option<(String, String)> {
     Some((base, quote))
 }
 
-/// Atomic decimals of a MEXC asset. A ck token has its native asset's decimals.
-pub(super) fn mexc_asset_decimals(symbol: &str) -> Option<u8> {
+/// Atomic decimals of an exchange asset. A ck token has its native asset's decimals.
+pub(super) fn asset_decimals(symbol: &str) -> Option<u8> {
     use liquidium_pipeline_core::types::protocol_types::{Asset, Assets};
     let symbol = symbol.to_ascii_uppercase();
     let native = symbol.strip_prefix("CK").unwrap_or(&symbol);
@@ -55,13 +55,13 @@ pub(super) fn mexc_asset_decimals(symbol: &str) -> Option<u8> {
 /// A slice amount in atomic units of its asset, for the execution record.
 /// An unknown asset keeps whole units, with a warning, so the record still completes.
 pub(super) fn slice_amount_to_nat(amount: f64, symbol: &str) -> candid::Nat {
-    let converted = mexc_asset_decimals(symbol)
-        .ok_or_else(|| format!("unknown MEXC asset {symbol}"))
+    let converted = asset_decimals(symbol)
+        .ok_or_else(|| format!("unknown asset {symbol}"))
         .and_then(|decimals| {
             liquidium_pipeline_connectors::backend::amount_utils::amount_to_nat_units_strict(amount, decimals)
         });
     converted.unwrap_or_else(|error| {
-        log::warn!("[mexc] slice amount {amount} {symbol} kept in whole units: {error}");
+        log::warn!("[cex] slice amount {amount} {symbol} kept in whole units: {error}");
         f64_to_nat(amount)
     })
 }

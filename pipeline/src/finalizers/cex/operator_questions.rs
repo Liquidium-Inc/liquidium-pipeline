@@ -1,4 +1,4 @@
-//! What a parked MEXC leg asks an operator, and where an answer is written.
+//! What a parked exchange leg asks an operator, and where an answer is written.
 //! Each park keeps its undecided action in one place of the leg state.
 use liquidium_pipeline_connectors::backend::{bridge_backend::BridgeRouteKind, cex_backend::CexBackend};
 
@@ -11,11 +11,11 @@ use crate::{
 /// Where the undecided action of a parked leg lives.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Undecided {
-    /// The send that funds the MEXC deposit.
+    /// The send that funds the exchange deposit.
     DepositFunding,
     /// The send to a bridge provider's deposit address.
     BridgeFunding,
-    /// The MEXC withdrawal request.
+    /// The exchange withdrawal request.
     Withdrawal,
     /// The provider call that bridges the deposit.
     BridgeCall,
@@ -43,7 +43,7 @@ fn open_questions<C: CexBackend>(state: &CexState) -> Vec<(Undecided, OperatorQu
     if let Some(record) = undecided(&state.deposit.deposit_funding) {
         questions.push((
             Undecided::DepositFunding,
-            send_question("MEXC deposit funding", record, "receipt"),
+            send_question("exchange deposit funding", record, "receipt"),
         ));
     }
     if let Some(record) = undecided(&state.withdraw.bridge.withdraw_bridge_funding) {
@@ -55,7 +55,7 @@ fn open_questions<C: CexBackend>(state: &CexState) -> Vec<(Undecided, OperatorQu
     if let Some(record) = undecided(&state.withdraw.withdraw_send) {
         questions.push((
             Undecided::Withdrawal,
-            send_question("MEXC withdrawal", record, "MEXC withdrawal id"),
+            send_question("exchange withdrawal", record, "exchange withdrawal id"),
         ));
     }
     if let Some(record) = undecided(&state.deposit.bridge.deposit_bridge_call) {
@@ -121,7 +121,7 @@ impl<C: CexBackend> CexVenueFinalizer<C> {
             Undecided::BridgeCall => &mut state.deposit.bridge.deposit_bridge_call,
             Undecided::DepositId => return record_deposit_id(state, answer),
         };
-        // The next run asks the chain or MEXC first, so the decision is used
+        // The next run asks the chain or the exchange first, so the decision is used
         // only while that answer stays open.
         send.as_mut()
             .ok_or_else(|| format!("open question has no saved state: {}", question.detail))?

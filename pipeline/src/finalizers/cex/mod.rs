@@ -3,6 +3,7 @@ pub mod finalizer;
 mod multi_venue_adapter;
 mod multi_venue_support;
 mod operator_questions;
+pub mod profile;
 mod route_preview;
 pub mod state;
 mod utils;

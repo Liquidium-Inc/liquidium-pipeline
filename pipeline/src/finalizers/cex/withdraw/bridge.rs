@@ -1,4 +1,4 @@
-//! The return bridge after a MEXC withdrawal: the deposit send to the
+//! The return bridge after an exchange withdrawal: the deposit send to the
 //! provider, the one-deposit-per-address wait, and the notice.
 use super::*;
 
@@ -36,7 +36,7 @@ where
             return Ok(false);
         };
         info!(
-            "[mexc] liq_id={} bridge deposit waits for liq_id={} on the same deposit address",
+            "[cex] liq_id={} bridge deposit waits for liq_id={} on the same deposit address",
             liq_id, other
         );
         Ok(true)
@@ -60,7 +60,7 @@ where
             .map(|send| send.liq_id))
     }
 
-    /// The return bridge route from the planned MEXC withdrawal to the final asset.
+    /// The return bridge route from the planned exchange withdrawal to the final asset.
     pub(in crate::finalizers::cex) fn withdraw_route(state: &CexState) -> Option<&'static BridgeRouteSpec> {
         resolve_route(
             &<Self as BridgePlanner>::planned_withdraw_asset(state),
@@ -93,7 +93,7 @@ where
                     Ok(bridge_send) => bridge_send,
                     // A busy bridge wallet is a wait. Nothing was signed.
                     Err(BridgeError::Deferred(error)) => {
-                        info!("[mexc] liq_id={} bridged withdraw deferred: {}", liq_id, error);
+                        info!("[cex] liq_id={} bridged withdraw deferred: {}", liq_id, error);
                         return Ok(());
                     }
                     Err(error) => return Err(error.into()),
@@ -113,7 +113,7 @@ where
                     {
                         funds.withdraw_bridge_reverts += 1;
                         warn!(
-                            "[mexc] liq_id={} bridge deposit send reverted; sending again ({}/{}): {}",
+                            "[cex] liq_id={} bridge deposit send reverted; sending again ({}/{}): {}",
                             liq_id, funds.withdraw_bridge_reverts, MAX_REVERTED_BRIDGE_RESUBMITS, reason
                         );
                         return Ok(());
@@ -122,7 +122,7 @@ where
                 };
             if let Some(receipt) = landed {
                 info!(
-                    "[mexc] liq_id={} bridge deposit send landed: receipt={} route={}@{}->{}",
+                    "[cex] liq_id={} bridge deposit send landed: receipt={} route={}@{}->{}",
                     liq_id, receipt, route.source_asset, route.source_chain, route.target_asset
                 );
                 funds.withdraw_bridge_funding_txid = Some(receipt);
@@ -146,7 +146,7 @@ where
         {
             DepositNotice::Accepted(submission) => {
                 info!(
-                    "[mexc] liq_id={} bridge deposit {} accepted: bridge_id={}",
+                    "[cex] liq_id={} bridge deposit {} accepted: bridge_id={}",
                     liq_id, receipt, submission.bridge_id
                 );
                 funds.withdraw_bridge_id = Some(submission.bridge_id);
@@ -161,7 +161,7 @@ where
                     )));
                 }
                 info!(
-                    "[mexc] liq_id={} bridge deposit {} not accepted yet: {}",
+                    "[cex] liq_id={} bridge deposit {} not accepted yet: {}",
                     liq_id, receipt, reason
                 );
                 Ok(())
@@ -169,7 +169,7 @@ where
         }
     }
 
-    /// A withdrawal that a bridge carries on: the MEXC withdrawal to the bridge
+    /// A withdrawal that a bridge carries on: the exchange withdrawal to the bridge
     /// source, then the bridge call or deposit send, then its status.
     pub(super) async fn withdraw_bridged(
         &self,
@@ -228,7 +228,7 @@ where
         self.poll_withdraw_bridge(state, bridge, route).await
     }
 
-    /// The MEXC withdrawal reached the bridge source: sizes the bridge amount
+    /// The exchange withdrawal reached the bridge source: sizes the bridge amount
     /// from the source balance and starts the bridge call or deposit send.
     #[allow(clippy::too_many_arguments)]
     async fn start_withdraw_bridge(
@@ -266,7 +266,7 @@ where
             .get_withdraw_status_snapshot_by_id(planned_asset, &withdraw_id)
             .await?;
         info!(
-            "[mexc] liq_id={} withdraw snapshot: withdraw_id={} status={:?} txid_present={} fee={:?}",
+            "[cex] liq_id={} withdraw snapshot: withdraw_id={} status={:?} txid_present={} fee={:?}",
             state.liq_id,
             withdraw_id,
             withdraw_snapshot.status,
@@ -278,7 +278,7 @@ where
             WithdrawStatus::Pending | WithdrawStatus::Unknown => {
                 if withdraw_snapshot.txid.is_some() {
                     info!(
-                        "[mexc] liq_id={} withdraw status={:?} but txid is present for withdraw_id={}; proceeding to source-balance bridge preflight",
+                        "[cex] liq_id={} withdraw status={:?} but txid is present for withdraw_id={}; proceeding to source-balance bridge preflight",
                         state.liq_id, withdraw_snapshot.status, withdraw_id
                     );
                 } else {
@@ -321,7 +321,7 @@ where
             })?;
             if adjusted_amount < bridge_amount {
                 info!(
-                    "[mexc] liq_id={} applying CEX withdraw fee to bridged amount: gross={} fee={} net={} asset={} network={} withdraw_id={}",
+                    "[cex] liq_id={} applying CEX withdraw fee to bridged amount: gross={} fee={} net={} asset={} network={} withdraw_id={}",
                     state.liq_id,
                     bridge_amount,
                     withdraw_fee,
@@ -352,7 +352,7 @@ where
                 let adjusted_source_available = (source_available - NATIVE_ETH_BRIDGEABLE_SAFETY_MARGIN).max(0.0);
                 if adjusted_source_available <= WITHDRAW_BRIDGE_SOURCE_BALANCE_TOLERANCE {
                     debug!(
-                        "[mexc] liq_id={} bridged native ETH withdraw waiting for source funding after safety margin: available={} adjusted={} expected={} tolerance={} source={} route={}@{}->{}",
+                        "[cex] liq_id={} bridged native ETH withdraw waiting for source funding after safety margin: available={} adjusted={} expected={} tolerance={} source={} route={}@{}->{}",
                         state.liq_id,
                         source_available,
                         adjusted_source_available,
@@ -367,7 +367,7 @@ where
                     return Ok(());
                 }
                 info!(
-                    "[mexc] liq_id={} bridged native ETH withdraw adjusting to bridgeable source balance: amount {} -> {} (source includes gas reserve; safety_margin={} tolerance={} source={} route={}@{}->{})",
+                    "[cex] liq_id={} bridged native ETH withdraw adjusting to bridgeable source balance: amount {} -> {} (source includes gas reserve; safety_margin={} tolerance={} source={} route={}@{}->{})",
                     state.liq_id,
                     bridge_amount,
                     adjusted_source_available,
@@ -381,7 +381,7 @@ where
                 bridge_amount = adjusted_source_available;
             } else {
                 debug!(
-                    "[mexc] liq_id={} bridged withdraw waiting for source funding: available={} expected={} tolerance={} source={} route={}@{}->{}",
+                    "[cex] liq_id={} bridged withdraw waiting for source funding: available={} expected={} tolerance={} source={} route={}@{}->{}",
                     state.liq_id,
                     source_available,
                     bridge_amount,
@@ -398,7 +398,7 @@ where
 
         if source_available < bridge_amount {
             info!(
-                "[mexc] liq_id={} adjusting bridged withdraw amount within source balance tolerance: amount {} -> {} (tolerance={} source={} route={}@{}->{})",
+                "[cex] liq_id={} adjusting bridged withdraw amount within source balance tolerance: amount {} -> {} (tolerance={} source={} route={}@{}->{})",
                 state.liq_id,
                 bridge_amount,
                 source_available,
@@ -442,7 +442,7 @@ where
             Ok(submission) => submission,
             // Same wait semantics as the deposit side: no budget spent.
             Err(BridgeError::Deferred(error)) => {
-                info!("[mexc] liq_id={} bridged withdraw deferred: {}", state.liq_id, error);
+                info!("[cex] liq_id={} bridged withdraw deferred: {}", state.liq_id, error);
                 state.step = CexStep::WithdrawPending;
                 return Ok(());
             }
@@ -549,7 +549,7 @@ where
                     )));
                 }
                 warn!(
-                    "[mexc] liq_id={} bridge deposit {} dropped by the provider, notifying again: {}",
+                    "[cex] liq_id={} bridge deposit {} dropped by the provider, notifying again: {}",
                     state.liq_id, bridge_id, reason
                 );
                 Ok(())
@@ -589,10 +589,10 @@ where
             state.liq_id
         );
         if waited < BRIDGE_CREDIT_STALL_SECS {
-            debug!("[mexc] {line}");
+            debug!("[cex] {line}");
             return Ok(());
         }
-        warn!("[mexc] {line} (past {BRIDGE_CREDIT_STALL_SECS}s)");
+        warn!("[cex] {line} (past {BRIDGE_CREDIT_STALL_SECS}s)");
         if unreadable.is_some() {
             return Err(line.into());
         }

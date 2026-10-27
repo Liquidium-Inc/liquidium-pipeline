@@ -16,7 +16,7 @@ use crate::{
     utils::now_ts,
 };
 
-/// Amount-scoped MEXC preview used by the thin multi-venue adapter. The full
+/// Amount-scoped CEX preview used by the thin multi-venue adapter. The full
 /// `CexState` remains the single execution state of the CEX step machine.
 pub(super) struct CexPreparedPreview {
     pub state: CexState,
@@ -129,16 +129,19 @@ where
         })
     }
 
-    /// Resolves the receive token required by MEXC's deposit/withdraw state and
+    /// Resolves the receive token required by the leg's deposit/withdraw state and
     /// validates that the request's exact pay allocation is internally sound.
     pub(super) fn prepare_swap_request(&self, execution_id: &str, request: &SwapRequest) -> Result<CexState, String> {
         if request.pay_amount.token.asset_id() != request.pay_asset {
-            return Err("MEXC request pay asset does not match pay amount token".to_string());
+            return Err(format!(
+                "{} request pay asset does not match pay amount token",
+                self.profile.name()
+            ));
         }
         let registry = self
             .token_registry
             .as_ref()
-            .ok_or_else(|| "MEXC multi-venue adapter requires a token registry".to_string())?;
+            .ok_or_else(|| "CEX multi-venue adapter requires a token registry".to_string())?;
         let receive_token = registry.resolve(&request.receive_asset)?;
         self.prepare_amount_scoped_state(
             execution_id,
@@ -194,7 +197,7 @@ where
                 let recv_amount = super::utils::slice_amount_to_nat(slice.amount_out, &recv_symbol);
 
                 SwapQuoteLeg {
-                    venue: "mexc".to_string(),
+                    venue: self.profile.venue_id().to_string(),
                     route_id: slice.market.clone(),
                     pay_chain: state.deposit.deposit_asset.chain(),
                     pay_symbol,
@@ -238,7 +241,10 @@ where
     ) -> Result<CexPreparedPreview, String> {
         let mut state = self.prepare_swap_request(execution_id, request)?;
         if state.size_in.value == Nat::from(0u8) {
-            return Err("MEXC cannot quote a non-positive pay amount".to_string());
+            return Err(format!(
+                "{} cannot quote a non-positive pay amount",
+                self.profile.name()
+            ));
         }
         if let Some(requested_bps) = request.max_slippage_bps {
             amount_after_bps_haircut(&Nat::from(0u8), requested_bps)?;
@@ -246,7 +252,10 @@ where
         let mut side_costs = Vec::new();
         let initial_amount = self.preview_trade_input(&state, &mut side_costs).await?;
         if initial_amount <= LIQUIDITY_EPS {
-            return Err("MEXC cannot quote a non-positive pay amount".to_string());
+            return Err(format!(
+                "{} cannot quote a non-positive pay amount",
+                self.profile.name()
+            ));
         }
         let legs = self
             .resolve_trade_legs_for_symbols(
@@ -299,7 +308,7 @@ where
             exec_price: execution_price,
             estimated_price_impact_bps: route_preview.price_impact_bps,
             legs: vec![SwapQuoteLeg {
-                venue: "mexc".to_string(),
+                venue: self.profile.venue_id().to_string(),
                 route_id,
                 pay_chain: state.size_in.token.chain(),
                 pay_symbol: state.size_in.token.symbol(),
@@ -317,7 +326,7 @@ where
         let conservative_haircut_bps = self
             .quote_route_fee_bps
             .checked_add(self.quote_delay_buffer_bps)
-            .ok_or_else(|| "MEXC conservative quote haircut overflowed u32".to_string())?;
+            .ok_or_else(|| "CEX conservative quote haircut overflowed u32".to_string())?;
         let conservative_value = amount_after_bps_haircut(&receive_amount.value, conservative_haircut_bps)?;
 
         Ok(CexPreparedPreview {
@@ -329,12 +338,15 @@ where
         })
     }
 
-    /// The amount that reaches MEXC to trade, sized as the deposit sizes it.
+    /// The amount that reaches the exchange to trade, sized as the deposit sizes it.
     async fn preview_trade_input(&self, state: &CexState, side_costs: &mut Vec<SideCost>) -> Result<f64, String> {
         if !state.deposit.bridge.deposit_bridge_required {
-            let (_, executable_pay) =
-                Self::compute_fee_adjusted_deposit_transfer(&state.deposit.deposit_asset, &state.size_in, false)
-                    .map_err(|error| error.to_string())?;
+            let (_, executable_pay) = Self::compute_fee_adjusted_deposit_transfer(
+                &state.deposit.deposit_asset,
+                &state.size_in,
+                self.deposit_fee_count(&state.deposit.deposit_asset, false),
+            )
+            .map_err(|error| error.to_string())?;
             return Ok(executable_pay.to_f64());
         }
         let bridge = self.bridge_runtime()?;
@@ -346,7 +358,7 @@ where
         Ok(arrival.expected_amount)
     }
 
-    /// What arrives as the final asset after MEXC's withdrawal fee and the
+    /// What arrives as the final asset after the exchange's withdrawal fee and the
     /// return bridge, as the withdrawal meets them.
     async fn preview_receive(
         &self,
@@ -360,10 +372,11 @@ where
             .backend
             .get_withdraw_terms(&planned_asset, &planned_network)
             .await?;
-        // MEXC refuses a smaller withdrawal, and the leg would end as dust.
+        // The exchange refuses a smaller withdrawal, and the leg would end as dust.
         if trade_out < terms.minimum {
             return Err(format!(
-                "MEXC {planned_asset} withdrawal of {trade_out} is below its minimum {}",
+                "{} {planned_asset} withdrawal of {trade_out} is below its minimum {}",
+                self.profile.name(),
                 terms.minimum
             ));
         }

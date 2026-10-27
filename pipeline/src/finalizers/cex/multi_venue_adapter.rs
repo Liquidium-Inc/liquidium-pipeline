@@ -20,9 +20,8 @@ use crate::{
     utils::now_ts,
 };
 
-const VENUE_ID: &str = "mexc";
 
-/// How long a leg keeps re-offering an order that MEXC rejects as not yet
+/// How long a leg keeps re-offering an order that the exchange rejects as not yet
 /// tradable before an operator has to look at it.
 ///
 /// Deposit credit and matching-engine availability are minutes apart on MEXC,
@@ -31,7 +30,7 @@ const VENUE_ID: &str = "mexc";
 /// an account that is genuinely short never resolves and must not loop forever.
 const SETTLEMENT_WAIT_TIMEOUT_SECS: i64 = 15 * 60;
 
-/// MEXC's complete venue-local state plus a persistence gate. The gate makes
+/// The exchange leg's complete venue-local state plus a persistence gate. The gate makes
 /// every call that may submit a transfer, order, withdrawal, or bridge request
 /// take two orchestrator cycles: first persist `ready_to_advance`, then execute.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -59,10 +58,10 @@ impl<B> CexVenueFinalizer<B>
 where
     B: CexBackend,
 {
-    /// Translates the amount-scoped MEXC preview into the generic venue shape;
-    /// all route preparation remains on the existing MEXC/CEX implementation.
+    /// Translates the amount-scoped CEX preview into the generic venue shape;
+    /// route preparation stays in the CEX machine.
     async fn preview_leg_request(&self, request: &SwapRequest) -> Result<VenueRoutePreview, String> {
-        let execution_id = crate::utils::new_venue_execution_id(VENUE_ID);
+        let execution_id = crate::utils::new_venue_execution_id(self.profile.venue_id());
         let preview = self.preview_swap_request(&execution_id, request).await?;
         let execution = CexVenueExecutionState {
             cex: preview.state,
@@ -75,30 +74,40 @@ where
             market_receive: Some(preview.market_receive),
             side_costs: preview.side_costs,
             ..VenueRoutePreview::new(
-                VENUE_ID,
+                self.profile.venue_id(),
                 request.clone(),
                 preview.quote,
                 preview.conservative_receive,
-                VenueExecutionState::new(VENUE_ID, &execution)?,
+                VenueExecutionState::new(self.profile.venue_id(), &execution)?,
             )
         })
     }
 
-    /// Decodes this leg only and verifies that its persisted MEXC allocation
+    /// Decodes this leg only and verifies that its persisted allocation
     /// still matches the immutable request committed by the parent plan.
     fn decode_leg_state(&self, leg: &VenueLegState) -> Result<CexVenueExecutionState, String> {
-        if leg.venue_id != VENUE_ID {
-            return Err(format!("MEXC adapter cannot advance venue `{}`", leg.venue_id));
+        if leg.venue_id != self.profile.venue_id() {
+            return Err(format!(
+                "{} adapter cannot advance venue `{}`",
+                self.profile.name(),
+                leg.venue_id
+            ));
         }
         let state = leg
             .execution
-            .decode::<CexVenueExecutionState>(VENUE_ID)?
-            .ok_or_else(|| "MEXC leg execution state decoded to the wrong venue".to_string())?;
+            .decode::<CexVenueExecutionState>(self.profile.venue_id())?
+            .ok_or_else(|| format!("{} leg execution state decoded to the wrong venue", self.profile.name()))?;
         if state.cex.size_in != leg.request.pay_amount {
-            return Err("MEXC persisted allocation does not match the leg request".to_string());
+            return Err(format!(
+                "{} persisted allocation does not match the leg request",
+                self.profile.name()
+            ));
         }
         if state.cex.withdraw.withdraw_asset.asset_id() != leg.request.receive_asset {
-            return Err("MEXC persisted receive asset does not match the leg request".to_string());
+            return Err(format!(
+                "{} persisted receive asset does not match the leg request",
+                self.profile.name()
+            ));
         }
         Ok(state)
     }
@@ -141,17 +150,17 @@ where
                 .cex
                 .last_error
                 .clone()
-                .unwrap_or_else(|| "MEXC leg requires operator reconciliation".to_string());
+                .unwrap_or_else(|| format!("{} leg requires operator reconciliation", self.profile.name()));
             return self.operator_required_progress(execution, error);
         }
 
         if !execution.ready_to_advance {
             execution.ready_to_advance = true;
-            let intent_id = crate::utils::new_venue_execution_id("mexc-intent");
+            let intent_id = crate::utils::new_venue_execution_id(&format!("{}-intent", self.profile.venue_id()));
             execution.intent_id = Some(intent_id.clone());
             self.multi_venue_armed_intents
                 .lock()
-                .map_err(|_| "MEXC multi-venue intent lock poisoned".to_string())?
+                .map_err(|_| "multi-venue intent lock poisoned".to_string())?
                 .insert(intent_id);
             return self.progress_for(execution, None);
         }
@@ -159,16 +168,19 @@ where
         let intent_id = execution
             .intent_id
             .clone()
-            .ok_or_else(|| "persisted MEXC execution gate has no intent ID".to_string())?;
+            .ok_or_else(|| "persisted CEX execution gate has no intent ID".to_string())?;
         let armed_here = self
             .multi_venue_armed_intents
             .lock()
-            .map_err(|_| "MEXC multi-venue intent lock poisoned".to_string())?
+            .map_err(|_| "multi-venue intent lock poisoned".to_string())?
             .remove(&intent_id);
         if !armed_here && !self.can_resume_by_polling(&mut execution.cex) {
             return self.operator_required_progress(
                 execution,
-                format!("persisted MEXC intent `{intent_id}` has ambiguous submission state after restart"),
+                format!(
+                    "persisted {} intent `{intent_id}` has ambiguous submission state after restart",
+                    self.profile.name()
+                ),
             );
         }
         execution.ready_to_advance = false;
@@ -206,7 +218,7 @@ where
             // spends no retry budget.
             Err(CexBackendError::Unreachable(message)) => {
                 warn!(
-                    "[mexc] liq_id={} venue unreachable at step={:?}: {}",
+                    "[cex] liq_id={} venue unreachable at step={:?}: {}",
                     execution.cex.liq_id, execution.cex.step, message
                 );
                 None
@@ -229,7 +241,7 @@ where
 
     /// Holds a leg whose funds the venue reports as not tradable yet.
     ///
-    /// Nothing failed here: MEXC accepted the deposit into the account balance
+    /// Nothing failed here: the exchange accepted the deposit into the account balance
     /// but its matching engine still refuses to trade it, and only the venue
     /// can say when that changes. The leg therefore keeps its `Running` status
     /// and reports no retryable error, so the orchestrator re-offers the same
@@ -246,11 +258,11 @@ where
 
         if waited < SETTLEMENT_WAIT_TIMEOUT_SECS {
             info!(
-                "[mexc] liq_id={} waiting for venue settlement: waited={}s timeout={}s err={}",
+                "[cex] liq_id={} waiting for venue settlement: waited={}s timeout={}s err={}",
                 execution.cex.liq_id, waited, SETTLEMENT_WAIT_TIMEOUT_SECS, error
             );
             return Ok(VenueLegProgress {
-                execution: VenueExecutionState::new(VENUE_ID, &execution)?,
+                execution: VenueExecutionState::new(self.profile.venue_id(), &execution)?,
                 status: VenueLegStatus::Running,
                 result: None,
                 last_error: Some(error),
@@ -268,17 +280,20 @@ where
             Err(balance_error) => format!("unavailable ({})", balance_error),
         };
         warn!(
-            "[mexc] liq_id={} venue settlement wait expired after {}s free_{}={} err={}",
+            "[cex] liq_id={} venue settlement wait expired after {}s free_{}={} err={}",
             execution.cex.liq_id, waited, asset, observed, error
         );
         self.operator_required_progress(
             execution,
-            format!("MEXC leg not settled after {waited}s: {error} (free {asset}={observed})"),
+            format!(
+                "{} leg not settled after {waited}s: {error} (free {asset}={observed})",
+                self.profile.name()
+            ),
         )
     }
 
     /// Maps the detailed CEX state onto the generic leg status and creates a
-    /// result only after this MEXC leg itself reaches `Completed`.
+    /// result only after this exchange leg itself reaches `Completed`.
     fn progress_for(
         &self,
         execution: CexVenueExecutionState,
@@ -306,7 +321,7 @@ where
             _ => error,
         };
         Ok(VenueLegProgress {
-            execution: VenueExecutionState::new(VENUE_ID, &execution)?,
+            execution: VenueExecutionState::new(self.profile.venue_id(), &execution)?,
             status,
             result,
             last_error,
@@ -323,7 +338,7 @@ where
         execution.operator_required = true;
         execution.cex.last_error = Some(error.clone());
         Ok(VenueLegProgress {
-            execution: VenueExecutionState::new(VENUE_ID, &execution)?,
+            execution: VenueExecutionState::new(self.profile.venue_id(), &execution)?,
             status: VenueLegStatus::OperatorRequired,
             result: None,
             last_error: Some(error),
@@ -339,12 +354,12 @@ where
     B: CexBackend + 'static,
 {
     fn venue_id(&self) -> &'static str {
-        VENUE_ID
+        self.profile.venue_id()
     }
 
     fn validate_configuration(&self) -> Result<(), String> {
         if self.token_registry.is_none() {
-            return Err("token registry is required for amount-scoped MEXC previews".to_string());
+            return Err("token registry is required for amount-scoped CEX previews".to_string());
         }
         Ok(())
     }
@@ -415,7 +430,7 @@ where
         let mut execution = self.decode_leg_state(leg)?;
         Self::answer_operator(&mut execution.cex, answer)?;
         execution.release_park();
-        VenueExecutionState::new(VENUE_ID, &execution)
+        VenueExecutionState::new(self.profile.venue_id(), &execution)
     }
 
     async fn recover(
@@ -425,7 +440,10 @@ where
     ) -> Result<VenueLegProgress, String> {
         let mut execution = self.decode_leg_state(leg)?;
         if execution.cex.step == CexStep::Completed {
-            return Err("completed MEXC leg does not require recovery".to_string());
+            return Err(format!(
+                "completed {} leg does not require recovery",
+                self.profile.name()
+            ));
         }
         // OperatorRequired rows are excluded from automatic WAL polling. An
         // explicit re-enqueue is therefore the operator's authorization to
@@ -446,7 +464,11 @@ where
                 CexStep::DepositPending | CexStep::TradePending | CexStep::WithdrawPending | CexStep::Failed
             )
         {
-            return Err(format!("MEXC leg at {:?} is not in recovery", execution.cex.step));
+            return Err(format!(
+                "{} leg at {:?} is not in recovery",
+                self.profile.name(),
+                execution.cex.step
+            ));
         }
         self.advance_decoded_leg(execution, checkpoint).await
     }

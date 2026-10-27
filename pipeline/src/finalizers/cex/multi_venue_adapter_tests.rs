@@ -20,6 +20,9 @@ use crate::{
     swappers::model::SwapRequest,
 };
 
+/// The venue id the MEXC profile writes into saved leg state.
+const VENUE_ID: &str = "mexc";
+
 struct NoopCheckpoint;
 
 fn planning_context() -> VenuePlanningContext {
@@ -495,7 +498,11 @@ async fn restart_polls_a_direct_deposit_then_gates_the_trade_separately() {
 
     // Confirmation must not submit an order; the trade needs a new durable gate.
     let progress = finalizer().advance_decoded_leg(execution, &NoopCheckpoint).await.unwrap();
-    let execution = progress.execution.decode::<CexVenueExecutionState>(VENUE_ID).unwrap().unwrap();
+    let execution = progress
+        .execution
+        .decode::<CexVenueExecutionState>(VENUE_ID)
+        .unwrap()
+        .unwrap();
     assert_eq!(execution.cex.step, CexStep::Trade);
     assert!(execution.ready_to_advance);
     assert!(execution.intent_id.is_some());
@@ -741,7 +748,11 @@ async fn restart_resumes_a_bridged_deposit_once_its_funding_transfer_is_durable(
             progress.status,
             if has_transfer { VenueLegStatus::Running } else { VenueLegStatus::OperatorRequired }
         );
-        let execution = progress.execution.decode::<CexVenueExecutionState>(VENUE_ID).unwrap().unwrap();
+        let execution = progress
+            .execution
+            .decode::<CexVenueExecutionState>(VENUE_ID)
+            .unwrap()
+            .unwrap();
         assert!(execution.cex.deposit.bridge.deposit_bridge_required);
         assert_eq!(execution.operator_required, !has_transfer);
         assert_eq!(
@@ -789,7 +800,11 @@ async fn restart_surfaces_a_failed_deposit_bridge_without_resubmitting() {
     assert_eq!(progress.status, VenueLegStatus::Running);
     let error = progress.retryable_error.expect("bridge failure is reported");
     assert!(error.contains("minter rejected the deposit"), "{error}");
-    let execution = progress.execution.decode::<CexVenueExecutionState>(VENUE_ID).unwrap().unwrap();
+    let execution = progress
+        .execution
+        .decode::<CexVenueExecutionState>(VENUE_ID)
+        .unwrap()
+        .unwrap();
     assert_eq!(execution.cex.step, CexStep::DepositPending);
     assert_eq!(execution.cex.deposit.bridge.deposit_bridge_id.as_deref(), Some("persisted-deposit-bridge"));
     assert!(!execution.operator_required);
@@ -821,7 +836,11 @@ async fn restart_direct_deposit_without_baseline_records_one_and_keeps_waiting()
     // records one and waits; the total-balance fallback needs elapsed time.
     assert_eq!(progress.status, VenueLegStatus::Running);
     assert!(progress.retryable_error.is_none());
-    let execution = progress.execution.decode::<CexVenueExecutionState>(VENUE_ID).unwrap().unwrap();
+    let execution = progress
+        .execution
+        .decode::<CexVenueExecutionState>(VENUE_ID)
+        .unwrap()
+        .unwrap();
     assert_eq!(execution.cex.step, CexStep::DepositPending);
     assert_eq!(execution.cex.deposit.deposit_balance_before, Some(1.0));
     assert!(execution.cex.deposit.deposit_sent_at_ts.is_some());
@@ -1134,7 +1153,10 @@ fn finalizer_with_trade_result(
 
 /// Places a committed leg on its trade step with one resolved USDT-quoted
 /// market, so the slice runner reaches the venue call without route discovery.
-async fn leg_at_trade_step(finalizer: &CexVenueFinalizer<MockCexBackend>, waiting_since_ts: Option<i64>) -> VenueLegState {
+async fn leg_at_trade_step(
+    finalizer: &CexVenueFinalizer<MockCexBackend>,
+    waiting_since_ts: Option<i64>,
+) -> VenueLegState {
     let preview = MultiVenueAdapter::preview(finalizer, &planning_context(), &request(100_000_000))
         .await
         .expect("preview should succeed");
@@ -1390,7 +1412,11 @@ mod bridged_deposit_restart {
     }
 
     fn decode(progress: &VenueLegProgress) -> CexVenueExecutionState {
-        progress.execution.decode::<CexVenueExecutionState>(VENUE_ID).unwrap().unwrap()
+        progress
+            .execution
+            .decode::<CexVenueExecutionState>(VENUE_ID)
+            .unwrap()
+            .unwrap()
     }
 
     #[tokio::test]
@@ -1570,13 +1596,21 @@ async fn a_saved_funding_transfer_resumes_after_a_restart_only_when_a_replay_is_
 
         if replay_safe {
             assert_eq!(progress.status, VenueLegStatus::Running);
-            let execution = progress.execution.decode::<CexVenueExecutionState>(VENUE_ID).unwrap().unwrap();
+            let execution = progress
+                .execution
+                .decode::<CexVenueExecutionState>(VENUE_ID)
+                .unwrap()
+                .unwrap();
             assert_eq!(execution.cex.deposit.deposit_txid.as_deref(), Some("block-4"));
         } else {
             // It may have gone out before the crash, so it is only read back.
             // A send that the chain cannot decide parks on the next cycle.
             assert_eq!(progress.status, VenueLegStatus::Running);
-            let execution = progress.execution.decode::<CexVenueExecutionState>(VENUE_ID).unwrap().unwrap();
+            let execution = progress
+                .execution
+                .decode::<CexVenueExecutionState>(VENUE_ID)
+                .unwrap()
+                .unwrap();
             assert!(matches!(
                 execution.cex.deposit.deposit_funding.unwrap().phase,
                 OutboundPhase::Submitted { .. }

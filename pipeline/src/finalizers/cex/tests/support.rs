@@ -242,7 +242,10 @@ pub(super) fn repayment_account() -> icrc_ledger_types::icrc1::account::Account 
 }
 
 /// The finalizer most tests use: an anonymous liquidator and the test tunables.
-pub(super) fn test_finalizer<C: CexBackend>(backend: Arc<C>, transfers: Arc<dyn TransferActions>) -> CexVenueFinalizer<C> {
+pub(super) fn test_finalizer<C: CexBackend>(
+    backend: Arc<C>,
+    transfers: Arc<dyn TransferActions>,
+) -> CexVenueFinalizer<C> {
     CexVenueFinalizer::new(
         backend,
         transfers,

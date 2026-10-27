@@ -1660,14 +1660,14 @@ async fn mexc_approval_bump_retries_after_first_batch_failure_and_then_short_cir
         fee: Nat::from(1_000u64),
     };
 
-    let first = finalizer.maybe_bump_mexc_approval("liq-first-batch", &asset).await;
+    let first = finalizer.maybe_bump_approval("liq-first-batch", &asset).await;
     assert_eq!(first, 1);
 
-    let second = finalizer.maybe_bump_mexc_approval("liq-first-batch", &asset).await;
+    let second = finalizer.maybe_bump_approval("liq-first-batch", &asset).await;
     assert_eq!(second, 6);
 
     // After a full success the same liq_id should short-circuit and do no approvals.
-    let third = finalizer.maybe_bump_mexc_approval("liq-first-batch", &asset).await;
+    let third = finalizer.maybe_bump_approval("liq-first-batch", &asset).await;
     assert_eq!(third, 0);
 
     assert_eq!(*approve_call_count.lock().unwrap(), 8);

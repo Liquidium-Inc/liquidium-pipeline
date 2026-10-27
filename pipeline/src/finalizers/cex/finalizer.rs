@@ -25,7 +25,8 @@ use log::{debug, info, warn};
 use tokio::sync::Mutex as TokioMutex;
 use tokio::time::sleep;
 
-use super::utils::{LIQUIDITY_EPS, SlicePreview, TradeLeg, is_usd_stable_symbol, mexc_special_trade_legs};
+use super::profile::CexVenueProfile;
+use super::utils::{LIQUIDITY_EPS, SlicePreview, TradeLeg, is_usd_stable_symbol};
 use liquidium_pipeline_connectors::outbound::{AcceptedWithdrawal, CexWithdrawals, WithdrawRequest, prepare_cex_withdraw};
 
 pub(super) const WITHDRAW_BRIDGE_SOURCE_BALANCE_TOLERANCE: f64 = LIQUIDITY_EPS;
@@ -33,7 +34,7 @@ const NATIVE_ETH_BRIDGEABLE_SAFETY_MARGIN: f64 = 1e-15;
 pub(super) const BRIDGE_FEE_TOKEN_SYMBOL: &str = "ckETH";
 pub(super) const BRIDGE_FEE_TOKEN_CHAIN: &str = "ICP";
 pub(super) const CKETH_DECIMALS: u8 = 18;
-/// A direct withdrawal that MEXC accepted but never reports as delivered
+/// A direct withdrawal that the exchange accepted but never reports as delivered
 /// must not wait forever. After this long the row parks for an operator.
 const DIRECT_WITHDRAW_DELIVERY_TIMEOUT_SECS: i64 = 60 * 60;
 /// How long a landed bridge deposit may wait for the provider to accept it.
@@ -51,11 +52,11 @@ use crate::{
     finalizers::cex::state::{CexState, CexStep},
     outbound::driver::{OutboundError, OutboundRecord, step_outbound},
     stages::bridge_submit_lock::acquire_bridge_submit_lock,
-    swappers::mexc::orderbook_quote::{simulate_buy_from_asks, simulate_sell_from_bids},
+    swappers::orderbook_quote::{simulate_buy_from_asks, simulate_sell_from_bids},
     utils::{ICP_LEDGER_PRINCIPAL, now_ts},
 };
 
-// MEXC-specific implementation of the generic CEX finalizer logic.
+// The CEX step machine. `profile` holds what differs between exchanges.
 //
 // This is a thin state machine wrapper around the generic `CexState`:
 // - `prepare` initializes the state from a liquidation id / receipt plus static config
@@ -67,6 +68,8 @@ where
     C: CexBackend,
 {
     pub backend: Arc<C>,
+    /// The exchange this machine runs against.
+    pub profile: CexVenueProfile,
     pub transfer_service: Arc<dyn TransferActions>,
     /// Sends from the trader account that are saved before they run. Funding
     /// transfers go through it; it defaults to plain sends over `transfer_service`.
@@ -86,9 +89,9 @@ where
     /// Enables inverse buy fallback after truncation.
     pub cex_buy_inverse_enabled: bool,
     /// Configured market universe used for route graph search.
-    pub cex_mexc_available_pairs: Vec<String>,
+    pub available_pairs: Vec<String>,
     /// Maximum intermediate hops allowed in graph-based route discovery.
-    pub cex_mexc_max_hops: usize,
+    pub max_hops: usize,
     /// Extra end-to-end route costs included in conservative planner output.
     pub quote_route_fee_bps: u32,
     /// Price-move buffer for deposit/trade/withdraw latency.
@@ -116,6 +119,8 @@ const DEFAULT_ORDERBOOK_LIMIT: u32 = 50;
 /// Number of binary-search iterations for max-slice estimation.
 const SLICE_SEARCH_STEPS: usize = 24;
 pub const APPROVE_BUMP_MAX_COUNT: u8 = 6;
+/// A bridged deposit sends no approval bumps, so only its transfer fee is held back.
+const BRIDGED_DEPOSIT_FEE_COUNT: u8 = 1;
 const APPROVE_BUMP_BATCH_SIZE: u8 = 3;
 const APPROVE_BUMP_DELAY_MS: u64 = 300;
 const APPROVE_BUMP_BATCH_DELAY_SECS: u64 = 3;
@@ -127,16 +132,16 @@ const DEFAULT_BUY_INVERSE_OVERSPEND_BPS: u32 = 10;
 const DEFAULT_BUY_INVERSE_MAX_RETRIES: u32 = 1;
 #[allow(dead_code)]
 const DEFAULT_BUY_INVERSE_ENABLED: bool = true;
-const DEFAULT_MEXC_MAX_HOPS: usize = 2;
-const MAX_MEXC_MAX_HOPS: usize = 4;
+const DEFAULT_MAX_HOPS: usize = 2;
+const MAX_HOPS_CAP: usize = 4;
 
 impl<C> CexVenueFinalizer<C>
 where
     C: CexBackend,
 {
     pub fn with_route_config(mut self, available_pairs: Vec<String>, max_hops: usize) -> Self {
-        self.cex_mexc_available_pairs = Self::normalize_market_pairs(available_pairs);
-        self.cex_mexc_max_hops = max_hops.min(MAX_MEXC_MAX_HOPS);
+        self.available_pairs = Self::normalize_market_pairs(available_pairs);
+        self.max_hops = max_hops.min(MAX_HOPS_CAP);
         self
     }
 
@@ -145,7 +150,7 @@ where
         self
     }
 
-    /// The bridge runtime, for routes whose MEXC leg moves through a bridge.
+    /// The bridge runtime, for routes whose exchange leg moves through a bridge.
     pub(super) fn bridge_runtime(&self) -> Result<&BridgeRuntime, String> {
         self.bridge
             .as_deref()
@@ -168,8 +173,8 @@ where
         self
     }
 
-    // used in tests
-    #[allow(unused)]
+    /// A MEXC machine with default tunables, for tests.
+    #[cfg(test)]
     pub fn new(
         backend: Arc<C>,
         transfer_service: Arc<dyn TransferActions>,
@@ -179,6 +184,7 @@ where
         cex_slice_target_ratio: f64,
     ) -> Self {
         Self::new_with_tunables(
+            CexVenueProfile::mexc(),
             backend,
             transfer_service,
             liquidator_principal,
@@ -194,6 +200,7 @@ where
 
     #[allow(clippy::too_many_arguments)]
     pub fn new_with_tunables(
+        profile: CexVenueProfile,
         backend: Arc<C>,
         transfer_service: Arc<dyn TransferActions>,
         liquidator_principal: Principal,
@@ -207,6 +214,7 @@ where
     ) -> Self {
         Self {
             backend,
+            profile,
             outbound: Arc::new(UnsettledSender::new(transfer_service.clone())),
             transfer_service,
             liquidator_principal,
@@ -217,8 +225,8 @@ where
             cex_buy_inverse_overspend_bps,
             cex_buy_inverse_max_retries,
             cex_buy_inverse_enabled,
-            cex_mexc_available_pairs: vec![],
-            cex_mexc_max_hops: DEFAULT_MEXC_MAX_HOPS,
+            available_pairs: vec![],
+            max_hops: DEFAULT_MAX_HOPS,
             quote_route_fee_bps: 0,
             quote_delay_buffer_bps: 0,
             bridge: None,
@@ -259,7 +267,7 @@ mod withdraw_bridge;
 mod withdraw_direct;
 
 pub(super) use sizing::{BridgeDepositSizing, BridgedDepositArrival};
-pub use withdraw_direct::mexc_withdraw_order_id;
+pub use withdraw_direct::withdraw_order_id;
 
 /// Builds a leg's state from a liquidation receipt, as tests set legs up.
 #[cfg(test)]
@@ -306,7 +314,7 @@ where
         let planned_network = <Self as BridgePlanner>::planned_deposit_network(state);
 
         debug!(
-            "[mexc] liq_id={} step=Deposit source_asset={} source_network={} cex_asset={} cex_network={} bridge_required={}",
+            "[cex] liq_id={} step=Deposit source_asset={} source_network={} cex_asset={} cex_network={} bridge_required={}",
             state.liq_id,
             state.deposit.deposit_asset,
             state.deposit.deposit_asset.chain(),
@@ -338,7 +346,7 @@ where
 
         // 1) Trace function entry with the currently persisted trade snapshot.
         debug!(
-            "[mexc] liq_id={} step=Trade market={} side={} size_in={}",
+            "[cex] liq_id={} step=Trade market={} side={} size_in={}",
             state.liq_id,
             state.market,
             state.side,
@@ -353,7 +361,7 @@ where
 
         // 4) Log explicit multi-hop route details when applicable.
         if legs.len() > 1 {
-            debug!("[mexc] liq_id={} multi-hop route: {:?}", state.liq_id, legs);
+            debug!("[cex] liq_id={} multi-hop route: {:?}", state.liq_id, legs);
         }
 
         // 5) For one-leg routes, normalize state market/side to the resolved leg.
@@ -385,7 +393,7 @@ where
         //     input spent. Its output feeds the next leg; only the last leg ends the route.
         if amount_in <= LIQUIDITY_EPS {
             debug!(
-                "[mexc] liq_id={} trade leg {}/{} has nothing left to trade: amount_in={}",
+                "[cex] liq_id={} trade leg {}/{} has nothing left to trade: amount_in={}",
                 state.liq_id,
                 idx + 1,
                 legs.len(),
@@ -404,7 +412,7 @@ where
 
         // 13) Log leg-level execution start.
         debug!(
-            "[mexc] liq_id={} trade leg {}/{} market={} side={} amount_in={}",
+            "[cex] liq_id={} trade leg {}/{} market={} side={} amount_in={}",
             state.liq_id,
             idx + 1,
             legs.len(),
@@ -435,7 +443,7 @@ where
 
         // 15) Emit end-of-leg summary including residual and dust info.
         info!(
-            "[mexc] liq_id={} trade leg {}/{} completed market={} side={} amount_in={} amount_out={} residual_in={} dust_skipped={} dust_usd={:?}",
+            "[cex] liq_id={} trade leg {}/{} completed market={} side={} amount_in={} amount_out={} residual_in={} dust_skipped={} dust_usd={:?}",
             state.liq_id,
             idx + 1,
             legs.len(),
@@ -461,7 +469,7 @@ where
         let planned_network = <Self as BridgePlanner>::planned_withdraw_network(state);
 
         debug!(
-            "[mexc] liq_id={} step={:?} source_asset={} source_network={} final_asset={} final_network={} withdraw_address={} bridge_required={}",
+            "[cex] liq_id={} step={:?} source_asset={} source_network={} final_asset={} final_network={} withdraw_address={} bridge_required={}",
             state.liq_id,
             state.step,
             planned_asset,

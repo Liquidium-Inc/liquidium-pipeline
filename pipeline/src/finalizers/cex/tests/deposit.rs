@@ -135,7 +135,7 @@ async fn mexc_deposit_phase_a_rejects_invalid_evm_deposit_address() {
     let mut state = finalizer.prepare("44", &receipt).await.expect("prepare should succeed");
 
     let err = finalizer.deposit(&mut state).await.expect_err("deposit should fail");
-    assert!(err.to_string().contains("invalid MEXC EVM deposit address"));
+    assert!(err.to_string().contains("invalid exchange EVM deposit address"));
 }
 
 #[tokio::test]
@@ -793,11 +793,11 @@ async fn mexc_approval_bump_second_batch_failure_does_not_mark_as_completed() {
         fee: Nat::from(1_000u64),
     };
 
-    let first = finalizer.maybe_bump_mexc_approval("liq-second-batch", &asset).await;
+    let first = finalizer.maybe_bump_approval("liq-second-batch", &asset).await;
     assert_eq!(first, 4);
 
     // If first call had marked completion, this would have returned 0 with no approve call.
-    let second = finalizer.maybe_bump_mexc_approval("liq-second-batch", &asset).await;
+    let second = finalizer.maybe_bump_approval("liq-second-batch", &asset).await;
     assert_eq!(second, 0);
 
     assert_eq!(*approve_call_count.lock().unwrap(), 6);

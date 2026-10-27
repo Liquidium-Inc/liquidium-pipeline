@@ -6,7 +6,7 @@ impl<C> CexVenueFinalizer<C>
 where
     C: CexBackend,
 {
-    /// The bridge route from the collateral to the asset MEXC receives.
+    /// The bridge route from the collateral to the asset the exchange receives.
     pub(in crate::finalizers::cex) fn deposit_route(
         state: &CexState,
         planned_asset: &str,
@@ -54,7 +54,7 @@ where
         self.poll_deposit_bridge(state, bridge).await
     }
 
-    /// Reads the bridge status. A completed bridge hands over to the MEXC
+    /// Reads the bridge status. A completed bridge hands over to the exchange
     /// balance check; a failed or canceled bridge returns an error.
     async fn poll_deposit_bridge(&self, state: &mut CexState, bridge: &BridgeRuntime) -> Result<(), CexBackendError> {
         state.deposit.bridge.deposit_bridge_polled_at_ts = Some(now_ts());

@@ -55,7 +55,7 @@ impl BridgedDeposit<'_> {
         let required_source_available = requested + fee_budget.source_fee_budget;
         if source_available + WITHDRAW_BRIDGE_SOURCE_BALANCE_TOLERANCE < required_source_available {
             debug!(
-                "[mexc] liq_id={} bridged deposit waiting for source funding: available={} expected={} tolerance={} source={} route={}@{}->{}",
+                "[cex] liq_id={} bridged deposit waiting for source funding: available={} expected={} tolerance={} source={} route={}@{}->{}",
                 liq_id,
                 source_available,
                 required_source_available,
@@ -70,7 +70,7 @@ impl BridgedDeposit<'_> {
 
         let amount = if source_available < requested {
             info!(
-                "[mexc] liq_id={} adjusting bridged deposit amount within source balance tolerance: amount {} -> {} (tolerance={} source={} route={}@{}->{})",
+                "[cex] liq_id={} adjusting bridged deposit amount within source balance tolerance: amount {} -> {} (tolerance={} source={} route={}@{}->{})",
                 liq_id,
                 requested,
                 source_available,
@@ -96,7 +96,7 @@ impl BridgedDeposit<'_> {
                 .await?;
             if fee_available + WITHDRAW_BRIDGE_SOURCE_BALANCE_TOLERANCE < required_fee_budget {
                 debug!(
-                    "[mexc] liq_id={} bridged deposit waiting for fee funding: available={} expected={} tolerance={} source={} fee_asset={}@{} route={}@{}->{}",
+                    "[cex] liq_id={} bridged deposit waiting for fee funding: available={} expected={} tolerance={} source={} fee_asset={}@{} route={}@{}->{}",
                     liq_id,
                     fee_available,
                     required_fee_budget,
@@ -155,7 +155,7 @@ where
             // A busy bridge wallet is a wait. The next cycle measures the
             // funds again and saves a new call.
             Err(OutboundError::Deferred(error)) => {
-                info!("[mexc] liq_id={} bridged deposit deferred: {}", state.liq_id, error);
+                info!("[cex] liq_id={} bridged deposit deferred: {}", state.liq_id, error);
                 Ok(())
             }
             Err(error) => Err(error.into()),
@@ -209,7 +209,7 @@ where
         };
         call.cursor = deposit.bridge.backend.prepare_submission(&call.request()?).await?;
         info!(
-            "[mexc] liq_id={} bridged deposit funded; call saved amount={} destination={} cursor={:?}",
+            "[cex] liq_id={} bridged deposit funded; call saved amount={} destination={} cursor={:?}",
             state.liq_id, call.amount, call.destination, call.cursor
         );
         let id = crate::utils::new_venue_execution_id("bridge-call");

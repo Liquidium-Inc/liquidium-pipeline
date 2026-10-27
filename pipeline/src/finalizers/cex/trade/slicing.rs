@@ -280,7 +280,7 @@ where
         state.trade.trade_dust_skipped = true;
         state.trade.trade_dust_usd = Some(residual_usd);
         info!(
-            "[mexc] liq_id={} dust skipped market={} side={} residual_in={} residual_usd={}",
+            "[cex] liq_id={} dust skipped market={} side={} residual_in={} residual_usd={}",
             state.liq_id, leg.market, leg.side, remaining_in, residual_usd
         );
         Ok(true)

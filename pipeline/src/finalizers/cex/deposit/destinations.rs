@@ -1,4 +1,4 @@
-//! Deposit and withdrawal addresses on the ledgers MEXC uses: native ICP
+//! Deposit and withdrawal addresses on the ledgers the exchange uses: native ICP
 //! account ids, ICRC accounts and the per-network deposit destination.
 use super::*;
 
@@ -36,7 +36,7 @@ where
         if requested_destination.is_empty() {
             return Ok(Self::principal_default_account_id_hex(self.liquidator_principal));
         }
-        if let Ok(account_id) = Self::validate_icp_account_id_hex(requested_destination, "MEXC withdraw") {
+        if let Ok(account_id) = Self::validate_icp_account_id_hex(requested_destination, "exchange withdraw") {
             return Ok(account_id);
         }
 
@@ -53,7 +53,7 @@ where
         let destination = address.trim();
         if destination.is_empty() {
             return Err(format!(
-                "invalid MEXC deposit address for network '{}': address is empty",
+                "invalid exchange deposit address for network '{}': address is empty",
                 planned_network
             ));
         }
@@ -62,18 +62,18 @@ where
             ChainToken::Icp { .. } => {
                 if !planned_network.eq_ignore_ascii_case("ICP") {
                     return Err(format!(
-                        "unsupported MEXC deposit network '{}' for ICP asset {}; expected ICP",
+                        "unsupported exchange deposit network '{}' for ICP asset {}; expected ICP",
                         planned_network,
                         token.symbol()
                     ));
                 }
                 if Self::is_native_icp_token(token) {
-                    let account_id_hex = Self::validate_icp_account_id_hex(destination, "MEXC ICP deposit")?;
+                    let account_id_hex = Self::validate_icp_account_id_hex(destination, "exchange ICP deposit")?;
                     return Ok(ChainAccount::IcpLedger(account_id_hex));
                 }
                 let owner = Principal::from_text(destination).map_err(|e| {
                     format!(
-                        "invalid MEXC ICP deposit address '{}' for network '{}': {e}",
+                        "invalid exchange ICP deposit address '{}' for network '{}': {e}",
                         destination, planned_network
                     )
                 })?;
@@ -85,21 +85,21 @@ where
             ChainToken::EvmNative { .. } | ChainToken::EvmErc20 { .. } => {
                 if planned_network.eq_ignore_ascii_case("ICP") {
                     return Err(format!(
-                        "unsupported MEXC deposit network '{}' for EVM asset {}; expected EVM-compatible network",
+                        "unsupported exchange deposit network '{}' for EVM asset {}; expected EVM-compatible network",
                         planned_network,
                         token.symbol()
                     ));
                 }
                 let evm_address = destination.parse::<EvmAddress>().map_err(|e| {
                     format!(
-                        "invalid MEXC EVM deposit address '{}' for network '{}': {e}",
+                        "invalid exchange EVM deposit address '{}' for network '{}': {e}",
                         destination, planned_network
                     )
                 })?;
                 Ok(ChainAccount::Evm(evm_address.to_string()))
             }
             ChainToken::SolanaNative { .. } | ChainToken::SolanaSpl { .. } => Err(format!(
-                "unsupported MEXC deposit network '{}' for Solana asset {}; Solana settlement is not wired yet",
+                "unsupported exchange deposit network '{}' for Solana asset {}; Solana settlement is not wired yet",
                 planned_network,
                 token.symbol()
             )),

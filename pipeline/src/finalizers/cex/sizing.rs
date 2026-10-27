@@ -10,12 +10,12 @@ pub(in crate::finalizers::cex) struct BridgeDepositSizing {
     pub fee_budget: BridgeFeeBudget,
 }
 
-/// A bridged deposit from funding to the amount MEXC should see arrive.
+/// A bridged deposit from funding to the amount the exchange should see arrive.
 pub(in crate::finalizers::cex) struct BridgedDepositArrival {
     pub sizing: BridgeDepositSizing,
     /// What the bridge call sends.
     pub submit_amount: f64,
-    /// What reaches MEXC after the route's destination fee.
+    /// What reaches the exchange after the route's destination fee.
     pub expected_amount: f64,
 }
 
@@ -124,7 +124,7 @@ where
         size_in: &ChainTokenAmount,
     ) -> Result<BridgeDepositSizing, CexBackendError> {
         let (transfer_value, mut bridge_amount) =
-            Self::compute_fee_adjusted_deposit_transfer(deposit_asset, size_in, true)?;
+            Self::compute_fee_adjusted_deposit_transfer(deposit_asset, size_in, BRIDGED_DEPOSIT_FEE_COUNT)?;
         let fee_budget = bridge
             .backend
             .get_fee_budget(route.source_asset, route.source_chain, route.target_asset)
@@ -147,7 +147,7 @@ where
         })
     }
 
-    /// Sizes a bridged deposit through to its MEXC arrival. The preview and
+    /// Sizes a bridged deposit through to its exchange arrival. The preview and
     /// the deposit both use this, so a quote counts the fees execution pays.
     pub(in crate::finalizers::cex) async fn bridged_deposit_arrival(
         bridge: &BridgeRuntime,
