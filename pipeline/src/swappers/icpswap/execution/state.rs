@@ -44,6 +44,7 @@ impl IcpswapState {
             schema_version: ICPSWAP_STATE_VERSION,
             step: IcpswapStep::Funding,
             operator_pending_step: None,
+            operator_answer: None,
             last_error: None,
             next_attempt_at_nanos: None,
             plan,

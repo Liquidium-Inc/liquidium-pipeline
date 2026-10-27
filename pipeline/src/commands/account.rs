@@ -1,6 +1,5 @@
 use icrc_ledger_types::icrc1::account::Account;
 
-use liquidium_pipeline_connectors::account::icp_account::RECOVERY_ACCOUNT;
 use std::fs::{self, OpenOptions};
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
@@ -16,7 +15,7 @@ use solana_sdk::{signature::Keypair, signer::Signer};
 use prettytable::{Cell, Row, Table, format};
 use tracing::info;
 
-use crate::config::Config;
+use crate::config::{Config, ConfigTrait};
 use crate::output::plain_logs_enabled;
 
 /// One address the pipeline signs for or receives on.
@@ -32,6 +31,8 @@ pub struct AddressEntry {
 pub struct AddressBook {
     pub liquidator_principal: Principal,
     pub trader_principal: Principal,
+    /// The account the daemon's recovery sweep pays into.
+    pub recovery_account: Account,
     pub trader_evm: Result<String, String>,
     pub trader_solana: String,
     pub bridge_principal: Principal,
@@ -56,6 +57,7 @@ impl AddressBook {
         Self {
             liquidator_principal: config.liquidator_principal,
             trader_principal: config.trader_principal,
+            recovery_account: config.get_recovery_account(),
             trader_evm,
             trader_solana: Keypair::new_from_array(config.solana_private_key_bytes)
                 .pubkey()
@@ -71,10 +73,6 @@ impl AddressBook {
 
     pub fn entries(&self) -> Vec<AddressEntry> {
         let entry = |role, chain, address: String| AddressEntry { role, chain, address };
-        let recovery = Account {
-            owner: self.liquidator_principal,
-            subaccount: Some(*RECOVERY_ACCOUNT),
-        };
         let trader_evm = match &self.trader_evm {
             Ok(address) => address.clone(),
             Err(reason) => format!("({reason})"),
@@ -82,9 +80,9 @@ impl AddressBook {
         vec![
             entry("Liquidator", "ICP principal", self.liquidator_principal.to_string()),
             entry("Liquidator", "ICP account id", icp_account_id(self.liquidator_principal)),
-            entry("Liquidator recovery", "ICP account", recovery.to_string()),
             entry("Trader", "ICP principal", self.trader_principal.to_string()),
             entry("Trader", "ICP account id", icp_account_id(self.trader_principal)),
+            entry("Trader recovery", "ICP account", self.recovery_account.to_string()),
             entry("Trader", "EVM", trader_evm),
             entry("Trader", "Solana", self.trader_solana.clone()),
             entry("Bridge", "ICP principal", self.bridge_principal.to_string()),
@@ -196,6 +194,8 @@ pub async fn new() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use liquidium_pipeline_connectors::account::icp_account::RECOVERY_ACCOUNT;
+
     use super::*;
 
     #[test]
@@ -203,6 +203,10 @@ mod tests {
         let book = AddressBook {
             liquidator_principal: Principal::management_canister(),
             trader_principal: Principal::anonymous(),
+            recovery_account: Account {
+                owner: Principal::anonymous(),
+                subaccount: Some(*RECOVERY_ACCOUNT),
+            },
             trader_evm: Err("invalid EVM private key in config".into()),
             trader_solana: "So11111111111111111111111111111111111111112".into(),
             bridge_principal: Principal::from_text("xeefw-xlb5n-2hfz2-35dam-x6lxm-v2fsu-faxj6-4tbgi-mpwir-pqa4s-mae")
@@ -217,7 +221,11 @@ mod tests {
         let roles: Vec<&str> = entries.iter().map(|e| e.role).collect();
         assert_eq!(roles.iter().filter(|r| **r == "Trader").count(), 4);
         assert_eq!(roles.iter().filter(|r| **r == "Bridge").count(), 5);
-        assert!(entries.iter().any(|e| e.role == "Liquidator recovery" && e.address.contains('.')));
+        // The sweep pays into the trader's subaccount, not the liquidator's.
+        let recovery = entries.iter().find(|e| e.role == "Trader recovery").unwrap();
+        assert_eq!(recovery.address, book.recovery_account.to_string());
+        assert!(recovery.address.starts_with(&book.trader_principal.to_text()));
+        assert!(!entries.iter().any(|e| e.role == "Liquidator recovery"));
         let trader_evm = entries.iter().find(|e| e.role == "Trader" && e.chain == "EVM").unwrap();
         assert_eq!(trader_evm.address, "(invalid EVM private key in config)");
         let bridge_icp_id = entries

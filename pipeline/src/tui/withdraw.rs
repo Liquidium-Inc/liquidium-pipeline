@@ -6,6 +6,7 @@ use alloy::primitives::Address as EvmAddress;
 use alloy::providers::{Provider, ProviderBuilder};
 use alloy::signers::local::PrivateKeySigner;
 use candid::Nat;
+use chrono::Local;
 use icrc_ledger_types::icrc1::account::Account;
 use num_traits::ToPrimitive;
 use solana_client::nonblocking::rpc_client::RpcClient;
@@ -17,15 +18,15 @@ use crate::config::ConfigTrait;
 use crate::swappers::mexc::mexc_adapter::MexcClient;
 use crate::finalizers::bridge_planner::cex_network_from_destination_kind;
 use liquidium_pipeline_connectors::backend::bridge_backend::resolve_reverse_route_by_source;
-use liquidium_pipeline_connectors::backend::cex_backend::CexBackend;
+use liquidium_pipeline_connectors::backend::cex_backend::{CexBackend, DepositAddress};
 use liquidium_pipeline_core::account::model::ChainAccount;
 use liquidium_pipeline_core::tokens::asset_id::AssetId;
 use liquidium_pipeline_core::tokens::chain_token::ChainToken;
+use liquidium_pipeline_core::tokens::chain_token_amount::decimal_to_units;
 use liquidium_pipeline_core::tokens::token_registry::TokenRegistryTrait;
 
 use super::app::{App, BalancesPanel, WithdrawAccountKind, WithdrawDestinationKind, WithdrawField};
 use super::events::UiEvent;
-use super::format;
 
 const EVM_NATIVE_GAS_BUFFER_WEI: u128 = 200_000_000_000_000;
 const EVM_NATIVE_TRANSFER_GAS_LIMIT: u128 = 21_000;
@@ -232,6 +233,8 @@ fn request_mexc_deposit_address(
         app.deposit.at = None;
     }
 
+    app.deposit.request += 1;
+    let request = app.deposit.request;
     app.deposit.in_flight = true;
     app.deposit.asset = Some(asset.clone());
     app.deposit.network = Some(network.clone());
@@ -252,14 +255,36 @@ fn request_mexc_deposit_address(
         let client = match MexcClient::from_env() {
             Ok(v) => v,
             Err(e) => {
-                let _ = ui_tx.send(UiEvent::Deposit(Err(e)));
+                let _ = ui_tx.send(UiEvent::Deposit {
+                    request,
+                    result: Err(e),
+                });
                 return;
             }
         };
 
-        let res = client.get_deposit_address(&mexc_asset, &network).await;
-        let _ = ui_tx.send(UiEvent::Deposit(res));
+        let result = client.get_deposit_address(&mexc_asset, &network).await;
+        let _ = ui_tx.send(UiEvent::Deposit { request, result });
     });
+}
+
+/// Shows a deposit-address reply only if it answers the newest lookup. An
+/// older reply belongs to an asset that is no longer selected.
+pub(super) fn apply_deposit_reply(app: &mut App, request: u64, result: Result<DepositAddress, String>) {
+    if request != app.deposit.request {
+        return;
+    }
+    app.deposit.in_flight = false;
+    app.deposit.at = Some(Local::now());
+    match &result {
+        Ok(v) => {
+            app.push_log(format!("deposit: {} {} -> {}", v.asset, v.network, v.address));
+        }
+        Err(e) => {
+            app.push_log(format!("deposit: failed ({})", e));
+        }
+    }
+    app.deposit.last = Some(result);
 }
 
 pub(super) fn ensure_withdraw_deposit_address(app: &mut App, ui_tx: &mpsc::UnboundedSender<UiEvent>) {
@@ -461,7 +486,7 @@ async fn execute_withdraw(
                 }
                 Nat::from(send_native)
             } else {
-                let send_units = format::decimal_to_units(amount.trim(), *decimals).ok_or_else(|| {
+                let send_units = decimal_to_units(amount.trim(), *decimals).ok_or_else(|| {
                     format!("invalid amount (expected decimal with <= {decimals} decimals, or 'all')")
                 })?;
                 let send_nat = Nat::from(send_units);
@@ -492,7 +517,7 @@ async fn execute_withdraw(
                 let bal = balances.get_balance(&asset).await?;
                 bal.value
             } else {
-                let units = format::decimal_to_units(amount.trim(), *decimals).ok_or_else(|| {
+                let units = decimal_to_units(amount.trim(), *decimals).ok_or_else(|| {
                     format!("invalid amount (expected decimal with <= {decimals} decimals, or 'all')")
                 })?;
                 Nat::from(units)
@@ -570,7 +595,7 @@ fn compute_withdraw_amount_native(balance: Nat, fee: Nat, amount: &str, decimals
         }
         Ok(Nat::from(bal_u128 - fee_u128))
     } else {
-        let units = format::decimal_to_units(amount.trim(), decimals)
+        let units = decimal_to_units(amount.trim(), decimals)
             .ok_or_else(|| format!("invalid amount (expected decimal with <= {decimals} decimals, or 'all')"))?;
         Ok(Nat::from(units))
     }
@@ -597,7 +622,7 @@ fn compute_evm_withdraw_amount_native(
             Ok(balance)
         }
     } else {
-        let units = format::decimal_to_units(amount.trim(), decimals)
+        let units = decimal_to_units(amount.trim(), decimals)
             .ok_or_else(|| format!("invalid amount (expected decimal with <= {decimals} decimals, or 'all')"))?;
         Ok(Nat::from(units))
     }

@@ -485,8 +485,8 @@ pub async fn withdraw() -> Result<()> {
                 value: amount_native,
             }
         } else {
-            let val = f64::from_str(&amount_input).unwrap_or(0.0);
-            ChainTokenAmount::from_formatted(token.clone(), val)
+            ChainTokenAmount::from_decimal_str(token.clone(), &amount_input)
+                .map_err(|err| anyhow!("{err}; aborting."))?
         };
 
         plan.push((id, token, amount_nat, bal_fmt));
@@ -494,7 +494,7 @@ pub async fn withdraw() -> Result<()> {
 
     // Preview (labeled, plain prints)
     println!("\nPlanned transfers:\n");
-    for (i, (asset_id, tok, _amt, bal)) in plan.iter().enumerate() {
+    for (i, (asset_id, tok, amt, bal)) in plan.iter().enumerate() {
         let src_str = match tok {
             ChainToken::Icp { .. } => {
                 if source_kind == "bridge" {
@@ -524,7 +524,7 @@ pub async fn withdraw() -> Result<()> {
             }
         );
         println!("  Asset:       {} ({})", asset_id.symbol, asset_id.address);
-        println!("  Amount:      {}", amount_input);
+        println!("  Amount:      {}", amt.formatted());
         println!("  Balance:     {}", bal);
         println!();
     }
@@ -594,6 +594,7 @@ pub async fn withdraw() -> Result<()> {
             }
         };
 
+        let amount_shown = amt.formatted();
         match transfer_service
             .transfer_by_asset_id(&asset_id, to.clone(), amt.value)
             .await
@@ -610,7 +611,7 @@ pub async fn withdraw() -> Result<()> {
                     }
                 );
                 println!("  Asset:       {}", asset_id.symbol);
-                println!("  Amount:      {}", amount_input);
+                println!("  Amount:      {}", amount_shown);
                 println!("  Balance:     {}", bal_fmt);
                 println!("  Result:      ok: {}", txid);
                 println!();
@@ -627,7 +628,7 @@ pub async fn withdraw() -> Result<()> {
                     }
                 );
                 println!("  Asset:       {}", asset_id.symbol);
-                println!("  Amount:      {}", amount_input);
+                println!("  Amount:      {}", amount_shown);
                 println!("  Balance:     {}", bal_fmt);
                 println!("  Result:      err: {}", e);
                 println!();
@@ -1061,8 +1062,7 @@ pub async fn withdraw_noninteractive(source: &str, destination: &str, asset: &st
                     value: candid::Nat::from(send_units),
                 }
             } else {
-                let val = f64::from_str(amount).unwrap_or(0.0);
-                ChainTokenAmount::from_formatted(token.clone(), val)
+                ChainTokenAmount::from_decimal_str(token.clone(), amount).map_err(|err| anyhow!("{err}; aborting."))?
             };
 
             plan.push((
@@ -1230,8 +1230,7 @@ pub async fn withdraw_noninteractive(source: &str, destination: &str, asset: &st
                 }
             }
         } else {
-            let val = f64::from_str(amount).unwrap_or(0.0);
-            ChainTokenAmount::from_formatted(token.clone(), val)
+            ChainTokenAmount::from_decimal_str(token.clone(), amount).map_err(|err| anyhow!("{err}; aborting."))?
         };
 
         plan.push((id, token, destination_account, amount_nat, bal_fmt));
@@ -1243,7 +1242,7 @@ pub async fn withdraw_noninteractive(source: &str, destination: &str, asset: &st
 
     // Echo plan
     println!("Planned transfers (non-interactive):\n");
-    for (i, (asset_id, token, to, _amt, bal)) in plan.iter().enumerate() {
+    for (i, (asset_id, token, to, amt, bal)) in plan.iter().enumerate() {
         let src = match token {
             ChainToken::Icp { .. } => {
                 if source_kind == "bridge" {
@@ -1272,7 +1271,7 @@ pub async fn withdraw_noninteractive(source: &str, destination: &str, asset: &st
         println!("  Source:      {}", src);
         println!("  Destination: {}", dst);
         println!("  Asset:       {}", asset_id.symbol);
-        println!("  Amount:      {}", amount);
+        println!("  Amount:      {}", amt.formatted());
         println!("  Balance:     {}", bal);
         println!();
     }
@@ -1317,7 +1316,7 @@ pub async fn withdraw_noninteractive(source: &str, destination: &str, asset: &st
                 println!("  Source:      {}", src);
                 println!("  Destination: {}", dst);
                 println!("  Asset:       {}", asset_id.symbol);
-                println!("  Amount:      {}", amount);
+                println!("  Amount:      {}", amt.formatted());
                 println!("  Balance:     {}", bal_fmt);
                 println!("  Result:      ok: {}", txid);
                 println!();
@@ -1327,7 +1326,7 @@ pub async fn withdraw_noninteractive(source: &str, destination: &str, asset: &st
                 println!("  Source:      {}", src);
                 println!("  Destination: {}", dst);
                 println!("  Asset:       {}", asset_id.symbol);
-                println!("  Amount:      {}", amount);
+                println!("  Amount:      {}", amt.formatted());
                 println!("  Balance:     {}", bal_fmt);
                 println!("  Result:      err: {}", e);
                 println!();

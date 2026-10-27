@@ -248,6 +248,8 @@ pub(super) enum UiFocus {
 
 #[derive(Default)]
 pub(super) struct DepositState {
+    /// The id of the newest lookup. A reply to an older one is stale.
+    pub(super) request: u64,
     pub(super) in_flight: bool,
     pub(super) asset: Option<AssetId>,
     pub(super) network: Option<String>,
@@ -507,8 +509,11 @@ impl App {
 
 #[cfg(test)]
 mod tests {
+    use liquidium_pipeline_connectors::backend::cex_backend::DepositAddress;
+
     use super::{App, ConfigSummary, WalCounts};
     use crate::persistance::ResultStatus;
+    use crate::tui::withdraw::apply_deposit_reply;
     use std::collections::HashMap;
 
     fn sample_config() -> ConfigSummary {
@@ -618,5 +623,49 @@ mod tests {
         assert_eq!(app.logs_scroll, 5);
         assert_eq!(app.dashboard_logs_scroll, 7);
         assert_eq!(app.logs.back().expect("last"), "newline");
+    }
+
+    fn address(asset: &str) -> DepositAddress {
+        DepositAddress {
+            asset: asset.to_string(),
+            network: "ETH".to_string(),
+            address: format!("{asset}-address"),
+            tag: None,
+        }
+    }
+
+    #[test]
+    fn a_deposit_reply_shows_only_for_the_newest_lookup() {
+        // Lookup 1 asked for USDC and lookup 2 for ETH; the replies come in either order.
+        for late_first in [true, false] {
+            let mut app = App::new(vec![], sample_config());
+            app.deposit.request = 2;
+            app.deposit.in_flight = true;
+            let replies = [(1, address("USDC")), (2, address("ETH"))];
+            let order: Vec<_> = if late_first {
+                replies.into_iter().collect()
+            } else {
+                replies.into_iter().rev().collect()
+            };
+            for (request, reply) in order {
+                apply_deposit_reply(&mut app, request, Ok(reply));
+            }
+
+            assert!(!app.deposit.in_flight);
+            let shown = app.deposit.last.as_ref().expect("reply").as_ref().expect("address");
+            assert_eq!(shown.asset, "ETH", "late_first {late_first}");
+        }
+    }
+
+    #[test]
+    fn a_stale_deposit_reply_leaves_the_newest_lookup_waiting() {
+        let mut app = App::new(vec![], sample_config());
+        app.deposit.request = 2;
+        app.deposit.in_flight = true;
+
+        apply_deposit_reply(&mut app, 1, Ok(address("USDC")));
+
+        assert!(app.deposit.in_flight);
+        assert!(app.deposit.last.is_none());
     }
 }

@@ -1,88 +1,69 @@
+use std::iter::Peekable;
+use std::str::Chars;
+
 /// Removes ANSI escape/control sequences and non-printable control chars from
 /// externally sourced log lines before rendering in ratatui.
 pub(super) fn sanitize_log_line(input: &str) -> String {
-    let bytes = input.as_bytes();
-    let mut i = 0usize;
     let mut out = String::with_capacity(input.len());
-
-    while i < bytes.len() {
-        if bytes[i] == 0x1b {
-            skip_escape_sequence(bytes, &mut i);
-            continue;
+    let mut chars = input.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\x1b' => skip_escape_sequence(&mut chars),
+            '\t' => out.push(' '),
+            ch if ch.is_control() => {}
+            ch => out.push(ch),
         }
-
-        let mut chars = input[i..].chars();
-        let Some(ch) = chars.next() else {
-            break;
-        };
-        i += ch.len_utf8();
-
-        if ch == '\t' {
-            out.push(' ');
-            continue;
-        }
-        if ch.is_control() {
-            continue;
-        }
-        out.push(ch);
     }
-
     out
 }
 
-fn skip_escape_sequence(bytes: &[u8], i: &mut usize) {
-    *i += 1;
-    if *i >= bytes.len() {
-        return;
-    }
-
-    match bytes[*i] {
-        b'[' => {
+/// Skips one escape sequence after its ESC. It steps by character, so a
+/// malformed sequence cannot cut a multibyte character in half.
+fn skip_escape_sequence(chars: &mut Peekable<Chars<'_>>) {
+    match chars.peek() {
+        Some('[') => {
             // CSI ... final-byte
-            *i += 1;
-            while *i < bytes.len() {
-                let b = bytes[*i];
-                *i += 1;
-                if (0x40..=0x7e).contains(&b) {
+            chars.next();
+            for c in chars.by_ref() {
+                if ('\x40'..='\x7e').contains(&c) {
                     break;
                 }
             }
         }
-        b']' => {
+        Some(']') => {
             // OSC ... BEL or ST (ESC \)
-            *i += 1;
-            while *i < bytes.len() {
-                if bytes[*i] == 0x07 {
-                    *i += 1;
+            chars.next();
+            while let Some(c) = chars.next() {
+                if c == '\x07' {
                     break;
                 }
-                if bytes[*i] == 0x1b && *i + 1 < bytes.len() && bytes[*i + 1] == b'\\' {
-                    *i += 2;
+                if c == '\x1b' && chars.next_if_eq(&'\\').is_some() {
                     break;
                 }
-                *i += 1;
             }
         }
-        b'P' | b'X' | b'^' | b'_' => {
+        Some('P' | 'X' | '^' | '_') => {
             // DCS/SOS/PM/APC ... ST (ESC \)
-            *i += 1;
-            while *i < bytes.len() {
-                if bytes[*i] == 0x1b && *i + 1 < bytes.len() && bytes[*i + 1] == b'\\' {
-                    *i += 2;
+            chars.next();
+            while let Some(c) = chars.next() {
+                if c == '\x1b' && chars.next_if_eq(&'\\').is_some() {
                     break;
                 }
-                *i += 1;
             }
         }
-        _ => {
+        Some(' '..='~') => {
             // Single-char escape sequence.
-            *i += 1;
+            chars.next();
         }
+        // ESC before text or at the end: drop the ESC and keep the text.
+        _ => {}
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use proptest::prelude::*;
+
     use super::sanitize_log_line;
 
     #[test]
@@ -107,5 +88,31 @@ mod tests {
     fn preserves_unicode_printable_text() {
         let input = "Δ profit ✅";
         assert_eq!(sanitize_log_line(input), "Δ profit ✅");
+    }
+
+    #[test]
+    fn escape_before_a_multibyte_character_keeps_the_character() {
+        // The audit's reproduction: the old byte walk panicked on this line.
+        assert_eq!(sanitize_log_line("MEXC error: \x1bé"), "MEXC error: é");
+        assert_eq!(sanitize_log_line("\x1b[31m\x1b✅ ok\x1b"), "✅ ok");
+        assert_eq!(sanitize_log_line("\x1b]0;title\x1b\\Δ"), "Δ");
+    }
+
+    proptest! {
+        #[test]
+        fn any_line_sanitizes_to_printable_text(
+            parts in proptest::collection::vec(
+                prop_oneof![
+                    any::<String>(),
+                    "\x1b[\\[\\]PX^_ -~]?.{0,4}",
+                    Just("\x1b".to_string()),
+                ],
+                0..8,
+            )
+        ) {
+            let line = parts.concat();
+            let clean = sanitize_log_line(&line);
+            prop_assert!(!clean.chars().any(|c| c.is_control()), "{clean:?}");
+        }
     }
 }

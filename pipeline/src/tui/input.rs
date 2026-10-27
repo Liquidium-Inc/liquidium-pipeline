@@ -209,6 +209,10 @@ pub(super) async fn handle_key(
         return Ok(false);
     }
 
+    if edit_withdraw_text(app, key) {
+        return Ok(false);
+    }
+
     if matches!(app.tab, Tab::Logs | Tab::Dashboard) {
         let scroll_active = matches!(app.tab, Tab::Logs) && app.logs_scroll_active
             || matches!(app.tab, Tab::Dashboard) && app.dashboard_logs_scroll_active;
@@ -261,17 +265,6 @@ pub(super) async fn handle_key(
             return Ok(true);
         }
         (KeyCode::Esc, _) => {
-            if app.withdraw.editing.is_some() {
-                // Cancel edit and restore previous value.
-                if let (Some(field), Some(backup)) = (app.withdraw.editing.take(), app.withdraw.edit_backup.take()) {
-                    match field {
-                        WithdrawField::Amount => app.withdraw.amount = backup,
-                        WithdrawField::ManualDestination => app.withdraw.manual_destination = backup,
-                        _ => {}
-                    }
-                }
-                return Ok(false);
-            }
             if matches!(app.tab, Tab::Executions) {
                 if matches!(app.ui_focus, UiFocus::ExecutionsDetails) {
                     app.ui_focus = UiFocus::ExecutionsTable;
@@ -714,31 +707,6 @@ pub(super) async fn handle_key(
             if matches!(app.tab, Tab::Balances) && matches!(app.balances_panel, BalancesPanel::Withdraw) =>
         {
             // Withdraw form key handling.
-            if let Some(editing) = app.withdraw.editing {
-                match code {
-                    KeyCode::Enter => {
-                        app.withdraw.editing = None;
-                        app.withdraw.edit_backup = None;
-                    }
-                    KeyCode::Backspace => match editing {
-                        WithdrawField::Amount => {
-                            app.withdraw.amount.pop();
-                        }
-                        WithdrawField::ManualDestination => {
-                            app.withdraw.manual_destination.pop();
-                        }
-                        _ => {}
-                    },
-                    KeyCode::Char(c) => match editing {
-                        WithdrawField::Amount => app.withdraw.amount.push(c),
-                        WithdrawField::ManualDestination => app.withdraw.manual_destination.push(c),
-                        _ => {}
-                    },
-                    _ => {}
-                }
-                return Ok(false);
-            }
-
             match code {
                 KeyCode::Down => {
                     app.withdraw.field = match app.withdraw.field {
@@ -831,6 +799,38 @@ pub(super) async fn handle_key(
     Ok(false)
 }
 
+/// Gives a key to the open withdraw text field, if there is one. The field
+/// takes every key, so typing an address cannot quit, pause or navigate.
+fn edit_withdraw_text(app: &mut App, key: KeyEvent) -> bool {
+    if !matches!(app.tab, Tab::Balances) || !matches!(app.balances_panel, BalancesPanel::Withdraw) {
+        return false;
+    }
+    let withdraw = &mut app.withdraw;
+    let text = match withdraw.editing {
+        Some(WithdrawField::Amount) => &mut withdraw.amount,
+        Some(WithdrawField::ManualDestination) => &mut withdraw.manual_destination,
+        _ => return false,
+    };
+    match (key.code, key.modifiers) {
+        (KeyCode::Esc, _) => {
+            if let Some(backup) = withdraw.edit_backup.take() {
+                *text = backup;
+            }
+            withdraw.editing = None;
+        }
+        (KeyCode::Enter, _) => {
+            withdraw.editing = None;
+            withdraw.edit_backup = None;
+        }
+        (KeyCode::Backspace, _) => {
+            text.pop();
+        }
+        (KeyCode::Char(c), KeyModifiers::NONE | KeyModifiers::SHIFT) if !c.is_control() => text.push(c),
+        _ => {}
+    }
+    true
+}
+
 pub(super) fn handle_paste(app: &mut App, text: String) {
     let mut chars = text.chars().filter(|c| !c.is_control());
 
@@ -867,9 +867,11 @@ pub(super) fn handle_paste(app: &mut App, text: String) {
 
 #[cfg(test)]
 mod tests {
-    use super::{scroll_dashboard_logs_up, scroll_logs_up};
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    use super::{edit_withdraw_text, scroll_dashboard_logs_up, scroll_logs_up};
     use crate::commands::liquidation_loop::LoopControl;
-    use crate::tui::app::{App, ConfigSummary};
+    use crate::tui::app::{App, BalancesPanel, ConfigSummary, Tab, WithdrawField};
 
     fn sample_config() -> ConfigSummary {
         ConfigSummary {
@@ -923,5 +925,62 @@ mod tests {
 
         app.dashboard_logs_scroll = u16::MAX;
         assert!(scroll_dashboard_logs_up(&mut app, 1));
+    }
+
+    fn editing_app(field: WithdrawField) -> App {
+        let mut app = App::new(vec![], sample_config());
+        app.tab = Tab::Balances;
+        app.balances_panel = BalancesPanel::Withdraw;
+        app.withdraw.editing = Some(field);
+        app.withdraw.edit_backup = Some(String::new());
+        app
+    }
+
+    fn typed(c: char) -> KeyEvent {
+        let modifiers = if c.is_ascii_uppercase() {
+            KeyModifiers::SHIFT
+        } else {
+            KeyModifiers::NONE
+        };
+        KeyEvent::new(KeyCode::Char(c), modifiers)
+    }
+
+    #[test]
+    fn the_withdraw_field_takes_every_typed_character() {
+        // Each address holds letters that are global shortcuts (q, r, b, c, e, w, d, p, o).
+        for address in [
+            "qrbcewdpo-2yaaa-aaaae-qddxa-cai",
+            "0xAbCdEf0123456789abcdefABCDEF0123456789qw",
+            "So11111111111111111111111111111111111111112",
+            "bc1qrwdpe0",
+        ] {
+            let mut app = editing_app(WithdrawField::ManualDestination);
+            for c in address.chars() {
+                assert!(edit_withdraw_text(&mut app, typed(c)), "{c} left the field");
+            }
+            assert_eq!(app.withdraw.manual_destination, address);
+            assert!(!app.should_quit);
+            assert!(matches!(app.tab, Tab::Balances));
+            assert!(matches!(app.balances_panel, BalancesPanel::Withdraw));
+        }
+    }
+
+    #[test]
+    fn the_withdraw_field_edits_confirms_and_cancels() {
+        let mut app = editing_app(WithdrawField::Amount);
+        app.withdraw.amount.clear();
+        app.withdraw.edit_backup = Some("1.5".to_string());
+        for c in "2.25x".chars() {
+            edit_withdraw_text(&mut app, typed(c));
+        }
+        edit_withdraw_text(&mut app, KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
+        assert_eq!(app.withdraw.amount, "2.25");
+
+        edit_withdraw_text(&mut app, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(app.withdraw.amount, "1.5");
+        assert_eq!(app.withdraw.editing, None);
+
+        // With no field open, keys go to the global shortcuts.
+        assert!(!edit_withdraw_text(&mut app, typed('q')));
     }
 }
