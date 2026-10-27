@@ -1,15 +1,13 @@
 //! Orders: IOC at the limit, the buy sizing, the fill report, and the error kinds.
 use liquidium_pipeline_connectors::backend::cex_backend::{
-    BuyOrderInputMode, CexBackend, CexBackendError, PriceLimit, SwapExecutionOptions,
+    CexBackend, CexBackendError, PriceLimit, SwapExecutionOptions,
 };
 use rust_decimal::Decimal;
 
 use super::support::{btc_usd_client, btc_usd_pair, level, one_coin_book};
 use crate::swappers::kraken::{
     api::{KrakenApiError, KrakenBook, KrakenOrder, KrakenOrderStatus, KrakenSide, MockKrakenApi},
-    trading::{
-        ORDER_POLL_ATTEMPTS, TAKER_FEE_BPS, estimate_buy_cost, estimate_sell_output, fill_report, ioc_limit_price,
-    },
+    trading::{ORDER_POLL_ATTEMPTS, TAKER_FEE_BPS, estimate_sell_output, fill_report},
 };
 
 fn closed(volume_executed: Decimal, cost: Decimal, fee: Decimal) -> KrakenOrder {
@@ -58,22 +56,17 @@ async fn the_order_book_carries_the_measured_taker_fee() {
     assert_eq!(book.taker_fee_bps, TAKER_FEE_BPS);
 }
 
-#[test]
-fn the_ioc_price_rounds_toward_the_inside_of_the_limit() {
-    let limit = PriceLimit {
-        reference_price: 60_000.05,
-        max_slippage_bps: 200.0,
-    };
-    // 58,800.049: a sell rounds up, so it never accepts less than the limit.
-    assert_eq!(
-        ioc_limit_price(KrakenSide::Sell, &limit, 1).unwrap(),
-        Decimal::new(588_001, 1)
-    );
-    // 61,200.051: a buy rounds down, so it never pays more than the limit.
-    assert_eq!(
-        ioc_limit_price(KrakenSide::Buy, &limit, 1).unwrap(),
-        Decimal::new(612_000, 1)
-    );
+#[tokio::test]
+async fn an_order_without_a_price_limit_is_refused() {
+    let mut api = MockKrakenApi::new();
+    api.expect_place_order().never();
+
+    let error = btc_usd_client(api)
+        .execute_swap_detailed_with_options("BTC_USD", "sell", 0.1, SwapExecutionOptions::default())
+        .await
+        .expect_err("no limit");
+
+    assert!(error.to_string().contains("price limit"), "{error}");
 }
 
 #[tokio::test]
@@ -84,7 +77,7 @@ async fn an_ioc_sell_carries_the_limit_and_the_client_id_and_reports_the_net_fil
             request.pair == "XXBTZUSD"
                 && request.side == KrakenSide::Sell
                 && request.volume == Decimal::new(1, 1)
-                && request.limit_price == Some(Decimal::new(58_800, 0))
+                && request.limit_price == Decimal::new(58_800, 0)
                 && request.client_order_id.as_deref() == Some("liq-42")
         })
         .once()
@@ -118,7 +111,7 @@ async fn an_ioc_buy_never_spends_more_than_its_budget() {
         .withf(|request| {
             request.side == KrakenSide::Buy
                 && request.volume == Decimal::new(9_803_921, 8)
-                && request.limit_price == Some(Decimal::new(61_200, 0))
+                && request.limit_price == Decimal::new(61_200, 0)
         })
         .once()
         .returning(|_| Ok("ORDER-BUY".into()));
@@ -187,75 +180,15 @@ async fn a_sell_below_the_cost_minimum_is_refused_before_submission() {
     assert!(matches!(error, CexBackendError::BelowMinimum(_)), "{error}");
 }
 
-#[tokio::test]
-async fn a_market_buy_sizes_its_volume_from_the_asks() {
-    let mut api = trading_api();
-    api.expect_place_order()
-        .withf(|request| {
-            request.side == KrakenSide::Buy && request.volume == Decimal::new(1, 1) && request.limit_price.is_none()
-        })
-        .once()
-        .returning(|_| Ok("ORDER-MARKET".into()));
-    api.expect_order()
-        .once()
-        .returning(|_| Ok(closed(Decimal::new(1, 1), Decimal::new(6_000, 0), Decimal::new(48, 0))));
-
-    let report = btc_usd_client(api)
-        .execute_swap_detailed_with_options(
-            "BTC_USD",
-            "buy",
-            6_000.0,
-            SwapExecutionOptions {
-                client_order_id: Some("liq-market".into()),
-                buy_mode: BuyOrderInputMode::BaseQuantity,
-                ..SwapExecutionOptions::default()
-            },
-        )
-        .await
-        .expect("filled buy");
-
-    assert_eq!(report.input_consumed, 6_000.0);
-}
-
-/// `Decimal` panics on a division by zero, so a zero-priced ask is stepped
-/// over and the order is sized on the depth it can buy.
-#[tokio::test]
-async fn a_zero_priced_ask_is_stepped_over() {
-    let mut api = MockKrakenApi::new();
-    api.expect_pairs().returning(|| Ok(vec![btc_usd_pair()]));
-    api.expect_closed_order_by_client_id().returning(|_| Ok(None));
-    api.expect_orderbook().returning(|_, _| {
-        Ok(KrakenBook {
-            bids: vec![],
-            asks: vec![level(0, Decimal::ONE), level(60_000, Decimal::ONE)],
-        })
-    });
-    api.expect_place_order()
-        .withf(|request| request.volume == Decimal::new(1, 1))
-        .once()
-        .returning(|_| Ok("ORDER-BUY".into()));
-    api.expect_order()
-        .once()
-        .returning(|_| Ok(closed(Decimal::new(1, 1), Decimal::new(6_000, 0), Decimal::new(48, 0))));
-
-    btc_usd_client(api)
-        .execute_swap_detailed("BTC_USD", "buy", 6_000.0)
-        .await
-        .expect("a malformed level must not stop a fillable buy");
-}
-
-/// A walk that counted a zero-priced level as free volume would report a
-/// cost of zero, and a spend cap checked against zero passes any order.
+/// A zero-priced bid is not a price, so it adds nothing to a sell's output.
 #[test]
 fn an_untradable_level_never_fills_volume_for_free() {
     let book = KrakenBook {
         bids: vec![level(0, Decimal::ONE), level(60_000, Decimal::ONE)],
-        asks: vec![level(0, Decimal::ONE), level(60_000, Decimal::ONE)],
+        asks: vec![],
     };
     let half = Decimal::new(5, 1);
-    assert_eq!(estimate_buy_cost(&book, half).unwrap(), Decimal::new(30_000, 0));
     assert_eq!(estimate_sell_output(&book, half).unwrap(), Decimal::new(30_000, 0));
-    assert!(estimate_buy_cost(&book, Decimal::new(15, 1)).is_err());
     assert!(estimate_sell_output(&book, Decimal::new(15, 1)).is_err());
 }
 

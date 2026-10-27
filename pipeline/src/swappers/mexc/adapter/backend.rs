@@ -1,62 +1,8 @@
-//! `CexBackend` for MEXC: quotes, swaps, balances, deposits and withdrawals.
+//! `CexBackend` for MEXC: orders, balances, deposits and withdrawals.
 use super::*;
 
 #[async_trait]
 impl CexBackend for MexcClient {
-    async fn get_quote(&self, market: &str, amount_in: f64) -> Result<f64, String> {
-        let ex = self.inner.lock().await;
-
-        let symbol = normalize_market_symbol(market);
-        let ob = ex
-            .depth(DepthParams {
-                limit: None,
-                symbol: &symbol,
-            })
-            .await
-            .map_err(|e| e.to_string())?;
-
-        // asks: Vec<Vec<f64>> = [ [price, qty], ... ]
-        let asks = &ob.asks;
-
-        if asks.is_empty() {
-            return Err("no asks".into());
-        }
-
-        let mut remaining =
-            Decimal::from_f64_retain(amount_in).ok_or_else(|| "could not convert amount to Decimal".to_string())?;
-        let mut cost = Decimal::ZERO;
-
-        for level in asks {
-            let price = level.price;
-            let qty = level.quantity;
-
-            if remaining <= Decimal::ZERO {
-                break;
-            }
-
-            let take = qty.min(remaining);
-            cost += take * price;
-            remaining -= take;
-        }
-
-        if remaining > Decimal::ZERO {
-            return Err("not enough liquidity".into());
-        }
-
-        cost.to_f64().ok_or("f64 conversion failed".to_string())
-    }
-
-    async fn execute_swap(&self, market: &str, side: &str, amount_in: f64) -> Result<f64, String> {
-        let report = self.execute_swap_detailed(market, side, amount_in).await?;
-        Ok(report.output_received)
-    }
-
-    async fn execute_swap_detailed(&self, market: &str, side: &str, amount_in: f64) -> Result<SwapFillReport, String> {
-        self.execute_swap_detailed_with_options(market, side, amount_in, SwapExecutionOptions::default())
-            .await
-            .map_err(|error| error.to_string())
-    }
-
     async fn execute_swap_detailed_with_options(
         &self,
         market: &str,
@@ -451,11 +397,6 @@ impl CexBackend for MexcClient {
             txid: None,
             internal_id: Some(res.id),
         })
-    }
-
-    async fn get_withdraw_status_by_id(&self, coin: &str, withdraw_id: &str) -> Result<WithdrawStatus, String> {
-        let snapshot = self.get_withdraw_status_snapshot_by_id(coin, withdraw_id).await?;
-        Ok(snapshot.status)
     }
 
     async fn get_withdraw_status_snapshot_by_id(

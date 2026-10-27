@@ -282,16 +282,11 @@ impl KrakenApi for KrakenRestApi {
             KrakenSide::Buy => (BuySell::Buy, OrderFlag::FeesInBase),
             KrakenSide::Sell => (BuySell::Sell, OrderFlag::FeesInQuote),
         };
-        let order_type = if request.limit_price.is_some() {
-            OrderType::Limit
-        } else {
-            OrderType::Market
-        };
-        let mut builder = AddOrderRequest::builder(order_type, side, request.volume, request.pair.clone());
-        builder.order_flags(OrderFlags::new(vec![fee_flag]));
-        if let Some(price) = request.limit_price {
-            builder.price(price).time_in_force(TimeInForce::IOC);
-        }
+        let mut builder = AddOrderRequest::builder(OrderType::Limit, side, request.volume, request.pair.clone());
+        builder
+            .price(request.limit_price)
+            .time_in_force(TimeInForce::IOC)
+            .order_flags(OrderFlags::new(vec![fee_flag]));
         if let Some(client_order_id) = &request.client_order_id {
             builder.client_order_id(client_order_id.clone());
         }

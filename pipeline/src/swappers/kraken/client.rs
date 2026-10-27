@@ -10,7 +10,7 @@ use std::{
 use async_trait::async_trait;
 use liquidium_pipeline_connectors::backend::cex_backend::{
     CexBackend, CexBackendError, DepositAddress, FundingRoute, FundingRouteError, OrderBook, SwapExecutionOptions,
-    SwapFillReport, WithdrawError, WithdrawStatus, WithdrawStatusSnapshot, WithdrawTerms, WithdrawalReceipt,
+    SwapFillReport, WithdrawError, WithdrawStatusSnapshot, WithdrawTerms, WithdrawalReceipt,
 };
 use rust_decimal::{
     Decimal,
@@ -96,23 +96,6 @@ impl KrakenClient {
 
 #[async_trait]
 impl CexBackend for KrakenClient {
-    async fn get_quote(&self, market: &str, amount_in: f64) -> Result<f64, String> {
-        self.quote_sell(market, amount_in).await
-    }
-
-    async fn execute_swap(&self, market: &str, side: &str, amount_in: f64) -> Result<f64, String> {
-        Ok(self
-            .execute_swap_detailed(market, side, amount_in)
-            .await?
-            .output_received)
-    }
-
-    async fn execute_swap_detailed(&self, market: &str, side: &str, amount_in: f64) -> Result<SwapFillReport, String> {
-        self.execute_order(market, side, amount_in, SwapExecutionOptions::default())
-            .await
-            .map_err(|error| error.to_string())
-    }
-
     async fn execute_swap_detailed_with_options(
         &self,
         market: &str,
@@ -159,10 +142,6 @@ impl CexBackend for KrakenClient {
             .await
             .map_err(|error| error.to_string())?;
         decimal_f64(balance, "balance")
-    }
-
-    async fn get_withdraw_status_by_id(&self, coin: &str, withdraw_id: &str) -> Result<WithdrawStatus, String> {
-        Ok(self.withdrawal_status(coin, withdraw_id).await?.status)
     }
 
     async fn get_withdraw_status_snapshot_by_id(

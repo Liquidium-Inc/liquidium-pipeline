@@ -204,12 +204,6 @@ pub struct WithdrawStatusSnapshot {
 #[async_trait]
 pub trait CexBackend: Send + Sync {
     // trading
-    async fn get_quote(&self, market: &str, amount_in: f64) -> Result<f64, String>;
-
-    async fn execute_swap(&self, market: &str, side: &str, amount_in: f64) -> Result<f64, String>;
-
-    async fn execute_swap_detailed(&self, market: &str, side: &str, amount_in: f64) -> Result<SwapFillReport, String>;
-
     async fn execute_swap_detailed_with_options(
         &self,
         market: &str,
@@ -244,9 +238,6 @@ pub trait CexBackend: Send + Sync {
 
     // balance
     async fn get_balance(&self, asset: &str) -> Result<f64, String>;
-
-    // withdrawal status
-    async fn get_withdraw_status_by_id(&self, coin: &str, withdraw_id: &str) -> Result<WithdrawStatus, String>;
 
     // withdrawal status with optional transfer metadata (txid, fee)
     async fn get_withdraw_status_snapshot_by_id(

@@ -289,26 +289,12 @@ impl MexcClient {
         limit: &PriceLimit,
         filters: Option<&SymbolFilters>,
     ) -> Result<Decimal, String> {
-        let reference = Decimal::from_f64(limit.reference_price)
-            .filter(|price| *price > Decimal::ZERO)
-            .ok_or_else(|| format!("invalid reference price {}", limit.reference_price))?;
-        let cap = Decimal::from_f64(limit.max_slippage_bps / BPS_PER_RATIO_UNIT)
-            .filter(|cap| *cap >= Decimal::ZERO && *cap < Decimal::ONE)
-            .ok_or_else(|| format!("invalid slippage cap {} bps", limit.max_slippage_bps))?;
         let sell = side_norm == "sell";
         let band = filters.and_then(|f| if sell { f.sell_price_band } else { f.buy_price_band });
         // MEXC measures its band from its own price, so stay inside 90% of it.
-        let allowed = band.map_or(cap, |band| cap.min(band * Decimal::new(9, 1)));
+        let max_distance = band.map(|band| band * Decimal::new(9, 1));
         let decimals = filters.and_then(|f| f.quote_precision).unwrap_or(8);
-        let price = if sell {
-            (reference * (Decimal::ONE - allowed)).round_dp_with_strategy(decimals, RoundingStrategy::AwayFromZero)
-        } else {
-            (reference * (Decimal::ONE + allowed)).round_dp_with_strategy(decimals, RoundingStrategy::ToZero)
-        };
-        if price <= Decimal::ZERO {
-            return Err(format!("IOC price {price} not valid"));
-        }
-        Ok(price.normalize())
+        crate::swappers::model::ioc_limit_price(sell, limit, max_distance, decimals)
     }
 
     /// The base quantity an IOC buy may take: every unit fills at or under the

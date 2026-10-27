@@ -57,15 +57,14 @@ pub enum KrakenSide {
     Sell,
 }
 
-/// One order. With a limit price it is an IOC limit order, else a market
-/// order. The fee is always taken from the asset the order pays out.
+/// One IOC limit order. The fee is taken from the asset the order pays out.
 #[derive(Debug, Clone, PartialEq)]
 pub struct KrakenOrderRequest {
     pub pair: String,
     pub side: KrakenSide,
     /// In base units.
     pub volume: Decimal,
-    pub limit_price: Option<Decimal>,
+    pub limit_price: Decimal,
     pub client_order_id: Option<String>,
 }
 

@@ -1,26 +1,21 @@
-//! Trading on Kraken: the sell quote, the order book, and one order per
-//! slice, IOC at the caller's price limit, read to its final fill.
-//!
-//! Kraken takes order volume in base units, so a buy turns its quote budget
-//! into a base volume here. The book walks that size an order live together.
+//! Trading on Kraken: the order book, and one IOC order per slice at the
+//! caller's price limit, read to its final fill. Kraken takes order volume in
+//! base units, so a buy turns its quote budget into a base volume here.
 
 use std::time::Duration;
 
 use liquidium_pipeline_connectors::backend::cex_backend::{
-    BuyOrderInputMode, CexBackendError, OrderBook, OrderBookLevel, PriceLimit, SwapExecutionOptions, SwapFillReport,
+    CexBackendError, OrderBook, OrderBookLevel, SwapExecutionOptions, SwapFillReport,
 };
 use log::info;
-use rust_decimal::{
-    Decimal, RoundingStrategy,
-    prelude::{FromPrimitive, ToPrimitive},
-};
+use rust_decimal::{Decimal, RoundingStrategy, prelude::ToPrimitive};
 
 use super::api::{
     KrakenApiError, KrakenBook, KrakenBookLevel, KrakenOrder, KrakenOrderRequest, KrakenOrderStatus, KrakenPair,
     KrakenSide,
 };
 use super::client::{KrakenClient, decimal_f64, to_decimal};
-use crate::swappers::model::BPS_PER_RATIO_UNIT;
+use crate::swappers::model::ioc_limit_price;
 
 pub(super) const ORDER_POLL_ATTEMPTS: usize = 20;
 const ORDER_POLL_INTERVAL: Duration = Duration::from_millis(500);
@@ -36,13 +31,6 @@ pub(super) const TAKER_FEE_BPS: f64 = 80.0;
 const FILL_ROUNDING_MARGIN_RATIO: Decimal = Decimal::from_parts(1, 0, 0, false, 6);
 
 impl KrakenClient {
-    pub(super) async fn quote_sell(&self, market: &str, amount_in: f64) -> Result<f64, String> {
-        let pair = self.pair(market).await?;
-        let volume = to_decimal(amount_in, "sell amount")?;
-        let output = estimate_sell_output(&self.book(&pair, ORDERBOOK_DEPTH).await?, volume)?;
-        decimal_f64(output, "sell quote")
-    }
-
     pub(super) async fn read_orderbook(&self, market: &str, limit: Option<u32>) -> Result<OrderBook, String> {
         let pair = self.pair(market).await?;
         let book = self.book(&pair, limit.unwrap_or(ORDERBOOK_DEPTH)).await?;
@@ -56,8 +44,8 @@ impl KrakenClient {
     /// Places one order and reads it to its final fill.
     ///
     /// `amount_in` is what the route spends: base volume on a sell, the quote
-    /// budget on a buy. With a price limit the order is IOC at that limit;
-    /// Kraken supports IOC on every pair, so there is no market fallback.
+    /// budget on a buy. Every order is IOC at its price limit; Kraken supports
+    /// IOC on every pair, so an order without a limit is refused.
     pub(super) async fn execute_order(
         &self,
         market: &str,
@@ -66,6 +54,10 @@ impl KrakenClient {
         options: SwapExecutionOptions,
     ) -> Result<SwapFillReport, CexBackendError> {
         let side = parse_side(side)?;
+        let limit = options
+            .price_limit
+            .as_ref()
+            .ok_or_else(|| "a Kraken order needs a price limit".to_string())?;
         let pair = self.pair(market).await?;
 
         // A resumed leg holds the client id of an order it may have placed.
@@ -85,15 +77,10 @@ impl KrakenClient {
         }
 
         let amount = to_decimal(amount_in, "order amount")?;
-        let book = self.book(&pair, ORDERBOOK_DEPTH).await?;
-        let limit_price = options
-            .price_limit
-            .as_ref()
-            .map(|limit| ioc_limit_price(side, limit, pair.price_decimals))
-            .transpose()?;
+        let limit_price = ioc_limit_price(side == KrakenSide::Sell, limit, None, pair.price_decimals)?;
         let volume = match side {
-            KrakenSide::Sell => sell_volume(&pair, &book, amount)?,
-            KrakenSide::Buy => buy_volume(&pair, &book, amount, limit_price, &options)?,
+            KrakenSide::Sell => sell_volume(&pair, &self.book(&pair, ORDERBOOK_DEPTH).await?, amount)?,
+            KrakenSide::Buy => buy_volume(&pair, amount, limit_price)?,
         };
 
         let request = KrakenOrderRequest {
@@ -167,29 +154,6 @@ fn truncate(value: Decimal, decimals: u32) -> Decimal {
     value.round_dp_with_strategy(decimals, RoundingStrategy::ToZero)
 }
 
-/// The worst price the order accepts, rounded to the pair's precision in the
-/// direction that keeps it inside the limit.
-pub(super) fn ioc_limit_price(side: KrakenSide, limit: &PriceLimit, price_decimals: u32) -> Result<Decimal, String> {
-    let reference = Decimal::from_f64(limit.reference_price)
-        .filter(|price| *price > Decimal::ZERO)
-        .ok_or_else(|| format!("invalid reference price {}", limit.reference_price))?;
-    let cap = Decimal::from_f64(limit.max_slippage_bps / BPS_PER_RATIO_UNIT)
-        .filter(|cap| *cap >= Decimal::ZERO && *cap < Decimal::ONE)
-        .ok_or_else(|| format!("invalid slippage cap {} bps", limit.max_slippage_bps))?;
-    let price = match side {
-        KrakenSide::Sell => {
-            (reference * (Decimal::ONE - cap)).round_dp_with_strategy(price_decimals, RoundingStrategy::AwayFromZero)
-        }
-        KrakenSide::Buy => {
-            (reference * (Decimal::ONE + cap)).round_dp_with_strategy(price_decimals, RoundingStrategy::ToZero)
-        }
-    };
-    if price <= Decimal::ZERO {
-        return Err(format!("IOC price {price} is not valid"));
-    }
-    Ok(price)
-}
-
 fn below_minimum(message: String) -> CexBackendError {
     CexBackendError::BelowMinimum(message)
 }
@@ -213,31 +177,16 @@ fn sell_volume(pair: &KrakenPair, book: &KrakenBook, amount: Decimal) -> Result<
     Ok(volume)
 }
 
-/// A buy turns its quote budget into base volume. With a limit, every unit
-/// fills at or under the limit, so `budget / limit` never spends more than the
-/// budget. Without one, the volume comes from a walk over the asks.
-fn buy_volume(
-    pair: &KrakenPair,
-    book: &KrakenBook,
-    budget: Decimal,
-    limit_price: Option<Decimal>,
-    options: &SwapExecutionOptions,
-) -> Result<Decimal, CexBackendError> {
-    if options.buy_mode == BuyOrderInputMode::QuoteOrderQty {
-        return Err("Kraken buys need a base quantity, not a quote order quantity"
-            .to_string()
-            .into());
-    }
+/// A buy turns its quote budget into base volume. Every unit fills at or
+/// under the limit, so `budget / limit` never spends more than the budget.
+fn buy_volume(pair: &KrakenPair, budget: Decimal, limit_price: Decimal) -> Result<Decimal, CexBackendError> {
     if budget < pair.cost_min {
         return Err(below_minimum(format!(
             "Kraken quote budget {budget} is below cost minimum {}",
             pair.cost_min
         )));
     }
-    let volume = match limit_price {
-        Some(limit) => truncate(budget / limit, pair.lot_decimals),
-        None => market_buy_volume(pair, book, budget, options)?,
-    };
+    let volume = truncate(budget / limit_price, pair.lot_decimals);
     if volume < pair.order_min {
         return Err(below_minimum(format!(
             "Kraken base volume {volume} is below order minimum {}",
@@ -247,68 +196,20 @@ fn buy_volume(
     Ok(volume)
 }
 
-fn market_buy_volume(
-    pair: &KrakenPair,
-    book: &KrakenBook,
-    budget: Decimal,
-    options: &SwapExecutionOptions,
-) -> Result<Decimal, String> {
-    let cap_bps = options.max_quote_overspend_bps.unwrap_or(0.0);
-    if !cap_bps.is_finite() || !(0.0..=BPS_PER_RATIO_UNIT).contains(&cap_bps) {
-        return Err(format!("invalid Kraken quote overspend cap {cap_bps} bps"));
-    }
-    let max_spend = budget * (Decimal::ONE + Decimal::from_f64(cap_bps / BPS_PER_RATIO_UNIT).unwrap_or_default());
-    let mut remaining = budget;
-    let mut volume = Decimal::ZERO;
-    for level in book.asks.iter().filter(|level| is_tradable_level(level)) {
-        if remaining <= Decimal::ZERO {
-            break;
-        }
-        let take = level.quantity.min(remaining / level.price);
-        volume += take;
-        remaining -= take * level.price;
-    }
-    if remaining > Decimal::new(1, 10) {
-        return Err("not enough Kraken ask liquidity".to_string());
-    }
-    let volume = truncate(volume, pair.lot_decimals);
-    let estimated_cost = estimate_buy_cost(book, volume)?;
-    if estimated_cost > max_spend {
-        return Err(format!(
-            "Kraken buy estimate {estimated_cost} exceeds quote-input cap {max_spend}"
-        ));
-    }
-    Ok(volume)
-}
-
-/// A price at or below zero is not a price: dividing by it panics `Decimal`.
-/// Every walk skips such levels the same way, so sizing and repricing agree.
-fn is_tradable_level(level: &KrakenBookLevel) -> bool {
-    level.price > Decimal::ZERO
-}
-
-pub(super) fn estimate_buy_cost(book: &KrakenBook, base_volume: Decimal) -> Result<Decimal, String> {
-    walk(&book.asks, base_volume).ok_or_else(|| "not enough Kraken ask liquidity".to_string())
-}
-
+/// The quote a sell of `base_volume` gets from the bids. A price at or below
+/// zero is not a price, so such a level counts for nothing.
 pub(super) fn estimate_sell_output(book: &KrakenBook, base_volume: Decimal) -> Result<Decimal, String> {
-    walk(&book.bids, base_volume).ok_or_else(|| "not enough Kraken bid liquidity".to_string())
-}
-
-/// The quote value of `base_volume` taken from `levels`, or `None` when the
-/// priced depth runs out first.
-fn walk(levels: &[KrakenBookLevel], base_volume: Decimal) -> Option<Decimal> {
     let mut remaining = base_volume;
     let mut value = Decimal::ZERO;
-    for level in levels.iter().filter(|level| is_tradable_level(level)) {
+    for level in book.bids.iter().filter(|level| level.price > Decimal::ZERO) {
         let take = remaining.min(level.quantity);
         value += take * level.price;
         remaining -= take;
         if remaining <= Decimal::ZERO {
-            return Some(value);
+            return Ok(value);
         }
     }
-    (remaining <= Decimal::ZERO).then_some(value)
+    Err("not enough Kraken bid liquidity".to_string())
 }
 
 fn convert_levels(levels: Vec<KrakenBookLevel>) -> Result<Vec<OrderBookLevel>, String> {

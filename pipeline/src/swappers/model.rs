@@ -1,6 +1,8 @@
 use candid::{CandidType, Nat};
+use liquidium_pipeline_connectors::backend::cex_backend::PriceLimit;
 use liquidium_pipeline_core::tokens::{asset_id::AssetId, chain_token_amount::ChainTokenAmount};
 use liquidium_pipeline_core::types::side_cost::SideCost;
+use rust_decimal::{Decimal, RoundingStrategy, prelude::FromPrimitive};
 use serde::{Deserialize, Serialize};
 
 pub const BASIS_POINTS_DENOMINATOR: u32 = 10_000;
@@ -29,6 +31,33 @@ pub fn amount_after_bps_haircut(amount: &Nat, haircut_bps: u32) -> Result<Nat, S
         .checked_sub(haircut_bps)
         .ok_or_else(|| format!("basis-point haircut {haircut_bps} exceeds {BASIS_POINTS_DENOMINATOR}"))?;
     Ok((amount.clone() * Nat::from(retained_bps)) / Nat::from(BASIS_POINTS_DENOMINATOR))
+}
+
+/// The price of an IOC order under `limit`: the reference moved by the limit,
+/// or by `max_distance` when that is smaller, rounded to `decimals` toward the
+/// stricter price.
+pub(crate) fn ioc_limit_price(
+    sell: bool,
+    limit: &PriceLimit,
+    max_distance: Option<Decimal>,
+    decimals: u32,
+) -> Result<Decimal, String> {
+    let reference = Decimal::from_f64(limit.reference_price)
+        .filter(|price| *price > Decimal::ZERO)
+        .ok_or_else(|| format!("invalid reference price {}", limit.reference_price))?;
+    let cap = Decimal::from_f64(limit.max_slippage_bps / BPS_PER_RATIO_UNIT)
+        .filter(|cap| *cap >= Decimal::ZERO && *cap < Decimal::ONE)
+        .ok_or_else(|| format!("invalid slippage cap {} bps", limit.max_slippage_bps))?;
+    let distance = max_distance.map_or(cap, |max| cap.min(max));
+    let price = if sell {
+        (reference * (Decimal::ONE - distance)).round_dp_with_strategy(decimals, RoundingStrategy::AwayFromZero)
+    } else {
+        (reference * (Decimal::ONE + distance)).round_dp_with_strategy(decimals, RoundingStrategy::ToZero)
+    };
+    if price <= Decimal::ZERO {
+        return Err(format!("IOC price {price} is not valid"));
+    }
+    Ok(price.normalize())
 }
 
 #[derive(CandidType, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -129,6 +158,29 @@ mod tests {
     use liquidium_pipeline_core::tokens::{chain_token::ChainToken, chain_token_amount::ChainTokenAmount};
 
     use super::*;
+
+    #[test]
+    fn the_ioc_price_rounds_toward_the_stricter_side() {
+        let limit = PriceLimit {
+            reference_price: 60_000.05,
+            max_slippage_bps: 200.0,
+        };
+        // 58,800.049: a sell rounds up, so it never accepts less than the limit.
+        assert_eq!(
+            ioc_limit_price(true, &limit, None, 1).unwrap(),
+            Decimal::new(588_001, 1)
+        );
+        // 61,200.051: a buy rounds down, so it never pays more than the limit.
+        assert_eq!(
+            ioc_limit_price(false, &limit, None, 1).unwrap(),
+            Decimal::new(612_000, 1)
+        );
+        // A smaller distance wins: 1% instead of 2%.
+        assert_eq!(
+            ioc_limit_price(true, &limit, Some(Decimal::new(1, 2)), 0).unwrap(),
+            Decimal::new(59_401, 0)
+        );
+    }
 
     fn request() -> SwapRequest {
         let pay_token = ChainToken::EvmNative {
