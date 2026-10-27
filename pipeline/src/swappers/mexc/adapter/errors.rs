@@ -92,13 +92,13 @@ pub(super) fn is_definite_rejection(err: &v3::ApiError) -> bool {
     }
 }
 
-/// MEXC answered the IOC order with a refusal about the order itself, for
-/// example 30041 "current order type can not place order". Nothing was placed.
+/// MEXC refused the IOC order type itself (30041), so nothing was placed. Any
+/// other refusal, such as a price outside the band, must not become a market order.
 pub(super) fn is_ioc_refusal(err: &v3::ApiError) -> bool {
-    matches!(err, v3::ApiError::ErrorResponse(_))
-        && is_definite_rejection(err)
-        && !is_bad_symbol(err)
-        && !is_pending_settlement(err)
+    matches!(
+        err,
+        v3::ApiError::ErrorResponse(resp) if resp.code == v3::ErrorCode::CurrentOrderTypeCanNotPlaceOrder
+    )
 }
 
 pub(super) fn is_order_missing_lookup_error(message: &str) -> bool {

@@ -6,9 +6,12 @@ use crate::swappers::model::BPS_PER_RATIO_UNIT;
 /// Hard stop to avoid unbounded per-leg slicing loops on pathological books.
 const MAX_SLICE_EXECUTION_ROUNDS: usize = 128;
 
-/// Orders in a row that fill nothing within the price limit before the leg
-/// pauses until the next cycle. A pause is a wait, not an error.
+/// Orders in a row that fill nothing at the slippage cap before the limit
+/// widens. The leg pauses until the next cycle once the widest limit also fills nothing.
 const MAX_EMPTY_FILLS_IN_A_ROW: usize = 3;
+
+/// How much each order past the empty fills at the cap widens the IOC limit.
+const IOC_WIDEN_STEP_BPS: f64 = 100.0;
 
 impl<C> CexVenueFinalizer<C>
 where
@@ -34,10 +37,11 @@ where
     ///   soft target (`target_bps`) first, hard-cap fallback second.
     /// - `maybe_mark_trade_dust` stops execution when, after the leg's first fill,
     ///   the chunk and remainder notional are both below `cex_min_exec_usd`.
-    /// - each accepted chunk is sent as an IOC limit order at the slippage cap.
+    /// - each accepted chunk is sent as an IOC limit order at the slippage cap;
+    ///   after empty fills the limit widens in steps to `max_widened_slippage_bps`.
     /// - realized `exec_price` is derived from actual fills and compared to preview
     ///   midpoint to compute realized slippage in bps.
-    /// - if realized slippage exceeds `max_sell_slippage_bps`, the leg fails fast.
+    /// - if realized slippage exceeds the slice's limit, the leg fails fast.
     /// - each executed slice is recorded, and the route slippage is computed from the records.
     ///
     /// Returns `Some((remaining_in, total_out))` once the leg is done, where
@@ -98,8 +102,9 @@ where
             let buy_mode = Self::resolve_slice_buy_mode(state, leg, &mut forced_next_buy_mode);
             let pending = Self::prepare_pending_slice_request(state, leg, leg_idx, preview.chunk_in, buy_mode);
 
-            // The exchange enforces the slippage cap with an IOC order. Only if
-            // the exchange refuses IOC outright does the slice go out as a market order.
+            // The exchange enforces the limit with an IOC order. Only if the
+            // exchange refuses IOC outright does the slice go out as a market order.
+            let limit_bps = self.slice_limit_bps(empty_fills_in_a_row);
             let fill_report = self
                 .backend
                 .execute_swap_detailed_with_options(
@@ -112,7 +117,7 @@ where
                         max_quote_overspend_bps: Some(self.cex_buy_inverse_overspend_bps as f64),
                         price_limit: Some(PriceLimit {
                             reference_price: preview.preview_mid_price,
-                            max_slippage_bps: self.max_sell_slippage_bps,
+                            max_slippage_bps: limit_bps,
                         }),
                     },
                 )
@@ -127,13 +132,13 @@ where
                     .trade_applied_client_order_ids
                     .push(pending.client_order_id.clone());
                 empty_fills_in_a_row += 1;
-                if empty_fills_in_a_row >= MAX_EMPTY_FILLS_IN_A_ROW {
+                if empty_fills_in_a_row >= MAX_EMPTY_FILLS_IN_A_ROW && limit_bps >= self.max_widened_slippage_bps {
                     // The book keeps moving away. Waiting costs no retry budget,
                     // so the capital is never parked for this alone.
                     Self::persist_trade_progress(state, remaining_in, total_out);
                     warn!(
-                        "[cex] liq_id={} {} {}: {} orders in a row filled nothing within the limit; retrying next cycle",
-                        state.liq_id, leg.market, leg.side, empty_fills_in_a_row
+                        "[cex] liq_id={} {} {}: {} orders in a row filled nothing up to a {:.0} bps limit; retrying next cycle",
+                        state.liq_id, leg.market, leg.side, empty_fills_in_a_row, limit_bps
                     );
                     return Ok(None);
                 }
@@ -190,13 +195,13 @@ where
             );
 
             // Enforce hard per-slice slippage limit before allowing leg continuation.
-            if slice_slippage_bps > self.max_sell_slippage_bps {
+            if slice_slippage_bps > limit_bps {
                 let err = format!(
                     "slice slippage too high for {} {}: {:.2} bps > {:.2} bps (client_id={} buy_mode={} requested_in={} actual_in={} actual_out={} preview_mid={} exec_price={})",
                     leg.market,
                     leg.side,
                     slice_slippage_bps,
-                    self.max_sell_slippage_bps,
+                    limit_bps,
                     pending.client_order_id,
                     pending.buy_mode_label,
                     pending.requested_in,
@@ -238,6 +243,13 @@ where
         Self::persist_trade_progress(state, remaining_in, total_out);
         // Return any unexecuted residual (often 0 or dust) plus total output of this leg.
         Ok(Some((remaining_in, total_out)))
+    }
+
+    /// The IOC limit for the next order: the cap until the empty fills at the
+    /// cap run out, then one step wider per empty fill, never past the widened maximum.
+    fn slice_limit_bps(&self, empty_fills_in_a_row: usize) -> f64 {
+        let widenings = empty_fills_in_a_row.saturating_sub(MAX_EMPTY_FILLS_IN_A_ROW - 1);
+        (self.max_sell_slippage_bps + IOC_WIDEN_STEP_BPS * widenings as f64).min(self.max_widened_slippage_bps)
     }
 
     fn persist_trade_progress(state: &mut CexState, remaining_in: f64, total_out: f64) {

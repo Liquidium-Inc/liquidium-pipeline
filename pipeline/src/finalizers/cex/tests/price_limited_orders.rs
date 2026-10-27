@@ -129,3 +129,56 @@ async fn empty_fills_in_a_row_pause_the_leg_without_an_error() {
     assert_eq!(state.trade.trade_slices.len(), 1);
     assert_eq!(state.trade.trade_leg_index, Some(1));
 }
+
+fn limits(orders: &Orders) -> Vec<f64> {
+    orders
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|order| order.price_limit.expect("every order has a limit").max_slippage_bps)
+        .collect()
+}
+
+/// After the empty fills at the cap, each order widens the limit by one step
+/// up to the maximum, then the leg pauses. The next cycle starts at the cap again.
+#[tokio::test]
+async fn empty_fills_widen_the_limit_in_steps_up_to_the_maximum() {
+    let (finalizer, orders) = finalizer_with_fills(vec![Some(0.0); 5].into_iter().chain([None]).collect());
+    let finalizer = finalizer.with_widened_slippage_cap(TEST_MAX_SELL_SLIPPAGE_BPS + 200.0);
+    let mut state = trade_state(&finalizer).await;
+
+    finalizer
+        .trade(&mut state)
+        .await
+        .expect("a pause is a wait, not an error");
+
+    let cap = TEST_MAX_SELL_SLIPPAGE_BPS;
+    assert_eq!(limits(&orders), vec![cap, cap, cap, cap + 100.0, cap + 200.0]);
+    assert!(state.trade.trade_slices.is_empty());
+
+    finalizer.trade(&mut state).await.expect("the next cycle fills");
+    assert_eq!(limits(&orders)[5], cap, "a new cycle starts at the cap");
+    assert_eq!(state.trade.trade_slices.len(), 1);
+}
+
+/// A fill at a widened limit passes the check for that limit, and the next
+/// order is back at the cap.
+#[tokio::test]
+async fn a_fill_at_a_widened_limit_resets_the_limit_to_the_cap() {
+    let (finalizer, orders) = finalizer_with_fills(vec![Some(0.0), Some(0.0), Some(0.0), Some(0.0001), None]);
+    let finalizer = finalizer.with_widened_slippage_cap(TEST_MAX_SELL_SLIPPAGE_BPS + 200.0);
+    let mut state = trade_state(&finalizer).await;
+
+    finalizer.trade(&mut state).await.expect("the leg fills");
+
+    let cap = TEST_MAX_SELL_SLIPPAGE_BPS;
+    assert_eq!(limits(&orders), vec![cap, cap, cap, cap + 100.0, cap]);
+    assert_eq!(state.trade.trade_slices.len(), 2);
+}
+
+#[test]
+fn a_maximum_below_the_cap_leaves_the_cap_in_force() {
+    let (finalizer, _) = finalizer_with_fills(vec![]);
+    let finalizer = finalizer.with_widened_slippage_cap(TEST_MAX_SELL_SLIPPAGE_BPS - 50.0);
+    assert_eq!(finalizer.max_widened_slippage_bps, TEST_MAX_SELL_SLIPPAGE_BPS);
+}

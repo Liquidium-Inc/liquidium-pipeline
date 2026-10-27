@@ -522,6 +522,7 @@ mod tests {
             db_path: "wal.db".to_string(),
             max_allowed_dex_slippage: 125,
             max_allowed_cex_slippage_bps: 200,
+            max_widened_cex_slippage_bps: 400,
             bad_debt_collateral_slippage_bps: 500,
             cex_min_exec_usd: 5.0,
             cex_slice_target_ratio: 0.85,

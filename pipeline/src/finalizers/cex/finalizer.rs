@@ -76,6 +76,9 @@ where
     pub(super) outbound: Arc<dyn OutboundSender>,
     pub liquidator_principal: Principal,
     pub max_sell_slippage_bps: f64,
+    /// The widest IOC limit after orders at the cap fill nothing. Equal to the
+    /// cap, it turns widening off.
+    pub max_widened_slippage_bps: f64,
     /// Minimum USD notional allowed for any CEX execution slice.
     pub cex_min_exec_usd: f64,
     /// Target fraction of slippage cap used for per-slice sizing.
@@ -167,6 +170,12 @@ where
         self
     }
 
+    /// A maximum below the cap leaves the cap in force.
+    pub fn with_widened_slippage_cap(mut self, max_widened_slippage_bps: f64) -> Self {
+        self.max_widened_slippage_bps = max_widened_slippage_bps.max(self.max_sell_slippage_bps);
+        self
+    }
+
     pub fn with_quote_costs(mut self, route_fee_bps: u32, delay_buffer_bps: u32) -> Self {
         self.quote_route_fee_bps = route_fee_bps;
         self.quote_delay_buffer_bps = delay_buffer_bps;
@@ -219,6 +228,7 @@ where
             transfer_service,
             liquidator_principal,
             max_sell_slippage_bps,
+            max_widened_slippage_bps: max_sell_slippage_bps,
             cex_min_exec_usd,
             cex_slice_target_ratio,
             cex_buy_truncation_trigger_ratio,

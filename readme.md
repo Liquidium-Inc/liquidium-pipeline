@@ -234,6 +234,7 @@ ICPSWAP_DUST_FALLBACK_MAX_PRICE_IMPACT_BPS=150
 CEX_MEXC_API_KEY=your_api_key
 CEX_MEXC_API_SECRET=your_api_secret
 MAX_ALLOWED_CEX_SLIPPAGE_BPS=200  # 2.00% in basis points
+MAX_WIDENED_CEX_SLIPPAGE_BPS=400  # 4.00%: widest IOC limit after empty fills at the cap
 
 # Liquidation guard (bad debt only)
 BAD_DEBT_COLLATERAL_SLIPPAGE_BPS=500  # 5.00% haircut used for min collateral
@@ -339,7 +340,8 @@ Even with slicing, execution still has market-impact and timing risk:
 
 How config controls this risk:
 
-- `MAX_ALLOWED_CEX_SLIPPAGE_BPS`: hard per-slice reject limit (safety brake).
+- `MAX_ALLOWED_CEX_SLIPPAGE_BPS`: the IOC limit of each slice order, and the per-slice reject limit (safety brake).
+- `MAX_WIDENED_CEX_SLIPPAGE_BPS`: after 3 orders in a row fill nothing at the cap, each next order widens the limit by 100 bps up to this value. When the widest order also fills nothing, the leg waits for the next cycle. A value at or below the cap turns widening off. No order goes out without a limit, unless the exchange refuses the IOC order type itself.
 - `CEX_SLICE_TARGET_RATIO`: softer sizing target below hard limit (execution smoothness).
 - `CEX_MIN_EXEC_USD`: prevents low-notional micro-fills that usually have poor quality.
 - `CEX_BUY_*`: controls adaptive buy fallback when quote-mode truncation leaves meaningful residual.

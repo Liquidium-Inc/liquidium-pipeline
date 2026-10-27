@@ -51,6 +51,9 @@ pub struct Config {
     pub db_path: String,
     pub max_allowed_dex_slippage: u32,
     pub max_allowed_cex_slippage_bps: u32,
+    /// The widest IOC limit after orders at the CEX cap fill nothing. A value
+    /// at or below the cap turns widening off.
+    pub max_widened_cex_slippage_bps: u32,
     pub bad_debt_collateral_slippage_bps: u32,
     /// Minimum USD notional allowed for a single CEX execution chunk.
     /// Chunks below this threshold are treated as dust.
@@ -381,6 +384,7 @@ impl Config {
             parse_slippage_bps_from_env("MAX_ALLOWED_DEX_SLIPPAGE", DEFAULT_MAX_ALLOWED_DEX_SLIPPAGE_BPS)?;
         let max_allowed_cex_slippage_bps =
             parse_slippage_bps_from_env("MAX_ALLOWED_CEX_SLIPPAGE_BPS", DEFAULT_MAX_ALLOWED_CEX_SLIPPAGE_BPS)?;
+        let max_widened_cex_slippage_bps = parse_widened_cex_slippage_bps_from_env()?;
 
         let bad_debt_collateral_slippage_bps = parse_bad_debt_collateral_slippage_bps_from_env();
         let cex_tunables = parse_cex_tunables_from_env();
@@ -436,6 +440,7 @@ impl Config {
             db_path,
             max_allowed_dex_slippage,
             max_allowed_cex_slippage_bps,
+            max_widened_cex_slippage_bps,
             bad_debt_collateral_slippage_bps,
             cex_min_exec_usd: cex_tunables.min_exec_usd,
             cex_slice_target_ratio: cex_tunables.slice_target_ratio,
@@ -653,6 +658,7 @@ fn parse_bad_debt_collateral_slippage_bps_from_env() -> u32 {
 const MAX_CONFIGURABLE_SLIPPAGE_BPS: u32 = 2_000;
 const DEFAULT_MAX_ALLOWED_DEX_SLIPPAGE_BPS: u32 = 125;
 const DEFAULT_MAX_ALLOWED_CEX_SLIPPAGE_BPS: u32 = 200;
+const DEFAULT_MAX_WIDENED_CEX_SLIPPAGE_BPS: u32 = 400;
 
 /// Reads a basis-point slippage allowance, falling back to the shared
 /// `MAX_ALLOWED_SLIPPAGE_BPS` and then to `default_bps`.
@@ -678,7 +684,20 @@ fn parse_slippage_bps_from_env(primary: &str, default_bps: u32) -> Result<u32, S
     else {
         return Ok(default_bps);
     };
+    parse_slippage_bps(name, &trimmed)
+}
 
+/// The widest IOC limit after orders at the cap fill nothing. It has no shared
+/// fallback, because the shared value is a cap, not a widened limit.
+fn parse_widened_cex_slippage_bps_from_env() -> Result<u32, String> {
+    const NAME: &str = "MAX_WIDENED_CEX_SLIPPAGE_BPS";
+    match env::var(NAME).ok().map(|value| value.trim().to_string()) {
+        Some(value) if !value.is_empty() => parse_slippage_bps(NAME, &value),
+        _ => Ok(DEFAULT_MAX_WIDENED_CEX_SLIPPAGE_BPS),
+    }
+}
+
+fn parse_slippage_bps(name: &str, trimmed: &str) -> Result<u32, String> {
     let parsed: u32 = trimmed
         .parse()
         .map_err(|_| format!("{name}='{trimmed}' is not a whole number of basis points (e.g. 125 for 1.25%)"))?;
@@ -1319,6 +1338,32 @@ mod tests {
         unsafe {
             env::remove_var("SWAPPER");
             env::remove_var("ENABLED_SWAP_VENUES");
+        }
+    }
+
+    #[test]
+    fn the_widened_cex_limit_has_its_own_default_and_no_shared_fallback() {
+        let _guard = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        unsafe {
+            env::remove_var("MAX_WIDENED_CEX_SLIPPAGE_BPS");
+            env::set_var("MAX_ALLOWED_SLIPPAGE_BPS", "150");
+        }
+        assert_eq!(parse_widened_cex_slippage_bps_from_env().unwrap(), 400);
+
+        unsafe {
+            env::set_var("MAX_WIDENED_CEX_SLIPPAGE_BPS", " 300 ");
+        }
+        assert_eq!(parse_widened_cex_slippage_bps_from_env().unwrap(), 300);
+
+        for bad in ["3%", "9999"] {
+            unsafe {
+                env::set_var("MAX_WIDENED_CEX_SLIPPAGE_BPS", bad);
+            }
+            assert!(parse_widened_cex_slippage_bps_from_env().is_err(), "{bad}");
+        }
+        unsafe {
+            env::remove_var("MAX_WIDENED_CEX_SLIPPAGE_BPS");
+            env::remove_var("MAX_ALLOWED_SLIPPAGE_BPS");
         }
     }
 

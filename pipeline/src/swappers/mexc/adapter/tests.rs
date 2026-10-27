@@ -549,6 +549,22 @@ async fn an_ambiguous_ioc_error_sends_no_market_order() {
     assert_eq!(server.await.unwrap().len(), 1);
 }
 
+/// Only an unsupported order type sends the market order. Any other refusal
+/// of the IOC order, such as its price, must not become an order without a limit.
+#[tokio::test]
+async fn a_refused_ioc_price_sends_no_market_order() {
+    let refused = r#"{"code":30010,"msg":"no valid trade price"}"#;
+    // The server would accept a market order, so only the refusal rule stops one.
+    let (endpoint, server) = serve(vec![(400, refused), (200, ACCEPTED)]).await;
+
+    let placed = tokio::time::timeout(std::time::Duration::from_secs(5), submit(endpoint))
+        .await
+        .unwrap();
+    server.abort();
+
+    assert!(placed.is_err(), "no market order after a price refusal: {placed:?}");
+}
+
 fn coin(coin: &str, networks: &[(&str, &str, bool, &str)]) -> mexc_rs::spot::v3::coin_config::CoinConfig {
     serde_json::from_value(serde_json::json!({
         "coin": coin,

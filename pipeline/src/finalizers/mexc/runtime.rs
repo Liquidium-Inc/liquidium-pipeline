@@ -32,6 +32,7 @@ pub async fn build_mexc_finalizer(
             config.cex_buy_inverse_max_retries,
             config.cex_buy_inverse_enabled,
         )
+        .with_widened_slippage_cap(config.max_widened_cex_slippage_bps as f64)
         .with_token_registry(ctx.registry.clone())
         .with_quote_costs(config.cex_route_fee_bps, config.cex_delay_buffer_bps)
         .with_bridge_runtime(bridge)
