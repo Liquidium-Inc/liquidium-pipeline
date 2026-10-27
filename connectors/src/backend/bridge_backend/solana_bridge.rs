@@ -1252,8 +1252,9 @@ mod tests {
         let err = backend
             .submit_bridge(request)
             .await
-            .expect_err("non-solana route kind must fail");
-        assert!(err.to_string().contains("is not supported by SolanaBridgeBackend"));
+            .expect_err("non-solana route kind must fail")
+            .to_string();
+        assert!(err.contains("is not supported by SolanaBridgeBackend"));
     }
 
     #[tokio::test]
@@ -1284,8 +1285,9 @@ mod tests {
         let err = backend
             .submit_bridge(request)
             .await
-            .expect_err("source/configured bridge source mismatch must fail");
-        assert!(err.to_string().contains("does not match configured bridge source"));
+            .expect_err("source/configured bridge source mismatch must fail")
+            .to_string();
+        assert!(err.contains("does not match configured bridge source"));
     }
 
     #[tokio::test]
@@ -1606,8 +1608,9 @@ mod tests {
         let err = backend
             .submit_bridge(request)
             .await
-            .expect_err("insufficient bridge source balance must fail");
-        assert!(err.to_string().contains("below transfer+fee buffer budget"));
+            .expect_err("insufficient bridge source balance must fail")
+            .to_string();
+        assert!(err.contains("below transfer+fee buffer budget"));
     }
 
     #[tokio::test]
@@ -1657,15 +1660,15 @@ mod tests {
         let err = backend
             .submit_bridge(request)
             .await
-            .expect_err("transfer failure must fail submission");
+            .expect_err("transfer failure must fail submission")
+            .to_string();
         assert_eq!(
-            err.to_string()
-                .starts_with(liquidium_pipeline_core::outbound::SIDE_EFFECT_AMBIGUOUS_PREFIX),
+            err.starts_with(liquidium_pipeline_core::outbound::SIDE_EFFECT_AMBIGUOUS_PREFIX),
             ambiguous,
             "{err}"
         );
-        assert!(err.to_string().contains("SOL transfer from configured bridge source"));
-        assert!(err.to_string().contains("rpc failure"));
+        assert!(err.contains("SOL transfer from configured bridge source"));
+        assert!(err.contains("rpc failure"));
         }
     }
 
@@ -1703,8 +1706,9 @@ mod tests {
         let err = backend
             .submit_bridge(request)
             .await
-            .expect_err("missing proxy canister should fail-fast");
-        assert!(err.to_string().contains("bridge proxy canister is not configured"));
+            .expect_err("missing proxy canister should fail-fast")
+            .to_string();
+        assert!(err.contains("bridge proxy canister is not configured"));
     }
 
     #[tokio::test]
@@ -1719,8 +1723,9 @@ mod tests {
         let err = backend
             .submit_bridge(wrong_owner)
             .await
-            .expect_err("owner mismatch must fail");
-        assert!(err.to_string().contains("does not match configured bridge owner"));
+            .expect_err("owner mismatch must fail")
+            .to_string();
+        assert!(err.contains("does not match configured bridge owner"));
 
         let with_subaccount = Account {
             owner: bridge_owner(),
@@ -1730,8 +1735,9 @@ mod tests {
         let err = backend
             .submit_bridge(icp_to_sol_request(with_subaccount))
             .await
-            .expect_err("subaccount source must fail");
-        assert!(err.to_string().contains("subaccount must be None"));
+            .expect_err("subaccount source must fail")
+            .to_string();
+        assert!(err.contains("subaccount must be None"));
     }
 
     #[tokio::test]
@@ -1800,8 +1806,9 @@ mod tests {
         let err = backend
             .submit_bridge(icp_to_sol_request(bridge_owner().to_text()))
             .await
-            .expect_err("withdraw error must propagate with explicit variant");
-        assert!(err.to_string().contains("InsufficientAllowance"));
+            .expect_err("withdraw error must propagate with explicit variant")
+            .to_string();
+        assert!(err.contains("InsufficientAllowance"));
     }
 
     #[tokio::test]

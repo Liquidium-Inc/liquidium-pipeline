@@ -339,8 +339,8 @@ async fn forward_bridge_rejects_subaccount_destination_when_native_helper_is_res
         provider_fee_budget_native_units: None,
     };
 
-    let err = backend.submit_bridge(request).await.expect_err("must fail");
-    assert!(err.to_string().contains("does not support subaccount destinations"));
+    let err = backend.submit_bridge(request).await.expect_err("must fail").to_string();
+    assert!(err.contains("does not support subaccount destinations"));
 }
 
 #[tokio::test]
@@ -595,10 +595,11 @@ async fn forward_bridge_fails_preflight_when_balance_is_insufficient() {
     let err = backend
         .submit_bridge(request)
         .await
-        .expect_err("bridge must fail preflight");
-    assert!(err.to_string().contains("bridge amount preflight failed"));
-    assert!(err.to_string().contains("available=999999"));
-    assert!(err.to_string().contains("required=1000000"));
+        .expect_err("bridge must fail preflight")
+        .to_string();
+    assert!(err.contains("bridge amount preflight failed"));
+    assert!(err.contains("available=999999"));
+    assert!(err.contains("required=1000000"));
 }
 
 #[tokio::test]
@@ -822,11 +823,9 @@ async fn native_forward_bridge_rejects_insufficient_eth_after_gas_reserve() {
     let err = backend
         .submit_bridge(request)
         .await
-        .expect_err("bridge must fail preflight");
-    assert!(
-        err.to_string()
-            .contains("ETH balance is below requested deposit amount plus gas reserve")
-    );
+        .expect_err("bridge must fail preflight")
+        .to_string();
+    assert!(err.contains("ETH balance is below requested deposit amount plus gas reserve"));
 }
 
 #[tokio::test]
@@ -885,8 +884,9 @@ async fn native_forward_bridge_propagates_dynamic_gas_reserve_errors() {
     let err = backend
         .submit_bridge(request)
         .await
-        .expect_err("gas reserve failure should stop native forward bridge");
-    assert!(err.to_string().contains("native gas price fetch failed"));
+        .expect_err("gas reserve failure should stop native forward bridge")
+        .to_string();
+    assert!(err.contains("native gas price fetch failed"));
 }
 
 #[tokio::test]
@@ -1677,8 +1677,8 @@ async fn native_reverse_bridge_rejects_wrong_bridge_owner() {
         provider_fee_budget_native_units: None,
     };
 
-    let err = backend.submit_bridge(request).await.expect_err("must fail");
-    assert!(err.to_string().contains("does not match configured bridge owner"));
+    let err = backend.submit_bridge(request).await.expect_err("must fail").to_string();
+    assert!(err.contains("does not match configured bridge owner"));
 }
 
 mod lost_submission_lookup {
@@ -1938,14 +1938,16 @@ async fn forward_bridge_helper_send_error_is_ambiguous() {
     };
 
     // The transaction can land after the error, so a repeat would deposit twice.
-    let error = backend.submit_bridge(request).await.expect_err("the send failed");
+    let error = backend
+        .submit_bridge(request)
+        .await
+        .expect_err("the send failed")
+        .to_string();
     assert!(
-        error
-            .to_string()
-            .starts_with(liquidium_pipeline_core::outbound::SIDE_EFFECT_AMBIGUOUS_PREFIX),
+        error.starts_with(liquidium_pipeline_core::outbound::SIDE_EFFECT_AMBIGUOUS_PREFIX),
         "{error}"
     );
-    assert!(error.to_string().contains("rpc timed out"), "{error}");
+    assert!(error.contains("rpc timed out"), "{error}");
 }
 
 #[tokio::test]

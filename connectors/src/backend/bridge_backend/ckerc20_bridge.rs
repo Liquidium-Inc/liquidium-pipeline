@@ -513,21 +513,7 @@ where
         Nat::from(DEFAULT_CKETH_MIN_WITHDRAWAL_WEI)
     }
 
-    fn below_minimum_bridge_error(
-        asset: &str,
-        chain: &str,
-        target_asset: &str,
-        amount: f64,
-        minimum: f64,
-    ) -> BridgeError {
-        BridgeError::BelowMinimum(format!(
-            "{}@{} -> {} amount below minimum withdrawal (amount={} minimum={})",
-            asset, chain, target_asset, amount, minimum
-        ))
-    }
-
-    async fn ensure_native_cketh_withdrawal_minimum(
-        &self,
+    fn ensure_native_cketh_withdrawal_minimum(
         route: &BridgeRouteSpec,
         amount_native: &Nat,
         amount: f64,
@@ -535,13 +521,10 @@ where
         let minimum_native = Self::native_cketh_minimum_withdrawal_amount();
         if amount_native < &minimum_native {
             let minimum = nat_units_to_amount_via_core(&minimum_native, ETH_DECIMALS)?;
-            return Err(Self::below_minimum_bridge_error(
-                route.source_asset,
-                route.source_chain,
-                route.target_asset,
-                amount,
-                minimum,
-            ));
+            return Err(BridgeError::BelowMinimum(format!(
+                "{}@{} -> {} amount below minimum withdrawal (amount={} minimum={})",
+                route.source_asset, route.source_chain, route.target_asset, amount, minimum
+            )));
         }
         Ok(())
     }
@@ -922,8 +905,7 @@ where
         let destination = expect_evm_destination(route, &request.destination)?;
         let cketh_ledger_id = parse_ckerc20_ledger_id(route)?;
         let amount_native = amount_to_nat_units_strict(request.amount, ETH_DECIMALS)?;
-        self.ensure_native_cketh_withdrawal_minimum(route, &amount_native, request.amount)
-            .await?;
+        Self::ensure_native_cketh_withdrawal_minimum(route, &amount_native, request.amount)?;
         let approve_fee = icrc1_fee_with_context(self.icp_backend.as_ref(), cketh_ledger_id, "cketh bridge").await?;
         // The minter burns exactly `amount` and sends `amount - gas`.
         let required_budget = amount_native.clone() + approve_fee.clone();
