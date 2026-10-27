@@ -373,6 +373,7 @@ fn persisted_adapter_state_defaults_a_missing_persistence_gate_to_closed() {
         ready_to_advance: true,
         intent_id: None,
         operator_required: false,
+        unreachable_since_ts: None,
     };
     let mut encoded = serde_json::to_value(state).expect("encode state");
     encoded
@@ -516,6 +517,7 @@ fn after_restart(cex: CexState) -> CexVenueExecutionState {
         ready_to_advance: true,
         intent_id: Some("lost-process-local-gate".into()),
         operator_required: false,
+        unreachable_since_ts: None,
     }
 }
 
@@ -1204,6 +1206,41 @@ async fn an_unreachable_venue_retries_without_spending_the_retry_budget() {
         .expect("MEXC state");
     assert!(!execution.operator_required);
     assert_eq!(execution.cex.trade.trade_settlement_waiting_since_ts, None);
+    assert!(execution.unreachable_since_ts.is_some(), "the outage wait starts");
+}
+
+/// An outage that outlasts the wait spends the retry budget, so the row
+/// parks with an alert instead of waiting in silence (audit L01).
+#[tokio::test]
+async fn an_unreachable_venue_past_the_wait_spends_the_retry_budget() {
+    let message = "Swap err: err=error sending request: error trying to connect: dns error";
+    let finalizer = finalizer_with_trade_result(Err(CexBackendError::Unreachable(message.to_string())), 0);
+    let mut leg = leg_at_trade_step(&finalizer, None).await;
+    let mut execution = leg
+        .execution
+        .decode::<CexVenueExecutionState>(VENUE_ID)
+        .expect("decode armed state")
+        .expect("MEXC state");
+    let since = now_ts() - UNREACHABLE_WAIT_SECS - 1;
+    execution.unreachable_since_ts = Some(since);
+    leg.execution = VenueExecutionState::new(VENUE_ID, &execution).expect("state should encode");
+
+    let progress = MultiVenueAdapter::advance(&finalizer, &leg, &NoopCheckpoint)
+        .await
+        .expect("a long outage is a retryable error, not a park");
+
+    assert_eq!(progress.status, VenueLegStatus::Running);
+    assert_eq!(progress.retryable_error.as_deref(), Some(message));
+    let execution = progress
+        .execution
+        .decode::<CexVenueExecutionState>(VENUE_ID)
+        .expect("decode state")
+        .expect("MEXC state");
+    assert_eq!(
+        execution.unreachable_since_ts,
+        Some(since),
+        "the outage keeps its start"
+    );
 }
 
 #[tokio::test]
@@ -1538,6 +1575,7 @@ mod bridged_deposit_restart {
             ready_to_advance: false,
             intent_id: None,
             operator_required: false,
+            unreachable_since_ts: None,
         };
 
         // The first cycle arms a fresh intent; the second runs the lookup.
@@ -1668,6 +1706,7 @@ async fn a_saved_withdrawal_is_written_then_sent_in_one_cycle_and_a_crash_settle
         ready_to_advance: false,
         intent_id: None,
         operator_required: false,
+        unreachable_since_ts: None,
     };
     let armed = decode(&live.advance_decoded_leg(fresh, &NoopCheckpoint).await.unwrap());
 

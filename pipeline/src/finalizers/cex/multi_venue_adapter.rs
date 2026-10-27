@@ -20,7 +20,6 @@ use crate::{
     utils::now_ts,
 };
 
-
 /// How long a leg keeps re-offering an order that the exchange rejects as not yet
 /// tradable before an operator has to look at it.
 ///
@@ -29,6 +28,10 @@ use crate::{
 /// live here rather than in the retry counter. The deadline still bounds it:
 /// an account that is genuinely short never resolves and must not loop forever.
 const SETTLEMENT_WAIT_TIMEOUT_SECS: i64 = 15 * 60;
+
+/// How long a leg waits for an exchange it cannot connect to before each
+/// failed cycle spends the retry budget. A lasting outage then parks with an alert.
+const UNREACHABLE_WAIT_SECS: i64 = 40 * 60;
 
 /// The exchange leg's complete venue-local state plus a persistence gate. The gate makes
 /// every call that may submit a transfer, order, withdrawal, or bridge request
@@ -42,6 +45,9 @@ struct CexVenueExecutionState {
     intent_id: Option<String>,
     #[serde(default)]
     operator_required: bool,
+    /// When the exchange first became unreachable in the current outage.
+    #[serde(default)]
+    unreachable_since_ts: Option<i64>,
 }
 
 impl CexVenueExecutionState {
@@ -68,6 +74,7 @@ where
             ready_to_advance: false,
             intent_id: None,
             operator_required: false,
+            unreachable_since_ts: None,
         };
 
         Ok(VenueRoutePreview {
@@ -203,6 +210,10 @@ where
         if let Err(error) = &outcome {
             execution.cex.last_error = Some(error.to_string());
         }
+        execution.unreachable_since_ts = match &outcome {
+            Err(CexBackendError::Unreachable(_)) => execution.unreachable_since_ts.or(Some(now_ts())),
+            _ => None,
+        };
         let error = match outcome {
             Err(error @ CexBackendError::PendingSettlement(_)) => {
                 return self.settlement_wait_progress(execution, error.to_string()).await;
@@ -214,14 +225,17 @@ where
                 progress.failure = Some(VenueLegFailure::BelowMinimum);
                 return Ok(progress);
             }
-            // The request never reached the venue, so the leg waits; the wait
-            // spends no retry budget.
+            // The request never reached the venue, so a short outage spends no
+            // retry budget. A long one does, so it cannot wait without an alert.
             Err(CexBackendError::Unreachable(message)) => {
+                let waited = execution
+                    .unreachable_since_ts
+                    .map_or(0, |since| now_ts().saturating_sub(since));
                 warn!(
-                    "[cex] liq_id={} venue unreachable at step={:?}: {}",
-                    execution.cex.liq_id, execution.cex.step, message
+                    "[cex] liq_id={} venue unreachable at step={:?} waited={}s: {}",
+                    execution.cex.liq_id, execution.cex.step, waited, message
                 );
-                None
+                (waited >= UNREACHABLE_WAIT_SECS).then_some(message)
             }
             // Only an operator can say which row owns the provider record, or
             // whether a call without an answer moved funds.
