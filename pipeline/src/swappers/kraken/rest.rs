@@ -10,8 +10,11 @@ use std::{
 use async_trait::async_trait;
 use kraken_async_rs::{
     clients::{
-        core_kraken_client::CoreKrakenClient, errors::ClientError, http_response_types::ResultErrorResponse,
-        kraken_client::KrakenClient, rate_limited_kraken_client::RateLimitedKrakenClient,
+        core_kraken_client::CoreKrakenClient,
+        errors::{ClientError, KrakenError},
+        http_response_types::ResultErrorResponse,
+        kraken_client::KrakenClient,
+        rate_limited_kraken_client::RateLimitedKrakenClient,
     },
     crypto::nonce_provider::{IncreasingNonceProvider, NonceProvider},
     request_types::{
@@ -32,14 +35,20 @@ use super::api::{
 };
 use super::client::canonical_symbol;
 
-/// Only a failed connection proves the request never left. A timeout or a
-/// broken response may come after Kraken acted.
+/// Only a failed connection proves the request never left, and only Kraken's
+/// own refusal proves it did nothing. A timeout, a broken response or an
+/// internal error may come after Kraken acted.
 fn transport_error(error: ClientError) -> KrakenApiError {
     match &error {
         ClientError::HyperClient(inner) if inner.is_connect() => KrakenApiError::Unreachable(error.to_string()),
+        ClientError::Kraken(KrakenError::InternalError) => KrakenApiError::Transport(error.to_string()),
+        ClientError::Kraken(refusal) => KrakenApiError::Rejected(format!("Kraken refused the request: {refusal}")),
         _ => KrakenApiError::Transport(error.to_string()),
     }
 }
+
+/// Kraken errors after which the request may still have run.
+const UNDECIDED_ERRORS: [&str; 2] = ["EGeneral:Internal error", "EService:Deadline elapsed"];
 
 struct OwnedSecretsProvider {
     key: String,
@@ -101,9 +110,13 @@ impl KrakenRestApi {
 }
 
 /// Kraken marks each `error` entry `E` (the request failed) or `W` (a warning
-/// on a request it carried out). A result next to an error is unclear, so the request may have acted.
+/// on a request it carried out). A result next to an error is unclear, so the
+/// request may have acted.
 fn read_answer<T>(errors: Vec<String>, result: Option<T>) -> Result<T, KrakenApiError> {
     let warnings_only = errors.iter().all(|entry| entry.starts_with('W'));
+    let undecided = errors
+        .iter()
+        .any(|entry| UNDECIDED_ERRORS.iter().any(|prefix| entry.starts_with(prefix)));
     match result {
         Some(result) if warnings_only => {
             if !errors.is_empty() {
@@ -111,15 +124,12 @@ fn read_answer<T>(errors: Vec<String>, result: Option<T>) -> Result<T, KrakenApi
             }
             Ok(result)
         }
-        Some(_) => Err(KrakenApiError::Transport(format!(
-            "Kraken answered with a result and errors: {}",
+        None if !warnings_only && !undecided => Err(KrakenApiError::Rejected(errors.join(" | "))),
+        result => Err(KrakenApiError::Transport(format!(
+            "Kraken gave no clear answer (result {}): [{}]",
+            if result.is_some() { "present" } else { "missing" },
             errors.join(" | ")
         ))),
-        None if errors.is_empty() || warnings_only => Err(KrakenApiError::Transport(format!(
-            "Kraken answered with no result: [{}]",
-            errors.join(" | ")
-        ))),
-        None => Err(KrakenApiError::Rejected(errors.join(" | "))),
     }
 }
 
@@ -400,9 +410,10 @@ mod tests {
             read_answer::<u8>(strings(&["EFunding:Unknown withdraw key"]), None),
             Err(KrakenApiError::Rejected(_))
         ));
-        // Mixed signals and empty answers may follow an action.
+        // Mixed signals, empty answers and undecided errors may follow an action.
         for (errors, result) in [
             (strings(&["EGeneral:Internal error"]), Some(1)),
+            (strings(&["EService:Deadline elapsed"]), None),
             (strings(&["WGeneral:Deprecated"]), None),
             (strings(&[]), None),
         ] {
@@ -411,6 +422,32 @@ mod tests {
                 "may have acted"
             );
         }
+    }
+
+    /// Review finding 6: the client turns Kraken's own refusals into errors
+    /// before the answer is read. Kraken did not act on them.
+    #[test]
+    fn kraken_refusals_are_rejections_and_only_an_internal_error_is_undecided() {
+        for refusal in [
+            KrakenError::TradingRateLimitExceeded,
+            KrakenError::RateLimitExceeded,
+            KrakenError::InvalidNonce,
+            KrakenError::PermissionDenied,
+            KrakenError::ServiceBusy,
+        ] {
+            assert!(matches!(
+                transport_error(ClientError::Kraken(refusal)),
+                KrakenApiError::Rejected(_)
+            ));
+        }
+        assert!(matches!(
+            transport_error(ClientError::Kraken(KrakenError::InternalError)),
+            KrakenApiError::Transport(_)
+        ));
+        assert!(matches!(
+            transport_error(ClientError::HttpStatus("502 Bad Gateway".into())),
+            KrakenApiError::Transport(_)
+        ));
     }
 
     #[test]
