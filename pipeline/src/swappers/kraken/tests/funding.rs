@@ -330,6 +330,33 @@ async fn each_withdrawal_failure_keeps_its_kind() {
     }
 }
 
+/// Review finding 9: nothing is sent before the reads succeed, so a failed
+/// read must take the outage wait, not spend a retry on a refusal.
+#[tokio::test]
+async fn a_failed_read_before_a_withdrawal_waits_like_an_outage() {
+    for failure in [
+        KrakenApiError::Unreachable("connection refused".into()),
+        KrakenApiError::Transport("operation timed out".into()),
+    ] {
+        let mut api = MockKrakenApi::new();
+        api.expect_withdrawal_methods().once().return_once(move |_| Err(failure));
+        api.expect_withdraw().never();
+        let error = btc_usd_client(api)
+            .withdraw("BTC", "bitcoin", "bc1qdestination", 0.01, "lq1w0")
+            .await
+            .expect_err("the read failed");
+        assert!(matches!(error, WithdrawError::Unreachable(_)), "{error:?}");
+    }
+
+    let mut api = funding_api(Decimal::ZERO, None);
+    api.expect_withdraw().never();
+    let error = btc_usd_client(api)
+        .withdraw("BTC", "bitcoin", "bc1qunverified", 0.01, "lq1w0")
+        .await
+        .expect_err("not a verified address");
+    assert!(matches!(error, WithdrawError::Refused(_)), "{error:?}");
+}
+
 /// A pending withdrawal is read every cycle and is nearly always among the
 /// newest, so the recent page answers first.
 #[tokio::test]

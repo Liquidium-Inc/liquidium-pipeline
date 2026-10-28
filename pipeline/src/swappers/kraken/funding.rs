@@ -174,11 +174,15 @@ impl KrakenClient {
         amount: f64,
     ) -> Result<WithdrawalReceipt, WithdrawError> {
         let amount_decimal = to_decimal(amount, "withdrawal amount").map_err(WithdrawError::Refused)?;
-        // Nothing is sent before these reads succeed, so a failure is a refusal.
+        // Nothing is sent before these reads succeed. A failed read waits like an
+        // outage, and a route Kraken cannot serve is a refusal.
         let (method, key) = self
             .resolve_withdrawal(asset, network, address)
             .await
-            .map_err(|error| WithdrawError::Refused(error.to_string()))?;
+            .map_err(|error| match error {
+                FundingRouteError::Unavailable(message) => WithdrawError::Unreachable(message),
+                other => WithdrawError::Refused(other.to_string()),
+            })?;
         // Kraken refuses a small amount with no code, so the minimum is checked here.
         if amount_decimal < method.minimum {
             return Err(WithdrawError::BelowMinimum(format!(
