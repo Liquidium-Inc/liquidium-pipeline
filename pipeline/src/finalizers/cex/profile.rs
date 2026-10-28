@@ -42,6 +42,14 @@ impl CexVenueProfile {
         }
     }
 
+    /// The profile of the exchange with this venue id, or `None` when the
+    /// venue is not an exchange.
+    pub fn for_venue(venue_id: &str) -> Option<Self> {
+        [Self::mexc(), Self::kraken()]
+            .into_iter()
+            .find(|profile| profile.venue_id == venue_id)
+    }
+
     /// The venue id the planner and the saved leg state use.
     pub fn venue_id(&self) -> &'static str {
         self.venue_id
