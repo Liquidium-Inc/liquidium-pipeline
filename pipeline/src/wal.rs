@@ -14,20 +14,29 @@ pub fn decode_receipt_wrapper(row: &LiqResultRecord) -> Result<Option<LiqMetaWra
     match serde_json::from_str::<LiqMetaWrapper>(&row.meta_json) {
         Ok(wrapper) => Ok(Some(wrapper)),
         Err(wrapper_err) => match serde_json::from_str::<ExecutionReceipt>(&row.meta_json) {
-            Ok(receipt) => Ok(Some(LiqMetaWrapper {
-                receipt,
-                meta: Vec::new(),
-                finalizer_decision: None,
-                profit_snapshot: None,
-                venue_execution: None,
-                meta_v2: None,
-            })),
+            Ok(receipt) => Ok(Some(LiqMetaWrapper::new(receipt))),
             Err(receipt_err) => Err(format!(
                 "invalid meta_json for {}: wrapper_err={}; receipt_err={}",
                 row.id, wrapper_err, receipt_err
             )),
         },
     }
+}
+
+/// Saves a new receipt into a row's meta and keeps every other part of it.
+pub async fn wal_save_receipt(
+    wal: &dyn WalStore,
+    mut row: LiqResultRecord,
+    receipt: &ExecutionReceipt,
+    touch: bool,
+) -> Result<(), String> {
+    let mut wrapper = decode_receipt_wrapper(&row)?.unwrap_or_else(|| LiqMetaWrapper::new(receipt.clone()));
+    wrapper.receipt = receipt.clone();
+    encode_meta(&mut row, &wrapper)?;
+    if touch {
+        row.updated_at = crate::utils::now_ts();
+    }
+    wal.upsert_result(row).await.map_err(|e| e.to_string())
 }
 
 pub fn encode_meta<T: Serialize>(row: &mut LiqResultRecord, meta: &T) -> Result<(), String> {

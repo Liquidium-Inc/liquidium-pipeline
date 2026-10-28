@@ -990,14 +990,7 @@ mod tests {
     #[tokio::test]
     async fn cex_finalize_runs_trade_pending_in_same_call() {
         let receipt = make_receipt(42);
-        let wrapper = LiqMetaWrapper {
-            receipt: receipt.clone(),
-            meta: Vec::new(),
-            finalizer_decision: None,
-            profit_snapshot: None,
-            venue_execution: None,
-            meta_v2: None,
-        };
+        let wrapper = LiqMetaWrapper::new(receipt.clone());
 
         let mut row = LiqResultRecord {
             id: "42".to_string(),
@@ -1034,14 +1027,7 @@ mod tests {
     #[tokio::test]
     async fn cex_finalize_persists_failed_retryable_and_resumes_from_serialized_state() {
         let receipt = make_receipt(777);
-        let wrapper = LiqMetaWrapper {
-            receipt: receipt.clone(),
-            meta: Vec::new(),
-            finalizer_decision: None,
-            profit_snapshot: None,
-            venue_execution: None,
-            meta_v2: None,
-        };
+        let wrapper = LiqMetaWrapper::new(receipt.clone());
 
         let mut row = LiqResultRecord {
             id: "777".to_string(),

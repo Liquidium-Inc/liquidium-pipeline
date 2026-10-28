@@ -197,13 +197,15 @@ impl WalStore for SqliteWalStore {
         .set((tbl::status.eq(ResultStatus::Enqueued as i32), tbl::updated_at.eq(now)))
         .execute(&mut conn)?;
 
+        // New work first, then retries that waited longest. Rows that retry for
+        // a long time (audit L17) must never fill the batch and starve new rows.
         let rows = tbl::table
             .filter(
                 tbl::status
                     .eq(ResultStatus::Enqueued as i32)
                     .or(tbl::status.eq(ResultStatus::FailedRetryable as i32)),
             )
-            .order(tbl::created_at.asc())
+            .order((tbl::status.asc(), tbl::updated_at.asc()))
             .limit(limit as i64)
             .load::<Row>(&mut conn)?;
         Ok(rows.into_iter().map(Self::from_row).collect())
@@ -241,6 +243,25 @@ impl WalStore for SqliteWalStore {
             .order(tbl::created_at.asc())
             .limit(limit as i64)
             .load::<Row>(&mut conn)?;
+        Ok(rows.into_iter().map(Self::from_row).collect())
+    }
+
+    async fn list_by_status_after(
+        &self,
+        status: ResultStatus,
+        after_id: Option<String>,
+        limit: usize,
+    ) -> Result<Vec<LiqResultRecord>> {
+        let mut conn = self.get_conn()?;
+        let mut query = tbl::table
+            .filter(tbl::status.eq(status as i32))
+            .order(tbl::liq_id.asc())
+            .limit(limit as i64)
+            .into_boxed();
+        if let Some(after_id) = after_id {
+            query = query.filter(tbl::liq_id.gt(after_id));
+        }
+        let rows = query.load::<Row>(&mut conn)?;
         Ok(rows.into_iter().map(Self::from_row).collect())
     }
 
@@ -624,31 +645,98 @@ mod tests {
         assert!(err.to_string().contains("read-only"));
     }
 
-    #[test]
-    fn operator_required_rows_are_persisted_but_not_returned_as_pending() {
+    /// A writable store in a temporary file and a runtime for its calls. Keep
+    /// the file handle alive for the whole test.
+    fn temp_store() -> (tempfile::NamedTempFile, SqliteWalStore, tokio::runtime::Runtime) {
         let temp = tempfile::NamedTempFile::new().expect("tmp db");
-        let path = temp.path().display().to_string();
-        let store = SqliteWalStore::new_with_busy_timeout(&path, 5_000).expect("store");
-        let now = now_secs();
-        let make_row = |id: &str, status| LiqResultRecord {
+        let store = SqliteWalStore::new_with_busy_timeout(&temp.path().display().to_string(), 5_000).expect("store");
+        (temp, store, tokio::runtime::Runtime::new().expect("runtime"))
+    }
+
+    fn record(id: &str, status: ResultStatus, created_at: i64, updated_at: i64) -> LiqResultRecord {
+        LiqResultRecord {
             id: id.to_string(),
             status,
             attempt: 0,
             error_count: 0,
             last_error: None,
-            created_at: now,
-            updated_at: now,
+            created_at,
+            updated_at,
             meta_json: "{}".to_string(),
-        };
-        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        }
+    }
+
+    fn ids(rows: Vec<LiqResultRecord>) -> Vec<String> {
+        rows.into_iter().map(|row| row.id).collect()
+    }
+
+    #[test]
+    fn rows_of_one_status_can_be_walked_in_pages() {
+        let (_temp, store, rt) = temp_store();
+        let now = now_secs();
+
+        rt.block_on(async {
+            for id in ["c", "a", "b"] {
+                store
+                    .upsert_result(record(id, ResultStatus::WaitingCollateral, now, now))
+                    .await
+                    .expect("seed waiting row");
+            }
+            store
+                .upsert_result(record("other", ResultStatus::Enqueued, now, now))
+                .await
+                .expect("seed other row");
+
+            let first = store
+                .list_by_status_after(ResultStatus::WaitingCollateral, None, 2)
+                .await
+                .unwrap();
+            assert_eq!(ids(first), ["a", "b"]);
+            let rest = store
+                .list_by_status_after(ResultStatus::WaitingCollateral, Some("b".to_string()), 2)
+                .await
+                .unwrap();
+            assert_eq!(ids(rest), ["c"]);
+        });
+    }
+
+    /// Audit L17: rows that retry for a long time must not fill the batch, or
+    /// a new liquidation would wait behind them.
+    #[test]
+    fn pending_rows_put_new_work_before_long_retries() {
+        let (_temp, store, rt) = temp_store();
+        let now = now_secs();
+
+        rt.block_on(async {
+            for (id, updated_at) in [("retry-recent", now - 60), ("retry-oldest", now - 3_600)] {
+                store
+                    .upsert_result(record(id, ResultStatus::FailedRetryable, now - 86_400, updated_at))
+                    .await
+                    .expect("seed retrying row");
+            }
+            store
+                .upsert_result(record("new", ResultStatus::Enqueued, now, now))
+                .await
+                .expect("seed new row");
+
+            let pending = store.get_pending(10).await.expect("pending rows");
+            assert_eq!(ids(pending), ["new", "retry-oldest", "retry-recent"]);
+            assert_eq!(store.get_pending(1).await.expect("one row")[0].id, "new");
+        });
+    }
+
+    #[test]
+    fn operator_required_rows_are_persisted_but_not_returned_as_pending() {
+        let (_temp, store, rt) = temp_store();
+        let now = now_secs();
 
         rt.block_on(async {
             store
-                .upsert_result(make_row("runnable", ResultStatus::Enqueued))
+                .upsert_result(record("runnable", ResultStatus::Enqueued, now, now))
                 .await
                 .expect("seed runnable row");
             store
-                .upsert_result(make_row("parked", ResultStatus::OperatorRequired))
+                .upsert_result(record("parked", ResultStatus::OperatorRequired, now, now))
                 .await
                 .expect("seed operator-required row");
 

@@ -108,17 +108,15 @@ impl LiquidationIntentStore for SqliteWalStore {
         self.ensure_writable()?;
         let liquidation = receipt.liquidation_result.as_ref().context("accepted receipt has no liquidation result")?;
         anyhow::ensure!(liquidation.id.to_string() == liquidation_id, "accepted receipt liquidation id mismatch");
+        // A row without a swap is enqueued too: the finalize stage records its
+        // profit, export and notification (audit L03).
         let status = match liquidation.collateral_tx.status {
-            TransferStatus::Success if receipt.request.swap_args.is_none() => ResultStatus::Succeeded,
             TransferStatus::Success => ResultStatus::Enqueued,
             TransferStatus::Pending | TransferStatus::Failed(_) => ResultStatus::WaitingCollateral,
         };
         let receipt_json = serde_json::to_string(receipt).context("encode accepted liquidation receipt")?;
         let now = now_secs();
         let meta_json = serde_json::to_string(&LiqMetaWrapper {
-            receipt: receipt.clone(),
-            meta: Vec::new(),
-            finalizer_decision: None,
             profit_snapshot: Some(WalProfitSnapshot {
                 expected_profit_raw: receipt.request.expected_profit.to_string(),
                 realized_profit_raw: None,
@@ -126,8 +124,7 @@ impl LiquidationIntentStore for SqliteWalStore {
                 debt_decimals: receipt.request.debt_asset.decimals(),
                 updated_at: now,
             }),
-            venue_execution: None,
-            meta_v2: None,
+            ..LiqMetaWrapper::new(receipt.clone())
         })?;
         let mut conn = self.get_conn()?;
         // Acceptance and runnable work commit together. No importer/cursor can
@@ -376,6 +373,8 @@ mod tests {
         assert_eq!(intent.liquidation_id.as_deref(), Some("42"));
 
         let mut row = store.get_result("42").await.unwrap().unwrap();
+        // No swap, but the finalize stage still records the outcome (audit L03).
+        assert_eq!(row.status, ResultStatus::Enqueued);
         row.status = ResultStatus::InFlight;
         row.attempt = 3;
         row.meta_json = "checkpoint".into();

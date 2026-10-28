@@ -444,7 +444,8 @@ impl Config {
             cex_retry_base_secs: cex_tunables.retry_base_secs,
             cex_retry_max_secs: cex_tunables.retry_max_secs,
             multi_venue_min_net_edge_bps: parse_multi_venue_min_net_edge_bps_from_env(),
-            multi_venue_settlement_min_net_edge_bps: parse_multi_venue_settlement_min_net_edge_bps_from_env(),
+            multi_venue_settlement_min_net_edge_bps: parse_multi_venue_settlement_min_net_edge_bps_from_env()
+                .or(Some(DEFAULT_MULTI_VENUE_SETTLEMENT_MIN_NET_EDGE_BPS)),
             multi_venue_bad_debt_min_net_edge_bps: parse_multi_venue_bad_debt_min_net_edge_bps_from_env(),
             multi_venue_max_oracle_discount_bps: parse_multi_venue_max_oracle_discount_bps_from_env(),
             multi_venue_oracle_snapshot_max_age_secs: parse_multi_venue_oracle_snapshot_max_age_secs_from_env(),
@@ -542,6 +543,9 @@ const DEFAULT_MULTI_VENUE_MIN_NET_EDGE_BPS: u32 = 150;
 /// Bad debt may return this much less than it repaid and still be recycled
 /// automatically; anything further underwater is escalated to an operator.
 const DEFAULT_MULTI_VENUE_BAD_DEBT_MIN_NET_EDGE_BPS: i32 = -500;
+/// After a liquidation the debt is already repaid, so the swap may return up to
+/// this much less (audit L17). The entry margin here would hold the collateral after an ordinary price move.
+const DEFAULT_MULTI_VENUE_SETTLEMENT_MIN_NET_EDGE_BPS: i32 = -150;
 const DEFAULT_MULTI_VENUE_MAX_ORACLE_DISCOUNT_BPS: u32 = 500;
 const DEFAULT_MULTI_VENUE_ORACLE_SNAPSHOT_MAX_AGE_SECS: i64 = 300;
 const DEFAULT_CEX_DELAY_BUFFER_BPS: u32 = 75;

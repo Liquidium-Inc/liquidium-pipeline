@@ -62,6 +62,20 @@ pub struct LiqMetaWrapper {
     pub meta_v2: Option<FinalizerMetaV2>,
 }
 
+impl LiqMetaWrapper {
+    /// A wrapper that holds only the receipt, as an accepted liquidation starts.
+    pub fn new(receipt: ExecutionReceipt) -> Self {
+        Self {
+            receipt,
+            meta: Vec::new(),
+            finalizer_decision: None,
+            profit_snapshot: None,
+            venue_execution: None,
+            meta_v2: None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct VenueExecutionState {
     pub venue: String,
@@ -137,6 +151,17 @@ pub trait WalStore: Send + Sync {
     async fn list_updated_since(&self, since_ts: i64, limit: usize) -> Result<Vec<LiqResultRecord>> {
         let _ = (since_ts, limit);
         anyhow::bail!("list_updated_since is not supported by this store")
+    }
+    /// Rows with `status` whose id comes after `after_id`, in id order. A caller
+    /// walks every row in pages by passing the last id it saw.
+    async fn list_by_status_after(
+        &self,
+        status: ResultStatus,
+        after_id: Option<String>,
+        limit: usize,
+    ) -> Result<Vec<LiqResultRecord>> {
+        let _ = (status, after_id, limit);
+        anyhow::bail!("list_by_status_after is not supported by this store")
     }
     async fn get_pending(&self, limit: usize) -> Result<Vec<LiqResultRecord>>;
     async fn update_status(&self, liq_id: &str, next: ResultStatus, bump_attempt: bool) -> Result<()>;

@@ -741,12 +741,8 @@ mod tests {
             change_received: true,
         };
         let wrapper = LiqMetaWrapper {
-            receipt,
-            meta: Vec::new(),
-            finalizer_decision: None,
-            profit_snapshot: None,
-            venue_execution: None,
             meta_v2: Some(meta_v2),
+            ..LiqMetaWrapper::new(receipt)
         };
 
         LiqResultRecord {

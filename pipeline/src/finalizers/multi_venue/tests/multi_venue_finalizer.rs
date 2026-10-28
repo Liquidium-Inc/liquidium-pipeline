@@ -78,14 +78,7 @@ struct TestWal {
 
 impl TestWal {
     fn with_receipt(receipt: &ExecutionReceipt) -> Self {
-        let wrapper = LiqMetaWrapper {
-            receipt: receipt.clone(),
-            meta: Vec::new(),
-            finalizer_decision: None,
-            profit_snapshot: None,
-            venue_execution: None,
-            meta_v2: None,
-        };
+        let wrapper = LiqMetaWrapper::new(receipt.clone());
         Self::with_wrapper(wrapper)
     }
 
@@ -686,18 +679,7 @@ fn row_for_receipt(receipt: ExecutionReceipt) -> LiqResultRecord {
         updated_at: 0,
         meta_json: String::new(),
     };
-    encode_meta(
-        &mut row,
-        &LiqMetaWrapper {
-            receipt,
-            meta: Vec::new(),
-            finalizer_decision: None,
-            profit_snapshot: None,
-            venue_execution: None,
-            meta_v2: None,
-        },
-    )
-    .expect("encode batch WAL row");
+    encode_meta(&mut row, &LiqMetaWrapper::new(receipt)).expect("encode batch WAL row");
     row
 }
 
@@ -992,7 +974,10 @@ mod cketh_bridge_minimum {
                 .expect_err("outages remain retryable");
 
             assert!(error.to_string().contains("unavailable"));
-            assert!(matches!(error, FinalizerError::Retryable(_)));
+            assert!(
+                matches!(error, FinalizerError::NoRoute(_)),
+                "an outage is a route that may return"
+            );
             assert!(wal.wrapper().meta_v2.is_none());
         }
     }
@@ -1219,7 +1204,10 @@ async fn transient_icpswap_outage_below_minimum_is_retried_instead_of_swept() {
         error.message().contains("canister is out of cycles"),
         "expected the outage to be reported: {error}"
     );
-    assert!(matches!(error, FinalizerError::Retryable(_)), "unexpected kind: {error:?}");
+    assert!(
+        matches!(error, FinalizerError::NoRoute(_)),
+        "unexpected kind: {error:?}"
+    );
     assert!(
         wal.wrapper().meta_v2.is_none(),
         "an outage must not commit a recovery sweep"

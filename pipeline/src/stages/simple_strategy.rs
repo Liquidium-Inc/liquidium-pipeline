@@ -409,7 +409,8 @@ where
                     debt_pool_id: debt_position.pool_id,
                     collateral_pool_id: debt_position.pool_id,
                     debt_amount: repay_amount.clone(),
-                    receiver_address: self.config.get_trader_principal(),
+                    // No swap follows, so the main account that paid gets it back directly (audit L03).
+                    receiver_address: self.config.get_liquidator_principal(),
                     buy_bad_debt: true,
                 },
                 ref_price: 0u32.into(),
@@ -731,6 +732,13 @@ where
                 continue;
             }
 
+            // Swaps run from the trader account. Without a swap the collateral goes
+            // straight back to the main account that paid the debt (audit L03).
+            let collateral_receiver = if swap_args.is_some() {
+                self.config.get_trader_principal()
+            } else {
+                self.config.get_liquidator_principal()
+            };
             result.push(ExecutorRequest {
                 debt_asset: repayment_token.clone(),
                 collateral_asset: collateral_token.clone(),
@@ -739,7 +747,7 @@ where
                     debt_pool_id: debt_position.pool_id,
                     collateral_pool_id: collateral_position.pool_id,
                     debt_amount: estimation.repaid_debt.clone(),
-                    receiver_address: self.config.get_trader_principal(),
+                    receiver_address: collateral_receiver,
                     buy_bad_debt,
                 },
                 ref_price: estimation.ref_price,
@@ -879,7 +887,7 @@ mod tests {
         let mut cfg = MockConfigTrait::new();
         let trader = p("aaaaa-aa");
         cfg.expect_get_trader_principal().return_const(trader);
-        cfg.expect_get_liquidator_principal().return_const(trader);
+        cfg.expect_get_liquidator_principal().return_const(p("2vxsx-fae"));
         cfg.expect_should_buy_bad_debt().return_const(false);
         cfg.expect_get_max_allowed_dex_slippage().return_const(2000u32);
         cfg.expect_get_lending_canister()
@@ -942,6 +950,11 @@ mod tests {
         assert_eq!(req.liquidation.borrower, pos.account);
         assert_eq!(req.liquidation.debt_amount, Nat::from(2_000u64));
         assert!(req.swap_args.is_none(), "no swap expected when assets match");
+        assert_eq!(
+            req.liquidation.receiver_address,
+            p("2vxsx-fae"),
+            "no swap, so the main account receives"
+        );
         assert_eq!(req.min_collateral_amount, Nat::from(0u8));
     }
 
@@ -1113,7 +1126,7 @@ mod tests {
         let mut cfg = MockConfigTrait::new();
         let trader = p("aaaaa-aa");
         cfg.expect_get_trader_principal().return_const(trader);
-        cfg.expect_get_liquidator_principal().return_const(trader);
+        cfg.expect_get_liquidator_principal().return_const(p("2vxsx-fae"));
         cfg.expect_should_buy_bad_debt().return_const(false);
         cfg.expect_get_max_allowed_dex_slippage().return_const(2000u32);
         cfg.expect_get_lending_canister()
@@ -1178,6 +1191,11 @@ mod tests {
         assert_eq!(req.liquidation.collateral_pool_id, icp_pool);
         assert!(!req.liquidation.buy_bad_debt);
         assert!(req.swap_args.is_some());
+        assert_eq!(
+            req.liquidation.receiver_address,
+            p("aaaaa-aa"),
+            "a swap runs from the trader account"
+        );
     }
 
     // HF at or above 1000: no liquidation attempts.
