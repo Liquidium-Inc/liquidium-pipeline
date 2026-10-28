@@ -79,7 +79,7 @@ the requested subaccount is preserved.
 
 ## At a Glance
 
-- **Default venues:** `ENABLED_SWAP_VENUES=icpswap,mexc`; disable MEXC when credentials are not configured. Kraken is opt-in: add `kraken` to the list.
+- **Default venues:** `ENABLED_SWAP_VENUES=icpswap,mexc`; disable MEXC when credentials are not configured. This release disables Kraken: `kraken` in the list stops startup.
 - **Current config precedence:** shell env vars > local `.env` > `~/.liquidium-pipeline/config.env`.
 - **Required env vars (minimum):** `MNEMONIC_FILE`, `IC_URL`, `EVM_RPC_URL`, `LENDING_CANISTER`, `DEBT_ASSETS`, `COLLATERAL_ASSETS`.
 - **Optional Solana RPC env var:** `SOLANA_RPC_URL` (defaults to `https://api.devnet.solana.com` when unset).
@@ -885,7 +885,7 @@ liquidator tui --log-file ./liquidator.log
 
 ## Kraken Venue
 
-Kraken is opt-in. Before you enable it:
+This release disables Kraken: `kraken` in `ENABLED_SWAP_VENUES` stops startup. When a release enables it again, Kraken is opt-in. Before you enable it:
 
 1. Create an API key with balance and funding reads, order create and query, and withdrawal access only. Use an IP allowlist.
 2. In Kraken, save and verify each withdrawal address the pipeline uses: the bridge source wallet on each chain a return crosses (EVM, Solana), and the final ICP account for a direct ICP withdrawal. The pipeline never adds or changes an address.

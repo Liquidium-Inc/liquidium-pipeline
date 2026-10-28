@@ -607,6 +607,8 @@ const DEFAULT_CEX_MAX_PRICE_IMPACT_BPS: f64 = 200.0;
 const DEFAULT_ICPSWAP_MAX_SEARCH_ITERATIONS: u8 = 16;
 const DEFAULT_ENABLED_SWAP_VENUES: &str = "icpswap,mexc";
 const SUPPORTED_SWAP_VENUES: [&str; 3] = ["icpswap", "mexc", "kraken"];
+/// Venues this release refuses to start with. Remove a venue here to release it.
+const RELEASE_DISABLED_SWAP_VENUES: [&str; 1] = ["kraken"];
 
 fn parse_multi_venue_min_net_edge_bps_from_env() -> u32 {
     env::var("MULTI_VENUE_MIN_NET_EDGE_BPS")
@@ -749,6 +751,11 @@ fn parse_enabled_swap_venues_from_env() -> Result<Vec<String>, String> {
             return Err(format!(
                 "ENABLED_SWAP_VENUES contains unsupported venue `{venue_id}`; expected one of {}",
                 SUPPORTED_SWAP_VENUES.join(", ")
+            ));
+        }
+        if RELEASE_DISABLED_SWAP_VENUES.contains(&venue_id.as_str()) {
+            return Err(format!(
+                "ENABLED_SWAP_VENUES contains `{venue_id}`, which this release disables; remove it to start"
             ));
         }
         if !seen.insert(venue_id.clone()) {
@@ -1392,26 +1399,34 @@ mod tests {
         }
     }
 
-    /// Kraken is opt-in: it is accepted when named, and its markets come from its own setting.
+    /// This release disables Kraken, so a config that names it does not start.
     #[test]
-    fn kraken_is_an_accepted_venue_with_its_own_route_settings() {
+    fn kraken_stops_startup_until_it_is_released() {
         let _guard = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
         unsafe {
             env::set_var("ENABLED_SWAP_VENUES", "icpswap,mexc,kraken");
+        }
+        let error = parse_enabled_swap_venues_from_env().expect_err("Kraken is disabled in this release");
+        assert!(error.contains("`kraken`"), "{error}");
+        unsafe {
+            env::remove_var("ENABLED_SWAP_VENUES");
+        }
+    }
+
+    /// Kraken's markets come from its own setting.
+    #[test]
+    fn kraken_route_settings_come_from_their_own_keys() {
+        let _guard = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        unsafe {
             env::set_var("CEX_KRAKEN_AVAILABLE_PAIRS", " icp/usd, ETH-USD, icp_usd ");
             env::set_var("CEX_KRAKEN_MAX_HOPS", "3");
         }
-        assert_eq!(
-            parse_enabled_swap_venues_from_env().unwrap(),
-            vec!["icpswap".to_string(), "mexc".to_string(), "kraken".to_string()]
-        );
         assert_eq!(
             parse_cex_available_pairs_from_env("CEX_KRAKEN_AVAILABLE_PAIRS"),
             vec!["ICP_USD".to_string(), "ETH_USD".to_string()]
         );
         assert_eq!(parse_cex_max_hops_from_env("CEX_KRAKEN_MAX_HOPS"), 3);
         unsafe {
-            env::remove_var("ENABLED_SWAP_VENUES");
             env::remove_var("CEX_KRAKEN_AVAILABLE_PAIRS");
             env::remove_var("CEX_KRAKEN_MAX_HOPS");
         }
