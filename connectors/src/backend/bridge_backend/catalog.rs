@@ -2,9 +2,11 @@ use super::{BridgeDestinationKind, BridgeRouteKind, BridgeRouteSpec};
 
 const USDC_ETH_TOKEN_ADDRESS: &str = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48";
 const CKUSDC_ICP_LEDGER_ID: &str = "xevnm-gaaaa-aaaar-qafnq-cai";
+const USDT_ETH_TOKEN_ADDRESS: &str = "0xdAC17F958D2ee523a2206206994597C13D831ec7";
+const CKUSDT_ICP_LEDGER_ID: &str = "cngnf-vqaaa-aaaar-qag4q-cai";
 const CKETH_ICP_LEDGER_ID: &str = "ss2fx-dyaaa-aaaar-qacoq-cai";
 
-pub(super) const BRIDGE_ROUTE_CATALOG: [BridgeRouteSpec; 8] = [
+pub(super) const BRIDGE_ROUTE_CATALOG: [BridgeRouteSpec; 10] = [
     BridgeRouteSpec {
         source_asset: "ETH",
         source_chain: "ETH",
@@ -47,6 +49,29 @@ pub(super) const BRIDGE_ROUTE_CATALOG: [BridgeRouteSpec; 8] = [
         exchange_transport: true,
         evm_token_address: Some(USDC_ETH_TOKEN_ADDRESS),
         ckerc20_ledger_id: Some(CKUSDC_ICP_LEDGER_ID),
+        min_sweep_amount: 0.0,
+    },
+    // An exchange that lists ckUSDT itself keeps it on ICP; see `CexVenueProfile`.
+    BridgeRouteSpec {
+        source_asset: "USDT",
+        source_chain: "ETH",
+        target_asset: "ckUSDT",
+        destination_kind: BridgeDestinationKind::IcpAccount,
+        route_kind: BridgeRouteKind::CkEthErc20Forward,
+        exchange_transport: true,
+        evm_token_address: Some(USDT_ETH_TOKEN_ADDRESS),
+        ckerc20_ledger_id: Some(CKUSDT_ICP_LEDGER_ID),
+        min_sweep_amount: 0.0,
+    },
+    BridgeRouteSpec {
+        source_asset: "ckUSDT",
+        source_chain: "ICP",
+        target_asset: "USDT",
+        destination_kind: BridgeDestinationKind::EvmAddress,
+        route_kind: BridgeRouteKind::CkEthErc20Reverse,
+        exchange_transport: true,
+        evm_token_address: Some(USDT_ETH_TOKEN_ADDRESS),
+        ckerc20_ledger_id: Some(CKUSDT_ICP_LEDGER_ID),
         min_sweep_amount: 0.0,
     },
     BridgeRouteSpec {

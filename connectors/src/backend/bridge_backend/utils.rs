@@ -162,7 +162,12 @@ pub fn validate_destination_for_route(route: &BridgeRouteSpec, destination: &Bri
 mod tests {
     #[test]
     fn generic_lookups_cover_every_bridged_asset_without_symbol_tests() {
-        for (asset, target) in [("ckUSDC", "USDC"), ("ckETH", "ETH"), ("ckSOL", "SOL")] {
+        for (asset, target) in [
+            ("ckUSDC", "USDC"),
+            ("ckUSDT", "USDT"),
+            ("ckETH", "ETH"),
+            ("ckSOL", "SOL"),
+        ] {
             let route = super::resolve_reverse_route_by_source(asset, "ICP").expect(asset);
             assert_eq!(route.target_asset, target);
             let back = super::resolve_forward_route_by_target(asset).expect(asset);
@@ -199,6 +204,19 @@ mod tests {
         assert_eq!(ckusdc.destination_kind, BridgeDestinationKind::EvmAddress);
         assert_eq!(ckusdc.route_kind, BridgeRouteKind::CkEthErc20Reverse);
         assert_eq!(ckusdc.ckerc20_ledger_id, Some("xevnm-gaaaa-aaaar-qafnq-cai"));
+
+        for (source, chain, target, kind) in [
+            ("USDT", "ETH", "ckUSDT", BridgeRouteKind::CkEthErc20Forward),
+            ("ckUSDT", "ICP", "USDT", BridgeRouteKind::CkEthErc20Reverse),
+        ] {
+            let usdt = resolve_route(source, chain, target).expect(source);
+            assert_eq!(usdt.route_kind, kind);
+            assert_eq!(
+                usdt.evm_token_address,
+                Some("0xdAC17F958D2ee523a2206206994597C13D831ec7")
+            );
+            assert_eq!(usdt.ckerc20_ledger_id, Some("cngnf-vqaaa-aaaar-qag4q-cai"));
+        }
 
         let eth = resolve_route("ETH", "ETH", "ckETH").expect("ETH route");
         assert_eq!(eth.destination_kind, BridgeDestinationKind::IcpAccount);
@@ -243,7 +261,8 @@ mod tests {
         assert!(resolve_route("CKBTC", "icp", "btc").is_some());
         assert!(resolve_route("sol", "sol", "cksol").is_some());
         assert!(resolve_route("cksol", "icp", "sol").is_some());
-        assert!(resolve_route("USDT", "ETH", "ckUSDT").is_none());
+        assert!(resolve_route("usdt", "eth", "ckusdt").is_some());
+        assert!(resolve_route("ckusdt", "icp", "usdt").is_some());
     }
 
     #[test]
@@ -258,7 +277,10 @@ mod tests {
     #[test]
     fn cketh_forward_routes_contains_usdc_entry() {
         let routes = cketh_forward_routes();
-        assert_eq!(routes.len(), 2);
+        assert_eq!(routes.len(), 3);
+        assert!(routes.iter().any(|route| {
+            route.source_asset == "USDT" && route.source_chain == "ETH" && route.target_asset == "ckUSDT"
+        }));
         assert!(routes.iter().any(|route| {
             route.source_asset == "USDC"
                 && route.source_chain == "ETH"
@@ -276,7 +298,10 @@ mod tests {
     #[test]
     fn cketh_reverse_routes_contains_ckusdc_entry() {
         let routes = cketh_reverse_routes();
-        assert_eq!(routes.len(), 2);
+        assert_eq!(routes.len(), 3);
+        assert!(routes.iter().any(|route| {
+            route.source_asset == "ckUSDT" && route.source_chain == "ICP" && route.target_asset == "USDT"
+        }));
         assert!(routes.iter().any(|route| {
             route.source_asset == "ckUSDC"
                 && route.source_chain == "ICP"

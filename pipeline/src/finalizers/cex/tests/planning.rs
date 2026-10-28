@@ -83,25 +83,47 @@ async fn mexc_deposit_phase_a_snapshots_baseline_and_sends_transfer() {
     assert!(matches!(state.step, CexStep::DepositPending));
 }
 
-#[test]
-fn mexc_bridge_planner_keeps_direct_path_when_no_bridge_route_matches() {
-    let finalizer = test_finalizer(Arc::new(MockCexBackend::new()), Arc::new(MockTransferActions::new()))
-    .with_bridge_runtime(bridge_dependencies(Arc::new(MockBridgeBackend::new())));
-
-    let debt_token = ChainToken::Icp {
+fn ckusdt_token() -> ChainToken {
+    ChainToken::Icp {
         ledger: Principal::anonymous(),
         symbol: "ckUSDT".to_string(),
         decimals: 6,
         fee: Nat::from(10_000u64),
-    };
+    }
+}
 
-    let plan = finalizer.resolve_bridge_plan_for_assets(&ckbtc_token(), &debt_token);
+/// The bridge has a ckUSDT route, but MEXC lists ckUSDT, so it never pays for the bridge.
+#[test]
+fn mexc_keeps_ckusdt_on_icp_although_the_bridge_has_a_route() {
+    let finalizer = test_finalizer(Arc::new(MockCexBackend::new()), Arc::new(MockTransferActions::new()))
+        .with_bridge_runtime(bridge_dependencies(Arc::new(MockBridgeBackend::new())));
+
+    let plan = finalizer.resolve_bridge_plan_for_assets(&ckbtc_token(), &ckusdt_token());
     assert!(!plan.deposit.bridge_required);
     assert_eq!(plan.deposit.cex_asset, "ckBTC");
     assert_eq!(plan.deposit.cex_network, "ICP");
     assert!(!plan.withdraw.bridge_required);
     assert_eq!(plan.withdraw.cex_asset, "ckUSDT");
     assert_eq!(plan.withdraw.cex_network, "ICP");
+
+    let plan = finalizer.resolve_bridge_plan_for_assets(&ckusdt_token(), &ckbtc_token());
+    assert!(!plan.deposit.bridge_required);
+    assert_eq!(plan.deposit.cex_asset, "ckUSDT");
+}
+
+/// Kraken does not list ckUSDT, so it moves as USDT on Ethereum both ways.
+#[test]
+fn kraken_bridges_ckusdt_as_usdt_on_ethereum() {
+    let mut finalizer = test_finalizer(Arc::new(MockCexBackend::new()), Arc::new(MockTransferActions::new()))
+        .with_bridge_runtime(bridge_dependencies(Arc::new(MockBridgeBackend::new())));
+    finalizer.profile = crate::finalizers::cex::profile::CexVenueProfile::kraken();
+
+    let plan = finalizer.resolve_bridge_plan_for_assets(&ckusdt_token(), &ckusdt_token());
+    for side in [&plan.deposit, &plan.withdraw] {
+        assert!(side.bridge_required);
+        assert_eq!(side.cex_asset, "USDT");
+        assert_eq!(side.cex_network, "ETH");
+    }
 }
 
 #[test]
