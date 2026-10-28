@@ -8,6 +8,9 @@ const CEX_PENDING_SETTLEMENT_PREFIX: &str = "cex pending settlement: ";
 pub enum CexBackendError {
     /// The venue sees the funds or order but cannot trade or reconcile it yet.
     PendingSettlement(String),
+    /// The amount is under a minimum on the route, so no later attempt can
+    /// succeed with it.
+    BelowMinimum(String),
     /// Any backend failure that follows the normal retry/error policy.
     Other(String),
 }
@@ -18,7 +21,7 @@ impl fmt::Display for CexBackendError {
             Self::PendingSettlement(message) => {
                 write!(formatter, "{CEX_PENDING_SETTLEMENT_PREFIX}{message}")
             }
-            Self::Other(message) => formatter.write_str(message),
+            Self::BelowMinimum(message) | Self::Other(message) => formatter.write_str(message),
         }
     }
 }
@@ -28,6 +31,13 @@ impl Error for CexBackendError {}
 impl From<String> for CexBackendError {
     fn from(message: String) -> Self {
         Self::Other(message)
+    }
+}
+
+/// Callers that report text keep the message, prefix included.
+impl From<CexBackendError> for String {
+    fn from(error: CexBackendError) -> Self {
+        error.to_string()
     }
 }
 

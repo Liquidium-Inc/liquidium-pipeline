@@ -35,7 +35,7 @@ where
         deposit_asset: &ChainToken,
         transfer_value: &Nat,
         source_fee_budget: f64,
-    ) -> Result<Option<(ChainTokenAmount, ChainTokenAmount)>, String> {
+    ) -> Result<Option<(ChainTokenAmount, ChainTokenAmount)>, CexBackendError> {
         if !matches!(
             route.route_kind,
             BridgeRouteKind::CkEthErc20Reverse | BridgeRouteKind::CkEthToEth | BridgeRouteKind::IcpToSolana
@@ -67,9 +67,9 @@ where
         amount: &Nat,
         reserve_budget: f64,
         label: &str,
-    ) -> Result<ChainTokenAmount, String> {
+    ) -> Result<ChainTokenAmount, CexBackendError> {
         if !reserve_budget.is_finite() || reserve_budget < 0.0 {
-            return Err(format!("invalid {label}: {reserve_budget}"));
+            return Err(format!("invalid {label}: {reserve_budget}").into());
         }
         let reserve = ChainTokenAmount::from_formatted(token.clone(), reserve_budget);
         Self::amount_less_reserve(token, amount, reserve.value, label)
@@ -82,16 +82,15 @@ where
         amount: &Nat,
         reserve: Nat,
         label: &str,
-    ) -> Result<ChainTokenAmount, String> {
+    ) -> Result<ChainTokenAmount, CexBackendError> {
         if reserve != Nat::from(0u8) && *amount <= reserve {
-            return Err(format!(
-                "{}: deposit amount {} too small to reserve {} {} for {}",
-                FINALIZER_PERMANENT_AMOUNT_FLOOR_PREFIX,
+            return Err(CexBackendError::BelowMinimum(format!(
+                "deposit amount {} too small to reserve {} {} for {}",
                 ChainTokenAmount::from_raw(token.clone(), amount.clone()).formatted(),
                 label,
                 ChainTokenAmount::from_raw(token.clone(), reserve).formatted(),
                 token.symbol(),
-            ));
+            )));
         }
         Ok(ChainTokenAmount::from_raw(token.clone(), amount.clone() - reserve))
     }
@@ -103,7 +102,7 @@ where
         route: &BridgeRouteSpec,
         gross: &ChainTokenAmount,
         source_fee_budget: f64,
-    ) -> Result<ChainTokenAmount, String> {
+    ) -> Result<ChainTokenAmount, CexBackendError> {
         // SOL and ckSOL have the same base units; keep the repayment token metadata.
         let net = Self::amount_after_fee_reserve(
             &gross.token,
@@ -123,7 +122,7 @@ where
         route: &BridgeRouteSpec,
         deposit_asset: &ChainToken,
         size_in: &ChainTokenAmount,
-    ) -> Result<BridgeDepositSizing, String> {
+    ) -> Result<BridgeDepositSizing, CexBackendError> {
         let (transfer_value, mut bridge_amount) =
             Self::compute_fee_adjusted_deposit_transfer(deposit_asset, size_in, true)?;
         let fee_budget = bridge
@@ -155,7 +154,7 @@ where
         route: &BridgeRouteSpec,
         deposit_asset: &ChainToken,
         size_in: &ChainTokenAmount,
-    ) -> Result<BridgedDepositArrival, String> {
+    ) -> Result<BridgedDepositArrival, CexBackendError> {
         let sizing = Self::size_bridged_deposit(bridge, route, deposit_asset, size_in).await?;
         Self::ensure_minimum_bridge_amount(bridge, route, &sizing.bridge_amount).await?;
         let submit_amount = Self::spend_f64(&sizing.bridge_amount)?;
@@ -195,17 +194,12 @@ where
         bridge: &BridgeRuntime,
         route: &BridgeRouteSpec,
         amount: &ChainTokenAmount,
-    ) -> Result<(), String> {
+    ) -> Result<(), CexBackendError> {
         if let Some((current, minimum)) = Self::bridge_minimum_shortfall(bridge, route, amount).await? {
-            return Err(format!(
-                "{}: {}@{} -> {} amount below minimum withdrawal (amount={} minimum={})",
-                FINALIZER_PERMANENT_AMOUNT_FLOOR_PREFIX,
-                route.source_asset,
-                route.source_chain,
-                route.target_asset,
-                current,
-                minimum
-            ));
+            return Err(CexBackendError::BelowMinimum(format!(
+                "{}@{} -> {} amount below minimum withdrawal (amount={} minimum={})",
+                route.source_asset, route.source_chain, route.target_asset, current, minimum
+            )));
         }
 
         Ok(())
@@ -237,21 +231,16 @@ where
         route: &BridgeRouteSpec,
         bridge_amount: f64,
         destination_fee_budget: f64,
-    ) -> Result<f64, String> {
+    ) -> Result<f64, CexBackendError> {
         if destination_fee_budget <= 0.0 {
             return Ok(bridge_amount);
         }
 
         if bridge_amount <= destination_fee_budget {
-            return Err(format!(
-                "{}: bridge amount {} too small to cover destination fee budget {} for {}@{} -> {}",
-                FINALIZER_PERMANENT_AMOUNT_FLOOR_PREFIX,
-                bridge_amount,
-                destination_fee_budget,
-                route.source_asset,
-                route.source_chain,
-                route.target_asset
-            ));
+            return Err(CexBackendError::BelowMinimum(format!(
+                "bridge amount {} too small to cover destination fee budget {} for {}@{} -> {}",
+                bridge_amount, destination_fee_budget, route.source_asset, route.source_chain, route.target_asset
+            )));
         }
 
         Ok(bridge_amount - destination_fee_budget)

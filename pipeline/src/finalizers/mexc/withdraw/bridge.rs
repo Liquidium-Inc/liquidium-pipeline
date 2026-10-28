@@ -78,7 +78,7 @@ where
         route: &BridgeRouteSpec,
         destination: &BridgeDestination,
         request: Option<&BridgeRequest>,
-    ) -> Result<(), String> {
+    ) -> Result<(), CexBackendError> {
         state.step = CexStep::WithdrawPending;
         let now = now_ts();
         let liq_id = state.liq_id.clone();
@@ -96,7 +96,7 @@ where
                         info!("[mexc] liq_id={} bridged withdraw deferred: {}", liq_id, error);
                         return Ok(());
                     }
-                    Err(error) => return Err(error),
+                    Err(error) => return Err(bridge_refusal(error)),
                 };
                 funds.withdraw_bridge_funding = Some(OutboundRecord::prepared(bridge_send.send));
                 funds.withdraw_bridge_send_handle = Some(bridge_send.handle);
@@ -142,7 +142,8 @@ where
                 if waited > DEPOSIT_NOTICE_WINDOW_SECS {
                     return Err(side_effect_ambiguous(format!(
                         "bridge deposit {receipt} landed {waited}s ago and the provider has not accepted it: {reason}"
-                    )));
+                    ))
+                    .into());
                 }
                 info!(
                     "[mexc] liq_id={} bridge deposit {} not accepted yet: {}",
@@ -161,7 +162,7 @@ where
         planned_asset: &str,
         planned_network: &str,
         amount: f64,
-    ) -> Result<(), String> {
+    ) -> Result<(), CexBackendError> {
         let bridge = self.bridge_runtime()?;
         let route = Self::withdraw_route(state).ok_or_else(|| {
             format!(
@@ -209,7 +210,7 @@ where
                 )
                 .await;
         }
-        self.poll_withdraw_bridge(state, bridge, route).await
+        Ok(self.poll_withdraw_bridge(state, bridge, route).await?)
     }
 
     /// The MEXC withdrawal reached the bridge source: sizes the bridge amount
@@ -224,7 +225,7 @@ where
         planned_network: &str,
         amount: f64,
         bridge_source_address: String,
-    ) -> Result<(), String> {
+    ) -> Result<(), CexBackendError> {
         // A started deposit send has left the source account, so the
         // balance checks below would wait for it forever.
         if state.withdraw.bridge.deposit_send_started() {
@@ -274,13 +275,15 @@ where
                 return Err(format!(
                     "cex withdraw failed for liq_id {} withdraw_id={}",
                     state.liq_id, withdraw_id
-                ));
+                )
+                .into());
             }
             WithdrawStatus::Canceled => {
                 return Err(format!(
                     "cex withdraw canceled for liq_id {} withdraw_id={}",
                     state.liq_id, withdraw_id
-                ));
+                )
+                .into());
             }
             WithdrawStatus::Completed => {}
         }
@@ -428,7 +431,7 @@ where
                 state.step = CexStep::WithdrawPending;
                 return Ok(());
             }
-            Err(error) => return Err(error),
+            Err(error) => return Err(bridge_refusal(error)),
         };
         state.withdraw.bridge.withdraw_bridge_id = Some(submission.bridge_id);
         state.withdraw.bridge.withdraw_bridge_submitted_at_ts = Some(now_ts());
@@ -538,5 +541,15 @@ where
                 reason.unwrap_or_else(|| "no reason provided".to_string())
             )),
         }
+    }
+}
+
+/// A bridge backend refusal as a step error. The bridge still reports its
+/// amount floor as text, until `BridgeBackend` returns typed errors.
+fn bridge_refusal(error: String) -> CexBackendError {
+    if error.starts_with(FINALIZER_PERMANENT_AMOUNT_FLOOR_PREFIX) {
+        CexBackendError::BelowMinimum(error)
+    } else {
+        CexBackendError::Other(error)
     }
 }

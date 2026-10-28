@@ -69,16 +69,6 @@ impl FinalizerResult {
             reason,
         }
     }
-
-    pub fn noop() -> Self {
-        Self {
-            swap_result: None,
-            finalized: false,
-            operator_required: false,
-            swapper: None,
-            reason: None,
-        }
-    }
 }
 
 /// Plumbing failures — a WAL write, an encode, a decode — carry no decision of

@@ -1,9 +1,7 @@
 use async_trait::async_trait;
-use liquidium_pipeline_connectors::backend::bridge_backend::{
-    FINALIZER_PERMANENT_AMOUNT_FLOOR_PREFIX, BridgeRouteKind, resolve_route,
-};
-use liquidium_pipeline_core::outbound::SIDE_EFFECT_AMBIGUOUS_PREFIX;
+use liquidium_pipeline_connectors::backend::bridge_backend::{BridgeRouteKind, resolve_route};
 use liquidium_pipeline_connectors::backend::cex_backend::{CexBackend, CexBackendError};
+use liquidium_pipeline_core::outbound::SIDE_EFFECT_AMBIGUOUS_PREFIX;
 use log::{info, warn};
 use serde::{Deserialize, Serialize};
 
@@ -11,14 +9,14 @@ use super::mexc_finalizer::MexcFinalizer;
 use crate::{
     finalizers::{
         bridge_planner::BridgePlanner,
-        cex_finalizer::{CexFinalizerLogic, CexState, CexStep},
+        cex_finalizer::{CexState, CexStep},
         multi_venue::{
             MultiVenueAdapter, OperatorQuestion, VenueAmountError, VenueLegCheckpoint, VenueLegProgress,
             VenuePlanningContext, VenueRoutePreview,
         },
     },
     outbound::driver::OperatorDecision,
-    persistance::{VenueExecutionState, VenueLegState, VenueLegStatus},
+    persistance::{VenueExecutionState, VenueLegFailure, VenueLegState, VenueLegStatus},
     swappers::model::SwapRequest,
     utils::now_ts,
 };
@@ -197,12 +195,17 @@ where
                 execution.cex.last_error = Some(error.clone());
                 return self.settlement_wait_progress(execution, error).await;
             }
+            // No later cycle can raise the amount, so the leg ends here.
+            Err(CexBackendError::BelowMinimum(message)) => {
+                execution.cex.last_error = Some(message.clone());
+                execution.cex.step = CexStep::Failed;
+                let mut progress = self.progress_for(execution, Some(message))?;
+                progress.failure = Some(VenueLegFailure::BelowMinimum);
+                return Ok(progress);
+            }
             Err(error) => {
                 let error = error.to_string();
                 execution.cex.last_error = Some(error.clone());
-                if error.starts_with(FINALIZER_PERMANENT_AMOUNT_FLOOR_PREFIX) {
-                    execution.cex.step = CexStep::Failed;
-                }
                 // Only an operator can say which row owns the provider record,
                 // or whether a call without an answer moved funds.
                 if error.starts_with(SIDE_EFFECT_AMBIGUOUS_PREFIX) {
@@ -248,6 +251,7 @@ where
                 result: None,
                 last_error: Some(error),
                 retryable_error: None,
+                failure: None,
             });
         }
 
@@ -303,6 +307,7 @@ where
             result,
             last_error,
             retryable_error,
+            failure: None,
         })
     }
 
@@ -319,6 +324,7 @@ where
             result: None,
             last_error: Some(error),
             retryable_error: None,
+            failure: None,
         })
     }
 }
@@ -360,7 +366,10 @@ where
         let bridge = self.bridge_runtime().map_err(VenueAmountError::Unavailable)?;
         let sizing = Self::size_bridged_deposit(bridge, route, &state.deposit.deposit_asset, &state.size_in)
             .await
-            .map_err(VenueAmountError::Unavailable)?;
+            .map_err(|error| match error {
+                CexBackendError::BelowMinimum(message) => VenueAmountError::BelowMinimum(message),
+                other => VenueAmountError::Unavailable(other.to_string()),
+            })?;
         match Self::bridge_minimum_shortfall(bridge, route, &sizing.bridge_amount)
             .await
             .map_err(VenueAmountError::Unavailable)?

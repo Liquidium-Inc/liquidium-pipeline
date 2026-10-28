@@ -136,8 +136,11 @@ async fn mexc_deposit_bridge_rejects_source_fee_reserve_too_small_with_permanent
         .await
         .expect_err("source fee reserve consuming deposit must fail");
 
-    assert!(err.starts_with(FINALIZER_PERMANENT_AMOUNT_FLOOR_PREFIX));
-    assert!(err.contains("too small to reserve reverse bridge source fee budget"));
+    assert!(matches!(err, CexBackendError::BelowMinimum(_)));
+    assert!(
+        err.to_string()
+            .contains("too small to reserve reverse bridge source fee budget")
+    );
     assert!(state.deposit.deposit_txid.is_none());
     assert!(state.deposit.bridge.deposit_bridge_id.is_none());
 }
@@ -310,7 +313,7 @@ async fn mexc_deposit_bridge_rejects_native_cketh_below_minimum_before_transfer(
         .await
         .expect_err("below minimum should fail before funding bridge source");
 
-    assert!(err.starts_with(FINALIZER_PERMANENT_AMOUNT_FLOOR_PREFIX));
+    assert!(matches!(err, CexBackendError::BelowMinimum(_)));
     assert!(state.deposit.deposit_txid.is_none());
     assert!(state.deposit.bridge.deposit_bridge_id.is_none());
 }
@@ -371,8 +374,8 @@ async fn mexc_deposit_bridge_rejects_native_cketh_when_destination_fee_consumes_
         .deposit(&mut state)
         .await
         .expect_err("destination fee consuming expected deposit must fail");
-    assert!(err.starts_with(FINALIZER_PERMANENT_AMOUNT_FLOOR_PREFIX));
-    assert!(err.contains("too small to cover destination fee budget"));
+    assert!(matches!(err, CexBackendError::BelowMinimum(_)));
+    assert!(err.to_string().contains("too small to cover destination fee budget"));
     assert!(state.deposit.deposit_txid.is_none());
     assert!(state.deposit.bridge.deposit_bridge_id.is_none());
 }
@@ -699,7 +702,7 @@ async fn mexc_withdraw_bridge_submit_resume_complete_and_idempotent() {
     // Reconstruct durable state: polling must not resubmit either withdrawal.
     state = serde_json::from_str(&serde_json::to_string(&state).unwrap()).unwrap();
     let error = finalizer.withdraw(&mut state).await.unwrap_err();
-    assert!(error.contains("destination/token"));
+    assert!(error.to_string().contains("destination/token"));
     assert!(matches!(state.step, CexStep::WithdrawPending));
     assert!(state.withdraw.bridge.withdraw_bridge_mint_receipt.is_none());
 

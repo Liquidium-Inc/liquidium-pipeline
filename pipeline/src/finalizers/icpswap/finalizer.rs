@@ -1,16 +1,11 @@
 use std::sync::Arc;
 
-use async_trait::async_trait;
 use icrc_ledger_types::icrc1::account::Account;
 
 use crate::{
-    finalizers::finalizer::{Finalizer, FinalizerError, FinalizerResult},
-    persistance::WalStore,
-    stages::executor::{ExecutionReceipt, ExecutionStatus},
     swappers::{
         icpswap::{
             VENUE_ID, ensure_supported_pair,
-            execution::{IcpswapExecutionStateStore, WalIcpswapExecutionStateStore},
             plan::input_fee_budget,
             session::{IcpswapExecutionSession, IcpswapExecutionSessionFactory},
             transfer_state::{IcpswapFundingState, IcpswapLedgerTransferState, IcpswapSettlementState},
@@ -20,11 +15,8 @@ use crate::{
         model::SwapRequest,
     },
     utils::now_nanos,
-    wal::liq_id_from_receipt,
     watchdog::{Watchdog, WatchdogEvent, noop_watchdog},
 };
-
-pub(crate) const ICPSWAP_FINALIZER_PERMANENT_PREFIX: &str = "permanent ICPSwap finalizer: ";
 
 /// Cooldown applied after a non-terminal step fails.
 ///
@@ -45,7 +37,7 @@ pub(super) fn is_terminal_step(step: IcpswapStep) -> bool {
     )
 }
 
-/// WAL-backed finalizer for the manual ICPSwap execution lifecycle.
+/// The ICPSwap venue: plans and drives one leg of a multi-venue execution.
 pub struct IcpswapFinalizer {
     pub(super) workflow: Arc<dyn IcpswapFinalizerLogic>,
     pub(super) trader: Account,
@@ -136,61 +128,6 @@ impl IcpswapFinalizer {
         self
     }
 
-    async fn load_state(
-        &self,
-        store: &dyn IcpswapExecutionStateStore,
-        liquidation_id: &str,
-    ) -> Result<IcpswapExecutionState, String> {
-        store
-            .load(liquidation_id)
-            .await?
-            .ok_or_else(|| format!("missing persisted ICPSwap state for liquidation {liquidation_id}"))
-    }
-
-    async fn result_for_state(
-        &self,
-        receipt: &ExecutionReceipt,
-        state: &IcpswapExecutionState,
-        now_nanos: u64,
-    ) -> Result<FinalizerResult, String> {
-        match state.step {
-            IcpswapStep::Completed => Ok(FinalizerResult {
-                swap_result: Some(
-                    self.workflow
-                        .finish(
-                            receipt
-                                .request
-                                .swap_args
-                                .as_ref()
-                                .ok_or_else(|| permanent_message("completed receipt has no swap request"))?,
-                            state,
-                            now_nanos,
-                        )
-                        .await
-                        .map_err(|error| permanent_message(&error))?,
-                ),
-                finalized: true,
-                operator_required: false,
-                swapper: Some("icpswap".to_string()),
-                reason: None,
-            }),
-            IcpswapStep::Refunded => Ok(FinalizerResult {
-                swap_result: None,
-                finalized: true,
-                operator_required: false,
-                swapper: Some("recovery".to_string()),
-                reason: Some("ICPSwap failed; deposited ICP was withdrawn back to the trader account".to_string()),
-            }),
-            IcpswapStep::Failed => Err(permanent_message(
-                state
-                    .last_error
-                    .as_deref()
-                    .unwrap_or("manual ICPSwap failed without detail"),
-            )),
-            _ => Ok(FinalizerResult::noop()),
-        }
-    }
-
     /// Alerts for as long as the execution stays parked, not just on the way in.
     /// Alerting once means a single dropped webhook can hide ambiguous custody
     /// indefinitely. The watchdog's cooldown key throttles repeated polls into
@@ -215,94 +152,4 @@ impl IcpswapFinalizer {
             })
             .await;
     }
-}
-
-#[async_trait]
-impl Finalizer for IcpswapFinalizer {
-    async fn finalize(
-        &self,
-        wal: &dyn WalStore,
-        receipt: ExecutionReceipt,
-    ) -> Result<FinalizerResult, FinalizerError> {
-        self.finalize_inner(wal, receipt).await.map_err(|error| {
-            // The sentinel stays private to this module; classification happens
-            // once, here, rather than being re-derived by the caller.
-            if error.starts_with(ICPSWAP_FINALIZER_PERMANENT_PREFIX) {
-                FinalizerError::Permanent(error)
-            } else {
-                FinalizerError::Retryable(error)
-            }
-        })
-    }
-}
-
-impl IcpswapFinalizer {
-    async fn finalize_inner(&self, wal: &dyn WalStore, receipt: ExecutionReceipt) -> Result<FinalizerResult, String> {
-        if !matches!(receipt.status, ExecutionStatus::Success) || receipt.request.swap_args.is_none() {
-            return Ok(FinalizerResult::noop());
-        }
-
-        let liquidation_id = liq_id_from_receipt(&receipt)?;
-        let store = WalIcpswapExecutionStateStore::new(wal);
-        let mut loaded_state = self.load_state(&store, &liquidation_id).await?;
-        let now_nanos = (self.clock)();
-        if is_terminal_step(loaded_state.step) {
-            return self.result_for_state(&receipt, &loaded_state, now_nanos).await;
-        }
-
-        // Back off after a failed step instead of re-running it every cycle.
-        if loaded_state
-            .next_attempt_at_nanos
-            .is_some_and(|ready_at| now_nanos < ready_at)
-        {
-            // Escalation is driven by persisted state, not by making progress, so
-            // it must not be throttled by this cooldown -- a parked execution
-            // going quiet is exactly the failure this alert exists to surface.
-            self.notify_operator_required(&liquidation_id, &loaded_state).await;
-            return Ok(FinalizerResult::noop());
-        }
-
-        // Cleared before advancing, not after, so the workflow's own persist
-        // carries the reset -- a successful step must not inherit the cooldown
-        // left behind by the failure that preceded it.
-        loaded_state.next_attempt_at_nanos = None;
-
-        // One step per call. Each step is an IC update round trip (~seconds of
-        // consensus), and the finalize stage runs inline on the daemon cycle
-        // ahead of the next opportunity scan. Driving further here would delay
-        // claiming -- which is competitive -- by a full round trip per extra
-        // step, so the state machine advances once and resumes next cycle.
-        let session = self.execution_session(&loaded_state)?;
-        let (state, advance_error) = match self
-            .workflow
-            .advance_loaded(&session, &store, &liquidation_id, now_nanos, loaded_state)
-            .await
-        {
-            Ok(state) => (state, None),
-            Err(error) => {
-                let mut state = self.load_state(&store, &liquidation_id).await?;
-                state.last_error = Some(error.clone());
-                if !is_terminal_step(state.step) {
-                    state.next_attempt_at_nanos = Some(now_nanos.saturating_add(RETRY_COOLDOWN_NANOS));
-                }
-                store.persist(&liquidation_id, &state).await?;
-                (state, Some(error))
-            }
-        };
-
-        self.notify_operator_required(&liquidation_id, &state).await;
-
-        if let Some(error) = advance_error {
-            if state.step == IcpswapStep::Failed {
-                return Err(permanent_message(&error));
-            }
-            return Ok(FinalizerResult::noop());
-        }
-
-        self.result_for_state(&receipt, &state, now_nanos).await
-    }
-}
-
-fn permanent_message(message: &str) -> String {
-    format!("{ICPSWAP_FINALIZER_PERMANENT_PREFIX}{message}")
 }

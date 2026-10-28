@@ -74,7 +74,7 @@ impl MultiVenueFinalizer {
         state.legs[index].execution = execution;
         state.legs[index].status = VenueLegStatus::Running;
         state.outcome = derive_outcome(&state.legs);
-        set_meta_v2(&mut wrapper, &state)?;
+        set_meta_v2(&mut wrapper, state).map_err(|error| error.to_string())?;
         row.status = ResultStatus::Enqueued;
         // Old failures must not count against the released leg.
         row.error_count = 0;

@@ -9,7 +9,8 @@ use ic_agent::export::reqwest;
 use log::warn;
 use tokio::sync::Mutex;
 
-use super::WATCHDOG_HTTP_TIMEOUT_SECS;
+/// A webhook that has not answered within this time counts as failed.
+const WATCHDOG_HTTP_TIMEOUT_SECS: u64 = 5;
 
 pub(super) struct WebhookPoster {
     url: String,

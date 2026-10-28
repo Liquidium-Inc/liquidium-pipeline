@@ -782,6 +782,7 @@ mod tests {
             status,
             result: None,
             last_error: last_error.map(str::to_string),
+            failure: None,
         }
     }
 

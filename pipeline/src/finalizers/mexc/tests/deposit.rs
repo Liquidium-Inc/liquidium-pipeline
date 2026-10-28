@@ -41,8 +41,8 @@ async fn mexc_deposit_phase_a_rejects_fee_consumed_deposit_with_permanent_prefix
         .await
         .expect_err("deposit consumed by fee must fail before transfer");
 
-    assert!(err.starts_with(FINALIZER_PERMANENT_AMOUNT_FLOOR_PREFIX));
-    assert!(err.contains("too small to reserve ledger fee"));
+    assert!(matches!(err, CexBackendError::BelowMinimum(_)));
+    assert!(err.to_string().contains("too small to reserve ledger fee"));
     assert!(state.deposit.deposit_txid.is_none());
 }
 
@@ -135,7 +135,7 @@ async fn mexc_deposit_phase_a_rejects_invalid_evm_deposit_address() {
     let mut state = finalizer.prepare("44", &receipt).await.expect("prepare should succeed");
 
     let err = finalizer.deposit(&mut state).await.expect_err("deposit should fail");
-    assert!(err.contains("invalid MEXC EVM deposit address"));
+    assert!(err.to_string().contains("invalid MEXC EVM deposit address"));
 }
 
 #[tokio::test]
@@ -220,7 +220,7 @@ async fn mexc_native_icp_deposit_rejects_invalid_ledger_account_id() {
         .deposit(&mut state)
         .await
         .expect_err("invalid native ICP account id should fail");
-    assert!(err.contains("invalid native ICP ledger account id"));
+    assert!(err.to_string().contains("invalid native ICP ledger account id"));
 }
 
 #[tokio::test]
@@ -252,7 +252,7 @@ async fn mexc_native_icp_deposit_rejects_memo_tag_before_transfer() {
         .deposit(&mut state)
         .await
         .expect_err("native ICP memo/tag should fail before transfer");
-    assert!(err.contains("unsupported memo/tag"));
+    assert!(err.to_string().contains("unsupported memo/tag"));
 }
 
 #[test]

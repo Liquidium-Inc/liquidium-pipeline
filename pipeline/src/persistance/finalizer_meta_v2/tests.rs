@@ -97,6 +97,7 @@ fn leg(leg_id: &str, venue_id: &str, pay: &ChainTokenAmount, receive: &ChainToke
         status: VenueLegStatus::Planned,
         result: None,
         last_error: None,
+        failure: None,
     }
 }
 

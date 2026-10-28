@@ -101,6 +101,7 @@ impl IcpswapExecutionStateStore for CheckpointedLegStateStore<'_> {
                 result: None,
                 last_error: state.last_error.clone(),
                 retryable_error: None,
+                failure: None,
             })
             .await
     }
@@ -152,6 +153,7 @@ impl IcpswapFinalizer {
             result,
             last_error,
             retryable_error: advance_error,
+            failure: None,
         })
     }
 

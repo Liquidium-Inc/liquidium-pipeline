@@ -94,7 +94,7 @@ async fn mexc_direct_withdraw_parks_when_delivery_never_arrives() {
     // Past the window the row errors so the retry budget parks it with an alert.
     state.withdraw.withdraw_accepted_at_ts = Some(accepted_at - 2 * 60 * 60);
     let error = finalizer.withdraw(&mut state).await.unwrap_err();
-    assert!(error.contains("not delivered"), "{error}");
+    assert!(error.to_string().contains("not delivered"), "{error}");
     assert!(matches!(state.step, CexStep::WithdrawPending));
 }
 
@@ -344,7 +344,7 @@ async fn mexc_non_bridge_withdraw_rejects_invalid_evm_destination_address() {
         .withdraw(&mut state)
         .await
         .expect_err("invalid EVM destination should fail");
-    assert!(err.contains("invalid EVM withdraw destination"));
+    assert!(err.to_string().contains("invalid EVM withdraw destination"));
 }
 
 #[tokio::test]
@@ -404,7 +404,7 @@ async fn mexc_withdraw_fails_on_non_positive_amount() {
         .await
         .expect_err("withdraw should fail for non-positive amount");
 
-    assert!(err.contains("withdrawal amount is zero or negative"));
+    assert!(err.to_string().contains("withdrawal amount is zero or negative"));
 }
 
 #[tokio::test]
@@ -425,7 +425,7 @@ async fn mexc_finish_builds_synthetic_swap_execution_from_state() {
     ));
     state.trade.trade_weighted_slippage_bps = Some(42.5);
 
-    let swap = finalizer.finish(&receipt, &state).await.expect("finish should succeed");
+    let swap = finalizer.finish_state(&state).expect("finish should succeed");
 
     // Pay leg comes from seized collateral (size_in).
     assert_eq!(swap.pay_asset, state.deposit.deposit_asset.asset_id());

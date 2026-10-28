@@ -5,7 +5,7 @@ use liquidium_pipeline_core::types::side_cost::SideCost;
 
 use crate::{
     outbound::driver::OperatorDecision,
-    persistance::{PricedSideCost, VenueExecutionState, VenueLegState, VenueLegStatus},
+    persistance::{PricedSideCost, VenueExecutionState, VenueLegFailure, VenueLegState, VenueLegStatus},
     swappers::model::{SwapExecution, SwapQuote, SwapRequest},
 };
 
@@ -74,6 +74,8 @@ pub struct VenueLegProgress {
     /// updated leg first, then returns this error so normal finalizer backoff
     /// and retry accounting apply without losing the venue's latest state.
     pub retryable_error: Option<String>,
+    /// Why a failed leg failed, where the row's outcome depends on it.
+    pub failure: Option<VenueLegFailure>,
 }
 
 /// A fact that only an operator can supply before a parked leg moves on.

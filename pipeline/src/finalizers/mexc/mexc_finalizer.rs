@@ -3,7 +3,6 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use alloy::primitives::Address as EvmAddress;
-use async_trait::async_trait;
 use candid::{Nat, Principal};
 use ic_ledger_types::{AccountIdentifier, Subaccount};
 use icrc_ledger_types::icrc1::account::Account;
@@ -45,14 +44,10 @@ const SOL_FINALITY_SECS: i64 = 20;
 use crate::{
     bridge::runtime::BridgeRuntime,
     finalizers::bridge_planner::BridgePlanner,
-    finalizers::cex_finalizer::{CexFinalizerLogic, CexRoutePreview, CexState, CexStep},
+    finalizers::cex_finalizer::{CexState, CexStep},
     outbound::driver::{OutboundError, OutboundRecord, step_outbound},
     stages::bridge_submit_lock::acquire_bridge_submit_lock,
-    stages::executor::ExecutionReceipt,
-    swappers::{
-        mexc::orderbook_quote::{simulate_buy_from_asks, simulate_sell_from_bids},
-        model::SwapExecution,
-    },
+    swappers::mexc::orderbook_quote::{simulate_buy_from_asks, simulate_sell_from_bids},
     utils::{ICP_LEDGER_PRINCIPAL, now_ts},
 };
 
@@ -262,16 +257,14 @@ mod withdraw_direct;
 pub(super) use sizing::{BridgeDepositSizing, BridgedDepositArrival};
 pub use withdraw_direct::mexc_withdraw_order_id;
 
-#[async_trait]
-impl<B> CexFinalizerLogic for MexcFinalizer<B>
-where
-    B: CexBackend,
-{
-    fn venue_id(&self) -> &'static str {
-        "mexc"
-    }
-
-    async fn prepare(&self, liq_id: &str, receipt: &ExecutionReceipt) -> Result<CexState, String> {
+/// Builds a leg's state from a liquidation receipt, as tests set legs up.
+#[cfg(test)]
+impl<B: CexBackend> MexcFinalizer<B> {
+    pub(crate) async fn prepare(
+        &self,
+        liq_id: &str,
+        receipt: &crate::stages::executor::ExecutionReceipt,
+    ) -> Result<CexState, String> {
         let amount = &receipt
             .liquidation_result
             .as_ref()
@@ -285,8 +278,25 @@ where
             None,
         )
     }
+}
 
-    async fn deposit(&self, state: &mut CexState) -> Result<(), String> {
+/// The CEX state machine one leg walks: deposit, trade, withdraw.
+impl<B> MexcFinalizer<B>
+where
+    B: CexBackend,
+{
+    /// Runs the current step once.
+    pub(super) async fn advance_current_step(&self, state: &mut CexState) -> Result<(), CexBackendError> {
+        match state.step {
+            CexStep::Deposit | CexStep::DepositPending => self.deposit(state).await,
+            CexStep::Trade | CexStep::TradePending => self.trade(state).await,
+            CexStep::Withdraw | CexStep::WithdrawPending => self.withdraw(state).await,
+            CexStep::Completed | CexStep::Failed => Ok(()),
+        }
+    }
+
+    /// On chain: collateral to the CEX deposit asset, sent to the deposit address.
+    pub(super) async fn deposit(&self, state: &mut CexState) -> Result<(), CexBackendError> {
         self.ensure_plan_on_state(state);
         let planned_asset = <Self as BridgePlanner>::planned_deposit_asset(state);
         let planned_network = <Self as BridgePlanner>::planned_deposit_network(state);
@@ -313,7 +323,8 @@ where
     /// the market lock. `execute_trade_leg_slices` has the slice algorithm.
     /// On success the state moves to `TradePending` for the next leg, or to
     /// `Withdraw` when the route is done. A paused leg resumes next cycle.
-    async fn trade(&self, state: &mut CexState) -> Result<(), CexBackendError> {
+    /// On the CEX: the deposit asset to the withdraw asset.
+    pub(super) async fn trade(&self, state: &mut CexState) -> Result<(), CexBackendError> {
         self.ensure_plan_on_state(state);
         state.market = format!(
             "{}_{}",
@@ -439,7 +450,8 @@ where
         Ok(())
     }
 
-    async fn withdraw(&self, state: &mut CexState) -> Result<(), String> {
+    /// From the CEX back to the chain.
+    pub(super) async fn withdraw(&self, state: &mut CexState) -> Result<(), CexBackendError> {
         self.ensure_plan_on_state(state);
         let planned_asset = <Self as BridgePlanner>::planned_withdraw_asset(state);
         let planned_network = <Self as BridgePlanner>::planned_withdraw_network(state);
@@ -466,47 +478,17 @@ where
             return Err(format!(
                 "withdrawal amount is zero or negative for liq_id {} (amount={})",
                 state.liq_id, amount
-            ));
+            )
+            .into());
         }
 
         if !state.withdraw.bridge.withdraw_bridge_required {
-            return self
+            return Ok(self
                 .withdraw_direct(state, &planned_asset, &planned_network, amount)
-                .await;
+                .await?);
         }
         self.withdraw_bridged(state, &planned_asset, &planned_network, amount)
             .await
-    }
-
-    async fn finish(&self, _receipt: &ExecutionReceipt, state: &CexState) -> Result<SwapExecution, String> {
-        self.finish_state(state)
-    }
-
-    async fn preview_route(&self, receipt: &ExecutionReceipt) -> Result<CexRoutePreview, String> {
-        let state = self.prepare("preview", receipt).await?;
-        let initial_amount = state.size_in.to_f64();
-        if initial_amount <= LIQUIDITY_EPS {
-            return Ok(CexRoutePreview {
-                is_executable: false,
-                estimated_receive_amount: 0.0,
-                estimated_price_impact_bps: 0.0,
-                reason: Some("non-positive amount_in".to_string()),
-            });
-        }
-        let legs = self
-            .resolve_trade_legs_for_symbols(
-                &<Self as BridgePlanner>::planned_deposit_asset(&state),
-                &<Self as BridgePlanner>::planned_withdraw_asset(&state),
-            )
-            .await?;
-        let route_preview = self.preview_resolved_trade_route(&legs, initial_amount).await?;
-
-        Ok(CexRoutePreview {
-            is_executable: true,
-            estimated_receive_amount: route_preview.receive_amount,
-            estimated_price_impact_bps: route_preview.price_impact_bps,
-            reason: None,
-        })
     }
 }
 

@@ -1021,6 +1021,7 @@ mod tests {
             status: VenueLegStatus::Running,
             result: None,
             last_error: Some("waiting for bridge".to_string()),
+            failure: None,
         };
 
         let mut lines = Vec::new();

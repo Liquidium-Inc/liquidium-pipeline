@@ -37,7 +37,7 @@ where
         state: &mut CexState,
         planned_asset: &str,
         planned_network: &str,
-    ) -> Result<(), String> {
+    ) -> Result<(), CexBackendError> {
         if state.deposit.deposit_txid.is_none() {
             let intent = if state.deposit.deposit_funding.is_some() {
                 None
@@ -67,7 +67,7 @@ where
             return Ok(());
         }
 
-        self.check_deposit(state).await
+        Ok(self.check_deposit(state).await?)
     }
 
     /// The exchange balance before the deposit. A failed read counts as zero.
@@ -93,7 +93,7 @@ where
         state: &mut CexState,
         planned_asset: &str,
         planned_network: &str,
-    ) -> Result<OutboundIntent, String> {
+    ) -> Result<OutboundIntent, CexBackendError> {
         self.record_balance_before_deposit(state, planned_asset).await;
         let addr = self
             .backend
@@ -107,7 +107,8 @@ where
             return Err(format!(
                 "native ICP MEXC deposit returned unsupported memo/tag for liq_id {} asset={} network={} address={} tag={}",
                 state.liq_id, planned_asset, planned_network, addr.address, tag
-            ));
+            )
+            .into());
         }
 
         state.deposit.bridge.deposit_bridge_destination_snapshot = Some(addr.address.clone());
@@ -135,7 +136,7 @@ where
         bridge: &BridgeRuntime,
         route: &BridgeRouteSpec,
         planned_asset: &str,
-    ) -> Result<OutboundIntent, String> {
+    ) -> Result<OutboundIntent, CexBackendError> {
         self.record_balance_before_deposit(state, planned_asset).await;
         let bridge_source_address = self.resolve_bridge_source_address(route.source_chain)?;
         let bridge_destination = <Self as BridgePlanner>::bridge_source_transfer_destination(
@@ -194,7 +195,7 @@ where
         deposit_asset: &ChainToken,
         size_in: &ChainTokenAmount,
         bridged: bool,
-    ) -> Result<(Nat, ChainTokenAmount), String> {
+    ) -> Result<(Nat, ChainTokenAmount), CexBackendError> {
         let fee = deposit_asset.fee() * Self::deposit_fee_count(deposit_asset, bridged);
         let transfer_amount = Self::amount_less_reserve(deposit_asset, &size_in.value, fee, "ledger fee")?;
         Ok((transfer_amount.value.clone(), transfer_amount))

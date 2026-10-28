@@ -133,9 +133,9 @@ async fn a_parked_funding_send_moves_only_on_an_operator_decision() {
     state.deposit.deposit_funding.as_mut().unwrap().phase = OutboundPhase::Submitted { at: 1 };
 
     let error = finalizer.deposit(&mut state).await.expect_err("the window ran out");
-    assert!(error.starts_with(SIDE_EFFECT_AMBIGUOUS_PREFIX), "{error}");
+    assert!(error.to_string().starts_with(SIDE_EFFECT_AMBIGUOUS_PREFIX), "{error}");
     let error = finalizer.deposit(&mut state).await.expect_err("a release without a decision parks again");
-    assert!(error.starts_with(SIDE_EFFECT_AMBIGUOUS_PREFIX), "{error}");
+    assert!(error.to_string().starts_with(SIDE_EFFECT_AMBIGUOUS_PREFIX), "{error}");
 
     state.deposit.deposit_funding.as_mut().unwrap().decision =
         Some(OperatorDecision::Landed { receipt: "block-9".into() });
@@ -177,7 +177,7 @@ async fn a_send_that_never_landed_is_measured_and_prepared_again() {
 
     finalizer.deposit(&mut state).await.unwrap();
     let error = finalizer.deposit(&mut state).await.expect_err("refused");
-    assert_eq!(error, "insufficient funds");
+    assert_eq!(error, CexBackendError::Other("insufficient funds".to_string()));
     assert!(state.deposit.deposit_funding.is_none());
     finalizer.deposit(&mut state).await.unwrap();
     finalizer.deposit(&mut state).await.unwrap();
@@ -291,7 +291,7 @@ async fn an_absent_withdraw_parks_then_a_new_order_follows_an_absent_answer() {
 
     age_open_request(&mut state);
     let error = finalizer.withdraw(&mut state).await.expect_err("no record after the window");
-    assert!(error.starts_with(SIDE_EFFECT_AMBIGUOUS_PREFIX), "{error}");
+    assert!(error.to_string().starts_with(SIDE_EFFECT_AMBIGUOUS_PREFIX), "{error}");
 
     // The operator found no request. The leg reads the history once more.
     MexcFinalizer::<MockCexBackend>::answer_operator(&mut state, Some(&OperatorDecision::Absent)).unwrap();
@@ -331,7 +331,7 @@ async fn a_bridged_unanswered_withdraw_parks_instead_of_waiting_forever() {
     finalizer.withdraw(&mut state).await.expect("inside the window");
     age_open_request(&mut state);
     let error = finalizer.withdraw(&mut state).await.expect_err("parks after the window");
-    assert!(error.starts_with(SIDE_EFFECT_AMBIGUOUS_PREFIX), "{error}");
+    assert!(error.to_string().starts_with(SIDE_EFFECT_AMBIGUOUS_PREFIX), "{error}");
     assert!(state.withdraw.withdraw_id.is_none());
     assert!(state.withdraw.bridge.withdraw_bridge_id.is_none());
 }
@@ -355,7 +355,7 @@ async fn a_refused_withdraw_retries_under_a_new_order_id() {
 
     finalizer.withdraw(&mut state).await.unwrap();
     let error = finalizer.withdraw(&mut state).await.expect_err("refused");
-    assert!(!error.starts_with(SIDE_EFFECT_AMBIGUOUS_PREFIX));
+    assert!(!error.to_string().starts_with(SIDE_EFFECT_AMBIGUOUS_PREFIX));
     assert_eq!(state.withdraw.withdraw_attempt, 1);
     finalizer.withdraw(&mut state).await.unwrap();
     finalizer.withdraw(&mut state).await.unwrap();

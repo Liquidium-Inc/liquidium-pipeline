@@ -17,7 +17,7 @@ use crate::{
 };
 
 /// Amount-scoped MEXC preview used by the thin multi-venue adapter. The full
-/// `CexState` remains the single execution state owned by `CexFinalizerLogic`.
+/// `CexState` remains the single execution state of the CEX step machine.
 pub(super) struct MexcPreparedPreview {
     pub state: CexState,
     pub quote: SwapQuote,
@@ -229,7 +229,7 @@ where
 
     /// Quotes and prepares the exact request amount without performing a CEX
     /// side effect. Resolved markets are saved into the existing `CexState`,
-    /// which remains the only execution state used by `CexFinalizerLogic`.
+    /// which remains the only execution state of the CEX step machine.
     pub(super) async fn preview_swap_request(
         &self,
         execution_id: &str,
