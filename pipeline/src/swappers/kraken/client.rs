@@ -113,22 +113,31 @@ impl KrakenClient {
             .await
     }
 
-    /// The one online Kraken pair for an allowed market.
+    /// The one online Kraken pair for an allowed market. A cached pair that is
+    /// not online is read again, so a short incident does not outlast the cache.
     pub(super) async fn pair(&self, market: &str) -> Result<KrakenPair, String> {
         let market = normalize_market(market);
         if !self.allowed_pairs.contains(&market) {
             return Err(format!("Kraken pair {market} is not allowed"));
         }
-        let candidates = self.pairs_by_market().await?.get(&market).cloned().unwrap_or_default();
-        let pair = exactly_one(
-            candidates,
-            || format!("Kraken pair {market} is unavailable"),
-            || format!("Kraken pair {market} is ambiguous"),
-        )?;
+        let mut pair = self.listed_pair(&market).await?;
+        if !pair.online {
+            self.cache.pairs.forget(&());
+            pair = self.listed_pair(&market).await?;
+        }
         if !pair.online {
             return Err(format!("Kraken pair {market} is not online"));
         }
         Ok(pair)
+    }
+
+    async fn listed_pair(&self, market: &str) -> Result<KrakenPair, String> {
+        let candidates = self.pairs_by_market().await?.get(market).cloned().unwrap_or_default();
+        exactly_one(
+            candidates,
+            || format!("Kraken pair {market} is unavailable"),
+            || format!("Kraken pair {market} is ambiguous"),
+        )
     }
 
     pub(super) async fn book(&self, pair: &KrakenPair, depth: u32) -> Result<KrakenBook, String> {

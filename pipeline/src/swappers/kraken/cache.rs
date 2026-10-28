@@ -47,6 +47,11 @@ impl<K: Eq + Hash, V: Clone> TtlCache<K, V> {
             .insert(key, (Instant::now(), value.clone()));
         Ok(value)
     }
+
+    /// Drops the answer for `key`, so the next read loads it again.
+    pub(super) fn forget(&self, key: &K) {
+        self.entries.lock().unwrap_or_else(|e| e.into_inner()).remove(key);
+    }
 }
 
 #[derive(Default)]

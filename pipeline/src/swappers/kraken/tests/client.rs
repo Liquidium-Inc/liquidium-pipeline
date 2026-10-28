@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use liquidium_pipeline_connectors::backend::cex_backend::CexBackend;
 
-use super::support::{btc_usd_client, btc_usd_pair};
+use super::support::{btc_usd_client, btc_usd_pair, one_coin_book};
 use crate::swappers::kraken::{
     api::MockKrakenApi,
     client::{KrakenClient, api_asset, normalize_market},
@@ -40,12 +40,32 @@ async fn a_market_outside_the_allowlist_is_refused_without_a_read() {
     assert!(error.contains("not allowed"), "{error}");
 }
 
+/// Review finding 22: a status cached during a short incident kept the pair
+/// offline for minutes, and each trade attempt spent a retry.
+#[tokio::test]
+async fn a_cached_offline_pair_is_read_again() {
+    let mut offline = btc_usd_pair();
+    offline.online = false;
+    let mut api = MockKrakenApi::new();
+    let mut reads = 0;
+    api.expect_pairs().times(2).returning(move || {
+        reads += 1;
+        Ok(vec![if reads == 1 { offline.clone() } else { btc_usd_pair() }])
+    });
+    api.expect_orderbook().once().returning(|_, _| Ok(one_coin_book()));
+    btc_usd_client(api)
+        .get_orderbook("BTC_USD", None)
+        .await
+        .expect("the second read finds the pair online");
+}
+
 #[tokio::test]
 async fn offline_and_ambiguous_pairs_are_refused() {
     let mut offline = btc_usd_pair();
     offline.online = false;
     let mut api = MockKrakenApi::new();
-    api.expect_pairs().once().return_once(move || Ok(vec![offline]));
+    // A cached offline status is read once more before it counts.
+    api.expect_pairs().times(2).returning(move || Ok(vec![offline.clone()]));
     let error = btc_usd_client(api).get_orderbook("BTC_USD", None).await.unwrap_err();
     assert!(error.contains("not online"), "{error}");
 
