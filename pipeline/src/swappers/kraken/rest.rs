@@ -266,6 +266,7 @@ impl KrakenApi for KrakenRestApi {
         Ok(response
             .into_iter()
             .map(|address| KrakenDepositAddress {
+                permanent: address.expire_time == "0",
                 address: address.address,
                 tag: address.tag.or(address.memo),
             })

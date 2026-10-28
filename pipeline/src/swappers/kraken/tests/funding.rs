@@ -60,6 +60,7 @@ fn funding_api(minimum: Decimal, tag: Option<&'static str>) -> MockKrakenApi {
         .withf(|asset, method| asset == "XBT" && method == "Bitcoin")
         .returning(move |_, _| {
             Ok(vec![KrakenDepositAddress {
+                permanent: true,
                 address: "bc1qdeposit".into(),
                 tag: tag.map(str::to_string),
             }])
@@ -214,6 +215,7 @@ async fn a_deposit_below_the_minimum_is_refused_before_the_withdrawal_is_read() 
         .returning(|_| Ok(vec![bitcoin_method(Decimal::new(1, 2))]));
     api.expect_deposit_addresses().returning(|_, _| {
         Ok(vec![KrakenDepositAddress {
+            permanent: true,
             address: "bc1qdeposit".into(),
             tag: None,
         }])
@@ -247,6 +249,7 @@ async fn an_icp_deposit_that_needs_a_memo_is_unsupported() {
         .returning(|_| Ok(vec![method("Internet Computer Protocol (ICP)", None)]));
     api.expect_deposit_addresses().returning(|_, _| {
         Ok(vec![KrakenDepositAddress {
+            permanent: true,
             address: "icp-account".into(),
             tag: Some("123".into()),
         }])
@@ -330,6 +333,34 @@ async fn each_withdrawal_failure_keeps_its_kind() {
     }
 }
 
+/// Review finding 28: Kraken keeps several addresses per coin, and the
+/// route was refused when it listed more than one.
+#[tokio::test]
+async fn the_first_non_expiring_deposit_address_is_used() {
+    let address = |address: &str, permanent| KrakenDepositAddress {
+        permanent,
+        address: address.into(),
+        tag: None,
+    };
+    let mut api = MockKrakenApi::new();
+    api.expect_deposit_methods()
+        .returning(|_| Ok(vec![bitcoin_method(Decimal::ZERO)]));
+    api.expect_deposit_addresses().returning(move |_, _| {
+        Ok(vec![
+            address("bc1qexpiring", false),
+            address("bc1qfirst", true),
+            address("bc1qsecond", true),
+        ])
+    });
+
+    let deposit = btc_usd_client(api)
+        .get_deposit_address("BTC", "bitcoin")
+        .await
+        .expect("a permanent address exists");
+
+    assert_eq!(deposit.address, "bc1qfirst");
+}
+
 /// Review finding 9: nothing is sent before the reads succeed, so a failed
 /// read must take the outage wait, not spend a retry on a refusal.
 #[tokio::test]
@@ -411,6 +442,7 @@ async fn a_second_route_check_reads_the_cached_methods_and_addresses() {
         .returning(|_| Ok(vec![bitcoin_method(Decimal::ZERO)]));
     api.expect_deposit_addresses().once().returning(|_, _| {
         Ok(vec![KrakenDepositAddress {
+            permanent: true,
             address: "bc1qdeposit".into(),
             tag: None,
         }])
@@ -445,6 +477,7 @@ async fn a_failed_read_is_not_cached() {
     });
     api.expect_deposit_addresses().returning(|_, _| {
         Ok(vec![KrakenDepositAddress {
+            permanent: true,
             address: "bc1qdeposit".into(),
             tag: None,
         }])

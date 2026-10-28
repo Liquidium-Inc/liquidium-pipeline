@@ -37,15 +37,13 @@ impl KrakenClient {
             .deposit_addresses(&api_asset, &method.method)
             .await
             .map_err(unavailable)?;
-        let address = exactly_one(
-            addresses,
-            || FundingRouteError::Unsupported(format!("Kraken has no {asset} deposit address for network {network}")),
-            || {
-                FundingRouteError::Unsupported(format!(
-                    "Kraken returned several {asset} deposit addresses for network {network}"
-                ))
-            },
-        )?;
+        // Kraken keeps up to five addresses per coin, and each one credits the
+        // account. Only an address that never expires is safe to send to later.
+        let address = addresses.into_iter().find(|address| address.permanent).ok_or_else(|| {
+            FundingRouteError::Unsupported(format!(
+                "Kraken has no non-expiring {asset} deposit address for network {network}"
+            ))
+        })?;
         Ok((method, address.address, address.tag))
     }
 

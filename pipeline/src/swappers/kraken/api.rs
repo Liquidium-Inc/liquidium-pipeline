@@ -41,6 +41,8 @@ pub struct KrakenFundingMethod {
 pub struct KrakenDepositAddress {
     pub address: String,
     pub tag: Option<String>,
+    /// Kraken never expires it.
+    pub permanent: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
