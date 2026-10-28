@@ -96,12 +96,30 @@ impl KrakenRestApi {
     ) -> Result<T, KrakenApiError> {
         let mut client = self.client.lock().await;
         let response = request(&mut client).await.map_err(transport_error)?;
-        if !response.error.is_empty() {
-            return Err(KrakenApiError::Rejected(response.error.join(" | ")));
+        read_answer(response.error, response.result)
+    }
+}
+
+/// Kraken marks each `error` entry `E` (the request failed) or `W` (a warning
+/// on a request it carried out). A result next to an error is unclear, so the request may have acted.
+fn read_answer<T>(errors: Vec<String>, result: Option<T>) -> Result<T, KrakenApiError> {
+    let warnings_only = errors.iter().all(|entry| entry.starts_with('W'));
+    match result {
+        Some(result) if warnings_only => {
+            if !errors.is_empty() {
+                log::warn!("[kraken] the answer carries warnings: {}", errors.join(" | "));
+            }
+            Ok(result)
         }
-        response
-            .result
-            .ok_or_else(|| KrakenApiError::Transport("response contained neither result nor error".to_string()))
+        Some(_) => Err(KrakenApiError::Transport(format!(
+            "Kraken answered with a result and errors: {}",
+            errors.join(" | ")
+        ))),
+        None if errors.is_empty() || warnings_only => Err(KrakenApiError::Transport(format!(
+            "Kraken answered with no result: [{}]",
+            errors.join(" | ")
+        ))),
+        None => Err(KrakenApiError::Rejected(errors.join(" | "))),
     }
 }
 
@@ -368,6 +386,31 @@ mod tests {
             None
         );
         assert_eq!(take_requested(map(&[]), "XXBTZUSD"), None);
+    }
+
+    /// Review finding 5: a warning comes with a request Kraken carried out, so
+    /// reading it as a refusal would send the same withdrawal again.
+    #[test]
+    fn only_an_error_without_a_result_is_a_refusal() {
+        let strings = |entries: &[&str]| entries.iter().map(|entry| entry.to_string()).collect::<Vec<_>>();
+
+        assert_eq!(read_answer(strings(&[]), Some(1)), Ok(1));
+        assert_eq!(read_answer(strings(&["WGeneral:Deprecated"]), Some(1)), Ok(1));
+        assert!(matches!(
+            read_answer::<u8>(strings(&["EFunding:Unknown withdraw key"]), None),
+            Err(KrakenApiError::Rejected(_))
+        ));
+        // Mixed signals and empty answers may follow an action.
+        for (errors, result) in [
+            (strings(&["EGeneral:Internal error"]), Some(1)),
+            (strings(&["WGeneral:Deprecated"]), None),
+            (strings(&[]), None),
+        ] {
+            assert!(
+                matches!(read_answer(errors, result), Err(KrakenApiError::Transport(_))),
+                "may have acted"
+            );
+        }
     }
 
     #[test]
