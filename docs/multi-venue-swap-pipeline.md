@@ -461,10 +461,12 @@ No change should be needed to:
 | Venue registry and concurrent quote book | `pipeline/src/finalizers/multi_venue/planning/venue_registry.rs` |
 | `icpswap_first` allocation policy | `pipeline/src/finalizers/multi_venue/planning/icpswap_first_planner.rs` |
 | ICPSwap adapter | `pipeline/src/finalizers/icpswap/multi_venue_adapter.rs` |
-| MEXC adapter | `pipeline/src/finalizers/mexc/mexc_multi_venue_adapter.rs` |
-| MEXC amount-scoped preparation and quote support | `pipeline/src/finalizers/mexc/mexc_multi_venue_support.rs` |
-| Shared legacy and multi-venue MEXC route quote | `pipeline/src/finalizers/mexc/mexc_route_preview.rs` |
-| Existing MEXC CEX state machine | `pipeline/src/finalizers/mexc/mexc_finalizer.rs` |
+| Exchange adapter | `pipeline/src/finalizers/cex/multi_venue_adapter.rs` |
+| Exchange amount-scoped preparation and quote support | `pipeline/src/finalizers/cex/multi_venue_support.rs` |
+| Exchange route quote | `pipeline/src/finalizers/cex/route_preview.rs` |
+| Shared exchange step machine (`CexVenueFinalizer`) | `pipeline/src/finalizers/cex/finalizer.rs` |
+| What differs per exchange (`CexVenueProfile`) | `pipeline/src/finalizers/cex/profile.rs` |
+| Exchange venue builders | `pipeline/src/finalizers/cex/runtime.rs` |
 
 ## Implementation Status
 

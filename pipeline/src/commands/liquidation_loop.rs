@@ -22,7 +22,7 @@ use crate::{
     executors::basic::basic_executor::BasicExecutor,
     bridge::{claims::WalBridgeClaims, runtime::BridgeRuntime},
     finalizers::{
-        mexc::runtime::build_mexc_finalizer,
+        cex::runtime::build_mexc_finalizer,
         multi_venue::{
             ICPSWAP_VENUE_ID, IcpswapFirstPlannerConfig, MEXC_VENUE_ID, MultiVenueAdapter, MultiVenueFinalizer,
         },

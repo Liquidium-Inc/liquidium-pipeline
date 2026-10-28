@@ -9,6 +9,7 @@ pub struct CexVenueProfile {
     name: &'static str,
     special_trade_legs: Option<fn(&str, &str) -> Option<Vec<TradeLeg>>>,
     approval_bumps: bool,
+    client_order_id_max_len: usize,
 }
 
 impl CexVenueProfile {
@@ -20,6 +21,7 @@ impl CexVenueProfile {
             name: "MEXC",
             special_trade_legs: Some(mexc_special_trade_legs),
             approval_bumps: true,
+            client_order_id_max_len: 32,
         }
     }
 
@@ -41,6 +43,11 @@ impl CexVenueProfile {
     /// Whether direct ICP deposits send approval bumps, and so reserve their fees.
     pub(super) fn approval_bumps(&self) -> bool {
         self.approval_bumps
+    }
+
+    /// The longest client order id the exchange accepts.
+    pub(super) fn client_order_id_max_len(&self) -> usize {
+        self.client_order_id_max_len
     }
 }
 

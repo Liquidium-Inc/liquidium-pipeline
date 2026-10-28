@@ -388,8 +388,8 @@ impl Config {
 
         let bad_debt_collateral_slippage_bps = parse_bad_debt_collateral_slippage_bps_from_env();
         let cex_tunables = parse_cex_tunables_from_env();
-        let cex_mexc_available_pairs = parse_cex_mexc_available_pairs_from_env();
-        let cex_mexc_max_hops = parse_cex_mexc_max_hops_from_env();
+        let cex_mexc_available_pairs = parse_cex_available_pairs_from_env("CEX_MEXC_AVAILABLE_PAIRS");
+        let cex_mexc_max_hops = parse_cex_max_hops_from_env("CEX_MEXC_MAX_HOPS");
         let icpswap_factory_canister = parse_icpswap_factory_from_env()?;
         let icpswap_fee_tiers = parse_icpswap_fee_tiers_from_env()?;
         let icpswap_test_allocation_usd = parse_icpswap_test_allocation_usd_from_env()?;
@@ -562,8 +562,8 @@ const DEFAULT_CEX_DELAY_BUFFER_BPS: u32 = 75;
 const DEFAULT_CEX_ROUTE_FEE_BPS: u32 = 0;
 /// One trillion cycles is one XDR. The XDR moves little against the USD.
 const DEFAULT_CYCLES_USD_PER_TRILLION: f64 = 1.35;
-const DEFAULT_CEX_MEXC_MAX_HOPS: u8 = 2;
-const MAX_CEX_MEXC_MAX_HOPS: u8 = 4;
+const DEFAULT_CEX_MAX_HOPS: u8 = 2;
+const MAX_CEX_MAX_HOPS: u8 = 4;
 const DEFAULT_BAD_DEBT_COLLATERAL_SLIPPAGE_BPS: u32 = 500;
 const MAX_BPS: u32 = 10_000;
 const MIN_RATIO: f64 = 0.0;
@@ -841,8 +841,9 @@ pub(crate) fn normalize_cex_market_pair(raw: &str) -> Option<String> {
     Some(format!("{}_{}", base, quote))
 }
 
-fn parse_cex_mexc_available_pairs_from_env() -> Vec<String> {
-    let raw = match env::var("CEX_MEXC_AVAILABLE_PAIRS") {
+/// An exchange's market allowlist from `name`, normalised and deduplicated.
+fn parse_cex_available_pairs_from_env(name: &str) -> Vec<String> {
+    let raw = match env::var(name) {
         Ok(v) => v,
         Err(_) => return vec![],
     };
@@ -859,12 +860,13 @@ fn parse_cex_mexc_available_pairs_from_env() -> Vec<String> {
     out
 }
 
-fn parse_cex_mexc_max_hops_from_env() -> u8 {
-    env::var("CEX_MEXC_MAX_HOPS")
+/// An exchange's route hop limit from `name`, clamped to the cap.
+fn parse_cex_max_hops_from_env(name: &str) -> u8 {
+    env::var(name)
         .ok()
         .and_then(|v| v.parse::<u8>().ok())
-        .map(|v| v.min(MAX_CEX_MEXC_MAX_HOPS))
-        .unwrap_or(DEFAULT_CEX_MEXC_MAX_HOPS)
+        .map(|v| v.min(MAX_CEX_MAX_HOPS))
+        .unwrap_or(DEFAULT_CEX_MAX_HOPS)
 }
 
 fn parse_cex_tunables_from_env() -> CexTunables {
@@ -1244,7 +1246,7 @@ mod tests {
             );
         }
 
-        let parsed = parse_cex_mexc_available_pairs_from_env();
+        let parsed = parse_cex_available_pairs_from_env("CEX_MEXC_AVAILABLE_PAIRS");
         assert_eq!(
             parsed,
             vec!["CKBTC_BTC".to_string(), "BTC_USDC".to_string(), "USDC_USDT".to_string(),]
@@ -1258,7 +1260,7 @@ mod tests {
             env::remove_var("CEX_MEXC_AVAILABLE_PAIRS");
         }
 
-        assert!(parse_cex_mexc_available_pairs_from_env().is_empty());
+        assert!(parse_cex_available_pairs_from_env("CEX_MEXC_AVAILABLE_PAIRS").is_empty());
     }
 
     #[test]
@@ -1267,17 +1269,17 @@ mod tests {
         unsafe {
             env::remove_var("CEX_MEXC_MAX_HOPS");
         }
-        assert_eq!(parse_cex_mexc_max_hops_from_env(), DEFAULT_CEX_MEXC_MAX_HOPS);
+        assert_eq!(parse_cex_max_hops_from_env("CEX_MEXC_MAX_HOPS"), DEFAULT_CEX_MAX_HOPS);
 
         unsafe {
             env::set_var("CEX_MEXC_MAX_HOPS", "9");
         }
-        assert_eq!(parse_cex_mexc_max_hops_from_env(), MAX_CEX_MEXC_MAX_HOPS);
+        assert_eq!(parse_cex_max_hops_from_env("CEX_MEXC_MAX_HOPS"), MAX_CEX_MAX_HOPS);
 
         unsafe {
             env::set_var("CEX_MEXC_MAX_HOPS", "1");
         }
-        assert_eq!(parse_cex_mexc_max_hops_from_env(), 1);
+        assert_eq!(parse_cex_max_hops_from_env("CEX_MEXC_MAX_HOPS"), 1);
     }
 
     #[test]

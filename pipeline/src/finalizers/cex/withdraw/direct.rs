@@ -40,7 +40,7 @@ where
             state.send_saved = true;
             return Ok(None);
         }
-        let sender = CexWithdrawals::new(self.backend.clone());
+        let sender = CexWithdrawals::new(self.backend.clone(), self.profile.name());
         match step_outbound(&mut state.withdraw.withdraw_send, &sender, None, now_ts()).await {
             Ok(landed) => Ok(landed.as_deref().map(AcceptedWithdrawal::parse)),
             Err(OutboundError::BelowMinimum(error)) => {

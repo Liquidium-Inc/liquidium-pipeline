@@ -69,7 +69,7 @@ where
         // we can force `BaseQuantity` on the next slice to consume more residual.
         let mut forced_next_buy_mode: Option<BuyOrderInputMode> = None;
 
-        Self::sanitize_pending_trade_state_for_leg(state, leg);
+        self.sanitize_pending_trade_state_for_leg(state, leg);
 
         // Keep slicing until the leg input is consumed (or considered dust).
         while remaining_in > LIQUIDITY_EPS {
@@ -114,7 +114,7 @@ where
             }
 
             let buy_mode = Self::resolve_slice_buy_mode(state, leg, &mut forced_next_buy_mode);
-            let pending = Self::prepare_pending_slice_request(state, leg, leg_idx, preview.chunk_in, buy_mode);
+            let pending = self.prepare_pending_slice_request(state, leg, leg_idx, preview.chunk_in, buy_mode);
 
             // The exchange enforces the limit with an IOC order. Only if the
             // exchange refuses IOC outright does the slice go out as a market order.
