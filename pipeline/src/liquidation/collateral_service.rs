@@ -97,28 +97,18 @@ impl<P: PriceOracle> CollateralServiceTrait for CollateralService<P> {
         // Start with the requested repay (bounded by remaining debt and external max)
         let mut repay_native = debt_position.debt_amount.clone().min(max_repay_amount.clone());
 
-        //Respect per-user liquidation ratio cap (value terms)
+        // Mirror the pool's close factor (`compute_repay_cap`): one call repays at
+        // most half of the selected debt position, or all of it at HF <= 975.
         const WIPEOUT_THRESHOLD: u128 = 975u128;
         let liquidation_ratio = if user.health_factor <= WIPEOUT_THRESHOLD {
             1000
         } else {
             MAX_LIQUIDATION_RATIO
         };
-        // convert repay_native (debt units) -> quote
-        let debt_scale = Nat::from(10u128.pow(debt_decimals));
-
-        // NOTE: All quote comparisons here are in RAY (1e27). Prices from oracle are RAY; dividing by token scale keeps quote in RAY.
-        // price_debt_ray is RAY; dividing only by debt_scale keeps quote in RAY
-        let repay_quote = (price_debt_ray.clone() * repay_native.clone()) / debt_scale.clone();
-        let max_liq_quote = (user.total_debt.clone() * Nat::from(liquidation_ratio)) / Nat::from(1000u32);
-        if repay_quote > max_liq_quote {
-            // max_liq_quote is RAY; convert back to native by dividing by price (RAY) and multiplying by debt_scale
-            let new_repay_native = (max_liq_quote.clone() * debt_scale.clone()) / price_debt_ray.clone();
-            repay_native = new_repay_native;
-        }
+        let close_cap = (debt_position.debt_amount.clone() * Nat::from(liquidation_ratio)) / Nat::from(1000u32);
+        repay_native = repay_native.min(close_cap);
 
         debug!("[debug] repay_native={} ", repay_native);
-        debug!("[debug] repay_quote={} max_liq_quote={}", repay_quote, max_liq_quote);
 
         // Cap by available collateral
         let bonus_bps = collateral_position.liquidation_bonus;
@@ -793,6 +783,79 @@ mod test {
         assert_eq!(res.received_collateral, Nat::from(0u8));
     }
 
+    /// The pool's `compute_repay_cap` caps one call at 50% of the selected debt
+    /// position, or 100% at HF <= 975; the rest of the portfolio does not count.
+    #[tokio::test]
+    async fn the_close_factor_applies_to_the_selected_debt_position() {
+        let mut oracle = MockPriceOracle::new();
+        oracle.expect_get_price().returning(|asset, _| {
+            let price = match asset {
+                "USDT" | "USDC" => 1u128,
+                "BTC" => 100_000u128,
+                _ => panic!("unexpected asset {asset}"),
+            };
+            Ok((Nat::from(price * 10u128.pow(27)), 27))
+        });
+        let service = CollateralService::new(Arc::new(oracle));
+        let usdt_debt = LiquidateblePosition {
+            pool_id: Principal::from_text("cngnf-vqaaa-aaaar-qag4q-cai").unwrap(),
+            account: Principal::anonymous(),
+            asset: Assets::USDT,
+            asset_type: AssetType::CkAsset(Principal::anonymous()),
+            debt_amount: Nat::from(100_000_000u64),
+            collateral_amount: Nat::from(0u8),
+            liquidation_bonus: 1000,
+            liquidation_threshold: 8500,
+            protocol_fee: 0,
+        };
+        let usdc_debt = LiquidateblePosition {
+            pool_id: Principal::from_text("xevnm-gaaaa-aaaar-qafnq-cai").unwrap(),
+            asset: Assets::USDC,
+            ..usdt_debt.clone()
+        };
+        let btc_collateral = LiquidateblePosition {
+            pool_id: Principal::from_text("mxzaz-hqaaa-aaaar-qaada-cai").unwrap(),
+            asset: Assets::BTC,
+            debt_amount: Nat::from(0u8),
+            collateral_amount: Nat::from(1_000_000u64),
+            ..usdt_debt.clone()
+        };
+        let repaid = |positions: Vec<LiquidateblePosition>, hf: u64| {
+            let service = &service;
+            let (usdt_debt, btc_collateral) = (usdt_debt.clone(), btc_collateral.clone());
+            async move {
+                let total = positions.iter().filter(|p| p.debt_amount > 0u8).count() as u128;
+                let mut user = LiquidatebleUser {
+                    account: Principal::anonymous(),
+                    health_factor: Nat::from(hf),
+                    weighted_liquidation_threshold: Nat::from(8500u64),
+                    total_debt: Nat::from(total * 100 * 10u128.pow(27)),
+                    positions,
+                };
+                service
+                    .calculate_liquidation_amounts(Nat::from(u64::MAX), &usdt_debt, &btc_collateral, &mut user)
+                    .await
+                    .unwrap()
+                    .repaid_debt
+            }
+        };
+        let two_debts = vec![usdt_debt.clone(), usdc_debt.clone(), btc_collateral.clone()];
+        let one_debt = vec![usdt_debt.clone(), btc_collateral.clone()];
+
+        assert_eq!(
+            repaid(two_debts.clone(), 980).await,
+            Nat::from(50_000_000u64),
+            "half of $100, not of $200"
+        );
+        assert_eq!(repaid(two_debts.clone(), 976).await, Nat::from(50_000_000u64));
+        assert_eq!(
+            repaid(two_debts, 975).await,
+            Nat::from(100_000_000u64),
+            "all of the position at HF <= 975"
+        );
+        assert_eq!(repaid(one_debt, 980).await, Nat::from(50_000_000u64));
+    }
+
     mod fuzz {
         use super::*;
         proptest! {
@@ -873,13 +936,11 @@ mod test {
                     fee_bps as u64,
                 ).unwrap_or_else(|_| Nat::from(0u8));
 
-                // Liquidation ratio cap in quote (RAY)
+                // The pool's close factor applies to the selected debt position.
                 let liquidation_ratio = if hf_permille <= 975 { 1000 } else { MAX_LIQUIDATION_RATIO };
-                let max_liq_quote = (user.total_debt.clone() * Nat::from(liquidation_ratio)) / Nat::from(1000u32);
+                let close_cap = (Nat::from(debt_native) * Nat::from(liquidation_ratio)) / Nat::from(1000u32);
                 let debt_scale = Nat::from(10u128.pow(6));
                 let price_debt_ray_nat: Nat = price_debt_ray;
-                let requested_quote = (price_debt_ray_nat.clone() * Nat::from(max_repay_native)) / debt_scale.clone();
-                let cap_quote = std::cmp::min(requested_quote.clone(), max_liq_quote.clone());
 
                 // Compute pre-call debt quote using price_debt_ray_nat and debt_scale
                 let pre_debt_quote = (price_debt_ray_nat.clone() * Nat::from(debt_native)) / debt_scale.clone();
@@ -908,9 +969,8 @@ mod test {
                 // Seized collateral cannot exceed available collateral
                 prop_assert!(res.received_collateral <= coll_native);
 
-                // Ratio cap enforced in quote terms (RAY)
-                let actual_quote = (price_debt_ray_nat.clone() * res.repaid_debt.clone()) / debt_scale.clone();
-                prop_assert!(actual_quote <= cap_quote);
+                // Close factor enforced on the selected position, in native units
+                prop_assert!(res.repaid_debt <= close_cap);
 
                 // Post-call total debt should not exceed the pre-call computed debt quote
                 prop_assert!(user.total_debt <= pre_debt_quote);

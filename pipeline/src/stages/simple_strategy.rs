@@ -36,31 +36,36 @@ use itertools::Itertools;
 #[cfg(test)]
 const WIPEOUT_THRESHOLD: u32 = 975;
 
-fn resolve_token_for_position(registry: &dyn TokenRegistryTrait, pos: &LiquidateblePosition) -> Option<ChainToken> {
+fn position_asset_id(pos: &LiquidateblePosition) -> Option<AssetId> {
     if pos.asset.symbol().eq_ignore_ascii_case("ICP") {
-        let id = AssetId {
+        return Some(AssetId {
             chain: "icp".to_string(),
             address: ICP_LEDGER_PRINCIPAL.to_string(),
             symbol: "ICP".to_string(),
-        };
-        return registry.get(&id);
+        });
     }
 
     match pos.asset_type {
-        AssetType::CkAsset(principal) => {
-            let id = AssetId {
-                chain: "icp".to_string(),
-                address: principal.to_text(),
-                symbol: pos.asset.symbol(),
-            };
-            registry.get(&id)
-        }
+        AssetType::CkAsset(principal) => Some(AssetId {
+            chain: "icp".to_string(),
+            address: principal.to_text(),
+            symbol: pos.asset.symbol(),
+        }),
         _ => None,
     }
 }
 
-fn is_supported_position_asset_type(pos: &LiquidateblePosition) -> bool {
-    pos.asset.symbol().eq_ignore_ascii_case("ICP") || matches!(pos.asset_type, AssetType::CkAsset(_))
+fn resolve_token_for_position(registry: &dyn TokenRegistryTrait, pos: &LiquidateblePosition) -> Option<ChainToken> {
+    registry.get(&position_asset_id(pos)?)
+}
+
+/// The same position in the borrower's working state, with the amounts left
+/// after the requests accepted earlier in this cycle.
+fn current_position(user: &LiquidatebleUser, pos: &LiquidateblePosition) -> Option<LiquidateblePosition> {
+    user.positions
+        .iter()
+        .find(|p| p.pool_id == pos.pool_id && p.asset == pos.asset && p.account == pos.account)
+        .cloned()
 }
 
 pub struct SimpleLiquidationStrategy<C, R, U>
@@ -192,6 +197,7 @@ where
         for user in users.iter() {
             for pos in user.positions.iter() {
                 if pos.debt_amount > 0u8
+                    && self.has_debt_role(pos)
                     && let Some(token) = resolve_token_for_position(self.registry.as_ref(), pos)
                 {
                     debt_assets.insert(token);
@@ -222,6 +228,14 @@ where
             .collect()
     }
 
+    fn has_debt_role(&self, pos: &LiquidateblePosition) -> bool {
+        position_asset_id(pos).is_some_and(|id| self.registry.is_debt_asset(&id))
+    }
+
+    fn has_collateral_role(&self, pos: &LiquidateblePosition) -> bool {
+        position_asset_id(pos).is_some_and(|id| self.registry.is_collateral_asset(&id))
+    }
+
     #[allow(clippy::type_complexity)]
     fn build_combos(
         &self,
@@ -234,26 +248,32 @@ where
         let mut bad_debts: Vec<(usize, LiquidateblePosition)> = Vec::new();
 
         for (idx, user) in work_users.iter().enumerate() {
-            let debts: Vec<_> = user.positions.iter().filter(|p| p.debt_amount > 0u8).cloned().collect();
-
-            let colls: Vec<_> = user
+            let debts: Vec<_> = user
                 .positions
                 .iter()
-                .filter(|p| p.collateral_amount > 0u8)
+                .filter(|p| p.debt_amount > 0u8 && self.has_debt_role(p))
                 .cloned()
                 .collect();
-
             if debts.is_empty() {
                 continue;
             }
 
-            if colls.is_empty() {
+            // Bad debt is judged on the whole portfolio. Collateral that the bot
+            // may not seize still backs the debt, so repaying it would donate.
+            if user.positions.iter().all(|p| p.collateral_amount == 0u8) {
                 debug!("Bad debt detected: user has no collateral; queueing debt positions.");
                 for d in debts {
                     bad_debts.push((idx, d));
                 }
                 continue;
             }
+
+            let colls: Vec<_> = user
+                .positions
+                .iter()
+                .filter(|p| p.collateral_amount > 0u8 && self.has_collateral_role(p))
+                .cloned()
+                .collect();
 
             for d in &debts {
                 for c in &colls {
@@ -296,10 +316,6 @@ where
 
             if work_users[user_idx].health_factor >= 1000u32 {
                 continue;
-            }
-
-            if !is_supported_position_asset_type(&debt_position) {
-                return Err("invalid asset type".to_string());
             }
 
             let repayment_token = if let Some(tok) = resolve_token_for_position(self.registry.as_ref(), &debt_position)
@@ -471,8 +487,8 @@ where
                 .then(c2.cmp(c1))
         });
 
-        for (user_idx, debt_position, collateral_position, _, _) in priced {
-            let debt_key = format!("{}:{}", debt_position.account, debt_position.pool_id);
+        for (user_idx, debt_ref, collateral_ref, _, _) in priced {
+            let debt_key = format!("{}:{}", debt_ref.account, debt_ref.pool_id);
             if cleared_debts.contains(&debt_key) {
                 continue;
             }
@@ -481,10 +497,16 @@ where
                 continue;
             }
 
-            if !is_supported_position_asset_type(&debt_position)
-                || !is_supported_position_asset_type(&collateral_position)
-            {
-                return Err("invalid asset type".to_string());
+            // Amounts come from the working state, so collateral that an earlier
+            // request in this cycle already takes is not planned twice.
+            let (Some(debt_position), Some(collateral_position)) = (
+                current_position(&work_users[user_idx], &debt_ref),
+                current_position(&work_users[user_idx], &collateral_ref),
+            ) else {
+                continue;
+            };
+            if debt_position.debt_amount == 0u8 || collateral_position.collateral_amount == 0u8 {
+                continue;
             }
 
             let repayment_token = if let Some(tok) = resolve_token_for_position(self.registry.as_ref(), &debt_position)
@@ -546,15 +568,28 @@ where
                 max_balance
             );
 
-            let mut estimation = self
+            // Estimate on a copy: only an accepted request may change the
+            // borrower that later candidates are planned against.
+            let mut candidate_user = work_users[user_idx].clone();
+            let mut estimation = match self
                 .collateral_service
                 .calculate_liquidation_amounts(
                     max_balance.clone(),
                     &debt_position,
                     &collateral_position,
-                    &mut work_users[user_idx],
+                    &mut candidate_user,
                 )
-                .await?;
+                .await
+            {
+                Ok(estimation) => estimation,
+                Err(error) => {
+                    warn!(
+                        "Skipping combo {} debt / {} collateral: estimation failed: {}",
+                        debt_position.asset, collateral_position.asset, error
+                    );
+                    continue;
+                }
+            };
 
             let gross_estimated_collateral = estimation.received_collateral.clone();
             estimation.received_collateral = if estimation.received_collateral < collateral_token.fee() {
@@ -717,6 +752,7 @@ where
                 debt_approval_needed,
                 min_collateral_amount,
             });
+            work_users[user_idx] = candidate_user;
 
             if estimation.repaid_debt >= debt_position.debt_amount {
                 cleared_debts.insert(debt_key);
@@ -810,6 +846,12 @@ mod tests {
         }
     }
 
+    /// Every asset is both a debt and a collateral asset, as in the sample config.
+    fn all_roles(registry: &mut MockTokenRegistryTrait) {
+        registry.expect_is_debt_asset().return_const(true);
+        registry.expect_is_collateral_asset().return_const(true);
+    }
+
     fn mk_user(positions: Vec<LiquidateblePosition>, total_debt: u64, hf: u64) -> LiquidatebleUser {
         LiquidatebleUser {
             account: Principal::anonymous(),
@@ -828,6 +870,7 @@ mod tests {
 
         // Registry always resolves to the same token for this test.
         let mut registry = MockTokenRegistryTrait::new();
+        all_roles(&mut registry);
         registry
             .expect_get()
             .returning(move |_id: &AssetId| Some(token.clone()));
@@ -909,6 +952,7 @@ mod tests {
         let token = mk_icp_token("ckUSDC", 6);
 
         let mut registry = MockTokenRegistryTrait::new();
+        all_roles(&mut registry);
         registry
             .expect_get()
             .returning(move |_id: &AssetId| Some(token.clone()));
@@ -962,12 +1006,12 @@ mod tests {
         assert_eq!(res.unwrap_err(), "Could not get balance");
     }
 
-    // Errors on unsupported asset type.
     #[tokio::test]
-    async fn simple_strategy_fails_on_unsupported_asset_type() {
+    async fn simple_strategy_skips_an_unsupported_asset_type() {
         let token = mk_icp_token("ckUSDC", 6);
 
         let mut registry = MockTokenRegistryTrait::new();
+        all_roles(&mut registry);
         registry
             .expect_get()
             .returning(move |_id: &AssetId| Some(token.clone()));
@@ -1026,9 +1070,10 @@ mod tests {
         };
 
         let user = mk_user(vec![pos], 1_000, 900);
-        let res = strategy.process(&vec![user]).await;
-        assert!(res.is_err());
-        assert_eq!(res.unwrap_err(), "invalid asset type");
+        // A position the bot cannot represent is skipped; it must not fail
+        // the cycle for every other borrower.
+        let res = strategy.process(&vec![user]).await.unwrap();
+        assert!(res.is_empty());
     }
 
     #[tokio::test]
@@ -1050,6 +1095,7 @@ mod tests {
         };
 
         let mut registry = MockTokenRegistryTrait::new();
+        all_roles(&mut registry);
         registry.expect_get().returning({
             let ckusdc_token = ckusdc_token.clone();
             let icp_token = icp_token.clone();
@@ -1141,6 +1187,7 @@ mod tests {
         let token = mk_icp_token("ckUSDC", 6);
 
         let mut registry = MockTokenRegistryTrait::new();
+        all_roles(&mut registry);
         registry
             .expect_get()
             .returning(move |_id: &AssetId| Some(token.clone()));
@@ -1211,6 +1258,7 @@ mod tests {
         };
 
         let mut registry = MockTokenRegistryTrait::new();
+        all_roles(&mut registry);
         registry
             .expect_get()
             .returning(move |_id: &AssetId| Some(token.clone()));
@@ -1303,6 +1351,7 @@ mod tests {
         };
 
         let mut registry = MockTokenRegistryTrait::new();
+        all_roles(&mut registry);
         registry
             .expect_get()
             .returning(move |_id: &AssetId| Some(token.clone()));
@@ -1385,6 +1434,7 @@ mod tests {
         let token = mk_icp_token("ckBTC", 8);
 
         let mut registry = MockTokenRegistryTrait::new();
+        all_roles(&mut registry);
         registry
             .expect_get()
             .returning(move |_id: &AssetId| Some(token.clone()));
@@ -1497,6 +1547,7 @@ mod tests {
         };
 
         let mut registry = MockTokenRegistryTrait::new();
+        all_roles(&mut registry);
         registry.expect_get().returning({
             let ckusdc_token = ckusdc_token.clone();
             let cketh_token = cketh_token.clone();
@@ -1595,6 +1646,7 @@ mod tests {
         };
 
         let mut registry = MockTokenRegistryTrait::new();
+        all_roles(&mut registry);
         registry.expect_get().returning({
             let ckusdc_token = ckusdc_token.clone();
             let cketh_token = cketh_token.clone();
@@ -1683,6 +1735,7 @@ mod tests {
         let token = mk_icp_token("ckUSDC", 6);
 
         let mut registry = MockTokenRegistryTrait::new();
+        all_roles(&mut registry);
         registry
             .expect_get()
             .returning(move |_id: &AssetId| Some(token.clone()));
@@ -1749,6 +1802,7 @@ mod tests {
         let token = mk_icp_token("ckUSDC", 6); // fee = 100
 
         let mut registry = MockTokenRegistryTrait::new();
+        all_roles(&mut registry);
         registry
             .expect_get()
             .returning(move |_id: &AssetId| Some(token.clone()));
@@ -1812,8 +1866,22 @@ mod tests {
         let pool = p("mxzaz-hqaaa-aaaar-qaada-cai");
         let borrower = p("user-budget");
         let debt_pos = mk_position(pool, borrower, ledger, 1_000, 0, Assets::USDC);
-        let coll_pos1 = mk_position(pool, borrower, ledger, 0, 3_000, Assets::USDC);
-        let coll_pos2 = mk_position(pool, borrower, ledger, 0, 2_500, Assets::USDC);
+        let coll_pos1 = mk_position(
+            p("ss2fx-dyaaa-aaaar-qacoq-cai"),
+            borrower,
+            ledger,
+            0,
+            3_000,
+            Assets::USDC,
+        );
+        let coll_pos2 = mk_position(
+            p("cngnf-vqaaa-aaaar-qag4q-cai"),
+            borrower,
+            ledger,
+            0,
+            2_500,
+            Assets::USDC,
+        );
         let user = mk_user(vec![debt_pos, coll_pos1, coll_pos2], 1_000, 900);
 
         let res = strategy.process(&vec![user]).await.unwrap();
@@ -1827,6 +1895,7 @@ mod tests {
         let token = mk_icp_token("ckUSDC", 6);
 
         let mut registry = MockTokenRegistryTrait::new();
+        all_roles(&mut registry);
         registry
             .expect_get()
             .returning(move |_id: &AssetId| Some(token.clone()));
@@ -1893,8 +1962,15 @@ mod tests {
         let pool = p("mxzaz-hqaaa-aaaar-qaada-cai");
         let borrower = p("user-hf-bump");
         let coll_pos = mk_position(pool, borrower, ledger, 0, 3_000, Assets::USDC);
-        let debt_pos1 = mk_position(pool, borrower, ledger, 1_000, 0, Assets::USDC);
-        let debt_pos2 = mk_position(pool, borrower, ledger, 500, 0, Assets::USDC);
+        let debt_pos1 = mk_position(
+            p("ss2fx-dyaaa-aaaar-qacoq-cai"),
+            borrower,
+            ledger,
+            1_000,
+            0,
+            Assets::USDC,
+        );
+        let debt_pos2 = mk_position(p("cngnf-vqaaa-aaaar-qag4q-cai"), borrower, ledger, 500, 0, Assets::USDC);
         let user = mk_user(vec![coll_pos, debt_pos1, debt_pos2], 1_500, 900);
 
         let res = strategy.process(&vec![user]).await.unwrap();
@@ -1912,6 +1988,7 @@ mod tests {
         let token = mk_icp_token("ckUSDC", 6);
 
         let mut registry = MockTokenRegistryTrait::new();
+        all_roles(&mut registry);
         registry
             .expect_get()
             .returning(move |_id: &AssetId| Some(token.clone()));
@@ -2004,6 +2081,7 @@ mod tests {
         let ckbtc_ledger = p("mxzaz-hqaaa-aaaar-qaada-cai");
 
         let mut registry = MockTokenRegistryTrait::new();
+        all_roles(&mut registry);
         registry.expect_get().returning(move |id: &AssetId| {
             Some(match id.symbol.as_str() {
                 "ETH" | "ckETH" => mk_icp_token("ckETH", 18),
@@ -2120,6 +2198,7 @@ mod tests {
         let token = mk_icp_token("ckUSDC", 6);
 
         let mut registry = MockTokenRegistryTrait::new();
+        all_roles(&mut registry);
         registry
             .expect_get()
             .returning(move |_id: &AssetId| Some(token.clone()));
@@ -2180,10 +2259,11 @@ mod tests {
         let unpriceable_borrower = p("user-with-sol");
         let healthy_borrower = p("user-with-usdc");
 
+        let collateral_pool = p("ss2fx-dyaaa-aaaar-qacoq-cai");
         let sol_debt = mk_position(pool, unpriceable_borrower, ledger, 1_000, 0, Assets::SOL);
-        let sol_collateral = mk_position(pool, unpriceable_borrower, ledger, 0, 4_000, Assets::SOL);
+        let sol_collateral = mk_position(collateral_pool, unpriceable_borrower, ledger, 0, 4_000, Assets::SOL);
         let usdc_debt = mk_position(pool, healthy_borrower, ledger, 1_000, 0, Assets::USDC);
-        let usdc_collateral = mk_position(pool, healthy_borrower, ledger, 0, 4_000, Assets::USDC);
+        let usdc_collateral = mk_position(collateral_pool, healthy_borrower, ledger, 0, 4_000, Assets::USDC);
 
         let sol_user = mk_user(vec![sol_debt, sol_collateral], 1_000, 900);
         let usdc_user = mk_user(vec![usdc_debt, usdc_collateral], 1_000, 900);
@@ -2203,6 +2283,7 @@ mod tests {
         let token = mk_icp_token("ckUSDC", 6);
 
         let mut registry = MockTokenRegistryTrait::new();
+        all_roles(&mut registry);
         registry
             .expect_get()
             .returning(move |_id: &AssetId| Some(token.clone()));
@@ -2281,5 +2362,278 @@ mod tests {
         let user_large = mk_user(vec![coll_pos, debt_large], 2_000, 900);
 
         let _ = strategy.process(&vec![user_small, user_large]).await.unwrap();
+    }
+
+    mod candidate_selection {
+        //! Audit S4, L05, L07 and L08: discovery and candidate selection.
+        use super::*;
+        use crate::liquidation::collateral_service::CollateralService;
+        use crate::price_oracle::price_oracle::MockPriceOracle;
+
+        const RAY: u128 = 1_000_000_000_000_000_000_000_000_000;
+
+        fn token(ledger: &str, symbol: &str, decimals: u8) -> ChainToken {
+            ChainToken::Icp {
+                ledger: p(ledger),
+                symbol: symbol.to_string(),
+                decimals,
+                fee: 100u8.into(),
+            }
+        }
+
+        fn tokens() -> Vec<ChainToken> {
+            vec![
+                token("xevnm-gaaaa-aaaar-qafnq-cai", "USDC", 6),
+                token("cngnf-vqaaa-aaaar-qag4q-cai", "USDT", 6),
+                token("mxzaz-hqaaa-aaaar-qaada-cai", "BTC", 8),
+                token("la34w-haaaa-aaaar-qb5na-cai", "SOL", 9),
+                token("ss2fx-dyaaa-aaaar-qacoq-cai", "ETH", 18),
+            ]
+        }
+
+        /// A registry with each token on its own ledger and the given roles.
+        fn registry(debt: &'static [&'static str], collateral: &'static [&'static str]) -> MockTokenRegistryTrait {
+            let tokens = tokens();
+            let mut registry = MockTokenRegistryTrait::new();
+            registry
+                .expect_get()
+                .returning(move |id: &AssetId| tokens.iter().find(|t| t.symbol() == id.symbol).cloned());
+            registry
+                .expect_is_debt_asset()
+                .returning(move |id: &AssetId| debt.contains(&id.symbol.as_str()));
+            registry
+                .expect_is_collateral_asset()
+                .returning(move |id: &AssetId| collateral.contains(&id.symbol.as_str()));
+            registry
+        }
+
+        fn strategy<U: CollateralServiceTrait>(
+            registry: MockTokenRegistryTrait,
+            collateral: U,
+            buy_bad_debt: bool,
+        ) -> SimpleLiquidationStrategy<MockConfigTrait, MockTokenRegistryTrait, U> {
+            let mut cfg = MockConfigTrait::new();
+            let trader = p("aaaaa-aa");
+            cfg.expect_get_trader_principal().return_const(trader);
+            cfg.expect_get_liquidator_principal().return_const(trader);
+            cfg.expect_should_buy_bad_debt().return_const(buy_bad_debt);
+            cfg.expect_get_max_allowed_dex_slippage().return_const(2000u32);
+            cfg.expect_get_bad_debt_collateral_slippage_bps().return_const(500u32);
+            cfg.expect_get_lending_canister()
+                .return_const(p("mxzaz-hqaaa-aaaar-qaada-cai"));
+            let mut account = MockAccountInfo::new();
+            let funded = |t: &ChainToken| {
+                Ok(ChainTokenAmount {
+                    token: t.clone(),
+                    value: Nat::from(1_000_000_000_000u64),
+                })
+            };
+            account.expect_get_balance().returning(funded);
+            account.expect_sync_balance().returning(funded);
+            let registry = Arc::new(registry);
+            let balance_service = Arc::new(BalanceService::new(registry.clone(), Arc::new(account)));
+            SimpleLiquidationStrategy::new(
+                Arc::new(cfg),
+                registry,
+                Arc::new(collateral),
+                balance_service,
+                Arc::new(ApprovalState::new()),
+            )
+        }
+
+        fn position(
+            pool: &str,
+            borrower: Principal,
+            debt: u128,
+            collateral: u128,
+            asset: Assets,
+        ) -> LiquidateblePosition {
+            LiquidateblePosition {
+                pool_id: p(pool),
+                debt_amount: Nat::from(debt),
+                collateral_amount: Nat::from(collateral),
+                asset,
+                asset_type: AssetType::CkAsset(p(pool)),
+                account: borrower,
+                liquidation_bonus: 1000,
+                liquidation_threshold: 8500,
+                protocol_fee: 0,
+            }
+        }
+
+        fn borrower(positions: Vec<LiquidateblePosition>, hf: u64) -> LiquidatebleUser {
+            LiquidatebleUser {
+                account: positions[0].account,
+                positions,
+                total_debt: Nat::from(0u8),
+                health_factor: Nat::from(hf),
+                weighted_liquidation_threshold: Nat::from(8500u64),
+            }
+        }
+
+        /// Real estimator over fixed USD prices; SOL has no feed.
+        fn estimator() -> CollateralService<MockPriceOracle> {
+            let mut oracle = MockPriceOracle::new();
+            oracle.expect_get_price().returning(|asset, _| match asset {
+                "USDT" | "USDC" => Ok((Nat::from(RAY), 27)),
+                "BTC" => Ok((Nat::from(100_000 * RAY), 27)),
+                _ => Err(format!("no price feed for {asset}")),
+            });
+            CollateralService::new(Arc::new(oracle))
+        }
+
+        const USDC_POOL: &str = "xevnm-gaaaa-aaaar-qafnq-cai";
+        const USDT_POOL: &str = "cngnf-vqaaa-aaaar-qag4q-cai";
+        const BTC_POOL: &str = "mxzaz-hqaaa-aaaar-qaada-cai";
+        const SOL_POOL: &str = "la34w-haaaa-aaaar-qb5na-cai";
+        const ETH_POOL: &str = "ss2fx-dyaaa-aaaar-qacoq-cai";
+
+        /// S4: ckUSDC is debt only and ckSOL collateral only. The borrower's
+        /// ckSOL backs the debt, so it is liquidated, never bought as bad debt.
+        #[tokio::test]
+        async fn collateral_outside_the_debt_list_is_seized_not_donated() {
+            let user = Principal::from_slice(&[1]);
+            let unseizable = Principal::from_slice(&[2]);
+            for buy_bad_debt in [true, false] {
+                let mut collateral = MockCollateralServiceTrait::new();
+                collateral.expect_price_ray().returning(|_| Ok(Nat::from(RAY)));
+                collateral
+                    .expect_calculate_liquidation_amounts()
+                    .returning(|_, _, _, _| {
+                        Ok(LiquidationEstimation {
+                            received_collateral: Nat::from(4_000_000_000u64),
+                            repaid_debt: Nat::from(1_000_000u64),
+                            ref_price: Nat::from(RAY),
+                            debt_price: Nat::from(RAY),
+                        })
+                    });
+                let strategy = strategy(registry(&["USDC"], &["SOL"]), collateral, buy_bad_debt);
+                let backed = borrower(
+                    vec![
+                        position(USDC_POOL, user, 1_000_000, 0, Assets::USDC),
+                        position(SOL_POOL, user, 0, 4_000_000_000, Assets::SOL),
+                    ],
+                    900,
+                );
+                // ETH has no role: the bot may not seize it, and it still backs the debt.
+                let backed_by_unseizable = borrower(
+                    vec![
+                        position(USDC_POOL, unseizable, 1_000_000, 0, Assets::USDC),
+                        position(ETH_POOL, unseizable, 0, 4_000_000_000_000_000_000, Assets::ETH),
+                    ],
+                    900,
+                );
+
+                let requests = strategy.process(&vec![backed, backed_by_unseizable]).await.unwrap();
+
+                assert_eq!(requests.len(), 1, "buy_bad_debt={buy_bad_debt}");
+                let liquidation = &requests[0].liquidation;
+                assert_eq!(liquidation.borrower, user);
+                assert_eq!(
+                    (liquidation.debt_pool_id, liquidation.collateral_pool_id),
+                    (p(USDC_POOL), p(SOL_POOL))
+                );
+                assert!(!liquidation.buy_bad_debt);
+            }
+        }
+
+        /// L05: two debts share one collateral that the first request takes
+        /// whole. The second must not be planned from the old amount.
+        #[tokio::test]
+        async fn collateral_taken_by_an_accepted_request_is_not_planned_again() {
+            let user = Principal::from_slice(&[3]);
+            let strategy = strategy(registry(&["USDT", "USDC"], &["BTC"]), estimator(), false);
+            let shared = borrower(
+                vec![
+                    position(USDT_POOL, user, 110_000_000, 0, Assets::USDT),
+                    position(USDC_POOL, user, 100_000_000, 0, Assets::USDC),
+                    position(BTC_POOL, user, 0, 110_000, Assets::BTC),
+                ],
+                900,
+            );
+
+            let requests = strategy.process(&vec![shared]).await.unwrap();
+
+            assert_eq!(requests.len(), 1, "{requests:?}");
+            assert_eq!(requests[0].liquidation.debt_pool_id, p(USDT_POOL));
+        }
+
+        /// L07: an estimate that is then rejected must leave the borrower as it
+        /// was, so the next collateral is planned from the real health factor.
+        #[tokio::test]
+        async fn a_rejected_estimate_leaves_the_borrower_unchanged() {
+            let user = Principal::from_slice(&[4]);
+            let mut collateral = MockCollateralServiceTrait::new();
+            collateral.expect_price_ray().returning(|_| Ok(Nat::from(RAY)));
+            collateral.expect_calculate_liquidation_amounts().returning(
+                |_, _, coll: &LiquidateblePosition, borrower: &mut LiquidatebleUser| {
+                    if coll.pool_id == p(BTC_POOL) {
+                        // The estimate projects a healthy borrower, then fails the fee gate.
+                        borrower.health_factor = Nat::from(1_000u64);
+                        return Ok(LiquidationEstimation {
+                            received_collateral: Nat::from(50u64),
+                            repaid_debt: Nat::from(1_000u64),
+                            ref_price: Nat::from(RAY),
+                            debt_price: Nat::from(RAY),
+                        });
+                    }
+                    assert_eq!(
+                        borrower.health_factor,
+                        Nat::from(900u64),
+                        "the rejected estimate leaked"
+                    );
+                    Ok(LiquidationEstimation {
+                        received_collateral: Nat::from(4_000_000_000_000_000_000u128),
+                        repaid_debt: Nat::from(1_000u64),
+                        ref_price: Nat::from(RAY),
+                        debt_price: Nat::from(RAY),
+                    })
+                },
+            );
+            let strategy = strategy(registry(&["USDC"], &["BTC", "ETH"]), collateral, false);
+            let user = borrower(
+                vec![
+                    position(USDC_POOL, user, 1_000, 0, Assets::USDC),
+                    // Worth more than the ETH, so the ranking estimates it first.
+                    position(BTC_POOL, user, 0, 5_000_000_000, Assets::BTC),
+                    position(ETH_POOL, user, 0, 4_000_000_000_000_000_000, Assets::ETH),
+                ],
+                900,
+            );
+
+            let requests = strategy.process(&vec![user]).await.unwrap();
+
+            assert_eq!(requests.len(), 1, "{requests:?}");
+            assert_eq!(requests[0].liquidation.collateral_pool_id, p(ETH_POOL));
+        }
+
+        /// L08: an estimate that fails on a missing price drops only its own
+        /// candidate; the rest of the cycle still produces its requests.
+        #[tokio::test]
+        async fn a_failed_estimate_drops_only_its_own_candidate() {
+            let unpriceable = Principal::from_slice(&[5]);
+            let valid = Principal::from_slice(&[6]);
+            let strategy = strategy(registry(&["USDT", "SOL"], &["BTC"]), estimator(), false);
+            // The lower health factor puts the unpriceable borrower first.
+            let sol_debt = borrower(
+                vec![
+                    position(SOL_POOL, unpriceable, 1_000_000_000, 0, Assets::SOL),
+                    position(BTC_POOL, unpriceable, 0, 110_000, Assets::BTC),
+                ],
+                800,
+            );
+            let usdt_debt = borrower(
+                vec![
+                    position(USDT_POOL, valid, 50_000_000, 0, Assets::USDT),
+                    position(BTC_POOL, valid, 0, 110_000, Assets::BTC),
+                ],
+                900,
+            );
+
+            let requests = strategy.process(&vec![sol_debt, usdt_debt]).await.unwrap();
+
+            assert_eq!(requests.len(), 1, "{requests:?}");
+            assert_eq!(requests[0].liquidation.borrower, valid);
+        }
     }
 }
