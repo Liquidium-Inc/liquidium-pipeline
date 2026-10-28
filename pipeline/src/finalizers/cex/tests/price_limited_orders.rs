@@ -228,6 +228,26 @@ fn a_fill_at_the_price_room_meets_the_limit_net_of_the_fee() {
     }
 }
 
+/// Review finding 23: only the trade step compared the cap with the fee, so a
+/// leg deposited and then never traded.
+#[tokio::test]
+async fn a_quote_refuses_a_cap_the_fee_uses_up() {
+    let (finalizer, orders) = finalizer_with_fee_and_fills(TEST_MAX_SELL_SLIPPAGE_BPS, vec![]);
+    let legs = [TradeLeg {
+        market: "CKBTC_BTC".to_string(),
+        side: "sell".to_string(),
+    }];
+
+    let error = finalizer
+        .preview_resolved_trade_route(&legs, 0.01)
+        .await
+        .err()
+        .expect("no price room");
+
+    assert!(error.contains("taker fee"), "{error}");
+    assert!(orders.lock().unwrap().is_empty());
+}
+
 /// A fee as large as the limit leaves the order no price room, so no order goes out.
 #[tokio::test]
 async fn a_limit_the_fee_uses_up_sends_no_order() {

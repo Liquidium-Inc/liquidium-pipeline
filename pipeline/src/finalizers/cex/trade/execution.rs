@@ -322,7 +322,7 @@ where
 
     /// How far an order's price may move from the preview price, so that a fill
     /// at that price, net of the taker fee, stays within `limit_bps`.
-    pub(super) fn price_room_bps(side: &str, limit_bps: f64, taker_fee_bps: f64) -> f64 {
+    pub(in crate::finalizers::cex) fn price_room_bps(side: &str, limit_bps: f64, taker_fee_bps: f64) -> f64 {
         let limit = limit_bps / BPS_PER_RATIO_UNIT;
         let fee = taker_fee_bps / BPS_PER_RATIO_UNIT;
         // A sell pays the fee from its quote output, a buy from its base output.
