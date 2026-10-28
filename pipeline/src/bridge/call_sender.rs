@@ -304,6 +304,7 @@ mod tests {
                 SendOutcome::Reverted { .. } => "reverted",
                 SendOutcome::BelowMinimum { .. } => "below minimum",
                 SendOutcome::Open { .. } => "open",
+                SendOutcome::InFlight { .. } => "in flight",
             };
             assert_eq!(kind, expected);
         }

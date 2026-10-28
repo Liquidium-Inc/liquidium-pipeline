@@ -335,8 +335,11 @@ where
                 if matches!(self.provider.get_transaction_by_hash(tx.hash).await, Ok(None)) {
                     let _ = self.provider.send_raw_transaction(&tx.raw).await;
                 }
-                SendOutcome::Open {
-                    reason: format!("transaction {:#x} is not mined yet", tx.hash),
+                SendOutcome::InFlight {
+                    reason: format!(
+                        "transaction {:#x} at nonce {} of {} is not mined yet",
+                        tx.hash, tx.nonce, tx.from
+                    ),
                 }
             }
         }

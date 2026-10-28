@@ -100,8 +100,8 @@ async fn anvil_a_signed_helper_deposit_lands_once() {
         "sent, not mined"
     );
     assert!(
-        matches!(sender.settle(&prepared).await, SendOutcome::Open { .. }),
-        "pending"
+        matches!(sender.settle(&prepared).await, SendOutcome::InFlight { .. }),
+        "pending, and it can still land"
     );
     // The node already holds the bytes, so a second submit cannot clear the record.
     let again = sender.submit(&prepared).await;

@@ -32,7 +32,7 @@ fn undecided(record: &Option<OutboundRecord>) -> Option<&OutboundRecord> {
 fn send_question(purpose: &str, record: &OutboundRecord, receipt: &str) -> OperatorQuestion {
     OperatorQuestion {
         detail: format!(
-            "did the {purpose} ({} send {}) happen? --landed <{receipt}> | --absent (a new send follows)",
+            "did the {purpose} ({} send {}) happen? --landed <{receipt}> | --absent (once it can no longer land; a new send follows)",
             record.prepared.sender, record.prepared.identity
         ),
     }
