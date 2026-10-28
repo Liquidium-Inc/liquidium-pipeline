@@ -81,6 +81,15 @@ pub enum BuyOrderInputMode {
     BaseQuantity,
 }
 
+/// A price bound that the exchange enforces on one order.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PriceLimit {
+    /// The preview mid price that the bound is measured from.
+    pub reference_price: f64,
+    /// The worst fill allowed, in bps away from the reference.
+    pub max_slippage_bps: f64,
+}
+
 #[derive(Debug, Clone)]
 pub struct SwapExecutionOptions {
     /// Optional deterministic client order id for retry-safe submissions.
@@ -89,6 +98,9 @@ pub struct SwapExecutionOptions {
     pub buy_mode: BuyOrderInputMode,
     /// Optional quote overspend cap (in bps) used by base-quantity buy mode.
     pub max_quote_overspend_bps: Option<f64>,
+    /// With a limit the order is an IOC limit order: nothing fills worse than the
+    /// limit. If the exchange refuses IOC outright, or without a limit, it is a market order.
+    pub price_limit: Option<PriceLimit>,
 }
 
 impl Default for SwapExecutionOptions {
@@ -97,6 +109,7 @@ impl Default for SwapExecutionOptions {
             client_order_id: None,
             buy_mode: BuyOrderInputMode::Auto,
             max_quote_overspend_bps: None,
+            price_limit: None,
         }
     }
 }

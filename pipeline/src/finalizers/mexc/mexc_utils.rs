@@ -34,6 +34,38 @@ pub(super) fn parse_market_symbols(market: &str) -> Option<(String, String)> {
     Some((base, quote))
 }
 
+/// Atomic decimals of a MEXC asset. A ck token has its native asset's decimals.
+pub(super) fn mexc_asset_decimals(symbol: &str) -> Option<u8> {
+    use liquidium_pipeline_core::types::protocol_types::{Asset, Assets};
+    let symbol = symbol.to_ascii_uppercase();
+    let native = symbol.strip_prefix("CK").unwrap_or(&symbol);
+    [
+        Assets::BTC,
+        Assets::ICP,
+        Assets::SOL,
+        Assets::USDC,
+        Assets::USDT,
+        Assets::ETH,
+    ]
+    .into_iter()
+    .find(|asset| asset.symbol() == native)
+    .and_then(|asset| u8::try_from(asset.decimals()).ok())
+}
+
+/// A slice amount in atomic units of its asset, for the execution record.
+/// An unknown asset keeps whole units, with a warning, so the record still completes.
+pub(super) fn slice_amount_to_nat(amount: f64, symbol: &str) -> candid::Nat {
+    let converted = mexc_asset_decimals(symbol)
+        .ok_or_else(|| format!("unknown MEXC asset {symbol}"))
+        .and_then(|decimals| {
+            liquidium_pipeline_connectors::backend::amount_utils::amount_to_nat_units_strict(amount, decimals)
+        });
+    converted.unwrap_or_else(|error| {
+        log::warn!("[mexc] slice amount {amount} {symbol} kept in whole units: {error}");
+        f64_to_nat(amount)
+    })
+}
+
 /// True when the symbol is expected to be ~1 USD (native or wrapped stables).
 pub(super) fn is_usd_stable_symbol(symbol: &str) -> bool {
     matches!(

@@ -2,6 +2,7 @@
 //! handle. The provider call is a saved send: the outbound driver saves it
 //! before it runs, and settles a lost answer from the provider history.
 use candid::Nat;
+use liquidium_pipeline_connectors::backend::amount_utils::nat_units_to_amount_via_core;
 use liquidium_pipeline_connectors::backend::bridge_backend::{
     BRIDGE_SUBMISSION_DEFERRED_PREFIX, BridgeFeeBudget, BridgeRouteKind, BridgeRouteSpec,
 };
@@ -11,7 +12,7 @@ use log::{debug, info};
 
 use super::mexc_finalizer::{
     BRIDGE_FEE_TOKEN_CHAIN, BRIDGE_FEE_TOKEN_SYMBOL, CKETH_DECIMALS, MexcFinalizer,
-    WITHDRAW_BRIDGE_SOURCE_BALANCE_TOLERANCE, nat_to_units,
+    WITHDRAW_BRIDGE_SOURCE_BALANCE_TOLERANCE,
 };
 use crate::{
     bridge::{
@@ -90,7 +91,7 @@ impl BridgedDeposit<'_> {
         if route.route_kind == BridgeRouteKind::CkEthErc20Reverse
             && let Some(required_fee_budget) = provider_fee
         {
-            let required_fee_budget = nat_to_units(required_fee_budget, CKETH_DECIMALS)?;
+            let required_fee_budget = nat_units_to_amount_via_core(required_fee_budget, CKETH_DECIMALS)?;
             let fee_available = self
                 .bridge
                 .backend

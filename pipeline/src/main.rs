@@ -161,6 +161,23 @@ enum Commands {
         proxy_canister: Option<String>,
     },
 
+    // Places two small IOC limit sells on MEXC: one above the market, which
+    // must not fill, and one at the best bid. Without --confirm it sends nothing.
+    MexcOrderCheck {
+        /// Market as the pipeline names it (e.g. "ICP_USDT")
+        #[arg(long)]
+        market: String,
+        /// Base quantity of each order, above the MEXC minimum order value
+        #[arg(long)]
+        quantity: f64,
+        /// Price decimals of the market (MEXC "quotePrecision")
+        #[arg(long)]
+        price_decimals: u32,
+        /// Place the orders. Without it the command only prints the plan.
+        #[arg(long)]
+        confirm: bool,
+    },
+
     // Sends one small MEXC withdrawal with an order id, then checks that the
     // withdraw history returns that id. Without --confirm it sends nothing.
     MexcWithdrawCheck {
@@ -414,6 +431,18 @@ async fn main() -> ExitCode {
             .await
             {
                 eprintln!("Bridge SOL process_deposit failed: {}", e);
+                return ExitCode::FAILURE;
+            }
+            ExitCode::SUCCESS
+        }
+        Commands::MexcOrderCheck {
+            market,
+            quantity,
+            price_decimals,
+            confirm,
+        } => {
+            if let Err(e) = commands::mexc_order_check::check(&market, quantity, price_decimals, confirm).await {
+                eprintln!("MEXC order check failed: {}", e);
                 return ExitCode::FAILURE;
             }
             ExitCode::SUCCESS

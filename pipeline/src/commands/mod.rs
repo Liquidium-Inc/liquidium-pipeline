@@ -3,6 +3,7 @@ pub mod bridge_sol;
 pub(crate) mod execution_worker;
 pub mod funds;
 pub mod liquidation_loop;
+pub mod mexc_order_check;
 pub mod mexc_withdraw_check;
 pub(crate) mod liquidation_loop_helpers;
 pub mod tui;

@@ -134,12 +134,8 @@ pub struct CexTradeState {
     pub trade_last_amount_out: Option<f64>,
     /// Amount to carry into the next leg after a completed leg.
     pub trade_next_amount_in: Option<f64>,
-    /// Weighted average route slippage across all executed slices, in bps.
+    /// Adverse slippage of the whole route against the preview mids, in bps.
     pub trade_weighted_slippage_bps: Option<f64>,
-    /// Sum(amount_in * mid_price) across slices.
-    pub trade_mid_notional_sum: Option<f64>,
-    /// Sum(amount_in * exec_price) across slices.
-    pub trade_exec_notional_sum: Option<f64>,
     /// Recorded slice-level executions for telemetry.
     #[serde(default)]
     pub trade_slices: Vec<CexTradeSlice>,
@@ -651,8 +647,6 @@ mod tests {
                     trade_last_amount_out: None,
                     trade_next_amount_in: None,
                     trade_weighted_slippage_bps: None,
-                    trade_mid_notional_sum: None,
-                    trade_exec_notional_sum: None,
                     trade_slices: Vec::new(),
                     trade_dust_skipped: false,
                     trade_dust_usd: None,
@@ -818,8 +812,6 @@ mod tests {
                     trade_last_amount_out: None,
                     trade_next_amount_in: None,
                     trade_weighted_slippage_bps: None,
-                    trade_mid_notional_sum: None,
-                    trade_exec_notional_sum: None,
                     trade_slices: Vec::new(),
                     trade_dust_skipped: false,
                     trade_dust_usd: None,
