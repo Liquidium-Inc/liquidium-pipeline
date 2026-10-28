@@ -151,7 +151,7 @@ impl IcpswapFirstPlanner {
 
     /// An exact exchange quote that meets the CEX minimum and the impact
     /// ceiling, or the reason it does not.
-    async fn preview_safe_cex(
+    pub(super) async fn preview_safe_cex(
         &self,
         input: &IcpswapFirstPlanInput,
         venue_id: &str,
@@ -236,6 +236,14 @@ impl IcpswapFirstPlanner {
         let Some(mexc_target_usd) = self.config.mexc_test_allocation_usd else {
             return self.ordered_overflow_previews(input, cex_value).await;
         };
+        // Without Kraken the MEXC test leg splits against ICPSwap, which cannot take this amount.
+        if !self.venues.contains(KRAKEN_VENUE_ID) {
+            warn!(
+                "[multi-venue] liq_id={} forced CEX split skipped: Kraken is not enabled",
+                input.liquidation_id
+            );
+            return self.ordered_overflow_previews(input, cex_value).await;
+        }
         let Some(reference_price) = input.pay_reference_price_usd else {
             warn!(
                 "[multi-venue] liq_id={} forced CEX split skipped: no collateral reference price",

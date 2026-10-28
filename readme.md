@@ -228,9 +228,11 @@ ENABLED_SWAP_VENUES=icpswap,mexc
 # so the check cannot judge the price. The remainder leg is still checked, and a
 # loud warning is logged at startup whenever this waiver is active.
 ICPSWAP_TEST_ALLOCATION_USD=1
-# Optional test-only CEX split. Needs ICPSwap, MEXC and Kraken enabled. Sends
-# about $10 to MEXC and the exact remainder to Kraken; when the split cannot be
-# shaped, the normal waterfall routes the amount.
+# Optional test-only MEXC split. Needs ICPSwap and MEXC enabled. Sends about $10
+# to MEXC. With Kraken enabled, Kraken takes the exact rest of the CEX side.
+# Without Kraken, ICPSwap takes the rest, and this setting must not be combined
+# with ICPSWAP_TEST_ALLOCATION_USD. When the split cannot be shaped, the normal
+# plan routes the amount.
 MEXC_TEST_ALLOCATION_USD=10
 # Allow full ICPSwap up to 1.5% impact only when the CEX remainder is dust.
 ICPSWAP_DUST_FALLBACK_MAX_PRICE_IMPACT_BPS=150

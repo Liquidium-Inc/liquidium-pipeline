@@ -120,8 +120,8 @@ pub struct Config {
     /// Test-only fixed USD allocation sent to ICPSwap before routing the
     /// remainder to an overflow venue. Unset preserves the normal policy.
     pub icpswap_test_allocation_usd: Option<f64>,
-    /// Test-only fixed USD allocation for MEXC. The CEX side is then MEXC and
-    /// the exact Kraken remainder. Unset preserves the normal policy.
+    /// Test-only fixed USD allocation for MEXC. Kraken takes the rest of the CEX
+    /// side, or ICPSwap the rest when Kraken is not enabled. Unset preserves the normal policy.
     pub mexc_test_allocation_usd: Option<f64>,
     /// Ordered venue IDs eligible for new multi-venue plans.
     pub enabled_swap_venues: Vec<String>,
@@ -413,7 +413,9 @@ impl Config {
         }
         let mexc_test_allocation_usd = parse_test_allocation_usd_from_env("MEXC_TEST_ALLOCATION_USD")?;
         if let Some(value) = mexc_test_allocation_usd {
-            warn!("TEST-ONLY CEX split is enabled: approximately ${value:.2} goes to MEXC and the remainder to Kraken");
+            warn!(
+                "TEST-ONLY MEXC split is enabled: approximately ${value:.2} goes to MEXC and the remainder to Kraken, or to ICPSwap when Kraken is not enabled"
+            );
         }
 
         let enabled_swap_venues = parse_enabled_swap_venues_from_env()?;

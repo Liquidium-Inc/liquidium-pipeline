@@ -2835,8 +2835,9 @@ async fn the_forced_cex_split_defers_to_the_waterfall_when_it_cannot_be_shaped()
     assert_eq!(state.legs[0].venue_id, MEXC_VENUE_ID);
 }
 
+/// Without Kraken, both test settings would fix the same ICPSwap and MEXC split.
 #[test]
-fn mexc_test_override_requires_all_three_venues() {
+fn without_kraken_the_two_test_allocations_are_refused_together() {
     let icpswap = mock_adapter(ICPSWAP_VENUE_ID, Arc::new(Mutex::new(Vec::new())), |request| {
         Ok(proportional_preview(request, ICPSWAP_VENUE_ID, 10.0, 2))
     });
@@ -2849,7 +2850,85 @@ fn mexc_test_override_requires_all_three_venues() {
 
     let error = IcpswapFirstPlanner::new(vec![Arc::new(icpswap), Arc::new(mexc)], planner_config)
         .err()
-        .expect("missing Kraken must reject the test configuration");
+        .expect("both test allocations without Kraken must be refused");
 
-    assert!(error.to_string().contains("ICPSwap, MEXC, and Kraken"));
+    assert!(error.to_string().contains("not both"), "{error}");
+}
+
+/// The MEXC test split needs ICPSwap, which takes the rest when Kraken is off.
+#[test]
+fn mexc_test_override_needs_icpswap() {
+    let mexc = mock_adapter(MEXC_VENUE_ID, Arc::new(Mutex::new(Vec::new())), |request| {
+        Ok(proportional_preview(request, MEXC_VENUE_ID, 10.0, 2))
+    });
+    let kraken = mock_adapter(KRAKEN_VENUE_ID, Arc::new(Mutex::new(Vec::new())), |request| {
+        Ok(proportional_preview(request, KRAKEN_VENUE_ID, 10.0, 2))
+    });
+    let mut planner_config = config(8.0);
+    planner_config.mexc_test_allocation_usd = Some(10.0);
+
+    let error = IcpswapFirstPlanner::new(vec![Arc::new(mexc), Arc::new(kraken)], planner_config)
+        .err()
+        .expect("a MEXC test allocation without ICPSwap must be refused");
+
+    assert!(error.to_string().contains("ICPSwap and MEXC"), "{error}");
+}
+
+#[tokio::test]
+async fn without_kraken_the_mexc_override_sends_its_amount_to_mexc_and_the_rest_to_icpswap() {
+    let icpswap_calls = Arc::new(Mutex::new(Vec::new()));
+    let mexc_calls = Arc::new(Mutex::new(Vec::new()));
+    let icpswap = mock_adapter(ICPSWAP_VENUE_ID, icpswap_calls.clone(), |request| {
+        Ok(proportional_preview(request, ICPSWAP_VENUE_ID, 10.0, 2))
+    });
+    let mexc = mock_adapter(MEXC_VENUE_ID, mexc_calls.clone(), |request| {
+        Ok(proportional_preview(request, MEXC_VENUE_ID, 10.0, 2))
+    });
+    let mut planner_config = config(8.0);
+    planner_config.mexc_test_allocation_usd = Some(8.0);
+
+    let state = planner(icpswap, mexc, planner_config)
+        .plan(&input_with_pay_token(native_icp()), 123)
+        .await
+        .expect("forced MEXC split");
+
+    // At $10/ICP, $8 is 0.8 ICP, and ICPSwap takes the other 0.2 ICP.
+    assert_eq!(*mexc_calls.lock().expect("MEXC calls"), vec![80_000_000]);
+    assert_eq!(*icpswap_calls.lock().expect("ICPSwap calls"), vec![20_000_000]);
+    assert_eq!(state.legs.len(), 2);
+    assert_eq!(state.legs[0].venue_id, ICPSWAP_VENUE_ID);
+    assert_eq!(state.legs[1].venue_id, MEXC_VENUE_ID);
+    assert_eq!(
+        state.plan.allocation_reason,
+        MultiVenueAllocationReason::PriceImpactSplit
+    );
+}
+
+/// A test setting must never fail a plan: a split MEXC cannot take falls back
+/// to the normal plan.
+#[tokio::test]
+async fn without_kraken_a_mexc_override_that_cannot_be_shaped_leaves_the_normal_plan() {
+    // $20 is more than the whole $10 collateral; $5 is below the $8 CEX minimum.
+    for (target_usd, icpswap_quotes) in [(20.0, vec![100_000_000]), (5.0, vec![50_000_000, 100_000_000])] {
+        let icpswap_calls = Arc::new(Mutex::new(Vec::new()));
+        let mexc_calls = Arc::new(Mutex::new(Vec::new()));
+        let icpswap = mock_adapter(ICPSWAP_VENUE_ID, icpswap_calls.clone(), |request| {
+            Ok(proportional_preview(request, ICPSWAP_VENUE_ID, 10.0, 2))
+        });
+        let mexc = mock_adapter(MEXC_VENUE_ID, mexc_calls.clone(), |request| {
+            Ok(proportional_preview(request, MEXC_VENUE_ID, 10.0, 2))
+        });
+        let mut planner_config = config(8.0);
+        planner_config.mexc_test_allocation_usd = Some(target_usd);
+
+        let state = planner(icpswap, mexc, planner_config)
+            .plan(&input_with_pay_token(native_icp()), 123)
+            .await
+            .expect("the normal plan still routes this");
+
+        assert!(mexc_calls.lock().expect("MEXC calls").is_empty(), "${target_usd}");
+        assert_eq!(*icpswap_calls.lock().expect("ICPSwap calls"), icpswap_quotes);
+        assert_eq!(state.legs.len(), 1);
+        assert_eq!(state.legs[0].venue_id, ICPSWAP_VENUE_ID);
+    }
 }

@@ -69,8 +69,8 @@ pub struct IcpswapFirstPlannerConfig {
     /// it as a fallback for a live oracle read.
     pub oracle_snapshot_max_age_secs: i64,
     pub icpswap_test_allocation_usd: Option<f64>,
-    /// Test-only fixed USD allocation for MEXC. The CEX side is then MEXC and
-    /// the exact Kraken remainder.
+    /// Test-only fixed USD allocation for MEXC. Kraken takes the rest of the
+    /// CEX side, or ICPSwap takes the rest when Kraken is not enabled.
     pub mexc_test_allocation_usd: Option<f64>,
     /// USD per trillion cycles, for side costs paid in cycles.
     pub cycles_usd_per_trillion: f64,
@@ -479,14 +479,18 @@ impl IcpswapFirstPlanner {
         {
             warn!("{}", oracle_guard_waiver_banner(target_usd));
         }
-        if config.mexc_test_allocation_usd.is_some()
-            && [ICPSWAP_VENUE_ID, MEXC_VENUE_ID, KRAKEN_VENUE_ID]
-                .iter()
-                .any(|venue_id| !venues.contains(venue_id))
-        {
-            return Err(IcpswapFirstPlannerError::InvalidInput(
-                "the test MEXC allocation needs ICPSwap, MEXC, and Kraken enabled".to_string(),
-            ));
+        if config.mexc_test_allocation_usd.is_some() {
+            if !venues.contains(ICPSWAP_VENUE_ID) || !venues.contains(MEXC_VENUE_ID) {
+                return Err(IcpswapFirstPlannerError::InvalidInput(
+                    "the test MEXC allocation needs ICPSwap and MEXC enabled".to_string(),
+                ));
+            }
+            // Without Kraken, both settings would fix the same ICPSwap and MEXC split.
+            if config.icpswap_test_allocation_usd.is_some() && !venues.contains(KRAKEN_VENUE_ID) {
+                return Err(IcpswapFirstPlannerError::InvalidInput(
+                    "without Kraken, set ICPSWAP_TEST_ALLOCATION_USD or MEXC_TEST_ALLOCATION_USD, not both".to_string(),
+                ));
+            }
         }
         let overflow_venue_ids = cex_policy_order(
             venues
@@ -532,6 +536,12 @@ impl IcpswapFirstPlanner {
 
         if let Some(target_usd) = self.config.icpswap_test_allocation_usd {
             return self.plan_test_fixed_icpswap_split(input, quoted_at, target_usd).await;
+        }
+        if let Some(target_usd) = self.config.mexc_test_allocation_usd
+            && !self.venues.contains(KRAKEN_VENUE_ID)
+            && let Some(state) = self.plan_test_fixed_mexc_split(input, quoted_at, target_usd).await
+        {
+            return Ok(state);
         }
 
         // The common safe-ICPSwap path needs no CEX data. Quote ICPSwap alone
@@ -651,6 +661,65 @@ impl IcpswapFirstPlanner {
         previews.extend(overflow_result?);
 
         self.build_state(input, previews, MultiVenueAllocationReason::PriceImpactSplit, quoted_at)
+    }
+
+    /// Test-only split without Kraken: MEXC takes the fixed USD amount and
+    /// ICPSwap takes the rest. `None` lets the normal plan run, because a test
+    /// setting must never fail a plan.
+    async fn plan_test_fixed_mexc_split(
+        &self,
+        input: &IcpswapFirstPlanInput,
+        quoted_at: i64,
+        target_usd: f64,
+    ) -> Option<MultiVenueExecutionState> {
+        let Some(reference_price) = input.pay_reference_price_usd else {
+            warn!(
+                "[multi-venue] liq_id={} forced MEXC split skipped: no collateral reference price",
+                input.liquidation_id
+            );
+            return None;
+        };
+        let mexc_value =
+            ChainTokenAmount::from_formatted(input.total_pay.token.clone(), target_usd / reference_price).value;
+        if mexc_value == 0u8 || mexc_value >= input.total_pay.value {
+            warn!(
+                "[multi-venue] liq_id={} forced MEXC split skipped: ${target_usd:.2} to MEXC leaves no ICPSwap remainder",
+                input.liquidation_id
+            );
+            return None;
+        }
+        warn!(
+            "[multi-venue] liq_id={} TEST-ONLY forced split: ${target_usd:.2} to MEXC, remainder to ICPSwap",
+            input.liquidation_id
+        );
+        let icpswap_request = input.request_for(ICPSWAP_VENUE_ID, input.total_pay.value.clone() - mexc_value.clone());
+        let (mexc, icpswap) = tokio::join!(
+            self.preview_safe_cex(input, MEXC_VENUE_ID, mexc_value),
+            self.preview_exact(input, ICPSWAP_VENUE_ID, &icpswap_request),
+        );
+        let abandoned = match (mexc, icpswap) {
+            (Err(error), _) => format!("{MEXC_VENUE_ID} could not quote its forced ${target_usd:.2} leg ({error})"),
+            (_, Err(error)) => format!("{ICPSWAP_VENUE_ID} could not quote the remainder ({error})"),
+            (Ok(_), Ok(icpswap)) if !self.is_safe_icpswap(&icpswap) => format!(
+                "{ICPSWAP_VENUE_ID} remainder impact {:.2} bps is not below {:.2} bps",
+                icpswap.quote.estimated_price_impact_bps, self.config.max_price_impact_bps
+            ),
+            (Ok(mexc), Ok(icpswap)) => match self.build_state(
+                input,
+                vec![icpswap, mexc],
+                MultiVenueAllocationReason::PriceImpactSplit,
+                quoted_at,
+            ) {
+                Ok(state) => return Some(state),
+                Err(error) => format!("the split plan was rejected ({error})"),
+            },
+        };
+        // Loudly, because the run no longer tests the split it was configured for.
+        warn!(
+            "[multi-venue] liq_id={} forced MEXC split abandoned: {abandoned}; planning normally",
+            input.liquidation_id
+        );
+        None
     }
 
     // Avoids a dust overflow leg by re-quoting the full amount on ICPSwap with
