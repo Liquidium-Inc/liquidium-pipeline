@@ -152,7 +152,12 @@ where
                 continue;
             };
 
-            if (base == "SOL" || quote == "SOL") && !(base == "SOL" && quote == "USDT") {
+            if (base == "SOL" || quote == "SOL")
+                && self
+                    .profile
+                    .sol_market()
+                    .is_some_and(|sol_market| *market != sol_market)
+            {
                 continue;
             }
 
@@ -367,21 +372,28 @@ where
             return Ok(vec![]);
         }
 
-        if deposit == "SOL" {
-            let mut legs = vec![TradeLeg {
-                market: "SOL_USDT".into(),
-                side: "sell".into(),
-            }];
-            legs.extend(self.resolve_standard_trade_legs("USDT", &withdraw).await?);
-            return Ok(legs);
-        }
-        if withdraw == "SOL" {
-            let mut legs = self.resolve_standard_trade_legs(&deposit, "USDT").await?;
-            legs.push(TradeLeg {
-                market: "SOL_USDT".into(),
-                side: "buy".into(),
-            });
-            return Ok(legs);
+        // An exchange that trades SOL on one market only routes SOL through it.
+        if let Some((sol_market, sol_quote)) = self
+            .profile
+            .sol_market()
+            .and_then(|market| Some((market, parse_market_symbols(market)?.1)))
+        {
+            if deposit == "SOL" {
+                let mut legs = vec![TradeLeg {
+                    market: sol_market.into(),
+                    side: "sell".into(),
+                }];
+                legs.extend(self.resolve_standard_trade_legs(&sol_quote, &withdraw).await?);
+                return Ok(legs);
+            }
+            if withdraw == "SOL" {
+                let mut legs = self.resolve_standard_trade_legs(&deposit, &sol_quote).await?;
+                legs.push(TradeLeg {
+                    market: sol_market.into(),
+                    side: "buy".into(),
+                });
+                return Ok(legs);
+            }
         }
         self.resolve_standard_trade_legs(&deposit, &withdraw).await
     }
