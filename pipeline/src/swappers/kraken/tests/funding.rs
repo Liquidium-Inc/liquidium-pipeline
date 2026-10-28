@@ -339,7 +339,9 @@ async fn a_failed_read_before_a_withdrawal_waits_like_an_outage() {
         KrakenApiError::Transport("operation timed out".into()),
     ] {
         let mut api = MockKrakenApi::new();
-        api.expect_withdrawal_methods().once().return_once(move |_| Err(failure));
+        api.expect_withdrawal_methods()
+            .once()
+            .return_once(move |_| Err(failure));
         api.expect_withdraw().never();
         let error = btc_usd_client(api)
             .withdraw("BTC", "bitcoin", "bc1qdestination", 0.01, "lq1w0")

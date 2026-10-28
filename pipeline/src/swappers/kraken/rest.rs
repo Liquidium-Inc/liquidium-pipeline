@@ -133,6 +133,17 @@ fn read_answer<T>(errors: Vec<String>, result: Option<T>) -> Result<T, KrakenApi
     }
 }
 
+/// Auto Earn books an asset under `<asset>.F`, and orders and withdrawals of
+/// the asset spend that balance too. So a deposit credited there counts.
+fn asset_balance(balances: &HashMap<String, Decimal>, asset: &str) -> Decimal {
+    let asset = canonical_symbol(asset);
+    balances
+        .iter()
+        .filter(|(name, _)| canonical_symbol(name.strip_suffix(".F").unwrap_or(name)) == asset)
+        .map(|(_, value)| *value)
+        .sum()
+}
+
 /// Kraken keys a one-item answer by its own name for the item, so a lone
 /// entry is ours. Several entries without our key belong to something else.
 fn take_requested<T>(mut entries: HashMap<String, T>, key: &str) -> Option<T> {
@@ -208,11 +219,7 @@ impl KrakenApi for KrakenRestApi {
 
     async fn balance(&self, asset: &str) -> Result<Decimal, KrakenApiError> {
         let response = self.call(async |client| client.get_account_balance().await).await?;
-        Ok(response
-            .iter()
-            .find(|(name, _)| canonical_symbol(name) == canonical_symbol(asset))
-            .map(|(_, value)| *value)
-            .unwrap_or(Decimal::ZERO))
+        Ok(asset_balance(&response, asset))
     }
 
     async fn deposit_methods(&self, asset: &str) -> Result<Vec<KrakenFundingMethod>, KrakenApiError> {
@@ -448,6 +455,22 @@ mod tests {
             transport_error(ClientError::HttpStatus("502 Bad Gateway".into())),
             KrakenApiError::Transport(_)
         ));
+    }
+
+    /// Review finding 18: with Auto Earn on, a deposit is credited to `.F`.
+    /// Bonded balances (`.S`, `.B`) cannot be spent, so they do not count.
+    #[test]
+    fn an_asset_balance_includes_its_auto_earn_balance() {
+        let balances = HashMap::from([
+            ("XETH".to_string(), Decimal::new(5, 1)),
+            ("ETH.F".to_string(), Decimal::new(12, 1)),
+            ("ETH.S".to_string(), Decimal::new(9, 0)),
+            ("XXBT".to_string(), Decimal::new(3, 0)),
+        ]);
+
+        assert_eq!(asset_balance(&balances, "ETH"), Decimal::new(17, 1));
+        assert_eq!(asset_balance(&balances, "BTC"), Decimal::new(3, 0));
+        assert_eq!(asset_balance(&balances, "ICP"), Decimal::ZERO);
     }
 
     #[test]
