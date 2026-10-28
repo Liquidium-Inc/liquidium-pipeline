@@ -11,19 +11,22 @@ pub struct CexVenueProfile {
     special_trade_legs: Option<fn(&str, &str) -> Option<Vec<TradeLeg>>>,
     /// The only market SOL trades on, when the exchange restricts SOL to one.
     sol_market: Option<&'static str>,
+    /// The ICP assets the exchange lists itself. They skip the bridge even when it has a route for them.
+    direct_assets: &'static [&'static str],
     approval_bumps: bool,
     client_order_id_max_len: usize,
 }
 
 impl CexVenueProfile {
-    /// MEXC: fixed routes for the legacy ck pairs, SOL only on `SOL_USDT`, and
-    /// approval bumps on direct ICP deposits so that the exchange notices them.
+    /// MEXC: fixed routes for the legacy ck pairs, SOL only on `SOL_USDT`, ckUSDT
+    /// on ICP, and approval bumps on direct ICP deposits so that the exchange notices them.
     pub fn mexc() -> Self {
         Self {
             venue_id: MEXC_VENUE_ID,
             name: "MEXC",
             special_trade_legs: Some(mexc_special_trade_legs),
             sol_market: Some("SOL_USDT"),
+            direct_assets: &["ckUSDT"],
             approval_bumps: true,
             client_order_id_max_len: 32,
         }
@@ -37,6 +40,7 @@ impl CexVenueProfile {
             name: "Kraken",
             special_trade_legs: None,
             sol_market: None,
+            direct_assets: &[],
             approval_bumps: false,
             client_order_id_max_len: 18,
         }
@@ -70,6 +74,13 @@ impl CexVenueProfile {
         self.sol_market
     }
 
+    /// Whether the exchange takes this ICP asset itself, so it skips the bridge.
+    pub fn takes_directly(&self, asset: &str) -> bool {
+        self.direct_assets
+            .iter()
+            .any(|direct| direct.eq_ignore_ascii_case(asset))
+    }
+
     /// Whether direct ICP deposits send approval bumps, and so reserve their fees.
     pub(super) fn approval_bumps(&self) -> bool {
         self.approval_bumps
@@ -93,6 +104,8 @@ mod tests {
         assert!(mexc.special_trade_legs("ckBTC", "ckUSDT").is_some());
         assert!(mexc.special_trade_legs("ICP", "ckUSDT").is_none());
         assert_eq!(mexc.sol_market(), Some("SOL_USDT"));
+        assert!(mexc.takes_directly("ckUSDT"));
+        assert!(!mexc.takes_directly("ckUSDC"));
         assert_eq!(mexc.client_order_id_max_len(), 32);
     }
 
@@ -103,6 +116,7 @@ mod tests {
         assert!(!kraken.approval_bumps());
         assert!(kraken.special_trade_legs("ckBTC", "ckUSDT").is_none());
         assert_eq!(kraken.sol_market(), None);
+        assert!(!kraken.takes_directly("ckUSDT"));
         assert_eq!(kraken.client_order_id_max_len(), 18);
     }
 }

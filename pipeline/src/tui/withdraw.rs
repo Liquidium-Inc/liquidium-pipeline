@@ -5,6 +5,7 @@ use tokio::sync::mpsc;
 
 use crate::commands::withdrawal::{destination_account, parse_typed_destination, withdraw_amount};
 use crate::finalizers::bridge_planner::cex_network_from_destination_kind;
+use crate::finalizers::cex::profile::CexVenueProfile;
 use crate::swappers::mexc::mexc_adapter::MexcClient;
 use liquidium_pipeline_connectors::backend::bridge_backend::resolve_reverse_route_by_source;
 use liquidium_pipeline_connectors::backend::cex_backend::{CexBackend, DepositAddress};
@@ -35,7 +36,9 @@ pub(super) fn deposit_network_for_asset(asset: &AssetId) -> String {
 
 pub(super) fn mexc_deposit_lookup_for_asset(asset: &AssetId) -> (String, String) {
     let source_network = deposit_network_for_asset(asset);
-    if let Some(route) = resolve_reverse_route_by_source(&asset.symbol, &source_network) {
+    if !CexVenueProfile::mexc().takes_directly(&asset.symbol)
+        && let Some(route) = resolve_reverse_route_by_source(&asset.symbol, &source_network)
+    {
         return (
             route.target_asset.to_string(),
             cex_network_from_destination_kind(route.destination_kind),
@@ -287,5 +290,20 @@ mod tests {
         };
 
         assert_eq!(mexc_deposit_lookup_for_asset(&asset), ("ICP".to_string(), "ICP".to_string()));
+    }
+
+    /// MEXC lists ckUSDT on ICP, so a ckUSDT bridge route must not move this deposit to Ethereum.
+    #[test]
+    fn mexc_deposit_lookup_keeps_ckusdt_on_icp() {
+        let asset = AssetId {
+            chain: "icp".to_string(),
+            address: "cngnf-vqaaa-aaaar-qag4q-cai".to_string(),
+            symbol: "ckUSDT".to_string(),
+        };
+
+        assert_eq!(
+            mexc_deposit_lookup_for_asset(&asset),
+            ("ckUSDT".to_string(), "ICP".to_string())
+        );
     }
 }

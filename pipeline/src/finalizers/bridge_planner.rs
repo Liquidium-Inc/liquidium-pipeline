@@ -71,6 +71,8 @@ pub(crate) trait BridgePlanner {
     fn bridge_enabled(&self) -> bool;
     /// Resolves the configured bridge source address/account string for a given source chain.
     fn resolve_bridge_source_address(&self, source_chain: &str) -> Result<String, String>;
+    /// Whether the exchange lists this ICP asset itself. The bridge route is then not used.
+    fn takes_directly(&self, asset: &str) -> bool;
     /// Builds a direct (non-bridged) transport plan from the provided asset.
     fn plan_from_direct_asset(asset: &ChainToken) -> BridgeTransportPlan {
         BridgeTransportPlan {
@@ -91,7 +93,9 @@ pub(crate) trait BridgePlanner {
 
         // Deposit side: the ICP asset leaves through its reverse route
         // (ckUSDC@ICP -> USDC@ETH, ckSOL@ICP -> SOL@SOL).
-        if let Some(route) = resolve_reverse_route_by_source(&deposit.cex_asset, &deposit.cex_network) {
+        if !self.takes_directly(&deposit.cex_asset)
+            && let Some(route) = resolve_reverse_route_by_source(&deposit.cex_asset, &deposit.cex_network)
+        {
             deposit = BridgeTransportPlan {
                 cex_asset: route.target_asset.to_string(),
                 cex_network: cex_network_from_destination_kind(route.destination_kind),
@@ -100,7 +104,9 @@ pub(crate) trait BridgePlanner {
         }
 
         // Withdraw side: the exchange delivers the forward route's source asset.
-        if let Some(route) = resolve_forward_route_by_target(&withdraw.cex_asset) {
+        if !self.takes_directly(&withdraw.cex_asset)
+            && let Some(route) = resolve_forward_route_by_target(&withdraw.cex_asset)
+        {
             withdraw = BridgeTransportPlan {
                 cex_asset: route.source_asset.to_string(),
                 cex_network: route.source_chain.to_string(),
@@ -206,7 +212,10 @@ pub(crate) trait BridgePlanner {
 mod tests {
     use super::*;
 
-    struct TestBridgePlanner;
+    #[derive(Default)]
+    struct TestBridgePlanner {
+        direct_assets: &'static [&'static str],
+    }
 
     impl BridgePlanner for TestBridgePlanner {
         fn bridge_enabled(&self) -> bool {
@@ -216,6 +225,41 @@ mod tests {
         fn resolve_bridge_source_address(&self, _source_chain: &str) -> Result<String, String> {
             unreachable!("not needed by destination test")
         }
+
+        fn takes_directly(&self, asset: &str) -> bool {
+            self.direct_assets.contains(&asset)
+        }
+    }
+
+    fn icp_token(symbol: &str) -> ChainToken {
+        ChainToken::Icp {
+            ledger: Principal::anonymous(),
+            symbol: symbol.to_string(),
+            decimals: 6,
+            fee: candid::Nat::from(10u64),
+        }
+    }
+
+    /// ckUSDC stands in for any asset with a bridge route: the exchange that
+    /// lists it keeps it on ICP, and the other one bridges it.
+    #[test]
+    fn an_asset_the_exchange_lists_skips_the_bridge_on_both_sides() {
+        let token = icp_token("ckUSDC");
+
+        let lists = TestBridgePlanner {
+            direct_assets: &["ckUSDC"],
+        }
+        .resolve_bridge_plan_for_assets(&token, &token);
+        for side in [&lists.deposit, &lists.withdraw] {
+            assert_eq!((side.cex_asset.as_str(), side.cex_network.as_str()), ("ckUSDC", "ICP"));
+            assert!(!side.bridge_required);
+        }
+
+        let bridges = TestBridgePlanner::default().resolve_bridge_plan_for_assets(&token, &token);
+        for side in [&bridges.deposit, &bridges.withdraw] {
+            assert_eq!((side.cex_asset.as_str(), side.cex_network.as_str()), ("USDC", "ETH"));
+            assert!(side.bridge_required);
+        }
     }
 
     #[test]
@@ -224,7 +268,7 @@ mod tests {
             owner: Principal::from_slice(&[42]),
             subaccount: Some([7; 32]),
         };
-        let destination = TestBridgePlanner
+        let destination = TestBridgePlanner::default()
             .bridge_destination_for_final_liquidator(BridgeDestinationKind::IcpAccount, &expected.to_string())
             .expect("valid ICP destination");
 
