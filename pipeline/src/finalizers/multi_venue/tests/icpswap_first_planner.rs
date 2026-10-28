@@ -278,9 +278,9 @@ fn config(cex_min_exec_usd: f64) -> IcpswapFirstPlannerConfig {
         settlement_min_net_edge_bps: None,
         buy_bad_debt: false,
         bad_debt_min_net_edge_bps: 150,
-        // Must stay above the 150 bps dust fallback impact cap, which already
-        // includes the pool fee.
-        max_oracle_discount_bps: 200,
+        // Must stay above the 150 bps dust fallback and 200 bps CEX impact caps,
+        // which already include the venue fee.
+        max_oracle_discount_bps: 250,
         oracle_snapshot_max_age_secs: 300,
         icpswap_test_allocation_usd: None,
         mexc_test_allocation_usd: None,
@@ -1224,8 +1224,24 @@ fn oracle_discount_limit_must_leave_room_above_the_impact_caps() {
     };
     assert!(error.to_string().contains("must exceed the 150.00 bps dust fallback"));
 
-    // The shipped pairing leaves 100 bps above the cap.
+    // The CEX cap is set apart from the dust cap. Above the limit, the waterfall
+    // would size a leg the guard then refuses, after the quotes are spent.
+    let at_cex_cap = IcpswapFirstPlannerConfig {
+        max_oracle_discount_bps: 200,
+        ..config(0.0)
+    };
+    let adapter = mock_adapter(ICPSWAP_VENUE_ID, Arc::new(Mutex::new(Vec::new())), |request| {
+        Ok(preview(request, ICPSWAP_VENUE_ID, 10.0, 1, 1))
+    });
+    let error = match IcpswapFirstPlanner::new(vec![Arc::new(adapter)], at_cex_cap) {
+        Ok(_) => panic!("a limit at the CEX cap must be rejected"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("must exceed the 200.00 bps CEX"), "{error}");
+
+    // The shipped pairing leaves room above both caps.
     assert!(config(0.0).max_oracle_discount_bps as f64 > config(0.0).dust_fallback_max_price_impact_bps);
+    assert!(config(0.0).max_oracle_discount_bps as f64 > config(0.0).max_cex_price_impact_bps);
     assert!(
         production_oracle_config(0.0).max_oracle_discount_bps as f64
             > production_oracle_config(0.0).dust_fallback_max_price_impact_bps
@@ -2445,15 +2461,15 @@ async fn cycles_are_priced_at_the_configured_xdr_rate() {
 
 #[tokio::test]
 async fn the_oracle_guard_reads_the_market_output_not_the_net() {
-    // The guard allows 200 bps under the oracle's 200 ckUSDC, so at least 196.
-    // Fixed fees bring the net to 195, but the book's price is the oracle's.
-    let state = mexc_only_planner(Vec::new(), Some(200_000_000), 195_000_000)
+    // The guard allows 250 bps under the oracle's 200 ckUSDC, so at least 195.
+    // Fixed fees bring the net to 194, but the book's price is the oracle's.
+    let state = mexc_only_planner(Vec::new(), Some(200_000_000), 194_000_000)
         .plan(&priced_icp_to_ckusdc_input(), QUOTED_AT)
         .await
         .expect("correctly counted fees are not a bad price");
-    assert_eq!(state.legs[0].quote.estimated_receive.value, Nat::from(195_000_000u64));
+    assert_eq!(state.legs[0].quote.estimated_receive.value, Nat::from(194_000_000u64));
 
-    let error = mexc_only_planner(Vec::new(), None, 195_000_000)
+    let error = mexc_only_planner(Vec::new(), None, 194_000_000)
         .plan(&priced_icp_to_ckusdc_input(), QUOTED_AT)
         .await
         .expect_err("without a market output the net is judged");

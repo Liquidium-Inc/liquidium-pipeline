@@ -164,11 +164,16 @@ impl IcpswapFirstPlannerConfig {
         // that same shortfall plus the input ledger fees and the pool-versus-
         // oracle basis, so its limit has to sit above the impact caps or it would
         // reject the quotes those caps deliberately allow.
-        if f64::from(self.max_oracle_discount_bps) <= self.dust_fallback_max_price_impact_bps {
-            return Err(IcpswapFirstPlannerError::InvalidInput(format!(
-                "maximum oracle discount {} bps must exceed the {:.2} bps dust fallback impact cap",
-                self.max_oracle_discount_bps, self.dust_fallback_max_price_impact_bps
-            )));
+        for (cap_name, cap_bps) in [
+            ("dust fallback", self.dust_fallback_max_price_impact_bps),
+            ("CEX", self.max_cex_price_impact_bps),
+        ] {
+            if f64::from(self.max_oracle_discount_bps) <= cap_bps {
+                return Err(IcpswapFirstPlannerError::InvalidInput(format!(
+                    "maximum oracle discount {} bps must exceed the {cap_bps:.2} bps {cap_name} impact cap",
+                    self.max_oracle_discount_bps
+                )));
+            }
         }
         if !self.cycles_usd_per_trillion.is_finite() || self.cycles_usd_per_trillion <= 0.0 {
             return Err(IcpswapFirstPlannerError::InvalidInput(
