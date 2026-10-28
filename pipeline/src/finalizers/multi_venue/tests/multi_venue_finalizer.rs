@@ -2259,14 +2259,21 @@ async fn mexc_custody_row_exhausting_retries_parks_without_blocking_the_next_bat
         receipt_with_id(EXHAUSTED_ID),
         receipt_with_id(SUCCEEDING_ID),
     ]));
-    wal.update_row(EXHAUSTED_ID, |row| row.error_count = MAX_FINALIZER_ERRORS - 1);
     let mexc = Arc::new(
         ScriptedAdapter::new(
             MEXC_VENUE_ID,
             None,
-            vec![VenueLegStatus::Running, VenueLegStatus::Completed],
+            vec![
+                VenueLegStatus::Running,
+                VenueLegStatus::Completed,
+                VenueLegStatus::Running,
+            ],
         )
-        .with_retryable_errors(vec![Some("last retryable MEXC failure".to_string()), None]),
+        .with_retryable_errors(vec![
+            Some("first retryable MEXC failure".to_string()),
+            None,
+            Some("last retryable MEXC failure".to_string()),
+        ]),
     );
     let finalizer = Arc::new(MultiVenueFinalizer::new(vec![mexc.clone()], planner_config()).expect("valid finalizer"));
     let stage = FinalizeStage::new(
@@ -2279,10 +2286,46 @@ async fn mexc_custody_row_exhausting_retries_parks_without_blocking_the_next_bat
         60,
     );
 
+    // The first pass commits both plans; the second spends the last strike
+    // on the committed custody row.
+    let outcomes = stage.process(&()).await.expect("the first pass should continue");
+    assert_eq!(wal.status(SUCCEEDING_ID), ResultStatus::Succeeded);
+    assert_eq!(outcomes.len(), 1);
+    wal.update_row(EXHAUSTED_ID, |row| row.error_count = MAX_FINALIZER_ERRORS - 1);
+    wal.make_retry_due(EXHAUSTED_ID);
     let outcomes = stage.process(&()).await.expect("failure-limit batch should continue");
 
     assert_eq!(wal.status(EXHAUSTED_ID), ResultStatus::OperatorRequired);
-    assert_eq!(wal.status(SUCCEEDING_ID), ResultStatus::Succeeded);
-    assert_eq!(mexc.calls(), 2);
-    assert_eq!(outcomes.len(), 1);
+    assert_eq!(mexc.calls(), 3);
+    assert!(outcomes.is_empty());
+}
+
+/// Review finding 7: strikes from route searches that found nothing must not
+/// make the first real error of a newly committed plan park the row.
+#[tokio::test]
+async fn a_committed_plan_drops_the_route_search_strikes() {
+    const ROW_ID: u128 = 811;
+    let wal = Arc::new(BatchWal::new([receipt_with_id(ROW_ID)]));
+    wal.update_row(ROW_ID, |row| row.error_count = MAX_FINALIZER_ERRORS - 1);
+    let mexc = Arc::new(
+        ScriptedAdapter::new(MEXC_VENUE_ID, None, vec![VenueLegStatus::Running])
+            .with_retryable_errors(vec![Some("one transient read failure".to_string())]),
+    );
+    let finalizer = Arc::new(MultiVenueFinalizer::new(vec![mexc.clone()], planner_config()).expect("valid finalizer"));
+    let stage = FinalizeStage::new(
+        wal.clone(),
+        finalizer,
+        Arc::new(SimpleProfitCalculator),
+        Arc::new(MockPipelineAgent::new()),
+        Principal::anonymous(),
+        1,
+        60,
+    );
+
+    stage.process(&()).await.expect("the batch should continue");
+
+    assert_eq!(wal.status(ROW_ID), ResultStatus::FailedRetryable);
+    let mut strikes = 0;
+    wal.update_row(ROW_ID, |row| strikes = row.error_count);
+    assert_eq!(strikes, 1, "only the error after the commit counts");
 }

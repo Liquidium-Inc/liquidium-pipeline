@@ -462,7 +462,15 @@ where
         error: FinalizerError,
         receipt: ExecutionReceipt,
     ) -> Option<Finished> {
-        let attempt = row.error_count + 1;
+        let mut strikes = row.error_count;
+        // A plan committed in this call drops the route-search strikes, so a
+        // row that would end or park reads its stored count again.
+        if strikes + 1 >= MAX_FINALIZER_ERRORS
+            && let Ok(Some(stored)) = self.wal.get_result(&row.id).await
+        {
+            strikes = stored.error_count;
+        }
+        let attempt = strikes + 1;
         let exhausted = attempt >= MAX_FINALIZER_ERRORS;
         let err_msg = error.message().to_string();
         warn!(
@@ -951,8 +959,10 @@ mod tests {
         row.error_count = MAX_FINALIZER_ERRORS - 1;
         let row_id = row.id.clone();
         let row_id_for_park = row_id.clone();
+        let stored = row.clone();
 
         let mut wal = MockWalStore::new();
+        wal.expect_get_result().returning(move |_| Ok(Some(stored.clone())));
         wal.expect_get_pending()
             .with(eq(100usize))
             .times(1)
@@ -998,8 +1008,10 @@ mod tests {
         row.error_count = MAX_FINALIZER_ERRORS - 1;
         let row_id = row.id.clone();
         let row_id_for_park = row_id.clone();
+        let stored = row.clone();
 
         let mut wal = MockWalStore::new();
+        wal.expect_get_result().returning(move |_| Ok(Some(stored.clone())));
         wal.expect_get_pending()
             .with(eq(100usize))
             .times(1)
@@ -1089,8 +1101,10 @@ mod tests {
         row.error_count = MAX_FINALIZER_ERRORS - 1;
         let row_id = row.id.clone();
         let row_id_for_retry = row_id.clone();
+        let stored = row.clone();
 
         let mut wal = MockWalStore::new();
+        wal.expect_get_result().returning(move |_| Ok(Some(stored.clone())));
         wal.expect_get_pending()
             .with(eq(100usize))
             .times(1)
