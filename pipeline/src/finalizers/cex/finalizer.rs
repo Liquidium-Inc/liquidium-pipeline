@@ -45,6 +45,8 @@ const DEPOSIT_NOTICE_WINDOW_SECS: i64 = 30 * 60;
 const BRIDGE_CREDIT_STALL_SECS: i64 = 40 * 60;
 /// How often a reverted return-bridge send is made again. Each one costs gas.
 const MAX_REVERTED_BRIDGE_RESUBMITS: u32 = 2;
+/// How often a withdrawal the exchange failed or canceled is requested again.
+const MAX_FAILED_WITHDRAWAL_RESUBMITS: u32 = 2;
 const SOL_FINALITY_SECS: i64 = 20;
 
 use crate::{

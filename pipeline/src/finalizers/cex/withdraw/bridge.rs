@@ -286,19 +286,12 @@ where
                     return Ok(());
                 }
             }
-            WithdrawStatus::Failed => {
-                return Err(format!(
-                    "cex withdraw failed for liq_id {} withdraw_id={}",
-                    state.liq_id, withdraw_id
-                )
-                .into());
-            }
-            WithdrawStatus::Canceled => {
-                return Err(format!(
-                    "cex withdraw canceled for liq_id {} withdraw_id={}",
-                    state.liq_id, withdraw_id
-                )
-                .into());
+            WithdrawStatus::Failed | WithdrawStatus::Canceled => {
+                return Ok(Self::resubmit_failed_withdrawal(
+                    state,
+                    &withdraw_id,
+                    &withdraw_snapshot,
+                )?);
             }
             WithdrawStatus::Completed => {}
         }

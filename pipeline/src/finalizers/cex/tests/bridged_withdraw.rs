@@ -89,6 +89,64 @@ async fn mexc_withdraw_bridge_waits_when_source_balance_below_expected_net() {
     assert!(state.withdraw.bridge.withdraw_bridge_id.is_none());
 }
 
+/// Review finding 8 on the bridged path: a canceled exchange withdrawal is
+/// requested again before any bridge step runs.
+#[tokio::test]
+async fn a_canceled_withdrawal_before_the_return_bridge_is_requested_again() {
+    let mut cex = MockCexBackend::new();
+    let mut bridge = MockBridgeBackend::new();
+    cex.expect_withdraw()
+        .times(1)
+        .returning(|asset, network, _, amount, _withdraw_order_id| {
+            Ok(liquidium_pipeline_connectors::backend::cex_backend::WithdrawalReceipt {
+                asset: asset.to_string(),
+                network: network.to_string(),
+                amount,
+                txid: None,
+                internal_id: Some("canceled-withdraw".to_string()),
+            })
+        });
+    cex.expect_get_withdraw_status_snapshot_by_id()
+        .times(1)
+        .returning(|_, _| {
+            Ok(WithdrawStatusSnapshot {
+                status: WithdrawStatus::Canceled,
+                txid: None,
+                transaction_fee: None,
+            })
+        });
+    bridge.expect_get_source_balance().times(0);
+    bridge.expect_submit_bridge().times(0);
+    let finalizer = CexVenueFinalizer::new(
+        Arc::new(cex),
+        Arc::new(MockTransferActions::new()),
+        Principal::management_canister(),
+        TEST_MAX_SELL_SLIPPAGE_BPS,
+        TEST_CEX_MIN_EXEC_USD,
+        TEST_CEX_SLICE_TARGET_RATIO,
+    )
+    .with_bridge_runtime(bridge_dependencies(Arc::new(bridge)));
+    let receipt = make_execution_receipt_with_assets(112, ckbtc_token(), ckusdc_token());
+    let mut state = finalizer.prepare("112", &receipt).await.unwrap();
+    state.step = CexStep::Withdraw;
+    state.withdraw.size_out = Some(ChainTokenAmount::from_formatted(
+        state.withdraw.withdraw_asset.clone(),
+        1.5,
+    ));
+
+    finalizer.withdraw(&mut state).await.expect("the request is saved");
+    finalizer.withdraw(&mut state).await.expect("the request is sent");
+    finalizer
+        .withdraw(&mut state)
+        .await
+        .expect("the cancel reopens the withdrawal");
+
+    assert!(matches!(state.step, CexStep::Withdraw));
+    assert!(state.withdraw.withdraw_id.is_none());
+    assert_eq!(state.withdraw.withdraw_attempt, 1);
+    assert_eq!(state.withdraw.withdraw_failures, 1);
+}
+
 #[tokio::test]
 async fn mexc_withdraw_bridge_deferral_keeps_step_pending_then_submits() {
     let mut cex = MockCexBackend::new();

@@ -173,6 +173,9 @@ pub struct CexWithdrawState {
     /// Bumped after each refused request, so a new request gets a new order id.
     #[serde(default)]
     pub withdraw_attempt: u32,
+    /// How often the exchange failed or canceled an accepted withdrawal.
+    #[serde(default)]
+    pub withdraw_failures: u32,
     /// The withdrawal request, saved before it is sent.
     #[serde(default)]
     pub withdraw_send: Option<crate::outbound::driver::OutboundRecord>,
@@ -381,6 +384,7 @@ mod tests {
                 withdraw_txid: None,
                 withdraw_accepted_at_ts: None,
                 withdraw_attempt: 0,
+                withdraw_failures: 0,
                 withdraw_send: None,
                 size_out: None,
                 bridge: CexWithdrawBridgeState {

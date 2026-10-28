@@ -98,6 +98,119 @@ async fn mexc_direct_withdraw_parks_when_delivery_never_arrives() {
     assert!(matches!(state.step, CexStep::WithdrawPending));
 }
 
+/// Review finding 8: the exchange returned the funds of a failed or canceled
+/// withdrawal, but every later cycle read the same request again.
+#[tokio::test]
+async fn a_failed_withdrawal_is_requested_again_under_a_new_order_id_up_to_a_bound() {
+    use liquidium_pipeline_connectors::backend::cex_backend::{
+        WithdrawStatus, WithdrawStatusSnapshot, WithdrawalReceipt,
+    };
+    let order_ids = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen = order_ids.clone();
+    let mut cex = MockCexBackend::new();
+    cex.expect_withdraw()
+        .times(3)
+        .returning(move |asset, network, _, amount, order_id| {
+            let mut seen = seen.lock().unwrap();
+            seen.push(order_id.to_string());
+            Ok(WithdrawalReceipt {
+                asset: asset.to_string(),
+                network: network.to_string(),
+                amount,
+                txid: None,
+                internal_id: Some(format!("request-{}", seen.len())),
+            })
+        });
+    cex.expect_get_withdraw_status_snapshot_by_id()
+        .times(3)
+        .returning(|_, id| {
+            Ok(WithdrawStatusSnapshot {
+                status: if id == "request-2" {
+                    WithdrawStatus::Canceled
+                } else {
+                    WithdrawStatus::Failed
+                },
+                txid: None,
+                transaction_fee: None,
+            })
+        });
+    let finalizer = test_finalizer(Arc::new(cex), Arc::new(MockTransferActions::new()));
+    let mut state = finalizer.prepare("failed", &make_execution_receipt(132)).await.unwrap();
+    state.step = CexStep::Withdraw;
+    state.withdraw.size_out = Some(ChainTokenAmount::from_formatted(
+        state.withdraw.withdraw_asset.clone(),
+        1.0,
+    ));
+
+    for round in 1..=2 {
+        finalizer.withdraw(&mut state).await.expect("the request is saved");
+        finalizer.withdraw(&mut state).await.expect("the request is sent");
+        assert!(matches!(state.step, CexStep::WithdrawPending));
+        finalizer
+            .withdraw(&mut state)
+            .await
+            .expect("the failure reopens the withdrawal");
+        assert!(matches!(state.step, CexStep::Withdraw));
+        assert_eq!(state.withdraw.withdraw_failures, round);
+        assert!(state.withdraw.withdraw_id.is_none());
+    }
+    finalizer.withdraw(&mut state).await.expect("the request is saved");
+    finalizer.withdraw(&mut state).await.expect("the request is sent");
+    let error = finalizer.withdraw(&mut state).await.unwrap_err();
+    assert!(error.to_string().contains("for an operator"), "{error}");
+
+    let ids = order_ids.lock().unwrap();
+    assert_eq!(ids.len(), 3);
+    assert!(ids[0] != ids[1] && ids[1] != ids[2], "{ids:?}");
+}
+
+/// A failed withdrawal that names a transaction may still land, so no new
+/// request goes out for it.
+#[tokio::test]
+async fn a_failed_withdrawal_with_a_txid_is_not_requested_again() {
+    use liquidium_pipeline_connectors::backend::cex_backend::{
+        WithdrawStatus, WithdrawStatusSnapshot, WithdrawalReceipt,
+    };
+    let mut cex = MockCexBackend::new();
+    cex.expect_withdraw()
+        .times(1)
+        .returning(|asset, network, _, amount, _| {
+            Ok(WithdrawalReceipt {
+                asset: asset.to_string(),
+                network: network.to_string(),
+                amount,
+                txid: None,
+                internal_id: Some("request-0".to_string()),
+            })
+        });
+    cex.expect_get_withdraw_status_snapshot_by_id()
+        .times(1)
+        .returning(|_, _| {
+            Ok(WithdrawStatusSnapshot {
+                status: WithdrawStatus::Failed,
+                txid: Some("0xsent".to_string()),
+                transaction_fee: None,
+            })
+        });
+    let finalizer = test_finalizer(Arc::new(cex), Arc::new(MockTransferActions::new()));
+    let mut state = finalizer
+        .prepare("failed-sent", &make_execution_receipt(133))
+        .await
+        .unwrap();
+    state.step = CexStep::Withdraw;
+    state.withdraw.size_out = Some(ChainTokenAmount::from_formatted(
+        state.withdraw.withdraw_asset.clone(),
+        1.0,
+    ));
+
+    finalizer.withdraw(&mut state).await.expect("the request is saved");
+    finalizer.withdraw(&mut state).await.expect("the request is sent");
+    let error = finalizer.withdraw(&mut state).await.unwrap_err();
+    assert!(error.to_string().contains("no new request"), "{error}");
+    assert_eq!(state.withdraw.withdraw_id.as_deref(), Some("request-0"));
+    assert_eq!(state.withdraw.withdraw_failures, 0);
+}
+
 #[tokio::test]
 async fn mexc_direct_withdraw_waits_for_delivery_and_deducts_fee_once() {
     use liquidium_pipeline_connectors::backend::cex_backend::{

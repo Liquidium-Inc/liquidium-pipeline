@@ -111,6 +111,7 @@ where
                 withdraw_txid: None,
                 withdraw_accepted_at_ts: None,
                 withdraw_attempt: 0,
+                withdraw_failures: 0,
                 withdraw_send: None,
                 size_out: None,
                 bridge: CexWithdrawBridgeState {
