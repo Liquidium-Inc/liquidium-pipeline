@@ -171,6 +171,7 @@ pub(crate) fn bootstrap_control_plane(
     db_path: &str,
     paused: Arc<AtomicBool>,
     lifecycle_watchdog: Option<Arc<dyn Watchdog>>,
+    operator: Arc<dyn crate::operator::OperatorConsole>,
 ) -> anyhow::Result<()> {
     let control_state_store = Arc::new(
         SqliteWalStore::new_with_busy_timeout(db_path, 30_000)
@@ -208,7 +209,13 @@ pub(crate) fn bootstrap_control_plane(
         });
 
         if let Err(err) =
-            crate::control_plane::serve_bound_listener_with_hook(control_listener, paused, Some(on_transition)).await
+            crate::control_plane::serve_bound_listener_with_hook(
+                control_listener,
+                paused,
+                Some(on_transition),
+                Some(operator),
+            )
+            .await
         {
             // The accept loop already retries transient failures, so reaching
             // here means the socket is unusable and pause/resume is gone for

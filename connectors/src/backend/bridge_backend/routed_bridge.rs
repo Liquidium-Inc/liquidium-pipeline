@@ -2,7 +2,10 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
-use super::{BridgeBackend, BridgeFeeBudget, BridgeRequest, BridgeStatus, BridgeSubmission, BridgeSubmissionCandidate};
+use super::{
+    BridgeBackend, BridgeDestination, BridgeFeeBudget, BridgeRequest, BridgeSend, BridgeStatus, BridgeSubmission,
+    BridgeSubmissionCandidate, DepositNotice,
+};
 
 /// Keeps provider-specific submission handles with the backend that issued them.
 pub struct RoutedBridgeBackend {
@@ -69,6 +72,25 @@ impl BridgeBackend for RoutedBridgeBackend {
 
     async fn submit_bridge(&self, request: BridgeRequest) -> Result<BridgeSubmission, String> {
         self.source(&request.asset, &request.source_chain).submit_bridge(request).await
+    }
+
+    async fn prepare_bridge_send(&self, request: &BridgeRequest) -> Result<BridgeSend, String> {
+        self.source(&request.asset, &request.source_chain)
+            .prepare_bridge_send(request)
+            .await
+    }
+
+    async fn track_deposit(
+        &self,
+        asset: &str,
+        chain: &str,
+        destination: &BridgeDestination,
+        handle: &str,
+        receipt: &str,
+    ) -> Result<DepositNotice, String> {
+        self.source(asset, chain)
+            .track_deposit(asset, chain, destination, handle, receipt)
+            .await
     }
 
     async fn prepare_submission(&self, request: &BridgeRequest) -> Result<Option<u64>, String> {

@@ -20,15 +20,15 @@ use crate::{
     context::{PipelineContext, init_context},
     control_plane::acquire_daemon_instance,
     executors::basic::basic_executor::BasicExecutor,
+    bridge::{claims::WalBridgeClaims, runtime::BridgeRuntime},
     finalizers::{
-        bridge_claims::WalBridgeClaims,
-        bridge_runtime::BridgeRuntime,
         mexc::runtime::build_mexc_finalizer,
         multi_venue::{
             ICPSWAP_VENUE_ID, IcpswapFirstPlannerConfig, MEXC_VENUE_ID, MultiVenueAdapter, MultiVenueFinalizer,
         },
         profit_calculator::SimpleProfitCalculator,
     },
+    operator::OperatorDesk,
     liquidation::collateral_service::CollateralService,
     persistance::{
         FinalizerMetaPayload, LiquidationIntentStore, MultiVenueExecutionOutcome, ResultStatus, VenueLegStatus,
@@ -193,6 +193,7 @@ async fn init(
         Arc<ExportStage>,
         Arc<FinalizeStage<MultiVenueFinalizer, SqliteWalStore, SimpleProfitCalculator, Agent>>,
         Arc<SqliteWalStore>,
+        Arc<dyn crate::operator::OperatorConsole>,
     ),
     String,
 > {
@@ -279,6 +280,12 @@ async fn init(
         .with_recovery_sweep(ctx.trader_transfers.actions(), config.get_recovery_account()),
     );
 
+    // Operator actions on parked rows reach the WAL through the control socket.
+    let operator: Arc<dyn crate::operator::OperatorConsole> = Arc::new(OperatorDesk::new(
+        db.clone() as Arc<dyn WalStore>,
+        multi_venue_finalizer.clone(),
+    ));
+
     // Profit calculator for expected/realized PnL
     let profit_calc = Arc::new(SimpleProfitCalculator); //todo implement real profit calculator
 
@@ -322,7 +329,7 @@ async fn init(
         path: config.export_path.clone(),
     });
 
-    Ok((finder, strategy, executor, exporter, finalizer, db))
+    Ok((finder, strategy, executor, exporter, finalizer, db, operator))
 }
 
 fn bridge_low_balance_service(ctx: &PipelineContext) -> Arc<BalanceService> {
@@ -436,7 +443,7 @@ pub async fn run_liquidation_loop(sock_path: PathBuf) -> ExitCode {
     );
 
     // Initialize components using shared pipeline context
-    let (finder, strategy, executor, exporter, finalizer, wal) = match init(ctx.clone()).await {
+    let (finder, strategy, executor, exporter, finalizer, wal, operator) = match init(ctx.clone()).await {
         Ok(stages) => stages,
         Err(err) => {
             tracing::error!("Failed to initialize pipeline stages: {}", err);
@@ -481,6 +488,7 @@ pub async fn run_liquidation_loop(sock_path: PathBuf) -> ExitCode {
         &config.db_path,
         paused.clone(),
         slack_watchdog.clone(),
+        operator,
     ) {
         tracing::error!("{}", err);
         return ExitCode::FAILURE;

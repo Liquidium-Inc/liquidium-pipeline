@@ -44,6 +44,7 @@ where
 
         Ok(CexState {
             liq_id: execution_id.to_string(),
+            send_saved: false,
             step: CexStep::Deposit,
             last_error: None,
             market: format!("{}_{}", bridge_plan.deposit.cex_asset, bridge_plan.withdraw.cex_asset),
@@ -55,7 +56,7 @@ where
                 deposit_balance_before: None,
                 deposit_sent_at_ts: None,
                 approval_bump_count: None,
-                deposit_transfer_created_at_ns: None,
+                deposit_funding: None,
                 bridge: CexDepositBridgeState {
                     deposit_planned_asset: Some(bridge_plan.deposit.cex_asset),
                     deposit_planned_network: Some(bridge_plan.deposit.cex_network),
@@ -67,7 +68,9 @@ where
                     deposit_bridge_submit_amount: None,
                     deposit_bridge_expected_amount: None,
                     deposit_bridge_provider_fee_budget_native_units: None,
-                    deposit_bridge_submit_phase: None,
+                    deposit_bridge_call: None,
+                    legacy_bridge_submit_phase: None,
+                    deposit_bridge_call_unrecorded: false,
                 },
             },
             trade: CexTradeState {
@@ -104,7 +107,7 @@ where
                 withdraw_txid: None,
                 withdraw_accepted_at_ts: None,
                 withdraw_attempt: 0,
-                withdraw_uncertain: None,
+                withdraw_send: None,
                 size_out: None,
                 bridge: CexWithdrawBridgeState {
                     withdraw_planned_asset: Some(bridge_plan.withdraw.cex_asset),
@@ -115,6 +118,10 @@ where
                     withdraw_bridge_polled_at_ts: None,
                     withdraw_bridge_mint_receipt: None,
                     withdraw_bridge_destination_snapshot: None,
+                    withdraw_bridge_funding: None,
+                    withdraw_bridge_send_handle: None,
+                    withdraw_bridge_funding_txid: None,
+                    withdraw_bridge_funded_at_ts: None,
                 },
             },
         })

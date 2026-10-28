@@ -1,16 +1,20 @@
 use alloy::{
-    network::{AnyNetwork, NetworkWallet, ReceiptResponse, TransactionBuilder},
-    primitives::{Address, TxHash, U256},
+    eips::{BlockId, eip2718::Encodable2718},
+    network::{AnyNetwork, Network, NetworkWallet, ReceiptResponse, TransactionBuilder},
+    primitives::{Address, Bytes, TxHash, U256, keccak256},
     providers::{Provider, WalletProvider},
     rpc::types::TransactionRequest,
+    transports::RpcError,
     sol,
 };
 use async_trait::async_trait;
 use candid::Nat;
+use liquidium_pipeline_core::outbound::SendOutcome;
+use serde::{Deserialize, Serialize};
 use tokio::time::{Duration, sleep};
 
 const ERC20_APPROVE_GAS_LIMIT: u64 = 120_000;
-const ERC20_APPROVE_GAS_BUFFER_BPS: u64 = 2_000; // +20%
+const GAS_BUFFER_BPS: u64 = 2_000; // +20%
 const NONCE_RETRY_MAX_ATTEMPTS: u8 = 3;
 const NONCE_RETRY_BASE_DELAY_MS: u64 = 200;
 
@@ -62,11 +66,76 @@ fn u256_to_nat(v: U256) -> Nat {
     Nat::from(v.to::<u128>())
 }
 
+/// Some RPC stacks under-estimate gas, so every estimate gets headroom.
+fn with_gas_buffer(estimate: u64) -> u64 {
+    estimate.saturating_add(estimate.saturating_mul(GAS_BUFFER_BPS) / 10_000)
+}
+
 fn is_nonce_too_low_error(message: &str) -> bool {
     let normalized = message.to_ascii_lowercase();
     normalized.contains("nonce too low")
         || normalized.contains("nonce has already been used")
         || normalized.contains("invalid transaction nonce")
+}
+
+/// A signed EVM transaction, saved before it is broadcast. Its hash and
+/// nonce exist before it reaches the network.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SignedEvmTx {
+    pub raw: Bytes,
+    pub hash: TxHash,
+    pub from: Address,
+    pub nonce: u64,
+}
+
+/// What one broadcast says about a signed transaction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Broadcast {
+    /// A node took it into its mempool.
+    Sent,
+    /// The node refused this exact transaction, so that node does not hold it.
+    Rejected(String),
+    /// No decided answer: a transport error, or the network may know it already.
+    Unknown(String),
+}
+
+/// Node refusals that prove this exact transaction failed validation, so no
+/// node took it. Any other error object, gateway errors included, leaves the
+/// answer to the chain.
+fn is_validation_refusal(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    [
+        "insufficient funds",
+        "intrinsic gas too low",
+        "exceeds block gas limit",
+        "invalid sender",
+        "max fee per gas less than block base fee",
+        "fee cap less than block base fee",
+    ]
+    .iter()
+    .any(|marker| message.contains(marker))
+}
+
+/// What the chain says about a signed transaction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EvmReading {
+    Landed,
+    /// Mined, but the call reverted: the nonce is used and no funds moved.
+    Reverted,
+    /// No receipt, and the finalized nonce moved past it: it cannot land.
+    NonceUsed,
+    Pending,
+}
+
+/// Decides from the receipt and from the wallet's finalized nonce, which the
+/// caller reads before the receipt.
+fn read_evm_outcome(receipt_success: Option<bool>, finalized_nonce: u64, tx_nonce: u64) -> EvmReading {
+    match receipt_success {
+        Some(true) => EvmReading::Landed,
+        Some(false) => EvmReading::Reverted,
+        None if finalized_nonce > tx_nonce => EvmReading::NonceUsed,
+        None => EvmReading::Pending,
+    }
 }
 
 pub struct EvmBackendImpl<P> {
@@ -99,6 +168,115 @@ where
             .await
             .map_err(|e| e.to_string())?;
         Ok(pending > latest)
+    }
+
+    /// Fills, signs and encodes a request for the wallet's next nonce. It
+    /// broadcasts nothing.
+    pub(crate) async fn sign_request(
+        &self,
+        request: <AnyNetwork as Network>::TransactionRequest,
+    ) -> Result<SignedEvmTx, String> {
+        let from = self.provider.default_signer_address();
+        let (nonce, chain_id, fees) = tokio::try_join!(
+            async {
+                let nonce = self.provider.get_transaction_count(from).pending().await;
+                nonce.map_err(|e| format!("nonce read failed for {from}: {e}"))
+            },
+            async {
+                let chain_id = self.provider.get_chain_id().await;
+                chain_id.map_err(|e| format!("chain id read failed: {e}"))
+            },
+            async {
+                let fees = self.provider.estimate_eip1559_fees().await;
+                fees.map_err(|e| format!("fee estimate failed: {e}"))
+            },
+        )?;
+        let mut request = request.with_from(from).with_nonce(nonce).with_chain_id(chain_id);
+        let estimate = self
+            .provider
+            .estimate_gas(request.clone())
+            .await
+            .map_err(|e| format!("gas estimate failed: {e}"))?;
+        request.set_gas_limit(with_gas_buffer(estimate));
+        request.set_max_fee_per_gas(fees.max_fee_per_gas);
+        request.set_max_priority_fee_per_gas(fees.max_priority_fee_per_gas);
+        let envelope = request
+            .build(self.provider.wallet())
+            .await
+            .map_err(|e| format!("sign transaction failed: {e}"))?;
+        let raw = Bytes::from(envelope.encoded_2718());
+        Ok(SignedEvmTx {
+            hash: keccak256(&raw),
+            raw,
+            from,
+            nonce,
+        })
+    }
+
+    pub(crate) async fn broadcast_signed(&self, tx: &SignedEvmTx) -> Broadcast {
+        match self.provider.send_raw_transaction(&tx.raw).await {
+            Ok(_) => Broadcast::Sent,
+            Err(RpcError::ErrorResp(error)) if is_validation_refusal(&error.message) => {
+                Broadcast::Rejected(error.message.to_string())
+            }
+            Err(error) => Broadcast::Unknown(error.to_string()),
+        }
+    }
+
+    /// Decides a signed transaction from the chain: its receipt first, then
+    /// the finalized nonce. A pending transaction is broadcast again.
+    pub(crate) async fn signed_outcome(&self, tx: &SignedEvmTx) -> SendOutcome {
+        // Read the nonce first, so the receipt read covers every block the
+        // nonce covers.
+        let finalized_nonce = match self
+            .provider
+            .get_transaction_count(tx.from)
+            .block_id(BlockId::finalized())
+            .await
+        {
+            Ok(nonce) => nonce,
+            Err(error) => {
+                return SendOutcome::Open {
+                    reason: format!("finalized nonce read failed: {error}"),
+                };
+            }
+        };
+        let receipt_success = match self.provider.get_transaction_receipt(tx.hash).await {
+            Ok(receipt) => receipt.map(|receipt| receipt.status()),
+            Err(error) => {
+                return SendOutcome::Open {
+                    reason: format!("receipt read failed for {:#x}: {error}", tx.hash),
+                };
+            }
+        };
+        match read_evm_outcome(receipt_success, finalized_nonce, tx.nonce) {
+            EvmReading::Landed => SendOutcome::Landed {
+                receipt: format!("{:#x}", tx.hash),
+            },
+            // A revert moved no funds, but a new send would most likely revert
+            // too, so an operator decides after the window.
+            EvmReading::Reverted => SendOutcome::Open {
+                reason: format!("transaction {:#x} reverted", tx.hash),
+            },
+            // The two reads may come from different nodes behind one URL, so
+            // a missing receipt is no proof. An operator decides after the window.
+            EvmReading::NonceUsed => SendOutcome::Open {
+                reason: format!(
+                    "nonce {} of {} is final but no receipt for {:#x} was found",
+                    tx.nonce, tx.from, tx.hash
+                ),
+            },
+            EvmReading::Pending => {
+                // A node may have dropped it, and the same bytes cannot land
+                // twice. A node that still holds it needs no new copy.
+                if matches!(self.provider.get_transaction_by_hash(tx.hash).await, Ok(None)) {
+                    let _ = self.provider.send_raw_transaction(&tx.raw).await;
+                }
+                SendOutcome::Open {
+                    reason: format!("transaction {:#x} is not mined yet", tx.hash),
+                }
+            }
+        }
     }
 
     pub(crate) async fn erc20_balance_of_raw(&self, token: Address, owner: Address) -> Result<U256, String> {
@@ -142,10 +320,7 @@ where
         let contract = IERC20::new(token, self.provider.clone());
         let estimated_gas = contract.approve(spender, amount).estimate_gas().await.ok();
         let gas_limit = estimated_gas
-            .map(|estimate| {
-                let extra = estimate.saturating_mul(ERC20_APPROVE_GAS_BUFFER_BPS) / 10_000;
-                estimate.saturating_add(extra).max(ERC20_APPROVE_GAS_LIMIT)
-            })
+            .map(|estimate| with_gas_buffer(estimate).max(ERC20_APPROVE_GAS_LIMIT))
             .unwrap_or(ERC20_APPROVE_GAS_LIMIT);
 
         let mut attempt: u8 = 0;
@@ -297,5 +472,35 @@ mod tests {
         ));
         assert!(is_nonce_too_low_error("invalid transaction nonce"));
         assert!(!is_nonce_too_low_error("insufficient funds for gas * price + value"));
+    }
+
+    #[test]
+    fn the_chain_decides_a_signed_transaction() {
+        use super::{EvmReading, read_evm_outcome};
+        assert_eq!(read_evm_outcome(Some(true), 0, 5), EvmReading::Landed);
+        assert_eq!(read_evm_outcome(Some(false), 9, 5), EvmReading::Reverted);
+        // Another transaction took the nonce, and it is final.
+        assert_eq!(read_evm_outcome(None, 6, 5), EvmReading::NonceUsed);
+        // Still pending, or mined but not final yet.
+        assert_eq!(read_evm_outcome(None, 5, 5), EvmReading::Pending);
+        assert_eq!(read_evm_outcome(None, 0, 5), EvmReading::Pending);
+    }
+
+    #[test]
+    fn only_validation_refusals_count_as_never_sent() {
+        use super::is_validation_refusal;
+        for message in ["insufficient funds for gas * price + value", "intrinsic gas too low"] {
+            assert!(is_validation_refusal(message), "{message}");
+        }
+        for message in [
+            "already known",
+            "nonce too low: next nonce 8, tx nonce 7",
+            "replacement transaction underpriced",
+            "transaction underpriced",
+            "Internal error",
+            "limit exceeded",
+        ] {
+            assert!(!is_validation_refusal(message), "{message}");
+        }
     }
 }

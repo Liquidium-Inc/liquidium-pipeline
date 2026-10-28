@@ -4,7 +4,10 @@ mod constants;
 mod context;
 mod executors;
 mod finalizers;
+mod bridge;
 mod liquidation;
+mod operator;
+mod outbound;
 mod output;
 mod persistance;
 mod price_oracle;
@@ -29,6 +32,8 @@ use std::process::ExitCode;
 use std::time::{Duration, SystemTime};
 
 use crate::commands::liquidation_loop::run_liquidation_loop;
+use crate::outbound::driver::OperatorDecision;
+use crate::operator::{ReconcileAction, ReconcileRequest};
 
 #[derive(Parser)]
 #[command(name = "liquidator")]
@@ -80,6 +85,7 @@ enum Commands {
         source: Option<String>,
         /// Destination:
         /// - ICP assets: "main", "trader", "recovery", "bridge", or full Account string
+        /// - native ICP: also a 64-hex ledger account id (exchange deposit addresses)
         /// - EVM assets: "main", "bridge", or 0x... address
         #[arg(long)]
         destination: Option<String>,
@@ -153,6 +159,48 @@ enum Commands {
         /// Optional proxy canister principal override.
         #[arg(long)]
         proxy_canister: Option<String>,
+    },
+
+    // Sends one small MEXC withdrawal with an order id, then checks that the
+    // withdraw history returns that id. Without --confirm it sends nothing.
+    MexcWithdrawCheck {
+        /// Asset as the pipeline plans it (e.g. "SOL")
+        #[arg(long)]
+        asset: String,
+        /// Network as the pipeline plans it (e.g. "SOL")
+        #[arg(long)]
+        network: String,
+        /// Destination address. Use an address we control.
+        #[arg(long)]
+        address: String,
+        /// Amount in asset units, above the MEXC minimum for the network
+        #[arg(long)]
+        amount: f64,
+        /// Send the withdrawal. Without it the command only reads the history.
+        #[arg(long)]
+        confirm: bool,
+    },
+
+    // Shows a parked liquidation row, or answers its open question and
+    // releases the parked leg. It talks to the running daemon.
+    Reconcile {
+        /// Liquidation row id
+        liq_id: String,
+        /// Leg id, needed when more than one leg of the row is parked
+        #[arg(long)]
+        leg: Option<String>,
+        /// The undecided action happened: give its receipt or provider id
+        #[arg(long, conflicts_with_all = ["absent", "release"])]
+        landed: Option<String>,
+        /// The undecided action did not happen: the leg checks once more, then acts again
+        #[arg(long, conflicts_with = "release")]
+        absent: bool,
+        /// Release a parked leg that has no open question
+        #[arg(long)]
+        release: bool,
+        /// Control socket path of the running daemon
+        #[arg(long)]
+        sock_path: Option<PathBuf>,
     },
 
     // Account management commands
@@ -369,6 +417,50 @@ async fn main() -> ExitCode {
                 return ExitCode::FAILURE;
             }
             ExitCode::SUCCESS
+        }
+        Commands::MexcWithdrawCheck {
+            asset,
+            network,
+            address,
+            amount,
+            confirm,
+        } => {
+            if let Err(e) = commands::mexc_withdraw_check::check(&asset, &network, &address, amount, confirm).await {
+                eprintln!("MEXC withdraw check failed: {}", e);
+                return ExitCode::FAILURE;
+            }
+            ExitCode::SUCCESS
+        }
+        Commands::Reconcile {
+            liq_id,
+            leg,
+            landed,
+            absent,
+            release,
+            sock_path,
+        } => {
+            let action = match (landed, absent, release) {
+                (Some(receipt), _, _) => ReconcileAction::Answer(OperatorDecision::Landed { receipt }),
+                (None, true, _) => ReconcileAction::Answer(OperatorDecision::Absent),
+                (None, false, true) => ReconcileAction::Release,
+                (None, false, false) => ReconcileAction::Show,
+            };
+            let request = ReconcileRequest {
+                liq_id,
+                leg_id: leg,
+                action,
+            };
+            let sock_path = sock_path.unwrap_or_else(control_plane::default_sock_path);
+            match control_plane::send_reconcile(&sock_path, &request).await {
+                Ok(report) => {
+                    println!("{report}");
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("Reconcile failed: {}", e);
+                    ExitCode::FAILURE
+                }
+            }
         }
         Commands::Account { subcommand } => {
             let outcome = match subcommand {

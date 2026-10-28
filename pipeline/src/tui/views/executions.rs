@@ -10,7 +10,7 @@ use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, Wrap};
 use serde::Deserialize;
 use serde_json::Value;
 
-use crate::finalizers::cex_finalizer::BridgeSubmitPhase;
+use crate::bridge::legacy::LegacyBridgeSubmitPhase;
 use crate::finalizers::liquidation_outcome::LiquidationOutcome;
 use crate::finalizers::multi_venue::MEXC_VENUE_ID;
 use crate::persistance::{
@@ -22,6 +22,29 @@ use crate::swappers::icpswap::{VENUE_ID as ICPSWAP_VENUE_ID, identity::IcpswapEx
 use crate::wal::liq_id_from_receipt;
 
 use super::super::app::{App, ExecutionRowData, UiFocus};
+use super::super::reconcile::ReconcilePanel;
+
+/// The reconcile panel takes the place of the details pane while it is open.
+fn draw_reconcile(f: &mut Frame<'_>, area: Rect, panel: &ReconcilePanel) {
+    let mut lines: Vec<Line> = match &panel.reply {
+        Ok(report) => report.lines().map(|line| Line::from(line.to_string())).collect(),
+        Err(error) => vec![Line::from(Span::styled(
+            error.clone(),
+            Style::default().fg(Color::Red),
+        ))],
+    };
+    lines.push(Line::from(""));
+    lines.push(Line::from(format!("> {}_", panel.input)));
+    lines.push(Line::from(Span::styled(
+        "show | release | absent | landed <receipt> [leg <id>] · Enter sends · Esc closes",
+        Style::default().fg(Color::DarkGray),
+    )));
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(format!("Reconcile {}", panel.liq_id))
+        .border_style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD));
+    f.render_widget(Paragraph::new(lines).block(block).wrap(Wrap { trim: false }), area);
+}
 
 pub(super) fn draw_executions(f: &mut Frame<'_>, area: Rect, app: &App) {
     let mut lines: Vec<Line> = Vec::new();
@@ -32,7 +55,7 @@ pub(super) fn draw_executions(f: &mut Frame<'_>, area: Rect, app: &App) {
         lines.push(Line::from("No executions yet (loading WAL)."));
     }
     lines.push(Line::from(
-        "Focus: Down -> table, Enter/Right -> details, Left/Esc -> table, Esc -> tabs",
+        "Focus: Down -> table, Enter/Right -> details, Left/Esc -> table, Esc -> tabs, o -> reconcile row",
     ));
 
     if let Some(wal) = &app.wal {
@@ -92,7 +115,7 @@ pub(super) fn draw_executions(f: &mut Frame<'_>, area: Rect, app: &App) {
         .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
         .split(body_area);
 
-    let selected = exec.rows.get(app.executions_selected).or_else(|| exec.rows.first());
+    let selected = app.selected_execution();
 
     let details_block = {
         let title = if matches!(app.ui_focus, UiFocus::ExecutionsDetails) {
@@ -107,7 +130,9 @@ pub(super) fn draw_executions(f: &mut Frame<'_>, area: Rect, app: &App) {
         block
     };
 
-    if let Some(row) = selected {
+    if let Some(panel) = &app.reconcile {
+        draw_reconcile(f, body_layout[1], panel);
+    } else if let Some(row) = selected {
         let lines = build_execution_details(row, app);
         let height = body_layout[1].height.saturating_sub(2) as usize;
         let content_width = body_layout[1].width.saturating_sub(2) as usize;
@@ -512,7 +537,9 @@ fn append_mexc_leg_transactions(lines: &mut Vec<Line<'static>>, execution: &Venu
             lines.push(Line::from(format!("   {label}: {value}")));
         }
     }
-    if let Some(phase) = cex.get("deposit_bridge_submit_phase").filter(|phase| !phase.is_null()) {
+    if let Some(call) = cex.get("deposit_bridge_call").filter(|call| !call.is_null()) {
+        lines.push(Line::from(format!("   MEXC deposit bridge call: {}", describe_bridge_call(call))));
+    } else if let Some(phase) = cex.get("deposit_bridge_submit_phase").filter(|phase| !phase.is_null()) {
         lines.push(Line::from(format!(
             "   MEXC deposit bridge phase: {}",
             describe_bridge_submit_phase(phase)
@@ -520,12 +547,38 @@ fn append_mexc_leg_transactions(lines: &mut Vec<Line<'static>>, execution: &Venu
     }
 }
 
-/// One line an operator can act on. A wait needs nothing; an attempt names
-/// what to look for on the minter.
+/// One line an operator can act on: what to look for on the provider, and
+/// whether the call may have run.
+fn describe_bridge_call(record: &Value) -> String {
+    use crate::{
+        bridge::call_sender::saved_call,
+        outbound::driver::{OutboundPhase, OutboundRecord},
+    };
+    let Ok(record) = serde_json::from_value::<OutboundRecord>(record.clone()) else {
+        return truncate(&record.to_string(), 80);
+    };
+    let phase = match &record.phase {
+        OutboundPhase::Prepared => "saved, not sent".to_string(),
+        OutboundPhase::Submitted { .. } => "sent, waiting for the provider".to_string(),
+        OutboundPhase::Parked { reason } => format!("parked: {}", truncate(reason, 60)),
+    };
+    match saved_call(&record.prepared) {
+        Ok(call) => format!(
+            "{} {} -> {} cursor={} {phase}",
+            call.amount,
+            call.asset,
+            call.destination,
+            call.cursor.map_or("none".to_string(), |cursor| cursor.to_string()),
+        ),
+        Err(_) => phase,
+    }
+}
+
+/// Rows saved before the outbound driver, until the bridge step upgrades them.
 fn describe_bridge_submit_phase(phase: &Value) -> String {
-    match serde_json::from_value::<BridgeSubmitPhase>(phase.clone()) {
-        Ok(BridgeSubmitPhase::WaitingFunds) => "waiting for bridge funds".to_string(),
-        Ok(BridgeSubmitPhase::Submitting(attempt)) => format!(
+    match serde_json::from_value::<LegacyBridgeSubmitPhase>(phase.clone()) {
+        Ok(LegacyBridgeSubmitPhase::WaitingFunds) => "waiting for bridge funds".to_string(),
+        Ok(LegacyBridgeSubmitPhase::Submitting(attempt)) => format!(
             "attempt {} {} -> {} cursor={} called={}",
             attempt.amount,
             attempt.asset,

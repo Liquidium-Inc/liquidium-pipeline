@@ -26,6 +26,7 @@ impl DepositExpectation {
 
 /// Taken before the helper call, so the audit scan for this deposit starts
 /// where its events can first appear.
+#[derive(serde::Serialize, serde::Deserialize)]
 pub(super) struct PendingMintHandle {
     event_start: u64,
     expectation: DepositExpectation,
@@ -47,6 +48,15 @@ impl PendingMintHandle {
                 token_symbol: token_symbol.to_string(),
             },
         })
+    }
+
+    /// The saved form. It is kept with the signed send until the send lands.
+    pub(super) fn encode(&self) -> Result<String, String> {
+        serde_json::to_string(self).map_err(|e| format!("encode mint handle: {e}"))
+    }
+
+    pub(super) fn decode(handle: &str) -> Result<Self, String> {
+        serde_json::from_str(handle).map_err(|e| format!("decode mint handle: {e}"))
     }
 
     pub(super) fn bridge_id(self, tx_hash: TxHash) -> Result<String, String> {

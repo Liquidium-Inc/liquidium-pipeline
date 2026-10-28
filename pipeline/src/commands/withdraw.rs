@@ -844,6 +844,14 @@ fn resolve_icp_destination(config: &crate::config::Config, destination: &str) ->
     }
 }
 
+/// A native ICP destination given as a ledger account id, the form that
+/// exchanges use for ICP deposits. The checksum must match.
+fn native_icp_account_id(ledger: Principal, destination: &str) -> Option<String> {
+    let native_ledger = Principal::from_text(crate::utils::ICP_LEDGER_PRINCIPAL).ok()?;
+    let normalized = destination.trim().to_ascii_lowercase();
+    (ledger == native_ledger && ic_ledger_types::AccountIdentifier::from_hex(&normalized).is_ok()).then_some(normalized)
+}
+
 fn resolve_evm_destination(default_main_evm: &str, bridge_evm: &str, destination: &str) -> Result<String, String> {
     if destination.eq_ignore_ascii_case("main") {
         return Ok(default_main_evm.to_string());
@@ -1083,9 +1091,12 @@ pub async fn withdraw_noninteractive(source: &str, destination: &str, asset: &st
             .unwrap_or_else(|| "n/a".to_string());
 
         let destination_account = match &token {
-            ChainToken::Icp { .. } => {
-                ChainAccount::Icp(resolve_icp_destination(&config, destination).map_err(|err| anyhow!("{err}"))?)
-            }
+            ChainToken::Icp { ledger, .. } => match native_icp_account_id(*ledger, destination) {
+                Some(account_id) => ChainAccount::IcpLedger(account_id),
+                None => {
+                    ChainAccount::Icp(resolve_icp_destination(&config, destination).map_err(|err| anyhow!("{err}"))?)
+                }
+            },
             ChainToken::EvmNative { .. } | ChainToken::EvmErc20 { .. } => ChainAccount::Evm(
                 resolve_evm_destination(&ctx.evm_address, &config.bridge_evm_address, destination)
                     .map_err(|err| anyhow!("{err}"))?,
@@ -1348,4 +1359,21 @@ pub async fn withdraw_noninteractive(source: &str, destination: &str, asset: &st
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_a_checksummed_account_id_on_the_icp_ledger_is_a_ledger_destination() {
+        let icp = Principal::from_text(crate::utils::ICP_LEDGER_PRINCIPAL).unwrap();
+        let other = Principal::from_text("xevnm-gaaaa-aaaar-qafnq-cai").unwrap();
+        let id = "D26A53ADB4DE6404F3D4A7B7978D233A99AFF6DFD35B45C41AE1AAB4CA249B9F";
+        assert_eq!(native_icp_account_id(icp, id).as_deref(), Some(id.to_ascii_lowercase().as_str()));
+        assert_eq!(native_icp_account_id(other, id), None, "ICRC tokens need an Account");
+        let typo = "e26a53adb4de6404f3d4a7b7978d233a99aff6dfd35b45c41ae1aab4ca249b9f";
+        assert_eq!(native_icp_account_id(icp, typo), None, "a bad checksum must not pass");
+        assert_eq!(native_icp_account_id(icp, "main"), None);
+    }
 }

@@ -6,7 +6,7 @@ use liquidium_pipeline_core::account::model::ChainAccount;
 use liquidium_pipeline_core::tokens::chain_token::ChainToken;
 use liquidium_pipeline_core::transfer::actions::{TransferActions, TransferFailure};
 
-use crate::backend::SIDE_EFFECT_AMBIGUOUS_PREFIX;
+use liquidium_pipeline_core::outbound::SIDE_EFFECT_AMBIGUOUS_PREFIX;
 use crate::backend::solana_backend::SolanaBackend;
 
 pub struct SolanaTransferAdapter<B: SolanaBackend> {

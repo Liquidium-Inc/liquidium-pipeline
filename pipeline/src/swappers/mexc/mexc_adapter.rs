@@ -3,7 +3,7 @@ use std::env;
 
 use async_trait::async_trait;
 
-use liquidium_pipeline_connectors::backend::SIDE_EFFECT_AMBIGUOUS_PREFIX;
+use liquidium_pipeline_core::outbound::SIDE_EFFECT_AMBIGUOUS_PREFIX;
 use liquidium_pipeline_connectors::backend::cex_backend::{
     BuyOrderInputMode, CexBackend, CexBackendError, DepositAddress, OrderBook, OrderBookLevel, SwapExecutionOptions,
     SwapFillReport, WithdrawStatus, WithdrawStatusSnapshot, WithdrawalReceipt,
@@ -153,6 +153,17 @@ fn is_coin_missing(err: &v3::ApiError) -> bool {
     )
 }
 
+/// MEXC answers a history read for a coin it does not list with 700004,
+/// "mandatory parameter 'coin' ... malformed". Seen live on 2026-10-26.
+const MEXC_MALFORMED_PARAM_RAW_CODE: i32 = 700004;
+
+/// True when a history read of a coin alias failed because MEXC does not
+/// list that alias, so no withdrawal can exist under it.
+fn is_unlisted_alias(err: &v3::ApiError) -> bool {
+    is_coin_missing(err)
+        || matches!(err, v3::ApiError::ErrorResponse(resp) if resp.raw_code == MEXC_MALFORMED_PARAM_RAW_CODE)
+}
+
 /// True when MEXC refused the request before it acted on it. Transport
 /// errors, 5xx answers, unreadable replies and "processing" codes leave the
 /// outcome open, and MEXC documents 5xx as possibly executed.
@@ -175,17 +186,6 @@ fn is_definite_rejection(err: &v3::ApiError) -> bool {
         | v3::ApiError::SignQueryError(_) => true,
         _ => false,
     }
-}
-
-/// MEXC answers a history read for a coin it does not list with 700004,
-/// "mandatory parameter 'coin' ... malformed". Seen live on 2026-10-26.
-const MEXC_MALFORMED_PARAM_RAW_CODE: i32 = 700004;
-
-/// True when a history read of a coin alias failed because MEXC does not
-/// list that alias, so no withdrawal can exist under it.
-fn is_unlisted_alias(err: &v3::ApiError) -> bool {
-    is_coin_missing(err)
-        || matches!(err, v3::ApiError::ErrorResponse(resp) if resp.raw_code == MEXC_MALFORMED_PARAM_RAW_CODE)
 }
 
 fn is_order_missing_lookup_error(message: &str) -> bool {
@@ -363,7 +363,7 @@ use mexc_rs::spot::{
         enums::{OrderSide, OrderStatus},
         get_order::{GetOrderEndpoint, GetOrderParams},
         order::{OrderEndpoint, OrderParams},
-        withdraw::{WithdrawEndpoint, WithdrawHistoryRequest, WithdrawRequest},
+        withdraw::{WithdrawEndpoint, WithdrawHistoryRecord, WithdrawHistoryRequest, WithdrawRequest},
     },
 };
 
@@ -425,6 +425,43 @@ impl MexcClient {
             symbol_filters: tokio::sync::Mutex::new(HashMap::new()),
             http: reqwest::Client::new(),
         }
+    }
+
+    /// Finds a recent withdrawal by its MEXC id or by our order id.
+    pub async fn find_withdraw_record(
+        &self,
+        coin: &str,
+        withdraw_id: &str,
+    ) -> Result<Option<WithdrawHistoryRecord>, String> {
+        let ex = self.inner.lock().await;
+        // Older durable rows retain the planned symbol, not the alias MEXC
+        // accepted. Search the same candidates as submission, matching only the
+        // durable withdrawal ID; absence under one alias is not non-delivery.
+        for (index, candidate) in mexc_withdraw_coin_candidates(coin).into_iter().enumerate() {
+            let records = match ex
+                .withdraw_history(WithdrawHistoryRequest {
+                    coin: Some(candidate),
+                    status: None,
+                    limit: Some(DEFAULT_WITHDRAW_HISTORY_LIMIT),
+                    start_time: None,
+                    end_time: None,
+                })
+                .await
+            {
+                Ok(records) => records,
+                Err(error) if is_coin_missing(&error) => continue,
+                // The planned coin must answer, so only an alias may be skipped.
+                Err(error) if index > 0 && is_unlisted_alias(&error) => continue,
+                Err(error) => return Err(error.to_string()),
+            };
+            let found = records
+                .into_iter()
+                .find(|record| record.id == withdraw_id || record.withdraw_order_id.as_deref() == Some(withdraw_id));
+            if found.is_some() {
+                return Ok(found);
+            }
+        }
+        Ok(None)
     }
 
     pub fn from_env() -> Result<Self, String> {
@@ -1461,41 +1498,12 @@ impl CexBackend for MexcClient {
         coin: &str,
         withdraw_id: &str,
     ) -> Result<WithdrawStatusSnapshot, String> {
-        let ex = self.inner.lock().await;
-        let mut rec = None;
-        // Older durable rows retain the planned symbol, not the alias MEXC
-        // accepted. Search the same candidates as submission, matching only the
-        // durable withdrawal ID; absence under one alias is not non-delivery.
-        for (index, candidate) in mexc_withdraw_coin_candidates(coin).into_iter().enumerate() {
-            let records = match ex.withdraw_history(WithdrawHistoryRequest {
-                coin: Some(candidate),
-                status: None,
-                limit: Some(DEFAULT_WITHDRAW_HISTORY_LIMIT),
-                start_time: None,
-                end_time: None,
-            }).await {
-                Ok(records) => records,
-                Err(error) if is_coin_missing(&error) => continue,
-                // The planned coin must answer, so only an alias may be skipped.
-                Err(error) if index > 0 && is_unlisted_alias(&error) => continue,
-                Err(error) => return Err(error.to_string()),
-            };
-            rec = records.into_iter()
-                .find(|record| record.id == withdraw_id || record.withdraw_order_id.as_deref() == Some(withdraw_id));
-            if rec.is_some() {
-                break;
-            }
-        }
-
-        let rec = match rec {
-            Some(r) => r,
-            None => {
-                return Ok(WithdrawStatusSnapshot {
-                    status: WithdrawStatus::Unknown,
-                    txid: None,
-                    transaction_fee: None,
-                });
-            }
+        let Some(rec) = self.find_withdraw_record(coin, withdraw_id).await? else {
+            return Ok(WithdrawStatusSnapshot {
+                status: WithdrawStatus::Unknown,
+                txid: None,
+                transaction_fee: None,
+            });
         };
 
         let status =

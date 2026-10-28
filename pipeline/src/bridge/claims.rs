@@ -1,14 +1,18 @@
-//! Bridge handles and open attempts held by other liquidation rows. The bridge
+//! Bridge handles and open bridge calls held by other liquidation rows. The bridge
 //! account is shared, so a lost submission is attached only when no other row
 //! can own the same provider record.
 use std::collections::HashSet;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 use crate::{
-    finalizers::cex_finalizer::{BridgeSubmitAttempt, BridgeSubmitPhase},
+    bridge::{
+        call_sender::{self, OpenBridgeCall},
+        legacy::LegacyBridgeSubmitPhase,
+    },
+    outbound::driver::OutboundRecord,
     persistance::{LiqResultRecord, ResultStatus, WalStore},
 };
 
@@ -16,19 +20,45 @@ use crate::{
 pub struct BridgeClaims {
     /// Every bridge handle another row holds, on either leg side.
     pub bridge_ids: Vec<String>,
-    /// Attempts other rows persisted and have not resolved.
-    pub open_attempts: Vec<BridgeSubmitAttempt>,
+    /// Bridge calls that rows saved and have not resolved.
+    pub open_calls: Vec<OpenBridgeCall>,
+    /// Deposit sends that rows started and the provider has not minted.
+    pub open_deposit_sends: Vec<OpenDepositSend>,
+}
+
+/// A send to a provider deposit address whose mint has not arrived. The
+/// address is shared, so a second send would merge with this deposit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenDepositSend {
+    pub liq_id: String,
+    pub asset: String,
+    pub network: String,
+}
+
+/// Reads an open deposit send from a saved leg state.
+fn open_deposit_send(fields: &Map<String, Value>) -> Option<OpenDepositSend> {
+    let present = |key: &str| fields.get(key).is_some_and(|value| !value.is_null());
+    let started = present("withdraw_bridge_funding") || present("withdraw_bridge_funding_txid");
+    if !started || present("withdraw_bridge_mint_receipt") {
+        return None;
+    }
+    let text = |key: &str| fields.get(key).and_then(Value::as_str).unwrap_or_default().to_string();
+    Some(OpenDepositSend {
+        liq_id: text("liq_id"),
+        asset: text("withdraw_planned_asset"),
+        network: text("withdraw_planned_network"),
+    })
 }
 
 #[cfg_attr(test, mockall::automock)]
 #[async_trait]
 pub trait BridgeClaimLookup: Send + Sync {
     /// Claims of every row that is still open, plus rows written since
-    /// `since_ts`. The caller's own attempt is in the result; it filters it by id.
+    /// `since_ts`. The caller's own call is in the result; it filters it by id.
     async fn claims_since(&self, since_ts: i64) -> Result<BridgeClaims, String>;
 }
 
-/// Rows in these statuses may still hold an unresolved attempt however old they are.
+/// Rows in these statuses may still hold an unresolved call however old they are.
 const OPEN_STATUSES: [ResultStatus; 7] = [
     ResultStatus::Enqueued,
     ResultStatus::InFlight,
@@ -65,17 +95,37 @@ impl WalBridgeClaims {
     }
 }
 
+fn open_bridge_call(value: &Value) -> Option<OpenBridgeCall> {
+    let record = serde_json::from_value::<OutboundRecord>(value.clone()).ok()?;
+    if record.prepared.sender != call_sender::NAME {
+        return None;
+    }
+    let call = call_sender::saved_call(&record.prepared).ok()?;
+    Some(OpenBridgeCall {
+        id: record.prepared.identity,
+        call,
+    })
+}
+
 fn visit(value: &Value, claims: &mut BridgeClaims) {
     match value {
         Value::Object(fields) => {
+            if let Some(send) = open_deposit_send(fields) {
+                claims.open_deposit_sends.push(send);
+            }
             for (key, child) in fields {
                 if key.ends_with("_bridge_id") {
                     if let Some(id) = child.as_str() {
                         claims.bridge_ids.push(id.to_string());
                     }
+                } else if key == "deposit_bridge_call" {
+                    if let Some(call) = open_bridge_call(child) {
+                        claims.open_calls.push(call);
+                    }
                 } else if key == "deposit_bridge_submit_phase" {
-                    if let Ok(BridgeSubmitPhase::Submitting(attempt)) = serde_json::from_value(child.clone()) {
-                        claims.open_attempts.push(attempt);
+                    // Rows saved before the outbound driver keep blocking.
+                    if let Ok(LegacyBridgeSubmitPhase::Submitting(attempt)) = serde_json::from_value(child.clone()) {
+                        claims.open_calls.push(attempt.open_call());
                     }
                 } else {
                     visit(child, claims);
@@ -153,7 +203,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn claims_cover_both_leg_sides_legacy_bytes_and_open_attempts_once_per_row() {
+    async fn claims_cover_both_leg_sides_legacy_bytes_and_journal_attempts_once_per_row() {
         let own = row(
             "1720",
             r#"{"venue_execution":{"state":{"deposit_bridge_id":"ic-withdraw:1:2"}}}"#,
@@ -195,10 +245,78 @@ mod tests {
             claims.bridge_ids,
             vec!["ic-withdraw:1:2", "ic-withdraw:3:4", "0xdead", "ic-withdraw-eth:9"]
         );
-        assert_eq!(claims.open_attempts.len(), 1);
-        assert_eq!(claims.open_attempts[0].id, "a1");
-        assert_eq!(claims.open_attempts[0].amount, 1.5);
-        assert_eq!(claims.open_attempts[0].cursor, Some(100));
+        assert_eq!(claims.open_calls.len(), 1);
+        assert_eq!(claims.open_calls[0].id, "a1");
+        assert_eq!(claims.open_calls[0].call.amount, 1.5);
+        assert_eq!(claims.open_calls[0].call.cursor, Some(100));
+    }
+
+    #[tokio::test]
+    async fn claims_list_saved_bridge_calls_as_open_calls() {
+        use crate::bridge::call_sender::{BridgeCall, prepare_bridge_call};
+        let call = BridgeCall {
+            asset: "ckUSDC".into(),
+            source_chain: "ICP".into(),
+            source_address: "owner".into(),
+            target_asset: "USDC".into(),
+            destination: "0xabc".into(),
+            amount: 2.5,
+            provider_fee_budget_native_units: None,
+            cursor: Some(7),
+            started_at_ts: 5,
+        };
+        let record = OutboundRecord::prepared(prepare_bridge_call("call-1".into(), &call).unwrap());
+        let other_sender = OutboundRecord::prepared(liquidium_pipeline_core::outbound::PreparedSend {
+            sender: "icp".into(),
+            identity: "funding".into(),
+            payload: "{}".into(),
+            replay_safe: true,
+        });
+        let meta = serde_json::json!({
+            "meta_v2": {"legs": [
+                {"execution": {"state": {"deposit_bridge_call": record}}},
+                {"execution": {"state": {"deposit_bridge_call": other_sender}}},
+            ]}
+        });
+        let rows = vec![row("1", &meta.to_string())];
+        let mut wal = MockWalStore::new();
+        wal.expect_list_by_status().returning(move |status, _| {
+            Ok(if status == ResultStatus::InFlight { rows.clone() } else { vec![] })
+        });
+        wal.expect_list_updated_since().returning(|_, _| Ok(vec![]));
+
+        let claims = WalBridgeClaims::new(Arc::new(wal)).claims_since(0).await.unwrap();
+
+        assert_eq!(claims.open_calls.len(), 1, "only bridge calls count");
+        assert_eq!(claims.open_calls[0].id, "call-1");
+        assert_eq!(claims.open_calls[0].call, call);
+    }
+
+    #[tokio::test]
+    async fn claims_list_deposit_sends_until_their_mint_arrives() {
+        let leg = |liq_id: &str, fields: &str| {
+            format!(
+                r#"{{"meta_v2":{{"legs":[{{"execution":{{"state":{{"liq_id":"{liq_id}","withdraw_planned_asset":"SOL","withdraw_planned_network":"SOL",{fields}}}}}}}]}}}}"#
+            )
+        };
+        let rows = vec![
+            row("1", &leg("saved", r#""withdraw_bridge_funding":{"phase":"Prepared"}"#)),
+            row("2", &leg("landed", r#""withdraw_bridge_funding_txid":"sig","withdraw_bridge_mint_receipt":null"#)),
+            row("3", &leg("minted", r#""withdraw_bridge_funding_txid":"sig","withdraw_bridge_mint_receipt":{"amount":1}"#)),
+            row("4", &leg("none", r#""withdraw_bridge_funding":null,"withdraw_bridge_funding_txid":null"#)),
+        ];
+        let mut wal = MockWalStore::new();
+        wal.expect_list_by_status().returning(move |status, _| {
+            Ok(if status == ResultStatus::InFlight { rows.clone() } else { vec![] })
+        });
+        wal.expect_list_updated_since().returning(|_, _| Ok(vec![]));
+
+        let claims = WalBridgeClaims::new(Arc::new(wal)).claims_since(0).await.unwrap();
+
+        let open: Vec<&str> = claims.open_deposit_sends.iter().map(|send| send.liq_id.as_str()).collect();
+        assert_eq!(open, vec!["saved", "landed"]);
+        assert_eq!(claims.open_deposit_sends[0].asset, "SOL");
+        assert_eq!(claims.open_deposit_sends[0].network, "SOL");
     }
 
     #[tokio::test]

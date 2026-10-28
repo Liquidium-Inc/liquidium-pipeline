@@ -38,6 +38,8 @@ use crate::swappers::icpswap::{
     client::IcpswapClient, session::IcpswapAgentSessionFactory, types::IcpswapTokenMetadata, venue::IcpswapVenue,
 };
 use crate::watchdog::{balance_monitor::DEFAULT_LOW_BALANCE_ALERT_COOLDOWN, slack_watchdog_from_env};
+use liquidium_pipeline_connectors::outbound::{IcpSender, OutboundRouter, SolanaSender, UnsettledSender};
+use liquidium_pipeline_core::outbound::OutboundSender;
 
 pub struct PipelineContext {
     pub config: Arc<Config>,
@@ -49,6 +51,8 @@ pub struct PipelineContext {
     pub agent: Arc<Agent>,
     pub main_transfers: Arc<TransferService>,
     pub trader_transfers: Arc<TransferService>,
+    /// Sends from the trader account that are saved before they run.
+    pub trader_outbound: Arc<dyn OutboundSender>,
     pub icpswap_finalizer: Option<Arc<IcpswapFinalizer>>,
     pub recovery_transfers: Arc<TransferService>,
     pub bridge_transfers: Arc<TransferService>,
@@ -284,6 +288,11 @@ impl<P: Provider<AnyNetwork> + WalletProvider<AnyNetwork> + Clone + 'static> Pip
             evm_transfer_trader,
             solana_transfer_trader,
         ));
+        let trader_outbound: Arc<dyn OutboundSender> = Arc::new(OutboundRouter {
+            icp: Arc::new(IcpSender::new(icp_backend_trader.clone(), trader_icp_account)),
+            solana: Arc::new(SolanaSender::new(solana_backend_trader.clone())),
+            fallback: Arc::new(UnsettledSender::new(transfer_router_trader.clone())),
+        });
         let trader_transfers = TransferService::new(registry.clone(), transfer_router_trader);
 
         let icp_transfer_recovery = Arc::new(IcpTransferAdapter::new(
@@ -373,6 +382,7 @@ impl<P: Provider<AnyNetwork> + WalletProvider<AnyNetwork> + Clone + 'static> Pip
             bridge_service: Arc::new(bridge_service),
             main_transfers: Arc::new(main_transfers),
             trader_transfers: Arc::new(trader_transfers),
+            trader_outbound,
             recovery_transfers: Arc::new(recovery_transfers),
             bridge_transfers: Arc::new(bridge_transfers),
             evm_address,

@@ -11,9 +11,10 @@ pub use ckerc20_bridge::{
     BRIDGE_AMOUNT_BELOW_MINIMUM_PREFIX, BRIDGE_SUBMISSION_DEFERRED_PREFIX, BridgeEvmBackend, CkErc20BridgeBackend,
     FINALIZER_PERMANENT_AMOUNT_FLOOR_PREFIX,
 };
-pub use solana_bridge::{DEFAULT_SOLANA_BRIDGE_FEE_BUFFER_LAMPORTS, SolanaBridgeBackend};
+pub use solana_bridge::{DEFAULT_SOLANA_BRIDGE_FEE_BUFFER_LAMPORTS, SolanaBridgeBackend, cksol_transfer_without_deposit_id};
 pub use types::{
     BridgeBackend, BridgeDestination, BridgeDestinationKind, BridgeFeeBudget, BridgeMintReceipt, BridgeRequest,
+    BridgeSend, DepositNotice,
     BridgeRouteKind, BridgeRouteSpec, BridgeStatus, BridgeSubmission, BridgeSubmissionCandidate, BridgeSweepRoute,
     EvmReceiptStatus, MockBridgeBackend,
 };

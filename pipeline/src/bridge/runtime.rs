@@ -21,9 +21,11 @@ use liquidium_pipeline_connectors::backend::{
     icp_backend::IcpBackendImpl,
     solana_backend::SolanaBackendImpl,
 };
+use liquidium_pipeline_connectors::outbound::{EvmSender, SignedSendRouter, SolanaSender};
+use liquidium_pipeline_core::outbound::OutboundSender;
 use solana_sdk::{signature::Keypair, signer::Signer};
 
-use crate::{config::Config, finalizers::bridge_claims::BridgeClaimLookup};
+use crate::{config::Config, bridge::claims::BridgeClaimLookup};
 
 /// The account the bridge spends from on each chain.
 #[derive(Debug, Clone)]
@@ -50,6 +52,8 @@ pub struct BridgeRuntime {
     pub backend: Arc<dyn BridgeBackend>,
     pub sources: BridgeSourceAccounts,
     pub claims: Arc<dyn BridgeClaimLookup>,
+    /// Sends what the bridge backends sign from the bridge source accounts.
+    pub outbound: Arc<dyn OutboundSender>,
 }
 
 impl BridgeRuntime {
@@ -101,24 +105,26 @@ impl BridgeRuntime {
                 .build()
                 .map_err(|e| format!("ic agent(bridge runtime) build: {e}"))?,
         );
+        let bridge_evm_wallet = Arc::new(EvmBackendImpl::new(bridge_provider));
         let bridge_backend = Arc::new(CkErc20BridgeBackend::new(
             bridge_agent.clone(),
             Arc::new(IcpBackendImpl::new(bridge_agent.clone())),
-            Arc::new(EvmBackendImpl::new(bridge_provider)),
+            bridge_evm_wallet.clone(),
             config.bridge_cketh_minter_canister,
             config.bridge_ic_owner_principal,
         ));
         let bridge_solana_address = Keypair::new_from_array(config.bridge_solana_private_key_bytes)
             .pubkey()
             .to_string();
+        let bridge_solana_wallet = Arc::new(SolanaBackendImpl::from_url_and_secret_key(
+            config.solana_rpc_url.clone(),
+            config.bridge_solana_private_key_bytes,
+        ));
         let solana_backend = Arc::new(
             SolanaBridgeBackend::new(
                 bridge_agent.clone(),
                 Arc::new(IcpBackendImpl::new(bridge_agent)),
-                Arc::new(SolanaBackendImpl::from_url_and_secret_key(
-                    config.solana_rpc_url.clone(),
-                    config.bridge_solana_private_key_bytes,
-                )),
+                bridge_solana_wallet.clone(),
                 config.bridge_cksol_minter_canister,
                 config.bridge_cksol_ledger_canister,
                 config.bridge_ic_owner_principal,
@@ -140,6 +146,10 @@ impl BridgeRuntime {
                 solana: bridge_solana_address,
             },
             claims,
+            outbound: Arc::new(SignedSendRouter {
+                solana: Arc::new(SolanaSender::new(bridge_solana_wallet)),
+                evm: Arc::new(EvmSender::new(bridge_evm_wallet)),
+            }),
         }))
     }
 
@@ -159,8 +169,15 @@ impl BridgeRuntime {
                 btc: "bc1qbridge000000000000000000000000000000000".to_string(),
                 solana: "So11111111111111111111111111111111111111112".to_string(),
             },
-            claims: Arc::new(crate::finalizers::bridge_claims::MockBridgeClaimLookup::new()),
+            claims: Arc::new(crate::bridge::claims::MockBridgeClaimLookup::new()),
+            outbound: Arc::new(liquidium_pipeline_core::outbound::MockOutboundSender::new()),
         }
+    }
+
+    #[cfg(test)]
+    pub fn with_outbound(mut self, outbound: Arc<dyn OutboundSender>) -> Self {
+        self.outbound = outbound;
+        self
     }
 
     #[cfg(test)]
