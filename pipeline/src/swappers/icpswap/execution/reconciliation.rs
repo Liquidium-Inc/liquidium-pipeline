@@ -6,12 +6,13 @@ use tracing::info;
 
 use crate::swappers::icpswap::{
     client::IcpswapManualClient,
+    manual::{pool_user_account, saved_deposit_account},
     state::{
         MAX_MANUAL_SLIPPAGE_STEPS, MAX_MANUAL_TRADE_RETRIES, MIN_UNCHANGED_TRADE_OBSERVATIONS,
         PENDING_TRADE_RECONCILIATION_TIMEOUT_NANOS, retry_backoff_nanos,
     },
     transfer_state::{IcpswapLedgerTransferState, IcpswapSettlementKind},
-    types::{IcpswapError, IcpswapExecutionPlan, IcpswapState, IcpswapStep, IcpswapUnusedBalance},
+    types::{IcpswapClientError, IcpswapError, IcpswapOperatorAnswer, IcpswapState, IcpswapStep, IcpswapTransferState},
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -61,11 +62,10 @@ pub(crate) async fn observe_deposit(client: &dyn IcpswapManualClient, state: &Ic
         .input_pool_balance_before
         .clone()
         .ok_or_else(|| "manual deposit is missing its input-pool baseline".to_string())?;
-    let unused = client
-        .unused_balance(state.plan.pool, state.owner.owner)
+    let current = pool_balances(client, state)
         .await
-        .map_err(|error| error.to_string())?;
-    let current = input_balance(&state.plan, &unused);
+        .map_err(|error| error.to_string())?
+        .input;
     let required = before.clone() + state.plan.amount_in.value.clone();
     let confirmed = current >= required;
     info!(
@@ -116,12 +116,10 @@ pub(crate) async fn observe_trade(
         .output_pool_balance_before
         .clone()
         .ok_or_else(|| "manual swap is missing its output-pool baseline".to_string())?;
-    let unused = client
-        .unused_balance(state.plan.pool, state.owner.owner)
-        .await
-        .map_err(|error| error.to_string())?;
-    let input_now = input_balance(&state.plan, &unused);
-    let output_now = output_balance(&state.plan, &unused);
+    let PoolBalances {
+        input: input_now,
+        output: output_now,
+    } = pool_balances(client, state).await.map_err(|error| error.to_string())?;
     if input_now == input_before && output_now == output_before {
         return Ok(TradeObservation::Unchanged);
     }
@@ -262,12 +260,12 @@ pub(crate) async fn observe_output_withdrawal(
         .wallet_balance_before
         .as_ref()
         .ok_or_else(|| "manual output withdrawal is missing its wallet baseline".to_string())?;
-    let (unused, wallet_now) = tokio::try_join!(
-        client.unused_balance(state.plan.pool, state.owner.owner),
+    let (pool, wallet_now) = tokio::try_join!(
+        pool_balances(client, state),
         client.ledger_balance(state.plan.token_out, &state.owner),
     )
     .map_err(|error| error.to_string())?;
-    let pool_now = output_balance(&state.plan, &unused);
+    let pool_now = pool.output;
     let expected_credit = nat_saturating_sub(&args.amount, &args.fee);
     let wallet_delta = nat_saturating_sub(&wallet_now, wallet_before);
     if pool_now <= nat_saturating_sub(pool_before, &args.amount) && wallet_delta >= expected_credit {
@@ -310,12 +308,12 @@ pub(crate) async fn observe_recovery(
         .wallet_balance_before
         .as_ref()
         .ok_or_else(|| "manual recovery is missing its wallet baseline".to_string())?;
-    let (unused, wallet_now) = tokio::try_join!(
-        client.unused_balance(state.plan.pool, state.owner.owner),
+    let (pool, wallet_now) = tokio::try_join!(
+        pool_balances(client, state),
         client.ledger_balance(state.plan.token_in, &state.owner),
     )
     .map_err(|error| error.to_string())?;
-    let pool_now = input_balance(&state.plan, &unused);
+    let pool_now = pool.input;
     let expected_credit = nat_saturating_sub(&args.amount, &args.fee);
     let wallet_delta = nat_saturating_sub(&wallet_now, wallet_before);
     if pool_now <= nat_saturating_sub(pool_before, &args.amount) && wallet_delta >= expected_credit {
@@ -340,14 +338,25 @@ pub(crate) fn complete_recovery(state: &mut IcpswapState, wallet_credit: Nat) {
     state.last_error = None;
 }
 
+/// Checks a parked leg again, then applies the operator's answer if the check
+/// proves nothing. An answer counts for one check, so a refused one needs a new release.
 pub(crate) async fn reconcile_operator_required(
     client: &dyn IcpswapManualClient,
     state: &mut IcpswapState,
 ) -> Result<(), String> {
+    let answer = state.operator_answer.take();
+    let absent = answer == Some(IcpswapOperatorAnswer::Absent);
     match state.operator_pending_step {
+        Some(IcpswapStep::TransferPending) => {
+            if let Some(answer) = answer {
+                answer_parked_transfer(client, state, answer).await?;
+            }
+        }
         Some(IcpswapStep::DepositPending) => {
             if observe_deposit(client, state).await? {
                 complete_deposit(state);
+            } else if absent {
+                redo_parked_deposit(client, state).await?;
             }
         }
         Some(IcpswapStep::TradePending) => match observe_trade(client, state).await? {
@@ -355,19 +364,208 @@ pub(crate) async fn reconcile_operator_required(
             TradeObservation::Unchanged if deposited_input_is_below_plan(state) => {
                 recover_after_insufficient_deposit(state);
             }
-            TradeObservation::Unchanged | TradeObservation::Inconsistent => {}
+            observation => {
+                if let Some(answer) = answer {
+                    answer_parked_trade(client, state, observation, answer).await?;
+                }
+            }
         },
         Some(IcpswapStep::WithdrawPending) => {
             if let Some(wallet_credit) = observe_output_withdrawal(client, state).await? {
                 complete_output_withdrawal(state, wallet_credit);
+            } else if absent {
+                redo_parked_withdrawal(client, state, false).await?;
             }
         }
         Some(IcpswapStep::RecoverPending) => {
             if let Some(wallet_credit) = observe_recovery(client, state).await? {
                 complete_recovery(state, wallet_credit);
+            } else if absent {
+                redo_parked_withdrawal(client, state, true).await?;
             }
         }
+        Some(IcpswapStep::Forward) if absent => {
+            // The balance is below one ledger fee, so forwarding it costs more than it is worth.
+            let reason = state.last_error.take().unwrap_or_default();
+            leave_park(
+                state,
+                IcpswapStep::Failed,
+                "balance below the forwarding fee written off",
+            );
+            state.last_error = Some(format!("written off by an operator: {reason}"));
+        }
         _ => {}
+    }
+    Ok(())
+}
+
+/// Moves a parked leg on after the balances agreed with the operator's answer.
+fn leave_park(state: &mut IcpswapState, step: IcpswapStep, action: &str) {
+    info!(
+        event = "icpswap_operator_answer_used",
+        execution_id = %state.execution_id,
+        parked_step = ?state.operator_pending_step,
+        next_step = ?step,
+        action,
+        "Operator answer moved a parked ICPSwap leg"
+    );
+    state.step = step;
+    state.operator_pending_step = None;
+    state.next_attempt_at_nanos = None;
+    state.last_error = None;
+}
+
+/// Keeps the leg parked and records why the balances contradict the answer.
+fn refuse_answer(state: &mut IcpswapState, reason: String) {
+    state.last_error = Some(format!("operator answer refused: {reason}"));
+}
+
+async fn answer_parked_transfer(
+    client: &dyn IcpswapManualClient,
+    state: &mut IcpswapState,
+    answer: IcpswapOperatorAnswer,
+) -> Result<(), String> {
+    let fee = state.plan.input_ledger_fee.value.clone();
+    let (deposit_account, amount) = match &state.transfer.args {
+        Some(args) => (args.to, args.amount.clone()),
+        None => (
+            pool_user_account(state.plan.pool, state.owner.owner),
+            state.plan.input_with_fee(),
+        ),
+    };
+    let (deposited, wallet) = tokio::try_join!(
+        client.ledger_balance(state.plan.token_in, &deposit_account),
+        client.ledger_balance(state.plan.token_in, &state.owner),
+    )
+    .map_err(|error| error.to_string())?;
+    match answer {
+        IcpswapOperatorAnswer::TransferLanded { block_index } => {
+            if state.transfer.args.is_none() {
+                refuse_answer(
+                    state,
+                    "the saved transfer is missing, so the deposit has no saved account".to_string(),
+                );
+            } else if deposited < amount {
+                refuse_answer(
+                    state,
+                    format!("the pool deposit account holds {deposited}, below the transfer {amount}"),
+                );
+            } else {
+                state.transfer.block_index = Some(block_index);
+                leave_park(state, IcpswapStep::Deposit, "input transfer landed");
+            }
+        }
+        IcpswapOperatorAnswer::Absent => {
+            // The leg account holds only this leg's input, so a new transfer can move it once.
+            let needed = amount.clone() + fee;
+            if deposited >= amount {
+                refuse_answer(state, format!("the pool deposit account already holds {deposited}"));
+            } else if wallet < needed {
+                refuse_answer(
+                    state,
+                    format!("the leg account holds {wallet}, below the {needed} a new transfer needs"),
+                );
+            } else {
+                state.transfer = IcpswapTransferState::default();
+                leave_park(
+                    state,
+                    IcpswapStep::Transfer,
+                    "input transfer absent; a new transfer follows",
+                );
+            }
+        }
+        IcpswapOperatorAnswer::SwapLanded { .. } => {
+            refuse_answer(state, "a swap output does not answer a parked transfer".to_string());
+        }
+    }
+    Ok(())
+}
+
+async fn redo_parked_deposit(client: &dyn IcpswapManualClient, state: &mut IcpswapState) -> Result<(), String> {
+    let deposit_account = saved_deposit_account(state)?;
+    let amount = state.plan.input_with_fee();
+    let held = client
+        .ledger_balance(state.plan.token_in, &deposit_account)
+        .await
+        .map_err(|error| error.to_string())?;
+    if held < amount {
+        refuse_answer(
+            state,
+            format!("the pool deposit account holds {held}, below the deposit {amount}, so the pool may have taken it"),
+        );
+    } else {
+        leave_park(state, IcpswapStep::Deposit, "deposit absent; the deposit runs again");
+    }
+    Ok(())
+}
+
+async fn answer_parked_trade(
+    client: &dyn IcpswapManualClient,
+    state: &mut IcpswapState,
+    observation: TradeObservation,
+    answer: IcpswapOperatorAnswer,
+) -> Result<(), String> {
+    match answer {
+        IcpswapOperatorAnswer::Absent if observation == TradeObservation::Unchanged => {
+            // No second swap: the price has moved since the plan.
+            state.trade.pending_since_nanos = None;
+            leave_park(state, IcpswapStep::Recover, "swap absent; the input comes back");
+        }
+        IcpswapOperatorAnswer::Absent => {
+            refuse_answer(
+                state,
+                "the pool balances moved since the swap, so it may have run".to_string(),
+            );
+        }
+        IcpswapOperatorAnswer::SwapLanded { output } => {
+            let before = state
+                .trade
+                .output_pool_balance_before
+                .clone()
+                .ok_or_else(|| "manual swap is missing its output-pool baseline".to_string())?;
+            let pool = pool_balances(client, state).await.map_err(|error| error.to_string())?;
+            let produced = nat_saturating_sub(&pool.output, &before);
+            if produced < output {
+                refuse_answer(
+                    state,
+                    format!("the pool holds {produced} new output, below the answered {output}"),
+                );
+            } else {
+                state.trade.gross_output_amount = Some(output);
+                leave_park(state, IcpswapStep::Withdraw, "swap landed");
+            }
+        }
+        IcpswapOperatorAnswer::TransferLanded { .. } => {
+            refuse_answer(state, "a transfer block does not answer a parked swap".to_string());
+        }
+    }
+    Ok(())
+}
+
+/// A second withdrawal cannot take more than the pool holds for this leg, so
+/// it runs again only while the pool still holds the first one's amount.
+async fn redo_parked_withdrawal(
+    client: &dyn IcpswapManualClient,
+    state: &mut IcpswapState,
+    recovery: bool,
+) -> Result<(), String> {
+    let (args, next) = if recovery {
+        (state.recovery.withdraw_args.as_ref(), IcpswapStep::Recover)
+    } else {
+        (state.withdraw.withdraw_args.as_ref(), IcpswapStep::Withdraw)
+    };
+    let amount = args
+        .map(|args| args.amount.clone())
+        .ok_or_else(|| "parked ICPSwap withdrawal is missing its arguments".to_string())?;
+    let pool = pool_balances(client, state).await.map_err(|error| error.to_string())?;
+    let held = if recovery { pool.input } else { pool.output };
+    if held < amount {
+        refuse_answer(
+            state,
+            format!("the pool holds {held}, below the withdrawal {amount}, so it may have run"),
+        );
+    } else {
+        leave_park(state, next, "withdrawal absent; the withdrawal runs again");
     }
     Ok(())
 }
@@ -406,20 +604,23 @@ pub(crate) fn require_operator(state: &mut IcpswapState, pending: IcpswapStep, m
     state.last_error = Some(message);
 }
 
-pub(crate) fn input_balance(plan: &IcpswapExecutionPlan, unused: &IcpswapUnusedBalance) -> Nat {
-    if plan.zero_for_one {
-        unused.balance0.clone()
-    } else {
-        unused.balance1.clone()
-    }
+/// This leg's unused balances in the pool, named by the swap direction.
+pub(crate) struct PoolBalances {
+    pub(crate) input: Nat,
+    pub(crate) output: Nat,
 }
 
-pub(crate) fn output_balance(plan: &IcpswapExecutionPlan, unused: &IcpswapUnusedBalance) -> Nat {
-    if plan.zero_for_one {
-        unused.balance1.clone()
+pub(crate) async fn pool_balances(
+    client: &dyn IcpswapManualClient,
+    state: &IcpswapState,
+) -> Result<PoolBalances, IcpswapClientError> {
+    let unused = client.unused_balance(state.plan.pool, state.owner.owner).await?;
+    let (input, output) = if state.plan.zero_for_one {
+        (unused.balance0, unused.balance1)
     } else {
-        unused.balance0.clone()
-    }
+        (unused.balance1, unused.balance0)
+    };
+    Ok(PoolBalances { input, output })
 }
 
 /// `candid::Nat` has no saturating subtraction and panics on underflow, so the

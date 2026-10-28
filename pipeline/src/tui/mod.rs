@@ -352,19 +352,7 @@ pub async fn run(opts: TuiOptions) -> anyhow::Result<()> {
                 }
                 app.withdraw.last_result = Some(res);
             }
-            UiEvent::Deposit(res) => {
-                app.deposit.in_flight = false;
-                app.deposit.at = Some(Local::now());
-                match &res {
-                    Ok(v) => {
-                        app.push_log(format!("deposit: {} {} -> {}", v.asset, v.network, v.address));
-                    }
-                    Err(e) => {
-                        app.push_log(format!("deposit: failed ({})", e));
-                    }
-                }
-                app.deposit.last = Some(res);
-            }
+            UiEvent::Deposit { request, result } => withdraw::apply_deposit_reply(&mut app, request, result),
             UiEvent::Input(key) => {
                 if input::handle_key(&mut app, key, sock_path.as_path(), &log_control, &ui_tx, &ctx).await? {
                     break;

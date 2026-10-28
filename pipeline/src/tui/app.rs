@@ -7,6 +7,7 @@ use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use super::log_sanitize::sanitize_log_line;
 use super::log_source::LOG_BUFFER_MAX;
 use crate::commands::liquidation_loop::LoopControl;
+pub(super) use crate::commands::withdrawal::{WithdrawDestination, WithdrawSource};
 use crate::finalizers::liquidation_outcome::LiquidationOutcome;
 use crate::persistance::ResultStatus;
 use liquidium_pipeline_connectors::backend::cex_backend::DepositAddress;
@@ -174,23 +175,6 @@ pub(super) struct WalSnapshot {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum WithdrawAccountKind {
-    Main,
-    Trader,
-    Recovery,
-    Bridge,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum WithdrawDestinationKind {
-    Main,
-    Trader,
-    Recovery,
-    Bridge,
-    Manual,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum WithdrawField {
     Source,
     Destination,
@@ -202,8 +186,8 @@ pub(super) enum WithdrawField {
 
 pub(super) struct WithdrawState {
     pub(super) field: WithdrawField,
-    pub(super) source: WithdrawAccountKind,
-    pub(super) destination: WithdrawDestinationKind,
+    pub(super) source: WithdrawSource,
+    pub(super) destination: WithdrawDestination,
     pub(super) manual_destination: String,
     pub(super) asset_idx: usize,
     pub(super) amount: String,
@@ -218,8 +202,8 @@ impl WithdrawState {
     fn new() -> Self {
         Self {
             field: WithdrawField::Source,
-            source: WithdrawAccountKind::Recovery,
-            destination: WithdrawDestinationKind::Main,
+            source: WithdrawSource::Recovery,
+            destination: WithdrawDestination::Main,
             manual_destination: String::new(),
             asset_idx: 0,
             amount: "all".to_string(),
@@ -248,6 +232,8 @@ pub(super) enum UiFocus {
 
 #[derive(Default)]
 pub(super) struct DepositState {
+    /// The id of the newest lookup. A reply to an older one is stale.
+    pub(super) request: u64,
     pub(super) in_flight: bool,
     pub(super) asset: Option<AssetId>,
     pub(super) network: Option<String>,
@@ -505,37 +491,43 @@ impl App {
     }
 }
 
+/// An `App` with a fixed config, for tests.
+#[cfg(test)]
+pub(super) fn test_app() -> App {
+    let config = ConfigSummary {
+        ic_url: "https://ic0.app".to_string(),
+        lending_canister: "nja4y-2yaaa-aaaae-qddxa-cai".to_string(),
+        icpswap_factory: "4mmnk-kiaaa-aaaag-qbllq-cai".to_string(),
+        liquidator_principal: "aaaaa-aa".to_string(),
+        trader_principal: "bbbbb-bb".to_string(),
+        evm_address: "0x0".to_string(),
+        solana_address: "So11111111111111111111111111111111111111112".to_string(),
+        bridge_evm_address: "0xbridge".to_string(),
+        bridge_solana_address: "So11111111111111111111111111111111111111112".to_string(),
+        bridge_ic_owner_principal: "ccccc-cc".to_string(),
+        bridge_btc_address: "bc1qbridge".to_string(),
+        enabled_swap_venues: "icpswap,mexc".to_string(),
+        max_dex_slippage_bps: 500,
+        max_cex_slippage_bps: 200,
+        bad_debt_collateral_slippage_bps: 500,
+        buy_bad_debt: false,
+        opportunity_filter: vec![],
+        control_socket: "/tmp/liquidator/ctl.sock".to_string(),
+        log_source: "Log source file: /tmp/liquidator/liquidator.log".to_string(),
+        db_path: "./wal.db".to_string(),
+        export_path: "executions.csv".to_string(),
+    };
+    App::new(vec![], config)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{App, ConfigSummary, WalCounts};
-    use crate::persistance::ResultStatus;
-    use std::collections::HashMap;
+    use liquidium_pipeline_connectors::backend::cex_backend::DepositAddress;
 
-    fn sample_config() -> ConfigSummary {
-        ConfigSummary {
-            ic_url: "https://ic0.app".to_string(),
-            lending_canister: "nja4y-2yaaa-aaaae-qddxa-cai".to_string(),
-            icpswap_factory: "4mmnk-kiaaa-aaaag-qbllq-cai".to_string(),
-            liquidator_principal: "aaaaa-aa".to_string(),
-            trader_principal: "bbbbb-bb".to_string(),
-            evm_address: "0x0".to_string(),
-            solana_address: "So11111111111111111111111111111111111111112".to_string(),
-            bridge_evm_address: "0xbridge".to_string(),
-            bridge_solana_address: "So11111111111111111111111111111111111111112".to_string(),
-            bridge_ic_owner_principal: "ccccc-cc".to_string(),
-            bridge_btc_address: "bc1qbridge".to_string(),
-            enabled_swap_venues: "icpswap,mexc".to_string(),
-            max_dex_slippage_bps: 500,
-            max_cex_slippage_bps: 200,
-            bad_debt_collateral_slippage_bps: 500,
-            buy_bad_debt: false,
-            opportunity_filter: vec![],
-            control_socket: "/tmp/liquidator/ctl.sock".to_string(),
-            log_source: "Log source file: /tmp/liquidator/liquidator.log".to_string(),
-            db_path: "./wal.db".to_string(),
-            export_path: "executions.csv".to_string(),
-        }
-    }
+    use super::WalCounts;
+    use crate::persistance::ResultStatus;
+    use crate::tui::withdraw::apply_deposit_reply;
+    use std::collections::HashMap;
 
     #[test]
     fn wal_counts_include_unresumable_rows() {
@@ -550,7 +542,7 @@ mod tests {
 
     #[test]
     fn push_log_sanitizes_and_splits_lines() {
-        let mut app = App::new(vec![], sample_config());
+        let mut app = super::test_app();
         app.push_log("\x1b[32mINFO\x1b[0m hello\tworld\r\nnext\x07 line");
         assert_eq!(app.logs.len(), 2);
         assert_eq!(app.logs[0], "INFO hello world");
@@ -559,7 +551,7 @@ mod tests {
 
     #[test]
     fn push_log_clamps_very_long_lines() {
-        let mut app = App::new(vec![], sample_config());
+        let mut app = super::test_app();
         let huge = format!("INFO {}", "x".repeat(6000));
         app.push_log(huge);
         assert_eq!(app.logs.len(), 1);
@@ -568,7 +560,7 @@ mod tests {
 
     #[test]
     fn append_logs_preserves_anchor_in_scroll_mode() {
-        let mut app = App::new(vec![], sample_config());
+        let mut app = super::test_app();
         app.logs_content_width = 120;
         app.logs_scroll_active = true;
         app.logs_follow = false;
@@ -583,7 +575,7 @@ mod tests {
 
     #[test]
     fn prepend_logs_preserves_anchor_and_order() {
-        let mut app = App::new(vec![], sample_config());
+        let mut app = super::test_app();
         app.logs_content_width = 120;
         app.logs_scroll_active = true;
         app.logs_follow = false;
@@ -599,7 +591,7 @@ mod tests {
 
     #[test]
     fn append_logs_eviction_keeps_scroll_offsets_stable() {
-        let mut app = App::new(vec![], sample_config());
+        let mut app = super::test_app();
         app.logs_content_width = 8;
         app.dashboard_logs_content_width = 8;
         app.logs_scroll_active = true;
@@ -618,5 +610,49 @@ mod tests {
         assert_eq!(app.logs_scroll, 5);
         assert_eq!(app.dashboard_logs_scroll, 7);
         assert_eq!(app.logs.back().expect("last"), "newline");
+    }
+
+    fn address(asset: &str) -> DepositAddress {
+        DepositAddress {
+            asset: asset.to_string(),
+            network: "ETH".to_string(),
+            address: format!("{asset}-address"),
+            tag: None,
+        }
+    }
+
+    #[test]
+    fn a_deposit_reply_shows_only_for_the_newest_lookup() {
+        // Lookup 1 asked for USDC and lookup 2 for ETH; the replies come in either order.
+        for late_first in [true, false] {
+            let mut app = super::test_app();
+            app.deposit.request = 2;
+            app.deposit.in_flight = true;
+            let replies = [(1, address("USDC")), (2, address("ETH"))];
+            let order: Vec<_> = if late_first {
+                replies.into_iter().collect()
+            } else {
+                replies.into_iter().rev().collect()
+            };
+            for (request, reply) in order {
+                apply_deposit_reply(&mut app, request, Ok(reply));
+            }
+
+            assert!(!app.deposit.in_flight);
+            let shown = app.deposit.last.as_ref().expect("reply").as_ref().expect("address");
+            assert_eq!(shown.asset, "ETH", "late_first {late_first}");
+        }
+    }
+
+    #[test]
+    fn a_stale_deposit_reply_leaves_the_newest_lookup_waiting() {
+        let mut app = super::test_app();
+        app.deposit.request = 2;
+        app.deposit.in_flight = true;
+
+        apply_deposit_reply(&mut app, 1, Ok(address("USDC")));
+
+        assert!(app.deposit.in_flight);
+        assert!(app.deposit.last.is_none());
     }
 }

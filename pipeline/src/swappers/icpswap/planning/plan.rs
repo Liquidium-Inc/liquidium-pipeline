@@ -64,6 +64,12 @@ impl IcpswapExecutionPlan {
             .unwrap_or_else(|_| Nat::from(0u8));
         ChainTokenAmount::from_raw(self.gross_quoted_out.token.clone(), net)
     }
+
+    /// The input plus one ledger fee: what the transfer moves into the pool
+    /// deposit account, and what the deposit sweeps from it.
+    pub fn input_with_fee(&self) -> Nat {
+        self.amount_in.value.clone() + self.input_ledger_fee.value.clone()
+    }
 }
 
 pub fn resolve_direction(

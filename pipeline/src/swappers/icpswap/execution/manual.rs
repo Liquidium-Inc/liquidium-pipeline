@@ -20,8 +20,8 @@ use crate::swappers::icpswap::{
         retry_slippage_bps,
     },
     types::{
-        IcpswapClientError, IcpswapDepositArgs, IcpswapError, IcpswapState, IcpswapStep, IcpswapSwapArgs,
-        IcpswapWithdrawArgs,
+        IcpswapClientError, IcpswapDepositArgs, IcpswapError, IcpswapExecutionPlan, IcpswapState, IcpswapStep,
+        IcpswapSwapArgs, IcpswapWithdrawArgs,
     },
 };
 
@@ -240,7 +240,7 @@ async fn transfer_input(
         fee: Some(state.plan.input_ledger_fee.value.clone()),
         created_at_time: Some(now_nanos),
         memo: None,
-        amount: state.plan.amount_in.value.clone() + state.plan.input_ledger_fee.value.clone(),
+        amount: state.plan.input_with_fee(),
     };
     state.transfer.args = Some(args.clone());
     state.step = IcpswapStep::TransferPending;
@@ -324,28 +324,17 @@ async fn deposit(
     state: &mut IcpswapState,
     now_nanos: u64,
 ) -> Result<(), String> {
-    let deposit_account = state
-        .transfer
-        .args
-        .as_ref()
-        .map(|args| args.to)
-        .ok_or_else(|| "ICPSwap deposit is missing its persisted ledger destination".to_string())?;
-    let (unused, deposit_ledger_balance) = tokio::try_join!(
-        client.unused_balance(state.plan.pool, state.owner.owner),
+    let deposit_account = saved_deposit_account(state)?;
+    let (pool, deposit_ledger_balance) = tokio::try_join!(
+        recon::pool_balances(client, state),
         client.ledger_balance(state.plan.token_in, &deposit_account),
     )
     .map_err(|error| error.to_string())?;
-    state.deposit.input_pool_balance_before = Some(recon::input_balance(&state.plan, &unused));
+    state.deposit.input_pool_balance_before = Some(pool.input);
     state.deposit.input_ledger_balance_before = Some(deposit_ledger_balance);
     state.deposit.ready_to_submit = true;
     state.deposit.observation_attempts = 0;
-    let args = IcpswapDepositArgs {
-        token: state.plan.token_in.to_text(),
-        // ICPSwap credits `amount - fee` when it sweeps this subaccount.
-        // Include the sweep fee so the credited balance equals the swap input.
-        amount: state.plan.amount_in.value.clone() + state.plan.input_ledger_fee.value.clone(),
-        fee: state.plan.input_ledger_fee.value.clone(),
-    };
+    let args = deposit_args(&state.plan);
     state.step = IcpswapStep::DepositPending;
     state.last_error = None;
     persist(store, execution_id, state).await?;
@@ -369,12 +358,7 @@ async fn submit_prepared_deposit(
         return persist(store, execution_id, state).await;
     }
 
-    let deposit_account = state
-        .transfer
-        .args
-        .as_ref()
-        .map(|args| args.to)
-        .ok_or_else(|| "prepared ICPSwap deposit is missing its persisted ledger destination".to_string())?;
+    let deposit_account = saved_deposit_account(state)?;
     let ledger_before = state
         .deposit
         .input_ledger_balance_before
@@ -393,11 +377,7 @@ async fn submit_prepared_deposit(
         return persist(store, execution_id, state).await;
     }
 
-    let args = IcpswapDepositArgs {
-        token: state.plan.token_in.to_text(),
-        amount: state.plan.amount_in.value.clone() + state.plan.input_ledger_fee.value.clone(),
-        fee: state.plan.input_ledger_fee.value.clone(),
-    };
+    let args = deposit_args(&state.plan);
     state.deposit.ready_to_submit = false;
     submit_deposit(client, store, execution_id, state, args, now_nanos).await
 }
@@ -459,7 +439,7 @@ async fn schedule_deposit_observation_retry(
 ) -> Result<(), String> {
     state.deposit.observation_attempts = state.deposit.observation_attempts.saturating_add(1);
     if state.deposit.observation_attempts >= MAX_DEPOSIT_OBSERVATION_ATTEMPTS {
-        let deposit_account = state.transfer.args.as_ref().map(|args| args.to);
+        let deposit_account = saved_deposit_account(state).ok();
         let ledger_before = state.deposit.input_ledger_balance_before.clone();
         if let (Some(deposit_account), Some(ledger_before)) = (deposit_account, ledger_before)
             && state.deposit.submission_retry_count < MAX_DEPOSIT_SUBMISSION_RETRIES
@@ -635,12 +615,11 @@ async fn prepare_trade_attempt(
     state.trade.current_amount_out_minimum =
         ChainTokenAmount::from_raw(state.plan.gross_quoted_out.token.clone(), minimum.clone());
 
-    let unused = client
-        .unused_balance(state.plan.pool, state.owner.owner)
+    let pool = recon::pool_balances(client, state)
         .await
         .map_err(|error| error.to_string())?;
-    state.trade.input_pool_balance_before = Some(recon::input_balance(&state.plan, &unused));
-    state.trade.output_pool_balance_before = Some(recon::output_balance(&state.plan, &unused));
+    state.trade.input_pool_balance_before = Some(pool.input);
+    state.trade.output_pool_balance_before = Some(pool.output);
     let args = IcpswapSwapArgs {
         zero_for_one: state.plan.zero_for_one,
         amount_in: nat_to_decimal_text(&state.plan.amount_in.value),
@@ -689,12 +668,12 @@ async fn withdraw_output(
         state.last_error = Some("gross swap output cannot cover the ckUSDC ledger fee".to_string());
         return persist(store, execution_id, state).await;
     }
-    let (unused, wallet_balance) = tokio::try_join!(
-        client.unused_balance(state.plan.pool, state.owner.owner),
+    let (pool, wallet_balance) = tokio::try_join!(
+        recon::pool_balances(client, state),
         client.ledger_balance(state.plan.token_out, &state.owner),
     )
     .map_err(|error| error.to_string())?;
-    state.withdraw.pool_balance_before = Some(recon::output_balance(&state.plan, &unused));
+    state.withdraw.pool_balance_before = Some(pool.output);
     state.withdraw.wallet_balance_before = Some(wallet_balance);
     let args = IcpswapWithdrawArgs {
         token: state.plan.token_out.to_text(),
@@ -740,15 +719,12 @@ async fn recover_input(
     state: &mut IcpswapState,
     _now_nanos: u64,
 ) -> Result<(), String> {
-    let (unused, wallet_balance) = tokio::try_join!(
-        client.unused_balance(state.plan.pool, state.owner.owner),
+    let (pool, wallet_balance) = tokio::try_join!(
+        recon::pool_balances(client, state),
         client.ledger_balance(state.plan.token_in, &state.owner),
     )
     .map_err(|error| error.to_string())?;
-    let amount = std::cmp::min(
-        recon::input_balance(&state.plan, &unused),
-        state.plan.amount_in.value.clone(),
-    );
+    let amount = std::cmp::min(pool.input.clone(), state.plan.amount_in.value.clone());
     if amount <= state.plan.input_ledger_fee.value {
         state.step = IcpswapStep::Failed;
         state.last_error = Some(format!(
@@ -757,7 +733,7 @@ async fn recover_input(
         ));
         return persist(store, execution_id, state).await;
     }
-    state.recovery.pool_balance_before = Some(recon::input_balance(&state.plan, &unused));
+    state.recovery.pool_balance_before = Some(pool.input);
     state.recovery.wallet_balance_before = Some(wallet_balance);
     let args = IcpswapWithdrawArgs {
         token: state.plan.token_in.to_text(),
@@ -801,6 +777,26 @@ async fn persist(
     state: &IcpswapState,
 ) -> Result<(), String> {
     store.persist(execution_id, state).await
+}
+
+/// The pool deposit account the saved transfer paid into.
+pub(crate) fn saved_deposit_account(state: &IcpswapState) -> Result<IcrcAccount, String> {
+    state
+        .transfer
+        .args
+        .as_ref()
+        .map(|args| args.to)
+        .ok_or_else(|| "ICPSwap deposit is missing its persisted ledger destination".to_string())
+}
+
+fn deposit_args(plan: &IcpswapExecutionPlan) -> IcpswapDepositArgs {
+    IcpswapDepositArgs {
+        token: plan.token_in.to_text(),
+        // ICPSwap credits `amount - fee` when it sweeps the deposit account,
+        // so the credit equals the swap input.
+        amount: plan.input_with_fee(),
+        fee: plan.input_ledger_fee.value.clone(),
+    }
 }
 
 pub(crate) fn pool_user_account(pool: Principal, owner: Principal) -> IcrcAccount {

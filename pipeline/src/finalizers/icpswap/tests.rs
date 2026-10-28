@@ -28,6 +28,7 @@ use crate::{
             ICPSWAP_VENUE_ID, MultiVenueAdapter, VenueLegCheckpoint, VenueLegProgress, VenuePlanningContext,
         },
     },
+    outbound::driver::OperatorDecision,
     persistance::{
         LiqMetaWrapper, LiqResultRecord, ResultStatus, VenueExecutionState, VenueLegQuote, VenueLegState,
         VenueLegStatus, WalStore,
@@ -41,8 +42,9 @@ use crate::{
             state::MAX_DEPOSIT_OBSERVATION_ATTEMPTS,
             transfer_state::{IcpswapFundingState, IcpswapLedgerTransferState, IcpswapSettlementState},
             types::{
-                IcpswapClientError, IcpswapDepositArgs, IcpswapExecutionPlan, IcpswapExecutionState, IcpswapQuoteError,
-                IcpswapRoutePreview, IcpswapStep, IcpswapSwapArgs, IcpswapUnusedBalance, IcpswapWithdrawArgs,
+                IcpswapClientError, IcpswapDepositArgs, IcpswapExecutionPlan, IcpswapExecutionState,
+                IcpswapOperatorAnswer, IcpswapQuoteError, IcpswapRoutePreview, IcpswapStep, IcpswapSwapArgs,
+                IcpswapUnusedBalance, IcpswapWithdrawArgs,
             },
             venue::IcpswapFinalizerLogic,
         },
@@ -597,13 +599,10 @@ async fn multi_venue_checkpoints_pending_state_before_transfer_side_effect() {
     let mut manual = MockIcpswapManualClient::new();
     manual.expect_ledger_transfer().times(1).return_once(move |_, _| {
         let checkpoints = observed.lock().expect("checkpoint lock");
-        let persisted = checkpoints
+        let last = checkpoints
             .last()
-            .expect("transfer intent must be checkpointed before submission")
-            .execution
-            .decode::<IcpswapExecutionState>(ICPSWAP_VENUE_ID)
-            .expect("decode checkpoint")
-            .expect("ICPSwap checkpoint");
+            .expect("transfer intent must be checkpointed before submission");
+        let persisted = decoded(&last.execution);
         assert_eq!(persisted.step, IcpswapStep::TransferPending);
         assert!(persisted.transfer.args.is_some());
         Err(IcpswapClientError::LedgerTransfer {
@@ -661,13 +660,10 @@ async fn multi_venue_submits_deposit_after_checkpoint_in_the_same_cycle() {
         .return_once(|_, _| Ok(Nat::from(100_010u64)));
     manual.expect_deposit().times(1).return_once(move |pool, _| {
         let checkpoints = observed.lock().expect("checkpoint lock");
-        let persisted = checkpoints
+        let last = checkpoints
             .last()
-            .expect("deposit intent must be checkpointed before submission")
-            .execution
-            .decode::<IcpswapExecutionState>(ICPSWAP_VENUE_ID)
-            .expect("decode checkpoint")
-            .expect("ICPSwap checkpoint");
+            .expect("deposit intent must be checkpointed before submission");
+        let persisted = decoded(&last.execution);
         assert_eq!(persisted.step, IcpswapStep::DepositPending);
         assert!(persisted.deposit.ready_to_submit);
         Err(IcpswapClientError::SubmissionUnknown {
@@ -681,11 +677,7 @@ async fn multi_venue_submits_deposit_after_checkpoint_in_the_same_cycle() {
         .advance(&leg, &checkpoint)
         .await
         .expect("submit checkpointed deposit");
-    let submitted_state = submitted
-        .execution
-        .decode::<IcpswapExecutionState>(ICPSWAP_VENUE_ID)
-        .expect("decode")
-        .expect("ICPSwap state");
+    let submitted_state = decoded(&submitted.execution);
     assert_eq!(submitted_state.step, IcpswapStep::DepositPending);
     assert!(!submitted_state.deposit.ready_to_submit);
     assert!(submitted_state.next_attempt_at_nanos.is_some());
@@ -830,11 +822,7 @@ async fn multi_venue_operator_required_state_parks_only_its_isolated_leg() {
     assert_eq!(progress.status, VenueLegStatus::OperatorRequired);
     assert!(progress.result.is_none());
     assert_eq!(progress.last_error.as_deref(), Some("withdrawal outcome is ambiguous"));
-    let persisted = progress
-        .execution
-        .decode::<IcpswapExecutionState>(ICPSWAP_VENUE_ID)
-        .expect("decode persisted ICPSwap state")
-        .expect("ICPSwap state");
+    let persisted = decoded(&progress.execution);
     assert_eq!(persisted.step, IcpswapStep::OperatorRequired);
 }
 
@@ -1060,4 +1048,126 @@ async fn operator_required_realerts_every_cycle_while_parked() {
         "a still-parked execution must keep escalating"
     );
     assert_eq!(watchdog.events()[1].2, "DepositPending");
+}
+
+fn parked_leg(pending: IcpswapStep) -> VenueLegState {
+    let route = native_plan();
+    let request = native_request(&route);
+    let mut state = pool_state("leg-execution-42", route);
+    state.step = IcpswapStep::OperatorRequired;
+    state.operator_pending_step = Some(pending);
+    state.next_attempt_at_nanos = Some(u64::MAX);
+    state.last_error = Some("ICPSwap settlement credit cannot cover its forwarding fee".to_string());
+    let mut leg = venue_leg(state, request);
+    leg.status = VenueLegStatus::OperatorRequired;
+    leg
+}
+
+fn decoded(execution: &VenueExecutionState) -> IcpswapExecutionState {
+    execution
+        .decode::<IcpswapExecutionState>(ICPSWAP_VENUE_ID)
+        .expect("decode ICPSwap state")
+        .expect("ICPSwap state")
+}
+
+fn landed(receipt: &str) -> Option<OperatorDecision> {
+    Some(OperatorDecision::Landed {
+        receipt: receipt.to_string(),
+    })
+}
+
+#[test]
+fn parked_leg_asks_the_question_of_its_park() {
+    let finalizer = finalizer(MockIcpswapManualClient::new());
+    for (pending, phrase) in [
+        (IcpswapStep::TransferPending, "--landed <block index>"),
+        (IcpswapStep::DepositPending, "the deposit runs again"),
+        (IcpswapStep::TradePending, "the input comes back"),
+        (IcpswapStep::WithdrawPending, "the withdrawal runs again"),
+        (IcpswapStep::RecoverPending, "the recovery runs again"),
+        (IcpswapStep::Forward, "writes the balance off"),
+    ] {
+        let questions = finalizer.operator_questions(&parked_leg(pending)).expect("questions");
+        assert_eq!(questions.len(), 1, "{pending:?}");
+        assert!(
+            questions[0].detail.contains(phrase),
+            "{pending:?}: {}",
+            questions[0].detail
+        );
+    }
+}
+
+#[test]
+fn parked_leg_release_takes_only_an_answer_its_park_can_check() {
+    let finalizer = finalizer(MockIcpswapManualClient::new());
+    for (pending, answer, error) in [
+        (IcpswapStep::TransferPending, None, "waits for an answer"),
+        (IcpswapStep::Forward, None, "waits for an answer"),
+        (IcpswapStep::DepositPending, landed("5"), "does not answer this park"),
+        (IcpswapStep::TradePending, landed("five"), "not a whole number"),
+        (IcpswapStep::TradePending, landed("0"), "above zero"),
+    ] {
+        let refused = finalizer
+            .operator_release(&parked_leg(pending), answer.as_ref())
+            .expect_err("refused");
+        assert!(refused.contains(error), "{pending:?}: {refused}");
+    }
+
+    for (pending, answer, stored) in [
+        (
+            IcpswapStep::TransferPending,
+            landed(" 77 "),
+            Some(IcpswapOperatorAnswer::TransferLanded {
+                block_index: Nat::from(77u64),
+            }),
+        ),
+        (
+            IcpswapStep::TradePending,
+            landed("60000"),
+            Some(IcpswapOperatorAnswer::SwapLanded {
+                output: Nat::from(60_000u64),
+            }),
+        ),
+        (
+            IcpswapStep::Forward,
+            Some(OperatorDecision::Absent),
+            Some(IcpswapOperatorAnswer::Absent),
+        ),
+        (IcpswapStep::WithdrawPending, None, None),
+    ] {
+        let execution = finalizer
+            .operator_release(&parked_leg(pending), answer.as_ref())
+            .expect("release");
+        let state = decoded(&execution);
+        assert_eq!(state.operator_answer, stored, "{pending:?}");
+        assert_eq!(state.step, IcpswapStep::OperatorRequired);
+        // The check must run on the next cycle, not after the old wait.
+        assert_eq!(state.next_attempt_at_nanos, None);
+    }
+}
+
+#[tokio::test]
+async fn released_forward_park_writes_the_dust_off_on_the_next_advance() {
+    let finalizer = finalizer(MockIcpswapManualClient::new());
+    let mut leg = parked_leg(IcpswapStep::Forward);
+    leg.execution = finalizer
+        .operator_release(&leg, Some(&OperatorDecision::Absent))
+        .expect("release");
+    leg.status = VenueLegStatus::Running;
+
+    let progress = finalizer
+        .advance(&leg, &NoopCheckpoint)
+        .await
+        .expect("advance makes no client call");
+
+    assert_eq!(progress.status, VenueLegStatus::FailedPermanent);
+    assert_eq!(decoded(&progress.execution).step, IcpswapStep::Failed);
+    assert!(
+        progress
+            .last_error
+            .as_deref()
+            .is_some_and(|error| error.starts_with("written off by an operator: ICPSwap settlement credit")),
+        "{:?}",
+        progress.last_error
+    );
 }

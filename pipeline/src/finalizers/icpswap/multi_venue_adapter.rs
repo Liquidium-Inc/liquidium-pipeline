@@ -1,8 +1,14 @@
 use std::sync::Mutex;
 
-use super::finalizer::{IcpswapFinalizer, RETRY_COOLDOWN_NANOS, is_terminal_step};
+use super::{
+    finalizer::{IcpswapFinalizer, RETRY_COOLDOWN_NANOS, is_terminal_step},
+    operator,
+};
 use crate::{
-    finalizers::multi_venue::{MultiVenueAdapter, VenueLegCheckpoint, VenueLegProgress, VenueRoutePreview},
+    finalizers::multi_venue::{
+        MultiVenueAdapter, OperatorQuestion, VenueLegCheckpoint, VenueLegProgress, VenueRoutePreview,
+    },
+    outbound::driver::OperatorDecision,
     persistance::{VenueExecutionState, VenueLegState, VenueLegStatus},
     swappers::{
         icpswap::{
@@ -238,6 +244,20 @@ impl MultiVenueAdapter for IcpswapFinalizer {
         checkpoint: &dyn VenueLegCheckpoint,
     ) -> Result<VenueLegProgress, String> {
         self.advance_leg(leg, checkpoint).await
+    }
+
+    fn operator_questions(&self, leg: &VenueLegState) -> Result<Vec<OperatorQuestion>, String> {
+        operator::operator_questions(&self.decode_leg_state(leg)?)
+    }
+
+    fn operator_release(
+        &self,
+        leg: &VenueLegState,
+        answer: Option<&OperatorDecision>,
+    ) -> Result<VenueExecutionState, String> {
+        let mut state = self.decode_leg_state(leg)?;
+        operator::release(&mut state, answer)?;
+        VenueExecutionState::new(VENUE_ID, &state)
     }
 
     async fn recover(

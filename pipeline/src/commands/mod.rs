@@ -8,3 +8,4 @@ pub mod mexc_withdraw_check;
 pub(crate) mod liquidation_loop_helpers;
 pub mod tui;
 pub mod withdraw;
+pub(crate) mod withdrawal;
