@@ -183,8 +183,8 @@ pub enum BridgeError {
 
 impl BridgeError {
     /// A failure before the provider call ran nothing, so an untyped one is a refusal.
-    pub(super) fn before_call(self) -> Self {
-        match self {
+    pub(super) fn before_call(error: impl Into<Self>) -> Self {
+        match error.into() {
             Self::Other(message) => Self::Refused(message),
             typed => typed,
         }

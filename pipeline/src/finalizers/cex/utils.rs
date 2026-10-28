@@ -1,4 +1,12 @@
 pub(super) use crate::swappers::model::{LIQUIDITY_EPS, f64_to_nat};
+use crate::utils::now_ts;
+
+/// Seconds waited since `since`. A row saved before this clock existed starts
+/// it now, so it waits from here and not forever.
+pub(super) fn waited_secs(since: &mut Option<i64>) -> i64 {
+    let since = *since.get_or_insert_with(now_ts);
+    now_ts().saturating_sub(since)
+}
 
 /// Stable 64-bit FNV-1a. Exchange ids derived from it must not change
 /// between releases, so the std hasher is not an option.

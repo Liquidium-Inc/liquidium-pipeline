@@ -86,35 +86,39 @@ fn eth_forward_gas_reserve_from_price(gas_price_wei: u128, gas_limit: u128) -> U
 
 /// The minter's certified answer to `withdraw_erc20`: no ckERC20 left the
 /// account. A ckETH fee it burned is reimbursed, so a new call is safe.
-fn erc20_withdraw_refusal(error: WithdrawErc20Error) -> BridgeError {
-    let message = format!("withdraw_erc20 error: {error:?}");
-    match error {
-        WithdrawErc20Error::TemporarilyUnavailable(_)
-        | WithdrawErc20Error::CkErc20LedgerError {
-            error: LedgerError::TemporarilyUnavailable(_),
-            ..
+impl From<WithdrawErc20Error> for BridgeError {
+    fn from(error: WithdrawErc20Error) -> Self {
+        let message = format!("withdraw_erc20 error: {error:?}");
+        match error {
+            WithdrawErc20Error::TemporarilyUnavailable(_)
+            | WithdrawErc20Error::CkErc20LedgerError {
+                error: LedgerError::TemporarilyUnavailable(_),
+                ..
+            }
+            | WithdrawErc20Error::CkEthLedgerError {
+                error: LedgerError::TemporarilyUnavailable(_),
+            } => BridgeError::Deferred(message),
+            WithdrawErc20Error::CkErc20LedgerError {
+                error: LedgerError::AmountTooLow { .. },
+                ..
+            }
+            | WithdrawErc20Error::CkEthLedgerError {
+                error: LedgerError::AmountTooLow { .. },
+            } => BridgeError::BelowMinimum(message),
+            _ => BridgeError::Refused(message),
         }
-        | WithdrawErc20Error::CkEthLedgerError {
-            error: LedgerError::TemporarilyUnavailable(_),
-        } => BridgeError::Deferred(message),
-        WithdrawErc20Error::CkErc20LedgerError {
-            error: LedgerError::AmountTooLow { .. },
-            ..
-        }
-        | WithdrawErc20Error::CkEthLedgerError {
-            error: LedgerError::AmountTooLow { .. },
-        } => BridgeError::BelowMinimum(message),
-        _ => BridgeError::Refused(message),
     }
 }
 
 /// The minter's certified answer to `withdraw_eth`: no ckETH left the account.
-fn eth_withdraw_refusal(error: WithdrawalError) -> BridgeError {
-    let message = format!("withdraw_eth error: {error:?}");
-    match error {
-        WithdrawalError::TemporarilyUnavailable(_) => BridgeError::Deferred(message),
-        WithdrawalError::AmountTooLow { .. } => BridgeError::BelowMinimum(message),
-        _ => BridgeError::Refused(message),
+impl From<WithdrawalError> for BridgeError {
+    fn from(error: WithdrawalError) -> Self {
+        let message = format!("withdraw_eth error: {error:?}");
+        match error {
+            WithdrawalError::TemporarilyUnavailable(_) => BridgeError::Deferred(message),
+            WithdrawalError::AmountTooLow { .. } => BridgeError::BelowMinimum(message),
+            _ => BridgeError::Refused(message),
+        }
     }
 }
 
@@ -823,7 +827,7 @@ where
         let (source_account, cketh_ledger_id, withdraw_args) = self
             .prepare_reverse_bridge(route, request)
             .await
-            .map_err(|error| BridgeError::from(error).before_call())?;
+            .map_err(BridgeError::before_call)?;
 
         let first_try = self.withdraw_erc20_call(&withdraw_args).await?;
         let result = match first_try {
@@ -850,7 +854,7 @@ where
                     request_id.ckerc20_block_index, request_id.cketh_block_index
                 ),
             }),
-            WithdrawErc20Ret::Err(err) => Err(erc20_withdraw_refusal(err)),
+            WithdrawErc20Ret::Err(err) => Err(err.into()),
         }
     }
 
@@ -966,7 +970,7 @@ where
             WithdrawalRet::Ok(request_id) => Ok(BridgeSubmission {
                 bridge_id: format!("ic-withdraw-eth:{}", request_id.block_index),
             }),
-            WithdrawalRet::Err(err) => Err(eth_withdraw_refusal(err)),
+            WithdrawalRet::Err(err) => Err(err.into()),
         }
     }
 

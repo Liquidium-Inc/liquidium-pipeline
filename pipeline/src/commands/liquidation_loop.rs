@@ -206,9 +206,11 @@ async fn init(
         .recover_submitting_as_ambiguous("process restarted during liquidation submission")
         .await
         .map_err(|e| format!("failed to recover interrupted liquidation intents: {e}"))?;
+    // One watchdog, so its alert cooldown covers every stage.
+    let slack_watchdog = slack_watchdog_from_env(DEFAULT_LOW_BALANCE_ALERT_COOLDOWN);
     if recovered != 0 {
         warn!(recovered, "Parked interrupted liquidation submissions as ambiguous");
-        slack_watchdog_from_env(DEFAULT_LOW_BALANCE_ALERT_COOLDOWN)
+        slack_watchdog
             .notify(WatchdogEvent::OperatorRequired {
                 execution_id: "restart".to_string(),
                 venue: "protocol".to_string(),
@@ -233,7 +235,7 @@ async fn init(
         db.clone(),
         ctx.approval_state.clone(),
     )
-    .with_watchdog(slack_watchdog_from_env(DEFAULT_LOW_BALANCE_ALERT_COOLDOWN));
+    .with_watchdog(slack_watchdog.clone());
 
     executor
         .init(&tokens)
@@ -284,7 +286,7 @@ async fn init(
                 icpswap_test_allocation_usd: config.icpswap_test_allocation_usd,
             },
         )?
-        .with_watchdog(slack_watchdog_from_env(DEFAULT_LOW_BALANCE_ALERT_COOLDOWN))
+        .with_watchdog(slack_watchdog.clone())
         .with_price_oracle(price_oracle.clone())
         .with_recovery_sweep(ctx.trader_transfers.actions(), config.get_recovery_account()),
     );
@@ -309,7 +311,7 @@ async fn init(
             config.cex_retry_base_secs,
             config.cex_retry_max_secs,
         )
-        .with_watchdog(slack_watchdog_from_env(DEFAULT_LOW_BALANCE_ALERT_COOLDOWN)),
+        .with_watchdog(slack_watchdog.clone()),
     );
 
     info!("Initializing searcher stage ...");

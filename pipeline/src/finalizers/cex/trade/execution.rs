@@ -107,15 +107,8 @@ where
             }
 
             let limit_bps = self.slice_limit_bps(empty_fills_in_a_row);
-            let price_room_bps = Self::price_room_bps(&leg.side, limit_bps, preview.taker_fee_bps);
-            if price_room_bps <= 0.0 {
-                let err = format!(
-                    "the {limit_bps:.0} bps limit on {} leaves no room for its {:.0} bps taker fee",
-                    leg.market, preview.taker_fee_bps
-                );
-                state.last_error = Some(err.clone());
-                return Err(err.into());
-            }
+            let price_room_bps = Self::price_room_or_err(&leg.side, limit_bps, preview.taker_fee_bps, &leg.market)
+                .inspect_err(|err| state.last_error = Some(err.clone()))?;
 
             let buy_mode = Self::resolve_slice_buy_mode(state, leg, &mut forced_next_buy_mode);
             let pending = self.prepare_pending_slice_request(state, leg, leg_idx, preview.chunk_in, buy_mode);
@@ -332,6 +325,23 @@ where
             (1.0 + limit) * (1.0 - fee) - 1.0
         };
         room * BPS_PER_RATIO_UNIT - PRICE_ROOM_MARGIN_BPS
+    }
+
+    /// The room an order gets, or the reason the fee leaves none. A route
+    /// without room would take the deposit and never trade.
+    pub(in crate::finalizers::cex) fn price_room_or_err(
+        side: &str,
+        limit_bps: f64,
+        taker_fee_bps: f64,
+        market: &str,
+    ) -> Result<f64, String> {
+        let room = Self::price_room_bps(side, limit_bps, taker_fee_bps);
+        if room <= 0.0 {
+            return Err(format!(
+                "the {limit_bps:.0} bps limit on {market} leaves no room for its {taker_fee_bps:.0} bps taker fee"
+            ));
+        }
+        Ok(room)
     }
 
     /// Compute slippage in bps from preview mid and realized execution price.

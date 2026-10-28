@@ -224,9 +224,7 @@ where
                 state.step = CexStep::Completed;
             }
             _ => {
-                // Rows accepted before this clock existed start it now.
-                let accepted_at = *state.withdraw.withdraw_accepted_at_ts.get_or_insert_with(now_ts);
-                let waited = now_ts().saturating_sub(accepted_at);
+                let waited = waited_secs(&mut state.withdraw.withdraw_accepted_at_ts);
                 if waited > WITHDRAW_DELIVERY_TIMEOUT_SECS {
                     return Err(format!(
                         "cex withdraw not delivered after {waited}s for liq_id {} withdraw_id={withdraw_id} status={:?}",

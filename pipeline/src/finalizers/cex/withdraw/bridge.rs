@@ -571,8 +571,7 @@ where
     /// row parks with an alert.
     fn wait_before_bridge(state: &mut CexState, reason: &str) -> Result<(), String> {
         state.step = CexStep::WithdrawPending;
-        let accepted_at = *state.withdraw.withdraw_accepted_at_ts.get_or_insert_with(now_ts);
-        let waited = now_ts().saturating_sub(accepted_at);
+        let waited = waited_secs(&mut state.withdraw.withdraw_accepted_at_ts);
         if waited > WITHDRAW_DELIVERY_TIMEOUT_SECS {
             return Err(format!(
                 "bridged withdraw for liq_id {} still waits after {waited}s: {reason}",

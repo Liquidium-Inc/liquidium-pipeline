@@ -57,23 +57,25 @@ impl CexBackend for MexcClient {
         });
         // A price limit is never dropped: an IOC order that cannot be built here
         // sends nothing. Only MEXC's own refusal of the IOC type allows a market order.
-        let ioc_order = match options.price_limit.as_ref() {
-            None => None,
-            Some(limit) => {
-                let built = Self::ioc_limit_price(&side_norm, limit, filters.as_ref()).and_then(|price| {
-                    let quantity = match order_side {
-                        OrderSide::Sell => market_order
-                            .as_ref()
-                            .map_err(Clone::clone)?
-                            .quantity
-                            .ok_or("sell order has no quantity")?,
-                        OrderSide::Buy => Self::ioc_buy_quantity(amount_dec, price, filters.as_ref(), &symbol)?,
-                    };
-                    Ok(IocOrder { quantity, price })
-                });
-                Some(built.map_err(|error| format!("no IOC order for {market} {side}: {error}"))?)
-            }
-        };
+        let ioc_order = options
+            .price_limit
+            .as_ref()
+            .map(|limit| {
+                Self::ioc_limit_price(&side_norm, limit, filters.as_ref())
+                    .and_then(|price| {
+                        let quantity = match order_side {
+                            OrderSide::Sell => market_order
+                                .as_ref()
+                                .map_err(Clone::clone)?
+                                .quantity
+                                .ok_or("sell order has no quantity")?,
+                            OrderSide::Buy => Self::ioc_buy_quantity(amount_dec, price, filters.as_ref(), &symbol)?,
+                        };
+                        Ok(IocOrder { quantity, price })
+                    })
+                    .map_err(|error| format!("no IOC order for {market} {side}: {error}"))
+            })
+            .transpose()?;
         let market_order = match (market_order, ioc_order) {
             (Ok(order), _) => Some(order),
             (Err(error), Some(_)) => {

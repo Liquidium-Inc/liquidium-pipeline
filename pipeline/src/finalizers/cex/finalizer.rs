@@ -27,7 +27,7 @@ use tokio::sync::Mutex as TokioMutex;
 use tokio::time::sleep;
 
 use super::profile::CexVenueProfile;
-use super::utils::{LIQUIDITY_EPS, SlicePreview, TradeLeg, is_usd_stable_symbol};
+use super::utils::{LIQUIDITY_EPS, SlicePreview, TradeLeg, is_usd_stable_symbol, waited_secs};
 use liquidium_pipeline_connectors::outbound::{AcceptedWithdrawal, CexWithdrawals, WithdrawRequest, prepare_cex_withdraw};
 
 pub(super) const WITHDRAW_BRIDGE_SOURCE_BALANCE_TOLERANCE: f64 = LIQUIDITY_EPS;

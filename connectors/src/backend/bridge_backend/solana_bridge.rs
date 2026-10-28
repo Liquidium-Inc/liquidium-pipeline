@@ -493,42 +493,6 @@ where
         })
     }
 
-    /// The minter's certified answer: no ckSOL left the account, so a later call is safe.
-    fn map_withdraw_error(err: CkSolWithdrawalError) -> BridgeError {
-        let kind = match &err {
-            CkSolWithdrawalError::ValueTooSmall { .. } => BridgeError::BelowMinimum,
-            CkSolWithdrawalError::AlreadyProcessing | CkSolWithdrawalError::TemporarilyUnavailable(_) => {
-                BridgeError::Deferred
-            }
-            _ => BridgeError::Refused,
-        };
-        kind(match err {
-            CkSolWithdrawalError::AlreadyProcessing => "ckSOL withdraw rejected: AlreadyProcessing".to_string(),
-            CkSolWithdrawalError::ValueTooSmall {
-                minimum_withdrawal_amount,
-                withdrawal_amount,
-            } => format!(
-                "ckSOL withdraw rejected: ValueTooSmall (minimum_withdrawal_amount={}, withdrawal_amount={})",
-                minimum_withdrawal_amount, withdrawal_amount
-            ),
-            CkSolWithdrawalError::MalformedAddress(address) => {
-                format!("ckSOL withdraw rejected: MalformedAddress ({address})")
-            }
-            CkSolWithdrawalError::InvalidDestination(reason) => {
-                format!("ckSOL withdraw rejected: InvalidDestination ({reason})")
-            }
-            CkSolWithdrawalError::InsufficientFunds { balance } => {
-                format!("ckSOL withdraw rejected: InsufficientFunds (balance={balance})")
-            }
-            CkSolWithdrawalError::InsufficientAllowance { allowance } => {
-                format!("ckSOL withdraw rejected: InsufficientAllowance (allowance={allowance})")
-            }
-            CkSolWithdrawalError::TemporarilyUnavailable(message) => {
-                format!("ckSOL withdraw rejected: TemporarilyUnavailable ({message})")
-            }
-        })
-    }
-
     async fn withdraw(&self, args: CkSolWithdrawalArgs) -> Result<CkSolWithdrawalOk, BridgeError> {
         let arg_blob = Encode!(&args).map_err(|e| BridgeError::Refused(format!("encode withdraw args failed: {e}")))?;
         let result: Result<CkSolWithdrawalOk, CkSolWithdrawalError> = self
@@ -541,7 +505,7 @@ where
             .await
             .map_err(|e| format!("withdraw call failed for minter {}: {e}", self.cksol_minter_canister))?;
 
-        result.map_err(Self::map_withdraw_error)
+        result.map_err(BridgeError::from)
     }
 
     async fn withdrawal_status(&self, block_index: u64) -> Result<CkSolWithdrawalStatus, String> {
@@ -827,7 +791,7 @@ where
                 // answer it could not decide stays ambiguous.
                 match failure {
                     TransferFailure::Ambiguous(_) => BridgeError::Ambiguous(message),
-                    TransferFailure::Rejected(_) => BridgeError::Other(message),
+                    TransferFailure::Rejected(_) => BridgeError::Refused(message),
                 }
             })?;
 
@@ -855,7 +819,7 @@ where
         let args = self
             .prepare_icp_to_solana(route, request)
             .await
-            .map_err(|error| BridgeError::from(error).before_call())?;
+            .map_err(BridgeError::before_call)?;
         let withdraw = self.withdraw(args).await?;
         Ok(BridgeSubmission {
             bridge_id: format!("{}{}", WITHDRAW_BRIDGE_ID_PREFIX, withdraw.block_index),
@@ -909,6 +873,44 @@ where
             from_subaccount: None,
             amount: amount_lamports,
             address: destination.to_string(),
+        })
+    }
+}
+
+/// The minter's certified answer: no ckSOL left the account, so a later call is safe.
+impl From<CkSolWithdrawalError> for BridgeError {
+    fn from(err: CkSolWithdrawalError) -> Self {
+        let kind = match &err {
+            CkSolWithdrawalError::ValueTooSmall { .. } => BridgeError::BelowMinimum,
+            CkSolWithdrawalError::AlreadyProcessing | CkSolWithdrawalError::TemporarilyUnavailable(_) => {
+                BridgeError::Deferred
+            }
+            _ => BridgeError::Refused,
+        };
+        kind(match err {
+            CkSolWithdrawalError::AlreadyProcessing => "ckSOL withdraw rejected: AlreadyProcessing".to_string(),
+            CkSolWithdrawalError::ValueTooSmall {
+                minimum_withdrawal_amount,
+                withdrawal_amount,
+            } => format!(
+                "ckSOL withdraw rejected: ValueTooSmall (minimum_withdrawal_amount={}, withdrawal_amount={})",
+                minimum_withdrawal_amount, withdrawal_amount
+            ),
+            CkSolWithdrawalError::MalformedAddress(address) => {
+                format!("ckSOL withdraw rejected: MalformedAddress ({address})")
+            }
+            CkSolWithdrawalError::InvalidDestination(reason) => {
+                format!("ckSOL withdraw rejected: InvalidDestination ({reason})")
+            }
+            CkSolWithdrawalError::InsufficientFunds { balance } => {
+                format!("ckSOL withdraw rejected: InsufficientFunds (balance={balance})")
+            }
+            CkSolWithdrawalError::InsufficientAllowance { allowance } => {
+                format!("ckSOL withdraw rejected: InsufficientAllowance (allowance={allowance})")
+            }
+            CkSolWithdrawalError::TemporarilyUnavailable(message) => {
+                format!("ckSOL withdraw rejected: TemporarilyUnavailable ({message})")
+            }
         })
     }
 }

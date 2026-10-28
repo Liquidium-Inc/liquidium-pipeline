@@ -113,8 +113,7 @@ where
                     return Ok(());
                 }
 
-                let since = *state.deposit.deposit_credit_since_ts.get_or_insert_with(now_ts);
-                let waited = now_ts().saturating_sub(since);
+                let waited = waited_secs(&mut state.deposit.deposit_credit_since_ts);
                 let line = format!(
                     "deposit of {symbol} for liq_id {} is not credited after {waited}s: before={} current={} delta={} expected={}",
                     state.liq_id, baseline_balance, current_balance, observed_balance_delta, expected_deposit_amount

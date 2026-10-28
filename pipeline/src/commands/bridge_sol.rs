@@ -1,4 +1,4 @@
-use std::{str::FromStr, sync::Arc};
+use std::{str::FromStr, sync::Arc, time::Duration};
 
 use candid::{CandidType, Encode, Nat, Principal};
 use ic_agent::Agent;
@@ -25,7 +25,7 @@ const SOL_DECIMALS: u8 = 9;
 /// The minter reads a deposit at finalized commitment, about 13 s after the
 /// transfer confirms. So the notice is sent again within this bound.
 const DEPOSIT_NOTICE_ATTEMPTS: usize = 8;
-const DEPOSIT_NOTICE_DELAY: std::time::Duration = std::time::Duration::from_secs(5);
+const DEPOSIT_NOTICE_DELAY: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SolanaPrefundPlan {
@@ -551,7 +551,7 @@ async fn notify_until_queued(
     backend: &impl BridgeBackend,
     destination: &BridgeDestination,
     signature: &str,
-    delay: std::time::Duration,
+    delay: Duration,
 ) -> Option<BridgeSubmission> {
     for attempt in 1..=DEPOSIT_NOTICE_ATTEMPTS {
         tokio::time::sleep(delay).await;
@@ -753,6 +753,12 @@ mod tests {
         parse_subaccount_override, resolve_proxy_canister, resolve_sol_to_cksol_source,
     };
 
+    use crate::config::Config;
+    use candid::{Nat, Principal};
+    use ic_agent::identity::AnonymousIdentity;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
     /// Review finding 35: the one notice went out before finality, so the
     /// minter refused it and the SOL was never swept.
     #[tokio::test]
@@ -783,19 +789,13 @@ mod tests {
             subaccount: None,
         });
 
-        let queued = super::notify_until_queued(&backend, &destination, "sig-1", std::time::Duration::ZERO).await;
+        let queued = super::notify_until_queued(&backend, &destination, "sig-1", super::Duration::ZERO).await;
 
         assert_eq!(
             queued.map(|submission| submission.bridge_id),
             Some("queued".to_string())
         );
     }
-    use crate::config::Config;
-    use candid::{Nat, Principal};
-    use ic_agent::identity::AnonymousIdentity;
-    use std::collections::HashMap;
-    use std::sync::Arc;
-
     #[test]
     fn parse_direction_accepts_expected_values() {
         assert_eq!(

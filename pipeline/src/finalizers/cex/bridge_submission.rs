@@ -11,6 +11,7 @@ use super::finalizer::{
     BRIDGE_FEE_TOKEN_CHAIN, BRIDGE_FEE_TOKEN_SYMBOL, CKETH_DECIMALS, CexVenueFinalizer,
     WITHDRAW_BRIDGE_SOURCE_BALANCE_TOLERANCE,
 };
+use super::utils::waited_secs;
 use crate::{
     bridge::{
         call_sender::{BridgeCall, BridgeCallSender, prepare_bridge_call},
@@ -169,8 +170,7 @@ where
     /// A wait before the deposit bridge starts, after the funding transfer landed.
     /// Past the bound it errors, so the row parks with an alert.
     fn wait_before_deposit_bridge(state: &mut CexState, reason: &str) -> Result<(), String> {
-        let funded_at = *state.deposit.deposit_sent_at_ts.get_or_insert_with(now_ts);
-        let waited = now_ts().saturating_sub(funded_at);
+        let waited = waited_secs(&mut state.deposit.deposit_sent_at_ts);
         if waited > BRIDGE_START_TIMEOUT_SECS {
             return Err(format!(
                 "bridged deposit for liq_id {} still waits after {waited}s: {reason}",
