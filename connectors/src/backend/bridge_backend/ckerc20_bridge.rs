@@ -644,9 +644,20 @@ where
                 signer_balance, amount_base_units, signer, token_address
             ).into());
         }
+        // Helper must be approved before deposit call can transfer ERC20 from signer.
+        let helper_allowance = self
+            .evm_backend
+            .erc20_allowance_of(token_address, signer, helper_address)
+            .await
+            .map_err(|e| format!("ERC20 allowance(helper={helper_address}) failed: {e}"))?;
+        // USDT refuses to change one non-zero allowance to another, so a leftover
+        // allowance goes to zero first. That costs one more approve.
+        let clears_allowance = !helper_allowance.is_zero() && helper_allowance < amount_base_units;
+        let approves: u128 = if clears_allowance { 2 } else { 1 };
+
         // The approve and the helper call pay gas from the wallet's own ETH. A
         // short wallet waits for funding instead of failing at broadcast.
-        let gas_limit = ETH_FORWARD_HELPER_GAS_LIMIT + u128::from(ERC20_APPROVE_GAS_LIMIT);
+        let gas_limit = ETH_FORWARD_HELPER_GAS_LIMIT + approves * u128::from(ERC20_APPROVE_GAS_LIMIT);
         let gas_needed = U256::from(self.evm_backend.gas_price_wei().await?).saturating_mul(U256::from(gas_limit));
         let eth_balance = self.evm_backend.native_balance_of(signer).await?;
         if eth_balance < gas_needed {
@@ -656,13 +667,13 @@ where
             )));
         }
 
-        // Helper must be approved before deposit call can transfer ERC20 from signer.
-        let helper_allowance = self
-            .evm_backend
-            .erc20_allowance_of(token_address, signer, helper_address)
-            .await
-            .map_err(|e| format!("ERC20 allowance(helper={helper_address}) failed: {e}"))?;
         if helper_allowance < amount_base_units {
+            if clears_allowance {
+                self.evm_backend
+                    .erc20_approve_and_wait(token_address, helper_address, U256::ZERO)
+                    .await
+                    .map_err(|e| format!("ERC20 approve(helper={helper_address}, 0) failed: {e}"))?;
+            }
             self.evm_backend
                 .erc20_approve_and_wait(token_address, helper_address, amount_base_units)
                 .await
