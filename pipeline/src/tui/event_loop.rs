@@ -321,15 +321,7 @@ pub async fn run(opts: TuiOptions) -> anyhow::Result<()> {
                 }
             },
             UiEvent::Executions(res) => match res {
-                Ok(snapshot) => {
-                    app.executions = Some(snapshot);
-                    app.executions_error = None;
-                    app.executions_selected = app
-                        .executions
-                        .as_ref()
-                        .map(|e| e.rows.len().saturating_sub(1).min(app.executions_selected))
-                        .unwrap_or(0);
-                }
+                Ok(snapshot) => app.set_executions(snapshot),
                 Err(err) => {
                     app.executions_error = Some(err);
                 }
