@@ -3,6 +3,7 @@ use candid::{CandidType, Encode, Nat, Principal};
 use icrc_ledger_types::{
     icrc1::account::Account,
     icrc2::{allowance::AllowanceArgs, approve::ApproveArgs},
+    icrc3::transactions::{GetTransactionsRequest, GetTransactionsResponse, Mint, TransactionRange},
 };
 use num_traits::ToPrimitive;
 use serde::Deserialize;
@@ -720,8 +721,8 @@ where
         }))
     }
 
-    /// Ties the transfer to a deposit id that an operator recorded. The
-    /// minter must know the id, so a typo waits and parks again.
+    /// Ties the transfer to a deposit id that an operator recorded. The minter
+    /// must know the id, and the mint must reach this transfer's account.
     async fn recorded_sol_deposit(
         &self,
         route: &BridgeRouteSpec,
@@ -738,6 +739,42 @@ where
         Ok(DepositNotice::Accepted(BridgeSubmission {
             bridge_id: Self::queued_deposit_id(account, Some(deposit_id), funding_receipt, None)?,
         }))
+    }
+
+    /// The mint the ckSOL ledger recorded at `block_index`, read from the ledger
+    /// or, for an older block, from its archive.
+    async fn ledger_mint(&self, block_index: u64) -> Result<Mint, String> {
+        let request = GetTransactionsRequest {
+            start: Nat::from(block_index),
+            length: Nat::from(1u8),
+        };
+        let arg = Encode!(&request).map_err(|error| error.to_string())?;
+        let response: GetTransactionsResponse = self
+            .agent
+            .call_query(&self.cksol_ledger_canister, "get_transactions", arg.clone())
+            .await?;
+        let transaction = match response.transactions.into_iter().next() {
+            Some(transaction) if response.first_index == block_index => transaction,
+            _ => {
+                let archive = response
+                    .archived_transactions
+                    .into_iter()
+                    .next()
+                    .ok_or_else(|| format!("the ckSOL ledger has no block {block_index}"))?;
+                let range: TransactionRange = self
+                    .agent
+                    .call_query(&archive.callback.canister_id, &archive.callback.method, arg)
+                    .await?;
+                range
+                    .transactions
+                    .into_iter()
+                    .next()
+                    .ok_or_else(|| format!("the ckSOL archive has no block {block_index}"))?
+            }
+        };
+        transaction
+            .mint
+            .ok_or_else(|| format!("ckSOL block {block_index} is not a mint"))
     }
 
     async fn deposit_status(&self, deposit_id: u64) -> Result<DepositSolStatus, String> {
@@ -1039,14 +1076,28 @@ where
             };
             let deposit = self.deposit_status(deposit_id).await.map_err(BridgeError::Unreadable)?;
             return Ok(match deposit {
-                DepositSolStatus::Minted { block_index, minted_amount } => BridgeStatus::Minted(BridgeMintReceipt {
-                    transaction_hash: state.transfer_signature,
-                    log_index: Nat::from(deposit_id),
-                    mint_block_index: Nat::from(block_index),
-                    amount: Nat::from(minted_amount),
-                    recipient: state.account,
-                    token_symbol: "ckSOL".into(),
-                }),
+                DepositSolStatus::Minted {
+                    block_index,
+                    minted_amount,
+                } => {
+                    // The minter's status names no account, and an operator may have
+                    // recorded the id by hand. Only the ledger proves whose mint it was.
+                    let mint = self.ledger_mint(block_index).await.map_err(BridgeError::Unreadable)?;
+                    if mint.to != state.account || mint.amount != minted_amount {
+                        return Err(BridgeError::Ambiguous(format!(
+                            "ckSOL deposit {deposit_id} minted {} to {}, not to {}; it is not the deposit of SOL transfer {}",
+                            mint.amount, mint.to, state.account, state.transfer_signature
+                        )));
+                    }
+                    BridgeStatus::Minted(BridgeMintReceipt {
+                        transaction_hash: state.transfer_signature,
+                        log_index: Nat::from(deposit_id),
+                        mint_block_index: Nat::from(block_index),
+                        amount: mint.amount,
+                        recipient: mint.to,
+                        token_symbol: "ckSOL".into(),
+                    })
+                }
                 DepositSolStatus::Queued { .. } | DepositSolStatus::Swept { .. }
                 | DepositSolStatus::Finalized { .. } => BridgeStatus::Pending,
                 DepositSolStatus::NotFound => BridgeStatus::Unknown,
@@ -1232,6 +1283,141 @@ mod tests {
         assert_eq!(backend.get_minimum_bridge_amount("ckSOL", "ICP", "SOL").await.unwrap(), 0.002);
     }
 
+    fn ledger_mint_at(
+        block_index: u64,
+        to: Account,
+        amount: u64,
+    ) -> icrc_ledger_types::icrc3::transactions::GetTransactionsResponse {
+        use icrc_ledger_types::icrc3::transactions::{Mint, Transaction};
+        icrc_ledger_types::icrc3::transactions::GetTransactionsResponse {
+            log_length: Nat::from(block_index + 1),
+            first_index: Nat::from(block_index),
+            transactions: vec![Transaction::mint(
+                Mint {
+                    amount: Nat::from(amount),
+                    to,
+                    memo: None,
+                    created_at_time: None,
+                },
+                0,
+            )],
+            archived_transactions: vec![],
+        }
+    }
+
+    /// Review finding 17: deposit ids are one sequence for every user, so a
+    /// mistyped id named another deposit's mint. The ledger shows its account.
+    #[tokio::test]
+    async fn a_mint_to_another_account_is_not_this_deposit() {
+        let state = super::QueuedSolDeposit {
+            account: Account {
+                owner: bridge_owner(),
+                subaccount: Some([7; 32]),
+            },
+            deposit_id: Some(4123),
+            transfer_signature: "sol-transfer".into(),
+            notification_error: None,
+        };
+        let id = format!(
+            "{}{}",
+            super::QUEUED_DEPOSIT_PREFIX,
+            serde_json::to_string(&state).unwrap()
+        );
+        let mut agent = MockPipelineAgent::new();
+        agent
+            .expect_call_query::<super::DepositSolStatus>()
+            .returning(|_, _, _| {
+                Ok(super::DepositSolStatus::Minted {
+                    block_index: 90,
+                    minted_amount: 5,
+                })
+            });
+        agent
+            .expect_call_query::<icrc_ledger_types::icrc3::transactions::GetTransactionsResponse>()
+            .returning(|_, method, _| {
+                assert_eq!(method, "get_transactions");
+                Ok(ledger_mint_at(
+                    90,
+                    Account {
+                        owner: Principal::anonymous(),
+                        subaccount: None,
+                    },
+                    5,
+                ))
+            });
+
+        let error = backend(agent, MockIcpBackend::new(), MockSolanaBackend::new())
+            .get_bridge_status(&id)
+            .await
+            .expect_err("someone else's mint");
+        assert!(matches!(error, BridgeError::Ambiguous(_)), "{error:?}");
+    }
+
+    #[tokio::test]
+    async fn an_archived_mint_is_read_from_the_archive() {
+        use icrc_ledger_types::icrc3::{
+            archive::{ArchivedRange, QueryArchiveFn},
+            transactions::{GetTransactionsResponse, TransactionRange},
+        };
+        let account = Account {
+            owner: bridge_owner(),
+            subaccount: Some([7; 32]),
+        };
+        let state = super::QueuedSolDeposit {
+            account,
+            deposit_id: Some(42),
+            transfer_signature: "sol-transfer".into(),
+            notification_error: None,
+        };
+        let id = format!(
+            "{}{}",
+            super::QUEUED_DEPOSIT_PREFIX,
+            serde_json::to_string(&state).unwrap()
+        );
+        let archive = Principal::from_slice(&[9]);
+        let mut agent = MockPipelineAgent::new();
+        agent
+            .expect_call_query::<super::DepositSolStatus>()
+            .returning(|_, _, _| {
+                Ok(super::DepositSolStatus::Minted {
+                    block_index: 7,
+                    minted_amount: 5,
+                })
+            });
+        agent
+            .expect_call_query::<GetTransactionsResponse>()
+            .returning(move |_, _, _| {
+                Ok(GetTransactionsResponse {
+                    log_length: Nat::from(5_000u64),
+                    first_index: Nat::from(4_000u64),
+                    transactions: vec![],
+                    archived_transactions: vec![ArchivedRange {
+                        start: Nat::from(7u64),
+                        length: Nat::from(1u8),
+                        callback: QueryArchiveFn {
+                            canister_id: archive,
+                            method: "get_transactions".into(),
+                            _marker: std::marker::PhantomData,
+                        },
+                    }],
+                })
+            });
+        agent
+            .expect_call_query::<TransactionRange>()
+            .returning(move |canister, _, _| {
+                assert_eq!(*canister, archive);
+                Ok(TransactionRange {
+                    transactions: ledger_mint_at(7, account, 5).transactions,
+                })
+            });
+
+        let status = backend(agent, MockIcpBackend::new(), MockSolanaBackend::new())
+            .get_bridge_status(&id)
+            .await
+            .expect("the archived mint is this deposit's");
+        assert!(matches!(status, super::BridgeStatus::Minted(_)));
+    }
+
     #[tokio::test]
     async fn queued_deposit_uses_actual_mint_receipt_without_wallet_balance() {
         let state = super::QueuedSolDeposit {
@@ -1247,6 +1433,11 @@ mod tests {
             assert_eq!(candid::decode_one::<u64>(&args).unwrap(), 42);
             Ok(super::DepositSolStatus::Minted { block_index: 88, minted_amount: 999104120 })
         });
+        let account = state.account;
+        agent
+            .expect_call_query::<icrc_ledger_types::icrc3::transactions::GetTransactionsResponse>()
+            .times(1)
+            .returning(move |_, _, _| Ok(ledger_mint_at(88, account, 999104120)));
         let backend = backend(agent, MockIcpBackend::new(), MockSolanaBackend::new());
         let status = backend.get_bridge_status(&id).await.unwrap();
         let super::BridgeStatus::Minted(receipt) = status else { panic!("expected mint receipt") };
