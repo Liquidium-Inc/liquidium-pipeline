@@ -11,6 +11,10 @@ Before:
 Now:
 - Bridge flow is catalog-driven.
 - Backend supports ckETH minter native and ERC-20 routes: `CkErc20BridgeBackend`.
+- Forward deposits remain pending after helper inclusion until matching minter
+  credit is found. Matching `InvalidDeposit` or `QuarantinedDeposit` audit events
+  report a failed bridge status for operator reconciliation; they are not treated
+  as an indefinitely pending mint. The finaliser retains the submitted bridge ID.
 - Supported catalog routes include:
   - native forward: `ETH@ETH -> ckETH`
   - native reverse: `ckETH@ICP -> ETH@ETH`

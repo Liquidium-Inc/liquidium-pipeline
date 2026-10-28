@@ -134,10 +134,10 @@ impl MultiVenueFinalizer {
         self
     }
 
-    async fn notify_operator_required_leg(&self, leg: &VenueLegState) {
+    async fn notify_operator_required_leg(&self, liquidation_id: &str, leg: &VenueLegState) {
         self.watchdog
             .notify(WatchdogEvent::OperatorRequired {
-                execution_id: leg.leg_id.clone(),
+                execution_id: format!("{liquidation_id}:{}", leg.leg_id),
                 venue: leg.venue_id.clone(),
                 pending_step: "venue_reconciliation".to_string(),
                 owner: leg.venue_id.clone(),
@@ -478,7 +478,7 @@ impl MultiVenueFinalizer {
             if current.status != VenueLegStatus::OperatorRequired
                 && state.legs[index].status == VenueLegStatus::OperatorRequired
             {
-                self.notify_operator_required_leg(&state.legs[index]).await;
+                self.notify_operator_required_leg(&row.id, &state.legs[index]).await;
             }
 
             if state.legs[index].status != VenueLegStatus::FailedPermanent

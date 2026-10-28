@@ -19,6 +19,7 @@ use chrono::Local;
 use crossterm::event::{self, Event as CrosstermEvent};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
+use solana_sdk::{signature::Keypair, signer::Signer};
 use tokio::sync::mpsc;
 
 use crate::commands::liquidation_loop::LoopControl;
@@ -93,19 +94,16 @@ pub async fn run(opts: TuiOptions) -> anyhow::Result<()> {
                 let res = tokio::task::spawn_blocking(move || {
                     let counts = store.status_counts().map_err(|e| e.to_string())?;
                     let rows = store.list_recent(200).map_err(|e| e.to_string())?;
-                    let paused = store.daemon_paused().map_err(|e| e.to_string())?;
-                    Ok::<_, String>((counts, rows, paused))
+                    Ok::<_, String>((counts, rows))
                 })
                 .await;
                 match res {
-                    Ok(Ok((map, rows, paused))) => {
+                    Ok(Ok((map, rows))) => {
                         let snapshot = WalSnapshot {
                             counts: WalCounts::from_map(&map),
                             at: Local::now(),
                         };
                         let _ = ui_tx.send(UiEvent::Wal(Ok(snapshot)));
-                        let _ = ui_tx.send(UiEvent::DaemonPaused(Ok(paused)));
-
                         let rows = rows
                             .into_iter()
                             .map(|row| ExecutionRowData {
@@ -125,12 +123,48 @@ pub async fn run(opts: TuiOptions) -> anyhow::Result<()> {
                     Ok(Err(e)) => {
                         let _ = ui_tx.send(UiEvent::Wal(Err(format!("db query failed: {e}"))));
                         let _ = ui_tx.send(UiEvent::Executions(Err(format!("db query failed: {e}"))));
-                        let _ = ui_tx.send(UiEvent::DaemonPaused(Err(format!("db query failed: {e}"))));
                     }
                     Err(e) => {
                         let _ = ui_tx.send(UiEvent::Wal(Err(format!("db task failed: {e}"))));
                         let _ = ui_tx.send(UiEvent::Executions(Err(format!("db task failed: {e}"))));
-                        let _ = ui_tx.send(UiEvent::DaemonPaused(Err(format!("db task failed: {e}"))));
+                    }
+                }
+            }
+        });
+    }
+
+    // Scanner/control state polling (read-only, separate from execution WAL).
+    {
+        let ui_tx = ui_tx.clone();
+        let stop = stop.clone();
+        let db_path = ctx.config.db_path.clone();
+        tokio::spawn(async move {
+            let store = match SqliteWalStore::new_read_only_with_busy_timeout(&db_path, 30_000) {
+                Ok(store) => Arc::new(store),
+                Err(error) => {
+                    let _ = ui_tx.send(UiEvent::DaemonPaused(Err(format!("control state db open failed: {error}"))));
+                    return;
+                }
+            };
+
+            let mut interval = tokio::time::interval(Duration::from_secs(1));
+            loop {
+                interval.tick().await;
+                if stop.load(Ordering::Relaxed) {
+                    break;
+                }
+                let store = store.clone();
+                let result =
+                    tokio::task::spawn_blocking(move || store.daemon_paused().map_err(|e| e.to_string())).await;
+                match result {
+                    Ok(Ok(paused)) => {
+                        let _ = ui_tx.send(UiEvent::DaemonPaused(Ok(paused)));
+                    }
+                    Ok(Err(error)) => {
+                        let _ = ui_tx.send(UiEvent::DaemonPaused(Err(format!("control state db query failed: {error}"))));
+                    }
+                    Err(error) => {
+                        let _ = ui_tx.send(UiEvent::DaemonPaused(Err(format!("control state db task failed: {error}"))));
                     }
                 }
             }
@@ -193,6 +227,12 @@ pub async fn run(opts: TuiOptions) -> anyhow::Result<()> {
 
     let withdraw_assets = build_withdrawable_assets(&ctx);
     let cfg = &ctx.config;
+    let solana_address = Keypair::new_from_array(cfg.solana_private_key_bytes)
+        .pubkey()
+        .to_string();
+    let bridge_solana_address = Keypair::new_from_array(cfg.bridge_solana_private_key_bytes)
+        .pubkey()
+        .to_string();
     let config = ConfigSummary {
         ic_url: cfg.ic_url.clone(),
         lending_canister: cfg.lending_canister.to_text(),
@@ -200,7 +240,9 @@ pub async fn run(opts: TuiOptions) -> anyhow::Result<()> {
         liquidator_principal: cfg.liquidator_principal.to_text(),
         trader_principal: cfg.trader_principal.to_text(),
         evm_address: ctx.evm_address.clone(),
+        solana_address,
         bridge_evm_address: cfg.bridge_evm_address.clone(),
+        bridge_solana_address,
         bridge_ic_owner_principal: cfg.bridge_ic_owner_principal.to_text(),
         bridge_btc_address: cfg.bridge_btc_address.clone(),
         enabled_swap_venues: cfg.enabled_swap_venues.join(","),

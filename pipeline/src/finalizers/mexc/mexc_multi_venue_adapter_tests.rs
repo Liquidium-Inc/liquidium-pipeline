@@ -366,6 +366,458 @@ async fn restart_with_an_outstanding_intent_requires_operator_instead_of_replayi
 }
 
 #[tokio::test]
+async fn restart_polls_a_direct_deposit_then_gates_the_trade_separately() {
+    let mut cex = finalizer()
+        .prepare_amount_scoped_state(
+            "deposit-receipt-poll",
+            ChainTokenAmount::from_raw(pay_token(), Nat::from(100_000_000u64)),
+            receive_token(),
+            None,
+        )
+        .unwrap();
+    cex.step = CexStep::DepositPending;
+    cex.deposit.deposit_txid = Some("persisted-transfer".into());
+    cex.deposit.deposit_balance_before = Some(0.0);
+    cex.trade.trade_next_amount_in = Some(0.9999);
+    let mut execution = after_restart(cex);
+
+    for (balance, expected_step) in [(0.0, CexStep::DepositPending), (1.0, CexStep::Trade)] {
+        let mut restarted = finalizer();
+        Arc::get_mut(&mut restarted.backend)
+            .unwrap()
+            .expect_get_balance()
+            .times(1)
+            .returning(move |asset| {
+                assert_eq!(asset, "PAY");
+                Ok(balance)
+            });
+        execution.ready_to_advance = true;
+        execution.intent_id = Some("lost-process-local-gate".into());
+        let restored = serde_json::from_str(&serde_json::to_string(&execution).unwrap()).unwrap();
+        let progress = restarted.advance_decoded_leg(restored).await.unwrap();
+        assert_eq!(progress.status, VenueLegStatus::Running);
+        assert!(progress.last_error.is_none());
+        execution = progress.execution.decode(VENUE_ID).unwrap().unwrap();
+        assert_eq!(execution.cex.step, expected_step);
+        assert_eq!(execution.cex.deposit.deposit_txid.as_deref(), Some("persisted-transfer"));
+        assert!(!execution.operator_required);
+        assert!(!execution.ready_to_advance);
+        assert!(execution.intent_id.is_none());
+    }
+
+    // Confirmation must not submit an order; the trade needs a new durable gate.
+    let progress = finalizer().advance_decoded_leg(execution).await.unwrap();
+    let execution = progress.execution.decode::<MexcVenueExecutionState>(VENUE_ID).unwrap().unwrap();
+    assert_eq!(execution.cex.step, CexStep::Trade);
+    assert!(execution.ready_to_advance);
+    assert!(execution.intent_id.is_some());
+}
+
+/// A leg as the orchestrator hands it back after a process restart: armed in a
+/// process that no longer exists.
+fn after_restart(cex: CexState) -> MexcVenueExecutionState {
+    MexcVenueExecutionState {
+        cex,
+        ready_to_advance: true,
+        intent_id: Some("lost-process-local-gate".into()),
+        operator_required: false,
+    }
+}
+
+fn deposit_poll_finalizer(
+    bridge: liquidium_pipeline_connectors::backend::bridge_backend::MockBridgeBackend,
+) -> MexcFinalizer<MockCexBackend> {
+    finalizer().with_bridge_runtime(crate::finalizers::bridge_runtime::BridgeRuntime::for_tests(Arc::new(bridge)))
+}
+
+fn amount_check_request(token: ChainToken, raw: u64) -> SwapRequest {
+    SwapRequest {
+        pay_asset: token.asset_id(),
+        pay_amount: ChainTokenAmount::from_raw(token, Nat::from(raw)),
+        ..request(1)
+    }
+}
+
+fn cketh_amount_check_request(raw: u64) -> SwapRequest {
+    let token = ChainToken::Icp {
+        ledger: Principal::from_text("ss2fx-dyaaa-aaaar-qacoq-cai").unwrap(),
+        symbol: "ckETH".into(),
+        decimals: 18,
+        fee: Nat::from(2_000_000_000_000u64),
+    };
+    amount_check_request(token, raw)
+}
+
+#[tokio::test]
+async fn cksol_planning_amount_check_uses_the_minter_minimum_after_the_approval_reserve() {
+    use liquidium_pipeline_connectors::backend::bridge_backend::{BridgeFeeBudget, MockBridgeBackend};
+
+    let cksol = ChainToken::Icp {
+        ledger: Principal::from_text("ls5lp-lqaaa-aaaar-qb5oa-cai").unwrap(),
+        symbol: "ckSOL".into(),
+        decimals: 9,
+        fee: Nat::from(500u64),
+    };
+    // 7 ledger fees of 500 come off the transfer, then a 1_000 lamport reserve.
+    for (raw, below_minimum) in [
+        (9_000_000, true),
+        (10_004_000, true),
+        (10_004_500, false),
+        (10_005_000, false),
+    ] {
+        let mut bridge = MockBridgeBackend::new();
+        bridge
+            .expect_get_fee_budget()
+            .times(1)
+            .returning(|asset, chain, target| {
+                assert_eq!((asset, chain, target), ("ckSOL", "ICP", "SOL"));
+                Ok(BridgeFeeBudget {
+                    source_fee_budget: 0.000_001,
+                    ..BridgeFeeBudget::default()
+                })
+            });
+        bridge
+            .expect_get_minimum_bridge_amount()
+            .times(1)
+            .returning(|_, _, _| Ok(0.01));
+        bridge.expect_submit_bridge().times(0);
+        let finalizer = deposit_poll_finalizer(bridge);
+
+        let result = finalizer.check_amount(&amount_check_request(cksol.clone(), raw)).await;
+
+        if below_minimum {
+            let Err(VenueAmountError::BelowMinimum(reason)) = result else {
+                panic!("expected a below-minimum decision for {raw}, got {result:?}");
+            };
+            assert!(reason.contains("ckSOL -> SOL"), "{reason}");
+            assert!(reason.contains("0.01"), "{reason}");
+        } else {
+            result.unwrap_or_else(|error| panic!("{raw} lamports must pass: {error}"));
+        }
+    }
+}
+
+#[tokio::test]
+async fn cketh_planning_amount_check_reserves_fees_before_comparing_the_bridge_minimum() {
+    use liquidium_pipeline_connectors::backend::bridge_backend::{BridgeFeeBudget, MockBridgeBackend};
+
+    for (raw, below_minimum) in [
+        (4_000_000_000_000_000, true),
+        (5_050_000_000_000_000, true),
+        (5_064_000_000_000_000, false),
+        (5_065_000_000_000_000, false),
+    ] {
+        let mut bridge = MockBridgeBackend::new();
+        bridge
+            .expect_get_fee_budget()
+            .times(1)
+            .returning(|asset, chain, target| {
+                assert_eq!((asset, chain, target), ("ckETH", "ICP", "ETH"));
+                Ok(BridgeFeeBudget {
+                    source_fee_budget: 0.00005,
+                    ..BridgeFeeBudget::default()
+                })
+            });
+        bridge
+            .expect_get_minimum_bridge_amount()
+            .times(1)
+            .returning(|_, _, _| Ok(0.005));
+        bridge.expect_submit_bridge().times(0);
+        bridge.expect_get_source_balance().times(0);
+        let finalizer = deposit_poll_finalizer(bridge);
+
+        let result = finalizer.check_amount(&cketh_amount_check_request(raw)).await;
+
+        if below_minimum {
+            let Err(VenueAmountError::BelowMinimum(reason)) = result else {
+                panic!("expected a below-minimum decision, got {result:?}");
+            };
+            assert!(reason.contains("ckETH -> ETH"));
+            assert!(reason.contains("0.005"));
+        } else {
+            result.expect("the exact minimum and larger amounts remain executable");
+        }
+    }
+}
+
+#[tokio::test]
+async fn cketh_planning_amount_check_keeps_bridge_outages_retryable() {
+    use liquidium_pipeline_connectors::backend::bridge_backend::MockBridgeBackend;
+    let mut bridge = MockBridgeBackend::new();
+    bridge
+        .expect_get_fee_budget()
+        .times(1)
+        .returning(|_, _, _| Err("minter unavailable".into()));
+    bridge.expect_submit_bridge().times(0);
+    let finalizer = deposit_poll_finalizer(bridge);
+
+    assert!(matches!(
+        finalizer
+            .check_amount(&cketh_amount_check_request(4_000_000_000_000_000))
+            .await,
+        Err(VenueAmountError::Unavailable(_))
+    ));
+}
+
+#[tokio::test]
+async fn restart_only_polls_bridged_deposits_with_both_durable_submission_ids() {
+    use liquidium_pipeline_connectors::backend::bridge_backend::{BridgeStatus, MockBridgeBackend};
+
+    for (has_transfer, has_bridge, legacy_plan, bridge_completed) in [
+        (true, true, false, false),
+        (true, true, false, true),
+        (true, false, false, false),
+        (false, true, false, false),
+        (true, false, true, false),
+        (true, true, true, false),
+    ] {
+        let can_poll = has_transfer && has_bridge;
+        let mut bridge = MockBridgeBackend::new();
+        bridge.expect_submit_bridge().times(0);
+        bridge
+            .expect_get_bridge_status()
+            .times(usize::from(can_poll))
+            .returning(move |id| {
+                assert_eq!(id, "persisted-deposit-bridge");
+                Ok(if bridge_completed { BridgeStatus::Completed } else { BridgeStatus::Pending })
+            });
+        let mut restarted = deposit_poll_finalizer(bridge);
+        Arc::get_mut(&mut restarted.backend)
+            .unwrap()
+            .expect_get_balance()
+            .times(usize::from(can_poll && bridge_completed))
+            .returning(|asset| {
+                assert_eq!(asset, "ETH");
+                Ok(0.01)
+            });
+        let cketh = ChainToken::Icp {
+            ledger: Principal::from_text("ss2fx-dyaaa-aaaar-qacoq-cai").unwrap(),
+            symbol: "ckETH".into(),
+            decimals: 18,
+            fee: Nat::from(2_000_000_000_000u64),
+        };
+        let mut cex = restarted
+            .prepare_amount_scoped_state(
+                "bridged-deposit-poll",
+                ChainTokenAmount::from_formatted(cketh, 0.01),
+                receive_token(),
+                None,
+            )
+            .unwrap();
+        cex.step = CexStep::DepositPending;
+        cex.deposit.deposit_txid = has_transfer.then(|| "persisted-transfer".into());
+        cex.deposit.bridge.deposit_bridge_id = has_bridge.then(|| "persisted-deposit-bridge".into());
+        cex.deposit.deposit_balance_before = Some(0.0);
+        cex.deposit.bridge.deposit_bridge_expected_amount = Some(0.009);
+        if legacy_plan {
+            cex.deposit.bridge.deposit_planned_asset = None;
+            cex.deposit.bridge.deposit_planned_network = None;
+            cex.deposit.bridge.deposit_bridge_required = false;
+        }
+        let execution = after_restart(cex);
+        let restored = serde_json::from_str(&serde_json::to_string(&execution).unwrap()).unwrap();
+        let progress = restarted.advance_decoded_leg(restored).await.unwrap();
+        assert_eq!(
+            progress.status,
+            if can_poll { VenueLegStatus::Running } else { VenueLegStatus::OperatorRequired }
+        );
+        let execution = progress.execution.decode::<MexcVenueExecutionState>(VENUE_ID).unwrap().unwrap();
+        assert!(execution.cex.deposit.bridge.deposit_bridge_required);
+        assert_eq!(execution.operator_required, !can_poll);
+        assert_eq!(
+            execution.cex.step,
+            if can_poll && bridge_completed { CexStep::Trade } else { CexStep::DepositPending }
+        );
+    }
+}
+
+#[tokio::test]
+async fn restart_surfaces_a_failed_deposit_bridge_without_resubmitting() {
+    use liquidium_pipeline_connectors::backend::bridge_backend::{BridgeStatus, MockBridgeBackend};
+
+    let mut bridge = MockBridgeBackend::new();
+    bridge.expect_submit_bridge().times(0);
+    bridge.expect_get_bridge_status().times(1).returning(|_| {
+        Ok(BridgeStatus::Failed {
+            reason: Some("minter rejected the deposit".into()),
+        })
+    });
+    let restarted_finalizer = deposit_poll_finalizer(bridge);
+    let cketh = ChainToken::Icp {
+        ledger: Principal::from_text("ss2fx-dyaaa-aaaar-qacoq-cai").unwrap(),
+        symbol: "ckETH".into(),
+        decimals: 18,
+        fee: Nat::from(2_000_000_000_000u64),
+    };
+    let mut cex = restarted_finalizer
+        .prepare_amount_scoped_state(
+            "bridged-deposit-failed",
+            ChainTokenAmount::from_formatted(cketh, 0.01),
+            receive_token(),
+            None,
+        )
+        .unwrap();
+    cex.step = CexStep::DepositPending;
+    cex.deposit.deposit_txid = Some("persisted-transfer".into());
+    cex.deposit.bridge.deposit_bridge_id = Some("persisted-deposit-bridge".into());
+    cex.deposit.deposit_balance_before = Some(0.0);
+
+    let progress = restarted_finalizer.advance_decoded_leg(after_restart(cex)).await.unwrap();
+
+    // A failed bridge is an ordinary retryable error: the leg keeps its ids,
+    // spends retry budget, and is never resubmitted from here.
+    assert_eq!(progress.status, VenueLegStatus::Running);
+    let error = progress.retryable_error.expect("bridge failure is reported");
+    assert!(error.contains("minter rejected the deposit"), "{error}");
+    let execution = progress.execution.decode::<MexcVenueExecutionState>(VENUE_ID).unwrap().unwrap();
+    assert_eq!(execution.cex.step, CexStep::DepositPending);
+    assert_eq!(execution.cex.deposit.bridge.deposit_bridge_id.as_deref(), Some("persisted-deposit-bridge"));
+    assert!(!execution.operator_required);
+}
+
+#[tokio::test]
+async fn restart_direct_deposit_without_baseline_records_one_and_keeps_waiting() {
+    let mut restarted_finalizer = finalizer();
+    Arc::get_mut(&mut restarted_finalizer.backend)
+        .unwrap()
+        .expect_get_balance()
+        .times(1)
+        .returning(|_| Ok(1.0));
+    let mut cex = restarted_finalizer
+        .prepare_amount_scoped_state(
+            "deposit-no-baseline",
+            ChainTokenAmount::from_raw(pay_token(), Nat::from(100_000_000u64)),
+            receive_token(),
+            None,
+        )
+        .unwrap();
+    cex.step = CexStep::DepositPending;
+    cex.deposit.deposit_txid = Some("persisted-transfer".into());
+    cex.deposit.deposit_balance_before = None;
+
+    let progress = restarted_finalizer.advance_decoded_leg(after_restart(cex)).await.unwrap();
+
+    // Without a baseline the balance cannot prove this deposit, so the step
+    // records one and waits; the total-balance fallback needs elapsed time.
+    assert_eq!(progress.status, VenueLegStatus::Running);
+    assert!(progress.retryable_error.is_none());
+    let execution = progress.execution.decode::<MexcVenueExecutionState>(VENUE_ID).unwrap().unwrap();
+    assert_eq!(execution.cex.step, CexStep::DepositPending);
+    assert_eq!(execution.cex.deposit.deposit_balance_before, Some(1.0));
+    assert!(execution.cex.deposit.deposit_sent_at_ts.is_some());
+    assert!(!execution.ready_to_advance);
+}
+
+#[tokio::test]
+async fn restart_keeps_the_gate_when_legacy_withdraw_planning_introduces_a_bridge() {
+    use liquidium_pipeline_connectors::backend::bridge_backend::MockBridgeBackend;
+
+    let restarted = deposit_poll_finalizer(MockBridgeBackend::new());
+    let mut cex = restarted
+        .prepare_amount_scoped_state(
+            "legacy-withdraw-plan",
+            ChainTokenAmount::from_raw(pay_token(), Nat::from(100_000_000u64)),
+            ChainToken::Icp {
+                ledger: Principal::from_text("xevnm-gaaaa-aaaar-qafnq-cai").unwrap(),
+                symbol: "ckUSDC".into(),
+                decimals: 6,
+                fee: Nat::from(10_000u64),
+            },
+            None,
+        )
+        .unwrap();
+    cex.step = CexStep::WithdrawPending;
+    cex.withdraw.withdraw_id = Some("persisted-withdrawal".into());
+    cex.withdraw.bridge.withdraw_planned_asset = None;
+    cex.withdraw.bridge.withdraw_planned_network = None;
+    cex.withdraw.bridge.withdraw_bridge_required = false;
+    let progress = restarted
+        .advance_decoded_leg(after_restart(cex))
+        .await
+        .unwrap();
+    assert_eq!(progress.status, VenueLegStatus::OperatorRequired);
+}
+
+#[tokio::test]
+async fn restart_can_reconcile_a_direct_withdrawal_receipt_without_resubmission() {
+    use liquidium_pipeline_connectors::backend::cex_backend::{WithdrawStatus, WithdrawStatusSnapshot};
+    let mut restarted = finalizer();
+    Arc::get_mut(&mut restarted.backend)
+        .unwrap()
+        .expect_get_withdraw_status_snapshot_by_id()
+        .times(1)
+        .returning(|_, id| {
+            assert_eq!(id, "persisted-withdrawal");
+            Ok(WithdrawStatusSnapshot {
+                status: WithdrawStatus::Completed,
+                txid: Some("ledger:123".to_string()),
+                transaction_fee: Some(0.02),
+            })
+        });
+    let mut cex = restarted
+        .prepare_amount_scoped_state(
+            "receipt-poll",
+            ChainTokenAmount::from_raw(pay_token(), Nat::from(100_000_000u64)),
+            receive_token(),
+            None,
+        )
+        .unwrap();
+    cex.step = CexStep::WithdrawPending;
+    cex.withdraw.withdraw_id = Some("persisted-withdrawal".to_string());
+    cex.withdraw.size_out = Some(ChainTokenAmount::from_formatted(receive_token(), 10.0));
+    let progress = restarted
+        .advance_decoded_leg(after_restart(cex))
+        .await
+        .unwrap();
+    assert_eq!(progress.status, VenueLegStatus::Completed);
+    assert_eq!(progress.result.unwrap().receive_amount, Nat::from(9_980_000u64));
+}
+
+#[tokio::test]
+async fn restart_polls_a_persisted_helper_instead_of_parking_or_resubmitting() {
+    use liquidium_pipeline_connectors::backend::bridge_backend::{BridgeStatus, MockBridgeBackend};
+
+    let mut bridge = MockBridgeBackend::new();
+    bridge.expect_get_bridge_status().times(1).returning(|id| {
+        assert_eq!(id, "persisted-helper");
+        Ok(BridgeStatus::Pending)
+    });
+    bridge.expect_submit_bridge().times(0);
+    let restarted = deposit_poll_finalizer(bridge);
+    let mut cex = restarted
+        .prepare_amount_scoped_state(
+            "bridge-receipt-poll",
+            ChainTokenAmount::from_raw(pay_token(), Nat::from(100_000_000u64)),
+            receive_token(),
+            None,
+        )
+        .unwrap();
+    cex.withdraw.withdraw_asset = ChainToken::Icp {
+        ledger: Principal::from_text("xevnm-gaaaa-aaaar-qafnq-cai").unwrap(),
+        symbol: "ckUSDC".into(),
+        decimals: 6,
+        fee: Nat::from(10_000u64),
+    };
+    cex.step = CexStep::WithdrawPending;
+    cex.withdraw.withdraw_id = Some("persisted-withdrawal".into());
+    cex.withdraw.size_out = Some(ChainTokenAmount::from_formatted(
+        cex.withdraw.withdraw_asset.clone(),
+        10.0,
+    ));
+    cex.withdraw.bridge.withdraw_bridge_required = true;
+    cex.withdraw.bridge.withdraw_bridge_id = Some("persisted-helper".into());
+    cex.withdraw.bridge.withdraw_planned_asset = Some("USDC".into());
+    cex.withdraw.bridge.withdraw_planned_network = Some("ETH".into());
+    let progress = restarted
+        .advance_decoded_leg(after_restart(cex))
+        .await
+        .unwrap();
+    assert_eq!(progress.status, VenueLegStatus::Running);
+    assert!(progress.last_error.is_none());
+    assert!(progress.result.is_none());
+}
+
+#[tokio::test]
 async fn completed_leg_returns_a_result_without_parent_wal_access() {
     let finalizer = finalizer();
     let preview = MultiVenueAdapter::preview(&finalizer, &planning_context(), &request(100_000_000))
@@ -689,4 +1141,191 @@ async fn a_settled_fill_clears_the_recorded_wait() {
     // Cleared, so a later refusal is timed from its own first occurrence
     // rather than inheriting a stale deadline.
     assert_eq!(execution.cex.trade.trade_settlement_waiting_since_ts, None);
+}
+
+mod bridged_deposit_restart {
+    //! The persisted submit phase decides what a restart may do with a bridged
+    //! deposit that has no handle yet.
+    use super::*;
+    use crate::finalizers::bridge_claims::{BridgeClaims, MockBridgeClaimLookup};
+    use crate::finalizers::cex_finalizer::{BRIDGE_SUBMISSION_AMBIGUOUS_PREFIX, BridgeSubmitAttempt, BridgeSubmitPhase};
+    use liquidium_pipeline_connectors::backend::bridge_backend::{
+        BridgeFeeBudget, BridgeSubmissionCandidate, MockBridgeBackend,
+    };
+
+    fn cketh_state(finalizer: &MexcFinalizer<MockCexBackend>, phase: BridgeSubmitPhase) -> CexState {
+        let cketh = ChainToken::Icp {
+            ledger: Principal::from_text("ss2fx-dyaaa-aaaar-qacoq-cai").unwrap(),
+            symbol: "ckETH".into(),
+            decimals: 18,
+            fee: Nat::from(2_000_000_000_000u64),
+        };
+        let mut cex = finalizer
+            .prepare_amount_scoped_state(
+                "bridged-deposit-restart",
+                ChainTokenAmount::from_formatted(cketh, 0.01),
+                receive_token(),
+                None,
+            )
+            .unwrap();
+        cex.step = CexStep::DepositPending;
+        cex.deposit.deposit_txid = Some("persisted-transfer".into());
+        cex.deposit.deposit_balance_before = Some(0.0);
+        cex.deposit.bridge.deposit_bridge_submit_amount = Some(0.009);
+        cex.deposit.bridge.deposit_bridge_expected_amount = Some(0.0089);
+        cex.deposit.bridge.deposit_bridge_submit_phase = Some(phase);
+        cex
+    }
+
+    fn attempt() -> BridgeSubmitAttempt {
+        BridgeSubmitAttempt::test("ckETH", "0x1111111111111111111111111111111111111111", 0.009, Some(100))
+    }
+
+    fn zero_fee(bridge: &mut MockBridgeBackend) {
+        bridge.expect_get_fee_budget().returning(|_, _, _| {
+            Ok(BridgeFeeBudget {
+                source_fee_budget: 0.0,
+                destination_fee_budget: 0.0,
+                provider_fee_budget_native_units: None,
+            })
+        });
+    }
+
+    /// A finalizer whose registry answers "nothing claimed" to every lookup.
+    fn lookup_finalizer(bridge: MockBridgeBackend) -> MexcFinalizer<MockCexBackend> {
+        let mut claims = MockBridgeClaimLookup::new();
+        claims.expect_claims_since().returning(|_| Ok(BridgeClaims::default()));
+        finalizer().with_bridge_runtime(
+            crate::finalizers::bridge_runtime::BridgeRuntime::for_tests(Arc::new(bridge)).with_claims(Arc::new(claims)),
+        )
+    }
+
+    #[tokio::test]
+    async fn a_funding_wait_resumes_without_the_gate_and_without_a_call() {
+        let mut bridge = MockBridgeBackend::new();
+        zero_fee(&mut bridge);
+        bridge.expect_get_source_balance().times(1).returning(|_, _, _| Ok(0.0));
+        bridge.expect_prepare_submission().times(0);
+        bridge.expect_submit_bridge().times(0);
+        let mut restarted = deposit_poll_finalizer(bridge);
+        Arc::get_mut(&mut restarted.backend)
+            .unwrap()
+            .expect_get_deposit_address()
+            .times(1)
+            .returning(|asset, network| {
+                Ok(liquidium_pipeline_connectors::backend::cex_backend::DepositAddress {
+                    asset: asset.into(),
+                    network: network.into(),
+                    address: "0x1111111111111111111111111111111111111111".into(),
+                    tag: None,
+                })
+            });
+        let cex = cketh_state(&restarted, BridgeSubmitPhase::WaitingFunds);
+
+        let progress = restarted.advance_decoded_leg(after_restart(cex)).await.unwrap();
+
+        assert_eq!(progress.status, VenueLegStatus::Running);
+        let execution = progress.execution.decode::<MexcVenueExecutionState>(VENUE_ID).unwrap().unwrap();
+        assert!(!execution.operator_required);
+        assert_eq!(
+            execution.cex.deposit.bridge.deposit_bridge_submit_phase,
+            Some(BridgeSubmitPhase::WaitingFunds)
+        );
+        assert!(execution.cex.deposit.bridge.deposit_bridge_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_recorded_attempt_is_looked_up_and_attached_before_any_call() {
+        let mut bridge = MockBridgeBackend::new();
+        zero_fee(&mut bridge);
+        bridge.expect_submit_bridge().times(0);
+        bridge.expect_find_submissions().times(1).returning(|request, cursor, _| {
+            assert_eq!(request.asset, "ckETH");
+            assert_eq!(cursor, 100);
+            Ok(vec![BridgeSubmissionCandidate {
+                bridge_id: "ic-withdraw-eth:105".into(),
+                sequence: 105,
+            }])
+        });
+        let restarted = lookup_finalizer(bridge);
+        let cex = cketh_state(&restarted, BridgeSubmitPhase::Submitting(attempt()));
+
+        let progress = restarted.advance_decoded_leg(after_restart(cex)).await.unwrap();
+
+        assert_eq!(progress.status, VenueLegStatus::Running);
+        let execution = progress.execution.decode::<MexcVenueExecutionState>(VENUE_ID).unwrap().unwrap();
+        assert!(!execution.operator_required);
+        assert_eq!(
+            execution.cex.deposit.bridge.deposit_bridge_id.as_deref(),
+            Some("ic-withdraw-eth:105")
+        );
+        assert!(execution.cex.deposit.bridge.deposit_bridge_submit_phase.is_none());
+        assert_eq!(execution.cex.trade.trade_next_amount_in, Some(0.0089));
+    }
+
+    #[tokio::test]
+    async fn an_attempt_the_provider_cannot_disambiguate_parks_for_an_operator() {
+        let mut bridge = MockBridgeBackend::new();
+        zero_fee(&mut bridge);
+        bridge.expect_submit_bridge().times(0);
+        bridge.expect_find_submissions().times(1).returning(|_, _, _| {
+            Ok([105, 106]
+                .map(|sequence| BridgeSubmissionCandidate {
+                    bridge_id: format!("ic-withdraw-eth:{sequence}"),
+                    sequence,
+                })
+                .to_vec())
+        });
+        let restarted = lookup_finalizer(bridge);
+        let cex = cketh_state(&restarted, BridgeSubmitPhase::Submitting(attempt()));
+
+        let progress = restarted.advance_decoded_leg(after_restart(cex)).await.unwrap();
+
+        assert_eq!(progress.status, VenueLegStatus::OperatorRequired);
+        assert!(progress.retryable_error.is_none());
+        let error = progress.last_error.expect("reason for the operator");
+        assert!(error.starts_with(BRIDGE_SUBMISSION_AMBIGUOUS_PREFIX), "{error}");
+        let execution = progress.execution.decode::<MexcVenueExecutionState>(VENUE_ID).unwrap().unwrap();
+        assert!(execution.operator_required);
+        let Some(BridgeSubmitPhase::Submitting(kept)) = execution.cex.deposit.bridge.deposit_bridge_submit_phase else {
+            panic!("the attempt stays for the operator");
+        };
+        assert!(kept.called_at_ts.is_some());
+        assert!(kept.parked_for_operator);
+    }
+
+    /// An operator releases a parked leg by clearing its operator flag and
+    /// setting it back to running. The attempt stays, so the lookup runs again.
+    #[tokio::test]
+    async fn a_released_park_allows_a_new_call_only_after_an_empty_lookup() {
+        let mut bridge = MockBridgeBackend::new();
+        zero_fee(&mut bridge);
+        bridge.expect_submit_bridge().times(0);
+        bridge.expect_find_submissions().times(1).returning(|_, _, _| Ok(vec![]));
+        let released = lookup_finalizer(bridge);
+        let mut parked = attempt();
+        parked.called_at_ts = Some(1);
+        parked.parked_for_operator = true;
+        let cex = cketh_state(&released, BridgeSubmitPhase::Submitting(parked));
+        let cleared = MexcVenueExecutionState {
+            cex,
+            ready_to_advance: false,
+            intent_id: None,
+            operator_required: false,
+        };
+
+        // The first cycle arms a fresh intent; the second runs the lookup.
+        let armed = released.advance_decoded_leg(cleared).await.unwrap();
+        assert_eq!(armed.status, VenueLegStatus::Running);
+        let armed = armed.execution.decode::<MexcVenueExecutionState>(VENUE_ID).unwrap().unwrap();
+        assert!(armed.ready_to_advance);
+
+        let progress = released.advance_decoded_leg(armed).await.unwrap();
+        assert_eq!(progress.status, VenueLegStatus::Running);
+        let execution = progress.execution.decode::<MexcVenueExecutionState>(VENUE_ID).unwrap().unwrap();
+        assert_eq!(
+            execution.cex.deposit.bridge.deposit_bridge_submit_phase,
+            Some(BridgeSubmitPhase::WaitingFunds)
+        );
+    }
 }

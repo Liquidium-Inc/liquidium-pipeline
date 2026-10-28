@@ -1,17 +1,24 @@
 mod catalog;
 pub mod ckerc20_bridge;
 mod ckerc20_bridge_utils;
+pub mod solana_bridge;
+mod routed_bridge;
+pub use routed_bridge::RoutedBridgeBackend;
+mod mint_events;
 mod types;
 mod utils;
 pub use ckerc20_bridge::{
-    BRIDGE_AMOUNT_BELOW_MINIMUM_PREFIX, BridgeEvmBackend, CkErc20BridgeBackend, FINALIZER_PERMANENT_AMOUNT_FLOOR_PREFIX,
+    BRIDGE_AMOUNT_BELOW_MINIMUM_PREFIX, BRIDGE_SUBMISSION_DEFERRED_PREFIX, BridgeEvmBackend, CkErc20BridgeBackend,
+    FINALIZER_PERMANENT_AMOUNT_FLOOR_PREFIX,
 };
+pub use solana_bridge::{DEFAULT_SOLANA_BRIDGE_FEE_BUFFER_LAMPORTS, SolanaBridgeBackend};
 pub use types::{
-    BridgeBackend, BridgeDestination, BridgeDestinationKind, BridgeFeeBudget, BridgeRequest, BridgeRouteKind,
-    BridgeRouteSpec, BridgeStatus, BridgeSubmission, BridgeSweepRoute, EvmReceiptStatus, MockBridgeBackend,
+    BridgeBackend, BridgeDestination, BridgeDestinationKind, BridgeFeeBudget, BridgeMintReceipt, BridgeRequest,
+    BridgeRouteKind, BridgeRouteSpec, BridgeStatus, BridgeSubmission, BridgeSubmissionCandidate, BridgeSweepRoute,
+    EvmReceiptStatus, MockBridgeBackend,
 };
 pub use utils::{
     cketh_forward_routes, cketh_reverse_routes, resolve_cketh_forward_route_by_source,
-    resolve_cketh_forward_route_by_target, resolve_cketh_reverse_route_by_source, resolve_route,
-    validate_destination_for_route,
+    resolve_cketh_forward_route_by_target, resolve_cketh_reverse_route_by_source, resolve_forward_route_by_target,
+    resolve_reverse_route_by_source, resolve_route, validate_destination_for_route,
 };

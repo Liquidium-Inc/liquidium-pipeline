@@ -1,5 +1,8 @@
 use candid::Nat;
-use liquidium_pipeline_connectors::backend::cex_backend::CexBackend;
+use liquidium_pipeline_connectors::backend::{
+    bridge_backend::{BridgeRouteKind, resolve_route},
+    cex_backend::CexBackend,
+};
 use liquidium_pipeline_core::tokens::{chain_token::ChainToken, chain_token_amount::ChainTokenAmount};
 
 use super::{mexc_finalizer::MexcFinalizer, mexc_utils::LIQUIDITY_EPS};
@@ -63,6 +66,7 @@ where
                     deposit_bridge_submit_amount: None,
                     deposit_bridge_expected_amount: None,
                     deposit_bridge_provider_fee_budget_native_units: None,
+                    deposit_bridge_submit_phase: None,
                 },
             },
             trade: CexTradeState {
@@ -96,6 +100,7 @@ where
                 withdraw_address: receive_address.unwrap_or_else(|| self.liquidator_principal.to_text()),
                 withdraw_id: None,
                 withdraw_txid: None,
+                withdraw_accepted_at_ts: None,
                 size_out: None,
                 bridge: CexWithdrawBridgeState {
                     withdraw_planned_asset: Some(bridge_plan.withdraw.cex_asset),
@@ -104,6 +109,7 @@ where
                     withdraw_bridge_id: None,
                     withdraw_bridge_submitted_at_ts: None,
                     withdraw_bridge_polled_at_ts: None,
+                    withdraw_bridge_mint_receipt: None,
                     withdraw_bridge_destination_snapshot: None,
                 },
             },
@@ -112,7 +118,7 @@ where
 
     /// Resolves the receive token required by MEXC's deposit/withdraw state and
     /// validates that the request's exact pay allocation is internally sound.
-    fn prepare_swap_request(&self, execution_id: &str, request: &SwapRequest) -> Result<CexState, String> {
+    pub(super) fn prepare_swap_request(&self, execution_id: &str, request: &SwapRequest) -> Result<CexState, String> {
         if request.pay_amount.token.asset_id() != request.pay_asset {
             return Err("MEXC request pay asset does not match pay amount token".to_string());
         }
@@ -241,10 +247,23 @@ where
             .collect();
         state.trade.trade_leg_total = Some(legs.len() as u32);
 
-        let receive_amount = ChainTokenAmount::from_formatted(
-            state.withdraw.withdraw_asset.clone(),
-            route_preview.receive_amount.max(0.0),
+        let mut net_receive = route_preview.receive_amount.max(0.0);
+        let mut execution_price = route_preview.execution_price;
+        let withdraw_route = resolve_route(
+            &<Self as BridgePlanner>::planned_withdraw_asset(&state),
+            &<Self as BridgePlanner>::planned_withdraw_network(&state),
+            &state.withdraw.withdraw_asset.symbol(),
         );
+        if state.withdraw.bridge.withdraw_bridge_required
+            && let Some(route) = withdraw_route
+            && route.route_kind == BridgeRouteKind::SolanaToIcp
+        {
+            let bridge = self.bridge.as_ref().ok_or_else(|| "SOL bridge runtime is missing".to_string())?;
+            let gross = ChainTokenAmount::from_formatted(state.withdraw.withdraw_asset.clone(), net_receive);
+            net_receive = Self::solana_repayment_bridge_amount(bridge, route, &gross).await?.to_f64();
+            execution_price = net_receive / initial_amount;
+        }
+        let receive_amount = ChainTokenAmount::from_formatted(state.withdraw.withdraw_asset.clone(), net_receive);
         let route_id = if legs.is_empty() {
             format!(
                 "{}_{}",
@@ -263,7 +282,7 @@ where
             receive_asset: request.receive_asset.clone(),
             receive_amount: receive_amount.value.clone(),
             mid_price: route_preview.reference_price,
-            exec_price: route_preview.execution_price,
+            exec_price: execution_price,
             estimated_price_impact_bps: route_preview.price_impact_bps,
             legs: vec![SwapQuoteLeg {
                 venue: "mexc".to_string(),
@@ -274,7 +293,7 @@ where
                 receive_chain: receive_amount.token.chain(),
                 receive_symbol: receive_amount.token.symbol(),
                 receive_amount: receive_amount.value.clone(),
-                price: route_preview.execution_price,
+                price: execution_price,
                 lp_fee: Nat::from(0u8),
                 gas_fee: Nat::from(0u8),
             }],

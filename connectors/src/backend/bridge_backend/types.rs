@@ -2,13 +2,14 @@ use alloy::primitives::Address;
 use async_trait::async_trait;
 use candid::{CandidType, Nat, Principal};
 use icrc_ledger_types::icrc1::account::Account;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BridgeDestination {
     IcpAccount(Account),
     EvmAddress(Address),
     BtcAddress(String),
+    SolanaAddress(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -16,6 +17,7 @@ pub enum BridgeDestinationKind {
     IcpAccount,
     EvmAddress,
     BtcAddress,
+    SolanaAddress,
 }
 
 impl BridgeDestination {
@@ -24,6 +26,7 @@ impl BridgeDestination {
             Self::IcpAccount(_) => BridgeDestinationKind::IcpAccount,
             Self::EvmAddress(_) => BridgeDestinationKind::EvmAddress,
             Self::BtcAddress(_) => BridgeDestinationKind::BtcAddress,
+            Self::SolanaAddress(_) => BridgeDestinationKind::SolanaAddress,
         }
     }
 }
@@ -36,6 +39,8 @@ pub enum BridgeRouteKind {
     CkEthToEth,
     BtcToCkBtc,
     CkBtcToBtc,
+    SolanaToIcp,
+    IcpToSolana,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -45,6 +50,9 @@ pub struct BridgeRouteSpec {
     pub target_asset: &'static str,
     pub destination_kind: BridgeDestinationKind,
     pub route_kind: BridgeRouteKind,
+    /// The exchange cannot hold the ICP asset, so exchange legs move through
+    /// this bridge. False for assets the exchange lists on the ICP network.
+    pub exchange_transport: bool,
     pub evm_token_address: Option<&'static str>,
     pub ckerc20_ledger_id: Option<&'static str>,
     pub min_sweep_amount: f64,
@@ -56,6 +64,14 @@ pub struct BridgeSweepRoute {
     pub source_chain: String,
     pub target_asset: String,
     pub min_sweep_amount: f64,
+}
+
+/// A provider record that may belong to an attempt whose handle was lost.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BridgeSubmissionCandidate {
+    pub bridge_id: String,
+    /// Provider-side monotonic position. Attempt cursors compare against it.
+    pub sequence: u64,
 }
 
 /// A normalized request for moving assets between chains/assets.
@@ -90,9 +106,21 @@ pub struct BridgeSubmission {
 pub enum BridgeStatus {
     Pending,
     Completed,
+    Minted(BridgeMintReceipt),
     Failed { reason: Option<String> },
     Canceled { reason: Option<String> },
     Unknown,
+}
+
+/// Deposit-specific ledger evidence; unrelated wallet credits cannot satisfy it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BridgeMintReceipt {
+    pub transaction_hash: String,
+    pub log_index: Nat,
+    pub mint_block_index: Nat,
+    pub amount: Nat,
+    pub recipient: Account,
+    pub token_symbol: String,
 }
 
 /// Backend contract for reading balances and executing bridge routes.
@@ -144,6 +172,27 @@ pub trait BridgeBackend: Send + Sync {
 
     /// Polls current status for a previously submitted bridge operation.
     async fn get_bridge_status(&self, bridge_id: &str) -> Result<BridgeStatus, String>;
+
+    /// Reads the provider's history position before a submission, so a handle
+    /// lost between the call and its persistence can be found again. `None`
+    /// means this provider cannot look up lost submissions.
+    async fn prepare_submission(&self, request: &BridgeRequest) -> Result<Option<u64>, String> {
+        let _ = request;
+        Ok(None)
+    }
+
+    /// Returns provider records after `cursor` that match the request exactly
+    /// and are not in `claimed_bridge_ids`. The read must be certified, because
+    /// the caller may submit again when nothing is found.
+    async fn find_submissions(
+        &self,
+        request: &BridgeRequest,
+        cursor: u64,
+        claimed_bridge_ids: &[String],
+    ) -> Result<Vec<BridgeSubmissionCandidate>, String> {
+        let _ = (request, cursor, claimed_bridge_ids);
+        Err("submission lookup is not supported by this bridge backend".to_string())
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -200,6 +249,29 @@ pub(super) struct WithdrawalArg {
     pub amount: Nat,
     pub recipient: String,
     pub from_subaccount: Option<Vec<u8>>,
+}
+
+// Variant names are the minter's candid tags.
+#[allow(clippy::enum_variant_names)]
+#[derive(CandidType, Deserialize, Clone, Debug)]
+pub(super) enum WithdrawalSearchParameter {
+    ByRecipient(String),
+    BySenderAccount(Account),
+    ByWithdrawalId(u64),
+}
+
+/// One minter withdrawal as `withdrawal_status` reports it. The status variant
+/// is kept opaque: the record proves the burn happened whatever its state.
+#[derive(CandidType, Deserialize, Clone, Debug)]
+pub(super) struct WithdrawalDetail {
+    pub token_symbol: String,
+    pub withdrawal_amount: Nat,
+    pub max_transaction_fee: Option<Nat>,
+    pub withdrawal_id: u64,
+    pub from: Principal,
+    pub from_subaccount: Option<Vec<u8>>,
+    pub recipient_address: String,
+    pub status: candid::Reserved,
 }
 
 #[derive(CandidType, Deserialize, Clone, Debug)]

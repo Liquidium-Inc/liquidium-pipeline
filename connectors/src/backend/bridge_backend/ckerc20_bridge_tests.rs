@@ -18,6 +18,29 @@ use super::{
     parse_source_icp_account, resolve_cketh_route_for_request,
 };
 
+/// A wallet with nothing in the mempool, the normal state for a submission.
+fn idle_wallet() -> MockBridgeEvmBackend {
+    let mut evm = MockBridgeEvmBackend::new();
+    evm.expect_has_pending_transactions().returning(|| Ok(false));
+    evm
+}
+
+fn expect_event_boundary(agent: &mut MockPipelineAgent) {
+    #[derive(candid::CandidType)]
+    struct Events {
+        events: Vec<u64>,
+        total_event_count: u64,
+    }
+    agent.expect_call_query_raw().times(1).returning(|_, method, _| {
+        assert_eq!(method, "get_events");
+        Ok(candid::encode_one(Events {
+            events: vec![],
+            total_event_count: 42,
+        })
+        .unwrap())
+    });
+}
+
 #[test]
 fn destination_account_encodes_principal_and_default_subaccount() {
     let account = Account {
@@ -175,6 +198,81 @@ fn reverse_source_must_match_bridge_owner_and_be_owner_only() {
 }
 
 #[tokio::test]
+async fn forward_bridge_serialises_preflight_and_defers_pending_wallet_after_restart() {
+    for _ in 0..2 {
+        let mut evm = MockBridgeEvmBackend::new();
+        evm.expect_has_pending_transactions().times(1).returning(|| Ok(true));
+        evm.expect_erc20_approve_and_wait().times(0);
+        evm.expect_helper_deposit_native().times(0);
+        evm.expect_helper_deposit_with_subaccount().times(0);
+        let backend = CkErc20BridgeBackend::new(
+            Arc::new(MockPipelineAgent::new()),
+            Arc::new(MockIcpBackend::new()),
+            Arc::new(evm),
+            Principal::management_canister(),
+            Principal::management_canister(),
+        );
+        let request = BridgeRequest {
+            asset: "USDC".into(),
+            source_chain: "ETH".into(),
+            source_address: "0x1111111111111111111111111111111111111111".into(),
+            target_asset: "ckUSDC".into(),
+            destination: BridgeDestination::IcpAccount(Account {
+                owner: Principal::management_canister(),
+                subaccount: None,
+            }),
+            amount: 1.0,
+            provider_fee_budget_native_units: None,
+        };
+        let guard = backend.forward_submission.lock().await;
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(10),
+                backend.submit_bridge(request.clone())
+            )
+            .await
+            .is_err()
+        );
+        drop(guard);
+        assert!(
+            backend
+                .submit_bridge(request)
+                .await
+                .unwrap_err()
+                .contains("pending transactions")
+        );
+    }
+}
+
+#[tokio::test]
+async fn successful_helper_receipt_without_a_minter_credit_stays_pending() {
+    let hash = TxHash::from([8; 32]);
+    let mut evm = MockBridgeEvmBackend::new();
+    evm.expect_receipt_status().with(eq(hash)).times(1).returning(|_| {
+        Ok(Some(super::EvmReceiptStatus {
+            success: true,
+            block_number: Some(100),
+        }))
+    });
+    let mut agent = MockPipelineAgent::new();
+    expect_event_boundary(&mut agent);
+    let backend = CkErc20BridgeBackend::new(
+        Arc::new(agent),
+        Arc::new(MockIcpBackend::new()),
+        Arc::new(evm),
+        Principal::management_canister(),
+        Principal::management_canister(),
+    );
+    assert!(matches!(
+        backend
+            .get_bridge_status(&format!("ckmint:42:{hash:#x}"))
+            .await
+            .unwrap(),
+        super::BridgeStatus::Pending
+    ));
+}
+
+#[tokio::test]
 async fn forward_bridge_rejects_subaccount_destination_when_native_helper_is_resolved() {
     let signer = "0x1111111111111111111111111111111111111111"
         .parse::<Address>()
@@ -195,7 +293,7 @@ async fn forward_bridge_rejects_subaccount_destination_when_native_helper_is_res
             })
         });
 
-    let mut mock_evm = MockBridgeEvmBackend::new();
+    let mut mock_evm = idle_wallet();
     mock_evm.expect_signer_address().times(1).returning(move || signer);
     mock_evm.expect_erc20_decimals_of().times(0);
     mock_evm.expect_erc20_approve_and_wait().times(0);
@@ -245,6 +343,7 @@ async fn forward_bridge_skips_approve_when_allowance_is_sufficient() {
     let tx_hash = TxHash::from([0x11u8; 32]);
 
     let mut mock_agent = MockPipelineAgent::new();
+    expect_event_boundary(&mut mock_agent);
     mock_agent
         .expect_call_query::<CkEthMinterInfo>()
         .times(1)
@@ -258,7 +357,7 @@ async fn forward_bridge_skips_approve_when_allowance_is_sufficient() {
             })
         });
 
-    let mut mock_evm = MockBridgeEvmBackend::new();
+    let mut mock_evm = idle_wallet();
     mock_evm.expect_signer_address().times(1).returning(move || signer);
     mock_evm
         .expect_erc20_decimals_of()
@@ -310,7 +409,7 @@ async fn forward_bridge_skips_approve_when_allowance_is_sufficient() {
     };
 
     let submission = backend.submit_bridge(request).await.expect("bridge must submit");
-    assert_eq!(submission.bridge_id, format!("{:#x}", tx_hash));
+    assert!(submission.bridge_id.starts_with(&format!("ckmint:42:{tx_hash:#x}:")));
 }
 
 #[tokio::test]
@@ -328,6 +427,7 @@ async fn forward_bridge_approves_when_allowance_is_insufficient() {
     let tx_hash = TxHash::from([0x22u8; 32]);
 
     let mut mock_agent = MockPipelineAgent::new();
+    expect_event_boundary(&mut mock_agent);
     mock_agent
         .expect_call_query::<CkEthMinterInfo>()
         .times(1)
@@ -341,7 +441,7 @@ async fn forward_bridge_approves_when_allowance_is_insufficient() {
             })
         });
 
-    let mut mock_evm = MockBridgeEvmBackend::new();
+    let mut mock_evm = idle_wallet();
     mock_evm.expect_signer_address().times(1).returning(move || signer);
     mock_evm
         .expect_erc20_decimals_of()
@@ -397,7 +497,7 @@ async fn forward_bridge_approves_when_allowance_is_insufficient() {
     };
 
     let submission = backend.submit_bridge(request).await.expect("bridge must submit");
-    assert_eq!(submission.bridge_id, format!("{:#x}", tx_hash));
+    assert!(submission.bridge_id.starts_with(&format!("ckmint:42:{tx_hash:#x}:")));
 }
 
 #[tokio::test]
@@ -426,7 +526,7 @@ async fn forward_bridge_fails_preflight_when_balance_is_insufficient() {
             })
         });
 
-    let mut mock_evm = MockBridgeEvmBackend::new();
+    let mut mock_evm = idle_wallet();
     mock_evm.expect_signer_address().times(1).returning(move || signer);
     mock_evm
         .expect_erc20_decimals_of()
@@ -489,6 +589,7 @@ async fn native_forward_bridge_uses_deposit_eth_with_subaccount_helper() {
     let tx_hash = TxHash::from([0x44u8; 32]);
 
     let mut mock_agent = MockPipelineAgent::new();
+    expect_event_boundary(&mut mock_agent);
     mock_agent
         .expect_call_query::<CkEthMinterInfo>()
         .times(1)
@@ -552,7 +653,7 @@ async fn native_forward_bridge_uses_deposit_eth_with_subaccount_helper() {
     };
 
     let submission = backend.submit_bridge(request).await.expect("bridge must submit");
-    assert_eq!(submission.bridge_id, format!("{:#x}", tx_hash));
+    assert!(submission.bridge_id.starts_with(&format!("ckmint:42:{tx_hash:#x}:")));
 }
 
 #[tokio::test]
@@ -568,6 +669,7 @@ async fn native_forward_bridge_falls_back_to_legacy_eth_helper_for_default_subac
     let tx_hash = TxHash::from([0x45u8; 32]);
 
     let mut mock_agent = MockPipelineAgent::new();
+    expect_event_boundary(&mut mock_agent);
     mock_agent
         .expect_call_query::<CkEthMinterInfo>()
         .times(1)
@@ -623,7 +725,7 @@ async fn native_forward_bridge_falls_back_to_legacy_eth_helper_for_default_subac
     };
 
     let submission = backend.submit_bridge(request).await.expect("bridge must submit");
-    assert_eq!(submission.bridge_id, format!("{:#x}", tx_hash));
+    assert!(submission.bridge_id.starts_with(&format!("ckmint:42:{tx_hash:#x}:")));
 }
 
 #[tokio::test]
@@ -1055,7 +1157,7 @@ async fn reverse_bridge_approves_only_missing_icrc2_allowance() {
         .expect_icrc2_approve()
         .withf(move |ledger, args| {
             *ledger == cketh_ledger
-                && args.amount == Nat::from(120_000u64)
+                && args.amount == 120_000u64
                 && args.spender.owner == minter
                 && args.spender.subaccount.is_none()
         })
@@ -1529,4 +1631,176 @@ async fn native_reverse_bridge_rejects_wrong_bridge_owner() {
 
     let err = backend.submit_bridge(request).await.expect_err("must fail");
     assert!(err.contains("does not match configured bridge owner"));
+}
+
+mod lost_submission_lookup {
+    //! The minter's withdrawal history is the record of every reverse submission.
+    use super::*;
+    use crate::backend::bridge_backend::ckerc20_bridge_utils::{minter_withdrawal_id, recovered_bridge_id};
+    use crate::backend::bridge_backend::{BridgeRouteKind, BridgeSubmissionCandidate};
+    use super::super::WithdrawalDetail;
+
+    const BRIDGE_OWNER: Principal = Principal::management_canister();
+    const RECIPIENT: &str = "0x1111111111111111111111111111111111111111";
+
+    fn withdrawal(id: u64, token: &str, amount: u64, recipient: &str) -> WithdrawalDetail {
+        WithdrawalDetail {
+            token_symbol: token.into(),
+            withdrawal_amount: Nat::from(amount),
+            max_transaction_fee: None,
+            withdrawal_id: id,
+            from: BRIDGE_OWNER,
+            from_subaccount: None,
+            recipient_address: recipient.into(),
+            status: candid::Reserved,
+        }
+    }
+
+    fn request(asset: &str, target: &str, amount: f64) -> BridgeRequest {
+        BridgeRequest {
+            asset: asset.into(),
+            source_chain: "ICP".into(),
+            source_address: BRIDGE_OWNER.to_text(),
+            target_asset: target.into(),
+            destination: BridgeDestination::EvmAddress(RECIPIENT.parse::<Address>().unwrap()),
+            amount,
+            provider_fee_budget_native_units: None,
+        }
+    }
+
+    fn backend(
+        agent: MockPipelineAgent,
+        icp: MockIcpBackend,
+    ) -> CkErc20BridgeBackend<MockPipelineAgent, MockIcpBackend, MockBridgeEvmBackend> {
+        CkErc20BridgeBackend::new(
+            Arc::new(agent),
+            Arc::new(icp),
+            Arc::new(MockBridgeEvmBackend::new()),
+            Principal::anonymous(),
+            BRIDGE_OWNER,
+        )
+    }
+
+    #[test]
+    fn handles_share_the_minter_withdrawal_id() {
+        assert_eq!(minter_withdrawal_id("ic-withdraw:12:105"), Some(105));
+        assert_eq!(minter_withdrawal_id("ic-withdraw:recovered:105"), Some(105));
+        assert_eq!(minter_withdrawal_id("ic-withdraw-eth:77"), Some(77));
+        assert_eq!(minter_withdrawal_id("0xabc"), None);
+        assert_eq!(minter_withdrawal_id("ckmint:1:0xabc:{}"), None);
+        assert_eq!(recovered_bridge_id(BridgeRouteKind::CkEthToEth, 77), "ic-withdraw-eth:77");
+        assert_eq!(
+            recovered_bridge_id(BridgeRouteKind::CkEthErc20Reverse, 105),
+            "ic-withdraw:recovered:105"
+        );
+    }
+
+    #[tokio::test]
+    async fn prepare_reads_the_highest_withdrawal_id_for_reverse_routes_only() {
+        let mut agent = MockPipelineAgent::new();
+        agent
+            .expect_call_query::<Vec<WithdrawalDetail>>()
+            .times(2)
+            .returning(|_, method, arg| {
+                assert_eq!(method, "withdrawal_status");
+                let parameter: super::super::WithdrawalSearchParameter = candid::decode_one(&arg).unwrap();
+                let super::super::WithdrawalSearchParameter::BySenderAccount(account) = parameter else {
+                    panic!("search by the bridge account");
+                };
+                assert_eq!(account.owner, BRIDGE_OWNER);
+                Ok(vec![
+                    withdrawal(100, "ckUSDC", 1, RECIPIENT),
+                    withdrawal(300, "ckETH", 1, RECIPIENT),
+                    withdrawal(200, "ckUSDC", 1, RECIPIENT),
+                ])
+            });
+        let backend = backend(agent, MockIcpBackend::new());
+
+        assert_eq!(backend.prepare_submission(&request("ckUSDC", "USDC", 1.0)).await, Ok(Some(300)));
+        assert_eq!(backend.prepare_submission(&request("ckETH", "ETH", 1.0)).await, Ok(Some(300)));
+
+        let forward = BridgeRequest {
+            asset: "USDC".into(),
+            source_chain: "ETH".into(),
+            source_address: RECIPIENT.into(),
+            target_asset: "ckUSDC".into(),
+            destination: BridgeDestination::IcpAccount(Account {
+                owner: BRIDGE_OWNER,
+                subaccount: None,
+            }),
+            amount: 1.0,
+            provider_fee_budget_native_units: None,
+        };
+        assert_eq!(backend.prepare_submission(&forward).await, Ok(None));
+        assert!(backend.find_submissions(&forward, 0, &[]).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn find_matches_exact_records_after_the_cursor_and_skips_claimed_ones() {
+        let mut agent = MockPipelineAgent::new();
+        agent
+            .expect_call_update::<Vec<WithdrawalDetail>>()
+            .times(1)
+            .returning(|_, method, _| {
+                assert_eq!(method, "withdrawal_status");
+                let mut other_owner = withdrawal(110, "ckUSDC", 920_000, RECIPIENT);
+                other_owner.from = Principal::anonymous();
+                let mut with_subaccount = withdrawal(111, "ckUSDC", 920_000, RECIPIENT);
+                with_subaccount.from_subaccount = Some(vec![1; 32]);
+                Ok(vec![
+                    withdrawal(100, "ckUSDC", 920_000, RECIPIENT),
+                    withdrawal(105, "ckUSDC", 920_000, RECIPIENT),
+                    withdrawal(106, "ckUSDC", 920_000, RECIPIENT),
+                    withdrawal(107, "ckUSDC", 920_001, RECIPIENT),
+                    withdrawal(108, "ckUSDC", 920_000, "0x2222222222222222222222222222222222222222"),
+                    withdrawal(109, "ckUSDT", 920_000, RECIPIENT),
+                    other_owner,
+                    with_subaccount,
+                    withdrawal(112, "ckusdc", 920_000, &RECIPIENT.to_ascii_uppercase()),
+                ])
+            });
+        let mut icp = MockIcpBackend::new();
+        icp.expect_icrc1_decimals().times(1).returning(|_| Ok(6));
+        let backend = backend(agent, icp);
+
+        let found = backend
+            .find_submissions(
+                &request("ckUSDC", "USDC", 0.92),
+                100,
+                &["ic-withdraw:12:106".into(), "0xdead".into()],
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            found,
+            vec![
+                BridgeSubmissionCandidate {
+                    bridge_id: "ic-withdraw:recovered:105".into(),
+                    sequence: 105
+                },
+                BridgeSubmissionCandidate {
+                    bridge_id: "ic-withdraw:recovered:112".into(),
+                    sequence: 112
+                },
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn native_cketh_records_rebuild_the_eth_handle_without_a_ledger_read() {
+        let mut agent = MockPipelineAgent::new();
+        agent
+            .expect_call_update::<Vec<WithdrawalDetail>>()
+            .times(1)
+            .returning(|_, _, _| Ok(vec![withdrawal(55, "ckETH", 5_000_000_000_000_000, RECIPIENT)]));
+        let backend = backend(agent, MockIcpBackend::new());
+
+        let found = backend
+            .find_submissions(&request("ckETH", "ETH", 0.005), 0, &[])
+            .await
+            .unwrap();
+
+        assert_eq!(found[0].bridge_id, "ic-withdraw-eth:55");
+    }
 }

@@ -7,19 +7,22 @@ use std::{
     sync::{Arc, atomic::AtomicBool},
     time::Duration,
 };
-use tokio::time::sleep;
 use tracing::instrument;
 use tracing::{info, warn};
 
 use crate::{
+    commands::execution_worker::spawn_execution_worker,
     commands::liquidation_loop_helpers::{
         bootstrap_control_plane, console_ui_enabled, debt_asset_principals, debt_assets_as_text,
         ensure_runtime_file_permissions, print_banner, run_daemon_cycle_loop,
     },
     config::{Config, ConfigTrait},
     context::{PipelineContext, init_context},
+    control_plane::acquire_daemon_instance,
     executors::basic::basic_executor::BasicExecutor,
     finalizers::{
+        bridge_claims::WalBridgeClaims,
+        bridge_runtime::BridgeRuntime,
         mexc::runtime::build_mexc_finalizer,
         multi_venue::{
             ICPSWAP_VENUE_ID, IcpswapFirstPlannerConfig, MEXC_VENUE_ID, MultiVenueAdapter, MultiVenueFinalizer,
@@ -28,8 +31,8 @@ use crate::{
     },
     liquidation::collateral_service::CollateralService,
     persistance::{
-        FinalizerMetaPayload, MultiVenueExecutionOutcome, ResultStatus, VenueLegStatus, WalStore,
-        sqlite::SqliteWalStore,
+        FinalizerMetaPayload, LiquidationIntentStore, MultiVenueExecutionOutcome, ResultStatus, VenueLegStatus,
+        WalStore, sqlite::SqliteWalStore,
     },
     price_oracle::price_oracle::LiquidationPriceOracle,
     stages::{
@@ -54,13 +57,6 @@ use liquidium_pipeline_core::{
 };
 
 const BRIDGE_CKETH_LEDGER_ID: &str = "ss2fx-dyaaa-aaaar-qacoq-cai";
-
-/// Cadence at which the settlement watcher polls the WAL for rows awaiting
-/// on-chain confirmation.
-const SETTLEMENT_POLL_INTERVAL: Duration = Duration::from_secs(3);
-
-/// Cooldown before the settlement watcher supervisor respawns a dead task.
-const SETTLEMENT_RESTART_DELAY: Duration = Duration::from_secs(5);
 
 fn disabled_venue_ids<'a>(
     outcome: &MultiVenueExecutionOutcome,
@@ -87,7 +83,7 @@ fn validate_icpswap_identity(identity: &IcpswapExecutionIdentity, configured_mne
     identity.validate_and_derive(configured_mnemonic).map(|_| ())
 }
 
-async fn park_unresumable_committed_rows(
+pub(crate) async fn park_unresumable_committed_rows(
     db: &SqliteWalStore,
     enabled_venues: &[String],
     configured_icpswap_mnemonic: &str,
@@ -196,14 +192,21 @@ async fn init(
         Arc<BasicExecutor<Agent, SqliteWalStore>>,
         Arc<ExportStage>,
         Arc<FinalizeStage<MultiVenueFinalizer, SqliteWalStore, SimpleProfitCalculator, Agent>>,
+        Arc<SqliteWalStore>,
     ),
     String,
 > {
     let config = ctx.config.clone();
     let agent = ctx.agent.clone();
     let registry = ctx.registry.clone();
-    let db = Arc::new(SqliteWalStore::new(&config.db_path).map_err(|e| format!("could not connect to db: {e}"))?);
-    park_unresumable_committed_rows(db.as_ref(), &config.enabled_swap_venues, &config.icpswap_mnemonic).await?;
+    let db = Arc::new(SqliteWalStore::new(&config.db_path).map_err(|e| format!("could not connect to db: {e:#}"))?);
+    let recovered = db
+        .recover_submitting_as_ambiguous("process restarted during liquidation submission")
+        .await
+        .map_err(|e| format!("failed to recover interrupted liquidation intents: {e}"))?;
+    if recovered != 0 {
+        warn!(recovered, "Parked interrupted liquidation submissions as ambiguous");
+    }
 
     let tokens = debt_asset_principals(&registry);
 
@@ -224,6 +227,14 @@ async fn init(
         .map_err(|e| format!("executor token init failed: {e}"))?;
     let executor = Arc::new(executor);
 
+    // One bridge for every exchange venue: they share its accounts, so they
+    // must share the registry of handles held on them.
+    let bridge = if config.enabled_swap_venues.iter().any(|venue| venue == MEXC_VENUE_ID) {
+        Some(BridgeRuntime::build(&config, Arc::new(WalBridgeClaims::new(db.clone()))).await?)
+    } else {
+        None
+    };
+
     let mut venue_adapters: Vec<Arc<dyn MultiVenueAdapter>> = Vec::new();
     for venue_id in &config.enabled_swap_venues {
         match venue_id.as_str() {
@@ -232,7 +243,13 @@ async fn init(
                     .clone()
                     .ok_or_else(|| "ICPSwap is enabled but its adapter was not initialized".to_string())?,
             ),
-            MEXC_VENUE_ID => venue_adapters.push(build_mexc_finalizer(ctx.as_ref()).await?),
+            MEXC_VENUE_ID => venue_adapters.push(
+                build_mexc_finalizer(
+                    ctx.as_ref(),
+                    bridge.clone().ok_or_else(|| "MEXC is enabled but the bridge was not built".to_string())?,
+                )
+                .await?,
+            ),
             _ => return Err(format!("unsupported enabled swap venue `{venue_id}`")),
         }
     }
@@ -249,6 +266,8 @@ async fn init(
                 dust_fallback_max_price_impact_bps: config.icpswap_dust_fallback_max_price_impact_bps,
                 cex_min_exec_usd: config.get_cex_min_exec_usd(),
                 min_net_edge_bps: config.multi_venue_min_net_edge_bps,
+                settlement_min_net_edge_bps: config.multi_venue_settlement_min_net_edge_bps,
+                buy_bad_debt: config.buy_bad_debt,
                 bad_debt_min_net_edge_bps: config.multi_venue_bad_debt_min_net_edge_bps,
                 max_oracle_discount_bps: config.multi_venue_max_oracle_discount_bps,
                 oracle_snapshot_max_age_secs: config.multi_venue_oracle_snapshot_max_age_secs,
@@ -303,7 +322,7 @@ async fn init(
         path: config.export_path.clone(),
     });
 
-    Ok((finder, strategy, executor, exporter, finalizer))
+    Ok((finder, strategy, executor, exporter, finalizer, db))
 }
 
 fn bridge_low_balance_service(ctx: &PipelineContext) -> Arc<BalanceService> {
@@ -355,7 +374,30 @@ pub async fn run_liquidation_loop(sock_path: PathBuf) -> ExitCode {
     let ctx = Arc::new(ctx);
     let config = ctx.config.clone();
 
-    if let Err(err) = ensure_runtime_file_permissions(&config.db_path, &config.export_path) {
+    // Claim process ownership before any database is opened or startup
+    // recovery can mutate live intent state. The database lock also prevents
+    // bypassing single-daemon ownership with a different control socket path.
+    let (daemon_instance_lock, control_listener) =
+        match acquire_daemon_instance(PathBuf::from(&config.db_path).as_path(), &sock_path) {
+            Ok(instance) => instance,
+            Err(err) => {
+                tracing::error!(
+                    db_path = %config.db_path,
+                    sock_path = %sock_path.display(),
+                    "Failed to claim daemon instance: {err:#}"
+                );
+                return ExitCode::FAILURE;
+            }
+        };
+    info!(
+        lock_path = %daemon_instance_lock.path().display(),
+        sock_path = %sock_path.display(),
+        "Daemon instance ownership claimed"
+    );
+
+    if let Err(err) =
+        ensure_runtime_file_permissions(&config.db_path, &config.export_path)
+    {
         tracing::error!(
             db_path = %config.db_path,
             export_path = %config.export_path,
@@ -394,7 +436,7 @@ pub async fn run_liquidation_loop(sock_path: PathBuf) -> ExitCode {
     );
 
     // Initialize components using shared pipeline context
-    let (finder, strategy, executor, exporter, finalizer) = match init(ctx.clone()).await {
+    let (finder, strategy, executor, exporter, finalizer, wal) = match init(ctx.clone()).await {
         Ok(stages) => stages,
         Err(err) => {
             tracing::error!("Failed to initialize pipeline stages: {}", err);
@@ -402,44 +444,11 @@ pub async fn run_liquidation_loop(sock_path: PathBuf) -> ExitCode {
         }
     };
 
-    let watcher_wal = match SqliteWalStore::new_with_busy_timeout(&config.db_path, 30_000) {
-        Ok(wal) => Arc::new(wal),
-        Err(err) => {
-            tracing::error!("Failed to init watcher WAL: {}", err);
-            return ExitCode::FAILURE;
-        }
-    };
-
-    // Settlement watcher is intentionally independent from pause/resume.
-    // Even while paused, it can continue reconciling previously-started work.
-    //
-    // `SettlementWatcher::run` contains per-sweep panics and stalls itself, so
-    // the supervisor below only covers the residual case where the task ends
-    // anyway. Losing it silently would strand in-flight liquidations in
-    // non-terminal WAL states while the daemon still looks healthy, so the task
-    // is restarted rather than dropped.
-    let watcher_agent = ctx.agent.clone();
-    let watcher_canister = config.lending_canister;
-    tokio::spawn(async move {
-        loop {
-            let watcher = SettlementWatcher::new(
-                watcher_wal.clone(),
-                watcher_agent.clone(),
-                watcher_canister,
-                SETTLEMENT_POLL_INTERVAL,
-            );
-
-            match tokio::spawn(watcher.run()).await {
-                Ok(()) => tracing::error!("Settlement watcher exited unexpectedly; restarting"),
-                Err(err) if err.is_panic() => {
-                    tracing::error!("Settlement watcher panicked; restarting: {}", err);
-                }
-                Err(err) => tracing::error!("Settlement watcher task ended; restarting: {}", err),
-            }
-
-            sleep(SETTLEMENT_RESTART_DELAY).await;
-        }
-    });
+    let settlement = Arc::new(SettlementWatcher::new(
+        wal.clone(),
+        ctx.agent.clone(),
+        config.lending_canister,
+    ));
 
     let debt_asset_principals = debt_asset_principals(&ctx.registry);
     let debt_assets = debt_assets_as_text(&debt_asset_principals);
@@ -465,9 +474,14 @@ pub async fn run_liquidation_loop(sock_path: PathBuf) -> ExitCode {
     };
     // The helper encapsulates:
     // - persisted paused/running state bootstrap
-    // - UDS bind + serve
+    // - serving the UDS listener claimed before database initialization
     // - state persistence on pause/resume transitions
-    if let Err(err) = bootstrap_control_plane(&sock_path, &config.db_path, paused.clone(), slack_watchdog.clone()) {
+    if let Err(err) = bootstrap_control_plane(
+        control_listener,
+        &config.db_path,
+        paused.clone(),
+        slack_watchdog.clone(),
+    ) {
         tracing::error!("{}", err);
         return ExitCode::FAILURE;
     }
@@ -506,16 +520,31 @@ pub async fn run_liquidation_loop(sock_path: PathBuf) -> ExitCode {
         ))
     });
 
+    let _execution_worker = match spawn_execution_worker(
+        finalizer,
+        wal,
+        settlement,
+        exporter,
+        config.enabled_swap_venues.clone(),
+        config.icpswap_mnemonic.clone(),
+        slack_watchdog.clone(),
+        ui_enabled,
+    ) {
+        Ok(worker) => worker,
+        Err(error) => {
+            tracing::error!("{error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    info!(thread = "liquidation-execution", "Execution worker started");
+
     // Steady-state operation is delegated to a helper to keep this entrypoint
     // focused on bootstrap wiring and lifecycle boundaries.
     run_daemon_cycle_loop(
         &finder,
         &strategy,
         &executor,
-        &exporter,
-        &finalizer,
         &liq_dog,
-        slack_watchdog,
         low_balance_monitor,
         paused,
         &debt_assets,

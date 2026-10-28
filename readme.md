@@ -22,7 +22,40 @@ Inspired by Artemis/MEV patterns and designed for permissionless, community-driv
 
 ---
 
+## ckSOL bridge compatibility
+
+The SOL bridge backend uses account-based `deposit_sol` and deposit-specific
+`deposit_sol_status` receipts, plus `withdraw_sol` / `withdraw_sol_status`.
+Configure `BRIDGE_CKSOL_LEDGER_CANISTER` for the deployment's repayment ledger
+and `BRIDGE_IC_PROXY_CANISTER` for the cycle-funded deposit call.
+
+If notification fails after SOL is transferred, the returned bridge handle stays
+`Unknown`. Reconcile the minter deposit before taking recovery action; submitting
+a fresh bridge request would send SOL again. Automated notification recovery,
+legacy balance-threshold handles and the legacy CLI `process-deposit` command
+are not migrated by these backend fixes.
+
 ## Features
+
+### Native SOL liquidation settlement
+
+With bridge dependencies enabled, MEXC settlement routes seized ckSOL through
+the ckSOL minter to a validated native SOL exchange deposit address. The bridge
+wallet reserves the ckSOL approval fee; the minter withdrawal fee is deducted
+from the expected exchange credit before sizing trades. Persisted ckSOL and
+EVM bridge handles are polled by their respective backends after restart.
+Configure `BRIDGE_CKSOL_MINTER_CANISTER`, `BRIDGE_CKSOL_LEDGER_CANISTER` and
+`SOLANA_RPC_URL` for the deployment. Stablecoin proceeds use the existing
+withdrawal/bridge route back to the repayment wallet.
+
+For ckSOL repayment, MEXC trades into native SOL (for example, ICP → USDT →
+SOL), withdraws to the dedicated bridge Solana wallet, then deposits through
+the minter into the repayment ICP account. Include `ICP_USDT` and `SOL_USDT`
+in `CEX_MEXC_AVAILABLE_PAIRS` for that two-hop route. SOL trades always use
+`SOL_USDT`; USDC proceeds convert through `USDC_USDT` when needed. The bridge
+reserves SOL for its transfer fee and records the actual minted ckSOL amount. Mint
+destinations are restricted to the bridge owner or the configured liquidator;
+the requested subaccount is preserved.
 
 - **Pipeline Architecture** — Composable stages for discovery, strategy, execution, finalization, and export.
 - **Async Rust** — Highly concurrent and efficient with Tokio runtime.
@@ -39,9 +72,29 @@ Inspired by Artemis/MEV patterns and designed for permissionless, community-driv
 - **Default venues:** `ENABLED_SWAP_VENUES=icpswap,mexc`; disable MEXC when credentials are not configured.
 - **Current config precedence:** shell env vars > local `.env` > `~/.liquidium-pipeline/config.env`.
 - **Required env vars (minimum):** `MNEMONIC_FILE`, `IC_URL`, `EVM_RPC_URL`, `LENDING_CANISTER`, `DEBT_ASSETS`, `COLLATERAL_ASSETS`.
+- **Optional Solana RPC env var:** `SOLANA_RPC_URL` (defaults to `https://api.devnet.solana.com` when unset).
 - **New client env var:** `BRIDGE_CKETH_MINTER_CANISTER` (recommended to set explicitly; defaults to `sv3dd-oaaaa-aaaar-qacoa-cai` when unset/empty).
 - **Primary operations:** `liquidator run`, `liquidator balance`, `liquidator withdraw`, `liquidator account show`.
 - **Persistence:** SQLite WAL (`DB_PATH`) enables idempotent retries and resume-safe execution.
+
+Discovery and venue execution run independently but share `DB_PATH`. Accepting a
+liquidation records its receipt and creates execution work in one SQLite
+transaction. Interrupted submissions remain ambiguous rather than being replayed;
+there is no second intake database, handoff importer or import cursor. The daemon
+lock is scoped to `DB_PATH`, and the TUI reads pause state from that same database.
+
+After a successful chain call, acceptance persistence is attempted up to three
+times without repeating the liquidation. If it still fails, the intent is parked
+as ambiguous with its chain receipt for operator reconciliation, and the daemon
+sends an operator-required watchdog alert. If the database also rejects that
+fallback write, the receipt is logged and the alert reports the persistence
+failure; startup still parks the remaining submitting intent. This does not
+automatically replay the liquidation or claim that its collateral was settled.
+
+The earlier unmerged two-database layout is not automatically migrated. Startup
+rejects `LIQUIDATIONS_DB_PATH` and WALs containing `intake_import_state` so accepted
+work in the old intake file cannot be silently left behind. Reconcile those files
+before migrating; ordinary legacy execution WALs are still adopted in place.
 
 ---
 
@@ -123,12 +176,15 @@ MEXC_DEFAULT_ROUTE_CHAIN_ID=1
 # Optional Arbitrum override for an Arbitrum EVM_RPC_URL:
 # MEXC_ROUTE_CHAIN_MAP=ETH=42161,ETHEREUM=42161,ARB=42161,ARBITRUM=42161
 
+# Solana Blockchain (optional; defaults to devnet if omitted)
+SOLANA_RPC_URL=https://api.devnet.solana.com
+
 # Identity
 MNEMONIC_FILE=~/.liquidium-pipeline/wallets/key
 
 # Assets (comma-separated chain:address:symbol entries)
-DEBT_ASSETS=icp:mxzaz-hqaaa-aaaar-qaada-cai:ckBTC,icp:cngnf-vqaaa-aaaar-qag4q-cai:ckUSDT,icp:xevnm-gaaaa-aaaar-qafnq-cai:ckUSDC,icp:ss2fx-dyaaa-aaaar-qacoq-cai:ckETH,icp:ryjl3-tyaaa-aaaaa-aaaba-cai:ICP
-COLLATERAL_ASSETS=icp:mxzaz-hqaaa-aaaar-qaada-cai:ckBTC,icp:cngnf-vqaaa-aaaar-qag4q-cai:ckUSDT,icp:xevnm-gaaaa-aaaar-qafnq-cai:ckUSDC,icp:ss2fx-dyaaa-aaaar-qacoq-cai:ckETH,icp:ryjl3-tyaaa-aaaaa-aaaba-cai:ICP
+DEBT_ASSETS=icp:mxzaz-hqaaa-aaaar-qaada-cai:ckBTC,icp:cngnf-vqaaa-aaaar-qag4q-cai:ckUSDT,icp:xevnm-gaaaa-aaaar-qafnq-cai:ckUSDC,icp:ss2fx-dyaaa-aaaar-qacoq-cai:ckETH,icp:ryjl3-tyaaa-aaaaa-aaaba-cai:ICP,sol:native:SOL,icp:la34w-haaaa-aaaar-qb5na-cai:ckSOL
+COLLATERAL_ASSETS=icp:mxzaz-hqaaa-aaaar-qaada-cai:ckBTC,icp:cngnf-vqaaa-aaaar-qag4q-cai:ckUSDT,icp:xevnm-gaaaa-aaaar-qafnq-cai:ckUSDC,icp:ss2fx-dyaaa-aaaar-qacoq-cai:ckETH,icp:ryjl3-tyaaa-aaaaa-aaaba-cai:ICP,sol:native:SOL,icp:la34w-haaaa-aaaar-qb5na-cai:ckSOL
 
 # Optional: only scan specific borrower principals (comma-separated). Set to "none" to disable.
 OPPORTUNITY_ACCOUNT_FILTER=principal1,principal2
@@ -194,6 +250,8 @@ CEX_RETRY_BASE_SECS=5
 CEX_RETRY_MAX_SECS=120
 # Minimum projected net edge required before executing any venue plan (bps)
 MULTI_VENUE_MIN_NET_EDGE_BPS=150
+# Optional normal-settlement override after liquidation (up to 1.5% shortfall)
+MULTI_VENUE_SETTLEMENT_MIN_NET_EDGE_BPS=-150
 # Reject a venue quote this far below the oracle-implied output (bps)
 MULTI_VENUE_MAX_ORACLE_DISCOUNT_BPS=250
 # How long a price recorded on a receipt may stand in for a live oracle read (seconds)
@@ -220,7 +278,9 @@ Quick reference:
 | `CEX_BUY_INVERSE_ENABLED` | Master toggle for adaptive buy fallback. |
 | `CEX_RETRY_BASE_SECS` | Initial retry delay after retryable CEX errors. |
 | `CEX_RETRY_MAX_SECS` | Maximum retry delay cap. |
-| `MULTI_VENUE_MIN_NET_EDGE_BPS` | Minimum conservative edge required for any ICPSwap, MEXC, or split plan. |
+| `MULTI_VENUE_MIN_NET_EDGE_BPS` | Default normal-settlement floor when the signed override is unset. |
+| `MULTI_VENUE_SETTLEMENT_MIN_NET_EDGE_BPS` | Optional signed floor for normal settlement after liquidation; `-150` allows up to 1.5% conservative shortfall. Valid range is greater than `-10000` through `10000`; absent or invalid values use `MULTI_VENUE_MIN_NET_EDGE_BPS`. Does not change liquidation-entry checks or already committed plans. |
+| `MULTI_VENUE_BAD_DEBT_MIN_NET_EDGE_BPS` | Existing signed floor used for all new settlement plans when `BUY_BAD_DEBT=true`, and for saved bad-debt rows even when global mode is off. Defaults to `-500` (up to 5% shortfall) and takes precedence over the normal-settlement override. |
 | `MULTI_VENUE_MAX_ORACLE_DISCOUNT_BPS` | Maximum amount any venue quote may fall below the oracle-implied output. Values at or above 10000 would accept anything, so they fall back to the default. |
 | `MULTI_VENUE_ORACLE_SNAPSHOT_MAX_AGE_SECS` | How stale a price recorded at detection may be before it stops standing in for a failed live oracle read. Past this age the quote guard stands down rather than block a liquidation that already holds collateral. |
 | `CEX_DELAY_BUFFER_BPS` | Extra haircut for execution-latency/price-move risk. |

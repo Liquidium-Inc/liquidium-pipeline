@@ -8,13 +8,15 @@ use alloy::signers::local::PrivateKeySigner;
 use candid::Nat;
 use icrc_ledger_types::icrc1::account::Account;
 use num_traits::ToPrimitive;
+use solana_client::nonblocking::rpc_client::RpcClient;
+use solana_sdk::{message::Message, pubkey::Pubkey, signature::Keypair, signer::Signer};
+use solana_system_interface::instruction as system_instruction;
 use tokio::sync::mpsc;
 
 use crate::config::ConfigTrait;
 use crate::swappers::mexc::mexc_adapter::MexcClient;
-use liquidium_pipeline_connectors::backend::bridge_backend::{
-    BridgeDestinationKind, resolve_cketh_reverse_route_by_source,
-};
+use crate::finalizers::bridge_planner::cex_network_from_destination_kind;
+use liquidium_pipeline_connectors::backend::bridge_backend::resolve_reverse_route_by_source;
 use liquidium_pipeline_connectors::backend::cex_backend::CexBackend;
 use liquidium_pipeline_core::account::model::ChainAccount;
 use liquidium_pipeline_core::tokens::asset_id::AssetId;
@@ -29,6 +31,10 @@ const EVM_NATIVE_GAS_BUFFER_WEI: u128 = 200_000_000_000_000;
 const EVM_NATIVE_TRANSFER_GAS_LIMIT: u128 = 21_000;
 const EVM_ERC20_TRANSFER_GAS_LIMIT: u128 = 100_000;
 const EVM_GAS_RESERVE_MULTIPLIER: u128 = 2;
+// Reserve enough lamports to keep the source system account rent-exempt
+// after transfer plus normal tx fee headroom.
+const SOLANA_NATIVE_FEE_RESERVE_LAMPORTS: u128 = 2_000_000;
+const SOLANA_SPL_FEE_RESERVE_LAMPORTS: u128 = 3_000_000;
 
 fn evm_private_key_for_source<'a>(config: &'a crate::config::Config, source: WithdrawAccountKind) -> &'a str {
     match source {
@@ -101,13 +107,11 @@ pub(super) fn deposit_network_for_asset(asset: &AssetId) -> String {
 
 pub(super) fn mexc_deposit_lookup_for_asset(asset: &AssetId) -> (String, String) {
     let source_network = deposit_network_for_asset(asset);
-    if let Some(route) = resolve_cketh_reverse_route_by_source(&asset.symbol, &source_network) {
-        let network = match route.destination_kind {
-            BridgeDestinationKind::IcpAccount => "ICP",
-            BridgeDestinationKind::EvmAddress => "ETH",
-            BridgeDestinationKind::BtcAddress => "BTC",
-        };
-        return (route.target_asset.to_string(), network.to_string());
+    if let Some(route) = resolve_reverse_route_by_source(&asset.symbol, &source_network) {
+        return (
+            route.target_asset.to_string(),
+            cex_network_from_destination_kind(route.destination_kind),
+        );
     }
 
     (asset.symbol.clone(), source_network)
@@ -118,6 +122,78 @@ fn parse_evm_destination_address(value: &str) -> Result<String, String> {
     Ok(addr.to_string())
 }
 
+fn parse_solana_destination_address(value: &str) -> Result<String, String> {
+    let addr = value
+        .parse::<Pubkey>()
+        .map_err(|_| "invalid destination Solana base58 pubkey".to_string())?;
+    Ok(addr.to_string())
+}
+
+fn derive_solana_address(secret_key: [u8; 32]) -> String {
+    Keypair::new_from_array(secret_key).pubkey().to_string()
+}
+
+fn solana_source_address_for_source(config: &crate::config::Config, source: WithdrawAccountKind) -> String {
+    match source {
+        WithdrawAccountKind::Bridge => derive_solana_address(config.bridge_solana_private_key_bytes),
+        _ => derive_solana_address(config.solana_private_key_bytes),
+    }
+}
+
+async fn estimate_solana_native_transfer_fee_lamports(
+    rpc_url: &str,
+    from: &str,
+    to: &str,
+) -> Result<u64, String> {
+    let from_pubkey = from
+        .parse::<Pubkey>()
+        .map_err(|e| format!("invalid Solana source pubkey `{from}`: {e}"))?;
+    let to_pubkey = to
+        .parse::<Pubkey>()
+        .map_err(|e| format!("invalid Solana destination pubkey `{to}`: {e}"))?;
+
+    let rpc = RpcClient::new(rpc_url.to_string());
+    let blockhash = rpc
+        .get_latest_blockhash()
+        .await
+        .map_err(|e| format!("solana get_latest_blockhash failed: {e}"))?;
+
+    let ix = system_instruction::transfer(&from_pubkey, &to_pubkey, 1);
+    let msg = Message::new_with_blockhash(&[ix], Some(&from_pubkey), &blockhash);
+    let fee = rpc
+        .get_fee_for_message(&msg)
+        .await
+        .map_err(|e| format!("solana get_fee_for_message failed: {e}"))?;
+
+    if fee == 0 {
+        return Err("solana estimated transfer fee is zero; refusing sweep".to_string());
+    }
+
+    Ok(fee)
+}
+
+fn find_solana_native_asset_id(ctx: &crate::context::PipelineContext) -> Option<AssetId> {
+    ctx.registry.tokens.iter().find_map(|(id, token)| match token {
+        ChainToken::SolanaNative { .. } => Some(id.clone()),
+        _ => None,
+    })
+}
+
+async fn solana_native_balance_lamports(
+    ctx: &crate::context::PipelineContext,
+    balances: &Arc<liquidium_pipeline_core::balance_service::BalanceService>,
+) -> Result<u128, String> {
+    let native_asset_id = find_solana_native_asset_id(ctx).ok_or_else(|| {
+        "missing Solana native asset in registry; expected an entry like `sol:native:SOL`".to_string()
+    })?;
+    let balance = balances.get_balance(&native_asset_id).await?;
+    balance
+        .value
+        .0
+        .to_u128()
+        .ok_or_else(|| "solana native balance too large for u128".to_string())
+}
+
 fn validate_manual_destination(token: &ChainToken, destination: &str) -> Result<(), String> {
     match token {
         ChainToken::Icp { .. } => {
@@ -126,6 +202,9 @@ fn validate_manual_destination(token: &ChainToken, destination: &str) -> Result<
         }
         ChainToken::EvmNative { .. } | ChainToken::EvmErc20 { .. } => {
             parse_evm_destination_address(destination).map(|_| ())
+        }
+        ChainToken::SolanaNative { .. } | ChainToken::SolanaSpl { .. } => {
+            parse_solana_destination_address(destination).map(|_| ())
         }
     }
 }
@@ -309,6 +388,7 @@ async fn execute_withdraw(
     };
 
     let destination_account = resolve_destination_account(&ctx, &token, destination, manual_destination.trim())?;
+    let source_solana_address = solana_source_address_for_source(&ctx.config, source);
 
     let amount_native: Nat = match &token {
         ChainToken::Icp { decimals, fee, .. } => {
@@ -354,6 +434,70 @@ async fn execute_withdraw(
                 compute_evm_withdraw_amount_native(Nat::from(0u8), amount.trim(), *decimals, false)?
             }
         }
+        ChainToken::SolanaNative { decimals, .. } => {
+            if amount.trim().eq_ignore_ascii_case("all") {
+                let bal = balances.get_balance(&asset).await?;
+                let native_balance_lamports = bal
+                    .value
+                    .0
+                    .to_u128()
+                    .ok_or_else(|| "solana native balance too large for u128".to_string())?;
+                let destination = match &destination_account {
+                    ChainAccount::Solana(addr) => addr.as_str(),
+                    _ => return Err("invalid Solana destination selected".to_string()),
+                };
+                let fee_lamports = estimate_solana_native_transfer_fee_lamports(
+                    &ctx.config.solana_rpc_url,
+                    &source_solana_address,
+                    destination,
+                )
+                .await? as u128;
+                let send_native = native_balance_lamports.saturating_sub(fee_lamports);
+                if send_native == 0 {
+                    return Err(format!(
+                        "native SOL balance too low to sweep (native_balance_lamports={} estimated_fee_lamports={})",
+                        native_balance_lamports, fee_lamports
+                    ));
+                }
+                Nat::from(send_native)
+            } else {
+                let send_units = format::decimal_to_units(amount.trim(), *decimals).ok_or_else(|| {
+                    format!("invalid amount (expected decimal with <= {decimals} decimals, or 'all')")
+                })?;
+                let send_nat = Nat::from(send_units);
+                let bal = balances.get_balance(&asset).await?;
+                let native_balance_lamports = bal
+                    .value
+                    .0
+                    .to_u128()
+                    .ok_or_else(|| "solana native balance too large for u128".to_string())?;
+                if native_balance_lamports < send_units.saturating_add(SOLANA_NATIVE_FEE_RESERVE_LAMPORTS) {
+                    return Err(format!(
+                        "native SOL balance too low to keep fee reserve (native_balance_lamports={} required_remaining_lamports={})",
+                        native_balance_lamports, SOLANA_NATIVE_FEE_RESERVE_LAMPORTS
+                    ));
+                }
+                send_nat
+            }
+        }
+        ChainToken::SolanaSpl { decimals, .. } => {
+            let native_balance_lamports = solana_native_balance_lamports(&ctx, &balances).await?;
+            if native_balance_lamports <= SOLANA_SPL_FEE_RESERVE_LAMPORTS {
+                return Err(format!(
+                    "native SOL balance too low to cover SPL transfer fees (native_balance_lamports={} required_reserve_lamports={})",
+                    native_balance_lamports, SOLANA_SPL_FEE_RESERVE_LAMPORTS
+                ));
+            }
+            if amount.trim().eq_ignore_ascii_case("all") {
+                let bal = balances.get_balance(&asset).await?;
+                bal.value
+            } else {
+                let units = format::decimal_to_units(amount.trim(), *decimals).ok_or_else(|| {
+                    format!("invalid amount (expected decimal with <= {decimals} decimals, or 'all')")
+                })?;
+                Nat::from(units)
+            }
+        }
     };
 
     transfers
@@ -392,6 +536,21 @@ fn resolve_destination_account(
                 }
             };
             Ok(ChainAccount::Evm(dst_address))
+        }
+        ChainToken::SolanaNative { .. } | ChainToken::SolanaSpl { .. } => {
+            let main_solana_address = derive_solana_address(ctx.config.solana_private_key_bytes);
+            let bridge_solana_address = derive_solana_address(ctx.config.bridge_solana_private_key_bytes);
+            let dst_address = match destination {
+                WithdrawDestinationKind::Main => main_solana_address,
+                WithdrawDestinationKind::Bridge => bridge_solana_address,
+                WithdrawDestinationKind::Manual => parse_solana_destination_address(manual_destination)?,
+                WithdrawDestinationKind::Trader | WithdrawDestinationKind::Recovery => {
+                    return Err(
+                        "destination trader/recovery is ICP-only; use main/bridge/manual for Solana assets".to_string(),
+                    );
+                }
+            };
+            Ok(ChainAccount::Solana(dst_address))
         }
     }
 }
@@ -512,6 +671,17 @@ mod tests {
         };
 
         assert_eq!(mexc_deposit_lookup_for_asset(&asset), ("USDC".to_string(), "ETH".to_string()));
+    }
+
+    #[test]
+    fn mexc_deposit_lookup_maps_cksol_to_sol_network() {
+        let asset = AssetId {
+            chain: "icp".to_string(),
+            address: "cksol-ledger".to_string(),
+            symbol: "ckSOL".to_string(),
+        };
+
+        assert_eq!(mexc_deposit_lookup_for_asset(&asset), ("SOL".to_string(), "SOL".to_string()));
     }
 
     #[test]

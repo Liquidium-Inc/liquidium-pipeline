@@ -24,7 +24,7 @@ use super::super::*;
 use crate::{
     executors::executor::ExecutorRequest,
     liquidation::collateral_service::USD_QUOTE_CURRENCY,
-    persistance::{MultiVenueAllocationReason, VenueExecutionState, VenueLegState},
+    persistance::{MultiVenueAllocationReason, MultiVenueExecutionState, VenueExecutionState, VenueLegState},
     price_oracle::price_oracle::MockPriceOracle,
     stages::executor::{ExecutionReceipt, ExecutionStatus},
     swappers::model::{SwapQuote, SwapQuoteLeg, SwapRequest},
@@ -273,6 +273,8 @@ fn config(cex_min_exec_usd: f64) -> IcpswapFirstPlannerConfig {
         dust_fallback_max_price_impact_bps: 150.0,
         cex_min_exec_usd,
         min_net_edge_bps: 150,
+        settlement_min_net_edge_bps: None,
+        buy_bad_debt: false,
         bad_debt_min_net_edge_bps: 150,
         // Must stay above the 150 bps dust fallback impact cap, which already
         // includes the pool fee.
@@ -955,6 +957,41 @@ async fn unsafe_exact_icpswap_requotes_full_even_when_the_remainder_is_unquotabl
 }
 
 #[tokio::test]
+async fn settlement_override_enforces_exact_boundaries_and_preserves_the_legacy_default() {
+    for (floor, output, accepted) in [
+        (None, TOTAL_PAY, false),
+        (Some(0), TOTAL_PAY, true),
+        (Some(0), TOTAL_PAY - 1, false),
+        (Some(-150), TOTAL_PAY * 985 / 1000, true),
+        (Some(-150), TOTAL_PAY * 985 / 1000 - 1, false),
+    ] {
+        let icpswap = mock_adapter(ICPSWAP_VENUE_ID, Arc::new(Mutex::new(Vec::new())), move |request| {
+            let mut preview = proportional_preview(request, ICPSWAP_VENUE_ID, 0.0, 1);
+            preview.conservative_receive.value = Nat::from(output);
+            Ok(preview)
+        });
+        let planner_config = IcpswapFirstPlannerConfig {
+            settlement_min_net_edge_bps: floor,
+            ..config(1.1)
+        };
+        let planner = IcpswapFirstPlanner::new(vec![Arc::new(icpswap)], planner_config).expect("valid planner");
+        let mut input = input_with_pay_token(native_icp());
+        input.debt_repaid.value = Nat::from(TOTAL_PAY);
+        let result = planner.plan(&input, QUOTED_AT).await;
+        if accepted {
+            let state = result.expect("output meets the settlement floor");
+            assert_eq!(state.plan.enforced_min_net_edge_bps, floor);
+            assert_eq!(state.plan.min_net_edge_bps, 150);
+            let restored: MultiVenueExecutionState =
+                serde_json::from_str(&serde_json::to_string(&state).expect("serialize")).expect("restore");
+            assert_eq!(restored.plan.enforced_min_net_edge_bps, floor);
+        } else {
+            assert!(matches!(result, Err(IcpswapFirstPlannerError::NoViableRoute(_))));
+        }
+    }
+}
+
+#[tokio::test]
 async fn the_plan_records_the_floor_it_was_actually_held_to() {
     // Bought at a known loss: the conservative output lands far below the debt
     // repaid, so only the bad-debt floor lets this plan exist at all. The
@@ -1558,6 +1595,64 @@ async fn non_native_icp_is_mexc_only_and_never_previews_icpswap() {
         mexc_calls_for_assert.lock().expect("calls lock").as_slice(),
         &[TOTAL_PAY]
     );
+}
+
+#[tokio::test]
+async fn tiny_non_native_collateral_is_rejected_before_mexc_preview() {
+    let mexc_calls = Arc::new(Mutex::new(Vec::new()));
+    let mexc = PlannerAdapter {
+        venue_id: MEXC_VENUE_ID,
+        calls: mexc_calls.clone(),
+        responder: Box::new(|_| Err("a below-minimum amount must not be quoted".to_string())),
+        validation_error: None,
+        preview_forbidden: true,
+    };
+    let planner = IcpswapFirstPlanner::new(vec![Arc::new(mexc)], config(8.0)).expect("MEXC-only planner");
+    let mut input = input_with_pay_token(non_native_icp_token());
+    input.total_pay.value = Nat::from(294u64);
+    input.pay_reference_price_usd = Some(77_663.34);
+
+    let error = planner
+        .plan(&input, QUOTED_AT)
+        .await
+        .expect_err("294 satoshis must be classified as below the MEXC minimum");
+
+    assert!(matches!(error, IcpswapFirstPlannerError::BelowVenueMinimum(_)));
+    assert!(error.to_string().contains("MEXC amount is below its minimum"));
+    assert!(mexc_calls.lock().expect("calls lock").is_empty());
+}
+
+#[tokio::test]
+async fn tiny_collateral_does_not_preview_mexc_when_icpswap_is_unavailable() {
+    let icpswap = mock_adapter(ICPSWAP_VENUE_ID, Arc::new(Mutex::new(Vec::new())), |_| {
+        Err("temporary pool outage".to_string())
+    });
+    let mexc_calls = Arc::new(Mutex::new(Vec::new()));
+    let mexc = PlannerAdapter {
+        venue_id: MEXC_VENUE_ID,
+        calls: mexc_calls.clone(),
+        responder: Box::new(|_| Err("a below-minimum amount must not be quoted".to_string())),
+        validation_error: None,
+        preview_forbidden: true,
+    };
+    let planner = planner(icpswap, mexc, config(8.0));
+    let mut input = input_with_pay_token(native_icp());
+    input.total_pay.value = Nat::from(1_000_000u64);
+    input.pay_reference_price_usd = Some(2.434);
+
+    let error = planner
+        .plan(&input, QUOTED_AT)
+        .await
+        .expect_err("a retryable ICPSwap failure must not trigger a dust MEXC preview");
+
+    assert!(matches!(error, IcpswapFirstPlannerError::NoViableRoute(_)));
+    assert!(
+        error
+            .to_string()
+            .contains("ICPSwap quote rejected (temporary pool outage)")
+    );
+    assert!(error.to_string().contains("MEXC amount is below its minimum"));
+    assert!(mexc_calls.lock().expect("calls lock").is_empty());
 }
 
 #[tokio::test]

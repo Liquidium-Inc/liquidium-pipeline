@@ -5,7 +5,9 @@ use ic_agent::Identity;
 use icrc_ledger_types::icrc1::account::Account;
 use liquidium_pipeline_commons::env::config_dir;
 use liquidium_pipeline_connectors::account::icp_account::{RECOVERY_ACCOUNT, derive_icp_identity};
-use liquidium_pipeline_connectors::crypto::derivation::{derive_btc_p2tr_address, derive_evm_private_key};
+use liquidium_pipeline_connectors::crypto::derivation::{
+    derive_btc_p2tr_address, derive_evm_private_key, derive_solana_private_key_bytes,
+};
 use log::{debug, warn};
 use std::collections::{HashMap, HashSet};
 use std::env;
@@ -31,12 +33,18 @@ pub struct Config {
     pub trader_principal: Principal,
     pub ic_url: String,
     pub evm_rpc_url: String,
+    pub solana_rpc_url: String,
     pub evm_private_key: String,
+    pub solana_private_key_bytes: [u8; 32],
     pub bridge_evm_private_key: String,
+    pub bridge_solana_private_key_bytes: [u8; 32],
     pub bridge_evm_address: String,
     pub bridge_ic_owner_principal: Principal,
     pub bridge_btc_address: String,
     pub bridge_cketh_minter_canister: Principal,
+    pub bridge_cksol_minter_canister: Principal,
+    pub bridge_cksol_ledger_canister: Principal,
+    pub bridge_ic_proxy_canister: Option<Principal>,
     pub lending_canister: Principal,
     pub export_path: String,
     pub buy_bad_debt: bool,
@@ -64,7 +72,9 @@ pub struct Config {
     pub cex_retry_max_secs: u64,
     /// Minimum projected net edge required for any multi-venue plan, in bps.
     pub multi_venue_min_net_edge_bps: u32,
-    /// Signed edge floor used only for bad-debt liquidations. See
+    /// Optional signed floor for normal settlement after liquidation.
+    pub multi_venue_settlement_min_net_edge_bps: Option<i32>,
+    /// Signed settlement floor for global bad-debt mode or saved bad-debt rows. See
     /// `parse_multi_venue_bad_debt_min_net_edge_bps_from_env`.
     pub multi_venue_bad_debt_min_net_edge_bps: i32,
     /// Maximum downside from the oracle-implied output allowed for any venue
@@ -274,12 +284,17 @@ impl Config {
         // The db path
         let db_path_raw = env::var("DB_PATH").unwrap_or(format!("{}/wal.db", home));
         let db_path = expand_tilde(&db_path_raw).to_string_lossy().into_owned();
+        // Do not silently abandon durable intents from the earlier two-file layout.
+        if env::var_os("LIQUIDATIONS_DB_PATH").is_some() {
+            return Err("LIQUIDATIONS_DB_PATH is retired; reconcile the old intake database before removing this setting and using DB_PATH alone".into());
+        }
 
         // Derive EVM private key
         let sk = derive_evm_private_key(&mnemonic, 0, 0)?;
         let evm_signer: PrivateKeySigner = PrivateKeySigner::from_slice(&sk.to_bytes()).map_err(|e| e.to_string())?;
         let hex = evm_signer.to_bytes().encode_hex();
         let evm_private_key = format!("{:#}", hex);
+        let solana_private_key_bytes = derive_solana_private_key_bytes(&mnemonic, 0, 0)?;
 
         // Derive dedicated bridge namespace identities.
         let bridge_sk = derive_evm_private_key(&mnemonic, BRIDGE_NAMESPACE_ACCOUNT, BRIDGE_EVM_INDEX)?;
@@ -287,6 +302,8 @@ impl Config {
             .map_err(|e| format!("failed to create bridge EVM signer: {e}"))?;
         let bridge_evm_private_key = format!("{:#}", bridge_signer.to_bytes().encode_hex());
         let bridge_evm_address = bridge_signer.address().to_string();
+        let bridge_solana_private_key_bytes =
+            derive_solana_private_key_bytes(&mnemonic, BRIDGE_NAMESPACE_ACCOUNT, BRIDGE_SOLANA_INDEX)?;
 
         let bridge_ic_identity = derive_icp_identity(&mnemonic, BRIDGE_NAMESPACE_ACCOUNT, BRIDGE_ICP_INDEX)
             .map_err(|e| format!("could not create bridge identity: {e}"))?;
@@ -312,6 +329,52 @@ impl Config {
                 bridge_cketh_minter_canister_text
             )
         })?;
+        let bridge_cksol_minter_canister_text = env::var("BRIDGE_CKSOL_MINTER_CANISTER")
+            .unwrap_or_else(|_| DEFAULT_BRIDGE_CKSOL_MINTER_CANISTER.to_string())
+            .trim()
+            .to_string();
+        let bridge_cksol_minter_canister_text = if bridge_cksol_minter_canister_text.is_empty() {
+            DEFAULT_BRIDGE_CKSOL_MINTER_CANISTER.to_string()
+        } else {
+            bridge_cksol_minter_canister_text
+        };
+        let bridge_cksol_minter_canister = Principal::from_text(&bridge_cksol_minter_canister_text).map_err(|e| {
+            format!(
+                "invalid BRIDGE_CKSOL_MINTER_CANISTER principal '{}': {e}",
+                bridge_cksol_minter_canister_text
+            )
+        })?;
+        let bridge_cksol_ledger_canister_text = env::var("BRIDGE_CKSOL_LEDGER_CANISTER")
+            .unwrap_or_else(|_| DEFAULT_BRIDGE_CKSOL_LEDGER_CANISTER.to_string())
+            .trim()
+            .to_string();
+        let bridge_cksol_ledger_canister_text = if bridge_cksol_ledger_canister_text.is_empty() {
+            DEFAULT_BRIDGE_CKSOL_LEDGER_CANISTER.to_string()
+        } else {
+            bridge_cksol_ledger_canister_text
+        };
+        let bridge_cksol_ledger_canister = Principal::from_text(&bridge_cksol_ledger_canister_text).map_err(|e| {
+            format!(
+                "invalid BRIDGE_CKSOL_LEDGER_CANISTER principal '{}': {e}",
+                bridge_cksol_ledger_canister_text
+            )
+        })?;
+        let bridge_ic_proxy_canister = match env::var("BRIDGE_IC_PROXY_CANISTER")
+            .or_else(|_| env::var("BRIDGE_IC_WALLET_CANISTER"))
+        {
+            Ok(value) => {
+                let trimmed = value.trim();
+                if trimmed.is_empty() {
+                    None
+                } else {
+                    Some(
+                        Principal::from_text(trimmed)
+                            .map_err(|e| format!("invalid BRIDGE_IC_PROXY_CANISTER principal '{}': {e}", trimmed))?,
+                    )
+                }
+            }
+            Err(_) => None,
+        };
         let max_allowed_dex_slippage =
             parse_slippage_bps_from_env("MAX_ALLOWED_DEX_SLIPPAGE", DEFAULT_MAX_ALLOWED_DEX_SLIPPAGE_BPS)?;
         let max_allowed_cex_slippage_bps =
@@ -357,16 +420,23 @@ impl Config {
         };
 
         let evm_rpc_url = env::var("EVM_RPC_URL").map_err(|_| "EVM_RPC_URL not configured".to_string())?;
+        let solana_rpc_url = env::var("SOLANA_RPC_URL").unwrap_or_else(|_| "https://api.devnet.solana.com".to_string());
 
         Ok(Arc::new(Config {
             icpswap_mnemonic: Arc::from(mnemonic),
             evm_private_key,
             evm_rpc_url,
+            solana_rpc_url,
+            solana_private_key_bytes,
             bridge_evm_private_key,
+            bridge_solana_private_key_bytes,
             bridge_evm_address,
             bridge_ic_owner_principal,
             bridge_btc_address,
             bridge_cketh_minter_canister,
+            bridge_cksol_minter_canister,
+            bridge_cksol_ledger_canister,
+            bridge_ic_proxy_canister,
             liquidator_identity: Arc::new(liquidator_identity),
             bridge_ic_identity: Arc::new(bridge_ic_identity),
             ic_url,
@@ -389,6 +459,7 @@ impl Config {
             cex_retry_base_secs: cex_tunables.retry_base_secs,
             cex_retry_max_secs: cex_tunables.retry_max_secs,
             multi_venue_min_net_edge_bps: parse_multi_venue_min_net_edge_bps_from_env(),
+            multi_venue_settlement_min_net_edge_bps: parse_multi_venue_settlement_min_net_edge_bps_from_env(),
             multi_venue_bad_debt_min_net_edge_bps: parse_multi_venue_bad_debt_min_net_edge_bps_from_env(),
             multi_venue_max_oracle_discount_bps: parse_multi_venue_max_oracle_discount_bps_from_env(),
             multi_venue_oracle_snapshot_max_age_secs: parse_multi_venue_oracle_snapshot_max_age_secs_from_env(),
@@ -476,7 +547,10 @@ const BRIDGE_NAMESPACE_ACCOUNT: u32 = 1;
 const BRIDGE_EVM_INDEX: u32 = 0;
 const BRIDGE_ICP_INDEX: u32 = 1;
 const BRIDGE_BTC_INDEX: u32 = 0;
+const BRIDGE_SOLANA_INDEX: u32 = 0;
 const DEFAULT_BRIDGE_CKETH_MINTER_CANISTER: &str = "sv3dd-oaaaa-aaaar-qacoa-cai";
+const DEFAULT_BRIDGE_CKSOL_MINTER_CANISTER: &str = "ljyxk-riaaa-aaaar-qb5mq-cai";
+const DEFAULT_BRIDGE_CKSOL_LEDGER_CANISTER: &str = "la34w-haaaa-aaaar-qb5na-cai";
 pub const DEFAULT_ICPSWAP_FACTORY_CANISTER: &str = "4mmnk-kiaaa-aaaag-qbllq-cai";
 const DEFAULT_ICPSWAP_FEE_TIERS: &str = "100,500,3000,10000";
 const DEFAULT_ICPSWAP_MAX_PRICE_IMPACT_BPS: f64 = 100.0;
@@ -494,24 +568,27 @@ fn parse_multi_venue_min_net_edge_bps_from_env() -> u32 {
         .min(MAX_BPS)
 }
 
-/// Edge floor for collateral bought as bad debt, which repays more than the
-/// collateral is worth by construction.
-///
-/// It mirrors `MULTI_VENUE_MIN_NET_EDGE_BPS` in sign, not in value: a
-/// profitable liquidation must clear the debt by 150 bps, while bad debt may
-/// fall short of it by 150 bps and still be recycled without a human. Anything
-/// further underwater is escalated instead of sold automatically.
-///
-/// Deliberately a constant rather than the negation of the profitable floor:
-/// raising the profit bar is a tightening, and must not silently widen how much
-/// loss the swap-back will accept. The quote is priced against the oracle
-/// regardless, so this governs recycling, never fill quality.
-fn parse_multi_venue_bad_debt_min_net_edge_bps_from_env() -> i32 {
-    let limit = i32::try_from(MAX_BPS).unwrap_or(i32::MAX);
-    env::var("MULTI_VENUE_BAD_DEBT_MIN_NET_EDGE_BPS")
+/// Reads a signed basis-point value, keeping it only when `valid` accepts it.
+fn parse_signed_bps_from_env(var: &str, valid: impl Fn(i32) -> bool) -> Option<i32> {
+    env::var(var)
         .ok()
         .and_then(|value| value.parse::<i32>().ok())
-        .filter(|bps| *bps >= -limit && *bps <= limit)
+        .filter(|bps| valid(*bps))
+}
+
+fn parse_multi_venue_settlement_min_net_edge_bps_from_env() -> Option<i32> {
+    parse_signed_bps_from_env(
+        "MULTI_VENUE_SETTLEMENT_MIN_NET_EDGE_BPS",
+        crate::finalizers::multi_venue::is_valid_settlement_floor,
+    )
+}
+
+/// Settlement floor for global bad-debt mode or saved bad-debt rows.
+/// Independent of the normal floor so changing it cannot widen bad-debt losses.
+/// The oracle quote guard still applies.
+fn parse_multi_venue_bad_debt_min_net_edge_bps_from_env() -> i32 {
+    let limit = i32::try_from(MAX_BPS).unwrap_or(i32::MAX);
+    parse_signed_bps_from_env("MULTI_VENUE_BAD_DEBT_MIN_NET_EDGE_BPS", |bps| bps >= -limit && bps <= limit)
         .unwrap_or(DEFAULT_MULTI_VENUE_BAD_DEBT_MIN_NET_EDGE_BPS)
 }
 
@@ -836,6 +913,7 @@ mod tests {
             "CEX_RETRY_BASE_SECS",
             "CEX_RETRY_MAX_SECS",
             "MULTI_VENUE_MIN_NET_EDGE_BPS",
+            "MULTI_VENUE_SETTLEMENT_MIN_NET_EDGE_BPS",
             "MULTI_VENUE_BAD_DEBT_MIN_NET_EDGE_BPS",
             "CEX_MIN_NET_EDGE_BPS",
             "MULTI_VENUE_MAX_ORACLE_DISCOUNT_BPS",
@@ -867,10 +945,31 @@ mod tests {
             }
         );
         assert_eq!(parse_multi_venue_min_net_edge_bps_from_env(), 150);
+        assert_eq!(parse_multi_venue_settlement_min_net_edge_bps_from_env(), None);
         // The same 150 bps, mirrored: a profitable liquidation must clear the
         // debt by that much, bad debt may fall short of it by that much.
         assert_eq!(parse_multi_venue_bad_debt_min_net_edge_bps_from_env(), -500);
         assert_eq!(parse_multi_venue_oracle_snapshot_max_age_secs_from_env(), 300);
+    }
+
+    #[test]
+    fn settlement_edge_floor_is_optional_and_accepts_only_bounded_overrides() {
+        let _guard = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        for (value, expected) in [
+            ("-150", Some(-150)),
+            ("0", Some(0)),
+            ("150", Some(150)),
+            ("-9999", Some(-9999)),
+            ("10000", Some(10000)),
+            ("-10000", None),
+            ("10001", None),
+            ("not-a-number", None),
+        ] {
+            unsafe { env::set_var("MULTI_VENUE_SETTLEMENT_MIN_NET_EDGE_BPS", value) };
+            assert_eq!(parse_multi_venue_settlement_min_net_edge_bps_from_env(), expected);
+        }
+        unsafe { env::remove_var("MULTI_VENUE_SETTLEMENT_MIN_NET_EDGE_BPS") };
+        assert_eq!(parse_multi_venue_settlement_min_net_edge_bps_from_env(), None);
     }
 
     #[test]
@@ -1286,4 +1385,5 @@ mod tests {
             }
         }
     }
+
 }

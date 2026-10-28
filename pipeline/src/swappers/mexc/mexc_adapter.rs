@@ -84,6 +84,28 @@ fn normalize_market_symbol(market: &str) -> String {
     market.replace(['/', '_', '-'], "").to_ascii_uppercase()
 }
 
+/// Splits an asset symbol into its upper-case form and its native symbol
+/// without the `CK` prefix. Every MEXC alias builder starts from this pair.
+fn ck_split(asset: &str) -> (String, String) {
+    let upper = asset.trim().to_ascii_uppercase();
+    let native = upper.strip_prefix("CK").unwrap_or(&upper).to_string();
+    (upper, native)
+}
+
+fn push_unique(candidates: &mut Vec<String>, value: String) {
+    if !candidates.iter().any(|item| item.eq_ignore_ascii_case(&value)) {
+        candidates.push(value);
+    }
+}
+
+fn mexc_withdraw_coin_candidates(asset: &str) -> Vec<String> {
+    let (upper, native) = ck_split(asset);
+    let mut candidates = vec![upper];
+    push_unique(&mut candidates, format!("CK{native}"));
+    push_unique(&mut candidates, native);
+    candidates
+}
+
 fn format_mexc_api_error(err: &v3::ApiError) -> String {
     match err {
         v3::ApiError::ErrorResponse(resp) => match &resp._extend {
@@ -124,6 +146,17 @@ fn is_coin_missing(err: &v3::ApiError) -> bool {
         err,
         v3::ApiError::ErrorResponse(resp) if resp.code == v3::ErrorCode::CurrencyDoesNotExist
     )
+}
+
+/// MEXC answers a history read for a coin it does not list with 700004,
+/// "mandatory parameter 'coin' ... malformed". Seen live on 2026-10-26.
+const MEXC_MALFORMED_PARAM_RAW_CODE: i32 = 700004;
+
+/// True when a history read of a coin alias failed because MEXC does not
+/// list that alias, so no withdrawal can exist under it.
+fn is_unlisted_alias(err: &v3::ApiError) -> bool {
+    is_coin_missing(err)
+        || matches!(err, v3::ApiError::ErrorResponse(resp) if resp.raw_code == MEXC_MALFORMED_PARAM_RAW_CODE)
 }
 
 fn is_order_missing_lookup_error(message: &str) -> bool {
@@ -195,8 +228,8 @@ fn mexc_network_candidates(asset: &str, network: &str) -> Vec<String> {
         return candidates;
     }
 
-    let asset_no_ck = asset_norm.strip_prefix("CK").unwrap_or(&asset_norm);
-    let ck_asset = format!("CK{}", asset_no_ck);
+    let (_, asset_no_ck) = ck_split(&asset_norm);
+    let ck_asset = format!("CK{asset_no_ck}");
 
     // For ck-assets, prefer CK network names only (avoid leaking base symbol like BTC/USDT as a network).
     if asset_norm.starts_with("CK") {
@@ -219,6 +252,17 @@ fn mexc_network_candidates(asset: &str, network: &str) -> Vec<String> {
     }
 
     candidates
+}
+
+/// MEXC labels deposit networks either as a bare code (`CKBTC`) or as a
+/// display name with the code in parentheses (`Solana(SOL)`). A plain
+/// substring test would let `ETH` match `MEGAETH` or `CKETH`.
+fn deposit_network_matches(item_network: &str, candidates: &[String]) -> bool {
+    let item_network = item_network.trim().to_ascii_uppercase();
+    candidates.iter().any(|cand| {
+        let cand = cand.to_ascii_uppercase();
+        item_network == cand || item_network.ends_with(&format!("({cand})"))
+    })
 }
 
 fn is_evm_network_alias(network_norm: &str) -> bool {
@@ -246,31 +290,37 @@ fn mexc_withdraw_network(asset: &str, network: &str) -> String {
     network.to_string()
 }
 
+/// Reads the advertised order types of one exchangeInfo symbol entry.
+///
+/// The live API always returns the list, so a missing list is treated as
+/// supported only to stay compatible with older or partial metadata.
+fn supports_market_orders(info: &Value) -> bool {
+    match info.get("orderTypes").and_then(Value::as_array) {
+        Some(types) => types.iter().any(|kind| kind.as_str() == Some("MARKET")),
+        None => true,
+    }
+}
+
 fn mexc_deposit_asset_candidates(asset: &str) -> Vec<String> {
     let asset_trimmed = asset.trim();
     if asset_trimmed.is_empty() {
         return vec![];
     }
-
-    let asset_upper = asset_trimmed.to_ascii_uppercase();
-    let has_ck_prefix = asset_upper.starts_with("CK");
-    let asset_no_ck = asset_upper.strip_prefix("CK").unwrap_or(&asset_upper);
-
-    let mut candidates = Vec::new();
-
-    if has_ck_prefix {
-        // only ck variants
-        candidates.push(format!("CK{}", asset_no_ck));
-        candidates.push(format!("ck{}", asset_no_ck));
+    let (upper, native) = ck_split(asset_trimmed);
+    // Order matters: the requested asset comes before its CK alias, otherwise
+    // a native ETH deposit could resolve to IC custody. A ck asset keeps only
+    // its ck forms so the base symbol never leaks as a coin.
+    let ordered = if upper.starts_with("CK") {
+        vec![format!("CK{native}"), format!("ck{native}")]
     } else {
-        // normal asset + ck variants
-        candidates.push(asset_trimmed.to_string());
-        candidates.push(asset_upper.clone());
-        candidates.push(format!("CK{}", asset_upper));
+        vec![asset_trimmed.to_string(), upper.clone(), format!("CK{upper}")]
+    };
+    let mut candidates = Vec::new();
+    for candidate in ordered {
+        if !candidates.contains(&candidate) {
+            candidates.push(candidate);
+        }
     }
-
-    candidates.sort();
-    candidates.dedup();
     candidates
 }
 
@@ -435,6 +485,8 @@ impl MexcClient {
             debug!("[mexc] resolved symbol filters {} -> {}", symbol, resolved_symbol);
         }
 
+        Self::validate_market_order_support(&info, &resolved_symbol)?;
+
         let mut filters = SymbolFilters::default();
         if let Some(entries) = info.get("filters").and_then(|v| v.as_array()) {
             for f in entries {
@@ -468,6 +520,15 @@ impl MexcClient {
 }
 
 impl MexcClient {
+    /// Execution uses MARKET orders, so a listed market is only usable when
+    /// its metadata advertises them.
+    fn validate_market_order_support(info: &Value, symbol: &str) -> Result<(), String> {
+        if !supports_market_orders(info) {
+            return Err(format!("MEXC market {symbol} does not support MARKET orders"));
+        }
+        Ok(())
+    }
+
     async fn fetch_ask_levels(
         &self,
         ex: &MexcSpotApiClientWithAuthentication,
@@ -1203,10 +1264,9 @@ impl CexBackend for MexcClient {
                     continue;
                 }
 
-                let addr = res.iter().find(|item| {
-                    let item_network = item.network.to_ascii_uppercase();
-                    candidates.iter().any(|cand| item_network.contains(cand))
-                });
+                let addr = res
+                    .iter()
+                    .find(|item| deposit_network_matches(&item.network, &candidates));
 
                 if let Some(v) = addr {
                     return Ok(DepositAddress {
@@ -1283,14 +1343,7 @@ impl CexBackend for MexcClient {
             }
         };
 
-        let asset_upper = asset.to_ascii_uppercase();
-        let asset_no_ck = asset_upper.strip_prefix("CK").unwrap_or(&asset_upper);
-        let mut candidates = Vec::new();
-        // Prefer native symbol and its CK-prefixed form first.
-        push_unique(&mut candidates, asset_upper.clone());
-        push_unique(&mut candidates, format!("CK{}", asset_no_ck));
-        push_unique(&mut candidates, asset_no_ck.to_string());
-        push_unique(&mut candidates, asset.to_string());
+        let candidates = mexc_withdraw_coin_candidates(asset);
 
         let mut network_candidates = mexc_network_candidates(asset, network);
         let network_mapped = mexc_withdraw_network(asset, network);
@@ -1327,7 +1380,7 @@ impl CexBackend for MexcClient {
                     .await
                 {
                     Ok(ok) => {
-                        res = Some(ok);
+                        res = Some((ok, coin.clone()));
                         break;
                     }
                     Err(e) => {
@@ -1347,13 +1400,13 @@ impl CexBackend for MexcClient {
             }
         }
 
-        let res = match res {
+        let (res, accepted_coin) = match res {
             Some(res) => res,
             None => return Err(hard_err.or(last_err).unwrap_or_else(|| "withdraw failed".to_string())),
         };
 
         Ok(WithdrawalReceipt {
-            asset: asset.to_string(),
+            asset: accepted_coin,
             network: network_mapped,
             amount,
             txid: None,
@@ -1372,20 +1425,30 @@ impl CexBackend for MexcClient {
         withdraw_id: &str,
     ) -> Result<WithdrawStatusSnapshot, String> {
         let ex = self.inner.lock().await;
-        let records = ex
-            .withdraw_history(WithdrawHistoryRequest {
-                coin: Some(coin.to_string()),
+        let mut rec = None;
+        // Older durable rows retain the planned symbol, not the alias MEXC
+        // accepted. Search the same candidates as submission, matching only the
+        // durable withdrawal ID; absence under one alias is not non-delivery.
+        for (index, candidate) in mexc_withdraw_coin_candidates(coin).into_iter().enumerate() {
+            let records = match ex.withdraw_history(WithdrawHistoryRequest {
+                coin: Some(candidate),
                 status: None,
                 limit: Some(DEFAULT_WITHDRAW_HISTORY_LIMIT),
                 start_time: None,
                 end_time: None,
-            })
-            .await
-            .map_err(|e| e.to_string())?;
-
-        let rec = records
-            .into_iter()
-            .find(|r| r.id == withdraw_id || r.withdraw_order_id.as_deref() == Some(withdraw_id));
+            }).await {
+                Ok(records) => records,
+                Err(error) if is_coin_missing(&error) => continue,
+                // The planned coin must answer, so only an alias may be skipped.
+                Err(error) if index > 0 && is_unlisted_alias(&error) => continue,
+                Err(error) => return Err(error.to_string()),
+            };
+            rec = records.into_iter()
+                .find(|record| record.id == withdraw_id || record.withdraw_order_id.as_deref() == Some(withdraw_id));
+            if rec.is_some() {
+                break;
+            }
+        }
 
         let rec = match rec {
             Some(r) => r,
@@ -1439,6 +1502,120 @@ impl CexBackend for MexcClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_history_read_skips_only_aliases_that_mexc_does_not_list() {
+        let response = |code: v3::ErrorCode, raw_code: i32| {
+            v3::ApiError::ErrorResponse(v3::ErrorResponse {
+                code,
+                raw_code,
+                msg: "test".into(),
+                _extend: None,
+            })
+        };
+        assert!(is_unlisted_alias(&response(
+            v3::ErrorCode::ParamOrigClientOrderIdOrOrderIdMustBeSentButBothWereEmptyNull,
+            700004
+        )));
+        assert!(is_unlisted_alias(&response(v3::ErrorCode::CurrencyDoesNotExist, 10232)));
+        assert!(!is_unlisted_alias(&response(v3::ErrorCode::InternalError, 500)));
+        assert!(!is_unlisted_alias(&v3::ApiError::RateLimitExceeded));
+        assert_eq!(mexc_withdraw_coin_candidates("SOL"), vec!["SOL", "CKSOL"]);
+    }
+
+    // Labels recorded from the live deposit address endpoint on 2026-10-21.
+    #[test]
+    fn deposit_network_matches_live_mexc_labels() {
+        let cands = |list: &[&str]| list.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        for (label, candidates) in [
+            ("Solana(SOL)", cands(&["SOL"])),
+            ("Bitcoin(BTC)", cands(&["BTC"])),
+            ("Ethereum(ERC20)", cands(&["ETH", "ERC20"])),
+            ("Internet Computer(ICP)", cands(&["ICP"])),
+            ("CKBTC", cands(&["CKBTC", "ICP"])),
+            ("CKUSDT", cands(&["CKUSDT", "ICP"])),
+        ] {
+            assert!(super::deposit_network_matches(label, &candidates), "{label}");
+        }
+        for (label, candidates) in [
+            ("CKETH", cands(&["ETH", "ERC20"])),
+            ("MEGAETH", cands(&["ETH", "ERC20"])),
+            ("Wormhole-SOL", cands(&["SOL"])),
+            ("Solana(SOL)", cands(&["ETH", "ERC20"])),
+            ("BNB Smart Chain(BEP20)", cands(&["BTC"])),
+        ] {
+            assert!(!super::deposit_network_matches(label, &candidates), "{label}");
+        }
+    }
+
+    #[test]
+    fn market_order_admission_rejects_limit_only_books() {
+        for order_types in [serde_json::json!(["LIMIT"]), serde_json::json!([])] {
+            let info = serde_json::json!({"orderTypes": order_types});
+            let error = MexcClient::validate_market_order_support(&info, "ETHUSDC").unwrap_err();
+            assert!(error.contains("ETHUSDC"));
+            assert!(error.contains("does not support MARKET"));
+        }
+        for info in [
+            serde_json::json!({"orderTypes": ["LIMIT", "MARKET"]}),
+            serde_json::json!({}),
+        ] {
+            assert!(MexcClient::validate_market_order_support(&info, "ETHUSDC").is_ok());
+        }
+    }
+
+    #[tokio::test]
+    async fn native_deposit_prefers_eth_and_ignores_cketh_address() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0; 1024];
+            while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                let count = stream.read(&mut buffer).await.unwrap();
+                assert!(count > 0);
+                request.extend_from_slice(&buffer[..count]);
+            }
+            let request = String::from_utf8(request).unwrap();
+            assert!(request.contains("coin=ETH"), "{request}");
+            assert!(!request.contains("coin=CKETH"), "{request}");
+            let body = r#"[{"coin":"ETH","network":"CKETH","address":"wrong-ic-account","memo":""},{"coin":"ETH","network":"ETH","address":"0x1111111111111111111111111111111111111111","memo":""}]"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+        });
+        let client = MexcClient {
+            inner: tokio::sync::Mutex::new(MexcSpotApiClientWithAuthentication::new(
+                mexc_rs::spot::MexcSpotApiEndpoint::Custom(endpoint),
+                "test-key".into(),
+                "test-secret".into(),
+            )),
+            symbol_filters: tokio::sync::Mutex::new(HashMap::new()),
+            http: reqwest::Client::new(),
+        };
+        let address = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            client.get_deposit_address("ETH", "ETH"),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        server.await.unwrap();
+        assert_eq!(address.network, "ETH");
+        assert_eq!(address.address, "0x1111111111111111111111111111111111111111");
+    }
+
+    #[test]
+    fn withdrawal_submission_and_history_cover_native_and_ck_aliases() {
+        assert_eq!(mexc_withdraw_coin_candidates(" usdc "), ["USDC", "CKUSDC"]);
+        assert_eq!(mexc_withdraw_coin_candidates("ckUSDC"), ["CKUSDC", "USDC"]);
+        assert_eq!(mexc_withdraw_coin_candidates("ICP"), ["ICP", "CKICP"]);
+    }
 
     // Buy fill mapping should keep quote as input-consumed and apply fee haircut to base output.
     #[test]

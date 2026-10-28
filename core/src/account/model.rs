@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 pub enum Chain {
     Icp,
     Evm { chain: String }, // "ETH", "ARB", ...
+    Sol,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, CandidType, PartialEq, Eq)]
@@ -13,6 +14,7 @@ pub enum ChainAccount {
     Icp(Account),
     IcpLedger(String),
     Evm(String), // EVM address as string
+    Solana(String), // Solana address (base58 pubkey)
 }
 
 impl std::fmt::Display for Chain {
@@ -20,6 +22,7 @@ impl std::fmt::Display for Chain {
         match self {
             Chain::Icp => write!(f, "icp"),
             Chain::Evm { chain } => write!(f, "evm:{chain}"),
+            Chain::Sol => write!(f, "sol"),
         }
     }
 }
@@ -43,6 +46,10 @@ impl std::str::FromStr for Chain {
             });
         }
 
+        if lower == "sol" {
+            return Ok(Chain::Sol);
+        }
+
         Err(format!("invalid chain: {s}"))
     }
 }
@@ -51,4 +58,5 @@ impl std::str::FromStr for Chain {
 pub enum TxRef {
     IcpBlockIndex(String),
     EvmTxHash(String),
+    SolanaSignature(String),
 }
