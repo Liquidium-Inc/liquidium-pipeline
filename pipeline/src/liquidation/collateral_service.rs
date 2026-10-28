@@ -5,13 +5,11 @@ use candid::Nat;
 use log::debug;
 
 use crate::{
-    liquidation::liquidation_math::{compute_liquidation_amounts, max_repay_from_collateral},
+    liquidation::liquidation_math::{close_cap, compute_liquidation_amounts, max_repay_from_collateral},
     price_oracle::price_oracle::PriceOracle,
 };
 
-use liquidium_pipeline_core::types::protocol_types::{
-    Asset, Assets, LiquidateblePosition, LiquidatebleUser, MAX_LIQUIDATION_RATIO,
-};
+use liquidium_pipeline_core::types::protocol_types::{Asset, Assets, LiquidateblePosition, LiquidatebleUser};
 
 pub(crate) const USD_QUOTE_CURRENCY: &str = "USDT";
 
@@ -97,16 +95,7 @@ impl<P: PriceOracle> CollateralServiceTrait for CollateralService<P> {
         // Start with the requested repay (bounded by remaining debt and external max)
         let mut repay_native = debt_position.debt_amount.clone().min(max_repay_amount.clone());
 
-        // Mirror the pool's close factor (`compute_repay_cap`): one call repays at
-        // most half of the selected debt position, or all of it at HF <= 975.
-        const WIPEOUT_THRESHOLD: u128 = 975u128;
-        let liquidation_ratio = if user.health_factor <= WIPEOUT_THRESHOLD {
-            1000
-        } else {
-            MAX_LIQUIDATION_RATIO
-        };
-        let close_cap = (debt_position.debt_amount.clone() * Nat::from(liquidation_ratio)) / Nat::from(1000u32);
-        repay_native = repay_native.min(close_cap);
+        repay_native = repay_native.min(close_cap(&debt_position.debt_amount, &user.health_factor));
 
         debug!("[debug] repay_native={} ", repay_native);
 
@@ -257,7 +246,7 @@ mod test {
     use proptest::prelude::*;
 
     use crate::price_oracle::price_oracle::MockPriceOracle;
-    use liquidium_pipeline_core::types::protocol_types::{AssetType, Assets};
+    use liquidium_pipeline_core::types::protocol_types::{AssetType, Assets, MAX_LIQUIDATION_RATIO};
 
     use super::*;
     use std::sync::Arc;

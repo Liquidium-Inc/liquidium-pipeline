@@ -1,10 +1,37 @@
 use candid::Nat;
+use liquidium_pipeline_core::types::protocol_types::MAX_LIQUIDATION_RATIO;
 
 pub const BPS_ONE: u64 = 10_000; // 100% in basis points
+
+/// At or below this health factor, one call may repay the whole debt position.
+const WIPEOUT_THRESHOLD: u128 = 975;
 
 #[inline]
 fn pow10(decimals: u64) -> Nat {
     Nat::from(10u128.pow(decimals as u32))
+}
+
+/// The most one call may repay of `debt_amount`, as the pool's `compute_repay_cap` allows.
+/// That is half of the position, or all of it at HF <= 975.
+pub fn close_cap(debt_amount: &Nat, health_factor: &Nat) -> Nat {
+    let liquidation_ratio = if *health_factor <= WIPEOUT_THRESHOLD {
+        1000
+    } else {
+        MAX_LIQUIDATION_RATIO
+    };
+    (debt_amount.clone() * Nat::from(liquidation_ratio)) / Nat::from(1000u32)
+}
+
+/// Collateral seized per repaid unit, in bps: `10_000 + bonus - bonus * fee / 10_000`.
+/// The protocol takes its fee from the bonus only; see the derivation above `max_repay_from_collateral`.
+pub fn seize_denominator_bps(bonus_bps: u64, fee_bps: u64) -> Result<Nat, String> {
+    if bonus_bps > BPS_ONE || fee_bps > BPS_ONE {
+        return Err("bps out of range".into());
+    }
+    let one_bps = Nat::from(BPS_ONE);
+    let bonus = Nat::from(bonus_bps);
+    let bonus_fee = (bonus.clone() * Nat::from(fee_bps)) / one_bps.clone();
+    Ok(one_bps + bonus - bonus_fee)
 }
 
 /*
@@ -145,18 +172,10 @@ pub fn max_repay_from_collateral(
     // coll_cap_quote_ray = price_coll_ray * max_coll_native / coll_scale
     let coll_cap_quote_ray = (price_coll_ray.clone() * max_coll_native.clone()) / coll_scale.clone();
 
-    // denom_bps = 10_000 + bonus_bps - floor(bonus_bps * fee_bps / 10_000)
-    let one_bps = Nat::from(BPS_ONE);
-    let bonus = Nat::from(bonus_bps);
-    let fee = Nat::from(fee_bps);
-    let bonus_fee = (bonus.clone() * fee.clone()) / one_bps.clone();
-    let denom_bps = one_bps.clone() + bonus - bonus_fee; // >= 10_000
-    if denom_bps == 0u8 {
-        return Err("Invalid liquidation params".into());
-    }
+    let denom_bps = seize_denominator_bps(bonus_bps, fee_bps)?;
 
     // r_max_quote_ray = coll_cap_quote_ray * 10_000 / denom_bps   (still RAY)
-    let r_max_quote_ray = (coll_cap_quote_ray * one_bps.clone()) / denom_bps;
+    let r_max_quote_ray = (coll_cap_quote_ray * Nat::from(BPS_ONE)) / denom_bps;
 
     // repay_native_max = (r_max_quote_ray * debt_scale) / price_debt_ray
     let repay_native = (r_max_quote_ray * debt_scale) / price_debt_ray.clone();
@@ -203,6 +222,20 @@ pub fn oracle_implied_output(
 mod tests {
     use super::*;
     use candid::Nat;
+
+    #[test]
+    fn close_cap_allows_the_whole_position_only_at_or_below_975() {
+        let debt = Nat::from(1_000u32);
+        assert_eq!(close_cap(&debt, &Nat::from(975u32)), Nat::from(1_000u32));
+        assert_eq!(close_cap(&debt, &Nat::from(976u32)), Nat::from(500u32));
+    }
+
+    #[test]
+    fn seize_denominator_takes_the_fee_from_the_bonus_only() {
+        // A 10% bonus with 2% of it to the protocol: 10_000 + 1_000 - 20.
+        assert_eq!(seize_denominator_bps(1_000, 200), Ok(Nat::from(10_980u32)));
+        assert!(seize_denominator_bps(10_001, 0).is_err());
+    }
 
     #[test]
     fn compute_errors_on_zero_prices() {

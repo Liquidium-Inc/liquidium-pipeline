@@ -22,7 +22,10 @@ use crate::{
     executors::basic::basic_executor::BasicExecutor,
     bridge::{claims::WalBridgeClaims, runtime::BridgeRuntime},
     finalizers::{
-        cex::runtime::{build_kraken_finalizer, build_mexc_finalizer},
+        cex::{
+            profile::CexVenueProfile,
+            runtime::{build_kraken_finalizer, build_mexc_finalizer},
+        },
         multi_venue::{
             ICPSWAP_VENUE_ID, IcpswapFirstPlannerConfig, KRAKEN_VENUE_ID, MEXC_VENUE_ID, MultiVenueAdapter,
             MultiVenueFinalizer,
@@ -329,6 +332,14 @@ async fn init(
     let wd = webhook_watchdog_from_env(Duration::from_secs(300));
     wd.notify(WatchdogEvent::Heartbeat { stage: "Init" }).await;
 
+    // Ranking prefers collateral that an enabled exchange takes on ICP without a bridge.
+    // The list comes from the profiles the bridge planner reads, so the two cannot disagree.
+    let venue_native_symbols = config
+        .enabled_swap_venues
+        .iter()
+        .filter_map(|venue_id| CexVenueProfile::for_venue(venue_id))
+        .flat_map(|profile| profile.direct_assets().iter().map(|symbol| symbol.to_string()))
+        .collect();
     let strategy = SimpleLiquidationStrategy::new(
         config.clone(),
         registry.clone(),
@@ -336,7 +347,8 @@ async fn init(
         ctx.main_service.clone(),
         ctx.approval_state.clone(),
     )
-    .with_watchdog(wd);
+    .with_watchdog(wd)
+    .with_venue_native_symbols(venue_native_symbols);
 
     let exporter = Arc::new(ExportStage {
         path: config.export_path.clone(),
