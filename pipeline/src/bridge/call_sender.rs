@@ -175,6 +175,8 @@ impl OutboundSender for BridgeCallSender {
             // Refused before any provider call: a floor or a busy wallet.
             Err(BridgeError::BelowMinimum(reason)) => SendOutcome::BelowMinimum { reason },
             Err(BridgeError::Deferred(reason)) => SendOutcome::Deferred { reason },
+            // Nothing moved, so the next cycle prepares a new call.
+            Err(BridgeError::Refused(reason)) => SendOutcome::NeverLanded { reason },
             // Any other failure may follow a call that ran, so the provider
             // history decides it.
             Err(BridgeError::Ambiguous(reason) | BridgeError::Unreadable(reason) | BridgeError::Other(reason)) => {
@@ -286,6 +288,12 @@ mod tests {
             ),
             (Err(BridgeError::Deferred("wallet busy".into())), "deferred"),
             (Err(BridgeError::BelowMinimum("below minimum".into())), "below minimum"),
+            (
+                Err(BridgeError::Refused(
+                    "withdraw_erc20 error: RecipientAddressBlocked".into(),
+                )),
+                "never",
+            ),
             (Err(BridgeError::Other("minter call timed out".into())), "open"),
         ];
         for (answer, expected) in cases {

@@ -43,9 +43,10 @@ impl From<BridgeError> for CexBackendError {
         match error {
             BridgeError::BelowMinimum(message) => Self::BelowMinimum(message),
             BridgeError::Ambiguous(message) => Self::Ambiguous(message),
-            BridgeError::Deferred(message) | BridgeError::Unreadable(message) | BridgeError::Other(message) => {
-                Self::Other(message)
-            }
+            BridgeError::Deferred(message)
+            | BridgeError::Unreadable(message)
+            | BridgeError::Refused(message)
+            | BridgeError::Other(message) => Self::Other(message),
         }
     }
 }

@@ -492,8 +492,16 @@ where
         })
     }
 
-    fn map_withdraw_error(err: CkSolWithdrawalError) -> String {
-        match err {
+    /// The minter's certified answer: no ckSOL left the account, so a later call is safe.
+    fn map_withdraw_error(err: CkSolWithdrawalError) -> BridgeError {
+        let kind = match &err {
+            CkSolWithdrawalError::ValueTooSmall { .. } => BridgeError::BelowMinimum,
+            CkSolWithdrawalError::AlreadyProcessing | CkSolWithdrawalError::TemporarilyUnavailable(_) => {
+                BridgeError::Deferred
+            }
+            _ => BridgeError::Refused,
+        };
+        kind(match err {
             CkSolWithdrawalError::AlreadyProcessing => "ckSOL withdraw rejected: AlreadyProcessing".to_string(),
             CkSolWithdrawalError::ValueTooSmall {
                 minimum_withdrawal_amount,
@@ -517,11 +525,11 @@ where
             CkSolWithdrawalError::TemporarilyUnavailable(message) => {
                 format!("ckSOL withdraw rejected: TemporarilyUnavailable ({message})")
             }
-        }
+        })
     }
 
-    async fn withdraw(&self, args: CkSolWithdrawalArgs) -> Result<CkSolWithdrawalOk, String> {
-        let arg_blob = Encode!(&args).map_err(|e| format!("encode withdraw args failed: {e}"))?;
+    async fn withdraw(&self, args: CkSolWithdrawalArgs) -> Result<CkSolWithdrawalOk, BridgeError> {
+        let arg_blob = Encode!(&args).map_err(|e| BridgeError::Refused(format!("encode withdraw args failed: {e}")))?;
         let result: Result<CkSolWithdrawalOk, CkSolWithdrawalError> = self
             .agent
             .call_update::<Result<CkSolWithdrawalOk, CkSolWithdrawalError>>(
@@ -806,7 +814,24 @@ where
         &self,
         route: &BridgeRouteSpec,
         request: &BridgeRequest,
-    ) -> Result<BridgeSubmission, String> {
+    ) -> Result<BridgeSubmission, BridgeError> {
+        let args = self
+            .prepare_icp_to_solana(route, request)
+            .await
+            .map_err(|error| BridgeError::from(error).before_call())?;
+        let withdraw = self.withdraw(args).await?;
+        Ok(BridgeSubmission {
+            bridge_id: format!("{}{}", WITHDRAW_BRIDGE_ID_PREFIX, withdraw.block_index),
+        })
+    }
+
+    /// Checks the ckSOL balance and sets the minter allowance. It does not
+    /// call the minter's withdraw.
+    async fn prepare_icp_to_solana(
+        &self,
+        route: &BridgeRouteSpec,
+        request: &BridgeRequest,
+    ) -> Result<CkSolWithdrawalArgs, String> {
         let source_account = self.ensure_principal_only_bridge_source(&request.source_address)?;
         let destination = Self::expect_solana_destination(route, &request.destination)?;
 
@@ -843,16 +868,10 @@ where
             )
         })?;
 
-        let withdraw = self
-            .withdraw(CkSolWithdrawalArgs {
-                from_subaccount: None,
-                amount: amount_lamports,
-                address: destination.to_string(),
-            })
-            .await?;
-
-        Ok(BridgeSubmission {
-            bridge_id: format!("{}{}", WITHDRAW_BRIDGE_ID_PREFIX, withdraw.block_index),
+        Ok(CkSolWithdrawalArgs {
+            from_subaccount: None,
+            amount: amount_lamports,
+            address: destination.to_string(),
         })
     }
 }
@@ -952,7 +971,7 @@ where
 
         match route.route_kind {
             BridgeRouteKind::SolanaToIcp => self.submit_solana_to_icp(route, &request).await,
-            BridgeRouteKind::IcpToSolana => Ok(self.submit_icp_to_solana(route, &request).await?),
+            BridgeRouteKind::IcpToSolana => self.submit_icp_to_solana(route, &request).await,
             _ => Err(format!(
                 "route {}@{} -> {} is not supported by SolanaBridgeBackend",
                 route.source_asset, route.source_chain, route.target_asset
@@ -1815,9 +1834,67 @@ mod tests {
         let err = backend
             .submit_bridge(icp_to_sol_request(bridge_owner().to_text()))
             .await
-            .expect_err("withdraw error must propagate with explicit variant")
-            .to_string();
-        assert!(err.contains("InsufficientAllowance"));
+            .expect_err("withdraw error must propagate with explicit variant");
+        assert!(matches!(&err, BridgeError::Refused(message) if message.contains("InsufficientAllowance")));
+    }
+
+    /// Review finding 11: a minter refusal and a failure before the minter
+    /// call moved nothing, but they read as "may have run" and parked the leg.
+    #[tokio::test]
+    async fn icp_to_solana_failures_keep_whether_the_minter_ran() {
+        type Answer = Result<Result<CkSolWithdrawalOk, CkSolWithdrawalError>, String>;
+        let refusal = |error: CkSolWithdrawalError| -> Option<Answer> { Some(Ok(Err(error))) };
+        let cases: [(Option<Answer>, fn(&BridgeError) -> bool); 5] = [
+            (
+                refusal(CkSolWithdrawalError::TemporarilyUnavailable("busy".into())),
+                |error| matches!(error, BridgeError::Deferred(_)),
+            ),
+            (
+                refusal(CkSolWithdrawalError::ValueTooSmall {
+                    minimum_withdrawal_amount: 10,
+                    withdrawal_amount: 1,
+                }),
+                |error| matches!(error, BridgeError::BelowMinimum(_)),
+            ),
+            (refusal(CkSolWithdrawalError::MalformedAddress("x".into())), |error| {
+                matches!(error, BridgeError::Refused(_))
+            }),
+            // The reply was lost, so the minter may have run.
+            (Some(Err("timed out".into())), |error| {
+                matches!(error, BridgeError::Other(_))
+            }),
+            // The balance read failed, so the minter was never called.
+            (None, |error| matches!(error, BridgeError::Refused(_))),
+        ];
+        for (answer, expected) in cases {
+            let mut mock_agent = MockPipelineAgent::new();
+            let reaches_minter = answer.is_some();
+            if let Some(answer) = answer {
+                mock_agent
+                    .expect_call_update::<Result<CkSolWithdrawalOk, CkSolWithdrawalError>>()
+                    .times(1)
+                    .return_once(move |_, _, _| answer);
+            }
+            let mut mock_icp = MockIcpBackend::new();
+            mock_icp.expect_icrc1_decimals().returning(|_| Ok(9));
+            mock_icp.expect_icrc1_fee().returning(|_| Ok(Nat::from(10_000u64)));
+            mock_icp.expect_icrc1_balance().returning(move |_, _| {
+                if reaches_minter {
+                    Ok(Nat::from(1_100_000_000u64))
+                } else {
+                    Err("balance read failed".to_string())
+                }
+            });
+            mock_icp
+                .expect_icrc2_allowance()
+                .returning(|_, _, _| Ok(Nat::from(1_000_000_000u64)));
+
+            let error = backend(mock_agent, mock_icp, MockSolanaBackend::new())
+                .submit_bridge(icp_to_sol_request(bridge_owner().to_text()))
+                .await
+                .expect_err("the submit fails");
+            assert!(expected(&error), "{error:?}");
+        }
     }
 
     #[tokio::test]

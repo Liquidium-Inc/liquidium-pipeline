@@ -12,9 +12,10 @@ use crate::backend::{
 use crate::pipeline_agent::MockPipelineAgent;
 
 use super::{
-    BridgeError, CkErc20BridgeBackend, CkEthMinterInfo, Eip1559TransactionPrice, MIN_ETH_FORWARD_GAS_RESERVE_WEI,
-    MockBridgeEvmBackend, WithdrawErc20Ret, WithdrawalRet, destination_to_bytes32, ensure_source_matches_bridge_owner,
-    ensure_source_matches_signer, eth_forward_gas_reserve_from_price, parse_source_icp_account,
+    BridgeError, CkErc20BridgeBackend, CkEthMinterInfo, Eip1559TransactionPrice, LedgerError,
+    MIN_ETH_FORWARD_GAS_RESERVE_WEI, MockBridgeEvmBackend, WithdrawErc20Error, WithdrawErc20Ret, WithdrawalError,
+    WithdrawalRet, destination_to_bytes32, ensure_source_matches_bridge_owner, ensure_source_matches_signer,
+    erc20_withdraw_refusal, eth_forward_gas_reserve_from_price, eth_withdraw_refusal, parse_source_icp_account,
     resolve_cketh_route_for_request,
 };
 
@@ -2111,4 +2112,40 @@ async fn a_usdc_return_waits_while_the_wallet_cannot_pay_its_gas() {
         .await
         .expect_err("a wallet short on gas must not approve or sign");
     assert!(matches!(error, BridgeError::Deferred(_)), "{error}");
+}
+
+/// Review finding 11: a certified minter refusal moved nothing, but it read
+/// as "may have run" and parked the leg.
+#[test]
+fn minter_refusals_keep_their_kind() {
+    assert!(matches!(
+        erc20_withdraw_refusal(WithdrawErc20Error::TemporarilyUnavailable("busy".into())),
+        BridgeError::Deferred(_)
+    ));
+    assert!(matches!(
+        erc20_withdraw_refusal(WithdrawErc20Error::RecipientAddressBlocked { address: "0x1".into() }),
+        BridgeError::Refused(_)
+    ));
+    assert!(matches!(
+        erc20_withdraw_refusal(WithdrawErc20Error::CkErc20LedgerError {
+            error: LedgerError::AmountTooLow {
+                minimum_burn_amount: Nat::from(10u8),
+                token_symbol: "ckUSDC".into(),
+                ledger_id: Principal::anonymous(),
+                failed_burn_amount: Nat::from(1u8),
+            },
+            cketh_block_index: Nat::from(3u8),
+        }),
+        BridgeError::BelowMinimum(_)
+    ));
+    assert!(matches!(
+        eth_withdraw_refusal(WithdrawalError::InsufficientFunds {
+            balance: Nat::from(0u8)
+        }),
+        BridgeError::Refused(_)
+    ));
+    assert!(matches!(
+        eth_withdraw_refusal(WithdrawalError::TemporarilyUnavailable("busy".into())),
+        BridgeError::Deferred(_)
+    ));
 }
