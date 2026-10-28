@@ -102,6 +102,23 @@ async fn slice_records_keep_token_decimals() {
     );
 }
 
+/// Review finding 26: a Kraken route through fiat USD saved the USD side of
+/// each slice in whole dollars.
+#[tokio::test]
+async fn usd_slice_records_keep_six_decimals() {
+    let finalizer = test_finalizer(Arc::new(MockCexBackend::new()), Arc::new(MockTransferActions::new()));
+    let mut state = finalizer.prepare("44", &make_execution_receipt(44)).await.unwrap();
+    state.withdraw.size_out = Some(ChainTokenAmount::from_formatted(
+        state.withdraw.withdraw_asset.clone(),
+        2.0,
+    ));
+    state.trade.trade_slices = vec![slice(0, "ICP_USD", "sell", 100.0, 812.37, 8.1237)];
+
+    let swap = finalizer.finish_state(&state).expect("finish should succeed");
+
+    assert_eq!(swap.legs[0].receive_amount, Nat::from(812_370_000u64));
+}
+
 /// Only a direct non-native ICP deposit sends approval bumps, so only it
 /// holds back their fees; every other route keeps the transfer fee alone.
 #[test]

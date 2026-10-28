@@ -36,10 +36,14 @@ pub(super) fn parse_market_symbols(market: &str) -> Option<(String, String)> {
     Some((base, quote))
 }
 
-/// Atomic decimals of an exchange asset. A ck token has its native asset's decimals.
+/// Atomic decimals of an exchange asset. A ck token has its native asset's
+/// decimals, and fiat USD uses six, as the USD stablecoins do.
 pub(super) fn asset_decimals(symbol: &str) -> Option<u8> {
     use liquidium_pipeline_core::types::protocol_types::{Asset, Assets};
     let symbol = symbol.to_ascii_uppercase();
+    if symbol == "USD" {
+        return Some(6);
+    }
     let native = symbol.strip_prefix("CK").unwrap_or(&symbol);
     [
         Assets::BTC,
