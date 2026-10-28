@@ -218,6 +218,23 @@ where
         Ok(pending > latest)
     }
 
+    /// The node's pending count for `from`, past any send this process
+    /// broadcast that the node does not show yet.
+    async fn next_nonce_for(&self, chain_id: u64, from: Address) -> Result<u64, String> {
+        let node_count = self
+            .provider
+            .get_transaction_count(from)
+            .pending()
+            .await
+            .map_err(|e| format!("nonce read failed for {from}: {e}"))?;
+        Ok(next_nonce(
+            &nonce_marks().lock().expect("nonce marks lock"),
+            (chain_id, from),
+            node_count,
+            Instant::now(),
+        ))
+    }
+
     /// Fills, signs and encodes a request for the wallet's next nonce. It
     /// broadcasts nothing.
     pub(crate) async fn sign_request(
@@ -230,22 +247,13 @@ where
             fees.map_err(|e| format!("fee estimate failed: {e}"))
         })?;
         let mut request = request.with_from(from).with_chain_id(chain_id);
-        let (estimate, node_count) = tokio::try_join!(
+        let (estimate, nonce) = tokio::try_join!(
             async {
                 let estimate = self.provider.estimate_gas(request.clone()).await;
                 estimate.map_err(|e| format!("gas estimate failed: {e}"))
             },
-            async {
-                let node_count = self.provider.get_transaction_count(from).pending().await;
-                node_count.map_err(|e| format!("nonce read failed for {from}: {e}"))
-            },
+            self.next_nonce_for(chain_id, from),
         )?;
-        let nonce = next_nonce(
-            &nonce_marks().lock().expect("nonce marks lock"),
-            (chain_id, from),
-            node_count,
-            Instant::now(),
-        );
         request.set_nonce(nonce);
         request.set_gas_limit(with_gas_buffer(estimate));
         request.set_max_fee_per_gas(fees.max_fee_per_gas);
@@ -389,25 +397,40 @@ where
             .map(|estimate| with_gas_buffer(estimate).max(ERC20_APPROVE_GAS_LIMIT))
             .unwrap_or(ERC20_APPROVE_GAS_LIMIT);
 
+        let from = self.provider.default_signer_address();
+        let chain_id = self.chain_id().await?;
         let mut attempt: u8 = 0;
         let pending = loop {
             attempt = attempt.saturating_add(1);
+            // Signed sends never pass alloy's nonce cache, so the approve takes
+            // its nonce the same way; the cache would fall behind them.
+            let nonce = self.next_nonce_for(chain_id, from).await?;
             let send_result = contract
                 .approve(spender, amount)
                 // Some RPC/provider stacks under-estimate ERC20 approve gas, causing
                 // intermittent out-of-gas failures. Use estimated gas with headroom.
                 .gas(gas_limit)
+                .nonce(nonce)
                 .send()
                 .await;
 
             match send_result {
-                Ok(pending) => break pending,
+                Ok(pending) => {
+                    let mut marks = nonce_marks().lock().expect("nonce marks lock");
+                    note_broadcast(&mut marks, (chain_id, from), nonce, Instant::now());
+                    break pending;
+                }
                 Err(err) => {
                     let err_message = err.to_string();
                     if attempt < NONCE_RETRY_MAX_ATTEMPTS && is_nonce_too_low_error(&err_message) {
                         let backoff_ms = NONCE_RETRY_BASE_DELAY_MS.saturating_mul(attempt as u64);
                         sleep(Duration::from_millis(backoff_ms)).await;
                         continue;
+                    }
+                    // A node may hold the approve, so the next send takes a later nonce.
+                    if !is_nonce_too_low_error(&err_message) && !is_validation_refusal(&err_message) {
+                        let mut marks = nonce_marks().lock().expect("nonce marks lock");
+                        note_broadcast(&mut marks, (chain_id, from), nonce, Instant::now());
                     }
                     return Err(format!(
                         "ERC20 approve(spender={spender}) failed for token {token}: {err}"
