@@ -6,8 +6,9 @@ use icrc_ledger_types::icrc1::account::Account;
 use liquidium_pipeline_connectors::backend::{
     amount_utils::amount_to_nat_units_strict,
     bridge_backend::{
-        BridgeBackend, BridgeDestination, BridgeRequest, BridgeStatus, DEFAULT_SOLANA_BRIDGE_FEE_BUFFER_LAMPORTS,
-        SolanaBridgeBackend,
+        BridgeBackend, BridgeDestination, BridgeRequest, BridgeStatus, BridgeSubmission,
+        DEFAULT_SOLANA_BRIDGE_FEE_BUFFER_LAMPORTS, DepositNotice, SolanaBridgeBackend,
+        cksol_transfer_without_deposit_id,
     },
     icp_backend::IcpBackendImpl,
     solana_backend::{SolanaBackend, SolanaBackendImpl},
@@ -21,6 +22,10 @@ use solana_sdk::{signature::Keypair, signer::Signer};
 
 use crate::config::Config;
 const SOL_DECIMALS: u8 = 9;
+/// The minter reads a deposit at finalized commitment, about 13 s after the
+/// transfer confirms. So the notice is sent again within this bound.
+const DEPOSIT_NOTICE_ATTEMPTS: usize = 8;
+const DEPOSIT_NOTICE_DELAY: std::time::Duration = std::time::Duration::from_secs(5);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SolanaPrefundPlan {
@@ -510,10 +515,20 @@ pub async fn submit(
         direction_raw, amount, request.source_address, destination_value
     );
 
-    let submission = backend
+    let destination = request.destination.clone();
+    let mut submission = backend
         .submit_bridge(request)
         .await
         .map_err(|error| error.to_string())?;
+    // A SOL transfer that the minter has not queued is never swept.
+    if let Some(signature) = cksol_transfer_without_deposit_id(&submission.bridge_id) {
+        match notify_until_queued(&backend, &destination, &signature, DEPOSIT_NOTICE_DELAY).await {
+            Some(queued) => submission = queued,
+            None => println!(
+                "SOL transfer {signature} landed, but the minter did not queue it; call deposit_sol for {destination:?} before another transfer"
+            ),
+        }
+    }
     println!("Bridge submitted. bridge_id={}", submission.bridge_id);
 
     if check_status {
@@ -529,6 +544,26 @@ pub async fn submit(
     }
 
     Ok(())
+}
+
+/// Sends the ckSOL deposit notice again until the minter queues the deposit.
+async fn notify_until_queued(
+    backend: &impl BridgeBackend,
+    destination: &BridgeDestination,
+    signature: &str,
+    delay: std::time::Duration,
+) -> Option<BridgeSubmission> {
+    for attempt in 1..=DEPOSIT_NOTICE_ATTEMPTS {
+        tokio::time::sleep(delay).await;
+        match backend.track_deposit("SOL", "SOL", destination, "", signature).await {
+            Ok(DepositNotice::Accepted(submission)) => return Some(submission),
+            Ok(DepositNotice::NotYet { reason }) => {
+                println!("Deposit not queued yet ({attempt}/{DEPOSIT_NOTICE_ATTEMPTS}): {reason}")
+            }
+            Err(error) => println!("Deposit notice failed ({attempt}/{DEPOSIT_NOTICE_ATTEMPTS}): {error}"),
+        }
+    }
+    None
 }
 
 pub async fn status(bridge_id: &str) -> Result<(), String> {
@@ -717,6 +752,44 @@ mod tests {
         BridgeSolDirection, build_sol_to_cksol_prefund_plan, parse_deposit_bridge_account, parse_optional_principal,
         parse_subaccount_override, resolve_proxy_canister, resolve_sol_to_cksol_source,
     };
+
+    /// Review finding 35: the one notice went out before finality, so the
+    /// minter refused it and the SOL was never swept.
+    #[tokio::test]
+    async fn the_deposit_notice_repeats_until_the_minter_queues_it() {
+        use liquidium_pipeline_connectors::backend::bridge_backend::{
+            BridgeDestination, BridgeSubmission, DepositNotice, MockBridgeBackend,
+        };
+        let mut backend = MockBridgeBackend::new();
+        let mut notices = 0;
+        backend
+            .expect_track_deposit()
+            .times(3)
+            .returning(move |asset, _, _, handle, receipt| {
+                assert_eq!((asset, handle, receipt), ("SOL", "", "sig-1"));
+                notices += 1;
+                Ok(if notices < 3 {
+                    DepositNotice::NotYet {
+                        reason: "ValueTooSmall".into(),
+                    }
+                } else {
+                    DepositNotice::Accepted(BridgeSubmission {
+                        bridge_id: "queued".into(),
+                    })
+                })
+            });
+        let destination = BridgeDestination::IcpAccount(icrc_ledger_types::icrc1::account::Account {
+            owner: Principal::anonymous(),
+            subaccount: None,
+        });
+
+        let queued = super::notify_until_queued(&backend, &destination, "sig-1", std::time::Duration::ZERO).await;
+
+        assert_eq!(
+            queued.map(|submission| submission.bridge_id),
+            Some("queued".to_string())
+        );
+    }
     use crate::config::Config;
     use candid::{Nat, Principal};
     use ic_agent::identity::AnonymousIdentity;
