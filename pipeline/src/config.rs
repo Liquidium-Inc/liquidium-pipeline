@@ -661,11 +661,15 @@ fn parse_enabled_swap_venues_from_env() -> Result<Vec<String>, String> {
     // Retained-collateral workbenches have no venue. A managed local MEXC
     // endpoint opts into real finalisation; its client validates loopback-only.
     if cfg!(feature = "simulator") {
-        return Ok(if env::var_os("SIM_MEXC_URL").is_some() {
-            vec!["mexc".to_string()]
-        } else {
-            Vec::new()
-        });
+        let mut venues = Vec::new();
+        if let Ok(factory) = env::var("SIM_ICPSWAP_FACTORY") {
+            Principal::from_text(&factory).map_err(|e| format!("SIM_ICPSWAP_FACTORY: {e}"))?;
+            venues.push("icpswap".to_string());
+        }
+        if env::var_os("SIM_MEXC_URL").is_some() {
+            venues.push("mexc".to_string());
+        }
+        return Ok(venues);
     }
     let raw = env::var("ENABLED_SWAP_VENUES").unwrap_or_else(|_| DEFAULT_ENABLED_SWAP_VENUES.to_string());
     let mut seen = HashSet::new();
@@ -695,7 +699,11 @@ fn parse_enabled_swap_venues_from_env() -> Result<Vec<String>, String> {
 }
 
 pub(crate) fn parse_icpswap_factory_from_env() -> Result<Principal, String> {
-    let raw = env::var("ICPSWAP_FACTORY_CANISTER").unwrap_or_else(|_| DEFAULT_ICPSWAP_FACTORY_CANISTER.to_string());
+    let raw = if cfg!(feature = "simulator") {
+        env::var("SIM_ICPSWAP_FACTORY").unwrap_or_else(|_| DEFAULT_ICPSWAP_FACTORY_CANISTER.to_string())
+    } else {
+        env::var("ICPSWAP_FACTORY_CANISTER").unwrap_or_else(|_| DEFAULT_ICPSWAP_FACTORY_CANISTER.to_string())
+    };
     let trimmed = raw.trim();
     Principal::from_text(trimmed)
         .map_err(|error| format!("invalid ICPSWAP_FACTORY_CANISTER principal '{trimmed}': {error}"))

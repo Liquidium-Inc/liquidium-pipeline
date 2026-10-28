@@ -304,7 +304,10 @@ where
                 continue;
             }
 
-            if cfg!(feature = "simulator") && std::env::var_os("SIM_MEXC_URL").is_none() {
+            if cfg!(feature = "simulator")
+                && std::env::var_os("SIM_MEXC_URL").is_none()
+                && std::env::var_os("SIM_ICPSWAP_FACTORY").is_none()
+            {
                 // A settled liquidation is real, but selling its collateral is
                 // outside this workbench phase. Keep custody explicit in the
                 // existing WAL instead of reporting a fictitious swap/profit.
