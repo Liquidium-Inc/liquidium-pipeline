@@ -13,6 +13,10 @@ const MAX_EMPTY_FILLS_IN_A_ROW: usize = 3;
 /// How much each order past the empty fills at the cap widens the IOC limit.
 const IOC_WIDEN_STEP_BPS: f64 = 100.0;
 
+/// A fill report rounds its output down by a hundredth of a basis point, so
+/// the order keeps a little more room than the exact limit.
+const PRICE_ROOM_MARGIN_BPS: f64 = 0.1;
+
 impl<C> CexVenueFinalizer<C>
 where
     C: CexBackend,
@@ -39,9 +43,9 @@ where
     ///   the chunk and remainder notional are both below `cex_min_exec_usd`.
     /// - after a fill, a last remainder the exchange refuses as below its
     ///   order minimum also ends the leg as dust.
-    /// - each accepted chunk is sent as an IOC limit order at the slippage cap
-    ///   less the taker fee; after empty fills the limit widens in steps to
-    ///   `max_widened_slippage_bps`.
+    /// - each accepted chunk is sent as an IOC limit order at the price room the
+    ///   slippage cap leaves after the taker fee; after empty fills the limit
+    ///   widens in steps to `max_widened_slippage_bps`.
     /// - realized `exec_price` is derived from actual fills and compared to preview
     ///   midpoint to compute realized slippage in bps.
     /// - if realized slippage exceeds the slice's limit, the leg fails fast.
@@ -102,10 +106,8 @@ where
                 break;
             }
 
-            // A fill is checked net of the fee, so the order's price may move
-            // only the limit less the fee.
             let limit_bps = self.slice_limit_bps(empty_fills_in_a_row);
-            let price_room_bps = limit_bps - preview.taker_fee_bps;
+            let price_room_bps = Self::price_room_bps(&leg.side, limit_bps, preview.taker_fee_bps);
             if price_room_bps <= 0.0 {
                 let err = format!(
                     "the {limit_bps:.0} bps limit on {} leaves no room for its {:.0} bps taker fee",
@@ -316,6 +318,20 @@ where
             return Err(format!("invalid execution price for {} {}", market, side));
         }
         Ok(exec_price)
+    }
+
+    /// How far an order's price may move from the preview price, so that a fill
+    /// at that price, net of the taker fee, stays within `limit_bps`.
+    pub(super) fn price_room_bps(side: &str, limit_bps: f64, taker_fee_bps: f64) -> f64 {
+        let limit = limit_bps / BPS_PER_RATIO_UNIT;
+        let fee = taker_fee_bps / BPS_PER_RATIO_UNIT;
+        // A sell pays the fee from its quote output, a buy from its base output.
+        let room = if side.eq_ignore_ascii_case("sell") {
+            1.0 - (1.0 - limit) / (1.0 - fee)
+        } else {
+            (1.0 + limit) * (1.0 - fee) - 1.0
+        };
+        room * BPS_PER_RATIO_UNIT - PRICE_ROOM_MARGIN_BPS
     }
 
     /// Compute slippage in bps from preview mid and realized execution price.

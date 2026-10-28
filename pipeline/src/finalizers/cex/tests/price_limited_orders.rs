@@ -60,6 +60,11 @@ async fn trade_state(finalizer: &CexVenueFinalizer<MockCexBackend>) -> CexState 
     state
 }
 
+/// The price room of a sell slice at `limit_bps` with the test fee.
+fn room(limit_bps: f64) -> f64 {
+    CexVenueFinalizer::<MockCexBackend>::price_room_bps("sell", limit_bps, FEE_BPS)
+}
+
 fn client_ids(orders: &Orders) -> Vec<String> {
     orders
         .lock()
@@ -82,7 +87,7 @@ async fn every_slice_order_carries_the_cap_less_the_fee_as_its_limit() {
         orders[0].price_limit,
         Some(PriceLimit {
             reference_price: state.trade.trade_slices[0].mid_price,
-            max_slippage_bps: TEST_MAX_SELL_SLIPPAGE_BPS - FEE_BPS,
+            max_slippage_bps: room(TEST_MAX_SELL_SLIPPAGE_BPS),
         })
     );
 }
@@ -163,8 +168,9 @@ async fn empty_fills_widen_the_limit_in_steps_up_to_the_maximum() {
         .await
         .expect("a pause is a wait, not an error");
 
-    let cap = TEST_MAX_SELL_SLIPPAGE_BPS - FEE_BPS;
-    assert_eq!(limits(&orders), vec![cap, cap, cap, cap + 100.0, cap + 200.0]);
+    let cap = room(TEST_MAX_SELL_SLIPPAGE_BPS);
+    let widened = |step: f64| room(TEST_MAX_SELL_SLIPPAGE_BPS + step);
+    assert_eq!(limits(&orders), vec![cap, cap, cap, widened(100.0), widened(200.0)]);
     assert!(state.trade.trade_slices.is_empty());
 
     finalizer.trade(&mut state).await.expect("the next cycle fills");
@@ -182,8 +188,11 @@ async fn a_fill_at_a_widened_limit_resets_the_limit_to_the_cap() {
 
     finalizer.trade(&mut state).await.expect("the leg fills");
 
-    let cap = TEST_MAX_SELL_SLIPPAGE_BPS - FEE_BPS;
-    assert_eq!(limits(&orders), vec![cap, cap, cap, cap + 100.0, cap]);
+    let cap = room(TEST_MAX_SELL_SLIPPAGE_BPS);
+    assert_eq!(
+        limits(&orders),
+        vec![cap, cap, cap, room(TEST_MAX_SELL_SLIPPAGE_BPS + 100.0), cap]
+    );
     assert_eq!(state.trade.trade_slices.len(), 2);
 }
 
@@ -192,6 +201,31 @@ fn a_maximum_below_the_cap_leaves_the_cap_in_force() {
     let (finalizer, _) = finalizer_with_fills(vec![]);
     let finalizer = finalizer.with_widened_slippage_cap(TEST_MAX_SELL_SLIPPAGE_BPS - 50.0);
     assert_eq!(finalizer.max_widened_slippage_bps, TEST_MAX_SELL_SLIPPAGE_BPS);
+}
+
+/// Review finding 24: the fee comes off a buy's base output, so a buy that
+/// filled at a limit of "cap less fee" failed the cap check net of the fee.
+#[test]
+fn a_fill_at_the_price_room_meets_the_limit_net_of_the_fee() {
+    type F = CexVenueFinalizer<MockCexBackend>;
+    let (mid, limit_bps, fee_bps) = (100.0, 200.0, 80.0);
+    let fee = fee_bps / 10_000.0;
+    for side in ["buy", "sell"] {
+        let room = F::price_room_bps(side, limit_bps, fee_bps) / 10_000.0;
+        let (limit_price, exec_price) = if side == "buy" {
+            let price = mid * (1.0 + room);
+            (price, price / (1.0 - fee))
+        } else {
+            let price = mid * (1.0 - room);
+            (price, price * (1.0 - fee))
+        };
+        let slippage = F::slice_slippage_bps(side, mid, exec_price);
+        assert!(slippage < limit_bps, "{side} at {limit_price}: {slippage} bps");
+        assert!(
+            slippage > limit_bps - 0.5,
+            "{side} keeps most of its room: {slippage} bps"
+        );
+    }
 }
 
 /// A fee as large as the limit leaves the order no price room, so no order goes out.
