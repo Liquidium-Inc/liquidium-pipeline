@@ -748,6 +748,7 @@ fn planner_config() -> IcpswapFirstPlannerConfig {
         max_price_impact_bps: 100.0,
         max_search_iterations: 16,
         dust_fallback_max_price_impact_bps: 150.0,
+        max_cex_price_impact_bps: 200.0,
         cex_min_exec_usd: 0.01,
         min_net_edge_bps: 150,
         settlement_min_net_edge_bps: None,
@@ -756,6 +757,7 @@ fn planner_config() -> IcpswapFirstPlannerConfig {
         max_oracle_discount_bps: 250,
         oracle_snapshot_max_age_secs: 300,
         icpswap_test_allocation_usd: None,
+        mexc_test_allocation_usd: None,
         cycles_usd_per_trillion: 1.35,
     }
 }

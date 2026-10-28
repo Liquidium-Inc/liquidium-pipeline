@@ -275,6 +275,7 @@ async fn init(
                 max_price_impact_bps: config.icpswap_max_price_impact_bps,
                 max_search_iterations: config.icpswap_max_search_iterations,
                 dust_fallback_max_price_impact_bps: config.icpswap_dust_fallback_max_price_impact_bps,
+                max_cex_price_impact_bps: config.cex_max_price_impact_bps,
                 cex_min_exec_usd: config.get_cex_min_exec_usd(),
                 min_net_edge_bps: config.multi_venue_min_net_edge_bps,
                 settlement_min_net_edge_bps: config.multi_venue_settlement_min_net_edge_bps,
@@ -284,6 +285,7 @@ async fn init(
                 oracle_snapshot_max_age_secs: config.multi_venue_oracle_snapshot_max_age_secs,
                 cycles_usd_per_trillion: config.cycles_usd_per_trillion,
                 icpswap_test_allocation_usd: config.icpswap_test_allocation_usd,
+                mexc_test_allocation_usd: config.mexc_test_allocation_usd,
             },
         )?
         .with_watchdog(slack_watchdog.clone())

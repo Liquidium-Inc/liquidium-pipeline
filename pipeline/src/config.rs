@@ -114,9 +114,15 @@ pub struct Config {
     /// Higher ICPSwap impact cap used only when an overflow remainder is below
     /// the venue minimum and the planner considers sending the full amount DEX-side.
     pub icpswap_dust_fallback_max_price_impact_bps: f64,
+    /// Highest price impact a CEX leg may carry while another CEX can take
+    /// the rest, in bps. With one CEX enabled the ceiling does not apply.
+    pub cex_max_price_impact_bps: f64,
     /// Test-only fixed USD allocation sent to ICPSwap before routing the
     /// remainder to an overflow venue. Unset preserves the normal policy.
     pub icpswap_test_allocation_usd: Option<f64>,
+    /// Test-only fixed USD allocation for MEXC. The CEX side is then MEXC and
+    /// the exact Kraken remainder. Unset preserves the normal policy.
+    pub mexc_test_allocation_usd: Option<f64>,
     /// Ordered venue IDs eligible for new multi-venue plans.
     pub enabled_swap_venues: Vec<String>,
     pub cex_credentials: HashMap<String, (String, String)>,
@@ -399,11 +405,15 @@ impl Config {
         let cex_kraken_max_hops = parse_cex_max_hops_from_env("CEX_KRAKEN_MAX_HOPS");
         let icpswap_factory_canister = parse_icpswap_factory_from_env()?;
         let icpswap_fee_tiers = parse_icpswap_fee_tiers_from_env()?;
-        let icpswap_test_allocation_usd = parse_icpswap_test_allocation_usd_from_env()?;
+        let icpswap_test_allocation_usd = parse_test_allocation_usd_from_env("ICPSWAP_TEST_ALLOCATION_USD")?;
         if let Some(value) = icpswap_test_allocation_usd {
             warn!(
-                "TEST-ONLY ICPSwap split is enabled: approximately ${value:.2} goes to ICPSwap and the remainder to MEXC"
+                "TEST-ONLY ICPSwap split is enabled: approximately ${value:.2} goes to ICPSwap and the remainder to the CEX waterfall"
             );
+        }
+        let mexc_test_allocation_usd = parse_test_allocation_usd_from_env("MEXC_TEST_ALLOCATION_USD")?;
+        if let Some(value) = mexc_test_allocation_usd {
+            warn!("TEST-ONLY CEX split is enabled: approximately ${value:.2} goes to MEXC and the remainder to Kraken");
         }
 
         let enabled_swap_venues = parse_enabled_swap_venues_from_env()?;
@@ -475,7 +485,9 @@ impl Config {
             icpswap_max_price_impact_bps: parse_icpswap_max_price_impact_bps_from_env(),
             icpswap_max_search_iterations: parse_icpswap_max_search_iterations_from_env(),
             icpswap_dust_fallback_max_price_impact_bps: parse_icpswap_dust_fallback_max_price_impact_bps_from_env(),
+            cex_max_price_impact_bps: parse_cex_max_price_impact_bps_from_env(),
             icpswap_test_allocation_usd,
+            mexc_test_allocation_usd,
             enabled_swap_venues,
             cex_credentials,
             opportunity_account_filter,
@@ -591,6 +603,7 @@ pub const DEFAULT_ICPSWAP_FACTORY_CANISTER: &str = "4mmnk-kiaaa-aaaag-qbllq-cai"
 const DEFAULT_ICPSWAP_FEE_TIERS: &str = "100,500,3000,10000";
 const DEFAULT_ICPSWAP_MAX_PRICE_IMPACT_BPS: f64 = 100.0;
 const DEFAULT_ICPSWAP_DUST_FALLBACK_MAX_PRICE_IMPACT_BPS: f64 = 150.0;
+const DEFAULT_CEX_MAX_PRICE_IMPACT_BPS: f64 = 200.0;
 const DEFAULT_ICPSWAP_MAX_SEARCH_ITERATIONS: u8 = 16;
 const DEFAULT_ENABLED_SWAP_VENUES: &str = "icpswap,mexc";
 const SUPPORTED_SWAP_VENUES: [&str; 3] = ["icpswap", "mexc", "kraken"];
@@ -786,8 +799,20 @@ fn parse_icpswap_dust_fallback_max_price_impact_bps_from_env() -> f64 {
         .unwrap_or(DEFAULT_ICPSWAP_DUST_FALLBACK_MAX_PRICE_IMPACT_BPS)
 }
 
-fn parse_icpswap_test_allocation_usd_from_env() -> Result<Option<f64>, String> {
-    let Ok(raw) = env::var("ICPSWAP_TEST_ALLOCATION_USD") else {
+/// Mirrors the planner's check: a ceiling outside 0..=10000 bps would be
+/// rejected by its constructor, so an unusable override falls back to the default.
+fn parse_cex_max_price_impact_bps_from_env() -> f64 {
+    env::var("CEX_MAX_PRICE_IMPACT_BPS")
+        .ok()
+        .and_then(|value| value.trim().parse::<f64>().ok())
+        .filter(|value| value.is_finite() && *value >= 0.0 && *value <= 10_000.0)
+        .unwrap_or(DEFAULT_CEX_MAX_PRICE_IMPACT_BPS)
+}
+
+/// A test-only USD allocation: absent or blank means off, anything else must
+/// be a positive number.
+fn parse_test_allocation_usd_from_env(var: &str) -> Result<Option<f64>, String> {
+    let Ok(raw) = env::var(var) else {
         return Ok(None);
     };
     let trimmed = raw.trim();
@@ -796,11 +821,9 @@ fn parse_icpswap_test_allocation_usd_from_env() -> Result<Option<f64>, String> {
     }
     let value = trimmed
         .parse::<f64>()
-        .map_err(|_| format!("ICPSWAP_TEST_ALLOCATION_USD='{trimmed}' must be a positive USD amount"))?;
+        .map_err(|_| format!("{var}='{trimmed}' must be a positive USD amount"))?;
     if !value.is_finite() || value <= 0.0 {
-        return Err(format!(
-            "ICPSWAP_TEST_ALLOCATION_USD='{trimmed}' must be finite and positive"
-        ));
+        return Err(format!("{var}='{trimmed}' must be finite and positive"));
     }
     Ok(Some(value))
 }
@@ -1218,16 +1241,33 @@ mod tests {
     #[test]
     fn parse_icpswap_test_allocation_is_optional_and_strictly_positive() {
         let _guard = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
-        unsafe { env::remove_var("ICPSWAP_TEST_ALLOCATION_USD") };
-        assert_eq!(parse_icpswap_test_allocation_usd_from_env().unwrap(), None);
+        for var in ["ICPSWAP_TEST_ALLOCATION_USD", "MEXC_TEST_ALLOCATION_USD"] {
+            unsafe { env::remove_var(var) };
+            assert_eq!(parse_test_allocation_usd_from_env(var).unwrap(), None);
 
-        unsafe { env::set_var("ICPSWAP_TEST_ALLOCATION_USD", "1") };
-        assert_eq!(parse_icpswap_test_allocation_usd_from_env().unwrap(), Some(1.0));
+            unsafe { env::set_var(var, "1") };
+            assert_eq!(parse_test_allocation_usd_from_env(var).unwrap(), Some(1.0));
 
-        unsafe { env::set_var("ICPSWAP_TEST_ALLOCATION_USD", "0") };
-        assert!(parse_icpswap_test_allocation_usd_from_env().is_err());
+            unsafe { env::set_var(var, "0") };
+            assert!(parse_test_allocation_usd_from_env(var).is_err());
 
-        unsafe { env::remove_var("ICPSWAP_TEST_ALLOCATION_USD") };
+            unsafe { env::remove_var(var) };
+        }
+    }
+
+    #[test]
+    fn parse_cex_max_price_impact_defaults_to_200_and_drops_an_unusable_value() {
+        let _guard = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        unsafe { env::remove_var("CEX_MAX_PRICE_IMPACT_BPS") };
+        assert_eq!(parse_cex_max_price_impact_bps_from_env(), 200.0);
+
+        unsafe { env::set_var("CEX_MAX_PRICE_IMPACT_BPS", "250") };
+        assert_eq!(parse_cex_max_price_impact_bps_from_env(), 250.0);
+
+        unsafe { env::set_var("CEX_MAX_PRICE_IMPACT_BPS", "-1") };
+        assert_eq!(parse_cex_max_price_impact_bps_from_env(), 200.0);
+
+        unsafe { env::remove_var("CEX_MAX_PRICE_IMPACT_BPS") };
     }
 
     #[test]
