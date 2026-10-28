@@ -568,6 +568,41 @@ async fn a_refused_ioc_price_sends_no_market_order() {
     assert!(placed.is_err(), "no market order after a price refusal: {placed:?}");
 }
 
+/// Review finding 29: an IOC order that could not be built here went out as
+/// a market order with no price limit.
+#[tokio::test]
+async fn an_ioc_order_that_cannot_be_built_sends_no_order() {
+    let (endpoint, server) = serve(vec![(200, ACCEPTED)]).await;
+    let client = client_at(endpoint);
+    client.symbol_filters.lock().await.insert(
+        "ICP_USDT".into(),
+        SymbolFilters {
+            base_precision: Some(2),
+            ..SymbolFilters::default()
+        },
+    );
+    let options = SwapExecutionOptions {
+        client_order_id: Some("lqclient2".into()),
+        // A zero reference price cannot give an IOC price.
+        price_limit: Some(PriceLimit {
+            reference_price: 0.0,
+            max_slippage_bps: 200.0,
+        }),
+        ..SwapExecutionOptions::default()
+    };
+
+    let error = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        client.execute_swap_detailed_with_options("ICP_USDT", "sell", 0.45, options),
+    )
+    .await
+    .unwrap()
+    .expect_err("no order without its limit");
+    server.abort();
+
+    assert!(error.to_string().contains("no IOC order"), "{error}");
+}
+
 fn coin(coin: &str, networks: &[(&str, &str, bool, &str)]) -> mexc_rs::spot::v3::coin_config::CoinConfig {
     serde_json::from_value(serde_json::json!({
         "coin": coin,
