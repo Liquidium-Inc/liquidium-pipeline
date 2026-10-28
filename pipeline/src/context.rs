@@ -546,6 +546,7 @@ mod tests {
             multi_venue_bad_debt_min_net_edge_bps: 25,
             multi_venue_max_oracle_discount_bps: 250,
             multi_venue_oracle_snapshot_max_age_secs: 300,
+            cycles_usd_per_trillion: 1.35,
             cex_delay_buffer_bps: 15,
             cex_route_fee_bps: 12,
             cex_mexc_available_pairs: vec![],

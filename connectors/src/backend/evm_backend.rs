@@ -13,7 +13,7 @@ use liquidium_pipeline_core::outbound::SendOutcome;
 use serde::{Deserialize, Serialize};
 use tokio::time::{Duration, sleep};
 
-const ERC20_APPROVE_GAS_LIMIT: u64 = 120_000;
+pub(crate) const ERC20_APPROVE_GAS_LIMIT: u64 = 120_000;
 const GAS_BUFFER_BPS: u64 = 2_000; // +20%
 const NONCE_RETRY_MAX_ATTEMPTS: u8 = 3;
 const NONCE_RETRY_BASE_DELAY_MS: u64 = 200;

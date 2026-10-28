@@ -2,9 +2,11 @@ use std::collections::HashSet;
 
 use candid::Nat;
 use liquidium_pipeline_core::tokens::{asset_id::AssetId, chain_token_amount::ChainTokenAmount};
+use liquidium_pipeline_core::types::side_cost::SideCost;
 use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::{
+    liquidation::liquidation_math::oracle_implied_output,
     persistance::VenueExecutionState,
     swappers::model::{SwapExecution, SwapRequest},
 };
@@ -85,6 +87,10 @@ pub struct MultiVenueExecutionPlan {
     pub enforced_min_net_edge_bps: Option<i32>,
     pub estimated_receive: ChainTokenAmount,
     pub conservative_receive: ChainTokenAmount,
+    /// The legs' side costs in receive-token units. The edge is measured on
+    /// `conservative_receive` minus this. `None` on rows written before it existed.
+    #[serde(default)]
+    pub side_cost_receive: Option<ChainTokenAmount>,
     pub combined_net_edge_bps: f64,
     pub quoted_at: i64,
 }
@@ -113,6 +119,50 @@ pub struct VenueLegQuote {
     #[serde(default, alias = "estimated_slippage_bps")]
     pub estimated_price_impact_bps: f64,
     pub route_id: String,
+    /// What this leg pays from other balances, priced at planning time.
+    #[serde(default)]
+    pub side_costs: Vec<PricedSideCost>,
+}
+
+/// A side cost with the prices it was converted at. Realized profit converts
+/// the actual cost at the same prices, so plan and outcome compare.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PricedSideCost {
+    pub cost: SideCost,
+    pub cost_price_ray: Nat,
+    pub receive_price_ray: Nat,
+    /// The cost in receive-token native units.
+    pub receive_equivalent: Nat,
+}
+
+impl PricedSideCost {
+    /// Prices `cost` in a receive token with `receive_decimals`.
+    pub fn new(
+        cost: SideCost,
+        cost_price_ray: Nat,
+        receive_price_ray: Nat,
+        receive_decimals: u8,
+    ) -> Result<Self, String> {
+        let mut priced = Self {
+            cost,
+            cost_price_ray,
+            receive_price_ray,
+            receive_equivalent: Nat::from(0u8),
+        };
+        priced.receive_equivalent = priced.value_of(&priced.cost, receive_decimals)?;
+        Ok(priced)
+    }
+
+    /// Another amount of the same asset, valued at this cost's prices.
+    pub fn value_of(&self, cost: &SideCost, receive_decimals: u8) -> Result<Nat, String> {
+        oracle_implied_output(
+            &cost.amount,
+            &self.cost_price_ray,
+            &self.receive_price_ray,
+            u64::from(cost.decimals),
+            u64::from(receive_decimals),
+        )
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]

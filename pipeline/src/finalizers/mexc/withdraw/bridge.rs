@@ -162,10 +162,7 @@ where
         planned_network: &str,
         amount: f64,
     ) -> Result<(), String> {
-        let bridge = self
-            .bridge
-            .as_ref()
-            .ok_or_else(|| "bridge runtime not configured for bridged withdraw".to_string())?;
+        let bridge = self.bridge_runtime()?;
         let route = Self::withdraw_route(state).ok_or_else(|| {
             format!(
                 "bridge route not found for withdraw {}@{} -> {}",
@@ -398,7 +395,13 @@ where
 
         if route.route_kind == BridgeRouteKind::SolanaToIcp {
             let gross = ChainTokenAmount::from_formatted(state.withdraw.withdraw_asset.clone(), bridge_amount);
-            bridge_amount = Self::spend_f64(&Self::solana_repayment_bridge_amount(bridge, route, &gross).await?)?;
+            let source_fee_budget = bridge
+                .backend
+                .get_source_fee_budget(route.source_asset, route.source_chain, route.target_asset)
+                .await?;
+            bridge_amount = Self::spend_f64(
+                &Self::solana_repayment_bridge_amount(bridge, route, &gross, source_fee_budget).await?,
+            )?;
         }
 
         let request = BridgeRequest {

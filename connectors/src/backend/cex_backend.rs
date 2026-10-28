@@ -64,6 +64,9 @@ pub struct OrderBookLevel {
 pub struct OrderBook {
     pub bids: Vec<OrderBookLevel>,
     pub asks: Vec<OrderBookLevel>,
+    /// The account's taker fee on this market, in bps. A fill comes out this
+    /// much below the book, so a preview takes it off the same way.
+    pub taker_fee_bps: f64,
 }
 
 #[derive(Debug, Clone)]
@@ -123,6 +126,16 @@ pub enum WithdrawStatus {
     Unknown,
 }
 
+/// What a withdrawal of one coin on one network costs and needs, as the
+/// exchange publishes it before the withdrawal.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct WithdrawTerms {
+    /// Taken from the withdrawn amount, in the coin's units.
+    pub fee: f64,
+    /// The smallest amount the exchange accepts.
+    pub minimum: f64,
+}
+
 #[derive(Debug, Clone)]
 pub struct WithdrawStatusSnapshot {
     pub status: WithdrawStatus,
@@ -164,6 +177,9 @@ pub trait CexBackend: Send + Sync {
         amount: f64,
         withdraw_order_id: &str,
     ) -> Result<WithdrawalReceipt, String>;
+
+    /// The fee and minimum of a withdrawal, known before it is sent.
+    async fn get_withdraw_terms(&self, asset: &str, network: &str) -> Result<WithdrawTerms, String>;
 
     // balance
     async fn get_balance(&self, asset: &str) -> Result<f64, String>;

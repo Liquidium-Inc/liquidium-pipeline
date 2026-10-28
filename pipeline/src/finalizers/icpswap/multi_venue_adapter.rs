@@ -223,13 +223,13 @@ impl MultiVenueAdapter for IcpswapFinalizer {
         // ID becomes the durable idempotency key used for every later advance.
         let execution_id = crate::utils::new_venue_execution_id(VENUE_ID);
         let state = self.prepare_execution_state(&execution_id, &context.liquidation_id, request, preview.route)?;
-        Ok(VenueRoutePreview {
-            venue_id: VENUE_ID.to_string(),
-            request: request.clone(),
-            quote: preview.quote,
+        Ok(VenueRoutePreview::new(
+            VENUE_ID,
+            request.clone(),
+            preview.quote,
             conservative_receive,
-            initial_execution_state: VenueExecutionState::new(VENUE_ID, &state)?,
-        })
+            VenueExecutionState::new(VENUE_ID, &state)?,
+        ))
     }
 
     async fn advance(

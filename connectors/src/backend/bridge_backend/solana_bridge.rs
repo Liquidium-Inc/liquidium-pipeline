@@ -17,6 +17,7 @@ use liquidium_pipeline_core::{
     account::model::ChainAccount,
     outbound::{OutboundIntent, SIDE_EFFECT_AMBIGUOUS_PREFIX, side_effect_ambiguous},
     tokens::chain_token::ChainToken,
+    types::side_cost::{CYCLES_DECIMALS, CYCLES_SYMBOL, SideCost},
 };
 use crate::{
     backend::{
@@ -37,6 +38,9 @@ const DEPOSIT_BRIDGE_ID_PREFIX: &str = "cksol-deposit:";
 pub const DEFAULT_SOLANA_BRIDGE_FEE_BUFFER_LAMPORTS: u64 = 2_000_000;
 /// The base fee of a transaction with one signature.
 const SOLANA_SIGNATURE_FEE_LAMPORTS: u64 = 5_000;
+/// What the ckSOL minter keeps for the balance read in `deposit_sol`
+/// (`GET_BALANCE_CYCLES` in the minter source).
+const CKSOL_BALANCE_READ_CYCLES: u64 = 10_000_000_000;
 
 #[derive(CandidType, Deserialize, Clone, Debug)]
 struct CkSolGetDepositAddressArgs {
@@ -893,8 +897,18 @@ where
     async fn get_fee_budget(&self, asset: &str, chain: &str, target: &str) -> Result<BridgeFeeBudget, String> {
         let route = resolve_route(asset, chain, target).ok_or_else(|| "unknown SOL bridge route".to_string())?;
         if route.route_kind == BridgeRouteKind::SolanaToIcp {
+            // `deposit_sol` refunds unused cycles. It keeps one balance read and,
+            // on success, `deposit_sol_fee`.
+            let info = self.minter_info().await?;
+            let cycles = info.deposit_sol_fee + Nat::from(CKSOL_BALANCE_READ_CYCLES);
             return Ok(BridgeFeeBudget {
                 source_fee_budget: nat_units_to_amount_via_core(&Nat::from(self.fee_buffer_lamports), 9)?,
+                side_costs: vec![SideCost::new(
+                    "cycles for the ckSOL deposit call",
+                    CYCLES_SYMBOL,
+                    CYCLES_DECIMALS,
+                    cycles,
+                )],
                 ..BridgeFeeBudget::default()
             });
         }
@@ -909,6 +923,7 @@ where
             source_fee_budget: nat_units_to_amount_via_core(&approval_fee, 9)?,
             destination_fee_budget: nat_units_to_amount_via_core(&Nat::from(info.withdrawal_fee), 9)?,
             provider_fee_budget_native_units: None,
+            side_costs: Vec::new(),
         })
     }
 
@@ -1074,6 +1089,7 @@ mod tests {
     };
     use candid::{Decode, Nat, Principal};
     use icrc_ledger_types::icrc1::account::Account;
+    use liquidium_pipeline_core::types::side_cost::{CYCLES_DECIMALS, CYCLES_SYMBOL, SideCost};
     use std::sync::{Arc, Mutex};
 
     fn bridge_owner() -> Principal {
@@ -1913,12 +1929,27 @@ mod tests {
     async fn get_source_balance_for_solana_to_icp_reads_configured_wallet_only() {
         let mut solana = MockSolanaBackend::new();
         solana.expect_native_balance().times(1).returning(|| Ok(Nat::from(123_000_000u64)));
-        let backend = backend(MockPipelineAgent::new(), MockIcpBackend::new(), solana);
+        let mut agent = MockPipelineAgent::new();
+        agent
+            .expect_call_query::<CkSolMinterInfo>()
+            .times(1)
+            .returning(|_, _, _| Ok(default_minter_info()));
+        let backend = backend(agent, MockIcpBackend::new(), solana);
         assert!(backend.get_source_balance("SOL", "SOL", &valid_solana_address()).await.is_err());
         let balance = backend.get_source_balance("SOL", "SOL", &bridge_source_address()).await.unwrap();
         assert!((balance - 0.123).abs() < 1e-12);
         let fees = backend.get_fee_budget("SOL", "SOL", "ckSOL").await.unwrap();
         assert!((fees.source_fee_budget - 0.002).abs() < 1e-12);
+        // The deposit call keeps its fee and one balance read; the rest of the cycles return.
+        assert_eq!(
+            fees.side_costs,
+            vec![SideCost::new(
+                "cycles for the ckSOL deposit call",
+                CYCLES_SYMBOL,
+                CYCLES_DECIMALS,
+                Nat::from(55_000_000_000u64)
+            )]
+        );
     }
 
     #[test]

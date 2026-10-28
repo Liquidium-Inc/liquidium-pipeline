@@ -45,6 +45,7 @@ async fn mexc_trade_executes_swap_and_sets_size_out_and_step_withdraw() {
             price: 1.001,
             quantity: 1_000.0,
         }],
+        taker_fee_bps: 10.0,
     };
     backend
         .expect_get_orderbook()
@@ -147,6 +148,7 @@ async fn mexc_trade_propagates_backend_errors() {
             price: 101.0,
             quantity: 1_000.0,
         }],
+        taker_fee_bps: 10.0,
     };
     backend
         .expect_get_orderbook()
@@ -188,6 +190,7 @@ async fn mexc_trade_marks_dust_only_after_a_fill() {
             price: 1.001,
             quantity: 100.0,
         }],
+        taker_fee_bps: 10.0,
     };
     let btc_usdc = OrderBook {
         bids: vec![OrderBookLevel {
@@ -198,6 +201,7 @@ async fn mexc_trade_marks_dust_only_after_a_fill() {
             price: 69_010.0,
             quantity: 100.0,
         }],
+        taker_fee_bps: 10.0,
     };
 
     backend
@@ -264,6 +268,7 @@ async fn mexc_committed_leg_below_dust_floor_still_executes() {
                 price: 1.001,
                 quantity: 100.0,
             }],
+            taker_fee_bps: 10.0,
         })
     });
     backend
@@ -318,6 +323,7 @@ async fn mexc_maybe_mark_trade_dust_honors_threshold_boundary() {
             quantity: 100.0,
         }],
         asks: vec![],
+        taker_fee_bps: 10.0,
     };
     let btc_usdc = OrderBook {
         bids: vec![OrderBookLevel {
@@ -325,6 +331,7 @@ async fn mexc_maybe_mark_trade_dust_honors_threshold_boundary() {
             quantity: 100.0,
         }],
         asks: vec![],
+        taker_fee_bps: 10.0,
     };
     backend_eq
         .expect_get_orderbook()
@@ -362,6 +369,7 @@ async fn mexc_maybe_mark_trade_dust_honors_threshold_boundary() {
             quantity: 100.0,
         }],
         asks: vec![],
+        taker_fee_bps: 10.0,
     };
     let btc_usdc_below = OrderBook {
         bids: vec![OrderBookLevel {
@@ -369,6 +377,7 @@ async fn mexc_maybe_mark_trade_dust_honors_threshold_boundary() {
             quantity: 100.0,
         }],
         asks: vec![],
+        taker_fee_bps: 10.0,
     };
     backend_below
         .expect_get_orderbook()
@@ -416,6 +425,7 @@ async fn mexc_maybe_mark_trade_dust_requires_small_chunk_and_small_residual() {
             quantity: 100.0,
         }],
         asks: vec![],
+        taker_fee_bps: 10.0,
     };
     let btc_usdc = OrderBook {
         bids: vec![OrderBookLevel {
@@ -423,6 +433,7 @@ async fn mexc_maybe_mark_trade_dust_requires_small_chunk_and_small_residual() {
             quantity: 100.0,
         }],
         asks: vec![],
+        taker_fee_bps: 10.0,
     };
     backend
         .expect_get_orderbook()
@@ -466,6 +477,7 @@ async fn mexc_trade_fails_when_realized_slice_slippage_exceeds_cap() {
             price: 1.001,
             quantity: 100.0,
         }],
+        taker_fee_bps: 10.0,
     };
     let btc_usdc = OrderBook {
         bids: vec![OrderBookLevel {
@@ -476,6 +488,7 @@ async fn mexc_trade_fails_when_realized_slice_slippage_exceeds_cap() {
             price: 69_010.0,
             quantity: 100.0,
         }],
+        taker_fee_bps: 10.0,
     };
 
     backend
@@ -543,6 +556,7 @@ async fn mexc_trade_buy_truncation_mismatch_does_not_false_spike_slippage() {
     let sell_probe = OrderBook {
         bids: vec![],
         asks: vec![],
+        taker_fee_bps: 10.0,
     };
     let buy_book = OrderBook {
         bids: vec![],
@@ -550,6 +564,7 @@ async fn mexc_trade_buy_truncation_mismatch_does_not_false_spike_slippage() {
             price: 1.0,
             quantity: 10.0,
         }],
+        taker_fee_bps: 10.0,
     };
     let btc_usdc = OrderBook {
         bids: vec![OrderBookLevel {
@@ -560,6 +575,7 @@ async fn mexc_trade_buy_truncation_mismatch_does_not_false_spike_slippage() {
             price: 69_010.0,
             quantity: 10.0,
         }],
+        taker_fee_bps: 10.0,
     };
 
     backend
@@ -663,6 +679,7 @@ async fn mexc_trade_slippage_error_includes_requested_and_actual_fill_details() 
             price: 1.001,
             quantity: 100.0,
         }],
+        taker_fee_bps: 10.0,
     };
     let btc_usdc = OrderBook {
         bids: vec![OrderBookLevel {
@@ -673,6 +690,7 @@ async fn mexc_trade_slippage_error_includes_requested_and_actual_fill_details() 
             price: 69_010.0,
             quantity: 100.0,
         }],
+        taker_fee_bps: 10.0,
     };
 
     backend
@@ -730,6 +748,7 @@ async fn mexc_trade_clamp_and_finish_under_consumed_buy_input_single_slice() {
     let sell_probe = OrderBook {
         bids: vec![],
         asks: vec![],
+        taker_fee_bps: 10.0,
     };
     let buy_book = OrderBook {
         bids: vec![],
@@ -737,6 +756,7 @@ async fn mexc_trade_clamp_and_finish_under_consumed_buy_input_single_slice() {
             price: 1.0,
             quantity: 10.0,
         }],
+        taker_fee_bps: 10.0,
     };
     let btc_usdc = OrderBook {
         bids: vec![OrderBookLevel {
@@ -747,6 +767,7 @@ async fn mexc_trade_clamp_and_finish_under_consumed_buy_input_single_slice() {
             price: 69_010.0,
             quantity: 10.0,
         }],
+        taker_fee_bps: 10.0,
     };
 
     backend
@@ -826,6 +847,7 @@ async fn mexc_trade_retries_current_leg_from_original_amount_after_mid_leg_error
             price: 1.001,
             quantity: 100.0,
         }],
+        taker_fee_bps: 10.0,
     };
     let btc_usdc = OrderBook {
         bids: vec![OrderBookLevel {
@@ -836,6 +858,7 @@ async fn mexc_trade_retries_current_leg_from_original_amount_after_mid_leg_error
             price: 69_010.0,
             quantity: 100.0,
         }],
+        taker_fee_bps: 10.0,
     };
 
     backend
@@ -922,6 +945,7 @@ async fn mexc_trade_uses_resume_amount_when_trade_next_amount_in_is_present() {
             price: 1.001,
             quantity: 100.0,
         }],
+        taker_fee_bps: 10.0,
     };
     let btc_usdc = OrderBook {
         bids: vec![OrderBookLevel {
@@ -932,6 +956,7 @@ async fn mexc_trade_uses_resume_amount_when_trade_next_amount_in_is_present() {
             price: 69_010.0,
             quantity: 100.0,
         }],
+        taker_fee_bps: 10.0,
     };
 
     backend
@@ -995,6 +1020,7 @@ async fn mexc_trade_clears_legacy_pending_without_client_id_before_submit() {
             price: 1.001,
             quantity: 100.0,
         }],
+        taker_fee_bps: 10.0,
     };
     let btc_usdc = OrderBook {
         bids: vec![OrderBookLevel {
@@ -1005,6 +1031,7 @@ async fn mexc_trade_clears_legacy_pending_without_client_id_before_submit() {
             price: 69_010.0,
             quantity: 100.0,
         }],
+        taker_fee_bps: 10.0,
     };
 
     backend
@@ -1073,6 +1100,7 @@ async fn mexc_trade_clears_stale_pending_from_different_leg_before_submit() {
             price: 1.001,
             quantity: 100.0,
         }],
+        taker_fee_bps: 10.0,
     };
     let btc_usdc = OrderBook {
         bids: vec![OrderBookLevel {
@@ -1083,6 +1111,7 @@ async fn mexc_trade_clears_stale_pending_from_different_leg_before_submit() {
             price: 69_010.0,
             quantity: 100.0,
         }],
+        taker_fee_bps: 10.0,
     };
 
     backend
@@ -1146,6 +1175,7 @@ async fn mexc_trade_regenerates_invalid_pending_client_order_id() {
             price: 1.001,
             quantity: 100.0,
         }],
+        taker_fee_bps: 10.0,
     };
     let btc_usdc = OrderBook {
         bids: vec![OrderBookLevel {
@@ -1156,6 +1186,7 @@ async fn mexc_trade_regenerates_invalid_pending_client_order_id() {
             price: 69_010.0,
             quantity: 100.0,
         }],
+        taker_fee_bps: 10.0,
     };
 
     backend
@@ -1244,6 +1275,7 @@ async fn mexc_trade_errors_when_direct_market_cannot_be_resolved() {
     let empty_book = OrderBook {
         bids: vec![],
         asks: vec![],
+        taker_fee_bps: 10.0,
     };
 
     backend
@@ -1326,6 +1358,7 @@ async fn mexc_preview_trade_slice_buy_binary_search_finds_largest_chunk_under_ta
                 quantity: 10.0,
             },
         ],
+        taker_fee_bps: 10.0,
     };
 
     backend
@@ -1376,6 +1409,7 @@ async fn mexc_preview_trade_slice_sell_fallback_uses_full_remaining_when_hard_ca
             },
         ],
         asks: vec![],
+        taker_fee_bps: 10.0,
     };
 
     backend
@@ -1425,6 +1459,7 @@ async fn mexc_preview_trade_slice_sell_fallback_errors_when_hard_cap_rejects() {
             },
         ],
         asks: vec![],
+        taker_fee_bps: 10.0,
     };
 
     backend
@@ -1473,6 +1508,7 @@ async fn mexc_preview_trade_slice_buy_fallback_uses_full_remaining_when_hard_cap
                 quantity: 10.0,
             },
         ],
+        taker_fee_bps: 10.0,
     };
 
     backend
@@ -1520,6 +1556,7 @@ async fn mexc_preview_trade_slice_buy_fallback_errors_when_hard_cap_rejects() {
                 quantity: 10.0,
             },
         ],
+        taker_fee_bps: 10.0,
     };
 
     backend

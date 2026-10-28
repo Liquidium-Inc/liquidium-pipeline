@@ -431,7 +431,7 @@ where
 
     async fn preview_through_legs(&self, legs: &[TradeLeg], mut amount_in: f64) -> Result<f64, String> {
         for leg in legs {
-            let (out, _avg, _impact) = self.preview_leg(&leg.market, &leg.side, amount_in).await?;
+            let out = self.preview_leg(&leg.market, &leg.side, amount_in).await?.gross_out;
             amount_in = out;
         }
         Ok(amount_in)

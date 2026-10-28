@@ -5083,7 +5083,7 @@ dependencies = [
 [[package]]
 name = "mexc-rs"
 version = "0.6.5"
-source = "git+https://github.com/liquidium-Inc/mexc-rs.git?rev=5b8dc1e5e4261cab27772e32e2311ba4e70c1b13#5b8dc1e5e4261cab27772e32e2311ba4e70c1b13"
+source = "git+https://github.com/liquidium-Inc/mexc-rs.git?rev=ce20f83c59d90ff2b86d4331dd4180d0865382e2#ce20f83c59d90ff2b86d4331dd4180d0865382e2"
 dependencies = [
  "anyhow",
  "async-channel 1.9.0",

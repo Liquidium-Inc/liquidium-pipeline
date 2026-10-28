@@ -10,6 +10,15 @@ pub(in crate::finalizers::mexc) struct BridgeDepositSizing {
     pub fee_budget: BridgeFeeBudget,
 }
 
+/// A bridged deposit from funding to the amount MEXC should see arrive.
+pub(in crate::finalizers::mexc) struct BridgedDepositArrival {
+    pub sizing: BridgeDepositSizing,
+    /// What the bridge call sends.
+    pub submit_amount: f64,
+    /// What reaches MEXC after the route's destination fee.
+    pub expected_amount: f64,
+}
+
 impl<C> MexcFinalizer<C>
 where
     C: CexBackend,
@@ -87,20 +96,19 @@ where
         Ok(ChainTokenAmount::from_raw(token.clone(), amount.clone() - reserve))
     }
 
+    /// The SOL a return sends after the wallet keeps `source_fee_budget` for
+    /// the send fee. The caller passes the budget it already read.
     pub(in crate::finalizers::mexc) async fn solana_repayment_bridge_amount(
         bridge: &BridgeRuntime,
         route: &BridgeRouteSpec,
         gross: &ChainTokenAmount,
+        source_fee_budget: f64,
     ) -> Result<ChainTokenAmount, String> {
-        let fee_budget = bridge
-            .backend
-            .get_source_fee_budget(route.source_asset, route.source_chain, route.target_asset)
-            .await?;
         // SOL and ckSOL have the same base units; keep the repayment token metadata.
         let net = Self::amount_after_fee_reserve(
             &gross.token,
             &gross.value,
-            fee_budget,
+            source_fee_budget,
             "repayment bridge source fee budget",
         )?;
         Self::ensure_minimum_bridge_amount(bridge, route, &net).await?;
@@ -137,6 +145,29 @@ where
             bridge_amount,
             source_fee_reserve,
             fee_budget,
+        })
+    }
+
+    /// Sizes a bridged deposit through to its MEXC arrival. The preview and
+    /// the deposit both use this, so a quote counts the fees execution pays.
+    pub(in crate::finalizers::mexc) async fn bridged_deposit_arrival(
+        bridge: &BridgeRuntime,
+        route: &BridgeRouteSpec,
+        deposit_asset: &ChainToken,
+        size_in: &ChainTokenAmount,
+    ) -> Result<BridgedDepositArrival, String> {
+        let sizing = Self::size_bridged_deposit(bridge, route, deposit_asset, size_in).await?;
+        Self::ensure_minimum_bridge_amount(bridge, route, &sizing.bridge_amount).await?;
+        let submit_amount = Self::spend_f64(&sizing.bridge_amount)?;
+        let expected_amount = Self::compute_expected_bridge_deposit_amount(
+            route,
+            submit_amount,
+            sizing.fee_budget.destination_fee_budget,
+        )?;
+        Ok(BridgedDepositArrival {
+            sizing,
+            submit_amount,
+            expected_amount,
         })
     }
 
@@ -188,7 +219,7 @@ where
 
     /// Nets an exchange withdrawal fee out of an amount. A zero fee leaves the
     /// amount unchanged; a fee that consumes the amount is an error.
-    pub(super) fn net_of_withdraw_fee(amount: f64, fee: f64) -> Result<f64, String> {
+    pub(in crate::finalizers::mexc) fn net_of_withdraw_fee(amount: f64, fee: f64) -> Result<f64, String> {
         if !fee.is_finite() || fee < 0.0 {
             return Err(format!("invalid withdrawal fee {fee}"));
         }

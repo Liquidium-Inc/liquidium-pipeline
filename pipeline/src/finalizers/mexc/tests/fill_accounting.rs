@@ -38,6 +38,7 @@ fn finalizer(
                 quantity: if first { 4.0 } else { 100.0 },
             }],
             asks: vec![],
+            taker_fee_bps: 10.0,
         })
     });
     backend

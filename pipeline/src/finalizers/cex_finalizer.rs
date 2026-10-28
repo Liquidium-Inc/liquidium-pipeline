@@ -2,6 +2,7 @@ use async_trait::async_trait;
 use candid::Nat;
 use liquidium_pipeline_connectors::backend::cex_backend::CexBackendError;
 use liquidium_pipeline_core::tokens::{chain_token::ChainToken, chain_token_amount::ChainTokenAmount};
+use liquidium_pipeline_core::types::side_cost::SideCost;
 
 use serde::{Deserialize, Serialize};
 
@@ -262,6 +263,10 @@ pub struct CexState {
     pub trade: CexTradeState,
     #[serde(flatten)]
     pub withdraw: CexWithdrawState,
+    /// What this leg commits to pay from other balances: bridge ckETH, gas or
+    /// cycles. One entry per label, so a retried step does not count twice.
+    #[serde(default)]
+    pub side_costs: Vec<SideCost>,
     /// Set by a step that saved a new send in this call. The venue writes the
     /// send to the WAL, then runs the step again to send it in the same cycle.
     #[serde(skip)]
@@ -269,6 +274,14 @@ pub struct CexState {
 }
 
 impl CexState {
+    /// Records side costs, replacing any earlier entry with the same label.
+    pub fn record_side_costs(&mut self, costs: &[SideCost]) {
+        for cost in costs {
+            self.side_costs.retain(|recorded| recorded.label != cost.label);
+            self.side_costs.push(cost.clone());
+        }
+    }
+
     /// Runs once after a restart. A saved send that is not safe to repeat may
     /// have gone out, so it becomes a settle; true when the step then only reads.
     pub fn resume_after_restart(&mut self, now: i64) -> bool {
@@ -609,6 +622,7 @@ mod tests {
             Ok(CexState {
                 liq_id: liq_id.to_string(),
                 send_saved: false,
+                side_costs: Vec::new(),
                 step: CexStep::Trade,
                 last_error: None,
                 market: "CKBTC_BTC".to_string(),
@@ -731,6 +745,8 @@ mod tests {
                 legs: vec![],
                 approval_count: None,
                 ts: 0,
+                side_costs: Vec::new(),
+                side_cost_receive: None,
             })
         }
 
@@ -774,6 +790,7 @@ mod tests {
             Ok(CexState {
                 liq_id: liq_id.to_string(),
                 send_saved: false,
+                side_costs: Vec::new(),
                 step: CexStep::Trade,
                 last_error: None,
                 market: "CKBTC_BTC".to_string(),
@@ -901,6 +918,8 @@ mod tests {
                 legs: vec![],
                 approval_count: None,
                 ts: 0,
+                side_costs: Vec::new(),
+                side_cost_receive: None,
             })
         }
 

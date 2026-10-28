@@ -229,7 +229,9 @@ impl<C: CexBackend> ExecutableSwapVenue for MexcSwapVenue<C> {
 
             legs: vec![leg],
             approval_count: None,
-            ts: 0, // populate from clock if needed
+            ts: 0, // populate from clock if needed,
+            side_costs: Vec::new(),
+            side_cost_receive: None,
         })
     }
 }
@@ -283,6 +285,7 @@ mod tests {
                         },
                     ],
                     asks: vec![],
+                    taker_fee_bps: 10.0,
                 })
             });
 
@@ -316,6 +319,7 @@ mod tests {
                 "USDC/ICP" => Ok(OrderBook {
                     bids: vec![],
                     asks: vec![],
+                    taker_fee_bps: 10.0,
                 }),
                 "ICP/USDC" => Ok(OrderBook {
                     bids: vec![],
@@ -329,6 +333,7 @@ mod tests {
                             quantity: 2.0,
                         },
                     ],
+                    taker_fee_bps: 10.0,
                 }),
                 other => Err(format!("unexpected market {other}")),
             });

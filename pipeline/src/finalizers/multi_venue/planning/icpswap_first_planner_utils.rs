@@ -79,6 +79,7 @@ pub(super) fn preview_to_leg(preview: VenueRoutePreview) -> VenueLegState {
             conservative_receive: preview.conservative_receive,
             estimated_price_impact_bps: preview.quote.estimated_price_impact_bps,
             route_id,
+            side_costs: preview.priced_side_costs.unwrap_or_default(),
         },
         execution: preview.initial_execution_state,
         status: VenueLegStatus::Planned,

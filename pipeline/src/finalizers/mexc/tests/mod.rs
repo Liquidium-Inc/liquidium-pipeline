@@ -12,7 +12,7 @@ use liquidium_pipeline_connectors::backend::bridge_backend::{
 };
 use liquidium_pipeline_connectors::backend::cex_backend::{
     BuyOrderInputMode, CexBackendError, DepositAddress, MockCexBackend, OrderBook, OrderBookLevel, SwapFillReport,
-    WithdrawStatus, WithdrawStatusSnapshot,
+    WithdrawStatus, WithdrawStatusSnapshot, WithdrawTerms,
 };
 use liquidium_pipeline_core::account::model::ChainAccount;
 use liquidium_pipeline_core::outbound::SIDE_EFFECT_AMBIGUOUS_PREFIX;
@@ -21,6 +21,7 @@ use liquidium_pipeline_core::transfer::actions::MockTransferActions;
 use liquidium_pipeline_core::types::protocol_types::{
     AssetType, LiquidationAmounts, LiquidationRequest, LiquidationResult, LiquidationStatus, TransferStatus, TxStatus,
 };
+use liquidium_pipeline_core::types::side_cost::{CYCLES_DECIMALS, CYCLES_SYMBOL, SideCost};
 
 use crate::executors::executor::ExecutorRequest;
 use crate::finalizers::cex_finalizer::{CexDepositState, CexState, CexStep};
@@ -203,6 +204,12 @@ fn native_icp_token() -> ChainToken {
     }
 }
 
+/// MEXC withdrawals with no fee and no minimum.
+fn free_withdrawals(cex: &mut MockCexBackend) {
+    cex.expect_get_withdraw_terms()
+        .returning(|_, _| Ok(WithdrawTerms { fee: 0.0, minimum: 0.0 }));
+}
+
 fn liquid_orderbook() -> OrderBook {
     OrderBook {
         bids: vec![OrderBookLevel {
@@ -213,6 +220,7 @@ fn liquid_orderbook() -> OrderBook {
             price: 1.001,
             quantity: 1_000_000.0,
         }],
+        taker_fee_bps: 10.0,
     }
 }
 
@@ -386,3 +394,4 @@ mod uncertain_side_effects;
 mod operator_answers;
 mod execution_records;
 mod price_limited_orders;
+mod route_costs;

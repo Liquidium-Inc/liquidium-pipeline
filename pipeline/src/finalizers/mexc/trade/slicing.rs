@@ -2,6 +2,15 @@
 //! target, the preview of one slice, and the dust decision.
 use super::*;
 
+/// One leg simulated on the current order book.
+pub(in crate::finalizers::mexc) struct LegPreview {
+    /// The output before the taker fee.
+    pub gross_out: f64,
+    pub impact_bps: f64,
+    /// The market's taker fee, in bps.
+    pub taker_fee_bps: f64,
+}
+
 impl<C> MexcFinalizer<C>
 where
     C: CexBackend,
@@ -76,24 +85,28 @@ where
         market: &str,
         side: &str,
         amount_in: f64,
-    ) -> Result<(f64, f64, f64), String> {
+    ) -> Result<LegPreview, String> {
         let orderbook = self
             .backend
             .get_orderbook(market, Some(DEFAULT_ORDERBOOK_LIMIT))
             .await?;
 
         if side.eq_ignore_ascii_case("sell") {
-            let (out, avg, impact, unfilled) = simulate_sell_from_bids(&orderbook.bids, amount_in)?;
+            let (out, _avg, impact, unfilled) = simulate_sell_from_bids(&orderbook.bids, amount_in)?;
             if unfilled > LIQUIDITY_EPS {
                 return Err(format!(
                     "not enough bid liquidity for {} (needed {}, missing {})",
                     market, amount_in, unfilled
                 ));
             }
-            return Ok((out, avg, impact));
+            return Ok(LegPreview {
+                gross_out: out,
+                impact_bps: impact,
+                taker_fee_bps: orderbook.taker_fee_bps,
+            });
         }
 
-        let (out, avg, impact, unspent) = simulate_buy_from_asks(&orderbook.asks, amount_in)?;
+        let (out, _avg, impact, unspent) = simulate_buy_from_asks(&orderbook.asks, amount_in)?;
         if unspent > LIQUIDITY_EPS {
             return Err(format!(
                 "not enough ask liquidity for {} (needed {}, missing {})",
@@ -101,7 +114,11 @@ where
             ));
         }
 
-        Ok((out, avg, impact))
+        Ok(LegPreview {
+            gross_out: out,
+            impact_bps: impact,
+            taker_fee_bps: orderbook.taker_fee_bps,
+        })
     }
 
     /// Target impact threshold used for one execution slice.

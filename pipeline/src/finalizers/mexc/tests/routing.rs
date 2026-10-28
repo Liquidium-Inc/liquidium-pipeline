@@ -9,6 +9,7 @@ async fn mexc_resolves_icp_to_ckbtc_route_from_configured_pairs() {
     let empty = OrderBook {
         bids: vec![],
         asks: vec![],
+        taker_fee_bps: 10.0,
     };
 
     backend
@@ -46,6 +47,7 @@ async fn mexc_resolves_ckbtc_to_icp_route_from_configured_pairs() {
     let empty = OrderBook {
         bids: vec![],
         asks: vec![],
+        taker_fee_bps: 10.0,
     };
 
     backend
@@ -83,6 +85,7 @@ async fn mexc_resolves_icp_to_ckusdt_route_from_configured_pairs() {
     let empty = OrderBook {
         bids: vec![],
         asks: vec![],
+        taker_fee_bps: 10.0,
     };
 
     backend
@@ -116,6 +119,7 @@ async fn mexc_resolves_icp_to_eth_route_from_configured_pairs() {
     let empty = OrderBook {
         bids: vec![],
         asks: vec![],
+        taker_fee_bps: 10.0,
     };
 
     backend
@@ -149,6 +153,7 @@ async fn mexc_resolves_ckbtc_to_eth_route_from_configured_pairs() {
     let empty = OrderBook {
         bids: vec![],
         asks: vec![],
+        taker_fee_bps: 10.0,
     };
 
     backend
@@ -186,6 +191,7 @@ async fn mexc_resolves_eth_to_ckbtc_route_from_configured_pairs() {
     let empty = OrderBook {
         bids: vec![],
         asks: vec![],
+        taker_fee_bps: 10.0,
     };
 
     backend
@@ -223,6 +229,7 @@ async fn mexc_resolves_ckusdt_to_icp_route_from_configured_pairs() {
     let empty = OrderBook {
         bids: vec![],
         asks: vec![],
+        taker_fee_bps: 10.0,
     };
 
     backend
@@ -264,10 +271,12 @@ async fn mexc_trade_prefers_direct_route_over_hops_when_both_available() {
             price: 101.0,
             quantity: 1_000.0,
         }],
+        taker_fee_bps: 10.0,
     };
     let empty = OrderBook {
         bids: vec![],
         asks: vec![],
+        taker_fee_bps: 10.0,
     };
     backend.expect_get_orderbook().returning(move |market, _limit| {
         *observed_markets_handle
@@ -348,10 +357,12 @@ async fn mexc_trade_uses_configured_hop_route_when_direct_unavailable() {
             price: 1.001,
             quantity: 1_000_000.0,
         }],
+        taker_fee_bps: 10.0,
     };
     let empty = OrderBook {
         bids: vec![],
         asks: vec![],
+        taker_fee_bps: 10.0,
     };
     backend
         .expect_get_orderbook()
@@ -421,6 +432,7 @@ async fn mexc_trade_reuses_persisted_route_without_reprobing_direct_markets() {
     let empty = OrderBook {
         bids: vec![],
         asks: vec![],
+        taker_fee_bps: 10.0,
     };
     let liquid = OrderBook {
         bids: vec![OrderBookLevel {
@@ -431,6 +443,7 @@ async fn mexc_trade_reuses_persisted_route_without_reprobing_direct_markets() {
             price: 1.001,
             quantity: 1_000_000.0,
         }],
+        taker_fee_bps: 10.0,
     };
 
     backend
@@ -524,6 +537,7 @@ async fn mexc_trade_errors_when_no_hop_route_exists_in_configured_pairs() {
     let empty = OrderBook {
         bids: vec![],
         asks: vec![],
+        taker_fee_bps: 10.0,
     };
     backend
         .expect_get_orderbook()
@@ -576,6 +590,7 @@ async fn mexc_preview_route_keeps_legacy_special_override_even_with_direct_pair_
             price: 1.001,
             quantity: 1_000.0,
         }],
+        taker_fee_bps: 10.0,
     };
     backend.expect_get_orderbook().returning(move |market, _limit| {
         *observed_markets_handle
@@ -650,6 +665,7 @@ async fn mexc_input_slice_usd_converts_non_hardcoded_quote_via_configured_hops()
     let empty = OrderBook {
         bids: vec![],
         asks: vec![],
+        taker_fee_bps: 10.0,
     };
     let sol_eth = OrderBook {
         bids: vec![OrderBookLevel {
@@ -660,6 +676,7 @@ async fn mexc_input_slice_usd_converts_non_hardcoded_quote_via_configured_hops()
             price: 2.1,
             quantity: 1_000.0,
         }],
+        taker_fee_bps: 10.0,
     };
     let eth_btc = OrderBook {
         bids: vec![OrderBookLevel {
@@ -670,6 +687,7 @@ async fn mexc_input_slice_usd_converts_non_hardcoded_quote_via_configured_hops()
             price: 0.051,
             quantity: 1_000.0,
         }],
+        taker_fee_bps: 10.0,
     };
     let btc_usdc = OrderBook {
         bids: vec![OrderBookLevel {
@@ -680,6 +698,7 @@ async fn mexc_input_slice_usd_converts_non_hardcoded_quote_via_configured_hops()
             price: 70_100.0,
             quantity: 1_000.0,
         }],
+        taker_fee_bps: 10.0,
     };
 
     backend
@@ -725,6 +744,7 @@ async fn mexc_preview_trade_slice_sell_binary_search_finds_largest_chunk_under_t
             },
         ],
         asks: vec![],
+        taker_fee_bps: 10.0,
     };
 
     backend
@@ -765,6 +785,7 @@ async fn mexc_preview_route_resolves_direct_buy_leg_when_sell_book_empty() {
     let btc_ckbtc = OrderBook {
         bids: vec![],
         asks: vec![],
+        taker_fee_bps: 10.0,
     };
     let ckbtc_btc = OrderBook {
         bids: vec![],
@@ -772,6 +793,7 @@ async fn mexc_preview_route_resolves_direct_buy_leg_when_sell_book_empty() {
             price: 1.0,
             quantity: 10.0,
         }],
+        taker_fee_bps: 10.0,
     };
     let btc_usdc = OrderBook {
         bids: vec![OrderBookLevel {
@@ -782,6 +804,7 @@ async fn mexc_preview_route_resolves_direct_buy_leg_when_sell_book_empty() {
             price: 69_010.0,
             quantity: 10.0,
         }],
+        taker_fee_bps: 10.0,
     };
 
     backend

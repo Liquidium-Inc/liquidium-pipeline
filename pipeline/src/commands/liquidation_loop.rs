@@ -272,6 +272,7 @@ async fn init(
                 bad_debt_min_net_edge_bps: config.multi_venue_bad_debt_min_net_edge_bps,
                 max_oracle_discount_bps: config.multi_venue_max_oracle_discount_bps,
                 oracle_snapshot_max_age_secs: config.multi_venue_oracle_snapshot_max_age_secs,
+                cycles_usd_per_trillion: config.cycles_usd_per_trillion,
                 icpswap_test_allocation_usd: config.icpswap_test_allocation_usd,
             },
         )?
@@ -688,6 +689,7 @@ mod tests {
                 conservative_receive: receive.clone(),
                 estimated_price_impact_bps: 50.0,
                 route_id: "icpswap-route".to_string(),
+                side_costs: Vec::new(),
             },
             execution: VenueExecutionState::new("icpswap", &execution).expect("tag execution"),
             status: VenueLegStatus::Running,
@@ -711,6 +713,7 @@ mod tests {
                     conservative_receive: receive,
                     combined_net_edge_bps: 175.0,
                     quoted_at: 123,
+                    side_cost_receive: None,
                 },
                 legs: vec![leg],
                 outcome: MultiVenueExecutionOutcome::Running,

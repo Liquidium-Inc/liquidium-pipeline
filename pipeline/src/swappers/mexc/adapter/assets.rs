@@ -91,6 +91,15 @@ fn is_evm_network_alias(network_norm: &str) -> bool {
     network_norm == "ETH" || network_norm == "ETHEREUM" || network_norm.starts_with("EVM")
 }
 
+/// The networks a withdrawal tries, best match first.
+pub(super) fn mexc_withdraw_network_order(asset: &str, network: &str) -> Vec<String> {
+    let mut ordered = vec![mexc_withdraw_network(asset, network)];
+    for candidate in mexc_network_candidates(asset, network) {
+        push_unique(&mut ordered, candidate);
+    }
+    ordered
+}
+
 pub(super) fn mexc_withdraw_network(asset: &str, network: &str) -> String {
     let asset_norm = asset.trim().to_ascii_uppercase();
     if asset_norm.starts_with("CK") && !asset_norm.is_empty() {

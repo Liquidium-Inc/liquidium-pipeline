@@ -26,6 +26,7 @@ use super::{
     },
 };
 use liquidium_pipeline_core::outbound::{SIDE_EFFECT_AMBIGUOUS_PREFIX, SendOutcome};
+use liquidium_pipeline_core::types::side_cost::SideCost;
 use crate::{
     backend::{
         amount_utils::{
@@ -37,7 +38,7 @@ use crate::{
             BridgeSend, BridgeStatus, BridgeSubmission, BridgeSubmissionCandidate, DepositNotice,
             resolve_cketh_forward_route_by_source, resolve_cketh_reverse_route_by_source,
         },
-        evm_backend::{Broadcast, EvmBackendImpl, SignedEvmTx},
+        evm_backend::{Broadcast, ERC20_APPROVE_GAS_LIMIT, EvmBackendImpl, SignedEvmTx},
         icp_backend::IcpBackend,
         icp_backend_helpers::{
             icrc1_balance_with_context, icrc1_decimals_with_context, icrc1_fee_with_context,
@@ -97,6 +98,8 @@ pub trait BridgeEvmBackend: Send + Sync {
 
     async fn native_balance_of(&self, owner: Address) -> Result<U256, String>;
     async fn native_tx_gas_reserve(&self, gas_limit: u128) -> Result<U256, String>;
+    /// The current gas price, for cost estimates.
+    async fn gas_price_wei(&self) -> Result<u128, String>;
     async fn erc20_balance_of(&self, token: Address, owner: Address) -> Result<U256, String>;
     async fn erc20_allowance_of(&self, token: Address, owner: Address, spender: Address) -> Result<U256, String>;
     async fn erc20_decimals_of(&self, token: Address) -> Result<u8, String>;
@@ -161,12 +164,17 @@ where
     }
 
     async fn native_tx_gas_reserve(&self, gas_limit: u128) -> Result<U256, String> {
-        let gas_price_wei = self
-            .provider
+        Ok(eth_forward_gas_reserve_from_price(
+            self.gas_price_wei().await?,
+            gas_limit,
+        ))
+    }
+
+    async fn gas_price_wei(&self) -> Result<u128, String> {
+        self.provider
             .get_gas_price()
             .await
-            .map_err(|e| format!("native gas price fetch failed: {e}"))?;
-        Ok(eth_forward_gas_reserve_from_price(gas_price_wei, gas_limit))
+            .map_err(|e| format!("native gas price fetch failed: {e}"))
     }
 
     async fn erc20_balance_of(&self, token: Address, owner: Address) -> Result<U256, String> {
@@ -472,6 +480,35 @@ where
         amount.clone() + (amount.clone() / Nat::from(5u8))
     }
 
+    /// A return to ICP pays gas from the bridge wallet: one helper call, plus
+    /// an approve when the token is an ERC-20. The limits are the ones execution budgets.
+    async fn forward_fee_budget(&self, route: &BridgeRouteSpec) -> Result<BridgeFeeBudget, String> {
+        let gas_limit = match route.route_kind {
+            BridgeRouteKind::EthToCkEth => ETH_FORWARD_HELPER_GAS_LIMIT,
+            _ => ETH_FORWARD_HELPER_GAS_LIMIT + u128::from(ERC20_APPROVE_GAS_LIMIT),
+        };
+        let gas_cost = self.evm_backend.gas_price_wei().await?.saturating_mul(gas_limit);
+        Ok(BridgeFeeBudget {
+            side_costs: vec![SideCost::new(
+                format!("ETH gas for the {} helper deposit", route.source_asset),
+                "ETH",
+                ETH_DECIMALS,
+                Nat::from(gas_cost),
+            )],
+            ..BridgeFeeBudget::default()
+        })
+    }
+
+    /// The ckETH a ckERC20 withdrawal needs in the bridge account: the burn
+    /// that pays gas, plus the fee of the approve that allows that burn.
+    async fn cketh_side_budget(&self, ckerc20_ledger: Principal, cketh_ledger_id: Principal) -> Result<Nat, String> {
+        let (burn_budget, approve_fee) = tokio::try_join!(
+            self.quoted_cketh_fee_budget(Some(ckerc20_ledger)),
+            icrc1_fee_with_context(self.icp_backend.as_ref(), cketh_ledger_id, "ckerc20 bridge")
+        )?;
+        Ok(burn_budget + approve_fee)
+    }
+
     async fn quoted_cketh_fee_budget(&self, quote_for_ledger: Option<Principal>) -> Result<Nat, String> {
         let fee_quote = self.eip_1559_transaction_price(quote_for_ledger).await?;
         Ok(Self::with_fee_headroom(&fee_quote.max_transaction_fee))
@@ -582,6 +619,17 @@ where
             return Err(format!(
                 "bridge amount preflight failed: ERC20 balance is below requested deposit amount (available={} required={} signer={} token={})",
                 signer_balance, amount_base_units, signer, token_address
+            ));
+        }
+        // The approve and the helper call pay gas from the wallet's own ETH. A
+        // short wallet waits for funding instead of failing at broadcast.
+        let gas_limit = ETH_FORWARD_HELPER_GAS_LIMIT + u128::from(ERC20_APPROVE_GAS_LIMIT);
+        let gas_needed = U256::from(self.evm_backend.gas_price_wei().await?).saturating_mul(U256::from(gas_limit));
+        let eth_balance = self.evm_backend.native_balance_of(signer).await?;
+        if eth_balance < gas_needed {
+            return Err(format!(
+                "{BRIDGE_SUBMISSION_DEFERRED_PREFIX}: bridge wallet holds {eth_balance} wei ETH, below the {gas_needed} wei of gas the {} return needs",
+                route.source_asset
             ));
         }
 
@@ -780,7 +828,7 @@ where
         let cketh_ledger_id = self.cketh_ledger_id().await?;
         let required_fee_budget = match &request.provider_fee_budget_native_units {
             Some(quoted) => quoted.clone(),
-            None => self.quoted_cketh_fee_budget(Some(ckerc20_ledger_id)).await?,
+            None => self.cketh_side_budget(ckerc20_ledger_id, cketh_ledger_id).await?,
         };
 
         // Minter withdraw burns ckERC20 and consumes ckETH for the EVM execution fee.
@@ -875,11 +923,8 @@ where
         self.ensure_native_cketh_withdrawal_minimum(route, &amount_native, request.amount)
             .await?;
         let approve_fee = icrc1_fee_with_context(self.icp_backend.as_ref(), cketh_ledger_id, "cketh bridge").await?;
-        let required_fee_budget = match &request.provider_fee_budget_native_units {
-            Some(quoted) => quoted.clone(),
-            None => self.quoted_cketh_fee_budget(None).await?,
-        };
-        let required_budget = amount_native.clone() + approve_fee.clone() + required_fee_budget.clone();
+        // The minter burns exactly `amount` and sends `amount - gas`.
+        let required_budget = amount_native.clone() + approve_fee.clone();
 
         let available_cketh = icrc1_balance_with_context(
             self.icp_backend.as_ref(),
@@ -892,13 +937,12 @@ where
             let available_formatted = nat_units_to_amount_via_core(&available_cketh, ETH_DECIMALS)?;
             let required_formatted = nat_units_to_amount_via_core(&required_budget, ETH_DECIMALS)?;
             return Err(format!(
-                "bridge amount preflight failed: ckETH balance is below required withdraw+approve+fee budget (available={} required={} source={})",
+                "bridge amount preflight failed: ckETH balance is below required withdraw+approve budget (available={} required={} source={})",
                 available_formatted, required_formatted, request.source_address
             ));
         }
 
-        let required_allowance = amount_native.clone() + required_fee_budget.clone();
-        self.ensure_minter_allowance(&source_account, cketh_ledger_id, required_allowance)
+        self.ensure_minter_allowance(&source_account, cketh_ledger_id, amount_native.clone())
             .await?;
 
         let withdraw_args = WithdrawalArg {
@@ -1059,6 +1103,11 @@ where
     }
 
     async fn get_fee_budget(&self, asset: &str, chain: &str, target_asset: &str) -> Result<BridgeFeeBudget, String> {
+        if let Some(route) = resolve_cketh_forward_route_by_source(asset, chain)
+            && route.target_asset.eq_ignore_ascii_case(target_asset)
+        {
+            return self.forward_fee_budget(route).await;
+        }
         let Some(route) = resolve_cketh_reverse_route_by_source(asset, chain) else {
             return Ok(BridgeFeeBudget::default());
         };
@@ -1070,14 +1119,21 @@ where
         match route.route_kind {
             BridgeRouteKind::CkEthErc20Reverse => {
                 let ledger_id = parse_ckerc20_ledger_id(route)?;
+                let cketh_ledger_id = self.cketh_ledger_id().await?;
                 let (decimals, approve_fee, withdrawal_fee_budget) = tokio::try_join!(
                     icrc1_decimals_with_context(self.icp_backend.as_ref(), ledger_id, "ckerc20 bridge"),
                     icrc1_fee_with_context(self.icp_backend.as_ref(), ledger_id, "ckerc20 bridge"),
-                    self.quoted_cketh_fee_budget(Some(ledger_id))
+                    self.cketh_side_budget(ledger_id, cketh_ledger_id)
                 )?;
                 Ok(BridgeFeeBudget {
                     source_fee_budget: nat_units_to_amount_via_core(&approve_fee, decimals)?,
                     destination_fee_budget: 0.0,
+                    side_costs: vec![SideCost::new(
+                        "ckETH for the ERC-20 withdrawal gas",
+                        "ETH",
+                        ETH_DECIMALS,
+                        withdrawal_fee_budget.clone(),
+                    )],
                     provider_fee_budget_native_units: Some(withdrawal_fee_budget),
                 })
             }
@@ -1087,11 +1143,13 @@ where
                     icrc1_fee_with_context(self.icp_backend.as_ref(), ledger_id, "cketh bridge"),
                     self.quoted_cketh_fee_budget(None)
                 )?;
-                let total_budget = approve_fee + withdrawal_fee_budget.clone();
+                // The minter burns exactly `amount` and takes the gas out of it,
+                // so the bridge account keeps only the approve fee back.
                 Ok(BridgeFeeBudget {
-                    source_fee_budget: nat_units_to_amount_via_core(&total_budget, ETH_DECIMALS)?,
+                    source_fee_budget: nat_units_to_amount_via_core(&approve_fee, ETH_DECIMALS)?,
                     destination_fee_budget: nat_units_to_amount_via_core(&withdrawal_fee_budget, ETH_DECIMALS)?,
                     provider_fee_budget_native_units: Some(withdrawal_fee_budget),
+                    side_costs: Vec::new(),
                 })
             }
             _ => Ok(BridgeFeeBudget::default()),

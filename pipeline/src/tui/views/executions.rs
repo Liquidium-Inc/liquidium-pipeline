@@ -993,6 +993,7 @@ mod tests {
                 conservative_receive: receive_amount,
                 estimated_price_impact_bps: 12.5,
                 route_id: "ICP_USDC".to_string(),
+                side_costs: Vec::new(),
             },
             execution: VenueExecutionState {
                 venue: "mexc".to_string(),

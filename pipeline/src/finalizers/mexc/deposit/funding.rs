@@ -143,12 +143,17 @@ where
             &bridge_source_address,
         )?;
 
-        let BridgeDepositSizing {
-            transfer_value,
-            bridge_amount: transfer_amount,
-            source_fee_reserve,
-            fee_budget,
-        } = Self::size_bridged_deposit(bridge, route, &state.deposit.deposit_asset, &state.size_in).await?;
+        let BridgedDepositArrival {
+            sizing:
+                BridgeDepositSizing {
+                    transfer_value,
+                    bridge_amount: transfer_amount,
+                    source_fee_reserve,
+                    fee_budget,
+                },
+            submit_amount: bridge_submit_amount,
+            expected_amount: bridge_expected_amount,
+        } = Self::bridged_deposit_arrival(bridge, route, &state.deposit.deposit_asset, &state.size_in).await?;
 
         if let Some(source_fee_reserve) = source_fee_reserve {
             let source_transfer_amount =
@@ -165,13 +170,7 @@ where
             );
         }
 
-        Self::ensure_minimum_bridge_amount(bridge, route, &transfer_amount).await?;
-        let bridge_submit_amount = Self::spend_f64(&transfer_amount)?;
-        let bridge_expected_amount = Self::compute_expected_bridge_deposit_amount(
-            route,
-            bridge_submit_amount,
-            fee_budget.destination_fee_budget,
-        )?;
+        state.record_side_costs(&fee_budget.side_costs);
         state.deposit.bridge.deposit_bridge_submit_amount = Some(bridge_submit_amount);
         state.deposit.bridge.deposit_bridge_expected_amount = Some(bridge_expected_amount);
         state.deposit.bridge.deposit_bridge_provider_fee_budget_native_units =

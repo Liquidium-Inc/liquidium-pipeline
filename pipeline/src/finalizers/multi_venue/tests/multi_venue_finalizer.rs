@@ -474,10 +474,10 @@ impl MultiVenueAdapter for ScriptedAdapter {
             _ => 50.0,
         };
         let receive = Nat::from(pay * 2);
-        Ok(VenueRoutePreview {
-            venue_id: self.venue_id.to_string(),
-            request: request.clone(),
-            quote: SwapQuote {
+        Ok(VenueRoutePreview::new(
+            self.venue_id.to_string(),
+            request.clone(),
+            SwapQuote {
                 pay_asset: request.pay_asset.clone(),
                 pay_amount: request.pay_amount.value.clone(),
                 receive_asset: request.receive_asset.clone(),
@@ -487,12 +487,12 @@ impl MultiVenueAdapter for ScriptedAdapter {
                 estimated_price_impact_bps: impact,
                 legs: Vec::new(),
             },
-            conservative_receive: ChainTokenAmount::from_raw(debt_token(), receive),
-            initial_execution_state: VenueExecutionState {
+            ChainTokenAmount::from_raw(debt_token(), receive),
+            VenueExecutionState {
                 venue: self.venue_id.to_string(),
                 state: serde_json::json!({ "step": "planned" }),
             },
-        })
+        ))
     }
 
     async fn advance(
@@ -710,6 +710,8 @@ fn execution_for(leg: &VenueLegState) -> SwapExecution {
         }],
         approval_count: None,
         ts: 0,
+        side_costs: Vec::new(),
+        side_cost_receive: None,
     }
 }
 
@@ -726,6 +728,7 @@ fn planner_config() -> IcpswapFirstPlannerConfig {
         max_oracle_discount_bps: 250,
         oracle_snapshot_max_age_secs: 300,
         icpswap_test_allocation_usd: None,
+        cycles_usd_per_trillion: 1.35,
     }
 }
 
@@ -1354,7 +1357,8 @@ async fn bad_debt_below_minimum_edge_never_advances_a_venue_leg() {
 
     assert!(error.message().contains("below required 150 bps"));
     assert_eq!(icpswap.previews(), 1);
-    assert_eq!(mexc.previews(), 0);
+    // MEXC is tried under the same floor before the planner gives up (audit L11).
+    assert_eq!(mexc.previews(), 1);
     assert_eq!(icpswap.calls(), 0);
     assert_eq!(mexc.calls(), 0);
     assert!(wal.wrapper().meta_v2.is_none(), "a rejected plan must not be committed");
