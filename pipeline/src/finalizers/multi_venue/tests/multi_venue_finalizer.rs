@@ -861,7 +861,7 @@ async fn recovery_transfer_is_persisted_as_ready_before_it_is_submitted() {
 
 mod cketh_bridge_minimum {
     use super::*;
-    use crate::{bridge::runtime::BridgeRuntime, finalizers::mexc::mexc_finalizer::MexcFinalizer};
+    use crate::{bridge::runtime::BridgeRuntime, finalizers::cex::finalizer::CexVenueFinalizer};
     use liquidium_pipeline_connectors::backend::{
         bridge_backend::{BridgeFeeBudget, MockBridgeBackend},
         cex_backend::MockCexBackend,
@@ -871,7 +871,7 @@ mod cketh_bridge_minimum {
     const COLLATERAL: u64 = 4_000_000_000_000_000;
     const LEDGER_FEE: u64 = 2_000_000_000_000;
 
-    fn setup(debt: ChainToken, bridge_unavailable: bool) -> (ExecutionReceipt, Arc<MexcFinalizer<MockCexBackend>>) {
+    fn setup(debt: ChainToken, bridge_unavailable: bool) -> (ExecutionReceipt, Arc<CexVenueFinalizer<MockCexBackend>>) {
         let collateral = ChainToken::Icp {
             ledger: Principal::from_text("ss2fx-dyaaa-aaaar-qacoq-cai").unwrap(),
             symbol: "ckETH".into(),
@@ -907,7 +907,7 @@ mod cketh_bridge_minimum {
         let mut venue_transfers = MockTransferActions::new();
         venue_transfers.expect_transfer().times(0);
         // No exchange calls are allowed: the bridge minimum rejects the route before its quote.
-        let mexc = MexcFinalizer::new(
+        let mexc = CexVenueFinalizer::new(
             Arc::new(MockCexBackend::new()),
             Arc::new(venue_transfers),
             Principal::anonymous(),

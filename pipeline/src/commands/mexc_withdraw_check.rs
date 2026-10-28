@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use liquidium_pipeline_connectors::backend::cex_backend::CexBackend;
 
-use crate::finalizers::mexc::mexc_finalizer::mexc_withdraw_order_id;
+use crate::finalizers::cex::finalizer::withdraw_order_id;
 use crate::swappers::mexc::mexc_adapter::MexcClient;
 use crate::utils::now_ts;
 
@@ -13,7 +13,7 @@ const HISTORY_POLL_INTERVAL: Duration = Duration::from_secs(5);
 
 pub async fn check(asset: &str, network: &str, address: &str, amount: f64, confirm: bool) -> Result<(), String> {
     let client = MexcClient::from_env()?;
-    let order_id = mexc_withdraw_order_id(&format!("withdraw-check-{}", now_ts()), 0);
+    let order_id = withdraw_order_id(&format!("withdraw-check-{}", now_ts()), 0);
 
     println!("asset={asset} network={network} amount={amount} address={address}");
     println!("withdrawOrderId={order_id}");

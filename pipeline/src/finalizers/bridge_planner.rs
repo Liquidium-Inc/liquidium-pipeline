@@ -8,7 +8,7 @@ use liquidium_pipeline_connectors::backend::bridge_backend::{
 };
 use liquidium_pipeline_core::{account::model::ChainAccount, tokens::chain_token::ChainToken};
 
-use crate::finalizers::cex_finalizer::CexState;
+use crate::finalizers::cex::state::CexState;
 
 /// Reads an ICRC account text or a bare principal.
 pub(crate) fn parse_icp_account_like(address: &str) -> Result<Account, String> {
