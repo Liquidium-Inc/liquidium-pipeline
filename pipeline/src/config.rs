@@ -517,12 +517,13 @@ fn load_cex_credentials() -> HashMap<String, (String, String)> {
             let name_lower = name.to_lowercase();
             let secret_var = format!("CEX_{}_API_SECRET", name);
 
+            // A blank key in the env file means the exchange has no credentials.
             match std::env::var(&secret_var) {
-                Ok(secret) => {
+                Ok(secret) if !value.trim().is_empty() && !secret.trim().is_empty() => {
                     debug!("Loaded CEX credentials for '{}'", name_lower);
                     cex_credentials.insert(name_lower, (value, secret));
                 }
-                Err(_) => {
+                _ => {
                     debug!("Found {} but missing {}", key, secret_var);
                 }
             }
@@ -1011,6 +1012,36 @@ mod tests {
         // debt by that much, bad debt may fall short of it by that much.
         assert_eq!(parse_multi_venue_bad_debt_min_net_edge_bps_from_env(), -500);
         assert_eq!(parse_multi_venue_oracle_snapshot_max_age_secs_from_env(), 300);
+    }
+
+    /// Review finding 27: `config.env` ships blank Kraken keys, and they passed
+    /// the "keys are missing" check, so every Kraken preview then failed.
+    #[test]
+    fn blank_cex_credentials_count_as_missing() {
+        let _guard = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        unsafe {
+            env::set_var("CEX_TESTBLANK_API_KEY", "");
+            env::set_var("CEX_TESTBLANK_API_SECRET", "secret");
+            env::set_var("CEX_TESTSET_API_KEY", "key");
+            env::set_var("CEX_TESTSET_API_SECRET", " ");
+            env::set_var("CEX_TESTFULL_API_KEY", "key");
+            env::set_var("CEX_TESTFULL_API_SECRET", "secret");
+        }
+
+        let credentials = load_cex_credentials();
+
+        assert!(!credentials.contains_key("testblank"));
+        assert!(!credentials.contains_key("testset"));
+        assert_eq!(
+            credentials.get("testfull"),
+            Some(&("key".to_string(), "secret".to_string()))
+        );
+        for name in ["TESTBLANK", "TESTSET", "TESTFULL"] {
+            unsafe {
+                env::remove_var(format!("CEX_{name}_API_KEY"));
+                env::remove_var(format!("CEX_{name}_API_SECRET"));
+            }
+        }
     }
 
     #[test]
