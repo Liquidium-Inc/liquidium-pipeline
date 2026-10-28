@@ -208,6 +208,17 @@ async fn init(
         .map_err(|e| format!("failed to recover interrupted liquidation intents: {e}"))?;
     if recovered != 0 {
         warn!(recovered, "Parked interrupted liquidation submissions as ambiguous");
+        slack_watchdog_from_env(DEFAULT_LOW_BALANCE_ALERT_COOLDOWN)
+            .notify(WatchdogEvent::OperatorRequired {
+                execution_id: "restart".to_string(),
+                venue: "protocol".to_string(),
+                pending_step: "liquidation-call-interrupted".to_string(),
+                owner: config.liquidator_principal.to_text(),
+                details: format!(
+                    "a restart interrupted {recovered} liquidation calls; each may have run on chain with no WAL row, so its intent is ambiguous"
+                ),
+            })
+            .await;
     }
 
     let tokens = debt_asset_principals(&registry);
@@ -221,7 +232,8 @@ async fn init(
         config.lending_canister,
         db.clone(),
         ctx.approval_state.clone(),
-    );
+    )
+    .with_watchdog(slack_watchdog_from_env(DEFAULT_LOW_BALANCE_ALERT_COOLDOWN));
 
     executor
         .init(&tokens)

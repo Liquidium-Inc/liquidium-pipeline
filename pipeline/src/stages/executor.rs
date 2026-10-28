@@ -11,6 +11,7 @@ use crate::{
     liquidation::lending_queries::get_liquidation_inflow,
     persistance::LiquidationIntentStore,
     stage::PipelineStage,
+    watchdog::WatchdogEvent,
 };
 use liquidium_pipeline_connectors::pipeline_agent::PipelineAgent;
 
@@ -123,6 +124,15 @@ impl<'a, A: PipelineAgent, D: LiquidationIntentStore> PipelineStage<'a, Vec<Exec
                     Err(err) => {
                         warn!("Liquidation call failed {err}");
                         receipt.status = ExecutionStatus::LiquidationCallFailed(err.clone());
+                        // The lost reply held the liquidation id, so nothing can finalize the call.
+                        self.alert_unrecorded(
+                            &intent_id,
+                            "liquidation-call-unanswered",
+                            format!(
+                                "liquidation call got no answer and may have run on chain: {err}; intent {intent_id} is ambiguous, and its collateral may be in the trader account with no WAL row | {summary}"
+                            ),
+                        )
+                        .await;
                         self.intents
                             .mark_ambiguous(&intent_id, &err, None)
                             .await
@@ -171,7 +181,13 @@ impl<'a, A: PipelineAgent, D: LiquidationIntentStore> PipelineStage<'a, Vec<Exec
                 }
 
                 debug!("Executed liquidation {:?}", liq);
-                persist_accepted_receipt(self.intents.as_ref(), &intent_id, &liq.id.to_string(), &receipt).await?;
+                if let Err(details) =
+                    persist_accepted_receipt(self.intents.as_ref(), &intent_id, &liq.id.to_string(), &receipt).await
+                {
+                    self.alert_unrecorded(&intent_id, "persist-liquidation-result", details.clone())
+                        .await;
+                    return Err(details);
+                }
 
                 Ok::<ExecutionReceipt, String>(receipt)
             }
@@ -198,6 +214,20 @@ impl<'a, A: PipelineAgent, D: LiquidationIntentStore> PipelineStage<'a, Vec<Exec
 }
 
 impl<A: PipelineAgent, D: LiquidationIntentStore> BasicExecutor<A, D> {
+    /// A liquidation that may have run has no WAL row, so nothing finalizes it.
+    /// The intent id keys the alert, so two liquidations never share a cooldown.
+    async fn alert_unrecorded(&self, intent_id: &str, pending_step: &str, details: String) {
+        self.watchdog
+            .notify(WatchdogEvent::OperatorRequired {
+                execution_id: intent_id.to_string(),
+                venue: "protocol".to_string(),
+                pending_step: pending_step.to_string(),
+                owner: self.account_id.owner.to_text(),
+                details,
+            })
+            .await;
+    }
+
     /// Saves a rejected liquidation on its intent and returns its receipt.
     async fn save_failed(
         &self,
@@ -644,14 +674,74 @@ mod tests {
             agent.expect_call_update::<Result<LiquidationResult, ProtocolError>>()
                 .times(1)
                 .returning(|_, _, _| Ok(Ok(make_liquidation_result(77))));
-            let executor = test_executor(agent, intents);
+            let watchdog = Arc::new(RecordingWatchdog::default());
+            let executor = test_executor(agent, intents).with_watchdog(watchdog.clone());
             let result = executor.process(&vec![icp_request()]).await;
+            let alerts = watchdog.0.lock().unwrap().clone();
             if recover {
                 assert!(result.is_ok());
+                assert!(alerts.is_empty());
             } else {
                 assert!(result.unwrap_err().contains("operator reconciliation required"));
+                assert_eq!(alerts.len(), 1);
+                assert_eq!(alerts[0].1, "persist-liquidation-result");
             }
         }
+    }
+
+    #[derive(Default)]
+    struct RecordingWatchdog(std::sync::Mutex<Vec<(String, String)>>);
+
+    #[async_trait]
+    impl crate::watchdog::Watchdog for RecordingWatchdog {
+        async fn notify(&self, event: WatchdogEvent<'_>) {
+            if let WatchdogEvent::OperatorRequired {
+                execution_id,
+                pending_step,
+                ..
+            } = event
+            {
+                self.0.lock().unwrap().push((execution_id, pending_step));
+            }
+        }
+    }
+
+    /// Review findings 15 and 16: a lost reply left a liquidation that may
+    /// have run with no WAL row and no alert.
+    #[tokio::test]
+    async fn a_lost_reply_alerts_once_for_its_own_intent() {
+        let created = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = created.clone();
+        let mut intents = MockLiquidationIntentStore::new();
+        intents.expect_create_submitting().times(2).returning(move |id, _| {
+            seen.lock().unwrap().push(id.to_string());
+            Ok(())
+        });
+        intents.expect_mark_ambiguous().times(2).returning(|_, _, _| Ok(()));
+        let mut agent = MockPipelineAgent::new();
+        agent
+            .expect_call_update::<Result<LiquidationResult, ProtocolError>>()
+            .times(2)
+            .returning(|_, _, _| Err("response lost".to_string()));
+        let watchdog = Arc::new(RecordingWatchdog::default());
+        let executor = test_executor(agent, intents).with_watchdog(watchdog.clone());
+
+        executor
+            .process(&vec![icp_request(), icp_request()])
+            .await
+            .expect("ambiguous results remain observable");
+
+        let mut alerts = watchdog.0.lock().unwrap().clone();
+        let mut intent_ids = created.lock().unwrap().clone();
+        alerts.sort();
+        intent_ids.sort();
+        assert_eq!(
+            alerts,
+            intent_ids
+                .into_iter()
+                .map(|id| (id, "liquidation-call-unanswered".to_string()))
+                .collect::<Vec<_>>()
+        );
     }
 
     #[tokio::test]
