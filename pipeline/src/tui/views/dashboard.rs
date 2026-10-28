@@ -5,6 +5,8 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table, Wrap};
 use unicode_width::UnicodeWidthStr;
 
+use crate::finalizers::cex::profile::CexVenueProfile;
+use crate::finalizers::multi_venue::ICPSWAP_VENUE_ID;
 use crate::persistance::{FinalizerMetaPayload, LiqMetaWrapper, ResultStatus, VenueLegState, VenueLegStatus};
 use crate::stages::executor::ExecutionReceipt;
 
@@ -464,12 +466,12 @@ fn venue_fork_rows(legs: &[VenueLegState]) -> Vec<VenueForkRow> {
         .collect()
 }
 
+/// Exchange names come from their profile, so a new exchange needs no entry here.
 pub(super) fn venue_display_name(venue_id: &str) -> String {
-    match venue_id {
-        "icpswap" => "ICPSwap".to_string(),
-        "mexc" => "MEXC".to_string(),
-        other => other.to_string(),
+    if venue_id == ICPSWAP_VENUE_ID {
+        return "ICPSwap".to_string();
     }
+    CexVenueProfile::for_venue(venue_id).map_or_else(|| venue_id.to_string(), |profile| profile.name().to_string())
 }
 
 pub(super) fn venue_leg_stage(leg: &VenueLegState) -> String {
@@ -729,18 +731,23 @@ fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
 }
 
 #[cfg(test)]
-mod tests {
+pub(in crate::tui::views) mod tests {
     use candid::Nat;
     use liquidium_pipeline_core::tokens::{chain_token::ChainToken, chain_token_amount::ChainTokenAmount};
     use serde_json::json;
 
-    use super::{humanize_step, venue_fork_rows};
+    use super::{humanize_step, venue_display_name, venue_fork_rows};
     use crate::{
         persistance::{VenueExecutionState, VenueLegQuote, VenueLegState, VenueLegStatus},
         swappers::model::SwapRequest,
     };
 
-    fn leg(venue: &str, status: VenueLegStatus, state: serde_json::Value, last_error: Option<&str>) -> VenueLegState {
+    pub(in crate::tui::views) fn leg(
+        venue: &str,
+        status: VenueLegStatus,
+        state: serde_json::Value,
+        last_error: Option<&str>,
+    ) -> VenueLegState {
         let pay_token = ChainToken::EvmNative {
             chain: "ICP".to_string(),
             symbol: "ICP".to_string(),
@@ -784,6 +791,14 @@ mod tests {
             last_error: last_error.map(str::to_string),
             failure: None,
         }
+    }
+
+    #[test]
+    fn exchange_names_come_from_their_profile() {
+        assert_eq!(venue_display_name("icpswap"), "ICPSwap");
+        assert_eq!(venue_display_name("mexc"), "MEXC");
+        assert_eq!(venue_display_name("kraken"), "Kraken");
+        assert_eq!(venue_display_name("other"), "other");
     }
 
     #[test]

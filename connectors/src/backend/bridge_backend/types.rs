@@ -172,9 +172,23 @@ pub enum BridgeError {
     /// keeps waiting; the read says nothing about the funds.
     #[error("{0}")]
     Unreadable(String),
+    /// The provider, or a step before its call, refused the request, so
+    /// nothing moved. A new request is safe.
+    #[error("{0}")]
+    Refused(String),
     /// Any other failure.
     #[error("{0}")]
     Other(String),
+}
+
+impl BridgeError {
+    /// A failure before the provider call ran nothing, so an untyped one is a refusal.
+    pub(super) fn before_call(error: impl Into<Self>) -> Self {
+        match error.into() {
+            Self::Other(message) => Self::Refused(message),
+            typed => typed,
+        }
+    }
 }
 
 impl From<String> for BridgeError {

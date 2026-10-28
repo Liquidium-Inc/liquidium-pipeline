@@ -26,6 +26,7 @@ fn only_refusals_before_execution_allow_another_withdraw_alias() {
     for refused in [
         response(v3::ErrorCode::InsufficientBalance, 10101),
         response(v3::ErrorCode::CurrencyDoesNotExist, 10232),
+        response(v3::ErrorCode::InvalidResponse, 10254),
         v3::ApiError::MalformedRequest,
         v3::ApiError::RateLimitExceeded,
         v3::ApiError::WebApplicationFirewallViolated,
@@ -37,6 +38,8 @@ fn only_refusals_before_execution_allow_another_withdraw_alias() {
         response(v3::ErrorCode::GatewayTimeout, 504),
         response(v3::ErrorCode::TransferOperationProcessing, 10200),
         response(v3::ErrorCode::InternalSystemErrorPleaseContactSupport, 20002),
+        // Review finding 4: a 5xx with a code the client does not know.
+        response(v3::ErrorCode::InvalidResponse, -1),
         v3::ApiError::InternalServerError,
         v3::ApiError::UnableToParseResponse,
     ] {
@@ -547,6 +550,57 @@ async fn an_ambiguous_ioc_error_sends_no_market_order() {
 
     assert!(error.to_string().contains("Swap err"), "{error}");
     assert_eq!(server.await.unwrap().len(), 1);
+}
+
+/// Only an unsupported order type sends the market order. Any other refusal
+/// of the IOC order, such as its price, must not become an order without a limit.
+#[tokio::test]
+async fn a_refused_ioc_price_sends_no_market_order() {
+    let refused = r#"{"code":30010,"msg":"no valid trade price"}"#;
+    // The server would accept a market order, so only the refusal rule stops one.
+    let (endpoint, server) = serve(vec![(400, refused), (200, ACCEPTED)]).await;
+
+    let placed = tokio::time::timeout(std::time::Duration::from_secs(5), submit(endpoint))
+        .await
+        .unwrap();
+    server.abort();
+
+    assert!(placed.is_err(), "no market order after a price refusal: {placed:?}");
+}
+
+/// Review finding 29: an IOC order that could not be built here went out as
+/// a market order with no price limit.
+#[tokio::test]
+async fn an_ioc_order_that_cannot_be_built_sends_no_order() {
+    let (endpoint, server) = serve(vec![(200, ACCEPTED)]).await;
+    let client = client_at(endpoint);
+    client.symbol_filters.lock().await.insert(
+        "ICP_USDT".into(),
+        SymbolFilters {
+            base_precision: Some(2),
+            ..SymbolFilters::default()
+        },
+    );
+    let options = SwapExecutionOptions {
+        client_order_id: Some("lqclient2".into()),
+        // A zero reference price cannot give an IOC price.
+        price_limit: Some(PriceLimit {
+            reference_price: 0.0,
+            max_slippage_bps: 200.0,
+        }),
+        ..SwapExecutionOptions::default()
+    };
+
+    let error = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        client.execute_swap_detailed_with_options("ICP_USDT", "sell", 0.45, options),
+    )
+    .await
+    .unwrap()
+    .expect_err("no order without its limit");
+    server.abort();
+
+    assert!(error.to_string().contains("no IOC order"), "{error}");
 }
 
 fn coin(coin: &str, networks: &[(&str, &str, bool, &str)]) -> mexc_rs::spot::v3::coin_config::CoinConfig {

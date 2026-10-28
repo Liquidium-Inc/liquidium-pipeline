@@ -2,7 +2,8 @@ use std::{collections::HashMap, sync::Arc};
 
 use candid::{Nat, Principal};
 use liquidium_pipeline_connectors::backend::cex_backend::{
-    CexBackendError, DepositAddress, MockCexBackend, OrderBook, OrderBookLevel, SwapFillReport, WithdrawTerms,
+    CexBackendError, DepositAddress, FundingRoute, FundingRouteError, MockCexBackend, OrderBook, OrderBookLevel,
+    SwapFillReport, WithdrawTerms,
 };
 use liquidium_pipeline_core::{
     tokens::{chain_token::ChainToken, chain_token_amount::ChainTokenAmount, token_registry::TokenRegistry},
@@ -13,15 +14,15 @@ use num_traits::ToPrimitive;
 use super::*;
 use crate::{
     finalizers::{
-        cex::state::CexRouteLeg,
-        multi_venue::{MultiVenueAdapter, VenueLegCheckpoint, VenueLegProgress, VenuePlanningContext},
+        cex::{finalizer::tests::support::free_withdrawals, state::CexRouteLeg},
+        multi_venue::{MEXC_VENUE_ID, MultiVenueAdapter, VenueLegCheckpoint, VenueLegProgress, VenuePlanningContext},
     },
     persistance::{VenueExecutionState, VenueLegFailure, VenueLegQuote, VenueLegState, VenueLegStatus},
     swappers::model::SwapRequest,
 };
 
 /// The venue id the MEXC profile writes into saved leg state.
-const VENUE_ID: &str = "mexc";
+const VENUE_ID: &str = MEXC_VENUE_ID;
 
 struct NoopCheckpoint;
 
@@ -65,14 +66,8 @@ fn request(raw_pay: u64) -> SwapRequest {
         receive_asset: receive.asset_id(),
         receive_address: None,
         max_slippage_bps: Some(100),
-        venue_hint: Some("mexc".to_string()),
+        venue_hint: Some(VENUE_ID.to_string()),
     }
-}
-
-/// MEXC withdrawals with no fee and no minimum.
-fn free_withdrawals(cex: &mut MockCexBackend) {
-    cex.expect_get_withdraw_terms()
-        .returning(|_, _| Ok(WithdrawTerms { fee: 0.0, minimum: 0.0 }));
 }
 
 fn finalizer() -> CexVenueFinalizer<MockCexBackend> {
@@ -80,8 +75,17 @@ fn finalizer() -> CexVenueFinalizer<MockCexBackend> {
 }
 
 fn finalizer_with_withdraw_terms(terms: WithdrawTerms) -> CexVenueFinalizer<MockCexBackend> {
+    finalizer_with_route_check(terms, |_| Ok(()))
+}
+
+/// A finalizer whose exchange answers each route check with `check`.
+fn finalizer_with_route_check(
+    terms: WithdrawTerms,
+    check: impl Fn(&FundingRoute) -> Result<(), FundingRouteError> + Send + 'static,
+) -> CexVenueFinalizer<MockCexBackend> {
     let mut backend = MockCexBackend::new();
     backend.expect_get_withdraw_terms().returning(move |_, _| Ok(terms));
+    backend.expect_check_funding_route().returning(check);
     backend.expect_get_orderbook().returning(|market, _| match market {
         "PAY_RECV" => Ok(OrderBook {
             bids: vec![OrderBookLevel {
@@ -193,7 +197,7 @@ fn finalizer_with_retryable_deposit_error() -> CexVenueFinalizer<MockCexBackend>
 fn leg_from_preview(preview: VenueRoutePreview) -> VenueLegState {
     VenueLegState {
         leg_id: "mexc-leg-0".to_string(),
-        venue_id: "mexc".to_string(),
+        venue_id: VENUE_ID.to_string(),
         request: preview.request,
         quote: VenueLegQuote {
             pay_amount: ChainTokenAmount::from_raw(pay_token(), preview.quote.pay_amount),
@@ -225,7 +229,7 @@ async fn preview_uses_the_exact_leg_allocation_and_persists_the_route() {
     assert!(preview.conservative_receive.value <= preview.quote.receive_amount);
     let execution = preview
         .initial_execution_state
-        .decode::<CexVenueExecutionState>("mexc")
+        .decode::<CexVenueExecutionState>(VENUE_ID)
         .expect("state should decode")
         .expect("state should be MEXC");
     assert_eq!(execution.cex.size_in, request.pay_amount);
@@ -311,13 +315,64 @@ async fn preview_persists_the_per_leg_receive_address() {
         .expect("MEXC preview should succeed");
     let execution = preview
         .initial_execution_state
-        .decode::<CexVenueExecutionState>("mexc")
+        .decode::<CexVenueExecutionState>(VENUE_ID)
         .expect("state should decode")
         .expect("state should be MEXC");
 
     assert_eq!(
         execution.cex.withdraw.withdraw_address,
         request.receive_address.unwrap()
+    );
+}
+
+/// The exchange checks the route the preview plans, before any funds move.
+#[tokio::test]
+async fn preview_hands_the_exchange_the_planned_route() {
+    let seen = Arc::new(std::sync::Mutex::new(None));
+    let record = seen.clone();
+    let finalizer = finalizer_with_route_check(WithdrawTerms { fee: 0.0, minimum: 0.0 }, move |route| {
+        *record.lock().unwrap() = Some(route.clone());
+        Ok(())
+    });
+    let mut request = request(100_000_000);
+    request.receive_address = Some(Principal::from_slice(&[42]).to_text());
+
+    MultiVenueAdapter::preview(&finalizer, &planning_context(), &request)
+        .await
+        .expect("preview should succeed");
+
+    let route = seen.lock().unwrap().clone().expect("the route was checked");
+    assert_eq!(
+        (route.deposit_asset.as_str(), route.deposit_network.as_str()),
+        ("PAY", "ICP")
+    );
+    assert_eq!(
+        (route.withdraw_asset.as_str(), route.withdraw_network.as_str()),
+        ("RECV", "ICP")
+    );
+    assert_eq!(route.withdraw_address, request.receive_address.unwrap());
+    assert!(
+        route.deposit_amount > 0.0 && route.deposit_amount <= 1.0,
+        "{}",
+        route.deposit_amount
+    );
+}
+
+/// A route the exchange refuses, such as an unverified withdrawal address,
+/// gets no quote, so the planner never sends funds there.
+#[tokio::test]
+async fn preview_fails_when_the_exchange_refuses_the_route() {
+    let finalizer = finalizer_with_route_check(WithdrawTerms { fee: 0.0, minimum: 0.0 }, |_| {
+        Err(FundingRouteError::Unsupported("the address is not verified".into()))
+    });
+
+    let error = MultiVenueAdapter::preview(&finalizer, &planning_context(), &request(100_000_000))
+        .await
+        .expect_err("refused route");
+
+    assert!(
+        error.contains("refused the route") && error.contains("not verified"),
+        "{error}"
     );
 }
 
@@ -400,7 +455,7 @@ async fn first_advance_only_opens_the_parent_persistence_gate() {
         .expect("gate transition should succeed");
     let execution = progress
         .execution
-        .decode::<CexVenueExecutionState>("mexc")
+        .decode::<CexVenueExecutionState>(VENUE_ID)
         .expect("state should decode")
         .expect("state should be MEXC");
 
@@ -967,12 +1022,12 @@ async fn completed_leg_returns_a_result_without_parent_wal_access() {
     let mut leg = leg_from_preview(preview);
     let mut execution = leg
         .execution
-        .decode::<CexVenueExecutionState>("mexc")
+        .decode::<CexVenueExecutionState>(VENUE_ID)
         .expect("state should decode")
         .expect("state should be MEXC");
     execution.cex.step = CexStep::Completed;
     execution.cex.withdraw.size_out = Some(ChainTokenAmount::from_raw(receive_token(), Nat::from(10_000_000u64)));
-    leg.execution = VenueExecutionState::new("mexc", &execution).expect("state should encode");
+    leg.execution = VenueExecutionState::new(VENUE_ID, &execution).expect("state should encode");
 
     let progress = MultiVenueAdapter::advance(&finalizer, &leg, &NoopCheckpoint)
         .await
@@ -1010,18 +1065,18 @@ async fn recover_accepts_each_durable_pending_reconciliation_phase() {
         let mut leg = leg_from_preview(preview);
         let mut execution = leg
             .execution
-            .decode::<CexVenueExecutionState>("mexc")
+            .decode::<CexVenueExecutionState>(VENUE_ID)
             .expect("state should decode")
             .expect("state should be MEXC");
         execution.cex.step = pending_step;
-        leg.execution = VenueExecutionState::new("mexc", &execution).expect("state should encode");
+        leg.execution = VenueExecutionState::new(VENUE_ID, &execution).expect("state should encode");
 
         let progress = MultiVenueAdapter::recover(&finalizer, &leg, &NoopCheckpoint)
             .await
             .expect("pending leg should enter reconciliation");
         let recovered = progress
             .execution
-            .decode::<CexVenueExecutionState>("mexc")
+            .decode::<CexVenueExecutionState>(VENUE_ID)
             .expect("state should decode")
             .expect("state should be MEXC");
 
@@ -1041,11 +1096,11 @@ async fn permanent_cex_error_marks_only_the_mexc_leg_failed() {
     // One unit cannot pay its own ledger fee, so the deposit meets its floor.
     let mut execution = leg
         .execution
-        .decode::<CexVenueExecutionState>("mexc")
+        .decode::<CexVenueExecutionState>(VENUE_ID)
         .expect("state should decode")
         .expect("state should be MEXC");
     execution.cex.size_in = ChainTokenAmount::from_raw(pay_token(), Nat::from(1u8));
-    leg.execution = VenueExecutionState::new("mexc", &execution).expect("encode state");
+    leg.execution = VenueExecutionState::new(VENUE_ID, &execution).expect("encode state");
     leg.request.pay_amount = execution.cex.size_in.clone();
 
     let armed = MultiVenueAdapter::advance(&finalizer, &leg, &NoopCheckpoint)
@@ -1102,7 +1157,7 @@ async fn ordinary_cex_error_remains_retryable_without_operator_intervention() {
     );
     let execution = retryable
         .execution
-        .decode::<CexVenueExecutionState>("mexc")
+        .decode::<CexVenueExecutionState>(VENUE_ID)
         .expect("decode retryable state")
         .expect("MEXC state");
     assert!(!execution.operator_required);
@@ -1182,6 +1237,25 @@ async fn leg_at_trade_step(
         .expect("first cycle should arm the leg");
     leg.execution = armed.execution;
     leg
+}
+
+/// The deposit already left the trader account, so a minimum refusal at the
+/// trade step must not end the leg and drop the funds (review finding 1).
+#[tokio::test]
+async fn a_minimum_refusal_after_the_deposit_keeps_the_leg_open_for_an_operator() {
+    let refusal = "Kraken base volume 1.4 is below order minimum 1.5";
+    let finalizer = finalizer_with_trade_result(Err(CexBackendError::BelowMinimum(refusal.to_string())), 0);
+    let leg = leg_at_trade_step(&finalizer, None).await;
+
+    let progress = MultiVenueAdapter::advance(&finalizer, &leg, &NoopCheckpoint)
+        .await
+        .expect("a refusal with moved funds is leg progress");
+
+    assert_eq!(progress.status, VenueLegStatus::Running);
+    assert_eq!(progress.failure, None);
+    let retryable = progress.retryable_error.expect("the refusal spends the retry budget");
+    assert!(retryable.starts_with(refusal), "{retryable}");
+    assert!(retryable.contains("operator"), "{retryable}");
 }
 
 /// A connect failure never reached MEXC, so it must not be charged to the

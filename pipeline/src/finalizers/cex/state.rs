@@ -43,6 +43,9 @@ pub struct CexDepositState {
     pub deposit_balance_before: Option<f64>,
     #[serde(default)]
     pub deposit_sent_at_ts: Option<i64>,
+    /// When the leg first found the deposit not credited by the exchange.
+    #[serde(default)]
+    pub deposit_credit_since_ts: Option<i64>,
     #[serde(default)]
     pub approval_bump_count: Option<u32>,
     /// The funding transfer, saved before it is sent. Retries and restarts send
@@ -167,12 +170,15 @@ pub struct CexWithdrawState {
     pub withdraw_address: String,
     pub withdraw_id: Option<String>,
     pub withdraw_txid: Option<String>,
-    /// When the exchange accepted a direct withdrawal that had no transaction id yet.
+    /// When the exchange accepted the withdrawal. The delivery wait counts from here.
     #[serde(default)]
     pub withdraw_accepted_at_ts: Option<i64>,
     /// Bumped after each refused request, so a new request gets a new order id.
     #[serde(default)]
     pub withdraw_attempt: u32,
+    /// How often the exchange failed or canceled an accepted withdrawal.
+    #[serde(default)]
+    pub withdraw_failures: u32,
     /// The withdrawal request, saved before it is sent.
     #[serde(default)]
     pub withdraw_send: Option<crate::outbound::driver::OutboundRecord>,
@@ -199,6 +205,10 @@ pub struct CexWithdrawBridgeState {
     pub withdraw_bridge_polled_at_ts: Option<i64>,
     #[serde(default)]
     pub withdraw_bridge_destination_snapshot: Option<String>,
+    /// The provider call that starts the return bridge, saved before it runs.
+    /// A lost answer settles from the provider history, never with a new call.
+    #[serde(default)]
+    pub withdraw_bridge_call: Option<crate::outbound::driver::OutboundRecord>,
     /// The send that funds the return bridge, saved before it is sent.
     #[serde(default)]
     pub withdraw_bridge_funding: Option<crate::outbound::driver::OutboundRecord>,
@@ -265,6 +275,7 @@ impl CexState {
             &mut self.deposit.deposit_funding,
             &mut self.deposit.bridge.deposit_bridge_call,
             &mut self.withdraw.withdraw_send,
+            &mut self.withdraw.bridge.withdraw_bridge_call,
             &mut self.withdraw.bridge.withdraw_bridge_funding,
         ]
         .into_iter()
@@ -285,10 +296,17 @@ impl CexState {
                 self.withdraw.withdraw_id.is_some()
                     && (!bridge.withdraw_bridge_required
                         || bridge.withdraw_bridge_id.is_some()
+                        || bridge.withdraw_bridge_call.is_some()
                         || bridge.deposit_send_started())
             }
             _ => false,
         }
+    }
+
+    /// True once the funding transfer has left the trader account. From then
+    /// on, a minimum refusal cannot end the leg, because the funds are elsewhere.
+    pub fn funds_left_trader_account(&self) -> bool {
+        self.step != CexStep::Deposit || self.deposit.deposit_txid.is_some()
     }
 }
 
@@ -325,6 +343,7 @@ mod tests {
                 deposit_txid: None,
                 deposit_balance_before: None,
                 deposit_sent_at_ts: None,
+                deposit_credit_since_ts: None,
                 approval_bump_count: None,
                 deposit_funding: None,
                 bridge: CexDepositBridgeState {
@@ -375,6 +394,7 @@ mod tests {
                 withdraw_txid: None,
                 withdraw_accepted_at_ts: None,
                 withdraw_attempt: 0,
+                withdraw_failures: 0,
                 withdraw_send: None,
                 size_out: None,
                 bridge: CexWithdrawBridgeState {
@@ -387,6 +407,7 @@ mod tests {
                     withdraw_bridge_polled_at_ts: None,
                     withdraw_bridge_mint_receipt: None,
                     withdraw_bridge_destination_snapshot: None,
+                    withdraw_bridge_call: None,
                     withdraw_bridge_funding: None,
                     withdraw_bridge_send_handle: None,
                     withdraw_bridge_funding_txid: None,

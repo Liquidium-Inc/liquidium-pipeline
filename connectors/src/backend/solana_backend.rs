@@ -226,13 +226,13 @@ impl SolanaBackendImpl {
                 | SendOutcome::BelowMinimum { reason }
                 | SendOutcome::Deferred { reason }
                 | SendOutcome::Reverted { reason } => return Err(TransferFailure::Rejected(reason)),
-                SendOutcome::Open { reason } if Instant::now() >= deadline => {
+                SendOutcome::Open { reason } | SendOutcome::InFlight { reason } if Instant::now() >= deadline => {
                     return Err(TransferFailure::Ambiguous(format!(
                         "solana transaction {} has no decided answer: {reason}",
                         tx.signature
                     )));
                 }
-                SendOutcome::Open { .. } => {
+                SendOutcome::Open { .. } | SendOutcome::InFlight { .. } => {
                     tokio::time::sleep(PLAIN_TRANSFER_POLL).await;
                     outcome = self.signed_outcome(&tx).await;
                 }

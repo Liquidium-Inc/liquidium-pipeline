@@ -12,4 +12,8 @@ where
     fn resolve_bridge_source_address(&self, source_chain: &str) -> Result<String, String> {
         self.bridge_runtime()?.sources.for_chain(source_chain)
     }
+
+    fn takes_directly(&self, asset: &str) -> bool {
+        self.profile.takes_directly(asset)
+    }
 }

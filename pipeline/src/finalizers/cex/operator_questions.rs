@@ -19,6 +19,8 @@ enum Undecided {
     Withdrawal,
     /// The provider call that bridges the deposit.
     BridgeCall,
+    /// The provider call that starts the return bridge.
+    WithdrawBridgeCall,
     /// The ckSOL notice after a landed send: the minter's deposit id.
     DepositId,
 }
@@ -32,7 +34,7 @@ fn undecided(record: &Option<OutboundRecord>) -> Option<&OutboundRecord> {
 fn send_question(purpose: &str, record: &OutboundRecord, receipt: &str) -> OperatorQuestion {
     OperatorQuestion {
         detail: format!(
-            "did the {purpose} ({} send {}) happen? --landed <{receipt}> | --absent (a new send follows)",
+            "did the {purpose} ({} send {}) happen? --landed <{receipt}> | --absent (once it can no longer land; a new send follows)",
             record.prepared.sender, record.prepared.identity
         ),
     }
@@ -62,6 +64,12 @@ fn open_questions<C: CexBackend>(state: &CexState) -> Vec<(Undecided, OperatorQu
         questions.push((
             Undecided::BridgeCall,
             send_question("deposit bridge call", record, "bridge id"),
+        ));
+    }
+    if let Some(record) = undecided(&state.withdraw.bridge.withdraw_bridge_call) {
+        questions.push((
+            Undecided::WithdrawBridgeCall,
+            send_question("return bridge call", record, "bridge id"),
         ));
     }
     // The minter answers a lost notice only with `ValueTooSmall` once it has
@@ -119,6 +127,7 @@ impl<C: CexBackend> CexVenueFinalizer<C> {
             Undecided::BridgeFunding => &mut state.withdraw.bridge.withdraw_bridge_funding,
             Undecided::Withdrawal => &mut state.withdraw.withdraw_send,
             Undecided::BridgeCall => &mut state.deposit.bridge.deposit_bridge_call,
+            Undecided::WithdrawBridgeCall => &mut state.withdraw.bridge.withdraw_bridge_call,
             Undecided::DepositId => return record_deposit_id(state, answer),
         };
         // The next run asks the chain or the exchange first, so the decision is used

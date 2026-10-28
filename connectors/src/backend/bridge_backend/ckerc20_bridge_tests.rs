@@ -12,8 +12,9 @@ use crate::backend::{
 use crate::pipeline_agent::MockPipelineAgent;
 
 use super::{
-    BridgeError, CkErc20BridgeBackend, CkEthMinterInfo, Eip1559TransactionPrice, MIN_ETH_FORWARD_GAS_RESERVE_WEI,
-    MockBridgeEvmBackend, WithdrawErc20Ret, WithdrawalRet, destination_to_bytes32, ensure_source_matches_bridge_owner,
+    BridgeError, CkErc20BridgeBackend, CkEthMinterInfo, ERC20_APPROVE_GAS_LIMIT, ETH_FORWARD_HELPER_GAS_LIMIT,
+    Eip1559TransactionPrice, LedgerError, MIN_ETH_FORWARD_GAS_RESERVE_WEI, MockBridgeEvmBackend, WithdrawErc20Error,
+    WithdrawErc20Ret, WithdrawalError, WithdrawalRet, destination_to_bytes32, ensure_source_matches_bridge_owner,
     ensure_source_matches_signer, eth_forward_gas_reserve_from_price, parse_source_icp_account,
     resolve_cketh_route_for_request,
 };
@@ -478,7 +479,7 @@ async fn forward_bridge_approves_when_allowance_is_insufficient() {
         .expect_erc20_allowance_of()
         .with(eq(token), eq(signer), eq(helper))
         .times(1)
-        .returning(|_, _, _| Ok(U256::from(999_999u64)));
+        .returning(|_, _, _| Ok(U256::ZERO));
     mock_evm
         .expect_erc20_approve_and_wait()
         .with(eq(token), eq(helper), eq(amount_base_units))
@@ -503,6 +504,102 @@ async fn forward_bridge_approves_when_allowance_is_insufficient() {
     let backend = CkErc20BridgeBackend::new(
         Arc::new(mock_agent),
         Arc::new(mock_icp),
+        Arc::new(mock_evm),
+        Principal::management_canister(),
+        Principal::management_canister(),
+    );
+
+    let request = BridgeRequest {
+        asset: "USDC".to_string(),
+        source_chain: "ETH".to_string(),
+        source_address: signer.to_string(),
+        target_asset: "ckUSDC".to_string(),
+        destination: BridgeDestination::IcpAccount(Account {
+            owner: Principal::management_canister(),
+            subaccount: None,
+        }),
+        amount: 1.0,
+        provider_fee_budget_native_units: None,
+    };
+
+    let submission = backend.submit_bridge(request).await.expect("bridge must submit");
+    assert!(submission.bridge_id.starts_with(&format!("ckmint:42:{tx_hash:#x}:")));
+}
+
+/// USDT reverts an approve that changes one non-zero allowance to another, so
+/// a leftover allowance from an earlier attempt goes to zero first.
+#[tokio::test]
+async fn forward_bridge_clears_a_leftover_allowance_before_it_approves() {
+    let signer = "0x1111111111111111111111111111111111111111"
+        .parse::<Address>()
+        .expect("address");
+    let helper = "0x2222222222222222222222222222222222222222"
+        .parse::<Address>()
+        .expect("address");
+    let token = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"
+        .parse::<Address>()
+        .expect("address");
+    let amount_base_units = U256::from(1_000_000u64);
+    let tx_hash = TxHash::from([0x23u8; 32]);
+
+    let mut mock_agent = MockPipelineAgent::new();
+    expect_event_boundary(&mut mock_agent);
+    mock_agent
+        .expect_call_query::<CkEthMinterInfo>()
+        .times(1)
+        .returning(move |_, _, _| {
+            Ok(CkEthMinterInfo {
+                deposit_with_subaccount_helper_contract_address: None,
+                eth_helper_contract_address: None,
+                erc20_helper_contract_address: Some(helper.to_string()),
+                cketh_ledger_id: None,
+                minimum_withdrawal_amount: None,
+            })
+        });
+
+    let mut mock_evm = idle_wallet();
+    fund_gas(&mut mock_evm);
+    mock_evm.expect_signer_address().times(1).returning(move || signer);
+    mock_evm
+        .expect_erc20_decimals_of()
+        .with(eq(token))
+        .times(1)
+        .returning(|_| Ok(6));
+    mock_evm
+        .expect_erc20_balance_of()
+        .with(eq(token), eq(signer))
+        .times(1)
+        .returning(|_, _| Ok(U256::from(1_000_000u64)));
+    mock_evm
+        .expect_erc20_allowance_of()
+        .with(eq(token), eq(signer), eq(helper))
+        .times(1)
+        .returning(|_, _, _| Ok(U256::from(400_000u64)));
+    let mut approves = mockall::Sequence::new();
+    mock_evm
+        .expect_erc20_approve_and_wait()
+        .with(eq(token), eq(helper), eq(U256::ZERO))
+        .times(1)
+        .in_sequence(&mut approves)
+        .returning(|_, _, _| Ok(TxHash::from([0x34u8; 32])));
+    mock_evm
+        .expect_erc20_approve_and_wait()
+        .with(eq(token), eq(helper), eq(amount_base_units))
+        .times(1)
+        .in_sequence(&mut approves)
+        .returning(|_, _, _| Ok(TxHash::from([0x35u8; 32])));
+    mock_evm
+        .expect_sign_helper_deposit_native()
+        .times(1)
+        .returning(move |_, _, _, _| Ok(signed(tx_hash)));
+    mock_evm
+        .expect_broadcast()
+        .times(1)
+        .returning(|_| crate::backend::evm_backend::Broadcast::Sent);
+
+    let backend = CkErc20BridgeBackend::new(
+        Arc::new(mock_agent),
+        Arc::new(MockIcpBackend::new()),
         Arc::new(mock_evm),
         Principal::management_canister(),
         Principal::management_canister(),
@@ -2085,6 +2182,7 @@ async fn a_usdc_return_waits_while_the_wallet_cannot_pay_its_gas() {
     mock_evm
         .expect_native_balance_of()
         .returning(|_| Ok(U256::from(1_000u64)));
+    mock_evm.expect_erc20_allowance_of().returning(|_, _, _| Ok(U256::ZERO));
     mock_evm.expect_erc20_approve_and_wait().times(0);
     mock_evm.expect_sign_helper_deposit_native().times(0);
     let backend = CkErc20BridgeBackend::new(
@@ -2111,4 +2209,104 @@ async fn a_usdc_return_waits_while_the_wallet_cannot_pay_its_gas() {
         .await
         .expect_err("a wallet short on gas must not approve or sign");
     assert!(matches!(error, BridgeError::Deferred(_)), "{error}");
+}
+
+/// Gas for one approve is not enough when a leftover allowance needs a second one.
+#[tokio::test]
+async fn a_leftover_allowance_waits_for_the_gas_of_both_approves() {
+    let signer = "0x1111111111111111111111111111111111111111"
+        .parse::<Address>()
+        .expect("address");
+    let helper = "0x2222222222222222222222222222222222222222"
+        .parse::<Address>()
+        .expect("address");
+    let mut mock_agent = MockPipelineAgent::new();
+    mock_agent
+        .expect_call_query::<CkEthMinterInfo>()
+        .returning(move |_, _, _| {
+            Ok(CkEthMinterInfo {
+                deposit_with_subaccount_helper_contract_address: None,
+                eth_helper_contract_address: None,
+                erc20_helper_contract_address: Some(helper.to_string()),
+                cketh_ledger_id: None,
+                minimum_withdrawal_amount: None,
+            })
+        });
+    let gas_price = 1_000_000_000u128;
+    let one_approve_gas = ETH_FORWARD_HELPER_GAS_LIMIT + u128::from(ERC20_APPROVE_GAS_LIMIT);
+    let mut mock_evm = idle_wallet();
+    mock_evm.expect_signer_address().returning(move || signer);
+    mock_evm.expect_erc20_decimals_of().returning(|_| Ok(6));
+    mock_evm
+        .expect_erc20_balance_of()
+        .returning(|_, _| Ok(U256::from(1_000_000u64)));
+    mock_evm
+        .expect_erc20_allowance_of()
+        .returning(|_, _, _| Ok(U256::from(400_000u64)));
+    mock_evm.expect_gas_price_wei().returning(move || Ok(gas_price));
+    mock_evm
+        .expect_native_balance_of()
+        .returning(move |_| Ok(U256::from(gas_price * one_approve_gas)));
+    mock_evm.expect_erc20_approve_and_wait().times(0);
+    mock_evm.expect_sign_helper_deposit_native().times(0);
+    let backend = CkErc20BridgeBackend::new(
+        Arc::new(mock_agent),
+        Arc::new(MockIcpBackend::new()),
+        Arc::new(mock_evm),
+        Principal::management_canister(),
+        Principal::management_canister(),
+    );
+
+    let error = backend
+        .submit_bridge(BridgeRequest {
+            asset: "USDC".to_string(),
+            source_chain: "ETH".to_string(),
+            source_address: signer.to_string(),
+            target_asset: "ckUSDC".to_string(),
+            destination: BridgeDestination::IcpAccount(Account {
+                owner: Principal::management_canister(),
+                subaccount: None,
+            }),
+            amount: 1.0,
+            provider_fee_budget_native_units: None,
+        })
+        .await
+        .expect_err("a wallet short of the second approve's gas must not approve");
+    assert!(matches!(error, BridgeError::Deferred(_)), "{error}");
+}
+
+/// Review finding 11: a certified minter refusal moved nothing, but it read
+/// as "may have run" and parked the leg.
+#[test]
+fn minter_refusals_keep_their_kind() {
+    assert!(matches!(
+        BridgeError::from(WithdrawErc20Error::TemporarilyUnavailable("busy".into())),
+        BridgeError::Deferred(_)
+    ));
+    assert!(matches!(
+        BridgeError::from(WithdrawErc20Error::RecipientAddressBlocked { address: "0x1".into() }),
+        BridgeError::Refused(_)
+    ));
+    assert!(matches!(
+        BridgeError::from(WithdrawErc20Error::CkErc20LedgerError {
+            error: LedgerError::AmountTooLow {
+                minimum_burn_amount: Nat::from(10u8),
+                token_symbol: "ckUSDC".into(),
+                ledger_id: Principal::anonymous(),
+                failed_burn_amount: Nat::from(1u8),
+            },
+            cketh_block_index: Nat::from(3u8),
+        }),
+        BridgeError::BelowMinimum(_)
+    ));
+    assert!(matches!(
+        BridgeError::from(WithdrawalError::InsufficientFunds {
+            balance: Nat::from(0u8)
+        }),
+        BridgeError::Refused(_)
+    ));
+    assert!(matches!(
+        BridgeError::from(WithdrawalError::TemporarilyUnavailable("busy".into())),
+        BridgeError::Deferred(_)
+    ));
 }

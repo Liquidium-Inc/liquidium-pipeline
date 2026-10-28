@@ -1,62 +1,8 @@
-//! `CexBackend` for MEXC: quotes, swaps, balances, deposits and withdrawals.
+//! `CexBackend` for MEXC: orders, balances, deposits and withdrawals.
 use super::*;
 
 #[async_trait]
 impl CexBackend for MexcClient {
-    async fn get_quote(&self, market: &str, amount_in: f64) -> Result<f64, String> {
-        let ex = self.inner.lock().await;
-
-        let symbol = normalize_market_symbol(market);
-        let ob = ex
-            .depth(DepthParams {
-                limit: None,
-                symbol: &symbol,
-            })
-            .await
-            .map_err(|e| e.to_string())?;
-
-        // asks: Vec<Vec<f64>> = [ [price, qty], ... ]
-        let asks = &ob.asks;
-
-        if asks.is_empty() {
-            return Err("no asks".into());
-        }
-
-        let mut remaining =
-            Decimal::from_f64_retain(amount_in).ok_or_else(|| "could not convert amount to Decimal".to_string())?;
-        let mut cost = Decimal::ZERO;
-
-        for level in asks {
-            let price = level.price;
-            let qty = level.quantity;
-
-            if remaining <= Decimal::ZERO {
-                break;
-            }
-
-            let take = qty.min(remaining);
-            cost += take * price;
-            remaining -= take;
-        }
-
-        if remaining > Decimal::ZERO {
-            return Err("not enough liquidity".into());
-        }
-
-        cost.to_f64().ok_or("f64 conversion failed".to_string())
-    }
-
-    async fn execute_swap(&self, market: &str, side: &str, amount_in: f64) -> Result<f64, String> {
-        let report = self.execute_swap_detailed(market, side, amount_in).await?;
-        Ok(report.output_received)
-    }
-
-    async fn execute_swap_detailed(&self, market: &str, side: &str, amount_in: f64) -> Result<SwapFillReport, String> {
-        self.execute_swap_detailed_with_options(market, side, amount_in, SwapExecutionOptions::default())
-            .await
-            .map_err(|error| error.to_string())
-    }
-
     async fn execute_swap_detailed_with_options(
         &self,
         market: &str,
@@ -109,23 +55,27 @@ impl CexBackend for MexcClient {
             quantity,
             quote_order_quantity,
         });
-        // An IOC order that cannot be built here goes out as the market order.
-        let ioc_order = options.price_limit.as_ref().and_then(|limit| {
-            let built = Self::ioc_limit_price(&side_norm, limit, filters.as_ref()).and_then(|price| {
-                let quantity = match order_side {
-                    OrderSide::Sell => market_order
-                        .as_ref()
-                        .map_err(Clone::clone)?
-                        .quantity
-                        .ok_or("sell order has no quantity")?,
-                    OrderSide::Buy => Self::ioc_buy_quantity(amount_dec, price, filters.as_ref(), &symbol)?,
-                };
-                Ok(IocOrder { quantity, price })
-            });
-            built
-                .inspect_err(|error| warn!("[mexc] no IOC order for {market} {side} ({error}); sending a market order"))
-                .ok()
-        });
+        // A price limit is never dropped: an IOC order that cannot be built here
+        // sends nothing. Only MEXC's own refusal of the IOC type allows a market order.
+        let ioc_order = options
+            .price_limit
+            .as_ref()
+            .map(|limit| {
+                Self::ioc_limit_price(&side_norm, limit, filters.as_ref())
+                    .and_then(|price| {
+                        let quantity = match order_side {
+                            OrderSide::Sell => market_order
+                                .as_ref()
+                                .map_err(Clone::clone)?
+                                .quantity
+                                .ok_or("sell order has no quantity")?,
+                            OrderSide::Buy => Self::ioc_buy_quantity(amount_dec, price, filters.as_ref(), &symbol)?,
+                        };
+                        Ok(IocOrder { quantity, price })
+                    })
+                    .map_err(|error| format!("no IOC order for {market} {side}: {error}"))
+            })
+            .transpose()?;
         let market_order = match (market_order, ioc_order) {
             (Ok(order), _) => Some(order),
             (Err(error), Some(_)) => {
@@ -327,6 +277,12 @@ impl CexBackend for MexcClient {
         find_withdraw_terms(&self.coin_config().await?, asset, network)
     }
 
+    /// MEXC publishes no deposit minimum and keeps no withdrawal address list
+    /// for this account, so it has nothing to refuse here.
+    async fn check_funding_route(&self, _route: &FundingRoute) -> Result<(), FundingRouteError> {
+        Ok(())
+    }
+
     async fn get_balance(&self, asset: &str) -> Result<f64, String> {
         let ex = self.inner.lock().await;
 
@@ -445,11 +401,6 @@ impl CexBackend for MexcClient {
             txid: None,
             internal_id: Some(res.id),
         })
-    }
-
-    async fn get_withdraw_status_by_id(&self, coin: &str, withdraw_id: &str) -> Result<WithdrawStatus, String> {
-        let snapshot = self.get_withdraw_status_snapshot_by_id(coin, withdraw_id).await?;
-        Ok(snapshot.status)
     }
 
     async fn get_withdraw_status_snapshot_by_id(

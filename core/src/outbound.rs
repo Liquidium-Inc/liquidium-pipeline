@@ -26,6 +26,9 @@ pub enum SendOutcome {
     Reverted { reason: String },
     /// No decided answer yet.
     Open { reason: String },
+    /// The chain holds the send, and it can still land. Only the chain can
+    /// decide it, so an operator's answer waits until it can no longer land.
+    InFlight { reason: String },
 }
 
 /// The funds to move.

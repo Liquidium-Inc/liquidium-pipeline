@@ -1,6 +1,7 @@
 //! The exchange withdrawal request: its order id, the saved send, and the
 //! below-minimum dust completion.
 use super::*;
+use liquidium_pipeline_connectors::backend::cex_backend::WithdrawStatusSnapshot;
 
 /// The withdrawal order id for one withdrawal attempt of a row (MEXC `withdrawOrderId`).
 pub fn withdraw_order_id(liq_id: &str, attempt: u32) -> String {
@@ -40,7 +41,7 @@ where
             state.send_saved = true;
             return Ok(None);
         }
-        let sender = CexWithdrawals::new(self.backend.clone());
+        let sender = CexWithdrawals::new(self.backend.clone(), self.profile.name());
         match step_outbound(&mut state.withdraw.withdraw_send, &sender, None, now_ts()).await {
             Ok(landed) => Ok(landed.as_deref().map(AcceptedWithdrawal::parse)),
             Err(OutboundError::BelowMinimum(error)) => {
@@ -153,6 +154,44 @@ where
         Ok(())
     }
 
+    /// The exchange ended an accepted withdrawal without sending it, so the funds
+    /// are back on its balance. Past the bound the error stays, and the retry budget parks the row.
+    pub(in crate::finalizers::cex) fn resubmit_failed_withdrawal(
+        state: &mut CexState,
+        withdraw_id: &str,
+        snapshot: &WithdrawStatusSnapshot,
+    ) -> Result<(), String> {
+        let ended = format!(
+            "cex withdraw {:?} for liq_id {} withdraw_id={withdraw_id}",
+            snapshot.status, state.liq_id
+        );
+        // A transaction id means a send went out, so a new request could pay twice.
+        if let Some(txid) = snapshot.txid.as_deref().filter(|tx| !tx.trim().is_empty()) {
+            return Err(format!(
+                "{ended} with txid={txid}; the send may still land, so no new request"
+            ));
+        }
+        let withdraw = &mut state.withdraw;
+        if withdraw.withdraw_failures >= MAX_FAILED_WITHDRAWAL_RESUBMITS {
+            return Err(format!(
+                "{ended}; after {} failed withdrawals the funds stay on the exchange for an operator",
+                withdraw.withdraw_failures + 1
+            ));
+        }
+        withdraw.withdraw_failures += 1;
+        // A new order id, so the exchange cannot answer with the failed request.
+        withdraw.withdraw_attempt += 1;
+        withdraw.withdraw_id = None;
+        withdraw.withdraw_txid = None;
+        withdraw.withdraw_accepted_at_ts = None;
+        warn!(
+            "[cex] {ended}; requesting it again ({}/{MAX_FAILED_WITHDRAWAL_RESUBMITS})",
+            withdraw.withdraw_failures
+        );
+        state.step = CexStep::Withdraw;
+        Ok(())
+    }
+
     /// Reads the delivery of an accepted withdrawal. The leg completes only
     /// with a transaction id, and parks if delivery never arrives.
     async fn poll_direct_withdraw(
@@ -170,10 +209,7 @@ where
             .await?;
         match snapshot.status {
             WithdrawStatus::Failed | WithdrawStatus::Canceled => {
-                return Err(format!(
-                    "cex withdraw failed for liq_id {} withdraw_id={withdraw_id}",
-                    state.liq_id
-                ));
+                Self::resubmit_failed_withdrawal(state, withdraw_id, &snapshot)?;
             }
             WithdrawStatus::Completed if snapshot.txid.as_ref().is_some_and(|tx| !tx.trim().is_empty()) => {
                 if let Some(fee) = snapshot.transaction_fee {
@@ -188,10 +224,8 @@ where
                 state.step = CexStep::Completed;
             }
             _ => {
-                // Rows accepted before this clock existed start it now.
-                let accepted_at = *state.withdraw.withdraw_accepted_at_ts.get_or_insert_with(now_ts);
-                let waited = now_ts().saturating_sub(accepted_at);
-                if waited > DIRECT_WITHDRAW_DELIVERY_TIMEOUT_SECS {
+                let waited = waited_secs(&mut state.withdraw.withdraw_accepted_at_ts);
+                if waited > WITHDRAW_DELIVERY_TIMEOUT_SECS {
                     return Err(format!(
                         "cex withdraw not delivered after {waited}s for liq_id {} withdraw_id={withdraw_id} status={:?}",
                         state.liq_id, snapshot.status

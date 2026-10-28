@@ -11,6 +11,7 @@ use super::finalizer::{
     BRIDGE_FEE_TOKEN_CHAIN, BRIDGE_FEE_TOKEN_SYMBOL, CKETH_DECIMALS, CexVenueFinalizer,
     WITHDRAW_BRIDGE_SOURCE_BALANCE_TOLERANCE,
 };
+use super::utils::waited_secs;
 use crate::{
     bridge::{
         call_sender::{BridgeCall, BridgeCallSender, prepare_bridge_call},
@@ -25,6 +26,10 @@ use crate::{
     stages::bridge_submit_lock::acquire_bridge_submit_lock,
     utils::now_ts,
 };
+
+/// Funds in the bridge account must start their deposit bridge within this time.
+/// After it, each waiting cycle errors, so the row parks for an operator.
+const BRIDGE_START_TIMEOUT_SECS: i64 = 60 * 60;
 
 /// What one cycle of a bridged deposit works with besides the state. Resolved
 /// once, so the phase methods read like the state machine they are.
@@ -156,10 +161,23 @@ where
             // funds again and saves a new call.
             Err(OutboundError::Deferred(error)) => {
                 info!("[cex] liq_id={} bridged deposit deferred: {}", state.liq_id, error);
-                Ok(())
+                Ok(Self::wait_before_deposit_bridge(state, &error)?)
             }
             Err(error) => Err(error.into()),
         }
+    }
+
+    /// A wait before the deposit bridge starts, after the funding transfer landed.
+    /// Past the bound it errors, so the row parks with an alert.
+    fn wait_before_deposit_bridge(state: &mut CexState, reason: &str) -> Result<(), String> {
+        let waited = waited_secs(&mut state.deposit.deposit_sent_at_ts);
+        if waited > BRIDGE_START_TIMEOUT_SECS {
+            return Err(format!(
+                "bridged deposit for liq_id {} still waits after {waited}s: {reason}",
+                state.liq_id
+            ));
+        }
+        Ok(())
     }
 
     /// Checks funding and, when it is present, saves the provider call with
@@ -193,7 +211,7 @@ where
             .funding(&state.liq_id, requested, &fee_budget, provider_fee.as_ref())
             .await?
         else {
-            return Ok(());
+            return Self::wait_before_deposit_bridge(state, "the bridge account or its ckETH fee balance is short");
         };
 
         let mut call = BridgeCall {

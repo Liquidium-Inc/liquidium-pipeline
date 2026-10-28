@@ -14,7 +14,8 @@ use liquidium_pipeline_connectors::backend::bridge_backend::{
 use liquidium_pipeline_connectors::outbound::UnsettledSender;
 use liquidium_pipeline_core::outbound::{OutboundIntent, OutboundSender};
 use liquidium_pipeline_connectors::backend::cex_backend::{
-    BuyOrderInputMode, CexBackend, CexBackendError, OrderBookLevel, PriceLimit, SwapExecutionOptions, WithdrawStatus,
+    BuyOrderInputMode, CexBackend, CexBackendError, OrderBook, OrderBookLevel, PriceLimit, SwapExecutionOptions,
+    WithdrawStatus,
 };
 use liquidium_pipeline_core::{
     account::model::ChainAccount,
@@ -26,7 +27,7 @@ use tokio::sync::Mutex as TokioMutex;
 use tokio::time::sleep;
 
 use super::profile::CexVenueProfile;
-use super::utils::{LIQUIDITY_EPS, SlicePreview, TradeLeg, is_usd_stable_symbol};
+use super::utils::{LIQUIDITY_EPS, SlicePreview, TradeLeg, is_usd_stable_symbol, waited_secs};
 use liquidium_pipeline_connectors::outbound::{AcceptedWithdrawal, CexWithdrawals, WithdrawRequest, prepare_cex_withdraw};
 
 pub(super) const WITHDRAW_BRIDGE_SOURCE_BALANCE_TOLERANCE: f64 = LIQUIDITY_EPS;
@@ -34,9 +35,9 @@ const NATIVE_ETH_BRIDGEABLE_SAFETY_MARGIN: f64 = 1e-15;
 pub(super) const BRIDGE_FEE_TOKEN_SYMBOL: &str = "ckETH";
 pub(super) const BRIDGE_FEE_TOKEN_CHAIN: &str = "ICP";
 pub(super) const CKETH_DECIMALS: u8 = 18;
-/// A direct withdrawal that the exchange accepted but never reports as delivered
-/// must not wait forever. After this long the row parks for an operator.
-const DIRECT_WITHDRAW_DELIVERY_TIMEOUT_SECS: i64 = 60 * 60;
+/// An accepted exchange withdrawal must reach its address, or the return bridge,
+/// within this time. After it, each waiting cycle errors, so the row parks for an operator.
+const WITHDRAW_DELIVERY_TIMEOUT_SECS: i64 = 60 * 60;
 /// How long a landed bridge deposit may wait for the provider to accept it.
 /// The ckSOL minter reads it at finalized commitment, which takes seconds.
 const DEPOSIT_NOTICE_WINDOW_SECS: i64 = 30 * 60;
@@ -44,6 +45,8 @@ const DEPOSIT_NOTICE_WINDOW_SECS: i64 = 30 * 60;
 const BRIDGE_CREDIT_STALL_SECS: i64 = 40 * 60;
 /// How often a reverted return-bridge send is made again. Each one costs gas.
 const MAX_REVERTED_BRIDGE_RESUBMITS: u32 = 2;
+/// How often a withdrawal the exchange failed or canceled is requested again.
+const MAX_FAILED_WITHDRAWAL_RESUBMITS: u32 = 2;
 const SOL_FINALITY_SECS: i64 = 20;
 
 use crate::{
@@ -76,6 +79,9 @@ where
     pub(super) outbound: Arc<dyn OutboundSender>,
     pub liquidator_principal: Principal,
     pub max_sell_slippage_bps: f64,
+    /// The widest IOC limit after orders at the cap fill nothing. Equal to the
+    /// cap, it turns widening off.
+    pub max_widened_slippage_bps: f64,
     /// Minimum USD notional allowed for any CEX execution slice.
     pub cex_min_exec_usd: f64,
     /// Target fraction of slippage cap used for per-slice sizing.
@@ -124,13 +130,13 @@ const BRIDGED_DEPOSIT_FEE_COUNT: u8 = 1;
 const APPROVE_BUMP_BATCH_SIZE: u8 = 3;
 const APPROVE_BUMP_DELAY_MS: u64 = 300;
 const APPROVE_BUMP_BATCH_DELAY_SECS: u64 = 3;
-#[allow(dead_code)]
+#[cfg(test)]
 const DEFAULT_BUY_TRUNCATION_TRIGGER_RATIO: f64 = 0.25;
-#[allow(dead_code)]
+#[cfg(test)]
 const DEFAULT_BUY_INVERSE_OVERSPEND_BPS: u32 = 10;
-#[allow(dead_code)]
+#[cfg(test)]
 const DEFAULT_BUY_INVERSE_MAX_RETRIES: u32 = 1;
-#[allow(dead_code)]
+#[cfg(test)]
 const DEFAULT_BUY_INVERSE_ENABLED: bool = true;
 const DEFAULT_MAX_HOPS: usize = 2;
 const MAX_HOPS_CAP: usize = 4;
@@ -164,6 +170,12 @@ where
 
     pub fn with_token_registry(mut self, token_registry: Arc<dyn TokenRegistryTrait>) -> Self {
         self.token_registry = Some(token_registry);
+        self
+    }
+
+    /// A maximum below the cap leaves the cap in force.
+    pub fn with_widened_slippage_cap(mut self, max_widened_slippage_bps: f64) -> Self {
+        self.max_widened_slippage_bps = max_widened_slippage_bps.max(self.max_sell_slippage_bps);
         self
     }
 
@@ -219,6 +231,7 @@ where
             transfer_service,
             liquidator_principal,
             max_sell_slippage_bps,
+            max_widened_slippage_bps: max_sell_slippage_bps,
             cex_min_exec_usd,
             cex_slice_target_ratio,
             cex_buy_truncation_trigger_ratio,
@@ -506,4 +519,4 @@ where
 
 #[cfg(test)]
 #[path = "tests/mod.rs"]
-mod tests;
+pub(super) mod tests;

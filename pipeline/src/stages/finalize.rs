@@ -33,6 +33,9 @@ pub(crate) const MAX_FINALIZER_ATTEMPTS: i32 = 20;
 const NO_ROUTE_SLOW_RETRY_SECS: u64 = 30 * 60;
 /// Maximum safe left-shift for `u64` multipliers in retry backoff.
 const MAX_U64_SHIFT: u32 = 63;
+/// The batch starts no new row after this, well inside the worker's 300 s stage
+/// timeout, which would drop the outcomes of rows already finished.
+const BATCH_TIME_BUDGET: std::time::Duration = std::time::Duration::from_secs(180);
 
 /// Why a row was parked for an operator while a venue leg may still hold its funds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -281,10 +284,8 @@ where
             .as_ref()
             .ok_or_else(|| "missing liquidation_result in receipt".to_string())?;
         let liq_id = liq.id;
-        // A row whose collateral settled at once comes straight here, so this
-        // read is the only one that can see its pending change land.
-        let change_pending = matches!(liq.change_tx.status, TransferStatus::Pending);
-        if !matches!(liq.collateral_tx.status, TransferStatus::Success) || change_pending {
+        let refreshed = !matches!(liq.collateral_tx.status, TransferStatus::Success);
+        if refreshed {
             self.refresh_liquidation(&row.id, liq_id, &mut receipt).await;
         }
 
@@ -313,6 +314,8 @@ where
         );
 
         if receipt.request.swap_args.is_none() {
+            self.refresh_pending_change(&row.id, liq_id, &mut receipt, refreshed)
+                .await;
             let result = FinalizerResult::finished_without_swap(Some("none".to_string()), None);
             let write = wal_mark_succeeded(&*self.wal, &row.id).await;
             return Ok(published(write, liq_id, result, receipt));
@@ -335,12 +338,32 @@ where
         if self.retry_not_due(row, liq_id) {
             return Ok(None);
         }
+        self.refresh_pending_change(&row.id, liq_id, &mut receipt, refreshed)
+            .await;
 
         wal_mark_inflight(&*self.wal, &row.id).await?;
         Ok(match self.run_finalizer(liq_id, &receipt).await {
             Ok(result) => self.handle_result(row, liq_id, result, receipt).await,
             Err(error) => self.handle_error(row, liq_id, error, receipt).await,
         })
+    }
+
+    /// A row whose collateral settled at once is read only here, so this is where
+    /// its pending change can land. It runs only for a row this cycle works.
+    async fn refresh_pending_change(
+        &self,
+        row_id: &str,
+        liq_id: u128,
+        receipt: &mut ExecutionReceipt,
+        refreshed: bool,
+    ) {
+        let change_pending = receipt
+            .liquidation_result
+            .as_ref()
+            .is_some_and(|liq| matches!(liq.change_tx.status, TransferStatus::Pending));
+        if change_pending && !refreshed {
+            self.refresh_liquidation(row_id, liq_id, receipt).await;
+        }
     }
 
     /// Asks the pool again while the collateral transfer is open, and saves a
@@ -442,7 +465,15 @@ where
         error: FinalizerError,
         receipt: ExecutionReceipt,
     ) -> Option<Finished> {
-        let attempt = row.error_count + 1;
+        let mut strikes = row.error_count;
+        // A plan committed in this call drops the route-search strikes, so a
+        // row that would end or park reads its stored count again.
+        if strikes + 1 >= MAX_FINALIZER_ERRORS
+            && let Ok(Some(stored)) = self.wal.get_result(&row.id).await
+        {
+            strikes = stored.error_count;
+        }
+        let attempt = strikes + 1;
         let exhausted = attempt >= MAX_FINALIZER_ERRORS;
         let err_msg = error.message().to_string();
         warn!(
@@ -609,17 +640,28 @@ where
         let rows = self.wal.get_pending(100).await.map_err(|e| e.to_string())?;
         debug!("Finalizing rows {:?}", rows);
 
-        // Each row runs on its own. Outcomes are built after the whole batch.
+        // Each row runs on its own. A row that fails or is not reached stays in
+        // the WAL for the next cycle, and the finished rows keep their outcomes.
+        let started = std::time::Instant::now();
         let mut finished = vec![];
         for (row, receipt) in self.decode_rows(rows).await {
-            if let Some(done) = self.finalize_row(&row, receipt).await? {
-                finished.push((row, done));
+            if started.elapsed() > BATCH_TIME_BUDGET {
+                warn!("[finalize] batch time budget spent; the rest of the batch waits for the next cycle");
+                break;
+            }
+            match self.finalize_row(&row, receipt).await {
+                Ok(Some(done)) => finished.push((row, done)),
+                Ok(None) => {}
+                Err(error) => warn!("[finalize] row {} waits for the next cycle: {error}", row.id),
             }
         }
 
         let mut outcomes = Vec::with_capacity(finished.len());
         for (row, (result, receipt)) in finished {
-            outcomes.push(self.record_outcome(&row, result, receipt).await?);
+            match self.record_outcome(&row, result, receipt).await {
+                Ok(outcome) => outcomes.push(outcome),
+                Err(error) => warn!("[finalize] no outcome for row {}: {error}", row.id),
+            }
         }
         Ok(outcomes)
     }
@@ -931,8 +973,10 @@ mod tests {
         row.error_count = MAX_FINALIZER_ERRORS - 1;
         let row_id = row.id.clone();
         let row_id_for_park = row_id.clone();
+        let stored = row.clone();
 
         let mut wal = MockWalStore::new();
+        wal.expect_get_result().returning(move |_| Ok(Some(stored.clone())));
         wal.expect_get_pending()
             .with(eq(100usize))
             .times(1)
@@ -978,8 +1022,10 @@ mod tests {
         row.error_count = MAX_FINALIZER_ERRORS - 1;
         let row_id = row.id.clone();
         let row_id_for_park = row_id.clone();
+        let stored = row.clone();
 
         let mut wal = MockWalStore::new();
+        wal.expect_get_result().returning(move |_| Ok(Some(stored.clone())));
         wal.expect_get_pending()
             .with(eq(100usize))
             .times(1)
@@ -1069,8 +1115,10 @@ mod tests {
         row.error_count = MAX_FINALIZER_ERRORS - 1;
         let row_id = row.id.clone();
         let row_id_for_retry = row_id.clone();
+        let stored = row.clone();
 
         let mut wal = MockWalStore::new();
+        wal.expect_get_result().returning(move |_| Ok(Some(stored.clone())));
         wal.expect_get_pending()
             .with(eq(100usize))
             .times(1)
@@ -1133,6 +1181,50 @@ mod tests {
 
     /// Audit L18: an outcome is published only after its terminal status is
     /// durable. A failed write leaves the row to run again.
+    /// Review finding 30: a later row's failed claim ended the batch, and the
+    /// row finished before it lost its outcome for good.
+    #[tokio::test]
+    async fn a_later_row_that_fails_keeps_the_outcome_of_a_finished_row() {
+        let finished = make_row(930u128, make_swapping_receipt(930u128));
+        let blocked = make_row(931u128, make_swapping_receipt(931u128));
+        let finished_for_profit = finished.clone();
+        let (finished_id, blocked_id) = (finished.id.clone(), blocked.id.clone());
+        let finished_id_for_success = finished_id.clone();
+
+        let mut wal = MockWalStore::new();
+        wal.expect_get_pending()
+            .times(1)
+            .return_once(move |_| Ok(vec![finished, blocked]));
+        wal.expect_update_status()
+            .withf(move |id, status, _| id == finished_id && *status == ResultStatus::InFlight)
+            .times(1)
+            .returning(|_, _, _| Ok(()));
+        wal.expect_update_status()
+            .withf(move |id, status, _| id == finished_id_for_success && *status == ResultStatus::Succeeded)
+            .times(1)
+            .returning(|_, _, _| Ok(()));
+        wal.expect_update_status()
+            .withf(move |id, status, _| id == blocked_id && *status == ResultStatus::InFlight)
+            .times(1)
+            .returning(|_, _, _| Err(anyhow::anyhow!("database locked")));
+        wal.expect_get_result()
+            .returning(move |_| Ok(Some(finished_for_profit.clone())));
+        wal.expect_upsert_result().returning(|_| Ok(()));
+        let stage = test_stage(
+            wal,
+            NoopFinalizer {
+                calls: Arc::new(Mutex::new(0usize)),
+            },
+        );
+
+        let outcomes = stage
+            .process(&())
+            .await
+            .expect("one row's failure is not a batch error");
+
+        assert_eq!(outcomes.len(), 1);
+    }
+
     #[tokio::test]
     async fn failed_terminal_write_publishes_no_outcome() {
         let liq_id = 928u128;

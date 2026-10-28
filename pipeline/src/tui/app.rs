@@ -353,6 +353,18 @@ impl App {
         rows.get(self.executions_selected).or_else(|| rows.first())
     }
 
+    /// Replaces the execution rows. The selection follows its row, so a new row
+    /// above it cannot put another row under the cursor.
+    pub(super) fn set_executions(&mut self, snapshot: ExecutionsSnapshot) {
+        let selected = self.selected_execution().map(|row| row.liq_id.clone());
+        let last = snapshot.rows.len().saturating_sub(1);
+        self.executions_selected = selected
+            .and_then(|liq_id| snapshot.rows.iter().position(|row| row.liq_id == liq_id))
+            .unwrap_or(self.executions_selected.min(last));
+        self.executions = Some(snapshot);
+        self.executions_error = None;
+    }
+
     pub(super) fn push_log(&mut self, line: impl Into<String>) {
         self.append_logs(vec![line.into()]);
     }
@@ -538,6 +550,36 @@ mod tests {
 
         assert_eq!(counts.unresumable, 1);
         assert_eq!(counts.total, 3);
+    }
+
+    /// Review finding 33: a new row above the selection put another row under
+    /// the cursor, and `o` opened that row.
+    #[test]
+    fn the_selection_follows_its_row_when_the_list_changes() {
+        let row = |liq_id: &str| super::ExecutionRowData {
+            liq_id: liq_id.to_string(),
+            status: ResultStatus::OperatorRequired,
+            attempt: 0,
+            error_count: 0,
+            last_error: None,
+            created_at: 0,
+            updated_at: 0,
+            meta_json: String::new(),
+        };
+        let snapshot = |ids: &[&str]| super::ExecutionsSnapshot {
+            rows: ids.iter().map(|id| row(id)).collect(),
+            at: chrono::Local::now(),
+        };
+        let mut app = super::test_app();
+        app.set_executions(snapshot(&["p0", "p1"]));
+        app.executions_selected = 1;
+
+        app.set_executions(snapshot(&["new", "p0", "p1"]));
+        assert_eq!(app.selected_execution().map(|row| row.liq_id.as_str()), Some("p1"));
+
+        // A row that left the list keeps the old position, inside the new list.
+        app.set_executions(snapshot(&["new"]));
+        assert_eq!(app.executions_selected, 0);
     }
 
     #[test]

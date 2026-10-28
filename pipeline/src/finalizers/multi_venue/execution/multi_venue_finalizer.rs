@@ -201,6 +201,10 @@ impl MultiVenueFinalizer {
         let input = IcpswapFirstPlanInput::from_receipt(receipt)
             .map_err(|error| FinalizerError::Permanent(error.to_string()))?;
 
+        // A committed plan ends the route search, so its strikes stop counting.
+        // The row is written only when a plan commits below.
+        row.error_count = 0;
+
         // This is the pure routing decision: quote the registered venues and
         // produce the immutable allocation plan plus initialized venue legs.
         // No swap, transfer, or order side effect is submitted by `plan`.

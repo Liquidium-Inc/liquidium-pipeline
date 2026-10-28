@@ -22,9 +22,10 @@ use crate::{
     executors::basic::basic_executor::BasicExecutor,
     bridge::{claims::WalBridgeClaims, runtime::BridgeRuntime},
     finalizers::{
-        mexc::runtime::build_mexc_finalizer,
+        cex::runtime::{build_kraken_finalizer, build_mexc_finalizer},
         multi_venue::{
-            ICPSWAP_VENUE_ID, IcpswapFirstPlannerConfig, MEXC_VENUE_ID, MultiVenueAdapter, MultiVenueFinalizer,
+            ICPSWAP_VENUE_ID, IcpswapFirstPlannerConfig, KRAKEN_VENUE_ID, MEXC_VENUE_ID, MultiVenueAdapter,
+            MultiVenueFinalizer,
         },
         profit_calculator::SimpleProfitCalculator,
     },
@@ -205,8 +206,21 @@ async fn init(
         .recover_submitting_as_ambiguous("process restarted during liquidation submission")
         .await
         .map_err(|e| format!("failed to recover interrupted liquidation intents: {e}"))?;
+    // One watchdog, so its alert cooldown covers every stage.
+    let slack_watchdog = slack_watchdog_from_env(DEFAULT_LOW_BALANCE_ALERT_COOLDOWN);
     if recovered != 0 {
         warn!(recovered, "Parked interrupted liquidation submissions as ambiguous");
+        slack_watchdog
+            .notify(WatchdogEvent::OperatorRequired {
+                execution_id: "restart".to_string(),
+                venue: "protocol".to_string(),
+                pending_step: "liquidation-call-interrupted".to_string(),
+                owner: config.liquidator_principal.to_text(),
+                details: format!(
+                    "a restart interrupted {recovered} liquidation calls; each may have run on chain with no WAL row, so its intent is ambiguous"
+                ),
+            })
+            .await;
     }
 
     let tokens = debt_asset_principals(&registry);
@@ -220,7 +234,8 @@ async fn init(
         config.lending_canister,
         db.clone(),
         ctx.approval_state.clone(),
-    );
+    )
+    .with_watchdog(slack_watchdog.clone());
 
     executor
         .init(&tokens)
@@ -229,12 +244,10 @@ async fn init(
     let executor = Arc::new(executor);
 
     // One bridge for every exchange venue: they share its accounts, so they
-    // must share the registry of handles held on them.
-    let bridge = if config.enabled_swap_venues.iter().any(|venue| venue == MEXC_VENUE_ID) {
-        Some(BridgeRuntime::build(&config, Arc::new(WalBridgeClaims::new(db.clone()))).await?)
-    } else {
-        None
-    };
+    // must share the registry of handles held on them. The first exchange builds it.
+    let bridge = tokio::sync::OnceCell::new();
+    let shared_bridge =
+        || bridge.get_or_try_init(|| BridgeRuntime::build(&config, Arc::new(WalBridgeClaims::new(db.clone()))));
 
     let mut venue_adapters: Vec<Arc<dyn MultiVenueAdapter>> = Vec::new();
     for venue_id in &config.enabled_swap_venues {
@@ -244,13 +257,10 @@ async fn init(
                     .clone()
                     .ok_or_else(|| "ICPSwap is enabled but its adapter was not initialized".to_string())?,
             ),
-            MEXC_VENUE_ID => venue_adapters.push(
-                build_mexc_finalizer(
-                    ctx.as_ref(),
-                    bridge.clone().ok_or_else(|| "MEXC is enabled but the bridge was not built".to_string())?,
-                )
-                .await?,
-            ),
+            MEXC_VENUE_ID => venue_adapters.push(build_mexc_finalizer(ctx.as_ref(), shared_bridge().await?.clone())?),
+            KRAKEN_VENUE_ID => {
+                venue_adapters.push(build_kraken_finalizer(ctx.as_ref(), shared_bridge().await?.clone())?)
+            }
             _ => return Err(format!("unsupported enabled swap venue `{venue_id}`")),
         }
     }
@@ -265,6 +275,7 @@ async fn init(
                 max_price_impact_bps: config.icpswap_max_price_impact_bps,
                 max_search_iterations: config.icpswap_max_search_iterations,
                 dust_fallback_max_price_impact_bps: config.icpswap_dust_fallback_max_price_impact_bps,
+                max_cex_price_impact_bps: config.cex_max_price_impact_bps,
                 cex_min_exec_usd: config.get_cex_min_exec_usd(),
                 min_net_edge_bps: config.multi_venue_min_net_edge_bps,
                 settlement_min_net_edge_bps: config.multi_venue_settlement_min_net_edge_bps,
@@ -274,9 +285,10 @@ async fn init(
                 oracle_snapshot_max_age_secs: config.multi_venue_oracle_snapshot_max_age_secs,
                 cycles_usd_per_trillion: config.cycles_usd_per_trillion,
                 icpswap_test_allocation_usd: config.icpswap_test_allocation_usd,
+                mexc_test_allocation_usd: config.mexc_test_allocation_usd,
             },
         )?
-        .with_watchdog(slack_watchdog_from_env(DEFAULT_LOW_BALANCE_ALERT_COOLDOWN))
+        .with_watchdog(slack_watchdog.clone())
         .with_price_oracle(price_oracle.clone())
         .with_recovery_sweep(ctx.trader_transfers.actions(), config.get_recovery_account()),
     );
@@ -301,7 +313,7 @@ async fn init(
             config.cex_retry_base_secs,
             config.cex_retry_max_secs,
         )
-        .with_watchdog(slack_watchdog_from_env(DEFAULT_LOW_BALANCE_ALERT_COOLDOWN)),
+        .with_watchdog(slack_watchdog.clone()),
     );
 
     info!("Initializing searcher stage ...");

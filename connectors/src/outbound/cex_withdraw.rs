@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 
 pub const NAME: &str = "mexc-withdraw";
 
-/// MEXC lists an accepted request within seconds. A request that stays
+/// An exchange lists an accepted request within seconds. A request that stays
 /// absent for this long needs an operator.
 const OPEN_WINDOW_SECS: i64 = 15 * 60;
 
@@ -26,7 +26,7 @@ pub struct WithdrawRequest {
 /// What the leg keeps from an accepted request.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AcceptedWithdrawal {
-    /// The MEXC id, or our order id when only the history found the request.
+    /// The exchange's id, or our order id when only the history found the request.
     /// The history lookup matches either.
     pub id: String,
     #[serde(default)]
@@ -34,7 +34,7 @@ pub struct AcceptedWithdrawal {
 }
 
 impl AcceptedWithdrawal {
-    /// Reads a receipt. An operator gives a bare MEXC id.
+    /// Reads a receipt. An operator gives a bare exchange id.
     pub fn parse(receipt: &str) -> Self {
         serde_json::from_str(receipt).unwrap_or_else(|_| Self {
             id: receipt.trim().to_string(),
@@ -49,22 +49,24 @@ impl AcceptedWithdrawal {
 
 pub struct CexWithdrawals<B> {
     backend: Arc<B>,
+    /// The exchange's name, for operator-facing messages.
+    venue: &'static str,
 }
 
 impl<B: CexBackend> CexWithdrawals<B> {
-    pub fn new(backend: Arc<B>) -> Self {
-        Self { backend }
+    pub fn new(backend: Arc<B>, venue: &'static str) -> Self {
+        Self { backend, venue }
     }
 }
 
 /// The saved form of a request. The leg builds it from its own state,
-/// because MEXC names the asset and network its own way.
+/// because each exchange names the asset and network its own way.
 pub fn prepare_cex_withdraw(request: &WithdrawRequest) -> Result<PreparedSend, String> {
     Ok(PreparedSend {
         sender: NAME.to_string(),
         identity: request.order_id.clone(),
         payload: super::encode_payload(request)?,
-        // MEXC is not known to refuse a reused order id, so a second
+        // An exchange is not known to refuse a reused order id, so a second
         // request could withdraw the same funds twice.
         replay_safe: false,
     })
@@ -77,7 +79,7 @@ fn saved_request(prepared: &PreparedSend) -> Result<WithdrawRequest, SendOutcome
 #[async_trait]
 impl<B: CexBackend> OutboundSender for CexWithdrawals<B> {
     async fn prepare(&self, _intent: &OutboundIntent) -> Result<PreparedSend, String> {
-        Err("a MEXC withdrawal is prepared from the leg state".to_string())
+        Err(format!("a {} withdrawal is prepared from the leg state", self.venue))
     }
 
     async fn submit(&self, prepared: &PreparedSend) -> SendOutcome {
@@ -130,10 +132,13 @@ impl<B: CexBackend> OutboundSender for CexWithdrawals<B> {
                 .encode(),
             },
             Ok(_) => SendOutcome::Open {
-                reason: format!("order id {} is not in the MEXC withdraw history", request.order_id),
+                reason: format!(
+                    "order id {} is not in the {} withdraw history",
+                    request.order_id, self.venue
+                ),
             },
             Err(error) => SendOutcome::Open {
-                reason: format!("MEXC withdraw history read failed: {error}"),
+                reason: format!("{} withdraw history read failed: {error}", self.venue),
             },
         }
     }
@@ -187,7 +192,7 @@ mod tests {
         for (error, expected) in cases {
             let mut backend = MockCexBackend::new();
             backend.expect_withdraw().return_once(move |_, _, _, _, _| Err(error));
-            let outcome = CexWithdrawals::new(Arc::new(backend)).submit(&prepared).await;
+            let outcome = CexWithdrawals::new(Arc::new(backend), "MEXC").submit(&prepared).await;
             assert_eq!(outcome, expected);
         }
     }

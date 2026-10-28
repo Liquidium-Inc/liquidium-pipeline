@@ -43,9 +43,10 @@ impl From<BridgeError> for CexBackendError {
         match error {
             BridgeError::BelowMinimum(message) => Self::BelowMinimum(message),
             BridgeError::Ambiguous(message) => Self::Ambiguous(message),
-            BridgeError::Deferred(message) | BridgeError::Unreadable(message) | BridgeError::Other(message) => {
-                Self::Other(message)
-            }
+            BridgeError::Deferred(message)
+            | BridgeError::Unreadable(message)
+            | BridgeError::Refused(message)
+            | BridgeError::Other(message) => Self::Other(message),
         }
     }
 }
@@ -166,6 +167,33 @@ pub struct WithdrawTerms {
     pub minimum: f64,
 }
 
+/// One route through an exchange, as a plan would run it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FundingRoute {
+    pub deposit_asset: String,
+    pub deposit_network: String,
+    /// What reaches the exchange, after transfer and bridge fees.
+    pub deposit_amount: f64,
+    pub withdraw_asset: String,
+    pub withdraw_network: String,
+    pub withdraw_address: String,
+}
+
+/// Why an exchange cannot settle a route.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum FundingRouteError {
+    /// The deposit is under the exchange's minimum, so it would not be credited.
+    #[error("{0}")]
+    BelowMinimum(String),
+    /// The exchange cannot settle the route as configured, for example to an
+    /// address it has not verified.
+    #[error("{0}")]
+    Unsupported(String),
+    /// A read failed, so nothing is known about the route.
+    #[error("{0}")]
+    Unavailable(String),
+}
+
 #[derive(Debug, Clone)]
 pub struct WithdrawStatusSnapshot {
     pub status: WithdrawStatus,
@@ -177,12 +205,6 @@ pub struct WithdrawStatusSnapshot {
 #[async_trait]
 pub trait CexBackend: Send + Sync {
     // trading
-    async fn get_quote(&self, market: &str, amount_in: f64) -> Result<f64, String>;
-
-    async fn execute_swap(&self, market: &str, side: &str, amount_in: f64) -> Result<f64, String>;
-
-    async fn execute_swap_detailed(&self, market: &str, side: &str, amount_in: f64) -> Result<SwapFillReport, String>;
-
     async fn execute_swap_detailed_with_options(
         &self,
         market: &str,
@@ -211,11 +233,12 @@ pub trait CexBackend: Send + Sync {
     /// The fee and minimum of a withdrawal, known before it is sent.
     async fn get_withdraw_terms(&self, asset: &str, network: &str) -> Result<WithdrawTerms, String>;
 
+    /// Read-only checks, before any funds move, that the exchange takes this
+    /// deposit and sends this withdrawal.
+    async fn check_funding_route(&self, route: &FundingRoute) -> Result<(), FundingRouteError>;
+
     // balance
     async fn get_balance(&self, asset: &str) -> Result<f64, String>;
-
-    // withdrawal status
-    async fn get_withdraw_status_by_id(&self, coin: &str, withdraw_id: &str) -> Result<WithdrawStatus, String>;
 
     // withdrawal status with optional transfer metadata (txid, fee)
     async fn get_withdraw_status_snapshot_by_id(

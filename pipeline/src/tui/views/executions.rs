@@ -11,8 +11,8 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use crate::bridge::legacy::LegacyBridgeSubmitPhase;
+use crate::finalizers::cex::profile::CexVenueProfile;
 use crate::finalizers::liquidation_outcome::LiquidationOutcome;
-use crate::finalizers::multi_venue::MEXC_VENUE_ID;
 use crate::persistance::{
     FinalizerMetaPayload, FinalizerMetaV2, LiqMetaWrapper, ResultStatus, VenueExecutionState, VenueLegState,
     WalProfitSnapshot,
@@ -492,8 +492,8 @@ fn append_venue_leg_summary(lines: &mut Vec<Line<'static>>, leg: &VenueLegState,
     )));
     lines.push(Line::from(format!("   Route: {}", leg.quote.route_id)));
 
-    if leg.venue_id == MEXC_VENUE_ID {
-        append_mexc_leg_transactions(lines, &leg.execution);
+    if let Some(profile) = CexVenueProfile::for_venue(&leg.venue_id) {
+        append_cex_leg_transactions(lines, profile.name(), &leg.execution);
     }
 
     if let Some(result) = &leg.result {
@@ -512,19 +512,19 @@ fn append_venue_leg_summary(lines: &mut Vec<Line<'static>>, leg: &VenueLegState,
     }
 }
 
-/// Shows transaction identifiers from the MEXC state stored inside a
-/// multi-venue leg. These are not present in the legacy top-level `meta` bytes.
-fn append_mexc_leg_transactions(lines: &mut Vec<Line<'static>>, execution: &VenueExecutionState) {
-    // Current multi-venue MEXC state wraps the existing CEX state in `cex`.
+/// Shows transaction identifiers from the CEX state stored inside a
+/// multi-venue leg. Every exchange saves the same state, so one reader serves all.
+fn append_cex_leg_transactions(lines: &mut Vec<Line<'static>>, venue: &str, execution: &VenueExecutionState) {
+    // Current multi-venue CEX state wraps the existing CEX state in `cex`.
     // Falling back to the root keeps this readable if an older direct CEX
     // state was persisted in the venue envelope.
     let cex = execution.state.get("cex").unwrap_or(&execution.state);
     let fields = [
-        ("deposit_txid", "MEXC deposit txid"),
-        ("deposit_bridge_id", "MEXC deposit bridge txid"),
-        ("withdraw_id", "MEXC withdraw id"),
-        ("withdraw_txid", "MEXC withdraw txid"),
-        ("withdraw_bridge_id", "MEXC withdraw bridge txid"),
+        ("deposit_txid", "deposit txid"),
+        ("deposit_bridge_id", "deposit bridge txid"),
+        ("withdraw_id", "withdraw id"),
+        ("withdraw_txid", "withdraw txid"),
+        ("withdraw_bridge_id", "withdraw bridge txid"),
     ];
 
     for (field, label) in fields {
@@ -534,14 +534,23 @@ fn append_mexc_leg_transactions(lines: &mut Vec<Line<'static>>, execution: &Venu
             .map(str::trim)
             .filter(|value| !value.is_empty())
         {
-            lines.push(Line::from(format!("   {label}: {value}")));
+            lines.push(Line::from(format!("   {venue} {label}: {value}")));
         }
     }
+    if let Some(call) = cex.get("withdraw_bridge_call").filter(|call| !call.is_null()) {
+        lines.push(Line::from(format!(
+            "   {venue} return bridge call: {}",
+            describe_bridge_call(call)
+        )));
+    }
     if let Some(call) = cex.get("deposit_bridge_call").filter(|call| !call.is_null()) {
-        lines.push(Line::from(format!("   MEXC deposit bridge call: {}", describe_bridge_call(call))));
+        lines.push(Line::from(format!(
+            "   {venue} deposit bridge call: {}",
+            describe_bridge_call(call)
+        )));
     } else if let Some(phase) = cex.get("deposit_bridge_submit_phase").filter(|phase| !phase.is_null()) {
         lines.push(Line::from(format!(
-            "   MEXC deposit bridge phase: {}",
+            "   {venue} deposit bridge phase: {}",
             describe_bridge_submit_phase(phase)
         )));
     }
@@ -1052,6 +1061,42 @@ mod tests {
         assert!(text.iter().any(|line| line == "   Last error: waiting for bridge"));
         assert!(text.iter().any(|line| line
             == "   MEXC deposit bridge phase: attempt 33.917291 ckUSDC -> 0xabc cursor=1114868 called=yes"));
+    }
+
+    /// A Kraken leg saved its transaction ids under the same keys as MEXC,
+    /// but only MEXC legs had lines to show them.
+    #[test]
+    fn execution_details_show_the_kraken_leg_transactions_too() {
+        let leg = super::super::dashboard::tests::leg(
+            "kraken",
+            VenueLegStatus::Running,
+            serde_json::json!({
+                "cex": {
+                    "step": "WithdrawPending",
+                    "deposit_txid": "991_924",
+                    "deposit_bridge_id": "ic-withdraw-eth:991_926",
+                    "withdraw_id": "FTR5nyg-hY0kJ1XzPvychxDADDUJjx",
+                    "withdraw_txid": "0xd81a",
+                    "withdraw_bridge_id": "0x6c93"
+                }
+            }),
+            None,
+        );
+
+        let mut lines = Vec::new();
+        append_venue_leg_summary(&mut lines, &leg, true);
+        let text = lines_as_text(&lines);
+
+        assert_eq!(text[0], "└─ Kraken · withdraw pending");
+        for expected in [
+            "   Kraken deposit txid: 991_924",
+            "   Kraken deposit bridge txid: ic-withdraw-eth:991_926",
+            "   Kraken withdraw id: FTR5nyg-hY0kJ1XzPvychxDADDUJjx",
+            "   Kraken withdraw txid: 0xd81a",
+            "   Kraken withdraw bridge txid: 0x6c93",
+        ] {
+            assert!(text.iter().any(|line| line == expected), "missing {expected:?} in {text:?}");
+        }
     }
 
     #[test]

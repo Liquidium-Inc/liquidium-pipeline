@@ -38,6 +38,13 @@ where
         for leg in legs {
             // The fee comes from the same source the fills are accounted with.
             let preview = self.preview_leg(&leg.market, &leg.side, amount_in).await?;
+            // Orders go out at the room the cap leaves after the fee.
+            Self::price_room_or_err(
+                &leg.side,
+                self.max_sell_slippage_bps,
+                preview.taker_fee_bps,
+                &leg.market,
+            )?;
             let (gross_amount_out, side_impact_bps) = (preview.gross_out, preview.impact_bps);
             let amount_out = gross_amount_out * (1.0 - preview.taker_fee_bps / BPS_PER_RATIO_UNIT);
             let impact_ratio = side_impact_bps / BPS_PER_RATIO_UNIT;

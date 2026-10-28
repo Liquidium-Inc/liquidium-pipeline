@@ -3,6 +3,7 @@ use candid::{CandidType, Encode, Nat, Principal};
 use icrc_ledger_types::{
     icrc1::account::Account,
     icrc2::{allowance::AllowanceArgs, approve::ApproveArgs},
+    icrc3::transactions::{GetTransactionsRequest, GetTransactionsResponse, Mint, TransactionRange},
 };
 use num_traits::ToPrimitive;
 use serde::Deserialize;
@@ -492,36 +493,8 @@ where
         })
     }
 
-    fn map_withdraw_error(err: CkSolWithdrawalError) -> String {
-        match err {
-            CkSolWithdrawalError::AlreadyProcessing => "ckSOL withdraw rejected: AlreadyProcessing".to_string(),
-            CkSolWithdrawalError::ValueTooSmall {
-                minimum_withdrawal_amount,
-                withdrawal_amount,
-            } => format!(
-                "ckSOL withdraw rejected: ValueTooSmall (minimum_withdrawal_amount={}, withdrawal_amount={})",
-                minimum_withdrawal_amount, withdrawal_amount
-            ),
-            CkSolWithdrawalError::MalformedAddress(address) => {
-                format!("ckSOL withdraw rejected: MalformedAddress ({address})")
-            }
-            CkSolWithdrawalError::InvalidDestination(reason) => {
-                format!("ckSOL withdraw rejected: InvalidDestination ({reason})")
-            }
-            CkSolWithdrawalError::InsufficientFunds { balance } => {
-                format!("ckSOL withdraw rejected: InsufficientFunds (balance={balance})")
-            }
-            CkSolWithdrawalError::InsufficientAllowance { allowance } => {
-                format!("ckSOL withdraw rejected: InsufficientAllowance (allowance={allowance})")
-            }
-            CkSolWithdrawalError::TemporarilyUnavailable(message) => {
-                format!("ckSOL withdraw rejected: TemporarilyUnavailable ({message})")
-            }
-        }
-    }
-
-    async fn withdraw(&self, args: CkSolWithdrawalArgs) -> Result<CkSolWithdrawalOk, String> {
-        let arg_blob = Encode!(&args).map_err(|e| format!("encode withdraw args failed: {e}"))?;
+    async fn withdraw(&self, args: CkSolWithdrawalArgs) -> Result<CkSolWithdrawalOk, BridgeError> {
+        let arg_blob = Encode!(&args).map_err(|e| BridgeError::Refused(format!("encode withdraw args failed: {e}")))?;
         let result: Result<CkSolWithdrawalOk, CkSolWithdrawalError> = self
             .agent
             .call_update::<Result<CkSolWithdrawalOk, CkSolWithdrawalError>>(
@@ -532,7 +505,7 @@ where
             .await
             .map_err(|e| format!("withdraw call failed for minter {}: {e}", self.cksol_minter_canister))?;
 
-        result.map_err(Self::map_withdraw_error)
+        result.map_err(BridgeError::from)
     }
 
     async fn withdrawal_status(&self, block_index: u64) -> Result<CkSolWithdrawalStatus, String> {
@@ -712,8 +685,8 @@ where
         }))
     }
 
-    /// Ties the transfer to a deposit id that an operator recorded. The
-    /// minter must know the id, so a typo waits and parks again.
+    /// Ties the transfer to a deposit id that an operator recorded. The minter
+    /// must know the id, and the mint must reach this transfer's account.
     async fn recorded_sol_deposit(
         &self,
         route: &BridgeRouteSpec,
@@ -730,6 +703,42 @@ where
         Ok(DepositNotice::Accepted(BridgeSubmission {
             bridge_id: Self::queued_deposit_id(account, Some(deposit_id), funding_receipt, None)?,
         }))
+    }
+
+    /// The mint the ckSOL ledger recorded at `block_index`, read from the ledger
+    /// or, for an older block, from its archive.
+    async fn ledger_mint(&self, block_index: u64) -> Result<Mint, String> {
+        let request = GetTransactionsRequest {
+            start: Nat::from(block_index),
+            length: Nat::from(1u8),
+        };
+        let arg = Encode!(&request).map_err(|error| error.to_string())?;
+        let response: GetTransactionsResponse = self
+            .agent
+            .call_query(&self.cksol_ledger_canister, "get_transactions", arg.clone())
+            .await?;
+        let transaction = match response.transactions.into_iter().next() {
+            Some(transaction) if response.first_index == block_index => transaction,
+            _ => {
+                let archive = response
+                    .archived_transactions
+                    .into_iter()
+                    .next()
+                    .ok_or_else(|| format!("the ckSOL ledger has no block {block_index}"))?;
+                let range: TransactionRange = self
+                    .agent
+                    .call_query(&archive.callback.canister_id, &archive.callback.method, arg)
+                    .await?;
+                range
+                    .transactions
+                    .into_iter()
+                    .next()
+                    .ok_or_else(|| format!("the ckSOL archive has no block {block_index}"))?
+            }
+        };
+        transaction
+            .mint
+            .ok_or_else(|| format!("ckSOL block {block_index} is not a mint"))
     }
 
     async fn deposit_status(&self, deposit_id: u64) -> Result<DepositSolStatus, String> {
@@ -782,7 +791,7 @@ where
                 // answer it could not decide stays ambiguous.
                 match failure {
                     TransferFailure::Ambiguous(_) => BridgeError::Ambiguous(message),
-                    TransferFailure::Rejected(_) => BridgeError::Other(message),
+                    TransferFailure::Rejected(_) => BridgeError::Refused(message),
                 }
             })?;
 
@@ -806,7 +815,24 @@ where
         &self,
         route: &BridgeRouteSpec,
         request: &BridgeRequest,
-    ) -> Result<BridgeSubmission, String> {
+    ) -> Result<BridgeSubmission, BridgeError> {
+        let args = self
+            .prepare_icp_to_solana(route, request)
+            .await
+            .map_err(BridgeError::before_call)?;
+        let withdraw = self.withdraw(args).await?;
+        Ok(BridgeSubmission {
+            bridge_id: format!("{}{}", WITHDRAW_BRIDGE_ID_PREFIX, withdraw.block_index),
+        })
+    }
+
+    /// Checks the ckSOL balance and sets the minter allowance. It does not
+    /// call the minter's withdraw.
+    async fn prepare_icp_to_solana(
+        &self,
+        route: &BridgeRouteSpec,
+        request: &BridgeRequest,
+    ) -> Result<CkSolWithdrawalArgs, String> {
         let source_account = self.ensure_principal_only_bridge_source(&request.source_address)?;
         let destination = Self::expect_solana_destination(route, &request.destination)?;
 
@@ -843,16 +869,48 @@ where
             )
         })?;
 
-        let withdraw = self
-            .withdraw(CkSolWithdrawalArgs {
-                from_subaccount: None,
-                amount: amount_lamports,
-                address: destination.to_string(),
-            })
-            .await?;
+        Ok(CkSolWithdrawalArgs {
+            from_subaccount: None,
+            amount: amount_lamports,
+            address: destination.to_string(),
+        })
+    }
+}
 
-        Ok(BridgeSubmission {
-            bridge_id: format!("{}{}", WITHDRAW_BRIDGE_ID_PREFIX, withdraw.block_index),
+/// The minter's certified answer: no ckSOL left the account, so a later call is safe.
+impl From<CkSolWithdrawalError> for BridgeError {
+    fn from(err: CkSolWithdrawalError) -> Self {
+        let kind = match &err {
+            CkSolWithdrawalError::ValueTooSmall { .. } => BridgeError::BelowMinimum,
+            CkSolWithdrawalError::AlreadyProcessing | CkSolWithdrawalError::TemporarilyUnavailable(_) => {
+                BridgeError::Deferred
+            }
+            _ => BridgeError::Refused,
+        };
+        kind(match err {
+            CkSolWithdrawalError::AlreadyProcessing => "ckSOL withdraw rejected: AlreadyProcessing".to_string(),
+            CkSolWithdrawalError::ValueTooSmall {
+                minimum_withdrawal_amount,
+                withdrawal_amount,
+            } => format!(
+                "ckSOL withdraw rejected: ValueTooSmall (minimum_withdrawal_amount={}, withdrawal_amount={})",
+                minimum_withdrawal_amount, withdrawal_amount
+            ),
+            CkSolWithdrawalError::MalformedAddress(address) => {
+                format!("ckSOL withdraw rejected: MalformedAddress ({address})")
+            }
+            CkSolWithdrawalError::InvalidDestination(reason) => {
+                format!("ckSOL withdraw rejected: InvalidDestination ({reason})")
+            }
+            CkSolWithdrawalError::InsufficientFunds { balance } => {
+                format!("ckSOL withdraw rejected: InsufficientFunds (balance={balance})")
+            }
+            CkSolWithdrawalError::InsufficientAllowance { allowance } => {
+                format!("ckSOL withdraw rejected: InsufficientAllowance (allowance={allowance})")
+            }
+            CkSolWithdrawalError::TemporarilyUnavailable(message) => {
+                format!("ckSOL withdraw rejected: TemporarilyUnavailable ({message})")
+            }
         })
     }
 }
@@ -952,7 +1010,7 @@ where
 
         match route.route_kind {
             BridgeRouteKind::SolanaToIcp => self.submit_solana_to_icp(route, &request).await,
-            BridgeRouteKind::IcpToSolana => Ok(self.submit_icp_to_solana(route, &request).await?),
+            BridgeRouteKind::IcpToSolana => self.submit_icp_to_solana(route, &request).await,
             _ => Err(format!(
                 "route {}@{} -> {} is not supported by SolanaBridgeBackend",
                 route.source_asset, route.source_chain, route.target_asset
@@ -1020,14 +1078,28 @@ where
             };
             let deposit = self.deposit_status(deposit_id).await.map_err(BridgeError::Unreadable)?;
             return Ok(match deposit {
-                DepositSolStatus::Minted { block_index, minted_amount } => BridgeStatus::Minted(BridgeMintReceipt {
-                    transaction_hash: state.transfer_signature,
-                    log_index: Nat::from(deposit_id),
-                    mint_block_index: Nat::from(block_index),
-                    amount: Nat::from(minted_amount),
-                    recipient: state.account,
-                    token_symbol: "ckSOL".into(),
-                }),
+                DepositSolStatus::Minted {
+                    block_index,
+                    minted_amount,
+                } => {
+                    // The minter's status names no account, and an operator may have
+                    // recorded the id by hand. Only the ledger proves whose mint it was.
+                    let mint = self.ledger_mint(block_index).await.map_err(BridgeError::Unreadable)?;
+                    if mint.to != state.account || mint.amount != minted_amount {
+                        return Err(BridgeError::Ambiguous(format!(
+                            "ckSOL deposit {deposit_id} minted {} to {}, not to {}; it is not the deposit of SOL transfer {}",
+                            mint.amount, mint.to, state.account, state.transfer_signature
+                        )));
+                    }
+                    BridgeStatus::Minted(BridgeMintReceipt {
+                        transaction_hash: state.transfer_signature,
+                        log_index: Nat::from(deposit_id),
+                        mint_block_index: Nat::from(block_index),
+                        amount: mint.amount,
+                        recipient: mint.to,
+                        token_symbol: "ckSOL".into(),
+                    })
+                }
                 DepositSolStatus::Queued { .. } | DepositSolStatus::Swept { .. }
                 | DepositSolStatus::Finalized { .. } => BridgeStatus::Pending,
                 DepositSolStatus::NotFound => BridgeStatus::Unknown,
@@ -1213,6 +1285,141 @@ mod tests {
         assert_eq!(backend.get_minimum_bridge_amount("ckSOL", "ICP", "SOL").await.unwrap(), 0.002);
     }
 
+    fn ledger_mint_at(
+        block_index: u64,
+        to: Account,
+        amount: u64,
+    ) -> icrc_ledger_types::icrc3::transactions::GetTransactionsResponse {
+        use icrc_ledger_types::icrc3::transactions::{Mint, Transaction};
+        icrc_ledger_types::icrc3::transactions::GetTransactionsResponse {
+            log_length: Nat::from(block_index + 1),
+            first_index: Nat::from(block_index),
+            transactions: vec![Transaction::mint(
+                Mint {
+                    amount: Nat::from(amount),
+                    to,
+                    memo: None,
+                    created_at_time: None,
+                },
+                0,
+            )],
+            archived_transactions: vec![],
+        }
+    }
+
+    /// Review finding 17: deposit ids are one sequence for every user, so a
+    /// mistyped id named another deposit's mint. The ledger shows its account.
+    #[tokio::test]
+    async fn a_mint_to_another_account_is_not_this_deposit() {
+        let state = super::QueuedSolDeposit {
+            account: Account {
+                owner: bridge_owner(),
+                subaccount: Some([7; 32]),
+            },
+            deposit_id: Some(4123),
+            transfer_signature: "sol-transfer".into(),
+            notification_error: None,
+        };
+        let id = format!(
+            "{}{}",
+            super::QUEUED_DEPOSIT_PREFIX,
+            serde_json::to_string(&state).unwrap()
+        );
+        let mut agent = MockPipelineAgent::new();
+        agent
+            .expect_call_query::<super::DepositSolStatus>()
+            .returning(|_, _, _| {
+                Ok(super::DepositSolStatus::Minted {
+                    block_index: 90,
+                    minted_amount: 5,
+                })
+            });
+        agent
+            .expect_call_query::<icrc_ledger_types::icrc3::transactions::GetTransactionsResponse>()
+            .returning(|_, method, _| {
+                assert_eq!(method, "get_transactions");
+                Ok(ledger_mint_at(
+                    90,
+                    Account {
+                        owner: Principal::anonymous(),
+                        subaccount: None,
+                    },
+                    5,
+                ))
+            });
+
+        let error = backend(agent, MockIcpBackend::new(), MockSolanaBackend::new())
+            .get_bridge_status(&id)
+            .await
+            .expect_err("someone else's mint");
+        assert!(matches!(error, BridgeError::Ambiguous(_)), "{error:?}");
+    }
+
+    #[tokio::test]
+    async fn an_archived_mint_is_read_from_the_archive() {
+        use icrc_ledger_types::icrc3::{
+            archive::{ArchivedRange, QueryArchiveFn},
+            transactions::{GetTransactionsResponse, TransactionRange},
+        };
+        let account = Account {
+            owner: bridge_owner(),
+            subaccount: Some([7; 32]),
+        };
+        let state = super::QueuedSolDeposit {
+            account,
+            deposit_id: Some(42),
+            transfer_signature: "sol-transfer".into(),
+            notification_error: None,
+        };
+        let id = format!(
+            "{}{}",
+            super::QUEUED_DEPOSIT_PREFIX,
+            serde_json::to_string(&state).unwrap()
+        );
+        let archive = Principal::from_slice(&[9]);
+        let mut agent = MockPipelineAgent::new();
+        agent
+            .expect_call_query::<super::DepositSolStatus>()
+            .returning(|_, _, _| {
+                Ok(super::DepositSolStatus::Minted {
+                    block_index: 7,
+                    minted_amount: 5,
+                })
+            });
+        agent
+            .expect_call_query::<GetTransactionsResponse>()
+            .returning(move |_, _, _| {
+                Ok(GetTransactionsResponse {
+                    log_length: Nat::from(5_000u64),
+                    first_index: Nat::from(4_000u64),
+                    transactions: vec![],
+                    archived_transactions: vec![ArchivedRange {
+                        start: Nat::from(7u64),
+                        length: Nat::from(1u8),
+                        callback: QueryArchiveFn {
+                            canister_id: archive,
+                            method: "get_transactions".into(),
+                            _marker: std::marker::PhantomData,
+                        },
+                    }],
+                })
+            });
+        agent
+            .expect_call_query::<TransactionRange>()
+            .returning(move |canister, _, _| {
+                assert_eq!(*canister, archive);
+                Ok(TransactionRange {
+                    transactions: ledger_mint_at(7, account, 5).transactions,
+                })
+            });
+
+        let status = backend(agent, MockIcpBackend::new(), MockSolanaBackend::new())
+            .get_bridge_status(&id)
+            .await
+            .expect("the archived mint is this deposit's");
+        assert!(matches!(status, super::BridgeStatus::Minted(_)));
+    }
+
     #[tokio::test]
     async fn queued_deposit_uses_actual_mint_receipt_without_wallet_balance() {
         let state = super::QueuedSolDeposit {
@@ -1228,6 +1435,11 @@ mod tests {
             assert_eq!(candid::decode_one::<u64>(&args).unwrap(), 42);
             Ok(super::DepositSolStatus::Minted { block_index: 88, minted_amount: 999104120 })
         });
+        let account = state.account;
+        agent
+            .expect_call_query::<icrc_ledger_types::icrc3::transactions::GetTransactionsResponse>()
+            .times(1)
+            .returning(move |_, _, _| Ok(ledger_mint_at(88, account, 999104120)));
         let backend = backend(agent, MockIcpBackend::new(), MockSolanaBackend::new());
         let status = backend.get_bridge_status(&id).await.unwrap();
         let super::BridgeStatus::Minted(receipt) = status else { panic!("expected mint receipt") };
@@ -1815,9 +2027,67 @@ mod tests {
         let err = backend
             .submit_bridge(icp_to_sol_request(bridge_owner().to_text()))
             .await
-            .expect_err("withdraw error must propagate with explicit variant")
-            .to_string();
-        assert!(err.contains("InsufficientAllowance"));
+            .expect_err("withdraw error must propagate with explicit variant");
+        assert!(matches!(&err, BridgeError::Refused(message) if message.contains("InsufficientAllowance")));
+    }
+
+    /// Review finding 11: a minter refusal and a failure before the minter
+    /// call moved nothing, but they read as "may have run" and parked the leg.
+    #[tokio::test]
+    async fn icp_to_solana_failures_keep_whether_the_minter_ran() {
+        type Answer = Result<Result<CkSolWithdrawalOk, CkSolWithdrawalError>, String>;
+        let refusal = |error: CkSolWithdrawalError| -> Option<Answer> { Some(Ok(Err(error))) };
+        let cases: [(Option<Answer>, fn(&BridgeError) -> bool); 5] = [
+            (
+                refusal(CkSolWithdrawalError::TemporarilyUnavailable("busy".into())),
+                |error| matches!(error, BridgeError::Deferred(_)),
+            ),
+            (
+                refusal(CkSolWithdrawalError::ValueTooSmall {
+                    minimum_withdrawal_amount: 10,
+                    withdrawal_amount: 1,
+                }),
+                |error| matches!(error, BridgeError::BelowMinimum(_)),
+            ),
+            (refusal(CkSolWithdrawalError::MalformedAddress("x".into())), |error| {
+                matches!(error, BridgeError::Refused(_))
+            }),
+            // The reply was lost, so the minter may have run.
+            (Some(Err("timed out".into())), |error| {
+                matches!(error, BridgeError::Other(_))
+            }),
+            // The balance read failed, so the minter was never called.
+            (None, |error| matches!(error, BridgeError::Refused(_))),
+        ];
+        for (answer, expected) in cases {
+            let mut mock_agent = MockPipelineAgent::new();
+            let reaches_minter = answer.is_some();
+            if let Some(answer) = answer {
+                mock_agent
+                    .expect_call_update::<Result<CkSolWithdrawalOk, CkSolWithdrawalError>>()
+                    .times(1)
+                    .return_once(move |_, _, _| answer);
+            }
+            let mut mock_icp = MockIcpBackend::new();
+            mock_icp.expect_icrc1_decimals().returning(|_| Ok(9));
+            mock_icp.expect_icrc1_fee().returning(|_| Ok(Nat::from(10_000u64)));
+            mock_icp.expect_icrc1_balance().returning(move |_, _| {
+                if reaches_minter {
+                    Ok(Nat::from(1_100_000_000u64))
+                } else {
+                    Err("balance read failed".to_string())
+                }
+            });
+            mock_icp
+                .expect_icrc2_allowance()
+                .returning(|_, _, _| Ok(Nat::from(1_000_000_000u64)));
+
+            let error = backend(mock_agent, mock_icp, MockSolanaBackend::new())
+                .submit_bridge(icp_to_sol_request(bridge_owner().to_text()))
+                .await
+                .expect_err("the submit fails");
+            assert!(expected(&error), "{error:?}");
+        }
     }
 
     #[tokio::test]

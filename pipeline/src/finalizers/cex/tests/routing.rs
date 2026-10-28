@@ -111,6 +111,48 @@ async fn mexc_resolves_icp_to_ckusdt_route_from_configured_pairs() {
     assert_eq!(legs[1].side, "buy");
 }
 
+/// Kraken takes ckUSDT as USDT and lists no ICP_USDT book, so the trade goes through USD.
+#[tokio::test]
+async fn kraken_trades_bridged_ckusdt_through_usd_with_the_configured_allowlist() {
+    let mut backend = MockCexBackend::new();
+    let liquid = liquid_orderbook();
+    backend
+        .expect_get_orderbook()
+        .returning(move |market, _limit| match market {
+            "ICP_USD" | "USDT_USD" => Ok(liquid.clone()),
+            other => Err(format!("unlisted market {other}")),
+        });
+    let allowlist = ["BTC_USD", "ETH_USD", "USDC_USD", "ICP_USD", "USDT_USD"].map(String::from);
+    let mut finalizer = test_finalizer(Arc::new(backend), Arc::new(MockTransferActions::new()))
+        .with_bridge_runtime(bridge_dependencies(Arc::new(MockBridgeBackend::new())))
+        .with_route_config(allowlist.to_vec(), 2);
+    finalizer.profile = crate::finalizers::cex::profile::CexVenueProfile::kraken();
+    let ckusdt = ChainToken::Icp {
+        ledger: Principal::anonymous(),
+        symbol: "ckUSDT".to_string(),
+        decimals: 6,
+        fee: Nat::from(10_000u64),
+    };
+
+    let to_ckusdt = [("ICP_USD", "sell"), ("USDT_USD", "buy")];
+    let from_ckusdt = [("USDT_USD", "sell"), ("ICP_USD", "buy")];
+    for (pay, receive, expected) in [
+        (native_icp_token(), ckusdt.clone(), to_ckusdt),
+        (ckusdt, native_icp_token(), from_ckusdt),
+    ] {
+        let plan = finalizer.resolve_bridge_plan_for_assets(&pay, &receive);
+        let legs = finalizer
+            .resolve_trade_legs_for_symbols(&plan.deposit.cex_asset, &plan.withdraw.cex_asset)
+            .await
+            .expect("Kraken route through USD");
+        let legs = legs
+            .iter()
+            .map(|leg| (leg.market.as_str(), leg.side.as_str()))
+            .collect::<Vec<_>>();
+        assert_eq!(legs, expected);
+    }
+}
+
 #[tokio::test]
 async fn mexc_resolves_icp_to_eth_route_from_configured_pairs() {
     let mut backend = MockCexBackend::new();

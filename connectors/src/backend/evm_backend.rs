@@ -173,11 +173,26 @@ fn note_broadcast(marks: &mut NonceMarks, signer: NonceKey, nonce: u64, now: Ins
 
 pub struct EvmBackendImpl<P> {
     pub provider: P,
+    /// Fixed for a provider, so it is read once.
+    chain_id: tokio::sync::OnceCell<u64>,
 }
 
 impl<P: Provider<AnyNetwork>> EvmBackendImpl<P> {
     pub fn new(provider: P) -> Self {
-        Self { provider }
+        Self {
+            provider,
+            chain_id: tokio::sync::OnceCell::new(),
+        }
+    }
+
+    async fn chain_id(&self) -> Result<u64, String> {
+        self.chain_id
+            .get_or_try_init(|| async {
+                let chain_id = self.provider.get_chain_id().await;
+                chain_id.map_err(|e| format!("chain id read failed: {e}"))
+            })
+            .await
+            .copied()
     }
 }
 
@@ -203,6 +218,23 @@ where
         Ok(pending > latest)
     }
 
+    /// The node's pending count for `from`, past any send this process
+    /// broadcast that the node does not show yet.
+    async fn next_nonce_for(&self, chain_id: u64, from: Address) -> Result<u64, String> {
+        let node_count = self
+            .provider
+            .get_transaction_count(from)
+            .pending()
+            .await
+            .map_err(|e| format!("nonce read failed for {from}: {e}"))?;
+        Ok(next_nonce(
+            &nonce_marks().lock().expect("nonce marks lock"),
+            (chain_id, from),
+            node_count,
+            Instant::now(),
+        ))
+    }
+
     /// Fills, signs and encodes a request for the wallet's next nonce. It
     /// broadcasts nothing.
     pub(crate) async fn sign_request(
@@ -210,30 +242,18 @@ where
         request: <AnyNetwork as Network>::TransactionRequest,
     ) -> Result<SignedEvmTx, String> {
         let from = self.provider.default_signer_address();
-        let (chain_id, fees) = tokio::try_join!(
-            async {
-                let chain_id = self.provider.get_chain_id().await;
-                chain_id.map_err(|e| format!("chain id read failed: {e}"))
-            },
-            async {
-                let fees = self.provider.estimate_eip1559_fees().await;
-                fees.map_err(|e| format!("fee estimate failed: {e}"))
-            },
-        )?;
+        let (chain_id, fees) = tokio::try_join!(self.chain_id(), async {
+            let fees = self.provider.estimate_eip1559_fees().await;
+            fees.map_err(|e| format!("fee estimate failed: {e}"))
+        })?;
         let mut request = request.with_from(from).with_chain_id(chain_id);
-        let estimate = self
-            .provider
-            .estimate_gas(request.clone())
-            .await
-            .map_err(|e| format!("gas estimate failed: {e}"))?;
-        let node_count = self.provider.get_transaction_count(from).pending().await;
-        let node_count = node_count.map_err(|e| format!("nonce read failed for {from}: {e}"))?;
-        let nonce = next_nonce(
-            &nonce_marks().lock().expect("nonce marks lock"),
-            (chain_id, from),
-            node_count,
-            Instant::now(),
-        );
+        let (estimate, nonce) = tokio::try_join!(
+            async {
+                let estimate = self.provider.estimate_gas(request.clone()).await;
+                estimate.map_err(|e| format!("gas estimate failed: {e}"))
+            },
+            self.next_nonce_for(chain_id, from),
+        )?;
         request.set_nonce(nonce);
         request.set_gas_limit(with_gas_buffer(estimate));
         request.set_max_fee_per_gas(fees.max_fee_per_gas);
@@ -260,11 +280,14 @@ where
             Err(error) => Broadcast::Unknown(error.to_string()),
         };
         // A node may hold the transaction, so the next send takes a later nonce.
-        if !matches!(broadcast, Broadcast::Rejected(_))
-            && let Ok(chain_id) = self.provider.get_chain_id().await
-        {
-            let mut marks = nonce_marks().lock().expect("nonce marks lock");
-            note_broadcast(&mut marks, (chain_id, tx.from), tx.nonce, Instant::now());
+        if !matches!(broadcast, Broadcast::Rejected(_)) {
+            match self.chain_id().await {
+                Ok(chain_id) => {
+                    let mut marks = nonce_marks().lock().expect("nonce marks lock");
+                    note_broadcast(&mut marks, (chain_id, tx.from), tx.nonce, Instant::now());
+                }
+                Err(error) => log::warn!("nonce {} of {} is not marked: {error}", tx.nonce, tx.from),
+            }
         }
         broadcast
     }
@@ -320,8 +343,11 @@ where
                 if matches!(self.provider.get_transaction_by_hash(tx.hash).await, Ok(None)) {
                     let _ = self.provider.send_raw_transaction(&tx.raw).await;
                 }
-                SendOutcome::Open {
-                    reason: format!("transaction {:#x} is not mined yet", tx.hash),
+                SendOutcome::InFlight {
+                    reason: format!(
+                        "transaction {:#x} at nonce {} of {} is not mined yet",
+                        tx.hash, tx.nonce, tx.from
+                    ),
                 }
             }
         }
@@ -371,25 +397,40 @@ where
             .map(|estimate| with_gas_buffer(estimate).max(ERC20_APPROVE_GAS_LIMIT))
             .unwrap_or(ERC20_APPROVE_GAS_LIMIT);
 
+        let from = self.provider.default_signer_address();
+        let chain_id = self.chain_id().await?;
         let mut attempt: u8 = 0;
         let pending = loop {
             attempt = attempt.saturating_add(1);
+            // Signed sends never pass alloy's nonce cache, so the approve takes
+            // its nonce the same way; the cache would fall behind them.
+            let nonce = self.next_nonce_for(chain_id, from).await?;
             let send_result = contract
                 .approve(spender, amount)
                 // Some RPC/provider stacks under-estimate ERC20 approve gas, causing
                 // intermittent out-of-gas failures. Use estimated gas with headroom.
                 .gas(gas_limit)
+                .nonce(nonce)
                 .send()
                 .await;
 
             match send_result {
-                Ok(pending) => break pending,
+                Ok(pending) => {
+                    let mut marks = nonce_marks().lock().expect("nonce marks lock");
+                    note_broadcast(&mut marks, (chain_id, from), nonce, Instant::now());
+                    break pending;
+                }
                 Err(err) => {
                     let err_message = err.to_string();
                     if attempt < NONCE_RETRY_MAX_ATTEMPTS && is_nonce_too_low_error(&err_message) {
                         let backoff_ms = NONCE_RETRY_BASE_DELAY_MS.saturating_mul(attempt as u64);
                         sleep(Duration::from_millis(backoff_ms)).await;
                         continue;
+                    }
+                    // A node may hold the approve, so the next send takes a later nonce.
+                    if !is_nonce_too_low_error(&err_message) && !is_validation_refusal(&err_message) {
+                        let mut marks = nonce_marks().lock().expect("nonce marks lock");
+                        note_broadcast(&mut marks, (chain_id, from), nonce, Instant::now());
                     }
                     return Err(format!(
                         "ERC20 approve(spender={spender}) failed for token {token}: {err}"

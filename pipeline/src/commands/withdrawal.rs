@@ -167,14 +167,25 @@ pub(crate) fn parse_typed_destination(token: &ChainToken, typed: &str) -> Result
                 .map(ChainAccount::Icp)
                 .map_err(|_| format!("invalid destination ICP account: {typed}")),
         },
-        ChainToken::EvmNative { .. } | ChainToken::EvmErc20 { .. } => typed
-            .parse::<EvmAddress>()
+        ChainToken::EvmNative { .. } | ChainToken::EvmErc20 { .. } => parse_evm_destination(typed)
             .map(|address| ChainAccount::Evm(address.to_string()))
-            .map_err(|_| format!("invalid destination EVM address: {typed}")),
+            .ok_or_else(|| format!("invalid destination EVM address: {typed}")),
         ChainToken::SolanaNative { .. } | ChainToken::SolanaSpl { .. } => typed
             .parse::<Pubkey>()
             .map(|address| ChainAccount::Solana(address.to_string()))
             .map_err(|_| format!("invalid destination Solana address: {typed}")),
+    }
+}
+
+/// A mixed-case address carries an EIP-55 checksum, so a mistyped digit fails
+/// it. A single-case address has no checksum to check.
+fn parse_evm_destination(typed: &str) -> Option<EvmAddress> {
+    let digits = typed.strip_prefix("0x").unwrap_or(typed);
+    let mixed_case = digits.chars().any(|c| c.is_ascii_lowercase()) && digits.chars().any(|c| c.is_ascii_uppercase());
+    if mixed_case {
+        EvmAddress::parse_checksummed(format!("0x{digits}"), None).ok()
+    } else {
+        typed.parse::<EvmAddress>().ok()
     }
 }
 
@@ -425,5 +436,22 @@ mod tests {
         };
         assert!(parse_typed_destination(&evm, "0x2222222222222222222222222222222222222222").is_ok());
         assert!(parse_typed_destination(&evm, "aaaaa-aa").is_err());
+    }
+
+    /// Review finding 32: a mixed-case address with one wrong digit passed, so
+    /// a withdrawal could pay an address nobody owns.
+    #[test]
+    fn a_mixed_case_evm_address_must_match_its_checksum() {
+        let evm = ChainToken::EvmNative {
+            chain: "eth".to_string(),
+            symbol: "ETH".to_string(),
+            decimals: 18,
+            fee: Nat::from(0u8),
+        };
+        let checksummed = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045";
+        assert!(parse_typed_destination(&evm, checksummed).is_ok());
+        assert!(parse_typed_destination(&evm, &checksummed.to_ascii_lowercase()).is_ok());
+        assert!(parse_typed_destination(&evm, &checksummed[2..]).is_ok());
+        assert!(parse_typed_destination(&evm, "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96046").is_err());
     }
 }

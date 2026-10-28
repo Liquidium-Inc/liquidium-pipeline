@@ -1,4 +1,12 @@
 pub(super) use crate::swappers::model::{LIQUIDITY_EPS, f64_to_nat};
+use crate::utils::now_ts;
+
+/// Seconds waited since `since`. A row saved before this clock existed starts
+/// it now, so it waits from here and not forever.
+pub(super) fn waited_secs(since: &mut Option<i64>) -> i64 {
+    let since = *since.get_or_insert_with(now_ts);
+    now_ts().saturating_sub(since)
+}
 
 /// Stable 64-bit FNV-1a. Exchange ids derived from it must not change
 /// between releases, so the std hasher is not an option.
@@ -21,6 +29,8 @@ pub(super) struct SlicePreview {
     pub chunk_in: f64,
     pub preview_mid_price: f64,
     pub preview_impact_bps: f64,
+    /// The market's taker fee, which a fill is measured net of.
+    pub taker_fee_bps: f64,
 }
 
 /// Parse `BASE_QUOTE` market symbols into uppercase `(base, quote)`.
@@ -34,10 +44,14 @@ pub(super) fn parse_market_symbols(market: &str) -> Option<(String, String)> {
     Some((base, quote))
 }
 
-/// Atomic decimals of an exchange asset. A ck token has its native asset's decimals.
+/// Atomic decimals of an exchange asset. A ck token has its native asset's
+/// decimals, and fiat USD uses six, as the USD stablecoins do.
 pub(super) fn asset_decimals(symbol: &str) -> Option<u8> {
     use liquidium_pipeline_core::types::protocol_types::{Asset, Assets};
     let symbol = symbol.to_ascii_uppercase();
+    if symbol == "USD" {
+        return Some(6);
+    }
     let native = symbol.strip_prefix("CK").unwrap_or(&symbol);
     [
         Assets::BTC,

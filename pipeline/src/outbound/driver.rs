@@ -117,13 +117,18 @@ async fn advance_saved(saved: &mut OutboundRecord, sender: &dyn OutboundSender, 
     let (outcome, submitted_at) = match &saved.phase {
         OutboundPhase::Prepared => (sender.submit(&saved.prepared).await, now),
         OutboundPhase::Submitted { at } => (sender.settle(&saved.prepared).await, *at),
-        OutboundPhase::Parked { reason } => {
-            let outcome = sender.settle(&saved.prepared).await;
-            if matches!(outcome, SendOutcome::Open { .. }) {
-                return decide_parked(saved, reason);
+        OutboundPhase::Parked { reason } => match sender.settle(&saved.prepared).await {
+            SendOutcome::Open { .. } => return decide_parked(saved, reason),
+            // An answer cannot stop a send the chain may still take, so it
+            // waits until a replacement or a cancel uses the nonce.
+            SendOutcome::InFlight { reason } => {
+                let reason =
+                    format!("{reason}; it can still land, so replace or cancel it before an operator decision applies");
+                saved.phase = OutboundPhase::Parked { reason: reason.clone() };
+                return Drive::Failed(OutboundError::Park(reason));
             }
-            (outcome, now)
-        }
+            outcome => (outcome, now),
+        },
     };
     match outcome {
         SendOutcome::Landed { receipt } => Drive::Done { receipt },
@@ -131,7 +136,7 @@ async fn advance_saved(saved: &mut OutboundRecord, sender: &dyn OutboundSender, 
         SendOutcome::BelowMinimum { reason } => Drive::Failed(OutboundError::BelowMinimum(reason)),
         SendOutcome::Deferred { reason } => Drive::Failed(OutboundError::Deferred(reason)),
         SendOutcome::Reverted { reason } => Drive::Failed(OutboundError::Reverted(reason)),
-        SendOutcome::Open { reason } => {
+        SendOutcome::Open { reason } | SendOutcome::InFlight { reason } => {
             let window = sender.open_window_secs(&saved.prepared);
             if now.saturating_sub(submitted_at) > window {
                 let reason = format!(
@@ -379,6 +384,39 @@ mod tests {
             .await,
             Drive::Done { receipt: "block-3".into() }
         );
+    }
+
+    /// Review finding 3: an absent answer for a send the chain may still take
+    /// would let a second send follow while the first can still land.
+    #[tokio::test]
+    async fn an_in_flight_send_stays_parked_until_it_can_no_longer_land() {
+        let in_flight = || SendOutcome::InFlight {
+            reason: "transaction 0xab at nonce 7 is not mined yet".into(),
+        };
+        let mut record = Some(OutboundRecord {
+            prepared: prepared(),
+            phase: OutboundPhase::Parked {
+                reason: "undecided".into(),
+            },
+            decision: Some(OperatorDecision::Absent),
+        });
+
+        let Drive::Failed(OutboundError::Park(reason)) =
+            advance_outbound(&mut record, &sender(open(), vec![in_flight()]), 500).await
+        else {
+            panic!("an in-flight send must stay parked");
+        };
+        assert!(reason.contains("replace or cancel"), "{reason}");
+        let saved = record.as_ref().expect("the record stays");
+        assert_eq!(saved.phase, OutboundPhase::Parked { reason });
+        assert_eq!(saved.decision, Some(OperatorDecision::Absent), "the answer waits");
+
+        // A cancel at the nonce leaves the chain undecided, so the answer applies.
+        assert!(matches!(
+            advance_outbound(&mut record, &sender(open(), vec![open()]), 600).await,
+            Drive::Failed(OutboundError::Retry(_))
+        ));
+        assert!(record.is_none());
     }
 
     #[tokio::test]

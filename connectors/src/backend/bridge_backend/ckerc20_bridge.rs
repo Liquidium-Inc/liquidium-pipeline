@@ -22,7 +22,7 @@ use super::{
     types::{
         BridgeError, CkEthMinterInfo, Eip1559TransactionPrice, Eip1559TransactionPriceArg, EvmReceiptStatus,
         HelperContract, LedgerError, WithdrawErc20Arg, WithdrawErc20Error, WithdrawErc20Ret, WithdrawalArg,
-        WithdrawalDetail, WithdrawalRet, WithdrawalSearchParameter,
+        WithdrawalDetail, WithdrawalError, WithdrawalRet, WithdrawalSearchParameter,
     },
 };
 use liquidium_pipeline_core::outbound::SendOutcome;
@@ -82,6 +82,44 @@ fn eth_forward_gas_reserve_from_price(gas_price_wei: u128, gas_limit: u128) -> U
         .saturating_mul(U256::from(gas_limit))
         .saturating_mul(U256::from(ETH_FORWARD_GAS_RESERVE_MULTIPLIER));
     dynamic_reserve.max(U256::from(MIN_ETH_FORWARD_GAS_RESERVE_WEI))
+}
+
+/// The minter's certified answer to `withdraw_erc20`: no ckERC20 left the
+/// account. A ckETH fee it burned is reimbursed, so a new call is safe.
+impl From<WithdrawErc20Error> for BridgeError {
+    fn from(error: WithdrawErc20Error) -> Self {
+        let message = format!("withdraw_erc20 error: {error:?}");
+        match error {
+            WithdrawErc20Error::TemporarilyUnavailable(_)
+            | WithdrawErc20Error::CkErc20LedgerError {
+                error: LedgerError::TemporarilyUnavailable(_),
+                ..
+            }
+            | WithdrawErc20Error::CkEthLedgerError {
+                error: LedgerError::TemporarilyUnavailable(_),
+            } => BridgeError::Deferred(message),
+            WithdrawErc20Error::CkErc20LedgerError {
+                error: LedgerError::AmountTooLow { .. },
+                ..
+            }
+            | WithdrawErc20Error::CkEthLedgerError {
+                error: LedgerError::AmountTooLow { .. },
+            } => BridgeError::BelowMinimum(message),
+            _ => BridgeError::Refused(message),
+        }
+    }
+}
+
+/// The minter's certified answer to `withdraw_eth`: no ckETH left the account.
+impl From<WithdrawalError> for BridgeError {
+    fn from(error: WithdrawalError) -> Self {
+        let message = format!("withdraw_eth error: {error:?}");
+        match error {
+            WithdrawalError::TemporarilyUnavailable(_) => BridgeError::Deferred(message),
+            WithdrawalError::AmountTooLow { .. } => BridgeError::BelowMinimum(message),
+            _ => BridgeError::Refused(message),
+        }
+    }
 }
 
 #[cfg_attr(test, mockall::automock)]
@@ -606,9 +644,20 @@ where
                 signer_balance, amount_base_units, signer, token_address
             ).into());
         }
+        // Helper must be approved before deposit call can transfer ERC20 from signer.
+        let helper_allowance = self
+            .evm_backend
+            .erc20_allowance_of(token_address, signer, helper_address)
+            .await
+            .map_err(|e| format!("ERC20 allowance(helper={helper_address}) failed: {e}"))?;
+        // USDT refuses to change one non-zero allowance to another, so a leftover
+        // allowance goes to zero first. That costs one more approve.
+        let clears_allowance = !helper_allowance.is_zero() && helper_allowance < amount_base_units;
+        let approves: u128 = if clears_allowance { 2 } else { 1 };
+
         // The approve and the helper call pay gas from the wallet's own ETH. A
         // short wallet waits for funding instead of failing at broadcast.
-        let gas_limit = ETH_FORWARD_HELPER_GAS_LIMIT + u128::from(ERC20_APPROVE_GAS_LIMIT);
+        let gas_limit = ETH_FORWARD_HELPER_GAS_LIMIT + approves * u128::from(ERC20_APPROVE_GAS_LIMIT);
         let gas_needed = U256::from(self.evm_backend.gas_price_wei().await?).saturating_mul(U256::from(gas_limit));
         let eth_balance = self.evm_backend.native_balance_of(signer).await?;
         if eth_balance < gas_needed {
@@ -618,13 +667,13 @@ where
             )));
         }
 
-        // Helper must be approved before deposit call can transfer ERC20 from signer.
-        let helper_allowance = self
-            .evm_backend
-            .erc20_allowance_of(token_address, signer, helper_address)
-            .await
-            .map_err(|e| format!("ERC20 allowance(helper={helper_address}) failed: {e}"))?;
         if helper_allowance < amount_base_units {
+            if clears_allowance {
+                self.evm_backend
+                    .erc20_approve_and_wait(token_address, helper_address, U256::ZERO)
+                    .await
+                    .map_err(|e| format!("ERC20 approve(helper={helper_address}, 0) failed: {e}"))?;
+            }
             self.evm_backend
                 .erc20_approve_and_wait(token_address, helper_address, amount_base_units)
                 .await
@@ -783,12 +832,53 @@ where
         &self,
         route: &BridgeRouteSpec,
         request: &BridgeRequest,
-    ) -> Result<BridgeSubmission, String> {
+    ) -> Result<BridgeSubmission, BridgeError> {
+        // Held until the withdraw spends the allowances it reads and sets.
+        let _submission = self.reverse_submission.lock().await;
+        let (source_account, cketh_ledger_id, withdraw_args) = self
+            .prepare_reverse_bridge(route, request)
+            .await
+            .map_err(BridgeError::before_call)?;
+
+        let first_try = self.withdraw_erc20_call(&withdraw_args).await?;
+        let result = match first_try {
+            ok @ WithdrawErc20Ret::Ok(_) => ok,
+            WithdrawErc20Ret::Err(WithdrawErc20Error::CkEthLedgerError {
+                error: LedgerError::InsufficientAllowance { failed_burn_amount, .. },
+            }) => {
+                // If fee drift exceeded pre-approved allowance, re-approve based on the
+                // failed burn amount and retry once.
+                let retry_fee_budget = Self::with_fee_headroom(&failed_burn_amount);
+                self.ensure_minter_allowance(&source_account, cketh_ledger_id, retry_fee_budget)
+                    .await
+                    .map_err(BridgeError::Refused)?;
+                self.withdraw_erc20_call(&withdraw_args).await?
+            }
+            err @ WithdrawErc20Ret::Err(_) => err,
+        };
+
+        match result {
+            // Both block indexes identify the ICP-side withdrawal request.
+            WithdrawErc20Ret::Ok(request_id) => Ok(BridgeSubmission {
+                bridge_id: format!(
+                    "ic-withdraw:{}:{}",
+                    request_id.ckerc20_block_index, request_id.cketh_block_index
+                ),
+            }),
+            WithdrawErc20Ret::Err(err) => Err(err.into()),
+        }
+    }
+
+    /// Checks the reverse ERC20 request and sets both minter allowances. It
+    /// does not call the minter's withdraw.
+    async fn prepare_reverse_bridge(
+        &self,
+        route: &BridgeRouteSpec,
+        request: &BridgeRequest,
+    ) -> Result<(Account, Principal, WithdrawErc20Arg), String> {
         let source_account = parse_source_icp_account(&request.source_address)?;
         // Reverse flow is restricted to the configured bridge owner principal.
         ensure_source_matches_bridge_owner(&source_account, self.bridge_ic_owner_principal)?;
-        // Held until the withdraw spends the allowances it reads and sets.
-        let _submission = self.reverse_submission.lock().await;
 
         let destination = expect_evm_destination(route, &request.destination)?;
 
@@ -858,33 +948,7 @@ where
             from_ckerc20_subaccount: None,
             amount: amount_native,
         };
-
-        let first_try = self.withdraw_erc20_call(&withdraw_args).await?;
-        let result = match first_try {
-            ok @ WithdrawErc20Ret::Ok(_) => ok,
-            WithdrawErc20Ret::Err(WithdrawErc20Error::CkEthLedgerError {
-                error: LedgerError::InsufficientAllowance { failed_burn_amount, .. },
-            }) => {
-                // If fee drift exceeded pre-approved allowance, re-approve based on the
-                // failed burn amount and retry once.
-                let retry_fee_budget = Self::with_fee_headroom(&failed_burn_amount);
-                self.ensure_minter_allowance(&source_account, cketh_ledger_id, retry_fee_budget)
-                    .await?;
-                self.withdraw_erc20_call(&withdraw_args).await?
-            }
-            err @ WithdrawErc20Ret::Err(_) => err,
-        };
-
-        match result {
-            // Both block indexes identify the ICP-side withdrawal request.
-            WithdrawErc20Ret::Ok(request_id) => Ok(BridgeSubmission {
-                bridge_id: format!(
-                    "ic-withdraw:{}:{}",
-                    request_id.ckerc20_block_index, request_id.cketh_block_index
-                ),
-            }),
-            WithdrawErc20Ret::Err(err) => Err(format!("withdraw_erc20 error: {:?}", err)),
-        }
+        Ok((source_account, cketh_ledger_id, withdraw_args))
     }
 
     /// Submits native reverse bridge flow (`ckETH@ICP -> ETH@ETH`).
@@ -906,10 +970,30 @@ where
         route: &BridgeRouteSpec,
         request: &BridgeRequest,
     ) -> Result<BridgeSubmission, BridgeError> {
-        let source_account = parse_source_icp_account(&request.source_address)?;
-        ensure_source_matches_bridge_owner(&source_account, self.bridge_ic_owner_principal)?;
         // Held until the withdraw spends the allowances it reads and sets.
         let _submission = self.reverse_submission.lock().await;
+        let withdraw_args = self
+            .prepare_native_reverse_bridge(route, request)
+            .await
+            .map_err(BridgeError::before_call)?;
+
+        match self.withdraw_eth_call(&withdraw_args).await? {
+            WithdrawalRet::Ok(request_id) => Ok(BridgeSubmission {
+                bridge_id: format!("ic-withdraw-eth:{}", request_id.block_index),
+            }),
+            WithdrawalRet::Err(err) => Err(err.into()),
+        }
+    }
+
+    /// Checks the native reverse request and sets the minter allowance. It
+    /// does not call the minter's withdraw.
+    async fn prepare_native_reverse_bridge(
+        &self,
+        route: &BridgeRouteSpec,
+        request: &BridgeRequest,
+    ) -> Result<WithdrawalArg, BridgeError> {
+        let source_account = parse_source_icp_account(&request.source_address)?;
+        ensure_source_matches_bridge_owner(&source_account, self.bridge_ic_owner_principal)?;
 
         let destination = expect_evm_destination(route, &request.destination)?;
         let cketh_ledger_id = parse_ckerc20_ledger_id(route)?;
@@ -938,18 +1022,11 @@ where
         self.ensure_minter_allowance(&source_account, cketh_ledger_id, amount_native.clone())
             .await?;
 
-        let withdraw_args = WithdrawalArg {
+        Ok(WithdrawalArg {
             amount: amount_native,
             recipient: destination.to_string(),
             from_subaccount: None,
-        };
-
-        match self.withdraw_eth_call(&withdraw_args).await? {
-            WithdrawalRet::Ok(request_id) => Ok(BridgeSubmission {
-                bridge_id: format!("ic-withdraw-eth:{}", request_id.block_index),
-            }),
-            WithdrawalRet::Err(err) => Err(format!("withdraw_eth error: {:?}", err).into()),
-        }
+        })
     }
 }
 
@@ -1181,7 +1258,7 @@ where
             BridgeRouteKind::CkEthErc20Forward | BridgeRouteKind::EthToCkEth => {
                 self.submit_signed_forward(route, &request).await
             }
-            BridgeRouteKind::CkEthErc20Reverse => Ok(self.submit_reverse_bridge(route, &request).await?),
+            BridgeRouteKind::CkEthErc20Reverse => self.submit_reverse_bridge(route, &request).await,
             BridgeRouteKind::CkEthToEth => self.submit_native_reverse_bridge(route, &request).await,
             _ => Err(format!(
                 "route {}@{} -> {} is not supported by CkErc20BridgeBackend",

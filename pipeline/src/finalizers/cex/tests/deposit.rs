@@ -277,9 +277,9 @@ fn mexc_sol_reverse_plan_reserves_approval_fee() {
     ).unwrap().unwrap();
     assert_eq!(reserve.value, Nat::from(500u64));
     assert_eq!(burn.value, Nat::from(999_999_500u64));
-    assert!(crate::finalizers::bridge_planner::deposit_destination(
-        route.destination_kind, "not-a-solana-address",
-    ).is_err());
+    assert!(
+        crate::finalizers::bridge_planner::bridge_destination(route.destination_kind, "not-a-solana-address",).is_err()
+    );
 }
 
 #[tokio::test]
@@ -311,6 +311,26 @@ async fn mexc_deposit_phase_b_moves_to_trade_when_balance_increased() {
     assert_eq!(state.deposit.deposit_balance_before, Some(5.0));
     assert_eq!(state.deposit.deposit_txid.as_deref(), Some("tx-123"));
     assert!(matches!(state.step, CexStep::Trade));
+}
+
+/// Review finding 14: an uncredited deposit waited forever with no alert.
+#[tokio::test]
+async fn an_uncredited_deposit_errors_once_its_wait_is_over() {
+    let mut backend = MockCexBackend::new();
+    backend.expect_get_balance().returning(|_symbol| Ok(5.0));
+    let finalizer = test_finalizer(Arc::new(backend), Arc::new(MockTransferActions::new()));
+    let mut state = finalizer.prepare("42", &make_execution_receipt(42)).await.unwrap();
+    state.deposit.deposit_txid = Some("tx-123".to_string());
+    state.deposit.deposit_balance_before = Some(5.0);
+    state.step = CexStep::DepositPending;
+
+    finalizer.deposit(&mut state).await.expect("the credit wait starts");
+    let since = state.deposit.deposit_credit_since_ts.expect("the wait has a clock");
+
+    state.deposit.deposit_credit_since_ts = Some(since - 3 * 60 * 60);
+    let error = finalizer.deposit(&mut state).await.unwrap_err();
+    assert!(error.to_string().contains("not credited"), "{error}");
+    assert!(matches!(state.step, CexStep::DepositPending));
 }
 
 #[tokio::test]
@@ -588,6 +608,7 @@ fn cex_deposit_state_deserialize_defaults_missing_sent_timestamp() {
         deposit_txid: Some("tx-123".to_string()),
         deposit_balance_before: Some(5.0),
         deposit_sent_at_ts: Some(123),
+        deposit_credit_since_ts: None,
         approval_bump_count: Some(2),
         deposit_funding: None,
         bridge: crate::finalizers::cex::state::CexDepositBridgeState {

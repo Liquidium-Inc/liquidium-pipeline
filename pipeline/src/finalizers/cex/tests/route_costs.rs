@@ -19,6 +19,7 @@ async fn bridged_preview_counts_both_bridges_and_the_mexc_withdrawal() {
         assert_eq!((asset, network), ("USDC", "ETH"));
         Ok(WithdrawTerms { fee: 1.0, minimum: 5.0 })
     });
+    cex.expect_check_funding_route().returning(|_| Ok(()));
     // ETH reaches USDC through USDT, one taker fee per leg.
     cex.expect_get_orderbook().returning(|market, _| {
         let price = match market {

@@ -29,9 +29,14 @@ use super::{
     venue_registry::{VenuePreviewOutcome, VenueQuoteBook, VenueRegistry},
 };
 
+#[path = "icpswap_first_planner/cex_waterfall.rs"]
+mod cex_waterfall;
+use cex_waterfall::cex_policy_order;
+
 pub const ICPSWAP_FIRST_STRATEGY_ID: &str = "icpswap_first";
 pub const ICPSWAP_VENUE_ID: &str = "icpswap";
 pub const MEXC_VENUE_ID: &str = "mexc";
+pub const KRAKEN_VENUE_ID: &str = "kraken";
 
 pub(super) const BPS_DENOMINATOR: u32 = 10_000;
 const RAY_PRICE_SCALE: f64 = 1e27;
@@ -44,6 +49,9 @@ pub struct IcpswapFirstPlannerConfig {
     pub max_price_impact_bps: f64,
     pub max_search_iterations: u8,
     pub dust_fallback_max_price_impact_bps: f64,
+    /// Highest price impact a CEX leg may carry while another CEX can take the
+    /// rest. With one CEX enabled the ceiling does not apply.
+    pub max_cex_price_impact_bps: f64,
     pub cex_min_exec_usd: f64,
     pub min_net_edge_bps: u32,
     /// Optional signed override for normal settlement after liquidation.
@@ -61,6 +69,9 @@ pub struct IcpswapFirstPlannerConfig {
     /// it as a fallback for a live oracle read.
     pub oracle_snapshot_max_age_secs: i64,
     pub icpswap_test_allocation_usd: Option<f64>,
+    /// Test-only fixed USD allocation for MEXC. Kraken takes the rest of the
+    /// CEX side, or ICPSwap takes the rest when Kraken is not enabled.
+    pub mexc_test_allocation_usd: Option<f64>,
     /// USD per trillion cycles, for side costs paid in cycles.
     pub cycles_usd_per_trillion: f64,
 }
@@ -108,6 +119,15 @@ impl IcpswapFirstPlannerConfig {
                 self.max_price_impact_bps, BPS_DENOMINATOR
             )));
         }
+        if !self.max_cex_price_impact_bps.is_finite()
+            || self.max_cex_price_impact_bps < 0.0
+            || self.max_cex_price_impact_bps > f64::from(BPS_DENOMINATOR)
+        {
+            return Err(IcpswapFirstPlannerError::InvalidInput(format!(
+                "maximum CEX price impact must be between 0 and {} bps",
+                BPS_DENOMINATOR
+            )));
+        }
         if !self.cex_min_exec_usd.is_finite() || self.cex_min_exec_usd < 0.0 {
             return Err(IcpswapFirstPlannerError::InvalidInput(
                 "CEX minimum execution USD must be finite and non-negative".to_string(),
@@ -144,11 +164,16 @@ impl IcpswapFirstPlannerConfig {
         // that same shortfall plus the input ledger fees and the pool-versus-
         // oracle basis, so its limit has to sit above the impact caps or it would
         // reject the quotes those caps deliberately allow.
-        if f64::from(self.max_oracle_discount_bps) <= self.dust_fallback_max_price_impact_bps {
-            return Err(IcpswapFirstPlannerError::InvalidInput(format!(
-                "maximum oracle discount {} bps must exceed the {:.2} bps dust fallback impact cap",
-                self.max_oracle_discount_bps, self.dust_fallback_max_price_impact_bps
-            )));
+        for (cap_name, cap_bps) in [
+            ("dust fallback", self.dust_fallback_max_price_impact_bps),
+            ("CEX", self.max_cex_price_impact_bps),
+        ] {
+            if f64::from(self.max_oracle_discount_bps) <= cap_bps {
+                return Err(IcpswapFirstPlannerError::InvalidInput(format!(
+                    "maximum oracle discount {} bps must exceed the {cap_bps:.2} bps {cap_name} impact cap",
+                    self.max_oracle_discount_bps
+                )));
+            }
         }
         if !self.cycles_usd_per_trillion.is_finite() || self.cycles_usd_per_trillion <= 0.0 {
             return Err(IcpswapFirstPlannerError::InvalidInput(
@@ -165,6 +190,13 @@ impl IcpswapFirstPlannerConfig {
         {
             return Err(IcpswapFirstPlannerError::InvalidInput(
                 "test ICPSwap allocation USD must be finite and positive".to_string(),
+            ));
+        }
+        if let Some(value) = self.mexc_test_allocation_usd
+            && (!value.is_finite() || value <= 0.0)
+        {
+            return Err(IcpswapFirstPlannerError::InvalidInput(
+                "test MEXC allocation USD must be finite and positive".to_string(),
             ));
         }
         Ok(())
@@ -370,11 +402,6 @@ fn after_side_costs(output: &Nat, side_costs: &Nat) -> Nat {
     }
 }
 
-/// A quote's conservative output after its side costs. Venues compare on this.
-fn net_conservative(preview: &VenueRoutePreview) -> Nat {
-    after_side_costs(&preview.conservative_receive.value, &side_cost_total(preview))
-}
-
 /// Startup notice that a configured test allocation has switched the oracle
 /// quote guard off for that leg. Loud on purpose: it is a live routing setting,
 /// not a test-harness flag, so it can reach production unnoticed.
@@ -457,11 +484,26 @@ impl IcpswapFirstPlanner {
         {
             warn!("{}", oracle_guard_waiver_banner(target_usd));
         }
-        let overflow_venue_ids = venues
-            .venue_ids()
-            .into_iter()
-            .filter(|venue_id| venue_id != ICPSWAP_VENUE_ID)
-            .collect();
+        if config.mexc_test_allocation_usd.is_some() {
+            if !venues.contains(ICPSWAP_VENUE_ID) || !venues.contains(MEXC_VENUE_ID) {
+                return Err(IcpswapFirstPlannerError::InvalidInput(
+                    "the test MEXC allocation needs ICPSwap and MEXC enabled".to_string(),
+                ));
+            }
+            // Without Kraken, both settings would fix the same ICPSwap and MEXC split.
+            if config.icpswap_test_allocation_usd.is_some() && !venues.contains(KRAKEN_VENUE_ID) {
+                return Err(IcpswapFirstPlannerError::InvalidInput(
+                    "without Kraken, set ICPSWAP_TEST_ALLOCATION_USD or MEXC_TEST_ALLOCATION_USD, not both".to_string(),
+                ));
+            }
+        }
+        let overflow_venue_ids = cex_policy_order(
+            venues
+                .venue_ids()
+                .into_iter()
+                .filter(|venue_id| venue_id != ICPSWAP_VENUE_ID)
+                .collect(),
+        );
         Ok(Self {
             venues,
             overflow_venue_ids,
@@ -499,6 +541,12 @@ impl IcpswapFirstPlanner {
 
         if let Some(target_usd) = self.config.icpswap_test_allocation_usd {
             return self.plan_test_fixed_icpswap_split(input, quoted_at, target_usd).await;
+        }
+        if let Some(target_usd) = self.config.mexc_test_allocation_usd
+            && !self.venues.contains(KRAKEN_VENUE_ID)
+            && let Some(state) = self.plan_test_fixed_mexc_split(input, quoted_at, target_usd).await
+        {
+            return Ok(state);
         }
 
         // The common safe-ICPSwap path needs no CEX data. Quote ICPSwap alone
@@ -539,32 +587,14 @@ impl IcpswapFirstPlanner {
             | VenuePreviewOutcome::Invalid(icpswap_error)
             | VenuePreviewOutcome::BelowMinimum(icpswap_error) => {
                 let fallthrough_reason = format!("ICPSwap quote rejected ({icpswap_error})");
-                let overflow_quotes = self
-                    .preview_overflow(input, input.total_pay.value.clone())
-                    .await
-                    .map_err(|error| self.classify_overflow_preview_error(error, Some(&fallthrough_reason)))?;
-                let overflow = self.best_executable_overflow(input, &overflow_quotes).ok_or_else(|| {
-                    IcpswapFirstPlannerError::NoViableRoute(format!(
-                        "ICPSwap quote rejected ({icpswap_error}); {}",
-                        self.overflow_failure_summary(&overflow_quotes)
-                    ))
-                })?;
-                let mut unavailable_venue_ids = vec![ICPSWAP_VENUE_ID.to_string()];
-                unavailable_venue_ids.extend(
-                    overflow_quotes
-                        .iter()
-                        .filter(|preview| !matches!(preview.outcome, VenuePreviewOutcome::Quoted(_)))
-                        .map(|preview| preview.venue_id.clone()),
-                );
-                self.build_state(
-                    input,
-                    vec![overflow.clone()],
+                let overflow = self.full_amount_overflow(input, Some(fallthrough_reason)).await?;
+                let reason = Self::overflow_reason(&overflow, |selected_venue_id| {
                     MultiVenueAllocationReason::VenueUnavailable {
-                        selected_venue_id: overflow.venue_id.clone(),
-                        unavailable_venue_ids,
-                    },
-                    quoted_at,
-                )
+                        selected_venue_id,
+                        unavailable_venue_ids: vec![ICPSWAP_VENUE_ID.to_string()],
+                    }
+                });
+                self.build_state(input, overflow, reason, quoted_at)
             }
         }
     }
@@ -597,7 +627,7 @@ impl IcpswapFirstPlanner {
         }
         if icpswap_value >= input.total_pay.value {
             return Err(IcpswapFirstPlannerError::NoViableRoute(format!(
-                "received collateral is too small to split ${target_usd:.2} to ICPSwap and leave a MEXC remainder"
+                "received collateral is too small to split ${target_usd:.2} to ICPSwap and leave a CEX remainder"
             )));
         }
 
@@ -623,7 +653,7 @@ impl IcpswapFirstPlanner {
         let icpswap_input = unguarded_input.as_ref().unwrap_or(input);
         let (icpswap_result, overflow_result) = tokio::join!(
             self.preview_exact(icpswap_input, ICPSWAP_VENUE_ID, &icpswap_request),
-            self.preview_overflow(input, remainder_value),
+            self.forced_or_ordered_overflow_previews(input, remainder_value),
         );
         let icpswap = icpswap_result?;
         if !self.is_safe_icpswap(&icpswap) {
@@ -632,17 +662,69 @@ impl IcpswapFirstPlanner {
                 icpswap.quote.estimated_price_impact_bps, self.config.max_price_impact_bps
             )));
         }
-        let overflow_quotes = overflow_result?;
-        let overflow = self
-            .best_executable_overflow(input, &overflow_quotes)
-            .ok_or_else(|| IcpswapFirstPlannerError::NoViableRoute(self.overflow_failure_summary(&overflow_quotes)))?;
+        let mut previews = vec![icpswap];
+        previews.extend(overflow_result?);
 
-        self.build_state(
-            input,
-            vec![icpswap, overflow.clone()],
-            MultiVenueAllocationReason::PriceImpactSplit,
-            quoted_at,
-        )
+        self.build_state(input, previews, MultiVenueAllocationReason::PriceImpactSplit, quoted_at)
+    }
+
+    /// Test-only split without Kraken: MEXC takes the fixed USD amount and
+    /// ICPSwap takes the rest. `None` lets the normal plan run, because a test
+    /// setting must never fail a plan.
+    async fn plan_test_fixed_mexc_split(
+        &self,
+        input: &IcpswapFirstPlanInput,
+        quoted_at: i64,
+        target_usd: f64,
+    ) -> Option<MultiVenueExecutionState> {
+        let Some(reference_price) = input.pay_reference_price_usd else {
+            warn!(
+                "[multi-venue] liq_id={} forced MEXC split skipped: no collateral reference price",
+                input.liquidation_id
+            );
+            return None;
+        };
+        let mexc_value =
+            ChainTokenAmount::from_formatted(input.total_pay.token.clone(), target_usd / reference_price).value;
+        if mexc_value == 0u8 || mexc_value >= input.total_pay.value {
+            warn!(
+                "[multi-venue] liq_id={} forced MEXC split skipped: ${target_usd:.2} to MEXC leaves no ICPSwap remainder",
+                input.liquidation_id
+            );
+            return None;
+        }
+        warn!(
+            "[multi-venue] liq_id={} TEST-ONLY forced split: ${target_usd:.2} to MEXC, remainder to ICPSwap",
+            input.liquidation_id
+        );
+        let icpswap_request = input.request_for(ICPSWAP_VENUE_ID, input.total_pay.value.clone() - mexc_value.clone());
+        let (mexc, icpswap) = tokio::join!(
+            self.preview_safe_cex(input, MEXC_VENUE_ID, mexc_value),
+            self.preview_exact(input, ICPSWAP_VENUE_ID, &icpswap_request),
+        );
+        let abandoned = match (mexc, icpswap) {
+            (Err(error), _) => format!("{MEXC_VENUE_ID} could not quote its forced ${target_usd:.2} leg ({error})"),
+            (_, Err(error)) => format!("{ICPSWAP_VENUE_ID} could not quote the remainder ({error})"),
+            (Ok(_), Ok(icpswap)) if !self.is_safe_icpswap(&icpswap) => format!(
+                "{ICPSWAP_VENUE_ID} remainder impact {:.2} bps is not below {:.2} bps",
+                icpswap.quote.estimated_price_impact_bps, self.config.max_price_impact_bps
+            ),
+            (Ok(mexc), Ok(icpswap)) => match self.build_state(
+                input,
+                vec![icpswap, mexc],
+                MultiVenueAllocationReason::PriceImpactSplit,
+                quoted_at,
+            ) {
+                Ok(state) => return Some(state),
+                Err(error) => format!("the split plan was rejected ({error})"),
+            },
+        };
+        // Loudly, because the run no longer tests the split it was configured for.
+        warn!(
+            "[multi-venue] liq_id={} forced MEXC split abandoned: {abandoned}; planning normally",
+            input.liquidation_id
+        );
+        None
     }
 
     // Avoids a dust overflow leg by re-quoting the full amount on ICPSwap with
@@ -689,22 +771,19 @@ impl IcpswapFirstPlanner {
         skipped_venue_ids.extend(
             self.overflow_venue_ids
                 .iter()
-                .filter(|venue_id| venue_id.as_str() != overflow.venue_id.as_str())
+                .filter(|venue_id| overflow.iter().all(|leg| leg.venue_id != **venue_id))
                 .cloned(),
         );
-        self.build_state(
-            input,
-            vec![overflow.clone()],
+        let reason = Self::overflow_reason(&overflow, |selected_venue_id| {
             MultiVenueAllocationReason::RemainderBelowMinimum {
                 skipped_venue_ids,
-                selected_venue_id: overflow.venue_id.clone(),
-            },
-            quoted_at,
-        )
+                selected_venue_id,
+            }
+        });
+        self.build_state(input, overflow, reason, quoted_at)
     }
 
-    // Quotes the complete allocation on every overflow venue and returns the
-    // best executable one.
+    // Runs the complete allocation down the CEX waterfall.
     //
     // `fallthrough_reason` prefixes the rejection summary when the caller
     // reached this path because another venue fell through. Its presence is
@@ -715,61 +794,33 @@ impl IcpswapFirstPlanner {
         &self,
         input: &IcpswapFirstPlanInput,
         fallthrough_reason: Option<String>,
-    ) -> Result<VenueRoutePreview, IcpswapFirstPlannerError> {
-        let quotes = self
-            .preview_overflow(input, input.total_pay.value.clone())
+    ) -> Result<Vec<VenueRoutePreview>, IcpswapFirstPlannerError> {
+        self.ordered_overflow_previews(input, input.total_pay.value.clone())
             .await
-            .map_err(|error| self.classify_overflow_preview_error(error, fallthrough_reason.as_deref()))?;
-        self.best_executable_overflow(input, &quotes).cloned().ok_or_else(|| {
-            let summary = self.overflow_failure_summary(&quotes);
-            match fallthrough_reason {
-                Some(reason) => IcpswapFirstPlannerError::NoViableRoute(format!("{reason}; {summary}")),
-                None if self.every_overflow_venue_responded(&quotes) => {
+            .map_err(|error| match (error, fallthrough_reason) {
+                (
                     IcpswapFirstPlannerError::BelowVenueMinimum(summary)
-                }
-                None => IcpswapFirstPlannerError::NoViableRoute(summary),
-            }
-        })
-    }
-
-    // Whether every configured overflow venue actually answered. Combined with
-    // `best_executable_overflow` returning nothing, this is what distinguishes
-    // "all venues are healthy and this amount is simply too small" from "a
-    // venue is down", which is not a permanent property of the amount. The
-    // pre-quote check in `preview_overflow` never reaches here.
-    fn every_overflow_venue_responded(&self, quotes: &VenueQuoteBook) -> bool {
-        !self.overflow_venue_ids.is_empty()
-            && self.overflow_venue_ids.iter().all(|venue_id| {
-                matches!(
-                    quotes.get(venue_id).map(|venue| &venue.outcome),
-                    Some(VenuePreviewOutcome::Quoted(_) | VenuePreviewOutcome::BelowMinimum(_))
-                )
+                    | IcpswapFirstPlannerError::NoViableRoute(summary),
+                    Some(reason),
+                ) => IcpswapFirstPlannerError::NoViableRoute(format!("{reason}; {summary}")),
+                (error, _) => error,
             })
     }
 
-    fn below_minimum_overflow_summary(&self) -> String {
-        self.overflow_venue_ids
-            .iter()
-            .map(|venue_id| format!("{} amount is below its minimum", venue_id.to_uppercase()))
-            .collect::<Vec<_>>()
-            .join("; ")
-    }
-
-    fn classify_overflow_preview_error(
-        &self,
-        error: IcpswapFirstPlannerError,
-        fallthrough_reason: Option<&str>,
-    ) -> IcpswapFirstPlannerError {
-        match (error, fallthrough_reason) {
-            (IcpswapFirstPlannerError::BelowVenueMinimum(summary), Some(reason)) => {
-                IcpswapFirstPlannerError::NoViableRoute(format!("{reason}; {summary}"))
-            }
-            (error, _) => error,
+    /// One CEX leg keeps the reason its caller names; a waterfall of two or
+    /// more legs is a price-impact split.
+    fn overflow_reason(
+        legs: &[VenueRoutePreview],
+        single: impl FnOnce(String) -> MultiVenueAllocationReason,
+    ) -> MultiVenueAllocationReason {
+        match legs {
+            [only] => single(only.venue_id.clone()),
+            _ => MultiVenueAllocationReason::PriceImpactSplit,
         }
     }
 
-    // Non-native ICP collateral cannot use ICPSwap, so choose the executable
-    // overflow venue with the highest conservative output.
+    // Collateral ICPSwap cannot take goes down the CEX waterfall, or into the
+    // forced test split when its setting is present.
     async fn plan_overflow_only(
         &self,
         input: &IcpswapFirstPlanInput,
@@ -780,14 +831,13 @@ impl IcpswapFirstPlanner {
                 "no enabled venue can accept this collateral asset".to_string(),
             ));
         }
-        let preview = self.full_amount_overflow(input, None).await?;
-        let venue_id = preview.venue_id.clone();
-        self.build_state(
-            input,
-            vec![preview],
-            MultiVenueAllocationReason::SingleVenue { venue_id },
-            quoted_at,
-        )
+        let overflow = self
+            .forced_or_ordered_overflow_previews(input, input.total_pay.value.clone())
+            .await?;
+        let reason = Self::overflow_reason(&overflow, |venue_id| MultiVenueAllocationReason::SingleVenue {
+            venue_id,
+        });
+        self.build_state(input, overflow, reason, quoted_at)
     }
 
     /// Builds the plan from a candidate that includes ICPSwap. If its profit or
@@ -827,16 +877,13 @@ impl IcpswapFirstPlanner {
         let overflow = self
             .full_amount_overflow(input, Some(format!("ICPSwap exact quote rejected ({icpswap_error})")))
             .await?;
-        let selected_venue_id = overflow.venue_id.clone();
-        self.build_state(
-            input,
-            vec![overflow],
+        let reason = Self::overflow_reason(&overflow, |selected_venue_id| {
             MultiVenueAllocationReason::VenueUnavailable {
                 selected_venue_id,
                 unavailable_venue_ids: vec![ICPSWAP_VENUE_ID.to_string()],
-            },
-            quoted_at,
-        )
+            }
+        });
+        self.build_state(input, overflow, reason, quoted_at)
     }
 
     // Finds the largest safe ICPSwap leg, then either sends the remainder to
@@ -861,19 +908,16 @@ impl IcpswapFirstPlanner {
 
         if safe_value == Nat::from(0u8) {
             let overflow = self.full_amount_overflow(input, None).await?;
-            let venue_id = overflow.venue_id.clone();
-            return self.build_state(
-                input,
-                vec![overflow],
-                MultiVenueAllocationReason::SingleVenue { venue_id },
-                quoted_at,
-            );
+            let reason = Self::overflow_reason(&overflow, |venue_id| MultiVenueAllocationReason::SingleVenue {
+                venue_id,
+            });
+            return self.build_state(input, overflow, reason, quoted_at);
         }
 
         let icpswap_request = input.request_for(ICPSWAP_VENUE_ID, safe_value);
         let (icpswap_result, overflow_result) = tokio::join!(
             self.preview_exact(input, ICPSWAP_VENUE_ID, &icpswap_request),
-            self.preview_overflow(input, remainder_value),
+            self.ordered_overflow_previews(input, remainder_value),
         );
         let icpswap = match icpswap_result {
             Ok(icpswap) => icpswap,
@@ -900,18 +944,11 @@ impl IcpswapFirstPlanner {
                 .await;
         }
 
-        let overflow_quotes = overflow_result?;
-        let overflow = self
-            .best_executable_overflow(input, &overflow_quotes)
-            .ok_or_else(|| IcpswapFirstPlannerError::NoViableRoute(self.overflow_failure_summary(&overflow_quotes)))?;
+        let mut previews = vec![icpswap];
+        previews.extend(overflow_result?);
 
-        self.build_or_overflow(
-            input,
-            vec![icpswap, overflow.clone()],
-            MultiVenueAllocationReason::PriceImpactSplit,
-            quoted_at,
-        )
-        .await
+        self.build_or_overflow(input, previews, MultiVenueAllocationReason::PriceImpactSplit, quoted_at)
+            .await
     }
 
     // Binary-searches for the largest amount whose confirmed ICPSwap impact
@@ -1009,36 +1046,6 @@ impl IcpswapFirstPlanner {
             ))
         })?;
         Ok(preview)
-    }
-
-    // Quotes configured overflow venues for the exact amount left after the
-    // safe ICPSwap allocation has been determined.
-    async fn preview_overflow(
-        &self,
-        input: &IcpswapFirstPlanInput,
-        pay_value: Nat,
-    ) -> Result<VenueQuoteBook, IcpswapFirstPlannerError> {
-        // Overflow dust must never reach a venue adapter. Fixed transfer fees
-        // can dominate a tiny allocation and make a fair market quote look like
-        // an oracle-price failure, while the venue cannot execute the amount
-        // economically in any case.
-        let pay_amount = ChainTokenAmount::from_raw(input.total_pay.token.clone(), pay_value.clone());
-        if !input.meets_cex_minimum(&pay_amount, self.config.cex_min_exec_usd) {
-            return Err(IcpswapFirstPlannerError::BelowVenueMinimum(
-                self.below_minimum_overflow_summary(),
-            ));
-        }
-
-        let context = input.planning_context();
-        let quotes = self
-            .venues
-            .preview_venues(&context, &self.overflow_venue_ids, |venue_id| {
-                input.request_for(venue_id, pay_value.clone())
-            })
-            .await
-            .map_err(IcpswapFirstPlannerError::InvalidInput)?;
-        let quotes = self.drop_invalid_quotes(input, quotes);
-        Ok(self.price_quote_book(input, quotes).await)
     }
 
     /// Prices every quoted venue's side costs. A venue whose costs cannot be
@@ -1267,55 +1274,6 @@ impl IcpswapFirstPlanner {
             "{venue_id} quote is {:.2} bps below oracle-implied output, exceeding the {} bps limit",
             discount_bps, self.config.max_oracle_discount_bps
         )))
-    }
-
-    // Excludes unavailable, invalid, and below-minimum overflow quotes, then
-    // selects the venue with the highest conservative output after side costs.
-    fn best_executable_overflow<'a>(
-        &self,
-        input: &IcpswapFirstPlanInput,
-        quotes: &'a VenueQuoteBook,
-    ) -> Option<&'a VenueRoutePreview> {
-        self.overflow_venue_ids
-            .iter()
-            .filter_map(|venue_id| quotes.get(venue_id))
-            .filter_map(|venue| match &venue.outcome {
-                VenuePreviewOutcome::Quoted(preview)
-                    if input.meets_cex_minimum(&preview.request.pay_amount, self.config.cex_min_exec_usd) =>
-                {
-                    Some(preview)
-                }
-                _ => None,
-            })
-            // Replace the current selection only for a strictly better quote,
-            // so an exact tie keeps the first venue from environment order.
-            .fold(None, |best, candidate| match best {
-                Some(current) if net_conservative(current) >= net_conservative(candidate) => Some(current),
-                _ => Some(candidate),
-            })
-    }
-
-    // Explains why none of the configured overflow venues can execute.
-    fn overflow_failure_summary(&self, quotes: &VenueQuoteBook) -> String {
-        self.overflow_venue_ids
-            .iter()
-            .map(|venue_id| match quotes.get(venue_id).map(|venue| &venue.outcome) {
-                Some(VenuePreviewOutcome::Unavailable(error)) => {
-                    format!("{} unavailable ({error})", venue_id.to_uppercase())
-                }
-                Some(VenuePreviewOutcome::Invalid(error)) => {
-                    format!("{} quote rejected ({error})", venue_id.to_uppercase())
-                }
-                Some(VenuePreviewOutcome::BelowMinimum(reason)) => {
-                    format!("{} amount below minimum ({reason})", venue_id.to_uppercase())
-                }
-                Some(VenuePreviewOutcome::Quoted(_)) => {
-                    format!("{} amount is below its minimum", venue_id.to_uppercase())
-                }
-                None => format!("{} preview is missing", venue_id.to_uppercase()),
-            })
-            .collect::<Vec<_>>()
-            .join("; ")
     }
 
     // Converts selected previews into persisted legs, enforces the combined

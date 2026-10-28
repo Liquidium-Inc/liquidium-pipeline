@@ -100,8 +100,8 @@ async fn anvil_a_signed_helper_deposit_lands_once() {
         "sent, not mined"
     );
     assert!(
-        matches!(sender.settle(&prepared).await, SendOutcome::Open { .. }),
-        "pending"
+        matches!(sender.settle(&prepared).await, SendOutcome::InFlight { .. }),
+        "pending, and it can still land"
     );
     // The node already holds the bytes, so a second submit cannot clear the record.
     let again = sender.submit(&prepared).await;
@@ -143,4 +143,42 @@ async fn anvil_a_refusal_for_missing_funds_never_landed() {
 
     let outcome = EvmSender::new(backend).submit(&evm_prepared_send(&tx).unwrap()).await;
     assert!(matches!(outcome, SendOutcome::NeverLanded { .. }), "{outcome:?}");
+}
+
+/// Review finding 10: alloy's nonce cache never saw the signed deposits, so
+/// a later approve tried spent nonces until its retries ran out.
+#[tokio::test]
+#[ignore = "needs anvil on PATH"]
+async fn anvil_an_approve_after_signed_deposits_takes_the_next_nonce() {
+    let (_anvil, provider, helper) = start_anvil().await;
+    let backend = Arc::new(EvmBackendImpl::new(provider.clone()));
+    let miner = {
+        let provider = provider.clone();
+        tokio::spawn(async move {
+            loop {
+                mine(&provider).await;
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        })
+    };
+    // The helper's STOP code accepts an approve call as well.
+    let spender = Address::repeat_byte(0x11);
+    backend
+        .erc20_approve_and_wait_raw(helper, spender, U256::from(1u64))
+        .await
+        .expect("the first approve lands");
+    let sender = EvmSender::new(backend.clone());
+    for salt in 1..=3u8 {
+        let tx = backend
+            .sign_helper_deposit_eth_native(helper, U256::from(1_000u64), FixedBytes::repeat_byte(salt))
+            .await
+            .expect("the deposit is signed");
+        sender.submit(&evm_prepared_send(&tx).unwrap()).await;
+    }
+
+    backend
+        .erc20_approve_and_wait_raw(helper, spender, U256::from(2u64))
+        .await
+        .expect("the second approve takes the nonce after the deposits");
+    miner.abort();
 }

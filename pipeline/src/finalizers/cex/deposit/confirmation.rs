@@ -9,6 +9,10 @@ const DEPOSIT_CONFIRMATION_DELTA_EPSILON: f64 = 0.00001;
 /// After this wait window, allow a fallback confirmation from total free balance.
 const DEPOSIT_TOTAL_FREE_FALLBACK_SECS: i64 = 25;
 
+/// A Bitcoin deposit needs several confirmations, so the credit wait allows
+/// hours. After it, each waiting cycle errors, so the row parks for an operator.
+const DEPOSIT_CREDIT_TIMEOUT_SECS: i64 = 2 * 60 * 60;
+
 impl<C> CexVenueFinalizer<C>
 where
     C: CexBackend,
@@ -109,10 +113,15 @@ where
                     return Ok(());
                 }
 
-                debug!(
-                    "[cex] liq_id={} deposit pending: before={} current={} delta={} expected={}",
+                let waited = waited_secs(&mut state.deposit.deposit_credit_since_ts);
+                let line = format!(
+                    "deposit of {symbol} for liq_id {} is not credited after {waited}s: before={} current={} delta={} expected={}",
                     state.liq_id, baseline_balance, current_balance, observed_balance_delta, expected_deposit_amount
                 );
+                if waited > DEPOSIT_CREDIT_TIMEOUT_SECS {
+                    return Err(line);
+                }
+                debug!("[cex] {line}");
             }
             None => {
                 // No baseline recorded yet (should normally be set when we send the transfer),

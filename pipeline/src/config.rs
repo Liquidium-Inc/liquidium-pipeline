@@ -51,6 +51,9 @@ pub struct Config {
     pub db_path: String,
     pub max_allowed_dex_slippage: u32,
     pub max_allowed_cex_slippage_bps: u32,
+    /// The widest IOC limit after orders at the CEX cap fill nothing. A value
+    /// at or below the cap turns widening off.
+    pub max_widened_cex_slippage_bps: u32,
     pub bad_debt_collateral_slippage_bps: u32,
     /// Minimum USD notional allowed for a single CEX execution chunk.
     /// Chunks below this threshold are treated as dust.
@@ -95,6 +98,11 @@ pub struct Config {
     /// Maximum intermediate hops allowed for MEXC route discovery.
     /// Example: `2` allows up to 3 legs total.
     pub cex_mexc_max_hops: u8,
+    /// Kraken's market allowlist, as `BASE_QUOTE`. Kraken refuses to start
+    /// with an empty one, so the setting is required when Kraken is enabled.
+    pub cex_kraken_available_pairs: Vec<String>,
+    /// Maximum intermediate hops allowed for Kraken route discovery.
+    pub cex_kraken_max_hops: u8,
     pub icpswap_factory_canister: Principal,
     pub icpswap_fee_tiers: Vec<candid::Nat>,
     /// Highest ICPSwap price impact an allocation may carry, in bps. The limit is
@@ -106,9 +114,15 @@ pub struct Config {
     /// Higher ICPSwap impact cap used only when an overflow remainder is below
     /// the venue minimum and the planner considers sending the full amount DEX-side.
     pub icpswap_dust_fallback_max_price_impact_bps: f64,
+    /// Highest price impact a CEX leg may carry while another CEX can take
+    /// the rest, in bps. With one CEX enabled the ceiling does not apply.
+    pub cex_max_price_impact_bps: f64,
     /// Test-only fixed USD allocation sent to ICPSwap before routing the
     /// remainder to an overflow venue. Unset preserves the normal policy.
     pub icpswap_test_allocation_usd: Option<f64>,
+    /// Test-only fixed USD allocation for MEXC. Kraken takes the rest of the CEX
+    /// side, or ICPSwap the rest when Kraken is not enabled. Unset preserves the normal policy.
+    pub mexc_test_allocation_usd: Option<f64>,
     /// Ordered venue IDs eligible for new multi-venue plans.
     pub enabled_swap_venues: Vec<String>,
     pub cex_credentials: HashMap<String, (String, String)>,
@@ -381,17 +395,26 @@ impl Config {
             parse_slippage_bps_from_env("MAX_ALLOWED_DEX_SLIPPAGE", DEFAULT_MAX_ALLOWED_DEX_SLIPPAGE_BPS)?;
         let max_allowed_cex_slippage_bps =
             parse_slippage_bps_from_env("MAX_ALLOWED_CEX_SLIPPAGE_BPS", DEFAULT_MAX_ALLOWED_CEX_SLIPPAGE_BPS)?;
+        let max_widened_cex_slippage_bps = parse_widened_cex_slippage_bps_from_env()?;
 
         let bad_debt_collateral_slippage_bps = parse_bad_debt_collateral_slippage_bps_from_env();
         let cex_tunables = parse_cex_tunables_from_env();
-        let cex_mexc_available_pairs = parse_cex_mexc_available_pairs_from_env();
-        let cex_mexc_max_hops = parse_cex_mexc_max_hops_from_env();
+        let cex_mexc_available_pairs = parse_cex_available_pairs_from_env("CEX_MEXC_AVAILABLE_PAIRS");
+        let cex_mexc_max_hops = parse_cex_max_hops_from_env("CEX_MEXC_MAX_HOPS");
+        let cex_kraken_available_pairs = parse_cex_available_pairs_from_env("CEX_KRAKEN_AVAILABLE_PAIRS");
+        let cex_kraken_max_hops = parse_cex_max_hops_from_env("CEX_KRAKEN_MAX_HOPS");
         let icpswap_factory_canister = parse_icpswap_factory_from_env()?;
         let icpswap_fee_tiers = parse_icpswap_fee_tiers_from_env()?;
-        let icpswap_test_allocation_usd = parse_icpswap_test_allocation_usd_from_env()?;
+        let icpswap_test_allocation_usd = parse_test_allocation_usd_from_env("ICPSWAP_TEST_ALLOCATION_USD")?;
         if let Some(value) = icpswap_test_allocation_usd {
             warn!(
-                "TEST-ONLY ICPSwap split is enabled: approximately ${value:.2} goes to ICPSwap and the remainder to MEXC"
+                "TEST-ONLY ICPSwap split is enabled: approximately ${value:.2} goes to ICPSwap and the remainder to the CEX waterfall"
+            );
+        }
+        let mexc_test_allocation_usd = parse_test_allocation_usd_from_env("MEXC_TEST_ALLOCATION_USD")?;
+        if let Some(value) = mexc_test_allocation_usd {
+            warn!(
+                "TEST-ONLY MEXC split is enabled: approximately ${value:.2} goes to MEXC and the remainder to Kraken, or to ICPSwap when Kraken is not enabled"
             );
         }
 
@@ -436,6 +459,7 @@ impl Config {
             db_path,
             max_allowed_dex_slippage,
             max_allowed_cex_slippage_bps,
+            max_widened_cex_slippage_bps,
             bad_debt_collateral_slippage_bps,
             cex_min_exec_usd: cex_tunables.min_exec_usd,
             cex_slice_target_ratio: cex_tunables.slice_target_ratio,
@@ -456,12 +480,16 @@ impl Config {
             cex_route_fee_bps: cex_tunables.route_fee_bps,
             cex_mexc_available_pairs,
             cex_mexc_max_hops,
+            cex_kraken_available_pairs,
+            cex_kraken_max_hops,
             icpswap_factory_canister,
             icpswap_fee_tiers,
             icpswap_max_price_impact_bps: parse_icpswap_max_price_impact_bps_from_env(),
             icpswap_max_search_iterations: parse_icpswap_max_search_iterations_from_env(),
             icpswap_dust_fallback_max_price_impact_bps: parse_icpswap_dust_fallback_max_price_impact_bps_from_env(),
+            cex_max_price_impact_bps: parse_cex_max_price_impact_bps_from_env(),
             icpswap_test_allocation_usd,
+            mexc_test_allocation_usd,
             enabled_swap_venues,
             cex_credentials,
             opportunity_account_filter,
@@ -503,12 +531,13 @@ fn load_cex_credentials() -> HashMap<String, (String, String)> {
             let name_lower = name.to_lowercase();
             let secret_var = format!("CEX_{}_API_SECRET", name);
 
+            // A blank key in the env file means the exchange has no credentials.
             match std::env::var(&secret_var) {
-                Ok(secret) => {
+                Ok(secret) if !value.trim().is_empty() && !secret.trim().is_empty() => {
                     debug!("Loaded CEX credentials for '{}'", name_lower);
                     cex_credentials.insert(name_lower, (value, secret));
                 }
-                Err(_) => {
+                _ => {
                     debug!("Found {} but missing {}", key, secret_var);
                 }
             }
@@ -557,8 +586,8 @@ const DEFAULT_CEX_DELAY_BUFFER_BPS: u32 = 75;
 const DEFAULT_CEX_ROUTE_FEE_BPS: u32 = 0;
 /// One trillion cycles is one XDR. The XDR moves little against the USD.
 const DEFAULT_CYCLES_USD_PER_TRILLION: f64 = 1.35;
-const DEFAULT_CEX_MEXC_MAX_HOPS: u8 = 2;
-const MAX_CEX_MEXC_MAX_HOPS: u8 = 4;
+const DEFAULT_CEX_MAX_HOPS: u8 = 2;
+const MAX_CEX_MAX_HOPS: u8 = 4;
 const DEFAULT_BAD_DEBT_COLLATERAL_SLIPPAGE_BPS: u32 = 500;
 const MAX_BPS: u32 = 10_000;
 const MIN_RATIO: f64 = 0.0;
@@ -576,9 +605,12 @@ pub const DEFAULT_ICPSWAP_FACTORY_CANISTER: &str = "4mmnk-kiaaa-aaaag-qbllq-cai"
 const DEFAULT_ICPSWAP_FEE_TIERS: &str = "100,500,3000,10000";
 const DEFAULT_ICPSWAP_MAX_PRICE_IMPACT_BPS: f64 = 100.0;
 const DEFAULT_ICPSWAP_DUST_FALLBACK_MAX_PRICE_IMPACT_BPS: f64 = 150.0;
+const DEFAULT_CEX_MAX_PRICE_IMPACT_BPS: f64 = 200.0;
 const DEFAULT_ICPSWAP_MAX_SEARCH_ITERATIONS: u8 = 16;
 const DEFAULT_ENABLED_SWAP_VENUES: &str = "icpswap,mexc";
-const SUPPORTED_SWAP_VENUES: [&str; 2] = ["icpswap", "mexc"];
+const SUPPORTED_SWAP_VENUES: [&str; 3] = ["icpswap", "mexc", "kraken"];
+/// Venues this release refuses to start with. Remove a venue here to release it.
+const RELEASE_DISABLED_SWAP_VENUES: [&str; 1] = ["kraken"];
 
 fn parse_multi_venue_min_net_edge_bps_from_env() -> u32 {
     env::var("MULTI_VENUE_MIN_NET_EDGE_BPS")
@@ -590,11 +622,14 @@ fn parse_multi_venue_min_net_edge_bps_from_env() -> u32 {
 }
 
 /// Reads a signed basis-point value, keeping it only when `valid` accepts it.
+/// A set but unusable value is logged, because its default may be far from it.
 fn parse_signed_bps_from_env(var: &str, valid: impl Fn(i32) -> bool) -> Option<i32> {
-    env::var(var)
-        .ok()
-        .and_then(|value| value.parse::<i32>().ok())
-        .filter(|bps| valid(*bps))
+    let raw = env::var(var).ok()?;
+    let parsed = raw.parse::<i32>().ok().filter(|bps| valid(*bps));
+    if parsed.is_none() {
+        warn!("{var}={raw} is not a usable signed bps value; the default applies");
+    }
+    parsed
 }
 
 fn parse_multi_venue_settlement_min_net_edge_bps_from_env() -> Option<i32> {
@@ -653,6 +688,7 @@ fn parse_bad_debt_collateral_slippage_bps_from_env() -> u32 {
 const MAX_CONFIGURABLE_SLIPPAGE_BPS: u32 = 2_000;
 const DEFAULT_MAX_ALLOWED_DEX_SLIPPAGE_BPS: u32 = 125;
 const DEFAULT_MAX_ALLOWED_CEX_SLIPPAGE_BPS: u32 = 200;
+const DEFAULT_MAX_WIDENED_CEX_SLIPPAGE_BPS: u32 = 400;
 
 /// Reads a basis-point slippage allowance, falling back to the shared
 /// `MAX_ALLOWED_SLIPPAGE_BPS` and then to `default_bps`.
@@ -678,7 +714,20 @@ fn parse_slippage_bps_from_env(primary: &str, default_bps: u32) -> Result<u32, S
     else {
         return Ok(default_bps);
     };
+    parse_slippage_bps(name, &trimmed)
+}
 
+/// The widest IOC limit after orders at the cap fill nothing. It has no shared
+/// fallback, because the shared value is a cap, not a widened limit.
+fn parse_widened_cex_slippage_bps_from_env() -> Result<u32, String> {
+    const NAME: &str = "MAX_WIDENED_CEX_SLIPPAGE_BPS";
+    match env::var(NAME).ok().map(|value| value.trim().to_string()) {
+        Some(value) if !value.is_empty() => parse_slippage_bps(NAME, &value),
+        _ => Ok(DEFAULT_MAX_WIDENED_CEX_SLIPPAGE_BPS),
+    }
+}
+
+fn parse_slippage_bps(name: &str, trimmed: &str) -> Result<u32, String> {
     let parsed: u32 = trimmed
         .parse()
         .map_err(|_| format!("{name}='{trimmed}' is not a whole number of basis points (e.g. 125 for 1.25%)"))?;
@@ -704,6 +753,11 @@ fn parse_enabled_swap_venues_from_env() -> Result<Vec<String>, String> {
             return Err(format!(
                 "ENABLED_SWAP_VENUES contains unsupported venue `{venue_id}`; expected one of {}",
                 SUPPORTED_SWAP_VENUES.join(", ")
+            ));
+        }
+        if RELEASE_DISABLED_SWAP_VENUES.contains(&venue_id.as_str()) {
+            return Err(format!(
+                "ENABLED_SWAP_VENUES contains `{venue_id}`, which this release disables; remove it to start"
             ));
         }
         if !seen.insert(venue_id.clone()) {
@@ -754,8 +808,20 @@ fn parse_icpswap_dust_fallback_max_price_impact_bps_from_env() -> f64 {
         .unwrap_or(DEFAULT_ICPSWAP_DUST_FALLBACK_MAX_PRICE_IMPACT_BPS)
 }
 
-fn parse_icpswap_test_allocation_usd_from_env() -> Result<Option<f64>, String> {
-    let Ok(raw) = env::var("ICPSWAP_TEST_ALLOCATION_USD") else {
+/// Mirrors the planner's check: a ceiling outside 0..=10000 bps would be
+/// rejected by its constructor, so an unusable override falls back to the default.
+fn parse_cex_max_price_impact_bps_from_env() -> f64 {
+    env::var("CEX_MAX_PRICE_IMPACT_BPS")
+        .ok()
+        .and_then(|value| value.trim().parse::<f64>().ok())
+        .filter(|value| value.is_finite() && *value >= 0.0 && *value <= 10_000.0)
+        .unwrap_or(DEFAULT_CEX_MAX_PRICE_IMPACT_BPS)
+}
+
+/// A test-only USD allocation: absent or blank means off, anything else must
+/// be a positive number.
+fn parse_test_allocation_usd_from_env(var: &str) -> Result<Option<f64>, String> {
+    let Ok(raw) = env::var(var) else {
         return Ok(None);
     };
     let trimmed = raw.trim();
@@ -764,11 +830,9 @@ fn parse_icpswap_test_allocation_usd_from_env() -> Result<Option<f64>, String> {
     }
     let value = trimmed
         .parse::<f64>()
-        .map_err(|_| format!("ICPSWAP_TEST_ALLOCATION_USD='{trimmed}' must be a positive USD amount"))?;
+        .map_err(|_| format!("{var}='{trimmed}' must be a positive USD amount"))?;
     if !value.is_finite() || value <= 0.0 {
-        return Err(format!(
-            "ICPSWAP_TEST_ALLOCATION_USD='{trimmed}' must be finite and positive"
-        ));
+        return Err(format!("{var}='{trimmed}' must be finite and positive"));
     }
     Ok(Some(value))
 }
@@ -822,8 +886,9 @@ pub(crate) fn normalize_cex_market_pair(raw: &str) -> Option<String> {
     Some(format!("{}_{}", base, quote))
 }
 
-fn parse_cex_mexc_available_pairs_from_env() -> Vec<String> {
-    let raw = match env::var("CEX_MEXC_AVAILABLE_PAIRS") {
+/// An exchange's market allowlist from `name`, normalised and deduplicated.
+fn parse_cex_available_pairs_from_env(name: &str) -> Vec<String> {
+    let raw = match env::var(name) {
         Ok(v) => v,
         Err(_) => return vec![],
     };
@@ -840,12 +905,13 @@ fn parse_cex_mexc_available_pairs_from_env() -> Vec<String> {
     out
 }
 
-fn parse_cex_mexc_max_hops_from_env() -> u8 {
-    env::var("CEX_MEXC_MAX_HOPS")
+/// An exchange's route hop limit from `name`, clamped to the cap.
+fn parse_cex_max_hops_from_env(name: &str) -> u8 {
+    env::var(name)
         .ok()
         .and_then(|v| v.parse::<u8>().ok())
-        .map(|v| v.min(MAX_CEX_MEXC_MAX_HOPS))
-        .unwrap_or(DEFAULT_CEX_MEXC_MAX_HOPS)
+        .map(|v| v.min(MAX_CEX_MAX_HOPS))
+        .unwrap_or(DEFAULT_CEX_MAX_HOPS)
 }
 
 fn parse_cex_tunables_from_env() -> CexTunables {
@@ -981,6 +1047,36 @@ mod tests {
         // debt by that much, bad debt may fall short of it by that much.
         assert_eq!(parse_multi_venue_bad_debt_min_net_edge_bps_from_env(), -500);
         assert_eq!(parse_multi_venue_oracle_snapshot_max_age_secs_from_env(), 300);
+    }
+
+    /// Review finding 27: `config.env` ships blank Kraken keys, and they passed
+    /// the "keys are missing" check, so every Kraken preview then failed.
+    #[test]
+    fn blank_cex_credentials_count_as_missing() {
+        let _guard = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        unsafe {
+            env::set_var("CEX_TESTBLANK_API_KEY", "");
+            env::set_var("CEX_TESTBLANK_API_SECRET", "secret");
+            env::set_var("CEX_TESTSET_API_KEY", "key");
+            env::set_var("CEX_TESTSET_API_SECRET", " ");
+            env::set_var("CEX_TESTFULL_API_KEY", "key");
+            env::set_var("CEX_TESTFULL_API_SECRET", "secret");
+        }
+
+        let credentials = load_cex_credentials();
+
+        assert!(!credentials.contains_key("testblank"));
+        assert!(!credentials.contains_key("testset"));
+        assert_eq!(
+            credentials.get("testfull"),
+            Some(&("key".to_string(), "secret".to_string()))
+        );
+        for name in ["TESTBLANK", "TESTSET", "TESTFULL"] {
+            unsafe {
+                env::remove_var(format!("CEX_{name}_API_KEY"));
+                env::remove_var(format!("CEX_{name}_API_SECRET"));
+            }
+        }
     }
 
     #[test]
@@ -1154,16 +1250,33 @@ mod tests {
     #[test]
     fn parse_icpswap_test_allocation_is_optional_and_strictly_positive() {
         let _guard = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
-        unsafe { env::remove_var("ICPSWAP_TEST_ALLOCATION_USD") };
-        assert_eq!(parse_icpswap_test_allocation_usd_from_env().unwrap(), None);
+        for var in ["ICPSWAP_TEST_ALLOCATION_USD", "MEXC_TEST_ALLOCATION_USD"] {
+            unsafe { env::remove_var(var) };
+            assert_eq!(parse_test_allocation_usd_from_env(var).unwrap(), None);
 
-        unsafe { env::set_var("ICPSWAP_TEST_ALLOCATION_USD", "1") };
-        assert_eq!(parse_icpswap_test_allocation_usd_from_env().unwrap(), Some(1.0));
+            unsafe { env::set_var(var, "1") };
+            assert_eq!(parse_test_allocation_usd_from_env(var).unwrap(), Some(1.0));
 
-        unsafe { env::set_var("ICPSWAP_TEST_ALLOCATION_USD", "0") };
-        assert!(parse_icpswap_test_allocation_usd_from_env().is_err());
+            unsafe { env::set_var(var, "0") };
+            assert!(parse_test_allocation_usd_from_env(var).is_err());
 
-        unsafe { env::remove_var("ICPSWAP_TEST_ALLOCATION_USD") };
+            unsafe { env::remove_var(var) };
+        }
+    }
+
+    #[test]
+    fn parse_cex_max_price_impact_defaults_to_200_and_drops_an_unusable_value() {
+        let _guard = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        unsafe { env::remove_var("CEX_MAX_PRICE_IMPACT_BPS") };
+        assert_eq!(parse_cex_max_price_impact_bps_from_env(), 200.0);
+
+        unsafe { env::set_var("CEX_MAX_PRICE_IMPACT_BPS", "250") };
+        assert_eq!(parse_cex_max_price_impact_bps_from_env(), 250.0);
+
+        unsafe { env::set_var("CEX_MAX_PRICE_IMPACT_BPS", "-1") };
+        assert_eq!(parse_cex_max_price_impact_bps_from_env(), 200.0);
+
+        unsafe { env::remove_var("CEX_MAX_PRICE_IMPACT_BPS") };
     }
 
     #[test]
@@ -1225,7 +1338,7 @@ mod tests {
             );
         }
 
-        let parsed = parse_cex_mexc_available_pairs_from_env();
+        let parsed = parse_cex_available_pairs_from_env("CEX_MEXC_AVAILABLE_PAIRS");
         assert_eq!(
             parsed,
             vec!["CKBTC_BTC".to_string(), "BTC_USDC".to_string(), "USDC_USDT".to_string(),]
@@ -1239,7 +1352,7 @@ mod tests {
             env::remove_var("CEX_MEXC_AVAILABLE_PAIRS");
         }
 
-        assert!(parse_cex_mexc_available_pairs_from_env().is_empty());
+        assert!(parse_cex_available_pairs_from_env("CEX_MEXC_AVAILABLE_PAIRS").is_empty());
     }
 
     #[test]
@@ -1248,17 +1361,17 @@ mod tests {
         unsafe {
             env::remove_var("CEX_MEXC_MAX_HOPS");
         }
-        assert_eq!(parse_cex_mexc_max_hops_from_env(), DEFAULT_CEX_MEXC_MAX_HOPS);
+        assert_eq!(parse_cex_max_hops_from_env("CEX_MEXC_MAX_HOPS"), DEFAULT_CEX_MAX_HOPS);
 
         unsafe {
             env::set_var("CEX_MEXC_MAX_HOPS", "9");
         }
-        assert_eq!(parse_cex_mexc_max_hops_from_env(), MAX_CEX_MEXC_MAX_HOPS);
+        assert_eq!(parse_cex_max_hops_from_env("CEX_MEXC_MAX_HOPS"), MAX_CEX_MAX_HOPS);
 
         unsafe {
             env::set_var("CEX_MEXC_MAX_HOPS", "1");
         }
-        assert_eq!(parse_cex_mexc_max_hops_from_env(), 1);
+        assert_eq!(parse_cex_max_hops_from_env("CEX_MEXC_MAX_HOPS"), 1);
     }
 
     #[test]
@@ -1288,6 +1401,39 @@ mod tests {
         }
     }
 
+    /// This release disables Kraken, so a config that names it does not start.
+    #[test]
+    fn kraken_stops_startup_until_it_is_released() {
+        let _guard = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        unsafe {
+            env::set_var("ENABLED_SWAP_VENUES", "icpswap,mexc,kraken");
+        }
+        let error = parse_enabled_swap_venues_from_env().expect_err("Kraken is disabled in this release");
+        assert!(error.contains("`kraken`"), "{error}");
+        unsafe {
+            env::remove_var("ENABLED_SWAP_VENUES");
+        }
+    }
+
+    /// Kraken's markets come from its own setting.
+    #[test]
+    fn kraken_route_settings_come_from_their_own_keys() {
+        let _guard = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        unsafe {
+            env::set_var("CEX_KRAKEN_AVAILABLE_PAIRS", " icp/usd, ETH-USD, icp_usd ");
+            env::set_var("CEX_KRAKEN_MAX_HOPS", "3");
+        }
+        assert_eq!(
+            parse_cex_available_pairs_from_env("CEX_KRAKEN_AVAILABLE_PAIRS"),
+            vec!["ICP_USD".to_string(), "ETH_USD".to_string()]
+        );
+        assert_eq!(parse_cex_max_hops_from_env("CEX_KRAKEN_MAX_HOPS"), 3);
+        unsafe {
+            env::remove_var("CEX_KRAKEN_AVAILABLE_PAIRS");
+            env::remove_var("CEX_KRAKEN_MAX_HOPS");
+        }
+    }
+
     #[test]
     fn enabled_swap_venues_reject_invalid_lists() {
         let _guard = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
@@ -1295,7 +1441,7 @@ mod tests {
             ("", "empty venue ID"),
             ("mexc,", "empty venue ID"),
             ("mexc,MEXC", "duplicate venue"),
-            ("kraken", "unsupported venue"),
+            ("binance", "unsupported venue"),
         ] {
             unsafe {
                 env::set_var("ENABLED_SWAP_VENUES", raw);
@@ -1319,6 +1465,32 @@ mod tests {
         unsafe {
             env::remove_var("SWAPPER");
             env::remove_var("ENABLED_SWAP_VENUES");
+        }
+    }
+
+    #[test]
+    fn the_widened_cex_limit_has_its_own_default_and_no_shared_fallback() {
+        let _guard = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        unsafe {
+            env::remove_var("MAX_WIDENED_CEX_SLIPPAGE_BPS");
+            env::set_var("MAX_ALLOWED_SLIPPAGE_BPS", "150");
+        }
+        assert_eq!(parse_widened_cex_slippage_bps_from_env().unwrap(), 400);
+
+        unsafe {
+            env::set_var("MAX_WIDENED_CEX_SLIPPAGE_BPS", " 300 ");
+        }
+        assert_eq!(parse_widened_cex_slippage_bps_from_env().unwrap(), 300);
+
+        for bad in ["3%", "9999"] {
+            unsafe {
+                env::set_var("MAX_WIDENED_CEX_SLIPPAGE_BPS", bad);
+            }
+            assert!(parse_widened_cex_slippage_bps_from_env().is_err(), "{bad}");
+        }
+        unsafe {
+            env::remove_var("MAX_WIDENED_CEX_SLIPPAGE_BPS");
+            env::remove_var("MAX_ALLOWED_SLIPPAGE_BPS");
         }
     }
 

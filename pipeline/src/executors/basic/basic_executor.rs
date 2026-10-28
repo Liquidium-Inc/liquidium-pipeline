@@ -20,6 +20,7 @@ use crate::{
     approval_state::ApprovalState,
     persistance::LiquidationIntentStore,
     utils::{approval_threshold, max_for_ledger},
+    watchdog::{Watchdog, noop_watchdog},
 };
 
 const ALLOWANCE_LEDGER_TIMEOUT: Duration = Duration::from_secs(20);
@@ -45,6 +46,8 @@ pub struct BasicExecutor<A: PipelineAgent, D: LiquidationIntentStore + Sync + Se
     pub lending_canister: Principal,
     pub intents: Arc<D>,
     pub approval_state: Arc<ApprovalState>,
+    /// Where a liquidation that may have run without a WAL row is reported.
+    pub(crate) watchdog: Arc<dyn Watchdog>,
     low_balance_allowance_warned_ledgers: Mutex<HashSet<Principal>>,
 }
 
@@ -62,8 +65,14 @@ impl<A: PipelineAgent, D: LiquidationIntentStore> BasicExecutor<A, D> {
             lending_canister,
             intents,
             approval_state,
+            watchdog: noop_watchdog(),
             low_balance_allowance_warned_ledgers: Mutex::new(HashSet::new()),
         }
+    }
+
+    pub fn with_watchdog(mut self, watchdog: Arc<dyn Watchdog>) -> Self {
+        self.watchdog = watchdog;
+        self
     }
 
     pub async fn init(&mut self, tokens: &[Principal]) -> Result<(), String> {

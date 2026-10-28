@@ -15,6 +15,7 @@ Inspired by Artemis/MEV patterns and designed for permissionless, community-driv
 - [CLI Commands](#cli-commands)
 - [Operations Runbook](#operations-runbook)
 - [Developer Setup](#developer-setup)
+- [Kraken Venue](#kraken-venue)
 - [Security](#security)
 - [Troubleshooting](#troubleshooting)
 - [Notes](#notes)
@@ -78,7 +79,7 @@ the requested subaccount is preserved.
 
 ## At a Glance
 
-- **Default venues:** `ENABLED_SWAP_VENUES=icpswap,mexc`; disable MEXC when credentials are not configured.
+- **Default venues:** `ENABLED_SWAP_VENUES=icpswap,mexc`; disable MEXC when credentials are not configured. This release disables Kraken: `kraken` in the list stops startup.
 - **Current config precedence:** shell env vars > local `.env` > `~/.liquidium-pipeline/config.env`.
 - **Required env vars (minimum):** `MNEMONIC_FILE`, `IC_URL`, `EVM_RPC_URL`, `LENDING_CANISTER`, `DEBT_ASSETS`, `COLLATERAL_ASSETS`.
 - **Optional Solana RPC env var:** `SOLANA_RPC_URL` (defaults to `https://api.devnet.solana.com` when unset).
@@ -227,13 +228,26 @@ ENABLED_SWAP_VENUES=icpswap,mexc
 # so the check cannot judge the price. The remainder leg is still checked, and a
 # loud warning is logged at startup whenever this waiver is active.
 ICPSWAP_TEST_ALLOCATION_USD=1
-# Allow full ICPSwap up to 1.5% impact only when the MEXC remainder is dust.
+# Optional test-only MEXC split. Needs ICPSwap and MEXC enabled. Sends about $10
+# to MEXC. With Kraken enabled, Kraken takes the exact rest of the CEX side.
+# Without Kraken, ICPSwap takes the rest, and this setting must not be combined
+# with ICPSWAP_TEST_ALLOCATION_USD. When the split cannot be shaped, the normal
+# plan routes the amount.
+MEXC_TEST_ALLOCATION_USD=10
+# Allow full ICPSwap up to 1.5% impact only when the CEX remainder is dust.
 ICPSWAP_DUST_FALLBACK_MAX_PRICE_IMPACT_BPS=150
+# The CEX side is a waterfall: MEXC takes what it can quote within this impact
+# ceiling, Kraken takes the rest. With one CEX enabled the ceiling does not apply.
+CEX_MAX_PRICE_IMPACT_BPS=200
 
 # CEX (MEXC) - Optional
 CEX_MEXC_API_KEY=your_api_key
 CEX_MEXC_API_SECRET=your_api_secret
+# CEX (Kraken) - Optional, only when `kraken` is in ENABLED_SWAP_VENUES
+CEX_KRAKEN_API_KEY=your_api_key
+CEX_KRAKEN_API_SECRET=your_api_secret
 MAX_ALLOWED_CEX_SLIPPAGE_BPS=200  # 2.00% in basis points
+MAX_WIDENED_CEX_SLIPPAGE_BPS=400  # 4.00%: widest IOC limit after empty fills at the cap
 
 # Liquidation guard (bad debt only)
 BAD_DEBT_COLLATERAL_SLIPPAGE_BPS=500  # 5.00% haircut used for min collateral
@@ -258,9 +272,9 @@ CEX_BUY_INVERSE_ENABLED=true
 # Retry backoff base and cap (seconds) for retryable CEX errors
 CEX_RETRY_BASE_SECS=5
 CEX_RETRY_MAX_SECS=120
-# Minimum projected net edge required before executing any venue plan (bps)
+# Recorded on each plan; only plans saved before the settlement floor existed still read it (bps)
 MULTI_VENUE_MIN_NET_EDGE_BPS=150
-# Optional normal-settlement override after liquidation (up to 1.5% shortfall)
+# Normal-settlement floor after liquidation; -150 allows up to 1.5% shortfall (the default)
 MULTI_VENUE_SETTLEMENT_MIN_NET_EDGE_BPS=-150
 # Reject a venue quote this far below the oracle-implied output (bps)
 MULTI_VENUE_MAX_ORACLE_DISCOUNT_BPS=250
@@ -274,6 +288,9 @@ CEX_ROUTE_FEE_BPS=25
 CEX_MEXC_AVAILABLE_PAIRS=CKBTC_BTC,BTC_USDC,BTC_USDT,USDC_USDT,CKUSDT_USDT,ICP_USDT,ICP_USDC,ETH_USDT
 # Max intermediate hops when searching configured pairs (0 disables hop fallback)
 CEX_MEXC_MAX_HOPS=2
+# Kraken market allowlist (`BASE_QUOTE`; XBT reads as BTC). Required when Kraken is enabled.
+CEX_KRAKEN_AVAILABLE_PAIRS=BTC_USD,ETH_USD,USDC_USD,ICP_USD
+CEX_KRAKEN_MAX_HOPS=2
 ```
 
 Quick reference:
@@ -288,8 +305,8 @@ Quick reference:
 | `CEX_BUY_INVERSE_ENABLED` | Master toggle for adaptive buy fallback. |
 | `CEX_RETRY_BASE_SECS` | Initial retry delay after retryable CEX errors. |
 | `CEX_RETRY_MAX_SECS` | Maximum retry delay cap. |
-| `MULTI_VENUE_MIN_NET_EDGE_BPS` | Default normal-settlement floor when the signed override is unset. |
-| `MULTI_VENUE_SETTLEMENT_MIN_NET_EDGE_BPS` | Optional signed floor for normal settlement after liquidation; `-150` allows up to 1.5% conservative shortfall. Valid range is greater than `-10000` through `10000`; absent or invalid values use `MULTI_VENUE_MIN_NET_EDGE_BPS`. Does not change liquidation-entry checks or already committed plans. |
+| `MULTI_VENUE_MIN_NET_EDGE_BPS` | Recorded on each plan. Only plans saved before the settlement floor existed still settle against it. |
+| `MULTI_VENUE_SETTLEMENT_MIN_NET_EDGE_BPS` | Signed floor for normal settlement after liquidation. The default `-150` allows up to 1.5% conservative shortfall, because the debt is already repaid. Valid range is greater than `-10000` through `10000`; an absent value uses `-150`, and an invalid value also uses `-150` with a warning in the log. Does not change liquidation-entry checks or already committed plans. |
 | `MULTI_VENUE_BAD_DEBT_MIN_NET_EDGE_BPS` | Existing signed floor used for all new settlement plans when `BUY_BAD_DEBT=true`, and for saved bad-debt rows even when global mode is off. Defaults to `-500` (up to 5% shortfall) and takes precedence over the normal-settlement override. |
 | `MULTI_VENUE_MAX_ORACLE_DISCOUNT_BPS` | Maximum amount any venue quote may fall below the oracle-implied output. Values at or above 10000 would accept anything, so they fall back to the default. |
 | `MULTI_VENUE_ORACLE_SNAPSHOT_MAX_AGE_SECS` | How stale a price recorded at detection may be before it stops standing in for a failed live oracle read. Past this age the quote guard stands down rather than block a liquidation that already holds collateral. |
@@ -297,6 +314,8 @@ Quick reference:
 | `CEX_ROUTE_FEE_BPS` | Fee haircut applied during route edge estimation. |
 | `CEX_MEXC_AVAILABLE_PAIRS` | Configured market universe used for direct/hop route discovery. |
 | `CEX_MEXC_MAX_HOPS` | Max intermediate hops allowed in configured-pair route search. |
+| `CEX_KRAKEN_AVAILABLE_PAIRS` | Kraken's market allowlist. Required when `kraken` is enabled: Kraken never trades outside it, and startup stops if it is empty. |
+| `CEX_KRAKEN_MAX_HOPS` | Max intermediate hops in Kraken's route search; defaults to 2. |
 
 Note: `CEX_BUY_INVERSE_OVESPEND_BPS` is still accepted as a legacy alias, but `CEX_BUY_INVERSE_OVERSPEND_BPS` is the canonical key.
 
@@ -319,8 +338,8 @@ Meaning:
 - Lower ratio (`0.4`) -> smaller slices, more orders, lower impact risk.
 
 Important:
-- This is a **sizing target**, not the hard reject limit.
-- Hard rejection still uses `MAX_ALLOWED_CEX_SLIPPAGE_BPS`.
+- This is a **sizing target**, not the reject limit.
+- Each order's reject limit is its own IOC limit: `MAX_ALLOWED_CEX_SLIPPAGE_BPS`, or the widened limit after empty fills.
 
 Examples when `MAX_ALLOWED_CEX_SLIPPAGE_BPS=200`:
 - `CEX_SLICE_TARGET_RATIO=0.5` -> target `100 bps`
@@ -339,7 +358,8 @@ Even with slicing, execution still has market-impact and timing risk:
 
 How config controls this risk:
 
-- `MAX_ALLOWED_CEX_SLIPPAGE_BPS`: hard per-slice reject limit (safety brake).
+- `MAX_ALLOWED_CEX_SLIPPAGE_BPS`: the limit of every first order in a slice loop, measured net of the taker fee. Each order is IOC at the price room this limit leaves after the market's taker fee, so a fill at its price still passes. A quote whose fee uses up the limit is refused before any deposit.
+- `MAX_WIDENED_CEX_SLIPPAGE_BPS`: after 3 orders in a row fill nothing at the cap, each next order widens the limit by 100 bps up to this value. When the widest order also fills nothing, the leg waits for the next cycle. A value at or below the cap turns widening off. No order goes out without a limit, unless the exchange refuses the IOC order type itself.
 - `CEX_SLICE_TARGET_RATIO`: softer sizing target below hard limit (execution smoothness).
 - `CEX_MIN_EXEC_USD`: prevents low-notional micro-fills that usually have poor quality.
 - `CEX_BUY_*`: controls adaptive buy fallback when quote-mode truncation leaves meaningful residual.
@@ -365,14 +385,14 @@ For each leg, the finalizer runs a resumable slice loop:
 4. If no positive chunk passes soft target, try one-shot fallback:
    full remaining amount is accepted only if fillable and under the hard cap.
 5. If chunk notional is below `CEX_MIN_EXEC_USD`, mark as dust and stop this leg.
-6. Submit one market slice with deterministic `client_order_id` (WAL-safe resume/idempotency).
+6. Submit one IOC slice at the order's price room, with a deterministic `client_order_id` (WAL-safe resume/idempotency).
 7. Use **actual** exchange fill amounts (`input_consumed`, `output_received`) for math.
 8. Compute realized execution price and slippage:
    - sell: `exec_price = output_received / input_consumed`
    - buy: `exec_price = input_consumed / output_received`
    - sell slippage bps: `max(0, (preview_mid - exec_price) / preview_mid * 10000)`
    - buy slippage bps: `max(0, (exec_price - preview_mid) / preview_mid * 10000)`
-9. If realized slippage > `MAX_ALLOWED_CEX_SLIPPAGE_BPS`, fail fast.
+9. If realized slippage is above the order's limit (the cap, or the widened limit after empty fills), fail fast.
 10. Otherwise, persist progress (`remaining_in`, `total_out`) and continue until consumed/dust.
 11. On buy legs only, if truncation ratio is large and residual is executable, arm one inverse/base fallback retry (bounded by `CEX_BUY_INVERSE_MAX_RETRIES`).
 
@@ -865,9 +885,21 @@ liquidator tui --log-file ./liquidator.log
 
 ---
 
+## Kraken Venue
+
+This release disables Kraken: `kraken` in `ENABLED_SWAP_VENUES` stops startup. When a release enables it again, Kraken is opt-in. Before you enable it:
+
+1. Create an API key with balance and funding reads, order create and query, and withdrawal access only. Use an IP allowlist.
+2. In Kraken, save and verify each withdrawal address the pipeline uses: the bridge source wallet on each chain a return crosses (EVM, Solana), and the final ICP account for a direct ICP withdrawal. The pipeline never adds or changes an address.
+3. Set `CEX_KRAKEN_API_KEY`, `CEX_KRAKEN_API_SECRET` and a narrow `CEX_KRAKEN_AVAILABLE_PAIRS`, then add `kraken` to `ENABLED_SWAP_VENUES`.
+
+Before any funds move, a Kraken quote checks the route: a deposit method and address for the asset and network (an ICP deposit that needs a memo is refused), the deposit minimum, and a verified withdrawal address. A refused route gets no quote, so the planner uses another venue.
+
+Every Kraken order is IOC at its price limit. Kraken keeps no caller id for a withdrawal, so a withdrawal whose reply was lost parks for an operator: check Kraken's withdrawal history before you release the leg.
+
 ## Security
 
-- Treat `MNEMONIC_FILE`, `CEX_MEXC_API_KEY`, and `CEX_MEXC_API_SECRET` as secrets; never commit them.
+- Treat `MNEMONIC_FILE` and every `CEX_*_API_KEY` / `CEX_*_API_SECRET` as secrets; never commit them.
 - Restrict CEX API keys to required permissions only, and rotate keys periodically.
 - Keep mnemonic backups offline and access controlled.
 - Prefer separate runtime users/environments for production bot instances.
@@ -877,6 +909,8 @@ liquidator tui --log-file ./liquidator.log
 - `LENDING_CANISTER not configured` / `EVM_RPC_URL not configured`: confirm required env vars are set in `.env` or `config.env`.
 - `Invalid source account` / destination parse errors during withdraw: use `main|trader|recovery` aliases or valid account/principal text.
 - MEXC initialization failing while `mexc` is enabled: verify `CEX_MEXC_API_KEY` and `CEX_MEXC_API_SECRET`, or remove `mexc` from `ENABLED_SWAP_VENUES`.
+- Kraken initialization failing while `kraken` is enabled: verify `CEX_KRAKEN_API_KEY`, `CEX_KRAKEN_API_SECRET` and a non-empty `CEX_KRAKEN_AVAILABLE_PAIRS`, or remove `kraken` from `ENABLED_SWAP_VENUES`.
+- Kraken quotes always unavailable: the log names the refusal. Check the pair allowlist, the deposit method for the asset and network, and that the withdrawal address is verified in Kraken.
 - Noisy terminal output in containerized logging stacks: build and run with `--features plain-logs`.
 - Missing diagnostic detail: rerun with `RUST_LOG=debug`.
 - Runtime socket permission mismatch under systemd: run `systemctl daemon-reload` and restart `liquidator.service`; ensure `RuntimeDirectory=liquidator` and `RuntimeDirectoryMode=0770` are set on the active unit.

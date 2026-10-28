@@ -298,6 +298,115 @@ async fn mexc_trade_marks_dust_only_after_a_fill() {
     assert_eq!(out.to_f64(), 0.02);
 }
 
+/// No order can trade less than the exchange minimum, so a filled leg ends
+/// with that last remainder as dust instead of failing (review finding 1).
+#[tokio::test]
+async fn a_last_remainder_under_the_exchange_minimum_ends_a_filled_leg_as_dust() {
+    let mut backend = MockCexBackend::new();
+    let book = |price: f64| OrderBook {
+        bids: vec![OrderBookLevel { price, quantity: 100.0 }],
+        asks: vec![OrderBookLevel {
+            price: price * 1.001,
+            quantity: 100.0,
+        }],
+        taker_fee_bps: 10.0,
+    };
+    backend
+        .expect_get_orderbook()
+        .returning(move |market, _limit| match market {
+            "CKBTC_BTC" => Ok(book(1.0)),
+            "BTC_USDC" => Ok(book(69_000.0)),
+            _ => Err(format!("unexpected market {market}")),
+        });
+    let mut orders = 0;
+    backend
+        .expect_execute_swap_detailed_with_options()
+        .times(2)
+        .returning(move |_, _, amount_in, _| {
+            orders += 1;
+            if orders == 1 {
+                return Ok(SwapFillReport {
+                    input_consumed: amount_in / 2.0,
+                    output_received: amount_in / 2.0 * 0.999,
+                });
+            }
+            Err(CexBackendError::BelowMinimum(
+                "base volume is below order minimum".to_string(),
+            ))
+        });
+
+    let finalizer = CexVenueFinalizer::new(
+        Arc::new(backend),
+        Arc::new(MockTransferActions::new()),
+        Principal::anonymous(),
+        TEST_MAX_SELL_SLIPPAGE_BPS,
+        0.0001,
+        TEST_CEX_SLICE_TARGET_RATIO,
+    );
+    let mut state = finalizer.prepare("42", &make_execution_receipt(42)).await.unwrap();
+    state.step = CexStep::Trade;
+    // A single-leg route: CKBTC -> BTC.
+    state.withdraw.withdraw_asset = ChainToken::Icp {
+        ledger: Principal::anonymous(),
+        symbol: "BTC".to_string(),
+        decimals: 8,
+        fee: Nat::from(1_000u64),
+    };
+    state.withdraw.bridge.withdraw_planned_asset = Some("BTC".to_string());
+    state.withdraw.bridge.withdraw_planned_network = Some("ICP".to_string());
+    state.withdraw.bridge.withdraw_bridge_required = false;
+    let amount_in = state.size_in.to_f64();
+
+    finalizer
+        .trade(&mut state)
+        .await
+        .expect("the remainder is dust, not an error");
+
+    assert!(matches!(state.step, CexStep::Withdraw));
+    assert!(state.trade.trade_dust_skipped);
+    assert_eq!(state.trade.trade_slices.len(), 1);
+    assert_eq!(state.trade.trade_pending_client_order_id, None);
+    let out = state.withdraw.size_out.as_ref().expect("size_out should be set");
+    assert!(
+        (out.to_f64() - amount_in / 2.0 * 0.999).abs() < 1e-8,
+        "{}",
+        out.to_f64()
+    );
+}
+
+/// Before a fill, a refused order leaves the whole input on the exchange,
+/// so the error reaches the adapter.
+#[tokio::test]
+async fn an_unfilled_leg_under_the_exchange_minimum_returns_the_refusal() {
+    let mut backend = MockCexBackend::new();
+    backend.expect_get_orderbook().returning(|_, _| {
+        Ok(OrderBook {
+            bids: vec![OrderBookLevel {
+                price: 1.0,
+                quantity: 100.0,
+            }],
+            asks: vec![OrderBookLevel {
+                price: 1.001,
+                quantity: 100.0,
+            }],
+            taker_fee_bps: 10.0,
+        })
+    });
+    backend
+        .expect_execute_swap_detailed_with_options()
+        .times(1)
+        .returning(|_, _, _, _| Err(CexBackendError::BelowMinimum("below order minimum".to_string())));
+    let finalizer = test_finalizer(Arc::new(backend), Arc::new(MockTransferActions::new()));
+    let mut state = finalizer.prepare("42", &make_execution_receipt(42)).await.unwrap();
+    state.step = CexStep::Trade;
+
+    let error = finalizer.trade(&mut state).await.unwrap_err();
+
+    assert!(matches!(error, CexBackendError::BelowMinimum(_)), "{error:?}");
+    assert!(!state.trade.trade_dust_skipped);
+    assert!(state.withdraw.size_out.is_none());
+}
+
 #[tokio::test]
 async fn mexc_committed_leg_below_dust_floor_still_executes() {
     let mut backend = MockCexBackend::new();

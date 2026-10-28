@@ -1,6 +1,8 @@
 //! The return bridge after an exchange withdrawal: the deposit send to the
-//! provider, the one-deposit-per-address wait, and the notice.
+//! provider or the saved provider call, the one-deposit-per-address wait, and
+//! the notice.
 use super::*;
+use crate::bridge::call_sender::{BridgeCall, BridgeCallSender, prepare_bridge_call};
 
 impl<C> CexVenueFinalizer<C>
 where
@@ -94,7 +96,7 @@ where
                     // A busy bridge wallet is a wait. Nothing was signed.
                     Err(BridgeError::Deferred(error)) => {
                         info!("[cex] liq_id={} bridged withdraw deferred: {}", liq_id, error);
-                        return Ok(());
+                        return Ok(Self::wait_before_bridge(state, &error)?);
                     }
                     Err(error) => return Err(error.into()),
                 };
@@ -207,6 +209,7 @@ where
             };
             state.withdraw.withdraw_id = Some(accepted.id);
             state.withdraw.withdraw_txid = accepted.txid;
+            state.withdraw.withdraw_accepted_at_ts = Some(now_ts());
             state.step = CexStep::WithdrawPending;
             return Ok(());
         }
@@ -249,6 +252,13 @@ where
                 .advance_withdraw_deposit_send(state, bridge, route, &destination, None)
                 .await;
         }
+        // A saved call may have run and spent the source balance, so it
+        // settles before the balance reads below.
+        if state.withdraw.bridge.withdraw_bridge_call.is_some() {
+            let _submit_guard =
+                acquire_bridge_submit_lock(route.source_asset, route.source_chain, &bridge_source_address).await;
+            return self.advance_withdraw_bridge_call(state, bridge).await;
+        }
         // Skips the reads below while another row's deposit is open. The
         // check under the submit lock decides.
         if Self::waits_for_other_deposit(bridge, route, &state.liq_id).await? {
@@ -282,23 +292,18 @@ where
                         state.liq_id, withdraw_snapshot.status, withdraw_id
                     );
                 } else {
-                    state.step = CexStep::WithdrawPending;
-                    return Ok(());
+                    return Ok(Self::wait_before_bridge(
+                        state,
+                        "the exchange has not sent the withdrawal",
+                    )?);
                 }
             }
-            WithdrawStatus::Failed => {
-                return Err(format!(
-                    "cex withdraw failed for liq_id {} withdraw_id={}",
-                    state.liq_id, withdraw_id
-                )
-                .into());
-            }
-            WithdrawStatus::Canceled => {
-                return Err(format!(
-                    "cex withdraw canceled for liq_id {} withdraw_id={}",
-                    state.liq_id, withdraw_id
-                )
-                .into());
+            WithdrawStatus::Failed | WithdrawStatus::Canceled => {
+                return Ok(Self::resubmit_failed_withdrawal(
+                    state,
+                    &withdraw_id,
+                    &withdraw_snapshot,
+                )?);
             }
             WithdrawStatus::Completed => {}
         }
@@ -363,8 +368,10 @@ where
                         route.source_chain,
                         route.target_asset,
                     );
-                    state.step = CexStep::WithdrawPending;
-                    return Ok(());
+                    return Ok(Self::wait_before_bridge(
+                        state,
+                        "the bridge source has no bridgeable ETH yet",
+                    )?);
                 }
                 info!(
                     "[cex] liq_id={} bridged native ETH withdraw adjusting to bridgeable source balance: amount {} -> {} (source includes gas reserve; safety_margin={} tolerance={} source={} route={}@{}->{})",
@@ -391,8 +398,10 @@ where
                     route.source_chain,
                     route.target_asset,
                 );
-                state.step = CexStep::WithdrawPending;
-                return Ok(());
+                return Ok(Self::wait_before_bridge(
+                    state,
+                    "the bridge source holds less than the withdrawal",
+                )?);
             }
         }
 
@@ -438,20 +447,73 @@ where
                 .advance_withdraw_deposit_send(state, bridge, route, &request.destination, Some(&request))
                 .await;
         }
-        let submission = match bridge.backend.submit_bridge(request).await {
-            Ok(submission) => submission,
-            // Same wait semantics as the deposit side: no budget spent.
-            Err(BridgeError::Deferred(error)) => {
-                info!("[cex] liq_id={} bridged withdraw deferred: {}", state.liq_id, error);
-                state.step = CexStep::WithdrawPending;
-                return Ok(());
-            }
-            Err(error) => return Err(error.into()),
+        Ok(Self::save_withdraw_bridge_call(state, bridge, &request).await?)
+    }
+
+    /// Saves the provider call with the history cursor taken before it. The
+    /// call runs on the next step, so a lost answer has a record to settle.
+    async fn save_withdraw_bridge_call(
+        state: &mut CexState,
+        bridge: &BridgeRuntime,
+        request: &BridgeRequest,
+    ) -> Result<(), String> {
+        let destination = state
+            .withdraw
+            .bridge
+            .withdraw_bridge_destination_snapshot
+            .clone()
+            .ok_or_else(|| "missing final destination snapshot for bridged withdraw".to_string())?;
+        let call = BridgeCall {
+            asset: request.asset.clone(),
+            source_chain: request.source_chain.clone(),
+            source_address: request.source_address.clone(),
+            target_asset: request.target_asset.clone(),
+            destination,
+            amount: request.amount,
+            provider_fee_budget_native_units: None,
+            cursor: bridge.backend.prepare_submission(request).await?,
+            started_at_ts: now_ts(),
         };
-        state.withdraw.bridge.withdraw_bridge_id = Some(submission.bridge_id);
-        state.withdraw.bridge.withdraw_bridge_submitted_at_ts = Some(now_ts());
+        info!(
+            "[cex] liq_id={} bridged withdraw funded; call saved amount={} destination={} cursor={:?}",
+            state.liq_id, call.amount, call.destination, call.cursor
+        );
+        let id = crate::utils::new_venue_execution_id("bridge-call");
+        state.withdraw.bridge.withdraw_bridge_call = Some(OutboundRecord::prepared(prepare_bridge_call(id, &call)?));
+        state.send_saved = true;
         state.step = CexStep::WithdrawPending;
         Ok(())
+    }
+
+    /// Drives the saved call: one step sends it, and a lost answer settles
+    /// from the provider history before any new call.
+    async fn advance_withdraw_bridge_call(
+        &self,
+        state: &mut CexState,
+        bridge: &BridgeRuntime,
+    ) -> Result<(), CexBackendError> {
+        state.step = CexStep::WithdrawPending;
+        let sender = BridgeCallSender::new(bridge.backend.clone(), bridge.claims.clone());
+        match step_outbound(&mut state.withdraw.bridge.withdraw_bridge_call, &sender, None, now_ts()).await {
+            Ok(Some(bridge_id)) => {
+                info!(
+                    "[cex] liq_id={} bridged withdraw submitted: bridge_id={}",
+                    state.liq_id, bridge_id
+                );
+                state.withdraw.bridge.withdraw_bridge_id = Some(bridge_id);
+                state.withdraw.bridge.withdraw_bridge_submitted_at_ts = Some(now_ts());
+                state.withdraw.bridge.withdraw_bridge_call = None;
+                Ok(())
+            }
+            Ok(None) => Ok(()),
+            // A busy bridge wallet is a wait. The driver dropped the call, so
+            // the next cycle sizes the amount again and saves a new one.
+            Err(OutboundError::Deferred(error)) => {
+                info!("[cex] liq_id={} bridged withdraw deferred: {}", state.liq_id, error);
+                Ok(Self::wait_before_bridge(state, &error)?)
+            }
+            Err(error) => Err(error.into()),
+        }
     }
 
     /// Reads the bridge status: a mint completes the leg; a dropped ckSOL
@@ -482,14 +544,10 @@ where
             return Ok(());
         }
         state.withdraw.bridge.withdraw_bridge_polled_at_ts = Some(now_ts());
-        let status = match bridge.backend.get_bridge_status(&bridge_id).await {
-            Ok(status) => status,
+        let (status, unreadable) = match bridge.backend.get_bridge_status(&bridge_id).await {
+            Ok(status) => (status, None),
             // A failed read says nothing about the credit, so it is a wait, not a strike.
-            Err(BridgeError::Unreadable(error)) => {
-                let submitted_at = state.withdraw.bridge.withdraw_bridge_submitted_at_ts;
-                state.step = CexStep::WithdrawPending;
-                return Self::note_bridge_wait(state, submitted_at, &bridge_id, Some(&error));
-            }
+            Err(BridgeError::Unreadable(error)) => (BridgeStatus::Pending, Some(error)),
             Err(error) => return Err(error.into()),
         };
         match status {
@@ -528,7 +586,7 @@ where
             BridgeStatus::Pending | BridgeStatus::Unknown => {
                 let submitted_at = state.withdraw.bridge.withdraw_bridge_submitted_at_ts;
                 state.step = CexStep::WithdrawPending;
-                Self::note_bridge_wait(state, submitted_at, &bridge_id, None)
+                Self::note_bridge_wait(state, submitted_at, &bridge_id, unreadable.as_deref())
             }
             // The ckSOL minter dropped its sweep and released the deposit
             // address. The funds stay there, and a new notice queues them again.
@@ -569,6 +627,21 @@ where
             )
             .into()),
         }
+    }
+
+    /// A wait before the return bridge starts, which only the exchange, the chain
+    /// or a funded bridge wallet can end. Past the delivery bound it errors, so the
+    /// row parks with an alert.
+    fn wait_before_bridge(state: &mut CexState, reason: &str) -> Result<(), String> {
+        state.step = CexStep::WithdrawPending;
+        let waited = waited_secs(&mut state.withdraw.withdraw_accepted_at_ts);
+        if waited > WITHDRAW_DELIVERY_TIMEOUT_SECS {
+            return Err(format!(
+                "bridged withdraw for liq_id {} still waits after {waited}s: {reason}",
+                state.liq_id
+            ));
+        }
+        Ok(())
     }
 
     /// A bridge wait past the stall bound is stamped on the leg. A read that still

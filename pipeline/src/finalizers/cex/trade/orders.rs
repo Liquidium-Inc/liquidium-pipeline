@@ -47,9 +47,9 @@ where
         }
     }
 
-    fn is_valid_client_order_id(value: &str) -> bool {
+    fn is_valid_client_order_id(&self, value: &str) -> bool {
         let len = value.len();
-        if !(1..=32).contains(&len) {
+        if !(1..=self.profile.client_order_id_max_len()).contains(&len) {
             return false;
         }
 
@@ -62,7 +62,7 @@ where
         format!("{:06x}", super::super::utils::fnv1a_64(value) & 0x00ff_ffff)
     }
 
-    fn sanitize_client_order_id(value: &str) -> String {
+    fn sanitize_client_order_id(&self, value: &str) -> String {
         let mut sanitized: String = value
             .bytes()
             .filter(|b| b.is_ascii_alphanumeric() || *b == b'_' || *b == b'-')
@@ -73,9 +73,16 @@ where
             sanitized.push_str("liq");
         }
 
-        if sanitized.len() > 32 {
+        let max_len = self.profile.client_order_id_max_len();
+        if sanitized.len() > max_len {
+            // A short cap keeps as much of the 64-bit hash as fits (all of it at
+            // 18 characters), so ids stay distinct.
+            if max_len < 32 {
+                let hash = format!("{:016x}", super::super::utils::fnv1a_64(&sanitized));
+                return format!("lq{}", &hash[..hash.len().min(max_len.saturating_sub(2))]);
+            }
             let hash = Self::stable_hash_6hex(&sanitized);
-            sanitized.truncate(25);
+            sanitized.truncate(max_len - 7);
             sanitized.push('-');
             sanitized.push_str(&hash);
         }
@@ -96,7 +103,7 @@ where
     /// - tied to a different market/side tuple,
     /// - missing a client order id (legacy partial state),
     /// - carrying an invalid client order id for the exchange.
-    pub(super) fn sanitize_pending_trade_state_for_leg(state: &mut CexState, leg: &TradeLeg) {
+    pub(super) fn sanitize_pending_trade_state_for_leg(&self, state: &mut CexState, leg: &TradeLeg) {
         if state.trade.trade_pending_client_order_id.is_some()
             && (state.trade.trade_pending_market.as_deref() != Some(leg.market.as_str())
                 || state.trade.trade_pending_side.as_deref() != Some(leg.side.as_str()))
@@ -123,7 +130,7 @@ where
         }
 
         if let Some(existing) = state.trade.trade_pending_client_order_id.as_deref()
-            && !Self::is_valid_client_order_id(existing)
+            && !self.is_valid_client_order_id(existing)
         {
             warn!(
                 "[cex] liq_id={} clearing invalid pending client_order_id={}",
@@ -160,6 +167,7 @@ where
 
     /// Persist one pending slice request in state and return the resolved values.
     pub(super) fn prepare_pending_slice_request(
+        &self,
         state: &mut CexState,
         leg: &TradeLeg,
         leg_idx: usize,
@@ -181,7 +189,7 @@ where
         let client_order_id = pending_id.unwrap_or_else(|| {
             let mut slice_seq = Self::next_slice_seq_for_leg(state, leg_idx);
             loop {
-                let id = Self::build_client_order_id(state, leg_idx, slice_seq, buy_mode);
+                let id = self.build_client_order_id(state, leg_idx, slice_seq, buy_mode);
                 if !state.trade.trade_applied_client_order_ids.contains(&id) {
                     break id;
                 }
@@ -204,6 +212,7 @@ where
     }
 
     fn build_client_order_id(
+        &self,
         state: &CexState,
         leg_idx: usize,
         slice_seq: usize,
@@ -216,7 +225,7 @@ where
             slice_seq,
             Self::buy_mode_short_code(buy_mode)
         );
-        Self::sanitize_client_order_id(&raw)
+        self.sanitize_client_order_id(&raw)
     }
 
     /// Apply adaptive buy fallback after one executed buy slice.

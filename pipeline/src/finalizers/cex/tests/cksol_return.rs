@@ -626,6 +626,29 @@ async fn mexc_sol_routes_always_use_usdt_even_with_a_direct_usdc_book() {
     }
 }
 
+/// Review finding 25: the MEXC rule sent every SOL route through `SOL_USDT`,
+/// so Kraken could not quote SOL with its USD allowlist.
+#[tokio::test]
+async fn kraken_routes_sol_through_its_own_allowlist() {
+    let mut cex = MockCexBackend::new();
+    free_withdrawals(&mut cex);
+    cex.expect_get_orderbook().returning(|market, _| match market {
+        "SOL_USD" | "ICP_USD" => Ok(liquid_orderbook()),
+        _ => Err("not allowed".into()),
+    });
+    let mut finalizer =
+        cksol_finalizer(cex, MockBridgeBackend::new()).with_route_config(vec!["SOL_USD".into(), "ICP_USD".into()], 2);
+    finalizer.profile = crate::finalizers::cex::profile::CexVenueProfile::kraken();
+
+    let legs = finalizer.resolve_trade_legs_for_symbols("SOL", "ICP").await.unwrap();
+
+    let route: Vec<_> = legs
+        .iter()
+        .map(|leg| (leg.market.as_str(), leg.side.as_str()))
+        .collect();
+    assert_eq!(route, vec![("SOL_USD", "sell"), ("ICP_USD", "buy")]);
+}
+
 #[tokio::test]
 async fn mexc_sol_usdc_is_not_used_as_an_intermediate_hop() {
     let mut cex = MockCexBackend::new();

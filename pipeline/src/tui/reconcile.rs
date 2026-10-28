@@ -14,6 +14,36 @@ use crate::operator::{ReconcileAction, ReconcileRequest};
 const RECONCILE_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_INPUT_LEN: usize = 256;
 
+/// Why a request has no confirmed reply.
+#[derive(Debug)]
+enum NoReply {
+    /// The daemon refused the request, or the request never reached it.
+    Refused(String),
+    /// The daemon did not answer in time. It may still apply the request.
+    TimedOut,
+}
+
+impl NoReply {
+    fn message(&self) -> String {
+        match self {
+            Self::Refused(error) => error.clone(),
+            Self::TimedOut => format!(
+                "the daemon did not answer within {}s; it may still apply the request, so show the row before you answer again",
+                RECONCILE_TIMEOUT.as_secs()
+            ),
+        }
+    }
+}
+
+/// The log line for an answer. Only a reply from the daemon proves a refusal.
+fn outcome(reply: &Result<String, NoReply>) -> String {
+    match reply {
+        Ok(_) => "released".to_string(),
+        Err(NoReply::Refused(error)) => format!("refused: {error}"),
+        Err(no_reply @ NoReply::TimedOut) => format!("not confirmed: {}", no_reply.message()),
+    }
+}
+
 /// An open reconcile panel for one execution row.
 #[derive(Clone, Debug)]
 pub(super) struct ReconcilePanel {
@@ -43,7 +73,7 @@ pub(super) async fn open_reconcile(app: &mut App, sock_path: &Path, liq_id: Stri
         leg_id: None,
         action: ReconcileAction::Show,
     };
-    let reply = send(sock_path, &request).await;
+    let reply = send(sock_path, &request).await.map_err(|no_reply| no_reply.message());
     app.reconcile = Some(ReconcilePanel {
         liq_id,
         input: String::new(),
@@ -62,17 +92,15 @@ pub(super) async fn handle_reconcile_key(app: &mut App, key: KeyEvent, sock_path
         (KeyCode::Enter, _) => {
             let line = std::mem::take(&mut panel.input);
             let request = parse_reconcile_input(&panel.liq_id, &line);
-            panel.reply = match &request {
+            let reply = match &request {
                 Ok(request) => send(sock_path, request).await,
-                Err(error) => Err(error.clone()),
+                Err(error) => Err(NoReply::Refused(error.clone())),
             };
-            if let Ok(request) = request
-                && request.action != ReconcileAction::Show
-            {
-                let outcome = match &panel.reply {
-                    Ok(_) => "released".to_string(),
-                    Err(error) => format!("refused: {error}"),
-                };
+            let logged = request
+                .is_ok_and(|request| request.action != ReconcileAction::Show)
+                .then(|| outcome(&reply));
+            panel.reply = reply.map_err(|no_reply| no_reply.message());
+            if let Some(outcome) = logged {
                 let liq_id = panel.liq_id.clone();
                 app.push_log(format!("reconcile {liq_id}: `{}` {outcome}", line.trim()));
             }
@@ -85,13 +113,10 @@ pub(super) async fn handle_reconcile_key(app: &mut App, key: KeyEvent, sock_path
     }
 }
 
-async fn send(sock_path: &Path, request: &ReconcileRequest) -> Result<String, String> {
+async fn send(sock_path: &Path, request: &ReconcileRequest) -> Result<String, NoReply> {
     match timeout(RECONCILE_TIMEOUT, send_reconcile(sock_path, request)).await {
-        Ok(reply) => reply,
-        Err(_) => Err(format!(
-            "the daemon did not answer within {}s",
-            RECONCILE_TIMEOUT.as_secs()
-        )),
+        Ok(reply) => reply.map_err(NoReply::Refused),
+        Err(_) => Err(NoReply::TimedOut),
     }
 }
 
@@ -133,6 +158,20 @@ mod tests {
 
     fn action(line: &str) -> Result<(ReconcileAction, Option<String>), String> {
         parse_reconcile_input("1720", line).map(|request| (request.action, request.leg_id))
+    }
+
+    /// Review finding 34: the daemon may still apply an answer it did not
+    /// confirm in time, so the log must not call it refused.
+    #[test]
+    fn an_unconfirmed_answer_is_not_logged_as_refused() {
+        assert_eq!(outcome(&Ok("ok".to_string())), "released");
+        assert_eq!(
+            outcome(&Err(NoReply::Refused("row 7 is Enqueued, not parked".to_string()))),
+            "refused: row 7 is Enqueued, not parked"
+        );
+        let timed_out = outcome(&Err(NoReply::TimedOut));
+        assert!(!timed_out.contains("refused"), "{timed_out}");
+        assert!(timed_out.contains("may still apply"), "{timed_out}");
     }
 
     #[test]

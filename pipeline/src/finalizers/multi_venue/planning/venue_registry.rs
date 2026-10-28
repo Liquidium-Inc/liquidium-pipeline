@@ -146,12 +146,17 @@ pub(in crate::finalizers::multi_venue) struct VenueQuoteBook {
 
 impl VenueQuoteBook {
     // Iteration follows deterministic registry/configuration order.
+    #[cfg(test)]
     pub(in crate::finalizers::multi_venue) fn iter(&self) -> impl Iterator<Item = &VenuePreview> {
         self.previews.iter()
     }
 
     pub(in crate::finalizers::multi_venue) fn get(&self, venue_id: &str) -> Option<&VenuePreview> {
         self.previews.iter().find(|preview| preview.venue_id == venue_id)
+    }
+
+    pub(in crate::finalizers::multi_venue) fn into_previews(self) -> Vec<VenuePreview> {
+        self.previews
     }
 
     pub(in crate::finalizers::multi_venue) fn iter_mut(&mut self) -> impl Iterator<Item = &mut VenuePreview> {

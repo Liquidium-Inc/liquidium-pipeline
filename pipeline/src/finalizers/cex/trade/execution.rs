@@ -6,9 +6,16 @@ use crate::swappers::model::BPS_PER_RATIO_UNIT;
 /// Hard stop to avoid unbounded per-leg slicing loops on pathological books.
 const MAX_SLICE_EXECUTION_ROUNDS: usize = 128;
 
-/// Orders in a row that fill nothing within the price limit before the leg
-/// pauses until the next cycle. A pause is a wait, not an error.
+/// Orders in a row that fill nothing at the slippage cap before the limit
+/// widens. The leg pauses until the next cycle once the widest limit also fills nothing.
 const MAX_EMPTY_FILLS_IN_A_ROW: usize = 3;
+
+/// How much each order past the empty fills at the cap widens the IOC limit.
+const IOC_WIDEN_STEP_BPS: f64 = 100.0;
+
+/// A fill report rounds its output down by a hundredth of a basis point, so
+/// the order keeps a little more room than the exact limit.
+const PRICE_ROOM_MARGIN_BPS: f64 = 0.1;
 
 impl<C> CexVenueFinalizer<C>
 where
@@ -34,10 +41,14 @@ where
     ///   soft target (`target_bps`) first, hard-cap fallback second.
     /// - `maybe_mark_trade_dust` stops execution when, after the leg's first fill,
     ///   the chunk and remainder notional are both below `cex_min_exec_usd`.
-    /// - each accepted chunk is sent as an IOC limit order at the slippage cap.
+    /// - after a fill, a last remainder the exchange refuses as below its
+    ///   order minimum also ends the leg as dust.
+    /// - each accepted chunk is sent as an IOC limit order at the price room the
+    ///   slippage cap leaves after the taker fee; after empty fills the limit
+    ///   widens in steps to `max_widened_slippage_bps`.
     /// - realized `exec_price` is derived from actual fills and compared to preview
     ///   midpoint to compute realized slippage in bps.
-    /// - if realized slippage exceeds `max_sell_slippage_bps`, the leg fails fast.
+    /// - if realized slippage exceeds the slice's limit, the leg fails fast.
     /// - each executed slice is recorded, and the route slippage is computed from the records.
     ///
     /// Returns `Some((remaining_in, total_out))` once the leg is done, where
@@ -64,7 +75,7 @@ where
         // we can force `BaseQuantity` on the next slice to consume more residual.
         let mut forced_next_buy_mode: Option<BuyOrderInputMode> = None;
 
-        Self::sanitize_pending_trade_state_for_leg(state, leg);
+        self.sanitize_pending_trade_state_for_leg(state, leg);
 
         // Keep slicing until the leg input is consumed (or considered dust).
         while remaining_in > LIQUIDITY_EPS {
@@ -95,12 +106,16 @@ where
                 break;
             }
 
-            let buy_mode = Self::resolve_slice_buy_mode(state, leg, &mut forced_next_buy_mode);
-            let pending = Self::prepare_pending_slice_request(state, leg, leg_idx, preview.chunk_in, buy_mode);
+            let limit_bps = self.slice_limit_bps(empty_fills_in_a_row);
+            let price_room_bps = Self::price_room_or_err(&leg.side, limit_bps, preview.taker_fee_bps, &leg.market)
+                .inspect_err(|err| state.last_error = Some(err.clone()))?;
 
-            // The exchange enforces the slippage cap with an IOC order. Only if
-            // the exchange refuses IOC outright does the slice go out as a market order.
-            let fill_report = self
+            let buy_mode = Self::resolve_slice_buy_mode(state, leg, &mut forced_next_buy_mode);
+            let pending = self.prepare_pending_slice_request(state, leg, leg_idx, preview.chunk_in, buy_mode);
+
+            // The exchange enforces the limit with an IOC order. Only if the
+            // exchange refuses IOC outright does the slice go out as a market order.
+            let sent = self
                 .backend
                 .execute_swap_detailed_with_options(
                     &leg.market,
@@ -112,11 +127,24 @@ where
                         max_quote_overspend_bps: Some(self.cex_buy_inverse_overspend_bps as f64),
                         price_limit: Some(PriceLimit {
                             reference_price: preview.preview_mid_price,
-                            max_slippage_bps: self.max_sell_slippage_bps,
+                            max_slippage_bps: price_room_bps,
                         }),
                     },
                 )
-                .await?;
+                .await;
+            let fill_report = match sent {
+                // No order can trade less than the exchange minimum, so the last
+                // remainder of a filled leg is dust. The refused order never went out.
+                Err(CexBackendError::BelowMinimum(refusal))
+                    if total_out > 0.0 && preview.chunk_in >= remaining_in - LIQUIDITY_EPS =>
+                {
+                    Self::clear_pending_trade_order(state);
+                    self.mark_exchange_minimum_dust(state, leg, remaining_in, &refusal)
+                        .await;
+                    break;
+                }
+                sent => sent?,
+            };
 
             Self::clear_pending_trade_order(state);
             if fill_report.input_consumed <= LIQUIDITY_EPS {
@@ -127,13 +155,13 @@ where
                     .trade_applied_client_order_ids
                     .push(pending.client_order_id.clone());
                 empty_fills_in_a_row += 1;
-                if empty_fills_in_a_row >= MAX_EMPTY_FILLS_IN_A_ROW {
+                if empty_fills_in_a_row >= MAX_EMPTY_FILLS_IN_A_ROW && limit_bps >= self.max_widened_slippage_bps {
                     // The book keeps moving away. Waiting costs no retry budget,
                     // so the capital is never parked for this alone.
                     Self::persist_trade_progress(state, remaining_in, total_out);
                     warn!(
-                        "[cex] liq_id={} {} {}: {} orders in a row filled nothing within the limit; retrying next cycle",
-                        state.liq_id, leg.market, leg.side, empty_fills_in_a_row
+                        "[cex] liq_id={} {} {}: {} orders in a row filled nothing up to a {:.0} bps limit; retrying next cycle",
+                        state.liq_id, leg.market, leg.side, empty_fills_in_a_row, limit_bps
                     );
                     return Ok(None);
                 }
@@ -190,13 +218,13 @@ where
             );
 
             // Enforce hard per-slice slippage limit before allowing leg continuation.
-            if slice_slippage_bps > self.max_sell_slippage_bps {
+            if slice_slippage_bps > limit_bps {
                 let err = format!(
                     "slice slippage too high for {} {}: {:.2} bps > {:.2} bps (client_id={} buy_mode={} requested_in={} actual_in={} actual_out={} preview_mid={} exec_price={})",
                     leg.market,
                     leg.side,
                     slice_slippage_bps,
-                    self.max_sell_slippage_bps,
+                    limit_bps,
                     pending.client_order_id,
                     pending.buy_mode_label,
                     pending.requested_in,
@@ -240,6 +268,13 @@ where
         Ok(Some((remaining_in, total_out)))
     }
 
+    /// The IOC limit for the next order: the cap until the empty fills at the
+    /// cap run out, then one step wider per empty fill, never past the widened maximum.
+    fn slice_limit_bps(&self, empty_fills_in_a_row: usize) -> f64 {
+        let widenings = empty_fills_in_a_row.saturating_sub(MAX_EMPTY_FILLS_IN_A_ROW - 1);
+        (self.max_sell_slippage_bps + IOC_WIDEN_STEP_BPS * widenings as f64).min(self.max_widened_slippage_bps)
+    }
+
     fn persist_trade_progress(state: &mut CexState, remaining_in: f64, total_out: f64) {
         state.trade.trade_progress_remaining_in = Some(remaining_in);
         state.trade.trade_progress_total_out = Some(total_out);
@@ -276,6 +311,37 @@ where
             return Err(format!("invalid execution price for {} {}", market, side));
         }
         Ok(exec_price)
+    }
+
+    /// How far an order's price may move from the preview price, so that a fill
+    /// at that price, net of the taker fee, stays within `limit_bps`.
+    pub(in crate::finalizers::cex) fn price_room_bps(side: &str, limit_bps: f64, taker_fee_bps: f64) -> f64 {
+        let limit = limit_bps / BPS_PER_RATIO_UNIT;
+        let fee = taker_fee_bps / BPS_PER_RATIO_UNIT;
+        // A sell pays the fee from its quote output, a buy from its base output.
+        let room = if side.eq_ignore_ascii_case("sell") {
+            1.0 - (1.0 - limit) / (1.0 - fee)
+        } else {
+            (1.0 + limit) * (1.0 - fee) - 1.0
+        };
+        room * BPS_PER_RATIO_UNIT - PRICE_ROOM_MARGIN_BPS
+    }
+
+    /// The room an order gets, or the reason the fee leaves none. A route
+    /// without room would take the deposit and never trade.
+    pub(in crate::finalizers::cex) fn price_room_or_err(
+        side: &str,
+        limit_bps: f64,
+        taker_fee_bps: f64,
+        market: &str,
+    ) -> Result<f64, String> {
+        let room = Self::price_room_bps(side, limit_bps, taker_fee_bps);
+        if room <= 0.0 {
+            return Err(format!(
+                "the {limit_bps:.0} bps limit on {market} leaves no room for its {taker_fee_bps:.0} bps taker fee"
+            ));
+        }
+        Ok(room)
     }
 
     /// Compute slippage in bps from preview mid and realized execution price.
