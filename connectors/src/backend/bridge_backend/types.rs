@@ -164,6 +164,10 @@ pub enum BridgeError {
     /// later request is safe, and the wait is not a failure.
     #[error("{0}")]
     Deferred(String),
+    /// A call may have moved funds, and no answer decides it. Only an operator
+    /// can say what happened, so no automatic retry is safe.
+    #[error("{0}")]
+    Ambiguous(String),
     /// Any other failure.
     #[error("{0}")]
     Other(String),
@@ -178,12 +182,6 @@ impl From<String> for BridgeError {
 impl From<&str> for BridgeError {
     fn from(message: &str) -> Self {
         Self::Other(message.to_string())
-    }
-}
-
-impl From<BridgeError> for String {
-    fn from(error: BridgeError) -> Self {
-        error.to_string()
     }
 }
 
@@ -236,7 +234,7 @@ pub trait BridgeBackend: Send + Sync {
     async fn submit_bridge(&self, request: BridgeRequest) -> Result<BridgeSubmission, BridgeError>;
 
     /// Polls current status for a previously submitted bridge operation.
-    async fn get_bridge_status(&self, bridge_id: &str) -> Result<BridgeStatus, String>;
+    async fn get_bridge_status(&self, bridge_id: &str) -> Result<BridgeStatus, BridgeError>;
 
     /// Checks a request and signs the send that funds it, without sending it.
     /// The outbound driver sends it, then the caller gives `track_deposit` its receipt.

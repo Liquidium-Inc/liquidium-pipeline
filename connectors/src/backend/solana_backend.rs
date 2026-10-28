@@ -15,7 +15,8 @@ use solana_sdk::{
     transaction::Transaction,
 };
 
-use liquidium_pipeline_core::outbound::{SendOutcome, side_effect_ambiguous};
+use liquidium_pipeline_core::outbound::SendOutcome;
+use liquidium_pipeline_core::transfer::actions::TransferFailure;
 use serde::{Deserialize, Serialize};
 
 /// How long a plain transfer waits for a decided answer before it reports
@@ -80,11 +81,11 @@ pub trait SolanaBackend: Send + Sync {
     async fn spl_decimals(&self, mint: &str) -> Result<u8, String>;
 
     // Native SOL transfer from the pipeline wallet.
-    async fn native_transfer(&self, to: &str, amount_lamports: Nat) -> Result<String, String>; // signature
+    async fn native_transfer(&self, to: &str, amount_lamports: Nat) -> Result<String, TransferFailure>; // signature
 
     // SPL token transfer from the pipeline wallet.
     // Creates destination ATA if missing.
-    async fn spl_transfer(&self, mint: &str, to: &str, amount: Nat) -> Result<String, String>; // signature
+    async fn spl_transfer(&self, mint: &str, to: &str, amount: Nat) -> Result<String, TransferFailure>; // signature
 
     /// Builds and signs a transfer without sending it. `mint` is `None` for SOL.
     async fn prepare_transfer(&self, mint: Option<String>, to: &str, amount: Nat) -> Result<SignedSolanaTx, String>;
@@ -215,7 +216,7 @@ impl SolanaBackendImpl {
 
     /// A plain transfer for callers without a saved record: send, then read
     /// the cluster until it decides or the deadline passes.
-    async fn transfer_and_wait(&self, tx: SignedSolanaTx) -> Result<String, String> {
+    async fn transfer_and_wait(&self, tx: SignedSolanaTx) -> Result<String, TransferFailure> {
         let deadline = Instant::now() + PLAIN_TRANSFER_DEADLINE;
         let mut outcome = self.send_signed(&tx).await;
         loop {
@@ -223,9 +224,9 @@ impl SolanaBackendImpl {
                 SendOutcome::Landed { receipt } => return Ok(receipt),
                 SendOutcome::NeverLanded { reason }
                 | SendOutcome::BelowMinimum { reason }
-                | SendOutcome::Deferred { reason } => return Err(reason),
+                | SendOutcome::Deferred { reason } => return Err(TransferFailure::Rejected(reason)),
                 SendOutcome::Open { reason } if Instant::now() >= deadline => {
-                    return Err(side_effect_ambiguous(format!(
+                    return Err(TransferFailure::Ambiguous(format!(
                         "solana transaction {} has no decided answer: {reason}",
                         tx.signature
                     )));
@@ -301,13 +302,19 @@ impl SolanaBackend for SolanaBackendImpl {
         Ok(supply.decimals)
     }
 
-    async fn native_transfer(&self, to: &str, amount_lamports: Nat) -> Result<String, String> {
-        let tx = self.prepare_transfer(None, to, amount_lamports).await?;
+    async fn native_transfer(&self, to: &str, amount_lamports: Nat) -> Result<String, TransferFailure> {
+        let tx = self
+            .prepare_transfer(None, to, amount_lamports)
+            .await
+            .map_err(TransferFailure::Rejected)?;
         self.transfer_and_wait(tx).await
     }
 
-    async fn spl_transfer(&self, mint: &str, to: &str, amount: Nat) -> Result<String, String> {
-        let tx = self.prepare_transfer(Some(mint.to_string()), to, amount).await?;
+    async fn spl_transfer(&self, mint: &str, to: &str, amount: Nat) -> Result<String, TransferFailure> {
+        let tx = self
+            .prepare_transfer(Some(mint.to_string()), to, amount)
+            .await
+            .map_err(TransferFailure::Rejected)?;
         self.transfer_and_wait(tx).await
     }
 

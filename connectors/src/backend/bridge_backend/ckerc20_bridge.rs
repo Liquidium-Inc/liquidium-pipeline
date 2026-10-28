@@ -25,7 +25,7 @@ use super::{
         WithdrawalDetail, WithdrawalRet, WithdrawalSearchParameter,
     },
 };
-use liquidium_pipeline_core::outbound::{SIDE_EFFECT_AMBIGUOUS_PREFIX, SendOutcome};
+use liquidium_pipeline_core::outbound::SendOutcome;
 use liquidium_pipeline_core::types::side_cost::SideCost;
 use crate::{
     backend::{
@@ -318,12 +318,6 @@ where
             bridge_ic_owner_principal,
             forward_submission: tokio::sync::Mutex::new(()),
         }
-    }
-
-    /// A helper send error does not prove the transaction stayed local. A
-    /// repeat after it lands would deposit the same funds twice.
-    fn helper_send_error(call: &str, error: String) -> String {
-        format!("{SIDE_EFFECT_AMBIGUOUS_PREFIX}: {call} has no decided answer: {error}")
     }
 
     async fn minter_info(&self) -> Result<CkEthMinterInfo, String> {
@@ -770,7 +764,11 @@ where
                 bridge_id: handle.bridge_id(tx.hash)?,
             }),
             Broadcast::Rejected(error) => Err(format!("helper deposit {:#x} refused: {error}", tx.hash).into()),
-            Broadcast::Unknown(error) => Err(Self::helper_send_error("helper deposit", error).into()),
+            // A send error does not prove the transaction stayed local. A
+            // repeat after it lands would deposit the same funds twice.
+            Broadcast::Unknown(error) => Err(BridgeError::Ambiguous(format!(
+                "helper deposit has no decided answer: {error}"
+            ))),
         }
     }
 
@@ -1268,7 +1266,7 @@ where
         Ok(candidates)
     }
 
-    async fn get_bridge_status(&self, bridge_id: &str) -> Result<BridgeStatus, String> {
+    async fn get_bridge_status(&self, bridge_id: &str) -> Result<BridgeStatus, BridgeError> {
         if bridge_id.starts_with("ic-withdraw:") || bridge_id.starts_with("ic-withdraw-eth:") {
             // The reverse-route caller separately requires the exchange deposit
             // credit before trading. This legacy status releases that polling

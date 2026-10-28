@@ -279,7 +279,7 @@ async fn mexc_cksol_deposit_notice_parks_after_its_window_and_resumes_on_accepta
     let mut state = cksol_funded_state(&finalizer, now_ts() - DEPOSIT_NOTICE_WINDOW_SECS - 1);
 
     let error = finalizer.withdraw(&mut state).await.expect_err("the window ran out");
-    assert!(error.to_string().starts_with(SIDE_EFFECT_AMBIGUOUS_PREFIX), "{error}");
+    assert!(matches!(error, CexBackendError::Ambiguous(_)), "{error}");
     assert!(error.to_string().contains("sol-sig"), "{error}");
     assert!(state.withdraw.bridge.withdraw_bridge_id.is_none());
 
@@ -413,7 +413,7 @@ async fn mexc_cksol_sweep_dropped_after_the_window_parks() {
     state.withdraw.bridge.withdraw_bridge_id = Some("cksol-deposit-v2:second".into());
 
     let error = finalizer.withdraw(&mut state).await.expect_err("the sweep keeps failing");
-    assert!(error.to_string().starts_with(SIDE_EFFECT_AMBIGUOUS_PREFIX), "{error}");
+    assert!(matches!(error, CexBackendError::Ambiguous(_)), "{error}");
     assert!(state.withdraw.bridge.withdraw_bridge_id.is_none());
 
     // A release gives one new notice.

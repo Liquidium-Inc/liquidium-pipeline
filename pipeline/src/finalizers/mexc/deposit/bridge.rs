@@ -51,12 +51,12 @@ where
             return self.advance_bridged_deposit_submission(state, bridge, route).await;
         }
 
-        Ok(self.poll_deposit_bridge(state, bridge).await?)
+        self.poll_deposit_bridge(state, bridge).await
     }
 
     /// Reads the bridge status. A completed bridge hands over to the MEXC
     /// balance check; a failed or canceled bridge returns an error.
-    async fn poll_deposit_bridge(&self, state: &mut CexState, bridge: &BridgeRuntime) -> Result<(), String> {
+    async fn poll_deposit_bridge(&self, state: &mut CexState, bridge: &BridgeRuntime) -> Result<(), CexBackendError> {
         state.deposit.bridge.deposit_bridge_polled_at_ts = Some(now_ts());
         let bridge_id = state
             .deposit
@@ -81,13 +81,15 @@ where
                 state.liq_id,
                 bridge_id,
                 reason.unwrap_or_else(|| "unknown failure".to_string())
-            )),
+            )
+            .into()),
             BridgeStatus::Canceled { reason } => Err(format!(
                 "bridged deposit canceled for liq_id {} bridge_id {}: {}",
                 state.liq_id,
                 bridge_id,
                 reason.unwrap_or_else(|| "no reason provided".to_string())
-            )),
+            )
+            .into()),
         }
     }
 }

@@ -12,7 +12,7 @@ use liquidium_pipeline_connectors::backend::bridge_backend::{
     DepositNotice, cksol_transfer_without_deposit_id, resolve_route,
 };
 use liquidium_pipeline_connectors::outbound::UnsettledSender;
-use liquidium_pipeline_core::outbound::{OutboundIntent, OutboundSender, side_effect_ambiguous};
+use liquidium_pipeline_core::outbound::{OutboundIntent, OutboundSender};
 use liquidium_pipeline_connectors::backend::cex_backend::{
     BuyOrderInputMode, CexBackend, CexBackendError, OrderBookLevel, PriceLimit, SwapExecutionOptions, WithdrawStatus,
 };
@@ -483,9 +483,9 @@ where
         }
 
         if !state.withdraw.bridge.withdraw_bridge_required {
-            return Ok(self
+            return self
                 .withdraw_direct(state, &planned_asset, &planned_network, amount)
-                .await?);
+                .await;
         }
         self.withdraw_bridged(state, &planned_asset, &planned_network, amount)
             .await

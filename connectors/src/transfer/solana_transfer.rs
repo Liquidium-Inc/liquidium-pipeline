@@ -6,7 +6,6 @@ use liquidium_pipeline_core::account::model::ChainAccount;
 use liquidium_pipeline_core::tokens::chain_token::ChainToken;
 use liquidium_pipeline_core::transfer::actions::{TransferActions, TransferFailure};
 
-use liquidium_pipeline_core::outbound::SIDE_EFFECT_AMBIGUOUS_PREFIX;
 use crate::backend::solana_backend::SolanaBackend;
 
 pub struct SolanaTransferAdapter<B: SolanaBackend> {
@@ -27,26 +26,15 @@ impl<B: SolanaBackend + Send + Sync> TransferActions for SolanaTransferAdapter<B
         to: &ChainAccount,
         amount_native: Nat,
     ) -> Result<String, TransferFailure> {
-        // The backend settles an unconfirmed send against the cluster. Only an
-        // answer it could not decide keeps the ambiguity prefix.
-        let classify = |error: String| {
-            if error.starts_with(SIDE_EFFECT_AMBIGUOUS_PREFIX) {
-                TransferFailure::Ambiguous(error)
-            } else {
-                TransferFailure::Rejected(error)
-            }
-        };
+        // The backend settles an unconfirmed send against the cluster, so its
+        // failure already says whether funds may have moved.
         match (token, to) {
-            (ChainToken::SolanaNative { .. }, ChainAccount::Solana(to_address)) => self
-                .backend
-                .native_transfer(to_address, amount_native)
-                .await
-                .map_err(classify),
-            (ChainToken::SolanaSpl { mint, .. }, ChainAccount::Solana(to_address)) => self
-                .backend
-                .spl_transfer(mint, to_address, amount_native)
-                .await
-                .map_err(classify),
+            (ChainToken::SolanaNative { .. }, ChainAccount::Solana(to_address)) => {
+                self.backend.native_transfer(to_address, amount_native).await
+            }
+            (ChainToken::SolanaSpl { mint, .. }, ChainAccount::Solana(to_address)) => {
+                self.backend.spl_transfer(mint, to_address, amount_native).await
+            }
             (ChainToken::SolanaNative { .. } | ChainToken::SolanaSpl { .. }, _) => Err(TransferFailure::Rejected(
                 "SolanaTransferAdapter: destination chain must be Solana".to_string(),
             )),

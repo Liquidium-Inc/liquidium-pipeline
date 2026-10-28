@@ -1938,16 +1938,11 @@ async fn forward_bridge_helper_send_error_is_ambiguous() {
     };
 
     // The transaction can land after the error, so a repeat would deposit twice.
-    let error = backend
-        .submit_bridge(request)
-        .await
-        .expect_err("the send failed")
-        .to_string();
+    let error = backend.submit_bridge(request).await.expect_err("the send failed");
     assert!(
-        error.starts_with(liquidium_pipeline_core::outbound::SIDE_EFFECT_AMBIGUOUS_PREFIX),
+        matches!(&error, BridgeError::Ambiguous(message) if message.contains("rpc timed out")),
         "{error}"
     );
-    assert!(error.contains("rpc timed out"), "{error}");
 }
 
 #[tokio::test]

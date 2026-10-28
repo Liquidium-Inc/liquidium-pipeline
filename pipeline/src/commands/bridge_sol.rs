@@ -510,11 +510,17 @@ pub async fn submit(
         direction_raw, amount, request.source_address, destination_value
     );
 
-    let submission = backend.submit_bridge(request).await?;
+    let submission = backend
+        .submit_bridge(request)
+        .await
+        .map_err(|error| error.to_string())?;
     println!("Bridge submitted. bridge_id={}", submission.bridge_id);
 
     if check_status {
-        let status = backend.get_bridge_status(&submission.bridge_id).await?;
+        let status = backend
+            .get_bridge_status(&submission.bridge_id)
+            .await
+            .map_err(|error| error.to_string())?;
         println!(
             "Immediate bridge status for {}: {}",
             submission.bridge_id,
@@ -533,7 +539,10 @@ pub async fn status(bridge_id: &str) -> Result<(), String> {
 
     let config = Config::load().await?;
     let backend = build_backend(config, DEFAULT_SOLANA_BRIDGE_FEE_BUFFER_LAMPORTS, None)?;
-    let status = backend.get_bridge_status(bridge_id).await?;
+    let status = backend
+        .get_bridge_status(bridge_id)
+        .await
+        .map_err(|error| error.to_string())?;
 
     println!("Bridge status for {}: {}", bridge_id, format_bridge_status(&status));
     Ok(())

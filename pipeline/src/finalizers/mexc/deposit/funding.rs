@@ -13,7 +13,7 @@ where
         &self,
         state: &mut CexState,
         intent: Option<OutboundIntent>,
-    ) -> Result<bool, String> {
+    ) -> Result<bool, CexBackendError> {
         let landed = step_outbound(
             &mut state.deposit.deposit_funding,
             self.outbound.as_ref(),

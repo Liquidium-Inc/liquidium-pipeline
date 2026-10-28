@@ -1263,7 +1263,6 @@ mod bridged_deposit_restart {
     use liquidium_pipeline_connectors::backend::bridge_backend::{
         BridgeFeeBudget, BridgeSubmissionCandidate, MockBridgeBackend,
     };
-    use liquidium_pipeline_core::outbound::SIDE_EFFECT_AMBIGUOUS_PREFIX;
 
     const DESTINATION: &str = "0x1111111111111111111111111111111111111111";
 
@@ -1435,7 +1434,7 @@ mod bridged_deposit_restart {
         assert_eq!(progress.status, VenueLegStatus::OperatorRequired);
         assert!(progress.retryable_error.is_none());
         let error = progress.last_error.clone().expect("reason for the operator");
-        assert!(error.starts_with(SIDE_EFFECT_AMBIGUOUS_PREFIX), "{error}");
+        assert!(error.contains("2 unclaimed provider records match"), "{error}");
         let execution = decode(&progress);
         assert!(execution.operator_required);
         assert!(matches!(
