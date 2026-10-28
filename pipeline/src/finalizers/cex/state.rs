@@ -205,6 +205,10 @@ pub struct CexWithdrawBridgeState {
     pub withdraw_bridge_polled_at_ts: Option<i64>,
     #[serde(default)]
     pub withdraw_bridge_destination_snapshot: Option<String>,
+    /// The provider call that starts the return bridge, saved before it runs.
+    /// A lost answer settles from the provider history, never with a new call.
+    #[serde(default)]
+    pub withdraw_bridge_call: Option<crate::outbound::driver::OutboundRecord>,
     /// The send that funds the return bridge, saved before it is sent.
     #[serde(default)]
     pub withdraw_bridge_funding: Option<crate::outbound::driver::OutboundRecord>,
@@ -271,6 +275,7 @@ impl CexState {
             &mut self.deposit.deposit_funding,
             &mut self.deposit.bridge.deposit_bridge_call,
             &mut self.withdraw.withdraw_send,
+            &mut self.withdraw.bridge.withdraw_bridge_call,
             &mut self.withdraw.bridge.withdraw_bridge_funding,
         ]
         .into_iter()
@@ -291,6 +296,7 @@ impl CexState {
                 self.withdraw.withdraw_id.is_some()
                     && (!bridge.withdraw_bridge_required
                         || bridge.withdraw_bridge_id.is_some()
+                        || bridge.withdraw_bridge_call.is_some()
                         || bridge.deposit_send_started())
             }
             _ => false,
@@ -401,6 +407,7 @@ mod tests {
                     withdraw_bridge_polled_at_ts: None,
                     withdraw_bridge_mint_receipt: None,
                     withdraw_bridge_destination_snapshot: None,
+                    withdraw_bridge_call: None,
                     withdraw_bridge_funding: None,
                     withdraw_bridge_send_handle: None,
                     withdraw_bridge_funding_txid: None,

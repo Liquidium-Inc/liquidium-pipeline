@@ -12,7 +12,7 @@ use liquidium_pipeline_connectors::outbound::{decode_payload, encode_payload};
 use liquidium_pipeline_core::outbound::{OutboundIntent, OutboundSender, PreparedSend, SendOutcome};
 use serde::{Deserialize, Serialize};
 
-use crate::{bridge::claims::BridgeClaimLookup, finalizers::bridge_planner::deposit_destination};
+use crate::{bridge::claims::BridgeClaimLookup, finalizers::bridge_planner::bridge_destination};
 
 pub const NAME: &str = "bridge-call";
 
@@ -54,7 +54,7 @@ impl BridgeCall {
             source_chain: self.source_chain.clone(),
             source_address: self.source_address.clone(),
             target_asset: self.target_asset.clone(),
-            destination: deposit_destination(route.destination_kind, &self.destination)?,
+            destination: bridge_destination(route.destination_kind, &self.destination)?,
             amount: self.amount,
             provider_fee_budget_native_units: self.provider_fee_budget_native_units.clone(),
         })

@@ -277,9 +277,9 @@ fn mexc_sol_reverse_plan_reserves_approval_fee() {
     ).unwrap().unwrap();
     assert_eq!(reserve.value, Nat::from(500u64));
     assert_eq!(burn.value, Nat::from(999_999_500u64));
-    assert!(crate::finalizers::bridge_planner::deposit_destination(
-        route.destination_kind, "not-a-solana-address",
-    ).is_err());
+    assert!(
+        crate::finalizers::bridge_planner::bridge_destination(route.destination_kind, "not-a-solana-address",).is_err()
+    );
 }
 
 #[tokio::test]

@@ -537,6 +537,12 @@ fn append_mexc_leg_transactions(lines: &mut Vec<Line<'static>>, execution: &Venu
             lines.push(Line::from(format!("   {label}: {value}")));
         }
     }
+    if let Some(call) = cex.get("withdraw_bridge_call").filter(|call| !call.is_null()) {
+        lines.push(Line::from(format!(
+            "   MEXC return bridge call: {}",
+            describe_bridge_call(call)
+        )));
+    }
     if let Some(call) = cex.get("deposit_bridge_call").filter(|call| !call.is_null()) {
         lines.push(Line::from(format!("   MEXC deposit bridge call: {}", describe_bridge_call(call))));
     } else if let Some(phase) = cex.get("deposit_bridge_submit_phase").filter(|phase| !phase.is_null()) {

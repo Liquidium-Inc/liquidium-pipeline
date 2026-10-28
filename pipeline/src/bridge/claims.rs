@@ -118,7 +118,7 @@ fn visit(value: &Value, claims: &mut BridgeClaims) {
                     if let Some(id) = child.as_str() {
                         claims.bridge_ids.push(id.to_string());
                     }
-                } else if key == "deposit_bridge_call" {
+                } else if key == "deposit_bridge_call" || key == "withdraw_bridge_call" {
                     if let Some(call) = open_bridge_call(child) {
                         claims.open_calls.push(call);
                     }
@@ -266,6 +266,7 @@ mod tests {
             started_at_ts: 5,
         };
         let record = OutboundRecord::prepared(prepare_bridge_call("call-1".into(), &call).unwrap());
+        let return_call = OutboundRecord::prepared(prepare_bridge_call("call-2".into(), &call).unwrap());
         let other_sender = OutboundRecord::prepared(liquidium_pipeline_core::outbound::PreparedSend {
             sender: "icp".into(),
             identity: "funding".into(),
@@ -276,6 +277,7 @@ mod tests {
             "meta_v2": {"legs": [
                 {"execution": {"state": {"deposit_bridge_call": record}}},
                 {"execution": {"state": {"deposit_bridge_call": other_sender}}},
+                {"execution": {"state": {"withdraw_bridge_call": return_call}}},
             ]}
         });
         let rows = vec![row("1", &meta.to_string())];
@@ -287,9 +289,10 @@ mod tests {
 
         let claims = WalBridgeClaims::new(Arc::new(wal)).claims_since(0).await.unwrap();
 
-        assert_eq!(claims.open_calls.len(), 1, "only bridge calls count");
+        assert_eq!(claims.open_calls.len(), 2, "bridge calls on both leg sides count");
         assert_eq!(claims.open_calls[0].id, "call-1");
         assert_eq!(claims.open_calls[0].call, call);
+        assert_eq!(claims.open_calls[1].id, "call-2");
     }
 
     #[tokio::test]

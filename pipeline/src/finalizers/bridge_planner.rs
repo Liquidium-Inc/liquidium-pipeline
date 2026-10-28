@@ -28,12 +28,8 @@ pub(crate) fn parse_icp_account_like(address: &str) -> Result<Account, String> {
 }
 
 /// The bridge destination for a CEX deposit address of the given kind.
-pub(crate) fn deposit_destination(kind: BridgeDestinationKind, cex_address: &str) -> Result<BridgeDestination, String> {
-    bridge_destination(kind, cex_address).map_err(|error| format!("invalid CEX deposit destination: {error}"))
-}
-
 /// Reads an address as a bridge destination of the given kind.
-fn bridge_destination(kind: BridgeDestinationKind, address: &str) -> Result<BridgeDestination, String> {
+pub(crate) fn bridge_destination(kind: BridgeDestinationKind, address: &str) -> Result<BridgeDestination, String> {
     match kind {
         BridgeDestinationKind::EvmAddress => address
             .parse::<EvmAddress>()
