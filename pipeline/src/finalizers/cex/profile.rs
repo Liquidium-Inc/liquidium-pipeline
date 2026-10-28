@@ -11,36 +11,36 @@ pub struct CexVenueProfile {
     special_trade_legs: Option<fn(&str, &str) -> Option<Vec<TradeLeg>>>,
     /// The only market SOL trades on, when the exchange restricts SOL to one.
     sol_market: Option<&'static str>,
-    /// The ICP assets the exchange lists itself. They skip the bridge even when it has a route for them.
+    /// The ICP assets the exchange lists itself. They skip the bridge, and ranking counts them as fast.
     direct_assets: &'static [&'static str],
     approval_bumps: bool,
     client_order_id_max_len: usize,
 }
 
 impl CexVenueProfile {
-    /// MEXC: fixed routes for the legacy ck pairs, SOL only on `SOL_USDT`, ckUSDT
-    /// on ICP, and approval bumps on direct ICP deposits so that the exchange notices them.
+    /// MEXC: fixed routes for the legacy ck pairs, SOL only on `SOL_USDT`, ckUSDT, ckBTC
+    /// and ICP on ICP, and approval bumps on direct ICP deposits so that the exchange notices them.
     pub fn mexc() -> Self {
         Self {
             venue_id: MEXC_VENUE_ID,
             name: "MEXC",
             special_trade_legs: Some(mexc_special_trade_legs),
             sol_market: Some("SOL_USDT"),
-            direct_assets: &["ckUSDT"],
+            direct_assets: &["ckUSDT", "ckBTC", "ICP"],
             approval_bumps: true,
             client_order_id_max_len: 32,
         }
     }
 
-    /// Kraken: no fixed routes and no approval bumps. It takes free-text client
-    /// order ids of at most 18 characters.
+    /// Kraken: no fixed routes and no approval bumps, and ICP is its only asset on
+    /// ICP. It takes free-text client order ids of at most 18 characters.
     pub fn kraken() -> Self {
         Self {
             venue_id: KRAKEN_VENUE_ID,
             name: "Kraken",
             special_trade_legs: None,
             sol_market: None,
-            direct_assets: &[],
+            direct_assets: &["ICP"],
             approval_bumps: false,
             client_order_id_max_len: 18,
         }
@@ -74,6 +74,11 @@ impl CexVenueProfile {
         self.sol_market
     }
 
+    /// The ICP assets the exchange lists itself.
+    pub fn direct_assets(&self) -> &'static [&'static str] {
+        self.direct_assets
+    }
+
     /// Whether the exchange takes this ICP asset itself, so it skips the bridge.
     pub fn takes_directly(&self, asset: &str) -> bool {
         self.direct_assets
@@ -104,6 +109,7 @@ mod tests {
         assert!(mexc.special_trade_legs("ckBTC", "ckUSDT").is_some());
         assert!(mexc.special_trade_legs("ICP", "ckUSDT").is_none());
         assert_eq!(mexc.sol_market(), Some("SOL_USDT"));
+        assert_eq!(mexc.direct_assets(), ["ckUSDT", "ckBTC", "ICP"]);
         assert!(mexc.takes_directly("ckUSDT"));
         assert!(!mexc.takes_directly("ckUSDC"));
         assert_eq!(mexc.client_order_id_max_len(), 32);
@@ -116,6 +122,7 @@ mod tests {
         assert!(!kraken.approval_bumps());
         assert!(kraken.special_trade_legs("ckBTC", "ckUSDT").is_none());
         assert_eq!(kraken.sol_market(), None);
+        assert_eq!(kraken.direct_assets(), ["ICP"]);
         assert!(!kraken.takes_directly("ckUSDT"));
         assert_eq!(kraken.client_order_id_max_len(), 18);
     }
