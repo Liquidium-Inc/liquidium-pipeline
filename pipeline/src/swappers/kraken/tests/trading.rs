@@ -36,7 +36,7 @@ fn trading_api() -> MockKrakenApi {
     let mut api = MockKrakenApi::new();
     api.expect_pairs().returning(|| Ok(vec![btc_usd_pair()]));
     api.expect_orderbook().returning(|_, _| Ok(one_coin_book()));
-    api.expect_closed_order_by_client_id().returning(|_| Ok(None));
+    api.expect_closed_orders_by_client_id().returning(|_| Ok(vec![]));
     api
 }
 
@@ -165,7 +165,7 @@ async fn an_ioc_order_that_fills_nothing_reports_an_empty_fill() {
 async fn a_sell_below_the_cost_minimum_is_refused_before_submission() {
     let mut api = MockKrakenApi::new();
     api.expect_pairs().returning(|| Ok(vec![btc_usd_pair()]));
-    api.expect_closed_order_by_client_id().returning(|_| Ok(None));
+    api.expect_closed_orders_by_client_id().returning(|_| Ok(vec![]));
     api.expect_orderbook().never();
     api.expect_place_order().never();
     let mut options = ioc("liq-small");
@@ -211,15 +211,15 @@ fn a_buy_reports_the_base_it_can_withdraw() {
 async fn a_resumed_leg_adopts_the_order_it_already_placed() {
     let mut api = MockKrakenApi::new();
     api.expect_pairs().returning(|| Ok(vec![btc_usd_pair()]));
-    api.expect_closed_order_by_client_id()
+    api.expect_closed_orders_by_client_id()
         .withf(|id| id == "lqd39ae79815a051f7")
         .once()
         .returning(|_| {
-            Ok(Some(closed(
+            Ok(vec![closed(
                 Decimal::new(1, 1),
                 Decimal::new(6_000, 0),
                 Decimal::new(48, 0),
-            )))
+            )])
         });
     api.expect_place_order().never();
 
@@ -231,24 +231,67 @@ async fn a_resumed_leg_adopts_the_order_it_already_placed() {
     assert!((report.input_consumed - 0.1).abs() < 1e-9);
 }
 
-/// An earlier IOC order under the id filled nothing, so a new order is safe.
+/// An earlier IOC order under the id filled nothing. That empty fill is the
+/// answer, so the machine spends the id and the next order takes a new one.
 #[tokio::test]
-async fn a_resumed_leg_whose_order_filled_nothing_sends_again() {
+async fn a_resumed_leg_whose_order_filled_nothing_reports_an_empty_fill() {
     let mut api = MockKrakenApi::new();
     api.expect_pairs().returning(|| Ok(vec![btc_usd_pair()]));
-    api.expect_orderbook().returning(|_, _| Ok(one_coin_book()));
-    api.expect_closed_order_by_client_id()
+    api.expect_closed_orders_by_client_id()
         .once()
-        .returning(|_| Ok(Some(closed(Decimal::ZERO, Decimal::ZERO, Decimal::ZERO))));
-    api.expect_place_order().once().returning(|_| Ok("ORDER-2".into()));
-    api.expect_order()
-        .once()
-        .returning(|_| Ok(closed(Decimal::new(1, 1), Decimal::new(6_000, 0), Decimal::new(48, 0))));
+        .returning(|_| Ok(vec![closed(Decimal::ZERO, Decimal::ZERO, Decimal::ZERO)]));
+    api.expect_place_order().never();
 
-    btc_usd_client(api)
+    let report = btc_usd_client(api)
         .execute_swap_detailed_with_options("BTC_USD", "sell", 0.1, ioc("liq-again"))
         .await
-        .expect("the new order fills");
+        .expect("the empty order is adopted");
+
+    assert_eq!(report.input_consumed, 0.0);
+    assert_eq!(report.output_received, 0.0);
+}
+
+/// Review finding 2: rows from before one order per id may hold an empty
+/// order and a filled one. The filled one is adopted, in either order.
+#[tokio::test]
+async fn of_an_empty_and_a_filled_order_under_one_id_the_fill_is_adopted() {
+    let empty = closed(Decimal::ZERO, Decimal::ZERO, Decimal::ZERO);
+    let filled = closed(Decimal::new(1, 1), Decimal::new(6_000, 0), Decimal::new(48, 0));
+    for placed in [vec![empty.clone(), filled.clone()], vec![filled, empty]] {
+        let mut api = MockKrakenApi::new();
+        api.expect_pairs().returning(|| Ok(vec![btc_usd_pair()]));
+        api.expect_closed_orders_by_client_id()
+            .once()
+            .return_once(move |_| Ok(placed));
+        api.expect_place_order().never();
+
+        let report = btc_usd_client(api)
+            .execute_swap_detailed_with_options("BTC_USD", "sell", 0.1, ioc("liq-twice"))
+            .await
+            .expect("the fill is adopted");
+
+        assert!((report.input_consumed - 0.1).abs() < 1e-9);
+    }
+}
+
+/// Two fills under one id mean the same input traded twice. Only an operator
+/// can say which fill the leg owns.
+#[tokio::test]
+async fn two_filled_orders_under_one_id_need_an_operator() {
+    let filled = closed(Decimal::new(1, 1), Decimal::new(6_000, 0), Decimal::new(48, 0));
+    let mut api = MockKrakenApi::new();
+    api.expect_pairs().returning(|| Ok(vec![btc_usd_pair()]));
+    api.expect_closed_orders_by_client_id()
+        .once()
+        .return_once(move |_| Ok(vec![filled.clone(), filled]));
+    api.expect_place_order().never();
+
+    let error = btc_usd_client(api)
+        .execute_swap_detailed_with_options("BTC_USD", "sell", 0.1, ioc("liq-double"))
+        .await
+        .expect_err("two fills are ambiguous");
+
+    assert!(matches!(error, CexBackendError::Ambiguous(_)), "{error:?}");
 }
 
 #[tokio::test]

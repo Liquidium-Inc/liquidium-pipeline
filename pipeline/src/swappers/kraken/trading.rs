@@ -60,18 +60,18 @@ impl KrakenClient {
         let pair = self.pair(market).await?;
 
         // A resumed leg holds the client id of an order it may have placed.
-        // A fill under that id is adopted, so the same funds never trade twice.
+        // An order under that id is the answer, even an empty one, so no id goes out twice.
         if let Some(client_order_id) = options.client_order_id.as_deref() {
-            match self.api.closed_order_by_client_id(client_order_id).await {
-                Ok(Some(order)) if order.volume_executed > Decimal::ZERO => {
-                    info!("[kraken] adopting the fill already placed under client id {client_order_id}");
-                    return Ok(fill_report(side, &order)?);
-                }
-                Ok(_) => {}
+            let placed = match self.api.closed_orders_by_client_id(client_order_id).await {
+                Ok(placed) => placed,
                 Err(KrakenApiError::Unreachable(error)) => return Err(CexBackendError::Unreachable(error)),
                 Err(error) => {
                     return Err(format!("Kraken lookup of client order {client_order_id} failed: {error}").into());
                 }
+            };
+            if let Some(order) = adopted_order(client_order_id, placed)? {
+                info!("[kraken] adopting the order already placed under client id {client_order_id}");
+                return Ok(fill_report(side, &order)?);
             }
         }
 
@@ -133,6 +133,21 @@ impl KrakenClient {
             }
             None => CexBackendError::Ambiguous(format!("Kraken order {order_id} did not reach a final state")),
         })
+    }
+}
+
+/// The order a client id already stands for. Rows from before one order per
+/// id may hold an empty order and a filled one; two fills need an operator.
+fn adopted_order(client_order_id: &str, placed: Vec<KrakenOrder>) -> Result<Option<KrakenOrder>, CexBackendError> {
+    let (mut filled, empty): (Vec<_>, Vec<_>) = placed
+        .into_iter()
+        .partition(|order| order.volume_executed > Decimal::ZERO);
+    match filled.len() {
+        0 => Ok(empty.into_iter().next()),
+        1 => Ok(filled.pop()),
+        count => Err(CexBackendError::Ambiguous(format!(
+            "{count} Kraken orders filled under client id {client_order_id}"
+        ))),
     }
 }
 

@@ -130,9 +130,9 @@ pub trait KrakenApi: Send + Sync {
     /// Places one order and returns its Kraken id.
     async fn place_order(&self, request: &KrakenOrderRequest) -> Result<String, KrakenApiError>;
     async fn order(&self, order_id: &str) -> Result<KrakenOrder, KrakenApiError>;
-    /// A closed order placed under this client id, if Kraken has one. A
-    /// resumed leg knows its order only by this id.
-    async fn closed_order_by_client_id(&self, client_order_id: &str) -> Result<Option<KrakenOrder>, KrakenApiError>;
+    /// Every closed order placed under this client id. A resumed leg knows
+    /// its order only by this id.
+    async fn closed_orders_by_client_id(&self, client_order_id: &str) -> Result<Vec<KrakenOrder>, KrakenApiError>;
     async fn withdraw(&self, asset: &str, key: &str, address: &str, amount: Decimal) -> Result<String, KrakenApiError>;
     /// The newest `limit` withdrawals of `asset`. Kraken caps this at 500 over
     /// 90 days and returns no cursor.

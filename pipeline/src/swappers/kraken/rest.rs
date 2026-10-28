@@ -294,7 +294,7 @@ impl KrakenApi for KrakenRestApi {
         Ok(to_kraken_order(order))
     }
 
-    async fn closed_order_by_client_id(&self, client_order_id: &str) -> Result<Option<KrakenOrder>, KrakenApiError> {
+    async fn closed_orders_by_client_id(&self, client_order_id: &str) -> Result<Vec<KrakenOrder>, KrakenApiError> {
         let request = ClosedOrdersRequest::builder()
             .client_order_id(client_order_id.to_string())
             .build();
@@ -305,8 +305,9 @@ impl KrakenApi for KrakenRestApi {
         Ok(response
             .closed
             .into_values()
-            .find(|order| order.client_order_id.as_deref() == Some(client_order_id))
-            .map(to_kraken_order))
+            .filter(|order| order.client_order_id.as_deref() == Some(client_order_id))
+            .map(to_kraken_order)
+            .collect())
     }
 
     async fn withdraw(&self, asset: &str, key: &str, address: &str, amount: Decimal) -> Result<String, KrakenApiError> {
