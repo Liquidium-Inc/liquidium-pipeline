@@ -8,6 +8,7 @@ use tracing::{debug, info, warn};
 
 use crate::{
     executors::{basic::basic_executor::BasicExecutor, executor::ExecutorRequest},
+    liquidation::lending_queries::get_liquidation_inflow,
     persistance::LiquidationIntentStore,
     stage::PipelineStage,
 };
@@ -70,19 +71,14 @@ impl<'a, A: PipelineAgent, D: LiquidationIntentStore> PipelineStage<'a, Vec<Exec
                 };
 
                 let liq_req = executor_request.liquidation.clone();
+                let summary = request_summary(&executor_request);
 
-                info!(
-                    "[executor] ⚡ liquidation req | borrower={} | debt_pool={} | collateral_pool={} | debt={} | bad_debt={} | min_collateral_amount={}",
-                    liq_req.borrower.to_text(),
-                    liq_req.debt_pool_id.to_text(),
-                    liq_req.collateral_pool_id.to_text(),
-                    liq_req.debt_amount,
-                    liq_req.buy_bad_debt,
-                    executor_request.min_collateral_amount
-                );
+                info!("[executor] ⚡ liquidation req | {summary}");
 
                 let args =
                     Encode!(&liq_req, &executor_request.min_collateral_amount).map_err(|e| e.to_string())?;
+                // Every call gets a new intent, also for a borrower whose last call lost its answer
+                // (audit L02). A repeat is a valid liquidation, or the pool rejects it and refunds the debt.
                 let intent_id = uuid::Uuid::new_v4().to_string();
                 self.intents
                     .create_submitting(&intent_id, &executor_request)
@@ -115,90 +111,38 @@ impl<'a, A: PipelineAgent, D: LiquidationIntentStore> PipelineStage<'a, Vec<Exec
                 let liq = match liq_call {
                     Ok(v) => v,
                     Err(err) => {
-                        warn!(
-                            "[executor] liquidate_with_slippage rejected by canister | borrower={} | debt_pool={} | collateral_pool={} | debt={} | min_collateral_amount={} | err={:?}",
-                            liq_req.borrower.to_text(),
-                            liq_req.debt_pool_id.to_text(),
-                            liq_req.collateral_pool_id.to_text(),
-                            liq_req.debt_amount,
-                            executor_request.min_collateral_amount,
-                            err
-                        );
+                        warn!("[executor] liquidate_with_slippage rejected by canister | {summary} | err={err:?}");
                         let error = format!("{:?}", err);
                         receipt.status = ExecutionStatus::FailedLiquidation(error.clone());
-                        self.intents
-                            .mark_failed(&intent_id, None, Some(receipt.clone()), &error)
-                            .await
-                            .map_err(|store_error| {
-                                format!("failed to mark liquidation intent {intent_id} failed: {store_error}")
-                            })?;
-                        return Ok::<ExecutionReceipt, String>(receipt);
+                        return self.save_failed(&intent_id, None, receipt, &error).await;
                     }
                 };
 
                 receipt.liquidation_result = Some(liq.clone());
                 if let LiquidationStatus::FailedLiquidation(err) = &liq.status {
                     warn!(
-                        "[executor] liquidate_with_slippage returned FailedLiquidation | liq_id={} | borrower={} | debt_pool={} | collateral_pool={} | debt={} | min_collateral_amount={} | err={}",
-                        liq.id,
-                        liq_req.borrower.to_text(),
-                        liq_req.debt_pool_id.to_text(),
-                        liq_req.collateral_pool_id.to_text(),
-                        liq_req.debt_amount,
-                        executor_request.min_collateral_amount,
-                        err
+                        "[executor] liquidate_with_slippage returned FailedLiquidation | liq_id={} | {summary} | err={err}",
+                        liq.id
                     );
-
                     receipt.status = ExecutionStatus::FailedLiquidation(err.clone());
-                    self.intents
-                        .mark_failed(
-                            &intent_id,
-                            Some(liq.id.to_string()),
-                            Some(receipt.clone()),
-                            err,
-                        )
-                        .await
-                        .map_err(|store_error| {
-                            format!("failed to mark liquidation intent {intent_id} failed: {store_error}")
-                        })?;
-
-                    return Ok::<ExecutionReceipt, String>(receipt);
+                    return self.save_failed(&intent_id, Some(liq.id.to_string()), receipt, err).await;
                 }
 
-                // The change transfer returns the unspent part of the debt
-                // tokens we sent. That is our money, but it is not on the
-                // critical path: the collateral leg below is what has to be
-                // swapped and finalized. Returning here dropped the receipt
-                // before it reached the WAL, and the WAL is the only handoff to
-                // the finalizer -- so the liquidation settled on-chain and then
-                // was never touched again, leaving the collateral stranded.
-                if matches!(
-                    liq.change_tx.status,
-                    TransferStatus::Failed(_) | TransferStatus::Pending
-                ) {
-                    warn!(
-                        "[executor] 💱 change not received; continuing with the collateral leg | change_tx status={:?} liq_id={}",
-                        liq.change_tx.status, liq.id
+                // A missing change must not stop the receipt: the WAL is the only handoff of the
+                // collateral to the finalizer. The batch end reports the unpaid change (audit L04).
+                receipt.change_received = matches!(liq.change_tx.status, TransferStatus::Success);
+
+                let collateral_error = match &liq.collateral_tx.status {
+                    TransferStatus::Success => None,
+                    TransferStatus::Pending => Some("collateral pending".to_string()),
+                    TransferStatus::Failed(err) => Some(err.clone()),
+                };
+                if let Some(error) = collateral_error {
+                    info!(
+                        "[executor] 🧱 collateral_tx status={:?} liq_id={}",
+                        liq.collateral_tx.status, liq.id
                     );
-                    receipt.change_received = false;
-                }
-
-                match &liq.collateral_tx.status {
-                    TransferStatus::Success => {}
-                    TransferStatus::Pending => {
-                        info!(
-                            "[executor] 🧱 collateral_tx status={:?} liq_id={}",
-                            liq.collateral_tx.status, liq.id
-                        );
-                        receipt.status = ExecutionStatus::CollateralTransferFailed("collateral pending".to_string());
-                    }
-                    TransferStatus::Failed(err) => {
-                        info!(
-                            "[executor] 🧱 collateral_tx status={:?} liq_id={}",
-                            liq.collateral_tx.status, liq.id
-                        );
-                        receipt.status = ExecutionStatus::CollateralTransferFailed(err.clone());
-                    }
+                    receipt.status = ExecutionStatus::CollateralTransferFailed(error);
                 }
 
                 debug!("Executed liquidation {:?}", liq);
@@ -217,8 +161,70 @@ impl<'a, A: PipelineAgent, D: LiquidationIntentStore> PipelineStage<'a, Vec<Exec
             liquidations.push(receipt);
         }
 
+        for liquidation in liquidations
+            .iter()
+            .filter_map(|receipt| receipt.liquidation_result.as_ref())
+        {
+            self.report_unpaid_change_or_refund(liquidation).await;
+        }
+
         Ok(liquidations)
     }
+}
+
+impl<A: PipelineAgent, D: LiquidationIntentStore> BasicExecutor<A, D> {
+    /// Saves a rejected liquidation on its intent and returns its receipt.
+    async fn save_failed(
+        &self,
+        intent_id: &str,
+        liquidation_id: Option<String>,
+        receipt: ExecutionReceipt,
+        error: &str,
+    ) -> Result<ExecutionReceipt, String> {
+        self.intents
+            .mark_failed(intent_id, liquidation_id, Some(receipt.clone()), error)
+            .await
+            .map_err(|store_error| format!("failed to mark liquidation intent {intent_id} failed: {store_error}"))?;
+        Ok(receipt)
+    }
+
+    /// Logs a liquidation whose change or refund has not landed yet (audit L04).
+    /// The pool retries a temporary failure for about nine hours, and only a
+    /// pool admin can recover a payment that never lands, so the bot only reports it.
+    async fn report_unpaid_change_or_refund(&self, liquidation: &LiquidationResult) {
+        if matches!(liquidation.change_tx.status, TransferStatus::Success) {
+            return;
+        }
+        // The pool keeps this record until it owes nothing. A failed deposit
+        // that moved no money has none, so it needs no report.
+        match get_liquidation_inflow(self.agent.as_ref(), &self.lending_canister, liquidation.id).await {
+            Ok(None) => {}
+            Ok(Some(inflow)) => tracing::error!(
+                liquidation_id = %liquidation.id,
+                debt_amount = %inflow.debt_amount,
+                change_tx = ?liquidation.change_tx.status,
+                "[executor] the pool has not returned the change or refund yet; it retries a temporary failure for about nine hours, and if the money never lands a pool admin must recover this liquidation"
+            ),
+            Err(error) => tracing::error!(
+                liquidation_id = %liquidation.id,
+                change_tx = ?liquidation.change_tx.status,
+                "[executor] could not read what the pool still owes for this liquidation: {error}"
+            ),
+        }
+    }
+}
+
+fn request_summary(request: &ExecutorRequest) -> String {
+    let liquidation = &request.liquidation;
+    format!(
+        "borrower={} | debt_pool={} | collateral_pool={} | debt={} | bad_debt={} | min_collateral_amount={}",
+        liquidation.borrower.to_text(),
+        liquidation.debt_pool_id.to_text(),
+        liquidation.collateral_pool_id.to_text(),
+        liquidation.debt_amount,
+        liquidation.buy_bad_debt,
+        request.min_collateral_amount
+    )
 }
 
 async fn persist_accepted_receipt<D: LiquidationIntentStore>(
@@ -266,7 +272,7 @@ mod tests {
     use liquidium_pipeline_connectors::pipeline_agent::MockPipelineAgent;
     use liquidium_pipeline_core::tokens::chain_token::ChainToken;
     use liquidium_pipeline_core::types::protocol_types::{
-        AssetType, LiquidationAmounts, LiquidationRequest, LiquidationStatus, TxStatus,
+        AssetType, LiquidationAmounts, LiquidationInflowRecord, LiquidationRequest, LiquidationStatus, TxStatus,
     };
 
     use crate::{
@@ -322,7 +328,7 @@ mod tests {
             timestamp: 0,
             change_tx: TxStatus {
                 tx_id: None,
-                status: TransferStatus::Pending,
+                status: TransferStatus::Success,
             },
             collateral_tx: TxStatus {
                 tx_id: None,
@@ -330,6 +336,49 @@ mod tests {
             },
             id,
         }
+    }
+
+    fn inflow_record() -> LiquidationInflowRecord {
+        LiquidationInflowRecord {
+            debt_amount: Nat::from(11_244u64),
+            collateral_pool_id: p("hnnn4-iyaaa-aaaar-qb4bq-cai"),
+            timestamp: 0,
+            liquidator: p("2vxsx-fae"),
+            debt_pool_id: p("hkmli-faaaa-aaaar-qb4ba-cai"),
+        }
+    }
+
+    fn lending_canister() -> Principal {
+        p("nja4y-2yaaa-aaaae-qddxa-cai")
+    }
+
+    fn test_executor(
+        agent: MockPipelineAgent,
+        intents: MockLiquidationIntentStore,
+    ) -> BasicExecutor<MockPipelineAgent, MockLiquidationIntentStore> {
+        BasicExecutor::new(
+            Arc::new(agent),
+            Account {
+                owner: p("2vxsx-fae"),
+                subaccount: None,
+            },
+            lending_canister(),
+            Arc::new(intents),
+            Arc::new(ApprovalState::new()),
+        )
+    }
+
+    /// A native ICP liquidation for the default borrower.
+    fn icp_request() -> ExecutorRequest {
+        make_request(
+            p("2vxsx-fae"),
+            ChainToken::Icp {
+                ledger: p("ryjl3-tyaaa-aaaaa-aaaba-cai"),
+                symbol: "ICP".to_string(),
+                decimals: 8,
+                fee: Nat::from(10_000u64),
+            },
+        )
     }
 
     fn accepting_intent_store(expected: usize) -> MockLiquidationIntentStore {
@@ -347,7 +396,7 @@ mod tests {
 
     #[tokio::test]
     async fn executor_calls_liquidate_with_slippage_without_allowance_preflight() {
-        let lending_canister = p("nja4y-2yaaa-aaaae-qddxa-cai");
+        let lending_canister = lending_canister();
         let first_ledger = p("mxzaz-hqaaa-aaaar-qaada-cai");
         let second_ledger = p("ryjl3-tyaaa-aaaaa-aaaba-cai");
 
@@ -370,16 +419,7 @@ mod tests {
             .times(2)
             .returning(move |_, _, _| Ok(Ok(make_liquidation_result(31u128))));
 
-        let executor = BasicExecutor::new(
-            Arc::new(agent),
-            Account {
-                owner: p("2vxsx-fae"),
-                subaccount: None,
-            },
-            lending_canister,
-            Arc::new(accepting_intent_store(2)),
-            Arc::new(ApprovalState::new()),
-        );
+        let executor = test_executor(agent, accepting_intent_store(2));
 
         let request_fail = make_request(
             p("tfeop-4aaaa-aaaaa-aaaaa-aaaaa-aaaaa-bdai"),
@@ -423,13 +463,26 @@ mod tests {
     /// receipt from entering the durable handoff journal.
     #[tokio::test]
     async fn pending_change_still_accepts_the_liquidation_intent() {
-        let lending_canister = p("nja4y-2yaaa-aaaae-qddxa-cai");
+        let lending_canister = lending_canister();
 
         let mut agent = MockPipelineAgent::new();
         agent
             .expect_call_update::<Result<LiquidationResult, ProtocolError>>()
             .times(1)
-            .returning(move |_, _, _| Ok(Ok(make_liquidation_result(1_556u128))));
+            .returning(move |_, _, _| {
+                let mut result = make_liquidation_result(1_556u128);
+                result.change_tx.status = TransferStatus::Pending;
+                Ok(Ok(result))
+            });
+        agent
+            .expect_call_query::<Option<LiquidationInflowRecord>>()
+            .withf(move |canister, method, arg| {
+                *canister == lending_canister
+                    && method == "get_liquidation_inflow"
+                    && Decode!(arg, u128).is_ok_and(|id| id == 1_556)
+            })
+            .times(1)
+            .returning(|_, _, _| Ok(Some(inflow_record())));
 
         let mut intents = MockLiquidationIntentStore::new();
         intents.expect_create_submitting().times(1).returning(|_, _| Ok(()));
@@ -439,26 +492,9 @@ mod tests {
             .times(1)
             .returning(|_, _, _| Ok(()));
 
-        let executor = BasicExecutor::new(
-            Arc::new(agent),
-            Account {
-                owner: p("2vxsx-fae"),
-                subaccount: None,
-            },
-            lending_canister,
-            Arc::new(intents),
-            Arc::new(ApprovalState::new()),
-        );
+        let executor = test_executor(agent, intents);
 
-        let request = make_request(
-            p("2vxsx-fae"),
-            ChainToken::Icp {
-                ledger: p("ryjl3-tyaaa-aaaaa-aaaba-cai"),
-                symbol: "ICP".to_string(),
-                decimals: 8,
-                fee: Nat::from(10_000u64),
-            },
-        );
+        let request = icp_request();
 
         let receipts = executor
             .process(&vec![request])
@@ -475,6 +511,37 @@ mod tests {
             "a pending change does not fail the liquidation, status was {:?}",
             receipts[0].status
         );
+    }
+
+    /// A failed deposit that moved no money leaves no pool record, so the
+    /// executor asks once and reports nothing.
+    #[tokio::test]
+    async fn a_failed_liquidation_asks_the_pool_what_it_still_owes() {
+        let mut intents = MockLiquidationIntentStore::new();
+        intents.expect_create_submitting().times(1).returning(|_, _| Ok(()));
+        intents.expect_mark_failed().times(1).returning(|_, _, _, _| Ok(()));
+        let mut agent = MockPipelineAgent::new();
+        agent
+            .expect_call_update::<Result<LiquidationResult, ProtocolError>>()
+            .times(1)
+            .returning(|_, _, _| {
+                let mut result = make_liquidation_result(9);
+                result.status = LiquidationStatus::FailedLiquidation("deposit underlying failed".to_string());
+                result.change_tx.status = TransferStatus::Pending;
+                Ok(Ok(result))
+            });
+        agent
+            .expect_call_query::<Option<LiquidationInflowRecord>>()
+            .withf(|_, method, arg| method == "get_liquidation_inflow" && Decode!(arg, u128).is_ok_and(|id| id == 9))
+            .times(1)
+            .returning(|_, _, _| Ok(None));
+        let executor = test_executor(agent, intents);
+
+        let receipts = executor
+            .process(&vec![icp_request()])
+            .await
+            .expect("a failed liquidation is a receipt, not an error");
+        assert!(matches!(receipts[0].status, ExecutionStatus::FailedLiquidation(_)));
     }
 
     #[tokio::test]
@@ -501,26 +568,9 @@ mod tests {
                 Ok(Ok(make_liquidation_result(77)))
             });
 
-        let executor = BasicExecutor::new(
-            Arc::new(agent),
-            Account {
-                owner: p("2vxsx-fae"),
-                subaccount: None,
-            },
-            p("nja4y-2yaaa-aaaae-qddxa-cai"),
-            Arc::new(intents),
-            Arc::new(ApprovalState::new()),
-        );
+        let executor = test_executor(agent, intents);
         executor
-            .process(&vec![make_request(
-                p("2vxsx-fae"),
-                ChainToken::Icp {
-                    ledger: p("ryjl3-tyaaa-aaaaa-aaaba-cai"),
-                    symbol: "ICP".to_string(),
-                    decimals: 8,
-                    fee: Nat::from(10_000u64),
-                },
-            )])
+            .process(&vec![icp_request()])
             .await
             .expect("liquidation succeeds");
     }
@@ -536,27 +586,10 @@ mod tests {
         agent
             .expect_call_update::<Result<LiquidationResult, ProtocolError>>()
             .times(0);
-        let executor = BasicExecutor::new(
-            Arc::new(agent),
-            Account {
-                owner: p("2vxsx-fae"),
-                subaccount: None,
-            },
-            p("nja4y-2yaaa-aaaae-qddxa-cai"),
-            Arc::new(intents),
-            Arc::new(ApprovalState::new()),
-        );
+        let executor = test_executor(agent, intents);
 
         let error = executor
-            .process(&vec![make_request(
-                p("2vxsx-fae"),
-                ChainToken::Icp {
-                    ledger: p("ryjl3-tyaaa-aaaaa-aaaba-cai"),
-                    symbol: "ICP".to_string(),
-                    decimals: 8,
-                    fee: Nat::from(10_000u64),
-                },
-            )])
+            .process(&vec![icp_request()])
             .await
             .expect_err("missing intent durability must stop submission");
         assert!(error.contains("failed to persist liquidation intent"));
@@ -586,22 +619,8 @@ mod tests {
             agent.expect_call_update::<Result<LiquidationResult, ProtocolError>>()
                 .times(1)
                 .returning(|_, _, _| Ok(Ok(make_liquidation_result(77))));
-            let executor = BasicExecutor::new(
-                Arc::new(agent),
-                Account { owner: p("2vxsx-fae"), subaccount: None },
-                p("nja4y-2yaaa-aaaae-qddxa-cai"),
-                Arc::new(intents),
-                Arc::new(ApprovalState::new()),
-            );
-            let result = executor.process(&vec![make_request(
-                p("2vxsx-fae"),
-                ChainToken::Icp {
-                    ledger: p("ryjl3-tyaaa-aaaaa-aaaba-cai"),
-                    symbol: "ICP".to_string(),
-                    decimals: 8,
-                    fee: Nat::from(10_000u64),
-                },
-            )]).await;
+            let executor = test_executor(agent, intents);
+            let result = executor.process(&vec![icp_request()]).await;
             if recover {
                 assert!(result.is_ok());
             } else {
@@ -624,27 +643,10 @@ mod tests {
             .expect_call_update::<Result<LiquidationResult, ProtocolError>>()
             .times(1)
             .returning(|_, _, _| Err("response lost".to_string()));
-        let executor = BasicExecutor::new(
-            Arc::new(agent),
-            Account {
-                owner: p("2vxsx-fae"),
-                subaccount: None,
-            },
-            p("nja4y-2yaaa-aaaae-qddxa-cai"),
-            Arc::new(intents),
-            Arc::new(ApprovalState::new()),
-        );
+        let executor = test_executor(agent, intents);
 
         let receipts = executor
-            .process(&vec![make_request(
-                p("2vxsx-fae"),
-                ChainToken::Icp {
-                    ledger: p("ryjl3-tyaaa-aaaaa-aaaba-cai"),
-                    symbol: "ICP".to_string(),
-                    decimals: 8,
-                    fee: Nat::from(10_000u64),
-                },
-            )])
+            .process(&vec![icp_request()])
             .await
             .expect("ambiguous result remains observable");
         assert!(matches!(receipts[0].status, ExecutionStatus::LiquidationCallFailed(_)));
@@ -666,27 +668,10 @@ mod tests {
             .expect_call_update::<Result<LiquidationResult, ProtocolError>>()
             .times(1)
             .returning(|_, _, _| Ok(Err(ProtocolError::InsufficientCollateral)));
-        let executor = BasicExecutor::new(
-            Arc::new(agent),
-            Account {
-                owner: p("2vxsx-fae"),
-                subaccount: None,
-            },
-            p("nja4y-2yaaa-aaaae-qddxa-cai"),
-            Arc::new(intents),
-            Arc::new(ApprovalState::new()),
-        );
+        let executor = test_executor(agent, intents);
 
         let receipts = executor
-            .process(&vec![make_request(
-                p("2vxsx-fae"),
-                ChainToken::Icp {
-                    ledger: p("ryjl3-tyaaa-aaaaa-aaaba-cai"),
-                    symbol: "ICP".to_string(),
-                    decimals: 8,
-                    fee: Nat::from(10_000u64),
-                },
-            )])
+            .process(&vec![icp_request()])
             .await
             .expect("definite rejection remains observable");
         assert!(matches!(receipts[0].status, ExecutionStatus::FailedLiquidation(_)));

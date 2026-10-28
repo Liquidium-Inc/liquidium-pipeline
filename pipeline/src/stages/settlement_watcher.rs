@@ -1,16 +1,17 @@
 use std::sync::Arc;
 
-use candid::{Encode, Principal};
+use candid::Principal;
 use tracing::instrument;
 use tracing::{info, warn};
 
+use crate::liquidation::lending_queries::get_liquidation;
 use crate::persistance::{LiqMetaWrapper, LiqResultRecord, ResultStatus, WalStore};
 use crate::stages::executor::ExecutionReceipt;
 use crate::stages::executor::ExecutionStatus;
 use crate::utils::now_ts;
 use crate::wal::{decode_receipt_wrapper, encode_meta};
 use liquidium_pipeline_connectors::pipeline_agent::PipelineAgent;
-use liquidium_pipeline_core::types::protocol_types::{LiquidationResult, ProtocolError, TransferStatus};
+use liquidium_pipeline_core::types::protocol_types::TransferStatus;
 
 pub struct SettlementWatcher<A, D>
 where
@@ -68,7 +69,7 @@ where
             .as_ref()
             .ok_or_else(|| format!("missing liquidation_result for WAL id {}", row.id))?;
 
-        let fresh = match self.refresh_liquidation(liq.id).await {
+        let fresh = match get_liquidation(self.agent.as_ref(), &self.lending_canister, liq.id).await {
             Ok(liq) => liq,
             Err(err) => {
                 warn!("[settlement] get_liquidation failed liq_id={} err={}", liq.id, err);
@@ -123,18 +124,6 @@ where
         Ok(())
     }
 
-    async fn refresh_liquidation(&self, liq_id: u128) -> Result<LiquidationResult, String> {
-        let args = Encode!(&liq_id).map_err(|e| format!("get_liquidation encode error: {e}"))?;
-        let res = self
-            .agent
-            .call_query::<Result<LiquidationResult, ProtocolError>>(&self.lending_canister, "get_liquidation", args)
-            .await?;
-        match res {
-            Ok(liq) => Ok(liq),
-            Err(err) => Err(format!("get_liquidation error: {err:?}")),
-        }
-    }
-
     async fn update_receipt_meta(
         &self,
         row: &LiqResultRecord,
@@ -170,14 +159,14 @@ mod tests {
     };
     use crate::stages::executor::ExecutionStatus;
     use crate::swappers::model::SwapRequest;
-    use candid::Nat;
+    use candid::{Encode, Nat};
     use liquidium_pipeline_connectors::pipeline_agent::MockPipelineAgent;
     use liquidium_pipeline_core::tokens::asset_id::AssetId;
     use liquidium_pipeline_core::tokens::chain_token::ChainToken;
     use liquidium_pipeline_core::tokens::chain_token_amount::ChainTokenAmount;
     use liquidium_pipeline_core::types::protocol_types::{
-        AssetType, LiquidationAmounts, LiquidationRequest, LiquidationResult, LiquidationStatus, TransferStatus,
-        TxStatus,
+        AssetType, LiquidationAmounts, LiquidationRequest, LiquidationResult, LiquidationStatus, ProtocolError,
+        TransferStatus, TxStatus,
     };
     use mockall::predicate::eq;
 
