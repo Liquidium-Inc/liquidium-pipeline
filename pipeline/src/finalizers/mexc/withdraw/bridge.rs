@@ -103,7 +103,23 @@ where
                 state.send_saved = true;
                 return Ok(());
             }
-            let landed = step_outbound(&mut funds.withdraw_bridge_funding, bridge.outbound.as_ref(), None, now).await?;
+            let landed =
+                match step_outbound(&mut funds.withdraw_bridge_funding, bridge.outbound.as_ref(), None, now).await {
+                    Ok(landed) => landed,
+                    // The revert moved no funds, and the driver cleared the send, so
+                    // the next cycle makes it again. Past the bound an operator decides.
+                    Err(OutboundError::Reverted(reason))
+                        if funds.withdraw_bridge_reverts < MAX_REVERTED_BRIDGE_RESUBMITS =>
+                    {
+                        funds.withdraw_bridge_reverts += 1;
+                        warn!(
+                            "[mexc] liq_id={} bridge deposit send reverted; sending again ({}/{}): {}",
+                            liq_id, funds.withdraw_bridge_reverts, MAX_REVERTED_BRIDGE_RESUBMITS, reason
+                        );
+                        return Ok(());
+                    }
+                    Err(error) => return Err(error.into()),
+                };
             if let Some(receipt) = landed {
                 info!(
                     "[mexc] liq_id={} bridge deposit send landed: receipt={} route={}@{}->{}",
@@ -466,7 +482,17 @@ where
             return Ok(());
         }
         state.withdraw.bridge.withdraw_bridge_polled_at_ts = Some(now_ts());
-        match bridge.backend.get_bridge_status(&bridge_id).await? {
+        let status = match bridge.backend.get_bridge_status(&bridge_id).await {
+            Ok(status) => status,
+            // A failed read says nothing about the credit, so it is a wait, not a strike.
+            Err(BridgeError::Unreadable(error)) => {
+                let submitted_at = state.withdraw.bridge.withdraw_bridge_submitted_at_ts;
+                state.step = CexStep::WithdrawPending;
+                return Self::note_bridge_wait(state, submitted_at, &bridge_id, Some(&error));
+            }
+            Err(error) => return Err(error.into()),
+        };
+        match status {
             BridgeStatus::Minted(receipt) => {
                 // The EVM backend already checks its receipt against the
                 // submitted expectation. The Solana backend has no such check,
@@ -500,8 +526,9 @@ where
                 Ok(())
             }
             BridgeStatus::Pending | BridgeStatus::Unknown => {
+                let submitted_at = state.withdraw.bridge.withdraw_bridge_submitted_at_ts;
                 state.step = CexStep::WithdrawPending;
-                Ok(())
+                Self::note_bridge_wait(state, submitted_at, &bridge_id, None)
             }
             // The ckSOL minter dropped its sweep and released the deposit
             // address. The funds stay there, and a new notice queues them again.
@@ -542,5 +569,34 @@ where
             )
             .into()),
         }
+    }
+
+    /// A bridge wait past the stall bound is stamped on the leg. A read that still
+    /// fails then counts as a strike, so a lasting failure parks with an alert.
+    pub(in crate::finalizers::mexc) fn note_bridge_wait(
+        state: &mut CexState,
+        submitted_at: Option<i64>,
+        bridge_id: &str,
+        unreadable: Option<&str>,
+    ) -> Result<(), CexBackendError> {
+        let waited = submitted_at.map_or(0, |sent| now_ts().saturating_sub(sent));
+        let detail = unreadable.map_or_else(
+            || "not done yet".to_string(),
+            |error| format!("could not read it: {error}"),
+        );
+        let line = format!(
+            "waiting on bridge {bridge_id} for liq_id {}: {detail}, waited={waited}s",
+            state.liq_id
+        );
+        if waited < BRIDGE_CREDIT_STALL_SECS {
+            debug!("[mexc] {line}");
+            return Ok(());
+        }
+        warn!("[mexc] {line} (past {BRIDGE_CREDIT_STALL_SECS}s)");
+        if unreadable.is_some() {
+            return Err(line.into());
+        }
+        state.last_error = Some(line);
+        Ok(())
     }
 }

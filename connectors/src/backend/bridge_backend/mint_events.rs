@@ -1,7 +1,7 @@
 //! Match the minter's successful ledger mint to its exact Ethereum event source.
 //! The append-only audit API is authoritative; wallet deltas and helper receipts
 //! cannot distinguish concurrent deposits or prove destination delivery.
-use super::{BridgeMintReceipt, BridgeStatus};
+use super::{BridgeError, BridgeMintReceipt, BridgeStatus};
 use crate::pipeline_agent::PipelineAgent;
 use alloy::primitives::{TxHash, U256};
 use candid::{CandidType, Encode, IDLArgs, Nat, Principal, types::value::IDLValue};
@@ -103,7 +103,7 @@ fn field<'a>(value: &'a IDLValue, name: &str) -> Result<&'a IDLValue, String> {
 }
 
 pub(super) async fn count<A: PipelineAgent>(agent: &A, minter: &Principal) -> Result<u64, String> {
-    let (total, _) = page(agent, minter, 0, 0).await?;
+    let (total, _) = page(agent, minter, 0, 0).await.map_err(|error| error.to_string())?;
     Ok(total)
 }
 
@@ -112,14 +112,17 @@ async fn page<A: PipelineAgent>(
     minter: &Principal,
     start: u64,
     length: u64,
-) -> Result<(u64, Vec<IDLValue>), String> {
+) -> Result<(u64, Vec<IDLValue>), BridgeError> {
+    // Only the call itself can fail for a passing reason; a reply that does
+    // not decode fails the same way on every read.
     let bytes = agent
         .call_query_raw(
             minter,
             "get_events",
             Encode!(&Range { start, length }).map_err(|e| e.to_string())?,
         )
-        .await?;
+        .await
+        .map_err(BridgeError::Unreadable)?;
     let args = IDLArgs::from_bytes(&bytes).map_err(|e| format!("decode minter events: {e}"))?;
     let value = args.args.first().ok_or("empty minter event response")?;
     let IDLValue::Nat64(total) = field(value, "total_event_count")? else {
@@ -201,7 +204,7 @@ pub(super) async fn status<A: PipelineAgent>(
     minter: &Principal,
     mut start: u64,
     hash: &str,
-) -> Result<BridgeStatus, String> {
+) -> Result<BridgeStatus, BridgeError> {
     let mut accepted = Vec::new();
     loop {
         let (total, events) = page(agent, minter, start, 1000).await?;

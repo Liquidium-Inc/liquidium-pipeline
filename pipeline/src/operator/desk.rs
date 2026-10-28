@@ -10,7 +10,9 @@ use crate::finalizers::multi_venue::{MultiVenueFinalizer, derive_outcome, set_me
 use crate::{
     finalizers::multi_venue::MultiVenueAdapter,
     operator::{OperatorConsole, ReconcileAction, ReconcileRequest},
-    persistance::{FinalizerMetaPayload, MultiVenueExecutionState, ResultStatus, VenueLegStatus, WalStore},
+    persistance::{
+        FinalizerMetaPayload, LiqResultRecord, MultiVenueExecutionState, ResultStatus, VenueLegStatus, WalStore,
+    },
     wal::{decode_receipt_wrapper, wal_load},
 };
 
@@ -67,6 +69,15 @@ impl MultiVenueFinalizer {
             return Err(format!("row {} is {:?}, not parked", row.id, row.status));
         }
 
+        // A budget parks the row while its legs still run. A release then
+        // queues the whole row again.
+        if !has_parked_leg(&state) && answer.is_none() && request.leg_id.is_none() {
+            requeue(&mut row);
+            self.persist_wrapper(wal, &mut row, &wrapper).await?;
+            info!(liquidation_id = %row.id, "Operator released a parked row");
+            return Ok(format!("{report}released row {}; it is queued again\n", row.id));
+        }
+
         let index = parked_leg_index(&state, request.leg_id.as_deref())?;
         let leg_id = state.legs[index].leg_id.clone();
         let adapter = self.operator_adapter(&state.legs[index].venue_id)?;
@@ -75,9 +86,7 @@ impl MultiVenueFinalizer {
         state.legs[index].status = VenueLegStatus::Running;
         state.outcome = derive_outcome(&state.legs);
         set_meta_v2(&mut wrapper, state).map_err(|error| error.to_string())?;
-        row.status = ResultStatus::Enqueued;
-        // Old failures must not count against the released leg.
-        row.error_count = 0;
+        requeue(&mut row);
         self.persist_wrapper(wal, &mut row, &wrapper).await?;
         info!(
             liquidation_id = %row.id,
@@ -107,6 +116,9 @@ impl MultiVenueFinalizer {
         if let Some(error) = last_error {
             lines.push(format!("  last error: {error}"));
         }
+        if status == ResultStatus::OperatorRequired && !has_parked_leg(state) {
+            lines.push("  no leg is parked: --release queues the row again".to_string());
+        }
         for leg in &state.legs {
             lines.push(format!("  leg {} at {}: {:?}", leg.leg_id, leg.venue_id, leg.status));
             if let Some(error) = &leg.last_error {
@@ -135,6 +147,21 @@ impl MultiVenueFinalizer {
         lines.push(String::new());
         lines.join("\n")
     }
+}
+
+fn has_parked_leg(state: &MultiVenueExecutionState) -> bool {
+    state
+        .legs
+        .iter()
+        .any(|leg| leg.status == VenueLegStatus::OperatorRequired)
+}
+
+/// Queues a released row again. Old failures and attempts must not count
+/// against it.
+fn requeue(row: &mut LiqResultRecord) {
+    row.status = ResultStatus::Enqueued;
+    row.error_count = 0;
+    row.attempt = 0;
 }
 
 fn parked_leg_index(state: &MultiVenueExecutionState, leg_id: Option<&str>) -> Result<usize, String> {

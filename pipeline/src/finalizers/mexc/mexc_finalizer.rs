@@ -39,6 +39,10 @@ const DIRECT_WITHDRAW_DELIVERY_TIMEOUT_SECS: i64 = 60 * 60;
 /// How long a landed bridge deposit may wait for the provider to accept it.
 /// The ckSOL minter reads it at finalized commitment, which takes seconds.
 const DEPOSIT_NOTICE_WINDOW_SECS: i64 = 30 * 60;
+/// A bridge credit not seen after this long is stamped on the leg for an operator.
+const BRIDGE_CREDIT_STALL_SECS: i64 = 40 * 60;
+/// How often a reverted return-bridge send is made again. Each one costs gas.
+const MAX_REVERTED_BRIDGE_RESUBMITS: u32 = 2;
 const SOL_FINALITY_SECS: i64 = 20;
 
 use crate::{
@@ -377,18 +381,18 @@ where
                 .unwrap_or_else(|| state.size_in.to_f64())
         });
 
-        // 10) Nothing to trade (or dust below epsilon) -> finish trading phase.
+        // 10) Nothing left on this leg: a failed cycle can save a leg with its
+        //     input spent. Its output feeds the next leg; only the last leg ends the route.
         if amount_in <= LIQUIDITY_EPS {
             debug!(
-                "[mexc] liq_id={} trade skipped: non-positive amount_in={}",
-                state.liq_id, amount_in
+                "[mexc] liq_id={} trade leg {}/{} has nothing left to trade: amount_in={}",
+                state.liq_id,
+                idx + 1,
+                legs.len(),
+                amount_in
             );
-            let out_amt = state
-                .trade
-                .trade_progress_total_out
-                .or(state.trade.trade_next_amount_in)
-                .map(|out_amt| out_amt.max(0.0));
-            Self::finish_trade_route(state, out_amt);
+            let total_out = state.trade.trade_progress_total_out.unwrap_or(0.0);
+            Self::advance_after_trade_leg(state, idx, legs.len(), total_out);
             return Ok(());
         }
 

@@ -48,6 +48,8 @@ pub struct ExecutionReceipt {
     pub request: ExecutorRequest,
     pub liquidation_result: Option<LiquidationResult>,
     pub status: ExecutionStatus,
+    /// Whether the change transfer had settled at the last read of the
+    /// liquidation. For display only; no retry or recovery reads it.
     pub change_received: bool,
 }
 
@@ -56,7 +58,12 @@ impl ExecutionReceipt {
     /// that has landed clears its earlier failure. Returns whether anything changed.
     pub fn apply_pool_view(&mut self, fresh: LiquidationResult) -> bool {
         let collateral_landed = matches!(fresh.collateral_tx.status, TransferStatus::Success);
+        let change_received = matches!(fresh.change_tx.status, TransferStatus::Success);
         let mut changed = false;
+        if self.change_received != change_received {
+            self.change_received = change_received;
+            changed = true;
+        }
         if self.liquidation_result.as_ref() != Some(&fresh) {
             self.liquidation_result = Some(fresh);
             changed = true;

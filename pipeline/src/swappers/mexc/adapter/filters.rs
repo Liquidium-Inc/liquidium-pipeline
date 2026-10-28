@@ -163,6 +163,20 @@ impl MexcClient {
 
         Self::validate_market_order_support(&info, &resolved_symbol)?;
 
+        let mut filters = Self::symbol_filters_from_info(&info);
+        filters.resolved_symbol = Some(resolved_symbol.clone());
+
+        let mut cache = self.symbol_filters.lock().await;
+        cache.insert(symbol.to_string(), filters.clone());
+        if resolved_symbol != symbol {
+            cache.insert(resolved_symbol, filters.clone());
+        }
+        Ok(Some(filters))
+    }
+
+    /// One symbol's trading rules from its `exchangeInfo` entry. MEXC sends no
+    /// `LOT_SIZE` or `MIN_NOTIONAL` filter, so its top-level fields are the fallback.
+    pub(super) fn symbol_filters_from_info(info: &Value) -> SymbolFilters {
         let mut filters = SymbolFilters::default();
         if let Some(entries) = info.get("filters").and_then(|v| v.as_array()) {
             for f in entries {
@@ -183,19 +197,24 @@ impl MexcClient {
                 }
             }
         }
-        filters.quote_precision = parse_u32(&info, "quotePrecision")
-            .or_else(|| parse_u32(&info, "quoteAssetPrecision"))
-            .or(filters.quote_precision);
-        filters.base_precision = parse_u32(&info, "baseAssetPrecision").or(filters.base_precision);
-        filters.taker_fee_bps = Self::parse_taker_fee_bps(&info);
-        filters.resolved_symbol = Some(resolved_symbol.clone());
+        // A "0" limit means unconstrained, so it stays absent.
+        filters.min_notional = filters
+            .min_notional
+            .or_else(|| parse_decimal(info, "quoteAmountPrecision"))
+            .filter(|value| !value.is_zero());
+        // `baseSizePrecision` is the smallest order, not a step: rounding to it can
+        // exceed the venue's own precision (ICP_USDT, liquidation 1620).
+        filters.min_qty = filters
+            .min_qty
+            .or_else(|| parse_decimal(info, "baseSizePrecision"))
+            .filter(|value| !value.is_zero());
 
-        let mut cache = self.symbol_filters.lock().await;
-        cache.insert(symbol.to_string(), filters.clone());
-        if resolved_symbol != symbol {
-            cache.insert(resolved_symbol, filters.clone());
-        }
-        Ok(Some(filters))
+        filters.quote_precision = parse_u32(info, "quotePrecision")
+            .or_else(|| parse_u32(info, "quoteAssetPrecision"))
+            .or(filters.quote_precision);
+        filters.base_precision = parse_u32(info, "baseAssetPrecision").or(filters.base_precision);
+        filters.taker_fee_bps = Self::parse_taker_fee_bps(info);
+        filters
     }
 
     /// An order without a price limit is a MARKET order, so a listed market is

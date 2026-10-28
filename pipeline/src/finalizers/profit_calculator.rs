@@ -29,6 +29,11 @@ impl ProfitCalculator for SimpleProfitCalculator {
         if req.debt_approval_needed {
             fee_total += req.debt_asset.fee();
         }
+        // The protocol returns the unspent debt in a second transfer, and its fee
+        // comes out of that change (liquidation 1614 was overstated by one fee).
+        if req.liquidation.debt_amount > liq.amounts.debt_repaid {
+            fee_total += req.debt_asset.fee();
+        }
 
         let receive_amount = match swap {
             Some(swap) => swap.receive_amount.clone(),
@@ -150,6 +155,57 @@ mod tests {
         let liq = liquidation(1_883_970_359_889_548, 2_248_987);
 
         assert_eq!(SimpleProfitCalculator.realized(&req, &liq, None), -2_249_987);
+    }
+
+    fn swap_receiving(receive_amount: u64) -> SwapExecution {
+        let asset = |symbol: &str| icp_token(symbol, 6, 0, Principal::anonymous()).asset_id();
+        SwapExecution {
+            swap_id: 0,
+            request_id: 0,
+            status: "completed".to_string(),
+            pay_asset: asset("ICP"),
+            pay_amount: Nat::from(0u8),
+            receive_asset: asset("ckUSDC"),
+            receive_amount: Nat::from(receive_amount),
+            mid_price: 0.0,
+            exec_price: 0.0,
+            realized_slippage_bps: 0.0,
+            legs: vec![],
+            approval_count: None,
+            ts: 0,
+            side_costs: Vec::new(),
+            side_cost_receive: None,
+        }
+    }
+
+    /// Liquidation 1614 on mainnet: the ledger showed 2.820225 ckUSDC, and the
+    /// pipeline reported 2.830225 because it ignored the fee on the returned change.
+    #[test]
+    fn realized_charges_the_fee_on_the_returned_change() {
+        let ledger = Principal::anonymous();
+        let mut req = request(
+            icp_token("ckUSDC", 6, 10_000, ledger),
+            icp_token("ICP", 8, 10_000, ledger),
+        );
+        req.liquidation.debt_amount = Nat::from(11_629_791u64);
+        let liq = liquidation(416_949_805, 5_814_395);
+
+        let realized = SimpleProfitCalculator.realized(&req, &liq, Some(&swap_receiving(8_654_620)));
+        assert_eq!(realized, 2_820_225);
+    }
+
+    #[test]
+    fn realized_charges_one_fee_when_no_change_is_returned() {
+        let ledger = Principal::anonymous();
+        let mut req = request(
+            icp_token("ckUSDC", 6, 10_000, ledger),
+            icp_token("ICP", 8, 10_000, ledger),
+        );
+        req.liquidation.debt_amount = Nat::from(5_814_395u64);
+        let liq = liquidation(416_949_805, 5_814_395);
+
+        let realized = SimpleProfitCalculator.realized(&req, &liq, Some(&swap_receiving(8_654_620)));
+        assert_eq!(realized, 2_830_225);
     }
 
     /// Audit L19: MEXC approval bumps are paid from the deposit reserve, so the

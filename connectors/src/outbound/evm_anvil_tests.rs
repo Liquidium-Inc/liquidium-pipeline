@@ -49,7 +49,15 @@ async fn start_anvil() -> (
     let port = free_port();
     let anvil = Anvil(
         Command::new("anvil")
-            .args(["--port", &port.to_string(), "--no-mining"])
+            // Each chain gets its own id, as real chains do, so their nonce
+            // counts stay apart in the process-wide nonce mark.
+            .args([
+                "--port",
+                &port.to_string(),
+                "--chain-id",
+                &port.to_string(),
+                "--no-mining",
+            ])
             .stdout(Stdio::null())
             .spawn()
             .expect("anvil on PATH"),

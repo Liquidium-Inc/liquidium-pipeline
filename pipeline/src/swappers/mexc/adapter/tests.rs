@@ -601,3 +601,91 @@ fn withdraw_terms_refuse_a_disabled_or_unknown_network() {
     let unknown = find_withdraw_terms(&config, "BTC", "BTC").unwrap_err();
     assert!(unknown.contains("no withdrawal terms"), "{unknown}");
 }
+
+/// A live BTCUSDT `exchangeInfo` shape: MEXC sends only PERCENT_PRICE_BY_SIDE,
+/// so the order-size limits come from the top-level fields or not at all.
+#[test]
+fn symbol_limits_are_read_from_the_fields_mexc_actually_publishes() {
+    let info = serde_json::json!({
+        "symbol": "BTCUSDT",
+        "baseAssetPrecision": 8,
+        "quotePrecision": 2,
+        "quoteAmountPrecision": "1",
+        "baseSizePrecision": "0.000001",
+        "filters": [{
+            "filterType": "PERCENT_PRICE_BY_SIDE",
+            "bidMultiplierUp": "0.005",
+            "askMultiplierDown": "0.005"
+        }]
+    });
+
+    let filters = MexcClient::symbol_filters_from_info(&info);
+
+    assert_eq!(filters.min_notional, Decimal::from_str_exact("1").ok());
+    assert_eq!(filters.min_qty, Decimal::from_str_exact("0.000001").ok());
+    assert_eq!(filters.step_size, None, "a minimum is not a step");
+    assert_eq!(filters.base_precision, Some(8));
+}
+
+#[test]
+fn a_zero_limit_is_absent_rather_than_an_enforced_floor() {
+    let info = serde_json::json!({
+        "symbol": "CKBTCBTC",
+        "quoteAmountPrecision": "0.000005",
+        "baseSizePrecision": "0",
+        "filters": []
+    });
+
+    let filters = MexcClient::symbol_filters_from_info(&info);
+
+    assert_eq!(filters.min_notional, Decimal::from_str_exact("0.000005").ok());
+    assert_eq!(filters.min_qty, None);
+}
+
+#[test]
+fn an_explicit_filter_outranks_the_top_level_fallback() {
+    let info = serde_json::json!({
+        "symbol": "BTCUSDT",
+        "quoteAmountPrecision": "1",
+        "baseSizePrecision": "0.000001",
+        "filters": [
+            {"filterType": "LOT_SIZE", "stepSize": "0.01", "minQty": "0.05"},
+            {"filterType": "MIN_NOTIONAL", "minNotional": "10"}
+        ]
+    });
+
+    let filters = MexcClient::symbol_filters_from_info(&info);
+
+    assert_eq!(filters.min_notional, Decimal::from_str_exact("10").ok());
+    assert_eq!(filters.step_size, Decimal::from_str_exact("0.01").ok());
+    assert_eq!(filters.min_qty, Decimal::from_str_exact("0.05").ok());
+}
+
+/// ICP_USDT: `baseSizePrecision` 0.0001 against `baseAssetPrecision` 2. Used as
+/// a step it rounded to four decimals, which MEXC refused (liquidation 1620).
+#[test]
+fn a_minimum_order_size_finer_than_the_venue_precision_does_not_set_the_scale() {
+    let info = serde_json::json!({
+        "symbol": "ICPUSDT",
+        "baseAssetPrecision": 2,
+        "quotePrecision": 3,
+        "quoteAmountPrecision": "1",
+        "baseSizePrecision": "0.0001",
+        "filters": []
+    });
+    let filters = MexcClient::symbol_filters_from_info(&info);
+    let sell = |filters: &SymbolFilters| {
+        let amount = Decimal::from_str_exact("7.8073757").expect("test amount");
+        let (_, qty, _) = MexcClient::prepare_sell_order(amount, Some(filters), "ICP_USDT").expect("a valid sell");
+        qty
+    };
+
+    assert_eq!(sell(&filters), Decimal::from_str_exact("7.8").ok());
+
+    // A real LOT_SIZE filter still decides where one is sent.
+    let with_lot_size = SymbolFilters {
+        step_size: Decimal::from_str_exact("0.001").ok(),
+        ..filters
+    };
+    assert_eq!(sell(&with_lot_size), Decimal::from_str_exact("7.807").ok());
+}

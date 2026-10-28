@@ -335,6 +335,37 @@ async fn a_bridged_unanswered_withdraw_parks_instead_of_waiting_forever() {
     assert!(state.withdraw.bridge.withdraw_bridge_id.is_none());
 }
 
+/// A withdraw that never reached MEXC moved nothing: it waits, keeps its
+/// order id, and does not park the leg.
+#[tokio::test]
+async fn an_unreachable_exchange_keeps_the_withdraw_order_id() {
+    let order_ids = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let mut cex = MockCexBackend::new();
+    let seen = order_ids.clone();
+    cex.expect_withdraw().times(2).returning(move |_, _, _, _, order_id| {
+        let mut seen = seen.lock().unwrap();
+        seen.push(order_id.to_string());
+        if seen.len() == 1 {
+            Err(WithdrawError::Unreachable("error trying to connect: dns error".into()))
+        } else {
+            Ok(receipt("mexc-internal"))
+        }
+    });
+    let finalizer = finalizer(cex, MockTransferActions::new());
+    let mut state = withdraw_state(&finalizer).await;
+
+    finalizer.withdraw(&mut state).await.unwrap();
+    let error = finalizer.withdraw(&mut state).await.expect_err("unreachable");
+    assert!(matches!(error, CexBackendError::Unreachable(_)), "{error}");
+    assert_eq!(state.withdraw.withdraw_attempt, 0);
+    finalizer.withdraw(&mut state).await.unwrap();
+    finalizer.withdraw(&mut state).await.unwrap();
+
+    let order_ids = order_ids.lock().unwrap();
+    assert_eq!(order_ids[0], order_ids[1], "the unsent request keeps its id");
+    assert_eq!(state.withdraw.withdraw_id.as_deref(), Some("mexc-internal"));
+}
+
 #[tokio::test]
 async fn a_refused_withdraw_retries_under_a_new_order_id() {
     let order_ids = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));

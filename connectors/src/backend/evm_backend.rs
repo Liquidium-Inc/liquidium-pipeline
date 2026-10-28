@@ -11,6 +11,7 @@ use async_trait::async_trait;
 use candid::Nat;
 use liquidium_pipeline_core::outbound::SendOutcome;
 use serde::{Deserialize, Serialize};
+use std::{collections::HashMap, sync::OnceLock, time::Instant};
 use tokio::time::{Duration, sleep};
 
 pub(crate) const ERC20_APPROVE_GAS_LIMIT: u64 = 120_000;
@@ -120,8 +121,10 @@ fn is_validation_refusal(message: &str) -> bool {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EvmReading {
     Landed,
-    /// Mined, but the call reverted: the nonce is used and no funds moved.
+    /// Mined and reverted, and the nonce is final: no funds moved.
     Reverted,
+    /// Mined and reverted, but not final yet: a reorg could still change it.
+    RevertNotFinal,
     /// No receipt, and the finalized nonce moved past it: it cannot land.
     NonceUsed,
     Pending,
@@ -132,10 +135,40 @@ enum EvmReading {
 fn read_evm_outcome(receipt_success: Option<bool>, finalized_nonce: u64, tx_nonce: u64) -> EvmReading {
     match receipt_success {
         Some(true) => EvmReading::Landed,
-        Some(false) => EvmReading::Reverted,
+        Some(false) if finalized_nonce > tx_nonce => EvmReading::Reverted,
+        Some(false) => EvmReading::RevertNotFinal,
         None if finalized_nonce > tx_nonce => EvmReading::NonceUsed,
         None => EvmReading::Pending,
     }
+}
+
+/// How long a nonce of an accepted broadcast outranks the node's pending count.
+const LOCAL_NONCE_TRUST_WINDOW: Duration = Duration::from_secs(120);
+
+/// The nonce after the last broadcast a node accepted, for each chain and
+/// signer. One key signs on several chains, each with its own count.
+type NonceKey = (u64, Address);
+type NonceMarks = HashMap<NonceKey, (u64, Instant)>;
+
+fn nonce_marks() -> &'static std::sync::Mutex<NonceMarks> {
+    static MARKS: OnceLock<std::sync::Mutex<NonceMarks>> = OnceLock::new();
+    MARKS.get_or_init(Default::default)
+}
+
+/// The node's pending count, or the mark of a recent accepted broadcast when
+/// that is ahead. A load-balanced RPC can miss a send it accepted moments ago.
+fn next_nonce(marks: &NonceMarks, signer: NonceKey, node_count: u64, now: Instant) -> u64 {
+    marks
+        .get(&signer)
+        .filter(|(_, marked_at)| now.duration_since(*marked_at) < LOCAL_NONCE_TRUST_WINDOW)
+        .map_or(node_count, |(mark, _)| (*mark).max(node_count))
+}
+
+/// Records a broadcast a node may hold. A signature that is never sent sets
+/// no mark, so it leaves no gap in the sequence.
+fn note_broadcast(marks: &mut NonceMarks, signer: NonceKey, nonce: u64, now: Instant) {
+    let mark = marks.get(&signer).map_or(nonce + 1, |(mark, _)| (*mark).max(nonce + 1));
+    marks.insert(signer, (mark, now));
 }
 
 pub struct EvmBackendImpl<P> {
@@ -177,11 +210,7 @@ where
         request: <AnyNetwork as Network>::TransactionRequest,
     ) -> Result<SignedEvmTx, String> {
         let from = self.provider.default_signer_address();
-        let (nonce, chain_id, fees) = tokio::try_join!(
-            async {
-                let nonce = self.provider.get_transaction_count(from).pending().await;
-                nonce.map_err(|e| format!("nonce read failed for {from}: {e}"))
-            },
+        let (chain_id, fees) = tokio::try_join!(
             async {
                 let chain_id = self.provider.get_chain_id().await;
                 chain_id.map_err(|e| format!("chain id read failed: {e}"))
@@ -191,12 +220,21 @@ where
                 fees.map_err(|e| format!("fee estimate failed: {e}"))
             },
         )?;
-        let mut request = request.with_from(from).with_nonce(nonce).with_chain_id(chain_id);
+        let mut request = request.with_from(from).with_chain_id(chain_id);
         let estimate = self
             .provider
             .estimate_gas(request.clone())
             .await
             .map_err(|e| format!("gas estimate failed: {e}"))?;
+        let node_count = self.provider.get_transaction_count(from).pending().await;
+        let node_count = node_count.map_err(|e| format!("nonce read failed for {from}: {e}"))?;
+        let nonce = next_nonce(
+            &nonce_marks().lock().expect("nonce marks lock"),
+            (chain_id, from),
+            node_count,
+            Instant::now(),
+        );
+        request.set_nonce(nonce);
         request.set_gas_limit(with_gas_buffer(estimate));
         request.set_max_fee_per_gas(fees.max_fee_per_gas);
         request.set_max_priority_fee_per_gas(fees.max_priority_fee_per_gas);
@@ -214,13 +252,21 @@ where
     }
 
     pub(crate) async fn broadcast_signed(&self, tx: &SignedEvmTx) -> Broadcast {
-        match self.provider.send_raw_transaction(&tx.raw).await {
+        let broadcast = match self.provider.send_raw_transaction(&tx.raw).await {
             Ok(_) => Broadcast::Sent,
             Err(RpcError::ErrorResp(error)) if is_validation_refusal(&error.message) => {
                 Broadcast::Rejected(error.message.to_string())
             }
             Err(error) => Broadcast::Unknown(error.to_string()),
+        };
+        // A node may hold the transaction, so the next send takes a later nonce.
+        if !matches!(broadcast, Broadcast::Rejected(_))
+            && let Ok(chain_id) = self.provider.get_chain_id().await
+        {
+            let mut marks = nonce_marks().lock().expect("nonce marks lock");
+            note_broadcast(&mut marks, (chain_id, tx.from), tx.nonce, Instant::now());
         }
+        broadcast
     }
 
     /// Decides a signed transaction from the chain: its receipt first, then
@@ -253,10 +299,12 @@ where
             EvmReading::Landed => SendOutcome::Landed {
                 receipt: format!("{:#x}", tx.hash),
             },
-            // A revert moved no funds, but a new send would most likely revert
-            // too, so an operator decides after the window.
-            EvmReading::Reverted => SendOutcome::Open {
+            // A final revert moved no funds; the caller decides whether to send again.
+            EvmReading::Reverted => SendOutcome::Reverted {
                 reason: format!("transaction {:#x} reverted", tx.hash),
+            },
+            EvmReading::RevertNotFinal => SendOutcome::Open {
+                reason: format!("transaction {:#x} reverted; waiting for finality", tx.hash),
             },
             // The two reads may come from different nodes behind one URL, so
             // a missing receipt is no proof. An operator decides after the window.
@@ -463,6 +511,51 @@ where
 #[cfg(test)]
 mod tests {
     use super::is_nonce_too_low_error;
+    use super::{Address, Duration, Instant, LOCAL_NONCE_TRUST_WINDOW, NonceMarks, next_nonce, note_broadcast};
+
+    #[test]
+    fn a_stale_node_count_never_reissues_a_broadcast_nonce() {
+        let mut marks = NonceMarks::default();
+        let (signer, now) = ((1, Address::repeat_byte(1)), Instant::now());
+        note_broadcast(&mut marks, signer, 70, now);
+        // The node has not seen the send that took 70 yet.
+        assert_eq!(next_nonce(&marks, signer, 70, now), 71);
+    }
+
+    #[test]
+    fn a_signature_that_is_never_sent_leaves_no_gap() {
+        let marks = NonceMarks::default();
+        let (signer, now) = ((1, Address::repeat_byte(2)), Instant::now());
+        assert_eq!(next_nonce(&marks, signer, 70, now), 70);
+        assert_eq!(next_nonce(&marks, signer, 70, now), 70);
+    }
+
+    #[test]
+    fn a_node_that_leads_the_mark_wins() {
+        let mut marks = NonceMarks::default();
+        let (signer, now) = ((1, Address::repeat_byte(3)), Instant::now());
+        note_broadcast(&mut marks, signer, 10, now);
+        assert_eq!(next_nonce(&marks, signer, 40, now), 40);
+    }
+
+    #[test]
+    fn each_chain_and_signer_has_its_own_mark() {
+        let mut marks = NonceMarks::default();
+        let now = Instant::now();
+        note_broadcast(&mut marks, (1, Address::repeat_byte(4)), 5, now);
+        assert_eq!(next_nonce(&marks, (1, Address::repeat_byte(4)), 5, now), 6);
+        assert_eq!(next_nonce(&marks, (1, Address::repeat_byte(5)), 5, now), 5);
+        assert_eq!(next_nonce(&marks, (2, Address::repeat_byte(4)), 5, now), 5);
+    }
+
+    #[test]
+    fn past_the_window_the_node_decides_again() {
+        let mut marks = NonceMarks::default();
+        let (signer, start) = ((1, Address::repeat_byte(6)), Instant::now());
+        note_broadcast(&mut marks, signer, 70, start);
+        let later = start + LOCAL_NONCE_TRUST_WINDOW + Duration::from_secs(1);
+        assert_eq!(next_nonce(&marks, signer, 70, later), 70);
+    }
 
     #[test]
     fn nonce_too_low_detector_matches_common_error_shapes() {
@@ -479,6 +572,8 @@ mod tests {
         use super::{EvmReading, read_evm_outcome};
         assert_eq!(read_evm_outcome(Some(true), 0, 5), EvmReading::Landed);
         assert_eq!(read_evm_outcome(Some(false), 9, 5), EvmReading::Reverted);
+        // A revert in a block that can still reorg is not acted on yet.
+        assert_eq!(read_evm_outcome(Some(false), 5, 5), EvmReading::RevertNotFinal);
         // Another transaction took the nonce, and it is final.
         assert_eq!(read_evm_outcome(None, 6, 5), EvmReading::NonceUsed);
         // Still pending, or mined but not final yet.

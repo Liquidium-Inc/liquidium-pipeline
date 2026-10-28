@@ -216,6 +216,9 @@ impl MexcClient {
         if is_pending_settlement(e) {
             return CexBackendError::PendingSettlement(format!("Swap err: {details}"));
         }
+        if is_unreachable(e) {
+            return CexBackendError::Unreachable(format!("Swap err: {details}"));
+        }
         format!("Swap err: {details}").into()
     }
 

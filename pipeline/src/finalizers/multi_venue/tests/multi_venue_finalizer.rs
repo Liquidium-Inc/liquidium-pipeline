@@ -37,7 +37,7 @@ use crate::{
     stage::PipelineStage,
     stages::{
         executor::{ExecutionReceipt, ExecutionStatus},
-        finalize::{FinalizeStage, MAX_FINALIZER_ERRORS},
+        finalize::{FinalizeStage, MAX_FINALIZER_ATTEMPTS, MAX_FINALIZER_ERRORS},
     },
     swappers::model::{SwapExecution, SwapQuote, SwapQuoteLeg, SwapRequest},
     utils::{CKUSDC_LEDGER_PRINCIPAL, CKUSDT_LEDGER_PRINCIPAL, ICP_LEDGER_PRINCIPAL},
@@ -225,34 +225,23 @@ impl BatchWal {
             .status
     }
 
-    fn set_status(&self, liquidation_id: u128, status: ResultStatus) {
-        self.rows
-            .lock()
-            .expect("batch WAL lock")
-            .iter_mut()
-            .find(|row| row.id == liquidation_id.to_string())
-            .expect("batch WAL row")
-            .status = status;
-    }
-
-    fn error_count(&self, liquidation_id: u128) -> i32 {
+    fn row(&self, liquidation_id: u128) -> LiqResultRecord {
         self.rows
             .lock()
             .expect("batch WAL lock")
             .iter()
             .find(|row| row.id == liquidation_id.to_string())
             .expect("batch WAL row")
-            .error_count
+            .clone()
     }
 
-    fn set_error_count(&self, liquidation_id: u128, error_count: i32) {
-        self.rows
-            .lock()
-            .expect("batch WAL lock")
-            .iter_mut()
-            .find(|row| row.id == liquidation_id.to_string())
-            .expect("batch WAL row")
-            .error_count = error_count;
+    fn update_row(&self, liquidation_id: u128, update: impl FnOnce(&mut LiqResultRecord)) {
+        let mut rows = self.rows.lock().expect("batch WAL lock");
+        update(
+            rows.iter_mut()
+                .find(|row| row.id == liquidation_id.to_string())
+                .expect("batch WAL row"),
+        );
     }
 
     fn make_retry_due(&self, liquidation_id: u128) {
@@ -338,6 +327,11 @@ impl WalStore for BatchWal {
         row.status = next;
         if bump_attempt {
             row.attempt += 1;
+        }
+        // As the store: an error-free release restarts the strikes.
+        if matches!(next, ResultStatus::Enqueued | ResultStatus::Succeeded) {
+            row.error_count = 0;
+            row.last_error = None;
         }
         Ok(())
     }
@@ -2089,7 +2083,7 @@ async fn reenqueuing_the_parent_row_does_not_rearm_an_operator_required_mexc_leg
     assert_eq!(wal.status(LIQUIDATION_ID), ResultStatus::OperatorRequired);
     assert_eq!(mexc.calls(), 1);
 
-    wal.set_status(LIQUIDATION_ID, ResultStatus::Enqueued);
+    wal.update_row(LIQUIDATION_ID, |row| row.status = ResultStatus::Enqueued);
     assert!(stage.process(&()).await.expect("polling cycle").is_empty());
     assert_eq!(wal.status(LIQUIDATION_ID), ResultStatus::OperatorRequired);
     assert_eq!(mexc.recovery_calls(), 0);
@@ -2139,14 +2133,18 @@ async fn reconcile_answers_a_parked_leg_and_queues_the_row_again() {
     assert!(error.contains("waits for an answer"), "{error}");
     assert_eq!(wal.status(LIQUIDATION_ID), ResultStatus::OperatorRequired);
 
-    wal.set_error_count(LIQUIDATION_ID, MAX_FINALIZER_ERRORS - 1);
+    wal.update_row(LIQUIDATION_ID, |row| row.error_count = MAX_FINALIZER_ERRORS - 1);
     let report = desk
         .reconcile(request(ReconcileAction::Answer(OperatorDecision::Absent)))
         .await
         .expect("answer");
     assert!(report.contains("queued again"), "{report}");
     assert_eq!(wal.status(LIQUIDATION_ID), ResultStatus::Enqueued);
-    assert_eq!(wal.error_count(LIQUIDATION_ID), 0, "a release starts a new error budget");
+    assert_eq!(
+        wal.row(LIQUIDATION_ID).error_count,
+        0,
+        "a release starts a new error budget"
+    );
 
     // The next finalize cycle advances the released leg.
     stage.process(&()).await.expect("released cycle");
@@ -2154,6 +2152,60 @@ async fn reconcile_answers_a_parked_leg_and_queues_the_row_again() {
     assert_ne!(wal.status(LIQUIDATION_ID), ResultStatus::OperatorRequired);
     let error = desk.reconcile(request(ReconcileAction::Release)).await.unwrap_err();
     assert!(error.contains("not parked"), "{error}");
+}
+
+/// A budget parks the row while its leg still runs. A release must give the row
+/// fresh error and attempt budgets, or the cap parks it again at once.
+#[tokio::test]
+async fn reconcile_releases_a_row_parked_by_a_budget() {
+    use crate::operator::{OperatorConsole, OperatorDesk, ReconcileAction, ReconcileRequest};
+    const LIQUIDATION_ID: u128 = 810;
+    let wal = Arc::new(BatchWal::new([receipt_with_id(LIQUIDATION_ID)]));
+    let mexc = Arc::new(ScriptedAdapter::new(
+        MEXC_VENUE_ID,
+        None,
+        vec![VenueLegStatus::Running, VenueLegStatus::Running],
+    ));
+    let finalizer = Arc::new(MultiVenueFinalizer::new(vec![mexc.clone()], planner_config()).expect("valid finalizer"));
+    let stage = FinalizeStage::new(
+        wal.clone(),
+        finalizer.clone(),
+        Arc::new(SimpleProfitCalculator),
+        Arc::new(MockPipelineAgent::new()),
+        Principal::anonymous(),
+        1,
+        60,
+    );
+    let desk = OperatorDesk::new(wal.clone(), finalizer);
+    let request = |action| ReconcileRequest {
+        liq_id: LIQUIDATION_ID.to_string(),
+        leg_id: None,
+        action,
+    };
+
+    stage.process(&()).await.expect("first cycle");
+    wal.update_row(LIQUIDATION_ID, |row| {
+        row.status = ResultStatus::OperatorRequired;
+        row.attempt = MAX_FINALIZER_ATTEMPTS;
+        row.error_count = MAX_FINALIZER_ERRORS;
+    });
+
+    let report = desk.reconcile(request(ReconcileAction::Show)).await.expect("show");
+    assert!(report.contains("no leg is parked"), "{report}");
+
+    let report = desk
+        .reconcile(request(ReconcileAction::Release))
+        .await
+        .expect("release");
+    assert!(report.contains("queued again"), "{report}");
+    let row = wal.row(LIQUIDATION_ID);
+    assert_eq!(
+        (row.status, row.error_count, row.attempt),
+        (ResultStatus::Enqueued, 0, 0)
+    );
+
+    stage.process(&()).await.expect("released cycle");
+    assert_eq!(mexc.calls(), 2, "the released row is worked again");
 }
 
 #[tokio::test]
@@ -2207,7 +2259,7 @@ async fn mexc_custody_row_exhausting_retries_parks_without_blocking_the_next_bat
         receipt_with_id(EXHAUSTED_ID),
         receipt_with_id(SUCCEEDING_ID),
     ]));
-    wal.set_error_count(EXHAUSTED_ID, MAX_FINALIZER_ERRORS - 1);
+    wal.update_row(EXHAUSTED_ID, |row| row.error_count = MAX_FINALIZER_ERRORS - 1);
     let mexc = Arc::new(
         ScriptedAdapter::new(
             MEXC_VENUE_ID,

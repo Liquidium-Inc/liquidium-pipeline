@@ -23,6 +23,12 @@ pub(super) fn format_mexc_api_error(err: &v3::ApiError) -> String {
     }
 }
 
+/// True when the request never reached MEXC. A timeout does not count: the
+/// request may have arrived and been acted on.
+pub(super) fn is_unreachable(err: &v3::ApiError) -> bool {
+    matches!(err, v3::ApiError::ReqwestError(inner) if inner.is_connect())
+}
+
 pub(super) fn is_bad_symbol(err: &v3::ApiError) -> bool {
     matches!(
         err,

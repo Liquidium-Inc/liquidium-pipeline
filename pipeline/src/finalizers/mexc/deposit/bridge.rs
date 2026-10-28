@@ -64,7 +64,17 @@ where
             .deposit_bridge_id
             .clone()
             .ok_or_else(|| "missing bridge id while polling bridged deposit".to_string())?;
-        match bridge.backend.get_bridge_status(&bridge_id).await? {
+        let status = match bridge.backend.get_bridge_status(&bridge_id).await {
+            Ok(status) => status,
+            // A failed read says nothing about the bridge, so it is a wait, not a strike.
+            Err(BridgeError::Unreadable(error)) => {
+                let submitted_at = state.deposit.bridge.deposit_bridge_submitted_at_ts;
+                state.step = CexStep::DepositPending;
+                return Self::note_bridge_wait(state, submitted_at, &bridge_id, Some(&error));
+            }
+            Err(error) => return Err(error.into()),
+        };
+        match status {
             BridgeStatus::Completed | BridgeStatus::Minted(_) => {
                 self.check_deposit(state).await?;
                 if !matches!(state.step, CexStep::Trade) {
@@ -73,8 +83,9 @@ where
                 Ok(())
             }
             BridgeStatus::Pending | BridgeStatus::Unknown => {
+                let submitted_at = state.deposit.bridge.deposit_bridge_submitted_at_ts;
                 state.step = CexStep::DepositPending;
-                Ok(())
+                Self::note_bridge_wait(state, submitted_at, &bridge_id, None)
             }
             BridgeStatus::Failed { reason } => Err(format!(
                 "bridged deposit failed for liq_id {} bridge_id {}: {}",

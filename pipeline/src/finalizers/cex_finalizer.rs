@@ -212,6 +212,9 @@ pub struct CexWithdrawBridgeState {
     /// When the send landed. The provider must accept it within a window.
     #[serde(default)]
     pub withdraw_bridge_funded_at_ts: Option<i64>,
+    /// How often that send reverted and was made again.
+    #[serde(default)]
+    pub withdraw_bridge_reverts: u32,
 }
 
 impl CexWithdrawBridgeState {
@@ -375,6 +378,7 @@ mod tests {
                 withdraw_send: None,
                 size_out: None,
                 bridge: CexWithdrawBridgeState {
+                    withdraw_bridge_reverts: 0,
                     withdraw_planned_asset: None,
                     withdraw_planned_network: None,
                     withdraw_bridge_required: false,

@@ -202,6 +202,15 @@ where
                 progress.failure = Some(VenueLegFailure::BelowMinimum);
                 return Ok(progress);
             }
+            // The request never reached the venue, so the leg waits; the wait
+            // spends no retry budget.
+            Err(CexBackendError::Unreachable(message)) => {
+                warn!(
+                    "[mexc] liq_id={} venue unreachable at step={:?}: {}",
+                    execution.cex.liq_id, execution.cex.step, message
+                );
+                None
+            }
             // Only an operator can say which row owns the provider record, or
             // whether a call without an answer moved funds.
             Err(CexBackendError::Ambiguous(message)) => {

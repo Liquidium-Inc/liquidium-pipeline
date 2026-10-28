@@ -1202,6 +1202,7 @@ async fn reverse_bridge_approves_only_missing_icrc2_allowance() {
         .withf(move |ledger, args| {
             *ledger == cketh_ledger
                 && args.amount == 121_000u64
+                && args.expected_allowance == Some(Nat::from(120_999u64))
                 && args.spender.owner == minter
                 && args.spender.subaccount.is_none()
         })
@@ -1297,6 +1298,7 @@ async fn native_reverse_bridge_approves_cketh_and_calls_withdraw_eth() {
         .withf(move |ledger, args| {
             *ledger == cketh_ledger
                 && args.amount == Nat::from(1_000_000_000_000_000_000u128)
+                && args.expected_allowance == Some(Nat::from(999_999_999_999_999_999u128))
                 && args.spender.owner == minter
                 && args.spender.subaccount.is_none()
         })

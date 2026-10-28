@@ -16,6 +16,10 @@ pub enum CexBackendError {
     /// can say what happened, so no automatic retry is safe.
     #[error("{0}")]
     Ambiguous(String),
+    /// The request never reached the venue (a failed connection), so nothing
+    /// happened there. The leg waits, and the wait spends no retry budget.
+    #[error("{0}")]
+    Unreachable(String),
     /// Any backend failure that follows the normal retry/error policy.
     #[error("{0}")]
     Other(String),
@@ -39,7 +43,9 @@ impl From<BridgeError> for CexBackendError {
         match error {
             BridgeError::BelowMinimum(message) => Self::BelowMinimum(message),
             BridgeError::Ambiguous(message) => Self::Ambiguous(message),
-            BridgeError::Deferred(message) | BridgeError::Other(message) => Self::Other(message),
+            BridgeError::Deferred(message) | BridgeError::Unreadable(message) | BridgeError::Other(message) => {
+                Self::Other(message)
+            }
         }
     }
 }
@@ -64,6 +70,9 @@ pub enum WithdrawError {
     /// The exchange refused the request before it acted on it.
     #[error("{0}")]
     Refused(String),
+    /// The request never reached the exchange, so a new request later is safe.
+    #[error("{0}")]
+    Unreachable(String),
 }
 
 #[derive(Debug, Clone)]

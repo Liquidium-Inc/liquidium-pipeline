@@ -219,7 +219,7 @@ async fn preview_uses_the_exact_leg_allocation_and_persists_the_route() {
 
     assert_eq!(preview.quote.pay_amount, Nat::from(200_000_000u64));
     assert!(preview.quote.receive_amount < Nat::from(20_000_000u64));
-    assert!(preview.conservative_receive.value < preview.quote.receive_amount);
+    assert!(preview.conservative_receive.value <= preview.quote.receive_amount);
     let execution = preview
         .initial_execution_state
         .decode::<MexcVenueExecutionState>("mexc")
@@ -230,6 +230,31 @@ async fn preview_uses_the_exact_leg_allocation_and_persists_the_route() {
     assert_eq!(execution.cex.trade.trade_resolved_legs[0].market, "PAY_RECV");
     uuid::Uuid::parse_str(execution.cex.liq_id.trim_start_matches("mexc-"))
         .expect("execution ID should contain a restart-safe UUID");
+}
+
+/// The simulated output is already net of measured impact and the taker fee.
+/// Charging the slippage cap again understated every MEXC plan by the full cap.
+#[tokio::test]
+async fn the_conservative_quote_carries_only_costs_the_simulation_cannot_see() {
+    // The slippage cap is 200 bps; the route fee and delay buffer add to 100 bps.
+    let finalizer = finalizer().with_quote_costs(25, 75);
+    let request = request(200_000_000);
+
+    let preview = MultiVenueAdapter::preview(&finalizer, &planning_context(), &request)
+        .await
+        .expect("MEXC preview should succeed");
+
+    let expected = (preview.quote.receive_amount.clone() * Nat::from(9_900u32)) / Nat::from(10_000u32);
+    assert_eq!(preview.conservative_receive.value, expected, "100 bps, not 300");
+}
+
+#[tokio::test]
+async fn a_venue_with_no_configured_quote_costs_is_not_discounted() {
+    let preview = MultiVenueAdapter::preview(&finalizer(), &planning_context(), &request(200_000_000))
+        .await
+        .expect("MEXC preview should succeed");
+
+    assert_eq!(preview.conservative_receive.value, preview.quote.receive_amount);
 }
 
 /// Audit L10: the preview takes MEXC's withdrawal fee off the output, as the
@@ -1133,6 +1158,30 @@ async fn leg_at_trade_step(finalizer: &MexcFinalizer<MockCexBackend>, waiting_si
         .expect("first cycle should arm the leg");
     leg.execution = armed.execution;
     leg
+}
+
+/// A connect failure never reached MEXC, so it must not be charged to the
+/// retry budget (liquidation 1625 parked this way).
+#[tokio::test]
+async fn an_unreachable_venue_retries_without_spending_the_retry_budget() {
+    let message = "Swap err: err=error sending request: error trying to connect: dns error";
+    let finalizer = finalizer_with_trade_result(Err(CexBackendError::Unreachable(message.to_string())), 0);
+    let leg = leg_at_trade_step(&finalizer, None).await;
+
+    let waiting = MultiVenueAdapter::advance(&finalizer, &leg, &NoopCheckpoint)
+        .await
+        .expect("an unreachable venue should produce durable waiting progress");
+
+    assert_eq!(waiting.status, VenueLegStatus::Running);
+    assert_eq!(waiting.retryable_error, None);
+    assert_eq!(waiting.last_error.as_deref(), Some(message));
+    let execution = waiting
+        .execution
+        .decode::<MexcVenueExecutionState>(VENUE_ID)
+        .expect("decode waiting state")
+        .expect("MEXC state");
+    assert!(!execution.operator_required);
+    assert_eq!(execution.cex.trade.trade_settlement_waiting_since_ts, None);
 }
 
 #[tokio::test]
