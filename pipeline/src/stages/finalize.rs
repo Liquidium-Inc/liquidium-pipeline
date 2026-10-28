@@ -572,7 +572,6 @@ mod tests {
     use crate::stages::executor::ExecutionStatus;
     use crate::swappers::model::SwapRequest;
     use candid::{Encode, Nat};
-    use liquidium_pipeline_connectors::backend::bridge_backend::FINALIZER_PERMANENT_AMOUNT_FLOOR_PREFIX;
     use liquidium_pipeline_connectors::pipeline_agent::MockPipelineAgent;
     use liquidium_pipeline_core::tokens::{chain_token::ChainToken, chain_token_amount::ChainTokenAmount};
     use liquidium_pipeline_core::types::protocol_types::{
@@ -1127,10 +1126,7 @@ mod tests {
         let liq_id_str = liq_id.to_string();
         let liq_id_for_failure = liq_id_str.clone();
 
-        let err = format!(
-            "{}: ckETH@ICP -> ETH amount below minimum withdrawal (amount=0.0049 minimum=0.005)",
-            FINALIZER_PERMANENT_AMOUNT_FLOOR_PREFIX
-        );
+        let err = "ckETH@ICP -> ETH amount below minimum withdrawal (amount=0.0049 minimum=0.005)".to_string();
         let err_for_failure = err.clone();
 
         let mut wal = MockWalStore::new();
@@ -1180,10 +1176,7 @@ mod tests {
         let liq_id_str = liq_id.to_string();
         let liq_id_for_success = liq_id_str.clone();
 
-        let err = format!(
-            "{}: ckETH@ICP -> ETH amount below minimum withdrawal (amount=0.0049 minimum=0.005)",
-            FINALIZER_PERMANENT_AMOUNT_FLOOR_PREFIX
-        );
+        let err = "ckETH@ICP -> ETH amount below minimum withdrawal (amount=0.0049 minimum=0.005)".to_string();
 
         let mut wal = MockWalStore::new();
         wal.expect_get_pending()

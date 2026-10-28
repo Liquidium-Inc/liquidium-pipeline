@@ -48,8 +48,8 @@ where
                 Ok(None)
             }
             Err(OutboundError::Park(error)) => Err(error),
-            // MEXC refused it, so the next request takes a new order id.
-            Err(OutboundError::Retry(error)) => {
+            // The request did not happen, so the next one takes a new order id.
+            Err(OutboundError::Retry(error) | OutboundError::Deferred(error)) => {
                 state.withdraw.withdraw_attempt += 1;
                 Err(error)
             }

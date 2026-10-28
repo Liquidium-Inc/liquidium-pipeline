@@ -7,16 +7,12 @@ pub use routed_bridge::RoutedBridgeBackend;
 mod mint_events;
 mod types;
 mod utils;
-pub use ckerc20_bridge::{
-    BRIDGE_AMOUNT_BELOW_MINIMUM_PREFIX, BRIDGE_SUBMISSION_DEFERRED_PREFIX, BridgeEvmBackend, CkErc20BridgeBackend,
-    FINALIZER_PERMANENT_AMOUNT_FLOOR_PREFIX,
-};
+pub use ckerc20_bridge::{BridgeEvmBackend, CkErc20BridgeBackend};
 pub use solana_bridge::{DEFAULT_SOLANA_BRIDGE_FEE_BUFFER_LAMPORTS, SolanaBridgeBackend, cksol_transfer_without_deposit_id};
 pub use types::{
-    BridgeBackend, BridgeDestination, BridgeDestinationKind, BridgeFeeBudget, BridgeMintReceipt, BridgeRequest,
-    BridgeSend, DepositNotice,
-    BridgeRouteKind, BridgeRouteSpec, BridgeStatus, BridgeSubmission, BridgeSubmissionCandidate, BridgeSweepRoute,
-    EvmReceiptStatus, MockBridgeBackend,
+    BridgeBackend, BridgeDestination, BridgeDestinationKind, BridgeError, BridgeFeeBudget, BridgeMintReceipt,
+    BridgeRequest, BridgeRouteKind, BridgeRouteSpec, BridgeSend, BridgeStatus, BridgeSubmission,
+    BridgeSubmissionCandidate, BridgeSweepRoute, DepositNotice, EvmReceiptStatus, MockBridgeBackend,
 };
 pub use utils::{
     cketh_forward_routes, cketh_reverse_routes, resolve_cketh_forward_route_by_source,

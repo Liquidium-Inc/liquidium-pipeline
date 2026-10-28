@@ -9,9 +9,9 @@ use serde::Deserialize;
 use std::{str::FromStr, sync::Arc};
 
 use super::{
-    BridgeBackend, BridgeDestination, BridgeFeeBudget, BridgeMintReceipt, BridgeRequest, BridgeRouteKind, BridgeRouteSpec,
-    BridgeSend, BridgeStatus, BridgeSubmission, DepositNotice,
-    catalog::BRIDGE_ROUTE_CATALOG, resolve_route, validate_destination_for_route,
+    BridgeBackend, BridgeDestination, BridgeError, BridgeFeeBudget, BridgeMintReceipt, BridgeRequest, BridgeRouteKind,
+    BridgeRouteSpec, BridgeSend, BridgeStatus, BridgeSubmission, DepositNotice, catalog::BRIDGE_ROUTE_CATALOG,
+    resolve_route, validate_destination_for_route,
 };
 use liquidium_pipeline_core::{
     account::model::ChainAccount,
@@ -946,32 +946,34 @@ where
         nat_units_to_amount_via_core(&Nat::from(minimum), 9)
     }
 
-    async fn submit_bridge(&self, request: BridgeRequest) -> Result<BridgeSubmission, String> {
+    async fn submit_bridge(&self, request: BridgeRequest) -> Result<BridgeSubmission, BridgeError> {
         let route = Self::resolve_solana_route_for_request(&request)?;
         validate_destination_for_route(route, &request.destination)?;
 
         match route.route_kind {
-            BridgeRouteKind::SolanaToIcp => self.submit_solana_to_icp(route, &request).await,
-            BridgeRouteKind::IcpToSolana => self.submit_icp_to_solana(route, &request).await,
+            BridgeRouteKind::SolanaToIcp => Ok(self.submit_solana_to_icp(route, &request).await?),
+            BridgeRouteKind::IcpToSolana => Ok(self.submit_icp_to_solana(route, &request).await?),
             _ => Err(format!(
                 "route {}@{} -> {} is not supported by SolanaBridgeBackend",
                 route.source_asset, route.source_chain, route.target_asset
-            )),
+            )
+            .into()),
         }
     }
 
-    async fn prepare_bridge_send(&self, request: &BridgeRequest) -> Result<BridgeSend, String> {
+    async fn prepare_bridge_send(&self, request: &BridgeRequest) -> Result<BridgeSend, BridgeError> {
         let route = Self::resolve_solana_route_for_request(request)?;
         validate_destination_for_route(route, &request.destination)?;
         if route.route_kind != BridgeRouteKind::SolanaToIcp {
             return Err(format!(
                 "route {}@{} -> {} has no signed bridge send",
                 route.source_asset, route.source_chain, route.target_asset
-            ));
+            )
+            .into());
         }
         let send = self.solana_to_icp_send(route, request).await?;
         let ChainAccount::Solana(deposit_address) = &send.to else {
-            return Err("ckSOL deposit address is not a Solana address".to_string());
+            return Err("ckSOL deposit address is not a Solana address".into());
         };
         let tx = self
             .solana_backend
@@ -1250,7 +1252,8 @@ mod tests {
         let err = backend
             .submit_bridge(request)
             .await
-            .expect_err("non-solana route kind must fail");
+            .expect_err("non-solana route kind must fail")
+            .to_string();
         assert!(err.contains("is not supported by SolanaBridgeBackend"));
     }
 
@@ -1282,7 +1285,8 @@ mod tests {
         let err = backend
             .submit_bridge(request)
             .await
-            .expect_err("source/configured bridge source mismatch must fail");
+            .expect_err("source/configured bridge source mismatch must fail")
+            .to_string();
         assert!(err.contains("does not match configured bridge source"));
     }
 
@@ -1604,7 +1608,8 @@ mod tests {
         let err = backend
             .submit_bridge(request)
             .await
-            .expect_err("insufficient bridge source balance must fail");
+            .expect_err("insufficient bridge source balance must fail")
+            .to_string();
         assert!(err.contains("below transfer+fee buffer budget"));
     }
 
@@ -1655,8 +1660,13 @@ mod tests {
         let err = backend
             .submit_bridge(request)
             .await
-            .expect_err("transfer failure must fail submission");
-        assert_eq!(err.starts_with(liquidium_pipeline_core::outbound::SIDE_EFFECT_AMBIGUOUS_PREFIX), ambiguous, "{err}");
+            .expect_err("transfer failure must fail submission")
+            .to_string();
+        assert_eq!(
+            err.starts_with(liquidium_pipeline_core::outbound::SIDE_EFFECT_AMBIGUOUS_PREFIX),
+            ambiguous,
+            "{err}"
+        );
         assert!(err.contains("SOL transfer from configured bridge source"));
         assert!(err.contains("rpc failure"));
         }
@@ -1696,7 +1706,8 @@ mod tests {
         let err = backend
             .submit_bridge(request)
             .await
-            .expect_err("missing proxy canister should fail-fast");
+            .expect_err("missing proxy canister should fail-fast")
+            .to_string();
         assert!(err.contains("bridge proxy canister is not configured"));
     }
 
@@ -1712,7 +1723,8 @@ mod tests {
         let err = backend
             .submit_bridge(wrong_owner)
             .await
-            .expect_err("owner mismatch must fail");
+            .expect_err("owner mismatch must fail")
+            .to_string();
         assert!(err.contains("does not match configured bridge owner"));
 
         let with_subaccount = Account {
@@ -1723,7 +1735,8 @@ mod tests {
         let err = backend
             .submit_bridge(icp_to_sol_request(with_subaccount))
             .await
-            .expect_err("subaccount source must fail");
+            .expect_err("subaccount source must fail")
+            .to_string();
         assert!(err.contains("subaccount must be None"));
     }
 
@@ -1793,7 +1806,8 @@ mod tests {
         let err = backend
             .submit_bridge(icp_to_sol_request(bridge_owner().to_text()))
             .await
-            .expect_err("withdraw error must propagate with explicit variant");
+            .expect_err("withdraw error must propagate with explicit variant")
+            .to_string();
         assert!(err.contains("InsufficientAllowance"));
     }
 

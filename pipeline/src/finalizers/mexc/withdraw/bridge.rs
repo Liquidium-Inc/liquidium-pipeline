@@ -92,11 +92,11 @@ where
                 let bridge_send = match bridge.backend.prepare_bridge_send(request).await {
                     Ok(bridge_send) => bridge_send,
                     // A busy bridge wallet is a wait. Nothing was signed.
-                    Err(error) if error.starts_with(BRIDGE_SUBMISSION_DEFERRED_PREFIX) => {
+                    Err(BridgeError::Deferred(error)) => {
                         info!("[mexc] liq_id={} bridged withdraw deferred: {}", liq_id, error);
                         return Ok(());
                     }
-                    Err(error) => return Err(bridge_refusal(error)),
+                    Err(error) => return Err(error.into()),
                 };
                 funds.withdraw_bridge_funding = Some(OutboundRecord::prepared(bridge_send.send));
                 funds.withdraw_bridge_send_handle = Some(bridge_send.handle);
@@ -426,12 +426,12 @@ where
         let submission = match bridge.backend.submit_bridge(request).await {
             Ok(submission) => submission,
             // Same wait semantics as the deposit side: no budget spent.
-            Err(error) if error.starts_with(BRIDGE_SUBMISSION_DEFERRED_PREFIX) => {
+            Err(BridgeError::Deferred(error)) => {
                 info!("[mexc] liq_id={} bridged withdraw deferred: {}", state.liq_id, error);
                 state.step = CexStep::WithdrawPending;
                 return Ok(());
             }
-            Err(error) => return Err(bridge_refusal(error)),
+            Err(error) => return Err(error.into()),
         };
         state.withdraw.bridge.withdraw_bridge_id = Some(submission.bridge_id);
         state.withdraw.bridge.withdraw_bridge_submitted_at_ts = Some(now_ts());
@@ -541,15 +541,5 @@ where
                 reason.unwrap_or_else(|| "no reason provided".to_string())
             )),
         }
-    }
-}
-
-/// A bridge backend refusal as a step error. The bridge still reports its
-/// amount floor as text, until `BridgeBackend` returns typed errors.
-fn bridge_refusal(error: String) -> CexBackendError {
-    if error.starts_with(FINALIZER_PERMANENT_AMOUNT_FLOOR_PREFIX) {
-        CexBackendError::BelowMinimum(error)
-    } else {
-        CexBackendError::Other(error)
     }
 }

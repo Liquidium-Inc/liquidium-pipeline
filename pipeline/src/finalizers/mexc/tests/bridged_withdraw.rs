@@ -118,7 +118,7 @@ async fn mexc_withdraw_bridge_deferral_keeps_step_pending_then_submits() {
         let mut calls = submit_calls.lock().unwrap();
         *calls += 1;
         if *calls == 1 {
-            Err(format!("{BRIDGE_SUBMISSION_DEFERRED_PREFIX}: bridge wallet has pending transactions"))
+            Err(BridgeError::Deferred("bridge wallet has pending transactions".into()))
         } else {
             Ok(evm_bridge_send())
         }
@@ -202,7 +202,7 @@ async fn mexc_deposit_bridge_deferral_keeps_step_pending_then_submits() {
         let mut calls = submit_calls.lock().unwrap();
         *calls += 1;
         if *calls == 1 {
-            Err(format!("{BRIDGE_SUBMISSION_DEFERRED_PREFIX}: bridge wallet has pending transactions"))
+            Err(BridgeError::Deferred("bridge wallet has pending transactions".into()))
         } else {
             Ok(BridgeSubmission {
                 bridge_id: "bridge-after-wait".to_string(),

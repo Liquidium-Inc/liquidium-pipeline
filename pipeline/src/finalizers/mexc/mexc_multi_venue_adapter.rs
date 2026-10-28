@@ -190,8 +190,8 @@ where
         }
 
         let error = match outcome {
-            Err(CexBackendError::PendingSettlement(message)) => {
-                let error = CexBackendError::PendingSettlement(message).to_string();
+            Err(error @ CexBackendError::PendingSettlement(_)) => {
+                let error = error.to_string();
                 execution.cex.last_error = Some(error.clone());
                 return self.settlement_wait_progress(execution, error).await;
             }

@@ -1,32 +1,21 @@
 use async_trait::async_trait;
-use std::{error::Error, fmt};
 
-const CEX_PENDING_SETTLEMENT_PREFIX: &str = "cex pending settlement: ";
+use super::bridge_backend::BridgeError;
 
 /// Classified failure from a CEX trade submission or reconciliation request.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum CexBackendError {
     /// The venue sees the funds or order but cannot trade or reconcile it yet.
+    #[error("cex pending settlement: {0}")]
     PendingSettlement(String),
     /// The amount is under a minimum on the route, so no later attempt can
     /// succeed with it.
+    #[error("{0}")]
     BelowMinimum(String),
     /// Any backend failure that follows the normal retry/error policy.
+    #[error("{0}")]
     Other(String),
 }
-
-impl fmt::Display for CexBackendError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::PendingSettlement(message) => {
-                write!(formatter, "{CEX_PENDING_SETTLEMENT_PREFIX}{message}")
-            }
-            Self::BelowMinimum(message) | Self::Other(message) => formatter.write_str(message),
-        }
-    }
-}
-
-impl Error for CexBackendError {}
 
 impl From<String> for CexBackendError {
     fn from(message: String) -> Self {
@@ -44,6 +33,16 @@ impl From<CexBackendError> for String {
 impl From<&str> for CexBackendError {
     fn from(message: &str) -> Self {
         Self::Other(message.to_string())
+    }
+}
+
+/// A bridge refusal inside a CEX leg step keeps its below-minimum kind.
+impl From<BridgeError> for CexBackendError {
+    fn from(error: BridgeError) -> Self {
+        match error {
+            BridgeError::BelowMinimum(message) => Self::BelowMinimum(message),
+            other => Self::Other(other.to_string()),
+        }
     }
 }
 

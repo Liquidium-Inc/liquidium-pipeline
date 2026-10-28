@@ -32,6 +32,9 @@ pub enum SendOutcome {
     /// The receiver refused the amount as too small. The send did not happen,
     /// and the same send fails again.
     BelowMinimum { reason: String },
+    /// The sender was not ready, for example a busy wallet. The send did not
+    /// happen, and a new send later is safe.
+    Deferred { reason: String },
     /// No decided answer yet.
     Open { reason: String },
 }

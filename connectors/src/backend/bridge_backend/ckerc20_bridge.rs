@@ -20,9 +20,9 @@ use super::{
         parse_evm_token_address, parse_source_icp_account, recovered_bridge_id, resolve_cketh_route_for_request,
     },
     types::{
-        CkEthMinterInfo, Eip1559TransactionPrice, Eip1559TransactionPriceArg, EvmReceiptStatus, HelperContract,
-        LedgerError, WithdrawErc20Arg, WithdrawErc20Error, WithdrawErc20Ret, WithdrawalArg, WithdrawalDetail,
-        WithdrawalRet, WithdrawalSearchParameter,
+        BridgeError, CkEthMinterInfo, Eip1559TransactionPrice, Eip1559TransactionPriceArg, EvmReceiptStatus,
+        HelperContract, LedgerError, WithdrawErc20Arg, WithdrawErc20Error, WithdrawErc20Ret, WithdrawalArg,
+        WithdrawalDetail, WithdrawalRet, WithdrawalSearchParameter,
     },
 };
 use liquidium_pipeline_core::outbound::{SIDE_EFFECT_AMBIGUOUS_PREFIX, SendOutcome};
@@ -76,11 +76,6 @@ const MIN_ETH_FORWARD_GAS_RESERVE_WEI: u128 = 5_000_000_000_000_000;
 const ETH_FORWARD_HELPER_GAS_LIMIT: u128 = 150_000;
 const ETH_FORWARD_GAS_RESERVE_MULTIPLIER: u128 = 2;
 const DEFAULT_CKETH_MIN_WITHDRAWAL_WEI: u128 = 5_000_000_000_000_000;
-pub const FINALIZER_PERMANENT_AMOUNT_FLOOR_PREFIX: &str = "finalizer_permanent_amount_floor";
-pub const BRIDGE_AMOUNT_BELOW_MINIMUM_PREFIX: &str = FINALIZER_PERMANENT_AMOUNT_FLOOR_PREFIX;
-/// Marks a submission the bridge refused only because the wallet is busy. The
-/// finalizer keeps the step pending and retries without spending its budget.
-pub const BRIDGE_SUBMISSION_DEFERRED_PREFIX: &str = "bridge_submission_deferred";
 
 fn eth_forward_gas_reserve_from_price(gas_price_wei: u128, gas_limit: u128) -> U256 {
     let dynamic_reserve = U256::from(gas_price_wei)
@@ -518,29 +513,18 @@ where
         Nat::from(DEFAULT_CKETH_MIN_WITHDRAWAL_WEI)
     }
 
-    fn below_minimum_bridge_error(asset: &str, chain: &str, target_asset: &str, amount: f64, minimum: f64) -> String {
-        format!(
-            "{FINALIZER_PERMANENT_AMOUNT_FLOOR_PREFIX}: {}@{} -> {} amount below minimum withdrawal (amount={} minimum={})",
-            asset, chain, target_asset, amount, minimum
-        )
-    }
-
-    async fn ensure_native_cketh_withdrawal_minimum(
-        &self,
+    fn ensure_native_cketh_withdrawal_minimum(
         route: &BridgeRouteSpec,
         amount_native: &Nat,
         amount: f64,
-    ) -> Result<(), String> {
+    ) -> Result<(), BridgeError> {
         let minimum_native = Self::native_cketh_minimum_withdrawal_amount();
         if amount_native < &minimum_native {
             let minimum = nat_units_to_amount_via_core(&minimum_native, ETH_DECIMALS)?;
-            return Err(Self::below_minimum_bridge_error(
-                route.source_asset,
-                route.source_chain,
-                route.target_asset,
-                amount,
-                minimum,
-            ));
+            return Err(BridgeError::BelowMinimum(format!(
+                "{}@{} -> {} amount below minimum withdrawal (amount={} minimum={})",
+                route.source_asset, route.source_chain, route.target_asset, amount, minimum
+            )));
         }
         Ok(())
     }
@@ -577,13 +561,13 @@ where
         &self,
         route: &BridgeRouteSpec,
         request: &BridgeRequest,
-    ) -> Result<(SignedEvmTx, super::mint_events::PendingMintHandle), String> {
+    ) -> Result<(SignedEvmTx, super::mint_events::PendingMintHandle), BridgeError> {
         // Exact approvals replace the wallet's allowance. Defer while a helper
         // may still consume one in the mempool. The RPC nonce check also
         // applies after backend reconstruction.
         if self.evm_backend.has_pending_transactions().await? {
-            return Err(format!(
-                "{BRIDGE_SUBMISSION_DEFERRED_PREFIX}: bridge wallet has pending transactions; retry after inclusion"
+            return Err(BridgeError::Deferred(
+                "bridge wallet has pending transactions; retry after inclusion".to_string(),
             ));
         }
         let token_address = parse_evm_token_address(route)?;
@@ -602,7 +586,7 @@ where
             return Err(format!(
                 "destination {:?} includes an ICP subaccount, but native helper contract does not support subaccount destinations",
                 request.destination
-            ));
+            ).into());
         }
         let helper_address = match helper {
             HelperContract::WithSubaccount(address) | HelperContract::Native(address) => address,
@@ -619,7 +603,7 @@ where
             return Err(format!(
                 "bridge amount preflight failed: ERC20 balance is below requested deposit amount (available={} required={} signer={} token={})",
                 signer_balance, amount_base_units, signer, token_address
-            ));
+            ).into());
         }
         // The approve and the helper call pay gas from the wallet's own ETH. A
         // short wallet waits for funding instead of failing at broadcast.
@@ -627,10 +611,10 @@ where
         let gas_needed = U256::from(self.evm_backend.gas_price_wei().await?).saturating_mul(U256::from(gas_limit));
         let eth_balance = self.evm_backend.native_balance_of(signer).await?;
         if eth_balance < gas_needed {
-            return Err(format!(
-                "{BRIDGE_SUBMISSION_DEFERRED_PREFIX}: bridge wallet holds {eth_balance} wei ETH, below the {gas_needed} wei of gas the {} return needs",
+            return Err(BridgeError::Deferred(format!(
+                "bridge wallet holds {eth_balance} wei ETH, below the {gas_needed} wei of gas the {} return needs",
                 route.source_asset
-            ));
+            )));
         }
 
         // Helper must be approved before deposit call can transfer ERC20 from signer.
@@ -692,7 +676,7 @@ where
         &self,
         route: &BridgeRouteSpec,
         request: &BridgeRequest,
-    ) -> Result<(SignedEvmTx, super::mint_events::PendingMintHandle), String> {
+    ) -> Result<(SignedEvmTx, super::mint_events::PendingMintHandle), BridgeError> {
         let signer = self.evm_backend.signer_address();
         ensure_source_matches_signer(&request.source_address, signer)?;
 
@@ -704,7 +688,7 @@ where
             return Err(format!(
                 "destination {:?} includes an ICP subaccount, but native ETH helper contract does not support subaccount destinations",
                 request.destination
-            ));
+            ).into());
         }
 
         let amount_wei = amount_to_base_units_strict(request.amount, ETH_DECIMALS)?;
@@ -724,7 +708,7 @@ where
             return Err(format!(
                 "bridge amount preflight failed: ETH balance is below requested deposit amount plus gas reserve (available={} required={} amount={} gas_reserve={} signer={})",
                 signer_balance, required_balance, amount_wei, gas_reserve, signer
-            ));
+            ).into());
         }
 
         let handle = super::mint_events::PendingMintHandle::prepare(
@@ -760,14 +744,15 @@ where
         &self,
         route: &BridgeRouteSpec,
         request: &BridgeRequest,
-    ) -> Result<(SignedEvmTx, super::mint_events::PendingMintHandle), String> {
+    ) -> Result<(SignedEvmTx, super::mint_events::PendingMintHandle), BridgeError> {
         match route.route_kind {
             BridgeRouteKind::CkEthErc20Forward => self.sign_forward_bridge(route, request).await,
             BridgeRouteKind::EthToCkEth => self.sign_native_forward_bridge(route, request).await,
             _ => Err(format!(
                 "route {}@{} -> {} has no signed helper call",
                 route.source_asset, route.source_chain, route.target_asset
-            )),
+            )
+            .into()),
         }
     }
 
@@ -776,7 +761,7 @@ where
         &self,
         route: &BridgeRouteSpec,
         request: &BridgeRequest,
-    ) -> Result<BridgeSubmission, String> {
+    ) -> Result<BridgeSubmission, BridgeError> {
         let _submission = self.forward_submission.lock().await;
         let (tx, handle) = self.sign_forward(route, request).await?;
         match self.evm_backend.broadcast(&tx).await {
@@ -784,8 +769,8 @@ where
             Broadcast::Sent => Ok(BridgeSubmission {
                 bridge_id: handle.bridge_id(tx.hash)?,
             }),
-            Broadcast::Rejected(error) => Err(format!("helper deposit {:#x} refused: {error}", tx.hash)),
-            Broadcast::Unknown(error) => Err(Self::helper_send_error("helper deposit", error)),
+            Broadcast::Rejected(error) => Err(format!("helper deposit {:#x} refused: {error}", tx.hash).into()),
+            Broadcast::Unknown(error) => Err(Self::helper_send_error("helper deposit", error).into()),
         }
     }
 
@@ -913,15 +898,14 @@ where
         &self,
         route: &BridgeRouteSpec,
         request: &BridgeRequest,
-    ) -> Result<BridgeSubmission, String> {
+    ) -> Result<BridgeSubmission, BridgeError> {
         let source_account = parse_source_icp_account(&request.source_address)?;
         ensure_source_matches_bridge_owner(&source_account, self.bridge_ic_owner_principal)?;
 
         let destination = expect_evm_destination(route, &request.destination)?;
         let cketh_ledger_id = parse_ckerc20_ledger_id(route)?;
         let amount_native = amount_to_nat_units_strict(request.amount, ETH_DECIMALS)?;
-        self.ensure_native_cketh_withdrawal_minimum(route, &amount_native, request.amount)
-            .await?;
+        Self::ensure_native_cketh_withdrawal_minimum(route, &amount_native, request.amount)?;
         let approve_fee = icrc1_fee_with_context(self.icp_backend.as_ref(), cketh_ledger_id, "cketh bridge").await?;
         // The minter burns exactly `amount` and sends `amount - gas`.
         let required_budget = amount_native.clone() + approve_fee.clone();
@@ -939,7 +923,7 @@ where
             return Err(format!(
                 "bridge amount preflight failed: ckETH balance is below required withdraw+approve budget (available={} required={} source={})",
                 available_formatted, required_formatted, request.source_address
-            ));
+            ).into());
         }
 
         self.ensure_minter_allowance(&source_account, cketh_ledger_id, amount_native.clone())
@@ -955,7 +939,7 @@ where
             WithdrawalRet::Ok(request_id) => Ok(BridgeSubmission {
                 bridge_id: format!("ic-withdraw-eth:{}", request_id.block_index),
             }),
-            WithdrawalRet::Err(err) => Err(format!("withdraw_eth error: {:?}", err)),
+            WithdrawalRet::Err(err) => Err(format!("withdraw_eth error: {:?}", err).into()),
         }
     }
 }
@@ -1181,23 +1165,24 @@ where
     ///
     /// The method performs route validation and preflight checks before sending any
     /// on-chain/canister state-changing calls.
-    async fn submit_bridge(&self, request: BridgeRequest) -> Result<BridgeSubmission, String> {
+    async fn submit_bridge(&self, request: BridgeRequest) -> Result<BridgeSubmission, BridgeError> {
         // Resolve route metadata once; it validates asset/chain pair and destination kind.
         let route = resolve_cketh_route_for_request(&request)?;
         match route.route_kind {
             BridgeRouteKind::CkEthErc20Forward | BridgeRouteKind::EthToCkEth => {
                 self.submit_signed_forward(route, &request).await
             }
-            BridgeRouteKind::CkEthErc20Reverse => self.submit_reverse_bridge(route, &request).await,
+            BridgeRouteKind::CkEthErc20Reverse => Ok(self.submit_reverse_bridge(route, &request).await?),
             BridgeRouteKind::CkEthToEth => self.submit_native_reverse_bridge(route, &request).await,
             _ => Err(format!(
                 "route {}@{} -> {} is not supported by CkErc20BridgeBackend",
                 route.source_asset, route.source_chain, route.target_asset
-            )),
+            )
+            .into()),
         }
     }
 
-    async fn prepare_bridge_send(&self, request: &BridgeRequest) -> Result<BridgeSend, String> {
+    async fn prepare_bridge_send(&self, request: &BridgeRequest) -> Result<BridgeSend, BridgeError> {
         let route = resolve_cketh_route_for_request(request)?;
         // Held until the send is signed, so two rows cannot sign one nonce.
         let _submission = self.forward_submission.lock().await;

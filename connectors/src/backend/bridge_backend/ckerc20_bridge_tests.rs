@@ -12,10 +12,10 @@ use crate::backend::{
 use crate::pipeline_agent::MockPipelineAgent;
 
 use super::{
-    CkErc20BridgeBackend, CkEthMinterInfo, Eip1559TransactionPrice, FINALIZER_PERMANENT_AMOUNT_FLOOR_PREFIX,
-    MIN_ETH_FORWARD_GAS_RESERVE_WEI, MockBridgeEvmBackend, WithdrawErc20Ret, WithdrawalRet, destination_to_bytes32,
-    ensure_source_matches_bridge_owner, ensure_source_matches_signer, eth_forward_gas_reserve_from_price,
-    parse_source_icp_account, resolve_cketh_route_for_request,
+    BridgeError, CkErc20BridgeBackend, CkEthMinterInfo, Eip1559TransactionPrice, MIN_ETH_FORWARD_GAS_RESERVE_WEI,
+    MockBridgeEvmBackend, WithdrawErc20Ret, WithdrawalRet, destination_to_bytes32, ensure_source_matches_bridge_owner,
+    ensure_source_matches_signer, eth_forward_gas_reserve_from_price, parse_source_icp_account,
+    resolve_cketh_route_for_request,
 };
 
 /// A helper call as the wallet signs it. Only its hash matters to the bridge.
@@ -252,13 +252,10 @@ async fn forward_bridge_serialises_preflight_and_defers_pending_wallet_after_res
             .is_err()
         );
         drop(guard);
-        assert!(
-            backend
-                .submit_bridge(request)
-                .await
-                .unwrap_err()
-                .contains("pending transactions")
-        );
+        assert!(matches!(
+            backend.submit_bridge(request).await,
+            Err(BridgeError::Deferred(_))
+        ));
     }
 }
 
@@ -342,7 +339,7 @@ async fn forward_bridge_rejects_subaccount_destination_when_native_helper_is_res
         provider_fee_budget_native_units: None,
     };
 
-    let err = backend.submit_bridge(request).await.expect_err("must fail");
+    let err = backend.submit_bridge(request).await.expect_err("must fail").to_string();
     assert!(err.contains("does not support subaccount destinations"));
 }
 
@@ -598,7 +595,8 @@ async fn forward_bridge_fails_preflight_when_balance_is_insufficient() {
     let err = backend
         .submit_bridge(request)
         .await
-        .expect_err("bridge must fail preflight");
+        .expect_err("bridge must fail preflight")
+        .to_string();
     assert!(err.contains("bridge amount preflight failed"));
     assert!(err.contains("available=999999"));
     assert!(err.contains("required=1000000"));
@@ -825,7 +823,8 @@ async fn native_forward_bridge_rejects_insufficient_eth_after_gas_reserve() {
     let err = backend
         .submit_bridge(request)
         .await
-        .expect_err("bridge must fail preflight");
+        .expect_err("bridge must fail preflight")
+        .to_string();
     assert!(err.contains("ETH balance is below requested deposit amount plus gas reserve"));
 }
 
@@ -885,7 +884,8 @@ async fn native_forward_bridge_propagates_dynamic_gas_reserve_errors() {
     let err = backend
         .submit_bridge(request)
         .await
-        .expect_err("gas reserve failure should stop native forward bridge");
+        .expect_err("gas reserve failure should stop native forward bridge")
+        .to_string();
     assert!(err.contains("native gas price fetch failed"));
 }
 
@@ -1370,7 +1370,7 @@ async fn native_reverse_bridge_rejects_below_minimum_before_allowance_or_withdra
         .submit_bridge(request)
         .await
         .expect_err("below minimum must fail");
-    assert!(err.starts_with(FINALIZER_PERMANENT_AMOUNT_FLOOR_PREFIX));
+    assert!(matches!(err, BridgeError::BelowMinimum(_)), "{err}");
 }
 
 #[tokio::test]
@@ -1677,7 +1677,7 @@ async fn native_reverse_bridge_rejects_wrong_bridge_owner() {
         provider_fee_budget_native_units: None,
     };
 
-    let err = backend.submit_bridge(request).await.expect_err("must fail");
+    let err = backend.submit_bridge(request).await.expect_err("must fail").to_string();
     assert!(err.contains("does not match configured bridge owner"));
 }
 
@@ -1938,8 +1938,15 @@ async fn forward_bridge_helper_send_error_is_ambiguous() {
     };
 
     // The transaction can land after the error, so a repeat would deposit twice.
-    let error = backend.submit_bridge(request).await.expect_err("the send failed");
-    assert!(error.starts_with(liquidium_pipeline_core::outbound::SIDE_EFFECT_AMBIGUOUS_PREFIX), "{error}");
+    let error = backend
+        .submit_bridge(request)
+        .await
+        .expect_err("the send failed")
+        .to_string();
+    assert!(
+        error.starts_with(liquidium_pipeline_core::outbound::SIDE_EFFECT_AMBIGUOUS_PREFIX),
+        "{error}"
+    );
     assert!(error.contains("rpc timed out"), "{error}");
 }
 
@@ -2106,5 +2113,5 @@ async fn a_usdc_return_waits_while_the_wallet_cannot_pay_its_gas() {
         })
         .await
         .expect_err("a wallet short on gas must not approve or sign");
-    assert!(error.starts_with(super::BRIDGE_SUBMISSION_DEFERRED_PREFIX), "{error}");
+    assert!(matches!(error, BridgeError::Deferred(_)), "{error}");
 }

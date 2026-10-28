@@ -6,8 +6,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use candid::Nat;
 use liquidium_pipeline_connectors::backend::bridge_backend::{
-    BRIDGE_SUBMISSION_DEFERRED_PREFIX, BridgeBackend, BridgeRequest, FINALIZER_PERMANENT_AMOUNT_FLOOR_PREFIX,
-    resolve_route,
+    BridgeBackend, BridgeError, BridgeRequest, resolve_route,
 };
 use liquidium_pipeline_connectors::outbound::{decode_payload, encode_payload};
 use liquidium_pipeline_core::outbound::{OutboundIntent, OutboundSender, PreparedSend, SendOutcome};
@@ -173,15 +172,12 @@ impl OutboundSender for BridgeCallSender {
             Ok(submission) => SendOutcome::Landed {
                 receipt: submission.bridge_id,
             },
-            // Refused before any provider call: a busy wallet or a floor. The
-            // bridge reports both as text until `BridgeBackend` returns types.
-            Err(reason) if reason.starts_with(FINALIZER_PERMANENT_AMOUNT_FLOOR_PREFIX) => {
-                SendOutcome::BelowMinimum { reason }
-            }
-            Err(reason) if reason.starts_with(BRIDGE_SUBMISSION_DEFERRED_PREFIX) => SendOutcome::NeverLanded { reason },
+            // Refused before any provider call: a floor or a busy wallet.
+            Err(BridgeError::BelowMinimum(reason)) => SendOutcome::BelowMinimum { reason },
+            Err(BridgeError::Deferred(reason)) => SendOutcome::Deferred { reason },
             // Any other failure may follow a call that ran, so the provider
             // history decides it.
-            Err(reason) => SendOutcome::Open { reason },
+            Err(BridgeError::Other(reason)) => SendOutcome::Open { reason },
         }
     }
 
@@ -278,7 +274,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn only_a_refusal_before_any_call_counts_as_never_landed() {
+    async fn only_a_refusal_before_any_call_is_decided_without_the_history() {
         let cases = [
             (
                 Ok(BridgeSubmission {
@@ -286,15 +282,9 @@ mod tests {
                 }),
                 "landed",
             ),
-            (
-                Err(format!("{BRIDGE_SUBMISSION_DEFERRED_PREFIX}: wallet busy")),
-                "never",
-            ),
-            (
-                Err(format!("{FINALIZER_PERMANENT_AMOUNT_FLOOR_PREFIX}: below minimum")),
-                "never",
-            ),
-            (Err("minter call timed out".to_string()), "open"),
+            (Err(BridgeError::Deferred("wallet busy".into())), "deferred"),
+            (Err(BridgeError::BelowMinimum("below minimum".into())), "below minimum"),
+            (Err(BridgeError::Other("minter call timed out".into())), "open"),
         ];
         for (answer, expected) in cases {
             let mut backend = MockBridgeBackend::new();
@@ -307,7 +297,9 @@ mod tests {
                 .await;
             let kind = match outcome {
                 SendOutcome::Landed { .. } => "landed",
-                SendOutcome::NeverLanded { .. } | SendOutcome::BelowMinimum { .. } => "never",
+                SendOutcome::NeverLanded { .. } => "never",
+                SendOutcome::Deferred { .. } => "deferred",
+                SendOutcome::BelowMinimum { .. } => "below minimum",
                 SendOutcome::Open { .. } => "open",
             };
             assert_eq!(kind, expected);
