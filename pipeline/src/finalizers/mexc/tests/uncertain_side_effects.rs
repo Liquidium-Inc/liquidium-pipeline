@@ -230,7 +230,7 @@ async fn an_unanswered_withdraw_is_settled_from_its_order_id_and_never_repeated(
     let mut cex = MockCexBackend::new();
     cex.expect_withdraw()
         .times(1)
-        .returning(|_, _, _, _, _| Err(format!("{SIDE_EFFECT_AMBIGUOUS_PREFIX}: MEXC withdraw timed out")));
+        .returning(|_, _, _, _, _| Err(WithdrawError::Ambiguous("MEXC withdraw timed out".into())));
     let polls = Arc::new(std::sync::Mutex::new(vec![
         snapshot(WithdrawStatus::Completed, Some("ledger:7")),
         snapshot(WithdrawStatus::Pending, None),
@@ -272,7 +272,7 @@ async fn an_absent_withdraw_parks_then_a_new_order_follows_an_absent_answer() {
         let mut seen = seen.lock().unwrap();
         seen.push(order_id.to_string());
         if seen.len() == 1 {
-            Err(format!("{SIDE_EFFECT_AMBIGUOUS_PREFIX}: MEXC withdraw timed out"))
+            Err(WithdrawError::Ambiguous("MEXC withdraw timed out".into()))
         } else {
             Ok(receipt("mexc-internal-2"))
         }
@@ -312,7 +312,7 @@ async fn a_bridged_unanswered_withdraw_parks_instead_of_waiting_forever() {
     let mut cex = MockCexBackend::new();
     cex.expect_withdraw()
         .times(1)
-        .returning(|_, _, _, _, _| Err(format!("{SIDE_EFFECT_AMBIGUOUS_PREFIX}: MEXC withdraw timed out")));
+        .returning(|_, _, _, _, _| Err(WithdrawError::Ambiguous("MEXC withdraw timed out".into())));
     cex.expect_get_withdraw_status_snapshot_by_id()
         .times(2)
         .returning(|_, _| Ok(snapshot(WithdrawStatus::Unknown, None)));
@@ -345,7 +345,7 @@ async fn a_refused_withdraw_retries_under_a_new_order_id() {
         let mut seen = seen.lock().unwrap();
         seen.push(order_id.to_string());
         if seen.len() == 1 {
-            Err("MEXC refused: insufficient balance".into())
+            Err(WithdrawError::Refused("MEXC refused: insufficient balance".into()))
         } else {
             Ok(receipt("mexc-internal"))
         }

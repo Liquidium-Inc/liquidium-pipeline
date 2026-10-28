@@ -45,6 +45,20 @@ pub struct DepositAddress {
     pub tag: Option<String>, // for exchanges that need memo/tag
 }
 
+/// Why a withdrawal request failed. The kind tells the caller what is safe next.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum WithdrawError {
+    /// The exchange may have executed the request; only its history decides.
+    #[error("{0}")]
+    Ambiguous(String),
+    /// The amount is below the exchange minimum, so the same request fails again.
+    #[error("{0}")]
+    BelowMinimum(String),
+    /// The exchange refused the request before it acted on it.
+    #[error("{0}")]
+    Refused(String),
+}
+
 #[derive(Debug, Clone)]
 pub struct WithdrawalReceipt {
     pub asset: String,
@@ -176,7 +190,7 @@ pub trait CexBackend: Send + Sync {
         address: &str,
         amount: f64,
         withdraw_order_id: &str,
-    ) -> Result<WithdrawalReceipt, String>;
+    ) -> Result<WithdrawalReceipt, WithdrawError>;
 
     /// The fee and minimum of a withdrawal, known before it is sent.
     async fn get_withdraw_terms(&self, asset: &str, network: &str) -> Result<WithdrawTerms, String>;

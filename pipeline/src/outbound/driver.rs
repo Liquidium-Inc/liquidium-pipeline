@@ -83,11 +83,9 @@ enum Drive {
     Done { receipt: String },
     /// Come back on the next cycle.
     Wait,
-    /// The send did not happen. The record is cleared, and the next cycle
-    /// prepares a new send.
-    Retry { reason: String },
-    /// An operator must decide. The reason carries the ambiguity prefix.
-    Park { reason: String },
+    /// The step stopped. A park keeps the record; any other failure clears it,
+    /// so the next cycle prepares a new send.
+    Failed(OutboundError),
 }
 
 /// Prepares a send and saves it. The send itself runs on the next cycle,
@@ -98,19 +96,17 @@ async fn start_outbound(record: &mut Option<OutboundRecord>, sender: &dyn Outbou
             *record = Some(OutboundRecord::prepared(prepared));
             Drive::Wait
         }
-        Err(reason) => Drive::Retry { reason },
+        Err(reason) => Drive::Failed(OutboundError::Retry(reason)),
     }
 }
 
 /// Advances a saved send by one step, and clears it once it is decided.
 async fn advance_outbound(record: &mut Option<OutboundRecord>, sender: &dyn OutboundSender, now: i64) -> Drive {
     let Some(saved) = record.as_mut() else {
-        return Drive::Retry {
-            reason: "no outbound send is saved".to_string(),
-        };
+        return Drive::Failed(OutboundError::Retry("no outbound send is saved".to_string()));
     };
     let drive = advance_saved(saved, sender, now).await;
-    if matches!(drive, Drive::Done { .. } | Drive::Retry { .. }) {
+    if !matches!(drive, Drive::Wait | Drive::Failed(OutboundError::Park(_))) {
         *record = None;
     }
     drive
@@ -132,7 +128,8 @@ async fn advance_saved(saved: &mut OutboundRecord, sender: &dyn OutboundSender, 
     };
     match outcome {
         SendOutcome::Landed { receipt } => Drive::Done { receipt },
-        SendOutcome::NeverLanded { reason } => Drive::Retry { reason },
+        SendOutcome::NeverLanded { reason } => Drive::Failed(OutboundError::Retry(reason)),
+        SendOutcome::BelowMinimum { reason } => Drive::Failed(OutboundError::BelowMinimum(reason)),
         SendOutcome::Open { reason } => {
             let window = sender.open_window_secs(&saved.prepared);
             if now.saturating_sub(submitted_at) > window {
@@ -141,7 +138,7 @@ async fn advance_saved(saved: &mut OutboundRecord, sender: &dyn OutboundSender, 
                     saved.prepared.sender, saved.prepared.identity
                 ));
                 saved.phase = OutboundPhase::Parked { reason: reason.clone() };
-                return Drive::Park { reason };
+                return Drive::Failed(OutboundError::Park(reason));
             }
             saved.phase = OutboundPhase::Submitted { at: submitted_at };
             Drive::Wait
@@ -149,14 +146,34 @@ async fn advance_saved(saved: &mut OutboundRecord, sender: &dyn OutboundSender, 
     }
 }
 
-/// One drive of a saved send; `intent` starts a new one. An error means a
-/// new send on the next cycle, or a park when it has the ambiguity prefix.
+/// Why one step did not finish its send.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum OutboundError {
+    /// The send did not happen; the next cycle prepares a new one.
+    #[error("{0}")]
+    Retry(String),
+    /// The send may have run; an operator must decide. The reason carries
+    /// the ambiguity prefix for the layers that still read text.
+    #[error("{0}")]
+    Park(String),
+    /// The receiver refuses the amount as too small, so a new send of it fails too.
+    #[error("{0}")]
+    BelowMinimum(String),
+}
+
+impl From<OutboundError> for String {
+    fn from(error: OutboundError) -> Self {
+        error.to_string()
+    }
+}
+
+/// One drive of a saved send; `intent` starts a new one.
 pub async fn step_outbound(
     record: &mut Option<OutboundRecord>,
     sender: &dyn OutboundSender,
     intent: Option<&OutboundIntent>,
     now: i64,
-) -> Result<Option<String>, String> {
+) -> Result<Option<String>, OutboundError> {
     let drive = match intent {
         Some(intent) => start_outbound(record, sender, intent).await,
         None => advance_outbound(record, sender, now).await,
@@ -164,7 +181,7 @@ pub async fn step_outbound(
     match drive {
         Drive::Done { receipt } => Ok(Some(receipt)),
         Drive::Wait => Ok(None),
-        Drive::Retry { reason } | Drive::Park { reason } => Err(reason),
+        Drive::Failed(error) => Err(error),
     }
 }
 
@@ -173,15 +190,11 @@ fn decide_parked(saved: &OutboundRecord, reason: &str) -> Drive {
         Some(OperatorDecision::Landed { receipt }) => Drive::Done {
             receipt: receipt.clone(),
         },
-        Some(OperatorDecision::Absent) => Drive::Retry {
-            reason: format!(
-                "operator confirmed {} send {} did not happen",
-                saved.prepared.sender, saved.prepared.identity
-            ),
-        },
-        None => Drive::Park {
-            reason: reason.to_string(),
-        },
+        Some(OperatorDecision::Absent) => Drive::Failed(OutboundError::Retry(format!(
+            "operator confirmed {} send {} did not happen",
+            saved.prepared.sender, saved.prepared.identity
+        ))),
+        None => Drive::Failed(OutboundError::Park(reason.to_string())),
     }
 }
 
@@ -256,7 +269,7 @@ mod tests {
         assert_eq!(record.as_ref().unwrap().phase, OutboundPhase::Submitted { at: 100 });
         assert_eq!(advance_outbound(&mut record, &sender, 150).await, Drive::Wait);
 
-        let Drive::Park { reason } = advance_outbound(&mut record, &sender, 161).await else {
+        let Drive::Failed(OutboundError::Park(reason)) = advance_outbound(&mut record, &sender, 161).await else {
             panic!("the window ran out");
         };
         assert!(is_side_effect_ambiguous(&reason), "{reason}");
@@ -272,7 +285,25 @@ mod tests {
 
         assert_eq!(
             advance_outbound(&mut record, &sender, 120).await,
-            Drive::Retry { reason: "expired".into() }
+            Drive::Failed(OutboundError::Retry("expired".into()))
+        );
+        assert!(record.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_too_small_send_clears_its_record_and_says_so() {
+        let reason = "under the receiver minimum".to_string();
+        let too_small = SendOutcome::BelowMinimum { reason: reason.clone() };
+        let sender = sender(too_small, vec![]);
+        let mut record = None;
+
+        assert_eq!(
+            step_outbound(&mut record, &sender, Some(&intent()), 100).await,
+            Ok(None)
+        );
+        assert_eq!(
+            step_outbound(&mut record, &sender, None, 100).await,
+            Err(OutboundError::BelowMinimum(reason))
         );
         assert!(record.is_none());
     }
@@ -291,7 +322,9 @@ mod tests {
 
         // A release without a decision parks again.
         let mut record = parked(None);
-        let Drive::Park { .. } = advance_outbound(&mut record, &sender(open(), vec![open()]), 500).await else {
+        let Drive::Failed(OutboundError::Park(_)) =
+            advance_outbound(&mut record, &sender(open(), vec![open()]), 500).await
+        else {
             panic!("no decision recorded");
         };
         assert!(record.is_some());
@@ -305,7 +338,7 @@ mod tests {
         let mut record = parked(Some(OperatorDecision::Absent));
         assert!(matches!(
             advance_outbound(&mut record, &sender(open(), vec![open()]), 500).await,
-            Drive::Retry { .. }
+            Drive::Failed(OutboundError::Retry(_))
         ));
         assert!(record.is_none());
 
@@ -330,7 +363,7 @@ mod tests {
 
         assert_eq!(
             start_outbound(&mut record, &sender, &intent()).await,
-            Drive::Retry { reason: "unsupported token".into() }
+            Drive::Failed(OutboundError::Retry("unsupported token".into()))
         );
         assert!(record.is_none());
     }

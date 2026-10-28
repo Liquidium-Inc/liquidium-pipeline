@@ -2,16 +2,6 @@
 use super::*;
 
 #[test]
-fn mexc_withdraw_below_min_detection_uses_raw_code() {
-    assert!(is_mexc_withdraw_below_min_error(
-        r#"Error response: ErrorResponse { code: InvalidResponse, raw_code: 10254, msg: "localized or changed text", _extend: None }"#
-    ));
-    assert!(!is_mexc_withdraw_below_min_error(
-        "Withdrawal shall not be less than the Min amount of:0.00002"
-    ));
-}
-
-#[test]
 fn the_withdraw_order_id_format_never_changes() {
     // A saved row polls MEXC history by this id, so a new release must build
     // the same id from the same row.
@@ -243,10 +233,9 @@ async fn mexc_non_bridge_withdraw_below_min_completes_as_zero_output_dust() {
     cex.expect_withdraw()
         .times(1)
         .returning(|_asset, _network, _address, _amount, _withdraw_order_id| {
-            Err(
-                r#"Error response: ErrorResponse { code: InvalidResponse, raw_code: 10254, msg: "Withdrawal shall not be less than the Min amount of:0.00002", _extend: None }"#
-                    .to_string(),
-            )
+            Err(WithdrawError::BelowMinimum(
+                "withdrawal is below the MEXC minimum".to_string(),
+            ))
         });
 
     let finalizer = test_finalizer(Arc::new(cex), Arc::new(transfers));
@@ -291,10 +280,9 @@ async fn mexc_bridged_withdraw_below_min_completes_as_zero_output_dust() {
             assert_eq!(network, "ETH");
             assert_eq!(address, "0x2222222222222222222222222222222222222222");
             assert_eq!(amount, 0.00001);
-            Err(
-                r#"Error response: ErrorResponse { code: InvalidResponse, raw_code: 10254, msg: "localized or changed text", _extend: None }"#
-                    .to_string(),
-            )
+            Err(WithdrawError::BelowMinimum(
+                "withdrawal is below the MEXC minimum".to_string(),
+            ))
         });
 
     let finalizer =

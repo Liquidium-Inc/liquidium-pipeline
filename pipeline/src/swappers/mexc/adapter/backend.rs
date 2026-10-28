@@ -365,7 +365,7 @@ impl CexBackend for MexcClient {
         address: &str,
         amount: f64,
         withdraw_order_id: &str,
-    ) -> Result<WithdrawalReceipt, String> {
+    ) -> Result<WithdrawalReceipt, WithdrawError> {
         let ex = self.inner.lock().await;
         let candidates = mexc_withdraw_coin_candidates(asset);
         let network_candidates = mexc_withdraw_network_order(asset, network);
@@ -375,8 +375,9 @@ impl CexBackend for MexcClient {
             asset, network_candidates, amount, address, withdraw_order_id
         );
 
-        let mut last_err: Option<String> = None;
-        let mut hard_err: Option<String> = None;
+        // The first real refusal outranks "this alias is not listed".
+        let mut refusal: Option<WithdrawError> = None;
+        let mut unlisted: Option<String> = None;
         let mut res = None;
         for coin in &candidates {
             for net in &network_candidates {
@@ -400,17 +401,18 @@ impl CexBackend for MexcClient {
                         // A request MEXC may have executed ends the search: the
                         // next alias would be a second withdrawal of the same funds.
                         if !is_definite_rejection(&e) {
-                            return Err(format!(
-                                "{SIDE_EFFECT_AMBIGUOUS_PREFIX}: MEXC withdraw coin={coin} network={net} withdraw_order_id={withdraw_order_id} has no decided answer: {e}"
-                            ));
+                            return Err(WithdrawError::Ambiguous(format!(
+                                "MEXC withdraw coin={coin} network={net} withdraw_order_id={withdraw_order_id} has no decided answer: {e}"
+                            )));
                         }
                         if is_coin_missing(&e) {
-                            last_err = Some(e.to_string());
-                            continue;
-                        }
-                        last_err = Some(e.to_string());
-                        if hard_err.is_none() {
-                            hard_err = last_err.clone();
+                            unlisted = Some(e.to_string());
+                        } else if refusal.is_none() {
+                            refusal = Some(if is_below_withdraw_minimum(&e) {
+                                WithdrawError::BelowMinimum(e.to_string())
+                            } else {
+                                WithdrawError::Refused(e.to_string())
+                            });
                         }
                     }
                 }
@@ -422,7 +424,11 @@ impl CexBackend for MexcClient {
 
         let (res, accepted_coin) = match res {
             Some(res) => res,
-            None => return Err(hard_err.or(last_err).unwrap_or_else(|| "withdraw failed".to_string())),
+            None => {
+                return Err(refusal.unwrap_or_else(|| {
+                    WithdrawError::Refused(unlisted.unwrap_or_else(|| "withdraw failed".to_string()))
+                }));
+            }
         };
 
         Ok(WithdrawalReceipt {

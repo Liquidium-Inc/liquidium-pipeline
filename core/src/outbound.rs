@@ -29,6 +29,9 @@ pub enum SendOutcome {
     Landed { receipt: String },
     /// The send did not happen and cannot happen later. A new send is safe.
     NeverLanded { reason: String },
+    /// The receiver refused the amount as too small. The send did not happen,
+    /// and the same send fails again.
+    BelowMinimum { reason: String },
     /// No decided answer yet.
     Open { reason: String },
 }

@@ -45,6 +45,23 @@ fn only_refusals_before_execution_allow_another_withdraw_alias() {
 }
 
 #[test]
+fn only_mexc_code_10254_is_a_below_minimum_withdrawal() {
+    let response = |code: v3::ErrorCode, raw_code: i32| {
+        v3::ApiError::ErrorResponse(v3::ErrorResponse {
+            code,
+            raw_code,
+            msg: "text that changes with the language".into(),
+            _extend: None,
+        })
+    };
+    let below_minimum = response(v3::ErrorCode::InvalidResponse, 10254);
+    let no_balance = response(v3::ErrorCode::InsufficientBalance, 10101);
+    assert!(is_below_withdraw_minimum(&below_minimum));
+    assert!(!is_below_withdraw_minimum(&no_balance));
+    assert!(!is_below_withdraw_minimum(&v3::ApiError::MalformedRequest));
+}
+
+#[test]
 fn a_history_read_skips_only_aliases_that_mexc_does_not_list() {
     let response = |code: v3::ErrorCode, raw_code: i32| {
         v3::ApiError::ErrorResponse(v3::ErrorResponse {

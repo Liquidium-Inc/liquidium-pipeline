@@ -8,20 +8,6 @@ pub fn mexc_withdraw_order_id(liq_id: &str, attempt: u32) -> String {
     format!("lq{hash:016x}w{attempt}")
 }
 
-pub(super) fn is_mexc_withdraw_below_min_error(err: &str) -> bool {
-    // The CEX backend trait currently erases MEXC's typed error into a string.
-    // Recover the stable raw code instead of matching MEXC's human-readable text.
-    parse_mexc_raw_code(err) == Some(MEXC_WITHDRAW_BELOW_MIN_RAW_CODE)
-}
-
-fn parse_mexc_raw_code(err: &str) -> Option<i64> {
-    let value = err.split("raw_code:").nth(1)?.trim_start();
-    let end = value
-        .find(|ch: char| !ch.is_ascii_digit() && ch != '-')
-        .unwrap_or(value.len());
-    value.get(..end)?.parse().ok()
-}
-
 impl<C> MexcFinalizer<C>
 where
     C: CexBackend,
@@ -57,13 +43,13 @@ where
         let sender = CexWithdrawals::new(self.backend.clone());
         match step_outbound(&mut state.withdraw.withdraw_send, &sender, None, now_ts()).await {
             Ok(landed) => Ok(landed.as_deref().map(AcceptedWithdrawal::parse)),
-            Err(error) if is_mexc_withdraw_below_min_error(&error) => {
+            Err(OutboundError::BelowMinimum(error)) => {
                 Self::complete_withdraw_as_below_min_dust(state, asset, network, amount, &error);
                 Ok(None)
             }
-            Err(error) if is_side_effect_ambiguous(&error) => Err(error),
+            Err(OutboundError::Park(error)) => Err(error),
             // MEXC refused it, so the next request takes a new order id.
-            Err(error) => {
+            Err(OutboundError::Retry(error)) => {
                 state.withdraw.withdraw_attempt += 1;
                 Err(error)
             }

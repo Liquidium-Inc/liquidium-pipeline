@@ -3,10 +3,8 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use crate::backend::cex_backend::{CexBackend, WithdrawStatus};
-use liquidium_pipeline_core::outbound::{
-    OutboundIntent, OutboundSender, PreparedSend, SendOutcome, is_side_effect_ambiguous,
-};
+use crate::backend::cex_backend::{CexBackend, WithdrawError, WithdrawStatus};
+use liquidium_pipeline_core::outbound::{OutboundIntent, OutboundSender, PreparedSend, SendOutcome};
 use serde::{Deserialize, Serialize};
 
 pub const NAME: &str = "mexc-withdraw";
@@ -105,8 +103,9 @@ impl<B: CexBackend> OutboundSender for CexWithdrawals<B> {
                 }
                 .encode(),
             },
-            Err(error) if is_side_effect_ambiguous(&error) => SendOutcome::Open { reason: error },
-            Err(error) => SendOutcome::NeverLanded { reason: error },
+            Err(WithdrawError::Ambiguous(reason)) => SendOutcome::Open { reason },
+            Err(WithdrawError::BelowMinimum(reason)) => SendOutcome::BelowMinimum { reason },
+            Err(WithdrawError::Refused(reason)) => SendOutcome::NeverLanded { reason },
         }
     }
 
@@ -140,5 +139,49 @@ impl<B: CexBackend> OutboundSender for CexWithdrawals<B> {
 
     fn open_window_secs(&self, _prepared: &PreparedSend) -> i64 {
         OPEN_WINDOW_SECS
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::backend::cex_backend::MockCexBackend;
+
+    #[tokio::test]
+    async fn each_withdraw_refusal_kind_becomes_its_send_outcome() {
+        let prepared = prepare_cex_withdraw(&WithdrawRequest {
+            asset: "USDC".into(),
+            network: "ETH".into(),
+            address: "0x2222222222222222222222222222222222222222".into(),
+            amount: 1.5,
+            order_id: "lq1w0".into(),
+        })
+        .expect("prepared");
+        let cases = [
+            (
+                WithdrawError::Ambiguous("timed out".into()),
+                SendOutcome::Open {
+                    reason: "timed out".into(),
+                },
+            ),
+            (
+                WithdrawError::BelowMinimum("under 2 USDC".into()),
+                SendOutcome::BelowMinimum {
+                    reason: "under 2 USDC".into(),
+                },
+            ),
+            (
+                WithdrawError::Refused("no balance".into()),
+                SendOutcome::NeverLanded {
+                    reason: "no balance".into(),
+                },
+            ),
+        ];
+        for (error, expected) in cases {
+            let mut backend = MockCexBackend::new();
+            backend.expect_withdraw().return_once(move |_, _, _, _, _| Err(error));
+            let outcome = CexWithdrawals::new(Arc::new(backend)).submit(&prepared).await;
+            assert_eq!(outcome, expected);
+        }
     }
 }

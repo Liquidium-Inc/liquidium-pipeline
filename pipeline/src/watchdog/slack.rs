@@ -1,69 +1,21 @@
 use async_trait::async_trait;
-use ic_agent::export::reqwest;
 use log::warn;
-use std::{
-    collections::HashMap,
-    sync::Arc,
-    time::{Duration, Instant},
-};
-use tokio::sync::Mutex;
+use std::{sync::Arc, time::Duration};
 
-use super::{WATCHDOG_HTTP_TIMEOUT_SECS, Watchdog, WatchdogEvent, noop_watchdog};
+use super::{Watchdog, WatchdogEvent, noop_watchdog, poster::WebhookPoster};
 
 const DEFAULT_BOT_NAME: &str = "liquidator";
 
 pub struct SlackWatchdog {
-    url: String,
+    poster: WebhookPoster,
     bot_name: String,
-    cooldown: Duration,
-    last: Mutex<HashMap<String, Instant>>,
-    client: reqwest::Client,
 }
 
 impl SlackWatchdog {
     pub fn new(url: impl Into<String>, cooldown: Duration) -> Self {
-        let timeout = Duration::from_secs(WATCHDOG_HTTP_TIMEOUT_SECS);
-        let client = reqwest::Client::builder().timeout(timeout).build().unwrap_or_else(|e| {
-            warn!(
-                "Failed to build Slack reqwest client with timeout: {}, using default",
-                e
-            );
-            reqwest::Client::new()
-        });
-
         Self {
-            url: url.into(),
+            poster: WebhookPoster::new(url, cooldown),
             bot_name: bot_name_from_env(),
-            cooldown,
-            last: Mutex::new(HashMap::new()),
-            client,
-        }
-    }
-
-    /// Claims the cooldown slot for `key`, returning the timestamp it displaced
-    /// so a failed send can put it back. Reserving up front keeps the check and
-    /// the claim atomic under one lock; [`Self::release_reservation`] undoes it
-    /// when the send fails, so a dropped alert is retried on the next attempt
-    /// rather than silently consuming the whole cooldown window.
-    async fn reserve_for_send(&self, key: &str) -> Option<Option<Instant>> {
-        let mut m = self.last.lock().await;
-        let now = Instant::now();
-        m.retain(|_, ts| now.duration_since(*ts) < self.cooldown);
-        if matches!(m.get(key), Some(&t) if now.duration_since(t) < self.cooldown) {
-            return None;
-        }
-        Some(m.insert(key.to_string(), now))
-    }
-
-    async fn release_reservation(&self, key: &str, displaced: Option<Instant>) {
-        let mut m = self.last.lock().await;
-        match displaced {
-            Some(previous) => {
-                m.insert(key.to_string(), previous);
-            }
-            None => {
-                m.remove(key);
-            }
         }
     }
 }
@@ -71,41 +23,11 @@ impl SlackWatchdog {
 #[async_trait]
 impl Watchdog for SlackWatchdog {
     async fn notify(&self, ev: WatchdogEvent<'_>) {
-        let cooldown_key = slack_cooldown_key(&ev);
-        let reservation = match cooldown_key.as_deref() {
-            Some(key) => match self.reserve_for_send(key).await {
-                Some(displaced) => Some((key.to_string(), displaced)),
-                None => return,
-            },
-            None => None,
-        };
-
         let Some(payload) = slack_payload_for_event_with_bot(&ev, &self.bot_name) else {
-            if let Some((key, displaced)) = reservation {
-                self.release_reservation(&key, displaced).await;
-            }
             return;
         };
-
-        let delivered = match self.client.post(&self.url).json(&payload).send().await {
-            Ok(resp) if resp.status().is_success() => true,
-            Ok(resp) => {
-                warn!("Slack notification failed with status {}", resp.status());
-                false
-            }
-            Err(err) => {
-                warn!("Slack notification failed: {}", err);
-                false
-            }
-        };
-
-        // An undelivered alert must not burn its cooldown: the caller re-notifies
-        // every cycle while a condition persists, and swallowing the failure here
-        // is what turns a stuck swap into one nobody is ever told about.
-        if !delivered
-            && let Some((key, displaced)) = reservation
-        {
-            self.release_reservation(&key, displaced).await;
+        if let Err(error) = self.poster.send(slack_cooldown_key(&ev).as_deref(), &payload).await {
+            warn!("Slack notification failed: {error}");
         }
     }
 }
@@ -517,15 +439,6 @@ mod tests {
             payload["blocks"][0]["text"]["text"],
             "*liquidator* - Liquidation finalized: `SwapFailed: insufficient liquidity`"
         );
-    }
-
-    #[tokio::test]
-    async fn slack_watchdog_cooldown_suppresses_repeated_keys() {
-        let wd = SlackWatchdog::new("http://localhost/slack", Duration::from_secs(60));
-
-        assert!(wd.reserve_for_send("low_balance:main:ckBTC").await.is_some());
-        assert!(wd.reserve_for_send("low_balance:main:ckBTC").await.is_none());
-        assert!(wd.reserve_for_send("low_balance:trader:ckBTC").await.is_some());
     }
 
     #[test]
