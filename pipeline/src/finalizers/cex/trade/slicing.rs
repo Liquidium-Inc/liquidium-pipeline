@@ -291,4 +291,23 @@ where
         );
         Ok(true)
     }
+
+    /// Records the remainder the exchange refused as below its order minimum.
+    /// It stays on the exchange, like dust under the configured floor.
+    pub(super) async fn mark_exchange_minimum_dust(
+        &self,
+        state: &mut CexState,
+        leg: &TradeLeg,
+        remaining_in: f64,
+        refusal: &str,
+    ) {
+        let residual_usd = self.input_slice_usd(&leg.market, &leg.side, remaining_in).await.ok();
+        state.trade.trade_dust_skipped = true;
+        state.trade.trade_dust_usd = residual_usd;
+        state.trade.trade_unexecutable_residual_in = Some(remaining_in);
+        warn!(
+            "[cex] liq_id={} remainder under the exchange minimum left as dust market={} side={} residual_in={} residual_usd={:?}: {}",
+            state.liq_id, leg.market, leg.side, remaining_in, residual_usd, refusal
+        );
+    }
 }

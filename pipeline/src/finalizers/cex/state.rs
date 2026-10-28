@@ -290,6 +290,12 @@ impl CexState {
             _ => false,
         }
     }
+
+    /// True once the funding transfer has left the trader account. From then
+    /// on, a minimum refusal cannot end the leg, because the funds are elsewhere.
+    pub fn funds_left_trader_account(&self) -> bool {
+        self.step != CexStep::Deposit || self.deposit.deposit_txid.is_some()
+    }
 }
 
 #[cfg(test)]

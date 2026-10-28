@@ -218,13 +218,19 @@ where
             Err(error @ CexBackendError::PendingSettlement(_)) => {
                 return self.settlement_wait_progress(execution, error.to_string()).await;
             }
-            // No later cycle can raise the amount, so the leg ends here.
-            Err(CexBackendError::BelowMinimum(message)) => {
+            // No later cycle can raise the amount, so the leg ends here with
+            // its funds still in the trader account.
+            Err(CexBackendError::BelowMinimum(message)) if !execution.cex.funds_left_trader_account() => {
                 execution.cex.step = CexStep::Failed;
                 let mut progress = self.progress_for(execution, Some(message))?;
                 progress.failure = Some(VenueLegFailure::BelowMinimum);
                 return Ok(progress);
             }
+            // Moved funds must stay tracked. The error spends the retry budget,
+            // so the row parks with an alert.
+            Err(CexBackendError::BelowMinimum(message)) => Some(format!(
+                "{message}; the leg's funds already left the trader account, so an operator must settle them"
+            )),
             // The request never reached the venue, so a short outage spends no
             // retry budget. A long one does, so it cannot wait without an alert.
             Err(CexBackendError::Unreachable(message)) => {

@@ -1239,6 +1239,25 @@ async fn leg_at_trade_step(
     leg
 }
 
+/// The deposit already left the trader account, so a minimum refusal at the
+/// trade step must not end the leg and drop the funds (review finding 1).
+#[tokio::test]
+async fn a_minimum_refusal_after_the_deposit_keeps_the_leg_open_for_an_operator() {
+    let refusal = "Kraken base volume 1.4 is below order minimum 1.5";
+    let finalizer = finalizer_with_trade_result(Err(CexBackendError::BelowMinimum(refusal.to_string())), 0);
+    let leg = leg_at_trade_step(&finalizer, None).await;
+
+    let progress = MultiVenueAdapter::advance(&finalizer, &leg, &NoopCheckpoint)
+        .await
+        .expect("a refusal with moved funds is leg progress");
+
+    assert_eq!(progress.status, VenueLegStatus::Running);
+    assert_eq!(progress.failure, None);
+    let retryable = progress.retryable_error.expect("the refusal spends the retry budget");
+    assert!(retryable.starts_with(refusal), "{retryable}");
+    assert!(retryable.contains("operator"), "{retryable}");
+}
+
 /// A connect failure never reached MEXC, so it must not be charged to the
 /// retry budget (liquidation 1625 parked this way).
 #[tokio::test]

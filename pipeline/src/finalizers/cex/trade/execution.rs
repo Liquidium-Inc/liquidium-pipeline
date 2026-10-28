@@ -37,6 +37,8 @@ where
     ///   soft target (`target_bps`) first, hard-cap fallback second.
     /// - `maybe_mark_trade_dust` stops execution when, after the leg's first fill,
     ///   the chunk and remainder notional are both below `cex_min_exec_usd`.
+    /// - after a fill, a last remainder the exchange refuses as below its
+    ///   order minimum also ends the leg as dust.
     /// - each accepted chunk is sent as an IOC limit order at the slippage cap
     ///   less the taker fee; after empty fills the limit widens in steps to
     ///   `max_widened_slippage_bps`.
@@ -118,7 +120,7 @@ where
 
             // The exchange enforces the limit with an IOC order. Only if the
             // exchange refuses IOC outright does the slice go out as a market order.
-            let fill_report = self
+            let sent = self
                 .backend
                 .execute_swap_detailed_with_options(
                     &leg.market,
@@ -134,7 +136,20 @@ where
                         }),
                     },
                 )
-                .await?;
+                .await;
+            let fill_report = match sent {
+                // No order can trade less than the exchange minimum, so the last
+                // remainder of a filled leg is dust. The refused order never went out.
+                Err(CexBackendError::BelowMinimum(refusal))
+                    if total_out > 0.0 && preview.chunk_in >= remaining_in - LIQUIDITY_EPS =>
+                {
+                    Self::clear_pending_trade_order(state);
+                    self.mark_exchange_minimum_dust(state, leg, remaining_in, &refusal)
+                        .await;
+                    break;
+                }
+                sent => sent?,
+            };
 
             Self::clear_pending_trade_order(state);
             if fill_report.input_consumed <= LIQUIDITY_EPS {
