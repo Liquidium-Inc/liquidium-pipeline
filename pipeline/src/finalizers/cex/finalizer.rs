@@ -128,13 +128,13 @@ const BRIDGED_DEPOSIT_FEE_COUNT: u8 = 1;
 const APPROVE_BUMP_BATCH_SIZE: u8 = 3;
 const APPROVE_BUMP_DELAY_MS: u64 = 300;
 const APPROVE_BUMP_BATCH_DELAY_SECS: u64 = 3;
-#[allow(dead_code)]
+#[cfg(test)]
 const DEFAULT_BUY_TRUNCATION_TRIGGER_RATIO: f64 = 0.25;
-#[allow(dead_code)]
+#[cfg(test)]
 const DEFAULT_BUY_INVERSE_OVERSPEND_BPS: u32 = 10;
-#[allow(dead_code)]
+#[cfg(test)]
 const DEFAULT_BUY_INVERSE_MAX_RETRIES: u32 = 1;
-#[allow(dead_code)]
+#[cfg(test)]
 const DEFAULT_BUY_INVERSE_ENABLED: bool = true;
 const DEFAULT_MAX_HOPS: usize = 2;
 const MAX_HOPS_CAP: usize = 4;
@@ -517,4 +517,4 @@ where
 
 #[cfg(test)]
 #[path = "tests/mod.rs"]
-mod tests;
+pub(super) mod tests;

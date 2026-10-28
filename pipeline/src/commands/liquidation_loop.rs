@@ -230,16 +230,10 @@ async fn init(
     let executor = Arc::new(executor);
 
     // One bridge for every exchange venue: they share its accounts, so they
-    // must share the registry of handles held on them.
-    let bridge = if config
-        .enabled_swap_venues
-        .iter()
-        .any(|venue| venue == MEXC_VENUE_ID || venue == KRAKEN_VENUE_ID)
-    {
-        Some(BridgeRuntime::build(&config, Arc::new(WalBridgeClaims::new(db.clone()))).await?)
-    } else {
-        None
-    };
+    // must share the registry of handles held on them. The first exchange builds it.
+    let bridge = tokio::sync::OnceCell::new();
+    let shared_bridge =
+        || bridge.get_or_try_init(|| BridgeRuntime::build(&config, Arc::new(WalBridgeClaims::new(db.clone()))));
 
     let mut venue_adapters: Vec<Arc<dyn MultiVenueAdapter>> = Vec::new();
     for venue_id in &config.enabled_swap_venues {
@@ -249,22 +243,10 @@ async fn init(
                     .clone()
                     .ok_or_else(|| "ICPSwap is enabled but its adapter was not initialized".to_string())?,
             ),
-            MEXC_VENUE_ID => venue_adapters.push(
-                build_mexc_finalizer(
-                    ctx.as_ref(),
-                    bridge.clone().ok_or_else(|| "MEXC is enabled but the bridge was not built".to_string())?,
-                )
-                .await?,
-            ),
-            KRAKEN_VENUE_ID => venue_adapters.push(
-                build_kraken_finalizer(
-                    ctx.as_ref(),
-                    bridge
-                        .clone()
-                        .ok_or_else(|| "Kraken is enabled but the bridge was not built".to_string())?,
-                )
-                .await?,
-            ),
+            MEXC_VENUE_ID => venue_adapters.push(build_mexc_finalizer(ctx.as_ref(), shared_bridge().await?.clone())?),
+            KRAKEN_VENUE_ID => {
+                venue_adapters.push(build_kraken_finalizer(ctx.as_ref(), shared_bridge().await?.clone())?)
+            }
             _ => return Err(format!("unsupported enabled swap venue `{venue_id}`")),
         }
     }

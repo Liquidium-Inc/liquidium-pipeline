@@ -115,7 +115,7 @@ pub enum KrakenApiError {
     Transport(String),
 }
 
-#[mockall::automock]
+#[cfg_attr(test, mockall::automock)]
 #[async_trait]
 pub trait KrakenApi: Send + Sync {
     async fn pairs(&self) -> Result<Vec<KrakenPair>, KrakenApiError>;

@@ -26,6 +26,8 @@ fn kraken_btc_codes_and_market_separators_are_canonical() {
     assert_eq!(api_asset("BTC"), "XBT");
     assert_eq!(normalize_market("xbt/usd"), "BTC_USD");
     assert_eq!(normalize_market("xxbt-usd"), "BTC_USD");
+    // One alias table serves the allowlist and Kraken's pair names.
+    assert_eq!(normalize_market("xeth/zusd"), "ETH_USD");
 }
 
 #[tokio::test]

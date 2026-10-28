@@ -1,6 +1,7 @@
 //! What the shared CEX step machine needs to know about one exchange. The
 //! exchange's API lives in its `CexBackend`; this holds only the machine's policy.
 use super::utils::{TradeLeg, mexc_special_trade_legs};
+use crate::finalizers::multi_venue::{KRAKEN_VENUE_ID, MEXC_VENUE_ID};
 
 /// The exchange-specific facts the step machine reads.
 #[derive(Debug, Clone, Copy)]
@@ -17,7 +18,7 @@ impl CexVenueProfile {
     /// ICP deposits so that the exchange notices them.
     pub fn mexc() -> Self {
         Self {
-            venue_id: "mexc",
+            venue_id: MEXC_VENUE_ID,
             name: "MEXC",
             special_trade_legs: Some(mexc_special_trade_legs),
             approval_bumps: true,
@@ -29,7 +30,7 @@ impl CexVenueProfile {
     /// order ids of at most 18 characters.
     pub fn kraken() -> Self {
         Self {
-            venue_id: "kraken",
+            venue_id: KRAKEN_VENUE_ID,
             name: "Kraken",
             special_trade_legs: None,
             approval_bumps: false,
@@ -60,17 +61,6 @@ impl CexVenueProfile {
     /// The longest client order id the exchange accepts.
     pub(super) fn client_order_id_max_len(&self) -> usize {
         self.client_order_id_max_len
-    }
-}
-
-#[cfg(test)]
-impl CexVenueProfile {
-    /// A venue that sends no approval bumps, as most exchanges do.
-    pub(super) fn without_approval_bumps(self) -> Self {
-        Self {
-            approval_bumps: false,
-            ..self
-        }
     }
 }
 

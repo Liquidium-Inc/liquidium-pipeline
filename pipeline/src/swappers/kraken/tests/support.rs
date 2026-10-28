@@ -26,7 +26,7 @@ pub(super) fn btc_usd_client(api: MockKrakenApi) -> KrakenClient {
     KrakenClient::with_api(Arc::new(api), vec!["BTC_USD".into()]).expect("a non-empty allowlist")
 }
 
-pub(super) fn level(price: i64, quantity: Decimal) -> KrakenBookLevel {
+fn level(price: i64, quantity: Decimal) -> KrakenBookLevel {
     KrakenBookLevel {
         price: Decimal::new(price, 0),
         quantity,

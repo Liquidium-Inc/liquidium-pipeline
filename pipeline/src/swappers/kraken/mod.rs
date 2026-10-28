@@ -7,7 +7,4 @@ mod rest;
 mod tests;
 mod trading;
 
-pub use api::{KrakenApi, KrakenApiError};
 pub use client::KrakenClient;
-pub(crate) use client::normalize_market;
-pub use rest::KrakenRestApi;

@@ -2,7 +2,7 @@
 //! live in `trading.rs` and deposits and withdrawals in `funding.rs`; this file
 //! holds the market allowlist and the cached metadata reads they share.
 
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 use async_trait::async_trait;
 use liquidium_pipeline_connectors::backend::cex_backend::{
@@ -18,14 +18,13 @@ use super::api::{
     KrakenApi, KrakenApiError, KrakenBook, KrakenDepositAddress, KrakenFundingMethod, KrakenPair,
     KrakenWithdrawalAddress,
 };
-use super::cache::MetadataCache;
+use super::cache::{MetadataCache, PairsByMarket};
 use super::rest::KrakenRestApi;
 
-#[derive(Clone)]
 pub struct KrakenClient {
     pub(super) api: Arc<dyn KrakenApi>,
-    cache: Arc<MetadataCache>,
-    allowed_pairs: Arc<Vec<String>>,
+    cache: MetadataCache,
+    allowed_pairs: Vec<String>,
 }
 
 impl KrakenClient {
@@ -35,7 +34,7 @@ impl KrakenClient {
         Self::with_api(Arc::new(KrakenRestApi::new(api_key, api_secret)), allowed_pairs)
     }
 
-    pub fn with_api(api: Arc<dyn KrakenApi>, allowed_pairs: Vec<String>) -> Result<Self, String> {
+    pub(super) fn with_api(api: Arc<dyn KrakenApi>, allowed_pairs: Vec<String>) -> Result<Self, String> {
         let allowed_pairs = allowed_pairs
             .iter()
             .map(|pair| normalize_market(pair))
@@ -48,15 +47,31 @@ impl KrakenClient {
         }
         Ok(Self {
             api,
-            cache: Arc::default(),
-            allowed_pairs: Arc::new(allowed_pairs),
+            cache: MetadataCache::default(),
+            allowed_pairs,
         })
     }
 
-    async fn all_pairs(&self) -> Result<Vec<KrakenPair>, String> {
+    /// The allowed markets as `BASE_QUOTE`, with Kraken's own spellings resolved.
+    pub fn allowed_pairs(&self) -> &[String] {
+        &self.allowed_pairs
+    }
+
+    /// Kraken's pairs for the allowed markets only, so a lookup copies no
+    /// part of the full pair list.
+    async fn pairs_by_market(&self) -> Result<PairsByMarket, String> {
         self.cache
             .pairs
-            .get_or_load((), async || self.api.pairs().await)
+            .get_or_load((), async || {
+                let mut by_market: HashMap<String, Vec<KrakenPair>> = HashMap::new();
+                for pair in self.api.pairs().await? {
+                    let market = format!("{}_{}", pair.base, pair.quote);
+                    if self.allowed_pairs.contains(&market) {
+                        by_market.entry(market).or_default().push(pair);
+                    }
+                }
+                Ok(Arc::new(by_market))
+            })
             .await
             .map_err(|error| error.to_string())
     }
@@ -104,18 +119,16 @@ impl KrakenClient {
         if !self.allowed_pairs.contains(&market) {
             return Err(format!("Kraken pair {market} is not allowed"));
         }
-        let matches = self
-            .all_pairs()
-            .await?
-            .into_iter()
-            .filter(|pair| format!("{}_{}", pair.base, pair.quote) == market)
-            .collect::<Vec<_>>();
-        match matches.as_slice() {
-            [] => Err(format!("Kraken pair {market} is unavailable")),
-            [pair] if !pair.online => Err(format!("Kraken pair {market} is not online")),
-            [pair] => Ok(pair.clone()),
-            _ => Err(format!("Kraken pair {market} is ambiguous")),
+        let candidates = self.pairs_by_market().await?.get(&market).cloned().unwrap_or_default();
+        let pair = exactly_one(
+            candidates,
+            || format!("Kraken pair {market} is unavailable"),
+            || format!("Kraken pair {market} is ambiguous"),
+        )?;
+        if !pair.online {
+            return Err(format!("Kraken pair {market} is not online"));
         }
+        Ok(pair)
     }
 
     pub(super) async fn book(&self, pair: &KrakenPair, depth: u32) -> Result<KrakenBook, String> {
@@ -185,19 +198,42 @@ impl CexBackend for KrakenClient {
     }
 }
 
-/// `BASE_QUOTE` in upper case, with Kraken's XBT spelled BTC.
-pub(crate) fn normalize_market(market: &str) -> String {
+/// `BASE_QUOTE` in upper case, each symbol by its common name (XBT is BTC).
+pub(super) fn normalize_market(market: &str) -> String {
     market
         .trim()
         .to_ascii_uppercase()
         .replace(['/', '-'], "_")
         .split('_')
-        .map(|symbol| match symbol {
-            "XBT" | "XXBT" => "BTC",
-            value => value,
-        })
+        .map(canonical_symbol)
         .collect::<Vec<_>>()
         .join("_")
+}
+
+/// The common name of a Kraken symbol: Kraken prefixes some legacy codes.
+pub(super) fn canonical_symbol(symbol: &str) -> String {
+    match symbol.trim().to_ascii_uppercase().as_str() {
+        "XBT" | "XXBT" => "BTC".to_string(),
+        "XDG" | "XXDG" => "DOGE".to_string(),
+        "XETH" => "ETH".to_string(),
+        "ZUSD" => "USD".to_string(),
+        "ZEUR" => "EUR".to_string(),
+        "ZGBP" => "GBP".to_string(),
+        "ZJPY" => "JPY".to_string(),
+        "ZCAD" => "CAD".to_string(),
+        "ZCHF" => "CHF".to_string(),
+        "ZAUD" => "AUD".to_string(),
+        value => value.to_string(),
+    }
+}
+
+/// The one item in `items`, or the error for none or for several.
+pub(super) fn exactly_one<T, E>(mut items: Vec<T>, none: impl FnOnce() -> E, many: impl FnOnce() -> E) -> Result<T, E> {
+    match items.len() {
+        0 => Err(none()),
+        1 => Ok(items.remove(0)),
+        _ => Err(many()),
+    }
 }
 
 /// Kraken's asset code for a symbol.

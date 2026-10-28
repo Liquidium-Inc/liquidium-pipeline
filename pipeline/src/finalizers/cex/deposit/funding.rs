@@ -51,7 +51,7 @@ where
                 return Ok(());
             }
 
-            if self.bumps_approvals(&state.deposit.deposit_asset, false) {
+            if self.bumps_approvals(&state.deposit.deposit_asset) {
                 let approved = self
                     .maybe_bump_approval(&state.liq_id, &state.deposit.deposit_asset)
                     .await;
@@ -114,7 +114,7 @@ where
         let (transfer_value, transfer_amount) = Self::compute_fee_adjusted_deposit_transfer(
             &state.deposit.deposit_asset,
             &state.size_in,
-            self.deposit_fee_count(&state.deposit.deposit_asset, false),
+            self.deposit_fee_count(&state.deposit.deposit_asset),
         )?;
         let destination = Self::direct_deposit_destination_account(
             &state.deposit.deposit_asset,
@@ -184,19 +184,18 @@ where
         })
     }
 
-    /// Whether a deposit of this asset sends approval bumps: only a direct
-    /// non-native ICP deposit to a venue that needs them.
-    fn bumps_approvals(&self, deposit_asset: &ChainToken, bridged: bool) -> bool {
+    /// Whether a direct deposit of this asset sends approval bumps: only a
+    /// non-native ICP deposit to a venue that needs them. A bridged deposit sends none.
+    fn bumps_approvals(&self, deposit_asset: &ChainToken) -> bool {
         self.profile.approval_bumps()
-            && !bridged
             && matches!(deposit_asset, ChainToken::Icp { .. })
             && !Self::is_native_icp_token(deposit_asset)
     }
 
-    /// Ledger fees held back from a deposit transfer: the transfer itself, plus
-    /// the approval bumps when the deposit sends them.
-    pub(in crate::finalizers::cex) fn deposit_fee_count(&self, deposit_asset: &ChainToken, bridged: bool) -> u8 {
-        if self.bumps_approvals(deposit_asset, bridged) {
+    /// Ledger fees held back from a direct deposit transfer: the transfer
+    /// itself, plus the approval bumps when the deposit sends them.
+    pub(in crate::finalizers::cex) fn deposit_fee_count(&self, deposit_asset: &ChainToken) -> u8 {
+        if self.bumps_approvals(deposit_asset) {
             1 + APPROVE_BUMP_MAX_COUNT
         } else {
             1

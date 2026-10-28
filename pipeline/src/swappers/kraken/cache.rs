@@ -5,13 +5,16 @@
 use std::{
     collections::HashMap,
     hash::Hash,
-    sync::Mutex,
+    sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 
 use super::api::{KrakenApiError, KrakenDepositAddress, KrakenFundingMethod, KrakenPair, KrakenWithdrawalAddress};
 
 const METADATA_TTL: Duration = Duration::from_secs(5 * 60);
+
+/// Kraken's pairs for the allowed markets, by `BASE_QUOTE` market.
+pub(super) type PairsByMarket = Arc<HashMap<String, Vec<KrakenPair>>>;
 
 pub(super) struct TtlCache<K, V> {
     entries: Mutex<HashMap<K, (Instant, V)>>,
@@ -48,7 +51,7 @@ impl<K: Eq + Hash, V: Clone> TtlCache<K, V> {
 
 #[derive(Default)]
 pub(super) struct MetadataCache {
-    pub(super) pairs: TtlCache<(), Vec<KrakenPair>>,
+    pub(super) pairs: TtlCache<(), PairsByMarket>,
     pub(super) deposit_methods: TtlCache<String, Vec<KrakenFundingMethod>>,
     pub(super) deposit_addresses: TtlCache<(String, String), Vec<KrakenDepositAddress>>,
     pub(super) withdrawal_methods: TtlCache<String, Vec<KrakenFundingMethod>>,

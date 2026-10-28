@@ -30,6 +30,7 @@ use super::api::{
     KrakenOrderRequest, KrakenOrderStatus, KrakenPair, KrakenSide, KrakenTransferStatus, KrakenWithdrawal,
     KrakenWithdrawalAddress,
 };
+use super::client::canonical_symbol;
 
 /// Only a failed connection proves the request never left. A timeout or a
 /// broken response may come after Kraken acted.
@@ -126,22 +127,6 @@ fn to_kraken_order(order: kraken_async_rs::response_types::Order) -> KrakenOrder
         volume_executed: order.volume_executed,
         cost: order.cost,
         fee: order.fee,
-    }
-}
-
-fn canonical_symbol(symbol: &str) -> String {
-    match symbol.trim().to_ascii_uppercase().as_str() {
-        "XBT" | "XXBT" => "BTC".to_string(),
-        "XDG" | "XXDG" => "DOGE".to_string(),
-        "XETH" => "ETH".to_string(),
-        "ZUSD" => "USD".to_string(),
-        "ZEUR" => "EUR".to_string(),
-        "ZGBP" => "GBP".to_string(),
-        "ZJPY" => "JPY".to_string(),
-        "ZCAD" => "CAD".to_string(),
-        "ZCHF" => "CHF".to_string(),
-        "ZAUD" => "AUD".to_string(),
-        value => value.to_string(),
     }
 }
 

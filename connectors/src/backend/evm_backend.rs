@@ -173,11 +173,26 @@ fn note_broadcast(marks: &mut NonceMarks, signer: NonceKey, nonce: u64, now: Ins
 
 pub struct EvmBackendImpl<P> {
     pub provider: P,
+    /// Fixed for a provider, so it is read once.
+    chain_id: tokio::sync::OnceCell<u64>,
 }
 
 impl<P: Provider<AnyNetwork>> EvmBackendImpl<P> {
     pub fn new(provider: P) -> Self {
-        Self { provider }
+        Self {
+            provider,
+            chain_id: tokio::sync::OnceCell::new(),
+        }
+    }
+
+    async fn chain_id(&self) -> Result<u64, String> {
+        self.chain_id
+            .get_or_try_init(|| async {
+                let chain_id = self.provider.get_chain_id().await;
+                chain_id.map_err(|e| format!("chain id read failed: {e}"))
+            })
+            .await
+            .copied()
     }
 }
 
@@ -210,24 +225,21 @@ where
         request: <AnyNetwork as Network>::TransactionRequest,
     ) -> Result<SignedEvmTx, String> {
         let from = self.provider.default_signer_address();
-        let (chain_id, fees) = tokio::try_join!(
+        let (chain_id, fees) = tokio::try_join!(self.chain_id(), async {
+            let fees = self.provider.estimate_eip1559_fees().await;
+            fees.map_err(|e| format!("fee estimate failed: {e}"))
+        })?;
+        let mut request = request.with_from(from).with_chain_id(chain_id);
+        let (estimate, node_count) = tokio::try_join!(
             async {
-                let chain_id = self.provider.get_chain_id().await;
-                chain_id.map_err(|e| format!("chain id read failed: {e}"))
+                let estimate = self.provider.estimate_gas(request.clone()).await;
+                estimate.map_err(|e| format!("gas estimate failed: {e}"))
             },
             async {
-                let fees = self.provider.estimate_eip1559_fees().await;
-                fees.map_err(|e| format!("fee estimate failed: {e}"))
+                let node_count = self.provider.get_transaction_count(from).pending().await;
+                node_count.map_err(|e| format!("nonce read failed for {from}: {e}"))
             },
         )?;
-        let mut request = request.with_from(from).with_chain_id(chain_id);
-        let estimate = self
-            .provider
-            .estimate_gas(request.clone())
-            .await
-            .map_err(|e| format!("gas estimate failed: {e}"))?;
-        let node_count = self.provider.get_transaction_count(from).pending().await;
-        let node_count = node_count.map_err(|e| format!("nonce read failed for {from}: {e}"))?;
         let nonce = next_nonce(
             &nonce_marks().lock().expect("nonce marks lock"),
             (chain_id, from),
@@ -260,11 +272,14 @@ where
             Err(error) => Broadcast::Unknown(error.to_string()),
         };
         // A node may hold the transaction, so the next send takes a later nonce.
-        if !matches!(broadcast, Broadcast::Rejected(_))
-            && let Ok(chain_id) = self.provider.get_chain_id().await
-        {
-            let mut marks = nonce_marks().lock().expect("nonce marks lock");
-            note_broadcast(&mut marks, (chain_id, tx.from), tx.nonce, Instant::now());
+        if !matches!(broadcast, Broadcast::Rejected(_)) {
+            match self.chain_id().await {
+                Ok(chain_id) => {
+                    let mut marks = nonce_marks().lock().expect("nonce marks lock");
+                    note_broadcast(&mut marks, (chain_id, tx.from), tx.nonce, Instant::now());
+                }
+                Err(error) => log::warn!("nonce {} of {} is not marked: {error}", tx.nonce, tx.from),
+            }
         }
         broadcast
     }

@@ -12,7 +12,7 @@ use liquidium_pipeline_connectors::backend::cex_backend::{
 use rust_decimal::Decimal;
 
 use super::api::{KrakenApiError, KrakenFundingMethod, KrakenTransferStatus};
-use super::client::{KrakenClient, api_asset, decimal_f64, to_decimal};
+use super::client::{KrakenClient, api_asset, decimal_f64, exactly_one, to_decimal};
 
 /// Withdrawals read per status poll before the whole history is read.
 pub(super) const WITHDRAWAL_RECENT_PAGE: i64 = 20;
@@ -37,15 +37,16 @@ impl KrakenClient {
             .deposit_addresses(&api_asset, &method.method)
             .await
             .map_err(unavailable)?;
-        match addresses.as_slice() {
-            [address] => Ok((method, address.address.clone(), address.tag.clone())),
-            [] => Err(FundingRouteError::Unsupported(format!(
-                "Kraken has no {asset} deposit address for network {network}"
-            ))),
-            _ => Err(FundingRouteError::Unsupported(format!(
-                "Kraken returned several {asset} deposit addresses for network {network}"
-            ))),
-        }
+        let address = exactly_one(
+            addresses,
+            || FundingRouteError::Unsupported(format!("Kraken has no {asset} deposit address for network {network}")),
+            || {
+                FundingRouteError::Unsupported(format!(
+                    "Kraken returned several {asset} deposit addresses for network {network}"
+                ))
+            },
+        )?;
+        Ok((method, address.address, address.tag))
     }
 
     /// The withdrawal method, and the key of the verified address `destination`.
@@ -60,15 +61,20 @@ impl KrakenClient {
             .into_iter()
             .filter(|(address, _)| addresses_match(address, destination))
             .collect::<Vec<_>>();
-        match matches.as_slice() {
-            [(_, key)] => Ok((method, key.clone())),
-            [] => Err(FundingRouteError::Unsupported(format!(
-                "{destination} is not a verified Kraken {asset} withdrawal address for network {network}"
-            ))),
-            _ => Err(FundingRouteError::Unsupported(format!(
-                "Kraken has several verified {asset} withdrawal addresses matching {destination}"
-            ))),
-        }
+        let (_, key) = exactly_one(
+            matches,
+            || {
+                FundingRouteError::Unsupported(format!(
+                    "{destination} is not a verified Kraken {asset} withdrawal address for network {network}"
+                ))
+            },
+            || {
+                FundingRouteError::Unsupported(format!(
+                    "Kraken has several verified {asset} withdrawal addresses matching {destination}"
+                ))
+            },
+        )?;
+        Ok((method, key))
     }
 
     /// The withdrawal method for an asset on a network, with its verified
@@ -253,13 +259,29 @@ pub(super) fn addresses_match(stored: &str, destination: &str) -> bool {
     stored == destination
 }
 
-/// Kraken's network label for a chain this pipeline names, when it has one.
-/// A method name cannot identify a chain: `Tether USD (SPL)` contains "eth".
-fn kraken_network_label(requested: &str) -> Option<&'static str> {
-    match requested.trim().to_ascii_uppercase().as_str() {
-        "ETH" | "ETHEREUM" | "ERC20" => Some("ethereum"),
-        "BTC" | "BITCOIN" => Some("bitcoin"),
-        _ => None,
+/// A chain this pipeline names that Kraken labels. A method name cannot
+/// identify a chain: `Tether USD (SPL)` contains "eth".
+#[derive(Clone, Copy)]
+enum KnownChain {
+    Ethereum,
+    Bitcoin,
+}
+
+impl KnownChain {
+    fn from_network(requested: &str) -> Option<Self> {
+        match requested.trim().to_ascii_uppercase().as_str() {
+            "ETH" | "ETHEREUM" | "ERC20" => Some(Self::Ethereum),
+            "BTC" | "BITCOIN" => Some(Self::Bitcoin),
+            _ => None,
+        }
+    }
+
+    /// Kraken's network label for the chain.
+    fn kraken_label(self) -> &'static str {
+        match self {
+            Self::Ethereum => "ethereum",
+            Self::Bitcoin => "bitcoin",
+        }
     }
 }
 
@@ -283,22 +305,21 @@ const OTHER_CHAIN_QUALIFIERS: [&str; 12] = [
 /// no network. Each accepted spelling is listed, and anything else does not match.
 fn method_name_names_chain(requested: &str, method_name: &str) -> bool {
     let name = method_name.to_ascii_lowercase();
-    match kraken_network_label(requested) {
+    match KnownChain::from_network(requested) {
         // Assets whose chain this pipeline does not translate, such as ICP.
         None => name.contains(&requested.to_ascii_lowercase()),
-        Some("ethereum") => {
+        Some(KnownChain::Ethereum) => {
             let ethereum_spelling = name.starts_with("ether") || name.contains("erc20") || name.contains("ethereum");
             ethereum_spelling && !OTHER_CHAIN_QUALIFIERS.iter().any(|other| name.contains(other))
         }
-        Some("bitcoin") => name.contains("bitcoin") && !name.contains("lightning") && !name.contains("kbtc"),
-        Some(_) => false,
+        Some(KnownChain::Bitcoin) => name.contains("bitcoin") && !name.contains("lightning") && !name.contains("kbtc"),
     }
 }
 
 fn network_matches(requested: &str, method: &KrakenFundingMethod) -> bool {
-    match (kraken_network_label(requested), method.network.as_deref()) {
+    match (KnownChain::from_network(requested), method.network.as_deref()) {
         // The reported network identifies the chain exactly.
-        (Some(expected), Some(network)) => network.trim().eq_ignore_ascii_case(expected),
+        (Some(chain), Some(network)) => network.trim().eq_ignore_ascii_case(chain.kraken_label()),
         (None, Some(network)) => network.to_ascii_lowercase().contains(&requested.to_ascii_lowercase()),
         (_, None) => method_name_names_chain(requested, &method.method),
     }
@@ -314,13 +335,9 @@ pub(super) fn unique_method(
         .into_iter()
         .filter(|method| network_matches(network, method))
         .collect::<Vec<_>>();
-    match matches.as_slice() {
-        [method] => Ok(method.clone()),
-        [] => Err(format!(
-            "Kraken has no {operation} method for {asset} on network {network}"
-        )),
-        _ => Err(format!(
-            "Kraken has several {operation} methods for {asset} on network {network}"
-        )),
-    }
+    exactly_one(
+        matches,
+        || format!("Kraken has no {operation} method for {asset} on network {network}"),
+        || format!("Kraken has several {operation} methods for {asset} on network {network}"),
+    )
 }

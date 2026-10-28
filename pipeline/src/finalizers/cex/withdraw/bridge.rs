@@ -482,14 +482,10 @@ where
             return Ok(());
         }
         state.withdraw.bridge.withdraw_bridge_polled_at_ts = Some(now_ts());
-        let status = match bridge.backend.get_bridge_status(&bridge_id).await {
-            Ok(status) => status,
+        let (status, unreadable) = match bridge.backend.get_bridge_status(&bridge_id).await {
+            Ok(status) => (status, None),
             // A failed read says nothing about the credit, so it is a wait, not a strike.
-            Err(BridgeError::Unreadable(error)) => {
-                let submitted_at = state.withdraw.bridge.withdraw_bridge_submitted_at_ts;
-                state.step = CexStep::WithdrawPending;
-                return Self::note_bridge_wait(state, submitted_at, &bridge_id, Some(&error));
-            }
+            Err(BridgeError::Unreadable(error)) => (BridgeStatus::Pending, Some(error)),
             Err(error) => return Err(error.into()),
         };
         match status {
@@ -528,7 +524,7 @@ where
             BridgeStatus::Pending | BridgeStatus::Unknown => {
                 let submitted_at = state.withdraw.bridge.withdraw_bridge_submitted_at_ts;
                 state.step = CexStep::WithdrawPending;
-                Self::note_bridge_wait(state, submitted_at, &bridge_id, None)
+                Self::note_bridge_wait(state, submitted_at, &bridge_id, unreadable.as_deref())
             }
             // The ckSOL minter dropped its sweep and released the deposit
             // address. The funds stay there, and a new notice queues them again.

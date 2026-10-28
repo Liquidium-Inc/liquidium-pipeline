@@ -8,11 +8,10 @@ use liquidium_pipeline_connectors::backend::cex_backend::{
     CexBackendError, OrderBook, OrderBookLevel, SwapExecutionOptions, SwapFillReport,
 };
 use log::info;
-use rust_decimal::{Decimal, RoundingStrategy, prelude::ToPrimitive};
+use rust_decimal::{Decimal, RoundingStrategy};
 
 use super::api::{
-    KrakenApiError, KrakenBook, KrakenBookLevel, KrakenOrder, KrakenOrderRequest, KrakenOrderStatus, KrakenPair,
-    KrakenSide,
+    KrakenApiError, KrakenBookLevel, KrakenOrder, KrakenOrderRequest, KrakenOrderStatus, KrakenPair, KrakenSide,
 };
 use super::client::{KrakenClient, decimal_f64, to_decimal};
 use crate::swappers::model::ioc_limit_price;
@@ -21,8 +20,8 @@ pub(super) const ORDER_POLL_ATTEMPTS: usize = 20;
 const ORDER_POLL_INTERVAL: Duration = Duration::from_millis(500);
 const ORDERBOOK_DEPTH: u32 = 100;
 
-/// Measured on the live account: every crypto pair charged 80 bps, stablecoin
-/// pairs 20. A preview that reads this errs high, which refuses no safe trade.
+/// Measured on the live account: crypto pairs charged 80 bps, stablecoin pairs
+/// 20. Erring high keeps previews safe, but it narrows a stablecoin pair's IOC price room by 60 bps.
 pub(super) const TAKER_FEE_BPS: f64 = 80.0;
 
 /// One hundredth of a basis point: a reported fill stays this far under what
@@ -78,10 +77,7 @@ impl KrakenClient {
 
         let amount = to_decimal(amount_in, "order amount")?;
         let limit_price = ioc_limit_price(side == KrakenSide::Sell, limit, None, pair.price_decimals)?;
-        let volume = match side {
-            KrakenSide::Sell => sell_volume(&pair, &self.book(&pair, ORDERBOOK_DEPTH).await?, amount)?,
-            KrakenSide::Buy => buy_volume(&pair, amount, limit_price)?,
-        };
+        let volume = order_volume(&pair, side, amount, limit_price)?;
 
         let request = KrakenOrderRequest {
             pair: pair.api_name.clone(),
@@ -154,62 +150,34 @@ fn truncate(value: Decimal, decimals: u32) -> Decimal {
     value.round_dp_with_strategy(decimals, RoundingStrategy::ToZero)
 }
 
-fn below_minimum(message: String) -> CexBackendError {
-    CexBackendError::BelowMinimum(message)
-}
-
-/// A sell spends the base volume itself, cut to the pair's lot precision.
-fn sell_volume(pair: &KrakenPair, book: &KrakenBook, amount: Decimal) -> Result<Decimal, CexBackendError> {
-    let volume = truncate(amount, pair.lot_decimals);
+/// The base volume of an order, cut to the pair's lot precision. Kraken
+/// checks its cost minimum on volume times the limit price.
+fn order_volume(
+    pair: &KrakenPair,
+    side: KrakenSide,
+    amount: Decimal,
+    limit_price: Decimal,
+) -> Result<Decimal, CexBackendError> {
+    // A sell spends base. A buy spends quote, and every unit fills at or under
+    // the limit, so `budget / limit` never spends more than the budget.
+    let volume = match side {
+        KrakenSide::Sell => truncate(amount, pair.lot_decimals),
+        KrakenSide::Buy => truncate(amount / limit_price, pair.lot_decimals),
+    };
     if volume < pair.order_min {
-        return Err(below_minimum(format!(
+        return Err(CexBackendError::BelowMinimum(format!(
             "Kraken base volume {volume} is below order minimum {}",
             pair.order_min
         )));
     }
-    let estimated_output = estimate_sell_output(book, volume)?;
-    if estimated_output < pair.cost_min {
-        return Err(below_minimum(format!(
-            "Kraken sell estimate {estimated_output} is below cost minimum {}",
+    let cost = volume * limit_price;
+    if cost < pair.cost_min {
+        return Err(CexBackendError::BelowMinimum(format!(
+            "Kraken order cost {cost} is below cost minimum {}",
             pair.cost_min
         )));
     }
     Ok(volume)
-}
-
-/// A buy turns its quote budget into base volume. Every unit fills at or
-/// under the limit, so `budget / limit` never spends more than the budget.
-fn buy_volume(pair: &KrakenPair, budget: Decimal, limit_price: Decimal) -> Result<Decimal, CexBackendError> {
-    if budget < pair.cost_min {
-        return Err(below_minimum(format!(
-            "Kraken quote budget {budget} is below cost minimum {}",
-            pair.cost_min
-        )));
-    }
-    let volume = truncate(budget / limit_price, pair.lot_decimals);
-    if volume < pair.order_min {
-        return Err(below_minimum(format!(
-            "Kraken base volume {volume} is below order minimum {}",
-            pair.order_min
-        )));
-    }
-    Ok(volume)
-}
-
-/// The quote a sell of `base_volume` gets from the bids. A price at or below
-/// zero is not a price, so such a level counts for nothing.
-pub(super) fn estimate_sell_output(book: &KrakenBook, base_volume: Decimal) -> Result<Decimal, String> {
-    let mut remaining = base_volume;
-    let mut value = Decimal::ZERO;
-    for level in book.bids.iter().filter(|level| level.price > Decimal::ZERO) {
-        let take = remaining.min(level.quantity);
-        value += take * level.price;
-        remaining -= take;
-        if remaining <= Decimal::ZERO {
-            return Ok(value);
-        }
-    }
-    Err("not enough Kraken bid liquidity".to_string())
 }
 
 fn convert_levels(levels: Vec<KrakenBookLevel>) -> Result<Vec<OrderBookLevel>, String> {
@@ -247,9 +215,9 @@ pub(super) fn fill_report(side: KrakenSide, order: &KrakenOrder) -> Result<SwapF
         .unwrap_or(Decimal::ZERO);
     Ok(SwapFillReport {
         input_consumed: decimal_f64(consumed, "order input")?,
-        output_received: (received - fee_in_received - rounding_margin)
-            .max(Decimal::ZERO)
-            .to_f64()
-            .ok_or_else(|| "Kraken order output cannot be represented as f64".to_string())?,
+        output_received: decimal_f64(
+            (received - fee_in_received - rounding_margin).max(Decimal::ZERO),
+            "order output",
+        )?,
     })
 }

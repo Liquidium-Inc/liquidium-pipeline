@@ -281,10 +281,8 @@ where
             .as_ref()
             .ok_or_else(|| "missing liquidation_result in receipt".to_string())?;
         let liq_id = liq.id;
-        // A row whose collateral settled at once comes straight here, so this
-        // read is the only one that can see its pending change land.
-        let change_pending = matches!(liq.change_tx.status, TransferStatus::Pending);
-        if !matches!(liq.collateral_tx.status, TransferStatus::Success) || change_pending {
+        let refreshed = !matches!(liq.collateral_tx.status, TransferStatus::Success);
+        if refreshed {
             self.refresh_liquidation(&row.id, liq_id, &mut receipt).await;
         }
 
@@ -313,6 +311,8 @@ where
         );
 
         if receipt.request.swap_args.is_none() {
+            self.refresh_pending_change(&row.id, liq_id, &mut receipt, refreshed)
+                .await;
             let result = FinalizerResult::finished_without_swap(Some("none".to_string()), None);
             let write = wal_mark_succeeded(&*self.wal, &row.id).await;
             return Ok(published(write, liq_id, result, receipt));
@@ -335,12 +335,32 @@ where
         if self.retry_not_due(row, liq_id) {
             return Ok(None);
         }
+        self.refresh_pending_change(&row.id, liq_id, &mut receipt, refreshed)
+            .await;
 
         wal_mark_inflight(&*self.wal, &row.id).await?;
         Ok(match self.run_finalizer(liq_id, &receipt).await {
             Ok(result) => self.handle_result(row, liq_id, result, receipt).await,
             Err(error) => self.handle_error(row, liq_id, error, receipt).await,
         })
+    }
+
+    /// A row whose collateral settled at once is read only here, so this is where
+    /// its pending change can land. It runs only for a row this cycle works.
+    async fn refresh_pending_change(
+        &self,
+        row_id: &str,
+        liq_id: u128,
+        receipt: &mut ExecutionReceipt,
+        refreshed: bool,
+    ) {
+        let change_pending = receipt
+            .liquidation_result
+            .as_ref()
+            .is_some_and(|liq| matches!(liq.change_tx.status, TransferStatus::Pending));
+        if change_pending && !refreshed {
+            self.refresh_liquidation(row_id, liq_id, receipt).await;
+        }
     }
 
     /// Asks the pool again while the collateral transfer is open, and saves a

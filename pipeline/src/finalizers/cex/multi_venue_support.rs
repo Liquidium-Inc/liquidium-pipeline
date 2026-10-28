@@ -360,7 +360,7 @@ where
             let (_, executable_pay) = Self::compute_fee_adjusted_deposit_transfer(
                 &state.deposit.deposit_asset,
                 &state.size_in,
-                self.deposit_fee_count(&state.deposit.deposit_asset, false),
+                self.deposit_fee_count(&state.deposit.deposit_asset),
             )
             .map_err(|error| error.to_string())?;
             return Ok(executable_pay.to_f64());

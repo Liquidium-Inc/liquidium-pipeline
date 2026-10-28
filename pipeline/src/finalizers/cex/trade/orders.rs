@@ -75,9 +75,11 @@ where
 
         let max_len = self.profile.client_order_id_max_len();
         if sanitized.len() > max_len {
-            // A cap under 32 keeps the whole 64-bit hash (18 characters), so ids stay distinct.
+            // A short cap keeps as much of the 64-bit hash as fits (all of it at
+            // 18 characters), so ids stay distinct.
             if max_len < 32 {
-                return format!("lq{:016x}", super::super::utils::fnv1a_64(&sanitized));
+                let hash = format!("{:016x}", super::super::utils::fnv1a_64(&sanitized));
+                return format!("lq{}", &hash[..hash.len().min(max_len.saturating_sub(2))]);
             }
             let hash = Self::stable_hash_6hex(&sanitized);
             sanitized.truncate(max_len - 7);

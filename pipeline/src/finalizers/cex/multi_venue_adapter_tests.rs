@@ -14,15 +14,15 @@ use num_traits::ToPrimitive;
 use super::*;
 use crate::{
     finalizers::{
-        cex::state::CexRouteLeg,
-        multi_venue::{MultiVenueAdapter, VenueLegCheckpoint, VenueLegProgress, VenuePlanningContext},
+        cex::{finalizer::tests::support::free_withdrawals, state::CexRouteLeg},
+        multi_venue::{MEXC_VENUE_ID, MultiVenueAdapter, VenueLegCheckpoint, VenueLegProgress, VenuePlanningContext},
     },
     persistance::{VenueExecutionState, VenueLegFailure, VenueLegQuote, VenueLegState, VenueLegStatus},
     swappers::model::SwapRequest,
 };
 
 /// The venue id the MEXC profile writes into saved leg state.
-const VENUE_ID: &str = "mexc";
+const VENUE_ID: &str = MEXC_VENUE_ID;
 
 struct NoopCheckpoint;
 
@@ -66,15 +66,8 @@ fn request(raw_pay: u64) -> SwapRequest {
         receive_asset: receive.asset_id(),
         receive_address: None,
         max_slippage_bps: Some(100),
-        venue_hint: Some("mexc".to_string()),
+        venue_hint: Some(VENUE_ID.to_string()),
     }
-}
-
-/// MEXC withdrawals with no fee and no minimum, on a route MEXC accepts.
-fn free_withdrawals(cex: &mut MockCexBackend) {
-    cex.expect_get_withdraw_terms()
-        .returning(|_, _| Ok(WithdrawTerms { fee: 0.0, minimum: 0.0 }));
-    cex.expect_check_funding_route().returning(|_| Ok(()));
 }
 
 fn finalizer() -> CexVenueFinalizer<MockCexBackend> {
@@ -204,7 +197,7 @@ fn finalizer_with_retryable_deposit_error() -> CexVenueFinalizer<MockCexBackend>
 fn leg_from_preview(preview: VenueRoutePreview) -> VenueLegState {
     VenueLegState {
         leg_id: "mexc-leg-0".to_string(),
-        venue_id: "mexc".to_string(),
+        venue_id: VENUE_ID.to_string(),
         request: preview.request,
         quote: VenueLegQuote {
             pay_amount: ChainTokenAmount::from_raw(pay_token(), preview.quote.pay_amount),
@@ -236,7 +229,7 @@ async fn preview_uses_the_exact_leg_allocation_and_persists_the_route() {
     assert!(preview.conservative_receive.value <= preview.quote.receive_amount);
     let execution = preview
         .initial_execution_state
-        .decode::<CexVenueExecutionState>("mexc")
+        .decode::<CexVenueExecutionState>(VENUE_ID)
         .expect("state should decode")
         .expect("state should be MEXC");
     assert_eq!(execution.cex.size_in, request.pay_amount);
@@ -322,7 +315,7 @@ async fn preview_persists_the_per_leg_receive_address() {
         .expect("MEXC preview should succeed");
     let execution = preview
         .initial_execution_state
-        .decode::<CexVenueExecutionState>("mexc")
+        .decode::<CexVenueExecutionState>(VENUE_ID)
         .expect("state should decode")
         .expect("state should be MEXC");
 
@@ -462,7 +455,7 @@ async fn first_advance_only_opens_the_parent_persistence_gate() {
         .expect("gate transition should succeed");
     let execution = progress
         .execution
-        .decode::<CexVenueExecutionState>("mexc")
+        .decode::<CexVenueExecutionState>(VENUE_ID)
         .expect("state should decode")
         .expect("state should be MEXC");
 
@@ -1029,12 +1022,12 @@ async fn completed_leg_returns_a_result_without_parent_wal_access() {
     let mut leg = leg_from_preview(preview);
     let mut execution = leg
         .execution
-        .decode::<CexVenueExecutionState>("mexc")
+        .decode::<CexVenueExecutionState>(VENUE_ID)
         .expect("state should decode")
         .expect("state should be MEXC");
     execution.cex.step = CexStep::Completed;
     execution.cex.withdraw.size_out = Some(ChainTokenAmount::from_raw(receive_token(), Nat::from(10_000_000u64)));
-    leg.execution = VenueExecutionState::new("mexc", &execution).expect("state should encode");
+    leg.execution = VenueExecutionState::new(VENUE_ID, &execution).expect("state should encode");
 
     let progress = MultiVenueAdapter::advance(&finalizer, &leg, &NoopCheckpoint)
         .await
@@ -1072,18 +1065,18 @@ async fn recover_accepts_each_durable_pending_reconciliation_phase() {
         let mut leg = leg_from_preview(preview);
         let mut execution = leg
             .execution
-            .decode::<CexVenueExecutionState>("mexc")
+            .decode::<CexVenueExecutionState>(VENUE_ID)
             .expect("state should decode")
             .expect("state should be MEXC");
         execution.cex.step = pending_step;
-        leg.execution = VenueExecutionState::new("mexc", &execution).expect("state should encode");
+        leg.execution = VenueExecutionState::new(VENUE_ID, &execution).expect("state should encode");
 
         let progress = MultiVenueAdapter::recover(&finalizer, &leg, &NoopCheckpoint)
             .await
             .expect("pending leg should enter reconciliation");
         let recovered = progress
             .execution
-            .decode::<CexVenueExecutionState>("mexc")
+            .decode::<CexVenueExecutionState>(VENUE_ID)
             .expect("state should decode")
             .expect("state should be MEXC");
 
@@ -1103,11 +1096,11 @@ async fn permanent_cex_error_marks_only_the_mexc_leg_failed() {
     // One unit cannot pay its own ledger fee, so the deposit meets its floor.
     let mut execution = leg
         .execution
-        .decode::<CexVenueExecutionState>("mexc")
+        .decode::<CexVenueExecutionState>(VENUE_ID)
         .expect("state should decode")
         .expect("state should be MEXC");
     execution.cex.size_in = ChainTokenAmount::from_raw(pay_token(), Nat::from(1u8));
-    leg.execution = VenueExecutionState::new("mexc", &execution).expect("encode state");
+    leg.execution = VenueExecutionState::new(VENUE_ID, &execution).expect("encode state");
     leg.request.pay_amount = execution.cex.size_in.clone();
 
     let armed = MultiVenueAdapter::advance(&finalizer, &leg, &NoopCheckpoint)
@@ -1164,7 +1157,7 @@ async fn ordinary_cex_error_remains_retryable_without_operator_intervention() {
     );
     let execution = retryable
         .execution
-        .decode::<CexVenueExecutionState>("mexc")
+        .decode::<CexVenueExecutionState>(VENUE_ID)
         .expect("decode retryable state")
         .expect("MEXC state");
     assert!(!execution.operator_required);

@@ -4,10 +4,10 @@ use liquidium_pipeline_connectors::backend::cex_backend::{
 };
 use rust_decimal::Decimal;
 
-use super::support::{btc_usd_client, btc_usd_pair, level, one_coin_book};
+use super::support::{btc_usd_client, btc_usd_pair, one_coin_book};
 use crate::swappers::kraken::{
-    api::{KrakenApiError, KrakenBook, KrakenOrder, KrakenOrderStatus, KrakenSide, MockKrakenApi},
-    trading::{ORDER_POLL_ATTEMPTS, TAKER_FEE_BPS, estimate_sell_output, fill_report},
+    api::{KrakenApiError, KrakenOrder, KrakenOrderStatus, KrakenSide, MockKrakenApi},
+    trading::{ORDER_POLL_ATTEMPTS, TAKER_FEE_BPS, fill_report},
 };
 
 fn closed(volume_executed: Decimal, cost: Decimal, fee: Decimal) -> KrakenOrder {
@@ -159,37 +159,28 @@ async fn an_ioc_order_that_fills_nothing_reports_an_empty_fill() {
     assert_eq!((report.input_consumed, report.output_received), (0.0, 0.0));
 }
 
+/// Kraken checks a limit order's cost as volume times the limit price, so the
+/// order is refused here without a read of the book.
 #[tokio::test]
 async fn a_sell_below_the_cost_minimum_is_refused_before_submission() {
     let mut api = MockKrakenApi::new();
     api.expect_pairs().returning(|| Ok(vec![btc_usd_pair()]));
     api.expect_closed_order_by_client_id().returning(|_| Ok(None));
-    api.expect_orderbook().returning(|_, _| {
-        Ok(KrakenBook {
-            bids: vec![level(10, Decimal::ONE)],
-            asks: vec![],
-        })
-    });
+    api.expect_orderbook().never();
     api.expect_place_order().never();
+    let mut options = ioc("liq-small");
+    // 0.1 BTC at a 9.8 limit costs 0.98, under the 5 USD minimum.
+    options.price_limit = Some(PriceLimit {
+        reference_price: 10.0,
+        max_slippage_bps: 200.0,
+    });
 
     let error = btc_usd_client(api)
-        .execute_swap_detailed_with_options("BTC_USD", "sell", 0.1, ioc("liq-small"))
+        .execute_swap_detailed_with_options("BTC_USD", "sell", 0.1, options)
         .await
         .expect_err("below the cost minimum");
 
     assert!(matches!(error, CexBackendError::BelowMinimum(_)), "{error}");
-}
-
-/// A zero-priced bid is not a price, so it adds nothing to a sell's output.
-#[test]
-fn an_untradable_level_never_fills_volume_for_free() {
-    let book = KrakenBook {
-        bids: vec![level(0, Decimal::ONE), level(60_000, Decimal::ONE)],
-        asks: vec![],
-    };
-    let half = Decimal::new(5, 1);
-    assert_eq!(estimate_sell_output(&book, half).unwrap(), Decimal::new(30_000, 0));
-    assert!(estimate_sell_output(&book, Decimal::new(15, 1)).is_err());
 }
 
 /// Liquidation 1634: Kraken reported the fee in USD and took it from the
