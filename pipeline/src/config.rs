@@ -605,11 +605,14 @@ fn parse_multi_venue_min_net_edge_bps_from_env() -> u32 {
 }
 
 /// Reads a signed basis-point value, keeping it only when `valid` accepts it.
+/// A set but unusable value is logged, because its default may be far from it.
 fn parse_signed_bps_from_env(var: &str, valid: impl Fn(i32) -> bool) -> Option<i32> {
-    env::var(var)
-        .ok()
-        .and_then(|value| value.parse::<i32>().ok())
-        .filter(|bps| valid(*bps))
+    let raw = env::var(var).ok()?;
+    let parsed = raw.parse::<i32>().ok().filter(|bps| valid(*bps));
+    if parsed.is_none() {
+        warn!("{var}={raw} is not a usable signed bps value; the default applies");
+    }
+    parsed
 }
 
 fn parse_multi_venue_settlement_min_net_edge_bps_from_env() -> Option<i32> {

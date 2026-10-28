@@ -263,9 +263,9 @@ CEX_BUY_INVERSE_ENABLED=true
 # Retry backoff base and cap (seconds) for retryable CEX errors
 CEX_RETRY_BASE_SECS=5
 CEX_RETRY_MAX_SECS=120
-# Minimum projected net edge required before executing any venue plan (bps)
+# Recorded on each plan; only plans saved before the settlement floor existed still read it (bps)
 MULTI_VENUE_MIN_NET_EDGE_BPS=150
-# Optional normal-settlement override after liquidation (up to 1.5% shortfall)
+# Normal-settlement floor after liquidation; -150 allows up to 1.5% shortfall (the default)
 MULTI_VENUE_SETTLEMENT_MIN_NET_EDGE_BPS=-150
 # Reject a venue quote this far below the oracle-implied output (bps)
 MULTI_VENUE_MAX_ORACLE_DISCOUNT_BPS=250
@@ -296,8 +296,8 @@ Quick reference:
 | `CEX_BUY_INVERSE_ENABLED` | Master toggle for adaptive buy fallback. |
 | `CEX_RETRY_BASE_SECS` | Initial retry delay after retryable CEX errors. |
 | `CEX_RETRY_MAX_SECS` | Maximum retry delay cap. |
-| `MULTI_VENUE_MIN_NET_EDGE_BPS` | Default normal-settlement floor when the signed override is unset. |
-| `MULTI_VENUE_SETTLEMENT_MIN_NET_EDGE_BPS` | Optional signed floor for normal settlement after liquidation; `-150` allows up to 1.5% conservative shortfall. Valid range is greater than `-10000` through `10000`; absent or invalid values use `MULTI_VENUE_MIN_NET_EDGE_BPS`. Does not change liquidation-entry checks or already committed plans. |
+| `MULTI_VENUE_MIN_NET_EDGE_BPS` | Recorded on each plan. Only plans saved before the settlement floor existed still settle against it. |
+| `MULTI_VENUE_SETTLEMENT_MIN_NET_EDGE_BPS` | Signed floor for normal settlement after liquidation. The default `-150` allows up to 1.5% conservative shortfall, because the debt is already repaid. Valid range is greater than `-10000` through `10000`; an absent value uses `-150`, and an invalid value also uses `-150` with a warning in the log. Does not change liquidation-entry checks or already committed plans. |
 | `MULTI_VENUE_BAD_DEBT_MIN_NET_EDGE_BPS` | Existing signed floor used for all new settlement plans when `BUY_BAD_DEBT=true`, and for saved bad-debt rows even when global mode is off. Defaults to `-500` (up to 5% shortfall) and takes precedence over the normal-settlement override. |
 | `MULTI_VENUE_MAX_ORACLE_DISCOUNT_BPS` | Maximum amount any venue quote may fall below the oracle-implied output. Values at or above 10000 would accept anything, so they fall back to the default. |
 | `MULTI_VENUE_ORACLE_SNAPSHOT_MAX_AGE_SECS` | How stale a price recorded at detection may be before it stops standing in for a failed live oracle read. Past this age the quote guard stands down rather than block a liquidation that already holds collateral. |
@@ -329,8 +329,8 @@ Meaning:
 - Lower ratio (`0.4`) -> smaller slices, more orders, lower impact risk.
 
 Important:
-- This is a **sizing target**, not the hard reject limit.
-- Hard rejection still uses `MAX_ALLOWED_CEX_SLIPPAGE_BPS`.
+- This is a **sizing target**, not the reject limit.
+- Each order's reject limit is its own IOC limit: `MAX_ALLOWED_CEX_SLIPPAGE_BPS`, or the widened limit after empty fills.
 
 Examples when `MAX_ALLOWED_CEX_SLIPPAGE_BPS=200`:
 - `CEX_SLICE_TARGET_RATIO=0.5` -> target `100 bps`
@@ -349,7 +349,7 @@ Even with slicing, execution still has market-impact and timing risk:
 
 How config controls this risk:
 
-- `MAX_ALLOWED_CEX_SLIPPAGE_BPS`: the per-slice reject limit (safety brake), measured net of the taker fee. Each slice order is IOC at this limit less the market's taker fee, so a fill at its price still passes.
+- `MAX_ALLOWED_CEX_SLIPPAGE_BPS`: the limit of every first order in a slice loop, measured net of the taker fee. Each order is IOC at the price room this limit leaves after the market's taker fee, so a fill at its price still passes. A quote whose fee uses up the limit is refused before any deposit.
 - `MAX_WIDENED_CEX_SLIPPAGE_BPS`: after 3 orders in a row fill nothing at the cap, each next order widens the limit by 100 bps up to this value. When the widest order also fills nothing, the leg waits for the next cycle. A value at or below the cap turns widening off. No order goes out without a limit, unless the exchange refuses the IOC order type itself.
 - `CEX_SLICE_TARGET_RATIO`: softer sizing target below hard limit (execution smoothness).
 - `CEX_MIN_EXEC_USD`: prevents low-notional micro-fills that usually have poor quality.
@@ -376,14 +376,14 @@ For each leg, the finalizer runs a resumable slice loop:
 4. If no positive chunk passes soft target, try one-shot fallback:
    full remaining amount is accepted only if fillable and under the hard cap.
 5. If chunk notional is below `CEX_MIN_EXEC_USD`, mark as dust and stop this leg.
-6. Submit one market slice with deterministic `client_order_id` (WAL-safe resume/idempotency).
+6. Submit one IOC slice at the order's price room, with a deterministic `client_order_id` (WAL-safe resume/idempotency).
 7. Use **actual** exchange fill amounts (`input_consumed`, `output_received`) for math.
 8. Compute realized execution price and slippage:
    - sell: `exec_price = output_received / input_consumed`
    - buy: `exec_price = input_consumed / output_received`
    - sell slippage bps: `max(0, (preview_mid - exec_price) / preview_mid * 10000)`
    - buy slippage bps: `max(0, (exec_price - preview_mid) / preview_mid * 10000)`
-9. If realized slippage > `MAX_ALLOWED_CEX_SLIPPAGE_BPS`, fail fast.
+9. If realized slippage is above the order's limit (the cap, or the widened limit after empty fills), fail fast.
 10. Otherwise, persist progress (`remaining_in`, `total_out`) and continue until consumed/dust.
 11. On buy legs only, if truncation ratio is large and residual is executable, arm one inverse/base fallback retry (bounded by `CEX_BUY_INVERSE_MAX_RETRIES`).
 
