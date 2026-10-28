@@ -98,6 +98,11 @@ pub struct Config {
     /// Maximum intermediate hops allowed for MEXC route discovery.
     /// Example: `2` allows up to 3 legs total.
     pub cex_mexc_max_hops: u8,
+    /// Kraken's market allowlist, as `BASE_QUOTE`. Kraken refuses to start
+    /// with an empty one, so the setting is required when Kraken is enabled.
+    pub cex_kraken_available_pairs: Vec<String>,
+    /// Maximum intermediate hops allowed for Kraken route discovery.
+    pub cex_kraken_max_hops: u8,
     pub icpswap_factory_canister: Principal,
     pub icpswap_fee_tiers: Vec<candid::Nat>,
     /// Highest ICPSwap price impact an allocation may carry, in bps. The limit is
@@ -390,6 +395,8 @@ impl Config {
         let cex_tunables = parse_cex_tunables_from_env();
         let cex_mexc_available_pairs = parse_cex_available_pairs_from_env("CEX_MEXC_AVAILABLE_PAIRS");
         let cex_mexc_max_hops = parse_cex_max_hops_from_env("CEX_MEXC_MAX_HOPS");
+        let cex_kraken_available_pairs = parse_cex_available_pairs_from_env("CEX_KRAKEN_AVAILABLE_PAIRS");
+        let cex_kraken_max_hops = parse_cex_max_hops_from_env("CEX_KRAKEN_MAX_HOPS");
         let icpswap_factory_canister = parse_icpswap_factory_from_env()?;
         let icpswap_fee_tiers = parse_icpswap_fee_tiers_from_env()?;
         let icpswap_test_allocation_usd = parse_icpswap_test_allocation_usd_from_env()?;
@@ -461,6 +468,8 @@ impl Config {
             cex_route_fee_bps: cex_tunables.route_fee_bps,
             cex_mexc_available_pairs,
             cex_mexc_max_hops,
+            cex_kraken_available_pairs,
+            cex_kraken_max_hops,
             icpswap_factory_canister,
             icpswap_fee_tiers,
             icpswap_max_price_impact_bps: parse_icpswap_max_price_impact_bps_from_env(),
@@ -583,7 +592,7 @@ const DEFAULT_ICPSWAP_MAX_PRICE_IMPACT_BPS: f64 = 100.0;
 const DEFAULT_ICPSWAP_DUST_FALLBACK_MAX_PRICE_IMPACT_BPS: f64 = 150.0;
 const DEFAULT_ICPSWAP_MAX_SEARCH_ITERATIONS: u8 = 16;
 const DEFAULT_ENABLED_SWAP_VENUES: &str = "icpswap,mexc";
-const SUPPORTED_SWAP_VENUES: [&str; 2] = ["icpswap", "mexc"];
+const SUPPORTED_SWAP_VENUES: [&str; 3] = ["icpswap", "mexc", "kraken"];
 
 fn parse_multi_venue_min_net_edge_bps_from_env() -> u32 {
     env::var("MULTI_VENUE_MIN_NET_EDGE_BPS")
@@ -1309,6 +1318,31 @@ mod tests {
         }
     }
 
+    /// Kraken is opt-in: it is accepted when named, and its markets come from its own setting.
+    #[test]
+    fn kraken_is_an_accepted_venue_with_its_own_route_settings() {
+        let _guard = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        unsafe {
+            env::set_var("ENABLED_SWAP_VENUES", "icpswap,mexc,kraken");
+            env::set_var("CEX_KRAKEN_AVAILABLE_PAIRS", " icp/usd, ETH-USD, icp_usd ");
+            env::set_var("CEX_KRAKEN_MAX_HOPS", "3");
+        }
+        assert_eq!(
+            parse_enabled_swap_venues_from_env().unwrap(),
+            vec!["icpswap".to_string(), "mexc".to_string(), "kraken".to_string()]
+        );
+        assert_eq!(
+            parse_cex_available_pairs_from_env("CEX_KRAKEN_AVAILABLE_PAIRS"),
+            vec!["ICP_USD".to_string(), "ETH_USD".to_string()]
+        );
+        assert_eq!(parse_cex_max_hops_from_env("CEX_KRAKEN_MAX_HOPS"), 3);
+        unsafe {
+            env::remove_var("ENABLED_SWAP_VENUES");
+            env::remove_var("CEX_KRAKEN_AVAILABLE_PAIRS");
+            env::remove_var("CEX_KRAKEN_MAX_HOPS");
+        }
+    }
+
     #[test]
     fn enabled_swap_venues_reject_invalid_lists() {
         let _guard = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
@@ -1316,7 +1350,7 @@ mod tests {
             ("", "empty venue ID"),
             ("mexc,", "empty venue ID"),
             ("mexc,MEXC", "duplicate venue"),
-            ("kraken", "unsupported venue"),
+            ("binance", "unsupported venue"),
         ] {
             unsafe {
                 env::set_var("ENABLED_SWAP_VENUES", raw);

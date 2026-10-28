@@ -9,7 +9,10 @@ use crate::{
     config::ConfigTrait,
     context::PipelineContext,
     finalizers::cex::{finalizer::CexVenueFinalizer, profile::CexVenueProfile},
-    swappers::mexc::mexc_adapter::MexcClient,
+    swappers::{
+        kraken::{KrakenClient, normalize_market},
+        mexc::mexc_adapter::MexcClient,
+    },
 };
 
 /// The CEX machine every exchange shares; only the backend, the profile and
@@ -61,5 +64,32 @@ pub async fn build_mexc_finalizer(
         Arc::new(MexcClient::new(&api_key, &secret)),
         ctx.config.cex_mexc_available_pairs.clone(),
         ctx.config.cex_mexc_max_hops,
+    ))
+}
+
+/// Kraken is opt-in: it needs its keys and an explicit market allowlist.
+pub async fn build_kraken_finalizer(
+    ctx: &PipelineContext,
+    bridge: Arc<BridgeRuntime>,
+) -> Result<Arc<CexVenueFinalizer<KrakenClient>>, String> {
+    let (api_key, secret) = ctx.config.get_cex_credentials("kraken").map_err(|error| {
+        format!("Kraken is enabled but CEX_KRAKEN_API_KEY/CEX_KRAKEN_API_SECRET are missing: {error}")
+    })?;
+    // Kraken spells BTC as XBT, so both the client and the route search get canonical names.
+    let available_pairs = ctx
+        .config
+        .cex_kraken_available_pairs
+        .iter()
+        .map(|pair| normalize_market(pair))
+        .collect::<Vec<_>>();
+    let client = KrakenClient::new(api_key, secret, available_pairs.clone())
+        .map_err(|error| format!("Kraken is enabled but CEX_KRAKEN_AVAILABLE_PAIRS is unusable: {error}"))?;
+    Ok(build_cex_finalizer(
+        ctx,
+        bridge,
+        CexVenueProfile::kraken(),
+        Arc::new(client),
+        available_pairs,
+        ctx.config.cex_kraken_max_hops,
     ))
 }

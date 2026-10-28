@@ -2,7 +2,8 @@ use std::{collections::HashMap, sync::Arc};
 
 use candid::{Nat, Principal};
 use liquidium_pipeline_connectors::backend::cex_backend::{
-    CexBackendError, DepositAddress, MockCexBackend, OrderBook, OrderBookLevel, SwapFillReport, WithdrawTerms,
+    CexBackendError, DepositAddress, FundingRoute, FundingRouteError, MockCexBackend, OrderBook, OrderBookLevel,
+    SwapFillReport, WithdrawTerms,
 };
 use liquidium_pipeline_core::{
     tokens::{chain_token::ChainToken, chain_token_amount::ChainTokenAmount, token_registry::TokenRegistry},
@@ -69,10 +70,11 @@ fn request(raw_pay: u64) -> SwapRequest {
     }
 }
 
-/// MEXC withdrawals with no fee and no minimum.
+/// MEXC withdrawals with no fee and no minimum, on a route MEXC accepts.
 fn free_withdrawals(cex: &mut MockCexBackend) {
     cex.expect_get_withdraw_terms()
         .returning(|_, _| Ok(WithdrawTerms { fee: 0.0, minimum: 0.0 }));
+    cex.expect_check_funding_route().returning(|_| Ok(()));
 }
 
 fn finalizer() -> CexVenueFinalizer<MockCexBackend> {
@@ -80,8 +82,17 @@ fn finalizer() -> CexVenueFinalizer<MockCexBackend> {
 }
 
 fn finalizer_with_withdraw_terms(terms: WithdrawTerms) -> CexVenueFinalizer<MockCexBackend> {
+    finalizer_with_route_check(terms, |_| Ok(()))
+}
+
+/// A finalizer whose exchange answers each route check with `check`.
+fn finalizer_with_route_check(
+    terms: WithdrawTerms,
+    check: impl Fn(&FundingRoute) -> Result<(), FundingRouteError> + Send + 'static,
+) -> CexVenueFinalizer<MockCexBackend> {
     let mut backend = MockCexBackend::new();
     backend.expect_get_withdraw_terms().returning(move |_, _| Ok(terms));
+    backend.expect_check_funding_route().returning(check);
     backend.expect_get_orderbook().returning(|market, _| match market {
         "PAY_RECV" => Ok(OrderBook {
             bids: vec![OrderBookLevel {
@@ -318,6 +329,57 @@ async fn preview_persists_the_per_leg_receive_address() {
     assert_eq!(
         execution.cex.withdraw.withdraw_address,
         request.receive_address.unwrap()
+    );
+}
+
+/// The exchange checks the route the preview plans, before any funds move.
+#[tokio::test]
+async fn preview_hands_the_exchange_the_planned_route() {
+    let seen = Arc::new(std::sync::Mutex::new(None));
+    let record = seen.clone();
+    let finalizer = finalizer_with_route_check(WithdrawTerms { fee: 0.0, minimum: 0.0 }, move |route| {
+        *record.lock().unwrap() = Some(route.clone());
+        Ok(())
+    });
+    let mut request = request(100_000_000);
+    request.receive_address = Some(Principal::from_slice(&[42]).to_text());
+
+    MultiVenueAdapter::preview(&finalizer, &planning_context(), &request)
+        .await
+        .expect("preview should succeed");
+
+    let route = seen.lock().unwrap().clone().expect("the route was checked");
+    assert_eq!(
+        (route.deposit_asset.as_str(), route.deposit_network.as_str()),
+        ("PAY", "ICP")
+    );
+    assert_eq!(
+        (route.withdraw_asset.as_str(), route.withdraw_network.as_str()),
+        ("RECV", "ICP")
+    );
+    assert_eq!(route.withdraw_address, request.receive_address.unwrap());
+    assert!(
+        route.deposit_amount > 0.0 && route.deposit_amount <= 1.0,
+        "{}",
+        route.deposit_amount
+    );
+}
+
+/// A route the exchange refuses, such as an unverified withdrawal address,
+/// gets no quote, so the planner never sends funds there.
+#[tokio::test]
+async fn preview_fails_when_the_exchange_refuses_the_route() {
+    let finalizer = finalizer_with_route_check(WithdrawTerms { fee: 0.0, minimum: 0.0 }, |_| {
+        Err(FundingRouteError::Unsupported("the address is not verified".into()))
+    });
+
+    let error = MultiVenueAdapter::preview(&finalizer, &planning_context(), &request(100_000_000))
+        .await
+        .expect_err("refused route");
+
+    assert!(
+        error.contains("refused the route") && error.contains("not verified"),
+        "{error}"
     );
 }
 

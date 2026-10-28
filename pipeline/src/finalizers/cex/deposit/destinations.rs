@@ -106,6 +106,19 @@ where
         }
     }
 
+    /// The address the exchange withdraws to: the bridge source for a bridged
+    /// withdrawal, else the final destination.
+    pub(in crate::finalizers::cex) fn planned_withdraw_address(&self, state: &CexState) -> Result<String, String> {
+        let asset = <Self as BridgePlanner>::planned_withdraw_asset(state);
+        let network = <Self as BridgePlanner>::planned_withdraw_network(state);
+        if state.withdraw.bridge.withdraw_bridge_required {
+            let route =
+                Self::withdraw_route(state).ok_or_else(|| format!("no return bridge route for {asset}@{network}"))?;
+            return self.resolve_bridge_source_address(route.source_chain);
+        }
+        self.direct_withdraw_destination(state, &asset, &network)
+    }
+
     /// The address a direct withdrawal goes to, checked for its network.
     pub(super) fn direct_withdraw_destination(
         &self,

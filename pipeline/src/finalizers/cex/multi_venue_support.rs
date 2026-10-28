@@ -1,5 +1,8 @@
 use candid::Nat;
-use liquidium_pipeline_connectors::backend::{bridge_backend::BridgeRouteKind, cex_backend::CexBackend};
+use liquidium_pipeline_connectors::backend::{
+    bridge_backend::BridgeRouteKind,
+    cex_backend::{CexBackend, FundingRoute},
+};
 use liquidium_pipeline_core::tokens::{chain_token::ChainToken, chain_token_amount::ChainTokenAmount};
 use liquidium_pipeline_core::types::side_cost::SideCost;
 
@@ -257,6 +260,19 @@ where
                 self.profile.name()
             ));
         }
+        // The exchange confirms, before any funds move, that it credits this
+        // deposit and pays out to this address.
+        self.backend
+            .check_funding_route(&FundingRoute {
+                deposit_asset: <Self as BridgePlanner>::planned_deposit_asset(&state),
+                deposit_network: <Self as BridgePlanner>::planned_deposit_network(&state),
+                deposit_amount: initial_amount,
+                withdraw_asset: <Self as BridgePlanner>::planned_withdraw_asset(&state),
+                withdraw_network: <Self as BridgePlanner>::planned_withdraw_network(&state),
+                withdraw_address: self.planned_withdraw_address(&state)?,
+            })
+            .await
+            .map_err(|error| format!("{} refused the route: {error}", self.profile.name()))?;
         let legs = self
             .resolve_trade_legs_for_symbols(
                 &<Self as BridgePlanner>::planned_deposit_asset(&state),

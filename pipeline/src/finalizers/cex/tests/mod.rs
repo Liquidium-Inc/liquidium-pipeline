@@ -32,6 +32,7 @@ use support::*;
 mod bridged_deposit;
 mod bridged_withdraw;
 mod cksol_return;
+mod client_order_ids;
 mod deposit;
 mod direct_withdraw;
 mod execution_records;

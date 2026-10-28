@@ -25,6 +25,18 @@ impl CexVenueProfile {
         }
     }
 
+    /// Kraken: no fixed routes and no approval bumps. It takes free-text client
+    /// order ids of at most 18 characters.
+    pub fn kraken() -> Self {
+        Self {
+            venue_id: "kraken",
+            name: "Kraken",
+            special_trade_legs: None,
+            approval_bumps: false,
+            client_order_id_max_len: 18,
+        }
+    }
+
     /// The venue id the planner and the saved leg state use.
     pub fn venue_id(&self) -> &'static str {
         self.venue_id
@@ -73,5 +85,15 @@ mod tests {
         assert!(mexc.approval_bumps());
         assert!(mexc.special_trade_legs("ckBTC", "ckUSDT").is_some());
         assert!(mexc.special_trade_legs("ICP", "ckUSDT").is_none());
+        assert_eq!(mexc.client_order_id_max_len(), 32);
+    }
+
+    #[test]
+    fn kraken_has_no_fixed_routes_or_bumps_and_short_client_ids() {
+        let kraken = CexVenueProfile::kraken();
+        assert_eq!((kraken.venue_id(), kraken.name()), ("kraken", "Kraken"));
+        assert!(!kraken.approval_bumps());
+        assert!(kraken.special_trade_legs("ckBTC", "ckUSDT").is_none());
+        assert_eq!(kraken.client_order_id_max_len(), 18);
     }
 }

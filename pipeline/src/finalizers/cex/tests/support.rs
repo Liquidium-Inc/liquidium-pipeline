@@ -177,10 +177,11 @@ pub(super) fn native_icp_token() -> ChainToken {
     }
 }
 
-/// MEXC withdrawals with no fee and no minimum.
+/// MEXC withdrawals with no fee and no minimum, on a route MEXC accepts.
 pub(super) fn free_withdrawals(cex: &mut MockCexBackend) {
     cex.expect_get_withdraw_terms()
         .returning(|_, _| Ok(WithdrawTerms { fee: 0.0, minimum: 0.0 }));
+    cex.expect_check_funding_route().returning(|_| Ok(()));
 }
 
 pub(super) fn liquid_orderbook() -> OrderBook {
