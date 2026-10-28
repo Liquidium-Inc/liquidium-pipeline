@@ -26,6 +26,7 @@ fn only_refusals_before_execution_allow_another_withdraw_alias() {
     for refused in [
         response(v3::ErrorCode::InsufficientBalance, 10101),
         response(v3::ErrorCode::CurrencyDoesNotExist, 10232),
+        response(v3::ErrorCode::InvalidResponse, 10254),
         v3::ApiError::MalformedRequest,
         v3::ApiError::RateLimitExceeded,
         v3::ApiError::WebApplicationFirewallViolated,
@@ -37,6 +38,8 @@ fn only_refusals_before_execution_allow_another_withdraw_alias() {
         response(v3::ErrorCode::GatewayTimeout, 504),
         response(v3::ErrorCode::TransferOperationProcessing, 10200),
         response(v3::ErrorCode::InternalSystemErrorPleaseContactSupport, 20002),
+        // Review finding 4: a 5xx with a code the client does not know.
+        response(v3::ErrorCode::InvalidResponse, -1),
         v3::ApiError::InternalServerError,
         v3::ApiError::UnableToParseResponse,
     ] {

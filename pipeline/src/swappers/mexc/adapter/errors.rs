@@ -74,6 +74,12 @@ pub(super) fn is_unlisted_alias(err: &v3::ApiError) -> bool {
 pub(super) fn is_definite_rejection(err: &v3::ApiError) -> bool {
     use v3::ErrorCode::*;
     match err {
+        // The client drops the HTTP status, so an unknown code may be a 5xx.
+        // Only the unlisted codes seen live as refusals count.
+        v3::ApiError::ErrorResponse(resp) if resp.code == InvalidResponse => matches!(
+            resp.raw_code,
+            MEXC_WITHDRAW_BELOW_MIN_RAW_CODE | MEXC_MALFORMED_PARAM_RAW_CODE
+        ),
         v3::ApiError::ErrorResponse(resp) => !matches!(
             resp.code,
             InternalError
