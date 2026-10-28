@@ -5,6 +5,7 @@ use std::{
     collections::HashMap,
     fmt::{self, Debug},
     sync::Arc,
+    time::Duration,
 };
 
 use async_trait::async_trait;
@@ -44,6 +45,24 @@ fn transport_error(error: ClientError) -> KrakenApiError {
         ClientError::Kraken(KrakenError::InternalError) => KrakenApiError::Transport(error.to_string()),
         ClientError::Kraken(refusal) => KrakenApiError::Rejected(format!("Kraken refused the request: {refusal}")),
         _ => KrakenApiError::Transport(error.to_string()),
+    }
+}
+
+/// The HTTP client has no timeout. This bound is well above the longest
+/// rate-limit wait, so only a stalled request reaches it.
+const CALL_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Bounds one request. A request past the bound may still have reached Kraken.
+async fn bounded<T>(
+    request: impl Future<Output = Result<T, ClientError>>,
+    limit: Duration,
+) -> Result<T, KrakenApiError> {
+    match tokio::time::timeout(limit, request).await {
+        Ok(answer) => answer.map_err(transport_error),
+        Err(_) => Err(KrakenApiError::Transport(format!(
+            "Kraken gave no answer within {}s",
+            limit.as_secs()
+        ))),
     }
 }
 
@@ -104,7 +123,7 @@ impl KrakenRestApi {
         request: impl AsyncFnOnce(&mut Client) -> Result<ResultErrorResponse<T>, ClientError>,
     ) -> Result<T, KrakenApiError> {
         let mut client = self.client.lock().await;
-        let response = request(&mut client).await.map_err(transport_error)?;
+        let response = bounded(request(&mut client), CALL_TIMEOUT).await?;
         read_answer(response.error, response.result)
     }
 }
@@ -471,6 +490,18 @@ mod tests {
         assert_eq!(asset_balance(&balances, "ETH"), Decimal::new(17, 1));
         assert_eq!(asset_balance(&balances, "BTC"), Decimal::new(3, 0));
         assert_eq!(asset_balance(&balances, "ICP"), Decimal::ZERO);
+    }
+
+    /// Review finding 20: one stalled request held the client lock until the
+    /// finalize stage timed out.
+    #[tokio::test]
+    async fn a_request_past_its_bound_may_have_reached_kraken() {
+        let stalled = std::future::pending::<Result<u8, ClientError>>();
+        assert!(matches!(
+            bounded(stalled, Duration::from_millis(1)).await,
+            Err(KrakenApiError::Transport(_))
+        ));
+        assert_eq!(bounded(async { Ok::<_, ClientError>(7) }, CALL_TIMEOUT).await, Ok(7));
     }
 
     #[test]
