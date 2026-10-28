@@ -141,12 +141,15 @@ pub trait CexBackend: Send + Sync {
     async fn get_deposit_address(&self, asset: &str, network: &str) -> Result<DepositAddress, String>;
 
     // withdrawals
+    /// `withdraw_order_id` is the caller's id for this request. The exchange
+    /// stores it, so a lookup can find a request whose reply was lost.
     async fn withdraw(
         &self,
         asset: &str,
         network: &str,
         address: &str,
         amount: f64,
+        withdraw_order_id: &str,
     ) -> Result<WithdrawalReceipt, String>;
 
     // balance

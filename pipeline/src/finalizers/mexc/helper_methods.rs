@@ -822,12 +822,7 @@ where
     }
 
     fn stable_hash_6hex(value: &str) -> String {
-        let mut hash: u64 = 0xcbf29ce484222325;
-        for byte in value.bytes() {
-            hash ^= byte as u64;
-            hash = hash.wrapping_mul(0x100000001b3);
-        }
-        format!("{:06x}", hash & 0x00ff_ffff)
+        format!("{:06x}", super::super::mexc_utils::fnv1a_64(value) & 0x00ff_ffff)
     }
 
     fn sanitize_client_order_id(value: &str) -> String {
@@ -934,13 +929,28 @@ where
         preview_chunk_in: f64,
         buy_mode: BuyOrderInputMode,
     ) -> PendingSliceRequest {
-        let slice_seq = Self::next_slice_seq_for_leg(state, leg_idx);
-        let requested_in = state.trade.trade_pending_requested_in.unwrap_or(preview_chunk_in);
-        let client_order_id = state
+        let applied = &state.trade.trade_applied_client_order_ids;
+        // A pending id is a resumed submission whose fill is not counted yet.
+        // Once counted, the id is spent, so a new order needs a new id.
+        let pending_id = state
             .trade
             .trade_pending_client_order_id
             .clone()
-            .unwrap_or_else(|| Self::build_client_order_id(state, leg_idx, slice_seq, buy_mode));
+            .filter(|id| !applied.contains(id));
+        if pending_id.is_none() && state.trade.trade_pending_client_order_id.is_some() {
+            state.trade.trade_pending_requested_in = None;
+        }
+        let requested_in = state.trade.trade_pending_requested_in.unwrap_or(preview_chunk_in);
+        let client_order_id = pending_id.unwrap_or_else(|| {
+            let mut slice_seq = Self::next_slice_seq_for_leg(state, leg_idx);
+            loop {
+                let id = Self::build_client_order_id(state, leg_idx, slice_seq, buy_mode);
+                if !state.trade.trade_applied_client_order_ids.contains(&id) {
+                    break id;
+                }
+                slice_seq += 1;
+            }
+        });
         let buy_mode_label = Self::buy_mode_to_str(buy_mode);
 
         state.trade.trade_pending_client_order_id = Some(client_order_id.clone());
@@ -1149,6 +1159,12 @@ where
                 actual_input_consumed,
                 actual_output_received,
             );
+            // Spend the id in the same state write as the fill, so no later
+            // error can let a retry submit it again.
+            state
+                .trade
+                .trade_applied_client_order_ids
+                .push(pending.client_order_id.clone());
 
             // Convert raw fill amounts into a realized execution price.
             // We need `exec_price` so slippage can be measured against preview mid-price.
@@ -1165,6 +1181,27 @@ where
             // Slippage is the realized price drift from preview midpoint, in bps.
             // This is the primary safety metric for adverse execution quality.
             let slice_slippage_bps = Self::slice_slippage_bps(&leg.side, preview.preview_mid_price, exec_price);
+
+            // Record the executed slice before the cap check. A breaching slice
+            // still happened, and its record is the durable trace of the breach.
+            Self::update_trade_notional_stats(
+                state,
+                &leg.side,
+                actual_input_consumed,
+                actual_output_received,
+                preview.preview_mid_price,
+            );
+            Self::record_trade_slice(
+                state,
+                leg_idx,
+                leg,
+                actual_input_consumed,
+                actual_output_received,
+                preview.preview_mid_price,
+                exec_price,
+                slice_slippage_bps,
+                preview.preview_impact_bps,
+            );
 
             // Enforce hard per-slice slippage limit before allowing leg continuation.
             if slice_slippage_bps > self.max_sell_slippage_bps {
@@ -1185,28 +1222,6 @@ where
                 state.last_error = Some(err.clone());
                 return Err(err.into());
             }
-
-            // Update weighted route-level aggregates used by finish/export summaries.
-            Self::update_trade_notional_stats(
-                state,
-                &leg.side,
-                actual_input_consumed,
-                actual_output_received,
-                preview.preview_mid_price,
-            );
-
-            // Persist per-slice telemetry for observability and post-trade analysis.
-            Self::record_trade_slice(
-                state,
-                leg_idx,
-                leg,
-                actual_input_consumed,
-                actual_output_received,
-                preview.preview_mid_price,
-                exec_price,
-                slice_slippage_bps,
-                preview.preview_impact_bps,
-            );
 
             // Emit slice execution log with route and quality context.
             info!(

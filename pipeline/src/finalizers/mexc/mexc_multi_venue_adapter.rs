@@ -2,6 +2,7 @@ use async_trait::async_trait;
 use liquidium_pipeline_connectors::backend::bridge_backend::{
     FINALIZER_PERMANENT_AMOUNT_FLOOR_PREFIX, BridgeRouteKind, resolve_route,
 };
+use liquidium_pipeline_connectors::backend::SIDE_EFFECT_AMBIGUOUS_PREFIX;
 use liquidium_pipeline_connectors::backend::cex_backend::{CexBackend, CexBackendError};
 use log::{info, warn};
 use serde::{Deserialize, Serialize};
@@ -10,7 +11,7 @@ use super::mexc_finalizer::MexcFinalizer;
 use crate::{
     finalizers::{
         bridge_planner::BridgePlanner,
-        cex_finalizer::{BRIDGE_SUBMISSION_AMBIGUOUS_PREFIX, CexFinalizerLogic, CexState, CexStep},
+        cex_finalizer::{CexFinalizerLogic, CexState, CexStep},
         multi_venue::{
             MultiVenueAdapter, VenueAmountError, VenueLegCheckpoint, VenueLegProgress, VenuePlanningContext,
             VenueRoutePreview,
@@ -167,8 +168,9 @@ where
                 if error.starts_with(FINALIZER_PERMANENT_AMOUNT_FLOOR_PREFIX) {
                     execution.cex.step = CexStep::Failed;
                 }
-                // Only an operator can say which row owns the provider record.
-                if error.starts_with(BRIDGE_SUBMISSION_AMBIGUOUS_PREFIX) {
+                // Only an operator can say which row owns the provider record,
+                // or whether a call without an answer moved funds.
+                if error.starts_with(SIDE_EFFECT_AMBIGUOUS_PREFIX) {
                     return self.operator_required_progress(execution, error);
                 }
                 Some(error)

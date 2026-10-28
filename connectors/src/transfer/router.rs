@@ -48,6 +48,25 @@ where
         }
     }
 
+    #[instrument(name = "transfer_router.transfer_deduplicated", skip_all, err, fields(token = %token.symbol()))]
+    async fn transfer_deduplicated(
+        &self,
+        token: &ChainToken,
+        to: &ChainAccount,
+        amount_native: Nat,
+        created_at_time_nanos: u64,
+    ) -> Result<String, TransferFailure> {
+        match (token, to) {
+            (ChainToken::Icp { .. }, ChainAccount::Icp(_) | ChainAccount::IcpLedger(_)) => {
+                self.icp
+                    .transfer_deduplicated(token, to, amount_native, created_at_time_nanos)
+                    .await
+            }
+            // Only ICP ledgers deduplicate; the plain route validates the rest.
+            _ => self.transfer(token, to, amount_native).await,
+        }
+    }
+
     #[instrument(name = "transfer_router.approve", skip_all, err, fields(token = %token.symbol()))]
     async fn approve(&self, token: &ChainToken, spender: &ChainAccount, amount_native: Nat) -> Result<String, String> {
         match token {

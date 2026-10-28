@@ -1804,3 +1804,90 @@ mod lost_submission_lookup {
         assert_eq!(found[0].bridge_id, "ic-withdraw-eth:55");
     }
 }
+
+#[tokio::test]
+async fn forward_bridge_helper_send_error_is_ambiguous() {
+    let signer = "0x1111111111111111111111111111111111111111"
+        .parse::<Address>()
+        .expect("address");
+    let helper = "0x2222222222222222222222222222222222222222"
+        .parse::<Address>()
+        .expect("address");
+    let token = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"
+        .parse::<Address>()
+        .expect("address");
+    let amount_base_units = U256::from(1_000_000u64);
+    let tx_hash = TxHash::from([0x11u8; 32]);
+
+    let mut mock_agent = MockPipelineAgent::new();
+    expect_event_boundary(&mut mock_agent);
+    mock_agent
+        .expect_call_query::<CkEthMinterInfo>()
+        .times(1)
+        .returning(move |_, _, _| {
+            Ok(CkEthMinterInfo {
+                deposit_with_subaccount_helper_contract_address: None,
+                eth_helper_contract_address: None,
+                erc20_helper_contract_address: Some(helper.to_string()),
+                cketh_ledger_id: None,
+                minimum_withdrawal_amount: None,
+            })
+        });
+
+    let mut mock_evm = idle_wallet();
+    mock_evm.expect_signer_address().times(1).returning(move || signer);
+    mock_evm
+        .expect_erc20_decimals_of()
+        .with(eq(token))
+        .times(1)
+        .returning(|_| Ok(6));
+    mock_evm
+        .expect_erc20_balance_of()
+        .with(eq(token), eq(signer))
+        .times(1)
+        .returning(|_, _| Ok(U256::from(1_000_000u64)));
+    mock_evm
+        .expect_erc20_allowance_of()
+        .with(eq(token), eq(signer), eq(helper))
+        .times(1)
+        .returning(|_, _, _| Ok(U256::from(1_000_000u64)));
+    mock_evm.expect_erc20_approve_and_wait().times(0);
+    mock_evm
+        .expect_helper_deposit_native()
+        .withf(move |seen_helper, seen_token, seen_amount, _| {
+            *seen_helper == helper && *seen_token == token && *seen_amount == amount_base_units
+        })
+        .times(1)
+        .returning(|_, _, _, _| Err("rpc timed out after eth_sendRawTransaction".to_string()));
+    mock_evm.expect_helper_deposit_with_subaccount().times(0);
+    mock_evm.expect_receipt_status().times(0);
+
+    let mock_icp = MockIcpBackend::new();
+
+    let backend = CkErc20BridgeBackend::new(
+        Arc::new(mock_agent),
+        Arc::new(mock_icp),
+        Arc::new(mock_evm),
+        Principal::management_canister(),
+        Principal::management_canister(),
+    );
+
+    let request = BridgeRequest {
+        asset: "USDC".to_string(),
+        source_chain: "ETH".to_string(),
+        source_address: signer.to_string(),
+        target_asset: "ckUSDC".to_string(),
+        destination: BridgeDestination::IcpAccount(Account {
+            owner: Principal::management_canister(),
+            subaccount: None,
+        }),
+        amount: 1.0,
+        provider_fee_budget_native_units: None,
+    };
+
+    let _ = tx_hash;
+    // The transaction can land after the error, so a repeat would deposit twice.
+    let error = backend.submit_bridge(request).await.expect_err("the send failed");
+    assert!(error.starts_with(crate::backend::SIDE_EFFECT_AMBIGUOUS_PREFIX), "{error}");
+    assert!(error.contains("rpc timed out"), "{error}");
+}

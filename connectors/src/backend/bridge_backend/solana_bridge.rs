@@ -15,6 +15,7 @@ use super::{
 };
 use crate::{
     backend::{
+        SIDE_EFFECT_AMBIGUOUS_PREFIX,
         amount_utils::{amount_to_nat_units_strict, nat_units_to_amount_via_core},
         icp_backend::IcpBackend,
         icp_backend_helpers::{
@@ -630,8 +631,15 @@ where
             .native_transfer(&expected_source, amount_native.clone())
             .await
             .map_err(|e| {
+                // The backend settles the send against the cluster; only an
+                // answer it could not decide keeps the ambiguity prefix.
+                let prefix = if e.starts_with(SIDE_EFFECT_AMBIGUOUS_PREFIX) {
+                    format!("{SIDE_EFFECT_AMBIGUOUS_PREFIX}: ")
+                } else {
+                    String::new()
+                };
                 format!(
-                    "SOL transfer from configured bridge source {} to ckSOL deposit address {} failed: {}",
+                    "{prefix}SOL transfer from configured bridge source {} to ckSOL deposit address {} failed: {}",
                     self.bridge_solana_source_address, expected_source, e
                 )
             })?;
@@ -1228,6 +1236,17 @@ mod tests {
 
     #[tokio::test]
     async fn solana_to_icp_transfer_failure_maps_to_clear_error_and_skips_process_deposit() {
+        // The backend settles the send. Only an undecided answer stays ambiguous.
+        for (backend_error, ambiguous) in [
+            ("solana transaction 1 expired unconfirmed and moved no funds: rpc failure".to_string(), false),
+            (
+                format!(
+                    "{}: solana transaction 1 has no decided answer: rpc failure",
+                    crate::backend::SIDE_EFFECT_AMBIGUOUS_PREFIX
+                ),
+                true,
+            ),
+        ] {
         let mut request = sol_to_icp_request(bridge_owner(), Some([9u8; 32]));
         request.amount = 2.0;
 
@@ -1256,15 +1275,17 @@ mod tests {
         mock_solana
             .expect_native_transfer()
             .times(1)
-            .returning(|_, _| Err("solana rpc failure".to_string()));
+            .returning(move |_, _| Err(backend_error.clone()));
 
         let backend = backend(mock_agent, mock_icp, mock_solana);
         let err = backend
             .submit_bridge(request)
             .await
             .expect_err("transfer failure must fail submission");
+        assert_eq!(err.starts_with(crate::backend::SIDE_EFFECT_AMBIGUOUS_PREFIX), ambiguous, "{err}");
         assert!(err.contains("SOL transfer from configured bridge source"));
-        assert!(err.contains("solana rpc failure"));
+        assert!(err.contains("rpc failure"));
+        }
     }
 
     #[tokio::test]

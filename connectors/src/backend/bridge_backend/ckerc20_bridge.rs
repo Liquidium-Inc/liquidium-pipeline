@@ -27,6 +27,7 @@ use super::{
 };
 use crate::{
     backend::{
+        SIDE_EFFECT_AMBIGUOUS_PREFIX,
         amount_utils::{
             amount_to_base_units_strict, amount_to_nat_units_strict, base_units_to_amount_via_core,
             nat_units_to_amount_via_core,
@@ -298,6 +299,12 @@ where
             bridge_ic_owner_principal,
             forward_submission: tokio::sync::Mutex::new(()),
         }
+    }
+
+    /// A helper send error does not prove the transaction stayed local. A
+    /// repeat after it lands would deposit the same funds twice.
+    fn helper_send_error(call: &str, error: String) -> String {
+        format!("{SIDE_EFFECT_AMBIGUOUS_PREFIX}: {call} has no decided answer: {error}")
     }
 
     async fn minter_info(&self) -> Result<CkEthMinterInfo, String> {
@@ -593,12 +600,12 @@ where
                     recipient_subaccount_bytes32,
                 )
                 .await
-                .map_err(|e| format!("helper depositErc20 failed: {e}"))?,
+                .map_err(|e| Self::helper_send_error("helper depositErc20", e))?,
             HelperContract::Native(address) => self
                 .evm_backend
                 .helper_deposit_native(address, token_address, amount_base_units, recipient_principal_bytes32)
                 .await
-                .map_err(|e| format!("native helper deposit failed: {e}"))?,
+                .map_err(|e| Self::helper_send_error("native helper deposit", e))?,
         };
 
         // Return the submitted tx hash; completion is tracked asynchronously via get_bridge_status.
@@ -677,12 +684,12 @@ where
                     recipient_subaccount_bytes32,
                 )
                 .await
-                .map_err(|e| format!("ETH helper depositEth failed: {e}"))?,
+                .map_err(|e| Self::helper_send_error("ETH helper depositEth", e))?,
             HelperContract::Native(address) => self
                 .evm_backend
                 .helper_deposit_eth_native(address, amount_wei, recipient_principal_bytes32)
                 .await
-                .map_err(|e| format!("native ETH helper deposit failed: {e}"))?,
+                .map_err(|e| Self::helper_send_error("native ETH helper deposit", e))?,
         };
 
         Ok(BridgeSubmission {

@@ -1148,7 +1148,8 @@ mod bridged_deposit_restart {
     //! deposit that has no handle yet.
     use super::*;
     use crate::finalizers::bridge_claims::{BridgeClaims, MockBridgeClaimLookup};
-    use crate::finalizers::cex_finalizer::{BRIDGE_SUBMISSION_AMBIGUOUS_PREFIX, BridgeSubmitAttempt, BridgeSubmitPhase};
+    use crate::finalizers::cex_finalizer::{BridgeSubmitAttempt, BridgeSubmitPhase};
+    use liquidium_pipeline_connectors::backend::SIDE_EFFECT_AMBIGUOUS_PREFIX;
     use liquidium_pipeline_connectors::backend::bridge_backend::{
         BridgeFeeBudget, BridgeSubmissionCandidate, MockBridgeBackend,
     };
@@ -1284,7 +1285,7 @@ mod bridged_deposit_restart {
         assert_eq!(progress.status, VenueLegStatus::OperatorRequired);
         assert!(progress.retryable_error.is_none());
         let error = progress.last_error.expect("reason for the operator");
-        assert!(error.starts_with(BRIDGE_SUBMISSION_AMBIGUOUS_PREFIX), "{error}");
+        assert!(error.starts_with(SIDE_EFFECT_AMBIGUOUS_PREFIX), "{error}");
         let execution = progress.execution.decode::<MexcVenueExecutionState>(VENUE_ID).unwrap().unwrap();
         assert!(execution.operator_required);
         let Some(BridgeSubmitPhase::Submitting(kept)) = execution.cex.deposit.bridge.deposit_bridge_submit_phase else {
@@ -1328,4 +1329,67 @@ mod bridged_deposit_restart {
             Some(BridgeSubmitPhase::WaitingFunds)
         );
     }
+}
+
+#[tokio::test]
+async fn an_unanswered_icp_funding_transfer_stays_retryable_with_its_created_at_time() {
+    use liquidium_pipeline_connectors::backend::SIDE_EFFECT_AMBIGUOUS_PREFIX;
+    use liquidium_pipeline_core::transfer::actions::TransferFailure;
+
+    let mut backend = MockCexBackend::new();
+    backend.expect_get_orderbook().returning(|_, _| {
+        Ok(OrderBook {
+            bids: vec![OrderBookLevel {
+                price: 10.0,
+                quantity: 1_000_000.0,
+            }],
+            asks: vec![],
+        })
+    });
+    backend.expect_get_balance().returning(|_| Ok(0.0));
+    backend.expect_get_deposit_address().returning(|_, _| {
+        Ok(liquidium_pipeline_connectors::backend::cex_backend::DepositAddress {
+            asset: "PAY".into(),
+            network: "ICP".into(),
+            address: "aaaaa-aa".into(),
+            tag: None,
+        })
+    });
+    let mut transfers = MockTransferActions::new();
+    transfers
+        .expect_transfer_deduplicated()
+        .times(1)
+        .returning(|_, _, _, _created_at_time_nanos| Err(TransferFailure::Ambiguous("replica timed out".into())));
+    let tokens = HashMap::from([
+        (pay_token().asset_id(), pay_token()),
+        (receive_token().asset_id(), receive_token()),
+    ]);
+    let finalizer = MexcFinalizer::new(
+        Arc::new(backend),
+        Arc::new(transfers),
+        Principal::anonymous(),
+        200.0,
+        0.0001,
+        0.7,
+    )
+    .with_token_registry(Arc::new(TokenRegistry::new(tokens)));
+    let preview = MultiVenueAdapter::preview(&finalizer, &planning_context(), &request(100_000_000))
+        .await
+        .unwrap();
+    let mut leg = leg_from_preview(preview);
+    leg.execution = MultiVenueAdapter::advance(&finalizer, &leg, &NoopCheckpoint)
+        .await
+        .unwrap()
+        .execution;
+
+    let progress = MultiVenueAdapter::advance(&finalizer, &leg, &NoopCheckpoint).await.unwrap();
+
+    // The ledger deduplicates the retry, so the leg retries instead of parking.
+    assert_eq!(progress.status, VenueLegStatus::Running);
+    let error = progress.retryable_error.expect("the retry spends budget like any error");
+    assert!(!error.starts_with(SIDE_EFFECT_AMBIGUOUS_PREFIX), "{error}");
+    let execution = progress.execution.decode::<MexcVenueExecutionState>(VENUE_ID).unwrap().unwrap();
+    assert!(!execution.operator_required);
+    assert!(execution.cex.deposit.deposit_txid.is_none());
+    assert!(execution.cex.deposit.deposit_transfer_created_at_ns.is_some(), "saved for the retry");
 }

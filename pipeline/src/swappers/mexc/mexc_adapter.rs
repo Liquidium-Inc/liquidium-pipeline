@@ -3,6 +3,7 @@ use std::env;
 
 use async_trait::async_trait;
 
+use liquidium_pipeline_connectors::backend::SIDE_EFFECT_AMBIGUOUS_PREFIX;
 use liquidium_pipeline_connectors::backend::cex_backend::{
     BuyOrderInputMode, CexBackend, CexBackendError, DepositAddress, OrderBook, OrderBookLevel, SwapExecutionOptions,
     SwapFillReport, WithdrawStatus, WithdrawStatusSnapshot, WithdrawalReceipt,
@@ -28,7 +29,11 @@ fn from_mexc_raw(s: &str) -> WithdrawStatus {
     let normalized = s.trim().to_ascii_uppercase();
     match normalized.as_str() {
         // Text statuses seen from MEXC.
-        "WAIT" | "PENDING" | "PROCESSING" => WithdrawStatus::Pending,
+        // Every in-flight name the MEXC client renders. An accepted withdrawal
+        // must never read as absent, or an uncertain request could be repeated.
+        "APPLY" | "AUDITING" | "WAIT" | "PENDING" | "PROCESSING" | "WAIT_PACKAGING" | "WAIT_CONFIRM" | "MANUAL" => {
+            WithdrawStatus::Pending
+        }
         "SUCCESS" | "FINISHED" | "DONE" => WithdrawStatus::Completed,
         "FAILED" | "FAIL" => WithdrawStatus::Failed,
         "CANCEL" | "CANCELED" => WithdrawStatus::Canceled,
@@ -146,6 +151,30 @@ fn is_coin_missing(err: &v3::ApiError) -> bool {
         err,
         v3::ApiError::ErrorResponse(resp) if resp.code == v3::ErrorCode::CurrencyDoesNotExist
     )
+}
+
+/// True when MEXC refused the request before it acted on it. Transport
+/// errors, 5xx answers, unreadable replies and "processing" codes leave the
+/// outcome open, and MEXC documents 5xx as possibly executed.
+fn is_definite_rejection(err: &v3::ApiError) -> bool {
+    use v3::ErrorCode::*;
+    match err {
+        v3::ApiError::ErrorResponse(resp) => !matches!(
+            resp.code,
+            InternalError
+                | ServiceUnavailable
+                | GatewayTimeout
+                | TransferOperationProcessing
+                | AssetFlowWritingFailedPleaseTryAgain
+                | InternalSystemErrorPleaseContactSupport
+        ),
+        v3::ApiError::MalformedRequest
+        | v3::ApiError::WebApplicationFirewallViolated
+        | v3::ApiError::RateLimitExceeded
+        | v3::ApiError::SerdeUrlencodedError(_)
+        | v3::ApiError::SignQueryError(_) => true,
+        _ => false,
+    }
 }
 
 /// MEXC answers a history read for a coin it does not list with 700004,
@@ -1335,6 +1364,7 @@ impl CexBackend for MexcClient {
         network: &str,
         address: &str,
         amount: f64,
+        withdraw_order_id: &str,
     ) -> Result<WithdrawalReceipt, String> {
         let ex = self.inner.lock().await;
         let push_unique = |list: &mut Vec<String>, value: String| {
@@ -1358,8 +1388,8 @@ impl CexBackend for MexcClient {
         let network_candidates = ordered_networks;
 
         info!(
-            "Withdraw request coin={} network_candidates={:?} amount={} address={}",
-            asset, network_candidates, amount, address
+            "Withdraw request coin={} network_candidates={:?} amount={} address={} withdraw_order_id={}",
+            asset, network_candidates, amount, address, withdraw_order_id
         );
 
         let mut last_err: Option<String> = None;
@@ -1375,7 +1405,7 @@ impl CexBackend for MexcClient {
                         memo: None,
                         network: Some(net.clone()),
                         remark: None,
-                        withdraw_order_id: None,
+                        withdraw_order_id: Some(withdraw_order_id.to_string()),
                     })
                     .await
                 {
@@ -1384,6 +1414,13 @@ impl CexBackend for MexcClient {
                         break;
                     }
                     Err(e) => {
+                        // A request MEXC may have executed ends the search: the
+                        // next alias would be a second withdrawal of the same funds.
+                        if !is_definite_rejection(&e) {
+                            return Err(format!(
+                                "{SIDE_EFFECT_AMBIGUOUS_PREFIX}: MEXC withdraw coin={coin} network={net} withdraw_order_id={withdraw_order_id} has no decided answer: {e}"
+                            ));
+                        }
                         if is_coin_missing(&e) {
                             last_err = Some(e.to_string());
                             continue;
@@ -1502,6 +1539,50 @@ impl CexBackend for MexcClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_status_the_mexc_client_renders_is_a_known_withdraw_status() {
+        for code in 1..=10 {
+            let status = mexc_rs::spot::v3::withdraw::WithdrawStatus::from_code(code).expect("documented code");
+            assert_ne!(
+                from_mexc_raw(status.as_str()),
+                WithdrawStatus::Unknown,
+                "{} must not read as an absent withdrawal",
+                status.as_str()
+            );
+        }
+    }
+
+    #[test]
+    fn only_refusals_before_execution_allow_another_withdraw_alias() {
+        let response = |code: v3::ErrorCode, raw_code: i32| {
+            v3::ApiError::ErrorResponse(v3::ErrorResponse {
+                code,
+                raw_code,
+                msg: "test".into(),
+                _extend: None,
+            })
+        };
+        for refused in [
+            response(v3::ErrorCode::InsufficientBalance, 10101),
+            response(v3::ErrorCode::CurrencyDoesNotExist, 10232),
+            v3::ApiError::MalformedRequest,
+            v3::ApiError::RateLimitExceeded,
+            v3::ApiError::WebApplicationFirewallViolated,
+        ] {
+            assert!(is_definite_rejection(&refused), "{refused:?}");
+        }
+        for open in [
+            response(v3::ErrorCode::InternalError, 500),
+            response(v3::ErrorCode::GatewayTimeout, 504),
+            response(v3::ErrorCode::TransferOperationProcessing, 10200),
+            response(v3::ErrorCode::InternalSystemErrorPleaseContactSupport, 20002),
+            v3::ApiError::InternalServerError,
+            v3::ApiError::UnableToParseResponse,
+        ] {
+            assert!(!is_definite_rejection(&open), "{open:?}");
+        }
+    }
 
     #[test]
     fn a_history_read_skips_only_aliases_that_mexc_does_not_list() {
