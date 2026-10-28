@@ -61,6 +61,7 @@ where
                 deposit_txid: None,
                 deposit_balance_before: None,
                 deposit_sent_at_ts: None,
+                deposit_credit_since_ts: None,
                 approval_bump_count: None,
                 deposit_funding: None,
                 bridge: CexDepositBridgeState {

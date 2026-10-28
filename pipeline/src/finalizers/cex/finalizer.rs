@@ -35,9 +35,9 @@ const NATIVE_ETH_BRIDGEABLE_SAFETY_MARGIN: f64 = 1e-15;
 pub(super) const BRIDGE_FEE_TOKEN_SYMBOL: &str = "ckETH";
 pub(super) const BRIDGE_FEE_TOKEN_CHAIN: &str = "ICP";
 pub(super) const CKETH_DECIMALS: u8 = 18;
-/// A direct withdrawal that the exchange accepted but never reports as delivered
-/// must not wait forever. After this long the row parks for an operator.
-const DIRECT_WITHDRAW_DELIVERY_TIMEOUT_SECS: i64 = 60 * 60;
+/// An accepted exchange withdrawal must reach its address, or the return bridge,
+/// within this time. After it, each waiting cycle errors, so the row parks for an operator.
+const WITHDRAW_DELIVERY_TIMEOUT_SECS: i64 = 60 * 60;
 /// How long a landed bridge deposit may wait for the provider to accept it.
 /// The ckSOL minter reads it at finalized commitment, which takes seconds.
 const DEPOSIT_NOTICE_WINDOW_SECS: i64 = 30 * 60;

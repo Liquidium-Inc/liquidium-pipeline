@@ -94,7 +94,7 @@ where
                     // A busy bridge wallet is a wait. Nothing was signed.
                     Err(BridgeError::Deferred(error)) => {
                         info!("[cex] liq_id={} bridged withdraw deferred: {}", liq_id, error);
-                        return Ok(());
+                        return Ok(Self::wait_before_bridge(state, &error)?);
                     }
                     Err(error) => return Err(error.into()),
                 };
@@ -207,6 +207,7 @@ where
             };
             state.withdraw.withdraw_id = Some(accepted.id);
             state.withdraw.withdraw_txid = accepted.txid;
+            state.withdraw.withdraw_accepted_at_ts = Some(now_ts());
             state.step = CexStep::WithdrawPending;
             return Ok(());
         }
@@ -282,8 +283,10 @@ where
                         state.liq_id, withdraw_snapshot.status, withdraw_id
                     );
                 } else {
-                    state.step = CexStep::WithdrawPending;
-                    return Ok(());
+                    return Ok(Self::wait_before_bridge(
+                        state,
+                        "the exchange has not sent the withdrawal",
+                    )?);
                 }
             }
             WithdrawStatus::Failed | WithdrawStatus::Canceled => {
@@ -356,8 +359,10 @@ where
                         route.source_chain,
                         route.target_asset,
                     );
-                    state.step = CexStep::WithdrawPending;
-                    return Ok(());
+                    return Ok(Self::wait_before_bridge(
+                        state,
+                        "the bridge source has no bridgeable ETH yet",
+                    )?);
                 }
                 info!(
                     "[cex] liq_id={} bridged native ETH withdraw adjusting to bridgeable source balance: amount {} -> {} (source includes gas reserve; safety_margin={} tolerance={} source={} route={}@{}->{})",
@@ -384,8 +389,10 @@ where
                     route.source_chain,
                     route.target_asset,
                 );
-                state.step = CexStep::WithdrawPending;
-                return Ok(());
+                return Ok(Self::wait_before_bridge(
+                    state,
+                    "the bridge source holds less than the withdrawal",
+                )?);
             }
         }
 
@@ -433,11 +440,10 @@ where
         }
         let submission = match bridge.backend.submit_bridge(request).await {
             Ok(submission) => submission,
-            // Same wait semantics as the deposit side: no budget spent.
+            // A busy bridge wallet is a wait, bounded like the other waits here.
             Err(BridgeError::Deferred(error)) => {
                 info!("[cex] liq_id={} bridged withdraw deferred: {}", state.liq_id, error);
-                state.step = CexStep::WithdrawPending;
-                return Ok(());
+                return Ok(Self::wait_before_bridge(state, &error)?);
             }
             Err(error) => return Err(error.into()),
         };
@@ -558,6 +564,22 @@ where
             )
             .into()),
         }
+    }
+
+    /// A wait before the return bridge starts, which only the exchange, the chain
+    /// or a funded bridge wallet can end. Past the delivery bound it errors, so the
+    /// row parks with an alert.
+    fn wait_before_bridge(state: &mut CexState, reason: &str) -> Result<(), String> {
+        state.step = CexStep::WithdrawPending;
+        let accepted_at = *state.withdraw.withdraw_accepted_at_ts.get_or_insert_with(now_ts);
+        let waited = now_ts().saturating_sub(accepted_at);
+        if waited > WITHDRAW_DELIVERY_TIMEOUT_SECS {
+            return Err(format!(
+                "bridged withdraw for liq_id {} still waits after {waited}s: {reason}",
+                state.liq_id
+            ));
+        }
+        Ok(())
     }
 
     /// A bridge wait past the stall bound is stamped on the leg. A read that still

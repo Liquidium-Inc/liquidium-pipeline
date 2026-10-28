@@ -459,6 +459,52 @@ async fn mexc_deposit_bridge_waits_for_source_funding_snapshot() {
     assert!(state.deposit.bridge.deposit_bridge_id.is_none());
 }
 
+/// The deposit-side twin of review finding 12: funds in the bridge account
+/// that never start their bridge must not wait forever.
+#[tokio::test]
+async fn a_deposit_bridge_that_never_starts_ends_at_its_bound() {
+    let mut cex = MockCexBackend::new();
+    let mut bridge = MockBridgeBackend::new();
+    let mut transfers = MockTransferActions::new();
+    cex.expect_get_balance().returning(|_| Ok(10.0));
+    cex.expect_get_deposit_address().returning(|asset, network| {
+        Ok(DepositAddress {
+            asset: asset.to_string(),
+            network: network.to_string(),
+            address: "0x1111111111111111111111111111111111111111".to_string(),
+            tag: None,
+        })
+    });
+    transfers
+        .expect_transfer()
+        .times(1)
+        .returning(|_token, _to, _amount| Ok("tx-bridge-fund-short".to_string()));
+    bridge.expect_get_source_balance().returning(|_, _, _| Ok(0.000_001));
+    bridge.expect_get_fee_budget().returning(|_, _, _| {
+        Ok(BridgeFeeBudget {
+            source_fee_budget: 0.01,
+            ..BridgeFeeBudget::default()
+        })
+    });
+    bridge.expect_get_minimum_bridge_amount().returning(|_, _, _| Ok(0.0));
+    let finalizer =
+        test_finalizer(Arc::new(cex), Arc::new(transfers)).with_bridge_runtime(bridge_dependencies(Arc::new(bridge)));
+    let receipt = make_execution_receipt_with_assets(82, ckusdc_token(), ckbtc_token());
+    let mut state = finalizer.prepare("82", &receipt).await.unwrap();
+
+    fund(&finalizer, &mut state).await;
+    finalizer
+        .deposit(&mut state)
+        .await
+        .expect("within the bound the leg waits");
+    let funded_at = state.deposit.deposit_sent_at_ts.expect("the funding time is the clock");
+
+    state.deposit.deposit_sent_at_ts = Some(funded_at - 2 * 60 * 60);
+    let error = finalizer.deposit(&mut state).await.unwrap_err();
+    assert!(error.to_string().contains("still waits"), "{error}");
+    assert!(state.deposit.bridge.deposit_bridge_id.is_none());
+}
+
 #[tokio::test]
 async fn mexc_deposit_bridge_waits_for_cketh_fee_funding_snapshot() {
     let mut cex = MockCexBackend::new();

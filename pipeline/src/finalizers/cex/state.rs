@@ -43,6 +43,9 @@ pub struct CexDepositState {
     pub deposit_balance_before: Option<f64>,
     #[serde(default)]
     pub deposit_sent_at_ts: Option<i64>,
+    /// When the leg first found the deposit not credited by the exchange.
+    #[serde(default)]
+    pub deposit_credit_since_ts: Option<i64>,
     #[serde(default)]
     pub approval_bump_count: Option<u32>,
     /// The funding transfer, saved before it is sent. Retries and restarts send
@@ -167,7 +170,7 @@ pub struct CexWithdrawState {
     pub withdraw_address: String,
     pub withdraw_id: Option<String>,
     pub withdraw_txid: Option<String>,
-    /// When the exchange accepted a direct withdrawal that had no transaction id yet.
+    /// When the exchange accepted the withdrawal. The delivery wait counts from here.
     #[serde(default)]
     pub withdraw_accepted_at_ts: Option<i64>,
     /// Bumped after each refused request, so a new request gets a new order id.
@@ -334,6 +337,7 @@ mod tests {
                 deposit_txid: None,
                 deposit_balance_before: None,
                 deposit_sent_at_ts: None,
+                deposit_credit_since_ts: None,
                 approval_bump_count: None,
                 deposit_funding: None,
                 bridge: CexDepositBridgeState {
