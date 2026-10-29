@@ -122,13 +122,8 @@ fn build_backend(
     proxy_canister: Option<Principal>,
 ) -> Result<SolanaBridgeBackend<Agent, IcpBackendImpl<Agent>, SolanaBackendImpl>, String> {
     let agent = Arc::new(
-        crate::simulator::build_ic_agent(
-            Agent::builder()
-                .with_url(config.ic_url.clone())
-                .with_identity(config.bridge_ic_identity.clone())
-                .with_max_tcp_error_retries(3),
-        )
-        .map_err(|e| format!("ic agent(bridge-sol command) build failed: {e}"))?,
+        crate::context::build_ic_agent(&config.ic_url, config.bridge_ic_identity.clone())
+            .map_err(|e| format!("ic agent(bridge-sol command) build failed: {e}"))?,
     );
 
     let icp_backend = Arc::new(IcpBackendImpl::new(agent.clone()));

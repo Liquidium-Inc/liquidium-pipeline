@@ -85,11 +85,12 @@ pub struct MexcClient {
 impl MexcClient {
     /// A client of the real MEXC, or of the workbench's local MEXC in a simulator build.
     pub fn new(api_key: &str, secret: &str) -> Result<Self, String> {
-        let (endpoint, api_base) = match crate::simulator::mexc_api_base()? {
-            Some(local) => (mexc_rs::spot::MexcSpotApiEndpoint::Custom(local.clone()), local),
-            None => (mexc_rs::spot::MexcSpotApiEndpoint::Base, MEXC_API_BASE.to_string()),
-        };
-        let api = MexcSpotApiClientWithAuthentication::new(endpoint, api_key.to_string(), secret.to_string());
+        let api_base = crate::simulator::mexc_api_base()?.unwrap_or_else(|| MEXC_API_BASE.to_string());
+        let api = MexcSpotApiClientWithAuthentication::new(
+            mexc_rs::spot::MexcSpotApiEndpoint::Custom(api_base.clone()),
+            api_key.to_string(),
+            secret.to_string(),
+        );
         Ok(Self {
             inner: tokio::sync::Mutex::new(api),
             symbol_filters: tokio::sync::Mutex::new(HashMap::new()),

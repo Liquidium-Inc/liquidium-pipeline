@@ -5,7 +5,7 @@ use alloy::network::AnyNetwork;
 use alloy::providers::{Provider, ProviderBuilder, WalletProvider};
 use alloy::signers::local::PrivateKeySigner;
 
-use ic_agent::Agent;
+use ic_agent::{Agent, Identity};
 use icrc_ledger_types::icrc1::account::Account;
 use liquidium_pipeline_connectors::account::evm_account::EvmAccountInfoAdapter;
 use liquidium_pipeline_connectors::account::icp_account::IcpAccountInfoAdapter;
@@ -139,13 +139,8 @@ impl<P: Provider<AnyNetwork> + WalletProvider<AnyNetwork> + Clone + 'static> Pip
                 PipelineContextError::Other("missing IC Trader".to_string())
             })?));
         let bridge_agent = Arc::new(
-            crate::simulator::build_ic_agent(
-                Agent::builder()
-                    .with_url(config.ic_url.clone())
-                    .with_identity(config.bridge_ic_identity.clone())
-                    .with_max_tcp_error_retries(3),
-            )
-            .map_err(|e| PipelineContextError::Other(format!("ic agent(bridge) build: {e}")))?,
+            build_ic_agent(&config.ic_url, config.bridge_ic_identity.clone())
+                .map_err(|e| PipelineContextError::Other(format!("ic agent(bridge) build: {e}")))?,
         );
         let icp_backend_bridge = Arc::new(IcpBackendImpl::new(bridge_agent));
 
@@ -383,6 +378,22 @@ impl<P: Provider<AnyNetwork> + WalletProvider<AnyNetwork> + Clone + 'static> Pip
     }
 }
 
+/// Builds an IC agent for `identity`. A simulator build trusts the PocketIC root key,
+/// and PocketIC does not sign query replies.
+pub fn build_ic_agent(url: &str, identity: Arc<dyn Identity>) -> Result<Agent, String> {
+    let agent = Agent::builder()
+        .with_url(url)
+        .with_arc_identity(identity)
+        .with_max_tcp_error_retries(3)
+        .with_verify_query_signatures(!crate::simulator::ENABLED)
+        .build()
+        .map_err(|error| error.to_string())?;
+    if crate::simulator::ENABLED {
+        agent.set_root_key(crate::simulator::ic_root_key()?);
+    }
+    Ok(agent)
+}
+
 fn setup_agents_and_provider(
     config: &Config,
 ) -> Result<
@@ -394,23 +405,13 @@ fn setup_agents_and_provider(
     String,
 > {
     let agent_main = Arc::new(
-        crate::simulator::build_ic_agent(
-            Agent::builder()
-                .with_url(config.ic_url.clone())
-                .with_identity(config.liquidator_identity.clone())
-                .with_max_tcp_error_retries(3),
-        )
-        .map_err(|e| format!("ic agent(main) build: {e}"))?,
+        build_ic_agent(&config.ic_url, config.liquidator_identity.clone())
+            .map_err(|e| format!("ic agent(main) build: {e}"))?,
     );
 
     let agent_trader = Arc::new(
-        crate::simulator::build_ic_agent(
-            Agent::builder()
-                .with_url(config.ic_url.clone())
-                .with_identity(config.trader_identity.clone())
-                .with_max_tcp_error_retries(3),
-        )
-        .map_err(|e| format!("ic agent(trader) build: {e}"))?,
+        build_ic_agent(&config.ic_url, config.trader_identity.clone())
+            .map_err(|e| format!("ic agent(trader) build: {e}"))?,
     );
 
     // Build a wallet-backed EVM RootProvider from config.evm_url and config.evm_private_key.

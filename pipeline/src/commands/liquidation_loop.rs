@@ -261,9 +261,10 @@ async fn init(
                     .ok_or_else(|| "ICPSwap is enabled but its adapter was not initialized".to_string())?,
             ),
             MEXC_VENUE_ID => {
-                let bridge = match crate::simulator::mexc_uses_bridge() {
-                    true => Some(shared_bridge().await?.clone()),
-                    false => None,
+                let bridge = if crate::simulator::mexc_uses_bridge() {
+                    Some(shared_bridge().await?.clone())
+                } else {
+                    None
                 };
                 venue_adapters.push(build_mexc_finalizer(ctx.as_ref(), bridge)?)
             }
@@ -323,7 +324,8 @@ async fn init(
             config.cex_retry_max_secs,
         )
         .with_watchdog(slack_watchdog.clone())
-        .with_retained_collateral(crate::simulator::retains_collateral()),
+        // A simulator build with no venue keeps the collateral; a default build always has a venue.
+        .with_retained_collateral(crate::simulator::ENABLED && config.enabled_swap_venues.is_empty()),
     );
 
     info!("Initializing searcher stage ...");

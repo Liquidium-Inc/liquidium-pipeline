@@ -1,4 +1,6 @@
 //! Trade route discovery and route previews.
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use super::*;
 
 #[tokio::test]
@@ -882,29 +884,26 @@ async fn mexc_preview_route_resolves_direct_buy_leg_when_sell_book_empty() {
     assert!(preview.price_impact_bps >= 0.0);
 }
 
-/// Books for BTC -> USDT: a deep direct book, and a better but shallow route through USDC.
-fn btc_usdt_books(high_usdc_fee: Arc<std::sync::atomic::AtomicBool>) -> MockCexBackend {
+/// A one-level book at `price`, with the ask just above the bid.
+fn book(price: f64, quantity: f64, taker_fee_bps: f64) -> OrderBook {
+    OrderBook {
+        bids: vec![OrderBookLevel { price, quantity }],
+        asks: vec![OrderBookLevel {
+            price: price * 1.001,
+            quantity,
+        }],
+        taker_fee_bps,
+    }
+}
+
+/// Books for BTC -> USDT: a deep direct book, and a slightly better but shallow route through USDC.
+fn btc_usdt_books(usdc_fee_bps: Arc<AtomicU64>) -> MockCexBackend {
     let mut backend = MockCexBackend::new();
-    backend.expect_get_orderbook().returning(move |market, _| {
-        let (price, quantity) = match market {
-            "BTC_USDT" => (100.0, 10.0),
-            "BTC_USDC" => (110.0, 1.0),
-            "USDC_USDT" => (1.0, 1000.0),
-            _ => return Err("unknown market".to_string()),
-        };
-        let fee = if market == "BTC_USDC" && high_usdc_fee.load(std::sync::atomic::Ordering::SeqCst) {
-            2000.0
-        } else {
-            5.0
-        };
-        Ok(OrderBook {
-            bids: vec![OrderBookLevel { price, quantity }],
-            asks: vec![OrderBookLevel {
-                price: price * 1.001,
-                quantity,
-            }],
-            taker_fee_bps: fee,
-        })
+    backend.expect_get_orderbook().returning(move |market, _| match market {
+        "BTC_USDT" => Ok(book(100.0, 10.0, 5.0)),
+        "BTC_USDC" => Ok(book(101.0, 1.0, usdc_fee_bps.load(Ordering::SeqCst) as f64)),
+        "USDC_USDT" => Ok(book(1.0, 1000.0, 5.0)),
+        _ => Err("unknown market".to_string()),
     });
     backend
 }
@@ -916,9 +915,9 @@ fn markets(legs: &[TradeLeg]) -> Vec<&str> {
 /// Best-output routing weighs depth for this amount and each hop's taker fee.
 #[tokio::test]
 async fn best_output_routing_weighs_depth_and_hop_fees_for_the_amount() {
-    let high_fee = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let usdc_fee_bps = Arc::new(AtomicU64::new(5));
     let finalizer = test_finalizer(
-        Arc::new(btc_usdt_books(high_fee.clone())),
+        Arc::new(btc_usdt_books(usdc_fee_bps.clone())),
         Arc::new(MockTransferActions::new()),
     )
     .with_route_config(vec!["BTC_USDT".into(), "BTC_USDC".into(), "USDC_USDT".into()], 2)
@@ -937,7 +936,8 @@ async fn best_output_routing_weighs_depth_and_hop_fees_for_the_amount() {
         .unwrap();
     assert_eq!(markets(&large), vec!["BTC_USDT"]);
 
-    high_fee.store(true, std::sync::atomic::Ordering::SeqCst);
+    // 150 bps stays inside the 200 bps cap, but it costs more than the better USDC price gains.
+    usdc_fee_bps.store(150, Ordering::SeqCst);
     let expensive = finalizer
         .resolve_trade_legs_for_amount("BTC", "USDT", 0.5)
         .await
@@ -948,9 +948,11 @@ async fn best_output_routing_weighs_depth_and_hop_fees_for_the_amount() {
 /// Without the switch, the first executable route stands, as before the workbench.
 #[tokio::test]
 async fn routing_keeps_the_first_executable_route_without_best_output() {
-    let high_fee = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let finalizer = test_finalizer(Arc::new(btc_usdt_books(high_fee)), Arc::new(MockTransferActions::new()))
-        .with_route_config(vec!["BTC_USDT".into(), "BTC_USDC".into(), "USDC_USDT".into()], 2);
+    let finalizer = test_finalizer(
+        Arc::new(btc_usdt_books(Arc::new(AtomicU64::new(5)))),
+        Arc::new(MockTransferActions::new()),
+    )
+    .with_route_config(vec!["BTC_USDT".into(), "BTC_USDC".into(), "USDC_USDT".into()], 2);
 
     let legs = finalizer
         .resolve_trade_legs_for_amount("BTC", "USDT", 0.5)
@@ -963,24 +965,11 @@ async fn routing_keeps_the_first_executable_route_without_best_output() {
 #[tokio::test]
 async fn best_output_routing_keeps_mexc_sol_on_its_one_market() {
     let mut backend = MockCexBackend::new();
-    backend.expect_get_orderbook().returning(|market, _| {
-        let price = match market {
-            "SOL_USDT" => 100.0,
-            "SOL_USDC" => 200.0,
-            "USDC_USDT" => 1.0,
-            _ => return Err("unlisted market".to_string()),
-        };
-        Ok(OrderBook {
-            bids: vec![OrderBookLevel {
-                price,
-                quantity: 1000.0,
-            }],
-            asks: vec![OrderBookLevel {
-                price: price * 1.001,
-                quantity: 1000.0,
-            }],
-            taker_fee_bps: 5.0,
-        })
+    backend.expect_get_orderbook().returning(|market, _| match market {
+        "SOL_USDT" => Ok(book(100.0, 1000.0, 5.0)),
+        "SOL_USDC" => Ok(book(200.0, 1000.0, 5.0)),
+        "USDC_USDT" => Ok(book(1.0, 1000.0, 5.0)),
+        _ => Err("unlisted market".to_string()),
     });
     let finalizer = test_finalizer(Arc::new(backend), Arc::new(MockTransferActions::new()))
         .with_route_config(vec!["SOL_USDT".into(), "SOL_USDC".into(), "USDC_USDT".into()], 2)

@@ -4,7 +4,8 @@
 use std::env;
 
 use candid::Principal;
-use ic_agent::{Agent, agent::AgentBuilder};
+
+use crate::finalizers::multi_venue::{ICPSWAP_VENUE_ID, MEXC_VENUE_ID};
 
 /// True in a `simulator` build. A default build never reads a `SIM_*` setting.
 pub const ENABLED: bool = cfg!(feature = "simulator");
@@ -13,30 +14,15 @@ pub const ENABLED: bool = cfg!(feature = "simulator");
 pub const RETAINED_COLLATERAL: &str =
     "simulator: liquidation settled; collateral retained, exchange finalisation disabled";
 
-/// Builds an IC agent. A simulator build trusts the PocketIC root key that the
-/// workbench exports, and PocketIC does not sign query replies.
-pub fn build_ic_agent(builder: AgentBuilder) -> Result<Agent, String> {
-    let agent = builder
-        .with_verify_query_signatures(!ENABLED)
-        .build()
-        .map_err(|error| error.to_string())?;
-    if ENABLED {
-        let path = env::var("SIM_IC_ROOT_KEY").map_err(|error| format!("SIM_IC_ROOT_KEY: {error}"))?;
-        agent.set_root_key(std::fs::read(path).map_err(|error| format!("PocketIC root key: {error}"))?);
-    }
-    Ok(agent)
+/// The PocketIC root key that the workbench exports to the file in `SIM_IC_ROOT_KEY`.
+pub fn ic_root_key() -> Result<Vec<u8>, String> {
+    let path = env::var("SIM_IC_ROOT_KEY").map_err(|error| format!("SIM_IC_ROOT_KEY: {error}"))?;
+    std::fs::read(path).map_err(|error| format!("PocketIC root key: {error}"))
 }
 
 /// A simulator build talks only to a PocketIC on this machine.
 pub fn require_loopback_ic_url(ic_url: &str) -> Result<(), String> {
-    if !ENABLED {
-        return Ok(());
-    }
-    loopback_ic_url(ic_url)
-}
-
-fn loopback_ic_url(raw: &str) -> Result<(), String> {
-    let url = reqwest::Url::parse(raw).map_err(|error| format!("invalid simulator IC URL: {error}"))?;
+    let url = reqwest::Url::parse(ic_url).map_err(|error| format!("invalid simulator IC URL: {error}"))?;
     if !is_loopback_http(&url) {
         return Err("simulator builds require a loopback PocketIC URL".to_string());
     }
@@ -78,17 +64,12 @@ pub fn enabled_swap_venues() -> Result<Vec<String>, String> {
     let mut venues = Vec::new();
     if let Ok(factory) = env::var("SIM_ICPSWAP_FACTORY") {
         Principal::from_text(&factory).map_err(|error| format!("SIM_ICPSWAP_FACTORY: {error}"))?;
-        venues.push("icpswap".to_string());
+        venues.push(ICPSWAP_VENUE_ID.to_string());
     }
     if env::var_os("SIM_MEXC_URL").is_some() {
-        venues.push("mexc".to_string());
+        venues.push(MEXC_VENUE_ID.to_string());
     }
     Ok(venues)
-}
-
-/// Whether a settled liquidation keeps its collateral, because no venue runs.
-pub fn retains_collateral() -> bool {
-    ENABLED && env::var_os("SIM_MEXC_URL").is_none() && env::var_os("SIM_ICPSWAP_FACTORY").is_none()
 }
 
 /// The local MEXC holds ck assets itself, so it skips the production bridge
@@ -99,18 +80,18 @@ pub fn mexc_uses_bridge() -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{local_origin, loopback_ic_url};
+    use super::{local_origin, require_loopback_ic_url};
 
     #[test]
     fn only_a_loopback_http_ic_url_is_accepted() {
-        assert!(loopback_ic_url("http://127.0.0.1:8080").is_ok());
+        assert!(require_loopback_ic_url("http://127.0.0.1:8080").is_ok());
         for url in [
             "https://127.0.0.1:8080",
             "http://localhost:8080",
             "https://icp-api.io",
             "not a url",
         ] {
-            assert!(loopback_ic_url(url).is_err(), "{url}");
+            assert!(require_loopback_ic_url(url).is_err(), "{url}");
         }
     }
 
@@ -129,12 +110,5 @@ mod tests {
         ] {
             assert!(local_origin(url).is_err(), "{url}");
         }
-    }
-
-    /// A default build keeps the real IC: it never checks the URL.
-    #[cfg(not(feature = "simulator"))]
-    #[test]
-    fn a_default_build_accepts_any_ic_url() {
-        assert!(super::require_loopback_ic_url("https://icp-api.io").is_ok());
     }
 }

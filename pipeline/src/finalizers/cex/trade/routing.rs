@@ -5,7 +5,6 @@ use crate::config::normalize_cex_market_pair;
 use crate::finalizers::bridge_planner::BridgePlanner;
 use crate::finalizers::cex::state::CexRouteLeg;
 use crate::finalizers::cex::utils::parse_market_symbols;
-use crate::swappers::model::BPS_PER_RATIO_UNIT;
 
 impl<C> CexVenueFinalizer<C>
 where
@@ -439,8 +438,8 @@ where
     }
 
     /// Of the configured simple routes and the first executable route, the one with the
-    /// largest net output for `amount`, after book depth and each hop's taker fee.
-    pub(crate) async fn best_trade_legs_for_amount(
+    /// largest net output for `amount`, by the same preview that prices the trade.
+    async fn best_trade_legs_for_amount(
         &self,
         deposit_symbol: &str,
         withdraw_symbol: &str,
@@ -448,9 +447,6 @@ where
     ) -> Result<Vec<TradeLeg>, String> {
         let deposit = Self::normalize_symbol(deposit_symbol);
         let withdraw = Self::normalize_symbol(withdraw_symbol);
-        if !amount.is_finite() || amount <= 0.0 {
-            return Err("route amount must be positive and finite".to_string());
-        }
         if deposit == withdraw {
             return Ok(vec![]);
         }
@@ -468,27 +464,16 @@ where
         candidates.dedup_by(|left, right| Self::route_signature(left) == Self::route_signature(right));
         let mut best: Option<(f64, Vec<TradeLeg>)> = None;
         for candidate in candidates {
-            let Ok(output) = self.preview_net_through_legs(&candidate, amount).await else {
+            let Ok(preview) = self.preview_resolved_trade_route(&candidate, amount).await else {
                 continue;
             };
+            let output = preview.receive_amount;
             if output.is_finite() && best.as_ref().is_none_or(|(best_output, _)| output > *best_output) {
                 best = Some((output, candidate));
             }
         }
         best.map(|(_, legs)| legs)
             .ok_or_else(|| format!("no fully executable route for {amount} {deposit} -> {withdraw}"))
-    }
-
-    /// The output of `legs` for `amount_in`, after each hop's taker fee.
-    async fn preview_net_through_legs(&self, legs: &[TradeLeg], mut amount_in: f64) -> Result<f64, String> {
-        for leg in legs {
-            let preview = self.preview_leg(&leg.market, &leg.side, amount_in).await?;
-            if !(0.0..BPS_PER_RATIO_UNIT).contains(&preview.taker_fee_bps) {
-                return Err(format!("invalid taker fee {} on {}", preview.taker_fee_bps, leg.market));
-            }
-            amount_in = preview.gross_out * (1.0 - preview.taker_fee_bps / BPS_PER_RATIO_UNIT);
-        }
-        Ok(amount_in)
     }
 
     /// Resolve route legs once, then always reuse persisted legs on subsequent calls.

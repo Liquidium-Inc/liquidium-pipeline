@@ -264,7 +264,9 @@ impl Config {
         let home = config_dir();
 
         let ic_url = env::var("IC_URL").map_err(|_| "IC_URL not configured".to_string())?;
-        crate::simulator::require_loopback_ic_url(&ic_url)?;
+        if crate::simulator::ENABLED {
+            crate::simulator::require_loopback_ic_url(&ic_url)?;
+        }
         let export_path_raw = env::var("EXPORT_PATH").unwrap_or(format!("{}/executions.csv", home));
         let export_path = expand_tilde(&export_path_raw).to_string_lossy().into_owned();
 
@@ -789,8 +791,7 @@ pub(crate) fn parse_icpswap_factory_from_env() -> Result<Principal, String> {
     };
     let raw = env::var(key).unwrap_or_else(|_| DEFAULT_ICPSWAP_FACTORY_CANISTER.to_string());
     let trimmed = raw.trim();
-    Principal::from_text(trimmed)
-        .map_err(|error| format!("invalid ICPSWAP_FACTORY_CANISTER principal '{trimmed}': {error}"))
+    Principal::from_text(trimmed).map_err(|error| format!("invalid {key} principal '{trimmed}': {error}"))
 }
 
 /// Mirrors `IcpswapFirstPlannerConfig::validate`: a non-finite or non-positive
