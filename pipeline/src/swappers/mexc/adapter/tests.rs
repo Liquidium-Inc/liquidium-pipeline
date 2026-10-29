@@ -150,16 +150,7 @@ async fn native_deposit_prefers_eth_and_ignores_cketh_address() {
         );
         stream.write_all(response.as_bytes()).await.unwrap();
     });
-    let client = MexcClient {
-        inner: tokio::sync::Mutex::new(MexcSpotApiClientWithAuthentication::new(
-            mexc_rs::spot::MexcSpotApiEndpoint::Custom(endpoint),
-            "test-key".into(),
-            "test-secret".into(),
-        )),
-        symbol_filters: tokio::sync::Mutex::new(HashMap::new()),
-        coin_config: CoinConfigCache::default(),
-        http: reqwest::Client::new(),
-    };
+    let client = client_at(endpoint);
     let address = tokio::time::timeout(
         std::time::Duration::from_secs(5),
         client.get_deposit_address("ETH", "ETH"),
@@ -470,13 +461,14 @@ async fn serve(responses: Vec<(u16, &'static str)>) -> (String, tokio::task::Joi
 fn client_at(endpoint: String) -> MexcClient {
     MexcClient {
         inner: tokio::sync::Mutex::new(MexcSpotApiClientWithAuthentication::new(
-            mexc_rs::spot::MexcSpotApiEndpoint::Custom(endpoint),
+            mexc_rs::spot::MexcSpotApiEndpoint::Custom(endpoint.clone()),
             "test-key".into(),
             "test-secret".into(),
         )),
         symbol_filters: tokio::sync::Mutex::new(HashMap::new()),
         coin_config: CoinConfigCache::default(),
         http: reqwest::Client::new(),
+        api_base: endpoint,
     }
 }
 
@@ -742,4 +734,88 @@ fn a_minimum_order_size_finer_than_the_venue_precision_does_not_set_the_scale() 
         ..filters
     };
     assert_eq!(sell(&with_lot_size), Decimal::from_str_exact("7.807").ok());
+}
+
+/// Reads the local MEXC's withdrawal history after a completed custody run.
+#[cfg(feature = "simulator")]
+#[tokio::test]
+#[ignore = "needs a completed local MEXC custody run; reads the withdrawal history only"]
+async fn simulator_mexc_history_contract() {
+    use liquidium_pipeline_connectors::backend::cex_backend::WithdrawStatus;
+
+    let client = MexcClient::from_env().expect("local exchange credentials");
+    let records = client
+        .inner
+        .lock()
+        .await
+        .withdraw_history(WithdrawHistoryRequest {
+            coin: Some("CKUSDT".to_string()),
+            ..Default::default()
+        })
+        .await
+        .expect("typed MEXC withdrawal history");
+    assert!(!records.is_empty());
+    for record in records {
+        let snapshot = client
+            .get_withdraw_status_snapshot_by_id("ckUSDT", &record.id)
+            .await
+            .unwrap();
+        assert_eq!(snapshot.status, WithdrawStatus::Completed);
+    }
+}
+
+/// Trades ckBTC to ckUSDT on the local MEXC and withdraws it.
+#[cfg(feature = "simulator")]
+#[tokio::test]
+#[ignore = "needs a funded local MEXC workbench; places local trades and a withdrawal"]
+async fn simulator_mexc_custody_contract() {
+    use liquidium_pipeline_connectors::backend::cex_backend::SwapExecutionOptions;
+
+    let market_order = || SwapExecutionOptions {
+        client_order_id: None,
+        buy_mode: BuyOrderInputMode::Auto,
+        max_quote_overspend_bps: None,
+        price_limit: None,
+    };
+    let client = MexcClient::from_env().expect("local exchange credentials");
+    let deposit = client
+        .get_deposit_address("CKBTC", "CKBTC")
+        .await
+        .expect("deposit address");
+    assert!(!deposit.address.is_empty());
+    let book = client.get_orderbook("BTC_USDT", Some(50)).await.expect("order book");
+    assert!(!book.bids.is_empty() && !book.asks.is_empty());
+    assert!(client.get_balance("CKBTC").await.unwrap() >= 0.001);
+
+    let first = client
+        .execute_swap_detailed_with_options("CKBTC_BTC", "sell", 0.001, market_order())
+        .await
+        .expect("CKBTC/BTC fill");
+    assert!(first.output_received > 0.0);
+    let btc = client.get_balance("BTC").await.unwrap();
+    let second = client
+        .execute_swap_detailed_with_options("BTC_USDT", "sell", btc, market_order())
+        .await
+        .expect("BTC/USDT fill");
+    assert!(second.output_received > 0.0);
+    let usdt = client.get_balance("USDT").await.unwrap();
+    let third = client
+        .execute_swap_detailed_with_options("CKUSDT_USDT", "buy", usdt, market_order())
+        .await
+        .expect("USDT/CKUSDT fill");
+    assert!(third.output_received > 0.0);
+
+    let ck = client.get_balance("CKUSDT").await.unwrap();
+    let destination = std::env::var("MEXC_TEST_WITHDRAW_ADDRESS").expect("local destination");
+    let receipt = client
+        .withdraw(
+            "CKUSDT",
+            "CKUSDT",
+            &destination,
+            (ck * 1_000_000.0).floor() / 1_000_000.0,
+            "sim-custody-contract",
+        )
+        .await
+        .expect("withdrawal accepted");
+    println!("local MEXC withdrawal: {receipt:?}");
 }

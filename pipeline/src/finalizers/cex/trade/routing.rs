@@ -420,6 +420,62 @@ where
             .map_err(|hop_err| format!("{}; {}", direct_err, hop_err))
     }
 
+    /// The route for `amount`: the largest net output with best-output routing,
+    /// the first executable route otherwise.
+    pub(crate) async fn resolve_trade_legs_for_amount(
+        &self,
+        deposit_symbol: &str,
+        withdraw_symbol: &str,
+        amount: f64,
+    ) -> Result<Vec<TradeLeg>, String> {
+        if self.best_output_routing {
+            self.best_trade_legs_for_amount(deposit_symbol, withdraw_symbol, amount)
+                .await
+        } else {
+            self.resolve_trade_legs_for_symbols(deposit_symbol, withdraw_symbol)
+                .await
+        }
+    }
+
+    /// Of the configured simple routes and the first executable route, the one with the
+    /// largest net output for `amount`, by the same preview that prices the trade.
+    async fn best_trade_legs_for_amount(
+        &self,
+        deposit_symbol: &str,
+        withdraw_symbol: &str,
+        amount: f64,
+    ) -> Result<Vec<TradeLeg>, String> {
+        let deposit = Self::normalize_symbol(deposit_symbol);
+        let withdraw = Self::normalize_symbol(withdraw_symbol);
+        if deposit == withdraw {
+            return Ok(vec![]);
+        }
+        // Both sources keep an exchange's one SOL market: the hop graph skips the others.
+        let mut candidates = self.discover_hop_candidates(&deposit, &withdraw, self.max_hops);
+        if let Ok(first_executable) = self.resolve_trade_legs_for_symbols(&deposit, &withdraw).await {
+            candidates.push(first_executable);
+        }
+        // A stable order breaks ties the same way each time, so the route does not churn.
+        candidates.sort_by(|left, right| {
+            left.len()
+                .cmp(&right.len())
+                .then_with(|| Self::route_signature(left).cmp(&Self::route_signature(right)))
+        });
+        candidates.dedup_by(|left, right| Self::route_signature(left) == Self::route_signature(right));
+        let mut best: Option<(f64, Vec<TradeLeg>)> = None;
+        for candidate in candidates {
+            let Ok(preview) = self.preview_resolved_trade_route(&candidate, amount).await else {
+                continue;
+            };
+            let output = preview.receive_amount;
+            if output.is_finite() && best.as_ref().is_none_or(|(best_output, _)| output > *best_output) {
+                best = Some((output, candidate));
+            }
+        }
+        best.map(|(_, legs)| legs)
+            .ok_or_else(|| format!("no fully executable route for {amount} {deposit} -> {withdraw}"))
+    }
+
     /// Resolve route legs once, then always reuse persisted legs on subsequent calls.
     ///
     /// Persistence location:
@@ -432,10 +488,15 @@ where
             return Ok(persisted);
         }
 
+        let amount = state
+            .trade
+            .trade_next_amount_in
+            .unwrap_or_else(|| state.size_in.to_f64());
         let legs = self
-            .resolve_trade_legs_for_symbols(
+            .resolve_trade_legs_for_amount(
                 &<Self as BridgePlanner>::planned_deposit_asset(state),
                 &<Self as BridgePlanner>::planned_withdraw_asset(state),
+                amount,
             )
             .await?;
         Self::persist_trade_legs(state, &legs);

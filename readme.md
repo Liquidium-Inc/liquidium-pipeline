@@ -16,6 +16,7 @@ Inspired by Artemis/MEV patterns and designed for permissionless, community-driv
 - [Operations Runbook](#operations-runbook)
 - [Developer Setup](#developer-setup)
 - [Kraken Venue](#kraken-venue)
+- [Native Simulator](#native-simulator)
 - [Security](#security)
 - [Troubleshooting](#troubleshooting)
 - [Notes](#notes)
@@ -896,6 +897,22 @@ This release disables Kraken: `kraken` in `ENABLED_SWAP_VENUES` stops startup. W
 Before any funds move, a Kraken quote checks the route: a deposit method and address for the asset and network (an ICP deposit that needs a memo is refused), the deposit minimum, and a verified withdrawal address. A refused route gets no quote, so the planner uses another venue.
 
 Every Kraken order is IOC at its price limit. Kraken keeps no caller id for a withdrawal, so a withdrawal whose reply was lost parks for an operator: check Kraken's withdrawal history before you release the leg.
+
+## Native Simulator
+
+The [`liquidium-cross-chain-local`](https://github.com/Liquidium-Inc/liquidium-cross-chain-local) workbench builds this binary with `--features simulator,plain-logs` and supervises `liquidator run` against a local PocketIC. Use its enable, pause, resume and stop commands. Do not install a separate liquidator service for it.
+
+A simulator build differs from a default build in these ways:
+
+- It needs a loopback `IC_URL` (`http://127.0.0.1:<port>`) and trusts the PocketIC root key in `SIM_IC_ROOT_KEY`.
+- It reads no `.env` file. The workbench supplies the whole environment.
+- `account show` writes the public principals and addresses to `SIM_IDENTITY_FILE`.
+- Venues come from the workbench, not from `ENABLED_SWAP_VENUES`: `SIM_ICPSWAP_FACTORY` enables ICPSwap, and `SIM_MEXC_URL` enables a local MEXC at a loopback origin.
+- The local MEXC holds ck assets itself, so it runs without the bridge. `SIM_MEXC_BRIDGE` adds the local bridge, and `SIM_BRIDGE_USDC_ADDRESS` names the local USDC contract.
+- The workbench sets `CEX_MEXC_ROUTE_SELECTION=best-output`, so MEXC picks the route with the largest net output for the amount. This setting works in any build; unset, MEXC keeps the first executable route.
+- With no venue, discovery, strategy, execution and settlement run as normal. A settled row then parks as `OperatorRequired` and keeps the collateral in the trader account. It reports no swap and no profit.
+
+A default build reads no `SIM_*` setting and keeps the normal venue rules and IC trust.
 
 ## Security
 

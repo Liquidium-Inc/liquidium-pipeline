@@ -277,9 +277,10 @@ where
             .await
             .map_err(|error| format!("{} refused the route: {error}", self.profile.name()))?;
         let legs = self
-            .resolve_trade_legs_for_symbols(
+            .resolve_trade_legs_for_amount(
                 &<Self as BridgePlanner>::planned_deposit_asset(&state),
                 &<Self as BridgePlanner>::planned_withdraw_asset(&state),
+                initial_amount,
             )
             .await?;
         let route_preview = self.preview_resolved_trade_route(&legs, initial_amount).await?;

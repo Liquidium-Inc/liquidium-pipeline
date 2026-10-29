@@ -16,54 +16,58 @@ use crate::{
 };
 
 /// The CEX machine every exchange shares; only the backend, the profile and
-/// the market allowlist differ.
+/// the market allowlist differ. Without a bridge, the venue moves only the assets it lists on ICP.
 fn build_cex_finalizer<C: CexBackend>(
     ctx: &PipelineContext,
-    bridge: Arc<BridgeRuntime>,
+    bridge: Option<Arc<BridgeRuntime>>,
     profile: CexVenueProfile,
     backend: Arc<C>,
     available_pairs: Vec<String>,
     max_hops: u8,
-) -> Arc<CexVenueFinalizer<C>> {
+) -> CexVenueFinalizer<C> {
     let config = &ctx.config;
-    Arc::new(
-        CexVenueFinalizer::new_with_tunables(
-            profile,
-            backend,
-            ctx.trader_transfers.actions(),
-            config.liquidator_principal,
-            config.max_allowed_cex_slippage_bps as f64,
-            config.cex_min_exec_usd,
-            config.cex_slice_target_ratio,
-            config.cex_buy_truncation_trigger_ratio,
-            config.cex_buy_inverse_overspend_bps,
-            config.cex_buy_inverse_max_retries,
-            config.cex_buy_inverse_enabled,
-        )
-        .with_widened_slippage_cap(config.max_widened_cex_slippage_bps as f64)
-        .with_token_registry(ctx.registry.clone())
-        .with_quote_costs(config.cex_route_fee_bps, config.cex_delay_buffer_bps)
-        .with_bridge_runtime(bridge)
-        .with_outbound(ctx.trader_outbound.clone())
-        .with_route_config(available_pairs, max_hops as usize),
+    let finalizer = CexVenueFinalizer::new_with_tunables(
+        profile,
+        backend,
+        ctx.trader_transfers.actions(),
+        config.liquidator_principal,
+        config.max_allowed_cex_slippage_bps as f64,
+        config.cex_min_exec_usd,
+        config.cex_slice_target_ratio,
+        config.cex_buy_truncation_trigger_ratio,
+        config.cex_buy_inverse_overspend_bps,
+        config.cex_buy_inverse_max_retries,
+        config.cex_buy_inverse_enabled,
     )
+    .with_widened_slippage_cap(config.max_widened_cex_slippage_bps as f64)
+    .with_token_registry(ctx.registry.clone())
+    .with_quote_costs(config.cex_route_fee_bps, config.cex_delay_buffer_bps)
+    .with_outbound(ctx.trader_outbound.clone())
+    .with_route_config(available_pairs, max_hops as usize);
+    match bridge {
+        Some(bridge) => finalizer.with_bridge_runtime(bridge),
+        None => finalizer,
+    }
 }
 
 pub fn build_mexc_finalizer(
     ctx: &PipelineContext,
-    bridge: Arc<BridgeRuntime>,
+    bridge: Option<Arc<BridgeRuntime>>,
 ) -> Result<Arc<CexVenueFinalizer<MexcClient>>, String> {
     let (api_key, secret) = ctx
         .config
         .get_cex_credentials("mexc")
         .map_err(|err| format!("Cex credentials not found: {err}"))?;
-    Ok(build_cex_finalizer(
+    let finalizer = build_cex_finalizer(
         ctx,
         bridge,
         CexVenueProfile::mexc(),
-        Arc::new(MexcClient::new(&api_key, &secret)),
+        Arc::new(MexcClient::new(&api_key, &secret)?),
         ctx.config.cex_mexc_available_pairs.clone(),
         ctx.config.cex_mexc_max_hops,
+    );
+    Ok(Arc::new(
+        finalizer.with_best_output_routing(ctx.config.cex_mexc_best_output_routing),
     ))
 }
 
@@ -79,12 +83,12 @@ pub fn build_kraken_finalizer(
         .map_err(|error| format!("Kraken is enabled but CEX_KRAKEN_AVAILABLE_PAIRS is unusable: {error}"))?;
     // The route search uses the client's markets, which name each symbol as Kraken's pairs do.
     let available_pairs = client.allowed_pairs().to_vec();
-    Ok(build_cex_finalizer(
+    Ok(Arc::new(build_cex_finalizer(
         ctx,
-        bridge,
+        Some(bridge),
         CexVenueProfile::kraken(),
         Arc::new(client),
         available_pairs,
         ctx.config.cex_kraken_max_hops,
-    ))
+    )))
 }

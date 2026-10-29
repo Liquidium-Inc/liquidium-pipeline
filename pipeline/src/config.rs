@@ -98,6 +98,9 @@ pub struct Config {
     /// Maximum intermediate hops allowed for MEXC route discovery.
     /// Example: `2` allows up to 3 legs total.
     pub cex_mexc_max_hops: u8,
+    /// `CEX_MEXC_ROUTE_SELECTION=best-output`: MEXC takes the route with the largest net
+    /// output for the amount. Unset keeps the first executable route, as before.
+    pub cex_mexc_best_output_routing: bool,
     /// Kraken's market allowlist, as `BASE_QUOTE`. Kraken refuses to start
     /// with an empty one, so the setting is required when Kraken is enabled.
     pub cex_kraken_available_pairs: Vec<String>,
@@ -261,6 +264,9 @@ impl Config {
         let home = config_dir();
 
         let ic_url = env::var("IC_URL").map_err(|_| "IC_URL not configured".to_string())?;
+        if crate::simulator::ENABLED {
+            crate::simulator::require_loopback_ic_url(&ic_url)?;
+        }
         let export_path_raw = env::var("EXPORT_PATH").unwrap_or(format!("{}/executions.csv", home));
         let export_path = expand_tilde(&export_path_raw).to_string_lossy().into_owned();
 
@@ -401,6 +407,7 @@ impl Config {
         let cex_tunables = parse_cex_tunables_from_env();
         let cex_mexc_available_pairs = parse_cex_available_pairs_from_env("CEX_MEXC_AVAILABLE_PAIRS");
         let cex_mexc_max_hops = parse_cex_max_hops_from_env("CEX_MEXC_MAX_HOPS");
+        let cex_mexc_best_output_routing = env::var("CEX_MEXC_ROUTE_SELECTION").as_deref() == Ok("best-output");
         let cex_kraken_available_pairs = parse_cex_available_pairs_from_env("CEX_KRAKEN_AVAILABLE_PAIRS");
         let cex_kraken_max_hops = parse_cex_max_hops_from_env("CEX_KRAKEN_MAX_HOPS");
         let icpswap_factory_canister = parse_icpswap_factory_from_env()?;
@@ -480,6 +487,7 @@ impl Config {
             cex_route_fee_bps: cex_tunables.route_fee_bps,
             cex_mexc_available_pairs,
             cex_mexc_max_hops,
+            cex_mexc_best_output_routing,
             cex_kraken_available_pairs,
             cex_kraken_max_hops,
             icpswap_factory_canister,
@@ -740,6 +748,9 @@ fn parse_slippage_bps(name: &str, trimmed: &str) -> Result<u32, String> {
 }
 
 fn parse_enabled_swap_venues_from_env() -> Result<Vec<String>, String> {
+    if crate::simulator::ENABLED {
+        return crate::simulator::enabled_swap_venues();
+    }
     let raw = env::var("ENABLED_SWAP_VENUES").unwrap_or_else(|_| DEFAULT_ENABLED_SWAP_VENUES.to_string());
     let mut seen = HashSet::new();
     let mut venues = Vec::new();
@@ -773,10 +784,14 @@ fn parse_enabled_swap_venues_from_env() -> Result<Vec<String>, String> {
 }
 
 pub(crate) fn parse_icpswap_factory_from_env() -> Result<Principal, String> {
-    let raw = env::var("ICPSWAP_FACTORY_CANISTER").unwrap_or_else(|_| DEFAULT_ICPSWAP_FACTORY_CANISTER.to_string());
+    let key = if crate::simulator::ENABLED {
+        "SIM_ICPSWAP_FACTORY"
+    } else {
+        "ICPSWAP_FACTORY_CANISTER"
+    };
+    let raw = env::var(key).unwrap_or_else(|_| DEFAULT_ICPSWAP_FACTORY_CANISTER.to_string());
     let trimmed = raw.trim();
-    Principal::from_text(trimmed)
-        .map_err(|error| format!("invalid ICPSWAP_FACTORY_CANISTER principal '{trimmed}': {error}"))
+    Principal::from_text(trimmed).map_err(|error| format!("invalid {key} principal '{trimmed}': {error}"))
 }
 
 /// Mirrors `IcpswapFirstPlannerConfig::validate`: a non-finite or non-positive
@@ -1374,6 +1389,7 @@ mod tests {
         assert_eq!(parse_cex_max_hops_from_env("CEX_MEXC_MAX_HOPS"), 1);
     }
 
+    #[cfg(not(feature = "simulator"))]
     #[test]
     fn enabled_swap_venues_default_to_icpswap_then_mexc() {
         let _guard = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
@@ -1386,6 +1402,7 @@ mod tests {
         );
     }
 
+    #[cfg(not(feature = "simulator"))]
     #[test]
     fn enabled_swap_venues_normalize_and_preserve_order() {
         let _guard = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
@@ -1402,6 +1419,7 @@ mod tests {
     }
 
     /// This release disables Kraken, so a config that names it does not start.
+    #[cfg(not(feature = "simulator"))]
     #[test]
     fn kraken_stops_startup_until_it_is_released() {
         let _guard = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
@@ -1434,6 +1452,7 @@ mod tests {
         }
     }
 
+    #[cfg(not(feature = "simulator"))]
     #[test]
     fn enabled_swap_venues_reject_invalid_lists() {
         let _guard = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
@@ -1454,6 +1473,7 @@ mod tests {
         }
     }
 
+    #[cfg(not(feature = "simulator"))]
     #[test]
     fn legacy_swapper_does_not_affect_enabled_venues() {
         let _guard = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
@@ -1465,6 +1485,33 @@ mod tests {
         unsafe {
             env::remove_var("SWAPPER");
             env::remove_var("ENABLED_SWAP_VENUES");
+        }
+    }
+
+    /// A simulator build takes its venues from the workbench, never from `ENABLED_SWAP_VENUES`.
+    #[cfg(feature = "simulator")]
+    #[test]
+    fn simulator_venues_come_from_the_workbench_settings() {
+        let _guard = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        unsafe {
+            env::set_var("ENABLED_SWAP_VENUES", "icpswap,mexc");
+            env::remove_var("SIM_MEXC_URL");
+            env::remove_var("SIM_ICPSWAP_FACTORY");
+        }
+        assert!(parse_enabled_swap_venues_from_env().unwrap().is_empty());
+        unsafe {
+            env::set_var("SIM_MEXC_URL", "http://127.0.0.1:23009");
+            env::set_var("SIM_ICPSWAP_FACTORY", "4mmnk-kiaaa-aaaag-qbllq-cai");
+        }
+        assert_eq!(parse_enabled_swap_venues_from_env().unwrap(), vec!["icpswap", "mexc"]);
+        unsafe {
+            env::set_var("SIM_ICPSWAP_FACTORY", "not a principal");
+        }
+        assert!(parse_enabled_swap_venues_from_env().is_err());
+        unsafe {
+            env::remove_var("ENABLED_SWAP_VENUES");
+            env::remove_var("SIM_MEXC_URL");
+            env::remove_var("SIM_ICPSWAP_FACTORY");
         }
     }
 

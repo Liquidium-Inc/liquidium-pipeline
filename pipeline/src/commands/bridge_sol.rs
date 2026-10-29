@@ -122,11 +122,7 @@ fn build_backend(
     proxy_canister: Option<Principal>,
 ) -> Result<SolanaBridgeBackend<Agent, IcpBackendImpl<Agent>, SolanaBackendImpl>, String> {
     let agent = Arc::new(
-        Agent::builder()
-            .with_url(config.ic_url.clone())
-            .with_identity(config.bridge_ic_identity.clone())
-            .with_max_tcp_error_retries(3)
-            .build()
+        crate::context::build_ic_agent(&config.ic_url, config.bridge_ic_identity.clone())
             .map_err(|e| format!("ic agent(bridge-sol command) build failed: {e}"))?,
     );
 
@@ -956,6 +952,7 @@ mod tests {
             cex_route_fee_bps: 25,
             cex_mexc_available_pairs: vec![],
             cex_mexc_max_hops: 2,
+            cex_mexc_best_output_routing: false,
             cex_kraken_available_pairs: vec![],
             cex_kraken_max_hops: 2,
             icpswap_factory_canister: Principal::from_text(crate::config::DEFAULT_ICPSWAP_FACTORY_CANISTER)

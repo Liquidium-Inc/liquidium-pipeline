@@ -16,7 +16,8 @@ impl VenueRegistry {
     // Registration order is retained because it gives quote collection and
     // later execution planning a deterministic venue order.
     pub(in crate::finalizers::multi_venue) fn new(adapters: Vec<Arc<dyn MultiVenueAdapter>>) -> Result<Self, String> {
-        if adapters.is_empty() {
+        // A simulator build with no venue keeps the collateral, so it registers none.
+        if adapters.is_empty() && !crate::simulator::ENABLED {
             return Err("venue registry must contain at least one adapter".to_string());
         }
 

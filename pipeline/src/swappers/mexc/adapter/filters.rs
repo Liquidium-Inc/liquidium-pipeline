@@ -83,7 +83,7 @@ impl MexcClient {
 
     async fn fetch_symbol_info(&self, symbol: &str) -> Result<Option<(Value, String)>, String> {
         let mut direct_error = None;
-        let url = format!("https://api.mexc.com/api/v3/exchangeInfo?symbol={}", symbol);
+        let url = format!("{}/api/v3/exchangeInfo?symbol={}", self.api_base, symbol);
         let resp = self.http.get(url).send().await.map_err(|e| e.to_string())?;
         if resp.status().is_success() {
             let payload: Value = resp.json().await.map_err(|e| e.to_string())?;
@@ -112,7 +112,7 @@ impl MexcClient {
 
         let resp = self
             .http
-            .get("https://api.mexc.com/api/v3/exchangeInfo")
+            .get(format!("{}/api/v3/exchangeInfo", self.api_base))
             .send()
             .await
             .map_err(|e| e.to_string())?;

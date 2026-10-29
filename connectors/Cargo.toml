@@ -42,3 +42,7 @@ spl-token = "8.0.0"
 spl-associated-token-account = "7.0.0"
 solana-system-interface = "1.0.0"
 liquidium-pipeline-core = { path = "../core" }
+
+[features]
+# Lets the bridge use the workbench's local USDC contract.
+simulator = []

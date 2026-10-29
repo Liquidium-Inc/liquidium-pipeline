@@ -10,6 +10,7 @@ pub mod operator;
 pub mod outbound;
 pub mod persistance;
 pub mod price_oracle;
+pub mod simulator;
 pub mod stage;
 pub mod stages;
 pub mod swappers;

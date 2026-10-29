@@ -70,26 +70,34 @@ pub use orders::LimitOrderReport;
 use withdraw_status::*;
 use withdraw_terms::*;
 
+/// The real MEXC REST origin.
+const MEXC_API_BASE: &str = "https://api.mexc.com";
+
 pub struct MexcClient {
     inner: tokio::sync::Mutex<MexcSpotApiClientWithAuthentication>,
     symbol_filters: tokio::sync::Mutex<HashMap<String, SymbolFilters>>,
     coin_config: CoinConfigCache,
     http: reqwest::Client,
+    /// The origin of unsigned metadata reads, the same as the signed client's.
+    api_base: String,
 }
 
 impl MexcClient {
-    pub fn new(api_key: &str, secret: &str) -> Self {
+    /// A client of the real MEXC, or of the workbench's local MEXC in a simulator build.
+    pub fn new(api_key: &str, secret: &str) -> Result<Self, String> {
+        let api_base = crate::simulator::mexc_api_base()?.unwrap_or_else(|| MEXC_API_BASE.to_string());
         let api = MexcSpotApiClientWithAuthentication::new(
-            mexc_rs::spot::MexcSpotApiEndpoint::Base,
+            mexc_rs::spot::MexcSpotApiEndpoint::Custom(api_base.clone()),
             api_key.to_string(),
             secret.to_string(),
         );
-        Self {
+        Ok(Self {
             inner: tokio::sync::Mutex::new(api),
             symbol_filters: tokio::sync::Mutex::new(HashMap::new()),
             coin_config: CoinConfigCache::default(),
             http: reqwest::Client::new(),
-        }
+            api_base,
+        })
     }
 
     /// Finds a recent withdrawal by its MEXC id or by our order id.
@@ -133,7 +141,7 @@ impl MexcClient {
         let api_key = env::var("CEX_MEXC_API_KEY").map_err(|_| "CEX_MEXC_API_KEY not set".to_string())?;
         let api_secret = env::var("CEX_MEXC_API_SECRET").map_err(|_| "CEX_MEXC_API_SECRET not set".to_string())?;
 
-        Ok(Self::new(&api_key, &api_secret))
+        Self::new(&api_key, &api_secret)
     }
 
 }
