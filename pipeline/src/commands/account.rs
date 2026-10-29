@@ -92,13 +92,31 @@ impl AddressBook {
             entry("Bridge", "Solana", self.bridge_solana.clone()),
         ]
     }
+
+    /// The public addresses the simulator workbench funds, by the keys its scripts read.
+    pub fn simulator_identity(&self) -> serde_json::Value {
+        serde_json::json!({
+            "liquidator": self.liquidator_principal.to_text(),
+            "trader": self.trader_principal.to_text(),
+            "bridge": self.bridge_principal.to_text(),
+            "bridgeEvm": self.bridge_evm,
+            "solana": self.trader_solana,
+            "bridgeSolana": self.bridge_solana,
+        })
+    }
 }
 
 pub async fn show() -> Result<()> {
     let config = Config::load()
         .await
         .map_err(|error| anyhow!("could not load account: {error}"))?;
-    let entries = AddressBook::from_config(&config).entries();
+    let book = AddressBook::from_config(&config);
+    if crate::simulator::ENABLED {
+        let path = env::var("SIM_IDENTITY_FILE").context("SIM_IDENTITY_FILE")?;
+        fs::write(path, serde_json::to_vec_pretty(&book.simulator_identity())?)?;
+        return Ok(());
+    }
+    let entries = book.entries();
 
     if plain_logs_enabled() {
         for entry in &entries {

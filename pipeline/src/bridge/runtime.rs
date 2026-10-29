@@ -98,12 +98,13 @@ impl BridgeRuntime {
         }
 
         let bridge_agent = Arc::new(
-            Agent::builder()
-                .with_url(config.ic_url.clone())
-                .with_identity(config.bridge_ic_identity.clone())
-                .with_max_tcp_error_retries(3)
-                .build()
-                .map_err(|e| format!("ic agent(bridge runtime) build: {e}"))?,
+            crate::simulator::build_ic_agent(
+                Agent::builder()
+                    .with_url(config.ic_url.clone())
+                    .with_identity(config.bridge_ic_identity.clone())
+                    .with_max_tcp_error_retries(3),
+            )
+            .map_err(|e| format!("ic agent(bridge runtime) build: {e}"))?,
         );
         let bridge_evm_wallet = Arc::new(EvmBackendImpl::new(bridge_provider));
         let bridge_backend = Arc::new(CkErc20BridgeBackend::new(

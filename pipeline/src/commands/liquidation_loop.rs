@@ -260,7 +260,13 @@ async fn init(
                     .clone()
                     .ok_or_else(|| "ICPSwap is enabled but its adapter was not initialized".to_string())?,
             ),
-            MEXC_VENUE_ID => venue_adapters.push(build_mexc_finalizer(ctx.as_ref(), shared_bridge().await?.clone())?),
+            MEXC_VENUE_ID => {
+                let bridge = match crate::simulator::mexc_uses_bridge() {
+                    true => Some(shared_bridge().await?.clone()),
+                    false => None,
+                };
+                venue_adapters.push(build_mexc_finalizer(ctx.as_ref(), bridge)?)
+            }
             KRAKEN_VENUE_ID => {
                 venue_adapters.push(build_kraken_finalizer(ctx.as_ref(), shared_bridge().await?.clone())?)
             }
@@ -316,7 +322,8 @@ async fn init(
             config.cex_retry_base_secs,
             config.cex_retry_max_secs,
         )
-        .with_watchdog(slack_watchdog.clone()),
+        .with_watchdog(slack_watchdog.clone())
+        .with_retained_collateral(crate::simulator::retains_collateral()),
     );
 
     info!("Initializing searcher stage ...");

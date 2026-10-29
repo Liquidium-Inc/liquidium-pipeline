@@ -61,12 +61,13 @@ impl IcpswapExecutionSessionFactory for IcpswapAgentSessionFactory {
     fn open(&self, descriptor: &IcpswapExecutionIdentity) -> Result<IcpswapExecutionSession, String> {
         let identity = self.derive_identity(descriptor)?;
         let agent = Arc::new(
-            Agent::builder()
-                .with_url(self.ic_url.clone())
-                .with_identity(identity)
-                .with_max_tcp_error_retries(3)
-                .build()
-                .map_err(|error| format!("failed to build ICPSwap execution agent: {error}"))?,
+            crate::simulator::build_ic_agent(
+                Agent::builder()
+                    .with_url(self.ic_url.clone())
+                    .with_identity(identity)
+                    .with_max_tcp_error_retries(3),
+            )
+            .map_err(|error| format!("failed to build ICPSwap execution agent: {error}"))?,
         );
         let backend = Arc::new(IcpBackendImpl::new(agent.clone()));
         let child = Arc::new(IcpswapClient::new(agent, backend.clone(), self.factory_canister));

@@ -139,12 +139,13 @@ impl<P: Provider<AnyNetwork> + WalletProvider<AnyNetwork> + Clone + 'static> Pip
                 PipelineContextError::Other("missing IC Trader".to_string())
             })?));
         let bridge_agent = Arc::new(
-            Agent::builder()
-                .with_url(config.ic_url.clone())
-                .with_identity(config.bridge_ic_identity.clone())
-                .with_max_tcp_error_retries(3)
-                .build()
-                .map_err(|e| PipelineContextError::Other(format!("ic agent(bridge) build: {e}")))?,
+            crate::simulator::build_ic_agent(
+                Agent::builder()
+                    .with_url(config.ic_url.clone())
+                    .with_identity(config.bridge_ic_identity.clone())
+                    .with_max_tcp_error_retries(3),
+            )
+            .map_err(|e| PipelineContextError::Other(format!("ic agent(bridge) build: {e}")))?,
         );
         let icp_backend_bridge = Arc::new(IcpBackendImpl::new(bridge_agent));
 
@@ -393,21 +394,23 @@ fn setup_agents_and_provider(
     String,
 > {
     let agent_main = Arc::new(
-        Agent::builder()
-            .with_url(config.ic_url.clone())
-            .with_identity(config.liquidator_identity.clone())
-            .with_max_tcp_error_retries(3)
-            .build()
-            .map_err(|e| format!("ic agent(main) build: {e}"))?,
+        crate::simulator::build_ic_agent(
+            Agent::builder()
+                .with_url(config.ic_url.clone())
+                .with_identity(config.liquidator_identity.clone())
+                .with_max_tcp_error_retries(3),
+        )
+        .map_err(|e| format!("ic agent(main) build: {e}"))?,
     );
 
     let agent_trader = Arc::new(
-        Agent::builder()
-            .with_url(config.ic_url.clone())
-            .with_identity(config.trader_identity.clone())
-            .with_max_tcp_error_retries(3)
-            .build()
-            .map_err(|e| format!("ic agent(trader) build: {e}"))?,
+        crate::simulator::build_ic_agent(
+            Agent::builder()
+                .with_url(config.ic_url.clone())
+                .with_identity(config.trader_identity.clone())
+                .with_max_tcp_error_retries(3),
+        )
+        .map_err(|e| format!("ic agent(trader) build: {e}"))?,
     );
 
     // Build a wallet-backed EVM RootProvider from config.evm_url and config.evm_private_key.

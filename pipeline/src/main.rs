@@ -11,6 +11,7 @@ mod outbound;
 mod output;
 mod persistance;
 mod price_oracle;
+mod simulator;
 mod stage;
 mod stages;
 pub mod swappers;
@@ -245,7 +246,11 @@ enum AccountCommands {
 /// successfully.
 #[tokio::main]
 async fn main() -> ExitCode {
-    load_env();
+    // The workbench supplies the whole simulator environment. dotenv also reads
+    // parent directories, so host settings could otherwise leak in.
+    if !simulator::ENABLED {
+        load_env();
+    }
     let cli = Cli::parse();
     let running_under_systemd = is_systemd_service_process();
 

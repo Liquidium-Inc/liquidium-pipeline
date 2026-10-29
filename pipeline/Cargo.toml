@@ -21,6 +21,8 @@ type_complexity = "allow"
 [features]
 default = []
 plain-logs = []
+# Runs against the local PocketIC workbench (liquidium-cross-chain-local).
+simulator = ["liquidium-pipeline-connectors/simulator"]
 
 [dependencies]
 liquidium-pipeline-core = { path = "../core" }

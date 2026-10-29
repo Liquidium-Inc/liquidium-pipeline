@@ -126,6 +126,9 @@ where
     /// Escalation channel for rows this stage removes from the runnable queue
     /// while a venue may still hold their funds.
     pub watchdog: Arc<dyn Watchdog>,
+    /// Parks each settled row with its collateral kept, instead of selling it.
+    /// Only a simulator build with no venue sets it.
+    pub retain_collateral: bool,
 }
 
 impl<F, D, P, A> FinalizeStage<F, D, P, A>
@@ -153,11 +156,17 @@ where
             cex_retry_base_secs,
             cex_retry_max_secs,
             watchdog: noop_watchdog(),
+            retain_collateral: false,
         }
     }
 
     pub fn with_watchdog(mut self, watchdog: Arc<dyn Watchdog>) -> Self {
         self.watchdog = watchdog;
+        self
+    }
+
+    pub fn with_retained_collateral(mut self, retain_collateral: bool) -> Self {
+        self.retain_collateral = retain_collateral;
         self
     }
 
@@ -298,6 +307,23 @@ where
                 "[finalize] ⏳ collateral_tx status={:?} liq_id={}",
                 liq.collateral_tx.status, liq_id
             );
+            return Ok(None);
+        }
+        // The liquidation is real, but selling the collateral is outside this workbench
+        // phase. The row parks for an operator instead of reporting a swap and a profit.
+        if self.retain_collateral {
+            if matches!(liq.change_tx.status, TransferStatus::Success) {
+                match wal_mark_operator_required_with_error(
+                    &*self.wal,
+                    &row.id,
+                    crate::simulator::RETAINED_COLLATERAL.to_string(),
+                )
+                .await
+                {
+                    Ok(()) => info!("[finalize] simulator kept the collateral of liq_id={}", liq_id),
+                    Err(error) => warn!("Failed to park simulator WAL row {}: {}", row.id, error),
+                }
+            }
             return Ok(None);
         }
 
@@ -959,6 +985,36 @@ mod tests {
 
         let outcomes = stage.process(&()).await.expect("operator row should park cleanly");
         assert!(outcomes.is_empty());
+    }
+
+    /// With no venue, the simulator keeps the collateral. The settled row parks for an
+    /// operator, and the finalizer never runs, so no swap or profit is reported.
+    #[tokio::test]
+    async fn a_retained_collateral_stage_parks_a_settled_row_without_a_swap() {
+        let liq_id = 9_220u128;
+        let row = make_row(liq_id, make_swapping_receipt(liq_id));
+        let row_id = row.id.clone();
+
+        let mut wal = MockWalStore::new();
+        wal.expect_get_pending()
+            .with(eq(100usize))
+            .times(1)
+            .return_once(move |_| Ok(vec![row]));
+        wal.expect_update_failure()
+            .withf(move |id, status, error, _| {
+                id == row_id
+                    && *status == ResultStatus::OperatorRequired
+                    && error == crate::simulator::RETAINED_COLLATERAL
+            })
+            .times(1)
+            .returning(|_, _, _, _| Ok(()));
+
+        let calls = Arc::new(Mutex::new(0usize));
+        let stage = test_stage(wal, NoopFinalizer { calls: calls.clone() }).with_retained_collateral(true);
+
+        let outcomes = stage.process(&()).await.expect("the settled row should park cleanly");
+        assert!(outcomes.is_empty());
+        assert_eq!(*calls.lock().expect("calls lock"), 0, "no swap may run");
     }
 
     /// A permanently failed row leaves the runnable queue for good. When the
