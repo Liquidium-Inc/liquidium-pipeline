@@ -98,6 +98,9 @@ where
     pub available_pairs: Vec<String>,
     /// Maximum intermediate hops allowed in graph-based route discovery.
     pub max_hops: usize,
+    /// Picks the route with the largest net output for the amount, not the first
+    /// executable one. Only the simulator workbench turns it on.
+    pub best_output_routing: bool,
     /// Extra end-to-end route costs included in conservative planner output.
     pub quote_route_fee_bps: u32,
     /// Price-move buffer for deposit/trade/withdraw latency.
@@ -148,6 +151,11 @@ where
     pub fn with_route_config(mut self, available_pairs: Vec<String>, max_hops: usize) -> Self {
         self.available_pairs = Self::normalize_market_pairs(available_pairs);
         self.max_hops = max_hops.min(MAX_HOPS_CAP);
+        self
+    }
+
+    pub fn with_best_output_routing(mut self, best_output_routing: bool) -> Self {
+        self.best_output_routing = best_output_routing;
         self
     }
 
@@ -240,6 +248,7 @@ where
             cex_buy_inverse_enabled,
             available_pairs: vec![],
             max_hops: DEFAULT_MAX_HOPS,
+            best_output_routing: false,
             quote_route_fee_bps: 0,
             quote_delay_buffer_bps: 0,
             bridge: None,

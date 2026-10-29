@@ -881,3 +881,115 @@ async fn mexc_preview_route_resolves_direct_buy_leg_when_sell_book_empty() {
     assert!(preview.receive_amount > 0.0);
     assert!(preview.price_impact_bps >= 0.0);
 }
+
+/// Books for BTC -> USDT: a deep direct book, and a better but shallow route through USDC.
+fn btc_usdt_books(high_usdc_fee: Arc<std::sync::atomic::AtomicBool>) -> MockCexBackend {
+    let mut backend = MockCexBackend::new();
+    backend.expect_get_orderbook().returning(move |market, _| {
+        let (price, quantity) = match market {
+            "BTC_USDT" => (100.0, 10.0),
+            "BTC_USDC" => (110.0, 1.0),
+            "USDC_USDT" => (1.0, 1000.0),
+            _ => return Err("unknown market".to_string()),
+        };
+        let fee = if market == "BTC_USDC" && high_usdc_fee.load(std::sync::atomic::Ordering::SeqCst) {
+            2000.0
+        } else {
+            5.0
+        };
+        Ok(OrderBook {
+            bids: vec![OrderBookLevel { price, quantity }],
+            asks: vec![OrderBookLevel {
+                price: price * 1.001,
+                quantity,
+            }],
+            taker_fee_bps: fee,
+        })
+    });
+    backend
+}
+
+fn markets(legs: &[TradeLeg]) -> Vec<&str> {
+    legs.iter().map(|leg| leg.market.as_str()).collect()
+}
+
+/// Best-output routing weighs depth for this amount and each hop's taker fee.
+#[tokio::test]
+async fn best_output_routing_weighs_depth_and_hop_fees_for_the_amount() {
+    let high_fee = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let finalizer = test_finalizer(
+        Arc::new(btc_usdt_books(high_fee.clone())),
+        Arc::new(MockTransferActions::new()),
+    )
+    .with_route_config(vec!["BTC_USDT".into(), "BTC_USDC".into(), "USDC_USDT".into()], 2)
+    .with_best_output_routing(true);
+
+    let small = finalizer
+        .resolve_trade_legs_for_amount("BTC", "USDT", 0.5)
+        .await
+        .unwrap();
+    assert_eq!(markets(&small), vec!["BTC_USDC", "USDC_USDT"]);
+
+    // The USDC book holds 1 BTC, so 2 BTC can only go direct.
+    let large = finalizer
+        .resolve_trade_legs_for_amount("BTC", "USDT", 2.0)
+        .await
+        .unwrap();
+    assert_eq!(markets(&large), vec!["BTC_USDT"]);
+
+    high_fee.store(true, std::sync::atomic::Ordering::SeqCst);
+    let expensive = finalizer
+        .resolve_trade_legs_for_amount("BTC", "USDT", 0.5)
+        .await
+        .unwrap();
+    assert_eq!(markets(&expensive), vec!["BTC_USDT"]);
+}
+
+/// Without the switch, the first executable route stands, as before the workbench.
+#[tokio::test]
+async fn routing_keeps_the_first_executable_route_without_best_output() {
+    let high_fee = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let finalizer = test_finalizer(Arc::new(btc_usdt_books(high_fee)), Arc::new(MockTransferActions::new()))
+        .with_route_config(vec!["BTC_USDT".into(), "BTC_USDC".into(), "USDC_USDT".into()], 2);
+
+    let legs = finalizer
+        .resolve_trade_legs_for_amount("BTC", "USDT", 0.5)
+        .await
+        .unwrap();
+    assert_eq!(markets(&legs), vec!["BTC_USDT"]);
+}
+
+/// MEXC trades SOL on `SOL_USDT` only, so best-output routing must not pick a better SOL book.
+#[tokio::test]
+async fn best_output_routing_keeps_mexc_sol_on_its_one_market() {
+    let mut backend = MockCexBackend::new();
+    backend.expect_get_orderbook().returning(|market, _| {
+        let price = match market {
+            "SOL_USDT" => 100.0,
+            "SOL_USDC" => 200.0,
+            "USDC_USDT" => 1.0,
+            _ => return Err("unlisted market".to_string()),
+        };
+        Ok(OrderBook {
+            bids: vec![OrderBookLevel {
+                price,
+                quantity: 1000.0,
+            }],
+            asks: vec![OrderBookLevel {
+                price: price * 1.001,
+                quantity: 1000.0,
+            }],
+            taker_fee_bps: 5.0,
+        })
+    });
+    let finalizer = test_finalizer(Arc::new(backend), Arc::new(MockTransferActions::new()))
+        .with_route_config(vec!["SOL_USDT".into(), "SOL_USDC".into(), "USDC_USDT".into()], 2)
+        .with_best_output_routing(true);
+
+    // Through SOL_USDC and back to USDT pays more, but MEXC must not trade SOL there.
+    let legs = finalizer
+        .resolve_trade_legs_for_amount("SOL", "USDT", 1.0)
+        .await
+        .unwrap();
+    assert_eq!(markets(&legs), vec!["SOL_USDT"]);
+}

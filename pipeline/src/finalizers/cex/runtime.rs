@@ -24,6 +24,7 @@ fn build_cex_finalizer<C: CexBackend>(
     backend: Arc<C>,
     available_pairs: Vec<String>,
     max_hops: u8,
+    best_output_routing: bool,
 ) -> Arc<CexVenueFinalizer<C>> {
     let config = &ctx.config;
     let finalizer = CexVenueFinalizer::new_with_tunables(
@@ -43,7 +44,8 @@ fn build_cex_finalizer<C: CexBackend>(
     .with_token_registry(ctx.registry.clone())
     .with_quote_costs(config.cex_route_fee_bps, config.cex_delay_buffer_bps)
     .with_outbound(ctx.trader_outbound.clone())
-    .with_route_config(available_pairs, max_hops as usize);
+    .with_route_config(available_pairs, max_hops as usize)
+    .with_best_output_routing(best_output_routing);
     Arc::new(match bridge {
         Some(bridge) => finalizer.with_bridge_runtime(bridge),
         None => finalizer,
@@ -65,6 +67,7 @@ pub fn build_mexc_finalizer(
         Arc::new(MexcClient::new(&api_key, &secret)?),
         ctx.config.cex_mexc_available_pairs.clone(),
         ctx.config.cex_mexc_max_hops,
+        ctx.config.cex_mexc_best_output_routing,
     ))
 }
 
@@ -87,5 +90,6 @@ pub fn build_kraken_finalizer(
         Arc::new(client),
         available_pairs,
         ctx.config.cex_kraken_max_hops,
+        false,
     ))
 }

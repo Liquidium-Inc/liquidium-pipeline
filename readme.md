@@ -909,6 +909,7 @@ A simulator build differs from a default build in these ways:
 - `account show` writes the public principals and addresses to `SIM_IDENTITY_FILE`.
 - Venues come from the workbench, not from `ENABLED_SWAP_VENUES`: `SIM_ICPSWAP_FACTORY` enables ICPSwap, and `SIM_MEXC_URL` enables a local MEXC at a loopback origin.
 - The local MEXC holds ck assets itself, so it runs without the bridge. `SIM_MEXC_BRIDGE` adds the local bridge, and `SIM_BRIDGE_USDC_ADDRESS` names the local USDC contract.
+- The workbench sets `CEX_MEXC_ROUTE_SELECTION=best-output`, so MEXC picks the route with the largest net output for the amount. This setting works in any build; unset, MEXC keeps the first executable route.
 - With no venue, discovery, strategy, execution and settlement run as normal. A settled row then parks as `OperatorRequired` and keeps the collateral in the trader account. It reports no swap and no profit.
 
 A default build reads no `SIM_*` setting and keeps the normal venue rules and IC trust.

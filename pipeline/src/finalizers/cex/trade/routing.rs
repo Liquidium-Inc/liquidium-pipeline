@@ -5,6 +5,7 @@ use crate::config::normalize_cex_market_pair;
 use crate::finalizers::bridge_planner::BridgePlanner;
 use crate::finalizers::cex::state::CexRouteLeg;
 use crate::finalizers::cex::utils::parse_market_symbols;
+use crate::swappers::model::BPS_PER_RATIO_UNIT;
 
 impl<C> CexVenueFinalizer<C>
 where
@@ -420,6 +421,76 @@ where
             .map_err(|hop_err| format!("{}; {}", direct_err, hop_err))
     }
 
+    /// The route for `amount`: the largest net output with best-output routing,
+    /// the first executable route otherwise.
+    pub(crate) async fn resolve_trade_legs_for_amount(
+        &self,
+        deposit_symbol: &str,
+        withdraw_symbol: &str,
+        amount: f64,
+    ) -> Result<Vec<TradeLeg>, String> {
+        if self.best_output_routing {
+            self.best_trade_legs_for_amount(deposit_symbol, withdraw_symbol, amount)
+                .await
+        } else {
+            self.resolve_trade_legs_for_symbols(deposit_symbol, withdraw_symbol)
+                .await
+        }
+    }
+
+    /// Of the configured simple routes and the first executable route, the one with the
+    /// largest net output for `amount`, after book depth and each hop's taker fee.
+    pub(crate) async fn best_trade_legs_for_amount(
+        &self,
+        deposit_symbol: &str,
+        withdraw_symbol: &str,
+        amount: f64,
+    ) -> Result<Vec<TradeLeg>, String> {
+        let deposit = Self::normalize_symbol(deposit_symbol);
+        let withdraw = Self::normalize_symbol(withdraw_symbol);
+        if !amount.is_finite() || amount <= 0.0 {
+            return Err("route amount must be positive and finite".to_string());
+        }
+        if deposit == withdraw {
+            return Ok(vec![]);
+        }
+        // Both sources keep an exchange's one SOL market: the hop graph skips the others.
+        let mut candidates = self.discover_hop_candidates(&deposit, &withdraw, self.max_hops);
+        if let Ok(first_executable) = self.resolve_trade_legs_for_symbols(&deposit, &withdraw).await {
+            candidates.push(first_executable);
+        }
+        // A stable order breaks ties the same way each time, so the route does not churn.
+        candidates.sort_by(|left, right| {
+            left.len()
+                .cmp(&right.len())
+                .then_with(|| Self::route_signature(left).cmp(&Self::route_signature(right)))
+        });
+        candidates.dedup_by(|left, right| Self::route_signature(left) == Self::route_signature(right));
+        let mut best: Option<(f64, Vec<TradeLeg>)> = None;
+        for candidate in candidates {
+            let Ok(output) = self.preview_net_through_legs(&candidate, amount).await else {
+                continue;
+            };
+            if output.is_finite() && best.as_ref().is_none_or(|(best_output, _)| output > *best_output) {
+                best = Some((output, candidate));
+            }
+        }
+        best.map(|(_, legs)| legs)
+            .ok_or_else(|| format!("no fully executable route for {amount} {deposit} -> {withdraw}"))
+    }
+
+    /// The output of `legs` for `amount_in`, after each hop's taker fee.
+    async fn preview_net_through_legs(&self, legs: &[TradeLeg], mut amount_in: f64) -> Result<f64, String> {
+        for leg in legs {
+            let preview = self.preview_leg(&leg.market, &leg.side, amount_in).await?;
+            if !(0.0..BPS_PER_RATIO_UNIT).contains(&preview.taker_fee_bps) {
+                return Err(format!("invalid taker fee {} on {}", preview.taker_fee_bps, leg.market));
+            }
+            amount_in = preview.gross_out * (1.0 - preview.taker_fee_bps / BPS_PER_RATIO_UNIT);
+        }
+        Ok(amount_in)
+    }
+
     /// Resolve route legs once, then always reuse persisted legs on subsequent calls.
     ///
     /// Persistence location:
@@ -432,10 +503,15 @@ where
             return Ok(persisted);
         }
 
+        let amount = state
+            .trade
+            .trade_next_amount_in
+            .unwrap_or_else(|| state.size_in.to_f64());
         let legs = self
-            .resolve_trade_legs_for_symbols(
+            .resolve_trade_legs_for_amount(
                 &<Self as BridgePlanner>::planned_deposit_asset(state),
                 &<Self as BridgePlanner>::planned_withdraw_asset(state),
+                amount,
             )
             .await?;
         Self::persist_trade_legs(state, &legs);

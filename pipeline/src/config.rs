@@ -98,6 +98,9 @@ pub struct Config {
     /// Maximum intermediate hops allowed for MEXC route discovery.
     /// Example: `2` allows up to 3 legs total.
     pub cex_mexc_max_hops: u8,
+    /// `CEX_MEXC_ROUTE_SELECTION=best-output`: MEXC takes the route with the largest net
+    /// output for the amount. Unset keeps the first executable route, as before.
+    pub cex_mexc_best_output_routing: bool,
     /// Kraken's market allowlist, as `BASE_QUOTE`. Kraken refuses to start
     /// with an empty one, so the setting is required when Kraken is enabled.
     pub cex_kraken_available_pairs: Vec<String>,
@@ -402,6 +405,7 @@ impl Config {
         let cex_tunables = parse_cex_tunables_from_env();
         let cex_mexc_available_pairs = parse_cex_available_pairs_from_env("CEX_MEXC_AVAILABLE_PAIRS");
         let cex_mexc_max_hops = parse_cex_max_hops_from_env("CEX_MEXC_MAX_HOPS");
+        let cex_mexc_best_output_routing = env::var("CEX_MEXC_ROUTE_SELECTION").as_deref() == Ok("best-output");
         let cex_kraken_available_pairs = parse_cex_available_pairs_from_env("CEX_KRAKEN_AVAILABLE_PAIRS");
         let cex_kraken_max_hops = parse_cex_max_hops_from_env("CEX_KRAKEN_MAX_HOPS");
         let icpswap_factory_canister = parse_icpswap_factory_from_env()?;
@@ -481,6 +485,7 @@ impl Config {
             cex_route_fee_bps: cex_tunables.route_fee_bps,
             cex_mexc_available_pairs,
             cex_mexc_max_hops,
+            cex_mexc_best_output_routing,
             cex_kraken_available_pairs,
             cex_kraken_max_hops,
             icpswap_factory_canister,

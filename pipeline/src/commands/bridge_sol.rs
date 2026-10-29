@@ -957,6 +957,7 @@ mod tests {
             cex_route_fee_bps: 25,
             cex_mexc_available_pairs: vec![],
             cex_mexc_max_hops: 2,
+            cex_mexc_best_output_routing: false,
             cex_kraken_available_pairs: vec![],
             cex_kraken_max_hops: 2,
             icpswap_factory_canister: Principal::from_text(crate::config::DEFAULT_ICPSWAP_FACTORY_CANISTER)
