@@ -44,9 +44,8 @@ pub(super) fn withdraw_status_from_mexc_record(
             // A completed status without chain txid is still in-flight from settlement perspective.
             WithdrawStatus::Pending
         }
-        WithdrawStatus::Unknown if has_chain_tx => {
-            // Some MEXC responses use numeric or undocumented status values even when
-            // a chain transaction id/hash is already present. Treat those as completed.
+        WithdrawStatus::Pending | WithdrawStatus::Unknown if has_chain_tx => {
+            // MEXC can leave its status pending after publishing the transfer reference.
             WithdrawStatus::Completed
         }
         other => other,

@@ -385,7 +385,7 @@ async fn run_single_daemon_cycle(
 
                 if executions.is_empty() {
                     info!(
-                        "Found {} opportunities but none executable yet; likely waiting for funds or liquidity",
+                        "Found {} opportunities but none executable yet; see strategy logs for skip reasons",
                         opportunities.len()
                     );
                 }

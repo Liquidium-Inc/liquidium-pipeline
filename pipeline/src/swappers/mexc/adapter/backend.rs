@@ -418,6 +418,12 @@ impl CexBackend for MexcClient {
 
         let status =
             withdraw_status_from_mexc_record(rec.status.as_str(), rec.tx_id.as_deref(), rec.trans_hash.as_deref());
+        if status == WithdrawStatus::Completed && from_mexc_raw(rec.status.as_str()) == WithdrawStatus::Pending {
+            warn!(
+                "[mexc] withdrawal {withdraw_id} has a transaction reference despite pending status {}; treating as completed",
+                rec.status
+            );
+        }
         let txid = rec
             .tx_id
             .as_ref()
