@@ -35,6 +35,16 @@ pub(super) fn draw_configuration(f: &mut Frame<'_>, area: Rect, app: &App) {
             Span::styled("BUY_BAD_DEBT: ", Style::default().add_modifier(Modifier::BOLD)),
             buy_bad_debt,
         ]),
+        Line::from(vec![
+            Span::styled("LOW_BALANCE_THRESHOLDS: ", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw(if app.config.low_balance_thresholds.trim().is_empty() {
+                "unset (token defaults)".to_string()
+            } else {
+                app.config.low_balance_thresholds.clone()
+            }),
+        ]),
+        Line::from("  Token units; omitted symbols use defaults. Requires SLACK_WEBHOOK_URL."),
+        Line::from("  Example: ckETH=0.01,ETH=0.02"),
         Line::from(""),
         Line::from(format!("Network: {}", app.config.ic_url)),
         Line::from(format!("LENDING_CANISTER: {}", app.config.lending_canister)),
