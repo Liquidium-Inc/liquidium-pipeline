@@ -1297,6 +1297,7 @@ impl IcpswapFirstPlanner {
         let side_cost = previews
             .iter()
             .fold(Nat::from(0u8), |total, preview| total + side_cost_total(preview));
+        let market_outputs: Vec<_> = previews.iter().map(|preview| preview.market_receive.clone()).collect();
         let legs: Vec<VenueLegState> = previews.into_iter().map(preview_to_leg).collect();
         let estimated_receive = sum_leg_outputs(&legs, false)?;
         let conservative_receive = sum_leg_outputs(&legs, true)?;
@@ -1311,6 +1312,54 @@ impl IcpswapFirstPlanner {
         let required_edge_bps = self.config.required_edge_bps(input.buy_bad_debt);
 
         if !meets_minimum_edge(&net_receive, &input.debt_repaid, required_edge_bps)? {
+            warn!(
+                liq_id = %input.liquidation_id,
+                debt_repaid = %input.debt_repaid.formatted(),
+                collateral = %input.total_pay.formatted(),
+                estimated_receive = %estimated_receive.formatted(),
+                conservative_receive = %conservative_receive.formatted(),
+                side_cost_receive = %ChainTokenAmount::from_raw(net_receive.token.clone(), side_cost).formatted(),
+                net_receive = %net_receive.formatted(),
+                edge_bps = combined_net_edge_bps,
+                required_edge_bps,
+                "[multi-venue] rejected plan recovery breakdown"
+            );
+            for (leg, market_output) in legs.iter().zip(market_outputs) {
+                let quote = &leg.quote;
+                let market_receive = market_output.map(|value| {
+                    ChainTokenAmount::from_raw(quote.estimated_receive.token.clone(), value).formatted()
+                });
+                let conservative_deduction = ChainTokenAmount::from_raw(
+                    quote.estimated_receive.token.clone(),
+                    quote.estimated_receive.value.clone() - quote.conservative_receive.value.clone(),
+                );
+                warn!(
+                    liq_id = %input.liquidation_id,
+                    venue = %leg.venue_id,
+                    route = %quote.route_id,
+                    pay_amount = %quote.pay_amount.formatted(),
+                    market_receive_before_fixed_fees = ?market_receive,
+                    estimated_receive = %quote.estimated_receive.formatted(),
+                    conservative_deduction = %conservative_deduction.formatted(),
+                    conservative_receive = %quote.conservative_receive.formatted(),
+                    price_impact_bps = quote.estimated_price_impact_bps,
+                    "[multi-venue] rejected plan leg breakdown"
+                );
+                for cost in &quote.side_costs {
+                    warn!(
+                        liq_id = %input.liquidation_id,
+                        venue = %leg.venue_id,
+                        label = %cost.cost.label,
+                        symbol = %cost.cost.symbol,
+                        amount_raw = %cost.cost.amount,
+                        decimals = cost.cost.decimals,
+                        receive_equivalent = %ChainTokenAmount::from_raw(
+                            net_receive.token.clone(), cost.receive_equivalent.clone()
+                        ).formatted(),
+                        "[multi-venue] rejected plan side cost"
+                    );
+                }
+            }
             return Err(IcpswapFirstPlannerError::NoViableRoute(format!(
                 "combined conservative output has {:.2} bps edge, below required {} bps",
                 combined_net_edge_bps, required_edge_bps

@@ -163,6 +163,25 @@ where
             .needs_approval(*ledger, self.config.get_lending_canister(), &threshold)
     }
 
+    fn log_funding_shortfall(
+        token: &ChainToken,
+        position: &LiquidateblePosition,
+        available: &Nat,
+        required: &Nat,
+        reason: &str,
+    ) {
+        let missing = required.clone() - available.clone();
+        info!(
+            "Skip liquidation: insufficient wallet funds; borrower={} debt_pool={} reason={} available={} required={} missing={}",
+            position.account,
+            position.pool_id,
+            reason,
+            ChainTokenAmount::from_raw(token.clone(), available.clone()).formatted(),
+            ChainTokenAmount::from_raw(token.clone(), required.clone()).formatted(),
+            ChainTokenAmount::from_raw(token.clone(), missing).formatted(),
+        );
+    }
+
     /// Both legs of this pair, and the return speed of its debt alone.
     /// A token the registry cannot name counts as slow, because the loop skips that pair anyway.
     fn combo_speeds(
@@ -418,9 +437,12 @@ where
                         available: available_balance.to_string(),
                     })
                     .await;
-                debug!(
-                    "Skipping bad-debt position due to insufficient funds: asset={}, available={} < min_required={}",
-                    debt_position.asset, available_balance, debt_fee_total
+                Self::log_funding_shortfall(
+                    &repayment_token,
+                    &debt_position,
+                    available_balance,
+                    &debt_fee_total,
+                    "ledger fees for bad-debt repayment",
                 );
                 continue;
             }
@@ -459,9 +481,12 @@ where
             if available_balance.clone() >= repay_amount.clone() + debt_fee_total.clone() {
                 *available_balance = available_balance.clone() - repay_amount.clone() - debt_fee_total.clone();
             } else {
-                debug!(
-                    "Available balance would underflow when updating bad-debt balance. available={}, repay={}, fees={}",
-                    available_balance, repay_amount, debt_fee_total
+                Self::log_funding_shortfall(
+                    &repayment_token,
+                    &debt_position,
+                    available_balance,
+                    &(repay_amount.clone() + debt_fee_total.clone()),
+                    "bad-debt repayment plus ledger fees",
                 );
                 continue;
             }
@@ -664,9 +689,12 @@ where
                         available: available_balance.to_string(),
                     })
                     .await;
-                debug!(
-                    "Skipping combo due to insufficient funds: asset={}, available={} < min_required={}",
-                    debt_position.asset, available_balance, debt_fee_total
+                Self::log_funding_shortfall(
+                    &repayment_token,
+                    &debt_position,
+                    available_balance,
+                    &debt_fee_total,
+                    "repayment ledger fees",
                 );
                 continue;
             }
@@ -842,9 +870,12 @@ where
                 *available_balance =
                     available_balance.clone() - estimation.repaid_debt.clone() - debt_fee_total.clone();
             } else {
-                debug!(
-                    "Available balance would underflow when updating. available={}, repay={}, fees={}",
-                    available_balance, estimation.repaid_debt, debt_fee_total
+                Self::log_funding_shortfall(
+                    &repayment_token,
+                    &debt_position,
+                    available_balance,
+                    &(estimation.repaid_debt.clone() + debt_fee_total.clone()),
+                    "repayment plus ledger fees",
                 );
                 continue;
             }

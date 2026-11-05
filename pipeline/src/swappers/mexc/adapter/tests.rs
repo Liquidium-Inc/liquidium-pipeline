@@ -333,14 +333,14 @@ fn withdraw_status_accepts_tx_id_or_trans_hash_for_completion() {
 }
 
 #[test]
-fn withdraw_status_keeps_non_completed_states_unchanged() {
+fn withdraw_status_handles_failed_pending_and_unknown_states() {
     assert_eq!(
         withdraw_status_from_mexc_record("FAILED", None, None),
         WithdrawStatus::Failed
     );
     assert_eq!(
         withdraw_status_from_mexc_record("PENDING", Some("0xabc"), None),
-        WithdrawStatus::Pending
+        WithdrawStatus::Completed
     );
     assert_eq!(
         withdraw_status_from_mexc_record("UNKNOWN_STATUS", None, None),
@@ -350,6 +350,35 @@ fn withdraw_status_keeps_non_completed_states_unchanged() {
         withdraw_status_from_mexc_record("UNKNOWN_STATUS", Some("0xabc"), None),
         WithdrawStatus::Completed
     );
+}
+
+#[test]
+fn withdraw_status_pending_completes_only_with_a_non_empty_transaction_reference() {
+    for status in [
+        "APPLY", "AUDITING", "WAIT", "PENDING", "PROCESSING", "WAIT_PACKAGING", "WAIT_CONFIRM", "MANUAL",
+        "1", "2", "3", "4", "5", "6", "10",
+    ] {
+        for (tx_id, trans_hash) in [(Some("1117316:hash"), None), (None, Some("1117316"))] {
+            assert_eq!(
+                withdraw_status_from_mexc_record(status, tx_id, trans_hash),
+                WithdrawStatus::Completed,
+                "{status} with a transaction reference"
+            );
+        }
+        for (tx_id, trans_hash) in [(None, None), (Some(" "), Some("  "))] {
+            assert_eq!(
+                withdraw_status_from_mexc_record(status, tx_id, trans_hash),
+                WithdrawStatus::Pending,
+                "{status} without a transaction reference"
+            );
+        }
+    }
+    for (status, expected) in [("FAILED", WithdrawStatus::Failed), ("CANCEL", WithdrawStatus::Canceled)] {
+        assert_eq!(
+            withdraw_status_from_mexc_record(status, Some("1117316:hash"), Some("1117316")),
+            expected
+        );
+    }
 }
 
 #[test]
