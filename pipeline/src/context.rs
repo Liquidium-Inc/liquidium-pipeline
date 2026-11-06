@@ -519,6 +519,7 @@ mod tests {
             lending_canister: Principal::from_text("aaaaa-aa").expect("principal"),
             export_path: "executions.csv".to_string(),
             buy_bad_debt: false,
+            liquidation_funding: Default::default(),
             db_path: "wal.db".to_string(),
             max_allowed_dex_slippage: 125,
             max_allowed_cex_slippage_bps: 200,

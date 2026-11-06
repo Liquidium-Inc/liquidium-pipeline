@@ -62,6 +62,7 @@ impl<'a, A: PipelineAgent, D: LiquidationIntentStore> PipelineStage<'a, Vec<Exec
             let executor_request = executor_request.clone();
 
             async move {
+                let _in_flight = self.begin_in_flight();
                 let mut receipt = ExecutionReceipt {
                     request: executor_request.clone(),
                     liquidation_result: None,
@@ -93,7 +94,7 @@ impl<'a, A: PipelineAgent, D: LiquidationIntentStore> PipelineStage<'a, Vec<Exec
                     .agent
                     .call_update::<Result<LiquidationResult, ProtocolError>>(
                         &self.lending_canister,
-                        "liquidate_with_slippage",
+                        self.funding.liquidate_method(),
                         args,
                     )
                     .await
@@ -116,7 +117,8 @@ impl<'a, A: PipelineAgent, D: LiquidationIntentStore> PipelineStage<'a, Vec<Exec
                     Ok(v) => v,
                     Err(err) => {
                         warn!(
-                            "[executor] liquidate_with_slippage rejected by canister | borrower={} | debt_pool={} | collateral_pool={} | debt={} | min_collateral_amount={} | err={:?}",
+                            "[executor] {} rejected by canister | borrower={} | debt_pool={} | collateral_pool={} | debt={} | min_collateral_amount={} | err={:?}",
+                            self.funding.liquidate_method(),
                             liq_req.borrower.to_text(),
                             liq_req.debt_pool_id.to_text(),
                             liq_req.collateral_pool_id.to_text(),
@@ -139,7 +141,8 @@ impl<'a, A: PipelineAgent, D: LiquidationIntentStore> PipelineStage<'a, Vec<Exec
                 receipt.liquidation_result = Some(liq.clone());
                 if let LiquidationStatus::FailedLiquidation(err) = &liq.status {
                     warn!(
-                        "[executor] liquidate_with_slippage returned FailedLiquidation | liq_id={} | borrower={} | debt_pool={} | collateral_pool={} | debt={} | min_collateral_amount={} | err={}",
+                        "[executor] {} returned FailedLiquidation | liq_id={} | borrower={} | debt_pool={} | collateral_pool={} | debt={} | min_collateral_amount={} | err={}",
+                        self.funding.liquidate_method(),
                         liq.id,
                         liq_req.borrower.to_text(),
                         liq_req.debt_pool_id.to_text(),
@@ -270,8 +273,8 @@ mod tests {
     };
 
     use crate::{
-        approval_state::ApprovalState, persistance::MockLiquidationIntentStore, stage::PipelineStage,
-        swappers::model::SwapRequest,
+        approval_state::ApprovalState, liquidation::supply_funding::LiquidationFunding,
+        persistance::MockLiquidationIntentStore, stage::PipelineStage, swappers::model::SwapRequest,
     };
 
     fn p(text: &str) -> Principal {
@@ -343,6 +346,53 @@ mod tests {
             .times(expected)
             .returning(|_, _, _| Ok(()));
         intents
+    }
+
+    #[tokio::test]
+    async fn supply_funded_executor_calls_liquidate_from_supply_and_skips_allowances() {
+        // given an executor in supply mode; the mock fails on any allowance call
+        let lending_canister = p("nja4y-2yaaa-aaaae-qddxa-cai");
+        let ledger = p("xevnm-gaaaa-aaaar-qafnq-cai");
+        let mut agent = MockPipelineAgent::new();
+        agent
+            .expect_call_update::<Result<LiquidationResult, ProtocolError>>()
+            .withf(move |canister, method, _| *canister == lending_canister && method == "liquidate_from_supply")
+            .times(1)
+            .returning(move |_, _, _| Ok(Ok(make_liquidation_result(7u128))));
+
+        let mut executor = BasicExecutor::new(
+            Arc::new(agent),
+            Account {
+                owner: p("2vxsx-fae"),
+                subaccount: None,
+            },
+            lending_canister,
+            Arc::new(accepting_intent_store(1)),
+            Arc::new(ApprovalState::new()),
+        )
+        .with_funding(LiquidationFunding::Supply);
+        executor.init(&[ledger]).await.expect("init must not touch allowances");
+        let in_flight = executor.in_flight_counter();
+
+        let request = make_request(
+            p("2vxsx-fae"),
+            ChainToken::Icp {
+                ledger,
+                symbol: "ckUSDC".to_string(),
+                decimals: 6,
+                fee: Nat::from(10_000u64),
+            },
+        );
+
+        // when
+        let receipts = executor
+            .process(&vec![request])
+            .await
+            .expect("executor process should succeed");
+
+        // then
+        assert!(matches!(receipts[0].status, ExecutionStatus::Success));
+        assert_eq!(in_flight.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
