@@ -9,9 +9,10 @@ use crate::executors::executor::ExecutorRequest;
 
 use crate::approval_state::ApprovalState;
 use crate::liquidation::collateral_service::CollateralServiceTrait;
+use crate::liquidation::supply_funding::SupplyBalanceSource;
 use crate::stage::PipelineStage;
 
-use candid::{Int, Nat};
+use candid::{Int, Nat, Principal};
 use futures::TryFutureExt;
 use liquidium_pipeline_core::{
     balance_service::BalanceService,
@@ -75,6 +76,8 @@ where
     pub account_service: Arc<BalanceService>,
     pub approval_state: Arc<ApprovalState>,
     pub watchdog: Arc<dyn Watchdog>,
+    // Set in supply funding mode: liquidations are sized from the supply position, not the wallet.
+    pub supply_balances: Option<Arc<dyn SupplyBalanceSource>>,
 }
 
 impl<C, R, U> SimpleLiquidationStrategy<C, R, U>
@@ -97,12 +100,33 @@ where
             account_service: balance_service,
             approval_state,
             watchdog: noop_watchdog(),
+            supply_balances: None,
         }
     }
 
     pub fn with_watchdog(mut self, wd: Arc<dyn Watchdog>) -> Self {
         self.watchdog = wd;
         self
+    }
+
+    pub fn with_supply_balances(mut self, source: Arc<dyn SupplyBalanceSource>) -> Self {
+        self.supply_balances = Some(source);
+        self
+    }
+
+    /// Whether an ICRC-2 approval is needed and the ledger fees the funding leg costs. Supply
+    /// funding moves no tokens in, so it needs neither.
+    fn debt_funding_cost(&self, token: &ChainToken) -> (bool, Nat) {
+        if self.supply_balances.is_some() {
+            return (false, Nat::from(0u8));
+        }
+
+        let approval_needed = self.debt_approval_needed(token);
+        let mut fee_total = token.fee();
+        if approval_needed {
+            fee_total += token.fee();
+        }
+        (approval_needed, fee_total)
     }
 
     fn debt_approval_needed(&self, token: &ChainToken) -> bool {
@@ -188,25 +212,30 @@ where
 
     // Helper: Prefetch balances for all debt assets we might need
     async fn prefetch_balances_for_users(&self, users: &[LiquidatebleUser]) -> Result<HashMap<String, Nat>, String> {
-        let mut debt_assets: HashSet<ChainToken> = HashSet::new();
+        // Each debt asset lives in exactly one debt pool; keep the pool for supply lookups.
+        let mut debt_assets: HashMap<ChainToken, Principal> = HashMap::new();
         for user in users.iter() {
             for pos in user.positions.iter() {
                 if pos.debt_amount > 0u8
                     && let Some(token) = resolve_token_for_position(self.registry.as_ref(), pos)
                 {
-                    debt_assets.insert(token);
+                    debt_assets.insert(token, pos.pool_id);
                 }
             }
         }
 
         let mut balances: HashMap<String, Nat> = HashMap::new();
-        for asset in debt_assets {
-            let balance = self
-                .account_service
-                .get_balance(&asset.asset_id())
-                .map_err(|_| "Could not get balance".to_string())
-                .await?
-                .value;
+        for (asset, pool_id) in debt_assets {
+            let balance = match &self.supply_balances {
+                Some(source) => source.supplied_native(pool_id).await?,
+                None => {
+                    self.account_service
+                        .get_balance(&asset.asset_id())
+                        .map_err(|_| "Could not get balance".to_string())
+                        .await?
+                        .value
+                }
+            };
 
             balances.insert(asset.asset_id().address, balance);
         }
@@ -324,13 +353,9 @@ where
                 continue;
             };
 
-            let debt_approval_needed = self.debt_approval_needed(&repayment_token);
-            let mut debt_fee_total = repayment_token.fee();
-            if debt_approval_needed {
-                debt_fee_total += repayment_token.fee();
-            }
+            let (debt_approval_needed, debt_fee_total) = self.debt_funding_cost(&repayment_token);
 
-            if available_balance.clone() < debt_fee_total.clone() {
+            if available_balance.clone() <= debt_fee_total.clone() {
                 self.watchdog
                     .notify(WatchdogEvent::InsufficientFunds {
                         asset: &debt_position.asset.to_string(),
@@ -517,13 +542,9 @@ where
                 continue;
             };
 
-            let debt_approval_needed = self.debt_approval_needed(&repayment_token);
-            let mut debt_fee_total = repayment_token.fee();
-            if debt_approval_needed {
-                debt_fee_total += repayment_token.fee();
-            }
+            let (debt_approval_needed, debt_fee_total) = self.debt_funding_cost(&repayment_token);
 
-            if available_balance.clone() < debt_fee_total.clone() {
+            if available_balance.clone() <= debt_fee_total.clone() {
                 self.watchdog
                     .notify(WatchdogEvent::InsufficientFunds {
                         asset: &debt_position.asset.to_string(),
@@ -900,6 +921,89 @@ mod tests {
         assert_eq!(req.liquidation.debt_amount, Nat::from(2_000u64));
         assert!(req.swap_args.is_none(), "no swap expected when assets match");
         assert_eq!(req.min_collateral_amount, Nat::from(0u8));
+    }
+
+    struct FixedSupply {
+        pool: Principal,
+        amount: Nat,
+    }
+
+    #[async_trait]
+    impl SupplyBalanceSource for FixedSupply {
+        async fn supplied_native(&self, pool_id: Principal) -> Result<Nat, String> {
+            assert_eq!(pool_id, self.pool, "supply must be read from the debt pool");
+            Ok(self.amount.clone())
+        }
+    }
+
+    // Supply funding sizes the offer from the supplied balance, with no ledger fees deducted.
+    #[tokio::test]
+    async fn supply_funded_strategy_sizes_from_supply_without_fees() {
+        // given
+        let ledger = p("xevnm-gaaaa-aaaar-qafnq-cai");
+        let token = mk_icp_token("ckUSDC", 6);
+        let mut registry = MockTokenRegistryTrait::new();
+        registry
+            .expect_get()
+            .returning(move |_id: &AssetId| Some(token.clone()));
+
+        let mut cfg = MockConfigTrait::new();
+        let trader = p("aaaaa-aa");
+        cfg.expect_get_trader_principal().return_const(trader);
+        cfg.expect_get_liquidator_principal().return_const(trader);
+        cfg.expect_should_buy_bad_debt().return_const(false);
+        cfg.expect_get_max_allowed_dex_slippage().return_const(2000u32);
+        cfg.expect_get_lending_canister()
+            .return_const(p("mxzaz-hqaaa-aaaar-qaada-cai"));
+
+        let supplied = Nat::from(777_000u64);
+        let expected_budget = supplied.clone();
+        let mut collateral = MockCollateralServiceTrait::new();
+        collateral
+            .expect_price_ray()
+            .returning(|_| Ok(Nat::from(1_000_000_000_000_000_000_000_000_000u128)));
+        collateral
+            .expect_calculate_liquidation_amounts()
+            .returning(move |max_balance, _debt_pos, _coll_pos, _user| {
+                assert_eq!(max_balance, expected_budget, "budget must be the full supplied balance");
+                Ok(LiquidationEstimation {
+                    received_collateral: Nat::from(4_000u64),
+                    repaid_debt: Nat::from(1_000u64),
+                    ref_price: Nat::from(0u8),
+                    debt_price: Nat::from(0u8),
+                })
+            });
+
+        // The wallet must not be consulted in supply mode.
+        let mut account = MockAccountInfo::new();
+        account
+            .expect_sync_balance()
+            .returning(|_t: &ChainToken| panic!("wallet balance read in supply mode"));
+        account
+            .expect_get_balance()
+            .returning(|_t: &ChainToken| panic!("wallet balance read in supply mode"));
+
+        let registry = Arc::new(registry);
+        let balance_service = Arc::new(BalanceService::new(registry.clone(), Arc::new(account)));
+        let pool = p("mxzaz-hqaaa-aaaar-qaada-cai");
+        let strategy = SimpleLiquidationStrategy::new(
+            Arc::new(cfg),
+            registry.clone(),
+            Arc::new(collateral),
+            balance_service,
+            Arc::new(ApprovalState::new()),
+        )
+        .with_supply_balances(Arc::new(FixedSupply { pool, amount: supplied }));
+
+        let pos = mk_position(pool, p("user-valid"), ledger, 1_000, 4_000, Assets::USDC);
+        let user = mk_user(vec![pos], 1_000, 900);
+
+        // when
+        let res = strategy.process(&vec![user]).await.unwrap();
+
+        // then
+        assert_eq!(res.len(), 1);
+        assert!(!res[0].debt_approval_needed, "supply funding never needs an approval");
     }
 
     // Fails fast when balance fetch errors.

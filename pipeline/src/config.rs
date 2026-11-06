@@ -1,3 +1,4 @@
+use crate::liquidation::supply_funding::LiquidationFunding;
 use alloy::hex::ToHexExt;
 use alloy::signers::local::PrivateKeySigner;
 use candid::Principal;
@@ -48,6 +49,8 @@ pub struct Config {
     pub lending_canister: Principal,
     pub export_path: String,
     pub buy_bad_debt: bool,
+    // Where liquidations take the debt asset from (`LIQUIDATION_FUNDING`, default wallet).
+    pub liquidation_funding: LiquidationFunding,
     pub db_path: String,
     pub max_allowed_dex_slippage: u32,
     pub max_allowed_cex_slippage_bps: u32,
@@ -272,6 +275,8 @@ impl Config {
             .map(|v| v.parse().unwrap_or(false))
             .unwrap_or(false);
 
+        let liquidation_funding = LiquidationFunding::parse(&env::var("LIQUIDATION_FUNDING").unwrap_or_default())?;
+
         debug!("Liquidator ID {}", liquidator_principal);
         debug!("Trader ID {}", trader_principal);
 
@@ -446,6 +451,7 @@ impl Config {
             lending_canister,
             export_path,
             buy_bad_debt,
+            liquidation_funding,
             db_path,
             max_allowed_dex_slippage,
             max_allowed_cex_slippage_bps,

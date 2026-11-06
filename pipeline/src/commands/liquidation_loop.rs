@@ -30,6 +30,7 @@ use crate::{
         profit_calculator::SimpleProfitCalculator,
     },
     liquidation::collateral_service::CollateralService,
+    liquidation::supply_funding::{self, LendingSupplyBalances, LiquidationFunding, Resupplier},
     persistance::{
         FinalizerMetaPayload, LiquidationIntentStore, MultiVenueExecutionOutcome, ResultStatus, VenueLegStatus,
         WalStore, sqlite::SqliteWalStore,
@@ -51,6 +52,7 @@ use crate::{
     },
 };
 use ic_agent::Agent;
+use liquidium_pipeline_core::tokens::token_registry::TokenRegistryTrait;
 use liquidium_pipeline_core::{
     balance_service::BalanceService,
     tokens::{chain_token::ChainToken, token_registry::TokenRegistry},
@@ -219,12 +221,17 @@ async fn init(
         config.lending_canister,
         db.clone(),
         ctx.approval_state.clone(),
-    );
+    )
+    .with_funding(config.liquidation_funding);
 
     executor
         .init(&tokens)
         .await
         .map_err(|e| format!("executor token init failed: {e}"))?;
+    let supply_profile = match config.liquidation_funding {
+        LiquidationFunding::Wallet => None,
+        LiquidationFunding::Supply => Some(start_supply_funding(ctx.as_ref(), &executor).await?),
+    };
     let executor = Arc::new(executor);
 
     // One bridge for every exchange venue: they share its accounts, so they
@@ -309,7 +316,7 @@ async fn init(
     let wd = webhook_watchdog_from_env(Duration::from_secs(300));
     wd.notify(WatchdogEvent::Heartbeat { stage: "Init" }).await;
 
-    let strategy = SimpleLiquidationStrategy::new(
+    let mut strategy = SimpleLiquidationStrategy::new(
         config.clone(),
         registry.clone(),
         collateral_service.clone(),
@@ -317,12 +324,53 @@ async fn init(
         ctx.approval_state.clone(),
     )
     .with_watchdog(wd);
+    if let Some(profile) = supply_profile {
+        strategy = strategy.with_supply_balances(Arc::new(LendingSupplyBalances::new(
+            agent.clone(),
+            config.lending_canister,
+            profile,
+        )));
+    }
 
     let exporter = Arc::new(ExportStage {
         path: config.export_path.clone(),
     });
 
     Ok((finder, strategy, executor, exporter, finalizer, db))
+}
+
+/// Resolves the liquidator's Liquidium profile and starts supplying idle wallet balances.
+async fn start_supply_funding(
+    ctx: &PipelineContext,
+    executor: &BasicExecutor<Agent, SqliteWalStore>,
+) -> Result<Principal, String> {
+    let config = &ctx.config;
+    let profile = supply_funding::lookup_profile(
+        ctx.agent.as_ref(),
+        &config.lending_canister,
+        config.liquidator_principal,
+    )
+    .await?
+    .ok_or_else(|| {
+        "LIQUIDATION_FUNDING=supply needs a Liquidium profile for the liquidator; run `liquidator supply register`"
+            .to_string()
+    })?;
+
+    let debt_tokens = ctx.registry.debt_assets().into_iter().map(|(_, token)| token).collect();
+    let resupplier = Resupplier::new(
+        ctx.agent.clone(),
+        config.lending_canister,
+        profile,
+        debt_tokens,
+        ctx.main_service.clone(),
+        ctx.main_transfers.actions(),
+        executor.in_flight_counter(),
+    )
+    .await?;
+    Arc::new(resupplier).spawn();
+
+    info!(profile = %profile, "Supply funding enabled; liquidations burn supplied balance");
+    Ok(profile)
 }
 
 fn bridge_low_balance_service(ctx: &PipelineContext) -> Arc<BalanceService> {
@@ -460,6 +508,7 @@ pub async fn run_liquidation_loop(sock_path: PathBuf) -> ExitCode {
         max_dex_slippage_bps = config.max_allowed_dex_slippage,
         max_cex_slippage_bps = config.max_allowed_cex_slippage_bps,
         buy_bad_debt = config.buy_bad_debt,
+        liquidation_funding = ?config.liquidation_funding,
         "Startup configuration"
     );
     info!("Liquidator started; scanning for liquidation opportunities...");
@@ -501,23 +550,25 @@ pub async fn run_liquidation_loop(sock_path: PathBuf) -> ExitCode {
     }
 
     let low_balance_monitor = slack_watchdog.as_ref().map(|slack| {
-        Arc::new(LowBalanceMonitor::new(
-            vec![
+        let mut accounts = vec![MonitoredBalanceAccount {
+            label: "bridge",
+            service: bridge_low_balance_service(&ctx),
+            only_symbols: None,
+            exclude_symbols: None,
+        }];
+        // In supply mode the main wallet is swept into the pools on purpose.
+        if config.liquidation_funding == LiquidationFunding::Wallet {
+            accounts.insert(
+                0,
                 MonitoredBalanceAccount {
                     label: "main",
                     service: ctx.main_service.clone(),
                     only_symbols: None,
                     exclude_symbols: balance_check_exclude_from_env(),
                 },
-                MonitoredBalanceAccount {
-                    label: "bridge",
-                    service: bridge_low_balance_service(&ctx),
-                    only_symbols: None,
-                    exclude_symbols: None,
-                },
-            ],
-            slack.clone(),
-        ))
+            );
+        }
+        Arc::new(LowBalanceMonitor::new(accounts, slack.clone()))
     });
 
     let _execution_worker = match spawn_execution_worker(
