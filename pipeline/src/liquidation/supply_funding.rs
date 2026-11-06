@@ -27,6 +27,11 @@ pub const SUPPLY_LIQUIDATE_METHOD: &str = "liquidate_from_supply";
 
 /// Signed requests must expire within the canister's signature window (5 minutes).
 const REQUEST_EXPIRY_SECS: u64 = 4 * 60;
+/// RAY precision used by the lending canister's share indices.
+const ONE_RAY: u128 = 1_000_000_000_000_000_000_000_000_000;
+/// Native units held back per supply-funded offer. Each burn rounds its shares up, which can
+/// cost up to one share (a couple of native units at realistic indices) beyond the offer.
+pub const SUPPLY_BURN_ROUNDING_RESERVE: u64 = 2;
 /// How often idle wallet balances are supplied back to the pools.
 pub const RESUPPLY_INTERVAL: Duration = Duration::from_secs(60);
 /// Wallet balances below this many ledger fees are left alone to avoid dust deposits.
@@ -64,7 +69,8 @@ impl LiquidationFunding {
 /// The subset of the lending `PositionView` this module needs.
 #[derive(Debug, Clone, CandidType, Deserialize)]
 struct PositionSupplyView {
-    deposited_native_now: Nat,
+    deposit_scaled: Nat,
+    lending_index_now: Nat,
 }
 
 /// The subset of the lending `Pool` record this module needs.
@@ -219,7 +225,19 @@ pub async fn withdraw_supply<A: PipelineAgent>(
         .map_err(|e| format!("withdraw rejected: {e:?}"))
 }
 
-/// Native amount the profile has supplied to `pool_id` (zero without a position).
+/// Largest offer the canister accepts for `shares`: it burns `ceil(offer / index)` shares, so
+/// `floor(shares * index)` is always covered. The index only grows, so the bound still holds
+/// when the call lands later.
+pub(crate) fn spendable_native(shares: &Nat, lending_index: &Nat) -> Nat {
+    let index = if *lending_index == 0u8 {
+        Nat::from(ONE_RAY)
+    } else {
+        lending_index.clone()
+    };
+    (shares.clone() * index) / Nat::from(ONE_RAY)
+}
+
+/// Native amount of `pool_id` supply the profile can spend on liquidations (zero without a position).
 pub async fn supplied_native<A: PipelineAgent>(
     agent: &A,
     lending_canister: &Principal,
@@ -232,7 +250,7 @@ pub async fn supplied_native<A: PipelineAgent>(
         .await
         .map_err(|e| format!("get_position failed for pool {pool_id}: {e}"))?;
     Ok(position
-        .map(|p| p.deposited_native_now)
+        .map(|p| spendable_native(&p.deposit_scaled, &p.lending_index_now))
         .unwrap_or_else(|| Nat::from(0u8)))
 }
 
@@ -254,11 +272,58 @@ pub async fn pool_for_ledger<A: PipelineAgent>(
         .ok_or_else(|| format!("no lending pool for ledger {ledger}"))
 }
 
+/// The pool subaccount that credits deposits to `profile`.
+pub async fn deposit_subaccount<A: PipelineAgent>(
+    agent: &A,
+    pool: Principal,
+    profile: Principal,
+) -> Result<[u8; 32], String> {
+    let args =
+        Encode!(&InflowSubaccount::Deposit(profile)).map_err(|e| format!("get_inflow_subaccount encode error: {e}"))?;
+    let subaccount = agent
+        .call_query::<Vec<u8>>(&pool, "get_inflow_subaccount", args)
+        .await
+        .map_err(|e| format!("get_inflow_subaccount failed: {e}"))?;
+    subaccount
+        .as_slice()
+        .try_into()
+        .map_err(|_| format!("pool returned a {}-byte subaccount", subaccount.len()))
+}
+
+/// Tokens sitting in the deposit subaccount that the pool has not swept yet.
+pub async fn unswept_deposit<A: PipelineAgent>(
+    agent: &A,
+    ledger: Principal,
+    pool: Principal,
+    subaccount: [u8; 32],
+) -> Result<Nat, String> {
+    let account = Account {
+        owner: pool,
+        subaccount: Some(subaccount),
+    };
+    let args = Encode!(&account).map_err(|e| format!("icrc1_balance_of encode error: {e}"))?;
+    agent
+        .call_query::<Nat>(&ledger, "icrc1_balance_of", args)
+        .await
+        .map_err(|e| format!("icrc1_balance_of failed: {e}"))
+}
+
+/// Asks the pool to sweep the deposit subaccount and credit the profile's supply. The ICP pool
+/// only credits subaccounts it has been told about, so this call is required.
+pub async fn sweep_deposit<A: PipelineAgent>(agent: &A, pool: Principal, subaccount: [u8; 32]) -> Result<(), String> {
+    let args = Encode!(&subaccount.to_vec()).map_err(|e| format!("check_subaccount encode error: {e}"))?;
+    agent
+        .call_update::<Result<(), candid::Reserved>>(&pool, "check_subaccount", args)
+        .await
+        .map_err(|e| format!("check_subaccount failed: {e}"))?
+        .map_err(|_| "check_subaccount rejected the sweep".to_string())
+}
+
 /// Supplies `amount` of an ICP-ledger token to `pool` on behalf of `profile`.
 ///
-/// Transfers to the pool's deposit subaccount for the profile, then asks the pool to sweep it
-/// right away instead of waiting for its timer. A failed sweep is not fatal: the pool's timer
-/// picks the deposit up later.
+/// Transfers to the pool's deposit subaccount for the profile, then asks the pool to sweep it.
+/// If either step fails, or the transfer outcome is unknown, the tokens may sit in the
+/// subaccount. Recover them with [`unswept_deposit`] and [`sweep_deposit`], never by sending again.
 pub async fn deposit<A: PipelineAgent>(
     agent: &A,
     transfers: &dyn TransferActions,
@@ -271,17 +336,7 @@ pub async fn deposit<A: PipelineAgent>(
         return Err(format!("{} is not an ICP ledger token", token.symbol()));
     }
 
-    let args =
-        Encode!(&InflowSubaccount::Deposit(profile)).map_err(|e| format!("get_inflow_subaccount encode error: {e}"))?;
-    let subaccount = agent
-        .call_query::<Vec<u8>>(&pool, "get_inflow_subaccount", args)
-        .await
-        .map_err(|e| format!("get_inflow_subaccount failed: {e}"))?;
-    let subaccount: [u8; 32] = subaccount
-        .as_slice()
-        .try_into()
-        .map_err(|_| format!("pool returned a {}-byte subaccount", subaccount.len()))?;
-
+    let subaccount = deposit_subaccount(agent, pool, profile).await?;
     let to = ChainAccount::Icp(Account {
         owner: pool,
         subaccount: Some(subaccount),
@@ -291,11 +346,9 @@ pub async fn deposit<A: PipelineAgent>(
         .await
         .map_err(|e| format!("supply transfer failed: {e}"))?;
 
-    let args = Encode!(&subaccount.to_vec()).map_err(|e| format!("check_subaccount encode error: {e}"))?;
-    if let Err(err) = agent.call_update_raw(&pool, "check_subaccount", args).await {
-        tracing::warn!(pool = %pool, error = %err, "check_subaccount failed; the pool timer will credit the supply");
-    }
-
+    sweep_deposit(agent, pool, subaccount)
+        .await
+        .map_err(|e| format!("supply transfer {tx} landed but is not credited yet: {e}"))?;
     Ok(tx)
 }
 
@@ -316,12 +369,19 @@ pub(crate) fn resupply_amount(balance: &Nat, fee: &Nat) -> Option<Nat> {
 /// flight. Anything that lands after the read is left for the next pass, so a sweep never
 /// moves tokens that arrived from a liquidation not yet recorded in the WAL. Amounts come from
 /// live balances, so an ambiguous transfer is never repeated blindly.
+struct ResupplyTarget {
+    token: ChainToken,
+    ledger: Principal,
+    pool: Principal,
+    subaccount: [u8; 32],
+}
+
 pub struct Resupplier<A: PipelineAgent> {
     agent: Arc<A>,
     profile: Principal,
     balances: Arc<BalanceService>,
     transfers: Arc<dyn TransferActions + Send + Sync>,
-    targets: Vec<(ChainToken, Principal)>,
+    targets: Vec<ResupplyTarget>,
     in_flight: Arc<AtomicUsize>,
 }
 
@@ -341,8 +401,15 @@ impl<A: PipelineAgent + 'static> Resupplier<A> {
             let ChainToken::Icp { ledger, .. } = &token else {
                 continue;
             };
-            let pool = pool_for_ledger(agent.as_ref(), &lending_canister, *ledger).await?;
-            targets.push((token, pool));
+            let ledger = *ledger;
+            let pool = pool_for_ledger(agent.as_ref(), &lending_canister, ledger).await?;
+            let subaccount = deposit_subaccount(agent.as_ref(), pool, profile).await?;
+            targets.push(ResupplyTarget {
+                token,
+                ledger,
+                pool,
+                subaccount,
+            });
         }
 
         Ok(Self {
@@ -356,7 +423,11 @@ impl<A: PipelineAgent + 'static> Resupplier<A> {
     }
 
     pub async fn run_once(&self) {
-        for (token, pool) in &self.targets {
+        for target in &self.targets {
+            // Finish any earlier deposit whose sweep failed or whose transfer outcome was unknown.
+            self.sweep_leftover(target).await;
+
+            let token = &target.token;
             let balance = match self.balances.get_balance(&token.asset_id()).await {
                 Ok(balance) => balance.value,
                 Err(err) => {
@@ -375,7 +446,7 @@ impl<A: PipelineAgent + 'static> Resupplier<A> {
                 self.agent.as_ref(),
                 self.transfers.as_ref(),
                 token,
-                *pool,
+                target.pool,
                 self.profile,
                 amount.clone(),
             )
@@ -387,6 +458,27 @@ impl<A: PipelineAgent + 'static> Resupplier<A> {
                 Err(err) => {
                     tracing::warn!(asset = %token.symbol(), error = %err, "resupply failed; retrying next pass")
                 }
+            }
+        }
+    }
+
+    async fn sweep_leftover(&self, target: &ResupplyTarget) {
+        let unswept = match unswept_deposit(self.agent.as_ref(), target.ledger, target.pool, target.subaccount).await {
+            Ok(unswept) => unswept,
+            Err(err) => {
+                tracing::warn!(asset = %target.token.symbol(), error = %err, "could not read deposit subaccount");
+                return;
+            }
+        };
+        if unswept <= target.token.fee() {
+            return;
+        }
+        match sweep_deposit(self.agent.as_ref(), target.pool, target.subaccount).await {
+            Ok(()) => {
+                tracing::info!(asset = %target.token.symbol(), amount = %unswept, "Credited a pending supply deposit")
+            }
+            Err(err) => {
+                tracing::warn!(asset = %target.token.symbol(), error = %err, "pending supply deposit still not credited")
             }
         }
     }
@@ -415,6 +507,22 @@ mod tests {
             LiquidationFunding::Supply
         );
         assert!(LiquidationFunding::parse("pool").is_err());
+    }
+
+    #[test]
+    fn spendable_native_floors_so_the_ceil_burn_fits() {
+        // given 1_500_000 shares at an index of 1.000001
+        let shares = Nat::from(1_500_000u64);
+        let index = Nat::from(ONE_RAY + ONE_RAY / 1_000_000);
+
+        // when
+        let spendable = spendable_native(&shares, &index);
+
+        // then the canister's ceil(offer / index) burn never exceeds the shares held
+        let ray = Nat::from(ONE_RAY);
+        let burn = (spendable.clone() * ray + index.clone() - Nat::from(1u8)) / index;
+        assert_eq!(spendable, Nat::from(1_500_001u64));
+        assert!(burn <= shares);
     }
 
     #[test]

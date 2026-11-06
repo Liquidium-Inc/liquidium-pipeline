@@ -9,7 +9,7 @@ use crate::executors::executor::ExecutorRequest;
 
 use crate::approval_state::ApprovalState;
 use crate::liquidation::collateral_service::CollateralServiceTrait;
-use crate::liquidation::supply_funding::SupplyBalanceSource;
+use crate::liquidation::supply_funding::{SUPPLY_BURN_ROUNDING_RESERVE, SupplyBalanceSource};
 use crate::stage::PipelineStage;
 
 use candid::{Int, Nat, Principal};
@@ -114,11 +114,11 @@ where
         self
     }
 
-    /// Whether an ICRC-2 approval is needed and the ledger fees the funding leg costs. Supply
-    /// funding moves no tokens in, so it needs neither.
+    /// Whether an ICRC-2 approval is needed and what the funding leg costs on top of the offer.
+    /// Supply funding moves no tokens in; it only holds back the share-rounding reserve.
     fn debt_funding_cost(&self, token: &ChainToken) -> (bool, Nat) {
         if self.supply_balances.is_some() {
-            return (false, Nat::from(0u8));
+            return (false, Nat::from(SUPPLY_BURN_ROUNDING_RESERVE));
         }
 
         let approval_needed = self.debt_approval_needed(token);
@@ -938,7 +938,7 @@ mod tests {
 
     // Supply funding sizes the offer from the supplied balance, with no ledger fees deducted.
     #[tokio::test]
-    async fn supply_funded_strategy_sizes_from_supply_without_fees() {
+    async fn supply_funded_strategy_sizes_from_supply_without_ledger_fees() {
         // given
         let ledger = p("xevnm-gaaaa-aaaar-qafnq-cai");
         let token = mk_icp_token("ckUSDC", 6);
@@ -957,7 +957,7 @@ mod tests {
             .return_const(p("mxzaz-hqaaa-aaaar-qaada-cai"));
 
         let supplied = Nat::from(777_000u64);
-        let expected_budget = supplied.clone();
+        let expected_budget = supplied.clone() - Nat::from(SUPPLY_BURN_ROUNDING_RESERVE);
         let mut collateral = MockCollateralServiceTrait::new();
         collateral
             .expect_price_ray()
@@ -965,7 +965,7 @@ mod tests {
         collateral
             .expect_calculate_liquidation_amounts()
             .returning(move |max_balance, _debt_pos, _coll_pos, _user| {
-                assert_eq!(max_balance, expected_budget, "budget must be the full supplied balance");
+                assert_eq!(max_balance, expected_budget, "budget is the supply less the rounding reserve");
                 Ok(LiquidationEstimation {
                     received_collateral: Nat::from(4_000u64),
                     repaid_debt: Nat::from(1_000u64),

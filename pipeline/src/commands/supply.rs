@@ -188,12 +188,51 @@ async fn pool_for(ctx: &PipelineContext, token: &ChainToken) -> Result<Principal
 }
 
 fn parse_amount(token: &ChainToken, amount: &str) -> Result<Nat> {
-    let value: f64 = amount
-        .parse()
-        .map_err(|_| anyhow!("amount must be a decimal number or `all`"))?;
-    let native = ChainTokenAmount::from_formatted(token.clone(), value).value;
+    let native = parse_decimal_native(amount.trim(), token.decimals())?;
     if native == 0u8 {
         bail!("amount must be greater than zero");
     }
     Ok(native)
+}
+
+/// Parses a decimal string into native units exactly, rejecting more fractional digits than
+/// the token has instead of rounding.
+fn parse_decimal_native(amount: &str, decimals: u8) -> Result<Nat> {
+    let (whole, fraction) = amount.split_once('.').unwrap_or((amount, ""));
+    let is_digits = |part: &str| part.bytes().all(|byte| byte.is_ascii_digit());
+    if (whole.is_empty() && fraction.is_empty()) || !is_digits(whole) || !is_digits(fraction) {
+        bail!("amount must be a decimal number or `all`");
+    }
+    if fraction.len() > decimals as usize {
+        bail!("amount has more than {decimals} decimal places");
+    }
+
+    let digits = format!("{whole}{fraction:0<width$}", width = decimals as usize);
+    let value: u128 = digits.parse().map_err(|_| anyhow!("amount is too large"))?;
+    Ok(Nat::from(value))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_decimal_native_is_exact() {
+        // given / when / then
+        assert_eq!(parse_decimal_native("10000", 6).unwrap(), Nat::from(10_000_000_000u64));
+        assert_eq!(parse_decimal_native("0.1", 6).unwrap(), Nat::from(100_000u64));
+        assert_eq!(parse_decimal_native("1.234567", 6).unwrap(), Nat::from(1_234_567u64));
+        assert_eq!(parse_decimal_native(".5", 8).unwrap(), Nat::from(50_000_000u64));
+        assert_eq!(parse_decimal_native("0", 8).unwrap(), Nat::from(0u8));
+    }
+
+    #[test]
+    fn parse_decimal_native_rejects_bad_input() {
+        // given / when / then
+        assert!(parse_decimal_native("1.2345678", 6).is_err());
+        assert!(parse_decimal_native("1e6", 6).is_err());
+        assert!(parse_decimal_native("-1", 6).is_err());
+        assert!(parse_decimal_native(".", 6).is_err());
+        assert!(parse_decimal_native("999999999999999999999999999999999999999", 6).is_err());
+    }
 }
