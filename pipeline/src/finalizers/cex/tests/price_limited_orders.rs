@@ -30,7 +30,13 @@ fn finalizer_with_fee_and_fills(
         }],
         taker_fee_bps,
     };
-    backend.expect_get_orderbook().returning(move |_, _| Ok(book.clone()));
+    backend.expect_get_orderbook().returning(move |market, _| {
+        if is_direct_ck_market(market) {
+            Err(format!("no market {market}"))
+        } else {
+            Ok(book.clone())
+        }
+    });
     let orders: Orders = Arc::default();
     let seen = orders.clone();
     let fills = std::sync::Mutex::new(fills.into_iter());

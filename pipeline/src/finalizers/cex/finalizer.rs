@@ -105,6 +105,9 @@ where
     pub quote_route_fee_bps: u32,
     /// Price-move buffer for deposit/trade/withdraw latency.
     pub quote_delay_buffer_bps: u32,
+    /// The impact above which a transport's book is not sound, so the preview
+    /// moves to the next transport. `CEX_MAX_PRICE_IMPACT_BPS`, with its default.
+    pub transport_impact_cap_bps: f64,
     /// The shared bridge, when exchange legs may bridge. Carries the claim
     /// registry every venue consults before it attaches a lost handle.
     pub bridge: Option<Arc<BridgeRuntime>>,
@@ -156,6 +159,12 @@ where
 
     pub fn with_best_output_routing(mut self, best_output_routing: bool) -> Self {
         self.best_output_routing = best_output_routing;
+        self
+    }
+
+    /// A preview whose impact is above the cap is not sound and the next transport is tried.
+    pub fn with_transport_impact_cap_bps(mut self, cap_bps: f64) -> Self {
+        self.transport_impact_cap_bps = cap_bps;
         self
     }
 
@@ -251,6 +260,7 @@ where
             best_output_routing: false,
             quote_route_fee_bps: 0,
             quote_delay_buffer_bps: 0,
+            transport_impact_cap_bps: crate::config::DEFAULT_CEX_MAX_PRICE_IMPACT_BPS,
             bridge: None,
             token_registry: None,
             approve_bumps: Mutex::new(HashMap::new()),

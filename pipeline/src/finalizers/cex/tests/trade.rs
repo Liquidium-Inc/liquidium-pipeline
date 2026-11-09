@@ -8,6 +8,7 @@ async fn mexc_trade_skips_when_amount_in_zero_and_moves_to_withdraw() {
 
     // When amount_in <= 0, execute_swap must never be called.
     backend.expect_execute_swap_detailed_with_options().times(0);
+    legacy_ck_route_books(&mut backend);
 
     let backend = Arc::new(backend);
     let transfer_service = Arc::new(transfers);
@@ -44,6 +45,7 @@ async fn mexc_trade_skips_when_amount_in_zero_and_moves_to_withdraw() {
 async fn an_exhausted_leg_that_is_not_the_last_hands_its_output_to_the_next_leg() {
     let mut backend = MockCexBackend::new();
     backend.expect_execute_swap_detailed_with_options().times(0);
+    legacy_ck_route_books(&mut backend);
     let finalizer = test_finalizer(Arc::new(backend), Arc::new(MockTransferActions::new()));
 
     let mut state = finalizer
@@ -90,9 +92,13 @@ async fn mexc_trade_executes_swap_and_sets_size_out_and_step_withdraw() {
         }],
         taker_fee_bps: 10.0,
     };
-    backend
-        .expect_get_orderbook()
-        .returning(move |_market, _limit| Ok(orderbook.clone()));
+    backend.expect_get_orderbook().returning(move |market, _limit| {
+        if is_direct_ck_market(market) {
+            Err(format!("no market {market}"))
+        } else {
+            Ok(orderbook.clone())
+        }
+    });
 
     let calls = std::sync::Arc::new(std::sync::Mutex::new(0usize));
     let calls_handle = calls.clone();
@@ -193,9 +199,13 @@ async fn mexc_trade_propagates_backend_errors() {
         }],
         taker_fee_bps: 10.0,
     };
-    backend
-        .expect_get_orderbook()
-        .returning(move |_market, _limit| Ok(orderbook.clone()));
+    backend.expect_get_orderbook().returning(move |market, _limit| {
+        if is_direct_ck_market(market) {
+            Err(format!("no market {market}"))
+        } else {
+            Ok(orderbook.clone())
+        }
+    });
 
     backend
         .expect_execute_swap_detailed_with_options()
@@ -875,12 +885,14 @@ async fn mexc_trade_slippage_error_includes_requested_and_actual_fill_details() 
     let receipt = make_execution_receipt(42);
     let mut state = finalizer.prepare("42", &receipt).await.expect("prepare should succeed");
     state.step = CexStep::Trade;
+    // A single-leg route, CKBTC -> BTC, so the one order is the slice under test.
     state.withdraw.withdraw_asset = ChainToken::Icp {
         ledger: Principal::anonymous(),
         symbol: "BTC".to_string(),
         decimals: 8,
         fee: Nat::from(1_000u64),
     };
+    state.withdraw.bridge.withdraw_planned_asset = Some("BTC".to_string());
 
     let err = finalizer.trade(&mut state).await.expect_err("trade should fail");
     let error = err.to_string();
@@ -1395,7 +1407,7 @@ async fn mexc_trade_when_leg_index_is_past_route_moves_to_withdraw_and_sets_size
     let mut backend = MockCexBackend::new();
     let transfers = MockTransferActions::new();
 
-    backend.expect_get_orderbook().times(0);
+    legacy_ck_route_books(&mut backend);
     backend.expect_execute_swap_detailed_with_options().times(0);
 
     let finalizer = test_finalizer(Arc::new(backend), Arc::new(transfers));
@@ -1516,7 +1528,13 @@ async fn mexc_preview_trade_slice_buy_binary_search_finds_largest_chunk_under_ta
     backend
         .expect_get_orderbook()
         .times(1)
-        .returning(move |_market, _limit| Ok(orderbook.clone()));
+        .returning(move |market, _limit| {
+            if is_direct_ck_market(market) {
+                Err(format!("no market {market}"))
+            } else {
+                Ok(orderbook.clone())
+            }
+        });
 
     let finalizer = CexVenueFinalizer::new(
         Arc::new(backend),
@@ -1567,7 +1585,13 @@ async fn mexc_preview_trade_slice_sell_fallback_uses_full_remaining_when_hard_ca
     backend
         .expect_get_orderbook()
         .times(1)
-        .returning(move |_market, _limit| Ok(orderbook.clone()));
+        .returning(move |market, _limit| {
+            if is_direct_ck_market(market) {
+                Err(format!("no market {market}"))
+            } else {
+                Ok(orderbook.clone())
+            }
+        });
 
     let finalizer = CexVenueFinalizer::new(
         Arc::new(backend),
@@ -1617,7 +1641,13 @@ async fn mexc_preview_trade_slice_sell_fallback_errors_when_hard_cap_rejects() {
     backend
         .expect_get_orderbook()
         .times(1)
-        .returning(move |_market, _limit| Ok(orderbook.clone()));
+        .returning(move |market, _limit| {
+            if is_direct_ck_market(market) {
+                Err(format!("no market {market}"))
+            } else {
+                Ok(orderbook.clone())
+            }
+        });
 
     let finalizer = CexVenueFinalizer::new(
         Arc::new(backend),
@@ -1666,7 +1696,13 @@ async fn mexc_preview_trade_slice_buy_fallback_uses_full_remaining_when_hard_cap
     backend
         .expect_get_orderbook()
         .times(1)
-        .returning(move |_market, _limit| Ok(orderbook.clone()));
+        .returning(move |market, _limit| {
+            if is_direct_ck_market(market) {
+                Err(format!("no market {market}"))
+            } else {
+                Ok(orderbook.clone())
+            }
+        });
 
     let finalizer = CexVenueFinalizer::new(
         Arc::new(backend),
@@ -1714,7 +1750,13 @@ async fn mexc_preview_trade_slice_buy_fallback_errors_when_hard_cap_rejects() {
     backend
         .expect_get_orderbook()
         .times(1)
-        .returning(move |_market, _limit| Ok(orderbook.clone()));
+        .returning(move |market, _limit| {
+            if is_direct_ck_market(market) {
+                Err(format!("no market {market}"))
+            } else {
+                Ok(orderbook.clone())
+            }
+        });
 
     let finalizer = CexVenueFinalizer::new(
         Arc::new(backend),
@@ -1784,9 +1826,10 @@ async fn mexc_approval_bump_retries_after_first_batch_failure_and_then_short_cir
 
 #[tokio::test]
 async fn mexc_route_preview_refuses_a_zero_amount() {
-    let backend = Arc::new(MockCexBackend::new());
+    let mut backend = MockCexBackend::new();
+    legacy_ck_route_books(&mut backend);
     let transfers = Arc::new(MockTransferActions::new());
-    let finalizer = test_finalizer(backend, transfers);
+    let finalizer = test_finalizer(Arc::new(backend), transfers);
 
     let mut receipt = make_execution_receipt(42);
     if let Some(liq) = receipt.liquidation_result.as_mut() {
