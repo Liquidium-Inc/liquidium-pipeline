@@ -12,6 +12,7 @@ use serde_json::Value;
 
 use crate::bridge::legacy::LegacyBridgeSubmitPhase;
 use crate::finalizers::cex::profile::CexVenueProfile;
+use crate::finalizers::multi_venue::RIFT_VENUE_ID;
 use crate::finalizers::liquidation_outcome::LiquidationOutcome;
 use crate::persistance::{
     FinalizerMetaPayload, FinalizerMetaV2, LiqMetaWrapper, ResultStatus, VenueExecutionState, VenueLegState,
@@ -494,6 +495,8 @@ fn append_venue_leg_summary(lines: &mut Vec<Line<'static>>, leg: &VenueLegState,
 
     if let Some(profile) = CexVenueProfile::for_venue(&leg.venue_id) {
         append_cex_leg_transactions(lines, profile.name(), &leg.execution);
+    } else if leg.venue_id == RIFT_VENUE_ID {
+        append_rift_leg_transactions(lines, &leg.execution);
     }
 
     if let Some(result) = &leg.result {
@@ -553,6 +556,54 @@ fn append_cex_leg_transactions(lines: &mut Vec<Line<'static>>, venue: &str, exec
             "   {venue} deposit bridge phase: {}",
             describe_bridge_submit_phase(phase)
         )));
+    }
+}
+
+/// Shows the ids of a Rift leg: the order, the funding transfer, and the two
+/// bridges around the order.
+fn append_rift_leg_transactions(lines: &mut Vec<Line<'static>>, execution: &VenueExecutionState) {
+    let rift = execution.state.get("rift").unwrap_or(&execution.state);
+    let text = |value: Option<&Value>| {
+        value
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+    };
+    if let Some(order) = rift.get("order").filter(|order| !order.is_null()) {
+        let id = text(order.get("id")).unwrap_or_default();
+        let status = text(order.get("status")).unwrap_or_else(|| "created".to_string());
+        lines.push(Line::from(format!("   Rift order: {id} ({status})")));
+        if let Some(payout) = text(order.get("payout_tx")) {
+            lines.push(Line::from(format!("   Rift payout tx: {payout}")));
+        }
+    }
+    let fields = [
+        ("funding_txid", "funding txid"),
+        ("bridge_out", "deposit bridge id"),
+        ("bridge_in", "return bridge id"),
+    ];
+    for (field, label) in fields {
+        let value = match field {
+            "bridge_out" => text(rift.get(field).and_then(|leg| leg.get("deposit_bridge_id"))),
+            "bridge_in" => text(rift.get(field).and_then(|leg| leg.get("withdraw_bridge_id"))),
+            _ => text(rift.get(field)),
+        };
+        if let Some(value) = value {
+            lines.push(Line::from(format!("   Rift {label}: {value}")));
+        }
+    }
+    for (leg, field, label) in [
+        ("bridge_out", "deposit_bridge_call", "deposit bridge call"),
+        ("bridge_in", "withdraw_bridge_call", "return bridge call"),
+    ] {
+        if let Some(call) = rift
+            .get(leg)
+            .and_then(|leg| leg.get(field))
+            .filter(|call| !call.is_null())
+        {
+            lines.push(Line::from(format!("   Rift {label}: {}", describe_bridge_call(call))));
+        }
     }
 }
 

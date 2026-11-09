@@ -19,7 +19,8 @@ use crate::{
         call_sender::{BridgeCall, BridgeCallSender, prepare_bridge_call},
         runtime::BridgeRuntime,
     },
-    outbound::driver::{OutboundError, OutboundRecord, step_outbound},
+    finalizers::multi_venue::{OperatorQuestion, VenueStepError},
+    outbound::driver::{OperatorDecision, OutboundError, OutboundRecord, step_outbound},
     utils::{now_ts, waited_secs},
 };
 
@@ -226,6 +227,54 @@ async fn save_provider_call(
     );
     let id = crate::utils::new_venue_execution_id("bridge-call");
     Ok(OutboundRecord::prepared(prepare_bridge_call(id, &call)?))
+}
+
+impl From<BridgeLegError> for VenueStepError {
+    fn from(error: BridgeLegError) -> Self {
+        match error {
+            BridgeLegError::BelowMinimum(reason) => Self::BelowMinimum(reason),
+            BridgeLegError::Ambiguous(reason) => Self::Ambiguous(reason),
+            BridgeLegError::Other(reason) => Self::Other(reason),
+        }
+    }
+}
+
+/// Matches an operator's answer to the leg's open questions. No question takes
+/// a release only; one question needs an answer. Returns what to decide.
+pub(crate) fn single_open_question<K>(
+    mut questions: Vec<(K, OperatorQuestion)>,
+    answer: Option<&OperatorDecision>,
+) -> Result<Option<(K, OperatorDecision)>, String> {
+    if questions.len() > 1 {
+        let details: Vec<String> = questions.into_iter().map(|(_, question)| question.detail).collect();
+        return Err(format!(
+            "leg has {} open questions: {}",
+            details.len(),
+            details.join("; ")
+        ));
+    }
+    match (questions.pop(), answer) {
+        (None, None) => Ok(None),
+        (None, Some(_)) => Err("leg has no open question; release it with --release".to_string()),
+        (Some((_, question)), None) => Err(format!("leg waits for an answer: {}", question.detail)),
+        (Some((undecided, _)), Some(answer)) => Ok(Some((undecided, answer.clone()))),
+    }
+}
+
+/// A saved send only an operator can decide: it parked, or it may have run
+/// before a restart and running it again is not safe.
+pub(crate) fn undecided_send(record: &Option<OutboundRecord>) -> Option<&OutboundRecord> {
+    record.as_ref().filter(|record| record.needs_operator())
+}
+
+/// The question for an undecided send, with the ids the operator needs.
+pub(crate) fn send_question(purpose: &str, record: &OutboundRecord, receipt: &str) -> OperatorQuestion {
+    OperatorQuestion {
+        detail: format!(
+            "did the {purpose} ({} send {}) happen? --landed <{receipt}> | --absent (once it can no longer land; a new send follows)",
+            record.prepared.sender, record.prepared.identity
+        ),
+    }
 }
 
 /// A bridge still pending: a debug line until the stall bound, then a warning.

@@ -101,6 +101,10 @@ pub struct Config {
     /// Kraken's market allowlist, as `BASE_QUOTE`. Kraken refuses to start
     /// with an empty one, so the setting is required when Kraken is enabled.
     pub cex_kraken_available_pairs: Vec<String>,
+    /// The Rift REST API. Only the simulator points it elsewhere.
+    pub rift_api_url: String,
+    /// Names the integrator to Rift. Lives only in the environment.
+    pub rift_api_key: Option<String>,
     /// Maximum intermediate hops allowed for Kraken route discovery.
     pub cex_kraken_max_hops: u8,
     pub icpswap_factory_canister: Principal,
@@ -407,6 +411,11 @@ impl Config {
         let cex_mexc_max_hops = parse_cex_max_hops_from_env("CEX_MEXC_MAX_HOPS");
         let cex_kraken_available_pairs = parse_cex_available_pairs_from_env("CEX_KRAKEN_AVAILABLE_PAIRS");
         let cex_kraken_max_hops = parse_cex_max_hops_from_env("CEX_KRAKEN_MAX_HOPS");
+        let rift_api_url = parse_rift_api_url_from_env();
+        let rift_api_key = env::var("RIFT_API_KEY")
+            .ok()
+            .map(|key| key.trim().to_string())
+            .filter(|key| !key.is_empty());
         let icpswap_factory_canister = parse_icpswap_factory_from_env()?;
         let icpswap_fee_tiers = parse_icpswap_fee_tiers_from_env()?;
         let icpswap_test_allocation_usd = parse_test_allocation_usd_from_env("ICPSWAP_TEST_ALLOCATION_USD")?;
@@ -486,6 +495,8 @@ impl Config {
             cex_mexc_max_hops,
             cex_kraken_available_pairs,
             cex_kraken_max_hops,
+            rift_api_url,
+            rift_api_key,
             icpswap_factory_canister,
             icpswap_fee_tiers,
             icpswap_max_price_impact_bps: parse_icpswap_max_price_impact_bps_from_env(),
@@ -612,7 +623,8 @@ const DEFAULT_ICPSWAP_DUST_FALLBACK_MAX_PRICE_IMPACT_BPS: f64 = 150.0;
 pub(crate) const DEFAULT_CEX_MAX_PRICE_IMPACT_BPS: f64 = 200.0;
 const DEFAULT_ICPSWAP_MAX_SEARCH_ITERATIONS: u8 = 16;
 const DEFAULT_ENABLED_SWAP_VENUES: &str = "icpswap,mexc";
-const SUPPORTED_SWAP_VENUES: [&str; 3] = ["icpswap", "mexc", "kraken"];
+const SUPPORTED_SWAP_VENUES: [&str; 4] = ["icpswap", "mexc", "rift", "kraken"];
+pub(crate) const DEFAULT_RIFT_API_URL: &str = "https://api.rift.trade";
 /// Venues this release refuses to start with. Remove a venue here to release it.
 const RELEASE_DISABLED_SWAP_VENUES: [&str; 1] = ["kraken"];
 
@@ -741,6 +753,14 @@ fn parse_slippage_bps(name: &str, trimmed: &str) -> Result<u32, String> {
         ));
     }
     Ok(parsed)
+}
+
+/// The simulator's Rift mock replaces the real API when it is configured.
+fn parse_rift_api_url_from_env() -> String {
+    if let Some(url) = crate::simulator::rift_url() {
+        return url;
+    }
+    env::var("RIFT_API_URL").unwrap_or_else(|_| DEFAULT_RIFT_API_URL.to_string())
 }
 
 fn parse_enabled_swap_venues_from_env() -> Result<Vec<String>, String> {

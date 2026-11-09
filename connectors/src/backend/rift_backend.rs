@@ -96,6 +96,21 @@ impl RiftOrderStatus {
         }
     }
 
+    /// The status as the API names it; the inverse of `from_api`.
+    pub fn as_api(&self) -> String {
+        match self {
+            Self::AwaitingDeposit => "awaiting_deposit".to_string(),
+            Self::Funded => "funded".to_string(),
+            Self::Underfunded => "underfunded".to_string(),
+            Self::Executing => "executing".to_string(),
+            Self::Delivered => "delivered".to_string(),
+            Self::Refunded => "refunded".to_string(),
+            Self::Expired => "expired".to_string(),
+            Self::Frozen => "frozen".to_string(),
+            Self::Unknown(other) => other.clone(),
+        }
+    }
+
     /// Whether Rift holds or has moved our funds. A caller must never treat
     /// such an order as if nothing happened.
     pub fn funds_moved(&self) -> bool {
@@ -119,8 +134,9 @@ pub struct RiftOrderState {
 /// the text is for the operator.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum RiftError {
-    /// The request never reached Rift or Rift could not serve it. Nothing
-    /// happened there, so the same request later is safe.
+    /// The request never reached Rift, or Rift could not serve it, or the
+    /// answer was lost. A repeat is safe: a quote creates nothing, and an
+    /// order is the same for the same quote id.
     #[error("{0}")]
     Unreachable(String),
     /// Rift refused the request before acting: an unknown asset, a bad amount

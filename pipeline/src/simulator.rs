@@ -5,7 +5,7 @@ use std::env;
 
 use candid::Principal;
 
-use crate::finalizers::multi_venue::{ICPSWAP_VENUE_ID, MEXC_VENUE_ID};
+use crate::finalizers::multi_venue::{ICPSWAP_VENUE_ID, MEXC_VENUE_ID, RIFT_VENUE_ID};
 
 /// True in a `simulator` build. A default build never reads a `SIM_*` setting.
 pub const ENABLED: bool = cfg!(feature = "simulator");
@@ -69,11 +69,22 @@ pub fn enabled_swap_venues() -> Result<Vec<String>, String> {
     if env::var_os("SIM_MEXC_URL").is_some() {
         venues.push(MEXC_VENUE_ID.to_string());
     }
+    if env::var_os("SIM_RIFT_URL").is_some() {
+        venues.push(RIFT_VENUE_ID.to_string());
+    }
     Ok(venues)
 }
 
 /// The local MEXC holds ck assets itself, so it skips the production bridge
 /// unless `SIM_MEXC_BRIDGE` asks for the local one.
+/// The Rift mock's URL, when the workbench runs one.
+pub fn rift_url() -> Option<String> {
+    if !ENABLED {
+        return None;
+    }
+    env::var("SIM_RIFT_URL").ok().filter(|url| !url.trim().is_empty())
+}
+
 pub fn mexc_uses_bridge() -> bool {
     !ENABLED || env::var_os("SIM_MEXC_BRIDGE").is_some()
 }
