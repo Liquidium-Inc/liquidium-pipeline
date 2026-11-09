@@ -1,7 +1,10 @@
 use bitcoin::{Address as BitcoinAddress, Network};
 use std::str::FromStr;
 
-use super::{BridgeDestination, BridgeRouteKind, BridgeRouteSpec, BridgeSweepRoute, catalog::BRIDGE_ROUTE_CATALOG};
+use super::{
+    BridgeDestination, BridgeDestinationKind, BridgeRouteKind, BridgeRouteSpec, BridgeSweepRoute,
+    catalog::BRIDGE_ROUTE_CATALOG,
+};
 
 fn validate_solana_address(address: &str, field_name: &str) -> Result<(), String> {
     let trimmed = address.trim();
@@ -53,6 +56,27 @@ pub fn resolve_cketh_reverse_route_by_source(
             BridgeRouteKind::CkEthErc20Reverse | BridgeRouteKind::CkEthToEth
         ) && source_asset.eq_ignore_ascii_case(route.source_asset)
             && source_chain.eq_ignore_ascii_case(route.source_chain)
+    })
+}
+
+/// The exchange-transport route that moves an ICP asset out to another chain,
+/// whatever the bridge behind it. Direction and eligibility come from the
+/// catalog, not from the symbol.
+pub fn resolve_reverse_route_by_source(source_asset: &str, source_chain: &str) -> Option<&'static BridgeRouteSpec> {
+    BRIDGE_ROUTE_CATALOG.iter().find(|route| {
+        route.exchange_transport
+            && route.source_chain.eq_ignore_ascii_case("ICP")
+            && source_asset.eq_ignore_ascii_case(route.source_asset)
+            && source_chain.eq_ignore_ascii_case(route.source_chain)
+    })
+}
+
+/// The exchange-transport route that delivers the target asset into an ICP account.
+pub fn resolve_forward_route_by_target(target_asset: &str) -> Option<&'static BridgeRouteSpec> {
+    BRIDGE_ROUTE_CATALOG.iter().find(|route| {
+        route.exchange_transport
+            && route.destination_kind == BridgeDestinationKind::IcpAccount
+            && target_asset.eq_ignore_ascii_case(route.target_asset)
     })
 }
 
@@ -136,6 +160,22 @@ pub fn validate_destination_for_route(route: &BridgeRouteSpec, destination: &Bri
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn generic_lookups_cover_every_bridged_asset_without_symbol_tests() {
+        for (asset, target) in [("ckUSDC", "USDC"), ("ckETH", "ETH"), ("ckSOL", "SOL")] {
+            let route = super::resolve_reverse_route_by_source(asset, "ICP").expect(asset);
+            assert_eq!(route.target_asset, target);
+            let back = super::resolve_forward_route_by_target(asset).expect(asset);
+            assert_eq!(back.source_asset, target);
+            assert_eq!(back.destination_kind, super::BridgeDestinationKind::IcpAccount);
+        }
+        assert!(super::resolve_reverse_route_by_source("USDC", "ETH").is_none());
+        assert!(super::resolve_forward_route_by_target("USDC").is_none());
+        // ckBTC trades on the exchange's ICP network, so its bridge is not exchange transport.
+        assert!(super::resolve_reverse_route_by_source("ckBTC", "ICP").is_none());
+        assert!(super::resolve_forward_route_by_target("ckBTC").is_none());
+    }
+
     use super::super::BridgeDestinationKind;
     use super::{
         BridgeDestination, BridgeRouteKind, BridgeRouteSpec, cketh_forward_routes, cketh_reverse_routes,
@@ -297,6 +337,7 @@ mod tests {
             target_asset: "SOL",
             destination_kind: BridgeDestinationKind::SolanaAddress,
             route_kind: BridgeRouteKind::IcpToSolana,
+            exchange_transport: true,
             evm_token_address: None,
             ckerc20_ledger_id: None,
             min_sweep_amount: 0.0,

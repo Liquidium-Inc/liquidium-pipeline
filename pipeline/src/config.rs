@@ -72,7 +72,9 @@ pub struct Config {
     pub cex_retry_max_secs: u64,
     /// Minimum projected net edge required for any multi-venue plan, in bps.
     pub multi_venue_min_net_edge_bps: u32,
-    /// Signed edge floor used only for bad-debt liquidations. See
+    /// Optional signed floor for normal settlement after liquidation.
+    pub multi_venue_settlement_min_net_edge_bps: Option<i32>,
+    /// Signed settlement floor for global bad-debt mode or saved bad-debt rows. See
     /// `parse_multi_venue_bad_debt_min_net_edge_bps_from_env`.
     pub multi_venue_bad_debt_min_net_edge_bps: i32,
     /// Maximum downside from the oracle-implied output allowed for any venue
@@ -288,6 +290,10 @@ impl Config {
         // The db path
         let db_path_raw = env::var("DB_PATH").unwrap_or(format!("{}/wal.db", home));
         let db_path = expand_tilde(&db_path_raw).to_string_lossy().into_owned();
+        // Do not silently abandon durable intents from the earlier two-file layout.
+        if env::var_os("LIQUIDATIONS_DB_PATH").is_some() {
+            return Err("LIQUIDATIONS_DB_PATH is retired; reconcile the old intake database before removing this setting and using DB_PATH alone".into());
+        }
 
         // Derive EVM private key
         let sk = derive_evm_private_key(&mnemonic, 0, 0)?;
@@ -459,6 +465,7 @@ impl Config {
             cex_retry_base_secs: cex_tunables.retry_base_secs,
             cex_retry_max_secs: cex_tunables.retry_max_secs,
             multi_venue_min_net_edge_bps: parse_multi_venue_min_net_edge_bps_from_env(),
+            multi_venue_settlement_min_net_edge_bps: parse_multi_venue_settlement_min_net_edge_bps_from_env(),
             multi_venue_bad_debt_min_net_edge_bps: parse_multi_venue_bad_debt_min_net_edge_bps_from_env(),
             multi_venue_max_oracle_discount_bps: parse_multi_venue_max_oracle_discount_bps_from_env(),
             multi_venue_oracle_snapshot_max_age_secs: parse_multi_venue_oracle_snapshot_max_age_secs_from_env(),
@@ -567,24 +574,27 @@ fn parse_multi_venue_min_net_edge_bps_from_env() -> u32 {
         .min(MAX_BPS)
 }
 
-/// Edge floor for collateral bought as bad debt, which repays more than the
-/// collateral is worth by construction.
-///
-/// It mirrors `MULTI_VENUE_MIN_NET_EDGE_BPS` in sign, not in value: a
-/// profitable liquidation must clear the debt by 150 bps, while bad debt may
-/// fall short of it by 150 bps and still be recycled without a human. Anything
-/// further underwater is escalated instead of sold automatically.
-///
-/// Deliberately a constant rather than the negation of the profitable floor:
-/// raising the profit bar is a tightening, and must not silently widen how much
-/// loss the swap-back will accept. The quote is priced against the oracle
-/// regardless, so this governs recycling, never fill quality.
-fn parse_multi_venue_bad_debt_min_net_edge_bps_from_env() -> i32 {
-    let limit = i32::try_from(MAX_BPS).unwrap_or(i32::MAX);
-    env::var("MULTI_VENUE_BAD_DEBT_MIN_NET_EDGE_BPS")
+/// Reads a signed basis-point value, keeping it only when `valid` accepts it.
+fn parse_signed_bps_from_env(var: &str, valid: impl Fn(i32) -> bool) -> Option<i32> {
+    env::var(var)
         .ok()
         .and_then(|value| value.parse::<i32>().ok())
-        .filter(|bps| *bps >= -limit && *bps <= limit)
+        .filter(|bps| valid(*bps))
+}
+
+fn parse_multi_venue_settlement_min_net_edge_bps_from_env() -> Option<i32> {
+    parse_signed_bps_from_env(
+        "MULTI_VENUE_SETTLEMENT_MIN_NET_EDGE_BPS",
+        crate::finalizers::multi_venue::is_valid_settlement_floor,
+    )
+}
+
+/// Settlement floor for global bad-debt mode or saved bad-debt rows.
+/// Independent of the normal floor so changing it cannot widen bad-debt losses.
+/// The oracle quote guard still applies.
+fn parse_multi_venue_bad_debt_min_net_edge_bps_from_env() -> i32 {
+    let limit = i32::try_from(MAX_BPS).unwrap_or(i32::MAX);
+    parse_signed_bps_from_env("MULTI_VENUE_BAD_DEBT_MIN_NET_EDGE_BPS", |bps| bps >= -limit && bps <= limit)
         .unwrap_or(DEFAULT_MULTI_VENUE_BAD_DEBT_MIN_NET_EDGE_BPS)
 }
 
@@ -926,6 +936,7 @@ mod tests {
             "CEX_RETRY_BASE_SECS",
             "CEX_RETRY_MAX_SECS",
             "MULTI_VENUE_MIN_NET_EDGE_BPS",
+            "MULTI_VENUE_SETTLEMENT_MIN_NET_EDGE_BPS",
             "MULTI_VENUE_BAD_DEBT_MIN_NET_EDGE_BPS",
             "CEX_MIN_NET_EDGE_BPS",
             "MULTI_VENUE_MAX_ORACLE_DISCOUNT_BPS",
@@ -957,10 +968,31 @@ mod tests {
             }
         );
         assert_eq!(parse_multi_venue_min_net_edge_bps_from_env(), 150);
+        assert_eq!(parse_multi_venue_settlement_min_net_edge_bps_from_env(), None);
         // The same 150 bps, mirrored: a profitable liquidation must clear the
         // debt by that much, bad debt may fall short of it by that much.
         assert_eq!(parse_multi_venue_bad_debt_min_net_edge_bps_from_env(), -500);
         assert_eq!(parse_multi_venue_oracle_snapshot_max_age_secs_from_env(), 300);
+    }
+
+    #[test]
+    fn settlement_edge_floor_is_optional_and_accepts_only_bounded_overrides() {
+        let _guard = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        for (value, expected) in [
+            ("-150", Some(-150)),
+            ("0", Some(0)),
+            ("150", Some(150)),
+            ("-9999", Some(-9999)),
+            ("10000", Some(10000)),
+            ("-10000", None),
+            ("10001", None),
+            ("not-a-number", None),
+        ] {
+            unsafe { env::set_var("MULTI_VENUE_SETTLEMENT_MIN_NET_EDGE_BPS", value) };
+            assert_eq!(parse_multi_venue_settlement_min_net_edge_bps_from_env(), expected);
+        }
+        unsafe { env::remove_var("MULTI_VENUE_SETTLEMENT_MIN_NET_EDGE_BPS") };
+        assert_eq!(parse_multi_venue_settlement_min_net_edge_bps_from_env(), None);
     }
 
     #[test]
@@ -1222,6 +1254,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(feature = "simulator"))]
     fn enabled_swap_venues_default_to_icpswap_then_mexc() {
         let _guard = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
         unsafe {
@@ -1238,8 +1271,10 @@ mod tests {
     fn simulator_venues_require_a_local_exchange_configuration() {
         let _guard = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
         let previous = env::var_os("SIM_MEXC_URL");
+        let previous_factory = env::var_os("SIM_ICPSWAP_FACTORY");
         unsafe {
             env::remove_var("SIM_MEXC_URL");
+            env::remove_var("SIM_ICPSWAP_FACTORY");
         }
         assert!(parse_enabled_swap_venues_from_env().unwrap().is_empty());
         unsafe {
@@ -1247,15 +1282,33 @@ mod tests {
         }
         assert_eq!(parse_enabled_swap_venues_from_env().unwrap(), vec!["mexc"]);
         unsafe {
+            env::set_var("SIM_ICPSWAP_FACTORY", "4mmnk-kiaaa-aaaag-qbllq-cai");
+        }
+        assert_eq!(parse_enabled_swap_venues_from_env().unwrap(), vec!["icpswap", "mexc"]);
+        unsafe {
+            env::remove_var("SIM_MEXC_URL");
+        }
+        assert_eq!(parse_enabled_swap_venues_from_env().unwrap(), vec!["icpswap"]);
+        unsafe {
+            env::set_var("SIM_ICPSWAP_FACTORY", "invalid-principal");
+        }
+        assert!(parse_enabled_swap_venues_from_env().is_err());
+        unsafe {
             if let Some(value) = previous {
                 env::set_var("SIM_MEXC_URL", value);
             } else {
                 env::remove_var("SIM_MEXC_URL");
             }
+            if let Some(value) = previous_factory {
+                env::set_var("SIM_ICPSWAP_FACTORY", value);
+            } else {
+                env::remove_var("SIM_ICPSWAP_FACTORY");
+            }
         }
     }
 
     #[test]
+    #[cfg(not(feature = "simulator"))]
     fn enabled_swap_venues_normalize_and_preserve_order() {
         let _guard = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
         unsafe {
@@ -1271,6 +1324,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(feature = "simulator"))]
     fn enabled_swap_venues_reject_invalid_lists() {
         let _guard = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
         for (raw, expected) in [
@@ -1291,6 +1345,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(feature = "simulator"))]
     fn legacy_swapper_does_not_affect_enabled_venues() {
         let _guard = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
         unsafe {
@@ -1398,4 +1453,5 @@ mod tests {
             }
         }
     }
+
 }

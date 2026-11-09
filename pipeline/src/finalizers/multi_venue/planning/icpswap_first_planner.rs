@@ -45,8 +45,12 @@ pub struct IcpswapFirstPlannerConfig {
     pub dust_fallback_max_price_impact_bps: f64,
     pub cex_min_exec_usd: f64,
     pub min_net_edge_bps: u32,
-    /// Edge floor applied instead of `min_net_edge_bps` when the liquidation was
-    /// bought as bad debt. Signed, because such a row repays more than the
+    /// Optional signed override for normal settlement after liquidation.
+    pub settlement_min_net_edge_bps: Option<i32>,
+    /// Reuse the bad-debt settlement floor for all new plans when enabled globally.
+    pub buy_bad_debt: bool,
+    /// Edge floor used when bad-debt mode is enabled or the row was bought as
+    /// bad debt. Signed, because such a row repays more than the
     /// collateral is worth by construction: a non-negative floor can never be
     /// met and would leave the collateral stranded. `-10000` recycles it
     /// whatever the shortfall; the quote is still bounded by the oracle guard.
@@ -58,7 +62,28 @@ pub struct IcpswapFirstPlannerConfig {
     pub icpswap_test_allocation_usd: Option<f64>,
 }
 
+/// A settlement floor of `-BPS_DENOMINATOR` would accept any output at all, so
+/// the valid range is open at the bottom and closed at the top.
+pub(crate) fn is_valid_settlement_floor(bps: i32) -> bool {
+    let limit = i32::try_from(BPS_DENOMINATOR).unwrap_or(i32::MAX);
+    bps > -limit && bps <= limit
+}
+
 impl IcpswapFirstPlannerConfig {
+    /// The edge floor a new plan is held to.
+    ///
+    /// Bad-debt mode, global or per row, permits bounded settlement losses even
+    /// for a row that looked profitable at entry. Otherwise the signed
+    /// settlement override applies, and without one the legacy unsigned floor.
+    pub(crate) fn required_edge_bps(&self, row_bad_debt: bool) -> i32 {
+        if self.buy_bad_debt || row_bad_debt {
+            self.bad_debt_min_net_edge_bps
+        } else {
+            self.settlement_min_net_edge_bps
+                .unwrap_or_else(|| i32::try_from(self.min_net_edge_bps).unwrap_or(i32::MAX))
+        }
+    }
+
     // Rejects configuration that could make allocation ambiguous or unsafe.
     fn validate(&self) -> Result<(), IcpswapFirstPlannerError> {
         if !self.max_price_impact_bps.is_finite() || self.max_price_impact_bps <= 0.0 {
@@ -92,6 +117,11 @@ impl IcpswapFirstPlannerConfig {
             )));
         }
         let bps_limit = i32::try_from(BPS_DENOMINATOR).unwrap_or(i32::MAX);
+        if self.settlement_min_net_edge_bps.is_some_and(|bps| !is_valid_settlement_floor(bps)) {
+            return Err(IcpswapFirstPlannerError::InvalidInput(format!(
+                "settlement minimum net edge must be greater than -{bps_limit} and at most {bps_limit} bps"
+            )));
+        }
         if self.bad_debt_min_net_edge_bps > bps_limit || self.bad_debt_min_net_edge_bps < -bps_limit {
             return Err(IcpswapFirstPlannerError::InvalidInput(format!(
                 "bad-debt minimum net edge {} bps must stay within ±{} bps",
@@ -342,14 +372,16 @@ pub enum IcpswapFirstPlannerError {
     InvalidInput(String),
     #[error("no viable ICPSwap-first route: {0}")]
     NoViableRoute(String),
-    /// Every venue that could take this collateral answered, and the only
-    /// reason none can execute is that the amount is below their execution
-    /// minimum. Unlike `NoViableRoute` this is a property of the amount rather
-    /// than of venue availability, so retrying cannot resolve it and the
-    /// caller may move the collateral out of the swap path.
+    /// The amount is below the configured execution minimum of every overflow
+    /// venue. `preview_overflow` decides this from the amount alone, before any
+    /// venue is asked; after quoting it also covers the case where every venue
+    /// answered and none can execute. Unlike `NoViableRoute` this is a property
+    /// of the amount, so retrying cannot resolve it and the caller may move the
+    /// collateral out of the swap path.
     ///
     /// Never construct this while any venue failed to quote: an outage may end,
-    /// and a retry would then produce a real route.
+    /// and a retry would then produce a real route. Callers that reached the
+    /// overflow preview through a venue failure downgrade it to `NoViableRoute`.
     #[error("no venue can execute this amount: {0}")]
     BelowVenueMinimum(String),
 }
@@ -457,8 +489,14 @@ impl IcpswapFirstPlanner {
                 ))
             }
             VenuePreviewOutcome::Quoted(_) => self.plan_split_or_fallback(input, quoted_at).await,
-            VenuePreviewOutcome::Unavailable(icpswap_error) | VenuePreviewOutcome::Invalid(icpswap_error) => {
-                let overflow_quotes = self.preview_overflow(input, input.total_pay.value.clone()).await?;
+            VenuePreviewOutcome::Unavailable(icpswap_error)
+            | VenuePreviewOutcome::Invalid(icpswap_error)
+            | VenuePreviewOutcome::BelowMinimum(icpswap_error) => {
+                let fallthrough_reason = format!("ICPSwap quote rejected ({icpswap_error})");
+                let overflow_quotes = self
+                    .preview_overflow(input, input.total_pay.value.clone())
+                    .await
+                    .map_err(|error| self.classify_overflow_preview_error(error, Some(&fallthrough_reason)))?;
                 let overflow = self.best_executable_overflow(input, &overflow_quotes).ok_or_else(|| {
                     IcpswapFirstPlannerError::NoViableRoute(format!(
                         "ICPSwap quote rejected ({icpswap_error}); {}",
@@ -630,12 +668,15 @@ impl IcpswapFirstPlanner {
         input: &IcpswapFirstPlanInput,
         fallthrough_reason: Option<String>,
     ) -> Result<VenueRoutePreview, IcpswapFirstPlannerError> {
-        let quotes = self.preview_overflow(input, input.total_pay.value.clone()).await?;
+        let quotes = self
+            .preview_overflow(input, input.total_pay.value.clone())
+            .await
+            .map_err(|error| self.classify_overflow_preview_error(error, fallthrough_reason.as_deref()))?;
         self.best_executable_overflow(input, &quotes).cloned().ok_or_else(|| {
             let summary = self.overflow_failure_summary(&quotes);
             match fallthrough_reason {
                 Some(reason) => IcpswapFirstPlannerError::NoViableRoute(format!("{reason}; {summary}")),
-                None if self.every_overflow_venue_quoted(&quotes) => {
+                None if self.every_overflow_venue_responded(&quotes) => {
                     IcpswapFirstPlannerError::BelowVenueMinimum(summary)
                 }
                 None => IcpswapFirstPlannerError::NoViableRoute(summary),
@@ -646,15 +687,37 @@ impl IcpswapFirstPlanner {
     // Whether every configured overflow venue actually answered. Combined with
     // `best_executable_overflow` returning nothing, this is what distinguishes
     // "all venues are healthy and this amount is simply too small" from "a
-    // venue is down", which is not a permanent property of the amount.
-    fn every_overflow_venue_quoted(&self, quotes: &VenueQuoteBook) -> bool {
+    // venue is down", which is not a permanent property of the amount. The
+    // pre-quote check in `preview_overflow` never reaches here.
+    fn every_overflow_venue_responded(&self, quotes: &VenueQuoteBook) -> bool {
         !self.overflow_venue_ids.is_empty()
             && self.overflow_venue_ids.iter().all(|venue_id| {
                 matches!(
                     quotes.get(venue_id).map(|venue| &venue.outcome),
-                    Some(VenuePreviewOutcome::Quoted(_))
+                    Some(VenuePreviewOutcome::Quoted(_) | VenuePreviewOutcome::BelowMinimum(_))
                 )
             })
+    }
+
+    fn below_minimum_overflow_summary(&self) -> String {
+        self.overflow_venue_ids
+            .iter()
+            .map(|venue_id| format!("{} amount is below its minimum", venue_id.to_uppercase()))
+            .collect::<Vec<_>>()
+            .join("; ")
+    }
+
+    fn classify_overflow_preview_error(
+        &self,
+        error: IcpswapFirstPlannerError,
+        fallthrough_reason: Option<&str>,
+    ) -> IcpswapFirstPlannerError {
+        match (error, fallthrough_reason) {
+            (IcpswapFirstPlannerError::BelowVenueMinimum(summary), Some(reason)) => {
+                IcpswapFirstPlannerError::NoViableRoute(format!("{reason}; {summary}"))
+            }
+            (error, _) => error,
+        }
     }
 
     // Non-native ICP collateral cannot use ICPSwap, so choose the executable
@@ -875,6 +938,17 @@ impl IcpswapFirstPlanner {
         input: &IcpswapFirstPlanInput,
         pay_value: Nat,
     ) -> Result<VenueQuoteBook, IcpswapFirstPlannerError> {
+        // Overflow dust must never reach a venue adapter. Fixed transfer fees
+        // can dominate a tiny allocation and make a fair market quote look like
+        // an oracle-price failure, while the venue cannot execute the amount
+        // economically in any case.
+        let pay_amount = ChainTokenAmount::from_raw(input.total_pay.token.clone(), pay_value.clone());
+        if !input.meets_cex_minimum(&pay_amount, self.config.cex_min_exec_usd) {
+            return Err(IcpswapFirstPlannerError::BelowVenueMinimum(
+                self.below_minimum_overflow_summary(),
+            ));
+        }
+
         let context = input.planning_context();
         let quotes = self
             .venues
@@ -894,7 +968,9 @@ impl IcpswapFirstPlanner {
                 VenuePreviewOutcome::Quoted(preview) => self
                     .validate_venue_preview(input, &venue.venue_id, &venue.request, preview)
                     .err(),
-                VenuePreviewOutcome::Unavailable(_) | VenuePreviewOutcome::Invalid(_) => None,
+                VenuePreviewOutcome::Unavailable(_)
+                | VenuePreviewOutcome::Invalid(_)
+                | VenuePreviewOutcome::BelowMinimum(_) => None,
             };
             if let Some(error) = validation_error {
                 venue.outcome = VenuePreviewOutcome::Invalid(error.to_string());
@@ -1076,6 +1152,9 @@ impl IcpswapFirstPlanner {
                 Some(VenuePreviewOutcome::Invalid(error)) => {
                     format!("{} quote rejected ({error})", venue_id.to_uppercase())
                 }
+                Some(VenuePreviewOutcome::BelowMinimum(reason)) => {
+                    format!("{} amount below minimum ({reason})", venue_id.to_uppercase())
+                }
                 Some(VenuePreviewOutcome::Quoted(_)) => {
                     format!("{} amount is below its minimum", venue_id.to_uppercase())
                 }
@@ -1099,15 +1178,8 @@ impl IcpswapFirstPlanner {
         let conservative_receive = sum_leg_outputs(&legs, true)?;
         let combined_net_edge_bps = edge_bps(&conservative_receive, &input.debt_repaid)?;
 
-        // Bad debt is bought at a known loss, so measuring the swap against the
-        // debt it repaid can only ever reject it. Its own floor decides how much
-        // of that shortfall may be recycled without a human; the quote is still
-        // held to the oracle by `validate_venue_preview`.
-        let required_edge_bps = if input.buy_bad_debt {
-            self.config.bad_debt_min_net_edge_bps
-        } else {
-            i32::try_from(self.config.min_net_edge_bps).unwrap_or(i32::MAX)
-        };
+        // Every quote is still held to the oracle by `validate_venue_preview`.
+        let required_edge_bps = self.config.required_edge_bps(input.buy_bad_debt);
 
         if !meets_minimum_edge(&conservative_receive, &input.debt_repaid, required_edge_bps)? {
             return Err(IcpswapFirstPlannerError::NoViableRoute(format!(

@@ -1,5 +1,5 @@
 use alloy::{
-    network::{AnyNetwork, NetworkWallet, TransactionBuilder},
+    network::{AnyNetwork, NetworkWallet, ReceiptResponse, TransactionBuilder},
     primitives::{Address, TxHash, U256},
     providers::{Provider, WalletProvider},
     rpc::types::TransactionRequest,
@@ -83,6 +83,24 @@ impl<P> EvmBackendImpl<P>
 where
     P: Provider<AnyNetwork> + WalletProvider<AnyNetwork> + Send + Sync + Clone + 'static,
 {
+    /// A pending nonce above the included nonce means a transaction from
+    /// this signer is still in the mempool. Submitting another one behind it
+    /// is the condition the nonce retry below is built to survive.
+    pub(crate) async fn has_pending_nonce_gap(&self, signer: Address) -> Result<bool, String> {
+        let latest = self
+            .provider
+            .get_transaction_count(signer)
+            .await
+            .map_err(|e| e.to_string())?;
+        let pending = self
+            .provider
+            .get_transaction_count(signer)
+            .pending()
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(pending > latest)
+    }
+
     pub(crate) async fn erc20_balance_of_raw(&self, token: Address, owner: Address) -> Result<U256, String> {
         let contract = IERC20::new(token, self.provider.clone());
         contract
@@ -281,4 +299,3 @@ mod tests {
         assert!(!is_nonce_too_low_error("insufficient funds for gas * price + value"));
     }
 }
-use alloy::network::ReceiptResponse;

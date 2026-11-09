@@ -48,6 +48,15 @@ Configure `BRIDGE_CKSOL_MINTER_CANISTER`, `BRIDGE_CKSOL_LEDGER_CANISTER` and
 `SOLANA_RPC_URL` for the deployment. Stablecoin proceeds use the existing
 withdrawal/bridge route back to the repayment wallet.
 
+For ckSOL repayment, MEXC trades into native SOL (for example, ICP → USDT →
+SOL), withdraws to the dedicated bridge Solana wallet, then deposits through
+the minter into the repayment ICP account. Include `ICP_USDT` and `SOL_USDT`
+in `CEX_MEXC_AVAILABLE_PAIRS` for that two-hop route. SOL trades always use
+`SOL_USDT`; USDC proceeds convert through `USDC_USDT` when needed. The bridge
+reserves SOL for its transfer fee and records the actual minted ckSOL amount. Mint
+destinations are restricted to the bridge owner or the configured liquidator;
+the requested subaccount is preserved.
+
 - **Pipeline Architecture** — Composable stages for discovery, strategy, execution, finalization, and export.
 - **Async Rust** — Highly concurrent and efficient with Tokio runtime.
 - **Multi-Chain** — Primary support for ICP with EVM (Arbitrum) integration.
@@ -67,6 +76,25 @@ withdrawal/bridge route back to the repayment wallet.
 - **New client env var:** `BRIDGE_CKETH_MINTER_CANISTER` (recommended to set explicitly; defaults to `sv3dd-oaaaa-aaaar-qacoa-cai` when unset/empty).
 - **Primary operations:** `liquidator run`, `liquidator balance`, `liquidator withdraw`, `liquidator account show`.
 - **Persistence:** SQLite WAL (`DB_PATH`) enables idempotent retries and resume-safe execution.
+
+Discovery and venue execution run independently but share `DB_PATH`. Accepting a
+liquidation records its receipt and creates execution work in one SQLite
+transaction. Interrupted submissions remain ambiguous rather than being replayed;
+there is no second intake database, handoff importer or import cursor. The daemon
+lock is scoped to `DB_PATH`, and the TUI reads pause state from that same database.
+
+After a successful chain call, acceptance persistence is attempted up to three
+times without repeating the liquidation. If it still fails, the intent is parked
+as ambiguous with its chain receipt for operator reconciliation, and the daemon
+sends an operator-required watchdog alert. If the database also rejects that
+fallback write, the receipt is logged and the alert reports the persistence
+failure; startup still parks the remaining submitting intent. This does not
+automatically replay the liquidation or claim that its collateral was settled.
+
+The earlier unmerged two-database layout is not automatically migrated. Startup
+rejects `LIQUIDATIONS_DB_PATH` and WALs containing `intake_import_state` so accepted
+work in the old intake file cannot be silently left behind. Reconcile those files
+before migrating; ordinary legacy execution WALs are still adopted in place.
 
 ---
 
@@ -222,6 +250,8 @@ CEX_RETRY_BASE_SECS=5
 CEX_RETRY_MAX_SECS=120
 # Minimum projected net edge required before executing any venue plan (bps)
 MULTI_VENUE_MIN_NET_EDGE_BPS=150
+# Optional normal-settlement override after liquidation (up to 1.5% shortfall)
+MULTI_VENUE_SETTLEMENT_MIN_NET_EDGE_BPS=-150
 # Reject a venue quote this far below the oracle-implied output (bps)
 MULTI_VENUE_MAX_ORACLE_DISCOUNT_BPS=250
 # How long a price recorded on a receipt may stand in for a live oracle read (seconds)
@@ -248,7 +278,9 @@ Quick reference:
 | `CEX_BUY_INVERSE_ENABLED` | Master toggle for adaptive buy fallback. |
 | `CEX_RETRY_BASE_SECS` | Initial retry delay after retryable CEX errors. |
 | `CEX_RETRY_MAX_SECS` | Maximum retry delay cap. |
-| `MULTI_VENUE_MIN_NET_EDGE_BPS` | Minimum conservative edge required for any ICPSwap, MEXC, or split plan. |
+| `MULTI_VENUE_MIN_NET_EDGE_BPS` | Default normal-settlement floor when the signed override is unset. |
+| `MULTI_VENUE_SETTLEMENT_MIN_NET_EDGE_BPS` | Optional signed floor for normal settlement after liquidation; `-150` allows up to 1.5% conservative shortfall. Valid range is greater than `-10000` through `10000`; absent or invalid values use `MULTI_VENUE_MIN_NET_EDGE_BPS`. Does not change liquidation-entry checks or already committed plans. |
+| `MULTI_VENUE_BAD_DEBT_MIN_NET_EDGE_BPS` | Existing signed floor used for all new settlement plans when `BUY_BAD_DEBT=true`, and for saved bad-debt rows even when global mode is off. Defaults to `-500` (up to 5% shortfall) and takes precedence over the normal-settlement override. |
 | `MULTI_VENUE_MAX_ORACLE_DISCOUNT_BPS` | Maximum amount any venue quote may fall below the oracle-implied output. Values at or above 10000 would accept anything, so they fall back to the default. |
 | `MULTI_VENUE_ORACLE_SNAPSHOT_MAX_AGE_SECS` | How stale a price recorded at detection may be before it stops standing in for a failed live oracle read. Past this age the quote guard stands down rather than block a liquidation that already holds collateral. |
 | `CEX_DELAY_BUFFER_BPS` | Extra haircut for execution-latency/price-move risk. |
@@ -863,10 +895,12 @@ The simulator feature requires a loopback IC URL and the driver's exported
 `SIM_IC_ROOT_KEY`; main, trader and bridge agents use that local key.
 
 This build runs normal discovery, strategy, approvals, execution, settlement and
-SQLite persistence, but enables no swap venues. After successful settlement it
-retains collateral in the trader account and parks the row as `OperatorRequired`
-with an explicit custody reason. It does not claim a completed swap or realised
-trading profit. Default builds retain normal venue requirements and IC trust.
+SQLite persistence. `SIM_MEXC_URL` and `SIM_ICPSWAP_FACTORY` opt into the managed
+local venues; without either it retains settled collateral in the trader account
+and parks the row as `OperatorRequired`, not a fictitious completed swap or profit.
+`SIM_MEXC_BRIDGE` enables the shared native bridge runtime; direct CK custody
+leaves it detached. `CEX_MEXC_ROUTE_SELECTION=best-output` retains the simulator's
+amount/depth/fee-aware route comparison. Default builds retain normal IC trust.
 
 Python owns the mnemonic, local configuration, logs and process lifecycle.
 `account show` writes public main/trader/bridge principals to `SIM_IDENTITY_FILE`

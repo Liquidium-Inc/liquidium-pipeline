@@ -451,7 +451,9 @@ where
                         // liquidation is not wrong, so it must not be failed:
                         // park it where an operator can see it, exactly as
                         // startup does for the same condition.
-                        if let Err(mark_error) = wal_mark_unresumable(&*self.wal, wal_id, err_msg.clone()).await {
+                        if let Err(mark_error) =
+                            wal_mark_unresumable(&*self.wal, wal_id, err_msg.clone()).await
+                        {
                             warn!("Failed to park unresumable WAL row {}: {}", wal_id, mark_error);
                         }
                         error!(

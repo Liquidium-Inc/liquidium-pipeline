@@ -128,27 +128,34 @@ impl WebhookWatchdog {
     }
 }
 
+/// One key per condition the operator should hear about once per cooldown.
+/// An operator-required key carries the execution id, which for a multi-venue
+/// leg includes the liquidation id, so two liquidations never share a slot.
+fn cooldown_key(ev: &WatchdogEvent<'_>) -> String {
+    match ev {
+        WatchdogEvent::Heartbeat { stage } => format!("hb:{stage}"),
+        WatchdogEvent::BalanceMissing { asset } => format!("bal_missing:{asset}"),
+        WatchdogEvent::InsufficientFunds { asset, .. } => format!("insuff:{asset}"),
+        WatchdogEvent::LowBalance { account, asset_id, .. } => format!("low_balance:{account}:{asset_id}"),
+        WatchdogEvent::Lifecycle { state, .. } => format!("lifecycle:{state}"),
+        WatchdogEvent::OperatorRequired {
+            execution_id,
+            venue,
+            pending_step,
+            ..
+        } => format!("operator_required:{venue}:{execution_id}:{pending_step}"),
+        WatchdogEvent::LiquidationFinalized {
+            liquidation_id, status, ..
+        } => {
+            format!("liquidation_finalized:{liquidation_id}:{status}")
+        }
+    }
+}
+
 #[async_trait]
 impl Watchdog for WebhookWatchdog {
     async fn notify(&self, ev: WatchdogEvent<'_>) {
-        let key = match &ev {
-            WatchdogEvent::Heartbeat { stage } => format!("hb:{stage}"),
-            WatchdogEvent::BalanceMissing { asset } => format!("bal_missing:{asset}"),
-            WatchdogEvent::InsufficientFunds { asset, .. } => format!("insuff:{asset}"),
-            WatchdogEvent::LowBalance { account, asset_id, .. } => format!("low_balance:{account}:{asset_id}"),
-            WatchdogEvent::Lifecycle { state, .. } => format!("lifecycle:{state}"),
-            WatchdogEvent::OperatorRequired {
-                execution_id,
-                venue,
-                pending_step,
-                ..
-            } => format!("operator_required:{venue}:{execution_id}:{pending_step}"),
-            WatchdogEvent::LiquidationFinalized {
-                liquidation_id, status, ..
-            } => {
-                format!("liquidation_finalized:{liquidation_id}:{status}")
-            }
-        };
+        let key = cooldown_key(&ev);
         let Some(displaced) = self.reserve_for_send(&key).await else {
             return;
         };
@@ -224,6 +231,22 @@ pub fn webhook_watchdog_from_env(default_cooldown: Duration) -> Arc<dyn Watchdog
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn operator_required_keys_separate_liquidations_and_repeat_for_one_row() {
+        let event = |execution_id: &str| WatchdogEvent::OperatorRequired {
+            execution_id: execution_id.to_string(),
+            venue: "mexc".to_string(),
+            pending_step: "venue_reconciliation".to_string(),
+            owner: "mexc".to_string(),
+            details: String::new(),
+        };
+        let first = cooldown_key(&event("1721:mexc-0"));
+        let second = cooldown_key(&event("1722:mexc-0"));
+        assert_ne!(first, second);
+        assert_eq!(first, cooldown_key(&event("1721:mexc-0")));
+        assert_eq!(first, "operator_required:mexc:1721:mexc-0:venue_reconciliation");
+    }
 
     #[tokio::test]
     async fn webhook_watchdog_attempt_reservation_consumes_cooldown() {

@@ -13,6 +13,14 @@ pub struct VenuePlanningContext {
     pub liquidation_id: String,
 }
 
+#[derive(Debug, thiserror::Error)]
+pub enum VenueAmountError {
+    #[error("{0}")]
+    BelowMinimum(String),
+    #[error("{0}")]
+    Unavailable(String),
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct VenueRoutePreview {
     pub venue_id: String,
@@ -56,6 +64,11 @@ pub trait MultiVenueAdapter: Send + Sync {
     /// Rejects an adapter with missing runtime dependencies when the venue
     /// registry is built, before any liquidation reaches quote planning.
     fn validate_configuration(&self) -> Result<(), String> {
+        Ok(())
+    }
+
+    /// Checks provider amount limits without transferring or reserving funds.
+    async fn check_amount(&self, _request: &SwapRequest) -> Result<(), VenueAmountError> {
         Ok(())
     }
 

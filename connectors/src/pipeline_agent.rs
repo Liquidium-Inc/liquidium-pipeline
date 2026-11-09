@@ -155,6 +155,8 @@ impl PipelineAgent for ic_agent::Agent {
             InsufficientCycles(ProxyInsufficientCyclesError),
             CallFailed(ProxyCallFailedError),
             UnauthorizedUser,
+            // The hardened proxy forwards only to allowlisted targets.
+            UnauthorizedTarget,
         }
 
         #[derive(CandidType, Deserialize)]
@@ -191,6 +193,9 @@ impl PipelineAgent for ic_agent::Agent {
                 Err(format!("proxy returned error: CallFailed ({})", err.reason))
             }
             ProxyResult::Err(ProxyError::UnauthorizedUser) => Err("proxy returned error: UnauthorizedUser".to_string()),
+            ProxyResult::Err(ProxyError::UnauthorizedTarget) => {
+                Err("proxy returned error: UnauthorizedTarget".to_string())
+            }
         }
     }
 
@@ -255,11 +260,10 @@ mod tests {
 
     #[async_trait::async_trait]
     impl PipelineAgent for ProxyRawOnlyAgent {
-        async fn call_query_raw(
-            &self, _canister: &Principal, _method: &str, _arg: Vec<u8>,
-        ) -> Result<Vec<u8>, String> {
+        async fn call_query_raw(&self, _canister: &Principal, _method: &str, _arg: Vec<u8>) -> Result<Vec<u8>, String> {
             panic!("unused in test")
         }
+
         async fn call_query<R: Sized + CandidType + DeserializeOwned + 'static>(
             &self,
             _canister: &Principal,
