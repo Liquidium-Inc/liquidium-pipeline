@@ -50,6 +50,17 @@ pub(crate) struct BridgeTransportPlan {
     pub bridge_required: bool,
 }
 
+impl BridgeTransportPlan {
+    /// The asset and network the exchange sees on the far side of a bridge route.
+    fn bridged(cex_asset: impl Into<String>, cex_network: impl Into<String>) -> Self {
+        Self {
+            cex_asset: cex_asset.into(),
+            cex_network: cex_network.into(),
+            bridge_required: true,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct BridgePlan {
     pub deposit: BridgeTransportPlan,
@@ -112,19 +123,17 @@ pub(crate) trait BridgePlanner {
         // Deposit side: the ICP asset leaves through its reverse route
         // (ckUSDC@ICP -> USDC@ETH, ckSOL@ICP -> SOL@SOL).
         let deposits = self.side_transports(deposit_asset, |asset, network| {
-            resolve_reverse_route_by_source(asset, network).map(|route| BridgeTransportPlan {
-                cex_asset: route.target_asset.to_string(),
-                cex_network: cex_network_from_destination_kind(route.destination_kind),
-                bridge_required: true,
+            resolve_reverse_route_by_source(asset, network).map(|route| {
+                BridgeTransportPlan::bridged(
+                    route.target_asset,
+                    cex_network_from_destination_kind(route.destination_kind),
+                )
             })
         });
         // Withdraw side: the exchange delivers the forward route's source asset.
         let withdraws = self.side_transports(withdraw_asset, |asset, _network| {
-            resolve_forward_route_by_target(asset).map(|route| BridgeTransportPlan {
-                cex_asset: route.source_asset.to_string(),
-                cex_network: route.source_chain.to_string(),
-                bridge_required: true,
-            })
+            resolve_forward_route_by_target(asset)
+                .map(|route| BridgeTransportPlan::bridged(route.source_asset, route.source_chain))
         });
         deposits
             .iter()
