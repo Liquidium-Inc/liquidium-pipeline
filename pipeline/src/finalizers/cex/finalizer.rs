@@ -264,7 +264,7 @@ where
 #[path = "bridge_planner_impl.rs"]
 mod bridge_planner_impl;
 
-#[path = "deposit/bridge.rs"]
+#[path = "bridge/deposit.rs"]
 mod deposit_bridge;
 #[path = "deposit/confirmation.rs"]
 mod deposit_check;
@@ -274,7 +274,7 @@ mod destinations;
 mod funding;
 #[path = "trade/routing.rs"]
 mod routing;
-#[path = "sizing.rs"]
+#[path = "bridge/sizing.rs"]
 mod sizing;
 #[path = "trade/execution.rs"]
 mod slice_execution;
@@ -284,7 +284,7 @@ mod slice_orders;
 mod slice_records;
 #[path = "trade/slicing.rs"]
 mod slicing;
-#[path = "withdraw/bridge.rs"]
+#[path = "bridge/withdraw.rs"]
 mod withdraw_bridge;
 #[path = "withdraw/direct.rs"]
 mod withdraw_direct;
