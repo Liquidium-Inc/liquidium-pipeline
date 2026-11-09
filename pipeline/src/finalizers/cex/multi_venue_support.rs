@@ -11,7 +11,7 @@ use super::{finalizer::CexVenueFinalizer, utils::LIQUIDITY_EPS};
 use crate::{
     finalizers::{
         bridge_legs::{
-            BridgeLegError, bridged_deposit_arrival, fee_adjusted_transfer, net_of_withdraw_fee,
+            BridgeLegError, bridged_deposit_arrival, ensure_return_gas, fee_adjusted_transfer, net_of_withdraw_fee,
             solana_repayment_bridge_amount,
         },
         bridge_planner::{BridgePlan, BridgePlanner, BridgeTransportPlan},
@@ -618,6 +618,9 @@ where
             .get_fee_budget(route.source_asset, route.source_chain, route.target_asset)
             .await
             .map_err(PreviewFailure::Venue)?;
+        ensure_return_gas(bridge, route, &budget)
+            .await
+            .map_err(PreviewFailure::Transport)?;
         if route.route_kind == BridgeRouteKind::SolanaToIcp {
             let gross = ChainTokenAmount::from_formatted(state.withdraw.withdraw_asset.clone(), net);
             net = solana_repayment_bridge_amount(bridge, route, &gross, budget.source_fee_budget)

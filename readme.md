@@ -252,6 +252,7 @@ CEX_KRAKEN_API_SECRET=your_api_secret
 # Rift - Optional, only when `rift` is in ENABLED_SWAP_VENUES
 RIFT_API_URL=https://api.rift.trade
 RIFT_API_KEY=your_api_key
+RIFT_MAX_ORDER_USD=25000
 MAX_ALLOWED_CEX_SLIPPAGE_BPS=200  # 2.00% in basis points
 MAX_WIDENED_CEX_SLIPPAGE_BPS=400  # 4.00%: widest IOC limit after empty fills at the cap
 
@@ -324,6 +325,7 @@ Quick reference:
 | `CEX_KRAKEN_MAX_HOPS` | Max intermediate hops in Kraken's route search; defaults to 2. |
 | `RIFT_API_URL` | The Rift REST API; defaults to `https://api.rift.trade`. |
 | `RIFT_API_KEY` | Optional. Names the integrator to Rift; without it Rift serves one request per second. |
+| `RIFT_MAX_ORDER_USD` | The most one Rift order carries, at the oracle price; defaults to 25000. A larger overflow takes this much on Rift and the rest goes to the next venue, or waits when there is none. |
 
 Note: `CEX_BUY_INVERSE_OVESPEND_BPS` is still accepted as a legacy alias, but `CEX_BUY_INVERSE_OVERSPEND_BPS` is the canonical key.
 
@@ -914,10 +916,10 @@ A Rift leg takes these steps, each saved before it acts:
 1. A fresh quote. A quote under the plan's conservative output is refused.
 2. The order. Rift delivers to the bridge EVM wallet and refunds to the main EVM wallet.
 3. The ckERC20 bridge pays the order's deposit address straight from the minter. Nothing passes through our EVM wallet on the way in.
-4. The order status until Rift delivers. A refunded, underfunded, frozen or expired order parks the leg for an operator: Rift or its support holds the funds, and the leg has no send to decide.
+4. The order status until Rift delivers. An underfunded, frozen or expired order parks the leg for an operator: Rift or its support holds the funds, and the leg has no send to decide. A refunded order parks too; the operator finds the refund on Ethereum and answers `landed <tx>`, which ends the leg as refunded and reports the row failed. The funds sit at the main EVM wallet, outside the pipeline.
 5. The ckERC20 bridge brings the delivered asset back to ICP as its ck form.
 
-Rift quotes carry no price impact, so the planner's oracle discount guard is the only price check on a Rift leg.
+Rift quotes carry no price impact, so the planner's oracle discount guard is the only price check on a Rift leg. `RIFT_MAX_ORDER_USD` bounds one order. The preview also checks that the bridge EVM wallet holds the ETH the return leg pays in gas; a short wallet refuses the route before any funds move. The CEX bridged exit makes the same check.
 
 ## Native Simulator
 

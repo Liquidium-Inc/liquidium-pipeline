@@ -12,7 +12,10 @@ use super::{
     state::{RiftState, RiftStep},
 };
 use crate::{
-    finalizers::{bridge_legs::bridged_deposit_arrival, multi_venue::RIFT_VENUE_ID},
+    finalizers::{
+        bridge_legs::{bridged_deposit_arrival, ensure_return_gas},
+        multi_venue::RIFT_VENUE_ID,
+    },
     swappers::model::{LIQUIDITY_EPS, SwapExecution, SwapQuote, SwapQuoteLeg, SwapRequest, amount_after_bps_haircut},
     utils::now_ts,
 };
@@ -104,6 +107,7 @@ impl<R: RiftBackend> RiftVenueFinalizer<R> {
             .get_fee_budget(back.source_asset, back.source_chain, back.target_asset)
             .await
             .map_err(|error| error.to_string())?;
+        ensure_return_gas(&self.bridge, back, &budget).await?;
         side_costs.extend(budget.side_costs);
 
         // Rift reports no impact and no fees inside the quote, so its price is
@@ -139,6 +143,7 @@ impl<R: RiftBackend> RiftVenueFinalizer<R> {
             bridge_out: Default::default(),
             bridge_in: Default::default(),
             size_out: None,
+            failure: None,
             side_costs: Vec::new(),
             send_saved: false,
         };

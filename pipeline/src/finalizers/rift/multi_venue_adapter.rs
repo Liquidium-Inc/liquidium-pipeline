@@ -140,9 +140,8 @@ impl<R: RiftBackend> RiftVenueFinalizer<R> {
             StepVerdict::Park(message) => self.operator_required_progress(execution, message),
             StepVerdict::EndBelowMinimum(message) => {
                 execution.rift.step = RiftStep::Failed;
-                let mut progress = self.progress_for(execution, Some(message))?;
-                progress.failure = Some(VenueLegFailure::BelowMinimum);
-                Ok(progress)
+                execution.rift.failure = Some(VenueLegFailure::BelowMinimum);
+                self.progress_for(execution, Some(message))
             }
         }
     }
@@ -168,13 +167,14 @@ impl<R: RiftBackend> RiftVenueFinalizer<R> {
             VenueLegStatus::FailedPermanent => None,
             _ => error,
         };
+        let failure = execution.rift.failure;
         Ok(VenueLegProgress {
             execution: VenueExecutionState::new(RIFT_VENUE_ID, &execution)?,
             status,
             result,
             last_error,
             retryable_error,
-            failure: None,
+            failure,
         })
     }
 

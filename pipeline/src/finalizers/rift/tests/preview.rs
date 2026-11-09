@@ -31,6 +31,13 @@ async fn preview_quotes_the_amount_the_bridge_delivers_and_keeps_both_bridge_cos
             })
         });
     bridge.expect_get_minimum_bridge_amount().returning(|_, _, _| Ok(0.0));
+    bridge
+        .expect_get_source_balance()
+        .times(1)
+        .returning(|asset, chain, _| {
+            assert_eq!((asset, chain), ("ETH", "ETH"));
+            Ok(0.05)
+        });
     let finalizer = finalizer(rift, bridge, MockOutboundSender::new());
 
     let preview = finalizer.preview(&context(), &request(100_010_000)).await.unwrap();
@@ -45,6 +52,38 @@ async fn preview_quotes_the_amount_the_bridge_delivers_and_keeps_both_bridge_cos
     let labels: Vec<&str> = preview.side_costs.iter().map(|cost| cost.label.as_str()).collect();
     assert_eq!(labels, vec!["ckUSDC@ICP->USDC", "USDT@ETH->ckUSDT"]);
     assert_eq!(preview.quote.legs[0].route_id, "ethereum.usdc>ethereum.usdt");
+}
+
+/// The return leg pays gas from the bridge wallet. A wallet that cannot pay
+/// it must not receive funds that then sit on Ethereum.
+#[tokio::test]
+async fn preview_refuses_the_route_while_the_bridge_wallet_lacks_return_gas() {
+    let mut rift = MockRiftBackend::new();
+    rift.expect_quote()
+        .returning(|request| Ok(quote(&request.amount_in, "99.5")));
+    let mut bridge = MockBridgeBackend::new();
+    bridge.expect_get_fee_budget().returning(|_, chain, _| {
+        let gas = if chain == "ETH" {
+            // 0.01 ETH for the approve and the helper call.
+            Nat::from(10_000_000_000_000_000u64)
+        } else {
+            Nat::from(0u8)
+        };
+        Ok(BridgeFeeBudget {
+            side_costs: vec![SideCost::new("gas", "ETH", 18, gas)],
+            ..BridgeFeeBudget::default()
+        })
+    });
+    bridge.expect_get_minimum_bridge_amount().returning(|_, _, _| Ok(0.0));
+    bridge
+        .expect_get_source_balance()
+        .times(1)
+        .returning(|_, _, _| Ok(0.001));
+    let finalizer = finalizer(rift, bridge, MockOutboundSender::new());
+
+    let error = finalizer.preview(&context(), &request(100_010_000)).await.unwrap_err();
+
+    assert!(error.contains("holds 0.001 ETH, below the 0.01 ETH"), "{error}");
 }
 
 #[tokio::test]

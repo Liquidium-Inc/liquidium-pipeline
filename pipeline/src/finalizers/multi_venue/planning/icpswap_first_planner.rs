@@ -73,6 +73,10 @@ pub struct IcpswapFirstPlannerConfig {
     /// Test-only fixed USD allocation for MEXC. Kraken takes the rest of the
     /// CEX side, or ICPSwap takes the rest when Kraken is not enabled.
     pub mexc_test_allocation_usd: Option<f64>,
+    /// The most one Rift order may carry, in USD at the oracle price. A
+    /// larger overflow takes this much on Rift and the rest goes on down the
+    /// waterfall.
+    pub rift_max_order_usd: f64,
     /// USD per trillion cycles, for side costs paid in cycles.
     pub cycles_usd_per_trillion: f64,
 }

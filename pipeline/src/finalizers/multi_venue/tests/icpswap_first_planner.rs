@@ -284,6 +284,7 @@ fn config(cex_min_exec_usd: f64) -> IcpswapFirstPlannerConfig {
         oracle_snapshot_max_age_secs: 300,
         icpswap_test_allocation_usd: None,
         mexc_test_allocation_usd: None,
+        rift_max_order_usd: 25_000.0,
         cycles_usd_per_trillion: 1.35,
     }
 }
@@ -1546,6 +1547,77 @@ async fn icpswap_unavailable_prioritizes_safe_mexc_over_a_better_kraken_quote() 
             unavailable_venue_ids: vec![ICPSWAP_VENUE_ID.to_string()],
         }
     );
+}
+
+/// One ICP at $10 against a $4 Rift cap: Rift takes 0.4 ICP, Kraken the rest.
+#[tokio::test]
+async fn rift_takes_its_order_cap_and_the_next_venue_takes_the_rest() {
+    let icpswap = mock_adapter(ICPSWAP_VENUE_ID, Arc::new(Mutex::new(Vec::new())), |_request| {
+        Err("pool unavailable".to_string())
+    });
+    let rift = mock_adapter(RIFT_VENUE_ID, Arc::new(Mutex::new(Vec::new())), |request| {
+        Ok(proportional_preview(request, RIFT_VENUE_ID, 0.0, 2))
+    });
+    let kraken = mock_adapter(KRAKEN_VENUE_ID, Arc::new(Mutex::new(Vec::new())), |request| {
+        Ok(proportional_preview(request, KRAKEN_VENUE_ID, 0.0, 2))
+    });
+    let planner_config = IcpswapFirstPlannerConfig {
+        rift_max_order_usd: 4.0,
+        ..config(0.0)
+    };
+    let planner = IcpswapFirstPlanner::new(
+        vec![Arc::new(icpswap), Arc::new(rift), Arc::new(kraken)],
+        planner_config,
+    )
+    .expect("valid planner");
+
+    let state = planner
+        .plan(&native_icp_to_ckusdc_with_oracle(), 123)
+        .await
+        .expect("capped Rift slice plus the Kraken remainder");
+
+    let legs: Vec<(&str, u64)> = state
+        .legs
+        .iter()
+        .map(|leg| {
+            (
+                leg.venue_id.as_str(),
+                leg.request.pay_amount.value.0.to_u64().expect("fits"),
+            )
+        })
+        .collect();
+    assert_eq!(legs, vec![(RIFT_VENUE_ID, 40_000_000), (KRAKEN_VENUE_ID, 60_000_000)]);
+}
+
+/// With no venue after it, Rift refuses an amount above its cap without a
+/// quote. The refusal is not permanent: a smaller amount or a raised cap clears it.
+#[tokio::test]
+async fn rift_as_the_last_venue_refuses_an_amount_above_its_order_cap() {
+    let icpswap = mock_adapter(ICPSWAP_VENUE_ID, Arc::new(Mutex::new(Vec::new())), |_request| {
+        Err("pool unavailable".to_string())
+    });
+    let rift_calls = Arc::new(Mutex::new(Vec::new()));
+    let rift = mock_adapter(RIFT_VENUE_ID, rift_calls.clone(), |request| {
+        Ok(proportional_preview(request, RIFT_VENUE_ID, 0.0, 2))
+    });
+    let planner_config = IcpswapFirstPlannerConfig {
+        rift_max_order_usd: 4.0,
+        ..config(0.0)
+    };
+    let planner = IcpswapFirstPlanner::new(vec![Arc::new(icpswap), Arc::new(rift)], planner_config)
+        .expect("valid planner");
+
+    let error = planner
+        .plan(&native_icp_to_ckusdc_with_oracle(), 123)
+        .await
+        .expect_err("the cap refuses the whole amount");
+
+    assert!(
+        matches!(error, IcpswapFirstPlannerError::NoViableRoute(_)),
+        "{error}"
+    );
+    assert!(error.to_string().contains("RIFT amount exceeds its order cap of $4"), "{error}");
+    assert!(rift_calls.lock().unwrap().is_empty(), "no quote above the cap");
 }
 
 #[tokio::test]

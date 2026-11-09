@@ -190,6 +190,7 @@ pub(super) fn state_at(step: RiftStep) -> RiftState {
             polled_at_ts: None,
             wait_since_ts: None,
             delivered_at_ts: None,
+            refund_tx: None,
         }),
         funding: None,
         funding_txid: None,
@@ -197,6 +198,7 @@ pub(super) fn state_at(step: RiftStep) -> RiftState {
         bridge_out: Default::default(),
         bridge_in: Default::default(),
         size_out: None,
+        failure: None,
         side_costs: Vec::new(),
         send_saved: false,
     }
