@@ -1859,45 +1859,31 @@ mod transport_fallback {
         }
     }
 
+    /// A bid side of `(price, quantity)` levels, best first, with no asks.
+    fn bids(levels: &[(f64, f64)]) -> OrderBook {
+        OrderBook {
+            bids: levels
+                .iter()
+                .map(|&(price, quantity)| OrderBookLevel { price, quantity })
+                .collect(),
+            asks: vec![],
+            taker_fee_bps: 10.0,
+        }
+    }
+
+    /// Deep at the top price.
     fn deep_bids(price: f64) -> OrderBook {
-        OrderBook {
-            bids: vec![OrderBookLevel {
-                price,
-                quantity: 1_000_000.0,
-            }],
-            asks: vec![],
-            taker_fee_bps: 10.0,
-        }
+        bids(&[(price, 1_000_000.0)])
     }
 
-    /// A book that takes two ICP only at half the top price.
+    /// Takes two ICP only at half the top price.
     fn thin_bids(price: f64) -> OrderBook {
-        OrderBook {
-            bids: vec![
-                OrderBookLevel { price, quantity: 0.01 },
-                OrderBookLevel {
-                    price: price / 2.0,
-                    quantity: 1_000_000.0,
-                },
-            ],
-            asks: vec![],
-            taker_fee_bps: 10.0,
-        }
+        bids(&[(price, 0.01), (price / 2.0, 1_000_000.0)])
     }
 
-    /// A book that takes two ICP at a quarter below the top price: thin, but less so than `thin_bids`.
+    /// Takes two ICP at a quarter below the top price: thin, but less so than `thin_bids`.
     fn less_thin_bids(price: f64) -> OrderBook {
-        OrderBook {
-            bids: vec![
-                OrderBookLevel { price, quantity: 0.01 },
-                OrderBookLevel {
-                    price: price * 0.75,
-                    quantity: 1_000_000.0,
-                },
-            ],
-            asks: vec![],
-            taker_fee_bps: 10.0,
-        }
+        bids(&[(price, 0.01), (price * 0.75, 1_000_000.0)])
     }
 
     /// MEXC with the bridge, the test cap as the sound-book limit, and `books` as its markets.

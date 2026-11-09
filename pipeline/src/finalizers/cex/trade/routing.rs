@@ -383,17 +383,16 @@ where
         withdraw_symbol: &str,
         amount: f64,
     ) -> Result<Vec<TradeLeg>, String> {
-        let deposit = Self::normalize_symbol(deposit_symbol);
-        let withdraw = Self::normalize_symbol(withdraw_symbol);
-        if deposit == withdraw {
-            return Ok(vec![]);
-        }
         // The first executable route is the baseline. Without one, its reason is the answer.
-        let baseline = self.resolve_trade_legs_for_symbols(&deposit, &withdraw).await?;
-        // Nothing to size: no preview can rank the routes, so the baseline stands.
-        if !amount.is_finite() || amount <= LIQUIDITY_EPS {
+        let baseline = self
+            .resolve_trade_legs_for_symbols(deposit_symbol, withdraw_symbol)
+            .await?;
+        // Nothing to trade or nothing to size: no preview can rank the routes, so the baseline stands.
+        if baseline.is_empty() || !amount.is_finite() || amount <= LIQUIDITY_EPS {
             return Ok(baseline);
         }
+        let deposit = Self::normalize_symbol(deposit_symbol);
+        let withdraw = Self::normalize_symbol(withdraw_symbol);
         let baseline_signature = Self::route_signature(&baseline);
         let mut candidates = self.discover_hop_candidates(&deposit, &withdraw, self.max_hops);
         candidates.push(baseline);
