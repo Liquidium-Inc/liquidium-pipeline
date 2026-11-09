@@ -925,6 +925,8 @@ mod tests {
             bridge_cketh_minter_canister: Principal::from_text("sv3dd-oaaaa-aaaar-qacoa-cai").expect("principal"),
             bridge_cksol_minter_canister: Principal::from_text("ljyxk-riaaa-aaaar-qb5mq-cai").expect("principal"),
             bridge_cksol_ledger_canister: Principal::from_text("la34w-haaaa-aaaar-qb5na-cai").expect("principal"),
+            bridge_ckbtc_minter_canister: Principal::from_text("mqygn-kiaaa-aaaar-qaadq-cai").expect("principal"),
+            bridge_ckbtc_ledger_canister: Principal::from_text("mxzaz-hqaaa-aaaar-qaada-cai").expect("principal"),
             bridge_ic_proxy_canister: Some(env_proxy),
             lending_canister: Principal::from_text("aaaaa-aa").expect("principal"),
             export_path: String::new(),
