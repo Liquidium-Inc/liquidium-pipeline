@@ -1,3 +1,4 @@
+#[path = "bridge/submission.rs"]
 mod bridge_submission;
 pub mod finalizer;
 mod multi_venue_adapter;
