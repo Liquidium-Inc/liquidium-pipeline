@@ -87,39 +87,3 @@ pub(super) fn is_usd_stable_symbol(symbol: &str) -> bool {
         "USD" | "USDT" | "USDC" | "CKUSDT" | "CKUSDC"
     )
 }
-
-/// Hardcoded multi-leg routes where direct market lookup is insufficient.
-/// The ck pairs have none: the route search finds them from the configured
-/// pairs, so a dead ck market falls through to the next transport.
-pub(super) fn mexc_special_trade_legs(deposit_symbol: &str, withdraw_symbol: &str) -> Option<Vec<TradeLeg>> {
-    let deposit = deposit_symbol.to_ascii_uppercase();
-    let withdraw = withdraw_symbol.to_ascii_uppercase();
-
-    if deposit == "ETH" && withdraw == "USDC" {
-        return Some(vec![
-            TradeLeg {
-                market: "ETH_USDT".to_string(),
-                side: "sell".to_string(),
-            },
-            TradeLeg {
-                market: "USDC_USDT".to_string(),
-                side: "buy".to_string(),
-            },
-        ]);
-    }
-
-    if deposit == "USDC" && withdraw == "ETH" {
-        return Some(vec![
-            TradeLeg {
-                market: "USDC_USDT".to_string(),
-                side: "sell".to_string(),
-            },
-            TradeLeg {
-                market: "ETH_USDT".to_string(),
-                side: "buy".to_string(),
-            },
-        ]);
-    }
-
-    None
-}

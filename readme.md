@@ -62,8 +62,9 @@ withdrawal/bridge route back to the repayment wallet.
 For ckSOL repayment, MEXC trades into native SOL (for example, ICP → USDT →
 SOL), withdraws to the dedicated bridge Solana wallet, then deposits through
 the minter into the repayment ICP account. Include `ICP_USDT` and `SOL_USDT`
-in `CEX_MEXC_AVAILABLE_PAIRS` for that two-hop route. SOL trades always use
-`SOL_USDT`; USDC proceeds convert through `USDC_USDT` when needed. The bridge
+in `CEX_MEXC_AVAILABLE_PAIRS` for that two-hop route. SOL trades on the SOL
+markets in that list; with `SOL_USDT` alone, USDC proceeds convert through
+`USDC_USDT`. The bridge
 reserves SOL for its transfer fee and records the actual minted ckSOL amount. Mint
 destinations are restricted to the bridge owner or the configured liquidator;
 the requested subaccount is preserved.
@@ -910,7 +911,7 @@ A simulator build differs from a default build in these ways:
 - `account show` writes the public principals and addresses to `SIM_IDENTITY_FILE`.
 - Venues come from the workbench, not from `ENABLED_SWAP_VENUES`: `SIM_ICPSWAP_FACTORY` enables ICPSwap, and `SIM_MEXC_URL` enables a local MEXC at a loopback origin.
 - The local MEXC holds ck assets itself, so it runs without the bridge. `SIM_MEXC_BRIDGE` adds the local bridge, and `SIM_BRIDGE_USDC_ADDRESS` names the local USDC contract.
-- The workbench sets `CEX_MEXC_ROUTE_SELECTION=best-output`, so MEXC picks the route with the largest net output for the amount. This setting works in any build; unset, MEXC keeps the first executable route.
+- MEXC picks the route with the largest net output for the amount, in every build. The former `CEX_MEXC_ROUTE_SELECTION` setting is gone.
 - With no venue, discovery, strategy, execution and settlement run as normal. A settled row then parks as `OperatorRequired` and keeps the collateral in the trader account. It reports no swap and no profit.
 
 A default build reads no `SIM_*` setting and keeps the normal venue rules and IC trust.
