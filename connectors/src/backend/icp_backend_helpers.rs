@@ -66,6 +66,49 @@ pub async fn icrc2_allowance_with_context<B: IcpBackend + ?Sized>(
         .map_err(|e| format!("{context}: icrc2_allowance failed on ledger {ledger}: {e}"))
 }
 
+/// Raises the allowance of `spender` on `account` to `required` when it is
+/// lower. `expected_allowance` makes the ledger refuse the approve when the
+/// allowance changed since it was read, instead of overwriting it.
+pub async fn ensure_icrc2_allowance<B: IcpBackend + ?Sized>(
+    backend: &B,
+    ledger: Principal,
+    account: &Account,
+    spender: Account,
+    required: Nat,
+    context: &str,
+) -> Result<(), String> {
+    let current = icrc2_allowance_with_context(
+        backend,
+        ledger,
+        AllowanceArgs {
+            account: *account,
+            spender,
+        },
+        context,
+    )
+    .await?;
+    if current >= required {
+        return Ok(());
+    }
+    icrc2_approve_with_context(
+        backend,
+        ledger,
+        ApproveArgs {
+            from_subaccount: None,
+            spender,
+            amount: required,
+            expected_allowance: Some(current),
+            expires_at: None,
+            fee: None,
+            memo: None,
+            created_at_time: None,
+        },
+        context,
+    )
+    .await
+    .map(|_| ())
+}
+
 #[cfg(test)]
 mod tests {
     use candid::{Nat, Principal};

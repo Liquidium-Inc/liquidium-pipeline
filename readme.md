@@ -325,6 +325,8 @@ Quick reference:
 | `CEX_KRAKEN_MAX_HOPS` | Max intermediate hops in Kraken's route search; defaults to 2. |
 | `RIFT_API_URL` | The Rift REST API; defaults to `https://api.rift.trade`. |
 | `RIFT_API_KEY` | Optional. Names the integrator to Rift; without it Rift serves one request per second. |
+| `BRIDGE_CKBTC_MINTER_CANISTER` | The ckBTC minter; defaults to `mqygn-kiaaa-aaaar-qaadq-cai`. |
+| `BRIDGE_CKBTC_LEDGER_CANISTER` | The ckBTC ledger the minter burns from; defaults to `mxzaz-hqaaa-aaaar-qaada-cai`. |
 | `RIFT_MAX_ORDER_USD` | The most one Rift order carries, at the oracle price; defaults to 25000. A larger overflow takes this much on Rift and the rest goes to the next venue, or waits when there is none. |
 
 Note: `CEX_BUY_INVERSE_OVESPEND_BPS` is still accepted as a legacy alias, but `CEX_BUY_INVERSE_OVERSPEND_BPS` is the canonical key.

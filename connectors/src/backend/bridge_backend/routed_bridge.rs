@@ -4,13 +4,14 @@ use async_trait::async_trait;
 
 use super::{
     BridgeBackend, BridgeDestination, BridgeError, BridgeFeeBudget, BridgeRequest, BridgeSend, BridgeStatus,
-    BridgeSubmission, BridgeSubmissionCandidate, DepositNotice,
+    BridgeSubmission, BridgeSubmissionCandidate, DepositNotice, ckbtc_bridge::RETRIEVE_BRIDGE_ID_PREFIX,
 };
 
 /// Keeps provider-specific submission handles with the backend that issued them.
 pub struct RoutedBridgeBackend {
     pub evm: Arc<dyn BridgeBackend>,
     pub solana: Arc<dyn BridgeBackend>,
+    pub btc: Arc<dyn BridgeBackend>,
 }
 
 #[cfg(test)]
@@ -29,7 +30,15 @@ mod tests {
         let mut evm = MockBridgeBackend::new();
         evm.expect_get_bridge_status().with(mockall::predicate::eq("legacy-evm-handle"))
             .times(1).returning(|_| Ok(BridgeStatus::Pending));
-        let backend = RoutedBridgeBackend { evm: Arc::new(evm), solana: Arc::new(solana) };
+        let mut btc = MockBridgeBackend::new();
+        btc.expect_get_bridge_status().with(mockall::predicate::eq("ckbtc-retrieve:9"))
+            .times(1).returning(|_| Ok(BridgeStatus::Pending));
+        btc.expect_get_minimum_bridge_amount().with(
+            mockall::predicate::eq("ckBTC"), mockall::predicate::eq("ICP"), mockall::predicate::eq("BTC"),
+        ).times(1).returning(|_, _, _| Ok(0.0005));
+        let backend = RoutedBridgeBackend { evm: Arc::new(evm), solana: Arc::new(solana), btc: Arc::new(btc) };
+        assert_eq!(backend.get_bridge_status("ckbtc-retrieve:9").await.unwrap(), BridgeStatus::Pending);
+        assert_eq!(backend.get_minimum_bridge_amount("ckBTC", "ICP", "BTC").await.unwrap(), 0.0005);
         assert_eq!(backend.get_bridge_status("cksol-withdraw:8").await.unwrap(), BridgeStatus::Completed);
         assert_eq!(backend.get_bridge_status("legacy-evm-handle").await.unwrap(), BridgeStatus::Pending);
         assert_eq!(backend.get_source_balance("ckSOL", "ICP", "wallet").await.unwrap(), 1.5);
@@ -42,6 +51,11 @@ impl RoutedBridgeBackend {
             || (asset.eq_ignore_ascii_case("SOL") && chain.eq_ignore_ascii_case("SOL"))
         {
             self.solana.as_ref()
+        } else if (asset.eq_ignore_ascii_case("ckBTC") && chain.eq_ignore_ascii_case("ICP"))
+            || (asset.eq_ignore_ascii_case("BTC") && chain.eq_ignore_ascii_case("BTC"))
+        {
+            // The BTC backend serves the retrieval only; it refuses `BTC@BTC` with the reason.
+            self.btc.as_ref()
         } else {
             self.evm.as_ref()
         }
@@ -115,6 +129,8 @@ impl BridgeBackend for RoutedBridgeBackend {
         // ckSOL owns these prefixes; all pre-existing ckETH handles stay with EVM.
         if bridge_id.starts_with("cksol-") {
             self.solana.get_bridge_status(bridge_id).await
+        } else if bridge_id.starts_with(RETRIEVE_BRIDGE_ID_PREFIX) {
+            self.btc.get_bridge_status(bridge_id).await
         } else {
             self.evm.get_bridge_status(bridge_id).await
         }

@@ -1,18 +1,17 @@
 use async_trait::async_trait;
 use candid::{CandidType, Encode, Nat, Principal};
-use icrc_ledger_types::{
-    icrc1::account::Account,
-    icrc2::{allowance::AllowanceArgs, approve::ApproveArgs},
-    icrc3::transactions::{GetTransactionsRequest, GetTransactionsResponse, Mint, TransactionRange},
-};
+use icrc_ledger_types::{icrc1::account::Account, icrc3::transactions::Mint};
 use num_traits::ToPrimitive;
 use serde::Deserialize;
 use std::{str::FromStr, sync::Arc};
 
 use super::{
     BridgeBackend, BridgeDestination, BridgeError, BridgeFeeBudget, BridgeMintReceipt, BridgeRequest, BridgeRouteKind,
-    BridgeRouteSpec, BridgeSend, BridgeStatus, BridgeSubmission, DepositNotice, catalog::BRIDGE_ROUTE_CATALOG,
-    resolve_route, validate_destination_for_route,
+    BridgeRouteSpec, BridgeSend, BridgeStatus, BridgeSubmission, DepositNotice,
+    catalog::BRIDGE_ROUTE_CATALOG,
+    resolve_route,
+    utils::{ledger_transaction, parse_source_icp_account},
+    validate_destination_for_route,
 };
 use liquidium_pipeline_core::{
     account::model::ChainAccount,
@@ -26,8 +25,7 @@ use crate::{
         amount_utils::{amount_to_nat_units_strict, nat_units_to_amount_via_core},
         icp_backend::IcpBackend,
         icp_backend_helpers::{
-            icrc1_balance_with_context, icrc1_decimals_with_context, icrc1_fee_with_context,
-            icrc2_allowance_with_context, icrc2_approve_with_context,
+            ensure_icrc2_allowance, icrc1_balance_with_context, icrc1_decimals_with_context, icrc1_fee_with_context,
         },
         solana_backend::SolanaBackend,
     },
@@ -220,22 +218,6 @@ where
         self
     }
 
-    fn parse_source_icp_account(source_address: &str) -> Result<Account, String> {
-        if let Ok(account) = Account::from_str(source_address.trim()) {
-            return Ok(account);
-        }
-        if let Ok(owner) = Principal::from_str(source_address.trim()) {
-            return Ok(Account {
-                owner,
-                subaccount: None,
-            });
-        }
-        Err(format!(
-            "invalid source ICP account '{}'; expected principal or Account text",
-            source_address
-        ))
-    }
-
     fn validate_solana_pubkey(address: &str, field_name: &str) -> Result<(), String> {
         let trimmed = address.trim();
         if trimmed.is_empty() {
@@ -285,7 +267,7 @@ where
     }
 
     fn ensure_principal_only_bridge_source(&self, source_address: &str) -> Result<Account, String> {
-        let source = Self::parse_source_icp_account(source_address)?;
+        let source = parse_source_icp_account(source_address)?;
         if source.owner != self.bridge_ic_owner_principal {
             return Err(format!(
                 "source ICP account owner {} does not match configured bridge owner {}",
@@ -523,45 +505,19 @@ where
     }
 
     async fn ensure_minter_allowance(&self, source_account: &Account, required_allowance: Nat) -> Result<(), String> {
-        let allowance_args = AllowanceArgs {
-            account: *source_account,
-            spender: Account {
-                owner: self.cksol_minter_canister,
-                subaccount: None,
-            },
+        let spender = Account {
+            owner: self.cksol_minter_canister,
+            subaccount: None,
         };
-        let current_allowance = icrc2_allowance_with_context(
+        ensure_icrc2_allowance(
             self.icp_backend.as_ref(),
             self.cksol_ledger_canister,
-            allowance_args,
-            "cksol bridge",
-        )
-        .await?;
-        if current_allowance >= required_allowance {
-            return Ok(());
-        }
-
-        let approve_args = ApproveArgs {
-            from_subaccount: None,
-            spender: Account {
-                owner: self.cksol_minter_canister,
-                subaccount: None,
-            },
-            amount: required_allowance,
-            expected_allowance: None,
-            expires_at: None,
-            fee: None,
-            memo: None,
-            created_at_time: None,
-        };
-        icrc2_approve_with_context(
-            self.icp_backend.as_ref(),
-            self.cksol_ledger_canister,
-            approve_args,
+            source_account,
+            spender,
+            required_allowance,
             "cksol bridge",
         )
         .await
-        .map(|_| ())
     }
 
     /// The minter deposit account for a mint to `destination`. Only the bridge
@@ -705,38 +661,10 @@ where
         }))
     }
 
-    /// The mint the ckSOL ledger recorded at `block_index`, read from the ledger
-    /// or, for an older block, from its archive.
+    /// The mint the ckSOL ledger recorded at `block_index`.
     async fn ledger_mint(&self, block_index: u64) -> Result<Mint, String> {
-        let request = GetTransactionsRequest {
-            start: Nat::from(block_index),
-            length: Nat::from(1u8),
-        };
-        let arg = Encode!(&request).map_err(|error| error.to_string())?;
-        let response: GetTransactionsResponse = self
-            .agent
-            .call_query(&self.cksol_ledger_canister, "get_transactions", arg.clone())
-            .await?;
-        let transaction = match response.transactions.into_iter().next() {
-            Some(transaction) if response.first_index == block_index => transaction,
-            _ => {
-                let archive = response
-                    .archived_transactions
-                    .into_iter()
-                    .next()
-                    .ok_or_else(|| format!("the ckSOL ledger has no block {block_index}"))?;
-                let range: TransactionRange = self
-                    .agent
-                    .call_query(&archive.callback.canister_id, &archive.callback.method, arg)
-                    .await?;
-                range
-                    .transactions
-                    .into_iter()
-                    .next()
-                    .ok_or_else(|| format!("the ckSOL archive has no block {block_index}"))?
-            }
-        };
-        transaction
+        ledger_transaction(self.agent.as_ref(), self.cksol_ledger_canister, block_index, "ckSOL")
+            .await?
             .mint
             .ok_or_else(|| format!("ckSOL block {block_index} is not a mint"))
     }

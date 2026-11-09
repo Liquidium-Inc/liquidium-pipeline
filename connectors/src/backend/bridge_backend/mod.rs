@@ -1,4 +1,5 @@
 mod catalog;
+pub mod ckbtc_bridge;
 pub mod ckerc20_bridge;
 mod ckerc20_bridge_utils;
 pub mod solana_bridge;
@@ -7,6 +8,7 @@ pub use routed_bridge::RoutedBridgeBackend;
 mod mint_events;
 mod types;
 mod utils;
+pub use ckbtc_bridge::CkBtcBridgeBackend;
 pub use ckerc20_bridge::{BridgeEvmBackend, CkErc20BridgeBackend};
 pub use solana_bridge::{DEFAULT_SOLANA_BRIDGE_FEE_BUFFER_LAMPORTS, SolanaBridgeBackend, cksol_transfer_without_deposit_id};
 pub use types::{

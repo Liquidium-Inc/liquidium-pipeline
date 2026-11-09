@@ -6,24 +6,22 @@ use alloy::{
 };
 use async_trait::async_trait;
 use candid::{Encode, Nat, Principal};
-use icrc_ledger_types::{
-    icrc1::account::Account,
-    icrc2::{allowance::AllowanceArgs, approve::ApproveArgs},
-};
+use icrc_ledger_types::icrc1::account::Account;
 use std::collections::HashSet;
 use std::sync::Arc;
 
 use super::{
     ckerc20_bridge_utils::{
-        destination_to_bytes32, ensure_source_matches_bridge_owner, ensure_source_matches_signer,
-        expect_evm_destination, expect_icp_destination, minter_withdrawal_id, parse_ckerc20_ledger_id,
-        parse_evm_token_address, parse_source_icp_account, recovered_bridge_id, resolve_cketh_route_for_request,
+        destination_to_bytes32, ensure_source_matches_signer, expect_evm_destination, expect_icp_destination,
+        minter_withdrawal_id, parse_ckerc20_ledger_id, parse_evm_token_address, recovered_bridge_id,
+        resolve_cketh_route_for_request,
     },
     types::{
         BridgeError, CkEthMinterInfo, Eip1559TransactionPrice, Eip1559TransactionPriceArg, EvmReceiptStatus,
         HelperContract, LedgerError, WithdrawErc20Arg, WithdrawErc20Error, WithdrawErc20Ret, WithdrawalArg,
         WithdrawalDetail, WithdrawalError, WithdrawalRet, WithdrawalSearchParameter,
     },
+    utils::{ensure_source_matches_bridge_owner, parse_source_icp_account},
 };
 use liquidium_pipeline_core::outbound::SendOutcome;
 use liquidium_pipeline_core::types::side_cost::SideCost;
@@ -41,8 +39,7 @@ use crate::{
         evm_backend::{Broadcast, ERC20_APPROVE_GAS_LIMIT, EvmBackendImpl, SignedEvmTx},
         icp_backend::IcpBackend,
         icp_backend_helpers::{
-            icrc1_balance_with_context, icrc1_decimals_with_context, icrc1_fee_with_context,
-            icrc2_allowance_with_context, icrc2_approve_with_context,
+            ensure_icrc2_allowance, icrc1_balance_with_context, icrc1_decimals_with_context, icrc1_fee_with_context,
         },
     },
     outbound::evm_prepared_send,
@@ -461,52 +458,25 @@ where
         self.evm_backend.erc20_decimals_of(token).await
     }
 
-    /// Sets the minter's allowance. `expected` makes the ledger refuse the approve
-    /// when the allowance changed since it was read, instead of overwriting it.
-    async fn approve_minter_spend(&self, ledger: Principal, amount: Nat, expected: Nat) -> Result<(), String> {
-        let approve_args = ApproveArgs {
-            from_subaccount: None,
-            spender: Account {
-                owner: self.cketh_minter_canister,
-                subaccount: None,
-            },
-            amount,
-            expected_allowance: Some(expected),
-            expires_at: None,
-            fee: None,
-            memo: None,
-            created_at_time: None,
-        };
-        icrc2_approve_with_context(self.icp_backend.as_ref(), ledger, approve_args, "ckerc20 bridge")
-            .await
-            .map(|_| ())?;
-        Ok(())
-    }
-
-    async fn minter_allowance(&self, source_account: &Account, ledger: Principal) -> Result<Nat, String> {
-        let allowance_args = AllowanceArgs {
-            account: *source_account,
-            spender: Account {
-                owner: self.cketh_minter_canister,
-                subaccount: None,
-            },
-        };
-        icrc2_allowance_with_context(self.icp_backend.as_ref(), ledger, allowance_args, "ckerc20 bridge").await
-    }
-
     async fn ensure_minter_allowance(
         &self,
         source_account: &Account,
         ledger: Principal,
         required_allowance: Nat,
     ) -> Result<(), String> {
-        let current_allowance = self.minter_allowance(source_account, ledger).await?;
-        if current_allowance >= required_allowance {
-            return Ok(());
-        }
-
-        self.approve_minter_spend(ledger, required_allowance, current_allowance)
-            .await
+        let spender = Account {
+            owner: self.cketh_minter_canister,
+            subaccount: None,
+        };
+        ensure_icrc2_allowance(
+            self.icp_backend.as_ref(),
+            ledger,
+            source_account,
+            spender,
+            required_allowance,
+            "ckerc20 bridge",
+        )
+        .await
     }
 
     fn with_fee_headroom(amount: &Nat) -> Nat {

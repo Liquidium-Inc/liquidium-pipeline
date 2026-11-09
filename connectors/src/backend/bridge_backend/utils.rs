@@ -1,10 +1,88 @@
 use bitcoin::{Address as BitcoinAddress, Network};
+use candid::{Encode, Nat, Principal};
+use icrc_ledger_types::{
+    icrc1::account::Account,
+    icrc3::transactions::{GetTransactionsRequest, GetTransactionsResponse, Transaction, TransactionRange},
+};
 use std::str::FromStr;
 
 use super::{
     BridgeDestination, BridgeDestinationKind, BridgeRouteKind, BridgeRouteSpec, BridgeSweepRoute,
     catalog::BRIDGE_ROUTE_CATALOG,
 };
+use crate::pipeline_agent::PipelineAgent;
+
+/// Parses a source ICP account from either textual `Account` form or principal text.
+/// If only principal text is provided, `subaccount` is set to `None`.
+pub(super) fn parse_source_icp_account(source_address: &str) -> Result<Account, String> {
+    if let Ok(account) = Account::from_str(source_address.trim()) {
+        return Ok(account);
+    }
+    if let Ok(owner) = Principal::from_str(source_address.trim()) {
+        return Ok(Account {
+            owner,
+            subaccount: None,
+        });
+    }
+    Err(format!(
+        "invalid source ICP account '{}'; expected principal or Account text",
+        source_address
+    ))
+}
+
+/// Verifies reverse-route source account ownership and enforces principal-only source
+/// accounts for bridge flow safety.
+pub(super) fn ensure_source_matches_bridge_owner(
+    source_account: &Account,
+    bridge_owner: Principal,
+) -> Result<(), String> {
+    if source_account.owner != bridge_owner {
+        return Err(format!(
+            "source ICP account owner {} does not match configured bridge owner {}",
+            source_account.owner, bridge_owner
+        ));
+    }
+    if source_account.subaccount.is_some() {
+        return Err(
+            "bridge reverse route requires principal-only source account (subaccount must be None)".to_string(),
+        );
+    }
+    Ok(())
+}
+
+/// The transaction `ledger` recorded at `block_index`, from the ledger or,
+/// for an older block, from its archive.
+pub(super) async fn ledger_transaction<A: PipelineAgent + ?Sized>(
+    agent: &A,
+    ledger: Principal,
+    block_index: u64,
+    what: &str,
+) -> Result<Transaction, String> {
+    let request = GetTransactionsRequest {
+        start: Nat::from(block_index),
+        length: Nat::from(1u8),
+    };
+    let arg = Encode!(&request).map_err(|error| error.to_string())?;
+    let response: GetTransactionsResponse = agent.call_query(&ledger, "get_transactions", arg.clone()).await?;
+    match response.transactions.into_iter().next() {
+        Some(transaction) if response.first_index == block_index => Ok(transaction),
+        _ => {
+            let archive = response
+                .archived_transactions
+                .into_iter()
+                .next()
+                .ok_or_else(|| format!("the {what} ledger has no block {block_index}"))?;
+            let range: TransactionRange = agent
+                .call_query(&archive.callback.canister_id, &archive.callback.method, arg)
+                .await?;
+            range
+                .transactions
+                .into_iter()
+                .next()
+                .ok_or_else(|| format!("the {what} archive has no block {block_index}"))
+        }
+    }
+}
 
 fn validate_solana_address(address: &str, field_name: &str) -> Result<(), String> {
     let trimmed = address.trim();

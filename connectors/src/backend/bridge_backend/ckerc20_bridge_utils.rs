@@ -71,44 +71,6 @@ pub(super) fn parse_ckerc20_ledger_id(route: &BridgeRouteSpec) -> Result<Princip
     })
 }
 
-/// Parses a source ICP account from either textual `Account` form or principal text.
-/// If only principal text is provided, `subaccount` is set to `None`.
-pub(super) fn parse_source_icp_account(source_address: &str) -> Result<Account, String> {
-    if let Ok(account) = Account::from_str(source_address.trim()) {
-        return Ok(account);
-    }
-    if let Ok(owner) = Principal::from_str(source_address.trim()) {
-        return Ok(Account {
-            owner,
-            subaccount: None,
-        });
-    }
-    Err(format!(
-        "invalid source ICP account '{}'; expected principal or Account text",
-        source_address
-    ))
-}
-
-/// Verifies reverse-route source account ownership and enforces principal-only source
-/// accounts for bridge flow safety.
-pub(super) fn ensure_source_matches_bridge_owner(
-    source_account: &Account,
-    bridge_owner: Principal,
-) -> Result<(), String> {
-    if source_account.owner != bridge_owner {
-        return Err(format!(
-            "source ICP account owner {} does not match configured bridge owner {}",
-            source_account.owner, bridge_owner
-        ));
-    }
-    if source_account.subaccount.is_some() {
-        return Err(
-            "bridge reverse route requires principal-only source account (subaccount must be None)".to_string(),
-        );
-    }
-    Ok(())
-}
-
 /// Extracts an ICP destination account from a route-validated destination.
 pub(super) fn expect_icp_destination<'a>(
     route: &BridgeRouteSpec,

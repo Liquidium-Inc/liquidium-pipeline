@@ -44,6 +44,8 @@ pub struct Config {
     pub bridge_cketh_minter_canister: Principal,
     pub bridge_cksol_minter_canister: Principal,
     pub bridge_cksol_ledger_canister: Principal,
+    pub bridge_ckbtc_minter_canister: Principal,
+    pub bridge_ckbtc_ledger_canister: Principal,
     pub bridge_ic_proxy_canister: Option<Principal>,
     pub lending_canister: Principal,
     pub export_path: String,
@@ -340,52 +342,16 @@ impl Config {
         let bridge_btc_address = derive_btc_p2tr_address(&mnemonic, BRIDGE_NAMESPACE_ACCOUNT, BRIDGE_BTC_INDEX)
             .map_err(|e| format!("could not derive bridge BTC address: {e}"))?;
 
-        let bridge_cketh_minter_canister_text = env::var("BRIDGE_CKETH_MINTER_CANISTER")
-            .unwrap_or_else(|_| DEFAULT_BRIDGE_CKETH_MINTER_CANISTER.to_string())
-            .trim()
-            .to_string();
-        let bridge_cketh_minter_canister_text = if bridge_cketh_minter_canister_text.is_empty() {
-            DEFAULT_BRIDGE_CKETH_MINTER_CANISTER.to_string()
-        } else {
-            bridge_cketh_minter_canister_text
-        };
-
-        let bridge_cketh_minter_canister = Principal::from_text(&bridge_cketh_minter_canister_text).map_err(|e| {
-            format!(
-                "invalid BRIDGE_CKETH_MINTER_CANISTER principal '{}': {e}",
-                bridge_cketh_minter_canister_text
-            )
-        })?;
-        let bridge_cksol_minter_canister_text = env::var("BRIDGE_CKSOL_MINTER_CANISTER")
-            .unwrap_or_else(|_| DEFAULT_BRIDGE_CKSOL_MINTER_CANISTER.to_string())
-            .trim()
-            .to_string();
-        let bridge_cksol_minter_canister_text = if bridge_cksol_minter_canister_text.is_empty() {
-            DEFAULT_BRIDGE_CKSOL_MINTER_CANISTER.to_string()
-        } else {
-            bridge_cksol_minter_canister_text
-        };
-        let bridge_cksol_minter_canister = Principal::from_text(&bridge_cksol_minter_canister_text).map_err(|e| {
-            format!(
-                "invalid BRIDGE_CKSOL_MINTER_CANISTER principal '{}': {e}",
-                bridge_cksol_minter_canister_text
-            )
-        })?;
-        let bridge_cksol_ledger_canister_text = env::var("BRIDGE_CKSOL_LEDGER_CANISTER")
-            .unwrap_or_else(|_| DEFAULT_BRIDGE_CKSOL_LEDGER_CANISTER.to_string())
-            .trim()
-            .to_string();
-        let bridge_cksol_ledger_canister_text = if bridge_cksol_ledger_canister_text.is_empty() {
-            DEFAULT_BRIDGE_CKSOL_LEDGER_CANISTER.to_string()
-        } else {
-            bridge_cksol_ledger_canister_text
-        };
-        let bridge_cksol_ledger_canister = Principal::from_text(&bridge_cksol_ledger_canister_text).map_err(|e| {
-            format!(
-                "invalid BRIDGE_CKSOL_LEDGER_CANISTER principal '{}': {e}",
-                bridge_cksol_ledger_canister_text
-            )
-        })?;
+        let bridge_cketh_minter_canister =
+            parse_canister_from_env("BRIDGE_CKETH_MINTER_CANISTER", DEFAULT_BRIDGE_CKETH_MINTER_CANISTER)?;
+        let bridge_cksol_minter_canister =
+            parse_canister_from_env("BRIDGE_CKSOL_MINTER_CANISTER", DEFAULT_BRIDGE_CKSOL_MINTER_CANISTER)?;
+        let bridge_cksol_ledger_canister =
+            parse_canister_from_env("BRIDGE_CKSOL_LEDGER_CANISTER", DEFAULT_BRIDGE_CKSOL_LEDGER_CANISTER)?;
+        let bridge_ckbtc_minter_canister =
+            parse_canister_from_env("BRIDGE_CKBTC_MINTER_CANISTER", DEFAULT_BRIDGE_CKBTC_MINTER_CANISTER)?;
+        let bridge_ckbtc_ledger_canister =
+            parse_canister_from_env("BRIDGE_CKBTC_LEDGER_CANISTER", DEFAULT_BRIDGE_CKBTC_LEDGER_CANISTER)?;
         let bridge_ic_proxy_canister = match env::var("BRIDGE_IC_PROXY_CANISTER")
             .or_else(|_| env::var("BRIDGE_IC_WALLET_CANISTER"))
         {
@@ -463,6 +429,8 @@ impl Config {
             bridge_cketh_minter_canister,
             bridge_cksol_minter_canister,
             bridge_cksol_ledger_canister,
+            bridge_ckbtc_minter_canister,
+            bridge_ckbtc_ledger_canister,
             bridge_ic_proxy_canister,
             liquidator_identity: Arc::new(liquidator_identity),
             bridge_ic_identity: Arc::new(bridge_ic_identity),
@@ -621,6 +589,8 @@ const BRIDGE_SOLANA_INDEX: u32 = 0;
 const DEFAULT_BRIDGE_CKETH_MINTER_CANISTER: &str = "sv3dd-oaaaa-aaaar-qacoa-cai";
 const DEFAULT_BRIDGE_CKSOL_MINTER_CANISTER: &str = "ljyxk-riaaa-aaaar-qb5mq-cai";
 const DEFAULT_BRIDGE_CKSOL_LEDGER_CANISTER: &str = "la34w-haaaa-aaaar-qb5na-cai";
+const DEFAULT_BRIDGE_CKBTC_MINTER_CANISTER: &str = "mqygn-kiaaa-aaaar-qaadq-cai";
+const DEFAULT_BRIDGE_CKBTC_LEDGER_CANISTER: &str = "mxzaz-hqaaa-aaaar-qaada-cai";
 pub const DEFAULT_ICPSWAP_FACTORY_CANISTER: &str = "4mmnk-kiaaa-aaaag-qbllq-cai";
 const DEFAULT_ICPSWAP_FEE_TIERS: &str = "100,500,3000,10000";
 const DEFAULT_ICPSWAP_MAX_PRICE_IMPACT_BPS: f64 = 100.0;
@@ -767,6 +737,14 @@ fn parse_rift_api_url_from_env() -> String {
         return url;
     }
     env::var("RIFT_API_URL").unwrap_or_else(|_| DEFAULT_RIFT_API_URL.to_string())
+}
+
+/// A canister id from `name`; blank or unset means the default.
+fn parse_canister_from_env(name: &str, default: &str) -> Result<Principal, String> {
+    let text = env::var(name).unwrap_or_default();
+    let text = text.trim();
+    let text = if text.is_empty() { default } else { text };
+    Principal::from_text(text).map_err(|e| format!("invalid {name} principal '{text}': {e}"))
 }
 
 /// A cap must be a positive number; anything else keeps the default, so a
