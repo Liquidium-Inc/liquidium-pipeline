@@ -4,8 +4,12 @@ use liquidium_pipeline_connectors::backend::{bridge_backend::BridgeRouteKind, ce
 
 use super::finalizer::CexVenueFinalizer;
 use crate::{
-    finalizers::{cex::state::CexState, multi_venue::OperatorQuestion},
-    outbound::driver::{OperatorDecision, OutboundRecord},
+    finalizers::{
+        bridge_legs::{send_question, single_open_question, undecided_send},
+        cex::state::CexState,
+        multi_venue::OperatorQuestion,
+    },
+    outbound::driver::OperatorDecision,
 };
 
 /// Where the undecided action of a parked leg lives.
@@ -25,48 +29,33 @@ enum Undecided {
     DepositId,
 }
 
-/// A saved send only an operator can decide: it parked, or it may have run
-/// before a restart and running it again is not safe.
-fn undecided(record: &Option<OutboundRecord>) -> Option<&OutboundRecord> {
-    record.as_ref().filter(|record| record.needs_operator())
-}
-
-fn send_question(purpose: &str, record: &OutboundRecord, receipt: &str) -> OperatorQuestion {
-    OperatorQuestion {
-        detail: format!(
-            "did the {purpose} ({} send {}) happen? --landed <{receipt}> | --absent (once it can no longer land; a new send follows)",
-            record.prepared.sender, record.prepared.identity
-        ),
-    }
-}
-
 fn open_questions<C: CexBackend>(state: &CexState) -> Vec<(Undecided, OperatorQuestion)> {
     let mut questions = Vec::new();
-    if let Some(record) = undecided(&state.deposit.deposit_funding) {
+    if let Some(record) = undecided_send(&state.deposit.deposit_funding) {
         questions.push((
             Undecided::DepositFunding,
             send_question("exchange deposit funding", record, "receipt"),
         ));
     }
-    if let Some(record) = undecided(&state.withdraw.bridge.withdraw_bridge_funding) {
+    if let Some(record) = undecided_send(&state.withdraw.bridge.withdraw_bridge_funding) {
         questions.push((
             Undecided::BridgeFunding,
             send_question("bridge deposit", record, "receipt"),
         ));
     }
-    if let Some(record) = undecided(&state.withdraw.withdraw_send) {
+    if let Some(record) = undecided_send(&state.withdraw.withdraw_send) {
         questions.push((
             Undecided::Withdrawal,
             send_question("exchange withdrawal", record, "exchange withdrawal id"),
         ));
     }
-    if let Some(record) = undecided(&state.deposit.bridge.deposit_bridge_call) {
+    if let Some(record) = undecided_send(&state.deposit.bridge.deposit_bridge_call) {
         questions.push((
             Undecided::BridgeCall,
             send_question("deposit bridge call", record, "bridge id"),
         ));
     }
-    if let Some(record) = undecided(&state.withdraw.bridge.withdraw_bridge_call) {
+    if let Some(record) = undecided_send(&state.withdraw.bridge.withdraw_bridge_call) {
         questions.push((
             Undecided::WithdrawBridgeCall,
             send_question("return bridge call", record, "bridge id"),
@@ -105,22 +94,8 @@ impl<C: CexBackend> CexVenueFinalizer<C> {
     /// Writes the answer where the leg reads it on its next run. A leg with
     /// an open question needs an answer; a leg without one takes a release only.
     pub(super) fn answer_operator(state: &mut CexState, answer: Option<&OperatorDecision>) -> Result<(), String> {
-        let mut questions = open_questions::<C>(state);
-        if questions.len() > 1 {
-            let details: Vec<String> = questions.into_iter().map(|(_, question)| question.detail).collect();
-            return Err(format!(
-                "leg has {} open questions: {}",
-                details.len(),
-                details.join("; ")
-            ));
-        }
-        let (undecided, question, answer) = match (questions.pop(), answer) {
-            (None, None) => return Ok(()),
-            (None, Some(_)) => return Err("leg has no open question; release it with --release".to_string()),
-            (Some((_, question)), None) => {
-                return Err(format!("leg waits for an answer: {}", question.detail));
-            }
-            (Some((undecided, question)), Some(answer)) => (undecided, question, answer),
+        let Some((undecided, answer)) = single_open_question(open_questions::<C>(state), answer)? else {
+            return Ok(());
         };
         let send = match undecided {
             Undecided::DepositFunding => &mut state.deposit.deposit_funding,
@@ -128,13 +103,13 @@ impl<C: CexBackend> CexVenueFinalizer<C> {
             Undecided::Withdrawal => &mut state.withdraw.withdraw_send,
             Undecided::BridgeCall => &mut state.deposit.bridge.deposit_bridge_call,
             Undecided::WithdrawBridgeCall => &mut state.withdraw.bridge.withdraw_bridge_call,
-            Undecided::DepositId => return record_deposit_id(state, answer),
+            Undecided::DepositId => return record_deposit_id(state, &answer),
         };
         // The next run asks the chain or the exchange first, so the decision is used
         // only while that answer stays open.
         send.as_mut()
-            .ok_or_else(|| format!("open question has no saved state: {}", question.detail))?
-            .decide(answer.clone());
+            .ok_or_else(|| format!("open question {undecided:?} has no saved state"))?
+            .decide(answer);
         Ok(())
     }
 }

@@ -6,3 +6,4 @@ pub mod icpswap;
 pub mod liquidation_outcome;
 pub mod multi_venue;
 pub mod profit_calculator;
+pub mod rift;

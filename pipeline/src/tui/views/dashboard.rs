@@ -6,7 +6,7 @@ use ratatui::widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table, Wrap}
 use unicode_width::UnicodeWidthStr;
 
 use crate::finalizers::cex::profile::CexVenueProfile;
-use crate::finalizers::multi_venue::ICPSWAP_VENUE_ID;
+use crate::finalizers::multi_venue::{ICPSWAP_VENUE_ID, RIFT_VENUE_ID};
 use crate::persistance::{FinalizerMetaPayload, LiqMetaWrapper, ResultStatus, VenueLegState, VenueLegStatus};
 use crate::stages::executor::ExecutionReceipt;
 
@@ -471,6 +471,9 @@ pub(super) fn venue_display_name(venue_id: &str) -> String {
     if venue_id == ICPSWAP_VENUE_ID {
         return "ICPSwap".to_string();
     }
+    if venue_id == RIFT_VENUE_ID {
+        return "Rift".to_string();
+    }
     CexVenueProfile::for_venue(venue_id).map_or_else(|| venue_id.to_string(), |profile| profile.name().to_string())
 }
 
@@ -490,7 +493,8 @@ fn persisted_venue_step(leg: &VenueLegState) -> Option<String> {
         .execution
         .state
         .get("step")
-        .or_else(|| leg.execution.state.pointer("/cex/step"))?
+        .or_else(|| leg.execution.state.pointer("/cex/step"))
+        .or_else(|| leg.execution.state.pointer("/rift/step"))?
         .as_str()?;
     Some(humanize_step(step))
 }
@@ -798,6 +802,7 @@ pub(in crate::tui::views) mod tests {
         assert_eq!(venue_display_name("icpswap"), "ICPSwap");
         assert_eq!(venue_display_name("mexc"), "MEXC");
         assert_eq!(venue_display_name("kraken"), "Kraken");
+        assert_eq!(venue_display_name("rift"), "Rift");
         assert_eq!(venue_display_name("other"), "other");
     }
 

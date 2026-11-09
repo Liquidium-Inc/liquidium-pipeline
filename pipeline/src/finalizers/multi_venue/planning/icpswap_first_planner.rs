@@ -37,6 +37,7 @@ pub const ICPSWAP_FIRST_STRATEGY_ID: &str = "icpswap_first";
 pub const ICPSWAP_VENUE_ID: &str = "icpswap";
 pub const MEXC_VENUE_ID: &str = "mexc";
 pub const KRAKEN_VENUE_ID: &str = "kraken";
+pub const RIFT_VENUE_ID: &str = "rift";
 
 pub(super) const BPS_DENOMINATOR: u32 = 10_000;
 const RAY_PRICE_SCALE: f64 = 1e27;
@@ -1241,7 +1242,13 @@ impl IcpswapFirstPlanner {
         validate_preview(venue_id, request, preview)?;
 
         // With no usable oracle prices there is nothing to compare against.
+        // A Rift quote reports no impact, so the oracle is its only price check.
         let Some(oracle_output) = oracle_expected_output(input, request, preview)? else {
+            if venue_id == RIFT_VENUE_ID {
+                return Err(IcpswapFirstPlannerError::NoViableRoute(
+                    "rift quote has no price check without oracle prices".to_string(),
+                ));
+            }
             return Ok(());
         };
         // A zero baseline cannot express a meaningful minimum output.

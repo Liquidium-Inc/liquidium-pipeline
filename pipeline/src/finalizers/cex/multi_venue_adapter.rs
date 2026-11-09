@@ -11,8 +11,8 @@ use crate::{
         bridge_planner::BridgePlanner,
         cex::state::{CexState, CexStep},
         multi_venue::{
-            MultiVenueAdapter, OperatorQuestion, VenueAmountError, VenueLegCheckpoint, VenueLegProgress,
-            VenuePlanningContext, VenueRoutePreview,
+            GateOpening, MultiVenueAdapter, OperatorQuestion, StepVerdict, VenueAmountError, VenueGate,
+            VenueLegCheckpoint, VenueLegProgress, VenuePlanningContext, VenueRoutePreview, VenueStepError,
         },
     },
     outbound::driver::OperatorDecision,
@@ -30,34 +30,24 @@ use crate::{
 /// an account that is genuinely short never resolves and must not loop forever.
 const SETTLEMENT_WAIT_TIMEOUT_SECS: i64 = 15 * 60;
 
-/// How long a leg waits for an exchange it cannot connect to before each
-/// failed cycle spends the retry budget. A lasting outage then parks with an alert.
-const UNREACHABLE_WAIT_SECS: i64 = 40 * 60;
-
-/// The exchange leg's complete venue-local state plus a persistence gate. The gate makes
-/// every call that may submit a transfer, order, withdrawal, or bridge request
-/// take two orchestrator cycles: first persist `ready_to_advance`, then execute.
+/// The exchange leg's complete venue-local state plus the persistence gate.
+/// The gate keeps its keys at the top level, as every saved row has them.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct CexVenueExecutionState {
     cex: CexState,
-    #[serde(default)]
-    ready_to_advance: bool,
-    #[serde(default)]
-    intent_id: Option<String>,
-    #[serde(default)]
-    operator_required: bool,
-    /// When the exchange first became unreachable in the current outage.
-    #[serde(default)]
-    unreachable_since_ts: Option<i64>,
+    #[serde(flatten)]
+    gate: VenueGate,
 }
 
-impl CexVenueExecutionState {
-    /// Clears a park. The next cycle persists a new intent before the leg
-    /// makes any venue call.
-    fn release_park(&mut self) {
-        self.operator_required = false;
-        self.ready_to_advance = false;
-        self.intent_id = None;
+/// A pending settlement is the exchange's own wait; the four shared kinds pass through.
+impl From<CexBackendError> for VenueStepError {
+    fn from(error: CexBackendError) -> Self {
+        match error {
+            CexBackendError::BelowMinimum(message) => Self::BelowMinimum(message),
+            CexBackendError::Ambiguous(message) => Self::Ambiguous(message),
+            CexBackendError::Unreachable(message) => Self::Unreachable(message),
+            CexBackendError::PendingSettlement(_) | CexBackendError::Other(_) => Self::Other(error.to_string()),
+        }
     }
 }
 
@@ -72,10 +62,7 @@ where
         let preview = self.preview_swap_request(&execution_id, request).await?;
         let execution = CexVenueExecutionState {
             cex: preview.state,
-            ready_to_advance: false,
-            intent_id: None,
-            operator_required: false,
-            unreachable_since_ts: None,
+            gate: VenueGate::default(),
         };
 
         Ok(VenueRoutePreview {
@@ -153,7 +140,7 @@ where
             let last_error = execution.cex.last_error.clone();
             return self.progress_for(execution, last_error);
         }
-        if execution.operator_required {
+        if execution.gate.operator_required {
             let error = execution
                 .cex
                 .last_error
@@ -162,37 +149,25 @@ where
             return self.operator_required_progress(execution, error);
         }
 
-        if !execution.ready_to_advance {
-            execution.ready_to_advance = true;
-            let intent_id = crate::utils::new_venue_execution_id(&format!("{}-intent", self.profile.venue_id()));
-            execution.intent_id = Some(intent_id.clone());
-            self.multi_venue_armed_intents
-                .lock()
-                .map_err(|_| "multi-venue intent lock poisoned".to_string())?
-                .insert(intent_id);
-            return self.progress_for(execution, None);
-        }
-
-        let intent_id = execution
-            .intent_id
-            .clone()
-            .ok_or_else(|| "persisted CEX execution gate has no intent ID".to_string())?;
-        let armed_here = self
-            .multi_venue_armed_intents
-            .lock()
-            .map_err(|_| "multi-venue intent lock poisoned".to_string())?
-            .remove(&intent_id);
-        if !armed_here && !self.can_resume_by_polling(&mut execution.cex) {
-            return self.operator_required_progress(
-                execution,
-                format!(
-                    "persisted {} intent `{intent_id}` has ambiguous submission state after restart",
-                    self.profile.name()
-                ),
-            );
-        }
-        execution.ready_to_advance = false;
-        execution.intent_id = None;
+        let intent_id = match execution
+            .gate
+            .open(self.profile.venue_id(), &self.multi_venue_armed_intents)?
+        {
+            GateOpening::Armed => return self.progress_for(execution, None),
+            GateOpening::Open { intent_id, armed_here } => {
+                if !armed_here && !self.can_resume_by_polling(&mut execution.cex) {
+                    return self.operator_required_progress(
+                        execution,
+                        format!(
+                            "persisted {} intent `{intent_id}` has ambiguous submission state after restart",
+                            self.profile.name()
+                        ),
+                    );
+                }
+                intent_id
+            }
+        };
+        execution.gate.close();
         execution.cex.last_error = None;
 
         let mut outcome = self.advance_current_step(&mut execution.cex).await;
@@ -201,63 +176,43 @@ where
         // restarts into the saved send, which parks unless a replay is safe.
         if outcome.is_ok() && std::mem::take(&mut execution.cex.send_saved) {
             let mut saved = execution.clone();
-            saved.ready_to_advance = true;
-            saved.intent_id = Some(intent_id);
+            saved.gate = execution.gate.held(intent_id);
             checkpoint.checkpoint(self.progress_for(saved, None)?).await?;
             outcome = self.advance_current_step(&mut execution.cex).await;
             execution.cex.send_saved = false;
         }
 
-        if let Err(error) = &outcome {
-            execution.cex.last_error = Some(error.to_string());
-        }
-        execution.unreachable_since_ts = match &outcome {
-            Err(CexBackendError::Unreachable(_)) => execution.unreachable_since_ts.or(Some(now_ts())),
-            _ => None,
-        };
-        let error = match outcome {
+        let outcome = match outcome {
             Err(error @ CexBackendError::PendingSettlement(_)) => {
+                execution.gate.unreachable_since_ts = None;
+                execution.cex.last_error = Some(error.to_string());
                 return self.settlement_wait_progress(execution, error.to_string()).await;
             }
-            // No later cycle can raise the amount, so the leg ends here with
-            // its funds still in the trader account.
-            Err(CexBackendError::BelowMinimum(message)) if !execution.cex.funds_left_trader_account() => {
-                execution.cex.step = CexStep::Failed;
-                let mut progress = self.progress_for(execution, Some(message))?;
-                progress.failure = Some(VenueLegFailure::BelowMinimum);
-                return Ok(progress);
-            }
-            // Moved funds must stay tracked. The error spends the retry budget,
-            // so the row parks with an alert.
-            Err(CexBackendError::BelowMinimum(message)) => Some(format!(
-                "{message}; the leg's funds already left the trader account, so an operator must settle them"
-            )),
-            // The request never reached the venue, so a short outage spends no
-            // retry budget. A long one does, so it cannot wait without an alert.
-            Err(CexBackendError::Unreachable(message)) => {
-                let waited = execution
-                    .unreachable_since_ts
-                    .map_or(0, |since| now_ts().saturating_sub(since));
-                warn!(
-                    "[cex] liq_id={} venue unreachable at step={:?} waited={}s: {}",
-                    execution.cex.liq_id, execution.cex.step, waited, message
-                );
-                (waited >= UNREACHABLE_WAIT_SECS).then_some(message)
-            }
-            // Only an operator can say which row owns the provider record, or
-            // whether a call without an answer moved funds.
-            Err(CexBackendError::Ambiguous(message)) => {
-                return self.operator_required_progress(execution, message);
-            }
-            Err(error) => Some(error.to_string()),
             // Any step that completes without an error proves the venue is
             // caught up, so a later wait starts from its own first refusal.
             Ok(()) => {
                 execution.cex.trade.trade_settlement_waiting_since_ts = None;
-                None
+                Ok(())
             }
+            Err(error) => Err(VenueStepError::from(error)),
         };
-        self.progress_for(execution, error)
+        if let Err(error) = &outcome {
+            execution.cex.last_error = Some(error.to_string());
+        }
+        let funds_left = execution.cex.funds_left_trader_account();
+        let context = format!("liq_id={} step={:?}", execution.cex.liq_id, execution.cex.step);
+        match execution.gate.judge(outcome, funds_left, "cex", &context) {
+            StepVerdict::Continue => self.progress_for(execution, None),
+            StepVerdict::Wait => self.progress_for(execution, None),
+            StepVerdict::Retry(message) => self.progress_for(execution, Some(message)),
+            StepVerdict::Park(message) => self.operator_required_progress(execution, message),
+            StepVerdict::EndBelowMinimum(message) => {
+                execution.cex.step = CexStep::Failed;
+                let mut progress = self.progress_for(execution, Some(message))?;
+                progress.failure = Some(VenueLegFailure::BelowMinimum);
+                Ok(progress)
+            }
+        }
     }
 
     /// Holds a leg whose funds the venue reports as not tradable yet.
@@ -356,7 +311,7 @@ where
         mut execution: CexVenueExecutionState,
         error: String,
     ) -> Result<VenueLegProgress, String> {
-        execution.operator_required = true;
+        execution.gate.operator_required = true;
         execution.cex.last_error = Some(error.clone());
         Ok(VenueLegProgress {
             execution: VenueExecutionState::new(self.profile.venue_id(), &execution)?,
@@ -450,7 +405,7 @@ where
     ) -> Result<VenueExecutionState, String> {
         let mut execution = self.decode_leg_state(leg)?;
         Self::answer_operator(&mut execution.cex, answer)?;
-        execution.release_park();
+        execution.gate.release_park();
         VenueExecutionState::new(self.profile.venue_id(), &execution)
     }
 
@@ -471,8 +426,8 @@ where
         // discard the old in-memory submission token and retry the persisted
         // CEX step through a newly persisted intent. This call only arms that
         // intent; the external action still happens in a later WAL cycle.
-        if execution.operator_required {
-            execution.release_park();
+        if execution.gate.operator_required {
+            execution.gate.release_park();
         }
         // The legacy CEX machine uses its Pending phases as durable restart
         // reconciliation points; unlike ICPSwap it has no separate Recover

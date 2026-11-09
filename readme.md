@@ -81,7 +81,7 @@ the requested subaccount is preserved.
 
 ## At a Glance
 
-- **Default venues:** `ENABLED_SWAP_VENUES=icpswap,mexc`; disable MEXC when credentials are not configured. This release disables Kraken: `kraken` in the list stops startup.
+- **Default venues:** `ENABLED_SWAP_VENUES=icpswap,mexc`; disable MEXC when credentials are not configured. Add `rift` for a bridge-and-swap fallback on ckUSDC and ckUSDT (see [Rift Venue](#rift-venue)). This release disables Kraken: `kraken` in the list stops startup.
 - **Current config precedence:** shell env vars > local `.env` > `~/.liquidium-pipeline/config.env`.
 - **Required env vars (minimum):** `MNEMONIC_FILE`, `IC_URL`, `EVM_RPC_URL`, `LENDING_CANISTER`, `DEBT_ASSETS`, `COLLATERAL_ASSETS`.
 - **Optional Solana RPC env var:** `SOLANA_RPC_URL` (defaults to `https://api.devnet.solana.com` when unset).
@@ -249,6 +249,9 @@ CEX_MEXC_API_SECRET=your_api_secret
 # CEX (Kraken) - Optional, only when `kraken` is in ENABLED_SWAP_VENUES
 CEX_KRAKEN_API_KEY=your_api_key
 CEX_KRAKEN_API_SECRET=your_api_secret
+# Rift - Optional, only when `rift` is in ENABLED_SWAP_VENUES
+RIFT_API_URL=https://api.rift.trade
+RIFT_API_KEY=your_api_key
 MAX_ALLOWED_CEX_SLIPPAGE_BPS=200  # 2.00% in basis points
 MAX_WIDENED_CEX_SLIPPAGE_BPS=400  # 4.00%: widest IOC limit after empty fills at the cap
 
@@ -319,6 +322,8 @@ Quick reference:
 | `CEX_MEXC_MAX_HOPS` | Max intermediate hops allowed in configured-pair route search. |
 | `CEX_KRAKEN_AVAILABLE_PAIRS` | Kraken's market allowlist. Required when `kraken` is enabled: Kraken never trades outside it, and startup stops if it is empty. |
 | `CEX_KRAKEN_MAX_HOPS` | Max intermediate hops in Kraken's route search; defaults to 2. |
+| `RIFT_API_URL` | The Rift REST API; defaults to `https://api.rift.trade`. |
+| `RIFT_API_KEY` | Optional. Names the integrator to Rift; without it Rift serves one request per second. |
 
 Note: `CEX_BUY_INVERSE_OVESPEND_BPS` is still accepted as a legacy alias, but `CEX_BUY_INVERSE_OVERSPEND_BPS` is the canonical key.
 
@@ -899,6 +904,20 @@ This release disables Kraken: `kraken` in `ENABLED_SWAP_VENUES` stops startup. W
 Before any funds move, a Kraken quote checks the route: a deposit method and address for the asset and network (an ICP deposit that needs a memo is refused), the deposit minimum, and a verified withdrawal address. A refused route gets no quote, so the planner uses another venue.
 
 Every Kraken order is IOC at its price limit. Kraken keeps no caller id for a withdrawal, so a withdrawal whose reply was lost parks for an operator: check Kraken's withdrawal history before you release the leg.
+
+## Rift Venue
+
+[Rift](https://www.rift.trade) swaps one asset on Ethereum for another and pays an address. It has no account and no order book, so it is a fallback for ckUSDC and ckUSDT when MEXC's book is thin; it carries no ICP and no ckBTC. Add `rift` to `ENABLED_SWAP_VENUES`; the planner asks MEXC first, Rift next, then Kraken.
+
+A Rift leg takes these steps, each saved before it acts:
+
+1. A fresh quote. A quote under the plan's conservative output is refused.
+2. The order. Rift delivers to the bridge EVM wallet and refunds to the main EVM wallet.
+3. The ckERC20 bridge pays the order's deposit address straight from the minter. Nothing passes through our EVM wallet on the way in.
+4. The order status until Rift delivers. A refunded, underfunded, frozen or expired order parks the leg for an operator: Rift or its support holds the funds, and the leg has no send to decide.
+5. The ckERC20 bridge brings the delivered asset back to ICP as its ck form.
+
+Rift quotes carry no price impact, so the planner's oracle discount guard is the only price check on a Rift leg.
 
 ## Native Simulator
 

@@ -9,13 +9,13 @@ use tracing::warn;
 
 use super::{
     BPS_DENOMINATOR, IcpswapFirstPlanInput, IcpswapFirstPlanner, IcpswapFirstPlannerError, KRAKEN_VENUE_ID,
-    MEXC_VENUE_ID,
+    MEXC_VENUE_ID, RIFT_VENUE_ID,
 };
 use crate::finalizers::multi_venue::{VenueRoutePreview, planning::venue_registry::VenuePreviewOutcome};
 
-/// The order the exchanges are asked in. A venue outside it follows in
-/// registry order.
-const CEX_POLICY_ORDER: [&str; 2] = [MEXC_VENUE_ID, KRAKEN_VENUE_ID];
+/// The order the overflow venues are asked in: MEXC, then Rift when MEXC's
+/// book is thin, then Kraken. A venue outside it follows in registry order.
+const CEX_POLICY_ORDER: [&str; 3] = [MEXC_VENUE_ID, RIFT_VENUE_ID, KRAKEN_VENUE_ID];
 
 /// Sorts the overflow venues into policy order. The sort is stable, so venues
 /// the policy does not name keep their registry order.
