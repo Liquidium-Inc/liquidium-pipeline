@@ -43,6 +43,12 @@ pub fn now_nanos() -> u64 {
         .unwrap_or(u64::MAX)
 }
 
+/// Seconds since `since`, which is set to now on first use.
+pub fn waited_secs(since: &mut Option<i64>) -> i64 {
+    let since = *since.get_or_insert_with(now_ts);
+    now_ts().saturating_sub(since)
+}
+
 /// Creates a restart-safe idempotency key for a venue execution prepared
 /// before the parent multi-venue plan has assigned its persisted leg ID.
 pub fn new_venue_execution_id(venue_id: &str) -> String {

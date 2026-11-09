@@ -1,7 +1,7 @@
 //! The deposit funding transfer: measuring the exchange balance, sizing the
 //! transfer with its fee reserve, the saved send, and the approval bumps.
 use super::*;
-use crate::finalizers::bridge_planner::BridgePlanner;
+use crate::finalizers::bridge_legs::fee_adjusted_transfer;
 
 impl<C> CexVenueFinalizer<C>
 where
@@ -69,7 +69,7 @@ where
     }
 
     /// The exchange balance before the deposit. A failed read counts as zero.
-    async fn record_balance_before_deposit(&self, state: &mut CexState, planned_asset: &str) {
+    pub(super) async fn record_balance_before_deposit(&self, state: &mut CexState, planned_asset: &str) {
         let baseline = self.backend.get_balance(planned_asset).await.unwrap_or_else(|error| {
             debug!(
                 "[cex] liq_id={} could not get baseline balance before deposit: {} (using 0.0)",
@@ -111,7 +111,7 @@ where
 
         state.deposit.bridge.deposit_bridge_destination_snapshot = Some(addr.address.clone());
 
-        let (transfer_value, transfer_amount) = Self::compute_fee_adjusted_deposit_transfer(
+        let (transfer_value, transfer_amount) = fee_adjusted_transfer(
             &state.deposit.deposit_asset,
             &state.size_in,
             self.deposit_fee_count(&state.deposit.deposit_asset),
@@ -125,61 +125,6 @@ where
         Ok(OutboundIntent {
             token: state.deposit.deposit_asset.clone(),
             to: destination,
-            amount_native: transfer_value,
-        })
-    }
-
-    /// Measures the exchange balance and sizes the bridged funding transfer,
-    /// saving the bridge amounts it implies. It runs once per transfer.
-    pub(super) async fn prepare_bridged_funding(
-        &self,
-        state: &mut CexState,
-        bridge: &BridgeRuntime,
-        route: &BridgeRouteSpec,
-        planned_asset: &str,
-    ) -> Result<OutboundIntent, CexBackendError> {
-        self.record_balance_before_deposit(state, planned_asset).await;
-        let bridge_source_address = self.resolve_bridge_source_address(route.source_chain)?;
-        let bridge_destination = <Self as BridgePlanner>::bridge_source_transfer_destination(
-            route.source_chain,
-            &bridge_source_address,
-        )?;
-
-        let BridgedDepositArrival {
-            sizing:
-                BridgeDepositSizing {
-                    transfer_value,
-                    bridge_amount: transfer_amount,
-                    source_fee_reserve,
-                    fee_budget,
-                },
-            submit_amount: bridge_submit_amount,
-            expected_amount: bridge_expected_amount,
-        } = Self::bridged_deposit_arrival(bridge, route, &state.deposit.deposit_asset, &state.size_in).await?;
-
-        if let Some(source_fee_reserve) = source_fee_reserve {
-            let source_transfer_amount =
-                ChainTokenAmount::from_raw(state.deposit.deposit_asset.clone(), transfer_value.clone());
-            info!(
-                "[cex] liq_id={} bridged deposit reserving reverse bridge source fee budget: reserve={} source_transfer={} bridge_amount={} route={}@{}->{}",
-                state.liq_id,
-                source_fee_reserve.formatted(),
-                source_transfer_amount.formatted(),
-                transfer_amount.formatted(),
-                route.source_asset,
-                route.source_chain,
-                route.target_asset,
-            );
-        }
-
-        state.record_side_costs(&fee_budget.side_costs);
-        state.deposit.bridge.deposit_bridge_submit_amount = Some(bridge_submit_amount);
-        state.deposit.bridge.deposit_bridge_expected_amount = Some(bridge_expected_amount);
-        state.deposit.bridge.deposit_bridge_provider_fee_budget_native_units =
-            fee_budget.provider_fee_budget_native_units.clone();
-        Ok(OutboundIntent {
-            token: state.deposit.deposit_asset.clone(),
-            to: bridge_destination,
             amount_native: transfer_value,
         })
     }
@@ -200,16 +145,6 @@ where
         } else {
             1
         }
-    }
-
-    pub(in crate::finalizers::cex) fn compute_fee_adjusted_deposit_transfer(
-        deposit_asset: &ChainToken,
-        size_in: &ChainTokenAmount,
-        fee_count: u8,
-    ) -> Result<(Nat, ChainTokenAmount), CexBackendError> {
-        let fee = deposit_asset.fee() * fee_count;
-        let transfer_amount = Self::amount_less_reserve(deposit_asset, &size_in.value, fee, "ledger fee")?;
-        Ok((transfer_amount.value.clone(), transfer_amount))
     }
 
     // Some venues notice approvals unreliably; a burst of tiny approvals raises the

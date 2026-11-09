@@ -6,11 +6,7 @@ use alloy::primitives::Address as EvmAddress;
 use candid::{Nat, Principal};
 use ic_ledger_types::{AccountIdentifier, Subaccount};
 use icrc_ledger_types::icrc1::account::Account;
-use liquidium_pipeline_connectors::backend::amount_utils::nat_units_to_spend_amount;
-use liquidium_pipeline_connectors::backend::bridge_backend::{
-    BridgeDestination, BridgeError, BridgeFeeBudget, BridgeRequest, BridgeRouteKind, BridgeRouteSpec, BridgeStatus,
-    DepositNotice, cksol_transfer_without_deposit_id, resolve_route,
-};
+use liquidium_pipeline_connectors::backend::bridge_backend::BridgeRouteSpec;
 use liquidium_pipeline_connectors::outbound::UnsettledSender;
 use liquidium_pipeline_core::outbound::{OutboundIntent, OutboundSender};
 use liquidium_pipeline_connectors::backend::cex_backend::{
@@ -30,31 +26,17 @@ use super::profile::CexVenueProfile;
 use super::utils::{LIQUIDITY_EPS, SlicePreview, TradeLeg, is_usd_stable_symbol, waited_secs};
 use liquidium_pipeline_connectors::outbound::{AcceptedWithdrawal, CexWithdrawals, WithdrawRequest, prepare_cex_withdraw};
 
-pub(super) const WITHDRAW_BRIDGE_SOURCE_BALANCE_TOLERANCE: f64 = LIQUIDITY_EPS;
-const NATIVE_ETH_BRIDGEABLE_SAFETY_MARGIN: f64 = 1e-15;
-pub(super) const BRIDGE_FEE_TOKEN_SYMBOL: &str = "ckETH";
-pub(super) const BRIDGE_FEE_TOKEN_CHAIN: &str = "ICP";
-pub(super) const CKETH_DECIMALS: u8 = 18;
 /// An accepted exchange withdrawal must reach its address, or the return bridge,
 /// within this time. After it, each waiting cycle errors, so the row parks for an operator.
 const WITHDRAW_DELIVERY_TIMEOUT_SECS: i64 = 60 * 60;
-/// How long a landed bridge deposit may wait for the provider to accept it.
-/// The ckSOL minter reads it at finalized commitment, which takes seconds.
-const DEPOSIT_NOTICE_WINDOW_SECS: i64 = 30 * 60;
-/// A bridge credit not seen after this long is stamped on the leg for an operator.
-const BRIDGE_CREDIT_STALL_SECS: i64 = 40 * 60;
-/// How often a reverted return-bridge send is made again. Each one costs gas.
-const MAX_REVERTED_BRIDGE_RESUBMITS: u32 = 2;
 /// How often a withdrawal the exchange failed or canceled is requested again.
 const MAX_FAILED_WITHDRAWAL_RESUBMITS: u32 = 2;
-const SOL_FINALITY_SECS: i64 = 20;
 
 use crate::{
     bridge::runtime::BridgeRuntime,
     finalizers::bridge_planner::BridgePlanner,
     finalizers::cex::state::{CexState, CexStep},
     outbound::driver::{OutboundError, OutboundRecord, step_outbound},
-    stages::bridge_submit_lock::acquire_bridge_submit_lock,
     swappers::orderbook_quote::{simulate_buy_from_asks, simulate_sell_from_bids},
     utils::{ICP_LEDGER_PRINCIPAL, now_ts},
 };
@@ -128,8 +110,6 @@ const DEFAULT_ORDERBOOK_LIMIT: u32 = 50;
 /// Number of binary-search iterations for max-slice estimation.
 const SLICE_SEARCH_STEPS: usize = 24;
 pub const APPROVE_BUMP_MAX_COUNT: u8 = 6;
-/// A bridged deposit sends no approval bumps, so only its transfer fee is held back.
-const BRIDGED_DEPOSIT_FEE_COUNT: u8 = 1;
 const APPROVE_BUMP_BATCH_SIZE: u8 = 3;
 const APPROVE_BUMP_DELAY_MS: u64 = 300;
 const APPROVE_BUMP_BATCH_DELAY_SECS: u64 = 3;
@@ -274,8 +254,6 @@ mod destinations;
 mod funding;
 #[path = "trade/routing.rs"]
 mod routing;
-#[path = "bridge/sizing.rs"]
-mod sizing;
 #[path = "trade/execution.rs"]
 mod slice_execution;
 #[path = "trade/orders.rs"]
@@ -289,7 +267,10 @@ mod withdraw_bridge;
 #[path = "withdraw/direct.rs"]
 mod withdraw_direct;
 
-pub(super) use sizing::{BridgeDepositSizing, BridgedDepositArrival};
+#[cfg(test)]
+pub(in crate::finalizers::cex) use crate::finalizers::bridge_legs::{
+    BRIDGE_CREDIT_STALL_SECS, DEPOSIT_NOTICE_WINDOW_SECS, MAX_REVERTED_BRIDGE_RESUBMITS, SOL_FINALITY_SECS,
+};
 pub use withdraw_direct::withdraw_order_id;
 
 /// Builds a leg's state from a liquidation receipt, as tests set legs up.
@@ -349,7 +330,7 @@ where
         if !state.deposit.bridge.deposit_bridge_required {
             return self.deposit_direct(state, &planned_asset, &planned_network).await;
         }
-        self.deposit_bridged(state, &planned_asset).await
+        self.deposit_bridged(state, &planned_asset, &planned_network).await
     }
 
     /// Execute one resumable trade invocation for the current CEX route leg.

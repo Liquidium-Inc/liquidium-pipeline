@@ -5,6 +5,7 @@ use log::{info, warn};
 use serde::{Deserialize, Serialize};
 
 use super::finalizer::CexVenueFinalizer;
+use crate::finalizers::bridge_legs::{BridgeLegError, bridge_minimum_shortfall, size_bridged_deposit};
 use crate::{
     finalizers::{
         bridge_planner::BridgePlanner,
@@ -403,13 +404,13 @@ where
             return Ok(());
         }
         let bridge = self.bridge_runtime().map_err(VenueAmountError::Unavailable)?;
-        let sizing = Self::size_bridged_deposit(bridge, route, &state.deposit.deposit_asset, &state.size_in)
+        let sizing = size_bridged_deposit(bridge, route, &state.deposit.deposit_asset, &state.size_in)
             .await
             .map_err(|error| match error {
-                CexBackendError::BelowMinimum(message) => VenueAmountError::BelowMinimum(message),
+                BridgeLegError::BelowMinimum(message) => VenueAmountError::BelowMinimum(message),
                 other => VenueAmountError::Unavailable(other.to_string()),
             })?;
-        match Self::bridge_minimum_shortfall(bridge, route, &sizing.bridge_amount)
+        match bridge_minimum_shortfall(bridge, route, &sizing.bridge_amount)
             .await
             .map_err(VenueAmountError::Unavailable)?
         {
