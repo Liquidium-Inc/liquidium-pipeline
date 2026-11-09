@@ -71,7 +71,7 @@ pub(crate) trait BridgePlanner {
     fn bridge_enabled(&self) -> bool;
     /// Resolves the configured bridge source address/account string for a given source chain.
     fn resolve_bridge_source_address(&self, source_chain: &str) -> Result<String, String>;
-    /// Whether the exchange lists this ICP asset itself. The bridge route is then not used.
+    /// Whether the exchange lists this ICP asset itself, so it can move without a bridge.
     fn takes_directly(&self, asset: &str) -> bool;
     /// Builds a direct (non-bridged) transport plan from the provided asset.
     fn plan_from_direct_asset(asset: &ChainToken) -> BridgeTransportPlan {
@@ -82,39 +82,68 @@ pub(crate) trait BridgePlanner {
         }
     }
 
-    /// Resolves per-leg transport plans (deposit and withdraw), including bridge symbol/network translation.
-    fn resolve_bridge_plan_for_assets(&self, deposit_asset: &ChainToken, withdraw_asset: &ChainToken) -> BridgePlan {
-        let mut deposit = Self::plan_from_direct_asset(deposit_asset);
-        let mut withdraw = Self::plan_from_direct_asset(withdraw_asset);
-
-        if !self.bridge_enabled() {
-            return BridgePlan { deposit, withdraw };
+    /// The transports one side may use, fast first: direct when the exchange lists
+    /// the asset, then the bridge route when the catalog has one. A side with
+    /// neither stays direct, and the exchange refuses it at the funding check, as before.
+    fn side_transports(
+        &self,
+        asset: &ChainToken,
+        bridged: impl Fn(&str, &str) -> Option<BridgeTransportPlan>,
+    ) -> Vec<BridgeTransportPlan> {
+        let direct = Self::plan_from_direct_asset(asset);
+        let mut transports = Vec::new();
+        if self.bridge_enabled() {
+            if self.takes_directly(&direct.cex_asset) {
+                transports.push(direct.clone());
+            }
+            if let Some(route) = bridged(&direct.cex_asset, &direct.cex_network) {
+                transports.push(route);
+            }
         }
+        if transports.is_empty() {
+            transports.push(direct);
+        }
+        transports
+    }
 
+    /// Every transport plan for the pair, fast first. Never empty. The preview
+    /// tries them in this order and keeps the first one whose book is sound.
+    fn bridge_plan_candidates(&self, deposit_asset: &ChainToken, withdraw_asset: &ChainToken) -> Vec<BridgePlan> {
         // Deposit side: the ICP asset leaves through its reverse route
         // (ckUSDC@ICP -> USDC@ETH, ckSOL@ICP -> SOL@SOL).
-        if !self.takes_directly(&deposit.cex_asset)
-            && let Some(route) = resolve_reverse_route_by_source(&deposit.cex_asset, &deposit.cex_network)
-        {
-            deposit = BridgeTransportPlan {
+        let deposits = self.side_transports(deposit_asset, |asset, network| {
+            resolve_reverse_route_by_source(asset, network).map(|route| BridgeTransportPlan {
                 cex_asset: route.target_asset.to_string(),
                 cex_network: cex_network_from_destination_kind(route.destination_kind),
                 bridge_required: true,
-            };
-        }
-
+            })
+        });
         // Withdraw side: the exchange delivers the forward route's source asset.
-        if !self.takes_directly(&withdraw.cex_asset)
-            && let Some(route) = resolve_forward_route_by_target(&withdraw.cex_asset)
-        {
-            withdraw = BridgeTransportPlan {
+        let withdraws = self.side_transports(withdraw_asset, |asset, _network| {
+            resolve_forward_route_by_target(asset).map(|route| BridgeTransportPlan {
                 cex_asset: route.source_asset.to_string(),
                 cex_network: route.source_chain.to_string(),
                 bridge_required: true,
-            };
-        }
+            })
+        });
+        deposits
+            .iter()
+            .flat_map(|deposit| {
+                withdraws.iter().map(move |withdraw| BridgePlan {
+                    deposit: deposit.clone(),
+                    withdraw: withdraw.clone(),
+                })
+            })
+            .collect()
+    }
 
-        BridgePlan { deposit, withdraw }
+    /// The fastest transport plan for the pair. Legacy state backfill and the
+    /// amount check use it; a preview chooses among `bridge_plan_candidates`.
+    fn resolve_bridge_plan_for_assets(&self, deposit_asset: &ChainToken, withdraw_asset: &ChainToken) -> BridgePlan {
+        self.bridge_plan_candidates(deposit_asset, withdraw_asset)
+            .into_iter()
+            .next()
+            .expect("the candidate list always holds the direct plan")
     }
 
     /// The bridge destination of the final liquidator for the return bridge.
@@ -231,6 +260,10 @@ mod tests {
         }
     }
 
+    fn transport(plan: &BridgeTransportPlan) -> (String, String, bool) {
+        (plan.cex_asset.clone(), plan.cex_network.clone(), plan.bridge_required)
+    }
+
     fn icp_token(symbol: &str) -> ChainToken {
         ChainToken::Icp {
             ledger: Principal::anonymous(),
@@ -260,6 +293,55 @@ mod tests {
             assert_eq!((side.cex_asset.as_str(), side.cex_network.as_str()), ("USDC", "ETH"));
             assert!(side.bridge_required);
         }
+    }
+
+    /// A listed asset with a bridge route offers both transports, the direct one first,
+    /// so a preview that finds the direct book thin still has the bridge to fall back to.
+    #[test]
+    fn a_listed_asset_with_a_route_offers_direct_then_bridged() {
+        let token = icp_token("ckUSDT");
+        let planner = TestBridgePlanner {
+            direct_assets: &["ckUSDT"],
+        };
+
+        let candidates = planner.bridge_plan_candidates(&icp_token("ICP"), &token);
+        let withdraws: Vec<_> = candidates.iter().map(|plan| transport(&plan.withdraw)).collect();
+        assert_eq!(
+            withdraws,
+            vec![
+                ("ckUSDT".to_string(), "ICP".to_string(), false),
+                ("USDT".to_string(), "ETH".to_string(), true),
+            ]
+        );
+        // ICP has no bridge route, so every candidate deposits it directly.
+        assert!(candidates.iter().all(|plan| !plan.deposit.bridge_required));
+    }
+
+    /// Both sides listed and routed: direct on both first, then one bridge, then both.
+    #[test]
+    fn candidates_are_ordered_from_no_bridge_to_two_bridges() {
+        let planner = TestBridgePlanner {
+            direct_assets: &["ckUSDT", "ckUSDC"],
+        };
+
+        let candidates = planner.bridge_plan_candidates(&icp_token("ckUSDC"), &icp_token("ckUSDT"));
+        let bridges: Vec<(bool, bool)> = candidates
+            .iter()
+            .map(|plan| (plan.deposit.bridge_required, plan.withdraw.bridge_required))
+            .collect();
+        assert_eq!(
+            bridges,
+            vec![(false, false), (false, true), (true, false), (true, true)]
+        );
+    }
+
+    /// Neither listed nor routed: the direct plan stands alone, and the exchange refuses it later.
+    #[test]
+    fn an_asset_without_listing_or_route_stays_direct() {
+        let candidates = TestBridgePlanner::default().bridge_plan_candidates(&icp_token("ICP"), &icp_token("ICP"));
+        assert_eq!(candidates.len(), 1);
+        assert!(!candidates[0].deposit.bridge_required);
+        assert!(!candidates[0].withdraw.bridge_required);
     }
 
     #[test]

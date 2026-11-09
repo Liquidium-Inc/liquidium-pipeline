@@ -618,46 +618,48 @@ async fn mexc_trade_errors_when_no_hop_route_exists_in_configured_pairs() {
     assert!(err.to_string().contains("no configured hop route"));
 }
 
+/// The ck pairs have no fixed route any more: a configured direct market is used
+/// when it quotes, and the search falls back to the configured hops when it does not.
 #[tokio::test]
-async fn mexc_preview_route_keeps_legacy_special_override_even_with_direct_pair_configured() {
+async fn mexc_resolves_ckbtc_to_ckusdt_from_the_configured_pairs() {
     let mut backend = MockCexBackend::new();
     let transfers = MockTransferActions::new();
-
-    let observed_markets = Arc::new(std::sync::Mutex::new(HashMap::<String, usize>::new()));
-    let observed_markets_handle = observed_markets.clone();
-    let liquid = OrderBook {
-        bids: vec![OrderBookLevel {
-            price: 1.0,
-            quantity: 1_000.0,
-        }],
-        asks: vec![OrderBookLevel {
-            price: 1.001,
-            quantity: 1_000.0,
-        }],
+    let liquid = liquid_orderbook();
+    let empty = OrderBook {
+        bids: vec![],
+        asks: vec![],
         taker_fee_bps: 10.0,
     };
-    backend.expect_get_orderbook().returning(move |market, _limit| {
-        *observed_markets_handle
-            .lock()
-            .unwrap()
-            .entry(market.to_string())
-            .or_insert(0) += 1;
-        match market {
-            "CKBTC_BTC" | "BTC_USDC" | "USDC_USDT" | "CKUSDT_USDT" | "CKBTC_CKUSDT" => Ok(liquid.clone()),
+    backend
+        .expect_get_orderbook()
+        .returning(move |market, _limit| match market {
+            "CKBTC_CKUSDT" | "CKUSDT_CKBTC" => Ok(empty.clone()),
+            "CKBTC_BTC" | "BTC_USDT" | "CKUSDT_USDT" => Ok(liquid.clone()),
             _ => Err(format!("unexpected market {}", market)),
-        }
-    });
+        });
 
-    let finalizer =
-        test_finalizer(Arc::new(backend), Arc::new(transfers)).with_route_config(vec!["CKBTC_CKUSDT".to_string()], 2);
+    let finalizer = test_finalizer(Arc::new(backend), Arc::new(transfers)).with_route_config(
+        vec![
+            "CKBTC_BTC".to_string(),
+            "BTC_USDT".to_string(),
+            "CKUSDT_USDT".to_string(),
+        ],
+        2,
+    );
 
-    let receipt = make_execution_receipt(1005);
-    preview_receipt_route(&finalizer, &receipt)
+    let legs = finalizer
+        .resolve_trade_legs_for_symbols("ckBTC", "ckUSDT")
         .await
-        .expect("preview should succeed");
+        .expect("the hop search should find the ck route");
+    assert_eq!(markets(&legs), vec!["CKBTC_BTC", "BTC_USDT", "CKUSDT_USDT"]);
+    assert_eq!(legs[2].side, "buy");
 
-    let markets = observed_markets.lock().unwrap();
-    assert_eq!(markets.get("CKBTC_CKUSDT").copied().unwrap_or(0), 0);
+    // The exit as plain USDT, for the bridged transport, is one hop shorter.
+    let legs = finalizer
+        .resolve_trade_legs_for_symbols("ckBTC", "USDT")
+        .await
+        .expect("the hop search should find the USDT exit");
+    assert_eq!(markets(&legs), vec!["CKBTC_BTC", "BTC_USDT"]);
 }
 
 #[tokio::test]
