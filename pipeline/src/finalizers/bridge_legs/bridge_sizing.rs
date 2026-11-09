@@ -2,7 +2,7 @@
 //! bridge leg sends and receives. Planning and execution use the same sizing,
 //! so a quote counts the fees execution pays.
 use candid::Nat;
-use liquidium_pipeline_connectors::backend::amount_utils::nat_units_to_spend_amount;
+use liquidium_pipeline_connectors::backend::amount_utils::{nat_units_to_amount_via_core, nat_units_to_spend_amount};
 use liquidium_pipeline_connectors::backend::bridge_backend::{BridgeFeeBudget, BridgeRouteKind, BridgeRouteSpec};
 use liquidium_pipeline_core::{
     account::model::ChainAccount,
@@ -14,6 +14,44 @@ use crate::{bridge::runtime::BridgeRuntime, finalizers::bridge_planner::parse_ic
 
 /// A bridged deposit sends no approval bumps, so only its transfer fee is held back.
 const BRIDGED_DEPOSIT_FEE_COUNT: u8 = 1;
+
+/// The symbol a return route's gas cost carries in its fee budget.
+const GAS_SYMBOL: &str = "ETH";
+const GAS_DECIMALS: u8 = 18;
+
+/// Checks that the bridge wallet holds the gas the return route pays before
+/// any funds commit to it. The balance read keeps a reserve back, so this
+/// asks a little more than the send needs.
+pub async fn ensure_return_gas(
+    bridge: &BridgeRuntime,
+    route: &BridgeRouteSpec,
+    budget: &BridgeFeeBudget,
+) -> Result<(), String> {
+    if route.route_kind != BridgeRouteKind::CkEthErc20Forward {
+        return Ok(());
+    }
+    let needed = budget
+        .side_costs
+        .iter()
+        .filter(|cost| cost.symbol == GAS_SYMBOL)
+        .fold(Nat::from(0u8), |sum, cost| sum + cost.amount.clone());
+    if needed == 0u8 {
+        return Ok(());
+    }
+    let needed = nat_units_to_amount_via_core(&needed, GAS_DECIMALS)?;
+    let wallet = bridge.sources.for_chain(route.source_chain)?;
+    let held = bridge
+        .backend
+        .get_source_balance(GAS_SYMBOL, route.source_chain, &wallet)
+        .await?;
+    if held < needed {
+        return Err(format!(
+            "bridge wallet {wallet} holds {held} ETH, below the {needed} ETH of gas the {} return needs",
+            route.source_asset
+        ));
+    }
+    Ok(())
+}
 
 /// What a bridged deposit sends and what the bridge receives from it.
 pub struct BridgeDepositSizing {

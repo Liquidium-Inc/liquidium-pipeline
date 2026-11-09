@@ -550,6 +550,7 @@ mod tests {
             cex_kraken_max_hops: 2,
             rift_api_url: crate::config::DEFAULT_RIFT_API_URL.to_string(),
             rift_api_key: None,
+            rift_max_order_usd: 25_000.0,
             icpswap_factory_canister: Principal::from_text(crate::config::DEFAULT_ICPSWAP_FACTORY_CANISTER)
                 .expect("principal"),
             icpswap_fee_tiers: vec![candid::Nat::from(500u32), candid::Nat::from(3000u32)],

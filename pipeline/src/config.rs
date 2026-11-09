@@ -105,6 +105,9 @@ pub struct Config {
     pub rift_api_url: String,
     /// Names the integrator to Rift. Lives only in the environment.
     pub rift_api_key: Option<String>,
+    /// The most one Rift order may carry, in USD at the oracle price. A Rift
+    /// quote has no slippage cap, so this bounds what one order can lose.
+    pub rift_max_order_usd: f64,
     /// Maximum intermediate hops allowed for Kraken route discovery.
     pub cex_kraken_max_hops: u8,
     pub icpswap_factory_canister: Principal,
@@ -412,6 +415,7 @@ impl Config {
         let cex_kraken_available_pairs = parse_cex_available_pairs_from_env("CEX_KRAKEN_AVAILABLE_PAIRS");
         let cex_kraken_max_hops = parse_cex_max_hops_from_env("CEX_KRAKEN_MAX_HOPS");
         let rift_api_url = parse_rift_api_url_from_env();
+        let rift_max_order_usd = parse_rift_max_order_usd_from_env();
         let rift_api_key = env::var("RIFT_API_KEY")
             .ok()
             .map(|key| key.trim().to_string())
@@ -497,6 +501,7 @@ impl Config {
             cex_kraken_max_hops,
             rift_api_url,
             rift_api_key,
+            rift_max_order_usd,
             icpswap_factory_canister,
             icpswap_fee_tiers,
             icpswap_max_price_impact_bps: parse_icpswap_max_price_impact_bps_from_env(),
@@ -625,6 +630,7 @@ const DEFAULT_ICPSWAP_MAX_SEARCH_ITERATIONS: u8 = 16;
 const DEFAULT_ENABLED_SWAP_VENUES: &str = "icpswap,mexc";
 const SUPPORTED_SWAP_VENUES: [&str; 4] = ["icpswap", "mexc", "rift", "kraken"];
 pub(crate) const DEFAULT_RIFT_API_URL: &str = "https://api.rift.trade";
+pub(crate) const DEFAULT_RIFT_MAX_ORDER_USD: f64 = 25_000.0;
 /// Venues this release refuses to start with. Remove a venue here to release it.
 const RELEASE_DISABLED_SWAP_VENUES: [&str; 1] = ["kraken"];
 
@@ -761,6 +767,16 @@ fn parse_rift_api_url_from_env() -> String {
         return url;
     }
     env::var("RIFT_API_URL").unwrap_or_else(|_| DEFAULT_RIFT_API_URL.to_string())
+}
+
+/// A cap must be a positive number; anything else keeps the default, so a
+/// typo never lifts it.
+fn parse_rift_max_order_usd_from_env() -> f64 {
+    env::var("RIFT_MAX_ORDER_USD")
+        .ok()
+        .and_then(|value| value.trim().parse::<f64>().ok())
+        .filter(|value| value.is_finite() && *value > 0.0)
+        .unwrap_or(DEFAULT_RIFT_MAX_ORDER_USD)
 }
 
 fn parse_enabled_swap_venues_from_env() -> Result<Vec<String>, String> {

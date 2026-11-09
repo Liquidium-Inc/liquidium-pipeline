@@ -5,7 +5,7 @@ use super::*;
 use crate::{
     finalizers::multi_venue::MultiVenueAdapter,
     outbound::driver::{OperatorDecision, OutboundPhase, OutboundRecord},
-    persistance::VenueExecutionState,
+    persistance::{VenueExecutionState, VenueLegFailure},
     utils::now_ts,
 };
 
@@ -91,6 +91,61 @@ fn a_parked_funding_transfer_is_one_question_and_takes_one_answer() {
     assert_eq!(
         released.state.get("operator_required").and_then(|v| v.as_bool()),
         Some(false)
+    );
+}
+
+/// A refunded order has no send to decide, but the refund transaction is a
+/// fact only an operator can supply. It ends the leg as a refund, not a retry.
+#[tokio::test]
+async fn a_refunded_order_takes_its_refund_transaction_and_ends_the_leg() {
+    let finalizer = finalizer(
+        MockRiftBackend::new(),
+        MockBridgeBackend::new(),
+        MockOutboundSender::new(),
+    );
+    let mut state = state_at(RiftStep::Wait);
+    state.order.as_mut().unwrap().status = Some("refunded".to_string());
+    let leg = leg_with(&state, true);
+
+    let questions = finalizer.operator_questions(&leg).unwrap();
+    assert_eq!(questions.len(), 1);
+    assert!(questions[0].detail.contains("order-1"), "{}", questions[0].detail);
+    assert!(questions[0].detail.contains("landed <tx>"), "{}", questions[0].detail);
+
+    let error = finalizer.operator_release(&leg, None).unwrap_err();
+    assert!(error.contains("waits for an answer"), "{error}");
+    let error = finalizer
+        .operator_release(&leg, Some(&OperatorDecision::Absent))
+        .unwrap_err();
+    assert!(error.contains("Rift support"), "{error}");
+
+    let released = finalizer
+        .operator_release(
+            &leg,
+            Some(&OperatorDecision::Landed {
+                receipt: "0xrefund".into(),
+            }),
+        )
+        .unwrap();
+    assert_eq!(
+        released.state.pointer("/rift/order/refund_tx").and_then(|v| v.as_str()),
+        Some("0xrefund")
+    );
+    assert_eq!(
+        released.state.pointer("/rift/failure").and_then(|v| v.as_str()),
+        Some("refunded")
+    );
+
+    let mut ended = leg.clone();
+    ended.execution = released;
+    let progress = finalizer.advance(&ended, &NoopCheckpoint).await.unwrap();
+    assert_eq!(progress.status, VenueLegStatus::FailedPermanent);
+    assert_eq!(progress.failure, Some(VenueLegFailure::Refunded));
+    assert!(progress.retryable_error.is_none());
+    assert!(
+        progress.last_error.as_deref().unwrap_or_default().contains("0xrefund"),
+        "{:?}",
+        progress.last_error
     );
 }
 

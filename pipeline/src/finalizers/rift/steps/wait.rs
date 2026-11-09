@@ -80,7 +80,7 @@ impl<R: RiftBackend> RiftVenueFinalizer<R> {
                 Ok(())
             }
             RiftOrderStatus::Refunded => Err(VenueStepError::Ambiguous(format!(
-                "Rift order {} was refunded; the funds are at the refund address {}",
+                "Rift order {} was refunded; the funds are at the refund address {}; the refund transaction ends the leg",
                 order.id,
                 answer.refund_address.as_deref().unwrap_or(&refund_address)
             ))),

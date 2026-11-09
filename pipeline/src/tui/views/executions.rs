@@ -577,6 +577,9 @@ fn append_rift_leg_transactions(lines: &mut Vec<Line<'static>>, execution: &Venu
         if let Some(payout) = text(order.get("payout_tx")) {
             lines.push(Line::from(format!("   Rift payout tx: {payout}")));
         }
+        if let Some(refund) = text(order.get("refund_tx")) {
+            lines.push(Line::from(format!("   Rift refund tx: {refund}")));
+        }
     }
     let fields = [
         ("funding_txid", "funding txid"),

@@ -1,5 +1,6 @@
 //! The persisted state of a Rift leg. The two bridge legs keep their shared
 //! shapes; the order and its status sit between them.
+use liquidium_pipeline_connectors::backend::rift_backend::RiftOrderStatus;
 use liquidium_pipeline_core::tokens::{chain_token::ChainToken, chain_token_amount::ChainTokenAmount};
 use liquidium_pipeline_core::types::side_cost::SideCost;
 use serde::{Deserialize, Serialize};
@@ -7,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     finalizers::bridge_legs::{BridgeInState, BridgeOutState},
     outbound::driver::OutboundRecord,
+    persistance::VenueLegFailure,
 };
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -48,6 +50,9 @@ pub struct RiftOrderRecord {
     /// When Rift delivered. The leg back counts its wait from here.
     #[serde(default)]
     pub delivered_at_ts: Option<i64>,
+    /// The refund transaction an operator confirmed. It ends the leg.
+    #[serde(default)]
+    pub refund_tx: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -85,6 +90,9 @@ pub struct RiftState {
     pub bridge_in: BridgeInState,
     #[serde(default)]
     pub size_out: Option<ChainTokenAmount>,
+    /// Why the leg ended as `Failed`, for the parent to act on.
+    #[serde(default)]
+    pub failure: Option<VenueLegFailure>,
     /// What this leg commits to pay from other balances: bridge ckETH and gas.
     /// One entry per label, so a retried step does not count twice.
     #[serde(default)]
@@ -129,6 +137,29 @@ impl RiftState {
         {
             record.mark_uncertain(now);
         }
+    }
+
+    /// True while Rift reports the order refunded. The money is back at the
+    /// refund address, outside the pipeline's accounts.
+    pub fn order_refunded(&self) -> bool {
+        self.order
+            .as_ref()
+            .and_then(|order| order.status.as_deref())
+            .is_some_and(|status| RiftOrderStatus::from_api(status) == RiftOrderStatus::Refunded)
+    }
+
+    /// Ends the leg on a confirmed refund. The parent reports the row failed;
+    /// the operator moves the refunded funds by hand.
+    pub fn write_off_refund(&mut self, refund_tx: String) -> Result<(), String> {
+        let order = self.order.as_mut().ok_or("no Rift order to write off")?;
+        self.last_error = Some(format!(
+            "Rift order {} was refunded in {refund_tx}; the funds are at the refund address, outside the pipeline",
+            order.id
+        ));
+        order.refund_tx = Some(refund_tx);
+        self.failure = Some(VenueLegFailure::Refunded);
+        self.step = RiftStep::Failed;
+        Ok(())
     }
 
     /// Drops an unfunded order so the next cycle quotes and orders again.

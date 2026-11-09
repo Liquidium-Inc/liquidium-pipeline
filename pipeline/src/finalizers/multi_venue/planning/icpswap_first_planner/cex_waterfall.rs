@@ -67,10 +67,39 @@ impl IcpswapFirstPlanner {
         let mut refusals = Vec::new();
         for (index, venue_id) in self.overflow_venue_ids.iter().enumerate() {
             let is_last = index + 1 == self.overflow_venue_ids.len();
-            let refusal = match self.preview_cex(input, venue_id, remainder.clone()).await? {
+            let slice = match self.venue_order_cap(input, venue_id) {
+                Some(cap) if cap < remainder => {
+                    if is_last {
+                        refusals.push(Refusal {
+                            reason: format!(
+                                "{} amount exceeds its order cap of ${:.0}",
+                                venue_id.to_uppercase(),
+                                self.config.rift_max_order_usd
+                            ),
+                            permanent: false,
+                        });
+                        continue;
+                    }
+                    let left = remainder.clone() - cap.clone();
+                    let left_amount = ChainTokenAmount::from_raw(input.total_pay.token.clone(), left);
+                    // A dust leftover is never a leg, so the cap gives way by that much.
+                    if input.meets_cex_minimum(&left_amount, self.config.cex_min_exec_usd) {
+                        cap
+                    } else {
+                        remainder.clone()
+                    }
+                }
+                _ => remainder.clone(),
+            };
+            let capped = slice != remainder;
+            let refusal = match self.preview_cex(input, venue_id, slice.clone()).await? {
                 VenuePreviewOutcome::Quoted(preview) if !ceiling_applies || self.is_safe_cex(&preview) => {
                     legs.push(preview);
-                    return Ok(legs);
+                    if !capped {
+                        return Ok(legs);
+                    }
+                    remainder -= slice;
+                    continue;
                 }
                 VenuePreviewOutcome::Quoted(preview) => {
                     let reason = format!(
@@ -79,7 +108,7 @@ impl IcpswapFirstPlanner {
                     );
                     if !is_last
                         && let Some(partial) = self
-                            .search_safe_cex_allocation(input, venue_id, remainder.clone())
+                            .search_safe_cex_allocation(input, venue_id, slice.clone())
                             .await?
                     {
                         let left = remainder.clone() - partial.request.pay_amount.value.clone();
@@ -121,6 +150,20 @@ impl IcpswapFirstPlanner {
             return Err(IcpswapFirstPlannerError::BelowVenueMinimum(summary));
         }
         Err(IcpswapFirstPlannerError::NoViableRoute(summary))
+    }
+
+    /// The most one order at this venue may carry, in pay units at the oracle
+    /// price. Only Rift has a cap; without a price the cap cannot be sized.
+    fn venue_order_cap(&self, input: &IcpswapFirstPlanInput, venue_id: &str) -> Option<Nat> {
+        if venue_id != RIFT_VENUE_ID {
+            return None;
+        }
+        let cap_usd = self.config.rift_max_order_usd;
+        let price = input.pay_reference_price_usd?;
+        if !(cap_usd.is_finite() && cap_usd > 0.0 && price > 0.0) {
+            return None;
+        }
+        Some(ChainTokenAmount::from_formatted(input.total_pay.token.clone(), cap_usd / price).value)
     }
 
     /// One exchange's answer for an exact amount, after its amount check and

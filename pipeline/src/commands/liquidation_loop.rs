@@ -301,6 +301,7 @@ async fn init(
                 cycles_usd_per_trillion: config.cycles_usd_per_trillion,
                 icpswap_test_allocation_usd: config.icpswap_test_allocation_usd,
                 mexc_test_allocation_usd: config.mexc_test_allocation_usd,
+                rift_max_order_usd: config.rift_max_order_usd,
             },
         )?
         .with_watchdog(slack_watchdog.clone())

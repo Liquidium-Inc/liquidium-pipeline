@@ -1,5 +1,6 @@
 //! What a parked Rift leg asks an operator, and where an answer is written.
-//! A park on a Rift status has no question: Rift or its support holds the funds.
+//! A park on a Rift status has no question, except a refund: Rift or its
+//! support holds the funds. A refund asks for its transaction and ends the leg.
 use liquidium_pipeline_connectors::backend::rift_backend::RiftBackend;
 
 use super::{finalizer::RiftVenueFinalizer, state::RiftState};
@@ -22,6 +23,8 @@ enum Undecided {
     ReturnBridgeCall,
     /// The send to the return bridge's deposit address.
     ReturnBridgeFunding,
+    /// The refund Rift reports. Its transaction writes the leg off.
+    Refund,
 }
 
 fn open_questions(state: &RiftState) -> Vec<(Undecided, OperatorQuestion)> {
@@ -47,6 +50,19 @@ fn open_questions(state: &RiftState) -> Vec<(Undecided, OperatorQuestion)> {
             send_question("return bridge deposit", record, "receipt"),
         ));
     }
+    if state.order_refunded()
+        && let Some(order) = state.order.as_ref()
+    {
+        questions.push((
+            Undecided::Refund,
+            OperatorQuestion {
+                detail: format!(
+                    "Rift order {} ({} {}) reports a refund to the refund address; find the refund transaction and answer `landed <tx>` to end the leg, or raise it with Rift support",
+                    order.id, order.amount_in, state.pay_symbol
+                ),
+            },
+        ));
+    }
     questions
 }
 
@@ -65,6 +81,13 @@ impl<R: RiftBackend> RiftVenueFinalizer<R> {
             return Ok(());
         };
         let send: &mut Option<OutboundRecord> = match undecided {
+            // A refund without a transaction stays with Rift support.
+            Undecided::Refund => {
+                return match answer {
+                    OperatorDecision::Landed { receipt } => state.write_off_refund(receipt),
+                    OperatorDecision::Absent => Err("a refund that did not land stays parked; raise it with Rift support".to_string()),
+                };
+            }
             Undecided::Funding => &mut state.funding,
             Undecided::BridgeCall => &mut state.bridge_out.deposit_bridge_call,
             Undecided::ReturnBridgeCall => &mut state.bridge_in.withdraw_bridge_call,

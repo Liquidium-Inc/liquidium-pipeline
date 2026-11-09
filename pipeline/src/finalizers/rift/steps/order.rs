@@ -99,6 +99,7 @@ impl<R: RiftBackend> RiftVenueFinalizer<R> {
             polled_at_ts: None,
             wait_since_ts: None,
             delivered_at_ts: None,
+            refund_tx: None,
         });
         state.step = RiftStep::BridgeOut;
         Ok(())

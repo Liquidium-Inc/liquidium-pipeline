@@ -240,7 +240,9 @@ async fn a_refunded_order_parks_the_leg_for_an_operator() {
             ..leg
         })
         .unwrap();
-    assert!(questions.is_empty(), "a Rift park has no send to decide: {questions:?}");
+    // The only question is the refund itself; its transaction ends the leg.
+    assert_eq!(questions.len(), 1, "{questions:?}");
+    assert!(questions[0].detail.contains("refund"), "{}", questions[0].detail);
 }
 
 /// Keeps every checkpoint, so a test can see what was durable before a call.
