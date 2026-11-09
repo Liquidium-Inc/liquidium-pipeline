@@ -38,17 +38,15 @@ pub(super) fn parse_evm_token_address(route: &BridgeRouteSpec) -> Result<Address
             route.source_asset, route.source_chain, route.target_asset
         )
     })?;
-    // The workbench's Anvil deploys its own USDC. The catalog stays fixed, and a
-    // default build cannot make this switch.
+    // The workbench's Anvil deploys its own USDC and USDT. The catalog stays
+    // fixed, and a default build cannot make this switch.
     #[cfg(feature = "simulator")]
-    let local_usdc =
-        if route.source_asset.eq_ignore_ascii_case("USDC") || route.target_asset.eq_ignore_ascii_case("USDC") {
-            std::env::var("SIM_BRIDGE_USDC_ADDRESS").ok()
-        } else {
-            None
-        };
+    let local_token = ["USDC", "USDT"]
+        .iter()
+        .find(|symbol| route.source_asset.eq_ignore_ascii_case(symbol) || route.target_asset.eq_ignore_ascii_case(symbol))
+        .and_then(|symbol| std::env::var(format!("SIM_BRIDGE_{symbol}_ADDRESS")).ok());
     #[cfg(feature = "simulator")]
-    let token = local_usdc.as_deref().unwrap_or(token);
+    let token = local_token.as_deref().unwrap_or(token);
     token.parse::<Address>().map_err(|e| {
         format!(
             "invalid EVM token address '{}' for route {}@{} -> {}: {e}",
