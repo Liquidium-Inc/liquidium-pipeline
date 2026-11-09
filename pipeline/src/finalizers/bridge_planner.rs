@@ -6,7 +6,7 @@ use icrc_ledger_types::icrc1::account::Account;
 use liquidium_pipeline_connectors::backend::bridge_backend::{
     BridgeDestination, BridgeDestinationKind, resolve_forward_route_by_target, resolve_reverse_route_by_source,
 };
-use liquidium_pipeline_core::{account::model::ChainAccount, tokens::chain_token::ChainToken};
+use liquidium_pipeline_core::tokens::chain_token::ChainToken;
 
 use crate::finalizers::cex::state::CexState;
 
@@ -155,16 +155,6 @@ pub(crate) trait BridgePlanner {
             .expect("the candidate list always holds the direct plan")
     }
 
-    /// The bridge destination of the final liquidator for the return bridge.
-    fn bridge_destination_for_final_liquidator(
-        &self,
-        destination_kind: BridgeDestinationKind,
-        direct_withdraw_address: &str,
-    ) -> Result<BridgeDestination, String> {
-        bridge_destination(destination_kind, direct_withdraw_address)
-            .map_err(|error| format!("invalid final destination for bridge withdraw: {error}"))
-    }
-
     /// Persists resolved bridge plan fields onto mutable CEX state.
     fn apply_plan_to_state(state: &mut CexState, plan: &BridgePlan) {
         state.deposit.bridge.deposit_planned_asset = Some(plan.deposit.cex_asset.clone());
@@ -228,21 +218,6 @@ pub(crate) trait BridgePlanner {
             .withdraw_planned_network
             .clone()
             .unwrap_or_else(|| state.withdraw.withdraw_asset.chain())
-    }
-
-    /// Builds a transfer destination account for pre-bridge funding on the given source chain.
-    fn bridge_source_transfer_destination(source_chain: &str, source_address: &str) -> Result<ChainAccount, String> {
-        if source_chain.eq_ignore_ascii_case("ICP") {
-            let account = parse_icp_account_like(source_address)?;
-            return Ok(ChainAccount::Icp(account));
-        }
-        if source_chain.eq_ignore_ascii_case("ETH") {
-            return Ok(ChainAccount::Evm(source_address.to_string()));
-        }
-        Err(format!(
-            "unsupported bridge source chain '{}' for transfer destination",
-            source_chain
-        ))
     }
 }
 
@@ -359,8 +334,7 @@ mod tests {
             owner: Principal::from_slice(&[42]),
             subaccount: Some([7; 32]),
         };
-        let destination = TestBridgePlanner::default()
-            .bridge_destination_for_final_liquidator(BridgeDestinationKind::IcpAccount, &expected.to_string())
+        let destination = bridge_destination(BridgeDestinationKind::IcpAccount, &expected.to_string())
             .expect("valid ICP destination");
 
         assert_eq!(destination, BridgeDestination::IcpAccount(expected));

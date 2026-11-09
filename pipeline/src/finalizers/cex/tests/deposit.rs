@@ -272,9 +272,10 @@ fn mexc_sol_reverse_plan_reserves_approval_fee() {
     assert!(!plan.withdraw.bridge_required);
     let route = liquidium_pipeline_connectors::backend::bridge_backend::resolve_route("ckSOL", "ICP", "SOL").unwrap();
     let amount = ChainTokenAmount::from_raw(sol.clone(), Nat::from(1_000_000_000u64));
-    let (reserve, burn) = CexVenueFinalizer::<MockCexBackend>::compute_reverse_bridge_source_fee_reserve(
-        route, &sol, &amount.value, 0.0000005,
-    ).unwrap().unwrap();
+    let (reserve, burn) =
+        crate::finalizers::bridge_legs::reverse_bridge_source_fee_reserve(route, &sol, &amount.value, 0.0000005)
+            .unwrap()
+            .unwrap();
     assert_eq!(reserve.value, Nat::from(500u64));
     assert_eq!(burn.value, Nat::from(999_999_500u64));
     assert!(

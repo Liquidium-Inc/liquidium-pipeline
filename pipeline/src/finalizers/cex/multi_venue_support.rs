@@ -10,6 +10,10 @@ use log::warn;
 use super::{finalizer::CexVenueFinalizer, utils::LIQUIDITY_EPS};
 use crate::{
     finalizers::{
+        bridge_legs::{
+            BridgeLegError, bridged_deposit_arrival, fee_adjusted_transfer, net_of_withdraw_fee,
+            solana_repayment_bridge_amount,
+        },
         bridge_planner::{BridgePlan, BridgePlanner, BridgeTransportPlan},
         cex::state::{
             CexDepositBridgeState, CexDepositState, CexRouteLeg, CexState, CexStep, CexTradeState,
@@ -85,6 +89,15 @@ impl From<CexBackendError> for PreviewFailure {
     fn from(error: CexBackendError) -> Self {
         match error {
             CexBackendError::BelowMinimum(reason) => Self::Transport(reason),
+            other => Self::Venue(other.to_string()),
+        }
+    }
+}
+
+impl From<BridgeLegError> for PreviewFailure {
+    fn from(error: BridgeLegError) -> Self {
+        match error {
+            BridgeLegError::BelowMinimum(reason) => Self::Transport(reason),
             other => Self::Venue(other.to_string()),
         }
     }
@@ -551,7 +564,7 @@ where
         side_costs: &mut Vec<SideCost>,
     ) -> Result<f64, PreviewFailure> {
         if !state.deposit.bridge.deposit_bridge_required {
-            let (_, executable_pay) = Self::compute_fee_adjusted_deposit_transfer(
+            let (_, executable_pay) = fee_adjusted_transfer(
                 &state.deposit.deposit_asset,
                 &state.size_in,
                 self.deposit_fee_count(&state.deposit.deposit_asset),
@@ -562,8 +575,7 @@ where
         let bridge = self.bridge_runtime().map_err(PreviewFailure::Venue)?;
         let route = Self::deposit_route(state, &<Self as BridgePlanner>::planned_deposit_asset(state))
             .map_err(PreviewFailure::Venue)?;
-        let arrival =
-            Self::bridged_deposit_arrival(bridge, route, &state.deposit.deposit_asset, &state.size_in).await?;
+        let arrival = bridged_deposit_arrival(bridge, route, &state.deposit.deposit_asset, &state.size_in).await?;
         side_costs.extend(arrival.sizing.fee_budget.side_costs);
         Ok(arrival.expected_amount)
     }
@@ -592,7 +604,7 @@ where
                 terms.minimum
             )));
         }
-        let mut net = Self::net_of_withdraw_fee(trade_out, terms.fee).map_err(PreviewFailure::Transport)?;
+        let mut net = net_of_withdraw_fee(trade_out, terms.fee).map_err(PreviewFailure::Transport)?;
 
         let (true, Some(route)) = (
             state.withdraw.bridge.withdraw_bridge_required,
@@ -608,7 +620,7 @@ where
             .map_err(PreviewFailure::Venue)?;
         if route.route_kind == BridgeRouteKind::SolanaToIcp {
             let gross = ChainTokenAmount::from_formatted(state.withdraw.withdraw_asset.clone(), net);
-            net = Self::solana_repayment_bridge_amount(bridge, route, &gross, budget.source_fee_budget)
+            net = solana_repayment_bridge_amount(bridge, route, &gross, budget.source_fee_budget)
                 .await?
                 .to_f64();
         }

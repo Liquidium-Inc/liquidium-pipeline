@@ -1,6 +1,27 @@
-//! A bridged deposit: the funding of the bridge account, then the bridge
-//! status poll. The provider call itself lives in `bridge_submission`.
+//! A bridged deposit on the exchange side: the exchange balance baseline and the
+//! deposit address around the shared leg out, and its outcome mapped onto the steps.
 use super::*;
+use crate::finalizers::bridge_legs::{
+    BridgeDestinationProvider, BridgeLegOutcome, BridgeOutInputs, FundingSlot, advance_bridge_out, out_route,
+};
+
+/// The exchange deposit address, looked up when the provider call is saved.
+struct ExchangeDepositAddress<'a, C: CexBackend> {
+    backend: &'a C,
+    asset: &'a str,
+    network: &'a str,
+}
+
+#[async_trait::async_trait]
+impl<C: CexBackend> BridgeDestinationProvider for ExchangeDepositAddress<'_, C> {
+    async fn destination(&self) -> Result<String, String> {
+        Ok(self
+            .backend
+            .get_deposit_address(self.asset, self.network)
+            .await?
+            .address)
+    }
+}
 
 impl<C> CexVenueFinalizer<C>
 where
@@ -11,92 +32,81 @@ where
         state: &CexState,
         planned_asset: &str,
     ) -> Result<&'static BridgeRouteSpec, String> {
-        let source_symbol = state.deposit.deposit_asset.symbol();
-        let source_chain = state.deposit.deposit_asset.chain();
-        resolve_route(&source_symbol, &source_chain, planned_asset).ok_or_else(|| {
-            format!("bridge route not found for deposit {source_symbol}@{source_chain} -> {planned_asset}")
-        })
+        out_route(&state.deposit.deposit_asset, planned_asset)
     }
 
-    /// A deposit through a bridge: fund the bridge account, send the provider
-    /// call for a bridge handle, then poll the bridge until it completes.
+    /// A deposit through a bridge: the shared leg out, then the exchange balance
+    /// check once the bridge completes.
     pub(super) async fn deposit_bridged(
         &self,
         state: &mut CexState,
         planned_asset: &str,
+        planned_network: &str,
     ) -> Result<(), CexBackendError> {
         let bridge = self.bridge_runtime()?;
         let route = Self::deposit_route(state, planned_asset)?;
-
-        // Phase A: move the seized collateral into the configured bridge source.
-        if state.deposit.deposit_txid.is_none() {
-            let intent = if state.deposit.deposit_funding.is_some() {
-                None
-            } else {
-                Some(
-                    self.prepare_bridged_funding(state, bridge, route, planned_asset)
-                        .await?,
-                )
-            };
-            if !self.drive_funding(state, intent).await? {
-                return Ok(());
-            }
-            // This build funded the bridge, so no call ran without a record.
-            state.deposit.bridge.deposit_bridge_call_unrecorded = false;
-            state.step = CexStep::DepositPending;
-            return Ok(());
+        // The baseline is taken once, before the funding transfer is sized.
+        if state.deposit.deposit_txid.is_none() && state.deposit.deposit_funding.is_none() {
+            self.record_balance_before_deposit(state, planned_asset).await;
         }
-
-        if state.deposit.bridge.deposit_bridge_id.is_none() {
-            return self.advance_bridged_deposit_submission(state, bridge, route).await;
-        }
-
-        self.poll_deposit_bridge(state, bridge).await
-    }
-
-    /// Reads the bridge status. A completed bridge hands over to the exchange
-    /// balance check; a failed or canceled bridge returns an error.
-    async fn poll_deposit_bridge(&self, state: &mut CexState, bridge: &BridgeRuntime) -> Result<(), CexBackendError> {
-        state.deposit.bridge.deposit_bridge_polled_at_ts = Some(now_ts());
-        let bridge_id = state
-            .deposit
-            .bridge
-            .deposit_bridge_id
-            .clone()
-            .ok_or_else(|| "missing bridge id while polling bridged deposit".to_string())?;
-        let (status, unreadable) = match bridge.backend.get_bridge_status(&bridge_id).await {
-            Ok(status) => (status, None),
-            // A failed read says nothing about the bridge, so it is a wait, not a strike.
-            Err(BridgeError::Unreadable(error)) => (BridgeStatus::Pending, Some(error)),
-            Err(error) => return Err(error.into()),
+        let destination = ExchangeDepositAddress {
+            backend: self.backend.as_ref(),
+            asset: planned_asset,
+            network: planned_network,
         };
-        match status {
-            BridgeStatus::Completed | BridgeStatus::Minted(_) => {
+        // While the funding transfer is saved or in flight the step stays at
+        // `Deposit`: the funds are still in the trader account, and a restart
+        // settles the saved transfer instead of asking an operator.
+        let funding_phase = state.deposit.deposit_txid.is_none();
+        let outcome = advance_bridge_out(
+            bridge,
+            &mut state.deposit.bridge,
+            FundingSlot {
+                record: &mut state.deposit.deposit_funding,
+                txid: &mut state.deposit.deposit_txid,
+                sent_at_ts: &mut state.deposit.deposit_sent_at_ts,
+            },
+            BridgeOutInputs {
+                leg_id: &state.liq_id,
+                route,
+                asset: &state.deposit.deposit_asset,
+                size_in: &state.size_in,
+                outbound: self.outbound.as_ref(),
+                destination: &destination,
+            },
+        )
+        .await?;
+        match outcome {
+            BridgeLegOutcome::Waiting { stalled } => {
+                if !funding_phase {
+                    state.step = CexStep::DepositPending;
+                }
+                if let Some(line) = stalled {
+                    state.last_error = Some(line);
+                }
+            }
+            BridgeLegOutcome::Saved { side_costs } => {
+                state.record_side_costs(&side_costs);
+                state.send_saved = true;
+                if !funding_phase {
+                    state.step = CexStep::DepositPending;
+                }
+            }
+            BridgeLegOutcome::Funded { side_costs } => {
+                state.record_side_costs(&side_costs);
+                state.step = CexStep::DepositPending;
+            }
+            BridgeLegOutcome::Submitted => {
+                state.trade.trade_next_amount_in = state.deposit.bridge.deposit_bridge_expected_amount;
+                state.step = CexStep::DepositPending;
+            }
+            BridgeLegOutcome::Completed { .. } => {
                 self.check_deposit(state).await?;
                 if !matches!(state.step, CexStep::Trade) {
                     state.step = CexStep::DepositPending;
                 }
-                Ok(())
             }
-            BridgeStatus::Pending | BridgeStatus::Unknown => {
-                let submitted_at = state.deposit.bridge.deposit_bridge_submitted_at_ts;
-                state.step = CexStep::DepositPending;
-                Self::note_bridge_wait(state, submitted_at, &bridge_id, unreadable.as_deref())
-            }
-            BridgeStatus::Failed { reason } => Err(format!(
-                "bridged deposit failed for liq_id {} bridge_id {}: {}",
-                state.liq_id,
-                bridge_id,
-                reason.unwrap_or_else(|| "unknown failure".to_string())
-            )
-            .into()),
-            BridgeStatus::Canceled { reason } => Err(format!(
-                "bridged deposit canceled for liq_id {} bridge_id {}: {}",
-                state.liq_id,
-                bridge_id,
-                reason.unwrap_or_else(|| "no reason provided".to_string())
-            )
-            .into()),
         }
+        Ok(())
     }
 }

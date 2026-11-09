@@ -554,7 +554,7 @@ async fn mexc_cksol_repayment_rejects_underfunded_bridge_before_submission() {
     for gross in [0.001, 0.021, f64::NAN, f64::INFINITY] {
         let amount = ChainTokenAmount::from_formatted(cksol_token(), gross);
         assert!(
-            CexVenueFinalizer::<MockCexBackend>::solana_repayment_bridge_amount(&deps, route, &amount, 0.002)
+            crate::finalizers::bridge_legs::solana_repayment_bridge_amount(&deps, route, &amount, 0.002)
                 .await
                 .is_err()
         );

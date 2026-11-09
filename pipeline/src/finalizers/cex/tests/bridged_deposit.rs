@@ -93,6 +93,50 @@ async fn mexc_deposit_bridge_reserves_reverse_bridge_approval_fee_in_trade_amoun
     assert!((state.trade.trade_next_amount_in.unwrap_or_default() - 0.98).abs() < 1e-9);
 }
 
+/// The funds are still in the trader account while the funding transfer is saved
+/// or in flight, so the step stays at `Deposit`: a restart settles the saved
+/// transfer, and a refusal ends the leg cleanly. The step moves once it lands.
+#[tokio::test]
+async fn a_bridged_deposit_stays_in_the_deposit_step_until_its_funding_lands() {
+    let mut cex = MockCexBackend::new();
+    let mut bridge = MockBridgeBackend::new();
+    let mut transfers = MockTransferActions::new();
+    cex.expect_get_balance().times(1).returning(|_| Ok(0.0));
+    transfers
+        .expect_transfer()
+        .times(1)
+        .returning(|_token, _to, _amount| Ok("tx-bridge-fund".to_string()));
+    bridge.expect_get_fee_budget().returning(|_, _, _| {
+        Ok(BridgeFeeBudget {
+            source_fee_budget: 0.01,
+            ..BridgeFeeBudget::default()
+        })
+    });
+    bridge.expect_get_minimum_bridge_amount().returning(|_, _, _| Ok(0.0));
+    let finalizer =
+        test_finalizer(Arc::new(cex), Arc::new(transfers)).with_bridge_runtime(bridge_dependencies(Arc::new(bridge)));
+    let receipt = make_execution_receipt_with_assets(9, ckusdc_token(), ckbtc_token());
+    let mut state = finalizer.prepare("9", &receipt).await.expect("prepare");
+
+    // The first cycle saves the funding transfer.
+    finalizer.deposit(&mut state).await.expect("the transfer is saved");
+    assert!(state.deposit.deposit_funding.is_some());
+    assert!(state.deposit.deposit_txid.is_none());
+    assert!(matches!(state.step, CexStep::Deposit), "{:?}", state.step);
+    assert!(
+        !state.funds_left_trader_account(),
+        "nothing has left the trader account"
+    );
+    assert!(state.send_saved);
+
+    // The second cycle sends it, and it lands.
+    state.send_saved = false;
+    finalizer.deposit(&mut state).await.expect("the transfer lands");
+    assert_eq!(state.deposit.deposit_txid.as_deref(), Some("tx-bridge-fund"));
+    assert!(matches!(state.step, CexStep::DepositPending), "{:?}", state.step);
+    assert!(state.funds_left_trader_account());
+}
+
 #[tokio::test]
 async fn mexc_deposit_bridge_rejects_source_fee_reserve_too_small_with_permanent_prefix() {
     let mut cex = MockCexBackend::new();
